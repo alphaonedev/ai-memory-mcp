@@ -128,6 +128,9 @@ fn detector_accepts_wired_and_commented_sites_2502() {
         "                    .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())\n",
         "                    // .serve(app.into_make_service())\n",
     );
-    assert!(wiring_violations("synthetic.rs", synthetic).is_empty());
+    assert_eq!(
+        wiring_violations("synthetic.rs", synthetic),
+        [] as [std::string::String; 0]
+    );
     assert_eq!(wired_site_count(synthetic), 1);
 }

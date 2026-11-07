@@ -1,0 +1,18 @@
+{
+ "ci.yml": [
+  {
+   "databaseId": 1,
+   "createdAt": "2026-10-30T14:00:00Z",
+   "conclusion": "success",
+   "status": "completed"
+  }
+ ],
+ "coverage.yml": [
+  {
+   "databaseId": 2,
+   "createdAt": "2026-10-30T10:00:00Z",
+   "conclusion": "success",
+   "status": "completed"
+  }
+ ]
+}

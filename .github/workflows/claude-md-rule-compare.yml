@@ -46,9 +46,13 @@ on:
 permissions:
   contents: read
 
+# #8332: a title or body edit never cancels a running comparison; a base retarget
+# and a body edit each get a real (cheap) comparison run once this file is on the
+# default branch (#8337: a pull_request_target workflow runs from the default branch,
+# so until then the retarget and body-edit runs hold).
 concurrency:
   group: claude-md-rule-compare-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event.action != 'edited' }}
 
 jobs:
   compare:

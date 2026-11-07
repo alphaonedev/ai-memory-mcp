@@ -336,6 +336,22 @@ def _safe_remove(raw: str) -> None:
         target.unlink()
 
 
+def _note_unavailable(stream: IO[str], exc: OSError) -> None:
+    """Best-effort ``LEG B evidence unavailable`` line; a broken stream cannot raise (#7893)."""
+    try:
+        stream.write("\n== LEG B evidence unavailable: %s ==\n" % (exc.strerror or exc.__class__.__name__))
+    except (OSError, ValueError):
+        return  # the stream itself is gone: the trap must still keep the gate's exit status
+
+
+def _stderr_note(text: str) -> None:
+    """Best-effort stderr line for the EXIT trap: a closed stderr cannot raise (#7894)."""
+    try:
+        sys.stderr.write(text)
+    except (OSError, ValueError):
+        return
+
+
 def finalize(state_dir: Path, evidence_dir: Path, tail_lines: int, stream: IO[str]) -> int:
     """EXIT-trap body of the gate: report LEG B evidence on a LEG B failure, then clean up.
 
@@ -352,18 +368,22 @@ def finalize(state_dir: Path, evidence_dir: Path, tail_lines: int, stream: IO[st
         if leg_b and evidence_dir.is_dir():
             stream.write("\n== LEG B evidence (redacted, last %d lines per file; #7181) ==\n" % tail_lines)
             print_evidence(evidence_dir, evidence_names(evidence_dir, DEFAULT_NAMES), tail_lines, stream)
-    except OSError:
-        pass
+    except OSError as exc:
+        # The failure artifact must say its LEG B section is missing (#7893).
+        _note_unavailable(stream, exc)
     listing = state_dir / "cleanup-list"
     try:
         paths = listing.read_text(encoding="utf-8", errors="replace").splitlines() if listing.is_file() else []
     except OSError:
         paths = []
+    failed: List[str] = []
     for raw in paths:
         try:
             _safe_remove(raw.strip())
         except OSError:
-            pass
+            failed.append(raw.strip())
+    if failed:  # residue on the runner must be detectable (#7894)
+        _stderr_note("could not remove %d cleanup paths (first: %s)\n" % (len(failed), failed[0]))
     shutil.rmtree(str(state_dir), ignore_errors=True)
     return 0
 

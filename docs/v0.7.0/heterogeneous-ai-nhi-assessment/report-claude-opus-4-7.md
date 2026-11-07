@@ -6,7 +6,7 @@ layout: doc
 **Evaluator:** Anthropic Claude Opus 4.7 (`claude-opus-4-7[1m]`, 1M-context variant) — FRESH Phase-1 re-run, distinct session from the 2026-05-24 report it supersedes.
 **Substrate:** ai-memory v0.7.0 (`attested-cortex`), `docs/opus-4-7-phase1-refine` branch HEAD `94ca855eb` (post-#1177 + #1178 + #1180 closure refinement).
 **Live schema:** v51 (the prompt's `schema v50` claim is one bump stale — the running daemon reports `schema_version = 51`).
-**Workspace:** `/Users/fate/v07/v07-fixes/.local-runs/v070-nhi-assessment-20260525T194158Z-opus-4-7-fresh/` (per CLAUDE.md `/tmp` hard-rule override).
+**Workspace:** `<home>/v07/v07-fixes/.local-runs/v070-nhi-assessment-20260525T194158Z-opus-4-7-fresh/` (per CLAUDE.md `/tmp` hard-rule override).
 **Date:** 2026-05-25
 **Issue:** [#1171](https://github.com/alphaonedev/ai-memory-mcp/issues/1171)
 **Phase:** 1 (isolated execution — did NOT read the prior 304-line 2026-05-24 Opus 4.7 report before writing this one, per the within-model decorrelation discipline the operator requested when picking "Fresh Phase-1 re-run").
@@ -57,7 +57,7 @@ A prior Opus 4.7 session produced a 304-line report at this path on 2026-05-24. 
 
 **Live probe:** `memory_entity_register` minted entity `23ee1c37-b601-4a5a-be09-174b25f4d15f` in test namespace. `memory_persona_generate` BEFORE writing any reflections returned literal `"no reflections found for entity '23ee1c37-...' in namespace 'v070-nhi-assessment-opus-fresh-20260525'"` — matches Display impl at `:167-173` verbatim. `memory_persona` returned `{persona: null}` — no partial write.
 
-**Two-call idempotency BLOCKED OPERATIONALLY** because the wire-layer drops caller `metadata.entity_id` (see Defect §G.1 below — filed as issue [#1315](https://github.com/alphaonedev/ai-memory-mcp/issues/1315)). When I wrote a depth-1 reflection with `metadata={"entity_id":"23ee1c37-..."}`, the reflection row landed with `mentioned_entity_id=NULL` (verified via direct SQL probe of `/Users/fate/.claude/ai-memory.db`). The control row (observation written through `memory_store`) correctly preserved the entity_id. Only `memory_reflect`'s JSON-RPC dispatch path drops caller metadata keys. The structural property at P2 (refuse-without-source-reflections at the read path) is CONFIRMED; the idempotent two-call probe is blocked on the live regression. Filed.
+**Two-call idempotency BLOCKED OPERATIONALLY** because the wire-layer drops caller `metadata.entity_id` (see Defect §G.1 below — filed as issue [#1315](https://github.com/alphaonedev/ai-memory-mcp/issues/1315)). When I wrote a depth-1 reflection with `metadata={"entity_id":"23ee1c37-..."}`, the reflection row landed with `mentioned_entity_id=NULL` (verified via direct SQL probe of `<home>/.claude/ai-memory.db`). The control row (observation written through `memory_store`) correctly preserved the entity_id. Only `memory_reflect`'s JSON-RPC dispatch path drops caller metadata keys. The structural property at P2 (refuse-without-source-reflections at the read path) is CONFIRMED; the idempotent two-call probe is blocked on the live regression. Filed.
 
 **P3. Reflection refusal taxonomy (HookVeto vs. DepthExceeded).** Code-anchored at `src/storage/reflect.rs:32-58`. Five variants: `Validation`, `SourceNotFound`, `DepthExceeded{attempted, cap, namespace}` (`:42-46`), `HookVeto{reason, code}` (`:47-54`), `Database`. The crucial design-intent comment at `:47-53`: *"hook vetoes are caller-policy refusals that carry their own provenance via the hook's own decision record (if any) — the Task 5 depth-cap audit row is NOT emitted on this path."* Display impl at `:60-81`.
 
@@ -125,7 +125,7 @@ The `stamp` function at `:93-130` is documented as non-destructive: *"federation
 
 ### Tier IV — Forensic chain & post-merge posture
 
-**P19. V-4 signed_events cross-row hash chain.** Direct SQL probe of the live DB (`/Users/fate/.claude/ai-memory.db`):
+**P19. V-4 signed_events cross-row hash chain.** Direct SQL probe of the live DB (`<home>/.claude/ai-memory.db`):
 
 ```
 COUNT(*), MIN(sequence), MAX(sequence) FROM signed_events:
@@ -402,7 +402,7 @@ The orchestrator-side correction surfaced by this assessment (G.10) is non-trivi
 
 ## Probe artifacts archived
 
-Live MCP probe transcripts + sqlite query outputs captured during this session under `/Users/fate/v07/v07-fixes/.local-runs/v070-nhi-assessment-20260525T194158Z-opus-4-7-fresh/` (per CLAUDE.md `/tmp` hard-rule override). Test namespaces `v070-nhi-assessment-opus-fresh-20260525`, `v070-nhi-assessment-opus-fresh-p5`, `v070-nhi-assessment-opus-fresh-p6`, `v070-nhi-assessment-opus-fresh-p7`, `v070-nhi-assessment-opus-fresh-p9` left in the live DB for operator post-hoc inspection — safe to `memory_forget` after Phase 2 synthesis.
+Live MCP probe transcripts + sqlite query outputs captured during this session under `<home>/v07/v07-fixes/.local-runs/v070-nhi-assessment-20260525T194158Z-opus-4-7-fresh/` (per CLAUDE.md `/tmp` hard-rule override). Test namespaces `v070-nhi-assessment-opus-fresh-20260525`, `v070-nhi-assessment-opus-fresh-p5`, `v070-nhi-assessment-opus-fresh-p6`, `v070-nhi-assessment-opus-fresh-p7`, `v070-nhi-assessment-opus-fresh-p9` left in the live DB for operator post-hoc inspection — safe to `memory_forget` after Phase 2 synthesis.
 
 ## Issues filed during this assessment
 

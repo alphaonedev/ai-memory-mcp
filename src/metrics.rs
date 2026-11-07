@@ -308,7 +308,8 @@ pub struct Metrics {
     /// quarantined row under target `federation.quarantine.unattributed`
     /// (a quarantine is a discrete security event, logged each time).
     /// **Always zero when the
-    /// quarantine knob is OFF (the default)** — the counter only moves on
+    /// quarantine knob is OFF (the `singleton`/`team` shapes unless set; the
+    /// `federated`, `hive` and `production` shapes force it on)** — the counter only moves on
     /// an actual quarantine, so a non-zero value means a peer relayed
     /// provenance-less content that this node is now black-holing until
     /// dequarantine. Closes the #2444 silent-hide anti-pattern (the
@@ -1172,7 +1173,7 @@ impl Metrics {
              route-IN provenance gate (AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED): \
              an unattributed row stored with lifecycle_state=quarantined and \
              hidden from every local read/egress lane until dequarantine. \
-             Always zero when the quarantine knob is off (the default); a \
+             Always zero when the quarantine knob is off (the singleton and team shapes unless set; the federated, hive and production shapes force it on); a \
              non-zero rate means a peer is relaying provenance-less content \
              this node is black-holing. #2966.",
             &mut err,

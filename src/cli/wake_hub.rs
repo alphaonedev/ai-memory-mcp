@@ -548,40 +548,15 @@ pub async fn dispatch(args: &WakeHubArgs, app_config: &AppConfig) -> Result<i32>
             HubDeps::default()
         }
     };
+    // #8193: install before the socket is bound, so a stop signal that
+    // arrives during startup is graceful too (and the socket is unlinked).
+    let mut stop = crate::stop_signal::StopListener::install();
     let hub = WakeHub::bind(cfg, deps)?;
     // A completed drain is a SUCCESSFUL shutdown: exit 0, so `systemctl stop`
     // and `launchctl bootout` do not record a failure for the thing they asked
     // for (#3471).
-    hub.serve(shutdown_signal()).await?;
+    hub.serve(async move { stop.wait().await }).await?;
     Ok(0)
-}
-
-/// Resolve on SIGINT or, on unix, SIGTERM — so `systemctl stop`, `docker stop`
-/// and a plain `kill` all trigger the same bounded drain.
-async fn shutdown_signal() {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-        let mut term = signal(SignalKind::terminate()).ok();
-        let term_fut = async {
-            match term.as_mut() {
-                Some(t) => {
-                    t.recv().await;
-                }
-                // No SIGTERM handler could be installed — park forever so the
-                // select resolves on ctrl_c alone.
-                None => std::future::pending::<()>().await,
-            }
-        };
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            () = term_fut => {}
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
-    }
 }
 
 #[cfg(test)]

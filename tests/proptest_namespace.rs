@@ -101,7 +101,7 @@ proptest! {
     ) {
         let ns = segments.join("/");
         let ancestors = namespace_ancestors(&ns);
-        assert!(!ancestors.is_empty());
+        assert_ne!(ancestors, [] as [std::string::String; 0]);
     }
 }
 
@@ -165,7 +165,7 @@ proptest! {
 proptest! {
     #[test]
     fn prop_namespace_ancestors_empty_is_empty(_u in Just("")) {
-        assert!(namespace_ancestors("").is_empty());
+        assert_eq!(namespace_ancestors(""), [] as [std::string::String; 0]);
     }
 }
 

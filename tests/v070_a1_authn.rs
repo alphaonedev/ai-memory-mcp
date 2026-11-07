@@ -26,6 +26,7 @@
 #![allow(clippy::doc_markdown)]
 
 use ai_memory::config::set_active_hooks_hmac_secret;
+use ai_memory::handlers::agent_api_key::approval_subject;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::json;
@@ -40,7 +41,9 @@ mod common;
 static A1_HMAC_LOCK: Mutex<()> = Mutex::new(());
 
 /// Synthesise a K10 approval signature binding method + `pending_id` per
-/// release/v0.7.0 commit 99ffacc. Canonical: `<ts>.<METHOD>.<pending_id>.<body>`.
+/// release/v0.7.0 commit 99ffacc. #8495 layout v2: callers pass
+/// `approval_subject(pid, approver)` so the canonical is
+/// `<ts>.<METHOD>.<n>:<pending_id>@<m>:<approver>.<body>`.
 fn sign(secret: &str, timestamp: &str, method: &str, pending_id: &str, body: &str) -> String {
     use sha2::Digest;
     use sha2::Sha256;
@@ -254,7 +257,13 @@ async fn s5c1_approve_without_server_secret_returns_401_even_with_signature() {
 
     let body = String::new();
     let ts = chrono::Utc::now().timestamp().to_string();
-    let sig = sign("anything-no-server-secret", &ts, "POST", &pid, &body);
+    let sig = sign(
+        "anything-no-server-secret",
+        &ts,
+        "POST",
+        &approval_subject(&pid, "alice"),
+        &body,
+    );
 
     let req = Request::builder()
         .method("POST")
@@ -286,7 +295,13 @@ async fn s5c1_approve_with_valid_hmac_returns_200() {
 
     let body = String::new();
     let ts = chrono::Utc::now().timestamp().to_string();
-    let sig = sign("a1-positive-secret", &ts, "POST", &pid, &body);
+    let sig = sign(
+        "a1-positive-secret",
+        &ts,
+        "POST",
+        &approval_subject(&pid, "a1-approver"),
+        &body,
+    );
 
     let req = Request::builder()
         .method("POST")
@@ -324,7 +339,13 @@ async fn s5c1_reject_with_valid_hmac_returns_200() {
 
     let body = String::new();
     let ts = chrono::Utc::now().timestamp().to_string();
-    let sig = sign("a1-positive-secret", &ts, "POST", &pid, &body);
+    let sig = sign(
+        "a1-positive-secret",
+        &ts,
+        "POST",
+        &approval_subject(&pid, "a1-rejecter"),
+        &body,
+    );
 
     let req = Request::builder()
         .method("POST")
@@ -465,6 +486,7 @@ async fn s5c1_pattern_a_non_loopback_bind_without_api_key_refuses() {
         quorum_ca_cert: None,
         catchup_interval_secs: 30,
         federation_identity: None,
+        check: false,
         #[cfg(feature = "sal")]
         store_url: None,
     };
@@ -513,6 +535,7 @@ async fn s5c1_pattern_a_loopback_bind_without_api_key_succeeds_with_warn() {
         quorum_ca_cert: None,
         catchup_interval_secs: 30,
         federation_identity: None,
+        check: false,
         #[cfg(feature = "sal")]
         store_url: None,
     };

@@ -158,5 +158,5 @@ fn k7_replay_unknown_subscription_returns_empty_envelope() {
         subscriptions::memory_subscription_replay(&conn, "does-not-exist", "1970-01-01T00:00:00Z")
             .expect("replay must not fail on unknown subscription");
     assert_eq!(envelope["count"].as_u64(), Some(0));
-    assert!(envelope["events"].as_array().unwrap().is_empty());
+    assert_eq!(envelope["events"].as_array().unwrap().len(), 0);
 }

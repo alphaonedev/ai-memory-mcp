@@ -18,7 +18,7 @@
 #![allow(clippy::doc_markdown, clippy::missing_panics_doc)]
 
 use std::io::{BufRead as _, BufReader};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -35,21 +35,16 @@ const BOOT_DEADLINE: Duration = Duration::from_secs(60);
 const PROBE_INTERVAL: Duration = Duration::from_millis(100);
 const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
-fn fixture(name: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/tls")
-        .join(name)
-}
+/// Subdirectory of the per-test root that holds the TLS leaf (cert and 0600
+/// key); it is removed with the root when the test's `TempDir` drops (#8179).
+const TLS_SUBDIR: &str = "tls";
 
-fn tls_args() -> [String; 4] {
-    [
-        "--tls-cert".to_string(),
-        fixture("valid_cert.pem").to_string_lossy().into_owned(),
-        "--tls-key".to_string(),
-        fixture("valid_key_pkcs8.pem")
-            .to_string_lossy()
-            .into_owned(),
-    ]
+/// A TLS leaf minted by the shared helper (SANs `localhost`, `127.0.0.1`,
+/// `::1`) under the per-test `root`; the daemon serves it and the probe client
+/// pins it as its only root, so certificate verification stays ON (#8179). The
+/// key never leaves `root`, so dropping the test's `TempDir` deletes it.
+fn leaf(root: &Path) -> common::tls::TestTls {
+    common::tls::TestTls::generate(&root.join(TLS_SUBDIR))
 }
 
 /// No config file (`AI_MEMORY_NO_CONFIG=1`): the declared shape is
@@ -77,12 +72,8 @@ fn command(root: &Path, store_url: &str) -> Command {
     cmd
 }
 
-fn health_is_200(port: u16) -> bool {
-    let client = reqwest::blocking::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .timeout(PROBE_TIMEOUT)
-        .build()
-        .expect("client");
+fn health_is_200(port: u16, tls: &common::tls::TestTls) -> bool {
+    let client = tls.client_with_timeout(PROBE_TIMEOUT);
     client
         .get(format!("https://127.0.0.1:{port}/api/v1/health"))
         .send()
@@ -100,10 +91,11 @@ enum BootOutcome {
 }
 
 fn boot_on_loopback(root: &Path, store_url: &str) -> BootOutcome {
+    let tls = leaf(root);
     let port = free_port();
     let mut child = command(root, store_url)
         .args(["serve", "--port", &port.to_string()])
-        .args(tls_args())
+        .args(tls.serve_args())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
@@ -128,7 +120,7 @@ fn boot_on_loopback(root: &Path, store_url: &str) -> BootOutcome {
             let stderr = buf.lock().unwrap().clone();
             return BootOutcome::Exited { status, stderr };
         }
-        if health_is_200(port) {
+        if health_is_200(port, &tls) {
             std::thread::sleep(Duration::from_secs(1));
             let _ = child.kill();
             let _ = child.wait();

@@ -154,7 +154,7 @@ See the SME-engineer file for the full meta-pattern analysis.
    `origin/release/v0.7.0`); HEAD `fd172f2cf629309514cd5dad486c2e59ac4eed39`.
 2. **Binary.** Single release SHA
    `d4b60aa5b8f97470d95007f30bddb15e7e35c3855f0085c6b4f43d57f6b4ef3e`
-   at `/Users/fate/v07/v07-fixes/.cargo-shared-target/release/ai-memory`
+   at `<home>/v07/v07-fixes/.cargo-shared-target/release/ai-memory`
    (symlinked to `/opt/homebrew/bin/ai-memory`).
 3. **Test invocation.**
    `cargo test --release --no-default-features --features sal,sal-postgres,sqlite-bundled -- --include-ignored --test-threads=1`.

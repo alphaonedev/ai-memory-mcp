@@ -152,4 +152,4 @@ A thin `src/rqgm_export.rs`, a “temporary” in-process panel breeder for test
 ---
 
 *Agent W3-A4 · Sibling-scope & CUT discipline · endpoint memory only · under 350 lines*  
-*Absolute path: `/Users/fate/Downloads/ai-memory-mcp/waves/w3-a4-scope-cuts.md`*
+*Absolute path: `<home>/Downloads/ai-memory-mcp/waves/w3-a4-scope-cuts.md`*

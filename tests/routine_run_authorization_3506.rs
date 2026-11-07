@@ -198,7 +198,7 @@ fn sqlite_owner_authorization() {
             let actor = result["run"]["metadata"]["agent_id"]
                 .as_str()
                 .expect("run attribution");
-            assert!(!actor.is_empty());
+            assert_ne!(actor, "");
             if case != "local-ownerless" {
                 assert_eq!(actor, OWNER);
             }

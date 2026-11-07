@@ -1106,5 +1106,5 @@ Do not re-argue seven axes. Do not re-score W2 without code. Do not brand perfec
 
 *W7-A7 Grand Synthesis Chair · Grok 4.5 assessment voice · 2026-07-08*  
 *Inputs: W1–W6 chairs + peers (W3-A1/A2 re-merged; W6-A1 bind); W7-A1…A6; red-team ADOPTED*  
-*Primary path: `/Users/fate/Downloads/ai-memory-mcp/waves/w7-a7-grand-synthesis.md`*  
+*Primary path: `<home>/Downloads/ai-memory-mcp/waves/w7-a7-grand-synthesis.md`*  
 *Comprehensive CORE draft · no code changes · source for UPDATED-ROADMAP-GROK-4-5-ASSESSMENT-PERFECT-ENDPOINT-AI-MEMORY.md*

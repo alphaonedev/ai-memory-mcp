@@ -29,6 +29,3 @@
 *.png   binary
 *.jpg   binary
 *.parquet binary
-
-# CHANGELOG append-conflict auto-resolution (both [Unreleased] entries kept).
-CHANGELOG.md merge=union

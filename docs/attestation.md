@@ -609,9 +609,13 @@ does **not** reach an MCP server the host launches with its own environment.
 
 ## Quarantine of provenance-less federated writes (v1.0.0 R19/A3, #1948)
 
-A federated node can OPT IN to hiding inbound relayed memories it cannot
-attribute. Set `AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED=1` (default **off** /
-permissive) and any inbound `/sync/push` memory that does not reach
+Inbound relayed memories a node cannot attribute are hidden by default on the
+`federated`, `hive` and `production` deployment shapes: the shape pins
+`AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED` on at boot, and an explicit zero (or
+any non-truthy value) is refused at boot there (`production` through the
+`asi-hard` posture floor). The `singleton` and `team` shapes do not react and
+stay permissive unless you set `AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED=1`
+yourself. Any inbound `/sync/push` memory that does not reach
 `attest_level=agent_attested` (no verified per-write content signature — it
 would land `claimed`) is **stored** with the system-only lifecycle state
 `quarantined`:
@@ -741,6 +745,23 @@ table.
 > node-wide inventory to that one principal and reported `{"count":0}` over a
 > populated `agent_subkey_certs` table — a security-inventory false negative.
 > `--principal` cannot be shadowed; omit it for the full node-wide list.
+
+## Re-owned rows (share, atomise, promote, consolidate; #8513, #8532)
+
+A signature commits to the owner, namespace, title, kind, `created_at` and
+content of the row it was made over. `memory_share`, atomisation,
+promotion and `memory_consolidate` clone or merge a row into a new owner, so the source signature can never be
+re-derived from the clone. The clone therefore does **not** inherit it:
+`write_signature`, `agent_pubkey`, `pubkey_bound_at`,
+`attestation_downgraded` and `forged_signature_skipped` are dropped,
+`attest_level` is `claimed`, and `attest_reset_reason` names the path
+(`reowned_by_share`, `reowned_by_atomise`, `reowned_by_promote`, `reowned_by_consolidate`). The source
+id and owner are recorded under `shared_from` / `atomised_from` /
+`promoted_from` and the matching `*_agent_id` key. The source row keeps its
+own attestation. Consolidate applies the reset on both backends, tenant and
+substrate/curator paths alike, and its merge loop never copies an attestation
+key from a source (its lineage stays in `derived_from` and
+`consolidated_from_agents`). This is the same rule update applies (#3420).
 
 ## Epistemic-typing provenance (`kind_provenance`, #1945)
 

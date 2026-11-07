@@ -235,11 +235,11 @@ impl HubMetrics {
     /// Record a connection closing. Saturating: an accounting slip must not
     /// wrap the gauge to `usize::MAX`.
     pub fn connection_closed(&self) {
-        let _ =
-            self.connections_current
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
-                    Some(cur.saturating_sub(1))
-                });
+        let _ = self
+            .connections_current
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                Some(cur.saturating_sub(1))
+            });
     }
 
     /// Connections currently established.

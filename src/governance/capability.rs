@@ -2253,15 +2253,17 @@ mod tests {
     fn token_debug_redacts_bearer_bytes() {
         let (tok, _, _, _) = mint_fixture(vec![Caveat::ExpiresAt(9_999_999_999)]);
         let rendered = format!("{tok:?}");
-        assert!(rendered.contains("<redacted>"), "got: {rendered}");
+        // #6588 — the rendering is the thing under test: a failing check
+        // must not echo it, because a regression puts bearer bytes in it.
+        assert!(
+            rendered.contains("<redacted>"),
+            "Debug must carry the <redacted> marker"
+        );
         assert!(
             !rendered.contains("root_sig: ["),
-            "root_sig bytes must never render: {rendered}"
+            "root_sig bytes must never render"
         );
-        assert!(
-            !rendered.contains("tag: ["),
-            "tag bytes must never render: {rendered}"
-        );
+        assert!(!rendered.contains("tag: ["), "tag bytes must never render");
     }
 
     #[test]

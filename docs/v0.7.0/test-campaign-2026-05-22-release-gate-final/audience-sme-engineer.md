@@ -24,7 +24,7 @@ against the C1–C8 orchestrator-safeguard set.
 ```
 Branch:    release/v0.7.0-mobile-ci-1068  (tracks origin/release/v0.7.0)
 HEAD:      fd172f2cf629309514cd5dad486c2e59ac4eed39
-Binary:    /Users/fate/v07/v07-fixes/.cargo-shared-target/release/ai-memory
+Binary:    <home>/v07/v07-fixes/.cargo-shared-target/release/ai-memory
 Binary SHA256:
            d4b60aa5b8f97470d95007f30bddb15e7e35c3855f0085c6b4f43d57f6b4ef3e
 Symlink:   /opt/homebrew/bin/ai-memory -> (above)

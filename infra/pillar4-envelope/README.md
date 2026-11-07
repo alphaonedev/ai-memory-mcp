@@ -33,7 +33,7 @@ figure is labelled **PROVISIONAL** in the design docs (operator flag (b)).
 
 ```bash
 cd infra/pillar4-envelope
-POSTGRES_PASSWORD=secret ./measure-envelope.sh
+POSTGRES_PASSWORD=<generated> ./measure-envelope.sh
 ```
 
 What it does:
@@ -54,12 +54,17 @@ What it does:
 
 Exit 0 prints `MEASURED ENVELOPE X = <n> concurrent agents/module`. Exit 72
 means no knee within the ramp (X ≥ last step — raise the ceiling and re-run).
+Exit 73 means the role has no SCRAM-SHA-256 verifier (an auth failure, not a
+capacity result). Exit 1 means a load worker exited non-zero (the FAIL line names the step), the stack bring-up failed (including the bind failure when another
+run holds 127.0.0.1:6432) or the teardown failed. Any other non-zero status is the failing command's own, under set -e. The other codes: 64 run as root, 65 bad `AI_MEMORY_SMOKE_RUN` (outside `[a-z0-9_-]` or over 64 characters), a `STEP_DURATION_SECS` that is not digits only with no leading zero before another digit, or non-decimal `P95_BUDGET_MS` / `SHED_RATE_KNEE` (digits with at most one dot, no leading zero before another digit; empty or dot-only values are refused after defaults; the FATAL message names the variable, never its value),
+69 a required tool is missing, 70 the fresh binary was not built, 71 the daemon
+did not become healthy. Each code has exactly one meaning (guarded).
 
 ## Tunables (env)
 
 | Env | Default | Meaning |
 |---|---|---|
-| `POSTGRES_PASSWORD` | `ai_memory_envelope` | DB + pooler password (rendered into the md5 userlist, never committed). |
+| `POSTGRES_PASSWORD` | random per run | DB + pooler password; generated when unset, no fixed default (the pooler userlist holds the role's SCRAM verifier, never the password; never committed). |
 | `CONCURRENCY_STEPS` | `8 16 32 64 128 256 512 1024` | Geometric ramp (brackets the knee without 1000 linear steps). |
 | `STEP_DURATION_SECS` | `20` | Load duration per concurrency step. |
 | `P95_BUDGET_MS` | `250` | p95 latency knee (recall hot-path 35 ms + headroom for the write+AGE mix). |

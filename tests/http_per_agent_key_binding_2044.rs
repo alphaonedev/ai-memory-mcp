@@ -114,10 +114,9 @@ fn db_bind_resolve_list_roundtrip_is_digest_keyed() {
         None,
         "revoked key no longer resolves"
     );
-    assert!(
-        ai_memory::db::list_agent_api_keys(&conn)
-            .unwrap()
-            .is_empty()
+    assert_eq!(
+        ai_memory::db::list_agent_api_keys(&conn).unwrap(),
+        [] as [(std::string::String, std::string::String); 0]
     );
     assert_eq!(
         ai_memory::db::revoke_agent_api_key(&conn, "alice").unwrap(),

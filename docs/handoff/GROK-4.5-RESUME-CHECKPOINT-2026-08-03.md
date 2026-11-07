@@ -11,7 +11,7 @@
 
 - **Orchestrator, reviewer, auditor, sole merge approver** for `alphaonedev/ai-memory-mcp` v1.0.0 GA.
 - Identity for all commits: **AlphaOne &lt;Justin@alpha-one.mobi&gt;**, SSH-signed (`commit.gpgsign=true`, `gpg.format=ssh`, `user.signingkey=~/.ssh/id_ed25519.pub`). Verify `G` on every commit.
-- Working tree: **`/home/fate_two/v07/v09-dev`**
+- Working tree: **`<home>/v07/v09-dev`**
 - Release tip (local + origin at checkpoint): **`release/v1.0.0` @ `5698df7b`**  
   (`docs(handoff): Grok 4.5 v1.0.0 GA engineering handoff [skip ci]`)
 - Main also has handoff mirror: **`36e64ff5`** (same doc, `[skip ci]`).
@@ -38,7 +38,7 @@ Operator: **"YES APPROVED AI NHI 100% in charge to make all decisions."**
 
 | Item | Rule |
 |------|------|
-| **Codegraph** | ALWAYS `projectPath="/home/fate_two/v07/v09-dev"` — never a worktree. Use **before** edit. |
+| **Codegraph** | ALWAYS `projectPath="<home>/v07/v09-dev"` — never a worktree. Use **before** edit. |
 | **ai-memory MCP** | `memory_session_start` + `memory_recall` on start; `memory_store` decisions/gotchas. Namespace `ai-memory`. |
 | **Rust skills** | Load **both** every Rust change: `~/.claude/skills/rust-skills` (265 rules) + `~/.claude/skills/rust-microsoft` (M-*). Cite IDs. fmt+clippy pedantic before push. Standing memory: `38cd8dbe`. |
 | **Disk** | ~562G free / 36% at checkpoint. **Never** `cargo llvm-cov`. **Never** full `cargo test --lib --tests`. Targeted tests only. Scratch **only** under `.local-runs/` (never `/tmp`). Worktree `target/` is the disk killer — clear when idle. |
@@ -185,11 +185,11 @@ Main checkout: `release/v1.0.0` clean enough for docs; feature work in worktrees
 1. memory_session_start (namespace ai-memory)
 2. memory_recall "v1.0.0 GA Grok 4.5 checkpoint 2680 2681"
 3. df -h /   # abort fan-out if disk &lt; ~100G free or climbing fast
-4. cd /home/fate_two/v07/v09-dev && git fetch origin && git status -sb
+4. cd <home>/v07/v09-dev && git fetch origin && git status -sb
 5. gh pr checks 2680; gh pr checks 2681
 6. Read this file + docs/handoff/GROK-4.5-HANDOFF-v1.0.0-GA.md §0 and §9
 7. Load rust-skills + rust-microsoft before any Rust edit
-8. codegraph projectPath=/home/fate_two/v07/v09-dev only
+8. codegraph projectPath=<home>/v07/v09-dev only
 9. Resume at §4.1 — fix QUAL-10 on #2680, green CI, merge, close #2679, then #2681
 10. Continue Gate 1/2/3/4 nonstop; no tag
 ```

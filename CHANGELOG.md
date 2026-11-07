@@ -7,6 +7,181 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security (#8574, umbrella #8493 — header-trust opt-in is bootstrap-only on credential routes)
+
+- `AI_MEMORY_ADMIN_HEADER_TRUST=1` no longer admits a claimed admin on pubkey bind, bind challenge, api-key mint and api-key revoke once any per-agent api key is enrolled, in every identity mode (403 plus a deny row, reason `header_trust_refused_registry_enrolled`); it remains the bootstrap while the registry is empty (bootstrap, or after every key is revoked), confirmed by an authoritative store read; a store error refuses, with deny reason `header_trust_refused_registry_unreadable`.
+
+### Security (#8496, umbrella #8493 — forwarded `memory_signal_send` sender bound to the verified caller)
+
+- `forward_signal_send_to_http` resolved the forwarded `X-Agent-Id` from the wire `from_agent` through `resolve_agent_id`, so an MCP caller could forge the sender of a forwarded signal. It now uses `resolve_governance_subject` (the #3171 store-forward precedent): under an enforced caller a mismatching `from_agent` is refused with `agent_id mismatch` before any network I/O, and an absent value is filled from the caller. The HTTP handler already stamps `from_agent` from the header and ignores the body field.
+### Security (#8497, #8493 — entity_register owner is the verified subject)
+
+- `memory_entity_register` and `POST /api/v1/entities` own the entity by the verified caller on both backends. A body `agent_id` or inline `metadata.agent_id` that differs from the verified subject is refused (HTTP 403 `AGENT_ID_MISMATCH`, MCP mismatch error, SAL `PermissionDenied`) with an `outcome: deny` audit row; the postgres funnel now stamps the resolved owner with `insert` like sqlite (#3171). Shared rule in `identity::entity_owner`; fragment `changelog.d/8497.security.md`.
+### Security (#8495 — approver identity bound into the approval HMAC)
+
+- **The approver is inside the approval HMAC (#8495).** The K10 decide signature on `POST /api/v1/approvals/{pending_id}`, `POST /api/v1/pending/{id}/approve` and `POST /api/v1/pending/{id}/reject` is now signed over the versioned layout 2 subject `<n>:<pending_id>@<m>:<X-Agent-Id>` (`<n>`, `<m>` the decimal byte lengths of the two ids, #8546; the subject the agent api-key approval route uses), so a signature names the approver it was made for and a request that presents it under another `X-Agent-Id` is refused `401`. A layout 1 signature (subject `<pending_id>` alone) is refused `401 {"error":"legacy_unbound_approver","signature_layout_version":2}` with a hint naming the new subject, and its nonce is not consumed, so the client can re-sign. Under `identity_mode = enforce` the three decide routes also refuse a caller whose `X-Agent-Id` is not bound to its credential (`403 identity_binding_mismatch` when a per-agent api-key is bound to a different agent, raised first by the transport middleware; `403 attested_identity_required` with the shared api-key, #8549), so one shared secret cannot cast every vote of a consensus quorum. Signers must move to the new subject.
+- **The approval signature subject is length-prefixed (#8546).** The layout 2 subject shared by the K10 decide routes and the agent api-key approval route is now `<n>:<pending_id>@<m>:<approver>`, where `<n>` and `<m>` are the decimal byte lengths of the two ids. Before this change two different (pending id, approver, body) triples could produce the same signed bytes, so a signature could be read as naming a different approver. `POST /api/v1/pending/{id}/approve` and `POST /api/v1/pending/{id}/reject` also refuse a non-empty body that is not JSON with `400` before the signature is checked. Signers must sign the length-prefixed subject; the layout version stays `2` because layout 2 has not been released.
+- **Refused approval signatures are recorded on the forensic chain (#8547).** Every signature refusal on `POST /api/v1/approvals/{pending_id}`, `POST /api/v1/pending/{id}/approve`, `POST /api/v1/pending/{id}/reject` and the agent api-key approval route now writes one `refuse` row of kind `approval_decide_signature`, naming the presented agent, the pending id, the endpoint and the refusal class (`invalid_signature` or `legacy_unbound_approver`). Before this change a mismatched, legacy, stale, future or replayed signature left no audit record. The row never carries the signature or the secret. An accepted decide still writes only its existing `allow` row.
+- **A non-JSON approval decide body is recorded on the forensic chain (#8563).** When `POST /api/v1/pending/{id}/approve` or `POST /api/v1/pending/{id}/reject` refuses a non-empty body that is not JSON with `400`, it now writes one `refuse` row of kind `approval_decide_signature` with reason `non_json_body`, naming the presented agent (or `anonymous`), the pending id and the endpoint. Before this change that refusal left no audit record. The row never carries the body, the signature or the secret.
+- **Approved deletes and promotions on SQLite are owner-gated for tenant contexts (#8564).** On the SQLite store, the SAL `execute_pending_action` delete arm and tier-bump `promote` arm executed on the target row whoever owned it. Under a tenant context both arms now run under the requester's owner gate, the same as the Postgres backend: a row owned by another agent, or a row with no owner stamp, is refused with `PermissionDenied` and left unchanged, and the requester's own row executes. A bypass context (the federated decide path, after its peer-scope check) keeps its bypass. The remaining ungated SQLite callers, `governance.rs`, `approvals.rs`, `src/mcp/tools/pending.rs` and `src/cli/agents.rs`, are tracked in #8571.
+- **Tenant decide surfaces refuse before the approval commit when the requester does not own the target row (#8577).** On the store-backed decide entries (`governance_approve_with_consensus`, `approve_with_approver_type`) an approve of a pending `delete` or tier-bump `promote` is checked against the row owner through the requester context BEFORE the approval vote is written. A refusal returns the owner-gate `PermissionDenied`, writes a `pending_action.refused_owner_gate` audit row, and leaves the pending row `pending`, instead of committing `approved` and then failing the execute. The execute-time gate stays as defence in depth; bypass contexts (federation) are untouched.
+
+### Fixed (#8548 — approved delete and promote on Postgres)
+
+- **Approved deletes and promotions execute on Postgres (#8548).** On the Postgres backend the SAL `execute_pending_action` delete arm and tier-bump `promote` arm ran under the approver's context, so the owner gate refused them and the decide answered `500 approved but execution failed` and the memory was left in place. Under a tenant context both arms now run as the requester, the same as the reflect arm, under the requester's owner gate: a row the requester owns executes, and another agent's row or an unstamped row is refused. A bypass context (the federated decide path) keeps its bypass. The SQLite backend applies the same gate to tenant contexts (#8564); its remaining ungated callers are tracked in #8571.
+
+### Security (#8357 — mTLS client certificate bound to agent identity)
+
+- New `AI_MEMORY_MTLS_AGENT_BINDING_MAP` binds each pinned client-certificate SHA-256 fingerprint to one agent id; `AI_MEMORY_MTLS_AGENT_BINDING=off|warn|enforce` (default `enforce` with a map, `off` without) refuses a differing `X-Agent-Id` with `403 agent_id_certificate_mismatch` or serves the request as the certificate's agent, and writes a forensic audit row for every mismatch. Under `enforce` the certificate also wins over an enrolled per-agent api key for a different agent (refused `403 agent_id_certificate_mismatch`, header present or not), and an allowlisted certificate that is not in the map cannot claim an agent id the map binds (refused the same way on every route; an unbound claimed id is kept). An explicit `warn` or `enforce` with no map refuses boot. With a map, a `/api/v1/sync/*` peer certificate must map to an agent, which becomes the caller id. Boot refuses a bad map or a map without `--mtls-allowlist`; `ai-memory serve --check` prints the parsed map. Details: `changelog.d/8357.security.md`.
+
+### Docs (#8262 — certification scope statement for v1.0.0 GA)
+
+- Add a "Certification scope statement" to `docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md` listing what the GA candidate certifies, what is in scope and certified on landing, and what it does not claim, each with its tracking issue and enforcing `file:line`; the open fail-closed controls (#8260, #8265) are listed as claimed only once landed, and the quarantine of unattributed inbound writes (#2967, closed by PR #8269) is listed as landed. The end-to-end content encryption work is tracked in #8278 (supersedes the closed #1968). Federation content is not end-to-end encrypted today (mTLS transport only); the end-to-end content encryption status is stated only in the [certification scope statement](docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md#certification-scope-statement-for-the-v100-ga-candidate-8262). Pointers and corrections added across `README.md`, `ROADMAP.md`, `SECURITY.md`, `docs/SECURITY.md`, `docs/compliance/honest-limitations.md`, `docs/compliance/nsa-csi-mcp-security-mapping.md`, `docs/encryption.html`, `docs/enterprise-deployment.md`, `docs/federation-identity.md`, `docs/federation.md`, `docs/production-deployment.md`, `docs/reference/ARCHITECTURE_REFERENCE.md`, `docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md`, `CHANGELOG.md`; guard `scripts/ci/tests/test_certification_scope_8262.py` (round 19: the mention views keep intra-word underscores so an escaped or emphasised identifier is still counted, rule 5 covers YAML front matter, the one-line comment pattern is anchored, the lexer reads each line in one pass (a single-pass lexer), and an unused regex is removed).
+### Security (#8472, #7302 — zip advisories resolved by the candle 0.11.1 bump)
+
+- Update `candle-core`, `candle-nn` and `candle-transformers` from 0.10.2 to
+  0.11.1, which moves the locked `zip` dependency from 7.2.0 to 9.2.2 and
+  resolves RUSTSEC-2026-0429 (`ZipArchive::extract` denial of service on a
+  symlink entry) together with the related zip advisories RUSTSEC-2026-0367,
+  RUSTSEC-2026-0368 and RUSTSEC-2026-0369. The three `.cargo/audit.toml`
+  ignores for them and the `scripts/check-zip-extract-unreachable.py` guard
+  are retired. The build-script ledger follows libc 0.2.191 and nix 0.31.3.
+  `src/` is unchanged.
+
+### Security (#4734 — pgbouncer smoke stack binds loopback and takes its password from env)
+
+- #8312: consume both smoke scripts with a strict shell subset, refuse K25–K29 and INFO-5 constructs by name, and validate decimal knee thresholds before use.
+- `infra/pgbouncer/docker-compose.yml` publishes the pooler as `127.0.0.1:6432:6432`
+  (was all interfaces) and requires `POSTGRES_PASSWORD` (was a fixed public
+  fallback); `smoke-test.sh` generates a random password when none is supplied.
+  `infra/pillar4-envelope/measure-envelope.sh` drops its fixed fallback the same way, both
+  scripts write the generated userlist owner-only (#4735), pass the password to
+  `docker exec` by variable name, and tear down loudly. The compose and password parts of the
+  original fix `aafd15ec3` (never on the chain) are re-applied by hand; its TLS, SCRAM and
+  admin-split parts are not.
+  The postgres image is pinned (`apache/age:release_PG16_1.6.0`) and the pooler runs as the
+  invoking uid (`PGBOUNCER_UID`/`PGBOUNCER_GID`, required by compose) so the 0600 userlist stays
+  readable; both scripts refuse to run as root (PgBouncer refuses uid 0).
+  Authentication is SCRAM-SHA-256 end to end (#4732 smoke path): the userlist is the role's own
+  stored SCRAM verifier, read after postgres is up; there is no md5 anywhere in the smoke stack,
+  and `pgbouncer.ini` pins `auth_type = scram-sha-256`. The userlist write removes a leftover file
+  first (umask only applies to a new file), and the postgres healthcheck probes `127.0.0.1`.
+  Guard: `scripts/ci/tests/test_pgbouncer_smoke_compose_4734.py` (no md5, root guard, parsed SQL,
+  loud teardown, trap and exit status, argv password check on every `docker exec`, `token_hex(>=16)`,
+  non-SCRAM refusal, `auth_type` pin).
+  Round 6: the compose project, container names and userlist file are per run
+  (`AI_MEMORY_SMOKE_RUN`, default date-and-pid) so concurrent smokes never recreate each other's
+  containers and a trap only removes its own project; the `[4/4]` step now asserts
+  `pool_mode = transaction` and `auth_type = scram-sha-256` from `SHOW CONFIG` and fails non-zero on a
+  mismatch; the envelope verifier refusal exits 73 (72 stays "no knee"); the pgbouncer.ini and README
+  wording now states that the pin refuses md5 entries but a plain-text entry is still accepted.
+  Round 7: the guard requires an explicit non-zero exit after every FAIL/FATAL echo and pins every
+  step marker, treats the password variable as an allowlist (the smoke refuses a pooled URL that
+  carries a password, exit 74), pins the exact refusing catch-all arms and the gitignore pattern for the
+  per-run userlist; exit code 1 is documented as also covering stack bring-up and teardown failures.
+  Rounds 8-11: a bad `AI_MEMORY_SMOKE_RUN` exits 65 (class `[a-z0-9_-]` and a 64-character bound); a
+  password-bearing pooled URL exits 74 before any password is set and before the first docker line; a
+  failed psql step now exits 1 with a FAIL line that names it (it was psql's own 3). The guard refuses
+  dump words anywhere on a code line, the compose password more than once or via env_file, a second
+  cleanup definition or trap, a negated gitignore line and a mis-anchored heredoc opener. Round 11: the
+  compose file may interpolate only `AI_MEMORY_SMOKE_RUN`, `POSTGRES_PASSWORD` (once), `PGBOUNCER_UID` and
+  `PGBOUNCER_GID`; function, cleanup and alias definitions are read after `;`, `&&`, `||`, `{`, `(` and `|`;
+  a FAIL site inside a subshell or a group closed by `|| true` is refused by a group-depth scan; both
+  script headers and READMEs carry one exit-code table and one identical set -e caveat.
+  Round 12: compose interpolation follows the escape rule (an odd dollar run before a name counts; a run of
+  three or more, YAML anchors, aliases, merge keys, `extends`, `include`, `secrets`, `configs`, `env_file` and any
+  top-level key besides `name` and `services` are refused); a definition after `then`, `do`, `else`, `elif`,
+  `time` or `!` is read; the group scan tracks loops and `case`, and refuses a closer with no opener; a trailing
+  comment cannot open a heredoc; both script headers match the exit codes their script uses.
+  Round 13: the compose scan reads the decoded YAML scalars with PyYAML (the guard fails when PyYAML is
+  absent) and refuses escapes, block scalars, folded joins, multi-line flow collections and a `$` in a quoted
+  scalar; every `docker compose` call passes `-f` of the one pinned file and `--project-directory`, and the
+  infra directory may hold no override file or `.env`; a definition after a case-pattern `)` or after
+  `if`, `while` or `until` is read; the group scan tracks `if`..`fi` and `case`..`esac`, and a group with a
+  FAIL site may be followed only by end of line, `;`, `;;`, `fi`, `done`, `esac`, `)` or `}` (round 13 also
+  accepted `&&`; round 14 removes it).
+  Round 14: a group with a FAIL site is refused when `&&` follows its closer (`done && :` ran the failure
+  inside a list) or when it sits in condition position (after `if`, `elif`, `while`, `until`, `!`, or piped
+  after `&&` or `||`), because `set -e` ignores a failure there; the decoded-YAML scan refuses any explicit
+  tag (`!!binary`, `!!str`, a verbatim or local tag) on a scalar, mapping or sequence, since compose decodes it
+  before it interpolates; every `docker ... compose` invocation is matched, a global docker flag between the
+  two words is refused, and after the pinned `-f` and `--project-directory` no further `-f`, `--file`,
+  `--project-directory`, `--env-file` or `--project-name` path may follow on the same command; the pin
+  comments now state that compose still reads a `.env` in the project directory for interpolation, which has
+  no effect because the script exports every interpolated name and the guard refuses a tracked `.env`.
+  Round 15: the group scan models shell condition state: after `if`, `elif`, `while`, `until` or `!` the
+  scanner stays in condition context until the matching `then` or `do`, across `;`, newlines, comments and
+  blank lines, and refuses a group with a FAIL site opened there; a function whose body holds a FAIL site
+  is judged at each call site, which must be in statement position, and the whole body of `psql_pooled`,
+  `need`, `now_ms` and `worker` is pinned; `measure-envelope.sh` now exits 1 when a load worker exits
+  non-zero and `psql_pooled` returns non-zero to its caller on failure; each `docker compose` command is
+  read as shell words, so no later `-f`, `--file`, `--project-directory`, `--env-file`, `--project-name`,
+  `-p` or `--profile` may follow the pin in any quoting, and the envelope directory may hold only its listed
+  files; both scripts refuse every daemon-selection variable (`DOCKER_HOST`, `DOCKER_CONTEXT`,
+  `DOCKER_CONFIG`, `DOCKER_CERT_PATH`, `DOCKER_TLS_VERIFY`, `DOCKER_API_VERSION`) and `docker context`.
+  Propagating the worker status exposed #8299: `worker()` read `${out}` in the same `local` that assigned it, so
+  under `set -u` every worker had exited at its first line since #1737 and the harness could only report no
+  knee; `bodyf` now has its own `local`, and the guard refuses a declaration that reads its own names.
+  Round 16: one quote-aware pass removes shell comments before every shell reader of the guard, so a quote
+  inside a trailing comment can no longer hide a compose call from the word pin; the envelope worker-status
+  lines are pinned exactly and every `wait` must reach a FAIL exit; and an exact group-count failure names
+  its constant and the lockstep remedy. The pass removes a comment by this rule: a `#` that begins a word
+  outside single and double quotes, heredocs, command and arithmetic substitutions, process substitutions
+  and backquotes starts a comment to the end of the line; an unterminated quote or backquote in code fails
+  closed. Round 17: a `)` that closes `$(`, `$((`, `<(` or `>(`, and a closing backquote, no longer begin a
+  word, so a `#` directly after one is text and the rest of that line stays visible to the pin readers; a
+  `)` that closes a plain subshell, an arithmetic command or a case pattern still does. Round 18: a `(`
+  opens a subshell or arithmetic-command bracket only in command position; the `(` of an array assignment
+  (`a=(`, `a+=(`), of an extglob pattern and every `(` inside `[[ ]]` is part of a word, so a `#` right
+  after its `)` is text; `case` and `esac` are keywords only in command position, an `esac` or a `)` the
+  pass cannot place fails closed, every problem names the script, line and column, and the bash agreement
+  selftest (`test_shell_comment_prepass_agrees_with_bash`) is the contract for this rule. Round 19: the
+  heredoc openers come from the pre-pass's own quote, arithmetic and parameter-expansion state (no second
+  lexer), with the full delimiter after quote removal, and a `<<` or a delimiter the pass cannot place or
+  read fails closed; the line alignment splits on newline only and refuses every Unicode or ASCII line
+  separator and a lone carriage return, naming the script, line and character column; and the two bash
+  agreement selftests (`test_shell_comment_prepass_agrees_with_bash` and
+  `test_shell_word_readers_agree_with_bash`) are the contract. Round 20: NUL bytes and C0 control
+  characters, `$(` or backquote expansions inside an unquoted heredoc body, a heredoc opened inside a
+  backquote substitution (or a body line inside a command substitution that only starts with the
+  delimiter) and invalid UTF-8 are refused by name before any reader; the redirect and group scans consume
+  the heredoc bodies of one pre-pass over the raw script text; and the shell-word problems name the line.
+  Round 21: a backslash-newline inside an unquoted heredoc body, command text stored as data (a `$(` or
+  backquote kept literal in a value that an eval-class expansion can run later) and `${var@P}` are refused
+  by name; the pre-pass line mapping and the continuation joiner are linear; and a byte-order mark is named.
+  Round 22: a parameter transformation (`${var@X}`), arithmetic on a runtime-joined value that is not a
+  number literal, a nested shell interpreter and a backslash-newline that splits a word are refused by name;
+  the linear readers are proven by a CPU-time growth ratio rather than a wall-clock budget; and a code-line
+  refusal names the raw script line.
+  Round 23: the six guarded smoke files are content-pinned, and a pin mismatch names the file and requires a
+  full review of its diff before the pin moves; `${v:-a@b}` defaults are no longer refused as
+  transformations; and measure-envelope.sh validates its numeric environment inputs as digits-only.
+### Fixed (#8291 — public docs relative links are guarded)
+
+- **Broken relative links in the public docs are repaired and guarded in CI.** `scripts/ci/tests/test_docs_relative_links_8291.py` (run by the `scripts/ci/tests` discover root) fails on any relative link in `CHANGELOG.md`, `SECURITY.md`, `README.md`, `CLAUDE.md` and `docs/security` whose target does not exist inside the checkout; markdown files that are themselves symlinks are skipped as sources; a link to a symlinked markdown file inside the checkout resolves; `..` is resolved lexically (never through a directory symlink); protocol-relative `//` targets, climbs out of the repository root, targets the operating system cannot resolve (such as an over-long name) and a trailing `/` on a file target are broken and named as such.
+  The envelope README now documents the digits-only STEP_DURATION_SECS refusal under exit 65 beside the
+  bad AI_MEMORY_SMOKE_RUN case, and a guard row keeps the README naming every exit-65 variable (#8313).
+
+### Fixed (#8301 / #8305 — the shared-namespace-claims self-test derives its ceilings and cleans up after itself)
+
+- **`scripts/check-shared-namespace-claims.sh --self-test` no longer goes red when `src/storage/migrations.rs` grows, and a killed run no longer poisons the next one.** Case 2 hardcoded the `migrations.rs` ceiling candidates (`7_440`, `7_400`); once the file outgrew them no candidate reported `PASSES` and the self-test failed for a reason unrelated to the gate. The fixture now measures the file at the base, projects the merge-result size, derives every candidate from that measurement, renders the gate's digit-group format with the same `python3` formatter the gate uses, and ties each verdict to its fixture. It aborts by name when `migrations.rs` is missing or empty, or when the `llm.rs` negative control would be a no-op. The fixture worktrees and branches are named per run (`fixture/3152-dup-v2-<pid>-<epoch>`), removed by an `EXIT`/`INT`/`TERM` trap, and `git worktree prune` runs before the first fixture, so concurrent worktrees no longer collide on the shared git directory. The gate script itself is not wired into a workflow (it is listed in `scripts/qc-allowlists/gates-not-wired.txt`); the self-test is wired through the guard `scripts/ci/tests/test_shared_namespace_claims_selftest_8301.py`, which the classify job's `unittest discover` runs, and the guard refuses any ceiling in the fixture that is not derived from the measured size.
+
+### Security (#2967 — quarantine-unattributed is shape-forced on the federating shapes)
+
+- **`AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED` now follows the `[deployment]
+  shape`.** `federated` and `hive` pin it ON when unset and refuse boot when
+  it is set non-truthy (a FLOOR); `production` pins it ON when unset, and an
+  explicit non-truthy value still refuses boot because `production` always
+  engages the `asi-hard` posture, whose no-disable floor covers this knob;
+  `singleton` and `team` keep the permissive default silently (the default is
+  listed by `ai-memory config show`, and hook-driven one-shot verbs stay
+  quiet). The shape table gains a `quarantine_unattributed` row. The shape
+  floor and the live `/sync/push` reader now share one truthiness parser
+  (`security_profile::is_truthy`, case-insensitive): before, a token such as
+  `TRUE` passed the floor and the `asi-hard` check but was read as OFF by the
+  receive path. Shape-forced over a global default flip, copying the
+  `governed_namespace_required` precedent.
+
 ### Security (#7112 — event-listener thread-safety advisory)
 
 - Update the locked `event-listener` dependency from 5.4.1 to 5.4.2 to
@@ -2685,15 +2860,6 @@ write is permission-evaluated as; see the operator note below.
   already-existing edge reports the level that is actually STORED on the row
   rather than the signature level it computed but never persisted (the write
   is an `INSERT OR IGNORE` no-op).
-- **#2988 — the recall ledger bound a NAMESPACE into the identity column.**
-  Both CLI recall paths wrote `--as-agent` (a namespace) into
-  `recall_observations.agent_id`: `src/cli/recall.rs` passed
-  `args.as_agent`, and the interactive shell passed `None`. The #1705
-  cross-agent replay guard keys on that column (`agent_id IS NULL OR agent_id
-  = ?`), so it was inert on both paths — a namespace cannot gate an identity.
-  Both now bind `resolve_read_visibility_caller()`, the same value the MCP/HTTP
-  writer stamps. `--as-agent` remains the namespace-scope visibility knob.
-
 ### Security
 
 - **#3192 — single-row `delete` wrote no `forget_tombstone` and did not crypto-erase, so every MCP `memory_delete` / HTTP DELETE / inbound federation `deletions[]` was LWW-resurrectable.** `db::delete` (`delete_inner`) now reuses the existing `tombstone_and_erase` primitive (the same helper `gc` / `size_gc` already call via `evict_tombstone_and_erase`) *inside* the caller's transaction: forget-tombstone INSERT, envelope crypto-erase + attestation, `cid_genesis` scrub, DLQ/dedup remanence purge, then DELETE. `insert_if_newer`'s G30 resurrection guard therefore sees the tombstone and drops a fresher peer re-push. Postgres `PostgresStore::delete` and `apply_remote_deletion` share one `pg_hard_delete_in_tx` so the two funnels cannot drift. A delete of a never-seen id stays a no-op with no tombstone and no `namespace_meta` sever (probe-then-write). Delete also discards undelivered federation DLQ pushes for that memory. Tombstone `signature` is NULL when no daemon keypair is present (unsigned resurrection guard); refuse-under-enforced-posture is the shared rule with #3240 and must not fork here. The MCP/CLI erasure-outbox remains best-effort + infallible (documented contract; an outbox failure still WARNs and does not fail the local delete). Distinct from #3177 (pg gc).
@@ -4161,27 +4327,6 @@ backend and missing or divergently implemented on its twin). Pinned by
   (`ai-memory bench (ubuntu-latest)`, `Regenerate bench baseline (ubuntu-latest,
   median-of-3)`) true again without a rename, so no required-context churn.
 
-- **CI moved to a self-hosted enterprise-fed fleet with a 2x2 `Check` matrix.**
-  All compute/gate jobs re-home from GitHub-hosted `ubuntu-latest`/`macos-latest`
-  onto two self-hosted runner labels — `[self-hosted, linux-fed]` (host pop-os/f2)
-  and `[self-hosted, macos-fed]` (host f1/FROSTYi) — EXCEPT the two mobile
-  cross-compile jobs (`Cross-compile (aarch64-linux-android)` / `(aarch64-apple-ios)`),
-  which stay GitHub-hosted. The `Check` job becomes a **2x2 matrix** over
-  {`linux-fed`, `macos-fed`} × {`sqlite` (default features), `enterprise-fed`
-  (`sal-postgres` against each node's always-up native pg18.6 + AGE 1.8.0 +
-  pgvector 0.8.6 tier, read from `$HOME/.ai-memory-ci-fed-url`)}. This **renames**
-  the two former required contexts `Check (ubuntu-latest)` / `Check (macos-latest)`
-  to the four `Check (linux-fed,sqlite)`, `Check (linux-fed,enterprise-fed)`,
-  `Check (macos-fed,sqlite)`, `Check (macos-fed,enterprise-fed)` — the mirror
-  `scripts/qc-allowlists/required-contexts-release.txt` is updated in lockstep and
-  branch protection must be updated to match. The `enterprise-fed` Check legs
-  absorb the old `Postgres feature gate` test run (now against the real cert tier);
-  that job is slimmed to the `sal-postgres` clippy-parity leg (name unchanged).
-  GitHub-hosted-only disk-freeing / swap / simulator-purge steps and all
-  `services: postgres:` blocks + per-PR pg image builds are removed (they would
-  delete real files on the persistent hosts; the native tier is always up).
-  JUnit-style durable test-result log artifacts are uploaded per leg.
-
 ### Fixed (data integrity: merge field-set coherence, long-tier permanence, archive identity, low-end schema guard; #2399 #2395 #2394 #2385 #2564)
 
 - **A fresh `long`-tier write that carried an `expires_at` was GC-reapable
@@ -4496,7 +4641,7 @@ this cluster does not close — the three an adversary can drive are covered.
     pull-accept path
     ([#2480](https://github.com/alphaonedev/ai-memory-mcp/issues/2480)). The
     residual limit is restated honestly: federation replicates plaintext
-    ([#1968](https://github.com/alphaonedev/ai-memory-mcp/issues/1968)), and
+    ([#1968](https://github.com/alphaonedev/ai-memory-mcp/issues/1968) (since closed, superseded by #8278)), and
     `CallerContext::for_admin(FEDERATION_CATCHUP)` still bypasses SAL
     *visibility* — the scope gate runs before it.
   - **DO runbook quorum semantics `503` -> `202`**
@@ -5240,32 +5385,6 @@ truthful.
   `mcp::tests::chunkc_forget_invalid_tier_string_silently_dropped`, and the
   "silently falls through" arm of
   `mcp::tools::list::tests::filters_by_tier`.
-- **Record-stop enforcement no longer silently degrades at the SAL layer when
-  the sqlite DB path resolves through a symlink** (e.g. the macOS
-  `/var -> /private/var` temp dir). The `SqliteStore` write-funnel gate keyed
-  the shared record-stop registry off the raw path passed to `open`, while the
-  actuator, the `db::` funnel gate, the status read and the open-time seed all
-  key off the connection's OWN resolved path (`conn.path()`, which SQLite's VFS
-  symlink-follows). When the two diverged the SAL gate read a stale RUNNING
-  entry, so a write issued under an engaged stop fell through to the deeper
-  `db::` gate and surfaced `StoreError::Backend` instead of the intended
-  `StoreError::Stopped` — a single-layer, fail-closed-ONLY degradation of the
-  SAL 503 refusal contract. The gate now caches and keys off the connection's
-  resolved path at open, restoring one source of truth across every layer.
-  Surfaced by the macOS `enterprise-fed` CI leg (`record_stop_r45_1955`); a
-  symlinked-open-path regression test pins it.
-- **The self-hosted `enterprise-fed` Check legs no longer kill a still-passing
-  sal-postgres suite at the hung-test watchdog.** The 2x2 `check` job reused the
-  sqlite-oriented 1500s per-invocation watchdog for the `enterprise-fed` legs,
-  which run the sal-postgres suite SINGLE-THREADED (`--test-threads=1`) and
-  CPU-contended by the sibling `sqlite` leg on the same self-hosted host — a
-  ~2231s measured runtime that the 1500s cap terminated mid-run (the same
-  regression the release `postgres-feature` job already fixed by raising its
-  cap to 2100s on its dedicated runner; the self-hosted leg runs both linux
-  legs on ONE host, so its ~2231s is the normal max-contention case). The
-  watchdog is now TIER-AWARE (`enterprise-fed` = 3300s, `sqlite` = 1500s) and
-  the `check` job's `timeout-minutes` is raised 45 -> 80 so the watchdog — not
-  the outer job cap — remains what fires on a genuine hang.
 ### Fixed (cross-backend parity — write funnels: archive / delete / update)
 
 A parity audit of the sqlite and postgres write funnels found four
@@ -8523,7 +8642,7 @@ the caller-origin gaps on that plane:
   (`src/tls.rs`) takes `_intermediates` and `_now` as IGNORED parameters and its whole body is
   a fingerprint comparison — PIN-ONLY, the SSH `known_hosts` model. Same page: added the
   missing honest-limitation that **federation is NOT end-to-end encrypted** (plaintext memory
-  content on the wire; [#1968](https://github.com/alphaonedev/ai-memory-mcp/issues/1968) OPEN,
+  content on the wire; [#1968](https://github.com/alphaonedev/ai-memory-mcp/issues/1968) OPEN (since closed, superseded by #8278),
   and the stated rationale for both #2448 and #2477), corrected
   `AI_MEMORY_FED_REQUIRE_WRITE_SIG` from "opt-in strict mode" to the v1.0.0 default-ON posture
   (`FED_REQUIRE_WRITE_SIG_DEFAULT = true`, #1801→#1954), and restamped the page from v0.9.0.
@@ -9127,7 +9246,7 @@ The AGE Cypher on three KG surfaces hard-coded the `related_to` relationship typ
 ### Security (federation peer URLs accepted plaintext `http://` with no flag, cert, or acknowledgement)
 
 - **A federation peer URL that is not `https://` is now REFUSED at boot, on BOTH peer-URL doors** (refs [#2477](https://github.com/alphaonedev/ai-memory-mcp/issues/2477); CONTENT DISCLOSURE; 3x3 adversarial vote, 9 lenses, option D 6/9, citing the 5-agent vote `4d3ea1c5`).
-  - **The defect.** `FederationConfig::build` formatted the raw operator `--quorum-peers` string straight into `PeerEndpoint::sync_push_url` with **no scheme validation whatsoever**; `src/federation/sync.rs` parsed the scheme only to populate a governance `NetworkRequest` action, never to require TLS. Federation replicates memory content that is **not** end-to-end encrypted (`src/encryption/mod.rs`; #1968 open), so `--quorum-peers http://peer:9077` shipped tenant memory in the clear to any on-path, DNS-position or BGP-position adversary. Meanwhile `docs/encryption.html` asserted unqualified that peer traffic "travels over mutual TLS … TLS 1.3 only (no fallback)".
+  - **The defect.** `FederationConfig::build` formatted the raw operator `--quorum-peers` string straight into `PeerEndpoint::sync_push_url` with **no scheme validation whatsoever**; `src/federation/sync.rs` parsed the scheme only to populate a governance `NetworkRequest` action, never to require TLS. Federation replicates memory content that is **not** end-to-end encrypted (`src/encryption/mod.rs`; #1968 open (since closed, superseded by #8278)), so `--quorum-peers http://peer:9077` shipped tenant memory in the clear to any on-path, DNS-position or BGP-position adversary. Meanwhile `docs/encryption.html` asserted unqualified that peer traffic "travels over mutual TLS … TLS 1.3 only (no fallback)".
   - **It was strictly weaker than a control already shipped.** #2448 built a **four-condition** opt-in ceremony for the *weaker* accept-ANY-server-cert case (`--insecure-skip-server-verify` **and** `--client-cert` **and** `--client-key` **and** an explicit falsy `AI_MEMORY_FED_REQUIRE_SERVER_VERIFY`, itself pinned by `asi-hard`). Plain `http://` needed **none** of them and disclosed strictly more. The mTLS control also cuts the other way: a peer pinning OUR client cert protects the PEER from an impostor client, not US from an impostor server.
   - **The guard is ONE validator called from BOTH doors.** `ai-memory sync-daemon --peers` (`cli::sync::build_sync_client`) is a fully independent peer-URL path that wired the #2448 ceremony but validated no scheme either — a fix scoped to `federation/peer.rs` alone would have been theatre. `tls::validate_peer_url_scheme` now gates both.
   - **Disposition.** `https://` always accepted. `http://` to a **literal** loopback host is always accepted with no hatch — the bytes never leave the kernel, dozens of this repo's own fixtures and every single-host dev mesh use `http://127.0.0.1:PORT`, and forcing a hatch-flip on all of them would train reflexive hatch use (a worse long-run posture). The loopback set is now the SSOT `tls::host_is_loopback`, shared with the inbound `tls_bind_guard` so the two cannot drift. A container-bridge hostname such as `http://alice:9077` is **not** loopback: it crosses an interceptable virtual NIC, and treating "feels local" as "is local" is the category error the control exists to prevent. Everything else — non-loopback `http://`, a foreign scheme, and a scheme-LESS `peer.example:9077` (previously accepted, then failing opaquely at request time) — is refused.
@@ -9214,7 +9333,7 @@ The AGE Cypher on three KG surfaces hard-coded the `related_to` relationship typ
 - **The security/compliance document surface now states the controls that exist, in the postures they ship in** (3x7 claims register `docs/audit/3x7-claims-register-2026-08-01.md`, items C-02 / C-04 / C-29 / C-38 / C-47 / C-48 / C-55 + §3.2 C). No code change; every replacement was verified against `release/v1.0.0` HEAD before it was written. The recurring shape being corrected is that **the code states its own limits accurately while a document asserts the opposite**, so the fix is usually to publish what the code already says.
   - **C-02 — the audit-log tail-truncation mitigation was a marker that does not exist.** `docs/security/audit-trail.md` published "periodic `CHECKPOINT.sig` markers (every `attestation_cadence_minutes`) bound rollback"; `src/audit.rs` says the marker "is **NOT** yet implemented: no emission code exists", and its only runtime effect is a one-shot operator WARN. The mitigation row is deleted and `CHECKPOINT.sig` is marked **RESERVED** in both `audit-trail.md` and `audit-schema.md`, matching the source comment. **Not an over-correction:** tail truncation of the in-DB `signed_events` chain IS detected — by the #1850 off-table forensic watermark high-water (`TruncationCheck`) — and a same-length whole-suffix rewrite by the #1873/#2202 head-hash anchor (`HeadHashCheck`). Both are now published as threat-model rows **with their honest residual bounds** (an interior / mid-suffix rewrite below the anchored row, and the up-to-63 un-anchored rows above the last watermark, are not caught in-DB; `AI_MEMORY_LOG_SINK=syslog` is the residual-closing control). The false control is replaced by the true one rather than left blank.
   - **C-38 — the SOC2 CC7.2 / FedRAMP AU-12 attestation-cadence mapping is withdrawn.** The resolver exists but has no production consumer, so `fedramp.applied = true` produced a 30-minute figure no code acts on — and `audit-trail.md`'s threat model then reused that dead cadence as its truncation defense. The cadence column is gone from both the regulatory mapping and the compliance-preset table; `retention_days` stays, because `AuditConfig::effective_retention_days` is live and consumed. A named control citation that resolves to a no-op is worse than no mapping.
-  - **C-04 — the mTLS claim in the procurement pair described the inverse of the code.** Both documents said "the sync daemon refuses to start without mTLS unless an explicit insecure flag is set". It does not: with neither flag set, `tls::select_sync_tls_mode` takes the CA-validated arm and `sync_client_identity` returns `None`, so the daemon starts with no client certificate; server-side `--mtls-allowlist` is an `Option<PathBuf>`, i.e. mTLS is opt-in on both ends, and the empty-allowlist refusal only fires once mTLS has already been chosen. Rewritten to the actual control in `honest-limitations.md` §4 and `nsa-csi-mcp-security-mapping.md` §3.4 — **while preserving what is genuinely strong**: outbound server verification is REQUIRED unless explicitly disabled (`tls::server_verify_required`, unset ⇒ required, pinned by `server_verify_required_default_on_grammar_2448`; accept-any needs four conditions, not one, and `asi-hard` pins the knob), and mTLS Layer 1 is exactly as advertised (`FingerprintAllowlistVerifier`, `client_auth_mandatory() -> true`, constant-time SHA-256(DER), rejection inside the handshake before any Axum layer). Both documents now also state that **federation replicates plaintext memory content** (`src/encryption/mod.rs`, #1968) — the guarantee tenant isolation actually rests on, and these are the documents where it belongs.
+  - **C-04 — the mTLS claim in the procurement pair described the inverse of the code.** Both documents said "the sync daemon refuses to start without mTLS unless an explicit insecure flag is set". It does not: with neither flag set, `tls::select_sync_tls_mode` takes the CA-validated arm and `sync_client_identity` returns `None`, so the daemon starts with no client certificate; server-side `--mtls-allowlist` is an `Option<PathBuf>`, i.e. mTLS is opt-in on both ends, and the empty-allowlist refusal only fires once mTLS has already been chosen. Rewritten to the actual control in `honest-limitations.md` §4 and `nsa-csi-mcp-security-mapping.md` §3.4 — **while preserving what is genuinely strong**: outbound server verification is REQUIRED unless explicitly disabled (`tls::server_verify_required`, unset ⇒ required, pinned by `server_verify_required_default_on_grammar_2448`; accept-any needs four conditions, not one, and `asi-hard` pins the knob), and mTLS Layer 1 is exactly as advertised (`FingerprintAllowlistVerifier`, `client_auth_mandatory() -> true`, constant-time SHA-256(DER), rejection inside the handshake before any Axum layer). Both documents now also state that **federation replicates plaintext memory content** (`src/encryption/mod.rs`, #1968 (since closed, superseded by #8278)) — the guarantee tenant isolation actually rests on, and these are the documents where it belongs.
   - **C-29 — the two compliance pages contradicted each other about H1, in opposite directions; both moved.** The mapping claimed NSA concern (a) access control flatly `structurally_addressed` while the assessment page on the same landing page listed H1 (High, cross-tenant IDOR via spoofable `X-Agent-Id`) as unremediated post-#2044/#2129/#2154. Verified state: the identity-binding control shipped, and `http_attested_identity_mode` defaults to `advisory` — inert with zero per-agent keys enrolled. Concern (a) is now published as *structurally addressed under `enforce` with per-agent keys enrolled; the shipped default is finding H1*, quoting the CHANGELOG verbatim, and the assessment page gains a **Remediation status** section saying the same thing from the other side. The landing page's "10 of 10 concerns" headline moved with it — a tally must not rest on a corrected row.
   - **C-47 — the published audit `action` vocabulary did not match the wire.** `AuditAction` has **no** `Search`/`List`/`Get` variants (those MCP tools all emit `recall`) and has a 14th, `CaptureLag` (`"capture_lag"`), which a SIEM built to the published 13-value enum meets on the wire and cannot classify. Both documents now publish the shipped 14 with exact wire strings. Two further facts a SIEM integrator needs, found while enumerating: `export` and `import` are declared variants with **no production emitter** at v1.0.0, and read-access events come from the **MCP stdio surface only** — the HTTP read routes emit nothing to this file.
   - **C-48 — the procurement pair's version stamp was stale by 31 schema versions.** Both documents were stamped "v0.7.0 (sqlite + postgres schema v57, lockstep)" and cited "Cargo.lock (~5,479 lines)" — on the stamp a reviewer uses to decide whether the assessment applies at all. Re-stamped to **v1.0.0 / schema v88**, `Cargo.lock` re-measured at **5,747** lines, and §3.9's wire-surface counts corrected from the v0.7.0 figures (89 routes / 74 tools / 82 / 80) to the pinned v1.0.0 SSOT (**94 route registrations over 80 unique paths, 103 MCP entries, 89 CLI subcommands default / 91 under `sal`**).
@@ -9229,7 +9348,7 @@ The AGE Cypher on three KG surfaces hard-coded the `related_to` relationship typ
   - **`docs/enterprise-deployment.md` §9.4 no longer recommends one cluster per tenant.** That recommendation contradicted §8.8 of the same document ("if subsets of peers should NOT see each other's data, the swarm shape is wrong"). Recommending a topology in one file while disclaiming its safety in another is a trap, not disclosure.
   - **§11.1's 14-cell ops/s capacity table is REMOVED, not annotated.** Eleven of fourteen cells had no producer in `benches/` at all, and the entire Postgres+AGE column came from `benches/age_vs_cte.rs`, which `exit 0`s unless `AI_MEMORY_TEST_AGE_URL` is exported. An unproduced number is not data, and this is the section a Fortune 500 capacity-plans from. Replaced with a per-bench statement of what the seven in-tree benches actually measure, and a pointer to the latency budgets — which are real and mechanically pinned — plus the `ai-memory bench --scale 10000 --json` command to measure throughput on your own hardware.
   - **§11.2 now names the 100k vector-index cap.** `hnsw::DEFAULT_MAX_ENTRIES = 100_000` and the index **evicts oldest** past it, so a deployment sized at 1M–5M memories on SQLite got semantic recall silently truncated to the newest ~100k rows. Neither capacity doc named `AI_MEMORY_VECTOR_INDEX_CAPACITY`; both the knob and the `AI_MEMORY_VECTOR_INDEX_HARD_FAIL` loud-refusal alternative are now documented at the point of sizing.
-  - **§14.6 now discloses that at-rest encryption is not end-to-end across federation** (refs [#1968](https://github.com/alphaonedev/ai-memory-mcp/issues/1968)). `federation.md` has always said so; the 1700-line document an architect reads as their compliance gate did not.
+  - **§14.6 now discloses that at-rest encryption is not end-to-end across federation** (refs [#1968](https://github.com/alphaonedev/ai-memory-mcp/issues/1968) (since closed, superseded by #8278)). `federation.md` has always said so; the 1700-line document an architect reads as their compliance gate did not.
   - **§7.4 now states that data residency is enforced in ONE direction.** The serve direction (`/sync/since`) is default-deny before any row crosses the wire; the accept direction is ungated. "What leaves your region is gated; what arrives is not."
   - **§6.6's federation-push-DLQ "not lost" is corrected to "durably queued, replayed by position"** (refs [#2442](https://github.com/alphaonedev/ai-memory-mcp/issues/2442)). The DLQ key is a positional index (`peer-{i}`, URL dropped from identity) and replay resolves by `find(|p| p.id == row.peer_id)`, so removing one peer reindexes every id above it and the queued payload is delivered to an unintended host — no counter, no error.
   - **The three-concurrent-auth-layers summary now agrees with `federation.md`.** Under an enforced mTLS posture `/api/v1/sync/*` bypasses the api-key layer by design ([#702](https://github.com/alphaonedev/ai-memory-mcp/issues/702)); the two documents previously contradicted each other within one published surface.
@@ -9525,7 +9644,7 @@ The AGE Cypher on three KG surfaces hard-coded the `related_to` relationship typ
 
 ### Fixed (federation outbound TLS lane, L-FED-OUTBOUND)
 
-- **`--insecure-skip-server-verify` is refused by default — outbound federation TLS must now verify the peer's SERVER certificate** ([#2448](https://github.com/alphaonedev/ai-memory-mcp/issues/2448), SECURITY / confidentiality; **BREAKING** for anyone passing that flag). Federation replicates **plaintext** memory content — it is NOT end-to-end encrypted (`src/encryption/mod.rs`, [#1968](https://github.com/alphaonedev/ai-memory-mcp/issues/1968) is open with zero implementation) — so an unverified peer *server* certificate is a direct content-disclosure surface: an adversary in DNS or BGP position presents any certificate, the handshake completes, and this node pushes it every memory. The compensating control that posture leaned on cuts the **other way**: the peer fingerprint-pinning *our* client cert via `--mtls-allowlist` protects the PEER from an impostor CLIENT; it does nothing to protect US from an impostor SERVER, and that is the direction governing confidentiality. **The issue's headline premise was stale and is corrected here rather than repeated:** the daemon quorum client (`federation/peer.rs`) has always CA-validated, the `ai-memory sync` CLI has CA-validated since [#1794](https://github.com/alphaonedev/ai-memory-mcp/issues/1794), and the cited `src/tls.rs:1034` `DangerousAnyServerVerifier` site sat inside `tls::build_rustls_client_config`, a **public but production-DEAD** builder with zero callers outside tests. Two real residuals remained. **(1)** The accept-any disposition was a single flag away, with no env-level or posture-level way to forbid it. New `AI_MEMORY_FED_REQUIRE_SERVER_VERIFY` (env-table row #148) defaults **ON** using the house `env_flag_default_on` grammar (the `AI_MEMORY_FED_REQUIRE_WRITE_SIG` #94 / `_CHECKPOINT_SIG` #125 / `_POLICY_CURRENT` #132 shape), with an explicit falsy token as the staged-rollout escape hatch. It is **strictly additive, never a cheaper path**: accept-any still ALSO requires the flag plus BOTH `--client-cert` and `--client-key` — four conditions, not one — so the env var raises the bar rather than opening a second door. The refusal lives in the **pure** `tls::select_sync_tls_mode` (now `-> Result<SyncTlsMode>`) rather than at the call site, so it is *structural*: no present or future caller can resolve `AcceptAny` without explicitly threading `false` through. Server-cert PINNING still wins outright — a pinned host is verified by SHA-256(DER), so the flag alongside an active pin map is a no-op, not a refusal. The refusal message names the SECURE remedies first (`--ca-cert`, `AI_MEMORY_FED_PEER_FINGERPRINTS`) and the escape hatch last, pinned by an ordering assertion, so an operator hitting it is steered to fix the posture rather than to disable the control. **(2)** The `asi-hard` PROCUREMENT posture pinned **zero** network access-control knobs — its 14-knob SSOT was 100% crypto/attestation/durability, so an operator deploying `docs/deploy/asi-hard.env` verbatim could still run `--insecure-skip-server-verify`. `AI_MEMORY_FED_REQUIRE_SERVER_VERIFY` is now pinned at floor `1` in `security_profile::KNOBS` (14 → 15), which also makes the new escape hatch **itself no-disable** under `asi-hard`: a falsy override refuses boot. **`tls::build_rustls_client_config` is DELETED**, not deprecated — pre-GA is the only free window to drop a `pub fn`, and `#[deprecated]` emits a warning while leaving the accept-any arm live and callable by anyone who ignores it; `tests/mtls_nodelay_acceptor.rs` ports to a local builder with **every assertion byte-identical** (construction only, so the mTLS client-cert-pinning contract that file exists to pin is exercised exactly as before). `cli::sync::build_sync_client` was extracted so the TLS posture is constructible without entering the daemon's infinite sync loop. **Migration:** pass `--ca-cert <peer-ca.pem>` for a self-signed / private-CA peer, or set `AI_MEMORY_FED_PEER_FINGERPRINTS` to pin the peer's server cert by SHA-256 (strongest); only if you must keep the insecure posture for a rollout window, set `AI_MEMORY_FED_REQUIRE_SERVER_VERIFY=0` — settable BEFORE the upgrade, and refused under `asi-hard`. R-203: `tests/fed_require_server_verify_2448.rs::insecure_skip_server_verify_is_refused_by_default_2448` drives the production `cli::sync::run_daemon` (signature unchanged, so it compiles at both commits) and FAILS at parent `6d7b59d9` — the daemon accepts the insecure posture and enters its sync loop until the timeout elapses — and PASSES after. Three siblings drive REAL rustls handshakes against a self-signed fixture peer, proving the refused disposition genuinely WAS forged-certificate acceptance and that the CA-validated default rejects that same certificate. **Doc truth-fixes shipped alongside** (the docs described a control that no longer matched the code): `docs/ADMIN_GUIDE.md`'s issue-#232 section flatly asserted `sync-daemon` "accepts ANY server cert" without `--client-cert` — false since #1794 and now replaced with a posture table; CLAUDE.md env row #85, `docs/federation.md` and `docs/federation-identity.md` each claimed the `ai-memory sync` CLI keeps `UnpinnedHostPolicy::AcceptAny`; `docs/federation-identity.md` also still listed `AI_MEMORY_FED_REQUIRE_WRITE_SIG` as "default `0` permissive" after #1954 flipped it; and `src/tls.rs` twice pointed operators at `docs/runbook/federation-tls.md`, **a file that does not exist**. Design resolved by a 3x3 adversarial vote (9 lenses, 6-3), citing `5-agent vote (4d3ea1c5)`. No new MCP tool / HTTP route / CLI subcommand / DB migration / schema-version bump — no SSOT-count move.
+- **`--insecure-skip-server-verify` is refused by default — outbound federation TLS must now verify the peer's SERVER certificate** ([#2448](https://github.com/alphaonedev/ai-memory-mcp/issues/2448), SECURITY / confidentiality; **BREAKING** for anyone passing that flag). Federation replicates **plaintext** memory content — it is NOT end-to-end encrypted (`src/encryption/mod.rs`, [#1968](https://github.com/alphaonedev/ai-memory-mcp/issues/1968) is open with zero implementation (since closed, superseded by #8278)) — so an unverified peer *server* certificate is a direct content-disclosure surface: an adversary in DNS or BGP position presents any certificate, the handshake completes, and this node pushes it every memory. The compensating control that posture leaned on cuts the **other way**: the peer fingerprint-pinning *our* client cert via `--mtls-allowlist` protects the PEER from an impostor CLIENT; it does nothing to protect US from an impostor SERVER, and that is the direction governing confidentiality. **The issue's headline premise was stale and is corrected here rather than repeated:** the daemon quorum client (`federation/peer.rs`) has always CA-validated, the `ai-memory sync` CLI has CA-validated since [#1794](https://github.com/alphaonedev/ai-memory-mcp/issues/1794), and the cited `src/tls.rs:1034` `DangerousAnyServerVerifier` site sat inside `tls::build_rustls_client_config`, a **public but production-DEAD** builder with zero callers outside tests. Two real residuals remained. **(1)** The accept-any disposition was a single flag away, with no env-level or posture-level way to forbid it. New `AI_MEMORY_FED_REQUIRE_SERVER_VERIFY` (env-table row #148) defaults **ON** using the house `env_flag_default_on` grammar (the `AI_MEMORY_FED_REQUIRE_WRITE_SIG` #94 / `_CHECKPOINT_SIG` #125 / `_POLICY_CURRENT` #132 shape), with an explicit falsy token as the staged-rollout escape hatch. It is **strictly additive, never a cheaper path**: accept-any still ALSO requires the flag plus BOTH `--client-cert` and `--client-key` — four conditions, not one — so the env var raises the bar rather than opening a second door. The refusal lives in the **pure** `tls::select_sync_tls_mode` (now `-> Result<SyncTlsMode>`) rather than at the call site, so it is *structural*: no present or future caller can resolve `AcceptAny` without explicitly threading `false` through. Server-cert PINNING still wins outright — a pinned host is verified by SHA-256(DER), so the flag alongside an active pin map is a no-op, not a refusal. The refusal message names the SECURE remedies first (`--ca-cert`, `AI_MEMORY_FED_PEER_FINGERPRINTS`) and the escape hatch last, pinned by an ordering assertion, so an operator hitting it is steered to fix the posture rather than to disable the control. **(2)** The `asi-hard` PROCUREMENT posture pinned **zero** network access-control knobs — its 14-knob SSOT was 100% crypto/attestation/durability, so an operator deploying `docs/deploy/asi-hard.env` verbatim could still run `--insecure-skip-server-verify`. `AI_MEMORY_FED_REQUIRE_SERVER_VERIFY` is now pinned at floor `1` in `security_profile::KNOBS` (14 → 15), which also makes the new escape hatch **itself no-disable** under `asi-hard`: a falsy override refuses boot. **`tls::build_rustls_client_config` is DELETED**, not deprecated — pre-GA is the only free window to drop a `pub fn`, and `#[deprecated]` emits a warning while leaving the accept-any arm live and callable by anyone who ignores it; `tests/mtls_nodelay_acceptor.rs` ports to a local builder with **every assertion byte-identical** (construction only, so the mTLS client-cert-pinning contract that file exists to pin is exercised exactly as before). `cli::sync::build_sync_client` was extracted so the TLS posture is constructible without entering the daemon's infinite sync loop. **Migration:** pass `--ca-cert <peer-ca.pem>` for a self-signed / private-CA peer, or set `AI_MEMORY_FED_PEER_FINGERPRINTS` to pin the peer's server cert by SHA-256 (strongest); only if you must keep the insecure posture for a rollout window, set `AI_MEMORY_FED_REQUIRE_SERVER_VERIFY=0` — settable BEFORE the upgrade, and refused under `asi-hard`. R-203: `tests/fed_require_server_verify_2448.rs::insecure_skip_server_verify_is_refused_by_default_2448` drives the production `cli::sync::run_daemon` (signature unchanged, so it compiles at both commits) and FAILS at parent `6d7b59d9` — the daemon accepts the insecure posture and enters its sync loop until the timeout elapses — and PASSES after. Three siblings drive REAL rustls handshakes against a self-signed fixture peer, proving the refused disposition genuinely WAS forged-certificate acceptance and that the CA-validated default rejects that same certificate. **Doc truth-fixes shipped alongside** (the docs described a control that no longer matched the code): `docs/ADMIN_GUIDE.md`'s issue-#232 section flatly asserted `sync-daemon` "accepts ANY server cert" without `--client-cert` — false since #1794 and now replaced with a posture table; CLAUDE.md env row #85, `docs/federation.md` and `docs/federation-identity.md` each claimed the `ai-memory sync` CLI keeps `UnpinnedHostPolicy::AcceptAny`; `docs/federation-identity.md` also still listed `AI_MEMORY_FED_REQUIRE_WRITE_SIG` as "default `0` permissive" after #1954 flipped it; and `src/tls.rs` twice pointed operators at `docs/runbook/federation-tls.md`, **a file that does not exist**. Design resolved by a 3x3 adversarial vote (9 lenses, 6-3), citing `5-agent vote (4d3ea1c5)`. No new MCP tool / HTTP route / CLI subcommand / DB migration / schema-version bump — no SSOT-count move.
 
 ### Security (federation write-lane confinement, GA blocker)
 
@@ -9619,7 +9738,7 @@ Six ROADMAP/docstring claims that advertised something as SHIPPED or DEFAULT whi
 - **OTLP reconciled — DEFERRED, not "shipping at v1.0"** ([#2407](https://github.com/alphaonedev/ai-memory-mcp/issues/2407), N27). §11.5 promised "an OTLP exporter shipping at v1.0 per §11.6" while §11.6's own v1.0.0 disposition ruling lists OpenTelemetry standardization as zero-implementation and DEFERRED to v1.x. `grep -ri 'otlp\|opentelemetry' src/ Cargo.toml` = 0 hits. §11.5, the §11.6 bullet, and `docs/telemetry.md` (§3 sink list + §6, which carried the same overclaim in the present tense at a shipped v1.0.0) are corrected in lockstep.
 - **Decorrelation enforce-as-default corrected to Advisory** ([#2408](https://github.com/alphaonedev/ai-memory-mcp/issues/2408), N28). §24, §25.6 (the *binding* claims-discipline list) and §26.2 presented enforce-as-default as the v1.0 state. [#1952](https://github.com/alphaonedev/ai-memory-mcp/issues/1952) flipped the compiled default **Off→Advisory**, not Off→Enforce (`src/config.rs:5476` `reflect_decorrelation_mode()` → `unwrap_or_default()` → `ReflectDecorrelationMode::Advisory`; `src/config.rs:4492-4494` already scoped enforce-as-default to v1.x). Claiming a refusal posture the binary lacks is the governance-overclaim class §25.6 exists to prevent. #1952 is also now recorded in ROADMAP (§27 Gate 1′) with its adjudicated landed scope.
 - **ROADMAP §9.7 tool-count attribution fixed** ([#2409](https://github.com/alphaonedev/ai-memory-mcp/issues/2409), N29 — the residual beyond #2361/PR #2363, which already fixed `CLAUDE.md:279` + added the gate's attribution rule). §9.7's header read "advanced through v0.8.0 GA" while carrying v1.0.0 counts, and attributed **103** to the v0.8.0 baseline, which shipped **100**. Per-release history is now explicit and cited: 74 (v0.7.0) → 100/99 (v0.8.0) → 101/100 (v0.9.0) → 103/102 (v1.0.0, `Profile::full().expected_tool_count()`).
-- **§11.6 E2E federation encryption placed in the DEFERRED ledger** ([#2411](https://github.com/alphaonedev/ai-memory-mcp/issues/2411), N31). The item appeared in NEITHER the landed nor the deferred set — invisible to release accounting and to operators asking whether federated memory CONTENT is E2E-protected. It is not: v1.0.0 ships transport mTLS plus optional **per-node at-rest** encryption, and `src/encryption/mod.rs:4-16` says so explicitly ("**NOT end-to-end across federation (#1809)** … the receiving peer re-seals under its own per-node key, so a federated peer holds plaintext transiently at apply time"). The ruling's "Three items" becomes "Four", tracking [#1968](https://github.com/alphaonedev/ai-memory-mcp/issues/1968) (OPEN); §25.3's "F-53/#1809 federation E2E" pointer is corrected in lockstep (#1809 was the CLOSED docs-drift fix, not the feature carrier).
+- **§11.6 E2E federation encryption placed in the DEFERRED ledger** ([#2411](https://github.com/alphaonedev/ai-memory-mcp/issues/2411), N31). The item appeared in NEITHER the landed nor the deferred set — invisible to release accounting and to operators asking whether federated memory CONTENT is E2E-protected. It is not: v1.0.0 ships transport mTLS plus optional **per-node at-rest** encryption, and `src/encryption/mod.rs:4-16` says so explicitly ("**NOT end-to-end across federation (#1809)** … the receiving peer re-seals under its own per-node key, so a federated peer holds plaintext transiently at apply time"). The ruling's "Three items" becomes "Four", tracking [#1968](https://github.com/alphaonedev/ai-memory-mcp/issues/1968) (OPEN); §25.3's "F-53/#1809 federation E2E" pointer is corrected in lockstep (#1809 was the CLOSED docs-drift fix, not the feature carrier). (Superseded by #8278 on 2026-10-28; #1968 closed; E2E federation content encryption is in v1.0.0 GA scope, not live until #8278 lands.)
 
 ### Documentation (CERT GATE 2 — release-attestation surface: `docs/v1.0.0/release-notes.md` + this file's version-heading structure)
 
@@ -15265,7 +15384,7 @@ alpha.1 will be **yanked from crates.io** once alpha.2 publishes successfully.
 First cut of the v0.6.0 release train. Integration branch for Phase 1 tasks 1.3–1.12
 plus the already-landed foundation work (1.1, 1.2). Pre-release; API is not yet stable.
 Successive alphas will be tagged at each track completion (A/B/C/D per
-[docs/PHASE-1.md](docs/PHASE-1.md) §Dependency Graph).
+the former `docs/PHASE-1.md` §Dependency Graph, removed in 150377c5d).
 
 ### Added — Task 1.1 (schema metadata foundation)
 

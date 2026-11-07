@@ -3,13 +3,13 @@
 # ---- Build stage ----
 # Pin to bookworm so the produced binary's glibc matches the runtime
 # stage (debian:bookworm-slim, glibc 2.36). Without the explicit
-# bookworm tag, rust:1.98-slim resolves to a trixie-based image
+# bookworm tag, rust:1.99-slim resolves to a trixie-based image
 # (glibc 2.41) and the binary fails at startup with
 # `version GLIBC_2.39 not found` — caught by the dockerfile-validate
 # CI job (PR #465 retrospective; v0.6.5 bake).
-# 1.98-slim-bookworm matches the rust-toolchain.toml dev/CI pin (1.98.0)
+# 1.99-slim-bookworm tracks the rust-toolchain.toml dev/CI pin (1.99.1)
 # so the shipped binary is built with the same compiler as CI.
-FROM rust:1.98-slim-bookworm AS builder
+FROM rust:1.99-slim-bookworm AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev build-essential && rm -rf /var/lib/apt/lists/*
 
@@ -84,6 +84,11 @@ VOLUME /data
 EXPOSE 9077
 
 USER aimem
+
+# #8193: `docker stop` sends this; serve drains and exits 0 on SIGTERM exactly
+# as on SIGINT (run it with `docker stop -t 90` / `stop_grace_period: 90s`,
+# the 90 s budget in docs/ADMIN_GUIDE.md; the Docker default is 10 s).
+STOPSIGNAL SIGTERM
 
 ENTRYPOINT ["ai-memory"]
 CMD ["serve", "--host", "0.0.0.0"]

@@ -6,7 +6,7 @@ layout: doc
 **Date:** 2026-04-30
 **Base SHA:** `d974112abbb56b2a036fcc32a15aebe101ea5efa` (release/v0.6.3.1, tip after all 8 PRs merged)
 **Branch:** `release/v0.6.3.1-issue-487-pr9c-e2e-smoke`
-**Binary under test:** `/Users/fate/ai-memory-mcp/.claude/worktrees/agent-a2594d69f868c3983/target/release/ai-memory` (built by `cargo build --release --bin ai-memory` on this branch — NOT the host's `/opt/homebrew/bin/ai-memory` symlink)
+**Binary under test:** `<home>/ai-memory-mcp/.claude/worktrees/agent-a2594d69f868c3983/target/release/ai-memory` (built by `cargo build --release --bin ai-memory` on this branch — NOT the host's `/opt/homebrew/bin/ai-memory` symlink)
 **Binary version (self-reported):** `ai-memory 0.6.3+patch.1`
 **Host platform:** Darwin 25.3.0 arm64 (macOS 26.3.1)
 **Workspace tempdir:** `/tmp/audit-c-smoke-work/` (all DBs, settings.json fixtures, fake `$HOME` trees, and audit/log directories live under this root — the host's real `~/.claude/ai-memory.db` and `~/.claude/settings.json` were never touched).

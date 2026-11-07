@@ -1144,7 +1144,7 @@ pub struct ServeArgs {
     #[arg(long, requires = "tls_cert")]
     pub mtls_allowlist: Option<PathBuf>,
     /// Seconds to wait for in-flight requests to complete on graceful
-    /// shutdown (SIGINT). Default 30. Bumped from 10 in v0.6.0 because
+    /// shutdown (SIGINT or SIGTERM). Default 30. Bumped from 10 in v0.6.0 because
     /// large `/sync/push` batches can take longer than 10s under load
     /// (red-team #233).
     #[arg(long, default_value_t = 30)]
@@ -1201,6 +1201,12 @@ pub struct ServeArgs {
     /// hostname change. Unset = keep the hostname default.
     #[arg(long)]
     pub federation_identity: Option<String>,
+    /// #8357 — validate the mTLS certificate-to-agent binding configuration
+    /// (`AI_MEMORY_MTLS_AGENT_BINDING`, `AI_MEMORY_MTLS_AGENT_BINDING_MAP`)
+    /// against `--mtls-allowlist`, print the parsed map as JSON and exit
+    /// without starting the daemon. A bad configuration exits non-zero.
+    #[arg(long)]
+    pub check: bool,
 
     // -------- v0.7.0 Wave-3 — adapter selection --------------------
     /// v0.7.0 Wave-3 — full SAL store URL. When set, the daemon binds
@@ -7973,6 +7979,24 @@ pub async fn bootstrap_serve(
         );
     }
 
+    // #8494 — the header-trust opt-in also re-admits a claimed admin to the
+    // bootstrap pubkey-bind routes (a claimed header can then bind a key to
+    // any agent). Classified operator-advisory in ARCHITECTURE_REFERENCE; the
+    // boot banner names it so it cannot be enabled silently.
+    if !app_state.admin_agent_ids.is_empty()
+        && crate::handlers::admin_role::admin_header_trust_enabled()
+    {
+        tracing::warn!(
+            "{}=1 with [admin].agent_ids configured: a CLAIMED admin X-Agent-Id is trusted, \
+             including on PUT /api/v1/agents/{{id}}/pubkey and POST /api/v1/agents/{{id}}/api-key[/revoke] (bootstrap key bind #8494, api-key mint/revoke #8535). Without \
+             this opt-in the bind requires the admin's enrolled per-agent api key. The opt-in is the \
+             bootstrap path only, while this daemon's enrolled registry is empty (at bootstrap, or after every key is revoked): once ANY per-agent api key is enrolled it is IGNORED on those \
+             credential routes in every identity mode (#8574), so only a key-bound admin can change \
+             credentials",
+            crate::handlers::admin_role::ENV_ADMIN_HEADER_TRUST,
+        );
+    }
+
     // #1775 — boot WARN when archive_on_gc is explicitly false (the GC
     // sweep + memory_forget become permanent hard-delete). One-shot via
     // an internal `std::sync::Once`; safe to call on both serve + mcp boot.
@@ -8108,6 +8132,12 @@ fn classify_server_failure(error: anyhow::Error) -> anyhow::Error {
 #[allow(clippy::too_many_lines)]
 pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) -> Result<()> {
     init_tracing();
+    if args.check {
+        let report =
+            crate::mtls_agent_binding::serve_check_report(args.mtls_allowlist.as_deref()).await?;
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
 
     let mut bootstrap = match bootstrap_serve(&db_path, &args, app_config).await {
         Ok(bootstrap) => bootstrap,
@@ -8262,8 +8292,17 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
     // so refusal rows submitted during graceful shutdown could be lost.
     let checkpoint_state = bootstrap.db_state.clone();
     let drain_metrics = bootstrap.deferred_audit_metrics.clone();
+    // #8193: SIGINT and SIGTERM (unix) share one graceful path; a failed
+    // registration is logged and parked, never read as a received stop.
+    let mut stop = crate::stop_signal::StopListener::install();
+    // #8193 N2: remember when the stop signal arrived, so the log after the
+    // server returns can tell a real drain from a cut at the grace budget.
+    let signalled_at = Arc::new(std::sync::OnceLock::<std::time::Instant>::new());
+    let signalled_at_for_shutdown = Arc::clone(&signalled_at);
+    let shutdown_grace_secs = args.shutdown_grace_secs;
     let shutdown = async move {
-        let _ = tokio::signal::ctrl_c().await;
+        stop.wait().await;
+        let _ = signalled_at_for_shutdown.set(std::time::Instant::now());
         tracing::info!("shutting down — draining deferred-audit queue then checkpointing WAL");
     };
     let api_key_state = bootstrap.api_key_state;
@@ -8303,12 +8342,16 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
                 );
                 tls::load_rustls_config(cert, key).await?
             };
+            // #8357 — certificate-to-agent binding; refuses boot on a bad map
+            // or a map without a client-certificate allowlist.
+            let agent_table =
+                crate::mtls_agent_binding::boot_from_env(args.mtls_allowlist.as_deref()).await?;
             let app = crate::build_router_with_timeout(api_key_state, app_state, request_timeout);
             tracing::info!("ai-memory listening on https://{addr}");
             let socket_addr: std::net::SocketAddr = addr.parse()?;
             // axum-server doesn't have a direct graceful-shutdown on the
             // TLS builder yet; spawn the signal listener on the Handle
-            // instead so ctrl_c triggers a graceful shutdown. Window is
+            // instead so SIGINT and SIGTERM (unix) trigger a graceful shutdown. Window is
             // operator-configurable via --shutdown-grace-secs (default 30,
             // bumped from 10 in v0.6.0 — red-team #233).
             let grace = std::time::Duration::from_secs(args.shutdown_grace_secs);
@@ -8434,16 +8477,19 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
             ) {
                 tracing::warn!(target: "federation::attestation", "{warning}");
             }
-            if let Some(bindings) = cert_peer_bindings {
+            if let Some(bindings) = &cert_peer_bindings {
                 tracing::info!(
                     bound_fingerprints = bindings.len(),
                     "mTLS cert↔x-peer-id binding active (#2045 L6); posture: {:?}",
                     tls::cert_peer_binding_mode()
                 );
+            }
+            if cert_peer_bindings.is_some() || agent_table.is_some() {
                 axum_server::bind(socket_addr)
-                    .acceptor(tls::serve_rustls_acceptor_with_peer_binding(
+                    .acceptor(tls::serve_rustls_acceptor_with_bindings(
                         &tls_config,
-                        bindings,
+                        cert_peer_bindings,
+                        agent_table,
                     ))
                     .handle(handle)
                     .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
@@ -8459,6 +8505,19 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
         Ok(())
     }
     .await;
+    if server_result.is_ok() {
+        // #8193 N2: axum-server returns Ok after a drain AND after a cut at
+        // the grace budget, so the elapsed time picks the text.
+        let elapsed = signalled_at.get().map_or(Duration::ZERO, |at| at.elapsed());
+        let outcome =
+            crate::stop_signal::drain_outcome(elapsed, Duration::from_secs(shutdown_grace_secs));
+        let text = outcome.log_text(shutdown_grace_secs);
+        if outcome == crate::stop_signal::DrainOutcome::Drained {
+            tracing::info!("{text}");
+        } else {
+            tracing::warn!("{text}");
+        }
+    }
     bootstrap.task_handles.extend(
         server_aux_tasks
             .lock()
@@ -8591,7 +8650,10 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
 pub async fn shutdown_witness_flush_and_checkpoint(db_state: &Db) -> Result<()> {
     let lock = db_state.lock().await;
     crate::signed_events::try_force_emit_audit_head_witness(&lock.0)?;
-    db::checkpoint(&lock.0)
+    tracing::info!("final witness flushed (a no-op when no witness key is enrolled)");
+    db::checkpoint(&lock.0)?;
+    tracing::info!("final WAL checkpoint complete");
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -10298,6 +10360,7 @@ mod tests {
             quorum_ca_cert: None,
             catchup_interval_secs: 0,
             federation_identity: None,
+            check: false,
             #[cfg(feature = "sal")]
             store_url: None,
         }

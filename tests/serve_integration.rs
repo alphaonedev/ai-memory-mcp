@@ -20,233 +20,29 @@
 //! the listener so the daemon can re-bind. This has a small TOCTOU race
 //! window but is the standard pattern across Rust integration suites.
 
-use std::io::{BufRead, BufReader};
-use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
 
 mod common;
-use common::free_port;
+#[cfg(unix)]
+use ai_memory::stop_signal::DrainOutcome;
+use common::tls_serve::{READINESS_POLL_INTERVAL, ServeChild};
 
-// CI's `Per-Module Coverage Thresholds` job runs the test binary under
-// `cargo llvm-cov` instrumentation, which inflates startup time by 3-5x. 60s gives
-// enough headroom on every supported CI surface (Linux/macOS/Windows)
-// regardless of instrumentation overhead.
-const SPAWN_TIMEOUT: Duration = Duration::from_mins(1);
-
-/// Number of times `spawn_serve` re-rolls the ephemeral port when the
-/// daemon child loses the `free_port()` TOCTOU race and exits with a
-/// bind error before `/health` comes up. The window is tiny but real
-/// under full-suite concurrency (many daemon-spawning tests bind
-/// ephemeral ports at once), so we re-roll on a collision rather than
-/// fail the suite on an environmental flake. A genuine startup crash
-/// carries different stderr and is surfaced immediately, never retried.
-const SPAWN_BIND_RETRY_ATTEMPTS: usize = 5;
-
-/// Substring the daemon's `bind` error carries on an ephemeral-port
-/// collision — `std::io::Error` for `EADDRINUSE` renders as this on both
-/// Linux and macOS. Used to tell a retryable port race apart from a real
-/// startup failure so retries never mask a genuine crash.
-const BIND_IN_USE_MARKER: &str = "Address already in use";
-
-/// Poll interval while waiting for the spawned daemon's `/health` to come
-/// up (and for an early-exit child to surface).
-const READINESS_POLL_INTERVAL: Duration = Duration::from_millis(100);
-
-/// Per-request timeout for the readiness `/health` probe.
-const READINESS_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
-
-/// Why a single `try_spawn_serve_once` attempt failed. `BindRace` is the
-/// only retryable variant; the others are surfaced to the caller with the
-/// child's captured stderr for diagnosis.
-enum SpawnFailure {
-    /// Child exited before readiness and its stderr names an in-use port —
-    /// it lost the `free_port()` TOCTOU race. Safe to retry on a new port.
-    BindRace { stderr: String },
-    /// Child exited before readiness for some other reason — a real
-    /// startup failure. Carries exit status + stderr for the panic.
-    Crashed {
-        status: std::process::ExitStatus,
-        stderr: String,
-    },
-    /// Child stayed up but `/health` never returned 200 within
-    /// [`SPAWN_TIMEOUT`].
-    NeverReady { stderr: String },
-}
-
-/// RAII guard for the spawned daemon. Drops kill the child on test
-/// exit so leaked test processes don't accumulate on flaky failures.
-struct ServeChild {
-    child: Option<Child>,
-    port: u16,
-    /// #3705 — the leaf the daemon serves; every client trusts exactly it.
-    tls: common::tls::TestTls,
-}
-
-impl ServeChild {
-    fn url(&self, path: &str) -> String {
-        format!("{}{}", common::tls::TestTls::base_url(self.port), path)
-    }
-}
-
-impl Drop for ServeChild {
-    fn drop(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
-}
-
-/// Spawn `ai-memory serve --host 127.0.0.1 --port <p> --db <db>` and wait
-/// for `/api/v1/health` to return 200. Returns a guard that kills the
-/// child on drop. `extra_args` are appended to the serve subcommand.
-/// `extra_envs` lets callers set `HOME` (for config-driven `api_key`
-/// scenarios) or other env vars on the child.
-///
-/// Retries on the `free_port()` TOCTOU bind race (see
-/// [`SPAWN_BIND_RETRY_ATTEMPTS`]); a real startup crash is surfaced
-/// immediately with the child's captured stderr.
+/// Apply this suite's arguments and authorization fixture to the shared TLS helper.
 fn spawn_serve(
     db: &std::path::Path,
     extra_args: &[&str],
     extra_envs: &[(&str, &str)],
 ) -> ServeChild {
-    for attempt in 1..=SPAWN_BIND_RETRY_ATTEMPTS {
-        match try_spawn_serve_once(db, extra_args, extra_envs) {
-            Ok(child) => return child,
-            Err(SpawnFailure::BindRace { stderr }) => {
-                // Lost the ephemeral-port race to a concurrent binder —
-                // re-roll the port. Not a product defect.
-                eprintln!(
-                    "spawn_serve: ephemeral-port bind race on attempt \
-                     {attempt}/{SPAWN_BIND_RETRY_ATTEMPTS}, re-rolling port. \
-                     child stderr:\n{stderr}"
-                );
-            }
-            Err(SpawnFailure::Crashed { status, stderr }) => {
-                panic!(
-                    "serve child exited before /health became ready: {status}\n\
-                     --- child stderr ---\n{stderr}"
-                );
-            }
-            Err(SpawnFailure::NeverReady { stderr }) => {
-                panic!(
-                    "serve daemon did not become ready within {SPAWN_TIMEOUT:?}\n\
-                     --- child stderr ---\n{stderr}"
-                );
-            }
+    common::tls_serve::spawn_serve(db, |cmd| {
+        // #1751: unsigned requests test serve wiring, with the #976/#1001 admin fixture.
+        cmd.env("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0")
+            .env("AI_MEMORY_ADMIN_AGENT_IDS", "ai:serve-test-admin")
+            .args(extra_args);
+        for (key, value) in extra_envs {
+            cmd.env(key, value);
         }
-    }
-    panic!(
-        "serve daemon lost the ephemeral-port bind race \
-         {SPAWN_BIND_RETRY_ATTEMPTS} times in a row"
-    );
-}
-
-/// Single spawn-and-wait attempt backing [`spawn_serve`]. Captures the
-/// child's stderr so the outcome can distinguish a retryable port race
-/// from a genuine startup crash (and so panics carry real diagnostics).
-fn try_spawn_serve_once(
-    db: &std::path::Path,
-    extra_args: &[&str],
-    extra_envs: &[(&str, &str)],
-) -> Result<ServeChild, SpawnFailure> {
-    let port = free_port();
-    let port_s = port.to_string();
-    // #3705 — the daemon refuses every plaintext bind; a per-spawn leaf.
-    let tls = common::tls::TestTls::generate(
-        &db.parent().expect("db lives in a tempdir").join("tls-3705"),
-    );
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_ai-memory"));
-    cmd.env("AI_MEMORY_NO_CONFIG", "1")
-        // #1751 — permissive attestation opt-out; this suite's unsigned
-        // HTTP stores exercise serve wiring, not the attestation gate.
-        .env("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0")
-        // #976 (2026-05-20) — admin allowlist so the post-#946
-        // admin-gated routes (stats, archive, forget, …) exercise the
-        // happy-path 200 in this test fixture. Negative admin
-        // contracts belong in dedicated test files.
-        //
-        // #1001 (2026-05-21) — pre-#980 this used the `"*"` wildcard
-        // sentinel; #980 made `"*"` shape-invalid in
-        // `validate_agent_id`, so the env entry got dropped. Tests
-        // using `spawn_serve` that hit admin endpoints must thread
-        // `X-Agent-Id: ai:serve-test-admin` (matches the env value).
-        .env("AI_MEMORY_ADMIN_AGENT_IDS", "ai:serve-test-admin")
-        .args([
-            "--db",
-            db.to_str().unwrap(),
-            "serve",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            &port_s,
-        ])
-        .args(tls.serve_arg_strs())
-        .args(extra_args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    for (k, v) in extra_envs {
-        cmd.env(k, v);
-    }
-    let mut child = cmd.spawn().expect("spawn ai-memory serve");
-
-    // Drain stdout to the void; capture stderr into a shared buffer so
-    // an early exit can be classified (bind race vs. real crash) and so
-    // failures surface the daemon's own error instead of being silent.
-    if let Some(stdout) = child.stdout.take() {
-        std::thread::spawn(move || for _ in BufReader::new(stdout).lines() {});
-    }
-    let stderr_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-    let stderr_handle = child.stderr.take().map(|stderr| {
-        let sink = std::sync::Arc::clone(&stderr_buf);
-        std::thread::spawn(move || {
-            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                let mut guard = sink.lock().unwrap();
-                guard.push_str(&line);
-                guard.push('\n');
-            }
-        })
-    });
-    // Join the stderr drainer (the pipe EOFs once the child exits, so the
-    // thread ends promptly) and return everything it captured.
-    let drain_stderr = move || -> String {
-        if let Some(handle) = stderr_handle {
-            let _ = handle.join();
-        }
-        stderr_buf.lock().unwrap().clone()
-    };
-
-    let client = tls.client_with_timeout(READINESS_PROBE_TIMEOUT);
-    let url = format!("{}/api/v1/health", common::tls::TestTls::base_url(port));
-    let deadline = Instant::now() + SPAWN_TIMEOUT;
-    while Instant::now() < deadline {
-        if let Ok(resp) = client.get(&url).send()
-            && resp.status().is_success()
-        {
-            return Ok(ServeChild {
-                child: Some(child),
-                port,
-                tls,
-            });
-        }
-        // Bail early if the child crashed — don't burn the full timeout.
-        if let Ok(Some(status)) = child.try_wait() {
-            let stderr = drain_stderr();
-            return Err(if stderr.contains(BIND_IN_USE_MARKER) {
-                SpawnFailure::BindRace { stderr }
-            } else {
-                SpawnFailure::Crashed { status, stderr }
-            });
-        }
-        std::thread::sleep(READINESS_POLL_INTERVAL);
-    }
-    let _ = child.kill();
-    let _ = child.wait();
-    Err(SpawnFailure::NeverReady {
-        stderr: drain_stderr(),
     })
 }
 
@@ -256,7 +52,7 @@ fn http_client(serve: &ServeChild) -> reqwest::blocking::Client {
 }
 
 /// Bounded retry window for a test's *first* real HTTP request against a
-/// freshly-spawned daemon, layered on top of [`try_spawn_serve_once`]'s own
+/// freshly-spawned daemon, layered on top of [`common::tls_serve::spawn_serve`]'s own
 /// `/api/v1/health` readiness gate (#1994).
 ///
 /// `spawn_serve` already blocks until `/health` returns 2xx before handing
@@ -296,26 +92,6 @@ where
             ),
         }
     }
-}
-
-/// Polls `<base_url>/api/v1/health` until it returns 2xx or `timeout`
-/// elapses. Shared readiness-gate helper for spawn paths that cannot reuse
-/// `spawn_serve` (e.g. [`serve_api_key_required_when_configured`], which
-/// needs a custom `HOME` + must NOT set `AI_MEMORY_NO_CONFIG`) but still
-/// need the same bounded retry-until-listening contract (#1994).
-fn wait_for_health(client: &reqwest::blocking::Client, base_url: &str, timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if client
-            .get(format!("{base_url}/api/v1/health"))
-            .send()
-            .is_ok_and(|r| r.status().is_success())
-        {
-            return true;
-        }
-        std::thread::sleep(READINESS_POLL_INTERVAL);
-    }
-    false
 }
 
 #[test]
@@ -434,107 +210,36 @@ fn serve_api_key_required_when_configured() {
     )
     .unwrap();
 
-    // Spawn without AI_MEMORY_NO_CONFIG=1 so the config.toml is honoured.
-    // Hosted-ubuntu `Check (ubuntu-latest,sqlite)` has hit a leftover
-    // daemon on the ephemeral port (health 200, /stats 403 admin-gate
-    // because THAT process had no api_key). Health is api-key-exempt, so
-    // `wait_for_health` cannot tell our child from the leftover — retry
-    // the whole spawn on a fresh port when /stats is not 401. Same
-    // attempt budget as `spawn_serve`'s bind-race loop.
-    // #3705 — the daemon refuses every plaintext bind; one leaf for the
-    // retry loop, trusted by the probe client.
-    let tls = common::tls::TestTls::generate(&tmp.path().join("tls-3705"));
-    let client = tls.client_with_timeout(Duration::from_secs(5));
-    let mut last_err = String::new();
-    for attempt in 1..=SPAWN_BIND_RETRY_ATTEMPTS {
-        let port = free_port();
-        let port_s = port.to_string();
-        let mut child = Command::new(env!("CARGO_BIN_EXE_ai-memory"))
-            .env_remove("AI_MEMORY_NO_CONFIG")
-            .env("AI_MEMORY_NO_CONFIG", "0")
-            .env("HOME", tmp.path().to_str().unwrap())
-            // #3002 / #3215 — `config_path()` resolves through `dirs::config_dir()`,
-            // which honors `XDG_CONFIG_HOME`. Without this pin an ambient host
-            // XDG root (or a leftover `config.toml` there) wins, the daemon boots
-            // without the test `api_key`, `api_key_auth` becomes a pass-through,
-            // and GET `/api/v1/stats` returns the admin-gate 403 instead of the
-            // api-key 401 this test is pinning.
+    // #3002/#3215: config_path honors XDG_CONFIG_HOME; pin it on this child.
+    // Every startup attempt has a unique trusted leaf, so another listener cannot
+    // satisfy readiness. Only bind collisions retry; an auth mismatch is a failure.
+    let serve = common::tls_serve::spawn_serve(&db, |cmd| {
+        cmd.env("AI_MEMORY_NO_CONFIG", "0")
+            .env("HOME", tmp.path())
             .env("XDG_CONFIG_HOME", &xdg_root)
             .env_remove("AI_MEMORY_DB")
-            .env("AI_MEMORY_ADMIN_AGENT_IDS", "ai:serve-test-admin")
-            .args([
-                "--db",
-                db.to_str().unwrap(),
-                "serve",
-                "--host",
-                "127.0.0.1",
-                "--port",
-                &port_s,
-            ])
-            .args(tls.serve_arg_strs())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        if let Some(stdout) = child.stdout.take() {
-            std::thread::spawn(move || for _ in BufReader::new(stdout).lines() {});
-        }
-        let stderr_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-        if let Some(stderr) = child.stderr.take() {
-            let sink = std::sync::Arc::clone(&stderr_buf);
-            std::thread::spawn(move || {
-                for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                    let mut guard = sink.lock().unwrap();
-                    guard.push_str(&line);
-                    guard.push('\n');
-                }
-            });
-        }
-
-        let url = common::tls::TestTls::base_url(port);
-        let ready = wait_for_health(&client, &url, SPAWN_TIMEOUT);
-        let guard = ServeChild {
-            child: Some(child),
-            port,
-            tls: tls.clone(),
-        };
-        if !ready {
-            last_err = format!(
-                "attempt {attempt}: auth-protected daemon never came up; stderr:\n{}",
-                stderr_buf.lock().unwrap()
-            );
-            drop(guard);
-            continue;
-        }
-
-        let resp = send_first_request(|| client.get(format!("{url}/api/v1/stats")));
-        let status = resp.status().as_u16();
-        let body = resp.text().unwrap_or_default();
-        if status != 401 {
-            last_err = format!(
-                "attempt {attempt}: missing x-api-key must 401 (got {status}); body={body}; stderr:\n{}",
-                stderr_buf.lock().unwrap()
-            );
-            drop(guard);
-            continue;
-        }
-
-        let resp = client
-            .get(format!("{url}/api/v1/stats"))
-            .header("x-api-key", api_key)
-            .header("x-agent-id", "ai:serve-test-admin")
-            .send()
-            .unwrap();
-        assert!(
-            resp.status().is_success(),
-            "auth header rejected: {}; stderr:\n{}",
-            resp.status(),
-            stderr_buf.lock().unwrap()
-        );
-        drop(guard);
-        return;
-    }
-    panic!("{last_err}");
+            .env("AI_MEMORY_ADMIN_AGENT_IDS", "ai:serve-test-admin");
+    });
+    let client = http_client(&serve);
+    let resp = send_first_request(|| client.get(serve.url("/api/v1/stats")));
+    assert_eq!(
+        resp.status().as_u16(),
+        401,
+        "missing x-api-key must be rejected; child stderr:\n{}",
+        serve.stderr()
+    );
+    let resp = client
+        .get(serve.url("/api/v1/stats"))
+        .header("x-api-key", api_key)
+        .header("x-agent-id", "ai:serve-test-admin")
+        .send()
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "auth header rejected: {}; child stderr:\n{}",
+        resp.status(),
+        serve.stderr()
+    );
 }
 
 #[cfg(unix)]
@@ -545,39 +250,460 @@ fn serve_graceful_shutdown_on_sigterm() {
     let tmp = TempDir::new().unwrap();
     let db = tmp.path().join("ai-memory.db");
     let serve = spawn_serve(&db, &[], &[]);
-    let pid = serve.child.as_ref().unwrap().id();
+    // #6237: this test sends the signal its name says. The shared shutdown
+    // primitive (#8193) gives SIGTERM the same graceful path as SIGINT.
+    let (status, stderr) = signal_and_wait(serve, libc::SIGTERM);
+    assert_eq!(
+        status.signal(),
+        None,
+        "#6237: SIGTERM must not kill the daemon by signal: {status:?}\n{stderr}"
+    );
+    assert!(
+        status.success(),
+        "#6237: SIGTERM must exit 0 like SIGINT: {status:?}\n{stderr}"
+    );
+}
 
-    // SIGINT (the daemon's wired signal — see `tokio::signal::ctrl_c()`
-    // in `daemon_runtime::serve`). SIGTERM is not currently wired but
-    // the spec calls the test "shutdown_on_sigterm" — using SIGINT keeps
-    // the assertion meaningful (graceful shutdown path actually runs).
+/// Bound on how long a signalled daemon may take to drain, certify and exit.
+#[cfg(unix)]
+const SIGNAL_EXIT_DEADLINE: Duration = Duration::from_secs(20);
+
+/// Poll interval while waiting for a signalled daemon to exit.
+#[cfg(unix)]
+const SIGNAL_EXIT_POLL: Duration = Duration::from_millis(100);
+
+/// Marker the serve shutdown future logs the moment a stop signal arrives.
+#[cfg(unix)]
+const SHUTDOWN_BEGIN_MARKER: &str = "shutting down";
+
+/// Marker logged once the deferred-audit queue drained, before the final
+/// witness and WAL checkpoint.
+#[cfg(unix)]
+const AUDIT_DRAINED_MARKER: &str = "deferred-audit queue drained";
+
+/// Send `signal` to the daemon (the child this test spawned and still owns).
+#[cfg(unix)]
+fn send_stop(serve: &ServeChild, signal: i32) {
+    let pid = serve.child.as_ref().unwrap().id();
+    // SAFETY: `pid` is the id of the child this test spawned and still owns.
     unsafe {
-        libc::kill(i32::try_from(pid).expect("pid fits in i32"), libc::SIGINT);
+        libc::kill(i32::try_from(pid).expect("pid fits in i32"), signal);
     }
-    // Give the daemon up to 10s to flush the WAL and exit.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let mut serve_mut = serve;
-    let exit_status = loop {
+}
+
+/// Wait for a signalled daemon to exit; returns its exit status and its full
+/// stderr. Force-kills (and fails) past the deadline.
+#[cfg(unix)]
+fn reap_after_stop(mut serve: ServeChild, signal: i32) -> (std::process::ExitStatus, String) {
+    let deadline = Instant::now() + SIGNAL_EXIT_DEADLINE;
+    let status = loop {
         if Instant::now() > deadline {
-            // Force kill so the test reports a real failure rather than
-            // hanging the suite.
-            let _ = serve_mut.child.as_mut().unwrap().kill();
-            panic!("daemon did not exit within 10s of SIGINT");
+            let _ = serve.child.as_mut().unwrap().kill();
+            panic!("daemon did not exit within {SIGNAL_EXIT_DEADLINE:?} of signal {signal}");
         }
-        match serve_mut.child.as_mut().unwrap().try_wait() {
+        match serve.child.as_mut().unwrap().try_wait() {
             Ok(Some(status)) => break status,
-            Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+            Ok(None) => std::thread::sleep(SIGNAL_EXIT_POLL),
             Err(e) => panic!("try_wait failed: {e}"),
         }
     };
-    // Discard the child handle so Drop doesn't try to wait again.
-    serve_mut.child = None;
+    // The child already exited; clearing it lets `stop` only join the pipe readers.
+    serve.child = None;
+    let _ = serve.stop();
+    let stderr = serve.stderr();
+    (status, stderr)
+}
 
-    // Either a clean exit (status 0) or signalled-by-INT is acceptable;
-    // what we *don't* want is a panic / abort signal.
-    let signal = exit_status.signal();
+/// Send `signal` to the daemon and wait for it to exit.
+#[cfg(unix)]
+fn signal_and_wait(serve: ServeChild, signal: i32) -> (std::process::ExitStatus, String) {
+    send_stop(&serve, signal);
+    reap_after_stop(serve, signal)
+}
+
+/// Marker logged once the HTTP server stopped and every in-flight request
+/// finished, before the deferred-audit drain.
+#[cfg(unix)]
+const INFLIGHT_DRAINED_MARKER: &str = "in-flight requests drained";
+
+/// Marker logged once the final audit-head witness step ran.
+#[cfg(unix)]
+const WITNESS_WRITTEN_MARKER: &str = "final witness flushed";
+
+/// Marker logged once the final WAL checkpoint completed.
+#[cfg(unix)]
+const CHECKPOINT_MARKER: &str = "final WAL checkpoint complete";
+
+/// Grace the grace-expiry case passes to `--shutdown-grace-secs`, the smallest
+/// whole-second budget the flag takes.
+#[cfg(unix)]
+const SHORT_GRACE_SECS: u64 = 1;
+
+/// The drained text does not name the budget, so any value renders it.
+#[cfg(unix)]
+const SERVE_DEFAULT_GRACE_SECS: u64 = 30;
+
+/// Fragment shared by every grace-expired log text (from the production text:
+/// it states the remaining connections were force-closed).
+#[cfg(unix)]
+const GRACE_EXPIRED_MARKER: &str = "force-closed, not drained";
+
+/// Longest a held request body may stay open before the test gives up.
+#[cfg(unix)]
+const HELD_BODY_LIMIT: Duration = Duration::from_secs(30);
+
+/// Pause so the held request is certainly received (headers and the first
+/// chunk are on the wire) before the stop signal is sent.
+#[cfg(unix)]
+const INFLIGHT_SETTLE: Duration = Duration::from_millis(1_000);
+
+/// Pause while the signalled daemon must still be waiting on the held request.
+#[cfg(unix)]
+const DRAIN_WAIT_PROBE: Duration = Duration::from_millis(500);
+
+/// Bound on waiting for the daemon to log that it began shutting down.
+#[cfg(unix)]
+const SHUTDOWN_LOG_DEADLINE: Duration = Duration::from_secs(10);
+
+/// A request body that yields its first half, then blocks until released:
+/// the request is in flight (received, not complete) for as long as the test
+/// holds it.
+#[cfg(unix)]
+struct HeldBody {
+    head: Vec<u8>,
+    tail: Vec<u8>,
+    pos: usize,
+    release: std::sync::mpsc::Receiver<()>,
+    released: bool,
+}
+
+#[cfg(unix)]
+impl std::io::Read for HeldBody {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.pos == self.head.len() && !self.released {
+            self.release
+                .recv_timeout(HELD_BODY_LIMIT)
+                .map_err(std::io::Error::other)?;
+            self.released = true;
+        }
+        let src = if self.pos < self.head.len() {
+            &self.head[self.pos..]
+        } else {
+            &self.tail[self.pos - self.head.len()..]
+        };
+        let n = src.len().min(buf.len());
+        buf[..n].copy_from_slice(&src[..n]);
+        self.pos += n;
+        Ok(n)
+    }
+}
+
+/// #6236 N3 — count the audit-head witness checkpoints the daemon persisted
+/// (read-only; the daemon has exited, so the file is quiescent).
+#[cfg(unix)]
+fn witness_checkpoint_count(db: &std::path::Path) -> i64 {
+    let conn =
+        rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect("open the daemon db read-only");
+    conn.query_row(
+        "SELECT COUNT(*) FROM checkpoints WHERE namespace = ?1",
+        [ai_memory::governance::audit::WITNESS_CHECKPOINT_NAMESPACE],
+        |r| r.get(0),
+    )
+    .expect("count witness checkpoints")
+}
+
+/// #6236 — for BOTH signals, with a request still in flight when the signal
+/// arrives: the in-flight request completes successfully, the exit is a
+/// success, and the shutdown log shows, in order: stop, in-flight drained,
+/// deferred-audit drained, final witness, WAL checkpoint. The WAL is
+/// checkpointed to zero length. SIGTERM must equal SIGINT.
+#[cfg(unix)]
+#[test]
+fn serve_stop_signals_drain_in_order_and_exit_success_6236() {
+    use std::os::unix::process::ExitStatusExt;
+
+    for (name, signal) in [("SIGINT", libc::SIGINT), ("SIGTERM", libc::SIGTERM)] {
+        let tmp = TempDir::new().unwrap();
+        let db = tmp.path().join("ai-memory.db");
+        // #6236 N3: enrol a witness key (custody dir + out-of-band pubkey pin)
+        // so the shutdown flush really signs and persists a witness row.
+        // A memory write does not append to the signed-event chain, and the
+        // shutdown flush is a no-op at chain head 0, so seed one event.
+        {
+            let conn = ai_memory::db::open(&db).expect("init the daemon db");
+            let event = ai_memory::signed_events::SignedEvent {
+                id: uuid::Uuid::new_v4().to_string(),
+                agent_id: "ai:serve-6236".to_string(),
+                event_type: "memory_link.created".to_string(),
+                payload_hash: ai_memory::signed_events::payload_hash(b"serve-6236-seed"),
+                signature: None,
+                attest_level: "unsigned".to_string(),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                ..ai_memory::signed_events::SignedEvent::default()
+            };
+            ai_memory::signed_events::append_signed_event(&conn, &event)
+                .expect("seed the signed-event chain");
+        }
+        let witness_dir = tmp.path().join("witness-keys");
+        let witness_key =
+            ai_memory::identity::keypair::generate(ai_memory::governance::audit::WITNESS_KEY_LABEL)
+                .expect("generate the witness key");
+        ai_memory::identity::keypair::save(&witness_key, &witness_dir)
+            .expect("save the witness key");
+        let witness_dir_arg = witness_dir.to_str().expect("utf-8 witness dir");
+        let witness_pub = witness_key.public_base64();
+        let serve = spawn_serve(
+            &db,
+            &[],
+            &[
+                (
+                    ai_memory::governance::audit::WITNESS_KEY_DIR_ENV,
+                    witness_dir_arg,
+                ),
+                (
+                    ai_memory::governance::audit::WITNESS_PUBKEY_ENV,
+                    witness_pub.as_str(),
+                ),
+            ],
+        );
+        let client = http_client(&serve);
+        let resp = send_first_request(|| {
+            client
+                .post(serve.url("/api/v1/memories"))
+                .header("X-Agent-Id", "ai:serve-6236")
+                .json(&serde_json::json!({
+                    "tier": "mid",
+                    "namespace": "sig-6236",
+                    "title": format!("before-{name}"),
+                    "content": "written before the stop signal"
+                }))
+        });
+        assert!(
+            resp.status().is_success(),
+            "{name}: create {}",
+            resp.status()
+        );
+        let wal = tmp.path().join("ai-memory.db-wal");
+        assert!(wal.exists(), "{name}: a WAL must exist before the signal");
+
+        // A request that is in flight when the signal arrives: its body is
+        // held half-sent until the test releases it.
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "tier": "mid",
+            "namespace": "sig-6236",
+            "title": format!("in-flight-{name}"),
+            "content": "completes while the daemon drains"
+        }))
+        .unwrap();
+        let (head, tail) = payload.split_at(payload.len() / 2);
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let body = reqwest::blocking::Body::new(HeldBody {
+            head: head.to_vec(),
+            tail: tail.to_vec(),
+            pos: 0,
+            release: release_rx,
+            released: false,
+        });
+        let slow_client = serve.tls.client_with_timeout(HELD_BODY_LIMIT);
+        let slow_request = serve.url("/api/v1/memories");
+        let in_flight = std::thread::spawn(move || {
+            slow_client
+                .post(slow_request)
+                .header("X-Agent-Id", "ai:serve-6236")
+                .header("Content-Type", "application/json")
+                .body(body)
+                .send()
+                .map(|r| r.status())
+        });
+        std::thread::sleep(INFLIGHT_SETTLE);
+
+        send_stop(&serve, signal);
+        let begun = Instant::now();
+        while !serve.stderr().contains(SHUTDOWN_BEGIN_MARKER) {
+            assert!(
+                begun.elapsed() < SHUTDOWN_LOG_DEADLINE,
+                "{name}: the daemon never logged that it began shutting down\n{}",
+                serve.stderr()
+            );
+            std::thread::sleep(SIGNAL_EXIT_POLL);
+        }
+        std::thread::sleep(DRAIN_WAIT_PROBE);
+        assert!(
+            !serve.stderr().contains(INFLIGHT_DRAINED_MARKER),
+            "{name}: the daemon must wait for the in-flight request\n{}",
+            serve.stderr()
+        );
+        release_tx.send(()).unwrap();
+        let in_flight_status = in_flight
+            .join()
+            .unwrap()
+            .unwrap_or_else(|e| panic!("{name}: the in-flight request failed: {e}"));
+        assert!(
+            in_flight_status.is_success(),
+            "{name}: the in-flight request must complete: {in_flight_status}"
+        );
+
+        let (status, stderr) = reap_after_stop(serve, signal);
+        assert_eq!(status.signal(), None, "{name}: died by signal\n{stderr}");
+        assert!(status.success(), "{name}: exit {status:?}\n{stderr}");
+        let order: Vec<Option<usize>> = [
+            SHUTDOWN_BEGIN_MARKER,
+            INFLIGHT_DRAINED_MARKER,
+            AUDIT_DRAINED_MARKER,
+            WITNESS_WRITTEN_MARKER,
+            CHECKPOINT_MARKER,
+        ]
+        .iter()
+        .map(|marker| stderr.find(marker))
+        .collect();
+        assert!(
+            order.iter().all(Option::is_some) && order.windows(2).all(|w| w[0] < w[1]),
+            "{name}: log must show stop, in-flight drained, audit drained, witness, checkpoint in that order: {order:?}\n{stderr}"
+        );
+        // #8193 R5: a real drain logs the drained text, taken from the
+        // production text source, and never the grace-expired text.
+        assert!(
+            stderr.contains(&DrainOutcome::Drained.log_text(SERVE_DEFAULT_GRACE_SECS)),
+            "{name}: a drained shutdown must log the drained text\n{stderr}"
+        );
+        assert!(
+            !stderr.contains(GRACE_EXPIRED_MARKER),
+            "{name}: a drained shutdown must not log the grace-expired text\n{stderr}"
+        );
+        let wal_len = std::fs::metadata(&wal).map_or(0, |m| m.len());
+        assert_eq!(
+            wal_len, 0,
+            "{name}: WAL must be checkpointed to zero length"
+        );
+        let witnesses = witness_checkpoint_count(&db);
+        assert!(
+            witnesses >= 1,
+            "{name}: the final witness must be persisted for the enrolled key, found {witnesses} rows"
+        );
+    }
+}
+
+/// #8193 R5 (code r4 M1) - the serve grace-expiry decision. With a held
+/// request outliving a 1 s `--shutdown-grace-secs`, the daemon cuts the
+/// request at the budget and must log the grace-expired text, never the
+/// drained text. Catches the mutation that drops the `signalled_at` `.set(..)`
+/// in the shutdown future (elapsed stays zero, every stop logs "drained").
+#[cfg(unix)]
+#[test]
+fn serve_sigterm_past_grace_logs_grace_expired_not_drained_8193() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("ai-memory.db");
+    let grace_arg = SHORT_GRACE_SECS.to_string();
+    let serve = spawn_serve(&db, &["--shutdown-grace-secs", grace_arg.as_str()], &[]);
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let body = reqwest::blocking::Body::new(HeldBody {
+        head: br#"{"tier":"mid","#.to_vec(),
+        tail: br#""namespace":"sig-8193"}"#.to_vec(),
+        pos: 0,
+        release: release_rx,
+        released: false,
+    });
+    let slow_client = serve.tls.client_with_timeout(HELD_BODY_LIMIT);
+    let slow_request = serve.url("/api/v1/memories");
+    let in_flight = std::thread::spawn(move || {
+        slow_client
+            .post(slow_request)
+            .header("X-Agent-Id", "ai:serve-8193")
+            .header("Content-Type", "application/json")
+            .body(body)
+            .send()
+            .map(|r| r.status())
+    });
+    std::thread::sleep(INFLIGHT_SETTLE);
+
+    let (status, stderr) = signal_and_wait(serve, libc::SIGTERM);
+    // The held request was cut at the budget; release the body thread.
+    let _ = release_tx.send(());
+    let _ = in_flight.join();
+    assert_eq!(status.signal(), None, "died by signal\n{stderr}");
+    assert!(status.success(), "exit {status:?}\n{stderr}");
     assert!(
-        exit_status.success() || signal == Some(libc::SIGINT) || signal.is_none(),
-        "unexpected exit: {exit_status:?} signal={signal:?}"
+        stderr.contains(&DrainOutcome::GraceExpired.log_text(SHORT_GRACE_SECS)),
+        "a stop past the grace budget must log the grace-expired text\n{stderr}"
     );
+    assert!(
+        !stderr.contains(&DrainOutcome::Drained.log_text(SHORT_GRACE_SECS)),
+        "a stop past the grace budget must not claim a drain\n{stderr}"
+    );
+}
+
+/// #6236 — packaging: the image stops with SIGTERM and the admin guide states
+/// the stop grace budget.
+#[test]
+fn dockerfile_stopsignal_and_admin_guide_grace_6236() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let dockerfile = std::fs::read_to_string(root.join("Dockerfile")).unwrap();
+    assert!(
+        dockerfile.lines().any(|l| l.trim() == "STOPSIGNAL SIGTERM"),
+        "#6236: Dockerfile must declare STOPSIGNAL SIGTERM"
+    );
+    let guide = std::fs::read_to_string(root.join("docs/ADMIN_GUIDE.md")).unwrap();
+    assert!(
+        guide.contains("SIGTERM") && guide.contains("--shutdown-grace-secs"),
+        "#6236: docs/ADMIN_GUIDE.md must state SIGTERM handling and the grace budget"
+    );
+    // The ONE stop budget (seconds): systemd `TimeoutStopSec`, `docker stop -t`
+    // and compose `stop_grace_period` all carry it, so a supervisor never
+    // SIGKILLs the daemon inside its drain (r1 L3/F4).
+    let budget = STOP_BUDGET_SECS;
+    for needle in [
+        format!("TimeoutStopSec={budget}"),
+        format!("docker stop -t {budget}"),
+        format!("stop_grace_period: {budget}s"),
+    ] {
+        assert!(
+            guide.contains(&needle),
+            "#6236: docs/ADMIN_GUIDE.md must state the container stop timeout: missing {needle:?}"
+        );
+    }
+}
+
+/// The documented stop budget in seconds: the HTTP grace plus the bounded
+/// drain, witness and checkpoint phases (systemd `TimeoutStopSec`).
+const STOP_BUDGET_SECS: u32 = 90;
+
+/// Return the text of one top-level service block (`  <name>:` at two-space
+/// indent) of a compose file, up to the next two-space-indent key.
+fn compose_service_block<'a>(compose: &'a str, name: &str) -> &'a str {
+    let header = format!("\n  {name}:\n");
+    let start = compose
+        .find(&header)
+        .unwrap_or_else(|| panic!("compose service {name} not found"))
+        + 1;
+    let rest = &compose[start..];
+    let end = rest
+        .match_indices("\n  ")
+        .find(|(i, _)| {
+            let after = &rest[i + 3..];
+            !after.starts_with(' ') && !after.starts_with('#') && !after.starts_with('\n')
+        })
+        .map_or(rest.len(), |(i, _)| i);
+    &rest[..end]
+}
+
+/// #8193: both daemon services of the docker-1461 compose file must carry the
+/// stop budget as `stop_grace_period`; the docker default of 10 s would
+/// SIGKILL the daemon inside its drain, before the final witness.
+#[test]
+fn compose_daemon_services_stop_grace_period_8193() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let path = root.join("deploy/docker-1461/docker-compose.yml");
+    let compose = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("#8193: read {}: {e}", path.display()));
+    let want = format!("stop_grace_period: {STOP_BUDGET_SECS}s");
+    for service in ["peer-1", "peer-2"] {
+        let block = compose_service_block(&compose, service);
+        assert!(
+            block.lines().any(|l| l.trim() == want),
+            "#8193: compose service {service} must declare `{want}`"
+        );
+    }
 }

@@ -454,7 +454,7 @@ hive node), the locked stack is:
 | --- | --- |
 | PostgreSQL | **18.6** |
 | Apache AGE | **1.8.0** |
-| pgvector | **0.8.6** |
+| pgvector | **0.8.7** |
 
 **On the AGE version, both surfaces, stated together** — because they disagree
 and the disagreement confuses people:

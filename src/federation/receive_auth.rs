@@ -626,12 +626,15 @@ pub const FED_QUARANTINE_UNATTRIBUTED_ENV: &str = "AI_MEMORY_FED_QUARANTINE_UNAT
 /// [`crate::models::lifecycle_visible_clause`] allow-list) rather than landing
 /// visible.
 ///
-/// **Default permissive (`false`)** per the #1948 decision (`560c8007`,
-/// 2×5-voted): a relayed memory is *data* (replication) — the bytes converge
-/// (CRDT-safe) regardless, and only this node's LOCAL VIEW differs. Mirrors the
-/// secure-opt-in shape of [`require_write_sig_enabled`] (#1464): unset / any
-/// non-truthy value keeps the pre-#1948 accept-visible posture; an operator
-/// opts in with `1`/`true`/`yes`/`on`.
+/// **Posture is shape-scoped (#2967).** Off on the `singleton` and `team`
+/// shapes (the #1948 decision, `560c8007`, 2×5-voted: a relayed memory is
+/// *data* (replication) — the bytes converge (CRDT-safe) regardless, and only
+/// this node's LOCAL VIEW differs), unless an operator opts in with
+/// `1`/`true`/`yes`/`on` (or selects `asi-hard`). Forced on for the
+/// `federated` and `hive` shapes (a FLOOR: an explicit non-truthy value is
+/// refused at boot), and pinned on for `production` when unset (an explicit
+/// non-truthy value is refused by the always-engaged `asi-hard` floor). This
+/// reader and the floor evaluator share [`crate::security_profile::is_truthy`].
 ///
 /// "Provenance-less" here means an inbound write the receive path could NOT
 /// attribute to an author with a verified per-write content signature — i.e.
@@ -642,7 +645,7 @@ pub const FED_QUARANTINE_UNATTRIBUTED_ENV: &str = "AI_MEMORY_FED_QUARANTINE_UNAT
 pub fn quarantine_unattributed_enabled() -> bool {
     std::env::var(FED_QUARANTINE_UNATTRIBUTED_ENV)
         .ok()
-        .is_some_and(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+        .is_some_and(|v| crate::security_profile::is_truthy(&v))
 }
 
 // ---------------------------------------------------------------------------

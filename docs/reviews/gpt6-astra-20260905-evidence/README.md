@@ -26,7 +26,7 @@ Review memories were deleted and their canonical gets returned not found. A synt
 
 ## Historical test data
 
-Read-only SFTP/SSH retrieved f2's `/home/fate_two/v07/v09-dev/infra/cf-dashboard/public` JSON/HTML products and sibling publisher, plus selected underlying run artifacts. Published products are served at [the test dashboard](https://test.agenticmem.co/). The local capture manifest includes all seven products, their renderers and the inspected raw NHI/scaling/continuity/Big-10 artifacts.
+Read-only SFTP/SSH retrieved f2's `<home>/v07/v09-dev/infra/cf-dashboard/public` JSON/HTML products and sibling publisher, plus selected underlying run artifacts. Published products are served at [the test dashboard](https://test.agenticmem.co/). The local capture manifest includes all seven products, their renderers and the inspected raw NHI/scaling/continuity/Big-10 artifacts.
 
 - [Capture hashes](remote-capture-manifest.json) and [remote scaling/continuity hashes](f2-artifact-manifest-enterprise.json) identify the retained evidence and acquisition boundaries. Publisher code was read, not executed.
 - [Displayed restart run](restart-artifacts/continuity-a56d9a.json) preserves the three manually transcribed card values; sibling files preserve failed and superseding runs. It demonstrates acknowledged-row retention across daemon kills, not model-state recovery or next correct business action.

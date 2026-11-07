@@ -9,7 +9,7 @@
 # directly rather than trusting a green tick. Run AFTER repro.sh.
 #
 #   1. SELECT version()                      == PostgreSQL 18.6
-#   2. age / vector extversion               == 1.8.0 / 0.8.6
+#   2. age / vector extversion               == 1.8.0 / 0.8.7
 #   3. SHOW ssl                              == on
 #   4. cleartext (sslmode=disable) TCP       == REFUSED pre-auth
 #   5. encrypted session                     negotiates TLS 1.3

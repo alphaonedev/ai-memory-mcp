@@ -1307,12 +1307,17 @@ fn apply_check_constraint_triggers(conn: &Connection) -> Result<()> {
 /// `AI_MEMORY_ENCRYPT_AT_REST` is app-level ChaCha and is allowed here.
 #[cfg(feature = "sqlcipher")]
 pub(crate) fn apply_sqlcipher_key(conn: &Connection) -> Result<()> {
-    let passphrase = db_passphrase()
-        .or_else(|| std::env::var(ENV_DB_PASSPHRASE).ok())
-        .ok_or_else(|| {
-            // #962 typed envelope — fatal boot refusal.
-            anyhow::Error::new(super::error::StorageError::SqlcipherMissingPassphrase)
-        })?;
+    // #6590 / #6581 (CodeQL rust/cleartext-logging) — the passphrase is
+    // bound by `let … else`, never carried inside a `Result` that `?`
+    // propagates: a `?` on a passphrase-bearing `Result` makes this
+    // function's return value (and every error message a caller derives
+    // from it) data-dependent on the secret.
+    let Some(passphrase) = db_passphrase().or_else(|| std::env::var(ENV_DB_PASSPHRASE).ok()) else {
+        // #962 typed envelope — fatal boot refusal.
+        return Err(anyhow::Error::new(
+            super::error::StorageError::SqlcipherMissingPassphrase,
+        ));
+    };
     // PRAGMA key must be the FIRST operation on a new connection. The
     // passphrase is quoted with SQL string-literal quoting rules.
     let escaped = passphrase.replace('\'', "''");

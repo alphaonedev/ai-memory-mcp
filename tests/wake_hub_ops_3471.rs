@@ -27,7 +27,7 @@ use ai_memory::wake_hub::identity::SameUidAuthorizer;
 use ai_memory::wake_hub::limits::{DRAIN_DEADLINE_MS, SLOW_CONSUMER_PERCENT};
 use ai_memory::wake_hub::{HubConfig, startup};
 use ed25519_dalek::SigningKey;
-use wake_hub_harness::{Harness, TestVerifier};
+use wake_hub_harness::{Harness, TestVerifier, scaled_timing};
 
 fn key(seed: u8) -> SigningKey {
     SigningKey::from_bytes(&[seed; 32])
@@ -306,6 +306,17 @@ async fn an_overflowing_recipient_names_the_bound_that_refused_it() {
     // correctly reads zero. Nothing is wrong with the hub in either case — the
     // TEST was sampling a live gauge after the moment it described.
     //
+    // A third legitimate observation of backpressure (#7951): the SENDER can be
+    // disconnected. Every refused wake queues an `error/507` on the sender's own
+    // egress queue, which has the same 8 KiB cap; if the sender is starved of
+    // CPU under load and its refusals pile up unread, the hub closes its session
+    // (`send_error` -> `send` -> `try_enqueue` false) and the next write fails
+    // with `BrokenPipe`. That is the designed policy for a peer that does not
+    // read, not a hub defect, so the flood treats it as the end of sending and
+    // goes straight to the observation: the hub-side gauges
+    // (`drop_recipient_queue_full`, `drop_channel_full`, `slow_consumers`)
+    // outlive the sender's socket.
+    //
     // Flooding until the census itself reports the backpressure removes the
     // race on both platforms, and it is deterministic rather than lucky: once
     // the deaf peer's buffer is full the writer blocks, and because that peer
@@ -314,14 +325,27 @@ async fn an_overflowing_recipient_names_the_bound_that_refused_it() {
     // never applies backpressure fails the run instead of hanging it.
     let mut refused = false;
     let mut census_observed = false;
+    let mut sender_closed = false;
     'flood: for _round in 0..200 {
         for _ in 0..50 {
-            sender.wake(&deaf_id, &big_row).await;
+            if let Err(e) = sender.try_wake(&deaf_id, &big_row).await {
+                // #7951 — the hub closed OUR session (our own egress queue
+                // filled with unread refusals). Not a failure: go straight to
+                // the observation, the hub-side gauges are still readable.
+                assert!(
+                    session_closed_by_hub(&e),
+                    "only a closed session may fail the write, got {e:?}"
+                );
+                sender_closed = true;
+                break;
+            }
+            // Drain our own error queue after EVERY wake so it cannot fill
+            // and get the sender disconnected before the signal is seen.
+            while let Ok(Some(_)) =
+                tokio::time::timeout(scaled_timing(SENDER_DRAIN_POLL), sender.read_frame()).await
+            {
+            }
         }
-        // Drain our own error queue so it cannot fill and mask the signal.
-        while let Ok(Some(_)) =
-            tokio::time::timeout(Duration::from_millis(20), sender.read_frame()).await
-        {}
 
         // `overflow` is a monotone counter: once refused, always refused.
         let snap = hub.metrics.snapshot(0);
@@ -370,6 +394,11 @@ async fn an_overflowing_recipient_names_the_bound_that_refused_it() {
             census_observed = true;
             break 'flood;
         }
+        if sender_closed {
+            // No further wake can be sent, so no further round can change
+            // the gauges: stop and let the assertions below name the bound.
+            break 'flood;
+        }
     }
     assert!(
         refused,
@@ -404,5 +433,136 @@ async fn an_overflowing_recipient_names_the_bound_that_refused_it() {
 
     // Let the deaf peer go so the hub can reap it, then drain.
     deaf.shutdown_write().await;
+    hub.stop().await;
+}
+
+/// The sender's own egress cap in the no-drain test (`cfg.queue_bytes`).
+const NO_DRAIN_QUEUE_BYTES: usize = 8 * 1_024;
+
+/// The `reason` text `conn.rs` puts in the `error/507` it queues for a refused
+/// wake (copied from the `send_error(ErrorCode::Overflow, ..)` call in
+/// `Conn::route_wake`).
+const REFUSAL_507_REASON: &str = "recipient queue or hub egress budget full";
+
+/// Encoded size of one `error/507` refusal addressed to `sender_id`, exactly
+/// the bytes `Conn::send` hands `try_enqueue`.
+fn refusal_507_len(hub_id: &str, sender_id: &str) -> usize {
+    Frame::new(
+        Kind::Error,
+        hub_id,
+        sender_id,
+        ai_memory::wake_hub::frame::encode_error(
+            ai_memory::wake_hub::frame::ErrorCode::Overflow,
+            REFUSAL_507_REASON,
+        ),
+    )
+    .encode()
+    .expect("encode 507")
+    .len()
+}
+
+/// Fewest unread refusals that can fill the sender's `NO_DRAIN_QUEUE_BYTES`
+/// egress queue: the hub closes only when a refusal does not fit, so at least
+/// `queue_bytes / refusal_len` must have been queued unread first. A hub that
+/// hangs up on the FIRST 507 (#7956 mutant) closes below this.
+fn min_refusals_before_close(hub_id: &str, sender_id: &str) -> usize {
+    NO_DRAIN_QUEUE_BYTES / refusal_507_len(hub_id, sender_id)
+}
+
+/// Upper bound on the wakes the no-drain regression sends. Measured, not
+/// guessed (#7958): with the 8 KiB queue and 120-byte ids the hub closed the
+/// sender at wake 104 (reviewer run of `cargo test --test wake_hub_ops_3471`
+/// with a probe printing `closed_after`); the hub drains refusals into the
+/// kernel socket buffer first, so the exact point is platform-dependent. 4000
+/// is ~38x the measurement and still bounded, so a hub that never closes fails
+/// the run instead of hanging it.
+const NO_DRAIN_WAKE_BOUND: usize = 4_000;
+
+/// How long the flood waits for one more frame of the sender's own refusals
+/// after each wake. Short on purpose: it only has to keep the sender's 8 KiB
+/// egress queue from filling, not to wait for the hub.
+const SENDER_DRAIN_POLL: Duration = Duration::from_millis(10);
+
+/// Did the hub close this session? `BrokenPipe`, `ConnectionReset` and
+/// `UnexpectedEof` are how a peer sees the hub dropping a connection whose own
+/// egress queue was full (#7951).
+fn session_closed_by_hub(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::UnexpectedEof
+    )
+}
+
+/// #7951 — a sender that never reads its own `error/507` refusals is
+/// disconnected by design (`conn.rs` `send_error` -> `send` ->
+/// `try_enqueue` returns `false` once the sender's own egress queue is full).
+/// The harness must report that closed session as an `Err`, not panic inside
+/// `write_raw_framed`.
+#[tokio::test]
+async fn a_sender_that_never_reads_its_refusals_is_disconnected_not_a_panic_7951() {
+    let sender_id = "s".repeat(120);
+    let deaf_id = "d".repeat(120);
+    let key_sender = key(23);
+    let key_deaf = key(24);
+    let hub = Harness::start(
+        |cfg: &mut HubConfig| {
+            cfg.rate_per_sec = 1_000_000;
+            cfg.rate_burst = 1_000_000;
+            cfg.queue_bytes = NO_DRAIN_QUEUE_BYTES;
+            cfg.global_egress_bytes = 32 * 1_024;
+        },
+        Arc::new(verifier_allowing(&[
+            (sender_id.as_str(), &key_sender),
+            (deaf_id.as_str(), &key_deaf),
+        ])),
+        Arc::new(SameUidAuthorizer::for_current_process()),
+    );
+
+    let mut deaf = hub.connect().await;
+    deaf.hello(&deaf_id, &key_deaf, &[]).await;
+    assert_eq!(deaf.expect_frame().await.kind, Kind::Welcome);
+
+    let mut sender = hub.connect().await;
+    sender.hello(&sender_id, &key_sender, &[]).await;
+    assert_eq!(sender.expect_frame().await.kind, Kind::Welcome);
+
+    let big_row = "r".repeat(80);
+    let mut closed_after = None;
+    for sent in 0..NO_DRAIN_WAKE_BOUND {
+        if let Err(e) = sender.try_wake(&deaf_id, &big_row).await {
+            assert!(
+                session_closed_by_hub(&e),
+                "only a closed session may fail the write, got {e:?}"
+            );
+            closed_after = Some(sent);
+            break;
+        }
+    }
+    let closed_after = closed_after.unwrap_or_else(|| {
+        panic!(
+            "{NO_DRAIN_WAKE_BOUND} unread refusals must overflow the sender's own \
+             egress queue and make the hub close its session"
+        )
+    });
+    // #7956 lower bound: the hub must not hang up on the first 507. It may only
+    // close once the sender's queue could not take another refusal.
+    let floor = min_refusals_before_close(ai_memory::wake_hub::DEFAULT_HUB_ID, &sender_id);
+    assert!(
+        closed_after >= floor,
+        "closed after {closed_after} wakes, before {floor} unread refusals could fill the \
+         {NO_DRAIN_QUEUE_BYTES} B queue: a 507 must not close the session on its own"
+    );
+    // The wake count alone is weak (the deaf peer's socket buffer delays the
+    // first refusal), so also bound the REFUSALS the hub issued: a hub closing
+    // on the first 507 has refused once, a correct one at least `floor` times.
+    let refused = hub.metrics.snapshot(0).overflow;
+    assert!(
+        refused >= u64::try_from(floor).unwrap_or(u64::MAX),
+        "the hub closed the sender after only {refused} refusals, before {floor} unread \
+         refusals could fill its queue"
+    );
+
     hub.stop().await;
 }

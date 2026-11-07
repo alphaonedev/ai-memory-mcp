@@ -49,7 +49,7 @@ LOCK_ARG = '--lock "${AI_MEMORY_CI_TARGET_ROOT:?per-runner cache root not set}/.
 SHARED_FLAG = "matrix.shared_target"
 NOT_SHARED_FLAG = "!matrix.shared_target"
 SELF_HOSTED_GUARD = "runner.environment == 'self-hosted'"
-DOCS_ONLY_GUARD = "needs.classify.outputs.docs_only != 'true'"
+DOCS_ONLY_GUARD = "needs.classify.outputs.cargo_skip != 'true'"  # #8322
 ROOT_ENV = "AI_MEMORY_CI_TARGET_ROOT"
 
 

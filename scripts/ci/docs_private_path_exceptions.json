@@ -1,0 +1,25 @@
+{
+  "exceptions": [
+    {
+      "path": "docs/reference-architectures.md",
+      "line": 486,
+      "text": "   tier 0 → tier 1: async logical repl, ~minutes lag, durable",
+      "sha256": "acc12415669b5048376d58a2c7d08e5c9ec87c86e2f667bd8824b36dda3773cf",
+      "reason": "QUESTION-CODEX-8493-fenced-prose.md, god-f2 04:44Z: estimates not account names"
+    },
+    {
+      "path": "docs/reference-architectures.md",
+      "line": 487,
+      "text": "   tier 1 → tier 2: streaming repl, ~seconds lag",
+      "sha256": "f5a9e2061840971b89a29ee96602c4d8873913af09c82aeda547b5ba82ce16fe",
+      "reason": "QUESTION-CODEX-8493-fenced-prose.md, god-f2 04:44Z: estimates not account names"
+    },
+    {
+      "path": "docs/reference-architectures.md",
+      "line": 488,
+      "text": "   tier 2 → tier 3: federation push, ~milliseconds (intra-zone)",
+      "sha256": "37e6e7a912ad59b0e78cb34fa3d401f4d2fba6ab7a379e859d6f0f0dba4b05ff",
+      "reason": "QUESTION-CODEX-8493-fenced-prose.md, god-f2 04:44Z: estimates not account names"
+    }
+  ]
+}

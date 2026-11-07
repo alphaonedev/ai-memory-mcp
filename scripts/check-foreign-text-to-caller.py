@@ -2150,7 +2150,7 @@ def self_test(scratch):
     prefix = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'test', 'fixtures', 'foreign-text-prefix-3711.py')
     try:
         import subprocess
-        out = subprocess.run([sys.executable, prefix, root, '--allowlist=/dev/null', '--json'], capture_output=True, text=True, timeout=600).stdout
+        out = subprocess.run([sys.executable, '-I', prefix, root, '--allowlist=/dev/null', '--json'], capture_output=True, text=True, timeout=600).stdout
         frozen_fails = {x['key'] for x in json.loads(out)['findings'] if x['sev'] == 'FAIL'}
         expect(not any(':block_tail_laundered:' in k for k in frozen_fails), 'R-203: the FROZEN pre-fix gate (test/fixtures/foreign-text-prefix-3711.py) ACCEPTS the laundered block tail — the defect reproduces')
         expect(any(':forward_sanitised:mcp-error:http' in k for k in frozen_fails), 'R-203 sanity: the frozen gate still rejects the single-line {text} sink, so its silence on the block is the defect, not a broken run')
@@ -2161,7 +2161,7 @@ def self_test(scratch):
     prefix_3713 = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'test', 'fixtures', 'foreign-text-prefix-3713.py')
     try:
         import subprocess
-        out = subprocess.run([sys.executable, prefix_3713, root, '--allowlist=/dev/null', '--json'], capture_output=True, text=True, timeout=600).stdout
+        out = subprocess.run([sys.executable, '-I', prefix_3713, root, '--allowlist=/dev/null', '--json'], capture_output=True, text=True, timeout=600).stdout
         frozen_3713 = {x['key'] for x in json.loads(out)['findings'] if x['sev'] == 'FAIL'}
         expect(any(':log_only_if_let:' in k for k in frozen_3713), 'R-203: the FROZEN pre-#3713 gate (test/fixtures/foreign-text-prefix-3713.py) FLAGS the log-only pattern — the defect reproduces')
         expect(any(':reraise_ident:mcp-error:db' in k for k in frozen_3713), 'R-203 sanity: the frozen gate rejects the bare re-raise too, so its verdict on the pattern is the defect, not a broken run')
@@ -2205,7 +2205,7 @@ def self_test(scratch):
     prefix_4501 = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'test', 'fixtures', 'foreign-text-prefix-4501.py')
     try:
         import subprocess
-        out = subprocess.run([sys.executable, prefix_4501, root, '--allowlist=/dev/null', '--json'], capture_output=True, text=True, timeout=600).stdout
+        out = subprocess.run([sys.executable, '-I', prefix_4501, root, '--allowlist=/dev/null', '--json'], capture_output=True, text=True, timeout=600).stdout
         frozen_4501 = {x['key'] for x in json.loads(out)['findings'] if x['sev'] == 'FAIL'}
         expect(not any(':wrapped_layer:' in k for k in frozen_4501), 'R-203: the FROZEN pre-#4501 gate MISSES the rustfmt-wrapped from_fn_with_state layer — the defect reproduces')
         expect(not any(':wrapped_route_handler:' in k for k in frozen_4501), 'R-203: the FROZEN pre-#4501 gate MISSES the rustfmt-wrapped get(..) handler — the defect reproduces')
@@ -2219,7 +2219,7 @@ def self_test(scratch):
     prefix_3760 = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'test', 'fixtures', 'foreign-text-prefix-3760.py')
     try:
         import subprocess
-        out = subprocess.run([sys.executable, prefix_3760, root, '--allowlist=/dev/null', '--json'], capture_output=True, text=True, timeout=600).stdout
+        out = subprocess.run([sys.executable, '-I', prefix_3760, root, '--allowlist=/dev/null', '--json'], capture_output=True, text=True, timeout=600).stdout
         frozen_3760 = {x['key'] for x in json.loads(out)['findings'] if x['sev'] == 'FAIL'}
         expect(not any(':import_bulk:' in k for k in frozen_3760), 'R-203: the FROZEN pre-#3760 gate (test/fixtures/foreign-text-prefix-3760.py) ACCEPTS the errors[] array — the defect reproduces')
         expect(not any(':detail_key_render:' in k for k in frozen_3760), 'R-203: the FROZEN gate ACCEPTS foreign text under a non-"error" key — the key-literal enumeration reproduces')
@@ -2237,7 +2237,7 @@ def self_test(scratch):
     prefix_3767 = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'test', 'fixtures', 'foreign-text-prefix-3767.py')
     try:
         import subprocess
-        out = subprocess.run([sys.executable, prefix_3767, root, '--allowlist=/dev/null', '--json'], capture_output=True, text=True, timeout=600).stdout
+        out = subprocess.run([sys.executable, '-I', prefix_3767, root, '--allowlist=/dev/null', '--json'], capture_output=True, text=True, timeout=600).stdout
         frozen_3767 = {x['key'] for x in json.loads(out)['findings'] if x['sev'] == 'FAIL'}
         expect(not any(':checkpoint_after_guard:' in k for k in frozen_3767), 'R-203: the FROZEN pre-#3767 gate (test/fixtures/foreign-text-prefix-3767.py) ACCEPTS the guard-then-rusqlite::Result call — the swallowed-block launder reproduces')
         expect(not any(':share_after_guard:' in k for k in frozen_3767), 'R-203: the FROZEN gate ACCEPTS the guard-then-storage-anyhow call — the same launder reproduces')

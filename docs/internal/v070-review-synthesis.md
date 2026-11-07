@@ -87,13 +87,13 @@ unless the **Parallel-safe with** / **Dependencies** rows say otherwise.
      `recall_with_source_uri_prefix_uses_idx_memories_source_uri` (EXPLAIN QUERY PLAN check),
      and a `row_to_memory_corrupt_citations_logs_and_returns_default`.
 - **Files (absolute):**
-  - `/Users/fate/v07/synth-fix/src/atomisation/mod.rs` (compute_atom_span, read_atomised_into)
-  - `/Users/fate/v07/synth-fix/src/storage/mod.rs` (row_to_memory)
-  - `/Users/fate/v07/synth-fix/src/validate.rs` (validate_source_span)
-  - `/Users/fate/v07/synth-fix/src/cli/recall.rs` and `src/storage/mod.rs` recall SQL site
+  - `<home>/v07/synth-fix/src/atomisation/mod.rs` (compute_atom_span, read_atomised_into)
+  - `<home>/v07/synth-fix/src/storage/mod.rs` (row_to_memory)
+  - `<home>/v07/synth-fix/src/validate.rs` (validate_source_span)
+  - `<home>/v07/synth-fix/src/cli/recall.rs` and `src/storage/mod.rs` recall SQL site
     (push source_uri_prefix into WHERE)
-  - `/Users/fate/v07/synth-fix/tests/form_4_provenance.rs`,
-    `/Users/fate/v07/synth-fix/tests/atomisation.rs`
+  - `<home>/v07/synth-fix/tests/form_4_provenance.rs`,
+    `<home>/v07/synth-fix/tests/atomisation.rs`
 - **Findings absorbed:** COR-1 CRITICAL, COR-2 HIGH, COR-3 HIGH, COR-7 MED, PERF-3 HIGH, COV-3 HIGH
 - **Acceptance tests required:** four new tests listed above; CI gate green.
 - **LOE:** ~1 session (3–4 hours)
@@ -123,10 +123,10 @@ unless the **Parallel-safe with** / **Dependencies** rows say otherwise.
      `synthesis_response_carries_synthesis_failed_on_llm_error`,
      `synthesis_prompt_truncates_candidate_content_at_cap`.
 - **Files:**
-  - `/Users/fate/v07/synth-fix/src/synthesis/mod.rs`
-  - `/Users/fate/v07/synth-fix/src/mcp/tools/store.rs`
-  - `/Users/fate/v07/synth-fix/src/governance/` (K9 hook call site)
-  - `/Users/fate/v07/synth-fix/tests/form_1_synthesis.rs`
+  - `<home>/v07/synth-fix/src/synthesis/mod.rs`
+  - `<home>/v07/synth-fix/src/mcp/tools/store.rs`
+  - `<home>/v07/synth-fix/src/governance/` (K9 hook call site)
+  - `<home>/v07/synth-fix/tests/form_1_synthesis.rs`
 - **Findings absorbed:** SEC-1 HIGH, SEC-11 MED, COR-5 MED, COR-6 MED, PERF-7 HIGH
 - **LOE:** ~1 session
 - **Parallel-safe with:** A, C, D, E, G, H, I, J
@@ -147,11 +147,11 @@ unless the **Parallel-safe with** / **Dependencies** rows say otherwise.
   4. **COV-5 fix:** add negative cross-method + cross-pending_id tests:
      `hmac_cross_method_binding_rejected`, `hmac_cross_pending_id_binding_rejected`.
 - **Files:**
-  - `/Users/fate/v07/synth-fix/src/signed_events.rs`
-  - `/Users/fate/v07/synth-fix/src/governance/deferred_audit.rs`
-  - `/Users/fate/v07/synth-fix/src/atomisation/mod.rs:656` (SEC-19 site — closed by SEC-3 fix)
-  - `/Users/fate/v07/synth-fix/tests/signed_events_chain_v34.rs`
-  - `/Users/fate/v07/synth-fix/tests/k10_approval_security.rs`
+  - `<home>/v07/synth-fix/src/signed_events.rs`
+  - `<home>/v07/synth-fix/src/governance/deferred_audit.rs`
+  - `<home>/v07/synth-fix/src/atomisation/mod.rs:656` (SEC-19 site — closed by SEC-3 fix)
+  - `<home>/v07/synth-fix/tests/signed_events_chain_v34.rs`
+  - `<home>/v07/synth-fix/tests/k10_approval_security.rs`
 - **Findings absorbed:** SEC-3 HIGH, SEC-19 LOW, COR-9 MED, COV-5 HIGH
 - **LOE:** ~1 session
 - **Parallel-safe with:** A, B, D, E, G, H, I, J
@@ -176,12 +176,12 @@ unless the **Parallel-safe with** / **Dependencies** rows say otherwise.
      log surface.
   6. **COV-8 fix:** add named test `tests/k9_kg_invalidate_governance_gate.rs::handle_kg_invalidate_refuses_when_rule_denies`.
 - **Files:**
-  - `/Users/fate/v07/synth-fix/src/governance/rules_store.rs`
-  - `/Users/fate/v07/synth-fix/src/governance/agent_action.rs`
-  - `/Users/fate/v07/synth-fix/src/hooks/executor.rs`
-  - `/Users/fate/v07/synth-fix/src/mcp/tools/offload.rs`
-  - `/Users/fate/v07/synth-fix/src/offload/mod.rs`
-  - `/Users/fate/v07/synth-fix/src/capabilities.rs`
+  - `<home>/v07/synth-fix/src/governance/rules_store.rs`
+  - `<home>/v07/synth-fix/src/governance/agent_action.rs`
+  - `<home>/v07/synth-fix/src/hooks/executor.rs`
+  - `<home>/v07/synth-fix/src/mcp/tools/offload.rs`
+  - `<home>/v07/synth-fix/src/offload/mod.rs`
+  - `<home>/v07/synth-fix/src/capabilities.rs`
 - **Findings absorbed:** SEC-2 HIGH, SEC-4 HIGH, SEC-12 MED, SEC-13 MED, SEC-17 LOW, COR-10 MED, COV-8 MED
 - **LOE:** ~1 session
 - **Parallel-safe with:** A, B, C, E, G, H, I, J
@@ -202,14 +202,14 @@ unless the **Parallel-safe with** / **Dependencies** rows say otherwise.
      `cli_recall_kinds_alias_kind_still_works`,
      skill CLI/HTTP integration tests (6 each).
 - **Files:**
-  - `/Users/fate/v07/synth-fix/src/models/memory.rs` (parse_csv)
-  - `/Users/fate/v07/synth-fix/src/mcp/tools/recall.rs` (apply_kinds_filter)
-  - `/Users/fate/v07/synth-fix/src/cli/recall.rs`
-  - `/Users/fate/v07/synth-fix/src/cli/skill.rs` (NEW)
-  - `/Users/fate/v07/synth-fix/src/handlers/http.rs` (NEW skill routes)
-  - `/Users/fate/v07/synth-fix/src/lib.rs` (router additions)
-  - `/Users/fate/v07/synth-fix/tests/form_6_memorykind_vocab.rs`
-  - `/Users/fate/v07/synth-fix/tests/skill_test.rs`
+  - `<home>/v07/synth-fix/src/models/memory.rs` (parse_csv)
+  - `<home>/v07/synth-fix/src/mcp/tools/recall.rs` (apply_kinds_filter)
+  - `<home>/v07/synth-fix/src/cli/recall.rs`
+  - `<home>/v07/synth-fix/src/cli/skill.rs` (NEW)
+  - `<home>/v07/synth-fix/src/handlers/http.rs` (NEW skill routes)
+  - `<home>/v07/synth-fix/src/lib.rs` (router additions)
+  - `<home>/v07/synth-fix/tests/form_6_memorykind_vocab.rs`
+  - `<home>/v07/synth-fix/tests/skill_test.rs`
 - **Findings absorbed:** COR-4 HIGH, API-3 MED, API-2 HIGH (Skills slice only — other HTTP gaps
   in cluster K disposition).
 - **LOE:** ~1.5 sessions (skills CLI+HTTP is the bulk)
@@ -237,13 +237,13 @@ unless the **Parallel-safe with** / **Dependencies** rows say otherwise.
   8. Tests: regression test asserting recall no longer issues separate `get_embedding`;
      regression test asserting K touches share one writer transaction.
 - **Files:**
-  - `/Users/fate/v07/synth-fix/src/mcp/tools/store.rs` (handler signature + hook wire-up)
-  - `/Users/fate/v07/synth-fix/src/hooks/pre_store/auto_atomise.rs`
-  - `/Users/fate/v07/synth-fix/src/hooks/post_reflect/auto_persona.rs`
-  - `/Users/fate/v07/synth-fix/src/hooks/post_reflect/auto_export.rs`
-  - `/Users/fate/v07/synth-fix/src/storage/mod.rs` (recall hybrid + touch)
-  - `/Users/fate/v07/synth-fix/src/synthesis/mod.rs`
-  - `/Users/fate/v07/synth-fix/src/atomisation/curator.rs` (max_retries)
+  - `<home>/v07/synth-fix/src/mcp/tools/store.rs` (handler signature + hook wire-up)
+  - `<home>/v07/synth-fix/src/hooks/pre_store/auto_atomise.rs`
+  - `<home>/v07/synth-fix/src/hooks/post_reflect/auto_persona.rs`
+  - `<home>/v07/synth-fix/src/hooks/post_reflect/auto_export.rs`
+  - `<home>/v07/synth-fix/src/storage/mod.rs` (recall hybrid + touch)
+  - `<home>/v07/synth-fix/src/synthesis/mod.rs`
+  - `<home>/v07/synth-fix/src/atomisation/curator.rs` (max_retries)
 - **Findings absorbed:** PERF-1 CRIT, PERF-2 CRIT, PERF-5 HIGH, PERF-6 HIGH, PERF-10 MED, PERF-14 LOW, PERF-15 LOW
 - **LOE:** ~2 sessions (handler signature change cascades; well-scoped)
 - **Parallel-safe with:** C, G, H, I, J, K, L
@@ -265,12 +265,12 @@ unless the **Parallel-safe with** / **Dependencies** rows say otherwise.
   4. **COV-2 fix:** add `mcp_handler_calibrate_confidence_returns_baselines_envelope` test.
   5. **COV-14 fix:** add `recall_touch_with_decay_env_set_updates_decayed_at` test.
 - **Files:**
-  - `/Users/fate/v07/synth-fix/migrations/sqlite/0033_v07_form5_confidence_calibration.sql`
+  - `<home>/v07/synth-fix/migrations/sqlite/0033_v07_form5_confidence_calibration.sql`
     (or new follow-up migration for the compound index + retention column)
-  - `/Users/fate/v07/synth-fix/src/confidence/shadow.rs`
-  - `/Users/fate/v07/synth-fix/src/confidence/calibrate.rs`
-  - `/Users/fate/v07/synth-fix/src/background/` (new sweeper)
-  - `/Users/fate/v07/synth-fix/tests/form_5_confidence_calibration.rs`
+  - `<home>/v07/synth-fix/src/confidence/shadow.rs`
+  - `<home>/v07/synth-fix/src/confidence/calibrate.rs`
+  - `<home>/v07/synth-fix/src/background/` (new sweeper)
+  - `<home>/v07/synth-fix/tests/form_5_confidence_calibration.rs`
 - **Findings absorbed:** PERF-4 HIGH, PERF-9 MED, PERF-12 MED, COV-2 HIGH, COV-14 LOW
 - **LOE:** ~1.5 sessions (GC sweeper + retention column = bulk)
 - **Parallel-safe with:** A, B, C, D, E, H, I, J, K, L
@@ -299,7 +299,7 @@ unless the **Parallel-safe with** / **Dependencies** rows say otherwise.
   6. **DOC-9:** in `docs/memory-kind-vocab.md`, replace `ai-memory doctor --capabilities=v3`
      with `ai-memory mcp call memory_capabilities '{"schema_version":"3"}' | jq .memory_kind_vocab`.
   7. **DOC-12:** in `cookbook/multistep-ingest/01-two-phase.sh`, replace hardcoded
-     `/Users/fate/v07/v07-fixes/` paths with `"${REPO_ROOT}/.local-runs"` /
+     `<home>/v07/v07-fixes/` paths with `"${REPO_ROOT}/.local-runs"` /
      `"${REPO_ROOT}/target"`.
   8. **DOC-13:** add post-audit prologue to `docs/internal/batman-framework-audit.md`
      declaring it reflects state at `53b4d39` and Forms 1-6 + 7th shipped in response (PRs
@@ -324,20 +324,20 @@ unless the **Parallel-safe with** / **Dependencies** rows say otherwise.
   18. **API-4:** add `"source": {"enum": ["shadow"], "default": "shadow"}` to MCP
       `memory_calibrate_confidence` inputSchema.
 - **Files:** (many; docs and registry strings)
-  - `/Users/fate/v07/synth-fix/README.md`
-  - `/Users/fate/v07/synth-fix/docs/v0.7.0/release-notes.md`
-  - `/Users/fate/v07/synth-fix/docs/MIGRATION_v0.7.md`
-  - `/Users/fate/v07/synth-fix/docs/memory-kind-vocab.md`
-  - `/Users/fate/v07/synth-fix/docs/atomisation.md`
-  - `/Users/fate/v07/synth-fix/docs/policy-engine.md`
-  - `/Users/fate/v07/synth-fix/docs/internal/batman-framework-audit.md`
-  - `/Users/fate/v07/synth-fix/docs/API_REFERENCE.md`
-  - `/Users/fate/v07/synth-fix/docs/CLI_REFERENCE.md`
-  - `/Users/fate/v07/synth-fix/cookbook/multistep-ingest/01-two-phase.sh`
-  - `/Users/fate/v07/synth-fix/src/daemon_runtime.rs:181` (help string)
-  - `/Users/fate/v07/synth-fix/src/mcp/registry.rs:1325` (docstring)
-  - `/Users/fate/v07/synth-fix/src/cli/governance.rs` (envelope key rename)
-  - `/Users/fate/v07/synth-fix/src/cli/commands/calibrate_confidence.rs` (--source enum)
+  - `<home>/v07/synth-fix/README.md`
+  - `<home>/v07/synth-fix/docs/v0.7.0/release-notes.md`
+  - `<home>/v07/synth-fix/docs/MIGRATION_v0.7.md`
+  - `<home>/v07/synth-fix/docs/memory-kind-vocab.md`
+  - `<home>/v07/synth-fix/docs/atomisation.md`
+  - `<home>/v07/synth-fix/docs/policy-engine.md`
+  - `<home>/v07/synth-fix/docs/internal/batman-framework-audit.md`
+  - `<home>/v07/synth-fix/docs/API_REFERENCE.md`
+  - `<home>/v07/synth-fix/docs/CLI_REFERENCE.md`
+  - `<home>/v07/synth-fix/cookbook/multistep-ingest/01-two-phase.sh`
+  - `<home>/v07/synth-fix/src/daemon_runtime.rs:181` (help string)
+  - `<home>/v07/synth-fix/src/mcp/registry.rs:1325` (docstring)
+  - `<home>/v07/synth-fix/src/cli/governance.rs` (envelope key rename)
+  - `<home>/v07/synth-fix/src/cli/commands/calibrate_confidence.rs` (--source enum)
   - **NEW:** `docs/hooks.md`, `docs/federation.md`, `docs/quotas.md`, `docs/approvals.md`,
     `docs/transcripts.md`, `docs/signed-events.md`
   - **NEW:** `RELEASE_NOTES_v0.7.0.md` (root)
@@ -369,9 +369,9 @@ unless the **Parallel-safe with** / **Dependencies** rows say otherwise.
   8. **COV-13 fix:** `mcp_handler_deref_envelope_round_trip` + `mcp_handler_deref_refuses_tampered_blob_with_structured_error`.
   9. **COV-4 fix:** `auto_persona_hook_fires_every_n_memories` end-to-end test.
 - **Files:**
-  - `/Users/fate/v07/synth-fix/.github/workflows/ci.yml`
-  - `/Users/fate/v07/synth-fix/tests/` (numerous new files)
-  - Seed DB: `/Users/fate/v07/synth-fix/tests/fixtures/v064_seed.db` (or equivalent)
+  - `<home>/v07/synth-fix/.github/workflows/ci.yml`
+  - `<home>/v07/synth-fix/tests/` (numerous new files)
+  - Seed DB: `<home>/v07/synth-fix/tests/fixtures/v064_seed.db` (or equivalent)
 - **Findings absorbed:** COV-1 CRIT, COV-4 HIGH, COV-6 HIGH, COV-7 MED, COV-9 MED, COV-10 MED, COV-11 MED, COV-12 MED, COV-13 MED
 - **LOE:** ~2 sessions (CI gate flip = 0.5h; the 8 test adds = remainder)
 - **Parallel-safe with:** all (test-only)
@@ -389,11 +389,11 @@ unless the **Parallel-safe with** / **Dependencies** rows say otherwise.
      safe to rename — currently it returns zero per DOC-20).
   3. Add `tests/migration_filename_unique.rs::no_duplicate_migration_prefix_collisions` ship-gate.
 - **Files:**
-  - `/Users/fate/v07/synth-fix/migrations/sqlite/0031_v07_namespace_auto_atomise.sql`
-  - `/Users/fate/v07/synth-fix/migrations/sqlite/0031_v07_persona.sql` (verify slot)
-  - `/Users/fate/v07/synth-fix/migrations/postgres/0018_v07_namespace_auto_atomise.sql`
-  - `/Users/fate/v07/synth-fix/migrations/postgres/0018_v07_persona.sql`
-  - **NEW:** `/Users/fate/v07/synth-fix/tests/migration_filename_unique.rs`
+  - `<home>/v07/synth-fix/migrations/sqlite/0031_v07_namespace_auto_atomise.sql`
+  - `<home>/v07/synth-fix/migrations/sqlite/0031_v07_persona.sql` (verify slot)
+  - `<home>/v07/synth-fix/migrations/postgres/0018_v07_namespace_auto_atomise.sql`
+  - `<home>/v07/synth-fix/migrations/postgres/0018_v07_persona.sql`
+  - **NEW:** `<home>/v07/synth-fix/tests/migration_filename_unique.rs`
 - **Findings absorbed:** COR-13 LOW, DOC-20 LOW
 - **LOE:** 30 minutes
 - **Parallel-safe with:** all
@@ -414,10 +414,10 @@ unless the **Parallel-safe with** / **Dependencies** rows say otherwise.
     13 missing routes; recommend (b) "honest documentation" in MIGRATION_v0.7.md noting
     the MCP-only surface, with HTTP routes scoped for v0.7.1.
 - **Files:** (depending on decision)
-  - `/Users/fate/v07/synth-fix/CHANGELOG.md`
-  - `/Users/fate/v07/synth-fix/docs/v0.7.0/release-notes.md`
-  - `/Users/fate/v07/synth-fix/docs/positioning.md`
-  - `/Users/fate/v07/synth-fix/docs/internal/v070-feature-inventory.md` (KU #9 closure note)
+  - `<home>/v07/synth-fix/CHANGELOG.md`
+  - `<home>/v07/synth-fix/docs/v0.7.0/release-notes.md`
+  - `<home>/v07/synth-fix/docs/positioning.md`
+  - `<home>/v07/synth-fix/docs/internal/v070-feature-inventory.md` (KU #9 closure note)
 - **Findings absorbed:** API-12 HIGH, API-2 HIGH (residual after E), DOC implicit
 - **LOE:** Option (a) 1-2 sessions; (b) 30 minutes; (c) 30 minutes
 - **Parallel-safe with:** all

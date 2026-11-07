@@ -220,8 +220,11 @@ pub(crate) fn forward_signal_send_to_http(
 ) -> Result<Value, String> {
     let url = format!("{}/api/v1/signals", forward_url.trim_end_matches('/'));
     let explicit = params[crate::mcp::param_names::FROM_AGENT].as_str();
-    let agent_id =
-        crate::identity::resolve_agent_id(explicit, mcp_client).map_err(|e| e.to_string())?;
+    // #8496 — the forwarded `X-Agent-Id` is the sender the daemon stamps, so it
+    // is bound to the enforced caller (#3171 store-forward precedent); a
+    // mismatching wire `from_agent` is refused before any network I/O.
+    let agent_id = crate::identity::resolve_governance_subject(explicit, mcp_client, "signal_send")
+        .map_err(|e| e.to_string())?;
     let body = params.clone();
     let headers: &[(&str, String)] = &[(crate::HEADER_AGENT_ID, agent_id)];
     forward_to_http(reqwest::Method::POST, &url, Some(&body), headers)
@@ -270,6 +273,75 @@ mod coordination_forward_tests {
         .expect_err("dead URL must error");
         assert!(err.contains("federation_forward"), "got: {err}");
         assert!(err.contains("/api/v1/signals"), "got: {err}");
+    }
+}
+
+#[cfg(test)]
+mod signal_sender_binding_8496_tests {
+    use super::*;
+    use crate::identity::test_agent_id::AgentIdOverride;
+    use serde_json::json;
+
+    /// Serve one request on loopback, answer `200 {}`, and hand back the raw
+    /// request bytes the daemon would have seen.
+    fn recording_server() -> (String, std::sync::mpsc::Receiver<String>) {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            let mut buf = [0u8; 8192];
+            let n = sock.read(&mut buf).unwrap_or(0);
+            let _ = tx.send(String::from_utf8_lossy(&buf[..n]).into_owned());
+            let _ = write!(
+                sock,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+            );
+            let _ = sock.flush();
+        });
+        (format!("http://127.0.0.1:{port}"), rx)
+    }
+
+    /// #8496 — a wire `from_agent` that names someone other than the bound
+    /// caller is refused before any network I/O (dead port: a transport error
+    /// would read `federation_forward`, never `agent_id mismatch`).
+    #[test]
+    fn forward_refuses_from_agent_that_differs_from_the_caller_8496() {
+        let _env = crate::identity::agent_id_env_test_lock();
+        let _id = AgentIdOverride::set("ai:alice");
+        let err = forward_signal_send_to_http(
+            "http://127.0.0.1:1",
+            &json!({"namespace": "ns", "subject": "s", "from_agent": "ai:mallory"}),
+            Some("ai:test"),
+        )
+        .expect_err("a forged sender must be refused");
+        assert!(err.contains("agent_id mismatch"), "got: {err}");
+        assert!(
+            !err.contains("federation_forward"),
+            "no I/O attempted: {err}"
+        );
+    }
+
+    /// #8496 — a `from_agent` equal to the caller, or absent, forwards with
+    /// the caller as `X-Agent-Id`.
+    #[test]
+    fn forward_header_is_the_verified_caller_8496() {
+        let _env = crate::identity::agent_id_env_test_lock();
+        let _id = AgentIdOverride::set("ai:alice");
+        for params in [
+            json!({"namespace": "ns", "subject": "s"}),
+            json!({"namespace": "ns", "subject": "s", "from_agent": "ai:alice"}),
+        ] {
+            let (url, rx) = recording_server();
+            forward_signal_send_to_http(&url, &params, Some("ai:test")).expect("forward ok");
+            let req = rx.recv().expect("request captured").to_ascii_lowercase();
+            let want = format!("{}: ai:alice", crate::HEADER_AGENT_ID.to_ascii_lowercase());
+            assert!(
+                req.contains(&want),
+                "X-Agent-Id must be the caller; got: {req}"
+            );
+        }
     }
 }
 

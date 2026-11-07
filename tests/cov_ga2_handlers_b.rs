@@ -243,10 +243,17 @@ async fn decode(router: &axum::Router, req: Request<Body>) -> (StatusCode, Value
 }
 
 /// Build a K10-signed `POST /api/v1/approvals/{id}` request bound to the
-/// canonical `(timestamp, "POST", pending_id, body)` envelope.
+/// canonical `(timestamp, "POST", "<pending_id>@operator-1", body)` envelope
+/// (the #8495 v2 layout binds the approver into the signed subject).
 fn signed_approval(pending_id: &str, body: &str) -> Request<Body> {
     let timestamp = chrono::Utc::now().timestamp().to_string();
-    let sig = common::sign_canonical_envelope(HMAC_SECRET, &timestamp, "POST", pending_id, body);
+    let sig = common::sign_canonical_envelope(
+        HMAC_SECRET,
+        &timestamp,
+        "POST",
+        &ai_memory::handlers::agent_api_key::approval_subject(pending_id, "operator-1"),
+        body,
+    );
     Request::builder()
         .method("POST")
         .uri(format!("/api/v1/approvals/{pending_id}"))
@@ -274,7 +281,7 @@ fn seed_pending_row(path: &std::path::Path, namespace: &str, requested_by: &str)
         source: "test".into(),
         created_at: chrono::Utc::now().to_rfc3339(),
         updated_at: chrono::Utc::now().to_rfc3339(),
-        metadata: json!({}),
+        metadata: json!({"agent_id": requested_by}),
         version: 1,
         ..ai_memory::models::Memory::default()
     };
@@ -1019,7 +1026,13 @@ async fn approval_decide_stale_timestamp_is_401() {
     let body = json!({"decision": "approve"}).to_string();
     // A timestamp far outside the 300s replay window -> stale -> 401.
     let stale_ts = (chrono::Utc::now().timestamp() - 10_000).to_string();
-    let sig = common::sign_canonical_envelope(HMAC_SECRET, &stale_ts, "POST", &pending_id, &body);
+    let sig = common::sign_canonical_envelope(
+        HMAC_SECRET,
+        &stale_ts,
+        "POST",
+        &ai_memory::handlers::agent_api_key::approval_subject(&pending_id, "operator-1"),
+        &body,
+    );
     let req = Request::builder()
         .method("POST")
         .uri(format!("/api/v1/approvals/{pending_id}"))
@@ -1047,7 +1060,13 @@ async fn approval_decide_nonce_replay_is_401() {
     // call consumes the row (approved); the SECOND replays the exact same
     // signature, which record_hmac_nonce rejects as a single-use replay.
     let timestamp = chrono::Utc::now().timestamp().to_string();
-    let sig = common::sign_canonical_envelope(HMAC_SECRET, &timestamp, "POST", &pending_id, &body);
+    let sig = common::sign_canonical_envelope(
+        HMAC_SECRET,
+        &timestamp,
+        "POST",
+        &ai_memory::handlers::agent_api_key::approval_subject(&pending_id, "operator-1"),
+        &body,
+    );
     let make = || {
         Request::builder()
             .method("POST")
@@ -1085,7 +1104,13 @@ async fn approval_decide_invalid_id_shape_is_400() {
     let decoded_id = "bad id";
     let body = json!({"decision": "approve"}).to_string();
     let timestamp = chrono::Utc::now().timestamp().to_string();
-    let sig = common::sign_canonical_envelope(HMAC_SECRET, &timestamp, "POST", decoded_id, &body);
+    let sig = common::sign_canonical_envelope(
+        HMAC_SECRET,
+        &timestamp,
+        "POST",
+        &ai_memory::handlers::agent_api_key::approval_subject(decoded_id, "operator-1"),
+        &body,
+    );
     let req = Request::builder()
         .method("POST")
         .uri("/api/v1/approvals/bad%20id")

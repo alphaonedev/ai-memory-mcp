@@ -603,7 +603,7 @@ async fn pg_namespace_meta_lane_dlq_parity_2667() {
         .find(|r| r.memory_id == expected_key)
         .expect("#2667: the namespace_meta lane must land a DLQ row on the postgres sink too");
     assert_eq!(row.peer_id, "peer-down");
-    assert!(!row.last_error.is_empty());
+    assert_ne!(row.last_error, "");
     assert_eq!(row.payload_json["namespace_meta"][0]["namespace"], ns);
 
     // Leave zero residue: clear the row we created.

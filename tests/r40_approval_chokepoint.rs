@@ -202,8 +202,9 @@ fn seed_escalated_store_pending(db_path: &std::path::Path, ns: &str, content: &s
 fn signed_http_request(uri: &str, pending_id: &str, body: &Value) -> Request<Body> {
     let body_str = serde_json::to_string(body).unwrap();
     let timestamp = chrono::Utc::now().timestamp().to_string();
-    let sig =
-        common::sign_canonical_envelope(TEST_SECRET, &timestamp, "POST", pending_id, &body_str);
+    // #8495 layout v2: the approver is inside the signed subject.
+    let subject = ai_memory::handlers::agent_api_key::approval_subject(pending_id, APPROVER);
+    let sig = common::sign_canonical_envelope(TEST_SECRET, &timestamp, "POST", &subject, &body_str);
     Request::builder()
         .method("POST")
         .uri(uri)

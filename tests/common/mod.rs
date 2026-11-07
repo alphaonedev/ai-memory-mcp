@@ -89,6 +89,8 @@ pub mod lane_db;
 // daemon-spawning suite uses (the daemon refuses every plaintext bind).
 pub mod tls;
 pub mod tls_receiver;
+/// Shared TLS serve startup, readiness, and child ownership (#8293).
+pub mod tls_serve;
 
 use std::path::PathBuf;
 use std::sync::Mutex;

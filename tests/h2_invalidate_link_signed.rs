@@ -255,7 +255,7 @@ fn unsigned_link_invalidation_does_not_create_audit_row() {
     )
     .expect("invalidate")
     .expect("found");
-    assert!(!res.valid_until.is_empty());
+    assert_ne!(res.valid_until, "");
 
     // No audit row should be appended for an unsigned-link
     // invalidation — the audit chain is signature-bearing only.

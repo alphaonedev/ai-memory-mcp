@@ -107,7 +107,7 @@ fn removed_downgrade_paths_named_with_remedy_3705() {
         // SAFETY: serialised by ENV_LOCK.
         unsafe { std::env::remove_var(env) };
     }
-    assert!(armed_downgrade_paths().is_empty());
+    assert_eq!(armed_downgrade_paths(), [] as [&str; 0]);
     assert!(enforce_no_downgrade_paths().is_ok());
     for env in REMOVED_DOWNGRADE_ENVS {
         // SAFETY: as above.

@@ -571,15 +571,20 @@ hmac_secret = "hmac-secret-must-not-leak"
         .expect("fixture parses");
         redact_toml_value(&mut value);
         let rendered = toml::to_string_pretty(&value).expect("render");
-        for secret in [
+        // #6585 — a failing check names the fixture by index and never
+        // echoes the fixture or the rendering that carries it.
+        for (fixture_idx, fixture) in [
             "legacy-top-level-secret",
             "reranker-secret-must-not-leak",
             "auto-tag-secret-must-not-leak",
             "hmac-secret-must-not-leak",
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             assert!(
-                !rendered.contains(secret),
-                "leaked {secret} in:\n{rendered}"
+                !rendered.contains(fixture),
+                "credential fixture #{fixture_idx} leaked into the redacted rendering"
             );
         }
         // ALLOWED: the shape stays readable and the pointer stays visible.

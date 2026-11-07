@@ -18,7 +18,7 @@ agent returns.
 ## Expected report path
 
 ```
-/Users/fate/v07/v07-f5/docs/v0.7.0/heterogeneous-ai-nhi-assessment/report-claude-opus-4-7-v3.md
+<home>/v07/v07-f5/docs/v0.7.0/heterogeneous-ai-nhi-assessment/report-claude-opus-4-7-v3.md
 ```
 
 If the report is not yet present at the time you are reading this

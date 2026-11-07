@@ -607,7 +607,14 @@ fn fbl24_scan_advances_past_all_decrypt_skipped_batch() {
     let page3 =
         db::get_unembedded_ids_batch_after(&conn, page2.raw_last_id.as_deref(), 2).expect("page 3");
     assert!(page3.raw_last_id.is_none(), "end of corpus");
-    assert!(page3.rows.is_empty());
+    assert_eq!(
+        page3.rows,
+        [] as [(
+            std::string::String,
+            std::string::String,
+            std::string::String
+        ); 0]
+    );
 
     // The reembed full-corpus scan exposes the same FIRST-DISCOVERY
     // contract on a fresh database (#3344 persist of skip markers from
@@ -626,7 +633,14 @@ fn fbl24_scan_advances_past_all_decrypt_skipped_batch() {
     }
     seed(&conn2, "fbl24-z", Tier::Long, None);
     let texts = db::get_memory_texts_batch(&conn2, None, None, 2, None).expect("texts page 1");
-    assert!(texts.rows.is_empty());
+    assert_eq!(
+        texts.rows,
+        [] as [(
+            std::string::String,
+            std::string::String,
+            std::string::String
+        ); 0]
+    );
     assert_eq!(texts.decrypt_skipped, 2);
     assert_eq!(texts.raw_last_id.as_deref(), Some("fbl24-b"));
     let texts2 = db::get_memory_texts_batch(&conn2, None, texts.raw_last_id.as_deref(), 2, None)

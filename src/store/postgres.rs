@@ -800,10 +800,14 @@ const SQL_SELECT_NS_VERSION_BY_ID: &str = "SELECT namespace, version FROM memori
 /// the optional G6 TOMBSTONE leaf share one probe (single SQL SSOT).
 const SQL_SELECT_NS_VERSION_AGENT_BY_ID: &str =
     "SELECT namespace, version, metadata->>'agent_id' FROM memories WHERE id = $1";
-/// #3192 — destroy the per-record envelope key for one encrypted (0x03) row.
+/// #3192 — destroy the per-record envelope key for one crypto-erasable row.
+/// `$3` binds [`crate::encryption::crypto_erasable_envelope_version_codes`]
+/// (`0x03` and `0x05`, #8278 R16), the codes of
+/// `crate::encryption::CRYPTO_ERASABLE_ENVELOPE_VERSIONS`, the SSOT the
+/// SQLite twin also reads.
 const SQL_CRYPTO_ERASE_ENVELOPE_BY_ID: &str = "UPDATE memories SET encrypted_envelope = $2 \
      WHERE id = $1 AND encrypted_envelope IS NOT NULL \
-       AND get_byte(encrypted_envelope, 0) = 3 \
+       AND get_byte(encrypted_envelope, 0) = ANY($3::int[]) \
      RETURNING id";
 /// #3192 — erasure invariant: NULL `cid_genesis` for one victim.
 const SQL_SCRUB_CID_GENESIS_BY_ID: &str =
@@ -16581,7 +16585,8 @@ async fn pg_hard_delete_in_tx(
 }
 
 /// #3192 — sqlite `tombstone_and_erase` parity for one live row: crypto-erase
-/// the per-record envelope (when 0x03), INSERT the forget tombstone, scrub
+/// the per-record envelope (when 0x03 or 0x05, the SSOT
+/// `crate::encryption::CRYPTO_ERASABLE_ENVELOPE_VERSIONS`), INSERT the forget tombstone, scrub
 /// `cid_genesis`, purge DLQ/dedup remanence, emit the signed erasure
 /// attestation. Returns `Some((namespace, version))` when the row existed
 /// (so the caller can emit the G6 leaf); `None` when already gone.
@@ -16603,6 +16608,7 @@ async fn pg_tombstone_and_erase_in_tx(
     let erased: Option<(String,)> = sqlx::query_as(SQL_CRYPTO_ERASE_ENVELOPE_BY_ID)
         .bind(id)
         .bind(crate::encryption::crypto_erase_marker())
+        .bind(crate::encryption::crypto_erasable_envelope_version_codes())
         .fetch_optional(&mut **tx)
         .await?;
     sqlx::query(SQL_SCRUB_CID_GENESIS_BY_ID)
@@ -20567,6 +20573,55 @@ impl PostgresStore {
         // Winner: re-derive the durable state and reconcile the cache. On a
         // read error `seed_record_stop` leaves the cache as-is (fail-closed).
         self.seed_record_stop().await;
+    }
+
+    /// #8577 — the row-owner rule of an approved `delete` / tier-bump
+    /// `promote` as a precondition of the approval vote: the same
+    /// `FOR UPDATE` owner probe the `delete` / `update` funnels run in the
+    /// execute arms, evaluated for the REQUESTER before the vote is written.
+    /// A refusal writes the `pending_action.refused_owner_gate` audit row and
+    /// leaves the pending row `pending`; a missing target is left to the
+    /// execute step. Parity doc `federation_signing_check.rs:86-112`.
+    async fn pg_assert_execute_owner(&self, pa: &crate::models::PendingAction) -> StoreResult<()> {
+        let Some((arm, mid)) = crate::storage::execute_owner_8577::execute_arm_target(pa) else {
+            return Ok(());
+        };
+        let (action, unstamped_reason, allow_inbox) = match arm {
+            crate::storage::ExecuteArm::Delete => (
+                "delete",
+                REASON_UNSTAMPED_TENANT_DELETE,
+                crate::visibility::inbox_delete_retains(&pa.namespace),
+            ),
+            crate::storage::ExecuteArm::TierBump => {
+                ("update", REASON_UNSTAMPED_TENANT_WRITE, false)
+            }
+        };
+        let requester = CallerContext::for_agent(&pa.requested_by);
+        match Self::assert_caller_owns_for_mutation_on(
+            &self.pool,
+            &requester,
+            mid,
+            action,
+            unstamped_reason,
+            allow_inbox,
+        )
+        .await
+        {
+            Err(StoreError::NotFound { .. }) | Ok(()) => Ok(()),
+            Err(refusal) => {
+                if let Err(e) = self
+                    .pg_emit_pending_action_event(
+                        pa,
+                        crate::storage::execute_owner_8577::EVENT_REFUSED_OWNER_GATE,
+                        None,
+                    )
+                    .await
+                {
+                    tracing::warn!("pending_action owner-gate refusal audit row not written: {e}");
+                }
+                Err(refusal)
+            }
+        }
     }
 
     /// v1.0.0 #3180 / #3175 — append ONE `pending_action.<state>` audit row
@@ -27650,13 +27705,15 @@ impl MemoryStore for PostgresStore {
                 .map_err(|e| to_store_err("forget scrub cid_genesis", e))?;
 
                 // #1956 [R56] — CRYPTO-ERASE the per-record envelope key for every
-                // encrypted (0x03) row this forget will reap, BEFORE the delete
+                // crypto-erasable row (0x03 per-record or 0x05 scope, the SSOT
+                // `crate::encryption::CRYPTO_ERASABLE_ENVELOPE_VERSIONS`) this forget will reap, BEFORE the delete
                 // (postgres parity with the sqlite `crypto_erase_record_envelope`).
                 // Overwriting the envelope with the destroy marker destroys the
                 // embedded wrapped DEK so the ciphertext is cryptographically
                 // unrecoverable even by a holder of the master KEK; the marker
                 // propagates to replicas / WAL as an UPDATE ahead of the tombstoning
-                // delete. `get_byte(...,0) = 3` selects only per-record envelopes —
+                // delete. `get_byte(...,0) = ANY($6)` selects the crypto-erasable
+                // versions (0x03 per-record and 0x05 scope, the #8278 R16 SSOT) —
                 // legacy 0x02 per-agent rows have no per-record key to destroy (the
                 // honest limit) and are left for row-delete + tombstone only. The
                 // predicate matches the DELETE's victim set EXACTLY. RETURNING id so
@@ -27664,7 +27721,7 @@ impl MemoryStore for PostgresStore {
                 let erased_ids: Vec<(String,)> = sqlx::query_as(
                     "UPDATE memories SET encrypted_envelope = $4
                      WHERE encrypted_envelope IS NOT NULL
-                       AND get_byte(encrypted_envelope, 0) = 3
+                       AND get_byte(encrypted_envelope, 0) = ANY($6::int[])
                        AND ($1::text IS NULL OR namespace = $1)
                        AND ($2::text IS NULL OR tier = $2)
                        AND ($3::text IS NULL
@@ -27677,6 +27734,7 @@ impl MemoryStore for PostgresStore {
                 .bind(pattern)
                 .bind(crate::encryption::crypto_erase_marker())
                 .bind(&locked)
+                .bind(crate::encryption::crypto_erasable_envelope_version_codes())
                 .fetch_all(&mut *tx)
                 .await
                 .map_err(|e| to_store_err("forget crypto-erase envelope", e))?;
@@ -28148,6 +28206,9 @@ impl MemoryStore for PostgresStore {
                         }
                         continue;
                     }
+                    if crate::identity::attest::is_source_attestation_key(&k) {
+                        continue;
+                    }
                     merged_metadata.insert(k, v);
                 }
             }
@@ -28170,20 +28231,6 @@ impl MemoryStore for PostgresStore {
             "agent_id".to_string(),
             serde_json::Value::String(consolidator_agent_id.to_string()),
         );
-        // #3014/#3018 — stamp `attest_level="claimed"` on the tenant permissive
-        // path so the consolidated row is a truthful `claimed` write
-        // (global-strict already refused above; substrate/curator exempt),
-        // exactly like an unsigned `store` (sqlite `storage::consolidate` twin).
-        if !ctx.bypass_visibility {
-            merged_metadata.insert(
-                crate::models::field_names::ATTEST_LEVEL.to_string(),
-                serde_json::Value::String(
-                    crate::identity::verify::AttestLevel::Claimed
-                        .as_str()
-                        .to_string(),
-                ),
-            );
-        }
         if !source_agent_ids.is_empty() {
             merged_metadata.insert(
                 "consolidated_from_agents".to_string(),
@@ -28219,6 +28266,17 @@ impl MemoryStore for PostgresStore {
             );
         }
         let mut merged_metadata_value = serde_json::Value::Object(merged_metadata);
+        // #8532 — re-owned by the consolidator: drop to `claimed` and strip
+        // any source attestation, substrate and tenant alike (sqlite twin).
+        crate::identity::attest::reset_for_reowned_row(
+            &mut merged_metadata_value,
+            Some(consolidator_agent_id),
+            &crate::identity::attest::ReownProvenance {
+                kind: crate::identity::attest::ReownKind::Consolidate,
+                source_id: ids.first().map_or("", String::as_str),
+                source_owner: None,
+            },
+        );
         // #2121 (supersedes the #2110/#2113 unconditional stamp) — the
         // consolidated summary is VERBATIM caller content on the tenant
         // surfaces, so the substrate why_trace is recorded ONLY for the
@@ -31224,6 +31282,12 @@ impl MemoryStore for PostgresStore {
             return Ok(super::ApproveOutcome::Rejected(reason));
         }
 
+        // #8577 — a tenant context is gated on the row owner BEFORE the vote
+        // is written (a bypass context, federation, keeps its bypass).
+        if !ctx.bypass_visibility {
+            self.pg_assert_execute_owner(&pa).await?;
+        }
+
         match approver {
             crate::models::ApproverType::Human => {
                 // #1793 (5-agent vote 4d3ea1c5) — UNCONDITIONALLY harden the
@@ -31475,7 +31539,22 @@ impl MemoryStore for PostgresStore {
             }
             "delete" => {
                 if let Some(mid) = pa.memory_id.clone() {
-                    self.delete(ctx, &mid).await?;
+                    // #8548 — the approved delete runs as the REQUESTER, like
+                    // the #4357 reflect arm below: the approver decides, the
+                    // requester owns the row. Under the approver's context the
+                    // owner gate refused every approved delete of another
+                    // principal's memory ("approved but execution failed").
+                    // #8495 r4 Option C, 3-agent vote (6def5ab6): a bypass ctx
+                    // (federated decide, parity doc federation_signing_check.rs:86-112)
+                    // keeps its bypass; a tenant ctx runs as the requester.
+                    let requester_owned;
+                    let actor = if ctx.bypass_visibility {
+                        ctx
+                    } else {
+                        requester_owned = CallerContext::for_agent(&pa.requested_by);
+                        &requester_owned
+                    };
+                    self.delete(actor, &mid).await?;
                     Some(mid)
                 } else {
                     None
@@ -31520,7 +31599,17 @@ impl MemoryStore for PostgresStore {
                             tier: Some(Tier::Long),
                             ..Default::default()
                         };
-                        self.update(ctx, &mid, patch).await?;
+                        // #8548 — as the requester, same as the delete arm.
+                        // #8495 r4 Option C: same ctx rule as the delete arm
+                        // (parity doc federation_signing_check.rs:86-112).
+                        let requester_owned;
+                        let actor = if ctx.bypass_visibility {
+                            ctx
+                        } else {
+                            requester_owned = CallerContext::for_agent(&pa.requested_by);
+                            &requester_owned
+                        };
+                        self.update(actor, &mid, patch).await?;
                         Some(mid)
                     }
                 } else {
@@ -33713,11 +33802,21 @@ impl MemoryStore for PostgresStore {
         use crate::models::{ConfidenceSource, ENTITY_KIND, EntityRegistration, MemoryKind, Tier};
 
         self.gate_record_stop().await?;
-        // Resolve effective agent_id: explicit arg wins; otherwise
-        // fall back to the caller context's agent_id.
-        let resolved_agent = agent_id
-            .map(str::to_string)
-            .unwrap_or_else(|| ctx.agent_id.clone());
+        // #8497 - owner = the caller context's verified principal (the shared
+        // rule the sqlite twin applies); a differing `agent_id` argument or
+        // inline `metadata.agent_id` is refused and audited.
+        let resolved_agent = crate::identity::entity_owner::trait_entity_owner(
+            &ctx.agent_id,
+            agent_id,
+            extra_metadata,
+            namespace,
+            canonical_name,
+        )
+        .map_err(|m| StoreError::PermissionDenied {
+            action: crate::identity::entity_owner::OP_ENTITY_REGISTER.to_string(),
+            target: format!("{namespace}/{canonical_name}"),
+            reason: m.to_string(),
+        })?;
 
         // #2993 — refuse a credential-bearing alias BEFORE any write (postgres
         // twin of the sqlite `db::entity_register` alias screen). The entity
@@ -33813,9 +33912,12 @@ impl MemoryStore for PostgresStore {
             serde_json::Value::String(ENTITY_KIND.to_string()),
         );
         meta_map.insert("aliases".to_string(), serde_json::json!(union.clone()));
-        meta_map
-            .entry("agent_id".to_string())
-            .or_insert(serde_json::Value::String(resolved_agent.clone()));
+        // #8497 / #3171 - the RESOLVED owner wins (`insert`, not `or_insert`),
+        // matching `db::entity_register` on sqlite.
+        meta_map.insert(
+            "agent_id".to_string(),
+            serde_json::Value::String(resolved_agent.clone()),
+        );
 
         // #3014 — cross the attestation posture on a NEW entity row (postgres
         // twin of the sqlite `db::entity_register` gate): refuse under

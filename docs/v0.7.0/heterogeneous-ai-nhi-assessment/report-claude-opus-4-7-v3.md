@@ -5,10 +5,10 @@ layout: doc
 
 **Evaluator:** Claude Opus 4.7 (1M context), 2026-05-28 morning session.
 **Tracking:** v3 re-run of issue #1171 against post-FX-12 / FX-C3 / ARCH-2 substrate state.
-**Workspace:** `/Users/fate/v07/v07-f5` @ HEAD `be3347d70` (release/v0.7.0 HEAD pre-drift-fix; the docs drift commits are on a topic branch not yet merged).
-**Substrate under test:** PID 10338, `/opt/homebrew/bin/ai-memory --db /Users/fate/.claude/ai-memory.db mcp --tier autonomous`, started 2026-05-27T16:55:25Z. Uptime ~21h against the live `/Users/fate/v07/v07-fixes/.cargo-shared-target/release/ai-memory` symlink. Binary version: `ai-memory 0.7.0`.
+**Workspace:** `<home>/v07/v07-f5` @ HEAD `be3347d70` (release/v0.7.0 HEAD pre-drift-fix; the docs drift commits are on a topic branch not yet merged).
+**Substrate under test:** PID 10338, `/opt/homebrew/bin/ai-memory --db <home>/.claude/ai-memory.db mcp --tier autonomous`, started 2026-05-27T16:55:25Z. Uptime ~21h against the live `<home>/v07/v07-fixes/.cargo-shared-target/release/ai-memory` symlink. Binary version: `ai-memory 0.7.0`.
 **Curator-LLM:** xAI Grok-4.3 (`models.llm = "xai:grok-4.3"` in capabilities). LIVE through 4 substrate-mediated round-trips (atomise → 7 atoms; persona_generate v1/v2; reflect d1/d2/d3; skill promote).
-**Scratch:** `/Users/fate/v07/v07-f5/.local-runs/2026-05-28-ship-campaign/nhi-assessment-opus-4-7-v3/` (skill export at `p11-skill-export/`).
+**Scratch:** `<home>/v07/v07-f5/.local-runs/2026-05-28-ship-campaign/nhi-assessment-opus-4-7-v3/` (skill export at `p11-skill-export/`).
 **Sibling reports read AFTER probing:** v1 (`report-claude-opus-4-7.md`, 2026-05-24), v2 (`report-claude-opus-4-7-v2.md`, 2026-05-25 evening). v3 vs v2 deltas under §J.
 
 ---
@@ -445,11 +445,11 @@ v1 SHIP, v2 SHIP, v3 SHIP. Verdict-stability is signal: substrate behaviour does
 
 ---
 
-**Workspace:** `/Users/fate/v07/v07-f5`
+**Workspace:** `<home>/v07/v07-f5`
 **Base SHA:** `be3347d70` (release/v0.7.0 HEAD pre-drift-fix)
 **Live MCP:** PID 10338, `ai-memory 0.7.0`, uptime ~21h
-**Live DB:** `/Users/fate/.claude/ai-memory.db` (41MB, 3151 memories, 225 links, 129 namespaces, schema v51)
+**Live DB:** `<home>/.claude/ai-memory.db` (41MB, 3151 memories, 225 links, 129 namespaces, schema v51)
 **Curator-LLM:** xAI Grok-4.3 via 4 substrate-mediated round-trips
-**Scratch:** `/Users/fate/v07/v07-f5/.local-runs/2026-05-28-ship-campaign/nhi-assessment-opus-4-7-v3/p11-skill-export/SKILL.md` + `references/source_{0,1}.md`
+**Scratch:** `<home>/v07/v07-f5/.local-runs/2026-05-28-ship-campaign/nhi-assessment-opus-4-7-v3/p11-skill-export/SKILL.md` + `references/source_{0,1}.md`
 
 — Claude Opus 4.7 (1M context), 2026-05-28

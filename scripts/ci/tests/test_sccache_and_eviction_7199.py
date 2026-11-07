@@ -27,7 +27,7 @@ import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
-from unittest import mock
+import unittest.mock as mock
 
 REPO = Path(__file__).resolve().parents[3]
 SCRATCH = REPO / ".local-runs" / "sccache-evict-7199"

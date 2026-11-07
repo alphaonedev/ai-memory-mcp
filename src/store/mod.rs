@@ -7605,7 +7605,7 @@ mod tests {
                 assert_eq!(capability, "BIND_AGENT_API_KEY");
             }
             Err(other) => panic!("expected UnsupportedCapability, got: {other}"),
-            Ok(outcome) => panic!("default bind_agent_api_key must error, got {outcome:?}"),
+            Ok(_) => panic!("default bind_agent_api_key must error, got an Ok outcome"),
         }
 
         // resolve default → Ok(None): no per-agent keys enrolled.

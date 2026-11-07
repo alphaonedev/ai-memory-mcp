@@ -9,7 +9,7 @@ This is the deep-dive page. For a one-screen summary go to [audience-c-level.md]
 
 ## Reproducibility
 
-**Pinned binary at write time:** git SHA `c3e344c7a` on branch `local/install-815-816`. Worktree: `/Users/fate/v07/v07-fixes/`. The campaign's earlier retest evidence was captured at SHA `e99fb0e` (post-fix batch on 2026-05-18 morning); the post-Gap-7 closeout moved HEAD forward through the provenance hardening commits (`6ad87c824` Gaps 1+2+5+6, `3cd8c116d` Gap 3 / schema v47, `23379e26f` Gap 4, `c3e344c7a` Gap 7).
+**Pinned binary at write time:** git SHA `c3e344c7a` on branch `local/install-815-816`. Worktree: `<home>/v07/v07-fixes/`. The campaign's earlier retest evidence was captured at SHA `e99fb0e` (post-fix batch on 2026-05-18 morning); the post-Gap-7 closeout moved HEAD forward through the provenance hardening commits (`6ad87c824` Gaps 1+2+5+6, `3cd8c116d` Gap 3 / schema v47, `23379e26f` Gap 4, `c3e344c7a` Gap 7).
 
 **Schema version at HEAD:** v47 (constant `CURRENT_SCHEMA_VERSION` in `src/storage/migrations.rs`; postgres parity ladder ends at migration 0020).
 
@@ -17,7 +17,7 @@ This is the deep-dive page. For a one-screen summary go to [audience-c-level.md]
 
 **Models (autonomous tier):** `nomic-ai/nomic-embed-text-v1.5` (768-dim), `cross-encoder/ms-marco-MiniLM-L-6-v2`, `gemma4:e4b` via Ollama.
 
-**Databases:** operator's live MCP DB at `/Users/fate/.claude/ai-memory.db` for sqlite path; Plan C postgres+AGE fleet on 192.168.50.1 (AGE 1.5.0, vector 0.8.2 in all 6 ai-memory DBs).
+**Databases:** operator's live MCP DB at `<home>/.claude/ai-memory.db` for sqlite path; Plan C postgres+AGE fleet on 192.168.50.1 (AGE 1.5.0, vector 0.8.2 in all 6 ai-memory DBs).
 
 ---
 

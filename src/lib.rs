@@ -926,6 +926,7 @@ pub mod mcp;
 pub mod metrics;
 pub mod mine;
 pub mod models;
+pub mod mtls_agent_binding;
 /// Crate-internal, test-only isolation helpers: process-wide env lock +
 /// snapshot/restore `EnvGuard` (#3301, #2905 class) and `LineageDagIsolation`
 /// for the process-global `LINEAGE_DAG` atomic (#3577).
@@ -957,6 +958,7 @@ pub mod offload;
 // of Reflection-kind memories. First-class MemoryKind variant +
 // MCP tools + namespace-policy cadence + optional filesystem export.
 pub mod persona;
+pub(crate) mod yaml_frontmatter;
 // v0.7.0 L1-5 — SKILL.md parser and structured-document ingestion pipelines.
 pub mod parsing;
 // v1.0.0 #2006 — the integrity-complete Portability-v2 exporter + importer
@@ -1027,6 +1029,7 @@ pub mod routines;
 pub mod signals;
 pub mod signed_events;
 pub mod sizes;
+pub mod stop_signal;
 // v1.0.0 V08-PE-3 (#1937) — MINIMAL signed spawn-audit chokepoint: exactly one
 // signed `process.spawn_audited` row per production `Command` spawn (argv0 +
 // caller), routing every production subprocess launch through one audited

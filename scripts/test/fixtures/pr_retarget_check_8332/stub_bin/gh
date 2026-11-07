@@ -1,0 +1,55 @@
+#!/usr/bin/env python3
+# Copyright 2026 AlphaOne LLC
+# SPDX-License-Identifier: Apache-2.0
+"""Stub ``gh`` for test_pr_retarget_check_8332.py (#8332): canned responses, no network.
+
+The test puts this file first on PATH and points GH_STUB_DIR at a directory of canned
+responses. Request keys (the script's live calls):
+
+* ``gh api repos/O/R/issues/N/timeline?per_page=P&page=K``  -> key ``timeline_pageK``
+* ``gh run list ... --workflow W ...``                      -> key ``runs_W``
+* anything else                                             -> exit 2
+
+Per key, in order: ``<key>.rc`` (exit with that code and print to stderr), ``<key>.raw``
+(print the bytes as is: a non-JSON answer), ``<key>.json`` (print it). A key with none
+of the three files exits 1 (an unexpected request is a failure, never an empty answer).
+Every request key is appended to ``requests.log`` in the stub directory.
+"""
+import os
+import re
+import sys
+from pathlib import Path
+
+
+def request_key(argv):
+    if argv[:1] == ["api"] and len(argv) > 1:
+        m = re.search(r"/timeline\?.*\bpage=(\d+)", argv[1])
+        if m:
+            return f"timeline_page{m.group(1)}"
+    if argv[:2] == ["run", "list"] and "--workflow" in argv:
+        return "runs_" + argv[argv.index("--workflow") + 1]
+    return None
+
+
+def main(argv):
+    stub = Path(os.environ["GH_STUB_DIR"])
+    key = request_key(argv)
+    if key is None:
+        print(f"stub gh: unsupported request {argv[:3]}", file=sys.stderr)
+        return 2
+    with (stub / "requests.log").open("a", encoding="utf-8") as log:
+        log.write(key + "\n")
+    rc_file, raw_file, json_file = stub / f"{key}.rc", stub / f"{key}.raw", stub / f"{key}.json"
+    if rc_file.is_file():
+        print(f"stub gh: forced failure for {key}", file=sys.stderr)
+        return int(rc_file.read_text().strip())
+    for path in (raw_file, json_file):
+        if path.is_file():
+            sys.stdout.write(path.read_text(encoding="utf-8"))
+            return 0
+    print(f"stub gh: no canned response for {key}", file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

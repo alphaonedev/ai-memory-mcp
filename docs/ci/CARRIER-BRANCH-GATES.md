@@ -16,13 +16,13 @@ that the named watchdog, not a nameless job-level cancel, is what fires (#6411).
 |---|---|---|---|---|
 | `ubuntu-latest,sqlite` | 2100 s (35 min) | 95 | see #3538 | see #3538 |
 | `macos-fed,sqlite` | 2400 s (40 min) | 80 | about 27 min (#3461) | n/a |
-| `linux-fed,enterprise-fed` | 7800 s (130 min) per shard | 160 | longest shard estimate 3,913 s (serial) | not yet measured (first green sharded run) |
+| `linux-fed,enterprise-fed` | 7800 s (130 min) per shard | 300 (#7914) | longest shard estimate 3,913 s (serial) | not yet measured (first green sharded run) |
 | `macos-fed,enterprise-fed` | 7800 s (130 min) per shard | 160 | n/a | n/a |
 
 Ratio rule: job `timeout-minutes` >= watchdog minutes + 15. On the sharded
 `enterprise-fed` legs the stricter rule applies: job `timeout-minutes` >=
 watchdog minutes + 28 (pre-watchdog compile and database setup) + 2 (teardown)
-= 160. All four rows meet both.
+= 160 (the linux-fed leg is 300 since #7914: it waits for a host-local semaphore slot, scripts/ci/host_semaphore.py, 2 slots, wait up to 3600 s, counted against the cap; identity: cap 18000 s >= load-gate wait 1200 + semaphore wait 3600 + cold compile 4100 + safety 300 + serial shard 7800 (= 17000 s)). All four rows meet both.
 
 ## Why enterprise-fed moved from 8100 s to 14400 s (#6202)
 
@@ -151,3 +151,26 @@ watchdog killed it, while `parallel_1` and `parallel_2` passed.
 - **Operational cap.** Run at most 2 concurrent cargo lanes per host (f1 had 9
   cargo / 17 rustc processes during the failing run). This is a fleet rule for
   Modules, not enforced by the workflow.
+
+### Manifest-inventoried paths (#8050)
+
+- **Owning pin test.** Every file path inventoried by a
+  `tests/fixtures/**/*.json` manifest (searched recursively; for example
+  `sdk/typescript/src/wake.ts`) is gated by that manifest's `tests/qual_*.rs`
+  test, even when the diff contains no Rust. The gate inventories every string
+  in the manifest, object keys included. Each string is normalised: backslashes
+  become `/`, surrounding whitespace is trimmed, `//` collapses, a leading `./`
+  or `/` and a trailing `/` are stripped, literal `..` segments are resolved,
+  and a string that leaves the repo root is ignored; matching is case-sensitive.
+  A changed path is normalised the same way and
+  matches when it equals the string or lies under it as a directory prefix, so a
+  deleted or renamed path and a deleted directory are still gated. A diff that
+  edits the manifest itself names its owning test. A lane and a reviewer must run
+  `python3 scripts/ci/manifest_owned_paths.py --diff-file <changed files>` and
+  then run and quote every `cargo test --test <qual>` it names before claiming
+  gates green. Exit 0 means nothing inventoried changed, exit 1 means tests are
+  named, exit 2 is a gate defect (unparseable manifest, manifest without an
+  owning test, unreadable fixtures folder, a `.json` fixture a qual test includes
+  that the walk never read, bad root or any internal error) and
+  fails the check. Unit tests:
+  `scripts/ci/tests/test_manifest_owned_paths_8050.py`.

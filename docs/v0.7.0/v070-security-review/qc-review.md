@@ -3,7 +3,7 @@ layout: doc
 ---
 # v0.7.0 Final-Review-Pass — QC Review
 
-**Working dir:** `/Users/fate/v07/v07-fixes/`
+**Working dir:** `<home>/v07/v07-fixes/`
 **Branch:** `local/install-815-816`
 **Base HEAD audited:** `7a5baf82d47228c21cb75ac2613ab98f8ebba020`
 **Post-QC HEAD:** `e40c81791a6e7b422f4471144863baab29aee1e2` — a parallel-agent commit landed during this QC pass with byte-identical patches for #911 + #912 (`git diff HEAD` is clean against my drafted edits). The QC also surfaces a second concurrent file `tests/admin_action_forensic_audit.rs` (parallel agent's #911 regression suite) + `tests/scope_private_sal_level_visibility.rs` (parallel agent's SAL-level #910 upgrade — exactly the long-term fix this QC report flagged as the right next-wave move).

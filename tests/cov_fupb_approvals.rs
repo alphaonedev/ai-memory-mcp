@@ -141,7 +141,9 @@ fn seed_pending_row(db_path: &std::path::Path, namespace: &str, requested_by: &s
 
 fn signed_request(pending_id: &str, body: &str) -> Request<Body> {
     let timestamp = chrono::Utc::now().timestamp().to_string();
-    let sig = common::sign_canonical_envelope(TEST_SECRET, &timestamp, "POST", pending_id, body);
+    // #8495 layout v2: the approver is inside the signed subject.
+    let subject = ai_memory::handlers::agent_api_key::approval_subject(pending_id, "operator-1");
+    let sig = common::sign_canonical_envelope(TEST_SECRET, &timestamp, "POST", &subject, body);
     Request::builder()
         .method("POST")
         .uri(format!("/api/v1/approvals/{pending_id}"))

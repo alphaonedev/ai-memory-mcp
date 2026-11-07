@@ -150,7 +150,7 @@ INDEX_SECTIONS = (
 # must be present exactly once: reworded, re-pointed, dropped, duplicated or added entries all fail.
 # code-R3-F3: sha256 of the exact index lines (both sections, in file order, joined by a newline), so the cited
 # range and the quote text are pinned together. Also pinned in SELF_TEST_PINNED_LIMITS: a change is two edits.
-INDEX_ENTRIES_SHA256 = "de11dd7af07f6e340e2c7d7a75b451f4e41c67cd66548d59165cf7c81c19b6f7"
+INDEX_ENTRIES_SHA256 = "da2953f86156997dcbc82ac807b519eba8cdec25f595da04f73c04e779aff705"
 INDEX_QUOTE_PINS = (
     ("ARCHITECTURE_REFERENCE",
      "123b8bbe696bb26fa77c2bf30545c3c5768b73904280534c126f74f88546ccd4"),
@@ -1531,7 +1531,7 @@ SELF_TEST_PINNED_LIMITS = {
     "INDEX_MIN_QUOTE_CHARS": 20,
     # sha256 of the exact index lines (both sections, file order, newline-joined): a changed range or quote is a
     # deliberate edit.
-    "INDEX_ENTRIES_SHA256": "de11dd7af07f6e340e2c7d7a75b451f4e41c67cd66548d59165cf7c81c19b6f7",
+    "INDEX_ENTRIES_SHA256": "da2953f86156997dcbc82ac807b519eba8cdec25f595da04f73c04e779aff705",
     # sha256 of the sorted "<file> <quote sha256>" index pin lines: any pinned quote change is a deliberate edit.
     "INDEX_QUOTE_PINS_SHA256": "9d4c301ad7f479615115f9605e0ea6d1d86d0ea04b653c08bedb4ed72986eaeb",
     "REFERENCE_SUBSECTIONS ARCHITECTURE_REFERENCE": 9,
@@ -1643,6 +1643,8 @@ WORKFLOW_CANONICAL_LINES = (
     '    timeout-minutes: 5',
     '    steps:',
     '      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262',
+    '        with:',
+    '          persist-credentials: false',
     '      - name: Guard the tracked CLAUDE.md and its reference files',
     '        run: python3 scripts/check-claude-md-size.py',
     '      - name: Guard self-test',
@@ -1757,7 +1759,7 @@ COMPARE_WORKFLOW_LINES = (
     "contents: read",
     "concurrency:",
     "group: claude-md-rule-compare-${{ github.event.pull_request.number }}",
-    "cancel-in-progress: true",
+    "cancel-in-progress: ${{ github.event.action != 'edited' }}",
     "jobs:",
     "compare:",
     "name: CLAUDE.md rule-change comparison",
@@ -2186,7 +2188,7 @@ def run_main_wiring_case(repo_root: Path, base: Path) -> bool:
         if old:
             target.write_text(good.replace(old, new, 1), encoding="utf-8")
         try:
-            res = subprocess.run([sys.executable, str(Path(__file__).resolve()), str(live)], capture_output=True,
+            res = subprocess.run([sys.executable, "-I", str(Path(__file__).resolve()), str(live)], capture_output=True,
                                  text=True, check=False, timeout=300)
             rc, stream = res.returncode, (res.stdout if want_rc == 0 else res.stderr)
         except (OSError, subprocess.SubprocessError) as exc:

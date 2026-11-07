@@ -219,6 +219,7 @@ use crate::models::{
 // canonical HTTP status. The error-prefix constants live alongside the
 // typed enum so the Display impl and the prefix tokens stay in lockstep.
 mod error;
+pub mod execute_owner_8577;
 pub use error::{LINK_CYCLE_ERR_PREFIX, LINK_PERMISSION_DENIED_ERR_PREFIX, LinkEnd, StorageError};
 
 // ---------------------------------------------------------------------------
@@ -6429,7 +6430,8 @@ fn purge_and_tombstone_forget(
             params![id, ns, now, agent_id, signature],
         )?;
         // #1956 [R56] — CRYPTO-ERASE + erasure attestation IN THIS tx, BEFORE
-        // the forget DELETE. For an encrypted per-record (0x03) row this
+        // the forget DELETE. For a crypto-erasable row (0x03 per-record or
+        // 0x05 scope, `crate::encryption::CRYPTO_ERASABLE_ENVELOPE_VERSIONS`) this
         // DESTROYS the per-record envelope key so the ciphertext is
         // cryptographically unrecoverable even by a KEK holder (belt-and-
         // suspenders on top of the row delete); for a plaintext / legacy-0x02
@@ -6786,7 +6788,8 @@ pub fn forget_scrub_cid_genesis(conn: &Connection, id: &str) -> Result<()> {
 /// commits to, and the honest crypto-erase-vs-delete boundary.
 ///
 /// * [`KeyDestroyed`](ErasureKind::KeyDestroyed) — the row carried an
-///   encrypted per-record (`0x03`) envelope whose wrapped DEK was DESTROYED
+///   crypto-erasable envelope (`0x03` per-record or `0x05` scope, the SSOT
+///   `crate::encryption::CRYPTO_ERASABLE_ENVELOPE_VERSIONS`) whose wrapped DEK was DESTROYED
 ///   before deletion, so the ciphertext is cryptographically unrecoverable
 ///   even by a holder of the master KEK. This is the ATTESTABLE guarantee
 ///   (conditional on at-rest encryption having been enabled when the row was
@@ -6858,8 +6861,9 @@ pub fn crypto_erase_signable_bytes(
 
 /// #1956 [R56] — CRYPTO-ERASE an encrypted record's per-record envelope key.
 ///
-/// Reads the row's `encrypted_envelope`; when it is a per-record (`0x03`)
-/// envelope, OVERWRITES it with the destroy marker (`crate::encryption::crypto_erase_marker`),
+/// Reads the row's `encrypted_envelope`; when it is a crypto-erasable envelope
+/// (`0x03` per-record or `0x05` scope, the SSOT
+/// `crate::encryption::CRYPTO_ERASABLE_ENVELOPE_VERSIONS`), OVERWRITES it with the destroy marker (`crate::encryption::crypto_erase_marker`),
 /// destroying the embedded wrapped DEK so the ciphertext is permanently
 /// unrecoverable. Returns `true` when a key was destroyed, `false` when the
 /// row is plaintext (NULL envelope) or a legacy `0x02` per-agent envelope
@@ -8964,27 +8968,21 @@ pub(crate) fn build_promotion_clone(
     let now = Utc::now().to_rfc3339();
     let clone_metadata = {
         let mut meta = source.metadata.clone();
-        if let Some(obj) = meta.as_object_mut() {
-            if let Some(actor) = promoted_by.filter(|a| !a.is_empty()) {
-                if let Some(prior) = obj
+        // #8513 — the clone is re-owned (to the acting caller when present):
+        // drop the source attestation, name the source id and owner.
+        crate::identity::attest::reset_for_reowned_row(
+            &mut meta,
+            promoted_by.filter(|a| !a.is_empty()),
+            &crate::identity::attest::ReownProvenance {
+                kind: crate::identity::attest::ReownKind::Promote,
+                source_id: &source.id,
+                source_owner: source
+                    .metadata
                     .get(crate::mcp::param_names::AGENT_ID)
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string)
-                {
-                    obj.insert(
-                        "promoted_from_agent_id".to_string(),
-                        serde_json::Value::String(prior),
-                    );
-                }
-                obj.insert(
-                    crate::mcp::param_names::AGENT_ID.to_string(),
-                    serde_json::Value::String(actor.to_string()),
-                );
-            }
-            obj.insert(
-                "promoted_from".to_string(),
-                serde_json::Value::String(source.id.clone()),
-            );
+                    .and_then(serde_json::Value::as_str),
+            },
+        );
+        if let Some(obj) = meta.as_object_mut() {
             obj.insert(
                 "promoted_from_namespace".to_string(),
                 serde_json::Value::String(source.namespace.clone()),
@@ -10788,6 +10786,9 @@ pub fn consolidate_with_expected_versions(
                                 }
                                 continue;
                             }
+                            if crate::identity::attest::is_source_attestation_key(&k) {
+                                continue;
+                            }
                             if let Some(existing) = merged_metadata.get(&k)
                                 && std::mem::discriminant(existing) != std::mem::discriminant(&v)
                             {
@@ -10834,20 +10835,6 @@ pub fn consolidate_with_expected_versions(
             "agent_id".to_string(),
             serde_json::Value::String(consolidator_agent_id.to_string()),
         );
-        // #3014/#3018 — stamp `attest_level="claimed"` on the tenant
-        // permissive path so the consolidated row is a truthful `claimed`
-        // write (global-strict already refused above; substrate/curator
-        // consolidates are exempt), exactly like an unsigned `store`.
-        if !substrate_authored {
-            merged_metadata.insert(
-                crate::models::field_names::ATTEST_LEVEL.to_string(),
-                serde_json::Value::String(
-                    crate::identity::verify::AttestLevel::Claimed
-                        .as_str()
-                        .to_string(),
-                ),
-            );
-        }
         if !source_agent_ids.is_empty() {
             merged_metadata.insert(
                 "consolidated_from_agents".to_string(),
@@ -10889,6 +10876,18 @@ pub fn consolidate_with_expected_versions(
             );
         }
         let mut merged_metadata_value = serde_json::Value::Object(merged_metadata);
+        // #8532 — the consolidated row is re-owned by the consolidator, so it
+        // never keeps a source's attestation: substrate and tenant alike drop
+        // to an honest `claimed` (#3014/#3018 stamp, now unconditional).
+        crate::identity::attest::reset_for_reowned_row(
+            &mut merged_metadata_value,
+            Some(consolidator_agent_id),
+            &crate::identity::attest::ReownProvenance {
+                kind: crate::identity::attest::ReownKind::Consolidate,
+                source_id: ids.first().map_or("", String::as_str),
+                source_owner: None,
+            },
+        );
         // #2121 (supersedes the #2110/#2113 unconditional stamp) — the
         // consolidated summary is VERBATIM caller content on the tenant
         // surfaces (MCP `memory_consolidate` / HTTP / CLI), so the substrate
@@ -17713,6 +17712,9 @@ fn restored_cid_stamp(
         params![id],
         |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<Vec<u8>>>(1)?)),
     )?;
+    // #8278 (code review r2 I-c): E2 routes a 0x05 row through
+    // `open_content_bound` and refuses instead of falling back to the stored
+    // content; E1 writes no 0x05 rows, so this fallback never sees one.
     let plaintext = match envelope {
         Some(env) => crate::encryption::open_content(&env, &agent_id).unwrap_or(raw_content),
         None => raw_content,
@@ -24162,6 +24164,26 @@ pub fn approve_with_approver_type(
     approver_agent_id: &str,
     surface: ApproveSurface,
 ) -> Result<ApproveOutcome> {
+    approve_with_approver_type_gated(conn, pending_id, approver_agent_id, surface, None)
+}
+
+/// #8577 — a precondition run on the pending row AFTER the eligibility
+/// refusals and BEFORE the approval vote is written.
+pub type ApprovePrecondition<'a> = &'a dyn Fn(&Connection, &PendingAction) -> Result<()>;
+
+/// [`approve_with_approver_type`] with an optional [`ApprovePrecondition`]
+/// (#8577): its refusal leaves the pending row `pending`.
+///
+/// # Errors
+///
+/// Everything [`approve_with_approver_type`] returns, plus the precondition's.
+pub fn approve_with_approver_type_gated(
+    conn: &Connection,
+    pending_id: &str,
+    approver_agent_id: &str,
+    surface: ApproveSurface,
+    precondition: Option<ApprovePrecondition<'_>>,
+) -> Result<ApproveOutcome> {
     crate::storage::record_stop::gate_storage_conn(conn)?;
     let Some(pa) = get_pending_action(conn, pending_id)? else {
         // #1620 — typed NotFound (was Rejected → 403; postgres 404'd).
@@ -24193,6 +24215,9 @@ pub fn approve_with_approver_type(
         surface,
     )? {
         return Ok(ApproveOutcome::Rejected(reason));
+    }
+    if let Some(precondition) = precondition {
+        precondition(conn, &pa)?;
     }
 
     match approver {
@@ -24396,6 +24421,37 @@ fn refuse_unapproved_destination_store(
 }
 
 pub fn execute_pending_action(conn: &Connection, pending_id: &str) -> Result<Option<String>> {
+    execute_pending_action_gated(conn, pending_id, None)
+}
+
+/// #8564 — the execute arm an [`ExecuteOwnerGate`] is asked to admit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecuteArm {
+    /// The approved `delete` arm (removes the target row).
+    Delete,
+    /// The approved tier-bump `promote` arm (target row to `long`).
+    TierBump,
+}
+
+/// #8564 — an owner gate run on the target row of the delete and the
+/// tier-bump arms, inside the arm's write transaction and before the
+/// mutation, so the refusal and the write see the same row. Arguments:
+/// the connection, the approved row, the target memory id and the arm.
+pub type ExecuteOwnerGate<'a> =
+    &'a dyn Fn(&Connection, &PendingAction, &str, ExecuteArm) -> Result<()>;
+
+/// [`execute_pending_action`] with an optional owner gate on the delete
+/// and tier-bump arms (#8564). `None` is the ungated primitive.
+///
+/// # Errors
+///
+/// Everything [`execute_pending_action`] returns, plus the gate's own
+/// refusal, which leaves the target row untouched.
+pub fn execute_pending_action_gated(
+    conn: &Connection,
+    pending_id: &str,
+    owner_gate: Option<ExecuteOwnerGate<'_>>,
+) -> Result<Option<String>> {
     crate::storage::record_stop::gate_storage_conn(conn)?;
     let Some(pa) = get_pending_action(conn, pending_id)? else {
         // #962 typed envelope — 404 NOT_FOUND.
@@ -24479,7 +24535,13 @@ pub fn execute_pending_action(conn: &Connection, pending_id: &str) -> Result<Opt
         }
         "delete" => {
             if let Some(mid) = pa.memory_id.clone() {
-                delete(conn, &mid)?;
+                // #8564: the gate and the delete share one transaction.
+                connection::in_write_txn(conn, || {
+                    if let Some(gate) = owner_gate {
+                        gate(conn, &pa, &mid, ExecuteArm::Delete)?;
+                    }
+                    delete(conn, &mid)
+                })?;
                 Some(mid)
             } else {
                 None
@@ -24502,20 +24564,26 @@ pub fn execute_pending_action(conn: &Connection, pending_id: &str) -> Result<Opt
                         promote_to_namespace(conn, &mid, to_ns, Some(pa.requested_by.as_str()))?;
                     Some(clone_id)
                 } else {
-                    // Tier bump to long + clear expiry.
-                    let (_found, _changed) = update(
-                        conn,
-                        &mid,
-                        None,
-                        None,
-                        Some(&Tier::Long),
-                        None,
-                        None,
-                        None,
-                        None,
-                        Some(""),
-                        None,
-                    )?;
+                    // Tier bump to long + clear expiry; #8564: the gate
+                    // and the update share one transaction.
+                    connection::in_write_txn(conn, || {
+                        if let Some(gate) = owner_gate {
+                            gate(conn, &pa, &mid, ExecuteArm::TierBump)?;
+                        }
+                        update(
+                            conn,
+                            &mid,
+                            None,
+                            None,
+                            Some(&Tier::Long),
+                            None,
+                            None,
+                            None,
+                            None,
+                            Some(""),
+                            None,
+                        )
+                    })?;
                     Some(mid)
                 }
             } else {

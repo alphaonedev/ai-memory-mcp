@@ -68,7 +68,9 @@ pub use store::ErasureStore;
 
 /// Opt-in master switch for the erasure-coded archive cold tier.
 /// Truthy grammar `1`/`true`/`yes`/`on` (case-insensitive, trimmed), the
-/// secure-opt-in shape of `AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED`.
+/// same truthy grammar as `AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED` (which the
+/// `federated`, `hive` and `production` shapes force on; this switch stays an
+/// explicit opt-in).
 pub const ENV_ERASURE_COLD_TIER: &str = "AI_MEMORY_ERASURE_COLD_TIER";
 
 /// Bundle-root directory override (env-only path knob, the

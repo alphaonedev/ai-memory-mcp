@@ -140,6 +140,15 @@ src/cost/mod.rs	usd_string
 # file carried implicitly is made explicit and reviewed here.
 src/subscriptions/audit_status.rs	persist_event_status
 src/subscriptions/audit_status.rs	persist_dispatch_counter
+# #7366 / #7708 — failed subscriber-lookup record (src/subscriptions/scan_failure.rs),
+# the same subscription-plane class as audit_status.rs above. `subscription_dlq` holds the
+# delivery state of an event whose subscriber lookup failed: `insert_capped` writes the
+# record, `settle_scan_failure` updates it and `clear_scan_failure` deletes it when a retry
+# recovers. It is never record-plane content, and a record stop must not lose the record of
+# an undelivered event. Narrow rows rather than widening the src/subscriptions skip prefix.
+src/subscriptions/scan_failure.rs	insert_capped
+src/subscriptions/scan_failure.rs	settle_scan_failure
+src/subscriptions/scan_failure.rs	clear_scan_failure
 # #3942 — in-tx free fn. Its `UPDATE memories SET metadata …` is split
 # across a `\` continuation, so the pre-fix single-line predicate never
 # saw it. The fn takes the caller's transaction and has no `&self`, so

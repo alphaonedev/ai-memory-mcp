@@ -568,7 +568,7 @@ async fn http_create_memory_happy_path() {
     let (router, _f) = build_router_fixture();
     let (status, id) = create_basic(&router, "chunk-d/happy", "hello").await;
     assert_eq!(status, StatusCode::CREATED);
-    assert!(!id.is_empty());
+    assert_ne!(id, "");
 }
 
 #[tokio::test]
@@ -816,7 +816,7 @@ async fn http_get_memory_by_id_and_prefix() {
     let (router, _f) = build_router_fixture();
     let (s, id) = create_basic(&router, "chunk-d/get", "get-mem").await;
     assert_eq!(s, StatusCode::CREATED);
-    assert!(!id.is_empty());
+    assert_ne!(id, "");
 
     // #927 (Track A P4, 2026-05-20) extended scope=private filter to
     // GET /memories/{id} on the sqlite path. `create_basic` stamps
@@ -1473,12 +1473,16 @@ fn sign(secret: &str, timestamp: &str, body: &str) -> String {
     // v0.7.0 release/v0.7.0 commit 99ffacc: K10 HMAC binds method + pending_id
     // in the canonical request to close the row-substitution attack vector.
     // Local-test wrapper delegates to sign_with_method_id with the legacy
-    // POST + zero-uuid path tests use.
+    // POST + zero-uuid path tests use. #8495 layout v2: the approver those
+    // tests send ("l07-approver") is inside the signed subject.
     sign_with_method_id(
         secret,
         timestamp,
         "POST",
-        "00000000-0000-0000-0000-000000000000",
+        &ai_memory::handlers::agent_api_key::approval_subject(
+            "00000000-0000-0000-0000-000000000000",
+            "l07-approver",
+        ),
         body,
     )
 }
@@ -1576,6 +1580,7 @@ async fn http_approve_pending_unknown_id_with_valid_hmac_passes_gate() {
     let req = Request::builder()
         .method("POST")
         .uri("/api/v1/pending/00000000-0000-0000-0000-000000000000/approve")
+        .header("x-agent-id", "l07-approver")
         .header("x-ai-memory-signature", sig)
         .header("x-ai-memory-timestamp", ts)
         .body(Body::empty())
@@ -1605,6 +1610,7 @@ async fn http_reject_pending_unknown_id_with_valid_hmac_passes_gate() {
     let req = Request::builder()
         .method("POST")
         .uri("/api/v1/pending/00000000-0000-0000-0000-000000000000/reject")
+        .header("x-agent-id", "l07-approver")
         .header("x-ai-memory-signature", sig)
         .header("x-ai-memory-timestamp", ts)
         .body(Body::empty())
