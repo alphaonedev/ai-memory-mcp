@@ -44,5 +44,26 @@ class ScriptArguments6389(unittest.TestCase):
         self.assertEqual(checker.scan_shell("python3 -u -I scripts/x.py"), [])
 
 
+class ModuleMode6799(unittest.TestCase):
+    def test_module_execution_requires_interpreter_isolation_6799(self):
+        checker = load_checker()
+        for program in ("unittest discover -s scripts/ci/tests", "pip --version", "pytest"):
+            with self.subTest(program=program):
+                self.assertEqual(len(checker.scan_shell("python3 -m " + program)), 1)
+                self.assertEqual(checker.scan_shell("python3 -I -m " + program), [])
+                self.assertEqual(len(checker.scan_shell("python3 -m " + program + " -I")), 1)
+
+    def test_ci_discovery_is_isolated_and_mutant_is_rejected_6799(self):
+        checker = load_checker()
+        lines = (ROOT / ".github/workflows/ci.yml").read_text().splitlines()
+        discovery = [line.strip().removeprefix("run: ") for line in lines
+                     if "unittest discover -s scripts/ci/tests" in line]
+        self.assertEqual(len(discovery), 1)
+        self.assertEqual(checker.scan_shell(discovery[0]), [])
+        mutant = discovery[0].replace(" -I", "", 1)
+        self.assertNotEqual(mutant, discovery[0])
+        self.assertEqual(len(checker.scan_shell(mutant)), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
