@@ -182,6 +182,29 @@ pub struct WriteTxn<'c> {
     frame_id: u64,
 }
 
+/// Own the BEGIN until frame registration can transfer it to `WriteTxn`.
+/// Like the existing transaction drop guard, this covers panic unwinds
+/// without catching them (OWNERSHIP-24/25).
+struct OpeningTxnRollback<'c>(Option<&'c Connection>);
+
+impl Drop for OpeningTxnRollback<'_> {
+    fn drop(&mut self) {
+        if let Some(conn) = self.0
+            && !conn.is_autocommit()
+            && let Err(error) = conn.execute_batch(SQL_ROLLBACK)
+        {
+            // Registration can panic inside a subscriber. Do not invoke
+            // that subscriber again while unwinding (OWNERSHIP-25).
+            let _ = std::io::Write::write_fmt(
+                &mut std::io::stderr(),
+                format_args!(
+                    "ERROR #6541: ROLLBACK after WriteTxn frame registration failed: {error}\n"
+                ),
+            );
+        }
+    }
+}
+
 impl<'c> WriteTxn<'c> {
     /// Open an immediate write transaction on `conn`.
     ///
@@ -244,10 +267,13 @@ impl<'c> WriteTxn<'c> {
 
     /// Register a freshly-opened transaction's #4116 escalation frame.
     fn opened(conn: &'c Connection) -> Self {
+        let mut opening = OpeningTxnRollback(Some(conn));
+        let frame_id = super::escalation_deferral::open_frame(conn);
+        opening.0 = None;
         Self {
             conn,
             finished: false,
-            frame_id: super::escalation_deferral::open_frame(conn),
+            frame_id,
         }
     }
 
