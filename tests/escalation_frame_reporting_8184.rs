@@ -105,3 +105,29 @@ fn issue_6449_thread_exit_labels_intents_and_frames_separately() {
         "one frame holding two intents must report both units: {stderr}"
     );
 }
+
+#[test]
+fn issue_6541_stale_frame_unwind_rolls_back_both_begin_modes() {
+    let name = "issue_6541_stale_frame_unwind_rolls_back_both_begin_modes";
+    child_stderr(name, || {
+        for exclusive in [false, true] {
+            let dir = tempfile::tempdir().expect("test directory");
+            let path = dir.path().join("leak.db");
+            leak(&path, &["lost"]);
+            let conn = Connection::open(&path).expect("open next connection");
+            let outcome = catch_unwind(AssertUnwindSafe(|| {
+                let txn = if exclusive {
+                    WriteTxn::begin_exclusive(&conn)
+                } else {
+                    WriteTxn::begin(&conn)
+                }
+                .expect("begin next transaction");
+                drop(txn);
+            }));
+            assert_eq!(outcome.is_err(), cfg!(debug_assertions));
+            assert!(conn.is_autocommit(), "frame registration must not leak BEGIN");
+            conn.execute_batch("BEGIN IMMEDIATE; ROLLBACK")
+                .expect("connection must remain usable after frame registration");
+        }
+    });
+}
