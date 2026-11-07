@@ -173,6 +173,15 @@ class CodeReviewRoundFive(unittest.TestCase):
             self.assertIn("python isolation: findings=2 exemptions=0", output)
             self.assertNotIn("Traceback", output)
 
+    def test_malformed_constructs_keep_prior_findings_and_real_line_c4(self):
+        checker = load_checker()
+        for malformed in ("echo 'unterminated", "echo $(unterminated",
+                          "echo `unterminated", "bash <<EOF"):
+            with self.subTest(malformed=malformed):
+                findings = checker.scan_shell("python3 x.py\necho ready\n" + malformed + "\n")
+                self.assertEqual([(item.line, item.malformed) for item in findings],
+                                 [(1, False), (3, True)])
+
     def test_sibling_mismatch_names_module_and_both_paths_c5(self):
         spec = importlib.util.spec_from_file_location(
             "sibling_round_five", ROOT / "scripts/ci/sibling_import.py")

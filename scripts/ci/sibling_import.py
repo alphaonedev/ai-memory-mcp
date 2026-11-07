@@ -13,8 +13,9 @@ def load_sibling(name, caller_file):
     path = Path(caller_file).resolve().with_name(name + ".py")
     existing = sys.modules.get(name)
     if existing is not None:
-        if Path(getattr(existing, "__file__", "")).resolve() != path:
-            raise ImportError("runner helper was imported from an unexpected path")
+        actual = Path(getattr(existing, "__file__", "")).resolve()
+        if actual != path:
+            raise ImportError(f"sibling {name!r} already loaded from {actual}; expected {path}")
         return existing
     spec = importlib.util.spec_from_file_location(name, path)
     if spec is None or spec.loader is None:
