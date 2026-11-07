@@ -74,7 +74,7 @@ class CiWorkflowInvariants6161(unittest.TestCase):
 
     def test_age_unit_test_step_is_wired(self):
         text = CI_YML.read_text(encoding="utf-8")
-        self.assertEqual(text.count("python3 scripts/test/" + AGE_SUITE), 1)
+        self.assertEqual(text.count("python3 -I scripts/test/" + AGE_SUITE), 1)
 
 
 if __name__ == "__main__":
