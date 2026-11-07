@@ -178,3 +178,56 @@ fn operator_log_renders_only_url_origins_6822() {
     assert!(!log.contains("?password="));
     assert_eq!(log.lines().count(), 1);
 }
+
+const BOUNDARY_SECRET_8205: &str = "fixture_boundary_8205";
+
+fn assert_private_detail_is_absent_8205(detail: &str, secret: &str) {
+    for foreign in [false, true] {
+        let error = if foreign {
+            ai_memory::errors::MemoryError::DatabaseError(detail.to_owned())
+        } else {
+            ai_memory::errors::MemoryError::Refused(detail.to_owned())
+        };
+        let (_, log) = captured(|| mcp_foreign_err("credential_boundary", error));
+        assert!(
+            !log.contains(secret),
+            "credential tail reached operator log"
+        );
+        assert_eq!(log.lines().count(), 1, "one operator event");
+    }
+}
+
+macro_rules! query_boundary_case_8205 {
+    ($name:ident, $separator:literal) => {
+        #[test]
+        fn $name() {
+            let detail = format!(
+                "connect https://query.example.invalid/x?token=prefix{}{BOUNDARY_SECRET_8205}",
+                $separator
+            );
+            assert_private_detail_is_absent_8205(&detail, BOUNDARY_SECRET_8205);
+        }
+    };
+}
+
+query_boundary_case_8205!(operator_semicolon_query_8205, ";");
+query_boundary_case_8205!(operator_comma_query_8205, ",");
+query_boundary_case_8205!(operator_quote_query_8205, "\"");
+query_boundary_case_8205!(operator_paren_query_8205, "(");
+
+macro_rules! userinfo_boundary_case_8205 {
+    ($name:ident, $separator:literal) => {
+        #[test]
+        fn $name() {
+            let user = "fixture_user";
+            let detail = format!(
+                "connect postgres://{user}:prefix{}{BOUNDARY_SECRET_8205}@db.example.invalid/data",
+                $separator
+            );
+            assert_private_detail_is_absent_8205(&detail, BOUNDARY_SECRET_8205);
+        }
+    };
+}
+
+userinfo_boundary_case_8205!(operator_paren_userinfo_8205, "(");
+userinfo_boundary_case_8205!(operator_space_userinfo_8205, " ");
