@@ -6,8 +6,9 @@ use std::sync::{Arc, Mutex};
 pub const FIXTURE_PASSWORD: &str = "fixture-only-6822";
 pub const FIXTURE_QUERY: &str = "fixture-query-6822";
 pub const FIXTURE_FRAGMENT: &str = "fixture-fragment-6822";
-const HOSTILE_CONTROLS: &str = "caller\nforged\r\t\x1b[31m\u{85}\u{2028}\u{2029}\u{202e}";
+const HOSTILE_CONTROLS: &str = "caller\0\nforged\r\t\x1b[31m\u{85}\u{2028}\u{2029}\u{202e}";
 pub const CONTROL_PAIRS: &[(char, &str)] = &[
+    ('\0', "\\0"),
     ('\n', "\\n"),
     ('\r', "\\r"),
     ('\t', "\\t"),
