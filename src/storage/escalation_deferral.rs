@@ -139,10 +139,15 @@ struct TxnFrame {
 /// that were never settled: a `mem::forget`-ed `WriteTxn`.
 struct Frames(Vec<TxnFrame>);
 
+/// Diagnostic units stay distinct: one frame can hold several intents.
+const UNREPORTED_ESCALATIONS_LABEL: &str = "unreported deferred escalation(s)";
+const UNSETTLED_FRAMES_LABEL: &str = "unsettled escalation frame(s)";
+
 impl Drop for Frames {
     fn drop(&mut self) {
         let lost: usize = self.0.iter().map(|f| f.deferred.len()).sum();
         if lost > 0 {
+            let unsettled = self.0.iter().filter(|frame| !frame.deferred.is_empty()).count();
             // No debug_assert here: a panic in a TLS destructor aborts. This
             // runs at thread exit, in thread-local destructor order (reverse
             // of registration). `tracing::error!` is NOT usable here: the
@@ -159,7 +164,8 @@ impl Drop for Frames {
             let _ = std::io::Write::write_fmt(
                 &mut std::io::stderr(),
                 format_args!(
-                    "ERROR #4116: thread exited with {lost} unsettled escalation frame(s) \
+                    "ERROR #4116: thread exited with {lost} {UNREPORTED_ESCALATIONS_LABEL} \
+                     in {unsettled} {UNSETTLED_FRAMES_LABEL} \
                      (a leaked WriteTxn); those escalated writes stay REFUSED but were NOT queued\n"
                 ),
             );
@@ -610,7 +616,7 @@ mod tests {
                 "child did not run:\n{stdout}"
             );
             assert!(
-                stderr.contains("ERROR #4116: thread exited with 1 unsettled escalation frame(s)"),
+                stderr.contains("ERROR #4116: thread exited with 1 unreported deferred escalation(s) in 1 unsettled escalation frame(s)"),
                 "the leak ERROR line must be on stderr:\n{stderr}"
             );
             assert!(
