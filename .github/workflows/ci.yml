@@ -862,7 +862,7 @@ jobs:
       - name: Fetch the corpus replay objects (#7988)
         run: python3 -I scripts/ci/tests/test_check_cert_expiry_corpus.py --print-replay-shas | xargs git fetch --no-tags --depth=1 origin
       - name: Shard partition and wiring unit tests (#6344)
-        run: python3 -m unittest discover -s scripts/ci/tests
+        run: python3 -I -m unittest discover -s scripts/ci/tests
       - name: AGE self-heal helper unit test (#6161)
         run: python3 scripts/test/test_ensure_age_extension_6161.py
       # #7160 - scripts/test/ is outside the discovery root above; run the

@@ -35,7 +35,9 @@ def script_is_unisolated(arguments):
             isolated = True
         elif argument in OPTIONS_WITH_VALUE:
             index += 1
-        elif argument in ("-m", "-c", "-"):
+        elif argument == "-m" or argument.startswith("-m"):
+            return not isolated
+        elif argument in ("-c", "-"):
             return False
         elif argument == "--":
             index += 1
