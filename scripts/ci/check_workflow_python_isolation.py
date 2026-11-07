@@ -25,7 +25,7 @@ import shlex
 import sys
 import textwrap
 
-PYTHON_NAME = re.compile(r"python(?:3(?:\.[0-9]+)?)?\Z")
+PYTHON_NAME = re.compile(r"python(?:3(?:\.[0-9]+)?)?\Z", re.IGNORECASE)
 OPTIONS_WITH_VALUE = frozenset(("-W", "-X", "--check-hash-based-pycs"))
 COMMAND_END = frozenset((";", "&&", "||", "|", "&", "(", ")", "\n"))
 LOOKUP_COMMANDS = frozenset(("which", "type"))
