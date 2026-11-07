@@ -217,7 +217,7 @@ fn print_curator_report(r: &curator::CuratorReport, out: &mut CliOutput<'_>) -> 
 }
 
 /// #3585 test-only handshake: published after unix SIGTERM + SIGINT
-/// handlers are installed in [`await_shutdown_signal`], so a self-signal
+/// handlers are installed in [`install_shutdown_listener`], so a self-signal
 /// kicker never races the default disposition (which would SIGTERM the
 /// whole `--lib` binary under load).
 #[cfg(all(test, unix))]
@@ -255,57 +255,29 @@ mod shutdown_handlers_ready {
     }
 }
 
-/// Resolve when the process receives SIGINT (ctrl_c, cross-platform)
-/// or — on unix — SIGTERM, so `systemctl stop` / `docker stop` / `kill`
-/// (whose default signal is SIGTERM) trigger the same clean
-/// between-cycles shutdown the `curator --daemon` doc promises
-/// (issue #2119). Mirrors the `cli::watch` daemon arm exactly: when the
-/// SIGTERM handler cannot install, its arm parks on `pending()` so the
-/// `select!` still resolves on interrupt alone. On non-unix targets only
-/// SIGINT is available.
-async fn await_shutdown_signal() {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-        let mut term = signal(SignalKind::terminate()).ok();
-        // Install SIGINT the same way (not via `ctrl_c()`, which only
-        // registers on first poll of the select branch) so both
-        // handlers exist before the test-only ready flag is published.
-        let mut interrupt = signal(SignalKind::interrupt()).ok();
-        // Publish ready only when both handlers actually installed —
-        // otherwise a #3585 kicker must refuse to signal (default
-        // disposition would kill the process).
-        #[cfg(test)]
-        if term.is_some() && interrupt.is_some() {
-            shutdown_handlers_ready::mark();
-        }
-        let term_fut = async {
-            match term.as_mut() {
-                Some(t) => {
-                    t.recv().await;
-                }
-                // No SIGTERM handler could be installed — park forever
-                // so `select!` resolves on interrupt alone.
-                None => std::future::pending::<()>().await,
-            }
-        };
-        let int_fut = async {
-            match interrupt.as_mut() {
-                Some(t) => {
-                    t.recv().await;
-                }
-                None => std::future::pending::<()>().await,
-            }
-        };
-        tokio::select! {
-            () = term_fut => {}
-            () = int_fut => {}
-        }
+/// Install the SIGINT / SIGTERM listeners (unix) or the Ctrl-C listener
+/// (elsewhere) eagerly, on the calling task, so a signal that arrives before
+/// the spawned waiter is first polled is remembered instead of hitting the
+/// default disposition (#8193, the sync.rs install-before-spawn precedent).
+/// The registration and park-on-failure logic lives in the shared
+/// [`crate::stop_signal`] primitive.
+fn install_shutdown_listener() -> crate::stop_signal::StopListener {
+    let stop = crate::stop_signal::StopListener::install();
+    // Publish ready only when every handler actually installed, so a
+    // #3585 kicker never signals into the default disposition.
+    #[cfg(all(test, unix))]
+    if stop.fully_installed() {
+        shutdown_handlers_ready::mark();
     }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
-    }
+    stop
+}
+
+/// Resolve when the already-installed listener sees SIGINT or SIGTERM
+/// (unix) or Ctrl-C (elsewhere), so `systemctl stop` / `docker stop` /
+/// `kill` trigger the clean between-cycles shutdown the `curator --daemon`
+/// doc promises (issue #2119).
+async fn await_shutdown_signal(mut stop: crate::stop_signal::StopListener) {
+    stop.wait().await;
 }
 
 /// `curator` handler. Daemon-mode delegates to `daemon_runtime`.
@@ -409,10 +381,12 @@ pub async fn run(
     // Daemon mode — delegate to daemon_runtime.
     let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
     let shutdown_for_signal = shutdown.clone();
+    // #8193: install before spawning so an early signal is not lost.
+    let stop = install_shutdown_listener();
     tokio::spawn(async move {
         // #2119 — honour BOTH SIGINT and (unix) SIGTERM so a process
         // manager's default stop signal triggers the clean shutdown.
-        await_shutdown_signal().await;
+        await_shutdown_signal(stop).await;
         shutdown_for_signal.notify_one();
     });
 
@@ -575,10 +549,12 @@ async fn run_store_backed_sweep(
     let shutdown_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let shutdown_for_signal = shutdown.clone();
     let flag_for_signal = shutdown_flag.clone();
+    // #8193: install before spawning so an early signal is not lost.
+    let stop = install_shutdown_listener();
     tokio::spawn(async move {
         // #2119 — honour BOTH SIGINT and (unix) SIGTERM so a process
         // manager's default stop signal triggers the clean shutdown.
-        await_shutdown_signal().await;
+        await_shutdown_signal(stop).await;
         flag_for_signal.store(true, std::sync::atomic::Ordering::Relaxed);
         shutdown_for_signal.notify_one();
     });
@@ -2135,7 +2111,7 @@ mod tests {
         // No assertion on the value; the test exercises lines 55-56.
     }
 
-    /// #3585 — wait until `await_shutdown_signal` has installed
+    /// #3585 — wait until `install_shutdown_listener` has installed
     /// handlers, then self-signal. Returns whether the kicker fired.
     /// False means handlers never became ready: the caller MUST panic
     /// rather than SIGTERM a not-ready process (the whole `--lib` binary
@@ -2150,6 +2126,34 @@ mod tests {
             libc::kill(libc::getpid(), sig);
         }
         true
+    }
+
+    /// #8193 N1: the listener is installed on the calling task, before any
+    /// spawned waiter is first polled. On a current-thread runtime nothing
+    /// else runs until this test yields, so a SIGTERM raised right after the
+    /// install and before the first `.await` reaches only the installed
+    /// handler; a lazy install inside the spawned task would leave the
+    /// default disposition in place and kill the process. Isolated in a
+    /// subprocess so a regression can only fail the child.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_signal_before_the_first_poll_is_remembered_8193() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "cli::curator::tests::shutdown_signal_before_the_first_poll_is_remembered_8193",
+        ) {
+            return;
+        }
+        let stop = super::install_shutdown_listener();
+        let waiter = tokio::spawn(super::await_shutdown_signal(stop));
+        // SAFETY: kill(getpid, SIGTERM) is well-defined on POSIX; the
+        // handler is installed and the waiter task has not run yet.
+        unsafe {
+            libc::kill(libc::getpid(), libc::SIGTERM);
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(10), waiter)
+            .await
+            .expect("an early SIGTERM must resolve the waiter, not be lost")
+            .expect("waiter join");
     }
 
     #[cfg(unix)]
