@@ -43,5 +43,30 @@ class PrefixDynamicN1(unittest.TestCase):
                 self.assertEqual(checker.scan_shell(command), [])
 
 
+class PrefixLaunchersN2(unittest.TestCase):
+    def test_console_launchers_after_wrappers(self):
+        checker = load_checker()
+        for command in ("xargs pip install x", "nohup pytest", "poetry run pytest",
+                        "pyenv exec pip install x", "uv tool run pytest", "uvx pytest",
+                        "pip3.12 install x", "pip3.x install x",
+                        "sudo -u u nohup poetry run pytest", "nice -n 10 pip3.12 install x"):
+            with self.subTest(command=command):
+                findings = checker.scan_shell(command)
+                self.assertEqual(len(findings), 1, "console launcher escaped")
+                self.assertIn("console launcher", findings[0].reason)
+                unsafe, exempt = checker.scan_source(command + " # isolation: exempt #8202")
+                self.assertEqual(unsafe, [])
+                self.assertEqual(exempt, [(1, "8202")])
+
+    def test_wrapper_controls_keep_isolated_module_calls(self):
+        checker = load_checker()
+        for prefix in ("xargs", "nohup", "poetry run", "pyenv exec", "sudo -u u nohup"):
+            with self.subTest(prefix=prefix):
+                self.assertEqual(checker.scan_shell(f"{prefix} python3 -I -m pytest"), [])
+        for data in ("echo pip3.12 install x", "poetry show pytest", "pyenv versions"):
+            with self.subTest(data=data):
+                self.assertEqual(checker.scan_shell(data), [])
+
+
 if __name__ == "__main__":
     unittest.main()
