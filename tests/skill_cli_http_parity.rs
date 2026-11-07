@@ -882,7 +882,7 @@ fn assert_escaped_promote_log(log: &str, context: &str) {
         "{diagnostic}"
     );
     assert!(
-        !log.contains("\u{1b}"),
+        !log.contains('\u{1b}'),
         "raw terminal escape in operator output"
     );
 }

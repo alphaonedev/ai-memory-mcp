@@ -91,10 +91,10 @@ pub fn log_foreign<E: Into<MemoryError> + std::fmt::Display>(
     context: &'static str,
     e: E,
 ) -> MemoryError {
-    // ERRORS-06: preserve the source chain before the caller-safe classifier
+    // ERRORS-15: preserve the source chain before the caller-safe classifier
     // consumes it. Reuse the operator-log URL password redactor (#6457).
     let detail = crate::logging::redact_urls_in_message(&format!("{e:#}"));
-    // ERRORS-06 / #6822: string Debug escapes controls for the text formatter.
+    // #6822 / CWE-117: string Debug escapes controls for the text formatter.
     // Both HTTP promotion and MCP/CLI tools use these same emitters.
     let e = e.into();
     if e.is_foreign_class() {
