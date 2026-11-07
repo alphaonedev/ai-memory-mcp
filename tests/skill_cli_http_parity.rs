@@ -837,8 +837,13 @@ mod operator_capture;
 /// Both the HTTP and MCP promotion funnels share the escaped operator channel.
 #[test]
 fn skill_promote_logs_escape_caller_controls_6822() {
-    const RAW_ID: &str = "missing\nforged\u{1b}[31m";
-    const URL_ID: &str = "missing%0Aforged%1B[31m";
+    let raw_id = operator_capture::hostile_detail();
+    // Preserve every fixture byte; URL parsing would strip LF, CR and tab.
+    use std::fmt::Write as _;
+    let mut url_id = String::new();
+    for byte in raw_id.bytes() {
+        write!(url_id, "%{byte:02X}").expect("string formatting");
+    }
     let (_dir, db_path) = fresh_db();
     let (router, _db) = build_router_with_db_path(&db_path);
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -848,25 +853,25 @@ fn skill_promote_logs_escape_caller_controls_6822() {
     let ((status, body), log) = operator_capture::captured(|| {
         runtime.block_on(post_promote(
             router,
-            URL_ID,
+            &url_id,
             &json!({"name": "safe-name", "description": "d"}),
         ))
     });
     assert_eq!(status, StatusCode::NOT_FOUND);
-    assert_eq!(body["error"], format!("reflection not found: {RAW_ID}"));
+    assert_eq!(body["error"], format!("reflection not found: {raw_id}"));
     assert_escaped_promote_log(&log, "skill_promote_route");
 
     let conn = ai_memory::db::open(&db_path).expect("open database");
     let (result, log) = operator_capture::captured(|| {
         ai_memory::mcp::handle_skill_promote_from_reflection(
             &conn,
-            &json!({"reflection_id": RAW_ID, "skill_name": "safe-name", "skill_description": "d"}),
+            &json!({"reflection_id": raw_id, "skill_name": "safe-name", "skill_description": "d"}),
             None,
         )
     });
     assert_eq!(
         result.expect_err("missing reflection"),
-        format!("reflection not found: {RAW_ID}")
+        format!("reflection not found: {raw_id}")
     );
     assert_escaped_promote_log(&log, "skill_promote_from_reflection");
 }
@@ -877,12 +882,15 @@ fn assert_escaped_promote_log(log: &str, context: &str) {
         .find(|line| line.contains("mcp.tool.error"))
         .expect("operator error event");
     assert!(diagnostic.contains(context), "{diagnostic}");
-    assert!(
-        diagnostic.contains("missing\\nforged\\u{1b}[31m"),
-        "{diagnostic}"
-    );
-    assert!(
-        !log.contains('\u{1b}'),
-        "raw terminal escape in operator output"
-    );
+    for &control in operator_capture::ESCAPED_CONTROLS {
+        assert!(
+            diagnostic.contains(control),
+            "missing {control}: {diagnostic}"
+        );
+    }
+    assert!(!log.contains("caller\nforged"), "raw newline in the detail");
+    assert!(!log.chars().any(|c| c.is_control() && c != '\n'));
+    assert!(!diagnostic.contains(operator_capture::FIXTURE_PASSWORD));
+    assert!(diagnostic.contains(ai_memory::logging::URL_PASSWORD_MASK));
+    assert!(diagnostic.contains("example.invalid/path"));
 }

@@ -3,6 +3,27 @@
 
 use std::sync::{Arc, Mutex};
 
+pub const FIXTURE_PASSWORD: &str = "fixture-only-6822";
+const HOSTILE_CONTROLS: &str = "caller\nforged\r\t\x1b[31m\u{85}\u{2028}\u{2029}\u{202e}";
+pub const ESCAPED_CONTROLS: &[&str] = &[
+    "\\n",
+    "\\r",
+    "\\t",
+    "\\u{1b}",
+    "\\u{85}",
+    "\\u{2028}",
+    "\\u{2029}",
+    "\\u{202e}",
+];
+
+pub fn hostile_detail() -> String {
+    let mut url = reqwest::Url::parse("https://example.invalid/path").expect("fixture URL");
+    url.set_username("fixture").expect("fixture username");
+    url.set_password(Some(FIXTURE_PASSWORD))
+        .expect("fixture password");
+    format!("{HOSTILE_CONTROLS} {url}")
+}
+
 #[derive(Clone, Default)]
 struct Capture(Arc<Mutex<Vec<u8>>>);
 

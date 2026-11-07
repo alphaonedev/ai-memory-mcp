@@ -30,30 +30,24 @@ fn operator_log_keeps_full_chain_6457() {
 
 #[test]
 fn operator_log_escapes_caller_controls_6822() {
-    const HOSTILE: &str = "caller\nforged\r\t\x1b[31m\u{85}\u{2028}\u{2029}\u{202e}";
+    let hostile = operator_capture::hostile_detail();
     for foreign in [false, true] {
         let error = if foreign {
-            ai_memory::errors::MemoryError::DatabaseError(HOSTILE.into())
+            ai_memory::errors::MemoryError::DatabaseError(hostile.clone())
         } else {
-            ai_memory::errors::MemoryError::Refused(HOSTILE.into())
+            ai_memory::errors::MemoryError::Refused(hostile.clone())
         };
         let (wire, log) = captured(|| mcp_foreign_err("control_probe", error));
-        assert_eq!(wire, if foreign { DB_ERROR_TEXT } else { HOSTILE });
+        assert_eq!(wire, if foreign { DB_ERROR_TEXT } else { &hostile });
         assert_eq!(log.lines().count(), 1, "one operator event: {log:?}");
         let line = log.strip_suffix("\n").expect("text event newline");
         assert!(!line.chars().any(char::is_control), "raw control: {log:?}");
-        for control in [
-            "\\n",
-            "\\r",
-            "\\t",
-            "\\u{1b}",
-            "\\u{85}",
-            "\\u{2028}",
-            "\\u{2029}",
-            "\\u{202e}",
-        ] {
+        for &control in operator_capture::ESCAPED_CONTROLS {
             assert!(line.contains(control), "missing {control}: {log:?}");
         }
+        assert!(!line.contains(operator_capture::FIXTURE_PASSWORD));
+        assert!(line.contains(ai_memory::logging::URL_PASSWORD_MASK));
+        assert!(line.contains("example.invalid/path"));
     }
 }
 
@@ -114,9 +108,7 @@ fn dlq_list_operator_label_identifies_failed_call_7745() {
 fn dlq_owner_operator_label_identifies_failed_call_7745() {
     use ai_memory::mcp::handle_subscription_dlq_list_for;
     use serde_json::json;
-    let conn = rusqlite::Connection::open_in_memory().expect("database");
-    conn.execute_batch("CREATE TABLE subscription_dlq (id INTEGER, subscription_id TEXT, correlation_id TEXT, event_type TEXT, payload TEXT, retry_count INTEGER, last_error TEXT, first_failed_at TEXT, last_failed_at TEXT);")
-        .expect("DLQ exists but owner table does not");
+    let conn = dlq_without_owner_table();
     let (result, log) = captured(|| {
         handle_subscription_dlq_list_for(
             &conn,
@@ -130,4 +122,32 @@ fn dlq_owner_operator_label_identifies_failed_call_7745() {
         log.contains("context=\"get_owner\""),
         "wrong owner operation: {log}"
     );
+}
+
+#[test]
+fn dlq_unfiltered_owner_label_identifies_failed_call_7745() {
+    use ai_memory::mcp::handle_subscription_dlq_list_for;
+    use serde_json::json;
+    let conn = dlq_without_owner_table();
+    conn.execute(
+        "INSERT INTO subscription_dlq VALUES (1, 'sub-7745', 'correlation-7745',
+         'memory.stored', '{}', 0, 'fixture', '2026-01-01T00:00:00Z',
+         '2026-01-01T00:00:00Z')",
+        [],
+    )
+    .expect("ordinary DLQ row for the unfiltered owner lookup");
+    let (result, log) =
+        captured(|| handle_subscription_dlq_list_for(&conn, &json!({}), "agent-7745", &[]));
+    assert!(result.is_err());
+    assert!(
+        log.contains("context=\"get_owner\""),
+        "wrong unfiltered owner operation: {log}"
+    );
+}
+
+fn dlq_without_owner_table() -> rusqlite::Connection {
+    let conn = rusqlite::Connection::open_in_memory().expect("database");
+    conn.execute_batch("CREATE TABLE subscription_dlq (id INTEGER, subscription_id TEXT, correlation_id TEXT, event_type TEXT, payload TEXT, retry_count INTEGER, last_error TEXT, first_failed_at TEXT, last_failed_at TEXT);")
+        .expect("DLQ exists but owner table does not");
+    conn
 }
