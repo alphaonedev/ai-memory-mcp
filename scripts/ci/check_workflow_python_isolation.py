@@ -32,7 +32,19 @@ DATA_COMMANDS = frozenset(("echo", "printf", "test", "[", "[["))
 SHELLS = frozenset(("sh", "bash", "zsh"))
 CONSOLE_LAUNCHERS = frozenset(("pip", "pip3", "pytest", "pipx"))
 COMMAND_PREFIXES = frozenset(("if", "then", "elif", "while", "until", "do", "!",
-                              "env", "command", "exec", "sudo", "nice", "time", "timeout"))
+                              "command", "exec"))
+PREFIX_VALUE_OPTIONS = {
+    "env": frozenset(("-u", "--unset", "-C", "--chdir", "-S", "--split-string")),
+    "sudo": frozenset(("-u", "--user", "-g", "--group", "-h", "--host", "-p", "--prompt",
+                       "-C", "--close-from", "-D", "--chdir", "-R", "--chroot", "-T",
+                       "--command-timeout", "-r", "--role", "-t", "--type")),
+    "nice": frozenset(("-n", "--adjustment")),
+    "time": frozenset(("-f", "--format", "-o", "--output")),
+    "timeout": frozenset(("-k", "--kill-after", "-s", "--signal")),
+    "xargs": frozenset(("-I", "-L", "--max-lines", "-n", "--max-args", "-P", "--max-procs",
+                        "-s", "--max-chars", "-E", "-d", "--delimiter", "-a", "--arg-file")),
+}
+PREFIX_POSITIONAL_ARGUMENTS = {"timeout": 1}
 EXIT_OK = 0
 EXIT_FINDINGS = 1
 EXIT_INPUT = 2
@@ -230,6 +242,29 @@ def shell_commands(text):
         yield words
 
 
+def executable_index(values):
+    """Walk command prefixes and their operands without inspecting operands as programs."""
+    index = 0
+    while index < len(values):
+        value = values[index]
+        name = value.rsplit("/", 1)[-1]
+        if value in COMMAND_PREFIXES or ("=" in value and not value.startswith("$")):
+            index += 1
+            continue
+        if name not in PREFIX_VALUE_OPTIONS:
+            break
+        index += 1
+        while index < len(values) and values[index].startswith("-"):
+            option = values[index]
+            index += 1
+            if option == "--":
+                break
+            if option in PREFIX_VALUE_OPTIONS[name]:
+                index += 1
+        index += PREFIX_POSITIONAL_ARGUMENTS.get(name, 0)
+    return index
+
+
 def scan_shell(text, *, masked=False):
     """Return unsafe literal Python invocations in command text."""
     findings = []
@@ -254,15 +289,12 @@ def scan_shell(text, *, masked=False):
                 command_index = values.index("-c") + 1
                 if command_index < len(values):
                     findings.extend(scan_shell(values[command_index]))
-            executable = 0
-            while executable < len(values):
-                value = values[executable]
-                if (value in COMMAND_PREFIXES or value.startswith("-")
-                        or ("=" in value and not value.startswith("$"))):
-                    executable += 1
-                else:
-                    break
+            executable = executable_index(values)
+            if executable < len(values) and values[executable] in DATA_COMMANDS | LOOKUP_COMMANDS:
+                continue
             for index, (value, line) in enumerate(words):
+                if index < executable:
+                    continue
                 name = value.rsplit("/", 1)[-1]
                 if index == executable and value.startswith("$"):
                     expression = " ".join(values[index:]).split("}}", 1)[0]
