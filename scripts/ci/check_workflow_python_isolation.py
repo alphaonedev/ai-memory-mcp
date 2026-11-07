@@ -6,7 +6,8 @@ argument passed to the program or consumed by -W/-X is not interpreter isolation
 Shell text is inspected, never executed. No invocation is exempt by default.
 An actual shell comment '# isolation: exempt #1234' on the invocation line
 records an issue-backed exception; each honoured exception is printed by the CLI.
-Console launchers pip, pip3, pytest, pipx and uv run are findings: use an isolated
+Console launchers pip (including versioned names), pytest, pipx, uvx and uv run or
+uv tool run are findings, including behind command prefixes: use an isolated
 Python -m invocation. Python-named variable/expression interpreters and py need an
 explicit issue exemption because their interpreter isolation cannot be established
 here. Names containing python (including dynamic /python* paths) are matched case
@@ -30,7 +31,10 @@ COMMAND_END = frozenset((";", "&&", "||", "|", "&", "(", ")", "\n"))
 LOOKUP_COMMANDS = frozenset(("which", "type"))
 DATA_COMMANDS = frozenset(("echo", "printf", "test", "[", "[["))
 SHELLS = frozenset(("sh", "bash", "zsh"))
-CONSOLE_LAUNCHERS = frozenset(("pip", "pip3", "pytest", "pipx"))
+CONSOLE_LAUNCHERS = frozenset(("pip", "pip3", "pytest", "pipx", "uvx"))
+VERSIONED_PIP = re.compile(r"pip3(?:\.(?:[0-9]+|x))?\Z")
+UNISOLATED_UV_COMMANDS = (("run",), ("tool", "run"))
+TOOL_PREFIXES = {"poetry": "run", "pyenv": "exec"}
 COMMAND_PREFIXES = frozenset(("if", "then", "elif", "while", "until", "do", "!",
                               "command", "exec"))
 PREFIX_VALUE_OPTIONS = {
@@ -43,6 +47,7 @@ PREFIX_VALUE_OPTIONS = {
     "timeout": frozenset(("-k", "--kill-after", "-s", "--signal")),
     "xargs": frozenset(("-I", "-L", "--max-lines", "-n", "--max-args", "-P", "--max-procs",
                         "-s", "--max-chars", "-E", "-d", "--delimiter", "-a", "--arg-file")),
+    "nohup": frozenset(),
 }
 PREFIX_POSITIONAL_ARGUMENTS = {"timeout": 1}
 EXIT_OK = 0
@@ -251,6 +256,9 @@ def executable_index(values):
         if value in COMMAND_PREFIXES or ("=" in value and not value.startswith("$")):
             index += 1
             continue
+        if name in TOOL_PREFIXES and values[index + 1:index + 2] == [TOOL_PREFIXES[name]]:
+            index += 2
+            continue
         if name not in PREFIX_VALUE_OPTIONS:
             break
         index += 1
@@ -316,8 +324,10 @@ def scan_shell(text, *, masked=False):
                     if name == "py":
                         findings.append(Finding(line, "dynamic interpreter requires an issue exemption"))
                         break
-                    if (name in CONSOLE_LAUNCHERS
-                            or (name == "uv" and values[index + 1:index + 2] == ["run"])):
+                    if (name in CONSOLE_LAUNCHERS or VERSIONED_PIP.fullmatch(name)
+                            or (name == "uv" and any(
+                                tuple(values[index + 1:index + 1 + len(command)]) == command
+                                for command in UNISOLATED_UV_COMMANDS))):
                         findings.append(Finding(line, "console launcher requires isolated Python -m"))
                         break
     except ValueError:
