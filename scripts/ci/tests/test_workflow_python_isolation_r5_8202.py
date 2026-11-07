@@ -3,6 +3,7 @@
 import importlib.util
 from pathlib import Path
 import sys
+import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -66,6 +67,34 @@ class PrefixLaunchersN2(unittest.TestCase):
         for data in ("echo pip3.12 install x", "poetry show pytest", "pyenv versions"):
             with self.subTest(data=data):
                 self.assertEqual(checker.scan_shell(data), [])
+
+
+class WorkflowShellN3(unittest.TestCase):
+    def test_path_case_and_expression_shell_declarations(self):
+        checker = load_checker()
+        scratch = ROOT / ".local-runs"
+        scratch.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=scratch) as directory:
+            root = Path(directory)
+            workflow = root / ".github/workflows/python.yml"
+            workflow.parent.mkdir(parents=True)
+            template = "jobs:\n  test:\n    steps:\n      - shell: %s\n        run: pass\n"
+            for shell in ("/usr/bin/python3 {0}", "Python3 {0}",
+                          "${{ matrix.python }} {0}", '"/usr/bin/python3 {0}"'):
+                with self.subTest(shell=shell):
+                    workflow.write_text(template % shell)
+                    found = checker.scan_repository(root)
+                    self.assertEqual(len(found), 1, "Python shell declaration escaped")
+                    self.assertEqual(found[0][1].line, 4)
+            for shell in ("/usr/bin/python3 -I {0}", "Python3 -I {0}", "bash -e {0}"):
+                with self.subTest(clean=shell):
+                    workflow.write_text(template % shell)
+                    self.assertEqual(checker.scan_repository(root), [])
+            workflow.write_text(template % (
+                "${{ matrix.python }} {0} # isolation: exempt #8202"))
+            exemptions = []
+            self.assertEqual(checker.scan_repository(root, exemptions), [])
+            self.assertEqual([(line, issue) for _, line, issue in exemptions], [(4, "8202")])
 
 
 class InterpreterCaseN5(unittest.TestCase):
