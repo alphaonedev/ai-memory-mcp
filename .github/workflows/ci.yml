@@ -1698,7 +1698,7 @@ jobs:
             echo "AI_MEMORY_TEST_PG_ISOLATE=0" >> "$GITHUB_ENV"
             echo "::notice::[#6383] per-binary Postgres isolation disabled by CI_PG_ISOLATE_OFF=1"
           else
-            AI_MEMORY_TEST_POSTGRES_URL="$new_url" python3 scripts/test/pg_isolated_binary.py setup --db "$CI_FED_DB" --jobs 8 --emit-env >> "$GITHUB_ENV"
+            AI_MEMORY_TEST_POSTGRES_URL="$new_url" python3 -I scripts/test/pg_isolated_binary.py setup --db "$CI_FED_DB" --jobs 8 --emit-env >> "$GITHUB_ENV"
             echo "::notice::[#6383] per-binary Postgres isolation ON: template ${CI_FED_DB}_tpl"
           fi
 
@@ -2172,9 +2172,9 @@ jobs:
             cargo test --no-run "$@" "${sel[@]}" || return "$?"
             started=$(date +%s)
             if [ -n "$TIMEOUT_BIN" ]; then
-              "$TIMEOUT_BIN" --signal=TERM --kill-after=60 "$WATCHDOG_SECS" python3 scripts/test/pg_isolated_binary.py run --jobs 8 --log-dir "$sd/iso-logs" --targets-file "$sd/iso_targets.txt" --residual-file "$sd/iso_residual.txt" --test-arg=--test-threads=1 -- cargo test --no-fail-fast "$@" || rc=$?
+              "$TIMEOUT_BIN" --signal=TERM --kill-after=60 "$WATCHDOG_SECS" python3 -I scripts/test/pg_isolated_binary.py run --jobs 8 --log-dir "$sd/iso-logs" --targets-file "$sd/iso_targets.txt" --residual-file "$sd/iso_residual.txt" --test-arg=--test-threads=1 -- cargo test --no-fail-fast "$@" || rc=$?
             else
-              python3 scripts/test/pg_isolated_binary.py run --jobs 8 --log-dir "$sd/iso-logs" --targets-file "$sd/iso_targets.txt" --residual-file "$sd/iso_residual.txt" --test-arg=--test-threads=1 -- cargo test --no-fail-fast "$@" || rc=$?
+              python3 -I scripts/test/pg_isolated_binary.py run --jobs 8 --log-dir "$sd/iso-logs" --targets-file "$sd/iso_targets.txt" --residual-file "$sd/iso_residual.txt" --test-arg=--test-threads=1 -- cargo test --no-fail-fast "$@" || rc=$?
             fi
             elapsed=$(( $(date +%s) - started ))
             echo "::notice::[#6383] '${label}' ran ${elapsed}s of the ${WATCHDOG_SECS}s per-invocation watchdog budget (tier=${TIER:-sqlite} node=${CI_NODE:-unknown})"
@@ -2275,7 +2275,7 @@ jobs:
             cargo test --no-run --message-format=json-render-diagnostics $FEAT "$@" > "$sd/build.jsonl" || return "$?"
             python3 scripts/ci/partition_test_binaries.py --build-json "$sd/build.jsonl" --repo-root . --out-dir "$sd" --with-doc "$with_doc" || return "$?"
             if [ "$PG_ISO_LANE" = "1" ]; then
-              python3 scripts/ci/pg_isolate_split.py --build-json "$sd/build.jsonl" --serial-file "$sd/serial.txt" --out-dir "$sd" || return "$?"
+              python3 -I scripts/ci/pg_isolate_split.py --build-json "$sd/build.jsonl" --serial-file "$sd/serial.txt" --out-dir "$sd" || return "$?"
             fi
             # #6795: the serial shard cannot be split further, so it gets the
             # whole job time left (job cap - time since the job started, which
@@ -2573,7 +2573,7 @@ jobs:
           # by the admin-only `pg_isolated_binary.py sweep --older-than N`,
           # which CI never runs. The URL travels in the environment, not argv.
           if [ -n "${AI_MEMORY_TEST_PG_RUN_ID:-}" ]; then
-            AI_MEMORY_TEST_POSTGRES_URL="$base_url" python3 scripts/test/pg_isolated_binary.py teardown --db "$CI_FED_DB" --run-id "$AI_MEMORY_TEST_PG_RUN_ID" \
+            AI_MEMORY_TEST_POSTGRES_URL="$base_url" python3 -I scripts/test/pg_isolated_binary.py teardown --db "$CI_FED_DB" --run-id "$AI_MEMORY_TEST_PG_RUN_ID" \
               || echo "::warning::[#6383] isolation teardown failed on $RUNNER_NAME (admin sweep reclaims it)"
           fi
           if psql "$base_url" -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS \"$CI_FED_DB\" WITH (FORCE);"; then
