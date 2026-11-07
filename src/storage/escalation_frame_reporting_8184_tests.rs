@@ -20,7 +20,8 @@ fn child_stderr(name: &str, action: impl FnOnce() + Send + 'static) -> Option<St
         std::thread::spawn(action).join().expect("child thread");
         return None;
     }
-    let test_path = format!("{}::{name}", module_path!());
+    let (_, module) = module_path!().split_once("::").expect("crate module path");
+    let test_path = format!("{module}::{name}");
     let output = crate::spawn_audit::audited_command(
         std::env::current_exe().expect("test executable"),
         "escalation_frame_reporting_8184::child",
