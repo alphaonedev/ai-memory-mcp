@@ -254,6 +254,24 @@ class RepositoryPolicy6814(unittest.TestCase):
 class RoundFourIsolation8202(unittest.TestCase):
     """Review regressions execute fixtures, never workflow shell commands."""
 
+    def test_python_named_dynamic_commands_are_findings(self):
+        checker = load_checker()
+        for interpreter in ("$PYTHON", "$pythonLocation/bin/python3",
+                            "${PYTHON_HOME}/bin/python3", "$BIN/python3",
+                            "${{ steps.x.outputs.PYTHON-path }}", "py -3.12"):
+            for flags in ("", "-I "):
+                with self.subTest(interpreter=interpreter, flags=flags):
+                    self.assertEqual(len(checker.scan_shell(
+                        interpreter + " " + flags + "scripts/x.py")), 1)
+
+    def test_non_python_dynamic_commands_stay_outside_the_name_scan(self):
+        checker = load_checker()
+        for command in ("$BIN run scripts/x.py", "$PSQL -c query",
+                        "$TIMEOUT_BIN 60 command", "${BIN} run python",
+                        "${{ steps.x.outputs.binary }} python"):
+            with self.subTest(command=command):
+                self.assertEqual(checker.scan_shell(command), [])
+
     def test_first_step_key_python_shell(self):
         checker = load_checker()
         scratch = ROOT / ".local-runs"
