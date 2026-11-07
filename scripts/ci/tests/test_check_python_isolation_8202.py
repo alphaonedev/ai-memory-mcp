@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Isolation policy regressions for #8202; fixtures never execute shell text."""
 import importlib.util
+import re
 from pathlib import Path
 import sys
 import tempfile
@@ -134,6 +135,21 @@ class CommandAndWrapper6330(unittest.TestCase):
         ):
             with self.subTest(command=command):
                 self.assertEqual(checker.scan_shell(command), [])
+
+
+class PostgresInvocations6997(unittest.TestCase):
+    def test_all_five_postgres_wrapper_calls_are_isolated_6997(self):
+        checker = load_checker()
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+        calls = [line.strip().removesuffix("\\").rstrip() for line in workflow.splitlines()
+                 if re.search(r"python3 .*scripts/(?:test|ci)/pg_isolat(?:ed_binary|e_split)\.py", line)]
+        self.assertEqual(len(calls), 5)
+        for call in calls:
+            with self.subTest(call=call):
+                self.assertEqual(checker.scan_shell(call), [])
+                mutant = call.replace("python3 -I", "python3", 1)
+                self.assertNotEqual(mutant, call)
+                self.assertEqual(len(checker.scan_shell(mutant)), 1)
 
 
 if __name__ == "__main__":
