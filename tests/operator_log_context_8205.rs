@@ -284,9 +284,25 @@ fn operator_bare_authority_credentials_8205() {
 }
 
 #[test]
+fn operator_bare_authority_last_at_credentials_8205() {
+    const SECRET: &str = "last_at_authority_fixture_8205";
+    for suffix in ["db.example.invalid", "db.example.invalid:5432"] {
+        let detail = format!("connect account@realm:{SECRET}@{suffix} refused");
+        for line in detail_lines_8205(&detail) {
+            assert!(
+                !line.contains(SECRET),
+                "credential after an account at-sign reached the sink"
+            );
+            assert!(line.contains(ai_memory::logging::URL_PASSWORD_MASK));
+            assert!(line.contains("refused"), "connection context lost");
+        }
+    }
+}
+
+#[test]
 fn operator_trailing_handle_context_survives_8205() {
     const CONTEXT: &str = "failed for agent bot@node later";
-    let detail = format!("connect postgres://db.example.invalid:5432 {CONTEXT}");
+    let detail = format!("connect postgres://db.example.invalid {CONTEXT}");
     for line in detail_lines_8205(&detail) {
         assert!(
             line.contains(CONTEXT),

@@ -1558,6 +1558,22 @@ fn rotation_for(cfg: &LoggingConfig) -> Rotation {
 /// line with the deployment; only the secret is destroyed.
 pub const URL_PASSWORD_MASK: &str = "****";
 
+/// Delimiter between a URL scheme and its authority.
+const SCHEME_SEPARATOR: &str = "://";
+/// Delimiters ending a host/port after any userinfo has been consumed.
+const AUTHORITY_TERMINATORS: [char; 3] = ['/', '?', '#'];
+/// Credential-bearing connection option names; diagnostic assignments stay readable.
+const CREDENTIAL_OPTION_KEYS: &[&str] = &[
+    "password",
+    "sslpassword",
+    "token",
+    "access_token",
+    "api_key",
+    "apikey",
+    "secret",
+    "client_secret",
+];
+
 /// #1579 A3 (SECURITY) — redact the userinfo *password* portion of a
 /// single URL: `postgres://user:hunter2@host:5432/db` becomes
 /// `postgres://user:****@host:5432/db`.
@@ -1580,14 +1596,14 @@ pub const URL_PASSWORD_MASK: &str = "****";
 /// through on a parse error.
 #[must_use]
 pub fn redact_url_password(url: &str) -> String {
-    let Some(scheme_end) = url.find("://") else {
+    let Some(scheme_end) = url.find(SCHEME_SEPARATOR) else {
         return url.to_string();
     };
-    let authority_start = scheme_end + 3;
+    let authority_start = scheme_end + SCHEME_SEPARATOR.len();
     let rest = &url[authority_start..];
     // The authority component ends at the first '/', '?' or '#'.
     let authority_end = rest
-        .find(['/', '?', '#'])
+        .find(AUTHORITY_TERMINATORS)
         .map_or(url.len(), |i| authority_start + i);
     let authority = &url[authority_start..authority_end];
     // Userinfo is everything before the LAST '@' in the authority
@@ -1618,21 +1634,23 @@ pub fn redact_urls_in_message(msg: &str) -> String {
     map_url_runs(msg, redact_url_password)
 }
 
-/// Render operator connection details without echoing option values or bare
-/// connection targets. All assignments are opaque, regardless of their key;
-/// this is not a credential-name denylist (ERRORS-15). URL rendering still uses
-/// the caller's allowlist renderer. The legacy userinfo wrapper bypasses this
-/// operator-only policy.
+/// Render credential-bearing options and bare connection targets privately.
+/// Harmless assignments remain readable; URLs use the caller's allowlist renderer.
+/// OWNERSHIP-05: borrow the diagnostic while constructing its rendered copy.
+/// The legacy userinfo wrapper bypasses this operator-only option policy.
 pub(crate) fn map_urls_in_message(msg: &str, render: fn(&str) -> String) -> String {
     let options = redact_connection_options(msg);
     let mut text = String::with_capacity(options.len());
     // OWNERSHIP-15: every slice endpoint comes from a char boundary.
     for part in options.split_inclusive(char::is_whitespace) {
         let token = part.trim_end_matches(char::is_whitespace);
-        let is_bare_target = !token.contains("://")
-            && token
-                .find(['/', '?', '#'])
-                .is_some_and(|end| token[..end].contains(':'));
+        let is_bare_target = !token.contains(SCHEME_SEPARATOR)
+            && (token
+                .find(AUTHORITY_TERMINATORS)
+                .is_some_and(|end| token[..end].contains(':'))
+                || token
+                    .rsplit_once('@')
+                    .is_some_and(|(userinfo, _)| userinfo.contains(':')));
         text.push_str(if is_bare_target {
             URL_PASSWORD_MASK
         } else {
@@ -1640,17 +1658,17 @@ pub(crate) fn map_urls_in_message(msg: &str, render: fn(&str) -> String) -> Stri
         });
         text.push_str(&part[token.len()..]);
     }
-    map_url_runs(&text, render)
+    map_url_runs(&text, |url| render_operator_url(url, render))
 }
 
-/// Keep the option name, never its value, including quoted/escaped libpq
-/// values. An unterminated quoted value consumes the remaining text.
+/// Keep named credential keys, masking quoted/escaped values without erasing
+/// later diagnostic tokens when a quote is unterminated (OWNERSHIP-15).
 fn redact_connection_options(msg: &str) -> String {
     let mut text = String::with_capacity(msg.len());
     let mut rest = msg;
-    while let Some(equal) = rest.find('=') {
-        text.push_str(&rest[..=equal]);
-        let value = rest[equal + '='.len_utf8()..].trim_start();
+    while let Some(start) = credential_value_start(rest) {
+        text.push_str(&rest[..start]);
+        let value = &rest[start..];
         text.push_str(URL_PASSWORD_MASK);
         rest = &value[connection_value_end(value)..];
     }
@@ -1658,31 +1676,71 @@ fn redact_connection_options(msg: &str) -> String {
     text
 }
 
+/// Locate a named key followed by '=' or a quoted key followed by ':'.
+/// OWNERSHIP-15: character-derived offsets keep UTF-8 keys and context intact.
+fn credential_value_start(msg: &str) -> Option<usize> {
+    for (offset, separator) in msg
+        .char_indices()
+        .filter(|(_, ch)| matches!(*ch, '=' | ':'))
+    {
+        let prefix = msg[..offset].trim_end();
+        let quoted = prefix.ends_with(['\'', '"']);
+        let key = if quoted {
+            let quote = prefix.chars().last()?;
+            let inner = &prefix[..prefix.len() - quote.len_utf8()];
+            let Some(start) = inner.rfind(quote) else {
+                continue;
+            };
+            &inner[start + quote.len_utf8()..]
+        } else {
+            prefix
+                .rsplit_once(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+                .map_or(prefix, |(_, key)| key)
+        };
+        if (separator == ':' && !quoted)
+            || !CREDENTIAL_OPTION_KEYS
+                .iter()
+                .any(|name| key.eq_ignore_ascii_case(name))
+        {
+            continue;
+        }
+        let value = &msg[offset + separator.len_utf8()..];
+        return Some(msg.len() - value.trim_start().len());
+    }
+    None
+}
+
+/// Consume one credential value, retaining later error-chain text on malformed input.
 fn connection_value_end(value: &str) -> usize {
-    let mut quote = None;
+    let quote = value.chars().next().filter(|ch| matches!(*ch, '\'' | '"'));
     let mut escaped = false;
     for (offset, ch) in value.char_indices() {
+        if offset == 0 && quote.is_some() {
+            continue;
+        }
         if escaped {
             escaped = false;
         } else if ch == '\\' {
             escaped = true;
         } else if quote == Some(ch) {
-            quote = None;
-        } else if offset == 0 && matches!(ch, '\'' | '"') {
-            quote = Some(ch);
+            return offset + ch.len_utf8();
         } else if quote.is_none() && ch.is_whitespace() {
             return offset;
         }
     }
-    value.len()
+    if quote.is_some() {
+        value.find(char::is_whitespace).unwrap_or(value.len())
+    } else {
+        value.len()
+    }
 }
 
 /// Apply one renderer to each URL run, sharing UTF-8-safe tokenization
 /// (OWNERSHIP-15) without duplicating the URL renderer's masking policy.
-fn map_url_runs(msg: &str, render: fn(&str) -> String) -> String {
+fn map_url_runs(msg: &str, render: impl Fn(&str) -> String) -> String {
     let mut out = String::with_capacity(msg.len());
     let mut rest = msg;
-    while let Some(sep) = rest.find("://") {
+    while let Some(sep) = rest.find(SCHEME_SEPARATOR) {
         // Walk back over scheme characters already buffered.
         let mut scheme_start = sep;
         while scheme_start > 0 {
@@ -1694,18 +1752,8 @@ fn map_url_runs(msg: &str, render: fn(&str) -> String) -> String {
             }
         }
         out.push_str(&rest[..scheme_start]);
-        // ERRORS-15: punctuation can be credential data, including in a
-        // malformed URL. Never emit a suffix just because parsing would
-        // reject it. Whitespace inside userinfo also belongs to the run.
-        let authority_start = sep + "://".len();
-        let authority = &rest[authority_start..];
-        let authority_end = authority.find(['/', '?', '#']).unwrap_or(authority.len());
-        let after_userinfo = authority[..authority_end]
-            .rfind('@')
-            .map_or(authority_start, |at| authority_start + at + '@'.len_utf8());
-        let url_end = rest[after_userinfo..]
-            .find(char::is_whitespace)
-            .map_or(rest.len(), |i| after_userinfo + i);
+        let authority_start = sep + SCHEME_SEPARATOR.len();
+        let url_end = operator_url_run_end(rest, authority_start);
         out.push_str(&render(&rest[scheme_start..url_end]));
         rest = &rest[url_end..];
     }
@@ -1713,9 +1761,127 @@ fn map_url_runs(msg: &str, render: fn(&str) -> String) -> String {
     out
 }
 
+/// Bound the ruled password-shaped look-ahead by the line and the next scheme.
+/// OWNERSHIP-15: find/split offsets are UTF-8 boundaries, including Unicode whitespace.
+fn operator_url_run_end(text: &str, authority_start: usize) -> usize {
+    let authority = &text[authority_start..];
+    let token_end = authority
+        .find(char::is_whitespace)
+        .unwrap_or(authority.len());
+    let token = &authority[..token_end];
+    if token.contains('@')
+        || !token
+            .split_once(':')
+            .is_some_and(|(account, _)| !account.is_empty())
+    {
+        return authority_start + token_end;
+    }
+    // ANSWER-CODEX-8205-R4-URL-BOUNDARY: numeric ports also remain password-shaped.
+    let line_end = authority.find(['\n', '\r']).unwrap_or(authority.len());
+    let stop = authority
+        .find(SCHEME_SEPARATOR)
+        .map_or(line_end, |next| next.min(line_end));
+    let Some(at) = authority[..stop].find('@') else {
+        return authority_start + token_end;
+    };
+    let host_start = at + '@'.len_utf8();
+    let end = authority[host_start..stop]
+        .find(char::is_whitespace)
+        .map_or(stop, |offset| host_start + offset);
+    authority_start + end
+}
+
+/// Remove ambiguous userinfo before the existing allowlist renderer sees the URL.
+/// OWNERSHIP-05: borrow source spans; allocate only the repaired URL and rendered result.
+fn render_operator_url(url: &str, render: fn(&str) -> String) -> String {
+    let Some((scheme, authority)) = url.split_once(SCHEME_SEPARATOR) else {
+        return render(url);
+    };
+    let token_end = authority
+        .find(char::is_whitespace)
+        .unwrap_or(authority.len());
+    let Some(at) = authority[..token_end]
+        .rfind('@')
+        .or_else(|| authority.find('@'))
+    else {
+        return render(url);
+    };
+    let host_tail = &authority[at + '@'.len_utf8()..];
+    let host_end = host_tail
+        .find(AUTHORITY_TERMINATORS)
+        .unwrap_or(host_tail.len());
+    let host = &host_tail[..host_end];
+    render(&format!(
+        "{scheme}{SCHEME_SEPARATOR}{URL_PASSWORD_MASK}@{host}"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn operator_numeric_password_with_path_boundary_8205() {
+        assert_eq!(
+            map_urls_in_message(
+                "connect postgres://svc:123/path note@host failed",
+                str::to_owned
+            ),
+            "connect postgres://****@host failed"
+        );
+    }
+
+    #[test]
+    fn operator_numeric_password_with_space_boundary_8205() {
+        assert_eq!(
+            map_urls_in_message("connect postgres://svc:123 note@host failed", str::to_owned),
+            "connect postgres://****@host failed"
+        );
+    }
+
+    #[test]
+    fn operator_url_authority_ruling_boundaries_8205() {
+        const PASSWORD_TAIL_8205: &str = "secret";
+        const CASES: &[(&str, &str)] = &[
+            (
+                "postgres://db.example.invalid:5432 failed for agent bot@node later",
+                "postgres://****@node later",
+            ),
+            (
+                "postgres://db.example.invalid:5432 connection refused",
+                "postgres://db.example.invalid:5432 connection refused",
+            ),
+            (
+                "postgres://db.example.invalid/path then see https://docs.example/x@y",
+                "postgres://db.example.invalid/path then see https://****@y",
+            ),
+            (
+                "postgres://host:5432\nagent bot@node",
+                "postgres://host:5432\nagent bot@node",
+            ),
+            (
+                "postgres://db.example.invalid failed for agent bot@node later",
+                "postgres://db.example.invalid failed for agent bot@node later",
+            ),
+            (
+                "postgres://host:5432 next https://user:pass@other/x",
+                "postgres://host:5432 next https://****@other",
+            ),
+        ];
+        let ambiguous =
+            format!("postgres://user:prefix/ss {PASSWORD_TAIL_8205}@db.example.invalid");
+        let rendered = map_urls_in_message(&ambiguous, str::to_owned);
+        assert_eq!(rendered, "postgres://****@db.example.invalid");
+        assert!(!rendered.contains(PASSWORD_TAIL_8205));
+        // TEST-02: identity rendering isolates the ruled byte spans from URL-origin formatting.
+        for (input, expected) in CASES {
+            assert_eq!(
+                map_urls_in_message(input, str::to_owned),
+                *expected,
+                "{input}"
+            );
+        }
+    }
 
     #[test]
     fn rotation_for_default_is_daily() {
