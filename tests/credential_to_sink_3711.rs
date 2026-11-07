@@ -594,7 +594,7 @@ fn rust_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
 
 fn userinfo_masker_reference_3711(code: &str) -> bool {
     const USERINFO_MASKERS: &[&str] = &["redact_url_password", "redact_urls_in_message"];
-    // ERRORS-15: a function value or aliased import is as unsafe as a call.
+    // TEST-02: assert on function values and aliased imports as well as calls.
     code.split(|ch: char| !(ch.is_alphanumeric() || ch == '_'))
         .any(|identifier| USERINFO_MASKERS.contains(&identifier))
 }
@@ -618,8 +618,50 @@ fn userinfo_masker_function_values_are_rejected_8205() {
 }
 
 fn production_line_has_userinfo_masker_8205(line: &str) -> bool {
-    let code = line.split("//").next().unwrap_or("");
-    userinfo_masker_reference_3711(code)
+    userinfo_masker_reference_3711(rust_code_before_line_comment_8205(line))
+}
+
+fn rust_code_before_line_comment_8205(line: &str) -> &str {
+    let mut chars = line.char_indices().peekable();
+    let mut quoted = false;
+    let mut escaped = false;
+    let mut raw_hashes = None;
+    while let Some((offset, ch)) = chars.next() {
+        if let Some(hashes) = raw_hashes {
+            if ch == '"'
+                && line.as_bytes()[offset + ch.len_utf8()..]
+                    .get(..hashes)
+                    .is_some_and(|bytes| bytes.iter().all(|byte| *byte == b'#'))
+            {
+                raw_hashes = None;
+            }
+            continue;
+        }
+        if quoted {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                quoted = false;
+            }
+            continue;
+        }
+        if ch == 'r' {
+            let suffix = &line[offset + ch.len_utf8()..];
+            let hashes = suffix.bytes().take_while(|byte| *byte == b'#').count();
+            if suffix.as_bytes().get(hashes) == Some(&b'"') {
+                raw_hashes = Some(hashes);
+                let _ = chars.nth(hashes);
+            }
+        } else if ch == '"' {
+            quoted = true;
+        } else if ch == '/' && chars.peek().is_some_and(|(_, next)| *next == '/') {
+            // OWNERSHIP-15: char_indices provides the UTF-8-safe borrowed prefix.
+            return &line[..offset];
+        }
+    }
+    line
 }
 
 #[test]
@@ -627,6 +669,7 @@ fn userinfo_masker_after_url_literal_is_rejected_8205() {
     for code in [
         "let render = logging::redact_url_password;",
         r#"let target = "https://peer.example.invalid"; let render = logging::redact_url_password;"#,
+        r##"let target = r#"https://peer.example.invalid"#; let render = logging::redact_url_password;"##,
     ] {
         assert!(
             production_line_has_userinfo_masker_8205(code),
