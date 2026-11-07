@@ -1029,6 +1029,7 @@ pub mod routines;
 pub mod signals;
 pub mod signed_events;
 pub mod sizes;
+pub mod stop_signal;
 // v1.0.0 V08-PE-3 (#1937) — MINIMAL signed spawn-audit chokepoint: exactly one
 // signed `process.spawn_audited` row per production `Command` spawn (argv0 +
 // caller), routing every production subprocess launch through one audited

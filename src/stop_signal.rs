@@ -1,0 +1,381 @@
+// Copyright 2026 AlphaOne LLC
+// SPDX-License-Identifier: Apache-2.0
+
+//! #8193 - the one shutdown primitive for every long-running verb.
+//!
+//! `serve`, `wake-hub`, `wake-listen`, `watch --daemon`, `curator --daemon`
+//! and `sync-daemon` all stop on SIGINT and SIGTERM (unix) or Ctrl-C
+//! (elsewhere) through [`StopListener`]. A signal registration that fails is
+//! an error: it is logged at `error` level and the matching arm parks, so a
+//! failed registration is never read as a received stop (ERRORS-19, #6385,
+//! #6869). The daemon keeps running, but with no handler installed that
+//! signal's default disposition applies and ends the process at once,
+//! undrained; the other signal still drains gracefully. The `mcp` stdio
+//! server keeps its own fail-closed listeners in [`crate::mcp::shutdown`] (it
+//! refuses to start rather than run unstoppable).
+//!
+//! Install the listener ONCE, before the daemon starts serving or spawns the
+//! task that waits on it. [`StopListener::wait`] is cancel-safe, so a loop may
+//! select on it every iteration.
+
+use std::io;
+
+/// Name of the interrupt signal in log lines and the test seam.
+pub const SIGNAL_NAME_INT: &str = "SIGINT";
+
+/// Name of the terminate signal in log lines and the test seam.
+pub const SIGNAL_NAME_TERM: &str = "SIGTERM";
+
+/// Test seam (unix debug and test builds only): the listed signal name, or
+/// `any`, fails its registration with an injected error. Shares the variable
+/// the `mcp` listeners use, so one switch drives every unix verb. The
+/// non-unix Ctrl-C path has no injected failure.
+#[cfg(any(test, debug_assertions))]
+pub const TEST_FAIL_REGISTER_ENV: &str = crate::mcp::shutdown::TEST_FAIL_STOP_INSTALL_ENV;
+
+/// Value of [`TEST_FAIL_REGISTER_ENV`] that fails every registration.
+#[cfg(all(unix, any(test, debug_assertions)))]
+const TEST_FAIL_ANY: &str = "any";
+
+/// The outcome of waiting for an interrupt registration.
+#[cfg(any(test, not(unix)))]
+#[derive(Debug)]
+pub enum InterruptWait {
+    /// An interrupt was delivered.
+    Received,
+    /// The handler could not be registered: no interrupt will ever arrive.
+    RegistrationFailed(io::Error),
+}
+
+/// Classify the result of `tokio::signal::ctrl_c()`: an `Err` is a failed
+/// registration, never a received interrupt (ERRORS-19).
+#[cfg(any(test, not(unix)))]
+#[must_use]
+pub fn classify_interrupt(result: io::Result<()>) -> InterruptWait {
+    match result {
+        Ok(()) => InterruptWait::Received,
+        Err(error) => InterruptWait::RegistrationFailed(error),
+    }
+}
+
+/// Log a failed registration and yield `None`; yield the handle otherwise.
+fn armed<T>(name: &'static str, result: io::Result<T>) -> Option<T> {
+    match result {
+        Ok(handle) => Some(handle),
+        Err(error) => {
+            tracing::error!(
+                signal = name,
+                %error,
+                "#8193: stop-signal registration failed; this signal is NOT handled and \
+                 will terminate the daemon immediately without a graceful drain - stop it \
+                 with the other signal or fix the host"
+            );
+            None
+        }
+    }
+}
+
+/// The injected registration failure for `name`, if the seam is armed.
+#[cfg(all(unix, any(test, debug_assertions)))]
+fn injected_failure(name: &str) -> Option<io::Error> {
+    let value = std::env::var(TEST_FAIL_REGISTER_ENV).ok()?;
+    let value = value.trim();
+    (value.eq_ignore_ascii_case(TEST_FAIL_ANY) || value.eq_ignore_ascii_case(name))
+        .then(|| io::Error::other("injected stop-signal registration failure (test seam)"))
+}
+
+/// Registered stop-signal listeners. Install once, before the daemon starts
+/// serving, so no stop signal can reach the default disposition afterwards.
+#[derive(Debug)]
+pub struct StopListener {
+    #[cfg(unix)]
+    int: Option<tokio::signal::unix::Signal>,
+    #[cfg(unix)]
+    term: Option<tokio::signal::unix::Signal>,
+    #[cfg(not(unix))]
+    ctrl_c: CtrlC,
+}
+
+/// State of the non-unix Ctrl-C wait.
+#[cfg(not(unix))]
+enum CtrlC {
+    /// Registered; not yet delivered.
+    Pending(std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<()>> + Send>>),
+    /// Delivered (possibly during registration).
+    Fired,
+    /// Registration failed: parks, never a stop.
+    Failed,
+}
+
+#[cfg(not(unix))]
+impl std::fmt::Debug for CtrlC {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Pending(_) => "Pending",
+            Self::Fired => "Fired",
+            Self::Failed => "Failed",
+        })
+    }
+}
+
+#[cfg(unix)]
+fn register(
+    kind: tokio::signal::unix::SignalKind,
+    name: &'static str,
+) -> Option<tokio::signal::unix::Signal> {
+    #[cfg(any(test, debug_assertions))]
+    if let Some(error) = injected_failure(name) {
+        return armed(name, Err(error));
+    }
+    armed(name, tokio::signal::unix::signal(kind))
+}
+
+/// Resolve when `slot` receives its signal. A missing slot (failed
+/// registration) and a closed stream (`recv() == None`, the runtime going
+/// away) both park: neither is a received stop.
+#[cfg(unix)]
+async fn wait_one(slot: &mut Option<tokio::signal::unix::Signal>) {
+    if let Some(signal) = slot.as_mut()
+        && signal.recv().await.is_some()
+    {
+        return;
+    }
+    std::future::pending::<()>().await;
+}
+
+impl StopListener {
+    /// Register SIGINT and SIGTERM (unix) or arm the Ctrl-C wait (elsewhere).
+    /// Must run inside the tokio runtime. A failed registration is logged and
+    /// leaves that signal parked; see [`Self::fully_installed`].
+    #[must_use]
+    pub fn install() -> Self {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::SignalKind;
+            Self {
+                int: register(SignalKind::interrupt(), SIGNAL_NAME_INT),
+                term: register(SignalKind::terminate(), SIGNAL_NAME_TERM),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            // Register eagerly: the first poll installs the handler, so poll
+            // once here (the src/mcp/shutdown.rs precedent) instead of on the
+            // first `wait`. A Ctrl-C inside that poll is an immediate stop.
+            let mut ctrl_c: std::pin::Pin<
+                Box<dyn std::future::Future<Output = io::Result<()>> + Send>,
+            > = Box::pin(tokio::signal::ctrl_c());
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            let ctrl_c = match ctrl_c.as_mut().poll(&mut cx) {
+                std::task::Poll::Ready(result) => match classify_interrupt(result) {
+                    InterruptWait::Received => CtrlC::Fired,
+                    InterruptWait::RegistrationFailed(error) => {
+                        let _ = armed::<()>(SIGNAL_NAME_INT, Err(error));
+                        CtrlC::Failed
+                    }
+                },
+                std::task::Poll::Pending => CtrlC::Pending(ctrl_c),
+            };
+            Self { ctrl_c }
+        }
+    }
+
+    /// Whether every stop signal this platform supports is registered.
+    #[must_use]
+    pub fn fully_installed(&self) -> bool {
+        #[cfg(unix)]
+        {
+            self.int.is_some() && self.term.is_some()
+        }
+        #[cfg(not(unix))]
+        {
+            !matches!(self.ctrl_c, CtrlC::Failed)
+        }
+    }
+
+    /// Resolve when a stop signal is received. Never resolves because of a
+    /// failed registration.
+    pub async fn wait(&mut self) {
+        #[cfg(unix)]
+        {
+            let Self { int, term } = self;
+            tokio::select! {
+                () = wait_one(int) => {}
+                () = wait_one(term) => {}
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            match &mut self.ctrl_c {
+                CtrlC::Fired => {}
+                CtrlC::Failed => std::future::pending::<()>().await,
+                CtrlC::Pending(ctrl_c) => match classify_interrupt(ctrl_c.as_mut().await) {
+                    InterruptWait::Received => self.ctrl_c = CtrlC::Fired,
+                    InterruptWait::RegistrationFailed(error) => {
+                        let _ = armed::<()>(SIGNAL_NAME_INT, Err(error));
+                        self.ctrl_c = CtrlC::Failed;
+                        std::future::pending::<()>().await;
+                    }
+                },
+            }
+        }
+    }
+}
+
+/// How the HTTP server's graceful shutdown ended (#8193 N2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrainOutcome {
+    /// The server returned before the grace budget ran out: every in-flight
+    /// request finished.
+    Drained,
+    /// The grace budget was reached: axum-server cut the remaining
+    /// connections and still returned Ok.
+    GraceExpired,
+}
+
+impl DrainOutcome {
+    /// The shutdown log line for this outcome. `Drained` claims a drain;
+    /// `GraceExpired` names the budget and says the rest was force-closed.
+    #[must_use]
+    pub fn log_text(self, grace_secs: u64) -> String {
+        match self {
+            Self::Drained => "in-flight requests drained — stopping background writers".to_owned(),
+            Self::GraceExpired => format!(
+                "shutdown grace of {grace_secs}s expired: remaining connections were force-closed, not drained — stopping background writers"
+            ),
+        }
+    }
+}
+
+/// Pick the outcome from the time between the stop signal and the server
+/// returning, against the `--shutdown-grace-secs` budget.
+#[must_use]
+pub fn drain_outcome(elapsed: std::time::Duration, grace: std::time::Duration) -> DrainOutcome {
+    if elapsed >= grace {
+        DrainOutcome::GraceExpired
+    } else {
+        DrainOutcome::Drained
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Bound a parked wait must outlast to count as "did not resolve".
+    const PARK_PROBE: std::time::Duration = std::time::Duration::from_millis(300);
+
+    /// Bound for a delivered signal to resolve the wait.
+    const DELIVER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+    #[test]
+    fn a_failed_ctrl_c_registration_is_not_a_received_interrupt_6385() {
+        assert!(matches!(
+            classify_interrupt(Ok(())),
+            InterruptWait::Received
+        ));
+        assert!(matches!(
+            classify_interrupt(Err(io::Error::other("no handler"))),
+            InterruptWait::RegistrationFailed(_)
+        ));
+    }
+
+    #[test]
+    fn armed_returns_none_for_an_error_and_the_handle_for_ok_6385() {
+        assert_eq!(armed(SIGNAL_NAME_INT, Ok(7_u8)), Some(7));
+        assert_eq!(
+            armed::<u8>(SIGNAL_NAME_INT, Err(io::Error::other("x"))),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_missing_listener_stays_pending_6869() {
+        let mut slot: Option<tokio::signal::unix::Signal> = None;
+        let outcome = tokio::time::timeout(PARK_PROBE, wait_one(&mut slot)).await;
+        assert!(
+            outcome.is_err(),
+            "a failed registration must park, not stop"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_all_failed_listener_never_resolves_6869() {
+        let mut listener = StopListener {
+            int: None,
+            term: None,
+        };
+        assert!(!listener.fully_installed());
+        let outcome = tokio::time::timeout(PARK_PROBE, listener.wait()).await;
+        assert!(outcome.is_err(), "no registered signal must mean no stop");
+    }
+
+    /// Raise `signal` on this process once the listener is installed.
+    #[cfg(unix)]
+    async fn stops_on(signal: libc::c_int) {
+        let mut listener = StopListener::install();
+        assert!(listener.fully_installed(), "both stop signals register");
+        // SAFETY: raising a signal on our own process whose handler is installed.
+        unsafe {
+            libc::raise(signal);
+        }
+        tokio::time::timeout(DELIVER_DEADLINE, listener.wait())
+            .await
+            .expect("an installed stop signal must resolve the wait");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sigint_and_sigterm_resolve_the_same_wait_8193() {
+        // A raised signal reaches every listener in the process, so run alone
+        // in a child (the curator tests kick the same signals).
+        if crate::config::run_env_isolated_child_or_spawn(
+            "stop_signal::tests::sigint_and_sigterm_resolve_the_same_wait_8193",
+        ) {
+            return;
+        }
+        stops_on(libc::SIGINT).await;
+        stops_on(libc::SIGTERM).await;
+    }
+
+    /// #8193 N2: the drain log is truthful. Below the grace budget the server
+    /// drained; at or past it axum-server force-closed the rest and still
+    /// returned Ok, which must not be reported as a drain.
+    #[test]
+    fn drain_outcome_reports_a_cut_at_the_grace_budget_8193() {
+        let grace = std::time::Duration::from_secs(30);
+        assert_eq!(
+            drain_outcome(std::time::Duration::from_millis(1_500), grace),
+            DrainOutcome::Drained
+        );
+        assert_eq!(
+            drain_outcome(grace - std::time::Duration::from_millis(1), grace),
+            DrainOutcome::Drained
+        );
+        assert_eq!(drain_outcome(grace, grace), DrainOutcome::GraceExpired);
+        assert_eq!(
+            drain_outcome(grace + std::time::Duration::from_secs(5), grace),
+            DrainOutcome::GraceExpired
+        );
+    }
+
+    /// #8193 L1: both log texts are pinned. The drained text claims a drain;
+    /// the grace-expired text names the budget and says the connections were
+    /// force-closed, and never claims a drain.
+    #[test]
+    fn drain_outcome_log_texts_are_truthful_8193() {
+        assert_eq!(
+            DrainOutcome::Drained.log_text(30),
+            "in-flight requests drained — stopping background writers"
+        );
+        let expired = DrainOutcome::GraceExpired.log_text(30);
+        assert_eq!(
+            expired,
+            "shutdown grace of 30s expired: remaining connections were force-closed, not drained — stopping background writers"
+        );
+        assert!(expired.contains("force-closed"));
+        assert!(!expired.contains("in-flight requests drained"));
+    }
+}
