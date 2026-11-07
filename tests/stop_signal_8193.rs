@@ -99,41 +99,90 @@ fn every_daemon_uses_the_shared_primitive_8193() {
     );
 }
 
-/// Boot line `sync-daemon` logs before it waits for a stop signal.
+/// Bound on waiting for a verb's boot line, and on its exit after a signal.
 #[cfg(unix)]
-const SYNC_BOOT_MARKER: &str = "sync-daemon: local_agent_id";
-
-/// Bound on waiting for the boot line, and on the exit after the signal.
-#[cfg(unix)]
-const SYNC_WAIT_DEADLINE: Duration = Duration::from_secs(60);
+const VERB_WAIT_DEADLINE: Duration = Duration::from_secs(60);
 
 /// Pause after the boot line so the stop listeners are installed.
 #[cfg(unix)]
-const SYNC_SETTLE: Duration = Duration::from_millis(750);
+const VERB_SETTLE: Duration = Duration::from_millis(750);
 
-/// Poll interval while waiting for the daemon to exit.
+/// Poll interval while waiting for a verb to boot or exit.
 #[cfg(unix)]
-const SYNC_POLL: Duration = Duration::from_millis(100);
+const VERB_POLL: Duration = Duration::from_millis(100);
+
+/// Both stop signals every verb must take down the same graceful path.
+#[cfg(unix)]
+const STOP_SIGNALS: [(&str, libc::c_int); 2] =
+    [("SIGINT", libc::SIGINT), ("SIGTERM", libc::SIGTERM)];
 
 /// A peer URL nothing listens on: the daemon only has to boot and wait.
 #[cfg(unix)]
 const SYNC_UNREACHABLE_PEER: &str = "https://127.0.0.1:9";
 
-/// `sync-daemon` takes SIGINT and SIGTERM down the same graceful path (exit 0).
+/// Boot line `sync-daemon` logs before it waits for a stop signal.
 #[cfg(unix)]
-#[test]
-fn sync_daemon_stop_signals_exit_zero_8193() {
-    use std::os::unix::process::ExitStatusExt;
+const SYNC_BOOT_MARKER: &str = "sync-daemon: local_agent_id";
 
-    for (name, signal) in [("SIGINT", libc::SIGINT), ("SIGTERM", libc::SIGTERM)] {
+/// Boot line `wake-hub` logs once its socket is bound and it is serving.
+#[cfg(unix)]
+const WAKE_HUB_BOOT_MARKER: &str = "wake-hub: listening";
+
+/// Line `wake-hub` logs once its drain finished.
+#[cfg(unix)]
+const WAKE_HUB_STOPPED_MARKER: &str = "wake-hub: stopped";
+
+/// Boot line `wake-listen` logs before it waits for a wake.
+#[cfg(unix)]
+const WAKE_LISTEN_BOOT_MARKER: &str = "wake listener: started";
+
+/// Line `wake-listen` logs when it stops on a signal.
+#[cfg(unix)]
+const WAKE_LISTEN_STOPPING_MARKER: &str = "wake listener: stopping on signal";
+
+/// Boot line `watch --daemon` logs before its first poll.
+#[cfg(unix)]
+const WATCH_BOOT_MARKER: &str = "L3 watch daemon started";
+
+/// Line `watch --daemon` logs once its loop has stopped.
+#[cfg(unix)]
+const WATCH_STOPPED_MARKER: &str = "L3 watch daemon shutdown";
+
+/// Boot line `curator --daemon` logs before its first cycle.
+#[cfg(unix)]
+const CURATOR_BOOT_MARKER: &str = "curator daemon started";
+
+/// How long the `wake-listen` test hook sleeps: long enough that the signal
+/// is delivered while the hook runs, short enough to finish well inside the
+/// exit deadline.
+#[cfg(unix)]
+const HOOK_SLEEP_SECS: u32 = 3;
+
+/// A spawned verb under test: its child, its streamed stderr and the temp dir
+/// that owns every path it touches.
+#[cfg(unix)]
+struct Verb {
+    child: std::process::Child,
+    rx: mpsc::Receiver<String>,
+    reader: Option<std::thread::JoinHandle<()>>,
+    log: String,
+    _tmp: tempfile::TempDir,
+}
+
+#[cfg(unix)]
+impl Verb {
+    /// Spawn `ai-memory --db <tmp>/verb-8193.db <args>` with an isolated home
+    /// and no config, stderr streamed line by line.
+    fn spawn(args: &[&str]) -> Self {
         let tmp = tempfile::TempDir::new().unwrap();
-        let db = tmp.path().join("sync-8193.db");
+        let db = tmp.path().join("verb-8193.db");
         let mut child = Command::new(env!("CARGO_BIN_EXE_ai-memory"))
             .arg("--db")
             .arg(&db)
-            .args(["sync-daemon", "--peers", SYNC_UNREACHABLE_PEER])
+            .args(args)
             .env("AI_MEMORY_NO_CONFIG", "1")
-            .env("AI_MEMORY_AGENT_ID", "ai:sync-8193")
+            .env("AI_MEMORY_AGENT_ID", "ai:verb-8193")
+            .env("HOME", tmp.path())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
@@ -145,44 +194,213 @@ fn sync_daemon_stop_signals_exit_zero_8193() {
                 let _ = tx.send(line);
             }
         });
-        let deadline = Instant::now() + SYNC_WAIT_DEADLINE;
-        let mut log = String::new();
-        let mut booted = false;
+        Self {
+            child,
+            rx,
+            reader: Some(reader),
+            log: String::new(),
+            _tmp: tmp,
+        }
+    }
+
+    /// Drain pending stderr lines into the log for up to `wait`.
+    fn pump(&mut self, wait: Duration) {
+        if let Ok(line) = self.rx.recv_timeout(wait) {
+            self.log.push_str(&line);
+            self.log.push('\n');
+        }
+    }
+
+    /// Kill the child (it is this test's own) and fail with the log.
+    fn fail(&mut self, why: &str) -> ! {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        self.pump(Duration::from_millis(50));
+        panic!("{why}:\n{}", self.log);
+    }
+
+    /// Wait until the log shows `marker`.
+    fn wait_for_log(&mut self, marker: &str) {
+        let deadline = Instant::now() + VERB_WAIT_DEADLINE;
         while Instant::now() < deadline {
-            if let Ok(line) = rx.recv_timeout(SYNC_POLL) {
-                log.push_str(&line);
-                log.push('\n');
-                if line.contains(SYNC_BOOT_MARKER) {
-                    booted = true;
-                    break;
-                }
-            } else if child.try_wait().unwrap().is_some() {
-                break;
+            self.pump(VERB_POLL);
+            if self.log.contains(marker) {
+                return;
+            }
+            if self.child.try_wait().unwrap().is_some() {
+                self.fail(&format!("verb exited before logging {marker:?}"));
             }
         }
-        if !booted {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!("{name}: sync-daemon did not boot:\n{log}");
+        self.fail(&format!("verb never logged {marker:?}"));
+    }
+
+    /// Wait until `path` exists.
+    fn wait_for_file(&mut self, path: &Path) {
+        let deadline = Instant::now() + VERB_WAIT_DEADLINE;
+        while Instant::now() < deadline {
+            if path.exists() {
+                return;
+            }
+            self.pump(VERB_POLL);
+            if self.child.try_wait().unwrap().is_some() {
+                self.fail(&format!("verb exited before creating {}", path.display()));
+            }
         }
-        std::thread::sleep(SYNC_SETTLE);
+        self.fail(&format!("verb never created {}", path.display()));
+    }
+
+    /// Send `signal` to the child, require a normal exit 0 inside the
+    /// deadline, and return the full log.
+    fn signal_and_expect_clean_exit(mut self, name: &str, signal: libc::c_int) -> (String, Self) {
+        use std::os::unix::process::ExitStatusExt;
+
         // SAFETY: the pid is this test's own, still-owned child.
         unsafe {
-            libc::kill(i32::try_from(child.id()).unwrap(), signal);
+            libc::kill(i32::try_from(self.child.id()).unwrap(), signal);
         }
+        let deadline = Instant::now() + VERB_WAIT_DEADLINE;
         let status = loop {
-            if Instant::now() > deadline + SYNC_WAIT_DEADLINE {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("{name}: sync-daemon did not exit after the signal");
+            if Instant::now() > deadline {
+                self.fail(&format!("{name}: verb did not exit after the signal"));
             }
-            if let Some(status) = child.try_wait().unwrap() {
+            if let Some(status) = self.child.try_wait().unwrap() {
                 break status;
             }
-            std::thread::sleep(SYNC_POLL);
+            self.pump(VERB_POLL);
         };
-        let _ = reader.join();
-        assert_eq!(status.signal(), None, "{name}: died by signal");
-        assert!(status.success(), "{name}: exit {status:?}");
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+        while let Ok(line) = self.rx.try_recv() {
+            self.log.push_str(&line);
+            self.log.push('\n');
+        }
+        assert_eq!(
+            status.signal(),
+            None,
+            "{name}: died by signal:\n{}",
+            self.log
+        );
+        assert!(status.success(), "{name}: exit {status:?}:\n{}", self.log);
+        (std::mem::take(&mut self.log), self)
+    }
+}
+
+/// `sync-daemon` takes SIGINT and SIGTERM down the same graceful path (exit 0).
+#[cfg(unix)]
+#[test]
+fn sync_daemon_stop_signals_exit_zero_8193() {
+    for (name, signal) in STOP_SIGNALS {
+        let mut verb = Verb::spawn(&["sync-daemon", "--peers", SYNC_UNREACHABLE_PEER]);
+        verb.wait_for_log(SYNC_BOOT_MARKER);
+        std::thread::sleep(VERB_SETTLE);
+        let _ = verb.signal_and_expect_clean_exit(name, signal);
+    }
+}
+
+/// `wake-hub` under a real SIGINT / SIGTERM: drains, exits 0, and unlinks the
+/// socket it created.
+#[cfg(unix)]
+#[test]
+fn wake_hub_stop_signals_exit_zero_and_unlink_the_socket_8193() {
+    for (name, signal) in STOP_SIGNALS {
+        // The socket path must stay short (AF_UNIX limit): a dedicated temp
+        // dir, alive for the whole iteration.
+        let sock_dir = tempfile::TempDir::new().unwrap();
+        // The hub refuses a socket directory that is not owner-only.
+        std::fs::set_permissions(
+            sock_dir.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let socket = sock_dir.path().join("hub.sock");
+        let socket_arg = socket.to_str().unwrap().to_owned();
+        let mut verb = Verb::spawn(&["wake-hub", "--socket", &socket_arg]);
+        verb.wait_for_log(WAKE_HUB_BOOT_MARKER);
+        assert!(socket.exists(), "{name}: the hub must own its socket");
+        std::thread::sleep(VERB_SETTLE);
+        let (log, _verb) = verb.signal_and_expect_clean_exit(name, signal);
+        assert!(
+            log.contains(WAKE_HUB_STOPPED_MARKER),
+            "{name}: the hub must log its drain:\n{log}"
+        );
+        assert!(
+            !socket.exists(),
+            "{name}: the hub must unlink the socket it created"
+        );
+    }
+}
+
+/// `watch --daemon` under a real SIGINT / SIGTERM: the loop stops between
+/// ticks and the process exits 0.
+#[cfg(unix)]
+#[test]
+fn watch_daemon_stop_signals_exit_zero_8193() {
+    for (name, signal) in STOP_SIGNALS {
+        let mut verb = Verb::spawn(&["watch", "--daemon", "--interval-secs", "1"]);
+        verb.wait_for_log(WATCH_BOOT_MARKER);
+        std::thread::sleep(VERB_SETTLE);
+        let (log, _verb) = verb.signal_and_expect_clean_exit(name, signal);
+        assert!(
+            log.contains(WATCH_STOPPED_MARKER),
+            "{name}: the watch loop must log its shutdown:\n{log}"
+        );
+    }
+}
+
+/// `curator --daemon` under a real SIGINT / SIGTERM exits 0.
+#[cfg(unix)]
+#[test]
+fn curator_daemon_stop_signals_exit_zero_8193() {
+    for (name, signal) in STOP_SIGNALS {
+        let mut verb = Verb::spawn(&["curator", "--daemon", "--interval-secs", "3600"]);
+        verb.wait_for_log(CURATOR_BOOT_MARKER);
+        std::thread::sleep(VERB_SETTLE);
+        let _ = verb.signal_and_expect_clean_exit(name, signal);
+    }
+}
+
+/// M1 of the r1 review: a stop signal delivered while a slow `--exec` hook is
+/// running must not be lost. The listener finishes (and reaps) the hook, sees
+/// the signal, and exits 0 inside the deadline; it never runs on until SIGKILL.
+#[cfg(unix)]
+#[test]
+fn wake_listen_stop_signal_during_a_slow_exec_hook_exits_zero_8193() {
+    for (name, signal) in STOP_SIGNALS {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let started = tmp.path().join("hook-started");
+        let done = tmp.path().join("hook-done");
+        let hook = format!(
+            "touch {started}; sleep {HOOK_SLEEP_SECS}; touch {done}",
+            started = started.display(),
+            done = done.display()
+        );
+        let key_dir = tmp.path().join("no-keys");
+        let mut verb = Verb::spawn(&[
+            "wake-listen",
+            "--agent-id",
+            "ai:listener-8193",
+            "--no-hub",
+            "--poll-secs",
+            "1",
+            "--key-dir",
+            key_dir.to_str().unwrap(),
+            "--exec",
+            &hook,
+        ]);
+        verb.wait_for_log(WAKE_LISTEN_BOOT_MARKER);
+        // The signal arrives while the hook is running: the window in which
+        // the pre-fix listener (one listener per loop iteration) had none.
+        verb.wait_for_file(&started);
+        let (log, _verb) = verb.signal_and_expect_clean_exit(name, signal);
+        assert!(
+            log.contains(WAKE_LISTEN_STOPPING_MARKER),
+            "{name}: the listener must log that it stopped on the signal:\n{log}"
+        );
+        assert!(
+            done.exists(),
+            "{name}: the in-flight hook must run to completion and be reaped"
+        );
+        drop(tmp);
     }
 }

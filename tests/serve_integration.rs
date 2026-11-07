@@ -279,15 +279,20 @@ const SHUTDOWN_BEGIN_MARKER: &str = "shutting down";
 #[cfg(unix)]
 const AUDIT_DRAINED_MARKER: &str = "deferred-audit queue drained";
 
-/// Send `signal` to the daemon and wait for it to exit; returns its exit
-/// status and its full stderr. Force-kills (and fails) past the deadline.
+/// Send `signal` to the daemon (the child this test spawned and still owns).
 #[cfg(unix)]
-fn signal_and_wait(mut serve: ServeChild, signal: i32) -> (std::process::ExitStatus, String) {
+fn send_stop(serve: &ServeChild, signal: i32) {
     let pid = serve.child.as_ref().unwrap().id();
     // SAFETY: `pid` is the id of the child this test spawned and still owns.
     unsafe {
         libc::kill(i32::try_from(pid).expect("pid fits in i32"), signal);
     }
+}
+
+/// Wait for a signalled daemon to exit; returns its exit status and its full
+/// stderr. Force-kills (and fails) past the deadline.
+#[cfg(unix)]
+fn reap_after_stop(mut serve: ServeChild, signal: i32) -> (std::process::ExitStatus, String) {
     let deadline = Instant::now() + SIGNAL_EXIT_DEADLINE;
     let status = loop {
         if Instant::now() > deadline {
@@ -307,9 +312,81 @@ fn signal_and_wait(mut serve: ServeChild, signal: i32) -> (std::process::ExitSta
     (status, stderr)
 }
 
-/// #6236 — for BOTH signals: a WAL exists before the signal, the exit is a
-/// success, the shutdown log shows stop then deferred-audit drain, and the
-/// WAL is checkpointed to zero length. SIGTERM must equal SIGINT.
+/// Send `signal` to the daemon and wait for it to exit.
+#[cfg(unix)]
+fn signal_and_wait(serve: ServeChild, signal: i32) -> (std::process::ExitStatus, String) {
+    send_stop(&serve, signal);
+    reap_after_stop(serve, signal)
+}
+
+/// Marker logged once the HTTP server stopped and every in-flight request
+/// finished, before the deferred-audit drain.
+#[cfg(unix)]
+const INFLIGHT_DRAINED_MARKER: &str = "in-flight requests drained";
+
+/// Marker logged once the final audit-head witness step ran.
+#[cfg(unix)]
+const WITNESS_WRITTEN_MARKER: &str = "final witness flushed";
+
+/// Marker logged once the final WAL checkpoint completed.
+#[cfg(unix)]
+const CHECKPOINT_MARKER: &str = "final WAL checkpoint complete";
+
+/// Longest a held request body may stay open before the test gives up.
+#[cfg(unix)]
+const HELD_BODY_LIMIT: Duration = Duration::from_secs(30);
+
+/// Pause so the held request is certainly received (headers and the first
+/// chunk are on the wire) before the stop signal is sent.
+#[cfg(unix)]
+const INFLIGHT_SETTLE: Duration = Duration::from_millis(1_000);
+
+/// Pause while the signalled daemon must still be waiting on the held request.
+#[cfg(unix)]
+const DRAIN_WAIT_PROBE: Duration = Duration::from_millis(500);
+
+/// Bound on waiting for the daemon to log that it began shutting down.
+#[cfg(unix)]
+const SHUTDOWN_LOG_DEADLINE: Duration = Duration::from_secs(10);
+
+/// A request body that yields its first half, then blocks until released:
+/// the request is in flight (received, not complete) for as long as the test
+/// holds it.
+#[cfg(unix)]
+struct HeldBody {
+    head: Vec<u8>,
+    tail: Vec<u8>,
+    pos: usize,
+    release: std::sync::mpsc::Receiver<()>,
+    released: bool,
+}
+
+#[cfg(unix)]
+impl std::io::Read for HeldBody {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.pos == self.head.len() && !self.released {
+            self.release
+                .recv_timeout(HELD_BODY_LIMIT)
+                .map_err(std::io::Error::other)?;
+            self.released = true;
+        }
+        let src = if self.pos < self.head.len() {
+            &self.head[self.pos..]
+        } else {
+            &self.tail[self.pos - self.head.len()..]
+        };
+        let n = src.len().min(buf.len());
+        buf[..n].copy_from_slice(&src[..n]);
+        self.pos += n;
+        Ok(n)
+    }
+}
+
+/// #6236 — for BOTH signals, with a request still in flight when the signal
+/// arrives: the in-flight request completes successfully, the exit is a
+/// success, and the shutdown log shows, in order: stop, in-flight drained,
+/// deferred-audit drained, final witness, WAL checkpoint. The WAL is
+/// checkpointed to zero length. SIGTERM must equal SIGINT.
 #[cfg(unix)]
 #[test]
 fn serve_stop_signals_drain_in_order_and_exit_success_6236() {
@@ -339,14 +416,91 @@ fn serve_stop_signals_drain_in_order_and_exit_success_6236() {
         let wal = tmp.path().join("ai-memory.db-wal");
         assert!(wal.exists(), "{name}: a WAL must exist before the signal");
 
-        let (status, stderr) = signal_and_wait(serve, signal);
-        assert_eq!(status.signal(), None, "{name}: died by signal\n{stderr}");
-        assert!(status.success(), "{name}: exit {status:?}\n{stderr}");
-        let begin = stderr.find(SHUTDOWN_BEGIN_MARKER);
-        let drained = stderr.find(AUDIT_DRAINED_MARKER);
+        // A request that is in flight when the signal arrives: its body is
+        // held half-sent until the test releases it.
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "tier": "mid",
+            "namespace": "sig-6236",
+            "title": format!("in-flight-{name}"),
+            "content": "completes while the daemon drains"
+        }))
+        .unwrap();
+        let (head, tail) = payload.split_at(payload.len() / 2);
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let body = reqwest::blocking::Body::new(HeldBody {
+            head: head.to_vec(),
+            tail: tail.to_vec(),
+            pos: 0,
+            release: release_rx,
+            released: false,
+        });
+        let slow_client = serve.tls.client_with_timeout(HELD_BODY_LIMIT);
+        let slow_request = serve.url("/api/v1/memories");
+        let in_flight = std::thread::spawn(move || {
+            slow_client
+                .post(slow_request)
+                .header("X-Agent-Id", "ai:serve-6236")
+                .header("Content-Type", "application/json")
+                .body(body)
+                .send()
+                .map(|r| r.status())
+        });
+        std::thread::sleep(INFLIGHT_SETTLE);
+
+        send_stop(&serve, signal);
+        let begun = Instant::now();
+        while !serve.stderr().contains(SHUTDOWN_BEGIN_MARKER) {
+            assert!(
+                begun.elapsed() < SHUTDOWN_LOG_DEADLINE,
+                "{name}: the daemon never logged that it began shutting down
+{}",
+                serve.stderr()
+            );
+            std::thread::sleep(SIGNAL_EXIT_POLL);
+        }
+        std::thread::sleep(DRAIN_WAIT_PROBE);
         assert!(
-            matches!((begin, drained), (Some(b), Some(d)) if b < d),
-            "{name}: log must show stop then audit drain: {begin:?} {drained:?}\n{stderr}"
+            !serve.stderr().contains(INFLIGHT_DRAINED_MARKER),
+            "{name}: the daemon must wait for the in-flight request
+{}",
+            serve.stderr()
+        );
+        release_tx.send(()).unwrap();
+        let in_flight_status = in_flight
+            .join()
+            .unwrap()
+            .unwrap_or_else(|e| panic!("{name}: the in-flight request failed: {e}"));
+        assert!(
+            in_flight_status.is_success(),
+            "{name}: the in-flight request must complete: {in_flight_status}"
+        );
+
+        let (status, stderr) = reap_after_stop(serve, signal);
+        assert_eq!(
+            status.signal(),
+            None,
+            "{name}: died by signal
+{stderr}"
+        );
+        assert!(
+            status.success(),
+            "{name}: exit {status:?}
+{stderr}"
+        );
+        let order: Vec<Option<usize>> = [
+            SHUTDOWN_BEGIN_MARKER,
+            INFLIGHT_DRAINED_MARKER,
+            AUDIT_DRAINED_MARKER,
+            WITNESS_WRITTEN_MARKER,
+            CHECKPOINT_MARKER,
+        ]
+        .iter()
+        .map(|marker| stderr.find(marker))
+        .collect();
+        assert!(
+            order.iter().all(Option::is_some) && order.windows(2).all(|w| w[0] < w[1]),
+            "{name}: log must show stop, in-flight drained, audit drained, witness,              checkpoint in that order: {order:?}
+{stderr}"
         );
         let wal_len = std::fs::metadata(&wal).map_or(0, |m| m.len());
         assert_eq!(
@@ -371,4 +525,22 @@ fn dockerfile_stopsignal_and_admin_guide_grace_6236() {
         guide.contains("SIGTERM") && guide.contains("--shutdown-grace-secs"),
         "#6236: docs/ADMIN_GUIDE.md must state SIGTERM handling and the grace budget"
     );
+    // The ONE stop budget (seconds): systemd `TimeoutStopSec`, `docker stop -t`
+    // and compose `stop_grace_period` all carry it, so a supervisor never
+    // SIGKILLs the daemon inside its drain (r1 L3/F4).
+    let budget = STOP_BUDGET_SECS;
+    for needle in [
+        format!("TimeoutStopSec={budget}"),
+        format!("docker stop -t {budget}"),
+        format!("stop_grace_period: {budget}s"),
+    ] {
+        assert!(
+            guide.contains(&needle),
+            "#6236: docs/ADMIN_GUIDE.md must state the container stop timeout: missing {needle:?}"
+        );
+    }
 }
+
+/// The documented stop budget in seconds: the HTTP grace plus the bounded
+/// drain, witness and checkpoint phases (systemd `TimeoutStopSec`).
+const STOP_BUDGET_SECS: u32 = 90;
