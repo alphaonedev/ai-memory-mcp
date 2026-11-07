@@ -231,3 +231,21 @@ macro_rules! userinfo_boundary_case_8205 {
 
 userinfo_boundary_case_8205!(operator_paren_userinfo_8205, "(");
 userinfo_boundary_case_8205!(operator_space_userinfo_8205, " ");
+
+#[test]
+fn operator_schemeless_connection_details_8205() {
+    const SECRET: &str = "fixture_schemeless_8205";
+    for detail in [
+        format!("connect db.example.invalid:5432/path?token={SECRET}"),
+        format!("connect db.example.invalid:5432/{SECRET}#fragment"),
+        format!("connect db.example.invalid:5432/path#{SECRET}"),
+        format!("connect host:port/path?token={SECRET}"),
+        format!("host=db password={SECRET} port=5432"),
+        format!("host=db password='{SECRET} with spaces' port=5432"),
+        format!("host=db password="{SECRET} with spaces" port=5432"),
+        format!("host=db password = '{SECRET} with spaces' port=5432"),
+        format!("host=db arbitrary_option={SECRET} port=5432"),
+    ] {
+        assert_private_detail_is_absent_8205(&detail, SECRET);
+    }
+}
