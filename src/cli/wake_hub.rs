@@ -559,29 +559,9 @@ pub async fn dispatch(args: &WakeHubArgs, app_config: &AppConfig) -> Result<i32>
 /// Resolve on SIGINT or, on unix, SIGTERM — so `systemctl stop`, `docker stop`
 /// and a plain `kill` all trigger the same bounded drain.
 async fn shutdown_signal() {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-        let mut term = signal(SignalKind::terminate()).ok();
-        let term_fut = async {
-            match term.as_mut() {
-                Some(t) => {
-                    t.recv().await;
-                }
-                // No SIGTERM handler could be installed — park forever so the
-                // select resolves on ctrl_c alone.
-                None => std::future::pending::<()>().await,
-            }
-        };
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            () = term_fut => {}
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
-    }
+    // #8193: the one shared stop primitive; a failed registration is logged
+    // and parked, never read as a received stop.
+    crate::stop_signal::stop_signal().await;
 }
 
 #[cfg(test)]

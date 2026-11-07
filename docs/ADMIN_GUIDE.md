@@ -891,14 +891,19 @@ See [Database Management → Backup](#backup) and [Database Management → Resto
 
 ## Graceful Shutdown
 
-The HTTP daemon handles SIGINT (Ctrl+C) gracefully:
+The HTTP daemon handles SIGINT (Ctrl+C) and SIGTERM gracefully, through the
+same path (#8193):
 
 1. Stops accepting new connections
 2. Waits for in-flight requests to complete
 3. Checkpoints the WAL (`PRAGMA wal_checkpoint(TRUNCATE)`)
 4. Exits cleanly
 
-For systemd, use `KillSignal=SIGINT` and `TimeoutStopSec=90`. This covers the
+SIGTERM is the default signal of `systemctl stop` and `docker stop`; the
+Dockerfile sets `STOPSIGNAL SIGTERM`. The in-flight request grace is
+`--shutdown-grace-secs`. A failed signal registration is logged at `error`
+level and never stops the daemon. For systemd, `KillSignal=SIGINT` (or the
+default SIGTERM) and `TimeoutStopSec=90` both work. This covers the
 default 30-second HTTP request grace period plus the bounded background-writer,
 webhook-delivery, deferred-audit drain, and final witness/checkpoint phases,
 leaving time for the visible exit-75 failure path.
@@ -912,7 +917,7 @@ crash or `SIGKILL` skips this step: webhook deliveries that had not started
 are lost, and neither replay nor the DLQ shows them. Use the graceful stop
 path above.
 
-> **Note:** The HTTP daemon handles SIGINT (Ctrl+C) gracefully with WAL checkpoint. Systemd sends SIGTERM by default -- the service file sets `KillSignal=SIGINT` to ensure clean shutdown.
+> **Note:** SIGINT and SIGTERM both drain and checkpoint the WAL before exit 0. `wake-hub`, `wake-listen`, `watch`, `curator` and `sync-daemon` use the same shared stop primitive.
 
 The daemon exits with status **75 (`EX_TEMPFAIL`)** when it cannot certify a
 safe shutdown or safely drop its Tokio runtime. Before final certification,

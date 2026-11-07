@@ -85,5 +85,9 @@ EXPOSE 9077
 
 USER aimem
 
+# #8193: `docker stop` sends this; serve drains and exits 0 on SIGTERM exactly
+# as on SIGINT (raise the stop timeout above --shutdown-grace-secs).
+STOPSIGNAL SIGTERM
+
 ENTRYPOINT ["ai-memory"]
 CMD ["serve", "--host", "0.0.0.0"]

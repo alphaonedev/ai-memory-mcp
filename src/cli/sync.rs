@@ -756,8 +756,10 @@ pub async fn run_daemon(
 
     let shutdown = Arc::new(tokio::sync::Notify::new());
     let shutdown_for_signal = shutdown.clone();
+    // #8193: install before spawning so SIGTERM is graceful too.
+    let mut stop = crate::stop_signal::StopListener::install();
     tokio::spawn(async move {
-        let _ = tokio::signal::ctrl_c().await;
+        stop.wait().await;
         shutdown_for_signal.notify_one();
     });
 

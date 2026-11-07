@@ -255,57 +255,20 @@ mod shutdown_handlers_ready {
     }
 }
 
-/// Resolve when the process receives SIGINT (ctrl_c, cross-platform)
-/// or — on unix — SIGTERM, so `systemctl stop` / `docker stop` / `kill`
-/// (whose default signal is SIGTERM) trigger the same clean
-/// between-cycles shutdown the `curator --daemon` doc promises
-/// (issue #2119). Mirrors the `cli::watch` daemon arm exactly: when the
-/// SIGTERM handler cannot install, its arm parks on `pending()` so the
-/// `select!` still resolves on interrupt alone. On non-unix targets only
-/// SIGINT is available.
+/// Resolve when the process receives SIGINT or SIGTERM (unix) or Ctrl-C
+/// (elsewhere), so `systemctl stop` / `docker stop` / `kill` trigger the
+/// clean between-cycles shutdown the `curator --daemon` doc promises
+/// (issue #2119). #8193: the registration and park-on-failure logic lives
+/// in the shared [`crate::stop_signal`] primitive.
 async fn await_shutdown_signal() {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-        let mut term = signal(SignalKind::terminate()).ok();
-        // Install SIGINT the same way (not via `ctrl_c()`, which only
-        // registers on first poll of the select branch) so both
-        // handlers exist before the test-only ready flag is published.
-        let mut interrupt = signal(SignalKind::interrupt()).ok();
-        // Publish ready only when both handlers actually installed —
-        // otherwise a #3585 kicker must refuse to signal (default
-        // disposition would kill the process).
-        #[cfg(test)]
-        if term.is_some() && interrupt.is_some() {
-            shutdown_handlers_ready::mark();
-        }
-        let term_fut = async {
-            match term.as_mut() {
-                Some(t) => {
-                    t.recv().await;
-                }
-                // No SIGTERM handler could be installed — park forever
-                // so `select!` resolves on interrupt alone.
-                None => std::future::pending::<()>().await,
-            }
-        };
-        let int_fut = async {
-            match interrupt.as_mut() {
-                Some(t) => {
-                    t.recv().await;
-                }
-                None => std::future::pending::<()>().await,
-            }
-        };
-        tokio::select! {
-            () = term_fut => {}
-            () = int_fut => {}
-        }
+    let mut stop = crate::stop_signal::StopListener::install();
+    // Publish ready only when every handler actually installed, so a
+    // #3585 kicker never signals into the default disposition.
+    #[cfg(all(test, unix))]
+    if stop.fully_installed() {
+        shutdown_handlers_ready::mark();
     }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
-    }
+    stop.wait().await;
 }
 
 /// `curator` handler. Daemon-mode delegates to `daemon_runtime`.

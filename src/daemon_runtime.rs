@@ -8292,8 +8292,11 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
     // so refusal rows submitted during graceful shutdown could be lost.
     let checkpoint_state = bootstrap.db_state.clone();
     let drain_metrics = bootstrap.deferred_audit_metrics.clone();
+    // #8193: SIGINT and SIGTERM (unix) share one graceful path; a failed
+    // registration is logged and parked, never read as a received stop.
+    let mut stop = crate::stop_signal::StopListener::install();
     let shutdown = async move {
-        let _ = tokio::signal::ctrl_c().await;
+        stop.wait().await;
         tracing::info!("shutting down — draining deferred-audit queue then checkpointing WAL");
     };
     let api_key_state = bootstrap.api_key_state;
