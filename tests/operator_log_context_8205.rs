@@ -42,7 +42,12 @@ fn operator_log_escapes_caller_controls_6822() {
         assert_eq!(log.lines().count(), 1, "one operator event: {log:?}");
         let line = log.strip_suffix("\n").expect("text event newline");
         assert!(!line.chars().any(char::is_control), "raw control: {log:?}");
-        for &control in operator_capture::ESCAPED_CONTROLS {
+        for &(raw, control) in operator_capture::CONTROL_PAIRS {
+            assert!(
+                !line.contains(raw),
+                "raw U+{:04X} in operator detail",
+                u32::from(raw)
+            );
             assert!(line.contains(control), "missing {control}: {log:?}");
         }
         assert!(!line.contains(operator_capture::FIXTURE_PASSWORD));

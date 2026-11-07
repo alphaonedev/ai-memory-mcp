@@ -882,7 +882,12 @@ fn assert_escaped_promote_log(log: &str, context: &str) {
         .find(|line| line.contains("mcp.tool.error"))
         .expect("operator error event");
     assert!(diagnostic.contains(context), "{diagnostic}");
-    for &control in operator_capture::ESCAPED_CONTROLS {
+    for &(raw, control) in operator_capture::CONTROL_PAIRS {
+        assert!(
+            !diagnostic.contains(raw),
+            "raw U+{:04X} in operator detail",
+            u32::from(raw)
+        );
         assert!(
             diagnostic.contains(control),
             "missing {control}: {diagnostic}"
