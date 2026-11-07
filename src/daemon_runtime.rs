@@ -8509,13 +8509,13 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
         // #8193 N2: axum-server returns Ok after a drain AND after a cut at
         // the grace budget, so the elapsed time picks the text.
         let elapsed = signalled_at.get().map_or(Duration::ZERO, |at| at.elapsed());
-        match crate::stop_signal::drain_outcome(elapsed, Duration::from_secs(shutdown_grace_secs)) {
-            crate::stop_signal::DrainOutcome::Drained => {
-                tracing::info!("in-flight requests drained — stopping background writers")
-            }
-            crate::stop_signal::DrainOutcome::GraceExpired => tracing::warn!(
-                "shutdown grace of {shutdown_grace_secs}s expired: remaining connections were force-closed, not drained — stopping background writers"
-            ),
+        let outcome =
+            crate::stop_signal::drain_outcome(elapsed, Duration::from_secs(shutdown_grace_secs));
+        let text = outcome.log_text(shutdown_grace_secs);
+        if outcome == crate::stop_signal::DrainOutcome::Drained {
+            tracing::info!("{text}");
+        } else {
+            tracing::warn!("{text}");
         }
     }
     bootstrap.task_handles.extend(

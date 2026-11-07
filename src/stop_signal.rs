@@ -233,6 +233,20 @@ pub enum DrainOutcome {
     GraceExpired,
 }
 
+impl DrainOutcome {
+    /// The shutdown log line for this outcome. `Drained` claims a drain;
+    /// `GraceExpired` names the budget and says the rest was force-closed.
+    #[must_use]
+    pub fn log_text(self, grace_secs: u64) -> String {
+        match self {
+            Self::Drained => "in-flight requests drained — stopping background writers".to_owned(),
+            Self::GraceExpired => format!(
+                "shutdown grace of {grace_secs}s expired: remaining connections were force-closed, not drained — stopping background writers"
+            ),
+        }
+    }
+}
+
 /// Pick the outcome from the time between the stop signal and the server
 /// returning, against the `--shutdown-grace-secs` budget.
 #[must_use]
@@ -345,5 +359,23 @@ mod tests {
             drain_outcome(grace + std::time::Duration::from_secs(5), grace),
             DrainOutcome::GraceExpired
         );
+    }
+
+    /// #8193 L1: both log texts are pinned. The drained text claims a drain;
+    /// the grace-expired text names the budget and says the connections were
+    /// force-closed, and never claims a drain.
+    #[test]
+    fn drain_outcome_log_texts_are_truthful_8193() {
+        assert_eq!(
+            DrainOutcome::Drained.log_text(30),
+            "in-flight requests drained — stopping background writers"
+        );
+        let expired = DrainOutcome::GraceExpired.log_text(30);
+        assert_eq!(
+            expired,
+            "shutdown grace of 30s expired: remaining connections were force-closed, not drained — stopping background writers"
+        );
+        assert!(expired.contains("force-closed"));
+        assert!(!expired.contains("in-flight requests drained"));
     }
 }
