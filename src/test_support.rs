@@ -27,6 +27,11 @@
 //! independent `OnceLock<Mutex<()>>` statics over the same process-global
 //! writes — a fourth instance of the $HOME per-module-mutex defect
 //! (#1998 -> #2115 -> #2127).
+//!
+//! The shared TLS test PKI is generated under `TMPDIR`. On Unix, its own
+//! directory is removed by a process-exit hook. SIGKILL, abort and a crashed
+//! harness skip that hook; there is no sweep of inherited paths here. Non-Unix
+//! hosts retain the directory after exit because no exit hook is registered.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -365,9 +370,14 @@ pub(crate) fn tls_fixture_paths() -> (PathBuf, PathBuf) {
 /// a leaf it signed whose SANs are the loopback names (`127.0.0.1`, `::1`,
 /// `localhost`), so a VERIFYING client accepts the mock exactly the way a
 /// production peer would — no `danger_accept_invalid_certs` anywhere.
-/// Generated once with rcgen under `TMPDIR` (the `TempDir` lives for the
-/// process; it is dropped with the static, never leaked).
+/// Generated once with rcgen under `TMPDIR`. The static is never dropped;
+/// on Unix an exit hook removes only this PKI's owned directory. See the
+/// module documentation for abnormal-exit and non-Unix limitations.
 pub(crate) struct TlsTestPki {
+    #[cfg(unix)]
+    dir: tempfile::TempDir,
+    // Non-Unix retains ownership without an exit hook or a field read.
+    #[cfg(not(unix))]
     _dir: tempfile::TempDir,
     /// The CA certificate (PEM) a client adds as its root.
     pub(crate) ca_pem: PathBuf,
@@ -381,7 +391,48 @@ static TLS_TEST_PKI: OnceLock<TlsTestPki> = OnceLock::new();
 
 /// The process-wide [`TlsTestPki`] (generated on first use).
 pub(crate) fn tls_test_pki() -> &'static TlsTestPki {
-    TLS_TEST_PKI.get_or_init(generate_tls_test_pki)
+    let pki = TLS_TEST_PKI.get_or_init(generate_tls_test_pki);
+    register_tls_test_pki_cleanup();
+    pki
+}
+
+/// Copy `governance::audit::register_exit_drain` without adding a dependency.
+fn register_tls_test_pki_cleanup() {
+    static REGISTERED: std::sync::Once = std::sync::Once::new();
+    REGISTERED.call_once(|| {
+        #[cfg(unix)]
+        {
+            // SAFETY: atexit only records an extern C function pointer. The
+            // handler never unwinds (UNSAFE-24) and touches only process-global
+            // OnceLock state that outlives main. Registration occurs once.
+            let rc = unsafe { libc::atexit(remove_tls_test_pki_at_exit) };
+            if rc != 0 {
+                // ERRORS-19: failed registration must be visible to the runner.
+                tracing::error!(
+                    "test PKI cleanup registration returned {rc}; its directory remains at exit (#8651)"
+                );
+            }
+        }
+    });
+}
+
+#[cfg(unix)]
+extern "C" fn remove_tls_test_pki_at_exit() {
+    use std::io::Write as _;
+
+    // UNSAFE-24: contain all unwinding before returning to the C exit handler.
+    if std::panic::catch_unwind(|| {
+        if let Some(pki) = TLS_TEST_PKI.get()
+            && let Err(error) = std::fs::remove_dir_all(pki.dir.path())
+        {
+            // Tracing may already be torn down. Discard only stderr write errors.
+            let _ = writeln!(std::io::stderr(), "test PKI cleanup error (#8651): {error}");
+        }
+    })
+    .is_err()
+    {
+        let _ = writeln!(std::io::stderr(), "test PKI cleanup panicked (#8651)");
+    }
 }
 
 fn generate_tls_test_pki() -> TlsTestPki {
@@ -419,6 +470,9 @@ fn generate_tls_test_pki() -> TlsTestPki {
             .expect("chmod 0600 test leaf key");
     }
     TlsTestPki {
+        #[cfg(unix)]
+        dir,
+        #[cfg(not(unix))]
         _dir: dir,
         ca_pem,
         leaf_pem,
@@ -583,6 +637,7 @@ mod tests {
     };
 
     /// #8651: a child owns its generated PKI until exit, then leaves no files.
+    #[cfg(unix)]
     #[test]
     fn tls_test_pki_is_removed_after_child_exit_8651() {
         const CHILD: &str = "AI_MEMORY_TLS_PKI_CHILD_8651";
@@ -650,6 +705,7 @@ mod tests {
     }
 
     /// Copy the #8166 file-capture and bounded child-reaping precedent.
+    #[cfg(unix)]
     fn run_pki_child_8651(
         mut command: std::process::Command,
         scratch: &std::path::Path,
