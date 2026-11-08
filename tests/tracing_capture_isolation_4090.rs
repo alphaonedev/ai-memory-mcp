@@ -363,6 +363,8 @@ fn install_patterns_match_every_install_shape_4090() {
     let shapes = [
         "let _g = tracing::subscriber::set_default(sub);",
         "tracing::subscriber::with_default(sub, || f());",
+        "subscriber::with_default(sub, || f());",
+        "dispatcher::with_default(&d, || f());",
         "let _g = tracing::dispatcher::set_default(&d);",
         "tracing::dispatcher::with_default(&d, || f());",
         "let _g = set_default(sub);",
@@ -373,6 +375,35 @@ fn install_patterns_match_every_install_shape_4090() {
         assert!(
             INSTALL_PATTERNS.iter().any(|p| shape.contains(p)),
             "INSTALL_PATTERNS misses the install shape: {shape}"
+        );
+    }
+}
+
+/// #8652: unrelated identifiers ending in an install name are not captures.
+#[test]
+fn install_patterns_require_identifier_boundary_8652() {
+    for shape in [
+        "fn webhook_host_port_with_default(url: &str) {}",
+        "webhook_host_port_with_default(url);",
+        "awith_default(value);",
+        "Zwith_default(value);",
+        "9with_default(value);",
+        "_with_default(value);",
+        "reset_default(value);",
+    ] {
+        assert!(
+            !INSTALL_PATTERNS.iter().any(|p| shape.contains(p)),
+            "identifier suffix is not a tracing install: {shape}"
+        );
+    }
+    for shape in [
+        "with_default(sub, || f());",
+        "(with_default(sub, || f()));",
+        "webhook_host_port_with_default(url); with_default(sub, || f());",
+    ] {
+        assert!(
+            INSTALL_PATTERNS.iter().any(|p| shape.contains(p)),
+            "actual install must remain visible: {shape}"
         );
     }
 }
