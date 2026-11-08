@@ -57,6 +57,7 @@
 use anyhow::Result;
 use rusqlite::Connection;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::num::NonZeroU16;
 
 /// Env var selecting the inference-plane egress posture.
 pub const ENV_INFERENCE_EGRESS: &str = "AI_MEMORY_INFERENCE_EGRESS";
@@ -471,8 +472,8 @@ pub fn evaluate_inference_egress_resolved(
 }
 
 /// #3822 (A2) — a target admitted for pinning under [`InferenceEgressMode::InternalOnly`].
-/// `host` is the bracket/port-stripped host string reqwest's `.resolve(host, addr)`
-/// keys on; `addrs` are the boot-resolved addresses to pin.
+/// `host` is the canonical `reqwest::Url::host_str()` value; `addrs` are
+/// the boot-resolved addresses to pin. IPv6 host strings retain their brackets.
 #[derive(Debug, Clone)]
 pub struct PinnedTarget {
     /// The resolved host string (reqwest resolve key).
@@ -481,38 +482,33 @@ pub struct PinnedTarget {
     pub addrs: Vec<SocketAddr>,
 }
 
+/// #8650: retain the HTTP/HTTPS policy while using the connection parser's port.
+/// PERF-15 / ERRORS-09: a validated nonzero port prevents a pin to port zero.
+fn inference_scheme_port(url: &reqwest::Url) -> Option<NonZeroU16> {
+    match url.scheme() {
+        "http" | "https" => url.port_or_known_default().and_then(NonZeroU16::new),
+        _ => None,
+    }
+}
+
 /// #3822 (A2) — resolve the URL's authority to socket addresses. An IP literal
 /// resolves without DNS; a hostname uses the system resolver. Failure / empty
 /// set is an `Err` (fail CLOSED — `AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL` does
 /// NOT apply on this lane). Returns `(resolved_host, addrs)`.
 fn resolve_inference_authority(url: &str) -> Result<(String, Vec<SocketAddr>), String> {
-    let lower = url.to_ascii_lowercase();
-    let rest = lower.split_once("://").map_or(lower.as_str(), |(_, r)| r);
-    let host_port = crate::subscriptions::authority_without_userinfo(rest);
-    if host_port.is_empty() {
-        return Err("target URL has no authority to resolve".to_string());
-    }
-    // Bracket/port-stripped host (the reqwest resolve key), and a resolvable
-    // `host:port` (default 80 when the URL omits the port), mirroring the
-    // subscriptions SSRF lane's normalization.
-    let (resolved_host, resolv_target) =
-        if let Some(close) = host_port.strip_prefix('[').and(host_port.find(']')) {
-            let inner = host_port[1..close].to_string();
-            let after = &host_port[close + 1..];
-            let tgt = if after.starts_with(':') {
-                host_port.to_string()
-            } else {
-                crate::subscriptions::host_port_with_default_http_port(host_port)
-            };
-            (inner, tgt)
-        } else if let Some(idx) = host_port.rfind(':') {
-            (host_port[..idx].to_string(), host_port.to_string())
-        } else {
-            (
-                host_port.to_string(),
-                crate::subscriptions::host_port_with_default_http_port(host_port),
-            )
-        };
+    // #8650: admission and reqwest must interpret the same authority. A second
+    // hand-written parser can classify one host while the client connects to another.
+    // ERRORS-15: retain the parse cause without including the credential-bearing URL.
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|error| format!("invalid inference target URL: {error}"))?;
+    let port = inference_scheme_port(&parsed)
+        .ok_or_else(|| "inference target requires http or https with a nonzero port".to_string())?;
+    let resolved_host = parsed
+        .host_str()
+        .ok_or_else(|| "target URL has no authority to resolve".to_string())?;
+    // host_str retains IPv6 brackets, so this is a socket-address authority for
+    // both IP families and DNS names. No userinfo or path reaches the resolver.
+    let resolv_target = format!("{resolved_host}:{}", port.get());
     match resolv_target.to_socket_addrs() {
         Ok(iter) => {
             let addrs: Vec<SocketAddr> = iter.collect();
@@ -521,7 +517,7 @@ fn resolve_inference_authority(url: &str) -> Result<(String, Vec<SocketAddr>), S
                     "target host {resolved_host} resolved to no addresses (internal-only fails closed)"
                 ))
             } else {
-                Ok((resolved_host, addrs))
+                Ok((resolved_host.to_string(), addrs))
             }
         }
         Err(e) => Err(format!(
@@ -641,6 +637,140 @@ pub fn refuse_inference_egress_audited(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inference_authority_parser_pin_identity_8650() {
+        // TEST-02: reqwest's parser is the independent connection-host oracle.
+        for url in [
+            r"https://127.0.0.1\@localhost/v1",
+            "https://LOCALHOST/v1",
+            "https://%6cocalhost/v1",
+            "https://2130706433/v1",
+            "https://[::1]/v1",
+            "https://user:password@localhost/v1",
+        ] {
+            let parsed = reqwest::Url::parse(url).expect("valid fixture URL");
+            let pin = admit_inference_target(
+                InferenceEgressMode::InternalOnly,
+                EgressClass::InferenceLlm,
+                url,
+            )
+            .expect("canonical loopback target must be admitted")
+            .expect("internal-only admission must pin");
+            assert_eq!(Some(pin.host.as_str()), parsed.host_str(), "pin key: {url}");
+            assert!(!pin.addrs.is_empty(), "pin must resolve: {url}");
+            assert!(
+                pin.addrs.iter().all(|addr| addr.ip().is_loopback()),
+                "canonical loopback addresses required: {url}",
+            );
+        }
+    }
+
+    #[test]
+    fn inference_authority_parser_public_host_refused_8650() {
+        // IP literal fixtures require no external DNS or connection.
+        let url = r"https://8.8.8.8\@localhost/v1";
+        assert_eq!(
+            reqwest::Url::parse(url).unwrap().host_str(),
+            Some("8.8.8.8")
+        );
+        assert!(
+            admit_inference_target(
+                InferenceEgressMode::InternalOnly,
+                EgressClass::InferenceLlm,
+                url,
+            )
+            .is_err(),
+            "the connection parser's public host must not obtain an internal pin",
+        );
+    }
+
+    #[test]
+    fn inference_authority_parser_empty_port_8650() {
+        for (scheme, expected_port) in [("https", 443), ("http", 80)] {
+            for host in ["localhost", "127.0.0.1", "[::1]"] {
+                let url = format!("{scheme}://{host}:/v1");
+                let parsed = reqwest::Url::parse(&url).expect("valid empty port URL");
+                assert_eq!(parsed.port_or_known_default(), Some(expected_port));
+                let (_, addrs) =
+                    resolve_inference_authority(&url).expect("empty port uses default");
+                assert!(!addrs.is_empty(), "empty-port target must resolve: {url}");
+                for addr in addrs {
+                    assert_eq!(addr.port(), expected_port, "empty port: {url}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn inference_authority_parser_zero_port_refused_8650() {
+        for host in ["localhost", "127.0.0.1", "[::1]"] {
+            let url = format!("https://{host}:0/v1");
+            assert!(
+                resolve_inference_authority(&url).is_err(),
+                "zero port: {url}"
+            );
+            assert!(
+                admit_inference_target(
+                    InferenceEgressMode::InternalOnly,
+                    EgressClass::InferenceLlm,
+                    &url,
+                )
+                .is_err(),
+                "zero port must never produce a pin: {url}",
+            );
+        }
+    }
+
+    #[test]
+    fn inference_authority_implicit_ports_8650() {
+        // TEST-02: expected ports are independent of the production defaults.
+        for (scheme, expected_port) in [("https", 443), ("http", 80), ("HTTPS", 443)] {
+            for host in ["localhost", "127.0.0.1", "[::1]"] {
+                let url = format!("{scheme}://{host}/v1");
+                let (_, addrs) = resolve_inference_authority(&url).expect("resolve local target");
+                assert!(!addrs.is_empty(), "{url} must resolve");
+                for addr in addrs {
+                    assert_eq!(addr.port(), expected_port, "wrong pinned port for {url}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn inference_authority_explicit_ports_8650() {
+        for host in ["localhost", "127.0.0.1", "[::1]"] {
+            let url = format!("https://{host}:8443/v1");
+            let (_, addrs) = resolve_inference_authority(&url).expect("resolve explicit port");
+            assert!(!addrs.is_empty(), "{url} must resolve");
+            for addr in addrs {
+                assert_eq!(addr.port(), 8443, "explicit port must survive for {url}");
+            }
+        }
+    }
+
+    #[test]
+    fn inference_authority_rejects_unsupported_scheme_8650() {
+        for url in [
+            "ftp://127.0.0.1/v1",
+            "ftp://[::1]:8443/v1",
+            "127.0.0.1:8443",
+        ] {
+            assert!(
+                resolve_inference_authority(url).is_err(),
+                "must refuse {url}"
+            );
+            assert!(
+                admit_inference_target(
+                    InferenceEgressMode::InternalOnly,
+                    EgressClass::InferenceLlm,
+                    url,
+                )
+                .is_err(),
+                "unsupported scheme must not produce a pin: {url}",
+            );
+        }
+    }
 
     #[test]
     fn class_tokens_are_stable_and_inference_flagged() {

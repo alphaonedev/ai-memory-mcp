@@ -50,37 +50,34 @@ pub(super) mod receiver;
 const PUBLIC_IP: Ipv4Addr = Ipv4Addr::new(93, 184, 216, 34);
 const PUNYCODE_HOST: &str = "xn--bcher-kva.example";
 
-thread_local! {
-    static PUBLIC_ANSWER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
 struct PublicAnswer;
 
 impl Drop for PublicAnswer {
     fn drop(&mut self) {
-        PUBLIC_ANSWER.set(false);
+        super::webhook_ssrf_8203_tests::DNS_ANSWER.with_borrow_mut(|answer| *answer = None);
     }
-}
-
-pub(super) fn resolve(target: &str) -> std::io::Result<Vec<std::net::SocketAddr>> {
-    if PUBLIC_ANSWER.get() {
-        let (host, port) = target.rsplit_once(':').expect("DNS target has a port");
-        assert!(
-            host == "bücher.example" || host == PUNYCODE_HOST,
-            "injected IDN name"
-        );
-        return Ok(vec![std::net::SocketAddr::new(
-            PUBLIC_IP.into(),
-            port.parse().expect("DNS port"),
-        )]);
-    }
-    target.to_socket_addrs().map(Iterator::collect)
 }
 
 fn public_answer(url: &str) -> (String, Vec<std::net::SocketAddr>) {
-    assert!(!PUBLIC_ANSWER.replace(true));
+    use super::webhook_ssrf_8203_tests::DNS_ANSWER;
+    let host = url
+        .strip_prefix("https://")
+        .and_then(|rest| rest.strip_suffix("/hook"))
+        .expect("IDN fixture authority");
+    DNS_ANSWER.with_borrow_mut(|answer| {
+        assert!(
+            answer
+                .replace((
+                    format!("{host}:{HTTPS_PORT}"),
+                    Ok(std::net::SocketAddr::new(PUBLIC_IP.into(), HTTPS_PORT)),
+                ))
+                .is_none()
+        );
+    });
     let _reset = PublicAnswer;
-    validate_url_dns_with(url, false).expect("injected public address must be admitted")
+    let result = validate_url_dns_with(url, false);
+    assert!(DNS_ANSWER.with_borrow_mut(Option::take).is_none());
+    result.expect("injected public address must be admitted")
 }
 
 #[test]

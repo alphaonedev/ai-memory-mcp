@@ -36,7 +36,9 @@ pub mod audit_status;
 pub mod scan_failure; // #7366 failed-lookup retry + DLQ record
 // #3979 — admitted-but-not-started deliveries, DLQ-recorded at the drain deadline.
 mod unstarted;
-use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
+#[cfg(not(test))]
+use std::net::ToSocketAddrs;
+use std::net::{IpAddr, Ipv4Addr};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -1575,6 +1577,7 @@ pub fn prewarm_dispatch_tls() {
         let _ = std::thread::spawn(|| {
             if let Err(e) = reqwest::blocking::Client::builder()
                 .timeout(ACK_TIMEOUT)
+                .no_proxy()
                 .build()
             {
                 tracing::warn!("webhook dispatch TLS warm-up failed: {e}");
@@ -1714,6 +1717,8 @@ fn send(
     // like any other non-2xx.
     let mut builder = reqwest::blocking::Client::builder()
         .timeout(ACK_TIMEOUT)
+        // #6372: a proxy would resolve the host again, bypassing the DNS pin.
+        .no_proxy()
         .redirect(reqwest::redirect::Policy::none());
     // v1.0.0 #3705 — a receiver behind a private PKI: the operator-installed
     // root (`[subscriptions] ca_cert`) is trusted in addition to the public
@@ -2005,10 +2010,9 @@ pub(crate) fn authority_without_userinfo(rest: &str) -> &str {
 }
 
 /// #3822 — append the default HTTP port (`:80`) to a bracket/colon-normalized
-/// `host_port` that omits one, so `ToSocketAddrs` resolves it. Single home of
-/// the `host:80` default-port literal, shared by the webhook SSRF lane
-/// (`validate_url_dns_with`) and the egress inference lane (`egress::host_of`
-/// via the #3744 one-helper rule).
+/// `host_port` that omits one, so `ToSocketAddrs` resolves it. This helper serves
+/// `validate_url_dns_with` in the webhook SSRF lane. Inference egress instead
+/// derives its canonical host and scheme-aware port from `reqwest::Url` (#8650).
 pub(crate) fn host_port_with_default_http_port(host_port: &str) -> String {
     format!("{host_port}:80")
 }
@@ -2105,31 +2109,22 @@ fn validate_url_dns_with(
     // way `validate_url_with` does it; this guard is the SECOND line of
     // defence for the same class and must read the same host.
     let host_port = authority_without_userinfo(rest);
-    // v0.7.0 #1082 — extract the host (sans port + brackets) for the
-    // reqwest `Client::builder().resolve(host, addr)` override the
-    // caller installs. The override matches by host string the
-    // reqwest URL parser produces, so we strip the brackets / port
-    // here to match.
+    // #1082: strip brackets and port for the reqwest resolver override key.
+    // Its host spelling must match the client URL parser.
     let resolved_host = {
         let s = host_port;
         if let Some(close_idx) = s.strip_prefix('[').and(s.find(']')) {
             // [ipv6]:port or [ipv6] — return the inner ipv6 text.
             s[1..close_idx].to_string()
         } else if let Some(idx) = s.rfind(':') {
-            // Hostname:port — strip the port. (IPv4-with-port. Bare
-            // ipv4 has no `:` so falls through to the else branch.)
+            // Strip hostname/IPv4 ports; bare IPv4 falls through unchanged.
             s[..idx].to_string()
         } else {
             s.to_string()
         }
     };
-    // Supply a default port so ToSocketAddrs resolves correctly.
-    // SSRF fix (W11): bracketed IPv6 without an explicit port ("[fe80::1]"
-    // with no trailing ":N") was previously passed to ToSocketAddrs as-is,
-    // which errors with "invalid port value" — and the catch-all `Err(_) =>
-    // return Ok(())` below treated that as a DNS hiccup, silently bypassing
-    // the SSRF guard. Detect the no-trailing-port form and append the scheme default so
-    // resolution succeeds and the IP is checked.
+    // W11 / #6401: supply the scheme default, including for bracketed IPv6,
+    // so a missing port cannot turn address validation into a DNS failure.
     let resolv_target = normalize_webhook_host_port(host_port, scheme)?;
     // v0.7.0 #1053 (Agent-2 #3) — fail-CLOSED on DNS resolution
     // failure. Pre-#1053 a SERVFAIL / timeout / hang at the daemon's
@@ -2175,7 +2170,7 @@ fn validate_url_dns_with(
         ));
     }
     #[cfg(test)]
-    let resolution = webhook_tls_8203_tests::resolve(&resolv_target);
+    let resolution = webhook_ssrf_8203_tests::resolve(&resolv_target);
     #[cfg(not(test))]
     let resolution = resolv_target.to_socket_addrs().map(Iterator::collect);
     let addrs: Vec<std::net::SocketAddr> = match resolution {
@@ -2348,9 +2343,13 @@ fn validate_url_with(url: &str, allow_loopback: bool) -> Result<()> {
 pub(crate) fn normalize_ip(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V6(v6) => {
-            let canonical = v6.to_canonical();
-            if matches!(canonical, IpAddr::V4(_)) {
-                return canonical;
+            // #6687: preserve the IPv6 meanings of :: and ::1, but classify
+            // IPv4-compatible and mapped addresses by the embedded IPv4 value.
+            if !v6.is_unspecified()
+                && !v6.is_loopback()
+                && let Some(v4) = v6.to_ipv4()
+            {
+                return IpAddr::V4(v4);
             }
             let segs = v6.segments();
             if segs[0] == 0x0064
@@ -2858,6 +2857,8 @@ fn record_dispatch_with_conn(conn: &Connection, sub_id: &str, correlation_id: &s
     audit_status::persist_dispatch_counter(conn, sub_id, correlation_id, ok);
 }
 
+#[cfg(test)]
+mod webhook_ssrf_8203_tests;
 #[cfg(test)]
 mod webhook_tls_8203_tests;
 
