@@ -147,7 +147,11 @@ impl Drop for Frames {
     fn drop(&mut self) {
         let lost: usize = self.0.iter().map(|f| f.deferred.len()).sum();
         if lost > 0 {
-            let unsettled = self.0.iter().filter(|frame| !frame.deferred.is_empty()).count();
+            let unsettled = self
+                .0
+                .iter()
+                .filter(|frame| !frame.deferred.is_empty())
+                .count();
             // No debug_assert here: a panic in a TLS destructor aborts. This
             // runs at thread exit, in thread-local destructor order (reverse
             // of registration). `tracing::error!` is NOT usable here: the

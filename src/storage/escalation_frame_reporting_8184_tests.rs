@@ -127,7 +127,10 @@ fn issue_6541_stale_frame_unwind_rolls_back_both_begin_modes() {
                 drop(txn);
             }));
             assert_eq!(outcome.is_err(), cfg!(debug_assertions));
-            assert!(conn.is_autocommit(), "frame registration must not leak BEGIN");
+            assert!(
+                conn.is_autocommit(),
+                "frame registration must not leak BEGIN"
+            );
             conn.execute_batch("BEGIN IMMEDIATE; ROLLBACK")
                 .expect("connection must remain usable after frame registration");
         }
