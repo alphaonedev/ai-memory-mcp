@@ -217,9 +217,11 @@ const MSG_FORCED_REPORT_WRITE_FAILURE: &str = "forced open-time escalation repor
 
 /// Write the report through stderr, without relying on tracing enablement.
 /// On Unix, write through an owned duplicate of the live stderr descriptor:
-/// `Stderr` itself treats a closed descriptor as a successful no-op. A successful
-/// write means the OS accepted the bytes, not that a downstream reader retained
-/// them. Hold stderr's lock only for this raw write, before the caller traces.
+/// `Stderr` itself treats EBADF from a closed or read-only descriptor as a
+/// successful no-op. Failed duplication or writing leaves report credit unchanged.
+/// A successful write means the OS accepted the bytes, not that a downstream
+/// reader retained them. Hold stderr's lock through the entire raw write to
+/// exclude other stderr-lock writers; release it before the caller traces.
 fn write_open_report(frame: &TxnFrame) -> std::io::Result<()> {
     #[cfg(test)]
     if FORCE_REPORT_WRITE_FAILURE.with(std::cell::Cell::get) {
