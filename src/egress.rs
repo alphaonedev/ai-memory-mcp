@@ -658,6 +658,90 @@ mod tests {
     use super::*;
 
     #[test]
+    fn inference_authority_parser_pin_identity_8650() {
+        // TEST-02: reqwest's parser is the independent connection-host oracle.
+        for url in [
+            r"https://127.0.0.1\@localhost/v1",
+            "https://LOCALHOST/v1",
+            "https://%6cocalhost/v1",
+            "https://2130706433/v1",
+            "https://[::1]/v1",
+            "https://user:password@localhost/v1",
+        ] {
+            let parsed = reqwest::Url::parse(url).expect("valid fixture URL");
+            let pin = admit_inference_target(
+                InferenceEgressMode::InternalOnly,
+                EgressClass::InferenceLlm,
+                url,
+            )
+            .expect("canonical loopback target must be admitted")
+            .expect("internal-only admission must pin");
+            assert_eq!(Some(pin.host.as_str()), parsed.host_str(), "pin key: {url}");
+            assert!(!pin.addrs.is_empty(), "pin must resolve: {url}");
+            assert!(
+                pin.addrs.iter().all(|addr| addr.ip().is_loopback()),
+                "canonical loopback addresses required: {url}",
+            );
+        }
+    }
+
+    #[test]
+    fn inference_authority_parser_public_host_refused_8650() {
+        // IP literal fixtures require no external DNS or connection.
+        let url = r"https://8.8.8.8\@localhost/v1";
+        assert_eq!(
+            reqwest::Url::parse(url).unwrap().host_str(),
+            Some("8.8.8.8")
+        );
+        assert!(
+            admit_inference_target(
+                InferenceEgressMode::InternalOnly,
+                EgressClass::InferenceLlm,
+                url,
+            )
+            .is_err(),
+            "the connection parser's public host must not obtain an internal pin",
+        );
+    }
+
+    #[test]
+    fn inference_authority_parser_empty_port_8650() {
+        for (scheme, expected_port) in [("https", 443), ("http", 80)] {
+            for host in ["localhost", "127.0.0.1", "[::1]"] {
+                let url = format!("{scheme}://{host}:/v1");
+                let parsed = reqwest::Url::parse(&url).expect("valid empty port URL");
+                assert_eq!(parsed.port_or_known_default(), Some(expected_port));
+                let (_, addrs) =
+                    resolve_inference_authority(&url).expect("empty port uses default");
+                assert!(!addrs.is_empty(), "empty-port target must resolve: {url}");
+                for addr in addrs {
+                    assert_eq!(addr.port(), expected_port, "empty port: {url}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn inference_authority_parser_zero_port_refused_8650() {
+        for host in ["localhost", "127.0.0.1", "[::1]"] {
+            let url = format!("https://{host}:0/v1");
+            assert!(
+                resolve_inference_authority(&url).is_err(),
+                "zero port: {url}"
+            );
+            assert!(
+                admit_inference_target(
+                    InferenceEgressMode::InternalOnly,
+                    EgressClass::InferenceLlm,
+                    &url,
+                )
+                .is_err(),
+                "zero port must never produce a pin: {url}",
+            );
+        }
+    }
+
+    #[test]
     fn inference_authority_implicit_ports_8650() {
         // TEST-02: expected ports are independent of the production defaults.
         for (scheme, expected_port) in [("https", 443), ("http", 80), ("HTTPS", 443)] {
