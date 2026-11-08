@@ -1648,10 +1648,11 @@ pub fn redact_url_password(url: &str) -> String {
 /// `sqlx::Error::Configuration("invalid url postgres://…")` whose
 /// Display interpolates the connection target). Scans the message for
 /// `scheme://` runs and masks the userinfo password inside each one;
-/// every other byte passes through unchanged.
+/// other bytes pass through unchanged unless a run exceeds the shared scanner
+/// cap, in which case its remainder is discarded and replaced with the mask.
 #[must_use]
 pub fn redact_urls_in_message(msg: &str) -> String {
-    map_url_runs(msg, redact_url_password)
+    map_url_runs(msg, |url, _| redact_url_password(url))
 }
 
 /// Render credential-bearing options and bare connection targets privately.
@@ -1661,7 +1662,7 @@ pub fn redact_urls_in_message(msg: &str) -> String {
 pub(crate) fn map_urls_in_message(msg: &str, render: fn(&str) -> String) -> String {
     let options = redact_connection_options(msg);
     let text = redact_bare_targets(&options);
-    map_url_runs(&text, |url| render_operator_url(url, render))
+    map_url_runs(&text, |url, run| render_operator_url(url, run, render))
 }
 
 /// Consume a scheme-less authority through its host, including a spaced password.
@@ -1746,34 +1747,28 @@ fn connection_value_end(value: &str) -> usize {
 
 /// Apply one renderer to each URL run, sharing UTF-8-safe tokenization
 /// (OWNERSHIP-15) without duplicating the URL renderer's masking policy.
-fn map_url_runs(msg: &str, render: impl Fn(&str) -> String) -> String {
+fn map_url_runs(msg: &str, render: impl Fn(&str, &url_scan::UrlRun) -> String) -> String {
     let mut out = String::with_capacity(msg.len());
     let mut rest = msg;
-    while let Some(span) = next_url_span(rest) {
-        out.push_str(&rest[..span.start]);
-        out.push_str(&render(&rest[span.clone()]));
-        rest = &rest[span.end..];
+    while let Some(run) = url_scan::next_url_run(rest) {
+        out.push_str(&rest[..run.span.start]);
+        if run.capped {
+            out.push_str(&rest[run.span.start..run.scheme_end + SCHEME_SEPARATOR.len()]);
+            out.push_str(URL_PASSWORD_MASK);
+        } else {
+            out.push_str(&render(&rest[run.span.clone()], &run));
+        }
+        rest = &rest[run.span.end..];
     }
     out.push_str(rest);
     out
 }
 
-/// Share URL ownership between scalar recognition and URL rendering (OWNERSHIP-15).
+mod url_scan;
+
+/// Ownership-only callers share the same forward boundary discovery.
 fn next_url_span(text: &str) -> Option<std::ops::Range<usize>> {
-    let separator = text.find(SCHEME_SEPARATOR);
-    #[cfg(test)]
-    masking_cost_tests::visited(separator.map_or(text.len(), |at| at + SCHEME_SEPARATOR.len()));
-    let sep = separator?;
-    let mut start = sep;
-    while start > 0 {
-        let byte = text.as_bytes()[start - 1];
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.') {
-            start -= 1;
-        } else {
-            break;
-        }
-    }
-    Some(start..operator_url_run_end(text, sep + SCHEME_SEPARATOR.len()))
+    url_scan::next_url_run(text).map(|run| run.span)
 }
 
 /// Only an authority colon identifies userinfo ambiguity; path colons do not.
@@ -1784,74 +1779,21 @@ fn credentialed_authority(token: &str) -> bool {
         .is_some_and(|authority| authority.contains(':'))
 }
 
-/// Keep ambiguous userinfo look-ahead inside one line and before the next scheme.
-fn authority_lookahead_end(authority: &str) -> usize {
-    // A single forward walk stops at the first boundary, rather than searching
-    // the entire remaining line once per URL (S2, linear in consumed input).
-    authority
-        .char_indices()
-        .find_map(|(offset, ch)| {
-            (CREDENTIAL_LINE_ENDS.contains(&ch)
-                || authority[offset..].starts_with(SCHEME_SEPARATOR))
-            .then_some(offset)
-        })
-        .unwrap_or(authority.len())
-}
-
-/// Bound the ruled password-shaped look-ahead by the line and the next scheme.
-/// OWNERSHIP-15: find/split offsets are UTF-8 boundaries, including Unicode whitespace.
-fn operator_url_run_end(text: &str, authority_start: usize) -> usize {
-    let authority = &text[authority_start..];
-    let token_end = authority
-        .find(char::is_whitespace)
-        .unwrap_or(authority.len());
-    let token = &authority[..token_end];
-    let ambiguous = credentialed_authority(token);
-    let stop = if ambiguous {
-        authority_lookahead_end(authority)
-    } else {
-        token_end
-    };
-    if let Some(at) = authority[..stop].rfind('@') {
-        let host_start = at + '@'.len_utf8();
-        let end = authority[host_start..stop]
-            .find(|ch: char| ch.is_whitespace() || KEYLESS_URL_TERMINATORS.contains(&ch))
-            .map_or(stop, |offset| host_start + offset);
-        return authority_start + end;
-    }
-    if ambiguous {
-        // Settled posture: a recognized credential without a closing authority
-        // owns the line; this whole span is consumed. Ruling:
-        // https://github.com/alphaonedev/ai-memory-mcp/issues/8205#issuecomment-6717162013
-        return authority_start
-            + authority
-                .find(CREDENTIAL_LINE_ENDS)
-                .unwrap_or(authority.len());
-    }
-    authority_start + token.find(KEYLESS_URL_TERMINATORS).unwrap_or(token_end)
-}
-
-/// Remove ambiguous userinfo before the existing allowlist renderer sees the URL.
-/// OWNERSHIP-05: borrow source spans; allocate only the repaired URL and rendered result.
-fn render_operator_url(url: &str, render: fn(&str) -> String) -> String {
-    let Some((scheme, authority)) = url.split_once(SCHEME_SEPARATOR) else {
-        return render(url);
-    };
-    let token_end = authority
-        .find(char::is_whitespace)
-        .unwrap_or(authority.len());
-    let Some(at) = authority[..authority_lookahead_end(authority)].rfind('@') else {
-        return if credentialed_authority(&authority[..token_end]) {
+/// Render from boundaries already discovered by the forward scanner.
+/// OWNERSHIP-15: relative offsets retain the original UTF-8 boundaries.
+fn render_operator_url(url: &str, run: &url_scan::UrlRun, render: fn(&str) -> String) -> String {
+    let scheme_end = run.scheme_end - run.span.start;
+    let scheme = &url[..scheme_end];
+    let Some(at) = run.userinfo_end else {
+        return if run.ambiguous {
             format!("{scheme}{SCHEME_SEPARATOR}{URL_PASSWORD_MASK}")
         } else {
             render(url)
         };
     };
-    let host_tail = &authority[at + '@'.len_utf8()..];
-    let host_end = host_tail
-        .find(AUTHORITY_TERMINATORS)
-        .unwrap_or(host_tail.len());
-    let host = &host_tail[..host_end];
+    let host_start = at + '@'.len_utf8() - run.span.start;
+    let host_end = run.host_end - run.span.start;
+    let host = &url[host_start..host_end];
     render(&format!(
         "{scheme}{SCHEME_SEPARATOR}{URL_PASSWORD_MASK}@{host}"
     ))

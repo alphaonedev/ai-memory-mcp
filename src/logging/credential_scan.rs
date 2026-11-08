@@ -1,8 +1,8 @@
 //! Credential-option scanning with a persistent URL cursor (#8205 round 7).
 
 use super::{
-    AUTHORITY_TERMINATORS, CREDENTIAL_OPTION_KEYS, EXACT_CREDENTIAL_KEYS, SCHEME_SEPARATOR,
-    URL_PASSWORD_MASK, connection_value_end, next_url_span,
+    CREDENTIAL_OPTION_KEYS, EXACT_CREDENTIAL_KEYS, SCHEME_SEPARATOR, URL_PASSWORD_MASK,
+    connection_value_end, url_scan,
 };
 
 /// ASCII punctuation ignored inside credential keys.
@@ -78,17 +78,9 @@ impl UrlContext {
                 break;
             }
         }
-        let relative = next_url_span(&msg[offset..])?;
-        let span = offset + relative.start..offset + relative.end;
-        let url = &msg[span.clone()];
-        let start = url
-            .find(SCHEME_SEPARATOR)
-            .map_or(url.len(), |at| at + SCHEME_SEPARATOR.len());
-        let authority_end = url[start..]
-            .find(AUTHORITY_TERMINATORS)
-            .map_or(span.end, |at| span.start + start + at);
-        #[cfg(test)]
-        super::masking_cost_tests::visited(authority_end - span.start);
+        let run = url_scan::next_url_run(&msg[offset..])?;
+        let authority_end = offset + run.authority_end;
+        let span = offset + run.span.start..offset + run.span.end;
         Some(Self {
             span,
             authority_end,

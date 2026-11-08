@@ -77,6 +77,10 @@ fn ended_url_does_not_own_later_credential_lines_8674() {
             "https://db.invalid/path\npassword=private\nlimit=10",
             "https://db.invalid/path\npassword=****\nlimit=10",
         ),
+        (
+            "https://db.invalid\nhttps://password:private@other.invalid\npassword=private",
+            "https://db.invalid\nhttps://****@other.invalid\npassword=****",
+        ),
     ];
     for &(input, expected) in CASES {
         assert_eq!(
@@ -84,5 +88,21 @@ fn ended_url_does_not_own_later_credential_lines_8674() {
             expected,
             "#8674: ended URL ownership must reset"
         );
+    }
+}
+
+#[test]
+fn oversized_url_run_is_discarded_without_splitting_utf8_8674() {
+    const LONG_CHARS: usize = 10_000;
+    const TAIL: &str = "\nlimit=10";
+    for prefix in ["https://", "https://u:", "https://u@", "https://h/path?"] {
+        for repeated in ["x", "λ", "🦀"] {
+            let input = format!("{prefix}{}{TAIL}", repeated.repeat(LONG_CHARS));
+            assert_eq!(
+                super::map_urls_in_message(&input, str::to_owned),
+                format!("https://****{TAIL}"),
+                "#8674: oversize run is wholly private and newline suffix survives"
+            );
+        }
     }
 }

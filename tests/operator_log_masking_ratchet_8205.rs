@@ -24,6 +24,20 @@ const COST_RATIO_LIMIT: u32 = 40;
 const COST_SMALL_URL_BYTES: usize = 2_048;
 const COST_SMALL_ROWS: usize = 2_048;
 const COST_SCHEDULING_SLACK: std::time::Duration = std::time::Duration::from_millis(20);
+const RUN_SMALL_BYTES_8674: usize = 100_000;
+const RUN_LARGE_BYTES_8674: usize = 1_000_000;
+const RUN_SMALL_CEILING_8674: std::time::Duration = std::time::Duration::from_millis(250);
+const RUN_LARGE_CEILING_8674: std::time::Duration = std::time::Duration::from_millis(2_500);
+const RUN_DOUBLING_LIMIT_8674: u32 = 3;
+const RUN_SHAPES_8674: &[&str] = &[
+    "http://u@a.io)",
+    "http://u:p@a.io)",
+    "http://a.io)",
+    "http://u@a.io'",
+    "http://user@b.io)",
+    "http://u@a.io>",
+    "http://u@a.io:80)",
+];
 const KEYS: &[&str] = &[
     "password",
     "passwd",
@@ -71,6 +85,55 @@ fn minimum_masking_cost(detail: &str) -> std::time::Duration {
         })
         .min()
         .expect("the named cost sample count is positive")
+}
+
+#[test]
+fn suppressed_foreign_log_url_cost_8674() {
+    // No environment write or subscriber installation: the work before the
+    // tracing macro must remain bounded even when that macro emits nothing.
+    for shape in RUN_SHAPES_8674 {
+        let mut small_cost = std::time::Duration::ZERO;
+        for bytes in [
+            RUN_SMALL_BYTES_8674,
+            RUN_SMALL_BYTES_8674 * 2,
+            RUN_LARGE_BYTES_8674,
+        ] {
+            let input = shape.repeat(bytes.div_ceil(shape.len()));
+            let cost = (0..COST_SAMPLES)
+                .map(|_| {
+                    let error = anyhow::anyhow!(input.clone());
+                    let started = std::time::Instant::now();
+                    std::hint::black_box(ai_memory::mcp::error_text::log_foreign(
+                        "url_cost_8674",
+                        error,
+                    ));
+                    started.elapsed()
+                })
+                .min()
+                .expect("positive cost sample count");
+            let ceiling = if bytes == RUN_SMALL_BYTES_8674 {
+                RUN_SMALL_CEILING_8674
+            } else {
+                RUN_LARGE_CEILING_8674
+            };
+            println!(
+                "#8674 log_foreign shape={shape:?} bytes={} minimum={cost:?}",
+                input.len()
+            );
+            assert!(
+                cost < ceiling,
+                "#8674: foreign log cost {cost:?} exceeds {ceiling:?}"
+            );
+            if bytes == RUN_SMALL_BYTES_8674 {
+                small_cost = cost;
+            } else if bytes == RUN_SMALL_BYTES_8674 * 2 {
+                assert!(
+                    cost < small_cost * RUN_DOUBLING_LIMIT_8674,
+                    "#8674: x2 foreign log cost exceeds x3: {small_cost:?} -> {cost:?}"
+                );
+            }
+        }
+    }
 }
 
 fn assert_masking_cost_growth(label: &str, small: &str, large: &str) {
