@@ -2,6 +2,8 @@
 import importlib.util
 from pathlib import Path
 import sys
+import subprocess
+import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -84,6 +86,79 @@ class ExecutableResolutionS1S3S4(unittest.TestCase):
         self.assertEqual(len(checker.scan_shell('values=($(python3 x.py))')), 1)
         self.assertEqual(len(checker.scan_shell('number=$(( $(python3 x.py) + 1 ))')), 1)
         self.assertEqual(len(checker.scan_shell('(( $(python3 x.py) > 0 ))')), 1)
+
+
+class WorkflowScalarsS5S6R1S8(unittest.TestCase):
+    def setUp(self):
+        scratch = ROOT / '.local-runs'
+        scratch.mkdir(exist_ok=True)
+        self.temporary = tempfile.TemporaryDirectory(dir=scratch)
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.workflow = self.root / '.github/workflows/check.yml'
+        self.workflow.parent.mkdir(parents=True)
+
+    def scan(self, steps):
+        self.workflow.write_text('jobs:\n  test:\n    steps:\n' + steps)
+        exemptions = []
+        return load_checker().scan_repository(self.root, exemptions), exemptions
+
+    def test_yaml_run_forms_s5(self):
+        for steps, line in (
+            ('      - run: echo ready &&\n          python3 x.py\n', 5),
+            ('      - run:\n          python3 x.py\n', 5),
+            ('      - {name: check, run: python3 x.py}\n', 4),
+            ('      - "run": python3 x.py\n', 4),
+            ("      - 'run': python3 x.py\n", 4),
+            ("      - run: 'python3 x.py' # ordinary YAML comment\n", 4),
+            ('      - run: >-\n          python3\n          x.py\n', 5),
+        ):
+            with self.subTest(steps=steps):
+                findings, exemptions = self.scan(steps)
+                self.assertEqual(len(findings), 1, 'workflow scalar escaped')
+                self.assertFalse(findings[0][1].malformed)
+                self.assertEqual(findings[0][1].line, line)
+                self.assertEqual(exemptions, [])
+                isolated = steps.replace('python3', 'python3 -I')
+                self.assertEqual(self.scan(isolated)[0], [])
+
+    def test_yaml_comments_do_not_exempt_shell_s6(self):
+        for steps in ('      - run: python3 x.py # isolation: exempt #8202\n',
+                      '      - shell: python3 {0} # isolation: exempt #8202\n'
+                      '        run: pass\n'):
+            with self.subTest(steps=steps):
+                findings, exemptions = self.scan(steps)
+                self.assertEqual(len(findings), 1, 'YAML comment exempted an invocation')
+                self.assertEqual(exemptions, [])
+        for steps in ('      - run: "python3 x.py # isolation: exempt #8202"\n',
+                      '      - run: |\n          python3 x.py # isolation: exempt #8202\n'):
+            with self.subTest(shell_comment=steps):
+                findings, exemptions = self.scan(steps)
+                self.assertEqual(findings, [])
+                self.assertEqual(len(exemptions), 1)
+
+    def test_bad_scalar_retains_real_line_and_other_findings_r1(self):
+        steps = ('      - run: "bad\\q"\n'
+                 '      - run: python3 x.py\n'
+                 '      - run: "also\\q"\n')
+        self.scan(steps)
+        result = subprocess.run([sys.executable, '-I', str(CHECKER), '--root', str(self.root)],
+                                capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 2)
+        for line in (4, 5, 6):
+            self.assertIn(f'{self.workflow}:{line}:', result.stdout)
+        self.assertIn('findings=3 exemptions=0', result.stdout)
+        self.assertNotIn('Traceback', result.stderr)
+
+    def test_missing_or_empty_repository_is_input_error_s8(self):
+        for root in (self.root / 'missing', self.root):
+            with self.subTest(root=root):
+                result = subprocess.run([sys.executable, '-I', str(CHECKER), '--root', str(root)],
+                                        capture_output=True, text=True, check=False)
+                self.assertEqual(result.returncode, 2, 'empty repository scan reported success')
+                self.assertIn(str(root), result.stdout + result.stderr)
+                self.assertIn('python isolation:', result.stdout)
+                self.assertNotIn('Traceback', result.stderr)
 
 
 if __name__ == "__main__":
