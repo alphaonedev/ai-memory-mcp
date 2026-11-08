@@ -1155,6 +1155,128 @@ mod tests {
         assert!(valid_public_url("https://[]:80").is_none());
     }
 
+    /// RFC 3986 `reg-name` characters beyond ALPHA / DIGIT (unreserved
+    /// punctuation and sub-delims), written out independently of the code
+    /// under test so the sweep below is an oracle, not a tautology.
+    const REG_NAME_PUNCT_8444: &str = "-._~!$&'()*+,;=";
+
+    #[test]
+    fn port_with_a_leading_zero_is_refused_8444() {
+        // #8444 r5 code INFO-B: a non-canonical port is never echoed.
+        for bad in [
+            "https://h.example:08443",
+            "https://h.example:00080",
+            "https://h.example:01",
+            "http://h.example:00",
+            "https://[::1]:08443",
+        ] {
+            assert!(valid_public_url(bad).is_none(), "{bad}");
+            assert_eq!(
+                resolve_card_base_url(Some(bad), true, "1.2.3.4:5"),
+                "https://1.2.3.4:5",
+                "{bad}"
+            );
+        }
+        for good in ["https://h.example:80", "https://h.example:1"] {
+            assert_eq!(valid_public_url(good).as_deref(), Some(good), "{good}");
+        }
+    }
+
+    #[test]
+    fn bracket_checks_are_pinned_8444() {
+        // #8444 r5 sec INFO-1: an unbalanced bracket and a stray bracket in
+        // a reg-name each refuse on their own.
+        for bad in [
+            "https://[::1",
+            "https://h]x.example",
+            "https://h[x.example",
+            "https://[::1]]",
+            "https://[[::1]]",
+            "https://[::1]x",
+            "https://[]:80",
+        ] {
+            assert!(valid_public_url(bad).is_none(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn host_predicate_is_rfc_3986_8444() {
+        // #8444 r5 sec INFO-2: a bracketed host is an IPv6 literal (optional
+        // `%25` zone), anything else is an RFC 3986 reg-name.
+        for bad in [
+            "https://[evil]",
+            "https://[not-v6]:80",
+            "https://[1.2.3.4]",
+            "https://[::1%25]",
+            "https://[::1%eth0]",
+            "https://[::1%25e th]",
+            "https://[fe80::1%25eth0%25x]",
+            "https://h<x>.example",
+            "https://h\"x.example",
+            "https://h{x}.example",
+            "https://h|x.example",
+            "https://h%2.example",
+            "https://h%zzx.example",
+            "https://h%.example",
+            "https://h%2",
+            "https://h\u{e9}x.example",
+            "https://\u{200b}.example",
+        ] {
+            assert!(valid_public_url(bad).is_none(), "{bad}");
+        }
+        for good in [
+            "https://[::1]",
+            "https://[2001:db8::1]:8443",
+            "https://[fe80::1%25eth0]",
+            "https://[::ffff:1.2.3.4]",
+            "https://h.example",
+            "http://127.0.0.1:9077",
+            "https://h_x.example",
+            "https://h~x.example",
+            "https://h%2Fx.example",
+            "https://a.b-c.example:65535",
+        ] {
+            assert_eq!(valid_public_url(good).as_deref(), Some(good), "{good}");
+        }
+    }
+
+    #[test]
+    fn reg_name_byte_sweep_matches_the_rfc_set_8444() {
+        // Every ASCII byte in the middle of a host: accepted exactly when it
+        // is ALPHA, DIGIT, unreserved punctuation or a sub-delim. `%` needs
+        // two hex digits and `:` begins a (non-numeric) port, so both refuse
+        // on their own.
+        for b in 0_u8..=127 {
+            let c = char::from(b);
+            let url = format!("https://h{c}x.example");
+            let expected = c.is_ascii_alphanumeric() || REG_NAME_PUNCT_8444.contains(c);
+            assert_eq!(
+                valid_public_url(&url).is_some(),
+                expected,
+                "byte {b:#04x} in {url:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn hostile_public_url_stays_linear_8444() {
+        // 100K+ inputs of every shape that reaches the host predicate refuse
+        // in a bounded time (the length bound short-circuits before any scan).
+        const BIG: usize = 120_000;
+        const CEILING: std::time::Duration = std::time::Duration::from_millis(500);
+        let started = std::time::Instant::now();
+        for url in [
+            format!("https://{}", "a".repeat(BIG)),
+            format!("https://[{}]", ":".repeat(BIG)),
+            format!("https://{}:80", "%".repeat(BIG)),
+            format!("https://h.example:{}", "0".repeat(BIG)),
+            format!("https://{}", "[".repeat(BIG)),
+        ] {
+            assert!(valid_public_url(&url).is_none());
+        }
+        assert!(started.elapsed() < CEILING, "{:?}", started.elapsed());
+    }
+
     #[test]
     fn negative_history_length_is_invalid_params() {
         // #8444 r2 code LOW-8.
