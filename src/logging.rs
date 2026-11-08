@@ -1861,6 +1861,9 @@ fn render_operator_url(url: &str, render: fn(&str) -> String) -> String {
 mod masking_cost_tests;
 
 #[cfg(test)]
+mod url_run_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
