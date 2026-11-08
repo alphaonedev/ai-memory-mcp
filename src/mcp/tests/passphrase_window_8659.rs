@@ -10,6 +10,7 @@ use std::sync::TryLockError;
 use std::time::Duration;
 
 const CHILD_ROLE: &str = "AI_MEMORY_PASSPHRASE_WINDOW_8659_CHILD";
+const NO_CONFIG_ENV: &str = "AI_MEMORY_NO_CONFIG";
 const EXACT_TEST: &str =
     "mcp::tests::passphrase_window_8659::audit_dispatch_holds_passphrase_window_8659";
 const CHILD_TIMEOUT: Duration = Duration::from_secs(30);
@@ -87,7 +88,7 @@ fn audit_dispatch_holds_passphrase_window_8659() {
         .env_clear()
         .envs(std::env::var_os("LLVM_PROFILE_FILE").map(|value| ("LLVM_PROFILE_FILE", value)))
         .env("TMPDIR", std::env::temp_dir())
-        .env("AI_MEMORY_NO_CONFIG", "1")
+        .env(NO_CONFIG_ENV, "1")
         .env(CHILD_ROLE, EXACT_TEST);
     let output = assert_cmd::Command::from_std(command)
         .timeout(CHILD_TIMEOUT)
