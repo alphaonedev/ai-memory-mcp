@@ -529,6 +529,62 @@ def check_change(repo, base, head, tip=None, base_name=None):
         return False, f"{PREFIX}: ERROR — {exc} (fail-closed)"
 
 
+# #8443 (decision B): a VOID-to-VOID edit leaves the banner identical, so the
+# banner predicate alone can never accept it. It is a voiding record only when
+# the diff ADDS, inside section 7, a firing-ledger entry that names a changed
+# watched path (or added/removed AI_MEMORY_FED_* identifier) AND a commit range.
+LEDGER_RANGE_RE = re.compile(r"(?<![0-9a-fA-F])[0-9a-fA-F]{7,40}\.\.\.?[0-9a-fA-F]{7,40}(?![0-9a-fA-F])")
+SEC7_HEADING_RE = re.compile(r"^##" + _S + r"+7\.")
+H2_HEADING_RE = re.compile(r"^##" + _S + r"+\S")
+HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
+
+
+def section7_span(lines):
+    """(first, end) 1-based line numbers of section 7, end exclusive; None when absent."""
+    start = None
+    for i, ln in enumerate(lines, 1):
+        if start is None:
+            if SEC7_HEADING_RE.match(ln):
+                start = i
+        elif H2_HEADING_RE.match(ln) and not ln.startswith("###"):
+            return (start, i)
+    return None if start is None else (start, len(lines) + 1)
+
+
+def added_cert_lines(repo, frm, to):
+    """[(line number at `to`, text)] of every line the diff adds to the cert doc."""
+    proc = run_git(repo, "diff", "-U0", "--no-renames", "--end-of-options", frm, to, "--", CERT_DOC)
+    if proc.returncode != 0:
+        err = proc.stderr.decode("utf-8", "replace").strip()
+        raise GateError(f"git diff {frm} {to} -- {CERT_DOC} exited {proc.returncode}: {err}")
+    added = []
+    lineno = None
+    for ln in proc.stdout.decode("utf-8", "replace").split("\n"):
+        m = HUNK_RE.match(ln)
+        if m:
+            lineno = int(m.group(1))
+            continue
+        if lineno is None:
+            continue
+        if ln.startswith("+"):
+            added.append((lineno, ln[1:]))
+            lineno += 1
+    return added
+
+
+def ledger_entry_added(repo, mb, judged, names):
+    """True iff the change adds a section 7 ledger entry naming one of `names`
+    and a commit range. Fail-closed: no section 7, or no match, is False."""
+    blob = read_blob(repo, judged, CERT_DOC)
+    if blob is None:
+        return False
+    span = section7_span(blob.decode("utf-8", "replace").split("\n"))
+    if span is None:
+        return False
+    text = "\n".join(t for n, t in added_cert_lines(repo, mb, judged) if span[0] < n < span[1])
+    return bool(LEDGER_RANGE_RE.search(text)) and any(name and name in text for name in names)
+
+
 def _judge(repo, base, head, judged, mb, tip):
     watched = []
     cert_touched = False
@@ -562,8 +618,19 @@ def _judge(repo, base, head, judged, mb, tip):
         # STATUS line and at most one Binds-to line is not a re-issue.
         malformed = banner_head[0] in ("DUPLICATE", "UNPARSEABLE") or banner_head[1] == "DUPLICATE"
 
-    if cert_touched and not incidental and not deleted and not malformed:
+    ledger = (
+        cert_touched and incidental and not deleted and not malformed
+        and banner_head[0] == "VOID" and banner_mb[0] == "VOID"
+        and ledger_entry_added(repo, mb, judged, [*watched, *added, *removed])
+    )
+    if cert_touched and (ledger or (not incidental and not deleted and not malformed)):
         ok, more = check_banner_consistency(repo, judged)
+        if ledger:
+            more = [
+                f"{PREFIX}: PASS — federation-wire surface changed AND a section 7 "
+                f"firing-ledger entry names the watched path and the commit range "
+                f"({mb}..{judged}; banner VOID at both ends)"
+            ] + more
         head_line = (
             f"{PREFIX}: PASS — federation-wire surface changed AND cert doc "
             f"re-issued/voided in the same change ({mb}..{judged}; banner "
@@ -577,7 +644,8 @@ def _judge(repo, base, head, judged, mb, tip):
             "The cert doc WAS edited in this change, but neither its STATUS line "
             f"nor its Binds-to line changed (banner {fmt_banner(banner_head)} at "
             "both ends) — an incidental edit is not a re-issue and not a voiding "
-            "record (#3556)."
+            "record (#3556). A VOID-to-VOID edit counts only with an ADDED section 7 "
+            "firing-ledger entry that names the watched path and the commit range."
         )
     if deleted:
         out.append(

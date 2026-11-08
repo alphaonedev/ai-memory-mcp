@@ -183,8 +183,13 @@ async fn bulk_create_unsigned_rejected_under_required_attestation_1919() {
             "source": "api"
         }
     ]);
-    let (status, resp) =
-        post_json(&router, "/api/v1/memories/bulk", Some("ai:curator"), &body).await;
+    let (status, resp) = post_json(
+        &router,
+        "/api/v1/memories/bulk",
+        Some("ai:victim-1919"),
+        &body,
+    )
+    .await;
 
     assert_eq!(
         status,

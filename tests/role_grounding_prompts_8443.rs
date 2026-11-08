@@ -338,7 +338,7 @@ fn multistep_cells_name_the_authenticated_caller_as_owner_8443() {
 #[test]
 fn multistep_without_a_caller_uses_the_unidentified_form_8443() {
     let prompts = multistep_prompts(TOOL_STEERING, None);
-    assert!(!prompts.is_empty());
+    assert_ne!(prompts.len(), 0);
     assert!(prompts.iter().all(|p| p.contains("not identified")));
 }
 

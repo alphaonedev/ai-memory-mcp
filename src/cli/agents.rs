@@ -1999,11 +1999,11 @@ mod tests {
     fn test_agents_bind_challenge_is_durable() {
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
-        let kp = register_and_keypair(&mut env, &db, "ai:curator");
+        let kp = register_and_keypair(&mut env, &db, "ai:bound-8443");
         let key = kp.public_base64();
         let args = AgentsArgs {
             action: Some(AgentsAction::BindChallenge {
-                agent_id: "ai:curator".to_string(),
+                agent_id: "ai:bound-8443".to_string(),
                 pubkey: key.clone(),
             }),
         };
@@ -2022,19 +2022,19 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .expect("durable challenge row");
-        assert_eq!(stored, ("ai:curator".to_string(), key));
+        assert_eq!(stored, ("ai:bound-8443".to_string(), key));
     }
 
     #[test]
     fn test_agents_bind_key_happy_text() {
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
-        let kp = register_and_keypair(&mut env, &db, "ai:curator");
+        let kp = register_and_keypair(&mut env, &db, "ai:bound-8443");
         let pk = kp.public_base64();
-        let proof = write_proof_file(&env, "bind-proof-text.json", "ai:curator", &kp);
+        let proof = write_proof_file(&env, "bind-proof-text.json", "ai:bound-8443", &kp);
         let args = AgentsArgs {
             action: Some(AgentsAction::BindKey {
-                agent_id: "ai:curator".to_string(),
+                agent_id: "ai:bound-8443".to_string(),
                 pubkey: pk.clone(),
                 proof_file: Some(proof),
             }),
@@ -2043,22 +2043,22 @@ mod tests {
             let mut out = env.output();
             run_agents(&db, args, false, &mut out).unwrap();
         }
-        assert!(env.stdout_str().contains("bound pubkey for ai:curator"));
+        assert!(env.stdout_str().contains("bound pubkey for ai:bound-8443"));
         // The key is now retrievable via db::agent_pubkey.
         let conn = db::open(&db).unwrap();
-        assert_eq!(db::agent_pubkey(&conn, "ai:curator").unwrap(), Some(pk));
+        assert_eq!(db::agent_pubkey(&conn, "ai:bound-8443").unwrap(), Some(pk));
     }
 
     #[test]
     fn test_agents_bind_key_happy_json() {
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
-        let kp = register_and_keypair(&mut env, &db, "ai:curator");
+        let kp = register_and_keypair(&mut env, &db, "ai:bound-8443");
         let pk = kp.public_base64();
-        let proof = write_proof_file(&env, "bind-proof-json.json", "ai:curator", &kp);
+        let proof = write_proof_file(&env, "bind-proof-json.json", "ai:bound-8443", &kp);
         let args = AgentsArgs {
             action: Some(AgentsAction::BindKey {
-                agent_id: "ai:curator".to_string(),
+                agent_id: "ai:bound-8443".to_string(),
                 pubkey: pk.clone(),
                 proof_file: Some(proof),
             }),
@@ -2069,7 +2069,7 @@ mod tests {
         }
         let v: serde_json::Value = serde_json::from_str(env.stdout_str().trim()).unwrap();
         assert_eq!(v["bound"].as_bool().unwrap(), true);
-        assert_eq!(v["agent_id"].as_str().unwrap(), "ai:curator");
+        assert_eq!(v["agent_id"].as_str().unwrap(), "ai:bound-8443");
         assert_eq!(v["agent_pubkey"].as_str().unwrap(), pk);
     }
 
@@ -2124,14 +2124,14 @@ mod tests {
     fn test_agents_bind_key_same_key_needs_fresh_challenge_and_stays_idempotent() {
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
-        let kp = register_and_keypair(&mut env, &db, "ai:curator");
+        let kp = register_and_keypair(&mut env, &db, "ai:bound-8443");
         let key = kp.public_base64();
 
-        let replayed = write_proof_file(&env, "single-use.json", "ai:curator", &kp);
+        let replayed = write_proof_file(&env, "single-use.json", "ai:bound-8443", &kp);
         for attempt in 0..2 {
             let args = AgentsArgs {
                 action: Some(AgentsAction::BindKey {
-                    agent_id: "ai:curator".to_string(),
+                    agent_id: "ai:bound-8443".to_string(),
                     pubkey: key.clone(),
                     proof_file: Some(replayed.clone()),
                 }),
@@ -2150,10 +2150,10 @@ mod tests {
             }
         }
 
-        let fresh = write_proof_file(&env, "fresh-reassert.json", "ai:curator", &kp);
+        let fresh = write_proof_file(&env, "fresh-reassert.json", "ai:bound-8443", &kp);
         let args = AgentsArgs {
             action: Some(AgentsAction::BindKey {
-                agent_id: "ai:curator".to_string(),
+                agent_id: "ai:bound-8443".to_string(),
                 pubkey: key.clone(),
                 proof_file: Some(fresh),
             }),
@@ -2162,7 +2162,7 @@ mod tests {
         run_agents(&db, args, false, &mut out).expect("fresh same-key proof must reassert");
 
         let conn = db::open(&db).unwrap();
-        let history = db::agent_pubkey_versions(&conn, "ai:curator").unwrap();
+        let history = db::agent_pubkey_versions(&conn, "ai:bound-8443").unwrap();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].pubkey_b64, key);
     }
@@ -2171,8 +2171,8 @@ mod tests {
     fn test_agents_bind_key_refuses_expired_durable_challenge() {
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
-        let kp = register_and_keypair(&mut env, &db, "ai:curator");
-        let proof = write_proof_file(&env, "expired.json", "ai:curator", &kp);
+        let kp = register_and_keypair(&mut env, &db, "ai:bound-8443");
+        let proof = write_proof_file(&env, "expired.json", "ai:bound-8443", &kp);
         let raw = std::fs::read_to_string(&proof).expect("read proof");
         let doc: serde_json::Value = serde_json::from_str(&raw).expect("parse proof");
         let nonce = doc["nonce"].as_str().expect("proof nonce");
@@ -2189,7 +2189,7 @@ mod tests {
 
         let args = AgentsArgs {
             action: Some(AgentsAction::BindKey {
-                agent_id: "ai:curator".to_string(),
+                agent_id: "ai:bound-8443".to_string(),
                 pubkey: kp.public_base64(),
                 proof_file: Some(proof),
             }),
@@ -2199,7 +2199,7 @@ mod tests {
             .expect_err("expired durable challenge must refuse");
         assert_eq!(error.to_string(), crate::errors::msg::BIND_PROOF_REFUSED);
         let conn = db::open(&db).expect("reopen DB");
-        assert_eq!(db::agent_pubkey(&conn, "ai:curator").unwrap(), None);
+        assert_eq!(db::agent_pubkey(&conn, "ai:bound-8443").unwrap(), None);
     }
 
     #[test]
@@ -2225,10 +2225,10 @@ mod tests {
     fn test_agents_bind_key_malformed_pubkey_is_rejected() {
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
-        register_and_key(&mut env, &db, "ai:curator");
+        register_and_key(&mut env, &db, "ai:bound-8443");
         let args = AgentsArgs {
             action: Some(AgentsAction::BindKey {
-                agent_id: "ai:curator".to_string(),
+                agent_id: "ai:bound-8443".to_string(),
                 pubkey: "not-a-valid-key".to_string(),
                 proof_file: None,
             }),
@@ -2242,38 +2242,41 @@ mod tests {
     fn test_agents_revoke_key_happy_text() {
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
-        let kp = register_and_keypair(&mut env, &db, "ai:curator");
+        let kp = register_and_keypair(&mut env, &db, "ai:bound-8443");
         // Bind then revoke.
         {
             let conn = db::open(&db).unwrap();
-            db::bind_agent_pubkey_with_keypair(&conn, "ai:curator", &kp).unwrap();
+            db::bind_agent_pubkey_with_keypair(&conn, "ai:bound-8443", &kp).unwrap();
         }
         let args = AgentsArgs {
             action: Some(AgentsAction::RevokeKey {
-                agent_id: "ai:curator".to_string(),
+                agent_id: "ai:bound-8443".to_string(),
             }),
         };
         {
             let mut out = env.output();
             run_agents(&db, args, false, &mut out).unwrap();
         }
-        assert!(env.stdout_str().contains("revoked pubkey for ai:curator"));
+        assert!(
+            env.stdout_str()
+                .contains("revoked pubkey for ai:bound-8443")
+        );
         let conn = db::open(&db).unwrap();
-        assert_eq!(db::agent_pubkey(&conn, "ai:curator").unwrap(), None);
+        assert_eq!(db::agent_pubkey(&conn, "ai:bound-8443").unwrap(), None);
     }
 
     #[test]
     fn test_agents_revoke_key_happy_json() {
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
-        let kp = register_and_keypair(&mut env, &db, "ai:curator");
+        let kp = register_and_keypair(&mut env, &db, "ai:bound-8443");
         {
             let conn = db::open(&db).unwrap();
-            db::bind_agent_pubkey_with_keypair(&conn, "ai:curator", &kp).unwrap();
+            db::bind_agent_pubkey_with_keypair(&conn, "ai:bound-8443", &kp).unwrap();
         }
         let args = AgentsArgs {
             action: Some(AgentsAction::RevokeKey {
-                agent_id: "ai:curator".to_string(),
+                agent_id: "ai:bound-8443".to_string(),
             }),
         };
         {
@@ -2282,25 +2285,28 @@ mod tests {
         }
         let v: serde_json::Value = serde_json::from_str(env.stdout_str().trim()).unwrap();
         assert_eq!(v["revoked"].as_bool().unwrap(), true);
-        assert_eq!(v["agent_id"].as_str().unwrap(), "ai:curator");
+        assert_eq!(v["agent_id"].as_str().unwrap(), "ai:bound-8443");
     }
 
     #[test]
     fn test_agents_revoke_key_idempotent_without_bound_key() {
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
-        register_and_key(&mut env, &db, "ai:curator");
+        register_and_key(&mut env, &db, "ai:bound-8443");
         // No key bound — revoke still succeeds.
         let args = AgentsArgs {
             action: Some(AgentsAction::RevokeKey {
-                agent_id: "ai:curator".to_string(),
+                agent_id: "ai:bound-8443".to_string(),
             }),
         };
         {
             let mut out = env.output();
             run_agents(&db, args, false, &mut out).unwrap();
         }
-        assert!(env.stdout_str().contains("revoked pubkey for ai:curator"));
+        assert!(
+            env.stdout_str()
+                .contains("revoked pubkey for ai:bound-8443")
+        );
     }
 
     #[test]
@@ -2420,8 +2426,8 @@ mod tests {
     fn test_enroll_subkey_cert_happy_text() {
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
-        let root = register_and_bind_root(&mut env, &db, "ai:curator");
-        let json = build_cert_json(&root, "ai:curator", CERT_NOT_BEFORE, CERT_NOT_AFTER);
+        let root = register_and_bind_root(&mut env, &db, "ai:bound-8443");
+        let json = build_cert_json(&root, "ai:bound-8443", CERT_NOT_BEFORE, CERT_NOT_AFTER);
         let file = write_cert_file(&env, "cert-happy.json", &json);
         let args = AgentsArgs {
             action: Some(AgentsAction::EnrollSubkeyCert { file }),
@@ -2435,12 +2441,12 @@ mod tests {
             "expected enrolled line, got: {}",
             env.stdout_str()
         );
-        assert!(env.stdout_str().contains("ai:curator"));
+        assert!(env.stdout_str().contains("ai:bound-8443"));
         // Observable persistence: exactly one row for the principal.
         let conn = db::open(&db).unwrap();
-        let certs = db::list_subkey_certs(&conn, Some("ai:curator")).unwrap();
+        let certs = db::list_subkey_certs(&conn, Some("ai:bound-8443")).unwrap();
         assert_eq!(certs.len(), 1);
-        assert_eq!(certs[0].principal, "ai:curator");
+        assert_eq!(certs[0].principal, "ai:bound-8443");
         assert!(!certs[0].revoked);
     }
 
@@ -2448,8 +2454,8 @@ mod tests {
     fn test_enroll_subkey_cert_happy_json() {
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
-        let root = register_and_bind_root(&mut env, &db, "ai:curator");
-        let json = build_cert_json(&root, "ai:curator", CERT_NOT_BEFORE, CERT_NOT_AFTER);
+        let root = register_and_bind_root(&mut env, &db, "ai:bound-8443");
+        let json = build_cert_json(&root, "ai:bound-8443", CERT_NOT_BEFORE, CERT_NOT_AFTER);
         let file = write_cert_file(&env, "cert-happy-json.json", &json);
         let args = AgentsArgs {
             action: Some(AgentsAction::EnrollSubkeyCert { file }),
@@ -2460,7 +2466,7 @@ mod tests {
         }
         let v: serde_json::Value = serde_json::from_str(env.stdout_str().trim()).unwrap();
         assert_eq!(v["enrolled"].as_bool().unwrap(), true);
-        assert_eq!(v["principal"].as_str().unwrap(), "ai:curator");
+        assert_eq!(v["principal"].as_str().unwrap(), "ai:bound-8443");
         assert!(v["id"].as_str().unwrap().starts_with("b3:"));
     }
 
@@ -2469,9 +2475,9 @@ mod tests {
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         // Bind the real root, but sign the cert with an UNRELATED key.
-        let _real_root = register_and_bind_root(&mut env, &db, "ai:curator");
+        let _real_root = register_and_bind_root(&mut env, &db, "ai:bound-8443");
         let attacker = ed25519_dalek::SigningKey::from_bytes(&[0x99u8; 32]);
-        let json = build_cert_json(&attacker, "ai:curator", CERT_NOT_BEFORE, CERT_NOT_AFTER);
+        let json = build_cert_json(&attacker, "ai:bound-8443", CERT_NOT_BEFORE, CERT_NOT_AFTER);
         let file = write_cert_file(&env, "cert-wrong-root.json", &json);
         let args = AgentsArgs {
             action: Some(AgentsAction::EnrollSubkeyCert { file }),
@@ -2519,7 +2525,7 @@ mod tests {
         // Register, then bind a base64 string that decodes to the WRONG
         // length (not a 32-byte Ed25519 key) directly via db — bypasses the
         // CLI's bind-key validation so we can drive the decode-failure arm.
-        let signer = register_and_bind_root(&mut env, &db, "ai:curator");
+        let signer = register_and_bind_root(&mut env, &db, "ai:bound-8443");
         {
             // #3464 — a 10-byte "key" cannot sign anything, so no possession
             // proof for it can exist and no bind funnel will take it. Corrupt
@@ -2539,13 +2545,13 @@ mod tests {
                  content = json_set(content, '$.agent_pubkey', ?2) \
                  WHERE namespace = '_agents' AND title = ?1",
                 rusqlite::params![
-                    crate::models::agent_registration_title("ai:curator"),
+                    crate::models::agent_registration_title("ai:bound-8443"),
                     b64.encode([0u8; 10])
                 ],
             )
             .unwrap();
         }
-        let json = build_cert_json(&signer, "ai:curator", CERT_NOT_BEFORE, CERT_NOT_AFTER);
+        let json = build_cert_json(&signer, "ai:bound-8443", CERT_NOT_BEFORE, CERT_NOT_AFTER);
         let file = write_cert_file(&env, "cert-malformed-root.json", &json);
         let args = AgentsArgs {
             action: Some(AgentsAction::EnrollSubkeyCert { file }),
@@ -2626,8 +2632,8 @@ mod tests {
     fn test_enroll_subkey_cert_missing_field_rejected() {
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
-        let root = register_and_bind_root(&mut env, &db, "ai:curator");
-        let mut json = build_cert_json(&root, "ai:curator", CERT_NOT_BEFORE, CERT_NOT_AFTER);
+        let root = register_and_bind_root(&mut env, &db, "ai:bound-8443");
+        let mut json = build_cert_json(&root, "ai:bound-8443", CERT_NOT_BEFORE, CERT_NOT_AFTER);
         // Drop a required string field.
         json.as_object_mut().unwrap().remove("model_version_ref");
         let file = write_cert_file(&env, "cert-missing-field.json", &json);
@@ -2649,8 +2655,8 @@ mod tests {
     fn test_enroll_subkey_cert_field_not_base64_rejected() {
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
-        let root = register_and_bind_root(&mut env, &db, "ai:curator");
-        let mut json = build_cert_json(&root, "ai:curator", CERT_NOT_BEFORE, CERT_NOT_AFTER);
+        let root = register_and_bind_root(&mut env, &db, "ai:bound-8443");
+        let mut json = build_cert_json(&root, "ai:bound-8443", CERT_NOT_BEFORE, CERT_NOT_AFTER);
         // Replace a base64 field with a non-base64 string.
         json["instance_key_id"] = serde_json::Value::String("%%%%not-base64%%%%".to_string());
         let file = write_cert_file(&env, "cert-not-b64.json", &json);
@@ -2704,8 +2710,8 @@ mod tests {
     fn test_subkey_certs_populated_text() {
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
-        let root = register_and_bind_root(&mut env, &db, "ai:curator");
-        let json = build_cert_json(&root, "ai:curator", CERT_NOT_BEFORE, CERT_NOT_AFTER);
+        let root = register_and_bind_root(&mut env, &db, "ai:bound-8443");
+        let json = build_cert_json(&root, "ai:bound-8443", CERT_NOT_BEFORE, CERT_NOT_AFTER);
         let file = write_cert_file(&env, "cert-list-text.json", &json);
         {
             let mut out = env.output();
@@ -2734,7 +2740,7 @@ mod tests {
             .unwrap();
         }
         let s = env.stdout_str();
-        assert!(s.contains("principal=ai:curator"), "got: {s}");
+        assert!(s.contains("principal=ai:bound-8443"), "got: {s}");
         assert!(s.contains("1 sub-key certificate(s)"), "got: {s}");
     }
 
@@ -2742,8 +2748,8 @@ mod tests {
     fn test_subkey_certs_populated_json_filtered_by_principal() {
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
-        let root = register_and_bind_root(&mut env, &db, "ai:curator");
-        let json = build_cert_json(&root, "ai:curator", CERT_NOT_BEFORE, CERT_NOT_AFTER);
+        let root = register_and_bind_root(&mut env, &db, "ai:bound-8443");
+        let json = build_cert_json(&root, "ai:bound-8443", CERT_NOT_BEFORE, CERT_NOT_AFTER);
         let file = write_cert_file(&env, "cert-list-json.json", &json);
         {
             let mut out = env.output();
@@ -2765,7 +2771,7 @@ mod tests {
                 &db,
                 AgentsArgs {
                     action: Some(AgentsAction::SubkeyCerts {
-                        principal: Some("ai:curator".to_string()),
+                        principal: Some("ai:bound-8443".to_string()),
                     }),
                 },
                 true,
@@ -2776,7 +2782,7 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(env.stdout_str().trim()).unwrap();
         assert_eq!(v["count"].as_u64().unwrap(), 1);
         let cert0 = &v["subkey_certs"][0];
-        assert_eq!(cert0["principal"].as_str().unwrap(), "ai:curator");
+        assert_eq!(cert0["principal"].as_str().unwrap(), "ai:bound-8443");
         assert_eq!(cert0["revoked"].as_bool().unwrap(), false);
         // The instance_key_id round-trips as a base64 string.
         assert!(cert0["instance_key_id"].as_str().is_some());

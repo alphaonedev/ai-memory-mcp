@@ -248,12 +248,23 @@ pub fn memories_to_toon_for(response: &Value, compact: bool, reader: Option<&str
                     // #199: `agent_id` is nested inside metadata in the Memory struct.
                     // Surface it as a top-level TOON column by digging into metadata.
                     if field == CONTENT_PRINCIPAL_COLUMN {
-                        let cell = mem.get("metadata").and_then(|m| m.get(field));
-                        match (cell.and_then(Value::as_str), reader) {
-                            (Some(marker), Some(r)) if marker.eq_ignore_ascii_case(r.trim()) => {
-                                crate::role_grounding::PRINCIPAL_UNKNOWN.to_string()
+                        match mem.get("metadata") {
+                            // The EFFECTIVE principal relative to the reader
+                            // (#8443 sec I1): a stored marker, else the foreign
+                            // author, else `unknown`; owner content is empty.
+                            Some(meta) if meta.is_object() => {
+                                let (_, principals) =
+                                    crate::role_grounding::effective_principals_with(
+                                        &[meta],
+                                        reader,
+                                        None,
+                                    );
+                                match principals.into_iter().next().flatten() {
+                                    Some(p) => escape_toon(p.as_str()),
+                                    None => String::new(),
+                                }
                             }
-                            _ => format_value(cell),
+                            other => format_value(other.and_then(|m| m.get(field))),
                         }
                     } else if field == "agent_id" {
                         format_value(mem.get("metadata").and_then(|m| m.get(field)))
@@ -740,9 +751,10 @@ mod tests {
             "count": 1,
         });
         let toon = memories_to_toon(&resp, false);
-        // Metadata column (last) is empty.
+        // The metadata cell is empty; the trailing content_principal cell is
+        // `unknown` because a row with no author is never owner content (#8443 S4).
         let row = toon.lines().last().unwrap();
-        assert!(row.ends_with('|') || row.ends_with("||"), "got: {row}");
+        assert!(row.ends_with("||unknown"), "got: {row}");
     }
 
     #[test]

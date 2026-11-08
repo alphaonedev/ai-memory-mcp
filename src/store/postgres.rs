@@ -28147,10 +28147,14 @@ impl MemoryStore for PostgresStore {
         // fault is no owner: the fold then treats every non-writer author as
         // foreign (fail closed).
         let substrate_owner = if ctx.bypass_visibility {
-            self.pg_resolve_namespace_owner(namespace)
-                .await
-                .ok()
-                .flatten()
+            let resolved = match self.pg_resolve_namespace_owner(namespace).await {
+                Ok(owner) => owner,
+                Err(e) => {
+                    crate::role_grounding::warn_owner_lookup_failed(namespace, &e);
+                    None
+                }
+            };
+            crate::role_grounding::substrate_owner_hint(resolved, namespace)
         } else {
             None
         };

@@ -235,7 +235,6 @@ fn mcp_wire_format(tool_name: &str, arguments: &Value) -> Result<Option<WireForm
 mod provider_echo_sinks_3648_tests;
 #[cfg(test)]
 mod provider_redaction_3648_tests;
-#[cfg(test)]
 mod rga_multistep_dispatch_8443_tests;
 #[cfg(test)]
 mod span_capture_4088_tests;

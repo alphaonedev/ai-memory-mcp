@@ -8,6 +8,8 @@
 //! `ctx.authority.read_caller()` is pinned (a dispatch that passed `None` would
 //! render the unidentified-owner form).
 
+#![cfg(test)]
+
 use super::*;
 use crate::config::FeatureTier;
 use crate::multistep_ingest::LlmDispatch;

@@ -239,29 +239,81 @@ pub fn stored_principal(metadata: &Value) -> Option<ContentPrincipal> {
     content_principal(metadata).and_then(ContentPrincipal::from_stored)
 }
 
+/// Deepest nesting level below the top-level metadata object that
+/// [`strip_content_principal`] and [`sanitize_inbound_principal`] walk.
+pub const STRIP_MAX_DEPTH: usize = 4;
+
+/// Unicode format characters (category Cf plus the invisible separators) that
+/// render as nothing, so a key spelled with one still reads as the claim key.
+fn is_format_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{061C}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206F}'
+            | '\u{FEFF}'
+            | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{E0001}'
+            | '\u{E0020}'..='\u{E007F}'
+    )
+}
+
+/// Whether `key` is the claim key after removing format characters and
+/// folding ASCII case.
+fn is_claim_key(key: &str) -> bool {
+    let norm: String = key.chars().filter(|c| !is_format_char(*c)).collect();
+    norm.eq_ignore_ascii_case(META_CONTENT_PRINCIPAL)
+}
+
+/// Remove claim keys from `value` and, up to [`STRIP_MAX_DEPTH`], from every
+/// nested object and array element. `keep_exact_top` keeps the exact
+/// top-level key (the federation sanitiser judges that one itself).
+fn strip_claims(value: &mut Value, depth: usize, keep_exact_top: bool) -> bool {
+    match value {
+        Value::Object(obj) => {
+            let variants: Vec<String> = obj
+                .keys()
+                .filter(|k| {
+                    is_claim_key(k) && !(keep_exact_top && k.as_str() == META_CONTENT_PRINCIPAL)
+                })
+                .cloned()
+                .collect();
+            let mut removed = false;
+            for key in variants {
+                removed |= obj.remove(&key).is_some();
+            }
+            if depth < STRIP_MAX_DEPTH {
+                for child in obj.values_mut() {
+                    removed |= strip_claims(child, depth + 1, false);
+                }
+            }
+            removed
+        }
+        Value::Array(items) if depth < STRIP_MAX_DEPTH => {
+            let mut removed = false;
+            for item in items {
+                removed |= strip_claims(item, depth + 1, false);
+            }
+            removed
+        }
+        _ => false,
+    }
+}
+
 /// Remove a caller-supplied `content_principal` from `metadata`. Every ingress
 /// calls this before the server stamps. Returns `true` when a key was removed.
 ///
-/// The key is matched without regard to letter case, and a nested `metadata`
-/// object is stripped too (a relay that wraps the real metadata one level
-/// down), so a variant spelling cannot smuggle a claim past the strip.
+/// The key is matched after removing Unicode format characters and folding
+/// ASCII case, and the strip is a bounded recursion over nested objects and
+/// arrays ([`STRIP_MAX_DEPTH`]), so a wrapped, variant-spelled or invisibly
+/// padded claim cannot smuggle itself past the strip. [`stored_principal`]
+/// reads only the exact top-level key.
 pub fn strip_content_principal(metadata: &mut Value) -> bool {
-    let Some(obj) = metadata.as_object_mut() else {
-        return false;
-    };
-    let variants: Vec<String> = obj
-        .keys()
-        .filter(|k| k.eq_ignore_ascii_case(META_CONTENT_PRINCIPAL))
-        .cloned()
-        .collect();
-    let mut removed = false;
-    for key in variants {
-        removed |= obj.remove(&key).is_some();
-    }
-    if let Some(inner) = obj.get_mut("metadata") {
-        removed |= strip_content_principal(inner);
-    }
-    removed
+    strip_claims(metadata, 0, false)
 }
 
 /// Whether two agent ids name the same principal. A claim that differs from
@@ -280,8 +332,11 @@ fn same_principal(a: &str, b: &str) -> bool {
 /// peer), or `unknown` when no publisher id is usable. Returns `true` when the
 /// metadata changed.
 pub fn sanitize_inbound_principal(metadata: &mut Value, publisher: Option<&str>) -> bool {
+    // Variant spellings and nested copies are never a stored claim: strip
+    // them all, keeping only the exact top-level key to judge below.
+    let stripped = strip_claims(metadata, 0, true);
     let Some(claim) = metadata.get(META_CONTENT_PRINCIPAL) else {
-        return false;
+        return stripped;
     };
     let row_agent = author_of(metadata).map(str::to_string);
     let kept = claim.as_str().and_then(ContentPrincipal::from_stored);
@@ -291,7 +346,7 @@ pub fn sanitize_inbound_principal(metadata: &mut Value, publisher: Option<&str>)
                 .as_deref()
                 .is_some_and(|r| same_principal(r, c.as_str())) =>
         {
-            false
+            stripped
         }
         Some(_) => {
             let replacement = publisher
@@ -303,9 +358,9 @@ pub fn sanitize_inbound_principal(metadata: &mut Value, publisher: Option<&str>)
                     ContentPrincipal::unknown,
                     ContentPrincipal::from_agent_id_or_unknown,
                 );
-            set_content_principal(metadata, Some(&replacement))
+            set_content_principal(metadata, Some(&replacement)) || stripped
         }
-        None => strip_content_principal(metadata),
+        None => strip_content_principal(metadata) || stripped,
     }
 }
 
@@ -591,8 +646,13 @@ pub fn effective_principals_with(
         metadatas.iter().map(|m| explicit_marker(m)).collect();
     let hint = owner_hint.map(str::trim).filter(|h| !h.is_empty());
     let writer = writer.map(str::trim).filter(|w| !w.is_empty());
+    // Only a reserved sentinel is a trusted writer: a caller cannot claim a
+    // reserved id, so a row authored by it is substrate-formed. Any other
+    // writer id is treated as an ordinary (foreign) author (#8443 sec S1).
+    let writer_passed = writer.is_some();
+    let writer = writer.filter(|w| crate::validate::RESERVED_AGENT_IDS.contains(w));
     let owner: Option<String> = hint.map(str::to_string).or_else(|| {
-        if writer.is_some() {
+        if writer_passed {
             return None;
         }
         let mut authors: Vec<&str> = Vec::new();
@@ -629,9 +689,16 @@ pub fn effective_principals_with(
                 );
             }
             match author_of(m) {
-                Some(a) if owner.as_deref() == Some(a) || writer == Some(a) => None,
+                Some(a)
+                    if owner.as_deref().is_some_and(|o| same_principal(o, a))
+                        || writer == Some(a) =>
+                {
+                    None
+                }
                 Some(a) => Some(ContentPrincipal::from_agent_id_or_unknown(a)),
-                None => None,
+                // No (or an empty) author and no marker: whose content this is
+                // is unknowable, so it is never owner content (#8443 sec S4).
+                None => Some(ContentPrincipal::unknown()),
             }
         })
         .collect();
@@ -806,19 +873,130 @@ pub async fn namespace_owner_via_store(
     ctx: &crate::store::CallerContext,
     namespace: &str,
 ) -> Option<String> {
-    let chain = store.build_namespace_chain(namespace).await.ok()?;
+    let chain = match store.build_namespace_chain(namespace).await {
+        Ok(chain) => chain,
+        Err(e) => {
+            tracing::warn!(
+                namespace,
+                error = %e,
+                "role grounding: namespace chain lookup failed; no owner (#8443)"
+            );
+            return None;
+        }
+    };
     for level in chain.iter().rev() {
-        let Ok(Some((standard_id, _parent))) = store.get_namespace_standard(ctx, level).await
-        else {
-            continue;
+        let standard_id = match store.get_namespace_standard(ctx, level).await {
+            Ok(Some((standard_id, _parent))) => standard_id,
+            Ok(None) => continue,
+            Err(e) => {
+                tracing::warn!(
+                    namespace = %level,
+                    error = %e,
+                    "role grounding: namespace standard lookup failed; level skipped (#8443)"
+                );
+                continue;
+            }
         };
         let Ok(standard) = store.get(ctx, &standard_id).await else {
+            tracing::warn!(
+                namespace = %level,
+                "role grounding: namespace standard row unreadable; level skipped (#8443)"
+            );
             continue;
         };
         if let Some(owner) = author_of(&standard.metadata) {
             return Some(owner.to_string());
         }
     }
+    None
+}
+
+/// The patch to write on an optimistic update: a caller `content_principal` the
+/// existing row never had is dropped (the SQL overlay re-applies only an
+/// existing one), so a patch can never introduce a claim.
+pub fn scrub_uninherited_principal<'a>(
+    existing: &Value,
+    patch: &'a Value,
+) -> std::borrow::Cow<'a, Value> {
+    if existing.get(META_CONTENT_PRINCIPAL).is_none() && patch.get(META_CONTENT_PRINCIPAL).is_some()
+    {
+        let mut scrubbed = patch.clone();
+        strip_content_principal(&mut scrubbed);
+        std::borrow::Cow::Owned(scrubbed)
+    } else {
+        std::borrow::Cow::Borrowed(patch)
+    }
+}
+
+/// The principal of a consolidated row. `ns_owner` is `Some` only for a
+/// substrate pass (it writes under its own id, so its hint is the namespace
+/// owner, else the bound identity; a lookup fault warns and folds foreign). A
+/// tenant call (`None`) is hinted by the bound consolidator.
+pub fn fold_consolidated<E: std::fmt::Display>(
+    sources: &[Value],
+    ns_owner: Option<Result<Option<String>, E>>,
+    namespace: &str,
+    consolidator: &str,
+) -> Option<ContentPrincipal> {
+    let refs: Vec<&Value> = sources.iter().collect();
+    match ns_owner {
+        None => fold_metadata(&refs, Some(consolidator)),
+        Some(looked_up) => {
+            let owner = looked_up.unwrap_or_else(|e| {
+                warn_owner_lookup_failed(namespace, &e);
+                None
+            });
+            let hint = substrate_owner_hint(owner, namespace);
+            fold_metadata_with(&refs, hint.as_deref(), Some(consolidator))
+        }
+    }
+}
+
+/// Log a failed namespace-owner lookup. The caller then passes `None` as the
+/// store owner, so [`substrate_owner_hint`] falls back to the bound identity and
+/// finally to the foreign fold (#8443 D): a lookup fault never promotes content.
+pub fn warn_owner_lookup_failed(namespace: &str, error: &dyn std::fmt::Display) {
+    tracing::warn!(
+        namespace,
+        error = %error,
+        "role grounding: namespace owner lookup failed; falling back (#8443)"
+    );
+}
+
+/// Owner hint for a substrate pass (issue #8443, code D). The namespace owner
+/// when a standard names one; else the daemon's bound local identity (the id
+/// the owner's own writes resolve to); else `None` with a warning, so the pass
+/// falls back to a foreign fold (fail-safe demotion). A reserved bound id is
+/// never an owner.
+#[must_use]
+pub fn substrate_owner_hint(ns_owner: Option<String>, namespace: &str) -> Option<String> {
+    substrate_owner_hint_with(
+        ns_owner,
+        namespace,
+        crate::identity::resolve_read_visibility_caller(),
+    )
+}
+
+/// [`substrate_owner_hint`] with the bound identity supplied by the caller.
+#[must_use]
+pub fn substrate_owner_hint_with(
+    ns_owner: Option<String>,
+    namespace: &str,
+    bound: Option<String>,
+) -> Option<String> {
+    if let Some(owner) = ns_owner.filter(|o| !o.trim().is_empty()) {
+        return Some(owner);
+    }
+    if let Some(b) = bound
+        .map(|b| b.trim().to_string())
+        .filter(|b| !b.is_empty() && !crate::validate::RESERVED_AGENT_IDS.contains(&b.as_str()))
+    {
+        return Some(b);
+    }
+    tracing::warn!(
+        namespace,
+        "role grounding: no namespace owner and no bound identity; the pass folds foreign (fail-safe demotion, #8443)"
+    );
     None
 }
 

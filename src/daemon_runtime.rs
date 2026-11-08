@@ -3057,12 +3057,8 @@ pub async fn run(
             let mut so = stdout.lock();
             let mut se = stderr.lock();
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
-            cli::commands::ingest_multistep::cmd_ingest_multistep(
-                &a,
-                app_config,
-                cli_agent_id.as_deref(),
-                &mut out,
-            )
+            let agent = cli_agent_id.as_deref();
+            cli::commands::ingest_multistep::cmd_ingest_multistep(&a, app_config, agent, &mut out)
         }
         Command::KgInvalidate(a) => {
             let stdout = std::io::stdout();

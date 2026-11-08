@@ -344,9 +344,16 @@ impl<'a> PersonaGenerator<'a> {
         // an owner-authored source set is owner content, a foreign author is
         // labelled and stamped. A read fault is no owner (fail closed).
         let writer = self.agent_id();
-        let ns_owner = crate::storage::namespace_owner(self.conn, namespace)
-            .ok()
-            .flatten();
+        let ns_owner = crate::role_grounding::substrate_owner_hint(
+            match crate::storage::namespace_owner(self.conn, namespace) {
+                Ok(owner) => owner,
+                Err(e) => {
+                    crate::role_grounding::warn_owner_lookup_failed(namespace, &e);
+                    None
+                }
+            },
+            namespace,
+        );
         let (grounded_owner, llm_input) = crate::role_grounding::summary_inputs_with(
             &sources,
             ns_owner.as_deref(),

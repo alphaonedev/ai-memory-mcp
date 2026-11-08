@@ -344,6 +344,8 @@ pub fn validate_source(source: &str) -> Result<()> {
 ///   forge a substrate-originated wake.
 /// - `"a2a-hub"` and its `/...` scoped forms → the hub delegation's
 ///   authority domain (#3578), never a wire caller principal.
+/// - `"ai:curator"` → the background passes' writer id (#8443): rows a pass
+///   formed are substrate content, so a wire caller must not claim it.
 /// - `"system"` → `src/handlers/hook_subscribers.rs` (stamped on
 ///   legacy-rewrite rows; also matched as the unowned-marker sentinel
 ///   in cross-tenant gates, so wire spoofing it would let the caller
@@ -359,6 +361,11 @@ pub const RESERVED_AGENT_IDS: &[&str] = &[
     crate::identity::sentinels::GOVERNANCE_INTERNAL,
     crate::identity::sentinels::EMBEDDING_BACKFILL,
     crate::identity::sentinels::WAKE_HUB_PRODUCER,
+    // #8443 (sec S1): the writer id every background pass (curator,
+    // compaction, reflection, persona, autonomy) writes under. A wire caller
+    // that could claim it would have its rows read as the substrate's own
+    // (owner content) by those passes.
+    crate::identity::sentinels::AI_CURATOR,
     crate::identity::hub_delegation::A2A_HUB_SCOPE,
     // #8443: the content-principal words. An agent id spelled like one would
     // read as the owner (or as unknown/mixed) in `content_principal`.

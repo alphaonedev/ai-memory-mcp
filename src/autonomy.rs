@@ -679,9 +679,16 @@ fn consolidate_cluster(
     // owner-authored cluster is owner content, a foreign single author is
     // labelled and stamped, not adopted as the owner.
     let curator = crate::identity::sentinels::AI_CURATOR;
-    let ns_owner = crate::storage::namespace_owner(conn, &cluster[0].namespace)
-        .ok()
-        .flatten();
+    let ns_owner = crate::role_grounding::substrate_owner_hint(
+        match crate::storage::namespace_owner(conn, &cluster[0].namespace) {
+            Ok(owner) => owner,
+            Err(e) => {
+                crate::role_grounding::warn_owner_lookup_failed(&cluster[0].namespace, &e);
+                None
+            }
+        },
+        &cluster[0].namespace,
+    );
     let (owner, input) =
         crate::role_grounding::summary_inputs_with(cluster, ns_owner.as_deref(), Some(curator));
     let summary = llm.summarize_memories_grounded(owner.as_deref(), &input)?;

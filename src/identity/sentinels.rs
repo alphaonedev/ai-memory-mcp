@@ -75,7 +75,8 @@ pub const EMBEDDING_BACKFILL: &str = "embedding-backfill";
 /// itself (NOT a privileged carve-out — unlike [`AI_HTTP_INTERNAL`]).
 pub const AI_HTTP: &str = "ai:http";
 
-/// Agent id the curator daemon writes with.
+/// Agent id the curator daemon writes with. Reserved (#8443): a wire caller
+/// cannot claim it, so rows stored under it are always substrate-formed.
 pub const AI_CURATOR: &str = "ai:curator";
 
 /// #1727 (v0.8.0) — principal label for an admin/operator CLI context
@@ -136,6 +137,7 @@ mod tests {
             GOVERNANCE_INTERNAL,
             EMBEDDING_BACKFILL,
             WAKE_HUB_PRODUCER,
+            AI_CURATOR,
         ] {
             assert!(
                 crate::validate::RESERVED_AGENT_IDS.contains(&s),

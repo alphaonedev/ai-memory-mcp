@@ -810,9 +810,11 @@ pub async fn run_reflection_pass(
             // stable across re-runs on the same input (helps debugging).
             cluster.sort_by(|a, b| a.id.cmp(&b.id));
 
-            let ns_owner =
+            let ns_owner = crate::role_grounding::substrate_owner_hint(
                 crate::role_grounding::namespace_owner_via_store(store, &pass.ctx, ns.as_str())
-                    .await;
+                    .await,
+                ns.as_str(),
+            );
             let summary = match pass.summarize_for(&cluster, ns_owner.as_deref()) {
                 Ok(s) => s,
                 Err(e) => {

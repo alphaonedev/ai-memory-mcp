@@ -428,6 +428,51 @@ async fn sal_consolidate_of_owner_authored_sources_stays_owner_content_8443() {
     );
 }
 
+/// Round 5 (D): a substrate pass with no namespace standard and no bound local
+/// identity has no owner to compare against. It folds the sources as foreign
+/// (here the one publisher), never promoting them to owner content.
+#[tokio::test]
+async fn sal_consolidate_without_any_owner_folds_foreign_d_8443() {
+    if std::env::var_os("AI_MEMORY_AGENT_ID").is_some() {
+        eprintln!("skipping: a bound local identity is set");
+        return;
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = open_store(&dir);
+    let admin = CallerContext::for_admin("ai:curator");
+    let ns = "tenant/no-owner";
+    let mut ids = Vec::new();
+    for i in 0..2 {
+        let id = store
+            .store(
+                &admin,
+                &mem(OWNER, ns, &format!("s{i}"), "a source body", json!({})),
+            )
+            .await
+            .expect("source");
+        ids.push(id);
+    }
+    let merged = store
+        .consolidate(
+            &admin,
+            &ids,
+            "merged",
+            "curated summary",
+            ns,
+            &Tier::Mid,
+            "curator",
+            "ai:curator",
+        )
+        .await
+        .expect("consolidate");
+    let row = store.get(&admin, &merged).await.expect("get");
+    assert_eq!(
+        principal(&row),
+        Some(OWNER),
+        "no owner resolves: foreign fold"
+    );
+}
+
 /// Live-Postgres twins of the cells above (code LOW C, INFO-1, MEDIUM A and
 /// the PG half of MEDIUM-3). Each skips when `AI_MEMORY_TEST_POSTGRES_URL` is
 /// unset.
@@ -691,6 +736,46 @@ mod pg {
                 .await
                 .as_deref(),
             Some("mixed")
+        );
+    }
+
+    #[tokio::test]
+    async fn pg_consolidate_without_any_owner_folds_foreign_d_8443() {
+        if std::env::var_os("AI_MEMORY_AGENT_ID").is_some() {
+            return;
+        }
+        let Some(store) = connect().await else { return };
+        let admin = CallerContext::for_admin("ai:curator");
+        let ns = ns();
+        let mut ids = Vec::new();
+        for i in 0..2 {
+            let id = store
+                .store(
+                    &admin,
+                    &mem(OWNER, &ns, &format!("s{i}"), "a source body", json!({})),
+                )
+                .await
+                .expect("source");
+            ids.push(id);
+        }
+        let merged = store
+            .consolidate(
+                &admin,
+                &ids,
+                "merged",
+                "curated summary",
+                &ns,
+                &Tier::Mid,
+                "curator",
+                "ai:curator",
+            )
+            .await
+            .expect("consolidate");
+        let row = store.get(&admin, &merged).await.expect("get");
+        assert_eq!(
+            principal(&row),
+            Some(OWNER),
+            "no owner resolves: foreign fold"
         );
     }
 }

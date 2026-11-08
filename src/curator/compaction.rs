@@ -665,12 +665,15 @@ impl<'a> ConsolidationPass<'a> {
                 continue;
             }
 
-            let ns_owner = crate::role_grounding::namespace_owner_via_store(
-                self.store,
-                &self.ctx,
+            let ns_owner = crate::role_grounding::substrate_owner_hint(
+                crate::role_grounding::namespace_owner_via_store(
+                    self.store,
+                    &self.ctx,
+                    &members[0].namespace,
+                )
+                .await,
                 &members[0].namespace,
-            )
-            .await;
+            );
             let summary = match self.summarize_for(&members, ns_owner.as_deref()) {
                 Ok(s) => s,
                 Err(e) => {

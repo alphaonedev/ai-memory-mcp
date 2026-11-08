@@ -49,7 +49,16 @@ capabilities:
      autonomy) passes the NAMESPACE OWNER as the owner hint and the id it
      writes under only as the writer, so a cluster written by one foreign
      author folds to that author instead of the writer and an owner-authored
-     cluster stays owner content.
+     cluster stays owner content. Only a RESERVED id (such as `ai:curator`,
+     which wire callers cannot claim) counts as a trusted writer; any other
+     writer id is an ordinary author. When no namespace standard names an
+     owner, the owner is the daemon's bound local identity
+     (`AI_MEMORY_AGENT_ID`); with neither, the pass logs a warning and folds
+     the rows as foreign (a fail-safe demotion, never a promotion). A row with
+     no usable author is `unknown`, never owner content. The strip matches the
+     claim key after removing invisible format characters and folding ASCII
+     case, and walks nested objects and arrays to a fixed depth
+     (`STRIP_MAX_DEPTH`); only the exact top-level key is ever read.
    - Each formation prompt that embeds foreign text binds its frame header,
      label line and closing marker to a per-prompt random 16-hex token; a
      source body that reproduces a frame header, label or closing marker lacks

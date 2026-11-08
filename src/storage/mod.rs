@@ -4398,26 +4398,10 @@ pub fn update_with_expected_version(
         );
     }
     let metadata = attest_reconciled.as_ref().unwrap_or(metadata);
-    // #8443 — the SQL below overlays only the EXISTING row's reserved keys onto
-    // the patch, so a `content_principal` the row never had would survive from
-    // the caller's patch. The principal is server-derived: drop an incoming-only
-    // key here (an existing one is re-applied by the overlay).
-    let principal_scrubbed;
-    let metadata = if existing
-        .metadata
-        .get(crate::role_grounding::META_CONTENT_PRINCIPAL)
-        .is_none()
-        && metadata
-            .get(crate::role_grounding::META_CONTENT_PRINCIPAL)
-            .is_some()
-    {
-        let mut scrubbed = metadata.clone();
-        crate::role_grounding::strip_content_principal(&mut scrubbed);
-        principal_scrubbed = scrubbed;
-        &principal_scrubbed
-    } else {
-        metadata
-    };
+    // #8443 — drop a caller `content_principal` the row never had (the SQL
+    // overlay re-applies only an existing one).
+    let scrubbed = crate::role_grounding::scrub_uninherited_principal(&existing.metadata, metadata);
+    let metadata = &*scrubbed;
 
     // #1451 (SEC, HIGH) — substrate governance pre-write gate on the
     // optimistic-update path. The insert/supersede/consolidate/restore
@@ -10865,24 +10849,15 @@ pub fn consolidate_with_expected_versions(
             "agent_id".to_string(),
             serde_json::Value::String(consolidator_agent_id.to_string()),
         );
-        // #8443 — whose content the merged row is: owner when every source is
-        // owner content (no key), the one publisher when all foreign sources
-        // share it, otherwise `mixed`.
-        // A SUBSTRATE pass writes under its own id, so its hint is the
-        // NAMESPACE OWNER and its own id is only the author of record (code
-        // M1); a tenant call's hint is the bound consolidator.
-        let source_refs: Vec<&serde_json::Value> = source_metas.iter().collect();
-        let folded = if substrate_authored {
-            let ns_owner = namespace_owner(conn, namespace).ok().flatten();
-            crate::role_grounding::fold_metadata_with(
-                &source_refs,
-                ns_owner.as_deref(),
-                Some(consolidator_agent_id),
-            )
-        } else {
-            crate::role_grounding::fold_metadata(&source_refs, Some(consolidator_agent_id))
-        };
-        if let Some(folded) = folded {
+        // #8443 — whose content the merged row is (owner / the one publisher /
+        // `mixed`); a substrate pass takes the namespace owner as its hint.
+        let ns_owner = substrate_authored.then(|| namespace_owner(conn, namespace));
+        if let Some(folded) = crate::role_grounding::fold_consolidated(
+            &source_metas,
+            ns_owner,
+            namespace,
+            consolidator_agent_id,
+        ) {
             merged_metadata.insert(
                 crate::role_grounding::META_CONTENT_PRINCIPAL.to_string(),
                 serde_json::Value::String(folded.as_str().to_string()),

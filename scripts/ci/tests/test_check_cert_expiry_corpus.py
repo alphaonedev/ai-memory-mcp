@@ -1062,6 +1062,63 @@ class Cells(CorpusBase):
         self.t.expect_green("t", "unrelated change over a VOID banner", s.repo, void, over)
         self.settle()
 
+    @staticmethod
+    def ledger_extra(entry_path, a, b, section="## 7. §5.4(7) — expiry", rng=True):
+        """A section 7 firing-ledger entry (or a look-alike) appended to the cert doc."""
+        span = f" Range `{a[:9]}..{b[:9]}`." if rng else ""
+        return (
+            f"\n{section}\n\n**Re-cert trigger - FIRED by #8443 (`{entry_path}`, "
+            f"2026-11-01).**{span}\n\n## 8. Current determination\n\nHistory.\n"
+        )
+
+    def ledger_case(self, extra):
+        """VOID base, then a second wire change keeping VOID and adding `extra`."""
+        s = self.scene()
+        void = self.void_commit(s)
+        s.fx.write(MOD_RS, "// mutate again\n", append=True)
+        s.fx.banner("VOID", s.genesis, extra(s, void))
+        return s, void, s.fx.commit([MOD_RS, CERT_DOC], "wire change + VOID-to-VOID cert edit")
+
+    @expect(GREEN)
+    def cell_ledger1_void_to_void_with_ledger_entry_green(self):
+        s, void, head = self.ledger_case(lambda s, v: self.ledger_extra(MOD_RS, s.genesis, v))
+        self.t.expect_green("ledger1", "VOID-to-VOID edit adding a section 7 ledger entry",
+                            s.repo, void, head, [
+            ("section 7 firing-ledger entry", "did not name the ledger-entry acceptance")])
+        self.settle()
+
+    @expect(GREEN)
+    def cell_ledger2_void_to_void_without_ledger_red(self):
+        s, void, head = self.ledger_case(lambda s, v: "Another prose edit.\n")
+        self.t.expect_red("ledger2", "VOID-to-VOID edit without a ledger entry", s.repo, void,
+                          head, [("an incidental edit is not a re-issue", "did not stay rc 1")])
+        self.settle()
+
+    @expect(GREEN)
+    def cell_ledger3_ledger_entry_naming_no_watched_path_red(self):
+        s, void, head = self.ledger_case(
+            lambda s, v: self.ledger_extra("src/unrelated.rs", s.genesis, v))
+        self.t.expect_red("ledger3", "ledger entry naming a path the change did not touch",
+                          s.repo, void, head, [
+            ("an incidental edit is not a re-issue", "did not stay rc 1")])
+        self.settle()
+
+    @expect(GREEN)
+    def cell_ledger4_ledger_entry_without_range_red(self):
+        s, void, head = self.ledger_case(
+            lambda s, v: self.ledger_extra(MOD_RS, s.genesis, v, rng=False))
+        self.t.expect_red("ledger4", "ledger entry naming no commit range", s.repo, void, head, [
+            ("an incidental edit is not a re-issue", "did not stay rc 1")])
+        self.settle()
+
+    @expect(GREEN)
+    def cell_ledger5_entry_outside_section7_red(self):
+        s, void, head = self.ledger_case(
+            lambda s, v: self.ledger_extra(MOD_RS, s.genesis, v, section="## 6. Not covered"))
+        self.t.expect_red("ledger5", "ledger-shaped entry outside section 7", s.repo, void, head, [
+            ("an incidental edit is not a re-issue", "did not stay rc 1")])
+        self.settle()
+
     def stale_live(self, s):
         drifted = s.edit(MOD_RS, "// mutate\n", "earlier: wire change, no re-issue", append=True)
         stale = s.edit(UNRELATED_RS, "// unrelated\n", "later: unrelated over stale LIVE", append=True)

@@ -805,7 +805,12 @@ pub fn run(
                 );
                 emit_status_header(out, &manifest, format)?;
             }
-            emit_toon(out, &mems, redact_titles)?;
+            emit_toon(
+                out,
+                &mems,
+                redact_titles,
+                crate::identity::resolve_read_visibility_caller().as_deref(),
+            )?;
         }
     }
 
@@ -1102,7 +1107,12 @@ fn emit_json_with_status(
     Ok(())
 }
 
-fn emit_toon(out: &mut CliOutput<'_>, mems: &[ClusteredMemory], redact_titles: bool) -> Result<()> {
+fn emit_toon(
+    out: &mut CliOutput<'_>,
+    mems: &[ClusteredMemory],
+    redact_titles: bool,
+    reader: Option<&str>,
+) -> Result<()> {
     // Reuse the canonical TOON serializer used by `memory_recall` so boot
     // output is byte-identical to a recall response on the wire format.
     // `memories_to_toon` takes the `{memories: [...], count: N}` shape.
@@ -1111,7 +1121,7 @@ fn emit_toon(out: &mut CliOutput<'_>, mems: &[ClusteredMemory], redact_titles: b
         "memories": rendered,
         "count": rendered.len(),
     });
-    let toon_str = toon::memories_to_toon(&body, true);
+    let toon_str = toon::memories_to_toon_for(&body, true, reader);
     writeln!(out.stdout, "{toon_str}")?;
     Ok(())
 }

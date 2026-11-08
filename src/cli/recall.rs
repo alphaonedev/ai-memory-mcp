@@ -721,7 +721,7 @@ pub(crate) fn run_with_embedder(
             writeln!(
                 out.stdout,
                 "{}",
-                crate::toon::memories_to_toon(&body, false)
+                crate::toon::memories_to_toon_for(&body, false, vis_caller.as_deref())
             )?;
         } else {
             writeln!(out.stdout, "{}", serde_json::to_string(&body)?)?;

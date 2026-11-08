@@ -2084,12 +2084,15 @@ STATUS=VOID — the doc makes no live claim; nothing to hold it to`. The §8
 statuses below are historical records of earlier binds, not a live claim.
 
 **Re-cert trigger - FIRED by #8443 (`src/handlers/federation_receive.rs`,
-2026-11-01; PR #8449).** One §7-watched path changed. The receive loop now
+2026-11-01; PR #8449, re-cut as the r5 PR over the chain range
+`3d256ea0b..80ee63f3f`).** One §7-watched path changed. The receive loop now
 sanitises a `content_principal` claim on every inbound row
 (`role_grounding::sanitize_inbound_principal`): a claim may demote content to
 a valid non-owner principal but never promote it, and a claim that names the
-row's own author or the receiving agent (compared without regard to letter
-case) is replaced by the authenticated peer. No `AI_MEMORY_FED_*` identifier
+row's own author (compared without regard to letter case) is replaced by the
+authenticated peer. A claim that names a local reader is not rewritten on
+receive: it is kept as a valid foreign principal and is read as `unknown` at
+read time, relative to that reader. No `AI_MEMORY_FED_*` identifier
 is added, removed or renamed, and no wire format, signature check,
 quarantine or accept/refuse rule changes. The posture is strictly MORE
 protective, never weaker.

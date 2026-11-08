@@ -751,8 +751,12 @@ trust-all reads.
   authenticated caller, never read from a request: any caller-supplied value is
   stripped at every ingress (MCP store, HTTP create, SAL store and store_batch,
   federation receive may only demote to a valid non-owner principal, and a claim
-  naming the receiver, the row's own author or the share target (compared without
-  regard to letter case) is replaced by the publisher, else `unknown`; an import
+  naming the row's own author or the share target (compared without regard to
+  letter case) is replaced by the publisher, else `unknown`, while a claim naming
+  a local reader is kept and read as `unknown` at read time; `ai:curator` is a
+  reserved writer id, a substrate pass takes its owner from the namespace
+  standard, else from the bound local identity, else folds foreign with a
+  warning; an import
   whose bundle `agent_id` is the importing caller is stamped `unknown`). The value is
   the publisher agent id, or `unknown`, stamped on content that did not come from
   the owner's own turn (`memory_share` copies, `memory_notify` deliveries,
