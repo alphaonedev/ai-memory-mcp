@@ -401,6 +401,8 @@ fn generate_tls_test_pki() -> TlsTestPki {
         "127.0.0.1".to_string(),
         "::1".to_string(),
         "localhost".to_string(),
+        "pin-test.invalid".to_string(),
+        "pin-test.invalid.".to_string(),
     ])
     .expect("test leaf params");
     let leaf_cert = leaf_params

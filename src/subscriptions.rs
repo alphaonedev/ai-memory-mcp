@@ -36,7 +36,9 @@ pub mod audit_status;
 pub mod scan_failure; // #7366 failed-lookup retry + DLQ record
 // #3979 — admitted-but-not-started deliveries, DLQ-recorded at the drain deadline.
 mod unstarted;
-use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
+#[cfg(not(test))]
+use std::net::ToSocketAddrs;
+use std::net::{IpAddr, Ipv4Addr};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -1575,6 +1577,7 @@ pub fn prewarm_dispatch_tls() {
         let _ = std::thread::spawn(|| {
             if let Err(e) = reqwest::blocking::Client::builder()
                 .timeout(ACK_TIMEOUT)
+                .no_proxy()
                 .build()
             {
                 tracing::warn!("webhook dispatch TLS warm-up failed: {e}");
@@ -1711,6 +1714,8 @@ fn send(
     // like any other non-2xx.
     let mut builder = reqwest::blocking::Client::builder()
         .timeout(ACK_TIMEOUT)
+        // #6372: a proxy would resolve the host again, bypassing the DNS pin.
+        .no_proxy()
         .redirect(reqwest::redirect::Policy::none());
     // v1.0.0 #3705 — a receiver behind a private PKI: the operator-installed
     // root (`[subscriptions] ca_cert`) is trusted in addition to the public
@@ -2157,8 +2162,12 @@ fn validate_url_dns_with(
              AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL=1 to revert)"
         ));
     }
-    let addrs: Vec<std::net::SocketAddr> = match resolv_target.to_socket_addrs() {
-        Ok(iter) => iter.collect(),
+    #[cfg(test)]
+    let resolution = webhook_ssrf_8203_tests::resolve(&resolv_target);
+    #[cfg(not(test))]
+    let resolution = resolv_target.to_socket_addrs().map(Iterator::collect);
+    let addrs: Vec<std::net::SocketAddr> = match resolution {
+        Ok(addrs) => addrs,
         Err(e) => {
             let fail_open = ssrf_dns_fail_open();
             if fail_open {
@@ -2327,9 +2336,13 @@ fn validate_url_with(url: &str, allow_loopback: bool) -> Result<()> {
 pub(crate) fn normalize_ip(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V6(v6) => {
-            let canonical = v6.to_canonical();
-            if matches!(canonical, IpAddr::V4(_)) {
-                return canonical;
+            // #6687: preserve the IPv6 meanings of :: and ::1, but classify
+            // IPv4-compatible and mapped addresses by the embedded IPv4 value.
+            if !v6.is_unspecified()
+                && !v6.is_loopback()
+                && let Some(v4) = v6.to_ipv4()
+            {
+                return IpAddr::V4(v4);
             }
             let segs = v6.segments();
             if segs[0] == 0x0064
@@ -2836,6 +2849,9 @@ fn record_dispatch(db_path: &std::path::Path, sub_id: &str, correlation_id: &str
 fn record_dispatch_with_conn(conn: &Connection, sub_id: &str, correlation_id: &str, ok: bool) {
     audit_status::persist_dispatch_counter(conn, sub_id, correlation_id, ok);
 }
+
+#[cfg(test)]
+mod webhook_ssrf_8203_tests;
 
 #[cfg(test)]
 mod tests {

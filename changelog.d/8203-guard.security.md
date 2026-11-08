@@ -1,0 +1,1 @@
+Webhook dispatch ignores environment proxies and classifies IPv4-compatible IPv6 targets by their embedded address; default-feature SSRF tests and send-level DNS-pin regression tests now cover these controls (#8203, #6372, #6685, #6687, #6860).
