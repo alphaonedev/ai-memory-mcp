@@ -376,7 +376,8 @@ fn issue_8654_live_stderr_write_error_leaves_credit_for_exit() {
         // were opened first and stay alive until stderr has been restored.
         assert_eq!(
             unsafe { libc::dup2(read_only.as_raw_fd(), libc::STDERR_FILENO) },
-            libc::STDERR_FILENO
+            libc::STDERR_FILENO,
+            "live write-error fixture must redirect stderr to the read-only descriptor"
         );
         let live = std::io::stderr()
             .as_fd()
@@ -385,14 +386,25 @@ fn issue_8654_live_stderr_write_error_leaves_credit_for_exit() {
         let failure = std::fs::File::from(live)
             .write_all(b"probe")
             .expect_err("live stderr rejects writes");
-        assert_eq!(failure.raw_os_error(), Some(libc::EBADF));
+        assert_eq!(
+            failure.raw_os_error(),
+            Some(libc::EBADF),
+            "live read-only stderr must reject writes with EBADF"
+        );
         let opened = catch_unwind(AssertUnwindSafe(|| super::open_frame(&conn)));
         restore
             .restore()
             .expect("restore stderr before checking credit");
-        assert_eq!(opened.is_err(), cfg!(debug_assertions));
+        assert_eq!(
+            opened.is_err(),
+            cfg!(debug_assertions),
+            "stale frame detection must unwind only when debug assertions are enabled"
+        );
         if let Ok(frame_id) = opened {
-            assert!(super::settle_frame(&conn, frame_id, false).is_empty());
+            assert!(
+                super::settle_frame(&conn, frame_id, false).is_empty(),
+                "the new frame after a failed report must contain no deferred escalations"
+            );
         }
         super::TXN_FRAMES.with(|frames| {
             assert_eq!(
@@ -409,7 +421,10 @@ fn issue_8654_live_stderr_write_error_leaves_credit_for_exit() {
     }) else {
         return;
     };
-    assert!(!stderr.lines().any(|line| line.starts_with(OPEN_REPORT)));
+    assert!(
+        !stderr.lines().any(|line| line.starts_with(OPEN_REPORT)),
+        "a failed live write must not emit an open-time report: {stderr}"
+    );
     assert!(stderr.contains("thread exited with 1 unreported deferred escalation(s) in 1 unsettled escalation frame(s)"),
         "the failed live write must remain reportable after stderr restoration: {stderr}");
 }
@@ -472,7 +487,10 @@ fn issue_8654_stderr_lock_is_held_through_raw_write() {
     }) else {
         return;
     };
-    assert!(stderr.lines().any(|line| line.starts_with(OPEN_REPORT)));
+    assert!(
+        stderr.lines().any(|line| line.starts_with(OPEN_REPORT)),
+        "the completed raw write must emit an open-time report: {stderr}"
+    );
 }
 
 #[test]
