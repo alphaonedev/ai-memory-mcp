@@ -762,7 +762,8 @@ trust-all reads.
   the owner's own turn (`memory_share` copies, `memory_notify` deliveries,
   untrusted `import`, mined transcripts, atoms of foreign sources); `mixed` after a
   consolidation folds foreign and owner sources. `owner`, `unknown` and `mixed`
-  are reserved agent ids. Owner-direct rows carry no key. An absent key is read
+  are ordinary agent ids; a writer using one is recorded as `unknown`, and
+  principals compare exactly. Owner-direct rows carry no key. An absent key is read
   relative to the owner: a row whose `agent_id` differs from the consolidating
   owner is foreign under its author whether or not it carries a key, and with no
   owner hint two or more authors fold to `mixed`. A background pass (consolidate,

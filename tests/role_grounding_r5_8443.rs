@@ -244,16 +244,18 @@ fn absent_or_empty_author_is_unknown_never_owner_s4_8443() {
 }
 
 #[test]
-fn author_case_variant_of_the_owner_stays_owner_content_i1_8443() {
+fn author_case_variant_of_the_owner_is_foreign_s_m1_8443() {
+    // Principal comparison is exact (#8443 sec M1): a case variant is a
+    // different agent id, so its rows are foreign under that id.
     let row = json!({"agent_id": "AI:Owner"});
     assert_eq!(
         principals(std::slice::from_ref(&row), Some(OWNER), None),
-        vec![None]
+        vec![Some("AI:Owner".to_string())]
     );
     let row = json!({"agent_id": OWNER});
     assert_eq!(
         principals(std::slice::from_ref(&row), Some("AI:OWNER"), None),
-        vec![None]
+        vec![Some(OWNER.to_string())]
     );
 }
 
@@ -434,8 +436,9 @@ fn toon_cell_renders_the_effective_principal_per_reader_sec_i1_8443() {
         principal_cell(&toon_row(OTHER, Some(OWNER), Some("ai:third"))),
         "ai\\:owner"
     );
-    // No reader: a lone author is the owner; a marker is shown as stored.
-    assert_eq!(principal_cell(&toon_row(OWNER, None, None)), "");
+    // No reader: there is no owner (#8443 sec M2), so even a lone author is
+    // named; a marker is shown as stored.
+    assert_eq!(principal_cell(&toon_row(OWNER, None, None)), "ai\\:owner");
     assert_eq!(
         principal_cell(&toon_row(OTHER, Some("ai:pub"), None)),
         "ai\\:pub"

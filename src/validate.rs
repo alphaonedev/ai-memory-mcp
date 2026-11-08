@@ -367,11 +367,10 @@ pub const RESERVED_AGENT_IDS: &[&str] = &[
     // (owner content) by those passes.
     crate::identity::sentinels::AI_CURATOR,
     crate::identity::hub_delegation::A2A_HUB_SCOPE,
-    // #8443: the content-principal words. An agent id spelled like one would
-    // read as the owner (or as unknown/mixed) in `content_principal`.
-    crate::role_grounding::PRINCIPAL_OWNER,
-    crate::role_grounding::PRINCIPAL_UNKNOWN,
-    crate::role_grounding::PRINCIPAL_MIXED,
+    // #8443 (sec M4): the content-principal words `owner` / `unknown` /
+    // `mixed` are NOT reserved agent ids. An agent named `owner` stays a valid
+    // writer; the grounding seam (`ContentPrincipal::from_agent_id_or_unknown`)
+    // records such an author as `unknown`, never as the role it spells.
 ];
 
 /// Shape-only validation for an agent identifier — the pre-#977
@@ -460,16 +459,33 @@ pub fn validate_agent_id(agent_id: &str) -> Result<()> {
     let hub_scoped_form = agent_id
         .strip_prefix(crate::identity::hub_delegation::A2A_HUB_SCOPE)
         .is_some_and(|suffix| suffix.starts_with('/'));
-    if RESERVED_AGENT_IDS.contains(&agent_id)
-        || hub_scoped_form
-        || crate::role_grounding::is_reserved_principal_word(agent_id)
-    {
+    if RESERVED_AGENT_IDS.contains(&agent_id) || hub_scoped_form {
         bail!(
             "agent_id '{agent_id}' is reserved for internal use and cannot be supplied by wire \
              callers"
         );
     }
     Ok(())
+}
+
+/// The ONE writer-id check for a reflection, shared by the sqlite and postgres
+/// reflect paths (issue #8443, code C-1). The substrate curator writes its
+/// reflections under the reserved [`crate::identity::sentinels::AI_CURATOR`]
+/// id, so an `internal` write (an admin / substrate context: sqlite's
+/// unscoped `caller == None`, postgres' `ctx.bypass_visibility`) naming
+/// exactly that id is shape-checked only. Every other write, and every
+/// non-internal write naming it, runs the full wire [`validate_agent_id`]
+/// and is refused (fail closed).
+///
+/// # Errors
+///
+/// Returns the [`validate_agent_id`] error (or the shape error) unchanged.
+pub fn validate_reflect_writer(agent_id: &str, internal: bool) -> Result<()> {
+    if internal && agent_id == crate::identity::sentinels::AI_CURATOR {
+        validate_agent_id_shape(agent_id)
+    } else {
+        validate_agent_id(agent_id)
+    }
 }
 
 /// Fixed refusal text for an invalid notify recipient (#4338). It never

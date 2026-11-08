@@ -186,7 +186,7 @@ fn no_owner_hint_never_promotes_a_lone_author_s_m2_8443() {
     );
 }
 
-/// consolidate.rs:108 and session_start.rs:151 call `summary_inputs_for`
+/// `consolidate.rs:108` and `session_start.rs:151` call `summary_inputs_for`
 /// with the read caller, which is `None` under the local-operator binding.
 #[test]
 fn summary_inputs_without_a_caller_name_no_owner_s_m2_8443() {
@@ -241,7 +241,7 @@ fn toon_cell(author: &str, reader: Option<&str>) -> String {
         .to_string()
 }
 
-/// toon.rs:257: a row rendered for no reader names its author.
+/// `toon.rs:257`: a row rendered for no reader names its author.
 #[test]
 fn toon_row_for_no_reader_names_the_lone_author_s_m2_8443() {
     assert_eq!(toon_cell(LONE, None), "ai\\:lone-author");
@@ -518,8 +518,7 @@ mod sal {
             let ns = ns();
             let src = mem("ai:someone", &ns, "src", "a source row");
             let id = store.store(&admin, &src).await.expect("store source");
-            let out = store
-                .reflect(&admin, &reflect_input(&id, &ns, CURATOR), None)
+            let out = MemoryStore::reflect(&store, &admin, &reflect_input(&id, &ns, CURATOR), None)
                 .await
                 .expect("the substrate curator reflects under its own id");
             assert_eq!(out.reflects_on, vec![id]);
@@ -536,9 +535,7 @@ mod sal {
                 .expect("store source");
             let wire = CallerContext::for_agent(CURATOR);
             assert_reserved_refusal(
-                store
-                    .reflect(&wire, &reflect_input(&id, &ns, CURATOR), None)
-                    .await,
+                MemoryStore::reflect(&store, &wire, &reflect_input(&id, &ns, CURATOR), None).await,
             );
         }
     }

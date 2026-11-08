@@ -343,13 +343,21 @@ fn principal_constructor_refuses_reserved_and_malformed_ids_8443() {
 }
 
 #[test]
-fn reserved_principal_words_are_refused_as_agent_ids_8443() {
-    for word in ["owner", "unknown", "mixed"] {
-        assert!(RESERVED_AGENT_IDS.contains(&word), "{word} is reserved");
-        assert!(validate_agent_id(word).is_err(), "{word} refused");
+fn principal_words_are_ordinary_agent_ids_s_m4_8443() {
+    // S-M4: the role words are not reserved; a writer using one is recorded
+    // as `unknown` at the grounding seam instead.
+    for word in ["owner", "unknown", "mixed", "Owner"] {
+        assert!(
+            !RESERVED_AGENT_IDS.contains(&word),
+            "{word} is not reserved"
+        );
+        assert!(validate_agent_id(word).is_ok(), "{word} accepted");
     }
-    assert!(validate_agent_id("Owner").is_err(), "case-insensitive");
     assert!(validate_agent_id(OWNER).is_ok());
+    assert!(
+        validate_agent_id("ai:curator").is_err(),
+        "the substrate writer stays reserved for wire callers"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -441,11 +449,10 @@ fn fold_without_an_owner_hint_fails_closed_on_two_authors_8443() {
     let b = json!({"agent_id": ATTACKER});
     let folded = fold_metadata(&[&a, &b], None).expect("not owner content");
     assert_eq!(folded.as_str(), "mixed");
-    let single = fold_metadata(&[&a, &a], None);
-    assert!(
-        single.is_none(),
-        "one author among unmarked rows is the owner"
-    );
+    // S-M2: with no bound owner a lone author is never guessed to be the
+    // owner; the fold keeps that author's principal.
+    let single = fold_metadata(&[&a, &a], None).expect("a lone author is not the owner");
+    assert_eq!(single.as_str(), OWNER);
 }
 
 // ---------------------------------------------------------------------------
@@ -863,7 +870,20 @@ fn toon_principal_cell_is_in_the_header_column_8443() {
     .expect("insert own");
     let resp = recall_value(&conn);
     for compact in [true, false] {
-        let toon = memories_to_toon(&resp, compact);
+        // S-M2: without a reader no row is guessed to be owner content, so
+        // the owner-empty cell is checked for the owner as reader.
+        let anonymous = memories_to_toon(&resp, compact);
+        let (anon_cols, anon_own) = toon_row(&anonymous, "own digest");
+        let anon_at = anon_cols
+            .iter()
+            .position(|c| c == KEY)
+            .expect("principal column");
+        assert_eq!(
+            anon_own[anon_at],
+            OWNER.replace(':', "\\:"),
+            "no reader: the author is shown (compact={compact})"
+        );
+        let toon = memories_to_toon_for(&resp, compact, Some(OWNER));
         let (cols, foreign) = toon_row(&toon, "digest");
         let at = cols
             .iter()

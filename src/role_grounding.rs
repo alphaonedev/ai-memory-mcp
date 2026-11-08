@@ -316,12 +316,22 @@ pub fn strip_content_principal(metadata: &mut Value) -> bool {
     strip_claims(metadata, 0, false)
 }
 
-/// Whether two agent ids name the same principal. A claim that differs from
-/// the receiver or owner only in letter case can only be an imitation of it
-/// (precedent: [`is_reserved_principal_word`]), so the strip filters compare
-/// without regard to case.
-fn same_principal(a: &str, b: &str) -> bool {
-    a.eq_ignore_ascii_case(b)
+/// Whether two agent ids name the same principal: byte-equal, no case
+/// folding (issue #8443, sec M1). The store and every authz gate compare
+/// `agent_id` exactly, so `AI:Owner` is a different agent from `ai:owner` and
+/// never owns its rows. Every ownership or author decision uses this compare.
+#[must_use]
+pub fn same_principal(a: &str, b: &str) -> bool {
+    a == b
+}
+
+/// Whether a stored or claimed principal `claim` imitates `principal` (equal
+/// without regard to ASCII case; precedent [`is_reserved_principal_word`]).
+/// Used ONLY where a match DEMOTES content (a claim naming its own receiver or
+/// owner is replaced by `unknown` or the publisher), never to grant
+/// ownership, so a case-variant spelling can only lose standing (fail closed).
+fn imitates_principal(claim: &str, principal: &str) -> bool {
+    claim.eq_ignore_ascii_case(principal)
 }
 
 /// Sanitise a `content_principal` on an inbound row from a trusted peer, where
@@ -344,7 +354,7 @@ pub fn sanitize_inbound_principal(metadata: &mut Value, publisher: Option<&str>)
         Some(c)
             if !row_agent
                 .as_deref()
-                .is_some_and(|r| same_principal(r, c.as_str())) =>
+                .is_some_and(|r| imitates_principal(c.as_str(), r)) =>
         {
             stripped
         }
@@ -352,7 +362,10 @@ pub fn sanitize_inbound_principal(metadata: &mut Value, publisher: Option<&str>)
             let replacement = publisher
                 .map(str::trim)
                 .filter(|p| {
-                    !p.is_empty() && !row_agent.as_deref().is_some_and(|r| same_principal(r, p))
+                    !p.is_empty()
+                        && !row_agent
+                            .as_deref()
+                            .is_some_and(|r| imitates_principal(p, r))
                 })
                 .map_or_else(
                     ContentPrincipal::unknown,
@@ -387,7 +400,7 @@ pub fn stamp_content_principal_for_receiver(
     receiver: &str,
 ) -> bool {
     match stored_principal(metadata) {
-        Some(existing) if !same_principal(existing.as_str(), receiver) => false,
+        Some(existing) if !imitates_principal(existing.as_str(), receiver) => false,
         _ => set_content_principal(metadata, Some(principal)),
     }
 }
@@ -426,7 +439,8 @@ pub fn set_content_principal(metadata: &mut Value, principal: Option<&ContentPri
 /// the publisher is stamped. When the bundle's `agent_id` equals the importing
 /// caller the bundle is a self-claim nobody attested (the import has no trust
 /// source), so the row is stamped `unknown`: never the publisher, never owner
-/// content (issue #8443, sec LOW-6). Ids compare without regard to case.
+/// content (issue #8443, sec LOW-6). A case variant of the caller counts as
+/// the caller here, because that match only demotes.
 pub fn restamp_untrusted_import(
     obj: &mut serde_json::Map<String, Value>,
     original: Option<&str>,
@@ -435,11 +449,11 @@ pub fn restamp_untrusted_import(
     let claimed = obj
         .remove(META_CONTENT_PRINCIPAL)
         .and_then(|v| v.as_str().and_then(ContentPrincipal::from_stored))
-        .filter(|c| !same_principal(c.as_str(), caller));
+        .filter(|c| !imitates_principal(c.as_str(), caller));
     let publisher = original.map(str::trim).filter(|o| !o.is_empty());
     let principal = match (claimed, publisher) {
         (Some(c), _) => Some(c),
-        (None, Some(p)) if same_principal(p, caller) => Some(ContentPrincipal::unknown()),
+        (None, Some(p)) if imitates_principal(p, caller) => Some(ContentPrincipal::unknown()),
         (None, Some(p)) => Some(ContentPrincipal::from_agent_id_or_unknown(p)),
         (None, None) => Some(ContentPrincipal::unknown()),
     };
@@ -610,12 +624,12 @@ fn author_of(metadata: &Value) -> Option<&str> {
 /// code M3). Nothing is read as owner content merely because a key is absent.
 ///
 /// * A source with an explicit foreign marker keeps it.
-/// * The owner is `owner_hint` (the authenticated caller, never content) when
-///   given, else the single distinct `agent_id` among unmarked sources.
-/// * An unmarked source authored by someone other than a known owner is
-///   foreign, with its author as principal.
-/// * With no owner and two or more distinct authors, every unmarked source is
-///   foreign under its own author (fail closed: the fold is `mixed`).
+/// * The owner is exactly `owner_hint` (the bound caller principal, never
+///   content). With no hint there is NO owner: it is never guessed from the
+///   sources, not even from a lone author (sec M2), so every unmarked source
+///   is foreign under its author.
+/// * An unmarked source authored by someone other than the owner (compared
+///   exactly, [`same_principal`]) is foreign, with its author as principal.
 #[must_use]
 pub fn effective_principals(
     metadatas: &[&Value],
@@ -634,8 +648,8 @@ pub fn effective_principals(
 /// * With no namespace owner known the owner is NOT guessed from the sources
 ///   (that would launder a lone foreign author): every unmarked source whose
 ///   author is not the writer is foreign under its author.
-/// * A marker naming the owner (compared without regard to case) is read as
-///   `unknown`, exactly as in [`effective_principals`].
+/// * A marker that imitates the owner (equal without regard to case) is read
+///   as `unknown`, exactly as in [`effective_principals`]; this only demotes.
 #[must_use]
 pub fn effective_principals_with(
     metadatas: &[&Value],
@@ -649,26 +663,9 @@ pub fn effective_principals_with(
     // Only a reserved sentinel is a trusted writer: a caller cannot claim a
     // reserved id, so a row authored by it is substrate-formed. Any other
     // writer id is treated as an ordinary (foreign) author (#8443 sec S1).
-    let writer_passed = writer.is_some();
     let writer = writer.filter(|w| crate::validate::RESERVED_AGENT_IDS.contains(w));
-    let owner: Option<String> = hint.map(str::to_string).or_else(|| {
-        if writer_passed {
-            return None;
-        }
-        let mut authors: Vec<&str> = Vec::new();
-        for (m, marker) in metadatas.iter().zip(&markers) {
-            if marker.is_none()
-                && let Some(a) = author_of(m)
-                && !authors.contains(&a)
-            {
-                authors.push(a);
-            }
-        }
-        match authors.as_slice() {
-            [only] => Some((*only).to_string()),
-            _ => None,
-        }
-    });
+    // Invariant 1 (sec M2): the owner is the bound principal or nobody.
+    let owner: Option<String> = hint.map(str::to_string);
     let principals = metadatas
         .iter()
         .zip(markers)
@@ -680,7 +677,7 @@ pub fn effective_principals_with(
                 return Some(
                     if owner
                         .as_deref()
-                        .is_some_and(|o| same_principal(o, mark.as_str()))
+                        .is_some_and(|o| imitates_principal(mark.as_str(), o))
                     {
                         ContentPrincipal::unknown()
                     } else {
@@ -691,7 +688,7 @@ pub fn effective_principals_with(
             match author_of(m) {
                 Some(a)
                     if owner.as_deref().is_some_and(|o| same_principal(o, a))
-                        || writer == Some(a) =>
+                        || writer.is_some_and(|w| same_principal(w, a)) =>
                 {
                     None
                 }
@@ -706,9 +703,10 @@ pub fn effective_principals_with(
 }
 
 /// Build the grounded summariser input for a set of source memories: the owner
-/// principal (from `owner_hint` or the store, never from content) and the
-/// labelled `(title, content)` pairs. `owner_hint` is the authenticated caller
-/// for a user-driven consolidation; a substrate pass passes `None`.
+/// principal (exactly `owner_hint`, never from content) and the labelled
+/// `(title, content)` pairs. `owner_hint` is the bound caller principal for a
+/// user-driven consolidation; `None` (no bound principal, e.g. the
+/// local-operator MCP binding) means no owner, so every source is labelled.
 #[must_use]
 pub fn summary_inputs_for(
     memories: &[crate::models::Memory],

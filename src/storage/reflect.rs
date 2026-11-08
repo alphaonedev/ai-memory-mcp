@@ -379,16 +379,11 @@ pub fn reflect_with_hooks_for_caller(
         .map_err(|e| ReflectError::Validation(e.to_string()))?;
     validate::validate_source(&input.source)
         .map_err(|e| ReflectError::Validation(e.to_string()))?;
-    // The substrate curator writes its reflections under its own reserved id
-    // (#8443 sec S1 reserved it): that id is shape-checked here, never
-    // accepted from a wire caller, because every wire entry (MCP, HTTP)
-    // already ran the reserved-name check before building this input.
-    if input.agent_id == crate::identity::sentinels::AI_CURATOR {
-        validate::validate_agent_id_shape(&input.agent_id)
-    } else {
-        validate::validate_agent_id(&input.agent_id)
-    }
-    .map_err(|e| ReflectError::Validation(e.to_string()))?;
+    // #8443 C-1: one writer check shared with the postgres twin. An unscoped
+    // (`None`) read is the admin / substrate context, the only one that may
+    // write as the reserved curator id; a tenant naming it is refused.
+    validate::validate_reflect_writer(&input.agent_id, caller.is_none())
+        .map_err(|e| ReflectError::Validation(e.to_string()))?;
     if input.source_ids.is_empty() {
         return Err(ReflectError::Validation(
             "source_ids cannot be empty — a reflection must reflect on at least one source memory"

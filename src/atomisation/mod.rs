@@ -582,11 +582,26 @@ impl Atomiser {
         // curator gets no owner, the text is labelled with its principal,
         // and each atom inherits that principal (the atom's own agent_id is
         // the caller, so without the stamp the split would launder it).
-        // A substrate caller names no owner; the owner is then derived.
-        let owner_hint = (!crate::validate::RESERVED_AGENT_IDS.contains(&calling_agent_id))
-            .then_some(calling_agent_id);
-        let (store_owner, principals) =
-            crate::role_grounding::effective_principals(&[&source.metadata], owner_hint);
+        // A substrate caller (a reserved writer id) is not the owner: the
+        // owner is then the namespace owner or the bound principal, never
+        // guessed from the source's author (#8443 C-L1, invariant 1).
+        let (store_owner, principals) = if crate::validate::RESERVED_AGENT_IDS
+            .contains(&calling_agent_id)
+        {
+            let ns_owner =
+                crate::storage::namespace_owner(conn, &source.namespace).unwrap_or_else(|e| {
+                    crate::role_grounding::warn_owner_lookup_failed(&source.namespace, &e);
+                    None
+                });
+            let hint = crate::role_grounding::substrate_owner_hint(ns_owner, &source.namespace);
+            crate::role_grounding::effective_principals_with(
+                &[&source.metadata],
+                hint.as_deref(),
+                Some(calling_agent_id),
+            )
+        } else {
+            crate::role_grounding::effective_principals(&[&source.metadata], Some(calling_agent_id))
+        };
         let source_principal = principals.into_iter().next().flatten();
         let (grounded_owner, curator_text) = match source_principal.as_ref() {
             None => (store_owner.as_deref(), source.content.clone()),

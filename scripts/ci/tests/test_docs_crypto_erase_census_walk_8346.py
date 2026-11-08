@@ -1338,7 +1338,7 @@ REGION_BEFORE = "#[test]fndoc_erase_scope_names_erasable_versions_8278(){"
 LIB_KNOWN_MACROS = {
     "reserved_upsert_metadata_keys_sql":
         '#[macro_export]macro_rules!reserved_upsert_metadata_keys_sql{()=>{"\'agent_id\', \'derived_from\', '
-        '\'consolidated_from_agents\', \'agent_pubkey\', \'pubkey_bound_at\'"};}',
+        '\'consolidated_from_agents\', \'content_principal\', \'agent_pubkey\', \'pubkey_bound_at\'"};}',
 }
 LIB_MOD = "pubmodencryption;"
 # The names the census region resolves outside itself are DERIVED from the region text (`derive_external_names`);

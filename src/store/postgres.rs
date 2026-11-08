@@ -14336,7 +14336,9 @@ impl PostgresStore {
             .map_err(|e| ReflectError::Validation(e.to_string()))?;
         validate::validate_source(&input.source)
             .map_err(|e| ReflectError::Validation(e.to_string()))?;
-        validate::validate_agent_id(&input.agent_id)
+        // #8443 C-1: the one writer check shared with the sqlite twin; only a
+        // bypass (admin / substrate) context may write as the curator id.
+        validate::validate_reflect_writer(&input.agent_id, ctx.bypass_visibility)
             .map_err(|e| ReflectError::Validation(e.to_string()))?;
         if input.source_ids.is_empty() {
             return Err(ReflectError::Validation(
