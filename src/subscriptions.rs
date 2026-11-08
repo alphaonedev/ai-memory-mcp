@@ -2026,6 +2026,17 @@ fn webhook_host_port_for_scheme(host_port: &str, scheme: &str) -> String {
 
 /// Normalize only the webhook resolver authority, retaining its original host spelling.
 fn normalize_webhook_host_port(host_port: &str, scheme: &str) -> Result<String> {
+    // #8649: reject invalid explicit ports before DNS and its fail-open override.
+    let explicit_port =
+        if let Some(close_idx) = host_port.strip_prefix('[').and(host_port.find(']')) {
+            host_port[close_idx + 1..].strip_prefix(':')
+        } else {
+            host_port.rsplit_once(':').map(|(_, port)| port)
+        };
+    if let Some(port) = explicit_port {
+        port.parse::<std::num::NonZeroU16>()
+            .context("webhook URL has an invalid explicit port")?;
+    }
     let target = if let Some(close_idx) = host_port.strip_prefix('[').and(host_port.find(']')) {
         let after_bracket = &host_port[close_idx + 1..];
         if after_bracket.starts_with(':') {
