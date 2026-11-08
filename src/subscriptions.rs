@@ -2002,10 +2002,9 @@ pub(crate) fn authority_without_userinfo(rest: &str) -> &str {
 }
 
 /// #3822 — append the default HTTP port (`:80`) to a bracket/colon-normalized
-/// `host_port` that omits one, so `ToSocketAddrs` resolves it. Single home of
-/// the `host:80` default-port literal, shared by the webhook SSRF lane
-/// (`validate_url_dns_with`) and the egress inference lane (`egress::host_of`
-/// via the #3744 one-helper rule).
+/// `host_port` that omits one, so `ToSocketAddrs` resolves it. This helper serves
+/// `validate_url_dns_with` in the webhook SSRF lane. Inference egress instead
+/// derives its canonical host and scheme-aware port from `reqwest::Url` (#8650).
 pub(crate) fn host_port_with_default_http_port(host_port: &str) -> String {
     format!("{host_port}:80")
 }
