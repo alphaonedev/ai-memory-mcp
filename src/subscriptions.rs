@@ -2271,6 +2271,9 @@ fn validate_url_with(url: &str, allow_loopback: bool) -> Result<()> {
         // target routinely carries a token).
         return Err(anyhow!("webhook URL scheme must be https: {url_display}"));
     }
+    // #8649: registration and dispatch share explicit-port validation.
+    let host_port = authority_without_userinfo(rest);
+    normalize_webhook_host_port(host_port, scheme)?;
     // v1.0.0 #3705 — "only encrypted data in transit": plaintext http:// is
     // refused to EVERY host, loopback included (the pre-#3705 loopback
     // exemption is gone — loopback is shared by every local process).
@@ -2280,12 +2283,9 @@ fn validate_url_with(url: &str, allow_loopback: bool) -> Result<()> {
             crate::transit_encryption::plaintext_url_refusal("webhook target", url)
         ));
     }
-    // Extract host (portion before '/' or ':' or '?'). IPv6 URLs use
-    // `[ipv6]:port` syntax — the brackets must be stripped and the
-    // colon-split must skip the colons inside the v6 literal.
-    // #3744 — userinfo is stripped BEFORE any host extraction; see
-    // `authority_without_userinfo`.
-    let host_port = authority_without_userinfo(rest);
+    // Extract the host without splitting IPv6's inner colons.
+    // #3744: host_port already excludes userinfo; both guards read the same
+    // authority before applying address policy.
     let host: String = if let Some(stripped) = host_port.strip_prefix('[') {
         // IPv6: host is everything before the closing bracket.
         match stripped.find(']') {
