@@ -183,6 +183,9 @@ thread_local! {
     /// Test seam: fail the deferred queue writes on this thread.
     #[cfg(test)]
     static FORCE_QUEUE_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Test seam: fail open-time raw report writes without touching stderr.
+    #[cfg(test)]
+    static FORCE_REPORT_WRITE_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 static NEXT_FRAME_ID: AtomicU64 = AtomicU64::new(1);

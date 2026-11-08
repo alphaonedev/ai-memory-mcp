@@ -157,6 +157,66 @@ fn issue_6132_open_on_other_database_does_not_credit_stale_frame() {
 }
 
 #[test]
+fn issue_6540_no_subscriber_never_silences_a_lost_intent() {
+    let name = "issue_6540_no_subscriber_never_silences_a_lost_intent";
+    let Some(stderr) = child_stderr(name, || {
+        let dir = tempfile::tempdir().expect("test directory");
+        let path = dir.path().join("leak.db");
+        leak(&path, &["lost"]);
+        reopen(&path);
+    }) else {
+        return;
+    };
+    assert_eq!(
+        stderr.lines().filter(|line| line.starts_with(RAW_REPORT_PREFIX)).count(),
+        1,
+        "a missing tracing subscriber must not erase the raw loss report: {stderr}"
+    );
+}
+
+#[test]
+fn issue_6540_filtered_tracing_never_silences_a_lost_intent() {
+    let name = "issue_6540_filtered_tracing_never_silences_a_lost_intent";
+    let Some(stderr) = child_stderr(name, || {
+        tracing_subscriber::fmt()
+            .with_max_level(tracing::level_filters::LevelFilter::OFF)
+            .try_init()
+            .expect("install disabled subscriber");
+        let dir = tempfile::tempdir().expect("test directory");
+        let path = dir.path().join("leak.db");
+        leak(&path, &["lost"]);
+        reopen(&path);
+    }) else {
+        return;
+    };
+    assert_eq!(
+        stderr.lines().filter(|line| line.starts_with(RAW_REPORT_PREFIX)).count(),
+        1,
+        "a disabled tracing module must not erase the raw loss report: {stderr}"
+    );
+}
+
+#[test]
+fn issue_6540_failed_raw_receipt_leaves_every_intent_for_exit() {
+    let name = "issue_6540_failed_raw_receipt_leaves_every_intent_for_exit";
+    let Some(stderr) = child_stderr(name, || {
+        super::FORCE_REPORT_WRITE_FAILURE.with(|failure| failure.set(true));
+        let dir = tempfile::tempdir().expect("test directory");
+        let path = dir.path().join("leak.db");
+        leak(&path, &["first", "second"]);
+        reopen(&path);
+        reopen(&path);
+    }) else {
+        return;
+    };
+    assert!(!stderr.lines().any(|line| line.starts_with(OPEN_REPORT)));
+    assert!(
+        stderr.contains("thread exited with 2 unreported deferred escalation(s) in 1 unsettled escalation frame(s)"),
+        "failed receipts must leave both intents pending for exit: {stderr}"
+    );
+}
+
+#[test]
 fn issue_6449_thread_exit_labels_intents_and_frames_separately() {
     let name = "issue_6449_thread_exit_labels_intents_and_frames_separately";
     let Some(stderr) = child_stderr(name, || {
