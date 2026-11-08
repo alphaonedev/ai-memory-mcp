@@ -1589,16 +1589,6 @@ const CREDENTIAL_OPTION_KEYS: &[&str] = &[
 ];
 /// These short names are credentials only when the whole normalized key matches.
 const EXACT_CREDENTIAL_KEYS: &[&str] = &["key", "auth"];
-/// ASCII punctuation removed when normalizing a credential key.
-const CREDENTIAL_KEY_PUNCTUATION: [char; 2] = ['_', '-'];
-/// Unicode dash spellings normalized to the same credential-key hyphen.
-const CREDENTIAL_KEY_DASHES: &[char] = &[
-    '\u{2010}', '\u{2011}', '\u{2012}', '\u{2013}', '\u{2014}', '\u{2015}', '\u{2212}', '\u{fe63}',
-];
-/// Fullwidth ASCII compatibility block and its offset to ASCII.
-const FULLWIDTH_ASCII_START: u32 = 0xff01;
-const FULLWIDTH_ASCII_END: u32 = 0xff5e;
-const FULLWIDTH_ASCII_OFFSET: u32 = 0xfee0;
 /// Closing punctuation ends a keyless URL, but never an identified secret value.
 const KEYLESS_URL_TERMINATORS: [char; 3] = ['\'', ')', '>'];
 /// Credential spans stop at physical line endings unless a quote owns the span.
@@ -1730,100 +1720,8 @@ fn redact_bare_targets(msg: &str) -> String {
     out
 }
 
-/// Normalize compatibility ASCII and Unicode dashes without changing source offsets.
-fn credential_key_char(ch: char) -> char {
-    let code = u32::from(ch);
-    if (FULLWIDTH_ASCII_START..=FULLWIDTH_ASCII_END).contains(&code) {
-        char::from_u32(code - FULLWIDTH_ASCII_OFFSET).unwrap_or(ch)
-    } else if CREDENTIAL_KEY_DASHES.contains(&ch) {
-        '-'
-    } else {
-        ch
-    }
-}
-
-/// Keep credential keys; mask values to line end or their closing quote.
-/// An unterminated quote owns the rest of the input (OWNERSHIP-15).
-fn redact_connection_options(msg: &str) -> String {
-    let mut text = String::with_capacity(msg.len());
-    let mut rest = msg;
-    while let Some(start) = credential_value_start(rest) {
-        text.push_str(&rest[..start]);
-        let value = &rest[start..];
-        text.push_str(URL_PASSWORD_MASK);
-        rest = &value[connection_value_end(value)..];
-    }
-    text.push_str(rest);
-    text
-}
-
-/// Locate a normalized credential key followed by '=' or ':'.
-/// OWNERSHIP-15: character-derived offsets keep UTF-8 keys and context intact.
-fn credential_value_start(msg: &str) -> Option<usize> {
-    let mut pending_url = next_url_span(msg);
-    for (offset, separator) in msg
-        .char_indices()
-        .filter(|(_, ch)| matches!(credential_key_char(*ch), '=' | ':'))
-    {
-        while let Some(span) = pending_url.as_ref() {
-            if offset < span.end {
-                break;
-            }
-            let base = span.end;
-            pending_url =
-                next_url_span(&msg[base..]).map(|next| base + next.start..base + next.end);
-        }
-        // Only the authority owns separators unconditionally. Credential keys in
-        // a path, query or fragment still own their entire value, including spaces.
-        if pending_url.as_ref().is_some_and(|span| {
-            let url = &msg[span.clone()];
-            let authority_start = url
-                .find(SCHEME_SEPARATOR)
-                .map_or(url.len(), |at| at + SCHEME_SEPARATOR.len());
-            let body = url[authority_start..]
-                .find(AUTHORITY_TERMINATORS)
-                .map_or(span.end, |at| span.start + authority_start + at);
-            #[cfg(test)]
-            masking_cost_tests::visited(body - span.start);
-            span.start <= offset && offset < body
-        }) {
-            continue;
-        }
-        let prefix = msg[..offset].trim_end();
-        let quoted = prefix.ends_with(['\'', '"']);
-        let key = if quoted {
-            let quote = prefix.chars().last()?;
-            let inner = &prefix[..prefix.len() - quote.len_utf8()];
-            let Some(start) = inner.rfind(quote) else {
-                continue;
-            };
-            &inner[start + quote.len_utf8()..]
-        } else {
-            prefix
-                .rsplit_once(|ch: char| {
-                    !(ch.is_alphanumeric()
-                        || CREDENTIAL_KEY_PUNCTUATION.contains(&credential_key_char(ch)))
-                })
-                .map_or(prefix, |(_, key)| key)
-        };
-        let normalized: String = key
-            .chars()
-            .map(credential_key_char)
-            .filter(|ch| !CREDENTIAL_KEY_PUNCTUATION.contains(ch))
-            .flat_map(char::to_lowercase)
-            .collect();
-        if !EXACT_CREDENTIAL_KEYS.contains(&normalized.as_str())
-            && !CREDENTIAL_OPTION_KEYS
-                .iter()
-                .any(|name| normalized.contains(name))
-        {
-            continue;
-        }
-        let value = &msg[offset + separator.len_utf8()..];
-        return Some(msg.len() - value.trim_start().len());
-    }
-    None
-}
+mod credential_scan;
+use credential_scan::redact_connection_options;
 
 /// Consume the entire ruled credential span, including whitespace and later assignments.
 fn connection_value_end(value: &str) -> usize {
