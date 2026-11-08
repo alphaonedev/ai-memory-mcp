@@ -134,8 +134,8 @@ fn issue_6541_stale_frame_unwind_rolls_back_both_begin_modes() {
     });
 }
 
-// Mirrors the original unit regression so its profile mismatch is reproduced
-// through this focused integration binary, without the full library harness.
+// Debug assertion contract; the release twin below verifies its reporting path.
+#[cfg(debug_assertions)]
 #[test]
 #[should_panic(expected = "stale escalation frame")]
 fn issue_7287_leaked_frame_with_intents_is_detected_on_next_open() {
@@ -144,4 +144,30 @@ fn issue_7287_leaked_frame_with_intents_is_detected_on_next_open() {
     leak(&path, &["lost"]);
     let conn = Connection::open(&path).expect("open next connection");
     let _txn = WriteTxn::begin(&conn).expect("begin next transaction");
+}
+
+#[cfg(not(debug_assertions))]
+#[test]
+fn issue_7287_release_open_reports_without_panicking() {
+    let name = "issue_7287_release_open_reports_without_panicking";
+    let Some(stderr) = child_stderr(name, || {
+        tracing_subscriber::fmt()
+            .with_writer(std::io::stderr)
+            .with_ansi(false)
+            .without_time()
+            .try_init()
+            .expect("install subscriber");
+        let dir = tempfile::tempdir().expect("test directory");
+        let path = dir.path().join("leak.db");
+        leak(&path, &["lost"]);
+        // This helper asserts that release begins and drops the next
+        // transaction without unwinding. The parent verifies the diagnostic.
+        reopen(&path);
+    }) else {
+        return;
+    };
+    assert!(
+        stderr.contains(OPEN_REPORT),
+        "release must retain stale-frame reporting: {stderr}"
+    );
 }

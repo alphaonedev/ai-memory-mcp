@@ -556,6 +556,7 @@ mod tests {
 
     /// Vote item 5(a) — a leaked `WriteTxn` whose frame still holds a deferred
     /// escalation is detected when the next transaction opens on the database.
+    #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "stale escalation frame")]
     fn leaked_frame_with_intents_is_detected_on_next_open() {
