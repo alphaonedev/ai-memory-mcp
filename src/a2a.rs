@@ -856,6 +856,13 @@ pub fn set_card_base_url(base: String) {
     let _ = CARD_BASE_URL.set(base);
 }
 
+/// Daemon start: resolve the card base URL from [`ENV_PUBLIC_URL`], the TLS
+/// state and the bind address, and record it. Never reads request headers.
+pub fn init_card_base_url(tls: bool, bind_addr: &str) {
+    let configured = std::env::var(ENV_PUBLIC_URL).ok();
+    set_card_base_url(resolve_card_base_url(configured.as_deref(), tls, bind_addr));
+}
+
 /// The recorded card base URL, or a fixed default before one is set.
 #[must_use]
 pub fn card_base_url() -> &'static str {
