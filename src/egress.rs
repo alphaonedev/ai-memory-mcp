@@ -643,6 +643,49 @@ mod tests {
     use super::*;
 
     #[test]
+    fn inference_authority_implicit_ports_8650() {
+        // TEST-02: expected ports are independent of the production defaults.
+        for (scheme, expected_port) in [("https", 443), ("http", 80), ("HTTPS", 443)] {
+            for host in ["localhost", "127.0.0.1", "[::1]"] {
+                let url = format!("{scheme}://{host}/v1");
+                let (_, addrs) = resolve_inference_authority(&url).expect("resolve local target");
+                assert!(!addrs.is_empty(), "{url} must resolve");
+                for addr in addrs {
+                    assert_eq!(addr.port(), expected_port, "wrong pinned port for {url}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn inference_authority_explicit_ports_8650() {
+        for host in ["localhost", "127.0.0.1", "[::1]"] {
+            let url = format!("https://{host}:8443/v1");
+            let (_, addrs) = resolve_inference_authority(&url).expect("resolve explicit port");
+            assert!(!addrs.is_empty(), "{url} must resolve");
+            for addr in addrs {
+                assert_eq!(addr.port(), 8443, "explicit port must survive for {url}");
+            }
+        }
+    }
+
+    #[test]
+    fn inference_authority_rejects_unsupported_scheme_8650() {
+        for url in ["ftp://127.0.0.1/v1", "ftp://[::1]:8443/v1", "127.0.0.1:8443"] {
+            assert!(resolve_inference_authority(url).is_err(), "must refuse {url}");
+            assert!(
+                admit_inference_target(
+                    InferenceEgressMode::InternalOnly,
+                    EgressClass::InferenceLlm,
+                    url,
+                )
+                .is_err(),
+                "unsupported scheme must not produce a pin: {url}",
+            );
+        }
+    }
+
+    #[test]
     fn class_tokens_are_stable_and_inference_flagged() {
         assert_eq!(EgressClass::InferenceLlm.as_str(), "inference_llm");
         assert_eq!(
