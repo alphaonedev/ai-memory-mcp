@@ -12,7 +12,8 @@ use crate::storage::escalation_deferral::{DeferredEscalation, defer_to_open_txn}
 use rusqlite::Connection;
 
 const CHILD_ROLE: &str = "AI_MEMORY_TEST_ESCALATION_8184_CHILD";
-const OPEN_REPORT: &str = "#4116: a WriteTxn opened";
+const RAW_REPORT_PREFIX: &str = "ERROR #4116:";
+const OPEN_REPORT: &str = "ERROR #4116: a WriteTxn opened";
 const EXIT_REPORT: &str = "ERROR #4116: thread exited";
 
 fn child_stderr(name: &str, action: impl FnOnce() + Send + 'static) -> Option<String> {
@@ -68,6 +69,9 @@ fn reopen(path: &Path) {
     assert_eq!(result.is_err(), cfg!(debug_assertions));
 }
 
+/// Only raw lines beginning `ERROR #4116:` are authoritative lost-write
+/// reports. Structured tracing diagnostics have a target prefix and do not
+/// count, even when the subscriber also writes to stderr (ruling #8184).
 #[test]
 fn issue_6132_stale_frame_reported_once_across_repeated_opens_and_exit() {
     let name = "issue_6132_stale_frame_reported_once_across_repeated_opens_and_exit";
@@ -87,10 +91,69 @@ fn issue_6132_stale_frame_reported_once_across_repeated_opens_and_exit() {
         return;
     };
     assert_eq!(
-        stderr.matches(OPEN_REPORT).count() + stderr.matches(EXIT_REPORT).count(),
+        stderr.lines().filter(|line| line.starts_with(RAW_REPORT_PREFIX)).count(),
         1,
         "one lost intent must produce one report: {stderr}"
     );
+    assert!(stderr.lines().any(|line| line.starts_with(OPEN_REPORT)));
+    assert!(!stderr.lines().any(|line| line.starts_with(EXIT_REPORT)));
+}
+
+#[test]
+fn issue_6132_no_subscriber_reports_at_open_and_not_again_at_exit() {
+    let name = "issue_6132_no_subscriber_reports_at_open_and_not_again_at_exit";
+    let Some(stderr) = child_stderr(name, || {
+        let dir = tempfile::tempdir().expect("test directory");
+        let path = dir.path().join("leak.db");
+        leak(&path, &["lost"]);
+        reopen(&path);
+    }) else {
+        return;
+    };
+    assert_eq!(
+        stderr.lines().filter(|line| line.starts_with(OPEN_REPORT)).count(),
+        1,
+        "no subscriber must still receive the open-time raw report: {stderr}"
+    );
+    assert!(
+        !stderr.lines().any(|line| line.starts_with(EXIT_REPORT)),
+        "a delivered open-time report must not repeat at exit: {stderr}"
+    );
+}
+
+#[test]
+fn issue_6132_later_intent_on_reported_frame_remains_reportable() {
+    let name = "issue_6132_later_intent_on_reported_frame_remains_reportable";
+    let Some(stderr) = child_stderr(name, || {
+        let dir = tempfile::tempdir().expect("test directory");
+        let path = dir.path().join("leak.db");
+        leak(&path, &["first"]);
+        reopen(&path);
+        let conn = Connection::open(&path).expect("open connection for later intent");
+        assert!(defer_to_open_txn(conn.path(), intent("later")).is_ok());
+    }) else {
+        return;
+    };
+    assert_eq!(stderr.lines().filter(|line| line.starts_with(OPEN_REPORT)).count(), 1);
+    assert!(
+        stderr.contains("thread exited with 1 unreported deferred escalation(s) in 1 unsettled escalation frame(s)"),
+        "only the later intent remains uncredited: {stderr}"
+    );
+}
+
+#[test]
+fn issue_6132_open_on_other_database_does_not_credit_stale_frame() {
+    let name = "issue_6132_open_on_other_database_does_not_credit_stale_frame";
+    let Some(stderr) = child_stderr(name, || {
+        let dir = tempfile::tempdir().expect("test directory");
+        leak(&dir.path().join("leak.db"), &["lost"]);
+        let other = Connection::open(dir.path().join("other.db")).expect("open other database");
+        drop(WriteTxn::begin(&other).expect("begin on other database"));
+    }) else {
+        return;
+    };
+    assert!(!stderr.lines().any(|line| line.starts_with(OPEN_REPORT)));
+    assert_eq!(stderr.lines().filter(|line| line.starts_with(EXIT_REPORT)).count(), 1);
 }
 
 #[test]
