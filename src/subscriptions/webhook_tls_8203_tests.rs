@@ -71,12 +71,16 @@ fn public_answer(url: &str) -> (String, Vec<std::net::SocketAddr>) {
                     format!("{host}:{HTTPS_PORT}"),
                     Ok(std::net::SocketAddr::new(PUBLIC_IP.into(), HTTPS_PORT)),
                 ))
-                .is_none()
+                .is_none(),
+            "#8649: IDN fixture must not replace an outstanding resolver answer"
         );
     });
     let _reset = PublicAnswer;
     let result = validate_url_dns_with(url, false);
-    assert!(DNS_ANSWER.with_borrow_mut(Option::take).is_none());
+    assert!(
+        DNS_ANSWER.with_borrow_mut(Option::take).is_none(),
+        "#8649: shared resolver must consume the injected IDN answer"
+    );
     result.expect("injected public address must be admitted")
 }
 
