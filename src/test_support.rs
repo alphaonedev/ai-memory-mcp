@@ -582,6 +582,115 @@ mod tests {
         no_lineage_dag_guard, simulate_production_lineage_seed,
     };
 
+    /// #8651: a child owns its generated PKI until exit, then leaves no files.
+    #[test]
+    fn tls_test_pki_is_removed_after_child_exit_8651() {
+        const CHILD: &str = "AI_MEMORY_TLS_PKI_CHILD_8651";
+        const TEST: &str = concat!(
+            module_path!(),
+            "::",
+            stringify!(tls_test_pki_is_removed_after_child_exit_8651)
+        );
+        if std::env::var_os(CHILD).is_some() {
+            let pki = super::tls_test_pki();
+            for path in [&pki.ca_pem, &pki.leaf_pem, &pki.leaf_key_pem] {
+                assert!(path.is_file(), "generated PKI file must exist: {path:?}");
+            }
+            assert!(
+                std::ptr::eq(pki, super::tls_test_pki()),
+                "all callers must share the process PKI"
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                const PRIVATE_KEY_MODE: u32 = 0o600;
+                const PERMISSION_BITS: u32 = 0o777;
+                let mode = std::fs::metadata(&pki.leaf_key_pem)
+                    .expect("leaf key metadata")
+                    .permissions()
+                    .mode();
+                assert_eq!(
+                    mode & PERMISSION_BITS,
+                    PRIVATE_KEY_MODE,
+                    "leaf key permissions must stay private"
+                );
+            }
+            return;
+        }
+        let scratch = tempfile::tempdir().expect("parent-owned PKI test scratch");
+        let tmp = scratch.path().join("child-tmp");
+        std::fs::create_dir(&tmp).expect("dedicated child TMPDIR");
+        let test = TEST.split_once("::").expect("crate-qualified test name").1;
+        let mut command = crate::spawn_audit::audited_command(
+            std::env::current_exe().expect("lib test binary"),
+            "test_support::tls_test_pki_is_removed_after_child_exit_8651",
+        );
+        command
+            .args(["--exact", test, "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1")
+            .env("AI_MEMORY_NO_CONFIG", "1");
+        for name in ["TMPDIR", "TMP", "TEMP"] {
+            command.env(name, &tmp);
+        }
+        let output = run_pki_child_8651(command, scratch.path());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "PKI child: {stdout}\n{stderr}");
+        assert!(
+            stdout.contains("1 passed") && !stdout.contains("0 passed"),
+            "PKI child must run exactly the selected test: {stdout}"
+        );
+        assert!(
+            std::fs::read_dir(&tmp)
+                .expect("read child TMPDIR")
+                .next()
+                .is_none(),
+            "#8651: child exit must remove every generated PKI file and directory"
+        );
+    }
+
+    /// Copy the #8166 file-capture and bounded child-reaping precedent.
+    fn run_pki_child_8651(
+        mut command: std::process::Command,
+        scratch: &std::path::Path,
+    ) -> std::process::Output {
+        // Hang guard, not a latency budget; startup under CI load is included.
+        const CHILD_HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(60);
+        const CHILD_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
+        let stdout = scratch.join("stdout");
+        let stderr = scratch.join("stderr");
+        let mut child = command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::fs::File::create(&stdout).expect("child stdout capture"))
+            .stderr(std::fs::File::create(&stderr).expect("child stderr capture"))
+            .spawn()
+            .expect("spawn isolated PKI child");
+        let deadline = std::time::Instant::now() + CHILD_HANG_GUARD;
+        let timed_out = loop {
+            if child.try_wait().expect("poll PKI child").is_some() {
+                break false;
+            }
+            if std::time::Instant::now() >= deadline {
+                break true;
+            }
+            std::thread::sleep(CHILD_POLL_INTERVAL);
+        };
+        // CONCURRENCY-11: always reap before reading captures or dropping scratch.
+        let kill_error = if timed_out { child.kill().err() } else { None };
+        let output = std::process::Output {
+            status: child.wait().expect("reap PKI child"),
+            stdout: std::fs::read(stdout).expect("read child stdout"),
+            stderr: std::fs::read(stderr).expect("read child stderr"),
+        };
+        assert!(
+            !timed_out,
+            "PKI child hang guard expired; kill error={kill_error:?}: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    }
+
     /// #3523 — the OBSERVED singleton pin: `test_support::env_lock()` and
     /// `config::test_env_lock()` are ONE mutex, not two.
     ///
