@@ -111,3 +111,27 @@ fn inference_http_default_helper_is_unchanged_6401() {
         "localhost:80"
     );
 }
+
+#[test]
+fn guard_rejects_zero_port_8649() {
+    for host in ["localhost", "127.0.0.1", "[::1]"] {
+        let url = format!("https://{host}:0/hook");
+        assert!(validate_url_dns_resolved(&url, true).is_err(), "{url}");
+    }
+}
+
+#[test]
+fn guard_rejects_empty_port_8649() {
+    for host in ["localhost", "127.0.0.1", "[::1]"] {
+        let url = format!("https://{host}:/hook");
+        assert!(validate_url_dns_resolved(&url, true).is_err(), "{url}");
+    }
+}
+
+#[test]
+fn guard_rejects_overflow_port_8649() {
+    for host in ["localhost", "127.0.0.1", "[::1]"] {
+        let url = format!("https://{host}:65536/hook");
+        assert!(validate_url_dns_resolved(&url, true).is_err(), "{url}");
+    }
+}

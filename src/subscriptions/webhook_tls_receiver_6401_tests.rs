@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 const CHILD_ROLE: &str = "AI_MEMORY_TEST_TLS_6401_CHILD";
+const CHILD_SCRATCH: &str = "AI_MEMORY_TEST_TLS_8649_SCRATCH";
 const CHILD_TIMEOUT: Duration = Duration::from_secs(120);
 const CHILD_POLL: Duration = Duration::from_millis(20);
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(60);
@@ -24,6 +25,19 @@ const TEST_SECRET: &str = "tls-6401-test-secret";
 const WRONG_PORT_URL: &str = "https://localhost:80/hook";
 const PORT_MISMATCH: &str = "tls-test-port-mismatch";
 static RECEIVER_PORT: AtomicU16 = AtomicU16::new(0);
+
+struct ChildProcess(std::process::Child);
+
+impl Drop for ChildProcess {
+    fn drop(&mut self) {
+        // Reap before the parent TempDir drops, including polling/assertion panics.
+        if !matches!(self.0.try_wait(), Ok(Some(_))) {
+            // Best effort on unwind; never cause a second panic in Drop.
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+}
 
 /// Only the isolated child remaps the logical HTTPS pin to its owned socket.
 /// A wrong logical port fails before any connection to a host service.
@@ -51,6 +65,12 @@ pub(crate) fn map_receiver(
 
 fn run_child(name: &str) {
     let scratch = tempfile::tempdir_in(std::env::temp_dir()).expect("child scratch");
+    let scratch_path = scratch.path().to_path_buf();
+    run_child_in(name, scratch);
+    assert!(!scratch_path.exists(), "child PKI scratch must be removed");
+}
+
+fn run_child_in(name: &str, scratch: tempfile::TempDir) {
     let stdout_path = scratch.path().join("stdout");
     let stderr_path = scratch.path().join("stderr");
     let module = module_path!().split_once("::").expect("crate module").1;
@@ -63,20 +83,22 @@ fn run_child(name: &str) {
         .args(["--exact", &filter, "--nocapture", "--test-threads=1"])
         .env_clear()
         .env("AI_MEMORY_NO_CONFIG", "1")
-        .env("TMPDIR", std::env::temp_dir())
+        // The parent owns this Drop guard: child process statics do not drop.
+        .env("TMPDIR", scratch.path())
+        .env(CHILD_SCRATCH, scratch.path())
         .env(CHILD_ROLE, "1")
         .envs(std::env::var_os("LLVM_PROFILE_FILE").map(|v| ("LLVM_PROFILE_FILE", v)))
         .stdout(std::fs::File::create(&stdout_path).expect("child stdout"))
         .stderr(std::fs::File::create(&stderr_path).expect("child stderr"));
-    let mut child = command.spawn().expect("spawn isolated TLS test");
+    let mut child = ChildProcess(command.spawn().expect("spawn isolated TLS test"));
     let started = Instant::now();
     let status = loop {
-        if let Some(status) = child.try_wait().expect("poll TLS child") {
+        if let Some(status) = child.0.try_wait().expect("poll TLS child") {
             break status;
         }
         if started.elapsed() >= CHILD_TIMEOUT {
-            child.kill().expect("kill timed-out child");
-            child.wait().expect("reap timed-out child");
+            child.0.kill().expect("kill timed-out child");
+            child.0.wait().expect("reap timed-out child");
             panic!("#6401: isolated TLS child exceeded {CHILD_TIMEOUT:?}");
         }
         std::thread::sleep(CHILD_POLL);
@@ -128,12 +150,25 @@ struct Receiver {
     task: tokio::task::JoinHandle<std::io::Result<()>>,
 }
 
+#[derive(Clone, Copy)]
+enum ReceiverTrust {
+    Trusted,
+    Untrusted,
+}
+
 impl Receiver {
-    async fn start() -> Self {
+    async fn start(trust: ReceiverTrust) -> Self {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let pki = crate::test_support::tls_test_pki();
-        install_dispatch_root_certificate(&std::fs::read(&pki.ca_pem).expect("test CA"))
-            .expect("trust existing test CA");
+        if matches!(trust, ReceiverTrust::Trusted) {
+            install_dispatch_root_certificate(&std::fs::read(&pki.ca_pem).expect("test CA"))
+                .expect("trust existing test CA");
+        } else {
+            assert!(
+                dispatch_root_certificate().is_none(),
+                "isolated trust store"
+            );
+        }
         let config = crate::tls::load_rustls_config(&pki.leaf_pem, &pki.leaf_key_pem)
             .await
             .expect("test TLS config");
@@ -220,7 +255,7 @@ fn verify_signature(request: &Received) {
 }
 
 async fn check_delivery() {
-    let mut receiver = Receiver::start().await;
+    let mut receiver = Receiver::start(ReceiverTrust::Trusted).await;
     let file = tempfile::NamedTempFile::new_in(std::env::temp_dir()).expect("SQLite fixture");
     let conn = crate::db::open(file.path()).expect("production SQLite schema");
     let id = register(&conn, super::IMPLICIT_URL);
@@ -265,7 +300,7 @@ async fn check_delivery() {
 }
 
 async fn check_wrong_port() {
-    let mut receiver = Receiver::start().await;
+    let mut receiver = Receiver::start(ReceiverTrust::Trusted).await;
     let file = tempfile::NamedTempFile::new_in(std::env::temp_dir()).expect("SQLite fixture");
     let conn = crate::db::open(file.path()).expect("production SQLite schema");
     let id = register(&conn, WRONG_PORT_URL);
@@ -277,6 +312,37 @@ async fn check_wrong_port() {
     let rows = list_dlq(&conn, Some(&id)).expect("DLQ query");
     assert_eq!(rows.len(), 1, "wrong port must dead-letter");
     assert_eq!(rows[0].last_error, PORT_MISMATCH);
+    let status: String = conn
+        .query_row(
+            "SELECT delivery_status FROM subscription_events WHERE subscription_id = ?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .expect("audit status");
+    assert_eq!(status, "failed");
+    let counters: (i64, i64) = conn
+        .query_row(
+            "SELECT dispatch_count, failure_count FROM subscriptions WHERE id = ?1",
+            params![id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("dispatch counters");
+    assert_eq!(counters, (1, 1));
+    receiver.stop().await;
+}
+
+async fn check_untrusted_ca() {
+    let mut receiver = Receiver::start(ReceiverTrust::Untrusted).await;
+    let file = tempfile::NamedTempFile::new_in(std::env::temp_dir()).expect("SQLite fixture");
+    let conn = crate::db::open(file.path()).expect("production SQLite schema");
+    let id = register(&conn, super::IMPLICIT_URL);
+    dispatch(&conn, file.path()).await;
+    assert!(
+        receiver.requests.try_recv().is_err(),
+        "#8649: untrusted certificate must prevent HTTP delivery"
+    );
+    let rows = list_dlq(&conn, Some(&id)).expect("DLQ query");
+    assert_eq!(rows.len(), 1, "untrusted certificate must dead-letter");
     let status: String = conn
         .query_row(
             "SELECT delivery_status FROM subscription_events WHERE subscription_id = ?1",
@@ -321,4 +387,42 @@ fn port_80_control_dead_letters_without_receiver_request_6401() {
         return;
     }
     runtime().block_on(check_wrong_port());
+}
+
+#[test]
+fn untrusted_ca_dead_letters_without_receiver_request_8649() {
+    if std::env::var_os(CHILD_ROLE).is_none() {
+        run_child("untrusted_ca_dead_letters_without_receiver_request_8649");
+        return;
+    }
+    runtime().block_on(check_untrusted_ca());
+}
+
+#[test]
+fn child_pki_is_removed_after_panic_8649() {
+    const EXPECTED_PANIC: &str = "#8649 intentional child panic after PKI creation";
+    if std::env::var_os(CHILD_ROLE).is_some() {
+        let pki = crate::test_support::tls_test_pki();
+        let scratch = std::env::var_os(CHILD_SCRATCH).expect("parent-owned child scratch");
+        assert!(
+            pki.leaf_key_pem.starts_with(std::path::Path::new(&scratch)),
+            "child PKI must live beneath the parent Drop guard"
+        );
+        assert!(pki.leaf_key_pem.is_file(), "PKI exists before panic");
+        panic!("{EXPECTED_PANIC}");
+    }
+    let scratch = tempfile::tempdir_in(std::env::temp_dir()).expect("panic child scratch");
+    let scratch_path = scratch.path().to_path_buf();
+    let failure = std::panic::catch_unwind(|| {
+        run_child_in("child_pki_is_removed_after_panic_8649", scratch);
+    })
+    .expect_err("child failure must propagate");
+    let message = failure
+        .downcast_ref::<String>()
+        .expect("child panic message");
+    assert!(message.contains(EXPECTED_PANIC), "{message}");
+    assert!(
+        !scratch_path.exists(),
+        "panic must remove child PKI scratch"
+    );
 }
