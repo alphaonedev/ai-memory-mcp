@@ -437,10 +437,32 @@ async fn start_lost(app: &AppState, agent: &str, task_id: &str) -> A2aResult<()>
 /// `-32004` when the task ended in a state other than COMPLETED, or kept
 /// moving for [`a2a::A2A_COMPLETION_CAS_ATTEMPTS`] attempts (the exhaustion
 /// message never says retry); `-32603` on a storage failure or a task that
-/// vanished. On either `-32004` the inbox memory is already stored and stays
-/// unlinked from the task (its id is logged at info).
+/// vanished. On any refusal the inbox memory is already stored and stays
+/// unlinked from the task (its id is logged at info, once, here).
+///
+/// decision: single outer log on every refusal over per-path logs because a
+/// new `?` exit in the inner function cannot bypass the log (code r5 INFO-A).
 #[doc(hidden)]
 pub async fn a2a_complete_message(
+    app: &AppState,
+    agent: &str,
+    task_id: &str,
+    entry: A2aHistoryEntry,
+) -> Result<(), A2aError> {
+    let memory_id = entry.memory_id.clone();
+    let result = complete_message_inner(app, agent, task_id, entry).await;
+    if result.is_err() {
+        tracing::info!(
+            target: "a2a",
+            "a2a task {task_id}: completion refused; inbox memory {memory_id} stays unlinked"
+        );
+    }
+    result
+}
+
+/// The CAS loop of [`a2a_complete_message`]; it logs nothing about the
+/// unlinked memory, the wrapper does.
+async fn complete_message_inner(
     app: &AppState,
     agent: &str,
     task_id: &str,
@@ -481,12 +503,6 @@ pub async fn a2a_complete_message(
             .await?
             .ok_or_else(A2aError::internal)?;
         if state::is_terminal(&row.state) && row.state != state::COMPLETED {
-            tracing::info!(
-                target: "a2a",
-                "a2a task {task_id} ended {}; inbox memory {} stays unlinked",
-                row.state,
-                entry.memory_id
-            );
             return Err(A2aError::task_terminal(&row.state));
         }
     }
@@ -494,11 +510,6 @@ pub async fn a2a_complete_message(
         target: "a2a",
         "a2a task {task_id} kept moving; completion gave up after {} attempts",
         a2a::A2A_COMPLETION_CAS_ATTEMPTS
-    );
-    tracing::info!(
-        target: "a2a",
-        "a2a task {task_id}: inbox memory {} stays unlinked",
-        entry.memory_id
     );
     Err(A2aError::task_completion_exhausted())
 }

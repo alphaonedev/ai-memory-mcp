@@ -722,9 +722,10 @@ const DEFAULT_CARD_BASE_URL: &str = "http://localhost";
 /// (fail closed). The daemon serves A2A at its own fixed route; a path prefix
 /// belongs to the reverse proxy in front of it, never to the advertised base.
 ///
-/// decision: a non-empty host and a 1-65535 port over the bare RFC 3986
-/// authority because RFC 9110 requires a host for http(s) and an empty host
-/// or an out-of-range port would make the card advertise an unusable base.
+/// decision: a non-empty RFC 3986 host and a canonical 1-65535 port over the
+/// bare RFC 3986 authority because RFC 9110 requires a host for http(s) and an
+/// empty host, a malformed host or an out-of-range port would make the card
+/// advertise an unusable base.
 #[must_use]
 pub fn valid_public_url(raw: &str) -> Option<String> {
     let t = raw.trim().trim_end_matches('/');
@@ -739,12 +740,20 @@ pub fn valid_public_url(raw: &str) -> Option<String> {
     ok.then(|| t.to_string())
 }
 
-/// `host[:port]` of a public base URL: the host is non-empty (a bracketed
-/// IPv6 literal, or a name or IPv4 address without a colon or bracket); a
-/// colon after the host carries 1 to 5 digits with a value in 1..=65535.
+/// `host[:port]` of a public base URL (RFC 3986 `host [ ":" port ]`). The
+/// host is non-empty: a bracketed IPv6 literal (parsed as an
+/// [`std::net::Ipv6Addr`], with an optional `%25` zone of unreserved or
+/// percent-encoded characters), or a `reg-name` (ALPHA, DIGIT, `-._~`,
+/// sub-delims and `%HH` escapes, so an IPv4 address is a `reg-name`). The
+/// port, when a colon follows the host, is 1 to 5 digits in 1..=65535 with no
+/// leading zero, so the published URL never echoes a non-canonical port.
+///
+/// decision: the RFC 3986 grammar over the earlier "any byte but a bracket"
+/// predicate because a host with angle brackets, quotes or a non-ASCII letter
+/// would make the card advertise an unusable base (sec r5 INFO-2).
 fn valid_authority(authority: &str) -> bool {
     let (host_ok, port) = if let Some(inner) = authority.strip_prefix('[') {
-        let Some((v6, after)) = inner.split_once(']') else {
+        let Some((literal, after)) = inner.split_once(']') else {
             return false;
         };
         let port = match after.strip_prefix(':') {
@@ -752,22 +761,74 @@ fn valid_authority(authority: &str) -> bool {
             None if after.is_empty() => None,
             None => return false,
         };
-        (!v6.is_empty() && !v6.contains('['), port)
+        (valid_ipv6_literal(literal), port)
     } else {
-        if authority.contains(['[', ']']) {
-            return false;
-        }
         match authority.split_once(':') {
-            Some((host, port)) => (!host.is_empty(), Some(port)),
-            None => (!authority.is_empty(), None),
+            Some((host, port)) => (valid_reg_name(host), Some(port)),
+            None => (valid_reg_name(authority), None),
         }
     };
-    host_ok
-        && port.is_none_or(|p| {
-            (1..=5).contains(&p.len())
-                && p.bytes().all(|b| b.is_ascii_digit())
-                && p.parse::<u16>().is_ok_and(|n| n >= 1)
-        })
+    host_ok && port.is_none_or(valid_port)
+}
+
+/// A port of 1 to 5 digits, 1..=65535, without a leading zero.
+fn valid_port(port: &str) -> bool {
+    (1..=5).contains(&port.len())
+        && port.bytes().all(|b| b.is_ascii_digit())
+        && (port.len() == 1 || !port.starts_with('0'))
+        && port.parse::<u16>().is_ok_and(|n| n >= 1)
+}
+
+/// The text between the brackets of an IPv6 host: an address, optionally
+/// followed by `%25` and a non-empty zone id (RFC 6874).
+fn valid_ipv6_literal(literal: &str) -> bool {
+    let (addr, zone) = match literal.split_once("%25") {
+        Some((addr, zone)) => (addr, Some(zone)),
+        None => (literal, None),
+    };
+    addr.parse::<std::net::Ipv6Addr>().is_ok()
+        && zone.is_none_or(|z| !z.is_empty() && escaped_text(z, is_unreserved))
+}
+
+/// A non-empty RFC 3986 `reg-name`: unreserved, sub-delims and `%HH` only.
+fn valid_reg_name(host: &str) -> bool {
+    !host.is_empty() && escaped_text(host, |b| is_unreserved(b) || is_sub_delim(b))
+}
+
+/// RFC 3986 `unreserved`: ALPHA, DIGIT and `-._~`.
+const fn is_unreserved(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~')
+}
+
+/// RFC 3986 `sub-delims`.
+const fn is_sub_delim(b: u8) -> bool {
+    matches!(
+        b,
+        b'!' | b'$' | b'&' | b'\'' | b'(' | b')' | b'*' | b'+' | b',' | b';' | b'='
+    )
+}
+
+/// Every byte of `text` satisfies `allowed`, or is a `%` followed by two hex
+/// digits. One pass, no allocation; a non-ASCII byte is never allowed.
+fn escaped_text(text: &str, allowed: fn(u8) -> bool) -> bool {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while let Some(&b) = bytes.get(i) {
+        if b == b'%' {
+            let hex_ok = bytes
+                .get(i + 1..i + 3)
+                .is_some_and(|h| h.iter().all(u8::is_ascii_hexdigit));
+            if !hex_ok {
+                return false;
+            }
+            i += 3;
+        } else if allowed(b) {
+            i += 1;
+        } else {
+            return false;
+        }
+    }
+    true
 }
 
 /// The base URL the Agent Card advertises: a valid configured `public_url`
@@ -1210,7 +1271,6 @@ mod tests {
             "https://[::1%25]",
             "https://[::1%eth0]",
             "https://[::1%25e th]",
-            "https://[fe80::1%25eth0%25x]",
             "https://h<x>.example",
             "https://h\"x.example",
             "https://h{x}.example",
