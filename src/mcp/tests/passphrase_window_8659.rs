@@ -3,6 +3,8 @@
 
 //! Observe the audit reader's actual passphrase-window ownership, without
 //! depending on the brief b11 seed overlapping a parallel SQLite open.
+//! Probe immediately before that open and at its first traced dispatch SQL;
+//! the open-time probe pins the S1 refusal window, before SQL tracing starts.
 
 use crate::storage::connection::OPEN_TRACE_5084;
 use std::cell::Cell;
@@ -24,40 +26,64 @@ enum Probe {
 }
 
 thread_local! {
+    static PRE_OPEN_ARMED: Cell<bool> = const { Cell::new(false) };
+    static OPEN_OBSERVED: Cell<Option<Probe>> = const { Cell::new(None) };
     static OBSERVED: Cell<Option<Probe>> = const { Cell::new(None) };
 }
 
-struct RestoreTrace(Option<fn(&str)>);
+struct RestoreTrace {
+    trace: Option<fn(&str)>,
+    pre_open_armed: bool,
+}
 
 impl Drop for RestoreTrace {
     fn drop(&mut self) {
-        OPEN_TRACE_5084.with(|trace| trace.set(self.0));
+        OPEN_TRACE_5084.with(|trace| trace.set(self.trace));
+        PRE_OPEN_ARMED.with(|armed| armed.set(self.pre_open_armed));
     }
 }
 
-fn probe_window(_sql: &str) {
-    if OBSERVED.with(Cell::get).is_some() {
-        return;
-    }
-    // CONCURRENCY-11: join the probe while the audited dispatch is suspended
-    // in its SQL callback. Never panic across SQLite's callback boundary.
+fn observe_window() -> Probe {
+    // CONCURRENCY-11: join while the audit reader is at its pre-open seam
+    // or SQL callback. Never panic across SQLite's callback boundary.
     let result =
         std::thread::Builder::new().spawn(|| match crate::test_support::env_mutex().try_lock() {
             Ok(_guard) => Probe::Acquired,
             Err(TryLockError::WouldBlock) => Probe::Excluded,
             Err(TryLockError::Poisoned(_)) => Probe::Poisoned,
         });
-    let observed = match result {
+    match result {
         Ok(thread) => thread.join().unwrap_or(Probe::ThreadFailed),
         Err(_) => Probe::ThreadFailed,
-    };
-    OBSERVED.with(|cell| cell.set(Some(observed)));
+    }
+}
+
+pub(super) fn probe_before_open() {
+    if PRE_OPEN_ARMED.with(Cell::get) {
+        OPEN_OBSERVED.with(|cell| cell.set(Some(observe_window())));
+    }
+}
+
+fn probe_window(_sql: &str) {
+    if OBSERVED.with(Cell::get).is_none() {
+        OBSERVED.with(|cell| cell.set(Some(observe_window())));
+    }
 }
 
 fn observe_audit_reader() {
     OBSERVED.with(|cell| cell.set(None));
-    let _restore = RestoreTrace(OPEN_TRACE_5084.with(|trace| trace.replace(Some(probe_window))));
+    OPEN_OBSERVED.with(|cell| cell.set(None));
+    let _restore = RestoreTrace {
+        trace: OPEN_TRACE_5084.with(|trace| trace.replace(Some(probe_window))),
+        pre_open_armed: PRE_OPEN_ARMED.with(|armed| armed.replace(true)),
+    };
     super::issue_965_audit_serial_dispatch_50_calls_through_single_connection();
+    assert_eq!(
+        OPEN_OBSERVED.with(Cell::take),
+        Some(Probe::Excluded),
+        "#8659: the audit reader must hold the passphrase window before db::open; \
+         a late guard leaves the S1 no-sqlcipher refusal exposed"
+    );
     let observed = OBSERVED.with(Cell::take);
     assert!(
         observed.is_some(),
@@ -66,7 +92,7 @@ fn observe_audit_reader() {
     assert_eq!(
         observed,
         Some(Probe::Excluded),
-        "#8659: the audit reader must hold the shared passphrase window throughout dispatch; \
+        "#8659: the audit reader must hold the shared passphrase window at first traced dispatch SQL; \
          Acquired means a b11 seeder could interleave, while poisoning/thread failure is not exclusion"
     );
 }
