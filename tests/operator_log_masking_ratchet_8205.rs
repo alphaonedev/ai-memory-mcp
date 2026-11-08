@@ -7,12 +7,12 @@
 #[path = "common/operator_log_capture.rs"]
 mod operator_capture;
 
-const CASE_COUNT: usize = 3_040;
+const CASE_COUNT: usize = 3_960;
 const SECRET_WINDOW: usize = 4;
 const SEED: u64 = 8_205;
 const LCG_MULTIPLIER: u64 = 6_364_136_223_846_793_005;
 const LCG_INCREMENT: u64 = 1;
-const FORM_COUNT: usize = 8;
+const FORM_COUNT: usize = 9;
 const HOST: &str = "db.example.invalid";
 const PREFIX: &str = "connection attempt: ";
 const KEYS: &[&str] = &[
@@ -33,6 +33,9 @@ const KEYS: &[&str] = &[
     "secretkey",
     "privatekey",
     "clientsecret",
+    "session",
+    "cookie",
+    "jwt",
     "key",
     "auth",
 ];
@@ -191,7 +194,11 @@ fn seeded_masking_class_ratchet_8205() {
             4 => (format!("{PREFIX}postgres://:{payload}@{HOST}"), true),
             5 => (format!("{PREFIX}postgres://account:{payload}"), false),
             6 => (format!("{PREFIX}postgres://account:{payload}@{HOST}"), true),
-            _ => (format!("{PREFIX}postgres://:{payload}"), false),
+            7 => (format!("{PREFIX}postgres://:{payload}"), false),
+            _ => (
+                format!("{PREFIX}postgres://account:{secret}@middle{split}{secret}@{HOST}"),
+                true,
+            ),
         };
         let line = assert_private(&detail, &secret, &format!("ratchet case {case}"));
         if host_expected {
