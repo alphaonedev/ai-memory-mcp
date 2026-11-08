@@ -77,11 +77,13 @@ class ExecutableResolutionS1S3S4(unittest.TestCase):
         checker = load_checker()
         for text in ('local left=$(( LIMIT - $(date +%s) ))',
                      'values=($(printf word)); echo ready',
-                     'mode=$(( $(id -u) + 1 ))'):
+                     'mode=$(( $(id -u) + 1 ))',
+                     'if (($(count one) % 2 || $(count two) % 2)); then echo ready; fi'):
             with self.subTest(text=text):
                 self.assertEqual(checker.scan_shell(text), [], "data substitution became executable")
         self.assertEqual(len(checker.scan_shell('values=($(python3 x.py))')), 1)
         self.assertEqual(len(checker.scan_shell('number=$(( $(python3 x.py) + 1 ))')), 1)
+        self.assertEqual(len(checker.scan_shell('(( $(python3 x.py) > 0 ))')), 1)
 
 
 if __name__ == "__main__":

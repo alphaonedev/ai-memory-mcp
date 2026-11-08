@@ -30,6 +30,8 @@ PYTHON_NAME = re.compile(
     r"(?:python|pypy)(?:3(?:\.[0-9]+)?)?(?:d|-dbg|t)?(?:\.exe)?\Z", re.IGNORECASE)
 PYTHON_NAME_MARKER = "python"
 SUBSTITUTION_TOKEN = "SUBSTITUTION"
+ARITHMETIC_OPEN = "$(("
+ARITHMETIC_TOKEN = "ARITHMETIC"
 ENV_COMMAND = "env"
 ENV_SPLIT_OPTIONS = frozenset(("-S", "--split-string"))
 ENV_SPLIT_PREFIXES = ("-S", "--split-string=")
@@ -230,8 +232,15 @@ def substitutions(text):
             continue
         if quotes.quote != "'" and text.startswith("$(", index):
             end = substitution_end(text, index + 2)
-            children.append((text[index + 2:end], text.count("\n", 0, index)))
-            parts.append(SUBSTITUTION_TOKEN + "\n" * text.count("\n", index, end))
+            offset = text.count("\n", 0, index)
+            if text.startswith(ARITHMETIC_OPEN, index):
+                _, nested = substitutions(text[index + len(ARITHMETIC_OPEN):end - 1])
+                children.extend((child, line + offset) for child, line in nested)
+                token = ARITHMETIC_TOKEN
+            else:
+                children.append((text[index + 2:end], offset))
+                token = SUBSTITUTION_TOKEN
+            parts.append(token + "\n" * text.count("\n", index, end))
             index = end + 1
             continue
         if quotes.quote != "'" and char == "`":
@@ -283,8 +292,22 @@ def shell_commands(text):
     lexer.whitespace = " \t\r"
     lexer.commenters = "#"
     words = []
+    array_depth = 0
+    arithmetic_depth = 0
     try:
         for token in lexer:
+            if arithmetic_depth:
+                arithmetic_depth += token.count("(") - token.count(")")
+                continue
+            if token == "((":
+                arithmetic_depth = 2
+                continue
+            if array_depth:
+                array_depth += token.count("(") - token.count(")")
+                continue
+            if token == "(" and words and words[-1][0].endswith("="):
+                array_depth = 1
+                continue
             if token in COMMAND_END:
                 if words:
                     yield words
