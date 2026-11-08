@@ -29,5 +29,50 @@ class InterpreterNamesS2(unittest.TestCase):
                 self.assertEqual(checker.scan_shell(f"{name} -I x.py"), [])
 
 
+class ExecutableResolutionS1S3S4(unittest.TestCase):
+    def test_command_substitution_executable_is_dynamic_s1(self):
+        checker = load_checker()
+        for program in ('$(which python3)', '`which python3`', '$(command -v python3)',
+                        '"$(which python3)"', 'timeout 60 $(which python3)'):
+            with self.subTest(program=program):
+                text = f'{program} x.py'
+                found = checker.scan_shell(text)
+                self.assertEqual(len(found), 1, "substitution interpreter escaped")
+                self.assertEqual(found[0].reason, checker.DYNAMIC_REASON)
+                self.assertEqual(checker.scan_source(text + ' # isolation: exempt #8202'),
+                                 ([], [(1, '8202')]))
+        for data in ('echo $(which python3)', '$BIN run', '${{ matrix.interp }} x.py'):
+            self.assertEqual(checker.scan_shell(data), [])
+
+    def test_relative_interpreter_at_resolved_index_s3(self):
+        checker = load_checker()
+        for prefix in ('timeout 60', 'nohup', 'nice -n 10', 'sudo -u u'):
+            for program in ('./python3', 'venv/python3', '.venv/Scripts/python'):
+                with self.subTest(prefix=prefix, program=program):
+                    self.assertEqual(len(checker.scan_shell(f'{prefix} {program} x.py')), 1,
+                                     "relative interpreter escaped")
+                    self.assertEqual(checker.scan_shell(f'{prefix} {program} -I x.py'), [])
+
+    def test_additional_prefixes_resolve_dynamic_and_launcher_s4(self):
+        checker = load_checker()
+        for prefix in ('stdbuf -oL', 'setsid', 'flock lockfile', 'ionice -c3',
+                       'chrt -i 0', 'taskset -c 0', 'taskset 0x1', 'nice -n 10 setsid'):
+            for program in ('$PYTHON', 'py -3', 'pip', 'pytest'):
+                with self.subTest(prefix=prefix, program=program):
+                    found = checker.scan_shell(f'{prefix} {program} x.py')
+                    self.assertEqual(len(found), 1, "wrapped interpreter escaped")
+                    self.assertFalse(found[0].malformed)
+            self.assertEqual(checker.scan_shell(f'{prefix} python3 -I x.py'), [])
+
+    def test_env_split_program_is_relexed_s4(self):
+        checker = load_checker()
+        for prefix in ('env -S ', 'env --split-string=', 'sudo -u u env -u X -S '):
+            for program in ('python3 x.py', '$PYTHON x.py', 'pip install x'):
+                with self.subTest(prefix=prefix, program=program):
+                    self.assertEqual(len(checker.scan_shell(f"{prefix}'{program}'")), 1,
+                                     "env split program escaped")
+            self.assertEqual(checker.scan_shell(f"{prefix}'python3 -I x.py'"), [])
+
+
 if __name__ == "__main__":
     unittest.main()
