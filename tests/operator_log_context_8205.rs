@@ -50,11 +50,23 @@ fn operator_log_escapes_caller_controls_6822() {
             );
             assert!(line.contains(control), "missing {control}: {log:?}");
         }
-        assert!(!line.contains(operator_capture::FIXTURE_PASSWORD));
-        assert!(!line.contains(operator_capture::FIXTURE_QUERY));
-        assert!(!line.contains(operator_capture::FIXTURE_FRAGMENT));
-        assert!(line.contains("https://example.invalid"));
-        assert!(!line.contains("/path"));
+        assert!(
+            !line.contains(operator_capture::FIXTURE_PASSWORD),
+            "password reached operator detail"
+        );
+        assert!(
+            !line.contains(operator_capture::FIXTURE_QUERY),
+            "query credential reached operator detail"
+        );
+        assert!(
+            !line.contains(operator_capture::FIXTURE_FRAGMENT),
+            "fragment credential reached operator detail"
+        );
+        assert!(
+            line.contains("https://example.invalid"),
+            "URL origin absent"
+        );
+        assert!(!line.contains("/path"), "URL path reached operator detail");
     }
 }
 
@@ -92,8 +104,14 @@ fn operator_contexts_name_operations_6894() {
             source.contains(expected),
             "missing operation label {expected}"
         );
-        assert!(!source.contains("foreign_err(\"as_deref\""));
-        assert!(!source.contains("log_foreign(\"as_deref\""));
+        assert!(
+            !source.contains("foreign_err(\"as_deref\""),
+            "generic foreign-error label remains"
+        );
+        assert!(
+            !source.contains("log_foreign(\"as_deref\""),
+            "generic log label remains"
+        );
     }
 }
 
@@ -104,7 +122,10 @@ fn dlq_list_operator_label_identifies_failed_call_7745() {
     let conn = rusqlite::Connection::open_in_memory().expect("database");
     let (result, log) =
         captured(|| handle_subscription_dlq_list_for(&conn, &json!({}), "agent-7745", &[]));
-    assert!(result.is_err());
+    assert!(
+        result.is_err(),
+        "fixture must exercise the storage error path"
+    );
     assert!(
         log.contains("context=\"list_dlq\""),
         "wrong list operation: {log}"
@@ -124,7 +145,10 @@ fn dlq_owner_operator_label_identifies_failed_call_7745() {
             &[],
         )
     });
-    assert!(result.is_err());
+    assert!(
+        result.is_err(),
+        "fixture must exercise the storage error path"
+    );
     assert!(
         log.contains("context=\"get_owner\""),
         "wrong owner operation: {log}"
@@ -145,7 +169,10 @@ fn dlq_unfiltered_owner_label_identifies_failed_call_7745() {
     .expect("ordinary DLQ row for the unfiltered owner lookup");
     let (result, log) =
         captured(|| handle_subscription_dlq_list_for(&conn, &json!({}), "agent-7745", &[]));
-    assert!(result.is_err());
+    assert!(
+        result.is_err(),
+        "fixture must exercise the storage error path"
+    );
     assert!(
         log.contains("context=\"get_owner\""),
         "wrong unfiltered owner operation: {log}"
@@ -166,17 +193,41 @@ fn operator_log_renders_only_url_origins_6822() {
     const PATH_SECRET: &str = "path_credential_8205";
     let inner =
         format!("connect https://query.example.invalid/{PATH_SECRET}?password={QUERY_SECRET}");
-    let outer = format!("fallback https://fragment.example.invalid:9443/x#{FRAGMENT_SECRET}");
-    let (wire, log) =
-        captured(|| mcp_foreign_err("url_chain_probe", anyhow::anyhow!(inner).context(outer)));
-    assert_eq!(wire, DB_ERROR_TEXT);
-    for secret in [QUERY_SECRET, FRAGMENT_SECRET, PATH_SECRET] {
-        assert!(!log.contains(secret), "URL credential reached operator log");
+    for port in ["", ":9443"] {
+        let outer = format!("fallback https://fragment.example.invalid{port}/x#{FRAGMENT_SECRET}");
+        let (wire, log) = captured(|| {
+            mcp_foreign_err(
+                "url_chain_probe",
+                anyhow::anyhow!(inner.clone()).context(outer),
+            )
+        });
+        assert_eq!(wire, DB_ERROR_TEXT);
+        for secret in [QUERY_SECRET, FRAGMENT_SECRET, PATH_SECRET] {
+            assert!(!log.contains(secret), "URL credential reached operator log");
+        }
+        if port.is_empty() {
+            assert!(
+                log.contains("connect https://query.example.invalid"),
+                "inner origin absent"
+            );
+            assert!(
+                log.contains("fallback https://fragment.example.invalid"),
+                "outer origin absent"
+            );
+        } else {
+            // The voted rule treats a colon authority without an at-sign as credentialed.
+            assert!(
+                log.contains("fallback https://****"),
+                "ambiguous authority not masked"
+            );
+            assert!(
+                !log.contains("connect https://query.example.invalid"),
+                "end-of-line mask stopped early"
+            );
+        }
+        assert!(!log.contains("?password="), "query syntax reached log");
+        assert_eq!(log.lines().count(), 1, "one operator event");
     }
-    assert!(log.contains("connect https://query.example.invalid"));
-    assert!(log.contains("fallback https://fragment.example.invalid:9443"));
-    assert!(!log.contains("?password="));
-    assert_eq!(log.lines().count(), 1);
 }
 
 const BOUNDARY_SECRET_8205: &str = "fixture_boundary_8205";
@@ -252,8 +303,14 @@ fn operator_schemeless_connection_details_8205() {
 
 #[test]
 fn operator_capture_fixture_contains_nul_8205() {
-    assert!(operator_capture::CONTROL_PAIRS.contains(&('\0', "\\0")));
-    assert!(operator_capture::hostile_detail().contains('\0'));
+    assert!(
+        operator_capture::CONTROL_PAIRS.contains(&('\0', "\\0")),
+        "NUL pair absent"
+    );
+    assert!(
+        operator_capture::hostile_detail().contains('\0'),
+        "NUL absent from hostile fixture"
+    );
 }
 
 fn detail_lines_8205(detail: &str) -> [String; 2] {
@@ -277,7 +334,10 @@ fn operator_bare_authority_credentials_8205() {
                 !line.contains(SECRET),
                 "bare authority credential reached the sink"
             );
-            assert!(line.contains(ai_memory::logging::URL_PASSWORD_MASK));
+            assert!(
+                line.contains(ai_memory::logging::URL_PASSWORD_MASK),
+                "credential mask absent"
+            );
             assert!(line.contains("refused"), "connection context lost");
         }
     }
@@ -293,7 +353,10 @@ fn operator_bare_authority_last_at_credentials_8205() {
                 !line.contains(SECRET),
                 "credential after an account at-sign reached the sink"
             );
-            assert!(line.contains(ai_memory::logging::URL_PASSWORD_MASK));
+            assert!(
+                line.contains(ai_memory::logging::URL_PASSWORD_MASK),
+                "credential mask absent"
+            );
             assert!(line.contains("refused"), "connection context lost");
         }
     }
@@ -341,7 +404,10 @@ fn operator_quoted_credential_keys_8205() {
                 !line.contains(SECRET),
                 "quoted-key credential reached the sink"
             );
-            assert!(line.contains(ai_memory::logging::URL_PASSWORD_MASK));
+            assert!(
+                line.contains(ai_memory::logging::URL_PASSWORD_MASK),
+                "credential mask absent"
+            );
         }
     }
 }
@@ -369,7 +435,7 @@ fn operator_keyless_equal_error_chain_survives_8205() {
 }
 
 #[test]
-fn operator_unterminated_secret_keeps_later_context_8205() {
+fn operator_unterminated_secret_masks_complete_input_8205() {
     const SECRET: &str = "unterminated_fixture_8205";
     const CONTEXT: &str = "connection refused by database";
     let detail = format!("password='{SECRET} {CONTEXT}");
@@ -379,8 +445,8 @@ fn operator_unterminated_secret_keeps_later_context_8205() {
             "unterminated credential reached the sink"
         );
         assert!(
-            line.contains(CONTEXT),
-            "unterminated value consumed later context"
+            !line.contains(CONTEXT),
+            "unterminated value leaked its tail"
         );
     }
 }

@@ -594,7 +594,7 @@ fn rust_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
 
 fn userinfo_masker_reference_3711(code: &str) -> bool {
     const USERINFO_MASKERS: &[&str] = &["redact_url_password", "redact_urls_in_message"];
-    // TEST-02: assert on function values and aliased imports as well as calls.
+    // Match function values and aliased imports as well as calls.
     code.split(|ch: char| !(ch.is_alphanumeric() || ch == '_'))
         .any(|identifier| USERINFO_MASKERS.contains(&identifier))
 }
@@ -613,8 +613,14 @@ fn userinfo_masker_function_values_are_rejected_8205() {
             "userinfo-only function reference escaped the guard: {code}"
         );
     }
-    assert!(!userinfo_masker_reference_3711("redact_url_password_extra"));
-    assert!(!userinfo_masker_reference_3711("url_display::url_origin"));
+    assert!(
+        !userinfo_masker_reference_3711("redact_url_password_extra"),
+        "longer identifier is not the masker"
+    );
+    assert!(
+        !userinfo_masker_reference_3711("url_display::url_origin"),
+        "allowlist renderer must pass"
+    );
 }
 
 fn production_line_has_userinfo_masker_8205(line: &str) -> bool {
@@ -622,11 +628,12 @@ fn production_line_has_userinfo_masker_8205(line: &str) -> bool {
 }
 
 fn production_masker_lines_8205(source: &str) -> Vec<usize> {
+    let mut state = RustLineState8205::default();
     source
         .lines()
         .enumerate()
         .filter_map(|(index, line)| {
-            production_line_has_userinfo_masker_8205(line).then_some(index + 1)
+            userinfo_masker_reference_3711(state.before_comment(line)).then_some(index + 1)
         })
         .collect()
 }
@@ -640,47 +647,57 @@ fn multiline_literal_continuation_masker_is_rejected_8205() {
     );
 }
 
+#[derive(Default)]
+struct RustLineState8205 {
+    quoted: bool,
+    escaped: bool,
+    raw_hashes: Option<usize>,
+}
+
 fn rust_code_before_line_comment_8205(line: &str) -> &str {
-    let mut chars = line.char_indices().peekable();
-    let mut quoted = false;
-    let mut escaped = false;
-    let mut raw_hashes = None;
-    while let Some((offset, ch)) = chars.next() {
-        if let Some(hashes) = raw_hashes {
-            if ch == '"'
-                && line.as_bytes()[offset + ch.len_utf8()..]
-                    .get(..hashes)
-                    .is_some_and(|bytes| bytes.iter().all(|byte| *byte == b'#'))
-            {
-                raw_hashes = None;
+    RustLineState8205::default().before_comment(line)
+}
+
+impl RustLineState8205 {
+    fn before_comment<'a>(&mut self, line: &'a str) -> &'a str {
+        let mut chars = line.char_indices().peekable();
+        while let Some((offset, ch)) = chars.next() {
+            if let Some(hashes) = self.raw_hashes {
+                if ch == '"'
+                    && line.as_bytes()[offset + ch.len_utf8()..]
+                        .get(..hashes)
+                        .is_some_and(|bytes| bytes.iter().all(|byte| *byte == b'#'))
+                {
+                    self.raw_hashes = None;
+                }
+                continue;
             }
-            continue;
-        }
-        if quoted {
-            if escaped {
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
+            if self.quoted {
+                if self.escaped {
+                    self.escaped = false;
+                } else if ch == '\\' {
+                    self.escaped = true;
+                } else if ch == '"' {
+                    self.quoted = false;
+                }
+                continue;
+            }
+            if ch == 'r' {
+                let suffix = &line[offset + ch.len_utf8()..];
+                let hashes = suffix.bytes().take_while(|byte| *byte == b'#').count();
+                if suffix.as_bytes().get(hashes) == Some(&b'"') {
+                    self.raw_hashes = Some(hashes);
+                    let _ = chars.nth(hashes);
+                }
             } else if ch == '"' {
-                quoted = false;
+                self.quoted = true;
+            } else if ch == '/' && chars.peek().is_some_and(|(_, next)| *next == '/') {
+                // OWNERSHIP-15: char_indices provides the UTF-8-safe borrowed prefix.
+                return &line[..offset];
             }
-            continue;
         }
-        if ch == 'r' {
-            let suffix = &line[offset + ch.len_utf8()..];
-            let hashes = suffix.bytes().take_while(|byte| *byte == b'#').count();
-            if suffix.as_bytes().get(hashes) == Some(&b'"') {
-                raw_hashes = Some(hashes);
-                let _ = chars.nth(hashes);
-            }
-        } else if ch == '"' {
-            quoted = true;
-        } else if ch == '/' && chars.peek().is_some_and(|(_, next)| *next == '/') {
-            // OWNERSHIP-15: char_indices provides the UTF-8-safe borrowed prefix.
-            return &line[..offset];
-        }
+        line
     }
-    line
 }
 
 #[test]
@@ -695,12 +712,16 @@ fn userinfo_masker_after_url_literal_is_rejected_8205() {
             "userinfo masker after a URL literal escaped the production guard"
         );
     }
-    assert!(!production_line_has_userinfo_masker_8205(
-        "// logging::redact_url_password is retired"
-    ));
-    assert!(!production_line_has_userinfo_masker_8205(
-        "let safe = url_display::url_origin; // redact_url_password is retired"
-    ));
+    assert!(
+        !production_line_has_userinfo_masker_8205("// logging::redact_url_password is retired"),
+        "comment-only masker mention must be ignored"
+    );
+    assert!(
+        !production_line_has_userinfo_masker_8205(
+            "let safe = url_display::url_origin; // redact_url_password is retired"
+        ),
+        "trailing comment must be ignored"
+    );
 }
 
 #[test]
@@ -718,10 +739,8 @@ fn no_production_site_renders_a_url_through_the_userinfo_maskers_3711() {
             continue;
         }
         let text = std::fs::read_to_string(&file).expect("read source");
-        for (i, line) in text.lines().enumerate() {
-            if production_line_has_userinfo_masker_8205(line) {
-                offenders.push(format!("{}:{}: {}", rel.display(), i + 1, line.trim()));
-            }
+        for line in production_masker_lines_8205(&text) {
+            offenders.push(format!("{}:{line}", rel.display()));
         }
     }
     assert!(
