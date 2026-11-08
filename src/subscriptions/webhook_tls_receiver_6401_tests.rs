@@ -10,6 +10,7 @@ use axum::{
     extract::State,
     http::{HeaderMap, Method, Uri},
 };
+use axum_server::accept::Accept;
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::{Duration, Instant};
@@ -146,8 +147,45 @@ async fn receive(
 
 struct Receiver {
     requests: UnboundedReceiver<Received>,
+    handshake_failures: UnboundedReceiver<Option<rustls::Error>>,
     handle: axum_server::Handle<SocketAddr>,
     task: tokio::task::JoinHandle<std::io::Result<()>>,
+}
+
+/// Observe the real server handshake without changing certificate verification.
+#[derive(Clone)]
+struct RecordingAcceptor<A> {
+    inner: A,
+    failures: UnboundedSender<Option<rustls::Error>>,
+}
+
+impl<I, S, A> Accept<I, S> for RecordingAcceptor<A>
+where
+    A: Accept<I, S>,
+    A::Future: Send + 'static,
+{
+    type Stream = A::Stream;
+    type Service = A::Service;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = std::io::Result<(A::Stream, A::Service)>> + Send>,
+    >;
+
+    fn accept(&self, stream: I, service: S) -> Self::Future {
+        let accepted = self.inner.accept(stream, service);
+        let failures = self.failures.clone();
+        Box::pin(async move {
+            accepted.await.inspect_err(|error| {
+                failures
+                    .send(
+                        error
+                            .get_ref()
+                            .and_then(|cause| cause.downcast_ref::<rustls::Error>())
+                            .cloned(),
+                    )
+                    .expect("record receiver handshake failure");
+            })
+        })
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -172,7 +210,11 @@ impl Receiver {
         let config = crate::tls::load_rustls_config(&pki.leaf_pem, &pki.leaf_key_pem)
             .await
             .expect("test TLS config");
-        let acceptor = crate::tls::serve_rustls_acceptor(&config);
+        let (failures, handshake_failures) = unbounded_channel();
+        let acceptor = RecordingAcceptor {
+            inner: crate::tls::serve_rustls_acceptor(&config),
+            failures,
+        };
         let listener =
             TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("ephemeral loopback listener");
         listener.set_nonblocking(true).expect("async listener");
@@ -190,6 +232,7 @@ impl Receiver {
         let task = tokio::spawn(server.serve(app.into_make_service()));
         Self {
             requests,
+            handshake_failures,
             handle,
             task,
         }
@@ -337,17 +380,44 @@ async fn check_untrusted_ca() {
     let conn = crate::db::open(file.path()).expect("production SQLite schema");
     let id = register(&conn, super::IMPLICIT_URL);
     dispatch(&conn, file.path()).await;
-    assert!(
-        receiver.requests.try_recv().is_err(),
-        "#8649: untrusted certificate must prevent HTTP delivery"
+    // The client verifies the server certificate. The server observes the
+    // client's UnknownCA alert; this is not a server-side client-cert check.
+    let failure = tokio::time::timeout(SERVER_TIMEOUT, receiver.handshake_failures.recv())
+        .await
+        .expect("receiver must observe certificate rejection within the deadline")
+        .expect("receiver handshake evidence channel must remain open");
+    assert_eq!(
+        failure,
+        Some(rustls::Error::AlertReceived(
+            rustls::AlertDescription::UnknownCA
+        )),
+        "#8649: the same receiver must observe the client's unknown-CA TLS alert"
+    );
+    assert_eq!(
+        receiver.requests.len(),
+        0,
+        "#8649: untrusted certificate must yield exactly zero accepted HTTP requests"
     );
     let rows = list_dlq(&conn, Some(&id)).expect("DLQ query");
     assert_eq!(rows.len(), 1, "untrusted certificate must dead-letter");
-    assert!(
-        rows[0].last_error.contains("certificate") || rows[0].last_error.contains("tls"),
-        "#8649: untrusted CA must name TLS/certificate verification refusal: {}",
-        rows[0].last_error
+    assert_eq!(
+        rows[0].last_error, "network: connect",
+        "#8649 ruling B: TLS refusal preserves the exact sanitized DLQ vocabulary"
     );
+    for forbidden in [
+        super::IMPLICIT_URL,
+        "https://",
+        "localhost",
+        "443",
+        "?",
+        "@",
+        "/hook",
+    ] {
+        assert!(
+            !rows[0].last_error.contains(forbidden),
+            "#8649: sanitized TLS refusal must contain no URL, host, port, query or userinfo"
+        );
+    }
     let status: String = conn
         .query_row(
             "SELECT delivery_status FROM subscription_events WHERE subscription_id = ?1",
