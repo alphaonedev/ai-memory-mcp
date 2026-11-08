@@ -371,7 +371,8 @@ pub(crate) fn tls_fixture_paths() -> (PathBuf, PathBuf) {
 /// `localhost`), so a VERIFYING client accepts the mock exactly the way a
 /// production peer would — no `danger_accept_invalid_certs` anywhere.
 /// Generated once with rcgen under `TMPDIR`. The static is never dropped;
-/// on Unix an exit hook removes only this PKI's owned directory. See the
+/// on Unix the directory is created with mode 0700 and an exit hook removes
+/// only this PKI's owned directory. See the
 /// module documentation for abnormal-exit and non-Unix limitations.
 pub(crate) struct TlsTestPki {
     #[cfg(unix)]
@@ -383,7 +384,7 @@ pub(crate) struct TlsTestPki {
     pub(crate) ca_pem: PathBuf,
     /// The leaf certificate (PEM) a mock listener presents.
     pub(crate) leaf_pem: PathBuf,
-    /// The leaf's PKCS#8 private key (PEM, mode 0600).
+    /// The leaf's PKCS#8 private key (PEM, created with mode 0600 on Unix).
     pub(crate) leaf_key_pem: PathBuf,
 }
 
@@ -435,7 +436,20 @@ fn register_tls_test_pki_cleanup() {
 }
 
 fn generate_tls_test_pki() -> TlsTestPki {
-    let dir = tempfile::tempdir().expect("TMPDIR tempdir for the #3705 test PKI");
+    use std::io::Write as _;
+
+    #[cfg(unix)]
+    let dir = {
+        use std::os::unix::fs::PermissionsExt as _;
+        const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
+        // #8663: tempfile passes this mode to DirBuilder before mkdir, not chmod.
+        tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE))
+            .tempdir()
+    };
+    #[cfg(not(unix))]
+    let dir = tempfile::tempdir();
+    let dir = dir.expect("TMPDIR tempdir for the #3705 test PKI");
     let ca_key = rcgen::KeyPair::generate().expect("test CA key");
     let mut ca_params =
         rcgen::CertificateParams::new(Vec::<String>::new()).expect("test CA params");
@@ -461,13 +475,21 @@ fn generate_tls_test_pki() -> TlsTestPki {
     let leaf_key_pem = dir.path().join("test-leaf-key.pem");
     std::fs::write(&ca_pem, ca_cert.pem()).expect("write test CA");
     std::fs::write(&leaf_pem, leaf_cert.pem()).expect("write test leaf");
-    std::fs::write(&leaf_key_pem, leaf_key.serialize_pem()).expect("write test leaf key");
+    let mut key_options = std::fs::OpenOptions::new();
+    key_options.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&leaf_key_pem, std::fs::Permissions::from_mode(0o600))
-            .expect("chmod 0600 test leaf key");
+        use std::os::unix::fs::OpenOptionsExt as _;
+        const PRIVATE_KEY_MODE: u32 = 0o600;
+        // #8663: restrict the creation syscall, before any private bytes are written.
+        key_options.mode(PRIVATE_KEY_MODE);
     }
+    let mut key_file = key_options
+        .open(&leaf_key_pem)
+        .expect("create private test leaf key");
+    key_file
+        .write_all(leaf_key.serialize_pem().as_bytes())
+        .expect("write test leaf key");
     TlsTestPki {
         #[cfg(unix)]
         dir,
