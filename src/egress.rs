@@ -481,20 +481,38 @@ pub struct PinnedTarget {
     pub addrs: Vec<SocketAddr>,
 }
 
+/// Default TCP port for unencrypted HTTP inference endpoints.
+const INFERENCE_HTTP_PORT: u16 = 80;
+/// Default TCP port for TLS HTTP inference endpoints.
+const INFERENCE_HTTPS_PORT: u16 = 443;
+
+/// #8650: only HTTP schemes have an inference port (ERRORS-04).
+fn inference_scheme_port(scheme: &str) -> Option<u16> {
+    match scheme {
+        "http" => Some(INFERENCE_HTTP_PORT),
+        "https" => Some(INFERENCE_HTTPS_PORT),
+        _ => None,
+    }
+}
+
 /// #3822 (A2) — resolve the URL's authority to socket addresses. An IP literal
 /// resolves without DNS; a hostname uses the system resolver. Failure / empty
 /// set is an `Err` (fail CLOSED — `AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL` does
 /// NOT apply on this lane). Returns `(resolved_host, addrs)`.
 fn resolve_inference_authority(url: &str) -> Result<(String, Vec<SocketAddr>), String> {
     let lower = url.to_ascii_lowercase();
-    let rest = lower.split_once("://").map_or(lower.as_str(), |(_, r)| r);
+    let (scheme, rest) = lower
+        .split_once("://")
+        .ok_or_else(|| "inference target URL is missing a scheme".to_string())?;
+    let default_port = inference_scheme_port(scheme)
+        .ok_or_else(|| "inference target requires an http or https scheme".to_string())?;
     let host_port = crate::subscriptions::authority_without_userinfo(rest);
     if host_port.is_empty() {
         return Err("target URL has no authority to resolve".to_string());
     }
     // Bracket/port-stripped host (the reqwest resolve key), and a resolvable
-    // `host:port` (default 80 when the URL omits the port), mirroring the
-    // subscriptions SSRF lane's normalization.
+    // `host:port`, using the scheme default only when no port is explicit.
+    // The pin must match the port reqwest selects for the original URL (#8650).
     let (resolved_host, resolv_target) =
         if let Some(close) = host_port.strip_prefix('[').and(host_port.find(']')) {
             let inner = host_port[1..close].to_string();
@@ -502,16 +520,13 @@ fn resolve_inference_authority(url: &str) -> Result<(String, Vec<SocketAddr>), S
             let tgt = if after.starts_with(':') {
                 host_port.to_string()
             } else {
-                crate::subscriptions::host_port_with_default_http_port(host_port)
+                format!("{host_port}:{default_port}")
             };
             (inner, tgt)
         } else if let Some(idx) = host_port.rfind(':') {
             (host_port[..idx].to_string(), host_port.to_string())
         } else {
-            (
-                host_port.to_string(),
-                crate::subscriptions::host_port_with_default_http_port(host_port),
-            )
+            (host_port.to_string(), format!("{host_port}:{default_port}"))
         };
     match resolv_target.to_socket_addrs() {
         Ok(iter) => {
@@ -671,8 +686,15 @@ mod tests {
 
     #[test]
     fn inference_authority_rejects_unsupported_scheme_8650() {
-        for url in ["ftp://127.0.0.1/v1", "ftp://[::1]:8443/v1", "127.0.0.1:8443"] {
-            assert!(resolve_inference_authority(url).is_err(), "must refuse {url}");
+        for url in [
+            "ftp://127.0.0.1/v1",
+            "ftp://[::1]:8443/v1",
+            "127.0.0.1:8443",
+        ] {
+            assert!(
+                resolve_inference_authority(url).is_err(),
+                "must refuse {url}"
+            );
             assert!(
                 admit_inference_target(
                     InferenceEgressMode::InternalOnly,
