@@ -57,6 +57,7 @@
 use anyhow::Result;
 use rusqlite::Connection;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::num::NonZeroU16;
 
 /// Env var selecting the inference-plane egress posture.
 pub const ENV_INFERENCE_EGRESS: &str = "AI_MEMORY_INFERENCE_EGRESS";
@@ -471,8 +472,8 @@ pub fn evaluate_inference_egress_resolved(
 }
 
 /// #3822 (A2) — a target admitted for pinning under [`InferenceEgressMode::InternalOnly`].
-/// `host` is the bracket/port-stripped host string reqwest's `.resolve(host, addr)`
-/// keys on; `addrs` are the boot-resolved addresses to pin.
+/// `host` is the canonical `reqwest::Url::host_str()` value; `addrs` are
+/// the boot-resolved addresses to pin. IPv6 host strings retain their brackets.
 #[derive(Debug, Clone)]
 pub struct PinnedTarget {
     /// The resolved host string (reqwest resolve key).
@@ -481,16 +482,11 @@ pub struct PinnedTarget {
     pub addrs: Vec<SocketAddr>,
 }
 
-/// Default TCP port for unencrypted HTTP inference endpoints.
-const INFERENCE_HTTP_PORT: u16 = 80;
-/// Default TCP port for TLS HTTP inference endpoints.
-const INFERENCE_HTTPS_PORT: u16 = 443;
-
-/// #8650: only HTTP schemes have an inference port (ERRORS-04).
-fn inference_scheme_port(scheme: &str) -> Option<u16> {
-    match scheme {
-        "http" => Some(INFERENCE_HTTP_PORT),
-        "https" => Some(INFERENCE_HTTPS_PORT),
+/// #8650: retain the HTTP/HTTPS policy while using the connection parser's port.
+/// PERF-15 / ERRORS-09: a validated nonzero port prevents a pin to port zero.
+fn inference_scheme_port(url: &reqwest::Url) -> Option<NonZeroU16> {
+    match url.scheme() {
+        "http" | "https" => url.port_or_known_default().and_then(NonZeroU16::new),
         _ => None,
     }
 }
@@ -500,34 +496,19 @@ fn inference_scheme_port(scheme: &str) -> Option<u16> {
 /// set is an `Err` (fail CLOSED — `AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL` does
 /// NOT apply on this lane). Returns `(resolved_host, addrs)`.
 fn resolve_inference_authority(url: &str) -> Result<(String, Vec<SocketAddr>), String> {
-    let lower = url.to_ascii_lowercase();
-    let (scheme, rest) = lower
-        .split_once("://")
-        .ok_or_else(|| "inference target URL is missing a scheme".to_string())?;
-    let default_port = inference_scheme_port(scheme)
-        .ok_or_else(|| "inference target requires an http or https scheme".to_string())?;
-    let host_port = crate::subscriptions::authority_without_userinfo(rest);
-    if host_port.is_empty() {
-        return Err("target URL has no authority to resolve".to_string());
-    }
-    // Bracket/port-stripped host (the reqwest resolve key), and a resolvable
-    // `host:port`, using the scheme default only when no port is explicit.
-    // The pin must match the port reqwest selects for the original URL (#8650).
-    let (resolved_host, resolv_target) =
-        if let Some(close) = host_port.strip_prefix('[').and(host_port.find(']')) {
-            let inner = host_port[1..close].to_string();
-            let after = &host_port[close + 1..];
-            let tgt = if after.starts_with(':') {
-                host_port.to_string()
-            } else {
-                format!("{host_port}:{default_port}")
-            };
-            (inner, tgt)
-        } else if let Some(idx) = host_port.rfind(':') {
-            (host_port[..idx].to_string(), host_port.to_string())
-        } else {
-            (host_port.to_string(), format!("{host_port}:{default_port}"))
-        };
+    // #8650: admission and reqwest must interpret the same authority. A second
+    // hand-written parser can classify one host while the client connects to another.
+    // ERRORS-15: retain the parse cause without including the credential-bearing URL.
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|error| format!("invalid inference target URL: {error}"))?;
+    let port = inference_scheme_port(&parsed)
+        .ok_or_else(|| "inference target requires http or https with a nonzero port".to_string())?;
+    let resolved_host = parsed
+        .host_str()
+        .ok_or_else(|| "target URL has no authority to resolve".to_string())?;
+    // host_str retains IPv6 brackets, so this is a socket-address authority for
+    // both IP families and DNS names. No userinfo or path reaches the resolver.
+    let resolv_target = format!("{resolved_host}:{}", port.get());
     match resolv_target.to_socket_addrs() {
         Ok(iter) => {
             let addrs: Vec<SocketAddr> = iter.collect();
@@ -536,7 +517,7 @@ fn resolve_inference_authority(url: &str) -> Result<(String, Vec<SocketAddr>), S
                     "target host {resolved_host} resolved to no addresses (internal-only fails closed)"
                 ))
             } else {
-                Ok((resolved_host, addrs))
+                Ok((resolved_host.to_string(), addrs))
             }
         }
         Err(e) => Err(format!(
