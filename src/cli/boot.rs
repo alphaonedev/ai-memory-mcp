@@ -1792,6 +1792,63 @@ mod tests {
         );
     }
 
+    /// #8679 / #8683 - invariant 1: the boot hook is an entry path that
+    /// reaches a schema-ahead refusal, so it prints the single
+    /// `schema_guard` refusal text (the same bytes `db::open` returns), in the
+    /// text header and in the JSON `note`, not a boot-private string.
+    #[test]
+    fn boot_schema_ahead_prints_the_shared_refusal_text_8683() {
+        let _g = test_lock();
+        let _guard_env = crate::storage::schema_guard::test_env_lock();
+        // SAFETY: process-wide env mutation, serialised by `_guard_env`.
+        unsafe {
+            std::env::remove_var(crate::storage::schema_guard::ENV_ALLOW_SCHEMA_AHEAD);
+        }
+        let cfg = default_config();
+        let mut env = TestEnv::fresh();
+        seed_memory(&env.db_path, "ns-ahead", "row", "x");
+        override_schema_version(&env.db_path, i64::from(MAX_SUPPORTED_SCHEMA) + 1);
+        let expected = crate::storage::schema_guard::schema_ahead_of(
+            &db::open(&env.db_path).expect_err("an ahead database is refused"),
+        )
+        .expect("typed refusal")
+        .detail
+        .clone();
+        let db_path = env.db_path.clone();
+        let mut args = default_args();
+        args.namespace = Some("ns-ahead".to_string());
+        let mut out = env.output();
+        run(&db_path, &args, &cfg, &mut out).unwrap();
+        let stdout = std::str::from_utf8(&env.stdout).unwrap().to_string();
+        assert!(stdout.contains("# ai-memory boot: warn"), "{stdout}");
+        assert!(
+            stdout.contains(&expected),
+            "text header must carry the shared refusal text verbatim: {stdout}"
+        );
+        assert!(
+            !stdout.contains("unsupported by binary"),
+            "the boot-private string must be gone: {stdout}"
+        );
+
+        let mut env = TestEnv::fresh();
+        seed_memory(&env.db_path, "ns-ahead", "row", "x");
+        override_schema_version(&env.db_path, i64::from(MAX_SUPPORTED_SCHEMA) + 1);
+        let json_db = env.db_path.clone();
+        let mut json_args = default_args();
+        json_args.namespace = Some("ns-ahead".to_string());
+        json_args.format = "json".to_string();
+        let mut out = env.output();
+        run(&json_db, &json_args, &cfg, &mut out).unwrap();
+        let json: serde_json::Value =
+            serde_json::from_str(std::str::from_utf8(&env.stdout).unwrap().trim()).unwrap();
+        let note = json["note"].as_str().expect("note");
+        assert!(
+            note.contains("database schema is AHEAD of this binary"),
+            "JSON note must be the shared refusal text: {note}"
+        );
+        assert!(note.contains("upgrade ai-memory to the build that wrote this database"));
+    }
+
     /// v1.0.0 #2564 — a destroyed stamp must NOT reuse the
     /// `WarnSchemaUnsupported` "consider upgrading" copy. The binary is
     /// already the right one; the operator needs backup-first / restore-the-

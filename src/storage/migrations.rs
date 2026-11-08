@@ -1142,7 +1142,7 @@ fn database_holds_durable_rows(conn: &Connection) -> Result<bool> {
 ///
 /// The snapshot path encodes the from→to version span plus a monotonic
 /// nanosecond token, so repeated upgrades of the same DB never collide.
-fn snapshot_before_migration(
+pub(super) fn snapshot_before_migration(
     conn: &Connection,
     from_version: i64,
     to_version: i64,
@@ -1934,9 +1934,7 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             }
             // ERRORS-02: propagate DDL/commit failures; the guard rolls back
             // both definitions together if repair cannot complete.
-            let repair_txn = super::connection::WriteTxn::begin_exclusive(conn)?;
-            crate::storage::embed_skip::repair_sqlite_after_trigger_gap(conn)?;
-            repair_txn.commit()?;
+            crate::storage::embed_skip::repair_under_writer_lock(conn)?;
         }
         return Ok(());
     }

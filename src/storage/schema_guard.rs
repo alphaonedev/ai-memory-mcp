@@ -691,6 +691,27 @@ mod tests {
         out
     }
 
+    /// #8679 F2 - the copy-advice clause names the selector of the backend
+    /// that produced the refusal. `--db` selects a sqlite file only; a
+    /// postgres store is selected with `--store-url`.
+    #[test]
+    fn remediation_names_the_selector_of_the_refusing_backend_8679() {
+        with_hatch(None, || {
+            let sqlite = evaluate(92, 87, BACKEND_SQLITE, "/db").unwrap_err().detail;
+            assert!(
+                sqlite.contains("open a backup copy with --db <copy>"),
+                "{sqlite}"
+            );
+            assert!(!sqlite.contains("--store-url"), "{sqlite}");
+            let pg = evaluate(92, 87, BACKEND_POSTGRES, "pg").unwrap_err().detail;
+            assert!(
+                pg.contains("open a backup copy with --store-url <copy-url>"),
+                "{pg}"
+            );
+            assert!(!pg.contains("--db <copy>"), "{pg}");
+        });
+    }
+
     #[test]
     fn equal_or_older_is_always_permitted() {
         with_hatch(None, || {

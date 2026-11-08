@@ -171,6 +171,22 @@ pub(super) fn repair_sqlite_after_trigger_gap(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// #4078 / #8679 - run the trigger-gap repair under the writer lock.
+///
+/// Returns `true` when the repair ran and committed. The caller probed the
+/// clear-trigger count BEFORE taking the lock; the repair also clears the
+/// derived `embed_skip` cache, so it must be decided under the lock.
+///
+/// # Errors
+///
+/// Propagates the lock, DDL or commit failure; the guard rolls back (ERRORS-02).
+pub(crate) fn repair_under_writer_lock(conn: &Connection) -> Result<bool> {
+    let repair_txn = super::connection::WriteTxn::begin_exclusive(conn)?;
+    repair_sqlite_after_trigger_gap(conn)?;
+    repair_txn.commit()?;
+    Ok(true)
+}
+
 /// Why a row was remembered as unembeddable. A descriptive enum, not a
 /// bare bool (API-09).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -24777,6 +24777,8 @@ pub fn reflect_input_from_pending(
 mod forensic_ident_namespace_3774_tests;
 #[cfg(test)]
 mod governance_read_fault_4043_tests;
+#[cfg(all(test, unix))]
+mod snapshot_mode_8679_tests;
 #[cfg(test)]
 pub(crate) mod txn_immediate_5084_tests;
 #[cfg(test)]

@@ -31,11 +31,13 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use ai_memory::db;
+use ai_memory::storage::embed_skip::{TRIGGER_CLEAR_ON_CONTENT, TRIGGER_CLEAR_ON_EMBED};
 use ai_memory::storage::migrations::{
     current_schema_version, pre_migration_backup_infix_for_tests,
 };
 use ai_memory::storage::schema_guard::{ENV_ALLOW_SCHEMA_AHEAD, schema_ahead_of};
 use sha2::{Digest, Sha256};
+use std::os::unix::fs::PermissionsExt;
 
 /// Scratch root for every fixture, under the worktree's gitignored `.local-runs/`.
 const FIXTURE_ROOT: &str = ".local-runs/issue-8677-cross-build";
@@ -46,11 +48,17 @@ const SEED_CONTENT: &str = "durable text that must survive every cross-build ope
 const NEWER_BUILD_SCHEMA_LEAD: i64 = 3;
 /// The previous-release schema shape reproduced by [`PREVIOUS_RELEASE_SHAPE`].
 const PREVIOUS_RELEASE_SCHEMA: i64 = 96;
-/// The two derived-state triggers the #4078 repair reinstalls.
-const CLEAR_TRIGGERS: [&str; 2] = [
-    "memories_embed_skip_clear_on_content",
-    "memories_embed_skip_clear_on_embed",
-];
+/// The two derived-state triggers the #4078 repair reinstalls (SSOT names).
+const CLEAR_TRIGGERS: [&str; 2] = [TRIGGER_CLEAR_ON_CONTENT, TRIGGER_CLEAR_ON_EMBED];
+/// Permission bits compared on the database and its snapshots.
+const MODE_MASK: u32 = 0o777;
+/// Source modes the snapshots must reproduce (invariant 2).
+const OWNER_ONLY_MODE: u32 = 0o600;
+const GROUP_READABLE_MODE: u32 = 0o640;
+/// The derived cache row the repair clears and the snapshot must still hold.
+const SEED_SKIP_SQL: &str = "INSERT INTO embed_skip \
+    (memory_id, agent_id, key_fingerprint, reason, created_at) \
+    VALUES ('m-8677', '', 'fp', 'oversize', '2026-01-01T00:00:00Z')";
 
 /// Reverse the documented additive v97-v100 migrations so the file has the
 /// exact v96 shape the previous release wrote (same reversal as
@@ -114,6 +122,67 @@ fn snapshots(dir: &Path) -> Vec<PathBuf> {
                 .is_some_and(|n| n.to_string_lossy().contains(infix))
         })
         .collect()
+}
+
+fn mode_of(path: &Path) -> u32 {
+    std::fs::metadata(path).expect("stat").permissions().mode() & MODE_MASK
+}
+
+fn set_mode(path: &Path, mode: u32) {
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("chmod");
+}
+
+/// Digest of everything in the file except the named exclusions: the
+/// `sqlite_master` rows (type, name, table, sql) minus excluded object names,
+/// and every row of every table minus excluded tables.
+fn state_digest(path: &Path, skip_objects: &[&str], skip_tables: &[&str]) -> String {
+    let conn = db::open_unmigrated(path).expect("digest open");
+    let mut hasher = Sha256::new();
+    let mut objects: Vec<String> = conn
+        .prepare("SELECT type, name, tbl_name, COALESCE(sql, '') FROM sqlite_master")
+        .unwrap()
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })
+        .unwrap()
+        .map(Result::unwrap)
+        .filter(|(_, name, _, _)| !skip_objects.contains(&name.as_str()))
+        .map(|(a, b, c, d)| format!("{a}|{b}|{c}|{d}"))
+        .collect();
+    objects.sort();
+    hasher.update(objects.join("\n"));
+    let tables: Vec<String> = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .filter(|t| !skip_tables.contains(&t.as_str()))
+        .collect();
+    let mut sorted_tables = tables;
+    sorted_tables.sort();
+    for table in sorted_tables {
+        let mut stmt = conn.prepare(&format!("SELECT * FROM \"{table}\"")).unwrap();
+        let width = stmt.column_count();
+        let mut rows: Vec<String> = stmt
+            .query_map([], |r| {
+                Ok((0..width)
+                    .map(|i| format!("{:?}", r.get_ref(i).unwrap()))
+                    .collect::<Vec<_>>()
+                    .join(","))
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        rows.sort();
+        hasher.update(format!("\n#{table}\n{}", rows.join("\n")));
+    }
+    hex::encode(hasher.finalize())
 }
 
 fn seed(conn: &rusqlite::Connection) {
@@ -250,6 +319,7 @@ fn current_build_snapshots_then_migrates_previous_release_database_8677() {
         "fixture has no snapshot"
     );
     let previous_release_hash = sha256_hex(&path);
+    set_mode(&path, GROUP_READABLE_MODE);
 
     // Upgrade.
     drop(db::open(&path).expect("current build migrates the previous release"));
@@ -268,7 +338,15 @@ fn current_build_snapshots_then_migrates_previous_release_database_8677() {
         )),
         "snapshot names the from/to span: {snap_name}"
     );
-    // The snapshot is the previous-release image: old stamp, durable row intact.
+    // The snapshot is taken after the bootstrap schema replay (#8680, a
+    // separate defect), so it is NOT asserted to be table-for-table the
+    // previous-release image. What it must hold is the old stamp and the
+    // durable row, and it must be exactly as private as its source.
+    assert_eq!(
+        mode_of(&snaps[0]),
+        GROUP_READABLE_MODE,
+        "snapshot mode = source mode"
+    );
     assert_eq!(stamp_of(&snaps[0]), PREVIOUS_RELEASE_SCHEMA);
     assert_eq!(seeded_content(&snaps[0]), SEED_CONTENT);
     assert_ne!(sha256_hex(&path), previous_release_hash, "live db migrated");
@@ -316,6 +394,7 @@ fn second_build_same_schema_only_repairs_derived_state_after_a_snapshot_8677() {
     no_hatch();
     let dir = fixture_dir();
     let path = current_build_db(dir.path());
+    set_mode(&path, OWNER_ONLY_MODE);
     {
         // The #4078 damage: an older build left the schema stamped at the tip
         // after dropping the derived-cache clear triggers.
@@ -324,7 +403,18 @@ fn second_build_same_schema_only_repairs_derived_state_after_a_snapshot_8677() {
             conn.execute_batch(&format!("DROP TRIGGER {trigger}"))
                 .unwrap();
         }
+        conn.execute(SEED_SKIP_SQL, [])
+            .expect("seed derived cache row");
     }
+    let skip_rows = |p: &Path| -> i64 {
+        db::open_unmigrated(p)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM embed_skip", [], |r| r.get(0))
+            .unwrap()
+    };
+    assert_eq!(skip_rows(&path), 1);
+    // Everything except the two triggers and the derived cache.
+    let digest_before = state_digest(&path, &CLEAR_TRIGGERS, &["embed_skip"]);
     let triggers = |p: &Path| -> i64 {
         db::open_unmigrated(p)
             .unwrap()
@@ -341,6 +431,12 @@ fn second_build_same_schema_only_repairs_derived_state_after_a_snapshot_8677() {
 
     // The only change allowed: the documented derived-state repair.
     assert_eq!(triggers(&path), 2, "derived triggers reinstalled");
+    assert_eq!(skip_rows(&path), 0, "derived cache cleared by the repair");
+    assert_eq!(
+        state_digest(&path, &CLEAR_TRIGGERS, &["embed_skip"]),
+        digest_before,
+        "the repair changes nothing but the triggers and the derived cache"
+    );
     assert_eq!(stamp_of(&path), current_schema_version(), "stamp unchanged");
     assert_eq!(
         seeded_content(&path),
@@ -352,6 +448,22 @@ fn second_build_same_schema_only_repairs_derived_state_after_a_snapshot_8677() {
     let snaps = snapshots(dir.path());
     assert_eq!(snaps.len(), 1, "one snapshot before the repair: {snaps:?}");
     let image = &snaps[0];
+    let expected_infix = format!(
+        "{}-v{cur}-to-v{cur}-",
+        pre_migration_backup_infix_for_tests(),
+        cur = current_schema_version()
+    );
+    let image_name = image.file_name().unwrap().to_string_lossy().into_owned();
+    assert!(
+        image_name.contains(&expected_infix),
+        "same-version snapshot name carries {expected_infix}: {image_name}"
+    );
+    assert_eq!(
+        mode_of(image),
+        OWNER_ONLY_MODE,
+        "snapshot mode = source mode"
+    );
+    assert_eq!(skip_rows(image), 1, "snapshot still holds the cache row");
     assert_eq!(triggers(image), 0, "snapshot predates the repair");
     assert_eq!(seeded_content(image), SEED_CONTENT);
 }

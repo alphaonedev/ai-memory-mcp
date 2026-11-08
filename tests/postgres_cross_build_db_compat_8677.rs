@@ -181,7 +181,14 @@ async fn pg_older_build_refuses_newer_database_unchanged_with_actionable_text_86
         msg.contains("upgrade ai-memory to the build that wrote this database"),
         "{msg}"
     );
-    assert!(msg.contains("open a backup copy with --db <copy>"), "{msg}");
+    assert!(
+        msg.contains("open a backup copy with --store-url <copy-url>"),
+        "postgres remediation names the postgres selector: {msg}"
+    );
+    assert!(
+        !msg.contains("--db <copy>"),
+        "--db selects a sqlite file and must not be advised on postgres: {msg}"
+    );
     assert_eq!(
         content_digest(&url).await,
         before,
