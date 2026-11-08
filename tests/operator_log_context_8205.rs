@@ -189,7 +189,7 @@ fn dlq_without_owner_table() -> rusqlite::Connection {
 #[test]
 fn operator_log_renders_only_url_origins_6822() {
     const QUERY_SECRET: &str = "query_credential_8205";
-    const FRAGMENT_SECRET: &str = "fragment_credential_8205";
+    const FRAGMENT_SECRET: &str = "fragment_fixture_8205";
     const PATH_SECRET: &str = "path_credential_8205";
     let inner =
         format!("connect https://query.example.invalid/{PATH_SECRET}?password={QUERY_SECRET}");

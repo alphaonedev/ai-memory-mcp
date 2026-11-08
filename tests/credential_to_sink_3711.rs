@@ -679,6 +679,39 @@ fn rust_code_before_line_comment_8205(line: &str) -> &str {
     RustLineState8205::default().before_comment(line)
 }
 
+// A lifetime is not a char literal; consume only a complete Rust char token.
+fn char_literal_end_8205(text: &str) -> Option<usize> {
+    let mut chars = text.char_indices();
+    if chars.next()?.1 != '\'' {
+        return None;
+    }
+    let (_, value) = chars.next()?;
+    if value == '\\' {
+        let (_, escape) = chars.next()?;
+        match escape {
+            'u' => {
+                if chars.next()?.1 != '{' {
+                    return None;
+                }
+                loop {
+                    if chars.next()?.1 == '}' {
+                        break;
+                    }
+                }
+            }
+            'x' => {
+                chars.next()?;
+                chars.next()?;
+            }
+            _ => {}
+        }
+    } else if matches!(value, '\'' | '\n' | '\r') {
+        return None;
+    }
+    let (end, quote) = chars.next()?;
+    (quote == '\'').then_some(end + quote.len_utf8())
+}
+
 impl RustLineState8205 {
     fn before_comment<'a>(&mut self, line: &'a str) -> &'a str {
         let mut chars = line.char_indices().peekable();
@@ -700,6 +733,14 @@ impl RustLineState8205 {
                     self.escaped = true;
                 } else if ch == '"' {
                     self.quoted = false;
+                }
+                continue;
+            }
+            if ch == '\''
+                && let Some(end) = char_literal_end_8205(&line[offset..])
+            {
+                while chars.peek().is_some_and(|(at, _)| *at < offset + end) {
+                    let _ = chars.next();
                 }
                 continue;
             }

@@ -1583,11 +1583,22 @@ const CREDENTIAL_OPTION_KEYS: &[&str] = &[
     "secretkey",
     "privatekey",
     "clientsecret",
+    "session",
+    "cookie",
+    "jwt",
 ];
 /// These short names are credentials only when the whole normalized key matches.
 const EXACT_CREDENTIAL_KEYS: &[&str] = &["key", "auth"];
-/// Punctuation allowed inside an unquoted ASCII credential key.
+/// ASCII punctuation removed when normalizing a credential key.
 const CREDENTIAL_KEY_PUNCTUATION: [char; 2] = ['_', '-'];
+/// Unicode dash spellings normalized to the same credential-key hyphen.
+const CREDENTIAL_KEY_DASHES: &[char] = &[
+    '\u{2010}', '\u{2011}', '\u{2012}', '\u{2013}', '\u{2014}', '\u{2015}', '\u{2212}', '\u{fe63}',
+];
+/// Fullwidth ASCII compatibility block and its offset to ASCII.
+const FULLWIDTH_ASCII_START: u32 = 0xff01;
+const FULLWIDTH_ASCII_END: u32 = 0xff5e;
+const FULLWIDTH_ASCII_OFFSET: u32 = 0xfee0;
 /// Closing punctuation ends a keyless URL, but never an identified secret value.
 const KEYLESS_URL_TERMINATORS: [char; 3] = ['\'', ')', '>'];
 /// Credential spans stop at physical line endings unless a quote owns the span.
@@ -1659,25 +1670,76 @@ pub fn redact_urls_in_message(msg: &str) -> String {
 /// The legacy userinfo wrapper bypasses this operator-only option policy.
 pub(crate) fn map_urls_in_message(msg: &str, render: fn(&str) -> String) -> String {
     let options = redact_connection_options(msg);
-    let mut text = String::with_capacity(options.len());
-    // OWNERSHIP-15: every slice endpoint comes from a char boundary.
-    for part in options.split_inclusive(char::is_whitespace) {
-        let token = part.trim_end_matches(char::is_whitespace);
-        let is_bare_target = !token.contains(SCHEME_SEPARATOR)
-            && (token
-                .find(AUTHORITY_TERMINATORS)
-                .is_some_and(|end| token[..end].contains(':'))
-                || token
-                    .rsplit_once('@')
-                    .is_some_and(|(userinfo, _)| userinfo.contains(':')));
-        text.push_str(if is_bare_target {
-            URL_PASSWORD_MASK
-        } else {
-            token
-        });
-        text.push_str(&part[token.len()..]);
-    }
+    let text = redact_bare_targets(&options);
     map_url_runs(&text, |url| render_operator_url(url, render))
+}
+
+/// Consume a scheme-less authority through its host, including a spaced password.
+/// URL spans are skipped as units so their userinfo is never partially rewritten.
+fn redact_bare_targets(msg: &str) -> String {
+    let mut out = String::with_capacity(msg.len());
+    let mut offset = 0;
+    let mut pending_url = next_url_span(msg);
+    let mut lookahead_end = 0;
+    let mut last_at = None;
+    while offset < msg.len() {
+        if let Some(span) = pending_url.as_ref().filter(|span| span.start == offset) {
+            out.push_str(&msg[span.clone()]);
+            offset = span.end;
+            lookahead_end = offset;
+            pending_url =
+                next_url_span(&msg[offset..]).map(|next| offset + next.start..offset + next.end);
+            continue;
+        }
+        let rest = &msg[offset..];
+        let stop = pending_url
+            .as_ref()
+            .map_or(rest.len(), |span| span.start - offset);
+        let local = &rest[..stop];
+        if offset >= lookahead_end {
+            let line_end = local.find(CREDENTIAL_LINE_ENDS).unwrap_or(local.len());
+            lookahead_end = offset + line_end;
+            last_at = local[..line_end].rfind('@').map(|at| offset + at);
+        }
+        let end = local.find(char::is_whitespace).unwrap_or(local.len());
+        let token = &local[..end];
+        let ambiguous = credentialed_authority(token)
+            && token
+                .split_once(':')
+                .is_some_and(|(_, value)| !value.is_empty());
+        let lookahead = lookahead_end - offset;
+        let at = last_at.filter(|at| *at >= offset).map(|at| at - offset);
+        let bare = ambiguous && (at.is_some() || token.contains(AUTHORITY_TERMINATORS));
+        if bare {
+            let consumed = at.map_or(end, |at| {
+                let host = at + '@'.len_utf8();
+                host + local[host..lookahead]
+                    .find(char::is_whitespace)
+                    .unwrap_or(lookahead - host)
+            });
+            out.push_str(URL_PASSWORD_MASK);
+            offset += consumed;
+        } else if end > 0 {
+            out.push_str(token);
+            offset += end;
+        } else if let Some(ch) = local.chars().next() {
+            out.push(ch);
+            offset += ch.len_utf8();
+        }
+    }
+    out
+}
+
+/// Normalize compatibility ASCII and Unicode dashes without changing source offsets.
+fn credential_key_char(ch: char) -> char {
+    let code = u32::from(ch);
+    if (FULLWIDTH_ASCII_START..=FULLWIDTH_ASCII_END).contains(&code) {
+        char::from_u32(code - FULLWIDTH_ASCII_OFFSET).unwrap_or(ch)
+    } else if CREDENTIAL_KEY_DASHES.contains(&ch) {
+        '-'
+    } else {
+        ch
+    }
 }
 
 /// Keep credential keys; mask values to line end or their closing quote.
@@ -1701,7 +1763,7 @@ fn credential_value_start(msg: &str) -> Option<usize> {
     let mut pending_url = next_url_span(msg);
     for (offset, separator) in msg
         .char_indices()
-        .filter(|(_, ch)| matches!(*ch, '=' | ':'))
+        .filter(|(_, ch)| matches!(credential_key_char(*ch), '=' | ':'))
     {
         while let Some(span) = pending_url.as_ref() {
             if offset < span.end {
@@ -1711,12 +1773,18 @@ fn credential_value_start(msg: &str) -> Option<usize> {
             pending_url =
                 next_url_span(&msg[base..]).map(|next| base + next.start..base + next.end);
         }
-        // A URL owns its path/query/fragment and userinfo. A key before the URL
-        // still owns its whole value, including any URL within that value.
-        if pending_url
-            .as_ref()
-            .is_some_and(|span| span.contains(&offset))
-        {
+        // Only the authority owns separators unconditionally. Credential keys in
+        // a path, query or fragment still own their entire value, including spaces.
+        if pending_url.as_ref().is_some_and(|span| {
+            let url = &msg[span.clone()];
+            let authority_start = url
+                .find(SCHEME_SEPARATOR)
+                .map_or(url.len(), |at| at + SCHEME_SEPARATOR.len());
+            let body = url[authority_start..]
+                .find(AUTHORITY_TERMINATORS)
+                .map_or(span.end, |at| span.start + authority_start + at);
+            span.start <= offset && offset < body
+        }) {
             continue;
         }
         let prefix = msg[..offset].trim_end();
@@ -1731,14 +1799,16 @@ fn credential_value_start(msg: &str) -> Option<usize> {
         } else {
             prefix
                 .rsplit_once(|ch: char| {
-                    !(ch.is_ascii_alphanumeric() || CREDENTIAL_KEY_PUNCTUATION.contains(&ch))
+                    !(ch.is_alphanumeric()
+                        || CREDENTIAL_KEY_PUNCTUATION.contains(&credential_key_char(ch)))
                 })
                 .map_or(prefix, |(_, key)| key)
         };
         let normalized: String = key
             .chars()
+            .map(credential_key_char)
             .filter(|ch| !CREDENTIAL_KEY_PUNCTUATION.contains(ch))
-            .map(|ch| ch.to_ascii_lowercase())
+            .flat_map(char::to_lowercase)
             .collect();
         if !EXACT_CREDENTIAL_KEYS.contains(&normalized.as_str())
             && !CREDENTIAL_OPTION_KEYS
@@ -1813,12 +1883,16 @@ fn credentialed_authority(token: &str) -> bool {
 
 /// Keep ambiguous userinfo look-ahead inside one line and before the next scheme.
 fn authority_lookahead_end(authority: &str) -> usize {
-    let line_end = authority
-        .find(CREDENTIAL_LINE_ENDS)
-        .unwrap_or(authority.len());
+    // A single forward walk stops at the first boundary, rather than searching
+    // the entire remaining line once per URL (S2, linear in consumed input).
     authority
-        .find(SCHEME_SEPARATOR)
-        .map_or(line_end, |next| next.min(line_end))
+        .char_indices()
+        .find_map(|(offset, ch)| {
+            (CREDENTIAL_LINE_ENDS.contains(&ch)
+                || authority[offset..].starts_with(SCHEME_SEPARATOR))
+            .then_some(offset)
+        })
+        .unwrap_or(authority.len())
 }
 
 /// Bound the ruled password-shaped look-ahead by the line and the next scheme.
@@ -1829,29 +1903,29 @@ fn operator_url_run_end(text: &str, authority_start: usize) -> usize {
         .find(char::is_whitespace)
         .unwrap_or(authority.len());
     let token = &authority[..token_end];
-    if let Some(at) = token.rfind('@') {
+    let ambiguous = credentialed_authority(token);
+    let stop = if ambiguous {
+        authority_lookahead_end(authority)
+    } else {
+        token_end
+    };
+    if let Some(at) = authority[..stop].rfind('@') {
         let host_start = at + '@'.len_utf8();
-        let end = token[host_start..]
-            .find(KEYLESS_URL_TERMINATORS)
-            .map_or(token_end, |offset| host_start + offset);
+        let end = authority[host_start..stop]
+            .find(|ch: char| ch.is_whitespace() || KEYLESS_URL_TERMINATORS.contains(&ch))
+            .map_or(stop, |offset| host_start + offset);
         return authority_start + end;
     }
-    if !credentialed_authority(token) {
-        return authority_start + token.find(KEYLESS_URL_TERMINATORS).unwrap_or(token_end);
+    if ambiguous {
+        // Settled posture: a recognized credential without a closing authority
+        // owns the line; this whole span is consumed. Ruling:
+        // https://github.com/alphaonedev/ai-memory-mcp/issues/8205#issuecomment-6717162013
+        return authority_start
+            + authority
+                .find(CREDENTIAL_LINE_ENDS)
+                .unwrap_or(authority.len());
     }
-    // Settled masking posture: https://github.com/alphaonedev/ai-memory-mcp/issues/8205#issuecomment-6717162013
-    let line_end = authority
-        .find(CREDENTIAL_LINE_ENDS)
-        .unwrap_or(authority.len());
-    let stop = authority_lookahead_end(authority);
-    let Some(at) = authority[..stop].find('@') else {
-        return authority_start + line_end;
-    };
-    let host_start = at + '@'.len_utf8();
-    let end = authority[host_start..stop]
-        .find(|ch: char| ch.is_whitespace() || KEYLESS_URL_TERMINATORS.contains(&ch))
-        .map_or(stop, |offset| host_start + offset);
-    authority_start + end
+    authority_start + token.find(KEYLESS_URL_TERMINATORS).unwrap_or(token_end)
 }
 
 /// Remove ambiguous userinfo before the existing allowlist renderer sees the URL.
@@ -1863,10 +1937,7 @@ fn render_operator_url(url: &str, render: fn(&str) -> String) -> String {
     let token_end = authority
         .find(char::is_whitespace)
         .unwrap_or(authority.len());
-    let Some(at) = authority[..token_end]
-        .rfind('@')
-        .or_else(|| authority[..authority_lookahead_end(authority)].find('@'))
-    else {
+    let Some(at) = authority[..authority_lookahead_end(authority)].rfind('@') else {
         return if credentialed_authority(&authority[..token_end]) {
             format!("{scheme}{SCHEME_SEPARATOR}{URL_PASSWORD_MASK}")
         } else {

@@ -273,3 +273,16 @@ fn hyphen_inside_credential_noun_is_normalized_8205() {
         );
     }
 }
+
+#[test]
+fn credential_shaped_fragment_colon_owns_its_value_8205() {
+    let detail = format!(
+        "{PREFIX}https://{HOST}/x#fragment_credential_8205: connect https://inner.example.invalid/path"
+    );
+    let line = captured_detail(&detail);
+    assert!(line.contains(HOST), "fragment origin must remain readable");
+    assert!(
+        !line.contains("inner.example.invalid"),
+        "ruling 6717162013: a recognized credential key owns the rest of its line"
+    );
+}
