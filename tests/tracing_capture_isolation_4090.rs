@@ -44,6 +44,19 @@ const INSTALL_PATTERNS: &[&str] = &[
     "with_default(",
 ];
 
+/// Bare imports and builder methods must start at an identifier boundary.
+/// Qualified install patterns keep their existing matching semantics (#8652).
+fn contains_install(line: &str) -> bool {
+    INSTALL_PATTERNS.iter().any(|pattern| {
+        line.match_indices(pattern).any(|(start, _)| {
+            pattern.contains("::")
+                || start == 0
+                || !line.as_bytes()[start - 1].is_ascii_alphanumeric()
+                    && line.as_bytes()[start - 1] != b'_'
+        })
+    })
+}
+
 const GUARD: &str = "run_env_isolated_child_or_spawn(";
 
 /// (file, fn): capture helpers whose CALLERS must be isolated. A caller that
@@ -311,9 +324,7 @@ fn every_lib_tracing_capture_runs_in_an_isolated_child_4090() {
         let text = fs::read_to_string(path).expect("read src file");
         let lines: Vec<&str> = text.lines().collect();
         for (i, line) in lines.iter().enumerate() {
-            if line.trim_start().starts_with("//")
-                || !INSTALL_PATTERNS.iter().any(|p| line.contains(p))
-            {
+            if line.trim_start().starts_with("//") || !contains_install(line) {
                 continue;
             }
             sites += 1;
@@ -373,7 +384,7 @@ fn install_patterns_match_every_install_shape_4090() {
     ];
     for shape in shapes {
         assert!(
-            INSTALL_PATTERNS.iter().any(|p| shape.contains(p)),
+            contains_install(shape),
             "INSTALL_PATTERNS misses the install shape: {shape}"
         );
     }
@@ -392,7 +403,7 @@ fn install_patterns_require_identifier_boundary_8652() {
         "reset_default(value);",
     ] {
         assert!(
-            !INSTALL_PATTERNS.iter().any(|p| shape.contains(p)),
+            !contains_install(shape),
             "identifier suffix is not a tracing install: {shape}"
         );
     }
@@ -402,7 +413,7 @@ fn install_patterns_require_identifier_boundary_8652() {
         "webhook_host_port_with_default(url); with_default(sub, || f());",
     ] {
         assert!(
-            INSTALL_PATTERNS.iter().any(|p| shape.contains(p)),
+            contains_install(shape),
             "actual install must remain visible: {shape}"
         );
     }
