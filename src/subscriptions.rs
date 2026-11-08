@@ -1964,49 +1964,36 @@ pub fn validate_url_dns(url: &str) -> Result<()> {
     validate_url_dns_with(url, crate::config::allow_loopback_webhooks()).map(|_| ())
 }
 
-/// v0.7.0 #1082 (SR-1 #2, HIGH) — DNS-rebind TOCTOU fix. Returns
-/// the validated host + the pre-resolved `Vec<SocketAddr>` so the
-/// caller can pin reqwest's resolver to the SAME addresses the
-/// SSRF guard cleared. Pre-#1082 the guard resolved once,
-/// validated, and discarded the addresses — reqwest then did its
-/// OWN independent resolve at send time, opening a DNS-rebind
-/// window where the second resolve could return a private IP that
-/// the daemon never saw.
-///
-/// # Errors
-/// - URL has no scheme.
-/// - DNS resolution failed AND `AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL`
-///   is not set (post-#1053 fail-CLOSED).
-/// - Any resolved address is private / link-local (or loopback when
-///   `allow_loopback` is false).
-/// #3744 — the AUTHORITY of a URL with any userinfo removed: everything
-/// after the LAST `@` of the segment between `scheme://` and the first
-/// `/`, `?` or `#`. Both SSRF guards extract their host from this, never
-/// from the raw authority. Before this helper the host was taken as the
-/// text before the last `:` of the raw authority, so for
-/// `https://a:b@169.254.169.254/` the "host" was the USERNAME `a`, the
-/// loopback / private-range checks ran against that literal and PASSED,
-/// and a private, loopback or cloud-metadata target rode into the table at
-/// registration; only the DNS guard's failure to RESOLVE the username text
-/// refused it later — by accident and under the wrong reason. A tenant who
-/// can register a webhook must not be able to hide an internal target in
-/// the userinfo. Userinfo is a credential in the row as well (#3697), and
-/// is stripped here rather than refused so the caller's error names the
-/// real host it targeted.
-pub(crate) fn authority_without_userinfo(rest: &str) -> &str {
-    let host_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let authority = &rest[..host_end];
-    authority
-        .rfind('@')
-        .map_or(authority, |at| &authority[at + 1..])
+/// #8655: one client-parser authority for registration and resolver pinning.
+/// ERRORS-09 / PERF-15: construction requires an HTTP(S) host and nonzero port.
+struct WebhookAuthority {
+    host: String,
+    port: std::num::NonZeroU16,
+    plaintext: bool,
 }
 
-/// #3822 — append the default HTTP port (`:80`) to a bracket/colon-normalized
-/// `host_port` that omits one, so `ToSocketAddrs` resolves it. This helper serves
-/// `validate_url_dns_with` in the webhook SSRF lane. Inference egress instead
-/// derives its canonical host and scheme-aware port from `reqwest::Url` (#8650).
-pub(crate) fn host_port_with_default_http_port(host_port: &str) -> String {
-    format!("{host_port}:80")
+impl WebhookAuthority {
+    fn parse(url: &str) -> Result<Self> {
+        let shown = crate::url_display::url_origin(url);
+        // ERRORS-15: preserve the parser cause without echoing caller credentials.
+        let parsed =
+            reqwest::Url::parse(url).with_context(|| format!("invalid webhook URL: {shown}"))?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            return Err(anyhow!("webhook URL scheme must be https: {shown}"));
+        }
+        let host = parsed
+            .host_str()
+            .ok_or_else(|| anyhow!("webhook URL has no host: {shown}"))?;
+        let port = parsed
+            .port_or_known_default()
+            .and_then(std::num::NonZeroU16::new)
+            .ok_or_else(|| anyhow!("webhook URL requires a nonzero port: {shown}"))?;
+        Ok(Self {
+            host: host.to_owned(),
+            port,
+            plaintext: parsed.scheme() == "http",
+        })
+    }
 }
 
 pub(crate) fn validate_url_dns_resolved(
@@ -2065,55 +2052,11 @@ fn validate_url_dns_with(
     // a chat-webhook URL carries its credential in the path.
     let shown = crate::url_display::url_origin(url);
     let url_display = shown.as_str();
-    let lower = url.to_ascii_lowercase();
-    let (_scheme, rest) = lower
-        .split_once("://")
-        .ok_or_else(|| anyhow!("webhook URL missing scheme: {url_display}"))?;
-    // #3744 — userinfo is stripped BEFORE any host extraction, the same
-    // way `validate_url_with` does it; this guard is the SECOND line of
-    // defence for the same class and must read the same host.
-    let host_port = authority_without_userinfo(rest);
-    // v0.7.0 #1082 — extract the host (sans port + brackets) for the
-    // reqwest `Client::builder().resolve(host, addr)` override the
-    // caller installs. The override matches by host string the
-    // reqwest URL parser produces, so we strip the brackets / port
-    // here to match.
-    let resolved_host = {
-        let s = host_port;
-        if let Some(close_idx) = s.strip_prefix('[').and(s.find(']')) {
-            // [ipv6]:port or [ipv6] — return the inner ipv6 text.
-            s[1..close_idx].to_string()
-        } else if let Some(idx) = s.rfind(':') {
-            // Hostname:port — strip the port. (IPv4-with-port. Bare
-            // ipv4 has no `:` so falls through to the else branch.)
-            s[..idx].to_string()
-        } else {
-            s.to_string()
-        }
-    };
-    // Supply a default port so ToSocketAddrs resolves correctly.
-    // SSRF fix (W11): bracketed IPv6 without an explicit port ("[fe80::1]"
-    // with no trailing ":N") was previously passed to ToSocketAddrs as-is,
-    // which errors with "invalid port value" — and the catch-all `Err(_) =>
-    // return Ok(())` below treated that as a DNS hiccup, silently bypassing
-    // the SSRF guard. Detect the no-trailing-port form and append `:80` so
-    // resolution succeeds and the IP is checked.
-    let resolv_target =
-        if let Some(close_idx) = host_port.strip_prefix('[').and(host_port.find(']')) {
-            let after_bracket = &host_port[close_idx + 1..];
-            if after_bracket.starts_with(':') {
-                // [ipv6]:port — already has a port
-                host_port.to_string()
-            } else {
-                // [ipv6] without port — append default
-                host_port_with_default_http_port(host_port)
-            }
-        } else if host_port.contains(':') {
-            // IPv4:port or hostname:port — use as-is
-            host_port.to_string()
-        } else {
-            host_port_with_default_http_port(host_port)
-        };
+    let authority = WebhookAuthority::parse(url)?;
+    // Preserve host_str exactly: the reqwest override key must match its URL host.
+    // IPv6 brackets also make this a valid socket authority for ToSocketAddrs.
+    let resolved_host = authority.host;
+    let resolv_target = format!("{resolved_host}:{}", authority.port.get());
     // v0.7.0 #1053 (Agent-2 #3) — fail-CLOSED on DNS resolution
     // failure. Pre-#1053 a SERVFAIL / timeout / hang at the daemon's
     // resolver returned Ok(()) here, but the subsequent
@@ -2245,46 +2188,18 @@ fn validate_url_with(url: &str, allow_loopback: bool) -> Result<()> {
     // the rest, and the operator log must not.
     let shown = crate::url_display::url_origin(url);
     let url_display = shown.as_str();
-    // Cheap scheme check without pulling the `url` crate.
-    let lower = url.to_ascii_lowercase();
-    let (scheme, rest) = lower
-        .split_once("://")
-        .ok_or_else(|| anyhow!("webhook URL missing scheme: {url_display}"))?;
-    if scheme != "https" && scheme != "http" {
-        // #3705 review — origin only, never the query/userinfo (a webhook
-        // target routinely carries a token).
-        return Err(anyhow!("webhook URL scheme must be https: {url_display}"));
-    }
+    let authority = WebhookAuthority::parse(url)?;
     // v1.0.0 #3705 — "only encrypted data in transit": plaintext http:// is
     // refused to EVERY host, loopback included (the pre-#3705 loopback
     // exemption is gone — loopback is shared by every local process).
-    if scheme == "http" {
+    if authority.plaintext {
         return Err(anyhow!(
             "{}",
             crate::transit_encryption::plaintext_url_refusal("webhook target", url)
         ));
     }
-    // Extract host (portion before '/' or ':' or '?'). IPv6 URLs use
-    // `[ipv6]:port` syntax — the brackets must be stripped and the
-    // colon-split must skip the colons inside the v6 literal.
-    // #3744 — userinfo is stripped BEFORE any host extraction; see
-    // `authority_without_userinfo`.
-    let host_port = authority_without_userinfo(rest);
-    let host: String = if let Some(stripped) = host_port.strip_prefix('[') {
-        // IPv6: host is everything before the closing bracket.
-        match stripped.find(']') {
-            Some(i) => stripped[..i].to_string(),
-            None => {
-                return Err(anyhow!("malformed IPv6 URL host: {url_display}"));
-            }
-        }
-    } else {
-        // IPv4 / hostname.
-        host_port
-            .rsplit_once(':')
-            .map_or(host_port.to_string(), |(h, _)| h.to_string())
-    };
-    let host = host.as_str();
+    // Host brackets are URL syntax, not part of an IPv6 address passed to IpAddr.
+    let host = authority.host.trim_start_matches('[').trim_end_matches(']');
     // H11 (#628 blocker): loopback hostnames + IPs are rejected by
     // default. Operators who need to point a webhook at a local
     // listener (CI, dev) opt in via `[subscriptions]
@@ -3089,31 +3004,20 @@ mod tests {
     }
 
     #[test]
-    fn authority_without_userinfo_strips_at_the_last_at_sign_3744() {
-        assert_eq!(
-            authority_without_userinfo("example.com/hook"),
-            "example.com"
-        );
-        assert_eq!(
-            authority_without_userinfo("a:b@example.com:8443/hook?x=1"),
-            "example.com:8443"
-        );
-        assert_eq!(
-            authority_without_userinfo("a@b@example.com/"),
-            "example.com"
-        );
-        assert_eq!(
-            authority_without_userinfo("a:b@[fd00::1]:443"),
-            "[fd00::1]:443"
-        );
-        assert_eq!(
-            authority_without_userinfo("example.com?x=@y"),
-            "example.com"
-        );
-        assert_eq!(
-            authority_without_userinfo("example.com/p@th"),
-            "example.com"
-        );
+    fn parsed_authority_preserves_userinfo_controls_3744() {
+        for (suffix, expected_host, expected_port) in [
+            ("example.com/hook", "example.com", 443),
+            ("a:b@example.com:8443/hook?x=1", "example.com", 8443),
+            ("a@b@example.com/", "example.com", 443),
+            ("a:b@[fd00::1]:443", "[fd00::1]", 443),
+            ("example.com?x=@y", "example.com", 443),
+            ("example.com/p@th", "example.com", 443),
+        ] {
+            let authority = WebhookAuthority::parse(&format!("https://{suffix}"))
+                .expect("valid existing userinfo control");
+            assert_eq!(authority.host, expected_host, "#3744: canonical host");
+            assert_eq!(authority.port.get(), expected_port, "#3744: canonical port");
+        }
     }
 
     #[test]

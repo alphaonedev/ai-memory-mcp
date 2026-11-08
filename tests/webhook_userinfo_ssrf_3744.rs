@@ -13,8 +13,8 @@
 //! because it saw the address: a defence that held by accident, under the
 //! wrong reason (`dns_ssrf_rejected`), one refactor from not holding.
 //!
-//! Both guards now strip userinfo at the LAST `@` of the authority before
-//! any host extraction (`subscriptions::authority_without_userinfo`); the
+//! Both guards now use the HTTP client URL parser for host extraction
+//! (#8655), retaining the userinfo regression protection here; the
 //! unit cells beside the guards pin the syntactic and the DNS line. These
 //! cells pin the REGISTRATION surface the tenant reaches: `insert` refuses
 //! each shape, names the real host, and never echoes the userinfo.
