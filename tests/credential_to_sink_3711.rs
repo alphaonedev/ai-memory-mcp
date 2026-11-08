@@ -621,6 +621,25 @@ fn production_line_has_userinfo_masker_8205(line: &str) -> bool {
     userinfo_masker_reference_3711(rust_code_before_line_comment_8205(line))
 }
 
+fn production_masker_lines_8205(source: &str) -> Vec<usize> {
+    source
+        .lines()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            production_line_has_userinfo_masker_8205(line).then_some(index + 1)
+        })
+        .collect()
+}
+
+#[test]
+fn multiline_literal_continuation_masker_is_rejected_8205() {
+    let source = "let target = \"first line\nhttps://peer.example.invalid\"; let render = logging::redact_url_password;";
+    assert!(
+        !production_masker_lines_8205(source).is_empty(),
+        "r4-6: masker on a multiline literal continuation escaped the guard"
+    );
+}
+
 fn rust_code_before_line_comment_8205(line: &str) -> &str {
     let mut chars = line.char_indices().peekable();
     let mut quoted = false;
