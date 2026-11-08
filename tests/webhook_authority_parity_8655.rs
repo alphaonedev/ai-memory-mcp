@@ -162,15 +162,11 @@ async fn postgres_registration_parser_parity_8655() {
     app.store = Arc::new(store);
     registration_cells(&app).await;
     let caller = ai_memory::store::CallerContext::for_agent(CALLER);
+    let mut filter = ai_memory::store::Filter::default();
+    filter.namespace = Some(format!("_subscriptions/{CALLER}"));
     let rows = app
         .store
-        .list(
-            &caller,
-            &ai_memory::store::Filter {
-                namespace: Some(format!("_subscriptions/{CALLER}")),
-                ..Default::default()
-            },
-        )
+        .list(&caller, &filter)
         .await
         .expect("list live subscriptions");
     assert_eq!(rows.len(), 1, "only the public control is persisted");
