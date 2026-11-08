@@ -150,58 +150,20 @@ fn compatible_addresses_share_internal_egress_classification_6687() {
 mod dispatch {
     use super::DNS_ANSWER;
     use std::net::{SocketAddr, TcpListener, TcpStream};
-    use std::time::{Duration, Instant};
 
     const CHILD_ROLE: &str = "AI_MEMORY_TEST_WEBHOOK_8203_CHILD";
-    const CHILD_TIMEOUT: Duration = Duration::from_secs(120);
-    const CHILD_POLL: Duration = Duration::from_millis(20);
     const BODY: &str = "{\"event\":\"dns-pin-8203\"}";
     const CORRELATION: &str = "webhook-pin-8203";
     const TIMESTAMP: &str = "1700000000";
     const SIGNATURE: &str = "test-signature-8203";
     const PIN_HOSTS: [&str; 2] = ["pin-test.invalid", "pin-test.invalid."];
 
-    fn run_child(test_name: &str, environment: &[(&str, &str)]) {
-        let directory = tempfile::tempdir_in(std::env::temp_dir()).expect("child scratch");
-        let stdout_path = directory.path().join("stdout");
-        let stderr_path = directory.path().join("stderr");
-        let mut command = crate::spawn_audit::audited_command(
-            std::env::current_exe().expect("current lib test binary"),
-            "webhook_ssrf_8203_tests::run_child",
-        );
-        // The crate name is not part of libtest's exact test path.
-        let module = module_path!().split_once("::").expect("crate module").1;
-        let filter = format!("{module}::{test_name}");
-        command
-            .args(["--exact", &filter, "--nocapture", "--test-threads=1"])
-            .env_clear()
-            .env("AI_MEMORY_NO_CONFIG", "1")
-            .env("TMPDIR", std::env::temp_dir())
-            .env(CHILD_ROLE, "1")
-            .env("NO_PROXY", "")
-            .env("no_proxy", "")
-            .envs(std::env::var_os("LLVM_PROFILE_FILE").map(|v| ("LLVM_PROFILE_FILE", v)))
-            .envs(environment.iter().copied())
-            .stdout(std::fs::File::create(&stdout_path).expect("child stdout"))
-            .stderr(std::fs::File::create(&stderr_path).expect("child stderr"));
-        let mut child = command.spawn().expect("spawn isolated webhook test");
-        let started = Instant::now();
-        let status = loop {
-            if let Some(status) = child.try_wait().expect("poll webhook child") {
-                break status;
-            }
-            if started.elapsed() >= CHILD_TIMEOUT {
-                child.kill().expect("kill timed-out child");
-                child.wait().expect("reap timed-out child");
-                panic!("#8203: isolated webhook child exceeded {CHILD_TIMEOUT:?}");
-            }
-            std::thread::sleep(CHILD_POLL);
-        };
-        let stdout = std::fs::read_to_string(stdout_path).expect("read child stdout");
-        let stderr = std::fs::read_to_string(stderr_path).expect("read child stderr");
+    fn assert_child_succeeded(output: &std::process::Output) {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
-            status.success(),
-            "#8203: child {filter}:\n{stdout}\n{stderr}"
+            output.status.success(),
+            "#8203: isolated webhook child:\n{stdout}\n{stderr}"
         );
         assert!(
             stdout.contains("1 passed") && !stdout.contains("0 passed"),
@@ -289,7 +251,11 @@ mod dispatch {
     #[test]
     fn send_uses_guarded_dns_answer_6860() {
         if std::env::var_os(CHILD_ROLE).is_none() {
-            run_child("send_uses_guarded_dns_answer_6860", &[]);
+            let output = crate::test_support::spawn_test_child(
+                "subscriptions::webhook_ssrf_8203_tests::dispatch::send_uses_guarded_dns_answer_6860",
+                &[(CHILD_ROLE, "1"), ("NO_PROXY", ""), ("no_proxy", "")],
+            );
+            assert_child_succeeded(&output);
             return;
         }
         exercise_pinned_hosts();
@@ -307,7 +273,16 @@ mod dispatch {
             );
             let proxy = format!("http://{address}");
             for key in ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"] {
-                run_child("send_ignores_environment_proxies_6372", &[(key, &proxy)]);
+                let output = crate::test_support::spawn_test_child(
+                    "subscriptions::webhook_ssrf_8203_tests::dispatch::send_ignores_environment_proxies_6372",
+                    &[
+                        (CHILD_ROLE, "1"),
+                        ("NO_PROXY", ""),
+                        ("no_proxy", ""),
+                        (key, &proxy),
+                    ],
+                );
+                assert_child_succeeded(&output);
             }
             return;
         }

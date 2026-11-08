@@ -2337,17 +2337,15 @@ fn validate_url_with(url: &str, allow_loopback: bool) -> Result<()> {
 pub(crate) fn normalize_ip(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V6(v6) => {
-            let canonical = v6.to_canonical();
-            if matches!(canonical, IpAddr::V4(_)) {
-                return canonical;
+            // #6687: preserve the IPv6 meanings of :: and ::1, but classify
+            // IPv4-compatible and mapped addresses by the embedded IPv4 value.
+            if !v6.is_unspecified()
+                && !v6.is_loopback()
+                && let Some(v4) = v6.to_ipv4()
+            {
+                return IpAddr::V4(v4);
             }
             let segs = v6.segments();
-            // #6687: preserve the IPv6 meanings of :: and ::1, but classify
-            // every other deprecated IPv4-compatible address by its IPv4 bits.
-            if segs[..6] == [0; 6] && !v6.is_unspecified() && !v6.is_loopback() {
-                let v4_bits = (u32::from(segs[6]) << 16) | u32::from(segs[7]);
-                return IpAddr::V4(Ipv4Addr::from(v4_bits));
-            }
             if segs[0] == 0x0064
                 && segs[1] == 0xff9b
                 && segs[2] == 0
