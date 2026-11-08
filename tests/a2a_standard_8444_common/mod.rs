@@ -578,7 +578,7 @@ async fn concurrent_continuations_keep_every_history_entry(router: &axum::Router
     let task = got.json()["result"].clone();
     let history = history_of(&got);
     let artifacts = task["artifacts"].as_array().cloned().unwrap_or_default();
-    assert!(!history.is_empty());
+    assert_ne!(history, [] as [serde_json::Value; 0]);
     assert_eq!(
         history.len(),
         artifacts.len(),

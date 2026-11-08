@@ -306,7 +306,7 @@ pub async fn list_always_serialises_next_page_token(router: &Router) {
         .as_str()
         .expect("nextPageToken present")
         .to_string();
-    assert!(!token.is_empty());
+    assert_ne!(token, "");
     let page2 = rpc(
         router,
         ALICE_KEY,
@@ -393,7 +393,7 @@ pub async fn task_and_context_id_rules(router: &Router, app: &AppState) {
     let b = send_ok(router, ALICE_KEY, "n2", "ROLE_USER").await;
     assert_ne!(a["id"], b["id"]);
     assert_ne!(a["contextId"], b["contextId"]);
-    assert!(!a["contextId"].as_str().expect("contextId").is_empty());
+    assert_ne!(a["contextId"].as_str().expect("contextId"), "");
     let given = unique("ctx-248-given");
     let honoured = send_msg(router, msg_in(&given, "g")).await;
     assert_eq!(honoured.json()["result"]["task"]["contextId"], json!(given));
