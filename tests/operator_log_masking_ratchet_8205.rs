@@ -15,6 +15,15 @@ const LCG_INCREMENT: u64 = 1;
 const FORM_COUNT: usize = 9;
 const HOST: &str = "db.example.invalid";
 const PREFIX: &str = "connection attempt: ";
+// Integration cost guard: compare tenfold inputs, never a response-time budget.
+// Minimum samples reduce host scheduling noise; unit counters independently pin
+// both rescan classes without clocks, including optimized test builds.
+const COST_SAMPLES: usize = 3;
+const COST_GROWTH: usize = 10;
+const COST_RATIO_LIMIT: u32 = 40;
+const COST_SMALL_URL_BYTES: usize = 2_048;
+const COST_SMALL_ROWS: usize = 2_048;
+const COST_SCHEDULING_SLACK: std::time::Duration = std::time::Duration::from_millis(20);
 const KEYS: &[&str] = &[
     "password",
     "passwd",
@@ -51,6 +60,63 @@ fn captured_detail(detail: &str) -> String {
         )
     })
     .1
+}
+
+fn minimum_masking_cost(detail: &str) -> std::time::Duration {
+    (0..COST_SAMPLES)
+        .map(|_| {
+            let started = std::time::Instant::now();
+            std::hint::black_box(captured_detail(std::hint::black_box(detail)));
+            started.elapsed()
+        })
+        .min()
+        .expect("the named cost sample count is positive")
+}
+
+fn assert_masking_cost_growth(label: &str, small: &str, large: &str) {
+    let small_cost = minimum_masking_cost(small);
+    let large_cost = minimum_masking_cost(large);
+    println!(
+        "{label}: bytes={}/{}, minimum_time={small_cost:?}/{large_cost:?}",
+        small.len(),
+        large.len()
+    );
+    assert!(
+        large_cost <= small_cost * COST_RATIO_LIMIT + COST_SCHEDULING_SLACK,
+        "{label}: tenfold input exceeded the cost-ratio bound: {small_cost:?} -> {large_cost:?}"
+    );
+}
+
+#[test]
+fn url_cost_runtime_8205_r7() {
+    let input = |size| format!("{PREFIX}https://{}", ":".repeat(size));
+    assert_masking_cost_growth(
+        "F5 URL authority",
+        &input(COST_SMALL_URL_BYTES),
+        &input(COST_SMALL_URL_BYTES * COST_GROWTH),
+    );
+}
+
+#[test]
+fn credential_cost_runtime_8205_r7() {
+    // More rows amplify the inexpensive substring search; the tenfold ratio is
+    // identical to the URL cell and is also pinned by the operation counter.
+    let input = |rows| format!("{PREFIX}{}", "password=x\n".repeat(rows));
+    assert_masking_cost_growth(
+        "F5 credential lines",
+        &input(COST_SMALL_ROWS),
+        &input(COST_SMALL_ROWS * COST_GROWTH),
+    );
+}
+
+#[test]
+fn bare_target_cost_runtime_8205_r7() {
+    let input = |rows| format!("{PREFIX}{}", "u:p@h x\n".repeat(rows));
+    assert_masking_cost_growth(
+        "F5 bare-target control",
+        &input(COST_SMALL_ROWS),
+        &input(COST_SMALL_ROWS * COST_GROWTH),
+    );
 }
 
 fn assert_private(detail: &str, secret: &str, label: &str) -> String {
