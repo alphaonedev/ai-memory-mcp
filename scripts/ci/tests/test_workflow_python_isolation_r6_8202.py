@@ -73,6 +73,16 @@ class ExecutableResolutionS1S3S4(unittest.TestCase):
                                      "env split program escaped")
             self.assertEqual(checker.scan_shell(f"{prefix}'python3 -I x.py'"), [])
 
+    def test_substitutions_in_arithmetic_and_array_assignments_are_data_s1(self):
+        checker = load_checker()
+        for text in ('local left=$(( LIMIT - $(date +%s) ))',
+                     'values=($(printf word)); echo ready',
+                     'mode=$(( $(id -u) + 1 ))'):
+            with self.subTest(text=text):
+                self.assertEqual(checker.scan_shell(text), [], "data substitution became executable")
+        self.assertEqual(len(checker.scan_shell('values=($(python3 x.py))')), 1)
+        self.assertEqual(len(checker.scan_shell('number=$(( $(python3 x.py) + 1 ))')), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
