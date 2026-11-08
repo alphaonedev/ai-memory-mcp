@@ -240,6 +240,87 @@ fn issue_6540_failed_raw_receipt_leaves_every_intent_for_exit() {
     );
 }
 
+/// #8654 security F1: a closed descriptor must not count as a raw receipt.
+/// Descriptor mutation stays in this test's child process, with all database
+/// and restoration handles opened first so they cannot reuse stderr's slot.
+#[cfg(unix)]
+#[test]
+fn issue_8654_closed_stderr_does_not_credit_lost_intents() {
+    let name = "issue_8654_closed_stderr_does_not_credit_lost_intents";
+    let Some(stderr) = child_stderr(name, || {
+        use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+
+        // Copy the panic-safe descriptor restoration precedent from
+        // cli::shell::with_stdin_lines (OWNERSHIP-25, UNSAFE-01).
+        struct RestoreStderr(OwnedFd);
+        impl RestoreStderr {
+            fn restore(&self) -> std::io::Result<()> {
+                // SAFETY: the saved descriptor is owned and live; dup2 only
+                // replaces fd 2 in this isolated child process.
+                if unsafe { libc::dup2(self.0.as_raw_fd(), libc::STDERR_FILENO) } < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            }
+        }
+        impl Drop for RestoreStderr {
+            fn drop(&mut self) {
+                // Best effort during unwind; the normal path checks the
+                // restoration result before any assertions or thread exit.
+                let _ = self.restore();
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("test directory");
+        let path = dir.path().join("leak.db");
+        leak(&path, &["lost"]);
+        let conn = Connection::open(&path).expect("open next connection before closing stderr");
+        let restore = RestoreStderr(
+            std::io::stderr()
+                .as_fd()
+                .try_clone_to_owned()
+                .expect("save stderr descriptor"),
+        );
+        // SAFETY: only this isolated child changes fd 2; no borrowed stderr
+        // descriptor survives this call, and the guard restores it on unwind.
+        assert_eq!(unsafe { libc::close(libc::STDERR_FILENO) }, 0);
+        let closed = std::io::stderr()
+            .as_fd()
+            .try_clone_to_owned()
+            .expect_err("stderr must actually be closed, not redirected");
+        assert_eq!(closed.raw_os_error(), Some(libc::EBADF));
+        // Exercise frame registration directly: opening SQLite handles here
+        // could reuse fd 2 and would invalidate the closed-descriptor fixture.
+        let opened = catch_unwind(AssertUnwindSafe(|| super::open_frame(&conn)));
+        restore
+            .restore()
+            .expect("restore stderr before observing credit");
+        assert_eq!(opened.is_err(), cfg!(debug_assertions));
+        if let Ok(frame_id) = opened {
+            assert!(super::settle_frame(&conn, frame_id, false).is_empty());
+        }
+        super::TXN_FRAMES.with(|frames| {
+            assert_eq!(
+                frames
+                    .borrow()
+                    .0
+                    .iter()
+                    .map(|frame| frame.reported)
+                    .sum::<usize>(),
+                0,
+                "a closed stderr must leave every intent uncredited"
+            );
+        });
+    }) else {
+        return;
+    };
+    assert!(!stderr.lines().any(|line| line.starts_with(OPEN_REPORT)));
+    assert!(
+        stderr.contains("thread exited with 1 unreported deferred escalation(s) in 1 unsettled escalation frame(s)"),
+        "restored stderr must receive the still-uncredited exit report: {stderr}"
+    );
+}
+
 #[test]
 fn issue_6449_thread_exit_labels_intents_and_frames_separately() {
     let name = "issue_6449_thread_exit_labels_intents_and_frames_separately";
