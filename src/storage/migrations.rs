@@ -1919,6 +1919,19 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             |row| row.get(0),
         )?;
         if clear_trigger_count != 2 {
+            // #8677: the repair mutates the database, so the safety-snapshot
+            // contract holds here too (from == to: the schema does not move).
+            // Taken before the writer lock, like the ladder snapshot below.
+            if let Some(snapshot) =
+                snapshot_before_migration(conn, version, CURRENT_SCHEMA_VERSION)?
+            {
+                tracing::info!(
+                    from_version = version,
+                    to_version = CURRENT_SCHEMA_VERSION,
+                    snapshot = %snapshot.display(),
+                    "pre-repair database snapshot written"
+                );
+            }
             // ERRORS-02: propagate DDL/commit failures; the guard rolls back
             // both definitions together if repair cannot complete.
             let repair_txn = super::connection::WriteTxn::begin_exclusive(conn)?;

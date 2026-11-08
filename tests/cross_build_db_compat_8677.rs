@@ -192,7 +192,7 @@ fn older_build_refuses_newer_database_byte_identical_with_actionable_text_8677()
     // The end-user sentence: who wrote it, what this binary supports, the fix.
     assert!(
         msg.contains(&format!(
-            "this database was written by a newer ai-memory build (schema v{ahead})"
+            "This database was written by a newer ai-memory build (schema v{ahead})"
         )),
         "must say a newer build wrote the database and name its schema: {msg}"
     );

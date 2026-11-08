@@ -314,17 +314,19 @@ impl std::error::Error for SchemaAheadOfBinary {}
 fn render(observed: i64, supported: i64, backend: &str, target: &str) -> String {
     format!(
         "database schema is AHEAD of this binary: {target} ({backend}) is on schema \
-         v{observed}, but ai-memory {bin} understands up to v{supported}. Refusing to \
-         operate it — an older binary writing a newer schema drops columns it does not \
-         know and violates invariants the newer migrations established, which is silent \
-         corruption of the durable tier. Reads still work: `ai-memory backup`, `boot` and \
-         `doctor` continue to operate against this database, so snapshot it before doing \
-         anything else. To proceed: run ai-memory >= the version that wrote this database, \
-         or restore a snapshot taken BEFORE the schema moved. If you have verified this \
-         binary can safely operate this database, set {env}={observed} for this process \
-         only (it is refused under the asi-hard security profile, and it stops applying \
-         the moment the database moves again). On postgres this schema is SHARED by every \
-         daemon on the cluster — one node's upgrade moves it for all of them (#2445).",
+         v{observed}. This database was written by a newer ai-memory build (schema \
+         v{observed}); this binary (ai-memory {bin}) supports schema v{supported}; \
+         upgrade ai-memory to the build that wrote this database, or open a backup copy \
+         with --db <copy>. Refusing to operate it — an older binary writing a newer \
+         schema drops columns it does not know and violates invariants the newer \
+         migrations established, which is silent corruption of the durable tier. Reads \
+         still work: `ai-memory backup`, `boot` and `doctor` continue to operate against \
+         this database, so snapshot it before doing anything else, or restore a snapshot \
+         taken BEFORE the schema moved. If you have verified this binary can safely \
+         operate this database, set {env}={observed} for this process only (it is \
+         refused under the asi-hard security profile, and it stops applying the moment \
+         the database moves again). On postgres this schema is SHARED by every daemon on \
+         the cluster — one node's upgrade moves it for all of them (#2445).",
         bin = crate::PKG_VERSION,
         env = ENV_ALLOW_SCHEMA_AHEAD,
     )
