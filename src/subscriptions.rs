@@ -3022,6 +3022,73 @@ mod tests {
     }
 
     #[test]
+    fn registration_parser_parity_8655() {
+        for host in ["10.0.0.1", "127.0.0.1", "[fd00::1]", "[::1]"] {
+            let url = format!("https://{host}{}@public.example/hook", char::from(92));
+            let parsed = reqwest::Url::parse(&url).expect("synthetic URL parses");
+            assert_eq!(parsed.host_str(), Some(host), "connection host oracle");
+            let error = validate_url_with(&url, false)
+                .expect_err("#8655: registration must check the connection host");
+            assert!(
+                error.to_string().contains(host),
+                "refusal names the parsed host"
+            );
+        }
+    }
+
+    #[test]
+    fn dns_pin_parser_parity_8655() {
+        let url = format!("https://127.0.0.2{}@127.0.0.1/hook", char::from(92));
+        let parsed = reqwest::Url::parse(&url).expect("synthetic URL parses");
+        let (host, addresses) = validate_url_dns_with(&url, true).expect("opted-in loopback");
+        assert_eq!(
+            Some(host.as_str()),
+            parsed.host_str(),
+            "#8655: DNS pin key parity"
+        );
+        assert!(!addresses.is_empty(), "pin has addresses");
+        assert!(
+            addresses.iter().all(|a| a.ip().to_string() == "127.0.0.2"),
+            "only the canonical connection host may be resolved"
+        );
+        assert!(
+            addresses.iter().all(|a| a.port() == 443),
+            "HTTPS default port"
+        );
+    }
+
+    #[test]
+    fn dns_private_target_parser_parity_8655() {
+        let url = format!("https://10.0.0.1{}@127.0.0.1/hook", char::from(92));
+        let error = validate_url_dns_with(&url, true)
+            .expect_err("#8655: loopback opt-in cannot hide a private target");
+        assert!(
+            error.to_string().contains("private"),
+            "address-class refusal"
+        );
+    }
+
+    #[test]
+    fn malformed_authority_refused_8655() {
+        for url in [
+            "https://",
+            "https://[",
+            "file:///hook",
+            "custom:/hook",
+            "https://example.invalid:0/",
+        ] {
+            assert!(
+                validate_url_with(url, true).is_err(),
+                "invalid registration authority"
+            );
+            assert!(
+                validate_url_dns_with(url, true).is_err(),
+                "invalid DNS authority"
+            );
+        }
+    }
+
+    #[test]
     fn authority_without_userinfo_strips_at_the_last_at_sign_3744() {
         assert_eq!(
             authority_without_userinfo("example.com/hook"),

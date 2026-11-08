@@ -639,6 +639,58 @@ mod tests {
     use super::*;
 
     #[test]
+    fn plaintext_floor_parser_parity_8656() {
+        let url = format!("http://192.0.2.1{}@localhost/v1", char::from(92));
+        let parsed = reqwest::Url::parse(&url).expect("synthetic URL parses");
+        assert_eq!(
+            host_of(&url).as_deref(),
+            parsed.host_str(),
+            "#8656: floor host parity"
+        );
+        for mode in [
+            InferenceEgressMode::Allow,
+            InferenceEgressMode::LoopbackOnly,
+            InferenceEgressMode::InternalOnly,
+            InferenceEgressMode::Deny,
+        ] {
+            assert!(
+                evaluate_inference_egress(mode, EgressClass::InferenceLlm, &url).is_refused(),
+                "#8656: plaintext floor applies in every mode"
+            );
+        }
+    }
+
+    #[test]
+    fn host_parser_controls_8656() {
+        for url in [
+            "http://localhost/v1",
+            "http://127.0.0.1/v1",
+            "https://[::1]/v1",
+            "https://LOCALHOST/v1",
+            "https://%6cocalhost/v1",
+            "https://2130706433/v1",
+        ] {
+            let parsed = reqwest::Url::parse(url).expect("control URL parses");
+            assert_eq!(
+                host_of(url).as_deref(),
+                parsed.host_str(),
+                "#8656: canonical host"
+            );
+            assert!(target_is_loopback(url), "loopback control stays local");
+        }
+        for url in [
+            "localhost",
+            "https://",
+            "https://[",
+            "file:///v1",
+            "custom:/v1",
+        ] {
+            assert_eq!(host_of(url), None, "#8656: malformed or absent authority");
+            assert!(!target_is_loopback(url), "absent host is never local");
+        }
+    }
+
+    #[test]
     fn inference_authority_parser_pin_identity_8650() {
         // TEST-02: reqwest's parser is the independent connection-host oracle.
         for url in [
