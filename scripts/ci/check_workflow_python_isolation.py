@@ -10,7 +10,7 @@ Console launchers pip (including versioned names), pytest, pipx, uvx and uv run 
 uv tool run are findings, including behind command prefixes: use an isolated
 Python -m invocation. Python-named variable/expression interpreters and py need an
 explicit issue exemption because their interpreter isolation cannot be established
-here. Literal python/python3 names accept version and d/-dbg suffixes; dynamic
+here. Literal python/PyPy names accept versions, d/-dbg/t and .exe suffixes; dynamic
 names containing python (including /python* paths) are matched case-insensitively,
 as are literal names. Other unresolved executables, such as $BIN or $PSQL, are left alone:
 this is a lexical name scan, not whole-workflow variable binding analysis.
@@ -26,7 +26,8 @@ import shlex
 import sys
 import textwrap
 
-PYTHON_NAME = re.compile(r"python(?:3(?:\.[0-9]+)?)?(?:d|-dbg)?\Z", re.IGNORECASE)
+PYTHON_NAME = re.compile(
+    r"(?:python|pypy)(?:3(?:\.[0-9]+)?)?(?:d|-dbg|t)?(?:\.exe)?\Z", re.IGNORECASE)
 PYTHON_NAME_MARKER = "python"
 PYTHON_LAUNCHER = "py"
 UV_LAUNCHER = "uv"
