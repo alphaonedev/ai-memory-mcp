@@ -91,7 +91,10 @@ fn issue_6132_stale_frame_reported_once_across_repeated_opens_and_exit() {
         return;
     };
     assert_eq!(
-        stderr.lines().filter(|line| line.starts_with(RAW_REPORT_PREFIX)).count(),
+        stderr
+            .lines()
+            .filter(|line| line.starts_with(RAW_REPORT_PREFIX))
+            .count(),
         1,
         "one lost intent must produce one report: {stderr}"
     );
@@ -111,7 +114,10 @@ fn issue_6132_no_subscriber_reports_at_open_and_not_again_at_exit() {
         return;
     };
     assert_eq!(
-        stderr.lines().filter(|line| line.starts_with(OPEN_REPORT)).count(),
+        stderr
+            .lines()
+            .filter(|line| line.starts_with(OPEN_REPORT))
+            .count(),
         1,
         "no subscriber must still receive the open-time raw report: {stderr}"
     );
@@ -134,7 +140,13 @@ fn issue_6132_later_intent_on_reported_frame_remains_reportable() {
     }) else {
         return;
     };
-    assert_eq!(stderr.lines().filter(|line| line.starts_with(OPEN_REPORT)).count(), 1);
+    assert_eq!(
+        stderr
+            .lines()
+            .filter(|line| line.starts_with(OPEN_REPORT))
+            .count(),
+        1
+    );
     assert!(
         stderr.contains("thread exited with 1 unreported deferred escalation(s) in 1 unsettled escalation frame(s)"),
         "only the later intent remains uncredited: {stderr}"
@@ -153,7 +165,13 @@ fn issue_6132_open_on_other_database_does_not_credit_stale_frame() {
         return;
     };
     assert!(!stderr.lines().any(|line| line.starts_with(OPEN_REPORT)));
-    assert_eq!(stderr.lines().filter(|line| line.starts_with(EXIT_REPORT)).count(), 1);
+    assert_eq!(
+        stderr
+            .lines()
+            .filter(|line| line.starts_with(EXIT_REPORT))
+            .count(),
+        1
+    );
 }
 
 #[test]
@@ -168,7 +186,10 @@ fn issue_6540_no_subscriber_never_silences_a_lost_intent() {
         return;
     };
     assert_eq!(
-        stderr.lines().filter(|line| line.starts_with(RAW_REPORT_PREFIX)).count(),
+        stderr
+            .lines()
+            .filter(|line| line.starts_with(RAW_REPORT_PREFIX))
+            .count(),
         1,
         "a missing tracing subscriber must not erase the raw loss report: {stderr}"
     );
@@ -190,7 +211,10 @@ fn issue_6540_filtered_tracing_never_silences_a_lost_intent() {
         return;
     };
     assert_eq!(
-        stderr.lines().filter(|line| line.starts_with(RAW_REPORT_PREFIX)).count(),
+        stderr
+            .lines()
+            .filter(|line| line.starts_with(RAW_REPORT_PREFIX))
+            .count(),
         1,
         "a disabled tracing module must not erase the raw loss report: {stderr}"
     );

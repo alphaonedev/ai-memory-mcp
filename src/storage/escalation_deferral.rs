@@ -129,10 +129,19 @@ struct TxnFrame {
     /// stable and unique for the frame's whole life.
     conn_addr: usize,
     deferred: Vec<DeferredEscalation>,
+    /// Intents included in a successfully written raw lost-write report.
+    /// A count keeps subsequently deferred intents reportable (#6132/#6540).
+    reported: usize,
     /// #7241 - the off-table audit anchors of signed-event appends made by
     /// nested funnels inside this transaction: emitted when it COMMITS,
     /// dropped unrecorded when it rolls back.
     anchor: crate::governance::audit::PendingAuditAnchor,
+}
+
+impl TxnFrame {
+    fn unreported(&self) -> usize {
+        self.deferred.len().saturating_sub(self.reported)
+    }
 }
 
 /// The per-thread frame stack. Its destructor (thread exit) reports frames
@@ -145,13 +154,9 @@ const UNSETTLED_FRAMES_LABEL: &str = "unsettled escalation frame(s)";
 
 impl Drop for Frames {
     fn drop(&mut self) {
-        let lost: usize = self.0.iter().map(|f| f.deferred.len()).sum();
+        let lost: usize = self.0.iter().map(TxnFrame::unreported).sum();
         if lost > 0 {
-            let unsettled = self
-                .0
-                .iter()
-                .filter(|frame| !frame.deferred.is_empty())
-                .count();
+            let unsettled = self.0.iter().filter(|frame| frame.unreported() > 0).count();
             // No debug_assert here: a panic in a TLS destructor aborts. This
             // runs at thread exit, in thread-local destructor order (reverse
             // of registration). `tracing::error!` is NOT usable here: the
@@ -207,21 +212,59 @@ fn forced_failure() -> bool {
     false
 }
 
+#[cfg(test)]
+const MSG_FORCED_REPORT_WRITE_FAILURE: &str = "forced open-time escalation report write failure";
+
+/// The same raw channel as thread exit provides a concrete delivery receipt.
+/// Tracing enablement cannot prove delivery through a filtered or lossy sink.
+fn write_open_report(frame: &TxnFrame) -> std::io::Result<()> {
+    #[cfg(test)]
+    if FORCE_REPORT_WRITE_FAILURE.with(std::cell::Cell::get) {
+        return Err(std::io::Error::other(MSG_FORCED_REPORT_WRITE_FAILURE));
+    }
+    let unreported = frame.unreported();
+    std::io::Write::write_fmt(
+        &mut std::io::stderr(),
+        format_args!(
+            "ERROR #4116: a WriteTxn opened while an older frame on the same database still \
+             holds {unreported} {UNREPORTED_ESCALATIONS_LABEL} (leaked transaction); \
+             those escalated writes stay REFUSED but were NOT queued\n"
+        ),
+    )
+}
+
 /// Register a frame for a write transaction just opened on `conn`.
 pub(super) fn open_frame(conn: &Connection) -> u64 {
     let id = NEXT_FRAME_ID.fetch_add(1, Ordering::Relaxed);
     let db_path = conn.path().filter(|p| !p.is_empty()).map(str::to_string);
     TXN_FRAMES.with(|frames| {
         let mut frames = frames.borrow_mut();
-        let stale = frames
+        let mut stale = false;
+        for frame in frames
             .0
-            .iter()
-            .any(|f| f.db_path == db_path && db_path.is_some() && !f.deferred.is_empty());
-        if stale {
+            .iter_mut()
+            .filter(|f| f.db_path == db_path && db_path.is_some() && !f.deferred.is_empty())
+        {
+            stale = true;
+            let intent_count = frame.unreported();
+            if intent_count == 0 {
+                continue;
+            }
+            // Credit only a completed raw write, before any debug assertion
+            // or subscriber can unwind. Failure leaves all intents pending
+            // for a later open or thread exit (ERRORS-19, OWNERSHIP-25).
+            if write_open_report(frame).is_ok() {
+                frame.reported = frame.deferred.len();
+            }
             tracing::error!(
+                frame_id = frame.id,
+                db_path = ?frame.db_path,
+                intent_count,
                 "#4116: a WriteTxn opened while an older frame on the same database still \
                  holds deferred escalations (leaked or unsettled transaction)"
             );
+        }
+        if stale {
             debug_assert!(false, "#4116: stale escalation frame on this database");
         }
         frames.0.push(TxnFrame {
@@ -229,6 +272,7 @@ pub(super) fn open_frame(conn: &Connection) -> u64 {
             db_path,
             conn_addr: std::ptr::from_ref(conn).addr(),
             deferred: Vec::new(),
+            reported: 0,
             anchor: crate::governance::audit::PendingAuditAnchor::none(),
         });
     });
