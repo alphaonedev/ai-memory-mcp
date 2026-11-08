@@ -286,3 +286,57 @@ fn credential_shaped_fragment_colon_owns_its_value_8205() {
         "ruling 6717162013: a recognized credential key owns the rest of its line"
     );
 }
+
+#[test]
+fn format_control_keys_are_private_8205_r7() {
+    for key in [
+        "pass\u{ad}word",
+        "pass\u{200b}word",
+        "pass\u{2060}word",
+        "pass\u{feff}word",
+    ] {
+        assert_private(
+            &format!("{PREFIX}{key}=Z1Z2Z3Z4Z5"),
+            "Z1Z2Z3Z4Z5",
+            &format!("F3 format-control key {key:?}"),
+        );
+    }
+}
+
+#[test]
+fn mathematical_keys_are_private_8205_r7() {
+    // Literal glyphs are independent of the production range arithmetic.
+    for key in [
+        "𝐩𝐚𝐬𝐬𝐰𝐨𝐫𝐝",
+        "𝑝𝑎𝑠𝑠𝑤𝑜𝑟𝑑",
+        "𝒑𝒂𝒔𝒔𝒘𝒐𝒓𝒅",
+        "𝓅𝒶𝓈𝓈𝓌ℴ𝓇𝒹",
+        "𝓹𝓪𝓼𝓼𝔀𝓸𝓻𝓭",
+        "𝔭𝔞𝔰𝔰𝔴𝔬𝔯𝔡",
+        "𝕡𝕒𝕤𝕤𝕨𝕠𝕣𝕕",
+        "𝖕𝖆𝖘𝖘𝖜𝖔𝖗𝖉",
+        "𝗉𝖺𝗌𝗌𝗐𝗈𝗋𝖽",
+        "𝗽𝗮𝘀𝘀𝘄𝗼𝗿𝗱",
+        "𝘱𝘢𝘴𝘴𝘸𝘰𝘳𝘥",
+        "𝙥𝙖𝙨𝙨𝙬𝙤𝙧𝙙",
+        "𝚙𝚊𝚜𝚜𝚠𝚘𝚛𝚍",
+        "𝐏𝐀𝐒𝐒𝐖𝐎𝐑𝐃",
+        "ℙ𝔸𝕊𝕊𝕎𝕆ℝ𝔻",
+    ] {
+        assert_private(
+            &format!("{PREFIX}{key}=Z1Z2Z3Z4Z5"),
+            "Z1Z2Z3Z4Z5",
+            &format!("F3 mathematical key {key:?}"),
+        );
+    }
+}
+
+#[test]
+fn quoted_url_value_does_not_own_the_next_key_8205_r7() {
+    let detail = format!("{PREFIX}password=\"https://db.example.invalid:443\" token=Z1Z2Z3Z4Z5");
+    let line = assert_private(&detail, "Z1Z2Z3Z4Z5", "quoted URL followed by credential");
+    assert!(
+        line.contains("password=**** token=****"),
+        "both credential values must be independently masked: {line}"
+    );
+}

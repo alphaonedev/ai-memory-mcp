@@ -1783,6 +1783,8 @@ fn credential_value_start(msg: &str) -> Option<usize> {
             let body = url[authority_start..]
                 .find(AUTHORITY_TERMINATORS)
                 .map_or(span.end, |at| span.start + authority_start + at);
+            #[cfg(test)]
+            masking_cost_tests::visited(body - span.start);
             span.start <= offset && offset < body
         }) {
             continue;
@@ -1860,7 +1862,10 @@ fn map_url_runs(msg: &str, render: impl Fn(&str) -> String) -> String {
 
 /// Share URL ownership between scalar recognition and URL rendering (OWNERSHIP-15).
 fn next_url_span(text: &str) -> Option<std::ops::Range<usize>> {
-    let sep = text.find(SCHEME_SEPARATOR)?;
+    let separator = text.find(SCHEME_SEPARATOR);
+    #[cfg(test)]
+    masking_cost_tests::visited(separator.map_or(text.len(), |at| at + SCHEME_SEPARATOR.len()));
+    let sep = separator?;
     let mut start = sep;
     while start > 0 {
         let byte = text.as_bytes()[start - 1];
@@ -1953,6 +1958,9 @@ fn render_operator_url(url: &str, render: fn(&str) -> String) -> String {
         "{scheme}{SCHEME_SEPARATOR}{URL_PASSWORD_MASK}@{host}"
     ))
 }
+
+#[cfg(test)]
+mod masking_cost_tests;
 
 #[cfg(test)]
 mod tests {
