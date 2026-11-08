@@ -54,6 +54,7 @@ pub struct IngestMultistepArgs {
 pub fn cmd_ingest_multistep(
     args: &IngestMultistepArgs,
     app_config: &AppConfig,
+    cli_agent_id: Option<&str>,
     out: &mut CliOutput<'_>,
 ) -> Result<()> {
     let mut params = json!({"content": args.content});
@@ -68,7 +69,7 @@ pub fn cmd_ingest_multistep(
     // tier-locked advisory envelope returns when the operator drives
     // this from a terminal. The MCP / HTTP daemon owns the dispatch.
     let feature_tier = app_config.effective_tier(None);
-    let envelope = crate::mcp::handle_ingest_multistep(&params, None, feature_tier)
+    let envelope = crate::mcp::handle_ingest_multistep(&params, None, feature_tier, cli_agent_id)
         .map_err(|e| anyhow::anyhow!("ingest-multistep: {e}"))?;
 
     if args.json {
@@ -108,7 +109,7 @@ mod tests {
         };
         {
             let mut out = env.output();
-            cmd_ingest_multistep(&args, &cfg, &mut out).expect("ok");
+            cmd_ingest_multistep(&args, &cfg, None, &mut out).expect("ok");
         }
         let stdout = env.stdout_str();
         let envelope: Value = serde_json::from_str(stdout.trim()).expect("parse envelope");
@@ -127,7 +128,7 @@ mod tests {
             json: true,
         };
         let mut out = env.output();
-        let err = cmd_ingest_multistep(&args, &cfg, &mut out).expect_err("must fail");
+        let err = cmd_ingest_multistep(&args, &cfg, None, &mut out).expect_err("must fail");
         assert!(err.to_string().contains("ingest-multistep"), "got: {err}");
     }
 
@@ -143,7 +144,7 @@ mod tests {
         };
         {
             let mut out = env.output();
-            cmd_ingest_multistep(&args, &cfg, &mut out).expect("ok");
+            cmd_ingest_multistep(&args, &cfg, None, &mut out).expect("ok");
         }
         // CLI passes handler=None → always the tier-locked advisory.
         // (The `variant=...` else-branch in the text formatter is only

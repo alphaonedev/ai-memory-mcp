@@ -195,6 +195,22 @@ impl AutonomyLlm for SwappableLlm {
         }
     }
 
+    /// #8443: forward the grounded call. Without this override the trait
+    /// default drops the owner and the role-grounding block, so a hot-swap
+    /// handle would summarise ungrounded.
+    fn summarize_memories_grounded(
+        &self,
+        owner: Option<&str>,
+        memories: &[(String, String)],
+    ) -> anyhow::Result<String> {
+        match self.current().as_ref() {
+            Some(client) => AutonomyLlm::summarize_memories_grounded(client, owner, memories),
+            None => Err(anyhow::anyhow!(
+                "llm client not configured (hot-swap current handle is None)"
+            )),
+        }
+    }
+
     fn classify_kind(
         &self,
         title: &str,

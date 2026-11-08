@@ -20,7 +20,7 @@ re-issue at `b0483115`, the 2026-09-11 #3595 re-issue at `ad60bead` and the orig
 mint `e22bc93c` remain as historical records. Any change to the federation wire path or the `AI_MEMORY_FED_*` surface **voids this
 certification and triggers re-cert** (see §7).
 
-## STATUS — **VOID as of 2026-10-28** (§7 fired again by #2967, `src/federation/receive_auth.rs`, recorded in the §7 firing ledger; no live claim; the certification had already EXPIRED as of 2026-10-07 when §7 fired: 4 watched federation-wire files changed after the `385da3a05` bind; re-measurement and re-issue pending under WP-B1, #6063; the last LIVE claim was the 2026-10-02 re-issue at `385da3a05`)
+## STATUS — **VOID as of 2026-11-01** (§7 fired again by #8443, `src/handlers/federation_receive.rs`, and before it by #2967, `src/federation/receive_auth.rs`, recorded in the §7 firing ledger; no live claim; the certification had already EXPIRED as of 2026-10-07 when §7 fired: 4 watched federation-wire files changed after the `385da3a05` bind; re-measurement and re-issue pending under WP-B1, #6063; the last LIVE claim was the 2026-10-02 re-issue at `385da3a05`)
 
 > **Amendment (2026-10-07, #6063 WP-B1 — §7 EXPIRY RECORD, certification EXPIRED).**
 > The federation certification **expired** per §7 when four §7-watched
@@ -2082,6 +2082,23 @@ federation-wire surface changed AND cert doc re-issued/voided in the same
 change (...; banner EXPIRED - → VOID -)` and `check-cert-expiry: banner
 STATUS=VOID — the doc makes no live claim; nothing to hold it to`. The §8
 statuses below are historical records of earlier binds, not a live claim.
+
+**Re-cert trigger - FIRED by #8443 (`src/handlers/federation_receive.rs`,
+2026-11-01; PR #8449).** One §7-watched path changed. The receive loop now
+sanitises a `content_principal` claim on every inbound row
+(`role_grounding::sanitize_inbound_principal`): a claim may demote content to
+a valid non-owner principal but never promote it, and a claim that names the
+row's own author or the receiving agent (compared without regard to letter
+case) is replaced by the authenticated peer. No `AI_MEMORY_FED_*` identifier
+is added, removed or renamed, and no wire format, signature check,
+quarantine or accept/refuse rule changes. The posture is strictly MORE
+protective, never weaker.
+
+*Disposition.* **This change does NOT re-mint the certification and does not
+approve its own control.** Re-issue stays a Conductor task under
+[**#6063**](https://github.com/alphaonedev/ai-memory-mcp/issues/6063) (WP-B1);
+#8443 only records the voiding. The last bound determination is unchanged at
+`385da3a054c4f82bcdfd51ec2d8f07ca4947f9a5`.
 
 ---
 

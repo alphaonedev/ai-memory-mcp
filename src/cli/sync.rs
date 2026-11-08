@@ -79,7 +79,7 @@ fn restamp_agent_id(mem: &mut models::Memory, caller_id: &str) {
             "agent_id".to_string(),
             serde_json::Value::String(caller_id.to_string()),
         );
-        if let Some(orig) = original
+        if let Some(orig) = original.clone()
             && orig != caller_id
         {
             obj.insert(
@@ -87,6 +87,8 @@ fn restamp_agent_id(mem: &mut models::Memory, caller_id: &str) {
                 serde_json::Value::String(orig),
             );
         }
+        // #8443 (arXiv 2610.38209) - never keep a claimed content_principal.
+        crate::role_grounding::restamp_untrusted_import(obj, original.as_deref(), caller_id);
     }
 }
 

@@ -414,7 +414,14 @@ impl<'a> ReflectionPass<'a> {
     /// * Tier = max of source tiers (never downgrade).
     /// * Priority = max of source priorities (the reflection inherits
     ///   the salience of its highest-priority source).
+    #[cfg(test)]
     fn summarize(&self, cluster: &[Memory]) -> Result<Memory> {
+        self.summarize_for(cluster, None)
+    }
+
+    /// [`Self::summarize`] with the NAMESPACE OWNER of the cluster (code M1):
+    /// the owner hint is the owner, the curator id is only the writer.
+    fn summarize_for(&self, cluster: &[Memory], ns_owner: Option<&str>) -> Result<Memory> {
         if cluster.len() < MIN_CLUSTER_SIZE {
             anyhow::bail!(
                 "summarize: cluster has {} members (< MIN_CLUSTER_SIZE = {})",
@@ -423,13 +430,15 @@ impl<'a> ReflectionPass<'a> {
             );
         }
 
-        let input: Vec<(String, String)> = cluster
-            .iter()
-            .map(|m| (m.title.clone(), m.content.clone()))
-            .collect();
+        // #8443 — ground the roles: owner from the store, sources labelled.
+        // The reflection is written under the curator id (the author of
+        // record); the owner hint is the namespace owner, never that id.
+        let writer = self.agent_id();
+        let (owner, input) =
+            crate::role_grounding::summary_inputs_with(cluster, ns_owner, Some(&writer));
         let summary_text = self
             .llm
-            .summarize_memories(&input)
+            .summarize_memories_grounded(owner.as_deref(), &input)
             .context("ReflectionPass::summarize: LLM call failed")?;
 
         let base_title = cluster
@@ -478,9 +487,19 @@ impl<'a> ReflectionPass<'a> {
             // operator-visible under enforcement. The owner stays the
             // curator for attribution (the substrate `reflect` path stamps
             // `metadata.agent_id` from `ReflectInput::agent_id`).
-            metadata: serde_json::json!({
-                "scope": crate::models::MemoryScope::Collective.as_str(),
-            }),
+            metadata: {
+                let mut metadata = serde_json::json!({
+                    "scope": crate::models::MemoryScope::Collective.as_str(),
+                });
+                // #8443 — a reflection over foreign sources is not owner content.
+                crate::role_grounding::stamp_folded_with(
+                    &mut metadata,
+                    cluster,
+                    ns_owner,
+                    Some(&writer),
+                );
+                metadata
+            },
             reflection_depth: 0,
             memory_kind: MemoryKind::Reflection,
             entity_id: None,
@@ -791,7 +810,10 @@ pub async fn run_reflection_pass(
             // stable across re-runs on the same input (helps debugging).
             cluster.sort_by(|a, b| a.id.cmp(&b.id));
 
-            let summary = match pass.summarize(&cluster) {
+            let ns_owner =
+                crate::role_grounding::namespace_owner_via_store(store, &pass.ctx, ns.as_str())
+                    .await;
+            let summary = match pass.summarize_for(&cluster, ns_owner.as_deref()) {
                 Ok(s) => s,
                 Err(e) => {
                     report
@@ -1755,6 +1777,74 @@ mod tests {
                     .unwrap();
             assert_eq!(report.dry_run, false);
             assert!(report.reflections_persisted >= 1);
+        }
+
+        /// #8443 code M1: records the owner hint and labelled inputs.
+        struct GroundingProbe {
+            seen: Mutex<Vec<(Option<String>, Vec<(String, String)>)>>,
+        }
+
+        impl AutonomyLlm for GroundingProbe {
+            fn auto_tag(&self, _t: &str, _c: &str) -> Result<Vec<String>> {
+                Ok(vec![])
+            }
+            fn detect_contradiction(&self, _a: &str, _b: &str) -> Result<bool> {
+                Ok(false)
+            }
+            fn summarize_memories(&self, _m: &[(String, String)]) -> Result<String> {
+                Ok("probe".to_string())
+            }
+            fn summarize_memories_grounded(
+                &self,
+                owner: Option<&str>,
+                memories: &[(String, String)],
+            ) -> Result<String> {
+                self.seen
+                    .lock()
+                    .unwrap()
+                    .push((owner.map(str::to_string), memories.to_vec()));
+                Ok("probe".to_string())
+            }
+        }
+
+        fn authored_obs(id: &str, author: &str) -> Memory {
+            let mut m = make_obs(id, "app", id, "shared keyword token strategy", 2);
+            m.metadata = serde_json::json!({"agent_id": author});
+            m
+        }
+
+        #[test]
+        fn summarize_for_uses_the_namespace_owner_not_the_curator_8443() {
+            let (store, _dir) = open_db();
+            let run = |authors: [&str; 3]| {
+                let llm = GroundingProbe {
+                    seen: Mutex::new(Vec::new()),
+                };
+                let pass = ReflectionPass::new(&store, &llm, None, None, false);
+                let cluster: Vec<Memory> = authors
+                    .iter()
+                    .enumerate()
+                    .map(|(i, a)| authored_obs(&format!("m{i}"), a))
+                    .collect();
+                let proposal = pass
+                    .summarize_for(&cluster, Some("ai:owner"))
+                    .expect("summarize");
+                let seen = llm.seen.lock().unwrap().first().cloned().expect("ran");
+                (
+                    crate::role_grounding::content_principal(&proposal.metadata)
+                        .map(str::to_string),
+                    seen,
+                )
+            };
+            let (principal, (owner, inputs)) = run(["ai:owner", "ai:owner", "ai:owner"]);
+            assert_eq!(principal, None, "owner-authored cluster is owner content");
+            assert_eq!(owner.as_deref(), Some("ai:owner"));
+            assert!(inputs.iter().all(|(_, c)| !c.contains("source principal")));
+            let (principal, (_, inputs)) = run(["ai:eve", "ai:eve", "ai:eve"]);
+            assert_eq!(principal.as_deref(), Some("ai:eve"));
+            assert!(inputs.iter().all(|(_, c)| c.contains("ai:eve")));
+            let (principal, _) = run(["ai:owner", "ai:eve", "ai:eve"]);
+            assert_eq!(principal.as_deref(), Some("mixed"));
         }
 
         #[tokio::test]

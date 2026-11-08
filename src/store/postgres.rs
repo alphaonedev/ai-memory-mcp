@@ -8692,7 +8692,7 @@ impl PostgresStore {
                         SELECT COALESCE(jsonb_object_agg(prov.k, prov.v), '{}'::jsonb)
                         FROM jsonb_each(metadata) AS prov(k, v)
                         -- #2941 — reserved set, lockstep-gated on crate::RESERVED_UPSERT_METADATA_KEYS.
-                        WHERE prov.k IN ('agent_id', 'derived_from', 'consolidated_from_agents', 'agent_pubkey', 'pubkey_bound_at')
+                        WHERE prov.k IN ('agent_id', 'derived_from', 'consolidated_from_agents', 'content_principal', 'agent_pubkey', 'pubkey_bound_at')
                     ))
                 END,
                 source_uri = COALESCE($10, source_uri),
@@ -14696,7 +14696,7 @@ impl PostgresStore {
                     SELECT COALESCE(jsonb_object_agg(prov.k, prov.v), '{{}}'::jsonb)
                     FROM jsonb_each(memories.metadata) AS prov(k, v)
                     -- #2941 — reserved set, lockstep-gated on crate::RESERVED_UPSERT_METADATA_KEYS.
-                    WHERE prov.k IN ('agent_id', 'derived_from', 'consolidated_from_agents', 'agent_pubkey', 'pubkey_bound_at')
+                    WHERE prov.k IN ('agent_id', 'derived_from', 'consolidated_from_agents', 'content_principal', 'agent_pubkey', 'pubkey_bound_at')
                 )) {unstamped_owner_drop},
                 reflection_depth = GREATEST(memories.reflection_depth, EXCLUDED.reflection_depth),
                 memory_kind = CASE WHEN memories.memory_kind = 'reflection' THEN 'reflection'
@@ -21275,7 +21275,14 @@ impl MemoryStore for PostgresStore {
             stamped_holder = m;
             &stamped_holder
         } else {
-            memory
+            // #8443: `content_principal` is server-stamped; a non-substrate
+            // caller's own value is dropped (parity with the sqlite funnel).
+            let mut m = memory.clone();
+            if !ctx.keep_server_principal {
+                crate::role_grounding::strip_content_principal(&mut m.metadata);
+            }
+            stamped_holder = m;
+            &stamped_holder
         };
         consult_why_trace_gate_pg(memory)?;
 
@@ -21481,7 +21488,7 @@ impl MemoryStore for PostgresStore {
                     SELECT COALESCE(jsonb_object_agg(prov.k, prov.v), '{{}}'::jsonb)
                     FROM jsonb_each(memories.metadata) AS prov(k, v)
                     -- #2941 — reserved set, lockstep-gated on crate::RESERVED_UPSERT_METADATA_KEYS.
-                    WHERE prov.k IN ('agent_id', 'derived_from', 'consolidated_from_agents', 'agent_pubkey', 'pubkey_bound_at')
+                    WHERE prov.k IN ('agent_id', 'derived_from', 'consolidated_from_agents', 'content_principal', 'agent_pubkey', 'pubkey_bound_at')
                 )) {unstamped_owner_drop},
                 -- v0.7.0 Task 1/8 — recursion depth takes max on upsert so a
                 -- newer reflection at higher depth doesn't lose its provenance
@@ -21757,7 +21764,18 @@ impl MemoryStore for PostgresStore {
                 .collect::<Vec<_>>();
             &stamped_holder
         } else {
-            memories
+            // #8443: ingress strip of the server-stamped content principal.
+            stamped_holder = memories
+                .iter()
+                .map(|m| {
+                    let mut m = m.clone();
+                    if !ctx.keep_server_principal {
+                        crate::role_grounding::strip_content_principal(&mut m.metadata);
+                    }
+                    m
+                })
+                .collect::<Vec<_>>();
+            &stamped_holder
         };
 
         // Substrate governance parity: each row still passes the
@@ -22073,7 +22091,7 @@ impl MemoryStore for PostgresStore {
                     SELECT COALESCE(jsonb_object_agg(prov.k, prov.v), '{{}}'::jsonb)
                     FROM jsonb_each(memories.metadata) AS prov(k, v)
                     -- #2941 — reserved set, lockstep-gated on crate::RESERVED_UPSERT_METADATA_KEYS.
-                    WHERE prov.k IN ('agent_id', 'derived_from', 'consolidated_from_agents', 'agent_pubkey', 'pubkey_bound_at')
+                    WHERE prov.k IN ('agent_id', 'derived_from', 'consolidated_from_agents', 'content_principal', 'agent_pubkey', 'pubkey_bound_at')
                 )) {unstamped_owner_drop},
                 reflection_depth = GREATEST(memories.reflection_depth, EXCLUDED.reflection_depth),
                 memory_kind = CASE WHEN memories.memory_kind = 'reflection' THEN 'reflection'
@@ -22538,7 +22556,7 @@ impl MemoryStore for PostgresStore {
                     SELECT COALESCE(jsonb_object_agg(prov.k, prov.v), '{{}}'::jsonb)
                     FROM jsonb_each(memories.metadata) AS prov(k, v)
                     -- #2941 — reserved set, lockstep-gated on crate::RESERVED_UPSERT_METADATA_KEYS.
-                    WHERE prov.k IN ('agent_id', 'derived_from', 'consolidated_from_agents', 'agent_pubkey', 'pubkey_bound_at')
+                    WHERE prov.k IN ('agent_id', 'derived_from', 'consolidated_from_agents', 'content_principal', 'agent_pubkey', 'pubkey_bound_at')
                 )) {unstamped_owner_drop},
                 reflection_depth = GREATEST(memories.reflection_depth, EXCLUDED.reflection_depth),
                 memory_kind = CASE WHEN memories.memory_kind = 'reflection' THEN 'reflection'
@@ -22932,7 +22950,7 @@ impl MemoryStore for PostgresStore {
                     SELECT COALESCE(jsonb_object_agg(prov.k, prov.v), '{{}}'::jsonb)
                     FROM jsonb_each(memories.metadata) AS prov(k, v)
                     -- #2941 — reserved set, lockstep-gated on crate::RESERVED_UPSERT_METADATA_KEYS.
-                    WHERE prov.k IN ('agent_id', 'derived_from', 'consolidated_from_agents', 'agent_pubkey', 'pubkey_bound_at')
+                    WHERE prov.k IN ('agent_id', 'derived_from', 'consolidated_from_agents', 'content_principal', 'agent_pubkey', 'pubkey_bound_at')
                 )) {unstamped_owner_drop},
                 reflection_depth = GREATEST(memories.reflection_depth, EXCLUDED.reflection_depth),
                 memory_kind = CASE WHEN memories.memory_kind = 'reflection' THEN 'reflection'
@@ -23741,6 +23759,18 @@ impl MemoryStore for PostgresStore {
         // keeps the STORED row's agent_id, so the seal must too. Captured
         // before the governance builder consumes `cur_meta`.
         let retained_seal_agent_id = metadata_agent_id_slot(&cur_meta).map(str::to_string);
+        // #8443 - the SQL overlay re-applies only the STORED row's reserved
+        // keys, so a `content_principal` the row never had would survive from
+        // the caller's patch. The principal is server-derived: drop an
+        // incoming-only key (twin of `storage::update_with_expected_version`).
+        let mut patch = patch;
+        if cur_meta
+            .get(crate::role_grounding::META_CONTENT_PRINCIPAL)
+            .is_none()
+            && let Some(m) = patch.metadata.as_mut()
+        {
+            crate::role_grounding::strip_content_principal(m);
+        }
 
         // `content_changed` is true when the patch supplies a title OR
         // content that differs from the stored row. A metadata / tag /
@@ -23943,7 +23973,7 @@ impl MemoryStore for PostgresStore {
                         SELECT COALESCE(jsonb_object_agg(prov.k, prov.v), '{}'::jsonb)
                         FROM jsonb_each(metadata) AS prov(k, v)
                         -- #2941 — reserved set, lockstep-gated on crate::RESERVED_UPSERT_METADATA_KEYS.
-                        WHERE prov.k IN ('agent_id', 'derived_from', 'consolidated_from_agents', 'agent_pubkey', 'pubkey_bound_at')
+                        WHERE prov.k IN ('agent_id', 'derived_from', 'consolidated_from_agents', 'content_principal', 'agent_pubkey', 'pubkey_bound_at')
                     ))
                 END,
                 source_uri = COALESCE($10, source_uri),
@@ -25272,7 +25302,7 @@ impl MemoryStore for PostgresStore {
                             SELECT COALESCE(jsonb_object_agg(prov.k, prov.v), '{{}}'::jsonb)
                             FROM jsonb_each(memories.metadata) AS prov(k, v)
                             -- #2941 — reserved set, lockstep-gated on crate::RESERVED_UPSERT_METADATA_KEYS.
-                            WHERE prov.k IN ('agent_id', 'derived_from', 'consolidated_from_agents', 'agent_pubkey', 'pubkey_bound_at')
+                            WHERE prov.k IN ('agent_id', 'derived_from', 'consolidated_from_agents', 'content_principal', 'agent_pubkey', 'pubkey_bound_at')
                         )) {unstamped_owner_drop}
                     ELSE memories.metadata
                 END,
@@ -28111,6 +28141,19 @@ impl MemoryStore for PostgresStore {
                 detail: crate::identity::attest::ATTESTATION_REFUSED_UNSIGNED_SURFACE.to_string(),
             });
         }
+        // #8443 (code M1) — a substrate pass writes the formed row under its
+        // own id, so the owner hint for its fold is the NAMESPACE OWNER, never
+        // that id. Resolved before the tx opens (pool read, not the tx). A read
+        // fault is no owner: the fold then treats every non-writer author as
+        // foreign (fail closed).
+        let substrate_owner = if ctx.bypass_visibility {
+            self.pg_resolve_namespace_owner(namespace)
+                .await
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
         let mut tx = self
             .pool
             .begin()
@@ -28137,6 +28180,8 @@ impl MemoryStore for PostgresStore {
         let mut total_access: i64 = 0;
         let mut merged_metadata = serde_json::Map::new();
         let mut source_agent_ids: Vec<String> = Vec::new();
+        // #8443 — each source's `content_principal` (None = absent).
+        let mut source_metas: Vec<serde_json::Value> = Vec::new();
         // v0.9.0 G13-mem (#1859) — per-source content-ids captured for the
         // `metadata.derived_from_cids` record + the tombstone-path edge
         // stamps below.
@@ -28196,8 +28241,13 @@ impl MemoryStore for PostgresStore {
             let metadata: serde_json::Value =
                 row.try_get("metadata").unwrap_or(serde_json::json!({}));
             source_trust_tiers.push(crate::trust::TrustTier::of_metadata(&metadata));
+            // #8443 — fold the content principal over every source (sqlite twin).
+            source_metas.push(metadata.clone());
             if let serde_json::Value::Object(map) = metadata {
                 for (k, v) in map {
+                    if k == crate::role_grounding::META_CONTENT_PRINCIPAL {
+                        continue;
+                    }
                     if k == "agent_id" {
                         if let serde_json::Value::String(aid) = &v
                             && !source_agent_ids.contains(aid)
@@ -28231,6 +28281,23 @@ impl MemoryStore for PostgresStore {
             "agent_id".to_string(),
             serde_json::Value::String(consolidator_agent_id.to_string()),
         );
+        // #8443 — folded content principal (sqlite `storage::consolidate` twin).
+        let source_refs: Vec<&serde_json::Value> = source_metas.iter().collect();
+        let folded = if ctx.bypass_visibility {
+            crate::role_grounding::fold_metadata_with(
+                &source_refs,
+                substrate_owner.as_deref(),
+                Some(consolidator_agent_id),
+            )
+        } else {
+            crate::role_grounding::fold_metadata(&source_refs, Some(consolidator_agent_id))
+        };
+        if let Some(folded) = folded {
+            merged_metadata.insert(
+                crate::role_grounding::META_CONTENT_PRINCIPAL.to_string(),
+                serde_json::Value::String(folded.as_str().to_string()),
+            );
+        }
         if !source_agent_ids.is_empty() {
             merged_metadata.insert(
                 "consolidated_from_agents".to_string(),
@@ -28454,7 +28521,7 @@ impl MemoryStore for PostgresStore {
                     SELECT COALESCE(jsonb_object_agg(prov.k, prov.v), '{{}}'::jsonb)
                     FROM jsonb_each(memories.metadata) AS prov(k, v)
                     -- #2941 — reserved set, lockstep-gated on crate::RESERVED_UPSERT_METADATA_KEYS.
-                    WHERE prov.k IN ('agent_id', 'derived_from', 'consolidated_from_agents', 'agent_pubkey', 'pubkey_bound_at')
+                    WHERE prov.k IN ('agent_id', 'derived_from', 'consolidated_from_agents', 'content_principal', 'agent_pubkey', 'pubkey_bound_at')
                 )) {unstamped_owner_drop}
                 -- reflection_depth intentionally not surfaced here: the
                 -- consolidate path mints a fresh memory and the DB column
@@ -30984,6 +31051,14 @@ impl MemoryStore for PostgresStore {
         // rationale here; see the trait docs). Sqlite adapter parity.
         if let Some(wt) = why_trace.filter(|s| !s.trim().is_empty()) {
             metadata[crate::storage::META_KEY_WHY_TRACE] = serde_json::json!(wt);
+        }
+        // #8443: the payload is the sender's content, not the recipient's
+        // (parity with the MCP notify funnel). A note to self is owner content.
+        if ctx.agent_id != target_agent {
+            crate::role_grounding::stamp_content_principal(
+                &mut metadata,
+                &crate::role_grounding::ContentPrincipal::from_agent_id_or_unknown(&ctx.agent_id),
+            );
         }
         let mem = Memory {
             id: row_id,
@@ -33906,6 +33981,8 @@ impl MemoryStore for PostgresStore {
             serde_json::Value::Object(m) => serde_json::Value::Object(m.clone()),
             _ => serde_json::json!({}),
         };
+        // #8443: `content_principal` is server-stamped; a caller value is dropped.
+        crate::role_grounding::strip_content_principal(&mut metadata);
         let meta_map = metadata.as_object_mut().expect("metadata is an object");
         meta_map.insert(
             "kind".to_string(),
@@ -34489,7 +34566,7 @@ impl PostgresStore {
                     SELECT COALESCE(jsonb_object_agg(prov.k, prov.v), '{{}}'::jsonb)
                     FROM jsonb_each(memories.metadata) AS prov(k, v)
                     -- #2941 — reserved set, lockstep-gated on crate::RESERVED_UPSERT_METADATA_KEYS.
-                    WHERE prov.k IN ('agent_id', 'derived_from', 'consolidated_from_agents', 'agent_pubkey', 'pubkey_bound_at')
+                    WHERE prov.k IN ('agent_id', 'derived_from', 'consolidated_from_agents', 'content_principal', 'agent_pubkey', 'pubkey_bound_at')
                 )) {unstamped_owner_drop},
                 -- v0.7.0 Task 1/8 — recursion depth takes max on upsert.
                 reflection_depth = GREATEST(memories.reflection_depth, EXCLUDED.reflection_depth),

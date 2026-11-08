@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::cache::{
-    CacheKey, EXPLICIT_TRUST_INSTRUCTION, PromptCacheTelemetry, build_shared_prefix,
+    CacheKey, EXPLICIT_TRUST_INSTRUCTION, PromptCacheTelemetry, build_shared_prefix_for,
 };
 #[cfg(test)]
 use super::helpers::HelperParams;
@@ -224,6 +224,9 @@ pub struct IngestExecutor<D: LlmDispatch + ?Sized> {
     /// not duplicated per helper. Release builds elide the
     /// recording entirely so production paths see zero overhead.
     helper_content_ptrs: Arc<std::sync::Mutex<Vec<usize>>>,
+    /// #8443 - memory owner named in the role-grounding block (store-resolved,
+    /// never content). `None` renders the unidentified-owner form.
+    owner: Option<String>,
 }
 
 impl<D: LlmDispatch + ?Sized> IngestExecutor<D> {
@@ -235,7 +238,15 @@ impl<D: LlmDispatch + ?Sized> IngestExecutor<D> {
             telemetry: Arc::new(PromptCacheTelemetry::new()),
             max_content_chars: None,
             helper_content_ptrs: Arc::new(std::sync::Mutex::new(Vec::new())),
+            owner: None,
         }
+    }
+
+    /// #8443 - name the memory owner in the role-grounding block.
+    #[must_use]
+    pub fn with_owner(mut self, owner: impl Into<String>) -> Self {
+        self.owner = Some(owner.into());
+        self
     }
 
     /// Builder-style setter for the per-LLM-stage content cap (issue
@@ -361,7 +372,11 @@ impl<D: LlmDispatch + ?Sized> IngestExecutor<D> {
 
         // Phase 2: walk the LLM stages, assembling the shared-prefix
         // prompt and resolving trust slots against helper_outputs.
-        let prefix = build_shared_prefix(pipeline.variant_tag(), &pipeline.system_prompt);
+        let prefix = build_shared_prefix_for(
+            pipeline.variant_tag(),
+            &pipeline.system_prompt,
+            self.owner.as_deref(),
+        );
         let cache_key = CacheKey::from_prefix(&prefix);
         let llm_cap = self
             .max_content_chars

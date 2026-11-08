@@ -1411,6 +1411,8 @@ pub async fn import_memories(
                     serde_json::Value::String(orig.clone()),
                 );
             }
+            // #8443 (arXiv 2610.38209) - never keep a claimed content_principal.
+            crate::role_grounding::restamp_untrusted_import(obj, original.as_deref(), &caller);
         }
         original
     };
@@ -1449,8 +1451,11 @@ pub async fn import_memories(
         // but the ctx is the auth principal so visibility filters
         // applied INSIDE store_inner (e.g., upsert dedup lookup)
         // see the actual caller.
+        // #8443: the principal on each row was re-derived by
+        // `restamp_untrusted_import` above; the SAL strip must keep it.
         let ctx = crate::store::CallerContext::for_agent(caller.clone())
-            .with_capability(capability.clone());
+            .with_capability(capability.clone())
+            .with_server_stamped_principal();
         let mut imported = 0usize;
         let mut pubkey_bindings_stripped = 0usize;
         let mut errors: Vec<String> = Vec::new();

@@ -147,11 +147,9 @@ pub(crate) fn handle_session_start(
     if let Some(llm_client) = llm
         && !results.is_empty()
     {
-        let pairs: Vec<(String, String)> = results
-            .iter()
-            .map(|m| (m.title.clone(), m.content.clone()))
-            .collect();
-        match llm_client.summarize_memories(&pairs) {
+        // #8443 — foreign-principal rows are labelled; the owner is the caller.
+        let (owner, pairs) = crate::role_grounding::summary_inputs_for(&results, caller);
+        match llm_client.summarize_memories_grounded(owner.as_deref(), &pairs) {
             Ok(summary) => {
                 response["summary"] = json!(summary);
             }

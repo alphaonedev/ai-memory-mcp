@@ -1753,6 +1753,12 @@ fn restamp_inbound_identity(
             );
             report.restamped += 1;
         }
+        // #8443 (arXiv 2610.38209) - never keep a claimed content_principal.
+        crate::role_grounding::restamp_untrusted_import(
+            obj,
+            original_claim.as_deref(),
+            &opts.caller_agent_id,
+        );
     }
     // #3625 — TAIL GUARANTEE (mirrors the v1 importer + receive): after the
     // `!trust_source` restamp above, ensure EVERY posture leaves a valid #3124

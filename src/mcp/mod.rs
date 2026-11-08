@@ -236,6 +236,8 @@ mod provider_echo_sinks_3648_tests;
 #[cfg(test)]
 mod provider_redaction_3648_tests;
 #[cfg(test)]
+mod rga_multistep_dispatch_8443_tests;
+#[cfg(test)]
 mod span_capture_4088_tests;
 
 /// PR-5 (issue #487): emit an audit event for an MCP `tools/call`
@@ -2602,6 +2604,7 @@ fn dispatch_memory_ingest_multistep(ctx: &ToolDispatchCtx<'_>) -> Result<Value, 
         ctx.arguments,
         ctx.ingest_multistep_handler,
         ctx.tier_config.tier,
+        ctx.authority.read_caller(),
     )
 }
 
@@ -3831,13 +3834,17 @@ fn handle_request(
                     use crate::mcp::registry::tool_names as tn;
                     let text = match wire_format {
                         Some(WireFormat::Toon) if tool_name == tn::MEMORY_SEARCH => {
-                            crate::toon::search_to_toon(&val, false)
+                            crate::toon::search_to_toon_for(&val, false, authority.read_caller())
                         }
                         Some(WireFormat::ToonCompact) if tool_name == tn::MEMORY_SEARCH => {
-                            crate::toon::search_to_toon(&val, true)
+                            crate::toon::search_to_toon_for(&val, true, authority.read_caller())
                         }
-                        Some(WireFormat::Toon) => crate::toon::memories_to_toon(&val, false),
-                        Some(WireFormat::ToonCompact) => crate::toon::memories_to_toon(&val, true),
+                        Some(WireFormat::Toon) => {
+                            crate::toon::memories_to_toon_for(&val, false, authority.read_caller())
+                        }
+                        Some(WireFormat::ToonCompact) => {
+                            crate::toon::memories_to_toon_for(&val, true, authority.read_caller())
+                        }
                         Some(WireFormat::Json) | None => {
                             serde_json::to_string_pretty(&val).unwrap_or_default()
                         }
