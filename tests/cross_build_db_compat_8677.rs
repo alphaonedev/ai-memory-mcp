@@ -223,7 +223,11 @@ fn older_build_refuses_newer_database_byte_identical_with_actionable_text_8677()
         listing_before,
         "a refused open must create no sidecar, journal or snapshot file"
     );
-    assert!(snapshots(dir.path()).is_empty());
+    assert_eq!(
+        snapshots(dir.path()),
+        Vec::<PathBuf>::new(),
+        "a refused open must take no snapshot"
+    );
 }
 
 // ---------------------------------------------------------------- case 2
@@ -240,7 +244,11 @@ fn current_build_snapshots_then_migrates_previous_release_database_8677() {
             .expect("restore previous-release shape");
     }
     assert_eq!(stamp_of(&path), PREVIOUS_RELEASE_SCHEMA);
-    assert!(snapshots(dir.path()).is_empty(), "fixture has no snapshot");
+    assert_eq!(
+        snapshots(dir.path()),
+        Vec::<PathBuf>::new(),
+        "fixture has no snapshot"
+    );
     let previous_release_hash = sha256_hex(&path);
 
     // Upgrade.
