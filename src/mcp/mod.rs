@@ -5812,6 +5812,8 @@ mod tests {
         assert_eq!(n, 50, "expected 50 audit-stress rows, found {n}");
     }
 
+    mod passphrase_window_8659;
+
     // ----- issue #811 verification: load_active_keypair_for_mcp fallback -----
 
     #[test]
