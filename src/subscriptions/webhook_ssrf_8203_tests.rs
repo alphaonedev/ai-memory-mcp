@@ -9,18 +9,66 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
 const PRIVATE_IPV4: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
 const METADATA_IPV4: Ipv4Addr = Ipv4Addr::new(169, 254, 169, 254);
 
+type DnsAnswer = (String, std::io::Result<SocketAddr>);
+
 thread_local! {
     // Only the current synchronous send thread can consume this one-shot answer.
     // The normal guard still validates its address before the client is built.
-    static DNS_ANSWER: RefCell<Option<(String, SocketAddr)>> = const { RefCell::new(None) };
+    static DNS_ANSWER: RefCell<Option<DnsAnswer>> = const { RefCell::new(None) };
 }
 
 pub(super) fn resolve(target: &str) -> std::io::Result<Vec<SocketAddr>> {
     if let Some((expected, address)) = DNS_ANSWER.with_borrow_mut(Option::take) {
         assert_eq!(target, expected, "#6860: resolve the actual webhook host");
-        return Ok(vec![address]);
+        return address.map(|address| vec![address]);
     }
     target.to_socket_addrs().map(Iterator::collect)
+}
+
+#[test]
+fn resolver_error_is_refused_8203() {
+    const RESOLVER_TARGET: &str = "resolver-error.invalid:443";
+    const WEBHOOK_URL: &str = "https://resolver-error.invalid:443/hook";
+    if crate::test_support::run_env_isolated_child_or_spawn_scrubbing(
+        "subscriptions::webhook_ssrf_8203_tests::resolver_error_is_refused_8203",
+        &["AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL"],
+    ) {
+        return;
+    }
+    DNS_ANSWER.with_borrow_mut(|answer| {
+        assert!(
+            answer
+                .replace((
+                    RESOLVER_TARGET.to_owned(),
+                    Err(std::io::ErrorKind::TimedOut.into()),
+                ))
+                .is_none()
+        );
+    });
+    let result = super::validate_url_dns_with(WEBHOOK_URL, false);
+    assert!(
+        DNS_ANSWER.with_borrow_mut(Option::take).is_none(),
+        "#8203: the guard must consume the injected resolver error"
+    );
+    assert!(
+        result.is_err(),
+        "#8203: resolver errors must fail closed: {result:?}"
+    );
+}
+
+#[test]
+fn compatible_and_mapped_private_addresses_are_refused_8203() {
+    for address in [
+        PRIVATE_IPV4.to_ipv6_compatible(),
+        PRIVATE_IPV4.to_ipv6_mapped(),
+    ] {
+        let ip = IpAddr::V6(address);
+        assert_eq!(super::normalize_ip(ip), IpAddr::V4(PRIVATE_IPV4));
+        assert!(super::is_private(ip), "#8203: private address {address}");
+        let url = format!("https://[{address}]/hook");
+        assert!(super::validate_url_with(&url, false).is_err());
+        assert!(super::validate_url_dns_with(&url, false).is_err());
+    }
 }
 
 #[test]
@@ -197,7 +245,7 @@ mod dispatch {
         let url = format!("https://{target}/hook");
         let result = tokio::task::spawn_blocking(move || {
             DNS_ANSWER.with_borrow_mut(|answer| {
-                assert!(answer.replace((target, address)).is_none());
+                assert!(answer.replace((target, Ok(address))).is_none());
             });
             let result =
                 crate::subscriptions::send(&url, BODY, TIMESTAMP, Some(SIGNATURE), CORRELATION);
