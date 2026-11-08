@@ -185,6 +185,17 @@ class HeredocLexingS7R2(unittest.TestCase):
                          [(3, True), (4, False)])
 
 
+class ContinuationQuotesR5(unittest.TestCase):
+    def test_single_quoted_continuation_is_literal_r5(self):
+        checker = load_checker()
+        literal = "printf '%s' 'first\\\nsecond'\npython3 x.py\n"
+        self.assertEqual(checker.join_continuations(literal), literal,
+                         'single-quoted continuation was rewritten')
+        for text in ('python3 \\\n-I x.py', 'echo "first\\\nsecond"'):
+            self.assertEqual(checker.join_continuations(text), text.replace('\\\n', '  '))
+        self.assertEqual(checker.scan_shell('python3 \\\n-I x.py'), [])
+
+
 class GrammarConstantsR4(unittest.TestCase):
     def test_named_grammar_tokens_have_no_function_local_copies_r4(self):
         tree = ast.parse(CHECKER.read_text())
