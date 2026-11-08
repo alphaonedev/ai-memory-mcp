@@ -237,6 +237,8 @@ fn write_open_report(frame: &TxnFrame) -> std::io::Result<()> {
     };
     #[cfg(not(unix))]
     let mut writer = stderr_lock;
+    #[cfg(test)]
+    let mut writer = reporting_tests::ObserveWrite(&mut writer);
     let unreported = frame.unreported();
     let result = std::io::Write::write_fmt(
         &mut writer,
