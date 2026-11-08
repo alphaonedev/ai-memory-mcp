@@ -647,6 +647,27 @@ fn multiline_literal_continuation_masker_is_rejected_8205() {
     );
 }
 
+#[test]
+fn char_and_byte_literals_preserve_guard_state_8205() {
+    for literal in [
+        r#"'"'"#,
+        r#"b'"'"#,
+        r#"'\"'"#,
+        r#"b'\"'"#,
+        r"'\u{22}'",
+        r"'\''",
+    ] {
+        let source = format!(
+            "let quote = {literal};\nlet url = \"https://peer.example.invalid\"; let render = logging::redact_url_password;"
+        );
+        assert_eq!(
+            production_masker_lines_8205(&source),
+            vec![2],
+            "C1: char or byte literal changed string state: {literal}"
+        );
+    }
+}
+
 #[derive(Default)]
 struct RustLineState8205 {
     quoted: bool,

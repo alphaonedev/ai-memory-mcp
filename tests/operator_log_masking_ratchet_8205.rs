@@ -143,6 +143,11 @@ fn ambiguous_agent_authority_stays_masked_8205() {
 
 #[test]
 fn seeded_masking_class_ratchet_8205() {
+    assert_eq!(
+        CASE_COUNT,
+        KEYS.len() * FORM_COUNT * SEPARATORS.len() * 2,
+        "every key, form, separator and assignment operator must execute"
+    );
     let mut state = SEED;
     for case in 0..CASE_COUNT {
         state = state
@@ -192,5 +197,72 @@ fn seeded_masking_class_ratchet_8205() {
         if host_expected {
             assert!(line.contains(HOST), "ratchet case {case}: URL host lost");
         }
+    }
+}
+
+#[test]
+fn url_query_and_path_credential_tails_8205() {
+    for location in ["?password=", "/token=", "#password="] {
+        for separator in ["'", "\"", ")", ">", " ", "\t"] {
+            assert_private(
+                &format!("{PREFIX}https://{HOST}{location}credentialA{separator}Z1Z2Z3Z4Z5"),
+                "Z1Z2Z3Z4Z5",
+                "S1 URL credential boundary",
+            );
+        }
+    }
+}
+
+#[test]
+fn userinfo_at_sign_before_whitespace_tail_8205() {
+    assert_private(
+        &format!("{PREFIX}postgres://account:prefix@middle Z1Z2Z3Z4Z5@{HOST}"),
+        "Z1Z2Z3Z4Z5",
+        "C3 userinfo at-sign",
+    );
+}
+
+#[test]
+fn schemeless_whitespace_password_8205() {
+    for account in ["account", "account@realm", ""] {
+        assert_private(
+            &format!("{PREFIX}{account}:credentialA Z1Z2Z3Z4Z5@{HOST} refused"),
+            "Z1Z2Z3Z4Z5",
+            "S3 bare authority",
+        );
+    }
+}
+
+#[test]
+fn unicode_keys_and_session_nouns_8205() {
+    for key in [
+        "pass‐word",
+        "pass‑word",
+        "pass–word",
+        "pass−word",
+        "ｐａｓｓｗｏｒｄ",
+        "session",
+        "session_id",
+        "cookie",
+        "jwt",
+    ] {
+        for separator in ["=", ":", "＝", "："] {
+            assert_private(
+                &format!("{PREFIX}{key}{separator}Z1Z2Z3Z4Z5"),
+                "Z1Z2Z3Z4Z5",
+                "S4 normalized key",
+            );
+        }
+    }
+}
+
+#[test]
+fn hyphen_inside_credential_noun_is_normalized_8205() {
+    for key in ["pass-word", "api-key", "creden-tial", "au-th"] {
+        assert_private(
+            &format!("{PREFIX}{key}=Z1Z2Z3Z4Z5"),
+            "Z1Z2Z3Z4Z5",
+            "S5 hyphen inside noun",
+        );
     }
 }
