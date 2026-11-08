@@ -402,6 +402,24 @@ fn register_tls_test_pki_cleanup() {
     REGISTERED.call_once(|| {
         #[cfg(unix)]
         {
+            extern "C" fn remove_tls_test_pki_at_exit() {
+                use std::io::Write as _;
+
+                // UNSAFE-24: contain all unwinding before returning to the C exit handler.
+                if std::panic::catch_unwind(|| {
+                    if let Some(pki) = TLS_TEST_PKI.get()
+                        && let Err(error) = std::fs::remove_dir_all(pki.dir.path())
+                    {
+                        // Tracing may already be torn down. Discard only stderr write errors.
+                        let _ = writeln!(std::io::stderr(), "test PKI cleanup error (#8651): {error}");
+                    }
+                })
+                .is_err()
+                {
+                    let _ = writeln!(std::io::stderr(), "test PKI cleanup panicked (#8651)");
+                }
+            }
+
             // SAFETY: atexit only records an extern C function pointer. The
             // handler never unwinds (UNSAFE-24) and touches only process-global
             // OnceLock state that outlives main. Registration occurs once.
@@ -414,25 +432,6 @@ fn register_tls_test_pki_cleanup() {
             }
         }
     });
-}
-
-#[cfg(unix)]
-extern "C" fn remove_tls_test_pki_at_exit() {
-    use std::io::Write as _;
-
-    // UNSAFE-24: contain all unwinding before returning to the C exit handler.
-    if std::panic::catch_unwind(|| {
-        if let Some(pki) = TLS_TEST_PKI.get()
-            && let Err(error) = std::fs::remove_dir_all(pki.dir.path())
-        {
-            // Tracing may already be torn down. Discard only stderr write errors.
-            let _ = writeln!(std::io::stderr(), "test PKI cleanup error (#8651): {error}");
-        }
-    })
-    .is_err()
-    {
-        let _ = writeln!(std::io::stderr(), "test PKI cleanup panicked (#8651)");
-    }
 }
 
 fn generate_tls_test_pki() -> TlsTestPki {
@@ -655,7 +654,6 @@ mod tests {
                 std::ptr::eq(pki, super::tls_test_pki()),
                 "all callers must share the process PKI"
             );
-            #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt as _;
                 const PRIVATE_KEY_MODE: u32 = 0o600;
