@@ -135,3 +135,55 @@ fn guard_rejects_overflow_port_8649() {
         assert!(validate_url_dns_resolved(&url, true).is_err(), "{url}");
     }
 }
+
+#[test]
+fn normalizer_rejects_zero_port_8649() {
+    assert_invalid_normalized_port("0");
+}
+
+#[test]
+fn normalizer_rejects_empty_port_8649() {
+    assert_invalid_normalized_port("");
+}
+
+#[test]
+fn normalizer_rejects_overflow_port_8649() {
+    assert_invalid_normalized_port("65536");
+}
+
+fn assert_invalid_normalized_port(port: &str) {
+    for host in ["localhost", "127.0.0.1", "[::1]"] {
+        for scheme in ["https", "http"] {
+            let authority = format!("{host}:{port}");
+            assert!(
+                normalize_webhook_host_port(&authority, scheme).is_err(),
+                "{authority}"
+            );
+        }
+    }
+}
+
+#[test]
+fn normalizer_preserves_valid_ports_and_host_spelling_8649() {
+    for host in [
+        "localhost",
+        "127.0.0.1",
+        "[::1]",
+        "bücher.example",
+        PUNYCODE_HOST,
+    ] {
+        for (scheme, default) in [("https", HTTPS_PORT), ("http", 80)] {
+            assert_eq!(
+                normalize_webhook_host_port(host, scheme).expect("scheme default"),
+                format!("{host}:{default}")
+            );
+            for port in [1, HTTPS_PORT, 8443, u16::MAX] {
+                let authority = format!("{host}:{port}");
+                assert_eq!(
+                    normalize_webhook_host_port(&authority, scheme).expect("explicit port"),
+                    authority
+                );
+            }
+        }
+    }
+}

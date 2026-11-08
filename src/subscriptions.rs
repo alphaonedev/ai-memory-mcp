@@ -2015,13 +2015,30 @@ pub(crate) fn host_port_with_default_http_port(host_port: &str) -> String {
 
 /// #6401 / #4075: webhook pins use the scheme default when no port is explicit.
 /// The inference HTTP-only helper above retains its existing contract.
-fn webhook_host_port_with_default(host_port: &str, scheme: &str) -> String {
+fn webhook_host_port_for_scheme(host_port: &str, scheme: &str) -> String {
     const HTTPS_DEFAULT_PORT: u16 = 443;
     if scheme == "https" {
         format!("{host_port}:{HTTPS_DEFAULT_PORT}")
     } else {
         host_port_with_default_http_port(host_port)
     }
+}
+
+/// Normalize only the webhook resolver authority, retaining its original host spelling.
+fn normalize_webhook_host_port(host_port: &str, scheme: &str) -> Result<String> {
+    let target = if let Some(close_idx) = host_port.strip_prefix('[').and(host_port.find(']')) {
+        let after_bracket = &host_port[close_idx + 1..];
+        if after_bracket.starts_with(':') {
+            host_port.to_string()
+        } else {
+            webhook_host_port_for_scheme(host_port, scheme)
+        }
+    } else if host_port.contains(':') {
+        host_port.to_string()
+    } else {
+        webhook_host_port_for_scheme(host_port, scheme)
+    };
+    Ok(target)
 }
 
 pub(crate) fn validate_url_dns_resolved(
@@ -2113,22 +2130,7 @@ fn validate_url_dns_with(
     // return Ok(())` below treated that as a DNS hiccup, silently bypassing
     // the SSRF guard. Detect the no-trailing-port form and append the scheme default so
     // resolution succeeds and the IP is checked.
-    let resolv_target =
-        if let Some(close_idx) = host_port.strip_prefix('[').and(host_port.find(']')) {
-            let after_bracket = &host_port[close_idx + 1..];
-            if after_bracket.starts_with(':') {
-                // [ipv6]:port — already has a port
-                host_port.to_string()
-            } else {
-                // [ipv6] without port — append default
-                webhook_host_port_with_default(host_port, scheme)
-            }
-        } else if host_port.contains(':') {
-            // IPv4:port or hostname:port — use as-is
-            host_port.to_string()
-        } else {
-            webhook_host_port_with_default(host_port, scheme)
-        };
+    let resolv_target = normalize_webhook_host_port(host_port, scheme)?;
     // v0.7.0 #1053 (Agent-2 #3) — fail-CLOSED on DNS resolution
     // failure. Pre-#1053 a SERVFAIL / timeout / hang at the daemon's
     // resolver returned Ok(()) here, but the subsequent
