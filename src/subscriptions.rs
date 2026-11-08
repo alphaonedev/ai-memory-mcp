@@ -2036,20 +2036,9 @@ fn normalize_webhook_host_port(host_port: &str, scheme: &str) -> Result<String> 
     if let Some(port) = explicit_port {
         port.parse::<std::num::NonZeroU16>()
             .context("webhook URL has an invalid explicit port")?;
+        return Ok(host_port.to_string());
     }
-    let target = if let Some(close_idx) = host_port.strip_prefix('[').and(host_port.find(']')) {
-        let after_bracket = &host_port[close_idx + 1..];
-        if after_bracket.starts_with(':') {
-            host_port.to_string()
-        } else {
-            webhook_host_port_for_scheme(host_port, scheme)
-        }
-    } else if host_port.contains(':') {
-        host_port.to_string()
-    } else {
-        webhook_host_port_for_scheme(host_port, scheme)
-    };
-    Ok(target)
+    Ok(webhook_host_port_for_scheme(host_port, scheme))
 }
 
 pub(crate) fn validate_url_dns_resolved(
