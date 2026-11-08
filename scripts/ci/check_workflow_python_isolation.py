@@ -29,6 +29,10 @@ import textwrap
 PYTHON_NAME = re.compile(
     r"(?:python|pypy)(?:3(?:\.[0-9]+)?)?(?:d|-dbg|t)?(?:\.exe)?\Z", re.IGNORECASE)
 PYTHON_NAME_MARKER = "python"
+SUBSTITUTION_TOKEN = "SUBSTITUTION"
+ENV_COMMAND = "env"
+ENV_SPLIT_OPTIONS = frozenset(("-S", "--split-string"))
+ENV_SPLIT_PREFIXES = ("-S", "--split-string=")
 PYTHON_LAUNCHER = "py"
 UV_LAUNCHER = "uv"
 REENTRY_COMMANDS = frozenset(("trap", "eval", "assert"))
@@ -64,8 +68,17 @@ PREFIX_VALUE_OPTIONS = {
     "xargs": frozenset(("-I", "-L", "--max-lines", "-n", "--max-args", "-P", "--max-procs",
                         "-s", "--max-chars", "-E", "-d", "--delimiter", "-a", "--arg-file")),
     "nohup": frozenset(),
+    "stdbuf": frozenset(("-i", "--input", "-o", "--output", "-e", "--error")),
+    "setsid": frozenset(),
+    "flock": frozenset(("-w", "--wait", "-E", "--conflict-exit-code")),
+    "ionice": frozenset(("-c", "--class", "-n", "--classdata", "-p", "--pid",
+                         "-P", "--pgid", "-u", "--uid")),
+    "chrt": frozenset(("-T", "--sched-runtime", "-P", "--sched-period",
+                       "-D", "--sched-deadline")),
+    "taskset": frozenset(("-c", "--cpu-list")),
 }
-PREFIX_POSITIONAL_ARGUMENTS = {"timeout": 1}
+PREFIX_POSITIONAL_ARGUMENTS = {"timeout": 1, "flock": 1, "chrt": 1, "taskset": 1}
+PREFIX_POSITIONAL_OPTIONS = {"taskset": frozenset(("-c", "--cpu-list"))}
 EXIT_OK = 0
 EXIT_FINDINGS = 1
 EXIT_INPUT = 2
@@ -218,7 +231,7 @@ def substitutions(text):
         if quotes.quote != "'" and text.startswith("$(", index):
             end = substitution_end(text, index + 2)
             children.append((text[index + 2:end], text.count("\n", 0, index)))
-            parts.append("SUBSTITUTION" + "\n" * text.count("\n", index, end))
+            parts.append(SUBSTITUTION_TOKEN + "\n" * text.count("\n", index, end))
             index = end + 1
             continue
         if quotes.quote != "'" and char == "`":
@@ -233,7 +246,7 @@ def substitutions(text):
             if end >= len(text):
                 raise ShellSyntaxError(text, index)
             children.append((text[index + 1:end], text.count("\n", 0, index)))
-            parts.append("SUBSTITUTION" + "\n" * text.count("\n", index, end))
+            parts.append(SUBSTITUTION_TOKEN + "\n" * text.count("\n", index, end))
             index = end + 1
             continue
         if quotes.quote is None and char == "#" and (index == 0 or text[index - 1].isspace()):
@@ -309,15 +322,22 @@ def executable_index(values):
             continue
         if name not in PREFIX_VALUE_OPTIONS:
             break
+        prefix_index = index
         index += 1
+        positional_options = PREFIX_POSITIONAL_OPTIONS.get(name, frozenset())
+        positional_consumed = False
         while index < len(values) and values[index].startswith("-"):
             option = values[index]
+            if name == ENV_COMMAND and option.startswith(ENV_SPLIT_PREFIXES):
+                return prefix_index
             index += 1
             if option == "--":
                 break
             if option in PREFIX_VALUE_OPTIONS[name]:
                 index += 1
-        index += PREFIX_POSITIONAL_ARGUMENTS.get(name, 0)
+            positional_consumed |= option.split("=", 1)[0] in positional_options
+        if not positional_consumed:
+            index += PREFIX_POSITIONAL_ARGUMENTS.get(name, 0)
     return index
 
 
@@ -350,6 +370,18 @@ def reentry_findings(words, executable):
     """Inspect evaluated strings and shell -c programs through the same scanner."""
     values = [value for value, _ in words]
     findings = []
+    if executable < len(values) and values[executable].rsplit("/", 1)[-1] == ENV_COMMAND:
+        for index in range(executable + 1, len(values)):
+            option = values[index]
+            if option in ENV_SPLIT_OPTIONS and index + 1 < len(values):
+                program, tail = values[index + 1], index + 2
+            elif option.startswith(ENV_SPLIT_PREFIXES):
+                prefix = next(item for item in ENV_SPLIT_PREFIXES if option.startswith(item))
+                program, tail = option[len(prefix):], index + 1
+            else:
+                continue
+            command = program + " " + shlex.join(values[tail:])
+            return offset_findings(scan_shell(command), words[index][1] - 1)
     if values[0] in REENTRY_COMMANDS:
         candidates = words[1:2] if values[0] == TRAP_COMMAND else words[1:]
         for candidate, line in candidates:
@@ -382,13 +414,15 @@ def invocation_findings(words, executable):
     for index in range(executable, len(words)):
         value, line = words[index]
         name = value.rsplit("/", 1)[-1]
+        if index == executable and SUBSTITUTION_TOKEN in value:
+            return [Finding(line, DYNAMIC_REASON)]
         if index == executable and value.startswith("$"):
             if dynamic_interpreter(values, index):
                 return [Finding(line, DYNAMIC_REASON)]
             # An unresolved wrapper may still invoke a literal interpreter.
             continue
         if PYTHON_NAME.fullmatch(name):
-            if "/" in value and index != 0 and "/bin/" not in value:
+            if "/" in value and index != executable and "/bin/" not in value:
                 continue
             return [Finding(line)] if script_is_unisolated(values[index + 1:]) else []
         if index == executable:
