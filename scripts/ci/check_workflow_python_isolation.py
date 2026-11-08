@@ -33,6 +33,9 @@ PYTHON_NAME = re.compile(
     r"(?:python|pypy)(?:3(?:\.[0-9]+)?)?(?:d|-dbg|t)?(?:\.exe)?\Z", re.IGNORECASE)
 PYTHON_NAME_MARKER = "python"
 SUBSTITUTION_TOKEN = "SUBSTITUTION"
+EXPRESSION_OPEN = "${{"
+EXPRESSION_CLOSE = "}}"
+BIN_PATH_COMPONENT = "/bin/"
 ARITHMETIC_OPEN = "$(("
 ARITHMETIC_TOKEN = "ARITHMETIC"
 ENV_COMMAND = "env"
@@ -89,13 +92,10 @@ EXIT_FINDINGS = 1
 EXIT_INPUT = 2
 HEREDOC = re.compile(r"(?<!<)<<(-?)[ \t]*(['\"]?)([A-Za-z_][A-Za-z_0-9]*)\2")
 WRAPPER_REF = re.compile(r"scripts/[A-Za-z_0-9./-]+\.sh\b")
-WORKFLOW_RUN = re.compile(r"^(\s*)(?:-\s+)?run:\s*(.*)$")
-WORKFLOW_SHELL = re.compile(r"^\s*(?:-\s+)?shell:\s*(['\"]?)(.*)")
 WORKFLOW_DIR = Path(".github/workflows")
 WORKFLOW_FIELD = re.compile(r"^(?P<indent>\s*)(?P<item>-\s+)?(?P<key>run|shell|'run'|'shell'|\"run\"|\"shell\"):\s*(?P<value>.*)$")
 FLOW_STEP = re.compile(r"^\s*-\s*\{")
 FLOW_FIELD = re.compile(r"^\s*(run|shell|'run'|'shell'|\"run\"|\"shell\"):\s*(.*)$", re.DOTALL)
-WORKFLOW_KEYS = frozenset(("run", "shell"))
 EMPTY_REPOSITORY_REASON = "repository contains no workflow files"
 EXEMPTION = re.compile(r"# isolation: exempt #([1-9][0-9]*)\s*\Z")
 
@@ -463,9 +463,9 @@ def reentry_findings(words, executable):
 def dynamic_interpreter(values, index):
     """Recognize Python-named variables without resolving arbitrary executables."""
     value = values[index]
-    expression = " ".join(values[index:]).split("}}", 1)[0]
+    expression = " ".join(values[index:]).split(EXPRESSION_CLOSE, 1)[0]
     return (PYTHON_NAME_MARKER in value.casefold()
-            or (value.startswith("${{") and PYTHON_NAME_MARKER in expression.casefold()))
+            or (value.startswith(EXPRESSION_OPEN) and PYTHON_NAME_MARKER in expression.casefold()))
 
 
 def console_launcher(name, arguments):
@@ -489,7 +489,7 @@ def invocation_findings(words, executable):
             # An unresolved wrapper may still invoke a literal interpreter.
             continue
         if PYTHON_NAME.fullmatch(name):
-            if "/" in value and index != executable and "/bin/" not in value:
+            if "/" in value and index != executable and BIN_PATH_COMPONENT not in value:
                 continue
             return [Finding(line)] if script_is_unisolated(values[index + 1:]) else []
         if index == executable:

@@ -7,13 +7,16 @@ import importlib.util
 from pathlib import Path
 import sys
 
+MISSING_MODULE_ORIGIN = "<no __file__>"
+
 
 def load_sibling(name, caller_file):
     """Load a path-bound module, retaining dataclass-compatible registration."""
     path = Path(caller_file).resolve().with_name(name + ".py")
     existing = sys.modules.get(name)
     if existing is not None:
-        actual = Path(getattr(existing, "__file__", "")).resolve()
+        origin = getattr(existing, "__file__", None)
+        actual = Path(origin).resolve() if origin else MISSING_MODULE_ORIGIN
         if actual != path:
             raise ImportError(f"sibling {name!r} already loaded from {actual}; expected {path}")
         return existing
