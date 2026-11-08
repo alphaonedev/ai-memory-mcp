@@ -1964,20 +1964,46 @@ pub fn validate_url_dns(url: &str) -> Result<()> {
     validate_url_dns_with(url, crate::config::allow_loopback_webhooks()).map(|_| ())
 }
 
+/// #8655: caller-owned display, with the parser cause retained (ERRORS-11/15).
+#[derive(Debug)]
+struct WebhookUrlParseError {
+    source: Box<dyn std::error::Error + Send + Sync>,
+    origin: String,
+}
+
+impl std::fmt::Display for WebhookUrlParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "invalid webhook URL: {}", self.origin)
+    }
+}
+
+impl std::error::Error for WebhookUrlParseError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
 /// #8655: one client-parser authority for registration and resolver pinning.
 /// ERRORS-09 / PERF-15: construction requires an HTTP(S) host and nonzero port.
+#[derive(Debug)]
 struct WebhookAuthority {
     host: String,
     port: std::num::NonZeroU16,
     plaintext: bool,
 }
 
+// ERRORS-11/15: typed caller-owned Display preserves the original parser cause.
+fn parse_webhook_url(url: &str) -> std::result::Result<reqwest::Url, WebhookUrlParseError> {
+    reqwest::Url::parse(url).map_err(|source| WebhookUrlParseError {
+        source: Box::new(source),
+        origin: crate::url_display::url_origin(url),
+    })
+}
+
 impl WebhookAuthority {
     fn parse(url: &str) -> Result<Self> {
+        let parsed = parse_webhook_url(url)?;
         let shown = crate::url_display::url_origin(url);
-        // ERRORS-15: preserve the parser cause without echoing caller credentials.
-        let parsed =
-            reqwest::Url::parse(url).with_context(|| format!("invalid webhook URL: {shown}"))?;
         if !matches!(parsed.scheme(), "http" | "https") {
             return Err(anyhow!("webhook URL scheme must be https: {shown}"));
         }
@@ -3001,6 +3027,26 @@ mod tests {
                 "invalid DNS authority"
             );
         }
+    }
+
+    #[test]
+    fn parse_error_keeps_own_display_and_source_8655() {
+        let url = "https://[";
+        let error = WebhookAuthority::parse(url).expect_err("invalid authority");
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "invalid webhook URL: {}",
+                crate::url_display::url_origin(url)
+            ),
+            "#8655: caller-facing text is owned by the validation boundary"
+        );
+        let expected = reqwest::Url::parse(url).expect_err("invalid URL");
+        assert_eq!(
+            error.chain().nth(1).expect("parser cause").to_string(),
+            expected.to_string(),
+            "#8655: the original parser cause remains available"
+        );
     }
 
     #[test]
