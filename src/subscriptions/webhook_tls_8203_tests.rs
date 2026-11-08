@@ -9,13 +9,24 @@ const HTTPS_PORT: u16 = 443;
 const IMPLICIT_URL: &str = "https://localhost/hook";
 const UNICODE_URL: &str = "https://bücher.example/hook";
 const PUNYCODE_URL: &str = "https://xn--bcher-kva.example/hook";
+const INVALID_PORTS: [&str; 4] = ["0", "", "65536", "+0"];
+const PORT_HOSTS: [&str; 3] = ["localhost", "127.0.0.1", "[::1]"];
+const URL_SCHEMES: [&str; 2] = ["http", "https"];
+const INVALID_PORT_ERROR: &str = "webhook URL has an invalid explicit port";
+const PORT_CHILD: &str = "AI_MEMORY_TEST_INVALID_PORT_8649_CHILD";
+const DNS_FAIL_OPEN: &str = "AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL";
+const LARGE_HOST_CHARS: usize = 100_000;
+const LARGE_INPUT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[test]
 fn implicit_https_default_port_6401() {
     let (host, addresses) =
         validate_url_dns_resolved(IMPLICIT_URL, true).expect("loopback resolver must succeed");
     assert_eq!(host, "localhost");
-    assert!(!addresses.is_empty());
+    assert!(
+        !addresses.is_empty(),
+        "#6401: implicit HTTPS must resolve addresses"
+    );
     let ports: Vec<_> = addresses.iter().map(std::net::SocketAddr::port).collect();
     assert!(
         ports.iter().all(|port| *port == HTTPS_PORT),
@@ -32,8 +43,11 @@ fn explicit_https_port_control_6401() {
     ] {
         let (_, addresses) =
             validate_url_dns_resolved(url, true).expect("loopback resolver must succeed");
-        assert!(!addresses.is_empty());
-        assert!(addresses.iter().all(|address| address.port() == port));
+        assert!(!addresses.is_empty(), "#6401: {url} must resolve addresses");
+        assert!(
+            addresses.iter().all(|address| address.port() == port),
+            "#6401: {url} must retain expected port {port}: {addresses:?}"
+        );
     }
 }
 
@@ -115,50 +129,155 @@ fn inference_http_default_helper_is_unchanged_6401() {
 
 #[test]
 fn guard_rejects_zero_port_8649() {
-    for host in ["localhost", "127.0.0.1", "[::1]"] {
-        let url = format!("https://{host}:0/hook");
-        assert!(validate_url_dns_resolved(&url, true).is_err(), "{url}");
-    }
+    assert_dispatch_port_refused("guard_rejects_zero_port_8649", INVALID_PORTS[0]);
 }
 
 #[test]
 fn guard_rejects_empty_port_8649() {
-    for host in ["localhost", "127.0.0.1", "[::1]"] {
-        let url = format!("https://{host}:/hook");
-        assert!(validate_url_dns_resolved(&url, true).is_err(), "{url}");
-    }
+    assert_dispatch_port_refused("guard_rejects_empty_port_8649", INVALID_PORTS[1]);
 }
 
 #[test]
 fn guard_rejects_overflow_port_8649() {
-    for host in ["localhost", "127.0.0.1", "[::1]"] {
-        let url = format!("https://{host}:65536/hook");
-        assert!(validate_url_dns_resolved(&url, true).is_err(), "{url}");
+    assert_dispatch_port_refused("guard_rejects_overflow_port_8649", INVALID_PORTS[2]);
+}
+
+#[test]
+fn guard_rejects_plus_zero_port_8649() {
+    assert_dispatch_port_refused("guard_rejects_plus_zero_port_8649", INVALID_PORTS[3]);
+}
+
+fn run_invalid_port_children(test_name: &str) -> bool {
+    if std::env::var(PORT_CHILD).as_deref() == Ok(test_name) {
+        return false;
+    }
+    let module = module_path!().split_once("::").expect("crate module").1;
+    let filter = format!("{module}::{test_name}");
+    for override_value in [None, Some("1")] {
+        let mut command = crate::spawn_audit::audited_command(
+            std::env::current_exe().expect("lib test binary"),
+            "webhook_tls_8203_tests::run_invalid_port_children",
+        );
+        command
+            .args(["--exact", &filter, "--nocapture", "--test-threads=1"])
+            .env_clear()
+            .env(PORT_CHILD, test_name)
+            .env("TMPDIR", std::env::temp_dir())
+            .env("AI_MEMORY_NO_CONFIG", "1")
+            .envs(std::env::var_os("LLVM_PROFILE_FILE").map(|v| ("LLVM_PROFILE_FILE", v)));
+        if let Some(value) = override_value {
+            command.env(DNS_FAIL_OPEN, value);
+        }
+        let output = command.output().expect("isolated invalid-port child");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "#8649: {test_name} with DNS override {override_value:?}: {stdout}\n{stderr}"
+        );
+        assert!(
+            stdout.contains("1 passed") && !stdout.contains("0 passed"),
+            "#8649: exact invalid-port child must execute one test: {stdout}"
+        );
+    }
+    true
+}
+
+fn assert_dispatch_port_refused(test_name: &str, port: &str) {
+    assert_invalid_url_ports(test_name, &[port], |url, allow_loopback| {
+        validate_url_dns_resolved(url, allow_loopback).map(|_| ())
+    });
+}
+
+fn assert_invalid_url_ports(
+    test_name: &str,
+    ports: &[&str],
+    validate: fn(&str, bool) -> Result<()>,
+) {
+    if run_invalid_port_children(test_name) {
+        return;
+    }
+    for port in ports {
+        for host in PORT_HOSTS {
+            for scheme in URL_SCHEMES {
+                let url = format!("{scheme}://{host}:{port}/hook");
+                let error = validate(&url, true).expect_err("#8649: invalid explicit port");
+                assert_eq!(error.to_string(), INVALID_PORT_ERROR, "#8649: {url}");
+            }
+        }
     }
 }
 
 #[test]
+fn registration_rejects_invalid_ports_8649() {
+    assert_invalid_url_ports(
+        "registration_rejects_invalid_ports_8649",
+        &INVALID_PORTS,
+        validate_url_with,
+    );
+}
+
+#[test]
+fn large_invalid_authorities_have_bounded_validation_8649() {
+    if run_invalid_port_children("large_invalid_authorities_have_bounded_validation_8649") {
+        return;
+    }
+    let started = std::time::Instant::now();
+    for unit in ["a", "é"] {
+        let host = unit.repeat(LARGE_HOST_CHARS);
+        for scheme in URL_SCHEMES {
+            let url = format!("{scheme}://{host}:{}/hook", INVALID_PORTS[0]);
+            let registration = validate_url_with(&url, true).expect_err("invalid large authority");
+            let dispatch =
+                validate_url_dns_resolved(&url, true).expect_err("invalid large authority");
+            assert_eq!(
+                registration.to_string(),
+                INVALID_PORT_ERROR,
+                "registration {scheme}"
+            );
+            assert_eq!(
+                dispatch.to_string(),
+                INVALID_PORT_ERROR,
+                "dispatch {scheme}"
+            );
+        }
+    }
+    assert!(
+        started.elapsed() < LARGE_INPUT_DEADLINE,
+        "#8649: 100K+ authority validation exceeded {LARGE_INPUT_DEADLINE:?}"
+    );
+}
+
+#[test]
 fn normalizer_rejects_zero_port_8649() {
-    assert_invalid_normalized_port("0");
+    assert_invalid_normalized_port(INVALID_PORTS[0]);
 }
 
 #[test]
 fn normalizer_rejects_empty_port_8649() {
-    assert_invalid_normalized_port("");
+    assert_invalid_normalized_port(INVALID_PORTS[1]);
 }
 
 #[test]
 fn normalizer_rejects_overflow_port_8649() {
-    assert_invalid_normalized_port("65536");
+    assert_invalid_normalized_port(INVALID_PORTS[2]);
+}
+
+#[test]
+fn normalizer_rejects_plus_zero_port_8649() {
+    assert_invalid_normalized_port(INVALID_PORTS[3]);
 }
 
 fn assert_invalid_normalized_port(port: &str) {
-    for host in ["localhost", "127.0.0.1", "[::1]"] {
-        for scheme in ["https", "http"] {
+    for host in PORT_HOSTS {
+        for scheme in URL_SCHEMES {
             let authority = format!("{host}:{port}");
-            assert!(
-                normalize_webhook_host_port(&authority, scheme).is_err(),
-                "{authority}"
+            let error = normalize_webhook_host_port(&authority, scheme)
+                .expect_err("#8649: invalid normalized port");
+            assert_eq!(
+                error.to_string(),
+                INVALID_PORT_ERROR,
+                "#8649: {scheme} authority {authority}"
             );
         }
     }

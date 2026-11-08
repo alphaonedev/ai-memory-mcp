@@ -343,6 +343,11 @@ async fn check_untrusted_ca() {
     );
     let rows = list_dlq(&conn, Some(&id)).expect("DLQ query");
     assert_eq!(rows.len(), 1, "untrusted certificate must dead-letter");
+    assert!(
+        rows[0].last_error.contains("certificate") || rows[0].last_error.contains("tls"),
+        "#8649: untrusted CA must name TLS/certificate verification refusal: {}",
+        rows[0].last_error
+    );
     let status: String = conn
         .query_row(
             "SELECT delivery_status FROM subscription_events WHERE subscription_id = ?1",
