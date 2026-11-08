@@ -14,7 +14,7 @@ type DnsAnswer = (String, std::io::Result<SocketAddr>);
 thread_local! {
     // Only the current synchronous send thread can consume this one-shot answer.
     // The normal guard still validates its address before the client is built.
-    static DNS_ANSWER: RefCell<Option<DnsAnswer>> = const { RefCell::new(None) };
+    pub(super) static DNS_ANSWER: RefCell<Option<DnsAnswer>> = const { RefCell::new(None) };
 }
 
 pub(super) fn resolve(target: &str) -> std::io::Result<Vec<SocketAddr>> {
