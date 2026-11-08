@@ -702,6 +702,77 @@ mod tests {
         );
     }
 
+    /// #8663: a permissive runner umask must not expose the PKI or leaf key.
+    #[cfg(unix)]
+    #[test]
+    fn tls_test_pki_starts_private_under_open_umask_8663() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        const CHILD: &str = "AI_MEMORY_TLS_PKI_CHILD_8663";
+        const TEST: &str = concat!(
+            module_path!(),
+            "::",
+            stringify!(tls_test_pki_starts_private_under_open_umask_8663)
+        );
+        const PERMISSIVE_UMASK: libc::mode_t = 0;
+        const PERMISSION_BITS: u32 = 0o777;
+        const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
+        const PRIVATE_KEY_MODE: u32 = 0o600;
+        if std::env::var_os(CHILD).is_some() {
+            // SAFETY: umask takes an integer and has no pointer preconditions.
+            // Only this selected test runs in the child; the parent's umask is
+            // unchanged, and this child exits after the permission assertions.
+            unsafe { libc::umask(PERMISSIVE_UMASK) };
+            let pki = super::tls_test_pki();
+            let directory = pki.leaf_key_pem.parent().expect("PKI directory");
+            for (path, expected, kind) in [
+                (directory, PRIVATE_DIRECTORY_MODE, "directory"),
+                (pki.leaf_key_pem.as_path(), PRIVATE_KEY_MODE, "private key"),
+            ] {
+                let actual = std::fs::metadata(path)
+                    .expect("PKI permissions")
+                    .permissions()
+                    .mode()
+                    & PERMISSION_BITS;
+                assert_eq!(
+                    actual, expected,
+                    "#8663: {kind} must be private with umask 0"
+                );
+            }
+            return;
+        }
+        // Keep even the deliberately insecure red fixture behind a private parent.
+        let scratch = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE))
+            .tempdir()
+            .expect("parent-owned permission test scratch");
+        let tmp = scratch.path().join("child-tmp");
+        std::fs::create_dir(&tmp).expect("dedicated permission child TMPDIR");
+        let test = TEST.split_once("::").expect("crate-qualified test name").1;
+        let mut command = crate::spawn_audit::audited_command(
+            std::env::current_exe().expect("lib test binary"),
+            "test_support::tls_test_pki_starts_private_under_open_umask_8663",
+        );
+        command
+            .args(["--exact", test, "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1")
+            .env("AI_MEMORY_NO_CONFIG", "1");
+        for name in ["TMPDIR", "TMP", "TEMP"] {
+            command.env(name, &tmp);
+        }
+        let output = run_pki_child_8651(command, scratch.path());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "permission child: {stdout}\n{stderr}"
+        );
+        assert!(
+            stdout.contains("1 passed") && !stdout.contains("0 passed"),
+            "permission child must execute the selected test: {stdout}"
+        );
+    }
+
     /// Copy the #8166 file-capture and bounded child-reaping precedent.
     #[cfg(unix)]
     fn run_pki_child_8651(
