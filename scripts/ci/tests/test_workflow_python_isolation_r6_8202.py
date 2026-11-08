@@ -1,10 +1,12 @@
 """Round-six isolation regressions; shell fixture text is never executed."""
 import importlib.util
+import ast
 from pathlib import Path
 import sys
 import subprocess
 import tempfile
 import unittest
+import types
 
 ROOT = Path(__file__).resolve().parents[3]
 CHECKER = ROOT / "scripts/ci/check_workflow_python_isolation.py"
@@ -181,6 +183,32 @@ class HeredocLexingS7R2(unittest.TestCase):
         found = checker.scan_shell("echo first\necho second\necho 'bad <<EOF\npython3 x.py\n")
         self.assertEqual([(item.line, item.malformed) for item in found],
                          [(3, True), (4, False)])
+
+
+class GrammarConstantsR4(unittest.TestCase):
+    def test_named_grammar_tokens_have_no_function_local_copies_r4(self):
+        tree = ast.parse(CHECKER.read_text())
+        tokens = {'SUBSTITUTION', '${{', '}}', '/bin/'}
+        for function in (node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)):
+            for node in ast.walk(function):
+                if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                    self.assertNotIn(node.value, tokens, f'inline grammar token in {function.name}')
+
+
+class SiblingOriginR6(unittest.TestCase):
+    def test_registered_module_without_file_has_explicit_origin_r6(self):
+        path = ROOT / 'scripts/ci/sibling_import.py'
+        spec = importlib.util.spec_from_file_location('r6_sibling_loader', path)
+        loader = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(loader)
+        name = 'r6_no_file_fixture'
+        self.assertNotIn(name, sys.modules)
+        sys.modules[name] = types.ModuleType(name)
+        self.addCleanup(sys.modules.pop, name, None)
+        with self.assertRaisesRegex(ImportError, '<no __file__>') as error:
+            loader.load_sibling(name, str(path))
+        self.assertIn(name, str(error.exception))
+        self.assertIn(str(path.with_name(name + '.py')), str(error.exception))
 
 
 if __name__ == "__main__":
