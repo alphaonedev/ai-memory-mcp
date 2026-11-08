@@ -303,7 +303,14 @@ impl fmt::Display for SchemaAheadOfBinary {
 
 impl std::error::Error for SchemaAheadOfBinary {}
 
-/// Render the operator-facing refusal.
+/// Selector that points the CLI at a sqlite backup copy.
+const COPY_SELECTOR_SQLITE: &str = "--db <copy>";
+/// Selector that points the CLI at a postgres backup copy (#8679).
+const COPY_SELECTOR_POSTGRES: &str = "--store-url <copy-url>";
+
+/// Render the operator-facing refusal. The single text every entry path
+/// (CLI, MCP, daemon, boot hook) prints; the backup-copy selector is the one
+/// the refusing backend understands.
 ///
 /// Deliberately does NOT promise a pre-migration snapshot exists. Postgres has
 /// no snapshot mechanism at all, and the sqlite one is skipped on a database
@@ -311,13 +318,18 @@ impl std::error::Error for SchemaAheadOfBinary {}
 /// panicking operator to restore a file that is not there is worse than
 /// telling them nothing. The wording points at the class of artifact and lets
 /// them look.
-fn render(observed: i64, supported: i64, backend: &str, target: &str) -> String {
+pub(crate) fn render(observed: i64, supported: i64, backend: &str, target: &str) -> String {
+    let copy_selector = if backend == BACKEND_POSTGRES {
+        COPY_SELECTOR_POSTGRES
+    } else {
+        COPY_SELECTOR_SQLITE
+    };
     format!(
         "database schema is AHEAD of this binary: {target} ({backend}) is on schema \
          v{observed}. This database was written by a newer ai-memory build (schema \
          v{observed}); this binary (ai-memory {bin}) supports schema v{supported}; \
          upgrade ai-memory to the build that wrote this database, or open a backup copy \
-         with --db <copy>. Refusing to operate it — an older binary writing a newer \
+         with {copy_selector}. Refusing to operate it — an older binary writing a newer \
          schema drops columns it does not know and violates invariants the newer \
          migrations established, which is silent corruption of the durable tier. Reads \
          still work: `ai-memory backup`, `boot` and `doctor` continue to operate against \

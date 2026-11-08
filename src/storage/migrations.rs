@@ -23,6 +23,7 @@
 //! `memory_capture_turn` MCP tool). Closes the #1388 substrate
 //! failure mode at the storage layer.
 
+use super::snapshot_file;
 use crate::models::field_names;
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension as _, params};
@@ -1165,13 +1166,22 @@ pub(super) fn snapshot_before_migration(
     // Single-quote-escape the target for the SQL string literal (the path
     // is crate-derived, but doubling quotes is the correct hygiene).
     let target = snapshot_path.to_string_lossy().replace('\'', "''");
-    conn.execute(&format!("VACUUM INTO '{target}'"), [])
+    // #8679: owner-only target first, source's mode after, removed on any failure.
+    snapshot_file::create_private_target(&snapshot_path)?;
+    let written = conn
+        .execute(&format!("VACUUM INTO '{target}'"), [])
+        .map_err(anyhow::Error::from)
+        .and_then(|_| snapshot_file::settle_mode_to_source(&snapshot_path, &db_path))
         .with_context(|| {
             format!(
                 "pre-migration snapshot (v{from_version}→v{to_version}) failed; \
                  refusing to mutate schema without a recoverable backup"
             )
-        })?;
+        });
+    if let Err(err) = written {
+        snapshot_file::discard(&snapshot_path);
+        return Err(err);
+    }
 
     Ok(Some(snapshot_path))
 }

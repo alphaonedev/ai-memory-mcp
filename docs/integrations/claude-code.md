@@ -425,16 +425,20 @@ operating it. The refusal reads:
 
 ```text
 database schema is AHEAD of this binary: ... this database was written by a
-newer ai-memory build (schema vN); this binary (ai-memory vX) supports schema
+newer ai-memory build (schema vN); this binary (ai-memory X.Y.Z) supports schema
 vM; upgrade ai-memory to the build that wrote this database, or open a backup
 copy with --db <copy> ...
 ```
 
 The refusal is the guard working, not a fault: it leaves the file byte-identical
 and writes nothing. A newer build that opens an older database takes a
-`*.pre-migration-vFROM-to-vTO-*.bak` snapshot next to the file before it
-migrates, and the same snapshot precedes the documented derived-state repair
-when a build of the same schema version finds damaged derived triggers.
+`*.pre-migration-vFROM-to-vTO-*.bak` snapshot next to the file before the
+migration ladder runs, and the same snapshot precedes the documented
+derived-state repair when a build of the same schema version finds damaged
+derived triggers (it is taken before the ladder or repair runs, not before
+every open-time write). The snapshot carries the same permission bits as the
+database (owner-only when the mode cannot be read). On postgres the copy
+selector is `--store-url <copy-url>` instead of `--db <copy>`.
 
 Safe practice:
 

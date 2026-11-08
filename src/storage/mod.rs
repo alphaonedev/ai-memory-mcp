@@ -951,6 +951,7 @@ pub mod model_attest;
 /// the sal-gated `crate::store`) so record-stop compiles + works in the
 /// default (non-`sal`) sqlite build. The sal surface wraps it.
 pub mod record_stop;
+mod snapshot_file;
 // v1.0.0 #2445 — the schema DOWNGRADE guard (an OLDER binary must not
 // silently open and WRITE a NEWER database). Its own module so the pure
 // verdict is shared verbatim by the sqlite and postgres funnels.

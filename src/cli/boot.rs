@@ -317,6 +317,10 @@ enum BootStatus {
     /// `ai-memory doctor` and consider upgrading. v0.6.3.1 (PR-9h /
     /// issue #487 PR #497 req #72).
     WarnSchemaUnsupported { db_schema: u32 },
+    /// #2445 / #8683 - `db::open` refused because the database is AHEAD of
+    /// this binary. The note is the one shared `schema_guard` refusal text
+    /// every entry path prints, not a boot-private string.
+    WarnSchemaAhead { observed: i64, supported: i64 },
     /// v1.0.0 #2564 — `db::open` refused because the recorded schema
     /// stamp is zero / negative / deleted on a database that holds
     /// durable rows. Distinct from [`Self::WarnSchemaUnsupported`]:
@@ -350,6 +354,7 @@ impl BootStatus {
             Self::InfoFallback | Self::InfoEmpty => "info",
             Self::WarnDbUnavailable
             | Self::WarnSchemaUnsupported { .. }
+            | Self::WarnSchemaAhead { .. }
             | Self::WarnSchemaStampInvalid { .. }
             | Self::WarnSchemaVersionPoisoned { .. }
             | Self::WarnSchemaBehind { .. } => "warn",
@@ -522,6 +527,15 @@ impl BootManifest {
                 min = MIN_SUPPORTED_SCHEMA,
                 max = MAX_SUPPORTED_SCHEMA,
             ),
+            BootStatus::WarnSchemaAhead {
+                observed,
+                supported,
+            } => crate::storage::schema_guard::render(
+                observed,
+                supported,
+                crate::storage::schema_guard::BACKEND_SQLITE,
+                &db_path.display().to_string(),
+            ),
             BootStatus::WarnSchemaStampInvalid { observed } => format!(
                 "db schema stamp invalid (observed {observed}) — the version \
                  row is zero, negative or deleted while the database holds \
@@ -631,9 +645,11 @@ pub fn run(
                 // for a database whose binary is already the right one.
                 // `observed` is the raw i64 so a negative stamp cannot
                 // be reported as schema v0-of-a-too-new-binary.
-                let status = crate::storage::schema_guard::schema_ahead_of(&e)
-                    .map(|ahead| BootStatus::WarnSchemaUnsupported {
-                        db_schema: u32::try_from(ahead.observed).unwrap_or(u32::MAX),
+                let ahead = crate::storage::schema_guard::schema_ahead_of(&e);
+                let status = ahead
+                    .map(|ahead| BootStatus::WarnSchemaAhead {
+                        observed: ahead.observed,
+                        supported: ahead.supported,
                     })
                     .or_else(|| {
                         crate::storage::schema_guard::schema_stamp_zeroed(&e).map(|zeroed| {
@@ -661,7 +677,7 @@ pub fn run(
                         })
                     })
                     .unwrap_or(BootStatus::WarnDbUnavailable);
-                let manifest = BootManifest::build(
+                let mut manifest = BootManifest::build(
                     status,
                     &namespace,
                     0,
@@ -672,6 +688,11 @@ pub fn run(
                     start.elapsed().as_millis(),
                     false, // schema_supported: DB unavailable → unknown → false
                 );
+                // #8683: the refusal's own detail (it also covers the
+                // hatch-mismatch wording) is the note, verbatim.
+                if let Some(ahead) = ahead {
+                    manifest.note.clone_from(&ahead.detail);
+                }
                 emit_status_header(out, &manifest, format)?;
             }
             return Ok(());
@@ -987,6 +1008,13 @@ fn emit_status_header(
                         manifest.version,
                         MIN_SUPPORTED_SCHEMA,
                         MAX_SUPPORTED_SCHEMA,
+                    )?;
+                }
+                BootStatus::WarnSchemaAhead { .. } => {
+                    writeln!(
+                        out.stdout,
+                        "#   namespace:  {} ({})",
+                        manifest.namespace, manifest.note
                     )?;
                 }
                 BootStatus::WarnSchemaStampInvalid { observed } => {
@@ -1780,15 +1808,12 @@ mod tests {
             "expected warn header for schema drift: {stdout}"
         );
         assert!(
-            stdout.contains("unsupported by binary"),
-            "expected schema-drift message text: {stdout}"
+            stdout.contains("database schema is AHEAD of this binary"),
+            "expected the shared schema-ahead refusal text: {stdout}"
         );
         assert!(
-            stdout.contains(&format!(
-                "v{}..v{}",
-                MIN_SUPPORTED_SCHEMA, MAX_SUPPORTED_SCHEMA
-            )),
-            "expected supported range in message: {stdout}"
+            stdout.contains("upgrade ai-memory to the build that wrote this database"),
+            "expected the shared remediation: {stdout}"
         );
     }
 
