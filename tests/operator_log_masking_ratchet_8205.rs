@@ -7,12 +7,12 @@
 #[path = "common/operator_log_capture.rs"]
 mod operator_capture;
 
-const CASE_COUNT: usize = 2_400;
+const CASE_COUNT: usize = 3_040;
 const SECRET_WINDOW: usize = 4;
 const SEED: u64 = 8_205;
 const LCG_MULTIPLIER: u64 = 6_364_136_223_846_793_005;
 const LCG_INCREMENT: u64 = 1;
-const FORM_COUNT: usize = 6;
+const FORM_COUNT: usize = 8;
 const HOST: &str = "db.example.invalid";
 const PREFIX: &str = "connection attempt: ";
 const KEYS: &[&str] = &[
@@ -63,7 +63,7 @@ fn assert_private(detail: &str, secret: &str, label: &str) -> String {
                 .as_bytes()
                 .windows(SECRET_WINDOW)
                 .any(|candidate| candidate == window),
-            "{label}: four-byte secret window survived"
+            "{label}: four-byte secret window survived: {window:?}"
         );
     }
     line
@@ -72,20 +72,20 @@ fn assert_private(detail: &str, secret: &str, label: &str) -> String {
 #[test]
 fn unterminated_and_unquoted_values_mask_complete_span_8205() {
     for value in [
-        "credentialA tailSecret",
-        "'credentialA tailSecret",
-        "\"credentialA\ntailSecret",
-        "credentialA x=tailSecret",
+        "credentialA Z1Z2Z3Z4Z5",
+        "'credentialA Z1Z2Z3Z4Z5",
+        "\"credentialA\nZ1Z2Z3Z4Z5",
+        "credentialA x=Z1Z2Z3Z4Z5",
     ] {
-        assert_private(&format!("{PREFIX}password={value}"), "tailSecret", "N1");
+        assert_private(&format!("{PREFIX}password={value}"), "Z1Z2Z3Z4Z5", "N1");
     }
 }
 
 #[test]
 fn empty_account_lookahead_masks_secret_tail_8205() {
     let line = assert_private(
-        &format!("{PREFIX}postgres://:credentialA tailSecret@{HOST}"),
-        "tailSecret",
+        &format!("{PREFIX}postgres://:credentialA Z1Z2Z3Z4Z5@{HOST}"),
+        "Z1Z2Z3Z4Z5",
         "N2",
     );
     assert!(line.contains(HOST), "N2: host lost");
@@ -103,8 +103,8 @@ fn normalized_compound_keys_and_colon_are_credentials_8205() {
     ] {
         for separator in [":", "="] {
             assert_private(
-                &format!("{PREFIX}{key}{separator} credentialA tailSecret"),
-                "tailSecret",
+                &format!("{PREFIX}{key}{separator} credentialA Z1Z2Z3Z4Z5"),
+                "Z1Z2Z3Z4Z5",
                 "N3",
             );
         }
@@ -148,11 +148,19 @@ fn seeded_masking_class_ratchet_8205() {
         state = state
             .wrapping_mul(LCG_MULTIPLIER)
             .wrapping_add(LCG_INCREMENT);
-        let secret = format!("Q{:016x}Z", state);
+        // Every four-byte window contains Z, absent from the captured-log framing.
+        let secret: String = format!("{state:016x}")
+            .chars()
+            .flat_map(|ch| ['Z', ch])
+            .collect();
         let split = SEPARATORS[(case / (KEYS.len() * FORM_COUNT)) % SEPARATORS.len()];
         let payload = format!("{secret}{split}{secret}");
         let key = KEYS[case % KEYS.len()];
-        let separator = if case % 2 == 0 { '=' } else { ':' };
+        let separator = if (case / (KEYS.len() * FORM_COUNT * SEPARATORS.len())).is_multiple_of(2) {
+            '='
+        } else {
+            ':'
+        };
         let compound = if matches!(key, "key" | "auth") {
             key.to_owned()
         } else {
@@ -176,7 +184,9 @@ fn seeded_masking_class_ratchet_8205() {
                 false,
             ),
             4 => (format!("{PREFIX}postgres://:{payload}@{HOST}"), true),
-            _ => (format!("{PREFIX}postgres://account:{payload}"), false),
+            5 => (format!("{PREFIX}postgres://account:{payload}"), false),
+            6 => (format!("{PREFIX}postgres://account:{payload}@{HOST}"), true),
+            _ => (format!("{PREFIX}postgres://:{payload}"), false),
         };
         let line = assert_private(&detail, &secret, &format!("ratchet case {case}"));
         if host_expected {
