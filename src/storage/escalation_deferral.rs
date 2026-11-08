@@ -167,8 +167,8 @@ impl Drop for Frames {
             // during or after destruction"), which aborts the process
             // ("thread local panicked on drop"). Catching that panic keeps the
             // process alive but loses the diagnostic. Write the ERROR line
-            // straight to stderr instead: no thread-local is touched, so it
-            // can neither panic nor be lost, and a failed write is discarded
+            // straight to stderr instead to avoid that thread-local teardown
+            // hazard. Delivery remains best effort; a failed write is discarded
             // on purpose (nothing left to report to; ERRORS-19).
             let _ = std::io::Write::write_fmt(
                 &mut std::io::stderr(),
@@ -215,22 +215,40 @@ fn forced_failure() -> bool {
 #[cfg(test)]
 const MSG_FORCED_REPORT_WRITE_FAILURE: &str = "forced open-time escalation report write failure";
 
-/// The same raw channel as thread exit provides a concrete delivery receipt.
-/// Tracing enablement cannot prove delivery through a filtered or lossy sink.
+/// Write the report through stderr, without relying on tracing enablement.
+/// On Unix, write through an owned duplicate of the live stderr descriptor:
+/// `Stderr` itself treats a closed descriptor as a successful no-op. A successful
+/// write means the OS accepted the bytes, not that a downstream reader retained
+/// them. Hold stderr's lock only for this raw write, before the caller traces.
 fn write_open_report(frame: &TxnFrame) -> std::io::Result<()> {
     #[cfg(test)]
     if FORCE_REPORT_WRITE_FAILURE.with(std::cell::Cell::get) {
         return Err(std::io::Error::other(MSG_FORCED_REPORT_WRITE_FAILURE));
     }
+    let stderr = std::io::stderr();
+    // Keep the serialization provided by Stderr::write_fmt at thread exit.
+    // The duplicate prevents descriptor closure between checking and writing
+    // from becoming a falsely successful receipt (ERRORS-02, ERRORS-19).
+    let stderr_lock = stderr.lock();
+    #[cfg(unix)]
+    let mut writer = {
+        use std::os::fd::AsFd;
+        std::fs::File::from(stderr.as_fd().try_clone_to_owned()?)
+    };
+    #[cfg(not(unix))]
+    let mut writer = stderr_lock;
     let unreported = frame.unreported();
-    std::io::Write::write_fmt(
-        &mut std::io::stderr(),
+    let result = std::io::Write::write_fmt(
+        &mut writer,
         format_args!(
             "ERROR #4116: a WriteTxn opened while an older frame on the same database still \
              holds {unreported} {UNREPORTED_ESCALATIONS_LABEL} (leaked transaction); \
              those escalated writes stay REFUSED but were NOT queued\n"
         ),
-    )
+    );
+    #[cfg(unix)]
+    drop(stderr_lock);
+    result
 }
 
 /// Register a frame for a write transaction just opened on `conn`.
