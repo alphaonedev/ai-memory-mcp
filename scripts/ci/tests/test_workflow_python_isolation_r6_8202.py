@@ -161,5 +161,24 @@ class WorkflowScalarsS5S6R1S8(unittest.TestCase):
                 self.assertNotIn('Traceback', result.stderr)
 
 
+class HeredocLexingS7R2(unittest.TestCase):
+    def test_quoted_and_arithmetic_shifts_are_not_heredocs_s7(self):
+        checker = load_checker()
+        for prefix in ("printf '%s' '<<EOF'", 'echo "<<EOF"',
+                       'value=$((left<<right))', 'value=$((1<<bits))'):
+            with self.subTest(prefix=prefix):
+                found = checker.scan_shell(prefix + '\npython3 x.py\n')
+                self.assertEqual([(item.line, item.malformed) for item in found], [(2, False)])
+        self.assertEqual(checker.scan_shell('cat <<EOF\npython3 x.py\nEOF\n'), [])
+        found = checker.scan_shell('bash <<EOF\npython3 x.py\nEOF\n')
+        self.assertEqual([(item.line, item.malformed) for item in found], [(2, False)])
+
+    def test_malformed_heredoc_prefix_retains_line_and_later_findings_r2(self):
+        checker = load_checker()
+        found = checker.scan_shell("echo first\necho second\necho 'bad <<EOF\npython3 x.py\n")
+        self.assertEqual([(item.line, item.malformed) for item in found],
+                         [(3, True), (4, False)])
+
+
 if __name__ == "__main__":
     unittest.main()
