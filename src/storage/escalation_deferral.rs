@@ -129,20 +129,34 @@ struct TxnFrame {
     /// stable and unique for the frame's whole life.
     conn_addr: usize,
     deferred: Vec<DeferredEscalation>,
+    /// Intents included in a successfully written raw lost-write report.
+    /// A count keeps subsequently deferred intents reportable (#6132/#6540).
+    reported: usize,
     /// #7241 - the off-table audit anchors of signed-event appends made by
     /// nested funnels inside this transaction: emitted when it COMMITS,
     /// dropped unrecorded when it rolls back.
     anchor: crate::governance::audit::PendingAuditAnchor,
 }
 
+impl TxnFrame {
+    fn unreported(&self) -> usize {
+        self.deferred.len().saturating_sub(self.reported)
+    }
+}
+
 /// The per-thread frame stack. Its destructor (thread exit) reports frames
 /// that were never settled: a `mem::forget`-ed `WriteTxn`.
 struct Frames(Vec<TxnFrame>);
 
+/// Diagnostic units stay distinct: one frame can hold several intents.
+const UNREPORTED_ESCALATIONS_LABEL: &str = "unreported deferred escalation(s)";
+const UNSETTLED_FRAMES_LABEL: &str = "unsettled escalation frame(s)";
+
 impl Drop for Frames {
     fn drop(&mut self) {
-        let lost: usize = self.0.iter().map(|f| f.deferred.len()).sum();
+        let lost: usize = self.0.iter().map(TxnFrame::unreported).sum();
         if lost > 0 {
+            let unsettled = self.0.iter().filter(|frame| frame.unreported() > 0).count();
             // No debug_assert here: a panic in a TLS destructor aborts. This
             // runs at thread exit, in thread-local destructor order (reverse
             // of registration). `tracing::error!` is NOT usable here: the
@@ -153,13 +167,14 @@ impl Drop for Frames {
             // during or after destruction"), which aborts the process
             // ("thread local panicked on drop"). Catching that panic keeps the
             // process alive but loses the diagnostic. Write the ERROR line
-            // straight to stderr instead: no thread-local is touched, so it
-            // can neither panic nor be lost, and a failed write is discarded
+            // straight to stderr instead to avoid that thread-local teardown
+            // hazard. Delivery remains best effort; a failed write is discarded
             // on purpose (nothing left to report to; ERRORS-19).
             let _ = std::io::Write::write_fmt(
                 &mut std::io::stderr(),
                 format_args!(
-                    "ERROR #4116: thread exited with {lost} unsettled escalation frame(s) \
+                    "ERROR #4116: thread exited with {lost} {UNREPORTED_ESCALATIONS_LABEL} \
+                     in {unsettled} {UNSETTLED_FRAMES_LABEL} \
                      (a leaked WriteTxn); those escalated writes stay REFUSED but were NOT queued\n"
                 ),
             );
@@ -173,6 +188,9 @@ thread_local! {
     /// Test seam: fail the deferred queue writes on this thread.
     #[cfg(test)]
     static FORCE_QUEUE_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Test seam: fail open-time raw report writes without touching stderr.
+    #[cfg(test)]
+    static FORCE_REPORT_WRITE_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 static NEXT_FRAME_ID: AtomicU64 = AtomicU64::new(1);
@@ -194,21 +212,81 @@ fn forced_failure() -> bool {
     false
 }
 
+#[cfg(test)]
+const MSG_FORCED_REPORT_WRITE_FAILURE: &str = "forced open-time escalation report write failure";
+
+/// Write the report through stderr, without relying on tracing enablement.
+/// On Unix, write through an owned duplicate of the live stderr descriptor:
+/// `Stderr` itself treats EBADF from a closed or read-only descriptor as a
+/// successful no-op. Failed duplication or writing leaves report credit unchanged.
+/// A successful write means the OS accepted the bytes, not that a downstream
+/// reader retained them. Hold stderr's lock through the entire raw write to
+/// exclude other stderr-lock writers; release it before the caller traces.
+fn write_open_report(frame: &TxnFrame) -> std::io::Result<()> {
+    #[cfg(test)]
+    if FORCE_REPORT_WRITE_FAILURE.with(std::cell::Cell::get) {
+        return Err(std::io::Error::other(MSG_FORCED_REPORT_WRITE_FAILURE));
+    }
+    let stderr = std::io::stderr();
+    // Keep the serialization provided by Stderr::write_fmt at thread exit.
+    // The duplicate prevents descriptor closure between checking and writing
+    // from becoming a falsely successful receipt (ERRORS-02, ERRORS-19).
+    let stderr_lock = stderr.lock();
+    #[cfg(unix)]
+    let mut writer = {
+        use std::os::fd::AsFd;
+        std::fs::File::from(stderr.as_fd().try_clone_to_owned()?)
+    };
+    #[cfg(not(unix))]
+    let mut writer = stderr_lock;
+    #[cfg(test)]
+    let mut writer = reporting_tests::ObserveWrite(&mut writer);
+    let unreported = frame.unreported();
+    let result = std::io::Write::write_fmt(
+        &mut writer,
+        format_args!(
+            "ERROR #4116: a WriteTxn opened while an older frame on the same database still \
+             holds {unreported} {UNREPORTED_ESCALATIONS_LABEL} (leaked transaction); \
+             those escalated writes stay REFUSED but were NOT queued\n"
+        ),
+    );
+    #[cfg(unix)]
+    drop(stderr_lock);
+    result
+}
+
 /// Register a frame for a write transaction just opened on `conn`.
 pub(super) fn open_frame(conn: &Connection) -> u64 {
     let id = NEXT_FRAME_ID.fetch_add(1, Ordering::Relaxed);
     let db_path = conn.path().filter(|p| !p.is_empty()).map(str::to_string);
     TXN_FRAMES.with(|frames| {
         let mut frames = frames.borrow_mut();
-        let stale = frames
+        let mut stale = false;
+        for frame in frames
             .0
-            .iter()
-            .any(|f| f.db_path == db_path && db_path.is_some() && !f.deferred.is_empty());
-        if stale {
+            .iter_mut()
+            .filter(|f| f.db_path == db_path && db_path.is_some() && !f.deferred.is_empty())
+        {
+            stale = true;
+            let intent_count = frame.unreported();
+            if intent_count == 0 {
+                continue;
+            }
+            // Credit only a completed raw write, before any debug assertion
+            // or subscriber can unwind. Failure leaves all intents pending
+            // for a later open or thread exit (ERRORS-19, OWNERSHIP-25).
+            if write_open_report(frame).is_ok() {
+                frame.reported = frame.deferred.len();
+            }
             tracing::error!(
+                frame_id = frame.id,
+                db_path = ?frame.db_path,
+                intent_count,
                 "#4116: a WriteTxn opened while an older frame on the same database still \
                  holds deferred escalations (leaked or unsettled transaction)"
             );
+        }
+        if stale {
             debug_assert!(false, "#4116: stale escalation frame on this database");
         }
         frames.0.push(TxnFrame {
@@ -216,6 +294,7 @@ pub(super) fn open_frame(conn: &Connection) -> u64 {
             db_path,
             conn_addr: std::ptr::from_ref(conn).addr(),
             deferred: Vec::new(),
+            reported: 0,
             anchor: crate::governance::audit::PendingAuditAnchor::none(),
         });
     });
@@ -503,6 +582,10 @@ pub fn insert_pending_action_row(
 }
 
 #[cfg(test)]
+#[path = "escalation_frame_reporting_8184_tests.rs"]
+mod reporting_tests;
+
+#[cfg(test)]
 mod tests {
     /// #7241 L1 - an anchor handed to a funnel that runs in a raw transaction
     /// with no `WriteTxn` frame is dropped; a debug or test build must trip a
@@ -546,6 +629,7 @@ mod tests {
 
     /// Vote item 5(a) — a leaked `WriteTxn` whose frame still holds a deferred
     /// escalation is detected when the next transaction opens on the database.
+    #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "stale escalation frame")]
     fn leaked_frame_with_intents_is_detected_on_next_open() {
@@ -606,7 +690,7 @@ mod tests {
                 "child did not run:\n{stdout}"
             );
             assert!(
-                stderr.contains("ERROR #4116: thread exited with 1 unsettled escalation frame(s)"),
+                stderr.contains("ERROR #4116: thread exited with 1 unreported deferred escalation(s) in 1 unsettled escalation frame(s)"),
                 "the leak ERROR line must be on stderr:\n{stderr}"
             );
             assert!(
