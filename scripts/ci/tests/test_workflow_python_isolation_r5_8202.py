@@ -95,8 +95,10 @@ class WorkflowShellN3(unittest.TestCase):
             workflow.write_text(template % (
                 "${{ matrix.python }} {0} # isolation: exempt #8202"))
             exemptions = []
-            self.assertEqual(checker.scan_repository(root, exemptions), [])
-            self.assertEqual([(line, issue) for _, line, issue in exemptions], [(4, "8202")])
+            findings = checker.scan_repository(root, exemptions)
+            self.assertEqual(len(findings), 1)
+            self.assertEqual(findings[0][1].line, 4)
+            self.assertEqual(exemptions, [])  # S6: YAML removes this comment.
 
 
 class ShellProgramsN4(unittest.TestCase):

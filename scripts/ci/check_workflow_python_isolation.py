@@ -14,7 +14,10 @@ here. Literal python/PyPy names accept versions, d/-dbg/t and .exe suffixes; dyn
 names containing python (including /python* paths) are matched case-insensitively,
 as are literal names. Other unresolved executables, such as $BIN or $PSQL, are left alone:
 this is a lexical name scan, not whole-workflow variable binding analysis.
-Exit codes: 0 clean, 1 findings, 2 unreadable or malformed input.
+Workflow scalars are decoded before scanning; YAML-side comments never exempt
+shell calls. Unsupported scalar encodings fail closed at their source line.
+Exit codes: 0 clean, 1 findings, 2 unreadable/malformed input or a repository with
+no workflow files. Input errors retain other findings and the summary.
 """
 import argparse
 from bisect import bisect_right
@@ -89,6 +92,11 @@ WRAPPER_REF = re.compile(r"scripts/[A-Za-z_0-9./-]+\.sh\b")
 WORKFLOW_RUN = re.compile(r"^(\s*)(?:-\s+)?run:\s*(.*)$")
 WORKFLOW_SHELL = re.compile(r"^\s*(?:-\s+)?shell:\s*(['\"]?)(.*)")
 WORKFLOW_DIR = Path(".github/workflows")
+WORKFLOW_FIELD = re.compile(r"^(?P<indent>\s*)(?P<item>-\s+)?(?P<key>run|shell|'run'|'shell'|\"run\"|\"shell\"):\s*(?P<value>.*)$")
+FLOW_STEP = re.compile(r"^\s*-\s*\{")
+FLOW_FIELD = re.compile(r"^\s*(run|shell|'run'|'shell'|\"run\"|\"shell\"):\s*(.*)$", re.DOTALL)
+WORKFLOW_KEYS = frozenset(("run", "shell"))
+EMPTY_REPOSITORY_REASON = "repository contains no workflow files"
 EXEMPTION = re.compile(r"# isolation: exempt #([1-9][0-9]*)\s*\Z")
 
 
@@ -486,38 +494,123 @@ def scan_shell(text, *, masked=False):
     return findings
 
 
-def workflow_runs(text):
-    """Yield run scalars with source line offsets; reject unsupported run scalars."""
+def yaml_comment_free(text):
+    """Drop YAML comments outside scalar quotes, using shared quote state."""
+    quotes = QuoteScanner()
+    index = 0
+    while index < len(text):
+        if quotes.quote is None and text[index] == "#" and (
+                index == 0 or text[index - 1].isspace()):
+            return text[:index].rstrip()
+        index = quotes.advance(text, index)
+    return text.rstrip()
+
+
+def decode_yaml_scalar(value):
+    """Decode the supported quoted/plain scalar subset; unsupported input is an error."""
+    value = yaml_comment_free(value).strip()
+    if value.startswith("'"):
+        if len(value) < 2 or not value.endswith("'"):
+            raise ValueError(WORKFLOW_REASON)
+        return value[1:-1].replace("''", "'")
+    if value.startswith('"'):
+        decoded = json.loads(value)
+        if not isinstance(decoded, str):
+            raise ValueError(WORKFLOW_REASON)
+        return decoded
+    return value
+
+
+def flow_fields(text, offset):
+    """Read fields of a flow-mapping step without splitting quoted values."""
+    body = yaml_comment_free(text).strip()
+    body = body[body.index("{") + 1:]
+    if not body.endswith("}"):
+        yield "run", None, "", offset
+        return
+    body = body[:-1]
+    quotes = QuoteScanner()
+    index = start = depth = 0
+    pieces = []
+    while index < len(body):
+        char = body[index]
+        if quotes.quote is None:
+            if char in "{[":
+                depth += 1
+            elif char in "}]":
+                depth -= 1
+            elif char == "," and depth == 0:
+                pieces.append((body[start:index], offset + body.count("\n", 0, start)))
+                start = index + 1
+        index = quotes.advance(body, index)
+    pieces.append((body[start:], offset + body.count("\n", 0, start)))
+    for piece, line in pieces:
+        match = FLOW_FIELD.match(piece)
+        if match:
+            try:
+                command = decode_yaml_scalar(match[2])
+            except ValueError:
+                command = None
+            yield match[1].strip("'\""), command, command or "", line
+
+
+def fold_yaml_lines(lines):
+    """Fold ordinary scalar lines; blank and more-indented lines retain breaks."""
+    result = []
+    for index, line in enumerate(lines):
+        result.append(line)
+        if index + 1 < len(lines):
+            following = lines[index + 1]
+            result.append("\n" if not line or not following or line[:1].isspace()
+                          or following[:1].isspace() else " ")
+    return "".join(result)
+
+
+def workflow_fields(text):
+    """Yield decoded run/shell fields, source views and located input errors."""
     lines = text.splitlines(keepends=True)
     index = 0
     while index < len(lines):
-        match = WORKFLOW_RUN.match(lines[index].rstrip("\r\n"))
+        raw = lines[index].rstrip("\r\n")
+        offset = index
         index += 1
+        if FLOW_STEP.match(raw):
+            yield from flow_fields(raw, offset)
+            continue
+        match = WORKFLOW_FIELD.match(raw)
         if not match:
             continue
-        indent = len(match[1])
-        value = match[2]
-        offset = index - 1
-        if value.startswith(("|", ">")):
-            body = []
-            while index < len(lines):
-                line = lines[index]
-                if line.strip() and len(line) - len(line.lstrip()) <= indent:
-                    break
-                body.append(line)
-                index += 1
-            # Preserve line boundaries for shell heredocs and exact source diagnostics.
-            yield textwrap.dedent("".join(body)), offset + 1
-        else:
-            if value[:1] in ("'", '"'):
-                # YAML single quotes double a literal quote; double quotes use JSON escapes.
-                if value.startswith("'") and value.endswith("'"):
-                    value = value[1:-1].replace("''", "'")
-                elif value.startswith('"'):
-                    value = json.loads(value)
-                else:
-                    raise ValueError("unsupported multiline run scalar")
-            yield value, offset
+        key = match['key'].strip("'\"")
+        indent = len(match['indent']) + len(match['item'] or '')
+        value = yaml_comment_free(match['value'])
+        body = []
+        while index < len(lines):
+            line = lines[index]
+            if line.strip() and len(line) - len(line.lstrip()) <= indent:
+                break
+            body.append(line)
+            index += 1
+        try:
+            if value.startswith(("|", ">")):
+                source = textwrap.dedent("".join(body))
+                command = (fold_yaml_lines(source.splitlines()) if value.startswith(">")
+                           else source)
+                yield key, command, source, offset + 1
+            else:
+                parts = [value] if value else []
+                parts.extend(yaml_comment_free(line.strip()) for line in body)
+                command = decode_yaml_scalar(fold_yaml_lines(parts))
+                source = "\n".join(parts)
+                yield key, command, source, offset if value else offset + 1
+        except ValueError:
+            yield key, None, "", offset
+
+
+def workflow_runs(text):
+    """Compatibility iterator for decoded run scalars and their source offsets."""
+    for key, command, _, offset in workflow_fields(text):
+        if key == "run" and command is not None:
+            yield command, offset
 
 
 def workflow_files(root):
@@ -585,24 +678,28 @@ def scan_repository(root, exemptions=None):
     findings = []
     if exemptions is None:
         exemptions = []
-    for path in workflow_files(root):
+    paths = workflow_files(root)
+    if not paths:
+        return [(root, Finding(1, EMPTY_REPOSITORY_REASON, True))]
+    for path in paths:
         text = read_source(path)
-        try:
-            commands = list(workflow_runs(text))
-            for line, value in enumerate(text.splitlines()):
-                match = WORKFLOW_SHELL.match(value)
-                if match:
-                    command = match[2]
-                    if match[1] and command.endswith(match[1]):
-                        command = command[:-1]
-                    commands.append((command, line))
-            for command, offset in commands:
-                unsafe, exempt = scan_source(command)
-                findings.extend((path, Finding(item.line + offset, item.reason, item.malformed))
-                                for item in unsafe)
-                exemptions.extend((path, line + offset, issue) for line, issue in exempt)
-        except ValueError:
-            findings.append((path, Finding(1, WORKFLOW_REASON, True)))
+        for key, command, source, offset in workflow_fields(text):
+            if command is None:
+                findings.append((path, Finding(offset + 1, WORKFLOW_REASON, True)))
+                continue
+            # A shell template is an argv declaration, not shell program text.
+            unsafe, exempt = (scan_source(command) if key == "run"
+                              else (scan_shell(command), []))
+            # Decoded text alone decides violations. The physical source view
+            # supplies locations for folded scalar tokens, never extra findings.
+            located = scan_shell(source) if source != command else list(unsafe)
+            for item in unsafe:
+                matching = next((part for part in located if part.reason == item.reason), item)
+                if matching in located:
+                    located.remove(matching)
+                findings.append((path, Finding(matching.line + offset,
+                                               item.reason, item.malformed)))
+            exemptions.extend((path, line + offset, issue) for line, issue in exempt)
     for path in wrapper_files(root):
         unsafe, exempt = scan_source(read_source(path))
         findings.extend((path, item) for item in unsafe)
