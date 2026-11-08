@@ -435,6 +435,20 @@ fn register_tls_test_pki_cleanup() {
     });
 }
 
+/// #8663: create exclusively with private permissions before returning the handle.
+fn create_tls_test_private_key(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        const PRIVATE_KEY_MODE: u32 = 0o600;
+        options.mode(PRIVATE_KEY_MODE);
+    }
+    // ERRORS-01: preserve the exact I/O kind, including AlreadyExists.
+    options.open(path)
+}
+
 fn generate_tls_test_pki() -> TlsTestPki {
     use std::io::Write as _;
 
@@ -475,18 +489,8 @@ fn generate_tls_test_pki() -> TlsTestPki {
     let leaf_key_pem = dir.path().join("test-leaf-key.pem");
     std::fs::write(&ca_pem, ca_cert.pem()).expect("write test CA");
     std::fs::write(&leaf_pem, leaf_cert.pem()).expect("write test leaf");
-    let mut key_options = std::fs::OpenOptions::new();
-    key_options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        const PRIVATE_KEY_MODE: u32 = 0o600;
-        // #8663: restrict the creation syscall, before any private bytes are written.
-        key_options.mode(PRIVATE_KEY_MODE);
-    }
-    let mut key_file = key_options
-        .open(&leaf_key_pem)
-        .expect("create private test leaf key");
+    let mut key_file =
+        create_tls_test_private_key(&leaf_key_pem).expect("create private test leaf key");
     key_file
         .write_all(leaf_key.serialize_pem().as_bytes())
         .expect("write test leaf key");
@@ -793,6 +797,103 @@ mod tests {
             stdout.contains("1 passed") && !stdout.contains("0 passed"),
             "permission child must execute the selected test: {stdout}"
         );
+    }
+
+    /// #8663: observe creation permissions before the first write or chmod.
+    #[cfg(unix)]
+    #[test]
+    fn tls_private_key_creation_is_private_8663() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        const CHILD: &str = "AI_MEMORY_TLS_KEY_CREATION_CHILD_8663";
+        const TEST: &str = concat!(
+            module_path!(),
+            "::",
+            stringify!(tls_private_key_creation_is_private_8663)
+        );
+        const PERMISSIVE_UMASK: libc::mode_t = 0;
+        const PERMISSION_BITS: u32 = 0o777;
+        const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
+        const PRIVATE_KEY_MODE: u32 = 0o600;
+        if std::env::var_os(CHILD).is_some() {
+            // SAFETY: the integer-only umask call is isolated to this re-executed
+            // child, which runs one test and exits; the parent umask is unchanged.
+            unsafe { libc::umask(PERMISSIVE_UMASK) };
+            let pki = super::tls_test_pki();
+            let directory = pki.leaf_key_pem.parent().expect("owned PKI directory");
+            let path = directory.join("creation-probe.pem");
+            let file = super::create_tls_test_private_key(&path).expect("new private key");
+            let metadata = file.metadata().expect("new key handle metadata");
+            assert_eq!(
+                metadata.permissions().mode() & PERMISSION_BITS,
+                PRIVATE_KEY_MODE,
+                "#8663: key must be born private before any write or chmod"
+            );
+            assert_eq!(metadata.len(), 0, "#8663: key has not been written yet");
+            assert_eq!(
+                std::fs::metadata(directory)
+                    .expect("owned PKI directory metadata")
+                    .permissions()
+                    .mode()
+                    & PERMISSION_BITS,
+                PRIVATE_DIRECTORY_MODE,
+                "#8663: key must be created inside the private PKI directory"
+            );
+            return;
+        }
+        let scratch = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE))
+            .tempdir()
+            .expect("private parent-owned creation scratch");
+        let tmp = scratch.path().join("child-tmp");
+        std::fs::create_dir(&tmp).expect("creation child TMPDIR");
+        let test = TEST.split_once("::").expect("crate-qualified test name").1;
+        let mut command = crate::spawn_audit::audited_command(
+            std::env::current_exe().expect("lib test binary"),
+            "test_support::tls_private_key_creation_is_private_8663",
+        );
+        command
+            .args(["--exact", test, "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1")
+            .env("AI_MEMORY_NO_CONFIG", "1");
+        for name in ["TMPDIR", "TMP", "TEMP"] {
+            command.env(name, &tmp);
+        }
+        let output = run_pki_child_8651(command, scratch.path());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "creation child: {stdout}\n{stderr}"
+        );
+        assert!(
+            stdout.contains("1 passed") && !stdout.contains("0 passed"),
+            "creation child must execute the selected test: {stdout}"
+        );
+    }
+
+    /// #8663: exclusive creation must preserve every byte at an existing path.
+    #[test]
+    fn tls_private_key_existing_path_is_unchanged_8663() {
+        const NAMES: [&str; 3] = ["existing.pem", "existing key.pem", "existing-λ.pem"];
+        const ORIGINAL: &[u8] = b"existing fixture bytes\x00\xff\n";
+        let directory = tempfile::tempdir().expect("existing-key fixture directory");
+        for name in NAMES {
+            let path = directory.path().join(name);
+            std::fs::write(&path, ORIGINAL).expect("seed existing fixture");
+            let result = super::create_tls_test_private_key(&path);
+            let bytes = std::fs::read(&path).expect("read existing fixture after refusal");
+            assert_eq!(
+                bytes, ORIGINAL,
+                "#8663: existing bytes must survive: {name}"
+            );
+            let error = result.expect_err("#8663: an existing key must be refused");
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::AlreadyExists,
+                "#8663: existing key error must be exact: {name}"
+            );
+        }
     }
 
     /// Copy the #8166 file-capture and bounded child-reaping precedent.
