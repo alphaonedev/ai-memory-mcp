@@ -5743,6 +5743,7 @@ mod tests {
     /// serial dispatch, which this test exercises.
     #[test]
     fn issue_965_audit_serial_dispatch_50_calls_through_single_connection() {
+        let _iso = crate::test_support::no_passphrase_guard();
         let tmp = tempfile::NamedTempFile::new().expect("tempfile");
         let conn = db::open(tmp.path()).expect("open db");
         let tier_config = crate::config::FeatureTier::Keyword.config();
