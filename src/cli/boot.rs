@@ -2166,6 +2166,12 @@ mod tests {
         let mut env2 = TestEnv::fresh();
         seed_memory(&env2.db_path, "ns-ssj2", "row", "x");
         override_schema_version(&env2.db_path, i64::from(MAX_SUPPORTED_SCHEMA) + 1);
+        let expected_ahead = crate::storage::schema_guard::schema_ahead_of(
+            &db::open(&env2.db_path).expect_err("an ahead database is refused"),
+        )
+        .expect("typed refusal")
+        .detail
+        .clone();
         let db_path2 = env2.db_path.clone();
         let mut args2 = default_args();
         args2.namespace = Some("ns-ssj2".to_string());
@@ -2184,11 +2190,11 @@ mod tests {
         // so without pinning the NOTE the drift path and the "db is gone" path
         // are indistinguishable and a regression in the typed downcast would
         // pass silently.
-        assert!(
-            parsed2["note"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("unsupported by binary"),
+        // #8679 / #8683 - the note is the shared `schema_guard` refusal text,
+        // derived from the same refusal `db::open` returns for this database.
+        assert_eq!(
+            parsed2["note"].as_str().unwrap_or_default(),
+            expected_ahead,
             "drift path must report SCHEMA drift, not generic unavailability: {stdout2}"
         );
     }
