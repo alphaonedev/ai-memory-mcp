@@ -172,6 +172,9 @@ class HeredocLexingS7R2(unittest.TestCase):
         self.assertEqual(checker.scan_shell('cat <<EOF\npython3 x.py\nEOF\n'), [])
         found = checker.scan_shell('bash <<EOF\npython3 x.py\nEOF\n')
         self.assertEqual([(item.line, item.malformed) for item in found], [(2, False)])
+        for text in ('value="$(python3 -I - <<EOF\nprint(1)\nEOF\n)"',
+                     'value="$(\npython3 -I - <<EOF\nprint(1)\nEOF\n)"'):
+            self.assertEqual(checker.scan_shell(text), [])
 
     def test_malformed_heredoc_prefix_retains_line_and_later_findings_r2(self):
         checker = load_checker()

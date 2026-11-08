@@ -170,10 +170,42 @@ def script_is_unisolated(arguments):
     return not isolated
 
 
+def heredoc_openings(line, contexts):
+    """Recognize redirections outside quotes, comments and arithmetic expansions."""
+    index = 0
+    program_start = 0
+    while index < len(line):
+        quotes = contexts[-1][0]
+        if quotes.quote != "'" and line.startswith(ARITHMETIC_OPEN, index):
+            index = substitution_end(line, index + 2) + 1
+            continue
+        if quotes.quote != "'" and line.startswith("$(", index):
+            contexts.append([QuoteScanner(), 1])
+            index += 2
+            program_start = index
+            continue
+        if quotes.quote is None:
+            if line[index] == "#" and (index == 0 or line[index - 1].isspace()):
+                break
+            if len(contexts) > 1 and line[index] in "()":
+                contexts[-1][1] += 1 if line[index] == "(" else -1
+                if contexts[-1][1] == 0:
+                    contexts.pop()
+                index += 1
+                continue
+            match = HEREDOC.match(line, index)
+            if match:
+                yield match, program_start
+                index = match.end()
+                continue
+        index = quotes.advance(line, index)
+
+
 def mask_heredocs(text):
     """Scan shell-program heredocs recursively; preserve line counts while masking data."""
     pending = []
     result = []
+    contexts = [[QuoteScanner(), 0]]
     for number, line in enumerate(text.splitlines(keepends=True), 1):
         if pending:
             delimiter, strip_tabs, program, body, _ = pending[0]
@@ -190,11 +222,15 @@ def mask_heredocs(text):
         else:
             result.append(line)
             if not line.lstrip().startswith("#"):
-                for match in HEREDOC.finditer(line):
-                    commands = list(shell_commands(line[:match.start()]))
-                    values = [value for value, _ in commands[-1]] if commands else []
-                    mode, _ = shell_input(values, executable_index(values))
-                    pending.append((match[3], bool(match[1]), mode == "stdin", [], number))
+                try:
+                    for match, start in heredoc_openings(line, contexts):
+                        commands = list(shell_commands(line[start:match.start()]))
+                        values = [value for value, _ in commands[-1]] if commands else []
+                        mode, _ = shell_input(values, executable_index(values))
+                        pending.append((match[3], bool(match[1]), mode == "stdin", [], number))
+                except ShellSyntaxError as error:
+                    error.line += number - 1
+                    raise
     if pending:
         offset = sum(len(line) for line in text.splitlines(keepends=True)[:pending[0][4] - 1])
         raise ShellSyntaxError(text, offset)
@@ -476,21 +512,29 @@ def command_findings(words):
     return findings
 
 
+def recover_shell(text, line, masked):
+    """Retain independently scannable lines on both sides of malformed input."""
+    lines = text.splitlines(keepends=True)
+    prefix = scan_shell("".join(lines[:line - 1]), masked=masked)
+    suffix = scan_shell("".join(lines[line:]), masked=masked)
+    return prefix + [Finding(line, MALFORMED_REASON, True)] + offset_findings(suffix, line)
+
+
 def scan_shell(text, *, masked=False):
     """Return unsafe Python invocations and located malformed-command findings."""
     findings = []
+    original = text
     try:
         text, children = substitutions(text if masked else mask_heredocs(text))
     except ShellSyntaxError as error:
-        prefix = "".join(text.splitlines(keepends=True)[:error.line - 1])
-        return scan_shell(prefix, masked=masked) + [Finding(error.line, MALFORMED_REASON, True)]
+        return recover_shell(original, error.line, masked)
     try:
         for child, offset in children:
             findings.extend(offset_findings(scan_shell(child, masked=True), offset))
         for words in shell_commands(text):
             findings.extend(command_findings(words))
-    except ValueError as error:
-        findings.append(Finding(getattr(error, "line", 1), MALFORMED_REASON, True))
+    except ShellSyntaxError as error:
+        return recover_shell(original, error.line, masked)
     return findings
 
 
