@@ -70,10 +70,17 @@
 //!   holds it. The pending row is then written inside that probe
 //!   transaction.
 //!
-//! Remaining window: the probe finds the lock held while the frame is dead
-//! (another process is writing at that instant). The intent is then deferred.
-//! The caller gets the DEFERRED text, which tells it how to detect a failed
-//! write, and the lost intent is reported at the next open or at thread exit.
+//! Remaining windows. In two routes a dead, not-yet-stale frame still takes
+//! the intent:
+//!
+//! | Route | When | Pinned by |
+//! |---|---|---|
+//! | probe finds the lock held | ANY other connection holds the write lock at the probe instant: another process, or another thread or connection of this process (the probe never waits, `busy_timeout` is 0) | `issue_8707_residual_windows_defer_fail_closed_and_report_once_at_exit` (`ForeignWriterHoldsLock`) |
+//! | router in its own transaction | the routing connection is not in autocommit, so liveness cannot be probed without nesting (#8710 tracks closing it) | the same test (`RouterInOwnTransaction`) |
+//!
+//! Both fail closed: no row is written, the caller gets the DEFERRED text,
+//! which tells it how to detect a failed write, and the dead frame reports
+//! the lost intent at the next open or at thread exit.
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -82,6 +89,7 @@ use anyhow::Result;
 use chrono::Utc;
 use rusqlite::{Connection, params};
 
+use super::connection::NoWaitWriteTxn;
 use crate::models::GovernedAction;
 
 /// One escalation routing deferred to the caller's open write transaction.
@@ -474,11 +482,6 @@ pub(crate) fn defer_to_open_txn(
     })
 }
 
-/// `busy_timeout` (ms) for the #8662 liveness probe: never wait.
-const PROBE_BUSY_TIMEOUT_MS: i64 = 0;
-/// SQLite pragma the liveness probe saves, zeroes and restores.
-const PRAGMA_BUSY_TIMEOUT: &str = "busy_timeout";
-
 /// Where an escalation routed on a connection goes (#8662).
 enum Route {
     /// No usable frame: write the pending row now on the routing connection.
@@ -489,15 +492,6 @@ enum Route {
     /// connection is in autocommit: probe the write lock to see whether that
     /// frame is still live.
     Probe(u64),
-}
-
-/// Result of the non-blocking `BEGIN IMMEDIATE` probe.
-enum WriteLock {
-    /// The probe holds the write lock (its transaction is OPEN on `conn`):
-    /// no other connection has a write transaction on this database.
-    Acquired,
-    /// Another connection holds the write lock.
-    Held,
 }
 
 fn classify_route(conn: &Connection) -> Route {
@@ -530,35 +524,11 @@ fn classify_route(conn: &Connection) -> Route {
             (true, false) => Route::Defer(frame.id),
             (false, true) => Route::Probe(frame.id),
             // The router is inside a transaction of its own; liveness cannot
-            // be probed without nesting, so the #4116 deferral stands.
+            // be probed without nesting, so the #4116 deferral stands. This
+            // is the second remaining window of the module doc (#8710).
             (false, false) => Route::Defer(frame.id),
         }
     })
-}
-
-/// Non-blocking `BEGIN IMMEDIATE` on `conn` (which is in autocommit). On
-/// [`WriteLock::Acquired`] the transaction is left OPEN for the caller.
-fn probe_write_lock(conn: &Connection) -> rusqlite::Result<WriteLock> {
-    let prior: i64 = conn.pragma_query_value(None, PRAGMA_BUSY_TIMEOUT, |r| r.get(0))?;
-    conn.pragma_update(None, PRAGMA_BUSY_TIMEOUT, PROBE_BUSY_TIMEOUT_MS)?;
-    let begun = conn.execute_batch(super::connection::SQL_BEGIN_IMMEDIATE);
-    if let Err(error) = conn.pragma_update(None, PRAGMA_BUSY_TIMEOUT, prior) {
-        // Degrades only contention handling on this connection (it now fails
-        // fast instead of retrying); every such failure is still surfaced.
-        tracing::error!(%error, prior, "#8662: busy_timeout not restored after the frame probe");
-    }
-    match begun {
-        Ok(()) => Ok(WriteLock::Acquired),
-        Err(rusqlite::Error::SqliteFailure(failure, _))
-            if matches!(
-                failure.code,
-                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
-            ) =>
-        {
-            Ok(WriteLock::Held)
-        }
-        Err(error) => Err(error),
-    }
 }
 
 fn insert_intent(conn: &Connection, intent: &DeferredEscalation) -> Result<()> {
@@ -573,22 +543,19 @@ fn insert_intent(conn: &Connection, intent: &DeferredEscalation) -> Result<()> {
     )
 }
 
-/// Write `intent` inside the probe transaction `conn` holds, then COMMIT.
-/// The row either exists when this returns `Ok`, or the error is returned and
-/// the probe transaction is rolled back.
-fn insert_in_probe_txn(conn: &Connection, intent: &DeferredEscalation) -> Result<()> {
+/// Write `intent` inside the probe transaction `probe` holds on `conn`, then
+/// COMMIT. The row either exists when this returns `Ok`, or the error is
+/// returned and the probe transaction is rolled back: by the guard's `Drop`
+/// on an early `?`, a failed COMMIT, or a panic unwind (#8707).
+fn insert_in_probe_txn(
+    probe: NoWaitWriteTxn<'_>,
+    conn: &Connection,
+    intent: &DeferredEscalation,
+) -> Result<()> {
     panic_if_probe_panic_forced();
-    let written = insert_intent(conn, intent).and_then(|()| {
-        conn.execute_batch(super::connection::SQL_COMMIT)
-            .map_err(anyhow::Error::from)
-    });
-    if written.is_err()
-        && !conn.is_autocommit()
-        && let Err(error) = conn.execute_batch(super::connection::SQL_ROLLBACK)
-    {
-        tracing::error!(%error, "#8662: ROLLBACK of the frame probe transaction failed");
-    }
-    written
+    insert_intent(conn, intent)?;
+    probe.commit()?;
+    Ok(())
 }
 
 fn mark_db_frames_stale(db_path: Option<&str>) {
@@ -627,7 +594,11 @@ fn push_to_frame(
 /// thread holds a LIVE write transaction on the same database, the intent is
 /// deferred to it and lands on that transaction's connection when it ends.
 /// Otherwise the pending row is written now. A frame left behind by a leaked
-/// `WriteTxn` never takes the intent (module doc, "Leaked frames").
+/// `WriteTxn` takes the intent only in the two remaining windows of the
+/// module doc ("Leaked frames"): the write lock is held by another connection
+/// at the probe instant, or the routing connection is inside a transaction of
+/// its own. The intent is then held by that dead frame, the caller gets the
+/// DEFERRED text, and the frame's exit report counts it.
 ///
 /// `Ok` means the row exists, or the intent is held by a frame that will
 /// settle it ([`is_deferred`] tells which).
@@ -643,14 +614,14 @@ pub fn defer_or_queue(conn: &Connection, intent: DeferredEscalation) -> Result<(
             Ok(()) => return Ok(()),
             Err(intent) => intent,
         },
-        Route::Probe(frame_id) => match probe_write_lock(conn)? {
-            WriteLock::Acquired => {
+        Route::Probe(frame_id) => match NoWaitWriteTxn::try_begin(conn)? {
+            Some(probe) => {
                 // Nothing holds the write lock, so every frame on this
                 // database on this thread is dead.
                 mark_db_frames_stale(conn.path().filter(|p| !p.is_empty()));
-                return insert_in_probe_txn(conn, &intent);
+                return insert_in_probe_txn(probe, conn, &intent);
             }
-            WriteLock::Held => match push_to_frame(frame_id, intent) {
+            None => match push_to_frame(frame_id, intent) {
                 Ok(()) => return Ok(()),
                 Err(intent) => intent,
             },

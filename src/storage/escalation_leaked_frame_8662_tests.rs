@@ -552,7 +552,7 @@ fn issue_8707_failed_insert_inside_probe_txn_rolls_back() {
                     conn,
                     intent(PROBE_FAILURE_ID),
                 )
-                .map_or_else(|e| format!("{e:#}"), |()| "Ok".to_owned());
+                .map_or_else(|e| e.root_cause().to_string(), |()| "Ok".to_owned());
                 (
                     error,
                     conn.is_autocommit(),
@@ -560,7 +560,7 @@ fn issue_8707_failed_insert_inside_probe_txn_rolls_back() {
                     is_deferred(PROBE_FAILURE_ID),
                 )
             });
-        assert!(error.contains(message), "{failure:?}: error was {error:?}");
+        assert_eq!(error, message, "{failure:?}: root cause of the error");
         assert!(autocommit, "{failure:?}: probe transaction left open");
         assert_eq!(timeout, WRITER_BUSY_TIMEOUT_MS, "{failure:?}: busy_timeout");
         assert!(!deferred, "{failure:?}: intent parked in a dead frame");
