@@ -21,7 +21,9 @@ import io
 import os
 import re
 import shutil
+import signal
 import stat
+import subprocess
 import sys
 import time
 import unittest
@@ -66,6 +68,9 @@ UNREACHABLE_CORPUS = (
     'psql: error: could not translate host name "nohost.invalid" to address: nodename nor servname provided',
     'psql: error: connection to server at "127.0.0.1", port 5445 failed: FATAL:  the database system is starting up',
     'psql: error: connection to server at "127.0.0.1", port 5445 failed: FATAL:  the database system is shutting down',
+    'psql: error: connection to server at "10.1.2.3", port 5445 failed: No route to host',
+    'psql: error: connection to server at "10.1.2.3", port 5445 failed: Network is unreachable',
+    'psql: error: connection to server on socket "/run/postgresql/.s.PGSQL.5432" failed: No such file or directory',
 )
 TLS_CORPUS = (
     'psql: error: connection to server at "127.0.0.1", port 5445 failed: SSL error: certificate verify failed',
@@ -73,7 +78,45 @@ TLS_CORPUS = (
     'host name "127.0.0.1"',
     'psql: error: connection to server at "127.0.0.1", port 5445 failed: root certificate file "/x/ca.crt" does not '
     "exist",
+    'psql: error: connection to server at "127.0.0.1", port 5445 failed: SSL SYSCALL error: EOF detected',
+    'psql: error: connection to server at "127.0.0.1", port 5445 failed: certificate verify failed',
+    'psql: error: connection to server at "127.0.0.1", port 5445 failed: SSL error: unexpected eof',
+    # S4: a missing client certificate or key file is a TLS failure, not "tier unreachable"
+    'psql: error: could not open certificate file "/x/client.crt": No such file or directory',
+    'psql: error: could not load private key file "/x/client.key": No such file or directory',
+    'psql: error: could not stat private key file "/x/client.key": No such file or directory',
+    'psql: error: could not open private key file "/x/client.key": No such file or directory',
 )
+
+# Every marker the helper matches, pinned here independently of the helper (removing one from the helper turns
+# test_every_marker_alone_gets_its_class red; adding one without a row turns test_marker_set_is_pinned red).
+EXPECTED_MARKERS = (
+    (MISMATCH_REASON, "password authentication failed"),
+    (MISMATCH_REASON, "no password supplied"),
+    (TLS_REASON, "certificate verify failed"),
+    (TLS_REASON, "server certificate for"),
+    (TLS_REASON, "root certificate file"),
+    (TLS_REASON, "SSL error"),
+    (TLS_REASON, "SSL SYSCALL error"),
+    (TLS_REASON, "could not open certificate file"),
+    (TLS_REASON, "could not load private key file"),
+    (TLS_REASON, "could not stat private key file"),
+    (TLS_REASON, "could not open private key file"),
+    (UNREACHABLE_REASON, "Connection refused"),
+    (UNREACHABLE_REASON, "timeout expired"),
+    (UNREACHABLE_REASON, "could not translate host name"),
+    (UNREACHABLE_REASON, "No route to host"),
+    (UNREACHABLE_REASON, "Network is unreachable"),
+    (UNREACHABLE_REASON, "the database system is starting up"),
+    (UNREACHABLE_REASON, "the database system is shutting down"),
+    (UNREACHABLE_REASON, "No such file or directory"),
+)
+EXPECTED_CODE = {MISMATCH_REASON: EXIT_MISMATCH, TLS_REASON: EXIT_UNAVAILABLE, UNREACHABLE_REASON: EXIT_UNAVAILABLE}
+# Check order the helper's comment claims: mismatch, then TLS, then unreachable.
+CLASS_ORDER = (MISMATCH_REASON, TLS_REASON, UNREACHABLE_REASON)
+INTERRUPTED_REASON = "tier pre-flight interrupted"
+SIGNAL_DEATH_RC = 137  # the supervisor reports a psql killed by signal 9 as 128+9
+PID_POLL_SECONDS = 10.0
 OTHER_CORPUS = (
     "",
     'psql: error: connection to server at "127.0.0.1", port 5445 failed: FATAL:  database "ai_memory_test" does not '
@@ -100,7 +143,16 @@ if mode == "ok":
 if mode == "garbage":
     print("not-one " + pw)
     sys.exit(0)
+if mode == "one-then-fail":
+    print("1")
+    sys.stderr.write({stderr!r} + "\\n")
+    sys.exit(2)
+if mode == "one-then-signal":
+    print("1", flush=True)
+    os.kill(os.getpid(), 9)
 if mode == "hang":
+    with open({record!r} + ".pid", "w") as fh:
+        fh.write(str(os.getpid()))
     time.sleep(60)
     sys.exit(0)
 # every failure echoes the password and the argv URL into stderr: the helper must never relay it
@@ -114,6 +166,32 @@ def load_helper():
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
+
+
+def read_pid(record):
+    return int(Path(str(record) + ".pid").read_text())
+
+
+def is_alive(pid):
+    """True while the process exists and is not a zombie (``ps`` works on Linux and macOS)."""
+    state = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
+    return bool(state) and not state.startswith("Z")
+
+
+def wait_gone(pid, seconds=PID_POLL_SECONDS):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if not is_alive(pid):
+            return True
+        time.sleep(0.05)
+    return not is_alive(pid)
+
+
+def kill_quietly(pid):
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except OSError:
+        pass
 
 
 def write_exe(path, text):
@@ -136,6 +214,41 @@ def configure_step(text):
 PREFLIGHT_CALL = 'if ! python3 -I scripts/ci/tier_cred_preflight.py --url-file "$url_file"; then'
 CREATE_DB = 'if ! psql "$base_url" -v ON_ERROR_STOP=1 -c "CREATE DATABASE \\"$CI_FED_DB\\";"; then'
 URL_FILE_LINE = 'url_file="$HOME/.ai-memory-ci-fed-url"'
+STEP_IF = "if: needs.classify.outputs.cargo_skip != 'true' && matrix.tier == 'enterprise-fed'"
+
+# shell compound commands: a command word that opens one, and the word that closes it
+_START = r"(?:^|[;&|(]\s*|\bthen\s+|\bdo\s+|\belse\s+|\belif\s+[^;]*;\s*then\s+)"
+OPENERS = re.compile(_START + r"(if|case|for|while|until|select)\b")
+CLOSERS = re.compile(_START + r"(fi|esac|done)\b")
+BRACE_OPEN = re.compile(r"(?:^|\s)\{\s*$|\)\s*\{\s*$")
+BRACE_CLOSE = re.compile(r"^\}")
+SKIPPERS = re.compile(r"(?:^|[;&|(]\s*|\bthen\s+|\bdo\s+|\belse\s+)(exit|return|break|continue)\b(?!\s+1\b)")
+CONTINUATION = re.compile(r"(?:&&|\|\||\\|\|)\s*$")
+
+
+def run_block(step):
+    """The lines of the step's ``run: |`` script (comments and blanks dropped)."""
+    start = next(i for i, ln in enumerate(step) if ln.startswith("run:"))
+    return [ln for ln in step[start + 1:] if ln and not ln.startswith("#")]
+
+
+def skip_problems(block, call):
+    """Everything above the call that can make a leg skip it, by shell structure, at any distance."""
+    found, depth = [], 0
+    for line in block[:call]:
+        code = re.sub(r"\s+#.*$", "", line)
+        depth += len(OPENERS.findall(code)) - len(CLOSERS.findall(code))
+        depth += (1 if BRACE_OPEN.search(code) else 0) - (1 if BRACE_CLOSE.match(code) else 0)
+        if SKIPPERS.search(code):
+            found.append("a line above the pre-flight can leave the step early: `%s`" % line)
+        if CONTINUATION.search(code):
+            found.append("a line above the pre-flight continues into the next one: `%s`" % line)
+        if "|| true" in code or "|| :" in code:
+            found.append("a line above the pre-flight swallows a failure: `%s`" % line)
+    if depth != 0:
+        found.append("the pre-flight sits inside %d open compound command(s) (if/case/for/while/brace); it must be "
+                     "top-level so no leg can skip it" % depth)
+    return found
 
 
 def wiring_problems(text):
@@ -146,19 +259,20 @@ def wiring_problems(text):
     except StopIteration:
         return ["the Configure enterprise-fed tier step is gone"]
     body = "\n".join(step)
-    calls = [i for i, s in enumerate(step) if "tier_cred_preflight.py" in s and not s.startswith("#")]
-    if len(calls) != 1 or step[calls[0]] != PREFLIGHT_CALL:
+    if STEP_IF not in step:
+        found.append("the step's `if:` must stay exactly `%s`: no leg may be excluded from the pre-flight" % STEP_IF)
+    block = run_block(step)
+    calls = [i for i, s in enumerate(block) if "tier_cred_preflight.py" in s]
+    if len(calls) != 1 or block[calls[0]] != PREFLIGHT_CALL:
         return found + ["the pre-flight must run exactly once as `%s`" % PREFLIGHT_CALL]
     i = calls[0]
-    if step[i + 1] != "exit 1" or step[i + 2] != "fi":
+    if block[i + 1] != "exit 1" or block[i + 2] != "fi":
         found.append("the pre-flight failure branch must be exactly `exit 1` then `fi`")
-    if URL_FILE_LINE not in step or step.index(URL_FILE_LINE) > i:
+    if URL_FILE_LINE not in block or block.index(URL_FILE_LINE) > i:
         found.append("the pre-flight must read the same url_file the step reads, after it is set")
-    if CREATE_DB not in step or step.index(CREATE_DB) < i:
+    if CREATE_DB not in block or block.index(CREATE_DB) < i:
         found.append("the pre-flight must run before CREATE DATABASE")
-    # it must not sit inside a node guard: every enterprise-fed leg authenticates first
-    if re.match(r"^if \[ .*CI_NODE", step[i - 1]):
-        found.append("the pre-flight is guarded by a node test; it must run on every enterprise-fed leg")
+    found.extend(skip_problems(block, i))
     if "continue-on-error" in body:
         found.append("the step sets continue-on-error")
     return found
@@ -220,6 +334,36 @@ class TestClassify(unittest.TestCase):
         # a multi-host attempt can print a refused host first and the auth failure second
         stderr = UNREACHABLE_CORPUS[0] + "\n" + MISMATCH_CORPUS[0]
         self.assertEqual(self.mod.classify(2, stderr), (MISMATCH_REASON, EXIT_MISMATCH))
+
+    def test_marker_set_is_pinned(self):
+        got = tuple((reason, marker) for reason, _code, markers in self.mod.CLASSES for marker in markers)
+        self.assertEqual(sorted(got), sorted(EXPECTED_MARKERS))
+        self.assertEqual(tuple(reason for reason, _c, _m in self.mod.CLASSES), CLASS_ORDER)
+
+    def test_every_marker_alone_gets_its_class(self):
+        for reason, marker in EXPECTED_MARKERS:
+            with self.subTest(marker=marker):
+                self.assertEqual(self.mod.classify(2, f"psql: error: {marker}"), (reason, EXPECTED_CODE[reason]))
+
+    def test_role_missing_alone_is_a_mismatch(self):
+        stderr = 'FATAL:  role "ai_memory" does not exist'
+        self.assertEqual(self.mod.classify(2, stderr), (MISMATCH_REASON, EXIT_MISMATCH))
+
+    def test_check_order_is_mismatch_then_tls_then_unreachable(self):
+        by_reason = {MISMATCH_REASON: MISMATCH_CORPUS[0], TLS_REASON: TLS_CORPUS[0],
+                     UNREACHABLE_REASON: UNREACHABLE_CORPUS[0]}
+        for i, early in enumerate(CLASS_ORDER):
+            for late in CLASS_ORDER[i + 1:]:
+                for first, second in ((early, late), (late, early)):  # the winner is independent of print order
+                    with self.subTest(early=early, late=late, printed=first):
+                        stderr = by_reason[first] + "\n" + by_reason[second]
+                        self.assertEqual(self.mod.classify(2, stderr), (early, EXPECTED_CODE[early]))
+        # a missing client certificate also prints "No such file or directory": TLS wins over unreachable
+        both = TLS_CORPUS[-4] + "\n" + UNREACHABLE_CORPUS[-1]
+        self.assertEqual(self.mod.classify(2, both), (TLS_REASON, EXIT_UNAVAILABLE))
+        # role_missing is the mismatch class too, ahead of TLS
+        role = 'FATAL:  role "ai_memory" does not exist\n' + TLS_CORPUS[0]
+        self.assertEqual(self.mod.classify(2, role), (MISMATCH_REASON, EXIT_MISMATCH))
 
     def test_classify_is_linear_on_a_large_input(self):
         filler = "x" * LARGE_INPUT_BYTES
@@ -284,6 +428,72 @@ class TestMain(Scratch):
         self.assertIn(TIMEOUT_REASON, out)
         self.assert_no_secret(out, err)
 
+    def test_a_nonzero_exit_that_printed_the_answer_is_never_ok(self):
+        # S2: stdout "1" with a non-zero psql exit is a failure; only exit 0 AND the answer pass
+        self.fake("one-then-fail", stderr=OTHER_CORPUS[2])
+        code, out, err = self.run_main()
+        self.assertEqual(code, EXIT_UNAVAILABLE)
+        self.assertIn(OTHER_REASON, out)
+        self.assertNotIn("tier credential ok", out)
+        self.assert_no_secret(out, err)
+
+    def test_a_nonzero_exit_that_printed_the_answer_keeps_its_class(self):
+        self.fake("one-then-fail", stderr=MISMATCH_CORPUS[0])
+        code, out, err = self.run_main()
+        self.assertEqual(code, EXIT_MISMATCH)
+        self.assertIn(MISMATCH_REASON, out)
+        self.assertNotIn("tier credential ok", out)
+        self.assert_no_secret(out, err)
+
+    def test_a_psql_killed_by_a_signal_is_never_ok(self):
+        self.fake("one-then-signal")
+        code, out, err = self.run_main()
+        self.assertEqual(code, EXIT_UNAVAILABLE)
+        self.assertIn(OTHER_REASON, out)
+        self.assertIn(f"psql exited {SIGNAL_DEATH_RC}", out)
+        self.assertNotIn("tier credential ok", out)
+        self.assert_no_secret(out, err)
+
+    def test_a_timed_out_psql_does_not_survive(self):
+        self.fake("hang")
+        code, out, _err = self.run_main("--timeout", str(FAKE_TIMEOUT_SECONDS))
+        self.assertEqual(code, EXIT_UNAVAILABLE)
+        self.assertIn(TIMEOUT_REASON, out)
+        self.assertTrue(wait_gone(read_pid(self.record)), "psql outlived the pre-flight timeout")
+
+    def _run_and_signal(self, signum):
+        """Start the helper as a process, wait for the fake psql to run, send ``signum``; return (rc, stdout, pid)."""
+        self.fake("hang")
+        env = {k: v for k, v in os.environ.items() if k in ("PATH", "HOME", "LANG")}
+        env["RUNNER_NAME"] = "runner-x"
+        proc = subprocess.Popen([sys.executable, "-I", str(HELPER_PATH), "--url-file", str(self.url_file),
+                                 "--psql", str(self.psql)], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, start_new_session=True)
+        self.addCleanup(lambda: proc.poll() is None and os.killpg(proc.pid, signal.SIGKILL))
+        pid_file = Path(str(self.record) + ".pid")
+        deadline = time.monotonic() + PID_POLL_SECONDS
+        while not pid_file.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertTrue(pid_file.exists(), "the fake psql never started")
+        time.sleep(0.2)  # the pid file is written first; let the helper reach its wait
+        pid = read_pid(self.record)
+        self.addCleanup(kill_quietly, pid)
+        proc.send_signal(signum)
+        out, err = proc.communicate(timeout=PID_POLL_SECONDS * 2)
+        return proc.returncode, out, err, pid
+
+    def test_sigterm_and_sigint_leave_no_psql_behind(self):
+        # S1: an interrupted pre-flight must not orphan a psql that holds PGPASSWORD (sibling of #6252 / #6337)
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            with self.subTest(signal=signum.name):
+                rc, out, err, pid = self._run_and_signal(signum)
+                self.assertEqual(rc, EXIT_UNAVAILABLE)
+                self.assertIn(INTERRUPTED_REASON, out)
+                self.assertTrue(wait_gone(pid), f"psql {pid} survived {signum.name}")
+                self.assert_no_secret(out, err)
+                for leftover in self.dir.glob("record.json*"):
+                    leftover.unlink()
+
     def test_the_password_travels_in_pgpassword_never_argv(self):
         import json
         os.environ["PGSERVICE"] = "x"  # a caller PG* variable must not reach psql
@@ -336,6 +546,9 @@ class TestWiring(unittest.TestCase):
         call_block = "          if ! python3 -I scripts/ci/tier_cred_preflight.py --url-file \"$url_file\"; then\n" \
                      "            exit 1\n          fi\n"
         self.assertIn(call_block, text)
+        wrap = lambda head, tail="fi": head + "\n" + call_block + "          " + tail + "\n"  # noqa: E731
+        first_line = "          url_file=\"$HOME/.ai-memory-ci-fed-url\"\n"
+        self.assertIn(first_line, text)
         mutants = {
             "removed": text.replace(call_block, ""),
             "or-true": text.replace(call_block, call_block.replace("exit 1", "true")),
@@ -343,8 +556,29 @@ class TestWiring(unittest.TestCase):
                                          "python3 scripts/ci/tier_cred_preflight.py"),
             "after-create": text.replace(call_block, "").replace(
                 "          # Rewrite the base URL's db-name", call_block + "          # Rewrite the base URL's db-name", 1),
-            "node-guarded": text.replace(call_block, '          if [ "${CI_NODE:-}" = "macos-fed" ]; then\n'
-                                         + call_block + "          fi\n"),
+            "node-guarded": text.replace(call_block, wrap('          if [ "${CI_NODE:-}" = "macos-fed" ]; then')),
+            "os-guarded": text.replace(call_block, wrap('          if [ "${RUNNER_OS:-}" = "macOS" ]; then')),
+            "leg-guarded": text.replace(call_block, wrap('          if [ "$LEG" = "linux-fed" ]; then')),
+            "runner-guarded": text.replace(call_block, wrap('          if [ -n "${RUNNER_NAME:-}" ]; then')),
+            "else-branch": text.replace(call_block, wrap('          if [ -z "${CI_PG_ISOLATE_OFF:-}" ]; then\n'
+                                                         "            :\n          else")),
+            "case-wrapped": text.replace(call_block, wrap('          case "$LEG" in\n            *) ', "  ;;\n          esac")),
+            "for-wrapped": text.replace(call_block, wrap('          for _ in 1; do', "done")),
+            "brace-wrapped": text.replace(call_block, wrap("          {", "}")),
+            "guard-far-above": text.replace(first_line, '          if [ "${CI_PG_ISOLATE_OFF:-}" != "1" ]; then\n'
+                                            + first_line).replace(call_block, call_block + "          fi\n"),
+            "early-exit-above": text.replace(call_block, '          if [ "$LEG" = "x" ]; then\n            exit 0\n'
+                                             "          fi\n" + call_block),
+            "and-exit-above": text.replace(call_block, '          [ "$LEG" = "x" ] && exit 0\n' + call_block),
+            "return-above": text.replace(call_block, '          if [ "$LEG" = "x" ]; then\n            return 0\n'
+                                         "          fi\n" + call_block),
+            "step-if-narrowed": text.replace(
+                "if: needs.classify.outputs.cargo_skip != 'true' && matrix.tier == 'enterprise-fed'\n        shell: bash",
+                "if: needs.classify.outputs.cargo_skip != 'true' && matrix.tier == 'enterprise-fed' && "
+                "matrix.node != 'macos-fed'\n        shell: bash"),
+            "continue-on-error": text.replace("        shell: bash\n        env:\n          # matrix.leg via env",
+                                              "        shell: bash\n        continue-on-error: true\n        env:\n"
+                                              "          # matrix.leg via env"),
         }
         for name, mutant in mutants.items():
             with self.subTest(mutant=name):
