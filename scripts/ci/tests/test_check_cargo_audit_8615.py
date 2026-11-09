@@ -32,6 +32,10 @@ EXCEPTIONS = [
     {"id": "RUSTSEC-2024-0449", "package": "unsafe-libyaml", "version": "0.2.11",
      "issue": 8476, "expires": date(2027, 2, 3), "reason": "YAML parser replacement tracked."},
 ]
+# #8695: tracked in the policy files only; the report fixtures predate the advisory.
+POLICY_ONLY_8695 = ("RUSTSEC-2026-0459", "libsqlite3-sys", "0.30.1", 8695)
+REASON_TERMS_8695 = ("-wal", "page size", "migrate --from", "restore", "local", "links", "sqlcipher",
+                     "libsqlite3-sys >= 0.39", "Not mitigated")
 
 
 def policy_documents(ignored=None, entries=None):
@@ -283,12 +287,22 @@ class CargoAudit8615Tests(unittest.TestCase):
         identities = [(entry["id"], entry["package"], entry["version"], entry["issue"])
                       for entry in entries]
         expected = [(entry["id"], entry["package"], entry["version"], entry["issue"])
-                    for entry in EXCEPTIONS]
+                    for entry in EXCEPTIONS] + [POLICY_ONLY_8695]
         self.assertEqual(identities, expected)
         GATE.exception_index(entries, TODAY)
         for entry in entries:
             self.assertLessEqual(entry["expires"], date(2027, 2, 3))
         self.assertFalse((ROOT / "scripts/ci/cargo_audit_allowlist.json").exists())
+
+    def test_8695_libsqlite3_sys_exception_carries_issue_expiry_and_reason(self):
+        entries = {entry["id"]: entry for entry in GATE.load_policy()}
+        entry = entries["RUSTSEC-2026-0459"]
+        self.assertEqual((entry["package"], entry["version"], entry["issue"]), POLICY_ONLY_8695[1:])
+        self.assertEqual(entry["expires"], date(2027, 2, 3))
+        for term in REASON_TERMS_8695:
+            self.assertIn(term, entry["reason"], term)
+        ignored = tomllib.loads(GATE.POLICY.read_text())["advisories"]["ignore"]
+        self.assertIn("RUSTSEC-2026-0459", ignored)
 
     def test_8615_cargo_audit_schema_and_sibling_metadata(self):
         policy = tomllib.loads(GATE.POLICY.read_text())
