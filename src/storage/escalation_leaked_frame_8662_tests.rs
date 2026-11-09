@@ -514,6 +514,18 @@ const PROBE_INSERT_FAILURES: &[(ProbeInsertFailure, &str, i64)] = &[
     (ProbeInsertFailure::RefusingTrigger, REFUSING_TRIGGER_MSG, 0),
 ];
 
+/// SQLite's own message carried by the `rusqlite` error in `error`'s chain,
+/// or the whole chain when there is none (so a mismatch shows what came back).
+fn sqlite_message(error: &anyhow::Error) -> String {
+    error
+        .chain()
+        .find_map(|cause| match cause.downcast_ref::<rusqlite::Error>() {
+            Some(rusqlite::Error::SqliteFailure(_, Some(message))) => Some(message.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| format!("{error:#}"))
+}
+
 /// Code F4 (#8707) - a failed INSERT inside the probe transaction returns
 /// its error, writes nothing, leaves the connection in autocommit (the probe
 /// was rolled back) and restores busy_timeout. `rows` is the count of rows
@@ -552,7 +564,7 @@ fn issue_8707_failed_insert_inside_probe_txn_rolls_back() {
                     conn,
                     intent(PROBE_FAILURE_ID),
                 )
-                .map_or_else(|e| e.root_cause().to_string(), |()| "Ok".to_owned());
+                .map_or_else(|e| sqlite_message(&e), |()| "Ok".to_owned());
                 (
                     error,
                     conn.is_autocommit(),
@@ -560,7 +572,7 @@ fn issue_8707_failed_insert_inside_probe_txn_rolls_back() {
                     is_deferred(PROBE_FAILURE_ID),
                 )
             });
-        assert_eq!(error, message, "{failure:?}: root cause of the error");
+        assert_eq!(error, message, "{failure:?}: SQLite message of the error");
         assert!(autocommit, "{failure:?}: probe transaction left open");
         assert_eq!(timeout, WRITER_BUSY_TIMEOUT_MS, "{failure:?}: busy_timeout");
         assert!(!deferred, "{failure:?}: intent parked in a dead frame");
