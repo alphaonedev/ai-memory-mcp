@@ -350,6 +350,10 @@ fn escape_toon(s: &str) -> String {
 }
 
 #[cfg(test)]
+#[path = "toon_principal_cell_8684_tests.rs"]
+mod principal_cell_8684_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::models::Tier;
@@ -494,11 +498,20 @@ mod tests {
             }],
             "count": 1
         });
+        // #8443 sec M2: with no reader there is no owner, so the lone author
+        // is named in the content_principal cell after the agent_id cell.
         let toon = memories_to_toon(&resp, true);
         let row = toon.lines().last().unwrap();
         assert!(
+            row.ends_with("|alice|alice"),
+            "agent_id precedes the content_principal column; row: {row}"
+        );
+        // The reader's own unmarked row is owner content: an empty cell.
+        let toon = memories_to_toon_for(&resp, true, Some("alice"));
+        let row = toon.lines().last().unwrap();
+        assert!(
             row.ends_with("|alice|"),
-            "agent_id precedes the (empty) content_principal column; row: {row}"
+            "the reader's own row has an empty content_principal cell; row: {row}"
         );
     }
 
