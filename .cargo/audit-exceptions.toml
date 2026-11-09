@@ -20,7 +20,7 @@ reason = "No patched release exists; replacing the YAML dependency is tracked in
 id = "RUSTSEC-2026-0459"
 package = "libsqlite3-sys"
 version = "0.30.1"
-issue = 8695
+issue = 8696
 expires = 2027-02-03
-reason = "Not mitigated: a database file opened with a sibling -wal of a different page size can expose uninitialized memory; precondition is an operator-supplied database plus mismatched -wal, local-only, reached via migrate --from or restore; no fixed release is usable (sqlx links=sqlite3 conflicts with libsqlite3-sys >= 0.39, the sqlcipher feature has no upstream fix); removal trigger: an sqlx release accepting libsqlite3-sys >= 0.39, tracked in #8695."
+reason = "Not mitigated: a database file opened with a sibling -wal of a different page size can expose uninitialized memory; precondition is an operator-supplied database plus mismatched -wal, local-only, reached whenever an operator-supplied database pair is opened (any SqliteStore::open or db::open of an operator-chosen file, including the plain --db open, migrate --from and restore); no fixed release is usable (sqlx links=sqlite3 conflicts with libsqlite3-sys >= 0.39, the sqlcipher feature has no upstream fix); removal trigger: an sqlx release accepting libsqlite3-sys >= 0.39, tracked in #8696; code guard #8697."
 
