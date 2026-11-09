@@ -586,6 +586,10 @@ pub fn insert_pending_action_row(
 mod reporting_tests;
 
 #[cfg(test)]
+#[path = "escalation_leaked_frame_8662_tests.rs"]
+mod leaked_frame_8662_tests;
+
+#[cfg(test)]
 mod tests {
     /// #7241 L1 - an anchor handed to a funnel that runs in a raw transaction
     /// with no `WriteTxn` frame is dropped; a debug or test build must trip a
