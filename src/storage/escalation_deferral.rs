@@ -217,7 +217,33 @@ thread_local! {
     /// Test seam: fail open-time raw report writes without touching stderr.
     #[cfg(test)]
     static FORCE_REPORT_WRITE_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Test seam (#8707): panic inside the #8662 probe transaction, after its
+    /// `BEGIN IMMEDIATE` succeeded and before the pending row is written.
+    #[cfg(test)]
+    static FORCE_PROBE_PANIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
+
+/// The panic message of the [`FORCE_PROBE_PANIC`] seam.
+#[cfg(test)]
+pub(crate) const MSG_FORCED_PROBE_PANIC: &str = "#8707: forced panic inside the probe transaction";
+
+/// Test seam (#8707): make the next probe transactions on this thread panic
+/// after their BEGIN, so a cell can prove the unwind rolls them back.
+#[cfg(test)]
+pub(crate) fn force_probe_panic_for_test(on: bool) {
+    FORCE_PROBE_PANIC.with(|f| f.set(on));
+}
+
+#[cfg(test)]
+fn panic_if_probe_panic_forced() {
+    assert!(
+        !FORCE_PROBE_PANIC.with(std::cell::Cell::get),
+        "{MSG_FORCED_PROBE_PANIC}"
+    );
+}
+
+#[cfg(not(test))]
+fn panic_if_probe_panic_forced() {}
 
 static NEXT_FRAME_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -551,6 +577,7 @@ fn insert_intent(conn: &Connection, intent: &DeferredEscalation) -> Result<()> {
 /// The row either exists when this returns `Ok`, or the error is returned and
 /// the probe transaction is rolled back.
 fn insert_in_probe_txn(conn: &Connection, intent: &DeferredEscalation) -> Result<()> {
+    panic_if_probe_panic_forced();
     let written = insert_intent(conn, intent).and_then(|()| {
         conn.execute_batch(super::connection::SQL_COMMIT)
             .map_err(anyhow::Error::from)
