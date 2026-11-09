@@ -23,6 +23,7 @@
 //! `memory_capture_turn` MCP tool). Closes the #1388 substrate
 //! failure mode at the storage layer.
 
+use super::embed_skip::{self, TRIGGER_CLEAR_ON_CONTENT, TRIGGER_CLEAR_ON_EMBED};
 use super::snapshot_file;
 use crate::models::field_names;
 use anyhow::{Context, Result};
@@ -1855,6 +1856,29 @@ fn migrate_v100(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn clear_trigger_count(conn: &Connection) -> rusqlite::Result<i64> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name IN (?1, ?2)",
+        params![TRIGGER_CLEAR_ON_CONTENT, TRIGGER_CLEAR_ON_EMBED],
+        |row| row.get(0),
+    )
+}
+
+/// #4078 / #8679 - run the trigger-gap repair under the writer lock; it stays
+/// here, the only caller module (#4324 pin). `true` when it ran, `false` when
+/// a racing open repaired first: the gap is re-probed UNDER the lock because
+/// the repair also clears the derived `embed_skip` cache. A lock, probe, DDL
+/// or commit failure propagates and the guard rolls back (ERRORS-02).
+pub(super) fn repair_under_writer_lock(conn: &Connection) -> Result<bool> {
+    let repair_txn = super::connection::WriteTxn::begin_exclusive(conn)?;
+    if clear_trigger_count(conn).context("re-probe the embed_skip clear triggers")? == 2 {
+        return Ok(false);
+    }
+    embed_skip::repair_sqlite_after_trigger_gap(conn)?;
+    repair_txn.commit()?;
+    Ok(true)
+}
+
 // COVERAGE: per-version ALTER/CREATE branches inside this function
 // are guarded by `has_X` column-existence probes and `IF NOT EXISTS`
 // markers. When the canonical SCHEMA constant already ships a target
@@ -1920,14 +1944,7 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
         // #4078: older binaries stamped v100 after dropping the v96 clear
         // triggers. Repair that derived state even when no ladder runs.
         // Probe first so a healthy store does not take another writer lock.
-        let clear_trigger_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name IN (?1, ?2)",
-            params![
-                crate::storage::embed_skip::TRIGGER_CLEAR_ON_CONTENT,
-                crate::storage::embed_skip::TRIGGER_CLEAR_ON_EMBED,
-            ],
-            |row| row.get(0),
-        )?;
+        let clear_trigger_count = clear_trigger_count(conn)?;
         if clear_trigger_count != 2 {
             // #8677: the repair mutates the database, so the safety-snapshot
             // contract holds here too (from == to: the schema does not move).
@@ -1944,7 +1961,7 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             }
             // ERRORS-02: propagate DDL/commit failures; the guard rolls back
             // both definitions together if repair cannot complete.
-            crate::storage::embed_skip::repair_under_writer_lock(conn)?;
+            repair_under_writer_lock(conn)?;
         }
         return Ok(());
     }

@@ -114,7 +114,7 @@ fn repair_is_skipped_when_a_racing_open_already_repaired_8679() {
     assert_eq!(clear_trigger_count(&conn), 2, "healthy store");
     // The caller's pre-lock probe saw a gap; by the time it holds the lock the
     // racing open has repaired. The re-probe under the lock must skip.
-    let repaired = embed_skip::repair_under_writer_lock(&conn).expect("lock + re-probe");
+    let repaired = migrations::repair_under_writer_lock(&conn).expect("lock + re-probe");
     assert!(!repaired, "healthy under the lock: repair must be skipped");
     assert_eq!(
         skip_rows(&conn),
@@ -135,7 +135,7 @@ fn repair_runs_when_the_gap_is_still_present_under_the_lock_8679() {
             .expect("open the gap");
     }
     assert_eq!(clear_trigger_count(&conn), 0);
-    let repaired = embed_skip::repair_under_writer_lock(&conn).expect("repair");
+    let repaired = migrations::repair_under_writer_lock(&conn).expect("repair");
     assert!(repaired, "gap still present: repair must run");
     assert_eq!(clear_trigger_count(&conn), 2, "triggers reinstalled");
     assert_eq!(skip_rows(&conn), 0, "stale cache cleared with the repair");

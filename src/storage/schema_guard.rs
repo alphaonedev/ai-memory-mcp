@@ -304,9 +304,9 @@ impl fmt::Display for SchemaAheadOfBinary {
 impl std::error::Error for SchemaAheadOfBinary {}
 
 /// Selector that points the CLI at a sqlite backup copy.
-const COPY_SELECTOR_SQLITE: &str = "--db <copy>";
+pub const COPY_SELECTOR_SQLITE: &str = "--db <copy>";
 /// Selector that points the CLI at a postgres backup copy (#8679).
-const COPY_SELECTOR_POSTGRES: &str = "--store-url <copy-url>";
+pub const COPY_SELECTOR_POSTGRES: &str = "--store-url <copy-url>";
 
 /// Render the operator-facing refusal. The single text every entry path
 /// (CLI, MCP, daemon, boot hook) prints; the backup-copy selector is the one
@@ -682,26 +682,28 @@ pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// Run `f` with the schema-ahead hatch set to `value` (or removed) under the
+/// shared env lock, then remove it. The one in-crate hatch mutator, so a
+/// test elsewhere in the lib binary never mutates the env itself (#3475).
+#[cfg(test)]
+pub(crate) fn with_hatch<T>(value: Option<&str>, f: impl FnOnce() -> T) -> T {
+    let _g = test_env_lock();
+    // SAFETY: process-wide env mutation, serialised by `_g`.
+    unsafe {
+        match value {
+            Some(v) => std::env::set_var(ENV_ALLOW_SCHEMA_AHEAD, v),
+            None => std::env::remove_var(ENV_ALLOW_SCHEMA_AHEAD),
+        }
+    }
+    let out = f();
+    // SAFETY: as above.
+    unsafe { std::env::remove_var(ENV_ALLOW_SCHEMA_AHEAD) };
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    use super::test_env_lock as env_lock;
-
-    fn with_hatch<T>(value: Option<&str>, f: impl FnOnce() -> T) -> T {
-        let _g = env_lock();
-        // SAFETY: process-wide env mutation, serialised by `_g`.
-        unsafe {
-            match value {
-                Some(v) => std::env::set_var(ENV_ALLOW_SCHEMA_AHEAD, v),
-                None => std::env::remove_var(ENV_ALLOW_SCHEMA_AHEAD),
-            }
-        }
-        let out = f();
-        // SAFETY: as above.
-        unsafe { std::env::remove_var(ENV_ALLOW_SCHEMA_AHEAD) };
-        out
-    }
 
     /// #8679 F2 - the copy-advice clause names the selector of the backend
     /// that produced the refusal. `--db` selects a sqlite file only; a

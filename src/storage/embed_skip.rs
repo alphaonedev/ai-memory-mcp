@@ -72,8 +72,6 @@ pub const TRIGGER_CLEAR_ON_CONTENT: &str = "memories_embed_skip_clear_on_content
 /// `memories` table that has not yet grown that column (v3 ALTER;
 /// bootstrap `SCHEMA` does not carry `embedding`).
 pub const TRIGGER_CLEAR_ON_EMBED: &str = "memories_embed_skip_clear_on_embed";
-/// Clear triggers a healthy sqlite store carries (content edit + embedding write).
-const HEALTHY_CLEAR_TRIGGER_COUNT: i64 = 2;
 
 const SQL_DROP_CLEAR_TRIGGERS: &str = "\
 DROP TRIGGER IF EXISTS memories_embed_skip_clear_on_content;\n\
@@ -171,35 +169,6 @@ pub(super) fn repair_sqlite_after_trigger_gap(conn: &Connection) -> Result<()> {
     conn.execute("DELETE FROM embed_skip", [])
         .context("clear embed_skip cache after the trigger gap")?;
     Ok(())
-}
-
-/// #4078 / #8679 - run the trigger-gap repair under the writer lock.
-///
-/// Returns `true` when the repair ran and committed, `false` when a racing
-/// open already repaired the store. The caller probed the clear-trigger count
-/// BEFORE taking the lock; the repair also clears the derived `embed_skip`
-/// cache, so the gap is re-probed UNDER the lock and a healthy store is left
-/// untouched.
-///
-/// # Errors
-///
-/// Propagates the lock, probe, DDL or commit failure; the guard rolls back
-/// (ERRORS-02).
-pub(crate) fn repair_under_writer_lock(conn: &Connection) -> Result<bool> {
-    let repair_txn = super::connection::WriteTxn::begin_exclusive(conn)?;
-    let present: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name IN (?1, ?2)",
-            rusqlite::params![TRIGGER_CLEAR_ON_CONTENT, TRIGGER_CLEAR_ON_EMBED],
-            |row| row.get(0),
-        )
-        .context("re-probe the embed_skip clear triggers under the writer lock")?;
-    if present == HEALTHY_CLEAR_TRIGGER_COUNT {
-        return Ok(false);
-    }
-    repair_sqlite_after_trigger_gap(conn)?;
-    repair_txn.commit()?;
-    Ok(true)
 }
 
 /// Why a row was remembered as unembeddable. A descriptive enum, not a
