@@ -194,7 +194,8 @@ class Scratch(unittest.TestCase):
     def assert_no_secret(self, *texts):
         for t in texts:
             self.assertNotIn(PASSWORD, t)
-            self.assertNotIn("postgres://", t)
+            self.assertNotIn("://" + USER, t)  # no URL (the scheme name alone may appear in a refusal)
+            self.assertNotIn("@127.0.0.1", t)
             self.assertNotIn("pw=", t)  # the fake's stderr is never relayed
 
 
@@ -332,8 +333,8 @@ class TestWiring(unittest.TestCase):
 
     def test_the_wiring_check_rejects_each_mutant(self):
         text = CI_YML.read_text()
-        call_block = "            if ! python3 -I scripts/ci/tier_cred_preflight.py --url-file \"$url_file\"; then\n" \
-                     "              exit 1\n            fi\n"
+        call_block = "          if ! python3 -I scripts/ci/tier_cred_preflight.py --url-file \"$url_file\"; then\n" \
+                     "            exit 1\n          fi\n"
         self.assertIn(call_block, text)
         mutants = {
             "removed": text.replace(call_block, ""),
@@ -342,8 +343,8 @@ class TestWiring(unittest.TestCase):
                                          "python3 scripts/ci/tier_cred_preflight.py"),
             "after-create": text.replace(call_block, "").replace(
                 "          # Rewrite the base URL's db-name", call_block + "          # Rewrite the base URL's db-name", 1),
-            "node-guarded": text.replace(call_block, '            if [ "${CI_NODE:-}" = "macos-fed" ]; then\n'
-                                         + call_block + "            fi\n"),
+            "node-guarded": text.replace(call_block, '          if [ "${CI_NODE:-}" = "macos-fed" ]; then\n'
+                                         + call_block + "          fi\n"),
         }
         for name, mutant in mutants.items():
             with self.subTest(mutant=name):
