@@ -349,8 +349,6 @@ pre-configured vendor aliases.
 | `xai` | `https://api.x.ai/v1` | `XAI_API_KEY` |
 | `anthropic` | `https://api.anthropic.com/v1` | `ANTHROPIC_API_KEY` |
 | `gemini` | `https://generativelanguage.googleapis.com/v1beta/openai` | `GEMINI_API_KEY`, `GOOGLE_API_KEY` |
-| `kimi` (= `moonshot`) | `https://api.moonshot.cn/v1` | `MOONSHOT_API_KEY`, `KIMI_API_KEY` |
-| `qwen` (= `dashscope`) | `https://dashscope.aliyuncs.com/compatible-mode/v1` | `DASHSCOPE_API_KEY`, `QWEN_API_KEY` |
 | `mistral` | `https://api.mistral.ai/v1` | `MISTRAL_API_KEY` |
 | `groq` | `https://api.groq.com/openai/v1` | `GROQ_API_KEY` |
 | `together` | `https://api.together.xyz/v1` | `TOGETHER_API_KEY` |
@@ -372,8 +370,7 @@ pre-configured vendor aliases.
   Treated as **secret** (never echoed in capabilities / banners / audit
   rows).
 - `AI_MEMORY_LLM_MODEL` — model identifier passed through verbatim.
-  Vendor-specific (e.g. `grok-4` for xAI, `qwen-max` for Qwen,
-  `gemma3:4b` for Ollama).
+  Vendor-specific (e.g. `grok-4` for xAI, `gemma3:4b` for Ollama).
 
 **Tier independence.** The substrate's tier no longer dictates which
 vendor speaks. Pre-#1067 the autonomous tier required local Ollama,

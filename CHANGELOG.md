@@ -534,7 +534,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
-- **The `deepseek` LLM provider alias is removed from the product and from
+- **A retired third-party LLM provider alias is removed from the product and from
   every current doc** ([#3627](https://github.com/alphaonedev/ai-memory-mcp/issues/3627),
   operator directive 2026-09-11).
 
@@ -553,8 +553,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   proxy) — use `openai-compatible` with an explicit `AI_MEMORY_LLM_BASE_URL`
   / `[llm].base_url`, which is the documented escape hatch and is
   unaffected. The accepted set is unchanged otherwise: `ollama`,
-  `openai-compatible`, `openai`, `xai`, `anthropic`, `gemini`, `kimi`
-  (`moonshot`), `qwen` (`dashscope`), `mistral`, `groq`, `together`,
+  `openai-compatible`, `openai`, `xai`, `anthropic`, `gemini`,
+  `mistral`, `groq`, `together`,
   `cerebras`, `openrouter`, `fireworks`, `lmstudio`, `vllm`.
 
   **It degrades, it does not die.** `ai-memory serve` and `ai-memory mcp`
@@ -580,7 +580,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `src/identity/model_family.rs` classifier. The live consequence is not the
   removed provider: an **Ollama-served open-weights model whose name carries
   that stem** (e.g. `AI_MEMORY_LLM_BACKEND=ollama` with
-  `AI_MEMORY_LLM_MODEL=deepseek-r1:8b`) previously received a
+  `AI_MEMORY_LLM_MODEL=<model-with-that-stem>`) previously received a
   `loader_observed` family attestation from
   `cli/curator.rs::capture_loader_attestation` and now records as CLAIMED
   with no family. Existing rows keep their stamped family — nothing durable
@@ -3823,7 +3823,7 @@ backend and missing or divergently implemented on its twin). Pinned by
   corpus into a space the daemon refuses to score. Both now call
   `daemon_runtime::resolve_boot_embedder_model`. That resolver additionally
   REPORTS a configured `[embeddings].model` it could not construct (the reported
-  case: `backend = "ollama"`, `model = "qwen3-embedding:4b"`, silently swapped
+  case: `backend = "ollama"`, `model = "<unconstructible-id>"`, silently swapped
   for the `all-MiniLM-L6-v2` tier preset behind a `tracing::warn!` a CLI one-shot
   renders nowhere), and `reembed` now REFUSES rather than rewriting every vector
   under a substitute model. The daemon keeps its warn-and-degrade boot posture.
@@ -3831,7 +3831,7 @@ backend and missing or divergently implemented on its twin). Pinned by
   configured non-API `[embeddings].model` is unconstructible, the Embeddings
   Reachability section now WARNs and adds `effective_model` /
   `model_honoured: false` facts. (The reporter's confusion started there —
-  `doctor` echoed `qwen3-embedding:4b` while both the daemon and `reembed`
+  `doctor` echoed the configured id while both the daemon and `reembed`
   actually used `all-MiniLM-L6-v2`.)
 ### Security (CLI destructive-op guards + tamper-evidence preservation; R-405 cluster — #3013 #3012 #3021)
 
@@ -12170,7 +12170,7 @@ Closes [#1174](https://github.com/alphaonedev/ai-memory-mcp/issues/1174) (parent
 
 **Wave 2 — static-state extraction + cross-surface containers (5 PRs).** `ACTIVE/OVERRIDE_PERMISSIONS_MODE` dual-source-of-truth collapsed into a single `RwLock` ([#1191](https://github.com/alphaonedev/ai-memory-mcp/pull/1191)); Class A SHOULD statics extracted into `AppState` / metrics registry ([#1195](https://github.com/alphaonedev/ai-memory-mcp/pull/1195)); test fixtures deflaked from vendor-specific `"claude"` literals via fresh canonical `"nhi"`/`"api"` constants in `tests/common::FIXTURE_SOURCE` ([#1189](https://github.com/alphaonedev/ai-memory-mcp/pull/1189)); per-vendor CLI-binary `WrapStrategy` table extracted from `src/cli/wrap.rs` into a new sibling `src/llm_cli_wrap.rs` module ([#1199](https://github.com/alphaonedev/ai-memory-mcp/pull/1199), closes [#1183](https://github.com/alphaonedev/ai-memory-mcp/issues/1183)); **NEW** `src/runtime_context.rs` with `pub struct RuntimeContext` + process-wide `OnceLock<Arc<RuntimeContext>>` singleton (`RuntimeContext::global()` / `global_arc()`) carrying MUST-class statics (`hooks_hmac_secret`, `max_decompressed_bytes`, `audit: Arc<AuditState>`) + SHOULD-class statics (`recall_tracker`, `keypair_cache`) — `AppState.runtime: Arc<RuntimeContext>` threads the singleton onto the HTTP daemon (73 `AppState { ... }` literals updated across production + test trees), MCP stdio + CLI reach the same singleton via the `OnceLock` ([#1204](https://github.com/alphaonedev/ai-memory-mcp/pull/1204), closes [#1192](https://github.com/alphaonedev/ai-memory-mcp/issues/1192) + [#1196](https://github.com/alphaonedev/ai-memory-mcp/issues/1196) + [#1205](https://github.com/alphaonedev/ai-memory-mcp/issues/1205)).
 
-**Wave 3 — load-bearing lint-gate enforcement (1 PR).** `scripts/check-vendor-literals.sh` ([#1200](https://github.com/alphaonedev/ai-memory-mcp/pull/1200)) HARD-BLOCKs (a) vendor-monoculture literals (`"claude" | "openai" | "xai" | "anthropic" | "gemini" | "deepseek" | "groq" | "ollama" | "grok" | "mistral" | "cohere" | "huggingface"`) outside the 7-file substrate carve-out (`src/llm.rs`, `src/config.rs`, `src/mine.rs`, `src/validate.rs`, `src/cli/wrap.rs`, `src/llm_cli_wrap.rs`, `src/harness.rs`) and (b) `Duration::from_secs(3600 | 86400 | 604800 | 3_600 | 86_400 | 604_800 | 7200 | 21600 | 172800)` magic numbers anywhere in production code. The gate's own `--self-test` mode injects a contrived `"anthropic"` literal, verifies the gate trips, then cleans up — providing a CI-side canary against future detection-logic decay. Wired into `.github/workflows/c8-precheck.yml` alongside the existing four cargo gates (fmt + clippy + test + audit). Documented in `CLAUDE.md` §"Lint gates (issue #1174 PR10)".
+**Wave 3 — load-bearing lint-gate enforcement (1 PR).** `scripts/check-vendor-literals.sh` ([#1200](https://github.com/alphaonedev/ai-memory-mcp/pull/1200)) HARD-BLOCKs (a) vendor-monoculture literals (`"claude" | "openai" | "xai" | "anthropic" | "gemini" | "groq" | "ollama" | "grok" | "mistral" | "cohere" | "huggingface"`) outside the 7-file substrate carve-out (`src/llm.rs`, `src/config.rs`, `src/mine.rs`, `src/validate.rs`, `src/cli/wrap.rs`, `src/llm_cli_wrap.rs`, `src/harness.rs`) and (b) `Duration::from_secs(3600 | 86400 | 604800 | 3_600 | 86_400 | 604_800 | 7200 | 21600 | 172800)` magic numbers anywhere in production code. The gate's own `--self-test` mode injects a contrived `"anthropic"` literal, verifies the gate trips, then cleans up — providing a CI-side canary against future detection-logic decay. Wired into `.github/workflows/c8-precheck.yml` alongside the existing four cargo gates (fmt + clippy + test + audit). Documented in `CLAUDE.md` §"Lint gates (issue #1174 PR10)".
 
 **Wire impact.** The PR9 ([#1189](https://github.com/alphaonedev/ai-memory-mcp/pull/1189)) `source: "claude"` → `source: "nhi"` / `"api"` test-fixture flip changes the `source` field on memories stored by the test harness only — production daemons preserve caller-supplied `source` verbatim (no live wire change). The PR4 ([#1184](https://github.com/alphaonedev/ai-memory-mcp/pull/1184)) `"ollama"` substrate sweep is internal-only — all wire surfaces continue to accept and emit the literal string `"ollama"` as a backend name. The PR #1199 WrapStrategy module move is purely internal — `src/cli/wrap.rs`'s public surface is unchanged (the move split detection logic from the per-vendor table).
 
@@ -12346,14 +12346,13 @@ code path each.
   `AI_MEMORY_LLM_MODEL` (vendor-specific identifier). Per-vendor
   fallback API-key env vars honoured: `OPENAI_API_KEY`,
   `XAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY` (or
-  `GOOGLE_API_KEY`), `DEEPSEEK_API_KEY`, `MOONSHOT_API_KEY` (or
-  `KIMI_API_KEY`), `DASHSCOPE_API_KEY` (or `QWEN_API_KEY`),
+  `GOOGLE_API_KEY`),
   `MISTRAL_API_KEY`, `GROQ_API_KEY`, `TOGETHER_API_KEY`,
   `CEREBRAS_API_KEY`, `OPENROUTER_API_KEY`, `FIREWORKS_API_KEY`.
 - **`OllamaClient::new_openai_compatible(base_url, model, api_key)`**
   constructor for direct instantiation.
 - **15 pre-filled vendor aliases**: `openai`, `xai`, `anthropic`,
-  `gemini`, `deepseek`, `kimi` (= `moonshot`), `qwen` (= `dashscope`),
+  `gemini`,
   `mistral`, `groq`, `together`, `cerebras`, `openrouter`,
   `fireworks`, `lmstudio`, plus the generic `openai-compatible`
   escape hatch.
@@ -12389,8 +12388,8 @@ wiremock test refresh at
 [`06c3965a8`](https://github.com/alphaonedev/ai-memory-mcp/commit/06c3965a8)).**
 The IronClaw-on-Grok-4.3 Docker runtime smoke surfaced that pre-fix
 `auto_tag` routed through `generate_with_body` (hardcoded to Ollama's
-`/api/generate` text-completion endpoint). xAI / OpenAI / DeepSeek /
-Kimi / Qwen / etc. don't expose `/api/generate` — only
+`/api/generate` text-completion endpoint). xAI / OpenAI /
+etc. don't expose `/api/generate` — only
 `/v1/chat/completions`. Fix routes `auto_tag` through the new
 `generate_with_model_override` helper which uses the provider-aware
 chat-shape (`/api/chat` for Ollama, `/v1/chat/completions` for

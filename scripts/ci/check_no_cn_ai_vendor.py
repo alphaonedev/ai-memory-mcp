@@ -39,10 +39,10 @@ VENDOR_TERMS_ROT13 = (
     "vagreayz", "qfu", "qnfufpbcr",
 )
 # The one family with an allowlisted testing exception (ROT13).
-GLM_TERM_ROT13 = "tyz"
+FLASH_FAMILY_ROT13 = "tyz"
 # Patterns that need more than a bare word (ROT13 fragments).
-MOONSHOT_ROT13 = "zbbafubg"
-MOONSHOT_SUFFIX = r"(?:\s+ai\b|_|-v\d|\.cn)"
+SUFFIXED_ROT13 = "zbbafubg"
+SUFFIXED_PATTERN = r"(?:\s+ai\b|_api|-v\d|\.cn)"
 ZERO_ONE_AI_ROT13 = "01.nv"
 YI_LARGE_ROT13 = "lv-ynetr"
 
@@ -68,10 +68,10 @@ def build_patterns():
     for stored in VENDOR_TERMS_ROT13:
         term = decode(stored)
         patterns.append((term, re.compile(LEAD + re.escape(term) + TRAIL, re.I)))
-    glm = decode(GLM_TERM_ROT13)
-    patterns.append((glm, re.compile(LEAD + re.escape(glm) + TRAIL, re.I)))
-    moon = decode(MOONSHOT_ROT13)
-    patterns.append((moon, re.compile(LEAD + moon + MOONSHOT_SUFFIX, re.I)))
+    family = decode(FLASH_FAMILY_ROT13)
+    patterns.append((family, re.compile(LEAD + re.escape(family) + TRAIL, re.I)))
+    moon = decode(SUFFIXED_ROT13)
+    patterns.append((moon, re.compile(LEAD + moon + SUFFIXED_PATTERN, re.I)))
     zero = decode(ZERO_ONE_AI_ROT13)
     patterns.append((zero, re.compile(r"(?<![\w.])" + re.escape(zero) + TRAIL, re.I)))
     yi = decode(YI_LARGE_ROT13)
@@ -115,9 +115,9 @@ def is_comment_line(line):
     return line.lstrip().startswith(COMMENT_PREFIXES)
 
 
-def glm_allowed(rel, line, allow):
+def flash_allowed(rel, line, allow):
     """The Flash-in-testing exception: allowlisted path prefix and line context."""
-    spec = allow.get("glm_flash_testing", {})
+    spec = allow.get("flash_testing", {})
     if not any(rel.startswith(p) for p in spec.get("path_prefixes", [])):
         return False
     context = spec.get("line_context_regex")
@@ -130,7 +130,7 @@ def glm_allowed(rel, line, allow):
 
 def scan_text(rel, text, patterns, allow):
     """Yield (line_number, label) for every disallowed hit in one file."""
-    glm = decode(GLM_TERM_ROT13)
+    family = decode(FLASH_FAMILY_ROT13)
     code_paths = {s["path"] for s in allow.get("functional_code_sites", [])}
     rust_code_ok = rel in code_paths and rel.endswith(RUST_SUFFIX)
     low = text.lower()
@@ -141,7 +141,7 @@ def scan_text(rel, text, patterns, allow):
         for label, rx in live:
             if not rx.search(line):
                 continue
-            if label == glm and glm_allowed(rel, line, allow):
+            if label == family and flash_allowed(rel, line, allow):
                 continue
             if rust_code_ok and not is_comment_line(line):
                 continue

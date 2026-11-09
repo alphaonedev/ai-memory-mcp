@@ -1,13 +1,14 @@
 {
   "_comment": "Allowlist data for scripts/ci/check_no_cn_ai_vendor.py. Every entry names its reason.",
-  "glm_flash_testing": {
+  "flash_testing": {
     "reason": "The one permitted exception: the Flash model in agent cluster, hive and swarm testing.",
     "path_prefixes": [
       "sdk/python/swarm/",
       "sdk/python/pyproject.toml",
       "infra/do-hive/",
       "docs/testing/",
-      "docs/reviews/gpt6-astra-20260905-evidence/"
+      "docs/reviews/gpt6-astra-20260905-evidence/",
+      "docs/reviews/branch-hygiene-3x7-2026-09-18"
     ],
     "line_context_regex": "flash|swarm|hive|cluster|nhi"
   },
@@ -27,6 +28,14 @@
     {
       "path": "tests/issue_809_nhi_self_persona_any_agent.rs",
       "reason": "model family fixture list; comment lines are still scanned"
+    },
+    {
+      "path": "src/daemon_runtime.rs",
+      "reason": "fallback API-key env-var names cleared by an env-isolation test; comment lines are still scanned"
+    },
+    {
+      "path": "tests/issue_3627_retired_llm_alias.rs",
+      "reason": "fallback API-key env-var names cleared by an env-isolation test; comment lines are still scanned"
     }
   ]
 }

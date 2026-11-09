@@ -22,7 +22,7 @@ Highlights:
 
 - **Provider-agnostic LLM client.** ai-memory now connects to any of
   17 LLM providers (Ollama, OpenAI, xAI, Anthropic, Gemini,
-  Kimi/Moonshot, Qwen/DashScope, Mistral, Groq, Together,
+  Mistral, Groq, Together,
   Cerebras, OpenRouter, Fireworks, LMStudio, vLLM, llama.cpp
   server). Tier no longer dictates vendor.
 - **Recursive-learning primitive.** The substrate-native

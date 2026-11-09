@@ -21,8 +21,8 @@ PLAIN_TERMS_ROT13 = (
     "qrrcfrrx", "djra", "xvzv", "zvavznk", "muvch", "pungtyz", "onvpuhna",
     "qbhonb", "reavr", "uhalhna", "fgrcsha", "vagreayz", "qfu", "qnfufpbcr",
 )
-GLM_ROT13 = "tyz"
-MOONSHOT_ROT13 = "zbbafubg"
+FLASH_FAMILY_ROT13 = "tyz"
+SUFFIXED_ROT13 = "zbbafubg"
 SPELLINGS = ("{t}", "{T}", "{C}", "use {t} here", "`{t}`", "{t}3", "{t}-max",
              "{T}_API_KEY", "x {C}/y")
 SIZE_BOUND_BYTES = 1_000_000
@@ -77,7 +77,7 @@ class PlainTermTests(unittest.TestCase):
 
 class MoonshotTests(unittest.TestCase):
     def test_forms(self):
-        moon = rot(MOONSHOT_ROT13)
+        moon = rot(SUFFIXED_ROT13)
         for line in (moon + " AI", moon.upper() + "_API_KEY", "api." + moon + ".cn",
                      moon + "-v1-8k"):
             with self.subTest(line=line):
@@ -86,17 +86,17 @@ class MoonshotTests(unittest.TestCase):
 
 class FlashExceptionTests(unittest.TestCase):
     def test_swarm_path_is_allowed(self):
-        glm = rot(GLM_ROT13)
-        self.assertEqual(scan("sdk/python/swarm/agent.py", f"{glm}-driven agent"), [])
+        family = rot(FLASH_FAMILY_ROT13)
+        self.assertEqual(scan("sdk/python/swarm/agent.py", f"{family}-driven agent"), [])
 
     def test_flash_line_in_testing_docs_is_allowed(self):
-        glm = rot(GLM_ROT13)
-        self.assertEqual(scan("docs/testing/index.html", f"{glm}-5.3-Flash NHIs"), [])
+        family = rot(FLASH_FAMILY_ROT13)
+        self.assertEqual(scan("docs/testing/index.html", f"{family}-5.3-Flash NHIs"), [])
 
     def test_same_name_outside_testing_is_a_hit(self):
-        glm = rot(GLM_ROT13)
-        self.assertEqual([lab for _, lab in scan("README.md", f"{glm}-5.3-Flash")], [glm])
-        self.assertEqual([lab for _, lab in scan("docs/x.md", f"use {glm} here")], [glm])
+        family = rot(FLASH_FAMILY_ROT13)
+        self.assertEqual([lab for _, lab in scan("README.md", f"{family}-5.3-Flash")], [family])
+        self.assertEqual([lab for _, lab in scan("docs/x.md", f"use {family} here")], [family])
 
     def test_exception_does_not_cover_other_names(self):
         term = rot("djra")

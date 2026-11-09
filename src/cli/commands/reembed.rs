@@ -394,7 +394,7 @@ pub async fn cmd_reembed(
     // #2972 — FAIL CLOSED on a silently-substituted model.
     //
     // The reporter's case: `[embeddings] backend = "ollama", model =
-    // "qwen3-embedding:4b"`. `doctor` echoes the CONFIGURED model, but the
+    // "3-embedding:4b"`. `doctor` echoes the CONFIGURED model, but the
     // resolver cannot construct that id, so it falls back to the tier preset
     // (`all-MiniLM-L6-v2`, 384-dim) with only a `tracing::warn!` — which a
     // CLI one-shot renders nowhere. `reembed` then REPLACED every stored

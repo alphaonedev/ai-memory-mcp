@@ -109,7 +109,7 @@ mod tests {
     /// never as a family token.
     ///
     /// ABSENCE assertion; the PRESENCE control on the SAME sink is the
-    /// `Some("qwen")` line below, which proves the table is still
+    /// positive-family line below, which proves the table is still
     /// wired and this test is not passing because `family_of` became
     /// vacuously `None` for everything.
     ///

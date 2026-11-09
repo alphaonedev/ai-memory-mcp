@@ -10825,7 +10825,7 @@ mod tests {
         let mut cfg = AppConfig::default();
         cfg.embeddings = Some(crate::config::EmbeddingsSection {
             backend: Some(crate::llm::BACKEND_OLLAMA.to_string()),
-            model: Some("qwen3-embedding:4b".to_string()),
+            model: Some("unlisted-embedder:4b".to_string()),
             ..crate::config::EmbeddingsSection::default()
         });
         let got = resolve_boot_embedder_model(&tier, &cfg);
@@ -10835,7 +10835,7 @@ mod tests {
         );
         assert_eq!(
             got.unhonoured_config_model.as_deref(),
-            Some("qwen3-embedding:4b"),
+            Some("unlisted-embedder:4b"),
             "#2972: the un-honoured id must be REPORTED so `reembed` can refuse before \
              replacing every vector under a model the operator never asked for"
         );

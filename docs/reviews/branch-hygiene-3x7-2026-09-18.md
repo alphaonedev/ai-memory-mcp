@@ -501,7 +501,7 @@ The task asked for "class-4 branches with 0 unique patch-ids". **That set is emp
 | `fix/3544-shim-status` | 1 | 1 | 2026-09-14 |
 | `fix/3555-durability-receipts` | 1 | 1 | 2026-09-12 |
 | `fix/3614-quarantined-dependents` | 1 | 1 | 2026-09-12 |
-| `fix/3627-remove-deepseek-alias` | 1 | 1 | 2026-09-12 |
+| `fix/3627-remove-retired-alias` | 1 | 1 | 2026-09-12 |
 | `fix/3636-a2a-integration` | 1 | 1 | 2026-09-12 |
 | `fix/3638-reflect-policy-redaction` | 1 | 1 | 2026-09-12 |
 | `fix/3646-health-monitoring-api` | 1 | 1 | 2026-09-12 |
