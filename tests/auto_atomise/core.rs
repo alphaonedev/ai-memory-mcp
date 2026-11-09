@@ -30,7 +30,7 @@
 
 use ai_memory::models::ConfidenceSource;
 use std::path::PathBuf;
-use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use ai_memory::atomisation::curator::{Atom, Curator, CuratorError};
@@ -51,6 +51,13 @@ use ai_memory::storage as db;
 
 use chrono::Utc;
 use rusqlite::Connection;
+
+// #8687 / #7215: the single shared gate helper. The worker's per-job atomiser
+// resolution parks on it (`park`) BEFORE any curator call, so a closed gate
+// holds the consumer at the very top of a job.
+#[path = "../common/atomise_gate.rs"]
+mod atomise_gate;
+use atomise_gate::AtomiseGate;
 
 // ---------------------------------------------------------------------------
 // MockCurator — programmable, deterministic.
@@ -277,44 +284,6 @@ fn private_worker() -> (
     private_worker_gated(None)
 }
 
-/// Holds the worker's per-job atomiser resolution closed until the test
-/// opens it (#7215). The provider runs on the worker thread BEFORE any
-/// curator call, so a closed gate parks the consumer at the very top of
-/// a job: nothing the hook handed over can progress, and a hook that
-/// waited on the worker could never return. Opening is idempotent and
-/// also happens on drop, so a failing assertion never leaves the worker
-/// parked.
-#[derive(Clone)]
-struct ProviderGate(Arc<(Mutex<bool>, Condvar)>);
-
-impl ProviderGate {
-    fn closed() -> Self {
-        Self(Arc::new((Mutex::new(false), Condvar::new())))
-    }
-
-    fn open(&self) {
-        let (lock, cvar) = &*self.0;
-        *lock.lock().unwrap_or_else(PoisonError::into_inner) = true;
-        cvar.notify_all();
-    }
-
-    /// Block until opened; the bounded wait is a hang guard only
-    /// (CONCURRENCY-17), never the correctness condition.
-    fn wait_open(&self) {
-        let (lock, cvar) = &*self.0;
-        let guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
-        let _ = cvar
-            .wait_timeout_while(guard, Duration::from_secs(120), |open| !*open)
-            .unwrap_or_else(PoisonError::into_inner);
-    }
-}
-
-impl Drop for ProviderGate {
-    fn drop(&mut self) {
-        self.open();
-    }
-}
-
 /// Close the producer side and await full drain of the private worker.
 /// `drop(queue)` closes the channel; the consumer exits only after every
 /// buffered job has run, so completion does not depend on host speed.
@@ -332,10 +301,10 @@ fn await_worker_drain(queue: AtomiseQueue, worker: std::thread::JoinHandle<()>) 
     worker.join().expect("private atomise worker joins");
 }
 
-/// [`private_worker`] with an optional [`ProviderGate`] the worker waits
+/// [`private_worker`] with an optional [`AtomiseGate`] the worker waits
 /// on before it resolves the atomiser for each job.
 fn private_worker_gated(
-    gate: Option<ProviderGate>,
+    gate: Option<AtomiseGate>,
 ) -> (
     Arc<Mutex<MockState>>,
     Arc<Atomiser>,
@@ -363,7 +332,7 @@ fn private_worker_gated(
     let (queue, handle) =
         ai_memory::background::atomise_worker::spawn_joinable(Arc::new(move || {
             if let Some(gate) = &gate {
-                gate.wait_open();
+                gate.park();
             }
             Some(Arc::clone(&provider))
         }))
@@ -745,7 +714,8 @@ fn test_auto_atomise_does_not_block_store_response() {
         );
         return;
     }
-    let gate = ProviderGate::closed();
+    let gate = AtomiseGate::closed();
+    let _release = gate.release_on_drop();
     let (curator_state, atomiser, queue, worker) = private_worker_gated(Some(gate.clone()));
     for _ in 0..CALLS {
         enqueue_atoms_into(

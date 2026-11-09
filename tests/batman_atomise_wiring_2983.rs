@@ -51,6 +51,10 @@ use chrono::Utc;
 use rusqlite::Connection;
 use serde_json::{Value, json};
 
+#[path = "common/atomise_gate.rs"]
+mod atomise_gate;
+use atomise_gate::{AtomiseGate, GatedCurator};
+
 // ---------------------------------------------------------------------------
 // Mock curator — deterministic, INJECTED (never installed into a global).
 // ---------------------------------------------------------------------------
@@ -326,7 +330,22 @@ fn deferred_mode_lands_atoms_through_the_bounded_worker_2986() {
     seed_policy(&conn, &ns, AutoAtomiseMode::Deferred);
 
     let calls = Arc::new(Mutex::new(0usize));
-    let atomiser = mock_atomiser(&calls);
+    // #8687 — park the curator behind a closed gate so "nothing landed at
+    // response time" holds by construction instead of racing the worker.
+    // `_release` opens the gate even if an assertion panics.
+    let gate = AtomiseGate::closed();
+    let _release = gate.release_on_drop();
+    let atomiser = Arc::new(Atomiser::new(
+        Box::new(GatedCurator::new(
+            Box::new(TwoAtomCurator {
+                calls: Arc::clone(&calls),
+            }),
+            &gate,
+        )),
+        None,
+        AtomiserConfig::default(),
+        FeatureTier::Smart,
+    ));
     let provider_atomiser = Arc::clone(&atomiser);
     let (queue, worker): (AtomiseQueue, std::thread::JoinHandle<()>) =
         ai_memory::background::atomise_worker::spawn_joinable(Arc::new(move || {
@@ -344,7 +363,12 @@ fn deferred_mode_lands_atoms_through_the_bounded_worker_2986() {
     assert_eq!(resp["atomise_outcome"].as_str(), Some(OUTCOME_QUEUED));
     let source_id = resp["id"].as_str().expect("response id").to_string();
 
-    // Deferred means deferred: nothing has landed yet at response time.
+    // Deferred means deferred: the response returned while the curator is
+    // parked at the closed gate, so the parent cannot have been archived.
+    assert!(
+        gate.wait_until_entered(),
+        "the queued job must reach the worker out-of-band"
+    );
     let immediate: Option<i64> = conn
         .query_row(
             "SELECT atomised_into FROM memories WHERE id = ?1",
@@ -365,6 +389,7 @@ fn deferred_mode_lands_atoms_through_the_bounded_worker_2986() {
     // reopen-and-COUNT poll contended with the worker's writes. join() returns
     // only after `rx.recv()` has drained every buffered job and the consumer
     // has exited, so the atoms are guaranteed committed here.
+    gate.open();
     drop(queue);
     worker
         .join()
