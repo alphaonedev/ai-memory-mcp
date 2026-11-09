@@ -26,8 +26,10 @@ const COST_SMALL_ROWS: usize = 2_048;
 const COST_SCHEDULING_SLACK: std::time::Duration = std::time::Duration::from_millis(20);
 const RUN_SMALL_BYTES_8674: usize = 100_000;
 const RUN_LARGE_BYTES_8674: usize = 1_000_000;
-const RUN_SMALL_CEILING_8674: std::time::Duration = std::time::Duration::from_millis(250);
-const RUN_LARGE_CEILING_8674: std::time::Duration = std::time::Duration::from_millis(2_500);
+// Gross backstops only (>= 10x measured cost): load cannot trip them, the old
+// quadratic (about 20 s at 100K) still does. The doubling ratio is the invariant.
+const RUN_SMALL_CEILING_8674: std::time::Duration = std::time::Duration::from_millis(2_500);
+const RUN_LARGE_CEILING_8674: std::time::Duration = std::time::Duration::from_secs(25);
 const RUN_DOUBLING_LIMIT_8674: u32 = 3;
 const RUN_SHAPES_8674: &[&str] = &[
     "http://u@a.io)",

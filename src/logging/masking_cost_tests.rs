@@ -18,6 +18,14 @@ pub(super) fn visited(bytes: usize) {
     SEARCH_BYTES.with(|count| count.set(count.get().saturating_add(bytes)));
 }
 
+pub(super) fn reset_visited() {
+    SEARCH_BYTES.with(|count| count.set(0));
+}
+
+pub(super) fn total_visited() -> usize {
+    SEARCH_BYTES.with(Cell::get)
+}
+
 fn measured(input: &str) -> usize {
     SEARCH_BYTES.with(|count| count.set(0));
     std::hint::black_box(super::redact_connection_options(input));
