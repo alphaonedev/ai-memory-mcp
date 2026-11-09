@@ -45,6 +45,10 @@ use chrono::Utc;
 use rusqlite::Connection;
 use serde_json::{Value, json};
 
+#[path = "common/atomise_gate.rs"]
+mod atomise_gate;
+use atomise_gate::{ATOM_LAND_DEADLINE, ATOM_POLL_INTERVAL, AtomiseGate, GatedCurator};
+
 // ---------------------------------------------------------------------------
 // #3050 — NO shared mock state. Every test injects its OWN stateless curator
 // (`StatelessTwoAtomCurator`, defined below) through an ISOLATED
@@ -98,6 +102,24 @@ fn isolated_atomiser() -> (Arc<Atomiser>, Arc<Mutex<usize>>) {
         Box::new(StatelessTwoAtomCurator {
             calls: Arc::clone(&calls),
         }),
+        None,
+        AtomiserConfig::default(),
+        FeatureTier::Smart,
+    ));
+    (atomiser, calls)
+}
+
+/// #8687 — like [`isolated_atomiser`], but the curator parks at `gate` until
+/// the test opens it, so the test controls when the worker may land atoms.
+fn isolated_gated_atomiser(gate: &AtomiseGate) -> (Arc<Atomiser>, Arc<Mutex<usize>>) {
+    let calls = Arc::new(Mutex::new(0usize));
+    let atomiser = Arc::new(Atomiser::new(
+        Box::new(GatedCurator::new(
+            Box::new(StatelessTwoAtomCurator {
+                calls: Arc::clone(&calls),
+            }),
+            gate,
+        )),
         None,
         AtomiserConfig::default(),
         FeatureTier::Smart,
@@ -346,7 +368,13 @@ fn deferred_mode_preserves_existing_behaviour() {
     // test's assertions can be perturbed by this worker's async drain
     // (the exact cross-test coupling that false-failed the off test), and
     // this test's own observations cannot be perturbed by anyone else's.
-    let (atomiser, calls) = isolated_atomiser();
+    //
+    // #8687 — the curator is held behind a closed gate, so "atomised_into is
+    // NULL at response time" is proven without racing the worker. `_release`
+    // opens the gate even if an assertion panics.
+    let gate = AtomiseGate::closed();
+    let _release = gate.release_on_drop();
+    let (atomiser, calls) = isolated_gated_atomiser(&gate);
     let provider_atomiser = Arc::clone(&atomiser);
     let queue: AtomiseQueue = ai_memory::background::atomise_worker::spawn(Arc::new(move || {
         Some(Arc::clone(&provider_atomiser))
@@ -368,14 +396,13 @@ fn deferred_mode_preserves_existing_behaviour() {
     let resp = store_through_mcp_with(&conn, shared_db_path(), &ns, deferred_wiring);
     let source_id = resp["id"].as_str().expect("response id").to_string();
 
-    // Form 2 deferred-mode contract: source's atomised_into is NULL at
-    // the moment the response returned. The worker thread may complete
-    // it later — that is the deferred semantic.
-    // #8687 RED: force the early-worker order, then run the old check.
-    let early = std::time::Instant::now() + std::time::Duration::from_secs(15);
-    while std::time::Instant::now() < early && count_atoms_for_source(&conn, &source_id) < 2 {
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
+    // Form 2 deferred-mode contract: the response returned while the curator
+    // is parked at the closed gate, so the source cannot be archived yet. The
+    // worker landing atoms LATER is the deferred semantic (asserted below).
+    assert!(
+        gate.wait_until_entered(),
+        "the queued job must reach the worker out-of-band"
+    );
     let atomised_into_immediate = read_atomised_into(&conn, &source_id);
     assert!(
         atomised_into_immediate.is_none(),
@@ -398,15 +425,15 @@ fn deferred_mode_preserves_existing_behaviour() {
     // isolated curator's own counter + the source rows; both are race-free
     // because nothing else drives this atomiser. Dropping `queue` after the
     // assertion lets the worker thread exit cleanly (its only sender gone).
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-    let mut atoms = 0i64;
-    while std::time::Instant::now() < deadline {
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        atoms = count_atoms_for_source(&conn, &source_id);
-        if atoms >= 2 {
-            break;
-        }
-    }
+    gate.open();
+    let landed = atomise_gate::poll_until(ATOM_LAND_DEADLINE, ATOM_POLL_INTERVAL, || {
+        count_atoms_for_source(&conn, &source_id) >= 2
+    });
+    assert!(
+        landed,
+        "deferred mode: the atoms must land within the bounded wait"
+    );
+    let atoms = count_atoms_for_source(&conn, &source_id);
     assert_eq!(
         atoms, 2,
         "deferred mode: the bounded worker must land the two atoms out-of-band",

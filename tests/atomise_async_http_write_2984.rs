@@ -53,6 +53,10 @@ use ai_memory::models::{
 };
 use ai_memory::storage as db;
 
+#[path = "common/atomise_gate.rs"]
+mod atomise_gate;
+use atomise_gate::{ATOM_LAND_DEADLINE, ATOM_POLL_INTERVAL, AtomiseGate, GatedCurator};
+
 /// #1751 — permissive attestation opt-out, the same pin
 /// `tests/autotag_async_write_2587.rs` carries.
 fn permissive_attestation_for_tests() {
@@ -111,6 +115,18 @@ fn build_atomise_router(
     wire_llm: bool,
     wire_worker: bool,
     calls: &Arc<Mutex<usize>>,
+) -> (axum::Router, std::path::PathBuf) {
+    build_atomise_router_gated(wire_llm, wire_worker, calls, None)
+}
+
+/// [`build_atomise_router`] with an optional #8687 gate: when `gate` is
+/// `Some`, the mock curator parks at it, so the test decides when the worker
+/// may land atoms instead of racing it.
+fn build_atomise_router_gated(
+    wire_llm: bool,
+    wire_worker: bool,
+    calls: &Arc<Mutex<usize>>,
+    gate: Option<&AtomiseGate>,
 ) -> (axum::Router, std::path::PathBuf) {
     permissive_attestation_for_tests();
     let db_path = local_runs_db("http-create");
@@ -173,12 +189,22 @@ fn build_atomise_router(
     };
     if wire_worker {
         let calls = Arc::clone(calls);
+        let gate = gate.cloned();
         app_state.atomise_queue =
             ai_memory::background::atomise_worker::spawn(Arc::new(move || {
-                Some(Arc::new(Atomiser::new(
-                    Box::new(TwoAtomCurator {
+                let curator: Box<dyn Curator> = match &gate {
+                    Some(g) => Box::new(GatedCurator::new(
+                        Box::new(TwoAtomCurator {
+                            calls: Arc::clone(&calls),
+                        }),
+                        g,
+                    )),
+                    None => Box::new(TwoAtomCurator {
                         calls: Arc::clone(&calls),
                     }),
+                };
+                Some(Arc::new(Atomiser::new(
+                    curator,
                     None,
                     AtomiserConfig::default(),
                     FeatureTier::Smart,
@@ -290,7 +316,12 @@ fn count_atoms(db_path: &std::path::Path, source_id: &str) -> i64 {
 #[tokio::test(flavor = "multi_thread")]
 async fn http_create_enqueues_atomisation_and_the_worker_lands_the_atoms_2984() {
     let calls = Arc::new(Mutex::new(0usize));
-    let (router, db_path) = build_atomise_router(true, true, &calls);
+    // #8687: the worker is held behind a closed gate, so "the response did not
+    // block on the curator" is proven without racing it. `_release` opens the
+    // gate even if an assertion below panics.
+    let gate = AtomiseGate::closed();
+    let _release = gate.release_on_drop();
+    let (router, db_path) = build_atomise_router_gated(true, true, &calls, Some(&gate));
     let ns = "atomise-2984-deferred";
     seed_policy(&db_path, ns, AutoAtomiseMode::Deferred);
 
@@ -312,30 +343,33 @@ async fn http_create_enqueues_atomisation_and_the_worker_lands_the_atoms_2984() 
     );
 
     let source_id = body["id"].as_str().expect("id").to_string();
-    // #8687 RED: deterministically force the early-worker order (the worker
-    // lands the atoms BEFORE the old response-time check runs) and then run
-    // the old assertion unchanged. It must fail here, proving the race.
-    let early = std::time::Instant::now() + Duration::from_secs(15);
-    while std::time::Instant::now() < early && count_atoms(&db_path, &source_id) < 2 {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    // Deferred means deferred: the response did not wait on the curator.
+    // Deferred means deferred: the response came back while the curator is
+    // still parked at the closed gate (a create that blocked on the curator
+    // would never have returned). The worker has picked the job up, yet no
+    // atom can have landed and the curator has not completed a call.
+    assert!(
+        gate.wait_until_entered(),
+        "the queued job must reach the worker out-of-band"
+    );
     assert_eq!(
         count_atoms(&db_path, &source_id),
         0,
-        "the create response must not have blocked on the curator"
+        "no atom may land while the curator is held behind the gate"
+    );
+    assert_eq!(
+        *calls.lock().unwrap(),
+        0,
+        "the curator has not returned yet"
     );
 
-    // …and the bounded single-consumer worker drains it out-of-band.
-    let deadline = std::time::Instant::now() + Duration::from_secs(15);
-    let mut atoms = 0;
-    while std::time::Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        atoms = count_atoms(&db_path, &source_id);
-        if atoms >= 2 {
-            break;
-        }
-    }
+    // Open the gate: the bounded single-consumer worker now drains it, and
+    // the atoms appear within a bounded wait (no timing-dependent zero).
+    gate.open();
+    let landed = atomise_gate::poll_until(ATOM_LAND_DEADLINE, ATOM_POLL_INTERVAL, || {
+        count_atoms(&db_path, &source_id) >= 2
+    });
+    assert!(landed, "the atoms must land within the bounded wait");
+    let atoms = count_atoms(&db_path, &source_id);
     assert_eq!(
         atoms, 2,
         "the worker must land the mock curator's two atoms"
