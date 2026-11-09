@@ -227,6 +227,47 @@ async fn agents_round_trip_via_sal() {
     let _ = handle.await;
 }
 
+/// #8692 — number of extra namespaces seeded before a listing lookup. It is
+/// above `NAMESPACES_DEFAULT_LIMIT` (50) and `STATS_BY_NAMESPACE_MAX_LIMIT`
+/// (100), so a seeded count-1 namespace cannot sit on the first page.
+const CROWDING_NAMESPACES_8692: usize = 200;
+
+/// #8692 — rows per crowding namespace; denser than the namespace under test
+/// (1 and 3 rows) so the capped listings order the crowd ahead of it.
+const CROWDING_ROWS_8692: usize = 5;
+
+/// #8692 — seed [`CROWDING_NAMESPACES_8692`] denser namespaces so any lookup
+/// that relies on the first page of a capped listing fails, however empty the
+/// shared database was.
+async fn crowd_namespaces_8692(client: &reqwest::Client, base: &str) {
+    let tag = uuid::Uuid::new_v4();
+    for n in 0..CROWDING_NAMESPACES_8692 {
+        for r in 0..CROWDING_ROWS_8692 {
+            let resp = client
+                .post(format!("{base}/api/v1/memories"))
+                .json(&json!({
+                    "tier": "long",
+                    "namespace": format!("crowd-{tag}-{n}"),
+                    "title": format!("crowd-row-{r}"),
+                    "content": "crowding row",
+                    "tags": [],
+                    "priority": 5,
+                    "confidence": 1.0,
+                    "source": "import",
+                    "metadata": {}
+                }))
+                .send()
+                .await
+                .expect("crowding memory create");
+            assert!(
+                resp.status().is_success(),
+                "crowding seed: {}",
+                resp.status()
+            );
+        }
+    }
+}
+
 /// Phase 4 — `GET /api/v1/stats` returns top-level totals projected
 /// from SAL aggregates. Verifies the canonical list wire-shape
 /// (`total_memories`, `by_tier`, `by_namespace`).
@@ -258,6 +299,8 @@ async fn stats_round_trip_via_sal() {
             .await
             .expect("stats memory create");
     }
+
+    crowd_namespaces_8692(&client, &base).await;
 
     let stats: Value = client
         .get(format!("{base}/api/v1/stats"))
@@ -309,6 +352,8 @@ async fn namespaces_round_trip_via_sal() {
         .send()
         .await
         .expect("ns marker create");
+
+    crowd_namespaces_8692(&client, &base).await;
 
     let ns: Value = client
         .get(format!("{base}/api/v1/namespaces"))
@@ -510,6 +555,8 @@ async fn taxonomy_round_trip_via_sal() {
             .await
             .expect("tax create");
     }
+
+    crowd_namespaces_8692(&client, &base).await;
 
     let tax: Value = client
         .get(format!("{base}/api/v1/taxonomy"))
