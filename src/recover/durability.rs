@@ -49,7 +49,7 @@ use rusqlite::Connection;
 /// = never abort (the normal path).
 ///
 /// Extends the existing `AI_MEMORY_TEST_*` fault-injection family
-/// (`AI_MEMORY_TEST_FORCE_SPAWN_EAGAIN`, `AI_MEMORY_AUTO_EXPORT_INJECT_PANIC`).
+/// (`AI_MEMORY_TEST_FORCE_SPAWN_EAGAIN`).
 /// Production deployments MUST leave it unset.
 pub const ENV_ABORT_AFTER_COMMIT: &str = "AI_MEMORY_TEST_ABORT_AFTER_COMMIT";
 

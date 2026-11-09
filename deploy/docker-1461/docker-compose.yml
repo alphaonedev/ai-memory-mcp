@@ -113,6 +113,7 @@ services:
     container_name: ${PEER1_NAME:?PEER1_NAME must be set in campaign.env}
     hostname: ${PEER1_NAME}
     restart: on-failure
+    stop_grace_period: 90s
     depends_on:
       pg-age:
         condition: service_healthy
@@ -191,6 +192,7 @@ services:
     container_name: ${PEER2_NAME:?PEER2_NAME must be set in campaign.env}
     hostname: ${PEER2_NAME}
     restart: on-failure
+    stop_grace_period: 90s
     depends_on:
       pg-age:
         condition: service_healthy

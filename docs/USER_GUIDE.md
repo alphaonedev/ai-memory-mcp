@@ -2369,6 +2369,14 @@ ai-memory man | man -l -
 ai-memory man | sudo tee /usr/local/share/man/man1/ai-memory.1 > /dev/null
 ```
 
+## Webhook delivery and proxies
+
+Webhook delivery connects directly over HTTPS and pins the addresses checked by
+the SSRF guard. It ignores `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and their
+lowercase equivalents, so a proxy cannot perform a second, unchecked DNS lookup.
+Webhook receivers must be directly reachable; redirects are refused. For a
+receiver using a private certificate authority, configure `[subscriptions] ca_cert`.
+
 ## Troubleshooting
 
 Common issues, their causes, and how to fix them.
@@ -2404,7 +2412,7 @@ Common issues, their causes, and how to fix them.
 
 **Solution:**
 1. Ensure you have internet access and can reach `huggingface.co`.
-2. If behind a corporate proxy, set `HTTPS_PROXY` before starting ai-memory.
+2. If behind a corporate proxy, set `HTTPS_PROXY` before starting ai-memory for the Hugging Face download. Webhook delivery ignores environment proxies.
 3. Wait -- the first download can take a few minutes on slow connections. Subsequent runs use the cached model.
 4. If the download is corrupted, delete the cached model directory (`~/.cache/huggingface/hub/models--sentence-transformers--all-MiniLM-L6-v2/`) and retry.
 

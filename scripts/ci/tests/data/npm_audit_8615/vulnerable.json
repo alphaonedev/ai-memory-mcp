@@ -1,0 +1,171 @@
+{
+  "auditReportVersion": 2,
+  "vulnerabilities": {
+    "@jest/core": {
+      "name": "@jest/core",
+      "severity": "low",
+      "isDirect": false,
+      "via": [
+        "jest-config"
+      ],
+      "effects": [
+        "jest"
+      ],
+      "range": ">=25.2.0-alpha.86",
+      "nodes": [
+        "node_modules/@jest/core"
+      ],
+      "fixAvailable": {
+        "name": "jest",
+        "version": "25.1.0",
+        "isSemVerMajor": true
+      }
+    },
+    "create-jest": {
+      "name": "create-jest",
+      "severity": "low",
+      "isDirect": false,
+      "via": [
+        "jest-config"
+      ],
+      "effects": [
+        "jest-cli"
+      ],
+      "range": ">=29.7.0",
+      "nodes": [
+        "node_modules/create-jest"
+      ],
+      "fixAvailable": true
+    },
+    "deepmerge": {
+      "name": "deepmerge",
+      "severity": "low",
+      "isDirect": false,
+      "via": [
+        {
+          "source": 1243505,
+          "name": "deepmerge",
+          "dependency": "deepmerge",
+          "title": "deepmerge mergeObject() allows prototype poisoning of returned objects",
+          "url": "https://github.com/advisories/GHSA-gcqx-w48m-w2h4",
+          "severity": "low",
+          "cwe": [
+            "CWE-1321"
+          ],
+          "cvss": {
+            "score": 5.3,
+            "vectorString": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:L/A:N"
+          },
+          "range": ">=4.2.0 <=4.3.1"
+        }
+      ],
+      "effects": [
+        "jest-config"
+      ],
+      "range": ">=4.2.0",
+      "nodes": [
+        "node_modules/deepmerge"
+      ],
+      "fixAvailable": {
+        "name": "jest",
+        "version": "25.1.0",
+        "isSemVerMajor": true
+      }
+    },
+    "jest": {
+      "name": "jest",
+      "severity": "low",
+      "isDirect": true,
+      "via": [
+        "@jest/core",
+        "jest-cli"
+      ],
+      "effects": [
+        "ts-jest"
+      ],
+      "range": ">=25.2.0-alpha.86",
+      "nodes": [
+        "node_modules/jest"
+      ],
+      "fixAvailable": {
+        "name": "jest",
+        "version": "25.1.0",
+        "isSemVerMajor": true
+      }
+    },
+    "jest-cli": {
+      "name": "jest-cli",
+      "severity": "low",
+      "isDirect": false,
+      "via": [
+        "@jest/core",
+        "create-jest",
+        "jest-config"
+      ],
+      "effects": [],
+      "range": ">=25.2.0-alpha.86",
+      "nodes": [
+        "node_modules/jest-cli"
+      ],
+      "fixAvailable": true
+    },
+    "jest-config": {
+      "name": "jest-config",
+      "severity": "low",
+      "isDirect": false,
+      "via": [
+        "deepmerge"
+      ],
+      "effects": [
+        "@jest/core",
+        "create-jest",
+        "jest-cli"
+      ],
+      "range": ">=25.2.0-alpha.86",
+      "nodes": [
+        "node_modules/jest-config"
+      ],
+      "fixAvailable": {
+        "name": "jest",
+        "version": "25.1.0",
+        "isSemVerMajor": true
+      }
+    },
+    "ts-jest": {
+      "name": "ts-jest",
+      "severity": "low",
+      "isDirect": true,
+      "via": [
+        "jest"
+      ],
+      "effects": [],
+      "range": ">=25.10.0-alpha.1",
+      "nodes": [
+        "node_modules/ts-jest"
+      ],
+      "fixAvailable": {
+        "name": "ts-jest",
+        "version": "25.5.1",
+        "isSemVerMajor": true
+      }
+    }
+  },
+  "metadata": {
+    "vulnerabilities": {
+      "info": 0,
+      "low": 7,
+      "moderate": 0,
+      "high": 0,
+      "critical": 0,
+      "total": 7
+    },
+    "dependencies": {
+      "prod": 2,
+      "dev": 281,
+      "optional": 2,
+      "peer": 0,
+      "peerOptional": 0,
+      "total": 282
+    }
+  }
+}

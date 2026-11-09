@@ -200,34 +200,15 @@ pub async fn run(
     // `cli::curator::run`'s `--daemon` arm).
     let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
     let shutdown_for_signal = shutdown.clone();
+    // Honour BOTH SIGINT and, on unix, SIGTERM, so `systemd stop` /
+    // `docker stop` / `kill` trigger the same clean between-ticks shutdown
+    // the `--daemon` doc promises (issue #2119). On non-unix targets only
+    // Ctrl-C is available. #8193: the one shared stop primitive, installed
+    // BEFORE the task is spawned so no signal can reach the default
+    // disposition in the gap (the sync.rs precedent).
+    let mut stop = crate::stop_signal::StopListener::install();
     tokio::spawn(async move {
-        // Honour BOTH SIGINT (ctrl_c, cross-platform) and — on unix —
-        // SIGTERM, so `systemd stop` / `docker stop` / `kill` trigger the
-        // same clean between-ticks shutdown the `--daemon` doc promises
-        // (issue #2119). On non-unix targets only SIGINT is available.
-        #[cfg(unix)]
-        {
-            use tokio::signal::unix::{SignalKind, signal};
-            let mut term = signal(SignalKind::terminate()).ok();
-            let term_fut = async {
-                match term.as_mut() {
-                    Some(t) => {
-                        t.recv().await;
-                    }
-                    // No SIGTERM handler could be installed — park
-                    // forever so `select!` resolves on ctrl_c alone.
-                    None => std::future::pending::<()>().await,
-                }
-            };
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {}
-                () = term_fut => {}
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = tokio::signal::ctrl_c().await;
-        }
+        stop.wait().await;
         shutdown_for_signal.notify_one();
     });
 
@@ -268,28 +249,10 @@ async fn run_via_store(
     }
     let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
     let shutdown_for_signal = shutdown.clone();
+    // #8193: install before spawning (the sync.rs precedent).
+    let mut stop = crate::stop_signal::StopListener::install();
     tokio::spawn(async move {
-        #[cfg(unix)]
-        {
-            use tokio::signal::unix::{SignalKind, signal};
-            let mut term = signal(SignalKind::terminate()).ok();
-            let term_fut = async {
-                match term.as_mut() {
-                    Some(t) => {
-                        t.recv().await;
-                    }
-                    None => std::future::pending::<()>().await,
-                }
-            };
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {}
-                () = term_fut => {}
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = tokio::signal::ctrl_c().await;
-        }
+        stop.wait().await;
         shutdown_for_signal.notify_one();
     });
     run_watch_daemon_with_primitives(std::path::PathBuf::from(""), cfg, shutdown).await

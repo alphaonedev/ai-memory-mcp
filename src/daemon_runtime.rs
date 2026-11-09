@@ -1144,7 +1144,7 @@ pub struct ServeArgs {
     #[arg(long, requires = "tls_cert")]
     pub mtls_allowlist: Option<PathBuf>,
     /// Seconds to wait for in-flight requests to complete on graceful
-    /// shutdown (SIGINT). Default 30. Bumped from 10 in v0.6.0 because
+    /// shutdown (SIGINT or SIGTERM). Default 30. Bumped from 10 in v0.6.0 because
     /// large `/sync/push` batches can take longer than 10s under load
     /// (red-team #233).
     #[arg(long, default_value_t = 30)]
@@ -8234,6 +8234,8 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
     }
 
     let addr = format!("{}:{}", args.host, args.port);
+    // #8444 r2: the Agent Card URL is configured or daemon-derived, never from headers.
+    crate::a2a::init_card_base_url(args.tls_cert.is_some() && args.tls_key.is_some(), &addr);
     tracing::info!("database: {}", db_path.display());
 
     // v1.0.0 #2166 — SIGHUP live `[llm]` reload. On unix, install a SIGHUP
@@ -8292,8 +8294,17 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
     // so refusal rows submitted during graceful shutdown could be lost.
     let checkpoint_state = bootstrap.db_state.clone();
     let drain_metrics = bootstrap.deferred_audit_metrics.clone();
+    // #8193: SIGINT and SIGTERM (unix) share one graceful path; a failed
+    // registration is logged and parked, never read as a received stop.
+    let mut stop = crate::stop_signal::StopListener::install();
+    // #8193 N2: remember when the stop signal arrived, so the log after the
+    // server returns can tell a real drain from a cut at the grace budget.
+    let signalled_at = Arc::new(std::sync::OnceLock::<std::time::Instant>::new());
+    let signalled_at_for_shutdown = Arc::clone(&signalled_at);
+    let shutdown_grace_secs = args.shutdown_grace_secs;
     let shutdown = async move {
-        let _ = tokio::signal::ctrl_c().await;
+        stop.wait().await;
+        let _ = signalled_at_for_shutdown.set(std::time::Instant::now());
         tracing::info!("shutting down — draining deferred-audit queue then checkpointing WAL");
     };
     let api_key_state = bootstrap.api_key_state;
@@ -8342,7 +8353,7 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
             let socket_addr: std::net::SocketAddr = addr.parse()?;
             // axum-server doesn't have a direct graceful-shutdown on the
             // TLS builder yet; spawn the signal listener on the Handle
-            // instead so ctrl_c triggers a graceful shutdown. Window is
+            // instead so SIGINT and SIGTERM (unix) trigger a graceful shutdown. Window is
             // operator-configurable via --shutdown-grace-secs (default 30,
             // bumped from 10 in v0.6.0 — red-team #233).
             let grace = std::time::Duration::from_secs(args.shutdown_grace_secs);
@@ -8496,6 +8507,19 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
         Ok(())
     }
     .await;
+    if server_result.is_ok() {
+        // #8193 N2: axum-server returns Ok after a drain AND after a cut at
+        // the grace budget, so the elapsed time picks the text.
+        let elapsed = signalled_at.get().map_or(Duration::ZERO, |at| at.elapsed());
+        let outcome =
+            crate::stop_signal::drain_outcome(elapsed, Duration::from_secs(shutdown_grace_secs));
+        let text = outcome.log_text(shutdown_grace_secs);
+        if outcome == crate::stop_signal::DrainOutcome::Drained {
+            tracing::info!("{text}");
+        } else {
+            tracing::warn!("{text}");
+        }
+    }
     bootstrap.task_handles.extend(
         server_aux_tasks
             .lock()
@@ -8628,7 +8652,10 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
 pub async fn shutdown_witness_flush_and_checkpoint(db_state: &Db) -> Result<()> {
     let lock = db_state.lock().await;
     crate::signed_events::try_force_emit_audit_head_witness(&lock.0)?;
-    db::checkpoint(&lock.0)
+    tracing::info!("final witness flushed (a no-op when no witness key is enrolled)");
+    db::checkpoint(&lock.0)?;
+    tracing::info!("final WAL checkpoint complete");
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

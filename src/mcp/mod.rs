@@ -754,8 +754,8 @@ pub use namespace::{
     handle_namespace_get_standard, handle_namespace_set_standard,
     handle_namespace_set_standard_trusted,
 };
-pub(crate) use notify::handle_notify_as_sender;
 pub use notify::{handle_inbox, handle_notify};
+pub(crate) use notify::{handle_notify_as_sender, handle_notify_as_sender_stamped};
 #[cfg(feature = "sal")]
 pub(crate) use notify::{inbox_envelope, inbox_message, notify_receipt};
 pub use pending::{handle_pending_approve, handle_pending_reject};
@@ -5743,7 +5743,9 @@ mod tests {
     /// serial dispatch, which this test exercises.
     #[test]
     fn issue_965_audit_serial_dispatch_50_calls_through_single_connection() {
+        let _iso = crate::test_support::no_passphrase_guard();
         let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        passphrase_window_8659::probe_before_open();
         let conn = db::open(tmp.path()).expect("open db");
         let tier_config = crate::config::FeatureTier::Keyword.config();
         let resolved_ttl = crate::config::ResolvedTtl::default();
@@ -5811,6 +5813,8 @@ mod tests {
             .expect("count query");
         assert_eq!(n, 50, "expected 50 audit-stress rows, found {n}");
     }
+
+    mod passphrase_window_8659;
 
     // ----- issue #811 verification: load_active_keypair_for_mcp fallback -----
 

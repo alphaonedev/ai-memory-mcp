@@ -37,6 +37,8 @@ mod common;
 use common::postgres_url;
 
 const ENV_ALLOW_SCHEMA_AHEAD: &str = ai_memory::storage::schema_guard::ENV_ALLOW_SCHEMA_AHEAD;
+const COPY_SELECTOR_POSTGRES: &str = ai_memory::storage::schema_guard::COPY_SELECTOR_POSTGRES;
+const COPY_SELECTOR_SQLITE: &str = ai_memory::storage::schema_guard::COPY_SELECTOR_SQLITE;
 const SCRATCH_PREFIX: &str = "ai_memory_dgrd_";
 
 /// Serialises the process-wide hatch env mutations.
@@ -225,8 +227,9 @@ async fn pg_guard_refuses_a_newer_database_and_leaves_it_untouched_2445() {
 
     // CROSS-BACKEND PARITY, asserted rather than assumed: both adapters route
     // through the ONE shared verdict, so for the same (observed, supported,
-    // target) the rendered refusal differs ONLY in the backend token. Anything
-    // else would mean the two funnels had drifted apart.
+    // target) the rendered refusal differs ONLY in the backend token and the
+    // backup-copy selector (#8679: `--db` selects a sqlite file, `--store-url`
+    // a postgres store). Anything else would mean the two funnels had drifted.
     let render = |backend| {
         ai_memory::storage::schema_guard::evaluate(ahead, tip(), backend, "TARGET")
             .expect_err("must refuse")
@@ -235,10 +238,18 @@ async fn pg_guard_refuses_a_newer_database_and_leaves_it_untouched_2445() {
     let pg_render = render(ai_memory::storage::schema_guard::BACKEND_POSTGRES);
     let sqlite_render = render(ai_memory::storage::schema_guard::BACKEND_SQLITE);
     assert_eq!(
-        pg_render.replacen("(postgres)", "(BACKEND)", 1),
-        sqlite_render.replacen("(sqlite)", "(BACKEND)", 1),
+        pg_render.replacen("(postgres)", "(BACKEND)", 1).replacen(
+            COPY_SELECTOR_POSTGRES,
+            "<SELECTOR>",
+            1
+        ),
+        sqlite_render.replacen("(sqlite)", "(BACKEND)", 1).replacen(
+            COPY_SELECTOR_SQLITE,
+            "<SELECTOR>",
+            1
+        ),
         "sqlite and postgres must emit a byte-identical refusal modulo the \
-         backend token"
+         backend token and the backup-copy selector"
     );
 
     // The refusal must not have replayed this binary's bootstrap DDL.

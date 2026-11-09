@@ -1763,6 +1763,8 @@ router in `src/lib.rs`.
 | `POST` | `/api/v1/notify` | Agent-to-agent inbox message. Sender resolved from `X-Agent-Id` only (#901); body `agent_id` must match or 403. MCP: `memory_notify`. Every delivery is a NEW row (#3639): the stored `title` is `<subject> [<id prefix>]` (unique by construction), the caller's title is kept verbatim as `metadata.subject`, a repeated subject never merges into, overwrites or re-attributes an earlier message, and the receipt carries `id`, `title` and `subject`. |
 | `GET`  | `/api/v1/inbox` | Read the calling agent's inbox — the messages it has not yet HANDLED. Handled = the recipient deleted the message (`DELETE /api/v1/memories/{id}`, archived on this namespace, see the delete route); reads never mark anything (#1869 purity) and there is no read marker — `access_count` counts touches, never handling ([#3730](https://github.com/alphaonedev/ai-memory-mcp/issues/3730)). `unread_only` is accepted for compatibility and narrows nothing (every listed message is unhandled); `unread_count == count`. MCP: `memory_inbox`; when `AI_MEMORY_AGENT_ID` is unset, access is bound to the same process-derived identity used by `memory_notify`, and an explicit `agent_id` must match it. MCP refuses startup when `AI_MEMORY_AGENT_ID` is configured empty or malformed. An isolated single-tenant process may explicitly set `[mcp] single_tenant_trust_all = true` to restore caller-unbound inbox selection; every use emits a WARN. |
 | `GET`  | `/api/v1/inbox/stream` | v1.0.0 [#3465](https://github.com/alphaonedev/ai-memory-mcp/issues/3465) — SSE wake stream for the calling agent's OWN inbox (`handlers::inbox_sse`). One `agent_notified` frame per committed `memory_notify`, plus a synthetic `lagged` frame when a slow subscriber overruns the bounded broadcast buffer; keepalive every 15 s. Identity-bound at stream open — no delegation, no namespace widening, and an unresolved identity (absent/unreadable `X-Agent-Id`, or a self-asserted `host:` principal) gets a stream that never emits. Frames carry the inbox row id, namespace, sender, a correlation id and a `sha256:` content digest — **never the body**; the woken client reads its mail through `GET /api/v1/inbox`. Fed from the in-process wake bus, not the webhook lane. No MCP twin (SSE has no MCP transport). |
+| `GET`  | `/.well-known/agent-card.json` | #8444 — Agent2Agent (A2A 1.0) Agent Card. **Authenticated callers only** (posture P1): the route sits behind the existing `api_key_auth`, so an unauthenticated GET is `401`; no exemption exists. Declares `capabilities {streaming:false, pushNotifications:false, extendedAgentCard:false, extensions:[]}`, one `supportedInterfaces` entry (`protocolBinding:"JSONRPC"`, `protocolVersion:"1.0"`, url `<base>/api/v1/a2a`, where `<base>` is the configured `AI_MEMORY_PUBLIC_URL` or else the daemon's own scheme (`https` under TLS) and bind address, never the request `Host` or `X-Forwarded-Proto`), the `apiKey` security scheme (header `x-api-key`) and one skill, `memory-inbox`. `mtls` is deliberately not declared (it would need a wider `/api/v1/sync/*` auth bypass). Served on both backends. |
+| `POST` | `/api/v1/a2a` | #8444 — the ONE Agent2Agent JSON-RPC 2.0 endpoint. Behind `api_key_auth` plus a credential-derived agent identity (fail-closed; an open/keyless server answers `401`). Methods: `SendMessage` (synchronous: the Task is `TASK_STATE_COMPLETED` in the response), `GetTask`, `ListTasks`, `CancelTask`. Declared unsupported: `SendStreamingMessage`, `SubscribeToTask`, `GetExtendedAgentCard` answer `-32004`; the four `*TaskPushNotificationConfig` methods answer `-32003`; an unknown method answers `-32601`. Requires `Content-Type: application/json`; `A2A-Version` is accepted when absent or `1.0` (anything else `-32009`) and `A2A-Version: 1.0` is returned on every response the A2A handlers produce (a `401` from the shared authentication layer is answered before the handler runs and carries none). Every inbound message is stored in the caller's `_inbox/<caller>` and stamped with `content_principal` (the authenticated agent id, never `X-Agent-Id` or the body) and `a2a_role` (untrusted label). A task owned by another caller answers `-32001` with HTTP `404`, never `403`. See *A2A error table* below and `docs/a2a-integration.md` section 10. |
 | `GET` `POST` `DELETE` | `/api/v1/skill/list`, `/api/v1/skill/register`, `/api/v1/skill/{id}`, `/api/v1/skill/{id}/resource`, `/api/v1/skill/{id}/export`, `/api/v1/skill/{id}/promote`, `/api/v1/skill/{id}/compose` | Cluster E API-2 (#767) — Agent Skills HTTP parity for the seven `memory_skill_*` MCP tools. **Admin-gated.** `…/export` writes on the daemon host and is **jailed** — see *Skills export root* below. |
 | `POST` | `/api/v1/memory_smart_load`, `/api/v1/memory_reflect`, `/api/v1/memory_recall_observations`, `/api/v1/memory_reflection_origin`, `/api/v1/memory_dependents_of_invalidated`, `/api/v1/memory_export_reflection`, `/api/v1/memory_atomise`, `/api/v1/memory_calibrate_confidence`, `/api/v1/memory_verify`, `/api/v1/memory_replay`, `/api/v1/memory_subscription_replay`, `/api/v1/memory_subscription_dlq_list`, `/api/v1/memory_rule_list`, `/api/v1/memory_check_agent_action` | #1111 — 14 thin HTTP wrappers around the same-named MCP substrate handlers (`src/handlers/route_1111.rs`); wire envelopes are byte-equal across MCP and HTTP. `memory_subscription_replay` events carry `delivery_status`: `ack` / `failed` are terminal; **`pending` means no terminal status was recorded — including a delivery that settled but whose terminal status write failed** ([#3659](https://github.com/alphaonedev/ai-memory-mcp/issues/3659)), so the field alone cannot separate in-flight from lost; a row still `pending` past the 60 s settle window is the lost case (`doctor` warns; the reliable write is [#3735](https://github.com/alphaonedev/ai-memory-mcp/issues/3735)). **`/api/v1/memory_calibrate_confidence` is a caller-scoped aggregate ([#3507](https://github.com/alphaonedev/ai-memory-mcp/issues/3507)):** the report's `baselines` NAME namespaces, so the sweep is computed only over rows the caller can read, using the store's own visibility predicates (subtree scopes, owner-keyed `scope=private`, substrate exclusion) on BOTH backends. `X-Agent-Id` is REQUIRED — an absent header answers `403`, never the pre-#3507 corpus-wide sweep, because the shared resolver would otherwise synthesize a per-request `anonymous:req-…` that owns no rows. An admin caller (the existing `is_admin_caller_trusted` gate) keeps the global aggregate; every other caller is scoped, and for a scoped caller the sweep is strictly read-only (the `recall_outcome` backfill is admin-only, so `consumption_utility` may report `null`). |
 | `GET`  | `/api/v1/admin/quarantine` | v1.0.0 [#2402](https://github.com/alphaonedev/ai-memory-mcp/issues/2402) — list the memories currently held in federation quarantine (`handlers::list_quarantined`). **Admin-gated.** Identifying metadata ONLY (id, namespace, title, source, kind, timestamps) — never `content`: a quarantined row is untrusted input by construction and its content may be an at-rest seal sentinel. `?namespace=` narrows, `?limit=` pages (clamped to 1000). |
@@ -1786,6 +1788,32 @@ PostgreSQL promotion remains 501 (#3183); its allowed path is not applicable unt
 
 
 HTTP `POST /api/v1/capture_turn` uses the HTTP-direct attestation posture (#3406): unsigned requests are refused with `403 ATTESTATION_FAILED` by default; `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0` or `false` explicitly permits them and emits an audit admission event. A presented host signature must verify against the L4 host-key allowlist **and** the resolved caller's bound public key, on both SQLite and PostgreSQL; the opt-out never relaxes these checks. The legacy envelope signs only `host_session_id`, `host_turn_index`, `role`, and `content` (NUL-separated), so it remains `signed_by_peer`, never `agent_attested`: identity, namespace, and timestamp are not signed fields. Durable `(session, turn)` deduplication makes repeats idempotent (`200`, the original memory ID, no new write); the 600-second `SignableWrite` replay ledger does not apply. MCP capture behavior is unchanged. A fully bound capture envelope is tracked separately in #3575.
+
+#### A2A error table (#8444)
+
+`POST /api/v1/a2a` answers every failure as a JSON-RPC error envelope. Parse
+errors (`-32700`) and invalid requests (`-32600`) answer HTTP `200`, per
+JSON-RPC over HTTP; every other code maps as below.
+
+| Code | Meaning | HTTP |
+|---|---|---|
+| `-32001` | task not found (also another caller's task) | 404 |
+| `-32002` | task not cancelable (terminal state) | 400 |
+| `-32003` | push notification not supported | 400 |
+| `-32004` | operation not supported (streaming, subscribe, extended card) | 400 |
+| `-32005` | content type not supported (non-JSON request, or a `file` part) | 400 |
+| `-32006` | invalid agent response | 500 |
+| `-32007` | authenticated extended card not configured | 400 |
+| `-32008` | extension support required | 400 |
+| `-32009` | version not supported (`A2A-Version` other than `1.0`) | 400 |
+| `-32601` | method not found | 404 |
+| `-32602` | invalid params (includes `pageSize` below 1 and a `taskId`/`contextId` mismatch) | 400 |
+| `-32603` | internal error | 500 |
+
+`ListTasks` is scoped to the caller; `pageSize` above 100 is clamped to 100;
+a negative `historyLength` clamps to 0. Terminal tasks are retained per agent
+up to a fixed bound (the oldest terminal tasks beyond it are pruned; active
+tasks are never pruned).
 
 #### Skills export root (#3357)
 
@@ -1815,12 +1843,12 @@ This is the write-side twin of the `AI_MEMORY_SKILLS_IMPORT_ROOT` register jail
 (#1923). The process working directory is deliberately NOT the fallback root: a
 daemon's CWD is arbitrary — frequently `/` or `$HOME` — which is not a jail.
 
-> **Total HTTP surface at v1.0.0: 89 unique URL paths across 103
+> **Total HTTP surface at v1.0.0: 91 unique URL paths across 105
 > production route registrations** (several paths carry more than one
 > method), on the sqlite-backed daemon and on the postgres-backed daemon
 > under `--features sal-postgres`. Both numbers are pinned in
-> `src/lib.rs` as `EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT = 89` and
-> `EXPECTED_PRODUCTION_ROUTES_COUNT = 103`, asserted by
+> `src/lib.rs` as `EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT = 91` and
+> `EXPECTED_PRODUCTION_ROUTES_COUNT = 105`, asserted by
 > `tests/route_count_invariant.rs`. Three further routes are
 > `#[cfg(test)]`-gated and never registered in a production build
 > (`EXPECTED_TEST_ROUTES_COUNT = 3`).
@@ -1831,7 +1859,7 @@ daemon's CWD is arbitrary — frequently `/` or `$HOME` — which is not a jail.
 > grep -oE '"/[^"]*"' src/handlers/routes.rs | sort -u | wc -l
 > ```
 >
-> That count is `EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT` (89): the
+> That count is `EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT` (91): the
 > `/api/v1/*` paths plus the bare `/metrics`. Do not count `.route(`
 > occurrences in `src/lib.rs` to get the registration total — the
 > router also registers test-only routes under `#[cfg(test)]`, so a

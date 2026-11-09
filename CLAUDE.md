@@ -58,11 +58,11 @@ Gates that check the environment-variable table or pinned counts read it there.
 
 These bind you even if you never open `docs/reference/ARCHITECTURE_REFERENCE.md`. Quoted verbatim (line breaks joined), anchored `file:line`:
 
-- `ARCHITECTURE_REFERENCE.md:132` "Do not "fix" `resolve_store_url` to match the general ladder."
-- `ARCHITECTURE_REFERENCE.md:141-143` "**Classification.** `secret` = leaks credentials or override authority if logged or echoed; MUST NOT appear in capabilities, banners, audit records, or `tracing` output. `config` = operational knob, safe to"
-- `ARCHITECTURE_REFERENCE.md:144` "echo. `test-only` = honored in test builds; never set in production."
-- `ARCHITECTURE_REFERENCE.md:648-650` "marker. See design discussion on issue #148. **agent_id is a *claimed* identity, not an *attested* one** — do not use it for security decisions without pairing with agent registration (Task 1.3, upcoming)."
-- `ARCHITECTURE_REFERENCE.md:732-739` "**Special metadata keys produced by the system** (do not overwrite):  - `imported_from_agent_id` — original claim preserved when `ai-memory import` restamps agent_id with caller's id (absent when `--trust-source` is passed) - `consolidated_from_agents` — array of source authors, preserved on `memory_consolidate` (the consolidator's id becomes `agent_id`) - `mined_from` — source format tag (`claude` / `chatgpt` / `slack`) stamped by `ai-memory mine` alongside the caller's `agent_id`"
+- `ARCHITECTURE_REFERENCE.md:133` "Do not "fix" `resolve_store_url` to match the general ladder."
+- `ARCHITECTURE_REFERENCE.md:142-144` "**Classification.** `secret` = leaks credentials or override authority if logged or echoed; MUST NOT appear in capabilities, banners, audit records, or `tracing` output. `config` = operational knob, safe to"
+- `ARCHITECTURE_REFERENCE.md:145` "echo. `test-only` = honored in test builds; never set in production."
+- `ARCHITECTURE_REFERENCE.md:649-651` "marker. See design discussion on issue #148. **agent_id is a *claimed* identity, not an *attested* one** — do not use it for security decisions without pairing with agent registration (Task 1.3, upcoming)."
+- `ARCHITECTURE_REFERENCE.md:733-740` "**Special metadata keys produced by the system** (do not overwrite):  - `imported_from_agent_id` — original claim preserved when `ai-memory import` restamps agent_id with caller's id (absent when `--trust-source` is passed) - `consolidated_from_agents` — array of source authors, preserved on `memory_consolidate` (the consolidator's id becomes `agent_id`) - `mined_from` — source format tag (`claude` / `chatgpt` / `slack`) stamped by `ai-memory mine` alongside the caller's `agent_id`"
 
 ## Adding New Functionality
 
@@ -96,7 +96,7 @@ These bind you even if you never open `docs/reference/CODE_STYLE.md`. Quoted ver
 
 > Overrides any framing of "non-blocking", "trend-line" or "surface-level". Applies to every agent touching this repository.
 
-**The rule.** If you find an issue, OPEN AN ISSUE, TRACK THE ISSUE, FIX THE ISSUE. Every issue gets fixed; there is no "surface-level" issue, every gap is a defect. World-class only (104 MCP tools at `--profile full`, 103 production HTTP route registrations / 89 unique URL paths, 99 CLI subcommands (97 in the default build) at v1.0.0).
+**The rule.** If you find an issue, OPEN AN ISSUE, TRACK THE ISSUE, FIX THE ISSUE. Every issue gets fixed; there is no "surface-level" issue, every gap is a defect. World-class only (104 MCP tools at `--profile full`, 105 production HTTP route registrations / 91 unique URL paths, 99 CLI subcommands (97 in the default build) at v1.0.0).
 
 **Mechanics.** Discovery → tracker entry → fix → close is one non-divisible workflow (the discoverer does all three or hands each to a named queue/PR with a tracker reference). Every `auto-filed-by-agent` issue MUST have a "Proposed fix" section (paths + line counts). Per test-campaign phase a "findings" memory lists EVERY anomaly; all reach the tracker before the next phase. Docs-vs-code drift is a defect: file AND fix it. Never classify a finding as "non-blocking", "docs-drift", "trend-line", "MCP-coverage-gap" or any framing that would let the issue rot in a queue. BANNED in writeups and agent reports: "non-blocking", "trend-line gap", "surface-level", "P2/P3 follow-up", "vN+1 polish", "DEFER-TO-V080", "WONTFIX", "operator-decision-pending", "address with rationale", "no network access from this worktree", "out of scope for this session" (when you just haven't done it), "operator should close/commit…", "I lack capability X" (without verification).
 
