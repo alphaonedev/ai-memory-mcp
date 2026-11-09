@@ -27,6 +27,11 @@
 //! independent `OnceLock<Mutex<()>>` statics over the same process-global
 //! writes — a fourth instance of the $HOME per-module-mutex defect
 //! (#1998 -> #2115 -> #2127).
+//!
+//! The shared TLS test PKI is generated under `TMPDIR`. On Unix, its own
+//! directory is removed by a process-exit hook. SIGKILL, abort and a crashed
+//! harness skip that hook; there is no sweep of inherited paths here. Non-Unix
+//! hosts retain the directory after exit because no exit hook is registered.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -365,15 +370,21 @@ pub(crate) fn tls_fixture_paths() -> (PathBuf, PathBuf) {
 /// a leaf it signed whose SANs are the loopback names (`127.0.0.1`, `::1`,
 /// `localhost`), so a VERIFYING client accepts the mock exactly the way a
 /// production peer would — no `danger_accept_invalid_certs` anywhere.
-/// Generated once with rcgen under `TMPDIR` (the `TempDir` lives for the
-/// process; it is dropped with the static, never leaked).
+/// Generated once with rcgen under `TMPDIR`. The static is never dropped;
+/// on Unix the directory is created with mode 0700 and an exit hook removes
+/// only this PKI's owned directory. See the
+/// module documentation for abnormal-exit and non-Unix limitations.
 pub(crate) struct TlsTestPki {
+    #[cfg(unix)]
+    dir: tempfile::TempDir,
+    // Non-Unix retains ownership without an exit hook or a field read.
+    #[cfg(not(unix))]
     _dir: tempfile::TempDir,
     /// The CA certificate (PEM) a client adds as its root.
     pub(crate) ca_pem: PathBuf,
     /// The leaf certificate (PEM) a mock listener presents.
     pub(crate) leaf_pem: PathBuf,
-    /// The leaf's PKCS#8 private key (PEM, mode 0600).
+    /// The leaf's PKCS#8 private key (PEM, created with mode 0600 on Unix).
     pub(crate) leaf_key_pem: PathBuf,
 }
 
@@ -381,11 +392,78 @@ static TLS_TEST_PKI: OnceLock<TlsTestPki> = OnceLock::new();
 
 /// The process-wide [`TlsTestPki`] (generated on first use).
 pub(crate) fn tls_test_pki() -> &'static TlsTestPki {
-    TLS_TEST_PKI.get_or_init(generate_tls_test_pki)
+    let pki = TLS_TEST_PKI.get_or_init(generate_tls_test_pki);
+    register_tls_test_pki_cleanup();
+    pki
+}
+
+/// Copy `governance::audit::register_exit_drain` without adding a dependency.
+fn register_tls_test_pki_cleanup() {
+    static REGISTERED: std::sync::Once = std::sync::Once::new();
+    REGISTERED.call_once(|| {
+        #[cfg(unix)]
+        {
+            extern "C" fn remove_tls_test_pki_at_exit() {
+                use std::io::Write as _;
+
+                // UNSAFE-24: contain all unwinding before returning to the C exit handler.
+                if std::panic::catch_unwind(|| {
+                    if let Some(pki) = TLS_TEST_PKI.get()
+                        && let Err(error) = std::fs::remove_dir_all(pki.dir.path())
+                    {
+                        // Tracing may already be torn down. Discard only stderr write errors.
+                        let _ = writeln!(std::io::stderr(), "test PKI cleanup error (#8651): {error}");
+                    }
+                })
+                .is_err()
+                {
+                    let _ = writeln!(std::io::stderr(), "test PKI cleanup panicked (#8651)");
+                }
+            }
+
+            // SAFETY: atexit only records an extern C function pointer. The
+            // handler never unwinds (UNSAFE-24) and touches only process-global
+            // OnceLock state that outlives main. Registration occurs once.
+            let rc = unsafe { libc::atexit(remove_tls_test_pki_at_exit) };
+            if rc != 0 {
+                // ERRORS-19: failed registration must be visible to the runner.
+                tracing::error!(
+                    "test PKI cleanup registration returned {rc}; its directory remains at exit (#8651)"
+                );
+            }
+        }
+    });
+}
+
+/// #8663: create exclusively with private permissions before returning the handle.
+fn create_tls_test_private_key(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        const PRIVATE_KEY_MODE: u32 = 0o600;
+        options.mode(PRIVATE_KEY_MODE);
+    }
+    // ERRORS-01: preserve the exact I/O kind, including AlreadyExists.
+    options.open(path)
 }
 
 fn generate_tls_test_pki() -> TlsTestPki {
-    let dir = tempfile::tempdir().expect("TMPDIR tempdir for the #3705 test PKI");
+    use std::io::Write as _;
+
+    #[cfg(unix)]
+    let dir = {
+        use std::os::unix::fs::PermissionsExt as _;
+        const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
+        // #8663: tempfile passes this mode to DirBuilder before mkdir, not chmod.
+        tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE))
+            .tempdir()
+    };
+    #[cfg(not(unix))]
+    let dir = tempfile::tempdir();
+    let dir = dir.expect("TMPDIR tempdir for the #3705 test PKI");
     let ca_key = rcgen::KeyPair::generate().expect("test CA key");
     let mut ca_params =
         rcgen::CertificateParams::new(Vec::<String>::new()).expect("test CA params");
@@ -413,14 +491,15 @@ fn generate_tls_test_pki() -> TlsTestPki {
     let leaf_key_pem = dir.path().join("test-leaf-key.pem");
     std::fs::write(&ca_pem, ca_cert.pem()).expect("write test CA");
     std::fs::write(&leaf_pem, leaf_cert.pem()).expect("write test leaf");
-    std::fs::write(&leaf_key_pem, leaf_key.serialize_pem()).expect("write test leaf key");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&leaf_key_pem, std::fs::Permissions::from_mode(0o600))
-            .expect("chmod 0600 test leaf key");
-    }
+    let mut key_file =
+        create_tls_test_private_key(&leaf_key_pem).expect("create private test leaf key");
+    key_file
+        .write_all(leaf_key.serialize_pem().as_bytes())
+        .expect("write test leaf key");
     TlsTestPki {
+        #[cfg(unix)]
+        dir,
+        #[cfg(not(unix))]
         _dir: dir,
         ca_pem,
         leaf_pem,
@@ -583,6 +662,284 @@ mod tests {
         EnvGuard, LineageDagIsolation, env_lock, env_mutex, lineage_dag_mutex,
         no_lineage_dag_guard, simulate_production_lineage_seed,
     };
+
+    /// #8651: a child owns its generated PKI until exit, then leaves no files.
+    #[cfg(unix)]
+    #[test]
+    fn tls_test_pki_is_removed_after_child_exit_8651() {
+        const CHILD: &str = "AI_MEMORY_TLS_PKI_CHILD_8651";
+        const TEST: &str = concat!(
+            module_path!(),
+            "::",
+            stringify!(tls_test_pki_is_removed_after_child_exit_8651)
+        );
+        if std::env::var_os(CHILD).is_some() {
+            let pki = super::tls_test_pki();
+            for path in [&pki.ca_pem, &pki.leaf_pem, &pki.leaf_key_pem] {
+                assert!(path.is_file(), "generated PKI file must exist: {path:?}");
+            }
+            assert!(
+                std::ptr::eq(pki, super::tls_test_pki()),
+                "all callers must share the process PKI"
+            );
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                const PRIVATE_KEY_MODE: u32 = 0o600;
+                const PERMISSION_BITS: u32 = 0o777;
+                let mode = std::fs::metadata(&pki.leaf_key_pem)
+                    .expect("leaf key metadata")
+                    .permissions()
+                    .mode();
+                assert_eq!(
+                    mode & PERMISSION_BITS,
+                    PRIVATE_KEY_MODE,
+                    "leaf key permissions must stay private"
+                );
+            }
+            return;
+        }
+        let scratch = tempfile::tempdir().expect("parent-owned PKI test scratch");
+        let tmp = scratch.path().join("child-tmp");
+        std::fs::create_dir(&tmp).expect("dedicated child TMPDIR");
+        let test = TEST.split_once("::").expect("crate-qualified test name").1;
+        let mut command = crate::spawn_audit::audited_command(
+            std::env::current_exe().expect("lib test binary"),
+            "test_support::tls_test_pki_is_removed_after_child_exit_8651",
+        );
+        command
+            .args(["--exact", test, "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1")
+            .env("AI_MEMORY_NO_CONFIG", "1");
+        for name in ["TMPDIR", "TMP", "TEMP"] {
+            command.env(name, &tmp);
+        }
+        let output = run_pki_child_8651(command, scratch.path());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "PKI child: {stdout}\n{stderr}");
+        assert!(
+            stdout.contains("1 passed") && !stdout.contains("0 passed"),
+            "PKI child must run exactly the selected test: {stdout}"
+        );
+        assert!(
+            std::fs::read_dir(&tmp)
+                .expect("read child TMPDIR")
+                .next()
+                .is_none(),
+            "#8651: child exit must remove every generated PKI file and directory"
+        );
+    }
+
+    /// #8663: a permissive runner umask must not expose the PKI or leaf key.
+    #[cfg(unix)]
+    #[test]
+    fn tls_test_pki_starts_private_under_open_umask_8663() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        const CHILD: &str = "AI_MEMORY_TLS_PKI_CHILD_8663";
+        const TEST: &str = concat!(
+            module_path!(),
+            "::",
+            stringify!(tls_test_pki_starts_private_under_open_umask_8663)
+        );
+        const PERMISSIVE_UMASK: libc::mode_t = 0;
+        const PERMISSION_BITS: u32 = 0o777;
+        const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
+        const PRIVATE_KEY_MODE: u32 = 0o600;
+        if std::env::var_os(CHILD).is_some() {
+            // SAFETY: umask takes an integer and has no pointer preconditions.
+            // Only this selected test runs in the child; the parent's umask is
+            // unchanged, and this child exits after the permission assertions.
+            unsafe { libc::umask(PERMISSIVE_UMASK) };
+            let pki = super::tls_test_pki();
+            let directory = pki.leaf_key_pem.parent().expect("PKI directory");
+            for (path, expected, kind) in [
+                (directory, PRIVATE_DIRECTORY_MODE, "directory"),
+                (pki.leaf_key_pem.as_path(), PRIVATE_KEY_MODE, "private key"),
+            ] {
+                let actual = std::fs::metadata(path)
+                    .expect("PKI permissions")
+                    .permissions()
+                    .mode()
+                    & PERMISSION_BITS;
+                assert_eq!(
+                    actual, expected,
+                    "#8663: {kind} must be private with umask 0"
+                );
+            }
+            return;
+        }
+        // Keep even the deliberately insecure red fixture behind a private parent.
+        let scratch = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE))
+            .tempdir()
+            .expect("parent-owned permission test scratch");
+        let tmp = scratch.path().join("child-tmp");
+        std::fs::create_dir(&tmp).expect("dedicated permission child TMPDIR");
+        let test = TEST.split_once("::").expect("crate-qualified test name").1;
+        let mut command = crate::spawn_audit::audited_command(
+            std::env::current_exe().expect("lib test binary"),
+            "test_support::tls_test_pki_starts_private_under_open_umask_8663",
+        );
+        command
+            .args(["--exact", test, "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1")
+            .env("AI_MEMORY_NO_CONFIG", "1");
+        for name in ["TMPDIR", "TMP", "TEMP"] {
+            command.env(name, &tmp);
+        }
+        let output = run_pki_child_8651(command, scratch.path());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "permission child: {stdout}\n{stderr}"
+        );
+        assert!(
+            stdout.contains("1 passed") && !stdout.contains("0 passed"),
+            "permission child must execute the selected test: {stdout}"
+        );
+    }
+
+    /// #8663: observe creation permissions before the first write or chmod.
+    #[cfg(unix)]
+    #[test]
+    fn tls_private_key_creation_is_private_8663() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        const CHILD: &str = "AI_MEMORY_TLS_KEY_CREATION_CHILD_8663";
+        const TEST: &str = concat!(
+            module_path!(),
+            "::",
+            stringify!(tls_private_key_creation_is_private_8663)
+        );
+        const PERMISSIVE_UMASK: libc::mode_t = 0;
+        const PERMISSION_BITS: u32 = 0o777;
+        const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
+        const PRIVATE_KEY_MODE: u32 = 0o600;
+        if std::env::var_os(CHILD).is_some() {
+            // SAFETY: the integer-only umask call is isolated to this re-executed
+            // child, which runs one test and exits; the parent umask is unchanged.
+            unsafe { libc::umask(PERMISSIVE_UMASK) };
+            let pki = super::tls_test_pki();
+            let directory = pki.leaf_key_pem.parent().expect("owned PKI directory");
+            let path = directory.join("creation-probe.pem");
+            let file = super::create_tls_test_private_key(&path).expect("new private key");
+            let metadata = file.metadata().expect("new key handle metadata");
+            assert_eq!(
+                metadata.permissions().mode() & PERMISSION_BITS,
+                PRIVATE_KEY_MODE,
+                "#8663: key must be born private before any write or chmod"
+            );
+            assert_eq!(metadata.len(), 0, "#8663: key has not been written yet");
+            assert_eq!(
+                std::fs::metadata(directory)
+                    .expect("owned PKI directory metadata")
+                    .permissions()
+                    .mode()
+                    & PERMISSION_BITS,
+                PRIVATE_DIRECTORY_MODE,
+                "#8663: key must be created inside the private PKI directory"
+            );
+            return;
+        }
+        let scratch = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE))
+            .tempdir()
+            .expect("private parent-owned creation scratch");
+        let tmp = scratch.path().join("child-tmp");
+        std::fs::create_dir(&tmp).expect("creation child TMPDIR");
+        let test = TEST.split_once("::").expect("crate-qualified test name").1;
+        let mut command = crate::spawn_audit::audited_command(
+            std::env::current_exe().expect("lib test binary"),
+            "test_support::tls_private_key_creation_is_private_8663",
+        );
+        command
+            .args(["--exact", test, "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1")
+            .env("AI_MEMORY_NO_CONFIG", "1");
+        for name in ["TMPDIR", "TMP", "TEMP"] {
+            command.env(name, &tmp);
+        }
+        let output = run_pki_child_8651(command, scratch.path());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "creation child: {stdout}\n{stderr}"
+        );
+        assert!(
+            stdout.contains("1 passed") && !stdout.contains("0 passed"),
+            "creation child must execute the selected test: {stdout}"
+        );
+    }
+
+    /// #8663: exclusive creation must preserve every byte at an existing path.
+    #[test]
+    fn tls_private_key_existing_path_is_unchanged_8663() {
+        const NAMES: [&str; 3] = ["existing.pem", "existing key.pem", "existing-λ.pem"];
+        const ORIGINAL: &[u8] = b"existing fixture bytes\x00\xff\n";
+        let directory = tempfile::tempdir().expect("existing-key fixture directory");
+        for name in NAMES {
+            let path = directory.path().join(name);
+            std::fs::write(&path, ORIGINAL).expect("seed existing fixture");
+            let result = super::create_tls_test_private_key(&path);
+            let bytes = std::fs::read(&path).expect("read existing fixture after refusal");
+            assert_eq!(
+                bytes, ORIGINAL,
+                "#8663: existing bytes must survive: {name}"
+            );
+            let error = result.expect_err("#8663: an existing key must be refused");
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::AlreadyExists,
+                "#8663: existing key error must be exact: {name}"
+            );
+        }
+    }
+
+    /// Copy the #8166 file-capture and bounded child-reaping precedent.
+    #[cfg(unix)]
+    fn run_pki_child_8651(
+        mut command: std::process::Command,
+        scratch: &std::path::Path,
+    ) -> std::process::Output {
+        // Hang guard, not a latency budget; startup under CI load is included.
+        const CHILD_HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(60);
+        const CHILD_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
+        let stdout = scratch.join("stdout");
+        let stderr = scratch.join("stderr");
+        let mut child = command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::fs::File::create(&stdout).expect("child stdout capture"))
+            .stderr(std::fs::File::create(&stderr).expect("child stderr capture"))
+            .spawn()
+            .expect("spawn isolated PKI child");
+        let deadline = std::time::Instant::now() + CHILD_HANG_GUARD;
+        let timed_out = loop {
+            if child.try_wait().expect("poll PKI child").is_some() {
+                break false;
+            }
+            if std::time::Instant::now() >= deadline {
+                break true;
+            }
+            std::thread::sleep(CHILD_POLL_INTERVAL);
+        };
+        // CONCURRENCY-11: always reap before reading captures or dropping scratch.
+        let kill_error = if timed_out { child.kill().err() } else { None };
+        let output = std::process::Output {
+            status: child.wait().expect("reap PKI child"),
+            stdout: std::fs::read(stdout).expect("read child stdout"),
+            stderr: std::fs::read(stderr).expect("read child stderr"),
+        };
+        assert!(
+            !timed_out,
+            "PKI child hang guard expired; kill error={kill_error:?}: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    }
 
     /// #3523 — the OBSERVED singleton pin: `test_support::env_lock()` and
     /// `config::test_env_lock()` are ONE mutex, not two.
