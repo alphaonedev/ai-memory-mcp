@@ -1816,6 +1816,9 @@ mod url_run_tests;
 mod scan_work_tests;
 
 #[cfg(test)]
+mod scan_timing_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
