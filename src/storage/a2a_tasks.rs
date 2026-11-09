@@ -475,6 +475,18 @@ pub fn a2a_task_transition(
     Ok(changed == 1)
 }
 
+// v101 (#8444): durable `a2a_tasks` table for the Agent2Agent standard
+// binding. Additive `CREATE TABLE IF NOT EXISTS`, idempotent, NoLoss. The
+// postgres twin is `PostgresStore::migrate_v101`.
+const MIGRATION_V101_SQLITE: &str = include_str!("../../migrations/sqlite/0085_v101_a2a_tasks.sql");
+
+pub(super) fn migrate_v101(conn: &Connection) -> Result<()> {
+    conn.execute_batch(MIGRATION_V101_SQLITE)?;
+    conn.execute(super::migrations::SQL_CLEAR_SCHEMA_VERSION, [])?;
+    conn.execute("INSERT INTO schema_version (version) VALUES (101)", [])?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1815,19 +1815,7 @@ const MIGRATION_V97_SQLITE: &str =
 const MIGRATION_V98_SQLITE: &str =
     include_str!("../../migrations/sqlite/0082_v98_canonical_inbox_namespace.sql");
 
-// v100 (#3690 / #3695 / #3699): the (title, namespace) unique index becomes
-// PARTIAL — tombstoned rows give up their slot so a later store of the same
-// title lands as a fresh, visible row instead of inside the hidden one. The
-// postgres twin is `PostgresStore::migrate_v100`.
-const MIGRATION_V100_SQLITE: &str =
-    include_str!("../../migrations/sqlite/0084_v100_title_slot_live_rows.sql");
-
-// v101 (#8444): durable `a2a_tasks` table for the Agent2Agent standard
-// binding. Additive `CREATE TABLE IF NOT EXISTS`, idempotent, NoLoss. The
-// postgres twin is `PostgresStore::migrate_v101`.
-const MIGRATION_V101_SQLITE: &str = include_str!("../../migrations/sqlite/0085_v101_a2a_tasks.sql");
-
-const SQL_CLEAR_SCHEMA_VERSION: &str = "DELETE FROM schema_version";
+pub(super) const SQL_CLEAR_SCHEMA_VERSION: &str = "DELETE FROM schema_version";
 
 fn migrate_v98(conn: &Connection) -> Result<()> {
     conn.execute_batch(MIGRATION_V98_SQLITE)?;
@@ -1851,20 +1839,6 @@ fn migrate_v99(conn: &Connection) -> Result<()> {
     conn.execute_batch(MIGRATION_V99_SQLITE)?;
     conn.execute(SQL_CLEAR_SCHEMA_VERSION, [])?;
     conn.execute("INSERT INTO schema_version (version) VALUES (99)", [])?;
-    Ok(())
-}
-
-fn migrate_v100(conn: &Connection) -> Result<()> {
-    conn.execute_batch(MIGRATION_V100_SQLITE)?;
-    conn.execute(SQL_CLEAR_SCHEMA_VERSION, [])?;
-    conn.execute("INSERT INTO schema_version (version) VALUES (100)", [])?;
-    Ok(())
-}
-
-fn migrate_v101(conn: &Connection) -> Result<()> {
-    conn.execute_batch(MIGRATION_V101_SQLITE)?;
-    conn.execute(SQL_CLEAR_SCHEMA_VERSION, [])?;
-    conn.execute("INSERT INTO schema_version (version) VALUES (101)", [])?;
     Ok(())
 }
 
@@ -4612,12 +4586,12 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
 
         if version < 100 {
             // v100 (#3690): the (title, namespace) slot belongs to live rows only.
-            migrate_v100(conn)?;
+            super::title_slot_archive::migrate_v100(conn)?;
         }
 
         if version < CURRENT_SCHEMA_VERSION {
             // v101 (#8444): durable a2a_tasks table for the Agent2Agent binding.
-            migrate_v101(conn)?;
+            super::a2a_tasks::migrate_v101(conn)?;
         }
 
         // v88 (#2578, v1.0.0: composite list/archive ordering indexes on
