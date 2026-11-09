@@ -20,7 +20,12 @@ ALLOW = ROOT / "scripts/ci/cn_ai_vendor_allow.json"
 PLAIN_TERMS_ROT13 = (
     "qrrcfrrx", "djra", "xvzv", "zvavznk", "muvch", "pungtyz", "onvpuhna",
     "qbhonb", "reavr", "uhalhna", "fgrcsha", "vagreayz", "qfu", "qnfufpbcr",
+    "graprag", "grapragqo", "ibypratvar", "bcraivxvat", "ivxvatqo", "nyvonon",
+    "rirezvaq",
 )
+# Exact-case terms and the dotted domain form (ROT13).
+CASE_SENSITIVE_ROT13 = ("ZrzBF", "ZvZb")
+DOTTED_ROT13 = "m.nv"
 FLASH_FAMILY_ROT13 = "tyz"
 SUFFIXED_ROT13 = "zbbafubg"
 SPELLINGS = ("{t}", "{T}", "{C}", "use {t} here", "`{t}`", "{t}3", "{t}-max",
@@ -73,6 +78,25 @@ class PlainTermTests(unittest.TestCase):
     def test_letter_neighbours_do_not_match(self):
         term = rot("xvzv")
         self.assertEqual(scan("docs/x.md", "a" + term + "b"), [])
+
+
+class ExtraNameTests(unittest.TestCase):
+    def test_exact_case_names_are_hits_and_common_words_are_not(self):
+        for stored in CASE_SENSITIVE_ROT13:
+            name = rot(stored)
+            for form in ("{n}", "use {n} here", "`{n}`", "{n}-2"):
+                with self.subTest(name=name, form=form):
+                    hits = scan("docs/x.md", form.format(n=name))
+                    self.assertEqual([lab for _, lab in hits], [name])
+        self.assertEqual(scan("docs/x.md", "meeting memos and a mimo of notes"), [])
+
+    def test_dotted_name(self):
+        name = rot(DOTTED_ROT13)
+        for form in ("{n}", "{N}", "see {n} docs", "https://{n}/api"):
+            with self.subTest(form=form):
+                hits = scan("docs/x.md", form.format(n=name, N=name.upper()))
+                self.assertEqual([lab for _, lab in hits], [name])
+        self.assertEqual(scan("docs/x.md", "buz" + "." + "ai and x" + name), [])
 
 
 class MoonshotTests(unittest.TestCase):
