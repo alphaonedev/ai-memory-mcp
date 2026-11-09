@@ -2,9 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Scripted agent-to-agent (A2A) choreographies.
 
-Where :class:`swarm.agent.SwarmAgent` is GLM-DRIVEN (the model chooses each
+Where :class:`swarm.agent.SwarmAgent` is FLASH-DRIVEN (the model chooses each
 action), these choreographies are DETERMINISTIC scripts that exercise specific
-cross-agent invariants against the live, GLM-driven population running around
+cross-agent invariants against the live, Flash-driven population running around
 them. Each scenario returns a :class:`ScenarioResult` recording what it
 asserted so the acceptance report can show the invariant held.
 
@@ -328,7 +328,7 @@ async def full_surface_sweep(swarm: Swarm, agents: list[SwarmAgent] | None = Non
     return ScenarioResult(name, True, " -> ".join(completed))
 
 
-#: ~150k tokens at 4 chars/token — safely inside every model we run (GLM 200k, Grok 500k).
+#: ~150k tokens at 4 chars/token — safely inside every model we run (the Flash model 200k, Grok 500k).
 _AUDIT_EVIDENCE_CHARS = 600_000
 
 

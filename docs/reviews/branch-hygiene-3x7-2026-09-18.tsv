@@ -10,7 +10,7 @@ feat/3322-swarm-rewind	1-MERGED-ANCESTRY	0	669	2026-08-31	0	0	0	0	0	0	0	3322	1	5
 feat/3323-lineage-cost-accounting	1-MERGED-ANCESTRY	0	676	2026-08-30	0	0	0	0	0	0	0	3323	1	383efbef9	feat(cost): per-lineage + per-namespace token/cost accounting (#3323)
 feat/3324-contaminated-lifecycle	1-MERGED-ANCESTRY	0	674	2026-08-30	0	0	0	0	0	0	0	3324	1	ab55252f1	feat(#3324): auto-propagate `contaminated` lifecycle along derives_from on invalidate
 feat/acceptance-nhi-sqlite	1-MERGED-ANCESTRY	0	714	2026-08-30	0	0	0	0	0	0	0	-	-1	4375a1fa3	fix(acceptance): Config-1 harness passes live — admin-header-trust + valid agent_type
-feat/glm-swarm-driver	1-MERGED-ANCESTRY	0	709	2026-08-30	0	0	0	0	0	0	0	-	-1	5c1300a51	test(swarm): add GLM-5.3-Flash acceptance-swarm driver (test-only)
+feat/flash-swarm-driver	1-MERGED-ANCESTRY	0	709	2026-08-30	0	0	0	0	0	0	0	-	-1	5c1300a51	test(swarm): add GLM-5.3-Flash acceptance-swarm driver (test-only)
 fix/2555-schema-version-guard	1-MERGED-ANCESTRY	0	690	2026-08-30	0	0	0	0	0	0	0	2555	1	189140ed3	test(#2555): coverage — boot + doctor poisoned-ledger branches
 fix/3041-provenance-equal-instant	1-MERGED-ANCESTRY	0	667	2026-08-31	0	0	0	0	0	0	0	3041	1	d6508042b	fix(storage): refuse equal-instant provenance edge that closes a cycle (#3041)
 fix/3064-pg-tool-parity	1-MERGED-ANCESTRY	0	417	2026-09-05	0	0	0	0	0	0	0	3064	1	24792d71d	docs(#3064): cite #3507 for the memory_calibrate_confidence caller gate

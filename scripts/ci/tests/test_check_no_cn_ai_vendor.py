@@ -51,6 +51,7 @@ def load_gate():
 
 GATE_MOD = load_gate()
 ALLOW_DATA = json.loads(ALLOW.read_text(encoding="utf-8"))
+EMPTY_ALLOW = {"flash_testing": {"path_prefixes": []}, "functional_code_sites": []}
 
 
 def scan(rel, text):
@@ -286,25 +287,29 @@ class CliTests(unittest.TestCase):
     def test_exit_codes_on_scratch_tree(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
+            allow = root / "allow.json"
+            allow.write_text(json.dumps(EMPTY_ALLOW), encoding="utf-8")
             (root / "a.md").write_text("clean text\n", encoding="utf-8")
-            self.assertEqual(GATE_MOD.main(["--root", tmp, "--allow-file", str(ALLOW)]), 0)
+            self.assertEqual(GATE_MOD.main(["--root", tmp, "--allow-file", str(allow)]), 0)
             (root / "b.md").write_text("see " + rot("djra") + "\n", encoding="utf-8")
-            self.assertEqual(GATE_MOD.main(["--root", tmp, "--allow-file", str(ALLOW)]), 1)
+            self.assertEqual(GATE_MOD.main(["--root", tmp, "--allow-file", str(allow)]), 1)
             self.assertEqual(GATE_MOD.main(["--root", tmp, "--allow-file", str(root / "no.json")]), 2)
 
     def test_binary_file_is_skipped_and_counted(self):
         with tempfile.TemporaryDirectory() as tmp:
             (Path(tmp) / "x.bin").write_bytes(b"\0" + rot("djra").encode())
-            result = GATE_MOD.run_scan(Path(tmp), ALLOW_DATA)
+            result = GATE_MOD.run_scan(Path(tmp), EMPTY_ALLOW)
             self.assertEqual((result.hits, result.skipped_binary), ([], 1))
-            self.assertEqual(GATE_MOD.scan_root(Path(tmp), ALLOW_DATA), [])
+            self.assertEqual(GATE_MOD.scan_root(Path(tmp), EMPTY_ALLOW), [])
 
     def test_skipped_binary_count_is_printed(self):
         with tempfile.TemporaryDirectory() as tmp:
             (Path(tmp) / "x.bin").write_bytes(b"\0\1\2")
             (Path(tmp) / "y.bin").write_bytes(b"\0\1\2")
+            allow = Path(tmp) / "allow.json"
+            allow.write_text(json.dumps(EMPTY_ALLOW), encoding="utf-8")
             out = subprocess.run(
-                ["python3", str(GATE), "--root", tmp, "--allow-file", str(ALLOW), "--count-only"],
+                ["python3", str(GATE), "--root", tmp, "--allow-file", str(allow), "--count-only"],
                 capture_output=True, text=True, check=False)
             self.assertEqual(out.returncode, 0)
             self.assertIn("skipped binary: 2", out.stdout)
@@ -323,7 +328,7 @@ class CliTests(unittest.TestCase):
         for name, raw in encoded.items():
             with self.subTest(codec=name), tempfile.TemporaryDirectory() as tmp:
                 (Path(tmp) / "doc.md").write_bytes(raw)
-                result = GATE_MOD.run_scan(Path(tmp), ALLOW_DATA)
+                result = GATE_MOD.run_scan(Path(tmp), EMPTY_ALLOW)
                 self.assertEqual(result.hits, [("doc.md", 2, term)])
                 self.assertEqual(result.skipped_binary, 0)
 

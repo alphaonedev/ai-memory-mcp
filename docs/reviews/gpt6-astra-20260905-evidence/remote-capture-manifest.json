@@ -132,42 +132,42 @@
       "sha256": "246cfd0b89462a2ae35cb4605107bd3505273264646b9e73d554e4904f8c8185"
     },
     {
-      "captured_path": "f2-runs/journals-nhi-grok46-run2-20260901T225637Z/ai:phase1-glm-1f054492-b765-5c97-a331-026227bd4001.jsonl",
+      "captured_path": "f2-runs/journals-nhi-grok46-run2-20260901T225637Z/ai:phase1-flash-1f054492-b765-5c97-a331-026227bd4001.jsonl",
       "bytes": 127712,
       "sha256": "0e7e00647ac5b56e2e6d89ae02fd8afc03a4350793ff338744bfa823b2314cfc"
     },
     {
-      "captured_path": "f2-runs/journals-nhi-grok46-run2-20260901T225637Z/ai:phase1-glm-363d9cac-3e4f-5c0b-a47d-f9ae53668852.jsonl",
+      "captured_path": "f2-runs/journals-nhi-grok46-run2-20260901T225637Z/ai:phase1-flash-363d9cac-3e4f-5c0b-a47d-f9ae53668852.jsonl",
       "bytes": 171064,
       "sha256": "4326490fbe7aa545461ac6ca8af0a99b489473f01b7b82cf6ee63c1391cb36dd"
     },
     {
-      "captured_path": "f2-runs/journals-nhi-grok46-run2-20260901T225637Z/ai:phase1-glm-58c7e4f8-a711-5690-829e-2af6c9647a78.jsonl",
+      "captured_path": "f2-runs/journals-nhi-grok46-run2-20260901T225637Z/ai:phase1-flash-58c7e4f8-a711-5690-829e-2af6c9647a78.jsonl",
       "bytes": 133835,
       "sha256": "4d82bf35bdc7c0694c54321554c9cb4ab9403735eb1abfde8734f1465941d745"
     },
     {
-      "captured_path": "f2-runs/journals-nhi-grok46-run2-20260901T225637Z/ai:phase1-glm-5a3705b9-5f1d-5623-8f3a-e1576866edf5.jsonl",
+      "captured_path": "f2-runs/journals-nhi-grok46-run2-20260901T225637Z/ai:phase1-flash-5a3705b9-5f1d-5623-8f3a-e1576866edf5.jsonl",
       "bytes": 181177,
       "sha256": "eeead2efd2d341ceb67d7d4b5257c75b539b837a335532de5ccc04ac2b8f05b9"
     },
     {
-      "captured_path": "f2-runs/journals-nhi-grok46-run2-20260901T225637Z/ai:phase1-glm-5c925229-0363-5061-bfd7-469b1519c17d.jsonl",
+      "captured_path": "f2-runs/journals-nhi-grok46-run2-20260901T225637Z/ai:phase1-flash-5c925229-0363-5061-bfd7-469b1519c17d.jsonl",
       "bytes": 85614,
       "sha256": "e1fc0483c566e6fe1a63baa4e92432a5c95c8f306d64f64e4b3d670ef2624c3b"
     },
     {
-      "captured_path": "f2-runs/journals-nhi-grok46-run2-20260901T225637Z/ai:phase1-glm-63cfe063-0bb1-5fc1-aaaf-ee32c487cc64.jsonl",
+      "captured_path": "f2-runs/journals-nhi-grok46-run2-20260901T225637Z/ai:phase1-flash-63cfe063-0bb1-5fc1-aaaf-ee32c487cc64.jsonl",
       "bytes": 106764,
       "sha256": "5c1e3226cdb501fe6829f006ae3b3cf241b30d566774356d206f983f8d461641"
     },
     {
-      "captured_path": "f2-runs/journals-nhi-grok46-run2-20260901T225637Z/ai:phase1-glm-d30227fa-37d5-50a4-842f-2b4895275153.jsonl",
+      "captured_path": "f2-runs/journals-nhi-grok46-run2-20260901T225637Z/ai:phase1-flash-d30227fa-37d5-50a4-842f-2b4895275153.jsonl",
       "bytes": 178154,
       "sha256": "5fea2a9cea4959da1acaae5e3df928632573458c0f5304e8a12d2cc91e0e4afd"
     },
     {
-      "captured_path": "f2-runs/journals-nhi-grok46-run2-20260901T225637Z/ai:phase1-glm-dace7d4e-4342-5a37-a298-dabfb200c3f2.jsonl",
+      "captured_path": "f2-runs/journals-nhi-grok46-run2-20260901T225637Z/ai:phase1-flash-dace7d4e-4342-5a37-a298-dabfb200c3f2.jsonl",
       "bytes": 101369,
       "sha256": "856031abde5a3d2e12dd44c4ac6694e14c9e9bacbe15dc794b7c080dc72e856e"
     },
@@ -202,7 +202,7 @@
       "sha256": "7cf02b7e10f52515b91f5e6a91ae4a8df2d38866b40914d2522d86d901cd18e2"
     },
     {
-      "captured_path": "f2-runs/nhi-assessment-glm.md",
+      "captured_path": "f2-runs/nhi-assessment-flash.md",
       "bytes": 4547,
       "sha256": "a28d8d8b64a501958907c826f0e204d6d6bcb82abfe562f9c6f59939503acddf"
     },

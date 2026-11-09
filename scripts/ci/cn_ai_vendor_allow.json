@@ -1,7 +1,7 @@
 {
   "_comment": "Allowlist data for scripts/ci/check_no_cn_ai_vendor.py. Every entry names its reason.",
   "flash_testing": {
-    "reason": "The one permitted exception: the Flash model in agent cluster, hive and swarm testing.",
+    "reason": "The one permitted exception: a Flash-qualified model token in agent cluster, hive and swarm test material. The qualifier is checked on the token itself; these prefixes only scope where it is allowed.",
     "path_prefixes": [
       "sdk/python/swarm/",
       "sdk/python/pyproject.toml",
@@ -9,8 +9,7 @@
       "docs/testing/",
       "docs/reviews/gpt6-astra-20260905-evidence/",
       "docs/reviews/branch-hygiene-3x7-2026-09-18"
-    ],
-    "line_context_regex": "flash|swarm|hive|cluster|nhi"
+    ]
   },
   "functional_code_sites": [
     {
