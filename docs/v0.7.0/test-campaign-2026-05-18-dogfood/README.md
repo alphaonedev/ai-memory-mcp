@@ -29,7 +29,7 @@ Test count: every dogfood probe that ran returned the expected wire shape and SQ
 
 ## The 4 dogfood findings
 
-1. **[#892](https://github.com/alphaonedev/ai-memory-mcp/issues/892)** — `memory_store` MCP wire schema omitted the `source_uri` property AND the store handler at `/Users/fate/v07/v07-fixes/src/mcp/tools/store/validation.rs:224` hard-coded `source_uri: None`, dropping any caller-supplied URI on the floor. **CLOSED** in commit `39aa158f9` with end-to-end SQL proof that `doc:dogfood-2026-05-19-verify` now persists through the full MCP path.
+1. **[#892](https://github.com/alphaonedev/ai-memory-mcp/issues/892)** — `memory_store` MCP wire schema omitted the `source_uri` property AND the store handler at `<home>/v07/v07-fixes/src/mcp/tools/store/validation.rs:224` hard-coded `source_uri: None`, dropping any caller-supplied URI on the floor. **CLOSED** in commit `39aa158f9` with end-to-end SQL proof that `doc:dogfood-2026-05-19-verify` now persists through the full MCP path.
 2. **[#893](https://github.com/alphaonedev/ai-memory-mcp/issues/893)** — `memory_update` MCP wire schema omitted `expected_version` and `edit_source` (the request-handler code already read them, so the gap was wire-schema-only — but an NHI could not discover the parameters via `tools/list`). `source_uri` update was also exposed. **CLOSED** in the same commit `39aa158f9`.
 3. **[#895](https://github.com/alphaonedev/ai-memory-mcp/issues/895)** — Gap 5 (#888) `SupersedeResult` docstring drift: the docstrings on `SupersedeResult` and the supersede sequence step 4 promised a `memory_links` row with relation `supersedes` was written; the implementation correctly skips it (the foreign-key constraint `target_id REFERENCES memories(id)` would reject pointing at an archived id). Lineage is preserved via `archived_memories.archive_reason='superseded'` and `new_memory.metadata.superseded_id`. **CLOSED** in commit `19b08543c` with a doc-only fix that restates the actual two-mechanism lineage; relaxing the FK or adding a parallel `archive_links` table remains a deeper design choice tracked under the same issue body.
 4. **[#894](https://github.com/alphaonedev/ai-memory-mcp/issues/894)** — Postgres + Apache AGE store missing schema-v44-v47 migrations (Gap 1 `version` column, Gap 2 `source_uri` upgrade path, Gap 3 `recall_observations` table, Gap 5 `edit_source` column) + 6 SAL methods + AGE Cypher snippets for the superseded edge. **FILED + OPEN.** Approximately 600 LOC of postgres + AGE code. Scheduled for the next agent dispatch. Track C cross-store parity stays gapped until this lands.
@@ -65,7 +65,7 @@ The 9,998 sits 2 tokens under the ceiling. The CI guard at `tests/token_budget_g
 
 ## Phase log location
 
-All artifacts live under `/Users/fate/v07/v07-fixes/.local-runs/dogfood-2026-05-18/`:
+All artifacts live under `<home>/v07/v07-fixes/.local-runs/dogfood-2026-05-18/`:
 
 | File | Purpose |
 |------|---------|
@@ -84,9 +84,9 @@ All artifacts live under `/Users/fate/v07/v07-fixes/.local-runs/dogfood-2026-05-
 
 ## Reproducibility contract
 
-1. **Pinned binary at write time** — git SHA `19b08543c` on branch `local/install-815-816` in worktree `/Users/fate/v07/v07-fixes/`. The wire-schema fix is at `39aa158f9`; the doc-drift fix is at `19b08543c`.
-2. **Binary location** — `/Users/fate/v07/v07-fixes/.cargo-shared-target/release/ai-memory` (release build).
-3. **Test DB** — `/Users/fate/v07/v07-fixes/.local-runs/dogfood-2026-05-18/phase_b_v2.db` (fresh; auto-migrated to schema v47 on first MCP open).
+1. **Pinned binary at write time** — git SHA `19b08543c` on branch `local/install-815-816` in worktree `<home>/v07/v07-fixes/`. The wire-schema fix is at `39aa158f9`; the doc-drift fix is at `19b08543c`.
+2. **Binary location** — `<home>/v07/v07-fixes/.cargo-shared-target/release/ai-memory` (release build).
+3. **Test DB** — `<home>/v07/v07-fixes/.local-runs/dogfood-2026-05-18/phase_b_v2.db` (fresh; auto-migrated to schema v47 on first MCP open).
 4. **Models** — `nomic-ai/nomic-embed-text-v1.5` (768-dim embedder), `cross-encoder/ms-marco-MiniLM-L-6-v2` (reranker), `gemma4:e4b` (LLM via Ollama). Tier `semantic` was sufficient for the dogfood probes (no LLM-dependent surfaces tested).
 5. **Authoring agent** — `ai:claude-code@FROSTYi.local:pid-1060` (Claude Opus 4.7, 1M context).
 6. **MCP client identity used in probes** — `df-pb-v2` (Phase B v2 retest).
@@ -118,7 +118,7 @@ Per the prime directive pm-v3 (canonical memory `cd8ede94-3376-4837-b570-9d97529
 | Operator | justin@alpha-one.mobi |
 | Authoring agent | Claude Opus 4.7 (1M context) |
 | Authority | Autonomous execution under pm-v3 (verify-before-claiming + no-operator-handoffs + fix-all-in-current-release) |
-| Prior campaign | `/Users/fate/v07/v07-fixes/docs/v0.7.0/test-campaign-2026-05-18/` (Track A NHI re-run + in-campaign fix batch) |
+| Prior campaign | `<home>/v07/v07-fixes/docs/v0.7.0/test-campaign-2026-05-18/` (Track A NHI re-run + in-campaign fix batch) |
 | Binary at write time | SHA `19b08543c` on branch `local/install-815-816` |
 
 Drafted by Claude Opus 4.7 (1M context).

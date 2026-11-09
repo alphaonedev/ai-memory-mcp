@@ -224,12 +224,14 @@ pub fn run_auto_export(
             return Ok(());
         }
     };
+    // ERRORS-02/15: refuse durable IDs before touching the destination tree.
+    export_reflections::validate_export_id(&mem.id, &mem.namespace)?;
     let edges = collect_outbound_reflects_on(&conn, memory_id)?;
     let attest_level = export_reflections::summarise_attest_level(&edges);
     let payload = export_reflections::render_payload(&mem, &edges, attest_level, config.format);
 
-    let root = export_reflections::private_file::PrivateExportDir::open(&config.out_dir)?;
     let relative = export_reflections::sanitise_namespace_for_path(&mem.namespace)?;
+    let root = export_reflections::private_file::PrivateExportDir::open(&config.out_dir)?;
     let namespace = root.namespace(&relative).with_context(|| {
         export_reflections::private_file::namespace_context(&config.out_dir.join(&relative))
     })?;

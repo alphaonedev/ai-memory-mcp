@@ -8,8 +8,8 @@ layout: doc
 **Probe run:** `truth-4-20260519T161520Z`
 **Base SHA:** `14fb8a7813121469899aa117b6c9a78df4048310`
 (branch `local/install-815-816`)
-**Binary under test:** `/Users/fate/v07/v07-fixes/.cargo-shared-target/release/ai-memory` (size 27.6 MiB, reports `ai-memory 0.7.0`)
-**Probe scratch root:** `/Users/fate/v07/v07-fixes/.local-runs/truth-4-20260519T161520Z/`
+**Binary under test:** `<home>/v07/v07-fixes/.cargo-shared-target/release/ai-memory` (size 27.6 MiB, reports `ai-memory 0.7.0`)
+**Probe scratch root:** `<home>/v07/v07-fixes/.local-runs/truth-4-20260519T161520Z/`
 
 ## 10-axis verdict table
 

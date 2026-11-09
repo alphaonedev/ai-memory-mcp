@@ -69,13 +69,13 @@ Escalation trigger 1 fires (≤2 forms IMPLEMENTED). Recommend correcting the pu
 ### FORM 1 — Online dedup-and-synthesis
 
 Files inspected:
-  - `/Users/fate/v07/audit-batman/src/mcp/tools/store.rs`
-  - `/Users/fate/v07/audit-batman/src/handlers/http.rs`
-  - `/Users/fate/v07/audit-batman/src/llm.rs`
-  - `/Users/fate/v07/audit-batman/src/autonomy.rs`
-  - `/Users/fate/v07/audit-batman/src/storage/mod.rs` (`find_contradictions`)
-  - `/Users/fate/v07/audit-batman/src/mcp/tools/check_duplicate.rs`
-  - `/Users/fate/v07/audit-batman/src/mcp/tools/detect_contradiction.rs`
+  - `<home>/v07/audit-batman/src/mcp/tools/store.rs`
+  - `<home>/v07/audit-batman/src/handlers/http.rs`
+  - `<home>/v07/audit-batman/src/llm.rs`
+  - `<home>/v07/audit-batman/src/autonomy.rs`
+  - `<home>/v07/audit-batman/src/storage/mod.rs` (`find_contradictions`)
+  - `<home>/v07/audit-batman/src/mcp/tools/check_duplicate.rs`
+  - `<home>/v07/audit-batman/src/mcp/tools/detect_contradiction.rs`
 
 Code evidence (the MCP store post-store hook, `src/mcp/tools/store.rs:524-605`):
 ```
@@ -130,11 +130,11 @@ Gap analysis:
 ### FORM 2 — Atomisation (decompose-before-embedding)
 
 Files inspected:
-  - `/Users/fate/v07/audit-batman/src/atomisation/mod.rs`
-  - `/Users/fate/v07/audit-batman/src/atomisation/curator.rs`
-  - `/Users/fate/v07/audit-batman/src/hooks/pre_store/auto_atomise.rs`
-  - `/Users/fate/v07/audit-batman/src/mcp/tools/store.rs` (lines 505-642)
-  - `/Users/fate/v07/audit-batman/src/mcp/tools/atomise.rs`
+  - `<home>/v07/audit-batman/src/atomisation/mod.rs`
+  - `<home>/v07/audit-batman/src/atomisation/curator.rs`
+  - `<home>/v07/audit-batman/src/hooks/pre_store/auto_atomise.rs`
+  - `<home>/v07/audit-batman/src/mcp/tools/store.rs` (lines 505-642)
+  - `<home>/v07/audit-batman/src/mcp/tools/atomise.rs`
 
 Code evidence (the atomiser entry point, `src/atomisation/mod.rs:248-307`):
 ```
@@ -198,10 +198,10 @@ Gap analysis:
 ### FORM 3 — Multi-step ingest (deterministic + LLM with prompt-cache reuse)
 
 Files inspected:
-  - `/Users/fate/v07/audit-batman/src/llm.rs` (every prompt constant)
-  - `/Users/fate/v07/audit-batman/src/atomisation/curator.rs`
-  - `/Users/fate/v07/audit-batman/src/mcp/tools/store.rs`
-  - `/Users/fate/v07/audit-batman/src/handlers/http.rs`
+  - `<home>/v07/audit-batman/src/llm.rs` (every prompt constant)
+  - `<home>/v07/audit-batman/src/atomisation/curator.rs`
+  - `<home>/v07/audit-batman/src/mcp/tools/store.rs`
+  - `<home>/v07/audit-batman/src/handlers/http.rs`
   - searched the entire `src/` tree for `prompt_cache|cache_prompt|cached_tokens|TRUST|two-phase|two_phase|multi-step|multi_step|deterministic.*helper` — no matches outside test/doc comments
 
 Code evidence: no code matching criterion found. ai-memory's LLM-using paths (`auto_tag`, `detect_contradiction`, `summarize_memories`, `query_expansion`, atomisation `decompose`) each issue independent prompts with no shared cache token, no "trust pre-computed deterministic helper" instruction, and no orchestrated multi-step pipeline. Each is single-shot.
@@ -233,9 +233,9 @@ Gap analysis:
 ### FORM 4 — Provenance metadata (fact-level: source + capture_timestamp + confidence + citations)
 
 Files inspected:
-  - `/Users/fate/v07/audit-batman/src/models/memory.rs` (the `Memory` struct, lines 129-185)
-  - `/Users/fate/v07/audit-batman/src/signed_events.rs`
-  - `/Users/fate/v07/audit-batman/src/audit.rs`
+  - `<home>/v07/audit-batman/src/models/memory.rs` (the `Memory` struct, lines 129-185)
+  - `<home>/v07/audit-batman/src/signed_events.rs`
+  - `<home>/v07/audit-batman/src/audit.rs`
 
 Code evidence (the Memory model, `src/models/memory.rs:129-185`):
 ```
@@ -295,8 +295,8 @@ Gap analysis:
 ### FORM 5 — Confidence scoring (with shadow-mode calibration)
 
 Files inspected:
-  - `/Users/fate/v07/audit-batman/src/models/memory.rs` (`confidence` field, lines 139, 229-230, 278-280)
-  - `/Users/fate/v07/audit-batman/src/storage/mod.rs` (insert path, conf preservation)
+  - `<home>/v07/audit-batman/src/models/memory.rs` (`confidence` field, lines 139, 229-230, 278-280)
+  - `<home>/v07/audit-batman/src/storage/mod.rs` (insert path, conf preservation)
   - searched the entire `src/` tree for `shadow|calibration|shadow_mode|shadow-mode` — only matches are unrelated (`unknown tier ... does NOT shadow it` in config.rs, `pre-computed calibration fields` in capabilities.rs referring to recall-mode telemetry, not confidence)
 
 Code evidence (default value, `src/models/memory.rs:278-280`):
@@ -339,9 +339,9 @@ Gap analysis:
 ### FORM 6 — Type tagging (semantic kind per atom)
 
 Files inspected:
-  - `/Users/fate/v07/audit-batman/src/models/memory.rs` (`MemoryKind` enum, lines 24-69)
-  - `/Users/fate/v07/audit-batman/src/models/link.rs` (`MemoryLinkRelation`, lines 88-110)
-  - `/Users/fate/v07/audit-batman/src/models/namespace.rs` (namespace policy — distinct from type tagging)
+  - `<home>/v07/audit-batman/src/models/memory.rs` (`MemoryKind` enum, lines 24-69)
+  - `<home>/v07/audit-batman/src/models/link.rs` (`MemoryLinkRelation`, lines 88-110)
+  - `<home>/v07/audit-batman/src/models/namespace.rs` (namespace policy — distinct from type tagging)
 
 Code evidence (the `MemoryKind` enum, `src/models/memory.rs:24-38`):
 ```
@@ -388,11 +388,11 @@ Gap analysis:
 ### 7th-form claim — substrate-authority enforcement at write time
 
 Files inspected:
-  - `/Users/fate/v07/audit-batman/src/governance/mod.rs` (K9 unified pipeline, lines 1-100)
-  - `/Users/fate/v07/audit-batman/src/governance/agent_action.rs` (Layer-4 agent-EXTERNAL engine, lines 1-100)
-  - `/Users/fate/v07/audit-batman/src/storage/mod.rs` (`GOVERNANCE_PRE_WRITE` hook, lines 72-123)
-  - `/Users/fate/v07/audit-batman/src/mcp/tools/store.rs` (K9 + `enforce_governance` call sites, lines 297-358)
-  - `/Users/fate/v07/audit-batman/src/daemon_runtime.rs:2062` (hook installation)
+  - `<home>/v07/audit-batman/src/governance/mod.rs` (K9 unified pipeline, lines 1-100)
+  - `<home>/v07/audit-batman/src/governance/agent_action.rs` (Layer-4 agent-EXTERNAL engine, lines 1-100)
+  - `<home>/v07/audit-batman/src/storage/mod.rs` (`GOVERNANCE_PRE_WRITE` hook, lines 72-123)
+  - `<home>/v07/audit-batman/src/mcp/tools/store.rs` (K9 + `enforce_governance` call sites, lines 297-358)
+  - `<home>/v07/audit-batman/src/daemon_runtime.rs:2062` (hook installation)
 
 Code evidence (substrate-internal K9 wiring in handle_store, `src/mcp/tools/store.rs:297-358`):
 ```

@@ -14,7 +14,7 @@ layout: doc
 
 ## 0. Role & mission
 
-You are an autonomous AI NHI engineer working inside the `ai-memory` substrate (`/home/fate_two/v07/v07-f5`, branch `release/v0.8.0`), under the v0.8.0 Distributed Coordination Substrate EPIC (#1709). Your task is a **self-contained, ~half-day, ships-clean** increment that strengthens **§2.5 (attested)** by surfacing **attested provenance** in recall output and demoting the stored confidence scalar to an honest ranking-cache — implementing the principle *"never store confidence as truth; recompute it at read from already-merged signed evidence."*
+You are an autonomous AI NHI engineer working inside the `ai-memory` substrate (`<home>/v07/v07-f5`, branch `release/v0.8.0`), under the v0.8.0 Distributed Coordination Substrate EPIC (#1709). Your task is a **self-contained, ~half-day, ships-clean** increment that strengthens **§2.5 (attested)** by surfacing **attested provenance** in recall output and demoting the stored confidence scalar to an honest ranking-cache — implementing the principle *"never store confidence as truth; recompute it at read from already-merged signed evidence."*
 
 This is incremental §2.5 polish, NOT a new subsystem. Touch the minimum surface. Every change must pass the existing CI gates (§5) with **zero recall-latency regression**.
 
@@ -30,7 +30,7 @@ This is incremental §2.5 polish, NOT a new subsystem. Touch the minimum surface
 
 ## 2. Codegraph-anchored map (verify before editing — use codegraph, not grep)
 
-Use the codegraph MCP (`codegraph_explore`, `projectPath="/home/fate_two/v07/v07-f5"`) to confirm each anchor at HEAD before editing; line numbers may drift.
+Use the codegraph MCP (`codegraph_explore`, `projectPath="<home>/v07/v07-f5"`) to confirm each anchor at HEAD before editing; line numbers may drift.
 
 - `src/mcp/tools/recall.rs:302` — `decorate_memory` (the read-side decorator; already emits `confidence_tier`, `freshness_state`, `latest_link_attest_level`). **Primary edit site.**
 - `src/mcp/tools/recall.rs:352` — `freshness_state` (pure, "no DB queries") — the precedent pattern for label-free recompute.

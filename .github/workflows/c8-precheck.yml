@@ -266,6 +266,8 @@ jobs:
           persist-credentials: false
       - name: Run docs-vs-SSOT drift gate
         run: bash scripts/check-docs-vs-ssot.sh
+      - name: Reject private home paths in documentation (#8493)
+        run: python3 scripts/ci/check_docs_private_paths.py
       - name: Self-test the gate (regression evidence)
         # Mirrors the vendor-literal self-test discipline. The
         # --self-test mode stages a contrived stale-claim CLAUDE.md

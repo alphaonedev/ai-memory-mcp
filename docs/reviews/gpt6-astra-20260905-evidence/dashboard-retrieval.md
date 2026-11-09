@@ -1,6 +1,6 @@
 # Dashboard retrieval and agent-outcome evidence — GPT 6 Astra
 
-Evidence scope: fully read all 104 MCP tool records and 22 swarm tool records in parent-downloaded JSON snapshots, including every supplied note (the upstream notes themselves truncate tool responses). Fully read dashboard-state.json `nhiAudit`. These are historical execution summaries, not tests freshly executed by this juror. The source snapshots are under `.local-runs/astra-evidence/`; original dashboard files are on f2 at `/home/fate_two/v07/v09-dev/infra/cf-dashboard/public/`. No inference that snapshot tip labels bind every older run to current release HEAD.
+Evidence scope: fully read all 104 MCP tool records and 22 swarm tool records in parent-downloaded JSON snapshots, including every supplied note (the upstream notes themselves truncate tool responses). Fully read dashboard-state.json `nhiAudit`. These are historical execution summaries, not tests freshly executed by this juror. The source snapshots are under `.local-runs/astra-evidence/`; original dashboard files are on f2 at `<home>/v07/v09-dev/infra/cf-dashboard/public/`. No inference that snapshot tip labels bind every older run to current release HEAD.
 
 ## Encounter coverage is not acceptance
 

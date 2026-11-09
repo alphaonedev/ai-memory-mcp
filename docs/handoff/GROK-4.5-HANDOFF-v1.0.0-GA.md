@@ -5,7 +5,7 @@
 **Prepared by:** Fable 5 (outgoing orchestrator / reviewer / auditor / sole merge approver)
 **Date:** 2026-08-03
 **Repo:** `alphaonedev/ai-memory-mcp`
-**Working tree:** `/home/fate_two/v07/v09-dev`
+**Working tree:** `<home>/v07/v09-dev`
 **Release branch:** `release/v1.0.0` @ `9916165d`
 **Tag state:** **no `v1.0.0*` tag exists.** Zero. The cut is operator-gated and has never been attempted.
 
@@ -414,7 +414,7 @@ Live-serve with a real embedder is the only way to verify HTTP recall (#1797 was
 ```
 cloud-init-datatier.yaml.tpl   # contains NOTHING describing the pg stack;
                                # four @@PLACEHOLDER@@ lines filled at render
-                               # time from /home/fate_two/v07/pg-age-stack/
+                               # time from <home>/v07/pg-age-stack/
 provision.sh                   # pins build to origin/release/v1.0.0 SHA
 teardown.sh                    # requires typing DESTROY
 ```
@@ -448,7 +448,7 @@ Four droplet provisioning failures were caused by ignoring this: `${VAR}` escapi
 
 ## 11. Codegraph — PERMANENT operator control
 
-**Codegraph MUST only ever be queried against `/home/fate_two/v07/v09-dev`** (tracks `release/v1.0.0`; index kept fresh by a SessionStart hook). **Always pass `projectPath="/home/fate_two/v07/v09-dev"`.**
+**Codegraph MUST only ever be queried against `<home>/v07/v09-dev`** (tracks `release/v1.0.0`; index kept fresh by a SessionStart hook). **Always pass `projectPath="<home>/v07/v09-dev"`.**
 
 Mechanically enforced by the PreToolUse hook `~/.claude/hooks/codegraph-pin-projectpath.sh`, which rewrites `projectPath` on every call — so a stale or wrong-branch index can never be queried. Never point it at a worktree, another release branch, or another repo.
 

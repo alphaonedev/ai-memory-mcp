@@ -580,4 +580,4 @@ flowchart TB
 ---
 
 *W7-A4 · Perfect-system target architecture · final design · mermaid + narrative · under 550 lines*  
-*Absolute path: `/Users/fate/Downloads/ai-memory-mcp/waves/w7-a4-perfect-architecture.md`*
+*Absolute path: `<home>/Downloads/ai-memory-mcp/waves/w7-a4-perfect-architecture.md`*

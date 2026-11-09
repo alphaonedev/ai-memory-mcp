@@ -556,4 +556,4 @@ Exempt: internal renames, comment-only, single-correct bugfix, copy existing fli
 
 ---
 
-*W7-A2 · Final v1.0.0 epic DAG · integrates W3-A3–A7 + W4-A1–A7 + Red Queen v1.0 rows · kickoff SSOT · `/Users/fate/Downloads/ai-memory-mcp/waves/w7-a2-v1-epic-dag.md`*
+*W7-A2 · Final v1.0.0 epic DAG · integrates W3-A3–A7 + W4-A1–A7 + Red Queen v1.0 rows · kickoff SSOT · `<home>/Downloads/ai-memory-mcp/waves/w7-a2-v1-epic-dag.md`*

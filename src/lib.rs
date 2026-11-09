@@ -958,6 +958,7 @@ pub mod offload;
 // of Reflection-kind memories. First-class MemoryKind variant +
 // MCP tools + namespace-policy cadence + optional filesystem export.
 pub mod persona;
+pub(crate) mod yaml_frontmatter;
 // v0.7.0 L1-5 — SKILL.md parser and structured-document ingestion pipelines.
 pub mod parsing;
 // v1.0.0 #2006 — the integrity-complete Portability-v2 exporter + importer

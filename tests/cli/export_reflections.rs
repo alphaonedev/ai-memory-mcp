@@ -154,13 +154,516 @@ fn assert_stored_namespace_refused(namespace: &str, writer: NamespaceExportWrite
     if matches!(writer, NamespaceExportWriter::Cli) {
         assert_eq!(
             error.to_string(),
-            format!("memory {reflection_id} namespace {namespace:?}: refusing export path")
+            format!("memory {reflection_id:?} namespace {namespace:?}: refusing export path")
         );
     }
-    if out_dir.exists() {
+    assert!(
+        !root.exists(),
+        "refused namespace must not create the export root or its ancestors"
+    );
+}
+
+#[test]
+fn cli_namespace_refusal_escapes_stored_id_8605() {
+    const STORED_ID: &str = "stored\nid\t";
+    const REFUSED_NAMESPACE: &str = "..";
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("ai-memory.db");
+    let conn = open(&db_path);
+    let original_id = seed_observation(&conn, "export-id-diagnostic", "source");
+    // Durable rows can bypass ingestion checks; exercise the actual CLI
+    // error boundary with a stored control character, without linked rows.
+    conn.execute(
+        "UPDATE memories SET id = ?1, namespace = ?2, memory_kind = 'reflection' WHERE id = ?3",
+        rusqlite::params![STORED_ID, REFUSED_NAMESPACE, original_id],
+    )
+    .unwrap();
+    db::checkpoint(&conn).expect("checkpoint before subprocess read");
+    drop(conn);
+
+    let out_dir = tmp.path().join("exports");
+    let assert = assert_cmd::Command::cargo_bin("ai-memory")
+        .unwrap()
+        .env("AI_MEMORY_NO_CONFIG", "1")
+        .arg("--db")
+        .arg(&db_path)
+        .arg("export-reflections")
+        .arg("--out-dir")
+        .arg(&out_dir)
+        .arg("--quiet")
+        .assert()
+        .failure();
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.contains(&format!(
+            "memory {STORED_ID:?} namespace {REFUSED_NAMESPACE:?}: refusing export id"
+        )),
+        "CLI refusal must identify the row with escaped stored values: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains(STORED_ID),
+        "CLI stderr must not include the raw stored control characters"
+    );
+    assert!(
+        !out_dir.exists(),
+        "invalid ID must leave the destination absent"
+    );
+}
+
+#[test]
+fn cli_namespace_refusal_bounds_stored_values_8605() {
+    const OVERSIZED_CHARS: usize = 1024 * 1024;
+    const STDERR_MAX_BYTES: usize = 4096;
+    let cases = [
+        ("\u{1}".repeat(OVERSIZED_CHARS), "..".to_string()),
+        (
+            "short-id".to_string(),
+            format!("{}/..", "é".repeat(OVERSIZED_CHARS)),
+        ),
+    ];
+    for (stored_id, namespace) in cases {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("ai-memory.db");
+        let conn = open(&db_path);
+        let original_id = seed_observation(&conn, "bounded-export-diagnostic", "source");
+        conn.execute(
+            "UPDATE memories SET id = ?1, namespace = ?2, memory_kind = 'reflection' WHERE id = ?3",
+            rusqlite::params![stored_id, namespace, original_id],
+        )
+        .unwrap();
+        db::checkpoint(&conn).expect("checkpoint before subprocess read");
+        drop(conn);
+        let output = assert_cmd::Command::cargo_bin("ai-memory")
+            .unwrap()
+            .env("AI_MEMORY_NO_CONFIG", "1")
+            .arg("--db")
+            .arg(&db_path)
+            .arg("export-reflections")
+            .arg("--out-dir")
+            .arg(tmp.path().join("exports"))
+            .arg("--quiet")
+            .assert()
+            .failure();
+        let stderr = std::str::from_utf8(&output.get_output().stderr).unwrap();
         assert!(
-            std::fs::read_dir(&out_dir).unwrap().next().is_none(),
-            "refused namespace must not create an export subtree"
+            stderr.len() <= STDERR_MAX_BYTES,
+            "refusal stderr must be bounded, got {} bytes",
+            stderr.len()
+        );
+        let original_bytes = stored_id.len().max(namespace.len());
+        assert!(stderr.contains(&format!("[truncated; original_bytes={original_bytes}]")));
+        if ai_memory::validate::validate_id(&stored_id).is_err() {
+            assert!(stderr.contains("refusing export id"));
+            assert!(!tmp.path().join("exports").exists());
+        } else {
+            assert!(stderr.contains("refusing export path"));
+        }
+        assert!(!stderr.contains('\u{1}'));
+    }
+}
+
+fn export_output_with_stored_id_8605(stored_id: &str) -> std::process::Output {
+    const NAMESPACE: &str = "export-output-diagnostic";
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("ai-memory.db");
+    let conn = open(&db_path);
+    let original_id = seed_observation(&conn, NAMESPACE, "source");
+    conn.execute(
+        "UPDATE memories SET id = ?1, memory_kind = 'reflection' WHERE id = ?2",
+        rusqlite::params![stored_id, original_id],
+    )
+    .unwrap();
+    db::checkpoint(&conn).expect("checkpoint before subprocess read");
+    drop(conn);
+    let out_dir = tmp.path().join("exports");
+    let output = assert_cmd::Command::cargo_bin("ai-memory")
+        .unwrap()
+        .env("AI_MEMORY_NO_CONFIG", "1")
+        .arg("--db")
+        .arg(&db_path)
+        .arg("export-reflections")
+        .arg("--out-dir")
+        .arg(&out_dir)
+        .output()
+        .expect("run export CLI");
+    if output.status.success() {
+        assert!(
+            out_dir
+                .join(NAMESPACE)
+                .join(format!("{stored_id}.md"))
+                .is_file()
+        );
+    } else {
+        assert!(
+            !out_dir.exists(),
+            "invalid ID must leave the destination absent"
+        );
+    }
+    output
+}
+
+#[test]
+fn cli_export_write_failure_escapes_stored_id_8605() {
+    const STORED_ID: &str = "missing/\u{1b}[2Jid\r";
+    let output = export_output_with_stored_id_8605(STORED_ID);
+    assert!(!output.status.success());
+    let stderr = std::str::from_utf8(&output.stderr).unwrap();
+    assert!(stderr.contains("refusing export id"));
+    assert!(stderr.contains(&format!("{STORED_ID:?}")));
+    assert!(!stderr.contains('\u{1b}') && !stderr.contains('\r'));
+}
+
+#[test]
+fn cli_export_wrote_escapes_stored_id_8605() {
+    const STORED_ID: &str = "\u{1b}[2Jid\r";
+    let output = export_output_with_stored_id_8605(STORED_ID);
+    assert!(!output.status.success());
+    assert_eq!(output.stdout.as_slice(), b"");
+    let stderr = std::str::from_utf8(&output.stderr).unwrap();
+    assert!(stderr.contains("refusing export id"));
+    assert!(stderr.contains(&format!("{STORED_ID:?}")));
+    assert!(!stderr.contains('\u{1b}') && !stderr.contains('\r'));
+}
+
+#[test]
+fn cli_export_write_failure_bounds_stored_id_8605() {
+    const OVERSIZED_WRITE_ID_CHARS: usize = 1024 * 1024;
+    const MAX_WRITE_ERROR_BYTES: usize = 4096;
+    let stored_id = format!("\u{1b}\r{}", "x".repeat(OVERSIZED_WRITE_ID_CHARS));
+    let output = export_output_with_stored_id_8605(&stored_id);
+    assert!(!output.status.success());
+    let stderr = std::str::from_utf8(&output.stderr).unwrap();
+    assert!(
+        stderr.len() <= MAX_WRITE_ERROR_BYTES,
+        "write-failure stderr must be bounded, got {} bytes",
+        stderr.len()
+    );
+    assert!(stderr.contains(&format!("[truncated; original_bytes={}]", stored_id.len())));
+    assert!(stderr.contains("refusing export id"));
+    assert!(stderr.contains("\\u{1b}\\r"));
+    assert!(!stderr.contains('\u{1b}') && !stderr.contains('\r'));
+}
+
+#[derive(Clone, Copy)]
+enum PlainExportDestination {
+    Absent,
+    Directory,
+}
+
+fn plain_export_output_8605(
+    destination: PlainExportDestination,
+) -> (TempDir, std::path::PathBuf, std::process::Output) {
+    const NAMESPACE: &str = "plain-export-output";
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("ai-memory.db");
+    let conn = open(&db_path);
+    let id = seed_observation(&conn, NAMESPACE, "source");
+    conn.execute(
+        "UPDATE memories SET memory_kind = 'reflection' WHERE id = ?1",
+        [&id],
+    )
+    .unwrap();
+    db::checkpoint(&conn).unwrap();
+    drop(conn);
+    let out_dir = tmp.path().join("exports");
+    let path = out_dir.join(NAMESPACE).join(format!("{id}.md"));
+    if matches!(destination, PlainExportDestination::Directory) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&path)
+                .unwrap();
+        }
+        #[cfg(not(unix))]
+        std::fs::create_dir_all(&path).unwrap();
+    }
+    let output = assert_cmd::Command::cargo_bin("ai-memory")
+        .unwrap()
+        .env("AI_MEMORY_NO_CONFIG", "1")
+        .arg("--db")
+        .arg(&db_path)
+        .arg("export-reflections")
+        .arg("--out-dir")
+        .arg(&out_dir)
+        .output()
+        .unwrap();
+    (tmp, path, output)
+}
+
+#[test]
+fn cli_export_wrote_plain_path_8605_r5() {
+    let (_tmp, expected, output) = plain_export_output_8605(PlainExportDestination::Absent);
+    assert!(output.status.success());
+    let stdout = std::str::from_utf8(&output.stdout).unwrap();
+    let printed = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("wrote "))
+        .unwrap();
+    assert_eq!(Path::new(printed), expected);
+    assert!(std::fs::metadata(printed).unwrap().is_file());
+}
+
+#[test]
+fn cli_export_write_failure_plain_path_8605_r5() {
+    let (_tmp, expected, output) = plain_export_output_8605(PlainExportDestination::Directory);
+    assert!(!output.status.success());
+    let stderr = std::str::from_utf8(&output.stderr).unwrap();
+    assert!(
+        stderr.contains(&format!("writing {}", expected.display())),
+        "{stderr:?}"
+    );
+}
+
+fn markdown_with_edge_values_8605(
+    title: &str,
+    target_id: &str,
+    attest_level: &str,
+    created_at: &str,
+) -> String {
+    const NAMESPACE: &str = "yaml-export";
+    const TIMESTAMP: &str = "2026-01-01T00:00:00Z";
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("ai-memory.db");
+    let conn = open(&db_path);
+    let id = seed_observation(&conn, NAMESPACE, "source");
+    // This fixture models durable fields that bypassed ingestion validation.
+    conn.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
+    conn.execute(
+        "UPDATE memories SET id = 'plain-id', memory_kind = 'reflection', title = ?1, \
+         created_at = ?2 WHERE id = ?3",
+        rusqlite::params![title, TIMESTAMP, id],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO memory_links (source_id, target_id, relation, created_at, attest_level) \
+         VALUES ('plain-id', ?1, 'reflects_on', ?2, ?3)",
+        rusqlite::params![target_id, created_at, attest_level],
+    )
+    .unwrap();
+    db::checkpoint(&conn).unwrap();
+    drop(conn);
+    let out_dir = tmp.path().join("exports");
+    assert_eq!(run_cli(&db_path, &make_args(&out_dir)), 0);
+    std::fs::read_to_string(out_dir.join(NAMESPACE).join("plain-id.md")).unwrap()
+}
+
+#[test]
+fn cli_export_yaml_stored_scalars_8605_r5() {
+    let controls: String = ('\0'..='\u{1f}').chain('\u{7f}'..='\u{9f}').collect();
+    let payload = format!(
+        "value\n    attest_level: signed\n    forged_key: added\"\\{controls}\u{2028}\u{2029}"
+    );
+    let document = markdown_with_edge_values_8605(&payload, &payload, "unsigned", &payload);
+    let header = document
+        .strip_prefix("---\n")
+        .unwrap()
+        .split_once("\n---\n")
+        .unwrap()
+        .0;
+    let parsed: serde_yaml_ng::Value = serde_yaml_ng::from_str(header).unwrap();
+    let keys: std::collections::BTreeSet<_> = parsed
+        .as_mapping()
+        .unwrap()
+        .keys()
+        .map(|key| key.as_str().unwrap())
+        .collect();
+    assert_eq!(
+        keys,
+        std::collections::BTreeSet::from([
+            "memory_id",
+            "namespace",
+            "title",
+            "reflection_depth",
+            "attest_level",
+            "created_at",
+            "agent_id",
+            "reflects_on",
+        ])
+    );
+    assert_eq!(parsed["title"].as_str(), Some(payload.as_str()));
+    let edge = &parsed["reflects_on"][0];
+    let edge_keys: std::collections::BTreeSet<_> = edge
+        .as_mapping()
+        .unwrap()
+        .keys()
+        .map(|key| key.as_str().unwrap())
+        .collect();
+    assert_eq!(
+        edge_keys,
+        std::collections::BTreeSet::from(["target_id", "attest_level", "created_at",])
+    );
+    assert_eq!(edge["attest_level"].as_str(), Some("unsigned"));
+    for key in ["target_id", "created_at"] {
+        assert_eq!(edge[key].as_str(), Some(payload.as_str()), "field {key}");
+    }
+    assert!(!header.chars().any(|c| c.is_control() && c != '\n'));
+}
+
+#[test]
+fn cli_export_yaml_plain_bytes_8605_r5() {
+    let document = markdown_with_edge_values_8605(
+        "plain title",
+        "source-id",
+        "unsigned",
+        "2026-01-01T00:00:00Z",
+    );
+    assert_eq!(
+        document,
+        concat!(
+            "---\nmemory_id: plain-id\nnamespace: yaml-export\ntitle: plain title\n",
+            "reflection_depth: 0\nattest_level: unsigned\ncreated_at: 2026-01-01T00:00:00Z\n",
+            "agent_id: \"ai:test\"\nreflects_on:\n  - target_id: source-id\n",
+            "    attest_level: unsigned\n    created_at: 2026-01-01T00:00:00Z\n",
+            "---\n\nbody for source\n",
+        )
+    );
+}
+
+#[test]
+fn cli_export_yaml_format_characters_8605_r6() {
+    // Unicode 18 DerivedGeneralCategory.txt: one row per Cf range, including
+    // supplementary-plane format controls requiring YAML's eight-digit escape.
+    let classes = [
+        ('\u{ad}', '\u{ad}'),
+        ('\u{600}', '\u{605}'),
+        ('\u{61c}', '\u{61c}'),
+        ('\u{6dd}', '\u{6dd}'),
+        ('\u{70f}', '\u{70f}'),
+        ('\u{890}', '\u{891}'),
+        ('\u{8e2}', '\u{8e2}'),
+        ('\u{180e}', '\u{180e}'),
+        ('\u{200b}', '\u{200f}'),
+        ('\u{202a}', '\u{202e}'),
+        ('\u{2060}', '\u{2064}'),
+        ('\u{2066}', '\u{206f}'),
+        ('\u{feff}', '\u{feff}'),
+        ('\u{fff9}', '\u{fffb}'),
+        ('\u{110bd}', '\u{110bd}'),
+        ('\u{110cd}', '\u{110cd}'),
+        ('\u{13430}', '\u{1343f}'),
+        ('\u{1bca0}', '\u{1bca3}'),
+        ('\u{1d173}', '\u{1d17a}'),
+        ('\u{e0001}', '\u{e0001}'),
+        ('\u{e0020}', '\u{e007f}'),
+    ];
+    let mut raw_classes = Vec::new();
+    for (first, last) in classes {
+        let controls: String = (first..=last).collect();
+        let value = format!("before{controls}after");
+        let document = markdown_with_edge_values_8605(&value, &value, "unsigned", &value);
+        let header = document
+            .strip_prefix("---\n")
+            .unwrap()
+            .split_once("\n---\n")
+            .unwrap()
+            .0;
+        let parsed: serde_yaml_ng::Value = serde_yaml_ng::from_str(header).unwrap();
+        assert_eq!(parsed["title"].as_str(), Some(value.as_str()));
+        for key in ["target_id", "created_at"] {
+            assert_eq!(parsed["reflects_on"][0][key].as_str(), Some(value.as_str()));
+        }
+        if (first..=last).any(|c| header.contains(c)) {
+            raw_classes.push(format!(
+                "U+{:04X}..U+{:04X}",
+                u32::from(first),
+                u32::from(last)
+            ));
+        }
+    }
+    assert!(
+        raw_classes.is_empty(),
+        "raw format classes: {raw_classes:?}"
+    );
+}
+
+#[test]
+fn cli_export_yaml_string_types_8605_r6() {
+    let values = [
+        "",
+        "~",
+        "null",
+        "NULL",
+        "NuLl",
+        "true",
+        "FALSE",
+        "TrUe",
+        "yes",
+        "NO",
+        "oN",
+        "Off",
+        "2026",
+        "0",
+        "01",
+        "184467440737095516160",
+        "1.0",
+        ".5",
+        "5.",
+        "0x1f",
+        "0o17",
+        "1e3",
+        "1E-3",
+        ".inf",
+        ".INF",
+        ".nan",
+        ".NaN",
+        "+1",
+        "-1",
+        "+word",
+        "-word",
+    ];
+    let mut unquoted = Vec::new();
+    for value in values {
+        let document = markdown_with_edge_values_8605(value, value, "unsigned", value);
+        let header = document
+            .strip_prefix("---\n")
+            .unwrap()
+            .split_once("\n---\n")
+            .unwrap()
+            .0;
+        let Ok(parsed) = serde_yaml_ng::from_str::<serde_yaml_ng::Value>(header) else {
+            unquoted.push(value);
+            continue;
+        };
+        // Check explicit quoting too: YAML 1.1 readers resolve legacy booleans.
+        if !header.lines().any(|line| line.starts_with("title: \""))
+            || parsed["title"].as_str() != Some(value)
+            || parsed["reflects_on"][0]["target_id"].as_str() != Some(value)
+            || parsed["reflects_on"][0]["created_at"].as_str() != Some(value)
+        {
+            unquoted.push(value);
+        }
+        assert_eq!(parsed["reflection_depth"].as_i64(), Some(0));
+    }
+    assert!(
+        unquoted.is_empty(),
+        "stored strings lost quoting/type: {unquoted:?}"
+    );
+}
+
+#[test]
+fn cli_export_yaml_binary_string_8605_r7() {
+    const BINARY_SHAPED_STRING: &str = "0b101";
+    let document = markdown_with_edge_values_8605(
+        BINARY_SHAPED_STRING,
+        BINARY_SHAPED_STRING,
+        "unsigned",
+        BINARY_SHAPED_STRING,
+    );
+    let header = document
+        .strip_prefix("---\n")
+        .unwrap()
+        .split_once("\n---\n")
+        .unwrap()
+        .0;
+    let parsed: serde_yaml_ng::Value = serde_yaml_ng::from_str(header).unwrap();
+    assert_eq!(parsed["title"].as_str(), Some(BINARY_SHAPED_STRING));
+    for key in ["target_id", "created_at"] {
+        assert_eq!(
+            parsed["reflects_on"][0][key].as_str(),
+            Some(BINARY_SHAPED_STRING)
         );
     }
 }

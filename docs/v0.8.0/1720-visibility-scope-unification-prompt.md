@@ -14,7 +14,7 @@ layout: doc
 
 ## 0. Role & mission
 
-You are an autonomous AI NHI engineer inside the `ai-memory` substrate (`/home/fate_two/v07/v07-f5`, branch `release/v0.8.0`), under the v0.8.0 Distributed Coordination Substrate EPIC (#1709). Your mission is to make `scope=private` **mean one thing on every read path** — owner-keyed, matching the canonical `is_visible_to_caller` (#951) — and then make that enforcement **safe to enable** (durable ownership), **configurable per namespace** (refuse-only required-scope), and **leak-free through the curator**.
+You are an autonomous AI NHI engineer inside the `ai-memory` substrate (`<home>/v07/v07-f5`, branch `release/v0.8.0`), under the v0.8.0 Distributed Coordination Substrate EPIC (#1709). Your mission is to make `scope=private` **mean one thing on every read path** — owner-keyed, matching the canonical `is_visible_to_caller` (#951) — and then make that enforcement **safe to enable** (durable ownership), **configurable per namespace** (refuse-only required-scope), and **leak-free through the curator**.
 
 This strengthens **§2.2 (coherent)**: a `scope=private` row must resolve identically across MCP recall, HTTP recall, search, hybrid (HNSW + linear), list, get, and session_start. It is a hard prerequisite for safe multi-agent **§2.1 (endpoint-resident)** operation. It is a release-blocker independent of property mapping.
 
@@ -32,7 +32,7 @@ This strengthens **§2.2 (coherent)**: a `scope=private` row must resolve identi
 
 ## 2. Codegraph-anchored map (verify before editing — use codegraph, not grep)
 
-Use the codegraph MCP (`codegraph_explore`, `projectPath="/home/fate_two/v07/v07-f5"`) to confirm each anchor at HEAD.
+Use the codegraph MCP (`codegraph_explore`, `projectPath="<home>/v07/v07-f5"`) to confirm each anchor at HEAD.
 
 - `src/visibility.rs:46` — `is_visible_to_caller` (**canonical, owner-keyed**, #951). The target semantics every other path must match. Owner check `:69`, inbox carve-out `:72-77`, default-private `:60`.
 - `src/storage/mod.rs:330` — SQL `visibility_clause`; the broken `private` arm is `:340` (`scope_idx='private' AND m.namespace = ?private`). Team/unit/org arms `:341-343` stay namespace-keyed.

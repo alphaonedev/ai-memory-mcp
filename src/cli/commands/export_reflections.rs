@@ -33,6 +33,7 @@ use serde::Serialize;
 use crate::cli::CliOutput;
 use crate::db;
 use crate::models::{Memory, MemoryKind};
+use crate::yaml_frontmatter::{YamlScalarKind, yaml_scalar};
 
 pub(crate) mod private_file;
 use private_file::PrivateExportDir;
@@ -40,6 +41,32 @@ use private_file::PrivateExportDir;
 /// Reflection-export subdirectory under `~/.ai-memory` — shared with the
 /// post-reflect auto-export hook (#1558 batch 6).
 pub(crate) const REFLECTIONS_SUBDIR: &str = "reflections";
+
+/// Maximum input characters included per stored value in export messages.
+const EXPORT_DIAGNOSTIC_MAX_CHARS: usize = 128;
+
+/// Bound allocation before Debug escaping, preserving UTF-8 boundaries.
+fn export_diagnostic(value: &str) -> String {
+    let prefix: String = value.chars().take(EXPORT_DIAGNOSTIC_MAX_CHARS).collect();
+    if prefix.len() < value.len() {
+        format!("{prefix:?} [truncated; original_bytes={}]", value.len())
+    } else {
+        format!("{prefix:?}")
+    }
+}
+
+/// Refuse an invalid durable ID before a filesystem export creates anything.
+/// ERRORS-02/15: retain the validation cause; OWNERSHIP-05/15: borrow inputs
+/// and reuse the bounded, character-safe diagnostic formatter from #8605.
+pub(crate) fn validate_export_id(id: &str, namespace: &str) -> Result<()> {
+    crate::validate::validate_id(id).with_context(|| {
+        format!(
+            "memory {} namespace {}: refusing export id",
+            export_diagnostic(id),
+            export_diagnostic(namespace)
+        )
+    })
+}
 
 /// CLI args for `ai-memory export-reflections`.
 #[derive(Args, Debug, Clone)]
@@ -107,25 +134,32 @@ struct JsonEnvelope<'a> {
 pub fn run(db_path: &Path, args: &ExportReflectionsArgs, out: &mut CliOutput<'_>) -> Result<i32> {
     let format = parse_format(&args.format)?;
     let out_dir = resolve_out_dir(args.out_dir.as_deref())?;
-    let private_root = PrivateExportDir::open(&out_dir)
-        .with_context(|| format!("opening private out-dir {}", out_dir.display()))?;
-
     let conn = db::open(db_path)?;
     let mut summary = ExportSummary::default();
 
     let reflections = collect_reflections(&conn, args.namespace.as_deref(), args.since.as_deref())?;
-    let mut swept_directories = HashSet::new();
+    // ERRORS-02: validate the whole batch before creating directories or files.
+    // OWNERSHIP-05: borrow each row and retain its validated namespace path.
+    let mut validated = Vec::with_capacity(reflections.len());
     for mem in &reflections {
+        validate_export_id(&mem.id, &mem.namespace)?;
+        let relative = sanitise_namespace_for_path(&mem.namespace).with_context(|| {
+            format!(
+                "memory {} namespace {}: refusing export path",
+                export_diagnostic(&mem.id),
+                export_diagnostic(&mem.namespace)
+            )
+        })?;
+        validated.push((mem, relative));
+    }
+    let private_root = PrivateExportDir::open(&out_dir)
+        .with_context(|| format!("opening private out-dir {}", out_dir.display()))?;
+    let mut swept_directories = HashSet::new();
+    for (mem, relative) in validated {
         let edges = collect_outbound_reflects_on(&conn, &mem.id)?;
         let attest_level = summarise_attest_level(&edges);
         let payload = render_payload(mem, &edges, attest_level, format);
 
-        let relative = sanitise_namespace_for_path(&mem.namespace).with_context(|| {
-            format!(
-                "memory {} namespace {:?}: refusing export path",
-                mem.id, mem.namespace
-            )
-        })?;
         let namespace = private_root
             .namespace(&relative)
             .with_context(|| private_file::namespace_context(&out_dir.join(&relative)))?;
@@ -134,13 +168,23 @@ pub fn run(db_path: &Path, args: &ExportReflectionsArgs, out: &mut CliOutput<'_>
         }
         let ns_dir = out_dir.join(relative);
         let filename = format!("{}.{}", mem.id, format.extension());
-        let path = ns_dir.join(&filename);
+        let escaped_id = export_diagnostic(&mem.id);
+        // OWNERSHIP-05/15: compare borrowed, bounded output; keep clean paths exact.
+        let unquoted = escaped_id
+            .strip_prefix('"')
+            .and_then(|s| s.strip_suffix('"'));
+        let printed_id = if unquoted == Some(mem.id.as_str()) {
+            mem.id.as_str()
+        } else {
+            &escaped_id
+        };
+        let diagnostic_path = ns_dir.join(format!("{printed_id}.{}", format.extension()));
         namespace
             .write(&filename, payload.as_bytes())
-            .with_context(|| crate::errors::msg::writing(path.display()))?;
+            .with_context(|| crate::errors::msg::writing(diagnostic_path.display()))?;
         summary.written += 1;
         if !args.quiet {
-            writeln!(out.stdout, "wrote {}", path.display())?;
+            writeln!(out.stdout, "wrote {}", diagnostic_path.display())?;
         }
     }
     writeln!(
@@ -350,21 +394,43 @@ pub(crate) fn render_payload(
 }
 
 /// Render the YAML-frontmatter markdown body. Frontmatter fields are
-/// emitted in a stable order (memory_id, namespace, reflection_depth,
+/// emitted in a stable order (memory_id, namespace, title, reflection_depth,
 /// attest_level, created_at, agent_id) followed by a sequence of
-/// `reflects_on` edges. The body of the reflection follows after a
+/// `reflects_on` edges. Every stored string uses the shared YAML encoder.
+/// Both `created_at` fields retain reader-safe plain RFC3339 timestamp scalars;
+/// `reflection_depth` remains an integer, matching its schema.
+/// The body of the reflection follows after a
 /// blank line, exactly as it was stored.
 fn render_markdown(mem: &Memory, edges: &[ReflectsOnEdge], attest_level: &str) -> String {
+    use YamlScalarKind::{StoredString, Timestamp};
     let agent_id = agent_id_of(mem);
     let mut out = String::with_capacity(256 + mem.content.len());
     out.push_str("---\n");
-    out.push_str(&format!("memory_id: {}\n", mem.id));
-    out.push_str(&format!("namespace: {}\n", yaml_scalar(&mem.namespace)));
-    out.push_str(&format!("title: {}\n", yaml_scalar(&mem.title)));
+    out.push_str(&format!(
+        "memory_id: {}\n",
+        yaml_scalar(&mem.id, StoredString)
+    ));
+    out.push_str(&format!(
+        "namespace: {}\n",
+        yaml_scalar(&mem.namespace, StoredString)
+    ));
+    out.push_str(&format!(
+        "title: {}\n",
+        yaml_scalar(&mem.title, StoredString)
+    ));
     out.push_str(&format!("reflection_depth: {}\n", mem.reflection_depth));
-    out.push_str(&format!("attest_level: {attest_level}\n"));
-    out.push_str(&format!("created_at: {}\n", mem.created_at));
-    out.push_str(&format!("agent_id: {}\n", yaml_scalar(agent_id)));
+    out.push_str(&format!(
+        "attest_level: {}\n",
+        yaml_scalar(attest_level, StoredString)
+    ));
+    out.push_str(&format!(
+        "created_at: {}\n",
+        yaml_scalar(&mem.created_at, Timestamp)
+    ));
+    out.push_str(&format!(
+        "agent_id: {}\n",
+        yaml_scalar(agent_id, StoredString)
+    ));
     out.push_str("reflects_on:\n");
     if edges.is_empty() {
         out.push_str("  []\n");
@@ -372,7 +438,9 @@ fn render_markdown(mem: &Memory, edges: &[ReflectsOnEdge], attest_level: &str) -
         for e in edges {
             out.push_str(&format!(
                 "  - target_id: {}\n    attest_level: {}\n    created_at: {}\n",
-                e.target_id, e.attest_level, e.created_at,
+                yaml_scalar(&e.target_id, StoredString),
+                yaml_scalar(&e.attest_level, StoredString),
+                yaml_scalar(&e.created_at, Timestamp),
             ));
         }
     }
@@ -404,30 +472,11 @@ fn render_json(mem: &Memory, edges: &[ReflectsOnEdge], attest_level: &str) -> St
     serde_json::to_string_pretty(&env).unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
 }
 
-/// Conservatively quote a YAML scalar. We escape only the obviously
-/// dangerous shapes (containing `:` `#` `"` `'` or starting with `-`
-/// `?` `*` `&`); everything else is emitted bare. The shape is
-/// deliberately simple — operators read these files; we never
-/// round-trip them back through a YAML parser, so over-engineering
-/// the escape is dead weight.
-fn yaml_scalar(s: &str) -> String {
-    let needs_quote = s.is_empty()
-        || s.starts_with(['-', '?', '*', '&', '!', '|', '>', '\'', '"', '%', '@', '`'])
-        || s.contains(':')
-        || s.contains('#')
-        || s.contains('\n');
-    if needs_quote {
-        let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
-        format!("\"{escaped}\"")
-    } else {
-        s.to_string()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::models::Tier;
+    use crate::yaml_frontmatter::YAML_SCHEMA_FORMS_8605_R7;
     use chrono::Utc;
     use tempfile::TempDir;
 
@@ -472,6 +521,65 @@ mod tests {
             version: 1,
             lifecycle_state: crate::models::LifecycleState::Open,
         }
+    }
+
+    const YAML_ORACLE_PREFIX_8605_R7: &str = "YAML_ORACLE_8605_R7 ";
+
+    #[test]
+    fn yaml_schema_table_8605_r7() {
+        let mut failures = Vec::new();
+        for &(value, plain_string, timestamp) in YAML_SCHEMA_FORMS_8605_R7 {
+            let mut mem = make_reflection(value, 0, value, "body\n", value);
+            mem.id = value.into();
+            mem.created_at = value.into();
+            let edges = [ReflectsOnEdge {
+                target_id: value.into(),
+                attest_level: value.into(),
+                created_at: value.into(),
+            }];
+            let document = render_markdown(&mem, &edges, value);
+            let header = document
+                .strip_prefix("---\n")
+                .unwrap()
+                .split_once("\n---\n")
+                .unwrap()
+                .0;
+            // The YAML 1.1 proof consumes these exact renderer bytes, not a second encoder.
+            println!(
+                "{YAML_ORACLE_PREFIX_8605_R7}{}",
+                serde_json::json!({
+                    "value": value, "plain_string": plain_string,
+                    "timestamp": timestamp, "header": header,
+                })
+            );
+            let Ok(parsed) = serde_yaml_ng::from_str::<serde_yaml_ng::Value>(header) else {
+                failures.push(format!("parser rejected {value:?}"));
+                continue;
+            };
+            let edge = &parsed["reflects_on"][0];
+            for (prefix, stored, timestamp_site) in [
+                ("memory_id: ", &parsed["memory_id"], false),
+                ("namespace: ", &parsed["namespace"], false),
+                ("title: ", &parsed["title"], false),
+                ("attest_level: ", &parsed["attest_level"], false),
+                ("created_at: ", &parsed["created_at"], true),
+                ("agent_id: ", &parsed["agent_id"], false),
+                ("  - target_id: ", &edge["target_id"], false),
+                ("    attest_level: ", &edge["attest_level"], false),
+                ("    created_at: ", &edge["created_at"], true),
+            ] {
+                let scalar = header
+                    .lines()
+                    .find_map(|line| line.strip_prefix(prefix))
+                    .unwrap();
+                let expected_plain = plain_string || (timestamp && timestamp_site);
+                if stored.as_str() != Some(value) || scalar.starts_with('"') == expected_plain {
+                    failures.push(format!("{prefix}{value:?}"));
+                }
+            }
+            assert_eq!(parsed["reflection_depth"].as_i64(), Some(0));
+        }
+        assert!(failures.is_empty(), "YAML schema table: {failures:?}");
     }
 
     #[test]
@@ -557,13 +665,15 @@ mod tests {
 
     #[test]
     fn render_markdown_carries_frontmatter_and_edges() {
-        let mem = make_reflection(
+        let mut mem = make_reflection(
             "team/alpha",
             2,
-            "lesson learned",
+            "What's next?",
             "Body line.\n",
             "agent-without-colon",
         );
+        mem.id = "123e4567-e89b-42d3-a456-426614174000".into();
+        mem.created_at = "2026-01-03T00:00:00Z".into();
         let edges = vec![
             ReflectsOnEdge {
                 target_id: "src-1".into(),
@@ -577,16 +687,28 @@ mod tests {
             },
         ];
         let s = render_markdown(&mem, &edges, "signed");
-        assert!(s.starts_with("---\n"));
-        assert!(s.contains(&format!("memory_id: {}\n", mem.id)));
-        assert!(s.contains("namespace: team/alpha\n"));
-        assert!(s.contains("reflection_depth: 2\n"));
-        assert!(s.contains("attest_level: signed\n"));
-        // Bare scalar (no quotes) when value has no YAML-unsafe chars.
-        assert!(s.contains("agent_id: agent-without-colon\n"));
-        assert!(s.contains("  - target_id: src-1\n"));
-        assert!(s.contains("    attest_level: signed\n"));
-        assert!(s.ends_with("Body line.\n"));
+        // TEST-02: pin real identifier bytes and the approved free-text quoting.
+        assert_eq!(
+            s,
+            concat!(
+                "---\n",
+                "memory_id: 123e4567-e89b-42d3-a456-426614174000\n",
+                "namespace: team/alpha\n",
+                "title: \"What's next?\"\n",
+                "reflection_depth: 2\n",
+                "attest_level: signed\n",
+                "created_at: 2026-01-03T00:00:00Z\n",
+                "agent_id: agent-without-colon\n",
+                "reflects_on:\n",
+                "  - target_id: src-1\n",
+                "    attest_level: unsigned\n",
+                "    created_at: 2026-01-01T00:00:00Z\n",
+                "  - target_id: src-2\n",
+                "    attest_level: signed\n",
+                "    created_at: 2026-01-02T00:00:00Z\n",
+                "---\n\nBody line.\n",
+            )
+        );
     }
 
     #[test]

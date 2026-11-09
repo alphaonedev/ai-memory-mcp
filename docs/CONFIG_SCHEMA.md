@@ -26,7 +26,7 @@ schema_version = 2
 
 # Top-level operational settings.
 tier = "autonomous"
-db   = "/Users/fate/.claude/ai-memory.db"
+db   = "<home>/.claude/ai-memory.db"
 
 # ---------------------------------------------------------------------
 # [llm] — chat-completion LLM configuration.
