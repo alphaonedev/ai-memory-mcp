@@ -129,8 +129,11 @@ For an older 0755 export tree, choose a new private root or explicitly repair
 the owned export directories before retrying. Refusal does not repair files
 previously exposed by an older export. Keep the root's ancestor directories
 under trusted control; permissions do not isolate processes running as the
-same OS user. A crash can leave a private `.private-export-*.stage` file;
-after stopping exporters, such incomplete files may be removed.
+same OS user. A crash can leave a private `.private-export-*.stage` file.
+Before publication, each persona export sweeps its namespace directory and
+removes only regular staging files whose modification time is older than one
+hour; newer or future modification times, symlinks and non-regular entries are
+kept. Cleanup errors warn without stopping export.
 
 The export is opt-in per namespace, symmetric with QW-1's
 `auto_export_reflections_to_filesystem`. Operators who want governance

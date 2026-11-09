@@ -533,7 +533,7 @@ refused. Ordinary `team/alpha` namespace nesting is preserved.
 Platforms without Unix permissions refuse these exports.
 Refusal cannot undo earlier disclosure. A crash can leave a private
 `.private-export-*.stage` file. Before publication, a sweep runs once per destination
-directory per CLI run and once per auto-export call. It removes only regular staging
+directory per CLI run and once per automatic reflection or persona export call. It removes only regular staging
 files whose modification time is older than one hour; newer or future modification
 times are retained, as are symlinks and non-regular entries. Cleanup errors warn
 without stopping export. Remove any remaining incomplete stages manually only with

@@ -1451,7 +1451,7 @@ interrupted-export cleanup details.
 Files are synced and closed before same-directory atomic replacement; the opened
 parent directory is then synced. A directory-sync error is reported without
 removing the published file. The sweep runs once per destination directory per CLI run and
-once per auto-export call. The sweep removes regular `.private-export-*.stage` files whose
+once per automatic reflection or persona export call. The sweep removes regular `.private-export-*.stage` files whose
 modification time is older than one hour; files with a newer or future modification
 time are kept. Cleanup errors emit a warning and do not stop export.
 The CLI returns an error on unsupported platforms; auto-export logs a warning and writes nothing.

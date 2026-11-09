@@ -322,6 +322,8 @@ fn write_persona_export(
                 &out_dir.join(&ns_safe),
             )
         })?;
+    // Same stale-stage cleanup as the reflection writers (warn-only).
+    namespace.sweep_stale_staging();
     let body = render_persona_md(persona);
     namespace.write(&format!("{entity_safe}.md"), body.as_bytes())?;
     Ok(())
