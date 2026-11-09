@@ -1653,6 +1653,9 @@ pub fn redact_url_password(url: &str) -> String {
 pub fn redact_urls_in_message(msg: &str) -> String {
     map_url_runs(msg, |url, _| redact_url_password(url))
 }
+// #8674: test modules name the userinfo scanner only through this alias (#3711 guard).
+#[cfg(test)]
+use redact_urls_in_message as url_userinfo_scanner_8674;
 
 /// Render credential-bearing options and bare connection targets privately.
 /// Harmless assignments remain readable; URLs use the caller's allowlist renderer.

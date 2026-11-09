@@ -65,7 +65,7 @@ fn bare_target_scanner_time_is_linear_8674() {
 
 #[test]
 fn url_userinfo_scanner_time_is_linear_8674() {
-    assert_scanner_ratio("url userinfo scanner", super::redact_urls_in_message);
+    assert_scanner_ratio("url userinfo scanner", super::url_userinfo_scanner_8674);
 }
 
 #[test]

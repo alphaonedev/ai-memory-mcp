@@ -95,7 +95,7 @@ fn bare_target_scan_work_is_linear_8674() {
 
 #[test]
 fn url_password_scan_work_is_linear_8674() {
-    assert_scanner_linear("redact_urls_in_message", super::redact_urls_in_message);
+    assert_scanner_linear("url userinfo scanner", super::url_userinfo_scanner_8674);
 }
 
 #[test]
@@ -140,9 +140,9 @@ fn work_counter_observes_every_examined_byte_8674() {
     );
     // The password masker searches the run again for its authority and userinfo.
     let userinfo = format!("http://{}@h", "a".repeat(URL_TAIL));
-    let charged = work(super::redact_urls_in_message, &userinfo);
+    let charged = work(super::url_userinfo_scanner_8674, &userinfo);
     assert!(
         charged >= 2 * URL_TAIL,
-        "#8674 redact_url_password: its searches are charged: {charged}"
+        "#8674 url userinfo scanner: its searches are charged: {charged}"
     );
 }
