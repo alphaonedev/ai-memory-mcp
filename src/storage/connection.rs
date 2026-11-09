@@ -337,6 +337,111 @@ impl Drop for WriteTxn<'_> {
     }
 }
 
+/// #8662 / #8707 - `busy_timeout` (ms) for [`NoWaitWriteTxn::try_begin`]:
+/// never wait for the write lock.
+const NOWAIT_BUSY_TIMEOUT_MS: i64 = 0;
+/// SQLite pragma [`NoWaitWriteTxn::try_begin`] saves, zeroes and restores.
+const PRAGMA_BUSY_TIMEOUT: &str = "busy_timeout";
+
+/// #8707 - restores a connection's `busy_timeout` when dropped, including on
+/// a panic unwind between the zeroing and the restore.
+struct RestoreBusyTimeout<'c> {
+    conn: &'c Connection,
+    prior: i64,
+}
+
+impl Drop for RestoreBusyTimeout<'_> {
+    fn drop(&mut self) {
+        if let Err(error) = self
+            .conn
+            .pragma_update(None, PRAGMA_BUSY_TIMEOUT, self.prior)
+        {
+            // Degrades only contention handling on this connection (it now
+            // fails fast instead of retrying); never panics (OWNERSHIP-25).
+            tracing::error!(%error, prior = self.prior, "#8707: busy_timeout not restored after a no-wait BEGIN");
+        }
+    }
+}
+
+/// #8662 / #8707 - the RAII guard for a NO-WAIT `BEGIN IMMEDIATE`: the
+/// write-lock liveness probe of `storage::escalation_deferral`.
+///
+/// [`NoWaitWriteTxn::try_begin`] issues `BEGIN IMMEDIATE` with `busy_timeout`
+/// set to 0 and restores the prior `busy_timeout` before it returns, on every
+/// path. `Ok(None)` means another connection holds the write lock.
+///
+/// The guard keeps the [`WriteTxn`] contract except for the frame: it does
+/// NOT register a #4116 escalation frame, because its only work is the one
+/// pending-row INSERT the probe exists for, and nothing may be deferred into
+/// it. [`NoWaitWriteTxn::commit`] is the only way to keep that work; every
+/// other exit (an early `?`, a failed COMMIT, a panic unwind) rolls back in
+/// [`Drop`], which never panics.
+#[must_use = "dropping the guard rolls the transaction back immediately"]
+pub struct NoWaitWriteTxn<'c> {
+    conn: &'c Connection,
+    finished: bool,
+}
+
+impl<'c> NoWaitWriteTxn<'c> {
+    /// Try to open an immediate write transaction on `conn` without waiting.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a `busy_timeout` read or write failure, and any `BEGIN`
+    /// failure other than `SQLITE_BUSY` / `SQLITE_LOCKED` (for example a
+    /// nested BEGIN). No guard is constructed on failure, and the prior
+    /// `busy_timeout` is restored on every path once it was changed.
+    pub fn try_begin(conn: &'c Connection) -> rusqlite::Result<Option<Self>> {
+        let prior: i64 = conn.pragma_query_value(None, PRAGMA_BUSY_TIMEOUT, |r| r.get(0))?;
+        conn.pragma_update(None, PRAGMA_BUSY_TIMEOUT, NOWAIT_BUSY_TIMEOUT_MS)?;
+        let restore = RestoreBusyTimeout { conn, prior };
+        let begun = conn.execute_batch(SQL_BEGIN_IMMEDIATE);
+        // Restore before the guard exists, so the caller's work inside the
+        // transaction already runs with the connection's own busy_timeout.
+        drop(restore);
+        match begun {
+            Ok(()) => Ok(Some(Self {
+                conn,
+                finished: false,
+            })),
+            Err(rusqlite::Error::SqliteFailure(failure, _))
+                if matches!(
+                    failure.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                ) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Commit the transaction, consuming the guard.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the `rusqlite` error from `COMMIT`. The guard stays ARMED
+    /// on failure, so its drop rolls the transaction back.
+    pub fn commit(mut self) -> rusqlite::Result<()> {
+        self.conn.execute_batch(SQL_COMMIT)?;
+        self.finished = true;
+        Ok(())
+    }
+}
+
+impl Drop for NoWaitWriteTxn<'_> {
+    fn drop(&mut self) {
+        if self.finished || self.conn.is_autocommit() {
+            return;
+        }
+        if let Err(error) = self.conn.execute_batch(SQL_ROLLBACK) {
+            // Never panic in a destructor (OWNERSHIP-25); the connection is
+            // left for the next `ensure_autocommit` sweep, which fails closed.
+            tracing::error!(%error, "#8707: ROLLBACK of a no-wait write transaction failed");
+        }
+    }
+}
+
 /// v1.0.0 #3152 — run `unit` as ONE write transaction on `conn`.
 ///
 /// Opens a [`WriteTxn`] when `conn` is in autocommit, commits it when
@@ -1965,6 +2070,108 @@ mod tests {
             .expect("insert");
         write_txn.commit().expect("second commit must succeed");
         assert_eq!(row_count(&conn), 1, "the post-failure write must persist");
+    }
+
+    /// `busy_timeout` (ms) the #8707 `NoWaitWriteTxn` tests give a connection,
+    /// so a restore is distinguishable from the zero the probe sets.
+    const NOWAIT_TEST_BUSY_TIMEOUT_MS: i64 = 5_000;
+    /// A no-wait BEGIN that found the lock held must return well inside
+    /// the connection's own `busy_timeout` (it must not have waited).
+    const NOWAIT_TEST_RETURN_CEILING: std::time::Duration = std::time::Duration::from_secs(2);
+    /// SQLite's text for a BEGIN issued inside an open transaction.
+    const MSG_NESTED_BEGIN: &str = "cannot start a transaction within a transaction";
+
+    /// A file database (two connections can contend for its write lock) with
+    /// the `txn_test_conn` table and a known `busy_timeout`.
+    fn nowait_test_conn(path: &Path) -> Connection {
+        let conn = Connection::open(path).expect("open file database");
+        conn.pragma_update(None, PRAGMA_BUSY_TIMEOUT, NOWAIT_TEST_BUSY_TIMEOUT_MS)
+            .expect("set busy_timeout");
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY)")
+            .expect("create t");
+        conn
+    }
+
+    fn busy_timeout_ms(conn: &Connection) -> i64 {
+        conn.pragma_query_value(None, PRAGMA_BUSY_TIMEOUT, |r| r.get(0))
+            .expect("read busy_timeout")
+    }
+
+    #[test]
+    fn nowait_write_txn_commit_persists_and_restores_busy_timeout_8707() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let conn = nowait_test_conn(&tmp.path().join("nowait.db"));
+        let probe = NoWaitWriteTxn::try_begin(&conn)
+            .expect("try_begin")
+            .expect("nothing holds the lock");
+        assert!(!conn.is_autocommit(), "the guard holds an open transaction");
+        assert_eq!(busy_timeout_ms(&conn), NOWAIT_TEST_BUSY_TIMEOUT_MS);
+        conn.execute("INSERT INTO t (id) VALUES (1)", [])
+            .expect("insert");
+        probe.commit().expect("commit");
+        assert!(conn.is_autocommit(), "COMMIT must restore autocommit");
+        assert_eq!(row_count(&conn), 1, "committed row must survive");
+    }
+
+    /// Code F1 (#8707): a panic inside the guarded scope rolls back, leaves
+    /// the connection in autocommit and keeps the restored busy_timeout.
+    #[test]
+    fn nowait_write_txn_rolls_back_on_panic_unwind_8707() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let conn = nowait_test_conn(&tmp.path().join("nowait.db"));
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _probe = NoWaitWriteTxn::try_begin(&conn)
+                .expect("try_begin")
+                .expect("nothing holds the lock");
+            conn.execute("INSERT INTO t (id) VALUES (1)", [])
+                .expect("partial write");
+            panic!("#8707: injected panic inside the no-wait transaction");
+        }));
+        assert!(unwound.is_err(), "the injected panic must have unwound");
+        assert!(conn.is_autocommit(), "the unwind left the transaction open");
+        assert_eq!(row_count(&conn), 0, "the partial write survived the unwind");
+        assert_eq!(busy_timeout_ms(&conn), NOWAIT_TEST_BUSY_TIMEOUT_MS);
+    }
+
+    /// Another connection holds the write lock: `Ok(None)` at once, nothing
+    /// opened on the prober, busy_timeout restored.
+    #[test]
+    fn nowait_write_txn_is_none_while_another_connection_writes_8707() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("nowait.db");
+        let holder = nowait_test_conn(&path);
+        let prober = nowait_test_conn(&path);
+        let held = WriteTxn::begin(&holder).expect("holder BEGIN IMMEDIATE");
+        let started = std::time::Instant::now();
+        let probe = NoWaitWriteTxn::try_begin(&prober).expect("busy is not an error");
+        let elapsed = started.elapsed();
+        assert!(probe.is_none(), "the lock is held by another connection");
+        assert!(elapsed < NOWAIT_TEST_RETURN_CEILING, "waited {elapsed:?}");
+        assert!(prober.is_autocommit(), "a refused BEGIN opened nothing");
+        assert_eq!(busy_timeout_ms(&prober), NOWAIT_TEST_BUSY_TIMEOUT_MS);
+        held.rollback();
+    }
+
+    /// Code F4 (#8707): a BEGIN failure other than BUSY / LOCKED (here a
+    /// nested BEGIN) is `Err` with SQLite's exact text, constructs no guard,
+    /// leaves the outer transaction alone and restores busy_timeout.
+    #[test]
+    fn nowait_write_txn_nested_begin_is_err_and_restores_busy_timeout_8707() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let conn = nowait_test_conn(&tmp.path().join("nowait.db"));
+        let outer = WriteTxn::begin(&conn).expect("outer BEGIN");
+        let error = NoWaitWriteTxn::try_begin(&conn).map_or_else(
+            |e| e.to_string(),
+            |guard| format!("unexpected Ok(is_some={})", guard.is_some()),
+        );
+        assert_eq!(error, MSG_NESTED_BEGIN);
+        assert!(
+            !conn.is_autocommit(),
+            "the outer transaction must stay open"
+        );
+        assert_eq!(busy_timeout_ms(&conn), NOWAIT_TEST_BUSY_TIMEOUT_MS);
+        outer.rollback();
+        assert!(conn.is_autocommit());
     }
 
     #[test]
