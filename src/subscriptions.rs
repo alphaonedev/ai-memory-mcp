@@ -36,7 +36,9 @@ pub mod audit_status;
 pub mod scan_failure; // #7366 failed-lookup retry + DLQ record
 // #3979 — admitted-but-not-started deliveries, DLQ-recorded at the drain deadline.
 mod unstarted;
-use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
+#[cfg(not(test))]
+use std::net::ToSocketAddrs;
+use std::net::{IpAddr, Ipv4Addr};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -1575,6 +1577,7 @@ pub fn prewarm_dispatch_tls() {
         let _ = std::thread::spawn(|| {
             if let Err(e) = reqwest::blocking::Client::builder()
                 .timeout(ACK_TIMEOUT)
+                .no_proxy()
                 .build()
             {
                 tracing::warn!("webhook dispatch TLS warm-up failed: {e}");
@@ -1698,6 +1701,9 @@ fn send(
                 return Err(dlq_reason::DNS_SSRF_REJECTED.to_string());
             }
         };
+    #[cfg(test)]
+    let validated_addrs =
+        webhook_tls_8203_tests::receiver::map_receiver(&resolved_host, validated_addrs)?;
     // v0.7.0 SR-W3 (HIGH) — redirect SSRF-pin bypass. The
     // `builder.resolve(host, addr)` pins below shadow reqwest's DNS
     // for the *validated* host only. reqwest's default redirect
@@ -1711,6 +1717,8 @@ fn send(
     // like any other non-2xx.
     let mut builder = reqwest::blocking::Client::builder()
         .timeout(ACK_TIMEOUT)
+        // #6372: a proxy would resolve the host again, bypassing the DNS pin.
+        .no_proxy()
         .redirect(reqwest::redirect::Policy::none());
     // v1.0.0 #3705 — a receiver behind a private PKI: the operator-installed
     // root (`[subscriptions] ca_cert`) is trusted in addition to the public
@@ -2000,8 +2008,23 @@ fn parse_webhook_url(url: &str) -> std::result::Result<reqwest::Url, WebhookUrlP
     })
 }
 
+/// #8649 on the client-parser authority (#8655): the explicit port text, when
+/// any, is checked before the URL parse so every invalid form (zero, empty,
+/// overflow, signed) reads one reason. Refuse-only: the host and effective
+/// port still come from the parsed URL, never from this raw slice.
+fn check_raw_explicit_port(url: &str) -> Result<()> {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return Ok(());
+    };
+    let end = rest.find(['/', '?', '#', '\\']).unwrap_or(rest.len());
+    let authority = &rest[..end];
+    let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    normalize_webhook_host_port(host_port, &scheme.to_ascii_lowercase()).map(|_| ())
+}
+
 impl WebhookAuthority {
     fn parse(url: &str) -> Result<Self> {
+        check_raw_explicit_port(url)?;
         let parsed = parse_webhook_url(url)?;
         let shown = crate::url_display::url_origin(url);
         if !matches!(parsed.scheme(), "http" | "https") {
@@ -2020,6 +2043,41 @@ impl WebhookAuthority {
             plaintext: parsed.scheme() == "http",
         })
     }
+}
+
+/// #3822 — append the default HTTP port (`:80`) to a bracket/colon-normalized
+/// `host_port` that omits one, so `ToSocketAddrs` resolves it. Inference egress
+/// instead derives its canonical host and port from `reqwest::Url` (#8650).
+pub(crate) fn host_port_with_default_http_port(host_port: &str) -> String {
+    format!("{host_port}:80")
+}
+
+/// #6401 / #4075: webhook pins use the scheme default when no port is explicit.
+/// The inference HTTP-only helper above retains its existing contract.
+fn webhook_host_port_for_scheme(host_port: &str, scheme: &str) -> String {
+    const HTTPS_DEFAULT_PORT: u16 = 443;
+    if scheme == "https" {
+        format!("{host_port}:{HTTPS_DEFAULT_PORT}")
+    } else {
+        host_port_with_default_http_port(host_port)
+    }
+}
+
+/// Normalize only the webhook resolver authority, retaining its original host spelling.
+fn normalize_webhook_host_port(host_port: &str, scheme: &str) -> Result<String> {
+    // #8649: reject invalid explicit ports before DNS and its fail-open override.
+    let explicit_port =
+        if let Some(close_idx) = host_port.strip_prefix('[').and(host_port.find(']')) {
+            host_port[close_idx + 1..].strip_prefix(':')
+        } else {
+            host_port.rsplit_once(':').map(|(_, port)| port)
+        };
+    if let Some(port) = explicit_port {
+        port.parse::<std::num::NonZeroU16>()
+            .context("webhook URL has an invalid explicit port")?;
+        return Ok(host_port.to_string());
+    }
+    Ok(webhook_host_port_for_scheme(host_port, scheme))
 }
 
 pub(crate) fn validate_url_dns_resolved(
@@ -2126,8 +2184,12 @@ fn validate_url_dns_with(
              AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL=1 to revert)"
         ));
     }
-    let addrs: Vec<std::net::SocketAddr> = match resolv_target.to_socket_addrs() {
-        Ok(iter) => iter.collect(),
+    #[cfg(test)]
+    let resolution = webhook_ssrf_8203_tests::resolve(&resolv_target);
+    #[cfg(not(test))]
+    let resolution = resolv_target.to_socket_addrs().map(Iterator::collect);
+    let addrs: Vec<std::net::SocketAddr> = match resolution {
+        Ok(addrs) => addrs,
         Err(e) => {
             let fail_open = ssrf_dns_fail_open();
             if fail_open {
@@ -2268,9 +2330,13 @@ fn validate_url_with(url: &str, allow_loopback: bool) -> Result<()> {
 pub(crate) fn normalize_ip(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V6(v6) => {
-            let canonical = v6.to_canonical();
-            if matches!(canonical, IpAddr::V4(_)) {
-                return canonical;
+            // #6687: preserve the IPv6 meanings of :: and ::1, but classify
+            // IPv4-compatible and mapped addresses by the embedded IPv4 value.
+            if !v6.is_unspecified()
+                && !v6.is_loopback()
+                && let Some(v4) = v6.to_ipv4()
+            {
+                return IpAddr::V4(v4);
             }
             let segs = v6.segments();
             if segs[0] == 0x0064
@@ -2777,6 +2843,11 @@ fn record_dispatch(db_path: &std::path::Path, sub_id: &str, correlation_id: &str
 fn record_dispatch_with_conn(conn: &Connection, sub_id: &str, correlation_id: &str, ok: bool) {
     audit_status::persist_dispatch_counter(conn, sub_id, correlation_id, ok);
 }
+
+#[cfg(test)]
+mod webhook_ssrf_8203_tests;
+#[cfg(test)]
+mod webhook_tls_8203_tests;
 
 #[cfg(test)]
 mod tests {

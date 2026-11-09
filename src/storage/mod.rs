@@ -928,6 +928,8 @@ pub use approval_depth::{
     ApprovalDepthLevel, ApprovalDepthLevelState, ApprovalDepthWalk, approval_depth_level_decision,
     approval_depth_level_state, resolve_require_approval_above_depth,
 };
+/// #8444 - durable Agent2Agent Task rows (SQLite SSOT; postgres twin in the store).
+pub mod a2a_tasks;
 pub mod embed_skip;
 /// v1.0.0 #3288 — sqlite half of the bounded, keyset-paged admin export.
 pub mod export_page;
@@ -951,6 +953,7 @@ pub mod model_attest;
 /// the sal-gated `crate::store`) so record-stop compiles + works in the
 /// default (non-`sal`) sqlite build. The sal surface wraps it.
 pub mod record_stop;
+mod snapshot_file;
 // v1.0.0 #2445 — the schema DOWNGRADE guard (an OLDER binary must not
 // silently open and WRITE a NEWER database). Its own module so the pure
 // verdict is shared verbatim by the sqlite and postgres funnels.
@@ -24777,6 +24780,8 @@ pub fn reflect_input_from_pending(
 mod forensic_ident_namespace_3774_tests;
 #[cfg(test)]
 mod governance_read_fault_4043_tests;
+#[cfg(all(test, unix))]
+mod snapshot_mode_8679_tests;
 #[cfg(test)]
 pub(crate) mod txn_immediate_5084_tests;
 #[cfg(test)]

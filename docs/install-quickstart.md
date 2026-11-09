@@ -56,6 +56,7 @@ Pick the row that matches your machine. If you're not sure, the
 
 > **Behind a corporate proxy?** Set `HTTPS_PROXY` before running the
 > curl one-liner or any `cargo install` command.
+> This applies to installation downloads; webhook delivery ignores environment proxies.
 
 ## 3. Verify the install
 

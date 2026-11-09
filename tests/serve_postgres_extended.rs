@@ -227,6 +227,47 @@ async fn agents_round_trip_via_sal() {
     let _ = handle.await;
 }
 
+/// #8692 — number of extra namespaces seeded before a listing lookup. It is
+/// above `NAMESPACES_DEFAULT_LIMIT` (50) and `STATS_BY_NAMESPACE_MAX_LIMIT`
+/// (100), so a seeded count-1 namespace cannot sit on the first page.
+const CROWDING_NAMESPACES_8692: usize = 200;
+
+/// #8692 — rows per crowding namespace; denser than the namespace under test
+/// (1 and 3 rows) so the capped listings order the crowd ahead of it.
+const CROWDING_ROWS_8692: usize = 5;
+
+/// #8692 — seed [`CROWDING_NAMESPACES_8692`] denser namespaces so any lookup
+/// that relies on the first page of a capped listing fails, however empty the
+/// shared database was.
+async fn crowd_namespaces_8692(client: &reqwest::Client, base: &str) {
+    let tag = uuid::Uuid::new_v4();
+    for n in 0..CROWDING_NAMESPACES_8692 {
+        for r in 0..CROWDING_ROWS_8692 {
+            let resp = client
+                .post(format!("{base}/api/v1/memories"))
+                .json(&json!({
+                    "tier": "long",
+                    "namespace": format!("crowd-{tag}-{n}"),
+                    "title": format!("crowd-row-{r}"),
+                    "content": "crowding row",
+                    "tags": [],
+                    "priority": 5,
+                    "confidence": 1.0,
+                    "source": "import",
+                    "metadata": {}
+                }))
+                .send()
+                .await
+                .expect("crowding memory create");
+            assert!(
+                resp.status().is_success(),
+                "crowding seed: {}",
+                resp.status()
+            );
+        }
+    }
+}
+
 /// Phase 4 — `GET /api/v1/stats` returns top-level totals projected
 /// from SAL aggregates. Verifies the canonical list wire-shape
 /// (`total_memories`, `by_tier`, `by_namespace`).
@@ -259,6 +300,8 @@ async fn stats_round_trip_via_sal() {
             .expect("stats memory create");
     }
 
+    crowd_namespaces_8692(&client, &base).await;
+
     let stats: Value = client
         .get(format!("{base}/api/v1/stats"))
         .send()
@@ -269,12 +312,26 @@ async fn stats_round_trip_via_sal() {
         .expect("stats body");
     assert!(stats["total_memories"].as_u64().unwrap_or(0) >= 3);
     assert!(stats["by_tier"].is_array());
-    let by_namespace = stats["by_namespace"].as_array().expect("by_namespace list");
+    // #8692: `by_namespace` keeps only the densest top-N, so the seeded
+    // namespace is looked up directly (`/namespaces?prefix=`), never by
+    // scanning the capped list. The capped list itself must still be a list.
     assert!(
-        by_namespace.iter().any(|row| {
-            row["namespace"] == unique_ns && row["count"].as_u64().unwrap_or(0) >= 3
-        })
+        stats["by_namespace"].is_array(),
+        "by_namespace list: {stats}"
     );
+    let direct: Value = client
+        .get(format!("{base}/api/v1/namespaces"))
+        .query(&[("prefix", unique_ns.as_str())])
+        .send()
+        .await
+        .expect("stats namespace lookup GET")
+        .json()
+        .await
+        .expect("stats namespace lookup body");
+    let rows = direct["namespaces"].as_array().expect("namespaces array");
+    assert_eq!(rows.len(), 1, "exactly the seeded namespace: {direct}");
+    assert_eq!(rows[0]["namespace"], unique_ns);
+    assert_eq!(rows[0]["count"].as_u64(), Some(3));
     assert_eq!(stats["storage_backend"], "postgres");
 
     shutdown.notify_one();
@@ -310,8 +367,11 @@ async fn namespaces_round_trip_via_sal() {
         .await
         .expect("ns marker create");
 
+    crowd_namespaces_8692(&client, &base).await;
+
     let ns: Value = client
         .get(format!("{base}/api/v1/namespaces"))
+        .query(&[("prefix", unique_ns.as_str())])
         .send()
         .await
         .expect("namespaces GET")
@@ -511,8 +571,11 @@ async fn taxonomy_round_trip_via_sal() {
             .expect("tax create");
     }
 
+    crowd_namespaces_8692(&client, &base).await;
+
     let tax: Value = client
         .get(format!("{base}/api/v1/taxonomy"))
+        .query(&[("prefix", unique_ns.as_str())])
         .send()
         .await
         .expect("taxonomy GET")
@@ -525,16 +588,12 @@ async fn taxonomy_round_trip_via_sal() {
     // node, not an array — its `children` array holds the top-level
     // namespaces. Original test asserted `tax["tree"].as_array()` which
     // doesn't match the actual envelope.
-    let tree = tax["tree"]["children"]
-        .as_array()
-        .expect("tree.children array");
+    // #8692: the root node of a prefixed walk is the seeded namespace, so
+    // the lookup never depends on the capped top-level children list.
     let total = tax["total_count"].as_u64().expect("total_count");
-    assert!(total >= 3);
-    let row = tree
-        .iter()
-        .find(|n| n["namespace"].as_str() == Some(&unique_ns))
-        .expect("our namespace appears in tree.children");
-    assert!(row["count"].as_u64().unwrap_or(0) >= 3);
+    assert_eq!(total, 3, "only the seeded rows are under the prefix: {tax}");
+    assert_eq!(tax["tree"]["namespace"], unique_ns);
+    assert_eq!(tax["tree"]["subtree_count"].as_u64(), Some(3));
     assert_eq!(tax["storage_backend"], "postgres");
 
     shutdown.notify_one();

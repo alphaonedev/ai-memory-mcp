@@ -2122,11 +2122,11 @@ SOURCE_FIELDS = ("path", "git", "registry", "registry-index", "branch", "tag", "
 ALLOWED_PATCHES = {("crates-io", "paste"): {"path": "vendor/paste"}}
 PATCH_STRING = re.compile(r"\"([^\"\\\n]*)\"|'([^'\n]*)'")
 # r13 (security LOW-1): the exact dependency names of the live Cargo.toml per table. A new dependency is a new crate that
-# can supply a proc macro, a path root or a trait; the counts are 64 [dependencies], 14 [dev-dependencies], 0
+# can supply a proc macro, a path root or a trait; the counts are 65 [dependencies], 14 [dev-dependencies], 0
 # [build-dependencies], 1 [target.'cfg(unix)'.dependencies], 1 [target.'cfg(unix)'.dev-dependencies].
 LIVE_DEPENDENCIES = {
     ("dependencies",): frozenset("""
-        anyhow async-trait axum axum-server base64 bitflags blake3 bytes candle-core candle-nn candle-transformers
+        a2a-lf anyhow async-trait axum axum-server base64 bitflags blake3 bytes candle-core candle-nn candle-transformers
         chacha20poly1305 chrono ciborium clap clap_complete clap_mangen dirs ed25519-dalek fs2 futures-core
         gethostname hex hf-hub hkdf hmac instant-distance notify pem pgvector prometheus rand_core rcgen
         reed-solomon-simd reqwest rusqlite rustls same-file schemars serde serde_json serde_yaml_ng sha2 sqlx
