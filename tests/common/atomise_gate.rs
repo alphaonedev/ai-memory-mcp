@@ -12,8 +12,11 @@
 //! [`GatedCurator`] wraps any [`Curator`] and parks the worker inside
 //! `decompose` until the test opens the gate. While the gate is closed the
 //! atoms CANNOT have landed, so a test can assert "the response did not block
-//! on the curator" deterministically, then open the gate and poll (with
-//! [`poll_until`]) for the atoms. Take it with the `#[path]` idiom:
+//! on the curator" deterministically, then open the gate and JOIN the worker
+//! (`spawn_joinable`, close the queue, `join`) so the atoms are committed with
+//! no wall-clock deadline. Nothing here sleeps a thread: sync tests block on a
+//! condvar, async tests await [`AtomiseGate::wait_until_entered_async`]
+//! (CONCURRENCY-22). Take it with the `#[path]` idiom:
 //!
 //! ```ignore
 //! #[path = "common/atomise_gate.rs"]
@@ -27,9 +30,10 @@ use std::time::{Duration, Instant};
 
 use ai_memory::atomisation::curator::{Atom, Curator, CuratorError};
 
-/// Bounded wait for the worker to land atoms or reach the gate.
+/// Hang guard for the worker to reach the gate (never the correctness
+/// condition for atoms landing: tests join the worker for that).
 pub const ATOM_LAND_DEADLINE: Duration = Duration::from_secs(15);
-/// Poll interval for [`poll_until`].
+/// Poll interval for [`AtomiseGate::wait_until_entered_async`].
 pub const ATOM_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// Ceiling on how long a parked curator waits for the gate. Only reached when
 /// a test forgets to open it; the worker then proceeds instead of hanging the
@@ -73,19 +77,39 @@ impl AtomiseGate {
     }
 
     /// Block until the worker is parked at the gate (bounded by
-    /// [`ATOM_LAND_DEADLINE`]); returns whether it got there.
+    /// [`ATOM_LAND_DEADLINE`]); returns whether it got there. Sync tests only:
+    /// it parks the calling thread on a condvar, so an async test must use
+    /// [`Self::wait_until_entered_async`].
     pub fn wait_until_entered(&self) -> bool {
-        poll_until(ATOM_LAND_DEADLINE, ATOM_POLL_INTERVAL, || {
-            self.entered() >= 1
-        })
+        let (lock, cv) = &*self.inner;
+        let guard = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (guard, _) = cv
+            .wait_timeout_while(guard, ATOM_LAND_DEADLINE, |st| st.entered < 1)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.entered >= 1
     }
 
-    fn park(&self) {
+    /// Async twin of [`Self::wait_until_entered`]: yields to the runtime between
+    /// polls instead of blocking a worker thread (CONCURRENCY-22).
+    pub async fn wait_until_entered_async(&self) -> bool {
+        poll_until_async(ATOM_LAND_DEADLINE, ATOM_POLL_INTERVAL, || {
+            self.entered() >= 1
+        })
+        .await
+    }
+
+    /// Park the calling thread at the gate until it opens (or
+    /// [`GATE_PARK_CEILING`] passes). Counts as an entry. Used by
+    /// [`GatedCurator`] and by tests that hold the worker's provider closed.
+    pub fn park(&self) {
         let (lock, cv) = &*self.inner;
         let mut st = lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         st.entered += 1;
+        cv.notify_all();
         let deadline = Instant::now() + GATE_PARK_CEILING;
         while !st.open {
             let left = deadline.saturating_duration_since(Instant::now());
@@ -142,8 +166,13 @@ impl Curator for GatedCurator {
     }
 }
 
-/// Poll `cond` every `interval` until it holds or `deadline` elapses.
-pub fn poll_until(deadline: Duration, interval: Duration, mut cond: impl FnMut() -> bool) -> bool {
+/// Async poll of `cond` every `interval` until it holds or `deadline` elapses,
+/// awaiting `tokio::time::sleep` so no runtime thread is blocked.
+pub async fn poll_until_async(
+    deadline: Duration,
+    interval: Duration,
+    mut cond: impl FnMut() -> bool,
+) -> bool {
     let end = Instant::now() + deadline;
     loop {
         if cond() {
@@ -152,6 +181,6 @@ pub fn poll_until(deadline: Duration, interval: Duration, mut cond: impl FnMut()
         if Instant::now() >= end {
             return false;
         }
-        std::thread::sleep(interval);
+        tokio::time::sleep(interval).await;
     }
 }

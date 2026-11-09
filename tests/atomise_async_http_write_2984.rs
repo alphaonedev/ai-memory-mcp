@@ -55,7 +55,7 @@ use ai_memory::storage as db;
 
 #[path = "common/atomise_gate.rs"]
 mod atomise_gate;
-use atomise_gate::{ATOM_LAND_DEADLINE, ATOM_POLL_INTERVAL, AtomiseGate, GatedCurator};
+use atomise_gate::{AtomiseGate, GatedCurator};
 
 /// #1751 — permissive attestation opt-out, the same pin
 /// `tests/autotag_async_write_2587.rs` carries.
@@ -116,18 +116,25 @@ fn build_atomise_router(
     wire_worker: bool,
     calls: &Arc<Mutex<usize>>,
 ) -> (axum::Router, std::path::PathBuf) {
-    build_atomise_router_gated(wire_llm, wire_worker, calls, None)
+    let (router, db_path, _worker) = build_atomise_router_gated(wire_llm, wire_worker, calls, None);
+    (router, db_path)
 }
 
 /// [`build_atomise_router`] with an optional #8687 gate: when `gate` is
 /// `Some`, the mock curator parks at it, so the test decides when the worker
-/// may land atoms instead of racing it.
+/// may land atoms instead of racing it. The third element is the worker's join
+/// handle (`Some` when `wire_worker`): drop the router (the queue's sole owner),
+/// then join it to know the buffered jobs have fully drained.
 fn build_atomise_router_gated(
     wire_llm: bool,
     wire_worker: bool,
     calls: &Arc<Mutex<usize>>,
     gate: Option<&AtomiseGate>,
-) -> (axum::Router, std::path::PathBuf) {
+) -> (
+    axum::Router,
+    std::path::PathBuf,
+    Option<std::thread::JoinHandle<()>>,
+) {
     permissive_attestation_for_tests();
     let db_path = local_runs_db("http-create");
     let conn = db::open(&db_path).expect("db::open");
@@ -187,29 +194,33 @@ fn build_atomise_router_gated(
         ),
         http_identity_mode: ai_memory::config::HttpIdentityMode::default(),
     };
+    let mut worker_handle = None;
     if wire_worker {
         let calls = Arc::clone(calls);
         let gate = gate.cloned();
-        app_state.atomise_queue =
-            ai_memory::background::atomise_worker::spawn(Arc::new(move || {
-                let curator: Box<dyn Curator> = match &gate {
-                    Some(g) => Box::new(GatedCurator::new(
-                        Box::new(TwoAtomCurator {
-                            calls: Arc::clone(&calls),
-                        }),
-                        g,
-                    )),
-                    None => Box::new(TwoAtomCurator {
+        let spawned = ai_memory::background::atomise_worker::spawn_joinable(Arc::new(move || {
+            let curator: Box<dyn Curator> = match &gate {
+                Some(g) => Box::new(GatedCurator::new(
+                    Box::new(TwoAtomCurator {
                         calls: Arc::clone(&calls),
                     }),
-                };
-                Some(Arc::new(Atomiser::new(
-                    curator,
-                    None,
-                    AtomiserConfig::default(),
-                    FeatureTier::Smart,
-                )))
-            }));
+                    g,
+                )),
+                None => Box::new(TwoAtomCurator {
+                    calls: Arc::clone(&calls),
+                }),
+            };
+            Some(Arc::new(Atomiser::new(
+                curator,
+                None,
+                AtomiserConfig::default(),
+                FeatureTier::Smart,
+            )))
+        }));
+        if let Some((queue, handle)) = spawned {
+            app_state.atomise_queue = Some(queue);
+            worker_handle = Some(handle);
+        }
     }
 
     let api_key_state = ApiKeyState {
@@ -222,7 +233,7 @@ fn build_atomise_router_gated(
         ..Default::default()
     };
     let router = ai_memory::build_router(api_key_state, app_state);
-    (router, db_path)
+    (router, db_path, worker_handle)
 }
 
 fn seed_policy(db_path: &std::path::Path, ns: &str, mode: AutoAtomiseMode) {
@@ -321,7 +332,8 @@ async fn http_create_enqueues_atomisation_and_the_worker_lands_the_atoms_2984() 
     // gate even if an assertion below panics.
     let gate = AtomiseGate::closed();
     let _release = gate.release_on_drop();
-    let (router, db_path) = build_atomise_router_gated(true, true, &calls, Some(&gate));
+    let (router, db_path, worker) = build_atomise_router_gated(true, true, &calls, Some(&gate));
+    let worker = worker.expect("atomise worker spawns");
     let ns = "atomise-2984-deferred";
     seed_policy(&db_path, ns, AutoAtomiseMode::Deferred);
 
@@ -348,7 +360,7 @@ async fn http_create_enqueues_atomisation_and_the_worker_lands_the_atoms_2984() 
     // would never have returned). The worker has picked the job up, yet no
     // atom can have landed and the curator has not completed a call.
     assert!(
-        gate.wait_until_entered(),
+        gate.wait_until_entered_async().await,
         "the queued job must reach the worker out-of-band"
     );
     assert_eq!(
@@ -362,13 +374,16 @@ async fn http_create_enqueues_atomisation_and_the_worker_lands_the_atoms_2984() 
         "the curator has not returned yet"
     );
 
-    // Open the gate: the bounded single-consumer worker now drains it, and
-    // the atoms appear within a bounded wait (no timing-dependent zero).
+    // Open the gate, drop the router (the queue's sole owner, so the channel
+    // closes) and JOIN the worker: join() returns only after every buffered job
+    // has run, so the atoms are committed with no wall-clock deadline (#2986
+    // precedent). The join runs on the blocking pool, not a runtime thread.
     gate.open();
-    let landed = atomise_gate::poll_until(ATOM_LAND_DEADLINE, ATOM_POLL_INTERVAL, || {
-        count_atoms(&db_path, &source_id) >= 2
-    });
-    assert!(landed, "the atoms must land within the bounded wait");
+    drop(router);
+    tokio::task::spawn_blocking(move || worker.join())
+        .await
+        .expect("join task runs")
+        .expect("atomise worker thread joins after draining");
     let atoms = count_atoms(&db_path, &source_id);
     assert_eq!(
         atoms, 2,

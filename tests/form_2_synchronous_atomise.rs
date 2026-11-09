@@ -47,7 +47,7 @@ use serde_json::{Value, json};
 
 #[path = "common/atomise_gate.rs"]
 mod atomise_gate;
-use atomise_gate::{ATOM_LAND_DEADLINE, ATOM_POLL_INTERVAL, AtomiseGate, GatedCurator};
+use atomise_gate::{AtomiseGate, GatedCurator};
 
 // ---------------------------------------------------------------------------
 // #3050 — NO shared mock state. Every test injects its OWN stateless curator
@@ -376,10 +376,11 @@ fn deferred_mode_preserves_existing_behaviour() {
     let _release = gate.release_on_drop();
     let (atomiser, calls) = isolated_gated_atomiser(&gate);
     let provider_atomiser = Arc::clone(&atomiser);
-    let queue: AtomiseQueue = ai_memory::background::atomise_worker::spawn(Arc::new(move || {
-        Some(Arc::clone(&provider_atomiser))
-    }))
-    .expect("atomise worker spawns");
+    let (queue, worker): (AtomiseQueue, std::thread::JoinHandle<()>) =
+        ai_memory::background::atomise_worker::spawn_joinable(Arc::new(move || {
+            Some(Arc::clone(&provider_atomiser))
+        }))
+        .expect("atomise worker spawns");
     let deferred_wiring = AtomiseWiring::new(Some(&atomiser), Some(&queue));
 
     let conn = open_shared_db();
@@ -420,19 +421,15 @@ fn deferred_mode_preserves_existing_behaviour() {
         "deferred-configured + deferred-ran must NOT report a divergence"
     );
 
-    // The deferred guarantee is EVENTUAL, not immediate — the bounded
-    // worker (this test's own) lands the atoms out-of-band. Poll the
-    // isolated curator's own counter + the source rows; both are race-free
-    // because nothing else drives this atomiser. Dropping `queue` after the
-    // assertion lets the worker thread exit cleanly (its only sender gone).
+    // The deferred guarantee is EVENTUAL, not immediate. Open the gate, close
+    // the queue (the sole sender) and JOIN this test's own worker: join()
+    // returns only after every buffered job has run, so the atoms are
+    // committed with no wall-clock deadline (#2986 precedent).
     gate.open();
-    let landed = atomise_gate::poll_until(ATOM_LAND_DEADLINE, ATOM_POLL_INTERVAL, || {
-        count_atoms_for_source(&conn, &source_id) >= 2
-    });
-    assert!(
-        landed,
-        "deferred mode: the atoms must land within the bounded wait"
-    );
+    drop(queue);
+    worker
+        .join()
+        .expect("atomise worker thread joins after draining");
     let atoms = count_atoms_for_source(&conn, &source_id);
     assert_eq!(
         atoms, 2,
@@ -443,7 +440,6 @@ fn deferred_mode_preserves_existing_behaviour() {
         1,
         "deferred mode: exactly one curator call, on the worker thread",
     );
-    drop(queue);
 }
 
 // ---------------------------------------------------------------------------
