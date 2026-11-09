@@ -11,8 +11,9 @@ const GROWTH: usize = 10;
 /// work: x10 plus the rounding of whole repeated pieces. A rescan gives x100.
 const LINEAR_WORK_RATIO_LIMIT: usize = 11;
 /// No scanner charges more than this many examined bytes per input byte. The
-/// largest honest charge is a key normalized once and matched against every
-/// credential noun (22 needles), so a key-shaped run costs about 22 per byte.
+/// largest honest charge is a key normalized once and searched for each of the
+/// 20 contained credential nouns: about 25 per byte in the option scanner and 30
+/// for the composed operator masker, which also runs the bare-target and URL passes.
 const MAX_WORK_PER_BYTE: usize = 32;
 
 /// `(label, prefix, repeated piece, suffix)`: the adversarial shapes of #8674.
@@ -25,6 +26,7 @@ const SHAPES: &[(&str, &str, &str, &str)] = &[
     ("port", "", "http://u@a.io:80)", ""),
     ("nested schemes", "", "http://a://b@c://", ""),
     ("whitespace-free authority", "https://", "a=1:", ""),
+    ("colon authority", "https://", ":", ""),
     ("ambiguous options", "https://user:secret ", "limit=10 ", ""),
     ("credential lines", "", "password=private\n", ""),
     ("quoted credential", "", "token: 'a\\'b' ", ""),

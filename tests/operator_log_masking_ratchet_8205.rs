@@ -15,22 +15,16 @@ const LCG_INCREMENT: u64 = 1;
 const FORM_COUNT: usize = 9;
 const HOST: &str = "db.example.invalid";
 const PREFIX: &str = "connection attempt: ";
-// Integration cost guard: compare tenfold inputs, never a response-time budget.
-// Minimum samples reduce host scheduling noise; unit counters independently pin
-// both rescan classes without clocks, including optimized test builds.
+// Integration cost guard: gross absolute backstops only (>= 10x the measured
+// debug cost), so host load cannot trip them while a rescan (about 20 s at 100K)
+// still does. No clock ratio: under a parallel run it measures the scheduler.
+// The x10 work ratio is pinned without clocks by the lib tests
+// `logging::scan_work_tests` for every shape below (#8674).
 const COST_SAMPLES: usize = 3;
-const COST_GROWTH: usize = 10;
-const COST_RATIO_LIMIT: u32 = 40;
-const COST_SMALL_URL_BYTES: usize = 2_048;
-const COST_SMALL_ROWS: usize = 2_048;
-const COST_SCHEDULING_SLACK: std::time::Duration = std::time::Duration::from_millis(20);
 const RUN_SMALL_BYTES_8674: usize = 100_000;
 const RUN_LARGE_BYTES_8674: usize = 1_000_000;
-// Gross backstops only (>= 10x measured cost): load cannot trip them, the old
-// quadratic (about 20 s at 100K) still does. The doubling ratio is the invariant.
 const RUN_SMALL_CEILING_8674: std::time::Duration = std::time::Duration::from_millis(2_500);
 const RUN_LARGE_CEILING_8674: std::time::Duration = std::time::Duration::from_secs(25);
-const RUN_DOUBLING_LIMIT_8674: u32 = 3;
 const RUN_SHAPES_8674: &[&str] = &[
     "http://u@a.io)",
     "http://u:p@a.io)",
@@ -94,12 +88,7 @@ fn suppressed_foreign_log_url_cost_8674() {
     // No environment write or subscriber installation: the work before the
     // tracing macro must remain bounded even when that macro emits nothing.
     for shape in RUN_SHAPES_8674 {
-        let mut small_cost = std::time::Duration::ZERO;
-        for bytes in [
-            RUN_SMALL_BYTES_8674,
-            RUN_SMALL_BYTES_8674 * 2,
-            RUN_LARGE_BYTES_8674,
-        ] {
+        for bytes in [RUN_SMALL_BYTES_8674, RUN_LARGE_BYTES_8674] {
             let input = shape.repeat(bytes.div_ceil(shape.len()));
             let cost = (0..COST_SAMPLES)
                 .map(|_| {
@@ -126,62 +115,36 @@ fn suppressed_foreign_log_url_cost_8674() {
                 cost < ceiling,
                 "#8674: foreign log cost {cost:?} exceeds {ceiling:?}"
             );
-            if bytes == RUN_SMALL_BYTES_8674 {
-                small_cost = cost;
-            } else if bytes == RUN_SMALL_BYTES_8674 * 2 {
-                assert!(
-                    cost < small_cost * RUN_DOUBLING_LIMIT_8674,
-                    "#8674: x2 foreign log cost exceeds x3: {small_cost:?} -> {cost:?}"
-                );
-            }
         }
     }
 }
 
-fn assert_masking_cost_growth(label: &str, small: &str, large: &str) {
-    let small_cost = minimum_masking_cost(small);
-    let large_cost = minimum_masking_cost(large);
-    println!(
-        "{label}: bytes={}/{}, minimum_time={small_cost:?}/{large_cost:?}",
-        small.len(),
-        large.len()
-    );
+/// One 1M-byte diagnostic through the captured operator line stays under the
+/// gross backstop; its x10 work ratio is the lib op-count test of the same shape.
+fn assert_masking_cost_bounded(label: &str, prefix: &str, piece: &str) {
+    let count = RUN_LARGE_BYTES_8674.div_ceil(piece.len());
+    let detail = format!("{PREFIX}{prefix}{}", piece.repeat(count));
+    let cost = minimum_masking_cost(&detail);
+    println!("{label}: bytes={}, minimum_time={cost:?}", detail.len());
     assert!(
-        large_cost <= small_cost * COST_RATIO_LIMIT + COST_SCHEDULING_SLACK,
-        "{label}: tenfold input exceeded the cost-ratio bound: {small_cost:?} -> {large_cost:?}"
+        cost < RUN_LARGE_CEILING_8674,
+        "{label}: masking cost {cost:?} exceeds {RUN_LARGE_CEILING_8674:?}"
     );
 }
 
 #[test]
 fn url_cost_runtime_8205_r7() {
-    let input = |size| format!("{PREFIX}https://{}", ":".repeat(size));
-    assert_masking_cost_growth(
-        "F5 URL authority",
-        &input(COST_SMALL_URL_BYTES),
-        &input(COST_SMALL_URL_BYTES * COST_GROWTH),
-    );
+    assert_masking_cost_bounded("F5 URL authority", "https://", ":");
 }
 
 #[test]
 fn credential_cost_runtime_8205_r7() {
-    // More rows amplify the inexpensive substring search; the tenfold ratio is
-    // identical to the URL cell and is also pinned by the operation counter.
-    let input = |rows| format!("{PREFIX}{}", "password=x\n".repeat(rows));
-    assert_masking_cost_growth(
-        "F5 credential lines",
-        &input(COST_SMALL_ROWS),
-        &input(COST_SMALL_ROWS * COST_GROWTH),
-    );
+    assert_masking_cost_bounded("F5 credential lines", "", "password=x\n");
 }
 
 #[test]
 fn bare_target_cost_runtime_8205_r7() {
-    let input = |rows| format!("{PREFIX}{}", "u:p@h x\n".repeat(rows));
-    assert_masking_cost_growth(
-        "F5 bare-target control",
-        &input(COST_SMALL_ROWS),
-        &input(COST_SMALL_ROWS * COST_GROWTH),
-    );
+    assert_masking_cost_bounded("F5 bare-target control", "", "u:p@h x\n");
 }
 
 fn assert_private(detail: &str, secret: &str, label: &str) -> String {

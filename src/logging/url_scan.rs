@@ -23,18 +23,40 @@ pub(super) fn next_url_run(text: &str) -> Option<UrlRun> {
     let mut start = 0;
     for (offset, ch) in text.char_indices() {
         if text[offset..].starts_with(SCHEME_SEPARATOR) {
-            let run = scan_authority(text, start, offset);
-            #[cfg(test)]
-            super::masking_cost_tests::visited(run.span.end);
-            return Some(run);
+            charge(offset + SCHEME_SEPARATOR.len());
+            return Some(scan_authority(text, start, offset));
         }
         if !(ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.')) {
             start = offset + ch.len_utf8();
         }
     }
-    #[cfg(test)]
-    super::masking_cost_tests::visited(text.len());
+    charge(text.len());
     None
+}
+
+/// #8674: charge the bytes a search walked over to the cfg(test) work counter.
+/// Fixed-width probes at a cursor position (the scheme separator, a table
+/// lookup) are folded into that cursor's one-byte-per-byte charge.
+#[inline]
+pub(super) fn charge(bytes: usize) {
+    #[cfg(test)]
+    super::masking_cost_tests::visited(bytes);
+    #[cfg(not(test))]
+    let _ = bytes;
+}
+
+/// Charge a forward search through its match, or the whole haystack on a miss.
+#[must_use]
+pub(super) fn charged_find(found: Option<usize>, haystack: usize) -> Option<usize> {
+    charge(found.map_or(haystack, |at| at.saturating_add(1)));
+    found
+}
+
+/// Charge a backward search from the end to its match, or the whole haystack.
+#[must_use]
+pub(super) fn charged_rfind(found: Option<usize>, haystack: usize) -> Option<usize> {
+    charge(found.map_or(haystack, |at| haystack.saturating_sub(at)));
+    found
 }
 
 /// Boundaries and the last userinfo delimiter are accumulated once, never searched
@@ -55,19 +77,22 @@ fn scan_authority(text: &str, start: usize, scheme_end: usize) -> UrlRun {
     let mut host_boundary = None;
     let mut host_path = None;
     let mut stop = text.len();
+    // Bytes this cursor read, including the remainder past the run end.
+    let mut examined = text.len();
     for (relative, ch) in text[authority_start..].char_indices() {
         let offset = authority_start + relative;
         if offset - start >= MAX_OPERATOR_URL_RUN_BYTES {
             run.capped = true;
+            examined = offset;
             stop = line_end_from(text, offset);
             break;
         }
-        if CREDENTIAL_LINE_ENDS.contains(&ch) || text[offset..].starts_with(SCHEME_SEPARATOR) {
-            stop = offset;
-            break;
-        }
         let whitespace = ch.is_whitespace();
-        if whitespace && !run.ambiguous {
+        if CREDENTIAL_LINE_ENDS.contains(&ch)
+            || text[offset..].starts_with(SCHEME_SEPARATOR)
+            || (whitespace && !run.ambiguous)
+        {
+            examined = offset + ch.len_utf8();
             stop = offset;
             break;
         }
@@ -97,6 +122,7 @@ fn scan_authority(text: &str, start: usize, scheme_end: usize) -> UrlRun {
             }
         }
     }
+    charge(examined.saturating_sub(authority_start));
     run.span.end = if run.capped {
         stop
     } else if run.userinfo_end.is_some() {
@@ -114,8 +140,6 @@ fn scan_authority(text: &str, start: usize, scheme_end: usize) -> UrlRun {
 
 /// Consume an already-owned remainder once; it will never be offered to a parser again.
 fn line_end_from(text: &str, offset: usize) -> usize {
-    offset
-        + text[offset..]
-            .find(CREDENTIAL_LINE_ENDS)
-            .unwrap_or(text.len() - offset)
+    let rest = text.len() - offset;
+    offset + charged_find(text[offset..].find(CREDENTIAL_LINE_ENDS), rest).unwrap_or(rest)
 }

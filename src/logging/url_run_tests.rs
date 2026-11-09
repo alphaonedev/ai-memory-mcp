@@ -7,11 +7,11 @@ const DOUBLE_BYTES: usize = SMALL_BYTES * 2;
 const LARGE_BYTES: usize = 1_000_000;
 /// Gross backstops only: at least 10x the measured debug cost, so host load
 /// cannot trip them while the old quadratic (about 20 s at 100K) still does.
+/// No clock ratio: under a parallel run it measures the scheduler, so growth is
+/// pinned by the op-count ratios here and in `scan_work_tests` (#8674).
 const GROSS_SMALL_CEILING: Duration = Duration::from_millis(2_500);
 const GROSS_LARGE_CEILING: Duration = Duration::from_secs(25);
 const SAMPLES: usize = 3;
-/// Primary timing invariant: time(2N) / time(N) stays below this; a quadratic gives about 4.
-const DOUBLING_LIMIT: u32 = 3;
 /// Primary op-count invariant: scanner work at 2N stays below this multiple of work at N.
 const WORK_DOUBLING_NUMERATOR: usize = 5;
 const WORK_DOUBLING_DENOMINATOR: usize = 2;
@@ -73,26 +73,13 @@ fn work(piece: &str, bytes: usize) -> usize {
 #[test]
 fn whitespace_free_url_runs_are_linear_8674() {
     for &(label, input, expected) in SHAPES {
-        let small = measure(
+        measure(
             label,
             input,
             expected,
             SMALL_BYTES,
             SAMPLES,
             GROSS_SMALL_CEILING,
-        );
-        let double = measure(
-            label,
-            input,
-            expected,
-            DOUBLE_BYTES,
-            SAMPLES,
-            GROSS_SMALL_CEILING,
-        );
-        println!("#8674 {label}: doubling ratio {double:?} / {small:?}");
-        assert!(
-            double < small * DOUBLING_LIMIT,
-            "#8674 {label}: x2 cost must stay below x{DOUBLING_LIMIT}: {small:?} -> {double:?}"
         );
         measure(label, input, expected, LARGE_BYTES, 1, GROSS_LARGE_CEILING);
     }

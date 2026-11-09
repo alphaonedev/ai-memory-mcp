@@ -1616,24 +1616,23 @@ const CREDENTIAL_LINE_ENDS: [char; 2] = ['\n', '\r'];
 /// through on a parse error.
 #[must_use]
 pub fn redact_url_password(url: &str) -> String {
-    let Some(scheme_end) = url.find(SCHEME_SEPARATOR) else {
+    let Some(scheme_end) = url_scan::charged_find(url.find(SCHEME_SEPARATOR), url.len()) else {
         return url.to_string();
     };
     let authority_start = scheme_end + SCHEME_SEPARATOR.len();
     let rest = &url[authority_start..];
     // The authority component ends at the first '/', '?' or '#'.
-    let authority_end = rest
-        .find(AUTHORITY_TERMINATORS)
+    let authority_end = url_scan::charged_find(rest.find(AUTHORITY_TERMINATORS), rest.len())
         .map_or(url.len(), |i| authority_start + i);
     let authority = &url[authority_start..authority_end];
     // Userinfo is everything before the LAST '@' in the authority
     // (RFC 3986 — the host may not contain '@', so the last one wins).
-    let Some(at_pos) = authority.rfind('@') else {
+    let Some(at_pos) = url_scan::charged_rfind(authority.rfind('@'), authority.len()) else {
         return url.to_string();
     };
     let userinfo = &authority[..at_pos];
     // Password is everything after the FIRST ':' in the userinfo.
-    let Some(colon_pos) = userinfo.find(':') else {
+    let Some(colon_pos) = url_scan::charged_find(userinfo.find(':'), userinfo.len()) else {
         return url.to_string();
     };
     let mut out = String::with_capacity(url.len());
@@ -1688,25 +1687,34 @@ fn redact_bare_targets(msg: &str) -> String {
             .map_or(rest.len(), |span| span.start - offset);
         let local = &rest[..stop];
         if offset >= lookahead_end {
-            let line_end = local.find(CREDENTIAL_LINE_ENDS).unwrap_or(local.len());
+            let line = url_scan::charged_find(local.find(CREDENTIAL_LINE_ENDS), local.len());
+            let line_end = line.unwrap_or(local.len());
             lookahead_end = offset + line_end;
-            last_at = local[..line_end].rfind('@').map(|at| offset + at);
+            last_at = url_scan::charged_rfind(local[..line_end].rfind('@'), line_end)
+                .map(|at| offset + at);
         }
-        let end = local.find(char::is_whitespace).unwrap_or(local.len());
+        let end = url_scan::charged_find(local.find(char::is_whitespace), local.len())
+            .unwrap_or(local.len());
         let token = &local[..end];
+        // A non-empty value follows the first ':' (an ASCII byte).
         let ambiguous = credentialed_authority(token)
-            && token
-                .split_once(':')
-                .is_some_and(|(_, value)| !value.is_empty());
+            && url_scan::charged_find(token.find(':'), token.len())
+                .is_some_and(|colon| colon + 1 < token.len());
         let lookahead = lookahead_end - offset;
         let at = last_at.filter(|at| *at >= offset).map(|at| at - offset);
-        let bare = ambiguous && (at.is_some() || token.contains(AUTHORITY_TERMINATORS));
+        let bare = ambiguous
+            && (at.is_some()
+                || url_scan::charged_find(token.find(AUTHORITY_TERMINATORS), token.len())
+                    .is_some());
         if bare {
             let consumed = at.map_or(end, |at| {
                 let host = at + '@'.len_utf8();
-                host + local[host..lookahead]
-                    .find(char::is_whitespace)
-                    .unwrap_or(lookahead - host)
+                let host_len = lookahead - host;
+                host + url_scan::charged_find(
+                    local[host..lookahead].find(char::is_whitespace),
+                    host_len,
+                )
+                .unwrap_or(host_len)
             });
             out.push_str(URL_PASSWORD_MASK);
             offset += consumed;
@@ -1773,10 +1781,9 @@ fn next_url_span(text: &str) -> Option<std::ops::Range<usize>> {
 
 /// Only an authority colon identifies userinfo ambiguity; path colons do not.
 fn credentialed_authority(token: &str) -> bool {
-    token
-        .split(AUTHORITY_TERMINATORS)
-        .next()
-        .is_some_and(|authority| authority.contains(':'))
+    let authority_end = url_scan::charged_find(token.find(AUTHORITY_TERMINATORS), token.len())
+        .unwrap_or(token.len());
+    url_scan::charged_find(token[..authority_end].find(':'), authority_end).is_some()
 }
 
 /// Render from boundaries already discovered by the forward scanner.
