@@ -70,7 +70,8 @@ run()   {
         printf '    [dry-run] %s\n' "$*"
         return 0
     fi
-    eval "$@"
+    # Operator-supplied shell step text, never a Python launch.
+    eval "$@" # isolation: exempt #8202
 }
 
 # ---------------------------------------------------------------- prereqs ---

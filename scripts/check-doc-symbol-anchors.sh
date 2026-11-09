@@ -330,7 +330,8 @@ if [[ -f "$LADDER_GATE" ]]; then
         printf '       If it was renamed, update the extraction here in lockstep.\n' >&2
         exit 1
     fi
-    eval "$reader"
+    # The reader is awk-extracted shell text from the repository, not a Python launch.
+    eval "$reader" # isolation: exempt #8202
     LADDER_TIP="$(read_current_schema_version "$REPO_ROOT/src/store/postgres.rs")"
 fi
 

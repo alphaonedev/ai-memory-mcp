@@ -86,7 +86,8 @@ export AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0
 assert() {
     local label="$1"
     local cond="$2"
-    if eval "$cond" >/dev/null 2>&1; then
+    # The condition is a literal test expression written in this suite.
+    if eval "$cond" >/dev/null 2>&1; then # isolation: exempt #8202
         printf '\033[32m  PASS\033[0m %s\n' "$label"
         PASS_COUNT=$((PASS_COUNT + 1))
     else

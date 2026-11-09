@@ -33,7 +33,7 @@ UNSAFE_REASONS = frozenset((REASON_ISOLATION, REASON_DYNAMIC, REASON_LAUNCHER,
 # Corpus constants: wrapper x form x context. Named so the class is auditable.
 WRAPPERS = ("", "timeout 60 ", "nohup ", "unknownwrap ", "unknownwrap --flag ",
             "sudo -u u ", "env FOO=1 ", "nice -n 5 unknownwrap ")
-UNSAFE_FORMS = ("python3 x.py", "$PYTHON x.py", "py -3 x.py", "pip install x",
+UNSAFE_FORMS = ("python3 x.py", "${PY:-python3} x.py", "$PYTHON x.py", "py -3 x.py", "pip install x",
                 "pytest -q", "$(which python3) x.py", "`which python3` x.py",
                 "${{ matrix.python }} x.py")
 SAFE_FORMS = ("python3 -I x.py", "$BIN run", "${BIN} run", "git status",
@@ -46,7 +46,7 @@ UNCLASSIFIED_FORMS = (
     "ksh -c 'python3 x.py'", "fish -c 'echo hi'", "mksh -c 'echo hi'",
     "busybox sh -c 'echo hi'", "pwsh -c Get-Date", "bash -c \"$CMD\"",
     "sh -c \"$(cat run.sh)\"", "eval \"$CMD\"", "eval $(make-cmd)",
-    "${!NAME} x.py", "${PY:-python3} x.py", "${PYTHON%/*} x.py")
+    "${!NAME} x.py", "${PYTHON%/*} x.py")
 UNSUPPORTED_YAML_STEPS = {
     "alias": "      - &a\n        run: echo hi\n      - run: *a",
     "space-before-colon": "      - run : python3 x.py",
@@ -61,7 +61,8 @@ UNSUPPORTED_YAML_STEPS = {
 }
 NEST_DEPTH_OVER_LIMIT = 80
 MALFORMED_LINES = 2500
-LINEAR_OPS_PER_LINE = 1
+RECOVERY_PASSES = 80
+GROWTH_CEILING = 2.2
 WALL_CEILING_SECONDS = 20.0
 RECOVERY_LIMIT_CEILING = 256
 INPUT_EXIT = 2
@@ -145,7 +146,7 @@ class StaleExemptionR7(unittest.TestCase):
 
     def test_stale_exemption_fails_the_repository_scan(self):
         directory, root = workflow_repo(
-            "    steps:\n      - run: echo hi # isolation: exempt #8202")
+            "    steps:\n      - run: |\n          echo hi # isolation: exempt #8202")
         with directory:
             result = run_cli("--root", str(root))
         self.assertEqual(result.returncode, FINDINGS_EXIT, result.stdout)
@@ -215,19 +216,35 @@ class BoundedCostR7(unittest.TestCase):
 
     def test_scan_work_is_bounded_by_the_input_size(self):
         checker = load_checker()
-        calls = []
-        original = checker.shell_commands
 
-        def counting(text):
-            calls.append(len(text))
-            return original(text)
+        def work(text):
+            sizes = []
+            originals = {name: getattr(checker, name)
+                         for name in ("substitutions", "mask_heredocs")}
 
-        checker.shell_commands = counting
-        text = "echo $(\n" * MALFORMED_LINES
-        found = checker.scan_shell(text)
-        self.assertTrue(found)
-        self.assertLessEqual(sum(calls), LINEAR_OPS_PER_LINE * len(text) * 2,
-                             "recovery re-lexes the input quadratically")
+            def counting(name):
+                def wrapper(chunk, *args, **kwargs):
+                    sizes.append(len(chunk))
+                    return originals[name](chunk, *args, **kwargs)
+                return wrapper
+
+            for name in originals:
+                setattr(checker, name, counting(name))
+            try:
+                self.assertTrue(checker.scan_shell(text))
+            finally:
+                for name, function in originals.items():
+                    setattr(checker, name, function)
+            return sum(sizes)
+
+        for line in ("echo $(\n", "cat <<EOF\n"):
+            with self.subTest(line=line):
+                small = work(line * MALFORMED_LINES)
+                large = work(line * MALFORMED_LINES * 2)
+                self.assertLessEqual(small, RECOVERY_PASSES * len(line) * MALFORMED_LINES,
+                                     "recovery re-lexes the input quadratically")
+                self.assertLessEqual(large, small * GROWTH_CEILING,
+                                     "work grows faster than the input")
 
     def test_no_recursion_error_at_any_malformed_count(self):
         checker = load_checker()
@@ -272,6 +289,34 @@ class DocstringR7(unittest.TestCase):
                       doc)
         self.assertIn("malformed constructs are located findings that keep every other "
                       "finding and the summary", doc)
+
+
+# Shell shapes that once produced false findings on the live wrapper scripts.
+LEXER_CLEAN_CASES = {
+    "hash-in-braces": 'for ((i = 0; i < ${#pat}; i++)); do\n  echo "$i"\ndone\n',
+    "quoted-paren-case-pattern": "case \"$c\" in\n  '.' | '(' | ')' | '\\') x+=1 ;;\n  *) x+=2 ;;\nesac\n",
+    "blank-in-braced-parameter": "loc=${hit%%  *}; key=${hit##*  }\n",
+    "python-named-path-operand": 'mkdir -p "$FIX/sdk/python/ai_memory"\n',
+    "test-regex": '[[ "$ref" =~ ^${rx}$ ]]\n',
+}
+LIVE_FINDING_COUNT = 0
+
+
+class LiveRepositoryR7(unittest.TestCase):
+    def test_lexer_shapes_are_not_findings(self):
+        checker = load_checker()
+        for name, text in LEXER_CLEAN_CASES.items():
+            with self.subTest(name=name):
+                self.assertEqual(checker.scan_shell(text), [])
+
+    def test_python_named_operand_of_unknown_wrapper_is_still_dynamic(self):
+        checker = load_checker()
+        found = checker.scan_shell("unknownwrap $PYTHON x.py\n")
+        self.assertEqual([item.reason for item in found], [REASON_DYNAMIC])
+
+    def test_repository_has_the_measured_finding_count(self):
+        checker = load_checker()
+        self.assertEqual(len(checker.scan_repository(ROOT)), LIVE_FINDING_COUNT)
 
 
 if __name__ == "__main__":

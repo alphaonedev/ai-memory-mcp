@@ -16,8 +16,17 @@ as are literal names. Other unresolved executables, such as $BIN or $PSQL, are l
 this is a lexical name scan, not whole-workflow variable binding analysis.
 Workflow scalars are decoded before scanning; YAML-side comments never exempt
 shell calls. Unsupported scalar encodings fail closed at their source line.
+Fail closed (option B): a shell or workflow form the checker cannot classify is a
+finding that tells the author to write python3 -I explicitly. That covers unknown
+wrappers before an interpreter-looking word, brace expansion or a glob in command
+position, shell -c re-entry through an unknown shell or a dynamic program string,
+eval of an expansion, complex parameter expansion in command position, unsupported
+YAML run forms, nesting past MAX_NESTING_DEPTH and more than MAX_RECOVERIES
+malformed commands in one input. An isolation exemption that matches no finding is
+itself a finding.
 Exit codes: 0 clean, 1 findings, 2 unreadable/malformed input or a repository with
-no workflow files. Input errors retain other findings and the summary.
+no workflow files. Unreadable files stop the scan with a path message and no summary;
+malformed constructs are located findings that keep every other finding and the summary.
 """
 import argparse
 from bisect import bisect_right
@@ -26,6 +35,7 @@ import json
 from pathlib import Path
 import re
 import shlex
+import string
 import sys
 import textwrap
 
@@ -36,7 +46,9 @@ SUBSTITUTION_TOKEN = "SUBSTITUTION"
 EXPRESSION_OPEN = "${{"
 EXPRESSION_CLOSE = "}}"
 BIN_PATH_COMPONENT = "/bin/"
+SUBSTITUTION_OPEN = "$("
 ARITHMETIC_OPEN = "$(("
+ARITHMETIC_PAREN = "(("
 ARITHMETIC_TOKEN = "ARITHMETIC"
 ENV_COMMAND = "env"
 ENV_SPLIT_OPTIONS = frozenset(("-S", "--split-string"))
@@ -50,6 +62,41 @@ DYNAMIC_REASON = "dynamic interpreter requires an issue exemption"
 LAUNCHER_REASON = "console launcher requires isolated Python -m"
 ISOLATION_REASON = "Python interpreter requires -I before the program"
 MALFORMED_REASON = "unparseable shell command"
+UNCLASSIFIED_REASON = "unclassifiable shell form: write python3 -I explicitly"
+NESTING_REASON = "nesting too deep to classify: write python3 -I explicitly"
+RECOVERY_REASON = "too many malformed commands to classify: write python3 -I explicitly"
+STALE_EXEMPTION_REASON = "stale isolation exemption matches no finding"
+MAX_NESTING_DEPTH = 32
+MAX_RECOVERIES = 32
+OTHER_SHELLS = frozenset(("ksh", "mksh", "ash", "csh", "tcsh", "fish", "yash", "rbash",
+                          "busybox", "pwsh", "powershell", "nu", "xonsh", "elvish"))
+OTHER_SHELL_COMMAND_OPTION = re.compile(r"-{1,2}[a-zA-Z]*c[a-zA-Z]*\Z", re.IGNORECASE)
+EVAL_COMMAND = "eval"
+PARAMETER_NAME = r"[A-Za-z_][A-Za-z_0-9]*"
+PLAIN_PARAMETER = re.compile(
+    rf"\$(?:{PARAMETER_NAME}|[0-9@*#?!$-]|\{{{PARAMETER_NAME}(?:\[[@*0-9]+\])?"
+    r"(?::?[-=+][^${}`*?\[\]]*)?\})(?:/[^${}`*?\[]*)?\Z")
+TEST_OPEN = "[["
+TEST_CLOSE = "]]"
+CASE_COMMAND = "case"
+CASE_IN = "in"
+CASE_ESAC = "esac"
+CASE_BREAKS = frozenset((";;", ";&", ";;&"))
+# A braced parameter expansion is one word even when its operator text holds blanks.
+BRACED_PARAMETER = re.compile(r"\$\{(?!\{)[^}\n]*\}")
+SPACE_PLACEHOLDER = "\x01"
+# A hash inside a parameter expansion is an operator, never a comment.
+HASH_PLACEHOLDER = "\x02"
+# Quoted punctuation is hidden from the tokenizer so it cannot pose as a grouping token.
+QUOTED_PUNCTUATION = {char: chr(0x10 + index) for index, char in enumerate(";&|()<>")}
+QUOTED_RESTORE = {ord(mask): char for char, mask in QUOTED_PUNCTUATION.items()}
+ARGUMENT_COUNT = "$#"
+ARGUMENT_COUNT_MASKED = "$" + HASH_PLACEHOLDER
+CASE_PATTERN = "pattern"
+CASE_BODY = "body"
+CASE_HEADER = (CASE_COMMAND, "subject", CASE_IN)
+BRACE_EXPANSION = re.compile(r"(?<!\$)\{[^{}]*(?:,|\.\.)[^{}]*\}")
+GLOB_CHARACTERS = frozenset("*?[")
 WORKFLOW_REASON = "unsupported workflow run scalar"
 OPTIONS_WITH_VALUE = frozenset(("-W", "-X", "--check-hash-based-pycs"))
 COMMAND_END = frozenset((";", "&&", "||", "|", "&", "(", ")", "\n"))
@@ -87,15 +134,29 @@ PREFIX_VALUE_OPTIONS = {
 }
 PREFIX_POSITIONAL_ARGUMENTS = {"timeout": 1, "flock": 1, "chrt": 1, "taskset": 1}
 PREFIX_POSITIONAL_OPTIONS = {"taskset": frozenset(("-c", "--cpu-list"))}
+LEXER_WORD_CHARACTERS = "".join(
+    char for char in string.printable
+    if not char.isspace() and char not in ";&|()<>'\"\\#")
 EXIT_OK = 0
 EXIT_FINDINGS = 1
 EXIT_INPUT = 2
 HEREDOC = re.compile(r"(?<!<)<<(-?)[ \t]*(['\"]?)([A-Za-z_][A-Za-z_0-9]*)\2")
 WRAPPER_REF = re.compile(r"scripts/[A-Za-z_0-9./-]+\.sh\b")
 WORKFLOW_DIR = Path(".github/workflows")
-WORKFLOW_FIELD = re.compile(r"^(?P<indent>\s*)(?P<item>-\s+)?(?P<key>run|shell|'run'|'shell'|\"run\"|\"shell\"):\s*(?P<value>.*)$")
+RUN_KEY = "run"
+SHELL_KEY = "shell"
+WORKFLOW_KEYS = (RUN_KEY, SHELL_KEY)
+KEY_FORMS = "|".join(f"{key}|'{key}'|\"{key}\"" for key in WORKFLOW_KEYS)
+WORKFLOW_FIELD = re.compile(
+    rf"^(?P<indent>\s*)(?P<item>-\s+)?(?P<key>{KEY_FORMS}):\s*(?P<value>.*)$")
 FLOW_STEP = re.compile(r"^\s*-\s*\{")
-FLOW_FIELD = re.compile(r"^\s*(run|shell|'run'|'shell'|\"run\"|\"shell\"):\s*(.*)$", re.DOTALL)
+FLOW_FIELD = re.compile(rf"^\s*({KEY_FORMS}):\s*(.*)$", re.DOTALL)
+KEY_ANYWHERE = re.compile(rf"(?<![\w.-])(?:{KEY_FORMS})\s*:")
+UNSUPPORTED_KEY_FORM = re.compile(
+    r"^\s*(?:-\s+)?(?:\"[^\"]*\\[^\"]*\"\s*:|\?(?:\s|\Z)|<<\s*:)")
+UNSUPPORTED_VALUE_START = ("*", "&", "!", "[", "{", "?")
+GENERIC_BLOCK_FIELD = re.compile(
+    r"^(?P<indent>\s*)(?:-\s+)?[^#\s][^:]*:\s*[|>][-+0-9]*\s*(?:#.*)?$")
 EMPTY_REPOSITORY_REASON = "repository contains no workflow files"
 EXEMPTION = re.compile(r"# isolation: exempt #([1-9][0-9]*)\s*\Z")
 
@@ -114,8 +175,9 @@ class InputError(ValueError):
 class ShellSyntaxError(ValueError):
     """A malformed shell construct with its source line retained."""
 
-    def __init__(self, text, offset):
-        super().__init__(MALFORMED_REASON)
+    def __init__(self, text, offset, reason=MALFORMED_REASON):
+        super().__init__(reason)
+        self.reason = reason
         self.line = text.count("\n", 0, offset) + 1
 
 
@@ -170,18 +232,18 @@ def script_is_unisolated(arguments):
     return not isolated
 
 
-def heredoc_openings(line, contexts):
+def heredoc_openings(line, contexts, depth=0):
     """Recognize redirections outside quotes, comments and arithmetic expansions."""
     index = 0
     program_start = 0
     while index < len(line):
         quotes = contexts[-1][0]
         if quotes.quote != "'" and line.startswith(ARITHMETIC_OPEN, index):
-            index = substitution_end(line, index + 2) + 1
+            index = substitution_end(line, index + len(SUBSTITUTION_OPEN), depth) + 1
             continue
-        if quotes.quote != "'" and line.startswith("$(", index):
+        if quotes.quote != "'" and line.startswith(SUBSTITUTION_OPEN, index):
             contexts.append([QuoteScanner(), 1])
-            index += 2
+            index += len(SUBSTITUTION_OPEN)
             program_start = index
             continue
         if quotes.quote is None:
@@ -201,20 +263,27 @@ def heredoc_openings(line, contexts):
         index = quotes.advance(line, index)
 
 
-def mask_heredocs(text):
+def mask_heredocs(text, depth=0):
     """Scan shell-program heredocs recursively; preserve line counts while masking data."""
+    if depth > MAX_NESTING_DEPTH:
+        raise ShellSyntaxError(text, 0, NESTING_REASON)
     pending = []
     result = []
     contexts = [[QuoteScanner(), 0]]
     for number, line in enumerate(text.splitlines(keepends=True), 1):
         if pending:
-            delimiter, strip_tabs, program, body, _ = pending[0]
+            delimiter, strip_tabs, program, body, opening = pending[0]
             candidate = line.rstrip("\r\n")
             if strip_tabs:
                 candidate = candidate.lstrip("\t")
             if candidate == delimiter:
                 content = "".join(body)
-                result.append(mask_heredocs(content) if program else "\n" * content.count("\n"))
+                try:
+                    result.append(mask_heredocs(content, depth + 1) if program
+                                  else "\n" * content.count("\n"))
+                except ShellSyntaxError as error:
+                    error.line += opening
+                    raise
                 result.append("\n" if line.endswith("\n") else "")
                 pending.pop(0)
             else:
@@ -223,7 +292,7 @@ def mask_heredocs(text):
             result.append(line)
             if not line.lstrip().startswith("#"):
                 try:
-                    for match, start in heredoc_openings(line, contexts):
+                    for match, start in heredoc_openings(line, contexts, depth):
                         commands = list(shell_commands(line[start:match.start()]))
                         values = [value for value, _ in commands[-1]] if commands else []
                         mode, _ = shell_input(values, executable_index(values))
@@ -237,8 +306,10 @@ def mask_heredocs(text):
     return "".join(result)
 
 
-def substitution_end(text, start):
+def substitution_end(text, start, nesting=0):
     """Find a command substitution's close, respecting quotes and nested calls."""
+    if nesting > MAX_NESTING_DEPTH:
+        raise ShellSyntaxError(text, start - len(SUBSTITUTION_OPEN), NESTING_REASON)
     index = start
     quotes = QuoteScanner()
     depth = 1
@@ -248,8 +319,8 @@ def substitution_end(text, start):
         if next_index > index + 1:
             index = next_index
             continue
-        if quotes.quote != "'" and text.startswith("$(", index):
-            index = substitution_end(text, index + 2)
+        if quotes.quote != "'" and text.startswith(SUBSTITUTION_OPEN, index):
+            index = substitution_end(text, index + len(SUBSTITUTION_OPEN), nesting + 1)
         elif quotes.quote is None:
             if char == "(":
                 depth += 1
@@ -258,10 +329,10 @@ def substitution_end(text, start):
                 if depth == 0:
                     return index
         index += 1
-    raise ShellSyntaxError(text, start - 2)
+    raise ShellSyntaxError(text, start - len(SUBSTITUTION_OPEN))
 
 
-def substitutions(text):
+def substitutions(text, depth=0):
     """Extract executed $() bodies even inside double-quoted shell words."""
     parts = []
     children = []
@@ -274,17 +345,20 @@ def substitutions(text):
             parts.append(text[index:next_index])
             index = next_index
             continue
-        if quotes.quote != "'" and text.startswith("$(", index):
-            end = substitution_end(text, index + 2)
+        if quotes.quote != "'" and text.startswith(SUBSTITUTION_OPEN, index):
+            end = substitution_end(text, index + len(SUBSTITUTION_OPEN), depth)
             offset = text.count("\n", 0, index)
             if text.startswith(ARITHMETIC_OPEN, index):
-                _, nested = substitutions(text[index + len(ARITHMETIC_OPEN):end - 1])
+                _, nested = substitutions(
+                    text[index + len(ARITHMETIC_OPEN):end - 1], depth + 1)
                 children.extend((child, line + offset) for child, line in nested)
-                token = ARITHMETIC_TOKEN
+                placeholder = ARITHMETIC_TOKEN
             else:
-                children.append((text[index + 2:end], offset))
-                token = SUBSTITUTION_TOKEN
-            parts.append(token + "\n" * text.count("\n", index, end))
+                body = text[index + len(SUBSTITUTION_OPEN):end]
+                children.append((body, offset))
+                placeholder = SUBSTITUTION_TOKEN + (
+                    PYTHON_NAME_MARKER if PYTHON_NAME_MARKER in body.casefold() else "")
+            parts.append(placeholder + "\n" * text.count("\n", index, end))
             index = end + 1
             continue
         if quotes.quote != "'" and char == "`":
@@ -298,8 +372,11 @@ def substitutions(text):
                     end += 1
             if end >= len(text):
                 raise ShellSyntaxError(text, index)
-            children.append((text[index + 1:end], text.count("\n", 0, index)))
-            parts.append(SUBSTITUTION_TOKEN + "\n" * text.count("\n", index, end))
+            body = text[index + 1:end]
+            children.append((body, text.count("\n", 0, index)))
+            placeholder = SUBSTITUTION_TOKEN + (
+                PYTHON_NAME_MARKER if PYTHON_NAME_MARKER in body.casefold() else "")
+            parts.append(placeholder + "\n" * text.count("\n", index, end))
             index = end + 1
             continue
         if quotes.quote is None and char == "#" and (index == 0 or text[index - 1].isspace()):
@@ -327,23 +404,72 @@ def join_continuations(text):
     return "".join(result)
 
 
+def mask_quoted_punctuation(text):
+    """Hide shell punctuation inside quotes so a quoted ')' is never a grouping token."""
+    quotes = QuoteScanner()
+    masked = list(text)
+    index = 0
+    while index < len(text):
+        following = quotes.advance(text, index)
+        if quotes.quote and text[index] in QUOTED_PUNCTUATION:
+            masked[index] = QUOTED_PUNCTUATION[text[index]]
+        index = following
+    return "".join(masked)
+
+
+def unmask_token(token):
+    """Restore the characters the lexer pre-pass hid from the tokenizer."""
+    token = token.replace(SPACE_PLACEHOLDER, " ").replace(HASH_PLACEHOLDER, "#")
+    return token.translate(QUOTED_RESTORE)
+
+
 def shell_commands(text):
     """Tokenize shell words, retaining newline boundaries and quoted arguments."""
     original_newlines = [index for index, char in enumerate(text) if char == "\n"]
     text = join_continuations(text)
+    text = BRACED_PARAMETER.sub(
+        lambda match: re.sub(r"[ \t]", SPACE_PLACEHOLDER, match.group()).replace(
+            "#", HASH_PLACEHOLDER), text).replace(ARGUMENT_COUNT, ARGUMENT_COUNT_MASKED)
+    text = mask_quoted_punctuation(text)
     lexer = shlex.shlex(text, posix=True, punctuation_chars=";&|()<>")
-    lexer.wordchars += "${}:"
+    lexer.wordchars += LEXER_WORD_CHARACTERS + SPACE_PLACEHOLDER + HASH_PLACEHOLDER
     lexer.whitespace = " \t\r"
     lexer.commenters = "#"
     words = []
     array_depth = 0
     arithmetic_depth = 0
+    group_depth = 0
+    in_test = False
+    case_modes = []
     try:
         for token in lexer:
+            if in_test:
+                in_test = token != TEST_CLOSE
+                continue
+            if token == TEST_OPEN and all(word in COMMAND_PREFIXES for word, _ in words):
+                in_test = True
+                continue
+            if case_modes and case_modes[-1] == CASE_PATTERN:
+                # Case patterns are data: skip them up to their closing parenthesis.
+                if token == ")":
+                    case_modes[-1] = CASE_BODY
+                elif token == CASE_ESAC:
+                    case_modes.pop()
+                continue
+            if case_modes and token == CASE_ESAC and not words:
+                case_modes.pop()
+                continue
+            if token in CASE_BREAKS:
+                if words:
+                    yield words
+                    words = []
+                if case_modes:
+                    case_modes[-1] = CASE_PATTERN
+                continue
             if arithmetic_depth:
                 arithmetic_depth += token.count("(") - token.count(")")
                 continue
-            if token == "((":
+            if token == ARITHMETIC_PAREN:
                 arithmetic_depth = 2
                 continue
             if array_depth:
@@ -353,6 +479,19 @@ def shell_commands(text):
                 array_depth = 1
                 continue
             if token in COMMAND_END:
+                if (len(words) >= len(CASE_HEADER) and words[0][0] == CASE_COMMAND
+                        and words[2][0] == CASE_IN):
+                    case_modes.append(CASE_BODY if token == ")" else CASE_PATTERN)
+                    words = []
+                    continue
+                if token == "(":
+                    group_depth += 1
+                elif token == ")":
+                    if group_depth == 0:
+                        # A case pattern's closing parenthesis ends a pattern, not a command.
+                        words = []
+                        continue
+                    group_depth -= 1
                 if words:
                     yield words
                     words = []
@@ -361,7 +500,7 @@ def shell_commands(text):
                 while position and text[position - 1].isspace():
                     position -= 1
                 line = bisect_right(original_newlines, position - 1) + 1
-                words.append((token, line))
+                words.append((unmask_token(token), line))
     except ValueError as error:
         quotes = QuoteScanner()
         index = 0
@@ -433,11 +572,31 @@ def offset_findings(findings, offset):
     return [Finding(item.line + offset, item.reason, item.malformed) for item in findings]
 
 
-def reentry_findings(words, executable):
-    """Inspect evaluated strings and shell -c programs through the same scanner."""
+def unclassified(line):
+    return Finding(line, UNCLASSIFIED_REASON)
+
+
+def dynamic_program(value):
+    """A program string built by expansion cannot be classified lexically."""
+    stripped = value.strip()
+    return SUBSTITUTION_TOKEN in value or (stripped.startswith("$") and len(stripped.split()) == 1)
+
+
+def reentry_findings(words, executable, depth=0):
+    """Inspect evaluated strings and shell -c programs through the same scanner.
+
+    Returns the findings and whether an env -S split already classified the command.
+    """
     values = [value for value, _ in words]
     findings = []
-    if executable < len(values) and values[executable].rsplit("/", 1)[-1] == ENV_COMMAND:
+    name = values[executable].rsplit("/", 1)[-1] if executable < len(values) else ""
+    if name in OTHER_SHELLS and any(
+            OTHER_SHELL_COMMAND_OPTION.fullmatch(item) or item in SHELLS
+            for item in values[executable + 1:]):
+        return [unclassified(words[executable][1])], True
+    if name == EVAL_COMMAND and any(dynamic_program(item) for item in values[executable + 1:]):
+        return [unclassified(words[executable][1])], True
+    if name == ENV_COMMAND:
         for index in range(executable + 1, len(values)):
             option = values[index]
             if option in ENV_SPLIT_OPTIONS and index + 1 < len(values):
@@ -448,16 +607,21 @@ def reentry_findings(words, executable):
             else:
                 continue
             command = program + " " + shlex.join(values[tail:])
-            return offset_findings(scan_shell(command), words[index][1] - 1)
+            return offset_findings(scan_shell(command, depth=depth + 1),
+                                   words[index][1] - 1), True
     if values[0] in REENTRY_COMMANDS:
         candidates = words[1:2] if values[0] == TRAP_COMMAND else words[1:]
         for candidate, line in candidates:
-            if PYTHON_NAME_MARKER in candidate.casefold():
-                findings.extend(offset_findings(scan_shell(candidate), line - 1))
+            if values[0] == EVAL_COMMAND or PYTHON_NAME_MARKER in candidate.casefold():
+                findings.extend(offset_findings(scan_shell(candidate, depth=depth + 1),
+                                                line - 1))
     mode, index = shell_input(values, executable)
     if mode == "command" and index < len(values):
-        findings.extend(offset_findings(scan_shell(values[index]), words[index][1] - 1))
-    return findings
+        if dynamic_program(values[index]):
+            return [unclassified(words[index][1])], True
+        findings.extend(offset_findings(scan_shell(values[index], depth=depth + 1),
+                                        words[index][1] - 1))
+    return findings, False
 
 
 def dynamic_interpreter(values, index):
@@ -478,16 +642,34 @@ def console_launcher(name, arguments):
 def invocation_findings(words, executable):
     """Classify a command after its wrappers; interpreter argv is never rescanned."""
     values = [value for value, _ in words]
+    operand = next((index for index in range(executable + 1, len(values))
+                    if not values[index].startswith("-")), None)
     for index in range(executable, len(words)):
         value, line = words[index]
         name = value.rsplit("/", 1)[-1]
         if index == executable and SUBSTITUTION_TOKEN in value:
             return [Finding(line, DYNAMIC_REASON)]
         if index == executable and value.startswith("$"):
+            if value != EXPRESSION_OPEN and not PLAIN_PARAMETER.fullmatch(value):
+                return [unclassified(line)]
             if dynamic_interpreter(values, index):
                 return [Finding(line, DYNAMIC_REASON)]
             # An unresolved wrapper may still invoke a literal interpreter.
             continue
+        if index == executable and (BRACE_EXPANSION.search(value)
+                                    or GLOB_CHARACTERS & set(value)):
+            return [unclassified(line)]
+        if index == operand and index > executable:
+            # An unknown wrapper may hand its operand to an interpreter.
+            if (SUBSTITUTION_TOKEN in value or value == EXPRESSION_OPEN) and dynamic_interpreter(
+                    values, index):
+                return [Finding(line, DYNAMIC_REASON)]
+            if value.startswith("$") and PYTHON_NAME_MARKER in name.casefold():
+                return [Finding(line, DYNAMIC_REASON)]
+            if name == PYTHON_LAUNCHER:
+                return [Finding(line, DYNAMIC_REASON)]
+            if console_launcher(name, values[index + 1:]):
+                return [Finding(line, LAUNCHER_REASON)]
         if PYTHON_NAME.fullmatch(name):
             if "/" in value and index != executable and BIN_PATH_COMPONENT not in value:
                 continue
@@ -500,42 +682,59 @@ def invocation_findings(words, executable):
     return []
 
 
-def command_findings(words):
+def command_findings(words, depth=0):
     """Separate data/lookups, evaluated programs and interpreter invocations."""
     values = [value for value, _ in words]
     if values[0] in DATA_COMMANDS | LOOKUP_COMMANDS or tuple(values[:2]) in COMMAND_LOOKUPS:
         return []
     executable = executable_index(values)
-    findings = reentry_findings(words, executable)
+    findings, handled = reentry_findings(words, executable, depth)
+    if handled:
+        return findings
     if executable < len(values) and values[executable] not in DATA_COMMANDS | LOOKUP_COMMANDS:
         findings.extend(invocation_findings(words, executable))
     return findings
 
 
-def recover_shell(text, line, masked):
-    """Retain independently scannable lines on both sides of malformed input."""
-    lines = text.splitlines(keepends=True)
-    prefix = scan_shell("".join(lines[:line - 1]), masked=masked)
-    suffix = scan_shell("".join(lines[line:]), masked=masked)
-    return prefix + [Finding(line, MALFORMED_REASON, True)] + offset_findings(suffix, line)
-
-
-def scan_shell(text, *, masked=False):
-    """Return unsafe Python invocations and located malformed-command findings."""
+def scan_segment(text, masked, depth):
+    """Scan one text without recovery; raise ShellSyntaxError on malformed input."""
     findings = []
-    original = text
-    try:
-        text, children = substitutions(text if masked else mask_heredocs(text))
-    except ShellSyntaxError as error:
-        return recover_shell(original, error.line, masked)
-    try:
-        for child, offset in children:
-            findings.extend(offset_findings(scan_shell(child, masked=True), offset))
-        for words in shell_commands(text):
-            findings.extend(command_findings(words))
-    except ShellSyntaxError as error:
-        return recover_shell(original, error.line, masked)
+    text, children = substitutions(text if masked else mask_heredocs(text, depth), depth)
+    for child, offset in children:
+        findings.extend(offset_findings(scan_shell(child, masked=True, depth=depth + 1),
+                                        offset))
+    for words in shell_commands(text):
+        findings.extend(command_findings(words, depth))
     return findings
+
+
+def scan_shell(text, *, masked=False, depth=0):
+    """Return unsafe Python invocations and located malformed-command findings.
+
+    Recovery is iterative and bounded: each malformed command splits its text once, at
+    most MAX_RECOVERIES times, so cost is linear and nothing recurses per malformed line.
+    """
+    if depth > MAX_NESTING_DEPTH:
+        return [Finding(1, NESTING_REASON, True)]
+    findings = []
+    pending = [(text, 0)]
+    recoveries = 0
+    while pending:
+        segment, offset = pending.pop()
+        if recoveries > MAX_RECOVERIES:
+            findings.append(Finding(offset + 1, RECOVERY_REASON, True))
+            continue
+        try:
+            found = scan_segment(segment, masked, depth)
+        except ShellSyntaxError as error:
+            recoveries += 1
+            lines = segment.splitlines(keepends=True)
+            findings.append(Finding(offset + error.line, error.reason, True))
+            pending.append(("".join(lines[error.line:]), offset + error.line))
+            pending.append(("".join(lines[:error.line - 1]), offset))
+            continue
+        findings.extend(offset_findings(found, offset))
+    return sorted(findings, key=lambda item: item.line)
 
 
 def yaml_comment_free(text):
@@ -570,7 +769,7 @@ def flow_fields(text, offset):
     body = yaml_comment_free(text).strip()
     body = body[body.index("{") + 1:]
     if not body.endswith("}"):
-        yield "run", None, "", offset
+        yield RUN_KEY, None, "", offset
         return
     body = body[:-1]
     quotes = QuoteScanner()
@@ -623,10 +822,23 @@ def workflow_fields(text):
             continue
         match = WORKFLOW_FIELD.match(raw)
         if not match:
+            generic = GENERIC_BLOCK_FIELD.match(raw)
+            if generic:
+                # Other keys' block scalars are data: skip their bodies.
+                while index < len(lines) and (not lines[index].strip() or len(
+                        lines[index]) - len(lines[index].lstrip()) > len(generic["indent"])):
+                    index += 1
+            elif (KEY_ANYWHERE.search(yaml_comment_free(raw))
+                  or UNSUPPORTED_KEY_FORM.match(raw)):
+                # A run/shell key in a form the line reader cannot decode fails closed.
+                yield RUN_KEY, None, "", offset
             continue
         key = match['key'].strip("'\"")
         indent = len(match['indent']) + len(match['item'] or '')
         value = yaml_comment_free(match['value'])
+        if value.startswith(UNSUPPORTED_VALUE_START):
+            yield key, None, "", offset
+            continue
         body = []
         while index < len(lines):
             line = lines[index]
@@ -653,7 +865,7 @@ def workflow_fields(text):
 def workflow_runs(text):
     """Compatibility iterator for decoded run scalars and their source offsets."""
     for key, command, _, offset in workflow_fields(text):
-        if key == "run" and command is not None:
+        if key == RUN_KEY and command is not None:
             yield command, offset
 
 
@@ -714,7 +926,10 @@ def scan_source(text):
             exempt.append((item.line, comments[item.line]))
         else:
             findings.append(item)
-    return findings, exempt
+    used = {line for line, _ in exempt}
+    findings.extend(Finding(line, STALE_EXEMPTION_REASON)
+                    for line in sorted(set(comments) - used))
+    return sorted(findings, key=lambda item: item.line), exempt
 
 
 def scan_repository(root, exemptions=None):
@@ -732,7 +947,7 @@ def scan_repository(root, exemptions=None):
                 findings.append((path, Finding(offset + 1, WORKFLOW_REASON, True)))
                 continue
             # A shell template is an argv declaration, not shell program text.
-            unsafe, exempt = (scan_source(command) if key == "run"
+            unsafe, exempt = (scan_source(command) if key == RUN_KEY
                               else (scan_shell(command), []))
             # Decoded text alone decides violations. The physical source view
             # supplies locations for folded scalar tokens, never extra findings.

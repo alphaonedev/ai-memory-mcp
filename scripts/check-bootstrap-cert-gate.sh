@@ -340,17 +340,25 @@ leg_a_setup() {
 #        to strip it entirely (the #2991 check-#20 negative control).
 posture_env() {
   local bin="$1"
+  # Optional assignments are built as arrays so no parameter expansion sits in command position.
+  local attest_assignment=() approver_assignment=()
+  [[ -n "${2:-}" ]] && attest_assignment=("AI_MEMORY_PG_AT_REST_ATTESTED=$2")
+  if [[ $# -ge 4 ]]; then
+    [[ -n "$4" ]] && approver_assignment=("$4")
+  else
+    approver_assignment=("AI_MEMORY_APPROVER_PUBKEYS=$APPROVER_PUBKEY_A")
+  fi
   env \
     AI_MEMORY_SECURITY_PROFILE=asi-hard \
     AI_MEMORY_FED_TRUST_DOMAIN=test-fleet \
     AI_MEMORY_FED_PEER_FINGERPRINTS="$FPFILE_A" \
     AI_MEMORY_FED_PEER_ATTESTATION='{"peer-1":{"allowed_namespaces":["public/*"]}}' \
     AI_MEMORY_STORE_URL="$3" \
-    ${2:+AI_MEMORY_PG_AT_REST_ATTESTED=$2} \
+    "${attest_assignment[@]}" \
     AI_MEMORY_APPEND_ONLY=1 \
     AI_MEMORY_KEY_DIR="$KEYDIR_A" \
     AI_MEMORY_AGENT_ID="$AGENT_A" \
-    ${4-AI_MEMORY_APPROVER_PUBKEYS=$APPROVER_PUBKEY_A} \
+    "${approver_assignment[@]}" \
     AI_MEMORY_REQUIRE_ENTERPRISE_FEDERATION_POSTURE=1 \
     "$bin" doctor --posture enterprise-federation --json
 }
