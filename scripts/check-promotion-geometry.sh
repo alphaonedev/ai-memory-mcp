@@ -4,4 +4,4 @@
 # #3872: keep this discoverable by the landing chain's check-*.sh inventory.
 set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-exec python3 "$SCRIPT_DIR/check_promotion_geometry.py" "$@"
+exec python3 -I "$SCRIPT_DIR/check_promotion_geometry.py" "$@"

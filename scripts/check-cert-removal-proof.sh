@@ -391,7 +391,7 @@ apply_mutation() {
   local ctl="$1" shape="$2" payload="$3" target="$4"
   CERT_CTL="$ctl" CERT_SHAPE="$shape" CERT_PAYLOAD="$payload" CERT_TARGET="$target" \
   CERT_MARK="$MUT_MARK" \
-  python3 - <<'PY'
+  python3 -I - <<'PY'
 import os, re, sys
 
 path    = os.environ["CERT_TARGET"]

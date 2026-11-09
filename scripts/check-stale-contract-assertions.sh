@@ -41,7 +41,7 @@ run_check() { # $1 = END revision (tests read there; or WORKTREE); $2 = START re
   # The diff goes through a project-local scratch file: `python3 -` takes its
   # SCRIPT from stdin, so the heredoc would otherwise swallow the piped diff.
   mkdir -p .local-runs; local df=.local-runs/stale-contract-diff.$$; cat > "$df"
-  python3 - "$1" "$df" "$2" <<'PY'
+  python3 -I - "$1" "$df" "$2" <<'PY'
 import re, sys, subprocess
 endrev = sys.argv[1]
 diff = open(sys.argv[2], encoding='utf-8', errors='replace').read()

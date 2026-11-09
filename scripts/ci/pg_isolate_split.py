@@ -21,10 +21,12 @@ unsafe selector. Python 3.9+, standard library only.
 """
 import argparse
 import sys
+import runpy
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import partition_test_binaries as ptb  # noqa: E402
+# -I/-P removes the script directory; load the shared path-bound importer.
+load_sibling = runpy.run_path(str(Path(__file__).resolve().with_name("sibling_import.py")))["load_sibling"]
+ptb = load_sibling("partition_test_binaries", __file__)
 
 
 class SplitError(Exception):

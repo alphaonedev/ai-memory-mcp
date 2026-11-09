@@ -12,4 +12,4 @@
 # Cargo-free, stdlib python3 only.
 set -u
 cd "$(dirname "$0")/.." || exit 2
-exec python3 scripts/check-foreign-text-to-caller.py "$@"
+exec python3 -I scripts/check-foreign-text-to-caller.py "$@"

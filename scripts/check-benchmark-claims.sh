@@ -68,7 +68,7 @@ DOCS_DIR="${AI_MEMORY_BENCHMARK_DOCS_DIR:-${HERE}}"
 scan() {
   local canon="$1"
   local root="$2"
-  python3 - "$canon" "$root" <<'PY'
+  python3 -I - "$canon" "$root" <<'PY'
 import os, re, sys
 
 # The binary-faithful keyword throughput published in README §Benchmark

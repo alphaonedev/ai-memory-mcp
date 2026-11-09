@@ -191,7 +191,7 @@ fi
 # Every awk must produce a BYTE-IDENTICAL violation set, or the gate is not
 # portable and the shared baseline cannot be trusted.
 if [[ "${1:-}" == "--self-test" ]]; then
-    python3 "${ROOT}/scripts/tests/gate-production-3623.py" "$(basename "$0")"
+    python3 -I "${ROOT}/scripts/tests/gate-production-3623.py" "$(basename "$0")"
     echo "Hardcoded-literal gate: self-test (planted probes A/B/C, once per awk on this host; #3537)"
 
     probe_dup="${ROOT}/src/.hardcoded_literal_gate_probe.rs"

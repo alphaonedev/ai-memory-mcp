@@ -80,14 +80,14 @@ jobs:
       - name: install package + pytest
         working-directory: clients/${{ matrix.package }}
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install -e .
-          python -m pip install "pytest>=8.0"
+          python -I -m pip install --upgrade pip
+          python -I -m pip install -e .
+          python -I -m pip install "pytest>=8.0"
       - name: pytest
         working-directory: clients/${{ matrix.package }}
         env:
           AI_MEMORY_NO_CONFIG: "1"
-        run: python -m pytest -q
+        run: python -I -m pytest -q
 
   ts-shims:
     name: node:test (${{ matrix.package }})
@@ -153,19 +153,19 @@ jobs:
         # A missing runtime makes the suite SKIP that adapter, so assert them
         # here rather than let a silent skip pass for a green gate.
         run: |
-          python3 --version
+          python3 -I --version
           node --version
           bash --version | head -1
           jq --version
       - name: install pytest
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install "pytest>=8.0"
+          python -I -m pip install --upgrade pip
+          python -I -m pip install "pytest>=8.0"
       - name: pytest
         working-directory: clients/host-adapter-shim
         env:
           AI_MEMORY_NO_CONFIG: "1"
-        run: python -m pytest -q
+        run: python -I -m pytest -q
 
   # ── #2455 — flagship SDK gates ────────────────────────────────────────────
   # `sdk/python` + `sdk/typescript` are the packages `publish-sdks.yml`
@@ -183,13 +183,13 @@ jobs:
       - name: install package + dev extras
         working-directory: sdk/python
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install -e ".[dev]"
+          python -I -m pip install --upgrade pip
+          python -I -m pip install -e ".[dev]"
       - name: pytest
         working-directory: sdk/python
         env:
           AI_MEMORY_NO_CONFIG: "1"
-        run: python -m pytest -q
+        run: python -I -m pytest -q
 
   sdk-typescript:
     name: jest + tsc (sdk/typescript)
@@ -208,8 +208,8 @@ jobs:
         run: npm ci
       - name: npm audit ratchet (#8615)
         run: |
-          python3 -m unittest discover -s scripts/ci/tests -p test_check_npm_audit_8615.py
-          python3 scripts/ci/check_npm_audit.py
+          python3 -I -m unittest discover -s scripts/ci/tests -p test_check_npm_audit_8615.py
+          python3 -I scripts/ci/check_npm_audit.py
       - name: npm test
         working-directory: sdk/typescript
         run: npm test

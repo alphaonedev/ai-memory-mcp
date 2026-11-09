@@ -49,6 +49,7 @@ does not fail the post-job step (exit stays 0): cleanup must never red a job.
 Python 3.9+, standard library only.
 """
 import argparse
+import runpy
 import errno
 import os
 import shutil
@@ -56,7 +57,9 @@ import sys
 import time
 from pathlib import Path
 
-import shared_cargo_target as shared
+# -I/-P removes the script directory; load the shared path-bound importer.
+load_sibling = runpy.run_path(str(Path(__file__).resolve().with_name("sibling_import.py")))["load_sibling"]
+shared = load_sibling("shared_cargo_target", __file__)
 
 SECS_PER_DAY = 86400
 TEMP_DIR_NAME = "_temp"

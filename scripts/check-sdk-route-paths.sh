@@ -257,7 +257,7 @@ MDEOF
     # — which swallows a crash into an empty value and would print a false
     # PASS; then prove the FIXED gate fails closed under an injected fault.
     write_clean
-    prefix_shape="$(v="$(python3 -c 'import sys; sys.exit(3)')" || true; [[ -z "$v" ]] && echo "WOULD-PRINT-PASS")"
+    prefix_shape="$(v="$(python3 -I -c 'import sys; sys.exit(3)')" || true; [[ -z "$v" ]] && echo "WOULD-PRINT-PASS")"
     [[ "$prefix_shape" == "WOULD-PRINT-PASS" ]] || {
         echo "FAIL: self-test R-203 — the pre-fix \`|| true\` shape did not reproduce the false-PASS fail-open" >&2; exit 1; }
     fault_rc=0
@@ -321,7 +321,7 @@ if ! violations="$(
     ROUTES_RS="$ROUTES_RS" \
     SDK_FILE_LIST="$(printf '%s\n' "${SDK_FILES[@]}")" \
     REPO_ROOT="$REPO_ROOT" \
-    python3 - <<'PY'
+    python3 -I - <<'PY'
 import os
 import re
 

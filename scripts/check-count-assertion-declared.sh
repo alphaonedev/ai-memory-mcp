@@ -77,7 +77,7 @@ while [ $# -gt 0 ]; do case "$1" in
 # gate_py check <A..B>   — findings on stdout, IGNORED reports on stderr, rc 1 on any red.
 # gate_py selftest       — builds scratch repositories under .local-runs/count-selftest.
 gate_py() {
-  python3 - "$@" <<'PY'
+  python3 -I - "$@" <<'PY'
 import os, re, shutil, subprocess, sys
 
 REPO = None                      # directory every git call runs in (None = the current one)

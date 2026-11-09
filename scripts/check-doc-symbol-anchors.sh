@@ -214,7 +214,7 @@ MDEOF
     # which swallows a crash into an empty value and would print a false
     # PASS; then prove the FIXED gate fails closed under an injected fault.
     write_clean
-    prefix_shape="$(v="$(python3 -c 'import sys; sys.exit(3)')" || true; [[ -z "$v" ]] && echo "WOULD-PRINT-PASS")"
+    prefix_shape="$(v="$(python3 -I -c 'import sys; sys.exit(3)')" || true; [[ -z "$v" ]] && echo "WOULD-PRINT-PASS")"
     [[ "$prefix_shape" == "WOULD-PRINT-PASS" ]] || {
         echo "FAIL: self-test R-203 — the pre-fix \`|| true\` shape did not reproduce the false-PASS fail-open" >&2; exit 1; }
     fault_rc=0
@@ -305,7 +305,7 @@ cd "$REPO_ROOT"
 # the self-test cannot prove).
 # R3-F7: the shared reference check refuses a symlink at EVERY level of each path
 # (docs, docs/reference, the file), not only the leaf.
-if ! python3 "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/check-claude-md-size.py" "$REPO_ROOT" --refs-only >&2; then
+if ! python3 -I "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/check-claude-md-size.py" "$REPO_ROOT" --refs-only >&2; then
     printf 'FAIL: check-doc-symbol-anchors: reference file check failed (#4507 fail-closed)\n' >&2
     exit 1
 fi
@@ -330,12 +330,13 @@ if [[ -f "$LADDER_GATE" ]]; then
         printf '       If it was renamed, update the extraction here in lockstep.\n' >&2
         exit 1
     fi
-    eval "$reader"
+    # The reader is awk-extracted shell text from the repository, not a Python launch.
+    eval "$reader" # isolation: exempt #8202
     LADDER_TIP="$(read_current_schema_version "$REPO_ROOT/src/store/postgres.rs")"
 fi
 
 if ! violations="$(
-    REPO_ROOT="$REPO_ROOT" LADDER_TIP="$LADDER_TIP" python3 - <<'PY'
+    REPO_ROOT="$REPO_ROOT" LADDER_TIP="$LADDER_TIP" python3 -I - <<'PY'
 import glob
 import os
 import re

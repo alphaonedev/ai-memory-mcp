@@ -66,7 +66,7 @@ scan () {
     # regeneration). Python walks src/ + tests/ itself: the program arrives
     # on stdin via the heredoc, so it must NOT also be the data channel (a
     # grep pipe here would be silently swallowed by the heredoc redirection).
-    python3 - "${1:-check}" "$ALLOWLIST" "$BASELINE" "$ROOT" "${ROOT}/src" "${ROOT}/tests" <<'PYEOF'
+    python3 -I - "${1:-check}" "$ALLOWLIST" "$BASELINE" "$ROOT" "${ROOT}/src" "${ROOT}/tests" <<'PYEOF'
 import os, re, sys
 
 mode = sys.argv[1]

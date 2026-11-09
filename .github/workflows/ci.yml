@@ -838,9 +838,13 @@ jobs:
             cat "$impact_out" >> "$GITHUB_OUTPUT"
           fi
       - name: Test impact selector security fallbacks
-        run: python3 scripts/test/test_ci_test_impact.py
+        run: python3 -I scripts/test/test_ci_test_impact.py
       - name: Workflow concurrency invariants (#6340)
-        run: python3 scripts/test/test_workflow_concurrency_6340.py
+        run: python3 -I scripts/test/test_workflow_concurrency_6340.py
+      - name: Workflow Python isolation (#8202)
+        run: |
+          python3 -I -m unittest discover -s scripts/test -p test_workflow_python_isolation_8202.py
+          python3 -I scripts/ci/check_workflow_python_isolation.py
       # #7987: the corpus ratchet reads the manifest from the base tree. Fetch the pull-request base branch so a
       # merge-base exists; a push has no base branch, so its first parent (fetch-depth 2) is the anchor.
       - name: Resolve the corpus ratchet base (#7987)
@@ -862,14 +866,16 @@ jobs:
       - name: Fetch the corpus replay objects (#7988)
         run: python3 -I scripts/ci/tests/test_check_cert_expiry_corpus.py --print-replay-shas | xargs git fetch --no-tags --depth=1 origin
       - name: Shard partition and wiring unit tests (#6344)
-        run: python3 -m unittest discover -s scripts/ci/tests
+        run: python3 -I -m unittest discover -s scripts/ci/tests
       - name: AGE self-heal helper unit test (#6161)
-        run: python3 scripts/test/test_ensure_age_extension_6161.py
+        run: python3 -I scripts/test/test_ensure_age_extension_6161.py
       # #7160 - scripts/test/ is outside the discovery root above; run the
       # sweep script tests (including the Linux-only O_PATH test, which this
       # ubuntu-latest job is where it executes) and the sweep workflow pin.
       - name: Target sweep unit tests (#7160)
-        run: python3 -m unittest scripts/test/test_ci_sweep_target.py scripts/test/test_workflow_sweep_7160.py
+        run: python3 -I scripts/test/test_ci_sweep_target.py
+      - name: Target sweep workflow pins (#7160)
+        run: python3 -I scripts/test/test_workflow_sweep_7160.py
 
   # Fast lint job — fmt + clippy on ubuntu only. Toolchain-portable, no
   # need to run on macOS where it just duplicates work and burns
@@ -978,14 +984,14 @@ jobs:
         # verifier then runs offline and content-pinned.
         run: cargo fetch --locked
       - name: Verify every custom-build package is ledgered
-        run: python3 scripts/check-build-script-vetting.py
+        run: python3 -I scripts/check-build-script-vetting.py
       - name: Self-test (prove the gate is load-bearing)
         # Runs AFTER the gate, mirroring the vendor-literal gate's convention:
         # if the detection logic regresses, this trips even when the ledger
         # happens to be clean. Includes the R-203 leg that runs the FROZEN
         # pre-#2635 ledger-only algorithm over a planted unvetted package and
         # requires it to MISS — so the leg cannot pass tautologically.
-        run: python3 scripts/check-build-script-vetting.py --self-test
+        run: python3 -I scripts/check-build-script-vetting.py --self-test
 
   # actionlint — workflow-injection guard (#1851, audit follow-up #1855).
   # actionlint's NATIVE expression-injection check flags the #1851 class: an
@@ -1359,7 +1365,7 @@ jobs:
         if: needs.classify.outputs.cargo_skip != 'true' && matrix.shared_target
         env:
           RUNNER_NAME_ARG: ${{ runner.name }}
-        run: python3 scripts/ci/shared_cargo_target.py --github-env "$GITHUB_ENV" --runner-name "$RUNNER_NAME_ARG"
+        run: python3 -I scripts/ci/shared_cargo_target.py --github-env "$GITHUB_ENV" --runner-name "$RUNNER_NAME_ARG"
 
       # #7199 - sccache for the self-hosted Linux enterprise-fed leg. Each runner
       # compiles into its own ~160 GiB target (#7188), so a cross-runner compile
@@ -1375,7 +1381,7 @@ jobs:
       # sccache.
       - name: sccache build cache (#7199)
         if: needs.classify.outputs.cargo_skip != 'true' && matrix.shared_target && runner.os == 'Linux'
-        run: python3 scripts/ci/sccache_env.py --github-env "$GITHUB_ENV"
+        run: python3 -I scripts/ci/sccache_env.py --github-env "$GITHUB_ENV"
 
       # #2452 — tests/conformance_readers.rs is FAIL-CLOSED: an absent
       # python3/node is a test FAILURE, not a silent pass. This job now spans
@@ -1504,7 +1510,7 @@ jobs:
         run: |
           command -v python3 >/dev/null || { echo "::error::python3 not on PATH on $RUNNER_NAME"; exit 1; }
           command -v node    >/dev/null || { echo "::error::node not on PATH on $RUNNER_NAME"; exit 1; }
-          echo "python3=$(python3 --version) node=$(node --version)"
+          echo "python3=$(python3 -I --version) node=$(node --version)"
 
       # FAIL CLOSED if rustup is missing on a self-hosted node — see the
       # `lint` job in ci.yml for the full rationale (#3128 / restore #3293).
@@ -1704,7 +1710,7 @@ jobs:
             echo "AI_MEMORY_TEST_PG_ISOLATE=0" >> "$GITHUB_ENV"
             echo "::notice::[#6383] per-binary Postgres isolation disabled by CI_PG_ISOLATE_OFF=1"
           else
-            AI_MEMORY_TEST_POSTGRES_URL="$new_url" python3 scripts/test/pg_isolated_binary.py setup --db "$CI_FED_DB" --jobs 8 --emit-env >> "$GITHUB_ENV"
+            AI_MEMORY_TEST_POSTGRES_URL="$new_url" python3 -I scripts/test/pg_isolated_binary.py setup --db "$CI_FED_DB" --jobs 8 --emit-env >> "$GITHUB_ENV"
             echo "::notice::[#6383] per-binary Postgres isolation ON: template ${CI_FED_DB}_tpl"
           fi
 
@@ -1718,8 +1724,7 @@ jobs:
           AI_MEMORY_TEST_PG_LIVE_REQUIRED: "1"
         run: |
           set -euo pipefail
-          cd scripts/ci/tests
-          python3 -m unittest -v test_pg_isolated_binary.LiveEndToEnd
+          python3 -I scripts/ci/tests/test_pg_isolated_binary.py -v LiveEndToEnd
 
       # Isolation shot after e380ca5d: mold + debuginfo=0 linked and RAN
       # the sqlite suite, then `hot_swap_llm_2166` SIGSEGV'd. That binary
@@ -2178,9 +2183,9 @@ jobs:
             cargo test --no-run "$@" "${sel[@]}" || return "$?"
             started=$(date +%s)
             if [ -n "$TIMEOUT_BIN" ]; then
-              "$TIMEOUT_BIN" --signal=TERM --kill-after=60 "$WATCHDOG_SECS" python3 scripts/test/pg_isolated_binary.py run --jobs 8 --log-dir "$sd/iso-logs" --targets-file "$sd/iso_targets.txt" --residual-file "$sd/iso_residual.txt" --test-arg=--test-threads=1 -- cargo test --no-fail-fast "$@" || rc=$?
+              "$TIMEOUT_BIN" --signal=TERM --kill-after=60 "$WATCHDOG_SECS" python3 -I scripts/test/pg_isolated_binary.py run --jobs 8 --log-dir "$sd/iso-logs" --targets-file "$sd/iso_targets.txt" --residual-file "$sd/iso_residual.txt" --test-arg=--test-threads=1 -- cargo test --no-fail-fast "$@" || rc=$?
             else
-              python3 scripts/test/pg_isolated_binary.py run --jobs 8 --log-dir "$sd/iso-logs" --targets-file "$sd/iso_targets.txt" --residual-file "$sd/iso_residual.txt" --test-arg=--test-threads=1 -- cargo test --no-fail-fast "$@" || rc=$?
+              python3 -I scripts/test/pg_isolated_binary.py run --jobs 8 --log-dir "$sd/iso-logs" --targets-file "$sd/iso_targets.txt" --residual-file "$sd/iso_residual.txt" --test-arg=--test-threads=1 -- cargo test --no-fail-fast "$@" || rc=$?
             fi
             elapsed=$(( $(date +%s) - started ))
             echo "::notice::[#6383] '${label}' ran ${elapsed}s of the ${WATCHDOG_SECS}s per-invocation watchdog budget (tier=${TIER:-sqlite} node=${CI_NODE:-unknown})"
@@ -2279,9 +2284,9 @@ jobs:
             rm -rf "$sd"; mkdir -p "$sd"
             echo "::notice::[#6344] '${label}': compile once, partition, then run serial + 2 parallel shards"
             cargo test --no-run --message-format=json-render-diagnostics $FEAT "$@" > "$sd/build.jsonl" || return "$?"
-            python3 scripts/ci/partition_test_binaries.py --build-json "$sd/build.jsonl" --repo-root . --out-dir "$sd" --with-doc "$with_doc" || return "$?"
+            python3 -I scripts/ci/partition_test_binaries.py --build-json "$sd/build.jsonl" --repo-root . --out-dir "$sd" --with-doc "$with_doc" || return "$?"
             if [ "$PG_ISO_LANE" = "1" ]; then
-              python3 scripts/ci/pg_isolate_split.py --build-json "$sd/build.jsonl" --serial-file "$sd/serial.txt" --out-dir "$sd" || return "$?"
+              python3 -I scripts/ci/pg_isolate_split.py --build-json "$sd/build.jsonl" --serial-file "$sd/serial.txt" --out-dir "$sd" || return "$?"
             fi
             # #6795: the serial shard cannot be split further, so it gets the
             # whole job time left (job cap - time since the job started, which
@@ -2496,11 +2501,11 @@ jobs:
             echo "::error::cargo-audit ${CARGO_AUDIT_VERSION} is not the installed version"
             exit 1
           fi
-          python3 -m unittest discover -s scripts/ci/tests -p test_check_cargo_audit_8615.py
+          python3 -I -m unittest discover -s scripts/ci/tests -p test_check_cargo_audit_8615.py
           # Cross-check .cargo/audit.toml with .cargo/audit-exceptions.toml.
           # The gate prints its summary and every public identity diagnostic;
           # cargo-audit JSON and external stderr remain captured inside it.
-          python3 scripts/ci/check_cargo_audit.py
+          python3 -I scripts/ci/check_cargo_audit.py
 
       # CI-speed: the release build here is only a release-PROFILE compile
       # smoke (opt-level + thin-LTO). The distributable per-OS artifacts are
@@ -2579,7 +2584,7 @@ jobs:
           # by the admin-only `pg_isolated_binary.py sweep --older-than N`,
           # which CI never runs. The URL travels in the environment, not argv.
           if [ -n "${AI_MEMORY_TEST_PG_RUN_ID:-}" ]; then
-            AI_MEMORY_TEST_POSTGRES_URL="$base_url" python3 scripts/test/pg_isolated_binary.py teardown --db "$CI_FED_DB" --run-id "$AI_MEMORY_TEST_PG_RUN_ID" \
+            AI_MEMORY_TEST_POSTGRES_URL="$base_url" python3 -I scripts/test/pg_isolated_binary.py teardown --db "$CI_FED_DB" --run-id "$AI_MEMORY_TEST_PG_RUN_ID" \
               || echo "::warning::[#6383] isolation teardown failed on $RUNNER_NAME (admin sweep reclaims it)"
           fi
           if psql "$base_url" -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS \"$CI_FED_DB\" WITH (FORCE);"; then
@@ -2592,13 +2597,13 @@ jobs:
       # SCCACHE_SERVER_PORT) unless a sibling runner's in-use marker is fresh.
       - name: sccache hit-rate summary (#7199)
         if: always() && matrix.shared_target && runner.os == 'Linux' && needs.classify.outputs.cargo_skip != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
-        run: python3 scripts/ci/sccache_env.py --stats
+        run: python3 -I scripts/ci/sccache_env.py --stats
 
       - name: sccache stop CI server (#7199)
         if: always() && matrix.shared_target && runner.os == 'Linux' && needs.classify.outputs.cargo_skip != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
         env:
           RUNNER_NAME_ARG: ${{ runner.name }}
-        run: python3 scripts/ci/sccache_env.py --stop --runner-name "$RUNNER_NAME_ARG"
+        run: python3 -I scripts/ci/sccache_env.py --stop --runner-name "$RUNNER_NAME_ARG"
 
       # #7188 - post-job cleanup on the self-hosted legs: prune stale per-job
       # artifacts (leftover .tmp* dirs, workspace incremental state, old
@@ -2617,7 +2622,7 @@ jobs:
         if: always() && matrix.shared_target && needs.classify.outputs.cargo_skip != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
         env:
           RUNNER_NAME_ARG: ${{ runner.name }}
-        run: python3 scripts/ci/prune_runner_artifacts.py --work-root "$RUNNER_WORKSPACE/.." --workspace "$GITHUB_WORKSPACE" --protected-root "$AI_MEMORY_CI_TARGET_ROOT" --evict-root "$AI_MEMORY_CI_TARGET_ROOT" --runner-name "$RUNNER_NAME_ARG"
+        run: python3 -I scripts/ci/prune_runner_artifacts.py --work-root "$RUNNER_WORKSPACE/.." --workspace "$GITHUB_WORKSPACE" --protected-root "$AI_MEMORY_CI_TARGET_ROOT" --evict-root "$AI_MEMORY_CI_TARGET_ROOT" --runner-name "$RUNNER_NAME_ARG"
 
       # #7160 - cap the persistent self-hosted target/debug (oldest-mtime
       # first). Last steps so they never race a running build. Two shapes,
@@ -2633,11 +2638,11 @@ jobs:
       # for the sweep, waits at most 20 s and then skips with one warning and exit 0.
       - name: Sweep target/debug to the size cap (self-hosted)
         if: always() && needs.classify.outputs.cargo_skip != 'true' && runner.environment == 'self-hosted' && !matrix.shared_target
-        run: python3 scripts/ci-sweep-target.py --target target --max-bytes ${{ env.SELF_HOSTED_TARGET_CAP_BYTES }}
+        run: python3 -I scripts/ci-sweep-target.py --target target --max-bytes ${{ env.SELF_HOSTED_TARGET_CAP_BYTES }}
 
       - name: Sweep per-runner cargo target to the size cap (self-hosted, #7160)
         if: always() && needs.classify.outputs.cargo_skip != 'true' && runner.environment == 'self-hosted' && matrix.shared_target
-        run: python3 scripts/ci-sweep-target.py --target "${CARGO_TARGET_DIR:?per-runner cargo target not set}" --allow-root --within "${AI_MEMORY_CI_TARGET_ROOT:?per-runner cache root not set}" --lock "${AI_MEMORY_CI_TARGET_ROOT:?per-runner cache root not set}/.evict.lock" --max-bytes ${{ env.SELF_HOSTED_TARGET_CAP_BYTES }}
+        run: python3 -I scripts/ci-sweep-target.py --target "${CARGO_TARGET_DIR:?per-runner cargo target not set}" --allow-root --within "${AI_MEMORY_CI_TARGET_ROOT:?per-runner cache root not set}" --lock "${AI_MEMORY_CI_TARGET_ROOT:?per-runner cache root not set}/.evict.lock" --max-bytes ${{ env.SELF_HOSTED_TARGET_CAP_BYTES }}
 
   # Postgres feature gate — the `sal-postgres` CLIPPY-parity leg.
   #

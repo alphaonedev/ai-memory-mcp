@@ -153,7 +153,7 @@ jobs:
             echo "no performance/baseline.json committed — skipping advisory compare" >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
-          BOOTSTRAP=$(python3 -c "import json;print(json.load(open('performance/baseline.json')).get('bootstrap', False))")
+          BOOTSTRAP=$(python3 -I -c "import json;print(json.load(open('performance/baseline.json')).get('bootstrap', False))")
           if [ "$BOOTSTRAP" != "False" ]; then
             {
               echo '## Baseline regression (advisory, #1987)'
@@ -237,7 +237,7 @@ jobs:
           for i in 1 2 3; do
             target/release/ai-memory bench --json > "run-$i.json"
           done
-          python3 .github/scripts/median_baseline.py "$(git rev-parse --short HEAD)" \
+          python3 -I .github/scripts/median_baseline.py "$(git rev-parse --short HEAD)" \
             run-1.json run-2.json run-3.json > performance/baseline.json
           {
             echo '## Regenerated bench baseline (median-of-3, ubuntu-latest)'

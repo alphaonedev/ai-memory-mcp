@@ -418,7 +418,7 @@ jobs:
       - name: Redact cert-bootstrap evidence on failure
         if: failure()
         run: |
-          python3 scripts/cert_gate_evidence.py \
+          python3 -I scripts/cert_gate_evidence.py \
             --evidence-dir .local-runs/cert-bootstrap-evidence \
             --write-redacted .local-runs/cert-bootstrap-evidence-redacted
 
@@ -468,4 +468,4 @@ jobs:
       # oldest-mtime first). Last step so it never races a running build.
       - name: Sweep target/debug to the size cap (self-hosted)
         if: always() && runner.environment == 'self-hosted'
-        run: python3 scripts/ci-sweep-target.py --target target --max-bytes ${{ env.SELF_HOSTED_TARGET_CAP_BYTES }}
+        run: python3 -I scripts/ci-sweep-target.py --target target --max-bytes ${{ env.SELF_HOSTED_TARGET_CAP_BYTES }}

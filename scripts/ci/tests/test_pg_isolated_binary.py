@@ -2274,7 +2274,8 @@ class CiLiveCells(unittest.TestCase):
         self.assertGreater(start, configure, 'runs after the URL is minted')
         self.assertIn("matrix.tier == 'enterprise-fed'", step)
         self.assertIn('AI_MEMORY_TEST_PG_LIVE_REQUIRED: "1"', step)
-        self.assertIn('test_pg_isolated_binary.LiveEndToEnd', step)
+        self.assertIn(
+            'python3 -I scripts/ci/tests/test_pg_isolated_binary.py -v LiveEndToEnd', step)
 
 
 class NoShell(unittest.TestCase):

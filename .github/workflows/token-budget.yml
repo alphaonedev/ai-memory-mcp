@@ -163,7 +163,7 @@ jobs:
           cargo build --release --bin ai-memory
           PAYLOAD="$(./target/release/ai-memory doctor --tokens --json)"
           TOTAL="$(printf '%s' "$PAYLOAD" \
-            | python3 -c 'import json,sys; print(json.loads(sys.stdin.read())["trimmed_full_profile_total_tokens"])')"
+            | python3 -I -c 'import json,sys; print(json.loads(sys.stdin.read())["trimmed_full_profile_total_tokens"])')"
           echo "doctor --tokens --json: trimmed_full_profile_total_tokens=$TOTAL (ceiling 8110, post-D1.6 + #1067 + #1709 + #2037 skill tools + #2059 covenant params + #2204 claim-bitemporal params + #3171 schema-vs-handler + #3266/#3322 swarm_rewind)"
           if [ "$TOTAL" -gt 8110 ]; then
             echo "::error::v0.7 C5 CI gate FAILED: trimmed full-profile tools/list payload is $TOTAL cl100k_base tokens (ceiling: 8110, post-D1.6 + #1067 + #1709 + #2037 + #2059 + #2204 + #3171 + #3266/#3322)."

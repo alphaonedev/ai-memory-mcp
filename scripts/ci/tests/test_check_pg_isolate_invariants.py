@@ -69,7 +69,7 @@ class Mutants(unittest.TestCase):
 
     def test_ci_sweep_call_is_caught(self):
         # Review r1 H2: the cross-run sweep is admin-only.
-        self.assert_caught(CI_YML + '\n          python3 scripts/test/pg_isolated_binary.py sweep --older-than 600\n',
+        self.assert_caught(CI_YML + '\n          python3 -I scripts/test/pg_isolated_binary.py sweep --older-than 600\n',
                            'G2-no-ci-sweep')
 
     def test_url_in_wrapper_argv_is_caught(self):
@@ -89,8 +89,8 @@ class Mutants(unittest.TestCase):
 
     def test_lost_watchdog_is_caught(self):
         self.assert_caught(CI_YML.replace('"$TIMEOUT_BIN" --signal=TERM --kill-after=60 "$WATCHDOG_SECS" '
-                                          'python3 scripts/test/pg_isolated_binary.py run',
-                                          'python3 scripts/test/pg_isolated_binary.py run'),
+                                          'python3 -I scripts/test/pg_isolated_binary.py run',
+                                          'python3 -I scripts/test/pg_isolated_binary.py run'),
                            'G6-watchdog')
 
     def test_missing_log_upload_is_caught(self):

@@ -187,7 +187,7 @@ class CargoAudit8615Tests(unittest.TestCase):
                 self.assertIn(entry[field], self.stderr)
         self.assertNotIn('"vulnerabilities"', self.stderr)
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()
-        self.assertIn("          python3 scripts/ci/check_cargo_audit.py\n", workflow)
+        self.assertIn("          python3 -I scripts/ci/check_cargo_audit.py\n", workflow)
 
     def test_8615_clean_report_passes(self):
         code, run = self.run_gate()

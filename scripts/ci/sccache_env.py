@@ -34,6 +34,7 @@ Exit codes: 0 ok, 2 bad arguments or home, 3 sccache not found on PATH,
 Python 3.9+, standard library only.
 """
 import argparse
+import runpy
 import os
 import re
 import shutil
@@ -42,7 +43,9 @@ import sys
 import time
 from pathlib import Path
 
-import shared_cargo_target as shared
+# -I/-P removes the script directory; load the shared path-bound importer.
+load_sibling = runpy.run_path(str(Path(__file__).resolve().with_name("sibling_import.py")))["load_sibling"]
+shared = load_sibling("shared_cargo_target", __file__)
 
 SCCACHE_BINARY = "sccache"
 CACHE_ROOT_RELATIVE = shared.TARGET_ROOT_RELATIVE.parent

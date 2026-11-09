@@ -63,7 +63,7 @@ SAFE_RE='redact_urls_in_message|without_request_url|safe_name|\{display_url|\{pe
 # `url_display::` call. Also accept an inline `url_display::` call in the sink window.
 # Exit 0 = safe (rendered by url_display), 1 = not proven safe.
 url_display_provenance() { # file fnstart sinkline ident
-  python3 - "$1" "$2" "$3" "$4" <<'PYE'
+  python3 -I - "$1" "$2" "$3" "$4" <<'PYE'
 import sys, re
 path, start, end, ident = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
 lines = open(path, encoding="utf-8", errors="replace").read().split("\n")

@@ -409,20 +409,24 @@ jobs:
           # failed the pre-stage on 2026-07-14. The Rust hf-hub the tests use is
           # classic (non-Xet), so the staged classic cache is what they read.
           HF_HUB_DISABLE_XET: "1"
+          # Isolated system Python does not load the runner's user site.
+          HF_PYTHON_TARGET: ${{ github.workspace }}/.local-runs/coverage-hf-python
+          TMPDIR: ${{ github.workspace }}/.local-runs/coverage-hf-tmp
         run: |
           set -euo pipefail
-          python3 -m pip install --quiet --disable-pip-version-check "huggingface_hub>=0.20" \
-            || pip3 install --quiet "huggingface_hub>=0.20"
+          python3 -I -c "import os; from pathlib import Path; Path(os.environ['TMPDIR']).mkdir(parents=True, exist_ok=True)"
+          python3 -I -m pip install --quiet --disable-pip-version-check --upgrade \
+            --target "$HF_PYTHON_TARGET" "huggingface_hub>=0.20"
           for m in sentence-transformers/all-MiniLM-L6-v2 cross-encoder/ms-marco-MiniLM-L-6-v2; do
             ok=0
             for attempt in 1 2 3 4 5; do
-              if python3 -c "from huggingface_hub import snapshot_download; snapshot_download('$m')"; then
+              if python3 -I -c "import os, sys; SITE_PACKAGE_SUFFIXES = ('/site-packages', '/dist-packages'); SITE_PACKAGE_INDEX = next((i for i, p in enumerate(sys.path) if p.rstrip('/').endswith(SITE_PACKAGE_SUFFIXES)), len(sys.path)); sys.path.insert(SITE_PACKAGE_INDEX, os.environ['HF_PYTHON_TARGET']); from huggingface_hub import snapshot_download; snapshot_download(sys.argv[1])" "$m"; then
                 echo "::notice::staged $m (attempt $attempt)"; ok=1; break
               fi
               echo "::warning::hf fetch $m attempt $attempt failed; retry in $((attempt*10))s"
               sleep $((attempt*10))
             done
-            [ "$ok" = 1 ] || { echo "::error::could not stage $m after 5 attempts"; exit 1; }
+            if [ "$ok" != 1 ]; then echo "::error::could not stage $m after 5 attempts"; exit 1; fi
           done
 
       # #2019 — VERIFY the Python-staged cache is resolvable by the RUST

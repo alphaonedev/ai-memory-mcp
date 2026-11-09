@@ -67,15 +67,15 @@ jobs:
         env:
           AI_MEMORY_NO_CONFIG: "1"
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install -e .
-          python -m pip install "pytest>=8.0"
-          python -m pytest -q
+          python -I -m pip install --upgrade pip
+          python -I -m pip install -e .
+          python -I -m pip install "pytest>=8.0"
+          python -I -m pytest -q
       - name: build wheel + sdist
         working-directory: clients/anthropic-shim-py
         run: |
-          python -m pip install --upgrade pip build
-          python -m build
+          python -I -m pip install --upgrade pip build
+          python -I -m build
       - name: publish via PyPI Trusted Publisher (OIDC)
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
         with:
@@ -107,15 +107,15 @@ jobs:
         env:
           AI_MEMORY_NO_CONFIG: "1"
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install -e .
-          python -m pip install "pytest>=8.0"
-          python -m pytest -q
+          python -I -m pip install --upgrade pip
+          python -I -m pip install -e .
+          python -I -m pip install "pytest>=8.0"
+          python -I -m pytest -q
       - name: build wheel + sdist
         working-directory: clients/openai-shim-py
         run: |
-          python -m pip install --upgrade pip build
-          python -m build
+          python -I -m pip install --upgrade pip build
+          python -I -m build
       - name: publish via PyPI Trusted Publisher (OIDC)
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
         with:
