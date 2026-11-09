@@ -15,16 +15,52 @@ import sys
 REGISTER = Path("docs/internal/v070-accepted-debt.md")
 ROOT_ENV = "AI_MEMORY_SYMBOL_GATE_ROOT"
 SOURCE_PATH = r"src/[A-Za-z0-9_/]+\.rs"
-PATH_ANCHOR = re.compile(r"`(?:\.\./)*(" + SOURCE_PATH + r")`")
-LINE_ANCHOR = re.compile(r"`(?:\.\./)*(" + SOURCE_PATH + r"):(\d+)")
-QUALIFIED_ANCHOR = re.compile(
-    r"`(?:\.\./)*(" + SOURCE_PATH + r")::(?:\{([^}]*)\}|([A-Za-z_][A-Za-z0-9_:]*))"
-)
-LINK_ANCHOR = re.compile(r"\[`([A-Za-z_][A-Za-z0-9_]*)`\]\((?:\.\./)*(" + SOURCE_PATH + r")[^)]*\)")
-DEFINITION = re.compile(r"\b(?:fn|struct|enum|trait|type|const|static|mod|union)\s+([A-Za-z_][A-Za-z0-9_]*)")
-MACRO = re.compile(r"macro_rules!\s+([A-Za-z_][A-Za-z0-9_]*)")
+IDENT = r"[A-Za-z_][A-Za-z0-9_]*"
+MAX_LINE_DIGITS = 9
+SOURCE_ROOT = "src/"
+RS_MARKER = ".rs"
+UNCLASSIFIED = "unclassified anchor"
+EMPTY_SYMBOLS = "empty symbol list"
+SOURCE_PREFIXED = re.compile(r"(?:\.\./)*" + re.escape(SOURCE_ROOT))
+SPAN = re.compile(r"`([^`\n]*)`")
+PARENTS = r"(?:\.\./)*"
+PATH_FORM = re.compile(PARENTS + "(" + SOURCE_PATH + ")")
+MODULE_FORM = re.compile(r"[A-Za-z0-9_]+(?:/[A-Za-z0-9_]+)*\.rs")
+LINE_FORM = re.compile(PARENTS + "(" + SOURCE_PATH + r"):(\d{1,%d})(?:-(\d{1,%d}))?" % (MAX_LINE_DIGITS, MAX_LINE_DIGITS))
+QUALIFIED_FORM = re.compile(PARENTS + "(" + SOURCE_PATH + r")::(?:\{([^{}`]*)\}|(" + IDENT + "(?:::" + IDENT + ")*))")
+SYMBOL_PATH = re.compile(IDENT + "(?:::" + IDENT + ")*")
+LINK_ANCHOR = re.compile(r"\[`(" + IDENT + r")`\]\((?:\.\./)*(" + SOURCE_PATH + r")[^)]*\)")
+DEFINITION = re.compile(r"\b(?:fn|struct|enum|trait|type|const|static|mod|union)\s+(" + IDENT + ")")
+MACRO = re.compile(r"macro_rules!\s+(" + IDENT + ")")
 VARIANT = re.compile(r"^\s{4}([A-Z][A-Za-z0-9_]*)\s*[,({=]", re.MULTILINE)
-IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+COMMENT_START = re.compile(r"//|/\*")
+BLOCK_TOKEN = re.compile(r"/\*|\*/")
+
+
+def strip_comments(text):
+    """Drop line and nested block comments in one linear pass, keeping newlines."""
+    pieces = []
+    position = 0
+    while True:
+        start = COMMENT_START.search(text, position)
+        if start is None:
+            pieces.append(text[position:])
+            return "".join(pieces)
+        pieces.append(text[position:start.start()])
+        if start.group() == "//":
+            newline = text.find("\n", start.end())
+            position = len(text) if newline < 0 else newline
+            continue
+        depth = 1
+        position = start.end()
+        while depth:
+            token = BLOCK_TOKEN.search(text, position)
+            if token is None:
+                position = len(text)
+                break
+            depth += 1 if token.group() == "/*" else -1
+            position = token.end()
+        pieces.append("\n" * text.count("\n", start.start(), position))
 
 
 def read_regular(root, relative):
@@ -33,13 +69,40 @@ def read_regular(root, relative):
     for part in relative.parts:
         path = path / part
         if path.is_symlink():
-            raise ValueError(f"{relative}: symlink at {path.relative_to(root)}")
+            raise ValueError(f"symlink at {path.relative_to(root)}")
     if not path.is_file():
-        raise ValueError(f"{relative}: expected a regular file")
+        raise ValueError("expected a regular file")
     try:
         return path.read_text(encoding="utf-8")
     except (OSError, UnicodeError) as error:
-        raise ValueError(f"{relative}: cannot read source text ({type(error).__name__})") from error
+        raise ValueError(f"cannot read source text ({type(error).__name__})") from error
+
+
+def classify(span):
+    """Return (source, token, symbols, line_range) for a known anchor form, else None.
+
+    A qualified anchor always carries a symbols tuple that is None only when
+    the brace list is empty, so the caller can name that exact reason.
+    """
+    if (match := PATH_FORM.fullmatch(span)) is not None:
+        return match.group(1), match.group(1), (), None
+    if MODULE_FORM.fullmatch(span) is not None:
+        return SOURCE_ROOT + span, SOURCE_ROOT + span, (), None
+    if (match := LINE_FORM.fullmatch(span)) is not None:
+        first = int(match.group(2))
+        last = int(match.group(3)) if match.group(3) is not None else first
+        token = f"{match.group(1)}:{match.group(2)}" + (f"-{match.group(3)}" if match.group(3) is not None else "")
+        return match.group(1), token, (), (first, last)
+    if (match := QUALIFIED_FORM.fullmatch(span)) is not None:
+        path, braced, plain = match.groups()
+        if plain is not None:
+            return path, f"{path}::{plain}", tuple(plain.split("::")), None
+        items = [item.strip() for item in braced.split(",") if item.strip()]
+        if not all(SYMBOL_PATH.fullmatch(item) for item in items):
+            return None
+        symbols = tuple(part for item in items for part in item.split("::"))
+        return path, f"{path}::{{{braced}}}", symbols or None, None
+    return None
 
 
 def check(root):
@@ -49,21 +112,26 @@ def check(root):
     try:
         document = read_regular(root, REGISTER)
     except ValueError as error:
-        return [str(error)], checked
+        return [f"{REGISTER}: {error}"], checked
     sources = {}
 
-    def verify(line_number, source, token, symbols=(), line=None):
+    def verify(line_number, source, token, symbols=(), line_range=None):
         nonlocal checked
         checked += 1
         try:
             if source not in sources:
                 text = read_regular(root, Path(source))
-                names = {match.group(1) for pattern in (DEFINITION, MACRO, VARIANT) for match in pattern.finditer(text)}
+                code = strip_comments(text)
+                names = {match.group(1) for pattern in (DEFINITION, MACRO, VARIANT) for match in pattern.finditer(code)}
                 names.add(Path(source).stem)
                 sources[source] = (names, len(text.splitlines()))
             names, line_count = sources[source]
-            if line is not None and not 1 <= line <= line_count:
-                raise ValueError(f"line is outside 1..{line_count}")
+            if line_range is not None:
+                first, last = line_range
+                if not (1 <= first <= line_count and 1 <= last <= line_count):
+                    raise ValueError(f"line is outside 1..{line_count}")
+                if first > last:
+                    raise ValueError(f"range start {first} is after end {last}")
             for symbol in symbols:
                 if symbol not in names and not (symbol.endswith("_") and any(name.startswith(symbol) for name in names)):
                     raise ValueError(f"symbol {symbol} is not defined in {source}")
@@ -71,14 +139,21 @@ def check(root):
             problems.append(f"{REGISTER}:{line_number}: {token}: {error}")
 
     for line_number, text in enumerate(document.splitlines(), 1):
-        for match in PATH_ANCHOR.finditer(text):
-            verify(line_number, match.group(1), match.group(1))
-        for match in LINE_ANCHOR.finditer(text):
-            verify(line_number, match.group(1), f"{match.group(1)}:{match.group(2)}", line=int(match.group(2)))
-        for match in QUALIFIED_ANCHOR.finditer(text):
-            raw = match.group(2) if match.group(2) is not None else match.group(3)
-            symbols = [part for word in raw.replace(",", " ").split() for part in word.split("::") if IDENTIFIER.fullmatch(part)]
-            verify(line_number, match.group(1), f"{match.group(1)}::{raw}", symbols=symbols)
+        for span_match in SPAN.finditer(text):
+            span = span_match.group(1)
+            if RS_MARKER not in span and SOURCE_PREFIXED.match(span) is None:
+                continue
+            anchor = classify(span)
+            if anchor is None:
+                checked += 1
+                problems.append(f"{REGISTER}:{line_number}: {span}: {UNCLASSIFIED}")
+                continue
+            source, token, symbols, line_range = anchor
+            if symbols is None:
+                checked += 1
+                problems.append(f"{REGISTER}:{line_number}: {token}: {EMPTY_SYMBOLS}")
+                continue
+            verify(line_number, source, token, symbols, line_range)
         for match in LINK_ANCHOR.finditer(text):
             verify(line_number, match.group(2), f"{match.group(2)}::{match.group(1)}", symbols=(match.group(1),))
     if checked == 0:
