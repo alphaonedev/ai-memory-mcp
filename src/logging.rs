@@ -1806,6 +1806,9 @@ mod masking_cost_tests;
 mod url_run_tests;
 
 #[cfg(test)]
+mod scan_work_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
