@@ -1,0 +1,32 @@
+{
+  "_comment": "Allowlist data for scripts/ci/check_no_cn_ai_vendor.py. Every entry names its reason.",
+  "glm_flash_testing": {
+    "reason": "The one permitted exception: the Flash model in agent cluster, hive and swarm testing.",
+    "path_prefixes": [
+      "sdk/python/swarm/",
+      "sdk/python/pyproject.toml",
+      "infra/do-hive/",
+      "docs/testing/",
+      "docs/reviews/gpt6-astra-20260905-evidence/"
+    ],
+    "line_context_regex": "flash|swarm|hive|cluster|nhi"
+  },
+  "functional_code_sites": [
+    {
+      "path": "src/llm.rs",
+      "reason": "provider alias match arms and their table tests; comment lines are still scanned"
+    },
+    {
+      "path": "src/config.rs",
+      "reason": "provider alias match arms, recognised-selector string and table tests; comment lines are still scanned"
+    },
+    {
+      "path": "src/identity/model_family.rs",
+      "reason": "model family stem table and its tests; comment lines are still scanned"
+    },
+    {
+      "path": "tests/issue_809_nhi_self_persona_any_agent.rs",
+      "reason": "model family fixture list; comment lines are still scanned"
+    }
+  ]
+}
