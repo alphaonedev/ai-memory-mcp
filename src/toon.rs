@@ -128,9 +128,14 @@ const MEMORY_FIELDS: &[&str] = &[
     CONTENT_PRINCIPAL_COLUMN,
 ];
 
-/// #8443: the foreign-content marker (`metadata.content_principal`) surfaced
-/// as a top-level column, like `agent_id`, so a reader of any TOON format can
-/// tell whose content a row is. Empty means owner content.
+/// #8443: the effective content principal of a row, surfaced as a top-level
+/// column like `agent_id`, so a reader of any TOON format can tell whose
+/// content a row is. The cell is exactly what the formation fold
+/// ([`crate::role_grounding::effective_principals_with`]) assigns the row for
+/// the reader: a stored or share/import marker, else the author when the
+/// author is not the reader, else `unknown` when the provenance is unknowable.
+/// Empty means the reader's own unmarked content; with no reader there is no
+/// owner (sec M2), so no row renders empty.
 const CONTENT_PRINCIPAL_COLUMN: &str = crate::role_grounding::META_CONTENT_PRINCIPAL;
 
 /// Compact memory fields — omits timestamps for tighter output.
@@ -166,10 +171,13 @@ pub fn memories_to_toon(response: &Value, compact: bool) -> String {
 }
 
 /// [`memories_to_toon`] rendered for a known reading caller (issue #8443, code
-/// L7). A `content_principal` marker that names the reader (compared without
-/// regard to letter case) renders as `unknown`, exactly as the formation fold
-/// reads it: content that claims the reader as its principal is not the
-/// reader's own content. `None` (a local operator) renders the raw marker.
+/// L7). The `content_principal` cell is the effective principal the formation
+/// fold assigns the row with `reader` as the owner (see
+/// `CONTENT_PRINCIPAL_COLUMN`). A marker that names the reader (compared
+/// without regard to letter case) renders as `unknown`: content that claims
+/// the reader as its principal is not the reader's own content. `None` (a
+/// local operator, no bound owner) renders a stored marker as stored and an
+/// unmarked row under its author.
 pub fn memories_to_toon_for(response: &Value, compact: bool, reader: Option<&str>) -> String {
     let fields = if compact {
         MEMORY_FIELDS_COMPACT
@@ -248,24 +256,7 @@ pub fn memories_to_toon_for(response: &Value, compact: bool, reader: Option<&str
                     // #199: `agent_id` is nested inside metadata in the Memory struct.
                     // Surface it as a top-level TOON column by digging into metadata.
                     if field == CONTENT_PRINCIPAL_COLUMN {
-                        match mem.get("metadata") {
-                            // The EFFECTIVE principal relative to the reader
-                            // (#8443 sec I1): a stored marker, else the foreign
-                            // author, else `unknown`; owner content is empty.
-                            Some(meta) if meta.is_object() => {
-                                let (_, principals) =
-                                    crate::role_grounding::effective_principals_with(
-                                        &[meta],
-                                        reader,
-                                        None,
-                                    );
-                                match principals.into_iter().next().flatten() {
-                                    Some(p) => escape_toon(p.as_str()),
-                                    None => String::new(),
-                                }
-                            }
-                            other => format_value(other.and_then(|m| m.get(field))),
-                        }
+                        principal_cell(mem.get("metadata"), reader)
                     } else if field == "agent_id" {
                         format_value(mem.get("metadata").and_then(|m| m.get(field)))
                     } else {
@@ -279,6 +270,22 @@ pub fn memories_to_toon_for(response: &Value, compact: bool, reader: Option<&str
     }
 
     out
+}
+
+/// The `content_principal` cell of one row: the EFFECTIVE principal relative
+/// to the reader (#8443 sec I1), computed by the formation fold. Metadata that
+/// is absent, null or not an object carries no author and no marker, so it is
+/// read as an empty object: unknowable provenance renders `unknown`, never the
+/// empty owner cell (sec S4).
+fn principal_cell(metadata: Option<&Value>, reader: Option<&str>) -> String {
+    let empty = Value::Object(serde_json::Map::new());
+    let meta = metadata.filter(|m| m.is_object()).unwrap_or(&empty);
+    let (_, principals) = crate::role_grounding::effective_principals_with(&[meta], reader, None);
+    principals
+        .into_iter()
+        .next()
+        .flatten()
+        .map_or_else(String::new, |p| escape_toon(p.as_str()))
 }
 
 /// Serialize a search response (which uses "results" key) to TOON.
