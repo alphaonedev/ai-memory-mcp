@@ -305,6 +305,23 @@ It is a no-op when AGE is healthy. `--age-dir` exists for the unit tests only;
 CI always uses the default node path, and there is no environment override.
 Keep `postgresql@18` and `pgvector` brew-pinned on the node regardless.
 
+### Tier credential pre-flight and re-alignment (#8686)
+Every enterprise-fed leg runs `python3 -I scripts/ci/tier_cred_preflight.py --url-file "$url_file"` before its
+`CREATE DATABASE`. It connects with exactly the node's `$HOME/.ai-memory-ci-fed-url` (parsed and TLS-checked by the
+AGE helper above; password through `PGPASSWORD` only) and runs `SELECT 1`. A rejected password, a missing password or
+a missing role fails the leg with `tier credential mismatch` (exit 3); TLS, unreachable, timeout and other failures
+have their own reasons (exit 1); a refused URL file exits 2. psql's stderr is never printed.
+
+Every runner on a node runs as the same user, so they share one URL file. To re-align after a mismatch, keep the
+file (mode 0600) as the source of truth and set the role from it, with no value on argv, in a log or on screen:
+1. Check: a libpq connection with the file's password through `PGPASSWORD` (the pre-flight above does this).
+2. Re-align: compute a SCRAM-SHA-256 verifier from the file's password locally and send
+   `ALTER ROLE ai_memory PASSWORD '<verifier>'` to the tier over its unix socket (local `trust`) on psql's stdin.
+   The server stores the verifier only; no restart or reload is needed.
+3. Re-check with step 1. Any other copy of an old tier URL on the node is a stale credential: keep it 0600 or
+   remove it.
+Rotating the password itself means writing the new URL file first (0600), then step 2.
+
 ### Self-hosted runners
 ```bash
 gh api repos/alphaonedev/ai-memory-mcp/actions/runners --jq '.runners[]|"\(.name) [\(.status)]"'
