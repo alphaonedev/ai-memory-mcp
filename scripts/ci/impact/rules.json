@@ -24,7 +24,8 @@
       "scripts/test/**", "scripts/ci/*", "scripts/ci/impact/**",
       "scripts/ci/tests/test_pg_isolated_binary.py",
       "scripts/ci/tests/test_retired_alias_walk_3627.py",
-      "scripts/ci/tests/test_docs_crypto_erase_census_walk_8346.py"
+      "scripts/ci/tests/test_docs_crypto_erase_census_walk_8346.py",
+      "scripts/ci/tests/test_check_no_cn_ai_vendor.py"
     ],
     "ci_tree_globs": [".github/**", "scripts/ci/**"],
     "ci_tree_exempt_globs": ["scripts/ci/tests/**"],
