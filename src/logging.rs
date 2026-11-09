@@ -1616,23 +1616,23 @@ const CREDENTIAL_LINE_ENDS: [char; 2] = ['\n', '\r'];
 /// through on a parse error.
 #[must_use]
 pub fn redact_url_password(url: &str) -> String {
-    let Some(scheme_end) = url_scan::charged_find(url.find(SCHEME_SEPARATOR), url.len()) else {
+    let Some(scheme_end) = charged_find(url.find(SCHEME_SEPARATOR), url.len()) else {
         return url.to_string();
     };
     let authority_start = scheme_end + SCHEME_SEPARATOR.len();
     let rest = &url[authority_start..];
     // The authority component ends at the first '/', '?' or '#'.
-    let authority_end = url_scan::charged_find(rest.find(AUTHORITY_TERMINATORS), rest.len())
+    let authority_end = charged_find(rest.find(AUTHORITY_TERMINATORS), rest.len())
         .map_or(url.len(), |i| authority_start + i);
     let authority = &url[authority_start..authority_end];
     // Userinfo is everything before the LAST '@' in the authority
     // (RFC 3986 — the host may not contain '@', so the last one wins).
-    let Some(at_pos) = url_scan::charged_rfind(authority.rfind('@'), authority.len()) else {
+    let Some(at_pos) = charged_rfind(authority.rfind('@'), authority.len()) else {
         return url.to_string();
     };
     let userinfo = &authority[..at_pos];
     // Password is everything after the FIRST ':' in the userinfo.
-    let Some(colon_pos) = url_scan::charged_find(userinfo.find(':'), userinfo.len()) else {
+    let Some(colon_pos) = charged_find(userinfo.find(':'), userinfo.len()) else {
         return url.to_string();
     };
     let mut out = String::with_capacity(url.len());
@@ -1667,73 +1667,12 @@ pub(crate) fn map_urls_in_message(msg: &str, render: fn(&str) -> String) -> Stri
     map_url_runs(&text, |url, run| render_operator_url(url, run, render))
 }
 
-/// Consume a scheme-less authority through its host, including a spaced password.
-/// URL spans are skipped as units so their userinfo is never partially rewritten.
-fn redact_bare_targets(msg: &str) -> String {
-    let mut out = String::with_capacity(msg.len());
-    let mut offset = 0;
-    let mut pending_url = next_url_span(msg);
-    let mut lookahead_end = 0;
-    let mut last_at = None;
-    while offset < msg.len() {
-        if let Some(span) = pending_url.as_ref().filter(|span| span.start == offset) {
-            out.push_str(&msg[span.clone()]);
-            offset = span.end;
-            lookahead_end = offset;
-            pending_url =
-                next_url_span(&msg[offset..]).map(|next| offset + next.start..offset + next.end);
-            continue;
-        }
-        let rest = &msg[offset..];
-        let stop = pending_url
-            .as_ref()
-            .map_or(rest.len(), |span| span.start - offset);
-        let local = &rest[..stop];
-        if offset >= lookahead_end {
-            let line = url_scan::charged_find(local.find(CREDENTIAL_LINE_ENDS), local.len());
-            let line_end = line.unwrap_or(local.len());
-            lookahead_end = offset + line_end;
-            last_at = url_scan::charged_rfind(local[..line_end].rfind('@'), line_end)
-                .map(|at| offset + at);
-        }
-        let end = url_scan::charged_find(local.find(char::is_whitespace), local.len())
-            .unwrap_or(local.len());
-        let token = &local[..end];
-        // A non-empty value follows the first ':' (an ASCII byte).
-        let ambiguous = credentialed_authority(token)
-            && url_scan::charged_find(token.find(':'), token.len())
-                .is_some_and(|colon| colon + 1 < token.len());
-        let lookahead = lookahead_end - offset;
-        let at = last_at.filter(|at| *at >= offset).map(|at| at - offset);
-        let bare = ambiguous
-            && (at.is_some()
-                || url_scan::charged_find(token.find(AUTHORITY_TERMINATORS), token.len())
-                    .is_some());
-        if bare {
-            let consumed = at.map_or(end, |at| {
-                let host = at + '@'.len_utf8();
-                let host_len = lookahead - host;
-                host + url_scan::charged_find(
-                    local[host..lookahead].find(char::is_whitespace),
-                    host_len,
-                )
-                .unwrap_or(host_len)
-            });
-            out.push_str(URL_PASSWORD_MASK);
-            offset += consumed;
-        } else if end > 0 {
-            out.push_str(token);
-            offset += end;
-        } else if let Some(ch) = local.chars().next() {
-            out.push(ch);
-            offset += ch.len_utf8();
-        }
-    }
-    out
-}
-
+mod bare_target_scan;
 mod credential_scan;
+mod scan_charge;
+use bare_target_scan::redact_bare_targets;
 use credential_scan::redact_connection_options;
+use scan_charge::{charged_find, charged_rfind};
 
 /// Consume the entire ruled credential span, including whitespace and later assignments.
 fn connection_value_end(value: &str) -> usize {
@@ -1776,18 +1715,6 @@ fn map_url_runs(msg: &str, render: impl Fn(&str, &url_scan::UrlRun) -> String) -
 }
 
 mod url_scan;
-
-/// Ownership-only callers share the same forward boundary discovery.
-fn next_url_span(text: &str) -> Option<std::ops::Range<usize>> {
-    url_scan::next_url_run(text).map(|run| run.span)
-}
-
-/// Only an authority colon identifies userinfo ambiguity; path colons do not.
-fn credentialed_authority(token: &str) -> bool {
-    let authority_end = url_scan::charged_find(token.find(AUTHORITY_TERMINATORS), token.len())
-        .unwrap_or(token.len());
-    url_scan::charged_find(token[..authority_end].find(':'), authority_end).is_some()
-}
 
 /// Render from boundaries already discovered by the forward scanner.
 /// OWNERSHIP-15: relative offsets retain the original UTF-8 boundaries.

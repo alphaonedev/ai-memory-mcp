@@ -1,5 +1,6 @@
 //! Forward-only URL boundary discovery for operator diagnostics (#8674).
 
+use super::scan_charge::{charge, charged_find};
 use super::{
     AUTHORITY_TERMINATORS, CREDENTIAL_LINE_ENDS, KEYLESS_URL_TERMINATORS, SCHEME_SEPARATOR,
 };
@@ -32,31 +33,6 @@ pub(super) fn next_url_run(text: &str) -> Option<UrlRun> {
     }
     charge(text.len());
     None
-}
-
-/// #8674: charge the bytes a search walked over to the cfg(test) work counter.
-/// Fixed-width probes at a cursor position (the scheme separator, a table
-/// lookup) are folded into that cursor's one-byte-per-byte charge.
-#[inline]
-pub(super) fn charge(bytes: usize) {
-    #[cfg(test)]
-    super::masking_cost_tests::visited(bytes);
-    #[cfg(not(test))]
-    let _ = bytes;
-}
-
-/// Charge a forward search through its match, or the whole haystack on a miss.
-#[must_use]
-pub(super) fn charged_find(found: Option<usize>, haystack: usize) -> Option<usize> {
-    charge(found.map_or(haystack, |at| at.saturating_add(1)));
-    found
-}
-
-/// Charge a backward search from the end to its match, or the whole haystack.
-#[must_use]
-pub(super) fn charged_rfind(found: Option<usize>, haystack: usize) -> Option<usize> {
-    charge(found.map_or(haystack, |at| haystack.saturating_sub(at)));
-    found
 }
 
 /// Boundaries and the last userinfo delimiter are accumulated once, never searched

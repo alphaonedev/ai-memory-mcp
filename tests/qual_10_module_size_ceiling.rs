@@ -35,12 +35,15 @@ use std::fs;
 /// additions). Bump in lockstep with growth.
 const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // #8674: exact ceilings for the scanner extraction and its cost guards.
-    ("src/logging.rs", 3275),
-    ("src/logging/credential_scan.rs", 228),
-    ("src/logging/url_scan.rs", 145),
+    ("src/logging.rs", 3265),
+    ("src/logging/credential_scan.rs", 214),
+    ("src/logging/url_scan.rs", 121),
     ("src/logging/url_run_tests.rs", 148),
     ("src/logging/masking_cost_tests.rs", 74),
     ("src/logging/scan_work_tests.rs", 148),
+    ("src/logging/scan_charge.rs", 55),
+    ("src/logging/bare_target_scan.rs", 75),
+    ("src/logging/scan_timing_tests.rs", 76),
     // The five 3000+ LOC offenders from QUAL-10.
     //
     // 2026-06-01 — bumped 16_000 → 16_100 by the v0.7.0 release QC of

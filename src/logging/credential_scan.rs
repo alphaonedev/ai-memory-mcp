@@ -2,7 +2,7 @@
 
 use super::{
     CREDENTIAL_OPTION_KEYS, EXACT_CREDENTIAL_KEYS, SCHEME_SEPARATOR, URL_PASSWORD_MASK,
-    connection_value_end, url_scan,
+    connection_value_end, scan_charge, url_scan,
 };
 
 /// ASCII punctuation ignored inside credential keys.
@@ -69,17 +69,7 @@ struct UrlContext {
 
 impl UrlContext {
     fn at_separator(msg: &str, separator: usize, floor: usize) -> Option<Self> {
-        let mut offset = separator;
-        while offset > floor {
-            let byte = msg.as_bytes()[offset - 1];
-            if byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.') {
-                offset -= 1;
-            } else {
-                break;
-            }
-        }
-        // The backward walk read each byte it stepped over plus the stopping byte.
-        url_scan::charge(separator - offset + 1);
+        let offset = scan_charge::charged_scheme_start(msg, separator, floor);
         let run = url_scan::next_url_run(&msg[offset..])?;
         let authority_end = offset + run.authority_end;
         let span = offset + run.span.start..offset + run.span.end;
@@ -98,7 +88,7 @@ pub(super) fn redact_connection_options(msg: &str) -> String {
     let mut pending_url: Option<UrlContext> = None;
     // Every input character is visited once, including characters skipped under
     // a value's ownership. Each search below charges the bytes it walks (#8674).
-    url_scan::charge(msg.len());
+    scan_charge::charge(msg.len());
     for (offset, separator) in msg.char_indices() {
         if offset < resume {
             continue;
@@ -127,7 +117,7 @@ pub(super) fn redact_connection_options(msg: &str) -> String {
             let value = &msg[offset + separator.len_utf8()..];
             let start = msg.len() - value.trim_start().len();
             let end = connection_value_end(&msg[start..]);
-            url_scan::charge(start - offset + end + 1);
+            scan_charge::charge(start - offset + end + 1);
             text.push_str(&msg[resume..start]);
             text.push_str(URL_PASSWORD_MASK);
             resume = start + end;
@@ -142,10 +132,10 @@ pub(super) fn redact_connection_options(msg: &str) -> String {
 fn credential_key(prefix: &str) -> bool {
     let untrimmed = prefix.len();
     let prefix = prefix.trim_end();
-    url_scan::charge(untrimmed - prefix.len() + 1);
+    scan_charge::charge(untrimmed - prefix.len() + 1);
     let key = if let Some(quote) = prefix.chars().last().filter(|ch| matches!(ch, '\'' | '"')) {
         let inner = &prefix[..prefix.len() - quote.len_utf8()];
-        let Some(start) = url_scan::charged_rfind(inner.rfind(quote), inner.len()) else {
+        let Some(start) = scan_charge::charged_rfind(inner.rfind(quote), inner.len()) else {
             return false;
         };
         &inner[start + quote.len_utf8()..]
@@ -157,7 +147,7 @@ fn credential_key(prefix: &str) -> bool {
                 })
             })
             .map_or(prefix, |(_, key)| key);
-        url_scan::charge(key.len() + 1);
+        scan_charge::charge(key.len() + 1);
         key
     };
     let normalized: String = key
@@ -166,13 +156,7 @@ fn credential_key(prefix: &str) -> bool {
         .filter(|ch| !CREDENTIAL_KEY_PUNCTUATION.contains(ch))
         .flat_map(char::to_lowercase)
         .collect();
-    // Normalization walks the key once and each contained noun is one more pass;
-    // an exact comparison reads at most its needle.
-    let exact: usize = EXACT_CREDENTIAL_KEYS.iter().map(|name| name.len()).sum();
-    let passes = normalized
-        .len()
-        .saturating_mul(CREDENTIAL_OPTION_KEYS.len());
-    url_scan::charge(key.len().saturating_add(passes).saturating_add(exact));
+    scan_charge::charge_key_match(key.len(), normalized.len());
     EXACT_CREDENTIAL_KEYS.contains(&normalized.as_str())
         || CREDENTIAL_OPTION_KEYS
             .iter()

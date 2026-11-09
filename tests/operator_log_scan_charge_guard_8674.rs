@@ -11,18 +11,20 @@
 use std::path::Path;
 
 /// Scanner files read whole.
-const SCANNER_FILES: &[&str] = &["src/logging/url_scan.rs", "src/logging/credential_scan.rs"];
+const SCANNER_FILES: &[&str] = &[
+    "src/logging/url_scan.rs",
+    "src/logging/credential_scan.rs",
+    "src/logging/bare_target_scan.rs",
+    "src/logging/scan_charge.rs",
+];
 /// The file whose named scanner functions are read; the rest of it is not a scanner.
 const LOGGING_FILE: &str = "src/logging.rs";
 const LOGGING_SCANNERS: &[&str] = &[
     "redact_url_password",
     "redact_urls_in_message",
     "map_urls_in_message",
-    "redact_bare_targets",
     "connection_value_end",
     "map_url_runs",
-    "next_url_span",
-    "credentialed_authority",
     "render_operator_url",
 ];
 /// Calls that charge the search passed as their first argument.
