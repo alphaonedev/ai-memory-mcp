@@ -754,8 +754,8 @@ pub use namespace::{
     handle_namespace_get_standard, handle_namespace_set_standard,
     handle_namespace_set_standard_trusted,
 };
-pub(crate) use notify::handle_notify_as_sender;
 pub use notify::{handle_inbox, handle_notify};
+pub(crate) use notify::{handle_notify_as_sender, handle_notify_as_sender_stamped};
 #[cfg(feature = "sal")]
 pub(crate) use notify::{inbox_envelope, inbox_message, notify_receipt};
 pub use pending::{handle_pending_approve, handle_pending_reject};

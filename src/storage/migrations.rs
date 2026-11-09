@@ -7,7 +7,7 @@
 //! constant, and the `migrate` function out of `src/db.rs` into
 //! this sub-module. Pure refactor — semantics unchanged. The
 //! `MAX_SUPPORTED_SCHEMA` constant in `cli::boot` must still bump
-//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 100).
+//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 101).
 //! Versions 45/46 are reserved for sibling provenance-write landings
 //! (Gaps 1+2, #884/#885); this crate jumps 44 → 47 for Gap 3 (#886).
 //! v48 (Track D #933) adds the `federation_push_dlq` table so quorum-
@@ -1002,7 +1002,7 @@ CREATE INDEX IF NOT EXISTS idx_agent_api_keys_agent ON agent_api_keys(agent_id);
 /// for schema reporting and compatibility checks. Settled ladder arms still
 /// gate on their own literal rung so adding v98 cannot make a v96 database
 /// skip v97.
-const CURRENT_SCHEMA_VERSION: i64 = 100;
+const CURRENT_SCHEMA_VERSION: i64 = 101;
 
 /// v1.0.0 #2555 — the ABSOLUTE upper ceiling for a `schema_version` stamp,
 /// the single source of truth shared by the SQL-side `CHECK` constraint (the
@@ -1815,14 +1815,7 @@ const MIGRATION_V97_SQLITE: &str =
 const MIGRATION_V98_SQLITE: &str =
     include_str!("../../migrations/sqlite/0082_v98_canonical_inbox_namespace.sql");
 
-// v100 (#3690 / #3695 / #3699): the (title, namespace) unique index becomes
-// PARTIAL — tombstoned rows give up their slot so a later store of the same
-// title lands as a fresh, visible row instead of inside the hidden one. The
-// postgres twin is `PostgresStore::migrate_v100`.
-const MIGRATION_V100_SQLITE: &str =
-    include_str!("../../migrations/sqlite/0084_v100_title_slot_live_rows.sql");
-
-const SQL_CLEAR_SCHEMA_VERSION: &str = "DELETE FROM schema_version";
+pub(super) const SQL_CLEAR_SCHEMA_VERSION: &str = "DELETE FROM schema_version";
 
 fn migrate_v98(conn: &Connection) -> Result<()> {
     conn.execute_batch(MIGRATION_V98_SQLITE)?;
@@ -1846,13 +1839,6 @@ fn migrate_v99(conn: &Connection) -> Result<()> {
     conn.execute_batch(MIGRATION_V99_SQLITE)?;
     conn.execute(SQL_CLEAR_SCHEMA_VERSION, [])?;
     conn.execute("INSERT INTO schema_version (version) VALUES (99)", [])?;
-    Ok(())
-}
-
-fn migrate_v100(conn: &Connection) -> Result<()> {
-    conn.execute_batch(MIGRATION_V100_SQLITE)?;
-    conn.execute(SQL_CLEAR_SCHEMA_VERSION, [])?;
-    conn.execute("INSERT INTO schema_version (version) VALUES (100)", [])?;
     Ok(())
 }
 
@@ -4598,9 +4584,14 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             migrate_v99(conn)?;
         }
 
-        if version < CURRENT_SCHEMA_VERSION {
+        if version < 100 {
             // v100 (#3690): the (title, namespace) slot belongs to live rows only.
-            migrate_v100(conn)?;
+            super::title_slot_archive::migrate_v100(conn)?;
+        }
+
+        if version < CURRENT_SCHEMA_VERSION {
+            // v101 (#8444): durable a2a_tasks table for the Agent2Agent binding.
+            super::a2a_tasks::migrate_v101(conn)?;
         }
 
         // v88 (#2578, v1.0.0: composite list/archive ordering indexes on

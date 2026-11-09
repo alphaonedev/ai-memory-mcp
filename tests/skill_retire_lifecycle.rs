@@ -328,10 +328,11 @@ fn migration_v82_applies_and_is_idempotent() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("mig.db");
 
-    // Fresh open reaches the ladder tip (v100, #3690 title-slot partial index) with the
+    // Fresh open reaches the ladder tip (v101, #8444 A2A task store) with the
     // v82 retire columns present.
     let conn = db::open(&path).unwrap();
-    assert_eq!(db::migrations::current_schema_version_for_tests(), 100);
+    // #8444: tip pin moved 100 -> 101 with the a2a_tasks migration.
+    assert_eq!(db::migrations::current_schema_version_for_tests(), 101);
     assert!(
         conn.prepare("SELECT retired_at, retired_by, retire_reason FROM skills LIMIT 0")
             .is_ok(),
