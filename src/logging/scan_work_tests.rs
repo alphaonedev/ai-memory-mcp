@@ -18,12 +18,12 @@ const MAX_WORK_PER_BYTE: usize = 32;
 
 /// `(label, prefix, repeated piece, suffix)`: the adversarial shapes of #8674.
 const SHAPES: &[(&str, &str, &str, &str)] = &[
-    ("userinfo", "", "http://u@a.io)", ""),
-    ("user:pass", "", "http://u:p@a.io)", ""),
-    ("unclosed paren", "", "(http://u@a.io/p(", ""),
-    ("quote", "", "http://u@a.io'", ""),
-    ("angle", "", "http://u@a.io>", ""),
-    ("port", "", "http://u@a.io:80)", ""),
+    ("userinfo", "", "http://u@a)", ""),
+    ("user:pass", "", "http://u:p@a)", ""),
+    ("unclosed paren", "", "(http://u@a/p(", ""),
+    ("quote", "", "http://u@a'", ""),
+    ("angle", "", "http://u@a>", ""),
+    ("port", "", "http://u@a:80)", ""),
     ("nested schemes", "", "http://a://b@c://", ""),
     ("whitespace-free authority", "https://", "a=1:", ""),
     ("colon authority", "https://", ":", ""),
@@ -31,7 +31,7 @@ const SHAPES: &[(&str, &str, &str, &str)] = &[
     ("credential lines", "", "password=private\n", ""),
     ("quoted credential", "", "token: 'a\\'b' ", ""),
     ("quoted keys", "", "'k'=\"v\":", ""),
-    ("bare targets", "", "u:p@h.io x ", ""),
+    ("bare targets", "", "u:p@h x ", ""),
     ("bare target lines", "", "u:p@h x\n", ""),
     ("plain words", "", "word ", ""),
     ("long key", "", "a", "=x"),
@@ -112,7 +112,7 @@ fn work_counter_observes_every_examined_byte_8674() {
     const URL_TAIL: usize = super::url_scan::MAX_OPERATOR_URL_RUN_BYTES / 2;
     // Below the cap, the authority loop reads the whole whitespace-free tail
     // before it ends the run at ')'.
-    let url = format!("http://u@a.io){}", "x".repeat(URL_TAIL));
+    let url = format!("http://u@a){}", "x".repeat(URL_TAIL));
     reset_visited();
     let run = super::url_scan::next_url_run(&url);
     assert!(

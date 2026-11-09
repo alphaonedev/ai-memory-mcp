@@ -26,13 +26,13 @@ const RUN_LARGE_BYTES_8674: usize = 1_000_000;
 const RUN_SMALL_CEILING_8674: std::time::Duration = std::time::Duration::from_millis(2_500);
 const RUN_LARGE_CEILING_8674: std::time::Duration = std::time::Duration::from_secs(25);
 const RUN_SHAPES_8674: &[&str] = &[
-    "http://u@a.io)",
-    "http://u:p@a.io)",
-    "http://a.io)",
-    "http://u@a.io'",
-    "http://user@b.io)",
-    "http://u@a.io>",
-    "http://u@a.io:80)",
+    "http://u@a)",
+    "http://u:p@a)",
+    "http://a)",
+    "http://u@a'",
+    "http://user@b)",
+    "http://u@a>",
+    "http://u@a:80)",
 ];
 const KEYS: &[&str] = &[
     "password",
