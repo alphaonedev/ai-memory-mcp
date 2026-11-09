@@ -68,8 +68,8 @@ UNREACHABLE_CORPUS = (
     'psql: error: could not translate host name "nohost.invalid" to address: nodename nor servname provided',
     'psql: error: connection to server at "127.0.0.1", port 5445 failed: FATAL:  the database system is starting up',
     'psql: error: connection to server at "127.0.0.1", port 5445 failed: FATAL:  the database system is shutting down',
-    'psql: error: connection to server at "10.1.2.3", port 5445 failed: No route to host',
-    'psql: error: connection to server at "10.1.2.3", port 5445 failed: Network is unreachable',
+    'psql: error: connection to server at "tier.invalid", port 5445 failed: No route to host',
+    'psql: error: connection to server at "tier.invalid", port 5445 failed: Network is unreachable',
     'psql: error: connection to server on socket "/run/postgresql/.s.PGSQL.5432" failed: No such file or directory',
 )
 TLS_CORPUS = (
