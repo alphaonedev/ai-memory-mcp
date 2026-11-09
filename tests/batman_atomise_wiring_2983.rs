@@ -344,6 +344,22 @@ fn deferred_mode_lands_atoms_through_the_bounded_worker_2986() {
     assert_eq!(resp["atomise_outcome"].as_str(), Some(OUTCOME_QUEUED));
     let source_id = resp["id"].as_str().expect("response id").to_string();
 
+    // #8687 RED: force the early-worker order (worker drains before the old
+    // response-time check), then run the old check unchanged.
+    let early = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while std::time::Instant::now() < early {
+        let landed: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE atom_of = ?1",
+                [&source_id],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if landed >= 2 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
     // Deferred means deferred: nothing has landed yet at response time.
     let immediate: Option<i64> = conn
         .query_row(

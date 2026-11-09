@@ -312,6 +312,13 @@ async fn http_create_enqueues_atomisation_and_the_worker_lands_the_atoms_2984() 
     );
 
     let source_id = body["id"].as_str().expect("id").to_string();
+    // #8687 RED: deterministically force the early-worker order (the worker
+    // lands the atoms BEFORE the old response-time check runs) and then run
+    // the old assertion unchanged. It must fail here, proving the race.
+    let early = std::time::Instant::now() + Duration::from_secs(15);
+    while std::time::Instant::now() < early && count_atoms(&db_path, &source_id) < 2 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     // Deferred means deferred: the response did not wait on the curator.
     assert_eq!(
         count_atoms(&db_path, &source_id),

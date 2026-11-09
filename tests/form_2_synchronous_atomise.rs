@@ -371,6 +371,11 @@ fn deferred_mode_preserves_existing_behaviour() {
     // Form 2 deferred-mode contract: source's atomised_into is NULL at
     // the moment the response returned. The worker thread may complete
     // it later — that is the deferred semantic.
+    // #8687 RED: force the early-worker order, then run the old check.
+    let early = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while std::time::Instant::now() < early && count_atoms_for_source(&conn, &source_id) < 2 {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
     let atomised_into_immediate = read_atomised_into(&conn, &source_id);
     assert!(
         atomised_into_immediate.is_none(),
