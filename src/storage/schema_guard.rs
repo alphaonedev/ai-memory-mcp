@@ -303,7 +303,14 @@ impl fmt::Display for SchemaAheadOfBinary {
 
 impl std::error::Error for SchemaAheadOfBinary {}
 
-/// Render the operator-facing refusal.
+/// Selector that points the CLI at a sqlite backup copy.
+pub const COPY_SELECTOR_SQLITE: &str = "--db <copy>";
+/// Selector that points the CLI at a postgres backup copy (#8679).
+pub const COPY_SELECTOR_POSTGRES: &str = "--store-url <copy-url>";
+
+/// Render the operator-facing refusal. The single text every entry path
+/// (CLI, MCP, daemon, boot hook) prints; the backup-copy selector is the one
+/// the refusing backend understands.
 ///
 /// Deliberately does NOT promise a pre-migration snapshot exists. Postgres has
 /// no snapshot mechanism at all, and the sqlite one is skipped on a database
@@ -311,20 +318,27 @@ impl std::error::Error for SchemaAheadOfBinary {}
 /// panicking operator to restore a file that is not there is worse than
 /// telling them nothing. The wording points at the class of artifact and lets
 /// them look.
-fn render(observed: i64, supported: i64, backend: &str, target: &str) -> String {
+pub(crate) fn render(observed: i64, supported: i64, backend: &str, target: &str) -> String {
+    let copy_selector = if backend == BACKEND_POSTGRES {
+        COPY_SELECTOR_POSTGRES
+    } else {
+        COPY_SELECTOR_SQLITE
+    };
     format!(
         "database schema is AHEAD of this binary: {target} ({backend}) is on schema \
-         v{observed}, but ai-memory {bin} understands up to v{supported}. Refusing to \
-         operate it — an older binary writing a newer schema drops columns it does not \
-         know and violates invariants the newer migrations established, which is silent \
-         corruption of the durable tier. Reads still work: `ai-memory backup`, `boot` and \
-         `doctor` continue to operate against this database, so snapshot it before doing \
-         anything else. To proceed: run ai-memory >= the version that wrote this database, \
-         or restore a snapshot taken BEFORE the schema moved. If you have verified this \
-         binary can safely operate this database, set {env}={observed} for this process \
-         only (it is refused under the asi-hard security profile, and it stops applying \
-         the moment the database moves again). On postgres this schema is SHARED by every \
-         daemon on the cluster — one node's upgrade moves it for all of them (#2445).",
+         v{observed}. This database was written by a newer ai-memory build (schema \
+         v{observed}); this binary (ai-memory {bin}) supports schema v{supported}; \
+         upgrade ai-memory to the build that wrote this database, or open a backup copy \
+         with {copy_selector}. Refusing to operate it — an older binary writing a newer \
+         schema drops columns it does not know and violates invariants the newer \
+         migrations established, which is silent corruption of the durable tier. Reads \
+         still work: `ai-memory backup`, `boot` and `doctor` continue to operate against \
+         this database, so snapshot it before doing anything else, or restore a snapshot \
+         taken BEFORE the schema moved. If you have verified this binary can safely \
+         operate this database, set {env}={observed} for this process only (it is \
+         refused under the asi-hard security profile, and it stops applying the moment \
+         the database moves again). On postgres this schema is SHARED by every daemon on \
+         the cluster — one node's upgrade moves it for all of them (#2445).",
         bin = crate::PKG_VERSION,
         env = ENV_ALLOW_SCHEMA_AHEAD,
     )
@@ -668,25 +682,48 @@ pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// Run `f` with the schema-ahead hatch set to `value` (or removed) under the
+/// shared env lock, then remove it. The one in-crate hatch mutator, so a
+/// test elsewhere in the lib binary never mutates the env itself (#3475).
+#[cfg(test)]
+pub(crate) fn with_hatch<T>(value: Option<&str>, f: impl FnOnce() -> T) -> T {
+    let _g = test_env_lock();
+    // SAFETY: process-wide env mutation, serialised by `_g`.
+    unsafe {
+        match value {
+            Some(v) => std::env::set_var(ENV_ALLOW_SCHEMA_AHEAD, v),
+            None => std::env::remove_var(ENV_ALLOW_SCHEMA_AHEAD),
+        }
+    }
+    let out = f();
+    // SAFETY: as above.
+    unsafe { std::env::remove_var(ENV_ALLOW_SCHEMA_AHEAD) };
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    use super::test_env_lock as env_lock;
-
-    fn with_hatch<T>(value: Option<&str>, f: impl FnOnce() -> T) -> T {
-        let _g = env_lock();
-        // SAFETY: process-wide env mutation, serialised by `_g`.
-        unsafe {
-            match value {
-                Some(v) => std::env::set_var(ENV_ALLOW_SCHEMA_AHEAD, v),
-                None => std::env::remove_var(ENV_ALLOW_SCHEMA_AHEAD),
-            }
-        }
-        let out = f();
-        // SAFETY: as above.
-        unsafe { std::env::remove_var(ENV_ALLOW_SCHEMA_AHEAD) };
-        out
+    /// #8679 F2 - the copy-advice clause names the selector of the backend
+    /// that produced the refusal. `--db` selects a sqlite file only; a
+    /// postgres store is selected with `--store-url`.
+    #[test]
+    fn remediation_names_the_selector_of_the_refusing_backend_8679() {
+        with_hatch(None, || {
+            let sqlite = evaluate(92, 87, BACKEND_SQLITE, "/db").unwrap_err().detail;
+            assert!(
+                sqlite.contains("open a backup copy with --db <copy>"),
+                "{sqlite}"
+            );
+            assert!(!sqlite.contains("--store-url"), "{sqlite}");
+            let pg = evaluate(92, 87, BACKEND_POSTGRES, "pg").unwrap_err().detail;
+            assert!(
+                pg.contains("open a backup copy with --store-url <copy-url>"),
+                "{pg}"
+            );
+            assert!(!pg.contains("--db <copy>"), "{pg}");
+        });
     }
 
     #[test]

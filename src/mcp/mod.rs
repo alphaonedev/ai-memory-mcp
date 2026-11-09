@@ -5743,7 +5743,9 @@ mod tests {
     /// serial dispatch, which this test exercises.
     #[test]
     fn issue_965_audit_serial_dispatch_50_calls_through_single_connection() {
+        let _iso = crate::test_support::no_passphrase_guard();
         let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        passphrase_window_8659::probe_before_open();
         let conn = db::open(tmp.path()).expect("open db");
         let tier_config = crate::config::FeatureTier::Keyword.config();
         let resolved_ttl = crate::config::ResolvedTtl::default();
@@ -5811,6 +5813,8 @@ mod tests {
             .expect("count query");
         assert_eq!(n, 50, "expected 50 audit-stress rows, found {n}");
     }
+
+    mod passphrase_window_8659;
 
     // ----- issue #811 verification: load_active_keypair_for_mcp fallback -----
 

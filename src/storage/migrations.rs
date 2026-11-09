@@ -23,6 +23,8 @@
 //! `memory_capture_turn` MCP tool). Closes the #1388 substrate
 //! failure mode at the storage layer.
 
+use super::embed_skip::{self, TRIGGER_CLEAR_ON_CONTENT, TRIGGER_CLEAR_ON_EMBED};
+use super::snapshot_file;
 use crate::models::field_names;
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension as _, params};
@@ -1142,7 +1144,7 @@ fn database_holds_durable_rows(conn: &Connection) -> Result<bool> {
 ///
 /// The snapshot path encodes the from→to version span plus a monotonic
 /// nanosecond token, so repeated upgrades of the same DB never collide.
-fn snapshot_before_migration(
+pub(super) fn snapshot_before_migration(
     conn: &Connection,
     from_version: i64,
     to_version: i64,
@@ -1165,13 +1167,22 @@ fn snapshot_before_migration(
     // Single-quote-escape the target for the SQL string literal (the path
     // is crate-derived, but doubling quotes is the correct hygiene).
     let target = snapshot_path.to_string_lossy().replace('\'', "''");
-    conn.execute(&format!("VACUUM INTO '{target}'"), [])
+    // #8679: owner-only target first, source's mode after, removed on any failure.
+    snapshot_file::create_private_target(&snapshot_path)?;
+    let written = conn
+        .execute(&format!("VACUUM INTO '{target}'"), [])
+        .map_err(anyhow::Error::from)
+        .and_then(|_| snapshot_file::settle_mode_to_source(&snapshot_path, &db_path))
         .with_context(|| {
             format!(
                 "pre-migration snapshot (v{from_version}→v{to_version}) failed; \
                  refusing to mutate schema without a recoverable backup"
             )
-        })?;
+        });
+    if let Err(err) = written {
+        snapshot_file::discard(&snapshot_path);
+        return Err(err);
+    }
 
     Ok(Some(snapshot_path))
 }
@@ -1857,6 +1868,29 @@ fn migrate_v101(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn clear_trigger_count(conn: &Connection) -> rusqlite::Result<i64> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name IN (?1, ?2)",
+        params![TRIGGER_CLEAR_ON_CONTENT, TRIGGER_CLEAR_ON_EMBED],
+        |row| row.get(0),
+    )
+}
+
+/// #4078 / #8679 - run the trigger-gap repair under the writer lock; it stays
+/// here, the only caller module (#4324 pin). `true` when it ran, `false` when
+/// a racing open repaired first: the gap is re-probed UNDER the lock because
+/// the repair also clears the derived `embed_skip` cache. A lock, probe, DDL
+/// or commit failure propagates and the guard rolls back (ERRORS-02).
+pub(super) fn repair_under_writer_lock(conn: &Connection) -> Result<bool> {
+    let repair_txn = super::connection::WriteTxn::begin_exclusive(conn)?;
+    if clear_trigger_count(conn).context("re-probe the embed_skip clear triggers")? == 2 {
+        return Ok(false);
+    }
+    embed_skip::repair_sqlite_after_trigger_gap(conn)?;
+    repair_txn.commit()?;
+    Ok(true)
+}
+
 // COVERAGE: per-version ALTER/CREATE branches inside this function
 // are guarded by `has_X` column-existence probes and `IF NOT EXISTS`
 // markers. When the canonical SCHEMA constant already ships a target
@@ -1922,20 +1956,24 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
         // #4078: older binaries stamped v100 after dropping the v96 clear
         // triggers. Repair that derived state even when no ladder runs.
         // Probe first so a healthy store does not take another writer lock.
-        let clear_trigger_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name IN (?1, ?2)",
-            params![
-                crate::storage::embed_skip::TRIGGER_CLEAR_ON_CONTENT,
-                crate::storage::embed_skip::TRIGGER_CLEAR_ON_EMBED,
-            ],
-            |row| row.get(0),
-        )?;
+        let clear_trigger_count = clear_trigger_count(conn)?;
         if clear_trigger_count != 2 {
+            // #8677: the repair mutates the database, so the safety-snapshot
+            // contract holds here too (from == to: the schema does not move).
+            // Taken before the writer lock, like the ladder snapshot below.
+            if let Some(snapshot) =
+                snapshot_before_migration(conn, version, CURRENT_SCHEMA_VERSION)?
+            {
+                tracing::info!(
+                    from_version = version,
+                    to_version = CURRENT_SCHEMA_VERSION,
+                    snapshot = %snapshot.display(),
+                    "pre-repair database snapshot written"
+                );
+            }
             // ERRORS-02: propagate DDL/commit failures; the guard rolls back
             // both definitions together if repair cannot complete.
-            let repair_txn = super::connection::WriteTxn::begin_exclusive(conn)?;
-            crate::storage::embed_skip::repair_sqlite_after_trigger_gap(conn)?;
-            repair_txn.commit()?;
+            repair_under_writer_lock(conn)?;
         }
         return Ok(());
     }

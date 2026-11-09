@@ -1701,6 +1701,9 @@ fn send(
                 return Err(dlq_reason::DNS_SSRF_REJECTED.to_string());
             }
         };
+    #[cfg(test)]
+    let validated_addrs =
+        webhook_tls_8203_tests::receiver::map_receiver(&resolved_host, validated_addrs)?;
     // v0.7.0 SR-W3 (HIGH) — redirect SSRF-pin bypass. The
     // `builder.resolve(host, addr)` pins below shadow reqwest's DNS
     // for the *validated* host only. reqwest's default redirect
@@ -2014,6 +2017,34 @@ pub(crate) fn host_port_with_default_http_port(host_port: &str) -> String {
     format!("{host_port}:80")
 }
 
+/// #6401 / #4075: webhook pins use the scheme default when no port is explicit.
+/// The inference HTTP-only helper above retains its existing contract.
+fn webhook_host_port_for_scheme(host_port: &str, scheme: &str) -> String {
+    const HTTPS_DEFAULT_PORT: u16 = 443;
+    if scheme == "https" {
+        format!("{host_port}:{HTTPS_DEFAULT_PORT}")
+    } else {
+        host_port_with_default_http_port(host_port)
+    }
+}
+
+/// Normalize only the webhook resolver authority, retaining its original host spelling.
+fn normalize_webhook_host_port(host_port: &str, scheme: &str) -> Result<String> {
+    // #8649: reject invalid explicit ports before DNS and its fail-open override.
+    let explicit_port =
+        if let Some(close_idx) = host_port.strip_prefix('[').and(host_port.find(']')) {
+            host_port[close_idx + 1..].strip_prefix(':')
+        } else {
+            host_port.rsplit_once(':').map(|(_, port)| port)
+        };
+    if let Some(port) = explicit_port {
+        port.parse::<std::num::NonZeroU16>()
+            .context("webhook URL has an invalid explicit port")?;
+        return Ok(host_port.to_string());
+    }
+    Ok(webhook_host_port_for_scheme(host_port, scheme))
+}
+
 pub(crate) fn validate_url_dns_resolved(
     url: &str,
     allow_loopback: bool,
@@ -2071,54 +2102,30 @@ fn validate_url_dns_with(
     let shown = crate::url_display::url_origin(url);
     let url_display = shown.as_str();
     let lower = url.to_ascii_lowercase();
-    let (_scheme, rest) = lower
+    let (scheme, rest) = lower
         .split_once("://")
         .ok_or_else(|| anyhow!("webhook URL missing scheme: {url_display}"))?;
     // #3744 — userinfo is stripped BEFORE any host extraction, the same
     // way `validate_url_with` does it; this guard is the SECOND line of
     // defence for the same class and must read the same host.
     let host_port = authority_without_userinfo(rest);
-    // v0.7.0 #1082 — extract the host (sans port + brackets) for the
-    // reqwest `Client::builder().resolve(host, addr)` override the
-    // caller installs. The override matches by host string the
-    // reqwest URL parser produces, so we strip the brackets / port
-    // here to match.
+    // #1082: strip brackets and port for the reqwest resolver override key.
+    // Its host spelling must match the client URL parser.
     let resolved_host = {
         let s = host_port;
         if let Some(close_idx) = s.strip_prefix('[').and(s.find(']')) {
             // [ipv6]:port or [ipv6] — return the inner ipv6 text.
             s[1..close_idx].to_string()
         } else if let Some(idx) = s.rfind(':') {
-            // Hostname:port — strip the port. (IPv4-with-port. Bare
-            // ipv4 has no `:` so falls through to the else branch.)
+            // Strip hostname/IPv4 ports; bare IPv4 falls through unchanged.
             s[..idx].to_string()
         } else {
             s.to_string()
         }
     };
-    // Supply a default port so ToSocketAddrs resolves correctly.
-    // SSRF fix (W11): bracketed IPv6 without an explicit port ("[fe80::1]"
-    // with no trailing ":N") was previously passed to ToSocketAddrs as-is,
-    // which errors with "invalid port value" — and the catch-all `Err(_) =>
-    // return Ok(())` below treated that as a DNS hiccup, silently bypassing
-    // the SSRF guard. Detect the no-trailing-port form and append `:80` so
-    // resolution succeeds and the IP is checked.
-    let resolv_target =
-        if let Some(close_idx) = host_port.strip_prefix('[').and(host_port.find(']')) {
-            let after_bracket = &host_port[close_idx + 1..];
-            if after_bracket.starts_with(':') {
-                // [ipv6]:port — already has a port
-                host_port.to_string()
-            } else {
-                // [ipv6] without port — append default
-                host_port_with_default_http_port(host_port)
-            }
-        } else if host_port.contains(':') {
-            // IPv4:port or hostname:port — use as-is
-            host_port.to_string()
-        } else {
-            host_port_with_default_http_port(host_port)
-        };
+    // W11 / #6401: supply the scheme default, including for bracketed IPv6,
+    // so a missing port cannot turn address validation into a DNS failure.
+    let resolv_target = normalize_webhook_host_port(host_port, scheme)?;
     // v0.7.0 #1053 (Agent-2 #3) — fail-CLOSED on DNS resolution
     // failure. Pre-#1053 a SERVFAIL / timeout / hang at the daemon's
     // resolver returned Ok(()) here, but the subsequent
@@ -2264,6 +2271,9 @@ fn validate_url_with(url: &str, allow_loopback: bool) -> Result<()> {
         // target routinely carries a token).
         return Err(anyhow!("webhook URL scheme must be https: {url_display}"));
     }
+    // #8649: registration and dispatch share explicit-port validation.
+    let host_port = authority_without_userinfo(rest);
+    normalize_webhook_host_port(host_port, scheme)?;
     // v1.0.0 #3705 — "only encrypted data in transit": plaintext http:// is
     // refused to EVERY host, loopback included (the pre-#3705 loopback
     // exemption is gone — loopback is shared by every local process).
@@ -2273,12 +2283,9 @@ fn validate_url_with(url: &str, allow_loopback: bool) -> Result<()> {
             crate::transit_encryption::plaintext_url_refusal("webhook target", url)
         ));
     }
-    // Extract host (portion before '/' or ':' or '?'). IPv6 URLs use
-    // `[ipv6]:port` syntax — the brackets must be stripped and the
-    // colon-split must skip the colons inside the v6 literal.
-    // #3744 — userinfo is stripped BEFORE any host extraction; see
-    // `authority_without_userinfo`.
-    let host_port = authority_without_userinfo(rest);
+    // Extract the host without splitting IPv6's inner colons.
+    // #3744: host_port already excludes userinfo; both guards read the same
+    // authority before applying address policy.
     let host: String = if let Some(stripped) = host_port.strip_prefix('[') {
         // IPv6: host is everything before the closing bracket.
         match stripped.find(']') {
@@ -2852,6 +2859,8 @@ fn record_dispatch_with_conn(conn: &Connection, sub_id: &str, correlation_id: &s
 
 #[cfg(test)]
 mod webhook_ssrf_8203_tests;
+#[cfg(test)]
+mod webhook_tls_8203_tests;
 
 #[cfg(test)]
 mod tests {
