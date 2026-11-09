@@ -178,15 +178,26 @@ fn issue_8662_escalation_after_leak_is_queued_not_parked_in_dead_frame() {
         let (id, deferred, timeout, elapsed) = with_leak(shape, &path, |conn| {
             let start = Instant::now();
             let id = route(conn);
-            (id.clone(), is_deferred(&id), busy_timeout(conn), start.elapsed())
+            (
+                id.clone(),
+                is_deferred(&id),
+                busy_timeout(conn),
+                start.elapsed(),
+            )
         });
-        assert!(!deferred, "{shape:?}: pending {id} parked in a leaked frame");
+        assert!(
+            !deferred,
+            "{shape:?}: pending {id} parked in a leaked frame"
+        );
         assert_eq!(
             pending_rows(&path, &id),
             1,
             "{shape:?}: caller was handed pending id {id} with no row"
         );
-        assert_eq!(timeout, WRITER_BUSY_TIMEOUT_MS, "{shape:?}: busy_timeout changed");
+        assert_eq!(
+            timeout, WRITER_BUSY_TIMEOUT_MS,
+            "{shape:?}: busy_timeout changed"
+        );
         assert!(elapsed < ROUTE_CEILING, "{shape:?}: route took {elapsed:?}");
     }
 }
@@ -216,11 +227,24 @@ fn issue_8662_live_frame_still_defers_and_lands_on_commit() {
         })
         .join()
         .expect("live thread");
-        assert!(deferred, "same={same_connection}: live frame must take the intent");
+        assert!(
+            deferred,
+            "same={same_connection}: live frame must take the intent"
+        );
         assert_eq!(rows_before, 0, "same={same_connection}: row before settle");
-        assert_eq!(pending_rows(&path, &id), 1, "same={same_connection}: row after commit");
-        assert_eq!(timeout, WRITER_BUSY_TIMEOUT_MS, "same={same_connection}: busy_timeout");
-        assert!(elapsed < ROUTE_CEILING, "same={same_connection}: route took {elapsed:?}");
+        assert_eq!(
+            pending_rows(&path, &id),
+            1,
+            "same={same_connection}: row after commit"
+        );
+        assert_eq!(
+            timeout, WRITER_BUSY_TIMEOUT_MS,
+            "same={same_connection}: busy_timeout"
+        );
+        assert!(
+            elapsed < ROUTE_CEILING,
+            "same={same_connection}: route took {elapsed:?}"
+        );
     }
 }
 

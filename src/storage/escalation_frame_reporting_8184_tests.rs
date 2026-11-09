@@ -179,16 +179,23 @@ fn issue_6132_no_subscriber_reports_at_open_and_not_again_at_exit() {
     );
 }
 
+/// #8662 supersedes the #6132 contract that a later intent could still join a
+/// reported leaked frame: that frame's transaction is over, so the caller
+/// would have held a pending id with no row. The later intent is now handed
+/// back (and queued immediately by `defer_or_queue`), and nothing beyond
+/// the original open-time report is left for the exit report.
 #[test]
-fn issue_6132_later_intent_on_reported_frame_remains_reportable() {
-    let name = "issue_6132_later_intent_on_reported_frame_remains_reportable";
+fn issue_8662_later_intent_is_not_deferred_into_reported_frame() {
+    let name = "issue_8662_later_intent_is_not_deferred_into_reported_frame";
     let Some(stderr) = child_stderr(name, || {
         let dir = tempfile::tempdir().expect("test directory");
         let path = dir.path().join("leak.db");
         leak(&path, &["first"]);
         reopen(&path);
         let conn = Connection::open(&path).expect("open connection for later intent");
-        assert!(defer_to_open_txn(conn.path(), intent("later")).is_ok());
+        let refused = defer_to_open_txn(conn.path(), intent("later"))
+            .expect_err("a leaked frame must not take a later intent");
+        assert_eq!(refused.pending_id, "later");
     }) else {
         return;
     };
@@ -200,8 +207,8 @@ fn issue_6132_later_intent_on_reported_frame_remains_reportable() {
         1
     );
     assert!(
-        stderr.contains("thread exited with 1 unreported deferred escalation(s) in 1 unsettled escalation frame(s)"),
-        "only the later intent remains uncredited: {stderr}"
+        !stderr.lines().any(|line| line.starts_with(EXIT_REPORT)),
+        "the reported frame holds no uncredited intent at exit: {stderr}"
     );
 }
 
@@ -444,6 +451,7 @@ fn issue_8654_stderr_lock_is_held_through_raw_write() {
                     db_path: None,
                     conn_addr: 0,
                     deferred: vec![intent("lost")],
+                    stale: true,
                     reported: 0,
                     anchor: crate::governance::audit::PendingAuditAnchor::none(),
                 };

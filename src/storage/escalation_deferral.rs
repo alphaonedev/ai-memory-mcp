@@ -52,6 +52,28 @@
 //! to stderr (an `ERROR #4116: ...` line), because the `tracing` fmt layer's
 //! own thread-local buffer may already be destroyed at thread exit and
 //! logging through it would abort the process.
+//!
+//! # Leaked frames accept no new work (#8662)
+//!
+//! A leaked frame stays on the stack until thread exit, but its transaction
+//! is over. Work handed to it would never be settled, and the caller would be
+//! holding a pending id that has no row. So a frame is marked `stale` as soon
+//! as its end is PROVEN, and a stale frame takes no new escalation or audit
+//! anchor:
+//!
+//! - a later `BEGIN IMMEDIATE` / `BEGIN EXCLUSIVE` succeeds on the same
+//!   database (a live frame would hold the write lock) or on the same
+//!   connection (a live frame would make it a nested BEGIN);
+//! - the routing connection IS the frame's connection and is in autocommit;
+//! - [`defer_or_queue`] finds a frame on another connection and its
+//!   non-blocking `BEGIN IMMEDIATE` probe gets the write lock, so nothing
+//!   holds it. The pending row is then written inside that probe
+//!   transaction.
+//!
+//! Remaining window: the probe finds the lock held while the frame is dead
+//! (another process is writing at that instant). The intent is then deferred.
+//! The caller gets the DEFERRED text, which tells it how to detect a failed
+//! write, and the lost intent is reported at the next open or at thread exit.
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -129,6 +151,10 @@ struct TxnFrame {
     /// stable and unique for the frame's whole life.
     conn_addr: usize,
     deferred: Vec<DeferredEscalation>,
+    /// #8662 - the transaction has provably ended without settling this
+    /// frame (a leaked `WriteTxn`). A stale frame takes no new escalation or
+    /// audit anchor; [`settle_frame`] still settles what it already holds.
+    stale: bool,
     /// Intents included in a successfully written raw lost-write report.
     /// A count keeps subsequently deferred intents reportable (#6132/#6540).
     reported: usize,
@@ -256,18 +282,28 @@ fn write_open_report(frame: &TxnFrame) -> std::io::Result<()> {
 }
 
 /// Register a frame for a write transaction just opened on `conn`.
+///
+/// #8662 - `BEGIN IMMEDIATE` / `BEGIN EXCLUSIVE` has just SUCCEEDED on
+/// `conn`. A live older frame on the same database would still hold the
+/// write lock, so that BEGIN would have failed `SQLITE_BUSY`. A live older
+/// frame on this same connection would have made it a refused nested BEGIN.
+/// Every such frame is therefore leaked, and it is marked stale.
 pub(super) fn open_frame(conn: &Connection) -> u64 {
     let id = NEXT_FRAME_ID.fetch_add(1, Ordering::Relaxed);
     let db_path = conn.path().filter(|p| !p.is_empty()).map(str::to_string);
+    let conn_addr = std::ptr::from_ref(conn).addr();
     TXN_FRAMES.with(|frames| {
         let mut frames = frames.borrow_mut();
-        let mut stale = false;
-        for frame in frames
-            .0
-            .iter_mut()
-            .filter(|f| f.db_path == db_path && db_path.is_some() && !f.deferred.is_empty())
-        {
-            stale = true;
+        let mut leaked_with_intents = false;
+        for frame in &mut frames.0 {
+            let same_db = db_path.is_some() && frame.db_path == db_path;
+            if same_db || frame.conn_addr == conn_addr {
+                frame.stale = true;
+            }
+            if !same_db || frame.deferred.is_empty() {
+                continue;
+            }
+            leaked_with_intents = true;
             let intent_count = frame.unreported();
             if intent_count == 0 {
                 continue;
@@ -286,14 +322,15 @@ pub(super) fn open_frame(conn: &Connection) -> u64 {
                  holds deferred escalations (leaked or unsettled transaction)"
             );
         }
-        if stale {
+        if leaked_with_intents {
             debug_assert!(false, "#4116: stale escalation frame on this database");
         }
         frames.0.push(TxnFrame {
             id,
             db_path,
-            conn_addr: std::ptr::from_ref(conn).addr(),
+            conn_addr,
             deferred: Vec::new(),
+            stale: false,
             reported: 0,
             anchor: crate::governance::audit::PendingAuditAnchor::none(),
         });
@@ -378,15 +415,16 @@ pub(super) fn settle_frame(
     outcomes
 }
 
-/// Hand `intent` to the innermost write transaction open on THIS thread
-/// against `db_path`, to be queued on that transaction's connection when it
-/// ends.
+/// Test primitive: hand `intent` to the innermost write transaction open on
+/// THIS thread against `db_path`. Production code routes through
+/// [`defer_or_queue`], which also proves that the frame is live.
 ///
 /// # Errors
 ///
-/// Returns `intent` unchanged when no such transaction is open (the caller
-/// then queues it itself, immediately).
-pub fn defer_to_open_txn(
+/// Returns `intent` unchanged when no such transaction is open or when the
+/// innermost one is stale (#8662).
+#[cfg(test)]
+pub(crate) fn defer_to_open_txn(
     db_path: Option<&str>,
     intent: DeferredEscalation,
 ) -> std::result::Result<(), DeferredEscalation> {
@@ -401,6 +439,154 @@ pub fn defer_to_open_txn(
             .rev()
             .find(|f| f.db_path.as_deref() == Some(db_path))
         {
+            Some(frame) if !frame.stale => {
+                frame.deferred.push(intent);
+                Ok(())
+            }
+            _ => Err(intent),
+        }
+    })
+}
+
+/// `busy_timeout` (ms) for the #8662 liveness probe: never wait.
+const PROBE_BUSY_TIMEOUT_MS: i64 = 0;
+/// SQLite pragma the liveness probe saves, zeroes and restores.
+const PRAGMA_BUSY_TIMEOUT: &str = "busy_timeout";
+
+/// Where an escalation routed on a connection goes (#8662).
+enum Route {
+    /// No usable frame: write the pending row now on the routing connection.
+    QueueNow,
+    /// Hand it to the live frame with this id.
+    Defer(u64),
+    /// A frame on ANOTHER connection is open on this database and the routing
+    /// connection is in autocommit: probe the write lock to see whether that
+    /// frame is still live.
+    Probe(u64),
+}
+
+/// Result of the non-blocking `BEGIN IMMEDIATE` probe.
+enum WriteLock {
+    /// The probe holds the write lock (its transaction is OPEN on `conn`):
+    /// no other connection has a write transaction on this database.
+    Acquired,
+    /// Another connection holds the write lock.
+    Held,
+}
+
+fn classify_route(conn: &Connection) -> Route {
+    let Some(db_path) = conn.path().filter(|p| !p.is_empty()) else {
+        return Route::QueueNow;
+    };
+    let conn_addr = std::ptr::from_ref(conn).addr();
+    TXN_FRAMES.with(|frames| {
+        let mut frames = frames.borrow_mut();
+        let Some(frame) = frames
+            .0
+            .iter_mut()
+            .rev()
+            .find(|f| f.db_path.as_deref() == Some(db_path))
+        else {
+            return Route::QueueNow;
+        };
+        if frame.stale {
+            // Every older frame on this database is dead too: a live one
+            // would have refused the BEGIN that this newer frame recorded.
+            return Route::QueueNow;
+        }
+        match (frame.conn_addr == conn_addr, conn.is_autocommit()) {
+            // The frame's own connection has no transaction open: the frame
+            // ended without being settled.
+            (true, true) => {
+                frame.stale = true;
+                Route::QueueNow
+            }
+            (true, false) => Route::Defer(frame.id),
+            (false, true) => Route::Probe(frame.id),
+            // The router is inside a transaction of its own; liveness cannot
+            // be probed without nesting, so the #4116 deferral stands.
+            (false, false) => Route::Defer(frame.id),
+        }
+    })
+}
+
+/// Non-blocking `BEGIN IMMEDIATE` on `conn` (which is in autocommit). On
+/// [`WriteLock::Acquired`] the transaction is left OPEN for the caller.
+fn probe_write_lock(conn: &Connection) -> rusqlite::Result<WriteLock> {
+    let prior: i64 = conn.pragma_query_value(None, PRAGMA_BUSY_TIMEOUT, |r| r.get(0))?;
+    conn.pragma_update(None, PRAGMA_BUSY_TIMEOUT, PROBE_BUSY_TIMEOUT_MS)?;
+    let begun = conn.execute_batch(super::connection::SQL_BEGIN_IMMEDIATE);
+    if let Err(error) = conn.pragma_update(None, PRAGMA_BUSY_TIMEOUT, prior) {
+        // Degrades only contention handling on this connection (it now fails
+        // fast instead of retrying); every such failure is still surfaced.
+        tracing::error!(%error, prior, "#8662: busy_timeout not restored after the frame probe");
+    }
+    match begun {
+        Ok(()) => Ok(WriteLock::Acquired),
+        Err(rusqlite::Error::SqliteFailure(failure, _))
+            if matches!(
+                failure.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            ) =>
+        {
+            Ok(WriteLock::Held)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn insert_intent(conn: &Connection, intent: &DeferredEscalation) -> Result<()> {
+    insert_pending_action_row(
+        conn,
+        &intent.pending_id,
+        intent.action,
+        &intent.namespace,
+        intent.memory_id.as_deref(),
+        &intent.requested_by,
+        &intent.payload,
+    )
+}
+
+/// Write `intent` inside the probe transaction `conn` holds, then COMMIT.
+/// The row either exists when this returns `Ok`, or the error is returned and
+/// the probe transaction is rolled back.
+fn insert_in_probe_txn(conn: &Connection, intent: &DeferredEscalation) -> Result<()> {
+    let written = insert_intent(conn, intent).and_then(|()| {
+        conn.execute_batch(super::connection::SQL_COMMIT)
+            .map_err(anyhow::Error::from)
+    });
+    if written.is_err()
+        && !conn.is_autocommit()
+        && let Err(error) = conn.execute_batch(super::connection::SQL_ROLLBACK)
+    {
+        tracing::error!(%error, "#8662: ROLLBACK of the frame probe transaction failed");
+    }
+    written
+}
+
+fn mark_db_frames_stale(db_path: Option<&str>) {
+    TXN_FRAMES.with(|frames| {
+        for frame in &mut frames.borrow_mut().0 {
+            if frame.db_path.as_deref() == db_path {
+                frame.stale = true;
+            }
+        }
+    });
+}
+
+/// Push `intent` into frame `frame_id`, or give it back when that frame is
+/// gone or has gone stale.
+fn push_to_frame(
+    frame_id: u64,
+    intent: DeferredEscalation,
+) -> std::result::Result<(), DeferredEscalation> {
+    TXN_FRAMES.with(|frames| {
+        match frames
+            .borrow_mut()
+            .0
+            .iter_mut()
+            .find(|f| f.id == frame_id && !f.stale)
+        {
             Some(frame) => {
                 frame.deferred.push(intent);
                 Ok(())
@@ -408,6 +594,42 @@ pub fn defer_to_open_txn(
             None => Err(intent),
         }
     })
+}
+
+/// #4116 / #8662 - route an escalation `intent` raised on `conn`. When THIS
+/// thread holds a LIVE write transaction on the same database, the intent is
+/// deferred to it and lands on that transaction's connection when it ends.
+/// Otherwise the pending row is written now. A frame left behind by a leaked
+/// `WriteTxn` never takes the intent (module doc, "Leaked frames").
+///
+/// `Ok` means the row exists, or the intent is held by a frame that will
+/// settle it ([`is_deferred`] tells which).
+///
+/// # Errors
+///
+/// The queue write or the liveness probe failed: no row exists and no frame
+/// holds the intent.
+pub fn defer_or_queue(conn: &Connection, intent: DeferredEscalation) -> Result<()> {
+    let intent = match classify_route(conn) {
+        Route::QueueNow => intent,
+        Route::Defer(frame_id) => match push_to_frame(frame_id, intent) {
+            Ok(()) => return Ok(()),
+            Err(intent) => intent,
+        },
+        Route::Probe(frame_id) => match probe_write_lock(conn)? {
+            WriteLock::Acquired => {
+                // Nothing holds the write lock, so every frame on this
+                // database on this thread is dead.
+                mark_db_frames_stale(conn.path().filter(|p| !p.is_empty()));
+                return insert_in_probe_txn(conn, &intent);
+            }
+            WriteLock::Held => match push_to_frame(frame_id, intent) {
+                Ok(()) => return Ok(()),
+                Err(intent) => intent,
+            },
+        },
+    };
+    insert_intent(conn, &intent)
 }
 
 /// #7241 - hand a signed-event append's pending audit anchor to the owner of
@@ -430,12 +652,25 @@ pub fn defer_audit_anchor(conn: &Connection, anchor: crate::governance::audit::P
         return;
     }
     let conn_addr = std::ptr::from_ref(conn).addr();
+    let conn_path = conn.path().filter(|p| !p.is_empty());
     let unowned = TXN_FRAMES.with(|frames| {
         let mut frames = frames.borrow_mut();
         match frames.0.iter_mut().rev().find(|f| f.conn_addr == conn_addr) {
-            Some(frame) => {
+            Some(frame)
+                if !frame.stale
+                    && !conn.is_autocommit()
+                    && frame.db_path.as_deref() == conn_path =>
+            {
                 frame.anchor = std::mem::take(&mut frame.anchor).merge(anchor);
                 None
+            }
+            // #8662 - a frame at this address whose connection is in
+            // autocommit, or that is on another database (a dropped
+            // connection's address reused), is leaked. The anchor never
+            // joins it, because a dead frame never emits.
+            Some(frame) => {
+                frame.stale = true;
+                Some(anchor)
             }
             None => Some(anchor),
         }
