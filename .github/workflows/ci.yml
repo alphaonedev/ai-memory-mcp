@@ -1638,6 +1638,12 @@ jobs:
             echo "::error::enterprise-fed leg on $RUNNER_NAME is missing $url_file — the native pg tier URL is not provisioned on this node"
             exit 1
           fi
+          # #8686 - authenticate with exactly this file first, so a role password that drifted from it reds the
+          # leg with the distinct reason "tier credential mismatch" (its own ::error:: line), not as a generic
+          # CREATE DATABASE failure. Password via PGPASSWORD only; psql stderr is never echoed.
+          if ! python3 -I scripts/ci/tier_cred_preflight.py --url-file "$url_file"; then
+            exit 1
+          fi
           base_url="$(cat "$url_file")"
           # Unique db name: valid pg identifier (lowercase, [a-z0-9_], <=59
           # bytes: 63 minus the `_tpl` suffix, i.e. IDENT_MAX - len(TEMPLATE_SUFFIX)
@@ -2490,7 +2496,11 @@ jobs:
             echo "::error::cargo-audit ${CARGO_AUDIT_VERSION} is not the installed version"
             exit 1
           fi
-          cargo audit --deny warnings
+          python3 -m unittest discover -s scripts/ci/tests -p test_check_cargo_audit_8615.py
+          # Cross-check .cargo/audit.toml with .cargo/audit-exceptions.toml.
+          # The gate prints its summary and every public identity diagnostic;
+          # cargo-audit JSON and external stderr remain captured inside it.
+          python3 scripts/ci/check_cargo_audit.py
 
       # CI-speed: the release build here is only a release-PROFILE compile
       # smoke (opt-level + thin-LTO). The distributable per-OS artifacts are

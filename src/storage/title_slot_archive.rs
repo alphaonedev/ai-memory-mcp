@@ -150,3 +150,17 @@ pub(super) fn probe_federation_merge_preimage(
     .optional()
     .map_err(Into::into)
 }
+
+// v100 (#3690 / #3695 / #3699): the (title, namespace) unique index becomes
+// PARTIAL — tombstoned rows give up their slot so a later store of the same
+// title lands as a fresh, visible row instead of inside the hidden one. The
+// postgres twin is `PostgresStore::migrate_v100`.
+const MIGRATION_V100_SQLITE: &str =
+    include_str!("../../migrations/sqlite/0084_v100_title_slot_live_rows.sql");
+
+pub(super) fn migrate_v100(conn: &Connection) -> Result<()> {
+    conn.execute_batch(MIGRATION_V100_SQLITE)?;
+    conn.execute(super::migrations::SQL_CLEAR_SCHEMA_VERSION, [])?;
+    conn.execute("INSERT INTO schema_version (version) VALUES (100)", [])?;
+    Ok(())
+}

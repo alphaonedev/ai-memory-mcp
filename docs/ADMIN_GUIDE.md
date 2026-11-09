@@ -48,7 +48,7 @@ Run the HTTP daemon directly in the foreground:
 ai-memory --db /path/to/ai-memory.db serve
 ```
 
-The daemon listens on `127.0.0.1:9077` by default and exposes 103 HTTP route registrations (89 unique URL paths) (canonical count on the [evidence page](https://alphaonedev.github.io/ai-memory-mcp/evidence.html)).
+The daemon listens on `127.0.0.1:9077` by default and exposes 105 HTTP route registrations (91 unique URL paths) (canonical count on the [evidence page](https://alphaonedev.github.io/ai-memory-mcp/evidence.html)).
 
 ### Systemd (Production HTTP Daemon)
 
@@ -891,17 +891,29 @@ See [Database Management → Backup](#backup) and [Database Management → Resto
 
 ## Graceful Shutdown
 
-The HTTP daemon handles SIGINT (Ctrl+C) gracefully:
+The HTTP daemon handles SIGINT (Ctrl+C) and SIGTERM gracefully, through the
+same path (#8193):
 
 1. Stops accepting new connections
 2. Waits for in-flight requests to complete
 3. Checkpoints the WAL (`PRAGMA wal_checkpoint(TRUNCATE)`)
 4. Exits cleanly
 
-For systemd, use `KillSignal=SIGINT` and `TimeoutStopSec=90`. This covers the
-default 30-second HTTP request grace period plus the bounded background-writer,
-webhook-delivery, deferred-audit drain, and final witness/checkpoint phases,
-leaving time for the visible exit-75 failure path.
+SIGTERM is the default signal of `systemctl stop` and `docker stop`; the
+Dockerfile sets `STOPSIGNAL SIGTERM`. The in-flight request grace is
+`--shutdown-grace-secs`. A failed signal registration is logged at `error`
+level and is never read as a stop; but that signal then has no handler, so it
+terminates the daemon at once, without a graceful drain. Stop the daemon with
+the other signal, or fix the host. For systemd, `KillSignal=SIGINT` (or the
+default SIGTERM) and `TimeoutStopSec=90` both work.
+
+The stop budget is one number, 90 seconds, for every supervisor:
+`TimeoutStopSec=90` (systemd), `docker stop -t 90` and `stop_grace_period: 90s`
+(compose). It covers the default 30-second HTTP request grace period plus the
+bounded background-writer, webhook-delivery, deferred-audit drain, and final
+witness/checkpoint phases, leaving time for the visible exit-75 failure path.
+The Docker default of 10 seconds is shorter and sends SIGKILL mid-drain, so set
+it. Raise all of them together if you raise `--shutdown-grace-secs`.
 
 If the webhook-delivery drain misses its 30-second budget, webhook
 deliveries that had not started yet are recorded to the subscription DLQ
@@ -912,7 +924,7 @@ crash or `SIGKILL` skips this step: webhook deliveries that had not started
 are lost, and neither replay nor the DLQ shows them. Use the graceful stop
 path above.
 
-> **Note:** The HTTP daemon handles SIGINT (Ctrl+C) gracefully with WAL checkpoint. Systemd sends SIGTERM by default -- the service file sets `KillSignal=SIGINT` to ensure clean shutdown.
+> **Note:** SIGINT and SIGTERM both drain and checkpoint the WAL before exit 0. `wake-hub`, `wake-listen`, `watch`, `curator` and `sync-daemon` use the same shared stop primitive.
 
 The daemon exits with status **75 (`EX_TEMPFAIL`)** when it cannot certify a
 safe shutdown or safely drop its Tokio runtime. Before final certification,
@@ -1786,7 +1798,7 @@ Both are cleaned up on graceful shutdown (the daemon runs `PRAGMA wal_checkpoint
 
 Maximum request body size: **2 MiB** (`HTTP_BODY_LIMIT_BYTES` in `src/lib.rs`).
 
-The HTTP daemon exposes **103 production `.route(...)` registrations / 89 unique URL paths** (canonical count via codegraph `codegraph_search kind=route limit=103` filtered to `src/lib.rs` excluding the `#[cfg(test)]`-gated test-only routes; multi-line-aware path extraction via `awk '/\.route\(/{in=1}in&&/"\/[^"]*"/{match($0,/"\/[^"]*"/);print substr($0,RSTART,RLENGTH);in=0}' src/lib.rs | sort -u`. The table below lists the high-traffic surfaces — see [`docs/API_REFERENCE.md`](API_REFERENCE.html) for the complete enumeration):
+The HTTP daemon exposes **105 production `.route(...)` registrations / 91 unique URL paths** (canonical count via codegraph `codegraph_search kind=route limit=105` filtered to `src/lib.rs` excluding the `#[cfg(test)]`-gated test-only routes; multi-line-aware path extraction via `awk '/\.route\(/{in=1}in&&/"\/[^"]*"/{match($0,/"\/[^"]*"/);print substr($0,RSTART,RLENGTH);in=0}' src/lib.rs | sort -u`. The table below lists the high-traffic surfaces — see [`docs/API_REFERENCE.md`](API_REFERENCE.html) for the complete enumeration):
 
 | Method | Path | Description |
 |--------|------|-------------|

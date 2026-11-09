@@ -20,7 +20,7 @@
 //! each shape, names the real host, and never echoes the userinfo.
 //! RED on `1ec64196b` (every `insert` below succeeded), GREEN on the fix.
 
-#![cfg(feature = "sal")]
+//! Runs under default features as well as SAL: registration is unconditional.
 
 use ai_memory::subscriptions::{NewSubscription, insert, list};
 use rusqlite::Connection;
