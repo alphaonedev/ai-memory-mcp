@@ -32,10 +32,11 @@ EXCEPTIONS = [
     {"id": "RUSTSEC-2024-0449", "package": "unsafe-libyaml", "version": "0.2.11",
      "issue": 8476, "expires": date(2027, 2, 3), "reason": "YAML parser replacement tracked."},
 ]
-# #8695: tracked in the policy files only; the report fixtures predate the advisory.
-POLICY_ONLY_8695 = ("RUSTSEC-2026-0459", "libsqlite3-sys", "0.30.1", 8695)
+# #8695 (CI red) is resolved here; the exception tracks the removal issue #8696 (code guard #8697).
+# Policy files only; the report fixtures predate the advisory.
+POLICY_ONLY_8695 = ("RUSTSEC-2026-0459", "libsqlite3-sys", "0.30.1", 8696)
 REASON_TERMS_8695 = ("-wal", "page size", "migrate --from", "restore", "local", "links", "sqlcipher",
-                     "libsqlite3-sys >= 0.39", "Not mitigated")
+                     "libsqlite3-sys >= 0.39", "Not mitigated", "#8696", "#8697", "--db")
 
 
 def policy_documents(ignored=None, entries=None):
