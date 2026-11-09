@@ -80,7 +80,7 @@ This page is the engineering-precise primer. The procurement-level
 introduction lives in [`v0.7.0/release-notes.md`](v0.7.0/release-notes.html).
 The CHANGELOG block sits under v0.7.0 in [`../CHANGELOG.md`](../CHANGELOG.md).
 The category-level comparison against other agent-memory projects
-(mem0, Letta, Tencent TencentDB Agent Memory, etc.) lives in
+(mem0, Letta, System Y, etc.) lives in
 [`positioning.md`](positioning.html).
 
 ## Conceptual model

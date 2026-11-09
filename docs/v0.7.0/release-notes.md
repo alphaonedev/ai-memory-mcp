@@ -330,7 +330,7 @@ and
 
 The historical Ollama-only LLM client is now a **provider-agnostic LLM
 substrate**. Every tier (keyword / semantic / smart / autonomous) can
-speak to any vendor — one code path, two wire shapes, fifteen
+speak to any vendor — one code path, two wire shapes, eleven
 pre-configured vendor aliases.
 
 **Wire shapes:**
@@ -703,7 +703,7 @@ Three v0.7.0 postures flip from v0.6.x fail-open behaviour to v0.7.0 fail-CLOSED
 - **#1055 passphrase_from_file rejects lax permissions** (commit [`0ef54ae64`](https://github.com/alphaonedev/ai-memory-mcp/commit/0ef54ae64)) — see Operator advisories.
 - **#1057 + #1058 + #1059 MCP wire honesty trio — token budget + default:null strip + overlay parity** (commit [`357b40873`](https://github.com/alphaonedev/ai-memory-mcp/commit/357b40873)).
 - **#1060 + #1062 constant_time_eq no len leak + for_admin_checked typed gate** (commit [`2c7356ca1`](https://github.com/alphaonedev/ai-memory-mcp/commit/2c7356ca1)).
-- **#1066 + #1067 provider-agnostic LLM substrate** (commit [`b8d94a89e`](https://github.com/alphaonedev/ai-memory-mcp/commit/b8d94a89e)). Every tier × every vendor (15 OpenAI-compatible aliases + Ollama).
+- **#1066 + #1067 provider-agnostic LLM substrate** (commit [`b8d94a89e`](https://github.com/alphaonedev/ai-memory-mcp/commit/b8d94a89e)). Every tier × every vendor (11 OpenAI-compatible aliases + Ollama).
 - **#1068 + #1070 mobile target CI** (commits [`29fef82aa`](https://github.com/alphaonedev/ai-memory-mcp/commit/29fef82aa) + [`6f4584daf`](https://github.com/alphaonedev/ai-memory-mcp/commit/6f4584daf)).
 
 ### MEDIUM — postgres parity, audit-trail hygiene, performance
@@ -1641,8 +1641,8 @@ folded into the v0.7.0 tag rather than slipping to v0.7.1:
     MCP tools, substrate `storage::insert` pre-write hook. Doc:
     [`docs/policy-engine.md`](../policy-engine.html) +
     [`docs/governance/agent-action-rules.md`](../governance/agent-action-rules.html).
-- **QW (Tencent quick-wins).** Four QW items are referenced in the
-  Tencent positioning work; **three carry code (QW-1/QW-2/QW-3); QW-4
+- **QW (System Y quick-wins).** Four QW items are referenced in the
+  System Y positioning work; **three carry code (QW-1/QW-2/QW-3); QW-4
   is a docs-only deliverable** (competitive positioning page +
   landscape comparison, no substrate or wire-surface change). Per
   [`docs/internal/v070-ship-readiness-adrs.md` ADR-1](../internal/v070-ship-readiness-adrs.html#adr-1--qw-4-disposition-docs-only-no-code-feature).
@@ -1659,11 +1659,11 @@ folded into the v0.7.0 tag rather than slipping to v0.7.1:
     addressable blob store with a background TTL sweep. Doc:
     [`docs/context-offload.md`](../context-offload.html). Cookbook:
     `cookbook/context-offload/`.
-  - **QW-4** *(docs-only — competitive positioning)* — Tencent
+  - **QW-4** *(docs-only — competitive positioning)* — System Y
     landscape page at [`docs/positioning.md`](../positioning.html).
     Not a code feature; included for inventory completeness so a
     procurement reader counting "QW items shipped" against the
-    Tencent analysis sees the same denominator.
+    System Y analysis sees the same denominator.
 - **Reconciliation security sweep (11 late-cycle commits, merged
   into trunk at `64528b1`).** K9 governance gate on `handle_kg_invalidate`
   (`a41c08f`), K10 SSE `host:` prefix bypass (`7496a6e`), K10 HMAC

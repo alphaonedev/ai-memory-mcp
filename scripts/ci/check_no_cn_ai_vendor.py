@@ -37,7 +37,13 @@ VENDOR_TERMS_ROT13 = (
     "qrrcfrrx", "djra", "xvzv", "zvavznk", "muvch",
     "pungtyz", "onvpuhna", "qbhonb", "reavr", "uhalhna", "fgrcsha",
     "vagreayz", "qfu", "qnfufpbcr",
+    "graprag", "grapragqo", "ibypratvar", "bcraivxvat", "ivxvatqo", "nyvonon",
+    "rirezvaq",
 )
+# Exact-case names (ROT13): common words in any other case.
+CASE_SENSITIVE_ROT13 = ("ZrzBF", "ZvZb")
+# Dotted domain-style name (ROT13).
+DOTTED_ROT13 = "m.nv"
 # The one family with an allowlisted testing exception (ROT13).
 FLASH_FAMILY_ROT13 = "tyz"
 # Patterns that need more than a bare word (ROT13 fragments).
@@ -76,6 +82,11 @@ def build_patterns():
     patterns.append((zero, re.compile(r"(?<![\w.])" + re.escape(zero) + TRAIL, re.I)))
     yi = decode(YI_LARGE_ROT13)
     patterns.append((yi, re.compile(LEAD + re.escape(yi) + TRAIL, re.I)))
+    for stored in CASE_SENSITIVE_ROT13:
+        name = decode(stored)
+        patterns.append((name, re.compile(LEAD + re.escape(name) + TRAIL)))
+    dotted = decode(DOTTED_ROT13)
+    patterns.append((dotted, re.compile(r"(?<![\w.])" + re.escape(dotted) + TRAIL, re.I)))
     return patterns
 
 

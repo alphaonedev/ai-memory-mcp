@@ -92,7 +92,7 @@ into `release/v0.7.0` ahead of the tag cut.
   closeout.** All 7 forms IMPLEMENTED at HEAD `c9472c1`. See
   [`docs/internal/batman-framework-audit.md`](docs/internal/batman-framework-audit.md)
   (prologue covers the post-audit Forms wave).
-- **QW-1/2/3 (Tencent quick-wins).** File-backed reflection export,
+- **QW-1/2/3 (System Y quick-wins).** File-backed reflection export,
   persona-as-artifact, context-offload primitive.
 - **Substrate trust.** Per-agent Ed25519 attestation, append-only
   `signed_events` audit table, V-4 cross-row hash chain (`prev_hash`

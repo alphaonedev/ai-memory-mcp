@@ -2420,7 +2420,7 @@ pub(crate) fn is_link_local_or_special(ip: IpAddr) -> bool {
 /// (169.254.169.254 is already link-local, fd00:ec2::254 already ULA); this
 /// is a NEW predicate the internal-only egress classifier consults so a
 /// metadata literal is refused even when it falls inside an otherwise-allowed
-/// range — notably `100.100.100.200` (Alibaba metadata) is inside the CGNAT
+/// range — notably `100.100.100.200` (cloud provider metadata) is inside the CGNAT
 /// /10, so "metadata beats CGNAT". Input is `normalize_ip`'d.
 pub(crate) fn is_metadata_literal(ip: IpAddr) -> bool {
     match ip {

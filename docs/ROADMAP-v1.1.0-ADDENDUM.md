@@ -7,9 +7,9 @@
 >
 > **Date:** 2026-09-27. Prepared from the dated audit series; the binding North Star synthesis and read-only issue refresh were completed on 2026-09-28 UTC. This is an advice date, not a claim that later evidence existed on September 27.
 >
-> **Provenance:** [#4055](https://github.com/alphaonedev/ai-memory-mcp/issues/4055) competitor 3×7; OpenViking 3×3; US market 3×3; competitive-advantage 3×3; North Star 3×3. All used the operator-designated **Codex gpt-6-astra high** configuration. ai-memory navigation used **CodeGraph on release/v1.0.0**, with authoritative source read through `git show origin/release/v1.0.0:<path>` and compared with code pin **`a1403c742f9d590a08b6fd170deec5f50ca8e940`**. Same-model review ballots are not independent empirical replications.
+> **Provenance:** [#4055](https://github.com/alphaonedev/ai-memory-mcp/issues/4055) competitor 3×7; System X 3×3; US market 3×3; competitive-advantage 3×3; North Star 3×3. All used the operator-designated **Codex gpt-6-astra high** configuration. ai-memory navigation used **CodeGraph on release/v1.0.0**, with authoritative source read through `git show origin/release/v1.0.0:<path>` and compared with code pin **`a1403c742f9d590a08b6fd170deec5f50ca8e940`**. Same-model review ballots are not independent empirical replications.
 
-Review documents: [competitor assessment](reviews/COMPETITOR-ASSESSMENT-3x7-2026-09-27.md), [ai-memory vs OpenViking](reviews/AI-MEMORY-VS-OPENVIKING-3x3-CODE-LEVEL-2026-09-27.md), [US agent-memory market audit](reviews/US-AGENT-MEMORY-MARKET-3x3-AUDIT-2026-09-27.md). Binding inputs: North Star Part III ([published review](reviews/US-AGENT-MEMORY-MARKET-3x3-AUDIT-2026-09-27.md#part-iii-north-star-ranking-and-v110-recommendations)), North Star TALLY.json (unpublished input; [publication provenance](#publication-provenance)). Supporting audit: competitive advantages, including downgraded claims ([published review](reviews/US-AGENT-MEMORY-MARKET-3x3-AUDIT-2026-09-27.md#5-not-real--downgraded-claims)) and its binding tally (unpublished input; [publication provenance](#publication-provenance)). Review links resolve within this repository; unpublished inputs have the limitation stated above.
+Review documents: [competitor assessment](reviews/COMPETITOR-ASSESSMENT-3x7-2026-09-27.md), [ai-memory vs System X](reviews/AI-MEMORY-VS-SYSTEM-X-3x3-CODE-LEVEL-2026-09-27.md), [US agent-memory market audit](reviews/US-AGENT-MEMORY-MARKET-3x3-AUDIT-2026-09-27.md). Binding inputs: North Star Part III ([published review](reviews/US-AGENT-MEMORY-MARKET-3x3-AUDIT-2026-09-27.md#part-iii-north-star-ranking-and-v110-recommendations)), North Star TALLY.json (unpublished input; [publication provenance](#publication-provenance)). Supporting audit: competitive advantages, including downgraded claims ([published review](reviews/US-AGENT-MEMORY-MARKET-3x3-AUDIT-2026-09-27.md#5-not-real--downgraded-claims)) and its binding tally (unpublished input; [publication provenance](#publication-provenance)). Review links resolve within this repository; unpublished inputs have the limitation stated above.
 
 **Decision advised:** complete the binding **41 MUST-V1.1** packages; retain **2 SHOULD-V1.1**, **11 LATER**, **1 NO**, and **15 NO-CONSENSUS** exactly as tallied. These are 70 decision rows, not 134 separate delivery commitments: the 64 source proposals absent from the tally have the ownership crosswalk in Part III §III.5 ([published review](reviews/US-AGENT-MEMORY-MARKET-3x3-AUDIT-2026-09-27.md#iii5--should-v11-later-no-cut-and-unresolved-decisions)). A missing vote is not adoption. Every proposed acceptance gate in this addendum is **NOT RUN / UNPROVEN**. No new product benchmark or certification was performed for this document.
 
@@ -59,7 +59,7 @@ The following numbers are the binding tally, not a new rating. Scale: 0 absent i
 | KIP / LDC Labs | 2 | 2 | 0 | 2 | 2 | 2 | n/a | 2 | 2 | 2 | 3 | 1 | 20 |
 | mem0 / OpenMemory | 2 | 2 | 0 | 2 | 2 | 2 | n/a | 2 | 2 | 2 | 2 | 2 | 20 |
 | cognee | 2 | 1 | 0 | 2 | 2 | 2 | 2 | 2 | 1 | 2 | 2.0 | 1.5 | 19.5 |
-| OpenViking | 2 | 1 | 0 | 2 | 2 | 2 | 1.5 | 2 | 1 | 2 | 2.0 | 1 | 18.5 |
+| System X | 2 | 1 | 0 | 2 | 2 | 2 | 1.5 | 2 | 1 | 2 | 2.0 | 1 | 18.5 |
 | Haystack | 1.0 | 1 | 0 | 1 | 1 | 2 | 1 | 2 | 1.0 | 1 | 2.0 | 1.5 | 14.5 |
 
 ai-memory ranks first by the supplied TOTAL, **21**; no primary criterion scores above **2**. Its narrow signed-author, capability-attenuation, identity and wake-admission mechanisms are defensible architectural advantages. They do not close the following defects. The competitive-advantage tally contains **zero NOT-REAL facets** among 182 inventoried mechanisms; the audit separately rejects inflated end-to-end guarantees. Advantage audit §§2,5 ([published review](reviews/US-AGENT-MEMORY-MARKET-3x3-AUDIT-2026-09-27.md#part-ii-ai-memory-competitive-advantage-at-code-level)).
@@ -68,16 +68,16 @@ ai-memory ranks first by the supplied TOTAL, **21**; no primary criterion scores
 |---|---|---|
 | DI1 — 2 | Tied maximum, not universal losslessness. Mem0 ADD-only and MemPalace searchable originals expose the failed-summary gap. | P3-08/19/22; [behind table](reviews/COMPETITOR-ASSESSMENT-3x7-2026-09-27.md#where-ai-memory-is-behind); [#4091](https://github.com/alphaonedev/ai-memory-mcp/issues/4091), [#4063](https://github.com/alphaonedev/ai-memory-mcp/issues/4063). |
 | DI2 — 2 | Tied maximum with KIP and others. Transactions do not make a semantic replacement safe or a fleet quorum atomic. | P3-01/14/15; advantage audit §5 ([published review](reviews/US-AGENT-MEMORY-MARKET-3x3-AUDIT-2026-09-27.md#5-not-real--downgraded-claims)); [#4053](https://github.com/alphaonedev/ai-memory-mcp/issues/4053), [#4034](https://github.com/alphaonedev/ai-memory-mcp/issues/4034). |
-| DI3 — 2 | Above OpenViking/cognee's scored record-signature support; tied maximum with Vestige and ContextLattice. Successful writes can still lack evidence. | P3-06/07/17; [US audit §6](reviews/US-AGENT-MEMORY-MARKET-3x3-AUDIT-2026-09-27.md#6-differentiators-under-adversarial-review); [#4000](https://github.com/alphaonedev/ai-memory-mcp/issues/4000), [#4021](https://github.com/alphaonedev/ai-memory-mcp/issues/4021), [#4086](https://github.com/alphaonedev/ai-memory-mcp/issues/4086). |
-| SE1 — 2 | Tied maximum; OpenViking leads enterprise identity/ACL integration. Empty enrollment and private fan-out defeat blanket isolation. | P3-02/03/04; [OpenViking K07/K08](reviews/AI-MEMORY-VS-OPENVIKING-3x3-CODE-LEVEL-2026-09-27.md#identity-and-authorization--k07k08-openviking-stronger-each-33); [#4059](https://github.com/alphaonedev/ai-memory-mcp/issues/4059), [#4069](https://github.com/alphaonedev/ai-memory-mcp/issues/4069), [#4066](https://github.com/alphaonedev/ai-memory-mcp/issues/4066). |
+| DI3 — 2 | Above System X/cognee's scored record-signature support; tied maximum with Vestige and ContextLattice. Successful writes can still lack evidence. | P3-06/07/17; [US audit §6](reviews/US-AGENT-MEMORY-MARKET-3x3-AUDIT-2026-09-27.md#6-differentiators-under-adversarial-review); [#4000](https://github.com/alphaonedev/ai-memory-mcp/issues/4000), [#4021](https://github.com/alphaonedev/ai-memory-mcp/issues/4021), [#4086](https://github.com/alphaonedev/ai-memory-mcp/issues/4086). |
+| SE1 — 2 | Tied maximum; System X leads enterprise identity/ACL integration. Empty enrollment and private fan-out defeat blanket isolation. | P3-02/03/04; [System X K07/K08](reviews/AI-MEMORY-VS-SYSTEM-X-3x3-CODE-LEVEL-2026-09-27.md#identity-and-authorization--k07k08-system_x-stronger-each-33); [#4059](https://github.com/alphaonedev/ai-memory-mcp/issues/4059), [#4069](https://github.com/alphaonedev/ai-memory-mcp/issues/4069), [#4066](https://github.com/alphaonedev/ai-memory-mcp/issues/4066). |
 | SE2 — 2 | Tied maximum, with unresolved policy-read/matcher/model-failure paths. No “all fail-closed” claim is earned. | P3-02/08/10, P2-35; [US gaps](reviews/US-AGENT-MEMORY-MARKET-3x3-AUDIT-2026-09-27.md#7-gaps-ai-memory-should-close); [#4043](https://github.com/alphaonedev/ai-memory-mcp/issues/4043), [#4042](https://github.com/alphaonedev/ai-memory-mcp/issues/4042), [#3986](https://github.com/alphaonedev/ai-memory-mcp/issues/3986). |
 | PF1 — 2 | Tied maximum. Per-child limits do not bound aggregate fan-out, replies or retention. | P3-30/22; [behind table](reviews/COMPETITOR-ASSESSMENT-3x7-2026-09-27.md#where-ai-memory-is-behind); [#4033](https://github.com/alphaonedev/ai-memory-mcp/issues/4033), [#3287](https://github.com/alphaonedev/ai-memory-mcp/issues/3287). |
 | PF2 — 1 | Trails cognee, Hindsight and other score-2 rows. Admission and quotas do not prove resistance to hostile aggregate work. | P3-29/30; Part III P3-30 ([published review](reviews/US-AGENT-MEMORY-MARKET-3x3-AUDIT-2026-09-27.md#p3-30)); [#4089](https://github.com/alphaonedev/ai-memory-mcp/issues/4089), [#4033](https://github.com/alphaonedev/ai-memory-mcp/issues/4033). |
-| PF3 — 1 | Trails OpenViking, Haystack, KIP/LDC Labs and others at 2. The recorded semantic-recall contention collapse remains a direct target. | P3-29; [#3335](https://github.com/alphaonedev/ai-memory-mcp/issues/3335), [#3341](https://github.com/alphaonedev/ai-memory-mcp/issues/3341), [#3342](https://github.com/alphaonedev/ai-memory-mcp/issues/3342); [root roadmap §11.9](../ROADMAP.md#119-v110--the-certification-release). |
+| PF3 — 1 | Trails System X, Haystack, KIP/LDC Labs and others at 2. The recorded semantic-recall contention collapse remains a direct target. | P3-29; [#3335](https://github.com/alphaonedev/ai-memory-mcp/issues/3335), [#3341](https://github.com/alphaonedev/ai-memory-mcp/issues/3341), [#3342](https://github.com/alphaonedev/ai-memory-mcp/issues/3342); [root roadmap §11.9](../ROADMAP.md#119-v110--the-certification-release). |
 | RL1 — 1 | Trails KIP/LDC Labs, mem0/OpenMemory and agentmemory rows at 2. MCP, skills, backup, graph and witness paths differ. | P3-28/27/39; [backend gaps](reviews/COMPETITOR-ASSESSMENT-3x7-2026-09-27.md#where-ai-memory-is-behind); [#4070](https://github.com/alphaonedev/ai-memory-mcp/issues/4070), [#4081](https://github.com/alphaonedev/ai-memory-mcp/issues/4081), [#3425](https://github.com/alphaonedev/ai-memory-mcp/issues/3425). |
-| RL2 — 2 | Tied maximum. OpenViking packaging, cognee migration refusal and ruflo backups supply useful narrower mechanisms. | P2-04, P3-21/36/37; [behind table](reviews/COMPETITOR-ASSESSMENT-3x7-2026-09-27.md#where-ai-memory-is-behind); [#4077](https://github.com/alphaonedev/ai-memory-mcp/issues/4077), [#4082](https://github.com/alphaonedev/ai-memory-mcp/issues/4082). |
+| RL2 — 2 | Tied maximum. System X packaging, cognee migration refusal and ruflo backups supply useful narrower mechanisms. | P2-04, P3-21/36/37; [behind table](reviews/COMPETITOR-ASSESSMENT-3x7-2026-09-27.md#where-ai-memory-is-behind); [#4077](https://github.com/alphaonedev/ai-memory-mcp/issues/4077), [#4082](https://github.com/alphaonedev/ai-memory-mcp/issues/4082). |
 | RL3 — 2 | Trails KIP/LDC Labs at 3. Endpoint custody is real; full disconnected staging and failure behavior are unqualified. | P3-41; [US endpoint limits](reviews/US-AGENT-MEMORY-MARKET-3x3-AUDIT-2026-09-27.md#6-differentiators-under-adversarial-review); [#3991](https://github.com/alphaonedev/ai-memory-mcp/issues/3991), [#4123](https://github.com/alphaonedev/ai-memory-mcp/issues/4123). |
-| EN1 — 2 | Tied maximum; OpenViking comparison favors the inspected network defaults, not universal compliance. Local inference and IPC remain gaps. | P3-11/12; [OpenViking K09](reviews/AI-MEMORY-VS-OPENVIKING-3x3-CODE-LEVEL-2026-09-27.md#encryption-in-transit--k09-ai-memory-stronger-33); [SECURITY.md](SECURITY.md#only-encrypted-data-in-transit-3705). |
+| EN1 — 2 | Tied maximum; System X comparison favors the inspected network defaults, not universal compliance. Local inference and IPC remain gaps. | P3-11/12; [System X K09](reviews/AI-MEMORY-VS-SYSTEM-X-3x3-CODE-LEVEL-2026-09-27.md#encryption-in-transit--k09-ai-memory-stronger-33); [SECURITY.md](SECURITY.md#only-encrypted-data-in-transit-3705). |
 
 **TABLE 5b — secondary anchor, condensed:** ai-memory M1=3, M2=2, M3=2, M4=2, M5=2, M6=1, M7=2; **M_TOTAL=14**. The weakest strategic claim is verified heterogeneous reflection. Model labels, different providers and different signing roles do not prove decorrelated training or errors. Independent role routing remains SHOULD; deterministic destructive clearance remains MUST. Part III TABLE 5b ([published review](reviews/US-AGENT-MEMORY-MARKET-3x3-AUDIT-2026-09-27.md#table-5b--secondary-moonshot-ranking-evidence)), [moonshot §2.6](strategy/moonshot-synthesis.md#26-bias-displaced-through-architectural-separation-of-powers).
 
@@ -140,19 +140,19 @@ Nothing below removes a binding MUST. CUT describes a proposed scope change, not
 | Existing item | Advice and reason | Acceptance / competitive claim gate |
 |---|---|---|
 | w5 MemTrapBench runner | RETAIN harness-first and real/stub separation. CUT any publication-set reselection to force “no-memory > memory.” [#3570](https://github.com/alphaonedev/ai-memory-mcp/issues/3570) requires frozen taxonomy/held-out hashes and null + oracle baselines. Calibrate on a disjoint set; an unexpected direction is a result, not permission to retune the test. | Unknown taxonomy fails; exact 1,050 synthetic cases and 350/150/350/200 split if that fixture is used. Both required backend cells execute for release. Real answerer/judge, frozen held-out test and P2-42 paired competitor gates; a structural harness pass earns no cognitive win. |
-| w1 applicability advisory + registered skill | RETAIN optional guidance and unknown-aware counts. DEFER any default flip or claimed trap mitigation until [#3570](https://github.com/alphaonedev/ai-memory-mcp/issues/3570) passes. | Golden outputs unchanged when off; all formats/backends tested when on. OpenViking/Haystack task superiority must pass P2-42, including no-memory/oracle controls. |
+| w1 applicability advisory + registered skill | RETAIN optional guidance and unknown-aware counts. DEFER any default flip or claimed trap mitigation until [#3570](https://github.com/alphaonedev/ai-memory-mcp/issues/3570) passes. | Golden outputs unchanged when off; all formats/backends tested when on. System X/Haystack task superiority must pass P2-42, including no-memory/oracle controls. |
 | w2 compact metadata | RETAIN seven-column visibility work and empty unknowns. CUT unmeasured token-saving/≤18-token claims; do not build a fourth wire format. | P3-13 digest/round-trip gate plus exact final serialized token accounting under P3-30; compare inline vs handles through [#3571](https://github.com/alphaonedev/ai-memory-mcp/issues/3571) before claiming savings against agentmemory/Haystack. |
 | w3 task/session boundary | RE-SCOPE to cross-session/source advice, as its text already qualifies. CUT claims that session inequality detects within-history task changes. | Unknown stamp omits verdict; rank unchanged for advice; both stores agree. Any task benefit must win P2-42 on the relevant within-history subset, not only a cross-session fixture. |
-| w4 feedback scope and damp | RETAIN authenticated-origin validation and default identity weights. DEFER tuning/default flip; a self-seeded wiring fixture proves plumbing only. | Full authoring truth table including Observation forgery; known/unknown scope controls; frozen held-out P3-39/P2-42 comparison against OpenViking/cognee/Haystack. |
+| w4 feedback scope and damp | RETAIN authenticated-origin validation and default identity weights. DEFER tuning/default flip; a self-seeded wiring fixture proves plumbing only. | Full authoring truth table including Observation forgery; known/unknown scope controls; frozen held-out P3-39/P2-42 comparison against System X/cognee/Haystack. |
 | w6 contested markers, weights, valid_at, sweep | RETAIN visibility and bounded off-hot-path work. CUT implied Safety-trap immunity; DEFER speculative weighting/sweep expansion before authoritative graph and scoring gates. | P3-20/P3-39 oracles; no LLM on recall hot path; absent contradiction is Unknown, not safe. Strict quality gain versus named retrieval rivals before a mitigation claim. |
-| w8 R1–R6 | RETAIN rig, source lineage, containment, stop/resume and forensic visibility. RE-SCOPE already-shipped primitives to residual tests; DEFER automatic truth elevation/default flips until measured. A signed model-family label does not certify independent training. | P2-31/P3-20/P2-42 plus SHOULD P1-12; publish SWARM-BENCH contamination, containment and rewind cost against KIP/ruflo/OpenViking. No code-presence or historical “no swarm rewind” sentence substitutes for rechecking the current pin. |
-| w7 docs truth | RETAIN sentence-scoped rule, attribution, normative scope note and enrollment. CUT any suggestion that prose enforcement mitigates runtime traps. | Every uncited/whitewashed/stub-backed claim plant fails; valid cited control passes. P3-34 compares planted-failure rejection against Haystack/OpenViking, explicitly an assurance comparison. |
+| w8 R1–R6 | RETAIN rig, source lineage, containment, stop/resume and forensic visibility. RE-SCOPE already-shipped primitives to residual tests; DEFER automatic truth elevation/default flips until measured. A signed model-family label does not certify independent training. | P2-31/P3-20/P2-42 plus SHOULD P1-12; publish SWARM-BENCH contamination, containment and rewind cost against KIP/ruflo/System X. No code-presence or historical “no swarm rewind” sentence substitutes for rechecking the current pin. |
+| w7 docs truth | RETAIN sentence-scoped rule, attribution, normative scope note and enrollment. CUT any suggestion that prose enforcement mitigates runtime traps. | Every uncited/whitewashed/stub-backed claim plant fails; valid cited control passes. P3-34 compares planted-failure rejection against Haystack/System X, explicitly an assurance comparison. |
 | Compatibility: additive/default-OFF/no schema migration | KEEP these rules for the existing advisory knobs. RE-SCOPE them for mandatory authority, commit, durability and EN1 contracts. Required repairs cannot ship as knowingly unsafe defaults. | Negative tests must fail in the claimed mission-critical configuration; named schema changes pass P3-21/36. Explicit version refusal and tested recovery replace silent wire/storage breakage. |
 | w5 PG soft skip / nightly never-required | KEEP advisory development runs distinct. CUT skip-as-release-pass. The expensive job need not run on every PR, but its digest-bound result must be required for a release claim. | Missing PG, model, competitor or fixture is INCOMPLETE/UNMEASURED; P3-28/P3-34 refuse certification with any missing required cell. |
-| Compatibility: “replicated ingest accepts peer rows verbatim” | RE-SCOPE to conservation of peer bytes under authenticated admission. Malformed or unauthorized peers do not bypass SE1/SE2; preserve rejected evidence only in an authorized bounded quarantine with an explicit receipt. | P3-13/15/17: zero accepted malformed security fields, zero silent discard, zero signature laundering; compare the same admitted transform trace against OpenViking/mem0/TencentDB-Agent-Memory. |
+| Compatibility: “replicated ingest accepts peer rows verbatim” | RE-SCOPE to conservation of peer bytes under authenticated admission. Malformed or unauthorized peers do not bypass SE1/SE2; preserve rejected evidence only in an authorized bounded quarantine with an explicit receipt. | P3-13/15/17: zero accepted malformed security fields, zero silent discard, zero signature laundering; compare the same admitted transform trace against System X/mem0/System Y. |
 | Root §11.9 OTLP and commercial entitlement | DEFER optional exporter breadth behind P3-38; preserve [#3800](https://github.com/alphaonedev/ai-memory-mcp/issues/3800). CUT any vendor remote kill dependency from core custody. Support entitlement remains outside local store/read/export/restore authority. | Optional telemetry overhead ≤5% with exact losses; P3-41 72-hour network denial and expiry/restart fixtures retain local custody. These are advice about release boundaries, not closure of commercial issues. |
 
-Broader scope stays at its binding disposition: OIDC/SCIM (P2-15), external KMS/HSM (P2-38), recipient E2EE (P1-19), standard A2A/framework adapters (P1-36/38), enterprise connectors (P1-40), multimodal ingestion (P1-41), federal authorization (P1-44), console (P1-47), review scheduling (P1-48), observer profiles (P1-49): **LATER**. Optional vector-backend proliferation **P1-50 is NO**. Full remote MCP **P1-35 is NO-CONSENSUS**, not a covert P3-42 dependency. Their individual named-rival re-entry tests remain in Part III §III.5 ([published review](reviews/US-AGENT-MEMORY-MARKET-3x3-AUDIT-2026-09-27.md#iii5--should-v11-later-no-cut-and-unresolved-decisions)). OpenViking's remote MCP and enterprise integration lead remains until corresponding tests actually pass.
+Broader scope stays at its binding disposition: OIDC/SCIM (P2-15), external KMS/HSM (P2-38), recipient E2EE (P1-19), standard A2A/framework adapters (P1-36/38), enterprise connectors (P1-40), multimodal ingestion (P1-41), federal authorization (P1-44), console (P1-47), review scheduling (P1-48), observer profiles (P1-49): **LATER**. Optional vector-backend proliferation **P1-50 is NO**. Full remote MCP **P1-35 is NO-CONSENSUS**, not a covert P3-42 dependency. Their individual named-rival re-entry tests remain in Part III §III.5 ([published review](reviews/US-AGENT-MEMORY-MARKET-3x3-AUDIT-2026-09-27.md#iii5--should-v11-later-no-cut-and-unresolved-decisions)). System X's remote MCP and enterprise integration lead remains until corresponding tests actually pass.
 
 ## 4. Measurement contract — applies to every item
 
@@ -174,13 +174,13 @@ The binding MUST set contains IMPROVE/REDESIGN packages rather than standalone N
 
 ### P3-12 — Enforce EN1 with typed encrypted channels, including local IPC
 
-**Problem/evidence.** The pin refuses off-host plaintext inference but permits loopback HTTP; authenticated stdio/UDS metadata is not encrypted transport. [docs/SECURITY.md:194](https://github.com/alphaonedev/ai-memory-mcp/blob/a1403c742f9d590a08b6fd170deec5f50ca8e940/docs/SECURITY.md#L194); [src/transit_encryption.rs:4](https://github.com/alphaonedev/ai-memory-mcp/blob/a1403c742f9d590a08b6fd170deec5f50ca8e940/src/transit_encryption.rs#L4); [O:80](reviews/AI-MEMORY-VS-OPENVIKING-3x3-CODE-LEVEL-2026-09-27.md); N3 §P3-12 (unpublished input; [publication provenance](#publication-provenance)); N9 §P3-12 (unpublished input; [publication provenance](#publication-provenance)).
+**Problem/evidence.** The pin refuses off-host plaintext inference but permits loopback HTTP; authenticated stdio/UDS metadata is not encrypted transport. [docs/SECURITY.md:194](https://github.com/alphaonedev/ai-memory-mcp/blob/a1403c742f9d590a08b6fd170deec5f50ca8e940/docs/SECURITY.md#L194); [src/transit_encryption.rs:4](https://github.com/alphaonedev/ai-memory-mcp/blob/a1403c742f9d590a08b6fd170deec5f50ca8e940/src/transit_encryption.rs#L4); [O:80](reviews/AI-MEMORY-VS-SYSTEM-X-3x3-CODE-LEVEL-2026-09-27.md); N3 §P3-12 (unpublished input; [publication provenance](#publication-provenance)); N9 §P3-12 (unpublished input; [publication provenance](#publication-provenance)).
 
 **Design.** Inventory every application-data and identity/control-data hop, then provide authenticated encrypted channels and usable host adapters. Require TLS for local inference or run it in-process; reject incompatible raw IPC before payload. No dev, loopback or optional-profile exception satisfies literal EN1.
 
 **North Star / moonshot criteria:** EN1, SE1, SE2, RL3, M1.
 
-**Competitors to defeat:** OpenViking, agentmemory, mem0; no defeat claimed yet.
+**Competitors to defeat:** System X, agentmemory, mem0; no defeat claimed yet.
 
 **TEST-PROVEN acceptance — NOT RUN:** For every supported network/IPC/control-data leg, run encrypted-positive and plaintext/downgrade/wrong-key/certificate-negative captures. Zero recoverable application canaries, credential or identity frames in plaintext; incompatible clients refuse before payload. At least two actual supported host integrations remain usable offline and remotely as declared. Require 100% EN1 coverage and strictly higher common-leg coverage than each named comparator for a win; no N/A inflation. Capture binary and encoded canaries and inspect authenticated-encryption/key protocols; absence of one text string is not encryption proof.
 
@@ -198,7 +198,7 @@ The binding MUST set contains IMPROVE/REDESIGN packages rather than standalone N
 
 **North Star / moonshot criteria:** DI1, DI2, DI3, RL1, M2, M4, M5, M6, M7.
 
-**Competitors to defeat:** TencentDB-Agent-Memory, cognee; no defeat claimed yet.
+**Competitors to defeat:** System Y, cognee; no defeat claimed yet.
 
 **TEST-PROVEN acceptance — NOT RUN:** For 10,000 existing derivations under persistence faults, every committed output links to exact retained source revisions and a signed run; missing fields are Incomplete, never Complete. Zero orphaned or falsely complete artifacts. On the identical supported transformation trace, achieve a strictly higher independently verifiable complete-lineage fraction than each named comparator; include all committed outputs in the denominator. Unknown/Incomplete earns no Complete numerator credit; compare equal successful generation yield.
 
@@ -216,7 +216,7 @@ The binding MUST set contains IMPROVE/REDESIGN packages rather than standalone N
 
 **North Star / moonshot criteria:** DI1, DI2, SE1, SE2, M3, M4, M6, M7.
 
-**Competitors to defeat:** OpenViking, Mem0, Haystack; no defeat claimed yet.
+**Competitors to defeat:** System X, Mem0, Haystack; no defeat claimed yet.
 
 **TEST-PROVEN acceptance — NOT RUN:** 10,000 malformed/replayed/stale/same-family/unknown-family/timeout judgment cases produce zero unauthorized destructive commits or Deny overrides. Correct permits bind revisions, policy and independently enrolled role identities. A learned-judgment win requires strictly fewer harmful promotions than each named comparator with useful-permit recall at least 90% of the best comparator under equal spend; include always-abstain and oracle controls. Training-error independence remains unproven. The existing implementation carrier is [#3806](https://github.com/alphaonedev/ai-memory-mcp/issues/3806), still OPEN/ga-blocker in the current snapshot; [#4011](https://github.com/alphaonedev/ai-memory-mcp/issues/4011)–[#4013](https://github.com/alphaonedev/ai-memory-mcp/issues/4013) remain landing regressions. If learned heterogeneous judgment ships, run at least 1,000 held-out cases, require at least 20% fewer harmful errors at matched useful yield/spend with a paired 95% interval; the stronger P1-04 claim separately requires its 50% reduction/95%-yield gate. Unknown training lineage cannot satisfy verified M6.
 
@@ -252,7 +252,7 @@ The binding MUST set contains IMPROVE/REDESIGN packages rather than standalone N
 
 **North Star / moonshot criteria:** DI1, DI2, DI3, RL1, RL2, RL3, M1, M5.
 
-**Competitors to defeat:** OpenViking, ruflo, MemPalace; no defeat claimed yet.
+**Competitors to defeat:** System X, ruflo, MemPalace; no defeat claimed yet.
 
 **TEST-PROVEN acceptance — NOT RUN:** Restore 100,000 records plus graph/policy/identity/queues/erasure floors on clean hosts for both stores from verified offsite bytes; no original disk required. Zero loss inside the declared captured snapshot/WAL boundary, no resurrected erased content, no omitted asset represented complete. Measure preregistered RTO at most 15 min separately from full-search readiness. Greater recovered required-asset coverage or 20% faster verified RTO than each comparator at identical inventory/custody proves a win.
 
@@ -270,9 +270,9 @@ The binding MUST set contains IMPROVE/REDESIGN packages rather than standalone N
 
 **North Star / moonshot criteria:** EN1, RL2, RL3, PF1, M1, M2, M7.
 
-**Competitors to defeat:** OpenViking and agentmemory; Amazon Bedrock AgentCore Memory is a documentary Unsupported comparator for disconnected endpoint residency; no defeat claimed yet.
+**Competitors to defeat:** System X and agentmemory; Amazon Bedrock AgentCore Memory is a documentary Unsupported comparator for disconnected endpoint residency; no defeat claimed yet.
 
-**TEST-PROVEN acceptance — NOT RUN:** From a clean staged bundle, deny all network/DNS for 72 h and restart 100 times: authorized local store/recall/verify/export/restore works with zero undeclared egress, unsigned writes or vendor-entitlement dependency. Optional model absence reports degradation while required model assets are verified. Complete more shared disconnected missions than locally configured OpenViking/agentmemory at equal staged assets to claim a win. AWS cloud-only incompatibility is a separately labeled residency requirement gap, not an executed reliability defect. An advertised seven-day claim requires the seven-day run in addition to the 72-hour release gate; no cloud federal disadvantage is inferred.
+**TEST-PROVEN acceptance — NOT RUN:** From a clean staged bundle, deny all network/DNS for 72 h and restart 100 times: authorized local store/recall/verify/export/restore works with zero undeclared egress, unsigned writes or vendor-entitlement dependency. Optional model absence reports degradation while required model assets are verified. Complete more shared disconnected missions than locally configured System X/agentmemory at equal staged assets to claim a win. AWS cloud-only incompatibility is a separately labeled residency requirement gap, not an executed reliability defect. An advertised seven-day claim requires the seven-day run in addition to the 72-hour release gate; no cloud federal disadvantage is inferred.
 
 **Effort/dependencies:** L; P3-12, P3-21, P3-36, P3-37.
 
@@ -288,7 +288,7 @@ The binding MUST set contains IMPROVE/REDESIGN packages rather than standalone N
 
 **North Star / moonshot criteria:** DI1, DI3, SE1, EN1, RL1, RL2, M2, M7.
 
-**Competitors to defeat:** OpenViking, agentmemory, mem0, Haystack; no defeat claimed yet.
+**Competitors to defeat:** System X, agentmemory, mem0, Haystack; no defeat claimed yet.
 
 **TEST-PROVEN acceptance — NOT RUN:** On two actual supported host versions and deliberately incompatible clients, restart after each capture/import record: zero missing/duplicate accepted turns, principal substitution or private-span egress; signed capture binds identity/namespace/time and a boot sentinel confirms delivery. Encrypted compatibility works end-to-end. Strictly higher continuity-task completion than each named comparator at equal semantics/budgets proves a win; native remote-MCP conformance remains unclaimed if deferred. Include a task-level retrieval-and-use oracle; boot sentinel delivery alone is insufficient.
 
@@ -306,7 +306,7 @@ The binding MUST set contains IMPROVE/REDESIGN packages rather than standalone N
 
 **North Star / moonshot criteria:** DI1, DI2, DI3, SE1, SE2, PF1, PF2, PF3, RL1, RL2, RL3, EN1, M1, M2, M3, M4, M5, M6, M7.
 
-**Competitors to defeat:** OpenViking, Mem0, Hindsight, KIP, Haystack; no defeat claimed yet.
+**Competitors to defeat:** System X, Mem0, Hindsight, KIP, Haystack; no defeat claimed yet.
 
 **TEST-PROVEN acceptance — NOT RUN:** Execute the retained release operation matrix, two GA missions then all 12 required missions with at least 30 independent seeds/arm, 24-hour then 72-hour soak and P2-04 resets. Zero silent-loss, partial, unsigned, unauthorized or plaintext successes; every required cell executed. For each accessible named competitor earn at least one preregistered shared-mission win of 5 accuracy points or 20% cost/latency/goodput improvement with a positive paired 95% interval and no mandatory safety regression. Do not count unsupported or inaccessible products as runtime failures.
 
@@ -352,7 +352,7 @@ The closure unit is the violated contract across all affected paths, not the ind
 
 **North Star / moonshot criteria:** DI1, SE1, SE2, RL1, RL2, M1.
 
-**Competitors to defeat:** agentmemory, OpenViking, KIP; no defeat claimed yet.
+**Competitors to defeat:** agentmemory, System X, KIP; no defeat claimed yet.
 
 **TEST-PROVEN acceptance — NOT RUN:** Invoke affected CLI and companion services from 20 unrelated cwd values and hostile environment/invalid-input fixtures: exactly the configured store changes and pure-invalid inputs trigger no migration/GC. Stable absolute store identity is recorded. Fewer wrong-target/ambient-context failures than each named comparator on equivalent documented workflows proves a win; missing services are not scored as runtime defects.
 
@@ -370,7 +370,7 @@ The closure unit is the violated contract across all affected paths, not the ind
 
 **North Star / moonshot criteria:** DI1, RL1, RL2, SE1.
 
-**Competitors to defeat:** OpenViking, KIP, TencentDB-Agent-Memory, Haystack; no defeat claimed yet.
+**Competitors to defeat:** System X, KIP, System Y, Haystack; no defeat claimed yet.
 
 **TEST-PROVEN acceptance — NOT RUN:** Freeze and execute the required operation × backend × current frontend × advertised OS matrix with malformed/allow/deny/conflict/fault cases. Every supported cell has correct normalized effects and zero hidden SQLite sidecar writes in PostgreSQL deployments. Zero skipped required cells. A greater passing fraction on preregistered shared tasks than each named comparator proves a win; Unsupported earns no pass and cannot remove a required release cell.
 
@@ -382,13 +382,13 @@ The closure unit is the violated contract across all affected paths, not the ind
 
 ### P3-30 — Carry one resource budget through every nested operation
 
-**Problem/evidence.** Per-child bounds do not bound aggregate bytes, work, fan-out, decompression or retry duration. [src/federation/sync.rs:2507](https://github.com/alphaonedev/ai-memory-mcp/blob/a1403c742f9d590a08b6fd170deec5f50ca8e940/src/federation/sync.rs#L2507); [src/federation/receive.rs:283](https://github.com/alphaonedev/ai-memory-mcp/blob/a1403c742f9d590a08b6fd170deec5f50ca8e940/src/federation/receive.rs#L283); [O:155](reviews/AI-MEMORY-VS-OPENVIKING-3x3-CODE-LEVEL-2026-09-27.md); N3 §P3-30 (unpublished input; [publication provenance](#publication-provenance)); N9 §P3-30 (unpublished input; [publication provenance](#publication-provenance)).
+**Problem/evidence.** Per-child bounds do not bound aggregate bytes, work, fan-out, decompression or retry duration. [src/federation/sync.rs:2507](https://github.com/alphaonedev/ai-memory-mcp/blob/a1403c742f9d590a08b6fd170deec5f50ca8e940/src/federation/sync.rs#L2507); [src/federation/receive.rs:283](https://github.com/alphaonedev/ai-memory-mcp/blob/a1403c742f9d590a08b6fd170deec5f50ca8e940/src/federation/receive.rs#L283); [O:155](reviews/AI-MEMORY-VS-SYSTEM-X-3x3-CODE-LEVEL-2026-09-27.md); N3 §P3-30 (unpublished input; [publication provenance](#publication-provenance)); N9 §P3-30 (unpublished input; [publication provenance](#publication-provenance)).
 
 **Design.** Carry one consumable parent budget and absolute deadline through nested work. Reserve bytes/CPU/DB/queues/storage, bound decoded responses before allocation, propagate cancellation and reserve control-plane capacity. Exhaustion preserves accepted durable work and never relaxes authority.
 
 **North Star / moonshot criteria:** PF1, PF2, PF3, RL3.
 
-**Competitors to defeat:** OpenViking, Haystack, ruflo; no defeat claimed yet.
+**Competitors to defeat:** System X, Haystack, ruflo; no defeat claimed yet.
 
 **TEST-PROVEN acceptance — NOT RUN:** For 60-minute adversarial response/decompression/frame/fan-out/slow-peer tests, allocations stay within reserved aggregate budget plus measured 10% allocator allowance; children share the parent deadline/bytes/retry budget. Valid trailing frames survive, accepted durable work never disappears and healthy control-plane p99 stays at most 250 ms on the specified rig. Strictly better bound compliance or 20% better benign goodput than each comparator under equal admitted load proves a win.
 
@@ -406,7 +406,7 @@ The closure unit is the violated contract across all affected paths, not the ind
 
 **North Star / moonshot criteria:** SE1, SE2, DI3, RL1, M3.
 
-**Competitors to defeat:** OpenViking, KIP, cognee; no defeat claimed yet.
+**Competitors to defeat:** System X, KIP, cognee; no defeat claimed yet.
 
 **TEST-PROVEN acceptance — NOT RUN:** Use an independent glob oracle on exhaustive reduced-alphabet cases and 100,000 generated patterns. Inject policy/lease/key failures and reload races: zero unavailable-to-Allow results or wrong policy digests; valid signed Allows work and Deny is terminal. Strictly higher correct decision-table pass rate than each named comparator under matched rules/faults establishes a win, with unsupported vocabulary excluded. AbsentAllowedBySignedPosture is distinct from Unavailable; freeze the reference grammar, reduced alphabet and exhaustive test count before the 100,000 larger cases.
 
@@ -424,7 +424,7 @@ The closure unit is the violated contract across all affected paths, not the ind
 
 **North Star / moonshot criteria:** SE1, SE2, RL1, DI3.
 
-**Competitors to defeat:** OpenViking, cognee, KIP, mem0; no defeat claimed yet.
+**Competitors to defeat:** System X, cognee, KIP, mem0; no defeat claimed yet.
 
 **TEST-PROVEN acceptance — NOT RUN:** Execute at least 10,000 private/restricted/shared scope cases across every retained surface and both stores, including counts/ranking/derived skills/fan-out and zero-key tenant boot. Zero unauthorized bytes/effects; all valid controls pass and no hidden-row contribution violates the declared query contract. A win requires fewer matched authorization violations than each comparator, not a larger tool catalog.
 
@@ -436,13 +436,13 @@ The closure unit is the violated contract across all affected paths, not the ind
 
 ### P3-04 — Revocation is a monotone epoch, never a replaceable cache snapshot
 
-**Problem/evidence.** Replaceable refresh caches can reinstall revoked credentials or preserve stale authorization indefinitely. [src/handlers/identity_binding.rs:322](https://github.com/alphaonedev/ai-memory-mcp/blob/a1403c742f9d590a08b6fd170deec5f50ca8e940/src/handlers/identity_binding.rs#L322); [src/handlers/monitoring.rs:70](https://github.com/alphaonedev/ai-memory-mcp/blob/a1403c742f9d590a08b6fd170deec5f50ca8e940/src/handlers/monitoring.rs#L70); [O:151](reviews/AI-MEMORY-VS-OPENVIKING-3x3-CODE-LEVEL-2026-09-27.md); N3 §P3-04 (unpublished input; [publication provenance](#publication-provenance)); N9 §P3-04 (unpublished input; [publication provenance](#publication-provenance)).
+**Problem/evidence.** Replaceable refresh caches can reinstall revoked credentials or preserve stale authorization indefinitely. [src/handlers/identity_binding.rs:322](https://github.com/alphaonedev/ai-memory-mcp/blob/a1403c742f9d590a08b6fd170deec5f50ca8e940/src/handlers/identity_binding.rs#L322); [src/handlers/monitoring.rs:70](https://github.com/alphaonedev/ai-memory-mcp/blob/a1403c742f9d590a08b6fd170deec5f50ca8e940/src/handlers/monitoring.rs#L70); [O:151](reviews/AI-MEMORY-VS-SYSTEM-X-3x3-CODE-LEVEL-2026-09-27.md); N3 §P3-04 (unpublished input; [publication provenance](#publication-provenance)); N9 §P3-04 (unpublished input; [publication provenance](#publication-provenance)).
 
 **Design.** Use monotone credential/revocation epochs with bounded freshness leases and CAS publication. Define local revoke ACK after durable visibility and remote-authority expiry separately. Preserve historical signature checking and independently governed local recovery credentials.
 
 **North Star / moonshot criteria:** SE1, SE2, PF2, RL1.
 
-**Competitors to defeat:** OpenViking, mem0; no defeat claimed yet.
+**Competitors to defeat:** System X, mem0; no defeat claimed yet.
 
 **TEST-PROVEN acceptance — NOT RUN:** Pause refresh, revoke, release the old refresh, restart and roll clocks backward; zero reinstalls or post-bound accepts. The same-process revoke ACK fences later requests; cross-process fixtures enforce their configured authority lease, measured from the authoritative change. Allowed local recovery credentials remain usable. Beat each comparator by fewer stale accepts or a strictly shorter measured bound at the same outage-denial semantics. At equal authority leases, use at least 20% faster revocation if both competitors have zero stale accepts.
 
@@ -460,7 +460,7 @@ The closure unit is the violated contract across all affected paths, not the ind
 
 **North Star / moonshot criteria:** SE1, SE2, EN1, PF2, M1.
 
-**Competitors to defeat:** OpenViking, Haystack, MemPalace; no defeat claimed yet.
+**Competitors to defeat:** System X, Haystack, MemPalace; no defeat claimed yet.
 
 **TEST-PROVEN acceptance — NOT RUN:** Enumerate and instrument all connection constructors, including doctor/reembed/download/webhook/telemetry/backup; denied destinations receive zero payload/credential bytes under URL-parser, DNS-rebind, redirect and proxy faults. Admitted controls work. Federation wrong-CA/peer/signing identity fails; valid staged rotation loses no accepted rows. A win requires strictly fewer matched policy-bypass/identity-acceptance cases than each named comparator. Instrument DNS/connect/write, subprocess and proxy operations; publish the DNS/control-metadata policy instead of claiming zero network bytes.
 
@@ -478,7 +478,7 @@ The closure unit is the violated contract across all affected paths, not the ind
 
 **North Star / moonshot criteria:** SE1, SE2, EN1, M1.
 
-**Competitors to defeat:** OpenViking, Haystack, agentmemory; no defeat claimed yet.
+**Competitors to defeat:** System X, Haystack, agentmemory; no defeat claimed yet.
 
 **TEST-PROVEN acceptance — NOT RUN:** Across every current capture/embed/model/log/webhook/export sink and every byte/nesting position in bounded inputs, seeded explicitly protected canaries never leave the permitted boundary, including scanner failure; allowed controls remain intact and signed original bytes verify. Fewer leakage cases than each named comparator on the shared canary/fault suite is required for a win. Semantic poisoning success requires its own held-out [#3570](https://github.com/alphaonedev/ai-memory-mcp/issues/3570) results.
 
@@ -490,13 +490,13 @@ The closure unit is the violated contract across all affected paths, not the ind
 
 ### P3-13 — Generate strict request schemas and canonical wire codecs from domain types
 
-**Problem/evidence.** Handwritten schemas and wire codecs silently coerce invalid CAS fields, panic on Unicode, duplicate keys or consume the next valid frame. [src/mcp/tools/update.rs:233](https://github.com/alphaonedev/ai-memory-mcp/blob/a1403c742f9d590a08b6fd170deec5f50ca8e940/src/mcp/tools/update.rs#L233); [src/mcp/tools/skill_export.rs:759](https://github.com/alphaonedev/ai-memory-mcp/blob/a1403c742f9d590a08b6fd170deec5f50ca8e940/src/mcp/tools/skill_export.rs#L759); [O:149](reviews/AI-MEMORY-VS-OPENVIKING-3x3-CODE-LEVEL-2026-09-27.md); N3 §P3-13 (unpublished input; [publication provenance](#publication-provenance)); N9 §P3-13 (unpublished input; [publication provenance](#publication-provenance)).
+**Problem/evidence.** Handwritten schemas and wire codecs silently coerce invalid CAS fields, panic on Unicode, duplicate keys or consume the next valid frame. [src/mcp/tools/update.rs:233](https://github.com/alphaonedev/ai-memory-mcp/blob/a1403c742f9d590a08b6fd170deec5f50ca8e940/src/mcp/tools/update.rs#L233); [src/mcp/tools/skill_export.rs:759](https://github.com/alphaonedev/ai-memory-mcp/blob/a1403c742f9d590a08b6fd170deec5f50ca8e940/src/mcp/tools/skill_export.rs#L759); [O:149](reviews/AI-MEMORY-VS-SYSTEM-X-3x3-CODE-LEVEL-2026-09-27.md); N3 §P3-13 (unpublished input; [publication provenance](#publication-provenance)); N9 §P3-13 (unpublished input; [publication provenance](#publication-provenance)).
 
 **Design.** Use closed typed commands, explicit Missing/Null/Value and bounded canonical codecs. Reject malformed security fields before effects; preserve the valid frame after an oversized frame. Start with affected security-critical DTOs and exports, without making a universal generator a prerequisite.
 
 **North Star / moonshot criteria:** DI1, DI2, SE1, PF1, RL1, M2.
 
-**Competitors to defeat:** OpenViking, Haystack, TencentDB-Agent-Memory; no defeat claimed yet.
+**Competitors to defeat:** System X, Haystack, System Y; no defeat claimed yet.
 
 **TEST-PROVEN acceptance — NOT RUN:** 100,000 bounded fuzz/property inputs for affected codecs: zero panics, duplicate output keys or invalid-security-field coercions. Valid frame B after oversized A executes once for every chunk boundary; supported skill/TOON round trips preserve digests. Strictly fewer silent coercions or losses than each comparator on equivalent commands establishes a win. Valid current supported clients remain compatible or get explicit version refusal. Use 100,000 inputs per affected codec, not one pooled count; reject malformed security fields before effects.
 
@@ -514,7 +514,7 @@ The closure unit is the violated contract across all affected paths, not the ind
 
 **North Star / moonshot criteria:** SE2, PF1, PF3, RL3, M7.
 
-**Competitors to defeat:** agentmemory, Haystack, OpenViking; no defeat claimed yet.
+**Competitors to defeat:** agentmemory, Haystack, System X; no defeat claimed yet.
 
 **TEST-PROVEN acceptance — NOT RUN:** Model-check epoch/probe/cancel interleavings and 100,000 typed outcomes: exactly one half-open probe, no stale reset, no invalid semantic result treated as usable, deadline plus 100 ms fixture tolerance at most. Valid calls recover after cooldown. Beat each named comparator by fewer wrong admissions/unbounded calls under identical budgets, or record parity.
 
@@ -534,7 +534,7 @@ The closure unit is the violated contract across all affected paths, not the ind
 
 **North Star / moonshot criteria:** DI1, DI2, SE1, SE2, RL1, PF3.
 
-**Competitors to defeat:** OpenViking, TencentDB-Agent-Memory, cognee; no defeat claimed yet.
+**Competitors to defeat:** System X, System Y, cognee; no defeat claimed yet.
 
 **TEST-PROVEN acceptance — NOT RUN:** Across both stores and two OS processes, run 10,000 barrier-controlled ownership/CAS/patch/lifecycle/quota/escalation schedules plus fault injection after every persistence boundary. Each acknowledged mutation has one coherent state+revision+signed-evidence+net-quota+outbox tuple; failures have none, except explicit durable pending outcomes. Zero partial or unauthorized effects and fewer violations than each named comparator on supported logical mutations are necessary for a win. Successful safe operations must progress within the fixture deadline. Durable escalation must return within the declared 5 s fixture budget; no lost patch fields or quota charged twice.
 
@@ -552,7 +552,7 @@ The closure unit is the violated contract across all affected paths, not the ind
 
 **North Star / moonshot criteria:** DI1, DI2, DI3, M5, SE2, RL1.
 
-**Competitors to defeat:** OpenViking, cognee, TencentDB-Agent-Memory; no defeat claimed yet.
+**Competitors to defeat:** System X, cognee, System Y; no defeat claimed yet.
 
 **TEST-PROVEN acceptance — NOT RUN:** Every admitted mutating operation on both stores commits a valid role-correct envelope or makes no authoritative change on signer/append failure. Tamper each signed field and substitute host for author credentials: verification must fail. Across 10,000 faulted operations require 100% signed committed-operation coverage and strictly higher coverage than each named comparator on shared operations. Legacy unsigned rows stay unverified.
 
@@ -570,9 +570,9 @@ The closure unit is the violated contract across all affected paths, not the ind
 
 **North Star / moonshot criteria:** DI1, DI2, RL2.
 
-**Competitors to defeat:** agentmemory, TencentDB-Agent-Memory; no defeat claimed yet.
+**Competitors to defeat:** agentmemory, System Y; no defeat claimed yet.
 
-**TEST-PROVEN acceptance — NOT RUN:** Run at least 100 randomized hard-reset trials per admitted backend/storage stack with an independent acknowledged digest/revision oracle; zero acknowledged loss or altered revisions in the declared durable profile. A process abort alone fails this gate. Against agentmemory and TencentDB-Agent-Memory require strictly lower ACK-loss rate at equivalent durability settings; ties are parity. Report local/replica ACK and incomplete quorum separately. The reset fixture must actually discard unflushed writes; otherwise label the outcome VM-reset persistence only and state flush assumptions.
+**TEST-PROVEN acceptance — NOT RUN:** Run at least 100 randomized hard-reset trials per admitted backend/storage stack with an independent acknowledged digest/revision oracle; zero acknowledged loss or altered revisions in the declared durable profile. A process abort alone fails this gate. Against agentmemory and System Y require strictly lower ACK-loss rate at equivalent durability settings; ties are parity. Report local/replica ACK and incomplete quorum separately. The reset fixture must actually discard unflushed writes; otherwise label the outcome VM-reset persistence only and state flush assumptions.
 
 **Effort/dependencies:** L; P3-01, P3-06.
 
@@ -588,7 +588,7 @@ The closure unit is the violated contract across all affected paths, not the ind
 
 **North Star / moonshot criteria:** DI1, DI3, M5, RL2.
 
-**Competitors to defeat:** OpenViking, cognee, Vestige; no defeat claimed yet.
+**Competitors to defeat:** System X, cognee, Vestige; no defeat claimed yet.
 
 **TEST-PROVEN acceptance — NOT RUN:** From a 10,000-event chain delete each interior position and suffix, restart and replay. Detect every deletion at/before the independently retained head; never certify an unknown unanchored tail or stale/rollback checkpoint as Complete. Zero false-complete verdicts and fewer than each comparator under equal retained-anchor assumptions are required for a win. Enforce the configured unanchored-window policy during witness outage. Include reserved-but-unwritten gaps and whole-store rollback, with zero false alarms on valid histories.
 
@@ -606,7 +606,7 @@ The closure unit is the violated contract across all affected paths, not the ind
 
 **North Star / moonshot criteria:** SE1, SE2, DI1, DI2, M3, RL2, RL3.
 
-**Competitors to defeat:** KIP, ruflo, OpenViking; no defeat claimed yet.
+**Competitors to defeat:** KIP, ruflo, System X; no defeat claimed yet.
 
 **TEST-PROVEN acceptance — NOT RUN:** Pause every mutator before its commit fence, stop from a second process, then release it on both stores: zero ordinary commits after stop linearization. Exhaust the effect registry including read-side maintenance; signed resume preserves every acknowledged operation. Fleet partitions report unacknowledged members. Strictly fewer post-fence writes or lost/duplicated accepted operations than each named rival on supported stop/cancel work; with equal safety, at least 20% lower complete stop/resume p99. Unsupported fleet stop is not an observed corrupt commit. Apply G independently to every named target above; record losses and ties.
 
@@ -624,7 +624,7 @@ The closure unit is the violated contract across all affected paths, not the ind
 
 **North Star / moonshot criteria:** DI1, DI2, SE2, RL2, M2, M4.
 
-**Competitors to defeat:** OpenViking, MemPalace, mem0, TencentDB-Agent-Memory; no defeat claimed yet.
+**Competitors to defeat:** System X, MemPalace, mem0, System Y; no defeat claimed yet.
 
 **TEST-PROVEN acceptance — NOT RUN:** Across HTTP/MCP/CLI/curator and both stores, absent/empty/whitespace/timeout/quota/error/stale-source cases preserve all acknowledged source bytes and authorized recall reachability; no source/vector retirement precedes committed replacement+lineage. Inject every persistence boundary. Fewer lost/unreachable source facts than each comparator on the same transformations, with successful useful consolidation yield at least 95% of its baseline, is required for superiority; ties remain parity. For zero-loss ties with MemPalace/mem0, the alternative win requires at least 20% fewer total context tokens at equal held-out factual accuracy and spend.
 
@@ -680,7 +680,7 @@ The closure unit is the violated contract across all affected paths, not the ind
 
 **North Star / moonshot criteria:** DI1, DI2, SE1, RL1, RL2, PF1.
 
-**Competitors to defeat:** OpenViking, ruflo, agentmemory; no defeat claimed yet.
+**Competitors to defeat:** System X, ruflo, agentmemory; no defeat claimed yet.
 
 **TEST-PROVEN acceptance — NOT RUN:** Race erasure/inbound/restore on separate connections in both stores; reconnect stale peers and restore old snapshots. Zero resurrection, no false drainable/fleet-erased status, durable erasure intent survives disabled workers. Compact only behind a tested causal floor; stale peers rebootstrap. A win requires fewer reappearances or greater verified sink coverage than each comparator on the same declared custody inventory; offline excluded copies remain unproven.
 
@@ -698,7 +698,7 @@ The closure unit is the violated contract across all affected paths, not the ind
 
 **North Star / moonshot criteria:** DI1, DI3, SE1, SE2, M5, RL1.
 
-**Competitors to defeat:** OpenViking, TencentDB-Agent-Memory, mem0; no defeat claimed yet.
+**Competitors to defeat:** System X, System Y, mem0; no defeat claimed yet.
 
 **TEST-PROVEN acceptance — NOT RUN:** Run forged, redacted, same-ID/different-bytes, cross-ID and local-winning merge cases on both adapters: zero signature laundering, unjustified release or vector/content mismatch. Valid controls retain independently verifiable attribution. Strictly greater exact-byte provenance coverage than each named comparator on the common transform trace proves a win. No truth claim follows from a valid signature. Compare equal successful import yield; no credit for dropping all transformed records.
 
@@ -716,7 +716,7 @@ The closure unit is the violated contract across all affected paths, not the ind
 
 **North Star / moonshot criteria:** DI1, DI2, RL1, RL2, PF3.
 
-**Competitors to defeat:** cognee, OpenViking, agentmemory; no defeat claimed yet.
+**Competitors to defeat:** cognee, System X, agentmemory; no defeat claimed yet.
 
 **TEST-PROVEN acceptance — NOT RUN:** Every supported historical schema/feature combination has a fixture. Fault each migration phase, missing trigger/orphan graph/concurrent vector write/pool-size-one case: zero unapproved loss, false-current stamp or write service over incomplete migration. Recover valid upgrades via resume or documented staging restore. Fewer unrecoverable/false-success upgrades than each comparator on equivalent fault boundaries proves a win.
 
@@ -734,7 +734,7 @@ The closure unit is the violated contract across all affected paths, not the ind
 
 **North Star / moonshot criteria:** DI1, DI2, RL1, RL2, PF1, M4.
 
-**Competitors to defeat:** agentmemory, OpenViking, cognee; no defeat claimed yet.
+**Competitors to defeat:** agentmemory, System X, cognee; no defeat claimed yet.
 
 **TEST-PROVEN acceptance — NOT RUN:** On 100,000 rows, corrupt FTS, pause AGE, reorder projection jobs, edit during rebuild and crash reembed: zero false-clean checks, resurrected edges or incompatible-vector comparisons. Every source remains safely discoverable or returns explicit incomplete status; drain/rebuild restores oracle coverage within configured resource budgets. Fewer silent incompleteness failures, or 20% faster verified readiness at equal recall/resources, than each comparator proves a win.
 
@@ -752,7 +752,7 @@ The closure unit is the violated contract across all affected paths, not the ind
 
 **North Star / moonshot criteria:** DI1, DI2, SE1, RL1, RL2, M3.
 
-**Competitors to defeat:** OpenViking, KIP, ruflo; no defeat claimed yet.
+**Competitors to defeat:** System X, KIP, ruflo; no defeat claimed yet.
 
 **TEST-PROVEN acceptance — NOT RUN:** Pause AGE and race edge commits/rewind in 10,000 lock schedules. Containment covers every authoritative reachable affected record or reports a durable resumable incomplete frontier; never false success, wrong-store certification or deadlock. Compare completed containment at equal frontier bounds: fewer surviving contaminated dependents, or 20% lower p99 with equal safety, than each named comparator establishes a win.
 
@@ -770,7 +770,7 @@ The closure unit is the violated contract across all affected paths, not the ind
 
 **North Star / moonshot criteria:** DI1, DI2, PF1, PF3, RL1, RL2.
 
-**Competitors to defeat:** MemPalace, OpenViking, TencentDB-Agent-Memory; no defeat claimed yet.
+**Competitors to defeat:** MemPalace, System X, System Y; no defeat claimed yet.
 
 **TEST-PROVEN acceptance — NOT RUN:** Concurrent expiry changes, no-op merge replay and crashes after archive/delete steps preserve exact required archive revisions/links or explicit authorized-erasure receipts. For a preregistered 100-row fixture batch p99 lock hold is at most 100 ms and foreground goodput at least 80% of no-GC baseline. Fewer unrecoverable revisions than each named comparator at equal retention semantics proves a win.
 
@@ -818,13 +818,13 @@ The closure unit is the violated contract across all affected paths, not the ind
 
 ### P3-27 — Use structured concurrency and backend-aware shutdown certification
 
-**Problem/evidence.** Detached writers and incomplete signal handling allow writes after a final witness or certify the wrong store. [src/daemon_runtime.rs:8250](https://github.com/alphaonedev/ai-memory-mcp/blob/a1403c742f9d590a08b6fd170deec5f50ca8e940/src/daemon_runtime.rs#L8250); [src/daemon_runtime.rs:8572](https://github.com/alphaonedev/ai-memory-mcp/blob/a1403c742f9d590a08b6fd170deec5f50ca8e940/src/daemon_runtime.rs#L8572); [O:179](reviews/AI-MEMORY-VS-OPENVIKING-3x3-CODE-LEVEL-2026-09-27.md); N3 §P3-27 (unpublished input; [publication provenance](#publication-provenance)); N9 §P3-27 (unpublished input; [publication provenance](#publication-provenance)).
+**Problem/evidence.** Detached writers and incomplete signal handling allow writes after a final witness or certify the wrong store. [src/daemon_runtime.rs:8250](https://github.com/alphaonedev/ai-memory-mcp/blob/a1403c742f9d590a08b6fd170deec5f50ca8e940/src/daemon_runtime.rs#L8250); [src/daemon_runtime.rs:8572](https://github.com/alphaonedev/ai-memory-mcp/blob/a1403c742f9d590a08b6fd170deec5f50ca8e940/src/daemon_runtime.rs#L8572); [O:179](reviews/AI-MEMORY-VS-SYSTEM-X-3x3-CODE-LEVEL-2026-09-27.md); N3 §P3-27 (unpublished input; [publication provenance](#publication-provenance)); N9 §P3-27 (unpublished input; [publication provenance](#publication-provenance)).
 
 **Design.** Own every writer under a runtime supervisor: stop admission, persist intents, drain/join or fence writers, then witness/checkpoint the active store. A deadline yields explicit incomplete shutdown. Design the supervisor interface alongside delivery workers to avoid a dependency cycle.
 
 **North Star / moonshot criteria:** DI1, DI2, DI3, PF1, RL1, RL2, M3.
 
-**Competitors to defeat:** OpenViking, agentmemory, cognee; no defeat claimed yet.
+**Competitors to defeat:** System X, agentmemory, cognee; no defeat claimed yet.
 
 **TEST-PROVEN acceptance — NOT RUN:** SIGINT/SIGTERM at every worker phase: zero writes after a certified final head; active-store receipt matches the final ledger and all accepted work is durable after restart. Deadline 30 s yields complete or explicit incomplete, never false clean. Fewer lost-work/false-complete shutdowns than each named comparator under equal admitted workloads proves a win. Hard-reset evidence is separately required by P2-04.
 
@@ -844,7 +844,7 @@ The closure unit is the violated contract across all affected paths, not the ind
 
 **North Star / moonshot criteria:** PF1, PF2, PF3, RL3.
 
-**Competitors to defeat:** Haystack, OpenViking, cognee; no defeat claimed yet.
+**Competitors to defeat:** Haystack, System X, cognee; no defeat claimed yet.
 
 **TEST-PROVEN acceptance — NOT RUN:** At 100k real 768-dimensional rows and 1/16/64/256 clients on a pinned rig, stall inference while health/auth/keyword reads remain live; health p99 at most 250 ms, no tenant starvation beyond the declared 5 s fixture allowance and bounded queues. At admitted load 64-client useful throughput is at least 95% of 16-client throughput. Earn 20% goodput or p99 improvement versus each named comparator at equal quality, signing, durability and completed semantic-readiness work; refusals and late jobs count as failures.
 
@@ -862,7 +862,7 @@ The closure unit is the violated contract across all affected paths, not the ind
 
 **North Star / moonshot criteria:** DI1, PF1, PF3, RL1, M2, M4, M7.
 
-**Competitors to defeat:** OpenViking, cognee, Haystack, KIP; no defeat claimed yet.
+**Competitors to defeat:** System X, cognee, Haystack, KIP; no defeat claimed yet.
 
 **TEST-PROVEN acceptance — NOT RUN:** Both backends match eligibility, policy, contradiction and scoring-formula oracles on fixed candidate fixtures; keyword-only backend differences are evaluated against external relevance judgments. Zero confident no-evidence negatives when candidate generation fails; exact token/drop accounting. On frozen held-out sets require at least 5% relative nDCG@10 gain versus each named comparator, paired 95% CI above zero, equal spend and at most 5% p95 regression. Safety/parity fixes ship regardless of whether quality superiority is achieved. At equal candidate sets use a declared score tolerance; production ANN quality uses an external relevance oracle, not self-agreement.
 
@@ -880,7 +880,7 @@ The closure unit is the violated contract across all affected paths, not the ind
 
 **North Star / moonshot criteria:** SE1, SE2, DI3, RL1.
 
-**Competitors to defeat:** KIP, Haystack, OpenViking; no defeat claimed yet.
+**Competitors to defeat:** KIP, Haystack, System X; no defeat claimed yet.
 
 **TEST-PROVEN acceptance — NOT RUN:** All known alias/fn-item/multiline-SQL/visibility/test-filename/adjacent-function bypass plants plus 100 syntax-equivalent variants are rejected in every supported feature target; authorized controls compile/pass. Missing analysis is incomplete, never pass. Require strictly higher caught-bypass fraction than each named comparator on equivalent boundary fixtures for an assurance win; no claim about private CI or arbitrary whole-program soundness.
 
@@ -898,7 +898,7 @@ The closure unit is the violated contract across all affected paths, not the ind
 
 **North Star / moonshot criteria:** SE2, RL1, RL2, DI3.
 
-**Competitors to defeat:** Haystack, OpenViking; no defeat claimed yet.
+**Competitors to defeat:** Haystack, System X; no defeat claimed yet.
 
 **TEST-PROVEN acceptance — NOT RUN:** Artifact/config/backend/OS/fixture digests bind every required receipt. Tampered/unsigned tag, unpinned tool, digest drift, unknown distribution license/notice, missing coverage source/prerequisite/context, stale receipt and false power-loss label each block release on Linux/macOS across declared locales. Two builders reproduce declared reproducible artifacts; tests run distributed bytes. Strictly higher planted-failure rejection coverage than each named comparator proves an assurance win, not runtime supremacy. Run 100 shuffled Linux/macOS repetitions across umask/descriptor-limit fixtures; injected false assertions must fail, and every configured gate self-test must execute.
 
@@ -916,7 +916,7 @@ The closure unit is the violated contract across all affected paths, not the ind
 
 **North Star / moonshot criteria:** DI1, RL1, RL2, RL3, M1.
 
-**Competitors to defeat:** OpenViking, agentmemory, ruflo; no defeat claimed yet.
+**Competitors to defeat:** System X, agentmemory, ruflo; no defeat claimed yet.
 
 **TEST-PROVEN acceptance — NOT RUN:** Interrupt every copy/fsync/rename/full-disk point: old or complete verified new executable remains runnable. Advertised packages contain working service assets and preserve configured DB/key/audit volumes. Binary rollback only with schema compatibility; otherwise successful forward recovery is required. A higher successful faulted-upgrade fraction or fewer measured recovery steps than each named comparator on equivalent package paths proves a win. Fsync the publication directory as well as staged bytes; safe refusal is reported separately from a completed upgrade.
 
@@ -934,7 +934,7 @@ The closure unit is the violated contract across all affected paths, not the ind
 
 **North Star / moonshot criteria:** DI1, DI3, SE1, SE2, PF2, RL2, M5.
 
-**Competitors to defeat:** OpenViking, TencentDB-Agent-Memory, Haystack; no defeat claimed yet.
+**Competitors to defeat:** System X, System Y, Haystack; no defeat claimed yet.
 
 **TEST-PROVEN acceptance — NOT RUN:** Canaries in credentials/content/titles/DSNs never appear in diagnostic/OTLP output across success/error/debug paths; canonical signed evidence remains byte-verifiable. Collector/disk failures yield bounded optional drop counts or durable required evidence/refusal, never false health or fabricated zero counters. Fewer leaks/false-healthy states than each named comparator at equivalent observability configuration proves a win; OTLP overhead must remain at most 5% goodput on the retained workload.
 
@@ -970,7 +970,7 @@ These two packages follow their mandatory foundations. They are not release prer
 
 **Scope:** Make every cognitive role independently replaceable and observable. SHOULD: close actual role-routing gaps after current safety paths; no new modality/provider catalogue or dependency on a full router for deterministic clearance.
 
-**Competitors to defeat:** OpenViking, Haystack, Mastra, Honcho.
+**Competitors to defeat:** System X, Haystack, Mastra, Honcho.
 
 **TEST-PROVEN acceptance — NOT RUN:** Route all roles to distinct instrumented mock endpoints, hot-swap one, and verify only its requests change. Run real adapters from at least three model families plus a staged local provider. Unknown config, wrong output dimensions, absent credentials and provider outage produce the declared safe outcome; destructive roles never fall back to permissive generation. COMPETITIVE GATE: Match the rivals’ actual role independence, then require strictly greater verified cognitive-boundary coverage with enforced egress/identity/failure contracts. If all shared roles pass, use G’s provider-swap recovery time or equal-budget task-quality threshold instead of counting aliases. Also require 10,000 interleaved calls with zero wrong tuple deliveries and at least 20% lower role-swap recovery p95 across 30 paired runs when role-coverage correctness ties.
 
@@ -1001,20 +1001,20 @@ All current result cells are **NOT RUN at the proposed v1.1.0 artifact**. Target
 | Metric / acceptance owner | Required target | How measured / rival win threshold |
 |---|---|---|
 | Mandatory integrity/authority failures — P3-01/02/03/06 | **0** silent-loss, partial, unsigned, unauthorized or unavailable-to-Allow outcomes across every required cell; ≥10k atomic schedules. **0 open unresolved fail-open classes in the release boundary.** | External committed-state/authority oracle plus current defect-class register. Closure requires executed regression and mutation-negative control, not issue labels. Each package's named-rival lower-violation/coverage test applies. |
-| EN1 coverage — P3-12 | **100% supported application/identity/control-data legs encrypted**, zero plaintext/downgrade acceptance; ≥2 real usable host integrations. | Instrument socket/IPC and crypto protocol; plaintext, binary and encoded canaries, wrong-key/cert tests. Strictly higher common-leg coverage than OpenViking/agentmemory/mem0; tied coverage is parity. |
-| Physical-reset ACK loss — P2-04 | **0** lost/altered acknowledged digest+revisions over **≥100 randomized lost-flush trials per backend/storage stack**. | Independent external ACK ledger; actual discard of unflushed writes. Compare agentmemory/TencentDB-Agent-Memory at equal flush guarantees. Process abort is not this metric. |
-| Generation provenance — P1-05 | **100%** committed derivations in 10k faults have source revisions and signed run; **0 falsely Complete/orphaned** artifacts. | Independently verify exact inputs/config/output lineage; Unknown/Incomplete is excluded from Complete numerator. Strictly higher complete fraction at equal generation yield than TencentDB-Agent-Memory/cognee. |
+| EN1 coverage — P3-12 | **100% supported application/identity/control-data legs encrypted**, zero plaintext/downgrade acceptance; ≥2 real usable host integrations. | Instrument socket/IPC and crypto protocol; plaintext, binary and encoded canaries, wrong-key/cert tests. Strictly higher common-leg coverage than System X/agentmemory/mem0; tied coverage is parity. |
+| Physical-reset ACK loss — P2-04 | **0** lost/altered acknowledged digest+revisions over **≥100 randomized lost-flush trials per backend/storage stack**. | Independent external ACK ledger; actual discard of unflushed writes. Compare agentmemory/System Y at equal flush guarantees. Process abort is not this metric. |
+| Generation provenance — P1-05 | **100%** committed derivations in 10k faults have source revisions and signed run; **0 falsely Complete/orphaned** artifacts. | Independently verify exact inputs/config/output lineage; Unknown/Incomplete is excluded from Complete numerator. Strictly higher complete fraction at equal generation yield than System Y/cognee. |
 | Wake discovery p99 — P3-25 | At 256 recipients, **≥20% lower commit→durable-inbox-discovery p99** than each applicable MemPalace/agentmemory/ruflo arm, or fewer liveness violations; **≤60 s** discovery when hints fail; **≤2 s** startup/refusal. | Correlate durable row IDs; separately time notify entry, commit, hint, inbox read, client completion. Report missing/duplicate rows, clock uncertainty and 128/256-recipient cells. No credit from later-fix one-recipient NVMe numbers. |
 | Federation convergence / drainage — P3-14/15 | Zero divergent retained state, skipped revision or false Applied ACK in **100k operations / 10k equal timestamps / 3 persisted peers**. Meet frozen `T_drain` after connectivity and prerequisites recover. | Proposed initial fixture target **T_drain ≤60 s**, explicitly additional advice, not inherited measured capacity; freeze link/resources/backlog/admission/retry policy before testing. Inventory all pending operations and compare final digest+revision state. A timing win requires ≥20% lower drain p99 versus applicable ruflo/agentmemory/MemPalace with equal safety; otherwise parity. |
-| Useful performance under contention — P3-29 | At 1/16/64/256 clients and 100k 768-d rows: health p99 **≤250 ms**, 64-client useful throughput **≥95%** of 16-client; no tenant starvation past fixture **5 s**. | Measure queue/model/network/embedding/retrieval/rerank/storage separately, including semantic readiness and refusals. **≥20%** goodput or p99 improvement versus Haystack/OpenViking/cognee at equal quality, signing and durability. |
-| Aggregate work bounds — P3-30 | 60-minute adversarial runs stay within shared byte/deadline/row budgets; memory reservation + measured **≤10% allocator allowance**; control p99 **≤250 ms**. | Unbounded compressed replies, graph fan-out, slow peers/clients, cancellation; child work spends one parent budget. Strictly better compliance or ≥20% benign goodput over OpenViking/Haystack/ruflo. |
-| Recall quality — P3-39 | **≥5% relative nDCG@10 improvement**, paired 95% CI above zero; **≤5% p95 latency regression**, equal model/context/spend; zero unauthorized hits or false confident no-evidence. | Freeze **LongMemEval** and **LoCoMo** adapters plus multilingual/temporal/conflict held-out subsets before tuning. Use graded source/evidence judgments suitable for nDCG; report dataset/version, R@K and downstream answer accuracy separately. Compare OpenViking/cognee/Haystack/KIP only on supported shared tasks; do not relabel a synthetic set as official benchmark results. |
-| Downstream task and contamination benefit — P2-42 | For each accessible target OpenViking/mem0/Hindsight/KIP/Haystack: ≥1 preregistered shared-mission gain of **5 accuracy points** or **20% cost/latency/goodput**, positive paired 95% CI, no mandatory safety regression. | **MemTrapBench** taxonomy/frozen held-out set, null+oracle baselines; **SWARM-BENCH** cascade/rewind; all 12 missions, ≥30 independent seeds/arm. Synthetic fixtures labeled; real answerer/judge required. Publish per-trap contamination and correct-completion denominators. |
-| Restore / search readiness — P3-36 | Captured snapshot/WAL boundary **RPO=0**, verified restore **RTO≤15 min** for 100k records; no omitted keys/policy/queues/erasure floor reported Complete. | Restore verified offsite bytes on clean host; separately clock Restored and SearchReady. Strictly greater asset coverage or **20% faster verified RTO** than OpenViking/ruflo/MemPalace with identical inventory/custody. No promise of RPO=0 after the captured boundary. |
-| Audit / shutdown — P3-07/27 | Zero false Complete through every suffix/interior deletion of a 10k-event chain; zero post-certified-head writes. SIGINT/SIGTERM complete or explicitly incomplete within **30 s**. | Independent operator-controlled retained head; active-store digest oracle; unanchored tail stays unknown. Compare against OpenViking/cognee/Vestige for audit and OpenViking/agentmemory/cognee for shutdown. |
+| Useful performance under contention — P3-29 | At 1/16/64/256 clients and 100k 768-d rows: health p99 **≤250 ms**, 64-client useful throughput **≥95%** of 16-client; no tenant starvation past fixture **5 s**. | Measure queue/model/network/embedding/retrieval/rerank/storage separately, including semantic readiness and refusals. **≥20%** goodput or p99 improvement versus Haystack/System X/cognee at equal quality, signing and durability. |
+| Aggregate work bounds — P3-30 | 60-minute adversarial runs stay within shared byte/deadline/row budgets; memory reservation + measured **≤10% allocator allowance**; control p99 **≤250 ms**. | Unbounded compressed replies, graph fan-out, slow peers/clients, cancellation; child work spends one parent budget. Strictly better compliance or ≥20% benign goodput over System X/Haystack/ruflo. |
+| Recall quality — P3-39 | **≥5% relative nDCG@10 improvement**, paired 95% CI above zero; **≤5% p95 latency regression**, equal model/context/spend; zero unauthorized hits or false confident no-evidence. | Freeze **LongMemEval** and **LoCoMo** adapters plus multilingual/temporal/conflict held-out subsets before tuning. Use graded source/evidence judgments suitable for nDCG; report dataset/version, R@K and downstream answer accuracy separately. Compare System X/cognee/Haystack/KIP only on supported shared tasks; do not relabel a synthetic set as official benchmark results. |
+| Downstream task and contamination benefit — P2-42 | For each accessible target System X/mem0/Hindsight/KIP/Haystack: ≥1 preregistered shared-mission gain of **5 accuracy points** or **20% cost/latency/goodput**, positive paired 95% CI, no mandatory safety regression. | **MemTrapBench** taxonomy/frozen held-out set, null+oracle baselines; **SWARM-BENCH** cascade/rewind; all 12 missions, ≥30 independent seeds/arm. Synthetic fixtures labeled; real answerer/judge required. Publish per-trap contamination and correct-completion denominators. |
+| Restore / search readiness — P3-36 | Captured snapshot/WAL boundary **RPO=0**, verified restore **RTO≤15 min** for 100k records; no omitted keys/policy/queues/erasure floor reported Complete. | Restore verified offsite bytes on clean host; separately clock Restored and SearchReady. Strictly greater asset coverage or **20% faster verified RTO** than System X/ruflo/MemPalace with identical inventory/custody. No promise of RPO=0 after the captured boundary. |
+| Audit / shutdown — P3-07/27 | Zero false Complete through every suffix/interior deletion of a 10k-event chain; zero post-certified-head writes. SIGINT/SIGTERM complete or explicitly incomplete within **30 s**. | Independent operator-controlled retained head; active-store digest oracle; unanchored tail stays unknown. Compare against System X/cognee/Vestige for audit and System X/agentmemory/cognee for shutdown. |
 | GC / work accounting — P3-22/24/38 | 100-row GC batch p99 lock **≤100 ms**, foreground goodput **≥80%** of no-GC; all **10k deliveries** accounted with 4 permits; no false-zero counters. | Exact immutable victim/delivery ID sets and active-store accounting; injected SQLITE_BUSY/disk/collector failure. Rival gates in those packages; optional OTLP goodput overhead **≤5%**. |
-| Disconnected continuity — P3-41/42 | **72 h** no network/DNS plus **100 restarts**; no undeclared egress/vendor kill dependency, source loss or unsigned mutation; two real host versions usable. | Store/recall/verify/export/restore and subsequent retrieval/use oracles. More completed shared local missions than OpenViking/agentmemory; AWS cloud-only residency is documentary Unsupported, not a measured outage failure. |
-| Release evidence — P3-33/34 | Every required cell bound to installed artifact; **100** shuffled OS/umask/fd-limit repetitions; all known bypasses + **100** syntax variants rejected; **0** false release passes. | Two builders reproduce declared artifacts; tampered/unsigned tag, unpinned tool, digest drift, missing PG/context/coverage source, stale evidence, unknown notice and false durability claim all fail. Compare assurance mutation coverage with Haystack/OpenViking/KIP as scoped by package. |
+| Disconnected continuity — P3-41/42 | **72 h** no network/DNS plus **100 restarts**; no undeclared egress/vendor kill dependency, source loss or unsigned mutation; two real host versions usable. | Store/recall/verify/export/restore and subsequent retrieval/use oracles. More completed shared local missions than System X/agentmemory; AWS cloud-only residency is documentary Unsupported, not a measured outage failure. |
+| Release evidence — P3-33/34 | Every required cell bound to installed artifact; **100** shuffled OS/umask/fd-limit repetitions; all known bypasses + **100** syntax variants rejected; **0** false release passes. | Two builders reproduce declared artifacts; tampered/unsigned tag, unpinned tool, digest drift, missing PG/context/coverage source, stale evidence, unknown notice and false durability claim all fail. Compare assurance mutation coverage with Haystack/System X/KIP as scoped by package. |
 
 The named benchmark adapters are measurement choices advised here under P3-39/P2-42, not claims that upstream data formats, data rights or competitor adapters are already implemented. Missing official datasets require an explicitly named synthetic lane; unavailable official lanes remain Unmeasured. Freeze the score transformation and relevance annotation protocol before inspecting outcomes. Existing benchmark work is owned by [#3568](https://github.com/alphaonedev/ai-memory-mcp/issues/3568)/[#3570](https://github.com/alphaonedev/ai-memory-mcp/issues/3570), not a duplicate benchmark issue. [ROADMAP-v110 w5](ROADMAP-v110.md#p1--w5-memtrapbench-harness-memtrapbench-benchmark-runner-per-trap-class-claims-audit-numbers), [competitor evidence limits](reviews/COMPETITOR-ASSESSMENT-3x7-2026-09-27.md#benchmark-evidence-is-not-a-shared-leaderboard).
 

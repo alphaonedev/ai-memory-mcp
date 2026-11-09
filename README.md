@@ -141,7 +141,7 @@ v0.7.0 closes the `attested-cortex` epic (69/69 across 11 tracks A–K), folds i
 - **7th-form — agent-EXTERNAL Layer-4 wiring (Option-B foundation)** (issue [#760](https://github.com/alphaonedev/ai-memory-mcp/issues/760); v0.8.0 complete cover at [#697](https://github.com/alphaonedev/ai-memory-mcp/issues/697)). Operator-keypair-signed seed rules `R001..R004`, `memory_check_agent_action` + `memory_rule_list` MCP tools, substrate `storage::insert` pre-write hook. See [`docs/policy-engine.md`](docs/policy-engine.md) + [`docs/governance/agent-action-rules.md`](docs/governance/agent-action-rules.md).
 - **Operator how-to — turning Forms 1–6 + 7th from capable → active** (issue [#800](https://github.com/alphaonedev/ai-memory-mcp/issues/800)). 7-step recipe (operator keygen → sign-seed → enable R001–R004 → curator daemon → optional reflection-pass → namespace policies), launchd / systemd / Task-Scheduler permanence, verification block, rollback path. See [`docs/batman-active-mode.md`](docs/batman-active-mode.md) and the [GitHub Pages atlas](https://alphaonedev.github.io/ai-memory-mcp/batman-active-mode.html).
 
-### Quick wins (Tencent QW-1/2/3)
+### Quick wins (System Y QW-1/2/3)
 
 - **QW-1 — file-backed reflection chain export.** `memory_export_reflection` MCP tool + `auto_export_reflections_to_filesystem` namespace policy → `~/.ai-memory/reflections/<ns>/<id>.md`.
 - **QW-2 — persona-as-artifact.** `memory_persona` + `memory_persona_generate` tools, `MemoryKind::Persona` rows, `auto_persona_trigger_every_n_memories` namespace policy. See [`docs/persona.md`](docs/persona.md).
