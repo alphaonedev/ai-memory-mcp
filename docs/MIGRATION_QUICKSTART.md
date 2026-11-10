@@ -60,6 +60,30 @@ action required for the database itself.
 
 ---
 
+## Upgrade note — retired provider aliases
+
+Four provider aliases are no longer accepted as a backend selector. The
+refusal applies on every surface that names a backend: `AI_MEMORY_LLM_BACKEND`,
+`AI_MEMORY_EMBED_BACKEND`, `[llm].backend`, `[embeddings].backend`,
+`[llm.auto_tag].backend`, a backend passed on the command line, and the
+`ai-memory doctor` LLM section. It applies in any case and with or without
+surrounding white space. A refused selector gets no fallback provider and no
+default base URL:
+
+```text
+LLM backend `<selector>` is not a recognized backend alias. Valid values: ollama, openai-compatible, openai, xai, anthropic, gemini, mistral, groq, together, cerebras, openrouter, fireworks, lmstudio, vllm
+```
+
+**Before upgrading,** check each of those surfaces. If one names a selector
+that is not in the list above, switch it to a listed selector. For an
+endpoint that speaks the OpenAI wire format, use `openai-compatible` with an
+explicit base URL (`AI_MEMORY_LLM_BASE_URL` / `[llm].base_url`;
+`AI_MEMORY_EMBED_BASE_URL` / `[embeddings].base_url` for embeddings).
+
+New loader attestations for models of the retired families, served through
+any backend, record no family (the memory stays CLAIMED); existing rows are
+not rewritten.
+
 ## Tier 1 — Non-technical end user (5 steps)
 
 For solo developers with one MCP server (Claude Code / Cursor /

@@ -175,6 +175,8 @@ ai-memory serve --host 127.0.0.1 --port 9077
 
 The `smart` and `autonomous` tiers require an LLM backend. **Post-[#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067) + [#1146](https://github.com/alphaonedev/ai-memory-mcp/issues/1146) (v0.7.0)** the backend is provider-agnostic — pick from local Ollama OR any OpenAI-compatible vendor (xAI Grok, OpenAI, Anthropic via OpenAI shim, Google Gemini, Mistral, Groq, Together AI, Cerebras, OpenRouter, Fireworks, LMStudio, vLLM, llama.cpp server).
 
+> **Retired provider aliases.** A selector outside the accepted list is refused fail closed on every backend surface; see the [upgrade note](MIGRATION_QUICKSTART.html#upgrade-note--retired-provider-aliases) for the list and the `openai-compatible` remedy.
+
 #### Recommended path — `[llm]` section in `config.toml` (#1146)
 
 `~/.config/ai-memory/config.toml` is the **single source of truth**. Every surface (MCP stdio, HTTP daemon, `ai-memory atomise`, `ai-memory curator`, the boot banner, the `ai-memory doctor` reachability probe) consumes the same `AppConfig::resolve_llm` resolver output, so the boot banner and the live MCP server are guaranteed to agree on the backend.
