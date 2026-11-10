@@ -74,10 +74,10 @@ impl Drop for PublicAnswer {
 
 fn public_answer(url: &str) -> (String, Vec<std::net::SocketAddr>) {
     use super::webhook_ssrf_8203_tests::DNS_ANSWER;
-    let host = url
-        .strip_prefix("https://")
-        .and_then(|rest| rest.strip_suffix("/hook"))
-        .expect("IDN fixture authority");
+    // #8655: the resolver key is the client parser's host_str (the punycode
+    // spelling), the same key reqwest looks up, not the raw URL spelling.
+    let parsed = reqwest::Url::parse(url).expect("IDN fixture URL");
+    let host = parsed.host_str().expect("IDN fixture host").to_owned();
     DNS_ANSWER.with_borrow_mut(|answer| {
         assert!(
             answer
@@ -110,8 +110,9 @@ fn punycode_idn_public_dns_pins_443_6866() {
 
 #[test]
 fn unicode_idn_public_dns_answer_6866() {
-    // #6371 owns the Unicode/client pin-key difference. This cell exercises
-    // the real guard's public-address admission without normalizing its input.
+    // #8655 closed the Unicode/client pin-key difference (#6371): the guard
+    // pins the client parser's host spelling. This cell exercises the real
+    // guard's public-address admission.
     let (_, addresses) = public_answer(UNICODE_URL);
     assert_eq!(
         addresses,

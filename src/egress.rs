@@ -252,27 +252,12 @@ pub fn target_is_loopback(base_url: &str) -> bool {
 /// Extract the host from a `scheme://[user@]host[:port][/path]` base URL.
 /// Returns `None` when no authority can be found.
 fn host_of(base_url: &str) -> Option<String> {
-    let after_scheme = base_url
-        .split_once("://")
-        .map_or(base_url, |(_, rest)| rest);
-    // #3744 (A4) — ONE userinfo-stripping helper shared with the subscriptions
-    // SSRF lane, so egress and the webhook guard read the identical host.
-    let host_port = crate::subscriptions::authority_without_userinfo(after_scheme);
-    if host_port.is_empty() {
-        return None;
-    }
-    // Strip the port. IPv6 literals are bracketed, so a `]` guards the
-    // port split from eating a `:` inside the address.
-    let host = if let Some(end) = host_port.find(']') {
-        &host_port[..=end]
-    } else {
-        host_port.split(':').next().unwrap_or(host_port)
-    };
-    if host.is_empty() {
-        None
-    } else {
-        Some(host.to_string())
-    }
+    // #8656: use the connection parser, as the inference pin already does (#8650).
+    // ERRORS-04: parse failure or an absent host remains None, never loopback.
+    reqwest::Url::parse(base_url)
+        .ok()?
+        .host_str()
+        .map(str::to_owned)
 }
 
 /// The pure inference-plane egress gate. Given the resolved posture, the
@@ -637,6 +622,58 @@ pub fn refuse_inference_egress_audited(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plaintext_floor_parser_parity_8656() {
+        let url = format!("http://192.0.2.1{}@localhost/v1", char::from(92));
+        let parsed = reqwest::Url::parse(&url).expect("synthetic URL parses");
+        assert_eq!(
+            host_of(&url).as_deref(),
+            parsed.host_str(),
+            "#8656: floor host parity"
+        );
+        for mode in [
+            InferenceEgressMode::Allow,
+            InferenceEgressMode::LoopbackOnly,
+            InferenceEgressMode::InternalOnly,
+            InferenceEgressMode::Deny,
+        ] {
+            assert!(
+                evaluate_inference_egress(mode, EgressClass::InferenceLlm, &url).is_refused(),
+                "#8656: plaintext floor applies in every mode"
+            );
+        }
+    }
+
+    #[test]
+    fn host_parser_controls_8656() {
+        for url in [
+            "http://localhost/v1",
+            "http://127.0.0.1/v1",
+            "https://[::1]/v1",
+            "https://LOCALHOST/v1",
+            "https://%6cocalhost/v1",
+            "https://2130706433/v1",
+        ] {
+            let parsed = reqwest::Url::parse(url).expect("control URL parses");
+            assert_eq!(
+                host_of(url).as_deref(),
+                parsed.host_str(),
+                "#8656: canonical host"
+            );
+            assert!(target_is_loopback(url), "loopback control stays local");
+        }
+        for url in [
+            "localhost",
+            "https://",
+            "https://[",
+            "file:///v1",
+            "custom:/v1",
+        ] {
+            assert_eq!(host_of(url), None, "#8656: malformed or absent authority");
+            assert!(!target_is_loopback(url), "absent host is never local");
+        }
+    }
 
     #[test]
     fn inference_authority_parser_pin_identity_8650() {
@@ -1006,7 +1043,7 @@ mod tests {
         assert!(target_is_loopback("http://127.0.0.1:11434/api/embed"));
         assert!(target_is_loopback("http://[::1]:11434"));
         assert!(target_is_loopback("http://0.0.0.0:8080"));
-        assert!(target_is_loopback("localhost:11434")); // scheme-less
+        assert!(!target_is_loopback("localhost:11434")); // no HTTP authority
         // External vendors are NOT loopback.
         assert!(!target_is_loopback("https://api.openai.com/v1"));
         assert!(!target_is_loopback("https://openrouter.ai/api/v1"));
