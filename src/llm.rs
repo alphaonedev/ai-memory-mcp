@@ -371,8 +371,6 @@ pub(crate) fn default_base_url_for_alias(alias: &str) -> Option<&'static str> {
         "xai" => Some("https://api.x.ai/v1"),
         "anthropic" => Some("https://api.anthropic.com/v1"),
         "gemini" => Some("https://generativelanguage.googleapis.com/v1beta/openai"),
-        "kimi" | "moonshot" => Some("https://api.moonshot.cn/v1"),
-        "qwen" | "dashscope" => Some("https://dashscope.aliyuncs.com/compatible-mode/v1"),
         "mistral" => Some("https://api.mistral.ai/v1"),
         "groq" => Some("https://api.groq.com/openai/v1"),
         "together" => Some("https://api.together.xyz/v1"),
@@ -405,8 +403,6 @@ fn alias_api_key_env_vars(alias: &str) -> &'static [&'static str] {
         "xai" => &["XAI_API_KEY"],
         "anthropic" => &["ANTHROPIC_API_KEY"],
         "gemini" => &["GEMINI_API_KEY", "GOOGLE_API_KEY"],
-        "kimi" | "moonshot" => &["MOONSHOT_API_KEY", "KIMI_API_KEY"],
-        "qwen" | "dashscope" => &["DASHSCOPE_API_KEY", "QWEN_API_KEY"],
         "mistral" => &["MISTRAL_API_KEY"],
         "groq" => &["GROQ_API_KEY"],
         "together" => &["TOGETHER_API_KEY"],
@@ -1238,8 +1234,6 @@ impl OllamaClient {
                 "openai" => "gpt-5".to_string(),
                 "anthropic" => "claude-opus-4.7".to_string(),
                 "gemini" => "gemini-2.0-flash".to_string(),
-                "kimi" | "moonshot" => "moonshot-v1-8k".to_string(),
-                "qwen" | "dashscope" => "qwen-max".to_string(),
                 "mistral" => "mistral-large-latest".to_string(),
                 "groq" => "llama-3.3-70b-versatile".to_string(),
                 "together" => "meta-llama/Llama-3.3-70B-Instruct-Turbo".to_string(),
@@ -3375,10 +3369,10 @@ mod tests {
 
     /// v0.7.0 #1067 + #1113 — per-alias default base URL pin. Walks
     /// every vendor alias the LLM client advertises and asserts
-    /// `default_base_url_for_alias` returns the documented host. v0.8.0
-    /// #1709 §11.4.C added the 16th; #3627 retired one, leaving 15.
+    /// `default_base_url_for_alias` returns the documented host: 12
+    /// vendor aliases (vLLM included) plus two unrecognised controls.
     #[test]
-    fn default_base_url_for_alias_covers_all_15_aliases_1067() {
+    fn default_base_url_for_alias_covers_all_12_aliases_1067() {
         let cases: &[(&str, Option<&str>)] = &[
             ("openai", Some("https://api.openai.com/v1")),
             ("xai", Some("https://api.x.ai/v1")),
@@ -3386,16 +3380,6 @@ mod tests {
             (
                 "gemini",
                 Some("https://generativelanguage.googleapis.com/v1beta/openai"),
-            ),
-            ("kimi", Some("https://api.moonshot.cn/v1")),
-            ("moonshot", Some("https://api.moonshot.cn/v1")),
-            (
-                "qwen",
-                Some("https://dashscope.aliyuncs.com/compatible-mode/v1"),
-            ),
-            (
-                "dashscope",
-                Some("https://dashscope.aliyuncs.com/compatible-mode/v1"),
             ),
             ("mistral", Some("https://api.mistral.ai/v1")),
             ("groq", Some("https://api.groq.com/openai/v1")),
@@ -3425,10 +3409,6 @@ mod tests {
             ("xai", &["XAI_API_KEY"]),
             ("anthropic", &["ANTHROPIC_API_KEY"]),
             ("gemini", &["GEMINI_API_KEY", "GOOGLE_API_KEY"]),
-            ("kimi", &["MOONSHOT_API_KEY", "KIMI_API_KEY"]),
-            ("moonshot", &["MOONSHOT_API_KEY", "KIMI_API_KEY"]),
-            ("qwen", &["DASHSCOPE_API_KEY", "QWEN_API_KEY"]),
-            ("dashscope", &["DASHSCOPE_API_KEY", "QWEN_API_KEY"]),
             ("mistral", &["MISTRAL_API_KEY"]),
             ("groq", &["GROQ_API_KEY"]),
             ("together", &["TOGETHER_API_KEY"]),

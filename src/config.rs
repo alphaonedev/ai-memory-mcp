@@ -3866,7 +3866,7 @@ pub struct LlmSection {
     /// explicit `base_url`), or an alias that pre-fills `base_url`
     /// (`openai`, `xai`, `anthropic`, `gemini`,
     /// `mistral`, `groq`, `together`, `cerebras`, `openrouter`,
-    /// `fireworks`, `lmstudio`). Unset = inherit legacy resolution
+    /// `fireworks`, `lmstudio`, `vllm`). Unset = inherit legacy resolution
     /// (treated as `ollama`).
     pub backend: Option<String>,
 
@@ -7763,8 +7763,6 @@ fn backend_default_model(backend: &str) -> &'static str {
         "openai" => "gpt-5",
         "anthropic" => "claude-opus-4.7",
         "gemini" => "gemini-2.0-flash",
-        "kimi" | "moonshot" => "moonshot-v1-8k",
-        "qwen" | "dashscope" => "qwen-max",
         "mistral" => "mistral-large-latest",
         "groq" => "llama-3.3-70b-versatile",
         "together" => "meta-llama/Llama-3.3-70B-Instruct-Turbo",
@@ -7802,8 +7800,7 @@ fn backend_default_base_url(backend: &str) -> &'static str {
 /// its arm in `crate::llm::default_base_url_for_alias` — which stays
 /// the alias SSOT — AND its name here.
 pub(crate) const RECOGNIZED_LLM_BACKENDS: &str = "ollama, openai-compatible, openai, xai, \
-     anthropic, gemini, kimi, moonshot, qwen, dashscope, mistral, groq, together, cerebras, \
-     openrouter, fireworks, lmstudio, vllm";
+     anthropic, gemini, mistral, groq, together, cerebras, openrouter, fireworks, lmstudio, vllm";
 
 /// #3627 — true when `backend` names a selector the substrate can
 /// actually build a wire shape for.
@@ -7848,8 +7845,6 @@ fn alias_api_key_env_vars_for_resolver(alias: &str) -> &'static [&'static str] {
         "xai" => &["XAI_API_KEY"],
         "anthropic" => &["ANTHROPIC_API_KEY"],
         "gemini" => &["GEMINI_API_KEY", "GOOGLE_API_KEY"],
-        "kimi" | "moonshot" => &["MOONSHOT_API_KEY", "KIMI_API_KEY"],
-        "qwen" | "dashscope" => &["DASHSCOPE_API_KEY", "QWEN_API_KEY"],
         "mistral" => &["MISTRAL_API_KEY"],
         "groq" => &["GROQ_API_KEY"],
         "together" => &["TOGETHER_API_KEY"],
@@ -13914,10 +13909,6 @@ max_page_size = 1000000
             "xai",
             "anthropic",
             "gemini",
-            "kimi",
-            "moonshot",
-            "qwen",
-            "dashscope",
             "mistral",
             "groq",
             "together",

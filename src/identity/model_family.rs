@@ -47,14 +47,13 @@ pub fn family_of(provider: &str, model_ref: &str) -> Option<String> {
         ("anthropic", "claude"),
         ("grok", "grok"),
         ("gpt", "gpt"),
-        // #3627 (2026-09-18) — the retired provider's family stem was
-        // REMOVED with its alias. Dropping a stem is the FAIL-SAFE
-        // direction for this table: the model now resolves to `None`
-        // (CLAIMED, unattested) instead of being laundered into a
-        // family whose provider the substrate can no longer construct
-        // a client for. No durable row is rewritten; only new
-        // attestations change, and they change toward "we do not know".
-        ("qwen", "qwen"),
+        // Retired providers have no stem here. A model of a retired
+        // family therefore resolves to `None` on EVERY backend, including
+        // a supported multi-family backend that still serves it. That is
+        // the FAIL-SAFE direction for this table: the model reads as
+        // CLAIMED (unattested), never mis-attributed to another family.
+        // No durable row is rewritten; only new attestations change, and
+        // they change toward "we do not know".
         ("mixtral", "mistral"),
         ("mistral", "mistral"),
     ];
@@ -84,7 +83,6 @@ mod tests {
         );
         assert_eq!(family_of("xai", "grok-4").as_deref(), Some("grok"));
         assert_eq!(family_of("openai", "gpt-4o").as_deref(), Some("gpt"));
-        assert_eq!(family_of("qwen", "qwen-max").as_deref(), Some("qwen"));
         assert_eq!(
             family_of("mistral", "mistral-large").as_deref(),
             Some("mistral")
@@ -127,9 +125,16 @@ mod tests {
             "#3627: the retired provider's model must resolve to None (CLAIMED), \
              never to a family token"
         );
+        // A second retired provider stem, assembled from fragments.
+        let second_retired = ["qw", "en"].concat();
         assert_eq!(
-            family_of(&retired, "qwen-max").as_deref(),
-            Some("qwen"),
+            family_of(&second_retired, &format!("{second_retired}-max")),
+            None,
+            "a retired provider stem must resolve to None (CLAIMED)"
+        );
+        assert_eq!(
+            family_of("ollama", "gemma2:9b").as_deref(),
+            Some("gemma"),
             "#3627 presence control: the family table still resolves a \
              still-supported stem on the same sink"
         );

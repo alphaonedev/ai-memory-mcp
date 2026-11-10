@@ -175,6 +175,8 @@ ai-memory serve --host 127.0.0.1 --port 9077
 
 The `smart` and `autonomous` tiers require an LLM backend. **Post-[#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067) + [#1146](https://github.com/alphaonedev/ai-memory-mcp/issues/1146) (v0.7.0)** the backend is provider-agnostic — pick from local Ollama OR any OpenAI-compatible vendor (xAI Grok, OpenAI, Anthropic via OpenAI shim, Google Gemini, Mistral, Groq, Together AI, Cerebras, OpenRouter, Fireworks, LMStudio, vLLM, llama.cpp server).
 
+> **Retired provider aliases.** A selector outside the accepted list is refused fail closed on every backend surface; see the [upgrade note](MIGRATION_QUICKSTART.html#upgrade-note--retired-provider-aliases) for the list and the `openai-compatible` remedy.
+
 #### Recommended path — `[llm]` section in `config.toml` (#1146)
 
 `~/.config/ai-memory/config.toml` is the **single source of truth**. Every surface (MCP stdio, HTTP daemon, `ai-memory atomise`, `ai-memory curator`, the boot banner, the `ai-memory doctor` reachability probe) consumes the same `AppConfig::resolve_llm` resolver output, so the boot banner and the live MCP server are guaranteed to agree on the backend.
@@ -190,7 +192,7 @@ db   = "/Users/<you>/.claude/ai-memory.db"
 backend     = "xai"                    # ollama | openai | xai | anthropic | gemini |
                                        # mistral | groq |
                                        # together | cerebras | openrouter |
-                                       # fireworks | lmstudio | openai-compatible
+                                       # fireworks | lmstudio | vllm | openai-compatible
 model       = "grok-4.3"               # vendor-specific identifier
 base_url    = "https://api.x.ai/v1"   # optional; vendor-default if unset
 api_key_env = "XAI_API_KEY"            # process-env-var name (NOT the literal key)
@@ -271,7 +273,7 @@ Env vars take precedence over `[llm]` in `config.toml`. Useful for CI / per-sess
 >
 > If you DO use the env-block override, the same `AI_MEMORY_LLM_BACKEND` / `AI_MEMORY_LLM_API_KEY` / `AI_MEMORY_LLM_MODEL` variables must live inside the MCP server config's `env:` block. Copy-pasteable per-backend recipes: [`integrations/llm-backends.md`](integrations/llm-backends.html).
 
-**Selection by env var.** Set `AI_MEMORY_LLM_BACKEND` to one of: `ollama` (default), `openai-compatible` (generic; requires `AI_MEMORY_LLM_BASE_URL`), or a pre-filled vendor alias (`openai`, `xai`, `anthropic`, `gemini`, `mistral`, `groq`, `together`, `cerebras`, `openrouter`, `fireworks`, `lmstudio`).
+**Selection by env var.** Set `AI_MEMORY_LLM_BACKEND` to one of: `ollama` (default), `openai-compatible` (generic; requires `AI_MEMORY_LLM_BASE_URL`), or a pre-filled vendor alias (`openai`, `xai`, `anthropic`, `gemini`, `mistral`, `groq`, `together`, `cerebras`, `openrouter`, `fireworks`, `lmstudio`, `vllm`).
 
 ```bash
 # Example 1: xAI Grok 4.3 (remote, no GPU required) — v0.7.0 compiled default for xai backend
@@ -352,7 +354,7 @@ At the `semantic` tier and above, ai-memory downloads a sentence-transformer mod
 |----------|---------|-------------|
 | `AI_MEMORY_DB` | `ai-memory.db` | Database path (overridden by `--db`) |
 | `AI_MEMORY_AGENT_ID` | (auto) | Default `agent_id` stamped on memories this process writes. Used when no `--agent-id` flag is passed. See §Agent Identity below. |
-| `AI_MEMORY_LLM_BACKEND` | `ollama` (legacy default) | **[#1067, v0.7.0]** LLM backend selector. Accepts `ollama`, `openai-compatible`, or a pre-filled vendor alias (`openai`, `xai`, `anthropic`, `gemini`, `mistral`, `groq`, `together`, `cerebras`, `openrouter`, `fireworks`, `lmstudio`). When set, the LLM client is tier-independent. |
+| `AI_MEMORY_LLM_BACKEND` | `ollama` (legacy default) | **[#1067, v0.7.0]** LLM backend selector. Accepts `ollama`, `openai-compatible`, or a pre-filled vendor alias (`openai`, `xai`, `anthropic`, `gemini`, `mistral`, `groq`, `together`, `cerebras`, `openrouter`, `fireworks`, `lmstudio`, `vllm`). When set, the LLM client is tier-independent. |
 | `AI_MEMORY_LLM_BASE_URL` | per-alias default; `http://localhost:11434` for `ollama` | **[#1067, v0.7.0]** Overrides default per-backend URL. REQUIRED with `AI_MEMORY_LLM_BACKEND=openai-compatible`. Legacy `OLLAMA_BASE_URL` still honoured when `BACKEND=ollama`. |
 | `AI_MEMORY_LLM_API_KEY` | unset | **[#1067, v0.7.0, secret]** Bearer secret for OpenAI-compatible backends. Per-vendor fallback env vars honoured (`OPENAI_API_KEY`, `XAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY` or `GOOGLE_API_KEY`, `MISTRAL_API_KEY`, `GROQ_API_KEY`, `TOGETHER_API_KEY`, `CEREBRAS_API_KEY`, `OPENROUTER_API_KEY`, `FIREWORKS_API_KEY`). Never echoed in capabilities / banners / audit. |
 | `AI_MEMORY_LLM_MODEL` | tier-/vendor-specific | **[#1067, v0.7.0]** Model identifier (e.g. `grok-4.3` for xAI, `gpt-5` for OpenAI, `gemma3:4b` for Ollama). |
@@ -534,7 +536,8 @@ Below is a complete example showing every supported field with explanatory comme
 #   AI_MEMORY_LLM_BACKEND   — selector: ollama | openai-compatible |
 #                             openai | xai | anthropic | gemini |
 #                             mistral | groq | together |
-#                             cerebras | openrouter | fireworks | lmstudio
+#                             cerebras | openrouter | fireworks | lmstudio |
+#                             vllm
 #   AI_MEMORY_LLM_BASE_URL  — override per-alias default URL
 #   AI_MEMORY_LLM_API_KEY   — Bearer secret (or per-vendor fallback env var)
 #   AI_MEMORY_LLM_MODEL     — vendor-specific model identifier

@@ -5,7 +5,7 @@ layout: doc
 
 **Audience:** operators wiring ai-memory's `smart` / `autonomous` tiers to a specific LLM provider via an MCP-capable AI client (Claude Code, Claude Desktop, Cursor, Codex CLI, Cline, Continue, Zed, Windsurf, Goose, Roo Code, Aider, Cody, Gemini CLI, OpenClaw, …).
 
-**Why this page exists.** ai-memory v0.7.0 (#1067 / #1142 / #1143 / #1146) ships a provider-agnostic LLM client; v0.7.x (#1598) extends the same vendor-alias vocabulary to the embedder via the `[embeddings]` section / `AI_MEMORY_EMBED_*` env vars. **11 vendor aliases + the generic `openai-compatible` escape hatch + native Ollama = 13 acceptable values** for the backend selector — local Ollama, LMStudio, vLLM, llama.cpp server, xAI Grok, OpenAI, Anthropic, Google Gemini, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks. Authoritative vendor-alias list lives in `src/llm.rs::default_base_url_for_alias` (resolved by `OllamaClient::from_env`); compiled default models per backend live in `src/config.rs::backend_default_model`.
+**Why this page exists.** ai-memory v0.7.0 (#1067 / #1142 / #1143 / #1146) ships a provider-agnostic LLM client; v0.7.x (#1598) extends the same vendor-alias vocabulary to the embedder via the `[embeddings]` section / `AI_MEMORY_EMBED_*` env vars. **12 vendor aliases + the generic `openai-compatible` escape hatch + native Ollama = 14 acceptable values** for the backend selector — local Ollama, LMStudio, vLLM, llama.cpp server, xAI Grok, OpenAI, Anthropic, Google Gemini, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks. Authoritative vendor-alias list lives in `src/llm.rs::default_base_url_for_alias` (resolved by `OllamaClient::from_env`); compiled default models per backend live in `src/config.rs::backend_default_model`.
 
 ## Recommended path — `[llm]` section in `~/.config/ai-memory/config.toml` (#1146)
 
@@ -89,6 +89,19 @@ ai-memory: embedder loaded (<embed-backend description>)
 ```
 
 The second line confirms the embedder built against the **independently-resolved** embeddings configuration (#1598: `AI_MEMORY_EMBED_*` env > `[embeddings]` section > legacy flat > compiled default — historically #1143 disambiguated the embed-client wire shape by always building a dedicated localhost-Ollama embed client beside a non-Ollama chat client; #1598 superseded that boot site, and the embedder now speaks to any #1067 alias / `openai-compatible` endpoint of its own). If embedder construction fails you instead get a loud `embedder init failed … semantic recall DEGRADED to keyword (#1143, #1593, #1598)` line — the chat LLM client is never silently reused for embeddings. If you see `llm=gemma3:4b` or another local Ollama tag when you intended a cloud backend, the `env:` block didn't land — re-check the path of the MCP config file your AI client actually reads.
+
+## Backend selection — accepted selectors
+
+A backend selector (`AI_MEMORY_LLM_BACKEND`, `AI_MEMORY_EMBED_BACKEND`,
+`[llm].backend`, `[embeddings].backend`, `[llm.auto_tag].backend`, or a
+backend passed on the command line) must be one of: `ollama`,
+`openai-compatible`, `openai`, `xai`, `anthropic`, `gemini`, `mistral`,
+`groq`, `together`, `cerebras`, `openrouter`, `fireworks`, `lmstudio`,
+`vllm`. Any other value, including a retired provider alias, is refused fail
+closed with ``LLM backend `<selector>` is not a recognized backend alias``;
+no fallback provider or default base URL is used. For an endpoint that
+speaks the OpenAI wire format, choose `openai-compatible` with an explicit
+base URL. See the [upgrade note](../MIGRATION_QUICKSTART.html#upgrade-note--retired-provider-aliases).
 
 ## The canonical recipe shape
 

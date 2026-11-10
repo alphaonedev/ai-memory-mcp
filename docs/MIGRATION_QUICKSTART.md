@@ -40,7 +40,7 @@ action required for the database itself.
 
 | Area | v0.6.4 | v0.7.0 |
 |---|---|---|
-| **LLM backends** | Local Ollama only | **11 vendor aliases** + generic OpenAI-compatible (#1067): ollama, openai, xai, anthropic, gemini, mistral, groq, together, cerebras, openrouter, fireworks, lmstudio, openai-compatible |
+| **LLM backends** | Local Ollama only | **12 vendor aliases** + generic OpenAI-compatible (#1067): ollama, openai, xai, anthropic, gemini, mistral, groq, together, cerebras, openrouter, fireworks, lmstudio, vllm, openai-compatible |
 | **Config schema** | Flat fields (`llm_model`, `ollama_url`, ...) | **Sectioned v2** (`[llm]`, `[llm.auto_tag]`, `[embeddings]`, `[reranker]`, `[storage]`) — see [`CONFIG_SCHEMA.md`](CONFIG_SCHEMA.html). Legacy v1 continues to work with deprecation WARN; removed in v0.8.0. |
 | **Secret handling** | Inline `api_key = "..."` accepted | **REJECTED at parse time** (#1146). Use `api_key_env` (env var reference) or `api_key_file` (mode 0400 enforced). |
 | **DB schema** | v20 | v57 (37 version bumps bridge the gap, auto-applied on first open) |
@@ -59,6 +59,30 @@ action required for the database itself.
 | **Boot banner LLM field** | `llm=gemma3:4b` | `llm=<backend>:<model>` when backend != ollama; legacy shape preserved when backend == ollama |
 
 ---
+
+## Upgrade note — retired provider aliases
+
+Four provider aliases are no longer accepted as a backend selector. The
+refusal applies on every surface that names a backend: `AI_MEMORY_LLM_BACKEND`,
+`AI_MEMORY_EMBED_BACKEND`, `[llm].backend`, `[embeddings].backend`,
+`[llm.auto_tag].backend`, a backend passed on the command line, and the
+`ai-memory doctor` LLM section. It applies in any case and with or without
+surrounding white space. A refused selector gets no fallback provider and no
+default base URL:
+
+```text
+LLM backend `<selector>` is not a recognized backend alias. Valid values: ollama, openai-compatible, openai, xai, anthropic, gemini, mistral, groq, together, cerebras, openrouter, fireworks, lmstudio, vllm
+```
+
+**Before upgrading,** check each of those surfaces. If one names a selector
+that is not in the list above, switch it to a listed selector. For an
+endpoint that speaks the OpenAI wire format, use `openai-compatible` with an
+explicit base URL (`AI_MEMORY_LLM_BASE_URL` / `[llm].base_url`;
+`AI_MEMORY_EMBED_BASE_URL` / `[embeddings].base_url` for embeddings).
+
+New loader attestations for models of the retired families, served through
+any backend, record no family (the memory stays CLAIMED); existing rows are
+not rewritten.
 
 ## Tier 1 — Non-technical end user (5 steps)
 
