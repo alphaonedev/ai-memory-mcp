@@ -430,6 +430,7 @@ mod tests {
 
     #[test]
     fn handle_persona_returns_null_when_unminted() {
+        let _agent_id_env_guard = crate::identity::agent_id_env_unset_guard();
         let (conn, _dir) = fresh_db();
         let out = handle_persona(
             &conn,
@@ -442,6 +443,7 @@ mod tests {
 
     #[test]
     fn handle_persona_rejects_empty_entity_id() {
+        let _agent_id_env_guard = crate::identity::agent_id_env_unset_guard();
         let (conn, _dir) = fresh_db();
         let err = handle_persona(&conn, &json!({"entity_id": ""}), None).unwrap_err();
         assert!(err.contains("entity_id cannot be empty"));
@@ -449,6 +451,7 @@ mod tests {
 
     #[test]
     fn handle_persona_generate_refuses_below_smart_tier() {
+        let _agent_id_env_guard = crate::identity::agent_id_env_unset_guard();
         let (conn, _dir) = fresh_db();
         let llm = StubLlm;
         let err = handle_persona_generate(
@@ -464,6 +467,7 @@ mod tests {
 
     #[test]
     fn handle_persona_generate_writes_and_handle_persona_returns_it() {
+        let _agent_id_env_guard = crate::identity::agent_id_env_unset_guard();
         let (conn, _dir) = fresh_db();
         seed_reflection(
             &conn,
@@ -511,6 +515,7 @@ mod tests {
     /// source reflections as `derives_from` parents.
     #[test]
     fn issue_848_handle_persona_generate_omitted_namespace_aggregates_cross_namespace() {
+        let _agent_id_env_guard = crate::identity::agent_id_env_unset_guard();
         let (conn, _dir) = fresh_db();
         let id_a = seed_reflection(
             &conn,
@@ -569,6 +574,7 @@ mod tests {
     /// also route to the cross-namespace path.
     #[test]
     fn issue_848_handle_persona_generate_null_namespace_routes_to_cross_namespace() {
+        let _agent_id_env_guard = crate::identity::agent_id_env_unset_guard();
         let (conn, _dir) = fresh_db();
         seed_reflection(
             &conn,
@@ -594,6 +600,7 @@ mod tests {
     /// reflections surfaces the broadened sentinel error message.
     #[test]
     fn issue_848_cross_namespace_with_no_reflections_reports_any_namespace_sentinel() {
+        let _agent_id_env_guard = crate::identity::agent_id_env_unset_guard();
         let (conn, _dir) = fresh_db();
         let llm = StubLlm;
         let err = handle_persona_generate(
@@ -633,6 +640,7 @@ mod tests {
     /// to that caller; a hidden reflection never reaches the LLM.
     #[test]
     fn persona_generate_for_caller_matches_memory_get_8754() {
+        let _agent_id_env_guard = crate::identity::agent_id_env_unset_guard();
         const OWNER: &str = "ai:persona-owner-8754";
         const OTHER: &str = "ai:persona-other-8754";
         const NS: &str = "team/alpha";
@@ -738,6 +746,7 @@ mod authority_gate_3596_tests {
 
     #[test]
     fn foreign_owner_private_persona_is_null_for_another_caller_3596() {
+        let _agent_id_env_guard = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         seed_private_persona(&conn, "ai:alice");
         let params: Value = serde_json::from_str(PARAMS).unwrap();
@@ -750,6 +759,7 @@ mod authority_gate_3596_tests {
 
     #[test]
     fn owner_and_local_operator_read_the_persona_3596() {
+        let _agent_id_env_guard = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         let id = seed_private_persona(&conn, "ai:alice");
         let params: Value = serde_json::from_str(PARAMS).unwrap();

@@ -1238,12 +1238,28 @@ pub async fn handle_atomise_http(
     if matches!(app.storage_backend, StorageBackend::Postgres) {
         return atomise_http_via_store(&app, &body);
     }
-    let lock = app.db.lock().await;
-    let tier = app.tier_config.tier;
-    let result = crate::mcp::tools::handle_atomise(&lock.0, &body, None, tier, None);
-    drop(lock);
-    match result {
-        Ok(v) => (StatusCode::OK, Json(v)).into_response(),
+    // #8753 — the sqlite arm is storage-free too: with no engine on this
+    // surface the answer is the DB-free precheck (tier-locked envelope or a
+    // validation error), so no source row is ever loaded and no store text
+    // can reach the HTTP body.
+    match crate::mcp::tools::atomise_precheck(&body, app.tier_config.tier, false) {
+        Ok(crate::mcp::tools::AtomisePrecheck::TierLocked(envelope)) => {
+            (StatusCode::OK, Json(envelope)).into_response()
+        }
+        Ok(crate::mcp::tools::AtomisePrecheck::EngineRequired(_)) => {
+            // Unreachable while `handler_present = false`; fail CLOSED rather
+            // than dispatching an engine this surface does not own.
+            tracing::error!(
+                "handle_atomise_http reached EngineRequired with no engine on the HTTP surface; refusing"
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(
+                    json!({"error": "memory_atomise engine is not available on the HTTP surface"}),
+                ),
+            )
+                .into_response()
+        }
         Err(e) => err_response(e),
     }
 }

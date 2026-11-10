@@ -915,6 +915,7 @@ mod tests {
     /// unchanged; only the owner (or the trust-all `None`) atomises.
     #[test]
     fn atomise_for_caller_admits_by_memory_get_and_ownership_8753() {
+        let _agent_id_env_guard = crate::identity::agent_id_env_unset_guard();
         const OWNER: &str = "ai:atomise-owner-8753";
         const OTHER: &str = "ai:atomise-other-8753";
         const NS: &str = "atomise-gate-8753";
