@@ -375,3 +375,45 @@ fn cli_non_owner_skill_mutation_is_refused_8771() {
         );
     }
 }
+
+/// #8775 — the CLI `agents register` twin of `memory_agent_register`: an
+/// enforced caller may not re-register another agent's roster identity.
+#[test]
+fn cli_non_owner_agent_register_is_refused_8775() {
+    let fixture = Fixture::new();
+    {
+        let mut owner = Mcp::start(&fixture, Some(OWNER));
+        owner.call_ok(
+            TOOL_AGENT_REGISTER,
+            &json!({
+                "agent_id": OWNER,
+                "agent_type": OWNER_AGENT_TYPE,
+                "capabilities": [OWNER_CAPABILITY],
+                "format": "json"
+            }),
+        );
+    }
+    let target = Target::Agent(OWNER.to_string());
+    let before = object_snapshot(&fixture.db, &target);
+    let output = fixture
+        .command()
+        .env("AI_MEMORY_AGENT_ID", INTRUDER)
+        .args(["agents", "register", "--agent-id", OWNER])
+        .args(["--agent-type", FORGED_AGENT_TYPE, "--capabilities", FORGED_CAPABILITY])
+        .output()
+        .expect("cli child");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "cli agents register: a non-owner re-register must exit non-zero; stderr={stderr}"
+    );
+    assert!(
+        stderr.lines().any(|line| line.ends_with(DENIED)),
+        "cli agents register: stderr must carry the exact owner-gate text; stderr={stderr}"
+    );
+    assert_eq!(
+        object_snapshot(&fixture.db, &target),
+        before,
+        "cli agents register: the owner's roster row must be byte-unchanged"
+    );
+}
