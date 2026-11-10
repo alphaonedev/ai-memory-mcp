@@ -56,6 +56,12 @@ mod platform {
     const DIRECTORY_MODE: u32 = 0o700;
     const MKDIR_MODE: libc::mode_t = 0o700;
     const FILE_MODE: libc::c_uint = 0o600;
+    /// Selects the nine permission bits compared against [`DIRECTORY_MODE`].
+    /// The setuid, setgid and sticky bits are deliberately ignored: a directory
+    /// created below a setgid parent inherits the setgid bit (#8593), and on an
+    /// owner-only directory owned by the effective user none of the three grants
+    /// another local user any access. The refusal text therefore names the
+    /// permission bits, never "mode" (#8716).
     const PERMISSION_MASK: u32 = 0o777;
     const OPEN_DIRECTORY: libc::c_int =
         libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
@@ -130,7 +136,7 @@ mod platform {
             {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
-                    "export directory must be owned by the current user with mode 0700; choose a private root or repair its permissions explicitly",
+                    "export directory must be owned by the current user with permission bits 0700 (owner only); choose a private root or repair its permissions explicitly",
                 ));
             }
             Ok(Self(directory))
