@@ -26,7 +26,8 @@ use std::time::{Duration, Instant};
 use child_stdin_report::{
     EXIT_LINE_EXITED, EXIT_LINE_KILLED, STDERR_HEADER, STDERR_REPORT_MAX_BYTES,
     STDERR_TRUNCATION_MARKER_PREFIX, StderrCapture, WRITE_FAILED_PREFIX,
-    child_write_failure_message, send_and_close, write_line_or_report,
+    child_write_failure_message, child_write_failure_message_with, finish_reader, send_and_close,
+    write_line_or_report, write_line_or_report_with,
 };
 
 /// What the failing call site names itself.
@@ -173,7 +174,7 @@ fn a_healthy_child_sees_the_same_bytes_8734() {
     let output = child.wait_with_output().expect("collect output");
     assert!(output.status.success());
     assert_eq!(String::from_utf8_lossy(&output.stdout), PAYLOAD);
-    assert!(output.stderr.is_empty());
+    assert_eq!(output.stderr, Vec::<u8>::new());
 }
 
 #[test]
@@ -298,4 +299,64 @@ fn a_later_write_failure_reports_the_cause_8734() {
         "{message}"
     );
     assert_eq!(stderr_section(&message), format!("{LATE_STDERR}\n"));
+}
+
+// Row (f): a caller that keeps stderr in its own buffer.
+
+#[test]
+fn caller_buffer_stderr_is_quoted_and_cut_at_the_bound_8734() {
+    let mut child = early_exit_child();
+    let err = write_error(&mut child);
+    let long = "y".repeat(STDERR_REPORT_MAX_BYTES + 100);
+    let message =
+        child_write_failure_message_with(&mut child, || long.clone(), WHAT, &err, GENEROUS_BOUND);
+    let marker = format!("{STDERR_TRUNCATION_MARKER_PREFIX}{STDERR_REPORT_MAX_BYTES} bytes]");
+    let (shown, tail) = stderr_section(&message)
+        .split_once('\n')
+        .expect("marker follows the stderr text");
+    assert_eq!(shown.len(), STDERR_REPORT_MAX_BYTES);
+    assert_eq!(tail, marker);
+    assert!(
+        message.contains(&format!("{EXIT_LINE_EXITED}exit status: {EARLY_EXIT_CODE}")),
+        "{message}"
+    );
+}
+
+#[test]
+fn write_line_or_report_with_runs_the_collector_after_the_reap_8734() {
+    let mut child = early_exit_child();
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    let mut stderr_pipe = child.stderr.take().expect("piped stderr");
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        write_line_or_report_with(
+            &mut stdin,
+            &mut child,
+            || {
+                let mut text = String::new();
+                stderr_pipe.read_to_string(&mut text).expect("read stderr");
+                text
+            },
+            WHAT,
+            PAYLOAD,
+        );
+    }));
+    let payload = outcome.expect_err("a write to a gone child must fail the caller");
+    let message = payload.downcast_ref::<String>().cloned().expect("String");
+    assert_eq!(stderr_section(&message), format!("{EARLY_STDERR}\n"));
+}
+
+#[test]
+fn finish_reader_returns_within_its_bound_when_the_pipe_stays_open_8734() {
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    let handle = std::thread::spawn(move || {
+        let _ = rx.recv();
+    });
+    let started = Instant::now();
+    finish_reader(handle);
+    assert!(
+        started.elapsed() < KILL_CEILING,
+        "took {:?}",
+        started.elapsed()
+    );
+    drop(tx);
 }

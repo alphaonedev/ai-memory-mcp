@@ -17,11 +17,12 @@
 //!
 //! Scratch DBs live under the cargo target dir (project no-`/tmp` HARD RULE).
 
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, Output, Stdio};
 
 use serde_json::{Value, json};
+#[path = "common/child_stdin_report.rs"]
+mod child_stdin_report;
 
 /// A fresh scratch dir + DB path under the cargo target dir.
 fn scratch(tag: &str) -> (tempfile::TempDir, PathBuf) {
@@ -59,12 +60,7 @@ fn run_cli_env(db: &Path, args: &[&str], stdin: &str, extra_env: &[(&str, &str)]
         cmd.env(key, value);
     }
     let mut child = cmd.spawn().expect("spawn ai-memory");
-    child
-        .stdin
-        .as_mut()
-        .expect("piped stdin")
-        .write_all(stdin.as_bytes())
-        .expect("write stdin");
+    child_stdin_report::send_and_close(&mut child, "stdin payload", stdin.as_bytes());
     child.wait_with_output().expect("wait ai-memory")
 }
 

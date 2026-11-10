@@ -55,7 +55,7 @@
 //! are behind RAII kill guards; every wait is bounded so a hung daemon fails the
 //! test rather than hanging CI.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -66,6 +66,8 @@ use tempfile::TempDir;
 
 // #3198 — sandbox the daemon keystore at a 0700 tempdir so a group/world-
 // writable host `~/.config/ai-memory/keys` cannot fail the daemon closed.
+#[path = "../common/child_stdin_report.rs"]
+mod child_stdin_report;
 #[path = "../common/key_dir_sandbox.rs"]
 mod key_dir_sandbox;
 
@@ -1202,6 +1204,18 @@ fn tombstone_exists(conn: &rusqlite::Connection, id: &str) -> bool {
 struct McpChild {
     child: Option<Child>,
     stdin: Option<ChildStdin>,
+    stderr: Option<child_stdin_report::StderrCapture>,
+}
+
+impl McpChild {
+    /// Write one request line; a failed write reaps the child and fails with
+    /// its exit status and stderr (#8734).
+    fn write_line(&mut self, what: &str, line: &str) {
+        let (Some(stdin), Some(child)) = (self.stdin.as_mut(), self.child.as_mut()) else {
+            panic!("{what}: the MCP child is already closed");
+        };
+        child_stdin_report::write_line_or_report(stdin, child, self.stderr.as_ref(), what, line);
+    }
 }
 
 impl Drop for McpChild {
@@ -1238,9 +1252,10 @@ fn spawn_mcp_full(db: &std::path::Path) -> (McpChild, mpsc::Receiver<String>) {
 
     let stdin = child.stdin.take().expect("mcp stdin");
     let stdout = child.stdout.take().expect("mcp stdout");
-    if let Some(stderr) = child.stderr.take() {
-        std::thread::spawn(move || for _ in BufReader::new(stderr).lines() {});
-    }
+    let stderr = child
+        .stderr
+        .take()
+        .map(child_stdin_report::StderrCapture::drain);
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         for line in BufReader::new(stdout).lines() {
@@ -1259,20 +1274,18 @@ fn spawn_mcp_full(db: &std::path::Path) -> (McpChild, mpsc::Receiver<String>) {
         McpChild {
             child: Some(child),
             stdin: Some(stdin),
+            stderr,
         },
         rx,
     )
 }
 
 /// Send one JSON-RPC line and wait (bounded) for the next response line.
-fn mcp_rpc(stdin: &mut ChildStdin, rx: &mpsc::Receiver<String>, payload: &Value) -> Value {
-    writeln!(
-        stdin,
-        "{}",
-        serde_json::to_string(payload).expect("serialize rpc")
-    )
-    .expect("write mcp stdin");
-    stdin.flush().expect("flush mcp stdin");
+fn mcp_rpc(stdin: &mut McpChild, rx: &mpsc::Receiver<String>, payload: &Value) -> Value {
+    stdin.write_line(
+        "MCP request",
+        &serde_json::to_string(payload).expect("serialize rpc"),
+    );
     let line = rx
         .recv_timeout(MCP_RECV_TIMEOUT)
         .expect("mcp response within bounded timeout");
@@ -1284,7 +1297,7 @@ fn config1_mcp_stdio_full_profile_smoke() {
     let tmp = TempDir::new().expect("tempdir");
     let db = tmp.path().join("acc-mcp.db");
     let (mut guard, rx) = spawn_mcp_full(&db);
-    let stdin = guard.stdin.as_mut().expect("mcp stdin handle");
+    let stdin = &mut guard;
 
     // initialize — JSON-RPC 2.0 handshake framing.
     let init = mcp_rpc(

@@ -25,6 +25,8 @@ use common::{DAEMON_READY_TIMEOUT, bounded_test_client, free_port, wait_for_http
 // … could not be generated" boot refusal on the ledger-writing tests. #3733
 // moved eleven key-dir-CREATING fixtures onto this sandbox; THIS file was
 // missed because it CREATES nothing, it merely INHERITED. See `cmd`.
+#[path = "common/child_stdin_report.rs"]
+mod child_stdin_report;
 #[path = "common/key_dir_sandbox.rs"]
 mod key_dir_sandbox;
 
@@ -248,7 +250,6 @@ fn drive_mcp_bounded(
     requests: &[String],
     ctx: &str,
 ) -> std::process::Output {
-    use std::io::Write;
     command
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -256,16 +257,14 @@ fn drive_mcp_bounded(
     let mut child = command
         .spawn()
         .unwrap_or_else(|e| panic!("failed to spawn mcp subprocess for {ctx}: {e}"));
-    {
-        let mut stdin = child.stdin.take().expect("piped mcp stdin");
-        for line in requests {
-            writeln!(stdin, "{line}")
-                .unwrap_or_else(|e| panic!("failed to write mcp stdin for {ctx}: {e}"));
-        }
-        stdin
-            .flush()
-            .unwrap_or_else(|e| panic!("failed to flush mcp stdin for {ctx}: {e}"));
-    } // stdin dropped here → child sees EOF and can exit
+    // The payload is written and flushed, then stdin is closed so the child
+    // sees EOF and can exit; a failed write reports the child's exit (#8734).
+    let payload = requests.join("\n") + "\n";
+    child_stdin_report::send_and_close(
+        &mut child,
+        &format!("mcp stdin for {ctx}"),
+        payload.as_bytes(),
+    );
     wait_child_bounded(child, ctx, "MCP")
 }
 
@@ -555,7 +554,6 @@ fn test_gc_removes_expired() {
 
 #[test]
 fn test_content_size_limit() {
-    use std::io::Write;
     let binary = env!("CARGO_BIN_EXE_ai-memory");
     let db_path = integration_scratch_db("size-test");
 
@@ -577,12 +575,7 @@ fn test_content_size_limit() {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(huge_content.as_bytes())
-        .unwrap();
+    child_stdin_report::send_and_close(&mut child, "stdin payload", huge_content.as_bytes());
     drop(child.stdin.take());
     let output = child.wait_with_output().unwrap();
     assert!(!output.status.success(), "should reject oversized content");
@@ -633,7 +626,7 @@ fn test_import_export_roundtrip() {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    std::io::Write::write_all(&mut child.stdin.take().unwrap(), &export_output.stdout).unwrap();
+    child_stdin_report::send_and_close(&mut child, "export payload", &export_output.stdout);
     let result = child.wait_with_output().unwrap();
     assert!(
         result.status.success(),
@@ -733,7 +726,6 @@ fn test_reject_bad_namespace() {
 
 #[test]
 fn test_reject_oversized_content() {
-    use std::io::Write;
     let binary = env!("CARGO_BIN_EXE_ai-memory");
     let db_path = integration_scratch_db("val-size");
 
@@ -754,12 +746,7 @@ fn test_reject_oversized_content() {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(huge.as_bytes())
-        .unwrap();
+    child_stdin_report::send_and_close(&mut child, "stdin payload", huge.as_bytes());
     drop(child.stdin.take());
     let output = child.wait_with_output().unwrap();
     assert!(!output.status.success(), "should reject oversized content");
@@ -1807,7 +1794,7 @@ fn test_import_roundtrip_count_match() {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    std::io::Write::write_all(&mut child.stdin.take().unwrap(), &export_output.stdout).unwrap();
+    child_stdin_report::send_and_close(&mut child, "export payload", &export_output.stdout);
     let result = child.wait_with_output().unwrap();
     assert!(result.status.success());
 

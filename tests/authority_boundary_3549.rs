@@ -28,6 +28,8 @@ use std::sync::Arc;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use tower::ServiceExt as _;
+#[path = "common/child_stdin_report.rs"]
+mod child_stdin_report;
 
 const ENV_AGENT_ID: &str = "AI_MEMORY_AGENT_ID";
 
@@ -259,13 +261,14 @@ async fn http_admin_route_keeps_the_984_contract_through_the_chokepoint_3549() {
 // MCP — the real binary over stdio (`CARGO_BIN_EXE_ai-memory`)
 // ---------------------------------------------------------------------------
 
-use std::io::{BufRead as _, BufReader, Read as _, Write as _};
+use std::io::{BufRead as _, BufReader};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
 
 struct McpChild {
     child: Child,
+    stderr: child_stdin_report::StderrCapture,
 }
 
 impl Drop for McpChild {
@@ -315,17 +318,7 @@ fn spawn_mcp(agent_id: Option<&str>) -> (McpChild, ChildStdin, mpsc::Receiver<St
         .expect("spawn ai-memory mcp");
     let stdin = child.stdin.take().expect("stdin");
     let stdout = child.stdout.take().expect("stdout");
-    if let Some(stderr) = child.stderr.take() {
-        std::thread::spawn(move || {
-            let mut sink = stderr;
-            let mut buf = [0u8; 4096];
-            while let Ok(n) = sink.read(&mut buf) {
-                if n == 0 {
-                    break;
-                }
-            }
-        });
-    }
+    let stderr = child_stdin_report::StderrCapture::drain(child.stderr.take().expect("stderr"));
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         for line in BufReader::new(stdout).lines() {
@@ -340,15 +333,22 @@ fn spawn_mcp(agent_id: Option<&str>) -> (McpChild, ChildStdin, mpsc::Receiver<St
             }
         }
     });
-    (McpChild { child }, stdin, rx)
+    (McpChild { child, stderr }, stdin, rx)
 }
 
 fn send(
+    mcp: &mut McpChild,
     stdin: &mut ChildStdin,
     rx: &mpsc::Receiver<String>,
     req: &serde_json::Value,
 ) -> serde_json::Value {
-    writeln!(stdin, "{req}").expect("write request");
+    child_stdin_report::write_line_or_report(
+        stdin,
+        &mut mcp.child,
+        Some(&mcp.stderr),
+        "request",
+        &req.to_string(),
+    );
     let line = rx
         .recv_timeout(Duration::from_secs(60))
         .expect("mcp response within 60s");
@@ -368,8 +368,9 @@ fn call(id: u64, tool: &str, args: &serde_json::Value) -> serde_json::Value {
 /// through the real stdio dispatch; the owner reads back its own row.
 #[test]
 fn mcp_valid_configured_identity_serves_read_and_write_3549() {
-    let (_child, mut stdin, rx) = spawn_mcp(Some("ai:alice"));
+    let (mut mcp, mut stdin, rx) = spawn_mcp(Some("ai:alice"));
     let stored = send(
+        &mut mcp,
         &mut stdin,
         &rx,
         &call(
@@ -382,6 +383,7 @@ fn mcp_valid_configured_identity_serves_read_and_write_3549() {
     );
     assert!(stored["error"].is_null(), "{stored}");
     let listed = send(
+        &mut mcp,
         &mut stdin,
         &rx,
         &call(
@@ -404,8 +406,9 @@ fn mcp_valid_configured_identity_serves_read_and_write_3549() {
 /// dispatch serves normally.
 #[test]
 fn mcp_unset_identity_is_served_as_the_local_operator_3549() {
-    let (_child, mut stdin, rx) = spawn_mcp(None);
+    let (mut mcp, mut stdin, rx) = spawn_mcp(None);
     let listed = send(
+        &mut mcp,
         &mut stdin,
         &rx,
         &call(1, "memory_list", &serde_json::json!({})),

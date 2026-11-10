@@ -19,13 +19,16 @@
 
 #![allow(dead_code)]
 
-use std::io::{BufRead as _, BufReader, Write as _};
+use std::io::{BufRead as _, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use serde_json::{Value, json};
 
 use super::mcp_wait;
+
+#[path = "child_stdin_report.rs"]
+mod child_stdin_report;
 
 /// Hermetic `ai-memory` command against `db`, with HOME / config / key dir
 /// sandboxed under `sandbox` and the ambient agent identity removed. The
@@ -123,8 +126,13 @@ impl Mcp {
         let mut request = request.clone();
         request["id"] = json!(self.next_id);
         self.next_id += 1;
-        writeln!(self.input, "{request}").expect("MCP request");
-        self.input.flush().expect("flush");
+        child_stdin_report::write_line_or_report(
+            &mut self.input,
+            &mut self.child,
+            None,
+            "MCP request",
+            &request.to_string(),
+        );
         loop {
             let line = mcp_wait::recv_mcp_response(&self.output, "fit4059-4065");
             let response: Value = serde_json::from_str(&line).expect("JSON RPC");
