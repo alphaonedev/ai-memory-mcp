@@ -25,8 +25,7 @@ use common::{DAEMON_READY_TIMEOUT, bounded_test_client, free_port, wait_for_http
 // … could not be generated" boot refusal on the ledger-writing tests. #3733
 // moved eleven key-dir-CREATING fixtures onto this sandbox; THIS file was
 // missed because it CREATES nothing, it merely INHERITED. See `cmd`.
-#[path = "common/child_stdin_report.rs"]
-mod child_stdin_report;
+use common::child_stdin_report;
 #[path = "common/key_dir_sandbox.rs"]
 mod key_dir_sandbox;
 
@@ -576,7 +575,6 @@ fn test_content_size_limit() {
         .spawn()
         .unwrap();
     child_stdin_report::send_and_close(&mut child, "stdin payload", huge_content.as_bytes());
-    drop(child.stdin.take());
     let output = child.wait_with_output().unwrap();
     assert!(!output.status.success(), "should reject oversized content");
 
@@ -747,7 +745,6 @@ fn test_reject_oversized_content() {
         .spawn()
         .unwrap();
     child_stdin_report::send_and_close(&mut child, "stdin payload", huge.as_bytes());
-    drop(child.stdin.take());
     let output = child.wait_with_output().unwrap();
     assert!(!output.status.success(), "should reject oversized content");
 

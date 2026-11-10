@@ -27,6 +27,8 @@
 
 use serde_json::json;
 
+#[path = "common/child_stdin_report.rs"]
+mod child_stdin_report;
 #[path = "common/mcp_wait.rs"]
 mod mcp_wait;
 

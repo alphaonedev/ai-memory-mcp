@@ -36,12 +36,11 @@ mod mcp_wait;
 // onto the release head and declares `pub mod tls;` there, so the one
 // `common::tls` path serves both trees (a second by-path declaration is the
 // clippy `duplicate_mod` lint).
+use common::child_stdin_report;
 use common::tls::{
     LOCAL_CA_CERT_FILE, LOCAL_CA_KEY_FILE, LOCAL_TLS_SUBDIR, SERVER_CERT_FILE, SERVER_KEY_FILE,
     TestTls, local_ca_client,
 };
-#[path = "common/child_stdin_report.rs"]
-mod child_stdin_report;
 
 /// The doctor section the #3705 fix adds to the DEFAULT report.
 const SECTION_TRANSIT: &str = "Transit encryption (#3705)";

@@ -21,6 +21,7 @@ mod child_stdin_report;
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use child_stdin_report::{
@@ -49,14 +50,35 @@ const PAYLOAD: &str = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}";
 /// A bound that no healthy child comes near.
 const GENEROUS_BOUND: Duration = Duration::from_secs(30);
 
+/// One lock held across every spawn in this binary. Measured cause (f1,
+/// macOS, `cargo test --test child_stdin_write_report_8734` with default test
+/// threads: red in the early-exit rows at the `write_error` call, which
+/// expects the write to a gone child to fail): on Apple targets std makes a
+/// pipe with `pipe()` and then sets close-on-exec as a second step, so a
+/// sibling test thread that forks a child between those two steps leaks the
+/// read end of this test's stdin pipe into its child (for example the
+/// `sleep 60` fixture of row (c)). The pipe then still has a reader, and the
+/// write that must fail with `BrokenPipe` succeeds. Linux creates the pipe
+/// with `pipe2(O_CLOEXEC)` in one step and is not affected. Serialising every
+/// spawn makes pipe creation and its close-on-exec step atomic with respect
+/// to every other spawn in this binary. The fixtures it protects stay
+/// concurrent; only the spawn call is serial.
+static SPAWN_LOCK: Mutex<()> = Mutex::new(());
+
+/// Spawn `command` while holding [`SPAWN_LOCK`].
+fn spawn_locked(command: &mut Command) -> Child {
+    let _serial = SPAWN_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    command.spawn().expect("spawn fixture child")
+}
+
 fn sh(script: &str) -> Child {
-    Command::new("sh")
-        .args(["-c", script])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn sh fixture")
+    spawn_locked(
+        Command::new("sh")
+            .args(["-c", script])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    )
 }
 
 /// Block until the fixture has exited and closed every descriptor, so the
@@ -144,14 +166,14 @@ fn early_exit_through_send_and_close_panics_with_the_cause_8734() {
 fn early_exit_of_the_product_binary_names_its_stderr_8734() {
     // The #8734 shape itself: the product binary refuses an invalid `--db`
     // path and exits before it reads the request.
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ai-memory"))
-        .env("AI_MEMORY_NO_CONFIG", "1")
-        .args(["--db", "/nonexistent-8734/dir/x.db", "mcp"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn the product binary");
+    let mut child = spawn_locked(
+        Command::new(env!("CARGO_BIN_EXE_ai-memory"))
+            .env("AI_MEMORY_NO_CONFIG", "1")
+            .args(["--db", "/nonexistent-8734/dir/x.db", "mcp"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    );
     wait_until_closed(&mut child);
     let err = write_error(&mut child);
     let message = child_write_failure_message(&mut child, None, WHAT, &err, GENEROUS_BOUND);
@@ -443,7 +465,7 @@ const WRITE_TOKENS: &[&str] = &[
 const PATTERN_KEYWORDS: &[&str] = &["let", "if", "while", "Some", "Ok", "mut", "ref", "else"];
 
 /// How far past an access a bound name is followed (lines).
-const FOLLOW_LINES: usize = 40;
+const FOLLOW_LINES: usize = 200;
 
 fn is_ident_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_'
@@ -477,7 +499,11 @@ fn statement_boundaries(source: &str) -> Vec<usize> {
             }
             b'\'' => {
                 // A char literal ('x' or '\n'); a lifetime has no closing quote.
-                let close = if bytes.get(i + 1) == Some(&b'\\') { i + 3 } else { i + 2 };
+                let close = if bytes.get(i + 1) == Some(&b'\\') {
+                    i + 3
+                } else {
+                    i + 2
+                };
                 if bytes.get(close) == Some(&b'\'') {
                     i = close;
                 }
@@ -536,8 +562,11 @@ fn bound_names(statement: &str) -> Vec<String> {
     names
 }
 
-/// Whether `region` writes to the binding `name`.
+/// Whether `region` writes to the binding `name` (whitespace-insensitive, so a
+/// macro or a method chain wrapped over lines is still seen).
 fn writes_to_name(region: &str, name: &str) -> bool {
+    let region: String = region.chars().filter(|c| !c.is_whitespace()).collect();
+    let region = region.as_str();
     let macro_forms = [
         format!("write!({name}"),
         format!("writeln!({name}"),
@@ -551,12 +580,9 @@ fn writes_to_name(region: &str, name: &str) -> bool {
         .iter()
         .any(|method| {
             let needle = format!("{name}{method}");
-            region.match_indices(&needle).any(|(at, _)| {
-                !region[..at]
-                    .chars()
-                    .next_back()
-                    .is_some_and(is_ident_char)
-            })
+            region
+                .match_indices(&needle)
+                .any(|(at, _)| !region[..at].chars().next_back().is_some_and(is_ident_char))
         })
 }
 
@@ -578,9 +604,40 @@ fn following_region(source: &str, end: usize) -> &str {
     &rest[..offset]
 }
 
-/// STUB (red commit): reports nothing, so the rows that need a flagged site fail.
-fn scan_source(_file: &str, _source: &str) -> Vec<Site> {
-    Vec::new()
+/// Every child-stdin access in `source` whose handle is written to directly.
+fn scan_source(file: &str, source: &str) -> Vec<Site> {
+    let clean = blank_comment_lines(source);
+    let boundaries = statement_boundaries(&clean);
+    let mut sites = Vec::new();
+    for at in stdin_accesses(&clean) {
+        let split = boundaries.partition_point(|&b| b < at);
+        let start = if split == 0 {
+            0
+        } else {
+            boundaries[split - 1] + 1
+        };
+        let end = boundaries.get(split).map_or(clean.len(), |&b| b + 1);
+        let statement = &clean[start..end];
+        let direct = WRITE_TOKENS.iter().any(|token| statement.contains(token));
+        let through_name = bound_names(statement)
+            .iter()
+            .any(|name| writes_to_name(following_region(&clean, end), name));
+        if direct || through_name {
+            let line = clean[..at].matches('\n').count() + 1;
+            let text = clean
+                .lines()
+                .nth(line - 1)
+                .unwrap_or_default()
+                .trim()
+                .to_owned();
+            sites.push(Site {
+                file: file.to_owned(),
+                line,
+                text,
+            });
+        }
+    }
+    sites
 }
 
 /// Sites no allowlist entry covers, and the entries whose site count is not
@@ -634,7 +691,10 @@ fn scan_tree() -> Vec<Site> {
             .expect("under the manifest dir")
             .to_string_lossy()
             .replace('\\', "/");
-        if GUARD_EXEMPT_FILES.iter().any(|exempt| exempt.path == relative) {
+        if GUARD_EXEMPT_FILES
+            .iter()
+            .any(|exempt| exempt.path == relative)
+        {
             continue;
         }
         let source = std::fs::read_to_string(&path).expect("read a test source");
@@ -675,10 +735,10 @@ const NON_WRITE_SOURCE: &str = "fn drive() {\n    let child = Command::new(\"x\"
 fn guard_flags_an_unconverted_write_with_its_line_8734() {
     let sites = scan_source("tests/scratch_8734.rs", UNCONVERTED_SOURCE);
     assert_eq!(sites.len(), 1, "{sites:?}");
-    assert_eq!(describe(&sites[0]).split(':').take(2).collect::<Vec<_>>(), [
-        "tests/scratch_8734.rs",
-        "3"
-    ]);
+    assert_eq!(
+        describe(&sites[0]).split(':').take(2).collect::<Vec<_>>(),
+        ["tests/scratch_8734.rs", "3"]
+    );
     let (violations, stale) = unallowed_and_stale(&sites, &[]);
     assert_eq!(violations, sites, "no allowlist entry: it is a violation");
     assert!(stale.is_empty());
@@ -726,7 +786,7 @@ fn guard_fails_a_stale_allowlist_entry_8734() {
         reason: "synthetic",
     }];
     let (violations, stale) = unallowed_and_stale(&sites, &allow);
-    assert!(violations.is_empty());
+    assert_eq!(violations, Vec::<Site>::new());
     assert_eq!(stale.len(), 1, "the entry has no site left");
     // A second matching site than the entry names fails the same way.
     let doubled = scan_source(
@@ -741,6 +801,14 @@ fn guard_fails_a_stale_allowlist_entry_8734() {
 
 #[test]
 fn every_child_stdin_write_in_tests_and_benches_goes_through_the_helper_8734() {
+    for exempt in GUARD_EXEMPT_FILES {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        assert!(
+            root.join(exempt.path).is_file() && !exempt.reason.trim().is_empty(),
+            "exempt file {} must exist and carry a reason",
+            exempt.path
+        );
+    }
     let sites = scan_tree();
     let (violations, stale) = unallowed_and_stale(&sites, STDIN_WRITE_ALLOWLIST);
     let report: Vec<String> = violations.iter().map(describe).collect();

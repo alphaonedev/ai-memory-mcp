@@ -13,6 +13,8 @@
 //! ```ignore
 //! #[path = "common/mcp_wait.rs"]
 //! mod mcp_wait;
+//! #[path = "common/child_stdin_report.rs"]
+//! mod child_stdin_report;
 //! #[path = "common/mcp_stdio_child.rs"]
 //! mod mcp_stdio_child;
 //! ```
@@ -27,8 +29,7 @@ use serde_json::{Value, json};
 
 use super::mcp_wait;
 
-#[path = "child_stdin_report.rs"]
-mod child_stdin_report;
+use super::child_stdin_report;
 
 /// Hermetic `ai-memory` command against `db`, with HOME / config / key dir
 /// sandboxed under `sandbox` and the ambient agent identity removed. The

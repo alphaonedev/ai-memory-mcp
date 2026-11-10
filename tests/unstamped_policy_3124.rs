@@ -31,9 +31,8 @@ use ai_memory::identity::owner_stamp::{
 };
 use ai_memory::models::{Memory, MemoryKind, Tier};
 use common::EnvVarGuard;
+use common::child_stdin_report;
 use serde_json::{Value, json};
-#[path = "common/child_stdin_report.rs"]
-mod child_stdin_report;
 
 const NS: &str = "unstamped-3124";
 
@@ -585,11 +584,7 @@ fn mcp_call(path: &Path, home: &Path, mode: &str, tool: &str, args: &Value) -> V
         child_stdin_report::send_and_close(
             &mut child,
             "request",
-            format!(
-                "{request}
-"
-            )
-            .as_bytes(),
+            format!("{request}\n").as_bytes(),
         );
     }
     let output = child.wait_with_output().expect("output");

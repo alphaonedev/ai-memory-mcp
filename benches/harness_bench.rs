@@ -45,11 +45,19 @@
 //! exit. Criterion's `bench_function` only emits per-bench reports, not
 //! a single cross-cutting JSON document.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
+
+// #8734 - one place turns a failed write to the mcp child's stdin into a
+// failure that has reaped the child and carries its exit status and stderr,
+// instead of a bare `Broken pipe` panic. The std-only leaf under tests/common
+// is shared through `#[path]`; benches/ is outside the #6569 tests/ guard, so
+// this is the one load of it in this crate and adds no dependency.
+#[path = "../tests/common/child_stdin_report.rs"]
+mod child_stdin_report;
 
 const N: usize = 200;
 const WARMUP: usize = 10;
@@ -99,6 +107,8 @@ fn binary_path() -> PathBuf {
 struct McpChild {
     child: Option<Child>,
     stdin: Option<ChildStdin>,
+    /// Keeps the first bytes of the child's stderr for a failed-write report.
+    stderr: Option<child_stdin_report::StderrCapture>,
 }
 
 impl Drop for McpChild {
@@ -136,18 +146,12 @@ fn spawn_mcp(binary: &PathBuf, db_path: &str) -> (McpChild, mpsc::Receiver<Strin
 
     let stdin = child.stdin.take().unwrap();
     let stdout = child.stdout.take().unwrap();
-    // Drain stderr so the child never blocks on a full pipe.
-    if let Some(stderr) = child.stderr.take() {
-        std::thread::spawn(move || {
-            let mut buf = [0u8; 4096];
-            let mut s = stderr;
-            while let Ok(n) = s.read(&mut buf) {
-                if n == 0 {
-                    break;
-                }
-            }
-        });
-    }
+    // Drain stderr so the child never blocks on a full pipe; the capture keeps
+    // the first bytes so a failed stdin write can quote them (#8734).
+    let stderr = child
+        .stderr
+        .take()
+        .map(child_stdin_report::StderrCapture::drain);
 
     let (tx, rx) = mpsc::channel();
     spawn_stdout_reader(stdout, tx);
@@ -155,6 +159,7 @@ fn spawn_mcp(binary: &PathBuf, db_path: &str) -> (McpChild, mpsc::Receiver<Strin
         McpChild {
             child: Some(child),
             stdin: Some(stdin),
+            stderr,
         },
         rx,
     )
@@ -180,15 +185,26 @@ fn spawn_stdout_reader(stdout: ChildStdout, tx: mpsc::Sender<String>) {
 /// Send one JSON-RPC line and wait for the next response line. Returns
 /// the parsed response so callers can sanity-check the result without
 /// adding latency to the measurement (the timing we record is just the
-/// write+read pair).
+/// write+read pair). A failed write reaps the child and fails with its exit
+/// status and stderr (#8734), not a bare `Broken pipe`.
 fn send_and_recv(
-    stdin: &mut ChildStdin,
+    mcp: &mut McpChild,
     rx: &mpsc::Receiver<String>,
     payload: &serde_json::Value,
 ) -> serde_json::Value {
     let line = serde_json::to_string(payload).unwrap();
-    writeln!(stdin, "{line}").expect("write to mcp stdin");
-    stdin.flush().expect("flush mcp stdin");
+    let McpChild {
+        child,
+        stdin,
+        stderr,
+    } = mcp;
+    child_stdin_report::write_line_or_report(
+        stdin.as_mut().expect("mcp stdin is open"),
+        child.as_mut().expect("mcp child is running"),
+        stderr.as_ref(),
+        "mcp request",
+        &line,
+    );
     let resp = rx
         .recv_timeout(READ_TIMEOUT)
         .expect("mcp response did not arrive within READ_TIMEOUT");
@@ -198,9 +214,9 @@ fn send_and_recv(
 /// Drive `initialize` with the supplied `clientInfo.name`. Returns once
 /// the handshake is acknowledged so subsequent `tools/call` measurements
 /// don't include the one-time setup cost.
-fn initialize(stdin: &mut ChildStdin, rx: &mpsc::Receiver<String>, client_name: &str) {
+fn initialize(mcp: &mut McpChild, rx: &mpsc::Receiver<String>, client_name: &str) {
     let resp = send_and_recv(
-        stdin,
+        mcp,
         rx,
         &serde_json::json!({
             "jsonrpc": "2.0",
@@ -293,8 +309,7 @@ fn main() {
             .to_string();
 
         let (mut guard, rx) = spawn_mcp(&binary, &db_path);
-        let stdin = guard.stdin.as_mut().unwrap();
-        initialize(stdin, &rx, client_name);
+        initialize(&mut guard, &rx, client_name);
 
         // ---- memory_capabilities ----
         let cap_call = serde_json::json!({
@@ -308,7 +323,7 @@ fn main() {
             id += 1;
             let mut req = cap_call.clone();
             req["id"] = serde_json::json!(id);
-            let resp = send_and_recv(stdin, &rx, &req);
+            let resp = send_and_recv(&mut guard, &rx, &req);
             assert_eq!(resp["id"], serde_json::json!(id));
         });
         cap_samples.sort_unstable();
@@ -330,7 +345,7 @@ fn main() {
         // the loaded-DB case. This bench's job is harness-level
         // overhead, not query-engine perf.
         let _ = send_and_recv(
-            stdin,
+            &mut guard,
             &rx,
             &serde_json::json!({
                 "jsonrpc": "2.0",
@@ -365,7 +380,7 @@ fn main() {
             rid += 1;
             let mut req = recall_call.clone();
             req["id"] = serde_json::json!(rid);
-            let resp = send_and_recv(stdin, &rx, &req);
+            let resp = send_and_recv(&mut guard, &rx, &req);
             assert_eq!(resp["id"], serde_json::json!(rid));
         });
         recall_samples.sort_unstable();
