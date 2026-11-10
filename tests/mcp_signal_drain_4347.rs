@@ -30,6 +30,8 @@ use ai_memory::governance::audit::{
     CHAIN_HEAD_PREV_HASH, ForensicDecision, TEST_FORENSIC_WRITER_DELAY_ENV,
 };
 use serde_json::{Value, json};
+#[path = "common/child_stdin_report.rs"]
+mod child_stdin_report;
 
 /// Writer delay that makes a queued row certainly outlive a signalled process.
 const WRITER_DELAY_MS: &str = "600";
@@ -122,6 +124,15 @@ fn spawn_mcp(home: &Path, extra_env: &[(&str, String)], ignored: &[libc::c_int])
     cmd.spawn().expect("spawn mcp")
 }
 
+/// The child's stderr so far, for a write-failure report: waits (bounded) for
+/// the reader thread, then reads the shared buffer.
+fn collect_stderr(thread: &mut Option<std::thread::JoinHandle<()>>, buf: &Mutex<String>) -> String {
+    if let Some(t) = thread.take() {
+        child_stdin_report::finish_reader(t);
+    }
+    buf.lock().map(|b| b.clone()).unwrap_or_default()
+}
+
 struct Session {
     child: Child,
     stdin: Option<ChildStdin>,
@@ -201,8 +212,14 @@ impl Session {
     /// Send one request line without waiting for its response.
     fn send(&mut self, req: &Value) {
         let stdin = self.stdin.as_mut().expect("stdin open");
-        writeln!(stdin, "{req}").expect("write request");
-        stdin.flush().expect("flush");
+        let (thread, buf) = (&mut self.stderr_thread, &self.stderr_buf);
+        child_stdin_report::write_line_or_report_with(
+            stdin,
+            &mut self.child,
+            || collect_stderr(thread, buf),
+            "request",
+            &req.to_string(),
+        );
     }
 
     /// Read one response line (blocks; the cells' children are bounded).
@@ -216,8 +233,14 @@ impl Session {
 
     fn request(&mut self, req: &Value) -> Value {
         let stdin = self.stdin.as_mut().expect("stdin open");
-        writeln!(stdin, "{req}").expect("write request");
-        stdin.flush().expect("flush");
+        let (thread, buf) = (&mut self.stderr_thread, &self.stderr_buf);
+        child_stdin_report::write_line_or_report_with(
+            stdin,
+            &mut self.child,
+            || collect_stderr(thread, buf),
+            "request",
+            &req.to_string(),
+        );
         let mut line = String::new();
         self.stdout.read_line(&mut line).expect("read response");
         serde_json::from_str(&line).expect("json response")
@@ -749,15 +772,16 @@ fn a_pipelined_burst_cut_by_sigterm_loses_no_acknowledged_write_4347() {
         // Initialize first and wait for the answer: the stop handlers are
         // installed before the loop serves, so from here a signal is a
         // graceful stop (a signal before that has nothing queued to lose).
-        writeln!(
-            stdin,
-            "{}",
-            json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+        child_stdin_report::write_line_or_report(
+            &mut stdin,
+            &mut child,
+            None,
+            "initialize",
+            &json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
                 "protocolVersion":"2024-11-05","capabilities":{},
                 "clientInfo":{"name":"probe4347","version":"1"}}})
-        )
-        .expect("write initialize");
-        stdin.flush().expect("flush");
+            .to_string(),
+        );
         let init_deadline = Instant::now() + STARTUP_BOUND;
         while !responses.lock().is_ok_and(|m| m.contains_key(&1)) {
             // A child that exited at start-up fails now, with its status and

@@ -26,6 +26,8 @@ use std::process::Stdio;
 use ai_memory::mcp::MCP_MAX_LINE_BYTES;
 use serde_json::Value;
 
+#[path = "common/child_stdin_report.rs"]
+mod child_stdin_report;
 #[path = "common/mcp_wait.rs"]
 mod mcp_wait;
 

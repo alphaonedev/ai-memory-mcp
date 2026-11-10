@@ -36,6 +36,7 @@ mod mcp_wait;
 // onto the release head and declares `pub mod tls;` there, so the one
 // `common::tls` path serves both trees (a second by-path declaration is the
 // clippy `duplicate_mod` lint).
+use common::child_stdin_report;
 use common::tls::{
     LOCAL_CA_CERT_FILE, LOCAL_CA_KEY_FILE, LOCAL_TLS_SUBDIR, SERVER_CERT_FILE, SERVER_KEY_FILE,
     TestTls, local_ca_client,
@@ -481,7 +482,6 @@ fn observed_fleet_signals_never_promote_out_of_zero_config_3709() {
 /// asserted; whether a key file appears depends on the tree, not on this cell.
 #[cfg(unix)]
 fn provision_daemon_signing_key(root: &Path) {
-    use std::io::Write as _;
     let params = serde_json::json!({
         "host_session_id": "sess-3705",
         "host_turn_index": 1,
@@ -496,12 +496,7 @@ fn provision_daemon_signing_key(root: &Path) {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn capture-turn");
-    child
-        .stdin
-        .take()
-        .expect("piped stdin")
-        .write_all(params.to_string().as_bytes())
-        .expect("write stdin");
+    child_stdin_report::send_and_close(&mut child, "stdin payload", params.to_string().as_bytes());
     let out = child.wait_with_output().expect("capture-turn output");
     assert!(
         out.status.success(),

@@ -14,7 +14,7 @@
 //! All reads use a worker thread with a bounded timeout so a hung
 //! response surfaces as a test failure rather than a CI hang.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::mpsc;
 
@@ -25,6 +25,8 @@ use tempfile::TempDir;
 // detection) instead of the fixed 10s constant this file used to carry
 // (and that `tests/issue_1317_cli_reflect_wire_layer_preserves_caller_
 // metadata.rs` copied verbatim before it flaked on PR #2522).
+#[path = "common/child_stdin_report.rs"]
+mod child_stdin_report;
 #[path = "common/mcp_wait.rs"]
 mod mcp_wait;
 
@@ -33,6 +35,18 @@ mod mcp_wait;
 struct McpChild {
     child: Option<Child>,
     stdin: Option<ChildStdin>,
+    stderr: Option<child_stdin_report::StderrCapture>,
+}
+
+impl McpChild {
+    /// Write one request line; a failed write reaps the child and fails with
+    /// its exit status and stderr (#8734).
+    fn write_line(&mut self, what: &str, line: &str) {
+        let (Some(stdin), Some(child)) = (self.stdin.as_mut(), self.child.as_mut()) else {
+            panic!("{what}: the MCP child is already closed");
+        };
+        child_stdin_report::write_line_or_report(stdin, child, self.stderr.as_ref(), what, line);
+    }
 }
 
 impl Drop for McpChild {
@@ -87,18 +101,10 @@ fn spawn_mcp(db: &std::path::Path) -> (McpChild, mpsc::Receiver<String>) {
 
     let stdin = child.stdin.take().unwrap();
     let stdout = child.stdout.take().unwrap();
-    // Drain stderr so the child doesn't block writing to it.
-    if let Some(stderr) = child.stderr.take() {
-        std::thread::spawn(move || {
-            let mut buf = [0u8; 4096];
-            let mut s = stderr;
-            while let Ok(n) = s.read(&mut buf) {
-                if n == 0 {
-                    break;
-                }
-            }
-        });
-    }
+    let stderr = child
+        .stderr
+        .take()
+        .map(child_stdin_report::StderrCapture::drain);
 
     let (tx, rx) = mpsc::channel();
     spawn_stdout_reader(stdout, tx);
@@ -106,6 +112,7 @@ fn spawn_mcp(db: &std::path::Path) -> (McpChild, mpsc::Receiver<String>) {
         McpChild {
             child: Some(child),
             stdin: Some(stdin),
+            stderr,
         },
         rx,
     )
@@ -131,14 +138,13 @@ fn spawn_stdout_reader(stdout: ChildStdout, tx: mpsc::Sender<String>) {
 /// Send a JSON-RPC request line to the MCP child's stdin, then wait up
 /// to `READ_TIMEOUT` for the next response line.
 fn send_and_recv(
-    stdin: &mut ChildStdin,
+    stdin: &mut McpChild,
     rx: &mpsc::Receiver<String>,
     payload: &serde_json::Value,
 ) -> serde_json::Value {
     let line = serde_json::to_string(payload).unwrap();
     let ctx = payload["method"].as_str().unwrap_or("<unknown method>");
-    writeln!(stdin, "{line}").expect("write to mcp stdin");
-    stdin.flush().expect("flush mcp stdin");
+    stdin.write_line("MCP request", &line);
     let resp = mcp_wait::recv_mcp_response(rx, ctx);
     serde_json::from_str(&resp).unwrap_or_else(|e| panic!("parse mcp response: {e}: {resp}"))
 }
@@ -148,7 +154,7 @@ fn mcp_initialize_handshake_succeeds() {
     let tmp = TempDir::new().unwrap();
     let db = tmp.path().join("mcp.db");
     let (mut guard, rx) = spawn_mcp(&db);
-    let stdin = guard.stdin.as_mut().unwrap();
+    let stdin = &mut guard;
 
     let resp = send_and_recv(
         stdin,
@@ -175,7 +181,7 @@ fn mcp_list_tools_returns_expected_count() {
     let tmp = TempDir::new().unwrap();
     let db = tmp.path().join("mcp.db");
     let (mut guard, rx) = spawn_mcp(&db);
-    let stdin = guard.stdin.as_mut().unwrap();
+    let stdin = &mut guard;
 
     // initialize first
     let _ = send_and_recv(
@@ -227,7 +233,7 @@ fn mcp_call_memory_store_then_memory_recall_roundtrip() {
     let tmp = TempDir::new().unwrap();
     let db = tmp.path().join("mcp.db");
     let (mut guard, rx) = spawn_mcp(&db);
-    let stdin = guard.stdin.as_mut().unwrap();
+    let stdin = &mut guard;
 
     // initialize
     let _ = send_and_recv(

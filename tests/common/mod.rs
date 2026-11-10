@@ -82,6 +82,12 @@ pub mod pg_isolate;
 #[cfg(feature = "sal-postgres")]
 pub mod pg_barrier;
 
+// #8734 — the ONE declaration of `child_stdin_report.rs` for every crate that has
+// `mod common;`. A test file there writes `use common::child_stdin_report;`; a
+// crate without `mod common;` loads it through `#[path]` (std-only leaf, same
+// idiom as `mcp_wait`); `mcp_stdio_child` reaches it as `super::child_stdin_report`.
+pub mod child_stdin_report;
+
 // #3777 — the ONE lane-database predicate every guarded postgres cell calls.
 pub mod lane_db;
 

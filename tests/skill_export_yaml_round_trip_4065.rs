@@ -22,6 +22,8 @@
 use rusqlite::OptionalExtension as _;
 use serde_json::{Value, json};
 
+#[path = "common/child_stdin_report.rs"]
+mod child_stdin_report;
 #[path = "common/mcp_wait.rs"]
 mod mcp_wait;
 
