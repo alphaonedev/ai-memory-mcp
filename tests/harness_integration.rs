@@ -90,7 +90,7 @@ fn detect_from_initialize(client_name: &str) -> Harness {
         "id": 1,
         "method": "initialize",
         "params": {
-            "protocolVersion": "2025-03-26",
+            "protocolVersion": "2024-11-05",
             "capabilities": {},
             "clientInfo": { "name": client_name, "version": "0.0.0-test" }
         }

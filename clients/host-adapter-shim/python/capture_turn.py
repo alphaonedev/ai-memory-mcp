@@ -130,7 +130,7 @@ def build_mcp_frames(capture_request: dict[str, Any]) -> str:
         "id": 1,
         "method": "initialize",
         "params": {
-            "protocolVersion": "2025-03-26",
+            "protocolVersion": "2024-11-05",
             "capabilities": {},
             "clientInfo": {"name": "capture-turn-shim-py", "version": "0.1"},
         },
