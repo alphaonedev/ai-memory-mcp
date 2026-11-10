@@ -419,7 +419,7 @@ fn argument_text(clean: &str, open: usize) -> Option<(&str, usize)> {
     None
 }
 
-/// A literal, or a SCREAMING_CASE constant path, has a fixed width.
+/// A literal, or a `SCREAMING_CASE` constant path, has a fixed width.
 fn constant_width(argument: &str) -> bool {
     let argument = argument.trim().trim_start_matches('&');
     let last = argument.rsplit("::").next().unwrap_or(argument);
@@ -524,7 +524,7 @@ fn audit(findings: &[Finding], allowed: &[Allowed]) -> Vec<String> {
 }
 
 fn whole(source: &str) -> Vec<std::ops::Range<usize>> {
-    vec![0..source.len()]
+    std::iter::once(0..source.len()).collect()
 }
 
 #[test]
