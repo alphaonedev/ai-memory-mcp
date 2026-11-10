@@ -333,17 +333,13 @@ impl<'a> ReflectionPass<'a> {
     /// 4. Discard clusters below [`MIN_CLUSTER_SIZE`] (eligibility
     ///    enforces this too, but discarding here keeps the API tight).
     fn cluster(&self, memories: &[Memory]) -> Vec<Vec<MemoryId>> {
-        let mut by_ns: std::collections::HashMap<&str, Vec<&Memory>> =
-            std::collections::HashMap::new();
-        for m in memories {
-            if !is_clusterable_observation(m) {
-                continue;
-            }
-            by_ns.entry(&m.namespace).or_default().push(m);
-        }
+        // #8758 — group by `(namespace, owner, scope)` partition.
+        let by_partition =
+            crate::partition::group_indices_by_partition(memories, is_clusterable_observation);
 
         let mut clusters: Vec<Vec<MemoryId>> = Vec::new();
-        for (_ns, group) in by_ns {
+        for idxs in by_partition.into_values() {
+            let group: Vec<&Memory> = idxs.iter().map(|&i| &memories[i]).collect();
             let mut used = vec![false; group.len()];
             for i in 0..group.len() {
                 if used[i] {
@@ -390,11 +386,13 @@ impl<'a> ReflectionPass<'a> {
         if ns.starts_with('_') {
             return false;
         }
-        cluster.iter().all(|m| {
-            m.memory_kind == MemoryKind::Observation
-                && &m.namespace == ns
-                && m.access_count >= MIN_RECALL_COUNT
-        })
+        // #8758 — one namespace, one owner, one scope arm.
+        crate::partition::single_partition(cluster).is_some()
+            && cluster.iter().all(|m| {
+                m.memory_kind == MemoryKind::Observation
+                    && &m.namespace == ns
+                    && m.access_count >= MIN_RECALL_COUNT
+            })
     }
 
     /// LLM-summarise the cluster into a single proposed Reflection
@@ -478,8 +476,13 @@ impl<'a> ReflectionPass<'a> {
             // operator-visible under enforcement. The owner stays the
             // curator for attribution (the substrate `reflect` path stamps
             // `metadata.agent_id` from `ReflectInput::agent_id`).
+            //
+            // #8758 — but never WIDER than its sources: the stamp is the
+            // canonical token of the narrowest source arm, so a reflection
+            // over private observations stays private and one over
+            // collective observations stays collective.
             metadata: serde_json::json!({
-                "scope": crate::models::MemoryScope::Collective.as_str(),
+                "scope": crate::partition::narrowest_scope_token(cluster),
             }),
             reflection_depth: 0,
             memory_kind: MemoryKind::Reflection,
@@ -1578,13 +1581,14 @@ mod tests {
             // verify() should succeed on it.
             pass.verify(refl.id.clone()).await.unwrap();
             // #1720 D2 — the persisted reflection carries an EXPLICIT
-            // `collective` scope (not the accidental default-private that
-            // would be operator-invisible under enforcement), and stays
-            // attributed to the curator via metadata.agent_id.
+            // scope (never an absent one), and stays attributed to the
+            // curator via metadata.agent_id. #8758 — that scope is never
+            // wider than its sources: these observations carry no scope
+            // (owner-private), so the reflection is stamped `private`.
             assert_eq!(
                 refl.metadata.get("scope").and_then(|v| v.as_str()),
-                Some(crate::models::MemoryScope::Collective.as_str()),
-                "curator reflection must be stamped collective (#1720 D2); got {:?}",
+                Some(crate::models::MemoryScope::Private.as_str()),
+                "curator reflection over private sources must be stamped private (#8758); got {:?}",
                 refl.metadata.get("scope")
             );
             assert_eq!(

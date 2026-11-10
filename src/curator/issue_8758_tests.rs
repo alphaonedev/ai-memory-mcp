@@ -18,9 +18,9 @@ use crate::models::{ConfidenceSource, LifecycleState, Memory, MemoryKind, Tier};
 use super::cluster::ConsolidationClustering;
 
 /// Two owners that share a namespace in the audit scenario.
-pub(super) const OWNERS: [&str; 2] = ["ai:alice-8758", "ai:bob-8758"];
+pub(crate) const OWNERS: [&str; 2] = ["ai:alice-8758", "ai:bob-8758"];
 /// Every scope arm, plus the two spellings that alias an arm.
-pub(super) const SCOPES: [Option<&str>; 7] = [
+pub(crate) const SCOPES: [Option<&str>; 7] = [
     None,
     Some("private"),
     Some("team"),
@@ -30,14 +30,14 @@ pub(super) const SCOPES: [Option<&str>; 7] = [
     Some("shared"),
 ];
 /// Two sibling namespaces (cross-namespace merging was already refused).
-pub(super) const NAMESPACES: [&str; 2] = ["proj8758/app", "proj8758/other"];
+pub(crate) const NAMESPACES: [&str; 2] = ["proj8758/app", "proj8758/other"];
 /// One body for every row, so content similarity never separates them: only
 /// the partition may.
 const BODY: &str = "kubernetes rolling canary deploy strategy notes for the payments service";
 /// Embedding width for the pure clustering table.
 const DIM: usize = 8;
 /// The canonical private token stamped on curator-written rows.
-pub(super) const PRIVATE: &str = "private";
+pub(crate) const PRIVATE: &str = "private";
 
 /// Independent scope oracle: the visibility arm a raw scope token selects.
 fn arm(scope: Option<&str>) -> u8 {
@@ -53,10 +53,10 @@ fn arm(scope: Option<&str>) -> u8 {
 
 /// One cell of the owner x scope x namespace grid.
 #[derive(Clone, Copy, Debug)]
-pub(super) struct Cell {
-    pub(super) owner: &'static str,
-    pub(super) scope: Option<&'static str>,
-    pub(super) namespace: &'static str,
+pub(crate) struct Cell {
+    pub(crate) owner: &'static str,
+    pub(crate) scope: Option<&'static str>,
+    pub(crate) namespace: &'static str,
 }
 
 impl Cell {
@@ -76,7 +76,7 @@ impl Cell {
     }
 }
 
-pub(super) fn grid() -> Vec<Cell> {
+pub(crate) fn grid() -> Vec<Cell> {
     let mut cells = Vec::new();
     for namespace in NAMESPACES {
         for owner in OWNERS {
@@ -92,7 +92,7 @@ pub(super) fn grid() -> Vec<Cell> {
     cells
 }
 
-pub(super) fn memory(
+pub(crate) fn memory(
     id: &str,
     title: &str,
     cell: Cell,
@@ -138,7 +138,8 @@ pub(super) fn memory(
     }
 }
 
-pub(super) fn scope_of(m: &Memory) -> Option<&str> {
+#[cfg(feature = "sal")]
+pub(crate) fn scope_of(m: &Memory) -> Option<&str> {
     m.metadata
         .get(crate::META_KEY_SCOPE)
         .and_then(serde_json::Value::as_str)
@@ -148,7 +149,7 @@ pub(super) fn scope_of(m: &Memory) -> Option<&str> {
 /// `clusters_pair` runs the clustering site under test over `[a, a2, b]`
 /// (`a2` is a second row in `a`'s cell so a pass with a 3-member floor can
 /// still form a cluster) and reports whether `a` and `b` landed together.
-pub(super) fn assert_pair_table(site: &str, mut clusters_pair: impl FnMut(Cell, Cell) -> bool) {
+pub(crate) fn assert_pair_table(site: &str, mut clusters_pair: impl FnMut(Cell, Cell) -> bool) {
     let cells = grid();
     let mut wrong = Vec::new();
     let mut together = 0_usize;
@@ -290,13 +291,13 @@ fn issue_8758_rollback_rows_are_explicitly_private() {
 /// Recording stub: every summarise prompt is kept as the titles it carried.
 #[cfg(feature = "sal")]
 #[derive(Default)]
-pub(super) struct RecordingLlm {
+pub(crate) struct RecordingLlm {
     prompts: std::sync::Mutex<Vec<Vec<String>>>,
 }
 
 #[cfg(feature = "sal")]
 impl RecordingLlm {
-    pub(super) fn prompts(&self) -> Vec<Vec<String>> {
+    pub(crate) fn prompts(&self) -> Vec<Vec<String>> {
         self.prompts.lock().map(|p| p.clone()).unwrap_or_default()
     }
 }

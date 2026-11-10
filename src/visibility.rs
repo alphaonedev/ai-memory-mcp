@@ -349,8 +349,8 @@ pub fn title_slot_disposition(
 /// surface needing to distinguish "visible because this principal OWNS the row"
 /// from "visible because the row's scope is broad" had to re-derive the
 /// classification — precisely the duplication #951 exists to prevent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ScopeArm {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) enum ScopeArm {
     /// Owner-keyed private: an absent `scope` key, an explicit `private`, or
     /// (per #2633) any unrecognised token outside [`LEGACY_BROAD_SCOPES`].
     OwnerPrivate,
@@ -359,6 +359,12 @@ enum ScopeArm {
     /// `team` / `unit` / `org` — #1921 subtree-restricted. The payload is the
     /// namespace-ancestor index (1 / 2 / 3).
     Subtree(usize),
+}
+
+/// #8758 — the visibility arm `memory` is in; the scope component of
+/// [`crate::partition::PartitionKey`].
+pub(crate) fn scope_arm_of(memory: &crate::models::Memory) -> ScopeArm {
+    classify_scope(&memory.id, &memory.namespace, &memory.metadata)
 }
 
 /// Classify `metadata.scope` into the arm [`is_visible_by_fields`] dispatches
