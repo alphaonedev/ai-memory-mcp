@@ -63,13 +63,16 @@ const SEPARATORS: &[&str] = &[
 ];
 
 fn captured_detail(detail: &str) -> String {
-    operator_capture::captured(|| {
+    let log = operator_capture::captured(|| {
         ai_memory::mcp::error_text::log_foreign(
             "masking_class_8205",
             anyhow::anyhow!(detail.to_owned()),
         )
     })
-    .1
+    .1;
+    // Every caller reads an absence or a cost; an empty capture would pass both.
+    operator_capture::assert_event_captured(&log, "masking_class_8205");
+    log
 }
 
 fn minimum_masking_cost(detail: &str) -> std::time::Duration {

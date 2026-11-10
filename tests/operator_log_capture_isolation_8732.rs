@@ -26,6 +26,9 @@ use std::sync::Barrier;
 /// Fixed panic text of a nested `captured` on one thread.
 const NESTED_CAPTURE_PANIC: &str =
     "operator_log_capture: captured() called while this thread already holds an active capture";
+/// Fixed panic text when a capture that must hold an event is empty.
+const EMPTY_CAPTURE_PANIC: &str =
+    "operator_log_capture: expected a captured event but the capture is empty";
 /// Fixed panic text when another global subscriber is already installed.
 const GLOBAL_INSTALL_PANIC: &str = "operator_log_capture: another global tracing subscriber is already installed in this test binary";
 
@@ -110,7 +113,7 @@ fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
 #[test]
 fn sibling_pins_callsite_before_capturing_thread_emits_8732() {
     let ((), log) = captured(|| {
-        std::thread::spawn(|| emit_sibling_race("sibling"))
+        std::thread::spawn(|| emit_sibling_race("other-thread"))
             .join()
             .expect("sibling thread");
         emit_sibling_race("capturing");
@@ -125,7 +128,10 @@ fn sibling_pins_callsite_before_capturing_thread_emits_8732() {
         lines[0].contains("capturing"),
         "wrong event captured: {log:?}"
     );
-    assert!(!log.contains("sibling"), "sibling event leaked: {log:?}");
+    assert!(
+        !log.contains("other-thread"),
+        "sibling event leaked: {log:?}"
+    );
 }
 
 /// (b) Many sinkless siblings hammer a fresh callsite in every round, in step
@@ -230,6 +236,20 @@ fn events_outside_a_capture_are_not_carried_into_the_next_one_8732() {
         lines_with(&log, "isolation_probe_plain_8732").len(),
         1,
         "{log:?}"
+    );
+}
+
+/// An empty capture that must hold an event names itself with the fixed text.
+#[test]
+fn empty_capture_where_an_event_is_expected_names_itself_8732() {
+    let ((), log) = captured(|| ());
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        operator_capture::assert_event_captured(&log, "no-op closure");
+    }));
+    let payload = outcome.expect_err("an empty capture must panic");
+    assert_eq!(
+        panic_text(payload.as_ref()),
+        format!("{EMPTY_CAPTURE_PANIC}: no-op closure")
     );
 }
 

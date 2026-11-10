@@ -877,10 +877,16 @@ fn skill_promote_logs_escape_caller_controls_6822() {
 }
 
 fn assert_escaped_promote_log(log: &str, context: &str) {
-    let diagnostic = log
+    let events: Vec<&str> = log
         .lines()
-        .find(|line| line.contains("mcp.tool.error"))
-        .expect("operator error event");
+        .filter(|line| line.contains("mcp.tool.error"))
+        .collect();
+    assert_eq!(
+        events.len(),
+        1,
+        "{context}: expected exactly one mcp.tool.error event; captured log: {log:?}"
+    );
+    let diagnostic = events[0];
     assert!(diagnostic.contains(context), "{diagnostic}");
     for &(raw, control) in operator_capture::CONTROL_PAIRS {
         assert!(
