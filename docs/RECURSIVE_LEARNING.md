@@ -522,6 +522,23 @@ opening a `sqlite3` shell. The on-disk artefact is **derived** —
 the SQL row stays canonical; the directory is safe to delete and
 regenerate.
 
+On Unix, CLI and automatic exports create mode 0700 export roots and namespace
+directories owned by the current user, and atomically publish mode 0600 files.
+Existing managed directories must already have mode 0700; the exporter refuses
+broader directories instead of changing permissions. Choose a new private root
+or explicitly repair the owned export directories before retrying an older
+0755 tree. Existing ancestors are not changed and must remain under trusted
+control. Symlink directories and symlink/non-regular file destinations are
+refused. Ordinary `team/alpha` namespace nesting is preserved.
+Platforms without Unix permissions refuse these exports.
+Refusal cannot undo earlier disclosure. A crash can leave a private
+`.private-export-*.stage` file. Before publication, a sweep runs once per destination
+directory per CLI run and once per automatic reflection or persona export call. It removes only regular staging
+files whose modification time is older than one hour; newer or future modification
+times are retained, as are symlinks and non-regular entries. Cleanup errors warn
+without stopping export. Remove any remaining incomplete stages manually only with
+exporters stopped.
+
 ```bash
 # Bulk export, operator-driven.
 ai-memory export-reflections \

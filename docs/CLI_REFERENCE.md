@@ -1439,17 +1439,22 @@ Walks the reflection-chain and writes Markdown to
 `~/.ai-memory/reflections/<ns>/<id>.md` by default. Pair with
 `auto_export_reflections_to_filesystem = true` for hands-off operation.
 
-On Unix, CLI and automatic reflection exports create plaintext files with mode
-0600 through a synced, same-directory staging file and atomic replacement of an
-existing regular file, refusing symlink and non-regular destinations; the parent
-directory is then synced, and a sync error is reported without removing the
-published file. The sweep runs once per destination directory per CLI run and
-once per auto-export call. The sweep removes regular `.private-export-*.stage` files whose
+Unix exports create current-user-owned mode 0700 roots and namespace directories
+and atomically publish mode 0600 files. Existing managed directories must already
+have mode 0700: choose a new private `--out-dir` or explicitly repair the owned
+export directories before retrying. Existing ancestors are never chmodded.
+Symlink directories and symlink/non-regular destinations are refused; platforms
+without Unix permissions refuse filesystem exports. See
+[file-backed export](RECURSIVE_LEARNING.md#file-backed-export) for migration and
+interrupted-export cleanup details.
+
+Files are synced and closed before same-directory atomic replacement; the opened
+parent directory is then synced. A directory-sync error is reported without
+removing the published file. The sweep runs once per destination directory per CLI run and
+once per automatic reflection or persona export call. The sweep removes regular `.private-export-*.stage` files whose
 modification time is older than one hour; files with a newer or future modification
 time are kept. Cleanup errors emit a warning and do not stop export.
-Non-Unix platforms refuse filesystem reflection export because the private-file
-and directory-sync guarantees are unsupported: the CLI returns an error, while
-auto-export logs a warning and writes nothing.
+The CLI returns an error on unsupported platforms; auto-export logs a warning and writes nothing.
 
 ### `persona` — QW-2 persona-as-artifact
 

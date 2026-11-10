@@ -222,6 +222,12 @@ fn assert_writer(writer: Writer, shape: IdShape) {
         fs::write(root.join("protected"), b"unchanged").unwrap();
         let out_dir = root.join("exports");
         if existing {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                fs::DirBuilder::new().mode(0o700).create(&out_dir).unwrap();
+            }
+            #[cfg(not(unix))]
             fs::create_dir(&out_dir).unwrap();
             fs::write(out_dir.join("keep"), b"existing export").unwrap();
         }

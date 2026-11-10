@@ -117,6 +117,24 @@ the same fields as the SQL row plus the rendered body. Operators may
 freely delete or regenerate the directory — the SQL row stays
 canonical.
 
+On Unix, persona exports use mode 0600 files and mode 0700 directories
+owned by the current user. Publication replaces the file atomically; symlinks
+and non-regular destinations are refused. Slashes in namespace and entity
+names become underscores; empty names and the components `.` and `..` are
+refused. These exports are unsupported on platforms without Unix permissions.
+
+Existing export roots and namespace directories must already have mode 0700.
+The exporter never changes their permissions or those of existing ancestors.
+For an older 0755 export tree, choose a new private root or explicitly repair
+the owned export directories before retrying. Refusal does not repair files
+previously exposed by an older export. Keep the root's ancestor directories
+under trusted control; permissions do not isolate processes running as the
+same OS user. A crash can leave a private `.private-export-*.stage` file.
+Before publication, each persona export sweeps its namespace directory and
+removes only regular staging files whose modification time is older than one
+hour; newer or future modification times, symlinks and non-regular entries are
+kept. Cleanup errors warn without stopping export.
+
 The export is opt-in per namespace, symmetric with QW-1's
 `auto_export_reflections_to_filesystem`. Operators who want governance
 enforcement *without* plaintext personas on disk leave the policy
