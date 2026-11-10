@@ -47,12 +47,13 @@ pub fn family_of(provider: &str, model_ref: &str) -> Option<String> {
         ("anthropic", "claude"),
         ("grok", "grok"),
         ("gpt", "gpt"),
-        // Retired providers have no stem here. Dropping a stem is the
-        // FAIL-SAFE direction for this table: such a model resolves to
-        // `None` (CLAIMED, unattested) instead of being laundered into a
-        // family whose provider the substrate can no longer construct a
-        // client for. No durable row is rewritten; only new attestations
-        // change, and they change toward "we do not know".
+        // Retired providers have no stem here. A model of a retired
+        // family therefore resolves to `None` on EVERY backend, including
+        // a supported multi-family backend that still serves it. That is
+        // the FAIL-SAFE direction for this table: the model reads as
+        // CLAIMED (unattested), never mis-attributed to another family.
+        // No durable row is rewritten; only new attestations change, and
+        // they change toward "we do not know".
         ("mixtral", "mistral"),
         ("mistral", "mistral"),
     ];

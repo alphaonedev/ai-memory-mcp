@@ -7,3 +7,6 @@ API-key environment-variable fallbacks and model-family stem are removed, and
 the provider-name gate (`scripts/ci/check_no_cn_ai_vendor.py`) now exempts no
 functional code (`functional_code_sites` is empty). The documented alias count
 is reconciled to 12 vendor aliases plus `openai-compatible` and native Ollama.
+New loader attestations for models of the retired families, served through
+any backend, record no family (the memory stays CLAIMED); existing rows are
+not rewritten.

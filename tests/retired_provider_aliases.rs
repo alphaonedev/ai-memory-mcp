@@ -49,6 +49,7 @@ use ai_memory::config::{
 };
 use ai_memory::egress::PinnedTarget;
 use ai_memory::embeddings::Embedder;
+use ai_memory::identity::model_family::family_of;
 use ai_memory::llm::OllamaClient;
 
 /// Fragments of each retired provider alias. One row per alias the
@@ -851,5 +852,42 @@ fn vendor_gate_functional_code_sites_is_empty() {
     assert!(
         listed.is_empty(),
         "{FUNCTIONAL_CODE_SITES_KEY} must be empty; still listed: {listed:?}"
+    );
+}
+
+/// Supported multi-family backends that can still serve a model of a
+/// retired family.
+const MULTI_FAMILY_BACKENDS: &[&str] = &["ollama", "openrouter", "together", "openai-compatible"];
+
+/// The family table holds no stem for a retired family: a model of that
+/// family resolves to no family (CLAIMED) on EVERY backend, including a
+/// supported multi-family backend that still serves it. The control on
+/// the same sink proves the table still resolves a supported family.
+#[test]
+fn retired_family_model_has_no_family_on_any_backend() {
+    let stem = ["qw", "en"].concat();
+    let model_tags = [
+        format!("{stem}2.5:7b"),
+        format!("{stem}/{stem}-2.5-72b-instruct"),
+        format!(
+            "{}/{}2.5-72B",
+            stem.to_ascii_uppercase(),
+            stem.to_ascii_uppercase()
+        ),
+        format!("{PAD_LEAD}{stem}3:8b{PAD_TRAIL}"),
+    ];
+    for backend in MULTI_FAMILY_BACKENDS {
+        for model in &model_tags {
+            assert_eq!(
+                family_of(backend, model),
+                None,
+                "backend `{backend}` model `{model}`: a retired family must record no family"
+            );
+        }
+    }
+    assert_eq!(
+        family_of(SUPPORTED_PARENT_BACKEND, "llama3.1:8b").as_deref(),
+        Some("llama"),
+        "presence control: a supported family still resolves on the same sink"
     );
 }
