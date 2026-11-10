@@ -196,8 +196,31 @@ pub(crate) fn forward_action_transition_to_http(
         forward_url.trim_end_matches('/'),
         id
     );
-    let agent_id =
-        crate::identity::resolve_agent_id(None, mcp_client).map_err(|e| e.to_string())?;
+    // #8759 — the forwarded `X-Agent-Id` is the principal the daemon binds
+    // `claimed_by` to, so it must never be derived from a request field
+    // without first COMPARING that field to the authenticated MCP principal.
+    // Shape, then the shared bind (refused before any network I/O with the
+    // same named error as the local lane); the header then follows the #3171
+    // store-forward precedent (the single-operator posture forwards as the
+    // worker it names).
+    let claimed_by = params[crate::mcp::param_names::CLAIMED_BY].as_str();
+    if let Some(claimed) = claimed_by {
+        crate::validate::validate_agent_id(claimed).map_err(|e| e.to_string())?;
+        crate::coordination_guard::with_mcp_principal(|principal| {
+            crate::coordination_guard::bind_claimed_identity(
+                crate::mcp::param_names::CLAIMED_BY,
+                claimed,
+                principal,
+                crate::coordination_guard::TRANSITION_ACTION_OP,
+            )
+        })?;
+    }
+    let agent_id = crate::identity::resolve_governance_subject(
+        claimed_by,
+        mcp_client,
+        crate::coordination_guard::TRANSITION_ACTION_OP,
+    )
+    .map_err(|e| e.to_string())?;
     let body = params.clone();
     let headers: &[(&str, String)] = &[(crate::HEADER_AGENT_ID, agent_id)];
     forward_to_http(reqwest::Method::POST, &url, Some(&body), headers)
@@ -261,6 +284,34 @@ mod coordination_forward_tests {
             err.contains("/api/v1/actions/act-1/transition"),
             "URL carries the action id in the path; got: {err}"
         );
+    }
+
+    /// #8759 — a forwarded transition whose `claimed_by` differs from the
+    /// authenticated MCP principal is refused with the shared named error
+    /// BEFORE any network I/O (the dead URL would otherwise surface a
+    /// `federation_forward` transport error).
+    #[test]
+    fn action_transition_forward_refuses_a_foreign_claimed_by_8759() {
+        let _id = crate::identity::test_agent_id::AgentIdOverride::set("ai:bob-act");
+        let err = forward_action_transition_to_http(
+            DEAD_URL,
+            &json!({"id": "act-1", "to": "done", "claimed_by": "ai:alice-act"}),
+            None,
+        )
+        .expect_err("a foreign claimed_by must be refused");
+        assert_eq!(
+            err,
+            "acting_identity_mismatch: caller 'ai:bob-act' may only transition an action as \
+             itself (claimed_by 'ai:alice-act')"
+        );
+        // equal: passes the bind and reaches the transport.
+        let err = forward_action_transition_to_http(
+            DEAD_URL,
+            &json!({"id": "act-1", "to": "done", "claimed_by": "ai:bob-act"}),
+            None,
+        )
+        .expect_err("dead URL must error");
+        assert!(err.contains("federation_forward"), "got: {err}");
     }
 
     #[test]

@@ -133,6 +133,95 @@ pub fn resolve_actor(caller_supplied: Option<&str>) -> Result<String, String> {
     })
 }
 
+/// #8759 — prefix of the refusal raised by [`bind_claimed_identity`] when a
+/// caller-supplied holder / claimant field names a principal other than the
+/// authenticated caller. One literal shared by every transport (MCP stdio,
+/// the MCP→HTTP forward, HTTP) so a client can match the refusal exactly.
+pub const ACTING_IDENTITY_MISMATCH: &str = "acting_identity_mismatch";
+
+/// #8759 — names the operation in the [`bind_claimed_identity`] refusal for an
+/// action transition (`memory_action_transition` / `POST
+/// /api/v1/actions/{id}/transition`).
+pub const TRANSITION_ACTION_OP: &str = "transition an action";
+
+/// #8759 — names the operation in the [`bind_claimed_identity`] refusal for a
+/// checkpoint resolve (`memory_checkpoint_resolve`).
+pub const RESOLVE_CHECKPOINT_OP: &str = "resolve a checkpoint";
+
+/// #8759 — the AUTHENTICATED acting principal of a coordination mutation,
+/// resolved by the transport, never read from the request body.
+///
+/// - `Authenticated(id)`: the transport established who the caller is (the
+///   MCP process identity `AI_MEMORY_AGENT_ID`, or the HTTP `X-Agent-Id`
+///   header / synthesized per-request anonymous id). Every caller-supplied
+///   holder / claimant field must equal `id`.
+/// - `SingleOperator`: the MCP stdio process runs with no configured identity
+///   — the local single-operator posture, in which the one operator may name
+///   any worker identity (the #3171 / #3363 precedent of
+///   [`crate::identity::resolve_governance_subject`]). HTTP never yields this
+///   variant: it always resolves a principal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActingPrincipal<'a> {
+    /// The transport-authenticated caller id.
+    Authenticated(&'a str),
+    /// MCP stdio with no configured identity (single-operator posture).
+    SingleOperator,
+}
+
+impl<'a> ActingPrincipal<'a> {
+    /// Map the MCP stdio caller (`identity::resolve_mcp_read_visibility_caller`)
+    /// onto a principal: `None` is the single-operator posture.
+    #[must_use]
+    pub fn from_mcp_caller(caller: Option<&'a str>) -> Self {
+        caller.map_or(Self::SingleOperator, Self::Authenticated)
+    }
+}
+
+/// #8759 — resolve the MCP stdio acting principal for a coordination mutation
+/// and hand it to `f`. Fails closed: an `AI_MEMORY_AGENT_ID` that is set but
+/// empty, malformed or non-Unicode is a refusal, never a fall-back to the
+/// single-operator posture.
+///
+/// # Errors
+/// The stringified identity-resolution failure, or whatever `f` returns.
+pub fn with_mcp_principal<T>(
+    f: impl FnOnce(ActingPrincipal<'_>) -> Result<T, String>,
+) -> Result<T, String> {
+    let caller =
+        crate::identity::resolve_mcp_read_visibility_caller().map_err(|e| e.to_string())?;
+    f(ActingPrincipal::from_mcp_caller(caller.as_deref()))
+}
+
+/// #8759 — the ONE comparison between a caller-supplied holder / claimant
+/// field and the authenticated acting principal. A coordination mutation
+/// never takes its acting identity from a request field: the field may only
+/// be COMPARED to the principal, and a difference is refused with the named
+/// [`ACTING_IDENTITY_MISMATCH`] error. Under the single-operator posture the
+/// field is accepted (the operator acts for any worker it names).
+///
+/// The caller shape-validates `claimed` before this (so a malformed value
+/// surfaces as the more informative shape error, the
+/// `identity::resolve_http_agent_id` precedent).
+///
+/// # Errors
+/// `"acting_identity_mismatch: caller '<principal>' may only <op> as itself
+/// (<field> '<claimed>')"` when `claimed` differs from an authenticated
+/// principal.
+pub fn bind_claimed_identity(
+    field: &str,
+    claimed: &str,
+    principal: ActingPrincipal<'_>,
+    op: &str,
+) -> Result<(), String> {
+    match principal {
+        ActingPrincipal::Authenticated(caller) if caller != claimed => Err(format!(
+            "{ACTING_IDENTITY_MISMATCH}: caller '{caller}' may only {op} as itself \
+             ({field} '{claimed}')"
+        )),
+        ActingPrincipal::Authenticated(_) | ActingPrincipal::SingleOperator => Ok(()),
+    }
+}
+
 /// Validate and screen an action through the shared direct/routine create boundary.
 /// Returns the validated action and its #1807 storage-only charge.
 ///

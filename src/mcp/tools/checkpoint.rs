@@ -209,14 +209,15 @@ pub fn handle_checkpoint_resolve(
     // #3368 — shape-validate the resolver BEFORE any lookup, state change or
     // audit emit. Pre-#3368 a control-character value (`"ai:x\nINJECTED"`)
     // reached the persisted row, the signed audit row and the log line (the
-    // #3009 vector, closed for `claimed_by`). SHAPE ONLY, never a caller
-    // binding: on the `epoch_advance` lane `resolved_by` is the OPERATOR,
-    // authenticated by its detached signature against its enrolled key (the
-    // #3007 gate below), so it legitimately differs from the node's own
-    // `AI_MEMORY_AGENT_ID`; binding it here refused a valid operator-signed
-    // resolve (the regression pinned by
-    // `epoch_advance_resolve_with_enrolled_operator_sig_accepts_signed_3007_3368`). Same shape-only precedent as
-    // `claimed_by` (#3009). Fail closed: any refusal returns here.
+    // #3009 vector, closed for `claimed_by`). SHAPE ONLY at this point: on the
+    // `epoch_advance` lane `resolved_by` may be the OPERATOR, authenticated by
+    // its detached signature against its enrolled key (the #3007 gate below),
+    // so it legitimately differs from the node's own `AI_MEMORY_AGENT_ID`
+    // (pinned by
+    // `epoch_advance_resolve_with_enrolled_operator_sig_accepts_signed_3007_3368`).
+    // #8759 — every resolution that is NOT so attested is bound to the
+    // authenticated MCP principal after the gate (`operator_attested` below).
+    // Fail closed: any refusal returns here.
     crate::validate::validate_agent_id(resolved_by)
         .map_err(|e| format!("invalid agent_id: {e}"))?;
     let resolution = params.get(param_names::RESOLUTION).and_then(Value::as_str);
@@ -326,6 +327,22 @@ pub fn handle_checkpoint_resolve(
         (keypair, now, None)
     };
     let operator_attested = external_attestation.is_some();
+    // #8759 — the acting identity of a resolution is the authenticated
+    // principal, never the `resolved_by` field: unless the resolver is
+    // attested by a verified detached signature against its own enrolled key
+    // (the #3007 `Accept` verdict above), `resolved_by` naming anyone other
+    // than the MCP principal is refused BEFORE the state change and the audit
+    // emit. A malformed principal fails closed.
+    if !operator_attested {
+        crate::coordination_guard::with_mcp_principal(|principal| {
+            crate::coordination_guard::bind_claimed_identity(
+                param_names::RESOLVED_BY,
+                resolved_by,
+                principal,
+                crate::coordination_guard::RESOLVE_CHECKPOINT_OP,
+            )
+        })?;
+    }
 
     let resolved = crate::checkpoints::resolve(
         conn,
@@ -709,6 +726,10 @@ mod d1_6_1709_tests {
 }
 
 #[cfg(test)]
+#[path = "checkpoint_principal_8759_tests.rs"]
+mod checkpoint_principal_8759_tests;
+
+#[cfg(test)]
 mod handler_tests {
     use super::*;
 
@@ -718,6 +739,9 @@ mod handler_tests {
 
     #[test]
     fn create_query_resolve_verify_roundtrips_over_mcp() {
+        // #8759 — resolve binds `resolved_by` to the MCP principal; pin the
+        // single-operator posture on this thread.
+        let _caller = crate::identity::test_agent_id::AgentIdOverride::unset();
         let conn = fresh();
         // Create a pending checkpoint.
         let created = handle_checkpoint_create(
@@ -792,6 +816,9 @@ mod handler_tests {
 
     #[test]
     fn resolve_rejects_invalid_state() {
+        // #8759 — resolve binds `resolved_by` to the MCP principal; pin the
+        // single-operator posture on this thread.
+        let _caller = crate::identity::test_agent_id::AgentIdOverride::unset();
         let conn = fresh();
         let created = handle_checkpoint_create(&conn, &json!({ "namespace": "_cp", "title": "t" }))
             .expect("create ok");
@@ -807,6 +834,9 @@ mod handler_tests {
 
     #[test]
     fn resolve_missing_id_errors() {
+        // #8759 — resolve binds `resolved_by` to the MCP principal; pin the
+        // single-operator posture on this thread.
+        let _caller = crate::identity::test_agent_id::AgentIdOverride::unset();
         let conn = fresh();
         let err = handle_checkpoint_resolve(
             &conn,
@@ -820,6 +850,9 @@ mod handler_tests {
     /// #3171 Fable MED (3) — blank/absent schema-REQUIRED strings refuse.
     #[test]
     fn resolve_refuses_blank_id_and_resolved_by_3171() {
+        // #8759 — resolve binds `resolved_by` to the MCP principal; pin the
+        // single-operator posture on this thread.
+        let _caller = crate::identity::test_agent_id::AgentIdOverride::unset();
         let conn = fresh();
         let created = handle_checkpoint_create(&conn, &json!({ "namespace": "_cp", "title": "t" }))
             .expect("create ok");
@@ -975,19 +1008,30 @@ mod handler_tests {
         .expect_err("malformed resolved_by on an unknown id is refused");
         assert!(err.contains("invalid agent_id"), "got: {err}");
 
-        // Shape-only, not a caller binding: a differing enforced caller does
-        // not refuse a well-formed resolver on the legacy lane.
+        // #8759 / #8773 — the legacy lane now binds `resolved_by` to the
+        // enforced caller: a differing well-formed resolver is refused with
+        // the named error (this line used to pin the forgery as accepted),
+        // and the caller resolving as itself succeeds.
         let _bound = crate::identity::test_agent_id::AgentIdOverride::set("ai:node");
-        let ok = handle_checkpoint_resolve(
+        let err = handle_checkpoint_resolve(
             &conn,
             &json!({ "id": id, "state": "resolved", "resolved_by": "ai:worker-1" }),
             None,
         )
-        .expect("a valid resolved_by still resolves");
+        .expect_err("a foreign resolved_by is refused");
         assert_eq!(
-            ok["checkpoint"]["resolved_by"].as_str(),
-            Some("ai:worker-1")
+            err,
+            "acting_identity_mismatch: caller 'ai:node' may only resolve a checkpoint \
+             as itself (resolved_by 'ai:worker-1')"
         );
+        assert_eq!(audit_rows(&conn), 0, "no audit row on the refusal");
+        let ok = handle_checkpoint_resolve(
+            &conn,
+            &json!({ "id": id, "state": "resolved", "resolved_by": "ai:node" }),
+            None,
+        )
+        .expect("the caller resolving as itself succeeds");
+        assert_eq!(ok["checkpoint"]["resolved_by"].as_str(), Some("ai:node"));
         assert_eq!(audit_rows(&conn), 1, "exactly one audit row on success");
     }
 
@@ -1028,6 +1072,9 @@ mod handler_tests {
     /// resolving agent; the append-only chain stays intact.
     #[test]
     fn resolve_emits_signed_events_audit_row_1722() {
+        // #8759 — resolve binds `resolved_by` to the MCP principal; pin the
+        // single-operator posture on this thread.
+        let _caller = crate::identity::test_agent_id::AgentIdOverride::unset();
         let conn = fresh();
         let created = handle_checkpoint_create(
             &conn,
@@ -1190,6 +1237,9 @@ mod handler_tests {
     /// the gate DEGRADES, never daemon-signs a caller-mintable freeze anchor.
     #[test]
     fn epoch_advance_resolve_without_enrolled_sig_stays_unsigned_3007() {
+        // #8759 — resolve binds `resolved_by` to the MCP principal; pin the
+        // single-operator posture on this thread.
+        let _caller = crate::identity::test_agent_id::AgentIdOverride::unset();
         if crate::config::run_env_isolated_child_or_spawn(
             "mcp::checkpoint::handler_tests::epoch_advance_resolve_without_enrolled_sig_stays_unsigned_3007",
         ) {

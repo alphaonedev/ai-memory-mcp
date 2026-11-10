@@ -755,8 +755,11 @@ pub fn lease_get(
 ///
 /// Dispositions:
 /// - `claimed_by = Some(cb)`: `cb` is shape-validated (audit log-injection
-///   guard) and must equal the holder of a live (non-expired) lease, so two
-///   agents cannot each believe they own the action.
+///   guard), must equal the authenticated `principal` (#8759, via
+///   [`crate::coordination_guard::bind_claimed_identity`]; the single-operator
+///   posture names any worker) and must equal the holder of a live
+///   (non-expired) lease, so two agents cannot each believe they own the
+///   action.
 /// - `claimed_by = None` with a LIVE lease: REFUSED. Leases are the
 ///   ownership primitive, so a transition on a leased action must name its
 ///   holder.
@@ -766,10 +769,12 @@ pub fn lease_get(
 ///   internal path, so a dead holder never wedges the action here.
 ///
 /// # Errors
-/// Returns a caller-facing string on a shape mismatch, a holder mismatch, or
-/// an unbound transition attempted against a live lease.
+/// Returns a caller-facing string on a shape mismatch, an acting-identity
+/// mismatch, a holder mismatch, or an unbound transition attempted against a
+/// live lease.
 pub fn authorize_claimed_by(
     claimed_by: Option<&str>,
+    principal: crate::coordination_guard::ActingPrincipal<'_>,
     lease: Option<&crate::models::Lease>,
     now: i64,
     action_id: &str,
@@ -787,6 +792,16 @@ pub fn authorize_claimed_by(
         };
     };
     crate::validate::validate_agent_id(claimed_by).map_err(|e| e.to_string())?;
+    // #8759 — the acting identity is the authenticated principal, never the
+    // request field: a `claimed_by` naming anyone else is refused BEFORE the
+    // lease bind, so naming the live holder no longer lets a non-holder drive
+    // the holder's action (and be audited as the holder).
+    crate::coordination_guard::bind_claimed_identity(
+        crate::mcp::param_names::CLAIMED_BY,
+        claimed_by,
+        principal,
+        crate::coordination_guard::TRANSITION_ACTION_OP,
+    )?;
     if let Some(holder) = live_holder
         && holder != claimed_by
     {
@@ -981,6 +996,12 @@ pub fn sweep_expired_leases_audited(conn: &Connection, now: i64) -> rusqlite::Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #8759 — the pre-#8759 lease-bind unit cells run under the MCP
+    /// single-operator posture, where the principal bind accepts any named
+    /// worker, so they keep pinning the lease disposition alone.
+    const SINGLE_OP: crate::coordination_guard::ActingPrincipal<'static> =
+        crate::coordination_guard::ActingPrincipal::SingleOperator;
     use crate::models::ActionState;
 
     fn fresh() -> Connection {
@@ -1694,8 +1715,8 @@ mod tests {
             expires_at: 1_000,
             heartbeat_at: 1,
         };
-        assert!(authorize_claimed_by(Some("ai:w1"), Some(&live), 10, "act-1").is_ok());
-        let err = authorize_claimed_by(Some("ai:w2"), Some(&live), 10, "act-1")
+        assert!(authorize_claimed_by(Some("ai:w1"), SINGLE_OP, Some(&live), 10, "act-1").is_ok());
+        let err = authorize_claimed_by(Some("ai:w2"), SINGLE_OP, Some(&live), 10, "act-1")
             .expect_err("non-holder must be refused");
         assert!(
             err.contains("not the live lease holder"),
@@ -1706,11 +1727,13 @@ mod tests {
             expires_at: 5,
             ..live.clone()
         };
-        assert!(authorize_claimed_by(Some("ai:w2"), Some(&expired), 10, "act-1").is_ok());
+        assert!(
+            authorize_claimed_by(Some("ai:w2"), SINGLE_OP, Some(&expired), 10, "act-1").is_ok()
+        );
         // No lease is unbound.
-        assert!(authorize_claimed_by(Some("ai:w2"), None, 10, "act-1").is_ok());
+        assert!(authorize_claimed_by(Some("ai:w2"), SINGLE_OP, None, 10, "act-1").is_ok());
         // Control-char claimed_by is refused even with no lease.
-        assert!(authorize_claimed_by(Some("bad\nid"), None, 10, "act-1").is_err());
+        assert!(authorize_claimed_by(Some("bad\nid"), SINGLE_OP, None, 10, "act-1").is_err());
     }
 
     /// #3360 — the lease bind must NOT be opt-in. An OMITTED `claimed_by`
@@ -1730,7 +1753,7 @@ mod tests {
         };
 
         // DENIED: no claimed_by while alice holds a live lease.
-        let err = authorize_claimed_by(None, Some(&live), 10, "act-2")
+        let err = authorize_claimed_by(None, SINGLE_OP, Some(&live), 10, "act-2")
             .expect_err("an unbound transition on a leased action must be refused");
         assert!(
             err.contains("is held by lease holder 'ai:alice'"),
@@ -1742,7 +1765,9 @@ mod tests {
         );
 
         // ALLOWED: the holder itself still transitions its own action.
-        assert!(authorize_claimed_by(Some("ai:alice"), Some(&live), 10, "act-2").is_ok());
+        assert!(
+            authorize_claimed_by(Some("ai:alice"), SINGLE_OP, Some(&live), 10, "act-2").is_ok()
+        );
 
         // ALLOWED: once the lease has EXPIRED the action is unbound again, so
         // a dead holder can never wedge it (the sweep reclaims + requeues).
@@ -1750,9 +1775,9 @@ mod tests {
             expires_at: 5,
             ..live.clone()
         };
-        assert!(authorize_claimed_by(None, Some(&expired), 10, "act-2").is_ok());
+        assert!(authorize_claimed_by(None, SINGLE_OP, Some(&expired), 10, "act-2").is_ok());
 
         // ALLOWED: the lease-free flow is untouched.
-        assert!(authorize_claimed_by(None, None, 10, "act-2").is_ok());
+        assert!(authorize_claimed_by(None, SINGLE_OP, None, 10, "act-2").is_ok());
     }
 }

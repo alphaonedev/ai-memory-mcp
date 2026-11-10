@@ -92,12 +92,20 @@ pub struct SendSignalRequest {
 
 /// #2391 — request body for `POST /api/v1/checkpoints/{id}/resolve`.
 ///
-/// `resolved_by` is deliberately NOT a body field: the resolver is the
-/// authenticated caller (the node), mirroring [`SendSignalRequest`]'s
-/// `from_agent` provenance posture. A body-supplied resolver could not be
-/// attested against the sending node's enrolled key on the receiving peer.
+/// The resolver is the authenticated caller (the node), mirroring
+/// [`SendSignalRequest`]'s `from_agent` provenance posture: a body-supplied
+/// resolver could not be attested against the sending node's enrolled key on
+/// the receiving peer. #8759 / #8773 — an optional body `resolved_by` (the MCP
+/// field name) is accepted ONLY when it equals that principal; pre-fix it was
+/// silently ignored, so a caller naming another agent got a `200` it could read
+/// as "resolved as that agent".
 #[derive(Debug, Clone, Deserialize)]
 pub struct CheckpointResolveHttpRequest {
+    /// Optional claimed resolver. Compared to the authenticated principal and
+    /// refused (`403 acting_identity_mismatch`) when it differs; never used as
+    /// the acting identity.
+    #[serde(default)]
+    pub resolved_by: Option<String>,
     /// Terminal resolution state — `"resolved"` or `"rejected"`.
     pub state: String,
     /// Structured resolution verdict (free-form string).
@@ -178,12 +186,28 @@ pub async fn transition_action(
                 )
                 .await
             } else {
-                local_transition_via_db(&app, &action_id, to, body.claimed_by.as_deref(), now).await
+                local_transition_via_db(
+                    &app,
+                    &action_id,
+                    &node_agent_id,
+                    to,
+                    body.claimed_by.as_deref(),
+                    now,
+                )
+                .await
             }
         }
         #[cfg(not(feature = "sal"))]
         {
-            local_transition_via_db(&app, &action_id, to, body.claimed_by.as_deref(), now).await
+            local_transition_via_db(
+                &app,
+                &action_id,
+                &node_agent_id,
+                to,
+                body.claimed_by.as_deref(),
+                now,
+            )
+            .await
         }
     };
     let (updated, from_state, namespace) = match local {
@@ -550,6 +574,7 @@ fn action_not_found(action_id: &str) -> Response {
 async fn local_transition_via_db(
     app: &AppState,
     action_id: &str,
+    node_agent_id: &str,
     to: crate::models::ActionState,
     claimed_by: Option<&str>,
     now: i64,
@@ -574,9 +599,15 @@ async fn local_transition_via_db(
                 .into_response());
         }
     };
-    if let Err(msg) =
-        crate::actions::authorize_claimed_by(claimed_by, lease.as_ref(), now, action_id)
-    {
+    // #8759 — bound to the header-resolved principal (anonymous included),
+    // never to the body field.
+    if let Err(msg) = crate::actions::authorize_claimed_by(
+        claimed_by,
+        crate::coordination_guard::ActingPrincipal::Authenticated(node_agent_id),
+        lease.as_ref(),
+        now,
+        action_id,
+    ) {
         return Err((StatusCode::FORBIDDEN, Json(json!({"error": msg}))).into_response());
     }
     let current = match crate::actions::get(&lock.0, action_id) {
@@ -634,9 +665,15 @@ async fn local_transition_via_store(
         Ok(l) => l,
         Err(e) => return Err(super::store_err_to_response(e)),
     };
-    if let Err(msg) =
-        crate::actions::authorize_claimed_by(claimed_by, lease.as_ref(), now, action_id)
-    {
+    // #8759 — bound to the header-resolved principal (anonymous included),
+    // never to the body field.
+    if let Err(msg) = crate::actions::authorize_claimed_by(
+        claimed_by,
+        crate::coordination_guard::ActingPrincipal::Authenticated(node_agent_id),
+        lease.as_ref(),
+        now,
+        action_id,
+    ) {
         return Err((StatusCode::FORBIDDEN, Json(json!({"error": msg}))).into_response());
     }
     let current = match app.store.action_get(&ctx, action_id).await {
@@ -770,6 +807,29 @@ pub async fn resolve_checkpoint(
                 .into_response();
         }
     };
+    // #8759 / #8773 — a body `resolved_by` is a claim to COMPARE, never the
+    // acting identity: shape-check it (400, same as `claimed_by`), then bind it
+    // to the header principal through the one helper (403 on a mismatch).
+    if let Some(claimed) = body.resolved_by.as_deref() {
+        if let Err(e) = crate::validate::validate_agent_id(claimed) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": crate::errors::msg::invalid(
+                    crate::mcp::param_names::RESOLVED_BY,
+                    e,
+                )})),
+            )
+                .into_response();
+        }
+        if let Err(msg) = crate::coordination_guard::bind_claimed_identity(
+            crate::mcp::param_names::RESOLVED_BY,
+            claimed,
+            crate::coordination_guard::ActingPrincipal::Authenticated(&node_agent_id),
+            crate::coordination_guard::RESOLVE_CHECKPOINT_OP,
+        ) {
+            return (StatusCode::FORBIDDEN, Json(json!({"error": msg}))).into_response();
+        }
+    }
     // Only the two terminal resolution states are accepted — same filter as the
     // MCP `memory_checkpoint_resolve` handler.
     let Some(state) = crate::models::CheckpointState::from_str(&body.state).filter(|s| {
