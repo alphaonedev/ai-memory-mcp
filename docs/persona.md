@@ -6,7 +6,7 @@ layout: doc
 A **Persona** is a curator-generated Markdown profile of an entity,
 synthesised from a cluster of `MemoryKind::Reflection` rows that
 reference that entity. Personas are the substrate-native expression of
-the Tencent L3 pattern (PersonaMem 48% → 76% on the long-horizon
+the System Y L3 pattern (PersonaMem 48% → 76% on the long-horizon
 benchmark): the substrate distils the agent's reflections about a
 subject into a stable, recallable artefact so the agent can re-load
 "what we know about Alice" with a single recall hit instead of paging

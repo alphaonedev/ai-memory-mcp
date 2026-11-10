@@ -10,7 +10,7 @@ feat/3322-swarm-rewind	1-MERGED-ANCESTRY	0	669	2026-08-31	0	0	0	0	0	0	0	3322	1	5
 feat/3323-lineage-cost-accounting	1-MERGED-ANCESTRY	0	676	2026-08-30	0	0	0	0	0	0	0	3323	1	383efbef9	feat(cost): per-lineage + per-namespace token/cost accounting (#3323)
 feat/3324-contaminated-lifecycle	1-MERGED-ANCESTRY	0	674	2026-08-30	0	0	0	0	0	0	0	3324	1	ab55252f1	feat(#3324): auto-propagate `contaminated` lifecycle along derives_from on invalidate
 feat/acceptance-nhi-sqlite	1-MERGED-ANCESTRY	0	714	2026-08-30	0	0	0	0	0	0	0	-	-1	4375a1fa3	fix(acceptance): Config-1 harness passes live — admin-header-trust + valid agent_type
-feat/glm-swarm-driver	1-MERGED-ANCESTRY	0	709	2026-08-30	0	0	0	0	0	0	0	-	-1	5c1300a51	test(swarm): add GLM-5.3-Flash acceptance-swarm driver (test-only)
+feat/flash-swarm-driver	1-MERGED-ANCESTRY	0	709	2026-08-30	0	0	0	0	0	0	0	-	-1	5c1300a51	test(swarm): add GLM-5.3-Flash acceptance-swarm driver (test-only)
 fix/2555-schema-version-guard	1-MERGED-ANCESTRY	0	690	2026-08-30	0	0	0	0	0	0	0	2555	1	189140ed3	test(#2555): coverage — boot + doctor poisoned-ledger branches
 fix/3041-provenance-equal-instant	1-MERGED-ANCESTRY	0	667	2026-08-31	0	0	0	0	0	0	0	3041	1	d6508042b	fix(storage): refuse equal-instant provenance edge that closes a cycle (#3041)
 fix/3064-pg-tool-parity	1-MERGED-ANCESTRY	0	417	2026-09-05	0	0	0	0	0	0	0	3064	1	24792d71d	docs(#3064): cite #3507 for the memory_calibrate_confidence caller gate
@@ -319,7 +319,7 @@ fix/3555-durability-receipts	2-MERGED-PATCHID	1	2	2026-09-12	0	0	0	0	1	1	0	3555	
 fix/3614-quarantined-dependents	2-MERGED-PATCHID	1	2	2026-09-12	0	0	0	0	1	1	0	3614	1	e2a3c21d5	fix: hide quarantined invalidation dependents on both backends (#3614)
 fix/3616-signing-domain-tags	2-MERGED-PATCHID	2	2	2026-09-12	0	0	0	0	2	2	0	3616	1	84ae81d35	fix(routines): refuse invalid freeze attestations with recovery guidance (#3616)
 fix/3623-production-gate-coverage	2-MERGED-PATCHID	18	2	2026-09-12	0	0	0	0	18	14	0	3623	1	82a7becb6	fix(gates): restore production coverage and document baseline correction (#3623)
-fix/3627-remove-deepseek-alias	2-MERGED-PATCHID	1	2	2026-09-12	0	0	0	0	1	1	0	3627	1	ad9d035c8	fix(#3627): refuse the retired LLM provider alias (no silent fallback)
+fix/3627-remove-retired-alias	2-MERGED-PATCHID	1	2	2026-09-12	0	0	0	0	1	1	0	3627	1	ad9d035c8	fix(#3627): refuse the retired LLM provider alias (no silent fallback)
 fix/3631-fed-inbox-wake-fable	2-MERGED-PATCHID	4	2	2026-09-12	0	0	0	0	4	4	0	3631	1	bb944d085	test(#3631): own the sqlite receiver store with a TempDir, not a leaked temp file
 fix/3636-a2a-integration	2-MERGED-PATCHID	1	2	2026-09-12	0	0	0	0	1	1	0	3636	1	93d5c575d	docs: integrate arbitrary agents with the A2A wake plane (#3636)
 fix/3638-reflect-policy-redaction	2-MERGED-PATCHID	1	2	2026-09-12	0	0	0	0	1	1	0	3638	1	d77b5281e	fix(reflect): redact private policy diagnostics (#3638)

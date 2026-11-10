@@ -63,7 +63,7 @@ The Claude Code **PreToolUse governance hook** now *enforces*: a substrate `Refu
 Peer enrollment on by default, per-transition signatures, per-write content attestation, replay-proof nonces, and outbound server-cert pinning. Heterogeneous fleets that don't have to trust each other.
 
 ### 🔌 Provider-agnostic LLM **and** embeddings
-Local models or 15+ cloud vendors (xAI, OpenAI, Anthropic, Gemini, DeepSeek, Mistral, Groq, …) for chat **and** embeddings — swappable by config, no GPU required.
+Local models or 15+ cloud vendors (xAI, OpenAI, Anthropic, Gemini, Mistral, Groq, …) for chat **and** embeddings — swappable by config, no GPU required.
 
 ### 📱 Desktop, server, on-device
 SQLite or PostgreSQL+AGE; macOS / Linux / Windows binaries; iOS `.xcframework` + Android `jniLibs` cross-compiled and runtime-tested in CI.

@@ -501,7 +501,7 @@ The task asked for "class-4 branches with 0 unique patch-ids". **That set is emp
 | `fix/3544-shim-status` | 1 | 1 | 2026-09-14 |
 | `fix/3555-durability-receipts` | 1 | 1 | 2026-09-12 |
 | `fix/3614-quarantined-dependents` | 1 | 1 | 2026-09-12 |
-| `fix/3627-remove-deepseek-alias` | 1 | 1 | 2026-09-12 |
+| `fix/3627-remove-retired-alias` | 1 | 1 | 2026-09-12 |
 | `fix/3636-a2a-integration` | 1 | 1 | 2026-09-12 |
 | `fix/3638-reflect-policy-redaction` | 1 | 1 | 2026-09-12 |
 | `fix/3646-health-monitoring-api` | 1 | 1 | 2026-09-12 |
@@ -517,7 +517,7 @@ Tips are ancestors of `release/v1.0.0` or `rehearsal/audit-wip`; deleting them c
 - `chain/next` · `docs/3064-pg-unavailable-tools` · `docs/3075-pg-federation-lanes`
 - `docs/3595-cert-reissue` · `docs/fable-astra-audit-2026-09-09` · `docs/g5-drift-fixes`
 - `docs/passes-2-3-drift` · `feat/3322-swarm-rewind` · `feat/3323-lineage-cost-accounting`
-- `feat/3324-contaminated-lifecycle` · `feat/acceptance-nhi-sqlite` · `feat/glm-swarm-driver`
+- `feat/3324-contaminated-lifecycle` · `feat/acceptance-nhi-sqlite` · `feat/flash-swarm-driver`
 - `fix/2555-schema-version-guard` · `fix/3041-provenance-equal-instant` · `fix/3064-pg-tool-parity`
 - `fix/3071-bulk-secret-screen-order` · `fix/3075-pg-federation-lanes` · `fix/3111-capability-inline-tests`
 - `fix/3111-terminal-operator-deny` · `fix/3117-cert-legA-keyless` · `fix/3142-db-url-scheme-refuse`

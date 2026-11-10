@@ -33,7 +33,7 @@
 #   - Each invocation < 3 min on a fresh ai-memory.
 #
 # Issue links
-#   QW-1 spec:        v0.7.0 Grand-Slam QW-1 (Tencent comparison)
+#   QW-1 spec:        v0.7.0 Grand-Slam QW-1 (System Y comparison)
 #   Substrate cap:    issues/655
 #   Recipe ticket:    QW-1
 

@@ -4962,7 +4962,7 @@ fn section_embeddings_reachability_1598() -> ReportSection {
     // `EmbeddingModel` families, so any other id is silently swapped for the
     // tier preset behind a `tracing::warn!` a CLI one-shot renders nowhere.
     // That is exactly how the #2972 reporter came to believe `doctor` and
-    // `reembed` disagreed: `doctor` echoed `qwen3-embedding:4b` while the
+    // `reembed` disagreed: `doctor` echoed `unlisted-embedder:4b` while the
     // daemon (and `reembed`) used `all-MiniLM-L6-v2`. Report the EFFECTIVE
     // model whenever it differs from the configured one — a doctor that
     // states a model the binary will not load is a false claim, not a

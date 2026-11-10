@@ -118,7 +118,7 @@ AI_MEMORY_TOOLS_VERBOSE
 | Category | Sub-tasks / items | Status |
 |---|---|---|
 | WT-1 atomisation primitive | **7** sub-tasks (A-G) | SHIPPED |
-| QW Tencent quick wins | **4** (QW-1 file-backed export, QW-2 persona, QW-3 context-offload, QW-4 inferred from `RuleRefused`) | SHIPPED |
+| QW System Y quick wins | **4** (QW-1 file-backed export, QW-2 persona, QW-3 context-offload, QW-4 inferred from `RuleRefused`) | SHIPPED |
 | Batman 7-form closeout | **7** forms (1-6 + 7th-form agent-EXTERNAL Layer-4) | Forms 1-6 SHIPPED; 7th-form Option B foundation LANDED, full cover at v0.8.0 per `#697` |
 | Recursive-learning primitive | **8** tasks (issue `#655`) | Tasks 1-6 SHIPPED commits; Tasks 7-8 ship-gate landed on `feat/v0.7.0-recursive-learning` |
 | L1/L2 grand-slam wave | **8** L2 items + **3** L1 items (issues `#666`-`#673`, `#691`, `#693`) | SHIPPED |
@@ -374,7 +374,7 @@ AI_MEMORY_TOOLS_VERBOSE
 
 ### Feature: QW-1 file-backed reflection chain export
 
-- **Issue(s):** v0.7.0 Tencent QW-1
+- **Issue(s):** v0.7.0 System Y QW-1
 - **Status:** SHIPPED
 - **Net-new in v0.7.0:** YES
 - **Cookbook:** `cookbook/file-backed-export/01-export-and-inspect.sh`
@@ -387,7 +387,7 @@ AI_MEMORY_TOOLS_VERBOSE
 
 ### Feature: QW-2 persona-as-artifact
 
-- **Issue(s):** v0.7.0 Tencent QW-2
+- **Issue(s):** v0.7.0 System Y QW-2
 - **Status:** SHIPPED
 - **Net-new in v0.7.0:** YES
 - **Docs:** `docs/persona.md` (894 words)
@@ -404,7 +404,7 @@ AI_MEMORY_TOOLS_VERBOSE
 
 ### Feature: QW-3 context offload primitive
 
-- **Issue(s):** v0.7.0 Tencent QW-3
+- **Issue(s):** v0.7.0 System Y QW-3
 - **Status:** SHIPPED
 - **Net-new in v0.7.0:** YES
 - **Docs:** `docs/context-offload.md` (497 words)
@@ -677,7 +677,7 @@ AI_MEMORY_TOOLS_VERBOSE
 6. **CapabilityCuration / CapabilityFederation absence** — no `Capability*` struct for the curator pipeline or federation. The release notes treat both as first-class features. Reviewer should confirm whether the absence is intentional (rolled into `CapabilityCompaction` and federation-config respectively) or a capabilities-surface gap.
 7. **Persona `entity_id` + `persona_version` columns** — referenced in `MemoryKind::Persona` doc-comment as "populated only for this variant". No dedicated schema migration; columns must already exist or be added by `0031_v07_persona.sql`. Reviewer should verify column-level coverage.
 8. **`memory_deref` MCP tool** — added in v0.7.0 but not covered explicitly by any of the named feature categories (QW-3 context offload registers `memory_offload`, but `memory_deref` is its read-side companion). Reviewer should confirm `memory_deref` belongs under QW-3 / context-offload.
-9. **Tencent QW-4** — **RESOLVED 2026-05-15 (Cluster K).** QW-4 is a **docs-only deliverable** (competitive positioning page + landscape comparison), not a code feature. Disposition pinned by [`v070-ship-readiness-adrs.md` ADR-1](v070-ship-readiness-adrs.html#adr-1--qw-4-disposition-docs-only-no-code-feature). The three code-bearing QW items are QW-1 / QW-2 / QW-3; QW-4 is the positioning page at `docs/positioning.md`.
+9. **System Y QW-4** — **RESOLVED 2026-05-15 (Cluster K).** QW-4 is a **docs-only deliverable** (competitive positioning page + landscape comparison), not a code feature. Disposition pinned by [`v070-ship-readiness-adrs.md` ADR-1](v070-ship-readiness-adrs.html#adr-1--qw-4-disposition-docs-only-no-code-feature). The three code-bearing QW items are QW-1 / QW-2 / QW-3; QW-4 is the positioning page at `docs/positioning.md`.
 10. **HTTP `/api/v1/auto_tag` and `/api/v1/expand_query` ownership** — both surfaces are added but neither is enumerated in CHANGELOG track summaries. Reviewer should map these to their owning track/feature.
 11. **`policy-engine/wire-points`, `policy-engine/harness-hook`, `policy-engine/deferred-audit-log` branch refs** — CHANGELOG references these as the source branches for PE-1/PE-2/PE-3. Verify all three are merged into HEAD `64528b1` (the CHANGELOG asserts this; reviewer should grep).
 

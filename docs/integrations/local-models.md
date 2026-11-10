@@ -5,7 +5,7 @@ layout: doc
 
 **Category 3 (programmatic).** 100% reliable when implemented.
 
-Hermes (Nous Research), Llama, Mistral, Qwen, and other open-weight models
+Hermes (Nous Research), Llama, Mistral, and other open-weight models
 run locally via LM Studio, Ollama, vLLM, llama.cpp, etc. None of these
 runtimes ship a session-start hook today; integration is at the application
 boundary. The pattern is the same regardless of runtime: the front-end app

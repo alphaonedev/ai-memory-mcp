@@ -973,7 +973,7 @@ pub struct CapabilityModels {
 /// - `llm` — `"none"` when no LLM is configured; bare `model` for
 ///   Ollama backends (legacy banner shape); `backend:model` for
 ///   every OpenAI-compatible vendor (xAI, OpenAI, Anthropic,
-///   Gemini, Kimi, Qwen, Mistral, Groq, Together,
+///   Gemini, Mistral, Groq, Together,
 ///   Cerebras, OpenRouter, Fireworks, LMStudio, vLLM, llama.cpp).
 /// - `embedding` — `"none"` when the tier preset disables the
 ///   embedder (`keyword` tier); otherwise the resolver's canonical
@@ -3864,8 +3864,8 @@ pub struct LlmSection {
     /// Backend selector. One of: `ollama` (native `/api/chat` +
     /// `/api/embed`, no auth), `openai-compatible` (generic; requires
     /// explicit `base_url`), or an alias that pre-fills `base_url`
-    /// (`openai`, `xai`, `anthropic`, `gemini`, `kimi`,
-    /// `qwen`, `mistral`, `groq`, `together`, `cerebras`, `openrouter`,
+    /// (`openai`, `xai`, `anthropic`, `gemini`,
+    /// `mistral`, `groq`, `together`, `cerebras`, `openrouter`,
     /// `fireworks`, `lmstudio`). Unset = inherit legacy resolution
     /// (treated as `ollama`).
     pub backend: Option<String>,
@@ -13895,8 +13895,7 @@ max_page_size = 1000000
     /// (`crate::llm::default_base_url_for_alias`), but
     /// [`RECOGNIZED_LLM_BACKENDS`] — the list the refusal prints — is a
     /// hand-maintained fourth copy of that vocabulary, and it had already
-    /// drifted: it omitted the documented synonyms `moonshot` and
-    /// `dashscope`, which the predicate accepts. A refusal that
+    /// drifted: it omitted documented synonyms that the predicate accepts. A refusal that
     /// under-advertises the accepted set sends an operator to the wrong
     /// remedy, so the two are pinned to agree.
     ///

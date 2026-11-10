@@ -39,7 +39,7 @@ The roadmap's broader claims should be narrowed:
 
 ## Historical live NHI run: useful diagnostic evidence, not victory
 
-Examined f2-runs/journals-nhi-grok46-run2-20260901T225637Z: all 273 call records were parsed and counted; all 48 step records had selected tools/outcome prefixes screened; assessments.json, nhi-audit.json and usage.json read. This run identifies x-ai/grok-4.6 for eight agents despite IDs containing glm. It is one model family, not eight independent families.
+Examined f2-runs/journals-nhi-grok46-run2-20260901T225637Z: all 273 call records were parsed and counted; all 48 step records had selected tools/outcome prefixes screened; assessments.json, nhi-audit.json and usage.json read. This run identifies x-ai/grok-4.6 for eight agents despite IDs containing a model-family stem. It is one model family, not eight independent families.
 
 The call log reconciles 273/273; 265 are ok and eight fail_closed. Four refusals are deliberate authorization/duplicate canary probes; others include duplicate mission titles and a rejected reflection cycle. These numbers measure dispatch results, not task correctness. The run reports 0/8 strict mission completion, 6/8 would rely, mean usefulness 4.5/5, and 0/8 latency acceptable. A substrate can be useful while its wired agent workflow fails its mission.
 

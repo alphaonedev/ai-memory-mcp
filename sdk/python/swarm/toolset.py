@@ -492,7 +492,7 @@ SPECS_BY_NAME: dict[str, ToolSpec] = {s.name: s for s in TOOL_SPECS}
 
 
 def selectable_schemas() -> list[dict[str, Any]]:
-    """OpenAI tool schemas for the tools the GLM model may choose."""
+    """OpenAI tool schemas for the tools the Flash model may choose."""
     return [s.openai_schema() for s in TOOL_SPECS if s.agent_selectable]
 
 

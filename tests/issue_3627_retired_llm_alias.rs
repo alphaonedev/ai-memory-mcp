@@ -160,7 +160,7 @@ const HISTORICAL_RECORD_CARVE_OUTS: &[(&str, &str)] = &[
     ),
     (
         "docs/reviews/opus5-1x3-baml-paw-20260919-evidence/assessor-B-technical-fit.md",
-        "third-party tool assessment; the token appears inside a list of providers the EXTERNAL tool supports, alongside Gemini/Kimi/Qwen/Mistral/Groq — describing what that tool offers, never what this product offers",
+        "third-party tool assessment; the token appears inside a list of providers the EXTERNAL tool supports, alongside Gemini/Mistral/Groq — describing what that tool offers, never what this product offers",
     ),
 ];
 

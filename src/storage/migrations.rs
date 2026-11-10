@@ -838,7 +838,7 @@ CREATE INDEX IF NOT EXISTS idx_agent_api_keys_agent ON agent_api_keys(agent_id);
 //       `idx_personas_by_entity` covering Persona-kind rows. The
 //       ALTERs are emitted from Rust (SQLite has no `ADD COLUMN IF
 //       NOT EXISTS`); the SQL file holds the supporting partial
-//       index. Substrate for Tencent-pattern L3 personas; non-
+//       index. Substrate for System Y-pattern L3 personas; non-
 //       Persona rows keep NULL payloads with no backfill.
 // v38 = v0.7.0 Form 4 — fact-provenance closeout (issue #757). Adds
 //       `memories.citations TEXT NOT NULL DEFAULT '[]'` (JSON array of

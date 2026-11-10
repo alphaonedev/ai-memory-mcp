@@ -1,0 +1,40 @@
+{
+  "_comment": "Allowlist data for scripts/ci/check_no_cn_ai_vendor.py. Every entry names its reason.",
+  "flash_testing": {
+    "reason": "The one permitted exception: a Flash-qualified model token in agent cluster, hive and swarm test material. The qualifier is checked on the token itself; these prefixes only scope where it is allowed.",
+    "path_prefixes": [
+      "sdk/python/swarm/",
+      "sdk/python/pyproject.toml",
+      "infra/do-hive/",
+      "docs/testing/",
+      "docs/reviews/gpt6-astra-20260905-evidence/",
+      "docs/reviews/branch-hygiene-3x7-2026-09-18"
+    ]
+  },
+  "functional_code_sites": [
+    {
+      "path": "src/llm.rs",
+      "reason": "provider alias match arms and their table tests; comment lines are still scanned"
+    },
+    {
+      "path": "src/config.rs",
+      "reason": "provider alias match arms, recognised-selector string and table tests; comment lines are still scanned"
+    },
+    {
+      "path": "src/identity/model_family.rs",
+      "reason": "model family stem table and its tests; comment lines are still scanned"
+    },
+    {
+      "path": "tests/issue_809_nhi_self_persona_any_agent.rs",
+      "reason": "model family fixture list; comment lines are still scanned"
+    },
+    {
+      "path": "src/daemon_runtime.rs",
+      "reason": "fallback API-key env-var names cleared by an env-isolation test; comment lines are still scanned"
+    },
+    {
+      "path": "tests/issue_3627_retired_llm_alias.rs",
+      "reason": "fallback API-key env-var names cleared by an env-isolation test; comment lines are still scanned"
+    }
+  ]
+}

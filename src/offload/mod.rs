@@ -4,7 +4,7 @@
 //! v0.7.0 QW-3 — context-offload substrate primitive.
 //!
 //! Substrate plumbing for the offload+deref pattern absorbed from
-//! the Tencent comparison (2026-05-15). The FULL pattern (Mermaid
+//! the System Y comparison (2026-05-15). The FULL pattern (Mermaid
 //! canvas, auto-cadence, node_id integration) targets v0.8.0; this
 //! module ships the substrate so v0.8.0 has plumbing to call.
 //!
@@ -66,7 +66,7 @@ const ZSTD_LEVEL: i32 = 3;
 pub const MAX_DECOMPRESSED_BYTES: usize = 16 * 1024 * 1024;
 
 /// Default per-blob byte limit when no namespace policy override is set.
-/// 1 MiB — Tencent's offload primitive uses ~256 KB chunks; 1 MiB
+/// 1 MiB — System Y's offload primitive uses ~256 KB chunks; 1 MiB
 /// gives headroom for batched tool outputs without crossing the
 /// hostile-bomb threshold above.
 pub const DEFAULT_MAX_OFFLOAD_BLOB_BYTES: u32 = 1_048_576;

@@ -16,7 +16,7 @@ on this plumbing.
 ## Why it exists
 
 Long-running agent sessions accumulate large tool-call outputs that
-crowd the working window. The Tencent comparison work (absorbed
+crowd the working window. The System Y comparison work (absorbed
 2026-05-15) showed that promoting these to a substrate-side blob
 store, keyed by a short `ref_id` the agent keeps inline, recovers
 context budget without losing the verbatim content. This module is

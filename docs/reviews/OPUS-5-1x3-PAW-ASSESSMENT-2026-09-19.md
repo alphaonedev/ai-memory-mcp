@@ -40,7 +40,7 @@ and the operator should know why an interesting thesis still loses.
 ## 2. What PAW claims
 
 PAW compiles a natural-language specification into a small LoRA adapter — a
-"neural binary" of roughly 22 megabytes — over a small base model, Qwen3 0.6B or
+"neural binary" of roughly 22 megabytes — over a small base model, the 0.6B base model or
 GPT-2. One text in, one text out. The pitch is that a 0.6B model carrying a
 compiled program matches a 32B model prompted conventionally.
 
@@ -61,9 +61,9 @@ Hugging Face API rather than by reading a page.
   adapter repository carrying 433-plus variants and, by C's measurement, 66,973
   downloads. C confirmed the licence field is null on every one.
 
-The base models themselves are clean — Qwen3-0.6B Apache-2.0, GPT-2 MIT,
-Qwen3-4B-Instruct Apache-2.0 — which makes the omission worse rather than
-better. The base-model bundle redistributes a Qwen3 artefact with no licence,
+The base models themselves are clean — the 0.6B base model is Apache-2.0, GPT-2 MIT,
+the 4B instruct base is Apache-2.0 — which makes the omission worse rather than
+better. The base-model bundle redistributes a base-model artefact with no licence,
 no notice file and no attribution, which is an apparent upstream Apache-2.0
 compliance defect that we would inherit by depending on it.
 
@@ -144,7 +144,7 @@ semver-incompatible, so both would compile into the binary simultaneously.
 ### 4.6 Its own benchmark table does not support the pitch
 
 Assessor C read the paper's table rather than the abstract. PAW **loses to
-Qwen3-32B on all four external benchmarks** — by 3.2, 8.3, 2.3 and 4.0 points —
+a 32B open-weights model on all four external benchmarks** — by 3.2, 8.3, 2.3 and 4.0 points —
 and wins only on the benchmark its own compiler was trained on. On that one, a
 contained and properly licensed 20B model beats it by 11.7 points.
 

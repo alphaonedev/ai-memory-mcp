@@ -66,7 +66,7 @@ class StepRecord:
 
 @dataclass
 class SwarmAgent:
-    """A single GLM-driven agent. Construct via :meth:`create`."""
+    """A single Flash-driven agent. Construct via :meth:`create`."""
 
     identity: AgentIdentity
     client: AsyncAiMemoryClient
@@ -97,7 +97,7 @@ class SwarmAgent:
     ) -> SwarmAgent:
         """Build an agent and its daemon client (no network I/O yet)."""
         stable = uuid.uuid5(uuid.NAMESPACE_URL, f"{config.namespace_prefix}:agent:{ordinal:03d}")
-        agent_id = f"ai:{config.namespace_prefix}-glm-{stable}"
+        agent_id = f"ai:{config.namespace_prefix}-flash-{stable}"
         client = AsyncAiMemoryClient(
             base_url=base_url,
             agent_id=agent_id,

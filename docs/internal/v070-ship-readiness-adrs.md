@@ -18,14 +18,13 @@ layout: doc
 
 **Context.** The v0.7.0 grand-slam release notes and CHANGELOG enumerate
 "4 QW items shipped" (QW-1 file-backed reflection export, QW-2 persona,
-QW-3 context-offload, QW-4 Tencent competitive positioning). The API-UX
+QW-3 context-offload, QW-4 System Y competitive positioning). The API-UX
 review (synthesis finding API-12 HIGH; review doc lives in the
 review-api-ux worktree and is summarised in
 [`v070-review-synthesis.md`](v070-review-synthesis.html)) and the
 feature inventory open question #9 both flagged that QW-4 has no
 corresponding code path — it is the [`docs/positioning.md`](../positioning.html)
-+ cookbook update that situates the substrate against TencentDB Agent
-Memory. The earlier "4 QW items shipped" framing overcounts by 1 if a
++ cookbook update that situates the substrate against System Y. The earlier "4 QW items shipped" framing overcounts by 1 if a
 reader interprets "shipped" as "code-evidence implemented".
 
 **Decision.** QW-4 is a **docs + competitive-positioning deliverable, not
@@ -33,7 +32,7 @@ a code feature**. The audit's original classification stands. The fix is
 to make the public framing honest:
 
 - The CHANGELOG entry for QW-4 already correctly describes the scope as
-  "Positioning page update at `docs/positioning.md` adds the TencentDB
+  "Positioning page update at `docs/positioning.md` adds the System Y
   Agent Memory entry alongside the existing landscape comparison." No
   further CHANGELOG edit beyond a one-line clarification.
 - The release-notes (`docs/v0.7.0/release-notes.md`) section on QW items
@@ -47,14 +46,14 @@ to make the public framing honest:
 
 - **(a) Ship a QW-4 code path.** Rejected — QW-4 was scoped as
   competitive positioning from inception; there is no code feature
-  Tencent's positioning suggests we lack. Inventing one for symmetry
+  System Y's positioning suggests we lack. Inventing one for symmetry
   would be a procurement lie.
 - **(b) Re-attribute QW-4 to `MCP_MUTATION_DISABLED_ERROR` or another
   refusal token.** Rejected — that wire token belongs to 7th-form
-  agent-EXTERNAL Layer-4, not Tencent positioning. Re-attribution would
+  agent-EXTERNAL Layer-4, not System Y positioning. Re-attribution would
   blur two distinct features.
 - **(c) Remove QW-4 from "shipped" lists.** Rejected — the docs
-  *did* land, and Tencent positioning *is* a real deliverable. Just
+  *did* land, and System Y positioning *is* a real deliverable. Just
   honest framing needed.
 
 **Consequences.**
@@ -62,7 +61,7 @@ to make the public framing honest:
 - Public framing of "4 QW items" is preserved with the honest qualifier
   that QW-4's deliverable is documentation.
 - Issue #767 ship-readiness checklist treats QW-4 as resolved.
-- Future readers of the inventory open question #9 (Tencent QW-4
+- Future readers of the inventory open question #9 (System Y QW-4
   unmapped) are redirected here.
 
 ## ADR-2 — Cluster H net-new doc scope: 6 shipped, 12-20h deferred as accepted debt

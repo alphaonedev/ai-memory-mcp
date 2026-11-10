@@ -50,7 +50,7 @@ a{color:var(--acc);text-decoration:none}a:hover{text-decoration:underline}
 <p><b>f2</b> — Linux, 93 GB RAM · cert pg+AGE+pgvector <code>:15432</code> (reference module)<br>
 <b>f1</b> — macOS, 32 GB RAM · cert pg+AGE+pgvector <code>:5445</code> (smaller-module baseline)</p></div>
 <div class="card"><h3>Cloud data tier</h3>
-<p><b>DigitalOcean</b> — the certified enterprise-federation stack on droplets; <b>minimal footprint</b>: DO hosts only the data tier, the GLM NHIs are OpenRouter API calls driven off-DO. Provisioned via <code>infra/do-hive/</code> Terraform.</p></div>
+<p><b>DigitalOcean</b> — the certified enterprise-federation stack on droplets; <b>minimal footprint</b>: DO hosts only the data tier, the Flash NHIs are OpenRouter API calls driven off-DO. Provisioned via <code>infra/do-hive/</code> Terraform.</p></div>
 <div class="card"><h3>Encryption in transit (mandatory)</h3>
 <p>All communications encrypted, as customers deploy: <b>mTLS</b> federation + agent→daemon HTTPS (fingerprint-pinned client certs) + PostgreSQL <code>sslmode=verify-full</code>. At-rest: LUKS (kernel) on the encrypted config; per-record crypto-erase.</p></div>
 <div class="card"><h3>Test swarm/hive</h3>
@@ -112,7 +112,7 @@ max_memory_mb     = 4096</pre></div>
 <tr><td>Module scaling curve (exponential via federation)</td><td><span class="s s-pend">PENDING</span></td><td>The real per-module multiplier as modules are added.</td></tr>
 <tr><td><b>Hard stop/start continuity</b> — swarm/hive survives aggressive kill cycles</td><td><span class="s s-pend">PENDING</span></td><td>The headline resilience proof. A swarm/hive is put on a multi-step <b>mission</b> (goals · purpose · objectives · plan stored in ai-memory), then <b>hard-killed mid-work and cold-restarted, repeatedly</b>. Each restart must recover the mission, goals, purpose, objectives, and last-worked-on state from federated memory (<code>recover-previous-session</code> + session-boot) and <b>pick up exactly where it left off</b> — no re-doing completed work, no lost context, no drift. Measured over multiple aggressive cycles.</td></tr>
 <tr><td><b>Experiential AI-NHI audit</b> — the agents assess the substrate they use</td><td><span class="s s-pend">PENDING</span></td><td>Beyond mechanical coverage: GLM-5.3-Flash NHIs do realistic multi-step work <i>using ai-memory as their working memory</i>, then reflect and surface structured insights from the AI-agent's own perspective — does recall return the right context when needed, does it preserve continuity across a task, does A2A coordination actually help, what is confusing / missing / valuable. Findings → Fable validity gate → 3×7 vote; usability/roadmap insights captured here.</td></tr>
-<tr><td>Config-1..5 on DigitalOcean (incl. LUKS-encrypted) + GLM swarm/hive</td><td><span class="s s-pend">PENDING</span></td><td>The certified enterprise-federation config at cloud scale, plaintext and machine-proven-encrypted.</td></tr>
+<tr><td>Config-1..5 on DigitalOcean (incl. LUKS-encrypted) + Flash swarm/hive</td><td><span class="s s-pend">PENDING</span></td><td>The certified enterprise-federation config at cloud scale, plaintext and machine-proven-encrypted.</td></tr>
 <tr><td>OS-tier matrix (Ubuntu/Fedora/CentOS/macOS + mobile clients)</td><td><span class="s s-pend">PENDING</span></td><td>Build + daemon + federation acceptance across the supported host/client matrix.</td></tr>
 </table>
 
