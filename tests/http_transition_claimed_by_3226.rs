@@ -372,6 +372,16 @@ async fn seed_8759(store: &Arc<dyn MemoryStore>, ctx: &ai_memory::store::CallerC
     id
 }
 
+/// One #8759 table row: (label, `X-Agent-Id`, body `claimed_by`, expected status,
+/// expected exact error body when one is pinned).
+type Row8759<'a> = (
+    &'a str,
+    Option<&'a str>,
+    Option<&'a str>,
+    StatusCode,
+    Option<String>,
+);
+
 /// The shared #8759 table, identical for both backends.
 async fn run_8759_table(router: axum::Router, store: Arc<dyn MemoryStore>) {
     use ai_memory::models::ActionState::{Claimed, Done, InProgress};
@@ -400,7 +410,7 @@ async fn run_8759_table(router: axum::Router, store: Arc<dyn MemoryStore>) {
     let not_holder = format!(
         "claimed_by '{BOB_8759}' is not the live lease holder '{ALICE_8759}' on action {id}"
     );
-    let rows: [(&str, Option<&str>, Option<&str>, StatusCode, Option<String>); 5] = [
+    let rows: [Row8759<'_>; 5] = [
         (
             "different (B names the holder A)",
             Some(BOB_8759),
