@@ -2053,7 +2053,9 @@ fn test_health_endpoint() {
     let port = listener.local_addr().unwrap().port();
     drop(listener);
 
-    // Start the server in the background
+    // Start the server in the background. Stderr goes to a file so a boot
+    // failure reports the child's own output (#4166).
+    let (stderr_file, stderr_log) = serve_stderr_log();
     let mut child = cmd(binary)
         .args([
             "--db",
@@ -2067,46 +2069,27 @@ fn test_health_endpoint() {
             tls_key(),
         ])
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(stderr_file)
         .spawn()
         .unwrap();
 
     // Wait for server to start
     // #3705: the daemon serves TLS only; probe over HTTPS trusting the
     // fixture certificate (never `--insecure`).
-    let url = format!("https://127.0.0.1:{port}/api/v1/health");
-    let mut ok = false;
-    for _ in 0..30 {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        if let Ok(output) = std::process::Command::new("curl")
-            .args([
-                "-s",
-                "-m",
-                CURL_PROBE_MAX_SECS,
-                "-o",
-                "/dev/null",
-                "-w",
-                "%{http_code}",
-                "--cacert",
-                tls_cert(),
-                &url,
-            ])
-            .output()
-        {
-            let code = String::from_utf8_lossy(&output.stdout);
-            if code == "200" {
-                ok = true;
-                break;
-            }
-        }
-    }
+    // #4166: the wait ends on child exit (with its stderr) or on health.
+    require_health(
+        "health endpoint should return 200",
+        port,
+        &mut child,
+        &stderr_log,
+        || health_is_200(port),
+    );
 
     // Kill the server
     let _ = child.kill();
     let _ = child.wait();
 
-    assert!(ok, "health endpoint should return 200");
-
+    let _ = std::fs::remove_file(&stderr_log);
     let _ = std::fs::remove_file(&db_path);
 }
 
@@ -8459,9 +8442,19 @@ fn health_is_200(port: u16) -> bool {
 /// elapses. Early-exits on the first healthy probe AND if the child dies
 /// (so a crashed daemon is not waited out for a full minute).
 fn wait_for_health(port: u16, child: &mut std::process::Child) -> Result<(), String> {
+    wait_for_health_with(child, || health_is_200(port))
+}
+
+/// Same wait with the caller's health probe (a different client or trust
+/// setup). The ceiling is a hang guard, not a product assertion: the wait
+/// ends on the first healthy probe or on child exit, whichever comes first.
+fn wait_for_health_with(
+    child: &mut std::process::Child,
+    mut healthy: impl FnMut() -> bool,
+) -> Result<(), String> {
     for _ in 0..health_probe_attempts() {
         std::thread::sleep(std::time::Duration::from_millis(HEALTH_PROBE_INTERVAL_MS));
-        if health_is_200(port) {
+        if healthy() {
             return Ok(());
         }
         match child.try_wait() {
@@ -8473,6 +8466,22 @@ fn wait_for_health(port: u16, child: &mut std::process::Child) -> Result<(), Str
         }
     }
     Err("timed out waiting for health 200".to_owned())
+}
+
+/// Wait for health with the caller's probe; on failure kill and reap the child
+/// (a no-op once it has exited) and panic with the child's captured stderr.
+fn require_health(
+    what: &str,
+    port: u16,
+    child: &mut std::process::Child,
+    stderr_log: &std::path::Path,
+    healthy: impl FnMut() -> bool,
+) {
+    if let Err(why) = wait_for_health_with(child, healthy) {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic_health_failed(what, port, &why, stderr_log);
+    }
 }
 
 fn panic_health_failed(what: &str, port: u16, why: &str, stderr_log: &std::path::Path) -> ! {
@@ -8718,6 +8727,7 @@ fn test_serve_native_tls_health_probe() {
     // boot (~0.25 s) again. On Linux the warm-up costs milliseconds.
     let _ = cmd(bin).arg("--version").output();
     let port = free_port();
+    let (stderr_file, stderr_log) = serve_stderr_log();
     let mut child = cmd(bin)
         .args([
             "--db",
@@ -8731,39 +8741,36 @@ fn test_serve_native_tls_health_probe() {
             key_path.to_str().unwrap(),
         ])
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(stderr_file)
         .spawn()
         .unwrap();
 
-    // Poll HTTPS health endpoint — curl --insecure against the self-signed cert.
-    let mut ok = false;
-    for _ in 0..50 {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        if let Ok(out) = std::process::Command::new("curl")
-            .args([
-                "-sk",
-                "-m",
-                CURL_PROBE_MAX_SECS,
-                "-o",
-                "/dev/null",
-                "-w",
-                "%{http_code}",
-                &format!("https://127.0.0.1:{port}/api/v1/health"),
-            ])
-            .output()
-            && String::from_utf8_lossy(&out.stdout) == "200"
-        {
-            ok = true;
-            break;
-        }
-    }
+    // Poll HTTPS health endpoint — curl --insecure against the self-signed
+    // cert. #4166: the wait ends on child exit (with its stderr) or on health.
+    require_health(
+        "HTTPS health endpoint never returned 200; is axum-server bound?",
+        port,
+        &mut child,
+        &stderr_log,
+        || {
+            std::process::Command::new("curl")
+                .args([
+                    "-sk",
+                    "-m",
+                    CURL_PROBE_MAX_SECS,
+                    "-o",
+                    "/dev/null",
+                    "-w",
+                    "%{http_code}",
+                    &format!("https://127.0.0.1:{port}/api/v1/health"),
+                ])
+                .output()
+                .is_ok_and(|out| String::from_utf8_lossy(&out.stdout) == "200")
+        },
+    );
     let _ = child.kill();
     let _ = child.wait();
-
-    assert!(
-        ok,
-        "HTTPS health endpoint never returned 200; is axum-server bound?"
-    );
+    let _ = std::fs::remove_file(&stderr_log);
 
     let _ = std::fs::remove_file(&db);
     let _ = std::fs::remove_file(&cert_path);
@@ -8882,6 +8889,7 @@ fn test_serve_mtls_fingerprint_allowlist_accepts_only_known_peer() {
     // and unlinks the temp fixture files (DBs, certs, keys, allowlist)
     // during unwind. Bare `Child` would orphan the server to PID 1.
     let port_b = free_port();
+    let (stderr_file, stderr_log) = serve_stderr_log();
     let serve_b_child = cmd(bin)
         .args([
             "--db",
@@ -8897,10 +8905,10 @@ fn test_serve_mtls_fingerprint_allowlist_accepts_only_known_peer() {
             allowlist_path.to_str().unwrap(),
         ])
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(stderr_file)
         .spawn()
         .unwrap();
-    let _serve_b = ChildGuard::new(serve_b_child).with_cleanup([
+    let mut serve_b = ChildGuard::new(serve_b_child).with_cleanup([
         db_a.clone(),
         db_b.clone(),
         server_cert.clone(),
@@ -8910,6 +8918,7 @@ fn test_serve_mtls_fingerprint_allowlist_accepts_only_known_peer() {
         outsider_cert.clone(),
         outsider_key.clone(),
         allowlist_path.clone(),
+        stderr_log.clone(),
     ]);
 
     // Build a reqwest::blocking client presenting peer-A's cert. We use
@@ -8921,17 +8930,19 @@ fn test_serve_mtls_fingerprint_allowlist_accepts_only_known_peer() {
     // Wait for TLS bind — 30s poll window; Windows is slower on the
     // first handshake (RSA key parse + custom verifier init).
     let health_url = format!("https://127.0.0.1:{port_b}/api/v1/health");
-    let mut ready = false;
-    for _ in 0..300 {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        if let Ok(resp) = client_a.get(&health_url).send()
-            && resp.status().is_success()
-        {
-            ready = true;
-            break;
-        }
-    }
-    assert!(ready, "mTLS serve never accepted peer A's cert for health");
+    // #4166: the wait ends on child exit (with its stderr) or on health.
+    require_health(
+        "mTLS serve never accepted peer A's cert for health",
+        port_b,
+        serve_b.child_mut(),
+        &stderr_log,
+        || {
+            client_a
+                .get(&health_url)
+                .send()
+                .is_ok_and(|resp| resp.status().is_success())
+        },
+    );
 
     // Seed a memory via mTLS POST.
     //
@@ -9055,7 +9066,7 @@ fn test_serve_mtls_fingerprint_allowlist_accepts_only_known_peer() {
         "unauthorised cert must be rejected at TLS handshake; got {neg:?}"
     );
 
-    // _serve_b drops at end of scope: kills the daemon, reaps it, and
+    // serve_b drops at end of scope: kills the daemon, reaps it, and
     // unlinks every temp file in the cleanup list. No manual kill or
     // remove_file needed.
 }

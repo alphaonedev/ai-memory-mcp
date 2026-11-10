@@ -54,13 +54,23 @@ fn scratch_db(infix: &str) -> std::path::PathBuf {
 
 /// Poll `GET /api/v1/health` until it returns `200` or `budget`
 /// elapses. Returns `Some(elapsed)` on success, `None` on timeout.
+/// #4166 — a child that exits before answering fails at once with its
+/// captured stderr (read from `stderr_log`) instead of burning the budget.
 fn wait_for_health_within(
     port: u16,
     budget: Duration,
     tls: &common::tls::TestTls,
+    child: &mut std::process::Child,
+    stderr_log: &std::path::Path,
 ) -> Option<Duration> {
     let started = Instant::now();
     while started.elapsed() < budget {
+        if let Some(status) = child.try_wait().expect("try_wait on serve child") {
+            panic!(
+                "ai-memory serve exited before /api/v1/health answered ({status}); stderr:\n{}",
+                String::from_utf8_lossy(&std::fs::read(stderr_log).unwrap_or_default())
+            );
+        }
         let out = Command::new("curl")
             .args([
                 "-s",
@@ -97,6 +107,8 @@ fn b3_precompute_does_not_block_serve_health() {
     // trigger embedder/LLM init outside the precompute we're
     // probing. The bug doesn't depend on this env var, but setting
     // it isolates the test from operator environment leaks.
+    let stderr_log = db.with_extension("serve-stderr.log");
+    let stderr_file = std::fs::File::create(&stderr_log).expect("create serve stderr log");
     let mut child = Command::cargo_bin("ai-memory")
         .expect("locate ai-memory cargo bin")
         .env("AI_MEMORY_NO_CONFIG", "1")
@@ -121,7 +133,7 @@ fn b3_precompute_does_not_block_serve_health() {
         ])
         .args(tls.serve_arg_strs())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::from(stderr_file))
         .spawn()
         .expect("spawn ai-memory serve");
 
@@ -157,13 +169,14 @@ fn b3_precompute_does_not_block_serve_health() {
     // property intact and removes a knife-edge that could only fail on a
     // slow runner, never on a defect.
     let budget = Duration::from_mins(1);
-    let result = wait_for_health_within(port, budget, &tls);
+    let result = wait_for_health_within(port, budget, &tls, &mut child, &stderr_log);
 
     // Always reap the child before asserting so a failed assertion
     // doesn't leave a zombie daemon holding the port.
     let _ = child.kill();
     let _ = child.wait();
     let _ = std::fs::remove_file(&db);
+    let _ = std::fs::remove_file(&stderr_log);
 
     assert!(
         result.is_some(),
