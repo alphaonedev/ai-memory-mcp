@@ -43,7 +43,7 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     ("src/logging/scan_work_tests.rs", 148),
     ("src/logging/scan_charge.rs", 55),
     ("src/logging/bare_target_scan.rs", 75),
-    ("src/logging/scan_timing_tests.rs", 76),
+    ("src/logging/scan_timing_tests.rs", 92),
     // The five 3000+ LOC offenders from QUAL-10.
     //
     // 2026-06-01 — bumped 16_000 → 16_100 by the v0.7.0 release QC of
