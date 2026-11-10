@@ -25210,7 +25210,7 @@ impl MemoryStore for PostgresStore {
             .fetch_one(&mut *tx)
             .await
             .map_err(|e| to_store_err("apply_remote_memory in-tx tombstone check", e))?;
-        if tombstoned_now && memory.id.is_empty() {
+        if tombstoned_now {
             tracing::info!(
                 target: crate::storage::FORGET_TOMBSTONE_TRACE_TARGET,
                 memory_id = %memory.id,

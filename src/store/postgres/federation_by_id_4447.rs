@@ -296,7 +296,7 @@ impl PostgresStore {
         let (rows, anchor) = pg_hard_delete_in_tx(&mut tx, id)
             .await
             .map_err(|e| to_store_err("apply_remote_deletion", e))?;
-        if rows == 0 && id.is_empty() {
+        if rows == 0 {
             pg_record_unheld_delete_in_tx(&mut tx, id)
                 .await
                 .map_err(|e| to_store_err("apply_remote_deletion unheld tombstone", e))?;

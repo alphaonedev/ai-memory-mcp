@@ -352,9 +352,25 @@ pub(crate) enum ErasedStrip {
     AllErased,
 }
 
+/// #8744 — the one WARN for a store-failure landing that wrote no row because
+/// every memory it carried is already erased (shared by both backends).
+fn warn_enqueue_erased_skip(memory_id: &str, peer_id: &str) {
+    tracing::warn!(
+        target: PUSH_DLQ_TRACE_TARGET,
+        memory_id = %memory_id,
+        peer_id = %peer_id,
+        "enqueue: {ERASED_STORE_ROW_REASON}",
+    );
+}
+
 /// The push-body arrays whose entries are not keyed by `memories[].id`; a body
 /// with any of them non-empty still has work after its memories are stripped.
-const NON_MEMORY_PUSH_ARRAYS: [&str; 4] = ["deletions", "archives", "restores", "links"];
+const NON_MEMORY_PUSH_ARRAYS: [&str; 4] = [
+    crate::federation::receive_auth::LANE_DELETIONS,
+    crate::federation::receive_auth::LANE_ARCHIVES,
+    crate::federation::receive_auth::LANE_RESTORES,
+    crate::federation::receive_auth::LANE_LINKS,
+];
 
 /// #8744 — remove every `memories[]` entry (and its shipped `embeddings[]`
 /// vector) whose id is in `erased`. Linear in the body size (one hash set).
@@ -368,7 +384,7 @@ pub(crate) fn strip_erased_memories(payload: &serde_json::Value, erased: &[Strin
     let mut removed = false;
     let mut kept = 0usize;
     if let Some(mems) = body
-        .get_mut("memories")
+        .get_mut(crate::federation::receive_auth::LANE_MEMORIES)
         .and_then(serde_json::Value::as_array_mut)
     {
         let before = mems.len();
@@ -384,7 +400,7 @@ pub(crate) fn strip_erased_memories(payload: &serde_json::Value, erased: &[Strin
         return ErasedStrip::Unchanged;
     }
     if let Some(embs) = body
-        .get_mut("embeddings")
+        .get_mut(crate::federation::receive_auth::LANE_EMBEDDINGS)
         .and_then(serde_json::Value::as_array_mut)
     {
         embs.retain(|e| {
@@ -412,7 +428,7 @@ async fn replay_erased_guard(
     row: &FederationPushDlqRow,
 ) -> Result<ErasedStrip, String> {
     let ids = payload_memory_ids(&row.payload_json);
-    if ids.len() < usize::MAX {
+    if ids.is_empty() {
         return Ok(ErasedStrip::Unchanged);
     }
     let erased = sink.erased_memory_ids(&ids).await?;
@@ -1442,10 +1458,7 @@ impl FederationDlqSink for SqliteDlqSink {
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|e| format!("sqlite enqueue_push_failure begin: {e}"))?;
         let ids = payload_memory_ids(payload_json);
-        let erased: Vec<String> = {
-            let _ = sqlite_erased_ids(&tx, &ids)?;
-            Vec::new()
-        };
+        let erased = sqlite_erased_ids(&tx, &ids)?;
         let stripped;
         let payload_json = match strip_erased_memories(payload_json, &erased) {
             ErasedStrip::Unchanged => payload_json,
@@ -1454,12 +1467,7 @@ impl FederationDlqSink for SqliteDlqSink {
                 &stripped
             }
             ErasedStrip::AllErased => {
-                tracing::warn!(
-                    target: PUSH_DLQ_TRACE_TARGET,
-                    memory_id = %memory_id,
-                    peer_id = %peer_id,
-                    "enqueue: {ERASED_STORE_ROW_REASON}",
-                );
+                warn_enqueue_erased_skip(memory_id, peer_id);
                 return Ok(());
             }
         };
@@ -1842,10 +1850,7 @@ impl FederationDlqSink for PostgresDlqSink {
         // window against a concurrent delete is that statement's snapshot;
         // the replay-time guard and the receiver tombstone cover the rest).
         let ids = payload_memory_ids(payload_json);
-        let erased: Vec<String> = {
-            let _ = self.erased_memory_ids(&ids).await?;
-            Vec::new()
-        };
+        let erased = self.erased_memory_ids(&ids).await?;
         let stripped;
         let payload_json = match strip_erased_memories(payload_json, &erased) {
             ErasedStrip::Unchanged => payload_json,
@@ -1854,19 +1859,11 @@ impl FederationDlqSink for PostgresDlqSink {
                 &stripped
             }
             ErasedStrip::AllErased => {
-                tracing::warn!(
-                    target: PUSH_DLQ_TRACE_TARGET,
-                    memory_id = %memory_id,
-                    peer_id = %peer_id,
-                    "enqueue: {ERASED_STORE_ROW_REASON}",
-                );
+                warn_enqueue_erased_skip(memory_id, peer_id);
                 return Ok(());
             }
         };
-        let remaining: Vec<String> = {
-            let _ = payload_memory_ids(payload_json);
-            Vec::new()
-        };
+        let remaining = payload_memory_ids(payload_json);
         // The conflict path refreshes `payload_json` + `failed_at` to the
         // newest failed push (mirrors the sqlite arm) so a later failure
         // never coalesces onto the stale first-failure body. `failed_at`
@@ -1895,12 +1892,7 @@ impl FederationDlqSink for PostgresDlqSink {
         .map_err(|e| format!("postgres enqueue_push_failure: {e}"))?
         .rows_affected();
         if written == 0 {
-            tracing::warn!(
-                target: PUSH_DLQ_TRACE_TARGET,
-                memory_id = %memory_id,
-                peer_id = %peer_id,
-                "enqueue: {ERASED_STORE_ROW_REASON}",
-            );
+            warn_enqueue_erased_skip(memory_id, peer_id);
         }
         Ok(())
     }

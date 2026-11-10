@@ -159,9 +159,6 @@ fn delete_recording_unheld(conn: &Connection, id: &str) -> Result<bool> {
     if delete(conn, id)? {
         return Ok(true);
     }
-    if !id.is_empty() {
-        return Ok(false);
-    }
     let archived: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM archived_memories WHERE id = ?1)",
         params![id],

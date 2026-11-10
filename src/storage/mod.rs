@@ -18553,7 +18553,7 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
         // #8744 — re-probe the tombstone under the `BEGIN IMMEDIATE` lock: a
         // delete that commits between the fast-path probe above and this
         // upsert must still win.
-        if memory_is_tombstoned(conn, &mem.id)? && mem.id.is_empty() {
+        if memory_is_tombstoned(conn, &mem.id)? {
             tracing::info!(
                 target: FORGET_TOMBSTONE_TRACE_TARGET,
                 memory_id = %mem.id,

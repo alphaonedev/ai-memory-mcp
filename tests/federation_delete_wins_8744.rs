@@ -259,7 +259,12 @@ async fn sqlite_store_unheld_deletion_then_store_is_refused_8744() {
     let store = SqliteStore::open(tmp.path().join("s.db")).expect("open store");
     let ctx = CallerContext::for_agent(TEST_AGENT);
     let id = uid("sal");
-    assert!(!store.apply_remote_deletion(&ctx, &id).await.expect("deletion"));
+    assert!(
+        !store
+            .apply_remote_deletion(&ctx, &id)
+            .await
+            .expect("deletion")
+    );
     let applied = store
         .apply_remote_memory(&ctx, &memory(&id))
         .await
@@ -351,7 +356,9 @@ async fn spawn_mock_peer(state: PeerState) -> String {
     let app = Router::new()
         .route("/api/v1/sync/push", post(push_handler))
         .with_state(state);
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind loopback");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback");
     let addr = listener.local_addr().expect("addr");
     tokio::spawn(async move {
         axum::serve(listener, app).await.ok();
@@ -532,13 +539,23 @@ fn concurrent_receive_and_delete_always_end_deleted_8744() {
     deleter.join().expect("deleter thread");
 
     let conn = ai_memory::storage::open(&path).expect("open check");
-    let resurrected: Vec<&String> = ids.iter().filter(|id| live_exists(&conn, id)).collect();
-    assert!(resurrected.is_empty(), "deleted ids came back: {resurrected:?}");
+    let resurrected: Vec<(&String, Option<String>)> = ids
+        .iter()
+        .filter(|id| live_exists(&conn, id))
+        .map(|id| (id, tombstone_namespace(&conn, id)))
+        .collect();
+    assert!(
+        resurrected.is_empty(),
+        "deleted ids came back: {resurrected:?}"
+    );
     let untombstoned: Vec<&String> = ids
         .iter()
         .filter(|id| !memory_is_tombstoned(&conn, id).expect("probe"))
         .collect();
-    assert!(untombstoned.is_empty(), "deletes left no record: {untombstoned:?}");
+    assert!(
+        untombstoned.is_empty(),
+        "deletes left no record: {untombstoned:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -560,7 +577,9 @@ mod pg {
             return None;
         };
         Some(Arc::new(
-            PostgresStore::connect(&url).await.expect("connect postgres"),
+            PostgresStore::connect(&url)
+                .await
+                .expect("connect postgres"),
         ))
     }
 
@@ -584,7 +603,12 @@ mod pg {
         let Some(store) = connect().await else { return };
         let ctx = CallerContext::for_agent(TEST_AGENT);
         let id = uid("pg-unheld");
-        assert!(!store.apply_remote_deletion(&ctx, &id).await.expect("deletion"));
+        assert!(
+            !store
+                .apply_remote_deletion(&ctx, &id)
+                .await
+                .expect("deletion")
+        );
         assert_eq!(
             pg_tombstone_namespace(&store, &id).await.as_deref(),
             Some(UNHELD_DELETE_TOMBSTONE_NAMESPACE)
@@ -607,9 +631,15 @@ mod pg {
         let Some(store) = connect().await else { return };
         let ctx = CallerContext::for_agent(TEST_AGENT);
         let old = uid("pg-old");
-        store.apply_remote_deletion(&ctx, &old).await.expect("deletion");
+        store
+            .apply_remote_deletion(&ctx, &old)
+            .await
+            .expect("deletion");
         let fresh = memory(&uid("pg-new"));
-        store.apply_remote_memory(&ctx, &fresh).await.expect("apply");
+        store
+            .apply_remote_memory(&ctx, &fresh)
+            .await
+            .expect("apply");
         assert_eq!(store.get(&ctx, &fresh.id).await.expect("get").id, fresh.id);
     }
 
@@ -661,7 +691,10 @@ mod pg {
                 let ctx = CallerContext::for_agent(TEST_AGENT);
                 start.wait().await;
                 for id in ids.iter() {
-                    store.apply_remote_memory(&ctx, &memory(id)).await.expect("receive");
+                    store
+                        .apply_remote_memory(&ctx, &memory(id))
+                        .await
+                        .expect("receive");
                 }
             })
         };
