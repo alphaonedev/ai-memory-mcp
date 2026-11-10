@@ -72,6 +72,8 @@ pub mod peer_attestation;
 pub mod peer_posture;
 // #3654 — per-peer fan-out task set that keeps its peer on a JoinError.
 mod peer_tasks;
+// #8743 — the receiver-clock-bounded `/sync/since` pull cursor.
+pub(crate) mod pull_cursor;
 // v0.7.0 Track D #933 — federation push DLQ + replay worker.
 // #2678: the module is ungated on the default (sqlite-only) build so
 // failed fanouts land in `federation_push_dlq` rather than being
@@ -106,6 +108,14 @@ pub use receive::spawn_catchup_loop_with_store;
 // the source-side so it doesn't appear in rustdoc, but kept `pub`
 // here so the integration test (separate crate) can import it.
 pub use receive::catchup_once_for_tests;
+// #8743 — the per-peer pull-window outcome and its named outcomes, plus the
+// integration-test drivers that return them.
+pub use pull_cursor::{
+    OUTCOME_DEFERRED_FUTURE_SKEW, PULL_HOLD_STALL_PASSES, PullOutcome, RefusalReason, RefusedRow,
+};
+pub use receive::catchup_pass_for_tests;
+#[cfg(feature = "sal")]
+pub use receive::catchup_pass_with_store_for_tests;
 pub use sync::*;
 // v0.7.0 Track D #933 — re-export push DLQ surface for daemon bootstrap +
 // integration tests.
@@ -3031,9 +3041,9 @@ mod tests {
 
     /// W12-G #13: `catchup_once` skips memories that fail
     /// `validate_memory` (e.g. invalid `source` enum). The valid memory
-    /// IS applied; sync_state advances to the latest TS seen. Exercises
-    /// the `if crate::validate::validate_memory(&mem).is_err() { continue; }`
-    /// branch which the F9 happy-path tests don't trigger.
+    /// IS applied; the invalid one is refused and recorded (#8789) and
+    /// sync_state passes it. Exercises the validate-fail refusal branch
+    /// which the F9 happy-path tests don't trigger.
     #[test]
     fn catchup_once_skips_invalid_memory_but_applies_valid_neighbour() {
         with_scoped_catchup_env(
@@ -3070,15 +3080,15 @@ mod tests {
                     )
                     .unwrap();
                 assert_eq!(title, "ok-mem");
-                // sync_state advanced to the latest TS of the APPLIED rows
-                // only — the validate-fail `continue` happens before the
-                // `latest_ts` bump, so the invalid 10:00:01 row does NOT
-                // contribute. Net: latest_ts == valid memory's timestamp.
+                // #8789: the invalid 10:00:01 row is refused AND recorded
+                // (WARN + `federation_pull_rows_refused_total{reason=
+                // "invalid_memory"}`), so the cursor may pass it: a page
+                // that is not full settles at its newest settled row.
                 let clock = crate::db::sync_state_load(&lock.0, "ai:catchup-test").unwrap();
                 assert_eq!(
                     clock.entries.get("peer-0").map(String::as_str),
-                    Some("2026-04-26T10:00:00Z"),
-                    "sync_state tracks latest_ts of validate-passing rows"
+                    Some("2026-04-26T10:00:01Z"),
+                    "sync_state passes a refused-and-recorded row (#8789)"
                 );
             },
         );

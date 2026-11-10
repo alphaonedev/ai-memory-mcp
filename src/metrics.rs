@@ -180,6 +180,9 @@ pub struct Metrics {
     pub federation_peer_consecutive_failures: IntGaugeVec,
     /// #3654 — failed attempts per peer, `direction` and closed-set `class`.
     pub federation_peer_failures_total: IntCounterVec,
+    /// #8788 / #8789 — delivered `/sync/since` rows the receiver refused and
+    /// recorded (the cursor passes them), by closed-set `reason`.
+    pub federation_pull_rows_refused_total: IntCounterVec,
     /// #3654 — peer clock minus local clock, whole seconds, from the peer's
     /// HTTP `Date` header on the last catch-up response.
     pub federation_peer_clock_skew_seconds: IntGaugeVec,
@@ -963,6 +966,15 @@ impl Metrics {
             &["peer", "direction", "class"],
             &mut err,
         );
+        let federation_pull_rows_refused_total = int_counter_vec(
+            &registry,
+            "ai_memory_federation_pull_rows_refused_total",
+            "Delivered /sync/since rows refused and recorded by the receiver; the pull \
+                 cursor passes them. reason=unparseable_ts|unparseable_body|invalid_memory|\
+                 namespace_scope|content_attestation|hold_stalled (#8788/#8789).",
+            &["reason"],
+            &mut err,
+        );
         let federation_peer_clock_skew_seconds = int_gauge_vec(
             &registry,
             "ai_memory_federation_peer_clock_skew_seconds",
@@ -1583,6 +1595,7 @@ impl Metrics {
             federation_peer_last_success_timestamp_seconds,
             federation_peer_consecutive_failures,
             federation_peer_failures_total,
+            federation_pull_rows_refused_total,
             federation_peer_clock_skew_seconds,
             federation_peer_push_dlq_depth,
             federation_peer_push_dlq_oldest_failed_timestamp_seconds,
