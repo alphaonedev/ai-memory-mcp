@@ -1,13 +1,11 @@
 //! #8674 / #8820: coarse wall-clock quadratic detector for every operator-log scanner entry.
 //!
-//! The proof of linearity is the deterministic op-count in `scan_work_tests`; it gives the same
-//! verdict at any machine load. This guard only sees what a counter cannot, uncharged work, and
-//! it cannot separate noise from a modest superlinear cost: a loaded macOS runner measured a
-//! linear scanner at x24.4 (run 42845848659, load1 about 24). So the bound sits between that
-//! noise and a quadratic scan. The 100K and 1M inputs are timed interleaved, so a load spike hits
-//! both sizes alike, and the minimum of each size is compared: linear work measures x10.4 quiet
-//! and up to x24.4 loaded, a quadratic scan about x100 (x10 input, x10 cost per byte).
-//! A ratio in the grey zone above linear gets more pairs, so load noise drops out.
+//! NOT a gate: every test here is `#[ignore]`d and runs only by name with `--ignored`. The proof of
+//! linearity is the deterministic op-count in `scan_work_tests`, which gives the same verdict at
+//! any machine load. A wall-clock ratio on a shared runner is noise: linear work measures x10 on a
+//! quiet host, and loaded macOS runners measured x24.4 (run 42845848659) and x57 (run 42881994767),
+//! so bounds of 20 and 50 both failed on load alone (#8820). The 100K and 1M inputs are timed
+//! interleaved and the minimum of each size is compared; a quadratic scan is about x100.
 //! The scans run on one worker thread and each wait has an absolute bound, so a hang fails the
 //! named test.
 
@@ -18,9 +16,8 @@ const SMALL_BYTES: usize = 100_000;
 const LARGE_BYTES: usize = 1_000_000;
 /// Base interleaved pairs; each pair times one small and one large input.
 const ROUNDS: usize = 5;
-/// `min(1M) / min(100K)` stays below this. Linear work measured x10.4 quiet and at most x24.4
-/// under load (#8820); a quadratic scan is about x100. 50 is twice the worst linear noise and
-/// half the quadratic ratio; the exact linearity verdict is the op-count, not this ratio.
+/// `min(1M) / min(100K)` stays below this when run by hand on a quiet host (linear x10,
+/// quadratic about x100); loaded runners exceed it (#8820), so the tests are ignored.
 const QUADRATIC_RATIO_LIMIT: u32 = 50;
 /// Hundredths of a ratio at or above which more pairs are measured: well above linear x10.4,
 /// well below the limit, so only load noise sits here and more samples lower it.
@@ -124,6 +121,7 @@ fn assert_scanner_ratio(name: &str, scan: fn(&str) -> String) {
 }
 
 #[test]
+#[ignore = "wall-clock ratio is host-load noise, not a gate (#8820); op-count tests in scan_work_tests hold linearity"]
 fn connection_option_scanner_time_is_linear_8674() {
     assert_scanner_ratio(
         "redact_connection_options",
@@ -132,16 +130,19 @@ fn connection_option_scanner_time_is_linear_8674() {
 }
 
 #[test]
+#[ignore = "wall-clock ratio is host-load noise, not a gate (#8820); op-count tests in scan_work_tests hold linearity"]
 fn bare_target_scanner_time_is_linear_8674() {
     assert_scanner_ratio("redact_bare_targets", super::redact_bare_targets);
 }
 
 #[test]
+#[ignore = "wall-clock ratio is host-load noise, not a gate (#8820); op-count tests in scan_work_tests hold linearity"]
 fn url_userinfo_scanner_time_is_linear_8674() {
     assert_scanner_ratio("url userinfo scanner", super::url_userinfo_scanner_8674);
 }
 
 #[test]
+#[ignore = "wall-clock ratio is host-load noise, not a gate (#8820); op-count tests in scan_work_tests hold linearity"]
 fn operator_url_scanner_time_is_linear_8674() {
     assert_scanner_ratio("map_urls_in_message", |msg| {
         super::map_urls_in_message(msg, str::to_owned)
