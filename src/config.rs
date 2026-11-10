@@ -3866,7 +3866,7 @@ pub struct LlmSection {
     /// explicit `base_url`), or an alias that pre-fills `base_url`
     /// (`openai`, `xai`, `anthropic`, `gemini`,
     /// `mistral`, `groq`, `together`, `cerebras`, `openrouter`,
-    /// `fireworks`, `lmstudio`). Unset = inherit legacy resolution
+    /// `fireworks`, `lmstudio`, `vllm`). Unset = inherit legacy resolution
     /// (treated as `ollama`).
     pub backend: Option<String>,
 
