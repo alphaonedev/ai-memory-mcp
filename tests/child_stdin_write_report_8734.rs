@@ -360,3 +360,403 @@ fn finish_reader_returns_within_its_bound_when_the_pipe_stays_open_8734() {
     );
     drop(tx);
 }
+
+// Guard (#8734, class fix): no new unconverted child-stdin write.
+//
+// A source scan over every `.rs` file under `tests/` and `benches/`. It fails,
+// naming `file:line`, on a child-stdin handle access (`<x>.stdin.take()`,
+// `.stdin.as_mut()`, `.stdin.as_ref()` and every other `.stdin` field form;
+// the `.stdin(Stdio::piped())` builder call is not an access) whose handle is
+// written to directly, in the same statement or through the name the access is
+// bound to, outside the helper modules. A handle that is handed to
+// `child_stdin_report`, or only dropped to close stdin, is not a write.
+//
+// Sites are matched on file plus a stable text anchor, never a bare line
+// number, so an unrelated edit does not break the guard.
+
+/// A file the scan never reports, with the reason.
+struct ExemptFile {
+    path: &'static str,
+    reason: &'static str,
+}
+
+/// Files outside the scan: the helper module and this binary.
+const GUARD_EXEMPT_FILES: &[ExemptFile] = &[
+    ExemptFile {
+        path: "tests/common/child_stdin_report.rs",
+        reason: "the helper itself: its raw writes are the one reviewed implementation",
+    },
+    ExemptFile {
+        path: "tests/child_stdin_write_report_8734.rs",
+        reason: "this binary: its fixtures write raw on purpose to produce the failures the \
+                 helper must report, and its synthetic sources hold the text the scan looks for",
+    },
+];
+
+/// One allowlisted site group: every flagged site in `file` whose line text
+/// contains `anchor`. `sites` is the exact number of such sites, so an entry
+/// whose site vanished (or a second site that appeared) fails the guard.
+struct AllowEntry {
+    file: &'static str,
+    anchor: &'static str,
+    sites: usize,
+    reason: &'static str,
+}
+
+/// The ONE allowlist of child-stdin writes that stay raw.
+const STDIN_WRITE_ALLOWLIST: &[AllowEntry] = &[
+    AllowEntry {
+        file: "tests/mcp_signal_drain_4347.rs",
+        anchor: "if let Some(mut stdin) = child.stdin.take()",
+        sites: 1,
+        reason: "deliberate `let _ = writeln!` to a child that is expected to have exited \
+                 (a failed write is the refusal the test asserts)",
+    },
+    AllowEntry {
+        file: "tests/mcp_signal_drain_4347.rs",
+        anchor: "let mut stdin = child.stdin.take().expect(\"stdin\");",
+        sites: 1,
+        reason: "burst writer thread whose write results are discarded with `let _` on \
+                 purpose: the child is cut by SIGTERM mid-burst",
+    },
+];
+
+/// A flagged child-stdin access.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Site {
+    file: String,
+    line: usize,
+    text: String,
+}
+
+/// Tokens that write to a handle.
+const WRITE_TOKENS: &[&str] = &[
+    "write_all(",
+    "write!(",
+    "writeln!(",
+    ".write(",
+    ".flush(",
+    "write_fmt(",
+];
+
+/// Pattern keywords that are not binding names.
+const PATTERN_KEYWORDS: &[&str] = &["let", "if", "while", "Some", "Ok", "mut", "ref", "else"];
+
+/// How far past an access a bound name is followed (lines).
+const FOLLOW_LINES: usize = 40;
+
+fn is_ident_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
+/// `source` with every whole-line `//` comment blanked, byte offsets kept.
+fn blank_comment_lines(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    for line in source.split_inclusive('\n') {
+        if line.trim_start().starts_with("//") {
+            out.extend(line.chars().map(|c| if c == '\n' { '\n' } else { ' ' }));
+        } else {
+            out.push_str(line);
+        }
+    }
+    out
+}
+
+/// Byte offsets of every `;`, `{` and `}` outside a string or char literal.
+fn statement_boundaries(source: &str) -> Vec<usize> {
+    let bytes = source.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'"' {
+                    i += if bytes[i] == b'\\' { 2 } else { 1 };
+                }
+            }
+            b'\'' => {
+                // A char literal ('x' or '\n'); a lifetime has no closing quote.
+                let close = if bytes.get(i + 1) == Some(&b'\\') { i + 3 } else { i + 2 };
+                if bytes.get(close) == Some(&b'\'') {
+                    i = close;
+                }
+            }
+            b';' | b'{' | b'}' => out.push(i),
+            _ => {}
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Byte offsets of every child-stdin field access in `source`: `.stdin`
+/// followed by neither an identifier character nor `(`.
+fn stdin_accesses(source: &str) -> Vec<usize> {
+    const NEEDLE: &str = ".stdin";
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(found) = source[from..].find(NEEDLE) {
+        let at = from + found;
+        let after = source[at + NEEDLE.len()..].chars().next();
+        if after.is_none_or(|c| !is_ident_char(c) && c != '(') {
+            out.push(at);
+        }
+        from = at + NEEDLE.len();
+    }
+    out
+}
+
+/// Identifiers a `let` / `if let` / `while let` statement binds.
+fn bound_names(statement: &str) -> Vec<String> {
+    let trimmed = statement.trim_start();
+    if !(trimmed.starts_with("let ")
+        || trimmed.starts_with("if let ")
+        || trimmed.starts_with("while let "))
+    {
+        return Vec::new();
+    }
+    let pattern = trimmed.split_once('=').map_or(trimmed, |(left, _)| left);
+    let mut names = Vec::new();
+    let mut word = String::new();
+    for c in pattern.chars().chain(std::iter::once(' ')) {
+        if is_ident_char(c) {
+            word.push(c);
+        } else {
+            if !word.is_empty()
+                && word != "_"
+                && !PATTERN_KEYWORDS.contains(&word.as_str())
+                && !word.starts_with(|first: char| first.is_ascii_digit())
+            {
+                names.push(word.clone());
+            }
+            word.clear();
+        }
+    }
+    names
+}
+
+/// Whether `region` writes to the binding `name`.
+fn writes_to_name(region: &str, name: &str) -> bool {
+    let macro_forms = [
+        format!("write!({name}"),
+        format!("writeln!({name}"),
+        format!("write!(&mut {name}"),
+        format!("writeln!(&mut {name}"),
+    ];
+    if macro_forms.iter().any(|form| region.contains(form)) {
+        return true;
+    }
+    [".write_all(", ".write(", ".flush(", ".write_fmt("]
+        .iter()
+        .any(|method| {
+            let needle = format!("{name}{method}");
+            region.match_indices(&needle).any(|(at, _)| {
+                !region[..at]
+                    .chars()
+                    .next_back()
+                    .is_some_and(is_ident_char)
+            })
+        })
+}
+
+/// The text after `end` up to the end of the enclosing function (or
+/// [`FOLLOW_LINES`] lines).
+fn following_region(source: &str, end: usize) -> &str {
+    let rest = &source[end..];
+    let mut offset = 0;
+    for (n, line) in rest.split_inclusive('\n').enumerate() {
+        let starts_item = line.starts_with("fn ")
+            || line.starts_with("pub fn ")
+            || line.starts_with("#[test]")
+            || line.starts_with('}');
+        if n > 0 && (starts_item || n > FOLLOW_LINES) {
+            break;
+        }
+        offset += line.len();
+    }
+    &rest[..offset]
+}
+
+/// STUB (red commit): reports nothing, so the rows that need a flagged site fail.
+fn scan_source(_file: &str, _source: &str) -> Vec<Site> {
+    Vec::new()
+}
+
+/// Sites no allowlist entry covers, and the entries whose site count is not
+/// the number of sites they match (stale or grown).
+fn unallowed_and_stale<'a>(
+    sites: &[Site],
+    allow: &'a [AllowEntry],
+) -> (Vec<Site>, Vec<&'a AllowEntry>) {
+    let covers = |entry: &AllowEntry, site: &Site| {
+        site.file == entry.file && site.text.contains(entry.anchor)
+    };
+    let unallowed = sites
+        .iter()
+        .filter(|site| !allow.iter().any(|entry| covers(entry, site)))
+        .cloned()
+        .collect();
+    let stale = allow
+        .iter()
+        .filter(|entry| sites.iter().filter(|site| covers(entry, site)).count() != entry.sites)
+        .collect();
+    (unallowed, stale)
+}
+
+/// Every `.rs` file under `dir`, recursively, sorted.
+fn rust_files_under(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut paths: Vec<_> = entries.filter_map(Result::ok).map(|e| e.path()).collect();
+    paths.sort();
+    for path in paths {
+        if path.is_dir() {
+            rust_files_under(&path, out);
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            out.push(path);
+        }
+    }
+}
+
+/// The scan over the real tree.
+fn scan_tree() -> Vec<Site> {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    for dir in ["tests", "benches"] {
+        rust_files_under(&root.join(dir), &mut files);
+    }
+    let mut sites = Vec::new();
+    for path in files {
+        let relative = path
+            .strip_prefix(root)
+            .expect("under the manifest dir")
+            .to_string_lossy()
+            .replace('\\', "/");
+        if GUARD_EXEMPT_FILES.iter().any(|exempt| exempt.path == relative) {
+            continue;
+        }
+        let source = std::fs::read_to_string(&path).expect("read a test source");
+        sites.extend(scan_source(&relative, &source));
+    }
+    sites
+}
+
+/// The failure text for a violation, naming `file:line`.
+fn describe(site: &Site) -> String {
+    format!("{}:{}: {}", site.file, site.line, site.text)
+}
+
+/// A scratch test file with an unconverted write, built without the text the
+/// scan looks for appearing in this file's own scan (this file is exempt).
+const UNCONVERTED_SOURCE: &str = "fn drive() {\n    let mut child = spawn();\n    \
+    writeln!(child.stdin.take().expect(\"stdin\"), \"{request}\").expect(\"request\");\n}\n";
+
+/// The same write after conversion to the helper.
+const CONVERTED_SOURCE: &str = "fn drive() {\n    let mut child = spawn();\n    \
+    child_stdin_report::send_and_close(&mut child, \"request\", b\"x\");\n}\n";
+
+/// The bound-name form: take, bind, write through the name.
+const BOUND_SOURCE: &str = "fn drive() {\n    let mut stdin = child.stdin.take().unwrap();\n    \
+    stdin.write_all(b\"x\").unwrap();\n}\n";
+
+/// The `as_mut` form on a field.
+const AS_MUT_SOURCE: &str = "fn drive(&mut self) {\n    let stdin = self.stdin.as_mut().unwrap();\n    \
+    stdin.flush().unwrap();\n}\n";
+
+/// A source whose only stdin use is closing it or the builder call.
+const NON_WRITE_SOURCE: &str = "fn drive() {\n    let child = Command::new(\"x\").stdin(Stdio::piped()).spawn();\n    \
+    drop(child.stdin.take());\n    // child.stdin.take() in a comment: ignored\n}\n";
+
+// Row (g1): an unconverted write is flagged with its line.
+
+#[test]
+fn guard_flags_an_unconverted_write_with_its_line_8734() {
+    let sites = scan_source("tests/scratch_8734.rs", UNCONVERTED_SOURCE);
+    assert_eq!(sites.len(), 1, "{sites:?}");
+    assert_eq!(describe(&sites[0]).split(':').take(2).collect::<Vec<_>>(), [
+        "tests/scratch_8734.rs",
+        "3"
+    ]);
+    let (violations, stale) = unallowed_and_stale(&sites, &[]);
+    assert_eq!(violations, sites, "no allowlist entry: it is a violation");
+    assert!(stale.is_empty());
+    for (name, source) in [("bound", BOUND_SOURCE), ("as_mut", AS_MUT_SOURCE)] {
+        let found = scan_source("tests/scratch_8734.rs", source);
+        assert_eq!(found.len(), 1, "{name} form: {found:?}");
+        assert_eq!(found[0].line, 2, "{name} form reports the access line");
+    }
+    for (name, source) in [
+        ("converted", CONVERTED_SOURCE),
+        ("close and builder", NON_WRITE_SOURCE),
+    ] {
+        assert!(
+            scan_source("tests/scratch_8734.rs", source).is_empty(),
+            "{name} form is not a write"
+        );
+    }
+}
+
+// Row (g2): a synthetic allowlisted site passes.
+
+#[test]
+fn guard_passes_an_allowlisted_site_8734() {
+    let sites = scan_source("tests/scratch_8734.rs", UNCONVERTED_SOURCE);
+    let allow = [AllowEntry {
+        file: "tests/scratch_8734.rs",
+        anchor: "child.stdin.take().expect(\"stdin\")",
+        sites: 1,
+        reason: "synthetic",
+    }];
+    let (violations, stale) = unallowed_and_stale(&sites, &allow);
+    assert!(violations.is_empty(), "{violations:?}");
+    assert!(stale.is_empty());
+}
+
+// Row (g3): an allowlist entry whose site no longer exists fails.
+
+#[test]
+fn guard_fails_a_stale_allowlist_entry_8734() {
+    let sites = scan_source("tests/scratch_8734.rs", CONVERTED_SOURCE);
+    let allow = [AllowEntry {
+        file: "tests/scratch_8734.rs",
+        anchor: "child.stdin.take().expect(\"stdin\")",
+        sites: 1,
+        reason: "synthetic",
+    }];
+    let (violations, stale) = unallowed_and_stale(&sites, &allow);
+    assert!(violations.is_empty());
+    assert_eq!(stale.len(), 1, "the entry has no site left");
+    // A second matching site than the entry names fails the same way.
+    let doubled = scan_source(
+        "tests/scratch_8734.rs",
+        &format!("{UNCONVERTED_SOURCE}{UNCONVERTED_SOURCE}"),
+    );
+    let (_, grown) = unallowed_and_stale(&doubled, &allow);
+    assert_eq!(grown.len(), 1, "a new site under an old entry fails");
+}
+
+// Row (g4): the real tree passes.
+
+#[test]
+fn every_child_stdin_write_in_tests_and_benches_goes_through_the_helper_8734() {
+    let sites = scan_tree();
+    let (violations, stale) = unallowed_and_stale(&sites, STDIN_WRITE_ALLOWLIST);
+    let report: Vec<String> = violations.iter().map(describe).collect();
+    assert!(
+        violations.is_empty(),
+        "unconverted child-stdin write(s); use tests/common/child_stdin_report.rs \
+         (or add one allowlist entry with a reason):\n{}",
+        report.join("\n")
+    );
+    let stale_report: Vec<String> = stale
+        .iter()
+        .map(|entry| format!("{} {:?} ({})", entry.file, entry.anchor, entry.reason))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "allowlist entries that match no site, or a different number than named:\n{}",
+        stale_report.join("\n")
+    );
+}
