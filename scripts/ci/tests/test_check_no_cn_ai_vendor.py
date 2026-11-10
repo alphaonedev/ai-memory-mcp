@@ -54,9 +54,20 @@ ALLOW_DATA = json.loads(ALLOW.read_text(encoding="utf-8"))
 EMPTY_ALLOW = {"flash_testing": {"path_prefixes": []}, "functional_code_sites": []}
 
 
-def scan(rel, text):
+# Fixture functional code site: the live allowlist exempts no code, so the
+# code-site behaviour is exercised against this fixture entry instead.
+CODE_SITE_PATH = "src/llm.rs"
+CODE_SITE_ALLOW = {**ALLOW_DATA,
+                   "functional_code_sites": [{"path": CODE_SITE_PATH, "reason": "fixture"}]}
+
+
+def scan(rel, text, allow=None):
     patterns = GATE_MOD.build_patterns()
-    return list(GATE_MOD.scan_text(rel, text, patterns, ALLOW_DATA))
+    return list(GATE_MOD.scan_text(rel, text, patterns, ALLOW_DATA if allow is None else allow))
+
+
+def scan_site(text):
+    return scan(CODE_SITE_PATH, text, CODE_SITE_ALLOW)
 
 
 class PlainTermTests(unittest.TestCase):
@@ -153,40 +164,46 @@ class FlashExceptionTests(unittest.TestCase):
 class RustCodeSiteTests(unittest.TestCase):
     def test_code_line_allowed_comment_line_flagged(self):
         term = rot("xvzv")
-        self.assertEqual(scan("src/llm.rs", f'    "{term}" => 1,'), [])
-        self.assertEqual([lab for _, lab in scan("src/llm.rs", f"/// {term}")], [term])
+        self.assertEqual(scan_site(f'    "{term}" => 1,'), [])
+        self.assertEqual([lab for _, lab in scan_site(f"/// {term}")], [term])
         self.assertEqual([lab for _, lab in scan("src/other.rs", f'"{term}"')], [term])
+
+    def test_live_allowlist_exempts_no_code_line(self):
+        term = rot("xvzv")
+        self.assertEqual(ALLOW_DATA["functional_code_sites"], [])
+        hits = scan(CODE_SITE_PATH, f'    "{term}" => 1,')
+        self.assertEqual([lab for _, lab in hits], [term])
 
 
 class RustTrailingCommentTests(unittest.TestCase):
     def test_trailing_line_comment_on_code_line_is_scanned(self):
         term = rot("xvzv")
-        hits = scan("src/llm.rs", f"    let x = 1; // {term} alias")
+        hits = scan_site(f"    let x = 1; // {term} alias")
         self.assertEqual([lab for _, lab in hits], [term])
 
     def test_slashes_inside_a_string_literal_are_not_a_comment(self):
         term = rot("xvzv")
-        self.assertEqual(scan("src/llm.rs", f'    "https://x/{term}" => 1, // plain note'), [])
+        self.assertEqual(scan_site(f'    "https://x/{term}" => 1, // plain note'), [])
 
     def test_escaped_quote_does_not_end_the_string(self):
         term = rot("xvzv")
         line = '    "a \\" // ' + term + '" => 1,'
-        self.assertEqual(scan("src/llm.rs", line), [])
+        self.assertEqual(scan_site(line), [])
 
     def test_trailing_comment_after_string_with_slashes_is_scanned(self):
         term = rot("xvzv")
         line = f'    "a//b" => 1, // {term}'
-        self.assertEqual([lab for _, lab in scan("src/llm.rs", line)], [term])
+        self.assertEqual([lab for _, lab in scan_site(line)], [term])
 
     def test_char_literal_quote_does_not_hide_a_comment(self):
         term = rot("xvzv")
         line = "    '\"' => 1, // " + term
-        self.assertEqual([lab for _, lab in scan("src/llm.rs", line)], [term])
+        self.assertEqual([lab for _, lab in scan_site(line)], [term])
 
     def test_trailing_block_comment_is_scanned(self):
         term = rot("xvzv")
         line = f"    let x = 1; /* {term} */"
-        self.assertEqual([lab for _, lab in scan("src/llm.rs", line)], [term])
+        self.assertEqual([lab for _, lab in scan_site(line)], [term])
 
 
 class UrlLabelTests(unittest.TestCase):
