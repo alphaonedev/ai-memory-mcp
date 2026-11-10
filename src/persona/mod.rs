@@ -203,6 +203,10 @@ pub struct PersonaGenerator<'a> {
     llm: &'a dyn AutonomyLlm,
     signer: Option<&'a AgentKeypair>,
     config: PersonaConfig,
+    /// #8754 — the read caller whose `memory_get` visibility bounds the
+    /// source pool. `None` (the [`Self::new`] default) is the trusted
+    /// operator / curator posture.
+    reader: Option<&'a str>,
 }
 
 impl<'a> PersonaGenerator<'a> {
@@ -218,7 +222,20 @@ impl<'a> PersonaGenerator<'a> {
             llm,
             signer,
             config,
+            reader: None,
         }
+    }
+
+    /// #8754 — bind the generator to a request caller: only reflections
+    /// [`crate::visibility::admit_derived_source`] admits for `reader` (the
+    /// `memory_get` read decision) reach the LLM prompt, the footnotes or the
+    /// returned persona. A pool with nothing admitted refuses with the same
+    /// [`PersonaError::NoReflections`] an unknown entity gets. Hidden rows do
+    /// not count against `max_reflection_sources`.
+    #[must_use]
+    pub fn reading_as(mut self, reader: Option<&'a str>) -> Self {
+        self.reader = reader;
+        self
     }
 
     /// Resolve the curator agent_id stamped on every persona this
@@ -313,11 +330,13 @@ impl<'a> PersonaGenerator<'a> {
                 entity_id,
                 ns,
                 self.config.max_reflection_sources,
+                self.reader,
             )?,
             PersonaScope::AnyTargeting(_) => load_reflections_for_entity_any_namespace(
                 self.conn,
                 entity_id,
                 self.config.max_reflection_sources,
+                self.reader,
             )?,
         };
         if sources.is_empty() {
@@ -713,6 +732,7 @@ fn load_reflections_for_entity(
     entity_id: &str,
     namespace: &str,
     limit: usize,
+    reader: Option<&str>,
 ) -> Result<Vec<Memory>> {
     // #3693 — a quarantined / contaminated / tombstoned reflection is never
     // source material for a generated persona (fail-closed allow-list).
@@ -731,18 +751,10 @@ fn load_reflections_for_entity(
         lifecycle_vis = crate::models::lifecycle_visible_clause(""),
     ))?;
     let rows = stmt.query_map(
-        rusqlite::params![
-            namespace,
-            entity_id,
-            i64::try_from(limit).unwrap_or(i64::MAX)
-        ],
+        rusqlite::params![namespace, entity_id, sql_row_cap(limit, reader)],
         crate::storage::row_to_memory,
     )?;
-    let mut out = Vec::new();
-    for row in rows {
-        out.push(row?);
-    }
-    Ok(out)
+    collect_admitted(rows, limit, reader)
 }
 
 /// v0.7.0 issue #848 — cross-namespace reflection loader. Identical
@@ -755,6 +767,7 @@ fn load_reflections_for_entity_any_namespace(
     conn: &Connection,
     entity_id: &str,
     limit: usize,
+    reader: Option<&str>,
 ) -> Result<Vec<Memory>> {
     // #3693 — same fail-closed allow-list as the namespaced loader above.
     let mut stmt = conn.prepare(&format!(
@@ -771,12 +784,47 @@ fn load_reflections_for_entity_any_namespace(
         lifecycle_vis = crate::models::lifecycle_visible_clause(""),
     ))?;
     let rows = stmt.query_map(
-        rusqlite::params![entity_id, i64::try_from(limit).unwrap_or(i64::MAX)],
+        rusqlite::params![entity_id, sql_row_cap(limit, reader)],
         crate::storage::row_to_memory,
     )?;
+    collect_admitted(rows, limit, reader)
+}
+
+/// #8754 — the SQL `LIMIT` for a reflection-pool query. The trusted pass
+/// (`reader == None`) keeps the `limit`-row cap; a caller-bound pass streams
+/// the entity's (index-backed) rows so hidden ones cannot starve visible ones,
+/// and [`collect_admitted`] stops at `limit` ADMITTED rows.
+fn sql_row_cap(limit: usize, reader: Option<&str>) -> i64 {
+    match reader {
+        None => i64::try_from(limit).unwrap_or(i64::MAX),
+        Some(_) => i64::MAX,
+    }
+}
+
+/// #8754 — keep only the rows `memory_get` would show `reader`
+/// ([`crate::visibility::admit_derived_source`], read use), in query order,
+/// stopping after `limit` admitted rows. One pass, no buffering of hidden
+/// rows: a hidden body never leaves this function.
+fn collect_admitted(
+    rows: impl Iterator<Item = rusqlite::Result<Memory>>,
+    limit: usize,
+    reader: Option<&str>,
+) -> Result<Vec<Memory>> {
     let mut out = Vec::new();
     for row in rows {
-        out.push(row?);
+        if out.len() >= limit {
+            break;
+        }
+        let mem = row?;
+        if crate::visibility::admit_derived_source(
+            &mem,
+            reader,
+            crate::visibility::DerivedSourceUse::Read,
+        )
+        .is_ok()
+        {
+            out.push(mem);
+        }
     }
     Ok(out)
 }

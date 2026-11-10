@@ -598,6 +598,65 @@ pub fn caller_owns_for_mutation(
     )
 }
 
+/// #8753 / #8754 — what a derived operation does with a source row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DerivedSourceUse {
+    /// The body only feeds a prompt or a derived record the caller receives
+    /// (`memory_persona_generate`): read visibility is the whole decision.
+    Read,
+    /// The operation also changes or re-owns the source (`memory_atomise`
+    /// archives it and stamps the caller on the atoms): the caller must
+    /// additionally own it, judged by [`caller_owns_for_mutation`] at `site`.
+    Mutate(crate::identity::owner_stamp::MutationSite),
+}
+
+/// #8753 / #8754 — why [`admit_derived_source`] refused a row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DerivedSourceDenial {
+    /// `memory_get` would not show this row to the caller. Render it exactly
+    /// like an absent id, so the refusal is not a presence oracle.
+    Hidden,
+    /// The caller can read the row but does not own it, and the use mutates.
+    NotOwned,
+}
+
+/// #8753 / #8754 — THE admission decision for a row that a derived operation
+/// (atomise, persona generation, any LLM-backed pass run for a caller) is
+/// about to use as SOURCE material. It must run on the loaded row BEFORE the
+/// body reaches a prompt or a derived record.
+///
+/// The read half is byte-for-byte `memory_get`'s decision
+/// (`mcp::tools::get::mask_invisible` routes through this function, so the two
+/// cannot drift, #951): [`is_readable_on_query`] with the row's OWN namespace
+/// as the requested one, and `caller == None` as the documented single-tenant
+/// trust-all posture. A [`DerivedSourceUse::Mutate`] use additionally requires
+/// [`caller_owns_for_mutation`] (no inbox admission); `None` stays trust-all
+/// there too, matching every other `None`-caller mutation funnel.
+///
+/// `agent_id` is a CLAIMED identity (see the module doc): this gate binds the
+/// operation to whatever principal the surface resolved, nothing stronger.
+///
+/// # Errors
+/// [`DerivedSourceDenial::Hidden`] when the caller cannot read the row;
+/// [`DerivedSourceDenial::NotOwned`] when it can read but not mutate it.
+pub fn admit_derived_source(
+    mem: &Memory,
+    caller: Option<&str>,
+    use_: DerivedSourceUse,
+) -> Result<(), DerivedSourceDenial> {
+    let Some(c) = caller else {
+        return Ok(());
+    };
+    if !is_readable_on_query(mem, Some(c), Some(mem.namespace.as_str())) {
+        return Err(DerivedSourceDenial::Hidden);
+    }
+    match use_ {
+        DerivedSourceUse::Read => Ok(()),
+        DerivedSourceUse::Mutate(site) if caller_owns_for_mutation(mem, c, false, site) => Ok(()),
+        DerivedSourceUse::Mutate(_) => Err(DerivedSourceDenial::NotOwned),
+    }
+}
+
 /// v1.0.0 #3124 — the PRE-#3124 ownership predicate, kept verbatim for the ONE
 /// read-side consumer (`storage::archive_row_readable`, #3382), which reuses an
 /// ownership check to scope archive LISTINGS. Reads are not mutations: the

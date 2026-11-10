@@ -80,10 +80,15 @@ pub(super) fn mask_invisible(
     row: Option<crate::models::Memory>,
     caller: Option<&str>,
 ) -> Option<crate::models::Memory> {
+    // #8753 / #8754: the read decision lives in ONE place so the derived
+    // operations (atomise, persona generation) cannot drift from memory_get.
     row.filter(|mem| {
-        caller.is_none_or(|c| {
-            crate::visibility::is_readable_on_query(mem, Some(c), Some(mem.namespace.as_str()))
-        })
+        crate::visibility::admit_derived_source(
+            mem,
+            caller,
+            crate::visibility::DerivedSourceUse::Read,
+        )
+        .is_ok()
     })
 }
 

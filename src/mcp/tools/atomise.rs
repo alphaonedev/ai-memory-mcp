@@ -265,10 +265,44 @@ pub fn handle_atomise(
     tier: FeatureTier,
     mcp_client: Option<&str>,
 ) -> Result<Value, String> {
-    let args = match atomise_precheck(params, tier, handler.is_some())? {
-        AtomisePrecheck::TierLocked(envelope) => return Ok(envelope),
-        AtomisePrecheck::EngineRequired(args) => args,
+    // #8753 — a direct caller of this pub entry resolves the read caller the
+    // way the MCP stdio surface does; a configured-but-unusable identity
+    // fails CLOSED here instead of collapsing to trust-all. With no engine
+    // (the HTTP twin) no source is ever loaded, so nothing is resolved and
+    // the tier-locked answer is unchanged.
+    let read_caller = if handler.is_some() {
+        crate::identity::resolve_mcp_read_visibility_caller().map_err(|e| e.to_string())?
+    } else {
+        None
     };
+    handle_atomise_for_caller(
+        conn,
+        params,
+        handler,
+        tier,
+        mcp_client,
+        read_caller.as_deref(),
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// #8753 — [`handle_atomise`] bound to the dispatcher's resolved read caller
+/// (`Authority::read_caller`). The source passes the caller-bound engine
+/// gate ([`Atomiser::atomise_sync_as_caller`]): hidden → the absent-id
+/// `MEMORY_NOT_FOUND` answer; readable but not owned → `GOVERNANCE_REFUSED`.
+pub(crate) fn handle_atomise_for_caller(
+    conn: &rusqlite::Connection,
+    params: &Value,
+    handler: Option<&AtomiseToolHandler>,
+    tier: FeatureTier,
+    mcp_client: Option<&str>,
+    read_caller: Option<&str>,
+) -> anyhow::Result<Value> {
+    let args =
+        match atomise_precheck(params, tier, handler.is_some()).map_err(anyhow::Error::msg)? {
+            AtomisePrecheck::TierLocked(envelope) => return Ok(envelope),
+            AtomisePrecheck::EngineRequired(args) => args,
+        };
     let Some(handler) = handler else {
         // UNREACHABLE by construction: `atomise_precheck` returns
         // `EngineRequired` only when `handler_present` is true. Fail CLOSED to
@@ -290,15 +324,16 @@ pub fn handle_atomise(
     // the enforced-read caller; single-operator default unchanged.
     let calling_agent_id =
         crate::identity::resolve_governance_subject(explicit_agent_id, mcp_client, "atomise")
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| anyhow::Error::msg(e.to_string()))?;
 
     // ── Engine dispatch ─────────────────────────────────────────────
-    match handler.atomiser.atomise_sync(
+    match handler.atomiser.atomise_sync_as_caller(
         conn,
         memory_id,
         max_atom_tokens,
         force_re_atomise,
         &calling_agent_id,
+        read_caller,
     ) {
         Ok(result) => Ok(json!({
             "source_id": result.source_id,
@@ -306,7 +341,7 @@ pub fn handle_atomise(
             (field_names::ATOM_COUNT): result.atom_count,
             (field_names::ARCHIVED_AT): result.archived_at,
         })),
-        Err(AtomiseError::NotFound) => Err(format!("MEMORY_NOT_FOUND: {memory_id}")),
+        Err(AtomiseError::NotFound) => Err(anyhow::anyhow!("MEMORY_NOT_FOUND: {memory_id}")),
         Err(AtomiseError::AlreadyAtomised {
             source_id,
             existing_atom_ids,
@@ -324,7 +359,7 @@ pub fn handle_atomise(
         // #3713 — the stable slug stays (the CLI / HTTP twins key on it); the
         // detail behind it is the curator's own text and goes to the operator
         // log through the ONE funnel, which renders the class to the caller.
-        Err(AtomiseError::CuratorFailed(detail)) => Err(format!(
+        Err(AtomiseError::CuratorFailed(detail)) => Err(anyhow::anyhow!(
             "CURATOR_FAILED: {}",
             crate::mcp::error_text::mcp_foreign_err(
                 "atomise curator",
@@ -342,7 +377,7 @@ pub fn handle_atomise(
             // `Atomiser::atomise_sync` step 8). We surface it
             // verbatim so the operator's log analyser sees the
             // index without a second roundtrip.
-            Err(format!("GOVERNANCE_REFUSED: {detail}"))
+            Err(anyhow::anyhow!("GOVERNANCE_REFUSED: {detail}"))
         }
         Err(AtomiseError::SignerError(detail)) => {
             tracing::error!(
@@ -351,9 +386,11 @@ pub fn handle_atomise(
                 detail,
                 "#3713: signer failure kept on the operator log"
             );
-            Err("SIGNER_ERROR: signing the atomisation record failed".to_owned())
+            Err(anyhow::Error::msg(
+                "SIGNER_ERROR: signing the atomisation record failed",
+            ))
         }
-        Err(AtomiseError::DbError(detail)) => Err(format!(
+        Err(AtomiseError::DbError(detail)) => Err(anyhow::anyhow!(
             "DB_ERROR: {}",
             crate::mcp::error_text::mcp_foreign_err(
                 "atomise store",
@@ -365,7 +402,7 @@ pub fn handle_atomise(
         // shape on the MCP surface (Err string prefixed with the stable
         // slug). Downstream MCP clients can switch on the slug without
         // parsing the prose.
-        Err(AtomiseError::DepthExceeded { attempted, cap }) => Err(format!(
+        Err(AtomiseError::DepthExceeded { attempted, cap }) => Err(anyhow::anyhow!(
             "ATOMISATION_DEPTH_EXCEEDED: atomisation depth {attempted} would exceed \
              compiled max_atomisation_depth {cap}"
         )),
@@ -870,5 +907,95 @@ mod tests {
         )
         .expect("null tokens defaults cleanly");
         assert!(resp["atom_count"].as_u64().unwrap() >= 2);
+    }
+
+    /// #8753 — the dispatcher-bound entry (`Authority::read_caller`): a row
+    /// `memory_get` hides answers exactly like an absent id, a readable row
+    /// the caller does not own is refused, and in both cases the source is
+    /// unchanged; only the owner (or the trust-all `None`) atomises.
+    #[test]
+    fn atomise_for_caller_admits_by_memory_get_and_ownership_8753() {
+        const OWNER: &str = "ai:atomise-owner-8753";
+        const OTHER: &str = "ai:atomise-other-8753";
+        const NS: &str = "atomise-gate-8753";
+        // `collective` is the broad scope; an unknown token such as `public`
+        // fails closed to private (#2633), so it would not test the not-owned arm.
+        for scope in ["private", "collective"] {
+            for caller in [Some(OWNER), Some(OTHER), None] {
+                let (_tmp, conn) = fresh_db();
+                let id = seed_big(&conn, NS);
+                conn.execute(
+                    "UPDATE memories SET metadata = ?1 WHERE id = ?2",
+                    rusqlite::params![json!({"agent_id": OWNER, "scope": scope}).to_string(), id],
+                )
+                .unwrap();
+                let cell = format!("scope={scope} caller={caller:?}");
+                let visible =
+                    super::super::get::handle_get(&conn, &json!({"id": id}), caller).is_ok();
+                let h = handler_with(
+                    FeatureTier::Smart,
+                    vec![Ok(vec![
+                        Atom {
+                            text: "first proposition".into(),
+                        },
+                        Atom {
+                            text: "second proposition".into(),
+                        },
+                    ])],
+                );
+                let out = handle_atomise_for_caller(
+                    &conn,
+                    &json!({"memory_id": id, "max_atom_tokens": 50}),
+                    Some(&h),
+                    FeatureTier::Smart,
+                    None,
+                    caller,
+                );
+                let owns = caller != Some(OTHER);
+                match (visible, owns) {
+                    (true, true) => {
+                        let resp = out.unwrap_or_else(|e| panic!("{cell}: {e}"));
+                        assert_eq!(resp["source_id"].as_str(), Some(id.as_str()), "{cell}");
+                    }
+                    (false, _) => {
+                        assert_eq!(
+                            out.unwrap_err().to_string(),
+                            format!("MEMORY_NOT_FOUND: {id}"),
+                            "{cell}"
+                        );
+                    }
+                    (true, false) => {
+                        assert_eq!(
+                            out.unwrap_err().to_string(),
+                            format!(
+                                "GOVERNANCE_REFUSED: {}",
+                                crate::errors::msg::CALLER_DOES_NOT_OWN_MEMORY
+                            ),
+                            "{cell}"
+                        );
+                    }
+                }
+                if !(visible && owns) {
+                    let row = db::get(&conn, &id).unwrap().expect("source row kept");
+                    assert!(
+                        row.metadata.get("atomised_into").is_none(),
+                        "{cell}: refused source must not be archived"
+                    );
+                    let atoms: i64 = conn
+                        .query_row(
+                            "SELECT COUNT(*) FROM memories WHERE id != ?1",
+                            rusqlite::params![id],
+                            |r| r.get(0),
+                        )
+                        .unwrap();
+                    assert_eq!(atoms, 0, "{cell}: refused call minted atoms");
+                }
+                assert_eq!(
+                    scope == "private" && caller == Some(OTHER),
+                    !visible,
+                    "{cell}"
+                );
+            }
+        }
     }
 }

@@ -328,15 +328,18 @@ fn atomise_caller_scope_table_8753() {
             let owns = caller.principal().is_none_or(|c| c == OWNER);
             let prompts = Prompts::default();
             let before = row_state(&conn, &id);
-            let _who = caller.bind();
+            let who = caller.bind();
             let got = atomise(&conn, &id, &prompts);
             let absent = atomise(&conn, &absent_id, &Prompts::default());
-            drop(_who);
+            drop(who);
             let cell = format!("scope={scope} caller={caller:?}");
             if readable && owns {
                 let ok = got.unwrap_or_else(|e| panic!("{cell}: must atomise, got {e}"));
                 assert_eq!(ok["source_id"], json!(id), "{cell}");
-                assert!(prompts.any_contains(&marker), "{cell}: curator saw the body");
+                assert!(
+                    prompts.any_contains(&marker),
+                    "{cell}: curator saw the body"
+                );
                 continue;
             }
             let err = got.expect_err(&format!("{cell}: must be refused"));
@@ -379,7 +382,10 @@ fn audit_scenario_atomise_foreign_private_row_8753() {
         atomise(&conn, &id, &prompts).expect_err("non-owner must be refused")
     };
     assert_eq!(err, format!("MEMORY_NOT_FOUND: {id}"));
-    assert!(!prompts.any_contains(marker), "private body reached the curator");
+    assert!(
+        !prompts.any_contains(marker),
+        "private body reached the curator"
+    );
     assert_eq!(row_state(&conn, &id), before);
     let atoms_owned_by_bob: i64 = conn
         .query_row(
@@ -388,7 +394,10 @@ fn audit_scenario_atomise_foreign_private_row_8753() {
             |r| r.get(0),
         )
         .expect("count");
-    assert_eq!(atoms_owned_by_bob, 0, "no atom may be minted for the caller");
+    assert_eq!(
+        atoms_owned_by_bob, 0,
+        "no atom may be minted for the caller"
+    );
 
     // The owner still atomises her own row.
     let _alice = Caller::Owner.bind();
@@ -449,10 +458,10 @@ fn persona_generate_caller_scope_table_8754() {
                 };
                 let before = row_state(&conn, &id);
                 let prompts = Prompts::default();
-                let _who = caller.bind();
+                let who = caller.bind();
                 let got = persona_generate(&conn, &params, &prompts);
                 let miss = persona_generate(&conn, &unknown, &Prompts::default());
-                drop(_who);
+                drop(who);
                 let cell = format!("scope={scope} caller={caller:?} cross={cross_namespace}");
                 if readable {
                     let ok = got.unwrap_or_else(|e| panic!("{cell}: must generate, got {e}"));
@@ -466,7 +475,8 @@ fn persona_generate_caller_scope_table_8754() {
                 let err = got.expect_err(&format!("{cell}: must be refused"));
                 assert_eq!(
                     err,
-                    miss.expect_err("unknown entity").replace("nobody-8754", ENTITY),
+                    miss.expect_err("unknown entity")
+                        .replace("nobody-8754", ENTITY),
                     "{cell}: a hidden source must answer exactly like no source"
                 );
                 assert!(prompts.is_empty(), "{cell}: the LLM must see nothing");
@@ -496,10 +506,19 @@ fn audit_scenario_persona_over_foreign_private_reflections_8754() {
             .expect("the collective source still yields a persona")
     };
     let wire = out.to_string();
-    assert!(!prompts.any_contains(private_marker), "private body reached the LLM");
-    assert!(!wire.contains(&private_id), "private id disclosed to the caller");
+    assert!(
+        !prompts.any_contains(private_marker),
+        "private body reached the LLM"
+    );
+    assert!(
+        !wire.contains(&private_id),
+        "private id disclosed to the caller"
+    );
     assert!(!wire.contains(private_marker), "private title disclosed");
-    assert!(prompts.any_contains(shared_marker), "collective source used");
+    assert!(
+        prompts.any_contains(shared_marker),
+        "collective source used"
+    );
     assert!(wire.contains(&shared_id), "collective source footnoted");
 }
 
@@ -508,11 +527,15 @@ fn audit_scenario_persona_over_foreign_private_reflections_8754() {
 /// row, the visible row is still the persona's source.
 #[test]
 fn persona_hidden_rows_do_not_starve_visible_sources_8754() {
-    const HIDDEN_ABOVE_LIMIT: usize =
-        ai_memory::persona::DEFAULT_MAX_REFLECTION_SOURCES + 4;
+    const HIDDEN_ABOVE_LIMIT: usize = ai_memory::persona::DEFAULT_MAX_REFLECTION_SOURCES + 4;
     let (conn, _tmp) = fresh_db();
     for i in 0..HIDDEN_ABOVE_LIMIT {
-        let id = seed(&conn, "private", MemoryKind::Reflection, &format!("HIDDEN-{i}"));
+        let id = seed(
+            &conn,
+            "private",
+            MemoryKind::Reflection,
+            &format!("HIDDEN-{i}"),
+        );
         conn.execute("UPDATE memories SET priority = 9 WHERE id = ?1", [&id])
             .expect("rank hidden rows first");
     }
@@ -520,9 +543,16 @@ fn persona_hidden_rows_do_not_starve_visible_sources_8754() {
     let visible = seed(&conn, "collective", MemoryKind::Reflection, visible_marker);
     let prompts = Prompts::default();
     let _carol = Caller::OtherNs.bind();
-    let out = persona_generate(&conn, &json!({"entity_id": ENTITY, "namespace": NS}), &prompts)
-        .expect("visible source admitted");
+    let out = persona_generate(
+        &conn,
+        &json!({"entity_id": ENTITY, "namespace": NS}),
+        &prompts,
+    )
+    .expect("visible source admitted");
     assert!(prompts.any_contains(visible_marker));
-    assert!(!prompts.any_contains("HIDDEN-"), "a hidden body reached the LLM");
+    assert!(
+        !prompts.any_contains("HIDDEN-"),
+        "a hidden body reached the LLM"
+    );
     assert!(out.to_string().contains(&visible));
 }

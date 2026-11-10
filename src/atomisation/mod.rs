@@ -366,6 +366,42 @@ pub struct Atomiser {
     curator_model: String,
 }
 
+/// #8753 — map [`crate::visibility::admit_derived_source`] onto the
+/// atomise error contract and audit the refusal of an EXISTING row (the
+/// caller is `Some` whenever a refusal is possible). The wire answer for a
+/// hidden row is the absent-id answer.
+fn admit_atomise_source(source: &Memory, read_caller: Option<&str>) -> Result<(), AtomiseError> {
+    use crate::visibility::{DerivedSourceDenial, DerivedSourceUse, admit_derived_source};
+    let site = crate::identity::owner_stamp::MutationSite::sqlite(
+        crate::identity::owner_stamp::funnel::ATOMISE,
+    );
+    let Err(denial) = admit_derived_source(source, read_caller, DerivedSourceUse::Mutate(site))
+    else {
+        return Ok(());
+    };
+    let reason = match denial {
+        DerivedSourceDenial::Hidden => "source memory is not readable by this caller",
+        DerivedSourceDenial::NotOwned => crate::errors::msg::CALLER_DOES_NOT_OWN_MEMORY,
+    };
+    if let Some(c) = read_caller {
+        crate::governance::audit::record_decision(
+            c,
+            "refuse",
+            crate::mcp::registry::tool_names::MEMORY_ATOMISE,
+            "",
+            crate::governance::audit::ForensicPayload::new()
+                .ident(crate::mcp::param_names::MEMORY_ID, &source.id)
+                .label("reason", reason),
+        );
+    }
+    Err(match denial {
+        DerivedSourceDenial::Hidden => AtomiseError::NotFound,
+        DerivedSourceDenial::NotOwned => AtomiseError::GovernanceRefused(
+            crate::errors::msg::CALLER_DOES_NOT_OWN_MEMORY.to_owned(),
+        ),
+    })
+}
+
 impl Atomiser {
     /// Construct an atomiser. `curator` is the LLM-facing surface
     /// (production: [`curator::LlmCurator`]; tests: a mock). `keypair`
@@ -505,6 +541,65 @@ impl Atomiser {
         calling_agent_id: &str,
         max_retries: u32,
     ) -> Result<AtomiseResult, AtomiseError> {
+        // Trusted entry (CLI operator, `pre_store` auto-atomise hook): no
+        // per-caller source gate, the `None` trust-all posture.
+        self.atomise_core(
+            conn,
+            source_id,
+            max_atom_tokens,
+            force,
+            calling_agent_id,
+            max_retries,
+            None,
+        )
+    }
+
+    /// #8753 — the CALLER-BOUND entry for a request surface (MCP
+    /// `memory_atomise`). Identical to [`Self::atomise_sync`] except the
+    /// loaded source must pass
+    /// [`crate::visibility::admit_derived_source`] with a mutating use for
+    /// `read_caller` BEFORE the idempotency read, the curator round-trip or
+    /// the archive: a row `memory_get` hides answers exactly like an absent
+    /// id ([`AtomiseError::NotFound`]); a readable row the caller does not
+    /// own answers [`AtomiseError::GovernanceRefused`] with
+    /// [`crate::errors::msg::CALLER_DOES_NOT_OWN_MEMORY`]. Both leave the
+    /// source untouched and send nothing to the curator. `None` keeps the
+    /// documented single-tenant trust-all posture.
+    ///
+    /// # Errors
+    ///
+    /// See [`AtomiseError`] for the closed enum.
+    pub fn atomise_sync_as_caller(
+        &self,
+        conn: &Connection,
+        source_id: &str,
+        max_atom_tokens: u32,
+        force: bool,
+        calling_agent_id: &str,
+        read_caller: Option<&str>,
+    ) -> Result<AtomiseResult, AtomiseError> {
+        self.atomise_core(
+            conn,
+            source_id,
+            max_atom_tokens,
+            force,
+            calling_agent_id,
+            self.config.curator_max_retries,
+            read_caller,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn atomise_core(
+        &self,
+        conn: &Connection,
+        source_id: &str,
+        max_atom_tokens: u32,
+        force: bool,
+        calling_agent_id: &str,
+        max_retries: u32,
+        read_caller: Option<&str>,
+    ) -> Result<AtomiseResult, AtomiseError> {
         // ARCH-5 (FX-6) — atomisation-pass cycle-depth guard. Acquire
         // the per-thread depth guard BEFORE any substrate work so a
         // nested atomise triggered by a `pre_store` / `post_store` hook
@@ -546,6 +641,10 @@ impl Atomiser {
         let source = db::get(conn, source_id)
             .map_err(|e| AtomiseError::DbError(e.to_string()))?
             .ok_or(AtomiseError::NotFound)?;
+        // #8753 — gate the SAME loaded row (no second read, no TOCTOU) before
+        // anything observes or changes it; the idempotency answer below would
+        // otherwise leak a hidden row's atom ids.
+        admit_atomise_source(&source, read_caller)?;
 
         // Step 2 — idempotency check.
         if !force {

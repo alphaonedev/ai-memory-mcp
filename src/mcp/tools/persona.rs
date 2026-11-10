@@ -123,22 +123,59 @@ pub fn handle_persona_generate(
     tier: FeatureTier,
     active_keypair: Option<&crate::identity::keypair::AgentKeypair>,
 ) -> Result<Value, String> {
+    handle_persona_generate_inner(conn, params, llm, tier, active_keypair, ReaderSource::Env)
+        .map_err(|e| e.to_string())
+}
+
+/// #8754 — where the source-pool reader comes from.
+#[derive(Clone, Copy)]
+pub(crate) enum ReaderSource<'a> {
+    /// The dispatcher already resolved it.
+    Bound(Option<&'a str>),
+    /// A direct caller of the pub entry: resolve `AI_MEMORY_AGENT_ID` the
+    /// way MCP stdio does, failing CLOSED on a configured-but-unusable value.
+    Env,
+}
+
+/// #8754 — the body of [`handle_persona_generate`]. The dispatcher calls it
+/// with [`ReaderSource::Bound`] (`Authority::read_caller`), so only
+/// reflections `memory_get` would show that caller reach the LLM or the
+/// persona. The error text is the unchanged wire string (`anyhow::Error::msg`).
+pub(crate) fn handle_persona_generate_inner(
+    conn: &rusqlite::Connection,
+    params: &Value,
+    llm: Option<&dyn AutonomyLlm>,
+    tier: FeatureTier,
+    active_keypair: Option<&crate::identity::keypair::AgentKeypair>,
+    reader: ReaderSource<'_>,
+) -> anyhow::Result<Value> {
     // Tier gate — refuse below smart so we never blow the budget by
     // accidentally firing curator synthesis on a keyword-only daemon.
     if !matches!(tier, FeatureTier::Smart | FeatureTier::Autonomous) {
-        return Err(format!(
+        return Err(anyhow::anyhow!(
             "memory_persona_generate requires smart tier or higher (current: {tier:?})"
         ));
     }
-    let llm = llm.ok_or(
-        "memory_persona_generate requires an LLM client; none is wired into this dispatch",
-    )?;
+    let llm = llm.ok_or_else(|| {
+        anyhow::Error::msg(
+            "memory_persona_generate requires an LLM client; none is wired into this dispatch",
+        )
+    })?;
+    let env_reader = match reader {
+        ReaderSource::Bound(_) => None,
+        ReaderSource::Env => crate::identity::resolve_mcp_read_visibility_caller()
+            .map_err(|e| anyhow::Error::msg(e.to_string()))?,
+    };
+    let read_caller = match reader {
+        ReaderSource::Bound(c) => c,
+        ReaderSource::Env => env_reader.as_deref(),
+    };
 
     let entity_id = params["entity_id"]
         .as_str()
-        .ok_or("entity_id is required")?;
+        .ok_or_else(|| anyhow::Error::msg("entity_id is required"))?;
     if entity_id.is_empty() {
-        return Err(crate::errors::msg::ENTITY_ID_EMPTY.to_string());
+        return Err(anyhow::Error::msg(crate::errors::msg::ENTITY_ID_EMPTY));
     }
     // v0.7.0 issue #848 — namespace handling.
     //
@@ -164,7 +201,7 @@ pub fn handle_persona_generate(
             Some(s) if s.is_empty() => None,
             Some(s) => Some(s),
             None => {
-                return Err("namespace must be a string or null".to_string());
+                return Err(anyhow::Error::msg("namespace must be a string or null"));
             }
         },
     };
@@ -172,18 +209,19 @@ pub fn handle_persona_generate(
     // v0.7.0 issue #811 / #813 — forward `active_keypair` through
     // `PersonaGenerator::new` so the link path AND the persona-body
     // signing path see the same identity.
-    let generator = PersonaGenerator::new(conn, llm, active_keypair, PersonaConfig::default());
+    let generator = PersonaGenerator::new(conn, llm, active_keypair, PersonaConfig::default())
+        .reading_as(read_caller);
     let (persona, scope_label) = match scoped_single {
         Some(ns) => (
             generator
                 .generate(entity_id, ns)
-                .map_err(persona_error_to_string)?,
+                .map_err(|e| anyhow::Error::msg(persona_error_to_string(e)))?,
             "single".to_string(),
         ),
         None => (
             generator
                 .generate_cross_namespace(entity_id, crate::DEFAULT_NAMESPACE)
-                .map_err(persona_error_to_string)?,
+                .map_err(|e| anyhow::Error::msg(persona_error_to_string(e)))?,
             "cross_namespace".to_string(),
         ),
     };
@@ -570,6 +608,78 @@ mod tests {
             err.contains("<any namespace>"),
             "#848 — empty cross-namespace scan must reference the cross-namespace sentinel; got: {err}"
         );
+    }
+
+    /// #8754 — LLM stub that records every source body it is handed.
+    struct RecordingLlm(std::sync::Mutex<Vec<String>>);
+    impl AutonomyLlm for RecordingLlm {
+        fn auto_tag(&self, _t: &str, _c: &str) -> anyhow::Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+        fn detect_contradiction(&self, _a: &str, _b: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+        fn summarize_memories(&self, mems: &[(String, String)]) -> anyhow::Result<String> {
+            let mut seen = self.0.lock().unwrap();
+            for (title, body) in mems {
+                seen.push(format!("{title}\n{body}"));
+            }
+            Ok(format!("Stub persona body [{} sources]", mems.len()))
+        }
+    }
+
+    /// #8754 — the dispatcher-bound entry (`Authority::read_caller`) admits a
+    /// reflection into the persona pool exactly when `memory_get` shows it
+    /// to that caller; a hidden reflection never reaches the LLM.
+    #[test]
+    fn persona_generate_for_caller_matches_memory_get_8754() {
+        const OWNER: &str = "ai:persona-owner-8754";
+        const OTHER: &str = "ai:persona-other-8754";
+        const NS: &str = "team/alpha";
+        const MARKER: &str = "PRIVATE-REFLECTION-BODY-8754";
+        for caller in [Some(OWNER), Some(OTHER), None] {
+            let (conn, _dir) = fresh_db();
+            let id = seed_reflection(&conn, NS, "private obs about alice", MARKER);
+            conn.execute(
+                "UPDATE memories SET metadata = ?1 WHERE id = ?2",
+                rusqlite::params![
+                    json!({"agent_id": OWNER, "entity_id": "alice", "scope": "private"})
+                        .to_string(),
+                    id
+                ],
+            )
+            .unwrap();
+            let visible = super::super::get::handle_get(&conn, &json!({"id": id}), caller).is_ok();
+            let llm = RecordingLlm(std::sync::Mutex::new(Vec::new()));
+            let out = handle_persona_generate_inner(
+                &conn,
+                &json!({"entity_id": "alice", "namespace": NS}),
+                Some(&llm),
+                FeatureTier::Smart,
+                None,
+                ReaderSource::Bound(caller),
+            );
+            let seen = llm.0.lock().unwrap().clone();
+            if visible {
+                let out = out.unwrap_or_else(|e| panic!("caller={caller:?}: {e}"));
+                assert_eq!(out["namespace_scope"], "single", "caller={caller:?}");
+                assert!(
+                    seen.iter().any(|s| s.contains(MARKER)),
+                    "caller={caller:?}: visible body must reach the LLM"
+                );
+            } else {
+                assert_eq!(
+                    out.unwrap_err().to_string(),
+                    format!("no reflections found for entity 'alice' in namespace '{NS}'"),
+                    "caller={caller:?}: hidden reflection must read as absent"
+                );
+                assert!(
+                    seen.is_empty(),
+                    "caller={caller:?}: hidden body reached the LLM: {seen:?}"
+                );
+            }
+            assert_eq!(caller == Some(OTHER), !visible, "caller={caller:?}");
+        }
     }
 }
 
