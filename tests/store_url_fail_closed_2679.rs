@@ -49,6 +49,8 @@ fn serve_once(db: &Path, store_url: Option<&str>) -> std::process::Output {
     // Fixed high port: clap rejects 0; refuse path exits before bind races matter.
     let mut cmd = Command::new(cargo_bin("ai-memory"));
     cmd.env("AI_MEMORY_NO_CONFIG", "1")
+        // #4166: a boot that gets past the refusal never waits on an embedder.
+        .env("AI_MEMORY_EMBED_OFFLINE", "1")
         .env("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0")
         .env_remove("AI_MEMORY_STORE_URL")
         .env_remove("AI_MEMORY_STORE_URL_FILE")
@@ -164,6 +166,8 @@ fn serve_without_store_url_still_starts_sqlite_path_smoke() {
 
     let mut cmd = Command::new(cargo_bin("ai-memory"));
     cmd.env("AI_MEMORY_NO_CONFIG", "1")
+        // #4166: a boot that gets past the refusal never waits on an embedder.
+        .env("AI_MEMORY_EMBED_OFFLINE", "1")
         .env("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0")
         .env_remove("AI_MEMORY_STORE_URL")
         .env_remove("AI_MEMORY_STORE_URL_FILE")
