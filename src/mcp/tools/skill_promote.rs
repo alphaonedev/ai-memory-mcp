@@ -123,12 +123,15 @@ pub fn handle_skill_promote_from_reflection(
         active_keypair,
         &caller,
         read_caller.as_deref(),
+        &crate::identity::object_owner::MutationPrincipal::from_process_env(),
     )
     .map_err(|error| crate::mcp::error_text::mcp_foreign_err("as_deref", error))
 }
 
 /// Shared SQLite promotion body. HTTP preserves its authenticated actor separately
 /// from the enrolled-admin read exemption; MCP preserves its unset-identity posture.
+/// `principal` is the #8771/#8772 owner-gate principal for superseding an
+/// existing lineage head (the admin-gated HTTP route passes `Granted`).
 #[allow(clippy::too_many_lines)]
 pub(crate) fn handle_skill_promote_for_caller(
     conn: &Connection,
@@ -136,6 +139,7 @@ pub(crate) fn handle_skill_promote_for_caller(
     active_keypair: Option<&AgentKeypair>,
     caller: &str,
     read_caller: Option<&str>,
+    principal: &crate::identity::object_owner::MutationPrincipal,
 ) -> anyhow::Result<Value> {
     // ─── 1. Argument parsing ────────────────────────────────────────────
     let reflection_id = params[field_names::REFLECTION_ID]
@@ -333,6 +337,8 @@ pub(crate) fn handle_skill_promote_for_caller(
             map.insert(field_names::PARAMETERS_SCHEMA.to_string(), schema.clone());
         }
     }
+    // #8772 — the promoting caller is the recorded owner of the new head.
+    crate::identity::object_owner::stamp_owner(&mut metadata, caller);
 
     // ─── 6. Compute per-resource digests for the signing surface ───────
     let res_digests: Vec<Vec<u8>> = resources
@@ -369,6 +375,7 @@ pub(crate) fn handle_skill_promote_for_caller(
         res_digests,
         &resources,
         active_keypair,
+        principal,
     )
     .map_err(register_core_error)?;
 
@@ -477,7 +484,9 @@ const RETIRED_LINEAGE_REFUSAL_SUFFIX: &str = "is retired; unretire before re-reg
 /// `mcp_foreign_err` output or foreign serialization / compression text,
 /// and must keep classifying as foreign so it is withheld (ERRORS-15).
 fn register_core_error(msg: String) -> anyhow::Error {
-    if msg.starts_with("skill lineage '") && msg.ends_with(RETIRED_LINEAGE_REFUSAL_SUFFIX) {
+    if (msg.starts_with("skill lineage '") && msg.ends_with(RETIRED_LINEAGE_REFUSAL_SUFFIX))
+        || msg == crate::errors::msg::CALLER_DOES_NOT_OWN_OBJECT
+    {
         crate::errors::refusal(msg)
     } else {
         anyhow::Error::msg(msg)
@@ -526,7 +535,14 @@ mod tests {
         params: &Value,
         keypair: Option<&AgentKeypair>,
     ) -> anyhow::Result<Value> {
-        super::handle_skill_promote_for_caller(conn, params, keypair, "ai:test", None)
+        super::handle_skill_promote_for_caller(
+            conn,
+            params,
+            keypair,
+            "ai:test",
+            None,
+            &crate::identity::object_owner::MutationPrincipal::Unbound,
+        )
     }
 
     use super::*;

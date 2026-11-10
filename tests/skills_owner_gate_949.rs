@@ -148,6 +148,7 @@ fn seed_skill(db_path: &std::path::Path, name: &str) -> String {
         &conn,
         &json!({"inline_skill": minimal_skill_md(name)}),
         None,
+        &ai_memory::identity::object_owner::MutationPrincipal::from_process_env(),
     )
     .expect("seed skill");
     v["id"].as_str().unwrap().to_string()

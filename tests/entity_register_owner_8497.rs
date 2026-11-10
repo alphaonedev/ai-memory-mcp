@@ -36,6 +36,10 @@ use tower::ServiceExt as _;
 
 const OWNER_X: &str = "ai:owner-x-8497";
 const FORGED_Y: &str = "ai:forged-y-8497";
+/// #8557 — the alias the owner registers first.
+const OWNER_ALIAS_8557: &str = "owner-alias-8557";
+/// #8557 — the alias a non-owner tries to merge in.
+const INTRUDER_ALIAS_8557: &str = "intruder-alias-8557";
 
 /// Process-wide audit trail file (the sink is global to the test binary).
 fn audit_trail() -> &'static PathBuf {
@@ -300,6 +304,74 @@ async fn kg_http_entity_register_owner_is_the_header_principal_8493() {
     assert_eq!(status, StatusCode::CREATED, "body={body}");
     let conn = ai_memory::db::open(f.path()).expect("reopen");
     assert_eq!(owner_of(&conn, &ns, "Acme").as_deref(), Some(OWNER_X));
+}
+
+/// #8557 — a second authenticated agent re-registering the SAME entity with
+/// a new alias is refused with the shared owner refusal, and the owner's
+/// alias rows are byte-unchanged.
+#[tokio::test]
+async fn kg_http_non_owner_alias_merge_is_refused_8557() {
+    let (router, f) = build_router_fixture();
+    let ns = unique("ns-http-merge");
+    let (status, body) = post_entity(
+        &router,
+        json!({"canonical_name": "Acme", "namespace": ns, "aliases": [OWNER_ALIAS_8557]}),
+        OWNER_X,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "body={body}");
+    let before = alias_rows_in(&f, &ns);
+    let (status, body) = post_entity(
+        &router,
+        json!({"canonical_name": "Acme", "namespace": ns, "aliases": [INTRUDER_ALIAS_8557]}),
+        FORGED_Y,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "body={body}");
+    assert_eq!(
+        body["code"],
+        ai_memory::errors::error_codes::NOT_OWNER,
+        "body={body}"
+    );
+    assert_eq!(
+        body["error"],
+        ai_memory::errors::msg::CALLER_DOES_NOT_OWN_OBJECT,
+        "body={body}"
+    );
+    assert_eq!(alias_rows_in(&f, &ns), before, "alias rows unchanged");
+    let (status, body) = post_entity(
+        &router,
+        json!({"canonical_name": "Acme", "namespace": ns, "aliases": [INTRUDER_ALIAS_8557]}),
+        OWNER_X,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the owner may still merge, body={body}"
+    );
+}
+
+/// Every `entity_aliases` row of the entities in `ns`, rendered in rowid order.
+fn alias_rows_in(f: &NamedTempFile, ns: &str) -> Vec<String> {
+    let conn = ai_memory::db::open(f.path()).expect("reopen");
+    let mut stmt = conn
+        .prepare(
+            "SELECT a.entity_id, a.alias, a.created_at FROM entity_aliases a \
+             JOIN memories m ON m.id = a.entity_id WHERE m.namespace = ?1 ORDER BY a.rowid",
+        )
+        .expect("prepare alias rows");
+    stmt.query_map([ns], |r| {
+        Ok(format!(
+            "{}|{}|{}",
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?
+        ))
+    })
+    .expect("query alias rows")
+    .collect::<Result<_, _>>()
+    .expect("alias rows")
 }
 
 // ---- SAL trait parity (sqlite always under `sal`, postgres when reachable) --

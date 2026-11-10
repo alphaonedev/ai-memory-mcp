@@ -135,7 +135,13 @@ pub async fn skill_register_route(
     }
     let lock = app.db.lock().await;
     let kp = (*app.active_keypair).as_ref();
-    match crate::mcp::handle_skill_register(&lock.0, &body, kp) {
+    match crate::mcp::handle_skill_register(
+        &lock.0,
+        &body,
+        kp,
+        // #8771: `require_admin` above is the shipped governance grant.
+        &crate::identity::object_owner::MutationPrincipal::Granted,
+    ) {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         // #3762 — forward the renderer's closed-vocabulary text verbatim so
         // HTTP says byte-identically what MCP says; the absolute jail path
@@ -402,7 +408,15 @@ pub async fn skill_promote_route(
     }
     let lock = app.db.lock().await;
     let kp = (*app.active_keypair).as_ref();
-    match crate::mcp::handle_skill_promote_for_caller(&lock.0, &params, kp, &caller, read_caller) {
+    match crate::mcp::handle_skill_promote_for_caller(
+        &lock.0,
+        &params,
+        kp,
+        &caller,
+        read_caller,
+        // #8772: `require_admin` above is the shipped governance grant.
+        &crate::identity::object_owner::MutationPrincipal::Granted,
+    ) {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(e) => {
             // #3707 / #6115 - the chain may carry a store or driver `Display`
@@ -554,7 +568,13 @@ pub async fn skill_retire_route(
     }
     let lock = app.db.lock().await;
     let kp = (*app.active_keypair).as_ref();
-    match crate::mcp::handle_skill_retire(&lock.0, &params, kp) {
+    match crate::mcp::handle_skill_retire(
+        &lock.0,
+        &params,
+        kp,
+        // #8771: `require_admin` above is the shipped governance grant.
+        &crate::identity::object_owner::MutationPrincipal::Granted,
+    ) {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(e) => {
             if e.starts_with(crate::errors::msg::SKILL_NOT_FOUND) {
@@ -597,7 +617,13 @@ pub async fn skill_delete_route(
     let params = json!({ "skill_id": id, "force": body.force });
     let lock = app.db.lock().await;
     let kp = (*app.active_keypair).as_ref();
-    match crate::mcp::handle_skill_delete(&lock.0, &params, kp) {
+    match crate::mcp::handle_skill_delete(
+        &lock.0,
+        &params,
+        kp,
+        // #8771: `require_admin` above is the shipped governance grant.
+        &crate::identity::object_owner::MutationPrincipal::Granted,
+    ) {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(e) => {
             if e.starts_with(crate::errors::msg::SKILL_NOT_FOUND) {
@@ -649,6 +675,7 @@ mod promote_status_4622_tests {
             None,
             CALLER,
             Some(CALLER),
+            &crate::identity::object_owner::MutationPrincipal::Granted,
         )
     }
 
@@ -780,9 +807,15 @@ mod promote_status_4622_tests {
             });
             let wire = crate::mcp::handle_skill_promote_from_reflection(c, &params, None)
                 .expect_err("MCP refused");
-            let http_err =
-                crate::mcp::handle_skill_promote_for_caller(c, &params, None, CALLER, Some(CALLER))
-                    .expect_err("HTTP refused");
+            let http_err = crate::mcp::handle_skill_promote_for_caller(
+                c,
+                &params,
+                None,
+                CALLER,
+                Some(CALLER),
+                &crate::identity::object_owner::MutationPrincipal::Granted,
+            )
+            .expect_err("HTTP refused");
             let body = promote_error_message(http_err);
             assert_eq!(body, wire, "HTTP and MCP text diverge for {name}");
             assert!(body.contains(needle), "{needle} missing from {body}");

@@ -281,6 +281,14 @@ pub fn handle_action_add_edge(
     let edge_type = crate::models::EdgeType::from_str(edge_type_name)
         .ok_or_else(|| "invalid edge_type".to_string())?;
 
+    // #8790 — the process principal must own both existing endpoints.
+    crate::identity::object_owner::authorize_action_edge(
+        conn,
+        &crate::identity::object_owner::MutationPrincipal::from_process_env(),
+        from_action,
+        to_action,
+    )
+    .map_err(|e| crate::mcp::error_text::mcp_foreign_err("add_edge", e))?;
     let now = chrono::Utc::now().timestamp();
     // #3008 — refuse a self-edge / ordering-cycle edge (both permanently wedge
     // the frontier) instead of silently accepting it.

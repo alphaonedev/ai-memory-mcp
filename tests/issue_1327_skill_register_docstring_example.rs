@@ -138,6 +138,7 @@ fn issue_1327_docstring_example_satisfies_parser_field_gate() {
         &conn,
         &json!({"folder_path": scratch.path().to_str().expect("utf8 path")}),
         None,
+        &ai_memory::identity::object_owner::MutationPrincipal::from_process_env(),
     );
     let err = result.expect_err("scratch dir has no SKILL.md so this must error");
     assert!(

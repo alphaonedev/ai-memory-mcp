@@ -2993,7 +2993,12 @@ fn dispatch_memory_dependents_of_invalidated(ctx: &ToolDispatchCtx<'_>) -> Resul
 }
 
 fn dispatch_memory_skill_register(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
-    handle_skill_register(ctx.conn, ctx.arguments, ctx.active_keypair)
+    handle_skill_register(
+        ctx.conn,
+        ctx.arguments,
+        ctx.active_keypair,
+        &crate::identity::object_owner::MutationPrincipal::from_process_env(),
+    )
 }
 
 fn dispatch_memory_skill_list(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
@@ -3026,11 +3031,21 @@ fn dispatch_memory_skill_compositional_context(ctx: &ToolDispatchCtx<'_>) -> Res
 }
 
 fn dispatch_memory_skill_retire(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
-    handle_skill_retire(ctx.conn, ctx.arguments, ctx.active_keypair)
+    handle_skill_retire(
+        ctx.conn,
+        ctx.arguments,
+        ctx.active_keypair,
+        &crate::identity::object_owner::MutationPrincipal::from_process_env(),
+    )
 }
 
 fn dispatch_memory_skill_delete(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
-    handle_skill_delete(ctx.conn, ctx.arguments, ctx.active_keypair)
+    handle_skill_delete(
+        ctx.conn,
+        ctx.arguments,
+        ctx.active_keypair,
+        &crate::identity::object_owner::MutationPrincipal::from_process_env(),
+    )
 }
 
 /// `memory_offload` dispatch — resolves caller's agent_id through the

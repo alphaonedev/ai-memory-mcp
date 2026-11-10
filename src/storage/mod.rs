@@ -12397,6 +12397,29 @@ pub fn entity_register(
     extra_metadata: &serde_json::Value,
     agent_id: Option<&str>,
 ) -> Result<crate::models::EntityRegistration> {
+    let principal = crate::identity::object_owner::MutationPrincipal::from_resolved(agent_id);
+    entity_register_as(
+        conn,
+        canonical_name,
+        namespace,
+        aliases,
+        extra_metadata,
+        agent_id,
+        &principal,
+    )
+}
+
+/// [`entity_register`] with the mutation principal explicit (#8557): merging
+/// aliases into an EXISTING entity is admitted only for its recorded owner.
+pub fn entity_register_as(
+    conn: &Connection,
+    canonical_name: &str,
+    namespace: &str,
+    aliases: &[String],
+    extra_metadata: &serde_json::Value,
+    agent_id: Option<&str>,
+    principal: &crate::identity::object_owner::MutationPrincipal,
+) -> Result<crate::models::EntityRegistration> {
     use crate::models::{ENTITY_KIND, ENTITY_TAG, EntityRegistration};
 
     // Wave-2 B7 — fence the existing-entity alias INSERT OR IGNORE as
@@ -12419,19 +12442,21 @@ pub fn entity_register(
     // Look up an existing entity in this namespace by canonical_name +
     // metadata.kind. If a non-entity memory occupies the same
     // (title, namespace), surface a hard error instead of upserting.
-    let existing_id: Option<String> = match conn.query_row(
-        "SELECT id FROM memories
+    let existing: Option<(String, String)> = match conn.query_row(
+        "SELECT id, metadata FROM memories
          WHERE namespace = ?1 AND title = ?2
            AND COALESCE(json_extract(metadata, '$.kind'), '') = ?3",
         params![namespace, canonical_name, ENTITY_KIND],
-        |r| r.get::<_, String>(0),
+        |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
     ) {
-        Ok(id) => Some(id),
+        Ok(row) => Some(row),
         Err(rusqlite::Error::QueryReturnedNoRows) => None,
         Err(e) => return Err(e.into()),
     };
 
-    let (entity_id, created) = if let Some(id) = existing_id {
+    let (entity_id, created) = if let Some((id, meta)) = existing {
+        use crate::identity::object_owner::{authorize_stored_owner, funnel};
+        authorize_stored_owner(principal, &meta, &id, funnel::ENTITY_REGISTER)?;
         (id, false)
     } else {
         let collision: Option<String> = match conn.query_row(
@@ -29737,9 +29762,36 @@ mod tests {
             "projects/alpha",
             &["pa".to_string(), "alpha".to_string()],
             &serde_json::json!({}),
-            Some("a2"),
+            Some("a1"),
         )
         .unwrap();
+        // #8557: a different agent may not merge aliases into a1's entity.
+        let refused = entity_register(
+            &conn,
+            "Project Alpha",
+            "projects/alpha",
+            &["beta".to_string()],
+            &serde_json::json!({}),
+            Some("a2"),
+        )
+        .expect_err("a non-owner alias merge must be refused");
+        assert_eq!(
+            refused.to_string(),
+            crate::errors::msg::CALLER_DOES_NOT_OWN_OBJECT
+        );
+        let after = entity_register(
+            &conn,
+            "Project Alpha",
+            "projects/alpha",
+            &[],
+            &serde_json::json!({}),
+            Some("a1"),
+        )
+        .unwrap();
+        assert_eq!(
+            after.aliases, second.aliases,
+            "refused merge left aliases unchanged"
+        );
         assert!(first.created);
         assert!(!second.created, "second call must reuse the entity");
         assert_eq!(first.entity_id, second.entity_id);

@@ -217,9 +217,13 @@ async fn mcp_register_escape_renders_label_not_path_3762() {
 
     let db_path = dir.path().join("t.db");
     let conn = ai_memory::db::open(&db_path).expect("db::open");
-    let err =
-        ai_memory::mcp::handle_skill_register(&conn, &json!({"folder_path": outside_s}), None)
-            .expect_err("a sibling outside the jail must be refused");
+    let err = ai_memory::mcp::handle_skill_register(
+        &conn,
+        &json!({"folder_path": outside_s}),
+        None,
+        &ai_memory::identity::object_owner::MutationPrincipal::from_process_env(),
+    )
+    .expect_err("a sibling outside the jail must be refused");
     assert!(
         !err.contains(&jail_canon),
         "the resolved jail path must not reach the caller: {err}"
@@ -262,6 +266,7 @@ async fn mcp_register_inside_jail_succeeds_control_3762() {
         &conn,
         &json!({"folder_path": inside.to_str().expect("utf8")}),
         None,
+        &ai_memory::identity::object_owner::MutationPrincipal::from_process_env(),
     )
     .expect("in-jail register must succeed");
     assert_eq!(v["registered"], json!(true));
@@ -291,8 +296,13 @@ async fn http_register_escape_matches_mcp_byte_for_byte_3762() {
     let params = json!({"folder_path": outside_s});
     let mcp_err = {
         let db = app.db.lock().await;
-        ai_memory::mcp::handle_skill_register(&db.0, &params, None)
-            .expect_err("a sibling outside the jail must be refused")
+        ai_memory::mcp::handle_skill_register(
+            &db.0,
+            &params,
+            None,
+            &ai_memory::identity::object_owner::MutationPrincipal::from_process_env(),
+        )
+        .expect_err("a sibling outside the jail must be refused")
     };
     let resp = ai_memory::handlers::skill_register_route(
         axum::extract::State(app),
@@ -352,8 +362,13 @@ async fn http_export_escape_matches_mcp_byte_for_byte_3762() {
     let app = app_state_sqlite(&db_path);
     let skill_id = {
         let db = app.db.lock().await;
-        let v = ai_memory::mcp::handle_skill_register(&db.0, &inline_skill("export-me-3762"), None)
-            .expect("seed register");
+        let v = ai_memory::mcp::handle_skill_register(
+            &db.0,
+            &inline_skill("export-me-3762"),
+            None,
+            &ai_memory::identity::object_owner::MutationPrincipal::from_process_env(),
+        )
+        .expect("seed register");
         v["id"].as_str().expect("id").to_owned()
     };
     let outside = dir.path().join("escaped-3762");
@@ -414,9 +429,13 @@ async fn http_export_relative_succeeds_control_3762() {
     let app = app_state_sqlite(&db_path);
     let skill_id = {
         let db = app.db.lock().await;
-        let v =
-            ai_memory::mcp::handle_skill_register(&db.0, &inline_skill("export-rel-ok-3762"), None)
-                .expect("seed register");
+        let v = ai_memory::mcp::handle_skill_register(
+            &db.0,
+            &inline_skill("export-rel-ok-3762"),
+            None,
+            &ai_memory::identity::object_owner::MutationPrincipal::from_process_env(),
+        )
+        .expect("seed register");
         v["id"].as_str().expect("id").to_owned()
     };
     let store_dir_canon = canon_spelling(dir.path());
@@ -478,8 +497,13 @@ async fn mcp_register_symlinked_resource_renders_label_not_resolved_path_3762() 
 
     let db_path = dir.path().join("t.db");
     let conn = ai_memory::db::open(&db_path).expect("db::open");
-    let err = ai_memory::mcp::handle_skill_register(&conn, &json!({"folder_path": folder_s}), None)
-        .expect_err("a symlinked resource must be refused");
+    let err = ai_memory::mcp::handle_skill_register(
+        &conn,
+        &json!({"folder_path": folder_s}),
+        None,
+        &ai_memory::identity::object_owner::MutationPrincipal::from_process_env(),
+    )
+    .expect_err("a symlinked resource must be refused");
     assert!(
         !err.contains(&canon_s),
         "the resolved folder spelling must not reach the caller: {err}"

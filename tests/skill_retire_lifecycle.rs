@@ -34,8 +34,13 @@ fn minimal_skill_md(name: &str) -> String {
 }
 
 fn register(conn: &rusqlite::Connection, name: &str) -> String {
-    let v = handle_skill_register(conn, &json!({"inline_skill": minimal_skill_md(name)}), None)
-        .expect("register");
+    let v = handle_skill_register(
+        conn,
+        &json!({"inline_skill": minimal_skill_md(name)}),
+        None,
+        &ai_memory::identity::object_owner::MutationPrincipal::from_process_env(),
+    )
+    .expect("register");
     v["id"].as_str().expect("id").to_string()
 }
 
@@ -64,6 +69,7 @@ fn retire_hides_from_list() {
         &conn,
         &json!({"namespace": "retns", "name": "hide-me"}),
         None,
+        &ai_memory::identity::object_owner::MutationPrincipal::from_process_env(),
     )
     .unwrap();
     assert_eq!(r["retired"], json!(true));
@@ -86,6 +92,7 @@ fn include_retired_shows_it() {
         &conn,
         &json!({"namespace": "retns", "name": "show-me"}),
         None,
+        &ai_memory::identity::object_owner::MutationPrincipal::from_process_env(),
     )
     .unwrap();
 
@@ -108,6 +115,7 @@ fn skill_get_shows_retired_state() {
         &conn,
         &json!({"namespace": "retns", "name": "get-state", "reason": "obsolete"}),
         None,
+        &ai_memory::identity::object_owner::MutationPrincipal::from_process_env(),
     )
     .unwrap();
 
@@ -128,13 +136,23 @@ fn skill_get_shows_retired_state() {
 fn idempotent_re_retire() {
     let (_d, conn) = open_db();
     register(&conn, "idem");
-    let first =
-        handle_skill_retire(&conn, &json!({"namespace": "retns", "name": "idem"}), None).unwrap();
+    let first = handle_skill_retire(
+        &conn,
+        &json!({"namespace": "retns", "name": "idem"}),
+        None,
+        &ai_memory::identity::object_owner::MutationPrincipal::from_process_env(),
+    )
+    .unwrap();
     assert_eq!(first["affected"], json!(1));
 
     // Re-retiring the already-retired lineage succeeds with affected=0.
-    let second =
-        handle_skill_retire(&conn, &json!({"namespace": "retns", "name": "idem"}), None).unwrap();
+    let second = handle_skill_retire(
+        &conn,
+        &json!({"namespace": "retns", "name": "idem"}),
+        None,
+        &ai_memory::identity::object_owner::MutationPrincipal::from_process_env(),
+    )
+    .unwrap();
     assert_eq!(second["retired"], json!(true));
     assert_eq!(
         second["affected"],
@@ -151,6 +169,7 @@ fn unretire_restores() {
         &conn,
         &json!({"namespace": "retns", "name": "restore"}),
         None,
+        &ai_memory::identity::object_owner::MutationPrincipal::from_process_env(),
     )
     .unwrap();
     assert_eq!(
@@ -162,6 +181,7 @@ fn unretire_restores() {
         &conn,
         &json!({"namespace": "retns", "name": "restore", "unretire": true}),
         None,
+        &ai_memory::identity::object_owner::MutationPrincipal::from_process_env(),
     )
     .unwrap();
     assert_eq!(un["unretired"], json!(true));
@@ -178,6 +198,7 @@ fn unretire_restores() {
         &conn,
         &json!({"namespace": "retns", "name": "restore", "unretire": true}),
         None,
+        &ai_memory::identity::object_owner::MutationPrincipal::from_process_env(),
     )
     .unwrap();
     assert_eq!(again["affected"], json!(0));
@@ -198,8 +219,13 @@ fn lineage_wide_multi_version_retire_then_unretire() {
         .unwrap();
     assert_eq!(total, 2, "chain has two versions");
 
-    let r =
-        handle_skill_retire(&conn, &json!({"namespace": "retns", "name": "chain"}), None).unwrap();
+    let r = handle_skill_retire(
+        &conn,
+        &json!({"namespace": "retns", "name": "chain"}),
+        None,
+        &ai_memory::identity::object_owner::MutationPrincipal::from_process_env(),
+    )
+    .unwrap();
     assert_eq!(
         r["affected"],
         json!(2),
@@ -211,6 +237,7 @@ fn lineage_wide_multi_version_retire_then_unretire() {
         &conn,
         &json!({"namespace": "retns", "name": "chain", "unretire": true}),
         None,
+        &ai_memory::identity::object_owner::MutationPrincipal::from_process_env(),
     )
     .unwrap();
     assert_eq!(un["affected"], json!(2));
@@ -223,7 +250,13 @@ fn single_version_retire_by_skill_id() {
     let v1 = register(&conn, "byid");
     register(&conn, "byid"); // v2 current
 
-    let r = handle_skill_retire(&conn, &json!({"skill_id": v1}), None).unwrap();
+    let r = handle_skill_retire(
+        &conn,
+        &json!({"skill_id": v1}),
+        None,
+        &ai_memory::identity::object_owner::MutationPrincipal::from_process_env(),
+    )
+    .unwrap();
     assert_eq!(r["affected"], json!(1));
     assert_eq!(r["skill_id"], json!(v1));
     // Only the targeted version is retired; the other stays active.
@@ -242,6 +275,7 @@ fn re_register_of_retired_refuses() {
         &conn,
         &json!({"namespace": "retns", "name": "refuse"}),
         None,
+        &ai_memory::identity::object_owner::MutationPrincipal::from_process_env(),
     )
     .unwrap();
 
@@ -249,6 +283,7 @@ fn re_register_of_retired_refuses() {
         &conn,
         &json!({"inline_skill": minimal_skill_md("refuse")}),
         None,
+        &ai_memory::identity::object_owner::MutationPrincipal::from_process_env(),
     )
     .unwrap_err();
     assert!(
@@ -261,12 +296,14 @@ fn re_register_of_retired_refuses() {
         &conn,
         &json!({"namespace": "retns", "name": "refuse", "unretire": true}),
         None,
+        &ai_memory::identity::object_owner::MutationPrincipal::from_process_env(),
     )
     .unwrap();
     handle_skill_register(
         &conn,
         &json!({"inline_skill": minimal_skill_md("refuse")}),
         None,
+        &ai_memory::identity::object_owner::MutationPrincipal::from_process_env(),
     )
     .expect("re-register after unretire succeeds");
 }
@@ -274,14 +311,26 @@ fn re_register_of_retired_refuses() {
 #[test]
 fn retire_unknown_skill_id_is_not_found() {
     let (_d, conn) = open_db();
-    let err = handle_skill_retire(&conn, &json!({"skill_id": "no-such-id"}), None).unwrap_err();
+    let err = handle_skill_retire(
+        &conn,
+        &json!({"skill_id": "no-such-id"}),
+        None,
+        &ai_memory::identity::object_owner::MutationPrincipal::from_process_env(),
+    )
+    .unwrap_err();
     assert!(err.contains("skill not found"), "got: {err}");
 }
 
 #[test]
 fn retire_without_target_errors() {
     let (_d, conn) = open_db();
-    let err = handle_skill_retire(&conn, &json!({}), None).unwrap_err();
+    let err = handle_skill_retire(
+        &conn,
+        &json!({}),
+        None,
+        &ai_memory::identity::object_owner::MutationPrincipal::from_process_env(),
+    )
+    .unwrap_err();
     assert!(err.contains("requires"), "got: {err}");
 }
 
@@ -293,11 +342,18 @@ fn retire_without_target_errors() {
 fn skill_retired_and_skill_unretired_events_emitted() {
     let (_d, conn) = open_db();
     register(&conn, "audit");
-    handle_skill_retire(&conn, &json!({"namespace": "retns", "name": "audit"}), None).unwrap();
+    handle_skill_retire(
+        &conn,
+        &json!({"namespace": "retns", "name": "audit"}),
+        None,
+        &ai_memory::identity::object_owner::MutationPrincipal::from_process_env(),
+    )
+    .unwrap();
     handle_skill_retire(
         &conn,
         &json!({"namespace": "retns", "name": "audit", "unretire": true}),
         None,
+        &ai_memory::identity::object_owner::MutationPrincipal::from_process_env(),
     )
     .unwrap();
 
@@ -397,12 +453,14 @@ fn migration_v82_applies_and_is_idempotent() {
         &conn3,
         &json!({"inline_skill": minimal_skill_md("post-mig")}),
         None,
+        &ai_memory::identity::object_owner::MutationPrincipal::from_process_env(),
     )
     .unwrap();
     let r = handle_skill_retire(
         &conn3,
         &json!({"namespace": "retns", "name": "post-mig"}),
         None,
+        &ai_memory::identity::object_owner::MutationPrincipal::from_process_env(),
     )
     .unwrap();
     assert_eq!(r["affected"], json!(1));
@@ -429,6 +487,7 @@ fn purge_refused_when_not_retired_and_no_force() {
         &conn,
         &json!({"namespace": "retns", "name": "no-force"}),
         None,
+        &ai_memory::identity::object_owner::MutationPrincipal::from_process_env(),
     )
     .unwrap_err();
     assert!(
@@ -447,12 +506,14 @@ fn purge_succeeds_after_retire() {
         &conn,
         &json!({"namespace": "retns", "name": "purge-after-retire"}),
         None,
+        &ai_memory::identity::object_owner::MutationPrincipal::from_process_env(),
     )
     .unwrap();
     let r = handle_skill_delete(
         &conn,
         &json!({"namespace": "retns", "name": "purge-after-retire"}),
         None,
+        &ai_memory::identity::object_owner::MutationPrincipal::from_process_env(),
     )
     .unwrap();
     assert_eq!(r["purged"], json!(true));
@@ -468,6 +529,7 @@ fn purge_with_force_bypasses_retire_gate() {
         &conn,
         &json!({"namespace": "retns", "name": "forced", "force": true}),
         None,
+        &ai_memory::identity::object_owner::MutationPrincipal::from_process_env(),
     )
     .unwrap();
     assert_eq!(r["purged"], json!(true));
@@ -494,6 +556,7 @@ fn purge_removes_all_lineage_versions_and_their_skill_resources() {
         &conn,
         &json!({"namespace": "retns", "name": "multi", "force": true}),
         None,
+        &ai_memory::identity::object_owner::MutationPrincipal::from_process_env(),
     )
     .unwrap();
     assert_eq!(r["affected"], json!(2), "purge removes every version");
@@ -517,7 +580,13 @@ fn purge_by_id_targets_whole_lineage() {
     let v1 = register(&conn, "byid-purge");
     register(&conn, "byid-purge"); // v2
     // A by-id purge resolves to the whole lineage (never partial-chain).
-    let r = handle_skill_delete(&conn, &json!({"skill_id": v1, "force": true}), None).unwrap();
+    let r = handle_skill_delete(
+        &conn,
+        &json!({"skill_id": v1, "force": true}),
+        None,
+        &ai_memory::identity::object_owner::MutationPrincipal::from_process_env(),
+    )
+    .unwrap();
     assert_eq!(r["affected"], json!(2));
     assert_eq!(skill_row_count(&conn, "retns", "byid-purge"), 0);
 }
@@ -529,6 +598,7 @@ fn purge_404_unknown_lineage() {
         &conn,
         &json!({"namespace": "retns", "name": "ghost", "force": true}),
         None,
+        &ai_memory::identity::object_owner::MutationPrincipal::from_process_env(),
     )
     .unwrap_err();
     assert!(err.contains("skill not found"), "got: {err}");
@@ -555,6 +625,7 @@ fn purge_emits_skill_purged_event_before_delete_and_chain_holds() {
         &conn,
         &json!({"namespace": "retns", "name": "purge-audit", "force": true}),
         None,
+        &ai_memory::identity::object_owner::MutationPrincipal::from_process_env(),
     )
     .unwrap();
 

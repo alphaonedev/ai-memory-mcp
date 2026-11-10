@@ -442,6 +442,18 @@ pub fn run_agents(
                 .map(String::from)
                 .collect();
             validate::validate_capabilities(&caps)?;
+            // #8775 — the same owner gate as `memory_agent_register`: an
+            // enforced caller (`AI_MEMORY_AGENT_ID`) re-registers only its own
+            // existing roster entry; minting a new entry stays as shipped.
+            if db::get_agent(&conn, &agent_id)?.is_some() {
+                crate::identity::object_owner::authorize_owner_mutation(
+                    &crate::identity::object_owner::MutationPrincipal::from_process_env(),
+                    &crate::identity::object_owner::owner_metadata(&agent_id),
+                    &agent_id,
+                    crate::identity::object_owner::funnel::AGENT_REGISTER,
+                )
+                .map_err(anyhow::Error::msg)?;
+            }
             let id = db::register_agent(&conn, &agent_id, &agent_type, &caps)?;
             if json_out {
                 writeln!(

@@ -174,9 +174,13 @@ fn sg_sk_1_skill_register_spec_validates_per_agentskills_io() {
 
     // Positive control — valid minimal skill registers.
     let (conn, _dir) = open_db();
-    let payload =
-        mcp::handle_skill_register(&conn, &json!({ "inline_skill": MINIMAL_SKILL_MD }), None)
-            .expect("valid skill registers");
+    let payload = mcp::handle_skill_register(
+        &conn,
+        &json!({ "inline_skill": MINIMAL_SKILL_MD }),
+        None,
+        &ai_memory::identity::object_owner::MutationPrincipal::from_process_env(),
+    )
+    .expect("valid skill registers");
     assert!(
         payload["digest"].as_str().is_some(),
         "register payload carries digest: {payload}"
@@ -196,9 +200,13 @@ fn sg_sk_1_skill_register_spec_validates_per_agentskills_io() {
 fn sg_sk_2_register_export_reregister_identical_digest() {
     let (conn_a, dir_a) = open_db();
 
-    let reg_payload =
-        mcp::handle_skill_register(&conn_a, &json!({ "inline_skill": MINIMAL_SKILL_MD }), None)
-            .expect("register");
+    let reg_payload = mcp::handle_skill_register(
+        &conn_a,
+        &json!({ "inline_skill": MINIMAL_SKILL_MD }),
+        None,
+        &ai_memory::identity::object_owner::MutationPrincipal::from_process_env(),
+    )
+    .expect("register");
     let skill_id = reg_payload["id"]
         .as_str()
         .expect("id in register payload")
@@ -235,6 +243,7 @@ fn sg_sk_2_register_export_reregister_identical_digest() {
         &conn_b,
         &json!({ "folder_path": export_dir.to_string_lossy() }),
         None,
+        &ai_memory::identity::object_owner::MutationPrincipal::from_process_env(),
     )
     .expect("re-register");
     let digest_rereg = rereg_payload["digest"]
@@ -345,9 +354,13 @@ fn sg_sk_4_skill_registration_replicates_with_attestation_preserved() {
 
     // Register on A. With no keypair the signing_agent is NULL and
     // signature is NULL but the digest is still stable.
-    let reg =
-        mcp::handle_skill_register(&conn_a, &json!({ "inline_skill": MINIMAL_SKILL_MD }), None)
-            .expect("register on A");
+    let reg = mcp::handle_skill_register(
+        &conn_a,
+        &json!({ "inline_skill": MINIMAL_SKILL_MD }),
+        None,
+        &ai_memory::identity::object_owner::MutationPrincipal::from_process_env(),
+    )
+    .expect("register on A");
     let skill_id = reg["id"]
         .as_str()
         .expect("id in register payload")
@@ -467,9 +480,13 @@ fn sg_sk_4_skill_registration_replicates_with_attestation_preserved() {
     // (instead of row-copy) yields the same digest — the on-wire
     // payload is content-stable.
     let (conn_c, _dir_c) = open_db();
-    let reg_c =
-        mcp::handle_skill_register(&conn_c, &json!({ "inline_skill": MINIMAL_SKILL_MD }), None)
-            .expect("register on C");
+    let reg_c = mcp::handle_skill_register(
+        &conn_c,
+        &json!({ "inline_skill": MINIMAL_SKILL_MD }),
+        None,
+        &ai_memory::identity::object_owner::MutationPrincipal::from_process_env(),
+    )
+    .expect("register on C");
     let digest_c = reg_c["digest"].as_str().expect("digest on C");
     let digest_a_hex = reg["digest"].as_str().expect("digest on A");
     assert_eq!(
@@ -497,9 +514,13 @@ fn sg_sk_5_skills_schema_lands_via_migration_ladder_and_survives_reopen() {
 
     {
         let conn = db::open(&db_path).expect("first open");
-        let reg =
-            mcp::handle_skill_register(&conn, &json!({ "inline_skill": MINIMAL_SKILL_MD }), None)
-                .expect("register on first open");
+        let reg = mcp::handle_skill_register(
+            &conn,
+            &json!({ "inline_skill": MINIMAL_SKILL_MD }),
+            None,
+            &ai_memory::identity::object_owner::MutationPrincipal::from_process_env(),
+        )
+        .expect("register on first open");
         skill_id_remembered = reg["id"].as_str().unwrap().to_string();
         digest_remembered = reg["digest"].as_str().unwrap().to_string();
 
@@ -559,15 +580,23 @@ fn sg_sk_5_skills_schema_lands_via_migration_ladder_and_survives_reopen() {
 fn sg_sk_6_repeat_registration_supersedes_previous_row_in_version_chain() {
     let conn = db::open(Path::new(":memory:")).expect("open");
 
-    let first =
-        mcp::handle_skill_register(&conn, &json!({ "inline_skill": MINIMAL_SKILL_MD }), None)
-            .expect("first register");
+    let first = mcp::handle_skill_register(
+        &conn,
+        &json!({ "inline_skill": MINIMAL_SKILL_MD }),
+        None,
+        &ai_memory::identity::object_owner::MutationPrincipal::from_process_env(),
+    )
+    .expect("first register");
     let first_id = first["id"].as_str().unwrap().to_string();
     let first_digest = first["digest"].as_str().unwrap().to_string();
 
-    let second =
-        mcp::handle_skill_register(&conn, &json!({ "inline_skill": MINIMAL_SKILL_MD }), None)
-            .expect("re-register identical content");
+    let second = mcp::handle_skill_register(
+        &conn,
+        &json!({ "inline_skill": MINIMAL_SKILL_MD }),
+        None,
+        &ai_memory::identity::object_owner::MutationPrincipal::from_process_env(),
+    )
+    .expect("re-register identical content");
     let second_id = second["id"].as_str().unwrap().to_string();
     let second_digest = second["digest"].as_str().unwrap().to_string();
 

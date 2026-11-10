@@ -407,7 +407,12 @@ fn run_register(
         params[field_names::PARAMETERS_SCHEMA] = v;
     }
 
-    match crate::mcp::handle_skill_register(conn, &params, active_keypair) {
+    match crate::mcp::handle_skill_register(
+        conn,
+        &params,
+        active_keypair,
+        &crate::identity::object_owner::MutationPrincipal::from_process_env(),
+    ) {
         Ok(v) => {
             if args.json {
                 emit_json(out, &v)?;
@@ -643,7 +648,12 @@ fn run_retire(
     if let Some(ref r) = args.reason {
         params["reason"] = json!(r);
     }
-    match crate::mcp::handle_skill_retire(conn, &params, active_keypair) {
+    match crate::mcp::handle_skill_retire(
+        conn,
+        &params,
+        active_keypair,
+        &crate::identity::object_owner::MutationPrincipal::from_process_env(),
+    ) {
         Ok(v) => {
             if args.json {
                 emit_json(out, &v)?;
@@ -684,7 +694,12 @@ fn run_delete(
     if let Some(ref ns) = args.namespace {
         params["namespace"] = json!(ns);
     }
-    match crate::mcp::handle_skill_delete(conn, &params, active_keypair) {
+    match crate::mcp::handle_skill_delete(
+        conn,
+        &params,
+        active_keypair,
+        &crate::identity::object_owner::MutationPrincipal::from_process_env(),
+    ) {
         Ok(v) => {
             if args.json {
                 emit_json(out, &v)?;
@@ -756,6 +771,7 @@ mod tests {
             &conn,
             &json!({"inline_skill": minimal_skill_md("cli-list")}),
             None,
+            &crate::identity::object_owner::MutationPrincipal::from_process_env(),
         )
         .unwrap();
         drop(conn);
@@ -786,6 +802,7 @@ mod tests {
             &conn,
             &json!({"inline_skill": minimal_skill_md("cli-get")}),
             None,
+            &crate::identity::object_owner::MutationPrincipal::from_process_env(),
         )
         .unwrap();
         let id = reg["id"].as_str().unwrap().to_string();
@@ -816,6 +833,7 @@ mod tests {
             &conn,
             &json!({"inline_skill": minimal_skill_md("cli-export")}),
             None,
+            &crate::identity::object_owner::MutationPrincipal::from_process_env(),
         )
         .unwrap();
         let id = reg["id"].as_str().unwrap().to_string();
@@ -873,6 +891,7 @@ mod tests {
             &conn,
             &json!({"inline_skill": minimal_skill_md("cli-compose")}),
             None,
+            &crate::identity::object_owner::MutationPrincipal::from_process_env(),
         )
         .unwrap();
         let id = reg["id"].as_str().unwrap().to_string();
@@ -940,6 +959,7 @@ mod tests {
             &conn,
             &json!({"inline_skill": minimal_skill_md("cli-list-human")}),
             None,
+            &crate::identity::object_owner::MutationPrincipal::from_process_env(),
         )
         .unwrap();
         drop(conn);
@@ -975,6 +995,7 @@ mod tests {
             &conn,
             &json!({"inline_skill": minimal_skill_md("cli-get-human")}),
             None,
+            &crate::identity::object_owner::MutationPrincipal::from_process_env(),
         )
         .unwrap();
         let id = reg["id"].as_str().unwrap().to_string();
@@ -1003,6 +1024,7 @@ mod tests {
             &conn,
             &json!({"inline_skill": minimal_skill_md("cli-export-human")}),
             None,
+            &crate::identity::object_owner::MutationPrincipal::from_process_env(),
         )
         .unwrap();
         let id = reg["id"].as_str().unwrap().to_string();
@@ -1220,6 +1242,7 @@ mod tests {
             &conn,
             &json!({"inline_skill": minimal_skill_md("cli-retire")}),
             None,
+            &crate::identity::object_owner::MutationPrincipal::from_process_env(),
         )
         .unwrap();
         let id = reg["id"].as_str().unwrap().to_string();

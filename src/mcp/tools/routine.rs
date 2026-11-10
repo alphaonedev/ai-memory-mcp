@@ -21,6 +21,9 @@
 //! run record.
 
 use crate::identity::keypair::AgentKeypair;
+use crate::identity::object_owner::{
+    MutationPrincipal, authorize_owner_mutation, funnel as object_funnel, owner_metadata,
+};
 use crate::mcp::param_names;
 use crate::models::{AttestLevel, Routine, RoutineRun, RoutineRunState, RoutineState};
 use serde_json::{Value, json};
@@ -131,7 +134,9 @@ pub fn handle_routine_create(conn: &rusqlite::Connection, params: &Value) -> Res
 ///
 /// # Errors
 /// Returns an error string when `id` is missing, when no row matches the id,
-/// or on the stringified `rusqlite` update error.
+/// [`crate::errors::msg::CALLER_DOES_NOT_OWN_OBJECT`] when the resolved
+/// caller is not the routine's creator (#8774), or on the stringified
+/// `rusqlite` update error.
 pub fn handle_routine_freeze(
     conn: &rusqlite::Connection,
     params: &Value,
@@ -143,6 +148,21 @@ pub fn handle_routine_freeze(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .ok_or_else(|| "id is required".to_string())?;
+    // #8774 — only the routine's creator may freeze it. `created_by` is
+    // written once at create and never updated, so this read cannot race the
+    // freeze below into checking a different owner.
+    let Some(existing) = crate::routines::routine_get(conn, id)
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("routine_freeze get", e))?
+    else {
+        return Err(format!("routine not found: {id}"));
+    };
+    let principal = MutationPrincipal::from_process_env();
+    authorize_owner_mutation(
+        &principal,
+        &owner_metadata(&existing.created_by),
+        &existing.id,
+        object_funnel::ROUTINE_FREEZE,
+    )?;
     let now = chrono::Utc::now().timestamp();
 
     let frozen = crate::routines::routine_freeze(conn, id, now, keypair)

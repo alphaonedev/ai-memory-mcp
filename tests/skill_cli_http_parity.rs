@@ -162,6 +162,7 @@ fn seed_skill(db_path: &std::path::Path, name: &str) -> String {
         &conn,
         &json!({"inline_skill": minimal_skill_md(name)}),
         None,
+        &ai_memory::identity::object_owner::MutationPrincipal::from_process_env(),
     )
     .expect("seed skill");
     v["id"].as_str().unwrap().to_string()
@@ -603,6 +604,7 @@ async fn http_skill_delete_200_admin() {
             &conn,
             &json!({"namespace": "testns", "name": "http-delete"}),
             None,
+            &ai_memory::identity::object_owner::MutationPrincipal::from_process_env(),
         )
         .unwrap();
     }

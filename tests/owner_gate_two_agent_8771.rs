@@ -1,7 +1,8 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
-//! #8771 / #8772 / #8774 / #8775 — the two-agent owner gate (Refs #8741).
+//! #8771 / #8772 / #8774 / #8775 / #8557 / #8790 — the two-agent owner gate
+//! (Refs #8741).
 //!
 //! ## The class
 //!
@@ -12,7 +13,8 @@
 //! retired / unretired / purged agent A's skill lineage (#8771), superseded
 //! A's skill head with its own body (#8772), froze A's draft routine
 //! (#8774), and re-registered A's roster identity with `update: true`
-//! (#8775).
+//! (#8775). The sweep added two more: B merged its alias into A's entity
+//! (#8557) and added a DAG edge between A's actions (#8790).
 //!
 //! ## The invariant pinned here, for every row of the sibling table
 //!
@@ -28,6 +30,8 @@
 //! are admin-gated and refuse on PostgreSQL (#3183); the one PostgreSQL-
 //! reachable sibling, `POST /api/v1/agents`, is pinned on both backends by
 //! `tests/agents_post_caller_binding_3398.rs`.
+//! The store-layer cells of #8557 / #8790 (SQLite and PostgreSQL through
+//! the `MemoryStore` trait) are in `tests/owner_gate_store_8557_8790.rs`.
 
 #![allow(clippy::missing_panics_doc)]
 
@@ -58,6 +62,15 @@ const TOOL_SKILL_DELETE: &str = "memory_skill_delete";
 const TOOL_ROUTINE_CREATE: &str = "memory_routine_create";
 const TOOL_ROUTINE_FREEZE: &str = "memory_routine_freeze";
 const TOOL_AGENT_REGISTER: &str = "memory_agent_register";
+const TOOL_ENTITY_REGISTER: &str = "memory_entity_register";
+const TOOL_ACTION_CREATE: &str = "memory_action_create";
+const TOOL_ACTION_ADD_EDGE: &str = "memory_action_add_edge";
+
+/// Entity and action fixture values (#8557 / #8790).
+const ENTITY_NAME: &str = "Entity 8557";
+const OWNER_ALIAS: &str = "owner-alias-8557";
+const INTRUDER_ALIAS: &str = "intruder-alias-8557";
+const EDGE_TYPE: &str = "requires";
 
 /// Agent roster fields.
 const OWNER_AGENT_TYPE: &str = "ai:claude-opus-5.5";
@@ -67,14 +80,17 @@ const FORGED_CAPABILITY: &str = "forged-capability";
 
 /// SKILL.md text for `name` with `body`.
 fn skill_md(name: &str, body: &str) -> String {
-    format!("---\nnamespace: {NAMESPACE}\nname: {name}\ndescription: Owner gate fixture.\n---\n\n{body}\n")
+    format!(
+        "---\nnamespace: {NAMESPACE}\nname: {name}\ndescription: Owner gate fixture.\n---\n\n{body}\n"
+    )
 }
 
 /// Every column of every row `sql` selects, rendered losslessly, in rowid
 /// order — the byte-unchanged witness.
 fn snapshot(db: &Path, sql: &str, args: &[&str]) -> Vec<Vec<String>> {
-    let conn = rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .expect("read-only snapshot connection");
+    let conn =
+        rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect("read-only snapshot connection");
     let mut stmt = conn.prepare(sql).expect("snapshot prepare");
     let columns = stmt.column_count();
     let rows = stmt
@@ -95,6 +111,11 @@ const SKILL_RESOURCES_SQL: &str = "SELECT r.* FROM skill_resources r JOIN skills
 const ROUTINE_SQL: &str = "SELECT * FROM routines WHERE id = ?1";
 const AGENT_ROW_SQL: &str =
     "SELECT * FROM memories WHERE namespace = '_agents' AND title = ?1 ORDER BY rowid";
+const ENTITY_ROW_SQL: &str = "SELECT * FROM memories WHERE id = ?1";
+const ENTITY_ALIASES_SQL: &str = "SELECT * FROM entity_aliases WHERE entity_id = ?1 ORDER BY rowid";
+const ACTION_ROWS_SQL: &str = "SELECT * FROM actions WHERE id IN (?1, ?2) ORDER BY rowid";
+const ACTION_EDGES_SQL: &str = "SELECT * FROM action_edges \
+     WHERE from_action IN (?1, ?2) OR to_action IN (?1, ?2) ORDER BY rowid";
 
 /// The stored witness of A's object for one case.
 fn object_snapshot(db: &Path, target: &Target) -> Vec<Vec<String>> {
@@ -110,6 +131,16 @@ fn object_snapshot(db: &Path, target: &Target) -> Vec<Vec<String>> {
             AGENT_ROW_SQL,
             &[&ai_memory::models::agent_registration_title(agent)],
         ),
+        Target::Entity(id) => {
+            let mut rows = snapshot(db, ENTITY_ROW_SQL, &[id]);
+            rows.extend(snapshot(db, ENTITY_ALIASES_SQL, &[id]));
+            rows
+        }
+        Target::ActionPair(from, to) => {
+            let mut rows = snapshot(db, ACTION_ROWS_SQL, &[from, to]);
+            rows.extend(snapshot(db, ACTION_EDGES_SQL, &[from, to]));
+            rows
+        }
     }
 }
 
@@ -121,6 +152,10 @@ enum Target {
     Routine(String),
     /// A roster entry.
     Agent(String),
+    /// An entity memory id (with its alias rows).
+    Entity(String),
+    /// Two action ids (with every edge touching them).
+    ActionPair(String, String),
 }
 
 /// One row of the sibling table.
@@ -142,9 +177,13 @@ enum Case {
     RoutineFreeze,
     /// #8775 — B re-registers A's roster identity with `update: true`.
     AgentReRegister,
+    /// #8557 — B merges its alias into A's entity.
+    EntityAliasMerge,
+    /// #8790 — B adds a DAG edge between two of A's actions.
+    ActionAddEdge,
 }
 
-const CASES: [Case; 8] = [
+const CASES: [Case; 10] = [
     Case::SkillSupersede,
     Case::SkillRetireLineage,
     Case::SkillRetireById,
@@ -153,6 +192,8 @@ const CASES: [Case; 8] = [
     Case::SkillDeleteRetiredById,
     Case::RoutineFreeze,
     Case::AgentReRegister,
+    Case::EntityAliasMerge,
+    Case::ActionAddEdge,
 ];
 
 /// A's setup for `case`: create the object (and put it in the state the
@@ -213,7 +254,10 @@ fn setup(case: Case, owner: &mut Mcp) -> (Target, &'static str, Value) {
         }
         Case::SkillDeleteRetiredById => {
             let id = register(owner);
-            owner.call_ok(TOOL_SKILL_RETIRE, &json!({"skill_id": id, "format": "json"}));
+            owner.call_ok(
+                TOOL_SKILL_RETIRE,
+                &json!({"skill_id": id, "format": "json"}),
+            );
             (
                 Target::Skill(skill_name),
                 TOOL_SKILL_DELETE,
@@ -259,6 +303,58 @@ fn setup(case: Case, owner: &mut Mcp) -> (Target, &'static str, Value) {
                 }),
             )
         }
+        Case::EntityAliasMerge => {
+            let created = owner.call_ok(
+                TOOL_ENTITY_REGISTER,
+                &json!({
+                    "canonical_name": ENTITY_NAME,
+                    "namespace": NAMESPACE,
+                    "aliases": [OWNER_ALIAS],
+                    "format": "json"
+                }),
+            );
+            let id = created["entity_id"]
+                .as_str()
+                .expect("entity id")
+                .to_string();
+            (
+                Target::Entity(id),
+                TOOL_ENTITY_REGISTER,
+                json!({
+                    "canonical_name": ENTITY_NAME,
+                    "namespace": NAMESPACE,
+                    "aliases": [INTRUDER_ALIAS],
+                    "format": "json"
+                }),
+            )
+        }
+        Case::ActionAddEdge => {
+            let mut create = |title: &str| -> String {
+                let v = owner.call_ok(
+                    TOOL_ACTION_CREATE,
+                    &json!({
+                        "namespace": NAMESPACE,
+                        "kind": "work",
+                        "title": title,
+                        "agent_id": OWNER,
+                        "format": "json"
+                    }),
+                );
+                v["id"].as_str().expect("action id").to_string()
+            };
+            let from = create("owner step 1");
+            let to = create("owner step 2");
+            (
+                Target::ActionPair(from.clone(), to.clone()),
+                TOOL_ACTION_ADD_EDGE,
+                json!({
+                    "from_action": from,
+                    "to_action": to,
+                    "edge_type": EDGE_TYPE,
+                    "format": "json"
+                }),
+            )
+        }
     }
 }
 
@@ -285,7 +381,11 @@ fn non_owner_mutation_is_refused_and_leaves_the_owner_row_byte_unchanged_8771() 
 
         let (target, tool, args) = setup(case, &mut owner);
         let before = object_snapshot(&fixture.db, &target);
-        assert_ne!(before, Vec::<Vec<String>>::new(), "{case:?}: setup stored nothing");
+        assert_ne!(
+            before,
+            Vec::<Vec<String>>::new(),
+            "{case:?}: setup stored nothing"
+        );
 
         let result = intruder.call(tool, &args);
         assert_denied(case, "mcp", &result);
@@ -323,9 +423,32 @@ fn owner_mutation_still_succeeds_8771() {
 fn cli_non_owner_skill_mutation_is_refused_8771() {
     const CLI_CASES: [(&str, &[&str]); 4] = [
         ("register", &["skill", "register"]),
-        ("retire", &["skill", "retire", "--namespace", NAMESPACE, "--name"]),
-        ("unretire", &["skill", "retire", "--unretire", "--namespace", NAMESPACE, "--name"]),
-        ("delete", &["skill", "delete", "--confirm", "--namespace", NAMESPACE, "--name"]),
+        (
+            "retire",
+            &["skill", "retire", "--namespace", NAMESPACE, "--name"],
+        ),
+        (
+            "unretire",
+            &[
+                "skill",
+                "retire",
+                "--unretire",
+                "--namespace",
+                NAMESPACE,
+                "--name",
+            ],
+        ),
+        (
+            "delete",
+            &[
+                "skill",
+                "delete",
+                "--confirm",
+                "--namespace",
+                NAMESPACE,
+                "--name",
+            ],
+        ),
     ];
     for (verb, argv) in CLI_CASES {
         let fixture = Fixture::new();
@@ -399,7 +522,12 @@ fn cli_non_owner_agent_register_is_refused_8775() {
         .command()
         .env("AI_MEMORY_AGENT_ID", INTRUDER)
         .args(["agents", "register", "--agent-id", OWNER])
-        .args(["--agent-type", FORGED_AGENT_TYPE, "--capabilities", FORGED_CAPABILITY])
+        .args([
+            "--agent-type",
+            FORGED_AGENT_TYPE,
+            "--capabilities",
+            FORGED_CAPABILITY,
+        ])
         .output()
         .expect("cli child");
     let stderr = String::from_utf8_lossy(&output.stderr);

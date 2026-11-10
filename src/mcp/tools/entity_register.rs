@@ -128,13 +128,16 @@ pub fn handle_entity_register(
     )
     .map_err(|e| e.to_string())?;
 
-    let reg = db::entity_register(
+    // #8557 — merging aliases into an existing entity is an owner-gated
+    // mutation; the principal is the process identity, never the wire value.
+    let reg = db::entity_register_as(
         conn,
         canonical_name,
         namespace,
         &aliases,
         &extra_metadata,
         Some(&agent_id),
+        &crate::identity::object_owner::MutationPrincipal::from_process_env(),
     )
     .map_err(|e| crate::mcp::error_text::mcp_foreign_err("handle_entity_register", e))?;
 
