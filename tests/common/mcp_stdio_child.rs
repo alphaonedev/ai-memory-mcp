@@ -86,7 +86,20 @@ impl Mcp {
     /// configured identity (the local-operator posture) when `None`.
     #[must_use]
     pub fn start(fixture: &Fixture, agent: Option<&str>) -> Self {
+        Self::spawn(fixture.command(), agent)
+    }
+
+    /// `start`, but the child loads `<sandbox>/config/ai-memory/config.toml`
+    /// (`AI_MEMORY_NO_CONFIG` removed), so a suite can drive config-driven
+    /// behaviour such as `[[permissions.rules]]` (#8760).
+    #[must_use]
+    pub fn start_with_config(fixture: &Fixture, agent: Option<&str>) -> Self {
         let mut cmd = fixture.command();
+        cmd.env_remove("AI_MEMORY_NO_CONFIG");
+        Self::spawn(cmd, agent)
+    }
+
+    fn spawn(mut cmd: Command, agent: Option<&str>) -> Self {
         if let Some(agent) = agent {
             cmd.env("AI_MEMORY_AGENT_ID", agent);
         }
