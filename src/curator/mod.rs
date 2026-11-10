@@ -53,6 +53,9 @@ pub mod reports;
 /// `run_decorrelation_probe` scans the Reflection corpus through the
 /// `MemoryStore` trait. Opt-in via `AI_MEMORY_REFLECT_DECORRELATION_MODE`.
 pub mod decorrelation_probe;
+/// #8758 — partition invariant tests (owner x scope x namespace x backend).
+#[cfg(test)]
+mod issue_8758_tests;
 pub mod reflection_pass;
 /// #1393 sub-unit 2 — curator transcript-classify pass. Entirely
 /// `sal`-gated: it operates exclusively through the `MemoryStore` trait
