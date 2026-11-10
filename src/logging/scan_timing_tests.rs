@@ -5,7 +5,10 @@
 //! load spike hits both sizes alike, and the minimum of each size is compared:
 //! linear work measures about x10.4 and a quadratic scan about x30.
 //! A ratio in the grey zone between them gets more pairs, so load noise drops out.
+//! The scans run on one worker thread and each wait has an absolute bound, so a hang fails the
+//! named test.
 
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 const SMALL_BYTES: usize = 100_000;
@@ -19,6 +22,9 @@ const RATIO_LIMIT: u32 = 20;
 const GREY_ZONE_HUNDREDTHS: u128 = 1_200;
 /// Pair cap for that resampling; a quadratic scan stays near x30 however often it is timed.
 const MAX_PAIRS: usize = 12;
+/// One linear 1M scan takes about 1 s in a loaded debug build; a scan still running at this
+/// bound is cut off and fails, instead of running until the CI shard watchdog kills it.
+const MEASUREMENT_TIMEOUT: Duration = Duration::from_secs(30);
 const SHAPES: &[(&str, &str)] = &[
     ("userinfo", "http://u@a)"),
     ("credential lines", "password=private\n"),
@@ -29,25 +35,71 @@ fn ratio_hundredths(small: Duration, large: Duration) -> u128 {
     large.as_nanos().saturating_mul(100) / small.as_nanos().max(1)
 }
 
-fn time_pair(inputs: &[String; 2], fastest: &mut [Duration; 2], scan: &impl Fn(&str) -> String) {
-    for (input, best) in inputs.iter().zip(fastest.iter_mut()) {
-        let started = Instant::now();
-        let masked = std::hint::black_box(scan(std::hint::black_box(input)));
-        *best = (*best).min(started.elapsed());
-        drop(masked);
+/// One long-lived thread that times `scan` on the input index it is sent, so every measurement
+/// runs on the same warm thread while the caller waits for it under `MEASUREMENT_TIMEOUT`.
+struct Timer {
+    lens: [usize; 2],
+    requests: mpsc::Sender<usize>,
+    replies: mpsc::Receiver<Duration>,
+}
+
+impl Timer {
+    fn spawn(inputs: [String; 2], scan: fn(&str) -> String) -> Self {
+        let lens = inputs.each_ref().map(String::len);
+        let (requests, request_rx) = mpsc::channel::<usize>();
+        let (reply_tx, replies) = mpsc::channel();
+        std::thread::spawn(move || {
+            for index in request_rx {
+                let started = Instant::now();
+                let masked = std::hint::black_box(scan(std::hint::black_box(&inputs[index])));
+                let elapsed = started.elapsed();
+                drop(masked);
+                if reply_tx.send(elapsed).is_err() {
+                    break;
+                }
+            }
+        });
+        Self {
+            lens,
+            requests,
+            replies,
+        }
+    }
+
+    fn time(&self, name: &str, shape: &str, index: usize) -> Duration {
+        let bytes = self.lens[index];
+        let waited = Instant::now();
+        let reply = match self.requests.send(index) {
+            Ok(()) => self.replies.recv_timeout(MEASUREMENT_TIMEOUT),
+            Err(_) => Err(mpsc::RecvTimeoutError::Disconnected),
+        };
+        match reply {
+            Ok(elapsed) => elapsed,
+            Err(mpsc::RecvTimeoutError::Timeout) => panic!(
+                "#8674 {name} [{shape}]: one {bytes}-byte scan ran {:?} without finishing, over \
+                 the {MEASUREMENT_TIMEOUT:?} bound; the scanner does superlinear work or hangs",
+                waited.elapsed()
+            ),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("#8674 {name} [{shape}]: the {bytes}-byte scan thread panicked")
+            }
+        }
     }
 }
 
-fn assert_scanner_ratio(name: &str, scan: impl Fn(&str) -> String) {
+fn assert_scanner_ratio(name: &str, scan: fn(&str) -> String) {
     for (shape, piece) in SHAPES {
         let inputs = [SMALL_BYTES, LARGE_BYTES].map(|bytes| piece.repeat(bytes / piece.len()));
+        let timer = Timer::spawn(inputs, scan);
         let mut fastest = [Duration::MAX; 2];
         let mut pairs = 0;
         while pairs < ROUNDS
             || (pairs < MAX_PAIRS
                 && ratio_hundredths(fastest[0], fastest[1]) >= GREY_ZONE_HUNDREDTHS)
         {
-            time_pair(&inputs, &mut fastest, &scan);
+            for (index, best) in fastest.iter_mut().enumerate() {
+                *best = (*best).min(timer.time(name, shape, index));
+            }
             pairs += 1;
         }
         let [small, large] = fastest;
