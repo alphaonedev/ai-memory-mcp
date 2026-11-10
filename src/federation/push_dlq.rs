@@ -275,6 +275,19 @@ pub trait FederationDlqSink: Send + Sync {
         memory_id: &str,
         erasure_failed_at: &str,
     ) -> Result<bool, String>;
+
+    /// #8744 — which of `memory_ids` are ERASED locally (carry a
+    /// forget-tombstone)? A store body for an erased id must never be
+    /// queued or replayed to a peer: it would re-create the deleted row
+    /// there. Only `insert_restore_same_id` clears a tombstone, so a
+    /// legitimate restore is not reported; a re-create mints a new id.
+    ///
+    /// # Errors
+    ///
+    /// Returns the formatted backend error on a read failure. The replay
+    /// caller FAILS SAFE (leaves the row unsent this tick, no attempt
+    /// burned); the enqueue caller propagates it.
+    async fn erased_memory_ids(&self, memory_ids: &[String]) -> Result<Vec<String>, String>;
 }
 
 /// #2716 (CB-12) — decide whether a LIVE row's `updated_at` supersedes a
@@ -306,6 +319,104 @@ fn payload_is_delete(payload: &serde_json::Value) -> bool {
         .get("deletions")
         .and_then(serde_json::Value::as_array)
         .is_some_and(|d| !d.is_empty())
+}
+
+/// #8744 — the `memories[].id` values a pending push body carries (empty for
+/// a delete / archive / restore / link body, so those rows pay no probe).
+fn payload_memory_ids(payload: &serde_json::Value) -> Vec<String> {
+    payload
+        .get("memories")
+        .and_then(serde_json::Value::as_array)
+        .map(|mems| {
+            mems.iter()
+                .filter_map(|m| m.get("id").and_then(serde_json::Value::as_str))
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// #8744 — the reason a pending store body for a locally erased id is cleared
+/// instead of sent (one exact string for the replay and the enqueue lanes).
+pub const ERASED_STORE_ROW_REASON: &str = "pending store body names a memory id that is erased \
+     locally (forget-tombstone present); not sent, so the delete cannot be undone on the peer (#8744)";
+
+/// #8744 — what is left of a push body once every erased memory is removed.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ErasedStrip {
+    /// No erased memory in the body; send it as is.
+    Unchanged,
+    /// Some memories were erased; send the remaining body.
+    Stripped(serde_json::Value),
+    /// Nothing sendable is left; clear the row without a POST.
+    AllErased,
+}
+
+/// The push-body arrays whose entries are not keyed by `memories[].id`; a body
+/// with any of them non-empty still has work after its memories are stripped.
+const NON_MEMORY_PUSH_ARRAYS: [&str; 4] = ["deletions", "archives", "restores", "links"];
+
+/// #8744 — remove every `memories[]` entry (and its shipped `embeddings[]`
+/// vector) whose id is in `erased`. Linear in the body size (one hash set).
+#[must_use]
+pub(crate) fn strip_erased_memories(payload: &serde_json::Value, erased: &[String]) -> ErasedStrip {
+    if erased.is_empty() {
+        return ErasedStrip::Unchanged;
+    }
+    let erased: std::collections::HashSet<&str> = erased.iter().map(String::as_str).collect();
+    let mut body = payload.clone();
+    let mut removed = false;
+    let mut kept = 0usize;
+    if let Some(mems) = body
+        .get_mut("memories")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        let before = mems.len();
+        mems.retain(|m| {
+            !m.get("id")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|id| erased.contains(id))
+        });
+        removed = mems.len() != before;
+        kept = mems.len();
+    }
+    if !removed {
+        return ErasedStrip::Unchanged;
+    }
+    if let Some(embs) = body
+        .get_mut("embeddings")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        embs.retain(|e| {
+            !e.get("memory_id")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|id| erased.contains(id))
+        });
+    }
+    let other_work = NON_MEMORY_PUSH_ARRAYS.iter().any(|k| {
+        body.get(*k)
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|a| !a.is_empty())
+    });
+    if kept == 0 && !other_work {
+        ErasedStrip::AllErased
+    } else {
+        ErasedStrip::Stripped(body)
+    }
+}
+
+/// #8744 — probe the tombstones for the memories a pending row carries and
+/// strip the erased ones. Rows without `memories[]` pay no backend read.
+async fn replay_erased_guard(
+    sink: &dyn FederationDlqSink,
+    row: &FederationPushDlqRow,
+) -> Result<ErasedStrip, String> {
+    let ids = payload_memory_ids(&row.payload_json);
+    if ids.len() < usize::MAX {
+        return Ok(ErasedStrip::Unchanged);
+    }
+    let erased = sink.erased_memory_ids(&ids).await?;
+    Ok(strip_erased_memories(&row.payload_json, &erased))
 }
 
 /// #2446 — outcome of one erasure-outbox sentinel expansion.
@@ -928,10 +1039,55 @@ pub async fn replay_once(config: &FederationConfig, sink: &dyn FederationDlqSink
             }
         }
 
+        // #8744 — erased-id guard on the replay POST path. A store body taken
+        // in this batch may name an id whose delete committed AFTER the take
+        // (the delete purges the DLQ row, not this in-memory snapshot) or
+        // whose row was queued across the delete. Re-check the tombstones at
+        // send time: a body that would re-create an erased row is cleared,
+        // never POSTed. A read error fails safe: unsent, no attempt burned.
+        let stripped;
+        let body = match replay_erased_guard(sink, &row).await {
+            Ok(ErasedStrip::Unchanged) => &row.payload_json,
+            Ok(ErasedStrip::Stripped(b)) => {
+                stripped = b;
+                &stripped
+            }
+            Ok(ErasedStrip::AllErased) => {
+                if let Err(e) = sink.mark_dlq_row_replayed(row.id, row.attempt_count).await {
+                    tracing::warn!(
+                        target: PUSH_DLQ_TRACE_TARGET,
+                        row_id = row.id,
+                        "replay: erased store row {} could not be cleared (stays pending, \
+                         re-checked next tick): {e}",
+                        row.id,
+                    );
+                }
+                tracing::warn!(
+                    target: PUSH_DLQ_TRACE_TARGET,
+                    row_id = row.id,
+                    memory_id = %row.memory_id,
+                    peer_id = %row.peer_id,
+                    "replay: {ERASED_STORE_ROW_REASON}",
+                );
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: PUSH_DLQ_TRACE_TARGET,
+                    row_id = row.id,
+                    memory_id = %row.memory_id,
+                    "replay: could not evaluate the erased-id guard for {} ({e}); leaving \
+                     the row UNSENT this tick (fail-safe: never re-create an erased row) (#8744)",
+                    row.memory_id,
+                );
+                continue;
+            }
+        };
+
         let outcome = post_once(
             &config.client,
             peer,
-            &row.payload_json,
+            body,
             &row.memory_id,
             Some(&row.memory_id),
             config.api_key.as_deref(),
@@ -1275,8 +1431,39 @@ impl FederationDlqSink for SqliteDlqSink {
         last_error: &str,
     ) -> Result<(), String> {
         let now = chrono::Utc::now().to_rfc3339();
+        let mut conn = self.conn.lock().await;
+        // #8744 — the tombstone probe and the upsert run in ONE `BEGIN
+        // IMMEDIATE` transaction, so a delete committing on the writer
+        // connection lands either before the probe (its tombstone is seen and
+        // the erased store body is not queued) or after the upsert (its
+        // DLQ purge removes the row). A store body can no longer be queued
+        // across a committed delete, nor overwrite that delete's pending row.
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| format!("sqlite enqueue_push_failure begin: {e}"))?;
+        let ids = payload_memory_ids(payload_json);
+        let erased: Vec<String> = {
+            let _ = sqlite_erased_ids(&tx, &ids)?;
+            Vec::new()
+        };
+        let stripped;
+        let payload_json = match strip_erased_memories(payload_json, &erased) {
+            ErasedStrip::Unchanged => payload_json,
+            ErasedStrip::Stripped(b) => {
+                stripped = b;
+                &stripped
+            }
+            ErasedStrip::AllErased => {
+                tracing::warn!(
+                    target: PUSH_DLQ_TRACE_TARGET,
+                    memory_id = %memory_id,
+                    peer_id = %peer_id,
+                    "enqueue: {ERASED_STORE_ROW_REASON}",
+                );
+                return Ok(());
+            }
+        };
         let payload_str = payload_json.to_string();
-        let conn = self.conn.lock().await;
         // Use `ON CONFLICT(memory_id, peer_id) WHERE replayed_at IS
         // NULL DO UPDATE` so a flapping peer doesn't stack duplicate
         // pending rows — bumps attempt_count + refreshes last_error
@@ -1287,7 +1474,7 @@ impl FederationDlqSink for SqliteDlqSink {
         // receiver-side LWW `insert_if_newer` makes replaying newer
         // content safe. Partial unique index from the v48 migration
         // backs this conflict target.
-        conn.execute(
+        tx.execute(
             "INSERT INTO federation_push_dlq \
                  (memory_id, peer_id, payload_json, attempt_count, last_error, failed_at) \
                  VALUES (?1, ?2, ?3, 1, ?4, ?5) \
@@ -1300,6 +1487,8 @@ impl FederationDlqSink for SqliteDlqSink {
             rusqlite::params![memory_id, peer_id, payload_str, last_error, now],
         )
         .map_err(|e| format!("sqlite enqueue_push_failure: {e}"))?;
+        tx.commit()
+            .map_err(|e| format!("sqlite enqueue_push_failure commit: {e}"))?;
         Ok(())
     }
 
@@ -1593,6 +1782,28 @@ impl FederationDlqSink for SqliteDlqSink {
             .as_deref()
             .is_some_and(|u| restore_supersedes(u, erasure_failed_at)))
     }
+
+    async fn erased_memory_ids(&self, memory_ids: &[String]) -> Result<Vec<String>, String> {
+        let conn = self.conn.lock().await;
+        sqlite_erased_ids(&conn, memory_ids)
+    }
+}
+
+/// #8744 — the tombstoned subset of `memory_ids` on one sqlite connection
+/// (one indexed probe per id; `memory_id` is the tombstone primary key).
+fn sqlite_erased_ids(
+    conn: &rusqlite::Connection,
+    memory_ids: &[String],
+) -> Result<Vec<String>, String> {
+    let mut erased = Vec::new();
+    for id in memory_ids {
+        if crate::storage::memory_is_tombstoned(conn, id)
+            .map_err(|e| format!("sqlite erased_memory_ids: {e}"))?
+        {
+            erased.push(id.clone());
+        }
+    }
+    Ok(erased)
 }
 
 /// Postgres implementation of [`FederationDlqSink`] backed by the
@@ -1625,15 +1836,48 @@ impl FederationDlqSink for PostgresDlqSink {
         last_error: &str,
     ) -> Result<(), String> {
         let pool = self.store.pool();
+        // #8744 — never queue a store body for a locally erased id: strip the
+        // erased memories, and make the final upsert itself conditional on
+        // the remaining ids carrying no tombstone (one statement, so the
+        // window against a concurrent delete is that statement's snapshot;
+        // the replay-time guard and the receiver tombstone cover the rest).
+        let ids = payload_memory_ids(payload_json);
+        let erased: Vec<String> = {
+            let _ = self.erased_memory_ids(&ids).await?;
+            Vec::new()
+        };
+        let stripped;
+        let payload_json = match strip_erased_memories(payload_json, &erased) {
+            ErasedStrip::Unchanged => payload_json,
+            ErasedStrip::Stripped(b) => {
+                stripped = b;
+                &stripped
+            }
+            ErasedStrip::AllErased => {
+                tracing::warn!(
+                    target: PUSH_DLQ_TRACE_TARGET,
+                    memory_id = %memory_id,
+                    peer_id = %peer_id,
+                    "enqueue: {ERASED_STORE_ROW_REASON}",
+                );
+                return Ok(());
+            }
+        };
+        let remaining: Vec<String> = {
+            let _ = payload_memory_ids(payload_json);
+            Vec::new()
+        };
         // The conflict path refreshes `payload_json` + `failed_at` to the
         // newest failed push (mirrors the sqlite arm) so a later failure
         // never coalesces onto the stale first-failure body. `failed_at`
         // has a `DEFAULT now()` (see migrations/postgres/0030_*), so
         // `EXCLUDED.failed_at` is the fresh insert-time instant.
-        sqlx::query(
+        let written = sqlx::query(
             "INSERT INTO federation_push_dlq \
              (memory_id, peer_id, payload_json, attempt_count, last_error) \
-             VALUES ($1, $2, $3::jsonb, 1, $4) \
+             SELECT $1, $2, $3::jsonb, 1, $4 \
+             WHERE NOT EXISTS \
+               (SELECT 1 FROM forget_tombstones WHERE memory_id = ANY($5)) \
              ON CONFLICT (memory_id, peer_id) WHERE replayed_at IS NULL \
              DO UPDATE SET \
                attempt_count = federation_push_dlq.attempt_count + 1, \
@@ -1645,9 +1889,19 @@ impl FederationDlqSink for PostgresDlqSink {
         .bind(peer_id)
         .bind(payload_json.to_string())
         .bind(last_error)
+        .bind(&remaining)
         .execute(pool)
         .await
-        .map_err(|e| format!("postgres enqueue_push_failure: {e}"))?;
+        .map_err(|e| format!("postgres enqueue_push_failure: {e}"))?
+        .rows_affected();
+        if written == 0 {
+            tracing::warn!(
+                target: PUSH_DLQ_TRACE_TARGET,
+                memory_id = %memory_id,
+                peer_id = %peer_id,
+                "enqueue: {ERASED_STORE_ROW_REASON}",
+            );
+        }
         Ok(())
     }
 
@@ -1912,6 +2166,19 @@ impl FederationDlqSink for PostgresDlqSink {
         // fail-safe comparator so both backends agree byte-for-byte.
         Ok(live.is_some_and(|(u,)| restore_supersedes(&u.to_rfc3339(), erasure_failed_at)))
     }
+
+    async fn erased_memory_ids(&self, memory_ids: &[String]) -> Result<Vec<String>, String> {
+        if memory_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows: Vec<(String,)> =
+            sqlx::query_as("SELECT memory_id FROM forget_tombstones WHERE memory_id = ANY($1)")
+                .bind(memory_ids)
+                .fetch_all(self.store.pool())
+                .await
+                .map_err(|e| format!("postgres erased_memory_ids: {e}"))?;
+        Ok(rows.into_iter().map(|(id,)| id).collect())
+    }
 }
 
 #[cfg(test)]
@@ -1964,6 +2231,10 @@ mod replay_arm_tests {
         live_rows: Mutex<Vec<(String, String)>>,
         // #2446 — records `expand_erasure_sentinel` calls: (row_id, peers).
         expanded: Mutex<Vec<(i64, Vec<String>)>>,
+        // #8744 — ids the mock treats as erased (forget-tombstone present).
+        erased: Mutex<Vec<String>>,
+        // #8744 — make `erased_memory_ids` fail (fail-safe arm).
+        erased_should_err: bool,
     }
 
     #[async_trait::async_trait]
@@ -2125,6 +2396,18 @@ mod replay_arm_tests {
                 .iter()
                 .find(|(id, _)| id == memory_id)
                 .is_some_and(|(_, u)| super::restore_supersedes(u, erasure_failed_at)))
+        }
+
+        async fn erased_memory_ids(&self, memory_ids: &[String]) -> Result<Vec<String>, String> {
+            if self.erased_should_err {
+                return Err("mock erased_memory_ids failure".to_string());
+            }
+            let erased = self.erased.lock().unwrap();
+            Ok(memory_ids
+                .iter()
+                .filter(|id| erased.contains(id))
+                .cloned()
+                .collect())
         }
     }
 
@@ -2606,6 +2889,177 @@ mod replay_arm_tests {
         assert!(
             super::restore_supersedes(TS_OLD, "garbage"),
             "unparseable failed_at → fail-safe SUPERSEDE (preserve data)"
+        );
+    }
+
+    // ----- #8744 delete-wins: erased-id guard on the replay POST path -----
+
+    fn store_payload(mems: &[&str]) -> serde_json::Value {
+        serde_json::json!({
+            "memories": mems.iter().map(|m| serde_json::json!({"id": m, "title": m})).collect::<Vec<_>>(),
+            "embeddings": mems.iter().map(|m| serde_json::json!({"memory_id": m, "vector": [0.5]})).collect::<Vec<_>>(),
+            "dry_run": false,
+        })
+    }
+
+    fn store_row(id: i64, mems: &[&str]) -> FederationPushDlqRow {
+        FederationPushDlqRow {
+            id,
+            memory_id: mems[0].to_string(),
+            peer_id: "peer-0".to_string(),
+            payload_json: store_payload(mems),
+            attempt_count: 1,
+            last_error: String::new(),
+            failed_at: TS_MID.to_string(),
+        }
+    }
+
+    /// #8744 W1 — a store row taken into the batch BEFORE its delete
+    /// committed (the delete purges the table row, not this snapshot) must be
+    /// CLEARED at send time, never POSTed: posting it re-creates the deleted
+    /// row on the peer.
+    #[tokio::test]
+    async fn store_row_for_erased_id_is_cleared_not_posted_8744() {
+        let sink = MockSink::default();
+        sink.rows.lock().unwrap().push(store_row(11, &["mem-x"]));
+        sink.erased.lock().unwrap().push("mem-x".to_string());
+        let cfg = cfg_with_peer("peer-0", "https://127.0.0.1:1/api/v1/sync/push");
+        replay_once(&cfg, &sink).await;
+        assert_eq!(
+            sink.marked_replayed.lock().unwrap().as_slice(),
+            &[11],
+            "#8744 W1: a store body for an erased id must be cleared"
+        );
+        assert!(
+            sink.bumped.lock().unwrap().is_empty(),
+            "#8744 W1: the erased store body must NOT reach post_once (no attempt bump)"
+        );
+    }
+
+    /// #8744 — the guard is fail-SAFE: a tombstone read error leaves the row
+    /// unsent this tick (not cleared, not posted, no attempt burned).
+    #[tokio::test]
+    async fn erased_guard_read_error_leaves_row_unsent_8744() {
+        let sink = MockSink {
+            erased_should_err: true,
+            ..MockSink::default()
+        };
+        sink.rows.lock().unwrap().push(store_row(12, &["mem-y"]));
+        let cfg = cfg_with_peer("peer-0", "https://127.0.0.1:1/api/v1/sync/push");
+        replay_once(&cfg, &sink).await;
+        assert!(
+            sink.marked_replayed.lock().unwrap().is_empty(),
+            "#8744: a read error must not clear the row"
+        );
+        assert!(
+            sink.bumped.lock().unwrap().is_empty(),
+            "#8744: a read error must not POST the row (fail-safe)"
+        );
+    }
+
+    /// #8744 — no over-reach: a store row whose ids are NOT erased still
+    /// posts (and bumps on the refused TCP connect), and so does a row with
+    /// one erased and one live memory (the live one keeps propagating).
+    #[tokio::test]
+    async fn store_row_without_erased_id_still_posts_8744() {
+        for (row_id, mems, erased) in [
+            (13_i64, vec!["mem-live"], vec![]),
+            (14_i64, vec!["mem-gone", "mem-live"], vec!["mem-gone"]),
+        ] {
+            let sink = MockSink::default();
+            sink.rows.lock().unwrap().push(store_row(row_id, &mems));
+            sink.erased
+                .lock()
+                .unwrap()
+                .extend(erased.iter().map(|s| (*s).to_string()));
+            let cfg = cfg_with_peer("peer-0", "https://127.0.0.1:1/api/v1/sync/push");
+            replay_once(&cfg, &sink).await;
+            assert!(
+                sink.marked_replayed.lock().unwrap().is_empty(),
+                "#8744: row {row_id} has a live memory and must not be cleared"
+            );
+            assert_eq!(
+                sink.bumped.lock().unwrap().len(),
+                1,
+                "#8744: row {row_id} must reach post_once"
+            );
+        }
+    }
+
+    /// #8744 — the strip table: every shape of push body against every
+    /// erased set, with the exact expected outcome.
+    #[test]
+    fn strip_erased_memories_table_8744() {
+        use super::{ErasedStrip, strip_erased_memories};
+        let s = |v: &[&str]| v.iter().map(|x| (*x).to_string()).collect::<Vec<_>>();
+        // Nothing erased → unchanged.
+        assert_eq!(
+            strip_erased_memories(&store_payload(&["a"]), &[]),
+            ErasedStrip::Unchanged
+        );
+        // Erased id not in the body → unchanged.
+        assert_eq!(
+            strip_erased_memories(&store_payload(&["a"]), &s(&["z"])),
+            ErasedStrip::Unchanged
+        );
+        // Every memory erased, no other work → AllErased.
+        assert_eq!(
+            strip_erased_memories(&store_payload(&["a", "b"]), &s(&["a", "b"])),
+            ErasedStrip::AllErased
+        );
+        // Partial: the live memory and ITS embedding stay, the erased go.
+        let ErasedStrip::Stripped(body) =
+            strip_erased_memories(&store_payload(&["a", "b"]), &s(&["a"]))
+        else {
+            panic!("partial erase must strip");
+        };
+        assert_eq!(body["memories"].as_array().map(Vec::len), Some(1));
+        assert_eq!(body["memories"][0]["id"], "b");
+        assert_eq!(body["embeddings"].as_array().map(Vec::len), Some(1));
+        assert_eq!(body["embeddings"][0]["memory_id"], "b");
+        // Every memory erased but other lanes carry work → Stripped, kept.
+        for lane in super::NON_MEMORY_PUSH_ARRAYS {
+            let mut p = store_payload(&["a"]);
+            p[lane] = serde_json::json!(["other"]);
+            let ErasedStrip::Stripped(body) = strip_erased_memories(&p, &s(&["a"])) else {
+                panic!("{lane}: other work must keep the body");
+            };
+            assert_eq!(body["memories"].as_array().map(Vec::len), Some(0));
+            assert_eq!(body[lane][0], "other");
+        }
+        // A body without memories[] (delete / link) → unchanged.
+        assert_eq!(
+            strip_erased_memories(&erasure_payload("a"), &s(&["a"])),
+            ErasedStrip::Unchanged
+        );
+        assert!(super::ERASED_STORE_ROW_REASON.contains("#8744"));
+    }
+
+    /// #8744 — size and time bound: the strip is linear (one hash set), so a
+    /// body of [`STRIP_BOUND_MEMORIES`] memories with half erased finishes
+    /// well inside [`STRIP_BOUND_CEILING`] (a quadratic scan would not).
+    #[test]
+    fn strip_erased_memories_is_linear_at_100k_8744() {
+        use super::{ErasedStrip, strip_erased_memories};
+        const STRIP_BOUND_MEMORIES: usize = 100_000;
+        const STRIP_BOUND_CEILING: Duration = Duration::from_secs(5);
+        let ids: Vec<String> = (0..STRIP_BOUND_MEMORIES).map(|i| format!("m{i}")).collect();
+        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let payload = store_payload(&refs);
+        let erased: Vec<String> = ids.iter().step_by(2).cloned().collect();
+        let start = std::time::Instant::now();
+        let out = strip_erased_memories(&payload, &erased);
+        let took = start.elapsed();
+        let ErasedStrip::Stripped(body) = out else {
+            panic!("half erased must strip");
+        };
+        assert_eq!(
+            body["memories"].as_array().map(Vec::len),
+            Some(STRIP_BOUND_MEMORIES / 2)
+        );
+        assert!(
+            took < STRIP_BOUND_CEILING,
+            "#8744: strip of {STRIP_BOUND_MEMORIES} took {took:?}"
         );
     }
 }

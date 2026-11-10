@@ -401,6 +401,11 @@ impl FederationDlqSink for RecordingDlqSink {
     ) -> Result<bool, String> {
         Ok(false)
     }
+
+    // #8744 — no id is erased in this harness.
+    async fn erased_memory_ids(&self, _memory_ids: &[String]) -> Result<Vec<String>, String> {
+        Ok(Vec::new())
+    }
 }
 
 // ---------------------------------------------------------------------------

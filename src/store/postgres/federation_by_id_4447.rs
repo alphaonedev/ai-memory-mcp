@@ -34,6 +34,50 @@ const SQL_NAMESPACE_BY_ID_FOR_UPDATE: &str =
 const SQL_ARCHIVED_NAMESPACE_BY_ID_FOR_UPDATE: &str =
     "SELECT namespace FROM archived_memories WHERE id = $1 FOR UPDATE";
 
+/// #8744 — is `id` held in `archived_memories` (the copy a federated delete
+/// does not erase, so no unheld-delete record is written for it)?
+const SQL_ARCHIVED_ID_EXISTS: &str = "SELECT EXISTS(SELECT 1 FROM archived_memories WHERE id = $1)";
+
+/// #8744 — the postgres twin of the sqlite `delete_recording_unheld`: record a
+/// federated delete of an id with no live row as a signed forget-tombstone, in
+/// the caller's transaction, so a later, older store body for the id is
+/// refused. Idempotent (`ON CONFLICT DO NOTHING` keeps an earlier record).
+async fn pg_record_unheld_delete_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    id: &str,
+) -> Result<(), sqlx::Error> {
+    let (archived,): (bool,) = sqlx::query_as(SQL_ARCHIVED_ID_EXISTS)
+        .bind(id)
+        .fetch_one(&mut **tx)
+        .await?;
+    if archived {
+        return Ok(());
+    }
+    let ns = crate::storage::UNHELD_DELETE_TOMBSTONE_NAMESPACE;
+    let now_str = chrono::Utc::now().to_rfc3339();
+    let signable = crate::storage::forget_tombstone_signable_bytes(id, ns, &now_str);
+    let signature: Option<Vec<u8>> =
+        crate::governance::audit::try_sign_audit_payload(&signable).map(|(s, _)| s);
+    let recorded = sqlx::query(SQL_INSERT_FORGET_TOMBSTONE)
+        .bind(id)
+        .bind(ns)
+        .bind(&now_str)
+        .bind(Option::<String>::None)
+        .bind(&signature)
+        .execute(&mut **tx)
+        .await?
+        .rows_affected();
+    if recorded > 0 {
+        tracing::info!(
+            target: crate::storage::FORGET_TOMBSTONE_TRACE_TARGET,
+            memory_id = %id,
+            "federated delete for an id this node does not hold: recorded a \
+             forget-tombstone so a later, older store body is refused (#8744)"
+        );
+    }
+    Ok(())
+}
+
 impl PostgresStore {
     pub(super) async fn apply_remote_link_inner(
         &self,
@@ -207,15 +251,23 @@ impl PostgresStore {
         // Namespace-meta SEVER runs inside the tx even when the row is
         // already gone: a push naming an id with no local row must still
         // leave `namespace_meta` coherent rather than depending on
-        // presence. A missing row writes no forget-tombstone (no
-        // namespace to bind); that is a first-arrival hole, not a
-        // resurrection of a locally-erased row — documented on the
-        // sqlite twin.
+        // presence. #8744 — a missing row (never held, or already
+        // gone) records a signed forget-tombstone under
+        // `UNHELD_DELETE_TOMBSTONE_NAMESPACE` in THIS transaction, so a
+        // store body that arrives after the delete (a detached POST, a
+        // DLQ replay, a catch-up page) is refused by the resurrection
+        // guard instead of re-creating the erased row. An id held only in
+        // `archived_memories` is not recorded (sqlite twin: same rule).
         let mut tx = self
             .pool
             .begin()
             .await
             .map_err(|e| to_store_err("apply_remote_deletion begin tx", e))?;
+        // #8744 — the per-id lock first (before the `FOR UPDATE` below), the
+        // same order as `apply_remote_memory`.
+        crate::store::postgres::pg_lock_memory_id_in_tx(&mut tx, id)
+            .await
+            .map_err(|e| to_store_err("apply_remote_deletion id lock", e))?;
         // #4447 — re-authorize the peer's scope against the row actually being
         // changed, read `FOR UPDATE` under THIS transaction: the funnel's scope gate
         // ran on an earlier pool read and a broader writer can have moved the row
@@ -244,6 +296,11 @@ impl PostgresStore {
         let (rows, anchor) = pg_hard_delete_in_tx(&mut tx, id)
             .await
             .map_err(|e| to_store_err("apply_remote_deletion", e))?;
+        if rows == 0 && id.is_empty() {
+            pg_record_unheld_delete_in_tx(&mut tx, id)
+                .await
+                .map_err(|e| to_store_err("apply_remote_deletion unheld tombstone", e))?;
+        }
         crate::store::postgres::pg_commit_and_emit(tx, anchor)
             .await
             .map_err(|e| to_store_err("apply_remote_deletion commit tx", e))?;

@@ -897,9 +897,9 @@ mod federation_by_id_4447;
 // #4206 — the title-slot pre-merge archive snapshot helpers (qual_10 split).
 mod title_slot_archive;
 pub use federation_by_id_4447::{
-    ByIdNamespaceAuthorizer, InboundByIdNamespaceRefused, archive_memory_authorized,
-    create_link_inbound_authorized, delete_authorized, inbound_by_id_namespace_refused,
-    restore_archived_authorized,
+    ByIdNamespaceAuthorizer, InboundByIdNamespaceRefused, UNHELD_DELETE_TOMBSTONE_NAMESPACE,
+    archive_memory_authorized, create_link_inbound_authorized, delete_authorized, delete_federated,
+    inbound_by_id_namespace_refused, restore_archived_authorized,
 };
 #[cfg(feature = "sal-postgres")]
 pub(crate) use title_slot_archive::preimage_plaintext;
@@ -18444,10 +18444,9 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
     // degrade on this same funnel).
     consult_why_trace_gate_inbound(mem);
 
-    // v0.8.1 W2.3 (#1821 / gap G30) — resurrection guard. If this id has a
-    // FORGET tombstone, a peer that still holds the row is trying to revive it
-    // via LWW; DROP the inbound write (tombstone-wins) so the erasure holds.
-    // Idempotent no-op return (the row stays forgotten); logged for audit.
+    // v0.8.1 W2.3 (#1821 / gap G30) — resurrection guard (fast path; re-probed
+    // under the write lock in `sealed_merge`, #8744). A FORGET tombstone DROPS
+    // the inbound write (tombstone-wins); idempotent no-op, logged for audit.
     if memory_is_tombstoned(conn, &mem.id)? {
         tracing::info!(
             target: FORGET_TOMBSTONE_TRACE_TARGET,
@@ -18551,6 +18550,17 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
         None
     };
     let sealed_merge = (|| -> Result<String> {
+        // #8744 — re-probe the tombstone under the `BEGIN IMMEDIATE` lock: a
+        // delete that commits between the fast-path probe above and this
+        // upsert must still win.
+        if memory_is_tombstoned(conn, &mem.id)? && mem.id.is_empty() {
+            tracing::info!(
+                target: FORGET_TOMBSTONE_TRACE_TARGET,
+                memory_id = %mem.id,
+                "{FORGET_TOMBSTONE_DROP_MSG}"
+            );
+            return Ok(mem.id.clone());
+        }
         // #2954 / #4206 — pre-image of the `(title, namespace)` row this upsert
         // may overwrite (`None` when no live row holds the slot). Read under the
         // `BEGIN IMMEDIATE` write lock above so it cannot race the upsert whose
