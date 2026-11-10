@@ -123,7 +123,9 @@ and non-regular destinations are refused. Slashes in namespace and entity
 names become underscores; empty names and the components `.` and `..` are
 refused. These exports are unsupported on platforms without Unix permissions.
 
-Existing export roots and namespace directories must already have mode 0700.
+Existing export roots and namespace directories must already have permission
+bits 0700 (owner only; a setgid bit inherited from the parent directory is
+accepted, as are sticky and setuid bits, which are ignored).
 The exporter never changes their permissions or those of existing ancestors.
 For an older 0755 export tree, choose a new private root or explicitly repair
 the owned export directories before retrying. Refusal does not repair files

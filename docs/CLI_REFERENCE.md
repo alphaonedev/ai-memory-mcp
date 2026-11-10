@@ -1441,7 +1441,9 @@ Walks the reflection-chain and writes Markdown to
 
 Unix exports create current-user-owned mode 0700 roots and namespace directories
 and atomically publish mode 0600 files. Existing managed directories must already
-have mode 0700: choose a new private `--out-dir` or explicitly repair the owned
+have permission bits 0700 (owner only; a setgid bit inherited from the parent
+directory is accepted, as are sticky and setuid bits, which are ignored): choose
+a new private `--out-dir` or explicitly repair the owned
 export directories before retrying. Existing ancestors are never chmodded.
 Symlink directories and symlink/non-regular destinations are refused; platforms
 without Unix permissions refuse filesystem exports. See
