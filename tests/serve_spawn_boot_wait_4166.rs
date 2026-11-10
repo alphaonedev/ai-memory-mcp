@@ -69,6 +69,12 @@ const SLEEP_CALL: &str = "sleep(";
 /// Tokens of a probe inside a loop whose URL was built above it.
 const PROBE_TOKENS: [&str; 6] = ["curl", "reqwest", "client", "url", "TcpStream", "health"];
 
+/// Closure-parameter types that mark a wait helper whose probe is passed in.
+const PROBE_CLOSURE_PARAMS: [&str; 2] = ["FnMut() -> bool", "Fn() -> bool"];
+
+/// How many lines below `fn` the signature is searched for a probe closure.
+const PROBE_PARAM_HEADER_LINES: usize = 6;
+
 /// This guard's own source quotes every pattern it looks for.
 const SELF_FILE: &str = "serve_spawn_boot_wait_4166.rs";
 
@@ -339,6 +345,11 @@ struct Model {
     /// Functions that build the binary's command, directly or through another
     /// such function: `(name, sets_knob)`.
     ctors: Vec<(String, bool)>,
+    /// Names of the functions that build the binary's command themselves (a
+    /// method such as `Sandbox::base_command` is called as `sb.base_command()`,
+    /// so these also match as method calls; a function that only wraps one
+    /// matches as a free call).
+    direct: Vec<String>,
 }
 
 impl Model {
@@ -378,7 +389,18 @@ impl Model {
             }
             ctors = next;
         }
-        Self { lines, fns, ctors }
+        let direct = fns
+            .iter()
+            .zip(&bodies)
+            .filter(|(f, body)| builds_binary_command(body) || f.returns_command)
+            .map(|(f, _)| f.name.clone())
+            .collect();
+        Self {
+            lines,
+            fns,
+            ctors,
+            direct,
+        }
     }
 
     /// `Some(Wait)` when the text calls a command helper of this file whose body
@@ -388,7 +410,8 @@ impl Model {
         self.fns
             .iter()
             .filter(|f| {
-                self.ctors.iter().any(|(n, _)| *n == f.name) && has_call(text, &f.name, false)
+                self.ctors.iter().any(|(n, _)| *n == f.name)
+                    && has_call(text, &f.name, self.method_call_ok(&f.name))
             })
             .any(|f| {
                 let body = range_text(&self.lines, f.start, f.end);
@@ -397,14 +420,33 @@ impl Model {
             .then_some(Terminal::Wait)
     }
 
+    /// A direct ctor also matches as a method call (`sb.base_command()`),
+    /// except under a name that std's `Command` / `Child` use for their own
+    /// methods, which would match every `cmd.spawn()` of the file.
+    fn method_call_ok(&self, name: &str) -> bool {
+        const STD_COMMAND_METHODS: [&str; 8] = [
+            "spawn",
+            "output",
+            "status",
+            "assert",
+            "args",
+            "arg",
+            "env",
+            "current_dir",
+        ];
+        self.direct.iter().any(|d| d == name) && !STD_COMMAND_METHODS.contains(&name)
+    }
+
     fn calls_ctor(&self, text: &str) -> bool {
-        self.ctors.iter().any(|(n, _)| has_call(text, n, false))
+        self.ctors
+            .iter()
+            .any(|(n, _)| has_call(text, n, self.method_call_ok(n)))
     }
 
     fn calls_knob_ctor(&self, text: &str) -> bool {
         self.ctors
             .iter()
-            .any(|(n, k)| *k && has_call(text, n, false))
+            .any(|(n, k)| *k && has_call(text, n, self.method_call_ok(n)))
     }
 
     /// Whether the line starts a command for the binary (or any program).
@@ -580,8 +622,24 @@ fn loops(m: &Model) -> Vec<LoopInfo> {
             .find(|f| f.start <= i && i <= f.end)
             .is_some_and(|f| range_text(&m.lines, f.start, i).contains(HEALTH_LITERAL))
             && PROBE_TOKENS.iter().any(|t| text.contains(t));
+        // A wait helper that takes its probe as a closure (`impl FnMut() -> bool`)
+        // names no `/health` itself; its callers do.
+        let probe_param = m
+            .fns
+            .iter()
+            .rev()
+            .find(|f| f.start <= i && i <= f.end)
+            .is_some_and(|f| {
+                let header = range_text(
+                    &m.lines,
+                    f.start,
+                    (f.start + PROBE_PARAM_HEADER_LINES).min(i),
+                );
+                PROBE_CLOSURE_PARAMS.iter().any(|p| header.contains(p))
+            });
         let probes_health = (text.contains(HEALTH_LITERAL)
             || url_built_above
+            || probe_param
             || health_fns.iter().any(|f| has_call(&text, f, true)))
             && text.contains(SLEEP_CALL);
         let exit_aware =
@@ -852,7 +910,7 @@ fn guard_accepts_the_helper_or_either_knob_literal_4166() {
         "    common::serve_test_env(&mut cmd);\n    cmd\n}",
     );
     assert!(with_helper.contains("serve_test_env("));
-    assert!(spawns_without_knob(&with_helper).is_empty());
+    assert_eq!(spawns_without_knob(&with_helper), []);
 }
 
 #[test]
@@ -871,10 +929,10 @@ fn guard_ignores_a_knob_or_helper_that_is_only_in_a_comment_4166() {
 fn guard_skips_files_that_never_spawn_serve_4166() {
     // Spawns the binary but never with a serve argument.
     let other_verb = SPAWN_WITHOUT_KNOB.replace("\"serve\"", "\"doctor\"");
-    assert!(spawns_without_knob(&other_verb).is_empty());
+    assert_eq!(spawns_without_knob(&other_verb), []);
     // Names serve but never spawns a command (a string or a table only).
     let no_spawn = "fn t() {\n    assert!(REASON.contains(\"serve\"));\n}\n";
-    assert!(spawns_without_knob(no_spawn).is_empty());
+    assert_eq!(spawns_without_knob(no_spawn), []);
 }
 
 /// M1: one knob elsewhere in the file must not pass a spawn that has none.
@@ -927,7 +985,7 @@ fn boot(bin: &str) {
     );
     let builder_with_knob =
         builder_without_knob.replace("\"RUST_LOG\", \"error\"", "\"HF_HUB_OFFLINE\", \"1\"");
-    assert!(spawns_without_knob(&builder_with_knob).is_empty());
+    assert_eq!(spawns_without_knob(&builder_with_knob), []);
     // A builder that reaches the knob through another builder is covered.
     let chained = r#"
 fn base(root: &Path) -> Command {
@@ -942,7 +1000,7 @@ fn boot(root: &Path) {
     let child = command(root).args(["serve"]).spawn().unwrap();
 }
 "#;
-    assert!(spawns_without_knob(chained).is_empty());
+    assert_eq!(spawns_without_knob(chained), []);
     let chained_bare = chained.replace("    common::serve_test_env(&mut c);\n", "");
     assert_eq!(
         spawns_without_knob(&chained_bare),
@@ -960,7 +1018,7 @@ fn boot() {
     let child = cmd.spawn().unwrap();
 }
 "#;
-    assert!(spawns_without_knob(built_earlier).is_empty());
+    assert_eq!(spawns_without_knob(built_earlier), []);
     let built_earlier_bare = built_earlier.replace("    common::serve_test_env(&mut cmd);\n", "");
     assert_eq!(
         spawns_without_knob(&built_earlier_bare),
@@ -982,7 +1040,7 @@ fn boot(bin: &str) {
     let child = cmd(bin).args(&args).spawn().unwrap();
 }
 "#;
-    assert!(spawns_without_knob(vec_form).is_empty());
+    assert_eq!(spawns_without_knob(vec_form), []);
     let raw = vec_form.replace("cmd(bin).args", "Command::new(bin).args");
     assert_eq!(spawns_without_knob(&raw), vec![line_of(&raw, "\"serve\"")]);
 }
@@ -1009,12 +1067,12 @@ pub fn spawn_any(args: &[&str]) -> Child {
         "    let mut cmd = Command::new(env!(\"CARGO_BIN_EXE_ai-memory\"));\n    super::serve_test_env(&mut cmd);\n    cmd.args(args)",
     );
     assert!(helper_spawner.contains("serve_test_env("));
-    assert!(common_spawners_without_knob(&helper_spawner).is_empty());
+    assert_eq!(common_spawners_without_knob(&helper_spawner), []);
     let knob_spawner = bare_spawner.replace(
         ".args(args)",
         ".env(\"AI_MEMORY_EMBED_OFFLINE\", \"1\")\n        .args(args)",
     );
-    assert!(common_spawners_without_knob(&knob_spawner).is_empty());
+    assert_eq!(common_spawners_without_knob(&knob_spawner), []);
     // A wrapper over a bare spawner is itself a bare spawner.
     let wrapper = format!(
         "{bare_spawner}\npub fn spawn_serve(db: &Path) -> Child {{\n    spawn_any(&[\"serve\"])\n}}\n"
@@ -1106,17 +1164,17 @@ fn guard_accepts_a_boot_wait_that_checks_child_exit_4166() {
         "        if curl(",
         "        if let Ok(Some(status)) = child.try_wait() {\n            panic!(\"exited {status}\");\n        }\n        if curl(",
     );
-    assert!(waits_without_exit_check(&counted).is_empty());
+    assert_eq!(waits_without_exit_check(&counted), []);
     let deadline = DEADLINE_WAIT.replace(
         "        if Instant::now() >= deadline {",
         "        if child.try_wait().unwrap().is_some() {\n            panic!(\"exited\");\n        }\n        if Instant::now() >= deadline {",
     );
-    assert!(waits_without_exit_check(&deadline).is_empty());
+    assert_eq!(waits_without_exit_check(&deadline), []);
     let helper = HELPER_WAIT.replace(
         "        if probe(port) {",
         "        if exited(&mut child) {\n            panic!(\"exited\");\n        }\n        if probe(port) {",
     ) + "fn exited(c: &mut Child) -> bool {\n    c.try_wait().is_ok_and(|s| s.is_some())\n}\n";
-    assert!(waits_without_exit_check(&helper).is_empty());
+    assert_eq!(waits_without_exit_check(&helper), []);
     // A comment that mentions try_wait is not an exit check.
     let commented = COUNTED_WAIT.replace(
         "        if curl(",
@@ -1132,16 +1190,16 @@ fn guard_accepts_a_boot_wait_that_checks_child_exit_4166() {
 fn guard_leaves_waits_outside_serve_files_and_non_waits_alone_4166() {
     // No serve spawn in the file: not this guard's class.
     let no_serve = COUNTED_WAIT.replace("\"serve\"", "\"doctor\"");
-    assert!(waits_without_exit_check(&no_serve).is_empty());
+    assert_eq!(waits_without_exit_check(&no_serve), []);
     // A loop that reads /health without sleeping is a measurement, not a wait.
     let measurement = COUNTED_WAIT.replace(
         "        std::thread::sleep(Duration::from_millis(100));\n",
         "",
     );
-    assert!(waits_without_exit_check(&measurement).is_empty());
+    assert_eq!(waits_without_exit_check(&measurement), []);
     // A sleeping loop that never touches /health is a different wait.
     let other = COUNTED_WAIT.replace("/api/v1/health", "/api/v1/other");
-    assert!(waits_without_exit_check(&other).is_empty());
+    assert_eq!(waits_without_exit_check(&other), []);
 }
 
 // --- (d) bare deadline asserts -----------------------------------------------
@@ -1418,4 +1476,67 @@ fn boot_waits_found_by_the_guard_are_all_exit_aware_4166() {
         }
     }
     assert!(total >= 5, "only {total} boot waits found");
+}
+
+/// A wait helper whose probe is a closure: the helper names no `/health`, its
+/// callers do, so the loop is recognised by the `impl FnMut() -> bool` parameter.
+const CLOSURE_WAIT: &str = r#"
+fn boot() {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_ai-memory"));
+    common::serve_test_env(&mut cmd);
+    let mut child = cmd.args(["serve"]).spawn().unwrap();
+    wait_with(&mut child, || curl("https://127.0.0.1/api/v1/health"));
+}
+
+fn wait_with(child: &mut Child, mut healthy: impl FnMut() -> bool) {
+    for _ in 0..30 {
+        std::thread::sleep(Duration::from_millis(100));
+        if healthy() {
+            return;
+        }
+    }
+}
+"#;
+
+#[test]
+fn guard_flags_a_closure_probe_wait_without_a_child_exit_check_4166() {
+    assert_eq!(
+        waits_without_exit_check(CLOSURE_WAIT),
+        vec![line_of(CLOSURE_WAIT, "for _ in 0..30")]
+    );
+    let aware = CLOSURE_WAIT.replace(
+        "        if healthy() {",
+        "        if child.try_wait().is_ok_and(|s| s.is_some()) {\n            panic!(\"exited\");\n        }\n        if healthy() {",
+    );
+    assert_eq!(waits_without_exit_check(&aware), []);
+}
+
+/// A builder that is a method (`sb.base_command()`) is a spawn start too: the
+/// spawn through it is checked for the knob, and a knob in the builder body or
+/// at the call site passes it.
+const METHOD_BUILDER_SPAWN: &str = r#"
+impl Sandbox {
+    fn base_command(&self) -> Command {
+        Command::new(env!("CARGO_BIN_EXE_ai-memory"))
+    }
+}
+
+fn boot(sb: &Sandbox) {
+    let mut cmd = sb.base_command();
+    cmd.args(["serve"]);
+    let _child = cmd.spawn().unwrap();
+}
+"#;
+
+#[test]
+fn guard_sees_a_spawn_through_a_method_builder_4166() {
+    assert_eq!(
+        spawns_without_knob(METHOD_BUILDER_SPAWN),
+        vec![line_of(METHOD_BUILDER_SPAWN, "\"serve\"")]
+    );
+    let call_site = METHOD_BUILDER_SPAWN.replace(
+        "    cmd.args([\"serve\"]);",
+        "    common::serve_test_env(&mut cmd);\n    cmd.args([\"serve\"]);",
+    );
+    assert_eq!(spawns_without_knob(&call_site), []);
 }
