@@ -1,0 +1,17 @@
+/* audit-banner.css - styles for the GA audit block drawn by audit-banner.js (issue #8741). No inline styles anywhere. */
+.ab-host{margin:14px 0}
+.ab-box{border:1px solid #2a3344;border-radius:12px;padding:12px 14px;background:rgba(20,27,40,.72);color:#d7deea;font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:12px}
+.ab-head{display:flex;flex-wrap:wrap;gap:10px;align-items:baseline;margin-bottom:8px}
+.ab-title{font-size:14px;letter-spacing:.02em}
+.ab-sha,.ab-when,.ab-sec{color:#8d9bb3}
+.ab-link{color:#7fb4ff;text-decoration:none}
+.ab-link:hover{text-decoration:underline}
+.ab-counts,.ab-phases{display:flex;flex-wrap:wrap;gap:6px;margin:6px 0}
+.ab-chip,.ab-ph{padding:2px 8px;border-radius:999px;border:1px solid #2a3344}
+.ab-pass{color:#46d19a}.ab-fail{color:#ff6b6b}.ab-running{color:#6cb8ff}.ab-not_run{color:#8d9bb3}.ab-partial{color:#e6b450}
+.ab-none{color:#e6b450;margin:6px 0}
+.ab-rows{border-collapse:collapse;width:100%;margin-top:6px}
+.ab-rows td{padding:3px 8px;border-top:1px solid #1f2735;vertical-align:top}
+.ab-rows .ab-id{white-space:nowrap}
+.ab-more{color:#8d9bb3;margin-top:4px}
+@media(max-width:700px){.ab-rows td.ab-ph{display:none}}
