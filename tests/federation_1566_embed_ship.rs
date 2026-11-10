@@ -20,9 +20,10 @@
 //!    directly on the receiver with ZERO local embed calls.
 //! 3. **Dim-mismatch fallback** — a mismatched vector is ignored and
 //!    the row is embedded by the deferred background path instead.
-//! 4. **Ack-after-commit** — a receiver whose embedder is SLOW
-//!    (mock ollama with a per-call delay) still acks the push well
-//!    inside the deadline; the embeddings land in the background.
+//! 4. **Ack-after-commit** — a receiver whose embedder is HELD behind a
+//!    gate the test owns still acks the push (the ack is observed while
+//!    the embedder has completed zero calls, #8715); after the gate
+//!    opens the embeddings land in the background.
 //! 5. **Signature covers the vector** — the `embeddings` array rides
 //!    inside the Ed25519-signed body bytes, so tampering with one
 //!    vector element invalidates `X-Memory-Sig` (401).
@@ -40,13 +41,16 @@
 #![allow(clippy::cast_precision_loss)]
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
 use tempfile::TempDir;
-use tokio::sync::Mutex;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{Mutex, watch};
 use tower::ServiceExt as _;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -87,6 +91,146 @@ async fn mock_ollama_embed(dim: usize, fill: f32, delay: Duration) -> MockServer
         .mount(&server)
         .await;
     server
+}
+
+/// #8715 hang guard (NOT a performance assertion). Upper bound on how long
+/// the test waits for the `/sync/push` ack while the embedder is held behind
+/// the gate. A correct receiver acks in milliseconds; a receiver that awaits
+/// the embedder inline can never ack, because the gate is closed. Must stay
+/// below the 30 s per-request embed timeout in `src/llm.rs`
+/// (`GENERATE_TIMEOUT`), so an inline embed cannot "finish" by timing out
+/// before this guard fires. The result never depends on how fast the ack is.
+const ACK_HANG_GUARD: Duration = Duration::from_secs(20);
+
+/// #8715 second hang guard. Upper bound on how long the background embed has
+/// to converge once the gate is opened. Bounds a mock that never opens the
+/// gate (or a background path that never embeds) so it fails with its own
+/// message instead of hanging.
+const CONVERGENCE_BOUND: Duration = Duration::from_secs(15);
+
+/// Per-read buffer size for the gated mock's minimal HTTP/1.1 request reader.
+const GATED_READ_CHUNK_BYTES: usize = 4096;
+/// URL scheme prefix of the mock server; spelled through `concat!` so the
+/// count-assertion gate's comment stripper does not read the double slash as a
+/// line comment and swallow the assertions that follow.
+const MOCK_URL_PREFIX: &str = concat!("http:", "/", "/");
+
+/// A mock Ollama `/api/embed` endpoint the TEST owns the clock of (#8715).
+///
+/// Every embed request is parked on a gate until [`Self::open_gate`] is
+/// called; only then is the response written. `completed` counts responses
+/// answered (counted just before the response is written), so "the embedder
+/// has completed zero calls" is a state the test observes, not a duration it
+/// measures (same shape as the atomise gate of #8687 / PR #8694).
+struct GatedEmbedServer {
+    base_url: String,
+    gate: watch::Sender<bool>,
+    completed: Arc<AtomicUsize>,
+    accept_task: tokio::task::JoinHandle<()>,
+}
+
+impl GatedEmbedServer {
+    async fn start(dim: usize, fill: f32) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind gated embed mock");
+        let base_url = format!(
+            "{MOCK_URL_PREFIX}{}",
+            listener.local_addr().expect("mock addr")
+        );
+        let (gate, gate_rx) = watch::channel(false);
+        let completed = Arc::new(AtomicUsize::new(0));
+        let body = serde_json::to_vec(&json!({"embeddings": [vec![fill; dim]]}))
+            .expect("serialize embed body");
+        let done = Arc::clone(&completed);
+        let accept_task = tokio::spawn(async move {
+            // Dropping the JoinSet (when this task is aborted) aborts every
+            // parked connection task with it.
+            let mut conns = tokio::task::JoinSet::new();
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                conns.spawn(serve_gated_embed(
+                    stream,
+                    gate_rx.clone(),
+                    body.clone(),
+                    Arc::clone(&done),
+                ));
+            }
+        });
+        Self {
+            base_url,
+            gate,
+            completed,
+            accept_task,
+        }
+    }
+
+    fn open_gate(&self) {
+        self.gate.send_replace(true);
+    }
+
+    fn gate_is_open(&self) -> bool {
+        *self.gate.borrow()
+    }
+
+    fn completed_calls(&self) -> usize {
+        self.completed.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for GatedEmbedServer {
+    fn drop(&mut self) {
+        self.accept_task.abort();
+    }
+}
+
+/// Read one HTTP/1.1 request (headers plus `Content-Length` body), park on
+/// the gate, then answer `200` with `body` and bump `done`.
+async fn serve_gated_embed(
+    mut stream: TcpStream,
+    mut gate: watch::Receiver<bool>,
+    body: Vec<u8>,
+    done: Arc<AtomicUsize>,
+) {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = [0_u8; GATED_READ_CHUNK_BYTES];
+    let header_end = loop {
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break pos + 4;
+        }
+        match stream.read(&mut chunk).await {
+            Ok(0) | Err(_) => return,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+        }
+    };
+    let head = String::from_utf8_lossy(&buf[..header_end]).to_ascii_lowercase();
+    let content_len: usize = head
+        .lines()
+        .find_map(|l| l.strip_prefix("content-length:"))
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0);
+    while buf.len() < header_end + content_len {
+        match stream.read(&mut chunk).await {
+            Ok(0) | Err(_) => return,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+        }
+    }
+    if gate.wait_for(|open| *open).await.is_err() {
+        return;
+    }
+    let head = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        body.len()
+    );
+    // Count the call as completed BEFORE the first response byte leaves, so
+    // a client that has read the response can never observe a stale count.
+    done.fetch_add(1, Ordering::SeqCst);
+    if stream.write_all(head.as_bytes()).await.is_ok() {
+        let _ = stream.write_all(&body).await;
+        let _ = stream.flush().await;
+    }
 }
 
 async fn embed_calls(server: &MockServer) -> usize {
@@ -487,33 +631,60 @@ async fn slow_embedder_does_not_delay_sync_push_ack() {
     unsafe {
         std::env::set_var(REQUIRE_SIG_ENV, "0");
     }
-    // 2s per embed call — the pre-#1566 inline loop would have spent
-    // 2 rows × 2s = 4s INSIDE this request (and inside the sender's
-    // quorum window, which defaults to 2s).
-    let ollama = mock_ollama_embed(768, 0.75, Duration::from_secs(2)).await;
-    let embedder = build_ollama_embedder(&ollama.uri());
+    // #8715: the embedder is held behind a gate the TEST owns. The ack is
+    // proven independent of the embedder by observed order: it must arrive
+    // while the gate is still closed and the mock has completed zero embed
+    // calls. The pre-#1566 inline loop would block here forever (gate
+    // closed), which the hang guard turns into a fixed failure message.
+    let ollama = GatedEmbedServer::start(768, 0.75).await;
+    let embedder = build_ollama_embedder(&ollama.base_url);
     let rx = build_receiver(Some(embedder));
 
     let mems = vec![sample_memory("slow-embed-1"), sample_memory("slow-embed-2")];
     let body = push_body(&mems, None);
 
-    let started = Instant::now();
-    let (status, v) = post_push(&rx.router, serde_json::to_vec(&body).unwrap(), None, None).await;
-    let elapsed = started.elapsed();
+    let acked = tokio::time::timeout(
+        ACK_HANG_GUARD,
+        post_push(&rx.router, serde_json::to_vec(&body).unwrap(), None, None),
+    )
+    .await;
+    let Ok((status, v)) = acked else {
+        panic!(
+            "HANG GUARD: sync_push ack did not arrive within {ACK_HANG_GUARD:?} while the \
+             embedder gate was closed; the ack path is waiting on the embedder"
+        );
+    };
     assert_eq!(status, StatusCode::OK, "push must be acked: {v}");
     assert_eq!(v["applied"], 2, "both rows applied: {v}");
     assert!(
-        elapsed < Duration::from_millis(1500),
-        "ack must NOT wait on the embedder (2 rows × 2s embed); took {elapsed:?}"
+        !ollama.gate_is_open(),
+        "gate must still be closed when the ack arrives"
+    );
+    assert_eq!(
+        ollama.completed_calls(),
+        0,
+        "ack must be returned before the embedder completed any embed call"
     );
 
+    // Release the embedder; the background path must converge both rows.
+    ollama.open_gate();
     // The background path must still converge both rows.
     for mem in &mems {
-        let stored = wait_for_embedding(&rx.db, &mem.id, Duration::from_secs(15))
+        let stored = wait_for_embedding(&rx.db, &mem.id, CONVERGENCE_BOUND)
             .await
-            .unwrap_or_else(|| panic!("background embed must land for {}", mem.id));
+            .unwrap_or_else(|| {
+                panic!(
+                    "background embed must land for {} within {CONVERGENCE_BOUND:?} after the \
+                     gate opened",
+                    mem.id
+                )
+            });
         assert_eq!(stored.len(), 768);
     }
+    assert!(
+        ollama.completed_calls() >= mems.len(),
+        "the embedder must have answered at least one call per row after the gate opened"
+    );
 }
 
 // ---------------------------------------------------------------------------
