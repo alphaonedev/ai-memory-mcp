@@ -124,6 +124,10 @@ pub use refusal::{
     require_governed_namespace, required_scope_refusal, ungoverned_namespace_refusal,
 };
 
+// #8760 — the one K9 agent-pattern matcher (rule selection + SSE approval
+// visibility). Any-byte `*`, Deny/Ask case-fold, fail-closed classification.
+pub mod agent_match;
+
 // v0.9.0 G10.1 (#1827) — stateless macaroon capability tokens. The opt-in,
 // attenuation-only Deny/Pending→Allow grant primitive; inert unless
 // `[capabilities].enabled`. See `capability.rs` for the trust model.
@@ -358,6 +362,14 @@ pub struct PermissionContext {
 /// matches across `/` boundaries. An exact string is treated as a
 /// literal match.
 ///
+/// The agent pattern is matched by [`agent_match`] (#8760): Deny and
+/// Ask rules compare letters ASCII-case-insensitively (no case spelling
+/// of an id avoids them), Allow rules compare exactly. A pattern that is
+/// empty, longer than [`agent_match::MAX_AGENT_PATTERN_LEN`] bytes, or
+/// holds a character outside the agent-id alphabet plus `*`, and a
+/// caller id that fails the agent-id shape check, are unclassifiable:
+/// they match every Deny / Ask rule and no Allow rule (fail closed).
+///
 /// `op` is required and matches the [`Op::as_str`] wire form. A
 /// missing `op` fails the loader.
 ///
@@ -396,9 +408,13 @@ pub enum RuleDecision {
 // Pattern matching
 // ---------------------------------------------------------------------------
 
-/// Tiny glob: `**` matches across `/`, `*` matches a single
+/// Namespace glob: `**` matches across `/`, `*` matches a single
 /// `/`-delimited segment. Exact strings match literally. Empty
 /// pattern matches the empty string only.
+///
+/// Namespaces only. Agent patterns go through
+/// [`agent_match::agent_pattern_matches`] (#8760): an agent id is not
+/// `/`-segmented, so this glob's `*` let `ai:team/a` escape a Deny `*`.
 ///
 /// A run of two or more `*` is a `**`; a lone `*` matches any run of
 /// non-`/` bytes (possibly empty).
@@ -707,12 +723,15 @@ fn matched_rules<'a>(
     ctx: &PermissionContext,
     rules: &'a [PermissionRule],
 ) -> Vec<&'a PermissionRule> {
+    // #8760: classify the authenticated caller once; every rule's agent
+    // pattern is matched through the one fail-closed matcher.
+    let principal = agent_match::AgentPrincipal::classify(&ctx.agent_id);
     let mut hits: Vec<&PermissionRule> = rules
         .iter()
         .filter(|r| {
             r.op == ctx.op.as_str()
                 && glob_matches(&r.namespace_pattern, &ctx.namespace)
-                && glob_matches(&r.agent_pattern, &ctx.agent_id)
+                && principal.matches(&r.agent_pattern, r.decision)
         })
         .collect();
     hits.sort_by(|a, b| {
@@ -926,6 +945,7 @@ static ACTIVE_PERMISSION_RULES: RwLock<Vec<PermissionRule>> = RwLock::new(Vec::n
 /// daemon bootstrap with the loaded `[[permissions.rules]]`
 /// entries from `config.toml`. Tests call this to seed scenarios.
 pub fn set_active_permission_rules(rules: Vec<PermissionRule>) {
+    agent_match::warn_unclassifiable_patterns(&rules);
     if let Ok(mut w) = ACTIVE_PERMISSION_RULES.write() {
         *w = rules;
     }

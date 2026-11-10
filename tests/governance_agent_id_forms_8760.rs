@@ -24,7 +24,18 @@
 //!   route on SQLite and on PostgreSQL (the PG cell is `#[ignore]`d and
 //!   runs with `--include-ignored` against a minted database).
 
-#![allow(clippy::doc_markdown, clippy::expect_used, clippy::too_many_lines)]
+// `await_holding_lock`: the HTTP cells hold the process-wide rule-registry
+// lock across the whole async matrix on purpose, so no other cell in this
+// binary can swap `ACTIVE_PERMISSION_RULES` mid-matrix (same discipline as
+// tests/admin_audit_chain_913.rs).
+#![allow(
+    clippy::doc_markdown,
+    clippy::expect_used,
+    clippy::too_many_lines,
+    clippy::await_holding_lock
+)]
+
+use std::fmt::Write as _;
 
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -40,9 +51,10 @@ use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
 use tower::ServiceExt as _;
 
-#[path = "common/child_stdin_report.rs"]
-mod child_stdin_report;
 mod common;
+// #8734: the one declaration lives in `common`; `mcp_stdio_child` reaches it
+// as `super::child_stdin_report`.
+use common::child_stdin_report;
 #[path = "common/mcp_stdio_child.rs"]
 mod mcp_stdio_child;
 #[path = "common/mcp_wait.rs"]
@@ -527,16 +539,19 @@ fn rules_toml(rules: &[PermissionRule]) -> String {
             RuleDecision::Deny => "deny",
             RuleDecision::Ask => "ask",
         };
+        // `fmt::Write` for `String` never fails; the results are discarded
+        // by design (per ERRORS-19, an explicit `let _`).
         out.push_str("[[permissions.rules]]\n");
-        out.push_str(&format!(
-            "namespace_pattern = {}\n",
+        let _ = writeln!(
+            out,
+            "namespace_pattern = {}",
             toml_str(&r.namespace_pattern)
-        ));
-        out.push_str(&format!("op = {}\n", toml_str(&r.op)));
-        out.push_str(&format!("agent_pattern = {}\n", toml_str(&r.agent_pattern)));
-        out.push_str(&format!("decision = \"{decision}\"\n"));
+        );
+        let _ = writeln!(out, "op = {}", toml_str(&r.op));
+        let _ = writeln!(out, "agent_pattern = {}", toml_str(&r.agent_pattern));
+        let _ = writeln!(out, "decision = \"{decision}\"");
         if let Some(reason) = &r.reason {
-            out.push_str(&format!("reason = {}\n\n", toml_str(reason)));
+            let _ = writeln!(out, "reason = {}\n", toml_str(reason));
         }
     }
     out
@@ -618,7 +633,7 @@ fn mcp_stdio_store_refuses_every_id_form() {
 
 fn app_state(
     db: Db,
-    store: Arc<dyn ai_memory::store::MemoryStore>,
+    #[cfg(feature = "sal")] store: Arc<dyn ai_memory::store::MemoryStore>,
     backend: StorageBackend,
 ) -> AppState {
     AppState {
@@ -633,6 +648,7 @@ fn app_state(
         active_keypair: Arc::new(None),
         family_embeddings: Arc::new(tokio::sync::RwLock::new(Some(Vec::new()))),
         storage_backend: backend,
+        #[cfg(feature = "sal")]
         store,
         llm: Arc::new(ai_memory::reload::SwappableLlm::new(None)),
         auto_tag_model: Arc::new(None),
@@ -684,9 +700,15 @@ fn sqlite_router(db_path: &std::path::Path) -> axum::Router {
         ResolvedTtl::default(),
         true,
     )));
+    #[cfg(feature = "sal")]
     let store: Arc<dyn ai_memory::store::MemoryStore> =
         Arc::new(ai_memory::store::sqlite::SqliteStore::open(db_path).expect("SqliteStore"));
-    router(app_state(db, store, StorageBackend::Sqlite))
+    router(app_state(
+        db,
+        #[cfg(feature = "sal")]
+        store,
+        StorageBackend::Sqlite,
+    ))
 }
 
 async fn http_capture(

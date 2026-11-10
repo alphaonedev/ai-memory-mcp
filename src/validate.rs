@@ -389,7 +389,7 @@ pub fn validate_agent_id_shape(agent_id: &str) -> Result<()> {
         bail!("agent_id exceeds max length of {MAX_AGENT_ID_LEN} bytes");
     }
     for c in agent_id.chars() {
-        if !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | ':' | '@' | '.' | '/')) {
+        if !is_agent_id_char(c) {
             bail!("agent_id contains invalid character '{c}' (allowed: alphanumeric, _-:@./)");
         }
     }
@@ -419,6 +419,16 @@ pub fn validate_agent_id_shape(agent_id: &str) -> Result<()> {
         bail!("agent_id may not start with '/' (path-traversal guard)");
     }
     Ok(())
+}
+
+/// The one agent-id alphabet: ASCII alphanumeric plus `_-:@./`.
+///
+/// Single source of truth for [`validate_agent_id_shape`] and for the K9
+/// agent-pattern matcher (`crate::governance::agent_match`, #8760), which
+/// classifies a rule's `agent_pattern` against this alphabet plus `*`.
+#[must_use]
+pub(crate) const fn is_agent_id_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | ':' | '@' | '.' | '/')
 }
 
 /// Validate an agent identifier (NHI-hardened) for wire-side use.
