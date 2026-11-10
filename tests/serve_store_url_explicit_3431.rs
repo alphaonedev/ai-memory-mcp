@@ -43,6 +43,12 @@ use std::process::{Command, Output};
 #[cfg(feature = "sal")]
 mod common;
 
+/// Upper bound on one `serve` boot, a HANG GUARD and not a performance
+/// assertion (#4166): the wait ends on the child's exit or on `/health`, and
+/// the spawn is offline so no embedder download can stretch it.
+#[cfg(feature = "sal")]
+const BOOT_HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// Project HARD RULE: scratch lives under `.local-runs/`, never `/tmp`.
 fn scratch_root() -> PathBuf {
     let root = std::env::current_dir()
@@ -240,6 +246,8 @@ fn serve_with_config_db_and_store_url_starts_3431() {
     // #3705 — the daemon refuses every plaintext bind.
     let tls = common::tls::TestTls::generate(&sb.store("tls-3705"));
     let mut cmd = sb.base_command();
+    // #4166: the boot never waits on an embedder.
+    common::serve_test_env(&mut cmd);
     cmd.args([
         "serve",
         "--host",
@@ -272,7 +280,7 @@ fn serve_with_config_db_and_store_url_starts_3431() {
 
     let client = tls.client_with_timeout(Duration::from_secs(2));
     let url = format!("{}/api/v1/health", common::tls::TestTls::base_url(port));
-    let deadline = Instant::now() + Duration::from_secs(120);
+    let deadline = Instant::now() + BOOT_HANG_GUARD;
     let mut healthy = false;
     while Instant::now() < deadline {
         if let Ok(resp) = client.get(&url).send()

@@ -31,7 +31,12 @@ use common::free_port;
 use common::postgres_env::PostgresTestEnv;
 
 const TEAM_LINE: &str = "[deployment] shape = \"team\"";
-const BOOT_DEADLINE: Duration = Duration::from_secs(60);
+/// Upper bound on one `serve` boot, a HANG GUARD and not a performance
+/// assertion (#4166). The wait below ends on the child's exit (reported with
+/// its captured stderr) or on `/health`; a healthy boot that is merely slow on
+/// a loaded runner must never fail the test, so the bound is generous and only
+/// trips for a daemon that neither exits nor answers.
+const BOOT_HANG_GUARD: Duration = Duration::from_secs(300);
 const PROBE_INTERVAL: Duration = Duration::from_millis(100);
 const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
@@ -69,6 +74,8 @@ fn command(root: &Path, store_url: &str) -> Command {
         .env("AI_MEMORY_NO_CONFIG", "1")
         .env("RUST_LOG", "error")
         .env("AI_MEMORY_STORE_URL", store_url);
+    // #4166: one shared helper keeps every serve boot off the embedder.
+    common::serve_test_env(&mut cmd);
     cmd
 }
 
@@ -111,7 +118,7 @@ fn boot_on_loopback(root: &Path, store_url: &str) -> BootOutcome {
             }
         })
     });
-    let deadline = Instant::now() + BOOT_DEADLINE;
+    let deadline = Instant::now() + BOOT_HANG_GUARD;
     loop {
         if let Ok(Some(status)) = child.try_wait() {
             if let Some(h) = reader {
@@ -130,11 +137,19 @@ fn boot_on_loopback(root: &Path, store_url: &str) -> BootOutcome {
             let stderr = buf.lock().unwrap().clone();
             return BootOutcome::Healthy { stderr };
         }
-        assert!(
-            Instant::now() < deadline,
-            "serve neither exited nor became healthy within {BOOT_DEADLINE:?}; stderr:\n{}",
-            buf.lock().unwrap()
-        );
+        if Instant::now() >= deadline {
+            // Reap BEFORE panicking so the daemon never outlives the test.
+            let _ = child.kill();
+            let _ = child.wait();
+            if let Some(h) = reader {
+                let _ = h.join();
+            }
+            panic!(
+                "serve neither exited nor became healthy within {BOOT_HANG_GUARD:?} (hang guard); stderr:
+{}",
+                buf.lock().unwrap()
+            );
+        }
         std::thread::sleep(PROBE_INTERVAL);
     }
 }

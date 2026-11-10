@@ -176,6 +176,8 @@ fn try_spawn_serve_once(
         .arg(db)
         .args(["serve", "--host", "127.0.0.1", "--port", &port.to_string()])
         .args(tls.serve_arg_strs());
+    // #4166: the boot never waits on an embedder.
+    super::serve_test_env(&mut cmd);
     configure(&mut cmd);
     let child = cmd
         .stdout(Stdio::piped())
