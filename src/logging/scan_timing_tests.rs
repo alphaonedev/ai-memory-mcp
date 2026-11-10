@@ -1,10 +1,13 @@
-//! #8674: load-robust clock ratio for every operator-log scanner entry.
+//! #8674 / #8820: coarse wall-clock quadratic detector for every operator-log scanner entry.
 //!
-//! The op-count tests in `scan_work_tests` see only charged work; this guard sees
-//! any work, charged or not. The 100K and 1M inputs are timed interleaved, so a
-//! load spike hits both sizes alike, and the minimum of each size is compared:
-//! linear work measures about x10.4 and a quadratic scan about x30.
-//! A ratio in the grey zone between them gets more pairs, so load noise drops out.
+//! The proof of linearity is the deterministic op-count in `scan_work_tests`; it gives the same
+//! verdict at any machine load. This guard only sees what a counter cannot, uncharged work, and
+//! it cannot separate noise from a modest superlinear cost: a loaded macOS runner measured a
+//! linear scanner at x24.4 (run 42845848659, load1 about 24). So the bound sits between that
+//! noise and a quadratic scan. The 100K and 1M inputs are timed interleaved, so a load spike hits
+//! both sizes alike, and the minimum of each size is compared: linear work measures x10.4 quiet
+//! and up to x24.4 loaded, a quadratic scan about x100 (x10 input, x10 cost per byte).
+//! A ratio in the grey zone above linear gets more pairs, so load noise drops out.
 //! The scans run on one worker thread and each wait has an absolute bound, so a hang fails the
 //! named test.
 
@@ -15,12 +18,14 @@ const SMALL_BYTES: usize = 100_000;
 const LARGE_BYTES: usize = 1_000_000;
 /// Base interleaved pairs; each pair times one small and one large input.
 const ROUNDS: usize = 5;
-/// `min(1M) / min(100K)` stays below this: linear work measures x10.4, a quadratic scan x30.
-const RATIO_LIMIT: u32 = 20;
+/// `min(1M) / min(100K)` stays below this. Linear work measured x10.4 quiet and at most x24.4
+/// under load (#8820); a quadratic scan is about x100. 50 is twice the worst linear noise and
+/// half the quadratic ratio; the exact linearity verdict is the op-count, not this ratio.
+const QUADRATIC_RATIO_LIMIT: u32 = 50;
 /// Hundredths of a ratio at or above which more pairs are measured: well above linear x10.4,
-/// well below quadratic x30, so only load noise sits here and more samples lower it.
+/// well below the limit, so only load noise sits here and more samples lower it.
 const GREY_ZONE_HUNDREDTHS: u128 = 1_200;
-/// Pair cap for that resampling; a quadratic scan stays near x30 however often it is timed.
+/// Pair cap for that resampling; a quadratic scan stays near x100 however often it is timed.
 const MAX_PAIRS: usize = 12;
 /// One linear 1M scan takes about 1 s in a loaded debug build; a scan still running at this
 /// bound is cut off and fails, instead of running until the CI shard watchdog kills it.
@@ -111,9 +116,9 @@ fn assert_scanner_ratio(name: &str, scan: fn(&str) -> String) {
             hundredths % 100
         );
         assert!(
-            large < small.saturating_mul(RATIO_LIMIT),
-            "#8674 {name} [{shape}]: min(1M) {large:?} is not below {RATIO_LIMIT} x min(100K) \
-             {small:?} after {pairs} pairs; the scanner does superlinear work"
+            large < small.saturating_mul(QUADRATIC_RATIO_LIMIT),
+            "#8674 {name} [{shape}]: min(1M) {large:?} is not below {QUADRATIC_RATIO_LIMIT} x min(100K) \
+             {small:?} after {pairs} pairs; the scanner does quadratic work"
         );
     }
 }
