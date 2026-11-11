@@ -49,6 +49,9 @@ use tempfile::TempDir;
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Owner-only mode the binary requires of a key directory (#3198).
+const KEY_DIR_MODE: u32 = 0o700;
+
 fn open_test_db(tmp: &TempDir) -> (rusqlite::Connection, std::path::PathBuf) {
     let db_path = tmp.path().join("ai-memory.db");
     let conn = db::open(&db_path).expect("db::open");
@@ -348,9 +351,13 @@ fn forensic_bundle_tampered_file_exits_2() {
 }
 
 #[test]
-fn forensic_bundle_clean_exits_0() {
-    // Confirm the clean path still exits 0 — i.e. #709 only touched
-    // the failure-side exit code.
+fn forensic_bundle_clean_exits_0_and_foreign_trust_root_exits_2() {
+    // #8851: green means attested. An export signs its manifest with the
+    // host key of its key directory, so a verify against that same trust root
+    // exits 0 with `signature_status = verified`; the same intact bundle
+    // verified against a different trust root is not attested and exits 2
+    // (the #709 verification-failed code) with the exact reason. The unsigned
+    // and renamed-signer cells are in `tests/verify_false_green_8741.rs`.
     let tmp = TempDir::new().unwrap();
     let (conn, db_path) = open_test_db(&tmp);
     let d0 = insert_mem(&conn, "fb-clean-ns", 0, MemoryKind::Observation);
@@ -358,28 +365,93 @@ fn forensic_bundle_clean_exits_0() {
     link_unsigned(&conn, &d1, &d0);
     drop(conn);
 
-    let bundle_path = tmp.path().join("clean.tar");
-    let export_args = fb::ExportForensicBundleArgs {
-        memory_id: d1.clone(),
-        output: Some(bundle_path.clone()),
-        include_reflections: true,
-        include_transcripts: false,
-        include_atomisation_chain: true,
-    };
+    // The CLI child gets an explicit, empty, owner-only key directory, so the
+    // export is deterministically unsigned whatever the host holds (#3355).
+    let key_dir = tmp.path().join("empty-keys");
+    std::fs::create_dir_all(&key_dir).expect("key dir");
+    #[cfg(unix)]
     {
-        let mut stdout = Vec::<u8>::new();
-        let mut stderr = Vec::<u8>::new();
-        let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
-        let code = fb::run_export(&db_path, &export_args, &mut out).expect("export");
-        assert_eq!(code, 0);
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&key_dir, std::fs::Permissions::from_mode(KEY_DIR_MODE))
+            .expect("key dir mode");
     }
+    let bundle_path = tmp.path().join("clean.tar");
+    let bundle_arg = bundle_path.to_str().expect("utf8 path");
+    let signer_keys = owner_only_dir(&tmp, "signer-keys");
+    let export = cli_with_keys(
+        &db_path,
+        &signer_keys,
+        &[
+            "export-forensic-bundle",
+            "--memory-id",
+            &d1,
+            "--include-reflections",
+            "--output",
+            bundle_arg,
+        ],
+    );
+    assert_eq!(export.status.code(), Some(0), "export: {export:?}");
 
-    let verify_args = fb::VerifyForensicBundleArgs {
-        bundle_path: bundle_path.clone(),
-    };
-    let mut stdout = Vec::<u8>::new();
-    let mut stderr = Vec::<u8>::new();
-    let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
-    let code = fb::run_verify(&verify_args, &mut out).expect("run_verify");
-    assert_eq!(code, 0, "clean bundle must still exit 0 post-#709");
+    let same_root = cli_with_keys(
+        &db_path,
+        &signer_keys,
+        &["verify-forensic-bundle", bundle_arg],
+    );
+    let printed = String::from_utf8_lossy(&same_root.stdout);
+    assert_eq!(
+        same_root.status.code(),
+        Some(0),
+        "attested bundle: {printed}"
+    );
+    assert!(
+        printed.contains("\"signature_status\": \"verified\""),
+        "{printed}"
+    );
+    assert!(printed.contains("verification OK"), "{printed}");
+
+    let foreign_keys = owner_only_dir(&tmp, "foreign-keys");
+    let foreign = cli_with_keys(
+        &db_path,
+        &foreign_keys,
+        &["verify-forensic-bundle", bundle_arg],
+    );
+    let printed = String::from_utf8_lossy(&foreign.stdout);
+    assert_eq!(
+        foreign.status.code(),
+        Some(2),
+        "unattested bundle: {printed}"
+    );
+    let named = [
+        fb::REASON_MANIFEST_SIGNATURE_FAILED,
+        fb::REASON_MANIFEST_SIGNER_UNKNOWN,
+    ]
+    .iter()
+    .any(|reason| printed.contains(&format!("verification FAILED: {reason}")));
+    assert!(named, "expected a signer-trust reason: {printed}");
+}
+
+/// A fresh owner-only (#3198) key directory under the test's temp root.
+fn owner_only_dir(tmp: &TempDir, name: &str) -> std::path::PathBuf {
+    let dir = tmp.path().join(name);
+    std::fs::create_dir_all(&dir).expect("key dir");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(KEY_DIR_MODE))
+            .expect("key dir mode");
+    }
+    dir
+}
+
+/// Runs the CLI as a child with an explicit key directory, so the trust root
+/// never comes from the host (#3355) and no process env is mutated.
+fn cli_with_keys(db_path: &Path, key_dir: &Path, args: &[&str]) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_ai-memory"))
+        .env("AI_MEMORY_NO_CONFIG", "1")
+        .env("AI_MEMORY_KEY_DIR", key_dir)
+        .arg("--db")
+        .arg(db_path)
+        .args(args)
+        .output()
+        .expect("spawn ai-memory")
 }

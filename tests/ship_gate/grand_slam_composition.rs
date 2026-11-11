@@ -245,7 +245,17 @@ fn sg_co_1_forensic_bundle_export_and_verify_roundtrip() {
         .expect("forensic bundle build ok");
 
     let report = bundle::verify(&bundle_path).expect("verify must succeed");
-    assert!(report.ok, "verify report must be ok: {report:?}");
+    // #8851: `build` signs with whatever key the process key directory holds
+    // (none on a clean runner), so the roll-up is pinned to the observed
+    // attestation: ok exactly when the signature verified, otherwise a named
+    // reason. Integrity is checked below either way.
+    let attested = report.signature_status == bundle::SignatureStatus::Verified;
+    assert_eq!(report.ok, attested, "ok must track attestation: {report:?}");
+    assert_eq!(
+        bundle::failure_reason(&report).is_none(),
+        attested,
+        "a reason is named exactly when unattested: {report:?}"
+    );
     assert!(report.manifest_present, "manifest.json present in bundle");
     assert_eq!(report.memory_id, d2, "memory_id matches the export target");
     assert!(

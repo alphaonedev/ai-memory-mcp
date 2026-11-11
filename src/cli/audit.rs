@@ -1079,6 +1079,53 @@ fn resolve_path(
     resolve_audit_path(&cfg)
 }
 
+/// Reason: the flat audit log is absent while the trail is enabled (#8867).
+pub const REASON_AUDIT_LOG_MISSING: &str = "audit_log_missing";
+/// Reason: the flat audit log is empty while the trail is enabled (#8867).
+pub const REASON_AUDIT_LOG_EMPTY: &str = "audit_log_empty";
+/// Reason: the flat audit log has rows but no seq mark (#8867).
+pub const REASON_SEQ_MARK_MISSING: &str = "seq_mark_missing";
+/// Exit code of every `audit verify` finding.
+const EXIT_AUDIT_FINDING: i32 = 2;
+
+/// Emit one absence finding in the existing `audit verify` fail shape (the
+/// reason code is the `failure.kind`) and return [`EXIT_AUDIT_FINDING`].
+fn absence_finding(
+    args: &VerifyArgs,
+    out: &mut CliOutput<'_>,
+    path: &std::path::Path,
+    total_lines: u64,
+    reason: &str,
+    detail: &str,
+) -> Result<i32> {
+    if args.json {
+        writeln!(
+            out.stdout,
+            "{}",
+            serde_json::json!({
+                "status": "fail",
+                (field_names::TOTAL_LINES): total_lines,
+                "failure": {
+                    (field_names::LINE_NUMBER): serde_json::Value::Null,
+                    "kind": reason,
+                    "detail": detail,
+                },
+                "gaps": [],
+                "gap_count": 0,
+                "torn_lines": [],
+                "path": path.display().to_string(),
+            })
+        )?;
+    } else {
+        writeln!(
+            out.stderr,
+            "audit verify FAIL: {reason} — {detail} ({})",
+            path.display()
+        )?;
+    }
+    Ok(EXIT_AUDIT_FINDING)
+}
+
 fn run_verify(
     args: &VerifyArgs,
     cli_audit_dir: Option<&std::path::Path>,
@@ -1093,7 +1140,22 @@ fn run_verify(
         return run_forensic_verify(since, args, cli_audit_dir, app_config, out);
     }
     let path = resolve_path(app_config, cli_audit_dir, args.path.as_deref());
+    // #8867 — absence is a finding. "Nothing to verify" is green only when the
+    // flat trail is provably disabled (`[audit] enabled` false AND no seq mark
+    // left by a writer), and the output then says so.
+    let audit_enabled = app_config.effective_audit().enabled.unwrap_or(false);
+    let mark_present = crate::audit::seq_mark_path(&path).exists();
     if !path.exists() {
+        if audit_enabled || mark_present {
+            return absence_finding(
+                args,
+                out,
+                &path,
+                0,
+                REASON_AUDIT_LOG_MISSING,
+                "the audit log is absent but the trail is enabled or a writer left its seq mark",
+            );
+        }
         if args.json {
             writeln!(
                 out.stdout,
@@ -1101,14 +1163,14 @@ fn run_verify(
                 serde_json::json!({
                     "status": "ok",
                     (field_names::TOTAL_LINES): 0,
-                    "note": "audit log does not exist (audit may be disabled)",
+                    "note": "audit is disabled ([audit] enabled = false) and no log exists: nothing to verify",
                     "path": path.display().to_string(),
                 })
             )?;
         } else {
             writeln!(
                 out.stdout,
-                "audit verify: log not present at {} — nothing to check",
+                "audit verify: audit is disabled ([audit] enabled = false) and no log exists at {} — nothing to verify",
                 path.display()
             )?;
         }
@@ -1183,6 +1245,29 @@ fn run_verify(
             writeln!(out.stderr, "audit verify FAIL: {message}")?;
         }
         return Ok(2);
+    }
+    // #8867 — the seq mark is the only tail anchor of the flat log: without it
+    // a tail cut is invisible, so its absence is a finding, as is an empty log
+    // while the trail is enabled or anchored.
+    if report.total_lines == 0 && (audit_enabled || mark_present) {
+        return absence_finding(
+            args,
+            out,
+            &path,
+            0,
+            REASON_AUDIT_LOG_EMPTY,
+            "the audit log holds no rows but the trail is enabled or anchored",
+        );
+    }
+    if report.total_lines > 0 && !mark_present {
+        return absence_finding(
+            args,
+            out,
+            &path,
+            report.total_lines,
+            REASON_SEQ_MARK_MISSING,
+            "the seq mark (tail anchor) is missing, so a tail cut cannot be ruled out",
+        );
     }
     // An acknowledgement that matched nothing is reported, so a stale one
     // left in a cron line is visible rather than silently inert.
@@ -1457,7 +1542,26 @@ mod tests {
             buf.push('\n');
         }
         fs::write(&path, buf).unwrap();
+        mark_as_writer_would(&path);
         path
+    }
+
+    /// #8867: a real writer leaves the `.seq` high-water mark next to every
+    /// trail it writes, so a fixture standing for a written trail carries one
+    /// (the highest sequence in the trail, in the writer's fixed-width form).
+    fn mark_as_writer_would(trail: &Path) {
+        let highest = fs::read_to_string(trail)
+            .unwrap()
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter_map(|v| v["sequence"].as_u64())
+            .max()
+            .unwrap();
+        fs::write(
+            crate::audit::seq_mark_path(trail),
+            format!("{highest:020}\n"),
+        )
+        .unwrap();
     }
 
     fn make_event(seq: u64, prev: &str) -> AuditEvent {
@@ -1542,6 +1646,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let p = tmp.path().join("audit.log");
         fs::write(&p, crate::audit::gapped_trail_for_test()).unwrap();
+        mark_as_writer_would(&p);
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
@@ -1667,7 +1772,10 @@ mod tests {
         .unwrap();
         assert_eq!(exit, 0);
         let s = std::str::from_utf8(&stdout).unwrap();
-        assert!(s.contains("nothing to check"));
+        // #8867: green only because the trail is provably disabled, and the
+        // output says so.
+        assert!(s.contains("audit is disabled"), "{s}");
+        assert!(s.contains("nothing to verify"), "{s}");
     }
 
     #[test]
@@ -2043,7 +2151,10 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(s.trim()).unwrap();
         assert_eq!(v["status"], "ok");
         assert_eq!(v["total_lines"], 0);
-        assert!(v["note"].as_str().unwrap().contains("does not exist"));
+        assert!(
+            v["note"].as_str().unwrap().contains("audit is disabled"),
+            "{v}"
+        );
     }
 
     #[test]

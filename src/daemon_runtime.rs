@@ -2650,7 +2650,10 @@ pub async fn run(
             let mut so = stdout.lock();
             let mut se = stderr.lock();
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
-            match cli::verify_signed_events::run(&db_path, &a, &mut out)? {
+            // #9046 — resolve the store first: a Postgres store is refused,
+            // never answered from the local SQLite side file.
+            let store_url = crate::store_url::resolve_store_url(None)?;
+            match cli::verify_signed_events::run(&db_path, store_url.as_deref(), &a, &mut out)? {
                 0 => Ok(()),
                 code => std::process::exit(code),
             }

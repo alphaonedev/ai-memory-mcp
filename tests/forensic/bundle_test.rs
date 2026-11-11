@@ -41,6 +41,32 @@ fn ai_memory_cmd(db_path: &std::path::Path) -> Command {
     cmd
 }
 
+/// Owner-only mode the binary requires of a key directory (#3198).
+const KEY_DIR_MODE: u32 = 0o700;
+/// Agent id of the operator key the CLI round-trip signs with.
+const BUNDLE_SIGNER: &str = "bundle-test-operator";
+
+/// `ai_memory_cmd` plus an isolated, provisioned operator key directory, so
+/// the exported manifest is signed and the verifier can resolve its signer.
+fn signing_cmd(db_path: &std::path::Path, key_dir: &std::path::Path) -> Command {
+    let mut cmd = ai_memory_cmd(db_path);
+    cmd.env("AI_MEMORY_KEY_DIR", key_dir);
+    cmd
+}
+
+fn provision_key_dir(tmp: &TempDir, db_path: &std::path::Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+    let key_dir = tmp.path().join("keys");
+    std::fs::create_dir_all(&key_dir).expect("key dir");
+    std::fs::set_permissions(&key_dir, std::fs::Permissions::from_mode(KEY_DIR_MODE))
+        .expect("key dir mode");
+    signing_cmd(db_path, &key_dir)
+        .args(["identity", "generate", "--agent-id", BUNDLE_SIGNER])
+        .assert()
+        .success();
+    key_dir
+}
+
 fn open_db(p: &std::path::Path) -> rusqlite::Connection {
     db::open(p).expect("db::open")
 }
@@ -97,8 +123,11 @@ fn depth2_chain_bundle_verifies_via_cli() {
     link_unsigned(&conn, &d1, &d0);
     drop(conn);
 
+    // #8851: a green verify needs an attested manifest, so the round-trip
+    // signs with a provisioned operator key.
+    let key_dir = provision_key_dir(&tmp, &db_path);
     let bundle_path = tmp.path().join("bundle.tar");
-    ai_memory_cmd(&db_path)
+    signing_cmd(&db_path, &key_dir)
         .args([
             "export-forensic-bundle",
             "--memory-id",
@@ -112,7 +141,7 @@ fn depth2_chain_bundle_verifies_via_cli() {
 
     assert!(bundle_path.exists(), "tarball must exist after export");
 
-    let assert = ai_memory_cmd(&db_path)
+    let assert = signing_cmd(&db_path, &key_dir)
         .args(["verify-forensic-bundle", bundle_path.to_str().unwrap()])
         .assert()
         .success();
@@ -282,9 +311,36 @@ fn run_verify_emits_structured_report_on_clean_bundle() {
         bundle::run_verify(&verify_args, &mut out).expect("verify")
     };
     let s = String::from_utf8(vstdout).unwrap();
-    assert_eq!(exit, 0);
-    assert!(s.contains("\"ok\": true"), "expected ok=true in JSON: {s}");
-    assert!(s.contains("verification OK"), "expected OK suffix: {s}");
+    assert!(
+        s.contains("\"tampered_files\": []"),
+        "integrity must still hold: {s}"
+    );
+    // #8851: the in-process export signs with whatever key the process key
+    // directory holds (none on a clean runner), so the roll-up is pinned to
+    // the observed attestation: green only when the signature verified,
+    // otherwise exit 2 naming the exact reason. The deterministic unsigned
+    // and signed cells run as child processes with an explicit key directory
+    // (`tests/verify_false_green_8741.rs`, `depth2_chain_bundle_verifies_via_cli`).
+    let report = bundle::verify(&bundle_path).expect("verify report");
+    match bundle::failure_reason(&report) {
+        None => {
+            assert_eq!(report.signature_status, bundle::SignatureStatus::Verified);
+            assert_eq!(exit, 0, "attested bundle exits 0: {s}");
+            assert!(s.contains("\"ok\": true"), "expected ok=true in JSON: {s}");
+        }
+        Some(reason) => {
+            assert_ne!(report.signature_status, bundle::SignatureStatus::Verified);
+            assert_eq!(exit, 2, "unattested bundle exits 2: {s}");
+            assert!(
+                s.contains("\"ok\": false"),
+                "expected ok=false in JSON: {s}"
+            );
+            assert!(
+                s.contains(&format!("verification FAILED: {reason}")),
+                "expected the {reason} reason: {s}"
+            );
+        }
+    }
 }
 
 #[test]

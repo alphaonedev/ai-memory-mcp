@@ -384,7 +384,19 @@ fn main() -> Result<()> {
     // opened) refuses boot exactly like the log sink above. Before this it
     // printed "continuing without" and ran with NO audit trail, the opposite
     // of every documented outcome. `doctor` stays runnable.
-    if let Err(e) = audit::init_from_config(&app_config.effective_audit()) {
+    //
+    // #8867: `audit verify` is a read-only check of the trail. Opening the
+    // sink would re-create a deleted log and re-anchor a removed seq mark from
+    // the (possibly truncated) tail, erasing the evidence the verifier exists
+    // to report, so the verifier never installs the sink.
+    let is_audit_verify = matches!(
+        &cli.command,
+        daemon_runtime::Command::Audit(ai_memory::cli::audit::AuditArgs {
+            action: ai_memory::cli::audit::AuditAction::Verify(_),
+            ..
+        })
+    );
+    if !is_audit_verify && let Err(e) = audit::init_from_config(&app_config.effective_audit()) {
         if is_doctor {
             eprintln!(
                 "ai-memory: the audit trail failed to initialise; `doctor` \

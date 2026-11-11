@@ -2618,30 +2618,16 @@ pub fn verify_since(
     let mut prev_hash = CHAIN_HEAD_PREV_HASH.to_string();
     let mut total: u64 = 0;
     let mut unsigned: u64 = 0;
+    // #9009 — once a signed row has been seen, an unsigned row is a downgrade
+    // (a stripped signature), never just an `unsigned` count.
+    let mut seen_signed = false;
 
+    // #9009 — ONE walk over every file. Rows before the window are not
+    // re-verified for signatures, but their parse and `prev_hash` links ARE
+    // checked, so a rewritten pre-window row is reported with its position
+    // instead of being silently re-anchored.
     for file in &files {
-        let date = file_date(file)?;
-        if date >= cutoff {
-            break;
-        }
-        let f = open_forensic_file_for_read(file)
-            .with_context(|| crate::errors::msg::opening(file.display()))?;
-        for line in BufReader::new(f).lines() {
-            let Ok(line) = line else { continue };
-            if line.trim().is_empty() {
-                continue;
-            }
-            if let Ok(row) = serde_json::from_str::<ForensicDecision>(&line) {
-                prev_hash = row.self_hash();
-            }
-        }
-    }
-
-    for file in &files {
-        let date = file_date(file)?;
-        if date < cutoff {
-            continue;
-        }
+        let in_window = file_date(file)? >= cutoff;
         let f = open_forensic_file_for_read(file)
             .with_context(|| crate::errors::msg::opening(file.display()))?;
         for (idx, line) in BufReader::new(f).lines().enumerate() {
@@ -2650,90 +2636,72 @@ pub fn verify_since(
             if line.trim().is_empty() {
                 continue;
             }
-            let row: ForensicDecision = match serde_json::from_str(&line) {
-                Ok(r) => r,
-                Err(e) => {
-                    return Ok(VerifyReport {
-                        total_lines: total,
-                        unsigned_lines: unsigned,
-                        first_failure: Some(VerifyFailure {
-                            line_number: line_no,
-                            file: file.clone(),
-                            kind: VerifyFailureKind::Parse,
-                            detail: format!("malformed JSON: {e}"),
-                        }),
-                    });
-                }
-            };
-
-            total += 1;
-
-            if row.prev_hash != prev_hash {
-                return Ok(VerifyReport {
+            let fail = |total: u64, unsigned: u64, kind: VerifyFailureKind, detail: String| {
+                Ok(VerifyReport {
                     total_lines: total,
                     unsigned_lines: unsigned,
                     first_failure: Some(VerifyFailure {
                         line_number: line_no,
                         file: file.clone(),
-                        kind: VerifyFailureKind::ChainBreak,
-                        detail: format!(
-                            "prev_hash mismatch: expected {prev_hash}, got {}",
-                            row.prev_hash
-                        ),
+                        kind,
+                        detail,
                     }),
-                });
+                })
+            };
+            let row: ForensicDecision = match serde_json::from_str(&line) {
+                Ok(r) => r,
+                Err(e) => {
+                    return fail(
+                        total,
+                        unsigned,
+                        VerifyFailureKind::Parse,
+                        format!("malformed JSON: {e}"),
+                    );
+                }
+            };
+
+            if in_window {
+                total += 1;
+            }
+
+            if row.prev_hash != prev_hash {
+                return fail(
+                    total,
+                    unsigned,
+                    VerifyFailureKind::ChainBreak,
+                    format!(
+                        "prev_hash mismatch: expected {prev_hash}, got {}",
+                        row.prev_hash
+                    ),
+                );
             }
 
             if row.sig.is_empty() {
-                unsigned += 1;
-            } else if let Some(pk) = public_key {
-                let canonical = row.canonical_bytes();
-                let sig_bytes = match B64.decode(row.sig.as_bytes()) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        return Ok(VerifyReport {
-                            total_lines: total,
-                            unsigned_lines: unsigned,
-                            first_failure: Some(VerifyFailure {
-                                line_number: line_no,
-                                file: file.clone(),
-                                kind: VerifyFailureKind::Signature,
-                                detail: format!("base64 decode failed: {e}"),
-                            }),
-                        });
-                    }
-                };
-                if sig_bytes.len() != 64 {
-                    return Ok(VerifyReport {
-                        total_lines: total,
-                        unsigned_lines: unsigned,
-                        first_failure: Some(VerifyFailure {
-                            line_number: line_no,
-                            file: file.clone(),
-                            kind: VerifyFailureKind::Signature,
-                            detail: format!("signature has {} bytes, expected 64", sig_bytes.len()),
-                        }),
-                    });
+                if seen_signed {
+                    return fail(
+                        total,
+                        unsigned,
+                        VerifyFailureKind::Signature,
+                        format!(
+                            "{FORENSIC_REASON_SIGNATURE_ABSENT}: unsigned row after a signed \
+                             row (stripped or downgraded signature)"
+                        ),
+                    );
                 }
-                let mut sig_arr = [0u8; 64];
-                sig_arr.copy_from_slice(&sig_bytes);
-                let sig = Signature::from_bytes(&sig_arr);
-                // #1899 — verify_strict so the forensic-chain walker rejects
-                // the same non-canonical / malleable Ed25519 signatures the
-                // forensic-bundle verifier (bundle.rs verify_strict) and
-                // identity::verify already reject. Keeps "one verifying key
-                // validates both chains uniformly" true.
-                if let Err(e) = pk.verify_strict(&canonical, &sig) {
-                    return Ok(VerifyReport {
-                        total_lines: total,
-                        unsigned_lines: unsigned,
-                        first_failure: Some(VerifyFailure {
-                            line_number: line_no,
-                            file: file.clone(),
-                            kind: VerifyFailureKind::Signature,
-                            detail: crate::errors::msg::signature_verify_failed(e),
-                        }),
-                    });
+                if in_window {
+                    unsigned += 1;
+                }
+            } else {
+                seen_signed = true;
+                if let (true, Some(pk)) = (in_window, public_key) {
+                    if let Err(detail) = verify_forensic_row_signature(&row, pk) {
+                        return fail(
+                            total,
+                            unsigned,
+                            VerifyFailureKind::Signature,
+                            detail.to_string(),
+                        );
+                    }
                 }
             }
 
@@ -2746,6 +2714,29 @@ pub fn verify_since(
         unsigned_lines: unsigned,
         first_failure: None,
     })
+}
+
+/// Reason code in a forensic `Signature` failure detail: an unsigned row
+/// follows a signed one (#9009).
+pub const FORENSIC_REASON_SIGNATURE_ABSENT: &str = "signature_absent";
+
+/// Verify one forensic row's Ed25519 signature; `Err` carries the detail
+/// (per ERRORS-13: an anyhow error, not a bare string error).
+fn verify_forensic_row_signature(row: &ForensicDecision, pk: &VerifyingKey) -> Result<()> {
+    let canonical = row.canonical_bytes();
+    let sig_bytes = B64
+        .decode(row.sig.as_bytes())
+        .map_err(|e| anyhow!("base64 decode failed: {e}"))?;
+    let sig_arr: [u8; 64] = sig_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow!("signature has {} bytes, expected 64", sig_bytes.len()))?;
+    let sig = Signature::from_bytes(&sig_arr);
+    // #1899 — verify_strict so the forensic-chain walker rejects the same
+    // non-canonical / malleable Ed25519 signatures the forensic-bundle
+    // verifier (bundle.rs verify_strict) and identity::verify already reject.
+    pk.verify_strict(&canonical, &sig)
+        .map_err(|e| anyhow!(crate::errors::msg::signature_verify_failed(e)))
 }
 
 fn parse_iso_date(s: &str) -> Result<i64> {

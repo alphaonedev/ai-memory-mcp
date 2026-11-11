@@ -21,8 +21,19 @@
 //! ## Exit codes
 //!
 //! - `0` — chain fully verified.
-//! - `1` — chain break detected (sequence gap, duplicate, or
-//!   `prev_hash` mismatch).
+//! - `1` — a finding: chain break detected (sequence gap, duplicate, or
+//!   `prev_hash` mismatch), or nothing that could be checked was found
+//!   (#9046 / #8741). Absence is a finding, never a vacuous green; every
+//!   finding prints one `verify-signed-events-chain FAIL: <reason>` line on
+//!   stderr carrying exactly one reason code:
+//!   - [`REASON_STORE_IS_POSTGRES`] — the configured store is Postgres; this
+//!     verb walks only a SQLite file, so it refuses rather than walk a side
+//!     file and print OK (use `verify-audit-trail`, which has a Postgres twin).
+//!   - [`REASON_STORE_MISSING`] — `--db` names no file (it is not created).
+//!   - [`REASON_EMPTY_CHAIN`] — the store has no `signed_events` rows.
+//!   - [`REASON_HEAD_BELOW_SINCE`] — the chain head is below `--since`, so
+//!     rows already verified are gone.
+//!   - [`REASON_CHAIN_BREAK`] — the cross-row chain does not hold.
 //!
 //! ## Output formats
 //!
@@ -38,6 +49,19 @@ use crate::cli::CliOutput;
 
 /// Shared `.context` label for the chain-report write paths (#1558 batch 6).
 const CTX_WRITE_CHAIN_REPORT: &str = "write chain report";
+
+/// Exit code for every finding (chain break or absence).
+pub const EXIT_FINDING: i32 = 1;
+/// Reason: the configured store is Postgres (#9046).
+pub const REASON_STORE_IS_POSTGRES: &str = "store_is_postgres";
+/// Reason: the `--db` file does not exist (#9046).
+pub const REASON_STORE_MISSING: &str = "store_missing";
+/// Reason: the store holds no `signed_events` rows (#8741).
+pub const REASON_EMPTY_CHAIN: &str = "empty_chain";
+/// Reason: the chain head sequence is below `--since` (#9008).
+pub const REASON_HEAD_BELOW_SINCE: &str = "head_below_since";
+/// Reason: the cross-row hash chain does not hold.
+pub const REASON_CHAIN_BREAK: &str = "chain_break";
 
 /// Arguments for `ai-memory verify-signed-events-chain`.
 #[derive(clap::Args, Debug)]
@@ -65,8 +89,21 @@ pub struct ChainVerifyReportJson {
     pub chain_holds: bool,
 }
 
+/// Write the one stderr finding line and return [`EXIT_FINDING`].
+fn finding(out: &mut CliOutput<'_>, reason: &str, detail: &str) -> Result<i32> {
+    writeln!(
+        out.stderr,
+        "verify-signed-events-chain FAIL: {reason}: {detail}"
+    )
+    .context(CTX_WRITE_CHAIN_REPORT)?;
+    Ok(EXIT_FINDING)
+}
+
 /// Run the verifier. Returns the desired process exit code (0 on
-/// chain GREEN, 1 on chain break).
+/// chain GREEN, [`EXIT_FINDING`] on any finding).
+///
+/// `store_url` is the resolved store URL (`resolve_store_url`); a Postgres
+/// URL is refused before anything is opened (#9046).
 ///
 /// # Errors
 ///
@@ -74,11 +111,46 @@ pub struct ChainVerifyReportJson {
 /// query or the report rendering fails.
 pub fn run(
     db_path: &Path,
+    store_url: Option<&str>,
     args: &VerifySignedEventsChainArgs,
     out: &mut CliOutput<'_>,
 ) -> Result<i32> {
+    if store_url.is_some_and(crate::store_url::is_postgres_url) {
+        return finding(
+            out,
+            REASON_STORE_IS_POSTGRES,
+            "the configured store is Postgres; this verb walks only a SQLite file \
+             (verify-audit-trail walks the Postgres chain)",
+        );
+    }
+    // `db::open` creates a missing file; check first so a typo is a finding,
+    // not an empty chain that was just created.
+    if !db_path.is_file() {
+        return finding(
+            out,
+            REASON_STORE_MISSING,
+            &format!("no database file at {}", db_path.display()),
+        );
+    }
     let conn =
         crate::db::open(db_path).with_context(|| format!("open db at {}", db_path.display()))?;
+    let head: i64 = conn
+        .query_row(crate::signed_events::CHAIN_HEAD_SQL, [], |row| row.get(0))
+        .context("read signed_events chain head")?;
+    if head == 0 {
+        return finding(
+            out,
+            REASON_EMPTY_CHAIN,
+            "the store holds no signed_events rows",
+        );
+    }
+    if args.since > head {
+        return finding(
+            out,
+            REASON_HEAD_BELOW_SINCE,
+            &format!("chain head sequence={head} is below --since {}", args.since),
+        );
+    }
     let since = if args.since > 0 {
         Some(args.since)
     } else {
@@ -87,6 +159,9 @@ pub fn run(
     let report = crate::signed_events::verify_chain(&conn, since, None)
         .context("verify_chain over signed_events")?;
     let holds = report.chain_holds();
+    let unverified = report
+        .rows_checked
+        .saturating_sub(report.rows_positively_verified);
 
     match args.format.as_str() {
         "json" => {
@@ -100,12 +175,15 @@ pub fn run(
             writeln!(out.stdout, "{json}").context(CTX_WRITE_CHAIN_REPORT)?;
         }
         _ => {
-            // text — one-line summary on stdout.
+            // text — one-line summary on stdout, with the coverage stated.
             if holds {
                 writeln!(
                     out.stdout,
-                    "verify-signed-events-chain OK: {} row(s) walked, chain holds",
+                    "verify-signed-events-chain OK: {} row(s) walked, chain holds \
+                     (sequence {}..={head}; {unverified} row signature(s) not verified \
+                     against a pin)",
                     report.rows_checked,
+                    args.since.saturating_add(1),
                 )
                 .context(CTX_WRITE_CHAIN_REPORT)?;
             } else {
@@ -123,7 +201,14 @@ pub fn run(
         }
     }
 
-    Ok(if holds { 0 } else { 1 })
+    if holds {
+        Ok(0)
+    } else {
+        let where_ = report
+            .chain_break
+            .map_or_else(|| "<unknown>".to_string(), |s| s.to_string());
+        finding(out, REASON_CHAIN_BREAK, &format!("at sequence={where_}"))
+    }
 }
 
 #[cfg(test)]
@@ -155,20 +240,43 @@ mod tests {
     }
 
     #[test]
-    fn empty_db_reports_zero_rows_chain_holds() {
+    fn empty_db_is_an_empty_chain_finding_8741() {
+        // #8741 — 0 rows is a finding, never a vacuous green.
         let (_dir, path) = temp_db();
+        for format in ["json", "text"] {
+            let args = VerifySignedEventsChainArgs {
+                since: 0,
+                format: format.to_string(),
+            };
+            let mut buf_out = Vec::<u8>::new();
+            let mut buf_err = Vec::<u8>::new();
+            let mut out = CliOutput::from_std(&mut buf_out, &mut buf_err);
+            let code = run(&path, None, &args, &mut out).expect("run");
+            assert_eq!(code, EXIT_FINDING, "{format}: empty chain is a finding");
+            let e = String::from_utf8(buf_err).expect("utf-8");
+            assert!(e.contains(REASON_EMPTY_CHAIN), "{format}: got: {e}");
+            assert!(buf_out.is_empty(), "{format}: no green report on stdout");
+        }
+    }
+
+    #[test]
+    fn since_above_head_is_a_finding_9008() {
+        let (_dir, path) = temp_db();
+        {
+            let conn = crate::db::open(&path).expect("open");
+            append_signed_event(&conn, &fixture_event(b"p-0")).expect("append");
+        }
         let args = VerifySignedEventsChainArgs {
-            since: 0,
-            format: "json".to_string(),
+            since: 5,
+            format: "text".to_string(),
         };
         let mut buf_out = Vec::<u8>::new();
         let mut buf_err = Vec::<u8>::new();
         let mut out = CliOutput::from_std(&mut buf_out, &mut buf_err);
-        let code = run(&path, &args, &mut out).expect("run");
-        assert_eq!(code, 0, "empty chain holds vacuously");
-        let s = String::from_utf8(buf_out).expect("utf-8");
-        assert!(s.contains("\"chain_holds\": true"), "got: {s}");
-        assert!(s.contains("\"rows_checked\": 0"), "got: {s}");
+        let code = run(&path, None, &args, &mut out).expect("run");
+        assert_eq!(code, EXIT_FINDING);
+        let e = String::from_utf8(buf_err).expect("utf-8");
+        assert!(e.contains(REASON_HEAD_BELOW_SINCE), "got: {e}");
     }
 
     #[test]
@@ -188,7 +296,7 @@ mod tests {
         let mut buf_out = Vec::<u8>::new();
         let mut buf_err = Vec::<u8>::new();
         let mut out = CliOutput::from_std(&mut buf_out, &mut buf_err);
-        let code = run(&path, &args, &mut out).expect("run");
+        let code = run(&path, None, &args, &mut out).expect("run");
         assert_eq!(code, 0, "3-row clean chain holds; got code={code}");
         let s = String::from_utf8(buf_out).expect("utf-8");
         assert!(s.contains("OK"), "got: {s}");
@@ -229,7 +337,7 @@ mod tests {
         let mut buf_out = Vec::<u8>::new();
         let mut buf_err = Vec::<u8>::new();
         let mut out = CliOutput::from_std(&mut buf_out, &mut buf_err);
-        let code = run(&path, &args, &mut out).expect("run");
+        let code = run(&path, None, &args, &mut out).expect("run");
         assert_eq!(code, 0, "filtered chain still holds");
         let s = String::from_utf8(buf_out).expect("utf-8");
         // We skipped sequence=1, so 2 rows walked.
@@ -271,7 +379,7 @@ mod tests {
         let mut buf_out = Vec::<u8>::new();
         let mut buf_err = Vec::<u8>::new();
         let mut out = CliOutput::from_std(&mut buf_out, &mut buf_err);
-        let code = run(&path, &args, &mut out).expect("run");
+        let code = run(&path, None, &args, &mut out).expect("run");
         assert_eq!(code, 1, "chain break must produce exit code 1");
         let s = String::from_utf8(buf_out).expect("utf-8");
         assert!(s.contains("FAIL"), "must say FAIL; got: {s}");
@@ -311,7 +419,7 @@ mod tests {
         let mut buf_out = Vec::<u8>::new();
         let mut buf_err = Vec::<u8>::new();
         let mut out = CliOutput::from_std(&mut buf_out, &mut buf_err);
-        let code = run(&path, &args, &mut out).expect("run");
+        let code = run(&path, None, &args, &mut out).expect("run");
         assert_eq!(code, 1);
         let s = String::from_utf8(buf_out).expect("utf-8");
         assert!(s.contains("\"chain_holds\": false"), "got: {s}");
@@ -325,6 +433,10 @@ mod tests {
         // including an empty string, "yaml", or the actual default
         // "text". Confirms the default-arm dispatch.
         let (_dir, path) = temp_db();
+        {
+            let conn = crate::db::open(&path).expect("open");
+            append_signed_event(&conn, &fixture_event(b"p-0")).expect("append");
+        }
         let args = VerifySignedEventsChainArgs {
             since: 0,
             format: "yaml-unrecognised".to_string(),
@@ -332,7 +444,7 @@ mod tests {
         let mut buf_out = Vec::<u8>::new();
         let mut buf_err = Vec::<u8>::new();
         let mut out = CliOutput::from_std(&mut buf_out, &mut buf_err);
-        let code = run(&path, &args, &mut out).expect("run");
+        let code = run(&path, None, &args, &mut out).expect("run");
         assert_eq!(code, 0);
         let s = String::from_utf8(buf_out).expect("utf-8");
         assert!(s.contains("OK"), "must hit text branch; got: {s}");

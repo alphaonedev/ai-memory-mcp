@@ -41,6 +41,13 @@ use crate::cli::CliOutput;
 /// literal de-dup — referenced at every `writeln!` site below).
 const CTX_WRITE_AUDIT_REPORT: &str = "write audit-trail report";
 
+/// Exit code for a dirty (or empty) audit trail.
+pub const EXIT_DIRTY: i32 = 1;
+/// Reason: the store holds no `signed_events` rows (#8741).
+pub const REASON_EMPTY_CHAIN: &str = "empty_chain";
+/// Reason: the `--db` file does not exist (#9046 sibling).
+pub const REASON_STORE_MISSING: &str = "store_missing";
+
 /// Arguments for `ai-memory verify-audit-trail`.
 #[derive(clap::Args, Debug)]
 pub struct VerifyAuditTrailArgs {
@@ -106,6 +113,17 @@ pub fn run(
     audit_pubkey: Option<&ed25519_dalek::VerifyingKey>,
     out: &mut CliOutput<'_>,
 ) -> Result<i32> {
+    // #9046 sibling — `db::open` creates a missing file; a typo'd `--db` is a
+    // finding, not an empty store that this verb just created.
+    if !db_path.is_file() {
+        writeln!(
+            out.stderr,
+            "verify-audit-trail FAIL: {REASON_STORE_MISSING}: no database file at {}",
+            db_path.display()
+        )
+        .context(CTX_WRITE_AUDIT_REPORT)?;
+        return Ok(EXIT_DIRTY);
+    }
     let conn =
         crate::db::open(db_path).with_context(|| format!("open db at {}", db_path.display()))?;
     let report =
@@ -131,6 +149,29 @@ pub fn render(
     json: bool,
     out: &mut CliOutput<'_>,
 ) -> Result<i32> {
+    // #8741 — an empty chain (head sequence 0) is a finding on BOTH backends:
+    // green means rows were checked, never "nothing to check". The library
+    // report stays vacuously clean; the CLI verdict, defined once here, does not.
+    if report.head_sequence == 0 {
+        if json {
+            let json =
+                serde_json::to_string_pretty(&report).context("serialize audit-trail report")?;
+            writeln!(out.stdout, "{json}").context(CTX_WRITE_AUDIT_REPORT)?;
+        } else {
+            writeln!(
+                out.stdout,
+                "verify-audit-trail FAIL: {REASON_EMPTY_CHAIN}: the store holds no \
+                 signed_events rows (0 event(s) checked, head sequence=0)",
+            )
+            .context(CTX_WRITE_AUDIT_REPORT)?;
+        }
+        writeln!(
+            out.stderr,
+            "verify-audit-trail FAIL: {REASON_EMPTY_CHAIN}: the store holds no signed_events rows"
+        )
+        .context(CTX_WRITE_AUDIT_REPORT)?;
+        return Ok(EXIT_DIRTY);
+    }
     let clean = report.is_clean();
 
     if json {
@@ -164,7 +205,8 @@ pub fn render(
             writeln!(
                 out.stdout,
                 "  tail truncation detected: off-table anchor head={anchored_head} \
-                 but in-DB head={db_head} ({} trailing row(s) removed)",
+                 but in-DB head={db_head} (at least {} trailing row(s) removed; rows \
+                 after the anchor are not tail-protected)",
                 anchored_head - db_head,
             )
             .context(CTX_WRITE_AUDIT_REPORT)?;
@@ -361,7 +403,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_db_exits_zero_intact() {
+    fn empty_db_is_an_empty_chain_finding_8741() {
         let (_dir, path) = temp_db();
         let args = VerifyAuditTrailArgs {
             since: None,
@@ -373,10 +415,33 @@ mod tests {
         let mut buf_err = Vec::<u8>::new();
         let mut out = CliOutput::from_std(&mut buf_out, &mut buf_err);
         let code = run(&path, &args, None, &mut out).expect("run");
-        assert_eq!(code, 0, "empty chain is trivially clean");
+        // #8741 — the library report stays vacuously clean (the JSON body is
+        // unchanged), but the CLI verdict for 0 rows is a finding.
+        assert_eq!(code, EXIT_DIRTY, "empty chain is a finding");
         let s = String::from_utf8(buf_out).expect("utf-8");
-        assert!(s.contains("\"chain_intact\": true"), "got: {s}");
         assert!(s.contains("\"total_events\": 0"), "got: {s}");
+        let e = String::from_utf8(buf_err).expect("utf-8");
+        assert!(e.contains(REASON_EMPTY_CHAIN), "got: {e}");
+    }
+
+    #[test]
+    fn missing_db_is_a_store_missing_finding_9046() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("absent.db");
+        let args = VerifyAuditTrailArgs {
+            since: None,
+            json: false,
+            store_url: None,
+            audit_pubkey: None,
+        };
+        let mut buf_out = Vec::<u8>::new();
+        let mut buf_err = Vec::<u8>::new();
+        let mut out = CliOutput::from_std(&mut buf_out, &mut buf_err);
+        let code = run(&path, &args, None, &mut out).expect("run");
+        assert_eq!(code, EXIT_DIRTY);
+        let e = String::from_utf8(buf_err).expect("utf-8");
+        assert!(e.contains(REASON_STORE_MISSING), "got: {e}");
+        assert!(!path.exists(), "the verifier must not create the store");
     }
 
     #[test]
