@@ -170,7 +170,7 @@ async fn mount_chat_yes(server: &MockServer) {
     Mock::given(method("POST"))
         .and(path("/api/chat"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "message": {"content": "yes"},
+            "message": {"content": "yes"}, "done_reason": "stop",
         })))
         .mount(server)
         .await;

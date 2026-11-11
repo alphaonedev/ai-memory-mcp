@@ -14,9 +14,9 @@ async fn issue_4046_whitespace_summary_is_refused() {
         let server = MockServer::start().await;
         let message = json!({"content": " \n\t"});
         let body = if openai {
-            json!({"choices": [{"message": message}]})
+            json!({"choices": [{"message": message, "finish_reason": "stop"}]})
         } else {
-            json!({"message": message})
+            json!({"message": message, "done": true, "done_reason": "stop"})
         };
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_json(body))

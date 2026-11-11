@@ -55,10 +55,9 @@ async fn start_chat_mock(chat_content: &str) -> MockServer {
         .await;
     Mock::given(method("POST"))
         .and(path("/api/chat"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(json!({"message": {"content": chat_content}, "done": true})),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            json!({"message": {"content": chat_content}, "done": true, "done_reason": "stop"}),
+        ))
         .mount(&server)
         .await;
     server
@@ -434,30 +433,147 @@ async fn consolidate_body_agent_id_mismatch_returns_403() {
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
+/// #9018 — start a chat endpoint that answers with an arbitrary Ollama body.
+async fn start_chat_body_mock(body: Value) -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .mount(&server)
+        .await;
+    server
+}
+
+/// #9018 — how many of `ids` are still rows in `memories`.
+async fn live_rows(db: &Db, ids: &[String]) -> usize {
+    let guard = db.lock().await;
+    ids.iter()
+        .filter(|id| {
+            guard
+                .0
+                .query_row(
+                    "SELECT COUNT(*) FROM memories WHERE id = ?1",
+                    [id.as_str()],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap_or(0)
+                > 0
+        })
+        .count()
+}
+
+/// #9018 — the LLM side of one consolidate cell.
+#[derive(Clone, Copy, Debug)]
+enum LlmCell {
+    Absent,
+    Complete,
+    Truncated,
+    Empty,
+    NoStopReason,
+    Http500,
+}
+
+/// #9018 — HTTP consolidate x llm form x caller summary present/absent.
+/// A caller summary is always used as-is (the LLM is never asked). With no
+/// caller summary, only a complete LLM summary lets the write through;
+/// every other form is refused with the exact error and the sources stay
+/// live rows.
 #[tokio::test]
-async fn consolidate_no_llm_deterministic_summary_fallback() {
-    // No LLM wired + summary omitted → deterministic concat fallback.
-    let (router, _f, _db) = build_llm_router(None);
-    let id1 = seed_memory(&router, "cov-cons4", "Det one", "det").await;
-    let id2 = seed_memory(&router, "cov-cons4", "Det two", "det").await;
-    let (status, v) = post_json_as(
-        &router,
-        "/api/v1/consolidate",
-        json!({
-            "ids": [id1, id2],
-            "title": "Deterministic merge",
-            "namespace": "cov-cons4",
-        }),
-        "det",
-    )
-    .await;
-    assert_eq!(status, StatusCode::CREATED, "{v}");
-    assert!(
-        v["summary"]
-            .as_str()
-            .is_some_and(|s| s.contains("Consolidated summary of")),
-        "deterministic fallback: {v}",
-    );
+async fn consolidate_9018_fails_closed_without_a_complete_summary() {
+    use ai_memory::errors::msg::{CONSOLIDATE_LLM_SUMMARY_FAILED, CONSOLIDATE_SUMMARY_REQUIRED};
+    use ai_memory::llm::{ERR_REPLY_EMPTY, ERR_REPLY_NO_STOP_REASON, ERR_REPLY_TRUNCATED};
+    const LLM_SUMMARY: &str = "A complete consolidated synthesis of the sources.";
+    const CALLER_SUMMARY: &str = "a caller-supplied summary that is comfortably over twenty chars";
+    let cells: [(LlmCell, Option<String>); 6] = [
+        (
+            LlmCell::Absent,
+            Some(CONSOLIDATE_SUMMARY_REQUIRED.to_string()),
+        ),
+        (LlmCell::Complete, None),
+        (
+            LlmCell::Truncated,
+            Some(format!(
+                "{CONSOLIDATE_LLM_SUMMARY_FAILED}: {ERR_REPLY_TRUNCATED}"
+            )),
+        ),
+        (
+            LlmCell::Empty,
+            Some(format!(
+                "{CONSOLIDATE_LLM_SUMMARY_FAILED}: {ERR_REPLY_EMPTY}"
+            )),
+        ),
+        (
+            LlmCell::NoStopReason,
+            Some(format!(
+                "{CONSOLIDATE_LLM_SUMMARY_FAILED}: {ERR_REPLY_NO_STOP_REASON}"
+            )),
+        ),
+        (LlmCell::Http500, None),
+    ];
+    for (cell, expected_error) in cells {
+        for caller_summary in [false, true] {
+            let server = match cell {
+                LlmCell::Absent => None,
+                LlmCell::Complete => Some(start_chat_mock(LLM_SUMMARY).await),
+                LlmCell::Truncated => Some(
+                    start_chat_body_mock(json!({"message": {"content": "A partial sum"},
+                        "done": true, "done_reason": "length"}))
+                    .await,
+                ),
+                LlmCell::Empty => Some(
+                    start_chat_body_mock(json!({"message": {"content": "  "},
+                        "done": true, "done_reason": "stop"}))
+                    .await,
+                ),
+                LlmCell::NoStopReason => Some(
+                    start_chat_body_mock(
+                        json!({"message": {"content": LLM_SUMMARY}, "done": true}),
+                    )
+                    .await,
+                ),
+                LlmCell::Http500 => Some(start_chat_error_mock().await),
+            };
+            let uri = server.as_ref().map(MockServer::uri);
+            let (router, _f, db) = build_llm_router(uri.as_deref());
+            let ns = format!("c9018-{}", uuid::Uuid::new_v4().simple());
+            let ids = vec![
+                seed_memory(&router, &ns, "Source one", "c9018").await,
+                seed_memory(&router, &ns, "Source two", "c9018").await,
+            ];
+            let mut body = json!({"ids": ids, "title": "Merged", "namespace": ns});
+            if caller_summary {
+                body["summary"] = json!(CALLER_SUMMARY);
+            }
+            let (status, v) = post_json_as(&router, "/api/v1/consolidate", body, "c9018").await;
+            let label = format!("{cell:?} caller_summary={caller_summary}");
+            let refused = !caller_summary && !matches!(cell, LlmCell::Complete);
+            if !refused {
+                assert_eq!(status, StatusCode::CREATED, "{label}: {v}");
+                let expected = if caller_summary {
+                    CALLER_SUMMARY
+                } else {
+                    LLM_SUMMARY
+                };
+                assert_eq!(v["summary"], json!(expected), "{label}: {v}");
+                assert_eq!(live_rows(&db, &ids).await, 0, "{label}: sources moved");
+                continue;
+            }
+            let err = v["error"].as_str().unwrap_or_default();
+            match cell {
+                LlmCell::Absent => assert_eq!(status, StatusCode::BAD_REQUEST, "{label}"),
+                _ => assert_eq!(status, StatusCode::BAD_GATEWAY, "{label}"),
+            }
+            match &expected_error {
+                Some(e) => assert_eq!(err, e, "{label}"),
+                None => assert!(
+                    err.starts_with(CONSOLIDATE_LLM_SUMMARY_FAILED),
+                    "{label}: {err}"
+                ),
+            }
+            assert!(!err.contains("A partial sum"), "{label}: reply echoed");
+            assert_eq!(live_rows(&db, &ids).await, 2, "{label}: sources untouched");
+        }
+    }
 }
 
 // ===========================================================================

@@ -177,7 +177,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/api/chat"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "message": {"content": "alpha\nbeta\ngamma\n"},
+                "message": {"content": "alpha\nbeta\ngamma\n"}, "done_reason": "stop",
             })))
             .mount(&server)
             .await;
@@ -208,7 +208,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/api/chat"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "message": {"content": "\n\n   \n"},
+                "message": {"content": "\n\n   \n"}, "done_reason": "stop",
             })))
             .mount(&server)
             .await;

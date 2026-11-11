@@ -1143,6 +1143,43 @@ mod tests {
         assert!(s.contains("sig=yes"), "signature flag: {s}");
     }
 
+    /// #9018 sibling (char-boundary class) — a multi-byte id whose byte 8
+    /// falls inside a char must render a whole-char prefix, never panic.
+    #[test]
+    fn render_text_multibyte_edge_id_does_not_panic() {
+        let multibyte_id = format!("a{}", "\u{e9}".repeat(8));
+        let report = ChainReport {
+            ok: true,
+            root_id: multibyte_id.clone(),
+            n_memories: 2,
+            chain_depth: 1,
+            edges_verified: 1,
+            edges_failed: 0,
+            edges: vec![EdgeResult {
+                source_id: multibyte_id.clone(),
+                target_id: multibyte_id,
+                signature_hex: None,
+                attest_level: "unsigned".to_string(),
+                verified: true,
+                failure_reason: None,
+            }],
+            max_reflection_depth_per_namespace: std::collections::HashMap::new(),
+            bounded_status: "within_cap".to_string(),
+            signed_events: vec![],
+            generated_at: "2026-11-11T00:00:00Z".to_string(),
+        };
+        let mut stdout = Vec::<u8>::new();
+        let mut stderr = Vec::<u8>::new();
+        let mut out = crate::cli::CliOutput::from_std(&mut stdout, &mut stderr);
+        render_text(&report, &mut out).expect("render");
+        let s = String::from_utf8(stdout).expect("utf8");
+        let prefix = format!("a{}", "\u{e9}".repeat(3));
+        assert!(
+            s.contains(&format!("{prefix} -> {prefix}")),
+            "whole-char prefix: {s}"
+        );
+    }
+
     #[test]
     fn render_text_signed_event_without_signature_says_no() {
         // Drives the `if ev.signature_present` else branch (line 508).

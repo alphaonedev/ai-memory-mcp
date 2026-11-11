@@ -1241,7 +1241,7 @@ async fn http_expand_query_success_envelope_uses_expanded_terms_key() {
     Mock::given(method("POST"))
         .and(path("/api/chat"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "message": {"content": "vec-search\nsemantic\nrecall"},
+            "message": {"content": "vec-search\nsemantic\nrecall"}, "done_reason": "stop",
         })))
         .mount(&server)
         .await;

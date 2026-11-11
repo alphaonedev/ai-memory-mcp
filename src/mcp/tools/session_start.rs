@@ -572,7 +572,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/api/chat"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "message": {"content": "summary text"},
+                "message": {"content": "summary text"}, "done_reason": "stop",
                 "done": true,
             })))
             .mount(&server)

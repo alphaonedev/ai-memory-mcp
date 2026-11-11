@@ -333,7 +333,7 @@ async fn auto_tag_refuses_unreadable_unowned_row_3381() {
     Mock::given(method("POST"))
         .and(path("/api/chat"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "message": {"content": "alpha"},
+            "message": {"content": "alpha"}, "done_reason": "stop",
         })))
         .mount(&server)
         .await;
@@ -370,7 +370,7 @@ async fn auto_tag_allows_owner_3381() {
     Mock::given(method("POST"))
         .and(path("/api/chat"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "message": {"content": "alpha\nbeta"},
+            "message": {"content": "alpha\nbeta"}, "done_reason": "stop",
         })))
         .mount(&server)
         .await;
@@ -413,7 +413,7 @@ async fn auto_tag_governed_namespace_queues_pending_3381() {
     Mock::given(method("POST"))
         .and(path("/api/chat"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "message": {"content": "alpha\nbeta"},
+            "message": {"content": "alpha\nbeta"}, "done_reason": "stop",
         })))
         .mount(&server)
         .await;
@@ -475,7 +475,7 @@ async fn success_unions_tags_and_persists() {
     Mock::given(method("POST"))
         .and(path("/api/chat"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "message": {"content": "alpha\nbeta\ngamma"},
+            "message": {"content": "alpha\nbeta\ngamma"}, "done_reason": "stop",
         })))
         .mount(&server)
         .await;
@@ -509,36 +509,40 @@ async fn success_unions_tags_and_persists() {
     assert_eq!(stored.len(), 3);
 }
 
-/// Envelope (6/N): LLM returns no tags (blank-only output) — the
-/// envelope still completes; `new_tags` is empty and `all_tags`
-/// is unchanged from the prior state.
+/// Envelope (6/N), #8963 — LLM returns a blank-only reply. An empty
+/// reply is not a classification, so the envelope refuses with the exact
+/// `ERR_REPLY_EMPTY` text and the stored tags stay unchanged; pre-fix it
+/// returned a clean success with zero new tags.
 #[tokio::test(flavor = "multi_thread")]
-async fn success_with_empty_response_yields_no_new_tags() {
+async fn blank_response_is_refused_and_tags_unchanged_8963() {
     let server = MockServer::start().await;
     mount_tags_ok(&server).await;
     Mock::given(method("POST"))
         .and(path("/api/chat"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "message": {"content": "   \n  \n"},
+            "message": {"content": "   \n  \n"}, "done_reason": "stop",
         })))
         .mount(&server)
         .await;
 
     let uri = server.uri();
-    let out = tokio::task::spawn_blocking(move || {
+    let (err, stored) = tokio::task::spawn_blocking(move || {
         let _identity = ai_memory::identity::test_agent_id::AgentIdOverride::unset();
         let (conn, _tmp) = fresh_db();
         let id = seed_memory(&conn, vec!["existing".to_string()]);
         let client = OllamaClient::new_for_tests_without_probe(&uri, "test-model").unwrap();
-        handle_auto_tag(&conn, Some(&client), &json!({"id": id}), None, None).expect("ok")
+        let err = handle_auto_tag(&conn, Some(&client), &json!({"id": id}), None, None)
+            .expect_err("#8963: a blank reply must be refused");
+        let stored = db::get(&conn, &id).unwrap().expect("row").tags;
+        (err, stored)
     })
     .await
     .unwrap();
-    let new_tags = out["new_tags"].as_array().unwrap();
-    assert_eq!(new_tags.len(), 0);
-    let all_tags = out["all_tags"].as_array().unwrap();
-    assert_eq!(all_tags.len(), 1);
-    assert_eq!(all_tags[0], "existing");
+    assert!(
+        err.starts_with(ai_memory::llm::ERR_REPLY_EMPTY),
+        "#8963: expected the empty-reply error, got {err:?}"
+    );
+    assert_eq!(stored, vec!["existing".to_string()]);
 }
 
 /// Envelope (7/N): LLM 500 → error surfaces through `?`.

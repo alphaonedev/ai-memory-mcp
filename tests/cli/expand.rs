@@ -39,7 +39,7 @@ async fn with_llm_emits_envelope_and_parses_terms() {
     Mock::given(method("POST"))
         .and(path("/api/chat"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "message": {"content": "alpha\nbeta\ngamma"},
+            "message": {"content": "alpha\nbeta\ngamma"}, "done_reason": "stop",
         })))
         .mount(&server)
         .await;
@@ -142,7 +142,7 @@ async fn cli_and_mcp_share_one_expansion_path() {
     Mock::given(method("POST"))
         .and(path("/api/chat"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "message": {"content": "vec-search\nsemantic\nrecall"},
+            "message": {"content": "vec-search\nsemantic\nrecall"}, "done_reason": "stop",
         })))
         .mount(&server)
         .await;

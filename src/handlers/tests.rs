@@ -15790,9 +15790,11 @@ async fn http_expand_query_route_returns_503_when_no_llm_l6() {
 //
 // Before L7, `ConsolidateBody.summary` was `String` (required), so
 // axum's `Json<T>` extractor rejected S51's `{use_llm: true}` body
-// with 422 UNPROCESSABLE ENTITY. The fix made `summary` optional
-// and synthesises a deterministic fallback when the LLM is absent.
-// The 2xx assertion guards against the regression returning.
+// with 422 UNPROCESSABLE ENTITY. L7 made `summary` optional. #9018:
+// with no LLM wired and no caller summary the handler no longer
+// synthesises a placeholder (that path stored a fake summary and then
+// removed the sources); it refuses with 400 and the exact
+// `CONSOLIDATE_SUMMARY_REQUIRED` text, still never 422.
 
 #[tokio::test]
 async fn http_consolidate_accepts_use_llm_without_summary_l7() {
@@ -15860,25 +15862,29 @@ async fn http_consolidate_accepts_use_llm_without_summary_l7() {
         )
         .await
         .unwrap();
-    // The regression manifests as 422; the fix produces 201.
+    // The L7 regression manifests as 422; #9018 refuses with 400.
     assert_ne!(
         resp.status(),
         StatusCode::UNPROCESSABLE_ENTITY,
         "L7 regression: consolidate 422'd on absent summary"
     );
-    assert_eq!(resp.status(), StatusCode::CREATED);
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     let bytes = axum::body::to_bytes(resp.into_body(), crate::TEST_BODY_READ_CAP)
         .await
         .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    // S51 reads `summary_len >= 20`; assert the body carries a
-    // summary string (the LLM-absent fallback is well above 20
-    // chars for any 2-id input).
-    let summary = v["summary"].as_str().expect("summary in response");
-    assert!(
-        summary.len() >= 20,
-        "L7 fallback summary too short: {summary:?}"
+    assert_eq!(
+        v["error"].as_str(),
+        Some(crate::errors::msg::CONSOLIDATE_SUMMARY_REQUIRED)
     );
+    // #9018: the refused consolidate removed neither source.
+    let lock = state.lock().await;
+    for id in [&id_a, &id_b] {
+        assert!(
+            db::get(&lock.0, id).unwrap().is_some(),
+            "#9018: refused consolidate removed source {id}"
+        );
+    }
 }
 
 // ------------------------------------------------------------------
@@ -15968,16 +15974,16 @@ async fn http_consolidate_response_carries_summary_on_every_key_s51_reads() {
         .route("/api/v1/consolidate", axum_post(consolidate_memories))
         .with_state(test_app_state(state.clone()));
 
-    // S51's exact request shape — `use_llm: true` and no `summary`
-    // field. test_state() does not wire an LLM, so the resolver
-    // falls through to the deterministic concat-of-titles
-    // fallback, exactly as the postgres branch will on a daemon
-    // whose Ollama endpoint is down.
+    // S51's request shape plus a caller summary. test_state() wires no
+    // LLM, and #9018 refuses a summary-less consolidate there instead of
+    // storing a placeholder, so the mirror contract is pinned on the
+    // caller-summary path.
     let body = serde_json::json!({
         "ids": [id_a, id_b],
         "title": "AOM-101 lifecycle",
         "namespace": "l7-followup",
         "use_llm": true,
+        "summary": "AOM-101 hardened the sync_push retry path with backoff and jitter.",
     });
     let resp = app
         .oneshot(

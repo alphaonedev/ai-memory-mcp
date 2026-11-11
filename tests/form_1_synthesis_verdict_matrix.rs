@@ -173,10 +173,9 @@ fn shared_mock_for_synthesis(verdicts_json: Value) -> MockServer {
         let body_str = serde_json::to_string(&verdicts_json).unwrap();
         Mock::given(method("POST"))
             .and(path("/api/chat"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(json!({"message": {"content": body_str}, "done": true})),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"message": {"content": body_str}, "done": true, "done_reason": "stop"}),
+            ))
             .mount(&server)
             .await;
         Mock::given(method("POST"))

@@ -652,6 +652,16 @@ pub enum ChatOutcome {
     ToolCalls(Vec<ToolCall>),
 }
 
+/// #8945 / #8963 — reply completion status and the contradiction verdict
+/// parser live in `src/llm/reply_integrity.rs`.
+mod reply_integrity;
+pub use reply_integrity::{
+    ERR_CONTRADICTION_UNCLASSIFIABLE, ERR_OLLAMA_NO_CONTENT, ERR_OPENAI_NO_CONTENT,
+    ERR_REPLY_EMPTY, ERR_REPLY_FILTERED, ERR_REPLY_NO_STOP_REASON, ERR_REPLY_NOT_DONE,
+    ERR_REPLY_TOOL_STOP, ERR_REPLY_TRUNCATED, ERR_REPLY_UNRECOGNISED_STOP, ReplyCompletion,
+    parse_contradiction_verdict,
+};
+
 /// #1866 — parse an assistant `message` object's `tool_calls` array into
 /// typed [`ToolCall`]s.
 ///
@@ -4527,7 +4537,7 @@ mod wiremock_tests {
         Mock::given(method("POST"))
             .and(path("/api/chat"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "message": {"role": "assistant", "content": "hello"},
+                "message": {"role": "assistant", "content": "hello"}, "done_reason": "stop",
                 "done": true,
             })))
             .mount(&server)
@@ -4611,7 +4621,7 @@ mod wiremock_tests {
                 "stream": false,
             })))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "message": {"role": "assistant", "content": "ok"},
+                "message": {"role": "assistant", "content": "ok"}, "done_reason": "stop",
             })))
             .mount(&server)
             .await;
@@ -4787,7 +4797,7 @@ mod wiremock_tests {
             .and(path("/api/chat"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 // Trailing newline + blank line should be filtered out.
-                "message": {"content": "term1\nterm2\nterm3\n\n"},
+                "message": {"content": "term1\nterm2\nterm3\n\n"}, "done_reason": "stop",
             })))
             .mount(&server)
             .await;
@@ -4823,7 +4833,7 @@ mod wiremock_tests {
         Mock::given(method("POST"))
             .and(path("/api/chat"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "message": {"content": "Tag1\nTAG2\ntag3"},
+                "message": {"content": "Tag1\nTAG2\ntag3"}, "done_reason": "stop",
             })))
             .mount(&server)
             .await;
@@ -4851,7 +4861,7 @@ mod wiremock_tests {
         Mock::given(method("POST"))
             .and(path("/api/chat"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "message": {"content": "yes\n"},
+                "message": {"content": "yes\n"}, "done_reason": "stop",
             })))
             .mount(&server)
             .await;
@@ -4872,7 +4882,7 @@ mod wiremock_tests {
         Mock::given(method("POST"))
             .and(path("/api/chat"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "message": {"content": "no"},
+                "message": {"content": "no"}, "done_reason": "stop",
             })))
             .mount(&server_no)
             .await;
@@ -4885,13 +4895,14 @@ mod wiremock_tests {
         .unwrap();
         assert!(!no.unwrap(), "'no' should NOT be detected as contradiction");
 
-        // Garbage input should fall through `starts_with("yes")` → false.
+        // #8945 — an unclassifiable answer is an explicit error, never a
+        // default false.
         let server_garbage = MockServer::start().await;
         mount_tags_ok(&server_garbage, json!({"models": []})).await;
         Mock::given(method("POST"))
             .and(path("/api/chat"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "message": {"content": "definitely-not-yes-or-no"},
+                "message": {"content": "definitely-not-yes-or-no"}, "done_reason": "stop",
             })))
             .mount(&server_garbage)
             .await;
@@ -4902,9 +4913,10 @@ mod wiremock_tests {
         })
         .await
         .unwrap();
-        assert!(
-            !garbage.unwrap(),
-            "garbage answer should default to non-contradiction"
+        assert_eq!(
+            garbage.map_err(|e| e.to_string()),
+            Err(super::ERR_CONTRADICTION_UNCLASSIFIABLE.to_string()),
+            "garbage answer is unclassifiable, not a default false"
         );
     }
 
@@ -4920,7 +4932,7 @@ mod wiremock_tests {
         Mock::given(method("POST"))
             .and(path("/api/chat"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "message": {"content": "yes"},
+                "message": {"content": "yes"}, "done_reason": "stop",
             })))
             .mount(&server)
             .await;
@@ -4951,7 +4963,7 @@ mod wiremock_tests {
         Mock::given(method("POST"))
             .and(path("/api/chat"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "message": {"content": "yes"},
+                "message": {"content": "yes"}, "done_reason": "stop",
             })))
             .mount(&server)
             .await;
@@ -5020,7 +5032,7 @@ mod wiremock_tests {
             .and(path("/api/chat"))
             .and(body_partial_json(json!({"model": "gemma3:4b"})))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "message": {"content": "alpha\nbeta\ngamma"},
+                "message": {"content": "alpha\nbeta\ngamma"}, "done_reason": "stop",
             })))
             .expect(1)
             .mount(&server)
@@ -5056,7 +5068,7 @@ mod wiremock_tests {
         Mock::given(method("POST"))
             .and(path("/api/chat"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "message": {"content": "one\ntwo"},
+                "message": {"content": "one\ntwo"}, "done_reason": "stop",
             })))
             .expect(1)
             .mount(&server)
@@ -5713,7 +5725,7 @@ mod perf9_async_tests {
         Mock::given(method("POST"))
             .and(path("/api/chat"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "message": {"role": "assistant", "content": "hello world"},
+                "message": {"role": "assistant", "content": "hello world"}, "done_reason": "stop",
             })))
             .mount(&server)
             .await;
@@ -5737,7 +5749,7 @@ mod perf9_async_tests {
                 ],
             })))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "message": {"content": "ok"},
+                "message": {"content": "ok"}, "done_reason": "stop",
             })))
             .mount(&server)
             .await;
@@ -5862,7 +5874,7 @@ mod perf9_async_tests {
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "choices": [{"message": {"role": "assistant", "content": "hi from openai"}}]
+                "choices": [{"message": {"role": "assistant", "content": "hi from openai"}, "finish_reason": "stop"}]
             })))
             .mount(&server)
             .await;
@@ -5953,7 +5965,9 @@ mod perf9_async_tests {
                     "tool_calls": [{
                         "function": {"name": "get_weather", "arguments": {"city": "London"}}
                     }]
-                }
+                },
+                "done": true,
+                "done_reason": "stop"
             })))
             .mount(&server)
             .await;
@@ -5981,7 +5995,7 @@ mod perf9_async_tests {
         Mock::given(method("POST"))
             .and(path("/api/chat"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "message": {"role": "assistant", "content": "{\"atoms\":[{\"text\":\"a\"}]}"}
+                "message": {"role": "assistant", "content": "{\"atoms\":[{\"text\":\"a\"}]}"}, "done_reason": "stop"
             })))
             .mount(&server)
             .await;
@@ -6009,7 +6023,9 @@ mod perf9_async_tests {
                     "role": "assistant",
                     "content": "fallback text",
                     "tool_calls": [{"function": {}}]
-                }
+                },
+                "done": true,
+                "done_reason": "stop"
             })))
             .mount(&server)
             .await;
@@ -6038,7 +6054,7 @@ mod perf9_async_tests {
                     "tool_calls": [{
                         "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"}
                     }]
-                }}]
+                }, "finish_reason": "tool_calls"}]
             })))
             .mount(&server)
             .await;
@@ -6065,7 +6081,7 @@ mod perf9_async_tests {
             .and(path("/api/chat"))
             .and(body_partial_json(json!({"stream": false})))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "message": {"role": "assistant", "content": "plain reply"}
+                "message": {"role": "assistant", "content": "plain reply"}, "done_reason": "stop"
             })))
             .mount(&server)
             .await;
@@ -6347,7 +6363,7 @@ mod perf9_async_tests {
         Mock::given(method("POST"))
             .and(path("/api/chat"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "message": {"content": "one\ntwo\n\nthree"},
+                "message": {"content": "one\ntwo\n\nthree"}, "done_reason": "stop",
             })))
             .mount(&server)
             .await;
@@ -6368,7 +6384,7 @@ mod perf9_async_tests {
         Mock::given(method("POST"))
             .and(path("/api/chat"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "message": {"content": "summarized"},
+                "message": {"content": "summarized"}, "done_reason": "stop",
             })))
             .mount(&server)
             .await;
@@ -6393,7 +6409,7 @@ mod perf9_async_tests {
         Mock::given(method("POST"))
             .and(path("/api/chat"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "message": {"content": "A\nB\nC\nD\nE\nF\nG\nH\nI\nJ"},
+                "message": {"content": "A\nB\nC\nD\nE\nF\nG\nH\nI\nJ"}, "done_reason": "stop",
             })))
             .mount(&server)
             .await;
@@ -6418,7 +6434,7 @@ mod perf9_async_tests {
             .and(path("/api/chat"))
             .and(body_partial_json(json!({"model": "fast-model"})))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "message": {"content": "a\nb\nc"},
+                "message": {"content": "a\nb\nc"}, "done_reason": "stop",
             })))
             .expect(1)
             .mount(&server)
@@ -6443,7 +6459,7 @@ mod perf9_async_tests {
         Mock::given(method("POST"))
             .and(path("/api/chat"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "message": {"content": "Yes."},
+                "message": {"content": "Yes."}, "done_reason": "stop",
             })))
             .mount(&server)
             .await;
@@ -6460,7 +6476,7 @@ mod perf9_async_tests {
         Mock::given(method("POST"))
             .and(path("/api/chat"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "message": {"content": "no, they don't"},
+                "message": {"content": "no, they don't"}, "done_reason": "stop",
             })))
             .mount(&server)
             .await;
@@ -6525,7 +6541,7 @@ mod perf9_async_tests {
         Mock::given(method("POST"))
             .and(path("/api/chat"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "message": {"content": "bridge ok"},
+                "message": {"content": "bridge ok"}, "done_reason": "stop",
             })))
             .mount(&server)
             .await;
@@ -6646,7 +6662,7 @@ mod perf9_async_tests {
         Mock::given(method("POST"))
             .and(path("/api/chat"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "message": {"content": "a\nb"},
+                "message": {"content": "a\nb"}, "done_reason": "stop",
             })))
             .mount(&server)
             .await;
@@ -6664,7 +6680,7 @@ mod perf9_async_tests {
         Mock::given(method("POST"))
             .and(path("/api/chat"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "message": {"content": "compacted"},
+                "message": {"content": "compacted"}, "done_reason": "stop",
             })))
             .mount(&server)
             .await;
@@ -6684,7 +6700,7 @@ mod perf9_async_tests {
         Mock::given(method("POST"))
             .and(path("/api/chat"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "message": {"content": "x\ny\nz"},
+                "message": {"content": "x\ny\nz"}, "done_reason": "stop",
             })))
             .mount(&server)
             .await;
@@ -6705,7 +6721,7 @@ mod perf9_async_tests {
         Mock::given(method("POST"))
             .and(path("/api/chat"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "message": {"content": "yes"},
+                "message": {"content": "yes"}, "done_reason": "stop",
             })))
             .mount(&server)
             .await;
@@ -6757,6 +6773,8 @@ mod perf9_async_tests {
             .and(path("/api/generate"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "response": "legacy text",
+                "done": true,
+                "done_reason": "stop",
             })))
             .mount(&server)
             .await;
@@ -6910,7 +6928,7 @@ mod perf9_async_tests {
             Mock::given(method("POST"))
                 .and(path("/api/chat"))
                 .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                    "message": {"content": "no-rt bridge ok"},
+                    "message": {"content": "no-rt bridge ok"}, "done_reason": "stop",
                 })))
                 .mount(&s)
                 .await;

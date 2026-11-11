@@ -430,7 +430,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/api/chat"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "message": {"content": "yes\n"},
+                "message": {"content": "yes\n"}, "done_reason": "stop",
             })))
             .mount(&server)
             .await;
@@ -466,7 +466,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/api/chat"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "message": {"content": "no"},
+                "message": {"content": "no"}, "done_reason": "stop",
             })))
             .mount(&server)
             .await;
@@ -562,17 +562,17 @@ mod tests {
         );
     }
 
-    /// Envelope (11/N): LLM returns garbage (not yes/no) → handler
-    /// completes with contradicts=false (per `starts_with("yes")`
-    /// semantics in OllamaClient::detect_contradiction).
+    /// Envelope (11/N): LLM returns garbage (not yes/no) → #8945 the
+    /// handler refuses with the unclassifiable error; it never reports a
+    /// default `contradicts=false`, and the model text is not echoed.
     #[tokio::test(flavor = "multi_thread")]
-    async fn garbage_response_defaults_to_false() {
+    async fn garbage_response_is_unclassifiable_error_8945() {
         let server = MockServer::start().await;
         mount_tags_ok(&server).await;
         Mock::given(method("POST"))
             .and(path("/api/chat"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "message": {"content": "mu"},
+                "message": {"content": "mu-koan-reply"}, "done_reason": "stop",
             })))
             .mount(&server)
             .await;
@@ -589,10 +589,15 @@ mod tests {
                 &json!({"id_a": id_a, "id_b": id_b}),
                 None,
             )
-            .expect("ok")
+            .err()
+            .unwrap_or_default()
         })
         .await
         .unwrap();
-        assert_eq!(out["contradicts"], json!(false));
+        assert!(
+            out.contains(crate::llm::ERR_CONTRADICTION_UNCLASSIFIABLE),
+            "expected unclassifiable error, got: {out}"
+        );
+        assert!(!out.contains("mu-koan-reply"), "model reply echoed: {out}");
     }
 }

@@ -410,6 +410,13 @@ pub mod msg {
     pub const ID_REQUIRED: &str = "id is required";
     pub const CONTENT_REQUIRED: &str = "content is required";
     pub const TITLE_REQUIRED: &str = "title is required";
+    /// #9018 — consolidate with no caller summary and no LLM wired. One
+    /// text for MCP and HTTP, so neither transport writes a placeholder.
+    pub const CONSOLIDATE_SUMMARY_REQUIRED: &str =
+        "summary is required (or use smart/autonomous tier for auto-summarization)";
+    /// #9018 — prefix of the consolidate refusal when the LLM summary fails
+    /// (transport error, timeout, truncated, empty or malformed reply).
+    pub const CONSOLIDATE_LLM_SUMMARY_FAILED: &str = "LLM summarization failed";
     pub const MEMORY_ID_REQUIRED: &str = "memory_id is required";
     pub const NAMESPACE_REQUIRED: &str = "namespace is required";
     pub const SOURCE_ID_REQUIRED: &str = "source_id is required";
