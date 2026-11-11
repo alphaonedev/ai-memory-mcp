@@ -64,7 +64,6 @@ use ai_memory::store::postgres::PostgresStore;
 use ai_memory::store::{CallerContext, MemoryStore};
 
 #[path = "common/pg_barrier.rs"]
-#[allow(dead_code)]
 mod pg_barrier;
 
 /// Scratch-database prefix for the empty-chain cell (swept when stale).
