@@ -22330,8 +22330,15 @@ pub fn memories_updated_since_counted(
 /// for its whole O(corpus) duration. Reached only from
 /// [`crate::background::fts_integrity`] (paced) and `ai-memory doctor`
 /// (explicit, operator-invoked).
+///
+/// #4036 / #9128: `rank = 1` makes FTS5 compare every posting with the
+/// external `memories` content. The default form (no rank) only checks the
+/// internal index structure and certifies stale, missing or ghost postings
+/// as healthy, so the paced worker, `/health`, `/monitoring/status` and
+/// `ai-memory doctor` (all of which read this one funnel) reported "ok"
+/// while a live memory was absent from the index.
 const SQL_FTS_INTEGRITY_CHECK: &str =
-    "INSERT INTO memories_fts(memories_fts) VALUES('integrity-check')";
+    "INSERT INTO memories_fts(memories_fts, rank) VALUES('integrity-check', 1)";
 
 /// A term deliberately absent from any real corpus, so the liveness probe
 /// below is a single miss in the FTS5 segment index rather than a doclist walk.
@@ -22356,8 +22363,8 @@ pub fn ping(conn: &Connection) -> Result<()> {
 /// A `MATCH` for a term that is not in the vocabulary resolves to one lookup
 /// in the segment b-tree: it proves the `fts5` module is registered and the
 /// shadow tables (`memories_fts_data` / `_idx` / `_config`) are readable,
-/// which is a real signal — a dropped sync trigger or a missing shadow table
-/// surfaces here. It is a `SELECT`, so it takes no write lock, and its cost
+/// which can expose missing shadow tables. It does not inspect sync triggers
+/// or detect stale postings. This `SELECT` takes no write lock; its cost
 /// is independent of corpus size (measured <0.1 ms warm at both 8k and 130k
 /// rows).
 ///

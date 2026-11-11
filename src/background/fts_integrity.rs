@@ -5,20 +5,24 @@
 //! the paced FTS5 index-integrity checker and the cached verdict
 //! `GET /api/v1/health` renders.
 //!
-//! **What this replaces.** `db::health_check` used to run
-//! `INSERT INTO memories_fts(memories_fts) VALUES('integrity-check')` on
-//! EVERY `/health` request. `memories_fts` is an **external-content** FTS5
-//! table (`content=memories`), so that command does not merely walk the
-//! index — it re-tokenizes every row's `title`/`content`/`tags` out of
-//! `memories` and compares the derived doclists. The cost is therefore
-//! O(corpus) in TOKENS, measured at 22-30 us/row on a real corpus
-//! (0.24 s at 8k rows, 2.8 s at 130k rows), and it is issued as an INSERT,
+//! **What this replaces.** `db::health_check` used to issue an FTS5
+//! `integrity-check` on EVERY `/health` request. That command is an INSERT,
 //! so SQLite prepares it as a NON-readonly statement that takes the single
-//! WAL writer lock for its whole duration. A liveness probe scraped on a
-//! fixed interval by Kubernetes / systemd therefore (a) exceeded its probe
-//! timeout on exactly the largest corpora, killing healthy pods, and (b)
-//! kept a write transaction perpetually open under a sustained scrape,
-//! which prevents WAL checkpointing.
+//! WAL writer lock for its whole duration, and its work grows with the
+//! corpus. A liveness probe scraped on a fixed interval by Kubernetes /
+//! systemd therefore (a) exceeded its probe timeout on the largest corpora,
+//! killing healthy pods, and (b) kept a write transaction perpetually open
+//! under a sustained scrape, which prevents WAL checkpointing.
+//!
+//! **Which form.** `memories_fts` is an **external-content** FTS5 table
+//! (`content=memories`). The default `integrity-check` form only checks the
+//! index's internal structure; it does NOT compare postings with
+//! `memories`, so a live row missing from the index, a ghost posting for a
+//! deleted row and stale postings all pass it (#4036, #9128). The deep
+//! check therefore supplies `rank = 1`
+//! ([`crate::storage::fts_integrity_check`]), which re-tokenizes the
+//! external content and raises `SQLITE_CORRUPT_VTAB` on any disagreement.
+//! Measured on this node at 100K rows: 0.63 s.
 //!
 //! **What this does instead.** The full check runs here, on a paced,
 //! jittered cadence, on its OWN connection — never the daemon's single

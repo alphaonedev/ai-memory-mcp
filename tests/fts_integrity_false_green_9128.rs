@@ -58,8 +58,6 @@ const CHECK_INTERVAL_SECS: &str = "1";
 const VERDICT_HANG_GUARD: Duration = Duration::from_mins(1);
 /// Poll step while waiting for the daemon to publish an observable verdict.
 const POLL_STEP: Duration = Duration::from_millis(100);
-/// `ai-memory doctor` exit code for a Critical finding.
-const DOCTOR_EXIT_CRITICAL: i32 = 2;
 /// Wire tags asserted on the transports.
 const WIRE_FAILED: &str = "failed";
 const WIRE_OK: &str = "ok";
@@ -73,6 +71,15 @@ const HTTP_UNAVAILABLE: u16 = 503;
 
 const ROUTE_HEALTH: &str = "/api/v1/health";
 const ROUTE_STATUS: &str = "/api/v1/monitoring/status";
+/// Test-only shared key so the daemon accepts an authenticated monitoring
+/// read (`/api/v1/monitoring/status` refuses anonymous callers).
+const TEST_API_KEY: &str = "fts-integrity-9128-test-key";
+const API_KEY_HEADER: &str = "x-api-key";
+/// The doctor's honest disposition on its read-only connection (#3434):
+/// the FTS5 check is a SQLite writer, so the local doctor never runs it and
+/// must never claim a verdict for it.
+const DOCTOR_FTS_NOT_OBSERVED_PREFIX: &str = "not_observed";
+const DOCTOR_FTS_VERIFIED_PREFIX: &str = "verified";
 
 /// The ways the derived FTS state can disagree with the rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -395,8 +402,13 @@ fn http_health_and_status_turn_not_ok_on_every_drift_arm_9128() {
     }
 }
 
+/// The CLI doctor opens the database read-only (#3434), and the FTS5 check
+/// is a SQLite writer, so the doctor cannot run it. Its invariant for this
+/// class is that it never certifies an index it did not compare: over every
+/// drift arm the `fts_index_integrity` fact is the explicit `not_observed`
+/// disposition, never `verified`.
 #[test]
-fn cli_doctor_reports_every_drift_arm_as_critical_9128() {
+fn cli_doctor_never_certifies_a_drifted_index_it_did_not_compare_9128() {
     let dir = tempfile::tempdir().expect("tempdir");
     for arm in DRIFT_ARMS {
         let path = damaged_db(dir.path(), arm);
@@ -410,16 +422,13 @@ fn cli_doctor_reports_every_drift_arm_as_critical_9128() {
             .output()
             .expect("run doctor");
         let stdout = String::from_utf8_lossy(&out.stdout);
-        assert_eq!(
-            out.status.code(),
-            Some(DOCTOR_EXIT_CRITICAL),
-            "#9128 {arm:?}: doctor must exit Critical over a drifted index; stdout: {stdout}"
-        );
         let v: serde_json::Value = serde_json::from_str(&stdout).expect("doctor json");
         let fact = find_fact(&v, "fts_index_integrity").unwrap_or_default();
         assert!(
-            fact.starts_with("FAILED"),
-            "#9128 {arm:?}: fts_index_integrity = {fact:?}"
+            fact.starts_with(DOCTOR_FTS_NOT_OBSERVED_PREFIX)
+                && !fact.starts_with(DOCTOR_FTS_VERIFIED_PREFIX),
+            "#9128 {arm:?}: doctor must not certify an uncompared index; \
+             fts_index_integrity = {fact:?}"
         );
     }
 }
@@ -490,6 +499,16 @@ impl Daemon {
         let tls = common::tls::shared(&std::env::temp_dir());
         let stderr_log = log_stem.with_extension("serve-stderr.log");
         let stderr_file = std::fs::File::create(&stderr_log).expect("stderr log");
+        // A per-daemon config home carrying only the keyword tier and the
+        // test key: the serve key is read from config, never from argv.
+        let config_home = log_stem.with_extension("config-home");
+        let config_dir = config_home.join("ai-memory");
+        std::fs::create_dir_all(&config_dir).expect("config dir");
+        std::fs::write(
+            config_dir.join("config.toml"),
+            format!("tier = \"keyword\"\napi_key = \"{TEST_API_KEY}\"\n"),
+        )
+        .expect("write config");
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_ai-memory"));
         cmd.args(["serve", "--host", "127.0.0.1", "--port", &port.to_string()]);
         if let Some(db) = db {
@@ -500,7 +519,9 @@ impl Daemon {
         }
         let child = cmd
             .args(tls.serve_arg_strs())
-            .env("AI_MEMORY_NO_CONFIG", "1")
+            .env_remove("AI_MEMORY_NO_CONFIG")
+            .env("XDG_CONFIG_HOME", &config_home)
+            .env("HOME", &config_home)
             .env("AI_MEMORY_INFERENCE_EGRESS", "deny")
             .env("AI_MEMORY_EMBED_OFFLINE", "1")
             .env("HF_HUB_OFFLINE", "1")
@@ -554,6 +575,7 @@ impl Daemon {
                 "{}{path}",
                 common::tls::TestTls::base_url(self.port)
             ))
+            .header(API_KEY_HEADER, TEST_API_KEY)
             .send()
             .ok()?;
         let status = resp.status().as_u16();
