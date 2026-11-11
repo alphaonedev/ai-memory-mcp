@@ -1165,24 +1165,29 @@ fn curator_signing_keypair() -> Result<Option<identity_keypair::AgentKeypair>> {
 
 /// #8863 — resolve the curator signing identity from `dir`.
 ///
-/// RED seam: still the lexicographically-first key in the directory.
+/// The curator signs and owns derived rows as the daemon identity
+/// ([`identity_keypair::DAEMON_KEYPAIR_LABEL`]), the same key the curator
+/// daemon loop signs with, minted on first use. Other agents' keys in a
+/// shared directory are never considered, so directory sort order can no
+/// longer pick the signer.
 ///
 /// # Errors
 ///
-/// None yet (the fix adds the `asi-hard` refusals).
+/// Under `asi-hard`, the exact no-signing-identity refusal when `dir` is
+/// unusable, the curator key cannot be minted or loaded, or only its public
+/// half is on disk. The default posture degrades those arms to `Ok(None)`
+/// (unsigned) with a WARN and never falls through to another key.
 #[cfg_attr(not(feature = "sal"), allow(dead_code))]
 fn curator_signing_keypair_in(
     dir: Result<std::path::PathBuf>,
     asi_hard: bool,
 ) -> Result<Option<identity_keypair::AgentKeypair>> {
-    let _ = asi_hard;
-    let Ok(dir) = dir else {
-        return Ok(None);
-    };
-    let first = identity_keypair::list(&dir)
-        .ok()
-        .and_then(|listed| listed.into_iter().next());
-    Ok(first.and_then(|f| identity_keypair::load(&f.agent_id, &dir).ok()))
+    Ok(identity_keypair::ensure_and_load_label_keypair_in(
+        dir,
+        identity_keypair::DAEMON_KEYPAIR_LABEL,
+        asi_hard,
+    )?
+    .0)
 }
 
 #[cfg_attr(not(feature = "sal"), allow(dead_code))]

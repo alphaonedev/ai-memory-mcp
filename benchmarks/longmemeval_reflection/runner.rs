@@ -838,6 +838,8 @@ where
             metadata: serde_json::json!({
                 "agent_id": "bench-l3-lme-refl",
                 "imported_from": sibling_d1.namespace,
+                // #8850: readable by the curator identity.
+                "scope": "collective",
                 "original_id": sib_id,
                 // The imported memory is depth=1 (it's a depth-1
                 // reflection from the sibling DB). The substrate

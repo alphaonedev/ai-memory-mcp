@@ -1166,6 +1166,99 @@ pub fn ensure_keypair(agent_id: &str, dir: &Path, disabled: bool) -> Result<Ensu
     }
 }
 
+/// #8863 — the ONE signing-identity resolver for a stable process `label`
+/// (the daemon and the curator both pass [`DAEMON_KEYPAIR_LABEL`]).
+///
+/// Ensures the `label` keypair exists in `dir` (generated on first run, never
+/// overwritten), then loads it. It never looks at any other key in `dir`:
+/// a directory shared with ordinary agent keys still resolves to `label` or
+/// to no signer, so the identity never depends on directory sort order.
+///
+/// Every arm that would leave the process signing nothing degrades to
+/// `Ok((None, _))` with a WARN under the default posture, and fails closed
+/// under `asi-hard` with the exact [`no_signing_identity_refusal`] /
+/// [`public_only_refusal`] reason (#3147, #3198).
+///
+/// # Errors
+///
+/// Only the `asi-hard` no-signing-identity refusals above.
+pub fn ensure_and_load_label_keypair_in(
+    dir: Result<PathBuf>,
+    label: &str,
+    asi_hard: bool,
+) -> Result<(Option<AgentKeypair>, Option<EnsureOutcome>)> {
+    let dir = match dir {
+        Ok(d) => d,
+        Err(e) => {
+            // #3198 — WARN with the cause: this arm also carries the key
+            // directory posture refusal (group- or world-writable store).
+            tracing::warn!(
+                "identity: no usable key directory, link/persona/witness signing is \
+                 DISABLED: {e:#}"
+            );
+            if let Some(reason) = no_signing_identity_refusal(asi_hard, &format!("{e:#}")) {
+                anyhow::bail!(reason);
+            }
+            return Ok((None, None));
+        }
+    };
+    // The `[identity].disabled` config field is not wired; pass `false` so
+    // the helper auto-generates unless the operator pre-staged a keypair.
+    let outcome = match ensure_keypair(label, &dir, false) {
+        Ok(o) => o,
+        Err(e) => {
+            tracing::warn!("identity: keypair auto-gen failed: {e:#}");
+            if let Some(reason) = no_signing_identity_refusal(asi_hard, &format!("{e:#}")) {
+                anyhow::bail!(reason);
+            }
+            return Ok((None, None));
+        }
+    };
+    // #3147 — public-key-without-private-key is refused under `asi-hard` and
+    // WARNed (inside `ensure_keypair`) under every other posture.
+    if let Some(reason) = public_only_refusal(&outcome, asi_hard) {
+        anyhow::bail!(reason);
+    }
+    if matches!(outcome, EnsureOutcome::SkippedDisabled) {
+        return Ok((None, Some(outcome)));
+    }
+    let kp = match load(label, &dir) {
+        Ok(kp) if kp.can_sign() => {
+            tracing::info!(
+                "identity: loaded signing keypair for {label} from {}",
+                dir.display()
+            );
+            Some(kp)
+        }
+        Ok(_) => {
+            // #3147 — WARN, not INFO: this process signs nothing until an
+            // operator intervenes.
+            tracing::warn!(
+                "identity: only the PUBLIC key is on disk for {label} in {} — \
+                 link/persona/witness signing is DISABLED and will stay disabled across \
+                 restarts. See `ai-memory doctor` -> Identity (#3147).",
+                dir.display()
+            );
+            if let Some(reason) =
+                no_signing_identity_refusal(asi_hard, "only the public key is on disk")
+            {
+                anyhow::bail!(reason);
+            }
+            None
+        }
+        Err(e) => {
+            tracing::warn!(
+                "identity: keypair load failed for {label}: {e:#}; link signing disabled"
+            );
+            if let Some(reason) = no_signing_identity_refusal(asi_hard, &format!("{e:#}")) {
+                anyhow::bail!(reason);
+            }
+            None
+        }
+    };
+    Ok((kp, Some(outcome)))
+}
+
 /// First-run branch of [`ensure_keypair`], split out so the gate above reads as
 /// a four-way state table.
 fn ensure_generate(agent_id: &str, dir: &Path, pub_path: PathBuf) -> Result<EnsureOutcome> {

@@ -736,30 +736,47 @@ fn sign_manifest_if_keyed(manifest: &Manifest) -> Result<Option<(String, String)
     sign_manifest_in(manifest, &key_dir)
 }
 
-/// #8863 RED seam: [`sign_manifest_if_keyed`] against an explicit key dir.
+/// #8863 — [`sign_manifest_if_keyed`] against an explicit key dir.
+///
+/// Only the daemon identity ([`kp_mod::DAEMON_KEYPAIR_LABEL`]) ever signs a
+/// forensic manifest. Before #8863 the first key in sort order that had a
+/// private half signed, so any agent session key that sorted before
+/// `daemon` became the bundle's attesting identity. Export never mints a
+/// key: an absent daemon key, or one with only its public half on disk,
+/// yields the unsigned bundle mode.
+///
+/// # Errors
+///
+/// A daemon key that is present but unreadable (corrupt or refused by the
+/// key-file posture checks) is an error rather than a silent downgrade to
+/// an unsigned bundle.
 fn sign_manifest_in(manifest: &Manifest, key_dir: &Path) -> Result<Option<(String, String)>> {
     if !key_dir.exists() {
         return Ok(None);
     }
-    let entries = match kp_mod::list(key_dir) {
-        Ok(v) => v,
-        Err(_) => return Ok(None),
-    };
-    // Find the first keypair with a private signing key on disk
-    // (operator-managed; deterministic by `agent_id` sort order).
-    let mut candidates: Vec<String> = entries.into_iter().map(|kp| kp.agent_id).collect();
-    candidates.sort();
-    for agent_id in candidates {
-        if let Ok(kp) = kp_mod::load(&agent_id, key_dir) {
-            if let Some(signing) = kp.private.as_ref() {
-                let bytes = canonical_signed_bytes(manifest);
-                let sig = signing.sign(&bytes);
-                let sig_b64 = STANDARD_NO_PAD.encode(sig.to_bytes());
-                return Ok(Some((agent_id, sig_b64)));
-            }
+    let label = kp_mod::DAEMON_KEYPAIR_LABEL;
+    let kp = match kp_mod::load(label, key_dir) {
+        Ok(kp) => kp,
+        Err(e) if kp_mod::is_key_absent_error(&e) => return Ok(None),
+        Err(e) => {
+            return Err(e.context(format!(
+                "forensic: the {label} signing key in {} is unreadable",
+                key_dir.display()
+            )));
         }
-    }
-    Ok(None)
+    };
+    let Some(signing) = kp.private.as_ref() else {
+        tracing::warn!(
+            "forensic: only the public {label} key is on disk in {}; the bundle is unsigned",
+            key_dir.display()
+        );
+        return Ok(None);
+    };
+    let sig = signing.sign(&canonical_signed_bytes(manifest));
+    Ok(Some((
+        label.to_string(),
+        STANDARD_NO_PAD.encode(sig.to_bytes()),
+    )))
 }
 
 // ─────────────────────────────────────────────────────────────────────

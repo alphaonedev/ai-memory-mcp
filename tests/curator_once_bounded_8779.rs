@@ -44,6 +44,12 @@ const SEEDED_ROWS: usize = 3;
 /// Namespace of the seeded rows.
 const SEED_NAMESPACE: &str = "curator-8779";
 
+/// Environment switch that turns the SQLite consolidation (compaction) pass
+/// on for one run. The audit reproduced #8779 through this pass as well: its
+/// nested store and runtime emit tracing on the blocking worker after the
+/// write-ahead row lands.
+const COMPACTION_ON: (&str, &str) = ("AI_MEMORY_COMPACTION_ENABLED", "1");
+
 /// Upper bound on one stub request's header block, so a malformed client can
 /// never make the stub read without end.
 const STUB_MAX_HEADER_LINES: usize = 128;
@@ -136,14 +142,20 @@ fn seed_rows(db: &Path, home: &Path) {
             .stderr(Stdio::null())
             .status()
             .expect("spawn ai-memory store");
-        assert!(status.success(), "#8779: seeding row {n} failed: {status:?}");
+        assert!(
+            status.success(),
+            "#8779: seeding row {n} failed: {status:?}"
+        );
     }
 }
 
 /// Run `curator --once` with `extra` args against a seeded store and the stub
 /// LLM, and return `(exit status, stdout, elapsed)`, killing the child (this
 /// test's own) at the ceiling.
-fn run_once_bounded(extra: &[&str]) -> (std::process::ExitStatus, String, Duration) {
+fn run_once_bounded(
+    extra: &[&str],
+    envs: &[(&str, &str)],
+) -> (std::process::ExitStatus, String, Duration) {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let db = tmp.path().join("curator-once-8779.db");
     let keys = tmp.path().join("keys");
@@ -164,6 +176,7 @@ fn run_once_bounded(extra: &[&str]) -> (std::process::ExitStatus, String, Durati
         .env("AI_MEMORY_LLM_MODEL", STUB_MODEL)
         .env("HOME", tmp.path())
         .env("RUST_LOG", TRACE_EVERYTHING)
+        .envs(envs.iter().copied())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         // stderr is discarded rather than piped so a full pipe can never be
@@ -198,7 +211,7 @@ fn run_once_bounded(extra: &[&str]) -> (std::process::ExitStatus, String, Durati
 
 #[test]
 fn curator_once_exits_within_ceiling_with_trace_logging_8779() {
-    let (status, stdout, elapsed) = run_once_bounded(&[]);
+    let (status, stdout, elapsed) = run_once_bounded(&[], &[]);
     assert!(
         status.success(),
         "#8779: curator --once exit {status:?}; stdout:\n{stdout}"
@@ -208,7 +221,7 @@ fn curator_once_exits_within_ceiling_with_trace_logging_8779() {
 
 #[test]
 fn curator_once_json_report_is_written_after_traced_sweep_8779() {
-    let (status, stdout, _) = run_once_bounded(&["--json"]);
+    let (status, stdout, _) = run_once_bounded(&["--json"], &[]);
     assert!(
         status.success(),
         "#8779: curator --once --json exit {status:?}; stdout:\n{stdout}"
@@ -223,5 +236,25 @@ fn curator_once_json_report_is_written_after_traced_sweep_8779() {
         scanned,
         u64::try_from(SEEDED_ROWS).expect("seeded rows fit u64"),
         "#8779: the sweep scanned the seeded rows: {report}"
+    );
+}
+
+#[test]
+fn curator_once_with_compaction_exits_within_ceiling_8779() {
+    let (status, stdout, elapsed) = run_once_bounded(&["--json"], &[COMPACTION_ON]);
+    assert!(
+        status.success(),
+        "#8779: curator --once (compaction on) exit {status:?}; stdout:\n{stdout}"
+    );
+    assert!(
+        elapsed < ONCE_CEILING,
+        "#8779: compaction run took {elapsed:?}"
+    );
+    let report: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!("#8779: compaction --json stdout is not one JSON report ({e}):\n{stdout}")
+    });
+    assert!(
+        report.get("memories_scanned").is_some(),
+        "#8779: the compaction sweep wrote its report: {report}"
     );
 }

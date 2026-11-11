@@ -24,7 +24,9 @@
 //! namespace so the cases cannot cluster together.
 
 #![cfg(feature = "sal")]
-#![allow(clippy::missing_panics_doc)]
+// `Memory` is `#[non_exhaustive]`, so rows are built from the default and
+// assigned in place (precedent: tests/inbox_unread_pushdown_3463.rs).
+#![allow(clippy::missing_panics_doc, clippy::field_reassign_with_default)]
 
 use std::sync::Mutex;
 
@@ -290,6 +292,87 @@ async fn assert_case(
             "{where_}: a reflection over a private source is listed to {OTHER}"
         );
     }
+}
+
+/// One row of the `narrowest_scope` table: the `metadata.scope` value of each
+/// source (`None` = the key is absent) and the scope a derived row must carry.
+type ScopeRow = (&'static [Option<&'static str>], &'static str);
+
+/// Every scope, the absent key, an unrecognised token, a legacy broad token,
+/// and the empty set, each against the narrowest result the read path implies.
+const NARROWEST_TABLE: [ScopeRow; 12] = [
+    (&[], "private"),
+    (&[None], "private"),
+    (&[Some("not-a-scope-8850")], "private"),
+    (&[Some("collective")], "collective"),
+    (&[Some("shared")], "collective"),
+    (&[Some("org"), Some("collective")], "org"),
+    (&[Some("collective"), Some("unit"), Some("org")], "unit"),
+    (&[Some("org"), Some("team"), Some("unit")], "team"),
+    (&[Some("collective"), Some("team")], "team"),
+    (&[Some("collective"), None], "private"),
+    (
+        &[Some("team"), Some("private"), Some("collective")],
+        "private",
+    ),
+    (&[Some("collective"), Some("bogus-8850")], "private"),
+];
+
+/// Upper bound on the large-input row count for the linear-cost check.
+const LARGE_SOURCE_ROWS: usize = 100_000;
+
+/// Wall-clock ceiling for classifying [`LARGE_SOURCE_ROWS`] sources.
+const LARGE_SOURCE_CEILING: std::time::Duration = std::time::Duration::from_secs(5);
+
+fn scoped_row(scope: Option<&str>) -> Memory {
+    let mut row = Memory::default();
+    row.id = uuid::Uuid::new_v4().to_string();
+    row.namespace = format!("{TEAM_NS}/narrowest-8850");
+    row.metadata = match scope {
+        Some(s) => serde_json::json!({"agent_id": OWNER, "scope": s}),
+        None => serde_json::json!({"agent_id": OWNER}),
+    };
+    row
+}
+
+#[test]
+fn narrowest_scope_table_8850() {
+    for (scopes, expected) in NARROWEST_TABLE {
+        let rows: Vec<Memory> = scopes.iter().map(|s| scoped_row(*s)).collect();
+        assert_eq!(
+            ai_memory::visibility::narrowest_scope(&rows).as_str(),
+            expected,
+            "#8850: narrowest scope of {scopes:?}"
+        );
+        // Order never matters.
+        let reversed: Vec<Memory> = rows.into_iter().rev().collect();
+        assert_eq!(
+            ai_memory::visibility::narrowest_scope(&reversed).as_str(),
+            expected,
+            "#8850: narrowest scope of reversed {scopes:?}"
+        );
+    }
+}
+
+#[test]
+fn narrowest_scope_is_linear_on_large_input_8850() {
+    let mut rows: Vec<Memory> = (0..LARGE_SOURCE_ROWS)
+        .map(|_| scoped_row(Some("collective")))
+        .collect();
+    rows.push(scoped_row(Some("team")));
+    let started = std::time::Instant::now();
+    let scope = ai_memory::visibility::narrowest_scope(&rows);
+    assert!(
+        started.elapsed() < LARGE_SOURCE_CEILING,
+        "#8850: {} rows took {:?}",
+        rows.len(),
+        started.elapsed()
+    );
+    assert_eq!(
+        scope.as_str(),
+        "team",
+        "#8850: one team row narrows the set"
+    );
 }
 
 /// Run the pass over one namespace as the default (keyless) curator.

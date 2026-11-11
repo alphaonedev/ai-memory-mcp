@@ -382,8 +382,8 @@ pub async fn dispatch(
                 crate::daemon_runtime::build_curator_store(Some(url), db_path, app_config).await?;
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = CliOutput::from_std(&mut so, &mut se);
             return run_store(store.as_ref(), args, cli_agent_id, &mut out).await;
         }
@@ -408,8 +408,8 @@ pub async fn dispatch(
     }
     let stdout = std::io::stdout();
     let stderr = std::io::stderr();
-    let mut so = stdout.lock();
-    let mut se = stderr.lock();
+    let mut so = stdout;
+    let mut se = stderr;
     let mut out = CliOutput::from_std(&mut so, &mut se);
     run(db_path, args, cli_agent_id, &mut out)
 }
