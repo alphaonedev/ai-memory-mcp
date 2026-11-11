@@ -748,7 +748,9 @@ pub(crate) fn claim_nonce_fingerprint_bounded(
     per_peer_cap: usize,
 ) -> rusqlite::Result<bool> {
     let cap = i64::try_from(per_peer_cap).unwrap_or(i64::MAX);
-    let tx = conn.unchecked_transaction()?;
+    // BEGIN IMMEDIATE (#5084): take the write lock before the touch read, so
+    // a sibling process can neither interleave nor deadlock the upgrade.
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
     let touch: i64 = tx.query_row(SQL_NEXT_PEER_TOUCH, rusqlite::params![peer_id], |r| {
         r.get(0)
     })?;
