@@ -158,6 +158,12 @@ struct RowState {
     live_row: Option<(String, String)>,
 }
 
+// Without `sal-postgres` the only variant is sqlite (sync rusqlite), so the
+// shared async signature has nothing to await in that build.
+#[cfg_attr(
+    not(feature = "sal-postgres"),
+    allow(clippy::unused_async, clippy::unused_async_trait_impl)
+)]
 impl RawView {
     async fn row_state(&self, id: &str) -> RowState {
         match self {
@@ -514,6 +520,8 @@ async fn shared_nonce_cells(
 async fn sqlite_store_claimed_nonce_replay_is_store_scoped_9140() {
     use ai_memory::identity::replay::FederationNonceCache;
     let (_dir, store_a, view) = sqlite_store();
+    // Irrefutable without `sal-postgres` (sqlite is then the only variant).
+    #[cfg_attr(not(feature = "sal-postgres"), allow(irrefutable_let_patterns))]
     let RawView::Sqlite(path) = &view else {
         panic!("sqlite_store yields a sqlite view");
     };
