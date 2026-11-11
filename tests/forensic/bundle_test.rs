@@ -41,8 +41,6 @@ fn ai_memory_cmd(db_path: &std::path::Path) -> Command {
     cmd
 }
 
-/// Owner-only mode the binary requires of a key directory (#3198).
-const KEY_DIR_MODE: u32 = 0o700;
 /// Agent id of the operator key the CLI round-trip signs with.
 const BUNDLE_SIGNER: &str = "bundle-test-operator";
 
@@ -55,11 +53,8 @@ fn signing_cmd(db_path: &std::path::Path, key_dir: &std::path::Path) -> Command 
 }
 
 fn provision_key_dir(tmp: &TempDir, db_path: &std::path::Path) -> std::path::PathBuf {
-    use std::os::unix::fs::PermissionsExt as _;
     let key_dir = tmp.path().join("keys");
-    std::fs::create_dir_all(&key_dir).expect("key dir");
-    std::fs::set_permissions(&key_dir, std::fs::Permissions::from_mode(KEY_DIR_MODE))
-        .expect("key dir mode");
+    crate::key_dir_sandbox::mkdir_0700(&key_dir);
     signing_cmd(db_path, &key_dir)
         .args(["identity", "generate", "--agent-id", BUNDLE_SIGNER])
         .assert()

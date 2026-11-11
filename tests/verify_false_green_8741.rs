@@ -20,7 +20,6 @@
 
 #![allow(clippy::doc_markdown)]
 
-use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -31,6 +30,9 @@ use ai_memory::governance::audit::{
 use base64::Engine as _;
 use ed25519_dalek::{Signer as _, SigningKey};
 use tempfile::TempDir;
+
+#[path = "common/key_dir_sandbox.rs"]
+mod key_dir_sandbox;
 
 // ─────────────────────────────────────────────────────────────────────
 // Reason codes and exit codes (the contract under test)
@@ -67,7 +69,6 @@ const STORE_URL_ENV: &str = "AI_MEMORY_STORE_URL";
 /// Audit-enabled store operations that write the flat trail.
 const TRAIL_WRITES: usize = 3;
 const FORENSIC_SEED: [u8; 32] = [7u8; 32];
-const KEY_DIR_MODE: u32 = 0o700;
 
 // ─────────────────────────────────────────────────────────────────────
 // Process fixture: an isolated HOME, its own key dir, explicit --db
@@ -82,11 +83,8 @@ impl Home {
         let dir = TempDir::new().expect("tempdir");
         let cfg = dir.path().join(".config").join("ai-memory");
         std::fs::create_dir_all(&cfg).expect("config dir");
-        let keys = dir.path().join("keys");
-        std::fs::create_dir_all(&keys).expect("key dir");
         // The key loader refuses a group- or world-writable key directory.
-        std::fs::set_permissions(&keys, std::fs::Permissions::from_mode(KEY_DIR_MODE))
-            .expect("key dir mode");
+        key_dir_sandbox::mkdir_0700(&dir.path().join("keys"));
         if let Some(enabled) = audit_enabled {
             std::fs::write(
                 cfg.join("config.toml"),

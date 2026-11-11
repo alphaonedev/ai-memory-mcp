@@ -45,12 +45,12 @@ use rusqlite::params;
 use std::path::Path;
 use tempfile::TempDir;
 
+#[path = "common/key_dir_sandbox.rs"]
+mod key_dir_sandbox;
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-/// Owner-only mode the binary requires of a key directory (#3198).
-const KEY_DIR_MODE: u32 = 0o700;
 
 fn open_test_db(tmp: &TempDir) -> (rusqlite::Connection, std::path::PathBuf) {
     let db_path = tmp.path().join("ai-memory.db");
@@ -368,13 +368,7 @@ fn forensic_bundle_clean_exits_0_and_foreign_trust_root_exits_2() {
     // The CLI child gets an explicit, empty, owner-only key directory, so the
     // export is deterministically unsigned whatever the host holds (#3355).
     let key_dir = tmp.path().join("empty-keys");
-    std::fs::create_dir_all(&key_dir).expect("key dir");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&key_dir, std::fs::Permissions::from_mode(KEY_DIR_MODE))
-            .expect("key dir mode");
-    }
+    key_dir_sandbox::mkdir_0700(&key_dir);
     let bundle_path = tmp.path().join("clean.tar");
     let bundle_arg = bundle_path.to_str().expect("utf8 path");
     let signer_keys = owner_only_dir(&tmp, "signer-keys");
@@ -433,13 +427,7 @@ fn forensic_bundle_clean_exits_0_and_foreign_trust_root_exits_2() {
 /// A fresh owner-only (#3198) key directory under the test's temp root.
 fn owner_only_dir(tmp: &TempDir, name: &str) -> std::path::PathBuf {
     let dir = tmp.path().join(name);
-    std::fs::create_dir_all(&dir).expect("key dir");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(KEY_DIR_MODE))
-            .expect("key dir mode");
-    }
+    key_dir_sandbox::mkdir_0700(&dir);
     dir
 }
 
