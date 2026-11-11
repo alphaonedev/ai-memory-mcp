@@ -509,4 +509,197 @@ mod tests {
             TransportFailure::classify(&err)
         );
     }
+
+    // ---- #8741 credential-display class: the funnel corpus (#6101 #6107) ----
+
+    /// The credential marker every corpus shape carries (a fake placeholder).
+    const MARKER_8741: &str = "SECRETX8741";
+    /// The rendering every ambiguous-authority http(s) URL collapses to.
+    const REDACTED_HTTPS: &str = "https://<redacted-authority>";
+    /// The rendering every credential-bearing sqlite URL collapses to.
+    const REDACTED_SQLITE: &str = "sqlite://<redacted-authority>";
+    /// Size of the oversized-input cells (OWNERSHIP-15, PERF: linear scan).
+    const HUGE_INPUT_LEN: usize = 120_000;
+    /// Wall-clock ceiling for rendering every oversized cell
+    /// [`HUGE_ITERATIONS`] times: linear work is well under a second.
+    const HUGE_INPUT_CEILING: std::time::Duration = std::time::Duration::from_secs(5);
+    /// Repetitions of each oversized cell under [`HUGE_INPUT_CEILING`].
+    const HUGE_ITERATIONS: usize = 20;
+
+    fn assert_no_marker(input: &str, rendered: &str) {
+        assert!(
+            !rendered
+                .to_ascii_lowercase()
+                .contains(&MARKER_8741.to_ascii_lowercase()),
+            "credential bytes of {input:?} reached the rendering {rendered:?}"
+        );
+    }
+
+    /// #6101 — federation / webhook / LLM base URLs whose userinfo holds an
+    /// unencoded `/`, `?`, `#` or `\`: the WHATWG authority ends inside the
+    /// credential. Every one renders exactly [`REDACTED_HTTPS`] through BOTH
+    /// `url_origin` and `url_origin_and_path`, in every scheme case.
+    fn ambiguous_http_urls_6101() -> Vec<String> {
+        let m = MARKER_8741;
+        vec![
+            format!("http://localhost:/{m}pw@127.0.0.1:9/v1"),
+            format!("https://svc:/{m}@peer.example:9077/mesh"),
+            format!("https://svc:123/{m}@peer.example/mesh"),
+            format!("https://svc/{m}user:pw@peer.example/mesh"),
+            format!("https://svc:a@{m}/x@peer.example/mesh"),
+            format!("https://svc:a@{m}?x@peer.example/mesh"),
+            format!("https://svc:a@{m}#x@peer.example/mesh"),
+            format!("https://svc:a@{m}\\x@peer.example/mesh"),
+            format!("HTTPS://svc:a@{m}/x@peer.example/mesh"),
+            format!("Https://svc:/{m}@peer.example/mesh"),
+            format!("https:\t//svc:a@{m}/x@peer.example/mesh"),
+            format!("https:svc:a@{m}/x@peer.example/mesh"),
+            format!("  https://svc:/{m}@peer.example/mesh \n"),
+        ]
+    }
+
+    #[test]
+    fn url_origin_redacts_an_ambiguous_authority_6101() {
+        for url in ambiguous_http_urls_6101() {
+            let r = url_origin(&url);
+            assert_no_marker(&url, &r);
+            assert_eq!(r, REDACTED_HTTPS, "#6101 url_origin({url:?})");
+        }
+    }
+
+    #[test]
+    fn url_origin_and_path_redacts_an_ambiguous_authority_6101() {
+        for url in ambiguous_http_urls_6101() {
+            let r = url_origin_and_path(&url);
+            assert_no_marker(&url, &r);
+            assert_eq!(r, REDACTED_HTTPS, "#6101 url_origin_and_path({url:?})");
+        }
+    }
+
+    /// Well-formed userinfo shapes per RFC 3986 / WHATWG: an unencoded `@`
+    /// or `:` inside the password (the LAST `@` ends the userinfo) and every
+    /// percent-encoded delimiter keep the real host, and the credential is
+    /// still absent. `(input, url_origin, url_origin_and_path)`.
+    fn well_formed_userinfo_cells_6101() -> Vec<(String, &'static str, &'static str)> {
+        let m = MARKER_8741;
+        vec![
+            (
+                format!("https://svc:a@{m}@peer.example:9077/mesh"),
+                "https://peer.example:9077",
+                "https://peer.example:9077/mesh",
+            ),
+            (
+                format!("https://svc:a:{m}@peer.example/mesh"),
+                "https://peer.example",
+                "https://peer.example/mesh",
+            ),
+            (
+                format!("https://svc:%2F{m}@peer.example/mesh"),
+                "https://peer.example",
+                "https://peer.example/mesh",
+            ),
+            (
+                format!("https://svc:%3F{m}%23@peer.example/mesh"),
+                "https://peer.example",
+                "https://peer.example/mesh",
+            ),
+            (
+                format!("https://svc:%40{m}@peer.example/"),
+                "https://peer.example",
+                "https://peer.example",
+            ),
+            (
+                format!("HTTP://svc:{m}@Peer.Example:8080/a/b?token={m}#{m}"),
+                "http://peer.example:8080",
+                "http://peer.example:8080/a/b",
+            ),
+        ]
+    }
+
+    #[test]
+    fn well_formed_userinfo_keeps_the_real_host_6101() {
+        for (url, origin, origin_and_path) in well_formed_userinfo_cells_6101() {
+            let o = url_origin(&url);
+            let op = url_origin_and_path(&url);
+            assert_no_marker(&url, &o);
+            assert_no_marker(&url, &op);
+            assert_eq!(o, origin, "url_origin({url:?})");
+            assert_eq!(op, origin_and_path, "url_origin_and_path({url:?})");
+        }
+    }
+
+    /// #6107 — a credential written behind `sqlite://` (any scheme case)
+    /// renders [`REDACTED_SQLITE`]; a plain path renders as the path only.
+    /// `(input, store_url_display)`.
+    fn sqlite_cells_6107() -> Vec<(String, String)> {
+        let m = MARKER_8741;
+        vec![
+            (format!("sqlite://svc:{m}@x/db"), REDACTED_SQLITE.into()),
+            (format!("SQLITE://svc:{m}@x/db"), REDACTED_SQLITE.into()),
+            (format!("Sqlite://svc:{m}@x/db"), REDACTED_SQLITE.into()),
+            (format!("sqlite://{m}@lba-missing-dir/sub/x.db"), REDACTED_SQLITE.into()),
+            (format!("sqlite://svc:/{m}@x/db"), REDACTED_SQLITE.into()),
+            (format!("sqlite:///var/x.db?key={m}"), REDACTED_SQLITE.into()),
+            (format!("sqlite:///var/x.db?password={m}"), REDACTED_SQLITE.into()),
+            (format!("  SQLITE://svc:{m}@x/db\n"), REDACTED_SQLITE.into()),
+            ("sqlite:///var/lib/ai-memory/x.db".into(), "sqlite:///var/lib/ai-memory/x.db".into()),
+            ("SQLITE:///var/lib/ai-memory/x.db".into(), "sqlite:///var/lib/ai-memory/x.db".into()),
+            ("sqlite:///var/x.db#frag".into(), "sqlite:///var/x.db".into()),
+            ("sqlite:///var/x.db?mode=ro".into(), REDACTED_SQLITE.into()),
+            ("sqlite://relative/x.db".into(), "sqlite://relative/x.db".into()),
+        ]
+    }
+
+    #[test]
+    fn store_url_sqlite_branch_is_case_insensitive_and_fail_closed_6107() {
+        for (url, want) in sqlite_cells_6107() {
+            let r = store_url_display(&url);
+            assert_no_marker(&url, &r);
+            assert_eq!(r, want, "#6107 store_url_display({url:?})");
+        }
+    }
+
+    /// Postgres store URLs in every scheme case keep scheme/host/port/db and
+    /// drop the userinfo and query; an ambiguous one is redacted (#6102).
+    #[test]
+    fn store_url_postgres_scheme_case_variants_6102() {
+        let m = MARKER_8741;
+        for (url, want) in [
+            (format!("POSTGRES://svc:{m}@db.example:5433/mem?password={m}"), "postgres://db.example:5433/mem"),
+            (format!("PostgreSQL://svc:{m}@db.example/mem"), "postgresql://db.example/mem"),
+            (format!("postgres://svc:{m}@db.example/mem?sslpassword={m}"), "postgres://db.example/mem"),
+            (format!("POSTGRES://svc:/{m}pw@db.example/mem"), "postgres://<redacted-authority>"),
+            (format!("postgres:svc:{m}@db.example/mem"), "postgres://<redacted-authority>"),
+        ] {
+            let r = store_url_display(&url);
+            assert_no_marker(&url, &r);
+            assert_eq!(r, want, "store_url_display({url:?})");
+        }
+    }
+
+    /// Oversized inputs render in linear time and still fail closed: a
+    /// 120K-char ambiguous userinfo, a 120K-char sqlite credential, and a
+    /// 120K run of multi-byte chars around the scheme window (OWNERSHIP-15:
+    /// no slice may split a char).
+    #[test]
+    fn oversized_inputs_are_bounded_and_fail_closed_8741() {
+        let pad = "/".repeat(HUGE_INPUT_LEN);
+        let ambiguous = format!("https://svc:{pad}{MARKER_8741}@peer.example/mesh");
+        let sqlite = format!("SQLITE://svc:{}{MARKER_8741}@x/db", "a".repeat(HUGE_INPUT_LEN));
+        let multibyte = format!("sqli{}://{MARKER_8741}@x", "\u{e9}".repeat(HUGE_INPUT_LEN));
+        let started = std::time::Instant::now();
+        for _ in 0..HUGE_ITERATIONS {
+            assert_eq!(url_origin(&ambiguous), REDACTED_HTTPS);
+            assert_eq!(url_origin_and_path(&ambiguous), REDACTED_HTTPS);
+            assert_eq!(store_url_display(&sqlite), REDACTED_SQLITE);
+            let r = store_url_display(&multibyte);
+            assert_no_marker("<multibyte>", &r);
+            assert_eq!(r, UNPARSEABLE_STORE_URL);
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < HUGE_INPUT_CEILING,
+            "oversized rendering took {elapsed:?} (ceiling {HUGE_INPUT_CEILING:?})"
+        );
+    }
 }
