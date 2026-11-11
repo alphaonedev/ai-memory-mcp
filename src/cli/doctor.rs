@@ -4567,6 +4567,37 @@ fn section_llm_reachability_1146() -> ReportSection {
     section_llm_reachability_from_resolved(&resolved)
 }
 
+/// #4121 — timeout for each inference reachability probe.
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// #4121 — the section a reachability probe returns when the
+/// inference-egress posture refused its target. Nothing was sent: the
+/// admission ran before any client existed.
+fn probe_refused_section(
+    name: &str,
+    noun: &str,
+    mut facts: Vec<(String, String)>,
+    base_url: &str,
+    mode: crate::egress::InferenceEgressMode,
+    reason: String,
+) -> ReportSection {
+    let note = format!(
+        "probe NOT sent (#4121): inference-plane egress refused the {noun} target {} under \
+         {}={}; no connection was opened and no API key left the process. {reason}",
+        crate::url_display::url_origin(base_url),
+        crate::egress::ENV_INFERENCE_EGRESS,
+        mode.as_str(),
+    );
+    facts.push(("inference_egress".into(), reason));
+    facts.push(("inference_egress_mode".into(), mode.as_str().to_string()));
+    ReportSection {
+        name: name.into(),
+        severity: Severity::Warning,
+        facts,
+        note: Some(note),
+    }
+}
+
 fn section_llm_reachability_from_resolved(resolved: &crate::config::ResolvedLlm) -> ReportSection {
     use crate::config::{ConfigSource, KeySource};
 
@@ -4587,9 +4618,10 @@ fn section_llm_reachability_from_resolved(resolved: &crate::config::ResolvedLlm)
         ),
     ];
 
-    // #3811/#3860: this probe builds its own HTTP client, so enforce the
-    // same selector gate as both LLM builders before any credential or
-    // request is attached, even when the operator supplied an explicit URL.
+    // #3811/#3860: enforce the same selector gate as both LLM builders
+    // before any credential or request is attached, even when the operator
+    // supplied an explicit URL (#4121: the client itself comes from the
+    // inference-egress admission funnel below).
     if !crate::config::is_recognized_llm_backend(&resolved.backend) {
         return ReportSection {
             name: SECTION_LLM_REACHABILITY.into(),
@@ -4655,13 +4687,25 @@ fn section_llm_reachability_from_resolved(resolved: &crate::config::ResolvedLlm)
     ));
 
     let started = std::time::Instant::now();
-    let client = match reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .connect_timeout(std::time::Duration::from_secs(5))
-        .build()
-    {
+    // #4121 — admission and the endpoint pin run BEFORE the client exists:
+    // a refused posture opens no connection and attaches no key.
+    let client = match crate::egress::admitted_blocking_client(
+        crate::egress::EgressClass::InferenceLlm,
+        &resolved.base_url,
+        PROBE_TIMEOUT,
+    ) {
         Ok(c) => c,
-        Err(e) => {
+        Err(crate::egress::AdmittedClientError::Refused { mode, reason }) => {
+            return probe_refused_section(
+                SECTION_LLM_REACHABILITY,
+                "LLM",
+                facts,
+                &resolved.base_url,
+                mode,
+                reason,
+            );
+        }
+        Err(crate::egress::AdmittedClientError::Build(e)) => {
             facts.push((
                 "error".into(),
                 format!("{MSG_HTTP_CLIENT_BUILD_FAILED}: {e}"),
@@ -4847,13 +4891,25 @@ fn section_embeddings_reachability_1598() -> ReportSection {
     let is_api = crate::config::is_api_embed_backend(&resolved.backend);
 
     let started = std::time::Instant::now();
-    let client = match reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .connect_timeout(std::time::Duration::from_secs(5))
-        .build()
-    {
+    // #4121 — admission and the endpoint pin run BEFORE the client exists:
+    // a refused posture opens no connection and attaches no key.
+    let client = match crate::egress::admitted_blocking_client(
+        crate::egress::EgressClass::InferenceEmbedding,
+        &resolved.url,
+        PROBE_TIMEOUT,
+    ) {
         Ok(c) => c,
-        Err(e) => {
+        Err(crate::egress::AdmittedClientError::Refused { mode, reason }) => {
+            return probe_refused_section(
+                SECTION_EMBEDDINGS_REACHABILITY,
+                "embeddings",
+                facts,
+                &resolved.url,
+                mode,
+                reason,
+            );
+        }
+        Err(crate::egress::AdmittedClientError::Build(e)) => {
             facts.push((
                 "error".into(),
                 format!("{MSG_HTTP_CLIENT_BUILD_FAILED}: {e}"),

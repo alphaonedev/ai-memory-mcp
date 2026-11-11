@@ -604,19 +604,76 @@ pub fn refuse_inference_egress_audited(
             if let Err(e) = emit_inference_egress_refusal(&conn, class, target, agent_id, reason) {
                 tracing::warn!(
                     "inference-egress signed refusal NOT recorded (append failed) for {} \
-                     target={target}: {e}",
-                    class.as_str()
+                     target={}: {e}",
+                    class.as_str(),
+                    crate::url_display::url_origin(target)
                 );
             }
         }
         Err(e) => {
             tracing::warn!(
                 "inference-egress signed refusal NOT recorded (db open failed) for {} \
-                 target={target}: {e}",
-                class.as_str()
+                 target={}: {e}",
+                class.as_str(),
+                crate::url_display::url_origin(target)
             );
         }
     }
+}
+
+/// #4121 — why [`admitted_blocking_client`] produced no client.
+#[derive(Debug)]
+pub enum AdmittedClientError {
+    /// The posture refused the target: no client was built, no connection
+    /// was opened and no credential was attached.
+    Refused {
+        /// The posture in force when the target was refused.
+        mode: InferenceEgressMode,
+        /// The refusal reason (never embeds the target URL).
+        reason: String,
+    },
+    /// The posture admitted the target but the client could not be built.
+    Build(reqwest::Error),
+}
+
+/// #4121 — the admission funnel for a blocking inference client built
+/// outside the boot chokepoints (the `doctor` reachability probes). It
+/// resolves the `AI_MEMORY_INFERENCE_EGRESS` posture, admits `url` under it
+/// BEFORE any client exists, and under `internal-only` pins the resolved
+/// addresses with proxies off, exactly like `llm::apply_internal_egress_pin`.
+/// Redirects are never followed, so an admitted endpoint cannot bounce the
+/// probe (or its key) to a target the posture would refuse.
+///
+/// # Errors
+/// [`AdmittedClientError::Refused`] when the posture refuses `url` (an
+/// admission error that carries no refusal also fails closed here);
+/// [`AdmittedClientError::Build`] when reqwest cannot build the client.
+pub fn admitted_blocking_client(
+    class: EgressClass,
+    url: &str,
+    timeout: std::time::Duration,
+) -> std::result::Result<reqwest::blocking::Client, AdmittedClientError> {
+    let mode = resolve_inference_egress_mode();
+    let pin = match admit_inference_target(mode, class, url) {
+        Ok(pin) => pin,
+        Err(EgressDecision::Refuse { reason, .. }) => {
+            return Err(AdmittedClientError::Refused { mode, reason });
+        }
+        Err(EgressDecision::Allow) => {
+            return Err(AdmittedClientError::Refused {
+                mode,
+                reason: "admission returned no decision; failing closed".to_string(),
+            });
+        }
+    };
+    let mut builder = reqwest::blocking::Client::builder()
+        .timeout(timeout)
+        .connect_timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none());
+    if let Some(pin) = pin {
+        builder = builder.resolve_to_addrs(&pin.host, &pin.addrs).no_proxy();
+    }
+    builder.build().map_err(AdmittedClientError::Build)
 }
 
 #[cfg(test)]
