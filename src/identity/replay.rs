@@ -702,12 +702,14 @@ const SQL_CLAIM_NONCE_FINGERPRINT: &str = "INSERT INTO federation_nonce_cache \
 
 /// #9140 — the next per-peer `last_touch` for a claim made through the SAL
 /// store (no in-process touch counter): one past the peer's newest row.
+#[cfg(feature = "sal")]
 const SQL_NEXT_PEER_TOUCH: &str =
     "SELECT COALESCE(MAX(last_touch), -1) + 1 FROM federation_nonce_cache WHERE peer_id = ?1";
 
 /// #9140 — keep only the newest `?2` rows of ONE peer (the store-claim twin of
 /// [`prune_nonce_cache_to_per_peer_cap`], scoped to the claiming peer so the
 /// hot path never scans other peers' rows).
+#[cfg(feature = "sal")]
 const SQL_PRUNE_PEER_TO_CAP: &str = "DELETE FROM federation_nonce_cache \
      WHERE peer_id = ?1 AND fingerprint NOT IN ( \
          SELECT fingerprint FROM federation_nonce_cache WHERE peer_id = ?1 \
@@ -741,6 +743,7 @@ pub(crate) fn claim_nonce_fingerprint(
 ///
 /// # Errors
 /// Propagates the `rusqlite` error; callers treat it as a replay.
+#[cfg(feature = "sal")]
 pub(crate) fn claim_nonce_fingerprint_bounded(
     conn: &rusqlite::Connection,
     peer_id: &str,
