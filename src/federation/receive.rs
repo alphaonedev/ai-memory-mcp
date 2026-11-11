@@ -522,15 +522,27 @@ pub(super) async fn catchup_once_with_store(
         // Load our local vector-clock entry for this peer so we only pull
         // the delta. First-time-ever runs with no prior clock pull a full
         // snapshot (capped below by ?limit=500 on the peer side).
-        let since_opt: Option<String> = {
+        // #9082 — the sequence cursor rides beside the timestamp cursor:
+        // `after_seq` is sent on every pull (0 when none is stored) and is
+        // never seeded from the timestamp cursor.
+        let (since_opt, seq_cursor) = {
             let lock = db.lock().await;
-            match crate::db::sync_state_load(&lock.0, &local_id) {
+            let since: Option<String> = match crate::db::sync_state_load(&lock.0, &local_id) {
                 Ok(clock) => clock.entries.get(&peer.id).cloned(),
                 Err(_) => None,
-            }
+            };
+            (
+                since,
+                super::pull_seq::load_cursor(&lock.0, &local_id, &peer.id),
+            )
         };
 
-        let url = sync_since_url(&base, &local_id, since_opt.as_deref());
+        let url = sync_since_url(
+            &base,
+            &local_id,
+            since_opt.as_deref(),
+            Some(seq_cursor.after_seq()),
+        );
 
         // v0.7.0 #239 — attach `x-peer-id` to the outbound /sync/since
         // GET so the peer's per-peer namespace allowlist can scope
@@ -571,6 +583,11 @@ pub(super) async fn catchup_once_with_store(
         let Some((body, memories)) = fetch_catchup_envelope(&peer.id, req).await else {
             continue;
         };
+        // #9082 — a peer that walked its sequence answers `next_seq`; a
+        // malformed sequence answer applies nothing and moves no cursor.
+        let Some(seq) = super::pull_seq::classify(&body, seq_cursor, &peer.id) else {
+            continue;
+        };
         // #2441 (CB-11) — the peer applies its per-peer namespace allowlist +
         // `scope=private` visibility filter IN MEMORY, AFTER the SQL `LIMIT`, so a
         // window composed entirely of out-of-scope rows returns `count:0` behind
@@ -605,10 +622,8 @@ pub(super) async fn catchup_once_with_store(
         // the tracker, which resolves the cursor from this node's clock and the
         // rows durably applied, held strictly below any delivered row that was
         // not applied (see `pull_cursor`).
-        let mut tracker = super::pull_cursor::PullCursorTracker::new(
-            since_opt.clone(),
-            catchup_page_limit(&body),
-        );
+        let mut tracker =
+            super::pull_seq::tracker_for(&seq, since_opt.clone(), catchup_page_limit(&body));
         // #2480 — load peer-attestation once per peer tick (not per row).
         let attest_cfg = crate::federation::peer_attestation::PeerAttestationConfig::from_env();
         let require_push_ns_scope =
@@ -777,9 +792,17 @@ pub(super) async fn catchup_once_with_store(
             }
             // #2714 + #2441 — advance to the peer's examined-watermark on a clean
             // window; hold at the last durable success when an apply halted.
-            if let Some(ts) = tracker.resolve(next_since.as_deref(), memories.len(), &peer.id) {
+            {
                 let lock = db.lock().await;
-                if let Err(e) = crate::db::sync_state_observe(&lock.0, &local_id, &peer.id, &ts) {
+                if let Err(e) = super::pull_seq::persist_cursor(
+                    &lock.0,
+                    &mut tracker,
+                    &seq,
+                    next_since.as_deref(),
+                    memories.len(),
+                    &local_id,
+                    &peer.id,
+                ) {
                     log_catchup_sync_state_observe_failed(&peer.id, e);
                 }
             }
@@ -896,9 +919,15 @@ pub(super) async fn catchup_once_with_store(
                 }
             }
             // #2714 + #2441 — halt-gated, validated cursor advance.
-            if let Some(ts) = tracker.resolve(next_since.as_deref(), memories.len(), &peer.id)
-                && let Err(e) = crate::db::sync_state_observe(&lock.0, &local_id, &peer.id, &ts)
-            {
+            if let Err(e) = super::pull_seq::persist_cursor(
+                &lock.0,
+                &mut tracker,
+                &seq,
+                next_since.as_deref(),
+                memories.len(),
+                &local_id,
+                &peer.id,
+            ) {
                 log_catchup_sync_state_observe_failed(&peer.id, e);
             }
         }
@@ -939,15 +968,27 @@ async fn catchup_once_legacy(
             .trim_end_matches(crate::handlers::routes::SYNC_PUSH)
             .to_string();
 
-        let since_opt: Option<String> = {
+        // #9082 — the sequence cursor rides beside the timestamp cursor:
+        // `after_seq` is sent on every pull (0 when none is stored) and is
+        // never seeded from the timestamp cursor.
+        let (since_opt, seq_cursor) = {
             let lock = db.lock().await;
-            match crate::db::sync_state_load(&lock.0, &local_id) {
+            let since: Option<String> = match crate::db::sync_state_load(&lock.0, &local_id) {
                 Ok(clock) => clock.entries.get(&peer.id).cloned(),
                 Err(_) => None,
-            }
+            };
+            (
+                since,
+                super::pull_seq::load_cursor(&lock.0, &local_id, &peer.id),
+            )
         };
 
-        let url = sync_since_url(&base, &local_id, since_opt.as_deref());
+        let url = sync_since_url(
+            &base,
+            &local_id,
+            since_opt.as_deref(),
+            Some(seq_cursor.after_seq()),
+        );
 
         // v0.7.0 #239 — attach `x-peer-id` so the peer's per-peer
         // namespace allowlist can scope the returned rows (sqlite
@@ -976,6 +1017,11 @@ async fn catchup_once_legacy(
         let Some((body, memories)) = fetch_catchup_envelope(&peer.id, req).await else {
             continue;
         };
+        // #9082 — a peer that walked its sequence answers `next_seq`; a
+        // malformed sequence answer applies nothing and moves no cursor.
+        let Some(seq) = super::pull_seq::classify(&body, seq_cursor, &peer.id) else {
+            continue;
+        };
 
         // #2441 (CB-11) — consume the peer's examined-watermark so an
         // all-out-of-scope (count:0) window still advances (see the SAL branch).
@@ -1002,10 +1048,8 @@ async fn catchup_once_legacy(
         // the tracker, which resolves the cursor from this node's clock and the
         // rows durably applied, held strictly below any delivered row that was
         // not applied (see `pull_cursor`).
-        let mut tracker = super::pull_cursor::PullCursorTracker::new(
-            since_opt.clone(),
-            catchup_page_limit(&body),
-        );
+        let mut tracker =
+            super::pull_seq::tracker_for(&seq, since_opt.clone(), catchup_page_limit(&body));
         // #2480 — load peer-attestation once per peer tick (not per row).
         let attest_cfg = crate::federation::peer_attestation::PeerAttestationConfig::from_env();
         let require_push_ns_scope =
@@ -1128,9 +1172,15 @@ async fn catchup_once_legacy(
                 }
             }
             // #2714 + #2441 — halt-gated, validated cursor advance.
-            if let Some(ts) = tracker.resolve(next_since.as_deref(), memories.len(), &peer.id)
-                && let Err(e) = crate::db::sync_state_observe(&lock.0, &local_id, &peer.id, &ts)
-            {
+            if let Err(e) = super::pull_seq::persist_cursor(
+                &lock.0,
+                &mut tracker,
+                &seq,
+                next_since.as_deref(),
+                memories.len(),
+                &local_id,
+                &peer.id,
+            ) {
                 log_catchup_sync_state_observe_failed(&peer.id, e);
             }
         }
@@ -1178,7 +1228,7 @@ pub async fn catchup_once_for_tests(config: &FederationConfig) {
             .sync_push_url
             .trim_end_matches(crate::handlers::routes::SYNC_PUSH)
             .to_string();
-        let url = sync_since_url(&base, &local_id, None);
+        let url = sync_since_url(&base, &local_id, None, None);
 
         let mut req = config
             .client
@@ -1205,21 +1255,31 @@ pub async fn catchup_once_for_tests(config: &FederationConfig) {
 
 /// Build the outbound `/api/v1/sync/since` catch-up URL for `base`
 /// (the peer base URL with the push suffix already trimmed): optional
-/// `since` vector-clock cursor + the local peer id. ONE builder so the
-/// three catch-up paths (store-backed, legacy, test harness) cannot
-/// drift on the query shape (#1558 batch 4).
-fn sync_since_url(base: &str, local_id: &str, since: Option<&str>) -> String {
-    match since {
-        Some(s) => format!(
-            "{base}{}?since={}&peer={local_id}",
-            crate::handlers::routes::SYNC_SINCE,
-            urlencoding_encode(s)
-        ),
-        None => format!(
-            "{base}{}?peer={local_id}",
-            crate::handlers::routes::SYNC_SINCE
-        ),
+/// `since` vector-clock cursor, optional #9082 `after_seq` sequence cursor
+/// + the local peer id. ONE builder so the three catch-up paths
+/// (store-backed, legacy, test harness) cannot drift on the query shape
+/// (#1558 batch 4).
+fn sync_since_url(
+    base: &str,
+    local_id: &str,
+    since: Option<&str>,
+    after_seq: Option<i64>,
+) -> String {
+    let mut url = format!(
+        "{base}{}?peer={local_id}",
+        crate::handlers::routes::SYNC_SINCE
+    );
+    if let Some(s) = since {
+        url.push_str("&since=");
+        url.push_str(&urlencoding_encode(s));
     }
+    if let Some(seq) = after_seq {
+        url.push('&');
+        url.push_str(crate::models::field_names::AFTER_SEQ);
+        url.push('=');
+        url.push_str(&seq.to_string());
+    }
+    url
 }
 
 // Minimal RFC 3986 percent-encoder for the `since` timestamp. Only covers
@@ -1568,8 +1628,12 @@ mod cov_catchup_helpers_3521 {
     /// bounded delta pull into a full-corpus re-pull.
     #[test]
     fn sync_since_url_carries_the_cursor_and_the_local_peer_id() {
-        let with_cursor =
-            sync_since_url("https://peer.test", "local-1", Some("2026-01-01T00:00:00Z"));
+        let with_cursor = sync_since_url(
+            "https://peer.test",
+            "local-1",
+            Some("2026-01-01T00:00:00Z"),
+            None,
+        );
         assert!(
             with_cursor.contains("since=2026-01-01T00%3A00%3A00Z"),
             "the cursor must be percent-encoded; got {with_cursor}"
@@ -1579,7 +1643,7 @@ mod cov_catchup_helpers_3521 {
             "the local peer id must be present; got {with_cursor}"
         );
 
-        let without_cursor = sync_since_url("https://peer.test", "local-1", None);
+        let without_cursor = sync_since_url("https://peer.test", "local-1", None, None);
         assert!(
             !without_cursor.contains("since="),
             "no cursor must mean no since= parameter; got {without_cursor}"
@@ -1587,6 +1651,31 @@ mod cov_catchup_helpers_3521 {
         assert!(
             without_cursor.contains("peer=local-1"),
             "the local peer id must be present without a cursor; got {without_cursor}"
+        );
+        assert!(
+            !with_cursor.contains("after_seq=") && !without_cursor.contains("after_seq="),
+            "no sequence cursor must mean no after_seq= parameter"
+        );
+    }
+
+    /// #9082 — `after_seq` is carried exactly once, beside `since`, so a peer
+    /// that knows the sequence walks it and an older peer still sees `since`.
+    #[test]
+    fn sync_since_url_carries_after_seq_9082() {
+        let url = sync_since_url(
+            "https://peer.test",
+            "local-1",
+            Some("2026-01-01T00:00:00Z"),
+            Some(0),
+        );
+        assert_eq!(
+            url,
+            "https://peer.test/api/v1/sync/since?peer=local-1&since=2026-01-01T00%3A00%3A00Z&after_seq=0"
+        );
+        let url = sync_since_url("https://peer.test", "local-1", None, Some(42));
+        assert_eq!(
+            url,
+            "https://peer.test/api/v1/sync/since?peer=local-1&after_seq=42"
         );
     }
 }

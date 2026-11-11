@@ -31,7 +31,7 @@ use ai_memory::federation::{FederationConfig, PeerEndpoint, PullOutcome, Refusal
 use ai_memory::replication::QuorumPolicy;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use serde_json::{Value, json};
+use serde_json::Value;
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tower::ServiceExt as _;
@@ -73,8 +73,9 @@ const TS_FAR_FUTURE: &str = "9999-12-31T23:59:59+00:00";
 const TS_CLASSES: [&str; 5] = [TS_FAR_FUTURE, TS_MIN, TS_EQUAL, TS_BELOW, TS_ABOVE];
 /// The relayed row's stamp: older than everything the edge already has.
 const TS_RELAYED: &str = "2020-01-01T00:00:00+00:00";
-/// A priority outside `1..=10`: the puller refuses the row as invalid.
-const INVALID_PRIORITY: i64 = 11;
+/// One tag over `validate_tags`' cap of 50: the store keeps the row (no
+/// CHECK on the tag count) and the puller refuses it as invalid.
+const INVALID_TAG_COUNT: usize = 51;
 
 /// Throughput row: rows seeded on the large table and the named ceilings.
 const LARGE_TABLE_ROWS: usize = 20_000;
@@ -231,9 +232,8 @@ fn sqlite_node(name: &str) -> Node {
     let db_path = dir.path().join(format!("{name}.db"));
     let db = open_db(&db_path);
     #[cfg(feature = "sal")]
-    let store: Arc<dyn ai_memory::store::MemoryStore> = Arc::new(
-        ai_memory::store::sqlite::SqliteStore::open(&db_path).expect("open sqlite store"),
-    );
+    let store: Arc<dyn ai_memory::store::MemoryStore> =
+        Arc::new(ai_memory::store::sqlite::SqliteStore::open(&db_path).expect("open sqlite store"));
     let state = app_state(
         &db,
         #[cfg(feature = "sal")]
@@ -292,34 +292,22 @@ async fn node(backend: Backend, name: &str) -> Option<Node> {
     }
 }
 
-fn row_json(id: &str, updated_at: &str, priority: i64) -> Value {
-    json!({
-        "id": id,
-        "tier": "long",
-        "namespace": NAMESPACE,
-        "title": format!("row {id}"),
-        "content": "sync_seq corpus row (#9082)",
-        "tags": [],
-        "priority": priority,
-        "confidence": 1.0,
-        "source": "api",
-        "metadata": {},
-        "access_count": 0,
-        "created_at": TS_MIN,
-        "updated_at": updated_at,
-    })
-}
-
 /// Insert one row the way a relay or a direct write lands it: straight into
 /// the node's database, so no write-path posture is in play.
 async fn seed(node: &Node, id: &str, updated_at: &str, priority: i64) {
+    seed_tagged(node, id, updated_at, priority, "[]").await;
+}
+
+/// [`seed`] with an explicit `tags` JSON array.
+async fn seed_tagged(node: &Node, id: &str, updated_at: &str, priority: i64, tags: &str) {
     #[cfg(feature = "sal-postgres")]
     if let Some((pool, _)) = node.pg.as_ref() {
         sqlx::query(
             "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, \
              confidence, source, metadata, access_count, created_at, updated_at) \
-             VALUES ($1, 'long', $2, $3, 'sync_seq corpus row (#9082)', '[]'::jsonb, $4, 1.0, \
-             'api', '{}'::jsonb, 0, $5::timestamptz, $6::timestamptz)",
+             VALUES ($1, 'long', $2, $3, 'sync_seq corpus row (#9082)', $7::jsonb, $4, 1.0, \
+             'api', '{\"agent_id\":\"ai:puller\",\"scope\":\"collective\"}'::jsonb, 0, \
+             $5::timestamptz, $6::timestamptz)",
         )
         .bind(id)
         .bind(NAMESPACE)
@@ -327,6 +315,7 @@ async fn seed(node: &Node, id: &str, updated_at: &str, priority: i64) {
         .bind(i32::try_from(priority).expect("priority fits"))
         .bind(TS_MIN)
         .bind(updated_at)
+        .bind(tags)
         .execute(pool)
         .await
         .expect("seed pg row");
@@ -338,9 +327,17 @@ async fn seed(node: &Node, id: &str, updated_at: &str, priority: i64) {
         .execute(
             "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, \
              confidence, source, metadata, access_count, created_at, updated_at) \
-             VALUES (?1, 'long', ?2, ?3, 'sync_seq corpus row (#9082)', '[]', ?4, 1.0, 'api', \
-             '{}', 0, ?5, ?6)",
-            rusqlite::params![id, NAMESPACE, format!("row {id}"), priority, TS_MIN, updated_at],
+             VALUES (?1, 'long', ?2, ?3, 'sync_seq corpus row (#9082)', ?7, ?4, 1.0, 'api', \
+             '{\"agent_id\":\"ai:puller\",\"scope\":\"collective\"}', 0, ?5, ?6)",
+            rusqlite::params![
+                id,
+                NAMESPACE,
+                format!("row {id}"),
+                priority,
+                TS_MIN,
+                updated_at,
+                tags
+            ],
         )
         .expect("seed row");
 }
@@ -397,10 +394,10 @@ async fn hide(node: &Node, id: &str) {
 /// One `/sync/since` request as `NODE_C`. `after_seq` is sent raw so the
 /// negative case reaches the handler.
 async fn get(router: &axum::Router, after_seq: Option<&str>, limit: usize) -> (StatusCode, Value) {
-    let mut uri = format!("/api/v1/sync/since?limit={limit}&peer={NODE_C}");
-    if let Some(a) = after_seq {
-        uri.push_str(&format!("&{AFTER_SEQ}={a}"));
-    }
+    let uri = match after_seq {
+        Some(a) => format!("/api/v1/sync/since?limit={limit}&peer={NODE_C}&{AFTER_SEQ}={a}"),
+        None => format!("/api/v1/sync/since?limit={limit}&peer={NODE_C}"),
+    };
     let req = Request::builder()
         .method("GET")
         .uri(uri)
@@ -415,7 +412,10 @@ async fn get(router: &axum::Router, after_seq: Option<&str>, limit: usize) -> (S
     let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024 * 1024)
         .await
         .expect("body");
-    (status, serde_json::from_slice(&bytes).expect("json envelope"))
+    (
+        status,
+        serde_json::from_slice(&bytes).expect("json envelope"),
+    )
 }
 
 async fn pull_seq(router: &axum::Router, after_seq: i64, limit: usize) -> Value {
@@ -461,7 +461,10 @@ async fn walk(router: &axum::Router, start: i64, limit: usize) -> (Vec<String>, 
         if page.is_empty() && next == after {
             return (served, cursors);
         }
-        assert!(next > after, "#9082: next_seq must move past {after}; got {next}");
+        assert!(
+            next > after,
+            "#9082: next_seq must move past {after}; got {next}"
+        );
         served.extend(page);
         after = next;
     }
@@ -506,13 +509,19 @@ async fn generative_walk(backend: Backend) {
             .filter(|(_, id)| *id != hidden)
             .map(|(_, id)| id.clone())
             .collect();
-        assert_eq!(served, expected, "{backend:?}/{position:?}: exact serve order");
+        assert_eq!(
+            served, expected,
+            "{backend:?}/{position:?}: exact serve order"
+        );
         let expected_cursors: Vec<i64> = seq_order
             .chunks(PAGE)
             .map(|c| c.last().expect("chunk").0)
             .chain(std::iter::once(seq_order.last().expect("rows").0))
             .collect();
-        assert_eq!(cursors, expected_cursors, "{backend:?}/{position:?}: window cursors");
+        assert_eq!(
+            cursors, expected_cursors,
+            "{backend:?}/{position:?}: window cursors"
+        );
     }
 }
 
@@ -550,7 +559,11 @@ async fn late_row_below_cursor(backend: Backend) {
 
     seed(&n, "late-relayed", TS_RELAYED, 5).await;
     let v = pull_seq(&n.router, cursor, PAGE).await;
-    assert_eq!(ids(&v), ["late-relayed"], "{backend:?}: the late row is served");
+    assert_eq!(
+        ids(&v),
+        ["late-relayed"],
+        "{backend:?}: the late row is served"
+    );
     assert_eq!(next_seq(&v), cursor + 1, "{backend:?}: next_seq is its seq");
 
     let since = legacy_since.expect("legacy next_since");
@@ -576,7 +589,10 @@ async fn late_row_below_cursor(backend: Backend) {
         Vec::<String>::new(),
         "{backend:?}: the since path keeps the hole for old pullers (documented risk)"
     );
-    assert!(old.get(NEXT_SEQ).is_none(), "the since path carries no next_seq: {old}");
+    assert!(
+        old.get(NEXT_SEQ).is_none(),
+        "the since path carries no next_seq: {old}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -605,7 +621,11 @@ async fn bump_rules(backend: Backend) {
     seed(&n, "bump-2", TS_EQUAL, 5).await;
     let s1 = seq_of(&n, "bump-1").await;
     let s2 = seq_of(&n, "bump-2").await;
-    assert_eq!((s1, s2), (1, 2), "{backend:?}: inserts number from 1 in commit order");
+    assert_eq!(
+        (s1, s2),
+        (1, 2),
+        "{backend:?}: inserts number from 1 in commit order"
+    );
 
     // Unreplicated column: no bump.
     exec(
@@ -615,7 +635,11 @@ async fn bump_rules(backend: Backend) {
         "bump-1",
     )
     .await;
-    assert_eq!(seq_of(&n, "bump-1").await, s1, "{backend:?}: access_count is a touch");
+    assert_eq!(
+        seq_of(&n, "bump-1").await,
+        s1,
+        "{backend:?}: access_count is a touch"
+    );
     // Replicated column set to its own value: no bump.
     exec(
         &n,
@@ -624,7 +648,11 @@ async fn bump_rules(backend: Backend) {
         "bump-1",
     )
     .await;
-    assert_eq!(seq_of(&n, "bump-1").await, s1, "{backend:?}: a no-op write is no change");
+    assert_eq!(
+        seq_of(&n, "bump-1").await,
+        s1,
+        "{backend:?}: a no-op write is no change"
+    );
     // A caller cannot pin the seq: a direct write of the column is not a
     // replicated change and a relayed insert is renumbered (risk: a raw
     // `SET sync_seq` is unguarded; nothing in the product issues one).
@@ -636,9 +664,17 @@ async fn bump_rules(backend: Backend) {
         "bump-1",
     )
     .await;
-    assert_eq!(seq_of(&n, "bump-1").await, 3, "{backend:?}: a real change takes head+1");
+    assert_eq!(
+        seq_of(&n, "bump-1").await,
+        3,
+        "{backend:?}: a real change takes head+1"
+    );
     let v = pull_seq(&n.router, s2, PAGE).await;
-    assert_eq!(ids(&v), ["bump-1"], "{backend:?}: the changed row is re-served");
+    assert_eq!(
+        ids(&v),
+        ["bump-1"],
+        "{backend:?}: the changed row is re-served"
+    );
     assert_eq!(next_seq(&v), 3, "{backend:?}");
 }
 
@@ -666,27 +702,51 @@ async fn edges(backend: Backend) {
         return;
     };
     let empty = pull_seq(&n.router, 0, PAGE).await;
-    assert_eq!((ids(&empty).len(), next_seq(&empty)), (0, 0), "{backend:?}: empty db");
+    assert_eq!(
+        (ids(&empty).len(), next_seq(&empty)),
+        (0, 0),
+        "{backend:?}: empty db"
+    );
     let e0 = epoch(&empty);
     assert!(!e0.is_empty(), "{backend:?}: the epoch is never empty");
     seed(&n, "edge-1", TS_EQUAL, 5).await;
     seed(&n, "edge-2", TS_ABOVE, 5).await;
 
     let echo = pull_seq(&n.router, 2, PAGE).await;
-    assert_eq!(ids(&echo), Vec::<String>::new(), "{backend:?}: nothing past the head");
-    assert_eq!(next_seq(&echo), 2, "{backend:?}: an empty page echoes after_seq");
+    assert_eq!(
+        ids(&echo),
+        Vec::<String>::new(),
+        "{backend:?}: nothing past the head"
+    );
+    assert_eq!(
+        next_seq(&echo),
+        2,
+        "{backend:?}: an empty page echoes after_seq"
+    );
     assert_eq!(epoch(&echo), e0, "{backend:?}: the epoch is stable");
 
     // A puller whose cursor is above the head (this node was restored or
     // re-initialised under it) is walked from 0, never left stranded.
     let reset = pull_seq(&n.router, 1_000, PAGE).await;
-    assert_eq!(ids(&reset), ["edge-1", "edge-2"], "{backend:?}: above head walks from 0");
+    assert_eq!(
+        ids(&reset),
+        ["edge-1", "edge-2"],
+        "{backend:?}: above head walks from 0"
+    );
     assert_eq!(next_seq(&reset), 2, "{backend:?}");
 
     let (status, body) = get(&n.router, Some("-1"), PAGE).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{backend:?}: negative after_seq: {body}");
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "{backend:?}: negative after_seq: {body}"
+    );
     let (status, body) = get(&n.router, Some("not-a-number"), PAGE).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{backend:?}: non-integer: {body}");
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "{backend:?}: non-integer: {body}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -725,11 +785,30 @@ async fn restore_regenerates_the_seq_epoch_9082() {
     }
     let target = n.db_path.with_file_name("restore-target.db");
     std::fs::copy(&snapshot, &target).expect("copy snapshot");
-    let restored = rusqlite::Connection::open(&target).expect("open restored");
-    let fresh = ai_memory::storage::sync_seq::regenerate_seq_epoch(&restored).expect("regen");
-    assert_ne!(fresh, before, "a restored database gets a new epoch");
-    let head = ai_memory::storage::sync_seq::seq_head(&restored).expect("head");
-    assert_eq!((head.head, head.epoch), (1, fresh), "the head survives, the epoch does not");
+    // A copy that was not published by a restore keeps the epoch.
+    {
+        let copied = ai_memory::db::open(&target).expect("open copy");
+        let head = ai_memory::storage::sync_seq::seq_head(&copied).expect("head");
+        assert_eq!(head.epoch, before, "an unarmed open never resets the epoch");
+    }
+    // `restore` arms the reset before it publishes; the next open consumes it.
+    ai_memory::storage::sync_seq::arm_epoch_reset(&target).expect("arm");
+    let marker = ai_memory::storage::sync_seq::epoch_reset_marker_path(&target);
+    assert!(marker.exists(), "the sidecar is armed");
+    let fresh = {
+        let restored = ai_memory::db::open(&target).expect("open restored");
+        let head = ai_memory::storage::sync_seq::seq_head(&restored).expect("head");
+        assert_ne!(head.epoch, before, "a restored database gets a new epoch");
+        assert_eq!(head.head, 1, "the head survives, the epoch does not");
+        head.epoch
+    };
+    assert!(!marker.exists(), "the sidecar is consumed by the open");
+    let reopened = ai_memory::db::open(&target).expect("reopen");
+    let head = ai_memory::storage::sync_seq::seq_head(&reopened).expect("head");
+    assert_eq!(
+        head.epoch, fresh,
+        "the reset happens once, not on every open"
+    );
     clear_posture();
 }
 
@@ -748,7 +827,8 @@ async fn sqlite_seq_walk_large_table_inside_ceiling_9082() {
             tx.execute(
                 "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, \
                  confidence, source, metadata, access_count, created_at, updated_at) \
-                 VALUES (?1, 'long', ?2, ?1, 'x', '[]', 5, 1.0, 'api', '{}', 0, ?3, ?3)",
+                 VALUES (?1, 'long', ?2, ?1, 'x', '[]', 5, 1.0, 'api', \
+                 '{\"agent_id\":\"ai:puller\",\"scope\":\"collective\"}', 0, ?3, ?3)",
                 rusqlite::params![
                     format!("large-{i:05}"),
                     NAMESPACE,
@@ -824,7 +904,8 @@ async fn postgres_concurrent_writers_commit_in_seq_order_9082() {
         .expect("noop");
     let insert = "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, \
                   confidence, source, metadata, access_count, created_at, updated_at) \
-                  VALUES ($1, 'long', $2, $1, 'x', '[]'::jsonb, 5, 1.0, 'api', '{}'::jsonb, 0, \
+                  VALUES ($1, 'long', $2, $1, 'x', '[]'::jsonb, 5, 1.0, 'api', \
+                  '{\"agent_id\":\"ai:puller\",\"scope\":\"collective\"}'::jsonb, 0, \
                   now(), now())";
     sqlx::query(insert)
         .bind("cc-first")
@@ -856,11 +937,19 @@ async fn postgres_concurrent_writers_commit_in_seq_order_9082() {
     wait_until_lock_waiting(pool, pid).await;
     // The reader sees nothing: seq 1 is in flight and seq 2 cannot exist yet.
     let mid = pull_seq(&n.router, 0, PAGE).await;
-    assert_eq!(ids(&mid), Vec::<String>::new(), "no row is visible mid-flight");
+    assert_eq!(
+        ids(&mid),
+        Vec::<String>::new(),
+        "no row is visible mid-flight"
+    );
     first.commit().await.expect("commit first");
     handle.await.expect("second writer");
     let v = pull_seq(&n.router, 0, PAGE).await;
-    assert_eq!(ids(&v), ["cc-first", "cc-second"], "seq order = commit order");
+    assert_eq!(
+        ids(&v),
+        ["cc-first", "cc-second"],
+        "seq order = commit order"
+    );
     assert_eq!(next_seq(&v), 2);
     clear_posture();
 }
@@ -919,7 +1008,10 @@ async fn postgres_counter_deadlock_aborts_one_side_with_40p01_9082() {
     };
     let codes = [code(&one_result), code(&two_result)];
     assert_eq!(
-        codes.iter().filter(|c| c.as_deref() == Some("40P01")).count(),
+        codes
+            .iter()
+            .filter(|c| c.as_deref() == Some("40P01"))
+            .count(),
         1,
         "exactly one side is the deadlock victim with SQLSTATE 40P01: {codes:?}"
     );
@@ -939,7 +1031,10 @@ async fn postgres_counter_deadlock_aborts_one_side_with_40p01_9082() {
         .fetch_one(pool)
         .await
         .expect("max");
-    assert_eq!(head, max, "the counter matches the committed rows after the abort");
+    assert_eq!(
+        head, max,
+        "the counter matches the committed rows after the abort"
+    );
     clear_posture();
 }
 
@@ -995,7 +1090,11 @@ async fn stored(node: &Node) -> BTreeSet<String> {
         .collect()
 }
 
-fn pull_cursor(node: &Node, local: &str, peer: &str) -> ai_memory::storage::sync_seq::PullSeqCursor {
+fn pull_cursor(
+    node: &Node,
+    local: &str,
+    peer: &str,
+) -> ai_memory::storage::sync_seq::PullSeqCursor {
     let conn = rusqlite::Connection::open(&node.db_path).expect("open");
     ai_memory::storage::sync_seq::sync_pull_seq_get(&conn, local, peer).expect("cursor")
 }
@@ -1016,17 +1115,35 @@ async fn relay(origin_backend: Backend) {
 
     seed(&a, "relay-r1", TS_ABOVE, 5).await;
     let ab = pass(&b_from_a, &b).await;
-    assert_eq!((ab.applied, ab.refused.len()), (1, 0), "{origin_backend:?}: B <- A r1");
+    assert_eq!(
+        (ab.applied, ab.refused.len()),
+        (1, 0),
+        "{origin_backend:?}: B <- A r1"
+    );
     let bc = pass(&c_from_b, &c).await;
-    assert_eq!((bc.applied, bc.refused.len()), (1, 0), "{origin_backend:?}: C <- B r1");
+    assert_eq!(
+        (bc.applied, bc.refused.len()),
+        (1, 0),
+        "{origin_backend:?}: C <- B r1"
+    );
 
     seed(&a, "relay-r0", TS_RELAYED, 5).await;
     let ab = pass(&b_from_a, &b).await;
-    assert_eq!(ab.applied, 1, "{origin_backend:?}: B pulls the old-stamped row by seq");
+    assert_eq!(
+        ab.applied, 1,
+        "{origin_backend:?}: B pulls the old-stamped row by seq"
+    );
     let bc = pass(&c_from_b, &c).await;
-    assert_eq!(bc.applied, 1, "{origin_backend:?}: C pulls the relayed row from B");
+    assert_eq!(
+        bc.applied, 1,
+        "{origin_backend:?}: C pulls the relayed row from B"
+    );
     let want: BTreeSet<String> = ["relay-r0", "relay-r1"].map(String::from).into();
-    assert_eq!(stored(&c).await, want, "{origin_backend:?}: the edge holds every row");
+    assert_eq!(
+        stored(&c).await,
+        want,
+        "{origin_backend:?}: the edge holds every row"
+    );
 
     let cb = pull_cursor(&c, NODE_C, NODE_B);
     let b_head = {
@@ -1034,7 +1151,11 @@ async fn relay(origin_backend: Backend) {
         ai_memory::storage::sync_seq::seq_head(&guard.0).expect("b head")
     };
     assert_eq!(cb.last_seq, Some(b_head.head), "C's seq cursor is B's head");
-    assert_eq!(cb.seq_epoch, Some(b_head.epoch), "C's cursor carries B's epoch");
+    assert_eq!(
+        cb.seq_epoch,
+        Some(b_head.epoch),
+        "C's cursor carries B's epoch"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1071,7 +1192,13 @@ async fn seq_puller_records_and_passes_a_refused_row_at_every_position_9082() {
         for i in 0..PAGE {
             let id = format!("refuse-{position:?}-{i}");
             if i == position.index() {
-                seed(&b, &id, TS_CLASSES[i % TS_CLASSES.len()], INVALID_PRIORITY).await;
+                let tags = serde_json::to_string(
+                    &(0..INVALID_TAG_COUNT)
+                        .map(|t| format!("t{t}"))
+                        .collect::<Vec<_>>(),
+                )
+                .expect("tags json");
+                seed_tagged(&b, &id, TS_CLASSES[i % TS_CLASSES.len()], 5, &tags).await;
                 refused_id = id;
             } else {
                 seed(&b, &id, TS_CLASSES[i % TS_CLASSES.len()], 5).await;
@@ -1080,9 +1207,18 @@ async fn seq_puller_records_and_passes_a_refused_row_at_every_position_9082() {
         }
         let out = pass(&cfg, &c).await;
         assert_eq!(out.applied, PAGE - 1, "{position:?}: every valid row lands");
-        assert_eq!(out.refused.len(), 1, "{position:?}: one refusal: {:?}", out.refused);
+        assert_eq!(
+            out.refused.len(),
+            1,
+            "{position:?}: one refusal: {:?}",
+            out.refused
+        );
         assert_eq!(out.refused[0].memory_id, refused_id, "{position:?}");
-        assert_eq!(out.refused[0].reason, RefusalReason::InvalidMemory, "{position:?}");
+        assert_eq!(
+            out.refused[0].reason,
+            RefusalReason::InvalidMemory,
+            "{position:?}"
+        );
         assert_eq!(stored(&c).await, valid, "{position:?}: exact set stored");
         let cursor = pull_cursor(&c, NODE_C, NODE_B);
         assert_eq!(
@@ -1125,13 +1261,24 @@ async fn seq_puller_rewalks_a_restored_peer_with_a_stale_high_cursor_9082() {
     seed(&b, "post-restore", TS_RELAYED, 5).await;
     let out = pass(&cfg, &c).await;
     assert_eq!(out.applied, 1, "the row written after the restore lands");
-    assert!(stored(&c).await.contains("post-restore"), "post-restore row stored");
+    assert!(
+        stored(&c).await.contains("post-restore"),
+        "post-restore row stored"
+    );
     let cursor = pull_cursor(&c, NODE_C, NODE_B);
     let head = {
         let guard = b.db.lock().await;
         ai_memory::storage::sync_seq::seq_head(&guard.0).expect("head")
     };
-    assert_eq!(cursor.last_seq, Some(head.head), "cursor re-based on the restored head");
-    assert_eq!(cursor.seq_epoch, Some(head.epoch), "cursor adopts the new epoch");
+    assert_eq!(
+        cursor.last_seq,
+        Some(head.head),
+        "cursor re-based on the restored head"
+    );
+    assert_eq!(
+        cursor.seq_epoch,
+        Some(head.epoch),
+        "cursor adopts the new epoch"
+    );
     clear_posture();
 }

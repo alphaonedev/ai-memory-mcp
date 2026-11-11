@@ -1758,6 +1758,14 @@ const MIGRATION_V100_TITLE_SLOT_LIVE_ROWS: &str =
 const MIGRATION_V101_A2A_TASKS: &str =
     include_str!("../../migrations/postgres/0058_v101_a2a_tasks.sql");
 
+/// v102 (#9082): the serving-assigned change sequence (`memories.sync_seq`,
+/// the one-row `sync_seq_counter` bumped by `UPDATE ... RETURNING` under a row
+/// lock held to commit, the UNIQUE index, the assignment triggers and the
+/// puller-side `sync_pull_seq` mirror). The sqlite twin is
+/// `migrations/sqlite/0086_v102_sync_seq.sql`. 5-agent vote (4d3ea1c5).
+const MIGRATION_V102_SYNC_SEQ: &str =
+    include_str!("../../migrations/postgres/0059_v102_sync_seq.sql");
+
 /// v0.7.0 Cluster G — shadow-mode retention + denormalised `source`
 /// column + compound `(namespace, source, observed_at)` index
 /// supporting the calibration scan (issue #767, PERF-4 + PERF-12).
@@ -2148,7 +2156,7 @@ const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
 //       has carried these since v56, so its v88 is a no-op; doc twins
 //       migrations/{postgres/0045,sqlite/0072}_v88_list_composite_indexes.sql.
 //       CURRENT_SCHEMA_VERSION stays pinned in lockstep with sqlite.
-const CURRENT_SCHEMA_VERSION: i32 = 101;
+const CURRENT_SCHEMA_VERSION: i32 = 102;
 
 /// PostgreSQL session-scoped advisory lock key used to serialize
 /// concurrent `migrate()` invocations across processes and across
@@ -4321,8 +4329,11 @@ impl PostgresStore {
         if current_version < 100 {
             self.migrate_v100().await?;
         }
-        if current_version < CURRENT_SCHEMA_VERSION {
+        if current_version < 101 {
             self.migrate_v101().await?;
+        }
+        if current_version < CURRENT_SCHEMA_VERSION {
+            self.migrate_v102().await?;
         }
 
         Ok(())
@@ -7522,6 +7533,35 @@ impl PostgresStore {
             target: TRACE_TARGET,
             "schema migration v101 applied (#8444: a2a_tasks - durable Task rows \
              for the Agent2Agent standard binding)"
+        );
+        Ok(())
+    }
+
+    /// v102 (#9082) - the serving-assigned change sequence. One transaction:
+    /// column, backfill, counter, UNIQUE index, then the triggers (the
+    /// backfill is never re-numbered). NoLoss; not idempotent on its own, the
+    /// ladder gate is the re-run guard.
+    async fn migrate_v102(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v102 sync-seq migration tx", e))?;
+
+        sqlx::raw_sql(MIGRATION_V102_SYNC_SEQ)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("apply v102 sync-seq migration", e))?;
+
+        record_schema_version(&mut tx, 102).await?;
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v102 migration", e))?;
+
+        tracing::info!(
+            target: TRACE_TARGET,
+            "schema migration v102 applied (#9082: memories.sync_seq - the serving-assigned \
+             change sequence /sync/since walks by)"
         );
         Ok(())
     }
@@ -25017,6 +25057,84 @@ impl MemoryStore for PostgresStore {
             .flatten()
             .collect();
         Ok((mems, raw_count))
+    }
+
+    async fn list_memories_after_seq(
+        &self,
+        after_seq: i64,
+        limit: usize,
+    ) -> StoreResult<crate::storage::sync_seq::SeqPage> {
+        // v1.0.0 #9082 — postgres twin of `storage::sync_seq::memories_after_seq`.
+        // The head, epoch and page are read in ONE repeatable-read snapshot so
+        // `effective_after` and the page agree. The counter row lock taken by
+        // `memories_sync_seq_assign` is held to commit, so every seq at or
+        // below the committed head belongs to a committed row (or a rolled-back
+        // gap), never to a row still in flight.
+        if after_seq < 0 {
+            return Err(StoreError::InvalidInput {
+                detail: crate::storage::sync_seq::negative_after_seq_detail(after_seq),
+            });
+        }
+        let limit_i: i64 = i64::try_from(limit)
+            .unwrap_or(STORE_LIST_MAX_LIMIT_SAL)
+            .clamp(1, STORE_LIST_MAX_LIMIT_SAL);
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("list after seq begin", e))?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("list after seq isolation", e))?;
+        let head_row: Option<(i64, String)> =
+            sqlx::query_as("SELECT head, epoch FROM sync_seq_counter WHERE id = 1")
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("list after seq head", e))?;
+        let Some((head, epoch)) = head_row else {
+            return Err(StoreError::IntegrityFailed {
+                detail: crate::storage::sync_seq::SYNC_SEQ_COUNTER_MISSING.to_string(),
+            });
+        };
+        let effective_after = if after_seq > head { 0 } else { after_seq };
+        let cols = MEMORY_READ_COLUMNS;
+        let vis = crate::models::lifecycle_visible_clause("");
+        let vis_expr = vis.strip_prefix("AND ").unwrap_or(&vis);
+        let rows = sqlx::query(&format!(
+            "SELECT {cols}, sync_seq AS sync_seq_examined, \
+                    ({vis_expr}) AS sync_seq_visible \
+               FROM memories WHERE sync_seq > $1 ORDER BY sync_seq ASC LIMIT $2",
+        ))
+        .bind(effective_after)
+        .bind(limit_i)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("list memories after seq", e))?;
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("list after seq commit", e))?;
+        let raw_count = rows.len();
+        let mut next_seq = effective_after;
+        let mut memories = Vec::with_capacity(raw_count);
+        for row in &rows {
+            next_seq = row
+                .try_get("sync_seq_examined")
+                .map_err(|e| to_store_err("list after seq column", e))?;
+            let visible: bool = row
+                .try_get("sync_seq_visible")
+                .map_err(|e| to_store_err("list after seq column", e))?;
+            if visible && let Some(mem) = Self::row_to_memory_scan(row)? {
+                memories.push(mem);
+            }
+        }
+        Ok(crate::storage::sync_seq::SeqPage {
+            memories,
+            raw_count,
+            next_seq,
+            effective_after,
+            head: crate::storage::sync_seq::SeqHead { head, epoch },
+        })
     }
 
     async fn apply_remote_memory(

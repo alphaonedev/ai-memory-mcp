@@ -2307,6 +2307,11 @@ pub struct SyncSinceQuery {
     /// Caller's claimed `agent_id`; optional but recorded in `sync_state`
     /// so the caller can later push incremental updates.
     pub peer: Option<String>,
+    /// v1.0.0 #9082 — walk the serving node's `memories.sync_seq` strictly
+    /// above this value instead of filtering by `updated_at`. Kept as the raw
+    /// query string so the handler can refuse a negative or malformed value
+    /// with an exact 400 (see `parse_after_seq`). Absent = the `since` path.
+    pub after_seq: Option<String>,
 }
 
 /// v0.7.0 Wave-3 Continuation 2 — postgres-backed federation push.

@@ -9011,7 +9011,7 @@ pub async fn sync_cycle_once_reporting(
     let peer_key = peer_key.as_str();
 
     // --- PULL --------------------------------------------------------
-    let since = {
+    let (since, seq_cursor) = {
         let conn = db::open(db_path)?;
         // #3675 — a row a pre-#3675 daemon keyed by the raw URL is moved
         // onto the rendered key (cursors folded, raw row deleted) so the
@@ -9023,15 +9023,22 @@ pub async fn sync_cycle_once_reporting(
                  URL key (#3675)"
             );
         }
-        db::sync_state_load(&conn, local_agent_id)?
+        let since = db::sync_state_load(&conn, local_agent_id)?
             .entries
             .get(peer_key)
-            .cloned()
+            .cloned();
+        // #9082 — the sequence cursor rides beside it (never seeded from it).
+        (
+            since,
+            crate::federation::pull_seq::load_cursor(&conn, local_agent_id, peer_key),
+        )
     };
 
     let mut pull_url = format!(
-        "{peer_url}/api/v1/sync/since?limit={batch_size}&peer={}",
-        urlencoding_minimal(local_agent_id)
+        "{peer_url}/api/v1/sync/since?limit={batch_size}&peer={}&{}={}",
+        urlencoding_minimal(local_agent_id),
+        field_names::AFTER_SEQ,
+        seq_cursor.after_seq()
     );
     if let Some(ref s) = since {
         pull_url.push_str("&since=");
@@ -9104,7 +9111,14 @@ pub async fn sync_cycle_once_reporting(
     // working for in-bound answers); a row stamped beyond now + skew is
     // DEFERRED (not applied, counted, logged) and holds the cursor below it.
     let page_limit = batch_size.min(pulled.limit);
-    let mut tracker = crate::federation::pull_cursor::PullCursorTracker::new(since, page_limit);
+    // #9082 — a malformed sequence answer applies nothing, moves no cursor.
+    let seq = crate::federation::pull_seq::classify(
+        &serde_json::Value::Object(pulled.rest),
+        seq_cursor,
+        peer_key,
+    )
+    .ok_or_else(|| anyhow::anyhow!("sync-daemon: malformed sequence answer"))?;
+    let mut tracker = crate::federation::pull_seq::tracker_for(&seq, since, page_limit);
     {
         let conn = db::open(db_path)?;
         crate::federation::pull_cursor::apply_sync_cycle_window(
@@ -9113,9 +9127,15 @@ pub async fn sync_cycle_once_reporting(
             &mut tracker,
             peer_key,
         );
-        if let Some(at) = tracker.resolve(pulled.next_since.as_deref(), pull_count, peer_key) {
-            db::sync_state_observe(&conn, local_agent_id, peer_key, &at)?;
-        }
+        crate::federation::pull_seq::persist_cursor(
+            &conn,
+            &mut tracker,
+            &seq,
+            pulled.next_since.as_deref(),
+            pull_count,
+            local_agent_id,
+            peer_key,
+        )?;
     }
     let outcome = tracker.outcome();
     crate::federation::pull_cursor::log_pull_outcome("sync-daemon", peer_key, &outcome);
@@ -9467,6 +9487,10 @@ struct SyncSinceResponse {
     /// working exactly as before.
     #[serde(default)]
     next_since: Option<String>,
+    /// #9082 — every other field; the sequence walk's answer
+    /// (`next_seq` / `after_seq` / `seq_epoch`) is read from it by name.
+    #[serde(flatten)]
+    rest: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Re-export the `Instant`/`Duration` types so test crate use sites stay

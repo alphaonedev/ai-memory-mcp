@@ -439,6 +439,12 @@ const DERIVED_OR_INTERNAL_COLUMNS: &[(&str, &str)] = &[
         "atom_of",
         "WT-1 atomisation parent FK; not a `Memory` field.",
     ),
+    (
+        "sync_seq",
+        "#9082 serving-node pull sequence: each node assigns its own from \
+         its own counter, so carrying a peer's value would corrupt the \
+         receiver's walk; it never leaves the node except as `next_seq`.",
+    ),
 ];
 
 /// #2384 STRUCTURAL drift blocker. The catch-up SEND path names its columns

@@ -196,6 +196,12 @@ pub struct PullOutcome {
     pub held: bool,
     /// The cursor written to `sync_state`, when it moved.
     pub advanced_to: Option<String>,
+    /// #9082 — rows stamped beyond the skew bound that a sequence-mode
+    /// window APPLIED (the sequence cursor never reads a row's timestamp, so
+    /// such a row cannot move it; it is logged and counted, not deferred).
+    pub future_skew_applied: usize,
+    /// #9082 — the sequence cursor persisted for a sequence-mode window.
+    pub advanced_seq: Option<i64>,
 }
 
 impl PullOutcome {
@@ -225,6 +231,10 @@ pub(crate) struct PullCursorTracker {
     pending: Vec<(String, String)>,
     max_delivered: Option<String>,
     min_blocker: Option<String>,
+    /// #9082 — the peer answered on its serving-assigned sequence: the
+    /// timestamp cursor rules (ceiling, tie groups, future-skew deferral) do
+    /// not apply, see [`Self::resolve_seq`].
+    seq_mode: bool,
     outcome: PullOutcome,
 }
 
@@ -250,7 +260,22 @@ impl PullCursorTracker {
             pending: Vec::new(),
             max_delivered: None,
             min_blocker: None,
+            seq_mode: false,
             outcome: PullOutcome::default(),
+        }
+    }
+
+    /// #9082 — a tracker for a window the peer answered on its sequence
+    /// (`next_seq` present), with a page of at most `page_limit` rows.
+    pub(crate) fn new_seq(page_limit: usize) -> Self {
+        Self::new_seq_at(page_limit, Utc::now())
+    }
+
+    /// As [`Self::new_seq`], judged against `now` (unit tests pin the clock).
+    pub(crate) fn new_seq_at(page_limit: usize, now: DateTime<Utc>) -> Self {
+        Self {
+            seq_mode: true,
+            ..Self::new_at(None, page_limit, now)
         }
     }
 
@@ -268,6 +293,24 @@ impl PullCursorTracker {
             self.max_delivered = Some(ts.to_string());
         }
         if dt > self.admit_ceiling || ts > self.admit_ceiling_str.as_str() {
+            if self.seq_mode {
+                // decision: apply over defer because the sequence cursor never
+                // reads a row timestamp, so the row cannot poison it, and a
+                // deferral would hold the whole page behind it. The receiver
+                // mirrors the origin's state (the row wins last-writer-wins
+                // here exactly as it does there).
+                self.outcome.future_skew_applied += 1;
+                tracing::warn!(
+                    target: crate::federation::SCOPE_TRACE_TARGET,
+                    peer = %peer,
+                    memory_id = ?memory_id,
+                    updated_at = ?ts,
+                    bound = %self.admit_ceiling_str,
+                    "pull: row timestamp leads this node's clock by more than {PULL_CURSOR_FUTURE_SKEW_SECS}s; \
+                     applied on the sequence walk, the cursor does not read it (#9082)"
+                );
+                return RowAdmission::Admit;
+            }
             self.outcome.future_skew += 1;
             self.block(ts);
             tracing::warn!(
@@ -469,6 +512,47 @@ impl PullCursorTracker {
         }
         self.outcome.held = advance.is_none() && page_full;
         self.outcome.advanced_to.clone_from(&advance);
+        advance
+    }
+
+    /// #9082 — resolve the sequence cursor after a sequence-mode window.
+    ///
+    /// `effective_after` is the `after_seq` the peer says it walked from (the
+    /// requested value, or 0 after its reset); `next_seq` is the highest
+    /// sequence it examined. The answer is `next_seq` when every delivered
+    /// row was applied or refused, else `effective_after`: a transiently
+    /// deferred row holds the whole window (the puller does not learn each
+    /// row's sequence), until it stalls into [`RefusalReason::HoldStalled`].
+    /// A `next_seq` below `effective_after` is a broken peer: refused, held.
+    /// `rewalk` (the stored cursor belongs to another epoch of the peer)
+    /// answers 0, so the next window walks the new numbering from the start.
+    pub(crate) fn resolve_seq(
+        &mut self,
+        effective_after: i64,
+        next_seq: i64,
+        returned: usize,
+        rewalk: bool,
+        peer: &str,
+    ) -> i64 {
+        self.outcome.returned = returned;
+        self.settle_stalls(peer);
+        let advance = if rewalk {
+            0
+        } else if next_seq < effective_after {
+            tracing::warn!(
+                target: crate::federation::SCOPE_TRACE_TARGET,
+                peer = %peer,
+                next_seq,
+                effective_after,
+                "pull: refusing a next_seq below the walked after_seq (#9082)"
+            );
+            effective_after
+        } else if self.min_blocker.is_some() {
+            effective_after
+        } else {
+            next_seq
+        };
+        self.outcome.advanced_seq = Some(advance);
         advance
     }
 
@@ -820,5 +904,108 @@ mod tests {
                 RefusalReason::InvalidMemory.label()
             ]
         );
+    }
+
+    // ---- #9082: the sequence walk ----
+
+    #[test]
+    fn seq_walk_applies_far_future_row_and_advances_9082() {
+        let peer = "peer-9082-future";
+        let rows = [at(-10), "9999-12-31T23:59:59+00:00".to_string()];
+        let mut t = PullCursorTracker::new_seq_at(SYNC_SINCE_DEFAULT_LIMIT, now());
+        for (i, ts) in rows.iter().enumerate() {
+            let id = format!("f{i}");
+            assert_eq!(t.admit(Some(ts), peer, &id), RowAdmission::Admit);
+            t.applied(ts, &id);
+        }
+        assert_eq!(t.resolve_seq(5, 9, rows.len(), false, peer), 9);
+        let o = t.outcome();
+        assert_eq!(
+            (
+                o.applied,
+                o.future_skew,
+                o.future_skew_applied,
+                o.advanced_seq
+            ),
+            (2, 0, 1, Some(9))
+        );
+    }
+
+    #[test]
+    fn seq_walk_table_9082() {
+        // (case, row action, effective_after, next_seq, rewalk, want)
+        #[derive(Clone, Copy)]
+        enum Row {
+            Applied,
+            Deferred,
+            Refused,
+            Unparseable,
+        }
+        let cases: &[(&str, Row, i64, i64, bool, i64)] = &[
+            ("clean", Row::Applied, 5, 9, false, 9),
+            ("empty-page echo", Row::Applied, 5, 5, false, 5),
+            ("transient hold", Row::Deferred, 5, 9, false, 5),
+            ("refused passes", Row::Refused, 5, 9, false, 9),
+            ("unparseable passes", Row::Unparseable, 5, 9, false, 9),
+            ("next below after", Row::Applied, 5, 3, false, 5),
+            ("foreign epoch", Row::Applied, 5, 9, true, 0),
+            ("foreign epoch while held", Row::Deferred, 5, 9, true, 0),
+            ("peer reset", Row::Applied, 0, 4, false, 4),
+        ];
+        for (i, &(case, row, after, next, rewalk, want)) in cases.iter().enumerate() {
+            let peer = format!("peer-9082-table-{i}");
+            let mut t = PullCursorTracker::new_seq_at(SYNC_SINCE_DEFAULT_LIMIT, now());
+            let ts = at(-5);
+            match row {
+                Row::Applied => {
+                    assert_eq!(t.admit(Some(&ts), &peer, "r"), RowAdmission::Admit);
+                    t.applied(&ts, "r");
+                }
+                Row::Deferred => {
+                    assert_eq!(t.admit(Some(&ts), &peer, "r"), RowAdmission::Admit);
+                    t.deferred(&ts, "r");
+                }
+                Row::Refused => {
+                    assert_eq!(t.admit(Some(&ts), &peer, "r"), RowAdmission::Admit);
+                    t.refused(&peer, "r", Some(&ts), RefusalReason::InvalidMemory);
+                }
+                Row::Unparseable => {
+                    assert_eq!(
+                        t.admit(Some("not-a-time"), &peer, "r"),
+                        RowAdmission::Rejected
+                    );
+                }
+            }
+            assert_eq!(
+                t.resolve_seq(after, next, 1, rewalk, &peer),
+                want,
+                "case {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn seq_walk_stalled_row_releases_the_window_8788_9082() {
+        let peer = "peer-9082-stall";
+        let mut last = None;
+        for pass in 0..=PULL_HOLD_STALL_PASSES {
+            let mut t = PullCursorTracker::new_seq_at(SYNC_SINCE_DEFAULT_LIMIT, now());
+            let (good, bad) = (at(-20), at(-10));
+            assert_eq!(t.admit(Some(&good), peer, "good"), RowAdmission::Admit);
+            t.applied(&good, "good");
+            assert_eq!(t.admit(Some(&bad), peer, "bad"), RowAdmission::Admit);
+            t.deferred(&bad, "bad");
+            let got = t.resolve_seq(5, 9, 2, false, peer);
+            last = Some((pass, got, t.outcome()));
+            if got == 9 {
+                break;
+            }
+            assert_eq!(got, 5, "pass {pass} holds the window");
+        }
+        let (pass, got, o) = last.expect("at least one pass");
+        assert_eq!((pass, got), (PULL_HOLD_STALL_PASSES - 1, 9));
+        assert_eq!(o.refused.len(), 1);
+        assert_eq!(o.refused[0].memory_id, "bad");
+        assert_eq!(o.refused[0].reason, RefusalReason::HoldStalled);
     }
 }

@@ -1200,6 +1200,9 @@ pub fn open(path: &Path) -> Result<Connection> {
     conn.execute_batch(SCHEMA)
         .context("failed to initialize schema")?;
     migrate(&conn)?;
+    // v1.0.0 #9082 — a restore armed a fresh sync_seq epoch for this file.
+    crate::storage::sync_seq::consume_epoch_reset(&conn, path)
+        .context("sync_seq epoch reset after restore (#9082)")?;
     // v1.0.0 (#3172) — SCHEMA-masks-DATA-LOSS gate for APPEND-ONLY bootstrap
     // relations (`agent_lineage`), placed HERE in the open funnel rather than
     // inside `migrate`, and deliberately AFTER `execute_batch(SCHEMA)`. The

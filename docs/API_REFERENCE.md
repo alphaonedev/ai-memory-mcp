@@ -1527,11 +1527,30 @@ signed-message gate over canonical GET bytes
 ### `GET /api/v1/sync/since`
 
 Query: `since` (RFC3339, optional), `limit` (default 500, max 10000),
-`peer` (attribution tag).
+`peer` (attribution tag), `after_seq` (decimal integer `>= 0`, optional;
+v1.0.0 #9082).
 
 ```json
 { "count": 5, "limit": 500, "memories": [ … ] }
 ```
+
+**Sequence walk (`after_seq`, #9082).** Every row carries `sync_seq`, a
+number the SERVING node assigns from a one-row counter on insert and on a
+real change of a replicated column (never from the row's own
+`updated_at`). With `after_seq` present the server filters by `sync_seq`
+only, so a row that arrived with an old or far-future `updated_at` is still
+served. The body then also carries `after_seq` (the value the walk started
+from: the sent value, or `0` after this node's numbering was reset),
+`next_seq` (the highest `sync_seq` the page examined before the namespace and
+visibility filters; an empty page echoes `after_seq`), `seq_epoch` (an opaque
+id of this node's numbering, regenerated on restore and re-init) and
+`next_since: null`. A puller stores `next_seq` with `seq_epoch` per peer in
+`sync_pull_seq` and restarts at `0` when the epoch changes. A malformed
+`after_seq` is refused with `400` and the exact text
+`invalid `after_seq` parameter — expected a decimal integer >= 0`. Without
+`after_seq` (or against a node built before v102, which answers without
+`next_seq`) the timestamp `since` path is unchanged. Hard deletes are not
+carried on either path.
 
 ## Import / export
 

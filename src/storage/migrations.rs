@@ -7,7 +7,7 @@
 //! constant, and the `migrate` function out of `src/db.rs` into
 //! this sub-module. Pure refactor — semantics unchanged. The
 //! `MAX_SUPPORTED_SCHEMA` constant in `cli::boot` must still bump
-//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 101).
+//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 102).
 //! Versions 45/46 are reserved for sibling provenance-write landings
 //! (Gaps 1+2, #884/#885); this crate jumps 44 → 47 for Gap 3 (#886).
 //! v48 (Track D #933) adds the `federation_push_dlq` table so quorum-
@@ -1002,7 +1002,7 @@ CREATE INDEX IF NOT EXISTS idx_agent_api_keys_agent ON agent_api_keys(agent_id);
 /// for schema reporting and compatibility checks. Settled ladder arms still
 /// gate on their own literal rung so adding v98 cannot make a v96 database
 /// skip v97.
-const CURRENT_SCHEMA_VERSION: i64 = 101;
+const CURRENT_SCHEMA_VERSION: i64 = 102;
 
 /// v1.0.0 #2555 — the ABSOLUTE upper ceiling for a `schema_version` stamp,
 /// the single source of truth shared by the SQL-side `CHECK` constraint (the
@@ -4589,9 +4589,15 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             super::title_slot_archive::migrate_v100(conn)?;
         }
 
-        if version < CURRENT_SCHEMA_VERSION {
+        if version < 101 {
             // v101 (#8444): durable a2a_tasks table for the Agent2Agent binding.
             super::a2a_tasks::migrate_v101(conn)?;
+        }
+
+        if version < CURRENT_SCHEMA_VERSION {
+            // v102 (#9082): the serving-assigned change sequence
+            // (`memories.sync_seq`, the one-row counter, `sync_pull_seq`).
+            super::sync_seq::migrate_v102(conn)?;
         }
 
         // v88 (#2578, v1.0.0: composite list/archive ordering indexes on

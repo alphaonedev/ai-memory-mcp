@@ -74,6 +74,7 @@ pub mod peer_posture;
 mod peer_tasks;
 // #8743 — the receiver-clock-bounded `/sync/since` pull cursor.
 pub(crate) mod pull_cursor;
+pub(crate) mod pull_seq;
 // v0.7.0 Track D #933 — federation push DLQ + replay worker.
 // #2678: the module is ungated on the default (sqlite-only) build so
 // failed fanouts land in `federation_push_dlq` rather than being

@@ -2684,6 +2684,20 @@ fn run_restore_with(
     }
     io.at(PublishStep::SidecarsCleared, &target_db);
 
+    // v1.0.0 #9082 — the restored file keeps the snapshot's bytes (#3131), so
+    // its sync_seq epoch is reset at the next open: a puller's stored cursor
+    // against this node must not survive a rewind of its history. Armed before
+    // the publish (a refusal from here on leaves one spurious reset, never a
+    // restored database under its old epoch); the directory fsync below covers
+    // the sidecar's entry.
+    crate::storage::sync_seq::arm_epoch_reset(&target_db).with_context(|| {
+        format!(
+            "arming the sync_seq epoch reset beside {} — refusing to publish a restore \
+             that pullers would keep walking under the old epoch (#9082)",
+            target_db.display()
+        )
+    })?;
+
     // v1.0.0 #3550 — make the unlinks and the staged directory entry durable
     // before the rename, then the rename itself after it. A lost directory
     // fsync after a power cut can bring the replaced database back, so the
@@ -3929,6 +3943,11 @@ mod tests {
             std::fs::read(&db).expect("read restored db"),
             snapshot_bytes,
             "the published database must be byte-identical to the snapshot"
+        );
+        // #9082 — the epoch reset is armed beside it, for the next open.
+        assert!(
+            crate::storage::sync_seq::epoch_reset_marker_path(&db).exists(),
+            "restore must arm the sync_seq epoch reset (#9082)"
         );
         assert!(
             env.stdout_str().contains(PRE_RESTORE_INFIX),

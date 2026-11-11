@@ -1891,6 +1891,21 @@ impl MemoryStore for SqliteStore {
         db::memories_updated_since_counted(&conn, since, capped).map_err(box_err)
     }
 
+    async fn list_memories_after_seq(
+        &self,
+        after_seq: i64,
+        limit: usize,
+    ) -> StoreResult<crate::storage::sync_seq::SeqPage> {
+        if after_seq < 0 {
+            return Err(StoreError::InvalidInput {
+                detail: crate::storage::sync_seq::negative_after_seq_detail(after_seq),
+            });
+        }
+        let conn = self.state.lock().await;
+        let capped = limit.clamp(1, 10_000);
+        crate::storage::sync_seq::memories_after_seq(&conn, after_seq, capped).map_err(box_err)
+    }
+
     async fn apply_remote_memory(
         &self,
         _ctx: &CallerContext,
