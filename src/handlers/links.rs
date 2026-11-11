@@ -501,9 +501,7 @@ pub async fn create_link(
     // dispatch path. The trait's `link_signed` returns the resolved
     // `attest_level` so the wire response carries the same byte shape
     // as the legacy `db::create_link_signed` path. Federation fanout
-    // is omitted on the postgres branch — quorum-broadcast is still
-    // SQLite-bound and lighting it up on Postgres is a follow-on
-    // wave.
+    // runs through the shared funnel on this branch too (#9087).
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
         let now = Utc::now().to_rfc3339();
@@ -613,17 +611,26 @@ pub async fn create_link(
                     )
                     .await;
                 }
-                (
-                    StatusCode::CREATED,
-                    Json(json!({
-                        "linked": true,
-                        "source_id": source_id,
-                        "target_id": target_id,
-                        "relation": relation,
-                        (field_names::ATTEST_LEVEL): attest_level,
-                    })),
+                // #9087 — the PG link create fans out through the funnel
+                // before it returns (pre-fix it returned here with no
+                // fan-out at all).
+                let mut receipt = json!({
+                    "linked": true,
+                    "source_id": source_id,
+                    "target_id": target_id,
+                    "relation": relation,
+                    (field_names::ATTEST_LEVEL): attest_level,
+                });
+                if let Err(resp) = super::fed_fanout::fanout_into(
+                    &app,
+                    super::fed_fanout::FanoutEffect::Link(&link),
+                    &mut receipt,
                 )
-                    .into_response()
+                .await
+                {
+                    return resp;
+                }
+                (StatusCode::CREATED, Json(receipt)).into_response()
             }
             Err(e) => store_err_to_response(e),
         };
@@ -812,8 +819,9 @@ pub async fn create_link(
     drop(lock);
     match create_result {
         Ok(attest_level) => {
+            let mut receipt = json!({"linked": true, (field_names::ATTEST_LEVEL): attest_level});
             // v0.6.2 (#325): propagate link to peers.
-            if let Some(fed) = app.federation.as_ref() {
+            if app.federation.as_ref().is_some() {
                 // v0.7.0 fix campaign R1-M4 — `validate_link` already
                 // gated `relation` against the closed set; the parse
                 // here cannot fail in practice.
@@ -844,26 +852,21 @@ pub async fn create_link(
                     source_cid: None,
                     target_cid: None,
                 };
-                match crate::federation::broadcast_link_quorum(fed, &link).await {
-                    Ok(tracker) => {
-                        if let Err(err) = crate::federation::finalise_quorum(&tracker) {
-                            // #869 — typed 503 envelope via the shared helper.
-                            let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
-                            return super::under_replicated_response(&payload);
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("link fanout error (local committed): {e:?}");
-                    }
+                // #8741 — the one funnel (pre-fix a broadcast `Err` was
+                // warned and answered 201).
+                if let Err(resp) = super::fed_fanout::fanout_into(
+                    &app,
+                    super::fed_fanout::FanoutEffect::Link(&link),
+                    &mut receipt,
+                )
+                .await
+                {
+                    return resp;
                 }
             }
             // v0.7 H2 — surface attest_level on the wire so callers
             // can tell signed vs unsigned without re-querying.
-            (
-                StatusCode::CREATED,
-                Json(json!({"linked": true, (field_names::ATTEST_LEVEL): attest_level})),
-            )
-                .into_response()
+            (StatusCode::CREATED, Json(receipt)).into_response()
         }
         Err(e) => {
             // v0.7.0 fix-campaign A3 (LINK-PARITY, #690) — map the
