@@ -57,6 +57,12 @@ const KIND_PROVENANCE_BIND: &str = "extract_kind_provenance(";
 /// call so the `memory_graph` projection never serves a deleted memory.
 const AGE_UNPROJECT_CALL: &str = "unproject_memory_from_age(";
 
+/// #9018 — the archive-first consolidate-source helper. It is itself an
+/// `AGE_UNPROJECT_FUNNELS` entry (so its own span must call
+/// [`AGE_UNPROJECT_CALL`]); a funnel whose hard-DELETE is delegated to it
+/// unprojects through it.
+const ARCHIVE_CONSOLIDATE_ROUTE: &str = "archive_consolidate_source_in_tx(";
+
 /// Every postgres funnel that INSERTs a `memories` row and MUST persist
 /// `kind_provenance`, because its sqlite twin does. Sweeping the whole set
 /// (not just the funnels issue #2393 named) is the FBL-22/FBL-12 lesson:
@@ -120,6 +126,12 @@ const AGE_UNPROJECT_FUNNELS: &[&str] = &[
     // to the function that owns it (same move as `store_with_embedding_inner`
     // above for #2771); the wrapper deletes nothing itself.
     "consolidate_with_expected_versions",
+    // #9018 — the legacy (tombstone sub-flag OFF) source disposition moved
+    // into the archive-first helper in `postgres/consolidate_archive_9018.rs`,
+    // which now owns the `DELETE FROM memories` and its AGE unprojection.
+    // The guard follows the DELETE to the helper, and the caller above must
+    // route through it (`ARCHIVE_CONSOLIDATE_ROUTE`).
+    "archive_consolidate_source_in_tx",
     "run_gc",
     "size_gc",
     // #4447 — `archive_by_ids` delegates to `archive_by_ids_inner` (moved).
@@ -411,9 +423,13 @@ fn pg_hard_delete_funnels_unproject_from_age_2397() {
         };
         // `delete` / `apply_remote_deletion` run pool-direct (no surrounding
         // tx) and route through the `unproject_memory_ids_best_effort`
-        // wrapper, which calls the helper on their behalf.
-        let unprojects =
-            span.contains(AGE_UNPROJECT_CALL) || span.contains("unproject_memory_ids_best_effort(");
+        // wrapper, which calls the helper on their behalf. `consolidate`'s
+        // legacy arm delegates its DELETE to the #9018 archive-first helper,
+        // which is checked as its own funnel in this same loop.
+        let unprojects = span.contains(AGE_UNPROJECT_CALL)
+            || span.contains("unproject_memory_ids_best_effort(")
+            || (*name != "archive_consolidate_source_in_tx"
+                && span.contains(ARCHIVE_CONSOLIDATE_ROUTE));
         if !unprojects {
             missing.push(format!(
                 "  {name}: hard-deletes a memories row without unprojecting it \

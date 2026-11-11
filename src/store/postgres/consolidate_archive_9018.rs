@@ -25,13 +25,18 @@ impl PostgresStore {
     ///
     /// # Errors
     ///
-    /// Any SQL failure; the caller's transaction then rolls back, so the
+    /// [`StoreError::Stopped`] when the record plane is stopped, or any SQL
+    /// failure; the caller's transaction then rolls back, so the
     /// consolidated summary row is not committed either.
     pub(super) async fn archive_consolidate_source_in_tx(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         id: &str,
     ) -> StoreResult<crate::governance::audit::PendingAuditAnchor> {
+        // Record-stop recheck inside the tx (B9): the caller gated at entry,
+        // but this helper writes `archived_memories` + `memories` itself, so
+        // it refuses on its own rather than trusting every future caller.
+        self.gate_record_stop_in_transaction()?;
         sqlx::query(SQL_DELETE_ARCHIVED_MEMORY_BY_ID)
             .bind(id)
             .execute(&mut **tx)

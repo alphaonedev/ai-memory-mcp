@@ -198,11 +198,12 @@ mod tests {
         assert_eq!(terms[2], "gamma");
     }
 
-    /// Envelope (5/N): LLM returns an empty body — the envelope still
-    /// completes; `expanded_terms` is an empty array. This is the
-    /// "no-op" / LLM-returns-nothing path called out in the playbook.
+    /// Envelope (5/N): LLM returns a blank-only body (normal stop, no
+    /// content). #8963 — an empty reply is not an answer: the envelope
+    /// refuses with the typed `ERR_REPLY_EMPTY` reason instead of
+    /// reporting "no expansions" as if the model had said so.
     #[tokio::test(flavor = "multi_thread")]
-    async fn success_with_empty_response_yields_no_terms() {
+    async fn blank_response_is_refused_not_empty_terms_8963() {
         let server = MockServer::start().await;
         mount_tags_ok(&server).await;
         Mock::given(method("POST"))
@@ -214,15 +215,17 @@ mod tests {
             .await;
 
         let uri = server.uri();
-        let value = tokio::task::spawn_blocking(move || {
+        let err = tokio::task::spawn_blocking(move || {
             let client = OllamaClient::new_with_url(&uri, "test-model").unwrap();
             handle_expand_query(Some(&client), &json!({"query": "x"}))
         })
         .await
         .unwrap()
-        .expect("handler should succeed");
-        let terms = value["expanded_terms"].as_array().unwrap();
-        assert!(terms.is_empty(), "blank-only response collapses to []");
+        .expect_err("a blank-only reply must be refused (#8963)");
+        assert!(
+            err.starts_with(crate::llm::ERR_REPLY_EMPTY),
+            "expected the typed empty-reply refusal, got: {err}"
+        );
     }
 
     /// Envelope (6/N): LLM 500 → error surfaces through the `?` ladder

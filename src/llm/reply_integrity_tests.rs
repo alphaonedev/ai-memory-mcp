@@ -121,7 +121,7 @@ async fn serve(wire: Wire, r: Reply) -> (MockServer, OllamaClient) {
         .mount(&server)
         .await;
     let client = match wire {
-        Wire::Ollama => OllamaClient::new_for_tests_without_probe(&server.uri(), TEST_MODEL),
+        Wire::Ollama => OllamaClient::new_with_url_no_health_check(&server.uri(), TEST_MODEL),
         Wire::OpenAi => OllamaClient::new_openai_compatible(&server.uri(), TEST_MODEL, TEST_KEY),
     }
     .expect("test client builds");
