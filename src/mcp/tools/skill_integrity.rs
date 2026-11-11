@@ -429,8 +429,8 @@ pub(super) fn load_verified_skill(
 #[doc(hidden)]
 pub fn reseal_skill_digest_for_tests(conn: &Connection, skill_id: &str) -> anyhow::Result<()> {
     let row = read_skill_row(conn, skill_id)
-        .map_err(anyhow::Error::msg)?
-        .ok_or_else(|| anyhow::Error::msg(msg::skill_not_found(skill_id)))?;
+        .map_err(crate::errors::refusal)?
+        .ok_or_else(|| crate::errors::refusal(msg::skill_not_found(skill_id)))?;
     let (_, namespace, name, description, license, compatibility, tools, metadata, body, ..) = row;
     let metadata: Value = serde_json::from_str(&metadata)?;
     let tools: Vec<String> = tools
@@ -438,12 +438,14 @@ pub fn reseal_skill_digest_for_tests(conn: &Connection, skill_id: &str) -> anyho
         .and_then(|json| serde_json::from_str(json).ok())
         .unwrap_or_default();
     let body = crate::mcp::skill_zstd::decode_all_bounded(body.as_slice())
-        .map_err(|e| anyhow::Error::msg(msg::zstd_decompress_body(e)))?;
+        .map_err(|e| crate::errors::refusal(msg::zstd_decompress_body(e)))?;
     let mut digests = Vec::new();
-    for (path, _, blob, stored) in read_resource_rows(conn, skill_id).map_err(anyhow::Error::msg)? {
+    for (path, _, blob, stored) in
+        read_resource_rows(conn, skill_id).map_err(crate::errors::refusal)?
+    {
         let digest = match (blob, stored) {
             (Some(blob), _) => {
-                resource_digest(&decode_resource(&path, &blob).map_err(anyhow::Error::msg)?)
+                resource_digest(&decode_resource(&path, &blob).map_err(crate::errors::refusal)?)
             }
             (None, Some(stored)) => stored,
             (None, None) => resource_digest(&[]),
@@ -463,7 +465,7 @@ pub fn reseal_skill_digest_for_tests(conn: &Connection, skill_id: &str) -> anyho
         &tools,
         &metadata,
     )
-    .map_err(anyhow::Error::msg)?;
+    .map_err(crate::errors::refusal)?;
     let digest = compute_skill_digest(&fm, &body, digests);
     conn.execute(
         "UPDATE skills SET digest = ?1, signature = NULL WHERE id = ?2",
