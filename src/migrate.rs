@@ -100,7 +100,7 @@ pub struct MigrateArgs {
 /// plain URL flag or its `*-url-file` twin (5-agent vote (4d3ea1c5), memory
 /// 6ceaee9a).
 ///
-/// `url_flag` / `file_flag` are the flag names (`--from` / `--from-url-file`),
+/// `inline_flag` / `file_flag` are the flag names (`--from` / `--from-url-file`),
 /// used only in messages. Exactly one of `url` / `file` must be set (clap
 /// enforces that at parse time; this re-checks so a programmatic caller
 /// cannot reach the connect path with an ambiguous or empty endpoint, failing
@@ -118,16 +118,16 @@ pub struct MigrateArgs {
 /// Returns an error when both or neither source is given, or when the file
 /// cannot be read, has lax permissions, or is empty.
 pub fn resolve_endpoint(
-    url_flag: &str,
+    inline_flag: &str,
     file_flag: &str,
     url: Option<&str>,
     file: Option<&std::path::Path>,
 ) -> Result<String> {
     match (url, file) {
         (Some(_), Some(_)) => {
-            anyhow::bail!("{url_flag} and {file_flag} are mutually exclusive (#4600)")
+            anyhow::bail!("{inline_flag} and {file_flag} are mutually exclusive (#4600)")
         }
-        (None, None) => anyhow::bail!("one of {url_flag} or {file_flag} is required (#4600)"),
+        (None, None) => anyhow::bail!("one of {inline_flag} or {file_flag} is required (#4600)"),
         (None, Some(path)) => crate::store_url::store_url_from_file(path)
             .with_context(|| format!("resolving {file_flag}")),
         (Some(url), None) => {
@@ -137,7 +137,7 @@ pub fn resolve_endpoint(
                 // `tracing::warn!` here would be dropped. Write the warning
                 // to stderr directly; it names the flag, never the URL.
                 eprintln!(
-                    "warning: {url_flag} carries a password in argv, which is exposed via \
+                    "warning: {inline_flag} carries a password in argv, which is exposed via \
                      world-readable /proc/<pid>/cmdline and `ps auxww` to any local UID \
                      (#4600). Prefer {file_flag} (a 0600 file holding the URL) instead."
                 );

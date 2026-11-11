@@ -241,8 +241,7 @@ for i in $(seq 1 1000); do
 done
 wait
 
-# Migrate to Postgres. The URL carries the password, so it goes in a 0600 file
-# read by --to-url-file, never on argv (#4600: argv is readable through ps).
+# Migrate to Postgres; the URL carries the password, so it goes in a 0600 file, never on argv (#4600)
 (umask 077; printf '%s\n' "postgres://ai_memory:${DB_PASS}@${DB_HOST}:25060/defaultdb?sslmode=verify-full&sslrootcert=/etc/ai-memory/do-ca.crt" > /etc/ai-memory/store-url)
 # (#3705: sslmode=require is refused at connect — download the managed-database CA from the DO console to /etc/ai-memory/do-ca.crt)
 ai-memory migrate \
