@@ -4902,7 +4902,7 @@ fn section_embeddings_reachability_1598() -> ReportSection {
         Err(crate::egress::AdmittedClientError::Refused { mode, reason }) => {
             return probe_refused_section(
                 SECTION_EMBEDDINGS_REACHABILITY,
-                "embeddings",
+                crate::config::config_keys::SECTION_EMBEDDINGS,
                 facts,
                 &resolved.url,
                 mode,

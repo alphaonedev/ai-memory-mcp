@@ -472,7 +472,7 @@ production Dockerfile. Quick summary:
 Bootstrap a fresh postgres backend with:
 
 ```bash
-# /etc/ai-memory/store-url: one line, mode 0600:  postgres://aimemory:PWD@hub.dc1.internal:5432/aimemory
+# /etc/ai-memory/store-url: one line, mode 0600:  postgres://aimemory:<password>@hub.dc1.internal:5432/aimemory
 AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url ai-memory schema-init
 ```
 
