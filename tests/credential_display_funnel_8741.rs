@@ -294,7 +294,10 @@ fn doctor_reachability_note_never_echoes_an_ambiguous_base_url_6101() {
         ("AI_MEMORY_LLM_MODEL", "stub-model".to_string()),
         ("AI_MEMORY_EMBED_BACKEND", "openai-compatible".to_string()),
         ("AI_MEMORY_EMBED_BASE_URL", base.clone()),
-        ("AI_MEMORY_EMBED_API_KEY", "placeholder-not-a-key".to_string()),
+        (
+            "AI_MEMORY_EMBED_API_KEY",
+            "placeholder-not-a-key".to_string(),
+        ),
         ("AI_MEMORY_EMBED_MODEL", "stub-embed".to_string()),
     ];
     // doctor stops at a CRIT storage section before the reachability probes

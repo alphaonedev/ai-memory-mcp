@@ -1116,6 +1116,29 @@ fn apply_writer_pragmas(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// #6106 — rusqlite appends the raw path to a `CannotOpen` failure message
+/// (`unable to open database file: <path>`) and carries it in
+/// `InvalidPath`, so a `db =` value that holds a credential would reach every
+/// `{e:#}` sink through the error chain. When the db-path funnel redacts the
+/// path, the raw text is swapped for the funnel's rendering; a message that
+/// does not carry the raw text verbatim is dropped (fail closed).
+fn scrub_open_error(err: rusqlite::Error, path: &Path) -> rusqlite::Error {
+    let raw = path.to_string_lossy();
+    let shown = crate::url_display::db_path_display(path);
+    if shown == raw {
+        return err;
+    }
+    match err {
+        rusqlite::Error::SqliteFailure(code, Some(msg)) => {
+            let scrubbed =
+                (!raw.is_empty() && msg.contains(&*raw)).then(|| msg.replace(&*raw, &shown));
+            rusqlite::Error::SqliteFailure(code, scrubbed)
+        }
+        rusqlite::Error::InvalidPath(_) => rusqlite::Error::InvalidPath(shown.into()),
+        other => other,
+    }
+}
+
 /// v1.0.0 #2445 — open an EXISTING database WITHOUT applying the bootstrap
 /// schema, the migration ladder, the CHECK triggers, or the downgrade guard.
 ///
@@ -1141,7 +1164,9 @@ fn apply_writer_pragmas(conn: &Connection) -> Result<()> {
 /// Propagates connection-open failures, the SQLCipher unlock failure, or any
 /// PRAGMA failure.
 pub fn open_unmigrated(path: &Path) -> Result<Connection> {
-    let conn = Connection::open(path).context("failed to open database")?;
+    let conn = Connection::open(path)
+        .map_err(|e| scrub_open_error(e, path))
+        .context("failed to open database")?;
     apply_sqlcipher_key(&conn)?;
     register_valid_time_functions(&conn).context(MSG_REGISTER_VALID_TIME_FNS)?;
     apply_writer_pragmas(&conn)?;
@@ -1172,7 +1197,9 @@ fn test_trace_on_open(conn: Connection) -> Connection {
 }
 
 pub fn open(path: &Path) -> Result<Connection> {
-    let conn = Connection::open(path).context("failed to open database")?;
+    let conn = Connection::open(path)
+        .map_err(|e| scrub_open_error(e, path))
+        .context("failed to open database")?;
     apply_sqlcipher_key(&conn)?;
     register_valid_time_functions(&conn).context(MSG_REGISTER_VALID_TIME_FNS)?;
     apply_writer_pragmas(&conn)?;
@@ -1184,7 +1211,7 @@ pub fn open(path: &Path) -> Result<Connection> {
     // EXISTS` bootstrap set replaying over a NEWER database first, which can
     // resurrect a table or index the newer ladder deliberately removed. #2424
     // proved bootstrap-vs-ladder shape disagreement is a live class here.
-    if resolve_schema_posture(&conn, &path.display().to_string())?
+    if resolve_schema_posture(&conn, &crate::url_display::db_path_display(path))?
         == SchemaPosture::AheadButAuthorised
     {
         // The operator hatch authorised THIS database. Hand it back exactly as
@@ -1269,6 +1296,7 @@ pub fn open_read_only(path: &Path) -> Result<Connection> {
         | OpenFlags::SQLITE_OPEN_URI
         | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let conn = Connection::open_with_flags(path, flags)
+        .map_err(|e| scrub_open_error(e, path))
         .context("failed to open read-only database connection")?;
     apply_sqlcipher_key(&conn)?;
     register_valid_time_functions(&conn).context(MSG_REGISTER_VALID_TIME_FNS)?;
@@ -1312,12 +1340,19 @@ pub const MISSING_DATABASE_REFUSAL: &str =
 /// guards can produce.
 pub fn open_existing_read_only(path: &Path) -> Result<Connection> {
     match path.try_exists() {
-        Ok(false) => anyhow::bail!("{}: {}", MISSING_DATABASE_REFUSAL, path.display()),
+        Ok(false) => anyhow::bail!(
+            "{}: {}",
+            MISSING_DATABASE_REFUSAL,
+            crate::url_display::db_path_display(path)
+        ),
         Ok(true) => {}
-        Err(e) => anyhow::bail!("cannot stat {}: {e}", path.display()),
+        Err(e) => anyhow::bail!(
+            "cannot stat {}: {e}",
+            crate::url_display::db_path_display(path)
+        ),
     }
     let conn = open_read_only(path)?;
-    let target = path.display().to_string();
+    let target = crate::url_display::db_path_display(path);
     // Diagnose schema-ahead / poisoned / zeroed WITHOUT migrating so
     // boot/doctor keep the #2445/#2555/#2564 typed refusals.
     assert_schema_not_ahead(&conn, &target)?;

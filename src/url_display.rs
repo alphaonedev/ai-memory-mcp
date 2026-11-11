@@ -80,23 +80,56 @@ fn unparseable(url: &str) -> String {
     }
 }
 
+/// The rendering of an ambiguous-authority URL (#6096 #6101): its scheme and
+/// [`REDACTED_AUTHORITY`], nothing parsed from the authority.
+fn redacted_authority(parsed: &reqwest::Url) -> String {
+    format!("{}://{REDACTED_AUTHORITY}", parsed.scheme())
+}
+
+/// `scheme://host[:port]` of an already-parsed URL that is NOT ambiguous.
+fn origin_of(parsed: &reqwest::Url) -> String {
+    let host = parsed.host_str().unwrap_or(NO_HOST);
+    match parsed.port() {
+        Some(port) => format!("{}://{host}:{port}", parsed.scheme()),
+        None => format!("{}://{host}", parsed.scheme()),
+    }
+}
+
+/// `true` when the PARSED path, query or fragment holds an `@` - the
+/// ambiguous-authority witness (#6096 #6101). The ONE predicate every
+/// renderer and the durable-key guard share (ERRORS-09).
+///
+/// An unencoded `/`, `?` or `#` (or `\` on a special scheme) in the
+/// userinfo makes the WHATWG parser end the authority inside the credential,
+/// so the rest of the credential and the real `@host` land in the path,
+/// query or fragment, and the parsed host / port / path are credential
+/// bytes. The decision is made on the PARSED value, never on the raw text,
+/// because the parser first deletes tab / LF / CR, folds `\`, and accepts
+/// `http:` with no slashes: a raw-text scan is bypassed by each. `@` stays
+/// literal in the path, query and fragment encode sets, so the parsed
+/// components are a faithful witness. It errs on the side of refusal: a
+/// literal `@` in a query value also trips it (percent-encode it as `%40`),
+/// the cost being a less specific line (ERRORS-01, fail closed).
+fn at_after_authority(parsed: &reqwest::Url) -> bool {
+    parsed.path().contains('@')
+        || parsed.query().is_some_and(|q| q.contains('@'))
+        || parsed.fragment().is_some_and(|f| f.contains('@'))
+}
+
 /// `scheme://host[:port]` — the origin of `url` and nothing else. No
 /// userinfo, no path, no query, no fragment.
 ///
 /// Use it for a federation peer, a webhook target, an LLM / embedder base
 /// URL, an MCP forward URL — any URL that reaches a log line, a refusal,
-/// a doctor fact or a stored record.
+/// a doctor fact or a stored record. An ambiguous authority (#6101, an
+/// unencoded `/`, `?` or `#` in the userinfo) renders
+/// `scheme://<redacted-authority>`: its parsed host is credential bytes.
 #[must_use]
 pub fn url_origin(url: &str) -> String {
     let trimmed = url.trim();
     match reqwest::Url::parse(trimmed) {
-        Ok(parsed) => {
-            let host = parsed.host_str().unwrap_or(NO_HOST);
-            match parsed.port() {
-                Some(port) => format!("{}://{host}:{port}", parsed.scheme()),
-                None => format!("{}://{host}", parsed.scheme()),
-            }
-        }
+        Ok(parsed) if at_after_authority(&parsed) => redacted_authority(&parsed),
+        Ok(parsed) => origin_of(&parsed),
         Err(_) => unparseable(trimmed),
     }
 }
@@ -109,12 +142,18 @@ pub fn url_origin(url: &str) -> String {
 /// peer's path is operator config, never a tenant credential channel. A
 /// webhook target is NOT rendered this way — chat webhooks carry their
 /// secret in the path (#3684); use [`url_origin`] there.
+///
+/// An ambiguous authority (#6101) renders `scheme://<redacted-authority>`:
+/// the parsed path of such a URL carries the password. That rendering is
+/// shared by every ambiguous URL of one scheme, so it is NOT a unique key:
+/// a durable-key writer checks [`origin_and_path_is_durable_key`] first.
 #[must_use]
 pub fn url_origin_and_path(url: &str) -> String {
     let trimmed = url.trim();
     match reqwest::Url::parse(trimmed) {
+        Ok(parsed) if at_after_authority(&parsed) => redacted_authority(&parsed),
         Ok(parsed) => {
-            let mut out = url_origin(trimmed);
+            let mut out = origin_of(&parsed);
             let path = parsed.path();
             if path != "/" {
                 out.push_str(path);
@@ -125,39 +164,90 @@ pub fn url_origin_and_path(url: &str) -> String {
     }
 }
 
+/// `true` when [`url_origin_and_path`] of `url` names ONE peer: the URL
+/// parses and its authority is not ambiguous (#6101 #6628). The redacted and
+/// unparseable renderings are shared by many URLs, so two such peers would
+/// share one `sync_state` cursor row; the sync cycle refuses them instead.
+#[must_use]
+pub fn origin_and_path_is_durable_key(url: &str) -> bool {
+    reqwest::Url::parse(url.trim()).is_ok_and(|parsed| !at_after_authority(&parsed))
+}
+
 /// `true` when `url` PARSES to a URL whose path, query or fragment holds an
-/// `@` - the ambiguous-authority shape (#6096).
-///
-/// An unencoded `/`, `?` or `#` (or `\` on a special scheme) in the userinfo
-/// makes the WHATWG parser end the authority inside the credential, so the
-/// rest of the credential and the real `@host` land in the path, query or
-/// fragment, and the parsed host / port / path are credential bytes. The
-/// decision is made on the PARSED value, never on the raw text, because the
-/// parser first deletes tab / LF / CR, folds `\`, and accepts `http:` with no
-/// slashes: a raw-text scan is bypassed by each (ERRORS-09, one predicate).
-/// `@` stays literal in the path, query and fragment encode sets, so the
-/// parsed components are a faithful witness. It errs on the side of refusal:
-/// a literal `@` in a query value also trips it (percent-encode it), the
-/// cost being a less specific log line (ERRORS-01, fail closed).
+/// `@` - the ambiguous-authority shape (#6096), decided by
+/// [`at_after_authority`].
 ///
 /// Shared by [`store_url_display`] and the transit floor
 /// (`transit_encryption::dsn_transport`), so a DSN the renderer redacts is
 /// also one the floor refuses before any connection or DNS lookup.
 #[must_use]
 pub(crate) fn store_url_is_ambiguous(url: &str) -> bool {
-    reqwest::Url::parse(url.trim()).is_ok_and(|parsed| {
-        parsed.path().contains('@')
-            || parsed.query().is_some_and(|q| q.contains('@'))
-            || parsed.fragment().is_some_and(|f| f.contains('@'))
-    })
+    reqwest::Url::parse(url.trim()).is_ok_and(|parsed| at_after_authority(&parsed))
+}
+
+/// The text after a `sqlite://` prefix, matched case-insensitively (RFC 3986
+/// section 3.1: the scheme is case-insensitive, #6107), or `None` when `url`
+/// is not a sqlite URL. `get` keeps the slice on a char boundary
+/// (OWNERSHIP-15): a multi-byte char inside the prefix window is a `None`.
+#[must_use]
+pub fn strip_sqlite_scheme(url: &str) -> Option<&str> {
+    let prefix = crate::store_url::SQLITE_URL_SCHEME;
+    url.get(..prefix.len())
+        .filter(|head| head.eq_ignore_ascii_case(prefix))
+        .and_then(|_| url.get(prefix.len()..))
+}
+
+/// Characters that make a sqlite path or a schemeless db value a possible
+/// credential carrier: `@` (a userinfo `user:pw@host`, #6107) and `=` (a
+/// libpq key/value DSN `host=.. password=..`, #6102 #6106). A real path may
+/// hold either; it then renders redacted, never verbatim (ERRORS-01).
+const CREDENTIAL_DELIMITERS: [char; 2] = ['@', '='];
+
+/// `sqlite://<path>` for the text after the scheme: the path up to the first
+/// `?` / `#` (a query or fragment is not part of the file name), or
+/// `sqlite://<redacted-authority>` when the path holds a
+/// [`CREDENTIAL_DELIMITERS`] char (#6107: `sqlite://svc:pw@x/db`).
+fn sqlite_store_display(rest: &str) -> String {
+    if rest.contains(CREDENTIAL_DELIMITERS) {
+        return format!("sqlite://{REDACTED_AUTHORITY}");
+    }
+    let path = rest.split(['?', '#']).next().unwrap_or_default();
+    format!("sqlite://{path}")
+}
+
+/// Rendering of a db path whose text could carry a credential (#6106): a
+/// schemeless value holding a [`CREDENTIAL_DELIMITERS`] char.
+const REDACTED_DB_PATH: &str = "<redacted-db-path>";
+
+/// A database PATH (`--db`, `AI_MEMORY_DB`, config `db =`) for every
+/// human- and machine-readable sink: doctor `source:` and notes, the open
+/// error, the boot `info!` line, governance and audit refusals (#6106).
+///
+/// - Text holding `://` is a URL and renders through [`store_url_display`].
+/// - Schemeless text holding `@` or `=` renders [`REDACTED_DB_PATH`]: a
+///   libpq key/value DSN (`host=db password=..`) or a `user:pw@host` value
+///   has no scheme to parse, so nothing of it is shown (ERRORS-01).
+/// - Any other path renders as written: a file path is not a credential.
+#[must_use]
+pub fn db_path_display(path: &std::path::Path) -> String {
+    let text = path.to_string_lossy();
+    if text.contains("://") {
+        return store_url_display(&text);
+    }
+    if text.contains(CREDENTIAL_DELIMITERS) {
+        return REDACTED_DB_PATH.to_string();
+    }
+    text.into_owned()
 }
 
 /// A store URL (`--store-url`, `AI_MEMORY_STORE_URL[_FILE]`) for every
 /// human- and machine-readable sink: the boot `info!` line, doctor,
 /// `schema-init --json`, `migrate --json`, refusals.
 ///
-/// - `sqlite://<path>` renders verbatim: the path IS the database file and
-///   carries no credential channel.
+/// - `sqlite://<path>` (any scheme case, #6107) renders the path: the path IS
+///   the database file. A path holding `@` or `=` renders
+///   `sqlite://<redacted-authority>`: `sqlite://svc:pw@host/db` is a
+///   credential written behind the wrong scheme, not a file name.
 /// - Any other scheme (`postgres://`, `postgresql://`, a typo) renders
 ///   `scheme://host[:port]/<database>` — the database name is the last
 ///   thing an operator needs to tell two stores apart and is not a
@@ -169,15 +259,13 @@ pub(crate) fn store_url_is_ambiguous(url: &str) -> bool {
 #[must_use]
 pub fn store_url_display(url: &str) -> String {
     let trimmed = url.trim();
-    if trimmed.starts_with(crate::store_url::SQLITE_URL_SCHEME) {
-        return trimmed.to_string();
+    if let Some(rest) = strip_sqlite_scheme(trimmed) {
+        return sqlite_store_display(rest);
     }
     match reqwest::Url::parse(trimmed) {
+        Ok(parsed) if at_after_authority(&parsed) => redacted_authority(&parsed),
         Ok(parsed) => {
-            if store_url_is_ambiguous(trimmed) {
-                return format!("{}://{REDACTED_AUTHORITY}", parsed.scheme());
-            }
-            let mut out = url_origin(trimmed);
+            let mut out = origin_of(&parsed);
             // The database is the FIRST path segment; libpq allows nothing
             // deeper, so a longer path is simply not rendered.
             if let Some(db) = parsed
@@ -542,7 +630,7 @@ mod tests {
     fn ambiguous_http_urls_6101() -> Vec<String> {
         let m = MARKER_8741;
         vec![
-            format!("http://localhost:/{m}pw@127.0.0.1:9/v1"),
+            format!("https://localhost:/{m}pw@127.0.0.1:9/v1"),
             format!("https://svc:/{m}@peer.example:9077/mesh"),
             format!("https://svc:123/{m}@peer.example/mesh"),
             format!("https://svc/{m}user:pw@peer.example/mesh"),
@@ -637,16 +725,37 @@ mod tests {
             (format!("sqlite://svc:{m}@x/db"), REDACTED_SQLITE.into()),
             (format!("SQLITE://svc:{m}@x/db"), REDACTED_SQLITE.into()),
             (format!("Sqlite://svc:{m}@x/db"), REDACTED_SQLITE.into()),
-            (format!("sqlite://{m}@lba-missing-dir/sub/x.db"), REDACTED_SQLITE.into()),
+            (
+                format!("sqlite://{m}@lba-missing-dir/sub/x.db"),
+                REDACTED_SQLITE.into(),
+            ),
             (format!("sqlite://svc:/{m}@x/db"), REDACTED_SQLITE.into()),
-            (format!("sqlite:///var/x.db?key={m}"), REDACTED_SQLITE.into()),
-            (format!("sqlite:///var/x.db?password={m}"), REDACTED_SQLITE.into()),
+            (
+                format!("sqlite:///var/x.db?key={m}"),
+                REDACTED_SQLITE.into(),
+            ),
+            (
+                format!("sqlite:///var/x.db?password={m}"),
+                REDACTED_SQLITE.into(),
+            ),
             (format!("  SQLITE://svc:{m}@x/db\n"), REDACTED_SQLITE.into()),
-            ("sqlite:///var/lib/ai-memory/x.db".into(), "sqlite:///var/lib/ai-memory/x.db".into()),
-            ("SQLITE:///var/lib/ai-memory/x.db".into(), "sqlite:///var/lib/ai-memory/x.db".into()),
-            ("sqlite:///var/x.db#frag".into(), "sqlite:///var/x.db".into()),
+            (
+                "sqlite:///var/lib/ai-memory/x.db".into(),
+                "sqlite:///var/lib/ai-memory/x.db".into(),
+            ),
+            (
+                "SQLITE:///var/lib/ai-memory/x.db".into(),
+                "sqlite:///var/lib/ai-memory/x.db".into(),
+            ),
+            (
+                "sqlite:///var/x.db#frag".into(),
+                "sqlite:///var/x.db".into(),
+            ),
             ("sqlite:///var/x.db?mode=ro".into(), REDACTED_SQLITE.into()),
-            ("sqlite://relative/x.db".into(), "sqlite://relative/x.db".into()),
+            (
+                "sqlite://relative/x.db".into(),
+                "sqlite://relative/x.db".into(),
+            ),
         ]
     }
 
@@ -665,11 +774,26 @@ mod tests {
     fn store_url_postgres_scheme_case_variants_6102() {
         let m = MARKER_8741;
         for (url, want) in [
-            (format!("POSTGRES://svc:{m}@db.example:5433/mem?password={m}"), "postgres://db.example:5433/mem"),
-            (format!("PostgreSQL://svc:{m}@db.example/mem"), "postgresql://db.example/mem"),
-            (format!("postgres://svc:{m}@db.example/mem?sslpassword={m}"), "postgres://db.example/mem"),
-            (format!("POSTGRES://svc:/{m}pw@db.example/mem"), "postgres://<redacted-authority>"),
-            (format!("postgres:svc:{m}@db.example/mem"), "postgres://<redacted-authority>"),
+            (
+                format!("POSTGRES://svc:{m}@db.example:5433/mem?password={m}"),
+                "postgres://db.example:5433/mem",
+            ),
+            (
+                format!("PostgreSQL://svc:{m}@db.example/mem"),
+                "postgresql://db.example/mem",
+            ),
+            (
+                format!("postgres://svc:{m}@db.example/mem?sslpassword={m}"),
+                "postgres://db.example/mem",
+            ),
+            (
+                format!("POSTGRES://svc:/{m}pw@db.example/mem"),
+                "postgres://<redacted-authority>",
+            ),
+            (
+                format!("postgres:svc:{m}@db.example/mem"),
+                "postgres://<redacted-authority>",
+            ),
         ] {
             let r = store_url_display(&url);
             assert_no_marker(&url, &r);
@@ -685,7 +809,10 @@ mod tests {
     fn oversized_inputs_are_bounded_and_fail_closed_8741() {
         let pad = "/".repeat(HUGE_INPUT_LEN);
         let ambiguous = format!("https://svc:{pad}{MARKER_8741}@peer.example/mesh");
-        let sqlite = format!("SQLITE://svc:{}{MARKER_8741}@x/db", "a".repeat(HUGE_INPUT_LEN));
+        let sqlite = format!(
+            "SQLITE://svc:{}{MARKER_8741}@x/db",
+            "a".repeat(HUGE_INPUT_LEN)
+        );
         let multibyte = format!("sqli{}://{MARKER_8741}@x", "\u{e9}".repeat(HUGE_INPUT_LEN));
         let started = std::time::Instant::now();
         for _ in 0..HUGE_ITERATIONS {
@@ -701,5 +828,125 @@ mod tests {
             elapsed < HUGE_INPUT_CEILING,
             "oversized rendering took {elapsed:?} (ceiling {HUGE_INPUT_CEILING:?})"
         );
+    }
+
+    /// #6101 — the redacted rendering keeps the parsed (lower-cased) scheme,
+    /// so an `http://` base URL collapses to `http://<redacted-authority>`.
+    #[test]
+    fn ambiguous_http_scheme_keeps_its_scheme_6101() {
+        let url = format!("HTTP://localhost:/{MARKER_8741}pw@127.0.0.1:9/v1");
+        for r in [url_origin(&url), url_origin_and_path(&url)] {
+            assert_no_marker(&url, &r);
+            assert_eq!(r, "http://<redacted-authority>");
+        }
+    }
+
+    /// #6101 — a durable `sync_state` key exists only for a URL that parses
+    /// and is not ambiguous; every redacted or unparseable shape is refused.
+    #[test]
+    fn durable_key_only_for_an_unambiguous_parse_6101() {
+        for url in ambiguous_http_urls_6101() {
+            assert!(
+                !origin_and_path_is_durable_key(&url),
+                "{url:?} must be refused"
+            );
+        }
+        for url in ["not a url", "", "://x", "http://[::1"] {
+            assert!(
+                !origin_and_path_is_durable_key(url),
+                "{url:?} must be refused"
+            );
+        }
+        for (url, _, _) in well_formed_userinfo_cells_6101() {
+            assert!(
+                origin_and_path_is_durable_key(&url),
+                "{url:?} is a durable key"
+            );
+        }
+        assert!(origin_and_path_is_durable_key(
+            "https://peer.example:9077/mesh"
+        ));
+    }
+
+    /// #6107 — the sqlite prefix matches in any case and never splits a char.
+    #[test]
+    fn strip_sqlite_scheme_is_case_insensitive_and_char_safe_6107() {
+        for (url, want) in [
+            ("sqlite:///x.db", Some("/x.db")),
+            ("SQLITE:///x.db", Some("/x.db")),
+            ("SqLiTe://rel.db", Some("rel.db")),
+            ("sqlite://", Some("")),
+            ("sqlite:/x.db", None),
+            ("postgres://h/db", None),
+            ("sqlit", None),
+            ("", None),
+            ("sqli\u{e9}e://x", None),
+            ("\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}://x", None),
+        ] {
+            assert_eq!(
+                strip_sqlite_scheme(url),
+                want,
+                "strip_sqlite_scheme({url:?})"
+            );
+        }
+    }
+
+    /// #6106 — every db PATH shape renders through one funnel: a URL through
+    /// `store_url_display`, a schemeless value holding `@` / `=` as
+    /// [`REDACTED_DB_PATH`], a plain path as written. `(input, rendering)`.
+    fn db_path_cells_6106() -> Vec<(String, String)> {
+        let m = MARKER_8741;
+        vec![
+            (
+                format!("postgres://svc:{m}@db.example:5433/mem"),
+                "postgres://db.example:5433/mem".into(),
+            ),
+            (
+                format!("POSTGRES://svc:/{m}pw@db.example/mem"),
+                "postgres://<redacted-authority>".into(),
+            ),
+            (format!("SQLITE://svc:{m}@x/db"), REDACTED_SQLITE.into()),
+            (
+                format!("postgres:/svc:{m}@db.example/mem"),
+                REDACTED_DB_PATH.into(),
+            ),
+            (
+                format!("postgres:svc:{m}@db.example/mem"),
+                REDACTED_DB_PATH.into(),
+            ),
+            (
+                format!("host=db.example password={m} dbname=mem"),
+                REDACTED_DB_PATH.into(),
+            ),
+            (format!("svc:{m}@db.example/mem"), REDACTED_DB_PATH.into()),
+            (
+                format!("/var/lib/{m}=x/ai-memory.db"),
+                REDACTED_DB_PATH.into(),
+            ),
+            (
+                "/var/lib/ai-memory/ai-memory.db".into(),
+                "/var/lib/ai-memory/ai-memory.db".into(),
+            ),
+            ("relative/x.db".into(), "relative/x.db".into()),
+            (":memory:".into(), ":memory:".into()),
+        ]
+    }
+
+    #[test]
+    fn db_path_display_routes_every_shape_through_the_funnel_6106() {
+        for (value, want) in db_path_cells_6106() {
+            let r = db_path_display(std::path::Path::new(&value));
+            assert_no_marker(&value, &r);
+            assert_eq!(r, want, "#6106 db_path_display({value:?})");
+        }
+        let huge = format!("{}{MARKER_8741}@h", "a".repeat(HUGE_INPUT_LEN));
+        let started = std::time::Instant::now();
+        for _ in 0..HUGE_ITERATIONS {
+            assert_eq!(
+                db_path_display(std::path::Path::new(&huge)),
+                REDACTED_DB_PATH
+            );
+        }
+        assert!(started.elapsed() < HUGE_INPUT_CEILING);
     }
 }
