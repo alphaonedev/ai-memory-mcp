@@ -790,7 +790,7 @@ async fn schema_init_run_postgres_enumerates_live_catalog() {
     let mut out = ai_memory::cli::CliOutput::from_std(&mut stdout, &mut stderr);
 
     let args = ai_memory::cli::schema_init::SchemaInitArgs {
-        store_url: url.clone(),
+        store_url: Some(url.clone()),
         json: true,
         embedding_dim: Some(384),
         force_reembed: false,
@@ -837,7 +837,7 @@ async fn schema_init_run_postgres_human_render() {
     let mut out = ai_memory::cli::CliOutput::from_std(&mut stdout, &mut stderr);
 
     let args = ai_memory::cli::schema_init::SchemaInitArgs {
-        store_url: url,
+        store_url: Some(url),
         json: false,
         embedding_dim: Some(384),
         force_reembed: false,

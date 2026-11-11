@@ -10,16 +10,15 @@ already has non-argv channels (``AI_MEMORY_STORE_URL_FILE`` first, then
 ``AI_MEMORY_STORE_URL``; ``src/store_url.rs`` ``resolve_store_url``), so a
 tracked doc, unit, template or script must not recommend the argv form.
 
-The gate fails when a tracked text file contains a ``--store-url`` argument
-whose value carries an inline userinfo password (``scheme://user:pass@``),
-unless:
+The gate fails when a tracked text file contains a ``--store-url`` argument,
+or a ``migrate`` ``--from`` / ``--to`` argument (#4600: those verbs take
+``--from-url-file`` / ``--to-url-file``), whose value carries an inline
+userinfo password (``scheme://user:pass@``), unless:
 
   * the password is a redaction token (an ellipsis, asterisks, ``REDACTED``,
     ``<redacted>``); or
-  * the command is a verb with no non-argv channel at all. ``schema-init``
-    takes its URL ONLY on argv (``src/cli/schema_init.rs`` ``store_url:
-    String``, required); tracked as #4600. Drop the entry from
-    ``ARGV_ONLY_VERBS`` when #4600 lands.
+  * the command is a verb with no non-argv channel at all (``ARGV_ONLY_VERBS``;
+    empty since #4600 gave ``schema-init`` the file and env channels).
 
 A value such as ``"$DSN"`` is not flagged: no literal credential is tracked.
 The gate looks only at what is written in tracked files; it cannot see a
@@ -43,7 +42,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 
 # Verbs that offer no non-argv channel. verb -> tracking issue.
-ARGV_ONLY_VERBS = {"schema-init": "#4600"}
+ARGV_ONLY_VERBS: dict[str, str] = {}
 
 # Redaction tokens that are not a credential.
 REDACTION_TOKENS = ("...", "…", "***", "redacted", "<redacted>", "xxxx")
@@ -60,7 +59,7 @@ SKIP_FILES = {"CHANGELOG.md"}
 # optional opening quote, then scheme://user:PASSWORD@ (userinfo cannot contain
 # `/`, `@`, whitespace or a quote; a percent-encoded password is still literal).
 ARG_RE = re.compile(
-    r"--store-url(?:=|(?:\s|\\)+)"
+    r"--(?:store-url|from|to)(?:=|(?:\s|\\)+)"
     r"[\"']?"
     r"[A-Za-z][A-Za-z0-9+.\-]*://"
     r"[^\s/@\"':]+"  # user
@@ -156,8 +155,9 @@ def run() -> int:
         for rel, line, snippet in hits:
             print("HIT %s:%d: %s" % (rel, line, snippet), file=sys.stderr)
         print(
-            "FAIL: check-docs-no-argv-secrets: %d tracked --store-url argument(s) carry an inline "
-            "password (#4577). Use AI_MEMORY_STORE_URL_FILE (a 0600 file); see docs/CLI_REFERENCE.md."
+            "FAIL: check-docs-no-argv-secrets: %d tracked --store-url / --from / --to argument(s) carry "
+            "an inline password (#4577 #4600). Use AI_MEMORY_STORE_URL_FILE or migrate "
+            "--from-url-file / --to-url-file (a 0600 file); see docs/CLI_REFERENCE.md."
             % len(hits),
             file=sys.stderr,
         )
@@ -174,6 +174,10 @@ RED_PROBES = {
     "shell-var": "ssh h \"ai-memory serve --store-url 'postgres://u:$PG_PW@h/d'\"",
     "continuation": "ai-memory serve \\\n  --store-url \\\n  postgres://u:hunter2@h/d",
     "other-verb": "ai-memory curator --store-url postgres://u:hunter2@h/d",
+    "schema-init-4600": "ai-memory schema-init --store-url postgres://u:hunter2@h/d",
+    "schema-init-continued-4600": "ai-memory schema-init \\\n  --store-url postgres://u:hunter2@h/d",
+    "migrate-to-4600": "ai-memory migrate --from sqlite:///a.db --to postgres://u:hunter2@h/d",
+    "migrate-from-equals-4600": "ai-memory migrate --from=postgres://u:hunter2@h/d --to-url-file f",
 }
 GREEN_PROBES = {
     "file-form": "AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url ai-memory serve",
@@ -185,8 +189,9 @@ GREEN_PROBES = {
     "ellipsis-char": "ai-memory serve --store-url postgres://user:…@h/db",
     "lookalike-flag": "wake_abab.sh --store-url-src postgres://u:p@h/d",
     "prose-mention": "the `serve --store-url` connection URL (e.g. postgres://user:pass@host/db)",
-    "argv-only-verb": "ai-memory schema-init --store-url postgres://u:hunter2@h/d",
-    "argv-only-verb-continued": "ai-memory schema-init \\\n  --store-url postgres://u:hunter2@h/d",
+    "migrate-file-form-4600": "ai-memory migrate --from sqlite:///a.db --to-url-file /etc/ai-memory/dst",
+    "migrate-no-password-4600": "ai-memory migrate --from sqlite:///a.db --to postgres://u@h/d",
+    "lookalike-from-flag-4600": "tool --from-url-file postgres://u:p@h/d",
 }
 
 

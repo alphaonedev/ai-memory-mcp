@@ -83,8 +83,11 @@ fn run(dir: &Path, verb: &[&str], extra_args: &[&str], env: &[(&str, &str)]) -> 
     cmd.current_dir(dir)
         .arg("--db")
         .arg(dir.join("main.db"))
-        .args(verb)
+        // `--store-url` is an argument of the top verb (`quarantine
+        // --store-url URL list`), so the extra args go right after verb[0].
+        .args(&verb[..1])
         .args(extra_args)
+        .args(&verb[1..])
         .env("AI_MEMORY_NO_CONFIG", "1")
         .env("HOME", &home)
         .env("XDG_CONFIG_HOME", home.join(".config"))
