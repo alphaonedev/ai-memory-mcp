@@ -415,6 +415,214 @@ enum Op {
     Restore,
     Forget,
     Consolidate,
+    RegisterAgent,
+    CaptureTurn,
+    EntityRegister,
+    Import,
+    NamespaceStandardSet,
+    NamespaceStandardClear,
+}
+
+/// The ids of every `memories[]` row the peer received.
+fn memory_ids_in(bodies: &[Value]) -> BTreeSet<String> {
+    memories_in(bodies)
+        .iter()
+        .filter_map(|m| m["id"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// `(namespace, standard_id)` of every `namespace_meta[]` entry received.
+fn ns_meta_in(bodies: &[Value]) -> BTreeSet<(String, String)> {
+    bodies
+        .iter()
+        .filter_map(|p| p.get("namespace_meta").and_then(Value::as_array))
+        .flatten()
+        .filter_map(|e| {
+            Some((
+                e["namespace"].as_str()?.to_string(),
+                e["standard_id"].as_str()?.to_string(),
+            ))
+        })
+        .collect()
+}
+
+fn ns_clears_in(bodies: &[Value]) -> BTreeSet<String> {
+    bodies
+        .iter()
+        .filter_map(|p| p.get("namespace_meta_clears").and_then(Value::as_array))
+        .flatten()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect()
+}
+
+fn standard_path(ns: &str) -> String {
+    routes::NAMESPACES_NS_STANDARD.replace("{ns}", ns)
+}
+
+/// #9152 / #9153 cells: one op, then the delivered effect `check`ed
+/// against the bodies the peer recorded. Returns `None` for the peer-down
+/// pass (the 202 was asserted).
+async fn run_extra(o: &Origin, op: Op, peer_down: bool) -> Option<(StatusCode, Value)> {
+    let label = format!("{op:?} peer_down={peer_down}");
+    let ns = format!("{}-{}", o.ns, uuid::Uuid::new_v4());
+    // Seed before the mark: these ops need an existing row.
+    let seeded = match op {
+        Op::NamespaceStandardSet => Some(o.create(&ns, "std").await),
+        Op::NamespaceStandardClear => {
+            let id = o.create(&ns, "std-clear").await;
+            let (status, body) = o
+                .call(Method::POST, &standard_path(&ns), Some(json!({"id": id})))
+                .await;
+            assert!(status.is_success(), "clear seed set: {status}: {body}");
+            Some(id)
+        }
+        _ => None,
+    };
+    let (method, uri, req) = match op {
+        Op::RegisterAgent => (
+            Method::POST,
+            routes::AGENTS.to_string(),
+            json!({
+                "agent_id": format!("ai:fedpush-8741-{}", uuid::Uuid::new_v4().simple()),
+                "agent_type": "ai:fedpush",
+                "capabilities": ["recall"],
+            }),
+        ),
+        Op::CaptureTurn => (
+            Method::POST,
+            routes::CAPTURE_TURN.to_string(),
+            json!({
+                "host_session_id": format!("fedpush-8741-{}", uuid::Uuid::new_v4()),
+                "host_turn_index": 1,
+                "role": "user",
+                "content": "fedpush 8741 captured turn content",
+                "namespace": ns,
+            }),
+        ),
+        Op::EntityRegister => (
+            Method::POST,
+            routes::ENTITIES.to_string(),
+            json!({
+                "canonical_name": format!("fedpush-entity-{}", uuid::Uuid::new_v4()),
+                "namespace": ns,
+                "aliases": ["fedpush-alias"],
+            }),
+        ),
+        Op::Import => {
+            let now = chrono::Utc::now().to_rfc3339();
+            let mk = |t: &str| {
+                json!({
+                    "id": uuid::Uuid::new_v4().to_string(),
+                    "tier": "mid",
+                    "namespace": ns,
+                    "title": format!("{t}-{}", uuid::Uuid::new_v4()),
+                    "content": format!("{t} imported body with enough length"),
+                    "tags": [],
+                    "priority": 5,
+                    "confidence": 1.0,
+                    "source": "import",
+                    "access_count": 0,
+                    "created_at": now,
+                    "updated_at": now,
+                    "metadata": {},
+                })
+            };
+            let (a, b) = (mk("imp-a"), mk("imp-b"));
+            let link = json!({
+                "source_id": a["id"], "target_id": b["id"],
+                "relation": LINK_RELATION, "created_at": now,
+            });
+            (
+                Method::POST,
+                routes::IMPORT.to_string(),
+                json!({"memories": [a, b], "links": [link]}),
+            )
+        }
+        Op::NamespaceStandardSet => (
+            Method::POST,
+            standard_path(&ns),
+            json!({"id": seeded.clone().expect("seeded standard")}),
+        ),
+        Op::NamespaceStandardClear => (Method::DELETE, standard_path(&ns), Value::Null),
+        _ => unreachable!("run_extra handles the #9152 / #9153 ops only"),
+    };
+    let mark = o.mark().await;
+    o.peer.fail.store(peer_down, Ordering::Release);
+    let (status, body) = o
+        .call(method, &uri, (!req.is_null()).then(|| req.clone()))
+        .await;
+    o.peer.fail.store(false, Ordering::Release);
+    if peer_down {
+        assert_under_replicated(&label, status, &body);
+        return None;
+    }
+    let bodies = o.since(mark).await;
+    match op {
+        Op::RegisterAgent => {
+            let agent = req["agent_id"].as_str().expect("agent id");
+            assert!(
+                memories_in(&bodies)
+                    .iter()
+                    .any(|m| m["namespace"] == json!("_agents")
+                        && m["title"].as_str().is_some_and(|t| t.contains(agent))),
+                "{label}: peer must receive the _agents row for {agent}: {bodies:?}"
+            );
+        }
+        Op::CaptureTurn | Op::EntityRegister => {
+            let id_field = if matches!(op, Op::CaptureTurn) {
+                "memory_id"
+            } else {
+                "entity_id"
+            };
+            let id = body[id_field].as_str().expect("written id").to_string();
+            assert!(
+                memory_ids_in(&bodies).contains(&id),
+                "{label}: peer must receive row {id}: {bodies:?}"
+            );
+        }
+        Op::Import => {
+            let want: BTreeSet<String> = req["memories"]
+                .as_array()
+                .expect("memories")
+                .iter()
+                .filter_map(|m| m["id"].as_str().map(str::to_string))
+                .collect();
+            let got = memory_ids_in(&bodies);
+            assert!(
+                want.is_subset(&got),
+                "{label}: imported rows {want:?} not all shipped: {got:?}"
+            );
+            let link_shipped = bodies
+                .iter()
+                .filter_map(|p| p.get("links").and_then(Value::as_array))
+                .flatten()
+                .any(|l| l["source_id"] == req["links"][0]["source_id"]);
+            assert!(
+                link_shipped,
+                "{label}: imported link not shipped: {bodies:?}"
+            );
+        }
+        Op::NamespaceStandardSet => {
+            let sid = seeded.expect("seeded");
+            assert!(
+                ns_meta_in(&bodies).contains(&(ns.clone(), sid.clone())),
+                "{label}: peer must receive the ({ns}, {sid}) binding: {bodies:?}"
+            );
+            assert!(
+                memory_ids_in(&bodies).contains(&sid),
+                "{label}: peer must receive the standard row {sid}: {bodies:?}"
+            );
+        }
+        Op::NamespaceStandardClear => {
+            assert_eq!(
+                ns_clears_in(&bodies),
+                BTreeSet::from([ns.clone()]),
+                "{label}"
+            );
+        }
+        _ => unreachable!(),
+    }
+    Some((status, body))
 }
 
 /// Run one cell. `peer_down` flips the mock peer to 503 right before the op
@@ -423,6 +631,15 @@ async fn run_cell(o: &Origin, op: Op, peer_down: bool) {
     let label = format!("{op:?} peer_down={peer_down}");
     let ns = o.ns.clone();
     let (status, body) = match op {
+        Op::RegisterAgent
+        | Op::CaptureTurn
+        | Op::EntityRegister
+        | Op::Import
+        | Op::NamespaceStandardSet
+        | Op::NamespaceStandardClear => match run_extra(o, op, peer_down).await {
+            Some(done) => done,
+            None => return,
+        },
         Op::Update => {
             let id = o.create(&ns, "upd").await;
             let new_content = format!("updated content {}", uuid::Uuid::new_v4());
@@ -694,6 +911,12 @@ op_cells! {
     restore_9052 => Op::Restore,
     bulk_forget_9023 => Op::Forget,
     consolidate_9057 => Op::Consolidate,
+    register_agent_9152 => Op::RegisterAgent,
+    namespace_standard_set_9152 => Op::NamespaceStandardSet,
+    namespace_standard_clear_9152 => Op::NamespaceStandardClear,
+    capture_turn_9153 => Op::CaptureTurn,
+    entity_register_9153 => Op::EntityRegister,
+    import_9153 => Op::Import,
 }
 
 // ---------------------------------------------------------------------------
@@ -725,7 +948,7 @@ const ROWS: &[(&str, &str, Fed)] = &[
     ("put", "MEMORIES_ID", Fed::Fanout),
     ("delete", "MEMORIES_ID", Fed::Fanout),
     ("post", "MEMORIES_ID_PROMOTE", Fed::Fanout),
-    ("post", "CAPTURE_TURN", Fed::Pending(9153)),
+    ("post", "CAPTURE_TURN", Fed::Fanout),
     ("post", "RECALL", Fed::ReadOnly),
     ("post", "FORGET", Fed::Fanout),
     ("post", "CONSOLIDATE", Fed::Fanout),
@@ -734,12 +957,12 @@ const ROWS: &[(&str, &str, Fed)] = &[
     ("post", "MEMORY_LOAD_FAMILY", Fed::ReadOnly),
     ("post", "LINKS", Fed::Fanout),
     ("delete", "LINKS", Fed::Pending(9154)),
-    ("post", "NAMESPACES", Fed::Pending(9152)),
-    ("delete", "NAMESPACES", Fed::Pending(9152)),
-    ("post", "NAMESPACES_NS_STANDARD", Fed::Pending(9152)),
-    ("delete", "NAMESPACES_NS_STANDARD", Fed::Pending(9152)),
+    ("post", "NAMESPACES", Fed::Fanout),
+    ("delete", "NAMESPACES", Fed::Fanout),
+    ("post", "NAMESPACES_NS_STANDARD", Fed::Fanout),
+    ("delete", "NAMESPACES_NS_STANDARD", Fed::Fanout),
     ("post", "CHECK_DUPLICATE", Fed::ReadOnly),
-    ("post", "ENTITIES", Fed::Pending(9153)),
+    ("post", "ENTITIES", Fed::Fanout),
     ("post", "KG_INVALIDATE", Fed::Pending(9154)),
     ("post", "KG_QUERY", Fed::ReadOnly),
     ("post", "KG_FIND_PATHS", Fed::ReadOnly),
@@ -748,18 +971,18 @@ const ROWS: &[(&str, &str, Fed)] = &[
     ("post", "QUOTA_STATUS", Fed::ReadOnly),
     ("post", "ADMIN_QUARANTINE_ID_RELEASE", Fed::Pending(9154)),
     ("post", "GC", Fed::Pending(9154)),
-    ("post", "IMPORT", Fed::Pending(9153)),
+    ("post", "IMPORT", Fed::Fanout),
     ("post", "ARCHIVE", Fed::Fanout),
     ("delete", "ARCHIVE", Fed::Pending(9154)),
     ("post", "ARCHIVE_ID_RESTORE", Fed::Fanout),
-    ("post", "AGENTS", Fed::Pending(9152)),
+    ("post", "AGENTS", Fed::Fanout),
     ("put", "AGENTS_ID_PUBKEY", Fed::Pending(9158)),
     ("post", "AGENTS_ID_PUBKEY_CHALLENGE", Fed::Pending(9158)),
     ("post", "AGENTS_ID_API_KEY", Fed::Pending(9158)),
     ("post", "AGENTS_ID_API_KEY_REVOKE", Fed::Pending(9158)),
-    ("post", "PENDING_ID_APPROVE", Fed::Pending(9152)),
-    ("post", "PENDING_ID_REJECT", Fed::Pending(9152)),
-    ("post", "APPROVALS_PENDING_ID", Fed::Pending(9152)),
+    ("post", "PENDING_ID_APPROVE", Fed::Fanout),
+    ("post", "PENDING_ID_REJECT", Fed::Fanout),
+    ("post", "APPROVALS_PENDING_ID", Fed::Fanout),
     ("post", "SYNC_PUSH", Fed::Receive),
     ("post", "NOTIFY", Fed::Fanout),
     ("post", "A2A", Fed::Pending(9158)),

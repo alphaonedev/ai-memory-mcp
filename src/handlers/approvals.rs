@@ -668,6 +668,9 @@ pub async fn approval_decide(
     // Snapshot the pending row before deciding so we can synthesise a
     // permission rule even after the row transitions.
     let pending_snapshot = db::get_pending_action(&lock.0, &id).ok().flatten();
+    // #8741 (#9152) — the finalised decision (approved?, produced memory)
+    // this request must deliver to the peers after the lock drops.
+    let mut decided: Option<(bool, Option<crate::models::Memory>)> = None;
     let outcome = match body.decision {
         crate::approvals::Decision::Approve => {
             // #2355 — R40 signed-approval chokepoint, strictly ABOVE the
@@ -703,14 +706,20 @@ pub async fn approval_decide(
                     audit_decide_verdict(&agent_id, &id, body.decision, "allow");
                     let executed = db::execute_pending_action(&lock.0, &id);
                     match executed {
-                        Ok(memory_id) => json!({
+                        Ok(memory_id) => {
+                            let produced = memory_id
+                                .as_deref()
+                                .and_then(|mid| db::get(&lock.0, mid).ok().flatten());
+                            decided = Some((true, produced));
+                            json!({
                             "approved": true,
                             "id": id,
                             (field_names::DECIDED_BY): agent_id,
                             "executed": true,
                             "memory_id": memory_id,
                             "remember": format!("{:?}", body.remember).to_lowercase(),
-                        }),
+                            })
+                        }
                         Err(e) => {
                             tracing::error!("execute pending error: {e}");
                             return (
@@ -768,6 +777,7 @@ pub async fn approval_decide(
                 Ok(db::RejectOutcome::Rejected) => {
                     // #2634 — explicit deny chains "refuse".
                     audit_decide_verdict(&agent_id, &id, body.decision, "refuse");
+                    decided = Some((false, None));
                     json!({
                         "rejected": true,
                         "id": id,
@@ -807,6 +817,35 @@ pub async fn approval_decide(
         body.remember,
         pending_snapshot,
     );
+    deliver_decision(&app, &id, &agent_id, decided, outcome).await
+}
+
+/// #8741 (#9152) — the K10 decide route finalises the same decision as
+/// `approve_pending` / `reject_pending`, so it delivers the same effects
+/// through the ONE funnel on both backends: `200` with the quorum fields,
+/// or the exact `202 quorum_met false`. A vote still awaiting consensus
+/// (`decided == None`) finalises nothing and fans out nothing, as on the
+/// governance route.
+async fn deliver_decision(
+    app: &AppState,
+    id: &str,
+    agent_id: &str,
+    decided: Option<(bool, Option<crate::models::Memory>)>,
+    mut outcome: serde_json::Value,
+) -> axum::response::Response {
+    if let Some((approved, produced)) = decided {
+        let decision = crate::models::PendingDecision {
+            id: id.to_string(),
+            approved,
+            decider: agent_id.to_string(),
+        };
+        if let Err(resp) =
+            super::fed_fanout::fanout_decision(app, &decision, produced.as_ref(), &mut outcome)
+                .await
+        {
+            return resp;
+        }
+    }
     Json(outcome).into_response()
 }
 
@@ -835,6 +874,7 @@ async fn approval_decide_postgres(
     // as the sqlite branch).
     let pending_snapshot = app.store.get_pending(&ctx, id).await.ok().flatten();
     let remember_label = format!("{:?}", body.remember).to_lowercase();
+    let mut decided: Option<(bool, Option<crate::models::Memory>)> = None;
     let outcome = match body.decision {
         crate::approvals::Decision::Approve => {
             // #2355 — R40 signed-approval chokepoint, strictly ABOVE the pg
@@ -861,14 +901,21 @@ async fn approval_decide_postgres(
                     // #2634 — record "allow" BEFORE the execute write below.
                     audit_decide_verdict(agent_id, id, body.decision, "allow");
                     match app.store.execute_pending_action(&ctx, id).await {
-                        Ok(memory_id) => json!({
-                            "approved": true,
-                            "id": id,
-                            (field_names::DECIDED_BY): agent_id,
-                            "executed": true,
-                            "memory_id": memory_id,
-                            "remember": remember_label,
-                        }),
+                        Ok(memory_id) => {
+                            let produced = match memory_id.as_deref() {
+                                Some(mid) => app.store.get(&ctx, mid).await.ok(),
+                                None => None,
+                            };
+                            decided = Some((true, produced));
+                            json!({
+                                "approved": true,
+                                "id": id,
+                                (field_names::DECIDED_BY): agent_id,
+                                "executed": true,
+                                "memory_id": memory_id,
+                                "remember": remember_label,
+                            })
+                        }
                         Err(e) => {
                             tracing::error!("approval_decide(postgres): execute pending: {e}");
                             return (
@@ -917,6 +964,7 @@ async fn approval_decide_postgres(
                 Ok(crate::store::RejectOutcome::Rejected) => {
                     // #2634 — explicit deny chains "refuse".
                     audit_decide_verdict(agent_id, id, body.decision, "refuse");
+                    decided = Some((false, None));
                     json!({
                         "rejected": true,
                         "id": id,
@@ -947,7 +995,7 @@ async fn approval_decide_postgres(
         }
     };
     publish_decision_event(id, agent_id, body.decision, body.remember, pending_snapshot);
-    Json(outcome).into_response()
+    deliver_decision(app, id, agent_id, decided, outcome).await
 }
 
 /// Shared post-decision fan-out for both storage-backend branches of

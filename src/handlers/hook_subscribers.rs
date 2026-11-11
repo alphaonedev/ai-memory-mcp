@@ -22,9 +22,9 @@ use crate::validate;
 use super::AppState;
 #[cfg(feature = "sal")]
 use super::StorageBackend;
+use super::resolve_caller_agent_id;
 #[cfg(feature = "sal")]
 use super::store_err_to_response;
-use super::{fanout_or_pending, resolve_caller_agent_id};
 
 /// Marker tag on namespace-standard rows (#1558 batch 6).
 const NAMESPACE_STANDARD_TAG: &str = "_namespace_standard";
@@ -669,16 +669,60 @@ async fn set_namespace_standard_inner(
             .set_namespace_standard(&ctx, ns, &standard_id, body.parent.as_deref())
             .await
         {
-            Ok(()) => (
-                StatusCode::CREATED,
-                Json(json!({
+            Ok(()) => {
+                // #8741 (#9152) — deliver exactly what the SQLite arm
+                // delivers: the standard memory (read back as committed)
+                // and the explicit (namespace, standard_id, parent) binding.
+                let mut receipt = json!({
                     "namespace": ns,
                     (field_names::STANDARD_ID): standard_id,
                     "parent": body.parent,
                     (field_names::STORAGE_BACKEND): "postgres",
-                })),
-            )
-                .into_response(),
+                });
+                match app.store.get(&ctx, &standard_id).await {
+                    Ok(mem) => {
+                        if let Err(resp) = super::fed_fanout::fanout_into(
+                            app,
+                            super::fed_fanout::FanoutEffect::Store(&mem),
+                            &mut receipt,
+                        )
+                        .await
+                        {
+                            return resp;
+                        }
+                    }
+                    Err(_) => {
+                        if let Err(resp) = super::fed_fanout::readback_failed(app, &standard_id) {
+                            return resp;
+                        }
+                    }
+                }
+                let binding = app
+                    .store
+                    .get_namespace_standard(&ctx, ns)
+                    .await
+                    .ok()
+                    .flatten();
+                let entry = crate::models::NamespaceMetaEntry {
+                    namespace: ns.to_string(),
+                    standard_id: binding
+                        .as_ref()
+                        .map_or_else(|| standard_id.clone(), |(sid, _)| sid.clone()),
+                    parent_namespace: binding
+                        .map_or_else(|| body.parent.clone(), |(_, parent)| parent),
+                    updated_at: chrono::Utc::now().to_rfc3339(),
+                };
+                match super::fed_fanout::fanout_into(
+                    app,
+                    super::fed_fanout::FanoutEffect::NamespaceMeta(&entry),
+                    &mut receipt,
+                )
+                .await
+                {
+                    Ok(()) => (StatusCode::CREATED, Json(receipt)).into_response(),
+                    Err(resp) => resp,
+                }
+            }
             // #3758 / #4356 — the adapter's own in-transaction refusal (a bind
             // that raced the pre-check above), in the same closed shape and
             // status the pre-check and the sqlite arm return.
@@ -890,26 +934,28 @@ async fn set_namespace_standard_inner(
     drop(lock);
 
     match result {
-        Ok(v) => {
+        Ok(mut v) => {
+            // #8741 (#9152) — the same two effects as the PostgreSQL arm,
+            // through the ONE funnel (quorum fields on the receipt).
             if let Some(ref mem) = standard_mem
-                && let Some(resp) = fanout_or_pending(app, mem).await
+                && let Err(resp) = super::fed_fanout::fanout_into(
+                    app,
+                    super::fed_fanout::FanoutEffect::Store(mem),
+                    &mut v,
+                )
+                .await
             {
                 return resp;
             }
-            if let (Some(entry), Some(fed)) = (meta_entry.as_ref(), app.federation.as_ref()) {
-                match crate::federation::broadcast_namespace_meta_quorum(fed, entry).await {
-                    Ok(tracker) => {
-                        if let Err(err) = crate::federation::finalise_quorum(&tracker) {
-                            // #869 — typed 503 envelope via the shared helper.
-                            let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
-                            return super::under_replicated_response(&payload);
-                        }
-                    }
-                    Err(err) => {
-                        let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
-                        return super::under_replicated_response(&payload);
-                    }
-                }
+            if let Some(entry) = meta_entry.as_ref()
+                && let Err(resp) = super::fed_fanout::fanout_into(
+                    app,
+                    super::fed_fanout::FanoutEffect::NamespaceMeta(entry),
+                    &mut v,
+                )
+                .await
+            {
+                return resp;
             }
             (StatusCode::CREATED, Json(v)).into_response()
         }
@@ -1308,15 +1354,26 @@ async fn clear_namespace_standard_inner(
         // header-resolved id used for the audit-record above.
         let ctx = crate::store::CallerContext::for_agent(caller.clone());
         return match app.store.clear_namespace_standard(&ctx, ns).await {
-            Ok(true) => (
-                StatusCode::OK,
-                Json(json!({
+            Ok(true) => {
+                // #8741 (#9152) — the clear travels as the same
+                // `namespace_meta_clears` entry the SQLite arm sends.
+                let mut body = json!({
                     "cleared": true,
                     "namespace": ns,
                     (field_names::STORAGE_BACKEND): "postgres",
-                })),
-            )
-                .into_response(),
+                });
+                let namespaces = [ns.to_string()];
+                match super::fed_fanout::fanout_into(
+                    &app,
+                    super::fed_fanout::FanoutEffect::NamespaceMetaClear(&namespaces),
+                    &mut body,
+                )
+                .await
+                {
+                    Ok(()) => (StatusCode::OK, Json(body)).into_response(),
+                    Err(resp) => resp,
+                }
+            }
             Ok(false) => (
                 StatusCode::NOT_FOUND,
                 Json(json!({"error": "no namespace_meta row matched"})),
@@ -1358,26 +1415,18 @@ async fn clear_namespace_standard_inner(
     let result = crate::mcp::handle_namespace_clear_standard(&lock.0, &params);
     drop(lock);
     match result {
-        Ok(v) => {
-            if let Some(fed) = app.federation.as_ref() {
-                let namespaces = vec![ns.to_string()];
-                match crate::federation::broadcast_namespace_meta_clear_quorum(fed, &namespaces)
-                    .await
-                {
-                    Ok(tracker) => {
-                        if let Err(err) = crate::federation::finalise_quorum(&tracker) {
-                            // #869 — typed 503 envelope via the shared helper.
-                            let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
-                            return super::under_replicated_response(&payload);
-                        }
-                    }
-                    Err(err) => {
-                        let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
-                        return super::under_replicated_response(&payload);
-                    }
-                }
+        Ok(mut v) => {
+            let namespaces = [ns.to_string()];
+            match super::fed_fanout::fanout_into(
+                app,
+                super::fed_fanout::FanoutEffect::NamespaceMetaClear(&namespaces),
+                &mut v,
+            )
+            .await
+            {
+                Ok(()) => (StatusCode::OK, Json(v)).into_response(),
+                Err(resp) => resp,
             }
-            (StatusCode::OK, Json(v)).into_response()
         }
         // #3407 — the owner-gate refusal is the ONE closed shape on both
         // backends (403 `NOT_OWNER`, `namespace` echoed, owner never named);

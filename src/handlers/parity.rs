@@ -83,8 +83,9 @@ pub(crate) fn under_replicated_response(payload: &QuorumNotMetPayload) -> axum::
 /// quorum, returns `None` (caller returns its normal 2xx success). On a
 /// quorum MISS, returns `Some(202_response)` carrying the replication
 /// state — the local commit already landed (W3/G12: a durable write is
-/// never reported as a 5xx). Network errors are logged and swallowed —
-/// the local commit already landed and the sync-daemon catches stragglers.
+/// never reported as a 5xx). A broadcast error is the same `Some(202)`:
+/// the peers received nothing, so the reply must not be a bare success
+/// (#8741 invariant 4).
 pub(crate) async fn fanout_or_pending(
     app: &AppState,
     mem: &Memory,
@@ -100,9 +101,13 @@ pub(crate) async fn fanout_or_pending(
                 Some(under_replicated_response(&payload))
             }
         },
-        Err(e) => {
-            tracing::warn!("fanout error (local committed): {e:?}");
-            None
+        // #8741 (#9152) — a broadcast that errored delivered nothing, so it
+        // is the same exact 202 as a quorum miss, never a silent success
+        // (ERRORS-19; the pre-fix arm logged and returned `None`).
+        Err(err) => {
+            tracing::warn!("fanout error (local committed): {err:?}");
+            let payload = QuorumNotMetPayload::from_err(&err);
+            Some(under_replicated_response(&payload))
         }
     }
 }

@@ -54,13 +54,13 @@ use super::store_err_to_response;
 /// instead of a literal per branch, sourced from the existing
 /// [`crate::storage::schema_guard::BACKEND_POSTGRES`] SSOT rather than a sixth
 /// bare `"postgres"` string.
-fn register_agent_response(
+fn register_agent_body(
     id: &str,
     agent_id: &str,
     agent_type: &str,
     capabilities: &[String],
     postgres: bool,
-) -> axum::response::Response {
+) -> serde_json::Value {
     let mut body = json!({
         (field_names::REGISTERED): true,
         "id": id,
@@ -74,7 +74,34 @@ fn register_agent_response(
             json!(crate::storage::schema_guard::BACKEND_POSTGRES),
         );
     }
-    (StatusCode::CREATED, Json(body)).into_response()
+    body
+}
+
+/// #8741 (#9152) — the registration receipt after the `_agents` row went
+/// through the ONE fan-out funnel: `201` with the real quorum fields, or
+/// the exact `202 quorum_met false` when the peers did not get it. Both
+/// backends call this, so the PostgreSQL arm can no longer return before
+/// its fan-out.
+async fn register_agent_fanout(
+    app: &AppState,
+    registered: Option<&Memory>,
+    mut body: serde_json::Value,
+) -> axum::response::Response {
+    let delivered = match registered {
+        Some(mem) => {
+            super::fed_fanout::fanout_into(
+                app,
+                super::fed_fanout::FanoutEffect::Store(mem),
+                &mut body,
+            )
+            .await
+        }
+        None => super::fed_fanout::readback_failed(app, crate::models::AGENTS_NAMESPACE),
+    };
+    match delivered {
+        Ok(()) => (StatusCode::CREATED, Json(body)).into_response(),
+        Err(resp) => resp,
+    }
 }
 
 pub async fn register_agent(
@@ -202,9 +229,8 @@ pub async fn register_agent(
     // against the sqlite scratch `app.db`, leaving postgres-backed
     // daemons with POST→sqlite and GET→postgres asymmetry — registered
     // agents never appeared in the list. Mirrors the import_memories +
-    // bulk_create dual-backend dispatch pattern. Federation fanout
-    // remains sqlite-only (broadcast_store_quorum uses sqlite-coupled
-    // fed-tracker state).
+    // bulk_create dual-backend dispatch pattern. #8741 (#9152): both arms
+    // fan out through `register_agent_fanout`.
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
         // #910 — admin surface (registration / list_agents / stats);
@@ -255,12 +281,16 @@ pub async fn register_agent(
             valid_from: None,
             valid_until: None,
         };
-        return match app.store.store(&ctx, &agent_mem).await {
-            Ok(id) => {
-                register_agent_response(&id, &body.agent_id, &body.agent_type, &capabilities, true)
-            }
-            Err(e) => store_err_to_response(e),
+        let id = match app.store.store(&ctx, &agent_mem).await {
+            Ok(id) => id,
+            Err(e) => return store_err_to_response(e),
         };
+        // The store is an upsert on the roster row: read the committed row
+        // back so peers receive exactly what the origin holds.
+        let registered = app.store.get(&ctx, &id).await.ok();
+        let receipt =
+            register_agent_body(&id, &body.agent_id, &body.agent_type, &capabilities, true);
+        return register_agent_fanout(&app, registered.as_ref(), receipt).await;
     }
 
     let lock = app.db.lock().await;
@@ -278,21 +308,9 @@ pub async fn register_agent(
 
     match register_result {
         Ok(id) => {
-            if let (Some(fed), Some(mem)) = (app.federation.as_ref(), registered_mem.as_ref()) {
-                match crate::federation::broadcast_store_quorum(fed, mem).await {
-                    Ok(tracker) => {
-                        if let Err(err) = crate::federation::finalise_quorum(&tracker) {
-                            // #869 — typed 503 envelope via the shared helper.
-                            let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
-                            return super::under_replicated_response(&payload);
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("register_agent fanout error (local committed): {e:?}");
-                    }
-                }
-            }
-            register_agent_response(&id, &body.agent_id, &body.agent_type, &capabilities, false)
+            let receipt =
+                register_agent_body(&id, &body.agent_id, &body.agent_type, &capabilities, false);
+            register_agent_fanout(&app, registered_mem.as_ref(), receipt).await
         }
         Err(e) => crate::handlers::errors::handler_error_500(&e),
     }
@@ -1466,6 +1484,8 @@ pub async fn import_memories(
         let ctx = crate::store::CallerContext::for_agent(caller.clone())
             .with_capability(capability.clone());
         let mut imported = 0usize;
+        let mut stored_ids: Vec<String> = Vec::new();
+        let mut linked: Vec<MemoryLink> = Vec::new();
         let mut pubkey_bindings_stripped = 0usize;
         let mut errors: Vec<String> = Vec::new();
         let mut pending: Vec<serde_json::Value> = Vec::new();
@@ -1619,7 +1639,10 @@ pub async fn import_memories(
             }
 
             match app.store.store(&ctx, &mem).await {
-                Ok(_) => imported += 1,
+                Ok(stored_id) => {
+                    imported += 1;
+                    stored_ids.push(stored_id);
+                }
                 Err(e) => {
                     // Issue #851: SAL `store.store` errors can carry raw
                     // sqlx/sqlite text — sanitize before echoing.
@@ -1645,20 +1668,38 @@ pub async fn import_memories(
             {
                 continue;
             }
-            let _ = app.store.link(&ctx, &link).await;
+            if app.store.link(&ctx, &link).await.is_ok() {
+                linked.push(link);
+            }
         }
-        return Json(json!({
+        // #8741 (#9153) — deliver every imported row (read back as
+        // committed) and every created link through the ONE bulk funnel.
+        let mut effects = Vec::with_capacity(stored_ids.len() + linked.len());
+        for stored_id in &stored_ids {
+            match app.store.get(&ctx, stored_id).await {
+                Ok(mem) => effects.push(super::fed_fanout::OwnedEffect::Store(mem)),
+                Err(_) => {
+                    if let Err(resp) = super::fed_fanout::readback_failed(&app, stored_id) {
+                        return resp;
+                    }
+                }
+            }
+        }
+        effects.extend(linked.into_iter().map(super::fed_fanout::OwnedEffect::Link));
+        let receipt = json!({
             "imported": imported,
             "errors": errors,
             "pending": pending,
             (field_names::PUBKEY_BINDINGS_STRIPPED): pubkey_bindings_stripped,
             (field_names::STORAGE_BACKEND): "postgres",
-        }))
-        .into_response();
+        });
+        return import_delivered(&app, effects, receipt).await;
     }
 
     let lock = app.db.lock().await;
     let mut imported = 0usize;
+    let mut stored_ids: Vec<String> = Vec::new();
+    let mut linked: Vec<MemoryLink> = Vec::new();
     let mut pubkey_bindings_stripped = 0usize;
     let mut errors = Vec::new();
     let mut pending: Vec<serde_json::Value> = Vec::new();
@@ -1810,7 +1851,10 @@ pub async fn import_memories(
         }
 
         match db::insert(&lock.0, &mem) {
-            Ok(_) => imported += 1,
+            Ok(stored_id) => {
+                imported += 1;
+                stored_ids.push(stored_id);
+            }
             Err(e) => {
                 // Issue #851: db::insert errors include raw rusqlite
                 // text (SQL fragments, constraint names). Sanitize.
@@ -1831,25 +1875,60 @@ pub async fn import_memories(
         {
             continue;
         }
-        let _ = db::create_link(
+        if db::create_link(
             &lock.0,
             &link.source_id,
             &link.target_id,
             link.relation.as_str(),
-        );
+        )
+        .is_ok()
+        {
+            linked.push(link);
+        }
     }
+    let mut effects = Vec::with_capacity(stored_ids.len() + linked.len());
+    let mut unread: Option<String> = None;
+    for stored_id in &stored_ids {
+        match db::get(&lock.0, stored_id).ok().flatten() {
+            Some(mem) => effects.push(super::fed_fanout::OwnedEffect::Store(mem)),
+            None => {
+                unread.get_or_insert_with(|| stored_id.clone());
+            }
+        }
+    }
+    drop(lock);
+    if let Some(stored_id) = unread
+        && let Err(resp) = super::fed_fanout::readback_failed(&app, &stored_id)
+    {
+        return resp;
+    }
+    effects.extend(linked.into_iter().map(super::fed_fanout::OwnedEffect::Link));
     // #3456 — the sqlite envelope now carries `pending`, so an `Approve`
     // namespace standard is EXPRESSIBLE on this backend: pre-fix a caller had
     // no way to learn a row was parked awaiting consensus, because the sqlite
     // lane never produced one. Additive — `imported` / `errors` are unchanged,
     // and an empty `pending` is the ordinary case.
-    Json(json!({
+    let receipt = json!({
         "imported": imported,
         "errors": errors,
         "pending": pending,
         (field_names::PUBKEY_BINDINGS_STRIPPED): pubkey_bindings_stripped,
-    }))
-    .into_response()
+    });
+    import_delivered(&app, effects, receipt).await
+}
+
+/// #8741 (#9153) — the import receipt after every imported row and link
+/// went through the ONE bulk funnel (both backends): `200` with the batch
+/// quorum fields, or the exact `202 quorum_met false`.
+async fn import_delivered(
+    app: &AppState,
+    effects: Vec<super::fed_fanout::OwnedEffect>,
+    mut receipt: serde_json::Value,
+) -> axum::response::Response {
+    match super::fed_fanout::fanout_effects_into(app, effects, &mut receipt).await {
+        Ok(()) => Json(receipt).into_response(),
+        Err(resp) => resp,
+    }
 }
 
 #[derive(serde::Deserialize)]

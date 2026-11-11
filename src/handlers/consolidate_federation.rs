@@ -201,7 +201,8 @@ pub(crate) const CONSOLIDATE_TOMBSTONE_MISSING: &str = "CONSOLIDATE_TOMBSTONE_MI
 pub(crate) const CONSOLIDATE_TOMBSTONE_READ_FAILED: &str = "CONSOLIDATE_TOMBSTONE_READ_FAILED";
 /// #9057 — the store adapter offers no unfiltered by-id read, so a
 /// tombstoned source cannot be read back (fail closed, never a partial
-/// disposition).
+/// disposition). Only the `sal` read-back uses it.
+#[cfg(feature = "sal")]
 pub(crate) const CONSOLIDATE_TOMBSTONE_READ_UNSUPPORTED: &str =
     "CONSOLIDATE_TOMBSTONE_READ_UNSUPPORTED";
 

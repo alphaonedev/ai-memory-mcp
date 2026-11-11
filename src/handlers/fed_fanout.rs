@@ -40,7 +40,7 @@ use axum::response::Response;
 use serde_json::{Value, json};
 
 use crate::federation::{FederationConfig, QuorumNotMetPayload};
-use crate::models::{Memory, MemoryLink};
+use crate::models::{Memory, MemoryLink, NamespaceMetaEntry, PendingDecision};
 use crate::replication::{AckTracker, QuorumError};
 
 use super::AppState;
@@ -64,6 +64,12 @@ pub(crate) enum FanoutEffect<'a> {
     Archive(&'a str),
     /// A restored memory id.
     Restore(&'a str),
+    /// A governance decision on a pending action (`sync_push.pending_decisions`).
+    PendingDecision(&'a PendingDecision),
+    /// A namespace standard binding (`sync_push.namespace_meta`).
+    NamespaceMeta(&'a NamespaceMetaEntry),
+    /// Cleared namespace standards (`sync_push.namespace_meta_clears`).
+    NamespaceMetaClear(&'a [String]),
 }
 
 async fn broadcast(
@@ -76,6 +82,15 @@ async fn broadcast(
         FanoutEffect::Link(link) => crate::federation::broadcast_link_quorum(fed, link).await,
         FanoutEffect::Archive(id) => crate::federation::broadcast_archive_quorum(fed, id).await,
         FanoutEffect::Restore(id) => crate::federation::broadcast_restore_quorum(fed, id).await,
+        FanoutEffect::PendingDecision(decision) => {
+            crate::federation::broadcast_pending_decision_quorum(fed, decision).await
+        }
+        FanoutEffect::NamespaceMeta(entry) => {
+            crate::federation::broadcast_namespace_meta_quorum(fed, entry).await
+        }
+        FanoutEffect::NamespaceMetaClear(namespaces) => {
+            crate::federation::broadcast_namespace_meta_clear_quorum(fed, namespaces).await
+        }
     }
 }
 
@@ -154,6 +169,29 @@ pub(crate) fn readback_failed(app: &AppState, detail: &str) -> Result<(), Respon
     Err(under_replicated(&err))
 }
 
+/// #8741 (#9152) — a finalised governance decision: the decision itself
+/// (`sync_push.pending_decisions`) and, when the approval executed a
+/// `store`, the produced memory, exactly what the SQLite `approve_pending`
+/// arm has always sent. Shared by `approve_pending` / `reject_pending` /
+/// `approval_decide` on both backends.
+///
+/// # Errors
+///
+/// Returns the 202 under-replication response for the first effect that
+/// missed quorum.
+pub(crate) async fn fanout_decision(
+    app: &AppState,
+    decision: &PendingDecision,
+    produced: Option<&Memory>,
+    receipt: &mut Value,
+) -> Result<(), Response> {
+    fanout_into(app, FanoutEffect::PendingDecision(decision), receipt).await?;
+    if let Some(mem) = produced {
+        fanout_into(app, FanoutEffect::Store(mem), receipt).await?;
+    }
+    Ok(())
+}
+
 /// The per-id effect a bulk mutation delivers.
 #[derive(Clone, Copy)]
 pub(crate) enum BulkEffect {
@@ -161,6 +199,29 @@ pub(crate) enum BulkEffect {
     Delete,
     /// POST `/api/v1/archive`: one archive per id.
     Archive,
+}
+
+/// One owned effect of a bulk delivery (each runs on its own task).
+pub(crate) enum OwnedEffect {
+    /// An imported / captured memory row.
+    Store(Memory),
+    /// An imported link.
+    Link(MemoryLink),
+    /// One erased id.
+    Delete(String),
+    /// One archived id.
+    Archive(String),
+}
+
+impl OwnedEffect {
+    fn borrowed(&self) -> FanoutEffect<'_> {
+        match self {
+            Self::Store(mem) => FanoutEffect::Store(mem),
+            Self::Link(link) => FanoutEffect::Link(link),
+            Self::Delete(id) => FanoutEffect::Delete(id),
+            Self::Archive(id) => FanoutEffect::Archive(id),
+        }
+    }
 }
 
 /// Bulk funnel (POST `/api/v1/forget`, POST `/api/v1/archive`): one
@@ -179,10 +240,35 @@ pub(crate) async fn fanout_bulk_into(
     ids: &[String],
     receipt: &mut Value,
 ) -> Result<(), Response> {
+    let effects = ids
+        .iter()
+        .map(|id| match kind {
+            BulkEffect::Delete => OwnedEffect::Delete(id.clone()),
+            BulkEffect::Archive => OwnedEffect::Archive(id.clone()),
+        })
+        .collect();
+    fanout_effects_into(app, effects, receipt).await
+}
+
+/// #8741 (#9153) — the general bulk funnel: every effect is broadcast on
+/// its own task, at most [`BULK_FANOUT_CONCURRENCY`] in flight, and the
+/// batch reports the minimum ack count, or the exact 202 for the first
+/// effect that missed quorum. POST `/api/v1/import` delivers its rows and
+/// links through it.
+///
+/// # Errors
+///
+/// Returns the 202 under-replication response for the first effect that
+/// missed quorum.
+pub(crate) async fn fanout_effects_into(
+    app: &AppState,
+    effects: Vec<OwnedEffect>,
+    receipt: &mut Value,
+) -> Result<(), Response> {
     let Some(fed) = app.federation.as_ref().as_ref() else {
         return Ok(());
     };
-    if ids.is_empty() {
+    if effects.is_empty() {
         // Nothing committed: the receipt still carries the configured policy
         // so the caller can tell a federated no-op from a local-only one.
         stamp_quorum(receipt, fed, fed.policy.n);
@@ -190,9 +276,8 @@ pub(crate) async fn fanout_bulk_into(
     }
     let sem = Arc::new(tokio::sync::Semaphore::new(BULK_FANOUT_CONCURRENCY));
     let mut joins: tokio::task::JoinSet<Result<usize, QuorumError>> = tokio::task::JoinSet::new();
-    for id in ids {
+    for effect in effects {
         let fed = fed.clone();
-        let id = id.clone();
         let sem = Arc::clone(&sem);
         joins.spawn(async move {
             let Ok(_permit) = sem.acquire_owned().await else {
@@ -200,11 +285,7 @@ pub(crate) async fn fanout_bulk_into(
                     detail: "fanout semaphore closed".to_string(),
                 });
             };
-            let effect = match kind {
-                BulkEffect::Delete => FanoutEffect::Delete(&id),
-                BulkEffect::Archive => FanoutEffect::Archive(&id),
-            };
-            settle(broadcast(&fed, &effect).await)
+            settle(broadcast(&fed, &effect.borrowed()).await)
         });
     }
     let mut min_acks = usize::MAX;
