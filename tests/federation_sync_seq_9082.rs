@@ -284,6 +284,13 @@ async fn postgres_node(name: &str) -> Option<Node> {
     })
 }
 
+#[cfg_attr(
+    not(feature = "sal-postgres"),
+    expect(
+        clippy::unused_async,
+        reason = "only the sal-postgres cell awaits; one async signature serves both builds"
+    )
+)]
 async fn node(backend: Backend, name: &str) -> Option<Node> {
     match backend {
         Backend::Sqlite => Some(sqlite_node(name)),
