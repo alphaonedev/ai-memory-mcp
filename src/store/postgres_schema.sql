@@ -1605,6 +1605,24 @@ CREATE TABLE IF NOT EXISTS attested_write_ledger (
 CREATE INDEX IF NOT EXISTS idx_attested_write_ledger_seen_at
     ON attested_write_ledger(seen_at);
 
+-- #9140 (v1.0.0) — SHARED FEDERATION NONCE CLAIM. The postgres twin of the
+-- sqlite `federation_nonce_cache` (v51): every daemon over this store claims
+-- each verified push's (peer_id, nonce) fingerprint here, so a push one daemon
+-- accepted is a replay at every sibling. The PRIMARY KEY is the claim (one
+-- INSERT ... ON CONFLICT DO NOTHING). Federation nonces carry no freshness
+-- window, so rows are never time-pruned; `seq` orders the per-peer bound
+-- (the newest FEDERATION_NONCE_CAPACITY_PER_PEER rows per peer are kept).
+-- Bootstrap-owned (replayed on every connect), so it needs no ladder arm.
+CREATE TABLE IF NOT EXISTS federation_nonce_cache (
+    peer_id     TEXT        NOT NULL,
+    fingerprint BYTEA       NOT NULL,
+    seq         BIGSERIAL   NOT NULL,
+    claimed_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (peer_id, fingerprint)
+);
+CREATE INDEX IF NOT EXISTS idx_federation_nonce_cache_peer_seq
+    ON federation_nonce_cache(peer_id, seq);
+
 -- v96 (#3344, v1.0.0) — DURABLE EMBED SKIP LIST. Derived cache of rows that
 -- cannot be embedded under the current key material (undecryptable envelope)
 -- or that exceed the embed byte cap. Boot/backfill skip them without a

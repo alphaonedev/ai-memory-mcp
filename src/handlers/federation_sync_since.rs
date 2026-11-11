@@ -163,7 +163,9 @@ pub async fn sync_since(
         &headers,
         peer_header_for_sig.as_deref(),
         &app.federation_nonce_cache,
-    ) {
+    )
+    .await
+    {
         return rejection;
     }
     // Validate `since` parses as RFC 3339 BEFORE hitting the DB so a

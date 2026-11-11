@@ -821,6 +821,13 @@ const SQL_INSERT_FORGET_TOMBSTONE: &str = "INSERT INTO forget_tombstones \
      (memory_id, namespace, forgotten_at, agent_id, signature) \
      VALUES ($1, $2, $3, $4, $5) \
      ON CONFLICT (memory_id) DO NOTHING";
+/// #9140 — first-writer-wins claim of one federation nonce fingerprint.
+const SQL_PG_CLAIM_FEDERATION_NONCE: &str = "INSERT INTO federation_nonce_cache \
+     (peer_id, fingerprint) VALUES ($1, $2) ON CONFLICT (peer_id, fingerprint) DO NOTHING";
+/// #9140 — keep only the newest `$2` claims of ONE peer.
+const SQL_PG_PRUNE_FEDERATION_NONCE_PEER: &str = "DELETE FROM federation_nonce_cache \
+     WHERE peer_id = $1 AND seq <= (SELECT seq FROM federation_nonce_cache \
+     WHERE peer_id = $1 ORDER BY seq DESC OFFSET $2 LIMIT 1)";
 /// #3192 / #3286 — purge the non-cascaded DLQ cleartext leak for the victim
 /// ids. `ANY($1)` binds a slice so the single-row and bulk hard-delete
 /// primitives share ONE statement pair (see [`pg_purge_dlq_dedup_in_tx`]).
@@ -26947,6 +26954,44 @@ impl MemoryStore for PostgresStore {
         .map_err(|e| to_store_err("admit attested write", e))?
         .rows_affected();
         Ok(inserted == 1)
+    }
+
+    /// #9140 — the PostgreSQL shared nonce claim (`federation_nonce_cache`,
+    /// bootstrap DDL). One `INSERT ... ON CONFLICT DO NOTHING` decides, so two
+    /// sibling daemons can never both see "fresh"; the per-peer bound prune
+    /// runs in the same transaction.
+    async fn federation_nonce_claim(
+        &self,
+        peer_id: &str,
+        fingerprint: &[u8; 32],
+        per_peer_cap: usize,
+    ) -> StoreResult<bool> {
+        let cap = i64::try_from(per_peer_cap).unwrap_or(i64::MAX);
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("federation nonce claim begin", e))?;
+        let fresh = sqlx::query(SQL_PG_CLAIM_FEDERATION_NONCE)
+            .bind(peer_id)
+            .bind(fingerprint.as_slice())
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("federation nonce claim", e))?
+            .rows_affected()
+            == 1;
+        if fresh {
+            sqlx::query(SQL_PG_PRUNE_FEDERATION_NONCE_PEER)
+                .bind(peer_id)
+                .bind(cap)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("federation nonce prune", e))?;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("federation nonce claim commit", e))?;
+        Ok(fresh)
     }
 
     async fn revoke_agent_pubkey(&self, _ctx: &CallerContext, agent_id: &str) -> StoreResult<()> {

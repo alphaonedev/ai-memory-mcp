@@ -649,6 +649,14 @@ pub struct FederationNonceCache {
     /// opens a fresh replay window (pre-#1255 behaviour, preserved
     /// for test harnesses and for any caller that opts out).
     db_path: Option<PathBuf>,
+    /// #9140 — when `Some`, the SHARED claim is made in this SAL store
+    /// ([`crate::store::MemoryStore::federation_nonce_claim`]) instead of the
+    /// sqlite file: the PostgreSQL daemons of one store then refuse a nonce
+    /// any sibling already accepted. Only the async
+    /// [`FederationNonceCache::record_and_check_shared`] can consult it; the
+    /// sync [`FederationNonceCache::record_and_check`] answers `Replay`.
+    #[cfg(feature = "sal")]
+    claim_store: Option<ClaimStore>,
 }
 
 /// #1690 — prune the on-disk `federation_nonce_cache` to the newest
@@ -681,6 +689,113 @@ fn prune_nonce_cache_to_per_peer_cap(
          )",
         rusqlite::params![cap],
     )
+}
+
+/// #9140 — the first-writer-wins claim of one fingerprint in the sqlite
+/// `federation_nonce_cache` table (PRIMARY KEY `(peer_id, fingerprint)`).
+const SQL_CLAIM_NONCE_FINGERPRINT: &str = "INSERT INTO federation_nonce_cache \
+     (peer_id, fingerprint, last_touch, inserted_at) VALUES (?1, ?2, ?3, ?4) \
+     ON CONFLICT (peer_id, fingerprint) DO NOTHING";
+
+/// #9140 — the next per-peer `last_touch` for a claim made through the SAL
+/// store (no in-process touch counter): one past the peer's newest row.
+const SQL_NEXT_PEER_TOUCH: &str =
+    "SELECT COALESCE(MAX(last_touch), -1) + 1 FROM federation_nonce_cache WHERE peer_id = ?1";
+
+/// #9140 — keep only the newest `?2` rows of ONE peer (the store-claim twin of
+/// [`prune_nonce_cache_to_per_peer_cap`], scoped to the claiming peer so the
+/// hot path never scans other peers' rows).
+const SQL_PRUNE_PEER_TO_CAP: &str = "DELETE FROM federation_nonce_cache \
+     WHERE peer_id = ?1 AND fingerprint NOT IN ( \
+         SELECT fingerprint FROM federation_nonce_cache WHERE peer_id = ?1 \
+         ORDER BY last_touch DESC LIMIT ?2)";
+
+/// #9140 — the sqlite claim primitive shared by the per-process disk mirror
+/// and [`crate::store::MemoryStore::federation_nonce_claim`] on the sqlite
+/// adapter (one barrier for the backend). `Ok(true)` when THIS call inserted
+/// the row; `Ok(false)` when any process sharing the file already claimed it.
+///
+/// # Errors
+/// Propagates the `rusqlite` error; callers treat it as a replay.
+pub(crate) fn claim_nonce_fingerprint(
+    conn: &rusqlite::Connection,
+    peer_id: &str,
+    fp: &[u8; 32],
+    last_touch: i64,
+) -> rusqlite::Result<bool> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let inserted = conn.execute(
+        SQL_CLAIM_NONCE_FINGERPRINT,
+        rusqlite::params![peer_id, fp.as_slice(), last_touch, now],
+    )?;
+    Ok(inserted == 1)
+}
+
+/// #9140 — the sqlite adapter's store-backed claim: claim at the peer's next
+/// `last_touch`, then bound the peer's rows to `per_peer_cap`. Runs in one
+/// transaction so the touch read and the claim are not interleaved by a
+/// sibling writer.
+///
+/// # Errors
+/// Propagates the `rusqlite` error; callers treat it as a replay.
+pub(crate) fn claim_nonce_fingerprint_bounded(
+    conn: &rusqlite::Connection,
+    peer_id: &str,
+    fp: &[u8; 32],
+    per_peer_cap: usize,
+) -> rusqlite::Result<bool> {
+    let cap = i64::try_from(per_peer_cap).unwrap_or(i64::MAX);
+    let tx = conn.unchecked_transaction()?;
+    let touch: i64 = tx.query_row(SQL_NEXT_PEER_TOUCH, rusqlite::params![peer_id], |r| {
+        r.get(0)
+    })?;
+    let fresh = claim_nonce_fingerprint(&tx, peer_id, fp, touch)?;
+    if fresh {
+        tx.execute(SQL_PRUNE_PEER_TO_CAP, rusqlite::params![peer_id, cap])?;
+    }
+    tx.commit()?;
+    Ok(fresh)
+}
+
+/// #9140 — the outcome of the cross-process disk claim of one fingerprint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiskClaim {
+    /// This process inserted the row, or persistence is off (`db_path` is
+    /// `None`: a test-harness cache whose in-memory verdict stands).
+    Claimed,
+    /// The row already existed: another process accepted this nonce.
+    AlreadyClaimed,
+    /// The claim could not be made (open or insert failed). Fail closed: the
+    /// caller answers `Replay` and rolls the in-memory entry back so a
+    /// legitimate retry after the outage is not itself refused.
+    Unavailable,
+}
+
+/// #9140 — the SAL store a PostgreSQL daemon claims nonces in. Wrapped so
+/// [`FederationNonceCache`] keeps its `Debug` derive.
+#[cfg(feature = "sal")]
+#[derive(Clone)]
+struct ClaimStore(std::sync::Arc<dyn crate::store::MemoryStore>);
+
+#[cfg(feature = "sal")]
+impl std::fmt::Debug for ClaimStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ClaimStore(..)")
+    }
+}
+
+/// #9140 — the in-memory admission of one fingerprint, before the shared
+/// claim decides it.
+enum MemoryAdmission {
+    /// This process already saw the fingerprint.
+    Replay,
+    /// New to this process; the shared claim must still confirm it.
+    Pending {
+        fp: [u8; 32],
+        touch: u64,
+        evicted_fp: Option<[u8; 32]>,
+        evicted_peer: Option<String>,
+    },
 }
 
 impl FederationNonceCache {
@@ -717,9 +832,57 @@ impl FederationNonceCache {
             touch_counter: AtomicU64::new(0),
             peer_evictions: AtomicU64::new(0),
             db_path: Some(db_path.clone()),
+            #[cfg(feature = "sal")]
+            claim_store: None,
         };
         cache.hydrate_from_disk(&db_path)?;
         Ok(cache)
+    }
+
+    /// #9140 — store-claimed constructor for a daemon whose store is shared
+    /// with sibling daemons (PostgreSQL). Every nonce new to this process is
+    /// claimed in `store`; a nonce a sibling already claimed is a replay. The
+    /// in-memory map stays as the per-process fast path and bound.
+    #[cfg(feature = "sal")]
+    #[must_use]
+    pub fn new_store_claimed(store: std::sync::Arc<dyn crate::store::MemoryStore>) -> Self {
+        Self {
+            claim_store: Some(ClaimStore(store)),
+            ..Self::default()
+        }
+    }
+
+    /// #9140 — the daemon boot constructor, fail closed by construction.
+    ///
+    /// `shared_store` is `Some` when the daemon's store is shared with
+    /// sibling daemons (PostgreSQL): the store decides every claim. Otherwise
+    /// the sqlite file at `db_path` decides it. When the sqlite rehydration
+    /// fails the cache still claims on disk for every nonce (a failed claim
+    /// is a replay), so the replay window never reopens; pre-#9140 the boot
+    /// fell back to an in-memory-only cache that accepted every nonce a
+    /// sibling or an earlier run had already accepted.
+    #[must_use]
+    pub fn for_daemon(
+        db_path: &Path,
+        #[cfg(feature = "sal")] shared_store: Option<std::sync::Arc<dyn crate::store::MemoryStore>>,
+    ) -> Self {
+        #[cfg(feature = "sal")]
+        if let Some(store) = shared_store {
+            return Self::new_store_claimed(store);
+        }
+        Self::new_with_db_persistence(db_path).unwrap_or_else(|e| {
+            tracing::warn!(
+                target: "ai_memory::identity::replay",
+                db_path = %db_path.display(),
+                err = %e,
+                "FederationNonceCache: rehydration failed; every nonce is claimed on disk and \
+                 refused while the claim cannot be made (#9140 fail closed)",
+            );
+            Self {
+                db_path: Some(db_path.to_path_buf()),
+                ..Self::default()
+            }
+        })
     }
 
     /// #1255 — read every persisted `(peer_id, fingerprint,
@@ -830,18 +993,14 @@ impl FederationNonceCache {
     }
 
     /// #1255 — persist one `(peer_id, fingerprint, last_touch)`
-    /// triple to disk. Called from the Fresh arm of
-    /// `record_and_check` when `db_path.is_some()`. The INSERT OR
-    /// REPLACE shape keeps the row's `last_touch` in lockstep with
-    /// the in-memory cache on every re-touch path (currently the
-    /// `record_and_check` Fresh path only inserts; re-touch on
-    /// existing fingerprints surfaces as `Replay` and skips the
-    /// persistence call, which is fine — the original row remains).
-    /// Persistence errors are warn-logged and swallowed: an
-    /// operator-disk-full or transient db lock failure should not
-    /// be a 500 on every federated push. The in-memory cap still
-    /// holds, so a persistence outage degrades gracefully to
-    /// pre-#1255 behaviour (replay window opens on next restart).
+    /// triple to disk. Called for a fingerprint new to this process when
+    /// `db_path.is_some()`. #9140 — the insert is a first-writer-wins claim
+    /// ([`claim_nonce_fingerprint`]): an existing row means another process
+    /// sharing the file already accepted the nonce
+    /// ([`DiskClaim::AlreadyClaimed`]), and a failed open or insert is
+    /// [`DiskClaim::Unavailable`]: the caller fails closed (pre-#9140 a
+    /// persistence error was swallowed as fresh, so a disk outage let every
+    /// sibling accept the same push).
     fn persist_fingerprint_and_evict(
         &self,
         peer_id: &str,
@@ -849,9 +1008,9 @@ impl FederationNonceCache {
         last_touch: u64,
         evicted_fp: Option<&[u8; 32]>,
         evicted_peer: Option<&str>,
-    ) {
+    ) -> DiskClaim {
         let Some(path) = self.db_path.as_deref() else {
-            return;
+            return DiskClaim::Claimed;
         };
         // `crate::db::open` runs migrations + is cheap on a warm
         // SQLite WAL connection; the persistence rate is bounded by
@@ -864,39 +1023,32 @@ impl FederationNonceCache {
                     peer_id = %peer_id,
                     path = %path.display(),
                     err = %e,
-                    "FederationNonceCache: persist open failed; in-memory cache still holds \
-                     (#1255 graceful degradation)",
+                    "FederationNonceCache: nonce claim open failed; refusing the push as a \
+                     replay (#9140 fail closed)",
                 );
-                return;
+                return DiskClaim::Unavailable;
             }
         };
-        // `i64::try_from` is safe because `touch_counter` advances
-        // at most once per record_and_check; a daemon would need to
-        // sustain >2^63 federated pushes/sec to overflow, which is
-        // not a real shape.
-        #[allow(clippy::cast_possible_wrap)]
-        let last_touch_i64 = last_touch as i64;
-        let now = chrono::Utc::now().to_rfc3339();
-        if let Err(e) = conn.execute(
-            "INSERT OR REPLACE INTO federation_nonce_cache
-             (peer_id, fingerprint, last_touch, inserted_at)
-             VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![peer_id, fp.as_slice(), last_touch_i64, now],
-        ) {
-            tracing::warn!(
-                target: "ai_memory::identity::replay",
-                peer_id = %peer_id,
-                err = %e,
-                "FederationNonceCache: persist insert failed; in-memory cache still holds \
-                 (#1255 graceful degradation)",
-            );
-        }
+        let last_touch_i64 = i64::try_from(last_touch).unwrap_or(i64::MAX);
+        let claim = match claim_nonce_fingerprint(&conn, peer_id, fp, last_touch_i64) {
+            Ok(true) => DiskClaim::Claimed,
+            Ok(false) => DiskClaim::AlreadyClaimed,
+            Err(e) => {
+                tracing::warn!(
+                    target: "ai_memory::identity::replay",
+                    peer_id = %peer_id,
+                    err = %e,
+                    "FederationNonceCache: nonce claim insert failed; refusing the push as a \
+                     replay (#9140 fail closed)",
+                );
+                return DiskClaim::Unavailable;
+            }
+        };
         // #1690 — delete-on-evict: prune the disk rows the in-memory LRU
         // just evicted so the table stays bounded by the same ceiling as
         // the in-memory cache. Best-effort on the SAME connection as the
-        // INSERT above; a failed DELETE only leaves a dead row (the
-        // in-memory cap still bounds the replay check), so it is
-        // warn-logged and swallowed like the INSERT.
+        // INSERT above; a failed DELETE only leaves a dead row (which keeps
+        // refusing that nonce: the safe direction), so it is warn-logged.
         if let Some(efp) = evicted_fp {
             if let Err(e) = conn.execute(
                 "DELETE FROM federation_nonce_cache WHERE peer_id = ?1 AND fingerprint = ?2",
@@ -925,12 +1077,13 @@ impl FederationNonceCache {
                 );
             }
         }
+        claim
     }
 
-    /// Check + record `(peer_id, nonce)`.
-    pub fn record_and_check(&self, peer_id: &str, nonce: &str) -> ReplayDecision {
-        use std::sync::atomic::Ordering;
-        let fp = Self::fingerprint(peer_id, nonce);
+    /// #9140 — the in-memory half of a check: the per-process fast path and
+    /// bound. Records the fingerprint as seen and reports what was evicted so
+    /// the shared claim can mirror it; the shared claim then decides.
+    fn admit_in_memory(&self, peer_id: &str, fp: [u8; 32]) -> MemoryAdmission {
         let mut guard = match self.inner.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
@@ -939,12 +1092,7 @@ impl FederationNonceCache {
         // pruned in lockstep (delete-on-evict). Without this the disk
         // `federation_nonce_cache` table grew unbounded: every Fresh
         // nonce INSERTs a row, but the in-memory LRU evictions (per-peer
-        // FIFO + outer peer-slot LRU) never deleted the disk counterpart,
-        // so a long-lived high-throughput peer accumulated millions of
-        // dead rows while the in-memory cache stayed bounded. Both
-        // deletes ride the SAME connection-open as the persist below
-        // (see `persist_fingerprint_and_evict`), so the hot-path disk
-        // I/O rate is unchanged.
+        // FIFO + outer peer-slot LRU) never deleted the disk counterpart.
         let mut evicted_peer: Option<String> = None;
         // v0.7.0 #1038 — bound the outer HashMap to
         // `FEDERATION_NONCE_MAX_PEERS`. When the incoming peer is a
@@ -976,7 +1124,7 @@ impl FederationNonceCache {
         slot.last_touch = touch;
         // v0.7.0 #1033 — O(1) HashSet membership replaces O(N) scan.
         if slot.seen.contains(&fp) {
-            return ReplayDecision::Replay;
+            return MemoryAdmission::Replay;
         }
         let mut evicted_fp: Option<[u8; 32]> = None;
         if slot.order.len() >= FEDERATION_NONCE_CAPACITY_PER_PEER {
@@ -988,25 +1136,118 @@ impl FederationNonceCache {
         }
         slot.order.push_back(fp);
         slot.seen.insert(fp);
-        // Release the inner mutex before doing disk I/O so a slow
-        // SQLite WAL fsync doesn't block sibling
-        // `record_and_check` calls. The persistence call itself
-        // opens its own connection (no shared state).
-        drop(guard);
-        // #1255 — persist the new fingerprint to disk so a daemon
-        // restart doesn't re-open the replay window. #1690 — and prune
-        // the rows the in-memory cache just evicted so the disk mirror
-        // stays bounded. Both ride one connection-open; failures are
-        // warn-logged and swallowed (graceful degradation to the
-        // in-memory-only pre-#1255 posture).
-        self.persist_fingerprint_and_evict(
-            peer_id,
-            &fp,
+        MemoryAdmission::Pending {
+            fp,
             touch,
-            evicted_fp.as_ref(),
-            evicted_peer.as_deref(),
-        );
-        ReplayDecision::Fresh
+            evicted_fp,
+            evicted_peer,
+        }
+    }
+
+    /// #9140 — undo the in-memory admission of `fp` after the shared claim
+    /// could not be made, so a legitimate retry once the store recovers is
+    /// not refused by this process's own memory.
+    fn forget_in_memory(&self, peer_id: &str, fp: &[u8; 32]) {
+        let mut guard = match self.inner.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        if let Some(slot) = guard.get_mut(peer_id) {
+            if slot.seen.remove(fp) {
+                slot.order.retain(|held| held != fp);
+            }
+        }
+    }
+
+    /// Map a disk claim to the decision, rolling memory back when the claim
+    /// was unavailable.
+    fn decide_disk_claim(&self, peer_id: &str, fp: &[u8; 32], claim: DiskClaim) -> ReplayDecision {
+        match claim {
+            DiskClaim::Claimed => ReplayDecision::Fresh,
+            DiskClaim::AlreadyClaimed => ReplayDecision::Replay,
+            DiskClaim::Unavailable => {
+                self.forget_in_memory(peer_id, fp);
+                ReplayDecision::Replay
+            }
+        }
+    }
+
+    /// Check + record `(peer_id, nonce)`.
+    ///
+    /// #9140 — a fingerprint new to this process is confirmed by the shared
+    /// sqlite claim when persistence is on (another process sharing the file
+    /// may have accepted it; a failed claim is a replay). A store-claimed
+    /// cache ([`Self::new_store_claimed`]) cannot claim synchronously, so this
+    /// answers `Replay` for it (fail closed by construction): its callers
+    /// use [`Self::record_and_check_shared`].
+    pub fn record_and_check(&self, peer_id: &str, nonce: &str) -> ReplayDecision {
+        let fp = Self::fingerprint(peer_id, nonce);
+        #[cfg(feature = "sal")]
+        if self.claim_store.is_some() {
+            tracing::error!(
+                target: "ai_memory::identity::replay",
+                peer_id = %peer_id,
+                "FederationNonceCache: sync check on a store-claimed cache; refusing as a \
+                 replay (#9140 fail closed; use record_and_check_shared)",
+            );
+            return ReplayDecision::Replay;
+        }
+        match self.admit_in_memory(peer_id, fp) {
+            MemoryAdmission::Replay => ReplayDecision::Replay,
+            MemoryAdmission::Pending {
+                fp,
+                touch,
+                evicted_fp,
+                evicted_peer,
+            } => {
+                // The inner mutex is released (inside `admit_in_memory`)
+                // before the disk I/O so a slow fsync does not block siblings.
+                let claim = self.persist_fingerprint_and_evict(
+                    peer_id,
+                    &fp,
+                    touch,
+                    evicted_fp.as_ref(),
+                    evicted_peer.as_deref(),
+                );
+                self.decide_disk_claim(peer_id, &fp, claim)
+            }
+        }
+    }
+
+    /// #9140 — check + record `(peer_id, nonce)` against the claim SHARED by
+    /// every daemon over this store. On a store-claimed cache the SAL store
+    /// decides ([`crate::store::MemoryStore::federation_nonce_claim`]): a
+    /// sibling's earlier claim, or any store error, is `Replay` (fail closed;
+    /// an errored claim is rolled back in memory). Otherwise this is
+    /// [`Self::record_and_check`]. No lock is held across the `.await`
+    /// (CONCURRENCY-20).
+    pub async fn record_and_check_shared(&self, peer_id: &str, nonce: &str) -> ReplayDecision {
+        #[cfg(feature = "sal")]
+        if let Some(ClaimStore(store)) = self.claim_store.clone() {
+            let fp = Self::fingerprint(peer_id, nonce);
+            let MemoryAdmission::Pending { fp, .. } = self.admit_in_memory(peer_id, fp) else {
+                return ReplayDecision::Replay;
+            };
+            return match store
+                .federation_nonce_claim(peer_id, &fp, FEDERATION_NONCE_CAPACITY_PER_PEER)
+                .await
+            {
+                Ok(true) => ReplayDecision::Fresh,
+                Ok(false) => ReplayDecision::Replay,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "ai_memory::identity::replay",
+                        peer_id = %peer_id,
+                        err = %e,
+                        "FederationNonceCache: shared nonce claim failed; refusing the push as \
+                         a replay (#9140 fail closed)",
+                    );
+                    self.forget_in_memory(peer_id, &fp);
+                    ReplayDecision::Replay
+                }
+            };
+        }
+        self.record_and_check(peer_id, nonce)
     }
 
     /// v0.7.0 #1038 — cumulative number of peer-slot evictions
@@ -1354,5 +1595,125 @@ mod federation_nonce_cache_tests {
             "#1255: a non-DB path must surface as a constructor Err so operators \
              see the persistence failure rather than silently falling back"
         );
+    }
+
+    /// #9140 — a scratch directory under the crate's `.local-runs/` (no tmp).
+    fn scratch_dir_9140() -> tempfile::TempDir {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".local-runs");
+        std::fs::create_dir_all(&root).expect("scratch root");
+        tempfile::Builder::new()
+            .prefix("nonce-9140-unit-")
+            .tempdir_in(&root)
+            .expect("scratch dir")
+    }
+
+    /// #9140 — a claim that cannot be made is a replay (fail closed), and the
+    /// in-memory admission is rolled back so a retry after recovery is not
+    /// refused by this process's own memory. Pre-#9140 the failed insert was
+    /// swallowed and the push answered `Fresh`.
+    #[test]
+    fn issue_9140_unavailable_disk_claim_fails_closed_and_rolls_back() {
+        let dir = scratch_dir_9140();
+        // A directory is not a database: every claim open fails.
+        let cache = FederationNonceCache {
+            db_path: Some(dir.path().to_path_buf()),
+            ..FederationNonceCache::default()
+        };
+        for attempt in 0..3 {
+            assert_eq!(
+                cache.record_and_check("ai:peer-9140", "nonce-a"),
+                ReplayDecision::Replay,
+                "attempt {attempt}: an unavailable claim must refuse"
+            );
+            assert_eq!(cache.len_for_peer("ai:peer-9140"), 0, "rolled back");
+        }
+    }
+
+    /// #9140 — the daemon boot constructor never degrades to an in-memory-only
+    /// cache: a failed rehydration still claims on disk, so it refuses while
+    /// the claim cannot be made. Pre-#9140 boot fell back to `new()`, which
+    /// answered `Fresh` to every nonce a sibling or an earlier run accepted.
+    #[test]
+    fn issue_9140_for_daemon_rehydration_failure_still_fails_closed() {
+        let dir = scratch_dir_9140();
+        let cache = FederationNonceCache::for_daemon(
+            dir.path(),
+            #[cfg(feature = "sal")]
+            None,
+        );
+        assert_eq!(
+            cache.record_and_check("ai:peer-9140", "nonce-b"),
+            ReplayDecision::Replay
+        );
+        assert_eq!(cache.len_for_peer("ai:peer-9140"), 0);
+    }
+
+    /// #9140 — a healthy `for_daemon` cache over a sqlite file claims on disk:
+    /// a second boot over the same file refuses what the first accepted.
+    #[test]
+    fn issue_9140_for_daemon_sqlite_claims_survive_a_sibling_boot() {
+        let dir = scratch_dir_9140();
+        let path = dir.path().join("ai-memory.db");
+        let first = FederationNonceCache::for_daemon(
+            &path,
+            #[cfg(feature = "sal")]
+            None,
+        );
+        assert_eq!(
+            first.record_and_check("ai:peer-9140", "nonce-c"),
+            ReplayDecision::Fresh
+        );
+        let sibling = FederationNonceCache::for_daemon(
+            &path,
+            #[cfg(feature = "sal")]
+            None,
+        );
+        assert_eq!(
+            sibling.record_and_check("ai:peer-9140", "nonce-c"),
+            ReplayDecision::Replay
+        );
+        let fresh_sibling = FederationNonceCache::new();
+        assert_eq!(
+            fresh_sibling.record_and_check("ai:peer-9140", "nonce-c"),
+            ReplayDecision::Fresh,
+            "control: an unclaimed in-memory cache cannot see the sibling (the #9140 defect)"
+        );
+    }
+
+    /// #9140 — a store error on the shared claim is a replay, rolled back in
+    /// memory (the table is dropped under the adapter to force the error).
+    #[cfg(feature = "sal")]
+    #[tokio::test]
+    async fn issue_9140_store_claim_error_fails_closed_and_rolls_back() {
+        let dir = scratch_dir_9140();
+        let path = dir.path().join("ai-memory.db");
+        let store: std::sync::Arc<dyn crate::store::MemoryStore> = std::sync::Arc::new(
+            crate::store::sqlite::SqliteStore::open(&path).expect("open store"),
+        );
+        let cache = FederationNonceCache::new_store_claimed(std::sync::Arc::clone(&store));
+        assert_eq!(
+            cache
+                .record_and_check_shared("ai:peer-9140", "nonce-d")
+                .await,
+            ReplayDecision::Fresh
+        );
+        rusqlite::Connection::open(&path)
+            .expect("raw conn")
+            .execute_batch("DROP TABLE federation_nonce_cache")
+            .expect("drop table");
+        for attempt in 0..3 {
+            assert_eq!(
+                cache
+                    .record_and_check_shared("ai:peer-9140", "nonce-e")
+                    .await,
+                ReplayDecision::Replay,
+                "attempt {attempt}: a store error must refuse"
+            );
+            assert_eq!(
+                cache.len_for_peer("ai:peer-9140"),
+                1,
+                "only nonce-d is held"
+            );
+        }
     }
 }

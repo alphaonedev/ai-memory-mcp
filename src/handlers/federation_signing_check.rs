@@ -80,6 +80,22 @@ async fn resolve_stored_namespace(
     app.store.namespace_by_id(&ns_probe_ctx, id).await
 }
 
+/// #9147 — [`resolve_stored_namespace`], falling back to the ARCHIVED copy's
+/// namespace when no live row exists: a federated deletion purges the archived
+/// copy too, so its scope must be checked rather than the id skipped as absent.
+#[cfg(feature = "sal")]
+async fn resolve_live_or_archived_namespace(
+    app: &AppState,
+    probe_principal: String,
+    id: &str,
+) -> Result<Option<String>, crate::store::StoreError> {
+    if let Some(namespace) = resolve_stored_namespace(app, probe_principal.clone(), id).await? {
+        return Ok(Some(namespace));
+    }
+    let ns_probe_ctx = crate::store::CallerContext::for_admin(probe_principal);
+    app.store.archived_namespace_by_id(&ns_probe_ctx, id).await
+}
+
 /// #3075 — the operator context the postgres federation-RECEIVE APPLY lanes use
 /// for their SAL writes.
 ///
@@ -1030,7 +1046,10 @@ pub(super) async fn sync_push_via_store(
                 &attest_cfg,
             );
             let stored_ns = if needs_stored {
-                match resolve_stored_namespace(&app, body.sender_agent_id.clone(), del_id).await {
+                // #9147 — fall back to the archived copy (sqlite twin).
+                match resolve_live_or_archived_namespace(&app, body.sender_agent_id.clone(), del_id)
+                    .await
+                {
                     Ok(Some(namespace)) => Some(namespace),
                     Ok(None) => {
                         noop += 1;
@@ -1449,7 +1468,11 @@ pub(super) async fn sync_push_via_store(
                     let nstr = base64::engine::general_purpose::STANDARD.encode(&op.nonce);
                     if matches!(
                         app.federation_nonce_cache
-                            .record_and_check(peer_header_owned.as_deref().unwrap_or(""), &nstr),
+                            .record_and_check_shared(
+                                peer_header_owned.as_deref().unwrap_or(""),
+                                &nstr
+                            )
+                            .await,
                         crate::identity::replay::ReplayDecision::Replay
                     ) {
                         tracing::warn!(
@@ -2548,7 +2571,7 @@ fn verify_credential_pubkey(
 /// unenrolled federation pair operational while the strict-deny
 /// arms fire once an operator enrols a peer key.
 /// `AI_MEMORY_FED_REQUIRE_SIG=0` bypasses every branch.
-pub(super) fn verify_signature_or_reject(
+pub(super) async fn verify_signature_or_reject(
     headers: &HeaderMap,
     body_bytes: &[u8],
     peer_id: Option<&str>,
@@ -2602,7 +2625,10 @@ pub(super) fn verify_signature_or_reject(
             let pid_for_cache = peer_id.unwrap_or("");
             match nonce_header {
                 Some(nonce) if !nonce.is_empty() => {
-                    match federation_nonce_cache.record_and_check(pid_for_cache, nonce) {
+                    match federation_nonce_cache
+                        .record_and_check_shared(pid_for_cache, nonce)
+                        .await
+                    {
                         crate::identity::replay::ReplayDecision::Fresh => None,
                         crate::identity::replay::ReplayDecision::Replay => {
                             tracing::warn!(
@@ -2895,7 +2921,7 @@ pub(super) fn canonical_get_bytes(method: &str, path: &str, query: &str) -> Vec<
 /// arms fire once an operator enrols a peer key.
 /// `AI_MEMORY_FED_REQUIRE_SIG=0` bypasses every branch (mirrors the
 /// `/sync/push` env-var posture).
-pub(super) fn verify_get_signature_or_reject(
+pub(super) async fn verify_get_signature_or_reject(
     method: &str,
     path: &str,
     query: &str,
@@ -2951,7 +2977,10 @@ pub(super) fn verify_get_signature_or_reject(
             let pid_for_cache = peer_id.unwrap_or("");
             match nonce_header {
                 Some(nonce) if !nonce.is_empty() => {
-                    match federation_nonce_cache.record_and_check(pid_for_cache, nonce) {
+                    match federation_nonce_cache
+                        .record_and_check_shared(pid_for_cache, nonce)
+                        .await
+                    {
                         crate::identity::replay::ReplayDecision::Fresh => None,
                         crate::identity::replay::ReplayDecision::Replay => {
                             tracing::warn!(
@@ -3128,6 +3157,17 @@ mod verify_arm_tests {
         crate::handlers::fed_env_test_lock()
     }
 
+    /// #9140 — the verify gates are async (the shared nonce claim awaits the
+    /// store); drive one on a private current-thread runtime so the sync env
+    /// lock above is never held across an `.await`.
+    fn block_on_test<F: std::future::Future>(fut: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime")
+            .block_on(fut)
+    }
+
     fn sig_header_value() -> HeaderValue {
         let b64 = base64::engine::general_purpose::STANDARD.encode([0u8; 64]);
         HeaderValue::from_str(&format!("{ED25519_PREFIX}{b64}")).unwrap()
@@ -3240,7 +3280,12 @@ mod verify_arm_tests {
             std::env::set_var(REQUIRE_SIG_ENV, "0");
         }
         let cache = FederationNonceCache::default();
-        let out = verify_signature_or_reject(&HeaderMap::new(), b"{}", Some("peer-x"), &cache);
+        let out = block_on_test(verify_signature_or_reject(
+            &HeaderMap::new(),
+            b"{}",
+            Some("peer-x"),
+            &cache,
+        ));
         unsafe {
             std::env::remove_var(REQUIRE_SIG_ENV);
         }
@@ -3257,7 +3302,12 @@ mod verify_arm_tests {
         headers.insert(SIGNATURE_HEADER, sig_header_value());
         let cache = FederationNonceCache::default();
         // peer-id has no on-disk key → (Some, None) arm.
-        let out = verify_signature_or_reject(&headers, b"{}", Some("no-such-peer"), &cache);
+        let out = block_on_test(verify_signature_or_reject(
+            &headers,
+            b"{}",
+            Some("no-such-peer"),
+            &cache,
+        ));
         unsafe {
             std::env::remove_var(REQUIRE_SIG_ENV);
         }
@@ -3278,7 +3328,12 @@ mod verify_arm_tests {
         }
         let cache = FederationNonceCache::default();
         // No sig, no enrolled key, falsy opt-out → allow-with-WARN (None).
-        let out = verify_signature_or_reject(&HeaderMap::new(), b"{}", Some("unenrolled"), &cache);
+        let out = block_on_test(verify_signature_or_reject(
+            &HeaderMap::new(),
+            b"{}",
+            Some("unenrolled"),
+            &cache,
+        ));
         unsafe {
             std::env::remove_var(REQUIRE_SIG_ENV);
             std::env::remove_var("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT");
@@ -3301,7 +3356,12 @@ mod verify_arm_tests {
             std::env::set_var("AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS", "1");
         }
         let cache = FederationNonceCache::default();
-        let out = verify_signature_or_reject(&HeaderMap::new(), b"{}", Some("unenrolled"), &cache);
+        let out = block_on_test(verify_signature_or_reject(
+            &HeaderMap::new(),
+            b"{}",
+            Some("unenrolled"),
+            &cache,
+        ));
         unsafe {
             std::env::remove_var(REQUIRE_SIG_ENV);
             std::env::remove_var("AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS");
@@ -3324,7 +3384,12 @@ mod verify_arm_tests {
             std::env::remove_var("AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS");
         }
         let cache = FederationNonceCache::default();
-        let out = verify_signature_or_reject(&HeaderMap::new(), b"{}", Some("unenrolled"), &cache);
+        let out = block_on_test(verify_signature_or_reject(
+            &HeaderMap::new(),
+            b"{}",
+            Some("unenrolled"),
+            &cache,
+        ));
         unsafe {
             std::env::remove_var(REQUIRE_SIG_ENV);
         }
@@ -3339,14 +3404,14 @@ mod verify_arm_tests {
             std::env::set_var(REQUIRE_SIG_ENV, "0");
         }
         let cache = FederationNonceCache::default();
-        let out = verify_get_signature_or_reject(
+        let out = block_on_test(verify_get_signature_or_reject(
             "GET",
             "/api/v1/sync/since",
             "limit=10",
             &HeaderMap::new(),
             Some("peer-x"),
             &cache,
-        );
+        ));
         unsafe {
             std::env::remove_var(REQUIRE_SIG_ENV);
         }
@@ -3363,14 +3428,14 @@ mod verify_arm_tests {
         let mut headers = HeaderMap::new();
         headers.insert(SIGNATURE_HEADER, sig_header_value());
         let cache = FederationNonceCache::default();
-        let out = verify_get_signature_or_reject(
+        let out = block_on_test(verify_get_signature_or_reject(
             "GET",
             "/api/v1/sync/since",
             "limit=10",
             &headers,
             Some("no-such-peer"),
             &cache,
-        );
+        ));
         unsafe {
             std::env::remove_var(REQUIRE_SIG_ENV);
             std::env::remove_var(REQUIRE_NONCE_ENV);
@@ -3388,14 +3453,14 @@ mod verify_arm_tests {
             std::env::remove_var("AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS");
         }
         let cache = FederationNonceCache::default();
-        let out = verify_get_signature_or_reject(
+        let out = block_on_test(verify_get_signature_or_reject(
             "GET",
             "/api/v1/sync/since",
             "limit=10",
             &HeaderMap::new(),
             Some("unenrolled"),
             &cache,
-        );
+        ));
         unsafe {
             std::env::remove_var(REQUIRE_SIG_ENV);
             std::env::remove_var("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT");
@@ -3414,14 +3479,14 @@ mod verify_arm_tests {
             std::env::set_var("AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS", "1");
         }
         let cache = FederationNonceCache::default();
-        let out = verify_get_signature_or_reject(
+        let out = block_on_test(verify_get_signature_or_reject(
             "GET",
             "/api/v1/sync/since",
             "limit=10",
             &HeaderMap::new(),
             Some("unenrolled"),
             &cache,
-        );
+        ));
         unsafe {
             std::env::remove_var(REQUIRE_SIG_ENV);
             std::env::remove_var("AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS");

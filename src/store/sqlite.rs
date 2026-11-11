@@ -1763,6 +1763,25 @@ impl MemoryStore for SqliteStore {
         db::admit_attested_write(&conn, &fp, agent_id, created_at).map_err(box_err)
     }
 
+    /// #9140 — sqlite twin of the shared nonce claim: the SAME
+    /// `federation_nonce_cache` table and claim primitive the per-process
+    /// disk mirror uses, so every daemon over this file agrees.
+    async fn federation_nonce_claim(
+        &self,
+        peer_id: &str,
+        fingerprint: &[u8; 32],
+        per_peer_cap: usize,
+    ) -> StoreResult<bool> {
+        let conn = self.state.lock().await;
+        crate::identity::replay::claim_nonce_fingerprint_bounded(
+            &conn,
+            peer_id,
+            fingerprint,
+            per_peer_cap,
+        )
+        .map_err(box_err)
+    }
+
     async fn revoke_agent_pubkey(&self, _ctx: &CallerContext, agent_id: &str) -> StoreResult<()> {
         let conn = self.state.lock().await;
         db::revoke_agent_pubkey(&conn, agent_id).map_err(box_err)

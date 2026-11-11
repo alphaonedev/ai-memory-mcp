@@ -2405,7 +2405,9 @@ async fn sync_push_write(
         &body_bytes,
         peer_header_owned.as_deref(),
         &app.federation_nonce_cache,
-    ) {
+    )
+    .await
+    {
         return rejection;
     }
 
@@ -3356,7 +3358,15 @@ async fn sync_push_write(
                 &attest_cfg,
             );
             let stored_ns = if needs_stored {
-                match db::namespace_by_id(&lock.0, del_id) {
+                // #9147 — an id held only as an ARCHIVED copy is still a
+                // deletion target (the store purges it): probe the archive
+                // when no live row exists, so a scoped peer's deletion of an
+                // archived row is authorized, not skipped as absent.
+                let probe = db::namespace_by_id(&lock.0, del_id).and_then(|live| match live {
+                    Some(namespace) => Ok(Some(namespace)),
+                    None => db::archived_namespace_by_id(&lock.0, del_id),
+                });
+                match probe {
                     Ok(Some(namespace)) => Some(namespace),
                     Ok(None) => {
                         noop += 1;
@@ -4321,7 +4331,11 @@ async fn sync_push_write(
                     let nstr = base64::engine::general_purpose::STANDARD.encode(&op.nonce);
                     if matches!(
                         app.federation_nonce_cache
-                            .record_and_check(peer_header_owned.as_deref().unwrap_or(""), &nstr),
+                            .record_and_check_shared(
+                                peer_header_owned.as_deref().unwrap_or(""),
+                                &nstr
+                            )
+                            .await,
                         crate::identity::replay::ReplayDecision::Replay
                     ) {
                         tracing::warn!(

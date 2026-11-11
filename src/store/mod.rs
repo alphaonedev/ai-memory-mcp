@@ -2389,6 +2389,38 @@ pub trait MemoryStore: Send + Sync {
         })
     }
 
+    /// #9140 — claim one federation nonce fingerprint for `peer_id` in the
+    /// SHARED store: `Ok(true)` when this call inserted it (the nonce is
+    /// fresh for EVERY daemon over this store), `Ok(false)` when a row
+    /// already existed (a sibling daemon, or this one, accepted it: replay).
+    ///
+    /// Federation nonces carry no freshness window, so unlike
+    /// [`Self::admit_attested_write`] the claim is NEVER time-pruned; the
+    /// adapter keeps the newest `per_peer_cap` rows per peer (the same bound
+    /// as the in-memory [`crate::identity::replay::FederationNonceCache`]).
+    /// The decision MUST be the engine's uniqueness constraint (one
+    /// `INSERT ... ON CONFLICT DO NOTHING` on `(peer_id, fingerprint)`),
+    /// never a check-then-act read.
+    ///
+    /// The default REFUSES: a backend without the shared claim cannot tell a
+    /// sibling's replay from a fresh push, and callers treat any error as a
+    /// replay (fail closed). It must never be softened to `Ok(true)`.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::UnsupportedCapability`] by default; adapters propagate
+    /// their backend error. Callers MUST refuse the request on any error.
+    async fn federation_nonce_claim(
+        &self,
+        _peer_id: &str,
+        _fingerprint: &[u8; 32],
+        _per_peer_cap: usize,
+    ) -> StoreResult<bool> {
+        Err(StoreError::UnsupportedCapability {
+            capability: FEDERATION_NONCE_CLAIM_CAPABILITY.to_string(),
+        })
+    }
+
     /// #2044 (v1.0.0, #2032-A / H1 IDOR + M1 admin spoof) — bind a per-agent
     /// api-key to `agent_id` by its `sha256(token)` digest. The RAW token is
     /// NEVER passed here or stored (only its lowercase-hex sha256), so the DB
@@ -5879,6 +5911,9 @@ pub const EXECUTE_PENDING_ACTION: &str = "execute_pending_action";
 /// [`MemoryStore::merge_inbound_authorized`] refuses a federation merge whose
 /// locked row sits outside the pushing peer's namespace scope.
 pub const FEDERATION_MERGE_INBOUND: &str = "federation_merge_inbound";
+/// #9140 — capability tag of the default (refusing)
+/// [`MemoryStore::federation_nonce_claim`].
+pub const FEDERATION_NONCE_CLAIM_CAPABILITY: &str = "FEDERATION_NONCE_CLAIM";
 
 /// #4447 — the `action` of the [`StoreError::PermissionDenied`] envelope the
 /// `apply_remote_*_authorized` methods return when the in-transaction re-check
