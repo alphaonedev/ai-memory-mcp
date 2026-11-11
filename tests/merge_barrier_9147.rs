@@ -20,6 +20,7 @@
 //! (deliberately not `#[ignore]`: the PR postgres job never passes
 //! `--include-ignored`).
 
+#![cfg(feature = "sal")]
 #![allow(clippy::too_many_lines)]
 
 use std::sync::Arc;
@@ -468,6 +469,62 @@ fn sqlite_nonce_replay_is_store_scoped_9140() {
     }
 }
 
+/// #9140 — the shared-claim half of the cells: two caches that claim through
+/// the SAL store (two daemons over one store, each with its own memory).
+async fn shared_nonce_cells(
+    daemon_a: &ai_memory::identity::replay::FederationNonceCache,
+    daemon_b: &ai_memory::identity::replay::FederationNonceCache,
+    backend: &str,
+) {
+    use ai_memory::identity::replay::ReplayDecision;
+    for cell in 0..NONCE_CELLS {
+        let peer = format!("ai:peer-9140-{backend}-{}", cell % 3);
+        let nonce = uuid::Uuid::new_v4().to_string();
+        let (first, second) = if cell % 2 == 0 {
+            (daemon_a, daemon_b)
+        } else {
+            (daemon_b, daemon_a)
+        };
+        assert_eq!(
+            first.record_and_check_shared(&peer, &nonce).await,
+            ReplayDecision::Fresh,
+            "{backend} cell {cell}: first sight of a nonce is fresh"
+        );
+        assert_eq!(
+            second.record_and_check_shared(&peer, &nonce).await,
+            ReplayDecision::Replay,
+            "{backend} cell {cell}: a sibling daemon accepted a captured push (#9140)"
+        );
+        assert_eq!(
+            first.record_and_check_shared(&peer, &nonce).await,
+            ReplayDecision::Replay,
+            "{backend} cell {cell}: the recording daemon must still see its own replay"
+        );
+        // The synchronous check cannot consult the shared store: it refuses.
+        assert_eq!(
+            first.record_and_check(&peer, &uuid::Uuid::new_v4().to_string()),
+            ReplayDecision::Replay,
+            "{backend} cell {cell}: a sync check on a store-claimed cache must fail closed"
+        );
+    }
+}
+
+/// #9140 — the SAL claim on the sqlite adapter (two caches over one store).
+#[tokio::test]
+async fn sqlite_store_claimed_nonce_replay_is_store_scoped_9140() {
+    use ai_memory::identity::replay::FederationNonceCache;
+    let (_dir, store_a, view) = sqlite_store();
+    let RawView::Sqlite(path) = &view else {
+        panic!("sqlite_store yields a sqlite view");
+    };
+    // A second adapter on the same file: a sibling daemon of the same store.
+    let store_b: Arc<dyn MemoryStore> =
+        Arc::new(ai_memory::store::sqlite::SqliteStore::open(path).expect("open sibling store"));
+    let daemon_a = FederationNonceCache::new_store_claimed(store_a);
+    let daemon_b = FederationNonceCache::new_store_claimed(store_b);
+    shared_nonce_cells(&daemon_a, &daemon_b, "sqlite").await;
+}
+
 #[cfg(feature = "sal-postgres")]
 async fn pg_store() -> Option<(Arc<dyn MemoryStore>, RawView)> {
     let url = std::env::var("AI_MEMORY_TEST_POSTGRES_URL")
@@ -512,4 +569,23 @@ async fn postgres_federated_deletion_is_a_restore_barrier_9147() {
         return;
     };
     deletion_barrier_cells(store, view, "postgres").await;
+}
+
+/// #9140 — two PostgreSQL daemons over one database (two connections, two
+/// caches) must not both accept the same `(peer, nonce)`.
+#[cfg(feature = "sal-postgres")]
+#[tokio::test]
+async fn postgres_nonce_replay_is_store_scoped_9140() {
+    use ai_memory::identity::replay::FederationNonceCache;
+    let Some((store_a, _view_a)) = pg_store().await else {
+        eprintln!("SKIP: AI_MEMORY_TEST_POSTGRES_URL unset");
+        return;
+    };
+    let Some((store_b, _view_b)) = pg_store().await else {
+        eprintln!("SKIP: AI_MEMORY_TEST_POSTGRES_URL unset");
+        return;
+    };
+    let daemon_a = FederationNonceCache::new_store_claimed(store_a);
+    let daemon_b = FederationNonceCache::new_store_claimed(store_b);
+    shared_nonce_cells(&daemon_a, &daemon_b, "postgres").await;
 }

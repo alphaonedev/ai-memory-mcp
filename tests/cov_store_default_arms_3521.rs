@@ -174,6 +174,13 @@ async fn unimplemented_default_arms_refuse_naming_their_capability() {
         "REOWN",
     );
     refused(s.size_gc("ns", 1_024, false).await, "SIZE_GC");
+    // #9140 — an adapter that cannot make the shared nonce claim refuses, so
+    // the caller treats the push as a replay (never as fresh).
+    refused(
+        s.federation_nonce_claim("ai:peer-9140", &[0_u8; 32], 1)
+            .await,
+        "FEDERATION_NONCE_CLAIM",
+    );
     refused(s.delete_link(&ctx, "a", "b").await, "DELETE_LINK");
 
     // --- curator / confidence -----------------------------------------
