@@ -62,6 +62,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use sha2::{Digest, Sha256};
 
+/// The tracing target of every replay-cache log line in this module.
+const REPLAY_LOG_TARGET: &str = "ai_memory::identity::replay";
+
 /// #2032 LM3 (class-a, 5-agent vote `4d3ea1c5`) — per-CALLER FIFO bound for
 /// the replay-protection cache. Mirrors [`FEDERATION_NONCE_CAPACITY_PER_PEER`]
 /// (10 000): each caller partition holds at most this many
@@ -173,7 +176,7 @@ impl ReplayCache {
                 guard.remove(&evict_id);
                 self.caller_evictions.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(
-                    target: "ai_memory::identity::replay",
+                    target: REPLAY_LOG_TARGET,
                     evicted_caller = %evict_id,
                     "ReplayCache: at caller ceiling ({}); evicted LRU caller slot to make \
                      room (#2032 LM3). Operator-visible via caller_evictions_since_boot().",
@@ -872,7 +875,7 @@ impl FederationNonceCache {
         }
         Self::new_with_db_persistence(db_path).unwrap_or_else(|e| {
             tracing::warn!(
-                target: "ai_memory::identity::replay",
+                target: REPLAY_LOG_TARGET,
                 db_path = %db_path.display(),
                 err = %e,
                 "FederationNonceCache: rehydration failed; every nonce is claimed on disk and \
@@ -924,7 +927,7 @@ impl FederationNonceCache {
                 Ok(fp) => fp,
                 Err(_) => {
                     tracing::warn!(
-                        target: "ai_memory::identity::replay",
+                        target: REPLAY_LOG_TARGET,
                         peer_id = %peer_id,
                         len = fp_bytes.len(),
                         "FederationNonceCache: skipping persisted row with non-32-byte \
@@ -973,12 +976,12 @@ impl FederationNonceCache {
         match prune_nonce_cache_to_per_peer_cap(&conn, FEDERATION_NONCE_CAPACITY_PER_PEER) {
             Ok(0) => {}
             Ok(n) => tracing::info!(
-                target: "ai_memory::identity::replay",
+                target: REPLAY_LOG_TARGET,
                 "FederationNonceCache: pruned {n} over-cap disk row(s) on hydration \
                  (#1690 legacy-bloat repair); disk now bounded to the per-peer cap"
             ),
             Err(e) => tracing::warn!(
-                target: "ai_memory::identity::replay",
+                target: REPLAY_LOG_TARGET,
                 err = %e,
                 "FederationNonceCache: hydration over-cap prune failed (non-fatal; in-memory \
                  cache still bounded)"
@@ -1019,7 +1022,7 @@ impl FederationNonceCache {
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!(
-                    target: "ai_memory::identity::replay",
+                    target: REPLAY_LOG_TARGET,
                     peer_id = %peer_id,
                     path = %path.display(),
                     err = %e,
@@ -1035,7 +1038,7 @@ impl FederationNonceCache {
             Ok(false) => DiskClaim::AlreadyClaimed,
             Err(e) => {
                 tracing::warn!(
-                    target: "ai_memory::identity::replay",
+                    target: REPLAY_LOG_TARGET,
                     peer_id = %peer_id,
                     err = %e,
                     "FederationNonceCache: nonce claim insert failed; refusing the push as a \
@@ -1055,7 +1058,7 @@ impl FederationNonceCache {
                 rusqlite::params![peer_id, efp.as_slice()],
             ) {
                 tracing::warn!(
-                    target: "ai_memory::identity::replay",
+                    target: REPLAY_LOG_TARGET,
                     peer_id = %peer_id,
                     err = %e,
                     "FederationNonceCache: evicted-fingerprint delete failed; disk row lingers \
@@ -1069,7 +1072,7 @@ impl FederationNonceCache {
                 rusqlite::params![ep],
             ) {
                 tracing::warn!(
-                    target: "ai_memory::identity::replay",
+                    target: REPLAY_LOG_TARGET,
                     evicted_peer = %ep,
                     err = %e,
                     "FederationNonceCache: evicted-peer delete failed; disk rows linger \
@@ -1110,7 +1113,7 @@ impl FederationNonceCache {
                 guard.remove(&evict_id);
                 self.peer_evictions.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(
-                    target: "ai_memory::identity::replay",
+                    target: REPLAY_LOG_TARGET,
                     evicted_peer = %evict_id,
                     "FederationNonceCache: at peer ceiling ({}); evicted LRU peer slot to make \
                      room. Operator-visible via peer_evictions_since_boot() (#1038).",
@@ -1185,7 +1188,7 @@ impl FederationNonceCache {
         #[cfg(feature = "sal")]
         if self.claim_store.is_some() {
             tracing::error!(
-                target: "ai_memory::identity::replay",
+                target: REPLAY_LOG_TARGET,
                 peer_id = %peer_id,
                 "FederationNonceCache: sync check on a store-claimed cache; refusing as a \
                  replay (#9140 fail closed; use record_and_check_shared)",
@@ -1236,7 +1239,7 @@ impl FederationNonceCache {
                 Ok(false) => ReplayDecision::Replay,
                 Err(e) => {
                     tracing::warn!(
-                        target: "ai_memory::identity::replay",
+                        target: REPLAY_LOG_TARGET,
                         peer_id = %peer_id,
                         err = %e,
                         "FederationNonceCache: shared nonce claim failed; refusing the push as \

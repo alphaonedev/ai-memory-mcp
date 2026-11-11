@@ -53,7 +53,7 @@ impl ReceiverMergeBarrier {
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Tombstoned => "tombstoned",
+            Self::Tombstoned => LifecycleState::Tombstoned.as_str(),
             Self::Archived => "archived",
             Self::Held(state) => state.as_str(),
         }
