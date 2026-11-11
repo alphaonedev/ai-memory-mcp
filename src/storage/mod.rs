@@ -11071,13 +11071,20 @@ pub fn consolidate_with_expected_versions(
                 }
             }
         } else {
-            // LEGACY hard-DELETE path. We intentionally do NOT create
-            // derived_from links before deletion because ON DELETE CASCADE
-            // would immediately remove them; source IDs live in
-            // `metadata.derived_from` (non-navigable, plus the cid twin
+            // LEGACY disposition (tombstone sub-flag OFF). We intentionally
+            // do NOT create derived_from links before removal because ON
+            // DELETE CASCADE would immediately remove them; source IDs live
+            // in `metadata.derived_from` (non-navigable, plus the cid twin
             // above when the master flag is on) instead.
+            //
+            // #9018 — ARCHIVE-FIRST, never a bare hard delete: each source
+            // row and its links move into the archive under
+            // `archive_reason = 'consolidate'` in THIS transaction (the
+            // `delete_archive_first` precedent; `archive_memory` joins the
+            // open tx and keeps the record-stop fence), so the merged-away
+            // text stays restorable and a failure rolls the summary back too.
             for id in ids {
-                delete(conn, id)?;
+                archive_memory(conn, id, Some(field_names::ARCHIVE_REASON_CONSOLIDATE))?;
             }
         }
 

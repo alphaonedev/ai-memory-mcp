@@ -560,6 +560,9 @@ fn verify_edge(
 // Text renderer
 // ─────────────────────────────────────────────────────────────────────
 
+/// Byte budget of the id prefix printed per edge by [`render_text`].
+const EDGE_ID_PREFIX_BYTES: usize = 8;
+
 pub(super) fn render_text(report: &ChainReport, out: &mut CliOutput<'_>) -> Result<()> {
     writeln!(
         out.stdout,
@@ -586,8 +589,10 @@ pub(super) fn render_text(report: &ChainReport, out: &mut CliOutput<'_>) -> Resu
         writeln!(out.stdout, "\nedges:")?;
         for e in &report.edges {
             let status = if e.verified { "OK" } else { "FAIL" };
-            let src_short = &e.source_id[..e.source_id.len().min(8)];
-            let tgt_short = &e.target_id[..e.target_id.len().min(8)];
+            // OWNERSHIP-15: ids admit any non-control char, so the cut is
+            // moved down to a char boundary instead of slicing mid-char.
+            let src_short = &e.source_id[..e.source_id.floor_char_boundary(EDGE_ID_PREFIX_BYTES)];
+            let tgt_short = &e.target_id[..e.target_id.floor_char_boundary(EDGE_ID_PREFIX_BYTES)];
             write!(
                 out.stdout,
                 "  [{status}] {src_short} -> {tgt_short}  attest={}",

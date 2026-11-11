@@ -109,17 +109,16 @@ pub(super) fn handle_consolidate(
             .collect();
         llm_client.summarize_memories(&memory_pairs).map_err(|e| {
             format!(
-                "LLM summarization failed: {}",
+                "{}: {}",
+                crate::errors::msg::CONSOLIDATE_LLM_SUMMARY_FAILED,
                 crate::mcp::error_text::mcp_foreign_err(
-                    "LLM summarization failed",
+                    crate::errors::msg::CONSOLIDATE_LLM_SUMMARY_FAILED,
                     crate::mcp::error_text::llm(e),
                 )
             )
         })?
     } else {
-        return Err(
-            "summary is required (or use smart/autonomous tier for auto-summarization)".into(),
-        );
+        return Err(crate::errors::msg::CONSOLIDATE_SUMMARY_REQUIRED.into());
     };
 
     validate::RequestValidator::validate_consolidate(&ids, title, &summary, namespace)

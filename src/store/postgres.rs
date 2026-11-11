@@ -114,7 +114,8 @@ mod merge_inbound_4023;
 // v1.0.0 #4447 — the federation by-id lane write bodies (deletions / archives /
 // restores / links) with the in-transaction peer-scope re-check. Own module:
 // postgres.rs is at its qual_10 budget.
-mod federation_by_id_4447;
+mod consolidate_archive_9018;
+mod federation_by_id_4447; // #9018 archive-first consolidate source (qual_10 budget)
 // v1.0.0 #3124 R4 — the audited `reown` sweep. Own module for the same
 // qual_10 budget reason as `parity_3064` above.
 mod governance_corrupt_4285;
@@ -28605,6 +28606,9 @@ impl MemoryStore for PostgresStore {
         } else {
             None
         };
+        // #9018 — audit anchors of the legacy arm's namespace-standard sever,
+        // emitted only after the COMMIT.
+        let mut sever_anchor = crate::governance::audit::PendingAuditAnchor::none();
         for (id, source_cid) in ids.iter().zip(source_cids.iter()) {
             if id == &new_id {
                 continue;
@@ -28770,22 +28774,14 @@ impl MemoryStore for PostgresStore {
                     }
                 }
             } else {
-                // LEGACY hard-DELETE path (sub-flag OFF) — byte-identical
-                // pre-#1859 behavior.
-                sqlx::query(SQL_DELETE_MEMORY_BY_ID)
-                    .bind(id)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|e| to_store_err("consolidate delete source", e))?;
-                // #1783 — remove the merged-away source's AGE projection in
-                // this tx so kg_query/find_paths don't keep a ghost edge to it.
-                if matches!(self.kg_backend, KgBackend::Age) {
-                    unproject_memory_from_age(&mut tx, id).await?;
-                }
+                // LEGACY disposition (sub-flag OFF). #9018 — archive-first,
+                // never a bare hard delete (sqlite twin: `archive_memory`).
+                let severed = self.archive_consolidate_source_in_tx(&mut tx, id).await?;
+                sever_anchor = sever_anchor.merge(severed);
             }
         }
 
-        tx.commit()
+        pg_commit_and_emit(tx, sever_anchor)
             .await
             .map_err(|e| to_store_err("consolidate commit", e))?;
         Ok(new_id)
