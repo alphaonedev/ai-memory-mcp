@@ -733,10 +733,15 @@ fn sign_manifest_if_keyed(manifest: &Manifest) -> Result<Option<(String, String)
         Ok(p) => p,
         Err(_) => return Ok(None),
     };
+    sign_manifest_in(manifest, &key_dir)
+}
+
+/// #8863 RED seam: [`sign_manifest_if_keyed`] against an explicit key dir.
+fn sign_manifest_in(manifest: &Manifest, key_dir: &Path) -> Result<Option<(String, String)>> {
     if !key_dir.exists() {
         return Ok(None);
     }
-    let entries = match kp_mod::list(&key_dir) {
+    let entries = match kp_mod::list(key_dir) {
         Ok(v) => v,
         Err(_) => return Ok(None),
     };
@@ -745,7 +750,7 @@ fn sign_manifest_if_keyed(manifest: &Manifest) -> Result<Option<(String, String)
     let mut candidates: Vec<String> = entries.into_iter().map(|kp| kp.agent_id).collect();
     candidates.sort();
     for agent_id in candidates {
-        if let Ok(kp) = kp_mod::load(&agent_id, &key_dir) {
+        if let Ok(kp) = kp_mod::load(&agent_id, key_dir) {
             if let Some(signing) = kp.private.as_ref() {
                 let bytes = canonical_signed_bytes(manifest);
                 let sig = signing.sign(&bytes);
@@ -1773,6 +1778,79 @@ mod tests {
             report.tampered_files.contains(&target_key),
             "verifier must name the tampered file; got {:?}",
             report.tampered_files
+        );
+    }
+
+    /// #8863: a manifest for the signing tests.
+    fn signing_manifest_8863() -> Manifest {
+        Manifest {
+            schema_version: 1,
+            memory_id: "mem-8863".into(),
+            generated_at: "2026-01-01T00:00:00Z".into(),
+            include_reflections: false,
+            include_transcripts: false,
+            files: Vec::new(),
+            signer_agent_id: None,
+            signature: None,
+        }
+    }
+
+    /// #8863: a key that sorts before the daemon key.
+    const FIRST_SORTED_AGENT_8863: &str = "aaa-first-session";
+
+    fn key_dir_with_8863(tmp: &TempDir, agents: &[&str]) -> PathBuf {
+        let dir = tmp.path().join("keys");
+        std::fs::create_dir_all(&dir).expect("key dir");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+                .expect("chmod key dir");
+        }
+        for agent in agents {
+            let kp = kp_mod::generate(agent).expect("generate");
+            kp_mod::save(&kp, &dir).expect("save");
+        }
+        dir
+    }
+
+    #[test]
+    fn manifest_signed_by_daemon_key_not_first_sorted_8863() {
+        let tmp = TempDir::new().expect("tmp");
+        let dir = key_dir_with_8863(
+            &tmp,
+            &[FIRST_SORTED_AGENT_8863, kp_mod::DAEMON_KEYPAIR_LABEL],
+        );
+        let manifest = signing_manifest_8863();
+        let (signer, sig_b64) = sign_manifest_in(&manifest, &dir)
+            .expect("sign")
+            .expect("daemon key present, manifest is signed");
+        assert_eq!(
+            signer,
+            kp_mod::DAEMON_KEYPAIR_LABEL,
+            "#8863: the first-sorted key must never sign a forensic manifest"
+        );
+        let daemon = kp_mod::load(kp_mod::DAEMON_KEYPAIR_LABEL, &dir).expect("load daemon");
+        let sig_bytes = STANDARD_NO_PAD.decode(sig_b64).expect("b64");
+        let sig_arr: [u8; ed25519_dalek::SIGNATURE_LENGTH] =
+            sig_bytes.as_slice().try_into().expect("sig len");
+        daemon
+            .public
+            .verify_strict(
+                &canonical_signed_bytes(&manifest),
+                &ed25519_dalek::Signature::from_bytes(&sig_arr),
+            )
+            .expect("#8863: signature verifies under the daemon public key");
+    }
+
+    #[test]
+    fn manifest_unsigned_when_only_other_agents_keys_exist_8863() {
+        let tmp = TempDir::new().expect("tmp");
+        let dir = key_dir_with_8863(&tmp, &[FIRST_SORTED_AGENT_8863]);
+        let signed = sign_manifest_in(&signing_manifest_8863(), &dir).expect("sign");
+        assert_eq!(
+            signed, None,
+            "#8863: another agent's session key must never be adopted as the bundle signer"
         );
     }
 
