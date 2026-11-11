@@ -106,7 +106,8 @@ fn stderr(o: &Output) -> String {
 
 /// What the binary must do once a Postgres URL is resolved: under `sal` only
 /// it refuses with the exact feature message (it never falls back to the
-/// local SQLite file); under `sal-postgres` it connects to the endpoint.
+/// local SQLite file); under `sal-postgres` the Postgres adapter takes it and
+/// its #3705 TLS floor refuses the fixture's `sslmode=disable`.
 fn assert_routed_to_postgres(out: &Output, listener: &RecordingListener, label: &str) {
     assert!(
         !out.status.success(),
@@ -124,12 +125,23 @@ fn assert_routed_to_postgres(out: &Output, listener: &RecordingListener, label: 
             stderr(out)
         );
     }
+    // Under `sal-postgres` the fixture URL (`sslmode=disable`) reaches the
+    // Postgres adapter, whose #3705 TLS floor refuses it before any socket
+    // opens: that refusal exists only on the Postgres path, so it proves the
+    // resolved URL was routed there and not to the local SQLite file.
     #[cfg(feature = "sal-postgres")]
-    assert!(
-        listener.connections() >= 1,
-        "#4600 {label}: the Postgres endpoint must be dialled; stderr: {}",
-        stderr(out)
-    );
+    {
+        assert!(
+            stderr(out).contains("#3705: refusing the PostgreSQL store DSN"),
+            "#4600 {label}: exact Postgres-adapter refusal; stderr: {}",
+            stderr(out)
+        );
+        assert_eq!(
+            listener.connections(),
+            0,
+            "#4600 {label}: the TLS floor refuses before any dial"
+        );
+    }
     let all = format!("{}{}", String::from_utf8_lossy(&out.stdout), stderr(out));
     assert!(
         !all.contains(FIXTURE_PASSWORD),
