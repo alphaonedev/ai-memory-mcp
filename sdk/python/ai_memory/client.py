@@ -13,8 +13,8 @@ See :class:`AsyncAiMemoryClient` for the asyncio counterpart.
 
 from __future__ import annotations
 
-from types import TracebackType
 from collections.abc import Iterator
+from types import TracebackType
 from typing import TYPE_CHECKING, Any
 
 import httpx
@@ -22,11 +22,12 @@ import httpx
 from ai_memory._common import (
     DEFAULT_BASE_URL,
     DEFAULT_EXPORT_PAGE_ROWS,
-    export_ceiling_from_error,
     DEFAULT_TIMEOUT,
+    VerifyArg,
     build_create_body,
     build_httpx_kwargs,
     encode_path_segment,
+    export_ceiling_from_error,
     handle_response,
     if_match_headers,
     prep_json,
@@ -66,12 +67,18 @@ class AiMemoryClient:
         agent_id: If provided, sent as ``X-Agent-Id`` so the server stamps
             this identity on stored memories (see docs/reference/ARCHITECTURE_REFERENCE.md §Agent Identity).
         timeout: Seconds before a request is aborted.
-        verify: ``httpx`` ``verify`` — path to server CA bundle or bool. A
-            zero-config daemon serves a certificate from the local CA it
-            wrote to ``<key_dir>/tls/local-ca.pem`` on first boot; pass that
-            path to verify it (#3782). Never ``False``.
-        cert: ``httpx`` ``cert`` — client cert for mTLS (path or
-            ``(cert, key)``).
+        verify: Trust for the daemon's certificate: ``None`` / ``True``
+            (``SSL_CERT_FILE``, ``SSL_CERT_DIR``, else ``certifi``), a CA
+            bundle or ``capath`` directory path, or a verifying
+            ``ssl.SSLContext`` / ``truststore.SSLContext``. The SDK copies
+            the CA material into its own frozen context and re-checks it
+            before every handshake (#6249 #6267 #6306). ``False`` and any
+            context with verification or hostname checking off raise
+            ``ValueError``. A zero-config daemon serves a certificate from
+            the local CA it wrote to ``<key_dir>/tls/local-ca.pem`` on first
+            boot; pass that path to verify it (#3782).
+        cert: Client certificate for mTLS (path or ``(cert, key)``), loaded
+            into the SDK's own TLS context.
         headers: Additional headers to send on every request.
     """
 
@@ -82,7 +89,7 @@ class AiMemoryClient:
         api_key: str | None = None,
         agent_id: str | None = None,
         timeout: float = DEFAULT_TIMEOUT,
-        verify: bool | str | None = None,
+        verify: VerifyArg = None,
         cert: str | tuple[str, str] | None = None,
         headers: dict[str, str] | None = None,
     ) -> None:

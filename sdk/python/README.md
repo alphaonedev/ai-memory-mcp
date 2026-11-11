@@ -42,9 +42,8 @@ so a client must be handed the CA explicitly:
 So on Linux, with no `AI_MEMORY_KEY_DIR` override, the file is
 `~/.config/ai-memory/keys/tls/local-ca.pem`.
 
-Pin it with the client's `verify=` option (the stock `httpx` parameter — it
-takes the PATH of a CA bundle). Both `AiMemoryClient` and
-`AsyncAiMemoryClient` accept it:
+Pin it with the client's `verify=` option (the PATH of a CA bundle). Both
+`AiMemoryClient` and `AsyncAiMemoryClient` accept it:
 
 ```python
 import os
@@ -61,13 +60,34 @@ with AiMemoryClient(base_url="https://localhost:9077", verify=str(ca)) as client
 
 `verify=` **replaces** the trust store with that bundle; verification stays
 full (chain + hostname — the daemon's leaf carries `localhost`, `127.0.0.1`,
-`::1` and the machine hostname as SANs). Never pass `verify=False`: that
-turns a TLS listener into an unauthenticated one. Two ways to avoid passing
-`verify=` per client:
+`::1` and the machine hostname as SANs).
 
-- install `local-ca.pem` into the OS trust store
-  (`update-ca-certificates`, `security add-trusted-cert`), or point
-  `SSL_CERT_FILE` at it;
+**The SDK never turns TLS verification off** (#6249 #6267 #6306). Whatever you
+pass, the client builds its own private, frozen TLS context, copies the CA
+certificates into it, and checks it again before every handshake. Accepted
+`verify=` forms:
+
+| `verify=` | Trust used |
+|---|---|
+| `None` / `True` (default) | `SSL_CERT_FILE`, else `SSL_CERT_DIR`, else the `certifi` bundle (the same order `httpx` uses) |
+| a `str` or `os.PathLike[str]` naming a PEM file | that bundle (a relative path is resolved when the client is built; at most 16 MiB) |
+| a `str` or `os.PathLike[str]` naming a directory | that OpenSSL `capath` directory |
+| an `ssl.SSLContext` with `CERT_REQUIRED` and `check_hostname` on | a copy of its CA certificates; later changes to your context do not reach the client |
+| a `truststore.SSLContext` with `CERT_REQUIRED` and `check_hostname` on | the platform trust store plus a copy of its CA certificates |
+
+Refused with `ValueError` when the client is built: `verify=False`, a context
+whose `verify_mode` is `CERT_NONE` or `CERT_OPTIONAL` or whose
+`check_hostname` is off, a context that asks for CRL checking, a context with no
+CA certificate the SDK can copy (certificates in a `capath` directory are
+loaded lazily and cannot be copied: pass the path instead), a CA path that is
+missing, unreadable, larger than 16 MiB or neither a file nor a directory, and
+any other type. Only the CA certificates and the minimum TLS version are copied
+from your context: put the client certificate in `cert=` (see mTLS below).
+
+Two ways to avoid passing `verify=` per client:
+
+- point `SSL_CERT_FILE` at `local-ca.pem`, or install it into the OS trust
+  store and pass `verify=truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)`;
 - run the daemon with an operator-supplied `--tls-cert`/`--tls-key` pair from
   a CA your hosts already trust, in which case no pinning is needed at all.
 
@@ -162,6 +182,9 @@ AiMemoryClient(
     cert=("/etc/ssl/client/client.pem", "/etc/ssl/client/client.key"),
 )
 ```
+
+`cert=` takes a certificate path or `(certificate, key)` (or
+`(certificate, key, password)`); it is loaded into the SDK's own TLS context.
 
 ### Agent identity (NHI)
 
