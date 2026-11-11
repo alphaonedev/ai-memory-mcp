@@ -103,6 +103,18 @@ pub fn merge_inbound_authorized(
                         stored_namespace: existing.namespace.clone(),
                     }));
                 }
+                // #9150 — a held (quarantined / contaminated) row is a merge
+                // barrier: the peer's LWW win must not swap content behind the
+                // hold. Read under this BEGIN IMMEDIATE lock; nothing written.
+                // The only yield is the #1948 route-OUT of a quarantine to a
+                // push THIS receiver verified, re-checked after the merge below.
+                let barrier = receiver_merge_barrier(conn, &existing.id, None)?;
+                if let Some(held) = barrier
+                    && !barrier_yields_to_verified_release(held, receiver_verified)
+                {
+                    trace_merge_barrier_drop(&existing.id, held);
+                    return Ok(Some(existing.id));
+                }
                 // #2123 — backend parity with `PostgresStore::merge_inbound`:
                 // the same-`id` field-merge path persists via
                 // `overwrite_full_row_by_id`, which (deliberately) bypasses
@@ -139,6 +151,13 @@ pub fn merge_inbound_authorized(
                 // #224 field-wise merge — the SAME pure reconciler the
                 // postgres adapter calls in Rust (no per-backend drift).
                 let merged = crate::models::merge_memory(&existing, &prepared);
+                // #9150 — a yielded quarantine releases the verified unit, not
+                // the LWW blend (which keeps the local `created_at`).
+                let merged = if barrier.is_some() {
+                    super::verified_release_candidate(&existing, &prepared, merged)
+                } else {
+                    merged
+                };
                 // #2863 — re-assert the receiver-VERIFIED `agent_attested` level
                 // ATOMICALLY (inside this BEGIN IMMEDIATE tx, before the
                 // content-sealing `overwrite_full_row_by_id`). `sanitize` above
@@ -154,6 +173,15 @@ pub fn merge_inbound_authorized(
                     inbound,
                     receiver_verified,
                 );
+                // #9150 — a yielded quarantine admits ONLY the exact signed
+                // unit this receiver verified; any other merge outcome (a
+                // stale or partially-merged row) stays behind the hold.
+                if let Some(held) = barrier
+                    && !crate::models::is_verified_signed_unit(&merged, inbound, receiver_verified)
+                {
+                    trace_merge_barrier_drop(&existing.id, held);
+                    return Ok(Some(existing.id));
+                }
                 overwrite_full_row_by_id(conn, &merged)?;
                 Ok(Some(merged.id))
             }

@@ -115,6 +115,8 @@ mod merge_inbound_4023;
 // restores / links) with the in-transaction peer-scope re-check. Own module:
 // postgres.rs is at its qual_10 budget.
 mod federation_by_id_4447;
+// #9147 — the receiver lifecycle merge barrier (own module: qual_10 budget).
+mod merge_barrier_9147;
 // v1.0.0 #3124 R4 — the audited `reown` sweep. Own module for the same
 // qual_10 budget reason as `parity_3064` above.
 mod governance_corrupt_4285;
@@ -8437,13 +8439,17 @@ impl PostgresStore {
         // Wave-2 B8 — sqlite `dequarantine` gates; this inner is reached
         // from the trait method AND from other pg callers (ERRORS-09).
         self.gate_record_stop().await?;
+        // #9150 — lift only a row whose stored attest level is
+        // `agent_attested` (sqlite twin: `crate::storage::dequarantine`).
         let res = sqlx::query(
             "UPDATE memories SET lifecycle_state = $1, updated_at = NOW(), version = version + 1 \
-             WHERE id = $2 AND lifecycle_state = $3",
+             WHERE id = $2 AND lifecycle_state = $3 AND metadata->>$4 = $5",
         )
         .bind(crate::models::LifecycleState::Open.as_str())
         .bind(id)
         .bind(crate::models::LifecycleState::Quarantined.as_str())
+        .bind(crate::models::field_names::ATTEST_LEVEL)
+        .bind(crate::identity::verify::AttestLevel::AgentAttested.as_str())
         .execute(&self.pool)
         .await
         .map_err(|e| to_store_err("dequarantine", e))?;
@@ -25174,6 +25180,25 @@ impl MemoryStore for PostgresStore {
             pg_probe_federation_merge_preimage(&mut tx, &memory.title, &memory.namespace)
                 .await
                 .map_err(|e| to_store_err("apply_remote_memory merge pre-image probe", e))?;
+        // #9147 / #9149 / #9150 — the receiver lifecycle merge barrier, read
+        // under the title-slot lock just taken: a tombstoned id (re-checked
+        // here, in-tx, after the pool pre-check above), an archived id with no
+        // live row, or a held (quarantined / contaminated) row at the id or
+        // the slot drops the inbound write (idempotent no-op, nothing written).
+        if let Some(barrier) = merge_barrier_9147::pg_receiver_merge_barrier(
+            &mut tx,
+            &memory.id,
+            Some((&memory.title, &memory.namespace)),
+        )
+        .await
+        .map_err(|e| to_store_err("apply_remote_memory merge barrier probe", e))?
+        {
+            crate::storage::trace_merge_barrier_drop(&memory.id, barrier);
+            tx.rollback()
+                .await
+                .map_err(|e| to_store_err("apply_remote_memory merge barrier rollback", e))?;
+            return Ok(memory.id.clone());
+        }
         // #4206 (the title-slot half of #1773 / #3961) — when the inbound row
         // wins the tiebreak AND its plaintext differs from the stored text,
         // snapshot the pre-merge row into `archived_memories`
@@ -41379,16 +41404,15 @@ mod tests {
             .expect("archive v1");
         assert_eq!(moved, 1);
 
-        // Re-seed the SAME id into `memories` with changed content (federation
-        // LWW insert preserves the id), then re-archive so the archive INSERT
-        // hits the ON CONFLICT (id) path.
+        // Re-seed the SAME id into `memories` with changed content through the
+        // LOCAL write path, then re-archive so the archive INSERT hits the ON
+        // CONFLICT (id) path. (#9149: the federation `merge_inbound` funnel now
+        // drops a push of an archived id, so it can no longer re-seed it.)
         let mut m2 = m1.clone();
         m2.content = "content-v2".to_string();
         m2.updated_at = (chrono::Utc::now() + chrono::Duration::seconds(5)).to_rfc3339();
-        store
-            .merge_inbound(&ctx, &m2, false)
-            .await
-            .expect("merge_inbound v2");
+        let reseeded = store.store(&ctx, &m2).await.expect("store v2");
+        assert_eq!(reseeded, id, "the local re-seed keeps the archived id");
 
         let moved = store
             .archive_by_ids(&ctx, &[id.clone()], Some("manual"))

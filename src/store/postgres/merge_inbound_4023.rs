@@ -122,6 +122,23 @@ impl PostgresStore {
                 ),
             });
         }
+        // #9150 — a held (quarantined / contaminated) row, or a tombstone /
+        // archived-only id, is a merge barrier: the peer's LWW win must not
+        // swap content behind it. Read under the `FOR UPDATE` lock above;
+        // nothing written (the transaction is rolled back on drop).
+        // The only yield is the #1948 route-OUT of a quarantine to a push
+        // THIS receiver verified, re-checked after the merge below.
+        let barrier =
+            super::merge_barrier_9147::pg_receiver_merge_barrier(&mut tx, &existing.id, None)
+                .await
+                .map_err(|e| to_store_err("merge_inbound merge barrier probe", e))?;
+        if let Some(held) = barrier
+            && !crate::storage::barrier_yields_to_verified_release(held, receiver_verified)
+        {
+            crate::storage::trace_merge_barrier_drop(&existing.id, held);
+            drop(tx);
+            return Ok(existing.id);
+        }
         // #1719 item 3a — neutralize the untrusted inbound's self-asserted
         // `metadata.attest_level` to `claimed` before merge (identical to
         // the sqlite `db::merge_inbound` boundary, no per-backend drift) so
@@ -138,6 +155,13 @@ impl PostgresStore {
             crate::identity::attest::ATTEST_CREATED_AT_SKEW_SECS,
         );
         let merged = crate::models::merge_memory(&existing, &prepared);
+        // #9150 — a yielded quarantine releases the verified unit, not the LWW
+        // blend (sqlite twin: `db::merge_inbound`).
+        let merged = if barrier.is_some() {
+            crate::storage::verified_release_candidate(&existing, &prepared, merged)
+        } else {
+            merged
+        };
         // #2863 — atomic `agent_attested` re-assert (postgres twin of the sqlite
         // `db::merge_inbound` path): `sanitize` above demoted the inbound level
         // to `claimed` for the LWW tiebreak, but that must not DEMOTE a level
@@ -149,6 +173,15 @@ impl PostgresStore {
         // `receiver_verified` is false.
         let merged =
             crate::models::reassert_verified_attestation(merged, inbound, receiver_verified);
+        // #9150 — a yielded quarantine admits ONLY the exact signed unit this
+        // receiver verified (sqlite twin: `db::merge_inbound`).
+        if let Some(held) = barrier
+            && !crate::models::is_verified_signed_unit(&merged, inbound, receiver_verified)
+        {
+            crate::storage::trace_merge_barrier_drop(&existing.id, held);
+            drop(tx);
+            return Ok(existing.id);
+        }
 
         // Encode the JSON-shaped columns the same way the
         // `apply_remote_memory` insert path does.

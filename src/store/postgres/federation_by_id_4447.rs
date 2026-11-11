@@ -241,16 +241,48 @@ impl PostgresStore {
                 });
             }
         }
+        // #9147 — the deletion reaches EVERY local copy of the id: lock the
+        // archived copy (re-authorized like the live one), so the purge below
+        // cannot be raced by a restore and an out-of-scope archived copy is
+        // refused, not erased.
+        let archived_ns: Option<(String,)> =
+            sqlx::query_as(SQL_ARCHIVED_NAMESPACE_BY_ID_FOR_UPDATE)
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("apply_remote_deletion archived lookup", e))?;
+        if let (Some(authorize), Some((stored_ns,))) = (authorize_stored, archived_ns.as_ref())
+            && !authorize(id, stored_ns)
+        {
+            drop(tx);
+            return Err(StoreError::PermissionDenied {
+                action: crate::store::FEDERATION_APPLY_DELETION.to_string(),
+                target: (id).to_string(),
+                reason: crate::storage::inbound_by_id_namespace_refused(
+                    crate::federation::receive_auth::LANE_DELETIONS,
+                    id,
+                    stored_ns,
+                ),
+            });
+        }
         let (rows, anchor) = pg_hard_delete_in_tx(&mut tx, id)
             .await
             .map_err(|e| to_store_err("apply_remote_deletion", e))?;
+        let purged = super::merge_barrier_9147::pg_purge_archived_copy_in_tx(
+            &mut tx,
+            id,
+            archived_ns.as_ref().map(|(ns,)| ns.as_str()),
+            rows > 0,
+        )
+        .await
+        .map_err(|e| to_store_err("apply_remote_deletion archived purge", e))?;
         crate::store::postgres::pg_commit_and_emit(tx, anchor)
             .await
             .map_err(|e| to_store_err("apply_remote_deletion commit tx", e))?;
         if rows > 0 {
             self.unproject_memory_ids_best_effort(&[id]).await;
         }
-        Ok(rows > 0)
+        Ok(rows > 0 || purged > 0)
     }
 
     pub(super) async fn archive_by_ids_inner(

@@ -1966,7 +1966,8 @@ impl MemoryStore for SqliteStore {
     async fn apply_remote_deletion(&self, _ctx: &CallerContext, id: &str) -> StoreResult<bool> {
         self.gate_record_stop()?;
         let conn = self.state.lock().await;
-        db::delete(&conn, id).map_err(box_err)
+        // #9147 — erase the archived copy too and tombstone the id.
+        db::federated_delete(&conn, id).map_err(box_err)
     }
 
     /// #4447 — in-transaction peer-scope re-check on the `deletions[]` lane.
@@ -6191,17 +6192,16 @@ mod tests {
             .expect("archive v1");
         assert_eq!(moved, 1);
 
-        // Re-seed the SAME id into `memories` with changed content (the
-        // federation LWW insert preserves the id), then re-archive so the
-        // archive INSERT hits the ON CONFLICT (id) path.
+        // Re-seed the SAME id into `memories` with changed content through the
+        // LOCAL write path, then re-archive so the archive INSERT hits the ON
+        // CONFLICT (id) path. (#9149: the federation `merge_inbound` funnel now
+        // drops a push of an archived id, so it can no longer re-seed it.)
         let mut m2 = m1.clone();
         m2.id = id.clone();
         m2.content = "content-v2".to_string();
         m2.updated_at = (chrono::Utc::now() + chrono::Duration::seconds(5)).to_rfc3339();
-        store
-            .merge_inbound(&ctx, &m2, false)
-            .await
-            .expect("merge_inbound v2");
+        let reseeded = store.store(&ctx, &m2).await.expect("store v2");
+        assert_eq!(reseeded, id, "the local re-seed keeps the archived id");
 
         let moved = store
             .archive_by_ids(&ctx, &[id.clone()], Some("manual"))

@@ -894,6 +894,14 @@ pub use merge_inbound_authorized_4023::{
 // by-id lanes (deletions / archives / restores / links). Own child module for
 // the same qual_10 reason as `merge_inbound_authorized_4023`.
 mod federation_by_id_4447;
+// #9147 / #9149 / #9150 — the receiver lifecycle merge barrier + the
+// archive-purging federated deletion (qual_10 split).
+mod merge_barrier_9147;
+pub use merge_barrier_9147::{
+    MERGE_BARRIER_TRACE_TARGET, ReceiverMergeBarrier, barrier_yields_to_verified_release,
+    dequarantine, federated_delete, receiver_merge_barrier, trace_merge_barrier_drop,
+    verified_release_candidate,
+};
 // #4206 — the title-slot pre-merge archive snapshot helpers (qual_10 split).
 mod title_slot_archive;
 pub use federation_by_id_4447::{
@@ -4174,38 +4182,6 @@ pub fn operator_dequarantine(conn: &mut Connection, id: &str, agent_id: &str) ->
     );
     crate::metrics::inc_operator_dequarantined();
     Ok(true)
-}
-
-/// v1.0.0 R19/A3 (#1948, decision `560c8007`) — system-only RAW dequarantine.
-///
-/// Clears a [`crate::models::LifecycleState::Quarantined`] row back to
-/// [`crate::models::LifecycleState::Open`] (per
-/// [`crate::models::LifecycleState::dequarantine_target`]) via a raw UPDATE
-/// that BYPASSES the [`set_lifecycle_state`] transition gate — `Quarantined`
-/// is terminal + absent from `can_transition_to`, so the ordinary caller path
-/// can neither reach nor leave it. The `WHERE lifecycle_state = 'quarantined'`
-/// guard makes this idempotent and a strict no-op on any non-quarantined row.
-///
-/// This is the shared route-OUT primitive for BOTH dequarantine-on-attest
-/// (the federation receive-attestation upgrade path) and operator
-/// dequarantine. Returns `true` when a quarantined row was cleared.
-///
-/// # Errors
-/// Propagates the `rusqlite` update error.
-pub fn dequarantine(conn: &Connection, id: &str) -> Result<bool> {
-    crate::storage::record_stop::gate_storage_conn(conn)?;
-    let now = Utc::now().to_rfc3339();
-    let n = conn.execute(
-        "UPDATE memories SET lifecycle_state = ?1, updated_at = ?2, version = version + 1 \
-         WHERE id = ?3 AND lifecycle_state = ?4",
-        params![
-            crate::models::LifecycleState::Open.as_str(),
-            now,
-            id,
-            crate::models::LifecycleState::Quarantined.as_str(),
-        ],
-    )?;
-    Ok(n > 0)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -18551,6 +18527,16 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
         None
     };
     let sealed_merge = (|| -> Result<String> {
+        // #9147 / #9149 / #9150 — receiver merge barrier, read under the write
+        // lock: a tombstoned id, an archived id with no live row, or a held
+        // (quarantined / contaminated) row on the id or the title slot is
+        // never overwritten or re-inserted by an inbound row.
+        if let Some(barrier) =
+            receiver_merge_barrier(conn, &mem.id, Some((&mem.title, &mem.namespace)))?
+        {
+            trace_merge_barrier_drop(&mem.id, barrier);
+            return Ok(mem.id.clone());
+        }
         // #2954 / #4206 — pre-image of the `(title, namespace)` row this upsert
         // may overwrite (`None` when no live row holds the slot). Read under the
         // `BEGIN IMMEDIATE` write lock above so it cannot race the upsert whose
@@ -35113,6 +35099,21 @@ mod tests {
     fn dequarantine_clears_only_quarantined_rows() {
         let conn = test_db();
         let (open_id, tomb, quar) = seed_lifecycle_corpus(&conn, "ns/deq");
+        // #9150 — a quarantined row whose bytes this node never verified
+        // (no stored `agent_attested` level) is NOT lifted by route-OUT.
+        assert!(
+            !dequarantine(&conn, &quar).unwrap(),
+            "#9150: an unattested quarantined row must stay held"
+        );
+        conn.execute(
+            "UPDATE memories SET metadata = json_set(metadata, '$.attest_level', ?2) \
+             WHERE id = ?1",
+            rusqlite::params![
+                quar,
+                crate::identity::verify::AttestLevel::AgentAttested.as_str()
+            ],
+        )
+        .unwrap();
         // Quarantined → Open, idempotent, and returns true once.
         assert!(
             dequarantine(&conn, &quar).unwrap(),

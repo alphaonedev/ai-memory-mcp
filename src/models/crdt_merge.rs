@@ -192,7 +192,7 @@ pub fn reassert_verified_attestation(
     verified_inbound: &Memory,
     receiver_verified: bool,
 ) -> Memory {
-    if receiver_verified && signed_surface_matches(&merged, verified_inbound) {
+    if is_verified_signed_unit(&merged, verified_inbound, receiver_verified) {
         if let Some(obj) = merged.metadata.as_object_mut() {
             obj.insert(
                 field_names::ATTEST_LEVEL.to_string(),
@@ -201,6 +201,19 @@ pub fn reassert_verified_attestation(
         }
     }
     merged
+}
+
+/// #2863 / #9150 — is `merged` the exact signed unit THIS receiver verified
+/// (`receiver_verified` and a byte-identical signed surface)? The #1948
+/// route-OUT release of a quarantine admits only such a row through the
+/// receiver merge barrier (`crate::storage::receiver_merge_barrier`).
+#[must_use]
+pub fn is_verified_signed_unit(
+    merged: &Memory,
+    verified_inbound: &Memory,
+    receiver_verified: bool,
+) -> bool {
+    receiver_verified && signed_surface_matches(merged, verified_inbound)
 }
 
 /// #2863 — do two rows carry a byte-identical 6-field `SignableWrite` surface
