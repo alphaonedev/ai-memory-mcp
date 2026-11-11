@@ -1786,6 +1786,14 @@ or hidden sources refuse before bundle/resource registration or promotion audit.
 PostgreSQL promotion remains 501 (#3183); its allowed path is not applicable until
 #2804. Unscoped substrate namespaces remain excluded.
 
+`GET /api/v1/skill/{id}` and `GET /api/v1/skill/{id}/resource` verify the
+skill digest, every resource digest and the stored signature on each read
+(#8834) and render a closed vocabulary only: `404` for `skill not found: <id>`
+or `resource not found: skill_id=<id> path=<path>`, `400` for a verify-on-read
+failure (`skill integrity check failed: ...`, see
+[`agent-skills.md`](agent-skills.html#ed25519-attestation)) or a reference-only
+resource, and the sanitized `500` for anything else (#1261).
+
 
 HTTP `POST /api/v1/capture_turn` uses the HTTP-direct attestation posture (#3406): unsigned requests are refused with `403 ATTESTATION_FAILED` by default; `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0` or `false` explicitly permits them and emits an audit admission event. A presented host signature must verify against the L4 host-key allowlist **and** the resolved caller's bound public key, on both SQLite and PostgreSQL; the opt-out never relaxes these checks. The legacy envelope signs only `host_session_id`, `host_turn_index`, `role`, and `content` (NUL-separated), so it remains `signed_by_peer`, never `agent_attested`: identity, namespace, and timestamp are not signed fields. Durable `(session, turn)` deduplication makes repeats idempotent (`200`, the original memory ID, no new write); the 600-second `SignableWrite` replay ledger does not apply. MCP capture behavior is unchanged. A fully bound capture envelope is tracked separately in #3575.
 

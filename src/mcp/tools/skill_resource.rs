@@ -3,13 +3,14 @@
 
 //! MCP `memory_skill_resource` handler (L1-5 Agent Skills substrate).
 //!
-//! Returns the decompressed content of a `skill_resources` row,
-//! verifying the SHA-256 digest on the way out. Returns an error if
-//! the digest does not match (data corruption / tampering).
+//! Returns the decompressed content of a `skill_resources` row. #8834: the
+//! row is served only through the verified skill read path
+//! ([`super::skill_integrity::load_verified_skill`]), so the resource digest,
+//! every sibling resource digest, the skill digest and any signature are all
+//! checked on every fetch, and #8832's scope binding gates the caller.
 
 use rusqlite::Connection;
 use serde_json::{Value, json};
-use sha2::{Digest as _, Sha256};
 
 /// MCP `memory_skill_resource` substrate handler.
 ///
@@ -17,11 +18,19 @@ use sha2::{Digest as _, Sha256};
 /// CLI `ai-memory skill resource` and HTTP routes can dispatch into
 /// the same implementation.
 ///
+/// #8832 — `read_caller` is the resolved read principal (MCP:
+/// `Authority::read_caller`; CLI: the process identity). `None` is the
+/// single-operator / admin-gated posture and reads every skill.
+///
 /// # Errors
 /// Returns a substrate error string when `skill_id` / `resource_path`
-/// are missing, the row is not found, zstd decompression fails, or
-/// the SHA-256 digest mismatches the stored digest (tampering check).
-pub fn handle_skill_resource(conn: &Connection, params: &Value) -> Result<Value, String> {
+/// are missing, the skill or row is not found (or not visible), zstd
+/// decompression fails, or any integrity check fails (#8834).
+pub fn handle_skill_resource(
+    conn: &Connection,
+    params: &Value,
+    read_caller: Option<&str>,
+) -> Result<Value, String> {
     let skill_id = params["skill_id"]
         .as_str()
         .filter(|s| !s.is_empty())
@@ -30,72 +39,42 @@ pub fn handle_skill_resource(conn: &Connection, params: &Value) -> Result<Value,
     let resource_path = params[crate::models::field_names::RESOURCE_PATH]
         .as_str()
         .filter(|s| !s.is_empty())
-        .ok_or("memory_skill_resource requires 'resource_path'")?;
+        .ok_or(crate::errors::msg::SKILL_RESOURCE_PATH_REQUIRED)?;
 
-    let row: Option<(String, Option<Vec<u8>>, Option<Vec<u8>>)> = conn
-        .query_row(
-            "SELECT resource_kind, content_blob, digest \
-             FROM skill_resources \
-             WHERE skill_id = ?1 AND resource_path = ?2",
-            [skill_id, resource_path],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .ok();
-
-    let Some((kind, content_blob_opt, stored_digest_opt)) = row else {
-        return Err(format!(
-            "resource not found: skill_id={skill_id} path={resource_path}"
+    let skill = super::skill_integrity::load_verified_skill(conn, skill_id, read_caller)?;
+    let Some(resource) = skill
+        .resources
+        .into_iter()
+        .find(|r| r.path == resource_path)
+    else {
+        return Err(crate::errors::msg::skill_resource_not_found(
+            skill_id,
+            resource_path,
         ));
     };
 
-    let content_blob = content_blob_opt.ok_or_else(|| {
-        format!("resource '{resource_path}' has no inline content (reference-only)")
-    })?;
-
-    // Decompress. #1933 — bounded streaming decode so a hostile
-    // `skill_resources.content_blob` that decodes to gigabytes cannot OOM
-    // the daemon (same anti-bomb ceiling as the transcript path).
-    let content_bytes = crate::mcp::skill_zstd::decode_all_bounded(content_blob.as_slice())
-        .map_err(|e| format!("zstd decompress resource: {e}"))?;
-
-    // Verify digest.
-    if let Some(ref stored_digest) = stored_digest_opt {
-        let mut hasher = Sha256::new();
-        hasher.update(&content_bytes);
-        let computed: Vec<u8> = hasher.finalize().to_vec();
-        if computed != *stored_digest {
-            return Err(format!(
-                "digest mismatch for resource '{resource_path}' in skill '{skill_id}': \
-                 stored={} computed={}",
-                hex_encode(stored_digest),
-                hex_encode(&computed),
-            ));
-        }
-    }
+    let content_bytes = resource
+        .content
+        .ok_or_else(|| crate::errors::msg::skill_resource_reference_only(resource_path))?;
 
     // Return as UTF-8 text if possible, else base64.
-    let (content_value, encoding) = match String::from_utf8(content_bytes.clone()) {
+    let (content_value, encoding) = match String::from_utf8(content_bytes) {
         Ok(text) => (json!(text), "utf-8"),
-        Err(_) => {
+        Err(err) => {
             use base64::Engine as _;
-            let b64 = base64::engine::general_purpose::STANDARD.encode(&content_bytes);
+            let b64 = base64::engine::general_purpose::STANDARD.encode(err.as_bytes());
             (json!(b64), "base64")
         }
     };
 
-    let digest_hex = stored_digest_opt
-        .as_ref()
-        .map(|d| hex_encode(d))
-        .unwrap_or_default();
-
     Ok(json!({
         "skill_id": skill_id,
         (crate::models::field_names::RESOURCE_PATH): resource_path,
-        "resource_kind": kind,
+        "resource_kind": resource.kind,
         "content": content_value,
         "encoding": encoding,
-        "digest": digest_hex,
-        "digest_verified": stored_digest_opt.is_some(),
+        "digest": hex_encode(&resource.digest),
+        "digest_verified": true,
     }))
 }
 
@@ -173,6 +152,13 @@ mod d1_5_986_tests {
 mod tests {
     use super::*;
     use rusqlite::params;
+    use sha2::Digest as _;
+
+    /// #8834 — recompute the hand-inserted fixture's digests so the verified
+    /// read path serves it.
+    fn reseal(conn: &rusqlite::Connection, id: &str) {
+        crate::mcp::reseal_skill_digest_for_tests(conn, id).expect("reseal");
+    }
 
     fn open_db() -> rusqlite::Connection {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -214,30 +200,32 @@ mod tests {
     #[test]
     fn rejects_missing_skill_id() {
         let conn = open_db();
-        let err = handle_skill_resource(&conn, &json!({"resource_path": "x"})).unwrap_err();
+        let err = handle_skill_resource(&conn, &json!({"resource_path": "x"}), None).unwrap_err();
         assert!(err.contains("requires 'skill_id'"));
     }
 
     #[test]
     fn rejects_empty_skill_id() {
         let conn = open_db();
-        let err = handle_skill_resource(&conn, &json!({"skill_id": "", "resource_path": "x"}))
-            .unwrap_err();
+        let err =
+            handle_skill_resource(&conn, &json!({"skill_id": "", "resource_path": "x"}), None)
+                .unwrap_err();
         assert!(err.contains("requires 'skill_id'"));
     }
 
     #[test]
     fn rejects_missing_resource_path() {
         let conn = open_db();
-        let err = handle_skill_resource(&conn, &json!({"skill_id": "sk"})).unwrap_err();
+        let err = handle_skill_resource(&conn, &json!({"skill_id": "sk"}), None).unwrap_err();
         assert!(err.contains("requires 'resource_path'"));
     }
 
     #[test]
     fn rejects_empty_resource_path() {
         let conn = open_db();
-        let err = handle_skill_resource(&conn, &json!({"skill_id": "sk", "resource_path": ""}))
-            .unwrap_err();
+        let err =
+            handle_skill_resource(&conn, &json!({"skill_id": "sk", "resource_path": ""}), None)
+                .unwrap_err();
         assert!(err.contains("requires 'resource_path'"));
     }
 
@@ -245,9 +233,11 @@ mod tests {
     fn returns_not_found_for_missing_resource() {
         let conn = open_db();
         insert_min_skill(&conn, "sk1");
+        reseal(&conn, "sk1");
         let err = handle_skill_resource(
             &conn,
             &json!({"skill_id": "sk1", "resource_path": "no-such.sh"}),
+            None,
         )
         .unwrap_err();
         assert!(err.contains("resource not found"));
@@ -266,9 +256,11 @@ mod tests {
             [],
         )
         .unwrap();
+        reseal(&conn, "sk1");
         let err = handle_skill_resource(
             &conn,
             &json!({"skill_id": "sk1", "resource_path": "ref.md"}),
+            None,
         )
         .unwrap_err();
         assert!(err.contains("no inline content"));
@@ -290,10 +282,12 @@ mod tests {
             content,
             Some(&dig),
         );
+        reseal(&conn, "sk1");
 
         let v = handle_skill_resource(
             &conn,
             &json!({"skill_id": "sk1", "resource_path": "scripts/run.sh"}),
+            None,
         )
         .unwrap();
         assert_eq!(v["skill_id"], json!("sk1"));
@@ -316,10 +310,12 @@ mod tests {
         h.update(&content);
         let dig: Vec<u8> = h.finalize().to_vec();
         insert_resource(&conn, "sk1", "asset.bin", "asset", &content, Some(&dig));
+        reseal(&conn, "sk1");
 
         let v = handle_skill_resource(
             &conn,
             &json!({"skill_id": "sk1", "resource_path": "asset.bin"}),
+            None,
         )
         .unwrap();
         assert_eq!(v["encoding"], json!("base64"));
@@ -339,26 +335,37 @@ mod tests {
         let wrong_dig = vec![0u8; 32]; // wrong digest
         insert_resource(&conn, "sk1", "x.txt", "asset", content, Some(&wrong_dig));
 
-        let err =
-            handle_skill_resource(&conn, &json!({"skill_id": "sk1", "resource_path": "x.txt"}))
-                .unwrap_err();
-        assert!(err.contains("digest mismatch"));
-        assert!(err.contains("stored="));
-        assert!(err.contains("computed="));
+        let err = handle_skill_resource(
+            &conn,
+            &json!({"skill_id": "sk1", "resource_path": "x.txt"}),
+            None,
+        )
+        .unwrap_err();
+        // #8834 — exact, fail-closed; no stored/computed digest disclosure.
+        assert_eq!(
+            err,
+            crate::errors::msg::skill_resource_digest_mismatch("x.txt", "sk1")
+        );
     }
 
     #[test]
-    fn no_digest_returns_unverified() {
+    fn no_digest_fails_closed_8834() {
+        // #8834 — pre-fix a NULL digest served the content unverified.
         let conn = open_db();
         insert_min_skill(&conn, "sk1");
         let content = b"unsigned content";
         insert_resource(&conn, "sk1", "u.txt", "asset", content, None);
 
-        let v = handle_skill_resource(&conn, &json!({"skill_id": "sk1", "resource_path": "u.txt"}))
-            .unwrap();
-        assert_eq!(v["digest_verified"], json!(false));
-        assert_eq!(v["digest"], json!(""));
-        assert_eq!(v["content"].as_str().unwrap(), "unsigned content");
+        let err = handle_skill_resource(
+            &conn,
+            &json!({"skill_id": "sk1", "resource_path": "u.txt"}),
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            crate::errors::msg::skill_resource_digest_missing("u.txt", "sk1")
+        );
     }
 
     #[test]
@@ -368,13 +375,14 @@ mod tests {
         let bogus: Vec<u8> = vec![0xff, 0xff, 0xff, 0xff];
         conn.execute(
             "INSERT INTO skill_resources (skill_id, resource_path, resource_kind, content_blob, digest) \
-             VALUES ('sk1', 'bad.bin', 'asset', ?1, NULL)",
+             VALUES ('sk1', 'bad.bin', 'asset', ?1, zeroblob(32))",
             params![bogus],
         )
         .unwrap();
         let err = handle_skill_resource(
             &conn,
             &json!({"skill_id": "sk1", "resource_path": "bad.bin"}),
+            None,
         )
         .unwrap_err();
         assert!(err.contains("zstd decompress resource"));

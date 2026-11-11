@@ -222,16 +222,18 @@ pub(super) fn register_core(
     resources: &[(String, String, Vec<u8>)], // (path, kind, content)
     active_keypair: Option<&AgentKeypair>,
 ) -> Result<RegisterResult, String> {
-    // Build canonical frontmatter JSON for digest computation.
-    let canonical_fm = serde_json::to_vec(&json!({
-        "namespace": namespace,
-        "name": name,
-        (field_names::DESCRIPTION): description,
-        "license": license,
-        (field_names::COMPATIBILITY): compatibility,
-        (field_names::ALLOWED_TOOLS): allowed_tools,
-    }))
-    .map_err(|e| format!("frontmatter JSON error: {e}"))?;
+    // Build canonical frontmatter JSON for digest computation. #8832 — the
+    // single canonical encoder the verified read path recomputes with, so a
+    // `_visibility` scope binding in `metadata` is sealed into the digest.
+    let canonical_fm = super::skill_integrity::canonical_frontmatter(
+        namespace,
+        name,
+        description,
+        license,
+        compatibility,
+        allowed_tools,
+        metadata,
+    )?;
 
     let digest = compute_skill_digest(&canonical_fm, body_bytes, resource_digests);
 

@@ -448,7 +448,9 @@ fn run_list(conn: &rusqlite::Connection, args: &ListArgs, out: &mut CliOutput<'_
     if args.include_retired {
         params[field_names::INCLUDE_RETIRED] = json!(true);
     }
-    match crate::mcp::handle_skill_list(conn, &params) {
+    // #8832 — the same CLI read-visibility caller `skill compose` uses.
+    let vis_caller = crate::identity::resolve_read_visibility_caller();
+    match crate::mcp::handle_skill_list(conn, &params, vis_caller.as_deref()) {
         Ok(v) => {
             if args.json {
                 emit_json(out, &v)?;
@@ -476,7 +478,9 @@ fn run_list(conn: &rusqlite::Connection, args: &ListArgs, out: &mut CliOutput<'_
 
 fn run_get(conn: &rusqlite::Connection, args: &GetArgs, out: &mut CliOutput<'_>) -> Result<i32> {
     let params = json!({ "skill_id": args.id });
-    match crate::mcp::handle_skill_get(conn, &params) {
+    // #8832 — the same CLI read-visibility caller `skill compose` uses.
+    let vis_caller = crate::identity::resolve_read_visibility_caller();
+    match crate::mcp::handle_skill_get(conn, &params, vis_caller.as_deref()) {
         Ok(v) => {
             if args.json {
                 emit_json(out, &v)?;
@@ -505,7 +509,9 @@ fn run_resource(
         "skill_id": args.id,
         (field_names::RESOURCE_PATH): args.path,
     });
-    match crate::mcp::handle_skill_resource(conn, &params) {
+    // #8832 — the same CLI read-visibility caller `skill compose` uses.
+    let vis_caller = crate::identity::resolve_read_visibility_caller();
+    match crate::mcp::handle_skill_resource(conn, &params, vis_caller.as_deref()) {
         Ok(v) => {
             if args.json {
                 emit_json(out, &v)?;
@@ -538,7 +544,10 @@ fn run_export(
     // #3357 — the store path anchors the default export jail root
     // (`<db parent>/skills-export`); an operator exporting elsewhere sets
     // AI_MEMORY_SKILLS_EXPORT_ROOT.
-    match crate::mcp::handle_skill_export(conn, db_path, &params, active_keypair) {
+    // #8832 — the same CLI read-visibility caller `skill compose` uses.
+    let vis_caller = crate::identity::resolve_read_visibility_caller();
+    let caller = vis_caller.as_deref();
+    match crate::mcp::handle_skill_export(conn, db_path, &params, active_keypair, caller) {
         Ok(v) => {
             if args.json {
                 emit_json(out, &v)?;

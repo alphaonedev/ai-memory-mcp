@@ -368,7 +368,7 @@ async fn http_export_escape_matches_mcp_byte_for_byte_3762() {
     let mcp_err = {
         let db = app.db.lock().await;
         let store_path = db.1.clone();
-        ai_memory::mcp::handle_skill_export(&db.0, &store_path, &params, None)
+        ai_memory::mcp::handle_skill_export(&db.0, &store_path, &params, None, None)
             .expect_err("an out-of-root export must be refused")
     };
     let resp = ai_memory::handlers::skill_export_route(

@@ -186,7 +186,7 @@ pub async fn skill_list_route(
         params[field_names::INCLUDE_RETIRED] = json!(ir);
     }
     let lock = app.db.lock().await;
-    match crate::mcp::handle_skill_list(&lock.0, &params) {
+    match crate::mcp::handle_skill_list(&lock.0, &params, None) {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(e) => {
             // #1261 — never forward the raw substrate error (often a
@@ -227,30 +227,127 @@ pub async fn skill_get_route(
     }
     let params = json!({"skill_id": id});
     let lock = app.db.lock().await;
-    match crate::mcp::handle_skill_get(&lock.0, &params) {
+    match crate::mcp::handle_skill_get(&lock.0, &params, None) {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
-        Err(e) => {
-            // Substrate uses a "skill not found:" prefix for the missing
-            // case; surface that as 404. Everything else is 500.
-            if e.starts_with(crate::errors::msg::SKILL_NOT_FOUND) {
-                (StatusCode::NOT_FOUND, Json(json!({"error": e}))).into_response()
-            } else {
-                // #1261 — never forward the raw substrate error (often
-                // a `rusqlite::Error` string carrying SQL fragments) on
-                // the HTTP wire. Log the raw text; emit a generic
-                // "internal server error" to the caller.
-                tracing::error!(
-                    target: SKILLS_TRACE_TARGET,
-                    error = %e,
-                    "skill_get_route: substrate error (sanitized for wire response, #1261)"
-                );
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": crate::errors::msg::INTERNAL_SERVER_ERROR})),
-                )
-                    .into_response()
+        Err(e) => skill_read_error_response("skill_get_route", &e, &id, None),
+    }
+}
+
+/// v1.0.0 #8834 — the closed-vocabulary error mapper of the skill read
+/// routes (`GET /skill/{id}` and `GET /skill/{id}/resource`).
+///
+/// The substrate error `e` is NEVER rendered. It is only compared against
+/// the text our own builders produce for this request's `skill_id` (and
+/// resource path); the wire body is then rebuilt from those builders, so
+/// nothing the store returned (SQL fragments, a decoder message, a stored
+/// resource path) reaches the caller. A verify-on-read failure is the
+/// caller's 400 (the stored row is not servable); anything outside the
+/// vocabulary is logged and returned as the #1261 sanitized 500.
+fn skill_read_error_response(
+    route: &'static str,
+    e: &str,
+    skill_id: &str,
+    resource_path: Option<&str>,
+) -> axum::response::Response {
+    use crate::errors::msg;
+    let (status, text) = match SkillReadError::classify(e, skill_id, resource_path) {
+        SkillReadError::NotFound => (StatusCode::NOT_FOUND, msg::skill_not_found(skill_id)),
+        SkillReadError::DigestMismatch => (
+            StatusCode::BAD_REQUEST,
+            msg::skill_digest_mismatch(skill_id),
+        ),
+        SkillReadError::SignatureInvalid => (
+            StatusCode::BAD_REQUEST,
+            msg::skill_signature_invalid(skill_id),
+        ),
+        SkillReadError::SignerKeyUnavailable => (
+            StatusCode::BAD_REQUEST,
+            msg::skill_signer_key_unavailable(skill_id),
+        ),
+        // A resource-level failure names a stored resource path; render the
+        // fixed skill-level text instead of echoing the stored bytes.
+        SkillReadError::ResourceIntegrity => (
+            StatusCode::BAD_REQUEST,
+            msg::skill_integrity_failed(skill_id),
+        ),
+        SkillReadError::ResourcePathRequired => (
+            StatusCode::BAD_REQUEST,
+            msg::SKILL_RESOURCE_PATH_REQUIRED.to_string(),
+        ),
+        SkillReadError::ResourceNotFound(path) => (
+            StatusCode::NOT_FOUND,
+            msg::skill_resource_not_found(skill_id, path),
+        ),
+        SkillReadError::ResourceReferenceOnly(path) => (
+            StatusCode::BAD_REQUEST,
+            msg::skill_resource_reference_only(path),
+        ),
+        SkillReadError::Internal => {
+            // #1261 — never forward the raw substrate error (often a
+            // `rusqlite::Error` string carrying SQL fragments) on the HTTP
+            // wire. Log the raw text; emit a generic error to the caller.
+            tracing::error!(
+                target: SKILLS_TRACE_TARGET,
+                route,
+                error = %e,
+                "skill read route: substrate error (sanitized for wire response, #1261)"
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                msg::INTERNAL_SERVER_ERROR.to_string(),
+            )
+        }
+    };
+    (status, Json(json!({"error": text}))).into_response()
+}
+
+/// The closed vocabulary of [`skill_read_error_response`]. A resource-path
+/// variant borrows the CALLER's request path, never the store's text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SkillReadError<'a> {
+    NotFound,
+    DigestMismatch,
+    SignatureInvalid,
+    SignerKeyUnavailable,
+    ResourceIntegrity,
+    ResourcePathRequired,
+    ResourceNotFound(&'a str),
+    ResourceReferenceOnly(&'a str),
+    Internal,
+}
+
+impl<'a> SkillReadError<'a> {
+    /// Classify `e` by exact comparison with our own builders' text for this
+    /// request; only the integrity family is matched by its fixed prefix.
+    fn classify(e: &str, skill_id: &str, resource_path: Option<&'a str>) -> Self {
+        use crate::errors::msg;
+        if e == msg::skill_not_found(skill_id) {
+            return Self::NotFound;
+        }
+        if e == msg::skill_digest_mismatch(skill_id) {
+            return Self::DigestMismatch;
+        }
+        if e == msg::skill_signature_invalid(skill_id) {
+            return Self::SignatureInvalid;
+        }
+        if e == msg::skill_signer_key_unavailable(skill_id) {
+            return Self::SignerKeyUnavailable;
+        }
+        if e.starts_with(msg::SKILL_INTEGRITY_FAILED) {
+            return Self::ResourceIntegrity;
+        }
+        if e == msg::SKILL_RESOURCE_PATH_REQUIRED {
+            return Self::ResourcePathRequired;
+        }
+        if let Some(path) = resource_path {
+            if e == msg::skill_resource_not_found(skill_id, path) {
+                return Self::ResourceNotFound(path);
+            }
+            if e == msg::skill_resource_reference_only(path) {
+                return Self::ResourceReferenceOnly(path);
             }
         }
+        Self::Internal
     }
 }
 
@@ -282,18 +379,12 @@ pub async fn skill_resource_route(
     }
     let params = json!({
         "skill_id": id,
-        (field_names::RESOURCE_PATH): q.path,
+        (field_names::RESOURCE_PATH): &q.path,
     });
     let lock = app.db.lock().await;
-    match crate::mcp::handle_skill_resource(&lock.0, &params) {
+    match crate::mcp::handle_skill_resource(&lock.0, &params, None) {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
-        Err(e) => {
-            if e.starts_with("resource not found") {
-                (StatusCode::NOT_FOUND, Json(json!({"error": e}))).into_response()
-            } else {
-                (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response()
-            }
-        }
+        Err(e) => skill_read_error_response("skill_resource_route", &e, &id, Some(&q.path)),
     }
 }
 
@@ -339,7 +430,7 @@ pub async fn skill_export_route(
     // #3762 — the `Err` text below is the renderer's closed vocabulary
     // forwarded verbatim (byte-identical with the MCP surface); see the
     // register route above.
-    match crate::mcp::handle_skill_export(&lock.0, &lock.1, &params, kp) {
+    match crate::mcp::handle_skill_export(&lock.0, &lock.1, &params, kp, None) {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(e) => {
             if e.starts_with(crate::errors::msg::SKILL_NOT_FOUND) {
@@ -826,5 +917,70 @@ mod promote_status_4622_tests {
         let mapped = MemoryError::from(anyhow::Error::new(ReflectionNotFound::new("z")));
         assert!(matches!(&mapped, MemoryError::Refused(m) if m == "reflection not found: z"));
         assert_eq!(mapped.code(), "REFUSED");
+    }
+}
+
+#[cfg(test)]
+mod skill_read_error_8834_tests {
+    use super::SkillReadError;
+    use crate::errors::msg;
+
+    const ID: &str = "sk-8834";
+    const PATH: &str = "scripts/run.py";
+
+    #[test]
+    fn classify_maps_only_own_builder_text_8834() {
+        let cases: [(String, Option<&str>, SkillReadError<'_>); 9] = [
+            (msg::skill_not_found(ID), None, SkillReadError::NotFound),
+            (
+                msg::skill_digest_mismatch(ID),
+                None,
+                SkillReadError::DigestMismatch,
+            ),
+            (
+                msg::skill_signature_invalid(ID),
+                None,
+                SkillReadError::SignatureInvalid,
+            ),
+            (
+                msg::skill_signer_key_unavailable(ID),
+                None,
+                SkillReadError::SignerKeyUnavailable,
+            ),
+            (
+                msg::skill_resource_digest_mismatch("stored/other", ID),
+                None,
+                SkillReadError::ResourceIntegrity,
+            ),
+            (
+                msg::SKILL_RESOURCE_PATH_REQUIRED.to_string(),
+                Some(""),
+                SkillReadError::ResourcePathRequired,
+            ),
+            (
+                msg::skill_resource_not_found(ID, PATH),
+                Some(PATH),
+                SkillReadError::ResourceNotFound(PATH),
+            ),
+            (
+                msg::skill_resource_reference_only(PATH),
+                Some(PATH),
+                SkillReadError::ResourceReferenceOnly(PATH),
+            ),
+            // A raw store error, and own text for a DIFFERENT skill id, are
+            // outside the vocabulary: the sanitized 500.
+            (
+                "near \"SELECT\": syntax error in skills".to_string(),
+                Some(PATH),
+                SkillReadError::Internal,
+            ),
+        ];
+        for (e, path, want) in cases {
+            assert_eq!(SkillReadError::classify(&e, ID, path), want, "e={e}");
+        }
+        assert_eq!(
+            SkillReadError::classify(&msg::skill_not_found("sk-other"), ID, None),
+            SkillReadError::Internal
+        );
     }
 }

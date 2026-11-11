@@ -278,10 +278,34 @@ signature) carry `attest_level = "unsigned"` and the signature
 column is empty — verification surfaces this honestly rather than
 silently passing.
 
-Verification on read is **always-on**: `memory_skill_resource`
-re-derives the resource's SHA-256 digest and compares to the
-recorded value before returning the decompressed bytes. Mismatch is
-an error, never a quiet fallback.
+Verification on read is **always-on and single-funnel** (v1.0.0
+#8834): every read path (`memory_skill_get`, `memory_skill_list`,
+`memory_skill_resource`, `memory_skill_export`,
+`memory_skill_compositional_context`, the CLI twins and the HTTP
+routes) loads the row through one verified reader that re-derives
+each resource digest and the skill digest, and checks the stored
+signature over the digest. Failures are fail-closed and exact:
+`skill integrity check failed: digest mismatch for skill <id>`,
+`… resource '<path>' digest mismatch …`,
+`… resource '<path>' has no stored digest …`,
+`… signature invalid for skill <id>` and
+`… signer public key unavailable for skill <id>` (a signed skill
+whose signer has no enrolled key is refused, never read as
+unsigned). `memory_skill_list` omits a row that fails
+verification. The HTTP read routes answer `400` with the
+skill-level text (a resource-level failure renders
+`skill integrity check failed: skill <id>`, never a stored path)
+and `404` for a missing skill or resource.
+
+**Promoted-skill scope (v1.0.0 #8832).** A skill promoted from a
+reflection takes the NARROWEST scope of its sources: any `private`
+source, a `team`/`unit`/`org` source in another namespace, or an
+absent or unknown scope makes the skill `private` to the promoting
+caller. The binding is stored under `metadata._visibility`, is part
+of the digest (only when present, so pre-#8832 digests are
+unchanged), and every read funnel applies the memory visibility
+predicate to it, so private source content is never republished to
+another agent.
 
 The skill-level signature complements (does not replace) the
 forensic-bundle attestation described in

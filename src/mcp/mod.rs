@@ -671,6 +671,8 @@ mod verify;
 mod skill_export;
 #[path = "tools/skill_get.rs"]
 mod skill_get;
+#[path = "tools/skill_integrity.rs"]
+mod skill_integrity;
 #[path = "tools/skill_list.rs"]
 mod skill_list;
 #[path = "tools/skill_register.rs"]
@@ -855,6 +857,7 @@ pub use skill_export::{
     handle_skill_export_in_root,
 };
 pub use skill_get::handle_skill_get;
+pub use skill_integrity::reseal_skill_digest_for_tests;
 pub use skill_list::handle_skill_list;
 pub(crate) use skill_promote::handle_skill_promote_for_caller;
 pub use skill_promote::handle_skill_promote_from_reflection;
@@ -2997,19 +3000,26 @@ fn dispatch_memory_skill_register(ctx: &ToolDispatchCtx<'_>) -> Result<Value, St
 }
 
 fn dispatch_memory_skill_list(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
-    handle_skill_list(ctx.conn, ctx.arguments)
+    handle_skill_list(ctx.conn, ctx.arguments, ctx.authority.read_caller())
 }
 
 fn dispatch_memory_skill_get(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
-    handle_skill_get(ctx.conn, ctx.arguments)
+    handle_skill_get(ctx.conn, ctx.arguments, ctx.authority.read_caller())
 }
 
 fn dispatch_memory_skill_resource(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
-    handle_skill_resource(ctx.conn, ctx.arguments)
+    handle_skill_resource(ctx.conn, ctx.arguments, ctx.authority.read_caller())
 }
 
 fn dispatch_memory_skill_export(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
-    handle_skill_export(ctx.conn, ctx.db_path, ctx.arguments, ctx.active_keypair)
+    let caller = ctx.authority.read_caller();
+    handle_skill_export(
+        ctx.conn,
+        ctx.db_path,
+        ctx.arguments,
+        ctx.active_keypair,
+        caller,
+    )
 }
 
 fn dispatch_memory_skill_promote_from_reflection(

@@ -445,6 +445,75 @@ pub mod msg {
         format!("{SKILL_NOT_FOUND}: {skill_id}")
     }
 
+    /// v1.0.0 #8834 — the prefix of every skill verify-on-read failure.
+    pub const SKILL_INTEGRITY_FAILED: &str = "skill integrity check failed";
+
+    /// v1.0.0 #8834 — the fixed skill-level verify-on-read text the HTTP read
+    /// routes render for a resource-level failure (no stored path echoed).
+    #[must_use]
+    pub fn skill_integrity_failed(skill_id: impl std::fmt::Display) -> String {
+        format!("{SKILL_INTEGRITY_FAILED}: skill {skill_id}")
+    }
+
+    /// `memory_skill_resource` / `GET /skill/{id}/resource` with no path.
+    pub const SKILL_RESOURCE_PATH_REQUIRED: &str = "memory_skill_resource requires 'resource_path'";
+
+    /// The prefix of [`skill_resource_not_found`].
+    pub const SKILL_RESOURCE_NOT_FOUND: &str = "resource not found";
+
+    /// `"resource not found: skill_id={skill_id} path={path}"`.
+    #[must_use]
+    pub fn skill_resource_not_found(
+        skill_id: impl std::fmt::Display,
+        path: impl std::fmt::Display,
+    ) -> String {
+        format!("{SKILL_RESOURCE_NOT_FOUND}: skill_id={skill_id} path={path}")
+    }
+
+    /// `"resource '{path}' has no inline content (reference-only)"`.
+    #[must_use]
+    pub fn skill_resource_reference_only(path: impl std::fmt::Display) -> String {
+        format!("resource '{path}' has no inline content (reference-only)")
+    }
+
+    /// v1.0.0 #8834 — the recomputed skill digest differs from the stored one.
+    #[must_use]
+    pub fn skill_digest_mismatch(skill_id: impl std::fmt::Display) -> String {
+        format!("{SKILL_INTEGRITY_FAILED}: digest mismatch for skill {skill_id}")
+    }
+
+    /// v1.0.0 #8834 — a resource's content hashes to a different digest.
+    #[must_use]
+    pub fn skill_resource_digest_mismatch(
+        path: impl std::fmt::Display,
+        skill_id: impl std::fmt::Display,
+    ) -> String {
+        format!("{SKILL_INTEGRITY_FAILED}: resource '{path}' digest mismatch for skill {skill_id}")
+    }
+
+    /// v1.0.0 #8834 — a resource carries inline content but no stored digest.
+    #[must_use]
+    pub fn skill_resource_digest_missing(
+        path: impl std::fmt::Display,
+        skill_id: impl std::fmt::Display,
+    ) -> String {
+        format!(
+            "{SKILL_INTEGRITY_FAILED}: resource '{path}' has no stored digest for skill {skill_id}"
+        )
+    }
+
+    /// v1.0.0 #8834 — the stored signature does not verify over the digest.
+    #[must_use]
+    pub fn skill_signature_invalid(skill_id: impl std::fmt::Display) -> String {
+        format!("{SKILL_INTEGRITY_FAILED}: signature invalid for skill {skill_id}")
+    }
+
+    /// v1.0.0 #8834 — a signed skill whose signer has no enrolled public key.
+    #[must_use]
+    pub fn skill_signer_key_unavailable(skill_id: impl std::fmt::Display) -> String {
+        format!("{SKILL_INTEGRITY_FAILED}: signer public key unavailable for skill {skill_id}")
+    }
+
     /// `"pending action not found: {pending_id}"`.
     #[must_use]
     pub fn pending_action_not_found(pending_id: impl std::fmt::Display) -> String {

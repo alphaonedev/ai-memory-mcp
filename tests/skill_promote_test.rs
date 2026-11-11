@@ -335,6 +335,7 @@ fn round_trip_promote_export_reregister_identical_digest() {
         }),
         None,
         dir.path(),
+        None,
     )
     .expect("export");
     assert_eq!(export_payload["exported"], true);
@@ -544,6 +545,7 @@ fn skills_ref_validates_promoted_skill_if_installed() {
         }),
         None,
         dir.path(),
+        None,
     )
     .expect("export");
 

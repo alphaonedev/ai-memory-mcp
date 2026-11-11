@@ -97,6 +97,10 @@ impl EnvLock {
     }
 
     /// Act as `agent` (`None` = the unset local-operator posture).
+    #[expect(
+        clippy::unused_self,
+        reason = "the receiver is the witness that ENV_GUARD is held while the env is mutated"
+    )]
     fn act_as(&self, agent: Option<&str>) {
         match agent {
             Some(a) => set_env(ENV_AGENT_ID, a),
@@ -319,7 +323,12 @@ fn private_sources_promoted_skill_is_owner_only_on_every_read_funnel_8832() {
     let skill_id = promote_as_owner(&env, &db_path, &reflection);
 
     for (n, op) in READ_OPS.iter().enumerate() {
-        let export_dir = dir.path().join(format!("export-{n}"));
+        // Inside the default export jail (`<db dir>/skills-export`), so an
+        // owner export is refused only by visibility, never by the jail.
+        let export_dir = dir
+            .path()
+            .join(mcp::DEFAULT_EXPORT_DIR_NAME)
+            .join(format!("export-{n}"));
 
         env.act_as(Some(OTHER));
         let denied = read(&db_path, &export_dir.join("other"), *op, &skill_id);
@@ -371,13 +380,11 @@ fn promoted_skill_takes_the_narrowest_source_scope_8832() {
         ),
         // A private reflection over collective sources stays private.
         (&[(NS, Some("collective"))], None, false),
-        // A team source in ANOTHER namespace cannot be expressed in the
-        // skill's namespace: it narrows to private.
-        (
-            &[(NS, Some("collective")), (OTHER_NS, Some("team"))],
-            Some("collective"),
-            false,
-        ),
+        // A team source in ANOTHER namespace narrows to private in
+        // `narrowest_scope_table_8832` (unit). End to end it never reaches
+        // the stamp: the #1921 subtree rule hides that row from OWNER, so
+        // promote refuses first (pinned by
+        // `promote_refuses_an_unreadable_foreign_team_source_8832`).
     ];
 
     for (n, (sources, reflection_scope, other_sees)) in CASES.iter().enumerate() {
@@ -395,6 +402,43 @@ fn promoted_skill_takes_the_narrowest_source_scope_8832() {
         }
         drop(env);
     }
+}
+
+/// A team source in another namespace is unreadable by the promoting
+/// caller, so no skill is minted and nothing is republished.
+#[test]
+fn promote_refuses_an_unreadable_foreign_team_source_8832() {
+    let env = EnvLock::new();
+    let (_dir, db_path) = fresh_db();
+    let reflection = make_reflection(
+        &db_path,
+        &[(NS, Some("collective")), (OTHER_NS, Some("team"))],
+        Some("collective"),
+    );
+    env.act_as(Some(OWNER));
+    let run = cli(
+        &db_path,
+        SkillAction::Promote(PromoteArgs {
+            id: reflection.clone(),
+            name: SKILL_NAME.to_string(),
+            description: "Promoted for #8832.".to_string(),
+            parameters_schema: None,
+            json: true,
+        }),
+    );
+    assert_ne!(run.code, 0, "promote must refuse: {}", run.stdout);
+    assert!(
+        run.stderr
+            .contains(&format!("reflection not found: {reflection}")),
+        "refusal names only the reflection: {}",
+        run.stderr
+    );
+    let conn = db::open(&db_path).expect("open");
+    let skills: i64 = conn
+        .query_row("SELECT COUNT(*) FROM skills", [], |r| r.get(0))
+        .expect("count");
+    assert_eq!(skills, 0, "no skill minted");
+    drop(env);
 }
 
 // ---------------------------------------------------------------------------
@@ -421,11 +465,15 @@ fn read_all_handlers(
     vec![
         (
             "get",
-            mcp::handle_skill_get(conn, &json!({ "skill_id": id })),
+            mcp::handle_skill_get(conn, &json!({ "skill_id": id }), None),
         ),
         (
             "resource",
-            mcp::handle_skill_resource(conn, &json!({ "skill_id": id, "resource_path": SOURCE_0 })),
+            mcp::handle_skill_resource(
+                conn,
+                &json!({ "skill_id": id, "resource_path": SOURCE_0 }),
+                None,
+            ),
         ),
         (
             "export",
@@ -434,6 +482,7 @@ fn read_all_handlers(
                 &json!({ "skill_id": id, "target_folder": "out" }),
                 None,
                 export_root,
+                None,
             ),
         ),
         (
@@ -588,7 +637,7 @@ fn tampered_skill_is_omitted_from_list_8834() {
     env.act_as(None);
     let conn = db::open(&db_path).expect("open");
     let listed = |conn: &rusqlite::Connection| {
-        mcp::handle_skill_list(conn, &json!({ "namespace": NS })).expect("list")["skills"]
+        mcp::handle_skill_list(conn, &json!({ "namespace": NS }), None).expect("list")["skills"]
             .as_array()
             .is_some_and(|a| {
                 a.iter()
@@ -639,7 +688,7 @@ fn signed_skill_signature_is_verified_on_read_8834() {
 
     // Intact signed skill reads.
     let ok_id = register_signed(&conn, &key_dir, "signed-ok");
-    assert!(mcp::handle_skill_get(&conn, &json!({ "skill_id": ok_id })).is_ok());
+    assert!(mcp::handle_skill_get(&conn, &json!({ "skill_id": ok_id }), None).is_ok());
 
     // A flipped signature byte fails closed with the exact error.
     let sig: Vec<u8> = conn
@@ -656,7 +705,7 @@ fn signed_skill_signature_is_verified_on_read_8834() {
         rusqlite::params![forged, ok_id],
     )
     .unwrap();
-    let err = mcp::handle_skill_get(&conn, &json!({ "skill_id": ok_id })).unwrap_err();
+    let err = mcp::handle_skill_get(&conn, &json!({ "skill_id": ok_id }), None).unwrap_err();
     assert!(
         err.contains(&format!(
             "{INTEGRITY_PREFIX}: signature invalid for skill {ok_id}"
@@ -676,7 +725,7 @@ fn signed_skill_signature_is_verified_on_read_8834() {
         [&ok_id],
     )
     .unwrap();
-    let err = mcp::handle_skill_get(&conn, &json!({ "skill_id": ok_id })).unwrap_err();
+    let err = mcp::handle_skill_get(&conn, &json!({ "skill_id": ok_id }), None).unwrap_err();
     assert!(
         err.contains(&format!(
             "{INTEGRITY_PREFIX}: signer public key unavailable for skill {ok_id}"
@@ -687,7 +736,7 @@ fn signed_skill_signature_is_verified_on_read_8834() {
     // The signer's key no longer enrolled: fail closed, never skip.
     let gone_id = register_signed(&conn, &key_dir, "signed-gone");
     std::fs::remove_file(key_dir.join(format!("{SIGNER}.pub"))).expect("remove pub");
-    let err = mcp::handle_skill_get(&conn, &json!({ "skill_id": gone_id })).unwrap_err();
+    let err = mcp::handle_skill_get(&conn, &json!({ "skill_id": gone_id }), None).unwrap_err();
     assert!(
         err.contains(&format!(
             "{INTEGRITY_PREFIX}: signer public key unavailable for skill {gone_id}"

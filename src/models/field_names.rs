@@ -515,6 +515,9 @@ pub const SENDER_POLICY_SEQ: &str = "sender_policy_seq";
 pub const SHAPE: &str = "shape";
 /// `signing_agent` — wire/row field name.
 pub const SIGNING_AGENT: &str = "signing_agent";
+/// `signature_verified` — skill / memory read payload flag (#8834): whether the
+/// stored signature was verified on this read.
+pub const SIGNATURE_VERIFIED: &str = "signature_verified";
 /// `similar_count` — boot / session_start payload annotation (#3352): how
 /// many other near-duplicate rows were collapsed into this representative.
 /// Absent when the cluster is a singleton (no wire noise on the common path).

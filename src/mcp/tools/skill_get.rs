@@ -84,10 +84,20 @@ fn record_skill_invocation(
 /// `GET /api/v1/skill/{id}` route can dispatch into the same
 /// implementation.
 ///
+/// #8832 — `read_caller` is the resolved read principal (MCP:
+/// `Authority::read_caller`; CLI: the process identity). `None` is the
+/// single-operator / admin-gated posture and reads every skill.
+///
 /// # Errors
 /// Returns a substrate error string when `skill_id` is missing/invalid,
-/// the skill is not found, or zstd body decompression fails.
-pub fn handle_skill_get(conn: &Connection, params: &Value) -> Result<Value, String> {
+/// the skill is not found (or not visible to the caller, #8832), its
+/// digest or signature does not verify (#8834), or zstd body
+/// decompression fails.
+pub fn handle_skill_get(
+    conn: &Connection,
+    params: &Value,
+    read_caller: Option<&str>,
+) -> Result<Value, String> {
     let skill_id = params["skill_id"]
         .as_str()
         .filter(|s| !s.is_empty())
@@ -104,168 +114,77 @@ pub fn handle_skill_get(conn: &Connection, params: &Value) -> Result<Value, Stri
     )
     .map_err(|e| e.to_string())?;
 
-    let row: Option<(
-        String,
-        String,
-        String,
-        String,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        String,
-        Vec<u8>,
-        Vec<u8>,
-        Option<Vec<u8>>,
-        Option<String>,
-        i64,
-        Option<String>,
-        Option<i64>,
-        Option<String>,
-        Option<String>,
-    )> = conn
-        .query_row(
-            "SELECT id, namespace, name, description, license, compatibility, \
-                    allowed_tools, metadata, body_blob, digest, signature, \
-                    signing_agent, created_at, superseded_by, \
-                    retired_at, retired_by, retire_reason \
-             FROM skills WHERE id = ?1",
-            [skill_id],
-            |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                    row.get(6)?,
-                    row.get(7)?,
-                    row.get(8)?,
-                    row.get(9)?,
-                    row.get(10)?,
-                    row.get(11)?,
-                    row.get(12)?,
-                    row.get(13)?,
-                    row.get(14)?,
-                    row.get(15)?,
-                    row.get(16)?,
-                ))
-            },
-        )
-        .ok();
-
-    let Some((
-        id,
-        namespace,
-        name,
-        description,
-        license,
-        compatibility,
-        allowed_tools,
-        metadata,
-        body_blob,
-        digest_bytes,
-        _signature,
-        signing_agent,
-        created_at,
-        superseded_by,
-        retired_at,
-        retired_by,
-        retire_reason,
-    )) = row
-    else {
-        return Err(crate::errors::msg::skill_not_found(skill_id));
-    };
-
-    // Decompress body. #3171/#1933 — BOUNDED streaming decode, the same
-    // anti-decompression-bomb ceiling the three sibling skill decode sites
-    // (`memory_skill_resource`, `memory_skill_export`,
-    // `memory_skill_compositional_context`) already use. Pre-fix this lone
-    // site used the unbounded `zstd::decode_all`, so a hostile `skills.
-    // body_blob` row that decodes to gigabytes would OOM the daemon on
-    // activation fetch.
-    let body_bytes = crate::mcp::skill_zstd::decode_all_bounded(body_blob.as_slice())
-        .map_err(crate::errors::msg::zstd_decompress_body)?;
-    let body = String::from_utf8_lossy(&body_bytes).into_owned();
-
-    let digest_hex: String = digest_bytes.iter().map(|b| format!("{b:02x}")).collect();
+    // #8832 / #8834 — the single verified read path: scope binding, resource
+    // digests, skill digest and signature, all before anything is served or
+    // the invocation is recorded. The body decode is bounded (#3171/#1933).
+    let skill = super::skill_integrity::load_verified_skill(conn, skill_id, read_caller)?;
+    let body = String::from_utf8_lossy(&skill.body).into_owned();
+    let digest_hex: String = skill.digest.iter().map(|b| format!("{b:02x}")).collect();
 
     let mut response = json!({
-        "id": id,
-        "namespace": namespace,
-        "name": name,
-        (field_names::DESCRIPTION): description,
+        "id": skill.id,
+        "namespace": skill.namespace,
+        "name": skill.name,
+        (field_names::DESCRIPTION): skill.description,
         "digest": digest_hex,
-        (field_names::CREATED_AT): created_at,
+        (field_names::CREATED_AT): skill.created_at,
         "body": body,
-        "current": superseded_by.is_none(),
+        "current": skill.superseded_by.is_none(),
         // #2024 — symmetric with `current`: retire is discovery-hide +
         // re-register-block; it does NOT hard-block activation-by-id
         // (consistent with superseded-stays-addressable), it just
         // surfaces the flag so a by-id caller can honor the retirement.
-        (field_names::RETIRED): retired_at.is_some(),
+        (field_names::RETIRED): skill.retired_at.is_some(),
+        // #8834 — `true` only when a stored signature verified on this read.
+        (field_names::SIGNATURE_VERIFIED): skill.signature_verified,
     });
 
-    if let Some(ts) = retired_at {
+    if let Some(ts) = skill.retired_at {
         response[field_names::RETIRED_AT] = json!(ts);
-        if let Some(by) = retired_by {
+        if let Some(by) = &skill.retired_by {
             response[field_names::RETIRED_BY] = json!(by);
         }
-        if let Some(reason) = retire_reason {
+        if let Some(reason) = &skill.retire_reason {
             response[field_names::RETIRE_REASON] = json!(reason);
         }
     }
 
-    if let Some(lic) = license {
+    if let Some(lic) = &skill.license {
         response["license"] = json!(lic);
     }
-    if let Some(compat) = compatibility {
+    if let Some(compat) = &skill.compatibility {
         response[field_names::COMPATIBILITY] = json!(compat);
     }
-    if let Some(tools_json) = allowed_tools {
-        if let Ok(v) = serde_json::from_str::<Value>(&tools_json) {
-            response[field_names::ALLOWED_TOOLS] = v;
-        }
+    if let Some(tools) = &skill.allowed_tools {
+        response[field_names::ALLOWED_TOOLS] = json!(tools);
     }
-    if let Some(agent) = signing_agent {
+    if let Some(agent) = &skill.signing_agent {
         response[field_names::SIGNING_AGENT] = json!(agent);
     }
-    if let Some(sup_id) = superseded_by {
+    if let Some(sup_id) = &skill.superseded_by {
         response[field_names::SUPERSEDED_BY] = json!(sup_id);
     }
-    if let Ok(meta_val) = serde_json::from_str::<Value>(&metadata) {
-        response["metadata"] = meta_val;
-    }
+    response["metadata"] = skill.metadata.clone();
 
     // v0.9.0 §11.5 B7-SKILL (#1865) — surface the version-chain position
     // (pure read-side derivation over the existing `superseded_by` chain,
     // see `skill_register::compute_skill_version`; no schema migration).
-    response["version"] = json!(super::skill_register::compute_skill_version(conn, &id));
+    response["version"] = json!(super::skill_register::compute_skill_version(
+        conn, &skill.id
+    ));
 
     // v0.9.0 §11.5 B7-SKILL (#1865) — capture the invocation record.
     // Best-effort; never fails an otherwise-successful activation fetch.
     response[field_names::INVOCATION_RECORD] =
-        record_skill_invocation(conn, &id, &namespace, &name, caller);
+        record_skill_invocation(conn, &skill.id, &skill.namespace, &skill.name, caller);
 
-    // Include resource list (paths only — content via memory_skill_resource).
-    let mut res_stmt = conn
-        .prepare(
-            "SELECT resource_path, resource_kind FROM skill_resources \
-             WHERE skill_id = ?1 ORDER BY resource_path",
-        )
-        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("resources prepare", e))?;
-
-    let resources: Vec<Value> = res_stmt
-        .query_map([&id], |row| {
-            Ok(json!({
-                "path": row.get::<_, String>(0)?,
-                "kind": row.get::<_, String>(1)?,
-            }))
-        })
-        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("resources query", e))?
-        .filter_map(|r| r.ok())
+    // Resource list (paths only — content via memory_skill_resource), from
+    // the verified rows, ordered by path.
+    let resources: Vec<Value> = skill
+        .resources
+        .iter()
+        .map(|r| json!({"path": r.path, "kind": r.kind}))
         .collect();
-
     response["resources"] = json!(resources);
 
     Ok(response)
@@ -377,14 +296,21 @@ mod tests {
             params![id, ns, name, body_blob, digest, now],
         )
         .unwrap();
+        // #8834 — the read path verifies the digest, so seal the fixture.
+        crate::mcp::reseal_skill_digest_for_tests(conn, id).expect("reseal");
         digest
+    }
+
+    /// #8834 — reseal a hand-inserted fixture row so its digest verifies.
+    fn reseal(conn: &rusqlite::Connection, id: &str) {
+        crate::mcp::reseal_skill_digest_for_tests(conn, id).expect("reseal");
     }
 
     #[test]
     fn rejects_missing_skill_id() {
         let conn = open_db();
         let params = json!({});
-        let err = handle_skill_get(&conn, &params).unwrap_err();
+        let err = handle_skill_get(&conn, &params, None).unwrap_err();
         assert!(err.contains("requires 'skill_id'"), "got: {err}");
     }
 
@@ -392,7 +318,7 @@ mod tests {
     fn rejects_empty_skill_id() {
         let conn = open_db();
         let params = json!({"skill_id": ""});
-        let err = handle_skill_get(&conn, &params).unwrap_err();
+        let err = handle_skill_get(&conn, &params, None).unwrap_err();
         assert!(err.contains("requires 'skill_id'"), "got: {err}");
     }
 
@@ -400,7 +326,7 @@ mod tests {
     fn rejects_nonstring_skill_id() {
         let conn = open_db();
         let params = json!({"skill_id": 42});
-        let err = handle_skill_get(&conn, &params).unwrap_err();
+        let err = handle_skill_get(&conn, &params, None).unwrap_err();
         assert!(err.contains("requires 'skill_id'"), "got: {err}");
     }
 
@@ -408,7 +334,7 @@ mod tests {
     fn returns_not_found_for_missing_id() {
         let conn = open_db();
         let params = json!({"skill_id": "no-such-skill"});
-        let err = handle_skill_get(&conn, &params).unwrap_err();
+        let err = handle_skill_get(&conn, &params, None).unwrap_err();
         assert!(err.contains("skill not found"), "got: {err}");
         assert!(err.contains("no-such-skill"), "got: {err}");
     }
@@ -419,7 +345,7 @@ mod tests {
         let id = "11111111-1111-1111-1111-111111111111";
         insert_min_skill(&conn, id, "ns-1", "hello", "# Hello\nbody.");
 
-        let v = handle_skill_get(&conn, &json!({"skill_id": id})).unwrap();
+        let v = handle_skill_get(&conn, &json!({"skill_id": id}), None).unwrap();
         assert_eq!(v["id"], json!(id));
         assert_eq!(v["namespace"], json!("ns-1"));
         assert_eq!(v["name"], json!("hello"));
@@ -450,8 +376,9 @@ mod tests {
             params![id, allowed_tools_json, metadata, body_blob, digest],
         )
         .unwrap();
+        reseal(&conn, id);
 
-        let v = handle_skill_get(&conn, &json!({"skill_id": id})).unwrap();
+        let v = handle_skill_get(&conn, &json!({"skill_id": id}), None).unwrap();
         assert_eq!(v["license"], json!("MIT"));
         assert_eq!(v["compatibility"], json!("v1"));
         assert_eq!(v["signing_agent"], json!("agent:alice"));
@@ -461,12 +388,13 @@ mod tests {
     }
 
     #[test]
-    fn ignores_malformed_allowed_tools_json() {
+    fn refuses_malformed_allowed_tools_json_8834() {
         let conn = open_db();
         let id = "33333333-3333-3333-3333-333333333333";
         let body_blob = zstd::encode_all(b"body".as_slice(), 3).unwrap();
         let digest = vec![0u8; 32];
-        // Malformed allowed_tools — handler must not propagate the error.
+        // #8834 — allowed_tools is inside the digest, so a column that does
+        // not parse can only be a tampered row: refused, never served.
         conn.execute(
             "INSERT INTO skills (id, namespace, name, description, allowed_tools, metadata, \
                                   body_blob, digest, created_at) \
@@ -475,9 +403,9 @@ mod tests {
         )
         .unwrap();
 
-        let v = handle_skill_get(&conn, &json!({"skill_id": id})).unwrap();
-        // allowed_tools should NOT appear in the response when parse fails.
-        assert!(v.get("allowed_tools").is_none());
+        reseal(&conn, id);
+        let err = handle_skill_get(&conn, &json!({"skill_id": id}), None).unwrap_err();
+        assert_eq!(err, crate::errors::msg::skill_digest_mismatch(id));
     }
 
     #[test]
@@ -493,10 +421,10 @@ mod tests {
         )
         .unwrap();
 
-        let r1 = handle_skill_get(&conn, &json!({"skill_id": v1})).unwrap();
+        let r1 = handle_skill_get(&conn, &json!({"skill_id": v1}), None).unwrap();
         assert_eq!(r1["current"], json!(false));
         assert_eq!(r1["superseded_by"], json!(v2));
-        let r2 = handle_skill_get(&conn, &json!({"skill_id": v2})).unwrap();
+        let r2 = handle_skill_get(&conn, &json!({"skill_id": v2}), None).unwrap();
         assert_eq!(r2["current"], json!(true));
         assert!(r2.get("superseded_by").is_none());
     }
@@ -520,8 +448,9 @@ mod tests {
             params![id, rblob, rdig],
         )
         .unwrap();
+        reseal(&conn, id);
 
-        let v = handle_skill_get(&conn, &json!({"skill_id": id})).unwrap();
+        let v = handle_skill_get(&conn, &json!({"skill_id": id}), None).unwrap();
         let resources = v["resources"].as_array().unwrap();
         assert_eq!(resources.len(), 2);
         // Sorted alphabetically by path.
@@ -543,7 +472,7 @@ mod tests {
             params![id, bogus_blob, digest],
         )
         .unwrap();
-        let err = handle_skill_get(&conn, &json!({"skill_id": id})).unwrap_err();
+        let err = handle_skill_get(&conn, &json!({"skill_id": id}), None).unwrap_err();
         assert!(err.contains("zstd decompress body"), "got: {err}");
     }
 
@@ -557,7 +486,7 @@ mod tests {
         let conn = open_db();
         let id = "77777777-7777-7777-7777-777777777777";
         insert_min_skill(&conn, id, "ns", "versioned", "body");
-        let v = handle_skill_get(&conn, &json!({"skill_id": id})).unwrap();
+        let v = handle_skill_get(&conn, &json!({"skill_id": id}), None).unwrap();
         assert_eq!(v["version"], json!(1));
     }
 
@@ -573,9 +502,9 @@ mod tests {
             params![v2, v1],
         )
         .unwrap();
-        let r1 = handle_skill_get(&conn, &json!({"skill_id": v1})).unwrap();
+        let r1 = handle_skill_get(&conn, &json!({"skill_id": v1}), None).unwrap();
         assert_eq!(r1["version"], json!(1));
-        let r2 = handle_skill_get(&conn, &json!({"skill_id": v2})).unwrap();
+        let r2 = handle_skill_get(&conn, &json!({"skill_id": v2}), None).unwrap();
         assert_eq!(r2["version"], json!(2));
     }
 
@@ -589,7 +518,7 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM signed_events", [], |r| r.get(0))
             .unwrap();
 
-        let v = handle_skill_get(&conn, &json!({"skill_id": id})).unwrap();
+        let v = handle_skill_get(&conn, &json!({"skill_id": id}), None).unwrap();
         let record = &v["invocation_record"];
         assert!(record["event_id"].as_str().is_some(), "{v}");
         assert!(record["recorded_at"].as_str().is_some(), "{v}");
@@ -616,8 +545,8 @@ mod tests {
         let id = "99999999-9999-9999-9999-999999999999";
         insert_min_skill(&conn, id, "ns", "multi-invoke", "body");
 
-        let v1 = handle_skill_get(&conn, &json!({"skill_id": id})).unwrap();
-        let v2 = handle_skill_get(&conn, &json!({"skill_id": id})).unwrap();
+        let v1 = handle_skill_get(&conn, &json!({"skill_id": id}), None).unwrap();
+        let v2 = handle_skill_get(&conn, &json!({"skill_id": id}), None).unwrap();
         assert_ne!(
             v1["invocation_record"]["event_id"], v2["invocation_record"]["event_id"],
             "each activation must mint a distinct invocation record"
@@ -634,7 +563,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_metadata_string_skipped() {
+    fn refuses_malformed_metadata_string_8834() {
         let conn = open_db();
         let id = "66666666-6666-6666-6666-666666666666";
         let body_blob = zstd::encode_all(b"body".as_slice(), 3).unwrap();
@@ -646,9 +575,10 @@ mod tests {
             params![id, body_blob, digest],
         )
         .unwrap();
-        let v = handle_skill_get(&conn, &json!({"skill_id": id})).unwrap();
-        // metadata key should NOT be present in response (parse failure).
-        assert!(v.get("metadata").is_none());
+        // #8834 — metadata carries the scope binding and is inside the
+        // digest; a column that does not parse is refused, never served.
+        let err = handle_skill_get(&conn, &json!({"skill_id": id}), None).unwrap_err();
+        assert_eq!(err, crate::errors::msg::skill_digest_mismatch(id));
     }
 
     /// #3171 / #1933 — the skill BODY decode is bounded, matching the
@@ -675,7 +605,7 @@ mod tests {
             params![id, blob, digest],
         )
         .unwrap();
-        let err = handle_skill_get(&conn, &json!({"skill_id": id})).unwrap_err();
+        let err = handle_skill_get(&conn, &json!({"skill_id": id}), None).unwrap_err();
         assert!(err.contains("zstd decompress body"), "got: {err}");
         assert!(
             err.contains("decompression-bomb defence"),

@@ -6,7 +6,9 @@
 //! Returns the **discovery payload** for all current (non-superseded)
 //! skills in a given namespace. Each entry carries ~100 tokens of
 //! metadata (name, description, id, namespace, created_at, digest_hex)
-//! but does NOT decompress or return the `body_blob`.
+//! but does NOT return the body. #8832 / #8834: every entry is loaded
+//! through the verified read path, so a skill the caller may not read, or
+//! whose digest or signature does not verify, is omitted from discovery.
 
 use crate::models::field_names;
 use rusqlite::Connection;
@@ -19,9 +21,17 @@ use serde_json::{Value, json};
 /// `GET /api/v1/skill/list` route can dispatch into the same
 /// implementation without duplicating SQL.
 ///
+/// #8832 — `read_caller` is the resolved read principal (MCP:
+/// `Authority::read_caller`; CLI: the process identity). `None` is the
+/// single-operator / admin-gated posture and reads every skill.
+///
 /// # Errors
 /// Returns the substrate's error string when SQL prepare/query fails.
-pub fn handle_skill_list(conn: &Connection, params: &Value) -> Result<Value, String> {
+pub fn handle_skill_list(
+    conn: &Connection,
+    params: &Value,
+    read_caller: Option<&str>,
+) -> Result<Value, String> {
     let namespace = params["namespace"].as_str().unwrap_or("%");
     let filter = params["filter"].as_str().unwrap_or("");
     // #2024 — discovery HIDES retired skills by default. `include_retired`
@@ -39,9 +49,7 @@ pub fn handle_skill_list(conn: &Connection, params: &Value) -> Result<Value, Str
     // Only return current (non-superseded) skills; retired rows are
     // hidden unless `include_retired` is set (the predicate above).
     let sql = format!(
-        "SELECT id, namespace, name, description, license, compatibility, \
-                allowed_tools, metadata, digest, signing_agent, created_at, retired_at \
-         FROM skills \
+        "SELECT id FROM skills \
          WHERE superseded_by IS NULL \
            AND (namespace = ?1 OR ?1 = '%'){retired_predicate} \
          ORDER BY namespace, name, created_at DESC"
@@ -49,84 +57,67 @@ pub fn handle_skill_list(conn: &Connection, params: &Value) -> Result<Value, Str
     let mut stmt = conn
         .prepare(&sql)
         .map_err(|e| crate::mcp::error_text::mcp_foreign_err("skill_list prepare", e))?;
+    let ids = stmt
+        .query_map([namespace], |row| row.get::<_, String>(0))
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("skill_list query", e))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("skill_list row", e))?;
 
     let mut skills: Vec<Value> = Vec::new();
-    let rows = stmt
-        .query_map([namespace], |row| {
-            Ok((
-                row.get::<_, String>(0)?,         // id
-                row.get::<_, String>(1)?,         // namespace
-                row.get::<_, String>(2)?,         // name
-                row.get::<_, String>(3)?,         // description
-                row.get::<_, Option<String>>(4)?, // license
-                row.get::<_, Option<String>>(5)?, // compatibility
-                row.get::<_, Option<String>>(6)?, // allowed_tools
-                row.get::<_, String>(7)?,         // metadata
-                row.get::<_, Vec<u8>>(8)?,        // digest
-                row.get::<_, Option<String>>(9)?, // signing_agent
-                row.get::<_, i64>(10)?,           // created_at
-                row.get::<_, Option<i64>>(11)?,   // retired_at
-            ))
-        })
-        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("skill_list query", e))?;
-
-    for row in rows {
-        let (
-            id,
-            ns,
-            name,
-            description,
-            license,
-            compatibility,
-            allowed_tools,
-            metadata,
-            digest_bytes,
-            signing_agent,
-            created_at,
-            retired_at,
-        ) = row.map_err(|e| crate::mcp::error_text::mcp_foreign_err("skill_list row", e))?;
+    for id in ids {
+        let skill = match super::skill_integrity::load_verified_skill(conn, &id, read_caller) {
+            Ok(skill) => skill,
+            // #8832 — a skill the caller may not read is simply not listed.
+            Err(e) if e == crate::errors::msg::skill_not_found(&id) => continue,
+            // #8834 — a row that fails verification is never discoverable;
+            // the operator sees why in the log, the caller sees nothing.
+            Err(e) => {
+                tracing::warn!(skill_id = %id, error = %e, "memory_skill_list omitted a skill");
+                continue;
+            }
+        };
 
         // Apply optional text filter on name or description.
-        if !filter.is_empty() && !name.contains(filter) && !description.contains(filter) {
+        if !filter.is_empty() && !skill.name.contains(filter) && !skill.description.contains(filter)
+        {
             continue;
         }
 
-        let digest_hex: String = digest_bytes.iter().map(|b| format!("{b:02x}")).collect();
+        let digest_hex: String = skill.digest.iter().map(|b| format!("{b:02x}")).collect();
 
         let mut entry = json!({
-            "id": id,
-            "namespace": ns,
-            "name": name,
-            (field_names::DESCRIPTION): description,
+            "id": skill.id,
+            "namespace": skill.namespace,
+            "name": skill.name,
+            (field_names::DESCRIPTION): skill.description,
             "digest": digest_hex,
-            (field_names::CREATED_AT): created_at,
+            (field_names::CREATED_AT): skill.created_at,
         });
 
-        if let Some(lic) = license {
+        if let Some(lic) = skill.license {
             entry["license"] = json!(lic);
         }
-        if let Some(compat) = compatibility {
+        if let Some(compat) = skill.compatibility {
             entry[field_names::COMPATIBILITY] = json!(compat);
         }
-        if let Some(tools_json) = allowed_tools {
-            if let Ok(v) = serde_json::from_str::<Value>(&tools_json) {
-                entry[field_names::ALLOWED_TOOLS] = v;
-            }
+        if let Some(tools) = skill.allowed_tools {
+            entry[field_names::ALLOWED_TOOLS] = json!(tools);
         }
-        if let Some(agent) = signing_agent {
+        if let Some(agent) = skill.signing_agent {
             entry[field_names::SIGNING_AGENT] = json!(agent);
         }
         // #2024 — surface the retired flag on retired entries (only
         // reachable when `include_retired` was set).
-        if let Some(ts) = retired_at {
+        if let Some(ts) = skill.retired_at {
             entry[field_names::RETIRED] = json!(true);
             entry[field_names::RETIRED_AT] = json!(ts);
         }
-        // metadata is a JSON string — include it parsed.
-        if let Ok(meta_val) = serde_json::from_str::<Value>(&metadata) {
-            if !meta_val.as_object().map_or(true, |m| m.is_empty()) {
-                entry["metadata"] = meta_val;
-            }
+        if !skill
+            .metadata
+            .as_object()
+            .is_none_or(serde_json::Map::is_empty)
+        {
+            entry["metadata"] = skill.metadata;
         }
 
         skills.push(entry);
@@ -241,12 +232,14 @@ mod tests {
             params![id, ns, name, description, body_blob, digest, created_at],
         )
         .unwrap();
+        // #8834 — the verified read path serves only rows whose digest holds.
+        crate::mcp::reseal_skill_digest_for_tests(conn, id).expect("reseal");
     }
 
     #[test]
     fn empty_db_returns_empty_list() {
         let conn = open_db();
-        let v = handle_skill_list(&conn, &json!({})).unwrap();
+        let v = handle_skill_list(&conn, &json!({}), None).unwrap();
         assert_eq!(v["count"], json!(0));
         assert_eq!(v["skills"], json!([]));
     }
@@ -262,7 +255,7 @@ mod tests {
         )
         .unwrap();
 
-        let v = handle_skill_list(&conn, &json!({})).unwrap();
+        let v = handle_skill_list(&conn, &json!({}), None).unwrap();
         assert_eq!(v["count"], json!(1));
         let arr = v["skills"].as_array().unwrap();
         assert_eq!(arr[0]["id"], json!("id-new"));
@@ -274,7 +267,7 @@ mod tests {
         insert_skill(&conn, "a", "ns-a", "ska", "a", 0);
         insert_skill(&conn, "b", "ns-b", "skb", "b", 1);
 
-        let v = handle_skill_list(&conn, &json!({"namespace": "ns-a"})).unwrap();
+        let v = handle_skill_list(&conn, &json!({"namespace": "ns-a"}), None).unwrap();
         assert_eq!(v["count"], json!(1));
         assert_eq!(v["skills"][0]["namespace"], json!("ns-a"));
     }
@@ -285,7 +278,7 @@ mod tests {
         insert_skill(&conn, "a", "ns-a", "ska", "a", 0);
         insert_skill(&conn, "b", "ns-b", "skb", "b", 1);
 
-        let v = handle_skill_list(&conn, &json!({"namespace": "%"})).unwrap();
+        let v = handle_skill_list(&conn, &json!({"namespace": "%"}), None).unwrap();
         assert_eq!(v["count"], json!(2));
     }
 
@@ -295,7 +288,7 @@ mod tests {
         insert_skill(&conn, "a", "ns-a", "ska", "a", 0);
         insert_skill(&conn, "b", "ns-b", "skb", "b", 1);
 
-        let v = handle_skill_list(&conn, &json!({})).unwrap();
+        let v = handle_skill_list(&conn, &json!({}), None).unwrap();
         assert_eq!(v["count"], json!(2));
     }
 
@@ -305,7 +298,7 @@ mod tests {
         insert_skill(&conn, "a", "ns", "deploy-canary", "k8s canary deploy", 0);
         insert_skill(&conn, "b", "ns", "audit-logs", "fetch audit logs", 1);
 
-        let v = handle_skill_list(&conn, &json!({"filter": "canary"})).unwrap();
+        let v = handle_skill_list(&conn, &json!({"filter": "canary"}), None).unwrap();
         assert_eq!(v["count"], json!(1));
         assert_eq!(v["skills"][0]["id"], json!("a"));
     }
@@ -316,7 +309,7 @@ mod tests {
         insert_skill(&conn, "a", "ns", "x", "kubernetes deploy notes", 0);
         insert_skill(&conn, "b", "ns", "y", "totally different", 1);
 
-        let v = handle_skill_list(&conn, &json!({"filter": "kubernetes"})).unwrap();
+        let v = handle_skill_list(&conn, &json!({"filter": "kubernetes"}), None).unwrap();
         assert_eq!(v["count"], json!(1));
     }
 
@@ -325,7 +318,7 @@ mod tests {
         let conn = open_db();
         insert_skill(&conn, "a", "ns", "x", "k8s", 0);
 
-        let v = handle_skill_list(&conn, &json!({"filter": "no-such-text"})).unwrap();
+        let v = handle_skill_list(&conn, &json!({"filter": "no-such-text"}), None).unwrap();
         assert_eq!(v["count"], json!(0));
     }
 
@@ -344,8 +337,9 @@ mod tests {
             params![allowed_tools, metadata, body_blob, digest],
         )
         .unwrap();
+        crate::mcp::reseal_skill_digest_for_tests(&conn, "id1").expect("reseal");
 
-        let v = handle_skill_list(&conn, &json!({})).unwrap();
+        let v = handle_skill_list(&conn, &json!({}), None).unwrap();
         let entry = &v["skills"][0];
         assert_eq!(entry["license"], json!("MIT"));
         assert_eq!(entry["compatibility"], json!("v1"));
@@ -361,14 +355,14 @@ mod tests {
     fn omits_empty_metadata_object() {
         let conn = open_db();
         insert_skill(&conn, "a", "ns", "x", "d", 0);
-        let v = handle_skill_list(&conn, &json!({})).unwrap();
+        let v = handle_skill_list(&conn, &json!({}), None).unwrap();
         let entry = &v["skills"][0];
         // metadata `{}` is omitted from the response.
         assert!(entry.get("metadata").is_none());
     }
 
     #[test]
-    fn ignores_malformed_allowed_tools_json() {
+    fn omits_a_row_with_malformed_allowed_tools_json_8834() {
         let conn = open_db();
         let body_blob = zstd::encode_all(b"body".as_slice(), 3).unwrap();
         let digest = vec![0u8; 32];
@@ -379,9 +373,10 @@ mod tests {
             params![body_blob, digest],
         )
         .unwrap();
-        let v = handle_skill_list(&conn, &json!({})).unwrap();
-        // allowed_tools should be absent on parse failure.
-        assert!(v["skills"][0].get("allowed_tools").is_none());
+        let v = handle_skill_list(&conn, &json!({}), None).unwrap();
+        // #8834 — `allowed_tools` is on the digest surface: a column that
+        // does not parse is a tampered row, never listed.
+        assert_eq!(v["count"], json!(0));
     }
 
     #[test]
@@ -389,7 +384,7 @@ mod tests {
         let conn = open_db();
         insert_skill(&conn, "a", "ns", "x", "d", 0);
         insert_skill(&conn, "b", "ns", "y", "e", 1);
-        let v = handle_skill_list(&conn, &json!({"filter": ""})).unwrap();
+        let v = handle_skill_list(&conn, &json!({"filter": ""}), None).unwrap();
         assert_eq!(v["count"], json!(2));
     }
 }

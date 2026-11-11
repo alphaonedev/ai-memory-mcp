@@ -124,7 +124,9 @@ pub fn handle_skill_promote_from_reflection(
         &caller,
         read_caller.as_deref(),
     )
-    .map_err(|error| crate::mcp::error_text::mcp_foreign_err("as_deref", error))
+    .map_err(|error| {
+        crate::mcp::error_text::mcp_foreign_err("skill_promote_from_reflection", error)
+    })
 }
 
 /// Shared SQLite promotion body. HTTP preserves its authenticated actor separately
@@ -318,16 +320,31 @@ pub(crate) fn handle_skill_promote_for_caller(
     }
 
     // ─── 5. Metadata: provenance edge to the source reflection ─────────
+    // #8832 — the skill inherits the NARROWEST scope of the reflection and
+    // every source, owned by the promoting caller. The binding is sealed into
+    // the digest (`skill_integrity::canonical_frontmatter`) and enforced by
+    // every read funnel, so private evidence is never republished wider.
+    let scope = super::skill_integrity::narrowest_scope(
+        &reflection.namespace,
+        std::iter::once(&reflection)
+            .chain(sources.iter())
+            .map(|m| (m.namespace.as_str(), &m.metadata)),
+    );
     let mut metadata = json!({
         "derived_from_reflection_id": reflection_id,
         "original_reflection_depth": reflection.reflection_depth,
         "promoted_by": caller,
+        (super::skill_integrity::VISIBILITY_META_KEY): {
+            "scope": scope.as_str(),
+            "agent_id": caller,
+        },
     });
     // v0.9.0 §11.5 B7-SKILL (#1865) — mirror `parameters_schema` into the
     // same `skills.metadata` column `skill_register` uses, so a promoted
     // skill's schema is queryable the same way regardless of which path
     // minted the row. Additive-only: does not change the signing digest
-    // (which covers frontmatter + body + resource digests, not metadata).
+    // (which covers frontmatter + body + resource digests and, since #8832,
+    // only the `_visibility` key of metadata).
     if let Some(schema) = parameters_schema {
         if let Value::Object(ref mut map) = metadata {
             map.insert(field_names::PARAMETERS_SCHEMA.to_string(), schema.clone());
