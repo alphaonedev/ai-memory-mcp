@@ -20,8 +20,12 @@
 //!    `/api/v1/monitoring/status` and `ai-memory doctor`.
 //! 2. A clean corpus still verifies (the control arm), so the cells are not
 //!    vacuous.
-//! 3. The deep check over [`BOUND_ROWS`] rows finishes inside
-//!    [`WRITER_BLOCK_BOUND`], the writers' `busy_timeout`.
+//! 3. At [`BOUND_ROWS`] rows (and only that size is pinned here) the deep
+//!    check finishes inside [`WRITER_BLOCK_BOUND`], the writers'
+//!    `busy_timeout`. The check holds the writer lock for a time linear in
+//!    the corpus with no runtime cap, so a corpus several times larger can
+//!    exceed that bound; the runtime bound is tracked as PRE-EXISTING #9181
+//!    (and #9161).
 //! 4. A repaired index returns to `ok` only through a fresh check.
 //!
 //! The first cell is the original #4036 regression test, re-landed from
@@ -32,7 +36,9 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use ai_memory::background::fts_integrity::{IntegrityStatus, Outcome, Verdict, run_once};
+use ai_memory::background::fts_integrity::{
+    IntegrityStatus, Outcome, Verdict, classify_error, run_once,
+};
 use ai_memory::models::{Memory, Tier};
 use ai_memory::storage as db;
 
@@ -48,7 +54,9 @@ const GHOST_ROWID: i64 = 9_128_000;
 const BOUND_ROWS: usize = 100_000;
 /// The production writer `busy_timeout` (`src/storage/connection.rs`). The
 /// deep check takes the WAL writer lock for its whole run, so a check longer
-/// than this makes a concurrent writer fail with `SQLITE_BUSY`.
+/// than this makes a concurrent writer fail with `SQLITE_BUSY`. The bound is
+/// asserted at [`BOUND_ROWS`] only; it is not a guarantee for larger corpora
+/// (PRE-EXISTING #9181).
 const WRITER_BLOCK_BOUND: Duration = Duration::from_millis(5_000);
 /// Daemon checker cadence for the transport cells, in whole seconds. One
 /// second keeps the startup spread at or under one second.
@@ -75,11 +83,22 @@ const ROUTE_STATUS: &str = "/api/v1/monitoring/status";
 /// read (`/api/v1/monitoring/status` refuses anonymous callers).
 const TEST_API_KEY: &str = "fts-integrity-9128-test-key";
 const API_KEY_HEADER: &str = "x-api-key";
+/// The documented config location under `$HOME` (`src/config.rs`
+/// `LEGACY_CONFIG_DIR` = `.config/ai-memory`, `CONFIG_FILE`), split so the
+/// same directory also serves as `XDG_CONFIG_HOME`.
+const DOT_CONFIG_DIR: &str = ".config";
+const CONFIG_APP_DIR: &str = "ai-memory";
+const CONFIG_FILE: &str = "config.toml";
 /// The doctor's honest disposition on its read-only connection (#3434):
 /// the FTS5 check is a SQLite writer, so the local doctor never runs it and
 /// must never claim a verdict for it.
-const DOCTOR_FTS_NOT_OBSERVED_PREFIX: &str = "not_observed";
+/// The exact value is `src/cli/doctor.rs` `FTS_INTEGRITY_READ_ONLY`.
+const DOCTOR_FTS_READ_ONLY: &str =
+    "not_observed (read-only; FTS integrity-check is a SQLite writer)";
 const DOCTOR_FTS_VERIFIED_PREFIX: &str = "verified";
+const DOCTOR_FTS_FACT: &str = "fts_index_integrity";
+const DOCTOR_INDEX_SECTION: &str = "Index";
+const DOCTOR_SEVERITY_INFO: &str = "info";
 
 /// The ways the derived FTS state can disagree with the rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -179,6 +198,26 @@ fn damage(conn: &rusqlite::Connection, ids: &[String], arm: Arm) {
     }
 }
 
+/// Assert the deep check failed with exactly the FTS5 content-mismatch error:
+/// `SQLITE_CORRUPT_VTAB`, which the worker classifies as [`Outcome::Corrupt`].
+/// Any other failure (a lock, a missing table, a closed connection) is a
+/// different finding and must not pass as this one.
+fn assert_corrupt_vtab(result: anyhow::Result<()>, ctx: &str) {
+    let err = match result {
+        Ok(()) => panic!("{ctx}: the deep check returned ok over a drifted index"),
+        Err(e) => e,
+    };
+    let extended = match err.downcast_ref::<rusqlite::Error>() {
+        Some(rusqlite::Error::SqliteFailure(e, _)) => Some(e.extended_code),
+        _ => None,
+    };
+    assert_eq!(
+        (extended, classify_error(&err)),
+        (Some(rusqlite::ffi::SQLITE_CORRUPT_VTAB), Outcome::Corrupt),
+        "{ctx}: want SQLITE_CORRUPT_VTAB classified Corrupt; got {err:#}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The original #4036 regression test (commit d228eb6c9), re-landed.
 // ---------------------------------------------------------------------------
@@ -223,9 +262,9 @@ fn deep_fts_check_detects_equal_count_stale_postings_4036() {
         .unwrap();
     assert_eq!(counts, (1, 1));
     assert!(db::fts_probe(&conn).is_ok());
-    assert!(
-        db::fts_integrity_check(&conn).is_err(),
-        "#4036: deep check must compare external content"
+    assert_corrupt_vtab(
+        db::fts_integrity_check(&conn),
+        "#4036: deep check must compare external content",
     );
     assert_eq!(run_once(&conn, &status, 2), Outcome::Corrupt);
     conn.execute_batch("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')")
@@ -249,6 +288,19 @@ fn every_drift_arm_fails_the_deep_check_and_the_verdict_funnel_9128() {
         damage(&conn, &ids, arm);
         // The shallow probe /health runs per request cannot see any arm.
         assert!(db::fts_probe(&conn).is_ok(), "{arm:?}: shallow probe");
+        // The funnel's own error is the exact content-mismatch code on every
+        // drift arm, not merely some failure.
+        if arm == Arm::Clean {
+            assert!(
+                db::fts_integrity_check(&conn).is_ok(),
+                "{arm:?}: a clean corpus must verify"
+            );
+        } else {
+            assert_corrupt_vtab(
+                db::fts_integrity_check(&conn),
+                &format!("#9128 {arm:?}: deep check funnel"),
+            );
+        }
 
         let status = IntegrityStatus::new(3_600);
         let outcome = run_once(&conn, &status, 10);
@@ -376,6 +428,18 @@ fn http_health_and_status_turn_not_ok_on_every_drift_arm_9128() {
         let fts = v["fts_integrity"]["status"].as_str();
         if arm == Arm::Clean {
             assert_eq!((code, fts), (HTTP_OK, Some(WIRE_OK)), "{arm:?}: {body}");
+            // The control proves the harness is authenticated on every
+            // platform: the status route answers 200 with a verified index.
+            let (status_code, status_body) = d.get(ROUTE_STATUS);
+            let s: serde_json::Value = serde_json::from_str(&status_body).expect("status json");
+            assert_eq!(
+                (
+                    status_code,
+                    s["singleton"]["fts_integrity"]["state"].as_str()
+                ),
+                (HTTP_OK, Some(WIRE_OK)),
+                "{arm:?}: {ROUTE_STATUS} body: {status_body}"
+            );
             continue;
         }
         assert_eq!(
@@ -384,7 +448,16 @@ fn http_health_and_status_turn_not_ok_on_every_drift_arm_9128() {
             "#9128 {arm:?}: /health must not answer ok over a drifted index; body: {body}"
         );
 
-        let (_, status_body) = d.get(ROUTE_STATUS);
+        // The status code first, exactly: an authentication refusal (401 /
+        // 403) reports as itself, never as a missing reason in a body that is
+        // not a status document. A failed verdict makes the route 503
+        // (`src/handlers/monitoring.rs` `failing`).
+        let (status_code, status_body) = d.get(ROUTE_STATUS);
+        assert_eq!(
+            status_code, HTTP_UNAVAILABLE,
+            "#9128 {arm:?}: {ROUTE_STATUS} must accept the configured key and answer 503 \
+             over a drifted index; body: {status_body}"
+        );
         let s: serde_json::Value = serde_json::from_str(&status_body).expect("status json");
         let reasons: Vec<&str> = s["reasons"]
             .as_array()
@@ -407,11 +480,55 @@ fn http_health_and_status_turn_not_ok_on_every_drift_arm_9128() {
 /// class is that it never certifies an index it did not compare: over every
 /// drift arm the `fts_index_integrity` fact is the explicit `not_observed`
 /// disposition, never `verified`.
+///
+/// Pinned exactly, per arm: the fact is the read-only disposition, the Index
+/// section severity is `info` (the FTS fact never raises it), and the exit
+/// status and overall severity equal the clean control's, so the read-only
+/// doctor neither certifies nor alarms on a check it did not run.
 #[test]
 fn cli_doctor_never_certifies_a_drifted_index_it_did_not_compare_9128() {
     let dir = tempfile::tempdir().expect("tempdir");
-    for arm in DRIFT_ARMS {
-        let path = damaged_db(dir.path(), arm);
+    let control = DoctorRun::on(&damaged_db(dir.path(), Arm::Clean));
+    assert!(
+        control.exit.is_some(),
+        "Clean: doctor must exit with a status, not a signal; stdout: {}",
+        control.json
+    );
+    let drift_runs = DRIFT_ARMS.map(|arm| (arm, DoctorRun::on(&damaged_db(dir.path(), arm))));
+    for (arm, run) in std::iter::once((Arm::Clean, &control))
+        .chain(drift_runs.iter().map(|(arm, run)| (*arm, run)))
+    {
+        let fact = find_fact(&run.json, DOCTOR_FTS_FACT).unwrap_or_default();
+        assert!(
+            !fact.starts_with(DOCTOR_FTS_VERIFIED_PREFIX),
+            "#9128 {arm:?}: doctor must not certify an uncompared index; {fact:?}"
+        );
+        assert_eq!(
+            (
+                fact.as_str(),
+                run.index_severity(),
+                run.exit,
+                run.json["overall"].as_str()
+            ),
+            (
+                DOCTOR_FTS_READ_ONLY,
+                Some(DOCTOR_SEVERITY_INFO),
+                control.exit,
+                control.json["overall"].as_str()
+            ),
+            "#9128 {arm:?}: read-only doctor disposition, Index severity, exit status, overall"
+        );
+    }
+}
+
+/// One `ai-memory doctor --json` run: exit status and parsed report.
+struct DoctorRun {
+    exit: Option<i32>,
+    json: serde_json::Value,
+}
+
+impl DoctorRun {
+    fn on(path: &Path) -> Self {
         let out = Command::new(env!("CARGO_BIN_EXE_ai-memory"))
             .args(["--db", &path.display().to_string(), "doctor", "--json"])
             .env("AI_MEMORY_NO_CONFIG", "1")
@@ -422,14 +539,18 @@ fn cli_doctor_never_certifies_a_drifted_index_it_did_not_compare_9128() {
             .output()
             .expect("run doctor");
         let stdout = String::from_utf8_lossy(&out.stdout);
-        let v: serde_json::Value = serde_json::from_str(&stdout).expect("doctor json");
-        let fact = find_fact(&v, "fts_index_integrity").unwrap_or_default();
-        assert!(
-            fact.starts_with(DOCTOR_FTS_NOT_OBSERVED_PREFIX)
-                && !fact.starts_with(DOCTOR_FTS_VERIFIED_PREFIX),
-            "#9128 {arm:?}: doctor must not certify an uncompared index; \
-             fts_index_integrity = {fact:?}"
-        );
+        Self {
+            exit: out.status.code(),
+            json: serde_json::from_str(&stdout).expect("doctor json"),
+        }
+    }
+
+    fn index_severity(&self) -> Option<&str> {
+        self.json["sections"]
+            .as_array()?
+            .iter()
+            .find(|s| s["name"].as_str() == Some(DOCTOR_INDEX_SECTION))?["severity"]
+            .as_str()
     }
 }
 
@@ -499,13 +620,20 @@ impl Daemon {
         let tls = common::tls::shared(&std::env::temp_dir());
         let stderr_log = log_stem.with_extension("serve-stderr.log");
         let stderr_file = std::fs::File::create(&stderr_log).expect("stderr log");
-        // A per-daemon config home carrying only the keyword tier and the
-        // test key: the serve key is read from config, never from argv.
-        let config_home = log_stem.with_extension("config-home");
-        let config_dir = config_home.join("ai-memory");
+        // A per-daemon HOME carrying only the keyword tier and the test key:
+        // the serve key is read from config, never from argv. The file sits at
+        // `$HOME/.config/ai-memory/config.toml` with `XDG_CONFIG_HOME` set to
+        // `$HOME/.config`, the one path the config resolver reads on every
+        // platform: the XDG path on Linux, the documented dot-config path on
+        // macOS, where `dirs::config_dir()` ignores `XDG_CONFIG_HOME`
+        // (`src/config.rs` `resolve_config_path_choice`; precedent
+        // `tests/bind_api_key_token_file_3781.rs`).
+        let home = log_stem.with_extension("home");
+        let config_home = home.join(DOT_CONFIG_DIR);
+        let config_dir = config_home.join(CONFIG_APP_DIR);
         std::fs::create_dir_all(&config_dir).expect("config dir");
         std::fs::write(
-            config_dir.join("config.toml"),
+            config_dir.join(CONFIG_FILE),
             format!("tier = \"keyword\"\napi_key = \"{TEST_API_KEY}\"\n"),
         )
         .expect("write config");
@@ -521,7 +649,7 @@ impl Daemon {
             .args(tls.serve_arg_strs())
             .env_remove("AI_MEMORY_NO_CONFIG")
             .env("XDG_CONFIG_HOME", &config_home)
-            .env("HOME", &config_home)
+            .env("HOME", &home)
             .env("AI_MEMORY_INFERENCE_EGRESS", "deny")
             .env("AI_MEMORY_EMBED_OFFLINE", "1")
             .env("HF_HUB_OFFLINE", "1")

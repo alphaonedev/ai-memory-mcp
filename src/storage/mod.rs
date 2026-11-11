@@ -22328,15 +22328,19 @@ pub fn memories_updated_since_counted(
 /// DELIBERATELY not on any per-request path: it re-tokenizes every row of
 /// `memories` and is prepared as a WRITER, so it holds the WAL write lock
 /// for its whole O(corpus) duration. Reached only from
-/// [`crate::background::fts_integrity`] (paced) and `ai-memory doctor`
-/// (explicit, operator-invoked).
+/// [`crate::background::fts_integrity`] (paced) and the doctor's Index
+/// section on a writable connection. The `ai-memory doctor` verb opens the
+/// database read-only (#3434), so it reports `not_observed` for this check
+/// and never runs it.
 ///
 /// #4036 / #9128: `rank = 1` makes FTS5 compare every posting with the
 /// external `memories` content. The default form (no rank) only checks the
 /// internal index structure and certifies stale, missing or ghost postings
-/// as healthy, so the paced worker, `/health`, `/monitoring/status` and
-/// `ai-memory doctor` (all of which read this one funnel) reported "ok"
-/// while a live memory was absent from the index.
+/// as healthy, so the paced worker and the `/health` and
+/// `/monitoring/status` surfaces that read its cached verdict reported "ok"
+/// while a live memory was absent from the index. The check holds the
+/// writer lock for a time linear in the corpus with no runtime cap
+/// (PRE-EXISTING #9181).
 const SQL_FTS_INTEGRITY_CHECK: &str =
     "INSERT INTO memories_fts(memories_fts, rank) VALUES('integrity-check', 1)";
 
