@@ -339,8 +339,10 @@ fn daemon_signed_row_behaves_as_before() {
 }
 
 #[test]
-fn self_signed_non_link_row_keeps_the_daemon_arm() {
-    // The offload audit row is `self_signed` but not a link row.
+fn self_signed_non_link_row_is_unverifiable_never_daemon_checked_9179() {
+    // The offload audit row is `self_signed` but not a link row: it is signed
+    // by an agent key over a pre-image the row does not carry, so it fails
+    // closed as `self_signed_unverifiable`, never as a false `daemon_signature`.
     let conn = link_db();
     let ev = SignedEvent {
         id: uuid::Uuid::new_v4().to_string(),
@@ -356,7 +358,60 @@ fn self_signed_non_link_row_keeps_the_daemon_arm() {
     };
     append_signed_event(&conn, &ev).expect("append");
     let rep = walk(&conn, &enrolled);
-    assert_eq!(rep.signature_failure_reasons, vec![(1, R_DAEMON_SIGNATURE)]);
+    assert_eq!(
+        rep.signature_failure_reasons,
+        vec![(1, R_SELF_SIGNED_UNVERIFIABLE)]
+    );
+    assert_eq!(rep.signature_failures, vec![1]);
+    // Same verdict with no daemon key at all: the arm never consults it.
+    let mut stored = ev;
+    stored.sequence = 1;
+    assert_eq!(
+        classify_row_signature(&stored, None, None).signature_failure_reason(),
+        Some(R_SELF_SIGNED_UNVERIFIABLE)
+    );
+}
+
+#[test]
+fn unsigned_invalidation_row_is_withheld_not_a_daemon_failure_9179() {
+    // `invalidate_link` appends an `unsigned` `memory_link.invalidated` row
+    // whose `signature` column is the SUPERSEDED link signature.
+    let conn = link_db();
+    add_signed_link(&conn, &observer_key(), "m-src", "m-dst");
+    let superseded = observer_key().sign(b"superseded-link").to_bytes().to_vec();
+    let ev = SignedEvent {
+        id: uuid::Uuid::new_v4().to_string(),
+        agent_id: OBSERVER.to_string(),
+        event_type: event_types::MEMORY_LINK_INVALIDATED.to_string(),
+        payload_hash: payload_hash(b"post-supersession-cbor"),
+        signature: Some(superseded),
+        attest_level: crate::models::AttestLevel::Unsigned.as_str().to_string(),
+        timestamp: INVALIDATED_AT.to_string(),
+        prev_hash: Vec::new(),
+        sequence: 0,
+        cause_hash: None,
+    };
+    append_signed_event(&conn, &ev).expect("append");
+    let rep = walk(&conn, &enrolled);
+    assert_eq!(rep.signature_failure_reasons, Vec::<(i64, &str)>::new());
+    assert_eq!(rep.signature_failures, Vec::<i64>::new());
+    assert!(rep.chain_holds());
+    // The create row verifies; the invalidation row is withheld (unverified).
+    assert_eq!(rep.rows_checked, 2);
+    assert_eq!(rep.rows_positively_verified, 1);
+
+    // Only that row class is exempt: the same row labelled `daemon_signed`
+    // still fails the daemon arm.
+    let mut relabelled = ev;
+    relabelled.attest_level = crate::models::AttestLevel::DaemonSigned
+        .as_str()
+        .to_string();
+    relabelled.sequence = 2;
+    let pin = daemon_pin();
+    assert_eq!(
+        classify_row_signature(&relabelled, Some(&pin), None).signature_failure_reason(),
+        Some(R_DAEMON_SIGNATURE)
+    );
 }
 
 #[test]

@@ -1324,11 +1324,20 @@ pub fn classify_row_signature(
 /// `memory_link.created` row at `attest_level = self_signed`, signed by the
 /// link OBSERVER key over the canonical link CBOR (the `storage::create_link`
 /// outbound and inbound writers), never by the daemon key. Other `self_signed`
-/// rows (the offload audit row) keep the legacy daemon arm.
+/// rows (the offload audit row) are `self_signed_unverifiable` (#9179).
 #[must_use]
 pub fn is_self_signed_link_row(event: &SignedEvent) -> bool {
     event.attest_level == crate::models::AttestLevel::SelfSigned.as_str()
         && event.event_type == event_types::MEMORY_LINK_CREATED
+}
+
+/// #9179 — `true` for the `unsigned` `memory_link.invalidated` audit row
+/// `storage::invalidate_link` writes: its `signature` column carries the
+/// superseded link signature, never a daemon attestation of the row.
+#[must_use]
+pub fn is_unsigned_invalidation_row(event: &SignedEvent) -> bool {
+    event.attest_level == crate::models::AttestLevel::Unsigned.as_str()
+        && event.event_type == event_types::MEMORY_LINK_INVALIDATED
 }
 
 /// #9162 — the link pre-image of a `self_signed` `memory_link.created` row as
@@ -1622,6 +1631,14 @@ pub fn classify_row_signature_with_links(
             None => RowSignatureVerdict::Failed(SignatureFailure::SelfSignedUnverifiable),
         };
     }
+    if event.attest_level == AttestLevel::SelfSigned.as_str() {
+        // #9179 — a non-link `self_signed` row (the offload audit row) is
+        // signed by an agent key over a pre-image the row does not carry, so
+        // no walk can verify it. It is never checked against the daemon key,
+        // which always false-failed it as `daemon_signature`; it fails closed
+        // with the honest reason instead.
+        return RowSignatureVerdict::Failed(SignatureFailure::SelfSignedUnverifiable);
+    }
     if event.attest_level == AttestLevel::RecorderSigned.as_str() {
         // RECORDER-signed row (C6: withhold when no recorder pubkey enrolled).
         let Some(rk) = recorder_verifier else {
@@ -1665,6 +1682,14 @@ pub fn classify_row_signature_with_links(
         // COUNTED as `Skipped(NoVerifier)`; never dirties without a pin.
         return RowSignatureVerdict::Skipped(SkipReason::NoVerifier);
     };
+    if is_unsigned_invalidation_row(event) {
+        // #9179 — `invalidate_link` records the SUPERSEDED link signature on
+        // an `unsigned` `memory_link.invalidated` row; it is no daemon row
+        // attestation, so checking it against the daemon key false-failed every
+        // clean invalidation. Withheld like every by-design unsigned row (and
+        // counted unverified, so dirty once an audit pin is enrolled).
+        return RowSignatureVerdict::Skipped(SkipReason::UnsignedByDesign);
+    }
     match event.signature.as_ref() {
         Some(sig_bytes) if !sig_bytes.is_empty() => {
             match <[u8; 64]>::try_from(sig_bytes.as_slice()) {
