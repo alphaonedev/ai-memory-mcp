@@ -65,6 +65,13 @@ const LINK_RELATION: &str = "related_to";
 const PEER_FAIL_STATUS: StatusCode = StatusCode::SERVICE_UNAVAILABLE;
 /// The under-replication status (W3 / G12: local row durable, peers short).
 const UNDER_REPLICATED: StatusCode = StatusCode::ACCEPTED;
+/// The K7 approval HMAC secret the decision cells sign with.
+const APPROVAL_SECRET: &str = "fedpush-8741-approval-secret";
+/// The approve-surface body the approval-decide cell sends.
+const APPROVE_DECISION_BODY: &str = r#"{"decision":"approve","remember":"once"}"#;
+/// The certified-tier marker (#2548, `cert-postgres-age.yml`): with it set a
+/// PostgreSQL cell that cannot run is a failure, never a skip.
+const CERT_TIER_MARKER: &str = "AI_MEMORY_TEST_AGE_URL";
 
 // ---------------------------------------------------------------------------
 // Recording mock peer with a fail switch
@@ -216,6 +223,7 @@ struct Origin {
     router: axum::Router,
     peer: MockPeer,
     ns: String,
+    store: Arc<dyn ai_memory::store::MemoryStore>,
     _db_file: Option<tempfile::NamedTempFile>,
 }
 
@@ -240,6 +248,8 @@ fn process_setup() {
     // Tombstoned, re-broadcast, never hard-deleted at peers).
     ai_memory::config::set_lineage_dag(true);
     ai_memory::config::set_consolidate_tombstone_sources(true);
+    // The approve / reject / approval-decide cells sign as the K7 decider.
+    ai_memory::config::set_active_hooks_hmac_secret(Some(APPROVAL_SECRET.to_string()));
 }
 
 /// `None` when the backend is not available in this run (PG URL unset).
@@ -262,12 +272,15 @@ async fn origin(backend: Backend) -> Option<Origin> {
             let store: Arc<dyn ai_memory::store::MemoryStore> = Arc::new(
                 ai_memory::store::sqlite::SqliteStore::open(&path).expect("SqliteStore::open"),
             );
-            let router =
-                ai_memory::build_router(api_key_state(), app_state(db, store, backend, fed));
+            let router = ai_memory::build_router(
+                api_key_state(),
+                app_state(db, store.clone(), backend, fed),
+            );
             Some(Origin {
                 router,
                 peer,
                 ns,
+                store,
                 _db_file: Some(f),
             })
         }
@@ -286,12 +299,15 @@ async fn origin(backend: Backend) -> Option<Origin> {
                     .await
                     .expect("PostgresStore::connect"),
             );
-            let router =
-                ai_memory::build_router(api_key_state(), app_state(db, store, backend, fed));
+            let router = ai_memory::build_router(
+                api_key_state(),
+                app_state(db, store.clone(), backend, fed),
+            );
             Some(Origin {
                 router,
                 peer,
                 ns,
+                store,
                 _db_file: None,
             })
         }
@@ -300,6 +316,19 @@ async fn origin(backend: Backend) -> Option<Origin> {
 
 impl Origin {
     async fn call(&self, method: Method, uri: &str, body: Option<Value>) -> (StatusCode, Value) {
+        self.call_raw(method, uri, body.map(|b| b.to_string()), &[])
+            .await
+    }
+
+    /// `call` with the exact body bytes and extra headers (the signed
+    /// decision routes sign the bytes they send).
+    async fn call_raw(
+        &self,
+        method: Method,
+        uri: &str,
+        body: Option<String>,
+        extra: &[(&str, String)],
+    ) -> (StatusCode, Value) {
         let mut req = Request::builder()
             .method(method)
             .uri(uri)
@@ -308,8 +337,11 @@ impl Origin {
         if body.is_none() {
             req = req.header("content-length", "0");
         }
+        for (name, value) in extra {
+            req = req.header(*name, value.as_str());
+        }
         let req = req
-            .body(body.map_or_else(Body::empty, |b| Body::from(b.to_string())))
+            .body(body.map_or_else(Body::empty, Body::from))
             .expect("request");
         let resp = self.router.clone().oneshot(req).await.expect("oneshot");
         let status = resp.status();
@@ -338,6 +370,71 @@ impl Origin {
             .await;
         assert_eq!(status, StatusCode::CREATED, "seed create: {body}");
         body["id"].as_str().expect("create id").to_string()
+    }
+
+    /// Queue an approve-gated pending Store by a distinct requester and
+    /// register `ADMIN_AGENT` as the decider (the Human-arm gate: a
+    /// registered approver that is not the requester). Returns
+    /// `(pending id, queued title)`.
+    async fn seed_pending(&self, ns: &str) -> (String, String) {
+        let requester = format!("ai:fedpush-8741-req-{}", uuid::Uuid::new_v4().simple());
+        let ctx = ai_memory::store::CallerContext::for_agent(requester.clone());
+        let now = chrono::Utc::now().to_rfc3339();
+        self.store
+            .register_agent(
+                &ctx,
+                &ai_memory::models::AgentRegistration {
+                    agent_id: ADMIN_AGENT.to_string(),
+                    agent_type: "ai:generic".to_string(),
+                    capabilities: Vec::new(),
+                    registered_at: now.clone(),
+                    last_seen_at: now.clone(),
+                },
+            )
+            .await
+            .ok();
+        let title = format!("pending-8741-{}", uuid::Uuid::new_v4());
+        let payload = json!({
+            "id": uuid::Uuid::new_v4().to_string(),
+            "tier": "mid",
+            "namespace": ns,
+            "title": title,
+            "content": format!("{title} queued body with enough length"),
+            "tags": [],
+            "priority": 5,
+            "confidence": 1.0,
+            "source": "api",
+            "access_count": 0,
+            "created_at": now,
+            "updated_at": now,
+            "metadata": {"agent_id": requester},
+        });
+        let pid = self
+            .store
+            .queue_pending_action(
+                &ctx,
+                ai_memory::store::GovernedAction::Store,
+                ns,
+                None,
+                &requester,
+                &payload,
+            )
+            .await
+            .expect("queue_pending_action");
+        (pid, title)
+    }
+
+    /// A K7-signed decision POST as `ADMIN_AGENT`.
+    async fn signed_decision(&self, uri: &str, pid: &str, body: &str) -> (StatusCode, Value) {
+        let ts = chrono::Utc::now().timestamp().to_string();
+        let subject = ai_memory::handlers::agent_api_key::approval_subject(pid, ADMIN_AGENT);
+        let sig = common::sign_canonical_envelope(APPROVAL_SECRET, &ts, "POST", &subject, body);
+        let extra = [
+            ("x-ai-memory-timestamp", ts),
+            ("x-ai-memory-signature", sig),
+        ];
+        let body = (!body.is_empty()).then(|| body.to_string());
+        self.call_raw(Method::POST, uri, body, &extra).await
     }
 
     async fn mark(&self) -> usize {
@@ -421,6 +518,10 @@ enum Op {
     Import,
     NamespaceStandardSet,
     NamespaceStandardClear,
+    Approve,
+    Reject,
+    ApprovalDecide,
+    ForgetEmpty,
 }
 
 /// The ids of every `memories[]` row the peer received.
@@ -453,6 +554,69 @@ fn ns_clears_in(bodies: &[Value]) -> BTreeSet<String> {
         .flatten()
         .filter_map(|v| v.as_str().map(str::to_string))
         .collect()
+}
+
+/// `(id, approved, decider)` of every `pending_decisions[]` entry received.
+fn decisions_in(bodies: &[Value]) -> BTreeSet<(String, bool, String)> {
+    bodies
+        .iter()
+        .filter_map(|p| p.get("pending_decisions").and_then(Value::as_array))
+        .flatten()
+        .filter_map(|d| {
+            Some((
+                d["id"].as_str()?.to_string(),
+                d["approved"].as_bool()?,
+                d["decider"].as_str()?.to_string(),
+            ))
+        })
+        .collect()
+}
+
+/// T1: approve / reject / approval-decide. Peer up: the peer receives the
+/// exact decision and (approve only) the produced row; peer down: the 202.
+async fn run_decision(o: &Origin, op: Op, peer_down: bool) -> Option<(StatusCode, Value)> {
+    let label = format!("{op:?} peer_down={peer_down}");
+    let ns = format!("{}-{}", o.ns, uuid::Uuid::new_v4());
+    let (pid, title) = o.seed_pending(&ns).await;
+    let mark = o.mark().await;
+    o.peer.fail.store(peer_down, Ordering::Release);
+    let (status, body) = match op {
+        Op::Approve => {
+            o.signed_decision(&path_with_id(routes::PENDING_ID_APPROVE, &pid), &pid, "")
+                .await
+        }
+        Op::Reject => {
+            o.signed_decision(&path_with_id(routes::PENDING_ID_REJECT, &pid), &pid, "")
+                .await
+        }
+        Op::ApprovalDecide => {
+            let uri = routes::APPROVALS_PENDING_ID.replace("{pending_id}", &pid);
+            o.signed_decision(&uri, &pid, APPROVE_DECISION_BODY).await
+        }
+        _ => unreachable!("run_decision handles the decision ops only"),
+    };
+    o.peer.fail.store(false, Ordering::Release);
+    if peer_down {
+        assert_under_replicated(&label, status, &body);
+        return None;
+    }
+    let approved = !matches!(op, Op::Reject);
+    let bodies = o.since(mark).await;
+    assert_eq!(
+        decisions_in(&bodies),
+        BTreeSet::from([(pid.clone(), approved, ADMIN_AGENT.to_string())]),
+        "{label}: peer must receive exactly this decision: {bodies:?}"
+    );
+    let produced: Vec<Value> = memories_in(&bodies)
+        .into_iter()
+        .filter(|m| m["title"] == json!(title) && m["namespace"] == json!(ns))
+        .collect();
+    assert_eq!(
+        produced.len(),
+        usize::from(approved),
+        "{label}: produced rows shipped: {bodies:?}"
+    );
+    Some((status, body))
 }
 
 fn standard_path(ns: &str) -> String {
@@ -596,7 +760,11 @@ async fn run_extra(o: &Origin, op: Op, peer_down: bool) -> Option<(StatusCode, V
                 .iter()
                 .filter_map(|p| p.get("links").and_then(Value::as_array))
                 .flatten()
-                .any(|l| l["source_id"] == req["links"][0]["source_id"]);
+                .any(|l| {
+                    l["source_id"] == req["links"][0]["source_id"]
+                        && l["target_id"] == req["links"][0]["target_id"]
+                        && l["relation"] == json!(LINK_RELATION)
+                });
             assert!(
                 link_shipped,
                 "{label}: imported link not shipped: {bodies:?}"
@@ -640,6 +808,36 @@ async fn run_cell(o: &Origin, op: Op, peer_down: bool) {
             Some(done) => done,
             None => return,
         },
+        Op::Approve | Op::Reject | Op::ApprovalDecide => {
+            match run_decision(o, op, peer_down).await {
+                Some(done) => done,
+                None => return,
+            }
+        }
+        Op::ForgetEmpty => {
+            // F5: nothing matched, nothing to deliver: no fabricated ack
+            // count, peer up or down, and the peer receives nothing.
+            let ns = format!("{ns}-forget-empty-{}", uuid::Uuid::new_v4());
+            let mark = o.mark().await;
+            o.peer.fail.store(peer_down, Ordering::Release);
+            let (status, body) = o
+                .call(Method::POST, routes::FORGET, Some(json!({"namespace": ns})))
+                .await;
+            o.peer.fail.store(false, Ordering::Release);
+            assert_eq!(status, StatusCode::OK, "{label}: {body}");
+            assert_eq!(body["deleted"], json!(0), "{label}: {body}");
+            for field in [QUORUM_ACKS_FIELD, QUORUM_N_FIELD, QUORUM_REQUIRED_FIELD] {
+                assert!(
+                    body.get(field).is_none(),
+                    "{label}: {field} stamped: {body}"
+                );
+            }
+            assert!(
+                o.since(mark).await.is_empty(),
+                "{label}: peer received a body"
+            );
+            return;
+        }
         Op::Update => {
             let id = o.create(&ns, "upd").await;
             let new_content = format!("updated content {}", uuid::Uuid::new_v4());
@@ -814,6 +1012,10 @@ async fn run_cell(o: &Origin, op: Op, peer_down: bool) {
             for i in 0..CONSOLIDATE_SOURCES {
                 sources.push(o.create(&ns, &format!("consol-{i}")).await);
             }
+            let title = json!(format!(
+                "fedpush 8741 consolidated {}",
+                uuid::Uuid::new_v4()
+            ));
             let mark = o.mark().await;
             o.peer.fail.store(peer_down, Ordering::Release);
             let (status, body) = o
@@ -822,7 +1024,7 @@ async fn run_cell(o: &Origin, op: Op, peer_down: bool) {
                     routes::CONSOLIDATE,
                     Some(json!({
                         "ids": sources,
-                        "title": format!("fedpush 8741 consolidated {}", uuid::Uuid::new_v4()),
+                        "title": title,
                         "summary": "caller supplied consolidation summary of enough length",
                         "namespace": ns,
                         "tier": "long",
@@ -832,10 +1034,16 @@ async fn run_cell(o: &Origin, op: Op, peer_down: bool) {
             o.peer.fail.store(false, Ordering::Release);
             if peer_down {
                 assert_under_replicated(&label, status, &body);
-                assert!(
-                    body["id"].is_string(),
-                    "{label}: 202 names the local row: {body}"
+                let id = body["id"].as_str().expect("202 names the local row");
+                let (got, row) = o
+                    .call(Method::GET, &path_with_id(routes::MEMORIES_ID, id), None)
+                    .await;
+                assert_eq!(
+                    got,
+                    StatusCode::OK,
+                    "{label}: 202 id {id} not persisted: {row}"
                 );
+                assert_eq!(row["memory"]["title"], title, "{label}: {row}");
                 return;
             }
             let derived = body["id"].as_str().expect("derived id").to_string();
@@ -870,6 +1078,13 @@ async fn run_cell(o: &Origin, op: Op, peer_down: bool) {
 /// then with the peer down (the exact 202).
 async fn run_op(backend: Backend, op: Op) {
     let Some(o) = origin(backend).await else {
+        // sec-F5 (#2548): under the certified tier a cell that did not run
+        // is a failure, never a green skip.
+        assert!(
+            std::env::var_os(CERT_TIER_MARKER).is_none(),
+            "{backend:?} cell did not run under the certified tier ({CERT_TIER_MARKER} set, \
+             AI_MEMORY_TEST_POSTGRES_URL unset)"
+        );
         eprintln!("skip {backend:?}: AI_MEMORY_TEST_POSTGRES_URL not set");
         return;
     };
@@ -917,6 +1132,10 @@ op_cells! {
     capture_turn_9153 => Op::CaptureTurn,
     entity_register_9153 => Op::EntityRegister,
     import_9153 => Op::Import,
+    pending_approve_8741 => Op::Approve,
+    pending_reject_8741 => Op::Reject,
+    approval_decide_8741 => Op::ApprovalDecide,
+    bulk_forget_empty_8741 => Op::ForgetEmpty,
 }
 
 // ---------------------------------------------------------------------------
@@ -997,7 +1216,8 @@ const ROWS: &[(&str, &str, Fed)] = &[
     ("post", "SKILL_ID_RETIRE", Fed::Pending(9158)),
     ("post", "SHARE", Fed::Pending(9158)),
     ("post", "MEMORY_SMART_LOAD", Fed::ReadOnly),
-    ("post", "MEMORY_REFLECT", Fed::Fanout),
+    // sec-F5: reflect_fanout (route_1111.rs) still swallows push errors.
+    ("post", "MEMORY_REFLECT", Fed::Pending(9182)),
     ("post", "MEMORY_RECALL_OBSERVATIONS", Fed::ReadOnly),
     ("post", "MEMORY_REFLECTION_ORIGIN", Fed::ReadOnly),
     ("post", "MEMORY_DEPENDENTS_OF_INVALIDATED", Fed::ReadOnly),
@@ -1018,13 +1238,82 @@ const ROUTER_FN: &str = "pub fn build_router_with_timeout(";
 const ROUTE_CALL: &str = ".route(";
 const ROUTES_PREFIX: &str = "handlers::routes::";
 
-/// Remove `//` line comments (a commented-out registration is not live).
-fn strip_line_comments(src: &str) -> String {
-    src.lines()
-        .map(|l| l.find("//").map_or(l, |i| &l[..i]))
-        .collect::<Vec<_>>()
-        .join("\n")
-        + "\n"
+/// Remove `//` line comments and (nested) `/* */` block comments, so a
+/// commented-out registration is not live, while string and char literals
+/// pass through verbatim (a `"http://..."` argument is not a comment).
+/// Newlines inside block comments are kept so line structure survives.
+/// One pass, linear in the input.
+fn strip_comments(src: &str) -> String {
+    let chars: Vec<char> = src.chars().collect();
+    let mut out = String::with_capacity(src.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let next = chars.get(i + 1).copied();
+        match (c, next) {
+            ('/', Some('/')) => {
+                while i < chars.len() && chars[i] != '\n' {
+                    i += 1;
+                }
+            }
+            ('/', Some('*')) => {
+                let mut depth = 0_usize;
+                while i < chars.len() {
+                    match (chars[i], chars.get(i + 1).copied()) {
+                        ('/', Some('*')) => {
+                            depth += 1;
+                            i += 2;
+                        }
+                        ('*', Some('/')) => {
+                            depth -= 1;
+                            i += 2;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        ('\n', _) => {
+                            out.push('\n');
+                            i += 1;
+                        }
+                        _ => i += 1,
+                    }
+                }
+            }
+            ('"', _) => {
+                out.push(c);
+                i += 1;
+                while i < chars.len() {
+                    out.push(chars[i]);
+                    match chars[i] {
+                        '\\' => {
+                            if let Some(&esc) = chars.get(i + 1) {
+                                out.push(esc);
+                            }
+                            i += 2;
+                        }
+                        '"' => {
+                            i += 1;
+                            break;
+                        }
+                        _ => i += 1,
+                    }
+                }
+            }
+            ('\'', Some(n)) if n == '\\' || chars.get(i + 2) == Some(&'\'') => {
+                // A char literal ('"', '\\', '/'); a lifetime falls through.
+                let end = (i + 1..chars.len())
+                    .find(|&j| chars[j] == '\'' && (j > i + 2 || n != '\\'))
+                    .unwrap_or(chars.len() - 1);
+                out.extend(&chars[i..=end]);
+                i = end + 1;
+            }
+            _ => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    out
 }
 
 /// The argument text of a call whose `(` was just consumed, up to the
@@ -1049,7 +1338,7 @@ fn balanced(s: &str) -> Option<&str> {
 /// `(method, route const)` for every mutating registration.
 fn mutating_registrations(lib_rs: &str) -> Vec<(String, String)> {
     let start = lib_rs.find(ROUTER_FN).expect("router fn present");
-    let body = strip_line_comments(&lib_rs[start..]);
+    let body = strip_comments(&lib_rs[start..]);
     let end = body.find("\n}\n").expect("router fn end");
     let body = &body[..end];
     let mut out = Vec::new();
@@ -1131,4 +1420,39 @@ fn registration_scanner_reads_chains_and_skips_comments_8741() {
             ("delete".to_string(), "A".to_string()),
         ]
     );
+}
+
+/// T3: a `//` inside a string literal is not a comment (the registration
+/// after it stays live) and a `/* */` block (nested, multi-line) is.
+#[test]
+fn registration_scanner_honours_strings_and_block_comments_8741() {
+    let src = "pub fn build_router_with_timeout(\n) {\n    \
+        .route(handlers::routes::A, get(h::a)).layer(x(\"http://h/p\")).route(handlers::routes::D, post(h::d))\n    \
+        /* .route(handlers::routes::B, post(h::b))\n    /* nested */ .route(handlers::routes::E, put(h::e)) */\n    \
+        .route(handlers::routes::C, delete(h::c('/')))\n}\n";
+    let got = mutating_registrations(src);
+    assert_eq!(
+        got,
+        vec![
+            ("post".to_string(), "D".to_string()),
+            ("delete".to_string(), "C".to_string()),
+        ]
+    );
+}
+
+/// T3 bound: the comment stripper is one linear pass (100K+ input).
+#[test]
+fn comment_stripper_is_linear_on_a_large_input_8741() {
+    const REPEAT: usize = 20_000;
+    let unit = "x(\"a//b\") /* c */ // d\n";
+    let src = unit.repeat(REPEAT);
+    assert!(src.len() > 100_000);
+    let started = std::time::Instant::now();
+    let out = strip_comments(&src);
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(out, "x(\"a//b\")  \n".repeat(REPEAT));
 }
