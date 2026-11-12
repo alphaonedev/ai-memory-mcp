@@ -91,6 +91,13 @@ struct ArmEffects {
     indexes: Vec<String>,
     /// `(table, column)` pairs added via `ALTER TABLE … ADD COLUMN`.
     columns: Vec<(String, String)>,
+    /// Trigger names created via `CREATE [OR REPLACE] [CONSTRAINT] TRIGGER`.
+    /// A trigger is schema state exactly like a column: a legacy shape that
+    /// keeps a later version's trigger is not that version's shape (#9217).
+    triggers: Vec<String>,
+    /// Function names created via `CREATE [OR REPLACE] FUNCTION` (trigger
+    /// functions included; a body can name a column a rewind has removed).
+    functions: Vec<String>,
 }
 
 fn repo_path(rel: &str) -> PathBuf {
@@ -235,20 +242,42 @@ fn scan_effects(text: &str, out: &mut ArmEffects) {
             }
             if t.eq_ignore_ascii_case("CREATE") {
                 let mut k = i + 1;
+                // Optional `OR REPLACE` (functions, triggers).
+                if tokens.get(k).is_some_and(|x| x.eq_ignore_ascii_case("OR"))
+                    && tokens
+                        .get(k + 1)
+                        .is_some_and(|x| x.eq_ignore_ascii_case("REPLACE"))
+                {
+                    k += 2;
+                }
                 if tokens
                     .get(k)
                     .is_some_and(|x| x.eq_ignore_ascii_case("UNIQUE"))
                 {
                     k += 1;
                 }
+                // Optional `CONSTRAINT` (deferrable constraint triggers).
+                if tokens
+                    .get(k)
+                    .is_some_and(|x| x.eq_ignore_ascii_case("CONSTRAINT"))
+                {
+                    k += 1;
+                }
                 let kind = tokens.get(k).copied().unwrap_or("");
-                if (kind.eq_ignore_ascii_case("INDEX") || kind.eq_ignore_ascii_case("TABLE"))
+                if (kind.eq_ignore_ascii_case("INDEX")
+                    || kind.eq_ignore_ascii_case("TABLE")
+                    || kind.eq_ignore_ascii_case("FUNCTION")
+                    || kind.eq_ignore_ascii_case("TRIGGER"))
                     && let Some(j) = ident_pos(&tokens, k + 1)
                 {
                     let name = ident(tokens[j]);
                     if !name.is_empty() {
                         if kind.eq_ignore_ascii_case("INDEX") {
                             out.indexes.push(name);
+                        } else if kind.eq_ignore_ascii_case("FUNCTION") {
+                            out.functions.push(name);
+                        } else if kind.eq_ignore_ascii_case("TRIGGER") {
+                            out.triggers.push(name);
                         } else {
                             out.tables.push(name);
                         }
@@ -466,6 +495,42 @@ impl ScratchDb {
 /// version row. Indexes first, then columns, then tables — so a column drop
 /// never races the table it lives on.
 async fn rewind_to_version(pool: &PgPool, effects: &BTreeMap<i32, ArmEffects>, v: i32) {
+    // Triggers and trigger functions first: they are schema state of the arm
+    // that introduces them, stripped with the same derivation as the columns
+    // they reference (#9217). Only objects whose FIRST definition is above `v`
+    // go; a function created at or below `v` and `CREATE OR REPLACE`d above it
+    // stays (the legacy shape had it).
+    for (name, first) in first_definition_versions(effects, |e| &e.triggers) {
+        if first <= v {
+            continue;
+        }
+        let tables: Vec<String> = sqlx::query_scalar(
+            "SELECT c.relname::text FROM pg_trigger t
+             JOIN pg_class c ON c.oid = t.tgrelid
+             JOIN pg_namespace n ON n.oid = c.relnamespace
+             WHERE t.tgname = $1 AND NOT t.tgisinternal AND t.tgparentid = 0
+               AND n.nspname = 'public'",
+        )
+        .bind(&name)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_else(|e| panic!("rewind: look up trigger {name}: {e}"));
+        for tbl in tables {
+            sqlx::query(&format!("DROP TRIGGER IF EXISTS {name} ON {tbl}"))
+                .execute(pool)
+                .await
+                .unwrap_or_else(|e| panic!("rewind: DROP TRIGGER {name} ON {tbl}: {e}"));
+        }
+    }
+    for (name, first) in first_definition_versions(effects, |e| &e.functions) {
+        if first > v {
+            sqlx::query(&format!("DROP FUNCTION IF EXISTS {name} CASCADE"))
+                .execute(pool)
+                .await
+                .unwrap_or_else(|e| panic!("rewind: DROP FUNCTION {name}: {e}"));
+        }
+    }
+
     for (&version, eff) in effects.iter().rev() {
         if version <= v {
             continue;
@@ -492,6 +557,31 @@ async fn rewind_to_version(pool: &PgPool, effects: &BTreeMap<i32, ArmEffects>, v
         }
     }
 
+    // Catalog assertion (#9217): no trigger function left in the synthetic
+    // legacy shape may name a column the strip removed.
+    let stripped: BTreeSet<String> = effects
+        .range((v + 1)..)
+        .flat_map(|(_, e)| e.columns.iter().map(|(_, c)| c.to_ascii_lowercase()))
+        .collect();
+    let bodies: Vec<(String, String)> = sqlx::query(
+        "SELECT p.proname::text AS name, p.prosrc AS src FROM pg_proc p
+         JOIN pg_namespace n ON n.oid = p.pronamespace
+         WHERE n.nspname = 'public' AND p.prorettype = 'trigger'::regtype",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("rewind: read trigger function bodies")
+    .into_iter()
+    .map(|r| (r.get::<String, _>("name"), r.get::<String, _>("src")))
+    .collect();
+    let dangling = trigger_bodies_referencing_stripped_columns(&bodies, &stripped);
+    assert!(
+        dangling.is_empty(),
+        "#9217: the synthetic v{v} legacy shape keeps trigger functions that reference columns \
+         the strip removed (function:column): {dangling:?} — the strip set must remove triggers \
+         and trigger functions together with the columns they use."
+    );
+
     sqlx::query("DELETE FROM schema_version")
         .execute(pool)
         .await
@@ -501,6 +591,48 @@ async fn rewind_to_version(pool: &PgPool, effects: &BTreeMap<i32, ArmEffects>, v
         .execute(pool)
         .await
         .expect("rewind: stamp legacy schema_version");
+}
+
+/// `name -> lowest ladder version whose arm defines it`, for one name list of
+/// [`ArmEffects`] (`triggers` or `functions`).
+fn first_definition_versions(
+    effects: &BTreeMap<i32, ArmEffects>,
+    pick: fn(&ArmEffects) -> &Vec<String>,
+) -> BTreeMap<String, i32> {
+    let mut first: BTreeMap<String, i32> = BTreeMap::new();
+    for (&version, eff) in effects {
+        for name in pick(eff) {
+            first.entry(name.clone()).or_insert(version);
+        }
+    }
+    first
+}
+
+/// `function:column` for every trigger function body that names a stripped
+/// column as a whole identifier token (SQL `--` comments ignored).
+fn trigger_bodies_referencing_stripped_columns(
+    bodies: &[(String, String)],
+    stripped: &BTreeSet<String>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for (name, src) in bodies {
+        let code: String = src
+            .lines()
+            .map(|l| l.split("--").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .to_ascii_lowercase();
+        let tokens: BTreeSet<&str> = code
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .filter(|t| !t.is_empty())
+            .collect();
+        for col in stripped {
+            if tokens.contains(col.as_str()) {
+                out.push(format!("{name}:{col}"));
+            }
+        }
+    }
+    out
 }
 
 /// `table.column -> "<data_type>/<is_nullable>"` for the public schema.
@@ -888,6 +1020,51 @@ fn ladder_effect_derivation_is_not_vacuous() {
              the replay would not exercise the defect.",
         );
     }
+}
+
+/// #9217 — the strip derivation sees the v102 sync_seq trigger function and
+/// triggers, and the body check flags a trigger function that names a stripped
+/// column (database-free).
+#[test]
+fn ladder_effect_derivation_sees_triggers_and_flags_dangling_bodies_9217() {
+    let effects = ladder_effects_by_version();
+    let eff = effects
+        .values()
+        .find(|e| {
+            e.functions
+                .iter()
+                .any(|f| f == "memories_sync_seq_placeholder")
+        })
+        .expect("#9217: scanner missed CREATE OR REPLACE FUNCTION memories_sync_seq_placeholder");
+    assert!(
+        effects
+            .values()
+            .any(|e| e.triggers.iter().any(|t| t == "memories_sync_seq_bi")),
+        "#9217: scanner missed CREATE TRIGGER memories_sync_seq_bi"
+    );
+    assert!(
+        effects
+            .values()
+            .any(|e| e.triggers.iter().any(|t| t == "memories_sync_seq_ai")),
+        "#9217: scanner missed CREATE CONSTRAINT TRIGGER memories_sync_seq_ai"
+    );
+    assert!(eff.columns.iter().any(|(_, c)| c == "sync_seq"));
+
+    let bodies = vec![
+        (
+            "dangling".to_string(),
+            "BEGIN NEW.sync_seq := 1; RETURN NEW; END".to_string(),
+        ),
+        (
+            "clean".to_string(),
+            "BEGIN -- sync_seq is only named in a comment\n RETURN NEW; END".to_string(),
+        ),
+    ];
+    let stripped: BTreeSet<String> = ["sync_seq".to_string()].into();
+    assert_eq!(
+        trigger_bodies_referencing_stripped_columns(&bodies, &stripped),
+        vec!["dangling:sync_seq".to_string()]
+    );
 }
 
 /// Unit-pin the two pure helpers the scratch-database plumbing rests on. They
