@@ -77,16 +77,20 @@ const ARCHIVE_CONSOLIDATE_ROUTE: &str = "archive_consolidate_source_in_tx(";
 /// the exact failure mode this campaign exists to prevent. Tracked
 /// separately; see the PR body for the 2x3 adversarial vote (4 of 6 for
 /// leave-symmetric, 0 of 6 for postgres-only).
-const KIND_PROVENANCE_FUNNELS: &[&str] = &[
+///
+/// #9178 A — each entry pins the EXACT [`InsertOps`] of its span (equality,
+/// not `contains`), so a second `INSERT INTO memories` added beside the
+/// provenance-bound one is red even though the column and bind still appear.
+const KIND_PROVENANCE_FUNNELS: &[(&str, InsertOps)] = &[
     // Already correct before #2393 — pinned so they cannot regress.
-    "store",
-    "store_batch", // #2289
+    ("store", InsertOps::BOUND_ONCE),
+    ("store_batch", InsertOps::BOUND_ONCE), // #2289
     // #4447 — `archive_restore` is now a thin delegator to the inherent
     // `archive_restore_inner` (moved verbatim to
     // `postgres/federation_by_id_4447.rs` to gain the in-transaction peer-scope
     // re-check). The guard follows the INSERT..SELECT to the function that owns
     // it, the same move as `store_with_embedding_inner` above (#2771).
-    "archive_restore_inner", // #2333 / FBL-03
+    ("archive_restore_inner", InsertOps::CARRIED_ONCE), // #2333 / FBL-03
     // Fixed by #2393 — the three funnels the issue named…
     // #2771 — `store_with_embedding` was refactored into a thin delegator to the
     // shared inherent `store_with_embedding_inner`, which now holds the INSERT +
@@ -94,14 +98,77 @@ const KIND_PROVENANCE_FUNNELS: &[&str] = &[
     // `store_with_embedding_no_overwrite` fail-closed) delegate to it, so the
     // provenance-bind guard follows the INSERT to `_inner` — strictly stronger,
     // since it now also covers the no-overwrite arm's bind.
-    "store_with_embedding_inner",
-    "capture_turn_idempotent",
-    "recover_turn_idempotent",
+    ("store_with_embedding_inner", InsertOps::BOUND_ONCE),
+    ("capture_turn_idempotent", InsertOps::BOUND_ONCE),
+    ("recover_turn_idempotent", InsertOps::BOUND_ONCE),
     // …and the three the completeness sweep found that it did not.
-    "update_with_archive_on_supersede",
-    "reflect_with_hooks",
-    "apply_remote_memory",
+    ("update_with_archive_on_supersede", InsertOps::BOUND_ONCE),
+    ("reflect_with_hooks", InsertOps::BOUND_ONCE),
+    ("apply_remote_memory", InsertOps::BOUND_ONCE),
 ];
+
+/// #9178 A — the `memories` INSERTs of one function span, counted in code
+/// with comments stripped (SQL string text kept).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InsertOps {
+    /// `INSERT INTO memories` statements.
+    inserts: usize,
+    /// `extract_kind_provenance(` bind calls.
+    provenance_binds: usize,
+}
+
+impl InsertOps {
+    /// One INSERT, provenance bound through the vocab-validating SSOT.
+    const BOUND_ONCE: Self = Self {
+        inserts: 1,
+        provenance_binds: 1,
+    };
+    /// One `INSERT ... SELECT` that carries the column from the archive row.
+    const CARRIED_ONCE: Self = Self {
+        inserts: 1,
+        provenance_binds: 0,
+    };
+    const NONE: Self = Self {
+        inserts: 0,
+        provenance_binds: 0,
+    };
+}
+
+/// #9178 A — the hard-DELETE routes of one function span (comments
+/// stripped, the signature line excluded so a function never counts itself).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DeleteOps {
+    /// `DELETE FROM memories` statements plus `SQL_DELETE_MEMORY_BY_ID` uses.
+    bare_deletes: usize,
+    /// In-transaction [`AGE_UNPROJECT_CALL`] calls.
+    in_tx_unprojects: usize,
+    /// Pool-direct `unproject_memory_ids_best_effort(` calls.
+    best_effort_unprojects: usize,
+    /// Delegations to the #9018 helper ([`ARCHIVE_CONSOLIDATE_ROUTE`]).
+    archive_routes: usize,
+}
+
+impl DeleteOps {
+    /// One bare DELETE unprojected in the same transaction.
+    const IN_TX_ONCE: Self = Self {
+        bare_deletes: 1,
+        in_tx_unprojects: 1,
+        best_effort_unprojects: 0,
+        archive_routes: 0,
+    };
+    const NONE: Self = Self {
+        bare_deletes: 0,
+        in_tx_unprojects: 0,
+        best_effort_unprojects: 0,
+        archive_routes: 0,
+    };
+
+    /// Every bare DELETE has an unprojection, and the span deletes somehow.
+    fn unprojects_every_delete(self) -> bool {
+        self.bare_deletes <= self.in_tx_unprojects + self.best_effort_unprojects
+            && self.bare_deletes + self.best_effort_unprojects + self.archive_routes > 0
+    }
+}
 
 /// Funnels that persist `kind_provenance` through an `INSERT ... SELECT` over
 /// the archive table rather than a Rust-side bind (they still must name the
@@ -113,30 +180,76 @@ const INSERT_SELECT_CARRIERS: &[&str] = &["archive_restore", "archive_restore_in
 /// `update_with_archive_on_supersede` is the #2397 net-new arm; the rest
 /// were already correct (`archive_by_ids` by #2315) and are pinned here so
 /// the class stays closed.
-const AGE_UNPROJECT_FUNNELS: &[&str] = &[
-    "delete",
+///
+/// #9178 A — each entry pins the EXACT [`DeleteOps`] of its span (equality,
+/// not `contains`): a bare `DELETE FROM memories` added beside an
+/// unprojecting route changes the tuple and is red.
+const AGE_UNPROJECT_FUNNELS: &[(&str, DeleteOps)] = &[
+    (
+        "delete",
+        DeleteOps {
+            best_effort_unprojects: 2,
+            ..DeleteOps::NONE
+        },
+    ),
     // #4447 — `apply_remote_deletion` is a thin delegator to
     // `apply_remote_deletion_inner` (moved to `postgres/federation_by_id_4447.rs`);
     // the guard follows the DELETE to the function that owns it.
-    "apply_remote_deletion_inner",
-    "forget",
+    (
+        "apply_remote_deletion_inner",
+        DeleteOps {
+            best_effort_unprojects: 1,
+            ..DeleteOps::NONE
+        },
+    ),
+    ("forget", DeleteOps::IN_TX_ONCE),
     // #4045/#4046/#4047 — `consolidate` was refactored into a thin delegator to
     // `consolidate_with_expected_versions`, which now holds the hard-DELETE of
     // the source rows and their AGE unprojection. The guard follows the DELETE
     // to the function that owns it (same move as `store_with_embedding_inner`
     // above for #2771); the wrapper deletes nothing itself.
-    "consolidate_with_expected_versions",
+    (
+        "consolidate_with_expected_versions",
+        DeleteOps {
+            archive_routes: 1,
+            ..DeleteOps::NONE
+        },
+    ),
     // #9018 — the legacy (tombstone sub-flag OFF) source disposition moved
     // into the archive-first helper in `postgres/consolidate_archive_9018.rs`,
     // which now owns the `DELETE FROM memories` and its AGE unprojection.
     // The guard follows the DELETE to the helper, and the caller above must
     // route through it (`ARCHIVE_CONSOLIDATE_ROUTE`).
-    "archive_consolidate_source_in_tx",
-    "run_gc",
-    "size_gc",
+    ("archive_consolidate_source_in_tx", DeleteOps::IN_TX_ONCE),
+    ("run_gc", DeleteOps::IN_TX_ONCE),
+    ("size_gc", DeleteOps::IN_TX_ONCE),
     // #4447 — `archive_by_ids` delegates to `archive_by_ids_inner` (moved).
-    "archive_by_ids_inner",
-    "update_with_archive_on_supersede", // #2397 (N17)
+    ("archive_by_ids_inner", DeleteOps::IN_TX_ONCE),
+    ("update_with_archive_on_supersede", DeleteOps::IN_TX_ONCE), // #2397 (N17)
+];
+
+/// #9178 A (sibling) — the EXACT set of child-module functions that write a
+/// `memories` row, with their exact ops. Before #9178 the child sweep only
+/// checked `contains` per function and its doc claimed no child wrote at all.
+const CHILD_MEMORIES_WRITERS: &[(&str, &str, InsertOps, DeleteOps)] = &[
+    (
+        "src/store/postgres/consolidate_archive_9018.rs",
+        "archive_consolidate_source_in_tx",
+        InsertOps::NONE,
+        DeleteOps::IN_TX_ONCE,
+    ),
+    (
+        "src/store/postgres/federation_by_id_4447.rs",
+        "archive_by_ids_inner",
+        InsertOps::NONE,
+        DeleteOps::IN_TX_ONCE,
+    ),
+    (
+        "src/store/postgres/federation_by_id_4447.rs",
+        "archive_restore_inner",
+        InsertOps::CARRIED_ONCE,
+        DeleteOps::NONE,
+    ),
 ];
 
 fn adapter_source() -> String {
@@ -381,23 +494,34 @@ fn fn_span_is_crlf_correct() {
 fn pg_write_funnels_bind_kind_provenance_2393() {
     let src = adapter_source();
     let mut missing: Vec<String> = Vec::new();
-    for name in KIND_PROVENANCE_FUNNELS {
+    for (name, pinned) in KIND_PROVENANCE_FUNNELS {
         let Some(span) = fn_span(&src, name) else {
             missing.push(format!("  {name}: function not found in {PG_ADAPTER_PATH}"));
             continue;
         };
-        if !span.contains(KIND_PROVENANCE_COLUMN) {
+        let code = strip_comments(span);
+        if !code.contains(KIND_PROVENANCE_COLUMN) {
             missing.push(format!(
                 "  {name}: SQL does not mention the `{KIND_PROVENANCE_COLUMN}` column"
             ));
         }
-        // `archive_restore` carries the column through an INSERT ... SELECT
-        // over `archived_memories` (with a metadata-carrier COALESCE fallback
-        // for legacy pre-v87 archive rows), so it has no Rust-side bind.
-        if !INSERT_SELECT_CARRIERS.contains(name) && !span.contains(KIND_PROVENANCE_BIND) {
+        // #9178 A: the exact op tuple, never a `contains` — an extra INSERT
+        // beside the bound one is red. `archive_restore` carries the column
+        // through an INSERT ... SELECT over `archived_memories` (with a
+        // metadata-carrier COALESCE fallback for legacy pre-v87 archive rows),
+        // so its pin is `CARRIED_ONCE` (no Rust-side bind).
+        let observed = insert_ops(&code);
+        if observed != *pinned {
             missing.push(format!(
-                "  {name}: no `{KIND_PROVENANCE_BIND}` bind — a raw literal or a \
-                 dropped column silently NULLs the v79/#1945 provenance on postgres"
+                "  {name}: memories INSERT ops {observed:?}, pinned {pinned:?} — every \
+                 INSERT needs its `{KIND_PROVENANCE_BIND}` bind or the v79/#1945 \
+                 provenance is silently NULL on postgres"
+            ));
+        }
+        let carrier = INSERT_SELECT_CARRIERS.contains(name);
+        if observed.provenance_binds != if carrier { 0 } else { observed.inserts } {
+            missing.push(format!(
+                "  {name}: binds do not match INSERTs ({observed:?})"
             ));
         }
     }
@@ -416,7 +540,7 @@ fn pg_write_funnels_bind_kind_provenance_2393() {
 fn pg_hard_delete_funnels_unproject_from_age_2397() {
     let src = adapter_source();
     let mut missing: Vec<String> = Vec::new();
-    for name in AGE_UNPROJECT_FUNNELS {
+    for (name, pinned) in AGE_UNPROJECT_FUNNELS {
         let Some(span) = fn_span(&src, name) else {
             missing.push(format!("  {name}: function not found in {PG_ADAPTER_PATH}"));
             continue;
@@ -425,15 +549,21 @@ fn pg_hard_delete_funnels_unproject_from_age_2397() {
         // tx) and route through the `unproject_memory_ids_best_effort`
         // wrapper, which calls the helper on their behalf. `consolidate`'s
         // legacy arm delegates its DELETE to the #9018 archive-first helper,
-        // which is checked as its own funnel in this same loop.
-        let unprojects = span.contains(AGE_UNPROJECT_CALL)
-            || span.contains("unproject_memory_ids_best_effort(")
-            || (*name != "archive_consolidate_source_in_tx"
-                && span.contains(ARCHIVE_CONSOLIDATE_ROUTE));
-        if !unprojects {
+        // which is checked as its own funnel in this same loop. #9178 A: the
+        // whole route tuple must EQUAL the pin, so a bare DELETE added beside
+        // an unprojecting route is red (a `contains` accepted it).
+        let observed = delete_ops(span);
+        if observed != *pinned || !observed.unprojects_every_delete() {
             missing.push(format!(
-                "  {name}: hard-deletes a memories row without unprojecting it \
-                 from the AGE memory_graph — leaves a ghost node kg_query serves"
+                "  {name}: hard-delete ops {observed:?}, pinned {pinned:?} — a memories \
+                 DELETE without its AGE unprojection leaves a ghost node kg_query serves"
+            ));
+        }
+    }
+    for (name, pinned) in AGE_UNPROJECT_FUNNELS {
+        if !pinned.unprojects_every_delete() {
+            missing.push(format!(
+                "  {name}: the pin itself {pinned:?} leaves a DELETE bare"
             ));
         }
     }
@@ -480,25 +610,156 @@ fn child_fn_spans(text: &str) -> Vec<(String, String)> {
     out
 }
 
-/// True when `body` contains the SQL fragment `needle` (whitespace-collapsed,
-/// case-insensitive) as a whole word.
-fn has_sql(body: &str, needle: &str) -> bool {
+fn is_ident_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// #9178 A — `src` with every `//` and (nested) `/* */` comment blanked to
+/// spaces, newlines kept. String, raw-string and char literals are copied
+/// verbatim (the SQL lives in them), so a `//` inside a string is not a
+/// comment and a commented-out DELETE never counts.
+fn strip_comments(src: &str) -> String {
+    let chars: Vec<char> = src.chars().collect();
+    let len = chars.len();
+    let mut out = String::with_capacity(src.len());
+    let mut pos = 0;
+    let blank = |ch: char| if ch == '\n' { '\n' } else { ' ' };
+    while pos < len {
+        let next = chars.get(pos + 1).copied();
+        if chars[pos] == '/' && next == Some('/') {
+            while pos < len && chars[pos] != '\n' {
+                out.push(' ');
+                pos += 1;
+            }
+            continue;
+        }
+        if chars[pos] == '/' && next == Some('*') {
+            let mut depth = 0usize;
+            while pos < len {
+                if chars[pos] == '/' && chars.get(pos + 1) == Some(&'*') {
+                    depth += 1;
+                    out.push_str("  ");
+                    pos += 2;
+                } else if chars[pos] == '*' && chars.get(pos + 1) == Some(&'/') {
+                    depth -= 1;
+                    out.push_str("  ");
+                    pos += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                } else {
+                    out.push(blank(chars[pos]));
+                    pos += 1;
+                }
+            }
+            continue;
+        }
+        let after_ident = pos > 0 && is_ident_char(chars[pos - 1]);
+        if chars[pos] == 'r' && !after_ident {
+            let mut scan = pos + 1;
+            while scan < len && chars[scan] == '#' {
+                scan += 1;
+            }
+            if scan < len && chars[scan] == '"' {
+                let hashes = scan - pos - 1;
+                let mut close_at = scan + 1;
+                while close_at < len
+                    && !(chars[close_at] == '"'
+                        && chars[close_at + 1..].iter().take(hashes).all(|h| *h == '#'))
+                {
+                    close_at += 1;
+                }
+                let end = (close_at + 1 + hashes).min(len);
+                out.extend(&chars[pos..end]);
+                pos = end;
+                continue;
+            }
+        }
+        if chars[pos] == '"' {
+            let mut scan = pos + 1;
+            while scan < len && chars[scan] != '"' {
+                scan += if chars[scan] == '\\' { 2 } else { 1 };
+            }
+            let end = (scan + 1).min(len);
+            out.extend(&chars[pos..end]);
+            pos = end;
+            continue;
+        }
+        if chars[pos] == '\'' && !after_ident {
+            // A char literal (`'"'`, `'\''`); a lifetime falls through.
+            let close = if next == Some('\\') {
+                chars[pos + 2..]
+                    .iter()
+                    .position(|ch| *ch == '\'')
+                    .map(|p| pos + 2 + p)
+            } else {
+                (chars.get(pos + 2) == Some(&'\'')).then_some(pos + 2)
+            };
+            if let Some(close) = close {
+                out.extend(&chars[pos..=close]);
+                pos = close + 1;
+                continue;
+            }
+        }
+        out.push(chars[pos]);
+        pos += 1;
+    }
+    out
+}
+
+/// How often the SQL fragment `needle` occurs in `body` (whitespace-collapsed,
+/// case-insensitive, whole word on the right).
+fn count_sql(body: &str, needle: &str) -> usize {
     let norm = body
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
         .to_uppercase();
     let needle = needle.to_uppercase();
-    let mut from = 0;
-    while let Some(pos) = norm[from..].find(&needle) {
-        let after = from + pos + needle.len();
-        let next = norm[after..].chars().next();
-        if next.is_none_or(|c| !(c.is_alphanumeric() || c == '_')) {
-            return true;
-        }
-        from = after;
+    norm.match_indices(&needle)
+        .filter(|(at, _)| {
+            norm[at + needle.len()..]
+                .chars()
+                .next()
+                .is_none_or(|c| !is_ident_char(c))
+        })
+        .count()
+}
+
+/// How often the identifier `ident` occurs in `body` as a whole token.
+fn count_ident(body: &str, ident: &str) -> usize {
+    body.match_indices(ident)
+        .filter(|(at, _)| {
+            let before = body[..*at].chars().next_back();
+            let after = body[at + ident.len()..].chars().next();
+            before.is_none_or(|c| !is_ident_char(c)) && after.is_none_or(|c| !is_ident_char(c))
+        })
+        .count()
+}
+
+/// The body of a span without its first (signature) line, comments stripped.
+fn span_code(span: &str) -> String {
+    strip_comments(span.split_once('\n').map_or("", |(_, rest)| rest))
+}
+
+/// The exact `memories` INSERT tuple of comment-stripped code.
+fn insert_ops(code: &str) -> InsertOps {
+    InsertOps {
+        inserts: count_sql(code, "INSERT INTO memories"),
+        provenance_binds: code.matches(KIND_PROVENANCE_BIND).count(),
     }
-    false
+}
+
+/// The exact hard-DELETE tuple of one function span.
+fn delete_ops(span: &str) -> DeleteOps {
+    let code = span_code(span);
+    DeleteOps {
+        bare_deletes: count_sql(&code, "DELETE FROM memories")
+            + count_ident(&code, "SQL_DELETE_MEMORY_BY_ID"),
+        in_tx_unprojects: code.matches(AGE_UNPROJECT_CALL).count(),
+        best_effort_unprojects: code.matches("unproject_memory_ids_best_effort(").count(),
+        archive_routes: code.matches(ARCHIVE_CONSOLIDATE_ROUTE).count(),
+    }
 }
 
 /// #4023 — child modules are NOT a blind spot. The two named-funnel lists
@@ -506,9 +767,12 @@ fn has_sql(body: &str, needle: &str) -> bool {
 /// moved into) a `src/store/postgres/*.rs` child module would never be named
 /// there. So every function in a child module that INSERTs a `memories` row
 /// must bind `kind_provenance` (#2393), and every one that hard-DELETEs a
-/// `memories` row must unproject it from AGE (#2397). Today no child does
-/// either; this keeps it that way. The loader asserts the child set is
-/// non-empty and contains the expected modules, so this cannot pass vacuously.
+/// `memories` row must unproject it from AGE (#2397). #9178 A: the set of
+/// child functions that write a `memories` row, with their exact op tuples,
+/// must EQUAL [`CHILD_MEMORIES_WRITERS`] (three today), so a new writer, an
+/// extra bare DELETE or a dropped bind is red. The loader asserts the child
+/// set is non-empty and contains the expected modules, so this cannot pass
+/// vacuously.
 #[test]
 fn pg_child_module_memories_writes_obey_2393_2397_4023() {
     let sources = pg_sources::pg_adapter_sources();
@@ -521,32 +785,47 @@ fn pg_child_module_memories_writes_obey_2393_2397_4023() {
         "child scan saw only {} files — the sweep would be vacuous",
         children.len()
     );
+    let mut observed: Vec<(String, String, InsertOps, DeleteOps)> = Vec::new();
     let mut violations: Vec<String> = Vec::new();
     for child in children {
         for (name, body) in child_fn_spans(&child.text) {
-            if has_sql(&body, "INSERT INTO memories")
-                && !(body.contains(KIND_PROVENANCE_COLUMN)
-                    && (body.contains(KIND_PROVENANCE_BIND)
-                        || INSERT_SELECT_CARRIERS.contains(&name.as_str())))
+            let code = span_code(&body);
+            let ins = insert_ops(&code);
+            let del = delete_ops(&body);
+            if ins.inserts == 0 && del.bare_deletes == 0 {
+                continue;
+            }
+            let carrier = INSERT_SELECT_CARRIERS.contains(&name.as_str());
+            if ins.inserts > 0
+                && !(code.contains(KIND_PROVENANCE_COLUMN)
+                    && ins.provenance_binds == if carrier { 0 } else { ins.inserts })
             {
                 violations.push(format!(
                     "  {}::{name}: INSERTs a memories row without the kind_provenance \
-                     column + `{KIND_PROVENANCE_BIND}` bind (#2393)",
+                     column + `{KIND_PROVENANCE_BIND}` bind (#2393): {ins:?}",
                     child.rel
                 ));
             }
-            if has_sql(&body, "DELETE FROM memories")
-                && !(body.contains(AGE_UNPROJECT_CALL)
-                    || body.contains("unproject_memory_ids_best_effort("))
-            {
+            if del.bare_deletes > 0 && !del.unprojects_every_delete() {
                 violations.push(format!(
                     "  {}::{name}: hard-DELETEs a memories row without AGE \
-                     unprojection (#2397)",
+                     unprojection (#2397): {del:?}",
                     child.rel
                 ));
             }
+            observed.push((child.rel.clone(), name, ins, del));
         }
     }
+    let pinned: Vec<(String, String, InsertOps, DeleteOps)> = CHILD_MEMORIES_WRITERS
+        .iter()
+        .map(|(rel, name, ins, del)| ((*rel).to_string(), (*name).to_string(), *ins, *del))
+        .collect();
+    observed.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+    assert_eq!(
+        observed, pinned,
+        "#9178 A: the child-module memories writers must equal CHILD_MEMORIES_WRITERS \
+         exactly (a new writer or an extra INSERT/DELETE is red)"
+    );
     assert!(
         violations.is_empty(),
         "#4023: child-module write funnels violate the #2393/#2397 parity pins:\n{}",
