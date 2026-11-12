@@ -75,14 +75,38 @@ certificates into it, and checks it again before every handshake. Accepted
 | an `ssl.SSLContext` with `CERT_REQUIRED` and `check_hostname` on | a copy of its CA certificates; later changes to your context do not reach the client |
 | a `truststore.SSLContext` with `CERT_REQUIRED` and `check_hostname` on | the platform trust store plus a copy of its CA certificates |
 
+The client's context never verifies more weakly than a context you pass.
+Each stricter setting of your `ssl.SSLContext` is carried onto the client's
+context and read back, or the client refuses to build. Carried: its CA
+certificates, `verify_flags` bits such as `VERIFY_X509_STRICT`, `options`
+bits such as `OP_NO_TLSv1_2`, a higher `minimum_version`, a lower
+`maximum_version`, a higher `security_level`, a cipher list narrowed with
+`set_ciphers()` (the client keeps the ciphers both lists share), and
+`hostname_checks_common_name` turned off. A weaker setting never lowers the
+SDK floor (the `create_default_context()` flags and options, TLS 1.2 minimum).
+
 Refused with `ValueError` when the client is built: `verify=False`, a context
 whose `verify_mode` is `CERT_NONE` or `CERT_OPTIONAL` or whose
 `check_hostname` is off, a context that asks for CRL checking, a context with no
 CA certificate the SDK can copy (certificates in a `capath` directory are
-loaded lazily and cannot be copied: pass the path instead), a CA path that is
-missing, unreadable, larger than 16 MiB or neither a file nor a directory, and
-any other type. Only the CA certificates and the minimum TLS version are copied
-from your context: put the client certificate in `cert=` (see mTLS below).
+loaded lazily and cannot be copied: pass the path instead), a context whose
+version range is empty or ends below TLS 1.2, `verify_flags` or `options` bits
+the SDK does not know, a cipher list that shares no cipher with the SDK's, a
+non-default `sni_callback`, a setting whose getter is missing or raises, an
+attribute of your Python's `SSLContext` that the SDK does not classify and that
+differs from a fresh default context, a `truststore.SSLContext` from a
+truststore without the 0.10.5 shape (a re-entrant `_ctx_lock` and its
+verifying socket and SSL-object classes; 0.10.4 and older are refused), a CA
+path that is missing, unreadable, larger than 16 MiB or neither a file nor a
+directory, and any other type.
+
+Never carried, because they cannot change how the server certificate is
+verified or because they only weaken it: `keylog_filename`,
+`post_handshake_auth`, `num_tickets`, the pre-shared-key callbacks, weakening
+`verify_flags` bits such as `VERIFY_X509_PARTIAL_CHAIN`, and the client
+certificate (put it in `cert=`, see mTLS below). Not
+readable at all, so not carried: the ECDH curve (`set_ecdh_curve`) and the
+NPN protocol list; `httpcore` sets ALPN itself on every connect.
 
 Two ways to avoid passing `verify=` per client:
 
