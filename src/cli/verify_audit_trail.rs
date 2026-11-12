@@ -40,6 +40,7 @@ use crate::cli::CliOutput;
 /// Shared `.context` label for the report-write paths (pm-v3.1
 /// literal de-dup — referenced at every `writeln!` site below).
 const CTX_WRITE_AUDIT_REPORT: &str = "write audit-trail report";
+const CTX_SERIALIZE_AUDIT_REPORT: &str = "serialize audit-trail report";
 
 /// Exit code for a dirty (or empty) audit trail.
 pub const EXIT_DIRTY: i32 = 1;
@@ -67,7 +68,7 @@ fn absence_finding(
 ) -> Result<i32> {
     if json {
         let mut body = match report {
-            Some(r) => serde_json::to_value(r).context("serialize audit-trail report")?,
+            Some(r) => serde_json::to_value(r).context(CTX_SERIALIZE_AUDIT_REPORT)?,
             None => serde_json::json!({}),
         };
         if let Some(obj) = body.as_object_mut() {
@@ -76,7 +77,7 @@ fn absence_finding(
             obj.insert("detail".into(), detail.into());
             obj.insert("chain_intact".into(), false.into());
         }
-        let text = serde_json::to_string_pretty(&body).context("serialize audit-trail report")?;
+        let text = serde_json::to_string_pretty(&body).context(CTX_SERIALIZE_AUDIT_REPORT)?;
         writeln!(out.stdout, "{text}").context(CTX_WRITE_AUDIT_REPORT)?;
     } else {
         writeln!(out.stdout, "verify-audit-trail FAIL: {reason}: {detail}")
@@ -269,11 +270,11 @@ pub fn render(
 
     if json {
         // #9179 r1 — the coverage figure rides the JSON body too.
-        let mut body = serde_json::to_value(report).context("serialize audit-trail report")?;
+        let mut body = serde_json::to_value(report).context(CTX_SERIALIZE_AUDIT_REPORT)?;
         if let Some(obj) = body.as_object_mut() {
             obj.insert("unanchored_tail".to_string(), serde_json::json!(tail));
         }
-        let json = serde_json::to_string_pretty(&body).context("serialize audit-trail report")?;
+        let json = serde_json::to_string_pretty(&body).context(CTX_SERIALIZE_AUDIT_REPORT)?;
         writeln!(out.stdout, "{json}").context(CTX_WRITE_AUDIT_REPORT)?;
     } else if clean {
         writeln!(
