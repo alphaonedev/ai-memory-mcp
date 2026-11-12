@@ -837,6 +837,10 @@ const SQL_DELETE_DEDUP_BY_MEMORY_IDS: &str =
 /// stays refused.
 const SQL_DELETE_FORGET_TOMBSTONE_BY_MEMORY_ID: &str =
     "DELETE FROM forget_tombstones WHERE memory_id = $1";
+/// #9178 E — the consolidate archive row of an id the `RestoreSameId` arm
+/// revives. Postgres twin of the sqlite `SQL_DELETE_ARCHIVE_ROW_BY_ID_REASON`.
+const SQL_DELETE_ARCHIVE_ROW_BY_ID_REASON: &str =
+    "DELETE FROM archived_memories WHERE id = $1 AND archive_reason = $2";
 
 /// v0.9.0 G13-mem (#1859) — endpoint content-id read for the lineage-DAG
 /// `memory_links.source_cid`/`target_cid` mirror stamp.
@@ -34886,6 +34890,14 @@ impl PostgresStore {
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| to_store_err("restore clear forget tombstone", e))?;
+            // #9178 E: a live row never also keeps its consolidate archive row
+            // (sqlite twin: `SQL_DELETE_ARCHIVE_ROW_BY_ID_REASON`, same tx).
+            sqlx::query(SQL_DELETE_ARCHIVE_ROW_BY_ID_REASON)
+                .bind(&id)
+                .bind(field_names::ARCHIVE_REASON_CONSOLIDATE)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("restore clear consolidate archive row", e))?;
         }
 
         // v0.7.0 #1156 — per-namespace quota dimension (v50 PK).
