@@ -120,9 +120,19 @@ fn curator_read_context(agent_id: &str) -> CallerContext {
 /// [`ReflectionPass::persist`], and the reflection carries the narrowest
 /// scope of those sources, so the bypass here never widens what a reader
 /// can see.
+///
+/// #9185 (L-F, I-3): `as_agent` names the principal the sources were read
+/// as. Both backends treat an admin context that carries `as_agent` as a
+/// DERIVED write and re-verify every source inside the reflect transaction
+/// (readable by that principal, same namespace, stamped scope equal to the
+/// narrowest fresh scope), so a source narrowed or moved between `persist`'s
+/// re-read and the write refuses the reflection.
 #[cfg(feature = "sal")]
 fn curator_write_context(agent_id: &str) -> CallerContext {
-    CallerContext::for_admin(agent_id)
+    CallerContext {
+        as_agent: Some(agent_id.to_string()),
+        ..CallerContext::for_admin(agent_id)
+    }
 }
 
 /// List up to `limit` memories in `namespace` through the SAL trait.
@@ -521,6 +531,14 @@ impl<'a> ReflectionPass<'a> {
         let mut fresh: Vec<Memory> = Vec::with_capacity(sources.len());
         for id in sources {
             match store_get_opt(self.store, &self.ctx, id).await? {
+                // #9185 (L-F) — the namespace is pinned too: a source moved to
+                // another namespace since `summarize` refuses the reflection.
+                Some(m) if m.namespace != summary.namespace => anyhow::bail!(
+                    "ReflectionPass::persist: source {id} is in namespace '{}', not '{}'; \
+                     the reflection is not written",
+                    m.namespace,
+                    summary.namespace
+                ),
                 Some(m) => fresh.push(m),
                 None => anyhow::bail!(
                     "ReflectionPass::persist: source {id} is not readable by curator {}; \
@@ -770,6 +788,26 @@ pub async fn run_reflection_pass(
     };
     report.namespaces_visited = namespaces.len();
 
+    // #9185 Y-9 — the curator reads as `for_agent`, so rows it may not read
+    // never reach the pass. The unscoped per-namespace totals let the pass log
+    // how many rows it could not see, so an empty result is observable. A
+    // failed totals read only loses the count; the pass itself is unaffected.
+    let namespace_totals: std::collections::HashMap<String, usize> =
+        match store.list_namespaces().await {
+            Ok(counts) => counts
+                .into_iter()
+                .map(|nc| (nc.namespace, nc.count))
+                .collect(),
+            Err(e) => {
+                tracing::debug!(
+                    target: REFLECTION_VISIBILITY_TRACE_TARGET,
+                    error = %e,
+                    "reflection pass: namespace totals unavailable; skipped-row count not logged"
+                );
+                std::collections::HashMap::new()
+            }
+        };
+
     for ns in &namespaces {
         if !enabled_check(ns) {
             continue;
@@ -797,6 +835,20 @@ pub async fn run_reflection_pass(
         };
         let scanned_here = candidates.len();
         report.observations_scanned += scanned_here;
+        if let Some(skipped) = visibility_skipped_count(
+            namespace_totals.get(ns.as_str()).copied(),
+            scanned_here,
+            MAX_CLUSTER_SIZE * 16,
+        ) {
+            tracing::info!(
+                target: REFLECTION_VISIBILITY_TRACE_TARGET,
+                namespace = %ns,
+                skipped,
+                visible = scanned_here,
+                curator = %pass.ctx.agent_id,
+                "{VISIBILITY_SKIPPED_LOG}"
+            );
+        }
 
         // Stage 1 — cluster.
         let clusters = pass.cluster(&candidates);
@@ -868,6 +920,34 @@ pub async fn run_reflection_pass(
 
     report.completed_at = Utc::now().to_rfc3339();
     Ok(report)
+}
+
+/// #9185 Y-9 — tracing target of the visibility-skipped count.
+pub const REFLECTION_VISIBILITY_TRACE_TARGET: &str = "curator::reflection_pass::visibility";
+
+/// #9185 Y-9 — message of the visibility-skipped count (#8850 narrowing:
+/// rows the curator may not read yield no reflection).
+pub const VISIBILITY_SKIPPED_LOG: &str =
+    "reflection pass: source rows not visible to the curator were skipped";
+
+/// #9185 Y-9 — rows of a namespace the curator's read did not return.
+///
+/// `total` is the unscoped row count of the namespace (`None` when unknown),
+/// `visible` the rows the curator listed and `limit` the list cap. The count
+/// is exact only below the cap, so a capped list yields `None`, as does a
+/// namespace with nothing hidden.
+#[must_use]
+pub fn visibility_skipped_count(
+    total: Option<usize>,
+    visible: usize,
+    limit: usize,
+) -> Option<usize> {
+    let total = total?;
+    if visible >= limit {
+        return None;
+    }
+    let skipped = total.saturating_sub(visible);
+    (skipped > 0).then_some(skipped)
 }
 
 /// Best-effort verify helper used by [`run_reflection_pass`]. Looks up

@@ -1036,9 +1036,11 @@ pub use migrations::current_schema_version_for_tests;
 // locate / name-assert the snapshot file without restamping the literal.
 pub use migrations::pre_migration_backup_infix_for_tests;
 pub use reflect::{
-    ReflectError, ReflectHookDecision, ReflectHooks, ReflectInput, ReflectOutcome,
-    canonical_cbor_reflection_decorrelation_refused, canonical_cbor_reflection_depth_exceeded,
-    reflect, reflect_with_hooks, reflect_with_hooks_for_caller,
+    DERIVED_REFUSAL_PREFIX, ReflectError, ReflectHookDecision, ReflectHooks, ReflectInput,
+    ReflectOutcome, canonical_cbor_reflection_decorrelation_refused,
+    canonical_cbor_reflection_depth_exceeded, reflect, reflect_with_hooks,
+    reflect_with_hooks_derived, reflect_with_hooks_for_caller, validate_reflection_author,
+    verify_derived_sources,
 };
 // `emit_reflection_depth_exceeded_audit` is `pub(crate)` — preserve
 // the same visibility on the re-export so it remains reachable from
