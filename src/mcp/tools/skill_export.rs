@@ -36,6 +36,7 @@ use rusqlite::Connection;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
+use super::skill_read_text::SkillReadClass;
 use crate::errors::msg::{SkillsJail, skills_io_kind, skills_root_label};
 use crate::identity::keypair::AgentKeypair;
 use crate::signed_events::{SignedEvent, append_signed_event, payload_hash};
@@ -339,9 +340,85 @@ pub fn handle_skill_export(
     active_keypair: Option<&AgentKeypair>,
     read_caller: Option<&str>,
 ) -> Result<Value, String> {
+    handle_skill_export_classified(conn, db_path, params, active_keypair, read_caller)
+        .map_err(|failure| classify_skill_export_failure(&failure).1)
+}
+
+/// #9174 R2 — the closed failure of an export. The stored text of a failure
+/// (the loader's text, a stored resource path, a governance rule reason, a
+/// metadata serializer message) never reaches a caller: the loader text is
+/// only classified through [`SkillReadClass`], and every other stored detail
+/// goes to the operator log at the site that refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkillExportFailure {
+    /// The verified load refused `skill_id`; `raw` is classified, never
+    /// rendered.
+    Read { skill_id: String, raw: String },
+    /// A refusal whose text holds only the caller's own `skill_id` /
+    /// `target_folder`, fixed labels and an I/O failure kind (#3762).
+    Refused(String),
+}
+
+/// #9174 R2 — the class of a [`SkillExportFailure`]: the HTTP route maps it
+/// to a status, and both surfaces render the text of the same mapping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkillExportClass {
+    /// A read refusal, in the vocabulary get, resource and compose share.
+    Read(SkillReadClass<'static>),
+    /// An export refusal of the request itself.
+    Refused,
+}
+
+/// #9174 R2 — the ONE caller text of an export failure, for the MCP tool,
+/// the CLI and the HTTP route alike (#3762 parity by construction).
+#[must_use]
+pub fn classify_skill_export_failure(failure: &SkillExportFailure) -> (SkillExportClass, String) {
+    match failure {
+        SkillExportFailure::Read { skill_id, raw } => {
+            let class = SkillReadClass::classify(raw, skill_id, None);
+            if class.is_sanitized() {
+                // #1261 — the raw loader text is operator detail.
+                tracing::error!(
+                    target: crate::mcp::error_text::TRACE_TARGET,
+                    skill_id = skill_id.as_str(),
+                    error = %raw,
+                    "skill export: read failure (sanitized for the caller, #1261)"
+                );
+            }
+            (SkillExportClass::Read(class), class.caller_text(skill_id))
+        }
+        SkillExportFailure::Refused(text) => (SkillExportClass::Refused, text.clone()),
+    }
+}
+
+/// Caller text of an export that refused a STORED resource path: the path
+/// itself goes to the operator log only (#9174 R2).
+pub const EXPORT_RESOURCE_PATH_REFUSED: &str = "refusing a stored resource with an unsafe path: absolute or parent-directory \
+     components are not allowed";
+/// Caller text of an export whose governance check refused a write; the rule
+/// reason goes to the operator log only (#9174 R2).
+pub const EXPORT_GOVERNANCE_REFUSED: &str = "governance refused the export write";
+/// Caller text of an export whose stored metadata does not serialize as
+/// YAML; the serializer message goes to the operator log only (#9174 R2).
+pub const EXPORT_FRONTMATTER_REFUSED: &str =
+    "skill metadata is not YAML-representable; nothing was exported";
+
+/// #9174 R2 — [`handle_skill_export`] with the typed failure, for the HTTP
+/// route (which maps [`SkillExportClass`] to a status).
+///
+/// # Errors
+/// Every refusal of [`handle_skill_export`], typed.
+pub fn handle_skill_export_classified(
+    conn: &Connection,
+    db_path: &Path,
+    params: &Value,
+    active_keypair: Option<&AgentKeypair>,
+    read_caller: Option<&str>,
+) -> Result<Value, SkillExportFailure> {
     let configured_root = std::env::var(SKILLS_EXPORT_ROOT_ENV).ok();
-    let export_root = resolve_export_root(configured_root.as_deref(), db_path)?;
-    handle_skill_export_in_root(conn, params, active_keypair, &export_root, read_caller)
+    let export_root = resolve_export_root(configured_root.as_deref(), db_path)
+        .map_err(SkillExportFailure::Refused)?;
+    export_in_root(conn, params, active_keypair, &export_root, read_caller)
 }
 
 /// #3357 — the export body, with the jail root supplied explicitly.
@@ -374,15 +451,29 @@ pub fn handle_skill_export_in_root(
     export_root: &Path,
     read_caller: Option<&str>,
 ) -> Result<Value, String> {
+    export_in_root(conn, params, active_keypair, export_root, read_caller)
+        .map_err(|failure| classify_skill_export_failure(&failure).1)
+}
+
+/// The export body behind [`handle_skill_export_in_root`], with the typed
+/// failure (#9174 R2).
+fn export_in_root(
+    conn: &Connection,
+    params: &Value,
+    active_keypair: Option<&AgentKeypair>,
+    export_root: &Path,
+    read_caller: Option<&str>,
+) -> Result<Value, SkillExportFailure> {
+    let refused = |text: &str| SkillExportFailure::Refused(text.to_owned());
     let skill_id = params["skill_id"]
         .as_str()
         .filter(|s| !s.is_empty())
-        .ok_or("memory_skill_export requires 'skill_id'")?;
+        .ok_or_else(|| refused("memory_skill_export requires 'skill_id'"))?;
 
     let target_str = params[param_names::TARGET_FOLDER]
         .as_str()
         .filter(|s| !s.is_empty())
-        .ok_or("memory_skill_export requires 'target_folder'")?;
+        .ok_or_else(|| refused("memory_skill_export requires 'target_folder'"))?;
 
     // #3357 — CONFINE the caller-supplied folder before ANY filesystem I/O.
     // `target` from here on is the RESOLVED, in-root path; `target_str` is
@@ -405,10 +496,10 @@ pub fn handle_skill_export_in_root(
             error = %e,
             "cannot resolve the skills-export root"
         );
-        format!(
+        SkillExportFailure::Refused(format!(
             "{} is not a directory or does not exist",
             skills_root_label(SkillsJail::Export)
-        )
+        ))
     })?;
     if !export_root.is_dir() {
         tracing::error!(
@@ -416,12 +507,13 @@ pub fn handle_skill_export_in_root(
             root = %export_root.display(),
             "the skills-export root is not a directory"
         );
-        return Err(format!(
+        return Err(SkillExportFailure::Refused(format!(
             "{} is not a directory",
             skills_root_label(SkillsJail::Export)
-        ));
+        )));
     }
-    let target = confine_export_target(target_str, &export_root)?;
+    let target =
+        confine_export_target(target_str, &export_root).map_err(SkillExportFailure::Refused)?;
 
     // -----------------------------------------------------------------------
     // Load the skill through the verified read path (#8832 / #8834)
@@ -429,7 +521,13 @@ pub fn handle_skill_export_in_root(
     // Visibility, every resource digest, the skill digest and any signature
     // are checked here, before the first write below. The bounded (#1933)
     // body and resource decode happens inside the verified load.
-    let skill = super::skill_integrity::load_verified_skill(conn, skill_id, read_caller)?;
+    let skill =
+        super::skill_integrity::load_verified_skill(conn, skill_id, read_caller).map_err(|e| {
+            SkillExportFailure::Read {
+                skill_id: skill_id.to_owned(),
+                raw: String::from(e),
+            }
+        })?;
     let body = String::from_utf8_lossy(&skill.body);
 
     // -----------------------------------------------------------------------
@@ -451,6 +549,16 @@ pub fn handle_skill_export_in_root(
         compatibility: skill.compatibility.as_deref(),
         allowed_tools: tools,
         metadata: skill.metadata.as_object(),
+    })
+    .map_err(|e| {
+        // #9174 R2 — the serializer message quotes stored metadata.
+        tracing::error!(
+            target: crate::mcp::error_text::TRACE_TARGET,
+            skill_id,
+            error = %e,
+            "skill export: stored metadata is not YAML-representable"
+        );
+        SkillExportFailure::Refused(EXPORT_FRONTMATTER_REFUSED.to_owned())
     })?;
 
     let skill_md_content = format!("---\n{frontmatter}\n---\n\n{body}");
@@ -479,9 +587,15 @@ pub fn handle_skill_export_in_root(
     // exemption, same rationale as `llm.rs`). MCP/`serve` still consult
     // the installed hook because they install it during bootstrap.
     if let Err(refusal) = crate::governance::wire_check::check(&skill_md_action) {
-        return Err(format!(
-            "governance refused SKILL.md write: {}",
-            refusal.reason
+        // #9174 R2 — the rule reason is operator text: log only.
+        tracing::error!(
+            target: crate::mcp::error_text::TRACE_TARGET,
+            requested = target_str,
+            reason = %refusal.reason,
+            "skill export: governance refused the SKILL.md write"
+        );
+        return Err(SkillExportFailure::Refused(
+            EXPORT_GOVERNANCE_REFUSED.to_owned(),
         ));
     }
     // #3762 — the `io::Error` Display carries the OS path text: log it for
@@ -495,7 +609,9 @@ pub fn handle_skill_export_in_root(
             "cannot create the export target directory"
         );
         let kind = skills_io_kind(e.kind());
-        format!("cannot create target_folder '{target_str}': {kind}")
+        SkillExportFailure::Refused(format!(
+            "cannot create target_folder '{target_str}': {kind}"
+        ))
     })?;
     // #3357 — re-assert containment AFTER the directory exists. `create_dir_all`
     // is the first moment the target is a real inode, so this closes the
@@ -513,7 +629,9 @@ pub fn handle_skill_export_in_root(
             "cannot resolve the export target after creation"
         );
         let kind = skills_io_kind(e.kind());
-        format!("cannot resolve target_folder '{target_str}' after creation: {kind}")
+        SkillExportFailure::Refused(format!(
+            "cannot resolve target_folder '{target_str}' after creation: {kind}"
+        ))
     })?;
     if !target.starts_with(&export_root) {
         tracing::error!(
@@ -522,11 +640,11 @@ pub fn handle_skill_export_in_root(
             root = %export_root.display(),
             "path-escape refused after creation (resolved target outside the jail)"
         );
-        return Err(format!(
+        return Err(SkillExportFailure::Refused(format!(
             "refusing target_folder '{target_str}': resolves outside the {} \
              (path-escape refused; set {SKILLS_EXPORT_ROOT_ENV} to export elsewhere)",
             skills_root_label(SkillsJail::Export)
-        ));
+        )));
     }
     let skill_md_path = target.join("SKILL.md");
     std::fs::write(&skill_md_path, skill_md_content.as_bytes()).map_err(|e| {
@@ -538,7 +656,9 @@ pub fn handle_skill_export_in_root(
             "cannot write the exported SKILL.md"
         );
         let kind = skills_io_kind(e.kind());
-        format!("cannot write SKILL.md for target_folder '{target_str}': {kind}")
+        SkillExportFailure::Refused(format!(
+            "cannot write SKILL.md for target_folder '{target_str}': {kind}"
+        ))
     })?;
 
     // -----------------------------------------------------------------------
@@ -567,9 +687,15 @@ pub fn handle_skill_export_in_root(
                         | std::path::Component::Prefix(_)
                 )
             }) {
-                return Err(format!(
-                    "refusing resource with unsafe path '{res_path}': \
-                     absolute or parent-directory components are not allowed"
+                // #9174 R2 — the stored path goes to the operator log only.
+                tracing::error!(
+                    target: crate::mcp::error_text::TRACE_TARGET,
+                    skill_id,
+                    resource_path = res_path,
+                    "skill export: refused a stored resource with an unsafe path"
+                );
+                return Err(SkillExportFailure::Refused(
+                    EXPORT_RESOURCE_PATH_REFUSED.to_owned(),
                 ));
             }
             let res_file = resources_root.join(&res_path);
@@ -579,8 +705,14 @@ pub fn handle_skill_export_in_root(
             // any future shape (e.g. an empty / `.`-only path that
             // normalises oddly) that slips past it.
             if !res_file.starts_with(&resources_root) {
-                return Err(format!(
-                    "refusing resource '{res_path}': resolved path escapes the resources root"
+                tracing::error!(
+                    target: crate::mcp::error_text::TRACE_TARGET,
+                    skill_id,
+                    resource_path = res_path,
+                    "skill export: a stored resource path escapes the resources root"
+                );
+                return Err(SkillExportFailure::Refused(
+                    EXPORT_RESOURCE_PATH_REFUSED.to_owned(),
                 ));
             }
             // v0.7.0 (issue #691 fold-1) — per-resource FilesystemWrite
@@ -596,9 +728,15 @@ pub fn handle_skill_export_in_root(
             // Fable HIGH (#3133): CLI `skill export` one-shot — `check`, not
             // `check_governed`. See the SKILL.md write above.
             if let Err(refusal) = crate::governance::wire_check::check(&res_action) {
-                return Err(format!(
-                    "governance refused resource '{res_path}' write: {}",
-                    refusal.reason
+                tracing::error!(
+                    target: crate::mcp::error_text::TRACE_TARGET,
+                    skill_id,
+                    resource_path = res_path,
+                    reason = %refusal.reason,
+                    "skill export: governance refused a resource write"
+                );
+                return Err(SkillExportFailure::Refused(
+                    EXPORT_GOVERNANCE_REFUSED.to_owned(),
                 ));
             }
             if let Some(parent) = res_file.parent() {
@@ -610,7 +748,7 @@ pub fn handle_skill_export_in_root(
                         "cannot create the export resource directory"
                     );
                     let kind = skills_io_kind(e.kind());
-                    format!("cannot create resource directory: {kind}")
+                    SkillExportFailure::Refused(format!("cannot create resource directory: {kind}"))
                 })?;
             }
             std::fs::write(&res_file, content).map_err(|e| {
@@ -621,7 +759,7 @@ pub fn handle_skill_export_in_root(
                     "cannot write the exported resource"
                 );
                 let kind = skills_io_kind(e.kind());
-                format!("cannot write resource '{res_path}': {kind}")
+                SkillExportFailure::Refused(format!("cannot write an exported resource: {kind}"))
             })?;
             exported_resources.push(resource.path.clone());
         }
@@ -1104,6 +1242,7 @@ mod tests {
             None,
         )
         .unwrap_err();
+        // #9174 R2 — the integrity family renders its fixed skill-level text.
         assert_eq!(err, crate::errors::msg::skill_signature_missing(id));
         assert!(!target.exists(), "nothing is written for a refused skill");
     }
@@ -1129,7 +1268,8 @@ mod tests {
             None,
         )
         .unwrap_err();
-        assert!(err.contains("zstd decompress body"));
+        // #9174 R2 — decoder text is operator detail: the sanitized text.
+        assert_eq!(err, crate::errors::msg::INTERNAL_SERVER_ERROR);
     }
 
     #[test]
@@ -1152,7 +1292,11 @@ mod tests {
             None,
         )
         .unwrap_err();
-        assert!(err.contains("decompress resource"));
+        assert_eq!(err, crate::errors::msg::INTERNAL_SERVER_ERROR);
+        assert!(
+            !err.contains("bad.bin"),
+            "stored path reached the caller: {err}"
+        );
     }
 
     // ---- #1453 path-traversal guard -------------------------------------
@@ -1182,9 +1326,11 @@ mod tests {
             None,
         )
         .unwrap_err();
+        // #9174 R2 — the fixed text; the stored path goes to the log only.
+        assert_eq!(err, super::EXPORT_RESOURCE_PATH_REFUSED);
         assert!(
-            err.contains("unsafe path") && err.contains("parent-directory"),
-            "expected parent-dir refusal, got: {err}"
+            !err.contains("escape.txt"),
+            "stored path reached the caller"
         );
         // `target/resources/../escape.txt` lexically resolves to
         // `target/escape.txt` — it must NOT have been written.
@@ -1222,10 +1368,8 @@ mod tests {
             None,
         )
         .unwrap_err();
-        assert!(
-            err.contains("unsafe path"),
-            "expected absolute-path refusal, got: {err}"
-        );
+        assert_eq!(err, super::EXPORT_RESOURCE_PATH_REFUSED);
+        assert!(!err.contains(abs_str), "stored path reached the caller");
         assert!(
             !abs.exists(),
             "absolute-path write must not have landed: {abs:?}"

@@ -555,9 +555,8 @@ const TAMPERS: &[Tamper] = &[
             )
             .unwrap();
         },
-        expected: |id| {
-            format!("{INTEGRITY_PREFIX}: resource '{SOURCE_0}' digest mismatch for skill {id}")
-        },
+        // #9174 R2 — a resource-level refusal never names the stored path.
+        expected: |id| format!("{INTEGRITY_PREFIX}: skill {id}"),
     },
     Tamper {
         name: "resource digest nulled",
@@ -569,9 +568,8 @@ const TAMPERS: &[Tamper] = &[
             )
             .unwrap();
         },
-        expected: |id| {
-            format!("{INTEGRITY_PREFIX}: resource '{SOURCE_0}' has no stored digest for skill {id}")
-        },
+        // #9174 R2 — a resource-level refusal never names the stored path.
+        expected: |id| format!("{INTEGRITY_PREFIX}: skill {id}"),
     },
     Tamper {
         name: "extra resource injected",

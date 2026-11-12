@@ -610,6 +610,16 @@ pub mod msg {
         format!("{ZSTD_DECOMPRESS_PREFIX}body: {e}")
     }
 
+    /// #9174 R2 — the caller text of a stored skill body that does not
+    /// decode; the decoder message goes to the operator log only.
+    pub const SKILL_BODY_UNDECODABLE: &str = "zstd decompress body: stored blob does not decode";
+
+    /// #9174 R2 — the caller text of a stored skill resource that does not
+    /// decode; the decoder message and the stored resource path go to the
+    /// operator log only.
+    pub const SKILL_RESOURCE_UNDECODABLE: &str =
+        "zstd decompress resource: stored blob does not decode";
+
     /// `"zstd decompress resource '{path}': {e}"`.
     #[must_use]
     pub fn zstd_decompress_resource(path: &str, e: impl std::fmt::Display) -> String {

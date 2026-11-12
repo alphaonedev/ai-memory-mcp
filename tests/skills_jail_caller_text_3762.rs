@@ -575,3 +575,203 @@ mod pg_3762 {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// #9174 R2 — one typed export text per class on BOTH surfaces
+// ---------------------------------------------------------------------------
+
+/// A stored path an attacker controls; it must never reach either caller.
+const STORED_MARKER_9174: &str = "STORED-MARKER-9174";
+
+fn zstd_9174(bytes: &[u8]) -> Vec<u8> {
+    zstd::encode_all(bytes, 3).expect("zstd")
+}
+
+/// Register one inline skill; return its id.
+async fn seed_9174(app: &AppState, name: &str) -> String {
+    let db = app.db.lock().await;
+    let v = ai_memory::mcp::handle_skill_register(&db.0, &inline_skill(name), None)
+        .expect("seed register");
+    v["id"].as_str().expect("id").to_owned()
+}
+
+/// Add one stored resource row at `path` and reseal the skill digest, so
+/// the row passes the integrity check and only the export walker sees it.
+fn add_resource_resealed_9174(conn: &rusqlite::Connection, skill_id: &str, path: &str) {
+    conn.execute(
+        "INSERT INTO skill_resources \
+         (skill_id, resource_path, resource_kind, content_blob, digest) \
+         VALUES (?1, ?2, 'reference', ?3, NULL)",
+        rusqlite::params![skill_id, path, zstd_9174(b"stored resource\n")],
+    )
+    .expect("insert resource");
+    ai_memory::mcp::reseal_skill_digest_for_tests(conn, skill_id).expect("reseal");
+}
+
+/// Export `skill_id` over MCP and over HTTP; return the MCP error text and
+/// the HTTP (status, error text).
+async fn export_both_9174(app: &AppState, skill_id: &str) -> (String, StatusCode, String) {
+    use axum::response::IntoResponse as _;
+
+    let params = json!({"skill_id": skill_id, "target_folder": "out-9174"});
+    let mcp_err = {
+        let db = app.db.lock().await;
+        let store_path = db.1.clone();
+        ai_memory::mcp::handle_skill_export(&db.0, &store_path, &params, None, None)
+            .expect_err("the export must be refused")
+    };
+    let resp = ai_memory::handlers::skill_export_route(
+        axum::extract::State(app.clone()),
+        admin_headers(),
+        axum::extract::Path(skill_id.to_owned()),
+        axum::Json(ai_memory::handlers::SkillExportBody {
+            target_folder: "out-9174".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+    let (status, body) = into_status_body(resp).await;
+    let http_err = body["error"].as_str().expect("error body").to_owned();
+    (mcp_err, status, http_err)
+}
+
+/// One export failure class: the tamper that produces it, and the exact
+/// caller text and HTTP status both surfaces must carry.
+struct ExportCase9174 {
+    name: &'static str,
+    apply: fn(&rusqlite::Connection, &str),
+    status: StatusCode,
+    want: fn(&str) -> String,
+}
+
+const EXPORT_CASES_9174: &[ExportCase9174] = &[
+    ExportCase9174 {
+        name: "digest mismatch (description rewritten)",
+        apply: |c, id| {
+            c.execute(
+                "UPDATE skills SET description = 'rewritten-9174' WHERE id = ?1",
+                [id],
+            )
+            .expect("tamper");
+        },
+        status: StatusCode::BAD_REQUEST,
+        want: |id| ai_memory::errors::msg::skill_digest_mismatch(id),
+    },
+    ExportCase9174 {
+        name: "resource integrity (stored content swapped, marker path)",
+        apply: |c, id| {
+            add_resource_resealed_9174(c, id, "references/STORED-MARKER-9174.md");
+            c.execute(
+                "UPDATE skill_resources SET content_blob = ?1 WHERE skill_id = ?2",
+                rusqlite::params![zstd_9174(b"swapped\n"), id],
+            )
+            .expect("tamper");
+        },
+        status: StatusCode::BAD_REQUEST,
+        want: |id| ai_memory::errors::msg::skill_integrity_failed(id),
+    },
+    ExportCase9174 {
+        name: "stored resource path escapes the export folder",
+        apply: |c, id| add_resource_resealed_9174(c, id, "../STORED-MARKER-9174/x.md"),
+        status: StatusCode::BAD_REQUEST,
+        want: |_| ai_memory::mcp::EXPORT_RESOURCE_PATH_REFUSED.to_owned(),
+    },
+    ExportCase9174 {
+        name: "stored resource path is absolute",
+        apply: |c, id| add_resource_resealed_9174(c, id, "/STORED-MARKER-9174/x.md"),
+        status: StatusCode::BAD_REQUEST,
+        want: |_| ai_memory::mcp::EXPORT_RESOURCE_PATH_REFUSED.to_owned(),
+    },
+    ExportCase9174 {
+        name: "stored body does not decode",
+        apply: |c, id| {
+            c.execute(
+                "UPDATE skills SET body_blob = ?1 WHERE id = ?2",
+                rusqlite::params![b"STORED-MARKER-9174 not zstd".to_vec(), id],
+            )
+            .expect("tamper");
+        },
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        want: |_| ai_memory::errors::msg::INTERNAL_SERVER_ERROR.to_owned(),
+    },
+];
+
+/// #9174 R2 / C9 — for every export failure class HTTP and MCP render ONE
+/// typed text from the same class mapping: byte-identical, exact per class,
+/// with the exact HTTP status, and no stored text on either surface.
+#[tokio::test]
+async fn http_and_mcp_export_render_one_typed_text_per_class_9174() {
+    // Unknown id: the not-found class.
+    {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let app = app_state_sqlite(&dir.path().join("ai-memory.db"));
+        let missing = "skill-missing-9174";
+        let (mcp_err, status, http_err) = export_both_9174(&app, missing).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "unknown id: {http_err}");
+        assert_eq!(http_err, mcp_err, "unknown id: HTTP == MCP");
+        assert_eq!(http_err, ai_memory::errors::msg::skill_not_found(missing));
+    }
+    for case in EXPORT_CASES_9174 {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let app = app_state_sqlite(&dir.path().join("ai-memory.db"));
+        let skill_id = seed_9174(&app, "typed-text-9174").await;
+        {
+            let db = app.db.lock().await;
+            (case.apply)(&db.0, &skill_id);
+        }
+        let (mcp_err, status, http_err) = export_both_9174(&app, &skill_id).await;
+        assert_eq!(status, case.status, "{}: status ({http_err})", case.name);
+        assert_eq!(
+            http_err, mcp_err,
+            "{}: HTTP == MCP byte for byte",
+            case.name
+        );
+        assert_eq!(
+            http_err,
+            (case.want)(&skill_id),
+            "{}: exact typed text",
+            case.name
+        );
+        assert!(
+            !http_err.contains(STORED_MARKER_9174),
+            "{}: stored text reached the caller: {http_err}",
+            case.name
+        );
+        assert!(
+            !dir.path().join("STORED-MARKER-9174").exists(),
+            "{}: the refused export wrote outside its folder",
+            case.name
+        );
+    }
+}
+
+/// #9174 C9 — a stored resource path carrying a marker never reaches either
+/// caller, whichever refusal the export takes (unsafe path, or a resource
+/// whose stored content no longer matches its digest).
+#[tokio::test]
+async fn stored_resource_path_marker_never_reaches_either_caller_9174() {
+    let stored_paths = [
+        "../../STORED-MARKER-9174/etc/x",
+        "/STORED-MARKER-9174/abs",
+        "scripts/../../STORED-MARKER-9174",
+    ];
+    for stored in stored_paths {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let app = app_state_sqlite(&dir.path().join("ai-memory.db"));
+        let skill_id = seed_9174(&app, "marker-9174").await;
+        {
+            let db = app.db.lock().await;
+            add_resource_resealed_9174(&db.0, &skill_id, stored);
+        }
+        let (mcp_err, status, http_err) = export_both_9174(&app, &skill_id).await;
+        for text in [&mcp_err, &http_err] {
+            assert!(
+                !text.contains(STORED_MARKER_9174),
+                "stored path {stored:?} reached a caller: {text}"
+            );
+        }
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{stored:?}: {http_err}");
+        assert_eq!(http_err, mcp_err, "{stored:?}: HTTP == MCP");
+        assert_eq!(http_err, ai_memory::mcp::EXPORT_RESOURCE_PATH_REFUSED);
+    }
+}

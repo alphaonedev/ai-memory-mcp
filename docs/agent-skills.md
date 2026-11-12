@@ -322,8 +322,9 @@ routes) loads the row through one verified reader that re-derives
 each resource digest and the skill digest, and checks the stored
 signature over the digest. Failures are fail-closed and exact:
 `skill integrity check failed: digest mismatch for skill <id>`,
-`… resource '<path>' digest mismatch …`,
-`… resource '<path>' has no stored digest …`,
+`skill integrity check failed: skill <id>` (a resource whose content
+no longer matches its stored digest, or that has no stored digest; the
+stored resource path goes to the operator log only, #9174),
 `… signature invalid for skill <id>` and
 `… signer public key unavailable for skill <id>` (a signed skill
 whose signer has no enrolled key is refused, never read as
@@ -331,8 +332,10 @@ unsigned) and `… signing agent named without a signature for
 skill <id>` (a row that names a signer but carries no signature is
 refused, never read as unsigned). A stored `allowed_tools` or
 `metadata` column that does not parse, or a corrupt or oversize
-stored blob, is refused the same way (`skill integrity check
-failed: ...`) instead of being read as empty. A signer is stored only when the
+stored blob, is refused the same way instead of being read as empty
+(a stored blob that does not decode renders `zstd decompress body:
+stored blob does not decode` or `zstd decompress resource: stored blob
+does not decode`; the decoder message stays on the operator log). A signer is stored only when the
 register call signs the digest (a keypair with no private half
 stores no signer), and the read paths return `signing_agent` only
 for a signature that verified. The visibility check runs before

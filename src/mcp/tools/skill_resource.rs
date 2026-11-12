@@ -342,10 +342,8 @@ mod tests {
         )
         .unwrap_err();
         // #8834 — exact, fail-closed; no stored/computed digest disclosure.
-        assert_eq!(
-            err,
-            crate::errors::msg::skill_resource_digest_mismatch("x.txt", "sk1")
-        );
+        // #9174 R2 — nor the stored resource path: the skill-level text only.
+        assert_eq!(err, crate::errors::msg::skill_integrity_failed("sk1"));
     }
 
     #[test]
@@ -362,10 +360,7 @@ mod tests {
             None,
         )
         .unwrap_err();
-        assert_eq!(
-            err,
-            crate::errors::msg::skill_resource_digest_missing("u.txt", "sk1")
-        );
+        assert_eq!(err, crate::errors::msg::skill_integrity_failed("sk1"));
     }
 
     #[test]
@@ -385,7 +380,9 @@ mod tests {
             None,
         )
         .unwrap_err();
-        assert!(err.contains("zstd decompress resource"));
+        // #9174 R2 — the fixed text; the decoder message and the stored path
+        // stay on the operator log.
+        assert_eq!(err, crate::errors::msg::SKILL_RESOURCE_UNDECODABLE);
     }
 
     #[test]

@@ -573,6 +573,24 @@ fn decode_resource(path: &str, blob: &[u8]) -> Result<Vec<u8>, String> {
         .map_err(|e| msg::zstd_decompress_resource(path, e))
 }
 
+/// #9174 R2 / C10 — a resource-level refusal names a STORED resource path and
+/// a decode refusal carries the decoder message: that detail goes to the
+/// operator log, and every read surface (MCP, HTTP, CLI, export) gets the fixed
+/// skill-level text, so no surface can forward it (fail closed by construction).
+fn withhold_stored_detail(skill_id: &str, detail: &str) -> String {
+    tracing::error!(
+        target: crate::mcp::error_text::TRACE_TARGET,
+        skill_id,
+        error = %detail,
+        "skill read refused; the stored detail stays on the operator log"
+    );
+    if detail.starts_with(msg::ZSTD_DECOMPRESS_PREFIX) {
+        msg::SKILL_RESOURCE_UNDECODABLE.to_owned()
+    } else {
+        msg::skill_integrity_failed(skill_id)
+    }
+}
+
 /// Verify one resource row; the digest it contributes is the stored one.
 fn verify_resource(skill_id: &str, row: ResourceRow) -> Result<VerifiedResource, String> {
     let (path, kind, blob, stored) = row;
@@ -681,15 +699,22 @@ pub(super) fn load_verified_skill(
         return Err(NotFound(msg::skill_not_found(skill_id)));
     }
 
-    let body = crate::mcp::skill_zstd::decode_all_bounded(body_blob.as_slice())
-        .map_err(|e| Integrity(msg::zstd_decompress_body(e)))?;
+    let body = crate::mcp::skill_zstd::decode_all_bounded(body_blob.as_slice()).map_err(|e| {
+        tracing::error!(
+            target: crate::mcp::error_text::TRACE_TARGET,
+            skill_id = %id,
+            error = %e,
+            "skill read refused; the decoder message stays on the operator log"
+        );
+        Integrity(msg::SKILL_BODY_UNDECODABLE.to_owned())
+    })?;
 
     let resources = read_resource_rows(conn, &id)
         .map_err(Substrate)?
         .into_iter()
         .map(|row| verify_resource(&id, row))
         .collect::<Result<Vec<_>, _>>()
-        .map_err(Integrity)?;
+        .map_err(|detail| Integrity(withhold_stored_detail(&id, &detail)))?;
 
     let allowed_tools: Option<Vec<String>> = allowed_tools_json
         .as_deref()

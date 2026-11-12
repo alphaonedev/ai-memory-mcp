@@ -295,129 +295,51 @@ fn skill_read_status_text(
     skill_id: &str,
     resource_path: Option<&str>,
 ) -> (StatusCode, String) {
-    use crate::errors::msg;
-    match SkillReadError::classify(e, skill_id, resource_path) {
-        SkillReadError::NotFound => (StatusCode::NOT_FOUND, msg::skill_not_found(skill_id)),
-        SkillReadError::DigestMismatch => (
-            StatusCode::BAD_REQUEST,
-            msg::skill_digest_mismatch(skill_id),
-        ),
-        SkillReadError::SignatureInvalid => (
-            StatusCode::BAD_REQUEST,
-            msg::skill_signature_invalid(skill_id),
-        ),
-        SkillReadError::SignerKeyUnavailable => (
-            StatusCode::BAD_REQUEST,
-            msg::skill_signer_key_unavailable(skill_id),
-        ),
-        // A resource-level failure names a stored resource path; render the
-        // fixed skill-level text instead of echoing the stored bytes.
-        SkillReadError::ResourceIntegrity => (
-            StatusCode::BAD_REQUEST,
-            msg::skill_integrity_failed(skill_id),
-        ),
-        SkillReadError::ResourcePathRequired => (
-            StatusCode::BAD_REQUEST,
-            msg::SKILL_RESOURCE_PATH_REQUIRED.to_string(),
-        ),
-        SkillReadError::ResourceNotFound(path) => (
-            StatusCode::NOT_FOUND,
-            msg::skill_resource_not_found(skill_id, path),
-        ),
-        SkillReadError::ResourceReferenceOnly(path) => (
-            StatusCode::BAD_REQUEST,
-            msg::skill_resource_reference_only(path),
-        ),
+    let class = crate::mcp::SkillReadClass::classify(e, skill_id, resource_path);
+    if class.is_sanitized() {
         // #1261 — never forward the raw substrate error (often a
         // `rusqlite::Error` string carrying SQL fragments) or a decoder
         // message (which can name a stored resource path) on the HTTP wire.
         // Log the raw text; emit a generic error to the caller.
-        SkillReadError::Decode | SkillReadError::Substrate | SkillReadError::Internal => {
-            tracing::error!(
-                target: SKILLS_TRACE_TARGET,
-                route,
-                error = %e,
-                "skill read route: substrate error (sanitized for wire response, #1261)"
-            );
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                msg::INTERNAL_SERVER_ERROR.to_string(),
-            )
-        }
+        tracing::error!(
+            target: SKILLS_TRACE_TARGET,
+            route,
+            error = %e,
+            "skill read route: substrate error (sanitized for wire response, #1261)"
+        );
+    }
+    (skill_read_class_status(class), class.caller_text(skill_id))
+}
+
+/// The HTTP status of a skill read class: a missing skill or resource is a
+/// 404, a stored row that is not servable is the caller's 400, and a
+/// sanitized class is the #1261 500.
+const fn skill_read_class_status(class: crate::mcp::SkillReadClass<'_>) -> StatusCode {
+    use crate::mcp::SkillReadClass as C;
+    match class {
+        C::NotFound | C::ResourceNotFound(_) => StatusCode::NOT_FOUND,
+        C::Decode | C::Substrate | C::Internal => StatusCode::INTERNAL_SERVER_ERROR,
+        C::DigestMismatch
+        | C::SignatureInvalid
+        | C::SignerKeyUnavailable
+        | C::SignatureMissing
+        | C::ResourceIntegrity
+        | C::ResourcePathRequired
+        | C::ResourceReferenceOnly(_) => StatusCode::BAD_REQUEST,
     }
 }
 
-/// #8834 (code LOW 3) — the export route's status and wire text. A loader
-/// refusal (every class [`SkillReadError::classify`] names) renders exactly
-/// as on get, resource and compose; only text outside that vocabulary is the
-/// export renderer's own closed vocabulary (#3762: jail and target-folder
-/// refusals naming the CALLER's target), forwarded verbatim as a 400.
-fn skill_export_status_text(e: &str, skill_id: &str) -> (StatusCode, String) {
-    match SkillReadError::classify(e, skill_id, None) {
-        SkillReadError::Internal => (StatusCode::BAD_REQUEST, e.to_owned()),
-        _ => skill_read_status_text("skill_export_route", e, skill_id, None),
-    }
-}
-
-/// The closed vocabulary of [`skill_read_error_response`]. A resource-path
-/// variant borrows the CALLER's request path, never the store's text.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SkillReadError<'a> {
-    NotFound,
-    DigestMismatch,
-    SignatureInvalid,
-    SignerKeyUnavailable,
-    ResourceIntegrity,
-    ResourcePathRequired,
-    ResourceNotFound(&'a str),
-    ResourceReferenceOnly(&'a str),
-    /// A stored blob failed to decode (`ZSTD_DECOMPRESS_PREFIX` family).
-    Decode,
-    /// The store failed (the sanitized `DB_ERROR_TEXT` of the loader's
-    /// substrate class).
-    Substrate,
-    Internal,
-}
-
-impl<'a> SkillReadError<'a> {
-    /// Classify `e` by exact comparison with our own builders' text for this
-    /// request; only the integrity family is matched by its fixed prefix.
-    fn classify(e: &str, skill_id: &str, resource_path: Option<&'a str>) -> Self {
-        use crate::errors::msg;
-        if e == msg::skill_not_found(skill_id) {
-            return Self::NotFound;
-        }
-        if e == msg::skill_digest_mismatch(skill_id) {
-            return Self::DigestMismatch;
-        }
-        if e == msg::skill_signature_invalid(skill_id) {
-            return Self::SignatureInvalid;
-        }
-        if e == msg::skill_signer_key_unavailable(skill_id) {
-            return Self::SignerKeyUnavailable;
-        }
-        if e.starts_with(msg::SKILL_INTEGRITY_FAILED) {
-            return Self::ResourceIntegrity;
-        }
-        if e == msg::SKILL_RESOURCE_PATH_REQUIRED {
-            return Self::ResourcePathRequired;
-        }
-        if e.starts_with(msg::ZSTD_DECOMPRESS_PREFIX) {
-            return Self::Decode;
-        }
-        if e == crate::mcp::error_text::DB_ERROR_TEXT {
-            return Self::Substrate;
-        }
-        if let Some(path) = resource_path {
-            if e == msg::skill_resource_not_found(skill_id, path) {
-                return Self::ResourceNotFound(path);
-            }
-            if e == msg::skill_resource_reference_only(path) {
-                return Self::ResourceReferenceOnly(path);
-            }
-        }
-        Self::Internal
-    }
+/// #9174 R2 — the export route's status and wire text. The text is
+/// [`crate::mcp::classify_skill_export_failure`], the SAME function the MCP tool
+/// renders, so the two surfaces are byte-identical by construction (#3762);
+/// a read class keeps its read-route status, an export refusal is a 400.
+fn skill_export_failure_status(failure: &crate::mcp::SkillExportFailure) -> (StatusCode, String) {
+    let (class, text) = crate::mcp::classify_skill_export_failure(failure);
+    let status = match class {
+        crate::mcp::SkillExportClass::Read(read) => skill_read_class_status(read),
+        crate::mcp::SkillExportClass::Refused => StatusCode::BAD_REQUEST,
+    };
+    (status, text)
 }
 
 /// `GET /api/v1/skill/{id}/resource?path=<resource_path>`.
@@ -496,13 +418,12 @@ pub async fn skill_export_route(
     let kp = (*app.active_keypair).as_ref();
     // #3357 — `lock.1` is the resolved store path; it anchors the default
     // export jail root (`<db parent>/skills-export`).
-    // #3762 — the `Err` text below is the renderer's closed vocabulary
-    // forwarded verbatim (byte-identical with the MCP surface); see the
-    // register route above.
-    match crate::mcp::handle_skill_export(&lock.0, &lock.1, &params, kp, None) {
+    // #9174 R2 — the failure is typed; its caller text comes from the one
+    // mapping the MCP tool renders too (byte-identical, #3762).
+    match crate::mcp::handle_skill_export_classified(&lock.0, &lock.1, &params, kp, None) {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
-        Err(e) => {
-            let (status, text) = skill_export_status_text(&e, &id);
+        Err(failure) => {
+            let (status, text) = skill_export_failure_status(&failure);
             (status, Json(json!({"error": text}))).into_response()
         }
     }
@@ -972,15 +893,15 @@ mod promote_status_4622_tests {
 
 #[cfg(test)]
 mod skill_read_error_8834_tests {
-    use super::SkillReadError;
     use crate::errors::msg;
+    use crate::mcp::SkillReadClass as SkillReadError;
 
     const ID: &str = "sk-8834";
     const PATH: &str = "scripts/run.py";
 
     #[test]
     fn classify_maps_only_own_builder_text_8834() {
-        let cases: [(String, Option<&str>, SkillReadError<'_>); 9] = [
+        let cases: [(String, Option<&str>, SkillReadError<'_>); 10] = [
             (msg::skill_not_found(ID), None, SkillReadError::NotFound),
             (
                 msg::skill_digest_mismatch(ID),
@@ -996,6 +917,11 @@ mod skill_read_error_8834_tests {
                 msg::skill_signer_key_unavailable(ID),
                 None,
                 SkillReadError::SignerKeyUnavailable,
+            ),
+            (
+                msg::skill_signature_missing(ID),
+                None,
+                SkillReadError::SignatureMissing,
             ),
             (
                 msg::skill_resource_digest_mismatch("stored/other", ID),
@@ -1060,7 +986,7 @@ mod skill_read_error_8834_tests {
             (
                 msg::skill_signature_missing(ID),
                 StatusCode::BAD_REQUEST,
-                msg::skill_integrity_failed(ID),
+                msg::skill_signature_missing(ID),
             ),
             (
                 msg::skill_resource_digest_mismatch(STORED, ID),
@@ -1085,7 +1011,13 @@ mod skill_read_error_8834_tests {
                     "resource",
                     super::skill_read_status_text("resource", &e, ID, Some(PATH)),
                 ),
-                ("export", super::skill_export_status_text(&e, ID)),
+                (
+                    "export",
+                    super::skill_export_failure_status(&crate::mcp::SkillExportFailure::Read {
+                        skill_id: ID.to_owned(),
+                        raw: e.clone(),
+                    }),
+                ),
                 (
                     "compose",
                     super::skill_read_status_text("compose", &e, ID, None),
@@ -1097,12 +1029,25 @@ mod skill_read_error_8834_tests {
                 assert!(!body.contains(STORED), "route={route} leaked: {body}");
             }
         }
-        // Text outside the loader vocabulary on export is the renderer's own
-        // #3762 caller-target text: a 400, verbatim.
+        // #9174 R2 — an export refusal is a 400 with its own fixed text, and
+        // read-class text outside the vocabulary is the sanitized 500, never
+        // forwarded.
         let own = "target_folder escapes the export root";
         assert_eq!(
-            super::skill_export_status_text(own, ID),
+            super::skill_export_failure_status(&crate::mcp::SkillExportFailure::Refused(
+                own.to_owned()
+            )),
             (StatusCode::BAD_REQUEST, own.to_owned())
+        );
+        assert_eq!(
+            super::skill_export_failure_status(&crate::mcp::SkillExportFailure::Read {
+                skill_id: ID.to_owned(),
+                raw: format!("cannot write resource '{STORED}'"),
+            }),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                msg::INTERNAL_SERVER_ERROR.to_owned()
+            )
         );
     }
 }

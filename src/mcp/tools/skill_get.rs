@@ -475,7 +475,7 @@ mod tests {
         )
         .unwrap();
         let err = handle_skill_get(&conn, &json!({"skill_id": id}), None).unwrap_err();
-        assert!(err.contains("zstd decompress body"), "got: {err}");
+        assert_eq!(err, crate::errors::msg::SKILL_BODY_UNDECODABLE);
     }
 
     // -----------------------------------------------------------------
@@ -607,11 +607,16 @@ mod tests {
             params![id, blob, digest],
         )
         .unwrap();
-        let err = handle_skill_get(&conn, &json!({"skill_id": id}), None).unwrap_err();
-        assert!(err.contains("zstd decompress body"), "got: {err}");
+        // The bounded decoder is what refuses the bomb ...
+        let decoder = crate::mcp::skill_zstd::decode_all_bounded(blob.as_slice())
+            .expect_err("the bounded decoder refuses the bomb");
         assert!(
-            err.contains("decompression-bomb defence"),
-            "the bomb must be refused by the bounded decoder, got: {err}"
+            decoder.to_string().contains("decompression-bomb defence"),
+            "the bomb must be refused by the bounded decoder, got: {decoder}"
         );
+        // ... and #9174 R2: the read renders the fixed text, the decoder
+        // message stays on the operator log.
+        let err = handle_skill_get(&conn, &json!({"skill_id": id}), None).unwrap_err();
+        assert_eq!(err, crate::errors::msg::SKILL_BODY_UNDECODABLE);
     }
 }
