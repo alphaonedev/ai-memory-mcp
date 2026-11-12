@@ -1117,11 +1117,16 @@ fn apply_writer_pragmas(conn: &Connection) -> Result<()> {
 }
 
 /// #6106 — rusqlite appends the raw path to a `CannotOpen` failure message
-/// (`unable to open database file: <path>`) and carries it in
-/// `InvalidPath`, so a `db =` value that holds a credential would reach every
-/// `{e:#}` sink through the error chain. When the db-path funnel redacts the
-/// path, the raw text is swapped for the funnel's rendering; a message that
-/// does not carry the raw text verbatim is dropped (fail closed).
+/// (`unable to open database file: <path>`), carries it in `InvalidPath`,
+/// and keeps the path bytes of a NUL-bearing path in `NulError`, so a `db =`
+/// value that holds a credential would reach every `{e:#}` / `{e:?}` sink
+/// through the error chain. When the db-path funnel redacts the path, EVERY
+/// variant is scrubbed (security LOW-4, ERRORS-09): a `SqliteFailure`
+/// message has the raw text swapped for the funnel's rendering (a message
+/// that does not carry it verbatim is dropped, fail closed); `InvalidPath`
+/// and `NulError` become `InvalidPath(<rendering>)`; any other variant whose
+/// `Display` or `Debug` names the raw path becomes `InvalidPath(<rendering>)`
+/// too, so a variant this match does not list cannot carry the path out.
 fn scrub_open_error(err: rusqlite::Error, path: &Path) -> rusqlite::Error {
     let raw = path.to_string_lossy();
     let shown = crate::url_display::db_path_display(path);
@@ -1134,9 +1139,19 @@ fn scrub_open_error(err: rusqlite::Error, path: &Path) -> rusqlite::Error {
                 (!raw.is_empty() && msg.contains(&*raw)).then(|| msg.replace(&*raw, &shown));
             rusqlite::Error::SqliteFailure(code, scrubbed)
         }
-        rusqlite::Error::InvalidPath(_) => rusqlite::Error::InvalidPath(shown.into()),
+        rusqlite::Error::SqliteFailure(code, None) => rusqlite::Error::SqliteFailure(code, None),
+        rusqlite::Error::InvalidPath(_) | rusqlite::Error::NulError(_) => {
+            rusqlite::Error::InvalidPath(shown.into())
+        }
+        other if names_raw_path(&other, &raw) => rusqlite::Error::InvalidPath(shown.into()),
         other => other,
     }
+}
+
+/// Does the `Display` or `Debug` form of `err` contain `raw`? An empty
+/// `raw` names nothing.
+fn names_raw_path(err: &rusqlite::Error, raw: &str) -> bool {
+    !raw.is_empty() && (err.to_string().contains(raw) || format!("{err:?}").contains(raw))
 }
 
 /// v1.0.0 #2445 — open an EXISTING database WITHOUT applying the bootstrap
@@ -1510,6 +1525,88 @@ pub(crate) fn apply_sqlcipher_key(_conn: &Connection) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Security LOW-4 (#6106): one row per `rusqlite::Error` shape an open
+    /// can produce, plus a variant the match does not list. A credential-
+    /// bearing path never survives in `Display` or `Debug`.
+    #[test]
+    fn scrub_open_error_scrubs_every_variant_6106() {
+        const CANARY: &str = "SCRUBX6106pw";
+        const SHOWN: &str = "<redacted-db-path: '@' or '=' may delimit a credential>";
+        /// The Display of a `SqliteFailure` whose message was dropped.
+        const NO_MESSAGE: &str = "Error code 14: Unable to open the database file";
+        let path_text = format!("/srv/svc:{CANARY}@db.example/mem.db");
+        let path = Path::new(&path_text);
+        let cant_open = || rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CANTOPEN);
+        let nul = std::ffi::CString::new(format!("{path_text}\0x").into_bytes())
+            .expect_err("an interior NUL is refused");
+        let rows: Vec<(&str, rusqlite::Error, String)> = vec![
+            (
+                "SqliteFailure with the raw path",
+                rusqlite::Error::SqliteFailure(
+                    cant_open(),
+                    Some(format!("unable to open database file: {path_text}")),
+                ),
+                format!("unable to open database file: {SHOWN}"),
+            ),
+            (
+                "SqliteFailure with a message that only partly names it",
+                rusqlite::Error::SqliteFailure(cant_open(), Some(format!("x {CANARY} y"))),
+                NO_MESSAGE.to_string(),
+            ),
+            (
+                "SqliteFailure without a message",
+                rusqlite::Error::SqliteFailure(cant_open(), None),
+                NO_MESSAGE.to_string(),
+            ),
+            (
+                "InvalidPath",
+                rusqlite::Error::InvalidPath(path.to_path_buf()),
+                format!("Invalid path: {SHOWN}"),
+            ),
+            (
+                "NulError",
+                rusqlite::Error::NulError(nul),
+                format!("Invalid path: {SHOWN}"),
+            ),
+            (
+                "an unlisted variant that names the path",
+                rusqlite::Error::InvalidParameterName(path_text.clone()),
+                format!("Invalid path: {SHOWN}"),
+            ),
+            (
+                "an unlisted variant that does not name the path",
+                rusqlite::Error::QueryReturnedNoRows,
+                "Query returned no rows".to_string(),
+            ),
+        ];
+        for (name, err, want) in rows {
+            let scrubbed = scrub_open_error(err, path);
+            assert_eq!(scrubbed.to_string(), want, "{name}: Display");
+            assert!(
+                !format!("{scrubbed:?}").contains(CANARY),
+                "{name}: Debug {scrubbed:?}"
+            );
+        }
+        // A path the funnel shows as written keeps the error unchanged.
+        let plain = Path::new("/var/lib/ai-memory/plain.db");
+        let kept = scrub_open_error(rusqlite::Error::InvalidPath(plain.to_path_buf()), plain);
+        assert_eq!(
+            kept.to_string(),
+            "Invalid path: /var/lib/ai-memory/plain.db"
+        );
+    }
+
+    /// End to end through [`open`]: a NUL-bearing credential path is refused
+    /// without its bytes in the error chain.
+    #[test]
+    fn open_refusal_of_a_nul_path_carries_no_credential_6106() {
+        const CANARY: &str = "NULX6106pw";
+        let path_text = format!("svc:{CANARY}@db.example/mem\0.db");
+        let err = open(Path::new(&path_text)).expect_err("a NUL path cannot open");
+        assert!(!format!("{err:#}").contains(CANARY), "{err:#}");
+        assert!(!format!("{err:?}").contains(CANARY), "{err:?}");
+    }
 
     #[test]
     fn valid_time_projection_accepts_sql_null_2266() {
