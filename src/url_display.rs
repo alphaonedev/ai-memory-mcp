@@ -146,7 +146,7 @@ pub fn url_origin(url: &str) -> String {
 /// An ambiguous authority (#6101) renders `scheme://<redacted-authority>`:
 /// the parsed path of such a URL carries the password. That rendering is
 /// shared by every ambiguous URL of one scheme, so it is NOT a unique key:
-/// a durable-key writer checks [`origin_and_path_is_durable_key`] first.
+/// a durable-key writer checks [`durable_key_refusal`] first.
 #[must_use]
 pub fn url_origin_and_path(url: &str) -> String {
     let trimmed = url.trim();
@@ -164,13 +164,93 @@ pub fn url_origin_and_path(url: &str) -> String {
     }
 }
 
-/// `true` when [`url_origin_and_path`] of `url` names ONE peer: the URL
-/// parses and its authority is not ambiguous (#6101 #6628). The redacted and
-/// unparseable renderings are shared by many URLs, so two such peers would
-/// share one `sync_state` cursor row; the sync cycle refuses them instead.
+/// Why [`url_origin_and_path`] of a peer URL is NOT a durable sync key
+/// (#6101 #6628). Each variant names its own remedy, so the refusal never
+/// gives advice that does not apply to the URL in hand (ERRORS-06).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DurableKeyRefusal {
+    /// The URL does not parse: it renders `scheme://<unparseable>`.
+    Unparseable,
+    /// The URL parses, but its authority is ambiguous (an `@` in the parsed
+    /// path, query or fragment): it renders `scheme://<redacted-authority>`.
+    AmbiguousAuthority,
+}
+
+/// Renders [`DurableKeyRefusal::reason`].
+impl fmt::Display for DurableKeyRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.reason())
+    }
+}
+
+impl DurableKeyRefusal {
+    /// The operator-facing remedy for this refusal.
+    #[must_use]
+    pub const fn reason(self) -> &'static str {
+        match self {
+            Self::Unparseable => {
+                "the peer URL does not parse; write it as scheme://host[:port][/path]"
+            }
+            Self::AmbiguousAuthority => {
+                "its authority is ambiguous; percent-encode each '/', '?', '#' or '@' inside the userinfo, path or query (a literal '@' as %40)"
+            }
+        }
+    }
+}
+
+/// `None` when [`url_origin_and_path`] of `url` names ONE peer: the URL
+/// parses and its authority is not ambiguous (#6101 #6628); otherwise the
+/// [`DurableKeyRefusal`]. The redacted and unparseable renderings are shared
+/// by many URLs, so two such peers would share one `sync_state` cursor row;
+/// the sync cycle refuses them instead.
+#[must_use]
+pub fn durable_key_refusal(url: &str) -> Option<DurableKeyRefusal> {
+    match reqwest::Url::parse(url.trim()) {
+        Err(_) => Some(DurableKeyRefusal::Unparseable),
+        Ok(parsed) if at_after_authority(&parsed) => Some(DurableKeyRefusal::AmbiguousAuthority),
+        Ok(_) => None,
+    }
+}
+
+/// `true` when [`durable_key_refusal`] of `url` is `None`.
 #[must_use]
 pub fn origin_and_path_is_durable_key(url: &str) -> bool {
-    reqwest::Url::parse(url.trim()).is_ok_and(|parsed| !at_after_authority(&parsed))
+    durable_key_refusal(url).is_none()
+}
+
+/// `true` when `value` starts with an RFC 3986 `scheme:` and holds an `@`
+/// after it: the userinfo shape `scheme:user:pw@host` (#6102, LOW-3 of the
+/// #9173 review). Any scheme qualifies, known or not, so an unknown or
+/// slashless scheme (`ftp:svc:pw@h`, `gopher:...`) is still URL-shaped and
+/// renders through the funnel (ERRORS-01, fail closed on an unclassified
+/// form). Leading and trailing C0 controls and spaces are trimmed and tab,
+/// LF and CR are dropped, as the WHATWG parser does before it reads the
+/// scheme. One linear pass over `value`.
+#[must_use]
+pub(crate) fn has_scheme_and_userinfo(value: &str) -> bool {
+    let folded: String = value
+        .trim_matches(|c: char| c.is_whitespace() || c.is_ascii_control())
+        .chars()
+        .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
+        .collect();
+    folded.split_once(':').is_some_and(|(scheme, rest)| {
+        is_rfc3986_scheme(scheme)
+            && rest
+                .split_once('@')
+                .is_some_and(|(userinfo, host)| !is_agent_id_form(scheme, userinfo, host))
+    })
+}
+
+/// The scheme token of the product's agent-id form `ai:<name>@<host>`.
+const AGENT_ID_SCHEME: &str = "ai";
+
+/// `true` for the agent-id form `ai:<name>@<host>` (scheme [`AGENT_ID_SCHEME`],
+/// any case): a public identity, not a URL. A `:`, `/`, `?` or `#` in the
+/// name, or a second `@`, is a userinfo credential shape and is NOT exempt.
+fn is_agent_id_form(scheme: &str, userinfo: &str, host: &str) -> bool {
+    scheme.eq_ignore_ascii_case(AGENT_ID_SCHEME)
+        && !userinfo.contains([':', '/', '?', '#'])
+        && !host.contains('@')
 }
 
 /// `true` when `url` PARSES to a URL whose path, query or fragment holds an
@@ -216,8 +296,10 @@ fn sqlite_store_display(rest: &str) -> String {
 }
 
 /// Rendering of a db path whose text could carry a credential (#6106): a
-/// schemeless value holding a [`CREDENTIAL_DELIMITERS`] char.
-const REDACTED_DB_PATH: &str = "<redacted-db-path>";
+/// schemeless value holding a [`CREDENTIAL_DELIMITERS`] char. The marker
+/// states WHY the path is hidden, so an operator whose real path holds an
+/// `@` or `=` is told what to rename (F6 of the #9173 review).
+const REDACTED_DB_PATH: &str = "<redacted-db-path: '@' or '=' may delimit a credential>";
 
 /// A database PATH (`--db`, `AI_MEMORY_DB`, config `db =`) for every
 /// human- and machine-readable sink: doctor `source:` and notes, the open
@@ -226,7 +308,9 @@ const REDACTED_DB_PATH: &str = "<redacted-db-path>";
 /// - Text holding `://` is a URL and renders through [`store_url_display`].
 /// - Schemeless text holding `@` or `=` renders [`REDACTED_DB_PATH`]: a
 ///   libpq key/value DSN (`host=db password=..`) or a `user:pw@host` value
-///   has no scheme to parse, so nothing of it is shown (ERRORS-01).
+///   has no scheme to parse, so nothing of it is shown (ERRORS-01). A real
+///   file path cannot be told apart from such a DSN by its text, so it is
+///   redacted too, and the marker names the two characters as the reason.
 /// - Any other path renders as written: a file path is not a credential.
 #[must_use]
 pub fn db_path_display(path: &std::path::Path) -> String {
@@ -948,5 +1032,115 @@ mod tests {
             );
         }
         assert!(started.elapsed() < HUGE_INPUT_CEILING);
+    }
+
+    /// Code F6 (#6106): the db-path marker states WHY the path is not shown,
+    /// and a real path holding '@' or '=' gets exactly that text.
+    #[test]
+    fn redacted_db_path_marker_states_its_reason_6106() {
+        assert_eq!(
+            REDACTED_DB_PATH,
+            "<redacted-db-path: '@' or '=' may delimit a credential>"
+        );
+        for path in ["/home/a@b/mem.db", "/srv/k=v/mem.db"] {
+            assert_eq!(
+                db_path_display(std::path::Path::new(path)),
+                REDACTED_DB_PATH,
+                "{path}"
+            );
+        }
+    }
+
+    /// Code F4 (#6101): each refusal names its own remedy; the `%40` advice
+    /// is given only for an ambiguous authority.
+    #[test]
+    fn durable_key_refusal_names_the_cause_exactly_6101() {
+        const UNPARSEABLE: &str =
+            "the peer URL does not parse; write it as scheme://host[:port][/path]";
+        const AMBIGUOUS: &str = "its authority is ambiguous; percent-encode each '/', '?', '#' or \
+                                 '@' inside the userinfo, path or query (a literal '@' as %40)";
+        for (url, want) in [
+            (
+                "http://[::1",
+                Some((DurableKeyRefusal::Unparseable, UNPARSEABLE)),
+            ),
+            (
+                "not a url",
+                Some((DurableKeyRefusal::Unparseable, UNPARSEABLE)),
+            ),
+            (
+                "http://svc:/pw@127.0.0.1:9/mesh",
+                Some((DurableKeyRefusal::AmbiguousAuthority, AMBIGUOUS)),
+            ),
+            ("https://peer.example:9077/mesh", None),
+            ("https://svc:pw@peer.example/mesh", None),
+        ] {
+            let got = durable_key_refusal(url);
+            assert_eq!(got, want.map(|(r, _)| r), "{url}");
+            if let Some((refusal, text)) = want {
+                assert_eq!(refusal.reason(), text, "{url}");
+                assert_eq!(refusal.to_string(), text, "{url}");
+            }
+            assert_eq!(origin_and_path_is_durable_key(url), want.is_none(), "{url}");
+        }
+        assert!(!DurableKeyRefusal::Unparseable.reason().contains("%40"));
+    }
+
+    /// Security LOW-3 (#6102): `scheme:` + userinfo of ANY RFC 3986 scheme is
+    /// URL-shaped. Generative over schemes, case, control bytes and shapes.
+    #[test]
+    fn has_scheme_and_userinfo_is_scheme_agnostic_6102() {
+        const SCHEMES: &[&str] = &[
+            "http", "HTTPS", "ftp", "Gopher", "ldap", "x-vendor", "a+b.c-d", "z", "AI",
+        ];
+        const SHAPES: &[&str] = &["svc:pw@h", "/svc:pw@h/x", "a@b/c@h", "svc:pw@h:1?q#f"];
+        for scheme in SCHEMES {
+            for shape in SHAPES {
+                for wrap in ["", " ", "\u{1}", "\t"] {
+                    let value = format!("{wrap}{scheme}:{shape}{wrap}");
+                    assert!(has_scheme_and_userinfo(&value), "{value:?}");
+                }
+                // A tab, CR or LF inside the scheme is dropped by the WHATWG
+                // parser, so it is dropped here too.
+                let split = format!("{}\r\n{}:{shape}", &scheme[..1], &scheme[1..]);
+                assert!(has_scheme_and_userinfo(&split), "{split:?}");
+            }
+        }
+        for value in [
+            "ai:claude@host-1",
+            "AI:node.f2@host",
+            "llama3:8b",
+            "C:\\path\\mem.db",
+            "no-at:here",
+            "1http:svc:pw@h",
+            "plain@text",
+            "",
+        ] {
+            assert!(!has_scheme_and_userinfo(value), "{value:?}");
+        }
+        // The agent-id exemption refuses a userinfo that could hold a password.
+        assert!(has_scheme_and_userinfo("ai:svc:pw@h"));
+        assert!(has_scheme_and_userinfo("ai:a@b@h"));
+    }
+
+    #[test]
+    fn has_scheme_and_userinfo_is_linear_on_huge_input_6102() {
+        let huge_scheme = format!("{}:svc:pw@h", "a".repeat(HUGE_INPUT_LEN));
+        let huge_rest = format!("http:{}@h", "b".repeat(HUGE_INPUT_LEN));
+        let no_at = format!("http:{}", ":".repeat(HUGE_INPUT_LEN));
+        let started = std::time::Instant::now();
+        for _ in 0..HUGE_ITERATIONS {
+            assert!(
+                !has_scheme_and_userinfo(&huge_scheme),
+                "over MAX_SCHEME_LEN"
+            );
+            assert!(has_scheme_and_userinfo(&huge_rest));
+            assert!(!has_scheme_and_userinfo(&no_at));
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < HUGE_INPUT_CEILING,
+            "took {elapsed:?} (ceiling {HUGE_INPUT_CEILING:?})"
+        );
     }
 }

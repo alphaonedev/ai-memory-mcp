@@ -17,6 +17,7 @@
 //! over stdout + stderr (`RUST_LOG=trace`, backtraces on), case-folded; the
 //! `config show` cells also assert the exact rendering.
 
+mod common;
 #[path = "common/key_dir_sandbox.rs"]
 mod key_dir_sandbox;
 
@@ -29,7 +30,7 @@ use tempfile::TempDir;
 const MARKER: &str = "SECRETX8741";
 
 /// Rendering of a schemeless db value that may carry a credential.
-const REDACTED_DB_PATH: &str = "<redacted-db-path>";
+const REDACTED_DB_PATH: &str = "<redacted-db-path: '@' or '=' may delimit a credential>";
 
 /// How long a `serve` that did open its database is left running before it
 /// is killed and its boot output inspected.
@@ -101,6 +102,9 @@ fn run_in(root: &TempDir, run: &Run<'_>) -> String {
         .env("RUST_LOG", "trace")
         .env("RUST_BACKTRACE", "1")
         .env("RUST_LIB_BACKTRACE", "1");
+    // #4166: every verb this file runs (`serve` included) boots offline, so a
+    // cell never waits on an embedder model download.
+    common::serve_test_env(&mut cmd);
     for (k, v) in run.env {
         cmd.env(k, v);
     }

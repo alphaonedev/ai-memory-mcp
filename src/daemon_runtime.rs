@@ -9030,9 +9030,9 @@ pub async fn sync_cycle_once(
     // `sync_state.peer_id`, every backup or every `VACUUM INTO` snapshot.
     let peer_key = crate::url_display::url_origin_and_path(peer_url);
     let peer_key = peer_key.as_str();
-    if !crate::url_display::origin_and_path_is_durable_key(peer_url) {
-        // #6101: an ambiguous URL redacts to a non-unique key; refuse rather than share a cursor.
-        anyhow::bail!("peer {peer_key} refused: no unique sync key; encode a literal '@' as %40");
+    if let Some(why) = crate::url_display::durable_key_refusal(peer_url) {
+        // #6101: a redacted / unparseable URL is a non-unique key; refuse rather than share a cursor.
+        anyhow::bail!("peer {peer_key} refused: no unique sync key; {why}");
     }
 
     // --- PULL --------------------------------------------------------
