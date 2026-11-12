@@ -1,14 +1,21 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
-//! #3582: production catchup loops must preserve delivered rows AND the cursor
-//! on namespace refusal, on SQLite and the live PostgreSQL SAL dispatch.
+//! #3582: production catchup loops must never apply a row the peer may not
+//! write, on SQLite and the live PostgreSQL SAL dispatch.
+//!
+//! #9198: under the #8788 settled-row contract a namespace refusal is
+//! recorded (one `RefusedRow` with reason `namespace_scope`, the refused-rows
+//! counter +1) and the since cursor passes the refused row; the receiver keeps
+//! every column of its own copy and the sender keeps the row.
 #![allow(clippy::too_many_lines)]
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use ai_memory::federation::{FederationConfig, PeerEndpoint};
+use ai_memory::federation::{
+    FederationConfig, PeerEndpoint, PullOutcome, RefusalReason, RefusedRow,
+};
 use ai_memory::handlers::Db;
 use ai_memory::models::Memory;
 use axum::{Json, Router, routing::get};
@@ -116,7 +123,20 @@ impl Task {
     }
 }
 
-async fn peer(rows: Vec<Memory>) -> (FederationConfig, Arc<Notify>, Task) {
+/// The label of the refused-rows counter series a namespace refusal bumps.
+const NAMESPACE_SCOPE: &str = "namespace_scope";
+
+fn refused_namespace_scope_total() -> u64 {
+    ai_memory::metrics::registry()
+        .federation_pull_rows_refused_total
+        .with_label_values(&[NAMESPACE_SCOPE])
+        .get()
+}
+
+/// The mock peer. `hold_second` parks every GET after the first, so a
+/// spawned loop completes exactly one tick; without it every GET is
+/// answered, so the sender can be read back after a single pass.
+async fn peer(rows: Vec<Memory>, hold_second: bool) -> (FederationConfig, Arc<Notify>, Task) {
     let second = Arc::new(Notify::new());
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let notice = second.clone();
@@ -127,7 +147,7 @@ async fn peer(rows: Vec<Memory>) -> (FederationConfig, Arc<Notify>, Task) {
             let calls = calls.clone();
             let notice = notice.clone();
             async move {
-                if calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed) > 0 {
+                if hold_second && calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed) > 0 {
                     // The sequential loop finished its first apply + cursor update.
                     // Hold this response so no second apply can begin.
                     notice.notify_one();
@@ -166,6 +186,65 @@ async fn peer(rows: Vec<Memory>) -> (FederationConfig, Arc<Notify>, Task) {
         dlq_sink: None,
     };
     (config, second, task)
+}
+
+/// The rows the sender still serves.
+async fn sender_rows(config: &FederationConfig) -> Vec<Memory> {
+    let base = config.peers[0]
+        .sync_push_url
+        .trim_end_matches("/api/v1/sync/push")
+        .to_string();
+    let body: Value = config
+        .client
+        .get(format!("{base}/api/v1/sync/since"))
+        .send()
+        .await
+        .expect("GET sender")
+        .json()
+        .await
+        .expect("sender JSON");
+    serde_json::from_value(body["memories"].clone()).expect("sender rows")
+}
+
+fn single(mut outcomes: Vec<(String, PullOutcome)>) -> PullOutcome {
+    assert_eq!(outcomes.len(), 1, "one configured peer, one outcome");
+    let (peer_id, outcome) = outcomes.remove(0);
+    assert_eq!(peer_id, PEER, "the outcome names the configured peer");
+    outcome
+}
+
+/// #9198 — the exact values of one refused window: the outcome records one
+/// `namespace_scope` refusal for `refused_id`, the counter moved by exactly
+/// one, and the cursor equals `prior` with this peer's entry at `AFTER`.
+async fn assert_refused_window(
+    label: &str,
+    db: &Db,
+    outcome: &PullOutcome,
+    refused_id: &str,
+    counter_before: u64,
+    prior: &Value,
+) {
+    assert_eq!(
+        outcome.refused,
+        vec![RefusedRow {
+            memory_id: refused_id.to_string(),
+            reason: RefusalReason::NamespaceScope,
+        }],
+        "{label}: a refused delivery is recorded as one namespace_scope RefusedRow"
+    );
+    assert_eq!(outcome.applied, 0, "{label}: nothing applied");
+    assert_eq!(
+        refused_namespace_scope_total() - counter_before,
+        1,
+        "{label}: the refused-rows counter moves by exactly one"
+    );
+    let mut expected = prior.clone();
+    expected["entries"][PEER] = json!(AFTER);
+    assert_eq!(
+        cursor(db).await,
+        expected,
+        "{label}: a refused delivery is settled, the cursor passes it to AFTER (#8788)"
+    );
 }
 
 async fn cursor(db: &Db) -> Value {
@@ -228,14 +307,50 @@ async fn sqlite_catchup_posture_preserves_rows_and_cursor_3582() {
         update.updated_at = AFTER.to_string();
         let mut new = memory(namespace);
         new.updated_at = AFTER.to_string();
-        let (config, second, mut server) = peer(vec![update.clone(), new.clone()]).await;
+        if !allowed {
+            // #9198: one delivered row, refused, through one pass of the
+            // production loop body (the outcome is the observable).
+            let (config, _second, mut server) = peer(vec![update.clone()], false).await;
+            let counter_before = refused_namespace_scope_total();
+            let outcome = single(ai_memory::federation::catchup_pass_for_tests(&config, &db).await);
+            assert_eq!(
+                sqlite_snapshot(&db).await,
+                before,
+                "{label}: the refused row is not applied, every column preserved"
+            );
+            assert_refused_window(
+                label,
+                &db,
+                &outcome,
+                &update.id,
+                counter_before,
+                &prior_cursor,
+            )
+            .await;
+            assert_eq!(
+                sender_rows(&config)
+                    .await
+                    .into_iter()
+                    .map(|m| (m.id, m.content, m.updated_at))
+                    .collect::<Vec<_>>(),
+                vec![(
+                    update.id.clone(),
+                    update.content.clone(),
+                    update.updated_at.clone()
+                )],
+                "{label}: the sender still holds the refused row"
+            );
+            server.stop().await;
+            continue;
+        }
+        let (config, second, mut server) = peer(vec![update.clone(), new.clone()], true).await;
         let task = Task(ai_memory::federation::spawn_catchup_loop(
             config,
             db.clone(),
             Duration::from_millis(1),
         ));
         complete_tick(task, &second, &mut server).await;
-        if allowed {
+        {
             let lock = db.lock().await;
             let stored = ai_memory::db::get(&lock.0, &original.id)
                 .expect("get old row")
@@ -249,17 +364,6 @@ async fn sqlite_catchup_posture_preserves_rows_and_cursor_3582() {
             );
             drop(lock);
             assert_eq!(cursor(&db).await["entries"][PEER], json!(AFTER), "{label}");
-        } else {
-            assert_eq!(
-                sqlite_snapshot(&db).await,
-                before,
-                "{label}: every column preserved, new row absent"
-            );
-            assert_eq!(
-                cursor(&db).await,
-                prior_cursor,
-                "{label}: refused delivery must not advance cursor"
-            );
         }
     }
 }
@@ -309,7 +413,54 @@ async fn postgres_catchup_posture_preserves_rows_and_cursor_3582() {
         update.updated_at = AFTER.to_string();
         let mut new = memory(&namespace);
         new.updated_at = AFTER.to_string();
-        let (config, second, mut server) = peer(vec![update.clone(), new.clone()]).await;
+        if !allowed {
+            // #9198: one delivered row, refused, through one pass of the
+            // production SAL loop body.
+            let (config, _second, mut server) = peer(vec![update.clone()], false).await;
+            let counter_before = refused_namespace_scope_total();
+            let outcome = single(
+                ai_memory::federation::catchup_pass_with_store_for_tests(&config, &db, &store)
+                    .await,
+            );
+            let after: Vec<Value> = sqlx::query_scalar(snapshot_sql)
+                .bind(&namespace)
+                .fetch_all(&pool)
+                .await
+                .expect("snapshot after");
+            assert_eq!(
+                after, before,
+                "{label}: the refused row is not applied, every PG column preserved"
+            );
+            assert_refused_window(
+                label,
+                &db,
+                &outcome,
+                &update.id,
+                counter_before,
+                &prior_cursor,
+            )
+            .await;
+            assert_eq!(
+                sender_rows(&config)
+                    .await
+                    .into_iter()
+                    .map(|m| (m.id, m.content, m.updated_at))
+                    .collect::<Vec<_>>(),
+                vec![(
+                    update.id.clone(),
+                    update.content.clone(),
+                    update.updated_at.clone()
+                )],
+                "{label}: the sender still holds the refused row"
+            );
+            assert!(
+                sqlite_snapshot(&db).await.is_empty(),
+                "PG writes must never land in the SQLite cursor DB"
+            );
+            server.stop().await;
+            continue;
+        }
+        let (config, second, mut server) = peer(vec![update.clone(), new.clone()], true).await;
         let task = Task(ai_memory::federation::spawn_catchup_loop_with_store(
             config,
             db.clone(),
@@ -322,7 +473,7 @@ async fn postgres_catchup_posture_preserves_rows_and_cursor_3582() {
             .fetch_all(&pool)
             .await
             .expect("snapshot after");
-        if allowed {
+        {
             assert_eq!(
                 store
                     .get(&ctx, &original.id)
@@ -338,16 +489,7 @@ async fn postgres_catchup_posture_preserves_rows_and_cursor_3582() {
                 "{label}"
             );
             assert_eq!(cursor(&db).await["entries"][PEER], json!(AFTER), "{label}");
-        } else {
-            assert_eq!(
-                after, before,
-                "{label}: every PG column preserved, new row absent"
-            );
-            assert_eq!(
-                cursor(&db).await,
-                prior_cursor,
-                "{label}: refused delivery must not advance cursor"
-            );
+            assert_ne!(after, before, "{label}: the authorised update is applied");
         }
         assert!(
             sqlite_snapshot(&db).await.is_empty(),

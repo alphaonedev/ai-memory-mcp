@@ -1817,6 +1817,57 @@ async fn sqlite_seq_limit_zero_advances_one_row_9176() {
     clear_posture();
 }
 
+/// #9176 F3: the seq clamp does not reach the since path, where `limit=0`
+/// answers 0 rows on both backends (the sqlite behaviour before #9082; the
+/// postgres path floored the limit at 1 in the SAL adapter and served a row).
+async fn since_limit_zero_serves_nothing(backend: Backend) {
+    let Some(n) = node(backend, "since-limit-zero").await else {
+        return;
+    };
+    seed(&n, "slz-1", TS_EQUAL, 5).await;
+    seed(&n, "slz-2", TS_ABOVE, 5).await;
+    let (status, v) = get(&n.router, None, 0).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{backend:?}: since pull answers 200: {v}"
+    );
+    assert_eq!(
+        ids(&v),
+        Vec::<String>::new(),
+        "{backend:?}: since-path limit=0 serves 0 rows"
+    );
+    assert_eq!(v["count"], 0, "{backend:?}: since-path count is 0");
+    assert_eq!(
+        v["limit"], 0,
+        "{backend:?}: since-path limit is not clamped"
+    );
+    let (status, all) = get(&n.router, None, PAGE).await;
+    assert_eq!(status, StatusCode::OK, "{backend:?}: control pull: {all}");
+    assert_eq!(
+        ids(&all).len(),
+        2,
+        "{backend:?}: control: both seeded rows are served at a real limit"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sqlite_since_limit_zero_serves_no_rows_9176() {
+    let _g = ENV_LOCK.lock().await;
+    set_posture();
+    since_limit_zero_serves_nothing(Backend::Sqlite).await;
+    clear_posture();
+}
+
+#[cfg(feature = "sal-postgres")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_since_limit_zero_serves_no_rows_9176() {
+    let _g = ENV_LOCK.lock().await;
+    set_posture();
+    since_limit_zero_serves_nothing(Backend::Postgres).await;
+    clear_posture();
+}
+
 #[cfg(feature = "sal-postgres")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn postgres_seq_limit_zero_advances_one_row_9176() {
