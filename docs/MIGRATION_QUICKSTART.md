@@ -235,9 +235,11 @@ for H in $FLEET; do ssh "$H" 'systemctl --user restart ai-memory && ai-memory do
 
 ### Postgres / Apache AGE / pgvector deployments
 
-If you run `ai-memory serve --store-url postgres://…` with the
+If you run `ai-memory serve` against a Postgres store with the
 `sal-postgres` feature, the schema upgrade happens via
-`ai-memory schema-init --store-url postgres://…` — opening the
+`ai-memory schema-init`, with the store URL in
+`AI_MEMORY_STORE_URL_FILE` (a `0600` file holding the URL) rather
+than on the command line — opening the
 store walks the in-process `migrate_v34()…migrate_v55()` async
 ladder as a side effect (there is no `--upgrade` flag). Apache AGE
 (`memory_graph`) is provisioned by the same command if the `age`
@@ -281,6 +283,10 @@ grep -l AI_MEMORY_LLM ~/.claude.json && \
 
 Drop this snippet into ansible / terraform / CI / Makefile.
 Every step is idempotent — safe to run on every play.
+Step 3 runs `schema-init` with no `--store-url` on purpose: it reads
+the store URL from `AI_MEMORY_STORE_URL_FILE` (a `0600` file), then
+`AI_MEMORY_STORE_URL`, because a URL on the command line is visible
+to every local user through the process list (#4600).
 
 ```bash
 #!/usr/bin/env bash

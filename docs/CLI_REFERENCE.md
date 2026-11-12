@@ -49,12 +49,15 @@ supplements `--help` with examples and context.
 | `AI_MEMORY_EMBED_MODEL` | #1598 — embedding model id (e.g. `google/gemini-embedding-001`). Dim resolves from `KNOWN_EMBEDDING_DIMS`; set `[embeddings].dim` (env `AI_MEMORY_EMBED_DIM`) for models outside the table or to pin a Matryoshka model to the `dim = 768` fleet width (#2626). |
 | `AI_MEMORY_EMBED_API_KEY` | #1598 — **secret.** Bearer key for API embedding backends; highest-precedence layer over the per-vendor alias env, `[embeddings].api_key_env`, and `[embeddings].api_key_file` (0400 enforced). |
 | `AI_MEMORY_STORE_URL` | #1927 — **secret.** Non-argv channel for the `serve --store-url` connection URL (e.g. `postgres://user:pass@host/db`), read from the owner-only environment instead of argv so a userinfo password is not exposed via `/proc/<pid>/cmdline` or `ps auxww`. |
-| `AI_MEMORY_STORE_URL_FILE` | #1927 — **secret.** Path to a `0600`-enforced file holding the `--store-url` connection URL; takes precedence over `AI_MEMORY_STORE_URL`, which in turn takes precedence over the CLI arg. |
+| `AI_MEMORY_STORE_URL_FILE` | #1927 — **secret.** Path to a `0600`-enforced file holding the `--store-url` connection URL; takes precedence over `AI_MEMORY_STORE_URL`, which in turn takes precedence over the CLI arg; on `schema-init`, `quarantine` and `recover-previous-session` a differing `--store-url` is refused instead (#4600). |
 | `RUST_LOG` | Tracing filter, e.g. `RUST_LOG=ai_memory=debug`. (Standard Rust ecosystem env, not product-specific.) |
 
 Most scalar settings use **CLI flag > `AI_MEMORY_*` env var > config
 file > compiled default**; check the setting's resolver contract. Store
-URL uses `AI_MEMORY_STORE_URL_FILE` > `AI_MEMORY_STORE_URL` > `--store-url`.
+URL uses `AI_MEMORY_STORE_URL_FILE` > `AI_MEMORY_STORE_URL` > `--store-url`
+for `serve` and the other daemon verbs; the one-shot writers `schema-init`,
+`quarantine` and `recover-previous-session` refuse a `--store-url` that differs
+from a set channel instead of overriding it (#4600).
 Application content encryption is enabled by a true config/seed OR a
 truthy `AI_MEMORY_ENCRYPT_AT_REST` value; a falsy env value does not
 override an enabled config. Removed downgrade controls and explicit
@@ -1155,9 +1158,12 @@ see the `*[advisory]*` rows in `PERFORMANCE.md`.
 **10-section** health dashboard (v0.7.x post-#1146/#1598): Storage /
 Index / Recall / Governance / Sync / Webhook / Capabilities /
 Reflection Health / **LLM Reachability (#1146)** / **Embeddings
-Reachability (#1598)**. Each section is severity-tagged. Read-only —
-never mutates the database. A missing `--db` is reported as Critical
-Storage and is never created (#3434). A `--db` whose schema stamp is
+Reachability (#1598)**. Each section is severity-tagged. It never changes
+a memory, the schema or the file set. Its one write: an LLM or embeddings
+probe that the `AI_MEMORY_INFERENCE_EGRESS` posture refuses appends one
+signed `egress.inference_refused` row to the existing database, the same
+audit row boot and `reembed` append (#4121, #4122). A missing `--db` is
+reported as Critical Storage and is never created (#3434). A `--db` whose schema stamp is
 behind this binary is Critical Storage naming `ai-memory migrate --in-place`
 (or start the daemon); the file is not migrated. Identity reports the resolved
 caller id and whether a signing key for THAT id is enrolled.
@@ -1687,8 +1693,9 @@ Walks the `signed_events` cross-row hash chain end-to-end. Supports
 
 Idempotent schema bootstrap for a fresh SAL store by URL
 (`--store-url <URL>` or, to keep a password off argv, `AI_MEMORY_STORE_URL_FILE` /
-`AI_MEMORY_STORE_URL`, resolved FILE > ENV > flag as for `serve`:
-`src/cli/schema_init.rs:293`, `src/store_url.rs:137`; flags: `--json`, `--embedding-dim`). When
+`AI_MEMORY_STORE_URL`, read FILE, then ENV, then flag; a `--store-url` that differs
+from a set channel is refused by channel name: `src/store_url_writer.rs::resolve`;
+flags: `--json`, `--embedding-dim`). When
 `--embedding-dim` is omitted it resolves from the SAME config-driven
 source the daemon uses to pick its embedder (the effective tier's
 embedder dim; 384 for the keyword / no-embedder case) — so `schema-init`

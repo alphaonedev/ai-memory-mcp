@@ -99,7 +99,7 @@ Before you start:
 AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url ai-memory schema-init
 ```
 
-`schema-init` resolves its URL exactly like `serve`: `AI_MEMORY_STORE_URL_FILE` (a `0600` file) first, then `AI_MEMORY_STORE_URL`, then `--store-url` (`src/cli/schema_init.rs:293`, `src/store_url.rs:137`), so keep the password off argv and use the file form shown above ([#4600](https://github.com/alphaonedev/ai-memory-mcp/issues/4600)).
+`schema-init` reads its URL from `AI_MEMORY_STORE_URL_FILE` (a `0600` file) first, then `AI_MEMORY_STORE_URL`, then `--store-url`; a `--store-url` that differs from a set file or env channel is refused by channel name instead of being silently overridden (`src/store_url_writer.rs::resolve`, over `src/store_url.rs::resolve_store_url`), so keep the password off argv and use the file form shown above ([#4600](https://github.com/alphaonedev/ai-memory-mcp/issues/4600)).
 
 Idempotent on rerun. Exit code 0 + the human summary reporting
 `schema_version: 57` is the success signal (pass `--json` for the
@@ -359,7 +359,7 @@ to v0.7.0's v55 parity:
 AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url ai-memory schema-init
 ```
 
-`schema-init` resolves its URL exactly like `serve`: `AI_MEMORY_STORE_URL_FILE` (a `0600` file) first, then `AI_MEMORY_STORE_URL`, then `--store-url` (`src/cli/schema_init.rs:293`, `src/store_url.rs:137`), so keep the password off argv and use the file form shown above ([#4600](https://github.com/alphaonedev/ai-memory-mcp/issues/4600)).
+`schema-init` reads its URL from `AI_MEMORY_STORE_URL_FILE` (a `0600` file) first, then `AI_MEMORY_STORE_URL`, then `--store-url`; a `--store-url` that differs from a set file or env channel is refused by channel name instead of being silently overridden (`src/store_url_writer.rs::resolve`, over `src/store_url.rs::resolve_store_url`), so keep the password off argv and use the file form shown above ([#4600](https://github.com/alphaonedev/ai-memory-mcp/issues/4600)).
 
 Opening the store walks the v15 → v55 deltas idempotently (the
 v34 → v55 layer lands via in-process `migrate_v34()…migrate_v55()`
