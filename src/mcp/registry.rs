@@ -1966,6 +1966,9 @@ mod d1_6_987_tests {
         // #3551: source admission replaces missing-source stubs before promotion.
         "memory_skill_promote_from_reflection",
         "memory_stats",
+        // #9213 — the docs now name the response-only hook keys
+        // (`autonomy_hook_skipped`, `autonomy_hook_degraded`) a caller reads.
+        "memory_store",
         // #3659 — `delivery_status` on replayed events: `pending` can mean
         // the terminal status write failed, not only in flight; the docs
         // now say so at the field a caller reads.

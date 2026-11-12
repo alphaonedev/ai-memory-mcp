@@ -531,8 +531,12 @@ fn degraded_9213_one_structured_warn_per_failure() {
 }
 
 /// The `handle_store` entry point with the default atomisation wiring.
+///
+/// Called only inside the isolated child of
+/// [`degraded_9213_store_handler_marker_and_skip_reason`], whose environment
+/// has the attestation knob removed, so the MCP write surface runs on its
+/// compiled default and no process environment variable is written here.
 fn store_via_handler(params: &Value, llm: Option<&OllamaClient>) -> Value {
-    crate::identity::attest::permissive_attestation_for_lib_tests();
     let conn = db::open(std::path::Path::new(":memory:")).expect("open");
     let resp = super::super::handle_store(
         &conn,
@@ -565,19 +569,31 @@ fn store_via_handler(params: &Value, llm: Option<&OllamaClient>) -> Value {
 /// the exact marker on the response and nothing in the row, leaving
 /// `autonomy_hook_skipped` absent; an eligibility-gate skip keeps its
 /// scalar `autonomy_hook_skipped` and has no degraded key at all.
-#[tokio::test(flavor = "multi_thread")]
-async fn degraded_9213_store_handler_marker_and_skip_reason() {
+///
+/// #3523 arm (e): the handler runs in an isolated child process that starts
+/// with the attestation knob removed (the `config::shape` #2967 precedent),
+/// so the test writes no process-global environment variable into the
+/// shared lib test binary.
+#[test]
+fn degraded_9213_store_handler_marker_and_skip_reason() {
+    if crate::test_support::run_env_isolated_child_or_spawn_scrubbing(
+        "mcp::store::legacy_classifier::degraded_9213_tests::degraded_9213_store_handler_marker_and_skip_reason",
+        &[crate::identity::attest::ENV_REQUIRE_AGENT_ATTESTATION],
+    ) {
+        return;
+    }
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
     let params =
         json!({"title": "deploy region east", "content": NEW_CONTENT, "namespace": TEST_NS});
-    let server = serve(Answer::Body(truncated)).await;
-    let uri = server.uri();
-    let p = params.clone();
-    let degraded = tokio::task::spawn_blocking(move || {
-        let client = OllamaClient::new_with_url_no_health_check(&uri, TEST_MODEL).expect("client");
-        store_via_handler(&p, Some(&client))
-    })
-    .await
-    .expect("joins");
+    let server = rt.block_on(serve(Answer::Body(truncated)));
+    // The handler is synchronous; it runs on this plain test thread while
+    // the mock endpoint is served by the runtime's worker threads.
+    let client =
+        OllamaClient::new_with_url_no_health_check(&server.uri(), TEST_MODEL).expect("client");
+    let degraded = store_via_handler(&params, Some(&client));
     assert_eq!(
         degraded[KEY_HOOK_DEGRADED],
         json!([{"hook": "auto_tag", "reason": "reply_truncated"}])
@@ -585,11 +601,11 @@ async fn degraded_9213_store_handler_marker_and_skip_reason() {
     assert_eq!(degraded.get("autonomy_hook_skipped"), None);
     assert_eq!(degraded.get("auto_tags"), None);
 
-    let skipped = tokio::task::spawn_blocking(move || store_via_handler(&params, None))
-        .await
-        .expect("joins");
+    let skipped = store_via_handler(&params, None);
     assert_eq!(skipped["autonomy_hook_skipped"], json!("no_llm"));
     assert_eq!(skipped.get(KEY_HOOK_DEGRADED), None);
+    drop(server);
+    drop(rt);
 }
 
 /// #9213 Z-5 — one serializer: the two wire keys are spelled only in
