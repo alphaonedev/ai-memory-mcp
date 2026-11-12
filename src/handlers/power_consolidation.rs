@@ -588,10 +588,9 @@ pub async fn consolidate_memories(
             let mut mem = match app.store.get(&author_ctx, &new_id).await {
                 Ok(mem) => mem,
                 Err(e) => {
-                    let detail = format!(
-                        "{}: {new_id}: {e}",
-                        super::fed_fanout::FANOUT_READBACK_FAILED
-                    );
+                    // #8741 round 1 (sec-F4) — stable code only on the wire.
+                    tracing::error!("consolidate(pg): read-back of {new_id} failed: {e}");
+                    let detail = format!("{}: {new_id}", super::fed_fanout::FANOUT_READBACK_FAILED);
                     return consolidate_not_delivered(receipt, &local_write_failed(detail));
                 }
             };
@@ -615,10 +614,9 @@ pub async fn consolidate_memories(
                         // exact code (e.g. CONSOLIDATE_TOMBSTONE_MISSING) on a 202
                         // instead of a success-shaped 201.
                         tracing::error!("consolidate(pg): finalize failed (no fanout): {e}");
-                        return consolidate_not_delivered(
-                            receipt,
-                            &local_write_failed(e.to_string()),
-                        );
+                        let detail =
+                            crate::handlers::consolidate_federation::finalize_detail(&e, &mem.id);
+                        return consolidate_not_delivered(receipt, &local_write_failed(detail));
                     }
                 };
             if let Err(resp) =

@@ -31,6 +31,7 @@
 //! Extracted from `src/handlers/mod.rs` as part of the issue #650
 //! file-architecture cleanup.
 
+use super::fed_fanout::Produced;
 use crate::models::field_names;
 use axum::{
     Json,
@@ -670,7 +671,7 @@ pub async fn approval_decide(
     let pending_snapshot = db::get_pending_action(&lock.0, &id).ok().flatten();
     // #8741 (#9152) — the finalised decision (approved?, produced memory)
     // this request must deliver to the peers after the lock drops.
-    let mut decided: Option<(bool, Option<crate::models::Memory>)> = None;
+    let mut decided: Option<(bool, Produced)> = None;
     let outcome = match body.decision {
         crate::approvals::Decision::Approve => {
             // #2355 — R40 signed-approval chokepoint, strictly ABOVE the
@@ -707,9 +708,14 @@ pub async fn approval_decide(
                     let executed = db::execute_pending_action(&lock.0, &id);
                     match executed {
                         Ok(memory_id) => {
+                            // #8741 round 1 (F3) — a failed read-back is
+                            // Unread (the exact 202), never "nothing produced".
                             let produced = memory_id
                                 .as_deref()
-                                .and_then(|mid| db::get(&lock.0, mid).ok().flatten());
+                                .filter(|_| Produced::leaves_row(pending_snapshot.as_ref()))
+                                .map_or(Produced::Nothing, |mid| {
+                                    Produced::from_read(mid, db::get(&lock.0, mid))
+                                });
                             decided = Some((true, produced));
                             json!({
                             "approved": true,
@@ -777,7 +783,7 @@ pub async fn approval_decide(
                 Ok(db::RejectOutcome::Rejected) => {
                     // #2634 — explicit deny chains "refuse".
                     audit_decide_verdict(&agent_id, &id, body.decision, "refuse");
-                    decided = Some((false, None));
+                    decided = Some((false, Produced::Nothing));
                     json!({
                         "rejected": true,
                         "id": id,
@@ -830,7 +836,7 @@ async fn deliver_decision(
     app: &AppState,
     id: &str,
     agent_id: &str,
-    decided: Option<(bool, Option<crate::models::Memory>)>,
+    decided: Option<(bool, Produced)>,
     mut outcome: serde_json::Value,
 ) -> axum::response::Response {
     if let Some((approved, produced)) = decided {
@@ -840,8 +846,7 @@ async fn deliver_decision(
             decider: agent_id.to_string(),
         };
         if let Err(resp) =
-            super::fed_fanout::fanout_decision(app, &decision, produced.as_ref(), &mut outcome)
-                .await
+            super::fed_fanout::fanout_decision(app, &decision, &produced, &mut outcome).await
         {
             return resp;
         }
@@ -874,7 +879,7 @@ async fn approval_decide_postgres(
     // as the sqlite branch).
     let pending_snapshot = app.store.get_pending(&ctx, id).await.ok().flatten();
     let remember_label = format!("{:?}", body.remember).to_lowercase();
-    let mut decided: Option<(bool, Option<crate::models::Memory>)> = None;
+    let mut decided: Option<(bool, Produced)> = None;
     let outcome = match body.decision {
         crate::approvals::Decision::Approve => {
             // #2355 — R40 signed-approval chokepoint, strictly ABOVE the pg
@@ -902,9 +907,18 @@ async fn approval_decide_postgres(
                     audit_decide_verdict(agent_id, id, body.decision, "allow");
                     match app.store.execute_pending_action(&ctx, id).await {
                         Ok(memory_id) => {
-                            let produced = match memory_id.as_deref() {
-                                Some(mid) => app.store.get(&ctx, mid).await.ok(),
-                                None => None,
+                            // #8741 round 1 (F3 / sec-F2) — unfiltered read
+                            // (not the approver's visibility), failure is Unread.
+                            let produced = match memory_id
+                                .as_deref()
+                                .filter(|_| Produced::leaves_row(pending_snapshot.as_ref()))
+                            {
+                                Some(mid) => Produced::from_read(
+                                    mid,
+                                    super::consolidate_federation::store_get_any(&*app.store, mid)
+                                        .await,
+                                ),
+                                None => Produced::Nothing,
                             };
                             decided = Some((true, produced));
                             json!({
@@ -964,7 +978,7 @@ async fn approval_decide_postgres(
                 Ok(crate::store::RejectOutcome::Rejected) => {
                     // #2634 — explicit deny chains "refuse".
                     audit_decide_verdict(agent_id, id, body.decision, "refuse");
-                    decided = Some((false, None));
+                    decided = Some((false, Produced::Nothing));
                     json!({
                         "rejected": true,
                         "id": id,

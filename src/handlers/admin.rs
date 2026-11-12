@@ -84,6 +84,7 @@ fn register_agent_body(
 /// its fan-out.
 async fn register_agent_fanout(
     app: &AppState,
+    id: &str,
     registered: Option<&Memory>,
     mut body: serde_json::Value,
 ) -> axum::response::Response {
@@ -96,7 +97,8 @@ async fn register_agent_fanout(
             )
             .await
         }
-        None => super::fed_fanout::readback_failed(app, crate::models::AGENTS_NAMESPACE),
+        // #8741 round 1 (F9) — name the registered row that was not read back.
+        None => super::fed_fanout::readback_failed(app, id),
     };
     match delivered {
         Ok(()) => (StatusCode::CREATED, Json(body)).into_response(),
@@ -290,7 +292,7 @@ pub async fn register_agent(
         let registered = app.store.get(&ctx, &id).await.ok();
         let receipt =
             register_agent_body(&id, &body.agent_id, &body.agent_type, &capabilities, true);
-        return register_agent_fanout(&app, registered.as_ref(), receipt).await;
+        return register_agent_fanout(&app, &id, registered.as_ref(), receipt).await;
     }
 
     let lock = app.db.lock().await;
@@ -310,7 +312,7 @@ pub async fn register_agent(
         Ok(id) => {
             let receipt =
                 register_agent_body(&id, &body.agent_id, &body.agent_type, &capabilities, false);
-            register_agent_fanout(&app, registered_mem.as_ref(), receipt).await
+            register_agent_fanout(&app, &id, registered_mem.as_ref(), receipt).await
         }
         Err(e) => crate::handlers::errors::handler_error_500(&e),
     }
@@ -1355,6 +1357,15 @@ pub async fn import_memories(
         )
             .into_response();
     }
+    // #8741 round 1 (sec-F1) — the links list is bounded exactly as the
+    // memories list is: every created link is one fan-out effect.
+    if body.links.as_ref().is_some_and(|l| l.len() > MAX_BULK_SIZE) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("import limited to {} links", MAX_BULK_SIZE)})),
+        )
+            .into_response();
+    }
 
     // #956 (security-medium, 2026-05-20) — admin-role gate + provenance
     // restamp on `/api/v1/import`. Pre-#956 the handler resolved the
@@ -1674,14 +1685,16 @@ pub async fn import_memories(
         }
         // #8741 (#9153) — deliver every imported row (read back as
         // committed) and every created link through the ONE bulk funnel.
+        // #8741 round 1 (F7) — an unread row no longer stops the batch:
+        // every readable effect is delivered, then the 202 names the unread.
         let mut effects = Vec::with_capacity(stored_ids.len() + linked.len());
+        let mut unread: Vec<String> = Vec::new();
         for stored_id in &stored_ids {
             match app.store.get(&ctx, stored_id).await {
                 Ok(mem) => effects.push(super::fed_fanout::OwnedEffect::Store(mem)),
-                Err(_) => {
-                    if let Err(resp) = super::fed_fanout::readback_failed(&app, stored_id) {
-                        return resp;
-                    }
+                Err(e) => {
+                    tracing::warn!("import_memories(postgres): read-back of {stored_id}: {e}");
+                    unread.push(stored_id.clone());
                 }
             }
         }
@@ -1693,7 +1706,7 @@ pub async fn import_memories(
             (field_names::PUBKEY_BINDINGS_STRIPPED): pubkey_bindings_stripped,
             (field_names::STORAGE_BACKEND): "postgres",
         });
-        return import_delivered(&app, effects, receipt).await;
+        return import_delivered(&app, effects, &unread, receipt).await;
     }
 
     let lock = app.db.lock().await;
@@ -1887,21 +1900,14 @@ pub async fn import_memories(
         }
     }
     let mut effects = Vec::with_capacity(stored_ids.len() + linked.len());
-    let mut unread: Option<String> = None;
+    let mut unread: Vec<String> = Vec::new();
     for stored_id in &stored_ids {
         match db::get(&lock.0, stored_id).ok().flatten() {
             Some(mem) => effects.push(super::fed_fanout::OwnedEffect::Store(mem)),
-            None => {
-                unread.get_or_insert_with(|| stored_id.clone());
-            }
+            None => unread.push(stored_id.clone()),
         }
     }
     drop(lock);
-    if let Some(stored_id) = unread
-        && let Err(resp) = super::fed_fanout::readback_failed(&app, &stored_id)
-    {
-        return resp;
-    }
     effects.extend(linked.into_iter().map(super::fed_fanout::OwnedEffect::Link));
     // #3456 — the sqlite envelope now carries `pending`, so an `Approve`
     // namespace standard is EXPRESSIBLE on this backend: pre-fix a caller had
@@ -1914,18 +1920,32 @@ pub async fn import_memories(
         "pending": pending,
         (field_names::PUBKEY_BINDINGS_STRIPPED): pubkey_bindings_stripped,
     });
-    import_delivered(&app, effects, receipt).await
+    import_delivered(&app, effects, &unread, receipt).await
 }
 
 /// #8741 (#9153) — the import receipt after every imported row and link
 /// went through the ONE bulk funnel (both backends): `200` with the batch
-/// quorum fields, or the exact `202 quorum_met false`.
+/// quorum fields, or the exact `202 quorum_met false`. #8741 round 1
+/// (F7): every readable effect is delivered first; rows that committed but
+/// could not be read back then make the response the exact
+/// `FANOUT_READBACK_FAILED` 202 naming the first unread id and the count.
 async fn import_delivered(
     app: &AppState,
     effects: Vec<super::fed_fanout::OwnedEffect>,
+    unread: &[String],
     mut receipt: serde_json::Value,
 ) -> axum::response::Response {
-    match super::fed_fanout::fanout_effects_into(app, effects, &mut receipt).await {
+    if let Err(resp) = super::fed_fanout::fanout_effects_into(app, effects, &mut receipt).await {
+        return resp;
+    }
+    let delivered = match unread {
+        [] => Ok(()),
+        [one] => super::fed_fanout::readback_failed(app, one),
+        [first, rest @ ..] => {
+            super::fed_fanout::readback_failed(app, &format!("{first} (+{} more)", rest.len()))
+        }
+    };
+    match delivered {
         Ok(()) => Json(receipt).into_response(),
         Err(resp) => resp,
     }

@@ -8731,6 +8731,37 @@ impl PostgresStore {
         row.as_ref().map(Self::row_to_memory).transpose()
     }
 
+    /// #8741 round 1 (F8 / sec-F3) — the committed `namespace_meta` row as
+    /// the federation `NamespaceMeta` effect carries it (Postgres twin of
+    /// [`crate::storage::get_namespace_meta_entry`]): the stored
+    /// `updated_at`, never a value made up by the caller. `Ok(None)` when no
+    /// row binds a standard (absent or severed).
+    ///
+    /// # Errors
+    ///
+    /// `StoreError::BackendUnavailable` on SQL failure.
+    pub async fn get_namespace_meta_entry(
+        &self,
+        namespace: &str,
+    ) -> StoreResult<Option<crate::models::NamespaceMetaEntry>> {
+        let row: Option<(Option<String>, Option<String>, DateTime<Utc>)> = sqlx::query_as(
+            "SELECT standard_id, parent_namespace, updated_at FROM namespace_meta \
+             WHERE namespace = $1",
+        )
+        .bind(namespace)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| to_store_err("get_namespace_meta_entry", e))?;
+        Ok(row.and_then(|(standard_id, parent_namespace, updated_at)| {
+            standard_id.map(|standard_id| crate::models::NamespaceMetaEntry {
+                namespace: namespace.to_string(),
+                standard_id,
+                parent_namespace,
+                updated_at: updated_at.to_rfc3339(),
+            })
+        }))
+    }
+
     /// v0.7.0 Provenance Gap 1 (issue #884) — optimistic-concurrency
     /// aware update. Postgres twin of
     /// [`crate::storage::update_with_expected_version`].

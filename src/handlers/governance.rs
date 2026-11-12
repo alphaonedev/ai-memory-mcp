@@ -352,9 +352,17 @@ pub async fn approve_pending(
                 // #8741 (#9152) — fan out the decision AND the produced
                 // memory exactly as the SQLite arm does, through the ONE
                 // funnel; no PostgreSQL write path returns before it.
-                let produced_mem = match executed_id.as_deref() {
-                    Some(mid) => app.store.get(&ctx, mid).await.ok(),
-                    None => None,
+                // #8741 round 1 (F3 / sec-F2) — unfiltered read (not the
+                // approver's visibility); a failed read-back is Unread.
+                let produced_mem = match executed_id
+                    .as_deref()
+                    .filter(|_| super::fed_fanout::Produced::leaves_row(pending_snapshot.as_ref()))
+                {
+                    Some(mid) => super::fed_fanout::Produced::from_read(
+                        mid,
+                        super::consolidate_federation::store_get_any(&*app.store, mid).await,
+                    ),
+                    None => super::fed_fanout::Produced::Nothing,
                 };
                 let mut body = json!({
                     "approved": true,
@@ -369,13 +377,8 @@ pub async fn approve_pending(
                     approved: true,
                     decider: agent_id.clone(),
                 };
-                match super::fed_fanout::fanout_decision(
-                    &app,
-                    &decision,
-                    produced_mem.as_ref(),
-                    &mut body,
-                )
-                .await
+                match super::fed_fanout::fanout_decision(&app, &decision, &produced_mem, &mut body)
+                    .await
                 {
                     Ok(()) => Json(body).into_response(),
                     Err(resp) => resp,
@@ -450,9 +453,15 @@ pub async fn approve_pending(
                     // memory so approve on one node makes the governed write
                     // visible on every peer. Drop the DB lock before any
                     // outbound HTTP.
+                    // #8741 round 1 (F3) — a failed read-back is Unread.
                     let produced_mem = memory_id
                         .as_deref()
-                        .and_then(|mid| db::get(&lock.0, mid).ok().flatten());
+                        .filter(|_| {
+                            super::fed_fanout::Produced::leaves_row(pending_snapshot.as_ref())
+                        })
+                        .map_or(super::fed_fanout::Produced::Nothing, |mid| {
+                            super::fed_fanout::Produced::from_read(mid, db::get(&lock.0, mid))
+                        });
                     drop(lock);
                     // #8741 (#9152) — the decision and the produced memory
                     // through the ONE funnel, as on the PostgreSQL arm.
@@ -471,7 +480,7 @@ pub async fn approve_pending(
                     match super::fed_fanout::fanout_decision(
                         &app,
                         &decision,
-                        produced_mem.as_ref(),
+                        &produced_mem,
                         &mut body,
                     )
                     .await
@@ -644,7 +653,14 @@ pub async fn reject_pending(
                     approved: false,
                     decider: agent_id.clone(),
                 };
-                match super::fed_fanout::fanout_decision(&app, &decision, None, &mut body).await {
+                match super::fed_fanout::fanout_decision(
+                    &app,
+                    &decision,
+                    &super::fed_fanout::Produced::Nothing,
+                    &mut body,
+                )
+                .await
+                {
                     Ok(()) => Json(body).into_response(),
                     Err(resp) => resp,
                 }
@@ -682,7 +698,14 @@ pub async fn reject_pending(
                 decider: agent_id.clone(),
             };
             let mut body = json!({"rejected": true, "id": id, (field_names::DECIDED_BY): agent_id});
-            match super::fed_fanout::fanout_decision(&app, &decision, None, &mut body).await {
+            match super::fed_fanout::fanout_decision(
+                &app,
+                &decision,
+                &super::fed_fanout::Produced::Nothing,
+                &mut body,
+            )
+            .await
+            {
                 Ok(()) => Json(body).into_response(),
                 Err(resp) => resp,
             }

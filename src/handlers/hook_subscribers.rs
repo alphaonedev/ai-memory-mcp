@@ -679,6 +679,10 @@ async fn set_namespace_standard_inner(
                     "parent": body.parent,
                     (field_names::STORAGE_BACKEND): "postgres",
                 });
+                // #8741 round 1 (F8 / sec-F3) — both effects are read back
+                // from the store; a failed or empty read-back is the exact
+                // FANOUT_READBACK_FAILED 202, and nothing is pushed that was
+                // not read back (no entry built from request values).
                 match app.store.get(&ctx, &standard_id).await {
                     Ok(mem) => {
                         if let Err(resp) = super::fed_fanout::fanout_into(
@@ -691,26 +695,19 @@ async fn set_namespace_standard_inner(
                             return resp;
                         }
                     }
-                    Err(_) => {
-                        if let Err(resp) = super::fed_fanout::readback_failed(app, &standard_id) {
-                            return resp;
-                        }
+                    Err(e) => {
+                        tracing::warn!("set_namespace_standard(pg): read-back failed: {e}");
+                        return super::fed_fanout::readback_failed(app, &standard_id).map_or_else(
+                            |resp| resp,
+                            |()| (StatusCode::CREATED, Json(receipt)).into_response(),
+                        );
                     }
                 }
-                let binding = app
-                    .store
-                    .get_namespace_standard(&ctx, ns)
-                    .await
-                    .ok()
-                    .flatten();
-                let entry = crate::models::NamespaceMetaEntry {
-                    namespace: ns.to_string(),
-                    standard_id: binding
-                        .as_ref()
-                        .map_or_else(|| standard_id.clone(), |(sid, _)| sid.clone()),
-                    parent_namespace: binding
-                        .map_or_else(|| body.parent.clone(), |(_, parent)| parent),
-                    updated_at: chrono::Utc::now().to_rfc3339(),
+                let Some(entry) = pg_namespace_meta_entry(app, ns).await else {
+                    return super::fed_fanout::readback_failed(app, ns).map_or_else(
+                        |resp| resp,
+                        |()| (StatusCode::CREATED, Json(receipt)).into_response(),
+                    );
                 };
                 match super::fed_fanout::fanout_into(
                     app,
@@ -937,23 +934,36 @@ async fn set_namespace_standard_inner(
         Ok(mut v) => {
             // #8741 (#9152) — the same two effects as the PostgreSQL arm,
             // through the ONE funnel (quorum fields on the receipt).
-            if let Some(ref mem) = standard_mem
-                && let Err(resp) = super::fed_fanout::fanout_into(
-                    app,
-                    super::fed_fanout::FanoutEffect::Store(mem),
-                    &mut v,
-                )
-                .await
+            // #8741 round 1 (F3) — the set committed, so an absent read-back
+            // of either effect is the exact FANOUT_READBACK_FAILED 202 naming
+            // what could not be read, never a 201 that no peer received.
+            let Some(mem) = standard_mem.as_ref() else {
+                return super::fed_fanout::readback_failed(app, &resolved_id).map_or_else(
+                    |resp| resp,
+                    |()| (StatusCode::CREATED, Json(v)).into_response(),
+                );
+            };
+            if let Err(resp) = super::fed_fanout::fanout_into(
+                app,
+                super::fed_fanout::FanoutEffect::Store(mem),
+                &mut v,
+            )
+            .await
             {
                 return resp;
             }
-            if let Some(entry) = meta_entry.as_ref()
-                && let Err(resp) = super::fed_fanout::fanout_into(
-                    app,
-                    super::fed_fanout::FanoutEffect::NamespaceMeta(entry),
-                    &mut v,
-                )
-                .await
+            let Some(entry) = meta_entry.as_ref() else {
+                return super::fed_fanout::readback_failed(app, ns).map_or_else(
+                    |resp| resp,
+                    |()| (StatusCode::CREATED, Json(v)).into_response(),
+                );
+            };
+            if let Err(resp) = super::fed_fanout::fanout_into(
+                app,
+                super::fed_fanout::FanoutEffect::NamespaceMeta(entry),
+                &mut v,
+            )
+            .await
             {
                 return resp;
             }
@@ -1631,4 +1641,32 @@ pub async fn session_start(
         }
         Err(e) => (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response(),
     }
+}
+
+/// #8741 round 1 (F8 / sec-F3) — the committed `namespace_meta` row of `ns`
+/// on PostgreSQL, read through the concrete adapter (the trait has no
+/// `updated_at` reader). `None` on a read error (logged), an absent or
+/// severed row, or a non-Postgres adapter: the caller then reports the
+/// exact `FANOUT_READBACK_FAILED` 202.
+#[cfg(feature = "sal")]
+async fn pg_namespace_meta_entry(
+    app: &AppState,
+    ns: &str,
+) -> Option<crate::models::NamespaceMetaEntry> {
+    #[cfg(feature = "sal-postgres")]
+    if let Some(pg) = app
+        .store
+        .as_any()
+        .downcast_ref::<crate::store::postgres::PostgresStore>()
+    {
+        return match pg.get_namespace_meta_entry(ns).await {
+            Ok(entry) => entry,
+            Err(e) => {
+                tracing::warn!("set_namespace_standard(pg): namespace_meta read-back failed: {e}");
+                None
+            }
+        };
+    }
+    let _ = (app, ns);
+    None
 }

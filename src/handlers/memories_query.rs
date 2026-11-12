@@ -779,7 +779,7 @@ pub async fn forget_memories(
         return match store_forget_ids(&app, &ctx, &body, archive_flag).await {
             Ok((n, erased)) => {
                 // #9023 (p2-siblings-06) — the erasure travels to the peers
-                // as per-id tombstones through the bulk funnel before the
+                // as chunked tombstones through the bulk funnel before the
                 // response (pre-fix the PG forget never fanned out).
                 let mut receipt = json!({"deleted": n});
                 let fanned = match erased {
@@ -835,19 +835,12 @@ pub async fn forget_memories(
     // lock, keep only the victims the forget actually removed (an
     // unfiltered by-id read that still finds a row means it was not
     // erased). Any read fault makes the erased set unknown.
+    // #8741 round 1 (sec-F1) — one chunked id-only `IN` probe per
+    // FORGET_SURVIVOR_PROBE_CHUNK victims instead of a full-row read per id.
     let erased: Option<Vec<String>> = match (&forget_result, &victims) {
-        (Ok(_), Ok(ids)) => {
-            let mut gone = Vec::with_capacity(ids.len());
-            let mut known = true;
-            for id in ids {
-                match crate::storage::get_any(&lock.0, id) {
-                    Ok(None) => gone.push(id.clone()),
-                    Ok(Some(_)) => {}
-                    Err(_) => known = false,
-                }
-            }
-            known.then_some(gone)
-        }
+        (Ok(_), Ok(ids)) => erased_ids(&lock.0, ids)
+            .inspect_err(|e| tracing::warn!("forget: survivor probe failed: {e}"))
+            .ok(),
         _ => None,
     };
     // Drop the DB lock BEFORE taking the vector-index lock (the locking
@@ -864,7 +857,7 @@ pub async fn forget_memories(
                 }
             }
             // #9023 (p2-siblings-06) — the erasure travels to the peers as
-            // per-id tombstones through the bulk funnel (pre-fix the HTTP
+            // chunked tombstones through the bulk funnel (pre-fix the HTTP
             // forget never fanned out on either backend).
             let mut receipt = json!({"deleted": n});
             let fanned = match erased {
@@ -971,3 +964,32 @@ pub async fn forget_memories(
 //   - validate_create early-return (1) empty title ⇒ 400
 //   - GovernanceRefusal downcast (1) → 403 + GOVERNANCE_REFUSED code
 // ===========================================================================
+
+/// #8741 round 1 (sec-F1) — victims per survivor probe statement (well under
+/// SQLite's bound-parameter limit).
+const FORGET_SURVIVOR_PROBE_CHUNK: usize = 500;
+
+/// #9023 / #8741 round 1 — the victims the forget actually removed: every
+/// id of `victims` that no longer has a `memories` row (an unfiltered
+/// id-only probe, so a row the forget kept for any reason is not reported
+/// as erased). One `SELECT id ... WHERE id IN (..)` per
+/// [`FORGET_SURVIVOR_PROBE_CHUNK`] ids. Any probe error is an error: the
+/// erased set is then unknown and the caller refuses a silent success.
+fn erased_ids(conn: &rusqlite::Connection, victims: &[String]) -> rusqlite::Result<Vec<String>> {
+    let mut survivors = std::collections::HashSet::new();
+    for chunk in victims.chunks(FORGET_SURVIVOR_PROBE_CHUNK) {
+        let marks = vec!["?"; chunk.len()].join(",");
+        let mut stmt = conn.prepare(&format!("SELECT id FROM memories WHERE id IN ({marks})"))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |r| {
+            r.get::<_, String>(0)
+        })?;
+        for row in rows {
+            survivors.insert(row?);
+        }
+    }
+    Ok(victims
+        .iter()
+        .filter(|id| !survivors.contains(id.as_str()))
+        .cloned()
+        .collect())
+}
