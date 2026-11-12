@@ -598,8 +598,44 @@ pub fn refuse_inference_egress_audited(
     target: &str,
     reason: &str,
 ) {
+    audit_refusal_on(crate::db::open(db_path), class, target, reason);
+}
+
+/// #4121 — the audited refusal for a caller that must not create or migrate
+/// the database (`doctor`, read-only by contract #3434). It opens the
+/// EXISTING file read-write without `SQLITE_OPEN_CREATE` (the
+/// `backup::lock_exclusive` precedent), keys it like every other open, and
+/// appends only the signed refusal row; a missing file or a failed open is a
+/// WARN, never a new file, a migration or a watermark write.
+pub fn refuse_inference_egress_audited_existing(
+    db_path: &std::path::Path,
+    class: EgressClass,
+    target: &str,
+    reason: &str,
+) {
+    audit_refusal_on(open_existing_for_audit(db_path), class, target, reason);
+}
+
+/// Busy wait for the one-row audit append on an existing database.
+const AUDIT_APPEND_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Open an existing database for the single audit append: no create flag,
+/// keyed via [`crate::storage::connection::apply_sqlcipher_key`].
+fn open_existing_for_audit(db_path: &std::path::Path) -> Result<Connection> {
+    let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+        | rusqlite::OpenFlags::SQLITE_OPEN_URI
+        | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let conn = Connection::open_with_flags(db_path, flags)?;
+    conn.busy_timeout(AUDIT_APPEND_BUSY_TIMEOUT)?;
+    crate::storage::connection::apply_sqlcipher_key(&conn)?;
+    Ok(conn)
+}
+
+/// Append the signed refusal on an opened connection, or WARN; never
+/// disturbs the enforcement the caller already applied.
+fn audit_refusal_on(opened: Result<Connection>, class: EgressClass, target: &str, reason: &str) {
     let agent_id = crate::identity::sentinels::DAEMON_PRINCIPAL;
-    match crate::db::open(db_path) {
+    match opened {
         Ok(conn) => {
             if let Err(e) = emit_inference_egress_refusal(&conn, class, target, agent_id, reason) {
                 tracing::warn!(
@@ -618,6 +654,32 @@ pub fn refuse_inference_egress_audited(
                 crate::url_display::url_origin(target)
             );
         }
+    }
+}
+
+/// #4121 / #4122 — the reason an admission that erred WITHOUT a refusal
+/// (`Err(EgressDecision::Allow)`, a contract break) is recorded under. It
+/// fails closed like any refusal and is audited like one.
+pub const NO_DECISION_REASON: &str = "admission returned no decision; failing closed";
+
+/// #4122 — the refusal facts `(class, target, reason)` the audit row records
+/// for an admission error. [`admit_inference_target`] errs only with
+/// [`EgressDecision::Refuse`]; an `Allow` in the error arm is normalised to a
+/// refusal of `url` under `class` with [`NO_DECISION_REASON`], so no
+/// fail-closed path can skip [`refuse_inference_egress_audited`].
+#[must_use]
+pub fn refusal_of(
+    decision: EgressDecision,
+    class: EgressClass,
+    url: &str,
+) -> (EgressClass, String, String) {
+    match decision {
+        EgressDecision::Refuse {
+            class,
+            target,
+            reason,
+        } => (class, target, reason),
+        EgressDecision::Allow => (class, url.to_string(), NO_DECISION_REASON.to_string()),
     }
 }
 
@@ -662,7 +724,7 @@ pub fn admitted_blocking_client(
         Err(EgressDecision::Allow) => {
             return Err(AdmittedClientError::Refused {
                 mode,
-                reason: "admission returned no decision; failing closed".to_string(),
+                reason: NO_DECISION_REASON.to_string(),
             });
         }
     };
@@ -1249,6 +1311,50 @@ mod tests {
             )
             .expect("count rows");
         assert_eq!(n, 1, "exactly one inference-egress refusal row");
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// #4122 (r1 C-L5) — an admission that errs WITHOUT a refusal
+    /// (`Err(Allow)`, the reembed fail-closed arm) is normalised to a refusal
+    /// and audited: exactly one signed `egress.inference_refused` row, with
+    /// the posture refusal (`Refuse`) passed through unchanged.
+    #[test]
+    fn refusal_of_audits_the_no_decision_arm_4122() {
+        let url = "https://embed.example.invalid/v1";
+        let (class, target, reason) =
+            refusal_of(EgressDecision::Allow, EgressClass::InferenceEmbedding, url);
+        assert_eq!(
+            (class, target.as_str(), reason.as_str()),
+            (EgressClass::InferenceEmbedding, url, NO_DECISION_REASON)
+        );
+        let refused = EgressDecision::Refuse {
+            class: EgressClass::InferenceLlm,
+            target: "https://llm.example.invalid".to_string(),
+            reason: "posture".to_string(),
+        };
+        assert_eq!(
+            refusal_of(refused, EgressClass::InferenceEmbedding, url),
+            (
+                EgressClass::InferenceLlm,
+                "https://llm.example.invalid".to_string(),
+                "posture".to_string()
+            )
+        );
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".local-runs");
+        std::fs::create_dir_all(&dir).expect("mkdir .local-runs");
+        let path = dir.join(format!("egress-no-decision-{}.db", uuid::Uuid::new_v4()));
+        drop(crate::db::open(&path).expect("create db"));
+        refuse_inference_egress_audited(&path, class, &target, &reason);
+        let conn = crate::db::open(&path).expect("reopen db");
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM signed_events WHERE event_type = ?1",
+                [crate::signed_events::event_types::EGRESS_INFERENCE_REFUSED],
+                |r| r.get(0),
+            )
+            .expect("count rows");
+        assert_eq!(n, 1, "the no-decision arm is audited exactly once");
         drop(conn);
         let _ = std::fs::remove_file(&path);
     }

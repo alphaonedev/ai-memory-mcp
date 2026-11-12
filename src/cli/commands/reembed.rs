@@ -448,17 +448,20 @@ pub async fn cmd_reembed(
     // resolve-then-pin). The local in-process candle embedder never
     // egresses and is not gated.
     let egress_pin = if crate::config::embed_lane_egresses(&resolved.backend, Some(tier_model)) {
-        use crate::egress::{
-            EgressClass, EgressDecision, InferenceEgressMode, admit_inference_target,
-        };
+        use crate::egress::{EgressClass, InferenceEgressMode, admit_inference_target};
         let mode = InferenceEgressMode::resolve();
         match admit_inference_target(mode, EgressClass::InferenceEmbedding, &resolved.url) {
             Ok(pin) => pin,
-            Err(EgressDecision::Refuse {
-                class,
-                target,
-                reason,
-            }) => {
+            // `admit_inference_target` only ever errs with a `Refuse`; an
+            // `Allow` in the error arm is a contract break. `refusal_of`
+            // normalises it to a refusal, so it fails CLOSED (no client, no
+            // egress) AND is audited exactly like a posture refusal.
+            Err(decision) => {
+                let (class, target, reason) = crate::egress::refusal_of(
+                    decision,
+                    EgressClass::InferenceEmbedding,
+                    &resolved.url,
+                );
                 crate::egress::refuse_inference_egress_audited(db_path, class, &target, &reason);
                 writeln!(
                     out.stderr,
@@ -471,18 +474,6 @@ pub async fn cmd_reembed(
                     crate::egress::ENV_INFERENCE_EGRESS,
                     mode.as_str(),
                     crate::egress::ENV_INFERENCE_EGRESS,
-                )?;
-                return Ok(EXIT_EMBEDDER_INIT_FAILED);
-            }
-            // `admit_inference_target` only ever errs with a `Refuse`; an
-            // `Allow` in the error arm is a contract break, so it fails
-            // CLOSED (no client, no egress) rather than running unpinned.
-            Err(EgressDecision::Allow) => {
-                writeln!(
-                    out.stderr,
-                    "reembed: REFUSED — inference-egress admission returned no decision for \
-                     the embed endpoint {}; failing closed, nothing was sent (#4122)",
-                    crate::url_display::url_origin(&resolved.url),
                 )?;
                 return Ok(EXIT_EMBEDDER_INIT_FAILED);
             }

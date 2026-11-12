@@ -1845,8 +1845,10 @@ fn run_local(db_path: &Path, caller_agent_id: Option<&str>) -> Report {
     sections.push(section_capabilities_local());
     sections.push(section_reflection_health(&conn));
     sections.push(section_atomisation_curator_2985(&conn));
-    sections.push(section_llm_reachability_1146());
-    sections.push(section_embeddings_reachability_1598());
+    // #4121 / #4122 — a refused probe appends one signed EGRESS_INFERENCE_REFUSED
+    // row to this database (proved present at the current schema above).
+    sections.push(section_llm_reachability_1146(Some(db_path)));
+    sections.push(section_embeddings_reachability_1598(Some(db_path)));
     // v1.0.0 #3471 — the wake-hub posture. Filesystem + `getrlimit` only: the
     // hub opens no store, so this section cannot be affected by (or affect)
     // the database connection above.
@@ -4561,10 +4563,13 @@ fn section_capabilities_local() -> ReportSection {
 /// plus the HTTP status code + observed latency, so operators can
 /// see WHERE the wiring came from and WHY the probe lands where it
 /// does.
-fn section_llm_reachability_1146() -> ReportSection {
+///
+/// `audit_db` is the store a refused probe records its signed refusal in
+/// (#4122 parity with boot and `reembed`); `None` records nothing.
+fn section_llm_reachability_1146(audit_db: Option<&Path>) -> ReportSection {
     let app_config = crate::config::AppConfig::load();
     let resolved = app_config.resolve_llm(None, None, None);
-    section_llm_reachability_from_resolved(&resolved)
+    section_llm_reachability_from_resolved(&resolved, audit_db)
 }
 
 /// #4121 — timeout for each inference reachability probe.
@@ -4572,7 +4577,12 @@ const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// #4121 — the section a reachability probe returns when the
 /// inference-egress posture refused its target. Nothing was sent: the
-/// admission ran before any client existed.
+/// admission ran before any client existed. With an `audit_db` the refusal
+/// is recorded through
+/// [`crate::egress::refuse_inference_egress_audited_existing`]: the same
+/// signed row boot and `reembed` append (#4122), on the existing file only
+/// (no create, no migration, #3434); the row carries a hash of the target,
+/// never the URL.
 fn probe_refused_section(
     name: &str,
     noun: &str,
@@ -4580,7 +4590,11 @@ fn probe_refused_section(
     base_url: &str,
     mode: crate::egress::InferenceEgressMode,
     reason: String,
+    audit: (crate::egress::EgressClass, Option<&Path>),
 ) -> ReportSection {
+    if let (class, Some(db)) = audit {
+        crate::egress::refuse_inference_egress_audited_existing(db, class, base_url, &reason);
+    }
     let note = format!(
         "probe NOT sent (#4121): inference-plane egress refused the {noun} target {} under \
          {}={}; no connection was opened and no API key left the process. {reason}",
@@ -4598,7 +4612,10 @@ fn probe_refused_section(
     }
 }
 
-fn section_llm_reachability_from_resolved(resolved: &crate::config::ResolvedLlm) -> ReportSection {
+fn section_llm_reachability_from_resolved(
+    resolved: &crate::config::ResolvedLlm,
+    audit_db: Option<&Path>,
+) -> ReportSection {
     use crate::config::{ConfigSource, KeySource};
 
     let mut facts = vec![
@@ -4703,6 +4720,7 @@ fn section_llm_reachability_from_resolved(resolved: &crate::config::ResolvedLlm)
                 &resolved.base_url,
                 mode,
                 reason,
+                (crate::egress::EgressClass::InferenceLlm, audit_db),
             );
         }
         Err(crate::egress::AdmittedClientError::Build(e)) => {
@@ -4840,7 +4858,7 @@ fn nvidia_gpu_detected() -> bool {
 /// Additionally emits the operator GPU-policy WARN
 /// ([`gpu_policy_warn_applicable`]) when the resolved backend is
 /// `ollama` on a host with no detectable NVIDIA GPU.
-fn section_embeddings_reachability_1598() -> ReportSection {
+fn section_embeddings_reachability_1598(audit_db: Option<&Path>) -> ReportSection {
     use crate::config::{AppConfig, ConfigSource, KeySource};
 
     let app_config = AppConfig::load();
@@ -4889,6 +4907,26 @@ fn section_embeddings_reachability_1598() -> ReportSection {
     }
 
     let is_api = crate::config::is_api_embed_backend(&resolved.backend);
+    // v1.0.0 #2972 — the model this binary will LOAD (the tier preset when the
+    // configured id is not constructible); the same resolver `reembed` uses.
+    let boot_model = crate::daemon_runtime::resolve_boot_embedder_model(
+        &app_config.effective_tier(None).config(),
+        &app_config,
+    );
+
+    // #3933 / #4121 — gate on TRANSPORT like boot and `reembed`: a lane that
+    // opens no socket (ollama + the local in-process MiniLM embedder) has no
+    // endpoint to probe, so nothing is admitted, refused or sent.
+    if !crate::config::embed_lane_egresses(&resolved.backend, boot_model.model) {
+        facts.push((EMBED_LANE_FACT.into(), EMBED_LANE_LOCAL.into()));
+        return finish_embeddings_section(
+            &resolved,
+            &boot_model,
+            facts,
+            Severity::Info,
+            Some(EMBED_LANE_LOCAL_NOTE.into()),
+        );
+    }
 
     let started = std::time::Instant::now();
     // #4121 — admission and the endpoint pin run BEFORE the client exists:
@@ -4907,6 +4945,7 @@ fn section_embeddings_reachability_1598() -> ReportSection {
                 &resolved.url,
                 mode,
                 reason,
+                (crate::egress::EgressClass::InferenceEmbedding, audit_db),
             );
         }
         Err(crate::egress::AdmittedClientError::Build(e)) => {
@@ -4948,7 +4987,7 @@ fn section_embeddings_reachability_1598() -> ReportSection {
         crate::url_display::url_origin_and_path(&probe_url),
     ));
 
-    let (mut severity, mut note) = match req.send() {
+    let (severity, note) = match req.send() {
         Ok(resp) => {
             let status = resp.status();
             let elapsed_ms = started.elapsed().as_millis();
@@ -5012,6 +5051,26 @@ fn section_embeddings_reachability_1598() -> ReportSection {
         }
     };
 
+    finish_embeddings_section(&resolved, &boot_model, facts, severity, note)
+}
+
+/// #4121 — the embeddings section facts key naming the lane transport.
+const EMBED_LANE_FACT: &str = "embed_lane";
+/// #3933 — the lane value for the local in-process embedder.
+const EMBED_LANE_LOCAL: &str = "local";
+/// #3933 / #4121 — the note for a lane that opens no socket.
+const EMBED_LANE_LOCAL_NOTE: &str = "probe not needed: the embed lane is the local in-process \
+     embedder, which opens no network connection (#3933); nothing was sent";
+
+/// The model-honoured and GPU-policy findings every embeddings section
+/// carries, whether or not a probe ran.
+fn finish_embeddings_section(
+    resolved: &crate::config::ResolvedEmbeddings,
+    boot_model: &crate::daemon_runtime::BootEmbedderModel,
+    mut facts: Vec<(String, String)>,
+    mut severity: Severity,
+    mut note: Option<String>,
+) -> ReportSection {
     // v1.0.0 #2972 — the `model` fact above is the CONFIGURED id, not
     // necessarily the one this binary will LOAD. On a non-API backend
     // `Embedder::from_resolved` constructs only from the compiled
@@ -5023,10 +5082,6 @@ fn section_embeddings_reachability_1598() -> ReportSection {
     // model whenever it differs from the configured one — a doctor that
     // states a model the binary will not load is a false claim, not a
     // cosmetic gap.
-    let boot_model = crate::daemon_runtime::resolve_boot_embedder_model(
-        &app_config.effective_tier(None).config(),
-        &app_config,
-    );
     if let Some(raw) = boot_model.unhonoured_config_model.as_deref() {
         let effective = boot_model.model.map_or_else(
             || "(none — keyword-only tier)".to_string(),
@@ -8885,7 +8940,7 @@ enabled = true
         let _g = reach_env_lock().lock().unwrap_or_else(|e| e.into_inner());
         clear_llm_embed_env();
         let _scope = EnvScope::set(&[]);
-        let section = tokio::task::spawn_blocking(section_llm_reachability_1146)
+        let section = tokio::task::spawn_blocking(|| section_llm_reachability_1146(None))
             .await
             .unwrap();
         assert_eq!(section.severity, Severity::Info);
@@ -8940,7 +8995,7 @@ enabled = true
                 assert!(resolved.base_url.is_empty());
             }
             let section = tokio::task::spawn_blocking(move || {
-                section_llm_reachability_from_resolved(&resolved)
+                section_llm_reachability_from_resolved(&resolved, None)
             })
             .await
             .unwrap();
@@ -8992,7 +9047,7 @@ enabled = true
                     ("AI_MEMORY_LLM_API_KEY", "probe-key"),
                     ("AI_MEMORY_LLM_MODEL", "probe-model"),
                 ]);
-                tokio::task::spawn_blocking(section_llm_reachability_1146)
+                tokio::task::spawn_blocking(|| section_llm_reachability_1146(None))
                     .await
                     .unwrap()
             };
@@ -9006,7 +9061,7 @@ enabled = true
         let _g = reach_env_lock().lock().unwrap_or_else(|e| e.into_inner());
         clear_llm_embed_env();
         let _scope = EnvScope::set(&[]);
-        let section = tokio::task::spawn_blocking(section_embeddings_reachability_1598)
+        let section = tokio::task::spawn_blocking(|| section_embeddings_reachability_1598(None))
             .await
             .unwrap();
         assert_eq!(section.severity, Severity::Info);
@@ -9048,7 +9103,7 @@ enabled = true
                     ("AI_MEMORY_EMBED_API_KEY", "probe-key"),
                     ("AI_MEMORY_EMBED_MODEL", "probe-embed-model"),
                 ]);
-                tokio::task::spawn_blocking(section_embeddings_reachability_1598)
+                tokio::task::spawn_blocking(|| section_embeddings_reachability_1598(None))
                     .await
                     .unwrap()
             };

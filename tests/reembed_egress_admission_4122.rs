@@ -466,8 +466,9 @@ fn reembed_threads_the_admitted_pin_into_the_pinned_builder_6400() {
         .find("let egress_pin = if")
         .expect("#6400: the admission binding `egress_pin` exists");
     let region = &verb[start..];
+    // The first `Err(` arm (the audited refusal, #4122 C-L5) ends the admit arm.
     let end = region
-        .find("Err(EgressDecision::Refuse")
+        .find("Err(")
         .expect("#6400: the refusal arm follows the admit arm");
     let admit_arm = &region[..end];
     assert!(

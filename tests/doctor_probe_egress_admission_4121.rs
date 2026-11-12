@@ -18,6 +18,10 @@
 //! Red on the carrier: both probes built their own `reqwest::blocking`
 //! client with no admission, so the `deny` cells saw a connection carrying
 //! `Authorization: Bearer <key>`.
+//!
+//! Round 1 (PR #9175): a refused probe appends the signed refusal row
+//! (C-L5), the admitted client follows no redirect (S-L6), and a local
+//! embed lane is not probed at all (C-L6).
 
 #![cfg(unix)]
 
@@ -68,12 +72,6 @@ impl Probe {
             Probe::Embeddings => "AI_MEMORY_EMBED",
         }
     }
-    fn other(self) -> Probe {
-        match self {
-            Probe::Llm => Probe::Embeddings,
-            Probe::Embeddings => Probe::Llm,
-        }
-    }
     /// The 200 body the probe accepts.
     fn ok_body(self) -> String {
         match self {
@@ -118,6 +116,19 @@ fn run_doctor(
     base_url: &str,
     posture: Option<&str>,
 ) -> Output {
+    let pre = probe.env_prefix();
+    let lane = [
+        (format!("{pre}_BACKEND"), "openai-compatible".to_string()),
+        (format!("{pre}_BASE_URL"), base_url.to_string()),
+        (format!("{pre}_API_KEY"), API_KEY.to_string()),
+        (format!("{pre}_MODEL"), "fixture-model".to_string()),
+    ];
+    spawn_doctor(dir, db, &lane, posture)
+}
+
+/// Run `doctor --json` with every inference lane variable cleared, then
+/// `lane` set, under `posture`.
+fn spawn_doctor(dir: &Path, db: &Path, lane: &[(String, String)], posture: Option<&str>) -> Output {
     let home = dir.join("home");
     std::fs::create_dir_all(home.join(".config")).expect("scratch home");
     let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_ai-memory"));
@@ -130,16 +141,14 @@ fn run_doctor(
         .env("XDG_CONFIG_HOME", home.join(".config"))
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    for p in [probe.other()] {
+    for p in PROBES {
         for k in ["BACKEND", "BASE_URL", "API_KEY", "MODEL"] {
             cmd.env_remove(format!("{}_{k}", p.env_prefix()));
         }
     }
-    let pre = probe.env_prefix();
-    cmd.env(format!("{pre}_BACKEND"), "openai-compatible")
-        .env(format!("{pre}_BASE_URL"), base_url)
-        .env(format!("{pre}_API_KEY"), API_KEY)
-        .env(format!("{pre}_MODEL"), "fixture-model");
+    for (k, v) in lane {
+        cmd.env(k, v);
+    }
     for var in [
         "HTTP_PROXY",
         "http_proxy",
@@ -388,5 +397,133 @@ fn doctor_builds_no_inference_client_around_the_gate_4121() {
             body.contains("crate::egress::admitted_blocking_client("),
             "#4121: {probe_fn} builds its client through the admission funnel"
         );
+    }
+}
+
+// ─── #4121 / #4122 r1: audit row, no redirect, local embed lane ────────────
+
+/// `signed_events` rows of the inference-egress refusal type in `db`.
+fn refusal_rows(db: &Path) -> i64 {
+    let conn =
+        rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect("open doctor db read-only");
+    conn.query_row(
+        "SELECT COUNT(*) FROM signed_events WHERE event_type = ?1",
+        [ai_memory::signed_events::event_types::EGRESS_INFERENCE_REFUSED],
+        |r| r.get(0),
+    )
+    .expect("count refusal rows")
+}
+
+/// C-L5: a refused probe appends exactly one signed refusal row (the record
+/// boot and `reembed` append); an admitted probe appends none.
+#[test]
+fn refused_probe_appends_one_signed_refusal_row_4121() {
+    for probe in PROBES {
+        let listener = RecordingListener::start(Some(http_json_response(&probe.ok_body())));
+        let (dir, db) = scratch("audit-deny");
+        assert_eq!(
+            refusal_rows(&db),
+            0,
+            "#4121 {probe:?}: seeded db has no refusal row"
+        );
+        let out = run_doctor(dir.path(), &db, probe, &listener.url(), Some("deny"));
+        assert_refused(&out, probe, "deny");
+        assert_eq!(
+            refusal_rows(&db),
+            1,
+            "#4121 {probe:?}/deny: one signed refusal row per refused probe"
+        );
+        let (dir, db) = scratch("audit-allow");
+        let out = run_doctor(dir.path(), &db, probe, &listener.url(), None);
+        assert_probed(&out, &listener, probe, "allow");
+        assert_eq!(
+            refusal_rows(&db),
+            0,
+            "#4121 {probe:?}/allow: no refusal row"
+        );
+    }
+}
+
+/// A `302 Found` pointing at `target` with an empty body.
+fn http_redirect_response(target: &str) -> Vec<u8> {
+    format!(
+        "HTTP/1.1 302 Found\r\nlocation: {target}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+    )
+    .into_bytes()
+}
+
+/// S-L6: the admitted client never follows a redirect, so an admitted
+/// endpoint cannot bounce the probe (or its key) to a second host.
+#[test]
+fn admitted_probe_never_follows_a_redirect_4121() {
+    for probe in PROBES {
+        let second = RecordingListener::start(Some(http_json_response(&probe.ok_body())));
+        let first = RecordingListener::start(Some(http_redirect_response(&format!(
+            "{}/v1/bounced",
+            second.url()
+        ))));
+        let (dir, db) = scratch("redirect");
+        let out = run_doctor(dir.path(), &db, probe, &first.url(), None);
+        let s = section(&out, probe);
+        assert_eq!(
+            fact(&s, "http_status").as_deref(),
+            Some("302"),
+            "#4121 {probe:?}: the probe reports the redirect it did not follow: {s}"
+        );
+        assert!(
+            first.connections() >= 1,
+            "#4121 {probe:?}: first endpoint probed"
+        );
+        assert_eq!(
+            second.connections(),
+            0,
+            "#4121 {probe:?}: the redirect target must see ZERO connections"
+        );
+    }
+}
+
+/// C-L6 (a): an `ollama` backend on the semantic tier embeds in process
+/// (local `MiniLM`), so the embed lane opens no socket (#3933). The probe is
+/// not needed under any posture: no refusal, no connection, `embed_lane`
+/// fact `local`.
+#[test]
+fn local_embed_lane_is_not_probed_under_any_posture_4121() {
+    for posture in [Some("deny"), None] {
+        let listener =
+            RecordingListener::start(Some(http_json_response(&Probe::Embeddings.ok_body())));
+        let (dir, db) = scratch("local-lane");
+        let lane = [
+            ("AI_MEMORY_EMBED_BACKEND".to_string(), "ollama".to_string()),
+            ("AI_MEMORY_EMBED_BASE_URL".to_string(), listener.url()),
+        ];
+        let out = spawn_doctor(dir.path(), &db, &lane, posture);
+        let s = section(&out, Probe::Embeddings);
+        assert_eq!(
+            fact(&s, "embed_lane").as_deref(),
+            Some("local"),
+            "#4121 {posture:?}: local lane fact: {s}"
+        );
+        assert!(
+            fact(&s, "inference_egress").is_none(),
+            "#4121 {posture:?}: a local lane is never refused: {s}"
+        );
+        // The section may append the host-dependent #1598 GPU-policy note
+        // after "; ", so the lane note is pinned exactly as the leading part.
+        let note = s["note"].as_str().unwrap_or_default();
+        assert_eq!(
+            note.split("; embeddings backend").next(),
+            Some(
+                "probe not needed: the embed lane is the local in-process embedder, which opens \
+                 no network connection (#3933); nothing was sent"
+            ),
+            "#4121 {posture:?}: exact note: {note}"
+        );
+        assert_eq!(
+            listener.connections(),
+            0,
+            "#4121 {posture:?}: no connection"
+        );
+        assert_eq!(refusal_rows(&db), 0, "#4121 {posture:?}: no refusal row");
     }
 }
