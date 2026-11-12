@@ -1291,18 +1291,59 @@ mod tests {
     /// #8832 (security L3) — a configured but shape-invalid
     /// `AI_MEMORY_AGENT_ID` is refused by every skill read verb (exit 2 with
     /// the resolver's exact text), never widened to the trust-all posture.
+    ///
+    /// The body runs in a clean-environment child of this test binary that
+    /// receives `AI_MEMORY_AGENT_ID` on its `Command` (the #3152 / #3523
+    /// shape): writing this process's environment would race every
+    /// concurrently running lib test that reads it (test-env-lock arm (d)).
+    /// The child writes a done-marker only after the body returns, because a
+    /// filter that matched nothing exits 0 too. No re-exec helper exists off
+    /// unix, and no CI runner either.
+    #[cfg(unix)]
     #[test]
     fn skill_read_verbs_refuse_a_shape_invalid_agent_id_8832() {
+        use crate::recover::in_tx_fault::{
+            CHILD_MARKER_ENV, CHILD_ROLE_ENV, child_role_is, child_var,
+        };
+        const TEST: &str = "skill_read_verbs_refuse_a_shape_invalid_agent_id_8832";
         const BAD: &str = "not a valid id";
+        if child_role_is(TEST) {
+            assert_read_verbs_refuse_bad_agent_id(BAD);
+            std::fs::write(child_var(CHILD_MARKER_ENV), TEST).expect("write the #8832 done marker");
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        let marker = dir.path().join("done-8832");
+        let out = crate::test_support::spawn_test_child(
+            &format!("cli::commands::skill::tests::{TEST}"),
+            &[
+                ("AI_MEMORY_AGENT_ID", BAD),
+                (CHILD_ROLE_ENV, TEST),
+                (CHILD_MARKER_ENV, &marker.to_string_lossy()),
+            ],
+        );
+        let detail = format!(
+            "status={:?}\nstdout={}\nstderr={}",
+            out.status,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.status.success(), "the {TEST} child failed: {detail}");
+        assert_eq!(
+            std::fs::read_to_string(&marker).ok().as_deref(),
+            Some(TEST),
+            "the child must have run {TEST}: {detail}"
+        );
+    }
+
+    /// The #8832 child body: `AI_MEMORY_AGENT_ID` is `bad` in this process.
+    #[cfg(unix)]
+    fn assert_read_verbs_refuse_bad_agent_id(bad: &str) {
         let (_dir, db_path) = fresh_db();
         let want_reason = format!(
             "AI_MEMORY_AGENT_ID is invalid: {}",
-            crate::validate::validate_agent_id_shape(BAD).expect_err("BAD must be shape-invalid")
+            crate::validate::validate_agent_id_shape(bad).expect_err("BAD must be shape-invalid")
         );
-        let _envg = crate::identity::agent_id_env_test_lock();
-        // SAFETY: process-global env mutation serialised on the crate-wide
-        // test lock held above; every mutator takes the same lock.
-        unsafe { std::env::set_var("AI_MEMORY_AGENT_ID", BAD) };
         let verbs = [
             (
                 "list",
@@ -1330,8 +1371,6 @@ mod tests {
             drop(out);
             results.push((verb, code, stdout, String::from_utf8(stderr).unwrap()));
         }
-        // SAFETY: as above.
-        unsafe { std::env::remove_var("AI_MEMORY_AGENT_ID") };
         for (verb, code, stdout, stderr) in results {
             assert_eq!(code, 2, "verb={verb}");
             assert!(stdout.is_empty(), "verb={verb} served output");
