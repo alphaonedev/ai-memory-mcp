@@ -14,6 +14,13 @@ use crate::models::field_names;
 use rusqlite::Connection;
 use serde_json::{Value, json};
 
+/// #8834 (code LOW 2 / security L2) — the most rows one `memory_skill_list`
+/// call reads and verifies. The namespace and text filters run in SQL first,
+/// so only the rows of this page pay the verify cost (digest, resource
+/// digests, bounded body decode). A response that reached the page limit
+/// carries `truncated: true`; the caller narrows with `namespace` / `filter`.
+pub const SKILL_LIST_PAGE_LIMIT: usize = 1000;
+
 /// MCP `memory_skill_list` substrate handler.
 ///
 /// Promoted to `pub` for v0.7.0 Cluster E API-2 (issue #767) so the
@@ -26,12 +33,15 @@ use serde_json::{Value, json};
 /// single-operator / admin-gated posture and reads every skill.
 ///
 /// # Errors
-/// Returns the substrate's error string when SQL prepare/query fails.
+/// Returns the substrate's error string when SQL prepare/query fails, or
+/// when the store fails while a row is verified (#8834: a store failure is a
+/// refusal, never an empty or partial list).
 pub fn handle_skill_list(
     conn: &Connection,
     params: &Value,
     read_caller: Option<&str>,
 ) -> Result<Value, String> {
+    use super::skill_integrity::SkillLoadError;
     let namespace = params["namespace"].as_str().unwrap_or("%");
     let filter = params["filter"].as_str().unwrap_or("");
     // #2024 — discovery HIDES retired skills by default. `include_retired`
@@ -47,41 +57,46 @@ pub fn handle_skill_list(
     };
 
     // Only return current (non-superseded) skills; retired rows are
-    // hidden unless `include_retired` is set (the predicate above).
+    // hidden unless `include_retired` is set (the predicate above). The
+    // text filter is the case-sensitive substring match on name or
+    // description (`instr`), applied here so unmatched rows are never
+    // verified; one row past the page limit detects truncation.
+    let fetch = SKILL_LIST_PAGE_LIMIT.saturating_add(1);
     let sql = format!(
         "SELECT id FROM skills \
          WHERE superseded_by IS NULL \
            AND (namespace = ?1 OR ?1 = '%'){retired_predicate} \
-         ORDER BY namespace, name, created_at DESC"
+           AND (?2 = '' OR instr(name, ?2) > 0 OR instr(description, ?2) > 0) \
+         ORDER BY namespace, name, created_at DESC \
+         LIMIT {fetch}"
     );
     let mut stmt = conn
         .prepare(&sql)
         .map_err(|e| crate::mcp::error_text::mcp_foreign_err("skill_list prepare", e))?;
-    let ids = stmt
-        .query_map([namespace], |row| row.get::<_, String>(0))
+    let mut ids = stmt
+        .query_map([namespace, filter], |row| row.get::<_, String>(0))
         .map_err(|e| crate::mcp::error_text::mcp_foreign_err("skill_list query", e))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| crate::mcp::error_text::mcp_foreign_err("skill_list row", e))?;
+    let truncated = ids.len() > SKILL_LIST_PAGE_LIMIT;
+    ids.truncate(SKILL_LIST_PAGE_LIMIT);
 
-    let mut skills: Vec<Value> = Vec::new();
+    let mut skills: Vec<Value> = Vec::with_capacity(ids.len());
     for id in ids {
         let skill = match super::skill_integrity::load_verified_skill(conn, &id, read_caller) {
             Ok(skill) => skill,
             // #8832 — a skill the caller may not read is simply not listed.
-            Err(e) if e == crate::errors::msg::skill_not_found(&id) => continue,
+            Err(SkillLoadError::NotFound(_)) => continue,
             // #8834 — a row that fails verification is never discoverable;
             // the operator sees why in the log, the caller sees nothing.
-            Err(e) => {
+            Err(SkillLoadError::Integrity(e)) => {
                 tracing::warn!(skill_id = %id, error = %e, "memory_skill_list omitted a skill");
                 continue;
             }
+            // #8834 (code MEDIUM 1) — a store failure is not a verdict on
+            // one row: refuse the whole call rather than under-report.
+            Err(e @ SkillLoadError::Substrate(_)) => return Err(e.into()),
         };
-
-        // Apply optional text filter on name or description.
-        if !filter.is_empty() && !skill.name.contains(filter) && !skill.description.contains(filter)
-        {
-            continue;
-        }
 
         let digest_hex: String = skill.digest.iter().map(|b| format!("{b:02x}")).collect();
 
@@ -126,6 +141,7 @@ pub fn handle_skill_list(
     Ok(json!({
         "count": skills.len(),
         "skills": skills,
+        (field_names::TRUNCATED): truncated,
     }))
 }
 
@@ -331,9 +347,9 @@ mod tests {
         let metadata = serde_json::json!({"author": "alice"}).to_string();
         conn.execute(
             "INSERT INTO skills (id, namespace, name, description, license, compatibility, \
-                                  allowed_tools, metadata, body_blob, digest, signing_agent, \
+                                  allowed_tools, metadata, body_blob, digest, \
                                   created_at) \
-             VALUES ('id1', 'ns', 'name', 'd', 'MIT', 'v1', ?1, ?2, ?3, ?4, 'agent:bob', 0)",
+             VALUES ('id1', 'ns', 'name', 'd', 'MIT', 'v1', ?1, ?2, ?3, ?4, 0)",
             params![allowed_tools, metadata, body_blob, digest],
         )
         .unwrap();
@@ -343,7 +359,8 @@ mod tests {
         let entry = &v["skills"][0];
         assert_eq!(entry["license"], json!("MIT"));
         assert_eq!(entry["compatibility"], json!("v1"));
-        assert_eq!(entry["signing_agent"], json!("agent:bob"));
+        // #8834: an unsigned row never lists a signer.
+        assert!(entry.get("signing_agent").is_none(), "{entry}");
         assert_eq!(entry["allowed_tools"], json!(["tool1"]));
         assert_eq!(entry["metadata"]["author"], json!("alice"));
         // digest is hex.

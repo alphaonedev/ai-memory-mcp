@@ -6,7 +6,9 @@
 //! Writes a skill back to a `target_folder` as a round-trip-compatible
 //! SKILL.md file (plus any attached resource files under `resources/`).
 //! Re-registering the exported folder via `memory_skill_register` produces
-//! the **identical SHA-256 digest** — the round-trip guarantee.
+//! the **identical SHA-256 digest** — the round-trip guarantee. A promoted
+//! skill keeps its `_visibility` binding, so the guarantee holds for the
+//! principal that promoted it; register refuses any other principal (#8832).
 //!
 //! A `signed_events` row is appended for the export action (Bucket 1
 //! attestation).
@@ -723,7 +725,15 @@ fn build_frontmatter_yaml(f: &FrontmatterFields<'_>) -> Result<String, String> {
     }
     if let Some(meta) = f.metadata {
         for (k, v) in meta {
-            if CORE_FRONTMATTER_KEYS.contains(&k.as_str()) {
+            // #8832 — the scope binding (`_visibility`) is exported: it is part
+            // of the digest, and register accepts it back for the principal it
+            // names, so the round trip keeps the identical digest and the
+            // binding. Every other `_`-prefixed key is substrate-stamped
+            // state register refuses, so an exported SKILL.md never carries it.
+            if CORE_FRONTMATTER_KEYS.contains(&k.as_str())
+                || (super::skill_integrity::is_reserved_meta_key(k)
+                    && k != super::skill_integrity::VISIBILITY_META_KEY)
+            {
                 continue;
             }
             let value = serde_yaml_ng::to_value(v)
@@ -962,9 +972,9 @@ mod tests {
         let id = "2bbbbbbb-0000-0000-0000-000000000002";
         conn.execute(
             "INSERT INTO skills (id, namespace, name, description, license, compatibility, \
-                                  allowed_tools, metadata, body_blob, digest, signing_agent, \
+                                  allowed_tools, metadata, body_blob, digest, \
                                   created_at) \
-             VALUES (?1, 'ns', 'name', 'desc', 'MIT', 'v1', ?2, ?3, ?4, ?5, 'agent:x', 0)",
+             VALUES (?1, 'ns', 'name', 'desc', 'MIT', 'v1', ?2, ?3, ?4, ?5, 0)",
             params![id, allowed_tools, metadata, body_blob, digest],
         )
         .unwrap();
@@ -1064,29 +1074,38 @@ mod tests {
     }
 
     #[test]
-    fn export_with_signing_agent_in_db_uses_that() {
-        // When no keypair is supplied, agent_id falls back to the
-        // skill's signing_agent column (when present).
+    fn export_refuses_a_signer_named_without_a_signature_8834() {
+        // #8834: a row that names a signer but carries no signature is a
+        // stripped signature or a self-asserted signer; export refuses it
+        // and writes nothing, so the signer never reaches the audit row.
         let (conn, dir) = open_db();
         let body_blob = zstd::encode_all(b"body".as_slice(), 3).unwrap();
         let digest = vec![0u8; 32];
         let id = "5eeee-0000-0000-0000-000000000005";
         conn.execute(
-            "INSERT INTO skills (id, namespace, name, description, metadata, body_blob, digest, signing_agent, created_at) \
-             VALUES (?1, 'ns', 'name', 'd', '{}', ?2, ?3, 'agent:from-db', 0)",
+            "INSERT INTO skills (id, namespace, name, description, metadata, body_blob, digest, created_at) \
+             VALUES (?1, 'ns', 'name', 'd', '{}', ?2, ?3, 0)",
             params![id, body_blob, digest],
         )
         .unwrap();
 
+        // The reseal clears any signer, so name one after it: the digest
+        // stays valid and only the signer claim is unbacked.
         reseal(&conn, id);
+        conn.execute(
+            "UPDATE skills SET signing_agent = 'agent:from-db' WHERE id = ?1",
+            params![id],
+        )
+        .unwrap();
         let target = dir.path().join("export-dbagent");
-        let v = handle_skill_export(
+        let err = handle_skill_export(
             &conn,
             &json!({"skill_id": id, "target_folder": target.to_str().unwrap()}),
             None,
         )
-        .unwrap();
-        assert_eq!(v["exported"], json!(true));
+        .unwrap_err();
+        assert_eq!(err, crate::errors::msg::skill_signature_missing(id));
+        assert!(!target.exists(), "nothing is written for a refused skill");
     }
 
     // ---- corrupt blob path ----------------------------------------------
@@ -1436,6 +1455,46 @@ mod tests {
             reparsed.metadata["tags"],
             json!(["a", "b"]),
             "array preserved"
+        );
+    }
+
+    #[test]
+    fn export_keeps_the_scope_binding_and_strips_other_reserved_keys_8832() {
+        // #8832 — the scope binding is part of the digest and register
+        // accepts it back for the principal it names, so export writes it
+        // (the promote → export → re-register digest stays identical). Every
+        // other reserved key is substrate state register refuses: stripped.
+        let (conn, dir) = open_db();
+        let body_blob = zstd::encode_all(b"body".as_slice(), 3).unwrap();
+        let digest = vec![0u8; 32];
+        let id = "ckkkk-0000-0000-0000-00000000000c";
+        let binding = json!({"scope": "private", "agent_id": "ai:owner"});
+        let meta = serde_json::json!({
+            "author": "alice",
+            "_visibility": binding,
+            "_signed_state": "x",
+        })
+        .to_string();
+        conn.execute(
+            "INSERT INTO skills (id, namespace, name, description, metadata, body_blob, digest, created_at) \
+             VALUES (?1, 'ns', 'name', 'd', ?2, ?3, ?4, 0)",
+            params![id, meta, body_blob, digest],
+        )
+        .unwrap();
+        reseal(&conn, id);
+        let target = dir.path().join("export-reserved");
+        handle_skill_export(
+            &conn,
+            &json!({"skill_id": id, "target_folder": target.to_str().unwrap()}),
+            None,
+        )
+        .unwrap();
+        let md = std::fs::read_to_string(target.join("SKILL.md")).unwrap();
+        let reparsed = crate::parsing::skill_md::parse(&md).expect("exported SKILL.md re-parses");
+        assert_eq!(
+            reparsed.metadata,
+            json!({"author": "alice", "_visibility": binding}),
+            "{md}"
         );
     }
 }

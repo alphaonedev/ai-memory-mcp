@@ -358,6 +358,24 @@ fn handler_err_exit(out: &mut CliOutput<'_>, verb: &str, e: &str) -> Result<i32>
     Ok(2)
 }
 
+/// #8832 (security L3) — the skill read verbs' visibility caller. An unset
+/// `AI_MEMORY_AGENT_ID` is the explicit local-operator posture (`None`); an
+/// empty, non-Unicode or shape-invalid value is configuration that cannot be
+/// a principal, so the verb refuses (exit 2) instead of widening the read to
+/// trust-all. Same resolver as the MCP read path (#3356).
+fn cli_read_caller(
+    out: &mut CliOutput<'_>,
+    verb: &str,
+) -> Result<std::result::Result<Option<String>, i32>> {
+    match crate::identity::resolve_mcp_read_visibility_caller() {
+        Ok(caller) => Ok(Ok(caller)),
+        Err(e) => {
+            writeln!(out.stderr, "ai-memory skill {verb}: {e}")?;
+            Ok(Err(2))
+        }
+    }
+}
+
 fn emit_json(out: &mut CliOutput<'_>, v: &Value) -> Result<()> {
     let s = serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string());
     writeln!(out.stdout, "{s}")?;
@@ -449,7 +467,10 @@ fn run_list(conn: &rusqlite::Connection, args: &ListArgs, out: &mut CliOutput<'_
         params[field_names::INCLUDE_RETIRED] = json!(true);
     }
     // #8832 — the same CLI read-visibility caller `skill compose` uses.
-    let vis_caller = crate::identity::resolve_read_visibility_caller();
+    let vis_caller = match cli_read_caller(out, "list")? {
+        Ok(caller) => caller,
+        Err(code) => return Ok(code),
+    };
     match crate::mcp::handle_skill_list(conn, &params, vis_caller.as_deref()) {
         Ok(v) => {
             if args.json {
@@ -479,7 +500,10 @@ fn run_list(conn: &rusqlite::Connection, args: &ListArgs, out: &mut CliOutput<'_
 fn run_get(conn: &rusqlite::Connection, args: &GetArgs, out: &mut CliOutput<'_>) -> Result<i32> {
     let params = json!({ "skill_id": args.id });
     // #8832 — the same CLI read-visibility caller `skill compose` uses.
-    let vis_caller = crate::identity::resolve_read_visibility_caller();
+    let vis_caller = match cli_read_caller(out, "get")? {
+        Ok(caller) => caller,
+        Err(code) => return Ok(code),
+    };
     match crate::mcp::handle_skill_get(conn, &params, vis_caller.as_deref()) {
         Ok(v) => {
             if args.json {
@@ -510,7 +534,10 @@ fn run_resource(
         (field_names::RESOURCE_PATH): args.path,
     });
     // #8832 — the same CLI read-visibility caller `skill compose` uses.
-    let vis_caller = crate::identity::resolve_read_visibility_caller();
+    let vis_caller = match cli_read_caller(out, "resource")? {
+        Ok(caller) => caller,
+        Err(code) => return Ok(code),
+    };
     match crate::mcp::handle_skill_resource(conn, &params, vis_caller.as_deref()) {
         Ok(v) => {
             if args.json {
@@ -545,7 +572,10 @@ fn run_export(
     // (`<db parent>/skills-export`); an operator exporting elsewhere sets
     // AI_MEMORY_SKILLS_EXPORT_ROOT.
     // #8832 — the same CLI read-visibility caller `skill compose` uses.
-    let vis_caller = crate::identity::resolve_read_visibility_caller();
+    let vis_caller = match cli_read_caller(out, "export")? {
+        Ok(caller) => caller,
+        Err(code) => return Ok(code),
+    };
     let caller = vis_caller.as_deref();
     match crate::mcp::handle_skill_export(conn, db_path, &params, active_keypair, caller) {
         Ok(v) => {
@@ -619,7 +649,10 @@ fn run_compose(
     // #4059 — the composed reflections are memory rows: scope them to the
     // CLI read-visibility caller exactly like `ai-memory recall` (`None`,
     // the single-operator posture, when no identity is configured).
-    let vis_caller = crate::identity::resolve_read_visibility_caller();
+    let vis_caller = match cli_read_caller(out, "compose")? {
+        Ok(caller) => caller,
+        Err(code) => return Ok(code),
+    };
     match crate::mcp::handle_skill_compositional_context(conn, &params, vis_caller.as_deref()) {
         Ok(v) => {
             emit_json(out, &v)?;
@@ -1253,5 +1286,60 @@ mod tests {
         let text = String::from_utf8(stdout).unwrap();
         assert!(text.contains("retired"), "got: {text}");
         assert!(text.contains("cli-retire"), "got: {text}");
+    }
+
+    /// #8832 (security L3) — a configured but shape-invalid
+    /// `AI_MEMORY_AGENT_ID` is refused by every skill read verb (exit 2 with
+    /// the resolver's exact text), never widened to the trust-all posture.
+    #[test]
+    fn skill_read_verbs_refuse_a_shape_invalid_agent_id_8832() {
+        const BAD: &str = "not a valid id";
+        let (_dir, db_path) = fresh_db();
+        let want_reason = format!(
+            "AI_MEMORY_AGENT_ID is invalid: {}",
+            crate::validate::validate_agent_id_shape(BAD).expect_err("BAD must be shape-invalid")
+        );
+        let _envg = crate::identity::agent_id_env_test_lock();
+        // SAFETY: process-global env mutation serialised on the crate-wide
+        // test lock held above; every mutator takes the same lock.
+        unsafe { std::env::set_var("AI_MEMORY_AGENT_ID", BAD) };
+        let verbs = [
+            (
+                "list",
+                SkillAction::List(ListArgs {
+                    namespace: None,
+                    filter: None,
+                    include_retired: false,
+                    json: true,
+                }),
+            ),
+            (
+                "get",
+                SkillAction::Get(GetArgs {
+                    id: "sk-any".to_string(),
+                    json: true,
+                }),
+            ),
+        ];
+        let mut results = Vec::new();
+        for (verb, action) in verbs {
+            let mut stdout: Vec<u8> = Vec::new();
+            let mut stderr: Vec<u8> = Vec::new();
+            let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
+            let code = run(&db_path, &SkillArgs { action }, None, &mut out).unwrap();
+            drop(out);
+            results.push((verb, code, stdout, String::from_utf8(stderr).unwrap()));
+        }
+        // SAFETY: as above.
+        unsafe { std::env::remove_var("AI_MEMORY_AGENT_ID") };
+        for (verb, code, stdout, stderr) in results {
+            assert_eq!(code, 2, "verb={verb}");
+            assert!(stdout.is_empty(), "verb={verb} served output");
+            assert_eq!(
+                stderr,
+                format!("ai-memory skill {verb}: {want_reason}\n"),
+                "verb={verb}"
+            );
+        }
     }
 }

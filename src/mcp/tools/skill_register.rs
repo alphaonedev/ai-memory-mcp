@@ -249,7 +249,12 @@ pub(super) fn register_core(
                 );
                 signing_key.sign(&digest).to_bytes().to_vec()
             });
-            (sig, Some(kp.agent_id.clone()))
+            // #8834 (security M1 b) — the signer is stored only beside a
+            // signature it produced: a keypair without a private key leaves
+            // the row unsigned and unattributed, never a named signer with no
+            // signature (which the verified read path refuses).
+            let agent = sig.as_ref().map(|_| kp.agent_id.clone());
+            (sig, agent)
         } else {
             (None, None)
         };
@@ -417,11 +422,38 @@ pub(super) fn register_core(
 // Handler
 // ---------------------------------------------------------------------------
 
+/// MCP and CLI entry. The principal a caller-supplied scope binding is held
+/// to is the process's authenticated identity (`AI_MEMORY_AGENT_ID`, else the
+/// durable host default), resolved with no request field: the same identity
+/// `memory_skill_promote_from_reflection` stamps when the request names none.
+///
+/// # Errors
+/// The caller-facing refusal text.
 pub fn handle_skill_register(
     conn: &Connection,
     params: &Value,
     active_keypair: Option<&AgentKeypair>,
 ) -> Result<Value, String> {
+    let principal = crate::identity::resolve_governance_subject(None, None, "register skills")
+        .map_err(|e| e.to_string())?;
+    handle_skill_register_as(conn, params, active_keypair, &principal).map_err(|e| e.to_string())
+}
+
+/// #8832 — the shared register body. `principal` is the authenticated caller
+/// context (HTTP: the admin-gated header principal; MCP and CLI: the process
+/// identity), never a request field or the skill body; a caller-supplied
+/// `_visibility` binding is accepted only when it is exactly the binding
+/// promote stamps for it ([`super::skill_integrity::check_register_metadata`]).
+///
+/// # Errors
+/// A [`crate::errors::refusal`] whose `Display` is the caller-facing text.
+pub(crate) fn handle_skill_register_as(
+    conn: &Connection,
+    params: &Value,
+    active_keypair: Option<&AgentKeypair>,
+    principal: &str,
+) -> anyhow::Result<Value> {
+    use crate::errors::refusal;
     // -----------------------------------------------------------------------
     // Input: folder_path or inline_skill
     // -----------------------------------------------------------------------
@@ -439,12 +471,13 @@ pub fn handle_skill_register(
             // symlinked entry — reading SKILL.md and resources ONLY from
             // within the canonical root. Fail closed on every ambiguity.
             let import_root_env = std::env::var(SKILLS_IMPORT_ROOT_ENV).ok();
-            let root = resolve_import_root(folder_str, import_root_env.as_deref())?;
+            let root =
+                resolve_import_root(folder_str, import_root_env.as_deref()).map_err(refusal)?;
 
             let md_path = root.join("SKILL.md");
             // SKILL.md must be a regular file inside the root — never a
             // symlink pointing back out of the jail.
-            reject_symlink_escape(&md_path, &root)?;
+            reject_symlink_escape(&md_path, &root).map_err(refusal)?;
             // #3762 — the `io::Error` Display carries the OS path text: log
             // it for the operator, render the failure class to the caller.
             let text = std::fs::read_to_string(&md_path).map_err(|e| {
@@ -456,7 +489,7 @@ pub fn handle_skill_register(
                     "cannot read SKILL.md for import"
                 );
                 let kind = crate::errors::msg::skills_io_kind(e.kind());
-                format!("cannot read SKILL.md in '{folder_str}': {kind}")
+                refusal(format!("cannot read SKILL.md in '{folder_str}': {kind}"))
             })?;
 
             // Collect resource files from a 'resources/' sub-directory.
@@ -464,25 +497,26 @@ pub fn handle_skill_register(
             let res_dir = root.join("resources");
             if res_dir.exists() {
                 // `resources` itself must not be a symlink escaping the root.
-                reject_symlink_escape(&res_dir, &root)?;
+                reject_symlink_escape(&res_dir, &root).map_err(refusal)?;
                 if res_dir.is_dir() {
                     let mut budget = ImportBudget::new();
-                    collect_resources(&res_dir, &res_dir, &mut res, &mut budget)?;
+                    collect_resources(&res_dir, &res_dir, &mut res, &mut budget)
+                        .map_err(refusal)?;
                 }
             }
             (text, res)
         } else if let Some(inline) = params["inline_skill"].as_str() {
             (inline.to_string(), Vec::new())
         } else {
-            return Err(
-                "memory_skill_register requires either 'folder_path' or 'inline_skill'".to_string(),
-            );
+            return Err(refusal(
+                "memory_skill_register requires either 'folder_path' or 'inline_skill'",
+            ));
         };
 
     // -----------------------------------------------------------------------
     // Parse + validate SKILL.md
     // -----------------------------------------------------------------------
-    let manifest = skill_md::parse(&skill_md_text)?;
+    let manifest = skill_md::parse(&skill_md_text).map_err(refusal)?;
 
     // v0.9.0 §11.5 B7-SKILL (#1865) — accept + VALIDATE `parameters_schema`
     // at REGISTER time. FAIL CLOSED here (before any DB write below): skill
@@ -493,8 +527,11 @@ pub fn handle_skill_register(
         .get(field_names::PARAMETERS_SCHEMA)
         .filter(|v| !v.is_null());
     if let Some(schema) = parameters_schema {
-        validate_parameters_schema(schema)
-            .map_err(|e| format!("parameters_schema rejected at register (fail-closed): {e}"))?;
+        validate_parameters_schema(schema).map_err(|e| {
+            refusal(format!(
+                "parameters_schema rejected at register (fail-closed): {e}"
+            ))
+        })?;
     }
     // #4065 — `memory_skill_export` now round-trips a registered schema
     // through the SKILL.md frontmatter, so a folder re-register carries it in
@@ -508,7 +545,9 @@ pub fn handle_skill_register(
             .filter(|v| !v.is_null())
     {
         validate_parameters_schema(schema).map_err(|e| {
-            format!("frontmatter parameters_schema rejected at register (fail-closed): {e}")
+            refusal(format!(
+                "frontmatter parameters_schema rejected at register (fail-closed): {e}"
+            ))
         })?;
     }
 
@@ -518,6 +557,16 @@ pub fn handle_skill_register(
     // inserted when the frontmatter's own metadata parsed to an object
     // (always true for `skill_md::parse` output) and the caller supplied
     // a schema.
+    //
+    // #8832 (code MEDIUM 2) — a key in the substrate-reserved `_` namespace
+    // is never accepted from the caller, at any depth, except the top-level
+    // scope binding in exactly the shape promote stamps for the AUTHENTICATED
+    // principal (so an exported promoted skill re-registers with an identical
+    // digest for its owner, and a binding naming anyone else is refused). One
+    // rule for every input form (folder, inline, MCP, HTTP, CLI all parse
+    // into `manifest.metadata` here).
+    super::skill_integrity::check_register_metadata(&manifest.metadata, principal)
+        .map_err(|r| refusal(r.message()))?;
     let mut metadata = manifest.metadata.clone();
     if let Some(schema) = parameters_schema {
         if let Value::Object(ref mut map) = metadata {
@@ -540,7 +589,10 @@ pub fn handle_skill_register(
         None,
         "register skills",
     )
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| refusal(e.to_string()))?;
+    // #8834 — `signed` reports what register_core does: it signs only with
+    // a private key, so a public-only keypair is an unsigned register.
+    let signs = active_keypair.is_some_and(|kp| kp.private.is_some());
     crate::governance::audit::record_decision(
         &caller,
         "allow",
@@ -550,7 +602,7 @@ pub fn handle_skill_register(
             .ident_or_commit("namespace", &manifest.namespace)
             .ident("name", &manifest.name)
             .number("resource_count", resource_files.len())
-            .flag("signed", active_keypair.is_some()),
+            .flag("signed", signs),
     );
 
     let body_bytes = manifest.body.as_bytes();
@@ -574,7 +626,8 @@ pub fn handle_skill_register(
         res_digests,
         &resource_files,
         active_keypair,
-    )?;
+    )
+    .map_err(refusal)?;
 
     let digest_hex = hex::encode(&result.digest);
     let mut response = json!({
@@ -583,7 +636,7 @@ pub fn handle_skill_register(
         "namespace": manifest.namespace,
         "name": manifest.name,
         "digest": digest_hex,
-        "signed": active_keypair.is_some(),
+        "signed": signs,
         // v0.9.0 §11.5 B7-SKILL (#1865) — surface the version-chain
         // position; the chain itself already existed (supersede-on-
         // register), this just exposes it on the wire.

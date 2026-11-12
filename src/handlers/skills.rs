@@ -129,18 +129,26 @@ pub async fn skill_register_route(
     // #949 — admin-only. Skill registration mints an executable
     // artefact; non-admin callers MUST NOT be able to plant a row
     // other agents will subsequently activate.
-    if let Err(resp) = crate::handlers::admin_role::require_admin(&app, &headers, "skill_register")
+    // #8832 — the admin-gated header principal is the authenticated caller a
+    // caller-supplied `_visibility` binding is held to (the same principal
+    // `skill_promote_route` stamps), never a body field.
+    let caller = match crate::handlers::admin_role::require_admin(&app, &headers, "skill_register")
     {
-        return resp;
-    }
+        Ok(caller) => caller,
+        Err(resp) => return resp,
+    };
     let lock = app.db.lock().await;
     let kp = (*app.active_keypair).as_ref();
-    match crate::mcp::handle_skill_register(&lock.0, &body, kp) {
+    match crate::mcp::handle_skill_register_as(&lock.0, &body, kp, &caller) {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         // #3762 — forward the renderer's closed-vocabulary text verbatim so
         // HTTP says byte-identically what MCP says; the absolute jail path
         // lives on the operator log at the refusal site, never here.
-        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
@@ -249,8 +257,21 @@ fn skill_read_error_response(
     skill_id: &str,
     resource_path: Option<&str>,
 ) -> axum::response::Response {
+    let (status, text) = skill_read_status_text(route, e, skill_id, resource_path);
+    (status, Json(json!({"error": text}))).into_response()
+}
+
+/// The status and wire text [`skill_read_error_response`] renders; split out
+/// so the parity test pins one status and one body per class on every read
+/// route (#8834).
+fn skill_read_status_text(
+    route: &'static str,
+    e: &str,
+    skill_id: &str,
+    resource_path: Option<&str>,
+) -> (StatusCode, String) {
     use crate::errors::msg;
-    let (status, text) = match SkillReadError::classify(e, skill_id, resource_path) {
+    match SkillReadError::classify(e, skill_id, resource_path) {
         SkillReadError::NotFound => (StatusCode::NOT_FOUND, msg::skill_not_found(skill_id)),
         SkillReadError::DigestMismatch => (
             StatusCode::BAD_REQUEST,
@@ -282,10 +303,11 @@ fn skill_read_error_response(
             StatusCode::BAD_REQUEST,
             msg::skill_resource_reference_only(path),
         ),
-        SkillReadError::Internal => {
-            // #1261 — never forward the raw substrate error (often a
-            // `rusqlite::Error` string carrying SQL fragments) on the HTTP
-            // wire. Log the raw text; emit a generic error to the caller.
+        // #1261 — never forward the raw substrate error (often a
+        // `rusqlite::Error` string carrying SQL fragments) or a decoder
+        // message (which can name a stored resource path) on the HTTP wire.
+        // Log the raw text; emit a generic error to the caller.
+        SkillReadError::Decode | SkillReadError::Substrate | SkillReadError::Internal => {
             tracing::error!(
                 target: SKILLS_TRACE_TARGET,
                 route,
@@ -297,8 +319,19 @@ fn skill_read_error_response(
                 msg::INTERNAL_SERVER_ERROR.to_string(),
             )
         }
-    };
-    (status, Json(json!({"error": text}))).into_response()
+    }
+}
+
+/// #8834 (code LOW 3) — the export route's status and wire text. A loader
+/// refusal (every class [`SkillReadError::classify`] names) renders exactly
+/// as on get, resource and compose; only text outside that vocabulary is the
+/// export renderer's own closed vocabulary (#3762: jail and target-folder
+/// refusals naming the CALLER's target), forwarded verbatim as a 400.
+fn skill_export_status_text(e: &str, skill_id: &str) -> (StatusCode, String) {
+    match SkillReadError::classify(e, skill_id, None) {
+        SkillReadError::Internal => (StatusCode::BAD_REQUEST, e.to_owned()),
+        _ => skill_read_status_text("skill_export_route", e, skill_id, None),
+    }
 }
 
 /// The closed vocabulary of [`skill_read_error_response`]. A resource-path
@@ -313,6 +346,11 @@ enum SkillReadError<'a> {
     ResourcePathRequired,
     ResourceNotFound(&'a str),
     ResourceReferenceOnly(&'a str),
+    /// A stored blob failed to decode (`ZSTD_DECOMPRESS_PREFIX` family).
+    Decode,
+    /// The store failed (the sanitized `DB_ERROR_TEXT` of the loader's
+    /// substrate class).
+    Substrate,
     Internal,
 }
 
@@ -338,6 +376,12 @@ impl<'a> SkillReadError<'a> {
         }
         if e == msg::SKILL_RESOURCE_PATH_REQUIRED {
             return Self::ResourcePathRequired;
+        }
+        if e.starts_with(msg::ZSTD_DECOMPRESS_PREFIX) {
+            return Self::Decode;
+        }
+        if e == crate::mcp::error_text::DB_ERROR_TEXT {
+            return Self::Substrate;
         }
         if let Some(path) = resource_path {
             if e == msg::skill_resource_not_found(skill_id, path) {
@@ -433,11 +477,8 @@ pub async fn skill_export_route(
     match crate::mcp::handle_skill_export(&lock.0, &lock.1, &params, kp, None) {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(e) => {
-            if e.starts_with(crate::errors::msg::SKILL_NOT_FOUND) {
-                (StatusCode::NOT_FOUND, Json(json!({"error": e}))).into_response()
-            } else {
-                (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response()
-            }
+            let (status, text) = skill_export_status_text(&e, &id);
+            (status, Json(json!({"error": text}))).into_response()
         }
     }
 }
@@ -573,25 +614,9 @@ pub async fn skill_compose_route(
     // declared namespaces under the operator trust-all posture (`None`).
     match crate::mcp::handle_skill_compositional_context(&lock.0, &params, None) {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
-        Err(e) => {
-            if e.starts_with(crate::errors::msg::SKILL_NOT_FOUND) {
-                (StatusCode::NOT_FOUND, Json(json!({"error": e}))).into_response()
-            } else {
-                // #1261 — never forward the raw substrate error on
-                // the HTTP wire. Log the raw text; emit a generic
-                // "internal server error" to the caller.
-                tracing::error!(
-                    target: SKILLS_TRACE_TARGET,
-                    error = %e,
-                    "skill_compose_route: substrate error (sanitized for wire response, #1261)"
-                );
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": crate::errors::msg::INTERNAL_SERVER_ERROR})),
-                )
-                    .into_response()
-            }
-        }
+        // #8834 (code LOW 3) — one status and one sanitized body per
+        // refusal class, as on get / resource / export.
+        Err(e) => skill_read_error_response("skill_compose_route", &e, &id, None),
     }
 }
 
@@ -981,6 +1006,78 @@ mod skill_read_error_8834_tests {
         assert_eq!(
             SkillReadError::classify(&msg::skill_not_found("sk-other"), ID, None),
             SkillReadError::Internal
+        );
+    }
+
+    /// #8834 (code LOW 3) — every loader refusal class renders one status and
+    /// one body on all four read routes (get, resource, export, compose), and
+    /// no body carries a stored resource path or decoder text.
+    #[test]
+    fn four_read_routes_render_one_status_and_body_per_class_8834() {
+        use axum::http::StatusCode;
+        const STORED: &str = "stored/secret-path.md";
+        let classes: [(String, StatusCode, String); 7] = [
+            (
+                msg::skill_not_found(ID),
+                StatusCode::NOT_FOUND,
+                msg::skill_not_found(ID),
+            ),
+            (
+                msg::skill_digest_mismatch(ID),
+                StatusCode::BAD_REQUEST,
+                msg::skill_digest_mismatch(ID),
+            ),
+            (
+                msg::skill_signature_invalid(ID),
+                StatusCode::BAD_REQUEST,
+                msg::skill_signature_invalid(ID),
+            ),
+            (
+                msg::skill_signature_missing(ID),
+                StatusCode::BAD_REQUEST,
+                msg::skill_integrity_failed(ID),
+            ),
+            (
+                msg::skill_resource_digest_mismatch(STORED, ID),
+                StatusCode::BAD_REQUEST,
+                msg::skill_integrity_failed(ID),
+            ),
+            (
+                msg::zstd_decompress_resource(STORED, "bad frame"),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                msg::INTERNAL_SERVER_ERROR.to_string(),
+            ),
+            (
+                crate::mcp::error_text::DB_ERROR_TEXT.to_string(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                msg::INTERNAL_SERVER_ERROR.to_string(),
+            ),
+        ];
+        for (e, want_status, want_body) in classes {
+            let routes = [
+                ("get", super::skill_read_status_text("get", &e, ID, None)),
+                (
+                    "resource",
+                    super::skill_read_status_text("resource", &e, ID, Some(PATH)),
+                ),
+                ("export", super::skill_export_status_text(&e, ID)),
+                (
+                    "compose",
+                    super::skill_read_status_text("compose", &e, ID, None),
+                ),
+            ];
+            for (route, (status, body)) in routes {
+                assert_eq!(status, want_status, "route={route} e={e}");
+                assert_eq!(body, want_body, "route={route} e={e}");
+                assert!(!body.contains(STORED), "route={route} leaked: {body}");
+            }
+        }
+        // Text outside the loader vocabulary on export is the renderer's own
+        // #3762 caller-target text: a 400, verbatim.
+        let own = "target_folder escapes the export root";
+        assert_eq!(
+            super::skill_export_status_text(own, ID),
+            (StatusCode::BAD_REQUEST, own.to_owned())
         );
     }
 }

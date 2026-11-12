@@ -55,7 +55,10 @@
 //! frontmatter + body + sorted resource digests) and by serializing the
 //! constructed SKILL.md in the same shape `memory_skill_export`
 //! produces it on disk. The accompanying integration test pins the
-//! contract.
+//! contract. The stamped `_visibility` binding names the promoting
+//! principal, so the identical digest holds when that principal
+//! re-registers; another principal is refused (#8832,
+//! `check_register_metadata`).
 
 use crate::mcp::param_names;
 use crate::models::field_names;
@@ -335,8 +338,8 @@ pub(crate) fn handle_skill_promote_for_caller(
         "original_reflection_depth": reflection.reflection_depth,
         "promoted_by": caller,
         (super::skill_integrity::VISIBILITY_META_KEY): {
-            "scope": scope.as_str(),
-            "agent_id": caller,
+            (crate::META_KEY_SCOPE): scope.as_str(),
+            (crate::META_KEY_AGENT_ID): caller,
         },
     });
     // v0.9.0 §11.5 B7-SKILL (#1865) — mirror `parameters_schema` into the
@@ -412,7 +415,8 @@ pub(crate) fn handle_skill_promote_for_caller(
         "derived_from_reflection_id": outcome.reflection_id,
         "original_reflection_depth": outcome.reflection_depth,
         "sources_attached": outcome.sources_attached,
-        "signed": active_keypair.is_some(),
+        // #8834 — register_core signs only with a private key.
+        "signed": active_keypair.is_some_and(|kp| kp.private.is_some()),
         // v0.9.0 §11.5 B7-SKILL (#1865) — surface the version-chain
         // position (chain already existed via supersede-on-register).
         "version": outcome.version,

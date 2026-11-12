@@ -600,6 +600,9 @@ pub const TRANSCRIPTS: &str = "transcripts";
 pub const TRANSITIVE_COUNT: &str = "transitive_count";
 /// `transitive_suspects` — MCP/HTTP `memory_dependents_of_invalidated`.
 pub const TRANSITIVE_SUSPECTS: &str = "transitive_suspects";
+/// `truncated` — `memory_skill_list` response flag (#8834): the listing
+/// reached `SKILL_LIST_PAGE_LIMIT` and more rows matched.
+pub const TRUNCATED: &str = "truncated";
 /// `unread_only` — wire/row field name.
 pub const UNREAD_ONLY: &str = "unread_only";
 /// `unretired` — #2024 skill-retire lifecycle response flag (bool; the

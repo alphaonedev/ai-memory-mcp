@@ -370,9 +370,9 @@ mod tests {
         let allowed_tools_json = serde_json::to_string(&vec!["tool_a", "tool_b"]).unwrap();
         conn.execute(
             "INSERT INTO skills (id, namespace, name, description, license, compatibility, \
-                                  allowed_tools, metadata, body_blob, digest, signing_agent, \
+                                  allowed_tools, metadata, body_blob, digest, \
                                   created_at) \
-             VALUES (?1, 'ns', 'sk', 'D', 'MIT', 'v1', ?2, ?3, ?4, ?5, 'agent:alice', 0)",
+             VALUES (?1, 'ns', 'sk', 'D', 'MIT', 'v1', ?2, ?3, ?4, ?5, 0)",
             params![id, allowed_tools_json, metadata, body_blob, digest],
         )
         .unwrap();
@@ -381,7 +381,9 @@ mod tests {
         let v = handle_skill_get(&conn, &json!({"skill_id": id}), None).unwrap();
         assert_eq!(v["license"], json!("MIT"));
         assert_eq!(v["compatibility"], json!("v1"));
-        assert_eq!(v["signing_agent"], json!("agent:alice"));
+        // #8834: an unsigned row never carries a signer on the wire; the
+        // signed path is pinned in tests/skill_scope_integrity_8832_8834.rs.
+        assert!(v.get("signing_agent").is_none(), "{v}");
         assert_eq!(v["allowed_tools"], json!(["tool_a", "tool_b"]));
         assert_eq!(v["metadata"]["author"], json!("alice"));
         assert_eq!(v["metadata"]["version"], json!("1.0"));

@@ -857,11 +857,14 @@ pub use skill_export::{
     handle_skill_export_in_root,
 };
 pub use skill_get::handle_skill_get;
+// #8834 (code LOW 4) — test fixtures only; never in the release lib surface.
+#[cfg(any(test, feature = "test-support"))]
 pub use skill_integrity::reseal_skill_digest_for_tests;
-pub use skill_list::handle_skill_list;
+pub use skill_list::{SKILL_LIST_PAGE_LIMIT, handle_skill_list};
 pub(crate) use skill_promote::handle_skill_promote_for_caller;
 pub use skill_promote::handle_skill_promote_from_reflection;
 pub use skill_register::handle_skill_register;
+pub(crate) use skill_register::handle_skill_register_as;
 pub use skill_resource::handle_skill_resource;
 pub use skill_retire::{handle_skill_delete, handle_skill_retire};
 

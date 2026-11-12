@@ -514,6 +514,30 @@ pub mod msg {
         format!("{SKILL_INTEGRITY_FAILED}: signer public key unavailable for skill {skill_id}")
     }
 
+    /// v1.0.0 #8834 — a row names a signing agent but carries no signature
+    /// (a stripped signature or a self-asserted signer, never a signed row).
+    #[must_use]
+    pub fn skill_signature_missing(skill_id: impl std::fmt::Display) -> String {
+        format!(
+            "{SKILL_INTEGRITY_FAILED}: signing agent named without a signature for skill {skill_id}"
+        )
+    }
+
+    /// v1.0.0 #8832 — `memory_skill_register` refuses caller-supplied metadata
+    /// that carries a key in the substrate-reserved `_` namespace other than
+    /// the top-level scope binding (any other substrate-stamped state, or a
+    /// binding nested below the top level). The key itself is not echoed: it
+    /// is caller input.
+    pub const SKILL_RESERVED_METADATA_KEY: &str = "memory_skill_register refused: metadata carries a reserved key (keys beginning with '_' are stamped by the substrate, never supplied by the caller; only a top-level '_visibility' binding exported for the registering principal is accepted)";
+
+    /// v1.0.0 #8832 — the top-level `_visibility` binding is not exactly the
+    /// shape `memory_skill_promote_from_reflection` stamps.
+    pub const SKILL_VISIBILITY_BINDING_MALFORMED: &str = "memory_skill_register refused: metadata '_visibility' must be exactly {\"scope\": <private|team|unit|org|collective>, \"agent_id\": <registering principal>} with no other key";
+
+    /// v1.0.0 #8832 — the `_visibility` binding names a principal other than
+    /// the registering one. Names the remedy; never echoes either principal.
+    pub const SKILL_VISIBILITY_BINDING_FOREIGN: &str = "memory_skill_register refused: metadata '_visibility' is bound to a different principal; register it as the principal that promoted it, or promote the source reflection again on this node as yourself";
+
     /// `"pending action not found: {pending_id}"`.
     #[must_use]
     pub fn pending_action_not_found(pending_id: impl std::fmt::Display) -> String {
@@ -556,10 +580,21 @@ pub mod msg {
         format!("signature verify failed: {e}")
     }
 
+    /// Prefix shared by every stored-blob decode failure (`"zstd decompress "`).
+    /// #8834 — the HTTP skill read routes classify the family by this prefix
+    /// and never echo the rest (a resource variant names a stored path).
+    pub const ZSTD_DECOMPRESS_PREFIX: &str = "zstd decompress ";
+
     /// `"zstd decompress body: {e}"`.
     #[must_use]
     pub fn zstd_decompress_body(e: impl std::fmt::Display) -> String {
-        format!("zstd decompress body: {e}")
+        format!("{ZSTD_DECOMPRESS_PREFIX}body: {e}")
+    }
+
+    /// `"zstd decompress resource '{path}': {e}"`.
+    #[must_use]
+    pub fn zstd_decompress_resource(path: &str, e: impl std::fmt::Display) -> String {
+        format!("{ZSTD_DECOMPRESS_PREFIX}resource '{path}': {e}")
     }
 
     /// `"network: {e}"`.
