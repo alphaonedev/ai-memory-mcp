@@ -819,6 +819,8 @@ pub mod erasure;
 pub mod storage;
 /// #1927/#2444/#2679 — store-URL channel resolution + fail-closed postgres scheme guard.
 pub mod store_url;
+/// #4600 — the one-shot writer verbs' store-URL funnel (flag/channel conflict refusal).
+pub mod store_url_writer;
 /// v1.0.0 #3711 family — allowlist rendering of URLs (scheme / host / port /
 /// database) and the closed-vocabulary transport-failure class, for every
 /// log line, refusal, doctor fact and stored record that used to print a

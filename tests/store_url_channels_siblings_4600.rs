@@ -3,9 +3,11 @@
 
 //! #4600 sibling sweep (Class A, credential-argv): every subcommand that can
 //! open the SAL store honours the same store-URL channels `serve` does
-//! (`AI_MEMORY_STORE_URL_FILE` > `AI_MEMORY_STORE_URL` > `--store-url`,
-//! `src/store_url.rs` `resolve_store_url`) with the same refusal rules (a
-//! group/world-readable URL file is refused).
+//! (`AI_MEMORY_STORE_URL_FILE`, `AI_MEMORY_STORE_URL`, `--store-url`) with the
+//! same refusal rules (a group/world-readable URL file is refused). These
+//! one-shot writers resolve through `src/store_url_writer.rs` `resolve`:
+//! without a flag the shared ladder (FILE, then ENV); a `--store-url` that
+//! differs from a set channel is refused by channel name (PR #9175 r1).
 //!
 //! Siblings covered here: `quarantine` and `recover-previous-session`. On the
 //! carrier both matched on the raw `--store-url` flag only, so a Postgres URL
@@ -27,6 +29,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Output;
 
+use ai_memory::store_url_writer::ARGV_CREDENTIAL_WARNING;
 use recording_listener::RecordingListener;
 
 /// Obvious fixture password; must never be printed.
@@ -167,6 +170,16 @@ fn every_sibling_routes_every_channel_to_the_configured_store_4600() {
                 Channel::Flag => run(dir.path(), verb, &["--store-url", &url], &[]),
             };
             assert_routed_to_postgres(&out, &listener, &label);
+            // #4600 (r1 C-L1) — these verbs install no console tracing
+            // subscriber, so the argv-credential warning must reach stderr
+            // directly, and only when the URL actually sat on argv.
+            let warned = stderr(&out).contains(ARGV_CREDENTIAL_WARNING);
+            assert_eq!(
+                warned,
+                matches!(channel, Channel::Flag),
+                "#4600 {label}: argv-credential warning on stderr iff the flag carried the URL; stderr: {}",
+                stderr(&out)
+            );
         }
     }
 }
@@ -221,23 +234,63 @@ fn every_sibling_refuses_an_empty_store_url_file_4600() {
     }
 }
 
+/// #4600 (r1 C-M1 / S-L1) — a `--store-url` that differs from a set FILE or
+/// ENV channel is refused naming the channel only (never a URL); the same
+/// URL on both is accepted and routed. Replaces `file_channel_wins_over_a_flag_4600`,
+/// which pinned the silent override (a sqlite flag with a Postgres file reached Postgres).
 #[test]
-fn file_channel_wins_over_a_flag_4600() {
-    // Precedence parity with `serve`: FILE > ENV > flag. A sqlite flag with a
-    // Postgres file must reach Postgres.
+fn every_sibling_refuses_a_flag_that_differs_from_a_channel_4600() {
     for verb in VERBS {
-        let listener = RecordingListener::start(None);
-        let dir = scratch("precedence");
-        let f = write_url_file(dir.path(), &pg_url(&listener), 0o600);
-        let fs = f.to_string_lossy().into_owned();
-        let flag = format!("sqlite://{}", dir.path().join("flag.db").display());
-        let out = run(
-            dir.path(),
-            verb,
-            &["--store-url", &flag],
-            &[(STORE_URL_FILE_ENV, &fs)],
-        );
-        assert_routed_to_postgres(&out, &listener, &format!("{verb:?}/precedence"));
+        for channel in [Channel::File, Channel::Env] {
+            for same in [true, false] {
+                let listener = RecordingListener::start(None);
+                let dir = scratch("conflict");
+                let url = pg_url(&listener);
+                let label = format!("{verb:?}/{channel:?}/same={same}");
+                let flag = if same {
+                    url.clone()
+                } else {
+                    format!("sqlite://{}", dir.path().join("flag.db").display())
+                };
+                let (name, value) = match channel {
+                    Channel::File => {
+                        let f = write_url_file(dir.path(), &url, 0o600);
+                        (STORE_URL_FILE_ENV, f.to_string_lossy().into_owned())
+                    }
+                    _ => (STORE_URL_ENV, url.clone()),
+                };
+                let out = run(dir.path(), verb, &["--store-url", &flag], &[(name, &value)]);
+                if same {
+                    assert_routed_to_postgres(&out, &listener, &label);
+                    continue;
+                }
+                assert!(!out.status.success(), "#4600 {label}: must be refused");
+                let expected = format!(
+                    "refusing --store-url: it differs from the store URL set by {name}; pass the \
+                     same URL on both, or drop one of them, so the write cannot reach a store \
+                     you did not name (#4600)"
+                );
+                assert!(
+                    stderr(&out).contains(&expected),
+                    "#4600 {label}: exact conflict refusal; stderr: {}",
+                    stderr(&out)
+                );
+                assert!(
+                    !stderr(&out).contains("://"),
+                    "#4600 {label}: no URL in the refusal"
+                );
+                assert!(!stderr(&out).contains(FIXTURE_PASSWORD));
+                assert_eq!(
+                    listener.connections(),
+                    0,
+                    "#4600 {label}: refused before any dial"
+                );
+                assert!(
+                    !dir.path().join("flag.db").exists(),
+                    "#4600 {label}: flag store written"
+                );
+            }
+        }
     }
 }
 

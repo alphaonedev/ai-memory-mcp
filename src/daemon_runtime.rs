@@ -550,9 +550,10 @@ pub enum Command {
     /// v0.6.3.1 (P7 / R7): operator-visible health dashboard. Reads
     /// Capabilities v2 (P1) + data integrity surfaces (P2) + recall
     /// observability (P3). With `--remote <url>` becomes a fleet doctor
-    /// at T3+. Read-only — never mutates the database. Exits 0 on a
-    /// healthy report, 2 on critical findings, and 1 on warnings when
-    /// `--fail-on-warn` is passed.
+    /// at T3+. Never changes a memory, the schema or the file set; a probe
+    /// the inference-egress posture refuses appends one signed refusal row
+    /// (#4121). Exits 0 on a healthy report, 2 on critical findings, and 1
+    /// on warnings when `--fail-on-warn` is passed.
     Doctor(DoctorCliArgs),
     /// Issue #487: emit session-boot context. Universal primitive every
     /// AI-agent integration recipe (Claude Code SessionStart hook, Cursor /
@@ -1238,8 +1239,8 @@ async fn dispatch_recover_previous_session(
     // `app_config` only feeds the postgres store build, which is `sal`-only.
     #[cfg(not(feature = "sal"))]
     let _ = app_config;
-    // #4600 — the same channels as `serve` (FILE > ENV > flag, lax file refused).
-    let resolved = crate::store_url::resolve_store_url(a.store_url.as_deref())?;
+    // #4600 — FILE > ENV > flag; a flag that differs from a set channel is refused.
+    let resolved = crate::store_url_writer::resolve(a.store_url.as_deref())?;
     match resolved.as_deref().filter(|u| u.starts_with("postgres")) {
         Some(url) => {
             #[cfg(feature = "sal")]
@@ -2208,8 +2209,8 @@ pub async fn run(
             // routes through the SAL so the enterprise tier gets the SAME
             // verb, and the async store build happens BEFORE the stdout lock
             // is taken so no `!Send` guard is held across an `.await`.
-            // #4600 — the same channels as `serve` (FILE > ENV > flag).
-            let resolved = crate::store_url::resolve_store_url(a.store_url.as_deref())?;
+            // #4600 — FILE > ENV > flag; a flag that differs from a set channel is refused.
+            let resolved = crate::store_url_writer::resolve(a.store_url.as_deref())?;
             match resolved.as_deref().filter(|u| u.starts_with("postgres")) {
                 Some(url) => {
                     #[cfg(feature = "sal")]
