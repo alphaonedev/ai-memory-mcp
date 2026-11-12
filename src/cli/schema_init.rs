@@ -307,9 +307,9 @@ pub async fn run(
     // (vs the SQLite branch which has no column-level dim). For
     // SQLite we go through the standard `open_store` path which
     // triggers INIT_SCHEMA as a side effect.
-    // #4600 (CWE-214) — the non-argv channels `serve` has (FILE > ENV), and
-    // a `--store-url` that differs from a set channel is refused
-    // (`crate::store_url_writer::resolve`). Fail closed when no channel
+    // #4600 (CWE-214) — the non-argv channels `serve` has, and any two set
+    // channels (FILE, ENV, `--store-url`) that differ are refused before any
+    // connection (`crate::store_url_writer::resolve`). Fail closed when no channel
     // supplies a URL; the message names no URL, so no credential can reach it.
     let store_url =
         crate::store_url_writer::resolve(args.store_url.as_deref())?.ok_or_else(|| {

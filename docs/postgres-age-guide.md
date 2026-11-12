@@ -334,7 +334,7 @@ way to bootstrap a fresh postgres backend:
 AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url ai-memory schema-init
 ```
 
-`schema-init` reads its URL from `AI_MEMORY_STORE_URL_FILE` (a `0600` file) first, then `AI_MEMORY_STORE_URL`, then `--store-url`; a `--store-url` that differs from a set file or env channel is refused by channel name instead of being silently overridden (`src/store_url_writer.rs::resolve`, over `src/store_url.rs::resolve_store_url`), so the password never has to be on argv ([#4600](https://github.com/alphaonedev/ai-memory-mcp/issues/4600)); `migrate` takes each side from `--from` / `--to` or from `--from-url-file` / `--to-url-file` (a `0600` file; it never reads the store-url env channels), so a Postgres password stays off argv there too.
+`schema-init` reads its URL from `AI_MEMORY_STORE_URL_FILE` (a `0600` file) first, then `AI_MEMORY_STORE_URL`, then `--store-url`; any two set channels (file, env, `--store-url`) that name different stores are refused by channel name before any connection, instead of one being silently picked (`src/store_url_writer.rs::resolve`, over `src/store_url.rs::resolve_store_url`), so the password never has to be on argv ([#4600](https://github.com/alphaonedev/ai-memory-mcp/issues/4600)); `migrate` takes each side from `--from` / `--to` or from `--from-url-file` / `--to-url-file` (a `0600` file; it never reads the store-url env channels), so a Postgres password stays off argv there too.
 
 Since v1.0.0 (#3705, "only encrypted data in transit") every DSN the
 daemon or CLI opens MUST pin `sslmode=verify-full&sslrootcert=<ca>`; a DSN

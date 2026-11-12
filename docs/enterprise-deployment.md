@@ -476,7 +476,7 @@ Bootstrap a fresh postgres backend with:
 AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url ai-memory schema-init
 ```
 
-`schema-init` reads its URL from `AI_MEMORY_STORE_URL_FILE` (a `0600` file) first, then `AI_MEMORY_STORE_URL`, then `--store-url`; a `--store-url` that differs from a set file or env channel is refused by channel name instead of being silently overridden (`src/store_url_writer.rs::resolve`, over `src/store_url.rs::resolve_store_url`), so keep the password off argv and use the file form shown above ([#4600](https://github.com/alphaonedev/ai-memory-mcp/issues/4600)).
+`schema-init` reads its URL from `AI_MEMORY_STORE_URL_FILE` (a `0600` file) first, then `AI_MEMORY_STORE_URL`, then `--store-url`; any two set channels (file, env, `--store-url`) that name different stores are refused by channel name before any connection, instead of one being silently picked (`src/store_url_writer.rs::resolve`, over `src/store_url.rs::resolve_store_url`), so keep the password off argv and use the file form shown above ([#4600](https://github.com/alphaonedev/ai-memory-mcp/issues/4600)).
 
 Opening the store runs the idempotent `postgres_schema.sql` bootstrap
 plus the in-process upgrade ladder to schema v91 as a side effect. The

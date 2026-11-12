@@ -49,15 +49,28 @@ supplements `--help` with examples and context.
 | `AI_MEMORY_EMBED_MODEL` | #1598 — embedding model id (e.g. `google/gemini-embedding-001`). Dim resolves from `KNOWN_EMBEDDING_DIMS`; set `[embeddings].dim` (env `AI_MEMORY_EMBED_DIM`) for models outside the table or to pin a Matryoshka model to the `dim = 768` fleet width (#2626). |
 | `AI_MEMORY_EMBED_API_KEY` | #1598 — **secret.** Bearer key for API embedding backends; highest-precedence layer over the per-vendor alias env, `[embeddings].api_key_env`, and `[embeddings].api_key_file` (0400 enforced). |
 | `AI_MEMORY_STORE_URL` | #1927 — **secret.** Non-argv channel for the `serve --store-url` connection URL (e.g. `postgres://user:pass@host/db`), read from the owner-only environment instead of argv so a userinfo password is not exposed via `/proc/<pid>/cmdline` or `ps auxww`. |
-| `AI_MEMORY_STORE_URL_FILE` | #1927 — **secret.** Path to a `0600`-enforced file holding the `--store-url` connection URL; takes precedence over `AI_MEMORY_STORE_URL`, which in turn takes precedence over the CLI arg; on `schema-init`, `quarantine` and `recover-previous-session` a differing `--store-url` is refused instead (#4600). |
+| `AI_MEMORY_STORE_URL_FILE` | #1927 — **secret.** Path to a `0600`-enforced file holding the `--store-url` connection URL; takes precedence over `AI_MEMORY_STORE_URL`, which in turn takes precedence over the CLI arg; on `schema-init`, `quarantine` and `recover-previous-session` any two set channels that differ are refused instead (#4600; table below). |
 | `RUST_LOG` | Tracing filter, e.g. `RUST_LOG=ai_memory=debug`. (Standard Rust ecosystem env, not product-specific.) |
 
 Most scalar settings use **CLI flag > `AI_MEMORY_*` env var > config
-file > compiled default**; check the setting's resolver contract. Store
-URL uses `AI_MEMORY_STORE_URL_FILE` > `AI_MEMORY_STORE_URL` > `--store-url`
-for `serve` and the other daemon verbs; the one-shot writers `schema-init`,
-`quarantine` and `recover-previous-session` refuse a `--store-url` that differs
-from a set channel instead of overriding it (#4600).
+file > compiled default**; check the setting's resolver contract. The store
+URL has three behaviours under `AI_MEMORY_STORE_URL_FILE`,
+`AI_MEMORY_STORE_URL` and `--store-url` (#4600, 3-agent vote 71472661):
+
+| Verbs | Behaviour |
+|---|---|
+| `migrate` | Reads neither env channel. Each side takes `--from` / `--to` or `--from-url-file` / `--to-url-file` (a `0600` file); both or neither fails at parse time. |
+| One-shot writers: `schema-init`, `quarantine`, `recover-previous-session` | Every set channel must name the same store, byte for byte (only the file's trailing newline is trimmed; no URL normalisation). Any two set channels that differ, the flag included or not, are refused before any connection with `` refusing to open a store: <CHANNEL> and <CHANNEL> name different stores (#4600); unset the channel you do not mean, for example `env -u AI_MEMORY_STORE_URL ...`, and run again ``. A set file that is unreadable, lax or empty is refused and never falls through; an empty env value is unset. |
+| `serve`, the other daemon verbs and the read verbs | `AI_MEMORY_STORE_URL_FILE` > `AI_MEMORY_STORE_URL` > `--store-url`: the first set channel wins (one order for all callers is tracked in #9202). |
+
+Runbook: on a host whose service unit exports `AI_MEMORY_STORE_URL_FILE`
+or `AI_MEMORY_STORE_URL`, run `quarantine` / `recover-previous-session`
+with that same channel and no other (no `--store-url`, no second variable);
+if the shell exports a channel you do not mean, drop it for the one command
+with `env -u AI_MEMORY_STORE_URL ...` (or `env -u AI_MEMORY_STORE_URL_FILE ...`).
+There is no override flag.
+
+
 Application content encryption is enabled by a true config/seed OR a
 truthy `AI_MEMORY_ENCRYPT_AT_REST` value; a falsy env value does not
 override an enabled config. Removed downgrade controls and explicit

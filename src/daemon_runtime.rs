@@ -1239,7 +1239,8 @@ async fn dispatch_recover_previous_session(
     // `app_config` only feeds the postgres store build, which is `sal`-only.
     #[cfg(not(feature = "sal"))]
     let _ = app_config;
-    // #4600 — FILE > ENV > flag; a flag that differs from a set channel is refused.
+    // #4600 — any two set channels (FILE, ENV, flag) that differ are refused
+    // here, before any store is built or connection opened (vote 71472661).
     let resolved = crate::store_url_writer::resolve(a.store_url.as_deref())?;
     match resolved.as_deref().filter(|u| u.starts_with("postgres")) {
         Some(url) => {
@@ -2209,7 +2210,8 @@ pub async fn run(
             // routes through the SAL so the enterprise tier gets the SAME
             // verb, and the async store build happens BEFORE the stdout lock
             // is taken so no `!Send` guard is held across an `.await`.
-            // #4600 — FILE > ENV > flag; a flag that differs from a set channel is refused.
+            // #4600 — any two set channels (FILE, ENV, flag) that differ are refused
+            // here, before any store is built or connection opened (vote 71472661).
             let resolved = crate::store_url_writer::resolve(a.store_url.as_deref())?;
             match resolved.as_deref().filter(|u| u.starts_with("postgres")) {
                 Some(url) => {
