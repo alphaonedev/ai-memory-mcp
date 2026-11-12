@@ -174,11 +174,16 @@ async fn unimplemented_default_arms_refuse_naming_their_capability() {
         "REOWN",
     );
     refused(s.size_gc("ns", 1_024, false).await, "SIZE_GC");
-    // #9140 — an adapter that cannot make the shared nonce claim refuses, so
-    // the caller treats the push as a replay (never as fresh).
+    // #9140 / #9192 — an adapter that cannot make the nonce claim refuses, so
+    // the caller fails closed (503 `nonce_store_unavailable`, never fresh).
+    let nonce_key = ai_memory::identity::replay::NonceClaimKey::for_verifying_key(
+        &[0_u8; 32],
+        "ai:peer-9140",
+        "nonce-3521-0000000000000000",
+    )
+    .expect("nonce key in bounds");
     refused(
-        s.federation_nonce_claim("ai:peer-9140", &[0_u8; 32], 1)
-            .await,
+        s.federation_nonce_claim(&nonce_key).await,
         "FEDERATION_NONCE_CLAIM",
     );
     refused(s.delete_link(&ctx, "a", "b").await, "DELETE_LINK");

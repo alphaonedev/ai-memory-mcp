@@ -1179,6 +1179,41 @@ What this means for an operator:
   postgres receiver does not carry a second implementation that could
   drift from the sqlite one.
 
+### Federation nonce claims (`federation_nonce_claims`, v103, #9192)
+
+A signed federation request (`POST /sync/push` and the signed
+`GET /sync/since`) carries an `X-Memory-Nonce` with no timestamp, so the
+receiver refuses a nonce for as long as the signing key lives. Each accepted
+`(signing key, nonce)` pair is one row in `federation_nonce_claims`
+(`key_fp BYTEA, nonce_fp BYTEA, accepted_at TIMESTAMPTZ`, PRIMARY KEY
+`(key_fp, nonce_fp)`). One `INSERT ... ON CONFLICT DO NOTHING` per request,
+committed in its own transaction, decides it: one row inserted is fresh, zero
+rows is a replay (401 `x_memory_nonce_replay`). Every daemon over the same
+database shares the table, so a sibling daemon refuses a nonce the other one
+accepted. The in-process cache in front of it never decides alone.
+
+- **Rows are never pruned.** Size the database for one row per accepted
+  signed request: about 235 bytes per row on PostgreSQL 18, heap plus
+  PRIMARY KEY index (`pg_total_relation_size`, measured at 100 000 rows by
+  `tests/federation_nonce_claims_9192.rs`). A peer that polls
+  `GET /sync/since` at the default 30 s catch-up interval adds 2 880 rows a
+  day.
+- **Outage behaviour.** If the claim cannot be made or its COMMIT fails, the
+  receiver answers **503** `{"error":"nonce_store_unavailable"}`, admits
+  nothing and increments
+  `ai_memory_federation_nonce_store_unavailable_total`. The sender retries
+  with a fresh nonce.
+- **Durability.** A claim is as durable as the server's
+  `synchronous_commit` (default `on`). With `synchronous_commit = off` a
+  server crash can lose the most recent claims, and those nonces become
+  acceptable once more.
+- **Residuals.** Claims belong to one receiver database: restoring a backup
+  forgets the claims made after it, and a request captured on its way to one
+  receiver can be replayed to a different receiver that never saw it.
+- The pre-v103 PostgreSQL `federation_nonce_cache` table is not created any
+  more. A PostgreSQL database never held v51 nonce rows (v51 is a no-op stamp
+  on this backend).
+
 ## Performance notes
 
 ### pgvector HNSW

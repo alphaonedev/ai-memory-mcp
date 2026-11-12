@@ -2404,7 +2404,7 @@ async fn sync_push_write(
         &headers,
         &body_bytes,
         peer_header_owned.as_deref(),
-        &app.federation_nonce_cache,
+        &super::federation_signing_check::NonceAuthority::for_app(&app),
     )
     .await
     {
@@ -4322,27 +4322,24 @@ async fn sync_push_write(
                 // nonce is signed (tamper-evident) but was never recorded, so a
                 // captured signed transition re-wrapped in a FRESH outer
                 // envelope replays through CAS on a cyclic/ABA edge (CAS is
-                // causal ordering, not anti-replay). Record it in the per-peer
-                // nonce cache (the #30 envelope-nonce store) and refuse a
+                // causal ordering, not anti-replay). Claim it durably under the
+                // verifying key (#9192, the envelope-nonce store) and refuse a
                 // repeat. Rides the #1718 / 4d3ea1c5 fail-closed posture; an
                 // empty nonce = unsigned op (heterogeneous rollout) → not gated.
                 if !op.nonce.is_empty() {
-                    use base64::Engine as _;
-                    let nstr = base64::engine::general_purpose::STANDARD.encode(&op.nonce);
-                    if matches!(
-                        app.federation_nonce_cache
-                            .record_and_check_shared(
-                                peer_header_owned.as_deref().unwrap_or(""),
-                                &nstr
-                            )
-                            .await,
-                        crate::identity::replay::ReplayDecision::Replay
+                    // #9192 — claimed synchronously through the held `app.db`
+                    // handle (the sqlite nonce store), never a second lock.
+                    let decision = super::federation_signing_check::transition_nonce_key(
+                        &op.nonce,
+                        &op.signature,
+                        enrolled.as_ref(),
+                        peer_header_owned.as_deref().unwrap_or(""),
+                    )
+                    .map(|key| app.federation_nonce_cache.check_with_conn(&lock.0, &key));
+                    if super::federation_signing_check::transition_nonce_refused(
+                        decision,
+                        &op.action_id,
                     ) {
-                        tracing::warn!(
-                            target: crate::federation::SIGNING_TRACE_TARGET,
-                            action_id = %op.action_id,
-                            "sync_push: replayed action-transition nonce refused (#1805)"
-                        );
                         skipped += 1;
                         continue;
                     }

@@ -142,6 +142,9 @@ pub enum VerifyError {
     ReplayedNonce,
     /// v0.7.0 #922 — `X-Memory-Nonce` header absent under strict mode.
     NonceMissing,
+    /// #9192 — `X-Memory-Nonce` longer than
+    /// [`crate::identity::replay::FEDERATION_NONCE_MAX_BYTES`].
+    NonceOversize,
 }
 
 impl VerifyError {
@@ -155,6 +158,7 @@ impl VerifyError {
             Self::BadSignature => "x_memory_sig_bad_signature",
             Self::ReplayedNonce => "x_memory_nonce_replay",
             Self::NonceMissing => "x_memory_nonce_missing",
+            Self::NonceOversize => "x_memory_nonce_oversize",
         }
     }
 }

@@ -2389,33 +2389,32 @@ pub trait MemoryStore: Send + Sync {
         })
     }
 
-    /// #9140 — claim one federation nonce fingerprint for `peer_id` in the
-    /// SHARED store: `Ok(true)` when this call inserted it (the nonce is
-    /// fresh for EVERY daemon over this store), `Ok(false)` when a row
-    /// already existed (a sibling daemon, or this one, accepted it: replay).
+    /// #9192 (C2 + C3) — claim one verified federation nonce in the DURABLE
+    /// store every daemon over this backend shares: `Ok(Claimed)` when this
+    /// call inserted the row (the nonce is fresh for every daemon),
+    /// `Ok(AlreadyClaimed)` when a row already existed (a replay), and `Err`
+    /// when the store could not decide (the caller answers 503; nothing is
+    /// admitted).
     ///
-    /// Federation nonces carry no freshness window, so unlike
-    /// [`Self::admit_attested_write`] the claim is NEVER time-pruned; the
-    /// adapter keeps the newest `per_peer_cap` rows per peer (the same bound
-    /// as the in-memory [`crate::identity::replay::FederationNonceCache`]).
-    /// The decision MUST be the engine's uniqueness constraint (one
-    /// `INSERT ... ON CONFLICT DO NOTHING` on `(peer_id, fingerprint)`),
-    /// never a check-then-act read.
+    /// Claims live for the signing key's lifetime (Ruling R, vote 71472661):
+    /// there is no prune, no cap and no delete. The decision MUST be the
+    /// engine's uniqueness constraint (one `INSERT ... ON CONFLICT DO
+    /// NOTHING` on `(key_fp, nonce_fp)`, committed before `Ok`), never a
+    /// check-then-act read. A hit in the read-only legacy v51 table is
+    /// `AlreadyClaimed` (sqlite only; the PostgreSQL v51 table never shipped).
     ///
-    /// The default REFUSES: a backend without the shared claim cannot tell a
-    /// sibling's replay from a fresh push, and callers treat any error as a
-    /// replay (fail closed). It must never be softened to `Ok(true)`.
+    /// The default REFUSES: a backend without the durable claim cannot tell a
+    /// sibling's replay from a fresh request. It must never be softened to
+    /// `Ok(Claimed)`.
     ///
     /// # Errors
     ///
     /// [`StoreError::UnsupportedCapability`] by default; adapters propagate
-    /// their backend error. Callers MUST refuse the request on any error.
+    /// their backend error, including a failed commit.
     async fn federation_nonce_claim(
         &self,
-        _peer_id: &str,
-        _fingerprint: &[u8; 32],
-        _per_peer_cap: usize,
-    ) -> StoreResult<bool> {
+        _key: &crate::identity::replay::NonceClaimKey,
+    ) -> StoreResult<crate::identity::replay::NonceClaim> {
         Err(StoreError::UnsupportedCapability {
             capability: FEDERATION_NONCE_CLAIM_CAPABILITY.to_string(),
         })

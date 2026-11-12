@@ -7622,17 +7622,11 @@ pub async fn bootstrap_serve(
         // operators opt into strict mode via `config.toml`.
         replay_cache: Arc::new(crate::identity::replay::ReplayCache::new()),
         verify_require_nonce: app_config.verify.as_ref().is_some_and(|v| v.require_nonce),
-        // #1255 / #9140 — the federation nonce cache claims every nonce in the
-        // store shared with sibling daemons (PostgreSQL) or in the sqlite file,
-        // fail closed: a failed claim is a replay, with no in-memory fallback.
-        federation_nonce_cache: Arc::new(
-            crate::identity::replay::FederationNonceCache::for_daemon(
-                db_path,
-                #[cfg(feature = "sal")]
-                matches!(storage_backend, crate::handlers::StorageBackend::Postgres)
-                    .then_some(store_handle),
-            ),
-        ),
+        // #9192 — a bounded hit cache only. The durable claim runs at each
+        // call site against the store the request uses (`app.store` on
+        // PostgreSQL, `app.db` on sqlite), so a nonce is admitted at most once
+        // per store; a store failure is 503 `nonce_store_unavailable`.
+        federation_nonce_cache: Arc::new(crate::identity::replay::FederationNonceCache::new()),
         // v0.7.0 (issue #519) — resolved autonomous_hooks flag for the
         // HTTP create_memory path's proactive conflict-detection
         // helper. Falls back to false when unset (preserves v0.6.x

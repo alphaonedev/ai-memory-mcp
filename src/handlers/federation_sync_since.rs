@@ -162,7 +162,7 @@ pub async fn sync_since(
         original_uri.query().unwrap_or(""),
         &headers,
         peer_header_for_sig.as_deref(),
-        &app.federation_nonce_cache,
+        &super::federation_signing_check::NonceAuthority::for_app(&app),
     )
     .await
     {

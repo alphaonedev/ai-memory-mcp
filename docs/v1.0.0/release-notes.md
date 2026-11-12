@@ -745,7 +745,16 @@ backup before upgrading across v97.** **v100 replaces the
 `(title, namespace)` unique index with a partial index** (index-only).
 v101 (#8444) adds the `a2a_tasks` table and v103 (#9187) the
 `federation_nonce_claims` table, both additive `CREATE TABLE IF NOT EXISTS`
-with no backfill.
+with no backfill. `federation_nonce_claims` grows by one row per accepted
+signed push and per signed `GET /sync/since` and is never pruned (#9192):
+about 162 bytes per row on SQLite and 235 bytes per row on
+PostgreSQL, PRIMARY KEY index included (measured at 100 000 rows); a peer
+polling at the default 30 s catch-up interval adds 2 880 rows a day. The
+claims are per receiver store, so a database restore forgets the claims made
+after the backup, and a request captured on its way to one receiver can be
+replayed to another receiver that never saw it. When the store cannot record
+a claim the receiver answers 503 `nonce_store_unavailable` and admits
+nothing.
 The v86 and v87 rungs are
 instant/value-preserving, idempotent, and fail-safe on an unparseable
 value (left byte-untouched rather than destroyed), but they are row

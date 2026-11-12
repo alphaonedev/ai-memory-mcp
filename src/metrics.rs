@@ -325,6 +325,10 @@ pub struct Metrics {
     /// cross-process `forensic.lock` (it could not be opened or locked).
     pub forensic_lock_unavailable: IntCounter,
 
+    /// #9192 (C3) - monotonic count of federation nonce claims refused because
+    /// the authoritative claims store could not answer (503, nothing admitted).
+    pub federation_nonce_store_unavailable: IntCounter,
+
     /// #7281 (ERRORS-19) - monotonic count of audit anchors dropped unrecorded
     /// because their append ran in a raw transaction with no `WriteTxn` frame.
     /// Under-emission only, never a false verdict; non-zero names a caller
@@ -1136,6 +1140,16 @@ impl Metrics {
             &mut err,
         );
 
+        // #9192 (C3) - a federation nonce claim the store could not decide.
+        let federation_nonce_store_unavailable = int_counter(
+            &registry,
+            "ai_memory_federation_nonce_store_unavailable_total",
+            "Monotonic count of signed federation requests refused with 503 \
+             nonce_store_unavailable because the nonce claims store could not \
+             answer; nothing was admitted or cached (#9192).",
+            &mut err,
+        );
+
         let audit_anchor_frameless_drop = int_counter(
             &registry,
             "ai_memory_audit_anchor_frameless_drop_total",
@@ -1599,6 +1613,7 @@ impl Metrics {
             federation_quarantined_unattributed,
             forensic_sink_unavailable,
             forensic_lock_unavailable,
+            federation_nonce_store_unavailable,
             audit_anchor_frameless_drop,
             federation_cross_id_title_merge,
             operator_dequarantined,
@@ -1772,6 +1787,17 @@ pub fn inc_forensic_sink_unavailable() {
 /// v1.0.0 #4304 — a forensic append ran without the cross-process lock.
 pub fn inc_forensic_lock_unavailable() {
     registry().forensic_lock_unavailable.inc();
+}
+
+/// #9192 (C3) - record one federation nonce claim the store could not decide.
+pub fn inc_federation_nonce_store_unavailable() {
+    registry().federation_nonce_store_unavailable.inc();
+}
+
+/// #9192 (C3) - read [`inc_federation_nonce_store_unavailable`]'s counter.
+#[must_use]
+pub fn federation_nonce_store_unavailable_count() -> u64 {
+    registry().federation_nonce_store_unavailable.get()
 }
 
 /// #7281 - an audit anchor was dropped unrecorded (frameless raw transaction).

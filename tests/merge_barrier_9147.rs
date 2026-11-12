@@ -432,11 +432,34 @@ async fn sqlite_federated_deletion_is_a_restore_barrier_9147() {
 
 /// Nonces each #9140 cell records (several, so one lucky ordering cannot pass).
 const NONCE_CELLS: usize = 16;
+/// Distinct peers (verifying keys) the #9140 cells rotate over.
+const NONCE_PEERS: usize = 3;
+/// Seed of the #9140 cell nonces (#9192 item 9: deterministic, never random).
+const NONCE_SEED_9140: &str = "nonce-9140";
 
-/// #9140 — the federation nonce cache is a STORE-scoped replay barrier: two
-/// daemons over the same store (two `FederationNonceCache` instances on one
-/// sqlite path, each with its own in-memory map) must not both accept the
-/// same `(peer, nonce)`. Table-driven over which instance records first.
+/// Deterministic nonce `i` of `seed` (#9192 item 9).
+fn test_nonce(seed: &str, i: u64) -> String {
+    format!("{seed}-{i:016x}")
+}
+
+/// The claim key of cell `cell`: peer `cell % NONCE_PEERS`, its own key bytes.
+fn cell_key(backend: &str, cell: usize) -> ai_memory::identity::replay::NonceClaimKey {
+    let peer = cell % NONCE_PEERS;
+    let key_bytes = [u8::try_from(peer).expect("peer index fits u8"); 32];
+    let seed = format!("{NONCE_SEED_9140}-{backend}");
+    ai_memory::identity::replay::NonceClaimKey::for_verifying_key(
+        &key_bytes,
+        &format!("ai:peer-9140-{peer}"),
+        &test_nonce(&seed, u64::try_from(cell).expect("cell index fits u64")),
+    )
+    .expect("cell nonce is in bounds")
+}
+
+/// #9140 / #9192 — the federation nonce claim is a STORE-scoped replay
+/// barrier: two daemons over the same sqlite file (two connections, two
+/// caches) must not both accept the same `(key, nonce)`, and a third daemon
+/// started later (a restart) must refuse it too. Table-driven over which
+/// daemon records first.
 #[test]
 fn sqlite_nonce_replay_is_store_scoped_9140() {
     use ai_memory::identity::replay::{FederationNonceCache, ReplayDecision};
@@ -447,70 +470,79 @@ fn sqlite_nonce_replay_is_store_scoped_9140() {
         .tempdir_in(&scratch)
         .expect("scratch dir");
     let path = dir.path().join("ai-memory.db");
-    let daemon_a = FederationNonceCache::new_with_db_persistence(&path).expect("daemon a cache");
-    let daemon_b = FederationNonceCache::new_with_db_persistence(&path).expect("daemon b cache");
+    let conn_a = ai_memory::db::open(&path).expect("daemon a connection");
+    let conn_b = ai_memory::db::open(&path).expect("daemon b connection");
+    let (daemon_a, daemon_b) = (FederationNonceCache::new(), FederationNonceCache::new());
     for cell in 0..NONCE_CELLS {
-        let peer = format!("ai:peer-9140-{}", cell % 3);
-        let nonce = uuid::Uuid::new_v4().to_string();
-        let (first, second) = if cell % 2 == 0 {
-            (&daemon_a, &daemon_b)
+        let key = cell_key("sqlite-conn", cell);
+        let ((first, first_conn), (second, second_conn)) = if cell % 2 == 0 {
+            ((&daemon_a, &conn_a), (&daemon_b, &conn_b))
         } else {
-            (&daemon_b, &daemon_a)
+            ((&daemon_b, &conn_b), (&daemon_a, &conn_a))
         };
         assert_eq!(
-            first.record_and_check(&peer, &nonce),
+            first.check_with_conn(first_conn, &key),
             ReplayDecision::Fresh,
             "cell {cell}: first sight of a nonce is fresh"
         );
         assert_eq!(
-            second.record_and_check(&peer, &nonce),
+            second.check_with_conn(second_conn, &key),
             ReplayDecision::Replay,
             "cell {cell}: a second daemon on the same store accepted a captured push (#9140)"
         );
         assert_eq!(
-            first.record_and_check(&peer, &nonce),
+            first.check_with_conn(first_conn, &key),
             ReplayDecision::Replay,
             "cell {cell}: the recording daemon must still see its own replay"
         );
     }
+    let restarted = FederationNonceCache::new();
+    let conn_c = ai_memory::db::open(&path).expect("restarted daemon connection");
+    for cell in 0..NONCE_CELLS {
+        assert_eq!(
+            restarted.check_with_conn(&conn_c, &cell_key("sqlite-conn", cell)),
+            ReplayDecision::Replay,
+            "cell {cell}: a restarted daemon admitted an accepted nonce (#9192)"
+        );
+    }
 }
 
-/// #9140 — the shared-claim half of the cells: two caches that claim through
-/// the SAL store (two daemons over one store, each with its own memory).
-async fn shared_nonce_cells(
-    daemon_a: &ai_memory::identity::replay::FederationNonceCache,
-    daemon_b: &ai_memory::identity::replay::FederationNonceCache,
-    backend: &str,
-) {
-    use ai_memory::identity::replay::ReplayDecision;
+/// #9140 / #9192 — the shared-claim half of the cells: two caches that claim
+/// through the SAL store (two daemons over one store, each with its own
+/// memory), then a fresh cache over the first store (a restart).
+async fn shared_nonce_cells(store_a: &dyn MemoryStore, store_b: &dyn MemoryStore, backend: &str) {
+    use ai_memory::identity::replay::{FederationNonceCache, ReplayDecision};
+    let (daemon_a, daemon_b) = (FederationNonceCache::new(), FederationNonceCache::new());
+    let seed = format!("{backend}-{}", uuid::Uuid::new_v4().simple());
     for cell in 0..NONCE_CELLS {
-        let peer = format!("ai:peer-9140-{backend}-{}", cell % 3);
-        let nonce = uuid::Uuid::new_v4().to_string();
-        let (first, second) = if cell % 2 == 0 {
-            (daemon_a, daemon_b)
+        let key = cell_key(&seed, cell);
+        let ((first, first_store), (second, second_store)) = if cell % 2 == 0 {
+            ((&daemon_a, store_a), (&daemon_b, store_b))
         } else {
-            (daemon_b, daemon_a)
+            ((&daemon_b, store_b), (&daemon_a, store_a))
         };
         assert_eq!(
-            first.record_and_check_shared(&peer, &nonce).await,
+            first.check_store(first_store, &key).await,
             ReplayDecision::Fresh,
             "{backend} cell {cell}: first sight of a nonce is fresh"
         );
         assert_eq!(
-            second.record_and_check_shared(&peer, &nonce).await,
+            second.check_store(second_store, &key).await,
             ReplayDecision::Replay,
             "{backend} cell {cell}: a sibling daemon accepted a captured push (#9140)"
         );
         assert_eq!(
-            first.record_and_check_shared(&peer, &nonce).await,
+            first.check_store(first_store, &key).await,
             ReplayDecision::Replay,
             "{backend} cell {cell}: the recording daemon must still see its own replay"
         );
-        // The synchronous check cannot consult the shared store: it refuses.
+    }
+    let restarted = FederationNonceCache::new();
+    for cell in 0..NONCE_CELLS {
         assert_eq!(
-            first.record_and_check(&peer, &uuid::Uuid::new_v4().to_string()),
+            restarted.check_store(store_a, &cell_key(&seed, cell)).await,
             ReplayDecision::Replay,
-            "{backend} cell {cell}: a sync check on a store-claimed cache must fail closed"
+            "{backend} cell {cell}: a restarted daemon admitted an accepted nonce (#9192)"
         );
     }
 }
@@ -518,7 +550,6 @@ async fn shared_nonce_cells(
 /// #9140 — the SAL claim on the sqlite adapter (two caches over one store).
 #[tokio::test]
 async fn sqlite_store_claimed_nonce_replay_is_store_scoped_9140() {
-    use ai_memory::identity::replay::FederationNonceCache;
     let (_dir, store_a, view) = sqlite_store();
     // Irrefutable without `sal-postgres` (sqlite is then the only variant).
     #[cfg_attr(not(feature = "sal-postgres"), allow(irrefutable_let_patterns))]
@@ -528,9 +559,7 @@ async fn sqlite_store_claimed_nonce_replay_is_store_scoped_9140() {
     // A second adapter on the same file: a sibling daemon of the same store.
     let store_b: Arc<dyn MemoryStore> =
         Arc::new(ai_memory::store::sqlite::SqliteStore::open(path).expect("open sibling store"));
-    let daemon_a = FederationNonceCache::new_store_claimed(store_a);
-    let daemon_b = FederationNonceCache::new_store_claimed(store_b);
-    shared_nonce_cells(&daemon_a, &daemon_b, "sqlite").await;
+    shared_nonce_cells(store_a.as_ref(), store_b.as_ref(), "sqlite").await;
 }
 
 #[cfg(feature = "sal-postgres")]
@@ -584,7 +613,6 @@ async fn postgres_federated_deletion_is_a_restore_barrier_9147() {
 #[cfg(feature = "sal-postgres")]
 #[tokio::test]
 async fn postgres_nonce_replay_is_store_scoped_9140() {
-    use ai_memory::identity::replay::FederationNonceCache;
     let Some((store_a, _view_a)) = pg_store().await else {
         eprintln!("SKIP: AI_MEMORY_TEST_POSTGRES_URL unset");
         return;
@@ -593,7 +621,5 @@ async fn postgres_nonce_replay_is_store_scoped_9140() {
         eprintln!("SKIP: AI_MEMORY_TEST_POSTGRES_URL unset");
         return;
     };
-    let daemon_a = FederationNonceCache::new_store_claimed(store_a);
-    let daemon_b = FederationNonceCache::new_store_claimed(store_b);
-    shared_nonce_cells(&daemon_a, &daemon_b, "postgres").await;
+    shared_nonce_cells(store_a.as_ref(), store_b.as_ref(), "postgres").await;
 }

@@ -1605,21 +1605,6 @@ CREATE TABLE IF NOT EXISTS attested_write_ledger (
 CREATE INDEX IF NOT EXISTS idx_attested_write_ledger_seen_at
     ON attested_write_ledger(seen_at);
 
--- #9140 (v1.0.0) — SUPERSEDED by `federation_nonce_claims` (v103, below);
--- removed in the C3 commit of #9187, which moves the claim onto the new table.
--- Until then every daemon over this store claims each verified push's
--- (peer_id, nonce) fingerprint here (one INSERT ... ON CONFLICT DO NOTHING on
--- the PRIMARY KEY); `seq` orders the per-peer bound.
-CREATE TABLE IF NOT EXISTS federation_nonce_cache (
-    peer_id     TEXT        NOT NULL,
-    fingerprint BYTEA       NOT NULL,
-    seq         BIGSERIAL   NOT NULL,
-    claimed_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (peer_id, fingerprint)
-);
-CREATE INDEX IF NOT EXISTS idx_federation_nonce_cache_peer_seq
-    ON federation_nonce_cache(peer_id, seq);
-
 -- v103 (#9187, v1.0.0) — FEDERATION NONCE CLAIMS. Shape: key_fp BYTEA (the
 -- push's signing-key fingerprint), nonce_fp BYTEA (its nonce fingerprint),
 -- accepted_at TIMESTAMPTZ, PRIMARY KEY (key_fp, nonce_fp). The PRIMARY KEY is
