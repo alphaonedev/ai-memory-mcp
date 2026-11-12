@@ -862,7 +862,7 @@ mod tests {
     fn finalize_detail_hides_backend_text_8741() {
         let backend = crate::store::StoreError::BackendUnavailable {
             backend: "postgres".to_string(),
-            detail: "connection refused at 10.0.0.9:5432".to_string(),
+            detail: "connection refused at db.example.invalid:5432".to_string(),
             sqlstate: None,
         };
         assert_eq!(
