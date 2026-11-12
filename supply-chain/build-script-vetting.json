@@ -371,7 +371,7 @@
       "source": "registry",
       "checksum": "e5e76742e5294153d4dde1207dbec5bdd81eef6fabdc0d2118babadabfd858aa",
       "disposition": "inventoried",
-      "first_seen": "2026-08-01"
+      "first_seen": "2026-11-12"
     },
     {
       "name": "rustls",
