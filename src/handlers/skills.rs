@@ -219,7 +219,12 @@ pub async fn skill_list_route(
         params[field_names::INCLUDE_RETIRED] = json!(ir);
     }
     let lock = app.db.lock().await;
-    match crate::mcp::handle_skill_list(&lock.0, &params, None) {
+    match crate::mcp::handle_skill_list(
+        &lock.0,
+        &params,
+        None,
+        crate::mcp::NodeSigning::of((*app.active_keypair).as_ref()),
+    ) {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(e) => {
             // #1261 — never forward the raw substrate error (often a
@@ -260,7 +265,12 @@ pub async fn skill_get_route(
     }
     let params = json!({"skill_id": id});
     let lock = app.db.lock().await;
-    match crate::mcp::handle_skill_get(&lock.0, &params, None) {
+    match crate::mcp::handle_skill_get(
+        &lock.0,
+        &params,
+        None,
+        crate::mcp::NodeSigning::of((*app.active_keypair).as_ref()),
+    ) {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(e) => skill_read_error_response("skill_get_route", &e, &id, None),
     }
@@ -323,6 +333,7 @@ const fn skill_read_class_status(class: crate::mcp::SkillReadClass<'_>) -> Statu
         | C::SignatureInvalid
         | C::SignerKeyUnavailable
         | C::SignatureMissing
+        | C::SignatureRequired
         | C::ResourceIntegrity
         | C::ResourcePathRequired
         | C::ResourceReferenceOnly(_) => StatusCode::BAD_REQUEST,
@@ -373,7 +384,12 @@ pub async fn skill_resource_route(
         (field_names::RESOURCE_PATH): &q.path,
     });
     let lock = app.db.lock().await;
-    match crate::mcp::handle_skill_resource(&lock.0, &params, None) {
+    match crate::mcp::handle_skill_resource(
+        &lock.0,
+        &params,
+        None,
+        crate::mcp::NodeSigning::of((*app.active_keypair).as_ref()),
+    ) {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(e) => skill_read_error_response("skill_resource_route", &e, &id, Some(&q.path)),
     }
@@ -558,7 +574,12 @@ pub async fn skill_compose_route(
     // #4059 — explicit HTTP-admin semantics preserved: this route is
     // admin-only (`require_admin` above), and an admin compose reads the
     // declared namespaces under the operator trust-all posture (`None`).
-    match crate::mcp::handle_skill_compositional_context(&lock.0, &params, None) {
+    match crate::mcp::handle_skill_compositional_context(
+        &lock.0,
+        &params,
+        None,
+        crate::mcp::NodeSigning::of((*app.active_keypair).as_ref()),
+    ) {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         // #8834 (code LOW 3) — one status and one sanitized body per
         // refusal class, as on get / resource / export.
@@ -901,7 +922,7 @@ mod skill_read_error_8834_tests {
 
     #[test]
     fn classify_maps_only_own_builder_text_8834() {
-        let cases: [(String, Option<&str>, SkillReadError<'_>); 10] = [
+        let cases: [(String, Option<&str>, SkillReadError<'_>); 11] = [
             (msg::skill_not_found(ID), None, SkillReadError::NotFound),
             (
                 msg::skill_digest_mismatch(ID),
@@ -922,6 +943,11 @@ mod skill_read_error_8834_tests {
                 msg::skill_signature_missing(ID),
                 None,
                 SkillReadError::SignatureMissing,
+            ),
+            (
+                msg::skill_signature_required(ID),
+                None,
+                SkillReadError::SignatureRequired,
             ),
             (
                 msg::skill_resource_digest_mismatch("stored/other", ID),

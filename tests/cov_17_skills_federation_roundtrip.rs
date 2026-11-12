@@ -235,6 +235,7 @@ fn skill_export_import_roundtrip_resolves_resources_on_peer() {
             "resource_path": "scripts/run.sh",
         }),
         None,
+        ai_memory::mcp::NodeSigning::NonSigning,
     )
     .expect("peer: resolve script resource");
     assert_eq!(script_resp["digest_verified"], json!(true));
@@ -253,6 +254,7 @@ fn skill_export_import_roundtrip_resolves_resources_on_peer() {
             "resource_path": "reference/notes.md",
         }),
         None,
+        ai_memory::mcp::NodeSigning::NonSigning,
     )
     .expect("peer: resolve reference resource");
     assert_eq!(reference_resp["digest_verified"], json!(true));

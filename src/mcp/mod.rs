@@ -862,6 +862,7 @@ pub use skill_export::{
     handle_skill_export_in_root,
 };
 pub use skill_get::handle_skill_get;
+pub use skill_integrity::NodeSigning; // #9174 (vote C1c)
 // #8834 (code LOW 4) — test fixtures only; never in the release lib surface.
 #[cfg(any(test, feature = "test-support"))]
 pub use skill_integrity::reseal_skill_digest_for_tests;
@@ -1231,13 +1232,15 @@ use search::handle_search;
 /// Forwards the handler's error string verbatim (the only failure mode
 /// is the handler itself returning `Err` — e.g. for an unknown
 /// `skill_id`).
+/// #9174 — test fixtures only (a node that does not sign).
+#[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub fn skill_compositional_context_for_tests(
     conn: &rusqlite::Connection,
     params: &serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     // Local-operator posture (`None` read caller), as before #4059.
-    handle_skill_compositional_context(conn, params, None)
+    handle_skill_compositional_context(conn, params, None, NodeSigning::NonSigning)
 }
 // handle_skill_export, handle_skill_promote_from_reflection,
 // handle_skill_register, handle_skill_get, handle_skill_list, and
@@ -3012,15 +3015,25 @@ fn dispatch_memory_skill_register(ctx: &ToolDispatchCtx<'_>) -> Result<Value, St
 }
 
 fn dispatch_memory_skill_list(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
-    handle_skill_list(ctx.conn, ctx.arguments, ctx.authority.read_caller())
+    skill_read(ctx, handle_skill_list)
+}
+
+/// The four skill read verbs, with the dispatch-resolved read caller and the
+/// node's signing state (#9174, vote C1c: `NodeSigning::of` the active key).
+fn skill_read(
+    ctx: &ToolDispatchCtx<'_>,
+    read: fn(&rusqlite::Connection, &Value, Option<&str>, NodeSigning) -> Result<Value, String>,
+) -> Result<Value, String> {
+    let node = NodeSigning::of(ctx.active_keypair);
+    read(ctx.conn, ctx.arguments, ctx.authority.read_caller(), node)
 }
 
 fn dispatch_memory_skill_get(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
-    handle_skill_get(ctx.conn, ctx.arguments, ctx.authority.read_caller())
+    skill_read(ctx, handle_skill_get)
 }
 
 fn dispatch_memory_skill_resource(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
-    handle_skill_resource(ctx.conn, ctx.arguments, ctx.authority.read_caller())
+    skill_read(ctx, handle_skill_resource)
 }
 
 fn dispatch_memory_skill_export(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
@@ -3043,8 +3056,7 @@ fn dispatch_memory_skill_promote_from_reflection(
 fn dispatch_memory_skill_compositional_context(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
     // v1.0.0 #4059 — the composed reflections are memory rows: every one must
     // be readable by the dispatch-resolved caller.
-    let caller = ctx.authority.read_caller();
-    handle_skill_compositional_context(ctx.conn, ctx.arguments, caller)
+    skill_read(ctx, handle_skill_compositional_context)
 }
 
 fn dispatch_memory_skill_retire(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {

@@ -314,6 +314,20 @@ signature) carry `attest_level = "unsigned"` and the signature
 column is empty — verification surfaces this honestly rather than
 silently passing.
 
+**A signing node serves only signed skills (v1.0.0 #9174).** When the
+node holds a private signing key (the active keypair can sign; no
+other flag or setting), every read path refuses an unsigned row with
+`skill integrity check failed: signature required on a signing node
+for skill <id>` (HTTP `400`), so a stripped signature never reads as
+an unsigned success. A node without a private key, or with a
+public-only keypair, serves an unsigned row with
+`signature_verified: false`. A presented signature that does not
+verify is refused on every node. The remedy for a refused row is to
+re-register the skill on the signing node: the new version is signed
+and served with `signature_verified: true`. Register and delete do not
+read the old row through the verified reader, so both work on a
+refused row.
+
 Verification on read is **always-on and single-funnel** (v1.0.0
 #8834): every read path (`memory_skill_get`, `memory_skill_list`,
 `memory_skill_resource`, `memory_skill_export`,
@@ -341,8 +355,8 @@ stores no signer), and the read paths return `signing_agent` only
 for a signature that verified. The visibility check runs before
 any integrity verdict, so a caller who may not read a skill gets
 `skill not found: <id>` even when the row is damaged.
-`memory_skill_list` omits a row that fails verification (with a
-warning in the log) and refuses the whole call with the sanitized
+`memory_skill_list` omits a row that fails verification (one
+warning per call in the log, with the count of rows it left out) and refuses the whole call with the sanitized
 `internal storage error` when the store itself fails; it filters
 in SQL and returns at most `SKILL_LIST_PAGE_LIMIT` (1000) rows,
 setting `truncated: true` when more matched. The HTTP read routes

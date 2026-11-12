@@ -26,10 +26,14 @@ use serde_json::{Value, json};
 /// Returns a substrate error string when `skill_id` / `resource_path`
 /// are missing, the skill or row is not found (or not visible), zstd
 /// decompression fails, or any integrity check fails (#8834).
+///
+/// #9174 — `node` is the reading node's [`super::skill_integrity::NodeSigning`]:
+/// on a signing node an unsigned skill is refused (`signature required`).
 pub fn handle_skill_resource(
     conn: &Connection,
     params: &Value,
     read_caller: Option<&str>,
+    node: super::skill_integrity::NodeSigning,
 ) -> Result<Value, String> {
     let skill_id = params["skill_id"]
         .as_str()
@@ -41,7 +45,7 @@ pub fn handle_skill_resource(
         .filter(|s| !s.is_empty())
         .ok_or(crate::errors::msg::SKILL_RESOURCE_PATH_REQUIRED)?;
 
-    let skill = super::skill_integrity::load_verified_skill(conn, skill_id, read_caller)?;
+    let skill = super::skill_integrity::load_verified_skill(conn, skill_id, read_caller, node)?;
     let Some(resource) = skill
         .resources
         .into_iter()
@@ -200,32 +204,52 @@ mod tests {
     #[test]
     fn rejects_missing_skill_id() {
         let conn = open_db();
-        let err = handle_skill_resource(&conn, &json!({"resource_path": "x"}), None).unwrap_err();
+        let err = handle_skill_resource(
+            &conn,
+            &json!({"resource_path": "x"}),
+            None,
+            crate::mcp::NodeSigning::NonSigning,
+        )
+        .unwrap_err();
         assert!(err.contains("requires 'skill_id'"));
     }
 
     #[test]
     fn rejects_empty_skill_id() {
         let conn = open_db();
-        let err =
-            handle_skill_resource(&conn, &json!({"skill_id": "", "resource_path": "x"}), None)
-                .unwrap_err();
+        let err = handle_skill_resource(
+            &conn,
+            &json!({"skill_id": "", "resource_path": "x"}),
+            None,
+            crate::mcp::NodeSigning::NonSigning,
+        )
+        .unwrap_err();
         assert!(err.contains("requires 'skill_id'"));
     }
 
     #[test]
     fn rejects_missing_resource_path() {
         let conn = open_db();
-        let err = handle_skill_resource(&conn, &json!({"skill_id": "sk"}), None).unwrap_err();
+        let err = handle_skill_resource(
+            &conn,
+            &json!({"skill_id": "sk"}),
+            None,
+            crate::mcp::NodeSigning::NonSigning,
+        )
+        .unwrap_err();
         assert!(err.contains("requires 'resource_path'"));
     }
 
     #[test]
     fn rejects_empty_resource_path() {
         let conn = open_db();
-        let err =
-            handle_skill_resource(&conn, &json!({"skill_id": "sk", "resource_path": ""}), None)
-                .unwrap_err();
+        let err = handle_skill_resource(
+            &conn,
+            &json!({"skill_id": "sk", "resource_path": ""}),
+            None,
+            crate::mcp::NodeSigning::NonSigning,
+        )
+        .unwrap_err();
         assert!(err.contains("requires 'resource_path'"));
     }
 
@@ -238,6 +262,7 @@ mod tests {
             &conn,
             &json!({"skill_id": "sk1", "resource_path": "no-such.sh"}),
             None,
+            crate::mcp::NodeSigning::NonSigning,
         )
         .unwrap_err();
         assert!(err.contains("resource not found"));
@@ -261,6 +286,7 @@ mod tests {
             &conn,
             &json!({"skill_id": "sk1", "resource_path": "ref.md"}),
             None,
+            crate::mcp::NodeSigning::NonSigning,
         )
         .unwrap_err();
         assert!(err.contains("no inline content"));
@@ -288,6 +314,7 @@ mod tests {
             &conn,
             &json!({"skill_id": "sk1", "resource_path": "scripts/run.sh"}),
             None,
+            crate::mcp::NodeSigning::NonSigning,
         )
         .unwrap();
         assert_eq!(v["skill_id"], json!("sk1"));
@@ -316,6 +343,7 @@ mod tests {
             &conn,
             &json!({"skill_id": "sk1", "resource_path": "asset.bin"}),
             None,
+            crate::mcp::NodeSigning::NonSigning,
         )
         .unwrap();
         assert_eq!(v["encoding"], json!("base64"));
@@ -339,6 +367,7 @@ mod tests {
             &conn,
             &json!({"skill_id": "sk1", "resource_path": "x.txt"}),
             None,
+            crate::mcp::NodeSigning::NonSigning,
         )
         .unwrap_err();
         // #8834 — exact, fail-closed; no stored/computed digest disclosure.
@@ -358,6 +387,7 @@ mod tests {
             &conn,
             &json!({"skill_id": "sk1", "resource_path": "u.txt"}),
             None,
+            crate::mcp::NodeSigning::NonSigning,
         )
         .unwrap_err();
         assert_eq!(err, crate::errors::msg::skill_integrity_failed("sk1"));
@@ -378,6 +408,7 @@ mod tests {
             &conn,
             &json!({"skill_id": "sk1", "resource_path": "bad.bin"}),
             None,
+            crate::mcp::NodeSigning::NonSigning,
         )
         .unwrap_err();
         // #9174 R2 — the fixed text; the decoder message and the stored path

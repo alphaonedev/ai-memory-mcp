@@ -523,6 +523,16 @@ pub mod msg {
         )
     }
 
+    /// v1.0.0 #9174 (vote C1c) — a node that holds a private signing key
+    /// serves only signed skills: an unsigned row is refused there, so a
+    /// stripped signature never reads as an unsigned success.
+    #[must_use]
+    pub fn skill_signature_required(skill_id: impl std::fmt::Display) -> String {
+        format!(
+            "{SKILL_INTEGRITY_FAILED}: signature required on a signing node for skill {skill_id}"
+        )
+    }
+
     /// v1.0.0 #8832 — `memory_skill_register` refuses caller-supplied metadata
     /// that carries a key in the substrate-reserved `_` namespace other than
     /// the top-level scope binding (any other substrate-stamped state, or a

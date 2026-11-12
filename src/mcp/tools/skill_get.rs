@@ -93,10 +93,14 @@ fn record_skill_invocation(
 /// the skill is not found (or not visible to the caller, #8832), its
 /// digest or signature does not verify (#8834), or zstd body
 /// decompression fails.
+///
+/// #9174 — `node` is the reading node's [`super::skill_integrity::NodeSigning`]:
+/// on a signing node an unsigned skill is refused (`signature required`).
 pub fn handle_skill_get(
     conn: &Connection,
     params: &Value,
     read_caller: Option<&str>,
+    node: super::skill_integrity::NodeSigning,
 ) -> Result<Value, String> {
     let skill_id = params["skill_id"]
         .as_str()
@@ -117,7 +121,7 @@ pub fn handle_skill_get(
     // #8832 / #8834 — the single verified read path: scope binding, resource
     // digests, skill digest and signature, all before anything is served or
     // the invocation is recorded. The body decode is bounded (#3171/#1933).
-    let skill = super::skill_integrity::load_verified_skill(conn, skill_id, read_caller)?;
+    let skill = super::skill_integrity::load_verified_skill(conn, skill_id, read_caller, node)?;
     let body = String::from_utf8_lossy(&skill.body).into_owned();
     let digest_hex: String = skill.digest.iter().map(|b| format!("{b:02x}")).collect();
 
@@ -310,7 +314,8 @@ mod tests {
     fn rejects_missing_skill_id() {
         let conn = open_db();
         let params = json!({});
-        let err = handle_skill_get(&conn, &params, None).unwrap_err();
+        let err = handle_skill_get(&conn, &params, None, crate::mcp::NodeSigning::NonSigning)
+            .unwrap_err();
         assert!(err.contains("requires 'skill_id'"), "got: {err}");
     }
 
@@ -318,7 +323,8 @@ mod tests {
     fn rejects_empty_skill_id() {
         let conn = open_db();
         let params = json!({"skill_id": ""});
-        let err = handle_skill_get(&conn, &params, None).unwrap_err();
+        let err = handle_skill_get(&conn, &params, None, crate::mcp::NodeSigning::NonSigning)
+            .unwrap_err();
         assert!(err.contains("requires 'skill_id'"), "got: {err}");
     }
 
@@ -326,7 +332,8 @@ mod tests {
     fn rejects_nonstring_skill_id() {
         let conn = open_db();
         let params = json!({"skill_id": 42});
-        let err = handle_skill_get(&conn, &params, None).unwrap_err();
+        let err = handle_skill_get(&conn, &params, None, crate::mcp::NodeSigning::NonSigning)
+            .unwrap_err();
         assert!(err.contains("requires 'skill_id'"), "got: {err}");
     }
 
@@ -334,7 +341,8 @@ mod tests {
     fn returns_not_found_for_missing_id() {
         let conn = open_db();
         let params = json!({"skill_id": "no-such-skill"});
-        let err = handle_skill_get(&conn, &params, None).unwrap_err();
+        let err = handle_skill_get(&conn, &params, None, crate::mcp::NodeSigning::NonSigning)
+            .unwrap_err();
         assert!(err.contains("skill not found"), "got: {err}");
         assert!(err.contains("no-such-skill"), "got: {err}");
     }
@@ -345,7 +353,13 @@ mod tests {
         let id = "11111111-1111-1111-1111-111111111111";
         insert_min_skill(&conn, id, "ns-1", "hello", "# Hello\nbody.");
 
-        let v = handle_skill_get(&conn, &json!({"skill_id": id}), None).unwrap();
+        let v = handle_skill_get(
+            &conn,
+            &json!({"skill_id": id}),
+            None,
+            crate::mcp::NodeSigning::NonSigning,
+        )
+        .unwrap();
         assert_eq!(v["id"], json!(id));
         assert_eq!(v["namespace"], json!("ns-1"));
         assert_eq!(v["name"], json!("hello"));
@@ -378,7 +392,13 @@ mod tests {
         .unwrap();
         reseal(&conn, id);
 
-        let v = handle_skill_get(&conn, &json!({"skill_id": id}), None).unwrap();
+        let v = handle_skill_get(
+            &conn,
+            &json!({"skill_id": id}),
+            None,
+            crate::mcp::NodeSigning::NonSigning,
+        )
+        .unwrap();
         assert_eq!(v["license"], json!("MIT"));
         assert_eq!(v["compatibility"], json!("v1"));
         // #8834: an unsigned row never carries a signer on the wire; the
@@ -406,7 +426,13 @@ mod tests {
         .unwrap();
 
         reseal(&conn, id);
-        let err = handle_skill_get(&conn, &json!({"skill_id": id}), None).unwrap_err();
+        let err = handle_skill_get(
+            &conn,
+            &json!({"skill_id": id}),
+            None,
+            crate::mcp::NodeSigning::NonSigning,
+        )
+        .unwrap_err();
         assert_eq!(err, crate::errors::msg::skill_digest_mismatch(id));
     }
 
@@ -423,10 +449,22 @@ mod tests {
         )
         .unwrap();
 
-        let r1 = handle_skill_get(&conn, &json!({"skill_id": v1}), None).unwrap();
+        let r1 = handle_skill_get(
+            &conn,
+            &json!({"skill_id": v1}),
+            None,
+            crate::mcp::NodeSigning::NonSigning,
+        )
+        .unwrap();
         assert_eq!(r1["current"], json!(false));
         assert_eq!(r1["superseded_by"], json!(v2));
-        let r2 = handle_skill_get(&conn, &json!({"skill_id": v2}), None).unwrap();
+        let r2 = handle_skill_get(
+            &conn,
+            &json!({"skill_id": v2}),
+            None,
+            crate::mcp::NodeSigning::NonSigning,
+        )
+        .unwrap();
         assert_eq!(r2["current"], json!(true));
         assert!(r2.get("superseded_by").is_none());
     }
@@ -452,7 +490,13 @@ mod tests {
         .unwrap();
         reseal(&conn, id);
 
-        let v = handle_skill_get(&conn, &json!({"skill_id": id}), None).unwrap();
+        let v = handle_skill_get(
+            &conn,
+            &json!({"skill_id": id}),
+            None,
+            crate::mcp::NodeSigning::NonSigning,
+        )
+        .unwrap();
         let resources = v["resources"].as_array().unwrap();
         assert_eq!(resources.len(), 2);
         // Sorted alphabetically by path.
@@ -474,7 +518,13 @@ mod tests {
             params![id, bogus_blob, digest],
         )
         .unwrap();
-        let err = handle_skill_get(&conn, &json!({"skill_id": id}), None).unwrap_err();
+        let err = handle_skill_get(
+            &conn,
+            &json!({"skill_id": id}),
+            None,
+            crate::mcp::NodeSigning::NonSigning,
+        )
+        .unwrap_err();
         assert_eq!(err, crate::errors::msg::SKILL_BODY_UNDECODABLE);
     }
 
@@ -488,7 +538,13 @@ mod tests {
         let conn = open_db();
         let id = "77777777-7777-7777-7777-777777777777";
         insert_min_skill(&conn, id, "ns", "versioned", "body");
-        let v = handle_skill_get(&conn, &json!({"skill_id": id}), None).unwrap();
+        let v = handle_skill_get(
+            &conn,
+            &json!({"skill_id": id}),
+            None,
+            crate::mcp::NodeSigning::NonSigning,
+        )
+        .unwrap();
         assert_eq!(v["version"], json!(1));
     }
 
@@ -504,9 +560,21 @@ mod tests {
             params![v2, v1],
         )
         .unwrap();
-        let r1 = handle_skill_get(&conn, &json!({"skill_id": v1}), None).unwrap();
+        let r1 = handle_skill_get(
+            &conn,
+            &json!({"skill_id": v1}),
+            None,
+            crate::mcp::NodeSigning::NonSigning,
+        )
+        .unwrap();
         assert_eq!(r1["version"], json!(1));
-        let r2 = handle_skill_get(&conn, &json!({"skill_id": v2}), None).unwrap();
+        let r2 = handle_skill_get(
+            &conn,
+            &json!({"skill_id": v2}),
+            None,
+            crate::mcp::NodeSigning::NonSigning,
+        )
+        .unwrap();
         assert_eq!(r2["version"], json!(2));
     }
 
@@ -520,7 +588,13 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM signed_events", [], |r| r.get(0))
             .unwrap();
 
-        let v = handle_skill_get(&conn, &json!({"skill_id": id}), None).unwrap();
+        let v = handle_skill_get(
+            &conn,
+            &json!({"skill_id": id}),
+            None,
+            crate::mcp::NodeSigning::NonSigning,
+        )
+        .unwrap();
         let record = &v["invocation_record"];
         assert!(record["event_id"].as_str().is_some(), "{v}");
         assert!(record["recorded_at"].as_str().is_some(), "{v}");
@@ -547,8 +621,20 @@ mod tests {
         let id = "99999999-9999-9999-9999-999999999999";
         insert_min_skill(&conn, id, "ns", "multi-invoke", "body");
 
-        let v1 = handle_skill_get(&conn, &json!({"skill_id": id}), None).unwrap();
-        let v2 = handle_skill_get(&conn, &json!({"skill_id": id}), None).unwrap();
+        let v1 = handle_skill_get(
+            &conn,
+            &json!({"skill_id": id}),
+            None,
+            crate::mcp::NodeSigning::NonSigning,
+        )
+        .unwrap();
+        let v2 = handle_skill_get(
+            &conn,
+            &json!({"skill_id": id}),
+            None,
+            crate::mcp::NodeSigning::NonSigning,
+        )
+        .unwrap();
         assert_ne!(
             v1["invocation_record"]["event_id"], v2["invocation_record"]["event_id"],
             "each activation must mint a distinct invocation record"
@@ -579,7 +665,13 @@ mod tests {
         .unwrap();
         // #8834 — metadata carries the scope binding and is inside the
         // digest; a column that does not parse is refused, never served.
-        let err = handle_skill_get(&conn, &json!({"skill_id": id}), None).unwrap_err();
+        let err = handle_skill_get(
+            &conn,
+            &json!({"skill_id": id}),
+            None,
+            crate::mcp::NodeSigning::NonSigning,
+        )
+        .unwrap_err();
         assert_eq!(err, crate::errors::msg::skill_digest_mismatch(id));
     }
 
@@ -616,7 +708,13 @@ mod tests {
         );
         // ... and #9174 R2: the read renders the fixed text, the decoder
         // message stays on the operator log.
-        let err = handle_skill_get(&conn, &json!({"skill_id": id}), None).unwrap_err();
+        let err = handle_skill_get(
+            &conn,
+            &json!({"skill_id": id}),
+            None,
+            crate::mcp::NodeSigning::NonSigning,
+        )
+        .unwrap_err();
         assert_eq!(err, crate::errors::msg::SKILL_BODY_UNDECODABLE);
     }
 }

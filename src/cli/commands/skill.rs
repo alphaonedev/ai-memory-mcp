@@ -302,14 +302,17 @@ pub fn run(
     out: &mut CliOutput<'_>,
 ) -> Result<i32> {
     let conn = db::open(db_path)?;
+    // #9174 (vote C1c) — a node holding a private signing key serves only
+    // signed skills on every read verb.
+    let node = crate::mcp::NodeSigning::of(active_keypair);
     match &args.action {
         SkillAction::Register(a) => run_register(&conn, a, active_keypair, out),
-        SkillAction::List(a) => run_list(&conn, a, out),
-        SkillAction::Get(a) => run_get(&conn, a, out),
-        SkillAction::Resource(a) => run_resource(&conn, a, out),
+        SkillAction::List(a) => run_list(&conn, a, node, out),
+        SkillAction::Get(a) => run_get(&conn, a, node, out),
+        SkillAction::Resource(a) => run_resource(&conn, a, node, out),
         SkillAction::Export(a) => run_export(&conn, db_path, a, active_keypair, out),
         SkillAction::Promote(a) => run_promote(&conn, a, active_keypair, out),
-        SkillAction::Compose(a) => run_compose(&conn, a, out),
+        SkillAction::Compose(a) => run_compose(&conn, a, node, out),
         SkillAction::Retire(a) => run_retire(&conn, a, active_keypair, out),
         SkillAction::Delete(a) => run_delete(&conn, a, active_keypair, out),
     }
@@ -455,7 +458,12 @@ fn run_register(
 // list
 // ---------------------------------------------------------------------------
 
-fn run_list(conn: &rusqlite::Connection, args: &ListArgs, out: &mut CliOutput<'_>) -> Result<i32> {
+fn run_list(
+    conn: &rusqlite::Connection,
+    args: &ListArgs,
+    node: crate::mcp::NodeSigning,
+    out: &mut CliOutput<'_>,
+) -> Result<i32> {
     let mut params = json!({});
     if let Some(ref ns) = args.namespace {
         params["namespace"] = json!(ns);
@@ -471,7 +479,7 @@ fn run_list(conn: &rusqlite::Connection, args: &ListArgs, out: &mut CliOutput<'_
         Ok(caller) => caller,
         Err(code) => return Ok(code),
     };
-    match crate::mcp::handle_skill_list(conn, &params, vis_caller.as_deref()) {
+    match crate::mcp::handle_skill_list(conn, &params, vis_caller.as_deref(), node) {
         Ok(v) => {
             if args.json {
                 emit_json(out, &v)?;
@@ -497,14 +505,19 @@ fn run_list(conn: &rusqlite::Connection, args: &ListArgs, out: &mut CliOutput<'_
 // get
 // ---------------------------------------------------------------------------
 
-fn run_get(conn: &rusqlite::Connection, args: &GetArgs, out: &mut CliOutput<'_>) -> Result<i32> {
+fn run_get(
+    conn: &rusqlite::Connection,
+    args: &GetArgs,
+    node: crate::mcp::NodeSigning,
+    out: &mut CliOutput<'_>,
+) -> Result<i32> {
     let params = json!({ "skill_id": args.id });
     // #8832 — the same CLI read-visibility caller `skill compose` uses.
     let vis_caller = match cli_read_caller(out, "get")? {
         Ok(caller) => caller,
         Err(code) => return Ok(code),
     };
-    match crate::mcp::handle_skill_get(conn, &params, vis_caller.as_deref()) {
+    match crate::mcp::handle_skill_get(conn, &params, vis_caller.as_deref(), node) {
         Ok(v) => {
             if args.json {
                 emit_json(out, &v)?;
@@ -527,6 +540,7 @@ fn run_get(conn: &rusqlite::Connection, args: &GetArgs, out: &mut CliOutput<'_>)
 fn run_resource(
     conn: &rusqlite::Connection,
     args: &ResourceArgs,
+    node: crate::mcp::NodeSigning,
     out: &mut CliOutput<'_>,
 ) -> Result<i32> {
     let params = json!({
@@ -538,7 +552,7 @@ fn run_resource(
         Ok(caller) => caller,
         Err(code) => return Ok(code),
     };
-    match crate::mcp::handle_skill_resource(conn, &params, vis_caller.as_deref()) {
+    match crate::mcp::handle_skill_resource(conn, &params, vis_caller.as_deref(), node) {
         Ok(v) => {
             if args.json {
                 emit_json(out, &v)?;
@@ -640,6 +654,7 @@ fn run_promote(
 fn run_compose(
     conn: &rusqlite::Connection,
     args: &ComposeArgs,
+    node: crate::mcp::NodeSigning,
     out: &mut CliOutput<'_>,
 ) -> Result<i32> {
     let mut params = json!({ "skill_id": args.id });
@@ -653,7 +668,8 @@ fn run_compose(
         Ok(caller) => caller,
         Err(code) => return Ok(code),
     };
-    match crate::mcp::handle_skill_compositional_context(conn, &params, vis_caller.as_deref()) {
+    match crate::mcp::handle_skill_compositional_context(conn, &params, vis_caller.as_deref(), node)
+    {
         Ok(v) => {
             emit_json(out, &v)?;
             Ok(0)

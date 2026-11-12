@@ -521,13 +521,16 @@ fn export_in_root(
     // Visibility, every resource digest, the skill digest and any signature
     // are checked here, before the first write below. The bounded (#1933)
     // body and resource decode happens inside the verified load.
-    let skill =
-        super::skill_integrity::load_verified_skill(conn, skill_id, read_caller).map_err(|e| {
-            SkillExportFailure::Read {
-                skill_id: skill_id.to_owned(),
-                raw: String::from(e),
-            }
-        })?;
+    let skill = super::skill_integrity::load_verified_skill(
+        conn,
+        skill_id,
+        read_caller,
+        super::skill_integrity::NodeSigning::of(active_keypair),
+    )
+    .map_err(|e| SkillExportFailure::Read {
+        skill_id: skill_id.to_owned(),
+        raw: String::from(e),
+    })?;
     let body = String::from_utf8_lossy(&skill.body);
 
     // -----------------------------------------------------------------------
@@ -1186,7 +1189,9 @@ mod tests {
         // Build an AgentKeypair (public-only) and run export. We're not
         // checking the signed_events row directly; this path simply
         // exercises the `active_keypair.map(|kp| kp.agent_id.clone())`
-        // branch versus the fallback.
+        // branch versus the fallback. #9174: the keypair stays public-only
+        // so the node is non-signing and the unsigned fixture row is served;
+        // the signing-node export cells live in tests/skill_signed_state_9174.rs.
         let (conn, dir) = open_db();
         let id = "4dddd-0000-0000-0000-000000000004";
         insert_skill_full(&conn, id, "ns", "name", "d", "body");
@@ -1198,7 +1203,7 @@ mod tests {
         let kp = crate::identity::keypair::AgentKeypair {
             agent_id: "test:agent-1".to_string(),
             public: vk,
-            private: Some(sk),
+            private: None,
         };
 
         let target = dir.path().join("export-kp");
