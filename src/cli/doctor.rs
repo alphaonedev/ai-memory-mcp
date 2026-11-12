@@ -9931,3 +9931,49 @@ mod cov_doctor_identity_posture_3521 {
         assert_eq!(still, behind, "doctor must not migrate a behind stamp");
     }
 }
+
+/// PR #9175 r2 D-L2 — a refused probe whose signed refusal could NOT be
+/// recorded says so on doctor's own output (the report), because doctor
+/// installs no tracing subscriber and a `tracing::warn!` alone is lost.
+#[cfg(test)]
+mod audit_unrecorded_9175 {
+    use super::probe_refused_section;
+    use crate::egress::{EgressClass, InferenceEgressMode};
+
+    #[test]
+    fn refused_probe_reports_an_unrecorded_refusal_in_the_note_9175() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(".local-runs")
+            .join(format!(
+                "doctor-audit-unrecorded-9175-{}",
+                uuid::Uuid::new_v4()
+            ));
+        std::fs::create_dir_all(&dir).expect("mkdir scratch");
+        let missing = dir.join("vanished.db");
+        let target = "https://llm.example.invalid/v1";
+        let section = probe_refused_section(
+            "llm_reachability",
+            "LLM",
+            Vec::new(),
+            target,
+            InferenceEgressMode::Deny,
+            "posture refused (#9175 fixture)".to_string(),
+            (EgressClass::InferenceLlm, Some(&missing)),
+        );
+        let expected = format!(
+            "inference-egress signed refusal NOT recorded (db open failed) for {} target={}: \
+             {}: {}",
+            EgressClass::InferenceLlm.as_str(),
+            crate::url_display::url_origin(target),
+            crate::storage::MISSING_DATABASE_REFUSAL,
+            missing.display(),
+        );
+        let note = section.note.expect("a refused probe carries a note");
+        assert!(
+            note.ends_with(&format!(" {expected}")),
+            "#9175 D-L2: the unrecorded refusal is on doctor's report, exact text: {note}"
+        );
+        assert!(!missing.exists(), "#9175: the audit open creates no file");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

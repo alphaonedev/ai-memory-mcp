@@ -1358,4 +1358,172 @@ mod tests {
         drop(conn);
         let _ = std::fs::remove_file(&path);
     }
+
+    // ─── PR #9175 r2 D-M1: the audit append opens through the funnel ───────
+
+    /// The probe target every #9175 audit-open test refuses.
+    const AUDIT_OPEN_TARGET: &str = "https://llm.example.invalid/v1";
+    /// The posture reason every #9175 audit-open test records.
+    const AUDIT_OPEN_REASON: &str = "posture refused (#9175 fixture)";
+
+    /// A fresh directory under `.local-runs` (no-/tmp HARD RULE) that holds
+    /// only the database the test names.
+    fn audit_open_scratch(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(".local-runs")
+            .join(format!(
+                "egress-audit-open-9175-{tag}-{}",
+                uuid::Uuid::new_v4()
+            ));
+        std::fs::create_dir_all(&dir).expect("mkdir scratch");
+        let db = dir.join("audit.db");
+        (dir, db)
+    }
+
+    /// A migrated database at the current schema, closed.
+    fn audit_open_current_db(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let (dir, db) = audit_open_scratch(tag);
+        drop(crate::db::open(&db).expect("create current db"));
+        (dir, db)
+    }
+
+    /// Re-stamp `db` to `version` through a raw test-only connection.
+    fn audit_open_plant_stamp(db: &std::path::Path, version: i64) {
+        let conn = Connection::open(db).expect("raw reopen to plant stamp");
+        conn.execute("DELETE FROM schema_version", [])
+            .expect("clear stamp");
+        conn.execute(
+            "INSERT INTO schema_version (version) VALUES (?1)",
+            rusqlite::params![version],
+        )
+        .expect("plant stamp");
+    }
+
+    /// `egress.inference_refused` rows in `db`, read without the funnel.
+    fn audit_open_refusal_rows(db: &std::path::Path) -> i64 {
+        let conn = Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect("raw read-only reopen");
+        conn.query_row(
+            "SELECT COUNT(*) FROM signed_events WHERE event_type = ?1",
+            [crate::signed_events::event_types::EGRESS_INFERENCE_REFUSED],
+            |r| r.get(0),
+        )
+        .expect("count refusal rows")
+    }
+
+    /// The sorted file names in `dir` (sidecars included).
+    fn audit_open_listing(dir: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .expect("read scratch dir")
+            .map(|e| {
+                e.expect("dir entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Run the audited refusal on a database the funnel must refuse, and
+    /// prove it wrote nothing: zero rows, identical bytes, identical files.
+    fn assert_audit_open_writes_nothing(dir: &std::path::Path, db: &std::path::Path, case: &str) {
+        let bytes_before = std::fs::read(db).expect("read db bytes");
+        let files_before = audit_open_listing(dir);
+        let rows_before = audit_open_refusal_rows(db);
+        refuse_inference_egress_audited_existing(
+            db,
+            EgressClass::InferenceLlm,
+            AUDIT_OPEN_TARGET,
+            AUDIT_OPEN_REASON,
+        );
+        assert_eq!(
+            audit_open_refusal_rows(db),
+            rows_before,
+            "#9175 D-M1 {case}: the refused audit open appends ZERO rows"
+        );
+        assert_eq!(
+            std::fs::read(db).expect("re-read db bytes"),
+            bytes_before,
+            "#9175 D-M1 {case}: the database file bytes are unchanged"
+        );
+        assert_eq!(
+            audit_open_listing(dir),
+            files_before,
+            "#9175 D-M1 {case}: no file or -wal/-shm sidecar is created"
+        );
+    }
+
+    #[test]
+    fn audit_open_refuses_schema_ahead_with_zero_rows_9175() {
+        crate::storage::schema_guard::with_hatch(None, || {
+            let (dir, db) = audit_open_current_db("ahead");
+            let ahead = crate::storage::migrations::current_schema_version() + 1;
+            audit_open_plant_stamp(&db, ahead);
+            assert_audit_open_writes_nothing(&dir, &db, "schema ahead");
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    #[test]
+    fn audit_open_refuses_hatched_schema_ahead_with_zero_rows_9175() {
+        let ahead = crate::storage::migrations::current_schema_version() + 1;
+        let hatch = ahead.to_string();
+        crate::storage::schema_guard::with_hatch(Some(&hatch), || {
+            let (dir, db) = audit_open_current_db("hatched");
+            audit_open_plant_stamp(&db, ahead);
+            assert_audit_open_writes_nothing(&dir, &db, "schema ahead under the hatch");
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    #[test]
+    fn audit_open_refuses_schema_behind_with_zero_rows_9175() {
+        crate::storage::schema_guard::with_hatch(None, || {
+            let (dir, db) = audit_open_current_db("behind");
+            let behind = crate::storage::migrations::current_schema_version() - 1;
+            audit_open_plant_stamp(&db, behind);
+            assert_audit_open_writes_nothing(&dir, &db, "schema behind");
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    #[test]
+    fn audit_open_missing_database_creates_no_file_9175() {
+        let (dir, db) = audit_open_scratch("missing");
+        assert!(audit_open_listing(&dir).is_empty(), "scratch starts empty");
+        refuse_inference_egress_audited_existing(
+            &db,
+            EgressClass::InferenceLlm,
+            AUDIT_OPEN_TARGET,
+            AUDIT_OPEN_REASON,
+        );
+        assert!(
+            audit_open_listing(&dir).is_empty(),
+            "#9175 D-M1 missing: no database file and no -wal/-shm sidecar is created: {:?}",
+            audit_open_listing(&dir)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn audit_open_current_database_appends_one_signed_row_9175() {
+        crate::storage::schema_guard::with_hatch(None, || {
+            let (dir, db) = audit_open_current_db("current");
+            assert_eq!(audit_open_refusal_rows(&db), 0, "fresh db has no row");
+            refuse_inference_egress_audited_existing(
+                &db,
+                EgressClass::InferenceLlm,
+                AUDIT_OPEN_TARGET,
+                AUDIT_OPEN_REASON,
+            );
+            assert_eq!(
+                audit_open_refusal_rows(&db),
+                1,
+                "#9175 D-M1 current: exactly one signed refusal row"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
 }
