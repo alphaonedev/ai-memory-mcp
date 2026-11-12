@@ -755,6 +755,10 @@ after the backup, and a request captured on its way to one receiver can be
 replayed to another receiver that never saw it. When the store cannot record
 a claim the receiver answers 503 `nonce_store_unavailable` and admits
 nothing.
+Known residual: SQLite runs with `synchronous=NORMAL`, so the newest accepted
+nonce claims can be lost on a power cut and those nonces become acceptable again
+after the restart; a process crash does not lose them, and PostgreSQL with
+`synchronous_commit=on` does not have this residual.
 The v86 and v87 rungs are
 instant/value-preserving, idempotent, and fail-safe on an unparseable
 value (left byte-untouched rather than destroyed), but they are row
