@@ -5234,15 +5234,17 @@ async fn run_verify_audit_trail(
         Some(url) if is_postgres_url(url) => {
             verify_audit_trail_postgres(url, a, app_config, audit_pubkey, &mut out).await
         }
-        Some(url) => {
-            let path = sqlite_store_url_to_path(url).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "unrecognised --store-url: {} (expected postgres://... or sqlite:///path)",
-                    crate::url_display::store_url_display(url)
-                )
-            })?;
-            crate::cli::verify_audit_trail::run(Path::new(path), a, audit_pubkey, &mut out)
-        }
+        Some(url) => match sqlite_store_url_to_path(url) {
+            Some(path) => {
+                crate::cli::verify_audit_trail::run(Path::new(path), a, audit_pubkey, &mut out)
+            }
+            // #9179 r1 — reason-coded finding, the verify-signed-events-chain twin.
+            None => crate::cli::verify_audit_trail::store_url_unrecognised(
+                a.json,
+                &crate::url_display::store_url_display(url),
+                &mut out,
+            ),
+        },
         None => crate::cli::verify_audit_trail::run(db_path, a, audit_pubkey, &mut out),
     }
 }

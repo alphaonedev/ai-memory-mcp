@@ -101,6 +101,31 @@ fn absence_finding(
     Ok(EXIT_DIRTY)
 }
 
+/// #9179 r1 — a `--store-url` (or its env / file channel) that names neither
+/// a postgres nor a `sqlite://` store is a reason-coded finding in the one
+/// absence shape (`store_url_unrecognised`, [`EXIT_DIRTY`]), the twin of the
+/// `verify-signed-events-chain` refusal, never an untyped error. `url_display`
+/// must already be credential-redacted.
+///
+/// # Errors
+///
+/// Returns an error only when the finding cannot be written.
+pub fn store_url_unrecognised(
+    json: bool,
+    url_display: &str,
+    out: &mut CliOutput<'_>,
+) -> Result<i32> {
+    let detail =
+        format!("unrecognised store URL {url_display} (expected postgres://... or sqlite:///path)");
+    absence_finding(
+        None,
+        json,
+        crate::cli::verify_signed_events::REASON_STORE_URL_UNRECOGNISED,
+        &detail,
+        out,
+    )
+}
+
 /// Arguments for `ai-memory verify-audit-trail`.
 #[derive(clap::Args, Debug)]
 pub struct VerifyAuditTrailArgs {
@@ -638,4 +663,64 @@ mod tests {
     // from a `src/` file. They live in the integration test
     // `tests/verify_audit_trail_pe8.rs` instead (same split rationale
     // as `verify_signed_events.rs`).
+
+    /// #9179 r1 sec F5 — an empty chain under an anchored off-table watermark
+    /// is the `empty_chain` finding AND keeps its tail-truncation detail (a
+    /// full delete is reported as rows removed, not only as "no rows").
+    #[test]
+    fn empty_chain_under_anchored_watermark_keeps_truncation_detail_9179() {
+        let (_dir, path) = temp_db();
+        let conn = crate::db::open(&path).expect("open");
+        let mut report =
+            crate::signed_events::verify_audit_trail(&conn, None, None).expect("report");
+        assert_eq!(report.head_sequence, 0);
+        report.truncation = crate::signed_events::TruncationCheck::Detected {
+            anchored_head: 5,
+            db_head: 0,
+        };
+        let mut buf_out = Vec::<u8>::new();
+        let mut buf_err = Vec::<u8>::new();
+        let mut out = CliOutput::from_std(&mut buf_out, &mut buf_err);
+        let code = render(&report, false, &mut out).expect("render");
+        assert_eq!(code, EXIT_DIRTY);
+        let o = String::from_utf8(buf_out).expect("utf-8");
+        assert!(
+            o.contains(&format!("FAIL: {REASON_EMPTY_CHAIN}:")),
+            "got: {o}"
+        );
+        assert!(
+            o.contains("tail truncation detected: off-table anchor head=5 but in-DB head=0"),
+            "got: {o}"
+        );
+        assert!(o.contains("at least 5 trailing row(s) removed"), "got: {o}");
+        assert!(!o.contains("OK"), "no green line: {o}");
+    }
+
+    /// #9179 r1 — an unrecognised store URL is the reason-coded
+    /// `store_url_unrecognised` finding in both modes, never an untyped error.
+    #[test]
+    fn unrecognised_store_url_is_a_reason_coded_finding_9179() {
+        const REASON: &str = crate::cli::verify_signed_events::REASON_STORE_URL_UNRECOGNISED;
+        for json in [false, true] {
+            let mut buf_out = Vec::<u8>::new();
+            let mut buf_err = Vec::<u8>::new();
+            let mut out = CliOutput::from_std(&mut buf_out, &mut buf_err);
+            let code = store_url_unrecognised(json, "mysql://host/db", &mut out).expect("finding");
+            assert_eq!(code, EXIT_DIRTY, "json={json}");
+            let e = String::from_utf8(buf_err).expect("utf-8");
+            assert!(
+                e.contains(&format!("FAIL: {REASON}:")),
+                "json={json}: got: {e}"
+            );
+            let o = String::from_utf8(buf_out).expect("utf-8");
+            if json {
+                let v: serde_json::Value = serde_json::from_str(&o).expect("json body");
+                assert_eq!(v["status"], "fail", "got: {o}");
+                assert_eq!(v["reason"], REASON, "got: {o}");
+                assert_eq!(v["chain_intact"], false, "got: {o}");
+            } else {
+                assert!(o.contains(&format!("FAIL: {REASON}:")), "got: {o}");
+            }
+        }
+    }
 }
