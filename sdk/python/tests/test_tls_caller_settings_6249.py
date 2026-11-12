@@ -623,6 +623,171 @@ def test_6249_unclassified_attribute_that_is_not_default_is_refused(
     )
 
 
+# -- Python 3.15 mutators (CI run 43159353048, the 3.x cell) ------------------
+
+#: Where a stand-in 3.15 mutator records its call on the context it was called on.
+PY315_MARK = "_sdk_test_py315_calls"
+#: Valid OpenSSL names for each 3.15 mutator input.
+PY315_TLS13_SUITE = "TLS_AES_256_GCM_SHA384"
+PY315_GROUPS = "P-256"
+PY315_SIGALGS = "ECDSA+SHA256"
+CIPHERS_NOT_SUBSET = "the SDK context would offer a cipher the caller context does not"
+#: Row outcomes: refused by the cipher row's message; never carried because it
+#: does not bear on verifying the server; a verification-relevant named residual.
+OUTCOME_REFUSED = "refused"
+OUTCOME_NOT_RELEVANT = "not_relevant"
+OUTCOME_RESIDUAL = "residual"
+#: (mutator, input, outcome, exact refusal message or None).
+PY315_ROWS: list[tuple[str, str, str, str | None]] = [
+    (
+        "set_ciphersuites",
+        PY315_TLS13_SUITE,
+        OUTCOME_REFUSED,
+        MSG_CIPHERS.format(kind=CALLER_KIND, detail=CIPHERS_NOT_SUBSET),
+    ),
+    ("set_groups", PY315_GROUPS, OUTCOME_NOT_RELEVANT, None),
+    ("set_client_sigalgs", PY315_SIGALGS, OUTCOME_NOT_RELEVANT, None),
+    ("set_server_sigalgs", PY315_SIGALGS, OUTCOME_RESIDUAL, None),
+]
+PY315_IDS = [row[0] for row in PY315_ROWS]
+#: Settings the SDK can neither read nor carry; named in the module docstring
+#: and the README (X-4, X-7).
+PY315_DOCUMENTED_RESIDUALS = ("set_groups", "set_server_sigalgs", "set_ciphersuites")
+README = Path(__file__).resolve().parents[1] / "README.md"
+
+
+def _record_py315(ctx: Any, name: str, value: str) -> None:
+    ctx.__dict__.setdefault(PY315_MARK, {})[name] = value
+
+
+def _stand_in_mutator(name: str) -> Callable[[Any, str], None]:
+    def mutator(self: Any, value: str) -> None:
+        _record_py315(self, name, value)
+
+    mutator.__name__ = name
+    return mutator
+
+
+#: A stand-in Python 3.15 ``_ssl._SSLContext`` half: the four mutators only.
+Python315SSLContext = type(
+    "Python315SSLContext", (), {name: _stand_in_mutator(name) for name in PY315_IDS}
+)
+
+
+def _install_python315(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make the running Python look like 3.15 to the SDK: the tripwire and the
+    backstop enumerate the stand-in class, and the C-base ``get_ciphers``
+    reports a TLS 1.3 suite list narrowed by the stand-in ``set_ciphersuites``."""
+    real = ssl.SSLContext.__base__
+
+    def get_ciphers(ctx: Any) -> list[dict[str, Any]]:
+        listed: list[dict[str, Any]] = real.get_ciphers(ctx)
+        suites = ctx.__dict__.get(PY315_MARK, {}).get("set_ciphersuites")
+        if suites is None:
+            return listed
+        keep = set(suites.split(":"))
+        return [c for c in listed if c.get("protocol") != _tls.TLS13_PROTOCOL or c["name"] in keep]
+
+    monkeypatch.setattr(_tls, "_C_BASE", _c_base_copy(get_ciphers=get_ciphers))
+    monkeypatch.setattr(_tls, "_SETTINGS_CLASSES", (*_tls._SETTINGS_CLASSES, Python315SSLContext))
+
+
+def _tables_holding(mutator: str) -> list[str]:
+    tables = [row.name for row in _tls.VERIFICATION_SETTINGS if mutator in row.mutators]
+    if mutator in _tls.NOT_VERIFICATION_RELEVANT:
+        tables.append("NOT_VERIFICATION_RELEVANT")
+    if mutator in _tls.UNREADABLE_RESIDUALS:
+        tables.append("UNREADABLE_RESIDUALS")
+    return tables
+
+
+#: The one table each outcome must come from.
+OUTCOME_TABLE = {
+    OUTCOME_REFUSED: "ciphers",
+    OUTCOME_NOT_RELEVANT: "NOT_VERIFICATION_RELEVANT",
+    OUTCOME_RESIDUAL: "UNREADABLE_RESIDUALS",
+}
+
+
+def _expect_outcome(
+    kind: str, url: str, verify: Any, mutator: str, outcome: str, message: str | None
+) -> Any:
+    """Build a client; a refused row raises the exact message, any other row
+    builds and completes a verifying handshake. Returns the owned context."""
+    if outcome == OUTCOME_REFUSED:
+        with pytest.raises(ValueError) as info:
+            _make(kind, UNUSED_URL, verify=verify)
+        assert str(info.value) == message, mutator
+        return None
+    client = _make(kind, url, verify=verify)
+    try:
+        owned = _owned(client)
+        assert _health(client) == LAB_HEALTH_BODY, mutator
+        return owned
+    finally:
+        _close(client)
+
+
+@pytest.mark.parametrize("mutator", PY315_IDS)
+def test_6249_each_python_3_15_mutator_is_in_exactly_its_table(mutator: str) -> None:
+    outcome = next(row[2] for row in PY315_ROWS if row[0] == mutator)
+    assert _tables_holding(mutator) == [OUTCOME_TABLE[outcome]], mutator
+
+
+@pytest.mark.parametrize("name", PY315_DOCUMENTED_RESIDUALS)
+def test_6249_python_3_15_residuals_are_named_in_the_docstring_and_readme(name: str) -> None:
+    assert _tls.__doc__ is not None
+    assert f"``{name}``" in _tls.__doc__, name
+    assert f"`{name}" in README.read_text(encoding="utf-8"), name
+
+
+@pytest.mark.parametrize("kind", CLIENT_KINDS)
+@pytest.mark.parametrize("caller_path", ["stdlib", "truststore_fake"], indirect=True)
+@pytest.mark.parametrize(("mutator", "value", "outcome", "message"), PY315_ROWS, ids=PY315_IDS)
+def test_6249_python_3_15_mutator_on_a_stand_in_context_follows_its_row(
+    lab: Lab,
+    good_server: LabServer,
+    caller_path: str,
+    kind: str,
+    mutator: str,
+    value: str,
+    outcome: str,
+    message: str | None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Runs on every Python: a caller context that called one 3.15 mutator is
+    refused by the exact message, or builds and verifies with the setting not
+    carried, as its row says."""
+    _install_python315(monkeypatch)
+    verify, settings = _caller(caller_path, lab)
+    getattr(Python315SSLContext, mutator)(settings, value)
+    owned = _expect_outcome(kind, good_server.url, verify, mutator, outcome, message)
+    if owned is not None:
+        assert PY315_MARK not in owned.__dict__, f"{mutator} reached the owned context"
+
+
+@pytest.mark.parametrize("kind", CLIENT_KINDS)
+@pytest.mark.parametrize("caller_path", ["stdlib", "truststore_fake"], indirect=True)
+def test_6249_python_3_15_mutators_real_calls_where_the_interpreter_has_them(
+    lab: Lab, good_server: LabServer, caller_path: str, kind: str
+) -> None:
+    """The real 3.15 call where ``ssl.SSLContext`` has it. No skip marker: the
+    branch count is asserted, and on Python 3.15+ every row must run for real."""
+    present = [row for row in PY315_ROWS if hasattr(ssl.SSLContext, row[0])]
+    absent = [row[0] for row in PY315_ROWS if row not in present]
+    count = (
+        f"real calls {len(present)}/{len(PY315_ROWS)} on Python {sys.version.split()[0]}; "
+        f"absent: {absent}"
+    )
+    assert len(present) + len(absent) == len(PY315_ROWS), count
+    if sys.version_info >= (3, 15):
+        assert len(present) == len(PY315_ROWS), count
+    for mutator, value, outcome, message in present:
+        verify, settings = _caller(caller_path, lab)
+        getattr(settings, mutator)(value)
+        _expect_outcome(kind, good_server.url, verify, mutator, outcome, message)
+
+
 # -- S-M1: the truststore shape contract ---------------------------------------
 
 

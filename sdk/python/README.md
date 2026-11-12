@@ -92,7 +92,9 @@ CA certificate the SDK can copy (certificates in a `capath` directory are
 loaded lazily and cannot be copied: pass the path instead), a context whose
 version range is empty or ends below TLS 1.2, `verify_flags` or `options` bits
 the SDK does not know, a cipher list that shares no cipher with the SDK's, a
-non-default `sni_callback`, a setting whose getter is missing or raises, an
+non-default `sni_callback`, TLS 1.3 suites narrowed with `set_ciphersuites()`
+(Python 3.15+; the SDK does not narrow its TLS 1.3 suites, so a narrower
+caller list is refused rather than dropped), a setting whose getter is missing or raises, an
 attribute of your Python's `SSLContext` that the SDK does not classify and that
 differs from a fresh default context, a `truststore.SSLContext` from a
 truststore without the 0.10.5 shape (a re-entrant `_ctx_lock` and its
@@ -104,9 +106,18 @@ Never carried, because they cannot change how the server certificate is
 verified or because they only weaken it: `keylog_filename`,
 `post_handshake_auth`, `num_tickets`, the pre-shared-key callbacks, weakening
 `verify_flags` bits such as `VERIFY_X509_PARTIAL_CHAIN`, and the client
-certificate (put it in `cert=`, see mTLS below). Not
-readable at all, so not carried: the ECDH curve (`set_ecdh_curve`) and the
-NPN protocol list; `httpcore` sets ALPN itself on every connect.
+certificate (put it in `cert=`, see mTLS below) together with
+`set_client_sigalgs` (Python 3.15+: the algorithms the client signs with for
+its own certificate, which constrains the client's side of the handshake, not
+how the server is verified). Not readable at all, so not carried (named
+residuals): the ECDH curve (`set_ecdh_curve`), the key-exchange group list
+(`set_groups`, Python 3.15+; `get_groups()` lists the groups OpenSSL
+implements, not the configured list), the signature algorithms the client
+accepts for the server's handshake signature (`set_server_sigalgs`, Python
+3.15+; this does bear on verifying the server, but there is no getter, so the
+client's context keeps OpenSSL's default list, bounded by the carried
+`security_level`) and the NPN protocol list; `httpcore` sets ALPN itself on
+every connect.
 
 Two ways to avoid passing `verify=` per client:
 

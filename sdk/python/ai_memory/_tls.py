@@ -28,16 +28,26 @@ How it holds:
 * State is read through the C-level ``_ssl._SSLContext`` descriptors, so a
   subclass whose Python properties lie is judged by what OpenSSL will do; a
   ``truststore.SSLContext`` is judged by its inner context, under its own
-  lock (#6267). An attribute of the running Python that is in neither
-  :data:`VERIFICATION_SETTINGS` nor :data:`NOT_VERIFICATION_RELEVANT` and
-  differs from a fresh default context is refused by name.
+  lock (#6267). An attribute of the running Python that is in none of
+  :data:`VERIFICATION_SETTINGS`, :data:`NOT_VERIFICATION_RELEVANT` and
+  :data:`UNREADABLE_RESIDUALS` and differs from a fresh default context is
+  refused by name.
 * Residual settings with no getter, which the SDK can neither read nor
-  carry: the ECDH curve (``set_ecdh_curve``) and the ALPN / NPN protocol
-  lists (httpcore sets ALPN itself on every connect). Neither changes how
-  the server certificate is verified. Never carried, each named with its
+  carry: the ECDH curve (``set_ecdh_curve``), the key-exchange group list
+  (``set_groups``, Python 3.15+) and the ALPN / NPN protocol lists (httpcore
+  sets ALPN itself on every connect). None of them changes how the server
+  certificate is verified. One residual does bear on verifying the server
+  and is named in :data:`UNREADABLE_RESIDUALS`: ``set_server_sigalgs``
+  (Python 3.15+), the signature algorithms the client accepts for the
+  server's handshake signature. It has no getter, so the SDK cannot prove it
+  default, refuse it or carry it; the owned context keeps OpenSSL's default
+  list, bounded by the carried security level. A TLS 1.3 suite list narrowed
+  with ``set_ciphersuites`` (Python 3.15+) is read through ``get_ciphers()``
+  and refused by the cipher row. Never carried, each named with its
   reason in :data:`NOT_VERIFICATION_RELEVANT`: ``keylog_filename``,
-  ``post_handshake_auth``, ``num_tickets``, the PSK callbacks and the
-  client identity (``cert=``).
+  ``post_handshake_auth``, ``num_tickets``, the PSK callbacks, the client
+  signing algorithms (``set_client_sigalgs``, Python 3.15+) and the client
+  identity (``cert=``).
 * The owned context is frozen once built: attribute writes, deletes and
   the trust / identity mutators raise :class:`AttributeError`.
 * ``wrap_socket`` / ``wrap_bio`` re-check the exact context at use time and
@@ -275,8 +285,9 @@ class Setting(NamedTuple):
 
 #: THE table of verification-relevant SSLContext state (X-1). Every row is
 #: read through the C-base descriptors and either carried (never weaker) or
-#: refused by its message. A new attribute of a future Python lands here or in
-#: NOT_VERIFICATION_RELEVANT; the tripwire test fails until it does.
+#: refused by its message. A new attribute of a future Python lands here, in
+#: NOT_VERIFICATION_RELEVANT or in UNREADABLE_RESIDUALS; the tripwire test
+#: fails until it does.
 VERIFICATION_SETTINGS: Final[tuple[Setting, ...]] = (
     Setting("verify_mode", "require", MSG_MODE),
     Setting("check_hostname", "require", MSG_HOST),
@@ -288,7 +299,9 @@ VERIFICATION_SETTINGS: Final[tuple[Setting, ...]] = (
     Setting("minimum_version", "minimum", MSG_VERSION_RANGE),
     Setting("maximum_version", "maximum", MSG_VERSION_RANGE),
     Setting("security_level", "level", MSG_CIPHERS),
-    Setting("ciphers", "ciphers", MSG_CIPHERS, ("set_ciphers",)),
+    # set_ciphersuites (Python 3.15+) narrows the TLS 1.3 suites; get_ciphers()
+    # lists them, so a narrowed list fails the subset check (CIPHERS_NOT_SUBSET).
+    Setting("ciphers", "ciphers", MSG_CIPHERS, ("set_ciphers", "set_ciphersuites")),
     Setting("sni_callback", "default", MSG_NOT_DEFAULT, ("set_servername_callback",)),
     Setting(
         "ca_certs",
@@ -321,7 +334,30 @@ NOT_VERIFICATION_RELEVANT: Final[Mapping[str, str]] = types.MappingProxyType(
         "set_npn_protocols": "deprecated protocol negotiation; no getter, a named residual",
         "set_psk_client_callback": "a pre-shared key skips certificate verification; never carried",
         "set_psk_server_callback": "server-side pre-shared keys; never carried",
+        "set_groups": "the key-exchange group list (Python 3.15+); no getter of the "
+        "configured list, a named residual",
+        "set_client_sigalgs": "the algorithms the client signs with for its own certificate "
+        "(Python 3.15+); identity, not server verification",
     }
+)
+
+#: Verification-relevant mutators with no getter: the SDK can neither prove
+#: them default, refuse them nor carry them (X-4). Each is named, with its
+#: reason, in the module docstring and the README. None is carried.
+UNREADABLE_RESIDUALS: Final[Mapping[str, str]] = types.MappingProxyType(
+    {
+        "set_server_sigalgs": "the signature algorithms the client accepts for the server's "
+        "handshake signature (Python 3.15+); no getter, a named residual",
+    }
+)
+
+#: SSLContext mutators new in Python 3.15; frozen on the owned context where
+#: the running Python has them, absent (and harmless) elsewhere.
+PY315_MUTATORS: Final = (
+    "set_ciphersuites",
+    "set_groups",
+    "set_client_sigalgs",
+    "set_server_sigalgs",
 )
 
 #: Prefixes of the mutator methods the tripwire enumerates.
@@ -341,6 +377,7 @@ _FROZEN_METHODS: Final = (
     "load_dh_params",
     "set_ecdh_curve",
     "set_npn_protocols",
+    *(name for name in PY315_MUTATORS if hasattr(ssl.SSLContext, name)),
 )
 
 
@@ -757,7 +794,11 @@ class _Carry:
 
     def backstop(self) -> None:
         """X-5: an unclassified attribute that is not default is refused."""
-        known = {row.name for row in VERIFICATION_SETTINGS} | set(NOT_VERIFICATION_RELEVANT)
+        known = (
+            {row.name for row in VERIFICATION_SETTINGS}
+            | set(NOT_VERIFICATION_RELEVANT)
+            | set(UNREADABLE_RESIDUALS)
+        )
         fresh = _fresh_default()
         for name, descriptor in _settings_descriptors().items():
             if name in known:
