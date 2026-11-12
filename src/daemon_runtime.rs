@@ -2645,15 +2645,12 @@ pub async fn run(
             }
         }
         Command::VerifySignedEventsChain(a) => {
-            let stdout = std::io::stdout();
-            let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
-            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
-            // #9046 — resolve the store first: a Postgres store is refused,
-            // never answered from the local SQLite side file.
-            let store_url = crate::store_url::resolve_store_url(None)?;
-            match cli::verify_signed_events::run(&db_path, store_url.as_deref(), &a, &mut out)? {
+            // #9046 / #9179 r1 — resolve the store first: a Postgres store is
+            // walked only from a URL file, never answered from the local
+            // SQLite side file; a configured sqlite:// URL opens that file.
+            match cli::verify_signed_events::run_command(&db_path, &a, app_config, audit_pubkey)
+                .await?
+            {
                 0 => Ok(()),
                 code => std::process::exit(code),
             }
@@ -5250,18 +5247,9 @@ async fn run_verify_audit_trail(
     }
 }
 
-/// Mirror [`build_store_handle`]'s `sqlite://` scheme handling so a
-/// `--store-url sqlite:///path` on `verify-audit-trail` opens the SAME
-/// file the daemon would. Returns `None` for a non-sqlite scheme.
-fn sqlite_store_url_to_path(url: &str) -> Option<&str> {
-    let path = url
-        .strip_prefix("sqlite://")
-        .or_else(|| url.strip_prefix("SQLITE://"))?;
-    Some(
-        path.strip_prefix('/')
-            .map_or(path, |p| if p.starts_with('/') { p } else { path }),
-    )
-}
+// `sqlite_store_url_to_path` lives in `cli::verify_signed_events` (SSOT,
+// #9179 r1): verify-signed-events-chain maps the same `sqlite://` forms.
+use crate::cli::verify_signed_events::sqlite_store_url_to_path;
 
 /// Postgres arm of [`run_verify_audit_trail`] — reuses the SAME
 /// no-embedder connect precedent [`build_store_handle`] uses (a verify
@@ -5277,20 +5265,12 @@ async fn verify_audit_trail_postgres(
     audit_pubkey: Option<&ed25519_dalek::VerifyingKey>,
     out: &mut cli::CliOutput<'_>,
 ) -> Result<i32> {
-    let timeout = app_config
-        .postgres_statement_timeout_secs
-        .unwrap_or(crate::store::postgres::DEFAULT_STATEMENT_TIMEOUT_SECS);
-    // #1579 A3 (SECURITY) — never echo the credential.
-    let display_url = crate::url_display::store_url_display(url);
-    tracing::info!("verify-audit-trail: opening Postgres SAL store at {display_url}");
-    let store = crate::store::postgres::PostgresStore::connect_with_dim_and_timeout(
+    let store = crate::cli::verify_signed_events::connect_postgres_for_verify(
         url,
-        crate::store::postgres::DEFAULT_EMBEDDING_DIM,
-        timeout,
-        app_config.resolve_pg_pool(),
+        app_config,
+        "verify-audit-trail",
     )
-    .await
-    .map_err(|e| anyhow::anyhow!("connect postgres adapter for verify-audit-trail: {e}"))?;
+    .await?;
     let report = store
         .verify_audit_trail(a.since.as_deref(), audit_pubkey)
         .await
@@ -12491,14 +12471,15 @@ mod tests {
     /// `verify-signed-events-chain` subcommand. We don't tamper here
     /// (the lib-side test suite owns that property); the goal is to
     /// exercise the dispatch arm so a `cargo llvm-cov` pass over the
-    /// daemon_runtime module sees it. On an empty DB the chain holds
-    /// vacuously and the subcommand exits 0, so `run()` returns
-    /// Ok(()).
+    /// daemon_runtime module sees it. A one-row chain holds and the
+    /// subcommand exits 0, so `run()` returns Ok(()).
     #[tokio::test]
     async fn test_run_dispatch_verify_signed_events_chain_command() {
         let _g = no_config_env();
         let env = TestEnv::fresh();
         let cfg = AppConfig::default();
+        // #9179 r1 code F6 — an empty store is a finding that exits the process.
+        cli::verify_signed_events::seed_one_unsigned_row_for_test(&env.db_path);
         let cli = Cli::try_parse_from([
             "ai-memory",
             "--db",
