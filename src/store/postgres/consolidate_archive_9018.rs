@@ -37,17 +37,14 @@ impl PostgresStore {
         // but this helper writes `archived_memories` + `memories` itself, so
         // it refuses on its own rather than trusting every future caller.
         self.gate_record_stop_in_transaction()?;
-        sqlx::query(SQL_DELETE_ARCHIVED_MEMORY_BY_ID)
-            .bind(id)
-            .execute(&mut **tx)
-            .await
-            .map_err(|e| to_store_err("consolidate clear prior archive record", e))?;
-        sqlx::query(SQL_ARCHIVE_SNAPSHOT_LIVE_ROW)
-            .bind(id)
-            .bind(crate::models::field_names::ARCHIVE_REASON_CONSOLIDATE)
-            .execute(&mut **tx)
-            .await
-            .map_err(|e| to_store_err("consolidate archive source", e))?;
+        // #9178 D: the one shared snapshot statement (#8169, #9218).
+        pg_replace_archive_snapshot_in_tx(
+            tx,
+            id,
+            crate::models::field_names::ARCHIVE_REASON_CONSOLIDATE,
+            "consolidate",
+        )
+        .await?;
         crate::store::postgres_parity::archive_links_for_memory_in_tx(tx, id).await?;
         let (_, anchor) = pg_sever_namespace_standards_in_tx(tx, id)
             .await
@@ -84,3 +81,4 @@ impl PostgresStore {
         Ok(anchor)
     }
 }
+

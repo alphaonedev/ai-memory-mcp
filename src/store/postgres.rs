@@ -226,6 +226,36 @@ const SQL_ARCHIVE_SNAPSHOT_LIVE_ROW: &str = "INSERT INTO archived_memories
                         confidence_source, confidence_signals, confidence_decayed_at,
                         mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until, cid, cid_genesis
                  FROM memories WHERE id = $1";
+
+/// #9178 D (#8169, #9218) — the ONE shared last-wins snapshot of a still-live
+/// row into `archived_memories` under `reason`, inside `tx`:
+/// [`SQL_DELETE_ARCHIVED_MEMORY_BY_ID`] then [`SQL_ARCHIVE_SNAPSHOT_LIVE_ROW`]
+/// (sqlite's `INSERT OR REPLACE`). New sites call this; the inline pairs left
+/// are pinned by `tests/pg_archive_snapshot_ssot_9178.rs` and may only fall.
+///
+/// # Errors
+///
+/// Any SQL failure, labelled `<what> clear prior archive record` or
+/// `<what> archive snapshot`; the caller's transaction then rolls back.
+async fn pg_replace_archive_snapshot_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    id: &str,
+    reason: &str,
+    what: &str,
+) -> StoreResult<()> {
+    sqlx::query(SQL_DELETE_ARCHIVED_MEMORY_BY_ID)
+        .bind(id)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| to_store_err(&format!("{what} clear prior archive record"), e))?;
+    sqlx::query(SQL_ARCHIVE_SNAPSHOT_LIVE_ROW)
+        .bind(id)
+        .bind(reason)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| to_store_err(&format!("{what} archive snapshot"), e))?;
+    Ok(())
+}
 /// #2195 (data-integrity archive-parity) — LAST-WINS `ON CONFLICT` clause for
 /// the eviction / manual archive-INSERT paths (`forget`, `run_gc`, `size_gc`,
 /// `archive_by_ids`). SQLite archives via `INSERT OR REPLACE` (last-wins: a
