@@ -557,30 +557,7 @@ async fn rewind_to_version(pool: &PgPool, effects: &BTreeMap<i32, ArmEffects>, v
         }
     }
 
-    // Catalog assertion (#9217): no trigger function left in the synthetic
-    // legacy shape may name a column the strip removed.
-    let stripped: BTreeSet<String> = effects
-        .range((v + 1)..)
-        .flat_map(|(_, e)| e.columns.iter().map(|(_, c)| c.to_ascii_lowercase()))
-        .collect();
-    let bodies: Vec<(String, String)> = sqlx::query(
-        "SELECT p.proname::text AS name, p.prosrc AS src FROM pg_proc p
-         JOIN pg_namespace n ON n.oid = p.pronamespace
-         WHERE n.nspname = 'public' AND p.prorettype = 'trigger'::regtype",
-    )
-    .fetch_all(pool)
-    .await
-    .expect("rewind: read trigger function bodies")
-    .into_iter()
-    .map(|r| (r.get::<String, _>("name"), r.get::<String, _>("src")))
-    .collect();
-    let dangling = trigger_bodies_referencing_stripped_columns(&bodies, &stripped);
-    assert!(
-        dangling.is_empty(),
-        "#9217: the synthetic v{v} legacy shape keeps trigger functions that reference columns \
-         the strip removed (function:column): {dangling:?} — the strip set must remove triggers \
-         and trigger functions together with the columns they use."
-    );
+    assert_no_stripped_column_dependents(pool, effects, v).await;
 
     sqlx::query("DELETE FROM schema_version")
         .execute(pool)
@@ -591,6 +568,92 @@ async fn rewind_to_version(pool: &PgPool, effects: &BTreeMap<i32, ArmEffects>, v
         .execute(pool)
         .await
         .expect("rewind: stamp legacy schema_version");
+}
+
+/// Catalog assertion run after EVERY strip (#9217): for every column stripped
+/// above `v`, no catalog object may still depend on it.
+///
+/// 1. the column itself is gone (`pg_attribute`, not merely dropped-flagged);
+/// 2. `pg_depend` holds no row whose referenced object is a dropped column
+///    (an index, constraint, default, view or trigger clause that outlived it);
+/// 3. no user-defined function body (trigger functions included; their text is
+///    invisible to `pg_depend`) still names a stripped column.
+///
+/// Every failure names the exact orphan objects.
+async fn assert_no_stripped_column_dependents(
+    pool: &PgPool,
+    effects: &BTreeMap<i32, ArmEffects>,
+    v: i32,
+) {
+    let stripped_pairs: Vec<(String, String)> = effects
+        .range((v + 1)..)
+        .flat_map(|(_, e)| e.columns.iter().cloned())
+        .collect();
+    let stripped: BTreeSet<String> = stripped_pairs
+        .iter()
+        .map(|(_, c)| c.to_ascii_lowercase())
+        .collect();
+
+    let mut surviving: Vec<String> = Vec::new();
+    for (tbl, col) in &stripped_pairs {
+        let hit: Option<i64> = sqlx::query_scalar(
+            "SELECT 1::bigint FROM pg_attribute a
+             JOIN pg_class c ON c.oid = a.attrelid
+             JOIN pg_namespace n ON n.oid = c.relnamespace
+             WHERE n.nspname = 'public' AND c.relname = $1 AND a.attname = $2
+               AND a.attnum > 0 AND NOT a.attisdropped",
+        )
+        .bind(tbl)
+        .bind(col)
+        .fetch_optional(pool)
+        .await
+        .unwrap_or_else(|e| panic!("rewind: read pg_attribute {tbl}.{col}: {e}"));
+        if hit.is_some() {
+            surviving.push(format!("{tbl}.{col}"));
+        }
+    }
+    assert!(
+        surviving.is_empty(),
+        "#9217: the synthetic v{v} legacy shape still carries stripped columns: {surviving:?}"
+    );
+
+    let orphans: Vec<String> = sqlx::query_scalar(
+        "SELECT pg_describe_object(d.classid, d.objid, d.objsubid) || ' -> ' || c.relname::text
+                || '.' || a.attname::text
+         FROM pg_depend d
+         JOIN pg_attribute a ON a.attrelid = d.refobjid AND a.attnum = d.refobjsubid
+         JOIN pg_class c ON c.oid = d.refobjid
+         JOIN pg_namespace n ON n.oid = c.relnamespace
+         WHERE d.refclassid = 'pg_class'::regclass AND a.attisdropped AND n.nspname = 'public'",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("rewind: read pg_depend");
+    assert!(
+        orphans.is_empty(),
+        "#9217: the synthetic v{v} legacy shape keeps catalog objects that depend on a stripped          column: {orphans:?}"
+    );
+
+    let bodies: Vec<(String, String)> = sqlx::query(
+        "SELECT p.proname::text AS name, p.prosrc AS src FROM pg_proc p
+         JOIN pg_namespace n ON n.oid = p.pronamespace
+         JOIN pg_language l ON l.oid = p.prolang
+         WHERE n.nspname = 'public' AND p.prokind = 'f' AND l.lanname IN ('plpgsql', 'sql')
+           AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.objid = p.oid AND d.deptype = 'e')",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("rewind: read function bodies")
+    .into_iter()
+    .map(|r| (r.get::<String, _>("name"), r.get::<String, _>("src")))
+    .collect();
+    let dangling = trigger_bodies_referencing_stripped_columns(&bodies, &stripped);
+    assert!(
+        dangling.is_empty(),
+        "#9217: the synthetic v{v} legacy shape keeps trigger functions that reference columns \
+         the strip removed (function:column): {dangling:?} — the strip set must remove triggers \
+         and trigger functions together with the columns they use."
+    );
 }
 
 /// `name -> lowest ladder version whose arm defines it`, for one name list of
