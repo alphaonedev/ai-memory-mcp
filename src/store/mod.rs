@@ -2807,6 +2807,29 @@ pub trait MemoryStore: Send + Sync {
         })
     }
 
+    /// #9147 C5 — [`apply_remote_memory`](MemoryStore::apply_remote_memory)
+    /// answering the typed [`crate::storage::InboundMergeOutcome`]: `Applied`
+    /// with the resolved id, or `Dropped` with the receiver merge barrier
+    /// (`Tombstoned` / `Archived` / `Held`) that refused the write (nothing
+    /// written). A counting caller (the federation receive tally, catch-up)
+    /// must use this, never count `apply_remote_memory`'s bare id as applied.
+    ///
+    /// Default implementation: `UnsupportedCapability`.
+    ///
+    /// # Errors
+    ///
+    /// Everything [`apply_remote_memory`](MemoryStore::apply_remote_memory)
+    /// returns.
+    async fn apply_remote_memory_outcome(
+        &self,
+        _ctx: &CallerContext,
+        _memory: &Memory,
+    ) -> StoreResult<crate::storage::InboundMergeOutcome> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "FEDERATION_APPLY_REMOTE".to_string(),
+        })
+    }
+
     /// v0.8.0 Pillar-3 (#1709 / #224) — federation conflict-path entry
     /// that field-merges a divergent same-`id` inbound row via the
     /// CRDT-lite [`crate::models::merge_memory`] reconciler instead of the
@@ -2876,6 +2899,9 @@ pub trait MemoryStore: Send + Sync {
     /// Default: `UnsupportedCapability` — an adapter that cannot re-check
     /// FAILS CLOSED rather than silently merging unchecked.
     ///
+    /// #9147 C5 — answers the typed [`crate::storage::InboundMergeOutcome`]:
+    /// a receiver merge-barrier drop is `Dropped`, never counted as applied.
+    ///
     /// # Errors
     ///
     /// Everything [`merge_inbound`](MemoryStore::merge_inbound) returns, plus a
@@ -2888,7 +2914,7 @@ pub trait MemoryStore: Send + Sync {
         _inbound: &Memory,
         _receiver_verified: bool,
         _authorize_stored: crate::storage::StoredNamespaceAuthorizer<'_>,
-    ) -> StoreResult<String> {
+    ) -> StoreResult<crate::storage::InboundMergeOutcome> {
         Err(StoreError::UnsupportedCapability {
             capability: "FEDERATION_MERGE_INBOUND_AUTHORIZED".to_string(),
         })

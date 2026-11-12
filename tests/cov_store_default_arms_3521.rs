@@ -251,6 +251,11 @@ async fn unimplemented_default_arms_refuse_naming_their_capability() {
         s.list_memories_updated_since_counted(None, 10).await,
         "FEDERATION_LIST_SINCE",
     );
+    // #9147 C5 — the typed-outcome apply arm fails closed like its id twin.
+    refused(
+        s.apply_remote_memory_outcome(&ctx, &mem).await,
+        "FEDERATION_APPLY_REMOTE",
+    );
     refused(
         s.merge_inbound(&ctx, &mem, false).await,
         "FEDERATION_MERGE_INBOUND",

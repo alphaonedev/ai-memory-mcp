@@ -2673,6 +2673,8 @@ async fn sync_push_write(
         return refusal;
     }
     let mut applied = 0usize;
+    // #9147 C5 — receiver merge-barrier drops; never part of `applied`.
+    let mut merge_barrier_dropped = 0usize;
     let mut noop = 0usize;
     let mut skipped = 0usize;
     // #3699 — collected with each item's WIRE index: the loop applies in causal
@@ -3095,7 +3097,14 @@ async fn sync_push_write(
             row_is_agent_attested(&to_insert),
             Some(&authorize_stored),
         ) {
-            Ok(actual_id) => {
+            // #9147 C5 — the receiver merge barrier dropped the row (nothing
+            // written): counted apart from `applied`, and none of the
+            // applied-row side effects (dequarantine, inbox wake, embedding)
+            // run for a row that was not written.
+            Ok(crate::storage::InboundMergeOutcome::Dropped { .. }) => {
+                merge_barrier_dropped += 1;
+            }
+            Ok(crate::storage::InboundMergeOutcome::Applied(actual_id)) => {
                 applied += 1;
                 // v1.0.0 R19/A3 (#1948) — route-OUT dequarantine-on-attest.
                 // Boids item 3 R2.2 (#3905 closed): `merge_inbound`'s same-id
@@ -3271,6 +3280,7 @@ async fn sync_push_write(
                 "max": q.max,
                 "agent_id": q.agent_id,
                 "applied_before_refusal": applied,
+                (crate::handlers::MERGE_BARRIER_DROPPED_FIELD): merge_barrier_dropped,
                 (crate::handlers::QUOTA_REFUSED_FIELD): quota_refused,
                 (crate::handlers::ATTESTATION_REJECTIONS_FIELD): rejections_in_wire_order(&attestation_rejections),
                 "reset_at": reset_at,
@@ -4808,6 +4818,7 @@ async fn sync_push_write(
             // into `skipped`.
             "namespace_meta_refused": namespace_meta_refused,
             "noop": noop,
+            (crate::handlers::MERGE_BARRIER_DROPPED_FIELD): merge_barrier_dropped,
             (crate::handlers::SKIPPED_FIELD): skipped,
             (crate::handlers::QUOTA_REFUSED_FIELD): quota_refused,
             (crate::handlers::ATTESTATION_REJECTIONS_FIELD): rejections_in_wire_order(&attestation_rejections),

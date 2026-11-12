@@ -60,6 +60,76 @@ impl ReceiverMergeBarrier {
     }
 }
 
+/// What an inbound federation upsert did on the receiver (#9147 C5).
+///
+/// A barrier drop is an idempotent no-op that still answers with an id (a
+/// refused row would make the pushing peer retry forever), so a bare id cannot
+/// tell the caller whether anything was written. Every caller that counts or
+/// side-effects an apply (the receive tallies, catch-up, `ai-memory sync`)
+/// matches on this instead: a [`Self::Dropped`] row is never counted as
+/// applied, never wakes waiters and never ships an embedding.
+#[must_use]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InboundMergeOutcome {
+    /// The row was merged, inserted, or lost the newer-wins vote against the
+    /// local row (the legacy "applied" meaning); carries the resolved local id.
+    Applied(String),
+    /// The receiver merge barrier refused the row; nothing was written.
+    Dropped {
+        /// The id the barrier fired on (the local row's id for a held slot).
+        id: String,
+        /// Why the barrier fired.
+        barrier: ReceiverMergeBarrier,
+    },
+}
+
+impl InboundMergeOutcome {
+    /// The resolved id, applied or dropped.
+    #[must_use]
+    pub fn id(&self) -> &str {
+        match self {
+            Self::Applied(id) | Self::Dropped { id, .. } => id,
+        }
+    }
+
+    /// Consume into the resolved id (the legacy `String` answer).
+    #[must_use]
+    pub fn into_id(self) -> String {
+        match self {
+            Self::Applied(id) | Self::Dropped { id, .. } => id,
+        }
+    }
+
+    /// The barrier that dropped the row, or `None` when it was applied.
+    #[must_use]
+    pub fn dropped_by(&self) -> Option<ReceiverMergeBarrier> {
+        match self {
+            Self::Applied(_) => None,
+            Self::Dropped { barrier, .. } => Some(*barrier),
+        }
+    }
+
+    /// A drop: trace it, count it in
+    /// [`crate::metrics::inc_fed_merge_barrier_dropped`], and build the outcome.
+    #[must_use]
+    pub fn dropped(id: String, barrier: ReceiverMergeBarrier) -> Self {
+        trace_merge_barrier_drop(&id, barrier);
+        crate::metrics::inc_fed_merge_barrier_dropped(barrier.as_str());
+        Self::Dropped { id, barrier }
+    }
+}
+
+/// [`insert_if_newer_outcome`] answering only the resolved id, applied or
+/// dropped. A caller that counts applies, advances a durability mark on an
+/// apply, or side-effects it must match the outcome instead (#9147 C5).
+///
+/// # Errors
+///
+/// Everything [`insert_if_newer_outcome`] returns.
+pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
+    insert_if_newer_outcome(conn, mem).map(InboundMergeOutcome::into_id)
+}
+
 /// Is `memory_id` archived with no live row of the same id?
 fn archived_without_live(conn: &Connection, memory_id: &str) -> Result<bool> {
     let hit: bool = conn.query_row(

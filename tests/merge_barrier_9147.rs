@@ -410,6 +410,26 @@ const FRESH_ROWS: usize = 3;
 /// cannot absorb a concurrent cell's drops.
 static DROP_METRIC_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// #9147 C5 — drive one funnel and keep its typed outcome (the value every
+/// receive tally matches on).
+async fn push_outcome(
+    store: &Arc<dyn MemoryStore>,
+    funnel: Funnel,
+    row: &Memory,
+) -> ai_memory::storage::InboundMergeOutcome {
+    let ctx = operator_ctx();
+    let authorize_all = |_: &str| true;
+    match funnel {
+        Funnel::ApplyRemoteMemory => store.apply_remote_memory_outcome(&ctx, row).await,
+        Funnel::MergeInbound => {
+            store
+                .merge_inbound_authorized(&ctx, row, false, &authorize_all)
+                .await
+        }
+    }
+    .unwrap_or_else(|e| panic!("{funnel:?} push must not error: {e}"))
+}
+
 /// Move a seeded live row behind the barrier named by `tag`.
 async fn put_behind_barrier(store: &Arc<dyn MemoryStore>, view: &RawView, id: &str, tag: &str) {
     let ctx = operator_ctx();
@@ -434,6 +454,69 @@ async fn put_behind_barrier(store: &Arc<dyn MemoryStore>, view: &RawView, id: &s
             assert!(moved, "archive must move the seeded row");
         }
         held => view.hold(id, held).await,
+    }
+}
+
+/// #9147 C5 (cF10, cF11) — a row the receiver merge barrier drops is never
+/// counted as applied: over one batch of `DROP_TAGS.len()` barrier targets and
+/// `FRESH_ROWS` fresh rows, each funnel answers EXACTLY `FRESH_ROWS` applies
+/// and `DROP_TAGS.len()` drops, each drop names its barrier, and the
+/// `ai_memory_fed_merge_barrier_dropped_total{barrier}` counter moves by
+/// exactly one per label.
+async fn drop_count_cells(store: Arc<dyn MemoryStore>, view: RawView, backend: &str) {
+    for funnel in FUNNELS {
+        let ns = uniq("barrier-c5");
+        let mut batch: Vec<(Memory, Option<&str>)> = Vec::new();
+        for tag in DROP_TAGS {
+            let id = uuid::Uuid::new_v4().to_string();
+            let row = mk_row(&id, &ns, &uniq("t"), ORIGINAL_CONTENT, &ts(0));
+            seed(&store, &view, &row).await;
+            put_behind_barrier(&store, &view, &id, tag).await;
+            batch.push((pushed(&row, Push::Newer), Some(tag)));
+        }
+        for _ in 0..FRESH_ROWS {
+            let id = uuid::Uuid::new_v4().to_string();
+            batch.push((mk_row(&id, &ns, &uniq("t"), PUSHED_CONTENT, &ts(0)), None));
+        }
+        let before = DROP_TAGS.map(ai_memory::metrics::fed_merge_barrier_dropped_count);
+        let (mut applied, mut dropped) = (0usize, 0usize);
+        for (row, expected) in &batch {
+            let outcome = push_outcome(&store, funnel, row).await;
+            assert_eq!(
+                outcome
+                    .dropped_by()
+                    .map(ai_memory::storage::ReceiverMergeBarrier::as_str),
+                *expected,
+                "{backend} {funnel:?}: row {} answered {outcome:?}",
+                row.id
+            );
+            assert_eq!(outcome.id(), row.id, "{backend} {funnel:?}: resolved id");
+            match outcome {
+                ai_memory::storage::InboundMergeOutcome::Applied(_) => applied += 1,
+                ai_memory::storage::InboundMergeOutcome::Dropped { .. } => dropped += 1,
+            }
+        }
+        assert_eq!(
+            (applied, dropped),
+            (FRESH_ROWS, DROP_TAGS.len()),
+            "{backend} {funnel:?}: (applied, dropped) over the batch"
+        );
+        for (tag, was) in DROP_TAGS.iter().zip(before) {
+            assert_eq!(
+                ai_memory::metrics::fed_merge_barrier_dropped_count(tag) - was,
+                1,
+                "{backend} {funnel:?}: drop metric delta for barrier={tag}"
+            );
+        }
+        for (row, expected) in &batch {
+            if expected.is_none() {
+                assert_eq!(
+                    view.row_state(&row.id).await.live,
+                    1,
+                    "{backend} {funnel:?}: an applied fresh row is live"
+                );
+            }
+        }
     }
 }
 
@@ -601,7 +684,7 @@ async fn sync_push(
 /// #9147 C5 (cF10, cF11) — the `/sync/push` tally: one batch of
 /// `DROP_TAGS.len()` barrier targets and `FRESH_ROWS` fresh rows answers
 /// EXACTLY `applied = FRESH_ROWS` and `merge_barrier_dropped =
-/// DROP_TAGS.len()`.
+/// DROP_TAGS.len()`, and the drop metric moves by one per barrier label.
 async fn push_tally_cell(
     store: Arc<dyn MemoryStore>,
     view: RawView,
@@ -630,6 +713,7 @@ async fn push_tally_cell(
     for row in &mut batch {
         row.source = PUSH_SOURCE.to_string();
     }
+    let before = DROP_TAGS.map(ai_memory::metrics::fed_merge_barrier_dropped_count);
     let (status, body) = sync_push(router, &batch).await;
     assert_eq!(
         status,
@@ -644,6 +728,13 @@ async fn push_tally_cell(
         ),
         "{backend}: (applied, merge_barrier_dropped) of the push: {body}"
     );
+    for (tag, was) in DROP_TAGS.iter().zip(before) {
+        assert_eq!(
+            ai_memory::metrics::fed_merge_barrier_dropped_count(tag) - was,
+            1,
+            "{backend}: push drop metric delta for barrier={tag}"
+        );
+    }
     for row in &fresh {
         assert_eq!(
             view.row_state(&row.id).await.live,
@@ -678,6 +769,13 @@ async fn sqlite_hold_is_a_merge_barrier_9150() {
     let _metric = DROP_METRIC_LOCK.lock().await;
     let (_dir, store, view) = sqlite_store();
     hold_barrier_cells(store, view, "sqlite").await;
+}
+
+#[tokio::test]
+async fn sqlite_barrier_drop_is_never_counted_applied_9147() {
+    let _metric = DROP_METRIC_LOCK.lock().await;
+    let (_dir, store, view) = sqlite_store();
+    drop_count_cells(store, view, "sqlite").await;
 }
 
 #[tokio::test]
@@ -871,6 +969,17 @@ async fn postgres_hold_is_a_merge_barrier_9150() {
         return;
     };
     hold_barrier_cells(store, view, "postgres").await;
+}
+
+#[cfg(feature = "sal-postgres")]
+#[tokio::test]
+async fn postgres_barrier_drop_is_never_counted_applied_9147() {
+    let _metric = DROP_METRIC_LOCK.lock().await;
+    let Some((store, view)) = pg_store().await else {
+        eprintln!("SKIP: AI_MEMORY_TEST_POSTGRES_URL unset");
+        return;
+    };
+    drop_count_cells(store, view, "postgres").await;
 }
 
 #[cfg(feature = "sal-postgres")]

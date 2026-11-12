@@ -25081,9 +25081,19 @@ impl MemoryStore for PostgresStore {
 
     async fn apply_remote_memory(
         &self,
-        _ctx: &CallerContext,
+        ctx: &CallerContext,
         memory: &Memory,
     ) -> StoreResult<String> {
+        self.apply_remote_memory_outcome(ctx, memory)
+            .await
+            .map(crate::storage::InboundMergeOutcome::into_id)
+    }
+
+    async fn apply_remote_memory_outcome(
+        &self,
+        _ctx: &CallerContext,
+        memory: &Memory,
+    ) -> StoreResult<crate::storage::InboundMergeOutcome> {
         self.gate_record_stop().await?;
         // #2314 — sqlite `insert_if_newer` guard parity on the pg
         // federation-apply funnel (reached by the /sync/push receive path
@@ -25111,7 +25121,10 @@ impl MemoryStore for PostgresStore {
                 "{}",
                 crate::storage::FORGET_TOMBSTONE_DROP_MSG
             );
-            return Ok(memory.id.clone());
+            return Ok(crate::storage::InboundMergeOutcome::dropped(
+                memory.id.clone(),
+                crate::storage::ReceiverMergeBarrier::Tombstoned,
+            ));
         }
         let screened = crate::secret_screen::redact_memory_for_receive(memory);
         let memory = screened.as_ref().unwrap_or(memory);
@@ -25247,11 +25260,13 @@ impl MemoryStore for PostgresStore {
         .await
         .map_err(|e| to_store_err("apply_remote_memory merge barrier probe", e))?
         {
-            crate::storage::trace_merge_barrier_drop(&memory.id, barrier);
             tx.rollback()
                 .await
                 .map_err(|e| to_store_err("apply_remote_memory merge barrier rollback", e))?;
-            return Ok(memory.id.clone());
+            return Ok(crate::storage::InboundMergeOutcome::dropped(
+                memory.id.clone(),
+                barrier,
+            ));
         }
         // #4206 (the title-slot half of #1773 / #3961) — when the inbound row
         // wins the tiebreak AND its plaintext differs from the stored text,
@@ -25652,7 +25667,7 @@ impl MemoryStore for PostgresStore {
         tx.commit()
             .await
             .map_err(|e| to_store_err("commit apply_remote_memory tx", e))?;
-        Ok(applied_id)
+        Ok(crate::storage::InboundMergeOutcome::Applied(applied_id))
     }
 
     async fn merge_inbound(
@@ -25663,6 +25678,7 @@ impl MemoryStore for PostgresStore {
     ) -> StoreResult<String> {
         self.pg_merge_inbound(ctx, inbound, receiver_verified, None)
             .await
+            .map(crate::storage::InboundMergeOutcome::into_id)
     }
 
     async fn merge_inbound_authorized(
@@ -25671,7 +25687,7 @@ impl MemoryStore for PostgresStore {
         inbound: &Memory,
         receiver_verified: bool,
         authorize_stored: crate::storage::StoredNamespaceAuthorizer<'_>,
-    ) -> StoreResult<String> {
+    ) -> StoreResult<crate::storage::InboundMergeOutcome> {
         self.pg_merge_inbound(ctx, inbound, receiver_verified, Some(authorize_stored))
             .await
     }

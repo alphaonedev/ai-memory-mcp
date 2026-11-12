@@ -1912,6 +1912,16 @@ impl MemoryStore for SqliteStore {
         db::insert_if_newer(&conn, memory).map_err(box_err)
     }
 
+    async fn apply_remote_memory_outcome(
+        &self,
+        _ctx: &CallerContext,
+        memory: &Memory,
+    ) -> StoreResult<crate::storage::InboundMergeOutcome> {
+        self.gate_record_stop()?;
+        let conn = self.state.lock().await;
+        db::insert_if_newer_outcome(&conn, memory).map_err(box_err)
+    }
+
     async fn merge_inbound(
         &self,
         _ctx: &CallerContext,
@@ -1933,7 +1943,7 @@ impl MemoryStore for SqliteStore {
         inbound: &Memory,
         receiver_verified: bool,
         authorize_stored: crate::storage::StoredNamespaceAuthorizer<'_>,
-    ) -> StoreResult<String> {
+    ) -> StoreResult<crate::storage::InboundMergeOutcome> {
         self.gate_record_stop()?;
         // #4023 — the re-check runs inside the free-fn's BEGIN IMMEDIATE.
         let conn = self.state.lock().await;

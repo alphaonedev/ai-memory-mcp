@@ -543,11 +543,17 @@ async fn assert_typed_refusal(backend: &str, store: &dyn MemoryStore) {
         "{backend}: refusal writes nothing"
     );
 
-    // CONTROL: an admitting authorizer merges.
-    store
+    // CONTROL: an admitting authorizer merges, and the outcome says so
+    // (#9147 C5: no barrier stands on this live row).
+    let outcome = store
         .merge_inbound_authorized(&admin_ctx(), &inbound, false, &|_stored: &str| true)
         .await
         .expect("admitted merge");
+    assert_eq!(
+        outcome,
+        ai_memory::storage::InboundMergeOutcome::Applied(id.clone()),
+        "{backend}: the admitted merge is an apply"
+    );
     let row = store.get(&admin_ctx(), &id).await.expect("row");
     assert_eq!(row.content, "narrow peer overwrite", "{backend}: control");
 }

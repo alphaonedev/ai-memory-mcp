@@ -347,6 +347,13 @@ pub struct Metrics {
     /// the divergence is never silent inside an HTTP 200.
     pub federation_cross_id_title_merge: IntCounter,
 
+    /// #9147 C5 — inbound federated upserts DROPPED by the receiver merge
+    /// barrier (nothing written), labeled by `barrier` (the closed
+    /// [`crate::storage::ReceiverMergeBarrier::as_str`] tag set). A drop is
+    /// never counted as applied; the receive response reports the same count
+    /// as `merge_barrier_dropped`.
+    pub federation_merge_barrier_dropped: IntCounterVec,
+
     /// v1.0.0 #2402 — the route-OUT twin of
     /// [`Self::federation_quarantined_unattributed`]: monotonic count of
     /// quarantined rows an OPERATOR released through
@@ -1193,6 +1200,19 @@ impl Metrics {
             &mut err,
         );
 
+        // #9147 C5 — receiver merge-barrier drops (closed `barrier` labels).
+        let federation_merge_barrier_dropped = int_counter_vec(
+            &registry,
+            "ai_memory_fed_merge_barrier_dropped_total",
+            "Inbound federated upserts dropped by the receiver merge barrier \
+             (the target id is tombstoned, archived with no live row, or held \
+             in quarantine / contamination), labeled by barrier. Nothing is \
+             written and the row is never counted as applied; the receive \
+             response reports the same drops as merge_barrier_dropped.",
+            &["barrier"],
+            &mut err,
+        );
+
         // #3699 (5-agent vote 4d3ea1c5) — cross-id title-merge observability.
         let federation_cross_id_title_merge = int_counter(
             &registry,
@@ -1616,6 +1636,7 @@ impl Metrics {
             federation_nonce_store_unavailable,
             audit_anchor_frameless_drop,
             federation_cross_id_title_merge,
+            federation_merge_barrier_dropped,
             operator_dequarantined,
             hnsw_evictions_total,
             hnsw_last_eviction_at_nanos,
@@ -1850,6 +1871,28 @@ pub fn fed_quarantined_unattributed_count() -> u64 {
 /// caller emits the paired WARN naming both ids (`federation.cross_id_merge`).
 pub fn inc_fed_cross_id_title_merge() {
     registry().federation_cross_id_title_merge.inc();
+}
+
+/// #9147 C5 — record ONE inbound federated upsert dropped by the receiver
+/// merge barrier named by `barrier` (a
+/// [`crate::storage::ReceiverMergeBarrier::as_str`] tag). Called only by
+/// [`crate::storage::InboundMergeOutcome::dropped`], so every backend and
+/// funnel counts a drop exactly once.
+pub fn inc_fed_merge_barrier_dropped(barrier: &str) {
+    registry()
+        .federation_merge_barrier_dropped
+        .with_label_values(&[barrier])
+        .inc();
+}
+
+/// #9147 C5 — read the merge-barrier drop counter for one `barrier` label
+/// (test accessor).
+#[must_use]
+pub fn fed_merge_barrier_dropped_count(barrier: &str) -> u64 {
+    registry()
+        .federation_merge_barrier_dropped
+        .with_label_values(&[barrier])
+        .get()
 }
 
 /// #3699 — read the cross-id title-merge counter (test accessor).

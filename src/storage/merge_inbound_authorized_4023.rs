@@ -64,6 +64,9 @@ impl std::error::Error for InboundStoredNamespaceRefused {}
 /// authorized), and a same-`id` row appearing concurrently fails the insert
 /// on the primary key rather than being overwritten.
 ///
+/// A receiver merge-barrier drop answers [`InboundMergeOutcome::Dropped`],
+/// never an apply (#9147 C5).
+///
 /// # Errors
 ///
 /// Everything [`merge_inbound`] returns, plus a refusal (built by
@@ -74,7 +77,7 @@ pub fn merge_inbound_authorized(
     inbound: &Memory,
     receiver_verified: bool,
     authorize_stored: Option<StoredNamespaceAuthorizer<'_>>,
-) -> Result<String> {
+) -> Result<InboundMergeOutcome> {
     // Wave-2 B2 — record-stop fence on the same-id overwrite path.
     // `insert_if_newer` (no-row fall-through) already gated; the existing-row
     // branch used to bypass via `overwrite_full_row_by_id`. Federation-receive
@@ -85,7 +88,7 @@ pub fn merge_inbound_authorized(
     // against a concurrent peer push (BEGIN IMMEDIATE — same idiom as
     // `consolidate` / `size_gc`).
     let write_txn = connection::WriteTxn::begin(conn)?;
-    let tx_result = (|| -> Result<Option<String>> {
+    let tx_result = (|| -> Result<Option<InboundMergeOutcome>> {
         // Boids item 3 R2.2 (#3905) — `get_any`, not `get`: `get` hides
         // system-only rows, so a contaminated local row fell through to the
         // insert lane instead of reaching `merge_memory` (whose R2.1
@@ -112,8 +115,7 @@ pub fn merge_inbound_authorized(
                 if let Some(held) = barrier
                     && !barrier_yields_to_verified_release(held, receiver_verified)
                 {
-                    trace_merge_barrier_drop(&existing.id, held);
-                    return Ok(Some(existing.id));
+                    return Ok(Some(InboundMergeOutcome::dropped(existing.id, held)));
                 }
                 // #2123 — backend parity with `PostgresStore::merge_inbound`:
                 // the same-`id` field-merge path persists via
@@ -179,11 +181,10 @@ pub fn merge_inbound_authorized(
                 if let Some(held) = barrier
                     && !crate::models::is_verified_signed_unit(&merged, inbound, receiver_verified)
                 {
-                    trace_merge_barrier_drop(&existing.id, held);
-                    return Ok(Some(existing.id));
+                    return Ok(Some(InboundMergeOutcome::dropped(existing.id, held)));
                 }
                 overwrite_full_row_by_id(conn, &merged)?;
-                Ok(Some(merged.id))
+                Ok(Some(InboundMergeOutcome::Applied(merged.id)))
             }
             // No row by this id — defer to the (title, namespace) dedup
             // path OUTSIDE this transaction (signalled by `None`).
@@ -192,16 +193,16 @@ pub fn merge_inbound_authorized(
     })();
 
     match tx_result {
-        Ok(Some(id)) => {
+        Ok(Some(outcome)) => {
             write_txn.commit()?;
-            Ok(id)
+            Ok(outcome)
         }
         Ok(None) => {
             // Nothing was written in the merge transaction; close it
             // cleanly and fall through to the unchanged LWW path
             // (handles fresh insert + (title, namespace) dedup-upsert).
             write_txn.commit()?;
-            insert_if_newer(conn, inbound)
+            insert_if_newer_outcome(conn, inbound)
         }
         // #4116 — settle deferred escalations, then report the REAL outcome.
         Err(e) => Err(write_txn.rollback_resolving(e)),

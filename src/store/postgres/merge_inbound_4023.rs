@@ -25,14 +25,16 @@ impl PostgresStore {
     /// Shared body of [`MemoryStore::merge_inbound`] and (#4023)
     /// [`MemoryStore::merge_inbound_authorized`]: `authorize_stored` is `None`
     /// for the unchecked legacy entry and `Some` for the federation receive
-    /// funnel's in-transaction peer-scope re-check.
+    /// funnel's in-transaction peer-scope re-check. A receiver merge-barrier
+    /// drop answers [`crate::storage::InboundMergeOutcome::Dropped`], never an
+    /// apply (#9147 C5).
     pub(super) async fn pg_merge_inbound(
         &self,
         ctx: &CallerContext,
         inbound: &Memory,
         receiver_verified: bool,
         authorize_stored: Option<crate::storage::StoredNamespaceAuthorizer<'_>>,
-    ) -> StoreResult<String> {
+    ) -> StoreResult<crate::storage::InboundMergeOutcome> {
         self.gate_record_stop().await?;
         // v0.8.1 W2.3 (#1821 / gap G30) — resurrection guard (postgres parity
         // with the sqlite insert_if_newer gate). DROP an inbound write for a
@@ -50,7 +52,10 @@ impl PostgresStore {
                 "{}",
                 crate::storage::FORGET_TOMBSTONE_DROP_MSG
             );
-            return Ok(inbound.id.clone());
+            return Ok(crate::storage::InboundMergeOutcome::dropped(
+                inbound.id.clone(),
+                crate::storage::ReceiverMergeBarrier::Tombstoned,
+            ));
         }
 
         // v0.8.1 W1 (#1821 / gap G29) — credential REDACT on the postgres
@@ -100,7 +105,7 @@ impl PostgresStore {
             // No row by this id — defer to the unchanged LWW path (the empty
             // transaction is rolled back on drop).
             drop(tx);
-            return self.apply_remote_memory(ctx, inbound).await;
+            return self.apply_remote_memory_outcome(ctx, inbound).await;
         };
 
         let existing = Self::row_to_memory(&row)?;
@@ -135,9 +140,11 @@ impl PostgresStore {
         if let Some(held) = barrier
             && !crate::storage::barrier_yields_to_verified_release(held, receiver_verified)
         {
-            crate::storage::trace_merge_barrier_drop(&existing.id, held);
             drop(tx);
-            return Ok(existing.id);
+            return Ok(crate::storage::InboundMergeOutcome::dropped(
+                existing.id,
+                held,
+            ));
         }
         // #1719 item 3a — neutralize the untrusted inbound's self-asserted
         // `metadata.attest_level` to `claimed` before merge (identical to
@@ -178,9 +185,11 @@ impl PostgresStore {
         if let Some(held) = barrier
             && !crate::models::is_verified_signed_unit(&merged, inbound, receiver_verified)
         {
-            crate::storage::trace_merge_barrier_drop(&existing.id, held);
             drop(tx);
-            return Ok(existing.id);
+            return Ok(crate::storage::InboundMergeOutcome::dropped(
+                existing.id,
+                held,
+            ));
         }
 
         // Encode the JSON-shaped columns the same way the
@@ -323,6 +332,6 @@ impl PostgresStore {
             .await
             .map_err(|e| to_store_err("merge_inbound commit tx", e))?;
 
-        Ok(merged.id)
+        Ok(crate::storage::InboundMergeOutcome::Applied(merged.id))
     }
 }

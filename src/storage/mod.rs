@@ -898,9 +898,9 @@ mod federation_by_id_4447;
 // archive-purging federated deletion (qual_10 split).
 mod merge_barrier_9147;
 pub use merge_barrier_9147::{
-    MERGE_BARRIER_TRACE_TARGET, ReceiverMergeBarrier, barrier_yields_to_verified_release,
-    dequarantine, federated_delete, receiver_merge_barrier, trace_merge_barrier_drop,
-    verified_release_candidate,
+    InboundMergeOutcome, MERGE_BARRIER_TRACE_TARGET, ReceiverMergeBarrier,
+    barrier_yields_to_verified_release, dequarantine, federated_delete, insert_if_newer,
+    receiver_merge_barrier, trace_merge_barrier_drop, verified_release_candidate,
 };
 // #4206 — the title-slot pre-merge archive snapshot helpers (qual_10 split).
 mod title_slot_archive;
@@ -18399,7 +18399,7 @@ static INSERT_IF_NEWER_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::n
 /// when NTP aligns clocks) previously produced non-deterministic
 /// winners per peer, causing permanent mesh divergence. Adding the
 /// memory.id tiebreaker yields a total order every peer agrees on.
-pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
+pub fn insert_if_newer_outcome(conn: &Connection, mem: &Memory) -> Result<InboundMergeOutcome> {
     // #1955 R45 — record-stop fence on the federation-receive funnel.
     // DISPOSITION: inbound federated writes ARE stopped — a relayed write
     // is still a record-plane mutation, so record-stop pauses convergence
@@ -18430,7 +18430,8 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
             memory_id = %mem.id,
             "{FORGET_TOMBSTONE_DROP_MSG}"
         );
-        return Ok(mem.id.clone());
+        let barrier = ReceiverMergeBarrier::Tombstoned;
+        return Ok(InboundMergeOutcome::dropped(mem.id.clone(), barrier));
     }
 
     // v0.8.1 W1 (#1821 / gap G29) + #1844 — credential REDACT on the
@@ -18526,7 +18527,7 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
     } else {
         None
     };
-    let sealed_merge = (|| -> Result<String> {
+    let sealed_merge = (|| -> Result<InboundMergeOutcome> {
         // #9147 / #9149 / #9150 — receiver merge barrier, read under the write
         // lock: a tombstoned id, an archived id with no live row, or a held
         // (quarantined / contaminated) row on the id or the title slot is
@@ -18534,8 +18535,7 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
         if let Some(barrier) =
             receiver_merge_barrier(conn, &mem.id, Some((&mem.title, &mem.namespace)))?
         {
-            trace_merge_barrier_drop(&mem.id, barrier);
-            return Ok(mem.id.clone());
+            return Ok(InboundMergeOutcome::dropped(mem.id.clone(), barrier));
         }
         // #2954 / #4206 — pre-image of the `(title, namespace)` row this upsert
         // may overwrite (`None` when no live row holds the slot). Read under the
@@ -18655,7 +18655,7 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
             content_to_store,
             encrypted_envelope,
         )?;
-        Ok(actual_id)
+        Ok(InboundMergeOutcome::Applied(actual_id))
     })();
     if let Some(write_txn) = write_txn {
         match &sealed_merge {
@@ -18763,6 +18763,7 @@ pub fn merge_inbound(
     // UNCHECKED: no peer-scope re-check (#4023). Tests and the sqlite adapter
     // delegation only — pinned by `tests/merge_inbound_unchecked_ceiling_4023.rs`.
     merge_inbound_authorized(conn, inbound, receiver_verified, None)
+        .map(InboundMergeOutcome::into_id)
 }
 
 /// v0.8.0 Pillar-3 (#1709 / #224) — persist a fully-merged [`Memory`] by

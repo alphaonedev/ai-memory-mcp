@@ -376,6 +376,8 @@ pub(super) async fn sync_push_via_store(
         );
     }
     let mut applied = 0usize;
+    // #9147 C5 — receiver merge-barrier drops; never part of `applied`.
+    let mut merge_barrier_dropped = 0usize;
     let mut noop = 0usize;
     let mut skipped = 0usize;
     // #3699 — wire index carried per item; rendered back in wire order.
@@ -789,7 +791,14 @@ pub(super) async fn sync_push_via_store(
             )
             .await
         {
-            Ok(applied_id) => {
+            // #9147 C5 — the receiver merge barrier dropped the row (nothing
+            // written): counted apart from `applied`, and none of the
+            // applied-row side effects (dequarantine, inbox wake, embedding)
+            // run for a row that was not written.
+            Ok(crate::storage::InboundMergeOutcome::Dropped { .. }) => {
+                merge_barrier_dropped += 1;
+            }
+            Ok(crate::storage::InboundMergeOutcome::Applied(applied_id)) => {
                 applied += 1;
                 // v1.0.0 R19/A3 (#1948) — route-OUT dequarantine-on-attest
                 // (postgres twin). `PostgresStore::merge_inbound` reads the
@@ -974,6 +983,7 @@ pub(super) async fn sync_push_via_store(
                 "max": q.max,
                 "agent_id": q.agent_id,
                 "applied_before_refusal": applied,
+                (crate::handlers::MERGE_BARRIER_DROPPED_FIELD): merge_barrier_dropped,
                 (crate::handlers::QUOTA_REFUSED_FIELD): quota_refused,
                 (crate::handlers::ATTESTATION_REJECTIONS_FIELD): crate::handlers::federation_receive::rejections_in_wire_order(&attestation_rejections),
                 "reset_at": reset_at,
@@ -2299,6 +2309,7 @@ pub(super) async fn sync_push_via_store(
             // is not folded into `skipped`.
             "namespace_meta_refused": namespace_meta_refused,
             "noop": noop,
+            (crate::handlers::MERGE_BARRIER_DROPPED_FIELD): merge_barrier_dropped,
             (crate::handlers::SKIPPED_FIELD): skipped,
             (crate::handlers::QUOTA_REFUSED_FIELD): quota_refused,
             (crate::handlers::ATTESTATION_REJECTIONS_FIELD): crate::handlers::federation_receive::rejections_in_wire_order(&attestation_rejections),

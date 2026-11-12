@@ -508,7 +508,12 @@ pub fn run(
                 if validate::validate_memory(&owned).is_err() {
                     continue;
                 }
-                if db::insert_if_newer(&local_conn, &owned).is_ok() {
+                // #9147 C5 — a receiver merge-barrier drop wrote nothing, so it
+                // is not counted as pulled.
+                if matches!(
+                    db::insert_if_newer_outcome(&local_conn, &owned),
+                    Ok(crate::storage::InboundMergeOutcome::Applied(_))
+                ) {
                     pulled += 1;
                 }
             }
@@ -518,7 +523,12 @@ pub fn run(
                 if validate::validate_memory(&owned).is_err() {
                     continue;
                 }
-                if db::insert_if_newer(&remote_conn, &owned).is_ok() {
+                // #9147 C5 — a receiver merge-barrier drop wrote nothing, so it
+                // is not counted as pushed.
+                if matches!(
+                    db::insert_if_newer_outcome(&remote_conn, &owned),
+                    Ok(crate::storage::InboundMergeOutcome::Applied(_))
+                ) {
                     pushed += 1;
                 }
             }
