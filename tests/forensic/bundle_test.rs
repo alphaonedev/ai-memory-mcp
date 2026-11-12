@@ -148,6 +148,65 @@ fn depth2_chain_bundle_verifies_via_cli() {
     );
 }
 
+/// #9179 r1 code F12 — the offline auditor's green path. An auditor who
+/// holds ONLY the signer's public key (no `.priv`, no daemon, a fresh
+/// empty database) pins it by placing `<signer>.pub` in a directory named
+/// by `AI_MEMORY_KEY_DIR`; the bundle then verifies green. Without the
+/// pinned key the same bundle exits 2 with `manifest_signer_unknown`.
+#[test]
+fn offline_auditor_pins_signer_pub_for_green_9179() {
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("ai-memory.db");
+    let conn = open_db(&db_path);
+    let d0 = insert_memory(&conn, "fb", 0, MemoryKind::Observation);
+    drop(conn);
+    let key_dir = provision_key_dir(&tmp, &db_path);
+    let bundle_path = tmp.path().join("bundle.tar");
+    signing_cmd(&db_path, &key_dir)
+        .args([
+            "export-forensic-bundle",
+            "--memory-id",
+            &d0,
+            "--output",
+            bundle_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let auditor = TempDir::new().unwrap();
+    let auditor_db = auditor.path().join("auditor.db");
+    let empty_keys = auditor.path().join("empty-keys");
+    crate::key_dir_sandbox::mkdir_0700(&empty_keys);
+    let unpinned = signing_cmd(&auditor_db, &empty_keys)
+        .args(["verify-forensic-bundle", bundle_path.to_str().unwrap()])
+        .assert()
+        .code(2);
+    let out = String::from_utf8_lossy(&unpinned.get_output().stdout).into_owned()
+        + &String::from_utf8_lossy(&unpinned.get_output().stderr);
+    assert!(
+        out.contains(bundle::REASON_MANIFEST_SIGNER_UNKNOWN),
+        "unpinned verify names the exact reason, got: {out}"
+    );
+
+    let pinned_keys = auditor.path().join("pinned-keys");
+    crate::key_dir_sandbox::mkdir_0700(&pinned_keys);
+    let pub_name = format!("{BUNDLE_SIGNER}.pub");
+    std::fs::copy(key_dir.join(&pub_name), pinned_keys.join(&pub_name)).unwrap();
+    assert!(
+        std::fs::read_dir(&pinned_keys).unwrap().count() == 1,
+        "the auditor dir holds the public key only"
+    );
+    let pinned = signing_cmd(&auditor_db, &pinned_keys)
+        .args(["verify-forensic-bundle", bundle_path.to_str().unwrap()])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&pinned.get_output().stdout).into_owned();
+    assert!(
+        stdout.contains("verification OK"),
+        "pinned public key verifies green, got: {stdout}"
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // Acceptance criterion #2 — tampered file is named in the report.
 // ─────────────────────────────────────────────────────────────────────
