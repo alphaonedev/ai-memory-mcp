@@ -483,7 +483,14 @@ pub fn handle_skill_register(
 ) -> Result<Value, String> {
     let principal = crate::identity::resolve_governance_subject(None, None, "register skills")
         .map_err(|e| e.to_string())?;
-    handle_skill_register_as(conn, params, active_keypair, &principal).map_err(|e| e.to_string())
+    handle_skill_register_as(conn, params, active_keypair, &principal).map_err(register_error_text)
+}
+
+/// #8832 — the caller-facing text of a failed register: a typed refusal
+/// root keeps its fixed text, a foreign root (storage, filesystem) never
+/// reaches the caller.
+fn register_error_text(e: anyhow::Error) -> String {
+    e.to_string()
 }
 
 /// #8832 — the shared register body. `principal` is the authenticated caller
@@ -1063,6 +1070,69 @@ mod d1_5_986_tests {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    /// Every `RegisterMetadataRefusal` class (the table the HTTP route maps).
+    const REGISTER_REFUSALS_8832: [crate::mcp::RegisterMetadataRefusal; 7] = {
+        use crate::mcp::RegisterMetadataRefusal as R;
+        [
+            R::ReservedKey,
+            R::MalformedBinding,
+            R::ScopeInvalid,
+            R::ForeignBinding,
+            R::ScopeNotMember,
+            R::UnresolvedPrincipal,
+            R::ShadowsExisting,
+        ]
+    };
+    /// Foreign roots a register can raise: a storage path, SQL text and an
+    /// io error naming a host path. None may reach the caller.
+    const FOREIGN_TEXTS_8832: [&str; 3] = [
+        "unable to open database file: /srv/secret/ai-memory.db",
+        "near \"SELEC\": syntax error in SELECT id FROM skills WHERE owner = 'x'",
+        "No such file or directory (os error 2): /home/operator/.skills/x",
+    ];
+
+    /// #8832 (C-2) — a foreign register failure reaches the MCP / CLI caller
+    /// as the closed storage class text; its detail stays on the log only,
+    /// also when wrapped in context.
+    #[test]
+    fn register_error_text_closes_foreign_roots_8832() {
+        for foreign in FOREIGN_TEXTS_8832 {
+            for e in [
+                anyhow::anyhow!(foreign.to_owned()),
+                anyhow::anyhow!(foreign.to_owned()).context("skill register"),
+                anyhow::Error::new(std::io::Error::other(foreign.to_owned())),
+            ] {
+                let text = register_error_text(e);
+                assert_eq!(
+                    text,
+                    crate::mcp::error_text::DB_ERROR_TEXT,
+                    "foreign={foreign}"
+                );
+                assert!(!text.contains(foreign), "foreign text leaked: {text}");
+            }
+        }
+    }
+
+    /// #8832 (C-2) — every typed refusal root keeps its fixed text byte for
+    /// byte (bare and under context), and so does an own-text `refusal`.
+    #[test]
+    fn register_error_text_keeps_typed_refusal_text_8832() {
+        for r in REGISTER_REFUSALS_8832 {
+            assert_eq!(
+                register_error_text(anyhow::Error::new(r)),
+                r.message(),
+                "{r:?}"
+            );
+            assert_eq!(
+                register_error_text(anyhow::Error::new(r).context("bind")),
+                r.message(),
+                "{r:?} under context"
+            );
+        }
+        let own = "skill manifest is missing the namespace field";
+        assert_eq!(register_error_text(crate::errors::refusal(own)), own);
+    }
 
     fn open_db() -> (rusqlite::Connection, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
