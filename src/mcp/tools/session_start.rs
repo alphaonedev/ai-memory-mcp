@@ -156,7 +156,17 @@ pub(crate) fn handle_session_start(
                 response["summary"] = json!(summary);
             }
             Err(e) => {
-                tracing::warn!("session_start LLM summary failed: {}", e);
+                // #9213 — a failed summary is a degraded outcome: one
+                // structured WARN (the first summarized row stands for the
+                // batch) and the `summary_degraded` reason code on the
+                // response, never the provider text.
+                let lead_id = results.first().map_or("", |m| m.id.as_str());
+                let reason = crate::llm::record_degraded_hook(
+                    lead_id,
+                    crate::llm::DEGRADED_HOOK_SESSION_SUMMARY,
+                    &e,
+                );
+                response[crate::models::field_names::SUMMARY_DEGRADED] = json!(reason);
             }
         }
     }
@@ -211,7 +221,7 @@ impl McpTool for SessionStartTool {
         "Auto-recall recent memories on session start."
     }
     fn docs() -> &'static str {
-        "Most-recently-accessed/updated. At smart/autonomous tier, includes LLM summary. as_agent is unsupported; visibility uses the enforced caller."
+        "Most-recently-accessed/updated. At smart/autonomous tier, includes LLM summary. as_agent is unsupported; visibility uses the enforced caller. summary_degraded (#9213): the reason code when the LLM summary failed; absent when clean."
     }
     fn input_schema() -> Value {
         crate::mcp::registry::input_schema_for::<SessionStartRequest>()

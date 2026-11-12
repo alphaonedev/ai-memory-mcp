@@ -13,7 +13,7 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::*;
-use crate::llm::{LlmProvider, OllamaClient};
+use crate::llm::{ChatOutcome, LlmProvider, OllamaClient, ToolCall, ToolDef};
 
 /// Wire path of the Ollama chat endpoint (mirrors `OLLAMA_CHAT_PATH`).
 const OLLAMA_CHAT: &str = "/api/chat";
@@ -110,6 +110,13 @@ fn body(wire: Wire, r: Reply) -> Value {
 /// Start a chat endpoint that answers every request with `r`, and a client
 /// bound to it. The server is returned so it outlives the client call.
 async fn serve(wire: Wire, r: Reply) -> (MockServer, OllamaClient) {
+    serve_body(wire, body(wire, r)).await
+}
+
+/// Start a chat endpoint that answers every request with the raw `reply`
+/// body (for forms `Reply` cannot express: null or numeric fields, an
+/// empty `choices` array), and a client bound to it.
+async fn serve_body(wire: Wire, reply: Value) -> (MockServer, OllamaClient) {
     let server = MockServer::start().await;
     let chat_path = match wire {
         Wire::Ollama => OLLAMA_CHAT,
@@ -117,7 +124,7 @@ async fn serve(wire: Wire, r: Reply) -> (MockServer, OllamaClient) {
     };
     Mock::given(method("POST"))
         .and(path(chat_path))
-        .respond_with(ResponseTemplate::new(200).set_body_json(body(wire, r)))
+        .respond_with(ResponseTemplate::new(200).set_body_json(reply))
         .mount(&server)
         .await;
     let client = match wire {
@@ -157,7 +164,17 @@ fn missing_content_error(wire: Wire) -> &'static str {
 
 /// Every reply form that is NOT a complete answer, with its exact error.
 /// The content is a valid yes so only the completion status decides.
-fn incomplete_forms(wire: Wire) -> Vec<(&'static str, Reply, &'static str)> {
+fn incomplete_forms(wire: Wire) -> Vec<(&'static str, Value, &'static str)> {
+    let mut forms: Vec<(&'static str, Value, &'static str)> = reply_forms(wire)
+        .into_iter()
+        .map(|(form, r, err)| (form, body(wire, r), err))
+        .collect();
+    forms.extend(raw_forms(wire));
+    forms
+}
+
+/// The incomplete forms a [`Reply`] can express.
+fn reply_forms(wire: Wire) -> Vec<(&'static str, Reply, &'static str)> {
     let mut forms = vec![
         (
             "truncated",
@@ -211,16 +228,141 @@ fn incomplete_forms(wire: Wire) -> Vec<(&'static str, Reply, &'static str)> {
             },
             ERR_REPLY_NOT_DONE,
         ));
+        // Ollama's model-load acknowledgement is not an answer.
+        forms.push((
+            "load",
+            reply(Some("yes"), Some("load")),
+            ERR_REPLY_UNRECOGNISED_STOP,
+        ));
     }
     forms
+}
+
+/// #8963 — the incomplete forms with a null or non-string field, or with
+/// no message at all, built as raw bodies.
+fn raw_forms(wire: Wire) -> Vec<(&'static str, Value, &'static str)> {
+    match wire {
+        Wire::Ollama => vec![
+            (
+                "null stop reason",
+                json!({"message": {"content": "yes"}, "done": true, "done_reason": null}),
+                ERR_REPLY_NO_STOP_REASON,
+            ),
+            (
+                "numeric stop reason",
+                json!({"message": {"content": "yes"}, "done": true, "done_reason": 1}),
+                ERR_REPLY_NO_STOP_REASON,
+            ),
+            (
+                "numeric content",
+                json!({"message": {"content": 42}, "done": true, "done_reason": "stop"}),
+                ERR_OLLAMA_NO_CONTENT,
+            ),
+            (
+                "null message",
+                json!({"message": null, "done": true, "done_reason": "stop"}),
+                ERR_OLLAMA_NO_CONTENT,
+            ),
+        ],
+        Wire::OpenAi => vec![
+            (
+                "null stop reason",
+                json!({"choices": [{"index": 0, "message": {"content": "yes"}, "finish_reason": null}]}),
+                ERR_REPLY_NO_STOP_REASON,
+            ),
+            (
+                "numeric stop reason",
+                json!({"choices": [{"index": 0, "message": {"content": "yes"}, "finish_reason": 1}]}),
+                ERR_REPLY_NO_STOP_REASON,
+            ),
+            (
+                "numeric content",
+                json!({"choices": [{"index": 0, "message": {"content": 42}, "finish_reason": "stop"}]}),
+                ERR_OPENAI_NO_CONTENT,
+            ),
+            (
+                "empty choices",
+                json!({"choices": []}),
+                ERR_OPENAI_NO_CONTENT,
+            ),
+        ],
+    }
+}
+
+/// #8963 — a tool-call body with `stop` as its stop reason (`None` leaves
+/// the field out).
+fn tool_call_body(wire: Wire, stop: Option<&'static str>, done: bool) -> Value {
+    let call = json!({"function": {"name": "lookup", "arguments": {"q": "x"}}});
+    let mut b = match wire {
+        Wire::Ollama => json!({"message": {"tool_calls": [call]}, "done": done}),
+        Wire::OpenAi => {
+            json!({"choices": [{"index": 0, "message": {"role": "assistant", "tool_calls": [call]}}]})
+        }
+    };
+    if let Some(s) = stop {
+        match wire {
+            Wire::Ollama => b["done_reason"] = json!(s),
+            Wire::OpenAi => b["choices"][0]["finish_reason"] = json!(s),
+        }
+    }
+    b
+}
+
+/// #8963 — on the tool path a tool call is dispatched only on a normal or
+/// tool-call stop; a call cut at the token limit carries truncated
+/// arguments and is refused with the exact error.
+#[tokio::test]
+async fn reply_integrity_8963_tool_path_refuses_incomplete_tool_call() {
+    let tools = [ToolDef::new("lookup", "look up", json!({"type": "object"}))];
+    for wire in WIRES {
+        let mut refused = vec![
+            ("length", Some("length"), true, ERR_REPLY_TRUNCATED),
+            ("max_tokens", Some("max_tokens"), true, ERR_REPLY_TRUNCATED),
+            ("filtered", Some("content_filter"), true, ERR_REPLY_FILTERED),
+            ("no stop reason", None, true, ERR_REPLY_NO_STOP_REASON),
+            (
+                "unknown stop",
+                Some("paused"),
+                true,
+                ERR_REPLY_UNRECOGNISED_STOP,
+            ),
+        ];
+        if wire == Wire::Ollama {
+            refused.push(("done false", Some("stop"), false, ERR_REPLY_NOT_DONE));
+        }
+        for (form, stop, done, expected) in refused {
+            let (_server, client) = serve_body(wire, tool_call_body(wire, stop, done)).await;
+            let got = client.generate_with_tools_async("p", None, &tools).await;
+            let err = match got {
+                Ok(v) => panic!("{wire:?}/{form}: accepted as Ok({v:?})"),
+                Err(e) => e.to_string(),
+            };
+            assert_eq!(err, expected, "{wire:?}/{form}");
+        }
+        for stop in ["tool_calls", "stop"] {
+            let (_server, client) = serve_body(wire, tool_call_body(wire, Some(stop), true)).await;
+            let got = client
+                .generate_with_tools_async("p", None, &tools)
+                .await
+                .unwrap_or_else(|e| panic!("{wire:?}/{stop}: {e:#}"));
+            assert_eq!(
+                got,
+                ChatOutcome::ToolCalls(vec![ToolCall {
+                    name: "lookup".to_string(),
+                    arguments: json!({"q": "x"}),
+                }]),
+                "{wire:?}/{stop}"
+            );
+        }
+    }
 }
 
 #[tokio::test]
 async fn reply_integrity_8963_every_feature_refuses_every_incomplete_form() {
     for wire in WIRES {
-        for (form, r, expected) in incomplete_forms(wire) {
+        for (form, reply_body, expected) in incomplete_forms(wire) {
             for feature in FEATURES {
-                let (_server, client) = serve(wire, r).await;
+                let (_server, client) = serve_body(wire, reply_body.clone()).await;
                 let got = run(feature, &client).await;
                 let err = match got {
                     Ok(v) => panic!("{wire:?}/{feature:?}/{form}: accepted as Ok({v:?})"),
@@ -420,5 +562,87 @@ fn reply_integrity_8945_parser_is_linear_on_large_input() {
     assert!(
         elapsed < LARGE_REPLY_BUDGET,
         "{LARGE_REPLY_WORDS}-word parse took {elapsed:?}"
+    );
+}
+
+/// #9213 — every typed reply error maps to its reason code, through any
+/// number of context layers; a text that only CONTAINS a typed text (for
+/// example provider output echoed into a transport error) is no typed
+/// reply and maps to the generic code.
+#[test]
+fn reply_integrity_9213_failure_reason_table() {
+    let typed: &[(&str, &str)] = &[
+        (ERR_REPLY_TRUNCATED, "reply_truncated"),
+        (ERR_REPLY_FILTERED, "reply_filtered"),
+        (ERR_REPLY_NOT_DONE, "reply_not_done"),
+        (ERR_REPLY_NO_STOP_REASON, "reply_no_stop_reason"),
+        (ERR_REPLY_UNRECOGNISED_STOP, "reply_unrecognised_stop"),
+        (ERR_REPLY_TOOL_STOP, "reply_tool_stop"),
+        (ERR_REPLY_EMPTY, "reply_empty"),
+        (ERR_OLLAMA_NO_CONTENT, "reply_no_content"),
+        (ERR_OPENAI_NO_CONTENT, "reply_no_content"),
+        (ERR_CONTRADICTION_UNCLASSIFIABLE, "verdict_unclassifiable"),
+    ];
+    assert_eq!(typed.len(), REPLY_FAILURE_REASONS.len());
+    for (text, code) in typed {
+        let bare = anyhow::anyhow!(*text);
+        assert_eq!(reply_failure_reason(&bare), *code, "{text}");
+        let wrapped = anyhow::anyhow!(*text).context("outer").context("outermost");
+        assert_eq!(reply_failure_reason(&wrapped), *code, "wrapped {text}");
+        let echoed = anyhow::anyhow!("transport: {text}");
+        assert_eq!(
+            reply_failure_reason(&echoed),
+            DEGRADED_REASON_LLM_ERROR,
+            "echoed {text}"
+        );
+    }
+    for other in ["", "HTTP 500", "circuit breaker open", "yes"] {
+        assert_eq!(
+            reply_failure_reason(&anyhow::anyhow!(other)),
+            DEGRADED_REASON_LLM_ERROR,
+            "{other:?}"
+        );
+    }
+}
+
+/// #9213 Z-1 — the closed set of reason codes a degraded marker can carry:
+/// exactly the codes of [`REPLY_FAILURE_REASONS`] plus the generic code,
+/// and the one serializer of a store-hook marker entry.
+#[test]
+fn reply_integrity_9213_reason_code_set_and_entry_shape() {
+    let mut codes: Vec<&str> = REPLY_FAILURE_REASONS.iter().map(|(_, c)| *c).collect();
+    codes.push(DEGRADED_REASON_LLM_ERROR);
+    codes.sort_unstable();
+    codes.dedup();
+    assert_eq!(
+        codes,
+        vec![
+            "llm_error",
+            "reply_empty",
+            "reply_filtered",
+            "reply_no_content",
+            "reply_no_stop_reason",
+            "reply_not_done",
+            "reply_tool_stop",
+            "reply_truncated",
+            "reply_unrecognised_stop",
+            "verdict_unclassifiable",
+        ]
+    );
+    assert_eq!(
+        degraded_hook_entry(DEGRADED_HOOK_AUTO_TAG, None, "reply_truncated"),
+        serde_json::json!({"hook": "auto_tag", "reason": "reply_truncated"})
+    );
+    assert_eq!(
+        degraded_hook_entry(DEGRADED_HOOK_DETECT_CONTRADICTION, Some("c-1"), "llm_error"),
+        serde_json::json!({"hook": "detect_contradiction", "candidate_id": "c-1", "reason": "llm_error"})
+    );
+    assert_eq!(
+        [
+            DEGRADED_HOOK_AUTO_TAG,
+            DEGRADED_HOOK_DETECT_CONTRADICTION,
+            DEGRADED_HOOK_SESSION_SUMMARY
+        ],
+        ["auto_tag", "detect_contradiction", "session_summary"]
     );
 }

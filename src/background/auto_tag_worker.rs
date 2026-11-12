@@ -190,10 +190,10 @@ async fn apply_auto_tag_job(app: &AppState, job: AutoTagJob) {
             .take(crate::handlers::http::AUTO_TAG_MAX_TAGS)
             .collect::<Vec<String>>(),
         Ok(Err(e)) => {
-            tracing::warn!(
-                "autotag.worker.llm_error: auto_tag hook failed for {}: {e}",
-                job.id
-            );
+            // #9213 — one structured WARN (memory id, hook, reason code; never
+            // the provider text) plus the degraded metric. The HTTP store
+            // response has already returned, so the metric is the record.
+            crate::llm::record_degraded_hook(&job.id, crate::llm::DEGRADED_HOOK_AUTO_TAG, &e);
             crate::metrics::inc_autotag_degraded();
             return;
         }

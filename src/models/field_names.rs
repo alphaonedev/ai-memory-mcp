@@ -209,6 +209,12 @@ pub const CONFIDENCE_SIGNALS: &str = "confidence_signals";
 pub const CONFIDENCE_SOURCE: &str = "confidence_source";
 /// `confirmed_contradictions` — wire/row field name.
 pub const CONFIRMED_CONTRADICTIONS: &str = "confirmed_contradictions";
+/// #9213 — `autonomy_hook_degraded` `memory_store` RESPONSE key (never row
+/// metadata): `[{hook, candidate_id?, reason}]`, absent when no hook degraded.
+pub const AUTONOMY_HOOK_DEGRADED: &str = "autonomy_hook_degraded";
+/// #9213 — `summary_degraded` `memory_session_start` RESPONSE key: the reason
+/// code of a failed LLM summary, absent when the summary succeeded or never ran.
+pub const SUMMARY_DEGRADED: &str = "summary_degraded";
 /// `consolidated` — wire/row field name.
 pub const CONSOLIDATED: &str = "consolidated";
 /// `content_sha256` — wire/row field name.

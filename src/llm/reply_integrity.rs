@@ -146,6 +146,85 @@ pub fn parse_contradiction_verdict(reply: &str) -> Option<bool> {
     Some(verdict)
 }
 
+/// #9213 — degraded-outcome reason code for an LLM failure that is not one
+/// of the typed reply forms below (transport error, timeout, HTTP status,
+/// open circuit breaker).
+pub const DEGRADED_REASON_LLM_ERROR: &str = "llm_error";
+
+/// #9213 — the typed reply errors and the stable reason code a best-effort
+/// consumer records for each, so a degraded outcome on the wire or in row
+/// metadata is told apart from a clean verdict without echoing provider
+/// text. One row per `ERR_*` constant of this module.
+pub const REPLY_FAILURE_REASONS: &[(&str, &str)] = &[
+    (ERR_REPLY_TRUNCATED, "reply_truncated"),
+    (ERR_REPLY_FILTERED, "reply_filtered"),
+    (ERR_REPLY_NOT_DONE, "reply_not_done"),
+    (ERR_REPLY_NO_STOP_REASON, "reply_no_stop_reason"),
+    (ERR_REPLY_UNRECOGNISED_STOP, "reply_unrecognised_stop"),
+    (ERR_REPLY_TOOL_STOP, "reply_tool_stop"),
+    (ERR_REPLY_EMPTY, "reply_empty"),
+    (ERR_OLLAMA_NO_CONTENT, "reply_no_content"),
+    (ERR_OPENAI_NO_CONTENT, "reply_no_content"),
+    (ERR_CONTRADICTION_UNCLASSIFIABLE, "verdict_unclassifiable"),
+];
+
+/// #9213 — the reason code of `err` for a degraded-outcome marker.
+///
+/// A layer of the error chain must EQUAL one of the typed texts (no
+/// substring match, so provider text can never select a code); anything
+/// else is [`DEGRADED_REASON_LLM_ERROR`]. Linear in the chain length.
+#[must_use]
+pub fn reply_failure_reason(err: &anyhow::Error) -> &'static str {
+    err.chain()
+        .find_map(|layer| {
+            let text = layer.to_string();
+            REPLY_FAILURE_REASONS
+                .iter()
+                .find(|(typed, _)| text == *typed)
+                .map(|(_, code)| *code)
+        })
+        .unwrap_or(DEGRADED_REASON_LLM_ERROR)
+}
+
+/// #9213 — hook name of the post-store `auto_tag` call in a degraded marker.
+pub const DEGRADED_HOOK_AUTO_TAG: &str = "auto_tag";
+/// #9213 — hook name of the legacy per-pair contradiction classifier.
+pub const DEGRADED_HOOK_DETECT_CONTRADICTION: &str = "detect_contradiction";
+/// #9213 — hook name of the `memory_session_start` LLM summary.
+pub const DEGRADED_HOOK_SESSION_SUMMARY: &str = "session_summary";
+/// #9213 — the message of the one structured WARN a degraded hook emits.
+pub const DEGRADED_WARN_MESSAGE: &str = "llm hook degraded";
+
+/// #9213 — record one degraded best-effort LLM hook: emits exactly one
+/// structured WARN carrying `memory_id`, `hook` and the `reason` code, and
+/// returns that code for the response marker. The error text is never
+/// logged or returned (it can carry provider output), only the code from the
+/// closed [`REPLY_FAILURE_REASONS`] table or [`DEGRADED_REASON_LLM_ERROR`].
+pub fn record_degraded_hook(
+    memory_id: &str,
+    hook: &'static str,
+    err: &anyhow::Error,
+) -> &'static str {
+    let reason = reply_failure_reason(err);
+    tracing::warn!(memory_id, hook, reason, "{}", DEGRADED_WARN_MESSAGE);
+    reason
+}
+
+/// #9213 — the one serializer of an `autonomy_hook_degraded` entry:
+/// `{hook, candidate_id?, reason}`. `candidate_id` is present only when the
+/// caller passes one (the caller has already checked that the requester
+/// can read that candidate).
+#[must_use]
+pub fn degraded_hook_entry(hook: &str, candidate_id: Option<&str>, reason: &str) -> Value {
+    let mut entry = serde_json::Map::new();
+    entry.insert("hook".to_string(), Value::from(hook));
+    if let Some(id) = candidate_id {
+        entry.insert("candidate_id".to_string(), Value::from(id));
+    }
+    entry.insert("reason".to_string(), Value::from(reason));
+    Value::Object(entry)
+}
+
 #[cfg(test)]
 #[path = "reply_integrity_tests.rs"]
 mod tests;

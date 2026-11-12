@@ -655,11 +655,17 @@ pub enum ChatOutcome {
 /// #8945 / #8963 — reply completion status and the contradiction verdict
 /// parser live in `src/llm/reply_integrity.rs`.
 mod reply_integrity;
+/// #9213 — degraded-outcome markers of the best-effort LLM hooks.
+pub use reply_integrity::{
+    DEGRADED_HOOK_AUTO_TAG, DEGRADED_HOOK_DETECT_CONTRADICTION, DEGRADED_HOOK_SESSION_SUMMARY,
+    DEGRADED_REASON_LLM_ERROR, DEGRADED_WARN_MESSAGE, REPLY_FAILURE_REASONS, degraded_hook_entry,
+    record_degraded_hook,
+};
 pub use reply_integrity::{
     ERR_CONTRADICTION_UNCLASSIFIABLE, ERR_OLLAMA_NO_CONTENT, ERR_OPENAI_NO_CONTENT,
     ERR_REPLY_EMPTY, ERR_REPLY_FILTERED, ERR_REPLY_NO_STOP_REASON, ERR_REPLY_NOT_DONE,
     ERR_REPLY_TOOL_STOP, ERR_REPLY_TRUNCATED, ERR_REPLY_UNRECOGNISED_STOP, ReplyCompletion,
-    parse_contradiction_verdict,
+    parse_contradiction_verdict, reply_failure_reason,
 };
 
 /// #1866 — parse an assistant `message` object's `tool_calls` array into
