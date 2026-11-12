@@ -246,8 +246,9 @@ fn cmd_verify_receipt(
     // Resolve the daemon audit verifying key (same ladder as verify-audit-trail).
     let agent_id =
         crate::identity::resolve_agent_id(None, None).unwrap_or_else(|_| "ai-memory".to_string());
-    let verifying_key =
-        crate::governance::audit::load_daemon_verifying_key(&agent_id).unwrap_or(None);
+    // #9179 r1 F3 sibling — a key that exists but fails to load is an error,
+    // never a silent "no key" verdict.
+    let verifying_key = crate::governance::audit::load_daemon_verifying_key_strict(&agent_id)?;
 
     let verdict = match (&verifying_key, receipt.signed) {
         // No key on this host — cannot verify a signed receipt here.

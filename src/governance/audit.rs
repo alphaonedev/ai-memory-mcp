@@ -2560,6 +2560,11 @@ fn list_forensic_files(dir: &Path) -> Result<Vec<PathBuf>> {
 pub struct VerifyReport {
     pub total_lines: u64,
     pub unsigned_lines: u64,
+    /// In-window rows that carry a signature (#9179 r1: the CLI refuses
+    /// green when these exist but no verifying key was available).
+    pub signed_lines: u64,
+    /// Forensic day files found in the directory (0 = the log is absent).
+    pub files_seen: u64,
     pub first_failure: Option<VerifyFailure>,
 }
 
@@ -2568,6 +2573,8 @@ pub struct VerifyFailure {
     pub line_number: u64,
     pub file: PathBuf,
     pub kind: VerifyFailureKind,
+    /// Stable reason code (one of the `FORENSIC_REASON_*` constants).
+    pub reason: &'static str,
     pub detail: String,
 }
 
@@ -2618,6 +2625,8 @@ pub fn verify_since(
     let mut prev_hash = CHAIN_HEAD_PREV_HASH.to_string();
     let mut total: u64 = 0;
     let mut unsigned: u64 = 0;
+    let mut signed: u64 = 0;
+    let files_seen = u64::try_from(files.len()).unwrap_or(u64::MAX);
     // #9009 — once a signed row has been seen, an unsigned row is a downgrade
     // (a stripped signature), never just an `unsigned` count.
     let mut seen_signed = false;
@@ -2626,24 +2635,33 @@ pub fn verify_since(
     // re-verified for signatures, but their parse and `prev_hash` links ARE
     // checked, so a rewritten pre-window row is reported with its position
     // instead of being silently re-anchored.
-    for file in &files {
+    for (file_idx, file) in files.iter().enumerate() {
         let in_window = file_date(file)? >= cutoff;
         let f = open_forensic_file_for_read(file)
             .with_context(|| crate::errors::msg::opening(file.display()))?;
+        let mut first_row_of_file = true;
         for (idx, line) in BufReader::new(f).lines().enumerate() {
             let line_no = (idx as u64) + 1;
             let line = line.with_context(|| format!("reading {}:{line_no}", file.display()))?;
             if line.trim().is_empty() {
                 continue;
             }
-            let fail = |total: u64, unsigned: u64, kind: VerifyFailureKind, detail: String| {
+            let fail = |total: u64,
+                        unsigned: u64,
+                        signed: u64,
+                        kind: VerifyFailureKind,
+                        reason: &'static str,
+                        detail: String| {
                 Ok(VerifyReport {
                     total_lines: total,
                     unsigned_lines: unsigned,
+                    signed_lines: signed,
+                    files_seen,
                     first_failure: Some(VerifyFailure {
                         line_number: line_no,
                         file: file.clone(),
                         kind,
+                        reason,
                         detail,
                     }),
                 })
@@ -2654,7 +2672,9 @@ pub fn verify_since(
                     return fail(
                         total,
                         unsigned,
+                        signed,
                         VerifyFailureKind::Parse,
+                        FORENSIC_REASON_PARSE,
                         format!("malformed JSON: {e}"),
                     );
                 }
@@ -2665,26 +2685,57 @@ pub fn verify_since(
             }
 
             if row.prev_hash != prev_hash {
+                // #9179 r1 — a break on the FIRST row of a later day file means
+                // the rows that linked it (the end of an earlier day, or a whole
+                // day file) are gone: name it, rather than a bare chain break.
+                // A quiet day with no decisions writes no file and leaves the
+                // links intact, so this never fires on a legitimate gap.
+                let reason = if first_row_of_file && file_idx > 0 {
+                    FORENSIC_REASON_DAY_FILE_MISSING
+                } else {
+                    FORENSIC_REASON_CHAIN_BREAK
+                };
                 return fail(
                     total,
                     unsigned,
+                    signed,
                     VerifyFailureKind::ChainBreak,
+                    reason,
                     format!(
-                        "prev_hash mismatch: expected {prev_hash}, got {}",
+                        "{reason}: prev_hash mismatch: expected {prev_hash}, got {}",
                         row.prev_hash
                     ),
                 );
             }
+            first_row_of_file = false;
 
             if row.sig.is_empty() {
-                if seen_signed {
+                // #9179 r1 F1 (HIGH, b29 ruling d2c3a41a) — `self_hash` covers
+                // `canonical_bytes`, which clears `sig`, so the signature is not
+                // part of the link chain: stripping it from every row, or from a
+                // prefix, keeps every link intact. With a verifying key present
+                // EVERY in-window unsigned row is therefore a finding. The only
+                // permitted exemption is an ANCHORED pre-key boundary (a
+                // first-signed position recorded outside the chain); the forensic
+                // chain has no such anchor yet (it rides the head-anchor PR), so
+                // no unsigned in-window row is exempt.
+                if seen_signed || (in_window && public_key.is_some()) {
+                    let why = if seen_signed {
+                        "an unsigned row after a signed row"
+                    } else {
+                        "an unsigned row in the window while a verifying key is present"
+                    };
                     return fail(
                         total,
                         unsigned,
+                        signed,
                         VerifyFailureKind::Signature,
+                        FORENSIC_REASON_SIGNATURE_ABSENT,
                         format!(
-                            "{FORENSIC_REASON_SIGNATURE_ABSENT}: unsigned row after a signed \
-                             row (stripped or downgraded signature)"
+                            "{FORENSIC_REASON_SIGNATURE_ABSENT}: {why}: either the signature \
+                             was stripped, or the writer ran without its signing key (it \
+                             warns at start-up and writes unsigned rows); no anchored \
+                             pre-key boundary exists to exempt it"
                         ),
                     );
                 }
@@ -2693,13 +2744,18 @@ pub fn verify_since(
                 }
             } else {
                 seen_signed = true;
+                if in_window {
+                    signed += 1;
+                }
                 if let (true, Some(pk)) = (in_window, public_key) {
                     if let Err(detail) = verify_forensic_row_signature(&row, pk) {
                         return fail(
                             total,
                             unsigned,
+                            signed,
                             VerifyFailureKind::Signature,
-                            detail.to_string(),
+                            FORENSIC_REASON_SIGNATURE_FAILED,
+                            format!("{FORENSIC_REASON_SIGNATURE_FAILED}: {detail}"),
                         );
                     }
                 }
@@ -2712,12 +2768,24 @@ pub fn verify_since(
     Ok(VerifyReport {
         total_lines: total,
         unsigned_lines: unsigned,
+        signed_lines: signed,
+        files_seen,
         first_failure: None,
     })
 }
 
-/// Reason code in a forensic `Signature` failure detail: an unsigned row
-/// follows a signed one (#9009).
+/// Reason code: a forensic row is not valid JSON.
+pub const FORENSIC_REASON_PARSE: &str = "parse";
+/// Reason code: a forensic row's `prev_hash` does not link to its predecessor.
+pub const FORENSIC_REASON_CHAIN_BREAK: &str = "chain_break";
+/// Reason code: the first row of a later day file does not link, so rows or a
+/// whole day file before it were removed (#9009, #9179 r1).
+pub const FORENSIC_REASON_DAY_FILE_MISSING: &str = "day_file_missing";
+/// Reason code: a forensic row signature does not verify.
+pub const FORENSIC_REASON_SIGNATURE_FAILED: &str = "signature_failed";
+
+/// Reason code: an unsigned row follows a signed one, or sits in the window
+/// while a verifying key is present (#9009, #9179 r1 F1).
 pub const FORENSIC_REASON_SIGNATURE_ABSENT: &str = "signature_absent";
 
 /// Verify one forensic row's Ed25519 signature; `Err` carries the detail
@@ -2829,6 +2897,31 @@ pub fn load_daemon_verifying_key(agent_id: &str) -> Result<Option<VerifyingKey>>
     match crate::identity::keypair::load(agent_id, &dir) {
         Ok(kp) => Ok(Some(kp.public)),
         Err(_) => Ok(None),
+    }
+}
+
+/// #9179 r1 F3 — the verifier's key loader. Like
+/// [`load_daemon_verifying_key`], but only an ABSENT key (no key dir, or a
+/// `NotFound` in the load chain) is `Ok(None)`; a key that exists but cannot
+/// be loaded (corrupt, wrong length, insecure mode, mismatched pair) is an
+/// `Err`, so a verifier never silently skips every signature check and still
+/// reports green. The lax loader stays for federation peer lookup, where an
+/// unknown peer is refused downstream.
+///
+/// # Errors
+/// - The key dir cannot be resolved.
+/// - The key exists but fails to load.
+pub fn load_daemon_verifying_key_strict(agent_id: &str) -> Result<Option<VerifyingKey>> {
+    let dir = crate::identity::keypair::default_key_dir()?;
+    if !dir.exists() {
+        return Ok(None);
+    }
+    match crate::identity::keypair::load(agent_id, &dir) {
+        Ok(kp) => Ok(Some(kp.public)),
+        Err(e) if signing_key_load_is_absent(&e) => Ok(None),
+        Err(e) => Err(e.context(format!(
+            "the verifying key for {agent_id} exists but cannot be loaded"
+        ))),
     }
 }
 
