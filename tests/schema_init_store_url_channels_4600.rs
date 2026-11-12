@@ -93,30 +93,51 @@ enum Row {
     },
 }
 
-/// The ONE refusal text a differing channel produces; names channels only.
-fn conflict_message(channels: &str) -> String {
+const FILE: &str = "AI_MEMORY_STORE_URL_FILE";
+const ENV: &str = "AI_MEMORY_STORE_URL";
+const FLAG: &str = "--store-url";
+
+/// The ONE refusal text (3-agent vote 71472661, V-4): the two disagreeing
+/// channel names, then a one-line remedy that unsets an env channel. Never
+/// any part of a URL.
+fn conflict_message(first: &str, second: &str) -> String {
+    let unset = if second == FLAG { first } else { second };
     format!(
-        "refusing --store-url: it differs from the store URL set by {channels}; pass the same \
-         URL on both, or drop one of them, so the write cannot reach a store you did not name \
-         (#4600)"
+        "refusing to open a store: {first} and {second} name different stores (#4600); unset \
+         the channel you do not mean, for example `env -u {unset} ...`, and run again"
     )
 }
 
+/// Run one schema-init with the given channels and assert the exact
+/// conflict refusal: non-zero exit, the pinned text, no URL on stderr.
+fn assert_conflict_refused(cmd: &mut Command, pair: (&str, &str), label: &str) -> String {
+    let out = cmd.output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(!out.status.success(), "{label}: must be refused");
+    assert!(
+        err.contains(&conflict_message(pair.0, pair.1)),
+        "{label}: exact conflict refusal; stderr: {err}"
+    );
+    assert!(
+        !err.contains("://"),
+        "{label}: the refusal must name no URL"
+    );
+    err
+}
+
 /// #4600 (r1 C-M1 / S-L1) — an explicit `--store-url` that differs from a set
-/// FILE or ENV channel is refused with a typed error naming the channel
-/// names only; the same value on both is accepted. Replaces the
-/// precedence row that pinned the silent override (env set +
-/// `--store-url p-flag.db` wrote p-env.db).
+/// FILE or ENV channel is refused with a typed error naming the two
+/// disagreeing channels only; the same value on every set channel is
+/// accepted. Replaces the precedence row that pinned the silent override (env
+/// set + `--store-url p-flag.db` wrote p-env.db).
 #[test]
 fn schema_init_4600_flag_against_channels_table() {
-    const FILE: &str = "AI_MEMORY_STORE_URL_FILE";
-    const ENV: &str = "AI_MEMORY_STORE_URL";
-    let rows: [(Row, Option<&str>); 9] = [
+    let rows: [(Row, Option<(&str, &str)>); 9] = [
         (Row::FlagAlone, None),
         (Row::File { same: true }, None),
-        (Row::File { same: false }, Some(FILE)),
+        (Row::File { same: false }, Some((FILE, FLAG))),
         (Row::Env { same: true }, None),
-        (Row::Env { same: false }, Some(ENV)),
+        (Row::Env { same: false }, Some((ENV, FLAG))),
         (
             Row::Both {
                 file_same: true,
@@ -129,21 +150,22 @@ fn schema_init_4600_flag_against_channels_table() {
                 file_same: true,
                 env_same: false,
             },
-            Some(ENV),
+            Some((FILE, ENV)),
         ),
         (
             Row::Both {
                 file_same: false,
                 env_same: true,
             },
-            Some(FILE),
+            Some((FILE, ENV)),
         ),
         (
+            // FILE and ENV agree with each other; the flag is the odd one.
             Row::Both {
                 file_same: false,
                 env_same: false,
             },
-            Some("AI_MEMORY_STORE_URL_FILE and AI_MEMORY_STORE_URL"),
+            Some((FILE, FLAG)),
         ),
     ];
     for (row, refused_by) in rows {
@@ -158,7 +180,7 @@ fn schema_init_4600_flag_against_channels_table() {
             }
         };
         let mut cmd = schema_init(&tmp.path().join("main.db"));
-        cmd.args(["--store-url", &flag_url]);
+        cmd.args([FLAG, &flag_url]);
         let (file, env) = match row {
             Row::FlagAlone => (None, None),
             Row::File { same } => (Some(pick(same)), None),
@@ -174,59 +196,229 @@ fn schema_init_4600_flag_against_channels_table() {
         if let Some(url) = env {
             cmd.env(ENV, url);
         }
-        let out = cmd.output().unwrap();
-        let err = String::from_utf8_lossy(&out.stderr);
+        let label = format!("{row:?}");
         match refused_by {
             None => {
+                let out = cmd.output().unwrap();
+                let err = String::from_utf8_lossy(&out.stderr);
                 assert!(
                     out.status.success(),
-                    "{row:?}: must be accepted; stderr: {err}"
+                    "{label}: must be accepted; stderr: {err}"
                 );
                 assert!(
                     tmp.path().join("flag.db").exists(),
-                    "{row:?}: flag store not initialised"
+                    "{label}: flag store not initialised"
                 );
             }
-            Some(channels) => {
-                assert!(!out.status.success(), "{row:?}: must be refused");
-                assert!(
-                    err.contains(&conflict_message(channels)),
-                    "{row:?}: exact conflict refusal; stderr: {err}"
-                );
-                assert!(
-                    !err.contains("sqlite://"),
-                    "{row:?}: the refusal must name no URL"
-                );
+            Some(pair) => {
+                assert_conflict_refused(&mut cmd, pair, &label);
                 assert!(
                     !tmp.path().join("flag.db").exists(),
-                    "{row:?}: flag store written"
+                    "{label}: flag store written"
                 );
                 assert!(
                     !tmp.path().join("other.db").exists(),
-                    "{row:?}: channel store written"
+                    "{label}: channel store written"
                 );
             }
         }
     }
 }
 
-/// Without `--store-url` the ladder is unchanged: FILE beats ENV.
+/// #4600 class gap (3-agent vote 71472661, A 3-0: refuse when two SET
+/// channels disagree) — FILE and ENV set to different stores refuse with the
+/// flag absent AND with the flag present (equal to either channel, or to
+/// neither). The pre-r1b funnel let FILE win silently when no flag was given.
 #[test]
-fn schema_init_4600_without_flag_file_beats_env() {
+fn schema_init_4600_file_and_env_disagree_refused_with_and_without_flag() {
+    for flag in [None, Some("p-file.db"), Some("p-env.db"), Some("p-flag.db")] {
+        let tmp = TempDir::new_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let f = write_url_file(
+            tmp.path(),
+            "store-url",
+            &sqlite_url(tmp.path(), "p-file.db"),
+            0o600,
+        );
+        let mut cmd = schema_init(&tmp.path().join("main.db"));
+        cmd.env(FILE, &f)
+            .env(ENV, sqlite_url(tmp.path(), "p-env.db"));
+        if let Some(name) = flag {
+            cmd.args([FLAG, &sqlite_url(tmp.path(), name)]);
+        }
+        assert_conflict_refused(&mut cmd, (FILE, ENV), &format!("flag={flag:?}"));
+        for db in ["p-file.db", "p-env.db", "p-flag.db"] {
+            assert!(
+                !tmp.path().join(db).exists(),
+                "flag={flag:?}: {db} written after a refusal"
+            );
+        }
+    }
+}
+
+/// FILE and ENV naming the same store, with no flag, proceed to that store.
+#[test]
+fn schema_init_4600_file_and_env_agree_without_flag_succeeds() {
     let tmp = TempDir::new_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
-    let f = write_url_file(
-        tmp.path(),
-        "store-url",
-        &sqlite_url(tmp.path(), "p-file.db"),
-        0o600,
-    );
+    let url = sqlite_url(tmp.path(), "p-both.db");
+    let f = write_url_file(tmp.path(), "store-url", &url, 0o600);
     schema_init(&tmp.path().join("main.db"))
-        .env("AI_MEMORY_STORE_URL_FILE", &f)
-        .env("AI_MEMORY_STORE_URL", sqlite_url(tmp.path(), "p-env.db"))
+        .env(FILE, &f)
+        .env(ENV, &url)
         .assert()
         .success();
-    assert!(tmp.path().join("p-file.db").exists());
-    assert!(!tmp.path().join("p-env.db").exists());
+    assert!(tmp.path().join("p-both.db").exists());
+}
+
+/// Distinct fixture parts so the "no URL part in the refusal" check is exact.
+const V1_HOST: &str = "db-host-4600.invalid";
+const V1_USER: &str = "user_alpha_4600";
+const V1_OTHER_USER: &str = "user_beta_4600";
+const V1_PASSWORD: &str = "pw_secret_4600";
+const V1_DB: &str = "dbname_alpha_4600";
+const V1_OTHER_DB: &str = "dbname_beta_4600";
+const V1_PORT: &str = "6543";
+const V1_DEFAULT_PORT: &str = "5432";
+
+/// Every part of a V-1 fixture URL; none may appear in a refusal.
+const V1_URL_PARTS: [&str; 10] = [
+    "postgres",
+    "://",
+    V1_HOST,
+    V1_USER,
+    V1_OTHER_USER,
+    V1_PASSWORD,
+    V1_DB,
+    V1_OTHER_DB,
+    V1_PORT,
+    V1_DEFAULT_PORT,
+];
+
+/// The V-1 corpus: pairs that name the same Postgres store under a URL
+/// normaliser or an origin compare, or differ only by whitespace on argv.
+/// "Same store" is exact byte equality, so every pair refuses.
+fn v1_rows() -> [(&'static str, String, String); 6] {
+    let base = format!("postgres://{V1_USER}@{V1_HOST}:{V1_PORT}/{V1_DB}");
+    [
+        (
+            "credentialed vs bare",
+            format!("postgres://{V1_USER}:{V1_PASSWORD}@{V1_HOST}:{V1_PORT}/{V1_DB}"),
+            base.clone(),
+        ),
+        ("trailing slash", base.clone(), format!("{base}/")),
+        (
+            "default port",
+            format!("postgres://{V1_USER}@{V1_HOST}/{V1_DB}"),
+            format!("postgres://{V1_USER}@{V1_HOST}:{V1_DEFAULT_PORT}/{V1_DB}"),
+        ),
+        (
+            "other database",
+            base.clone(),
+            format!("postgres://{V1_USER}@{V1_HOST}:{V1_PORT}/{V1_OTHER_DB}"),
+        ),
+        (
+            "other user",
+            base.clone(),
+            format!("postgres://{V1_OTHER_USER}@{V1_HOST}:{V1_PORT}/{V1_DB}"),
+        ),
+        ("argv trailing space", base.clone(), format!("{base} ")),
+    ]
+}
+
+/// 3-agent vote (71472661) V-1 — "same store" is exact byte equality of the
+/// resolved values; no URL normalisation, no origin compare. Each row runs on
+/// the three channel pairs (FILE vs flag, ENV vs flag, FILE vs ENV with no
+/// flag) and each refuses with the exact text and no URL part on stderr.
+#[test]
+fn schema_init_4600_same_store_is_exact_bytes_table() {
+    for (row, channel_value, other_value) in v1_rows() {
+        for pair in [(FILE, FLAG), (ENV, FLAG), (FILE, ENV)] {
+            let tmp = TempDir::new_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+            let mut cmd = schema_init(&tmp.path().join("main.db"));
+            if pair.0 == FILE {
+                cmd.env(
+                    FILE,
+                    write_url_file(tmp.path(), "store-url", &channel_value, 0o600),
+                );
+            } else {
+                cmd.env(ENV, &channel_value);
+            }
+            if pair.1 == FLAG {
+                cmd.args([FLAG, &other_value]);
+            } else {
+                cmd.env(ENV, &other_value);
+            }
+            let label = format!("{row} / {} vs {}", pair.0, pair.1);
+            let err = assert_conflict_refused(&mut cmd, pair, &label);
+            for part in V1_URL_PARTS {
+                assert!(
+                    !err.contains(part),
+                    "{label}: URL part {part:?} leaked into stderr: {err}"
+                );
+            }
+        }
+    }
+}
+
+/// 3-agent vote (71472661) V-2 — a SET file channel that is unreadable
+/// (missing path) or empty refuses with the shared reader's exact error and
+/// never falls through to ENV or the flag, which both name a usable store.
+#[test]
+fn schema_init_4600_set_file_channel_unreadable_or_empty_never_falls_through() {
+    for (case, with_flag) in [
+        ("missing", false),
+        ("missing", true),
+        ("empty", false),
+        ("empty", true),
+    ] {
+        let tmp = TempDir::new_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let path = tmp.path().join("store-url");
+        let expected = if case == "empty" {
+            std::fs::write(&path, "\n").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            format!("store-url file {} is empty", path.display())
+        } else {
+            format!("reading store-url file {}", path.display())
+        };
+        let fallback = sqlite_url(tmp.path(), "fallback.db");
+        let mut cmd = schema_init(&tmp.path().join("main.db"));
+        cmd.env(FILE, &path).env(ENV, &fallback);
+        if with_flag {
+            cmd.args([FLAG, &fallback]);
+        }
+        let out = cmd.output().unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        let label = format!("{case} file, flag={with_flag}");
+        assert!(!out.status.success(), "{label}: must be refused");
+        assert!(
+            err.contains(&expected),
+            "{label}: exact file-channel error; stderr: {err}"
+        );
+        assert!(
+            !tmp.path().join("fallback.db").exists(),
+            "{label}: fell through to the ENV / flag store"
+        );
+    }
+}
+
+/// 3-agent vote (71472661) V-2 — an empty (or blank) env value has ONE
+/// meaning: unset, exactly as the shared resolver treats it. Pinned for both
+/// env vars: the flag alone then decides.
+#[test]
+fn schema_init_4600_empty_env_value_is_unset() {
+    for (var, value) in [(ENV, ""), (ENV, "   "), (FILE, ""), (FILE, "  ")] {
+        let tmp = TempDir::new_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let out = schema_init(&tmp.path().join("main.db"))
+            .env(var, value)
+            .args([FLAG, &sqlite_url(tmp.path(), "flag.db")])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{var}={value:?}: an empty value is unset; stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(tmp.path().join("flag.db").exists(), "{var}={value:?}");
+    }
 }
 
 /// #4600 (r1 C-L1) — schema-init installs no console tracing subscriber, so

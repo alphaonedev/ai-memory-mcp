@@ -6,8 +6,9 @@
 //! (`AI_MEMORY_STORE_URL_FILE`, `AI_MEMORY_STORE_URL`, `--store-url`) with the
 //! same refusal rules (a group/world-readable URL file is refused). These
 //! one-shot writers resolve through `src/store_url_writer.rs` `resolve`:
-//! without a flag the shared ladder (FILE, then ENV); a `--store-url` that
-//! differs from a set channel is refused by channel name (PR #9175 r1).
+//! any two SET channels (FILE, ENV, `--store-url`) that disagree are refused
+//! by channel name before any connection (PR #9175 r1b, 3-agent vote
+//! 71472661 A 3-0).
 //!
 //! Siblings covered here: `quarantine` and `recover-previous-session`. On the
 //! carrier both matched on the raw `--store-url` flag only, so a Postgres URL
@@ -105,6 +106,22 @@ fn run(dir: &Path, verb: &[&str], extra_args: &[&str], env: &[(&str, &str)]) -> 
 
 fn stderr(o: &Output) -> String {
     String::from_utf8_lossy(&o.stderr).into_owned()
+}
+
+const STORE_URL_FLAG: &str = "--store-url";
+
+/// The ONE conflict refusal (3-agent vote 71472661, V-4): the two channel
+/// names and a one-line remedy; never any part of a URL.
+fn conflict_message(first: &str, second: &str) -> String {
+    let unset = if second == STORE_URL_FLAG {
+        first
+    } else {
+        second
+    };
+    format!(
+        "refusing to open a store: {first} and {second} name different stores (#4600); unset \
+         the channel you do not mean, for example `env -u {unset} ...`, and run again"
+    )
 }
 
 /// What the binary must do once a Postgres URL is resolved: under `sal` only
@@ -265,11 +282,7 @@ fn every_sibling_refuses_a_flag_that_differs_from_a_channel_4600() {
                     continue;
                 }
                 assert!(!out.status.success(), "#4600 {label}: must be refused");
-                let expected = format!(
-                    "refusing --store-url: it differs from the store URL set by {name}; pass the \
-                     same URL on both, or drop one of them, so the write cannot reach a store \
-                     you did not name (#4600)"
-                );
+                let expected = conflict_message(name, STORE_URL_FLAG);
                 assert!(
                     stderr(&out).contains(&expected),
                     "#4600 {label}: exact conflict refusal; stderr: {}",
@@ -303,6 +316,98 @@ fn no_channel_still_runs_on_local_sqlite_4600() {
             out.status.success(),
             "#4600 {verb:?}: no store channel keeps the local sqlite default; stderr: {}",
             stderr(&out)
+        );
+    }
+}
+
+/// #4600 class gap (3-agent vote 71472661, A 3-0) — FILE and ENV set to
+/// different stores refuse on every sibling, with the flag absent and with it
+/// present, before any dial; the pre-r1b funnel let FILE win silently.
+#[test]
+fn every_sibling_refuses_file_and_env_that_disagree_4600() {
+    for verb in VERBS {
+        for flag in [false, true] {
+            let file_listener = RecordingListener::start(None);
+            let env_listener = RecordingListener::start(None);
+            let dir = scratch("file-env");
+            let label = format!("{verb:?}/flag={flag}");
+            let file_url = pg_url(&file_listener);
+            let f = write_url_file(dir.path(), &file_url, 0o600);
+            let fs = f.to_string_lossy().into_owned();
+            let env_url = pg_url(&env_listener);
+            let extra: Vec<&str> = if flag {
+                vec![STORE_URL_FLAG, &file_url]
+            } else {
+                Vec::new()
+            };
+            let out = run(
+                dir.path(),
+                verb,
+                &extra,
+                &[(STORE_URL_FILE_ENV, &fs), (STORE_URL_ENV, &env_url)],
+            );
+            assert!(!out.status.success(), "#4600 {label}: must be refused");
+            assert!(
+                stderr(&out).contains(&conflict_message(STORE_URL_FILE_ENV, STORE_URL_ENV)),
+                "#4600 {label}: exact conflict refusal; stderr: {}",
+                stderr(&out)
+            );
+            assert!(!stderr(&out).contains("://"), "#4600 {label}: no URL");
+            assert!(!stderr(&out).contains(FIXTURE_PASSWORD));
+            assert_eq!(
+                file_listener.connections() + env_listener.connections(),
+                0,
+                "#4600 {label}: refused before any dial"
+            );
+        }
+    }
+}
+
+/// FILE and ENV naming the same store route to it on every sibling.
+#[test]
+fn every_sibling_routes_file_and_env_that_agree_4600() {
+    for verb in VERBS {
+        let listener = RecordingListener::start(None);
+        let dir = scratch("file-env-same");
+        let url = pg_url(&listener);
+        let f = write_url_file(dir.path(), &url, 0o600);
+        let fs = f.to_string_lossy().into_owned();
+        let out = run(
+            dir.path(),
+            verb,
+            &[],
+            &[(STORE_URL_FILE_ENV, &fs), (STORE_URL_ENV, &url)],
+        );
+        assert_routed_to_postgres(&out, &listener, &format!("{verb:?}/agree"));
+    }
+}
+
+/// 3-agent vote (71472661) V-2 — a SET but unreadable file channel refuses
+/// on every sibling and never falls through to a usable ENV store.
+#[test]
+fn every_sibling_refuses_an_unreadable_file_channel_without_fallthrough_4600() {
+    for verb in VERBS {
+        let listener = RecordingListener::start(None);
+        let dir = scratch("missing");
+        let missing = dir.path().join("no-such-store-url");
+        let ms = missing.to_string_lossy().into_owned();
+        let url = pg_url(&listener);
+        let out = run(
+            dir.path(),
+            verb,
+            &[],
+            &[(STORE_URL_FILE_ENV, &ms), (STORE_URL_ENV, &url)],
+        );
+        assert!(!out.status.success(), "#4600 {verb:?}: must be refused");
+        assert!(
+            stderr(&out).contains(&format!("reading store-url file {}", missing.display())),
+            "#4600 {verb:?}: exact read error; stderr: {}",
+            stderr(&out)
+        );
+        assert_eq!(
+            listener.connections(),
+            0,
+            "#4600 {verb:?}: fell through to ENV"
         );
     }
 }
