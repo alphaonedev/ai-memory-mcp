@@ -26,7 +26,7 @@ import types
 import warnings
 from collections.abc import Callable, Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import httpx
 import pytest
@@ -637,19 +637,40 @@ CIPHERS_NOT_SUBSET = "the SDK context would offer a cipher the caller context do
 OUTCOME_REFUSED = "refused"
 OUTCOME_NOT_RELEVANT = "not_relevant"
 OUTCOME_RESIDUAL = "residual"
-#: (mutator, input, outcome, exact refusal message or None).
-PY315_ROWS: list[tuple[str, str, str, str | None]] = [
-    (
+#: The first Python whose ``ssl.SSLContext`` has all four mutators.
+PY315 = (3, 15)
+
+
+class Py315Row(NamedTuple):
+    """One 3.15 mutator: its input, its outcome, the exact refusal message (or
+    None) and the hasattr gate, evaluated once here, in the table."""
+
+    mutator: str
+    value: str
+    outcome: str
+    message: str | None
+    real: bool
+
+
+def _py315_row(mutator: str, value: str, outcome: str, message: str | None) -> Py315Row:
+    return Py315Row(mutator, value, outcome, message, hasattr(ssl.SSLContext, mutator))
+
+
+PY315_ROWS: list[Py315Row] = [
+    _py315_row(
         "set_ciphersuites",
         PY315_TLS13_SUITE,
         OUTCOME_REFUSED,
         MSG_CIPHERS.format(kind=CALLER_KIND, detail=CIPHERS_NOT_SUBSET),
     ),
-    ("set_groups", PY315_GROUPS, OUTCOME_NOT_RELEVANT, None),
-    ("set_client_sigalgs", PY315_SIGALGS, OUTCOME_NOT_RELEVANT, None),
-    ("set_server_sigalgs", PY315_SIGALGS, OUTCOME_RESIDUAL, None),
+    _py315_row("set_groups", PY315_GROUPS, OUTCOME_NOT_RELEVANT, None),
+    _py315_row("set_client_sigalgs", PY315_SIGALGS, OUTCOME_NOT_RELEVANT, None),
+    _py315_row("set_server_sigalgs", PY315_SIGALGS, OUTCOME_RESIDUAL, None),
 ]
-PY315_IDS = [row[0] for row in PY315_ROWS]
+PY315_IDS = [row.mutator for row in PY315_ROWS]
+#: Test ids carry the gate's branch: ``-real`` runs the real call, ``-absent``
+#: is a clean no-op on a Python without the mutator.
+PY315_REAL_IDS = [f"{row.mutator}-{'real' if row.real else 'absent'}" for row in PY315_ROWS]
 #: Settings the SDK can neither read nor carry; named in the module docstring
 #: and the README (X-4, X-7).
 PY315_DOCUMENTED_RESIDUALS = ("set_groups", "set_server_sigalgs", "set_ciphersuites")
@@ -728,10 +749,9 @@ def _expect_outcome(
         _close(client)
 
 
-@pytest.mark.parametrize("mutator", PY315_IDS)
-def test_6249_each_python_3_15_mutator_is_in_exactly_its_table(mutator: str) -> None:
-    outcome = next(row[2] for row in PY315_ROWS if row[0] == mutator)
-    assert _tables_holding(mutator) == [OUTCOME_TABLE[outcome]], mutator
+@pytest.mark.parametrize("row", PY315_ROWS, ids=PY315_IDS)
+def test_6249_each_python_3_15_mutator_is_in_exactly_its_table(row: Py315Row) -> None:
+    assert _tables_holding(row.mutator) == [OUTCOME_TABLE[row.outcome]], row.mutator
 
 
 @pytest.mark.parametrize("name", PY315_DOCUMENTED_RESIDUALS)
@@ -743,16 +763,13 @@ def test_6249_python_3_15_residuals_are_named_in_the_docstring_and_readme(name: 
 
 @pytest.mark.parametrize("kind", CLIENT_KINDS)
 @pytest.mark.parametrize("caller_path", ["stdlib", "truststore_fake"], indirect=True)
-@pytest.mark.parametrize(("mutator", "value", "outcome", "message"), PY315_ROWS, ids=PY315_IDS)
+@pytest.mark.parametrize("row", PY315_ROWS, ids=PY315_IDS)
 def test_6249_python_3_15_mutator_on_a_stand_in_context_follows_its_row(
     lab: Lab,
     good_server: LabServer,
     caller_path: str,
     kind: str,
-    mutator: str,
-    value: str,
-    outcome: str,
-    message: str | None,
+    row: Py315Row,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Runs on every Python: a caller context that called one 3.15 mutator is
@@ -760,32 +777,37 @@ def test_6249_python_3_15_mutator_on_a_stand_in_context_follows_its_row(
     carried, as its row says."""
     _install_python315(monkeypatch)
     verify, settings = _caller(caller_path, lab)
-    getattr(Python315SSLContext, mutator)(settings, value)
-    owned = _expect_outcome(kind, good_server.url, verify, mutator, outcome, message)
+    getattr(Python315SSLContext, row.mutator)(settings, row.value)
+    owned = _expect_outcome(kind, good_server.url, verify, row.mutator, row.outcome, row.message)
     if owned is not None:
-        assert PY315_MARK not in owned.__dict__, f"{mutator} reached the owned context"
+        assert PY315_MARK not in owned.__dict__, f"{row.mutator} reached the owned context"
+
+
+def test_6249_python_3_15_real_call_branch_count() -> None:
+    """The gate's branch count: every row is real on Python 3.15+, and the
+    count is in the message on every Python."""
+    real = [row.mutator for row in PY315_ROWS if row.real]
+    count = f"real calls {len(real)}/{len(PY315_ROWS)} on Python {sys.version.split()[0]}: {real}"
+    if sys.version_info >= PY315:
+        assert len(real) == len(PY315_ROWS), count
+    assert all(row.real == hasattr(ssl.SSLContext, row.mutator) for row in PY315_ROWS), count
 
 
 @pytest.mark.parametrize("kind", CLIENT_KINDS)
 @pytest.mark.parametrize("caller_path", ["stdlib", "truststore_fake"], indirect=True)
-def test_6249_python_3_15_mutators_real_calls_where_the_interpreter_has_them(
-    lab: Lab, good_server: LabServer, caller_path: str, kind: str
+@pytest.mark.parametrize("row", PY315_ROWS, ids=PY315_REAL_IDS)
+def test_6249_python_3_15_mutator_real_call_follows_its_row(
+    lab: Lab, good_server: LabServer, caller_path: str, kind: str, row: Py315Row
 ) -> None:
-    """The real 3.15 call where ``ssl.SSLContext`` has it. No skip marker: the
-    branch count is asserted, and on Python 3.15+ every row must run for real."""
-    present = [row for row in PY315_ROWS if hasattr(ssl.SSLContext, row[0])]
-    absent = [row[0] for row in PY315_ROWS if row not in present]
-    count = (
-        f"real calls {len(present)}/{len(PY315_ROWS)} on Python {sys.version.split()[0]}; "
-        f"absent: {absent}"
-    )
-    assert len(present) + len(absent) == len(PY315_ROWS), count
-    if sys.version_info >= (3, 15):
-        assert len(present) == len(PY315_ROWS), count
-    for mutator, value, outcome, message in present:
-        verify, settings = _caller(caller_path, lab)
-        getattr(settings, mutator)(value)
-        _expect_outcome(kind, good_server.url, verify, mutator, outcome, message)
+    """One row per mutator, gated by the table's ``real`` column (no skip
+    marker): ``-real`` calls the interpreter's own mutator on a caller context
+    and expects the row's outcome; ``-absent`` is a clean no-op below 3.15."""
+    if not row.real:
+        assert sys.version_info < PY315, f"{row.mutator} missing on Python {sys.version}"
+        return
+    verify, settings = _caller(caller_path, lab)
+    getattr(settings, row.mutator)(row.value)
+    _expect_outcome(kind, good_server.url, verify, row.mutator, row.outcome, row.message)
 
 
 # -- S-M1: the truststore shape contract ---------------------------------------
