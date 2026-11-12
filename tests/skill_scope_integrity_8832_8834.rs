@@ -884,16 +884,89 @@ const RESERVED_KEY: &str = "memory_skill_register refused: metadata carries a re
 const BINDING_MALFORMED: &str = "memory_skill_register refused: metadata '_visibility' must be \
     exactly {\"scope\": <private|team|unit|org|collective>, \"agent_id\": <registering principal>} \
     with no other key";
-/// The exact refusal for a binding naming another principal (names both
-/// remedies, echoes no principal).
+/// The exact refusal for a binding naming another principal (B-13: names the
+/// remedy, echoes no principal).
 const BINDING_FOREIGN: &str = "memory_skill_register refused: metadata '_visibility' is bound to \
-    a different principal; register it as the principal that promoted it, or promote the source \
-    reflection again on this node as yourself";
+    a different principal; remove the '_visibility' binding and register the skill as your own \
+    (its digest then differs from the exported digest), or register it as the principal that \
+    promoted it";
+/// B-9: the exact refusal for a binding scope that is not a canonical token.
+const SCOPE_INVALID: &str = "memory_skill_register refused: metadata '_visibility' scope must be \
+    exactly one of private, team, unit, org, collective; unknown and legacy scope tokens are not \
+    accepted";
+/// B-9: the exact refusal for a binding scope the principal is not a member of.
+const SCOPE_NOT_MEMBER: &str = "memory_skill_register refused: metadata '_visibility' scope is \
+    one the registering principal is not a member of in this namespace; bind a scope you can read, \
+    or remove the binding";
+/// B-10: the exact refusal for any binding without a resolved principal.
+const PRINCIPAL_UNRESOLVED: &str = "memory_skill_register refused: metadata '_visibility' \
+    requires an authenticated agent identity (an anonymous, host-default or reserved identity \
+    cannot own a binding); register as your own agent id, or remove the binding";
+/// B-12: the exact refusal for a bound register over another principal's skill.
+const SHADOWS_EXISTING: &str = "memory_skill_register refused: a current skill with this \
+    namespace and name is not bound to the registering principal, and a '_visibility' binding \
+    may not supersede it; register under another name, or remove the binding";
 
-/// The frontmatter of a skill carrying `extra` metadata lines.
+/// The typed wire codes the HTTP route returns beside each refusal.
+use ai_memory::errors::error_codes::{
+    AGENT_ID_MISMATCH as CODE_MISMATCH, CONFLICT as CODE_CONFLICT,
+    IDENTITY_REQUIRED as CODE_IDENTITY, VALIDATION_FAILED as CODE_VALIDATION,
+};
+
+/// The frontmatter of a skill in `NS` carrying `extra` metadata lines.
 fn skill_with(name: &str, extra: &str) -> String {
+    skill_in(NS, name, extra)
+}
+
+/// The frontmatter of a skill in `ns` carrying `extra` metadata lines.
+fn skill_in(ns: &str, name: &str, extra: &str) -> String {
     format!(
-        "---\nnamespace: {NS}\nname: {name}\ndescription: Binding probe.\n{extra}---\n\nBody.\n"
+        "---\nnamespace: {ns}\nname: {name}\ndescription: Binding probe.\n{extra}---\n\nBody.\n"
+    )
+}
+
+/// The HTTP status and typed `code` the register route returns beside each
+/// exact refusal text (the `AGENT_ID_MISMATCH` pattern of the create route).
+fn http_class(reason: &str) -> (StatusCode, &'static str) {
+    match reason {
+        BINDING_FOREIGN => (StatusCode::FORBIDDEN, CODE_MISMATCH),
+        PRINCIPAL_UNRESOLVED => (StatusCode::FORBIDDEN, CODE_IDENTITY),
+        SHADOWS_EXISTING => (StatusCode::CONFLICT, CODE_CONFLICT),
+        _ => (StatusCode::BAD_REQUEST, CODE_VALIDATION),
+    }
+}
+
+/// Assert one HTTP register refusal: status, typed code and exact text.
+fn assert_http_refusal(form: &str, status: StatusCode, payload: &Value, reason: &str) {
+    let (want_status, want_code) = http_class(reason);
+    assert_eq!(status, want_status, "{form}: {payload}");
+    assert_eq!(payload["error"].as_str(), Some(reason), "{form}");
+    assert_eq!(payload["code"].as_str(), Some(want_code), "{form}");
+}
+
+/// Assert one CLI register refusal: exit 2 and the exact text on stderr.
+fn assert_cli_refusal(form: &str, run: &CliRun, reason: &str) {
+    assert_eq!(run.code, 2, "{form}: {}", run.stdout);
+    let tail = reason
+        .strip_prefix("memory_skill_register ")
+        .expect("register prefix");
+    assert_eq!(
+        run.stderr,
+        format!("ai-memory skill register: {tail}\n"),
+        "{form}"
+    );
+}
+
+/// Register an inline skill over the CLI register verb.
+fn cli_register(db_path: &Path, inline: String) -> CliRun {
+    cli(
+        db_path,
+        SkillAction::Register(RegisterArgs {
+            manifest: None,
+            inline: Some(inline),
+            parameters_schema: None,
+            json: true,
+        }),
     )
 }
 
@@ -907,7 +980,56 @@ fn binding(scope: &str, agent: &str) -> String {
 fn register_forms() -> Vec<(&'static str, String, Option<&'static str>)> {
     vec![
         ("self binding", binding("private", OWNER), None),
-        ("self binding, team", binding("team", OWNER), None),
+        ("self binding, collective", binding("collective", OWNER), None),
+        // B-9: OWNER has no team / unit / org ancestor, so it could not read
+        // a skill so bound in NS.
+        (
+            "self binding, team (non-member)",
+            binding("team", OWNER),
+            Some(SCOPE_NOT_MEMBER),
+        ),
+        (
+            "self binding, unit (non-member)",
+            binding("unit", OWNER),
+            Some(SCOPE_NOT_MEMBER),
+        ),
+        (
+            "self binding, org (non-member)",
+            binding("org", OWNER),
+            Some(SCOPE_NOT_MEMBER),
+        ),
+        (
+            "self binding, legacy-broad scope",
+            binding("shared", OWNER),
+            Some(SCOPE_INVALID),
+        ),
+        // B-8: the check runs on the parsed value, so every YAML spelling of
+        // the same mapping gets the same answer.
+        (
+            "flow-style self binding",
+            format!("_visibility: {{scope: private, agent_id: {OWNER}}}\n"),
+            None,
+        ),
+        (
+            "flow-style other-principal binding",
+            format!("_visibility: {{scope: private, agent_id: {OTHER}}}\n"),
+            Some(BINDING_FOREIGN),
+        ),
+        (
+            "quoted-key other-principal binding",
+            format!("\"_visibility\":\n  \"scope\": private\n  \"agent_id\": \"{OTHER}\"\n"),
+            Some(BINDING_FOREIGN),
+        ),
+        (
+            "case-folded self id",
+            binding("private", &OWNER.to_uppercase()),
+            Some(BINDING_FOREIGN),
+        ),
+        (
+            "unicode-folded self id",
+            binding("private", &OWNER.replace('a', "\u{ff41}")),
+            Some(BINDING_FOREIGN),
+        ),
         (
             "other-principal binding",
             binding("private", OTHER),
@@ -931,12 +1053,12 @@ fn register_forms() -> Vec<(&'static str, String, Option<&'static str>)> {
         (
             "binding with a non-canonical scope",
             binding("Private", OWNER),
-            Some(BINDING_MALFORMED),
+            Some(SCOPE_INVALID),
         ),
         (
             "binding with a wider unknown scope",
             binding("global", OWNER),
-            Some(BINDING_MALFORMED),
+            Some(SCOPE_INVALID),
         ),
         (
             "binding as a bare string",
@@ -1024,30 +1146,77 @@ fn register_metadata_forms_over_cli_8832() {
     env.act_as(Some(OWNER));
     let (_dir, db_path) = fresh_db();
     for (n, (form, extra, expected)) in register_forms().into_iter().enumerate() {
-        let run = cli(
-            &db_path,
-            SkillAction::Register(RegisterArgs {
-                manifest: None,
-                inline: Some(skill_with(&format!("cli-form-{n}"), &extra)),
-                parameters_schema: None,
-                json: true,
-            }),
-        );
+        let run = cli_register(&db_path, skill_with(&format!("cli-form-{n}"), &extra));
         match expected {
             None => assert_eq!(run.code, 0, "{form}: {}", run.stderr),
-            Some(reason) => {
-                assert_eq!(run.code, 2, "{form}");
-                let tail = reason
-                    .strip_prefix("memory_skill_register ")
-                    .expect("register prefix");
-                assert_eq!(
-                    run.stderr,
-                    format!("ai-memory skill register: {tail}\n"),
-                    "{form}"
-                );
-            }
+            Some(reason) => assert_cli_refusal(form, &run, reason),
         }
     }
+    drop(env);
+}
+
+/// B-11: the same forms over the HTTP register route, with `OWNER` as the
+/// authenticated admin caller: 200 for an accepted form, otherwise the exact
+/// text, status and typed code of the ONE shared check.
+#[test]
+fn register_metadata_forms_over_http_8832() {
+    let env = EnvLock::new();
+    let (_dir, db_path) = fresh_db();
+    for (n, (form, extra, expected)) in register_forms().into_iter().enumerate() {
+        let body = json!({ "inline_skill": skill_with(&format!("http-form-{n}"), &extra) });
+        let (status, payload) =
+            http_register_as(app_state(&db_path, StorageBackend::Sqlite), OWNER, body);
+        match expected {
+            None => assert_eq!(status, StatusCode::OK, "{form}: {payload}"),
+            Some(reason) => assert_http_refusal(form, status, &payload, reason),
+        }
+    }
+    drop(env);
+}
+
+/// B-8: the check runs on the final metadata that is stored and digested,
+/// so a reserved key carried in by the `parameters_schema` wire argument is
+/// refused like one in the frontmatter, on every surface; the stored binding
+/// of an accepted register is exactly `{scope, agent_id: <principal>}`.
+#[test]
+fn register_checks_the_stored_metadata_8832() {
+    let env = EnvLock::new();
+    env.act_as(Some(OWNER));
+    let (_dir, db_path) = fresh_db();
+    let conn = db::open(&db_path).expect("open");
+    let schema = json!({ "type": "object", "_trust": "admin" });
+    let got = mcp::handle_skill_register(
+        &conn,
+        &json!({ "inline_skill": skill_with("schema-8832", ""), "parameters_schema": schema }),
+        None,
+    );
+    assert_eq!(got.expect_err("a reserved schema key"), RESERVED_KEY);
+    let (status, payload) = http_register_as(
+        app_state(&db_path, StorageBackend::Sqlite),
+        OWNER,
+        json!({ "inline_skill": skill_with("schema-http-8832", ""), "parameters_schema": schema }),
+    );
+    assert_http_refusal("schema key over HTTP", status, &payload, RESERVED_KEY);
+
+    let flow = format!("_visibility: {{ agent_id: {OWNER},   scope: private }}\n");
+    let v = mcp::handle_skill_register(
+        &conn,
+        &json!({ "inline_skill": skill_with("stored-8832", &flow) }),
+        None,
+    )
+    .expect("a self binding registers");
+    let stored: String = conn
+        .query_row(
+            "SELECT metadata FROM skills WHERE id = ?1",
+            [v["id"].as_str().expect("id")],
+            |r| r.get(0),
+        )
+        .expect("stored metadata");
+    let stored: Value = serde_json::from_str(&stored).expect("metadata JSON");
+    assert_eq!(
+        stored["_visibility"],
+        json!({ "scope": "private", "agent_id": OWNER })
+    );
     drop(env);
 }
 
@@ -1194,7 +1363,13 @@ fn app_state(db_path: &Path, backend: StorageBackend) -> AppState {
         atomise_queue: None,
         recall_scope: std::sync::Arc::new(None),
         deferred_audit_queue: std::sync::Arc::new(None),
-        admin_agent_ids: std::sync::Arc::new(vec![HTTP_ADMIN.to_string()]),
+        admin_agent_ids: std::sync::Arc::new(
+            [HTTP_ADMIN, OWNER]
+                .into_iter()
+                .chain(HTTP_UNRESOLVED_ADMINS)
+                .map(str::to_string)
+                .collect(),
+        ),
         rule_cache: std::sync::Arc::new(ai_memory::governance::rule_cache::RuleCache::new()),
         resolved_models: std::sync::Arc::new(ai_memory::reload::Swappable::new(
             ai_memory::config::ResolvedModels::default(),
@@ -1210,6 +1385,11 @@ fn app_state(db_path: &Path, backend: StorageBackend) -> AppState {
 
 /// POST one register body through the HTTP route as `HTTP_ADMIN`.
 fn http_register(app: AppState, body: Value) -> (StatusCode, Value) {
+    http_register_as(app, HTTP_ADMIN, body)
+}
+
+/// POST one register body through the HTTP route as the admin `agent`.
+fn http_register_as(app: AppState, agent: &str, body: Value) -> (StatusCode, Value) {
     use axum::response::IntoResponse as _;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1217,7 +1397,7 @@ fn http_register(app: AppState, body: Value) -> (StatusCode, Value) {
         .expect("runtime");
     runtime.block_on(async move {
         let mut headers = axum::http::HeaderMap::new();
-        headers.insert("x-agent-id", HTTP_ADMIN.parse().expect("header value"));
+        headers.insert("x-agent-id", agent.parse().expect("header value"));
         let resp = ai_memory::handlers::skill_register_route(
             axum::extract::State(app),
             headers,
@@ -1239,52 +1419,45 @@ fn http_register(app: AppState, body: Value) -> (StatusCode, Value) {
 /// Over HTTP the registering principal is the authenticated admin caller,
 /// never the process identity: with `AI_MEMORY_AGENT_ID` naming another
 /// agent, a binding for the admin registers and a binding for the env agent
-/// is refused with the exact reason (400).
+/// is refused with the exact reason, status and typed code.
 #[test]
 fn http_register_binding_is_keyed_on_the_admin_caller_8832() {
     let env = EnvLock::new();
     env.act_as(Some(OTHER));
     let (_dir, db_path) = fresh_db();
-    let cases: [(&str, String, StatusCode, Option<&str>); 5] = [
-        (
-            "admin self binding",
-            binding("private", HTTP_ADMIN),
-            StatusCode::OK,
-            None,
-        ),
+    let cases: [(&str, String, Option<&str>); 5] = [
+        ("admin self binding", binding("private", HTTP_ADMIN), None),
         (
             "env-agent binding",
             binding("private", OTHER),
-            StatusCode::BAD_REQUEST,
             Some(BINDING_FOREIGN),
         ),
         (
             "malformed binding",
             format!("_visibility:\n  scope: private\n  agent_id: {HTTP_ADMIN}\n  x: 1\n"),
-            StatusCode::BAD_REQUEST,
             Some(BINDING_MALFORMED),
         ),
         (
             "nested reserved key",
             "metadata:\n  owner:\n    _trust: admin\n".to_string(),
-            StatusCode::BAD_REQUEST,
             Some(RESERVED_KEY),
         ),
-        ("unbound", String::new(), StatusCode::OK, None),
+        ("unbound", String::new(), None),
     ];
-    for (n, (form, extra, status, reason)) in cases.into_iter().enumerate() {
+    for (n, (form, extra, reason)) in cases.into_iter().enumerate() {
         let body = json!({ "inline_skill": skill_with(&format!("http-{n}"), &extra) });
         let (got, payload) = http_register(app_state(&db_path, StorageBackend::Sqlite), body);
-        assert_eq!(got, status, "{form}: {payload}");
-        if let Some(reason) = reason {
-            assert_eq!(payload["error"].as_str(), Some(reason), "{form}");
+        match reason {
+            None => assert_eq!(got, StatusCode::OK, "{form}: {payload}"),
+            Some(reason) => assert_http_refusal(form, got, &payload, reason),
         }
     }
     drop(env);
 }
 
-/// Skills are SQLite-only: on a PostgreSQL-backed daemon the register route
-/// fails closed (501) before any binding is read, for a self binding too.
+/// B-14: skills are SQLite-only. On a PostgreSQL-backed daemon the register
+/// route fails closed with the exact 501 body before any binding is read,
+/// for a self binding too.
 #[cfg(feature = "sal-postgres")]
 #[test]
 fn pg_register_with_a_binding_fails_closed_8832() {
@@ -1293,6 +1466,240 @@ fn pg_register_with_a_binding_fails_closed_8832() {
     let body = json!({ "inline_skill": skill_with("pg-8832", &binding("private", HTTP_ADMIN)) });
     let (status, payload) = http_register(app_state(&db_path, StorageBackend::Postgres), body);
     assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{payload}");
+    assert_eq!(
+        payload,
+        json!({
+            "error": "endpoint not yet implemented for postgres-backed daemon",
+            "endpoint": ai_memory::handlers::routes::SKILL_REGISTER,
+            "storage_backend": "postgres",
+            "remediation": "use sqlite-backed daemon or wait for v0.7.x trait coverage",
+        })
+    );
+    let rows: i64 = db::open(&db_path)
+        .expect("open")
+        .query_row("SELECT COUNT(*) FROM skills", [], |r| r.get(0))
+        .expect("count");
+    assert_eq!(rows, 0, "the refused register writes no row");
+    drop(env);
+}
+
+// ---------------------------------------------------------------------------
+// #8832 B-10 / B-11 — no resolved principal binds nothing, on every surface
+// ---------------------------------------------------------------------------
+
+/// HTTP admin principals that are not resolved agent identities (a host
+/// default and a synthesized anonymous id an operator could list as admin).
+const HTTP_UNRESOLVED_ADMINS: [&str; 2] = ["host:node-8832", "anonymous:admin-8832"];
+
+/// The rows of the shared check for a principal that is not resolved:
+/// every binding is refused with the B-10 reason before its shape is read,
+/// every other reserved key keeps `RESERVED_KEY`, a plain register succeeds.
+fn unresolved_forms(principal: &str) -> Vec<(&'static str, String, Option<&'static str>)> {
+    vec![
+        (
+            "self-named binding",
+            binding("private", principal),
+            Some(PRINCIPAL_UNRESOLVED),
+        ),
+        (
+            "collective self-named binding",
+            binding("collective", principal),
+            Some(PRINCIPAL_UNRESOLVED),
+        ),
+        (
+            "other-principal binding",
+            binding("private", OWNER),
+            Some(PRINCIPAL_UNRESOLVED),
+        ),
+        (
+            "malformed binding",
+            "_visibility: x\n".to_string(),
+            Some(PRINCIPAL_UNRESOLVED),
+        ),
+        (
+            "sibling reserved key",
+            "_signed_state: verified\n".to_string(),
+            Some(RESERVED_KEY),
+        ),
+        ("plain", String::new(), None),
+    ]
+}
+
+/// B-10 / B-11 — one table over MCP, CLI and HTTP. MCP and CLI act as the
+/// process identity: unset (the durable host default), a synthesized
+/// anonymous id, and a reserved sentinel. HTTP acts as the admin-gated
+/// header principal. No binding is accepted for any of them.
+#[test]
+fn unresolved_principal_binds_nothing_on_every_surface_8832() {
+    let env = EnvLock::new();
+    let process_identities: [Option<&str>; 3] = [None, Some("anonymous:x-8832"), Some("system")];
+    for agent in process_identities {
+        env.act_as(agent);
+        let principal = ai_memory::identity::resolve_governance_subject(None, None, "probe")
+            .expect("process identity");
+        if agent.is_none() {
+            assert!(
+                principal.starts_with("host:") || principal.starts_with("anonymous:"),
+                "the unset identity is the host default: {principal}"
+            );
+        }
+        let (_dir, db_path) = fresh_db();
+        let conn = db::open(&db_path).expect("open");
+        for (n, (form, extra, expected)) in unresolved_forms(&principal).into_iter().enumerate() {
+            let got = mcp::handle_skill_register(
+                &conn,
+                &json!({ "inline_skill": skill_with(&format!("mcp-u-{n}"), &extra) }),
+                None,
+            );
+            let run = cli_register(&db_path, skill_with(&format!("cli-u-{n}"), &extra));
+            match expected {
+                None => {
+                    got.unwrap_or_else(|e| panic!("{principal} {form}: must register: {e}"));
+                    assert_eq!(run.code, 0, "{principal} {form}: {}", run.stderr);
+                }
+                Some(reason) => {
+                    assert_eq!(got.expect_err(form), reason, "MCP {principal} {form}");
+                    assert_cli_refusal(form, &run, reason);
+                }
+            }
+        }
+    }
+    env.act_as(Some(OWNER));
+    for admin in HTTP_UNRESOLVED_ADMINS {
+        let (_dir, db_path) = fresh_db();
+        for (n, (form, extra, expected)) in unresolved_forms(admin).into_iter().enumerate() {
+            let body = json!({ "inline_skill": skill_with(&format!("http-u-{n}"), &extra) });
+            let (status, payload) =
+                http_register_as(app_state(&db_path, StorageBackend::Sqlite), admin, body);
+            match expected {
+                None => assert_eq!(status, StatusCode::OK, "{admin} {form}: {payload}"),
+                Some(reason) => assert_http_refusal(form, status, &payload, reason),
+            }
+        }
+    }
+    drop(env);
+}
+
+// ---------------------------------------------------------------------------
+// #8832 B-9 / B-12 — a self binding grants nothing and shadows nothing
+// ---------------------------------------------------------------------------
+
+/// B-9 / B-12: a team member may bind its team scope; the same binding in a
+/// namespace outside its team is refused. For every accepted binding, no
+/// reader is served the bound skill who is not served the same skill
+/// registered plain (a register-path binding only narrows).
+#[test]
+fn a_self_binding_grants_nothing_a_plain_register_does_not_8832() {
+    let env = EnvLock::new();
+    let (_dir, db_path) = fresh_db();
+    let conn = db::open(&db_path).expect("open");
+    env.act_as(Some(TEAM_OWNER));
+    let outside = mcp::handle_skill_register(
+        &conn,
+        &json!({ "inline_skill": skill_in(OTHER_NS, "team-out-8832", &binding("team", TEAM_OWNER)) }),
+        None,
+    );
+    assert_eq!(outside.expect_err("non-member team"), SCOPE_NOT_MEMBER);
+    let run = cli_register(
+        &db_path,
+        skill_in(TEAM_NS, "team-cli-8832", &binding("team", TEAM_OWNER)),
+    );
+    assert_eq!(run.code, 0, "a team member binds its team: {}", run.stderr);
+
+    let cases: [(&str, &str, &str); 3] = [
+        (OWNER, NS, "private"),
+        (OWNER, NS, "collective"),
+        (TEAM_OWNER, TEAM_NS, "team"),
+    ];
+    let readers = [OWNER, OTHER, TEAM_OWNER, TEAM_PEER, HTTP_ADMIN];
+    for (n, (registrant, ns, scope)) in cases.into_iter().enumerate() {
+        env.act_as(Some(registrant));
+        let mut ids = Vec::new();
+        for extra in [binding(scope, registrant), String::new()] {
+            let v = mcp::handle_skill_register(
+                &conn,
+                &json!({ "inline_skill": skill_in(ns, &format!("grant-{n}-{}", ids.len()), &extra) }),
+                None,
+            )
+            .unwrap_or_else(|e| panic!("{registrant} {scope}: must register: {e}"));
+            ids.push(v["id"].as_str().expect("id").to_string());
+        }
+        for reader in readers {
+            env.act_as(Some(reader));
+            let served = |id: &str| mcp::handle_skill_get(&conn, &json!({ "skill_id": id }), None);
+            let bound = served(&ids[0]).is_ok();
+            let plain = served(&ids[1]).is_ok();
+            assert!(plain, "{reader}: an unbound skill is readable by every caller");
+            assert!(
+                !bound || plain,
+                "{reader}: the {scope} binding granted more than a plain register"
+            );
+            if reader == registrant {
+                assert!(bound, "{reader}: the binder reads its own {scope} skill");
+            }
+        }
+    }
+    drop(env);
+}
+
+/// B-12: a self-bound register cannot supersede (and so hide) another
+/// principal's current skill of the same namespace and name, plain or
+/// bound, over MCP, the CLI or HTTP; that skill stays current and readable.
+/// The binder's own bound lineage still re-registers.
+#[test]
+fn bound_register_cannot_shadow_another_principals_skill_8832() {
+    let env = EnvLock::new();
+    let (_dir, db_path) = fresh_db();
+    let conn = db::open(&db_path).expect("open");
+    let register = |name: &str, extra: &str| {
+        mcp::handle_skill_register(
+            &conn,
+            &json!({ "inline_skill": skill_with(name, extra) }),
+            None,
+        )
+    };
+    let current = |name: &str| -> Vec<String> {
+        let mut stmt = conn
+            .prepare("SELECT id FROM skills WHERE name = ?1 AND superseded_by IS NULL")
+            .expect("prepare");
+        stmt.query_map([name], |r| r.get(0))
+            .expect("query")
+            .collect::<Result<_, _>>()
+            .expect("rows")
+    };
+    for (n, other_extra) in [String::new(), binding("private", OTHER)]
+        .into_iter()
+        .enumerate()
+    {
+        let name = format!("shadow-{n}-8832");
+        env.act_as(Some(OTHER));
+        let victim = register(&name, &other_extra).expect("the other principal registers");
+        let victim_id = victim["id"].as_str().expect("id").to_string();
+
+        env.act_as(Some(OWNER));
+        let got = register(&name, &binding("private", OWNER));
+        assert_eq!(got.expect_err("shadow over MCP"), SHADOWS_EXISTING);
+        let run = cli_register(&db_path, skill_with(&name, &binding("collective", OWNER)));
+        assert_cli_refusal("shadow over the CLI", &run, SHADOWS_EXISTING);
+        let (status, payload) = http_register_as(
+            app_state(&db_path, StorageBackend::Sqlite),
+            OWNER,
+            json!({ "inline_skill": skill_with(&name, &binding("private", OWNER)) }),
+        );
+        assert_http_refusal("shadow over HTTP", status, &payload, SHADOWS_EXISTING);
+
+        assert_eq!(current(&name), vec![victim_id.clone()], "the victim stays current");
+        env.act_as(Some(OTHER));
+        mcp::handle_skill_get(&conn, &json!({ "skill_id": victim_id }), None)
+            .expect("the other principal still reads its skill");
+    }
+
+    env.act_as(Some(OWNER));
+    let first = register("own-8832", &binding("private", OWNER)).expect("own bound register");
+    let rev = format!("{}metadata:\n  rev: 2\n", binding("private", OWNER));
+    let second = register("own-8832", &rev).expect("the binder re-registers its own lineage");
+    assert_eq!(second["superseded_id"].as_str(), first["id"].as_str());
+    assert_eq!(current("own-8832"), vec![second["id"].as_str().expect("id").to_string()]);
     drop(env);
 }
 
