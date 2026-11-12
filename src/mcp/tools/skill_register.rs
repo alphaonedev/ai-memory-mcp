@@ -488,9 +488,10 @@ pub fn handle_skill_register(
 
 /// #8832 — the caller-facing text of a failed register: a typed refusal
 /// root keeps its fixed text, a foreign root (storage, filesystem) never
-/// reaches the caller.
+/// reaches the caller: it goes to the operator log and the caller gets the
+/// closed class text (#3713, `mcp_foreign_err`).
 fn register_error_text(e: anyhow::Error) -> String {
-    e.to_string()
+    crate::mcp::error_text::mcp_foreign_err("skill register", e)
 }
 
 /// #8832 — the shared register body. `principal` is the authenticated caller

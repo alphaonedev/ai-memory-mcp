@@ -1219,6 +1219,12 @@ impl From<anyhow::Error> for MemoryError {
         if let Some(rnf) = e.downcast_ref::<ReflectionNotFound>() {
             return Self::Refused(rnf.to_string());
         }
+        // #8832 - a skill-register metadata refusal is our own typed root,
+        // one fixed message per class. It stays a refusal with its text
+        // unchanged; the HTTP register route downcasts the type first.
+        if let Some(r) = e.downcast_ref::<crate::mcp::RegisterMetadataRefusal>() {
+            return Self::Refused(r.message().to_owned());
+        }
         // #3713 — the optimistic-concurrency conflict (`memory_update`'s
         // `expected_version`) is our own typed root; keep its text.
         if let Some(vc) = e.downcast_ref::<crate::storage::VersionConflict>() {
