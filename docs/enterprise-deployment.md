@@ -486,7 +486,9 @@ bootstrap — see
 RDS, Cloud SQL)"](postgres-age-guide.html) for the one-time admin
 pre-create that lets a non-superuser owner role boot, and for the
 `SQLSTATE 42501` vs `0A000` diagnostics). Probe a backend BEFORE
-deploying with `ai-memory doctor`, which is read-only and reports the
+deploying with `ai-memory doctor`, which never creates or migrates the
+database (its one write is the signed refusal row of a probe the
+inference-egress posture refuses, #4121) and reports the
 "Postgres extensions (#3264)" section; `schema-init` is not a pre-deploy
 check for a failing backend, because opening the store runs the bootstrap
 and it refuses at connect with the classified remedy before any JSON is

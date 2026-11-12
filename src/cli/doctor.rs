@@ -51,7 +51,11 @@
 //! ## Anti-goals (per spec)
 //!
 //! - Do NOT add new monitoring infrastructure (no Prometheus, OTel exporters).
-//! - Do NOT make doctor write to the DB. Read-only.
+//! - Do NOT make doctor create, migrate or change the DB: it never changes a
+//!   memory, the schema or the file set. Its one write is the signed
+//!   `egress.inference_refused` row a probe the inference-egress posture
+//!   refuses appends to the EXISTING database (#4121, #9175);
+//!   `--repair-schema-version` is the separate repair mode (#2555).
 //! - Do NOT make doctor block the database. Indexed `COUNT(*)` queries only.
 
 use crate::cli::CliOutput;
@@ -783,7 +787,8 @@ fn render_hooks_human_with(
 
 /// Entry point. Returns the process exit code as a `i32` (0/1/2). The
 /// caller (daemon_runtime) must `std::process::exit(code)` after the WAL
-/// checkpoint has been skipped (doctor never writes).
+/// checkpoint has been skipped (doctor never migrates; its one write is the
+/// #4121 refused-probe audit row, appended to the existing file).
 ///
 /// # Errors
 ///
@@ -1681,7 +1686,9 @@ fn run_local(db_path: &Path, caller_agent_id: Option<&str>) -> Report {
     }
 
     // Open the connection once, READ-ONLY. A missing path is a refusal,
-    // never a create-and-migrate (#3434 — clap advertises "never mutates").
+    // never a create-and-migrate (#3434 — clap advertises "never changes a
+    // memory, the schema or the file set"; the one write is the #4121
+    // refused-probe audit row, through its own existing-file open).
     // Failures bubble into a single Critical section and the rest of the
     // report is N/A. Identity still renders (the keystore is independent
     // of the database).
@@ -1781,7 +1788,7 @@ fn run_local(db_path: &Path, caller_agent_id: Option<&str>) -> Report {
                 } else if e.to_string().contains(db::MISSING_DATABASE_REFUSAL) {
                     format!(
                         "database at {} does not exist — refusing to create it \
-                         (doctor is read-only). Every other section is N/A.",
+                         (doctor never creates the database). Every other section is N/A.",
                         db_path.display()
                     )
                 } else {
@@ -4581,8 +4588,11 @@ const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// is recorded through
 /// [`crate::egress::refuse_inference_egress_audited_existing`]: the same
 /// signed row boot and `reembed` append (#4122), on the existing file only
-/// (no create, no migration, #3434); the row carries a hash of the target,
-/// never the URL.
+/// (no create, no migration, refused on a schema stamp ahead of or behind
+/// the binary, #9175 D-M1); the row carries a hash of the target, never the
+/// URL. When the row could not be appended, the exact NOT-recorded line is
+/// appended to the note, because doctor installs no tracing subscriber
+/// (#9175 D-L2).
 fn probe_refused_section(
     name: &str,
     noun: &str,
@@ -4592,16 +4602,23 @@ fn probe_refused_section(
     reason: String,
     audit: (crate::egress::EgressClass, Option<&Path>),
 ) -> ReportSection {
-    if let (class, Some(db)) = audit {
-        crate::egress::refuse_inference_egress_audited_existing(db, class, base_url, &reason);
-    }
-    let note = format!(
+    let unrecorded = match audit {
+        (class, Some(db)) => {
+            crate::egress::refuse_inference_egress_audited_existing(db, class, base_url, &reason)
+        }
+        (_, None) => None,
+    };
+    let mut note = format!(
         "probe NOT sent (#4121): inference-plane egress refused the {noun} target {} under \
          {}={}; no connection was opened and no API key left the process. {reason}",
         crate::url_display::url_origin(base_url),
         crate::egress::ENV_INFERENCE_EGRESS,
         mode.as_str(),
     );
+    if let Some(line) = unrecorded {
+        note.push(' ');
+        note.push_str(&line);
+    }
     facts.push(("inference_egress".into(), reason));
     facts.push(("inference_egress_mode".into(), mode.as_str().to_string()));
     ReportSection {

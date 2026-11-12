@@ -200,7 +200,9 @@ periodic `ai-memory doctor --remote <url> --json` sweep (exit 2 = critical).
 
 - **Prefer read-only tools.** `ai-memory doctor` (local or `--remote`),
   `/api/v1/health`, `/api/v1/monitoring/status` and
-  `ai-memory verify-audit-trail` read; they do not change the store.
+  `ai-memory verify-audit-trail` read; they do not change a memory or the
+  schema. The one doctor write is the signed refusal row of a probe the
+  inference-egress posture refuses (#4121).
 - **Raise log verbosity narrowly and briefly.** `RUST_LOG=ai_memory=debug`
   (the postgres adapter logs under `store::postgres`, which an `ai_memory=…`
   filter does not match). Treat any debug or trace capture as sensitive: do

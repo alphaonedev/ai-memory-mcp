@@ -592,69 +592,77 @@ pub fn emit_inference_egress_refusal(
 /// mirroring [`crate::daemon_runtime::load_boot_index_entries`] — appends
 /// the signed refusal, and WARNs on any failure without disturbing the
 /// enforcement (the caller has already decided to return a `None` client).
+/// The WARN reaches stderr even on a verb with no tracing subscriber
+/// (#9175 D-L2, see [`emit_unrecorded`]).
 pub fn refuse_inference_egress_audited(
     db_path: &std::path::Path,
     class: EgressClass,
     target: &str,
     reason: &str,
 ) {
-    audit_refusal_on(crate::db::open(db_path), class, target, reason);
+    if let Some(line) = audit_refusal_on(crate::db::open(db_path), class, target, reason) {
+        emit_unrecorded(&line);
+    }
 }
 
 /// #4121 — the audited refusal for a caller that must not create or migrate
-/// the database (`doctor`, read-only by contract #3434). It opens the
-/// EXISTING file read-write without `SQLITE_OPEN_CREATE` (the
-/// `backup::lock_exclusive` precedent), keys it like every other open, and
-/// appends only the signed refusal row; a missing file or a failed open is a
-/// WARN, never a new file, a migration or a watermark write.
+/// the database (`doctor`, which writes nothing but this one signed refusal
+/// row). It opens the EXISTING file through
+/// [`crate::storage::connection::open_existing_unmigrated`] (#9175 D-M1): no
+/// `SQLITE_OPEN_CREATE`, keyed like every other open, refused when the
+/// schema stamp is ahead of or behind the binary, and no migration, schema
+/// init or watermark write. A refused open or a failed append appends zero
+/// rows and returns the exact NOT-recorded line, which the caller prints on
+/// its own output channel (#9175 D-L2); `None` means the row was appended.
+#[must_use]
 pub fn refuse_inference_egress_audited_existing(
     db_path: &std::path::Path,
     class: EgressClass,
     target: &str,
     reason: &str,
-) {
-    audit_refusal_on(open_existing_for_audit(db_path), class, target, reason);
-}
-
-/// Busy wait for the one-row audit append on an existing database.
-const AUDIT_APPEND_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-
-/// Open an existing database for the single audit append: no create flag,
-/// keyed via [`crate::storage::connection::apply_sqlcipher_key`].
-fn open_existing_for_audit(db_path: &std::path::Path) -> Result<Connection> {
-    let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-        | rusqlite::OpenFlags::SQLITE_OPEN_URI
-        | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
-    let conn = Connection::open_with_flags(db_path, flags)?;
-    conn.busy_timeout(AUDIT_APPEND_BUSY_TIMEOUT)?;
-    crate::storage::connection::apply_sqlcipher_key(&conn)?;
-    Ok(conn)
-}
-
-/// Append the signed refusal on an opened connection, or WARN; never
-/// disturbs the enforcement the caller already applied.
-fn audit_refusal_on(opened: Result<Connection>, class: EgressClass, target: &str, reason: &str) {
-    let agent_id = crate::identity::sentinels::DAEMON_PRINCIPAL;
-    match opened {
-        Ok(conn) => {
-            if let Err(e) = emit_inference_egress_refusal(&conn, class, target, agent_id, reason) {
-                tracing::warn!(
-                    "inference-egress signed refusal NOT recorded (append failed) for {} \
-                     target={}: {e}",
-                    class.as_str(),
-                    crate::url_display::url_origin(target)
-                );
-            }
-        }
-        Err(e) => {
-            tracing::warn!(
-                "inference-egress signed refusal NOT recorded (db open failed) for {} \
-                 target={}: {e}",
-                class.as_str(),
-                crate::url_display::url_origin(target)
-            );
-        }
+) -> Option<String> {
+    let opened = crate::storage::connection::open_existing_unmigrated(db_path);
+    let line = audit_refusal_on(opened, class, target, reason);
+    if let Some(unrecorded) = &line {
+        tracing::warn!("{unrecorded}");
     }
+    line
+}
+
+/// #9175 D-L2 — a NOT-recorded line must never be lost. `tracing::warn!`
+/// reaches the daemon's subscriber; a one-shot verb that installed none
+/// (atomise, reembed, mcp, reload) gets the same line on stderr, never on
+/// stdout (the MCP stdio channel).
+fn emit_unrecorded(line: &str) {
+    tracing::warn!("{line}");
+    if !tracing::dispatcher::has_been_set() {
+        eprintln!("ai-memory: WARN: {line}");
+    }
+}
+
+/// Append the signed refusal on an opened connection. Returns `None` when
+/// the row was appended, or the exact NOT-recorded line (target reduced to
+/// its origin, the error with its whole chain) when the open or the append
+/// failed; never disturbs the enforcement the caller already applied.
+fn audit_refusal_on(
+    opened: Result<Connection>,
+    class: EgressClass,
+    target: &str,
+    reason: &str,
+) -> Option<String> {
+    let agent_id = crate::identity::sentinels::DAEMON_PRINCIPAL;
+    let (stage, e) = match opened {
+        Ok(conn) => match emit_inference_egress_refusal(&conn, class, target, agent_id, reason) {
+            Ok(()) => return None,
+            Err(e) => ("append failed", e),
+        },
+        Err(e) => ("db open failed", e),
+    };
+    Some(format!(
+        "inference-egress signed refusal NOT recorded ({stage}) for {} target={}: {e:#}",
+        class.as_str(),
+        crate::url_display::url_origin(target)
+    ))
 }
 
 /// #4121 / #4122 — the reason an admission that erred WITHOUT a refusal
@@ -1399,10 +1407,14 @@ mod tests {
         .expect("plant stamp");
     }
 
-    /// `egress.inference_refused` rows in `db`, read without the funnel.
+    /// `egress.inference_refused` rows in `db`, read without the funnel. The
+    /// counter opens read-write WITHOUT create so that, as the last
+    /// connection, it removes the `-wal` / `-shm` sidecars it made on close
+    /// (a read-only connection cannot), leaving the directory listing for the
+    /// funnel open to account for.
     fn audit_open_refusal_rows(db: &std::path::Path) -> i64 {
-        let conn = Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .expect("raw read-only reopen");
+        let conn = Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
+            .expect("raw reopen without create");
         conn.query_row(
             "SELECT COUNT(*) FROM signed_events WHERE event_type = ?1",
             [crate::signed_events::event_types::EGRESS_INFERENCE_REFUSED],
@@ -1426,17 +1438,47 @@ mod tests {
         names
     }
 
+    /// The exact NOT-recorded line a refused audit open returns (#9175 D-L2).
+    fn audit_open_unrecorded_line(err: &str) -> String {
+        format!(
+            "inference-egress signed refusal NOT recorded (db open failed) for {} target={}: {err}",
+            EgressClass::InferenceLlm.as_str(),
+            crate::url_display::url_origin(AUDIT_OPEN_TARGET)
+        )
+    }
+
+    /// The exact schema-ahead refusal text the funnel renders for `db`.
+    fn audit_open_ahead_text(db: &std::path::Path, observed: i64) -> String {
+        crate::storage::schema_guard::render(
+            observed,
+            crate::storage::migrations::current_schema_version(),
+            crate::storage::schema_guard::BACKEND_SQLITE,
+            &db.display().to_string(),
+        )
+    }
+
     /// Run the audited refusal on a database the funnel must refuse, and
-    /// prove it wrote nothing: zero rows, identical bytes, identical files.
-    fn assert_audit_open_writes_nothing(dir: &std::path::Path, db: &std::path::Path, case: &str) {
+    /// prove it wrote nothing: zero rows, identical bytes, identical files,
+    /// and the exact NOT-recorded line naming `expected_err`.
+    fn assert_audit_open_writes_nothing(
+        dir: &std::path::Path,
+        db: &std::path::Path,
+        case: &str,
+        expected_err: &str,
+    ) {
         let bytes_before = std::fs::read(db).expect("read db bytes");
         let files_before = audit_open_listing(dir);
         let rows_before = audit_open_refusal_rows(db);
-        refuse_inference_egress_audited_existing(
+        let unrecorded = refuse_inference_egress_audited_existing(
             db,
             EgressClass::InferenceLlm,
             AUDIT_OPEN_TARGET,
             AUDIT_OPEN_REASON,
+        );
+        assert_eq!(
+            unrecorded.as_deref(),
+            Some(audit_open_unrecorded_line(expected_err).as_str()),
+            "#9175 D-L2 {case}: the exact NOT-recorded line is returned"
         );
         assert_eq!(
             audit_open_refusal_rows(db),
@@ -1461,7 +1503,8 @@ mod tests {
             let (dir, db) = audit_open_current_db("ahead");
             let ahead = crate::storage::migrations::current_schema_version() + 1;
             audit_open_plant_stamp(&db, ahead);
-            assert_audit_open_writes_nothing(&dir, &db, "schema ahead");
+            let expected = audit_open_ahead_text(&db, ahead);
+            assert_audit_open_writes_nothing(&dir, &db, "schema ahead", &expected);
             let _ = std::fs::remove_dir_all(&dir);
         });
     }
@@ -1473,7 +1516,8 @@ mod tests {
         crate::storage::schema_guard::with_hatch(Some(&hatch), || {
             let (dir, db) = audit_open_current_db("hatched");
             audit_open_plant_stamp(&db, ahead);
-            assert_audit_open_writes_nothing(&dir, &db, "schema ahead under the hatch");
+            let expected = audit_open_ahead_text(&db, ahead);
+            assert_audit_open_writes_nothing(&dir, &db, "schema ahead under the hatch", &expected);
             let _ = std::fs::remove_dir_all(&dir);
         });
     }
@@ -1484,7 +1528,13 @@ mod tests {
             let (dir, db) = audit_open_current_db("behind");
             let behind = crate::storage::migrations::current_schema_version() - 1;
             audit_open_plant_stamp(&db, behind);
-            assert_audit_open_writes_nothing(&dir, &db, "schema behind");
+            let expected = crate::storage::schema_guard::SchemaBehindReadOnly::new(
+                behind,
+                crate::storage::schema_guard::BACKEND_SQLITE,
+                &db.display().to_string(),
+            )
+            .detail;
+            assert_audit_open_writes_nothing(&dir, &db, "schema behind", &expected);
             let _ = std::fs::remove_dir_all(&dir);
         });
     }
@@ -1493,11 +1543,21 @@ mod tests {
     fn audit_open_missing_database_creates_no_file_9175() {
         let (dir, db) = audit_open_scratch("missing");
         assert!(audit_open_listing(&dir).is_empty(), "scratch starts empty");
-        refuse_inference_egress_audited_existing(
+        let unrecorded = refuse_inference_egress_audited_existing(
             &db,
             EgressClass::InferenceLlm,
             AUDIT_OPEN_TARGET,
             AUDIT_OPEN_REASON,
+        );
+        let expected = format!(
+            "{}: {}",
+            crate::storage::connection::MISSING_DATABASE_REFUSAL,
+            db.display()
+        );
+        assert_eq!(
+            unrecorded.as_deref(),
+            Some(audit_open_unrecorded_line(&expected).as_str()),
+            "#9175 D-L2 missing: the exact NOT-recorded line is returned"
         );
         assert!(
             audit_open_listing(&dir).is_empty(),
@@ -1512,12 +1572,13 @@ mod tests {
         crate::storage::schema_guard::with_hatch(None, || {
             let (dir, db) = audit_open_current_db("current");
             assert_eq!(audit_open_refusal_rows(&db), 0, "fresh db has no row");
-            refuse_inference_egress_audited_existing(
+            let unrecorded = refuse_inference_egress_audited_existing(
                 &db,
                 EgressClass::InferenceLlm,
                 AUDIT_OPEN_TARGET,
                 AUDIT_OPEN_REASON,
             );
+            assert_eq!(unrecorded, None, "#9175 D-L2 current: the row was recorded");
             assert_eq!(
                 audit_open_refusal_rows(&db),
                 1,

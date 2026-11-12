@@ -2392,7 +2392,8 @@ pub async fn run(
             cli::schema_init::run(&a, config_default_dim, &mut out).await
         }
         Command::Doctor(a) => {
-            // P7 / R7. The doctor is read-only; it never sets
+            // P7 / R7. The doctor never migrates (its one health-pass write
+            // is the #4121 refused-probe audit row); it never sets
             // `needs_checkpoint`. We compute the exit code from the
             // overall severity and propagate it via the process-exit
             // path below so callers (CI, ops scripts) can branch on it.

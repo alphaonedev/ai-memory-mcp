@@ -89,7 +89,8 @@ fn scratch(tag: &str) -> (tempfile::TempDir, PathBuf) {
         .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
         .expect("scratch dir under CARGO_TARGET_TMPDIR");
     let db = dir.path().join("doctor.db");
-    // `doctor` is read-only and refuses a missing database; `stats` creates it.
+    // `doctor` never creates a missing database (it refuses one); `stats`
+    // creates it.
     let seeded = std::process::Command::new(env!("CARGO_BIN_EXE_ai-memory"))
         .current_dir(dir.path())
         .arg("--db")
