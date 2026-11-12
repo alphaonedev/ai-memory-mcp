@@ -62,6 +62,8 @@ const REASON_DAY_FILE_MISSING: &str = "day_file_missing";
 const REASON_FORENSIC_LOG_MISSING: &str = "forensic_log_missing";
 const REASON_FORENSIC_WINDOW_EMPTY: &str = "forensic_window_empty";
 const REASON_FORENSIC_SIGNATURE_UNVERIFIED: &str = "signature_unverified";
+/// Forensic: a verifying key that exists on disk but does not load (F3).
+const REASON_FORENSIC_KEY_LOAD_FAILED: &str = "key_load_failed";
 const REASON_HEAD_BELOW_SINCE: &str = "head_below_since";
 const REASON_STORE_URL_UNRECOGNISED: &str = "store_url_unrecognised";
 const STORE_URL_FILE_ENV: &str = "AI_MEMORY_STORE_URL_FILE";
@@ -70,6 +72,10 @@ const FAR_FUTURE_RFC3339: &str = "2999-01-01T00:00:00Z";
 const MANIFEST_FILE: &str = "manifest.json";
 const SIGNER_AGENT: &str = "ai:bundle-signer-8741";
 const UNKNOWN_SIGNER: &str = "ai:nobody-8741";
+/// A signer whose `.pub` file exists but is not a 32-byte Ed25519 key.
+const UNLOADABLE_SIGNER: &str = "ai:broken-key-8741";
+/// Bytes of the truncated `.pub` file (any length other than 32).
+const UNLOADABLE_PUB_BYTES: &[u8] = b"not-a-key";
 /// A postgres DSN with no password that is never dialled: the verb must
 /// refuse it before any connect.
 const PG_URL_NEVER_DIALLED: &str = "postgres://verify8741@127.0.0.1:1/never";
@@ -694,10 +700,11 @@ fn forensic_window_tamper_table_9009() {
 fn forensic_since_cli_absence_table_9179() {
     let key = SigningKey::from_bytes(&FORENSIC_SEED);
     let days = [DAY_OLD, DAY_MID, DAY_NEW];
-    let cases: [(&str, &str); 3] = [
+    let cases: [(&str, &str); 4] = [
         ("no-day-file", REASON_FORENSIC_LOG_MISSING),
         ("window-past-every-file", REASON_FORENSIC_WINDOW_EMPTY),
         ("signed-rows-no-key", REASON_FORENSIC_SIGNATURE_UNVERIFIED),
+        ("key-exists-but-unloadable", REASON_FORENSIC_KEY_LOAD_FAILED),
     ];
     for (case, reason) in cases {
         let home = Home::new(Some(true));
@@ -715,11 +722,25 @@ fn forensic_since_cli_absence_table_9179() {
                 DAY_OLD
             }
         };
+        // #9179 F3 — a key file that exists but does not load is a finding,
+        // never treated as "no key" (which would skip every signature check).
+        let signer = if case == "key-exists-but-unloadable" {
+            std::fs::write(
+                home.path()
+                    .join("keys")
+                    .join(format!("{UNLOADABLE_SIGNER}.pub")),
+                UNLOADABLE_PUB_BYTES,
+            )
+            .expect("write unloadable pub");
+            UNLOADABLE_SIGNER
+        } else {
+            UNKNOWN_SIGNER
+        };
         for json in [false, true] {
             let mut args = vec!["audit", "verify", "--since", since];
             // A signer id with no key on this host: the boot never mints
             // one for it, so the verifier holds no key for these rows.
-            args.extend(["--forensic-agent-id", UNKNOWN_SIGNER]);
+            args.extend(["--forensic-agent-id", signer]);
             if json {
                 args.push("--json");
             }
