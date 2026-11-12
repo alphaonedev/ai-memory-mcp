@@ -76,13 +76,6 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-
-/// #6106 — every path this module renders (the spool, staging and journal
-/// paths sit next to the database, so they carry the `db =` value) goes
-/// through the db-path display funnel, never `Path::display`.
-fn shown(path: &Path) -> String {
-    crate::url_display::db_path_display(path)
-}
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
@@ -96,6 +89,13 @@ use tokio::task::JoinHandle;
 
 use crate::governance::agent_action::{AgentAction, Decision};
 use crate::signed_events::{SignedEvent, append_signed_event_no_tx, payload_hash};
+
+/// #6106 — every path this module renders (the spool, staging and journal
+/// paths sit next to the database, so they carry the `db =` value) goes
+/// through the db-path display funnel, never `Path::display`.
+fn shown(path: &Path) -> String {
+    crate::url_display::db_path_display(path)
+}
 
 /// Cluster-C SEC-3 (issue #767) — maximum number of times a sink will
 /// retry a single audit append after a `SQLITE_CONSTRAINT_UNIQUE` race
