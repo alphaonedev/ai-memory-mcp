@@ -214,6 +214,23 @@ pub(crate) fn readback_failed(app: &AppState, detail: &str) -> Result<(), Respon
     ))))
 }
 
+/// #8741 round 2 (Note 2) — the [`FANOUT_READBACK_FAILED`] detail naming
+/// the committed-but-unread ids. One id is named bare; several name the
+/// first id plus an explicit unread total, so the receipt never
+/// under-states how many committed rows the peers did not receive.
+/// `None` means every committed row was read back.
+pub(crate) fn unread_detail(unread: &[String]) -> Option<String> {
+    match unread {
+        [] => None,
+        [one] => Some(one.clone()),
+        [first, rest @ ..] => Some(format!(
+            "{first} (+{} more, {} unread)",
+            rest.len(),
+            unread.len()
+        )),
+    }
+}
+
 /// #8741 round 1 (F3 / sec-F2) — what a governance decision produced, as
 /// read back from the store. A failed or empty read is [`Produced::Unread`],
 /// never `None`: the decision funnel then reports the exact
@@ -466,5 +483,5 @@ async fn deliver_batch(
 }
 
 #[cfg(test)]
-#[path = "fed_fanout_tests.rs"]
+#[path = "fed_fanout/tests.rs"]
 mod tests;

@@ -1938,13 +1938,9 @@ async fn import_delivered(
     if let Err(resp) = super::fed_fanout::fanout_effects_into(app, effects, &mut receipt).await {
         return resp;
     }
-    let delivered = match unread {
-        [] => Ok(()),
-        [one] => super::fed_fanout::readback_failed(app, one),
-        [first, rest @ ..] => {
-            super::fed_fanout::readback_failed(app, &format!("{first} (+{} more)", rest.len()))
-        }
-    };
+    let delivered = super::fed_fanout::unread_detail(unread).map_or(Ok(()), |detail| {
+        super::fed_fanout::readback_failed(app, &detail)
+    });
     match delivered {
         Ok(()) => Json(receipt).into_response(),
         Err(resp) => resp,
