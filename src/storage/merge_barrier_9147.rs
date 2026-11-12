@@ -132,7 +132,7 @@ pub fn receiver_merge_barrier(
 
 /// Log one barrier drop (identity only, never content).
 pub fn trace_merge_barrier_drop(memory_id: &str, barrier: ReceiverMergeBarrier) {
-    tracing::info!(
+    tracing::debug!(
         target: MERGE_BARRIER_TRACE_TARGET,
         memory_id = %memory_id,
         barrier = barrier.as_str(),
@@ -175,7 +175,13 @@ pub fn verified_release_candidate(existing: &Memory, prepared: &Memory, merged: 
 /// The transaction-free core of a federated deletion: hard-delete the live
 /// row (tombstoned by [`delete`]) and purge every archived copy, tombstoning
 /// an archived-only id. Must run inside a write transaction.
+///
+/// The record-stop gate runs here, in the write-SQL target itself (B7
+/// `b7_gate_must_be_called_by_the_target_itself_r4_g2`), so no future caller
+/// can reach the deletion without the fence. It only reads the record-stop
+/// state, so it is valid inside the open write transaction.
 fn federated_delete_in_tx(conn: &Connection, id: &str) -> Result<bool> {
+    crate::storage::record_stop::gate_storage_conn(conn)?;
     let live_deleted = delete(conn, id)?;
     let Some(archived_ns) = archived_namespace_by_id(conn, id)? else {
         return Ok(live_deleted);
