@@ -94,7 +94,11 @@ const KIND_PROVENANCE_FUNNELS: &[&str] = &[
     // …and the three the completeness sweep found that it did not.
     "update_with_archive_on_supersede",
     "reflect_with_hooks",
-    "apply_remote_memory",
+    // #9147 — `apply_remote_memory` is a thin wrapper over
+    // `apply_remote_memory_outcome`, which now holds the upsert and every bind.
+    // The guard follows the body to the outcome function; the wrapper's
+    // delegation is pinned by `apply_remote_memory_wrapper_delegates_9147`.
+    "apply_remote_memory_outcome",
 ];
 
 /// Funnels that persist `kind_provenance` through an `INSERT ... SELECT` over
@@ -252,10 +256,11 @@ fn span_extractor_is_load_bearing() {
     // `apply_remote_memory` is one of the funnels the CRLF drift actually
     // mis-read; it lives near the end of the adapter, so any offset error
     // that accumulates per line is maximal here.
-    let late = fn_span(&src, "apply_remote_memory").expect("apply_remote_memory must exist");
+    let late = fn_span(&src, "apply_remote_memory_outcome")
+        .expect("apply_remote_memory_outcome must exist");
     assert!(
-        late.starts_with("    async fn apply_remote_memory(")
-            || late.starts_with("    pub async fn apply_remote_memory("),
+        late.starts_with("    async fn apply_remote_memory_outcome(")
+            || late.starts_with("    pub async fn apply_remote_memory_outcome("),
         "the LATE span must begin EXACTLY at its own signature — this is the \
          assertion that catches per-line offset drift (e.g. a CRLF checkout, \
          where the accumulated error is maximal this deep into the file) \
@@ -264,7 +269,7 @@ fn span_extractor_is_load_bearing() {
     );
     assert!(
         late.contains("apply_remote_memory upsert"),
-        "the LATE span must contain apply_remote_memory's own error label"
+        "the LATE span must contain apply_remote_memory_outcome's own error label"
     );
     assert!(
         late.contains("redact_memory_for_receive"),
@@ -281,10 +286,44 @@ fn span_extractor_is_load_bearing() {
         "the LATE span must NOT bleed into the following function"
     );
 
+    // #9147 — the public wrapper must keep delegating to the outcome function,
+    // so a future second body cannot bypass the checks above.
+    assert_apply_remote_memory_wrapper_delegates(&src);
+
     assert!(
         fn_span(&src, "a_function_that_does_not_exist_2393").is_none(),
         "a missing function must be reported, never silently skipped"
     );
+}
+
+/// #9147 — `apply_remote_memory` must stay a thin wrapper over
+/// `apply_remote_memory_outcome`: it calls the outcome function and carries
+/// no write, bind or redaction of its own. The kind-provenance, B4 receive-redact
+/// and error-label checks read the outcome body, so a second body in the
+/// wrapper would bypass them.
+fn assert_apply_remote_memory_wrapper_delegates(src: &str) {
+    let wrapper = fn_span(src, "apply_remote_memory").expect("apply_remote_memory must exist");
+    assert!(
+        wrapper.contains("self.apply_remote_memory_outcome("),
+        "#9147: apply_remote_memory must delegate to apply_remote_memory_outcome \
+         so the funnel checks keep reading the one real body. Got: {wrapper}"
+    );
+    for forbidden in [
+        "INSERT INTO memories",
+        "kind_provenance",
+        "redact_memory_for_receive",
+    ] {
+        assert!(
+            !wrapper.contains(forbidden),
+            "#9147: the apply_remote_memory wrapper must carry no body of its own \
+             (found `{forbidden}`); the logic lives in apply_remote_memory_outcome"
+        );
+    }
+}
+
+#[test]
+fn apply_remote_memory_wrapper_delegates_9147() {
+    assert_apply_remote_memory_wrapper_delegates(&adapter_source());
 }
 
 /// Regression pin for the CRLF offset-drift bug that red-ded Windows CI while
