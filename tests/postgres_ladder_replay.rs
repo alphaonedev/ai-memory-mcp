@@ -1051,6 +1051,10 @@ fn federation_nonce_claims_is_ladder_owned_at_v103() {
     );
 }
 
+/// Why the #9187 v103 nonce-claims ladder cell refuses to run without a tier (sF6).
+const NONCE_LADDER_PG_URL_REQUIRED: &str =
+    "AI_MEMORY_TEST_POSTGRES_URL must be set for the #9187 v103 ladder cell (sF6: no vacuous pass)";
+
 /// #9187 C1 (live half): a database stamped at v101 WITHOUT the claim table
 /// ladders to EXACTLY v103 with the table, its column shape and its
 /// `(key_fp, nonce_fp)` PRIMARY KEY (the only index) present, and a second run
@@ -1059,10 +1063,9 @@ fn federation_nonce_claims_is_ladder_owned_at_v103() {
 /// and no row.
 #[tokio::test]
 async fn federation_nonce_claims_ladders_from_v101_and_rerun_is_idempotent() {
-    let Some(admin_url) = postgres_url() else {
-        skip_note("federation_nonce_claims_ladders_from_v101_and_rerun_is_idempotent");
-        return;
-    };
+    // #9187 sF6: this binary only builds under `sal-postgres`, and every CI leg
+    // that builds it sets the URL, so a missing URL fails instead of passing.
+    let admin_url = postgres_url().expect(NONCE_LADDER_PG_URL_REQUIRED);
     reap_stale_scratch_dbs(&admin_url).await;
     let db = ScratchDb::create(&admin_url, "nonce9187").await;
 

@@ -119,14 +119,20 @@ fn scratch(prefix: &str) -> tempfile::TempDir {
         .expect("scratch dir")
 }
 
-/// The live-PostgreSQL admin URL, or `None` (the `_pg` cells then skip).
+/// The live-PostgreSQL admin URL. Panics when it is unset or empty (#9187 sF6):
+/// a `_pg` cell that returned early would pass vacuously, and every CI leg that
+/// builds `sal-postgres` mints a tier and sets the URL (precedent
+/// `tests/curator_report_bloat_3345_pg.rs`).
 #[cfg(feature = "sal-postgres")]
-fn pg_admin_url() -> Option<String> {
-    let url = std::env::var(PG_URL_ENV).ok().filter(|u| !u.is_empty());
-    if url.is_none() {
-        eprintln!("skip: {PG_URL_ENV} not set");
-    }
-    url
+fn pg_admin_url() -> String {
+    std::env::var(PG_URL_ENV)
+        .ok()
+        .filter(|u| !u.is_empty())
+        .unwrap_or_else(|| {
+            panic!(
+                "{PG_URL_ENV} must be set for the #9192 sal-postgres cells (sF6: no vacuous pass)"
+            )
+        })
 }
 
 /// Which store a receiver runs over.
@@ -601,9 +607,7 @@ macro_rules! http_twin {
         #[cfg(feature = "sal-postgres")]
         #[tokio::test(flavor = "current_thread")]
         async fn $pg() {
-            let Some(admin) = pg_admin_url() else {
-                return;
-            };
+            let admin = pg_admin_url();
             let _g = env_lock();
             require_sig_and_nonce();
             let dir = scratch($prefix);
@@ -1010,30 +1014,27 @@ mod store_cells {
         const DISARM_DDL: &str =
             "DROP TRIGGER nonce_9192_fail_at_commit ON federation_nonce_claims";
 
-        async fn scratch_db() -> Option<pg_barrier::ScratchDb> {
-            let admin = pg_admin_url()?;
-            Some(
-                pg_barrier::ScratchDb::create(&admin, PG_SCRATCH_PREFIX)
-                    .await
-                    .expect("create scratch database"),
-            )
+        async fn scratch_db() -> pg_barrier::ScratchDb {
+            pg_barrier::ScratchDb::create(&pg_admin_url(), PG_SCRATCH_PREFIX)
+                .await
+                .expect("create scratch database")
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
         async fn every_cap_restart_handle_and_peer_count_refuses_pg_9192() {
-            let Some(db) = scratch_db().await else { return };
+            let db = scratch_db().await;
             cell_every_cap(&Backend::Postgres(db.url())).await;
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
         async fn concurrent_identical_claims_admit_exactly_one_pg_9192() {
-            let Some(db) = scratch_db().await else { return };
+            let db = scratch_db().await;
             cell_race(&Backend::Postgres(db.url())).await;
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
         async fn store_outage_is_unavailable_for_cached_and_new_pg_9192() {
-            let Some(db) = scratch_db().await else { return };
+            let db = scratch_db().await;
             cell_outage(&Backend::Postgres(db.url())).await;
         }
 
@@ -1041,7 +1042,7 @@ mod store_cells {
         /// row, no cache entry; after recovery the nonce is claimable.
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
         async fn claim_commit_error_is_unavailable_and_writes_nothing_pg_9192() {
-            let Some(db) = scratch_db().await else { return };
+            let db = scratch_db().await;
             let backend = Backend::Postgres(db.url());
             let (store, rows) = open_store(&backend).await;
             let Rows::Postgres(pool) = &rows else {
@@ -1077,7 +1078,7 @@ mod store_cells {
         /// claimable exactly once.
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
         async fn cancelled_claim_leaves_no_cache_entry_pg_9192() {
-            let Some(db) = scratch_db().await else { return };
+            let db = scratch_db().await;
             let backend = Backend::Postgres(db.url());
             let (store, rows) = open_store(&backend).await;
             let Rows::Postgres(pool) = &rows else {
@@ -1116,7 +1117,7 @@ mod store_cells {
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
         async fn hundred_thousand_claims_stay_bounded_pg_9192() {
-            let Some(db) = scratch_db().await else { return };
+            let db = scratch_db().await;
             cell_bulk(&Backend::Postgres(db.url())).await;
         }
     }

@@ -20,7 +20,7 @@ re-issue at `b0483115`, the 2026-09-11 #3595 re-issue at `ad60bead` and the orig
 mint `e22bc93c` remain as historical records. Any change to the federation wire path or the `AI_MEMORY_FED_*` surface **voids this
 certification and triggers re-cert** (see §7).
 
-## STATUS — **VOID as of 2026-10-28** (§7 fired again by #2967, `src/federation/receive_auth.rs`, recorded in the §7 firing ledger; no live claim; the certification had already EXPIRED as of 2026-10-07 when §7 fired: 4 watched federation-wire files changed after the `385da3a05` bind; re-measurement and re-issue pending under WP-B1, #6063; the last LIVE claim was the 2026-10-02 re-issue at `385da3a05`)
+## STATUS — **VOID as of 2026-11-12** (§7 fired again by #9187: `src/federation/receive.rs`, `src/federation/signing.rs`, `src/handlers/federation_receive.rs`, `src/handlers/federation_signing_check.rs`, the `/sync/push` response field `merge_barrier_dropped`, the nonce answers 401 `x_memory_nonce_replay` / `x_memory_nonce_oversize` and 503 `nonce_store_unavailable` on push and signed `GET /sync/since`, migration v103 (SQLite 0086, PostgreSQL 0059), recorded in the §7 firing ledger; no live claim; the certification had already EXPIRED as of 2026-10-07 when §7 fired: 4 watched federation-wire files changed after the `385da3a05` bind; re-measurement and re-issue pending under WP-B1, #6063; the last LIVE claim was the 2026-10-02 re-issue at `385da3a05`)
 
 > **Amendment (2026-10-07, #6063 WP-B1 — §7 EXPIRY RECORD, certification EXPIRED).**
 > The federation certification **expired** per §7 when four §7-watched
@@ -2082,6 +2082,39 @@ federation-wire surface changed AND cert doc re-issued/voided in the same
 change (...; banner EXPIRED - → VOID -)` and `check-cert-expiry: banner
 STATUS=VOID — the doc makes no live claim; nothing to hold it to`. The §8
 statuses below are historical records of earlier binds, not a live claim.
+
+**Re-cert trigger — FIRED by #9147, #9149, #9150, #9140 and #9192
+(`src/federation/receive.rs`, `src/federation/signing.rs`,
+`src/handlers/federation_receive.rs`, `src/handlers/federation_signing_check.rs`,
+2026-11-12; PR #9187).** Four §7-watched paths changed. The nonce claim is served by
+the unwatched `src/identity/replay.rs` and the signed pull by the unwatched
+`src/handlers/federation_sync_since.rs`; they are recorded here because they change
+the wire. (1) Receiver merge barrier: an inbound upsert whose target the receiver
+holds tombstoned, archived without a live copy, quarantined or contaminated is
+dropped inside the funnel's write transaction on every inbound funnel, on SQLite
+and PostgreSQL, and is never counted as applied. The `/sync/push` response gains
+the count field `merge_barrier_dropped` (200 and quota-429 envelopes), apart from
+`applied` and `skipped`, and the counter
+`ai_memory_fed_merge_barrier_dropped_total{barrier}` moves once per dropped row.
+(2) Nonce replay: every accepted `(signing key, nonce)` pair is claimed in the
+receiver store (table `federation_nonce_claims`, migration v103, SQLite 0086 and
+PostgreSQL 0059) after the signature verifies, and is never pruned. A replay that
+used to return 200 now returns 401 `x_memory_nonce_replay`; a nonce over 256 bytes
+returns 401 `x_memory_nonce_oversize`; a store that cannot answer the claim returns
+503 `{"error":"nonce_store_unavailable"}` on push and signed `GET /sync/since`, and
+nothing is admitted. No `AI_MEMORY_FED_*` identifier is added, removed or renamed,
+and no route or signature algorithm changes. The posture is strictly MORE
+protective: rows that a peer could make live again stay held, and nonces that
+could be replayed after a restart, a cache eviction, from a sibling daemon or on
+the other route are refused.
+
+*Disposition.* **This change does NOT re-mint the certification and does not
+approve its own control.** The re-issue stays with
+[**#6063**](https://github.com/alphaonedev/ai-memory-mcp/issues/6063) (WP-B1) at the
+GA candidate head. The cert-expiry gate stays red on this change until the
+[#6124](https://github.com/alphaonedev/ai-memory-mcp/issues/6124) gate amendment
+lands, because a VOID to VOID firing record cannot pass the gate as it stands
+(BLOCKED-BY: #6124).
 
 ---
 

@@ -16,9 +16,10 @@
 //! the answer. Every assertion is an exact value (row counts, content bytes,
 //! lifecycle string, the restore verdict), never a bare `is_err`.
 //!
-//! PostgreSQL cells soft-skip when `AI_MEMORY_TEST_POSTGRES_URL` is unset
-//! (deliberately not `#[ignore]`: the PR postgres job never passes
-//! `--include-ignored`).
+//! PostgreSQL cells FAIL when a `sal-postgres` build runs without
+//! `AI_MEMORY_TEST_POSTGRES_URL` (#9187 sF6): a cell that returned early would
+//! pass vacuously. They are deliberately not `#[ignore]`, so the required
+//! enterprise-fed Check (which mints a tier and sets the URL) runs them.
 
 #![cfg(feature = "sal")]
 #![allow(clippy::too_many_lines)]
@@ -933,11 +934,20 @@ async fn sqlite_store_claimed_nonce_replay_is_store_scoped_9140() {
     shared_nonce_cells(store_a.as_ref(), store_b.as_ref(), "sqlite").await;
 }
 
+/// Why a `sal-postgres` build of this binary refuses to run without a live
+/// tier (#9187 sF6): a PG cell that returned early would pass vacuously.
 #[cfg(feature = "sal-postgres")]
-async fn pg_store() -> Option<(Arc<dyn MemoryStore>, RawView)> {
+const PG_URL_REQUIRED: &str = "AI_MEMORY_TEST_POSTGRES_URL must be set for the #9147 sal-postgres cells (sF6: no vacuous pass)";
+
+/// The live PostgreSQL store and a raw view of its tables. Panics when the URL
+/// is unset or empty, the precedent of `tests/curator_report_bloat_3345_pg.rs`:
+/// every CI leg that builds `sal-postgres` mints a tier and sets the URL.
+#[cfg(feature = "sal-postgres")]
+async fn pg_store() -> (Arc<dyn MemoryStore>, RawView) {
     let url = std::env::var("AI_MEMORY_TEST_POSTGRES_URL")
         .ok()
-        .filter(|s| !s.is_empty())?;
+        .filter(|s| !s.is_empty())
+        .expect(PG_URL_REQUIRED);
     let store = ai_memory::store::postgres::PostgresStore::connect(&url)
         .await
         .expect("connect postgres");
@@ -946,17 +956,14 @@ async fn pg_store() -> Option<(Arc<dyn MemoryStore>, RawView)> {
         .connect(&url)
         .await
         .expect("raw pg pool");
-    Some((Arc::new(store), RawView::Postgres(pool)))
+    (Arc::new(store), RawView::Postgres(pool))
 }
 
 #[cfg(feature = "sal-postgres")]
 #[tokio::test]
 async fn postgres_archive_is_a_merge_barrier_9149() {
     let _metric = DROP_METRIC_LOCK.lock().await;
-    let Some((store, view)) = pg_store().await else {
-        eprintln!("SKIP: AI_MEMORY_TEST_POSTGRES_URL unset");
-        return;
-    };
+    let (store, view) = pg_store().await;
     archive_barrier_cells(store, view, "postgres").await;
 }
 
@@ -964,10 +971,7 @@ async fn postgres_archive_is_a_merge_barrier_9149() {
 #[tokio::test]
 async fn postgres_hold_is_a_merge_barrier_9150() {
     let _metric = DROP_METRIC_LOCK.lock().await;
-    let Some((store, view)) = pg_store().await else {
-        eprintln!("SKIP: AI_MEMORY_TEST_POSTGRES_URL unset");
-        return;
-    };
+    let (store, view) = pg_store().await;
     hold_barrier_cells(store, view, "postgres").await;
 }
 
@@ -975,10 +979,7 @@ async fn postgres_hold_is_a_merge_barrier_9150() {
 #[tokio::test]
 async fn postgres_barrier_drop_is_never_counted_applied_9147() {
     let _metric = DROP_METRIC_LOCK.lock().await;
-    let Some((store, view)) = pg_store().await else {
-        eprintln!("SKIP: AI_MEMORY_TEST_POSTGRES_URL unset");
-        return;
-    };
+    let (store, view) = pg_store().await;
     drop_count_cells(store, view, "postgres").await;
 }
 
@@ -986,10 +987,7 @@ async fn postgres_barrier_drop_is_never_counted_applied_9147() {
 #[tokio::test]
 async fn postgres_sync_push_counts_barrier_drops_apart_9147() {
     let _metric = DROP_METRIC_LOCK.lock().await;
-    let Some((store, view)) = pg_store().await else {
-        eprintln!("SKIP: AI_MEMORY_TEST_POSTGRES_URL unset");
-        return;
-    };
+    let (store, view) = pg_store().await;
     // The postgres receive lane never opens the handler's sqlite `Db`.
     let router = push_router(
         Arc::clone(&store),
@@ -1002,10 +1000,7 @@ async fn postgres_sync_push_counts_barrier_drops_apart_9147() {
 #[cfg(feature = "sal-postgres")]
 #[tokio::test]
 async fn postgres_federated_deletion_is_a_restore_barrier_9147() {
-    let Some((store, view)) = pg_store().await else {
-        eprintln!("SKIP: AI_MEMORY_TEST_POSTGRES_URL unset");
-        return;
-    };
+    let (store, view) = pg_store().await;
     deletion_barrier_cells(store, view, "postgres").await;
 }
 
@@ -1014,13 +1009,7 @@ async fn postgres_federated_deletion_is_a_restore_barrier_9147() {
 #[cfg(feature = "sal-postgres")]
 #[tokio::test]
 async fn postgres_nonce_replay_is_store_scoped_9140() {
-    let Some((store_a, _view_a)) = pg_store().await else {
-        eprintln!("SKIP: AI_MEMORY_TEST_POSTGRES_URL unset");
-        return;
-    };
-    let Some((store_b, _view_b)) = pg_store().await else {
-        eprintln!("SKIP: AI_MEMORY_TEST_POSTGRES_URL unset");
-        return;
-    };
+    let (store_a, _view_a) = pg_store().await;
+    let (store_b, _view_b) = pg_store().await;
     shared_nonce_cells(store_a.as_ref(), store_b.as_ref(), "postgres").await;
 }
