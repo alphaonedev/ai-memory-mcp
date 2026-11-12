@@ -1203,6 +1203,13 @@ pub fn open(path: &Path) -> Result<Connection> {
     // v1.0.0 #9082 — a restore armed a fresh sync_seq epoch for this file.
     crate::storage::sync_seq::consume_epoch_reset(&conn, path)
         .context("sync_seq epoch reset after restore (#9082)")?;
+    // #9176 F6 — a file copied back without `ai-memory restore` carries
+    // another file's identity: re-mint the epoch so pullers rewalk it.
+    crate::storage::sync_seq::bind_node_identity(
+        &conn,
+        crate::storage::sync_seq::sqlite_node_identity(path).as_deref(),
+    )
+    .context("sync_seq node identity bind (#9176)")?;
     // v1.0.0 (#3172) — SCHEMA-masks-DATA-LOSS gate for APPEND-ONLY bootstrap
     // relations (`agent_lineage`), placed HERE in the open funnel rather than
     // inside `migrate`, and deliberately AFTER `execute_batch(SCHEMA)`. The
@@ -1818,6 +1825,11 @@ mod tests {
                 conn.execute(&format!("DROP INDEX IF EXISTS {ix}"), [])
                     .expect("drop index");
             }
+            // #9176 F2: the v102 `memories_sync_seq_au` trigger names listed
+            // columns; drop it before reshaping (the ladder re-run below
+            // recreates it from the idempotent v102 tail).
+            conn.execute_batch(crate::storage::sync_seq::SQL_DROP_SYNC_SEQ_TRIGGERS)
+                .expect("drop sync_seq triggers");
             for col in [
                 "mentioned_entity_id",
                 "confidence_decayed_at",

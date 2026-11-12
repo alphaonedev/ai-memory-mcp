@@ -38,7 +38,7 @@ const FED_CLIENT_TCP_KEEPALIVE: Duration = Duration::from_secs(60);
 /// `tracing` target for federation peer-construction events. Hoisted to a
 /// named const so the bare `"federation"` string lives at one site (the
 /// pm-v3.1 no-hardcoded-literal discipline), referenced by name everywhere.
-const FED_LOG_TARGET: &str = "federation";
+pub(crate) const FED_LOG_TARGET: &str = "federation";
 
 /// #2442 — prefix of the stable, identity-derived [`PeerEndpoint::id`].
 ///

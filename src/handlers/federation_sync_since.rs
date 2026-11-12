@@ -258,7 +258,10 @@ pub async fn sync_since(
     let limit = q
         .limit
         .unwrap_or(crate::federation::pull_cursor::SYNC_SINCE_DEFAULT_LIMIT)
-        .min(app.max_page_size);
+        .min(app.max_page_size)
+        // #9176 S4: one clamp before the backend split, so `limit=0` makes
+        // the same progress on both backends (a page of one row).
+        .max(1);
 
     // v0.7.0 #239 — per-peer namespace allowlist. Read the
     // `x-peer-id` header + the operator-configured attestation map
@@ -421,14 +424,32 @@ pub async fn sync_since(
     // `updated_at`), so a row that reached this node below a puller's
     // timestamp cursor is still served. `next_seq` comes from the rows the
     // SQL `LIMIT` examined, before the two filters below; an empty page
-    // echoes the effective `after_seq`, never the counter head. The server
-    // records no `sync_state` watermark on this path: the puller owns its
-    // cursor (`sync_pull_seq`).
+    // echoes the effective `after_seq`, never the counter head.
+    // decision (#9176 F8): no `sync_state_observe` on this path over
+    // recording a watermark because the seq walk has no timestamp watermark
+    // to record (`next_since` is null) and the puller owns its cursor
+    // (`sync_pull_seq`); `receiver_clock` keeps reflecting the since path and
+    // /sync/push only. Pinned by
+    // `seq_pull_records_no_serving_sync_state_9176`.
     if let Some(after_seq) = after_seq {
         let page = match read_seq_page(&app, after_seq, limit).await {
             Ok(p) => p,
             Err(rejection) => return rejection,
         };
+        // #9176 S5: a row this node cannot decrypt is passed (`next_seq`
+        // moves past it) and recorded here with its seq, id and reason, the
+        // same refused-and-passed shape the puller ledger uses. Stopping
+        // `next_seq` before it would stall every puller behind one row.
+        for (seq, id) in &page.undecryptable {
+            tracing::warn!(
+                target: crate::federation::peer::FED_LOG_TARGET,
+                sync_seq = *seq,
+                memory_id = %id,
+                reason = crate::storage::sync_seq::SEQ_ROW_UNDECRYPTABLE,
+                "/sync/since seq walk passed a row it cannot decrypt; a later \
+                 write re-offers it (#9176)"
+            );
+        }
         let total = page.memories.len();
         let ns_filtered: Vec<Memory> = page
             .memories

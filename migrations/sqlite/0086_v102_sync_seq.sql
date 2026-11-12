@@ -43,14 +43,37 @@ UPDATE memories SET sync_seq = ranked.rn FROM ranked WHERE ranked.id = memories.
 -- adds the column twice nor re-numbers live rows. Everything below is
 -- idempotent on its own.
 
+-- `node_identity` binds the epoch to this database file (its inode); the
+-- open re-mints the epoch when a copied-back file carries another one, so a
+-- file restored without `ai-memory restore` is rewalked by every puller
+-- (#9176 F6). An in-place overwrite of the live file keeps the inode: a
+-- restore must go through `ai-memory restore`, which arms the sidecar.
 CREATE TABLE IF NOT EXISTS sync_seq_counter (
-    id    INTEGER PRIMARY KEY CHECK (id = 1),
-    head  INTEGER NOT NULL CHECK (head >= 0),
-    epoch TEXT    NOT NULL
+    id            INTEGER PRIMARY KEY CHECK (id = 1),
+    head          INTEGER NOT NULL CHECK (head >= 0),
+    epoch         TEXT    NOT NULL,
+    node_identity TEXT
 );
 
 INSERT OR IGNORE INTO sync_seq_counter (id, head, epoch)
-SELECT 1, COALESCE(MAX(sync_seq), 0), lower(hex(randomblob(16))) FROM memories;
+SELECT 1, MAX(COALESCE(MAX(sync_seq), 0), 0), lower(hex(randomblob(16))) FROM memories;
+
+-- A row written while the triggers were dropped (a ladder re-run that drops
+-- a bump column, `SQL_DROP_SYNC_SEQ_TRIGGERS`) keeps the column default 0, and
+-- a walk (`sync_seq > after_seq >= 0`) would never serve it. Give each such
+-- row the next value and move the head past them; an assigned (positive)
+-- value is never touched (#9176 F1). Parity twin of the postgres heal.
+WITH pending AS (
+    SELECT id, row_number() OVER (ORDER BY sync_seq DESC, id) AS rn
+    FROM memories WHERE sync_seq <= 0
+)
+UPDATE memories
+SET sync_seq = (SELECT head FROM sync_seq_counter WHERE id = 1) + pending.rn
+FROM pending WHERE pending.id = memories.id;
+
+UPDATE sync_seq_counter
+SET head = MAX(head, (SELECT COALESCE(MAX(sync_seq), 0) FROM memories))
+WHERE id = 1;
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_sync_seq ON memories (sync_seq);
 

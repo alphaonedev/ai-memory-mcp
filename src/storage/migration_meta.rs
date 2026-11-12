@@ -467,11 +467,14 @@ pub const MIGRATION_LADDER: &[MigrationMeta] = &[
     // v102 (#9082, v1.0.0, data-integrity): the serving-assigned change
     // sequence. Adds `memories.sync_seq` (backfilled in `(updated_at, id)`
     // order), the one-row `sync_seq_counter`, the UNIQUE index, the assignment
-    // triggers and the puller-side `sync_pull_seq` table. Not idempotent (the
-    // `ALTER TABLE ... ADD COLUMN` refuses a second run) and not reversible
-    // (the backfill writes an existing table); nothing is destroyed, NoLoss.
-    // Postgres twin is `PostgresStore::migrate_v102`. 5-agent vote (4d3ea1c5).
-    meta(102, "SYNC_SEQ", false, false, NoLoss, Sqlite),
+    // triggers and the puller-side `sync_pull_seq` table. Idempotent (#9176
+    // F7): the column add and the backfill run only while `sync_seq` is
+    // absent (a `pragma_table_info` probe on sqlite, `information_schema` on
+    // Postgres) and the rest is `IF NOT EXISTS`, so a re-run never
+    // re-numbers an assigned value. Not reversible (the backfill writes an
+    // existing table); nothing is destroyed, NoLoss. Postgres twin is
+    // `PostgresStore::migrate_v102`. 5-agent vote (4d3ea1c5).
+    meta(102, "SYNC_SEQ", true, false, NoLoss, Sqlite),
 ];
 
 /// Look up the metadata for a target schema version.
