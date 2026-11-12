@@ -904,6 +904,44 @@ mod tests {
         assert_ne!(plain, bound);
     }
 
+    /// #9174 vote condition C4-1 — every form of the scope binding seals to
+    /// its own digest: absent, JSON null, the empty object and each scope
+    /// value are pairwise distinct, so no stored form can be rewritten into
+    /// another one without a digest mismatch.
+    #[test]
+    fn visibility_binding_forms_seal_pairwise_distinct_digests_c4_1_9174() {
+        let mut forms: Vec<(String, Value)> = vec![
+            ("absent".to_owned(), json!({"k": 1})),
+            (
+                "null".to_owned(),
+                json!({ VISIBILITY_META_KEY: null, "k": 1 }),
+            ),
+            (
+                "empty object".to_owned(),
+                json!({ VISIBILITY_META_KEY: {}, "k": 1 }),
+            ),
+        ];
+        for scope in MemoryScope::all_strs() {
+            forms.push((
+                format!("scope {scope}"),
+                json!({ VISIBILITY_META_KEY: {"scope": scope, "agent_id": SELF}, "k": 1 }),
+            ));
+        }
+        let digests: Vec<(String, Vec<u8>)> = forms
+            .into_iter()
+            .map(|(label, metadata)| {
+                let fm = canonical_frontmatter(NS, "n", "d", None, None, &[], &metadata).unwrap();
+                (label, compute_skill_digest(&fm, b"body", Vec::new()))
+            })
+            .collect();
+        assert_eq!(digests.len(), 3 + MemoryScope::all_strs().len());
+        for (i, (left, a)) in digests.iter().enumerate() {
+            for (right, b) in &digests[i + 1..] {
+                assert_ne!(a, b, "binding forms {left} and {right} seal to one digest");
+            }
+        }
+    }
+
     /// The registering principal in the table below.
     const SELF: &str = "ai:owner-8832";
     /// Another principal a binding may name.
