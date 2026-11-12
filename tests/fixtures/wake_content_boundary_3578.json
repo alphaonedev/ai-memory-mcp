@@ -139,9 +139,9 @@
   },
   {
     "path": "src/cli/wake_listen.rs",
-    "role": "Operator-resolved caller catch_up_read -> handle_inbox; refuses a Postgres store before opening the local sidecar (#3730, control-plane guard ahead of the content path); metadata rendering; operator --exec via audited_tokio_command.",
+    "role": "Operator-resolved caller catch_up_read -> handle_inbox; refuses a Postgres store before opening the local sidecar (#3730, control-plane guard ahead of the content path); metadata rendering; operator --exec via audited_tokio_command; #8779 stdout/stderr are unlocked handles that lock per write (no held stdio lock), bytes and content path unchanged.",
     "mode": "rust-production-tokens",
-    "sha256": "526462439c83cc93c94c66f7f150b9f0212ebcf05ca91d003bfda04226eaaa40"
+    "sha256": "070c658f507c6763610c68b62ecd63dc39031257c920fdcce1ad398ed12f9329"
   },
   {
     "path": "src/inbox_wake.rs",
