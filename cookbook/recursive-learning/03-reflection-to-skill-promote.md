@@ -10,12 +10,15 @@ chain. It reproduces the L2-6 closing-loop contract (#671) end-to-end:
 > A Reflection memory (synthesised via bounded `memory_reflect`) promotes
 > into an Apache-2.0 Agent Skill. The promoted skill exports to a
 > SKILL.md folder. Re-registering that folder on a separate, fresh
-> database produces a **byte-identical SHA-256 digest** — the same one
-> the promotion emitted in step 1.
+> database, as the same authenticated principal that promoted it,
+> produces a **byte-identical SHA-256 digest** — the same one the
+> promotion emitted in step 1.
 
 Identical-digest round-trip is what makes a promoted skill
-*portable*: the operator can ship the SKILL.md folder to any ai-memory
-deployment, re-register it, and prove cryptographically that what they
+*portable*: the operator can ship the SKILL.md folder to another ai-memory
+deployment, re-register it there as the same authenticated principal
+(set `AI_MEMORY_AGENT_ID` to the promoting agent id; the default
+`host:<hostname>` id differs per host and cannot own a binding), and prove cryptographically that what they
 re-registered is exactly what came out of the curator-driven reflection
 pipeline at the source. Without the round-trip property the promoted
 skill is a one-way deliverable; *with* it, the skill becomes a
@@ -27,9 +30,7 @@ source scope and the promoting principal, the export keeps that binding,
 and `memory_skill_register` accepts it only when the registering principal
 is that same principal. This recipe re-registers as the promoting agent,
 so the digest matches. Registered under a different principal, the export
-is refused with `metadata '_visibility' is bound to a different
-principal; register it as the principal that promoted it, or promote the
-source reflection again on this node as yourself`. An unbound skill
+is refused with `metadata '_visibility' is bound to a different principal; remove the '_visibility' binding and register the skill as your own (its digest then differs from the exported digest), or register it as the principal that promoted it`. An unbound skill
 (registered from a folder, never promoted) keeps the identical-digest
 guarantee for every principal. See
 [Round-trip semantics](../../docs/agent-skills.md#round-trip-semantics).

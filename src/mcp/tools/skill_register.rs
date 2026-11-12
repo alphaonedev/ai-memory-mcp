@@ -25,7 +25,7 @@ use crate::models::field_names;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension as _, params};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
@@ -204,6 +204,34 @@ pub(super) struct RegisterResult {
     pub version: i64,
 }
 
+/// Why [`register_core`] refused. A type, so the #8832 shadow refusal keeps
+/// its class and wire code on every surface (ERRORS-09) instead of being
+/// flattened to text; every other failure keeps its historic text.
+#[derive(Debug)]
+pub(super) enum RegisterCoreError {
+    /// A typed register-metadata refusal (the #8832 shadow guard).
+    Refused(super::skill_integrity::RegisterMetadataRefusal),
+    /// Every other failure, as caller-facing text.
+    Text(String),
+}
+
+impl From<String> for RegisterCoreError {
+    fn from(text: String) -> Self {
+        Self::Text(text)
+    }
+}
+
+/// Whether a register may supersede a current row bound to another
+/// principal (#8832, B-12). The register path guards; promote does not (its
+/// binding is substrate-derived from the reflection's own visibility).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SupersedeGuard {
+    /// A caller-supplied binding may supersede only its own bound lineage.
+    BoundToSamePrincipal,
+    /// The historic rule: any current row is superseded.
+    Unguarded,
+}
+
 /// Core registration logic shared by the folder and inline paths.
 ///
 /// `canonical_fm_json` is the sorted JSON encoding of the frontmatter
@@ -221,7 +249,8 @@ pub(super) fn register_core(
     resource_digests: Vec<Vec<u8>>,
     resources: &[(String, String, Vec<u8>)], // (path, kind, content)
     active_keypair: Option<&AgentKeypair>,
-) -> Result<RegisterResult, String> {
+    supersede_guard: SupersedeGuard,
+) -> Result<RegisterResult, RegisterCoreError> {
     // Build canonical frontmatter JSON for digest computation. #8832 — the
     // single canonical encoder the verified read path recomputes with, so a
     // `_visibility` scope binding in `metadata` is sealed into the digest.
@@ -292,15 +321,18 @@ pub(super) fn register_core(
     let conn: &Connection = &tx;
 
     // Find the current (non-superseded) row for this (namespace, name),
-    // carrying its `retired_at` so we can enforce the #2024 retire REFUSE.
-    let prev: Option<(String, Option<i64>)> = conn
+    // carrying its `retired_at` so we can enforce the #2024 retire REFUSE,
+    // and its stored metadata for the #8832 shadow guard. #8832 — a read
+    // error fails closed (it no longer reads as "no current row").
+    let prev: Option<(String, Option<i64>, String)> = conn
         .query_row(
-            "SELECT id, retired_at FROM skills \
+            "SELECT id, retired_at, metadata FROM skills \
              WHERE namespace = ?1 AND name = ?2 AND superseded_by IS NULL",
             params![namespace, name],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
-        .ok();
+        .optional()
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("skill register current row", e))?;
 
     // #2024 — REFUSE re-registration onto a RETIRED lineage. This runs
     // INSIDE the BEGIN IMMEDIATE tx (which took the write lock up front),
@@ -308,12 +340,23 @@ pub(super) fn register_core(
     // retire mutation serialises against us, and the RAII drop of `tx`
     // rolls back on this early return. Unretire the lineage before
     // re-registering.
-    if matches!(prev, Some((_, Some(_)))) {
-        return Err(format!(
+    if matches!(prev, Some((_, Some(_), _))) {
+        return Err(RegisterCoreError::Text(format!(
             "skill lineage '{namespace}/{name}' is retired; unretire before re-registering"
+        )));
+    }
+    // #8832 (B-12) — a bound register never supersedes (shadows) a current
+    // row that is not bound to the same principal. Inside the IMMEDIATE tx,
+    // so the row checked is the row superseded.
+    if supersede_guard == SupersedeGuard::BoundToSamePrincipal
+        && let Some((_, _, prev_metadata)) = &prev
+        && !super::skill_integrity::bound_register_may_supersede(metadata, prev_metadata)
+    {
+        return Err(RegisterCoreError::Refused(
+            super::skill_integrity::RegisterMetadataRefusal::ShadowsExisting,
         ));
     }
-    let prev_id: Option<String> = prev.map(|(id, _)| id);
+    let prev_id: Option<String> = prev.map(|(id, _, _)| id);
 
     // Insert new row.
     conn.execute(
@@ -426,6 +469,10 @@ pub(super) fn register_core(
 /// to is the process's authenticated identity (`AI_MEMORY_AGENT_ID`, else the
 /// durable host default), resolved with no request field: the same identity
 /// `memory_skill_promote_from_reflection` stamps when the request names none.
+/// #8832 (B-10) — the host default (`host:<hostname>`, which differs per
+/// host), an anonymous id and a reserved identity are not resolved
+/// principals: under them every binding is refused and a plain register
+/// is unchanged.
 ///
 /// # Errors
 /// The caller-facing refusal text.
@@ -558,21 +605,23 @@ pub(crate) fn handle_skill_register_as(
     // (always true for `skill_md::parse` output) and the caller supplied
     // a schema.
     //
-    // #8832 (code MEDIUM 2) — a key in the substrate-reserved `_` namespace
-    // is never accepted from the caller, at any depth, except the top-level
-    // scope binding in exactly the shape promote stamps for the AUTHENTICATED
-    // principal (so an exported promoted skill re-registers with an identical
-    // digest for its owner, and a binding naming anyone else is refused). One
-    // rule for every input form (folder, inline, MCP, HTTP, CLI all parse
-    // into `manifest.metadata` here).
-    super::skill_integrity::check_register_metadata(&manifest.metadata, principal)
-        .map_err(|r| refusal(r.message()))?;
     let mut metadata = manifest.metadata.clone();
     if let Some(schema) = parameters_schema {
         if let Value::Object(ref mut map) = metadata {
             map.insert(field_names::PARAMETERS_SCHEMA.to_string(), schema.clone());
         }
     }
+    // #8832 (code MEDIUM 2; 3-agent vote (71472661) B 3-0, B-8) — a key in
+    // the substrate-reserved `_` namespace is never accepted from the caller,
+    // at any depth, except the top-level scope binding in exactly the shape
+    // promote stamps for the AUTHENTICATED principal (so an exported promoted
+    // skill re-registers with an identical digest for its owner, and a
+    // binding naming anyone else is refused). One rule for every input form
+    // (folder, inline, MCP, HTTP, CLI), run on the FINAL metadata value that
+    // is stored and digested (the wire `parameters_schema` included), which
+    // then carries the principal written from the authenticated context.
+    super::skill_integrity::bind_register_metadata(&mut metadata, &manifest.namespace, principal)
+        .map_err(anyhow::Error::new)?;
 
     // #913 (security-medium / SOC2, 2026-05-19) — admin/state-change
     // audit. Skill registration mints an executable capability bundle
@@ -626,8 +675,12 @@ pub(crate) fn handle_skill_register_as(
         res_digests,
         &resource_files,
         active_keypair,
+        SupersedeGuard::BoundToSamePrincipal,
     )
-    .map_err(refusal)?;
+    .map_err(|e| match e {
+        RegisterCoreError::Refused(r) => anyhow::Error::new(r),
+        RegisterCoreError::Text(text) => refusal(text),
+    })?;
 
     let digest_hex = hex::encode(&result.digest);
     let mut response = json!({

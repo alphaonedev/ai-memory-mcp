@@ -980,7 +980,11 @@ fn binding(scope: &str, agent: &str) -> String {
 fn register_forms() -> Vec<(&'static str, String, Option<&'static str>)> {
     vec![
         ("self binding", binding("private", OWNER), None),
-        ("self binding, collective", binding("collective", OWNER), None),
+        (
+            "self binding, collective",
+            binding("collective", OWNER),
+            None,
+        ),
         // B-9: OWNER has no team / unit / org ancestor, so it could not read
         // a skill so bound in NS.
         (
@@ -1629,7 +1633,10 @@ fn a_self_binding_grants_nothing_a_plain_register_does_not_8832() {
             let served = |id: &str| mcp::handle_skill_get(&conn, &json!({ "skill_id": id }), None);
             let bound = served(&ids[0]).is_ok();
             let plain = served(&ids[1]).is_ok();
-            assert!(plain, "{reader}: an unbound skill is readable by every caller");
+            assert!(
+                plain,
+                "{reader}: an unbound skill is readable by every caller"
+            );
             assert!(
                 !bound || plain,
                 "{reader}: the {scope} binding granted more than a plain register"
@@ -1688,7 +1695,11 @@ fn bound_register_cannot_shadow_another_principals_skill_8832() {
         );
         assert_http_refusal("shadow over HTTP", status, &payload, SHADOWS_EXISTING);
 
-        assert_eq!(current(&name), vec![victim_id.clone()], "the victim stays current");
+        assert_eq!(
+            current(&name),
+            vec![victim_id.clone()],
+            "the victim stays current"
+        );
         env.act_as(Some(OTHER));
         mcp::handle_skill_get(&conn, &json!({ "skill_id": victim_id }), None)
             .expect("the other principal still reads its skill");
@@ -1699,7 +1710,10 @@ fn bound_register_cannot_shadow_another_principals_skill_8832() {
     let rev = format!("{}metadata:\n  rev: 2\n", binding("private", OWNER));
     let second = register("own-8832", &rev).expect("the binder re-registers its own lineage");
     assert_eq!(second["superseded_id"].as_str(), first["id"].as_str());
-    assert_eq!(current("own-8832"), vec![second["id"].as_str().expect("id").to_string()]);
+    assert_eq!(
+        current("own-8832"),
+        vec![second["id"].as_str().expect("id").to_string()]
+    );
     drop(env);
 }
 

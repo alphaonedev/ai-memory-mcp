@@ -69,7 +69,8 @@ use crate::identity::keypair::AgentKeypair;
 use crate::models::{MemoryKind, MemoryLinkRelation};
 
 use super::skill_register::{
-    RegisterResult, register_core, resource_digest, validate_parameters_schema,
+    RegisterCoreError, RegisterResult, SupersedeGuard, register_core, resource_digest,
+    validate_parameters_schema,
 };
 
 /// Compiled default for `governance.skill_promotion_min_depth` when the
@@ -389,6 +390,9 @@ pub(crate) fn handle_skill_promote_for_caller(
         res_digests,
         &resources,
         active_keypair,
+        // #8832 — promote's binding is substrate-derived, so its supersede
+        // rule is unchanged (the shadow guard is the register path's).
+        SupersedeGuard::Unguarded,
     )
     .map_err(register_core_error)?;
 
@@ -497,7 +501,11 @@ const RETIRED_LINEAGE_REFUSAL_SUFFIX: &str = "is retired; unretire before re-reg
 /// `register_core` string stays untyped: it is either already-sanitized
 /// `mcp_foreign_err` output or foreign serialization / compression text,
 /// and must keep classifying as foreign so it is withheld (ERRORS-15).
-fn register_core_error(msg: String) -> anyhow::Error {
+fn register_core_error(error: RegisterCoreError) -> anyhow::Error {
+    let msg = match error {
+        RegisterCoreError::Refused(refusal) => return anyhow::Error::new(refusal),
+        RegisterCoreError::Text(msg) => msg,
+    };
     if msg.starts_with("skill lineage '") && msg.ends_with(RETIRED_LINEAGE_REFUSAL_SUFFIX) {
         crate::errors::refusal(msg)
     } else {
@@ -668,7 +676,9 @@ mod tests {
     #[test]
     fn issue_6133_other_register_core_strings_stay_foreign() {
         let _agent_id_env_lock = crate::identity::agent_id_env_test_lock();
-        let foreign = register_core_error("zstd compress error: /srv/tenant/x EACCES".into());
+        let foreign = register_core_error(RegisterCoreError::Text(
+            "zstd compress error: /srv/tenant/x EACCES".into(),
+        ));
         assert_eq!(
             crate::mcp::error_text::mcp_foreign_err("issue_6133", foreign),
             crate::mcp::error_text::DB_ERROR_TEXT

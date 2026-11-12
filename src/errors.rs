@@ -535,8 +535,27 @@ pub mod msg {
     pub const SKILL_VISIBILITY_BINDING_MALFORMED: &str = "memory_skill_register refused: metadata '_visibility' must be exactly {\"scope\": <private|team|unit|org|collective>, \"agent_id\": <registering principal>} with no other key";
 
     /// v1.0.0 #8832 — the `_visibility` binding names a principal other than
-    /// the registering one. Names the remedy; never echoes either principal.
-    pub const SKILL_VISIBILITY_BINDING_FOREIGN: &str = "memory_skill_register refused: metadata '_visibility' is bound to a different principal; register it as the principal that promoted it, or promote the source reflection again on this node as yourself";
+    /// the registering one. Names the remedy (drop the binding and register
+    /// the skill as your own, whose digest then differs from the exported
+    /// one); never echoes either principal.
+    pub const SKILL_VISIBILITY_BINDING_FOREIGN: &str = "memory_skill_register refused: metadata '_visibility' is bound to a different principal; remove the '_visibility' binding and register the skill as your own (its digest then differs from the exported digest), or register it as the principal that promoted it";
+
+    /// v1.0.0 #8832 (B-9) — the binding scope is not a canonical scope token
+    /// (an unknown, differently-cased or legacy-broad token).
+    pub const SKILL_VISIBILITY_SCOPE_INVALID: &str = "memory_skill_register refused: metadata '_visibility' scope must be exactly one of private, team, unit, org, collective; unknown and legacy scope tokens are not accepted";
+
+    /// v1.0.0 #8832 (B-9) — the binding scope is one the registering
+    /// principal itself is not a member of in the skill's namespace.
+    pub const SKILL_VISIBILITY_SCOPE_NOT_MEMBER: &str = "memory_skill_register refused: metadata '_visibility' scope is one the registering principal is not a member of in this namespace; bind a scope you can read, or remove the binding";
+
+    /// v1.0.0 #8832 (B-10) — a binding needs a resolved principal: an
+    /// anonymous, host-default or reserved identity cannot own one.
+    pub const SKILL_VISIBILITY_PRINCIPAL_UNRESOLVED: &str = "memory_skill_register refused: metadata '_visibility' requires an authenticated agent identity (an anonymous, host-default or reserved identity cannot own a binding); register as your own agent id, or remove the binding";
+
+    /// v1.0.0 #8832 (B-12) — a bound register may not supersede a current
+    /// skill of the same namespace and name that is not bound to the same
+    /// principal (it would hide that skill from its readers).
+    pub const SKILL_VISIBILITY_SHADOWS_EXISTING: &str = "memory_skill_register refused: a current skill with this namespace and name is not bound to the registering principal, and a '_visibility' binding may not supersede it; register under another name, or remove the binding";
 
     /// `"pending action not found: {pending_id}"`.
     #[must_use]

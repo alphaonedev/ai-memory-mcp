@@ -141,14 +141,39 @@ pub async fn skill_register_route(
     let kp = (*app.active_keypair).as_ref();
     match crate::mcp::handle_skill_register_as(&lock.0, &body, kp, &caller) {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
-        // #3762 — forward the renderer's closed-vocabulary text verbatim so
-        // HTTP says byte-identically what MCP says; the absolute jail path
-        // lives on the operator log at the refusal site, never here.
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": e.to_string()})),
-        )
-            .into_response(),
+        // #8832 (B-11) — a register-metadata refusal carries its typed class:
+        // the same text MCP and CLI print, plus its wire `code` and status
+        // (the `AGENT_ID_MISMATCH` pattern of `handlers/create.rs`).
+        Err(e) => match e.downcast_ref::<crate::mcp::RegisterMetadataRefusal>() {
+            Some(refusal) => (
+                register_refusal_status(*refusal),
+                Json(json!({"code": refusal.code(), "error": refusal.message()})),
+            )
+                .into_response(),
+            // #3762 — forward the renderer's closed-vocabulary text verbatim
+            // so HTTP says byte-identically what MCP says; the absolute jail
+            // path lives on the operator log at the refusal site, never here.
+            None => (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response(),
+        },
+    }
+}
+
+/// #8832 (B-11) — the HTTP status of a register-metadata refusal class: a
+/// binding naming another principal and an unresolved principal are 403
+/// (the caller may not own that binding), a shadowing supersede is 409, and
+/// every malformed form is 400.
+const fn register_refusal_status(refusal: crate::mcp::RegisterMetadataRefusal) -> StatusCode {
+    use crate::mcp::RegisterMetadataRefusal as R;
+    match refusal {
+        R::ForeignBinding | R::UnresolvedPrincipal => StatusCode::FORBIDDEN,
+        R::ShadowsExisting => StatusCode::CONFLICT,
+        R::ReservedKey | R::MalformedBinding | R::ScopeInvalid | R::ScopeNotMember => {
+            StatusCode::BAD_REQUEST
+        }
     }
 }
 

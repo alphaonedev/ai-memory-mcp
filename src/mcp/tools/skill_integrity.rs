@@ -43,7 +43,10 @@ pub(super) const VISIBILITY_META_KEY: &str = "_visibility";
 /// this namespace carries authorization or integrity state that only the
 /// substrate stamps (today the scope binding [`VISIBILITY_META_KEY`]), so
 /// `memory_skill_register` refuses caller-supplied metadata that carries one
-/// at any depth, and `memory_skill_export` never writes one into a SKILL.md.
+/// at any depth, with one exception: `memory_skill_export` emits the
+/// top-level scope binding into the SKILL.md, and register accepts it back
+/// only in the exact promote shape for the AUTHENTICATED principal
+/// ([`check_register_metadata`]; 3-agent vote (71472661) B 3-0).
 pub(super) const RESERVED_META_KEY_PREFIX: &str = "_";
 
 /// `true` when `key` is in the substrate-reserved metadata namespace.
@@ -74,51 +77,117 @@ pub(super) fn carries_reserved_meta_key(value: &Value) -> bool {
 }
 
 /// #8832 — why `memory_skill_register` refused caller-supplied metadata.
-/// A type, so each refusal class maps to one fixed message (ERRORS-09) and
-/// no message ever echoes a principal id back to the caller.
+/// A type, so each refusal class maps to one fixed message and one wire code
+/// (ERRORS-09), and no message ever echoes a principal id back to the caller.
+/// The HTTP register route downcasts it to pick the status and `code`
+/// (the `AGENT_ID_MISMATCH` pattern of `src/handlers/create.rs`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum RegisterMetadataRefusal {
+pub(crate) enum RegisterMetadataRefusal {
     /// A substrate-reserved key other than the top-level scope binding, at
     /// any depth (a nested `_visibility` included).
     ReservedKey,
     /// The top-level scope binding is not exactly the shape promote stamps:
-    /// an object with exactly the keys `scope` (a canonical scope token) and
-    /// `agent_id` (a string).
+    /// an object with exactly the keys `scope` and `agent_id`, both strings.
     MalformedBinding,
+    /// The binding scope is not a canonical `MemoryScope::as_str()` token
+    /// (unknown, differently cased, or the legacy-broad federation token).
+    ScopeInvalid,
     /// The scope binding names a principal other than the registering one.
     ForeignBinding,
+    /// The binding scope is one the registering principal is not a member
+    /// of in the skill's namespace (it could not read its own skill).
+    ScopeNotMember,
+    /// No resolved principal (anonymous, unset/host default, or a reserved
+    /// identity): no binding is accepted at all.
+    UnresolvedPrincipal,
+    /// A bound register would supersede a current skill of the same
+    /// namespace and name that is not bound to the same principal.
+    ShadowsExisting,
 }
 
 impl RegisterMetadataRefusal {
     /// The fixed caller-facing refusal text for this class.
     #[must_use]
-    pub(super) const fn message(self) -> &'static str {
+    pub(crate) const fn message(self) -> &'static str {
         match self {
             Self::ReservedKey => msg::SKILL_RESERVED_METADATA_KEY,
             Self::MalformedBinding => msg::SKILL_VISIBILITY_BINDING_MALFORMED,
+            Self::ScopeInvalid => msg::SKILL_VISIBILITY_SCOPE_INVALID,
             Self::ForeignBinding => msg::SKILL_VISIBILITY_BINDING_FOREIGN,
+            Self::ScopeNotMember => msg::SKILL_VISIBILITY_SCOPE_NOT_MEMBER,
+            Self::UnresolvedPrincipal => msg::SKILL_VISIBILITY_PRINCIPAL_UNRESOLVED,
+            Self::ShadowsExisting => msg::SKILL_VISIBILITY_SHADOWS_EXISTING,
+        }
+    }
+
+    /// The typed wire code for this class (`error_codes::*`).
+    #[must_use]
+    pub(crate) const fn code(self) -> &'static str {
+        use crate::errors::error_codes;
+        match self {
+            Self::ForeignBinding => error_codes::AGENT_ID_MISMATCH,
+            Self::UnresolvedPrincipal => error_codes::IDENTITY_REQUIRED,
+            Self::ShadowsExisting => error_codes::CONFLICT,
+            Self::ReservedKey
+            | Self::MalformedBinding
+            | Self::ScopeInvalid
+            | Self::ScopeNotMember => error_codes::VALIDATION_FAILED,
         }
     }
 }
 
-/// #8832 — the register-side rule for substrate-reserved metadata.
+impl std::fmt::Display for RegisterMetadataRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message())
+    }
+}
+
+impl std::error::Error for RegisterMetadataRefusal {}
+
+/// The prefix of every synthesized anonymous principal
+/// (`anonymous:req-…`, `anonymous:invalid`, the `anonymous:<disc>` default).
+const ANONYMOUS_PRINCIPAL_PREFIX: &str = "anonymous:";
+
+/// #8832 (B-10) — `true` when `principal` is a resolved agent identity that
+/// may own a scope binding. Refused: the empty id, every synthesized
+/// anonymous id, the durable host default (`host:<hostname>`, the identity
+/// of an unset `AI_MEMORY_AGENT_ID`, which differs per host and names no
+/// agent), and any id `validate_agent_id` refuses (the reserved sentinels
+/// such as `system` and `daemon`, the hub scope).
+#[must_use]
+pub(crate) fn principal_is_resolved(principal: &str) -> bool {
+    !(principal.is_empty()
+        || principal.starts_with(ANONYMOUS_PRINCIPAL_PREFIX)
+        || principal.starts_with(crate::federation::identity::resolver::HOSTNAME_IDENTITY_PREFIX)
+        || crate::validate::validate_agent_id(principal).is_err())
+}
+
+/// #8832 — the register-side rule for substrate-reserved metadata, the ONE
+/// check every register surface (HTTP, MCP, CLI) runs.
 ///
-/// The only reserved key a caller may supply is the top-level scope binding
-/// ([`VISIBILITY_META_KEY`]), and only in exactly the shape
-/// `memory_skill_promote_from_reflection` stamps for `principal`:
-/// `{"scope": <canonical scope>, "agent_id": <principal>}` with no other key.
-/// That is the form an exported promoted skill carries, so the published
-/// promote → export → re-register digest guarantee holds for the promoting
+/// It runs on the parsed `serde_json::Value` that is stored and digested,
+/// never on raw text. The only reserved key a caller may supply is the
+/// top-level scope binding ([`VISIBILITY_META_KEY`]), and only when it is the
+/// promote shape for the AUTHENTICATED `principal`
+/// (3-agent vote (71472661) B 3-0): an object with exactly the keys `scope`
+/// and `agent_id`, both strings; `agent_id` byte-equal to `principal` (no
+/// case or Unicode folding); `scope` a canonical scope token the principal
+/// is a member of in `namespace`. No binding is accepted without a resolved
 /// principal. `principal` is the authenticated caller context, never a
-/// request field or the skill body. Any binding scope is accepted for the
-/// caller's own skill: an unbound skill is already visible to every caller,
-/// so a self-binding can only narrow who reads it, never widen it. Every
-/// other reserved key, at any depth, is refused.
+/// request field or the skill body.
+///
+/// The invariant: `agent_id` comes only from the authenticated principal;
+/// `scope` is caller-declared, validated, and narrowing only relative to an
+/// unbound register (an unbound skill is readable by every caller). A
+/// register-path binding is NOT evidence of promote's narrowest-scope
+/// derivation, and grants nothing a plain register does not. Every other
+/// reserved key, at any depth, is refused.
 ///
 /// # Errors
 /// The [`RegisterMetadataRefusal`] class of the first offending form.
-pub(super) fn check_register_metadata(
+pub(crate) fn check_register_metadata(
     metadata: &Value,
+    namespace: &str,
     principal: &str,
 ) -> Result<(), RegisterMetadataRefusal> {
     let Value::Object(top) = metadata else {
@@ -130,7 +199,7 @@ pub(super) fn check_register_metadata(
     };
     for (key, value) in top {
         if key == VISIBILITY_META_KEY {
-            check_register_binding(value, principal)?;
+            check_register_binding(value, namespace, principal)?;
         } else if is_reserved_meta_key(key) || carries_reserved_meta_key(value) {
             return Err(RegisterMetadataRefusal::ReservedKey);
         }
@@ -138,10 +207,41 @@ pub(super) fn check_register_metadata(
     Ok(())
 }
 
-/// The exact-shape check of a caller-supplied scope binding. The shape is
-/// checked before the principal, so a malformed binding never reveals
-/// whether the id it names matched.
-fn check_register_binding(binding: &Value, principal: &str) -> Result<(), RegisterMetadataRefusal> {
+/// #8832 (B-8) — run [`check_register_metadata`] on the final metadata that
+/// is stored and digested, then re-stamp the binding's `agent_id` from the
+/// authenticated `principal` (the check already proved it byte-equal, so the
+/// stored value is written from the authenticated context, never copied from
+/// caller input).
+///
+/// # Errors
+/// The [`RegisterMetadataRefusal`] class of the first offending form.
+pub(crate) fn bind_register_metadata(
+    metadata: &mut Value,
+    namespace: &str,
+    principal: &str,
+) -> Result<(), RegisterMetadataRefusal> {
+    check_register_metadata(metadata, namespace, principal)?;
+    if let Some(Value::Object(binding)) = metadata.get_mut(VISIBILITY_META_KEY) {
+        binding.insert(
+            crate::META_KEY_AGENT_ID.to_string(),
+            Value::String(principal.to_string()),
+        );
+    }
+    Ok(())
+}
+
+/// The exact-shape check of a caller-supplied scope binding. The principal
+/// is checked for resolution first (B-10: no binding at all without one),
+/// then the shape, then the scope token, so a malformed binding never
+/// reveals whether the id it names matched; membership is checked last.
+fn check_register_binding(
+    binding: &Value,
+    namespace: &str,
+    principal: &str,
+) -> Result<(), RegisterMetadataRefusal> {
+    if !principal_is_resolved(principal) {
+        return Err(RegisterMetadataRefusal::UnresolvedPrincipal);
+    }
     let Value::Object(map) = binding else {
         return Err(RegisterMetadataRefusal::MalformedBinding);
     };
@@ -151,17 +251,53 @@ fn check_register_binding(binding: &Value, principal: &str) -> Result<(), Regist
     ) else {
         return Err(RegisterMetadataRefusal::MalformedBinding);
     };
-    if map.len() != BINDING_KEY_COUNT || MemoryScope::from_str(scope).is_none() {
+    if map.len() != BINDING_KEY_COUNT {
         return Err(RegisterMetadataRefusal::MalformedBinding);
     }
-    if agent_id != principal {
+    if MemoryScope::from_str(scope).is_none_or(|parsed| parsed.as_str() != scope.as_str()) {
+        return Err(RegisterMetadataRefusal::ScopeInvalid);
+    }
+    if agent_id.as_bytes() != principal.as_bytes() {
         return Err(RegisterMetadataRefusal::ForeignBinding);
+    }
+    let own = json!({ crate::META_KEY_SCOPE: scope, crate::META_KEY_AGENT_ID: principal });
+    if !crate::visibility::is_visible_by_fields("", namespace, &own, principal) {
+        return Err(RegisterMetadataRefusal::ScopeNotMember);
     }
     Ok(())
 }
 
 /// The number of keys in a promote-stamped scope binding (`scope`, `agent_id`).
 const BINDING_KEY_COUNT: usize = 2;
+
+/// #8832 (B-12) — the `agent_id` a stored metadata blob's scope binding
+/// names, or `None` for an unbound (or malformed-binding) row.
+#[must_use]
+pub(crate) fn binding_owner(metadata: &Value) -> Option<&str> {
+    metadata
+        .get(VISIBILITY_META_KEY)?
+        .get(crate::META_KEY_AGENT_ID)?
+        .as_str()
+}
+
+/// #8832 (B-12) — may a register carrying `new_metadata` supersede the
+/// current row whose stored metadata is `prev_metadata`? An unbound register
+/// keeps the historic supersede rule. A bound register may supersede only a
+/// row bound to the same principal: an unbound or other-bound row's readers
+/// cannot be proven a subset of the new binding's, so superseding it would
+/// hide (shadow) another principal's visible skill. Fail closed: an
+/// unparseable stored blob counts as not the same principal.
+#[must_use]
+pub(crate) fn bound_register_may_supersede(new_metadata: &Value, prev_metadata: &str) -> bool {
+    let Some(new_owner) = binding_owner(new_metadata) else {
+        return true;
+    };
+    serde_json::from_str::<Value>(prev_metadata)
+        .ok()
+        .as_ref()
+        .and_then(binding_owner)
+        .is_some_and(|prev_owner| prev_owner.as_bytes() == new_owner.as_bytes())
+}
 
 /// #8834 — why [`load_verified_skill`] refused a row. The class is a type,
 /// never a match on message text (ERRORS-09): a caller that omits a row on
@@ -753,7 +889,9 @@ mod tests {
     /// registering principal passes.
     #[test]
     fn register_metadata_rule_table_8832() {
-        use RegisterMetadataRefusal::{ForeignBinding, MalformedBinding, ReservedKey};
+        use RegisterMetadataRefusal::{
+            ForeignBinding, MalformedBinding, ReservedKey, ScopeInvalid, ScopeNotMember,
+        };
         let cases: Vec<(Value, Result<(), RegisterMetadataRefusal>)> = vec![
             (json!({}), Ok(())),
             (json!({"author": "a", "tags": ["x"]}), Ok(())),
@@ -797,11 +935,27 @@ mod tests {
             ),
             (
                 json!({ VISIBILITY_META_KEY: {"scope": "Private", "agent_id": SELF} }),
-                Err(MalformedBinding),
+                Err(ScopeInvalid),
             ),
             (
                 json!({ VISIBILITY_META_KEY: {"scope": "shared", "agent_id": SELF} }),
-                Err(MalformedBinding),
+                Err(ScopeInvalid),
+            ),
+            (
+                json!({ VISIBILITY_META_KEY: {"scope": "global", "agent_id": SELF} }),
+                Err(ScopeInvalid),
+            ),
+            (
+                json!({ VISIBILITY_META_KEY: {"scope": "team", "agent_id": SELF} }),
+                Err(ScopeNotMember),
+            ),
+            (
+                json!({ VISIBILITY_META_KEY: {"scope": "org", "agent_id": SELF} }),
+                Err(ScopeNotMember),
+            ),
+            (
+                json!({ VISIBILITY_META_KEY: {"scope": "Private", "agent_id": OTHER} }),
+                Err(ScopeInvalid),
             ),
             (
                 json!({ VISIBILITY_META_KEY: {"scope": 1, "agent_id": SELF} }),
@@ -838,10 +992,142 @@ mod tests {
         ];
         for (n, (metadata, want)) in cases.iter().enumerate() {
             assert_eq!(
-                check_register_metadata(metadata, SELF),
+                check_register_metadata(metadata, NS, SELF),
                 *want,
                 "case {n}: {metadata}"
             );
+        }
+    }
+
+    /// #8832 (B-9) — a team member may bind its own team, unit and org
+    /// scopes in a namespace under them; outside them it may not.
+    #[test]
+    fn register_binding_scope_membership_8832() {
+        const MEMBER: &str = "acme/eng/owner";
+        let bind =
+            |scope: &str| json!({ VISIBILITY_META_KEY: {"scope": scope, "agent_id": MEMBER} });
+        for scope in ["private", "team", "unit", "collective"] {
+            assert_eq!(
+                check_register_metadata(&bind(scope), "acme/eng", MEMBER),
+                Ok(()),
+                "{scope}"
+            );
+        }
+        for (ns, scope) in [
+            ("other/eng", "team"),
+            ("acme/ops", "team"),
+            ("zeta", "unit"),
+        ] {
+            assert_eq!(
+                check_register_metadata(&bind(scope), ns, MEMBER),
+                Err(RegisterMetadataRefusal::ScopeNotMember),
+                "{ns} {scope}"
+            );
+        }
+    }
+
+    /// #8832 (B-10) — no binding at all without a resolved principal; every
+    /// other reserved key keeps its own refusal and plain metadata passes.
+    #[test]
+    fn register_binding_requires_a_resolved_principal_8832() {
+        let unresolved = [
+            "",
+            "anonymous:req-1",
+            "anonymous:invalid",
+            "host:node-1",
+            "system",
+            "daemon",
+            "has space",
+        ];
+        for principal in unresolved {
+            assert!(!principal_is_resolved(principal), "{principal:?}");
+            for binding in [
+                json!({"scope": "private", "agent_id": principal}),
+                json!({"scope": "private", "agent_id": SELF}),
+                json!("collective"),
+            ] {
+                assert_eq!(
+                    check_register_metadata(
+                        &json!({ VISIBILITY_META_KEY: binding }),
+                        NS,
+                        principal
+                    ),
+                    Err(RegisterMetadataRefusal::UnresolvedPrincipal),
+                    "{principal:?} {binding}"
+                );
+            }
+            assert_eq!(
+                check_register_metadata(&json!({"_k": 1}), NS, principal),
+                Err(RegisterMetadataRefusal::ReservedKey)
+            );
+            assert_eq!(
+                check_register_metadata(&json!({"k": 1}), NS, principal),
+                Ok(())
+            );
+        }
+        for principal in [SELF, "alice", "acme/eng/owner", "ai:claude@host-1"] {
+            assert!(principal_is_resolved(principal), "{principal}");
+        }
+    }
+
+    /// #8832 (B-8) — the stored binding is re-stamped from the principal.
+    #[test]
+    fn bind_register_metadata_stamps_the_principal_8832() {
+        let mut metadata =
+            json!({ VISIBILITY_META_KEY: {"agent_id": SELF, "scope": "private"}, "k": 1 });
+        assert_eq!(bind_register_metadata(&mut metadata, NS, SELF), Ok(()));
+        assert_eq!(
+            metadata,
+            json!({ VISIBILITY_META_KEY: {"scope": "private", "agent_id": SELF}, "k": 1 })
+        );
+        let mut foreign = json!({ VISIBILITY_META_KEY: {"scope": "private", "agent_id": OTHER} });
+        assert_eq!(
+            bind_register_metadata(&mut foreign, NS, SELF),
+            Err(RegisterMetadataRefusal::ForeignBinding)
+        );
+    }
+
+    /// #8832 (B-12) — a bound register supersedes only a row bound to the
+    /// same principal; an unbound register keeps the historic rule.
+    #[test]
+    fn bound_register_may_supersede_table_8832() {
+        let bound =
+            |who: &str| json!({ VISIBILITY_META_KEY: {"scope": "private", "agent_id": who} });
+        let own = bound(SELF).to_string();
+        let other = bound(OTHER).to_string();
+        let cases: [(Value, &str, bool); 9] = [
+            (json!({}), "{}", true),
+            (json!({}), &other, true),
+            (json!({"k": 1}), "not json", true),
+            (bound(SELF), &own, true),
+            (bound(SELF), &other, false),
+            (bound(SELF), "{}", false),
+            (bound(SELF), "not json", false),
+            (bound(SELF), "{\"_visibility\": \"private\"}", false),
+            (bound(&SELF.to_uppercase()), &own, false),
+        ];
+        for (n, (new, prev, want)) in cases.iter().enumerate() {
+            assert_eq!(bound_register_may_supersede(new, prev), *want, "case {n}");
+        }
+    }
+
+    /// #8832 (B-11) — every refusal class has its one typed wire code.
+    #[test]
+    fn register_metadata_refusal_codes_8832() {
+        use crate::errors::error_codes;
+        use RegisterMetadataRefusal as R;
+        let cases = [
+            (R::ReservedKey, error_codes::VALIDATION_FAILED),
+            (R::MalformedBinding, error_codes::VALIDATION_FAILED),
+            (R::ScopeInvalid, error_codes::VALIDATION_FAILED),
+            (R::ScopeNotMember, error_codes::VALIDATION_FAILED),
+            (R::ForeignBinding, error_codes::AGENT_ID_MISMATCH),
+            (R::UnresolvedPrincipal, error_codes::IDENTITY_REQUIRED),
+            (R::ShadowsExisting, error_codes::CONFLICT),
+        ];
+        for (refusal, code) in cases {
+            assert_eq!(refusal.code(), code, "{refusal:?}");
+            assert_eq!(refusal.to_string(), refusal.message(), "{refusal:?}");
         }
     }
 
@@ -851,7 +1137,11 @@ mod tests {
         for refusal in [
             RegisterMetadataRefusal::ReservedKey,
             RegisterMetadataRefusal::MalformedBinding,
+            RegisterMetadataRefusal::ScopeInvalid,
             RegisterMetadataRefusal::ForeignBinding,
+            RegisterMetadataRefusal::ScopeNotMember,
+            RegisterMetadataRefusal::UnresolvedPrincipal,
+            RegisterMetadataRefusal::ShadowsExisting,
         ] {
             let text = refusal.message();
             assert!(!text.contains(SELF) && !text.contains(OTHER), "{text}");
@@ -881,9 +1171,9 @@ mod tests {
         outer.insert("outer".to_owned(), deep);
         let deep = Value::Object(outer);
         let start = std::time::Instant::now();
-        assert_eq!(check_register_metadata(&wide, SELF), Ok(()));
+        assert_eq!(check_register_metadata(&wide, NS, SELF), Ok(()));
         assert_eq!(
-            check_register_metadata(&deep, SELF),
+            check_register_metadata(&deep, NS, SELF),
             Err(RegisterMetadataRefusal::ReservedKey)
         );
         assert!(start.elapsed() < BOUND, "took {:?}", start.elapsed());

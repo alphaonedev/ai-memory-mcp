@@ -860,6 +860,9 @@ pub use skill_get::handle_skill_get;
 // #8834 (code LOW 4) — test fixtures only; never in the release lib surface.
 #[cfg(any(test, feature = "test-support"))]
 pub use skill_integrity::reseal_skill_digest_for_tests;
+// #8832 (B-11) — the HTTP register route maps the typed refusal class to
+// its status and wire `code`.
+pub(crate) use skill_integrity::RegisterMetadataRefusal;
 pub use skill_list::{SKILL_LIST_PAGE_LIMIT, handle_skill_list};
 pub(crate) use skill_promote::handle_skill_promote_for_caller;
 pub use skill_promote::handle_skill_promote_from_reflection;

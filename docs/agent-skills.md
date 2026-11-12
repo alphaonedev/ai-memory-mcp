@@ -90,7 +90,7 @@ The 9 MCP tools that make up the Agent Skills wire surface:
 | `memory_skill_list` | `other` | L1-5 | List current (non-superseded) skills with `~100 tokens/skill`. Returns id, name, description, namespace, digest, metadata. **Body is NOT decompressed** — use `memory_skill_get` for activation. |
 | `memory_skill_get` | `other` | L1-5 | Return the full activation payload: metadata + decompressed body. Old version ids remain addressable after supersession (durable history). |
 | `memory_skill_resource` | `other` | L1-5 | Fetch a single resource by `(skill_id, resource_path)`, digest-verified against the row's SHA-256 before return. Errors on digest mismatch. |
-| `memory_skill_export` | `other` | L1-5 | Write SKILL.md + `resources/` to a target folder **inside the export root** (#3357 — see *Export root* below). Re-registering from the exported folder produces the **identical SHA-256 digest** — the round-trip guarantee. Appends a `skill.exported` row to `signed_events`. |
+| `memory_skill_export` | `other` | L1-5 | Write SKILL.md + `resources/` to a target folder **inside the export root** (#3357 — see *Export root* below). Re-registering from the exported folder produces the **identical SHA-256 digest** — the round-trip guarantee (for a promoted skill, only when re-registered by the same authenticated principal; see *Round-trip semantics*). Appends a `skill.exported` row to `signed_events`. |
 | `memory_skill_promote_from_reflection` | `other` | L2-6 | Promote a `Reflection`-kind memory (depth ≥ 1, default floor `1`) to a SKILL.md-format skill. Each `reflects_on` source becomes a `references/source_{i}.md` resource. Frontmatter records `derived_from_reflection_id` + `original_reflection_depth`. The resulting digest is identical to a hand-authored SKILL.md with the same content. |
 | `memory_skill_compositional_context` | `other` | L2-7 | Return a skill body + reflection memories from the namespaces declared in its `composes_with_reflections` frontmatter list, bounded by `max_reflection_depth` and a caller-supplied token budget (`budget_tokens`, default 4000, max 32000). |
 | `memory_skill_retire` | `other` | #2024 | **Reversible.** Retire (hide + block re-register) or unretire a skill lineage. Default target is the whole `(namespace, name)` lineage; pass `skill_id` to act on a single version. Idempotent (`affected=0` when already in the requested state). Set `unretire=true` to reverse. Backed by the schema-v82 `retired_at` / `retired_by` / `retire_reason` columns — the skill rows are NOT deleted. Admin-gated; HTTP twin `POST /api/v1/skill/{id}/retire`. |
@@ -199,14 +199,24 @@ revisions documented in
 **Promoted skills are principal-bound (v1.0.0 #8832).** A skill promoted
 from a reflection carries a `metadata._visibility` scope binding naming
 the promoting principal, and export keeps it so the digest is unchanged.
-The round trip above therefore holds for a promoted skill when the
-re-registering principal is the promoting principal. Registered by a
-DIFFERENT principal, the binding is refused with `memory_skill_register
-refused: metadata '_visibility' is bound to a different principal;
-register it as the principal that promoted it, or promote the source
-reflection again on this node as yourself` (no principal id is echoed).
-A skill without a binding (every hand-authored skill) keeps the
-guarantee for every principal.
+The round trip above therefore holds for a promoted skill only when the
+re-registering caller is the same authenticated principal that promoted
+it. Registered by a DIFFERENT principal, or with no resolved principal,
+the binding is refused (`AGENT_ID_MISMATCH` / `IDENTITY_REQUIRED`); the
+cross-principal text is `memory_skill_register refused: metadata '_visibility' is bound to a different principal; remove the '_visibility' binding and register the skill as your own (its digest then differs from the exported digest), or register it as the principal that promoted it` (no principal id is echoed). A skill without a binding (every
+hand-authored skill) keeps the guarantee for every principal.
+
+A `_visibility` binding supplied on the register path is accepted only
+as the promote shape for the authenticated principal (3-agent vote
+(71472661) B 3-0, conditions B-1..B-14): `agent_id` comes only from the
+authenticated principal, and `scope` is caller-declared, must be a
+canonical scope token the principal is a member of in the namespace,
+and only narrows relative to an unbound register. It is NOT evidence of
+promote's narrowest-scope derivation and grants nothing a plain register
+does not. A bound register may not supersede a current skill of the same
+namespace and name that is not bound to the same principal (`CONFLICT`).
+The default agent id is host-derived (`host:<hostname>`) and differs per
+host, so it owns no binding.
 
 `memory_skill_export` appends one `skill.exported` row to the
 append-only `signed_events` audit table on every export, so a
@@ -256,11 +266,14 @@ end-to-end by
 
 That guarantee is for an unbound skill. A **promoted** skill carries
 the promoting principal's scope binding (see *Round-trip semantics*),
-so on node B it registers with the identical digest only for that same
-principal; registered by a different principal it is refused with the
-message that names both remedies (register it as the promoting
-principal, or promote the source reflection again on node B), and the
-refusal never echoes the other principal's id. Both outcomes and the
+so on node B it registers with the identical digest only for the same
+authenticated principal (set `AI_MEMORY_AGENT_ID` on node B to the
+promoting principal; the host-default id differs per host and is
+refused). Registered by a different principal it is refused with the
+message that names the remedies (remove the binding and register the
+skill as your own, its digest then differs, or register it as the
+promoting principal), and the refusal never echoes the other
+principal's id. Both outcomes and the
 unbound cross-principal digest are pinned by
 `exported_promoted_skill_is_principal_bound_on_reregister_8832` in
 [`tests/skill_scope_integrity_8832_8834.rs`](../tests/skill_scope_integrity_8832_8834.rs).
