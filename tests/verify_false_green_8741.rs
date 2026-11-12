@@ -58,6 +58,14 @@ const REASON_AUDIT_LOG_EMPTY: &str = "audit_log_empty";
 const REASON_SEQ_MARK_MISSING: &str = "seq_mark_missing";
 /// Forensic: an unsigned row after a signed one (a signature downgrade).
 const REASON_FORENSIC_SIGNATURE_ABSENT: &str = "signature_absent";
+const REASON_DAY_FILE_MISSING: &str = "day_file_missing";
+const REASON_FORENSIC_LOG_MISSING: &str = "forensic_log_missing";
+const REASON_FORENSIC_WINDOW_EMPTY: &str = "forensic_window_empty";
+const REASON_FORENSIC_SIGNATURE_UNVERIFIED: &str = "signature_unverified";
+const REASON_HEAD_BELOW_SINCE: &str = "head_below_since";
+const REASON_STORE_URL_UNRECOGNISED: &str = "store_url_unrecognised";
+const STORE_URL_FILE_ENV: &str = "AI_MEMORY_STORE_URL_FILE";
+const FAR_FUTURE_RFC3339: &str = "2999-01-01T00:00:00Z";
 
 const MANIFEST_FILE: &str = "manifest.json";
 const SIGNER_AGENT: &str = "ai:bundle-signer-8741";
@@ -319,7 +327,126 @@ fn chain_verifiers_clean_store_is_green_8741() {
     ] {
         let home = Home::new(None);
         assert_ok(&home.run(&[], &["store", "--title", "t", "--content", "c"]));
-        assert_ok(&home.run(&[], args));
+        let out = home.run(&[], args);
+        assert_ok(&out);
+        // #9179 r1 — green states its coverage: the tail is not protected yet.
+        assert!(
+            both(&out).contains("unanchored_tail="),
+            "{args:?}: {}",
+            both(&out)
+        );
+    }
+}
+
+fn write_url_file(home: &Home, url: &str) -> PathBuf {
+    let p = home.path().join("store.url");
+    std::fs::write(&p, url).expect("write url file");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    }
+    p
+}
+
+/// #9179 r1 security F1 / Decision 3 — the store-URL channels of
+/// verify-signed-events-chain: a configured store is never ignored in
+/// favour of `--db`, and a Postgres URL VALUE is refused.
+#[test]
+fn signed_events_chain_store_url_table_9179() {
+    // A sqlite:// URL in the environment opens THAT file, here an empty chain,
+    // while --db holds a populated one.
+    let home = Home::new(None);
+    assert_ok(&home.run(&[], &["store", "--title", "t", "--content", "c"]));
+    let other = Home::new(None);
+    store_with_empty_chain(&other);
+    let other_url = format!("sqlite://{}", other.db().display());
+    let out = home.run(
+        &[(STORE_URL_ENV, &other_url)],
+        &["verify-signed-events-chain"],
+    );
+    assert_finding(&out, EXIT_CHAIN_FAIL, REASON_EMPTY_CHAIN);
+    // The same through --store-url-file and through the URL-file env.
+    let url_file = write_url_file(&home, &other_url);
+    let url_file_s = url_file.to_str().expect("utf-8 path");
+    let out = home.run(
+        &[],
+        &["verify-signed-events-chain", "--store-url-file", url_file_s],
+    );
+    assert_finding(&out, EXIT_CHAIN_FAIL, REASON_EMPTY_CHAIN);
+    let out = home.run(
+        &[(STORE_URL_FILE_ENV, url_file_s)],
+        &["verify-signed-events-chain"],
+    );
+    assert_finding(&out, EXIT_CHAIN_FAIL, REASON_EMPTY_CHAIN);
+    // An unknown scheme is a finding, never a walk of --db.
+    for url in ["bogus://h/x", "mysql://h/db"] {
+        let out = home.run(&[(STORE_URL_ENV, url)], &["verify-signed-events-chain"]);
+        assert_finding(&out, EXIT_CHAIN_FAIL, REASON_STORE_URL_UNRECOGNISED);
+    }
+    // A Postgres URL value (env) is refused with the URL-file hint.
+    for url in [
+        PG_URL_NEVER_DIALLED,
+        "postgresql://verify8741@127.0.0.1:1/never",
+    ] {
+        let out = home.run(&[(STORE_URL_ENV, url)], &["verify-signed-events-chain"]);
+        assert_finding(&out, EXIT_CHAIN_FAIL, REASON_STORE_IS_POSTGRES);
+        assert!(both(&out).contains("--store-url-file"), "{}", both(&out));
+    }
+}
+
+/// #9179 r1 code F5 / security F6 — a window that checks no row is
+/// `head_below_since` on both chain verifiers; a negative --since is refused.
+#[test]
+fn chain_verifiers_since_past_head_is_a_finding_9179() {
+    let home = Home::new(None);
+    assert_ok(&home.run(&[], &["store", "--title", "t", "--content", "c"]));
+    let table: [&[&str]; 4] = [
+        &["verify-signed-events-chain", "--since", "999999"],
+        &[
+            "verify-signed-events-chain",
+            "--since",
+            "999999",
+            "--format",
+            "json",
+        ],
+        &["verify-audit-trail", "--since", FAR_FUTURE_RFC3339],
+        &[
+            "verify-audit-trail",
+            "--since",
+            FAR_FUTURE_RFC3339,
+            "--json",
+        ],
+    ];
+    for args in table {
+        let out = home.run(&[], args);
+        assert_finding(&out, EXIT_CHAIN_FAIL, REASON_HEAD_BELOW_SINCE);
+    }
+    let out = home.run(&[], &["verify-signed-events-chain", "--since=-1"]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "clap usage error: {}",
+        both(&out)
+    );
+}
+
+/// #9179 r1 code F4 / F10c — absence in JSON mode is a JSON body with the
+/// reason on stdout, the same shape on both chain verifiers.
+#[test]
+fn chain_verifiers_json_absence_shape_9179() {
+    let home = Home::new(None);
+    store_with_empty_chain(&home);
+    for args in [
+        &["verify-signed-events-chain", "--format", "json"][..],
+        &["verify-audit-trail", "--json"][..],
+    ] {
+        let out = home.run(&[], args);
+        assert_eq!(out.status.code(), Some(EXIT_CHAIN_FAIL), "{}", both(&out));
+        let v: serde_json::Value =
+            serde_json::from_slice(&out.stdout).expect("JSON body on stdout");
+        assert_eq!(v["status"], "fail", "{args:?}: {v}");
+        assert_eq!(v["reason"], REASON_EMPTY_CHAIN, "{args:?}: {v}");
     }
 }
 
@@ -486,6 +613,9 @@ fn write_forensic(
     paths
 }
 
+/// `(day index, row index) -> signed?` for a [`write_forensic`] fixture.
+type SignedRowPredicate = fn(usize, usize) -> bool;
+
 #[test]
 fn forensic_window_tamper_table_9009() {
     let key = SigningKey::from_bytes(&FORENSIC_SEED);
@@ -524,15 +654,102 @@ fn forensic_window_tamper_table_9009() {
         f.detail
     );
 
-    // A legitimate unsigned prefix (rows written before a key existed)
-    // stays green.
-    let prefix = TempDir::new().expect("tempdir");
-    write_forensic(prefix.path(), &days, &key, |d, _| d > 0);
-    let r = verify_since(prefix.path(), DAY_OLD, Some(&pk)).expect("verify");
-    assert_eq!(
-        r.first_failure, None,
-        "unsigned prefix then signed is green"
-    );
+    // #9179 r1 code F1 (HIGH) / security F2 — the signature is outside the
+    // hash chain, so with a verifying key present EVERY in-window unsigned row
+    // is a finding. No anchored pre-key boundary exists, so no exemption:
+    // all-stripped and prefix-stripped are both `signature_absent` at the
+    // first unsigned row.
+    let stripped: [(&str, SignedRowPredicate); 3] = [
+        ("all-stripped", |_, _| false),
+        ("prefix-stripped", |d, _| d > 0),
+        ("one-row-prefix-stripped", |d, r| d > 0 || r > 0),
+    ];
+    for (name, signed) in stripped {
+        let dir = TempDir::new().expect("tempdir");
+        let files = write_forensic(dir.path(), &days, &key, signed);
+        let r = verify_since(dir.path(), DAY_OLD, Some(&pk)).expect("verify");
+        let f = r.first_failure.expect(name);
+        assert_eq!(f.kind, VerifyFailureKind::Signature, "{name}");
+        assert_eq!(f.reason, REASON_FORENSIC_SIGNATURE_ABSENT, "{name}");
+        assert_eq!(f.file, files[0], "{name}");
+        assert_eq!(f.line_number, 1, "{name}");
+    }
+
+    // #9179 r1 Decision 2 — a removed middle day file breaks the link into
+    // the next file: `day_file_missing`, at line 1 of that next file.
+    let gap = TempDir::new().expect("tempdir");
+    let files = write_forensic(gap.path(), &days, &key, |_, _| true);
+    std::fs::remove_file(&files[1]).expect("remove middle day file");
+    let r = verify_since(gap.path(), DAY_OLD, Some(&pk)).expect("verify");
+    let f = r.first_failure.expect("removed day file is a finding");
+    assert_eq!(f.reason, REASON_DAY_FILE_MISSING);
+    assert_eq!(f.file, files[2]);
+    assert_eq!(f.line_number, 1);
+}
+
+/// #9179 r1 code F2 / F3 / F8 — the CLI funnel of the forensic mode
+/// (`audit verify --since`): absence and an unverifiable signature are
+/// findings with exit 2 and their reason, in text and JSON.
+#[test]
+fn forensic_since_cli_absence_table_9179() {
+    let key = SigningKey::from_bytes(&FORENSIC_SEED);
+    let days = [DAY_OLD, DAY_MID, DAY_NEW];
+    let cases: [(&str, &str); 3] = [
+        ("no-day-file", REASON_FORENSIC_LOG_MISSING),
+        ("window-past-every-file", REASON_FORENSIC_WINDOW_EMPTY),
+        ("signed-rows-no-key", REASON_FORENSIC_SIGNATURE_UNVERIFIED),
+    ];
+    for (case, reason) in cases {
+        let home = Home::new(Some(true));
+        let audit_dir = home.path().join("audit");
+        std::fs::create_dir_all(&audit_dir).expect("audit dir");
+        let since = match case {
+            "no-day-file" => DAY_OLD,
+            "window-past-every-file" => {
+                write_forensic(&audit_dir, &days, &key, |_, _| true);
+                "2999-01-01"
+            }
+            _ => {
+                // Signed with a key the verifier does not hold.
+                write_forensic(&audit_dir, &days, &key, |_, _| true);
+                DAY_OLD
+            }
+        };
+        for json in [false, true] {
+            let mut args = vec!["audit", "verify", "--since", since];
+            // A signer id with no key on this host: the boot never mints
+            // one for it, so the verifier holds no key for these rows.
+            args.extend(["--forensic-agent-id", UNKNOWN_SIGNER]);
+            if json {
+                args.push("--json");
+            }
+            let out = home.run(&[], &args);
+            assert_finding(&out, EXIT_AUDIT_FAIL, reason);
+            assert!(!both(&out).contains("verify OK"), "{case}: {}", both(&out));
+        }
+    }
+}
+
+/// #9179 r1 F11 — `audit verify --path <copy>` of an archived trail: green
+/// with its sequence mark, `seq_mark_missing` without it. No acknowledgement
+/// flag exists (b29 ruling: no escape hatch on a verifier).
+#[test]
+fn audit_verify_path_copy_table_9179() {
+    let home = Home::new(Some(true));
+    for i in 0..TRAIL_WRITES {
+        let title = format!("copy-{i}");
+        assert_ok(&home.run(&[], &["store", "--title", &title, "--content", "c"]));
+    }
+    let archive = home.path().join("archive");
+    std::fs::create_dir_all(&archive).expect("archive dir");
+    let copy = archive.join("audit.log");
+    std::fs::copy(home.trail(), &copy).expect("copy trail");
+    let copy_s = copy.to_str().expect("utf-8 path").to_string();
+    // Without the sequence mark the copy is not provably whole.
+    let out = home.run(&[], &["audit", "verify", "--path", &copy_s]);
+    assert_finding(&out, EXIT_AUDIT_FAIL, REASON_SEQ_MARK_MISSING);
+    std::fs::copy(seq_mark(&home.trail()), seq_mark(&copy)).expect("copy mark");
+    assert_ok(&home.run(&[], &["audit", "verify", "--path", &copy_s]));
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -584,6 +801,70 @@ const VERIFY_COMMANDS_WITH_TAMPER_ROW: &[(&str, &str)] = &[
 /// `audit` subcommands that verify, each with its tamper row.
 const AUDIT_VERIFY_SUBCOMMANDS: &[(&str, &str)] = &[("verify", "audit_trail_tamper_table_8867")];
 
+/// #9179 r1 code F8 — flags that switch a verify command to another code
+/// path (another store, another log). Each (command, flag) pair the CLI
+/// offers needs its own absence or tamper row.
+const MODE_FLAGS: &[&str] = &["--since", "--store-url", "--store-url-file", "--path"];
+
+/// (command path, mode flag, test fn) rows. `audit verify --since` is the
+/// forensic walk, a different verifier from the flat trail.
+const VERIFY_MODE_ROWS: &[(&str, &str, &str)] = &[
+    (
+        "audit verify",
+        "--since",
+        "forensic_since_cli_absence_table_9179",
+    ),
+    (
+        "audit verify",
+        "--path",
+        "audit_verify_path_copy_table_9179",
+    ),
+    (
+        "verify-signed-events-chain",
+        "--since",
+        "chain_verifiers_since_past_head_is_a_finding_9179",
+    ),
+    (
+        "verify-signed-events-chain",
+        "--store-url-file",
+        "signed_events_chain_store_url_table_9179",
+    ),
+    (
+        "verify-audit-trail",
+        "--since",
+        "chain_verifiers_since_past_head_is_a_finding_9179",
+    ),
+    (
+        "verify-audit-trail",
+        "--store-url",
+        "store_url_pg_empty_chain_is_a_finding_8741",
+    ),
+];
+
+/// The long flags a `--help` page DEFINES: only option lines (a trimmed line
+/// that starts with `-`) count, so a flag named inside another flag's prose
+/// (the global `--db` doc mentions `serve --store-url`) is not a mode flag.
+fn help_flags(out: &Output) -> Vec<String> {
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut flags = Vec::new();
+    for line in text.lines().map(str::trim_start) {
+        if !line.starts_with('-') {
+            continue;
+        }
+        for word in line.split_whitespace() {
+            let word = word.trim_end_matches(',');
+            if !word.starts_with('-') {
+                break;
+            }
+            if let Some(long) = word.strip_prefix("--").filter(|w| !w.is_empty()) {
+                let name = long.split('=').next().unwrap_or(long);
+                flags.push(format!("--{name}"));
+            }
+        }
+    }
+    flags
+}
+
 fn help_commands(out: &Output) -> Vec<String> {
     let text = String::from_utf8_lossy(&out.stdout);
     let mut in_cmds = false;
@@ -629,6 +910,43 @@ fn every_verify_command_has_a_tamper_row() {
         assert!(
             AUDIT_VERIFY_SUBCOMMANDS.iter().any(|(c, _)| c == sub),
             "audit {sub} has no tamper row"
+        );
+    }
+    // (command, mode) registry: every mode flag a verify command offers has
+    // a row, and every row names a test fn that exists in a test file.
+    let mut paths: Vec<String> = top
+        .iter()
+        .filter(|c| c.starts_with("verify"))
+        .cloned()
+        .collect();
+    paths.extend(
+        audit
+            .iter()
+            .filter(|c| c.contains("verify"))
+            .map(|c| format!("audit {c}")),
+    );
+    for path in &paths {
+        let mut argv: Vec<&str> = path.split(' ').collect();
+        argv.push("--help");
+        let flags = help_flags(&home.run(&[], &argv));
+        for flag in MODE_FLAGS.iter().filter(|f| flags.iter().any(|g| g == *f)) {
+            assert!(
+                VERIFY_MODE_ROWS
+                    .iter()
+                    .any(|(c, m, _)| c == path && m == flag),
+                "{path} {flag} has no (command, mode) row in tests/verify_false_green_8741.rs"
+            );
+        }
+    }
+    let sources = [
+        include_str!("verify_false_green_8741.rs"),
+        include_str!("verify_audit_trail_store_url_prb.rs"),
+    ];
+    for (cmd, flag, test) in VERIFY_MODE_ROWS {
+        let needle = format!("fn {test}(");
+        assert!(
+            sources.iter().any(|src| src.contains(&needle)),
+            "row ({cmd}, {flag}) names {test}, which is not a test fn"
         );
     }
 }
