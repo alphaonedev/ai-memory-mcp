@@ -950,3 +950,155 @@ fn every_verify_command_has_a_tamper_row() {
         );
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// PostgreSQL cell: verify-signed-events-chain through --store-url-file
+// ─────────────────────────────────────────────────────────────────────
+
+#[cfg(feature = "sal-postgres")]
+#[path = "common/pg_barrier.rs"]
+mod pg_barrier;
+
+/// #9179 r1 (backend parity) — `verify-signed-events-chain --store-url-file`
+/// on a live Postgres store: a populated chain is green, a broken link is a
+/// red finding (never green), and the credentialed URL never reaches the
+/// output. Runs on a scratch database it creates and drops.
+#[cfg(feature = "sal-postgres")]
+mod postgres_store_url_file {
+    use super::{EXIT_CHAIN_FAIL, EXIT_OK, Home, both, pg_barrier, write_url_file};
+    use ai_memory::store::postgres::PostgresStore;
+
+    /// Scratch database name prefix for this file.
+    const SCRATCH_PREFIX: &str = "ai_memory_9179vsec";
+    /// Rows appended before the walk (more than one, so a break has a
+    /// predecessor to disagree with).
+    const CHAIN_ROWS: i64 = 4;
+    /// The JSON field that carries the walk's verdict.
+    const CHAIN_HOLDS_TRUE: &str = "\"chain_holds\": true";
+    const CHAIN_HOLDS_FALSE: &str = "\"chain_holds\": false";
+
+    async fn pg_head(pg: &PostgresStore) -> i64 {
+        sqlx::query_scalar("SELECT COALESCE(MAX(sequence), 0) FROM signed_events")
+            .fetch_one(pg.pool())
+            .await
+            .expect("read pg head")
+    }
+
+    #[track_caller]
+    fn assert_no_secret(text: &str, url: &str) {
+        assert!(
+            !text.contains(url),
+            "the store URL must never be echoed verbatim"
+        );
+        // The userinfo (`user:password`) between `://` and `@`.
+        let userinfo = url
+            .split_once("://")
+            .and_then(|(_, rest)| rest.split_once('@'))
+            .map(|(info, _)| info);
+        if let Some(pw) = userinfo
+            .and_then(|info| info.split_once(':'))
+            .map(|(_, pw)| pw)
+            .filter(|pw| !pw.is_empty())
+        {
+            assert!(
+                !text.contains(pw),
+                "the store password must never be echoed"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "live postgres: AI_MEMORY_TEST_POSTGRES_URL (postgres-ignored tier)"]
+    async fn pg_signed_events_chain_store_url_file_cell_9179() {
+        let Ok(url) = std::env::var("AI_MEMORY_TEST_POSTGRES_URL") else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let scratch = pg_barrier::ScratchDb::create(&url, SCRATCH_PREFIX)
+            .await
+            .expect("create scratch database");
+        let scratch_url = scratch.url();
+        let pg = PostgresStore::connect(&scratch_url)
+            .await
+            .expect("connect scratch database");
+        let mut n = 0;
+        while pg_head(&pg).await < CHAIN_ROWS {
+            n += 1;
+            pg.emit_spawn_audit(&format!("argv0-{n}"), "9179-pg-cell")
+                .await;
+        }
+        let home = Home::new(None);
+        let url_file = write_url_file(&home, &scratch_url);
+        let url_file_s = url_file.to_str().expect("utf-8 path").to_string();
+        let argv = [
+            "verify-signed-events-chain",
+            "--store-url-file",
+            url_file_s.as_str(),
+            "--format",
+            "json",
+        ];
+
+        // Green: the populated Postgres chain walks and holds.
+        let out = tokio::task::spawn_blocking({
+            let argv: Vec<String> = argv.iter().map(|s| (*s).to_string()).collect();
+            let home_dir = home.path().to_path_buf();
+            move || run_in(&home_dir, &argv)
+        })
+        .await
+        .expect("join");
+        let text = both(&out);
+        assert_no_secret(&text, &scratch_url);
+        assert_eq!(out.status.code(), Some(EXIT_OK), "green pg chain: {text}");
+        assert!(text.contains(CHAIN_HOLDS_TRUE), "green pg chain: {text}");
+
+        // Red: break the link of the head row (prev_hash no longer names its
+        // predecessor). Triggers are bypassed for this one tamper statement.
+        let mut tx = pg.pool().begin().await.expect("begin");
+        sqlx::query("SET LOCAL session_replication_role = replica")
+            .execute(&mut *tx)
+            .await
+            .expect("bypass append-only triggers");
+        sqlx::query(
+            "UPDATE signed_events SET prev_hash = decode(repeat('ab', 32), 'hex') \
+             WHERE sequence = (SELECT MAX(sequence) FROM signed_events)",
+        )
+        .execute(&mut *tx)
+        .await
+        .expect("tamper head link");
+        tx.commit().await.expect("commit tamper");
+
+        let out = tokio::task::spawn_blocking({
+            let argv: Vec<String> = argv.iter().map(|s| (*s).to_string()).collect();
+            let home_dir = home.path().to_path_buf();
+            move || run_in(&home_dir, &argv)
+        })
+        .await
+        .expect("join");
+        let text = both(&out);
+        assert_no_secret(&text, &scratch_url);
+        assert_eq!(
+            out.status.code(),
+            Some(EXIT_CHAIN_FAIL),
+            "a broken pg chain is red: {text}"
+        );
+        assert!(text.contains(CHAIN_HOLDS_FALSE), "broken pg chain: {text}");
+        pg.pool().close().await;
+        drop(scratch);
+    }
+
+    /// `Home::run` without borrowing the `Home` across the blocking task.
+    fn run_in(home_dir: &std::path::Path, argv: &[String]) -> std::process::Output {
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_ai-memory"));
+        cmd.env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("HOME", home_dir)
+            .env("XDG_CONFIG_HOME", home_dir.join(".config"))
+            .env("AI_MEMORY_KEY_DIR", home_dir.join("keys"))
+            .env("AI_MEMORY_NO_CONFIG", "1")
+            .current_dir(home_dir)
+            .arg("--db")
+            .arg(home_dir.join("store.db"))
+            .args(argv);
+        cmd.output().expect("spawn ai-memory")
+    }
+}
