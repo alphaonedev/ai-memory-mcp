@@ -491,6 +491,11 @@ promote) and refuses depths below
 **round-trip digest guarantee** holds: promote → export → re-register
 produces the IDENTICAL SHA-256 digest as the in-DB row — the lineage
 is preserved cryptographically across promotion and re-registration.
+The promoted skill carries a `_visibility` binding that names the
+promoting principal, so the guarantee holds when that principal
+re-registers; a different principal is refused with a message naming
+the remedies (v1.0.0 #8832, see `docs/agent-skills.md` *Round-trip
+semantics*).
 
 The reflection and every linked source must be readable by the resolved caller
 before promotion renders, audits, signs or registers the bundle (#3551).

@@ -21,6 +21,19 @@ pipeline at the source. Without the round-trip property the promoted
 skill is a one-way deliverable; *with* it, the skill becomes a
 shareable artefact with deterministic, audit-grade provenance.
 
+**A promoted skill is bound to the principal that promoted it (v1.0.0
+#8832).** Promotion stamps `metadata._visibility` with the narrowest
+source scope and the promoting principal, the export keeps that binding,
+and `memory_skill_register` accepts it only when the registering principal
+is that same principal. This recipe re-registers as the promoting agent,
+so the digest matches. Registered under a different principal, the export
+is refused with `metadata '_visibility' is bound to a different
+principal; register it as the principal that promoted it, or promote the
+source reflection again on this node as yourself`. An unbound skill
+(registered from a folder, never promoted) keeps the identical-digest
+guarantee for every principal. See
+[Round-trip semantics](../../docs/agent-skills.md#round-trip-semantics).
+
 ## Why it matters
 
 This is where recursive learning stops being an internal substrate
@@ -138,6 +151,9 @@ Exits `0` if and only if:
 When `COOKBOOK_KEEP_DB=1` is set, the recipe leaves the exported folder
 at `<run-dir>/exported-skill/`. That folder is a complete, portable
 Agent Skill — copy it into any ai-memory deployment's skill registry,
-run `ai-memory memory_skill_register --folder-path <folder>`, and you
-get back the same SHA-256 digest. That digest is the cryptographic
-proof of provenance for the entire promotion lineage.
+run `ai-memory memory_skill_register --folder-path <folder>` as the
+principal that promoted it, and you get back the same SHA-256 digest.
+That digest is the cryptographic proof of provenance for the entire
+promotion lineage. Another principal is refused with the remedy message
+quoted above: register as the promoting principal, or promote the source
+reflection again on that node.

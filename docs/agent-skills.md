@@ -196,6 +196,18 @@ across operating systems, and across the v0.7.0 → v0.8.0 schema
 revisions documented in
 [`docs/MIGRATION_v0.7.md`](MIGRATION_v0.7.html).
 
+**Promoted skills are principal-bound (v1.0.0 #8832).** A skill promoted
+from a reflection carries a `metadata._visibility` scope binding naming
+the promoting principal, and export keeps it so the digest is unchanged.
+The round trip above therefore holds for a promoted skill when the
+re-registering principal is the promoting principal. Registered by a
+DIFFERENT principal, the binding is refused with `memory_skill_register
+refused: metadata '_visibility' is bound to a different principal;
+register it as the principal that promoted it, or promote the source
+reflection again on this node as yourself` (no principal id is echoed).
+A skill without a binding (every hand-authored skill) keeps the
+guarantee for every principal.
+
 `memory_skill_export` appends one `skill.exported` row to the
 append-only `signed_events` audit table on every export, so a
 downstream auditor can re-derive when and by whom a skill was
@@ -241,6 +253,17 @@ content-addressed over the canonical serialisation, node B's
 registered row carries the **identical SHA-256 digest** — pinned
 end-to-end by
 [`tests/cov_17_skills_federation_roundtrip.rs`](../tests/cov_17_skills_federation_roundtrip.rs).
+
+That guarantee is for an unbound skill. A **promoted** skill carries
+the promoting principal's scope binding (see *Round-trip semantics*),
+so on node B it registers with the identical digest only for that same
+principal; registered by a different principal it is refused with the
+message that names both remedies (register it as the promoting
+principal, or promote the source reflection again on node B), and the
+refusal never echoes the other principal's id. Both outcomes and the
+unbound cross-principal digest are pinned by
+`exported_promoted_skill_is_principal_bound_on_reregister_8832` in
+[`tests/skill_scope_integrity_8832_8834.rs`](../tests/skill_scope_integrity_8832_8834.rs).
 
 On the receiving node:
 
@@ -291,11 +314,27 @@ signature over the digest. Failures are fail-closed and exact:
 `… signature invalid for skill <id>` and
 `… signer public key unavailable for skill <id>` (a signed skill
 whose signer has no enrolled key is refused, never read as
-unsigned). `memory_skill_list` omits a row that fails
-verification. The HTTP read routes answer `400` with the
-skill-level text (a resource-level failure renders
-`skill integrity check failed: skill <id>`, never a stored path)
-and `404` for a missing skill or resource.
+unsigned) and `… signing agent named without a signature for
+skill <id>` (a row that names a signer but carries no signature is
+refused, never read as unsigned). A stored `allowed_tools` or
+`metadata` column that does not parse, or a corrupt or oversize
+stored blob, is refused the same way (`skill integrity check
+failed: ...`) instead of being read as empty. A signer is stored only when the
+register call signs the digest (a keypair with no private half
+stores no signer), and the read paths return `signing_agent` only
+for a signature that verified. The visibility check runs before
+any integrity verdict, so a caller who may not read a skill gets
+`skill not found: <id>` even when the row is damaged.
+`memory_skill_list` omits a row that fails verification (with a
+warning in the log) and refuses the whole call with the sanitized
+`internal storage error` when the store itself fails; it filters
+in SQL and returns at most `SKILL_LIST_PAGE_LIMIT` (1000) rows,
+setting `truncated: true` when more matched. The HTTP read routes
+(get, resource, export and compose) share one renderer: `400` with
+the skill-level text (a resource-level failure renders
+`skill integrity check failed: skill <id>`, never a stored path),
+`404` for a missing or hidden skill or resource, and the sanitized
+`500` for a store or decode failure.
 
 **Promoted-skill scope (v1.0.0 #8832).** A skill promoted from a
 reflection takes the NARROWEST scope of its sources: any `private`
@@ -305,7 +344,26 @@ caller. The binding is stored under `metadata._visibility`, is part
 of the digest (only when present, so pre-#8832 digests are
 unchanged), and every read funnel applies the memory visibility
 predicate to it, so private source content is never republished to
-another agent.
+another agent. Keys beginning with `_` are stamped by the substrate.
+`memory_skill_register` (and its CLI and HTTP twins) accepts exactly
+one of them: a top-level `_visibility` binding in the shape promote
+stamps, `{scope: <private|team|unit|org|collective>, agent_id:
+<registering principal>}` with no other key, where the registering
+principal is the authenticated caller (the HTTP admin caller; for MCP
+and the CLI the process identity, `AI_MEMORY_AGENT_ID` first), never a
+request field or the skill body. A binding naming another principal is
+refused with the remedy message above; any other binding shape with
+`memory_skill_register refused: metadata '_visibility' must be exactly
+{"scope": <private|team|unit|org|collective>, "agent_id": <registering
+principal>} with no other key`; and every other reserved key, at any
+depth, with `memory_skill_register refused: metadata carries a reserved
+key (keys beginning with '_' are stamped by the substrate, never
+supplied by the caller; only a top-level '_visibility' binding exported
+for the registering principal is accepted)`. `memory_skill_export`
+keeps the binding (it is digest-bound) and strips every other reserved
+key. The CLI read verbs refuse a set but shape-invalid
+`AI_MEMORY_AGENT_ID` (exit 2) rather than reading as the local
+operator.
 
 The skill-level signature complements (does not replace) the
 forensic-bundle attestation described in
