@@ -14530,7 +14530,7 @@ decision = "allow"
     }
 
     #[tokio::test]
-    async fn prb_run_verify_audit_trail_unrecognised_scheme_errs() {
+    async fn prb_run_verify_audit_trail_unrecognised_scheme_is_finding_9179() {
         let _g = crate::store_url::store_url_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -14543,7 +14543,13 @@ decision = "allow"
         let cfg = crate::config::AppConfig::default();
         let res =
             run_verify_audit_trail(&env.db_path, &prb_args(Some("mysql://h/db")), &cfg, None).await;
-        assert!(res.is_err(), "an unrecognised store-url scheme is refused");
+        // #9179 r1: a reason-coded `store_url_unrecognised` finding (exit 1),
+        // never an untyped error and never green.
+        assert_eq!(
+            res.expect("an unrecognised scheme is a finding, not an error"),
+            crate::cli::verify_audit_trail::EXIT_DIRTY,
+            "an unrecognised store-url scheme is refused with the dirty exit code"
+        );
     }
 
     #[cfg(feature = "sal-postgres")]
