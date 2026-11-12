@@ -2189,8 +2189,14 @@ class ChildCwd7648(SymlinkBase):
         doctor = (REPO / 'src/cli/doctor.rs').read_text()
         refusal = re.search(
             r'pub const MISSING_DATABASE_REFUSAL: &str =\s*"([^"\n]+)";', connection)
-        missing = re.search(
+        # #9175: open_existing_read_only delegates to the ONE shared guard
+        # open_existing_guarded, whose first step is the missing-file refusal.
+        delegates = re.search(
             r'pub fn open_existing_read_only\(path: &Path\) -> Result<Connection> \{\s*'
+            r'open_existing_guarded\(path, ExistingAccess::ReadOnly\)\s*\}', connection)
+        missing = re.search(
+            r'fn open_existing_guarded\(path: &Path, access: ExistingAccess\) -> '
+            r'Result<Connection> \{\s*'
             r'match path\.try_exists\(\) \{\s*'
             r'Ok\(false\) => anyhow::bail!\("([^"\n]+)", '
             r'MISSING_DATABASE_REFUSAL, path\.display\(\)\)', connection)
@@ -2200,7 +2206,7 @@ class ChildCwd7648(SymlinkBase):
             r'Ok\(level\) => Some\(level\),\s*Err\(e\) => \{\s*'
             r'writeln!\(\s*out\.stderr,\s*"([^"\n]+)",\s*path\.display\(\)\s*\)\?;',
             doctor)
-        for match in (refusal, missing, diagnostic):
+        for match in (refusal, delegates, missing, diagnostic):
             self.assertIsNotNone(match, 'Rust diagnostic relationship changed; review the stub')
         path = 'ai-memory.db'
         error = missing.group(1).format(refusal.group(1), path)
