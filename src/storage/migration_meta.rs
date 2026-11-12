@@ -439,11 +439,11 @@ pub const MIGRATION_LADDER: &[MigrationMeta] = &[
     // `CREATE INDEX IF NOT EXISTS` + `INSERT OR IGNORE` on the composite PK make
     // the whole batch re-runnable, so a crash mid-arm self-heals on the next
     // open — idempotent. No full-table rebuild. Settled literal rung;
-    // v101 now owns the moving tip.
+    // v103 now owns the moving tip.
     // Postgres twin is `PostgresStore::migrate_v97`.
     meta(97, "AGENT_PUBKEY_HISTORY", true, true, NoLoss, Sqlite),
     // v98: live/archive namespace alias view; rollback drops the view, NoLoss.
-    // Settled literal rung; v101 now owns the moving tip.
+    // Settled literal rung; v103 now owns the moving tip.
     meta(98, "CANONICAL_INBOX_NAMESPACE", true, true, NoLoss, Sqlite),
     // v99 (#3655): additive `sync_peer_contact` table (durable per-peer
     // contact, apart from the data watermark); rollback drops the table,
@@ -464,6 +464,13 @@ pub const MIGRATION_LADDER: &[MigrationMeta] = &[
     // (`CREATE TABLE/INDEX IF NOT EXISTS`, idempotent). Postgres twin is
     // `PostgresStore::migrate_v101`.
     meta(101, "A2A_TASKS", true, true, NoLoss, Sqlite),
+    // v103 (#9187, v1.0.0): additive `federation_nonce_claims` table (the
+    // (key_fp, nonce_fp) federation nonce claim; the PRIMARY KEY is the
+    // atomic arbiter). Rollback drops the table, NoLoss (the table is new, no
+    // backfill). Re-runnable (`CREATE TABLE IF NOT EXISTS`, idempotent).
+    // Postgres twin is `PostgresStore::migrate_v103`. v102 is reserved for
+    // #9176.
+    meta(103, "FEDERATION_NONCE_CLAIMS", true, true, NoLoss, Sqlite),
 ];
 
 /// Look up the metadata for a target schema version.

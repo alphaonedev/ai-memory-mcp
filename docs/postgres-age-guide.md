@@ -51,9 +51,9 @@ choice. Switch to postgres+AGE when one or more of these is true:
   sharing the same store. Postgres is the supported topology;
   sqlite-over-NFS is not.
 
-The two backends are at **schema parity at v101**
-(`CURRENT_SCHEMA_VERSION = 101` on both ladders — the postgres upgrade
-ladder ends at `migrate_v101()`).
+The two backends are at **schema parity at v103**
+(`CURRENT_SCHEMA_VERSION = 103` on both ladders — the postgres upgrade
+ladder ends at `migrate_v103()`).
 
 **Schema parity is NOT feature parity.** Some postgres ladder arms are
 version-stamp no-ops rather than real DDL, so a matching version number
@@ -345,7 +345,7 @@ What it does (see `src/cli/schema_init.rs`):
    `migrate` verb uses — the open itself runs `INIT_SCHEMA` (the
    bundled `src/store/postgres_schema.sql`, idempotent `CREATE TABLE
    IF NOT EXISTS` throughout) plus the in-process upgrade ladder up to
-   schema v101 (the current `CURRENT_SCHEMA_VERSION`) as a side effect. The
+   schema v103 (the current `CURRENT_SCHEMA_VERSION`) as a side effect. The
    `vector` (pgvector) extension is
    **required** — `CREATE EXTENSION IF NOT EXISTS vector` failing
    aborts the bootstrap.
@@ -367,7 +367,7 @@ What it does (see `src/cli/schema_init.rs`):
    true` in the JSON report).
 4. Enumerates the resulting catalog and prints the human summary
    (tables / indices / views / functions / extensions /
-   `schema_version: 101`) or the `--json` report.
+   `schema_version: 103`) or the `--json` report.
 
 Idempotent on rerun — safe to invoke from a deploy script. Exit code
 0 on success, non-zero on connection / bootstrap failure.
@@ -1437,7 +1437,7 @@ parity test is the gate that prevents it.
 | | sqlite | postgres |
 |---|---|---|
 | Live daemon | ✓ (default) | ✓ (Wave 3) |
-| Schema parity | v101 | v101 (`CURRENT_SCHEMA_VERSION` pinned in lockstep) |
+| Schema parity | v103 | v103 (`CURRENT_SCHEMA_VERSION` pinned in lockstep) |
 | `link()` | ✓ | ✓ (Wave 1 Stream A) |
 | `register_agent()` | ✓ | ✓ (Wave 1 Stream A) |
 | Recall 6-factor scoring (SAL `search`) | ✓ | ✓ (Wave 1 Stream A) |

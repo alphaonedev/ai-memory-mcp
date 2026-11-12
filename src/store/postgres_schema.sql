@@ -1605,14 +1605,11 @@ CREATE TABLE IF NOT EXISTS attested_write_ledger (
 CREATE INDEX IF NOT EXISTS idx_attested_write_ledger_seen_at
     ON attested_write_ledger(seen_at);
 
--- #9140 (v1.0.0) — SHARED FEDERATION NONCE CLAIM. The postgres twin of the
--- sqlite `federation_nonce_cache` (v51): every daemon over this store claims
--- each verified push's (peer_id, nonce) fingerprint here, so a push one daemon
--- accepted is a replay at every sibling. The PRIMARY KEY is the claim (one
--- INSERT ... ON CONFLICT DO NOTHING). Federation nonces carry no freshness
--- window, so rows are never time-pruned; `seq` orders the per-peer bound
--- (the newest FEDERATION_NONCE_CAPACITY_PER_PEER rows per peer are kept).
--- Bootstrap-owned (replayed on every connect), so it needs no ladder arm.
+-- #9140 (v1.0.0) — SUPERSEDED by `federation_nonce_claims` (v103, below);
+-- removed in the C3 commit of #9187, which moves the claim onto the new table.
+-- Until then every daemon over this store claims each verified push's
+-- (peer_id, nonce) fingerprint here (one INSERT ... ON CONFLICT DO NOTHING on
+-- the PRIMARY KEY); `seq` orders the per-peer bound.
 CREATE TABLE IF NOT EXISTS federation_nonce_cache (
     peer_id     TEXT        NOT NULL,
     fingerprint BYTEA       NOT NULL,
@@ -1622,6 +1619,22 @@ CREATE TABLE IF NOT EXISTS federation_nonce_cache (
 );
 CREATE INDEX IF NOT EXISTS idx_federation_nonce_cache_peer_seq
     ON federation_nonce_cache(peer_id, seq);
+
+-- v103 (#9187, v1.0.0) — FEDERATION NONCE CLAIMS. Shape: key_fp BYTEA (the
+-- push's signing-key fingerprint), nonce_fp BYTEA (its nonce fingerprint),
+-- accepted_at TIMESTAMPTZ, PRIMARY KEY (key_fp, nonce_fp). The PRIMARY KEY is
+-- the atomic arbiter: the first INSERT of a pair wins at every daemon over this
+-- store, any later one is a replay. It is the only index. Rows are never
+-- pruned: the replay window is the signing-key lifetime, because the signed
+-- nonce carries no time (see #9234). Ladder-owned by `migrate_v103`
+-- (migrations/postgres/0059_v103_federation_nonce_claims.sql); this bootstrap
+-- copy is the same idempotent CREATE TABLE IF NOT EXISTS.
+CREATE TABLE IF NOT EXISTS federation_nonce_claims (
+    key_fp      BYTEA       NOT NULL,
+    nonce_fp    BYTEA       NOT NULL,
+    accepted_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (key_fp, nonce_fp)
+);
 
 -- v96 (#3344, v1.0.0) — DURABLE EMBED SKIP LIST. Derived cache of rows that
 -- cannot be embedded under the current key material (undecryptable envelope)

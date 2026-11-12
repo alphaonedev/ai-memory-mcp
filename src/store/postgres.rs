@@ -1767,6 +1767,12 @@ const MIGRATION_V100_TITLE_SLOT_LIVE_ROWS: &str =
 const MIGRATION_V101_A2A_TASKS: &str =
     include_str!("../../migrations/postgres/0058_v101_a2a_tasks.sql");
 
+/// v103 (#9187): `federation_nonce_claims`, the federation nonce claim table
+/// keyed `(key_fp, nonce_fp)`. The sqlite twin is `MIGRATION_V103_SQLITE`
+/// (`migrations/sqlite/0086_v103_federation_nonce_claims.sql`).
+const MIGRATION_V103_FEDERATION_NONCE_CLAIMS: &str =
+    include_str!("../../migrations/postgres/0059_v103_federation_nonce_claims.sql");
+
 /// v0.7.0 Cluster G — shadow-mode retention + denormalised `source`
 /// column + compound `(namespace, source, observed_at)` index
 /// supporting the calibration scan (issue #767, PERF-4 + PERF-12).
@@ -2157,7 +2163,13 @@ const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
 //       has carried these since v56, so its v88 is a no-op; doc twins
 //       migrations/{postgres/0045,sqlite/0072}_v88_list_composite_indexes.sql.
 //       CURRENT_SCHEMA_VERSION stays pinned in lockstep with sqlite.
-const CURRENT_SCHEMA_VERSION: i32 = 101;
+// v103 — #9187: `federation_nonce_claims` (key_fp, nonce_fp) claim table,
+//       ladder-owned so the stamp proves the table on every database
+//       whatever binary bootstrapped it. Pure CREATE TABLE IF NOT EXISTS,
+//       no backfill. v102 is reserved for #9176 and slots in before it.
+//       Doc twin: migrations/postgres/0059_v103_federation_nonce_claims.sql.
+//       CURRENT_SCHEMA_VERSION stays pinned in lockstep with sqlite.
+const CURRENT_SCHEMA_VERSION: i32 = 103;
 
 /// PostgreSQL session-scoped advisory lock key used to serialize
 /// concurrent `migrate()` invocations across processes and across
@@ -4330,8 +4342,11 @@ impl PostgresStore {
         if current_version < 100 {
             self.migrate_v100().await?;
         }
-        if current_version < CURRENT_SCHEMA_VERSION {
+        if current_version < 101 {
             self.migrate_v101().await?;
+        }
+        if current_version < CURRENT_SCHEMA_VERSION {
+            self.migrate_v103().await?;
         }
 
         Ok(())
@@ -7531,6 +7546,39 @@ impl PostgresStore {
             target: TRACE_TARGET,
             "schema migration v101 applied (#8444: a2a_tasks - durable Task rows \
              for the Agent2Agent standard binding)"
+        );
+        Ok(())
+    }
+
+    /// v103 (#9187) - `federation_nonce_claims`, the federation nonce claim
+    /// table: the `(key_fp, nonce_fp)` PRIMARY KEY is the atomic arbiter and
+    /// the only index; rows are never pruned (additive, idempotent, no
+    /// backfill, NoLoss).
+    async fn migrate_v103(&self) -> StoreResult<()> {
+        debug_assert!(
+            MIGRATION_V103_FEDERATION_NONCE_CLAIMS.contains("federation_nonce_claims"),
+            "v103 doc twin must create federation_nonce_claims"
+        );
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v103 federation-nonce-claims migration tx", e))?;
+
+        sqlx::raw_sql(MIGRATION_V103_FEDERATION_NONCE_CLAIMS)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("apply v103 federation-nonce-claims migration", e))?;
+
+        record_schema_version(&mut tx, 103).await?;
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v103 migration", e))?;
+
+        tracing::info!(
+            target: TRACE_TARGET,
+            "schema migration v103 applied (#9187: federation_nonce_claims - the \
+             (key_fp, nonce_fp) federation nonce claim table)"
         );
         Ok(())
     }
