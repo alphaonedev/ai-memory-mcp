@@ -2105,7 +2105,12 @@ Conductor's task under
 [**#6063**](https://github.com/alphaonedev/ai-memory-mcp/issues/6063) (WP-B1);
 #9177 only records the firing. The last bound determination is still the
 2026-10-02 re-issue at `385da3a054c4f82bcdfd51ec2d8f07ca4947f9a5`. Gate output
-at this change: GATE_OUTPUT_PENDING.
+at this change: `scripts/check_cert_expiry.py` exits 1 with "neither its STATUS
+line nor its Binds-to line changed (banner VOID - at both ends)". The gate
+compares only the parsed banner word and the Binds-to SHA, so a doc that is
+already VOID cannot record a second firing in a form the gate accepts; the
+Conductor's ruling on that case (the #6063 re-issue, or a gate rule for a
+firing while VOID) is pending, and this record does not work around it.
 
 ---
 
