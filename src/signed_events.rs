@@ -1111,9 +1111,22 @@ pub struct ChainVerificationReport {
     /// row DEMOTED because a recorder key is now enrolled (C2). Empty in the
     /// legacy posture (no recorder key enrolled).
     pub role_separation_failures: Vec<i64>,
+    /// #9162 — one `(sequence, reason)` per entry of `signature_failures`, in
+    /// the same order, with the reason from [`SignatureFailure::reason_code`]
+    /// (`daemon_signature`, `self_signed_signature`, `self_signed_unverifiable`).
+    /// Parallel to `signature_failures`, which keeps its shape.
+    pub signature_failure_reasons: Vec<(i64, &'static str)>,
 }
 
 impl ChainVerificationReport {
+    /// #9162 — the per-row signature reasons for an operator surface (see
+    /// [`operator_signature_reasons`]); the field keeps the exact
+    /// [`SignatureFailure::reason_code`]s.
+    #[must_use]
+    pub fn signature_failure_reasons(&self) -> Vec<(i64, &'static str)> {
+        operator_signature_reasons(&self.signature_failure_reasons)
+    }
+
     /// `true` when the cross-row chain held end-to-end. Per-row
     /// signature failures are surfaced separately because they are a
     /// disjoint property (a chain break is structurally worse than a
@@ -1183,6 +1196,32 @@ pub enum SignatureFailure {
     /// v0.9.0 G9 (C2) — a `daemon_signed` governance row DEMOTED once a recorder
     /// key is enrolled. A role-separation failure.
     DaemonRoleDemotion,
+    /// #9162 — a `self_signed` `memory_link.created` row whose link signature
+    /// does not verify against its observer's enrolled key over the canonical
+    /// link CBOR: a stripped or malformed signature, a rewritten `payload_hash`
+    /// or `agent_id`, or a rewritten link row. On the `signature_failure` axis.
+    SelfSignedSignature,
+    /// #9162 — a `self_signed` `memory_link.created` row that cannot be
+    /// verified: no link pre-image resolves for it, the link names no observer,
+    /// or the observer has no enrolled public key. Never `Verified`, never a
+    /// silent skip; on the `signature_failure` axis.
+    SelfSignedUnverifiable,
+}
+
+impl SignatureFailure {
+    /// Stable machine reason for this failure, printed by the verify CLIs and
+    /// carried in [`ChainVerificationReport::signature_failure_reasons`]. The
+    /// strings are a public contract: never rename one.
+    #[must_use]
+    pub const fn reason_code(&self) -> &'static str {
+        match self {
+            SignatureFailure::DaemonSignature => "daemon_signature",
+            SignatureFailure::RecorderVerification => "recorder_verification",
+            SignatureFailure::DaemonRoleDemotion => "daemon_role_demotion",
+            SignatureFailure::SelfSignedSignature => "self_signed_signature",
+            SignatureFailure::SelfSignedUnverifiable => "self_signed_unverifiable",
+        }
+    }
 }
 
 /// v1.0.0 L4 (PR-3) — TRI-STATE per-row Ed25519 verdict. Every row the chain
@@ -1216,15 +1255,30 @@ impl RowSignatureVerdict {
         matches!(self, RowSignatureVerdict::Verified)
     }
 
-    /// Legacy `signature_failure` axis — a daemon/audit signature that did not
-    /// verify. Preserved so [`AuditTrailReport::signature_failures`] is
-    /// byte-identical to the pre-tri-state behaviour.
+    /// `signature_failure` axis — a daemon/audit signature that did not verify,
+    /// or (#9162) a `self_signed` link row that failed or could not be verified
+    /// against its observer key. Daemon rows are byte-identical to the
+    /// pre-tri-state behaviour.
     #[must_use]
     pub fn signature_failure(self) -> bool {
         matches!(
             self,
-            RowSignatureVerdict::Failed(SignatureFailure::DaemonSignature)
+            RowSignatureVerdict::Failed(
+                SignatureFailure::DaemonSignature
+                    | SignatureFailure::SelfSignedSignature
+                    | SignatureFailure::SelfSignedUnverifiable
+            )
         )
+    }
+
+    /// #9162 — the stable reason of a `signature_failure` row, `None` for every
+    /// verdict off that axis (verified, skipped, role-separation).
+    #[must_use]
+    pub fn signature_failure_reason(self) -> Option<&'static str> {
+        match self {
+            RowSignatureVerdict::Failed(f) if self.signature_failure() => Some(f.reason_code()),
+            _ => None,
+        }
     }
 
     /// v0.9.0 G9 role-separation axis — a recorder-verify failure OR a C2
@@ -1252,11 +1306,294 @@ impl RowSignatureVerdict {
 ///   once a recorder key is enrolled (C2);
 /// - every other row routes to the legacy daemon verifier (#1071 / #1452),
 ///   byte-identical to the pre-G9 behaviour.
+///
+/// #9162 — a `self_signed` `memory_link.created` row has no link pre-image on
+/// this path, so it is `Failed(SelfSignedUnverifiable)` (never `Verified`, never
+/// a skip). A walk that can read the link rows calls
+/// [`classify_row_signature_with_links`] instead.
 #[must_use]
 pub fn classify_row_signature(
     event: &SignedEvent,
     daemon_verifier: Option<&ed25519_dalek::VerifyingKey>,
     recorder_verifier: Option<&ed25519_dalek::VerifyingKey>,
+) -> RowSignatureVerdict {
+    classify_row_signature_with_links(event, daemon_verifier, recorder_verifier, None)
+}
+
+/// #9162 — `true` for the rows the `self_signed` arm owns: a
+/// `memory_link.created` row at `attest_level = self_signed`, signed by the
+/// link OBSERVER key over the canonical link CBOR (the `storage::create_link`
+/// outbound and inbound writers), never by the daemon key. Other `self_signed`
+/// rows (the offload audit row) keep the legacy daemon arm.
+#[must_use]
+pub fn is_self_signed_link_row(event: &SignedEvent) -> bool {
+    event.attest_level == crate::models::AttestLevel::SelfSigned.as_str()
+        && event.event_type == event_types::MEMORY_LINK_CREATED
+}
+
+/// #9162 — the link pre-image of a `self_signed` `memory_link.created` row as
+/// it is stored in `memory_links` / `archived_memory_links`: the seven
+/// [`crate::identity::sign::SignableLink`] fields plus the stored signature.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SelfSignedLinkRow {
+    pub source_id: String,
+    pub target_id: String,
+    pub relation: String,
+    pub observed_by: Option<String>,
+    pub created_at: Option<String>,
+    pub valid_from: Option<String>,
+    pub valid_until: Option<String>,
+    /// The link's stored signature. `None` once `invalidate_link` cleared it.
+    pub signature: Option<Vec<u8>>,
+}
+
+impl SelfSignedLinkRow {
+    /// The signable view with `valid_until` replaced by `valid_until`.
+    fn signable<'a>(
+        &'a self,
+        valid_until: Option<&'a str>,
+    ) -> crate::identity::sign::SignableLink<'a> {
+        crate::identity::sign::SignableLink {
+            src_id: &self.source_id,
+            dst_id: &self.target_id,
+            relation: &self.relation,
+            observed_by: self.observed_by.as_deref(),
+            created_at: self.created_at.as_deref(),
+            valid_from: self.valid_from.as_deref(),
+            valid_until,
+        }
+    }
+
+    /// The `valid_until` values the CREATE-time pre-image may have carried: the
+    /// stored value, then `None`, because `invalidate_link` stamps
+    /// `valid_until` AFTER the `memory_link.created` row committed to `None`.
+    fn valid_until_candidates(&self) -> Vec<Option<&str>> {
+        match self.valid_until.as_deref() {
+            Some(stored) => vec![Some(stored), None],
+            None => vec![None],
+        }
+    }
+
+    /// The CREATE-time signable whose canonical CBOR hashes to `payload_hash`,
+    /// or `None` when no candidate does (the row or the link was rewritten).
+    fn signable_for_payload_hash(
+        &self,
+        want: &[u8],
+    ) -> Option<crate::identity::sign::SignableLink<'_>> {
+        self.valid_until_candidates()
+            .into_iter()
+            .map(|vu| self.signable(vu))
+            .find(|s| {
+                crate::identity::sign::canonical_cbor(s)
+                    .is_ok_and(|cbor| payload_hash(&cbor).as_slice() == want)
+            })
+    }
+}
+
+/// #9162 — every link pre-image a verify walk can resolve a `self_signed` row
+/// against, indexed by the CREATE-time `payload_hash` and by the stored
+/// signature. Built once per walk, linear in the link rows; each lookup is O(1).
+#[derive(Debug, Clone, Default)]
+pub struct SelfSignedLinkIndex {
+    links: Vec<SelfSignedLinkRow>,
+    by_payload_hash: std::collections::HashMap<Vec<u8>, usize>,
+    by_signature: std::collections::HashMap<Vec<u8>, usize>,
+}
+
+impl SelfSignedLinkIndex {
+    /// Index `rows`. A row whose canonical CBOR cannot be encoded is still
+    /// reachable by its signature (and then fails the payload binding).
+    #[must_use]
+    pub fn from_rows(rows: impl IntoIterator<Item = SelfSignedLinkRow>) -> Self {
+        let mut index = Self::default();
+        for row in rows {
+            let pos = index.links.len();
+            for vu in row.valid_until_candidates() {
+                if let Ok(cbor) = crate::identity::sign::canonical_cbor(&row.signable(vu)) {
+                    index
+                        .by_payload_hash
+                        .entry(payload_hash(&cbor))
+                        .or_insert(pos);
+                }
+            }
+            if let Some(sig) = row.signature.as_ref().filter(|s| !s.is_empty()) {
+                index.by_signature.entry(sig.clone()).or_insert(pos);
+            }
+            index.links.push(row);
+        }
+        index
+    }
+
+    /// The link pre-image of `event`: by `payload_hash` first, then by the
+    /// row's signature (which still finds a link whose row or `payload_hash`
+    /// was rewritten, so the rewrite fails rather than going unresolved).
+    #[must_use]
+    pub fn find(&self, event: &SignedEvent) -> Option<&SelfSignedLinkRow> {
+        self.by_payload_hash
+            .get(&event.payload_hash)
+            .or_else(|| {
+                event
+                    .signature
+                    .as_ref()
+                    .and_then(|sig| self.by_signature.get(sig))
+            })
+            .and_then(|&pos| self.links.get(pos))
+    }
+}
+
+/// #9162 — the pure `self_signed` verdict for one `memory_link.created` row,
+/// given its resolved link pre-image and its observer's enrolled key. Shared by
+/// every backend so the verdict for the same inputs is identical.
+///
+/// - stripped / malformed signature, `agent_id` other than the link observer, a
+///   `payload_hash` no CREATE-time pre-image hashes to, or a signature that
+///   does not verify -> `Failed(SelfSignedSignature)`;
+/// - no link pre-image, no observer, or no enrolled observer key ->
+///   `Failed(SelfSignedUnverifiable)`;
+/// - otherwise `Verified`.
+#[must_use]
+pub fn classify_self_signed_link(
+    event: &SignedEvent,
+    link: Option<&SelfSignedLinkRow>,
+    observer_key: Option<&ed25519_dalek::VerifyingKey>,
+) -> RowSignatureVerdict {
+    const SIGNATURE_FAILED: RowSignatureVerdict =
+        RowSignatureVerdict::Failed(SignatureFailure::SelfSignedSignature);
+    const UNVERIFIABLE: RowSignatureVerdict =
+        RowSignatureVerdict::Failed(SignatureFailure::SelfSignedUnverifiable);
+    let Some(sig) = event
+        .signature
+        .as_deref()
+        .filter(|s| s.len() == crate::identity::verify::SIGNATURE_LEN)
+    else {
+        return SIGNATURE_FAILED;
+    };
+    let Some(link) = link else {
+        return UNVERIFIABLE;
+    };
+    let Some(observer) = link.observed_by.as_deref() else {
+        return UNVERIFIABLE;
+    };
+    if observer != event.agent_id {
+        return SIGNATURE_FAILED;
+    }
+    let Some(key) = observer_key else {
+        return UNVERIFIABLE;
+    };
+    let Some(signable) = link.signable_for_payload_hash(&event.payload_hash) else {
+        return SIGNATURE_FAILED;
+    };
+    match crate::identity::verify::verify(key, &signable, sig) {
+        Ok(()) => RowSignatureVerdict::Verified,
+        Err(_) => SIGNATURE_FAILED,
+    }
+}
+
+/// #9162 — the per-walk `self_signed` resolver: the link index plus the
+/// observer-key lookup (production: [`crate::identity::verify::lookup_peer_public_key`],
+/// the key store the link verify path uses), cached per observer.
+pub struct SelfSignedLinkVerifier<'k> {
+    index: SelfSignedLinkIndex,
+    key_lookup: &'k dyn Fn(&str) -> Option<ed25519_dalek::VerifyingKey>,
+    key_cache: std::collections::HashMap<String, Option<ed25519_dalek::VerifyingKey>>,
+}
+
+impl<'k> SelfSignedLinkVerifier<'k> {
+    #[must_use]
+    pub fn new(
+        index: SelfSignedLinkIndex,
+        key_lookup: &'k dyn Fn(&str) -> Option<ed25519_dalek::VerifyingKey>,
+    ) -> Self {
+        Self {
+            index,
+            key_lookup,
+            key_cache: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Classify one `self_signed` link row via [`classify_self_signed_link`].
+    pub fn classify(&mut self, event: &SignedEvent) -> RowSignatureVerdict {
+        let link = self.index.find(event);
+        let key = match link.and_then(|l| l.observed_by.as_deref()) {
+            Some(observer) => {
+                let lookup = self.key_lookup;
+                *self
+                    .key_cache
+                    .entry(observer.to_string())
+                    .or_insert_with(|| lookup(observer))
+            }
+            None => None,
+        };
+        classify_self_signed_link(event, link, key.as_ref())
+    }
+}
+
+/// #9162 — the tables whose rows are `self_signed` link pre-images. A link
+/// moved to `archived_memory_links` keeps its attestation.
+const SELF_SIGNED_LINK_TABLES: [&str; 2] = ["memory_links", "archived_memory_links"];
+
+/// #9162 — read every link row that can be the pre-image of a `self_signed`
+/// `memory_link.created` row (a stored signature, or a `valid_until` stamped by
+/// an invalidation that cleared it). A table absent from this schema
+/// contributes nothing.
+///
+/// # Errors
+///
+/// Returns the `rusqlite` error of the schema probe or the SELECT.
+pub fn load_self_signed_link_index(conn: &Connection) -> Result<SelfSignedLinkIndex> {
+    use rusqlite::OptionalExtension;
+    let mut rows: Vec<SelfSignedLinkRow> = Vec::new();
+    for table in SELF_SIGNED_LINK_TABLES {
+        let present: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                params![table],
+                |r| r.get(0),
+            )
+            .optional()
+            .context("self_signed link index: schema probe")?;
+        if present.is_none() {
+            continue;
+        }
+        let sql = format!(
+            "SELECT source_id, target_id, relation, observed_by, created_at, valid_from, \
+                    valid_until, signature \
+             FROM {table} WHERE signature IS NOT NULL OR valid_until IS NOT NULL"
+        );
+        let mut stmt = conn
+            .prepare(&sql)
+            .context("self_signed link index: prepare")?;
+        let mapped = stmt
+            .query_map([], |r| {
+                Ok(SelfSignedLinkRow {
+                    source_id: r.get(0)?,
+                    target_id: r.get(1)?,
+                    relation: r.get(2)?,
+                    observed_by: r.get(3)?,
+                    created_at: r.get(4)?,
+                    valid_from: r.get(5)?,
+                    valid_until: r.get(6)?,
+                    signature: r.get(7)?,
+                })
+            })
+            .context("self_signed link index: query")?;
+        for row in mapped {
+            rows.push(row.context("self_signed link index: row")?);
+        }
+    }
+    Ok(SelfSignedLinkIndex::from_rows(rows))
+}
+
+/// [`classify_row_signature`] plus the #9162 `self_signed` arm: a
+/// `memory_link.created` row at `attest_level = self_signed` is verified by
+/// `self_signed_links` against its observer key over the canonical link CBOR,
+/// never against the daemon pin. `None` resolver -> `Failed(SelfSignedUnverifiable)`.
+#[must_use]
+pub fn classify_row_signature_with_links(
+    event: &SignedEvent,
+    daemon_verifier: Option<&ed25519_dalek::VerifyingKey>,
+    recorder_verifier: Option<&ed25519_dalek::VerifyingKey>,
+    self_signed_links: Option<&mut SelfSignedLinkVerifier<'_>>,
 ) -> RowSignatureVerdict {
     use crate::models::AttestLevel;
     if event.attest_level == AttestLevel::LineageSigned.as_str() {
@@ -1276,6 +1613,14 @@ pub fn classify_row_signature(
         // stops being a free pass — it is `unverified` → dirty. See
         // [`SignatureCheck`].
         return RowSignatureVerdict::Skipped(SkipReason::LineageWitness);
+    }
+    if is_self_signed_link_row(event) {
+        // #9162 — an observer-signed link row is never checked against the
+        // daemon pin; without a link resolver it fails closed.
+        return match self_signed_links {
+            Some(verifier) => verifier.classify(event),
+            None => RowSignatureVerdict::Failed(SignatureFailure::SelfSignedUnverifiable),
+        };
     }
     if event.attest_level == AttestLevel::RecorderSigned.as_str() {
         // RECORDER-signed row (C6: withhold when no recorder pubkey enrolled).
@@ -1365,6 +1710,25 @@ pub fn verify_chain(
     since_sequence: Option<i64>,
     audit_pubkey: Option<&ed25519_dalek::VerifyingKey>,
 ) -> Result<ChainVerificationReport> {
+    verify_chain_with_key_lookup(
+        conn,
+        since_sequence,
+        audit_pubkey,
+        &crate::identity::verify::lookup_peer_public_key,
+    )
+}
+
+/// [`verify_chain`] with the #9162 observer-key lookup injected (production
+/// passes [`crate::identity::verify::lookup_peer_public_key`]; tests pass a
+/// fixed key set). The `self_signed` link index is read lazily, on the first
+/// `self_signed` `memory_link.created` row, so a chain without one never
+/// touches the link tables.
+pub(crate) fn verify_chain_with_key_lookup(
+    conn: &Connection,
+    since_sequence: Option<i64>,
+    audit_pubkey: Option<&ed25519_dalek::VerifyingKey>,
+    key_lookup: &dyn Fn(&str) -> Option<ed25519_dalek::VerifyingKey>,
+) -> Result<ChainVerificationReport> {
     let lower = since_sequence.unwrap_or(0);
     let mut stmt = conn
         .prepare(
@@ -1407,8 +1771,10 @@ pub fn verify_chain(
             .ok()
             .flatten();
     let mut signature_failures: Vec<i64> = Vec::new();
+    let mut signature_failure_reasons: Vec<(i64, &'static str)> = Vec::new();
     let mut role_separation_failures: Vec<i64> = Vec::new();
     let mut rows_positively_verified: u64 = 0;
+    let mut self_signed_links: Option<SelfSignedLinkVerifier<'_>> = None;
 
     let mut expected_seq = lower + 1;
     let mut prev_canonical_hash: [u8; 32] = ZERO_HASH;
@@ -1496,12 +1862,25 @@ pub fn verify_chain(
         // the postgres verify twin (C7) surface IDENTICAL signature_failures +
         // role_separation_failures (K3 parity). A signature failure is disjoint
         // from a chain break by design (per-row forgery vs substrate tamper).
-        let rv = classify_row_signature(&event, verifier, recorder_verifier.as_ref());
+        // #9162 — a `self_signed` link row resolves against the link tables.
+        if self_signed_links.is_none() && is_self_signed_link_row(&event) {
+            self_signed_links = Some(SelfSignedLinkVerifier::new(
+                load_self_signed_link_index(conn)?,
+                key_lookup,
+            ));
+        }
+        let rv = classify_row_signature_with_links(
+            &event,
+            verifier,
+            recorder_verifier.as_ref(),
+            self_signed_links.as_mut(),
+        );
         if rv.is_verified() {
             rows_positively_verified += 1;
         }
-        if rv.signature_failure() {
+        if let Some(reason) = rv.signature_failure_reason() {
             signature_failures.push(event.sequence);
+            signature_failure_reasons.push((event.sequence, reason));
         }
         if rv.role_separation_failure() {
             role_separation_failures.push(event.sequence);
@@ -1522,6 +1901,7 @@ pub fn verify_chain(
         chain_break,
         signature_failures,
         role_separation_failures,
+        signature_failure_reasons,
     })
 }
 
@@ -2307,6 +2687,74 @@ pub struct AuditTrailReport {
     /// is dirty. Populated IDENTICALLY by both backends via the SHARED
     /// [`compute_signature_verdict`] (K3 parity). See [`SignatureCheck`].
     pub signature_check: SignatureCheck,
+    /// #9162 — one `(sequence, reason_code)` per `signature_failures` entry,
+    /// same order (see [`SignatureFailure::reason_code`]). Not on the wire.
+    #[serde(skip)]
+    pub signature_failure_reasons: Vec<(i64, &'static str)>,
+    /// #8741 — the trusted off-table watermark head, `Some` only when
+    /// `truncation` is [`TruncationCheck::NotDetected`] (see
+    /// [`truncation_verdict`]). Omitted from the JSON when `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub anchored_head: Option<i64>,
+}
+
+impl AuditTrailReport {
+    /// #9162 — the per-row signature reasons for an operator surface:
+    /// `self_signed_signature` / `self_signed_unverifiable` as recorded, every
+    /// other signature failure as [`SIGNATURE_FAILED_REASON`].
+    #[must_use]
+    pub fn signature_failure_reasons(&self) -> Vec<(i64, &'static str)> {
+        operator_signature_reasons(&self.signature_failure_reasons)
+    }
+}
+
+/// #9162 — the operator-surface reason of a present-signature failure that is
+/// not one of the `self_signed` reasons.
+pub const SIGNATURE_FAILED_REASON: &str = "signature_failed";
+
+/// #9162 — map recorded [`SignatureFailure::reason_code`]s to the operator
+/// surface: the `self_signed` reasons pass through, the rest collapse to
+/// [`SIGNATURE_FAILED_REASON`]. Shared by both report types (and so by both
+/// backends).
+#[must_use]
+pub fn operator_signature_reasons(recorded: &[(i64, &'static str)]) -> Vec<(i64, &'static str)> {
+    const SELF_SIGNED_SIGNATURE: &str = SignatureFailure::SelfSignedSignature.reason_code();
+    const SELF_SIGNED_UNVERIFIABLE: &str = SignatureFailure::SelfSignedUnverifiable.reason_code();
+    recorded
+        .iter()
+        .map(|&(seq, code)| match code {
+            SELF_SIGNED_SIGNATURE | SELF_SIGNED_UNVERIFIABLE => (seq, code),
+            _ => (seq, SIGNATURE_FAILED_REASON),
+        })
+        .collect()
+}
+
+/// v0.8.1 #1850 / #8741 — the off-table tail-truncation verdict, SHARED by the
+/// sqlite and postgres `verify_audit_trail` twins, plus the trusted watermark
+/// head (`Some` only when the verdict is `NotDetected`).
+///
+/// - in-DB head below the anchor -> `Detected` (CONVICT on the raw,
+///   unauthenticated anchor: a stripped signature never suppresses it);
+/// - anchor authenticated (or no pin enrolled) -> `NotDetected`;
+/// - pin enrolled but the anchor did not authenticate -> `Unknown` (L7
+///   withhold); no anchor -> `Unknown`.
+#[must_use]
+pub fn truncation_verdict(
+    watermark_head: Option<i64>,
+    head_sequence: i64,
+    exonerate_ok: bool,
+) -> (TruncationCheck, Option<i64>) {
+    match watermark_head {
+        Some(anchored_head) if head_sequence < anchored_head => (
+            TruncationCheck::Detected {
+                anchored_head,
+                db_head: head_sequence,
+            },
+            None,
+        ),
+        Some(anchored_head) if exonerate_ok => (TruncationCheck::NotDetected, Some(anchored_head)),
+        Some(_) | None => (TruncationCheck::Unknown, None),
+    }
 }
 
 impl AuditTrailReport {
@@ -2498,27 +2946,12 @@ pub fn verify_audit_trail(
         audit_pubkey,
         watermark_db_id.as_deref(),
     );
-    let truncation =
-        match crate::governance::audit::last_audit_watermark(watermark_db_id.as_deref()) {
-            Some((anchored_head, _head_canonical_hash)) => {
-                if head_sequence < anchored_head {
-                    // CONVICT on the raw (unauthenticated) anchor — a stripped
-                    // signature must never SUPPRESS a truncation conviction.
-                    TruncationCheck::Detected {
-                        anchored_head,
-                        db_head: head_sequence,
-                    }
-                } else if exonerate_ok {
-                    TruncationCheck::NotDetected
-                } else {
-                    // L7 — a pin is enrolled but the anchor did not authenticate:
-                    // WITHHOLD the clean bill of health rather than exonerate on
-                    // unauthenticated evidence.
-                    TruncationCheck::Unknown
-                }
-            }
-            None => TruncationCheck::Unknown,
-        };
+    let (truncation, anchored_head) = truncation_verdict(
+        crate::governance::audit::last_audit_watermark(watermark_db_id.as_deref())
+            .map(|(anchored, _head_canonical_hash)| anchored),
+        head_sequence,
+        exonerate_ok,
+    );
 
     // Resolve the RFC3339 `since` timestamp to a sequence FLOOR: the
     // max sequence of any row strictly BEFORE the window. `verify_chain`
@@ -2758,6 +3191,8 @@ pub fn verify_audit_trail(
         head_hash,
         cause_binding,
         signature_failures: report.signature_failures.clone(),
+        signature_failure_reasons: report.signature_failure_reasons.clone(),
+        anchored_head,
         role_separation,
         lineage,
         rollback,
@@ -3580,6 +4015,8 @@ mod tests {
                 checked: 1,
                 unverified: 0,
             },
+            signature_failure_reasons: Vec::new(),
+            anchored_head: None,
         };
         assert!(report.is_clean(), "baseline report must be clean");
         report.head_hash = HeadHashCheck::Mismatch {
@@ -4347,3 +4784,8 @@ mod tests {
         ));
     }
 }
+
+/// #9162 — the `self_signed` link-row verify arm, red-first.
+#[cfg(test)]
+#[path = "signed_events_self_signed_tests.rs"]
+mod self_signed_tests;
