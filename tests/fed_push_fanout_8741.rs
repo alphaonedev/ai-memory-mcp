@@ -31,10 +31,11 @@
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use ai_memory::config::{FeatureTier, ResolvedScoring, ResolvedTtl};
+use ai_memory::federation::push_dlq::{FederationDlqSink, SqliteDlqSink};
 use ai_memory::federation::{FederationConfig, PeerEndpoint};
 use ai_memory::handlers::routes;
 use ai_memory::handlers::{ApiKeyState, AppState, Db, StorageBackend};
@@ -72,6 +73,17 @@ const APPROVE_DECISION_BODY: &str = r#"{"decision":"approve","remember":"once"}"
 /// The certified-tier marker (#2548, `cert-postgres-age.yml`): with it set a
 /// PostgreSQL cell that cannot run is a failure, never a skip.
 const CERT_TIER_MARKER: &str = "AI_MEMORY_TEST_AGE_URL";
+/// Round 2 LOW-3 — a peer whose `max_page_size` is below the origin's
+/// deletion chunk ([`ai_memory::handlers::MAX_BULK_SIZE`]): config enforces
+/// no minimum, so a forget of [`FORGET_VICTIMS`] rows exceeds this peer's
+/// per-request deletions cap.
+const CAPPED_PEER_MAX_PAGE: usize = FORGET_VICTIMS - 1;
+/// The mock peer's "no deletions cap" setting.
+const UNCAPPED: usize = usize::MAX;
+/// The peer id the single-peer federation config names.
+const PEER_ID: &str = "peer-0";
+/// How many pending DLQ rows a cell reads back (well above any cell's rows).
+const DLQ_READ_LIMIT: usize = 64;
 
 // ---------------------------------------------------------------------------
 // Recording mock peer with a fail switch
@@ -82,6 +94,14 @@ struct MockPeer {
     url: String,
     recorded: Arc<Mutex<Vec<Value>>>,
     fail: Arc<AtomicBool>,
+    /// The receiver's per-request deletions cap ([`UNCAPPED`] = none).
+    deletions_cap: Arc<AtomicUsize>,
+}
+
+/// The receiver's exact refusal for a push over its deletions cap
+/// (`handlers::federation_receive`, the `max_page_size` bound).
+fn deletions_cap_refusal(cap: usize) -> String {
+    format!("sync_push limited to {cap} deletions per request")
 }
 
 async fn spawn_peer() -> MockPeer {
@@ -91,6 +111,7 @@ async fn spawn_peer() -> MockPeer {
     struct PeerState {
         recorded: Arc<Mutex<Vec<Value>>>,
         fail: Arc<AtomicBool>,
+        deletions_cap: Arc<AtomicUsize>,
     }
 
     async fn handler(
@@ -99,6 +120,17 @@ async fn spawn_peer() -> MockPeer {
     ) -> (StatusCode, AxumJson<Value>) {
         if state.fail.load(Ordering::Acquire) {
             return (PEER_FAIL_STATUS, AxumJson(json!({"error": "peer down"})));
+        }
+        let cap = state.deletions_cap.load(Ordering::Acquire);
+        if payload
+            .get("deletions")
+            .and_then(Value::as_array)
+            .is_some_and(|d| d.len() > cap)
+        {
+            return (
+                StatusCode::BAD_REQUEST,
+                AxumJson(json!({"error": deletions_cap_refusal(cap)})),
+            );
         }
         state.recorded.lock().await.push(payload);
         (
@@ -109,11 +141,13 @@ async fn spawn_peer() -> MockPeer {
 
     let recorded: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
     let fail = Arc::new(AtomicBool::new(false));
+    let deletions_cap = Arc::new(AtomicUsize::new(UNCAPPED));
     let app = Router::new()
         .route(routes::SYNC_PUSH, post(handler))
         .with_state(PeerState {
             recorded: recorded.clone(),
             fail: fail.clone(),
+            deletions_cap: deletions_cap.clone(),
         });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -126,10 +160,14 @@ async fn spawn_peer() -> MockPeer {
         url: format!("http://{addr}"),
         recorded,
         fail,
+        deletions_cap,
     }
 }
 
-fn federation_cfg(peer: &MockPeer) -> FederationConfig {
+fn federation_cfg(
+    peer: &MockPeer,
+    dlq_sink: Option<Arc<dyn FederationDlqSink>>,
+) -> FederationConfig {
     let _ =
         ai_memory::governance::wire_check::GOVERNANCE_PRE_ACTION.set(Box::new(|_action| Ok(())));
     let client = reqwest::Client::builder()
@@ -147,14 +185,14 @@ fn federation_cfg(peer: &MockPeer) -> FederationConfig {
     FederationConfig {
         policy,
         peers: vec![PeerEndpoint {
-            id: "peer-0".to_string(),
+            id: PEER_ID.to_string(),
             sync_push_url: format!("{}{}", peer.url, routes::SYNC_PUSH),
         }],
         client,
         sender_agent_id: ADMIN_AGENT.to_string(),
         api_key: None,
         signing_key: None,
-        dlq_sink: None,
+        dlq_sink,
     }
 }
 
@@ -254,9 +292,29 @@ fn process_setup() {
 
 /// `None` when the backend is not available in this run (PG URL unset).
 async fn origin(backend: Backend) -> Option<Origin> {
+    origin_with(backend, None).await
+}
+
+/// [`origin`] with a dead-letter sink wired into the federation config.
+async fn origin_with(
+    backend: Backend,
+    dlq_sink: Option<Arc<dyn FederationDlqSink>>,
+) -> Option<Origin> {
+    let default_timeout =
+        std::time::Duration::from_secs(ai_memory::config::DEFAULT_REQUEST_TIMEOUT_SECS);
+    origin_timed(backend, dlq_sink, default_timeout).await
+}
+
+/// [`origin_with`] on a router whose request timeout is `request_timeout`
+/// (the operator-configurable `build_router_with_timeout` knob).
+async fn origin_timed(
+    backend: Backend,
+    dlq_sink: Option<Arc<dyn FederationDlqSink>>,
+    request_timeout: std::time::Duration,
+) -> Option<Origin> {
     process_setup();
     let peer = spawn_peer().await;
-    let fed = federation_cfg(&peer);
+    let fed = federation_cfg(&peer, dlq_sink);
     let ns = format!("fedpush-8741-{}", uuid::Uuid::new_v4());
     match backend {
         Backend::Sqlite => {
@@ -272,9 +330,10 @@ async fn origin(backend: Backend) -> Option<Origin> {
             let store: Arc<dyn ai_memory::store::MemoryStore> = Arc::new(
                 ai_memory::store::sqlite::SqliteStore::open(&path).expect("SqliteStore::open"),
             );
-            let router = ai_memory::build_router(
+            let router = ai_memory::build_router_with_timeout(
                 api_key_state(),
                 app_state(db, store.clone(), backend, fed),
+                request_timeout,
             );
             Some(Origin {
                 router,
@@ -299,9 +358,10 @@ async fn origin(backend: Backend) -> Option<Origin> {
                     .await
                     .expect("PostgresStore::connect"),
             );
-            let router = ai_memory::build_router(
+            let router = ai_memory::build_router_with_timeout(
                 api_key_state(),
                 app_state(db, store.clone(), backend, fed),
+                request_timeout,
             );
             Some(Origin {
                 router,
@@ -392,7 +452,7 @@ impl Origin {
                 },
             )
             .await
-            .ok();
+            .expect("register the decider agent (the Human-arm gate needs it)");
         let title = format!("pending-8741-{}", uuid::Uuid::new_v4());
         let payload = json!({
             "id": uuid::Uuid::new_v4().to_string(),
@@ -674,24 +734,10 @@ async fn run_extra(o: &Origin, op: Op, peer_down: bool) -> Option<(StatusCode, V
         ),
         Op::Import => {
             let now = chrono::Utc::now().to_rfc3339();
-            let mk = |t: &str| {
-                json!({
-                    "id": uuid::Uuid::new_v4().to_string(),
-                    "tier": "mid",
-                    "namespace": ns,
-                    "title": format!("{t}-{}", uuid::Uuid::new_v4()),
-                    "content": format!("{t} imported body with enough length"),
-                    "tags": [],
-                    "priority": 5,
-                    "confidence": 1.0,
-                    "source": "import",
-                    "access_count": 0,
-                    "created_at": now,
-                    "updated_at": now,
-                    "metadata": {},
-                })
-            };
-            let (a, b) = (mk("imp-a"), mk("imp-b"));
+            let (a, b) = (
+                import_row(&ns, "imp-a", &now),
+                import_row(&ns, "imp-b", &now),
+            );
             let link = json!({
                 "source_id": a["id"], "target_id": b["id"],
                 "relation": LINK_RELATION, "created_at": now,
@@ -1078,15 +1124,7 @@ async fn run_cell(o: &Origin, op: Op, peer_down: bool) {
 /// then with the peer down (the exact 202).
 async fn run_op(backend: Backend, op: Op) {
     let Some(o) = origin(backend).await else {
-        // sec-F5 (#2548): under the certified tier a cell that did not run
-        // is a failure, never a green skip.
-        assert!(
-            std::env::var_os(CERT_TIER_MARKER).is_none(),
-            "{backend:?} cell did not run under the certified tier ({CERT_TIER_MARKER} set, \
-             AI_MEMORY_TEST_POSTGRES_URL unset)"
-        );
-        eprintln!("skip {backend:?}: AI_MEMORY_TEST_POSTGRES_URL not set");
-        return;
+        return skip_unless_cert(backend);
     };
     run_cell(&o, op, false).await;
     run_cell(&o, op, true).await;
@@ -1136,6 +1174,306 @@ op_cells! {
     pending_reject_8741 => Op::Reject,
     approval_decide_8741 => Op::ApprovalDecide,
     bulk_forget_empty_8741 => Op::ForgetEmpty,
+}
+
+// ---------------------------------------------------------------------------
+// Round 2 cells: import bounds, reflect (peer down), capped peer + DLQ
+// ---------------------------------------------------------------------------
+
+/// One importable memory row in `ns`.
+fn import_row(ns: &str, tag: &str, now: &str) -> Value {
+    json!({
+        "id": uuid::Uuid::new_v4().to_string(),
+        "tier": "mid",
+        "namespace": ns,
+        "title": format!("{tag}-{}", uuid::Uuid::new_v4()),
+        "content": format!("{tag} imported body with enough length"),
+        "tags": [],
+        "priority": 5,
+        "confidence": 1.0,
+        "source": "import",
+        "access_count": 0,
+        "created_at": now,
+        "updated_at": now,
+        "metadata": {},
+    })
+}
+
+/// `n` importable rows plus a ring of `n` links over them (row i -> row i+1).
+fn import_batch(ns: &str, n: usize) -> (Vec<Value>, Vec<Value>) {
+    let now = chrono::Utc::now().to_rfc3339();
+    let rows: Vec<Value> = (0..n)
+        .map(|i| import_row(ns, &format!("bound-{i}"), &now))
+        .collect();
+    let links = (0..n)
+        .map(|i| {
+            json!({
+                "source_id": rows[i]["id"],
+                "target_id": rows[(i + 1) % n]["id"],
+                "relation": LINK_RELATION,
+                "created_at": now,
+            })
+        })
+        .collect();
+    (rows, links)
+}
+
+/// Request timeout for the PostgreSQL at-cap import: the PostgreSQL import arm
+/// makes one awaited round trip per row and link, so `MAX_BULK_SIZE` of both
+/// overruns the default `DEFAULT_REQUEST_TIMEOUT_SECS` (#9209, which exists
+/// before this PR). Flip to the default timeout when #9209 lands.
+#[cfg(feature = "sal-postgres")]
+const PG_IMPORT_AT_CAP_TIMEOUT_SECS: u64 = 300;
+
+/// The router timeout the import-bounds cell runs under: the default on
+/// SQLite, [`PG_IMPORT_AT_CAP_TIMEOUT_SECS`] on PostgreSQL (#9209).
+fn import_at_cap_timeout(backend: Backend) -> std::time::Duration {
+    match backend {
+        Backend::Sqlite => {
+            std::time::Duration::from_secs(ai_memory::config::DEFAULT_REQUEST_TIMEOUT_SECS)
+        }
+        #[cfg(feature = "sal-postgres")]
+        Backend::Postgres => std::time::Duration::from_secs(PG_IMPORT_AT_CAP_TIMEOUT_SECS),
+    }
+}
+
+/// Round 2 LOW-1 — the import bounds: one past `MAX_BULK_SIZE` memories or
+/// links is the exact 400 and ships nothing; exactly `MAX_BULK_SIZE` of
+/// both is accepted, delivered and quorum-met.
+async fn run_import_bounds(backend: Backend) {
+    let max = ai_memory::handlers::MAX_BULK_SIZE;
+    let Some(o) = origin_timed(backend, None, import_at_cap_timeout(backend)).await else {
+        return skip_unless_cert(backend);
+    };
+    let ns = format!("{}-bounds", o.ns);
+
+    let (rows, _) = import_batch(&ns, max + 1);
+    let mark = o.mark().await;
+    let (status, body) = o
+        .call(
+            Method::POST,
+            routes::IMPORT,
+            Some(json!({"memories": rows})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "memories over cap: {body}");
+    assert_eq!(
+        body,
+        json!({"error": format!("import limited to {max} memories")})
+    );
+
+    let (_, links) = import_batch(&ns, max + 1);
+    let (status, body) = o
+        .call(
+            Method::POST,
+            routes::IMPORT,
+            Some(json!({"memories": [], "links": links})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "links over cap: {body}");
+    assert_eq!(
+        body,
+        json!({"error": format!("import limited to {max} links")})
+    );
+    assert!(
+        o.since(mark).await.is_empty(),
+        "a refused import ships nothing"
+    );
+
+    let (rows, links) = import_batch(&ns, max);
+    let want: BTreeSet<String> = rows
+        .iter()
+        .filter_map(|m| m["id"].as_str().map(str::to_string))
+        .collect();
+    let (status, body) = o
+        .call(
+            Method::POST,
+            routes::IMPORT,
+            Some(json!({"memories": rows, "links": links})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "import at the cap: {body}");
+    assert_eq!(body["imported"], json!(max), "import at the cap: {body}");
+    let bodies = o.since(mark).await;
+    assert_eq!(memory_ids_in(&bodies), want, "every imported row shipped");
+    let shipped_links = bodies
+        .iter()
+        .filter_map(|p| p.get("links").and_then(Value::as_array))
+        .flatten()
+        .count();
+    assert_eq!(shipped_links, max, "every imported link shipped");
+    assert_quorum_met("import at the cap", status, &body);
+}
+
+/// Round 2 LOW-2 — reflect with the peer down, pinned at its exact current
+/// behaviour. Flip when #9182 lands (the reflect route then reports the
+/// link fan-out miss through the funnel like every other write).
+async fn run_reflect_peer_down(backend: Backend) {
+    let Some(o) = origin(backend).await else {
+        return skip_unless_cert(backend);
+    };
+    let ns = format!("{}-reflect", o.ns);
+    let mut sources = Vec::new();
+    for i in 0..CONSOLIDATE_SOURCES {
+        sources.push(o.create(&ns, &format!("reflect-src-{i}")).await);
+    }
+    let mark = o.mark().await;
+    o.peer.fail.store(true, Ordering::Release);
+    let (status, body) = o
+        .call(
+            Method::POST,
+            routes::MEMORY_REFLECT,
+            Some(json!({
+                "source_ids": sources,
+                "title": format!("fedpush 8741 reflection {}", uuid::Uuid::new_v4()),
+                "content": "fedpush 8741 reflection content of enough length",
+                "namespace": ns,
+            })),
+        )
+        .await;
+    o.peer.fail.store(false, Ordering::Release);
+    pin_reflect_peer_down(status, &body);
+    assert!(
+        o.since(mark).await.is_empty(),
+        "a down peer records nothing: {body}"
+    );
+}
+
+/// Round 2 LOW-3 — a peer whose `max_page_size` is below the origin's
+/// deletion chunk refuses the bulk erase: the origin answers the exact 202
+/// and lands one dead-letter row per erased id, with that id's
+/// single-deletion body and the peer's exact refusal.
+async fn run_capped_peer_forget(backend: Backend) {
+    let dlq_dir = tempfile::Builder::new()
+        .prefix("fedpush-8741-dlq-")
+        .tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/.local-runs"))
+        .expect("dlq tempdir");
+    let dlq_path = dlq_dir.path().join("dlq.db");
+    let dlq_db: Db = Arc::new(Mutex::new((
+        ai_memory::db::open(&dlq_path).expect("open dlq db"),
+        dlq_path,
+        ResolvedTtl::default(),
+        true,
+    )));
+    let sink = Arc::new(SqliteDlqSink::new(dlq_db).await.expect("dlq sink"));
+    let Some(o) = origin_with(backend, Some(sink.clone())).await else {
+        return skip_unless_cert(backend);
+    };
+    let ns = format!("{}-capped-{}", o.ns, uuid::Uuid::new_v4());
+    let mut victims = BTreeSet::new();
+    for i in 0..FORGET_VICTIMS {
+        victims.insert(o.create(&ns, &format!("capped-{i}")).await);
+    }
+    let mark = o.mark().await;
+    o.peer
+        .deletions_cap
+        .store(CAPPED_PEER_MAX_PAGE, Ordering::Release);
+    let (status, body) = o
+        .call(Method::POST, routes::FORGET, Some(json!({"namespace": ns})))
+        .await;
+    o.peer.deletions_cap.store(UNCAPPED, Ordering::Release);
+    assert_eq!(status, UNDER_REPLICATED, "capped peer forget: {body}");
+    assert_eq!(body, partial_ack_receipt(), "capped peer forget");
+    assert!(
+        ids_in(&o.since(mark).await, "deletions").is_empty(),
+        "the capped peer applied nothing"
+    );
+    let rows = sink
+        .take_pending_dlq_rows(DLQ_READ_LIMIT)
+        .await
+        .expect("dlq rows");
+    let landed: BTreeSet<String> = rows.iter().map(|r| r.memory_id.clone()).collect();
+    assert_eq!(
+        landed, victims,
+        "one dead-letter row per erased id: {rows:?}"
+    );
+    for row in &rows {
+        assert_eq!(row.peer_id, PEER_ID, "{row:?}");
+        assert_eq!(row.attempt_count, 1, "{row:?}");
+        assert_eq!(
+            row.payload_json["deletions"],
+            json!([row.memory_id]),
+            "each row carries its own single-deletion body: {row:?}"
+        );
+        pin_capped_peer_reason(&row.last_error);
+    }
+}
+
+/// The exact under-replicated receipt of a one-peer write the peer did not
+/// ack: the local commit is the only ack, and a reachable peer that answered
+/// without acking is the public `timeout` reason
+/// (`federation::quorum::QuorumNotMetPayload::from_err`).
+fn partial_ack_receipt() -> Value {
+    json!({
+        "acks": 1,
+        "durability": "local",
+        "needed": QUORUM_W,
+        "quorum_met": false,
+        "reason": "timeout",
+    })
+}
+
+/// Exact current behaviour of reflect with the peer down: the reflection
+/// row's quorum miss reaches the response as the 202 receipt, while the
+/// `reflects_on` edge outcomes are logged and dropped (#9182).
+/// Flip when #9182 lands: the edges then join the same funnel and this pin
+/// is re-cut to the funnel's receipt.
+fn pin_reflect_peer_down(status: StatusCode, body: &Value) {
+    assert_eq!(status, UNDER_REPLICATED, "reflect, peer down: {body}");
+    assert_eq!(*body, partial_ack_receipt(), "reflect, peer down");
+}
+
+/// The exact dead-letter reason a capped peer's refusal lands with: the
+/// permanent-class tag over the first attempt and its one retry. The peer's
+/// refusal text stays out of the row (foreign text never reaches the
+/// operator surface); the HTTP status is what the row carries.
+const CAPPED_PEER_DLQ_REASON: &str =
+    "[ai-memory:class=permanent] first: http 400 Bad Request; retry: http 400 Bad Request";
+
+fn pin_capped_peer_reason(last_error: &str) {
+    assert_eq!(last_error, CAPPED_PEER_DLQ_REASON);
+}
+
+/// sec-F5 (#2548): under the certified tier a cell that did not run is a
+/// failure, never a green skip.
+fn skip_unless_cert(backend: Backend) {
+    assert!(
+        std::env::var_os(CERT_TIER_MARKER).is_none(),
+        "{backend:?} cell did not run under the certified tier ({CERT_TIER_MARKER} set, \
+         AI_MEMORY_TEST_POSTGRES_URL unset)"
+    );
+    eprintln!("skip {backend:?}: AI_MEMORY_TEST_POSTGRES_URL not set");
+}
+
+/// One named test per (backend, cell).
+macro_rules! backend_cells {
+    ($($name:ident => $cell:ident),+ $(,)?) => {
+        mod sqlite_round2_cells {
+            use super::*;
+            $(
+                #[tokio::test(flavor = "multi_thread")]
+                async fn $name() {
+                    $cell(Backend::Sqlite).await;
+                }
+            )+
+        }
+        #[cfg(feature = "sal-postgres")]
+        mod postgres_round2_cells {
+            use super::*;
+            $(
+                #[tokio::test(flavor = "multi_thread")]
+                async fn $name() {
+                    $cell(Backend::Postgres).await;
+                }
+            )+
+        }
+    };
+}
+
+backend_cells! {
+    import_bounds_8741 => run_import_bounds,
+    reflect_peer_down_current_9182 => run_reflect_peer_down,
+    capped_peer_forget_dlq_8741 => run_capped_peer_forget,
 }
 
 // ---------------------------------------------------------------------------
