@@ -369,6 +369,7 @@ mod tests {
         )
         .expect("insert biometric");
 
+        let _ = ai_memory::identity::test_key_dir::install(); // #9185: export may mint the daemon key
         let files = ai_memory::forensic::bundle::build_files(
             &conn,
             &bundle_args("bio"),
@@ -409,6 +410,7 @@ mod tests {
         )
         .expect("raw update inject");
 
+        let _ = ai_memory::identity::test_key_dir::install(); // #9185: export may mint the daemon key
         let files = ai_memory::forensic::bundle::build_files(
             &conn,
             &bundle_args("legacy"),

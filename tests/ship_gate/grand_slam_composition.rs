@@ -241,6 +241,7 @@ fn sg_co_1_forensic_bundle_export_and_verify_roundtrip() {
 
     // Build with a fixed `generated_at` so the bundle is reproducible
     // (the L2-5 byte-identical contract).
+    let _ = ai_memory::identity::test_key_dir::install(); // #9185: export may mint the daemon key
     bundle::build(&conn, &args, &bundle_path, Some("2026-05-14T00:00:00Z"))
         .expect("forensic bundle build ok");
 
@@ -664,6 +665,7 @@ fn sg_co_8_forensic_bundle_verify_reports_tampered_file_by_name() {
         include_atomisation_chain: true,
         output: None,
     };
+    let _ = ai_memory::identity::test_key_dir::install(); // #9185: export may mint the daemon key
     let mut files =
         bundle::build_files(&conn, &args, Some("2026-05-14T00:00:00Z")).expect("build_files ok");
 

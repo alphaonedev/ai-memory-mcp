@@ -188,6 +188,7 @@ fn test_forensic_export_includes_atomisation_chain() {
         include_atomisation_chain: true,
         output: None,
     };
+    let _ = ai_memory::identity::test_key_dir::install(); // #9185: export may mint the daemon key
     let files =
         bundle::build_files(&conn, &args, Some("2026-05-15T00:00:00Z")).expect("build_files");
     drop(conn);
@@ -308,6 +309,7 @@ fn test_forensic_export_chain_disable_flag() {
         include_atomisation_chain: false,
         output: None,
     };
+    let _ = ai_memory::identity::test_key_dir::install(); // #9185: export may mint the daemon key
     let files =
         bundle::build_files(&conn, &args, Some("2026-05-15T00:00:00Z")).expect("build_files");
 
@@ -399,6 +401,7 @@ fn test_forensic_export_can_reconstruct_chain() {
             include_atomisation_chain: true,
             output: Some(bundle_path.clone()),
         };
+        let _ = ai_memory::identity::test_key_dir::install(); // #9185: export may mint the daemon key
         bundle::build(&conn, &args, &bundle_path, Some("2026-05-15T00:00:00Z"))
             .expect("build bundle");
         drop(conn);

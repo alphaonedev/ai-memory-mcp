@@ -868,13 +868,14 @@ async fn run_reflect(
     // Postgres store identically to the local SQLite path.
     let store = build_reflect_store(db_path, args, app_config).await?;
 
-    // Resolve the curator's signing keypair. We rely on the
-    // process-wide identity (the same one `serve` uses) so every
-    // `reflects_on` edge attributes to the daemon's Ed25519 identity.
-    // When no keypair is configured (operator opted out via
-    // `[identity].disabled = true` or runs a one-off `--reflect`
-    // against a fresh data dir) the pass falls back to `"ai:curator"`
-    // — same fall-back the autonomy `consolidate` path uses.
+    // #8863 / #9185 (L-G) — resolve the curator's signing keypair: the
+    // daemon label key (`daemon.pub` / `daemon.priv`) in the default key
+    // directory, minted on first use with a WARN naming its key id and path.
+    // With it loaded, every reflection is owned by and every `reflects_on`
+    // edge is signed as the `daemon` principal. Under `asi-hard` a missing or
+    // unusable daemon key refuses the pass. In the default posture a key that
+    // cannot be minted or loaded degrades to an unsigned pass (WARN with the
+    // reason) attributed to `"ai:curator"`.
     let keypair = curator_signing_keypair()?;
 
     let feature_tier = app_config.effective_tier(None);
@@ -2634,6 +2635,75 @@ mod tests {
             stub.summarize_memories(&[("a".to_string(), "b".to_string())])
                 .unwrap(),
             "stub reflection summary"
+        );
+    }
+
+    /// #9185 (M-D) — one clustering observation for the sweep test.
+    #[cfg(feature = "sal")]
+    fn sweep_row_9185(ns: &str, idx: usize, metadata: serde_json::Value) -> crate::models::Memory {
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut row = crate::models::Memory::default();
+        row.id = uuid::Uuid::new_v4().to_string();
+        row.tier = crate::models::Tier::Long;
+        row.namespace = ns.to_string();
+        row.title = format!("observation sweep canary rollout strategy #{idx}");
+        row.content =
+            format!("sweep canary rollout strategy sweep canary rollout strategy row {idx}");
+        row.priority = 5;
+        row.confidence = 1.0;
+        row.source = "api".to_string();
+        row.access_count = 2;
+        row.created_at.clone_from(&now);
+        row.updated_at = now;
+        row.metadata = metadata;
+        row.memory_kind = crate::models::MemoryKind::Observation;
+        row
+    }
+
+    /// #9185 (M-D) — the daemon sweep reaches the reflection pass and its
+    /// persist path: a collective cluster yields one reflection, and another
+    /// owner's default (owner-private) cluster yields none and no error.
+    #[cfg(feature = "sal")]
+    #[tokio::test]
+    async fn store_backed_reflection_sweep_persists_readable_cluster_only_9185() {
+        const ROWS: usize = 4;
+        let env = TestEnv::fresh();
+        let open_ns = "acme/eng/sweep-collective-9185";
+        let private_ns = "acme/eng/sweep-private-9185";
+        {
+            let conn = crate::db::open(&env.db_path).expect("db::open");
+            for idx in 0..ROWS {
+                let open = sweep_row_9185(
+                    open_ns,
+                    idx,
+                    serde_json::json!({"agent_id": "acme/eng/alice", "scope": "collective"}),
+                );
+                crate::db::insert(&conn, &open).expect("seed collective");
+                let private = sweep_row_9185(
+                    private_ns,
+                    idx,
+                    serde_json::json!({"agent_id": "zeta/ops/bob"}),
+                );
+                crate::db::insert(&conn, &private).expect("seed private");
+            }
+        }
+        let store = crate::store::sqlite::SqliteStore::open(&env.db_path).expect("open store");
+        let stub = CovStubLlm;
+        let report = store_backed_reflection_sweep(
+            &store,
+            Some(&stub as &dyn crate::autonomy::AutonomyLlm),
+            None,
+            &default_args(),
+        )
+        .await;
+        assert!(report.errors.is_empty(), "errors: {:?}", report.errors);
+        assert_eq!(
+            report.reflections_persisted, 1,
+            "#9185: only the collective cluster reflects: {report:?}"
+        );
+        assert_eq!(
+            report.observations_scanned, ROWS,
+            "#9185: the owner-private rows are not visible to the sweep"
         );
     }
 
