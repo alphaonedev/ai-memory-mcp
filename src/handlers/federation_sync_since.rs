@@ -258,10 +258,7 @@ pub async fn sync_since(
     let limit = q
         .limit
         .unwrap_or(crate::federation::pull_cursor::SYNC_SINCE_DEFAULT_LIMIT)
-        .min(app.max_page_size)
-        // #9176 S4: one clamp before the backend split, so `limit=0` makes
-        // the same progress on both backends (a page of one row).
-        .max(1);
+        .min(app.max_page_size);
 
     // v0.7.0 #239 — per-peer namespace allowlist. Read the
     // `x-peer-id` header + the operator-configured attestation map
@@ -432,6 +429,10 @@ pub async fn sync_since(
     // /sync/push only. Pinned by
     // `seq_pull_records_no_serving_sync_state_9176`.
     if let Some(after_seq) = after_seq {
+        // #9176 S4 / F3: the clamp is scoped to the seq walk, so `limit=0`
+        // makes the same progress on both backends there (a page of one
+        // row) while the since path keeps `limit=0` -> 0 rows.
+        let limit = crate::storage::sync_seq::clamp_seq_limit(limit);
         let page = match read_seq_page(&app, after_seq, limit).await {
             Ok(p) => p,
             Err(rejection) => return rejection,
@@ -489,13 +490,20 @@ pub async fn sync_since(
     // to the underlying store.
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
-        let (mems, raw_count) = match app
-            .store
-            .list_memories_updated_since_counted(q.since.as_deref(), limit)
-            .await
-        {
-            Ok(v) => v,
-            Err(e) => return store_err_to_response(e),
+        // #9176 S4 / F3: `limit=0` serves 0 rows on every backend. The
+        // sqlite path below sends `LIMIT 0` to the database; the SAL adapters
+        // floor their limit at 1, so the postgres path would serve one row.
+        let (mems, raw_count) = if limit == 0 {
+            (Vec::new(), 0)
+        } else {
+            match app
+                .store
+                .list_memories_updated_since_counted(q.since.as_deref(), limit)
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => return store_err_to_response(e),
+            }
         };
         let total = mems.len();
         // #2441 — derive the pull cursor from rows EXAMINED, before the

@@ -262,11 +262,17 @@ pub fn memories_after_seq(conn: &Connection, after_seq: i64, limit: usize) -> Re
 
 /// Give the database a fresh epoch, so every puller's stored `last_seq`
 /// against this node is treated as foreign and the walk restarts at 0.
-/// Called after a restore publishes a snapshot over the live database.
+///
+/// The runtime entry: it is record-stop gated (#9176 B7). The open-time
+/// re-mint after a restore runs inside [`bind_node_identity`], reached only
+/// from [`bind_at_open`].
 ///
 /// # Errors
-/// Fails closed when the counter row is missing.
+/// [`crate::storage::StorageError::RecordStopped`] (or the other
+/// [`crate::storage::record_stop::gate_storage_conn`] refusals) while the
+/// record plane is stopped; fails closed when the counter row is missing.
 pub fn regenerate_seq_epoch(conn: &Connection) -> Result<String> {
+    crate::storage::record_stop::gate_storage_conn(conn)?;
     let epoch: Option<String> = conn
         .query_row(
             "UPDATE sync_seq_counter SET epoch = lower(hex(randomblob(16))) WHERE id = 1 \
@@ -313,20 +319,24 @@ pub fn arm_epoch_reset(db: &std::path::Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Consume an armed epoch reset on a read-write open of `db`.
+/// The open-time sync_seq bind of a read-write open of `db` (#9082, #9176).
 ///
-/// A database that predates v102 has no counter: the migration that just ran
-/// minted a fresh epoch, so the sidecar is only removed. The sidecar is
-/// removed only after the new epoch is committed.
+/// One entry for the open funnel: it consumes an armed epoch reset (a
+/// restore published this file) and binds the epoch to the file's identity
+/// (a copy carries another file's). Both writes run in [`bind_node_identity`],
+/// the one record-stop-exempt writer, so an open completes under record-stop;
+/// the sidecar is removed only after the new epoch is committed. A database
+/// that predates v102 has no counter: the migration that just ran minted a
+/// fresh epoch, so the sidecar is only removed.
 ///
 /// # Errors
-/// The epoch cannot be regenerated or the sidecar cannot be removed; the open
-/// fails closed rather than serve a restored database under its old epoch.
-pub fn consume_epoch_reset(conn: &Connection, db: &std::path::Path) -> Result<()> {
+/// The sidecar's existence cannot be read, the counter cannot be read or
+/// updated, or the sidecar cannot be removed; the open fails closed rather
+/// than serve a restored or copied database under its old epoch.
+pub(super) fn bind_at_open(conn: &Connection, db: &std::path::Path) -> Result<()> {
     let marker = epoch_reset_marker_path(db);
-    match marker.try_exists() {
-        Ok(false) => return Ok(()),
-        Ok(true) => {}
+    let restored = match marker.try_exists() {
+        Ok(found) => found,
         Err(e) => {
             return Err(anyhow!(
                 "cannot tell whether {} exists ({e}) - refusing to serve a possibly \
@@ -334,24 +344,27 @@ pub fn consume_epoch_reset(conn: &Connection, db: &std::path::Path) -> Result<()
                 marker.display()
             ));
         }
+    };
+    let bind = if restored {
+        Rebind::Restored
+    } else {
+        Rebind::OnIdentityChange
+    };
+    bind_node_identity(conn, sqlite_node_identity(db).as_deref(), bind)?;
+    if restored {
+        std::fs::remove_file(&marker)
+            .with_context(|| format!("removing the epoch-reset sidecar {}", marker.display()))?;
     }
-    let has_counter: bool = conn.query_row(
-        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' \
-           AND name = 'sync_seq_counter')",
-        [],
-        |row| row.get(0),
-    )?;
-    if has_counter {
-        let epoch = regenerate_seq_epoch(conn)?;
-        tracing::warn!(
-            target: crate::federation::peer::FED_LOG_TARGET,
-            epoch = %epoch,
-            "restored database: sync_seq epoch regenerated, pullers re-walk from 0 (#9082)"
-        );
-    }
-    std::fs::remove_file(&marker)
-        .with_context(|| format!("removing the epoch-reset sidecar {}", marker.display()))?;
     Ok(())
+}
+
+/// Why [`bind_node_identity`] may re-mint the epoch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Rebind {
+    /// Only when the stored identity differs (a copy of another database).
+    OnIdentityChange,
+    /// Always: a restore published a snapshot over this file (#9082).
+    Restored,
 }
 
 /// The restore-sensitive identity of the database file at `db`: its inode on
@@ -377,15 +390,21 @@ pub fn sqlite_node_identity(db: &std::path::Path) -> Option<String> {
 /// #9176 F6: bind the seq epoch to `identity` on a read-write open. A first
 /// bind (NULL) records it; a different stored value means this file is a
 /// copy of another database, so the epoch is re-minted and every puller
-/// walks it again from 0. Returns the new epoch when one was minted.
+/// walks it again from 0. [`Rebind::Restored`] re-mints whatever is stored.
+/// Returns the new epoch when one was minted.
+///
+/// Open-time only and record-stop exempt (B7 allowlist row, the #3172
+/// open-time precedent): private, reached only from [`bind_at_open`].
 ///
 /// # Errors
-/// The counter cannot be read or updated; the open fails closed rather than
-/// serve a copied database under its old epoch.
-pub fn bind_node_identity(conn: &Connection, identity: Option<&str>) -> Result<Option<String>> {
-    let Some(identity) = identity else {
-        return Ok(None);
-    };
+/// The counter cannot be read or updated, or a restore finds no counter
+/// row; the open fails closed rather than serve a copied or restored
+/// database under its old epoch.
+fn bind_node_identity(
+    conn: &Connection,
+    identity: Option<&str>,
+    bind: Rebind,
+) -> Result<Option<String>> {
     let has_counter: bool = conn.query_row(
         "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' \
            AND name = 'sync_seq_counter')",
@@ -395,6 +414,27 @@ pub fn bind_node_identity(conn: &Connection, identity: Option<&str>) -> Result<O
     if !has_counter {
         return Ok(None);
     }
+    if bind == Rebind::Restored {
+        let epoch: Option<String> = conn
+            .query_row(
+                "UPDATE sync_seq_counter SET epoch = lower(hex(randomblob(16))), \
+                   node_identity = COALESCE(?1, node_identity) \
+                 WHERE id = 1 RETURNING epoch",
+                [identity],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let epoch = epoch.ok_or_else(|| anyhow!(SYNC_SEQ_COUNTER_MISSING))?;
+        tracing::warn!(
+            target: crate::federation::peer::FED_LOG_TARGET,
+            epoch = %epoch,
+            "restored database: sync_seq epoch regenerated, pullers re-walk from 0 (#9082)"
+        );
+        return Ok(Some(epoch));
+    }
+    let Some(identity) = identity else {
+        return Ok(None);
+    };
     let stored: Option<Option<String>> = conn
         .query_row(
             "SELECT node_identity FROM sync_seq_counter WHERE id = 1",
@@ -482,10 +522,13 @@ pub fn sync_pull_seq_get(
 }
 
 /// Store the puller's sequence cursor. NOT monotonic: a peer reset (new epoch,
-/// or a head below the old cursor) legitimately lowers it.
+/// or a head below the old cursor) legitimately lowers it. Record-stop gated
+/// (#9176 B7): a stopped record plane moves no cursor.
 ///
 /// # Errors
-/// Returns an error on a negative `last_seq` or a SQL failure.
+/// [`crate::storage::StorageError::RecordStopped`] (or the other
+/// [`crate::storage::record_stop::gate_storage_conn`] refusals) while the
+/// record plane is stopped; a negative `last_seq` or a SQL failure.
 pub fn sync_pull_seq_set(
     conn: &Connection,
     agent_id: &str,
@@ -493,6 +536,7 @@ pub fn sync_pull_seq_set(
     last_seq: i64,
     seq_epoch: &str,
 ) -> Result<()> {
+    crate::storage::record_stop::gate_storage_conn(conn)?;
     if last_seq < 0 {
         return Err(anyhow!("last_seq must be >= 0, got {last_seq}"));
     }

@@ -162,3 +162,13 @@ src/store/postgres.rs	pg_apply_entitled_attestation_in_tx
 src/store/postgres/lifecycle_tx_3152.rs	apply_lifecycle_patch_in_tx
 # #4078 repair (reviewed): runs only inside the migrate/open repair transaction; visibility pub(super) (#4324) so only crate::storage migrate callers can reach it; clears a regenerable cache (embed_skip), no durable text. Deliberately NOT routed through the record-stop gate: a repair inside the ladder must not consult it.
 src/storage/embed_skip.rs	repair_sqlite_after_trigger_gap
+# #9176 (B7, same class as the #3172 open-time rows above): the sync_seq node-identity /
+# restore bind. Each runs at db::open / connect BEFORE any record-plane traffic and writes
+# ONLY the derived `sync_seq_counter` row (epoch + node_identity: a regenerable sequence
+# fence, never record-plane content) — NOT a record-stoppable write: a stopped plane must
+# still open. Visibility is pinned (tests/sync_seq_record_stop_9176.rs): the sqlite binder
+# is private and reached only via pub(super) bind_at_open from the open funnel; the
+# postgres binder is private and called only from connect and migrate. The RUNTIME
+# writers (regenerate_seq_epoch, sync_pull_seq_set) are gated, never allowlisted.
+src/storage/sync_seq.rs	bind_node_identity
+src/store/postgres.rs	bind_sync_seq_node_identity

@@ -1200,16 +1200,13 @@ pub fn open(path: &Path) -> Result<Connection> {
     conn.execute_batch(SCHEMA)
         .context("failed to initialize schema")?;
     migrate(&conn)?;
-    // v1.0.0 #9082 — a restore armed a fresh sync_seq epoch for this file.
-    crate::storage::sync_seq::consume_epoch_reset(&conn, path)
-        .context("sync_seq epoch reset after restore (#9082)")?;
-    // #9176 F6 — a file copied back without `ai-memory restore` carries
-    // another file's identity: re-mint the epoch so pullers rewalk it.
-    crate::storage::sync_seq::bind_node_identity(
-        &conn,
-        crate::storage::sync_seq::sqlite_node_identity(path).as_deref(),
-    )
-    .context("sync_seq node identity bind (#9176)")?;
+    // v1.0.0 #9082 / #9176 F6 — a restore armed a fresh sync_seq epoch for
+    // this file, or a file copied back without `ai-memory restore` carries
+    // another file's identity: re-mint the epoch so pullers rewalk it. The
+    // open-time bind is record-stop exempt (#9176 B7), so an open completes
+    // under record-stop.
+    crate::storage::sync_seq::bind_at_open(&conn, path)
+        .context("sync_seq open-time bind (#9082, #9176)")?;
     // v1.0.0 (#3172) — SCHEMA-masks-DATA-LOSS gate for APPEND-ONLY bootstrap
     // relations (`agent_lineage`), placed HERE in the open funnel rather than
     // inside `migrate`, and deliberately AFTER `execute_batch(SCHEMA)`. The
