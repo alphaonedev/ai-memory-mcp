@@ -2434,6 +2434,77 @@ mod tests {
             rollback_clears_consolidate_archive_9178(&store).await;
         }
 
+        /// #9178 B — the curator compaction persist runs the archive-first
+        /// consolidate (#9018) on every backend: after `persist`, no source
+        /// is live and each has exactly one `consolidate` archive row that
+        /// holds its full text (the content is in one place, never zero).
+        async fn compaction_persist_archives_sources_9178(store: &dyn MemoryStore) {
+            let _dag = crate::test_support::no_lineage_dag_guard();
+            let ctx = CallerContext::for_admin(CONSOLIDATOR_AGENT_ID);
+            let namespace = uuid::Uuid::new_v4().to_string();
+            let mut candidates = Vec::new();
+            for title in ["alpha", "beta"] {
+                let memory = make_memory_full(
+                    &uuid::Uuid::new_v4().to_string(),
+                    &namespace,
+                    title,
+                    "postgres archive-first compaction source text",
+                    Tier::Mid,
+                    5,
+                );
+                store.store(&ctx, &memory).await.unwrap();
+                candidates.push(store.get(&ctx, &memory.id).await.unwrap());
+            }
+            let llm = StubLlm::new("synth");
+            let pass = ConsolidationPass::new(store, &llm, false);
+            let summary = pass.summarize(&candidates).unwrap();
+            let ids: Vec<String> = candidates.iter().map(|m| m.id.clone()).collect();
+            pass.persist(&summary, &ids).await.unwrap();
+
+            let consolidate = crate::models::field_names::ARCHIVE_REASON_CONSOLIDATE;
+            let rows = store.list_archived(Some(&namespace), 100, 0).await.unwrap();
+            let mut archived: Vec<(String, String, String)> = rows
+                .iter()
+                .map(|r| {
+                    let field = |k: &str| r[k].as_str().unwrap_or_default().to_string();
+                    (field("id"), field("archive_reason"), field("content"))
+                })
+                .collect();
+            archived.sort();
+            let mut expected: Vec<(String, String, String)> = candidates
+                .iter()
+                .map(|m| (m.id.clone(), consolidate.to_string(), m.content.clone()))
+                .collect();
+            expected.sort();
+            assert_eq!(archived, expected, "every source archived with its text");
+            for m in &candidates {
+                assert!(
+                    store.get(&ctx, &m.id).await.is_err(),
+                    "{} is no longer live after the archive-first consolidate",
+                    m.id
+                );
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn compaction_persist_archives_sources_9178_sqlite() {
+            let (store, _dir) = open_db();
+            compaction_persist_archives_sources_9178(&store).await;
+        }
+
+        /// Skips only when the URL is unset; a SET but unreachable URL FAILS.
+        #[cfg(feature = "sal-postgres")]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn compaction_persist_archives_sources_9178_postgres() {
+            let Ok(url) = std::env::var("AI_MEMORY_TEST_POSTGRES_URL") else {
+                return;
+            };
+            let store = crate::store::postgres::PostgresStore::connect(&url)
+                .await
+                .unwrap();
+            compaction_persist_archives_sources_9178(&store).await;
+        }
+
         /// #2893 — the same scenario the pre-fix pin set up (a NEW memory
         /// squats one original's `(title, namespace)` slot before the Stage-6
         /// rollback), with the expectations inverted: the rollback is

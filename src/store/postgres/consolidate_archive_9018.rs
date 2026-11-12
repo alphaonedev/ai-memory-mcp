@@ -82,3 +82,96 @@ impl PostgresStore {
     }
 }
 
+#[cfg(test)]
+mod record_stop_9178_tests {
+    use super::*;
+    use crate::models::{ConfidenceSource, LifecycleState, Memory, MemoryKind, Tier};
+    use crate::store::{CallerContext, MemoryStore};
+
+    /// The operator id the test engages the record stop as.
+    const ISSUER: &str = "ai:operator-9178";
+    const AGENT: &str = "ai:consolidate-9178";
+
+    fn source(id: &str, namespace: &str) -> Memory {
+        Memory {
+            cid: None,
+            valid_from: None,
+            valid_until: None,
+            id: id.to_string(),
+            tier: Tier::Mid,
+            namespace: namespace.to_string(),
+            title: "record-stop source".to_string(),
+            content: "text the stopped plane must not move".to_string(),
+            tags: Vec::new(),
+            priority: 5,
+            confidence: 1.0,
+            source: "user".to_string(),
+            access_count: 0,
+            created_at: Utc::now().to_rfc3339(),
+            updated_at: Utc::now().to_rfc3339(),
+            last_accessed_at: None,
+            expires_at: None,
+            metadata: serde_json::json!({ "agent_id": AGENT }),
+            reflection_depth: 0,
+            memory_kind: MemoryKind::Observation,
+            entity_id: None,
+            persona_version: None,
+            citations: Vec::new(),
+            source_uri: None,
+            source_span: None,
+            confidence_source: ConfidenceSource::CallerProvided,
+            confidence_signals: None,
+            confidence_decayed_at: None,
+            version: 1,
+            lifecycle_state: LifecycleState::Open,
+        }
+    }
+
+    /// #9178 B — the helper refuses on its OWN record-stop recheck (B9), not
+    /// only behind the caller's entry gate: with the stop engaged between
+    /// admission and the helper, it returns the exact `Stopped` error and
+    /// writes nothing. Skips only when the URL is unset.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn archive_consolidate_source_refuses_when_stopped_9178() {
+        let Ok(url) = std::env::var("AI_MEMORY_TEST_POSTGRES_URL") else {
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.unwrap();
+        let ctx = CallerContext::for_agent(AGENT);
+        let namespace = format!("rs9178-{}", uuid::Uuid::new_v4());
+        let seeded = uuid::Uuid::new_v4().to_string();
+        let id = store
+            .store(&ctx, &source(&seeded, &namespace))
+            .await
+            .unwrap();
+
+        let mut tx = store.pool().begin().await.unwrap();
+        store
+            .record_stop
+            .engage(ISSUER, crate::store::record_stop::SCOPE_RECORD_PLANE);
+        let refused = store.archive_consolidate_source_in_tx(&mut tx, &id).await;
+        store.record_stop.release();
+        let err = refused.err().map(|e| e.to_string());
+        tx.rollback().await.unwrap();
+        assert_eq!(
+            err.as_deref(),
+            Some(
+                "substrate record plane stopped by ai:operator-9178 (scope=record-plane); \
+                 mutating operations refused until resume"
+            ),
+        );
+        let live: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM memories WHERE id = $1")
+            .bind(&id)
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        let archived: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM archived_memories WHERE id = $1")
+                .bind(&id)
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+        assert_eq!((live, archived), (1, 0), "the refused helper wrote nothing");
+        store.pool().close().await;
+    }
+}
