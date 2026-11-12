@@ -71,10 +71,11 @@ class AiMemoryClient:
             (``SSL_CERT_FILE``, ``SSL_CERT_DIR``, else ``certifi``), a CA
             bundle or ``capath`` directory path, or a verifying
             ``ssl.SSLContext`` / ``truststore.SSLContext``. The SDK copies
-            the CA material into its own frozen context and re-checks it
-            before every handshake (#6249 #6267 #6306). ``False`` and any
-            context with verification or hostname checking off raise
-            ``ValueError``. A zero-config daemon serves a certificate from
+            the CA material into its own frozen context, carries every
+            stricter verification setting of a caller context (or refuses
+            it), and re-checks it before every handshake (#6249 #6267
+            #6306). ``False`` and any context with verification or hostname
+            checking off raise ``ValueError``. A zero-config daemon serves a certificate from
             the local CA it wrote to ``<key_dir>/tls/local-ca.pem`` on first
             boot; pass that path to verify it (#3782).
         cert: Client certificate for mTLS (path or ``(cert, key)``), loaded

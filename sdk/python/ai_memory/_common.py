@@ -98,8 +98,11 @@ def build_httpx_kwargs(
     ``True``, a CA bundle path or directory, or a verifying
     ``ssl.SSLContext`` / ``truststore.SSLContext``) and loading ``cert`` (a
     path or ``(cert, key)``) into it; that context is httpx's ``verify``.
-    ``verify=False``, a context with verification or hostname checking off
-    and every unclassifiable form raise :class:`ValueError`. For a
+    Every stricter verification setting of a caller context is carried onto
+    it or the construction is refused (``VERIFICATION_SETTINGS`` in
+    :mod:`ai_memory._tls`). ``verify=False``, a context with verification or
+    hostname checking off and every unclassifiable form raise
+    :class:`ValueError`. For a
     zero-config daemon pass ``<key_dir>/tls/local-ca.pem`` (#3782).
 
     ``api_key`` is sent as ``X-API-Key`` (the server also accepts
