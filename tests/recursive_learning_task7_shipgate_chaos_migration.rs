@@ -180,6 +180,10 @@ fn legacy_sqlite_forwards_migrates_to_v29_reflection_depth() {
         // schema_version to 28. SQLite 3.35+ supports DROP COLUMN; we
         // dropped any indexes on the column at schema-init time (we
         // never built one) so the operation is direct.
+        // #9176 F2: `memories_sync_seq_au` names `reflection_depth`; drop the
+        // v102 triggers first (the ladder re-run recreates them).
+        conn.execute_batch(ai_memory::storage::sync_seq::SQL_DROP_SYNC_SEQ_TRIGGERS)
+            .expect("drop sync_seq triggers");
         conn.execute("ALTER TABLE memories DROP COLUMN reflection_depth", [])
             .expect("drop reflection_depth col");
         conn.execute("DELETE FROM schema_version", [])

@@ -147,6 +147,12 @@ async fn roll_back_to_pre_v36(pool: &PgPool) {
         .await
         .expect("drop idx_personas_by_entity");
 
+    // The v102 sync_seq trigger names these columns; postgres refuses the
+    // drop while it exists. The re-run ladder's v102 tail recreates it (#9176).
+    sqlx::raw_sql(ai_memory::storage::sync_seq::SQL_DROP_SYNC_SEQ_TRIGGERS_PG)
+        .execute(pool)
+        .await
+        .expect("drop sync_seq triggers");
     sqlx::query("ALTER TABLE memories DROP COLUMN IF EXISTS persona_version")
         .execute(pool)
         .await

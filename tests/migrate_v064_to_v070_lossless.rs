@@ -338,6 +338,11 @@ fn v064_legacy_rows_physically_lacking_v070_columns_upgrade_losslessly() {
             "encrypted_envelope",    // v44
             "version",               // v45
         ];
+        // #9176 F2: the v102 `memories_sync_seq_au` trigger names listed
+        // columns; drop it before the column drops (the upgrade's v102 tail
+        // recreates it).
+        conn.execute_batch(ai_memory::storage::sync_seq::SQL_DROP_SYNC_SEQ_TRIGGERS)
+            .expect("drop sync_seq triggers");
         for col in droppable_v070_columns {
             if column_present(&conn, "memories", col) {
                 conn.execute(&format!("ALTER TABLE memories DROP COLUMN {col}"), [])

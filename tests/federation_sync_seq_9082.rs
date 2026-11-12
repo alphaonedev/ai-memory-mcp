@@ -792,11 +792,25 @@ async fn restore_regenerates_the_seq_epoch_9082() {
     }
     let target = n.db_path.with_file_name("restore-target.db");
     std::fs::copy(&snapshot, &target).expect("copy snapshot");
-    // A copy that was not published by a restore keeps the epoch.
-    {
+    // #9176 F6: a file copied back WITHOUT `ai-memory restore` carries the
+    // source file's identity, so its first open re-mints the epoch too.
+    let copied_epoch = {
         let copied = ai_memory::db::open(&target).expect("open copy");
         let head = ai_memory::storage::sync_seq::seq_head(&copied).expect("head");
-        assert_eq!(head.epoch, before, "an unarmed open never resets the epoch");
+        assert_ne!(
+            head.epoch, before,
+            "a copied database file gets a new epoch at its first open (#9176 F6)"
+        );
+        assert_eq!(head.head, 1, "the copy keeps its head");
+        head.epoch
+    };
+    {
+        let again = ai_memory::db::open(&target).expect("reopen copy");
+        let head = ai_memory::storage::sync_seq::seq_head(&again).expect("head");
+        assert_eq!(
+            head.epoch, copied_epoch,
+            "the copy is re-minted once, not per open"
+        );
     }
     // `restore` arms the reset before it publishes; the next open consumes it.
     ai_memory::storage::sync_seq::arm_epoch_reset(&target).expect("arm");
@@ -806,6 +820,7 @@ async fn restore_regenerates_the_seq_epoch_9082() {
         let restored = ai_memory::db::open(&target).expect("open restored");
         let head = ai_memory::storage::sync_seq::seq_head(&restored).expect("head");
         assert_ne!(head.epoch, before, "a restored database gets a new epoch");
+        assert_ne!(head.epoch, copied_epoch, "the armed reset mints again");
         assert_eq!(head.head, 1, "the head survives, the epoch does not");
         head.epoch
     };
@@ -816,6 +831,215 @@ async fn restore_regenerates_the_seq_epoch_9082() {
         head.epoch, fresh,
         "the reset happens once, not on every open"
     );
+    clear_posture();
+}
+
+/// Every `(id, sync_seq)` pair and the counter `(head, epoch)`.
+type SeqSnapshot = (Vec<(String, i64)>, (i64, String));
+
+async fn seq_snapshot(node: &Node) -> SeqSnapshot {
+    #[cfg(feature = "sal-postgres")]
+    if let Some((pool, _)) = node.pg.as_ref() {
+        let rows: Vec<(String, i64)> =
+            sqlx::query_as("SELECT id, sync_seq FROM memories ORDER BY id")
+                .fetch_all(pool)
+                .await
+                .expect("pg seq rows");
+        let counter: (i64, String) =
+            sqlx::query_as("SELECT head, epoch FROM sync_seq_counter WHERE id = 1")
+                .fetch_one(pool)
+                .await
+                .expect("pg counter");
+        return (rows, counter);
+    }
+    let guard = node.db.lock().await;
+    let mut stmt = guard
+        .0
+        .prepare("SELECT id, sync_seq FROM memories ORDER BY id")
+        .expect("prepare seq rows");
+    let rows = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .expect("seq rows")
+        .collect::<Result<Vec<(String, i64)>, _>>()
+        .expect("collect seq rows");
+    let counter = guard
+        .0
+        .query_row(
+            "SELECT head, epoch FROM sync_seq_counter WHERE id = 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .expect("counter");
+    (rows, counter)
+}
+
+/// Rewind the stamp below v102 (one transaction, the #3528 shape) and run the
+/// ladder again through the backend's own open path.
+async fn rerun_v102(node: &Node) {
+    const STAMP_BELOW_V102: i32 = 101;
+    #[cfg(feature = "sal-postgres")]
+    if let Some((pool, scratch)) = node.pg.as_ref() {
+        let mut tx = pool.begin().await.expect("begin stamp rewind");
+        sqlx::query("DELETE FROM schema_version")
+            .execute(&mut *tx)
+            .await
+            .expect("clear stamp");
+        sqlx::query("INSERT INTO schema_version (version) VALUES ($1)")
+            .bind(STAMP_BELOW_V102)
+            .execute(&mut *tx)
+            .await
+            .expect("seed v101 stamp");
+        tx.commit().await.expect("commit stamp rewind");
+        let _store = ai_memory::store::postgres::PostgresStore::connect(&scratch.url())
+            .await
+            .expect("re-run the ladder");
+        return;
+    }
+    {
+        let guard = node.db.lock().await;
+        guard
+            .0
+            .execute_batch(&format!(
+                "BEGIN; DELETE FROM schema_version; \
+                 INSERT INTO schema_version (version) VALUES ({STAMP_BELOW_V102}); COMMIT;"
+            ))
+            .expect("rewind stamp");
+    }
+    let _conn = ai_memory::db::open(&node.db_path).expect("re-run the ladder");
+}
+
+/// F1 (#9176 r1): a second run of the v102 migration (stamp rewind, a
+/// re-applied ladder) never renumbers an assigned `sync_seq` and never moves
+/// the counter: a row a puller has not pulled yet must never drop below that
+/// puller's cursor under the same epoch.
+async fn v102_rerun_keeps_seq(backend: Backend) {
+    let Some(n) = node(backend, "rerun").await else {
+        return;
+    };
+    // Insert order differs from (updated_at, id) order, so a re-run of the
+    // backfill would renumber every row.
+    for (i, ts) in TS_CLASSES.iter().enumerate() {
+        seed(&n, &format!("rerun-{i}"), ts, 5).await;
+    }
+    exec(
+        &n,
+        "UPDATE memories SET title = 'bumped' WHERE id = ?1",
+        "UPDATE memories SET title = 'bumped' WHERE id = $1",
+        "rerun-0",
+    )
+    .await;
+    let before = seq_snapshot(&n).await;
+    assert_eq!(
+        before.1.0,
+        i64::try_from(TS_CLASSES.len() + 1).expect("rows"),
+        "{backend:?}: five inserts and one bump"
+    );
+    rerun_v102(&n).await;
+    let after = seq_snapshot(&n).await;
+    assert_eq!(
+        after, before,
+        "{backend:?}: a v102 re-run keeps every sync_seq, the head and the epoch"
+    );
+    // The triggers are live after the re-run: the next write takes head + 1.
+    seed(&n, "rerun-after", TS_EQUAL, 5).await;
+    assert_eq!(
+        seq_of(&n, "rerun-after").await,
+        before.1.0 + 1,
+        "{backend:?}: the counter continues"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sqlite_v102_rerun_keeps_every_sync_seq_and_the_counter_9082() {
+    let _g = ENV_LOCK.lock().await;
+    set_posture();
+    v102_rerun_keeps_seq(Backend::Sqlite).await;
+    clear_posture();
+}
+
+#[cfg(feature = "sal-postgres")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_v102_rerun_keeps_every_sync_seq_and_the_counter_9082() {
+    let _g = ENV_LOCK.lock().await;
+    set_posture();
+    v102_rerun_keeps_seq(Backend::Postgres).await;
+    clear_posture();
+}
+
+/// Drop the triggers a column drop needs out of the way (the F2 helpers).
+async fn drop_seq_triggers(node: &Node) {
+    #[cfg(feature = "sal-postgres")]
+    if let Some((pool, _)) = node.pg.as_ref() {
+        sqlx::raw_sql(ai_memory::storage::sync_seq::SQL_DROP_SYNC_SEQ_TRIGGERS_PG)
+            .execute(pool)
+            .await
+            .expect("drop pg triggers");
+        return;
+    }
+    let guard = node.db.lock().await;
+    guard
+        .0
+        .execute_batch(ai_memory::storage::sync_seq::SQL_DROP_SYNC_SEQ_TRIGGERS)
+        .expect("drop sqlite triggers");
+}
+
+/// #9176 r1: a row written while the triggers are dropped (a ladder re-run
+/// that drops a bump column) is numbered above the head by the v102 re-run
+/// and served, never left at a placeholder (postgres) or the default 0
+/// (sqlite) that no walk reaches. Assigned values are kept.
+async fn v102_rerun_numbers_rows_written_without_triggers(backend: Backend) {
+    const ASSIGNED_ROWS: usize = 3;
+    let Some(n) = node(backend, "heal").await else {
+        return;
+    };
+    for i in 0..ASSIGNED_ROWS {
+        seed(&n, &format!("heal-{i}"), TS_EQUAL, 5).await;
+    }
+    let before = seq_snapshot(&n).await;
+    drop_seq_triggers(&n).await;
+    seed(&n, "heal-orphan", TS_EQUAL, 5).await;
+    assert!(
+        seq_of(&n, "heal-orphan").await <= 0,
+        "{backend:?}: without the triggers the row is unnumbered"
+    );
+    rerun_v102(&n).await;
+    let head = i64::try_from(ASSIGNED_ROWS).expect("rows");
+    assert_eq!(
+        seq_of(&n, "heal-orphan").await,
+        head + 1,
+        "{backend:?}: the re-run numbers the row above the head"
+    );
+    let after = seq_snapshot(&n).await;
+    assert_eq!(after.1.0, head + 1, "{backend:?}: the head moves past it");
+    assert_eq!(after.1.1, before.1.1, "{backend:?}: the epoch is kept");
+    for row in &before.0 {
+        assert!(
+            after.0.contains(row),
+            "{backend:?}: assigned value kept: {row:?}"
+        );
+    }
+    let page = pull_seq(&n.router, head, PAGE).await;
+    assert_eq!(
+        ids(&page),
+        vec!["heal-orphan".to_string()],
+        "{backend:?}: the walk serves the row: {page}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sqlite_v102_rerun_numbers_rows_written_without_triggers_9176() {
+    let _g = ENV_LOCK.lock().await;
+    set_posture();
+    v102_rerun_numbers_rows_written_without_triggers(Backend::Sqlite).await;
+    clear_posture();
+}
+
+#[cfg(feature = "sal-postgres")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_v102_rerun_numbers_rows_written_without_triggers_9176() {
+    let _g = ENV_LOCK.lock().await;
+    set_posture();
+    v102_rerun_numbers_rows_written_without_triggers(Backend::Postgres).await;
     clear_posture();
 }
 
@@ -961,86 +1185,189 @@ async fn postgres_concurrent_writers_commit_in_seq_order_9082() {
     clear_posture();
 }
 
-/// The counter lock can deadlock against a writer that takes another lock
-/// first. Postgres detects it and aborts exactly one side with SQLSTATE
-/// 40P01 (the code the `tx_retry` funnel retries); the other commits, and the
-/// counter matches the committed rows. Never a hang.
+/// F5 (#9176 r1): the counter is taken only at COMMIT (a deferred constraint
+/// trigger), after every row lock the transaction needs is already held, so
+/// it can never be one edge of a lock cycle. The shape is the production one:
+/// writer `two` locks its rows up front (the `lock_order_4209` funnel: SELECT
+/// ... FOR UPDATE, then UPDATE) while writer `one` has already changed a row
+/// and then needs a row `two` holds. Before the fix `two` waited for the
+/// counter `one` held and `one` waited for `two`'s row: SQLSTATE 40P01 on one
+/// side, a failed write that no caller retries. Now both commit, in commit
+/// order, and the counter matches the committed rows.
 #[cfg(feature = "sal-postgres")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn postgres_counter_deadlock_aborts_one_side_with_40p01_9082() {
+async fn postgres_multi_row_writers_never_deadlock_on_the_counter_9082() {
     let _g = ENV_LOCK.lock().await;
     set_posture();
     let Some(n) = postgres_node("deadlock").await else {
         clear_posture();
         return;
     };
-    seed(&n, "dl-a", TS_EQUAL, 5).await;
-    seed(&n, "dl-b", TS_EQUAL, 5).await;
+    for id in ["dl-a", "dl-b", "dl-c"] {
+        seed(&n, id, TS_EQUAL, 5).await;
+    }
+    let seeded_head = seq_snapshot(&n).await.1.0;
     let (pool, _) = n.pg.as_ref().expect("pg");
     let mut one = pool.begin().await.expect("tx one");
     let mut two = pool.begin().await.expect("tx two");
-    // one: changes dl-a (takes the counter lock).
+    // one: a replicated change on dl-a (the old design took the counter here).
     sqlx::query("UPDATE memories SET title = 'one' WHERE id = 'dl-a'")
         .execute(&mut *one)
         .await
         .expect("one changes dl-a");
-    // two: locks dl-b without a replicated change (no counter yet).
+    // two: locks dl-b up front, then changes dl-c.
     sqlx::query("SELECT 1 FROM memories WHERE id = 'dl-b' FOR UPDATE")
         .execute(&mut *two)
         .await
         .expect("two locks dl-b");
-    let two_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
-        .fetch_one(&mut *two)
-        .await
-        .expect("pid");
     let two_task = tokio::spawn(async move {
-        // two: now needs the counter (held by one).
-        let r = sqlx::query("UPDATE memories SET title = 'two' WHERE id = 'dl-a'")
+        sqlx::query("UPDATE memories SET title = 'two' WHERE id = 'dl-c'")
             .execute(&mut *two)
-            .await;
-        (r.map(|_| ()), two)
+            .await?;
+        sqlx::query("UPDATE memories SET title = 'two-b' WHERE id = 'dl-b'")
+            .execute(&mut *two)
+            .await?;
+        two.commit().await
     });
-    wait_until_lock_waiting(pool, two_pid).await;
-    // one: needs dl-b (held by two) -> the cycle.
-    let one_result = sqlx::query("UPDATE memories SET title = 'one-b' WHERE id = 'dl-b'")
-        .execute(&mut *one)
-        .await
-        .map(|_| ());
-    let (two_result, two) = two_task.await.expect("join two");
+    let one_task = tokio::spawn(async move {
+        // one: needs dl-b, which two holds until it commits.
+        sqlx::query("UPDATE memories SET title = 'one-b' WHERE id = 'dl-b'")
+            .execute(&mut *one)
+            .await?;
+        one.commit().await
+    });
     let code = |r: &Result<(), sqlx::Error>| -> Option<String> {
         match r {
             Err(sqlx::Error::Database(db)) => db.code().map(|c| c.to_string()),
-            _ => None,
+            Err(other) => Some(other.to_string()),
+            Ok(()) => None,
         }
     };
-    let codes = [code(&one_result), code(&two_result)];
+    let two_result = two_task.await.expect("join two");
+    let one_result = one_task.await.expect("join one");
     assert_eq!(
-        codes
-            .iter()
-            .filter(|c| c.as_deref() == Some("40P01"))
-            .count(),
-        1,
-        "exactly one side is the deadlock victim with SQLSTATE 40P01: {codes:?}"
+        [code(&two_result), code(&one_result)],
+        [None, None],
+        "both writers commit: no 40P01 deadlock victim"
     );
-    if one_result.is_ok() {
-        one.commit().await.expect("commit one");
-        drop(two);
-    } else {
-        drop(one);
-        // two holds the counter now; its update of dl-a went through.
-        two.commit().await.expect("commit two");
-    }
-    let head: i64 = sqlx::query_scalar("SELECT head FROM sync_seq_counter WHERE id = 1")
-        .fetch_one(pool)
-        .await
-        .expect("head");
-    let max: i64 = sqlx::query_scalar("SELECT MAX(sync_seq) FROM memories")
-        .fetch_one(pool)
-        .await
-        .expect("max");
+    let snap = seq_snapshot(&n).await;
+    let seq = |id: &str| {
+        snap.0
+            .iter()
+            .find(|(i, _)| i == id)
+            .map(|(_, s)| *s)
+            .expect("row present")
+    };
+    // two commits first and numbers dl-c (+1) and dl-b (+2); one's commit
+    // then numbers dl-a (+3) and re-numbers dl-b (+4), the last writer.
     assert_eq!(
-        head, max,
-        "the counter matches the committed rows after the abort"
+        [seq("dl-c"), seq("dl-a"), seq("dl-b")],
+        [seeded_head + 1, seeded_head + 3, seeded_head + 4],
+        "seq order is commit order, the last writer of dl-b holds the highest seq"
+    );
+    assert_eq!(
+        snap.1.0,
+        seeded_head + 4,
+        "the counter matches the committed rows"
+    );
+    clear_posture();
+}
+
+/// Insert a corpus row inside an open transaction (the [`seed`] shape).
+#[cfg(feature = "sal-postgres")]
+async fn insert_in_tx(tx: &mut sqlx::PgConnection, id: &str) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, \
+         confidence, source, metadata, access_count, created_at, updated_at) \
+         VALUES ($1, 'long', $2, $3, 'sync_seq corpus row (#9082)', '[]'::jsonb, 5, 1.0, \
+         'api', '{\"agent_id\":\"ai:puller\",\"scope\":\"collective\"}'::jsonb, 0, \
+         $4::timestamptz, $5::timestamptz)",
+    )
+    .bind(id)
+    .bind(NAMESPACE)
+    .bind(format!("row {id}"))
+    .bind(TS_MIN)
+    .bind(TS_EQUAL)
+    .execute(tx)
+    .await
+    .map(|_| ())
+}
+
+/// F5 (#9176 r1), the INSERT sibling of the test above: a new row takes only
+/// a placeholder at insert time (the after-insert assignment is deferred to
+/// COMMIT), so a multi-row writer that inserts and then needs a row another
+/// writer holds is never one edge of a cycle through the counter. Before the
+/// fix `one`'s insert held the counter, `two`'s insert waited for it while
+/// `two` held the row `one` needed next: 40P01 on one side.
+#[cfg(feature = "sal-postgres")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn postgres_multi_row_inserters_never_deadlock_on_the_counter_9176() {
+    let _g = ENV_LOCK.lock().await;
+    set_posture();
+    let Some(n) = postgres_node("deadlock_ins").await else {
+        clear_posture();
+        return;
+    };
+    seed(&n, "di-b", TS_EQUAL, 5).await;
+    let seeded_head = seq_snapshot(&n).await.1.0;
+    let (pool, _) = n.pg.as_ref().expect("pg");
+    let mut one = pool.begin().await.expect("tx one");
+    let mut two = pool.begin().await.expect("tx two");
+    // one: inserts a row (the old design took the counter here).
+    insert_in_tx(&mut one, "di-one").await.expect("one inserts");
+    // two: locks di-b up front.
+    sqlx::query("SELECT 1 FROM memories WHERE id = 'di-b' FOR UPDATE")
+        .execute(&mut *two)
+        .await
+        .expect("two locks di-b");
+    let two_task = tokio::spawn(async move {
+        insert_in_tx(&mut two, "di-two").await?;
+        two.commit().await
+    });
+    let one_task = tokio::spawn(async move {
+        // one: needs di-b, which two holds until it commits.
+        sqlx::query("UPDATE memories SET title = 'one-b' WHERE id = 'di-b'")
+            .execute(&mut *one)
+            .await?;
+        one.commit().await
+    });
+    let code = |r: &Result<(), sqlx::Error>| -> Option<String> {
+        match r {
+            Err(sqlx::Error::Database(db)) => db.code().map(|c| c.to_string()),
+            Err(other) => Some(other.to_string()),
+            Ok(()) => None,
+        }
+    };
+    let two_result = two_task.await.expect("join two");
+    let one_result = one_task.await.expect("join one");
+    assert_eq!(
+        [code(&two_result), code(&one_result)],
+        [None, None],
+        "both inserters commit: no 40P01 deadlock victim"
+    );
+    let snap = seq_snapshot(&n).await;
+    let seq = |id: &str| {
+        snap.0
+            .iter()
+            .find(|(i, _)| i == id)
+            .map(|(_, s)| *s)
+            .expect("row present")
+    };
+    // two commits first and numbers di-two (+1); one's commit then numbers
+    // di-one (+2) and re-numbers di-b (+3), in that trigger order.
+    assert_eq!(
+        seq("di-two"),
+        seeded_head + 1,
+        "the first committer takes the next value"
+    );
+    assert!(
+        seq("di-one") > seeded_head + 1 && seq("di-b") > seeded_head + 1,
+        "the later committer's rows sit above it: {snap:?}"
+    );
+    assert_eq!(
+        snap.1.0,
+        seeded_head + 3,
+        "the counter matches the committed rows"
     );
     clear_posture();
 }
@@ -1288,4 +1615,381 @@ async fn seq_puller_rewalks_a_restored_peer_with_a_stale_high_cursor_9082() {
         "cursor adopts the new epoch"
     );
     clear_posture();
+}
+
+/// A peer restored under the puller's cursor whose head has since passed the
+/// stored `last_seq` (new epoch, head above the cursor): the server cannot see
+/// the stale cursor, so only the puller's epoch check walks it from 0. Without
+/// it the rows numbered at or below the old cursor are skipped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn seq_puller_rewalks_a_restored_peer_whose_head_passed_the_cursor_9082() {
+    const PRE_RESTORE_ROWS: usize = 3;
+    const POST_RESTORE_ROWS: usize = PRE_RESTORE_ROWS + 2;
+    let _g = ENV_LOCK.lock().await;
+    set_posture();
+    let b = sqlite_node("passed-b");
+    let c = sqlite_node("passed-c");
+    let b_url = serve(&b).await;
+    let cfg = fed_config(NODE_C, NODE_B, &b_url);
+    for i in 0..PRE_RESTORE_ROWS {
+        seed(&b, &format!("pre-{i}"), TS_EQUAL, 5).await;
+    }
+    assert_eq!(pass(&cfg, &c).await.applied, PRE_RESTORE_ROWS, "first walk");
+    {
+        let guard = b.db.lock().await;
+        guard
+            .0
+            .execute_batch(
+                "DELETE FROM memories; UPDATE sync_seq_counter SET head = 0 WHERE id = 1;",
+            )
+            .expect("simulate restore");
+        ai_memory::storage::sync_seq::regenerate_seq_epoch(&guard.0).expect("regen");
+    }
+    let mut post = BTreeSet::new();
+    for i in 0..POST_RESTORE_ROWS {
+        let id = format!("post-{i}");
+        seed(&b, &id, TS_RELAYED, 5).await;
+        post.insert(id);
+    }
+    // decision: assert a two-window convergence over one window, because
+    // `resolve_seq` answers 0 on an epoch mismatch and each catch-up pass
+    // walks one window per peer: the first window lands the rows above the
+    // old cursor and re-arms the walk at 0 under the new epoch, the second
+    // walks the new numbering from the start.
+    let first = pass(&cfg, &c).await;
+    assert_eq!(
+        first.applied,
+        POST_RESTORE_ROWS - PRE_RESTORE_ROWS,
+        "the first window lands the rows numbered above the old cursor"
+    );
+    let rearmed = pull_cursor(&c, NODE_C, NODE_B);
+    assert_eq!(
+        rearmed.last_seq,
+        Some(0),
+        "an epoch mismatch re-arms the walk at 0"
+    );
+    let head_epoch = {
+        let guard = b.db.lock().await;
+        ai_memory::storage::sync_seq::seq_head(&guard.0)
+            .expect("head")
+            .epoch
+    };
+    assert_eq!(
+        rearmed.seq_epoch,
+        Some(head_epoch),
+        "the re-armed cursor carries the new epoch"
+    );
+    let _second = pass(&cfg, &c).await;
+    let got = stored(&c).await;
+    assert!(post.is_subset(&got), "post-restore rows stored: {got:?}");
+    let cursor = pull_cursor(&c, NODE_C, NODE_B);
+    assert_eq!(
+        cursor.last_seq,
+        Some(i64::try_from(POST_RESTORE_ROWS).expect("rows")),
+        "cursor at the restored head"
+    );
+    clear_posture();
+}
+
+// ---------------------------------------------------------------------------
+// #9176 round 1
+// ---------------------------------------------------------------------------
+
+/// F6 (PostgreSQL): a database that comes back from a restore carries another
+/// instance's `node_identity` and a lower head. The next connect re-mints the
+/// epoch, so a puller whose cursor the restored head has already passed walks
+/// it from 0 and lands every row written after the restore, including those
+/// numbered at or below its old cursor.
+#[cfg(feature = "sal-postgres")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn postgres_restored_peer_is_rewalked_after_its_head_passes_the_cursor_9176() {
+    const PRE_RESTORE_ROWS: usize = 3;
+    const POST_RESTORE_ROWS: usize = PRE_RESTORE_ROWS + 2;
+    const FOREIGN_IDENTITY: &str = "restored-from-another-cluster:00000001:1";
+    let _g = ENV_LOCK.lock().await;
+    set_posture();
+    let Some(b) = postgres_node("pg-restored-b").await else {
+        clear_posture();
+        return;
+    };
+    let (pool, scratch) = b.pg.as_ref().expect("pg node");
+    let bound: Option<String> =
+        sqlx::query_scalar("SELECT node_identity FROM sync_seq_counter WHERE id = 1")
+            .fetch_one(pool)
+            .await
+            .expect("identity");
+    let live_identity = bound.expect("connect binds the node identity (#9176 F6)");
+    let c = sqlite_node("pg-restored-c");
+    let b_url = serve(&b).await;
+    let cfg = fed_config(NODE_C, NODE_B, &b_url);
+    for i in 0..PRE_RESTORE_ROWS {
+        seed(&b, &format!("pre-{i}"), TS_EQUAL, 5).await;
+    }
+    assert_eq!(pass(&cfg, &c).await.applied, PRE_RESTORE_ROWS, "first walk");
+    let before = epoch(&pull_seq(&b.router, 0, PAGE).await);
+    // The restore: the rows after the snapshot are gone, the counter is back
+    // at the snapshot head and the identity is the source instance's.
+    sqlx::raw_sql(&format!(
+        "DELETE FROM memories; UPDATE sync_seq_counter SET head = 0, \
+         node_identity = '{FOREIGN_IDENTITY}' WHERE id = 1;"
+    ))
+    .execute(pool)
+    .await
+    .expect("simulate restore");
+    let _reopened = ai_memory::store::postgres::PostgresStore::connect(&scratch.url())
+        .await
+        .expect("reconnect the restored database");
+    let (identity, head): (Option<String>, i64) =
+        sqlx::query_as("SELECT node_identity, head FROM sync_seq_counter WHERE id = 1")
+            .fetch_one(pool)
+            .await
+            .expect("counter");
+    assert_eq!(
+        identity.as_deref(),
+        Some(live_identity.as_str()),
+        "re-bound"
+    );
+    assert_eq!(head, 0, "the restored head is kept");
+    let after = epoch(&pull_seq(&b.router, 0, PAGE).await);
+    assert_ne!(
+        after, before,
+        "a restored database gets a new epoch (#9176 F6)"
+    );
+    let mut post = BTreeSet::new();
+    for i in 0..POST_RESTORE_ROWS {
+        let id = format!("post-{i}");
+        seed(&b, &id, TS_RELAYED, 5).await;
+        post.insert(id);
+    }
+    // Two windows, as on SQLite: the first lands the rows above the old
+    // cursor and re-arms the walk at 0 under the new epoch.
+    let first = pass(&cfg, &c).await;
+    assert_eq!(
+        first.applied,
+        POST_RESTORE_ROWS - PRE_RESTORE_ROWS,
+        "the first window lands the rows numbered above the old cursor"
+    );
+    assert_eq!(
+        pull_cursor(&c, NODE_C, NODE_B).last_seq,
+        Some(0),
+        "an epoch mismatch re-arms the walk at 0"
+    );
+    let _second = pass(&cfg, &c).await;
+    assert!(
+        post.is_subset(&stored(&c).await),
+        "every row written after the restore lands, including those numbered at or below the old cursor"
+    );
+    let cursor = pull_cursor(&c, NODE_C, NODE_B);
+    assert_eq!(
+        cursor.seq_epoch.as_deref(),
+        Some(after.as_str()),
+        "new epoch adopted"
+    );
+    // A plain reconnect of the same instance keeps the epoch.
+    let _again = ai_memory::store::postgres::PostgresStore::connect(&scratch.url())
+        .await
+        .expect("reconnect");
+    assert_eq!(epoch(&pull_seq(&b.router, 0, PAGE).await), after, "stable");
+    clear_posture();
+}
+
+/// S4: `limit=0` makes the same progress on both backends: a page of one row.
+async fn limit_zero_parity(backend: Backend) {
+    let Some(n) = node(backend, "limit-zero").await else {
+        return;
+    };
+    seed(&n, "lz-1", TS_EQUAL, 5).await;
+    seed(&n, "lz-2", TS_ABOVE, 5).await;
+    let v = pull_seq(&n.router, 0, 0).await;
+    assert_eq!(ids(&v), ["lz-1"], "{backend:?}: limit=0 serves one row");
+    assert_eq!(next_seq(&v), 1, "{backend:?}: limit=0 advances by one");
+    assert_eq!(
+        v["limit"], 1,
+        "{backend:?}: the echoed limit is the clamped one"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sqlite_seq_limit_zero_advances_one_row_9176() {
+    let _g = ENV_LOCK.lock().await;
+    set_posture();
+    limit_zero_parity(Backend::Sqlite).await;
+    clear_posture();
+}
+
+#[cfg(feature = "sal-postgres")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_seq_limit_zero_advances_one_row_9176() {
+    let _g = ENV_LOCK.lock().await;
+    set_posture();
+    limit_zero_parity(Backend::Postgres).await;
+    clear_posture();
+}
+
+/// S5: a row this node cannot decrypt is passed by `next_seq` and recorded in
+/// the page's `undecryptable` list with its seq and id (the handler WARNs it).
+async fn undecryptable_is_recorded(backend: Backend) {
+    let Some(n) = node(backend, "undecryptable").await else {
+        return;
+    };
+    for id in ["ud-1", "ud-2", "ud-3"] {
+        seed(&n, id, TS_EQUAL, 5).await;
+    }
+    // Poison ud-2: a non-NULL envelope that opens under no key. The write
+    // bumps its seq to 4.
+    exec(
+        &n,
+        "UPDATE memories SET content = '', encrypted_envelope = randomblob(48) WHERE id = ?1",
+        "UPDATE memories SET content = '', encrypted_envelope = decode(repeat('ff', 48), 'hex') \
+         WHERE id = $1",
+        "ud-2",
+    )
+    .await;
+    assert_eq!(
+        seq_of(&n, "ud-2").await,
+        4,
+        "{backend:?}: the poison write bumps"
+    );
+    let v = pull_seq(&n.router, 0, PAGE).await;
+    assert_eq!(
+        ids(&v),
+        ["ud-1", "ud-3"],
+        "{backend:?}: the row is not served"
+    );
+    assert_eq!(next_seq(&v), 4, "{backend:?}: next_seq passes it");
+    let page = page_after_seq(&n, 0, PAGE).await;
+    assert_eq!(
+        page.undecryptable,
+        vec![(4, "ud-2".to_string())],
+        "{backend:?}: recorded with its seq and id"
+    );
+    assert_eq!(page.next_seq, 4, "{backend:?}");
+}
+
+async fn page_after_seq(
+    node: &Node,
+    after: i64,
+    limit: usize,
+) -> ai_memory::storage::sync_seq::SeqPage {
+    #[cfg(feature = "sal-postgres")]
+    if let Some((_, scratch)) = node.pg.as_ref() {
+        use ai_memory::store::MemoryStore as _;
+        let store = ai_memory::store::postgres::PostgresStore::connect(&scratch.url())
+            .await
+            .expect("connect");
+        return store
+            .list_memories_after_seq(after, limit)
+            .await
+            .expect("pg page");
+    }
+    let guard = node.db.lock().await;
+    ai_memory::storage::sync_seq::memories_after_seq(&guard.0, after, limit).expect("page")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sqlite_seq_walk_records_an_undecryptable_row_9176() {
+    let _g = ENV_LOCK.lock().await;
+    set_posture();
+    undecryptable_is_recorded(Backend::Sqlite).await;
+    clear_posture();
+}
+
+#[cfg(feature = "sal-postgres")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_seq_walk_records_an_undecryptable_row_9176() {
+    let _g = ENV_LOCK.lock().await;
+    set_posture();
+    undecryptable_is_recorded(Backend::Postgres).await;
+    clear_posture();
+}
+
+/// F8: the seq path records no serving-side `sync_state` row for the puller;
+/// the since path on the same node does (the probe sees real writes).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn seq_pull_records_no_serving_sync_state_9176() {
+    let _g = ENV_LOCK.lock().await;
+    set_posture();
+    let n = sqlite_node("no-observe");
+    seed(&n, "obs-1", TS_EQUAL, 5).await;
+    let rows = |n: &Node| {
+        let conn = rusqlite::Connection::open(&n.db_path).expect("open");
+        conn.query_row(
+            "SELECT COUNT(*) FROM sync_state WHERE peer_id = ?1",
+            [NODE_C],
+            |r| r.get::<_, i64>(0),
+        )
+        .expect("count")
+    };
+    let _ = pull_seq(&n.router, 0, PAGE).await;
+    assert_eq!(
+        rows(&n),
+        0,
+        "the seq path records no sync_state row (#9176 F8)"
+    );
+    let (status, body) = get(&n.router, None, PAGE).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(rows(&n), 1, "the since path records one (control)");
+    clear_posture();
+}
+
+/// F2/S2 SSOT: both migrations' `memories_sync_seq_au` column lists (the
+/// `UPDATE OF` list and the `WHEN` chain) are exactly `SYNC_SEQ_BUMP_COLUMNS`,
+/// and any later migration that drops or renames one of those columns drops
+/// the trigger first.
+#[test]
+fn sync_seq_trigger_columns_match_the_ssot_9176() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let ssot: Vec<&str> = ai_memory::storage::sync_seq::SYNC_SEQ_BUMP_COLUMNS.to_vec();
+    for rel in [
+        "migrations/sqlite/0086_v102_sync_seq.sql",
+        "migrations/postgres/0059_v102_sync_seq.sql",
+    ] {
+        let sql = std::fs::read_to_string(root.join(rel)).expect("read migration");
+        let start = sql.find("AFTER UPDATE OF").expect("au trigger") + "AFTER UPDATE OF".len();
+        let end = start + sql[start..].find("ON memories").expect("ON memories");
+        let listed: Vec<&str> = sql[start..end].split(',').map(str::trim).collect();
+        assert_eq!(listed, ssot, "{rel}: UPDATE OF list");
+        let when = &sql[end..end + sql[end..].find(';').expect("trigger end")];
+        let mut seen: Vec<&str> = Vec::new();
+        for part in when.split("OLD.").skip(1) {
+            let col = part
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .next()
+                .expect("column");
+            if !seen.contains(&col) {
+                seen.push(col);
+            }
+        }
+        assert_eq!(seen, ssot, "{rel}: WHEN chain");
+    }
+    for (dir, after) in [("migrations/sqlite", 86_u32), ("migrations/postgres", 59)] {
+        for entry in std::fs::read_dir(root.join(dir)).expect("read dir") {
+            let path = entry.expect("entry").path();
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default()
+                .to_string();
+            let Some(num) = name.split('_').next().and_then(|n| n.parse::<u32>().ok()) else {
+                continue;
+            };
+            if num <= after {
+                continue;
+            }
+            let sql = std::fs::read_to_string(&path)
+                .expect("read")
+                .to_ascii_lowercase();
+            let touches = ssot.iter().any(|c| {
+                sql.contains(&format!("drop column {c}"))
+                    || sql.contains(&format!("drop column if exists {c}"))
+                    || sql.contains(&format!("rename column {c}"))
+            });
+            if touches {
+                assert!(
+                    sql.contains("drop trigger if exists memories_sync_seq_au"),
+                    "{name}: drops or renames a sync_seq column without rebuilding memories_sync_seq_au"
+                );
+            }
+        }
+    }
 }
