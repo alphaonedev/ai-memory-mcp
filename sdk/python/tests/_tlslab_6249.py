@@ -183,6 +183,9 @@ class _TLSServer(ThreadingHTTPServer):
 
     def __init__(self, ssl_context: ssl.SSLContext) -> None:
         self._ssl_context = ssl_context
+        self._count_lock = threading.Lock()
+        #: Server-side handshakes that completed (a refused client adds none).
+        self.handshakes = 0
         super().__init__(("127.0.0.1", 0), _Handler)
 
     def get_request(self) -> tuple[Any, Any]:
@@ -197,6 +200,8 @@ class _TLSServer(ThreadingHTTPServer):
             tls = self._ssl_context.wrap_socket(request, server_side=True)
         except (ssl.SSLError, OSError):
             return
+        with self._count_lock:
+            self.handshakes += 1
         try:
             super().finish_request(tls, client_address)
         finally:
@@ -221,6 +226,11 @@ class LabServer:
             ctx.load_verify_locations(cafile=str(client_ca))
         self._server = _TLSServer(ctx)
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+
+    @property
+    def handshakes(self) -> int:
+        """Completed server-side handshakes so far."""
+        return self._server.handshakes
 
     @property
     def url(self) -> str:

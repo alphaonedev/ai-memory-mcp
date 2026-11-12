@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import os
 import pathlib
+import re
 import ssl
 import threading
 from collections.abc import Callable, Iterator
@@ -82,6 +83,9 @@ MSG_USE_TIME = (
     "ai-memory SDK refused the TLS handshake: certificate verification or hostname "
     "checking is off on the handshake context"
 )
+
+#: CPython's reason for a CA bundle with no PEM certificate in it.
+GARBAGE_BUNDLE_REASON = "no start line: cadata does not contain a certificate"
 
 CLIENT_KINDS = ("sync", "async")
 
@@ -443,9 +447,15 @@ def test_missing_or_garbage_ca_path_is_refused(lab: Lab, kind: str) -> None:
     garbage.write_text("not a certificate\n", encoding="utf-8")
     with pytest.raises(ValueError) as info:
         _make(kind, "https://127.0.0.1:1", verify=str(garbage))
-    assert str(info.value).startswith(
-        f"verify={str(garbage)!r} is refused: the CA bundle could not be loaded ("
-    )
+    # The reason is CPython's own text plus "(_ssl.c:NNNN)", the C source line
+    # of the build that raised it, which differs between Python builds; that
+    # number is the only part matched by pattern, the rest is exact.
+    assert re.fullmatch(
+        re.escape(f"verify={str(garbage)!r} is refused: the CA bundle could not be loaded (")
+        + re.escape(GARBAGE_BUNDLE_REASON)
+        + r" \(_ssl\.c:\d+\)\)",
+        str(info.value),
+    ), str(info.value)
 
 
 @pytest.mark.parametrize("kind", CLIENT_KINDS)
@@ -470,6 +480,34 @@ def test_default_trust_honours_ssl_cert_file_like_httpx(
     client = _make(kind, good_server.url)
     try:
         assert _health(client) == LAB_HEALTH_BODY
+    finally:
+        _close(client)
+
+
+@pytest.mark.parametrize("kind", CLIENT_KINDS)
+@pytest.mark.parametrize(
+    ("server", "outcome"),
+    [("good_server", "ok"), ("rogue_server", VERIFY_FAILED), ("wrong_host_server", VERIFY_FAILED)],
+    ids=["good", "rogue", "wrong_host"],
+)
+def test_default_trust_honours_ssl_cert_dir_like_httpx(
+    lab: Lab,
+    kind: str,
+    server: str,
+    outcome: str,
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SSL_CERT_DIR (a hashed capath) with SSL_CERT_FILE unset, as httpx reads it."""
+    lab_server: LabServer = request.getfixturevalue(server)
+    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+    monkeypatch.setenv("SSL_CERT_DIR", _hashed_ca_dir(lab))
+    client = _make(kind, lab_server.url)
+    try:
+        if outcome == "ok":
+            assert _health(client) == LAB_HEALTH_BODY
+        else:
+            _assert_refused(client, reason=outcome)
     finally:
         _close(client)
 
@@ -745,8 +783,48 @@ def test_oversized_ca_bundle_is_refused_within_a_bound(lab: Lab, kind: str) -> N
             ("a", "b", "c", "d"),
             "cert=<tuple> is refused: pass a certificate path or (certificate, key[, password])",
         ),
+        (
+            ("client.crt", 7),
+            (
+                "cert=<tuple> is refused: its key is <int>, not a path (str or "
+                "os.PathLike[str]) or None"
+            ),
+        ),
+        (
+            (7,),
+            (
+                "cert=<tuple> is refused: its certificate is <int>, not a path (str or "
+                "os.PathLike[str])"
+            ),
+        ),
+        (
+            (b"client.crt", "client.key"),
+            (
+                "cert=<tuple> is refused: its certificate is <bytes>, not a path (str or "
+                "os.PathLike[str])"
+            ),
+        ),
+        (
+            ("client.crt", "client.key", 7),
+            (
+                "cert=<tuple> is refused: its password is <int>, not a password (str, "
+                "bytes, bytearray, a callable or None)"
+            ),
+        ),
+        (
+            "",
+            "cert=<str> is refused: pass a certificate path or (certificate, key[, password])",
+        ),
     ],
-    ids=["bytes", "four_tuple"],
+    ids=[
+        "bytes",
+        "four_tuple",
+        "cert_non_path",
+        "cert_non_path_first",
+        "cert_bytes_path",
+        "cert_non_password",
+        "cert_empty",
+    ],
 )
 def test_unclassifiable_client_cert_is_refused(
     lab: Lab, kind: str, cert: Any, expected: str
