@@ -1142,6 +1142,93 @@ class VoteTally(LedgerCase):
                 self.assertNotIn("stays VOID", out)
 
 
+# #6124 round 1 mutation proof: one row per looser-detector arm, cap edge and pre-region
+# reason, so a gate with any one arm or bound weakened fails on an exact-reason assertion
+# and not only on a timing row. Every row carries an exact record.
+NBSP = " "
+LOOSE_STATUS_ARM_ROWS = (
+    ("word_without_star", "#### STATUS: LIVE as of 2026-11-13"),
+    ("unicode_space_separator", f"Status{NBSP}LIVE as of 2026-11-13"),
+    ("format_char_in_label", f"STA{ZERO_WIDTH}TUS: LIVE as of 2026-11-13"),
+)
+LOOSE_BINDS_ARM_ROWS = (
+    ("plural_then_colon", "Binds to: the commit named below"),
+    ("singular_then_hex_run", "bind to deadbeefcafe0123 per the note"),
+    ("hyphen_separator", "Bind-to: the commit named below"),
+)
+PRE_INLINE_ROWS = (
+    ("inline_html_naming_amendment", "Prose <span>Amendment 2026-11-14</span> here.",
+     "inline HTML naming an amendment or a status above the ledger"),
+    ("comment_not_closed_on_its_line", "Prose <!-- open",
+     "an HTML comment not closed on its line above the ledger"),
+)
+PAD_LINE = "y" * 80 + "\n"
+
+
+def doc_of_size(doc, records, size):
+    """with_ledger(DOC, *RECORDS) padded above the marker with prose to exactly SIZE bytes."""
+    bare = len(with_ledger(doc, *records, pre="\n").encode("utf-8"))
+    fill = size - bare
+    whole, rest = divmod(fill, len(PAD_LINE))
+    pad = PAD_LINE * whole + ("y" * (rest - 1) + "\n" if rest else "")
+    out = with_ledger(doc, *records, pre=pad + "\n")
+    if len(out.encode("utf-8")) != size:
+        raise AssertionError(f"fixture is {len(out.encode('utf-8'))} bytes, wanted {size}")
+    return out
+
+
+class MutationKillRows(LedgerCase):
+    def test_each_loose_status_arm_refuses_its_decoy(self):
+        s = self.scene("VOID")
+        for name, fake in LOOSE_STATUS_ARM_ROWS:
+            with self.subTest(row=name):
+                doc = with_ledger(s.doc, record(DAY, path_item(MOD_RS)), pre=fake + "\n\n")
+                ok, out = s.judge(self.wire_and_doc(s, doc))
+                self.assert_banner_refused(ok, out, LOOSE_STATUS, line_no(doc, fake), "head",
+                                           DUPLICATE_3556, "DUPLICATE -")
+
+    def test_each_loose_binds_arm_refuses_its_decoy(self):
+        # Same refusal shape as the M-3 row (Bounds): the decoy's line, then the #3556
+        # Binds text, then the parsed banner.
+        s = self.scene("VOID")
+        for name, fake in LOOSE_BINDS_ARM_ROWS:
+            with self.subTest(row=name):
+                doc = with_ledger(s.doc, record(DAY, path_item(MOD_RS)), pre=fake + "\n\n")
+                ok, out = s.judge(self.wire_and_doc(s, doc))
+                self.assert_banner_refused(ok, out, LOOSE_BINDS, line_no(doc, fake), "head",
+                                           BINDS_DUPLICATE_3556, "VOID -")
+
+    def test_two_binds_like_lines_still_name_the_duplicate(self):
+        s = self.scene("VOID")
+        fake = LOOSE_BINDS_ARM_ROWS[0][1]
+        doc = with_ledger(s.doc.replace(NO_BIND_LINE, bind_line(s.genesis)),
+                          record(DAY, path_item(MOD_RS)), pre=fake + "\n\n")
+        ok, out = s.judge(self.wire_and_doc(s, doc))
+        self.assert_banner_refused(ok, out, LOOSE_BINDS, line_no(doc, fake), "head",
+                                   BINDS_DUPLICATE_3556, "VOID DUPLICATE")
+
+    def test_size_cap_edge_is_exact(self):
+        s = self.scene("VOID")
+        rec = record(DAY, path_item(MOD_RS))
+        at_cap = doc_of_size(s.doc, (rec,), DOC_LIMIT_BYTES)
+        ok, out = s.judge(self.wire_and_doc(s, at_cap))
+        self.assert_pass(ok, out, "a new amendment record names every change")
+        over = doc_of_size(s.doc, (rec,), DOC_LIMIT_BYTES + 1)
+        ok, out = s.judge(self.wire_and_doc(s, over))
+        self.assert_banner_refused(
+            ok, out, f"the document is {DOC_LIMIT_BYTES + 1} bytes, over the {DOC_LIMIT_BYTES}-byte limit",
+            None, "head", UNPARSEABLE_3556, "UNPARSEABLE -")
+
+    def test_inline_html_rows_are_refused_at_their_line(self):
+        s = self.scene("VOID")
+        for name, fake, reason in PRE_INLINE_ROWS:
+            with self.subTest(row=name):
+                doc = with_ledger(s.doc, record(DAY, path_item(MOD_RS)), pre=fake + "\n\n")
+                ok, out = s.judge(self.wire_and_doc(s, doc))
+                self.assertFalse(ok, out)
+                self.assertEqual(out.split("\n"), [reason_line(reason, line_no(doc, fake))], out)
+
+
 class DocRecordForm(unittest.TestCase):
     """I5 / F3: the doc states the record form the parser reads."""
 
