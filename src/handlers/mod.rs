@@ -119,6 +119,7 @@ pub mod coordination;
 pub mod create;
 pub mod embed_offload;
 pub mod errors;
+pub(crate) mod fed_fanout;
 pub mod federation_receive;
 pub mod federation_signing_check;
 pub mod federation_sync_since;

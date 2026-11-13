@@ -85,6 +85,44 @@ fn entity_owner_forbidden(message: &str) -> axum::response::Response {
         .into_response()
 }
 
+/// #8741 (#9153) — the entity row a registration created or alias-merged
+/// is delivered to the peers through the ONE funnel on both backends
+/// (`memories[]`, insert-if-newer), then the unchanged receipt is returned
+/// with the quorum fields, or the exact `202 quorum_met false`.
+async fn entity_register_delivered(
+    app: &AppState,
+    reg: &crate::models::EntityRegistration,
+    written: Option<&crate::models::Memory>,
+) -> axum::response::Response {
+    let mut receipt = json!({
+        "entity_id": reg.entity_id,
+        (field_names::CANONICAL_NAME): reg.canonical_name,
+        "namespace": reg.namespace,
+        "aliases": reg.aliases,
+        "created": reg.created,
+    });
+    let delivered = match written {
+        Some(mem) => {
+            super::fed_fanout::fanout_into(
+                app,
+                super::fed_fanout::FanoutEffect::Store(mem),
+                &mut receipt,
+            )
+            .await
+        }
+        None => super::fed_fanout::readback_failed(app, &reg.entity_id),
+    };
+    let status = if reg.created {
+        StatusCode::CREATED
+    } else {
+        StatusCode::OK
+    };
+    match delivered {
+        Ok(()) => (status, Json(receipt)).into_response(),
+        Err(resp) => resp,
+    }
+}
+
 /// `POST /api/v1/entities` — REST mirror of the MCP
 /// `memory_entity_register` tool. Idempotent on
 /// `(canonical_name, namespace)`; merges aliases on re-registration.
@@ -277,21 +315,10 @@ pub async fn entity_register(
             )
             .await
         {
-            Ok(reg) => (
-                if reg.created {
-                    StatusCode::CREATED
-                } else {
-                    StatusCode::OK
-                },
-                Json(json!({
-                    "entity_id": reg.entity_id,
-                    (field_names::CANONICAL_NAME): reg.canonical_name,
-                    "namespace": reg.namespace,
-                    "aliases": reg.aliases,
-                    "created": reg.created,
-                })),
-            )
-                .into_response(),
+            Ok(reg) => {
+                let written = app.store.get(&ctx, &reg.entity_id).await.ok();
+                entity_register_delivered(&app, &reg, written.as_ref()).await
+            }
             // #3014 — 403 ATTESTATION_FAILED under global-strict (parity with
             // the store path); otherwise the typed StoreError mapping.
             Err(e) => crate::handlers::errors::attestation_refused_response(&e.to_string())
@@ -309,22 +336,9 @@ pub async fn entity_register(
         agent_id.as_deref(),
     ) {
         Ok(reg) => {
-            let status = if reg.created {
-                StatusCode::CREATED
-            } else {
-                StatusCode::OK
-            };
-            (
-                status,
-                Json(json!({
-                    "entity_id": reg.entity_id,
-                    (field_names::CANONICAL_NAME): reg.canonical_name,
-                    "namespace": reg.namespace,
-                    "aliases": reg.aliases,
-                    "created": reg.created,
-                })),
-            )
-                .into_response()
+            let written = db::get(&lock.0, &reg.entity_id).ok().flatten();
+            drop(lock);
+            entity_register_delivered(&app, &reg, written.as_ref()).await
         }
         Err(e) => {
             // Title-collision errors carry a stable, recognisable

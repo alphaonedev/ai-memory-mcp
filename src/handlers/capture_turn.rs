@@ -64,6 +64,42 @@ fn capture_turn_ok(
     }
 }
 
+/// #8741 (#9153) — the capture receipt after the fresh row went through
+/// the ONE fan-out funnel. `written` is `None` for a dedup replay (no
+/// write, nothing to deliver) and `Some(None)` when the committed row could
+/// not be read back (the exact 202 naming `FANOUT_READBACK_FAILED`).
+async fn capture_turn_delivered(
+    app: &AppState,
+    result: &crate::models::CaptureTurnResult,
+    attest_level: crate::models::AttestLevel,
+    written: Option<Option<crate::models::Memory>>,
+) -> Response {
+    let Some(written) = written else {
+        return capture_turn_ok(result, attest_level);
+    };
+    let mut receipt = json!({
+        "memory_id": result.memory_id,
+        "dedup_hit": false,
+        "layer": "L4",
+        (field_names::ATTEST_LEVEL): attest_level.as_str(),
+    });
+    let delivered = match written.as_ref() {
+        Some(mem) => {
+            super::fed_fanout::fanout_into(
+                app,
+                super::fed_fanout::FanoutEffect::Store(mem),
+                &mut receipt,
+            )
+            .await
+        }
+        None => super::fed_fanout::readback_failed(app, &result.memory_id),
+    };
+    match delivered {
+        Ok(()) => (StatusCode::CREATED, Json(receipt)).into_response(),
+        Err(resp) => resp,
+    }
+}
+
 /// `POST /api/v1/capture_turn` — host-volunteered L4 turn capture.
 ///
 /// Mirrors the MCP `memory_capture_turn` tool over HTTP so postgres-
@@ -164,7 +200,16 @@ async fn capture_turn_write(
         // adapter, so this serves both backends through the trait method.
         let ctx = crate::store::CallerContext::for_agent(agent_id).with_capability(capability);
         match app.store.capture_turn_idempotent(&ctx, &write).await {
-            Ok(result) => capture_turn_ok(&result, attest_level),
+            Ok(result) => {
+                // #8741 (#9153) — a fresh capture wrote a memory row: read
+                // it back as committed and deliver it to the peers.
+                let written = if result.dedup_hit {
+                    None
+                } else {
+                    Some(app.store.get(&ctx, &result.memory_id).await.ok())
+                };
+                capture_turn_delivered(&app, &result, attest_level, written).await
+            }
             Err(e) => store_err_to_response(e),
         }
     };
@@ -182,7 +227,15 @@ async fn capture_turn_write(
         // the SAL branch above, whose `for_agent` ctx has
         // `bypass_visibility = false`).
         match crate::storage::capture_turn_idempotent(&lock.0, &write, false) {
-            Ok(result) => capture_turn_ok(&result, attest_level),
+            Ok(result) => {
+                let written = if result.dedup_hit {
+                    None
+                } else {
+                    Some(crate::db::get(&lock.0, &result.memory_id).ok().flatten())
+                };
+                drop(lock);
+                capture_turn_delivered(&app, &result, attest_level, written).await
+            }
             Err(msg) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({ "error": msg })),

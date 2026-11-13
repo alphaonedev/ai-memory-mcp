@@ -22,9 +22,9 @@ use crate::validate;
 use super::AppState;
 #[cfg(feature = "sal")]
 use super::StorageBackend;
+use super::resolve_caller_agent_id;
 #[cfg(feature = "sal")]
 use super::store_err_to_response;
-use super::{fanout_or_pending, resolve_caller_agent_id};
 
 /// Marker tag on namespace-standard rows (#1558 batch 6).
 const NAMESPACE_STANDARD_TAG: &str = "_namespace_standard";
@@ -669,16 +669,57 @@ async fn set_namespace_standard_inner(
             .set_namespace_standard(&ctx, ns, &standard_id, body.parent.as_deref())
             .await
         {
-            Ok(()) => (
-                StatusCode::CREATED,
-                Json(json!({
+            Ok(()) => {
+                // #8741 (#9152) — deliver exactly what the SQLite arm
+                // delivers: the standard memory (read back as committed)
+                // and the explicit (namespace, standard_id, parent) binding.
+                let mut receipt = json!({
                     "namespace": ns,
                     (field_names::STANDARD_ID): standard_id,
                     "parent": body.parent,
                     (field_names::STORAGE_BACKEND): "postgres",
-                })),
-            )
-                .into_response(),
+                });
+                // #8741 round 1 (F8 / sec-F3) — both effects are read back
+                // from the store; a failed or empty read-back is the exact
+                // FANOUT_READBACK_FAILED 202, and nothing is pushed that was
+                // not read back (no entry built from request values).
+                match app.store.get(&ctx, &standard_id).await {
+                    Ok(mem) => {
+                        if let Err(resp) = super::fed_fanout::fanout_into(
+                            app,
+                            super::fed_fanout::FanoutEffect::Store(&mem),
+                            &mut receipt,
+                        )
+                        .await
+                        {
+                            return resp;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("set_namespace_standard(pg): read-back failed: {e}");
+                        return super::fed_fanout::readback_failed(app, &standard_id).map_or_else(
+                            |resp| resp,
+                            |()| (StatusCode::CREATED, Json(receipt)).into_response(),
+                        );
+                    }
+                }
+                let Some(entry) = pg_namespace_meta_entry(app, ns).await else {
+                    return super::fed_fanout::readback_failed(app, ns).map_or_else(
+                        |resp| resp,
+                        |()| (StatusCode::CREATED, Json(receipt)).into_response(),
+                    );
+                };
+                match super::fed_fanout::fanout_into(
+                    app,
+                    super::fed_fanout::FanoutEffect::NamespaceMeta(&entry),
+                    &mut receipt,
+                )
+                .await
+                {
+                    Ok(()) => (StatusCode::CREATED, Json(receipt)).into_response(),
+                    Err(resp) => resp,
+                }
+            }
             // #3758 / #4356 — the adapter's own in-transaction refusal (a bind
             // that raced the pre-check above), in the same closed shape and
             // status the pre-check and the sqlite arm return.
@@ -890,26 +931,41 @@ async fn set_namespace_standard_inner(
     drop(lock);
 
     match result {
-        Ok(v) => {
-            if let Some(ref mem) = standard_mem
-                && let Some(resp) = fanout_or_pending(app, mem).await
+        Ok(mut v) => {
+            // #8741 (#9152) — the same two effects as the PostgreSQL arm,
+            // through the ONE funnel (quorum fields on the receipt).
+            // #8741 round 1 (F3) — the set committed, so an absent read-back
+            // of either effect is the exact FANOUT_READBACK_FAILED 202 naming
+            // what could not be read, never a 201 that no peer received.
+            let Some(mem) = standard_mem.as_ref() else {
+                return super::fed_fanout::readback_failed(app, &resolved_id).map_or_else(
+                    |resp| resp,
+                    |()| (StatusCode::CREATED, Json(v)).into_response(),
+                );
+            };
+            if let Err(resp) = super::fed_fanout::fanout_into(
+                app,
+                super::fed_fanout::FanoutEffect::Store(mem),
+                &mut v,
+            )
+            .await
             {
                 return resp;
             }
-            if let (Some(entry), Some(fed)) = (meta_entry.as_ref(), app.federation.as_ref()) {
-                match crate::federation::broadcast_namespace_meta_quorum(fed, entry).await {
-                    Ok(tracker) => {
-                        if let Err(err) = crate::federation::finalise_quorum(&tracker) {
-                            // #869 — typed 503 envelope via the shared helper.
-                            let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
-                            return super::under_replicated_response(&payload);
-                        }
-                    }
-                    Err(err) => {
-                        let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
-                        return super::under_replicated_response(&payload);
-                    }
-                }
+            let Some(entry) = meta_entry.as_ref() else {
+                return super::fed_fanout::readback_failed(app, ns).map_or_else(
+                    |resp| resp,
+                    |()| (StatusCode::CREATED, Json(v)).into_response(),
+                );
+            };
+            if let Err(resp) = super::fed_fanout::fanout_into(
+                app,
+                super::fed_fanout::FanoutEffect::NamespaceMeta(entry),
+                &mut v,
+            )
+            .await
+            {
+                return resp;
             }
             (StatusCode::CREATED, Json(v)).into_response()
         }
@@ -1308,15 +1364,26 @@ async fn clear_namespace_standard_inner(
         // header-resolved id used for the audit-record above.
         let ctx = crate::store::CallerContext::for_agent(caller.clone());
         return match app.store.clear_namespace_standard(&ctx, ns).await {
-            Ok(true) => (
-                StatusCode::OK,
-                Json(json!({
+            Ok(true) => {
+                // #8741 (#9152) — the clear travels as the same
+                // `namespace_meta_clears` entry the SQLite arm sends.
+                let mut body = json!({
                     "cleared": true,
                     "namespace": ns,
                     (field_names::STORAGE_BACKEND): "postgres",
-                })),
-            )
-                .into_response(),
+                });
+                let namespaces = [ns.to_string()];
+                match super::fed_fanout::fanout_into(
+                    &app,
+                    super::fed_fanout::FanoutEffect::NamespaceMetaClear(&namespaces),
+                    &mut body,
+                )
+                .await
+                {
+                    Ok(()) => (StatusCode::OK, Json(body)).into_response(),
+                    Err(resp) => resp,
+                }
+            }
             Ok(false) => (
                 StatusCode::NOT_FOUND,
                 Json(json!({"error": "no namespace_meta row matched"})),
@@ -1358,26 +1425,18 @@ async fn clear_namespace_standard_inner(
     let result = crate::mcp::handle_namespace_clear_standard(&lock.0, &params);
     drop(lock);
     match result {
-        Ok(v) => {
-            if let Some(fed) = app.federation.as_ref() {
-                let namespaces = vec![ns.to_string()];
-                match crate::federation::broadcast_namespace_meta_clear_quorum(fed, &namespaces)
-                    .await
-                {
-                    Ok(tracker) => {
-                        if let Err(err) = crate::federation::finalise_quorum(&tracker) {
-                            // #869 — typed 503 envelope via the shared helper.
-                            let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
-                            return super::under_replicated_response(&payload);
-                        }
-                    }
-                    Err(err) => {
-                        let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
-                        return super::under_replicated_response(&payload);
-                    }
-                }
+        Ok(mut v) => {
+            let namespaces = [ns.to_string()];
+            match super::fed_fanout::fanout_into(
+                app,
+                super::fed_fanout::FanoutEffect::NamespaceMetaClear(&namespaces),
+                &mut v,
+            )
+            .await
+            {
+                Ok(()) => (StatusCode::OK, Json(v)).into_response(),
+                Err(resp) => resp,
             }
-            (StatusCode::OK, Json(v)).into_response()
         }
         // #3407 — the owner-gate refusal is the ONE closed shape on both
         // backends (403 `NOT_OWNER`, `namespace` echoed, owner never named);
@@ -1582,4 +1641,32 @@ pub async fn session_start(
         }
         Err(e) => (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response(),
     }
+}
+
+/// #8741 round 1 (F8 / sec-F3) — the committed `namespace_meta` row of `ns`
+/// on PostgreSQL, read through the concrete adapter (the trait has no
+/// `updated_at` reader). `None` on a read error (logged), an absent or
+/// severed row, or a non-Postgres adapter: the caller then reports the
+/// exact `FANOUT_READBACK_FAILED` 202.
+#[cfg(feature = "sal")]
+async fn pg_namespace_meta_entry(
+    app: &AppState,
+    ns: &str,
+) -> Option<crate::models::NamespaceMetaEntry> {
+    #[cfg(feature = "sal-postgres")]
+    if let Some(pg) = app
+        .store
+        .as_any()
+        .downcast_ref::<crate::store::postgres::PostgresStore>()
+    {
+        return match pg.get_namespace_meta_entry(ns).await {
+            Ok(entry) => entry,
+            Err(e) => {
+                tracing::warn!("set_namespace_standard(pg): namespace_meta read-back failed: {e}");
+                None
+            }
+        };
+    }
+    let _ = (app, ns);
+    None
 }

@@ -617,6 +617,53 @@ pub async fn search_memories(
     }
 }
 
+/// #9023 — detail on the `quorum_not_met` 202 when the forget committed but
+/// the exact erased id set could not be established, so no tombstone was
+/// sent (a guessed set could delete rows the origin kept).
+const FORGET_IDS_UNAVAILABLE: &str = "FORGET_IDS_UNAVAILABLE";
+
+/// #9023 — run the SAL forget and return `(count, erased ids)`. The
+/// PostgreSQL store returns its exact `DELETE .. RETURNING id` set through
+/// the concrete-type hatch (#2587 precedent); any other store returns the
+/// count with `None` (ids unknown), which the caller reports as the exact
+/// 202 when federation is on.
+#[cfg(feature = "sal")]
+async fn store_forget_ids(
+    app: &AppState,
+    ctx: &crate::store::CallerContext,
+    body: &ForgetQuery,
+    archive: bool,
+) -> crate::store::StoreResult<(usize, Option<Vec<String>>)> {
+    #[cfg(feature = "sal-postgres")]
+    if let Some(pg) = app
+        .store
+        .as_any()
+        .downcast_ref::<crate::store::postgres::PostgresStore>()
+    {
+        let ids = pg
+            .forget_returning_ids(
+                ctx,
+                body.namespace.as_deref(),
+                body.pattern.as_deref(),
+                body.tier.as_ref(),
+                archive,
+            )
+            .await?;
+        return Ok((ids.len(), Some(ids)));
+    }
+    let n = app
+        .store
+        .forget(
+            ctx,
+            body.namespace.as_deref(),
+            body.pattern.as_deref(),
+            body.tier.as_ref(),
+            archive,
+        )
+        .await?;
+    Ok((n, None))
+}
+
 pub async fn forget_memories(
     State(app): State<AppState>,
     headers: axum::http::HeaderMap,
@@ -729,18 +776,29 @@ pub async fn forget_memories(
         // delete memories that matched the namespace/pattern filter
         // regardless of ownership — a destructive privacy bug.
         let ctx = crate::handlers::parity::http_caller_ctx(&headers, None);
-        return match app
-            .store
-            .forget(
-                &ctx,
-                body.namespace.as_deref(),
-                body.pattern.as_deref(),
-                body.tier.as_ref(),
-                archive_flag,
-            )
-            .await
-        {
-            Ok(n) => Json(json!({"deleted": n})).into_response(),
+        return match store_forget_ids(&app, &ctx, &body, archive_flag).await {
+            Ok((n, erased)) => {
+                // #9023 (p2-siblings-06) — the erasure travels to the peers
+                // as chunked tombstones through the bulk funnel before the
+                // response (pre-fix the PG forget never fanned out).
+                let mut receipt = json!({"deleted": n});
+                let fanned = match erased {
+                    Some(ids) => {
+                        super::fed_fanout::fanout_bulk_into(
+                            &app,
+                            super::fed_fanout::BulkEffect::Delete,
+                            &ids,
+                            &mut receipt,
+                        )
+                        .await
+                    }
+                    None => super::fed_fanout::readback_failed(&app, FORGET_IDS_UNAVAILABLE),
+                };
+                if let Err(resp) = fanned {
+                    return resp;
+                }
+                Json(receipt).into_response()
+            }
             Err(e) => store_err_to_response(e),
         };
     }
@@ -755,15 +813,17 @@ pub async fn forget_memories(
     // and the forget, so no concurrent writer can diverge it. (postgres uses
     // pgvector / DB-side ANN, so its recall drops the row on DELETE — no
     // in-memory eviction needed there.)
-    let victim_ids: Vec<String> = db::forget_matches(
+    // #9023 — a failed match collect is kept (not flattened to empty) so the
+    // federation fan-out below can refuse a silent success.
+    let victims = db::forget_matches(
         &lock.0,
         body.namespace.as_deref(),
         body.pattern.as_deref(),
         body.tier.as_ref(),
         usize::MAX,
     )
-    .map(|rows| rows.into_iter().map(|m| m.id).collect())
-    .unwrap_or_default();
+    .map(|rows| rows.into_iter().map(|m| m.id).collect::<Vec<String>>());
+    let victim_ids: Vec<String> = victims.as_ref().map_or_else(|_| Vec::new(), Clone::clone);
     let forget_result = db::forget(
         &lock.0,
         body.namespace.as_deref(),
@@ -771,6 +831,18 @@ pub async fn forget_memories(
         body.tier.as_ref(),
         lock.3, // archive_on_gc
     );
+    // #9023 — peers apply exactly what the origin applied: under the same
+    // lock, keep only the victims the forget actually removed (an
+    // unfiltered by-id read that still finds a row means it was not
+    // erased). Any read fault makes the erased set unknown.
+    // #8741 round 1 (sec-F1) — one chunked id-only `IN` probe per
+    // FORGET_SURVIVOR_PROBE_CHUNK victims instead of a full-row read per id.
+    let erased: Option<Vec<String>> = match (&forget_result, &victims) {
+        (Ok(_), Ok(ids)) => erased_ids(&lock.0, ids)
+            .inspect_err(|e| tracing::warn!("forget: survivor probe failed: {e}"))
+            .ok(),
+        _ => None,
+    };
     // Drop the DB lock BEFORE taking the vector-index lock (the locking
     // discipline pinned at handlers/memories.rs — never hold both).
     drop(lock);
@@ -784,7 +856,26 @@ pub async fn forget_memories(
                     }
                 }
             }
-            Json(json!({"deleted": n})).into_response()
+            // #9023 (p2-siblings-06) — the erasure travels to the peers as
+            // chunked tombstones through the bulk funnel (pre-fix the HTTP
+            // forget never fanned out on either backend).
+            let mut receipt = json!({"deleted": n});
+            let fanned = match erased {
+                Some(ids) => {
+                    super::fed_fanout::fanout_bulk_into(
+                        &app,
+                        super::fed_fanout::BulkEffect::Delete,
+                        &ids,
+                        &mut receipt,
+                    )
+                    .await
+                }
+                None => super::fed_fanout::readback_failed(&app, FORGET_IDS_UNAVAILABLE),
+            };
+            if let Err(resp) = fanned {
+                return resp;
+            }
+            Json(receipt).into_response()
         }
         // #3707 — `db::forget` mixes TWO error populations on one arm, and my
         // first cut flattened both. `StorageError::InvalidArgument` is OUR OWN
@@ -873,3 +964,32 @@ pub async fn forget_memories(
 //   - validate_create early-return (1) empty title ⇒ 400
 //   - GovernanceRefusal downcast (1) → 403 + GOVERNANCE_REFUSED code
 // ===========================================================================
+
+/// #8741 round 1 (sec-F1) — victims per survivor probe statement (well under
+/// SQLite's bound-parameter limit).
+const FORGET_SURVIVOR_PROBE_CHUNK: usize = 500;
+
+/// #9023 / #8741 round 1 — the victims the forget actually removed: every
+/// id of `victims` that no longer has a `memories` row (an unfiltered
+/// id-only probe, so a row the forget kept for any reason is not reported
+/// as erased). One `SELECT id ... WHERE id IN (..)` per
+/// [`FORGET_SURVIVOR_PROBE_CHUNK`] ids. Any probe error is an error: the
+/// erased set is then unknown and the caller refuses a silent success.
+fn erased_ids(conn: &rusqlite::Connection, victims: &[String]) -> rusqlite::Result<Vec<String>> {
+    let mut survivors = std::collections::HashSet::new();
+    for chunk in victims.chunks(FORGET_SURVIVOR_PROBE_CHUNK) {
+        let marks = vec!["?"; chunk.len()].join(",");
+        let mut stmt = conn.prepare(&format!("SELECT id FROM memories WHERE id IN ({marks})"))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |r| {
+            r.get::<_, String>(0)
+        })?;
+        for row in rows {
+            survivors.insert(row?);
+        }
+    }
+    Ok(victims
+        .iter()
+        .filter(|id| !survivors.contains(id.as_str()))
+        .cloned()
+        .collect())
+}

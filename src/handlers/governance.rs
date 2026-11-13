@@ -25,7 +25,6 @@ use crate::validate;
 use super::AppState;
 #[cfg(feature = "sal")]
 use super::StorageBackend;
-use super::fanout_or_pending;
 #[cfg(feature = "sal")]
 use super::store_err_to_response;
 
@@ -292,10 +291,8 @@ pub async fn approve_pending(
     // - audit emit + structured response envelope (Approved / Pending
     //   with vote count + quorum / Rejected with reason)
     //
-    // Federation fanout for the decision + executed memory remains
-    // sqlite-only (the broadcast_pending_decision_quorum path uses
-    // sqlite-coupled fed-tracker state); postgres operators relying on
-    // multi-node consistency should poll peers.
+    // #8741 (#9152): both arms fan out the decision and the executed
+    // memory through the ONE funnel.
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
         use crate::store::ApproveOutcome as SalOutcome;
@@ -352,15 +349,40 @@ pub async fn approve_pending(
                             None
                         }
                     };
-                Json(json!({
+                // #8741 (#9152) — fan out the decision AND the produced
+                // memory exactly as the SQLite arm does, through the ONE
+                // funnel; no PostgreSQL write path returns before it.
+                // #8741 round 1 (F3 / sec-F2) — unfiltered read (not the
+                // approver's visibility); a failed read-back is Unread.
+                let produced_mem = match executed_id
+                    .as_deref()
+                    .filter(|_| super::fed_fanout::Produced::leaves_row(pending_snapshot.as_ref()))
+                {
+                    Some(mid) => super::fed_fanout::Produced::from_read(
+                        mid,
+                        super::consolidate_federation::store_get_any(&*app.store, mid).await,
+                    ),
+                    None => super::fed_fanout::Produced::Nothing,
+                };
+                let mut body = json!({
                     "approved": true,
                     "id": id,
                     (field_names::DECIDED_BY): agent_id,
                     "executed": executed_id.is_some(),
                     "memory_id": executed_id,
                     (field_names::STORAGE_BACKEND): "postgres",
-                }))
-                .into_response()
+                });
+                let decision = PendingDecision {
+                    id: id.clone(),
+                    approved: true,
+                    decider: agent_id.clone(),
+                };
+                match super::fed_fanout::fanout_decision(&app, &decision, &produced_mem, &mut body)
+                    .await
+                {
+                    Ok(()) => Json(body).into_response(),
+                    Err(resp) => resp,
+                }
             }
             Ok(SalOutcome::Pending { votes, quorum }) => {
                 // #2634 — the approval vote was accepted (awaiting quorum).
@@ -431,51 +453,41 @@ pub async fn approve_pending(
                     // memory so approve on one node makes the governed write
                     // visible on every peer. Drop the DB lock before any
                     // outbound HTTP.
+                    // #8741 round 1 (F3) — a failed read-back is Unread.
                     let produced_mem = memory_id
                         .as_deref()
-                        .and_then(|mid| db::get(&lock.0, mid).ok().flatten());
+                        .filter(|_| {
+                            super::fed_fanout::Produced::leaves_row(pending_snapshot.as_ref())
+                        })
+                        .map_or(super::fed_fanout::Produced::Nothing, |mid| {
+                            super::fed_fanout::Produced::from_read(mid, db::get(&lock.0, mid))
+                        });
                     drop(lock);
-                    if let Some(fed) = app.federation.as_ref() {
-                        let decision = PendingDecision {
-                            id: id.clone(),
-                            approved: true,
-                            decider: agent_id.clone(),
-                        };
-                        match crate::federation::broadcast_pending_decision_quorum(fed, &decision)
-                            .await
-                        {
-                            Ok(tracker) => {
-                                if let Err(err) = crate::federation::finalise_quorum(&tracker) {
-                                    // #869 — typed 503 envelope via the shared helper.
-                                    let payload =
-                                        crate::federation::QuorumNotMetPayload::from_err(&err);
-                                    return super::under_replicated_response(&payload);
-                                }
-                            }
-                            Err(err) => {
-                                let payload =
-                                    crate::federation::QuorumNotMetPayload::from_err(&err);
-                                return super::under_replicated_response(&payload);
-                            }
-                        }
-                        // If approval produced a brand-new memory (store
-                        // path), also broadcast it so peers have the row.
-                        // delete / promote paths produce no new memory
-                        // (the pending payload carries memory_id).
-                        if let Some(ref mem) = produced_mem
-                            && let Some(resp) = fanout_or_pending(&app, mem).await
-                        {
-                            return resp;
-                        }
-                    }
-                    Json(json!({
+                    // #8741 (#9152) — the decision and the produced memory
+                    // through the ONE funnel, as on the PostgreSQL arm.
+                    let decision = PendingDecision {
+                        id: id.clone(),
+                        approved: true,
+                        decider: agent_id.clone(),
+                    };
+                    let mut body = json!({
                         "approved": true,
                         "id": id,
                         (field_names::DECIDED_BY): agent_id,
                         "executed": true,
                         "memory_id": memory_id,
-                    }))
-                    .into_response()
+                    });
+                    match super::fed_fanout::fanout_decision(
+                        &app,
+                        &decision,
+                        &produced_mem,
+                        &mut body,
+                    )
+                    .await
+                    {
+                        Ok(()) => Json(body).into_response(),
+                        Err(resp) => resp,
+                    }
                 }
                 Err(e) => {
                     tracing::error!("execute pending error: {e}");
@@ -628,13 +640,30 @@ pub async fn reject_pending(
                         crate::audit::target_memory(id.clone(), String::new(), None, None, None),
                     ));
                 }
-                Json(json!({
+                // #8741 (#9152) — the reject travels to the peers as the
+                // same `pending_decisions` entry the SQLite arm sends.
+                let mut body = json!({
                     "rejected": true,
                     "id": id,
                     (field_names::DECIDED_BY): agent_id,
                     (field_names::STORAGE_BACKEND): "postgres",
-                }))
-                .into_response()
+                });
+                let decision = PendingDecision {
+                    id: id.clone(),
+                    approved: false,
+                    decider: agent_id.clone(),
+                };
+                match super::fed_fanout::fanout_decision(
+                    &app,
+                    &decision,
+                    &super::fed_fanout::Produced::Nothing,
+                    &mut body,
+                )
+                .await
+                {
+                    Ok(()) => Json(body).into_response(),
+                    Err(resp) => resp,
+                }
             }
             Ok(crate::store::RejectOutcome::NotFound) => (
                 StatusCode::NOT_FOUND,
@@ -661,29 +690,25 @@ pub async fn reject_pending(
     match db::reject_with_approver_type(&lock.0, &id, &agent_id, db::ApproveSurface::Http) {
         Ok(db::RejectOutcome::Rejected) => {
             drop(lock);
-            // v0.6.2 (S34): fan out the reject so peers converge.
-            if let Some(fed) = app.federation.as_ref() {
-                let decision = PendingDecision {
-                    id: id.clone(),
-                    approved: false,
-                    decider: agent_id.clone(),
-                };
-                match crate::federation::broadcast_pending_decision_quorum(fed, &decision).await {
-                    Ok(tracker) => {
-                        if let Err(err) = crate::federation::finalise_quorum(&tracker) {
-                            // #869 — typed 503 envelope via the shared helper.
-                            let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
-                            return super::under_replicated_response(&payload);
-                        }
-                    }
-                    Err(err) => {
-                        let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
-                        return super::under_replicated_response(&payload);
-                    }
-                }
+            // v0.6.2 (S34) / #8741 (#9152): fan out the reject through the
+            // ONE funnel so peers converge and the receipt carries quorum.
+            let decision = PendingDecision {
+                id: id.clone(),
+                approved: false,
+                decider: agent_id.clone(),
+            };
+            let mut body = json!({"rejected": true, "id": id, (field_names::DECIDED_BY): agent_id});
+            match super::fed_fanout::fanout_decision(
+                &app,
+                &decision,
+                &super::fed_fanout::Produced::Nothing,
+                &mut body,
+            )
+            .await
+            {
+                Ok(()) => Json(body).into_response(),
+                Err(resp) => resp,
             }
-            Json(json!({"rejected": true, "id": id, (field_names::DECIDED_BY): agent_id}))
-                .into_response()
         }
         Ok(db::RejectOutcome::NotFound) => (
             StatusCode::NOT_FOUND,

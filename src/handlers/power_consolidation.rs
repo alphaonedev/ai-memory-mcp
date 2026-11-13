@@ -266,55 +266,69 @@ async fn gate_consolidate_sources(
 /// disposition (#2860) — so peers converge the consolidation, the source state,
 /// AND the lineage DAG synchronously instead of waiting on async catch-up.
 ///
-/// Returns `Some(response)` when the quorum is NOT met (a typed 503 the caller
-/// must return verbatim), or `None` on success / when federation is disabled
-/// (the single-node no-op path) so the caller proceeds to its 201 envelope.
+/// #9057 / #8741 — the consolidate arm of the fan-out funnel
+/// (`super::fed_fanout`). No federation: `Ok(())`, the receipt untouched.
+/// Quorum met: the receipt is stamped with the real `quorum_acks` /
+/// `quorum_n` / `quorum_required`. Quorum missed OR the broadcast itself
+/// errored: `Err` carrying the id-bearing consolidate 202 (pre-fix a
+/// broadcast `Err` only logged and the caller returned a bare 201).
 async fn consolidate_fanout(
     fed: Option<&crate::federation::FederationConfig>,
     mem: &crate::models::Memory,
-    deletions: &[String],
-    tombstoned_sources: &[crate::models::Memory],
-    derived_edges: &[crate::models::MemoryLink],
-) -> Option<axum::response::Response> {
-    let fed = fed?;
-    match crate::federation::broadcast_consolidate_quorum(
+    disp: &crate::handlers::consolidate_federation::FanoutDisposition,
+    receipt: &mut serde_json::Value,
+) -> Result<(), axum::response::Response> {
+    let Some(fed) = fed else {
+        return Ok(());
+    };
+    let outcome = crate::federation::broadcast_consolidate_quorum(
         fed,
         mem,
-        deletions,
-        tombstoned_sources,
-        derived_edges,
+        &disp.deletions,
+        &disp.tombstoned_sources,
+        &disp.derived_edges,
     )
     .await
-    {
-        Ok(tracker) => {
-            if let Err(err) = crate::federation::finalise_quorum(&tracker) {
-                // #2856/#2861 loud floor + #2860 convergence composed. #2860
-                // authors the consolidation as the daemon federation identity so
-                // the quorum normally SUCCEEDS (self-relay past strict write-sig)
-                // and this miss path is now the RESIDUAL peer-down / partition
-                // case. When it does miss, keep #2861's id-bearing under-
-                // replication 202 (`under_replicated_consolidate_response`, was
-                // the bare `under_replicated_response` that omitted the created
-                // `id`) so the caller can DISCOVER + reconcile the local-only row
-                // instead of seeing a success-shaped 2xx with nothing to act on
-                // (5-agent vote `4d3ea1c5`). Exactly one of `deletions` /
-                // `tombstoned_sources` is populated (legacy hard-delete vs the
-                // v1.0.0-default tombstone disposition), so their sum is the
-                // original consolidated-source count the 202 body reports.
-                let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
-                let source_count = deletions.len() + tombstoned_sources.len();
-                return Some(super::under_replicated_consolidate_response(
-                    &payload,
-                    mem,
-                    source_count,
-                ));
-            }
+    .and_then(|tracker| crate::federation::finalise_quorum(&tracker));
+    match outcome {
+        Ok(acks) => {
+            super::fed_fanout::stamp_quorum(receipt, fed, acks);
+            Ok(())
         }
-        Err(e) => {
-            tracing::warn!("consolidate fanout error (local committed): {e:?}");
+        Err(err) => {
+            // #2856/#2861 — keep the id-bearing under-replication 202 so the
+            // caller can discover + reconcile the local-only row.
+            tracing::warn!("consolidate fanout under-replicated (local committed): {err}");
+            Err(consolidate_not_delivered(receipt.clone(), &err))
         }
     }
-    None
+}
+
+/// #9057 — the consolidate committed locally but nothing (or not enough)
+/// reached the peers: the 201 receipt becomes the id-bearing `202` with the
+/// exact `quorum_not_met` payload merged into the full 201 receipt (so the
+/// caller can discover the local-only row; it replaces the narrower
+/// `under_replicated_consolidate_response` helper). A finalize or read-back
+/// failure arrives as `QuorumError::LocalWriteFailed` naming the exact code
+/// (`CONSOLIDATE_TOMBSTONE_MISSING`, `FANOUT_READBACK_FAILED`) and fans
+/// out NOTHING — never the pre-fix hard-delete fallback.
+fn consolidate_not_delivered(
+    mut receipt: serde_json::Value,
+    err: &crate::replication::QuorumError,
+) -> axum::response::Response {
+    let payload = crate::federation::QuorumNotMetPayload::from_err(err);
+    if let Some(obj) = receipt.as_object_mut() {
+        obj.insert("quorum_met".to_string(), json!(false));
+        obj.insert("acks".to_string(), json!(payload.got));
+        obj.insert("needed".to_string(), json!(payload.needed));
+        obj.insert("reason".to_string(), json!(payload.reason));
+        obj.insert("durability".to_string(), json!("local"));
+    }
+    (StatusCode::ACCEPTED, Json(receipt)).into_response()
+}
+
+fn local_write_failed(detail: String) -> crate::replication::QuorumError {
+    crate::replication::QuorumError::LocalWriteFailed { detail }
 }
 
 pub async fn consolidate_memories(
@@ -539,97 +553,80 @@ pub async fn consolidate_memories(
         // source disposition + `derived_from` lineage — the postgres twin of the
         // sqlite branch below. A read-back failure logs + falls through to the
         // success envelope (catch-up reconciles peers).
+        let mut receipt = json!({
+            "id": new_id,
+            (field_names::CONSOLIDATED): body.ids.len(),
+            "summary": summary,
+            // v0.7.0 L7-followup — also emit the materialised summary
+            // as `content` and inside a nested `memory` object so the
+            // S51 scenario reader (which falls through
+            // `cbody.get("summary") or cbody.get("content") or
+            // (cbody.get("memory") or {}).get("content")` under a
+            // ternary that requires `memory` to be a dict) sees a
+            // non-empty string regardless of which branch its
+            // operator precedence resolves to. Without the `memory`
+            // dict the whole expression collapses to `""` even
+            // though `summary` is set — see
+            // `scenarios/51_autonomous_tier_suite.py:140-145`.
+            "content": summary,
+            "memory": {
+                "id": new_id,
+                "title": body.title,
+                "content": summary,
+                "namespace": body.namespace,
+            },
+            (field_names::STORAGE_BACKEND): "postgres",
+        });
         if app.federation.is_some() {
             // #2860 — the consolidated row is now owned by `pg_author_id` (the
             // substrate sender), so read it back AS the author: the `for_agent`
             // tenant `ctx` would visibility-filter the sender-owned row to
-            // NotFound and silently skip the fanout. The source reads below stay
-            // on the tenant `ctx` (the tenant owns the sources).
+            // NotFound. The source reads stay on the tenant `ctx`.
             let author_ctx = crate::store::CallerContext::for_agent(&pg_author_id);
-            if let Ok(mut mem) = app.store.get(&author_ctx, &new_id).await {
-                // Shared, unit-tested finalize+disposition (SAL twin of the sqlite
-                // branch's `sqlite_finalize_and_disposition`). Source reads stay on
-                // the tenant `ctx` (the tenant owns the sources); `set_row_metadata`
-                // is by-id and ctx-agnostic.
-                let disp =
-                    match crate::handlers::consolidate_federation::store_finalize_and_disposition(
-                        app.store.as_ref(),
-                        &ctx,
-                        &mut mem,
-                        &source_ids,
-                        &pg_author_id,
-                        &consolidator_agent_id,
-                        body.summary.as_deref(),
-                    )
-                    .await
-                    {
-                        Ok(d) => d,
-                        Err(e) => {
-                            // #3238 — fail-closed: do NOT fanout a row whose
-                            // origin persist / tombstone read failed.
-                            tracing::error!(
-                                "consolidate(pg): finalize failed (skipping fanout): {e}"
-                            );
-                            return (
-                                StatusCode::CREATED,
-                                Json(json!({
-                                    "id": new_id,
-                                    (field_names::CONSOLIDATED): body.ids.len(),
-                                    "summary": summary,
-                                    "content": summary,
-                                    "memory": {
-                                        "id": new_id,
-                                        "title": body.title,
-                                        "content": summary,
-                                        "namespace": body.namespace,
-                                    },
-                                    (field_names::STORAGE_BACKEND): "postgres",
-                                })),
-                            )
-                                .into_response();
-                        }
-                    };
-                if let Some(resp) = consolidate_fanout(
-                    app.federation.as_ref().as_ref(),
-                    &mem,
-                    &disp.deletions,
-                    &disp.tombstoned_sources,
-                    &disp.derived_edges,
+            // #9057 — a read-back failure is the exact 202 naming
+            // FANOUT_READBACK_FAILED (pre-fix it fell through to a bare 201).
+            let mut mem = match app.store.get(&author_ctx, &new_id).await {
+                Ok(mem) => mem,
+                Err(e) => {
+                    // #8741 round 1 (sec-F4) — stable code only on the wire.
+                    tracing::error!("consolidate(pg): read-back of {new_id} failed: {e}");
+                    let detail = format!("{}: {new_id}", super::fed_fanout::FANOUT_READBACK_FAILED);
+                    return consolidate_not_delivered(receipt, &local_write_failed(detail));
+                }
+            };
+            // Shared, unit-tested finalize+disposition (SAL twin of the sqlite
+            // branch's `sqlite_finalize_and_disposition`).
+            let disp =
+                match crate::handlers::consolidate_federation::store_finalize_and_disposition(
+                    app.store.as_ref(),
+                    &ctx,
+                    &mut mem,
+                    &source_ids,
+                    &pg_author_id,
+                    &consolidator_agent_id,
+                    body.summary.as_deref(),
                 )
                 .await
                 {
-                    return resp;
-                }
+                    Ok(d) => d,
+                    Err(e) => {
+                        // #3238 / #9057 — fail-closed: no peer effect, and the
+                        // exact code (e.g. CONSOLIDATE_TOMBSTONE_MISSING) on a 202
+                        // instead of a success-shaped 201.
+                        tracing::error!("consolidate(pg): finalize failed (no fanout): {e}");
+                        let detail =
+                            crate::handlers::consolidate_federation::finalize_detail(&e, &mem.id);
+                        return consolidate_not_delivered(receipt, &local_write_failed(detail));
+                    }
+                };
+            if let Err(resp) =
+                consolidate_fanout(app.federation.as_ref().as_ref(), &mem, &disp, &mut receipt)
+                    .await
+            {
+                return resp;
             }
         }
-        return (
-            StatusCode::CREATED,
-            Json(json!({
-                "id": new_id,
-                (field_names::CONSOLIDATED): body.ids.len(),
-                "summary": summary,
-                // v0.7.0 L7-followup — also emit the materialised summary
-                // as `content` and inside a nested `memory` object so the
-                // S51 scenario reader (which falls through
-                // `cbody.get("summary") or cbody.get("content") or
-                // (cbody.get("memory") or {}).get("content")` under a
-                // ternary that requires `memory` to be a dict) sees a
-                // non-empty string regardless of which branch its
-                // operator precedence resolves to. Without the `memory`
-                // dict the whole expression collapses to `""` even
-                // though `summary` is set — see
-                // `scenarios/51_autonomous_tier_suite.py:140-145`.
-                "content": summary,
-                "memory": {
-                    "id": new_id,
-                    "title": body.title,
-                    "content": summary,
-                    "namespace": body.namespace,
-                },
-                (field_names::STORAGE_BACKEND): "postgres",
-            })),
-        )
-            .into_response();
+        return (StatusCode::CREATED, Json(receipt)).into_response();
     }
 
     let lock = app.db.lock().await;
@@ -743,30 +740,34 @@ pub async fn consolidate_memories(
     // The finalize+disposition logic is the shared, unit-tested helper (its
     // postgres twin `store_finalize_and_disposition` runs the identical body
     // through the SAL trait, so the two backends cannot drift).
-    let disposition = if fed_enabled {
-        match new_mem.as_mut() {
-            Some(mem) => {
-                match crate::handlers::consolidate_federation::sqlite_finalize_and_disposition(
-                    &lock.0,
-                    mem,
-                    &source_ids,
-                    &author_id,
-                    &consolidator_agent_id,
-                    body.summary.as_deref(),
-                ) {
-                    Ok(d) => Some(d),
-                    Err(e) => {
-                        // #3238 — fail-closed: do NOT fanout a row whose
-                        // origin persist / tombstone read failed.
-                        tracing::error!("consolidate: finalize failed (skipping fanout): {e}");
-                        None
-                    }
-                }
-            }
-            None => None,
+    // #9057 — `Err(detail)` carries the exact code of a federated finalize
+    // or read-back failure; it fans out NOTHING (the pre-fix fallback fanned
+    // out hard deletions of the sources the origin had only tombstoned).
+    let disposition: Result<
+        Option<crate::handlers::consolidate_federation::FanoutDisposition>,
+        String,
+    > = match (fed_enabled, &consolidate_result, new_mem.as_mut()) {
+        (false, _, _) | (true, Err(_), _) => Ok(None),
+        (true, Ok(_), Some(mem)) => {
+            crate::handlers::consolidate_federation::sqlite_finalize_and_disposition(
+                &lock.0,
+                mem,
+                &source_ids,
+                &author_id,
+                &consolidator_agent_id,
+                body.summary.as_deref(),
+            )
+            .map(Some)
+            .inspect_err(|e| {
+                // #3238 — fail-closed: do NOT fanout a row whose origin
+                // persist / tombstone read failed.
+                tracing::error!("consolidate: finalize failed (no fanout): {e}");
+            })
         }
-    } else {
-        None
+        (true, Ok(new_id), None) => Err(format!(
+            "{}: {new_id}",
+            super::fed_fanout::FANOUT_READBACK_FAILED
+        )),
     };
     // Drop DB lock before fanning out — peers POST back to our sync_push
     // and we'd deadlock on the shared Mutex if we held it.
@@ -776,47 +777,44 @@ pub async fn consolidate_memories(
             // v0.6.2 (#326) / #1552 / #2860: propagate the consolidation + its
             // source disposition + `derived_from` lineage to peers so the mesh
             // reaches the same terminal state (shared `consolidate_fanout`).
-            if let Some(mem) = new_mem {
-                let disp = disposition.unwrap_or_else(|| {
-                    crate::handlers::consolidate_federation::FanoutDisposition {
-                        deletions: source_ids.clone(),
-                        tombstoned_sources: Vec::new(),
-                        derived_edges: Vec::new(),
-                    }
-                });
-                if let Some(resp) = consolidate_fanout(
-                    app.federation.as_ref().as_ref(),
-                    &mem,
-                    &disp.deletions,
-                    &disp.tombstoned_sources,
-                    &disp.derived_edges,
-                )
-                .await
-                {
-                    return resp;
-                }
-            }
-            (
-                StatusCode::CREATED,
-                Json(json!({
+            let mut receipt = json!({
+                "id": new_id,
+                (field_names::CONSOLIDATED): body.ids.len(),
+                "summary": summary,
+                // v0.7.0 L7-followup — see postgres branch above for
+                // the rationale. Mirroring `content` and a nested
+                // `memory` dict here keeps both backends emitting the
+                // same wire shape so S51 passes regardless of whether
+                // the daemon is sqlite- or postgres-backed.
+                "content": summary,
+                "memory": {
                     "id": new_id,
-                    (field_names::CONSOLIDATED): body.ids.len(),
-                    "summary": summary,
-                    // v0.7.0 L7-followup — see postgres branch above for
-                    // the rationale. Mirroring `content` and a nested
-                    // `memory` dict here keeps both backends emitting the
-                    // same wire shape so S51 passes regardless of whether
-                    // the daemon is sqlite- or postgres-backed.
+                    "title": body.title,
                     "content": summary,
-                    "memory": {
-                        "id": new_id,
-                        "title": body.title,
-                        "content": summary,
-                        "namespace": body.namespace,
-                    },
-                })),
-            )
-                .into_response()
+                    "namespace": body.namespace,
+                },
+            });
+            match (disposition, new_mem) {
+                (Ok(Some(disp)), Some(mem)) => {
+                    if let Err(resp) = consolidate_fanout(
+                        app.federation.as_ref().as_ref(),
+                        &mem,
+                        &disp,
+                        &mut receipt,
+                    )
+                    .await
+                    {
+                        return resp;
+                    }
+                }
+                (Err(detail), _) => {
+                    return consolidate_not_delivered(receipt, &local_write_failed(detail));
+                }
+                // Federation off (or Ok(Some) with no row, unreachable by
+                // the match above): the local 201.
+                _ => {}
+            }
+            (StatusCode::CREATED, Json(receipt)).into_response()
         }
         // #3014 — 403 ATTESTATION_FAILED under global-strict (parity with the
         // store path); otherwise the sanitized 500.

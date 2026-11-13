@@ -193,6 +193,85 @@ pub(crate) fn derived_from_edges(consolidated: &Memory, source_ids: &[String]) -
         .collect()
 }
 
+/// #3238 / #9057 — a consolidated source is absent, or present but NOT
+/// tombstoned, after the consolidate committed: the tombstone disposition
+/// cannot be shipped, so the finalize fails closed with no peer effect.
+pub(crate) const CONSOLIDATE_TOMBSTONE_MISSING: &str = "CONSOLIDATE_TOMBSTONE_MISSING";
+/// #3238 — the source read itself failed.
+pub(crate) const CONSOLIDATE_TOMBSTONE_READ_FAILED: &str = "CONSOLIDATE_TOMBSTONE_READ_FAILED";
+/// #9057 — the store adapter offers no unfiltered by-id read, so a
+/// tombstoned source cannot be read back (fail closed, never a partial
+/// disposition). Only the `sal` read-back uses it.
+#[cfg(feature = "sal")]
+pub(crate) const CONSOLIDATE_TOMBSTONE_READ_UNSUPPORTED: &str =
+    "CONSOLIDATE_TOMBSTONE_READ_UNSUPPORTED";
+/// #3238 — the finalized metadata could not be serialized.
+pub(crate) const CONSOLIDATE_METADATA_SERIALIZE_FAILED: &str =
+    "CONSOLIDATE_METADATA_SERIALIZE_FAILED";
+/// #3238 — the finalized metadata could not be persisted on the origin row.
+pub(crate) const CONSOLIDATE_METADATA_PERSIST_FAILED: &str = "CONSOLIDATE_METADATA_PERSIST_FAILED";
+/// #8741 round 1 (sec-F4) — a finalize failure that carries no stable code.
+#[cfg(feature = "sal")]
+pub(crate) const CONSOLIDATE_FINALIZE_FAILED: &str = "CONSOLIDATE_FINALIZE_FAILED";
+
+/// #8741 round 1 (sec-F4) — the detail a finalize failure puts on the 202:
+/// the stable `CODE: <memory id>` only. The backend error text goes to the
+/// operator log, never into a client-visible reason.
+fn coded(code: &str, subject: &str, err: &dyn std::fmt::Display) -> String {
+    tracing::error!("consolidate finalize: {code}: {subject}: {err}");
+    format!("{code}: {subject}")
+}
+
+/// #8741 round 1 (sec-F4) — the client-visible detail of a SAL finalize
+/// error: an `IntegrityFailed` detail is always a stable code built by
+/// [`coded`] / [`require_tombstoned`]; any other error is reported as
+/// [`CONSOLIDATE_FINALIZE_FAILED`] with its text logged.
+#[cfg(feature = "sal")]
+pub(crate) fn finalize_detail(err: &crate::store::StoreError, id: &str) -> String {
+    match err {
+        crate::store::StoreError::IntegrityFailed { detail } => detail.clone(),
+        other => coded(CONSOLIDATE_FINALIZE_FAILED, id, other),
+    }
+}
+
+/// #9057 — a source re-broadcast under the tombstone disposition must be
+/// the row the origin actually tombstoned. `None` (row gone) and a live
+/// row (the origin did not tombstone it) both fail closed with
+/// [`CONSOLIDATE_TOMBSTONE_MISSING`], so peers can never be told about a
+/// state the origin does not hold.
+fn require_tombstoned(id: &str, read: Option<Memory>) -> Result<Memory, String> {
+    match read {
+        Some(src) if src.lifecycle_state == crate::models::LifecycleState::Tombstoned => Ok(src),
+        _ => Err(format!("{CONSOLIDATE_TOMBSTONE_MISSING}: {id}")),
+    }
+}
+
+/// #9057 — the unfiltered by-id read through the concrete SAL adapter
+/// (`as_any().downcast_ref`, the #2587 precedent). The `MemoryStore`
+/// trait has no unfiltered read and its `get` hides tombstoned rows.
+#[cfg(feature = "sal")]
+pub(crate) async fn store_get_any(
+    store: &dyn crate::store::MemoryStore,
+    id: &str,
+) -> crate::store::StoreResult<Option<Memory>> {
+    #[cfg(feature = "sal-postgres")]
+    if let Some(pg) = store
+        .as_any()
+        .downcast_ref::<crate::store::postgres::PostgresStore>()
+    {
+        return pg.get_any(id).await;
+    }
+    if let Some(lite) = store
+        .as_any()
+        .downcast_ref::<crate::store::sqlite::SqliteStore>()
+    {
+        return lite.get_any(id).await;
+    }
+    Err(crate::store::StoreError::IntegrityFailed {
+        detail: CONSOLIDATE_TOMBSTONE_READ_UNSUPPORTED.to_string(),
+    })
+}
+
 /// The broadcast disposition for a federated consolidation: the source ids to
 /// hard-DELETE at peers (legacy), the RETAINED tombstoned source rows to
 /// re-broadcast (tombstone disposition), and the `derived_from` edges to ship.
@@ -233,17 +312,18 @@ pub(crate) fn sqlite_finalize_and_disposition(
     // that broadcasts metadata the origin row never stored (origin-byte-match
     // contract). Serialize + persist first; only then mutate `mem.metadata`.
     let js = serde_json::to_string(&final_meta)
-        .map_err(|e| format!("CONSOLIDATE_METADATA_SERIALIZE_FAILED: {e}"))?;
+        .map_err(|e| coded(CONSOLIDATE_METADATA_SERIALIZE_FAILED, &mem.id, &e))?;
     let n = conn
         .execute(
             "UPDATE memories SET metadata = ?1 WHERE id = ?2",
             rusqlite::params![js, &mem.id],
         )
-        .map_err(|e| format!("CONSOLIDATE_METADATA_PERSIST_FAILED: {e}"))?;
+        .map_err(|e| coded(CONSOLIDATE_METADATA_PERSIST_FAILED, &mem.id, &e))?;
     if n == 0 {
-        return Err(format!(
-            "CONSOLIDATE_METADATA_PERSIST_FAILED: origin row {} missing",
-            mem.id
+        return Err(coded(
+            CONSOLIDATE_METADATA_PERSIST_FAILED,
+            &mem.id,
+            &"origin row missing",
         ));
     }
     mem.metadata = final_meta;
@@ -253,15 +333,13 @@ pub(crate) fn sqlite_finalize_and_disposition(
             // #3238 — do not swallow get errors or omit missing tombstones
             // (`get().ok().flatten()` silently dropped provenance the
             // origin-byte-match + lineage contract requires).
-            match crate::db::get(conn, id) {
-                Ok(Some(src)) => tombstoned_sources.push(src),
-                Ok(None) => {
-                    return Err(format!("CONSOLIDATE_TOMBSTONE_MISSING: {id}"));
-                }
-                Err(e) => {
-                    return Err(format!("CONSOLIDATE_TOMBSTONE_READ_FAILED: {id}: {e}"));
-                }
-            }
+            // #9057 — the read MUST be unfiltered: `db::consolidate` has just
+            // tombstoned these rows, and the visibility-filtered `db::get`
+            // folds a tombstoned row into `None`, so the pre-fix finalize
+            // ALWAYS failed with CONSOLIDATE_TOMBSTONE_MISSING.
+            let read = crate::storage::get_any(conn, id)
+                .map_err(|e| coded(CONSOLIDATE_TOMBSTONE_READ_FAILED, id, &e))?;
+            tombstoned_sources.push(require_tombstoned(id, read)?);
         }
         let derived_edges = derived_from_edges(mem, source_ids);
         Ok(FanoutDisposition {
@@ -306,22 +384,29 @@ pub(crate) async fn store_finalize_and_disposition(
     // #3238 / ERRORS-01 / ERRORS-19 — persist-fail must not WARN-and-continue.
     let js = serde_json::to_string(&final_meta).map_err(|e| {
         crate::store::StoreError::IntegrityFailed {
-            detail: format!("CONSOLIDATE_METADATA_SERIALIZE_FAILED: {e}"),
+            detail: coded(CONSOLIDATE_METADATA_SERIALIZE_FAILED, &mem.id, &e),
         }
     })?;
-    store.set_row_metadata(ctx, &mem.id, &js).await?;
+    store
+        .set_row_metadata(ctx, &mem.id, &js)
+        .await
+        .map_err(|e| crate::store::StoreError::IntegrityFailed {
+            detail: coded(CONSOLIDATE_METADATA_PERSIST_FAILED, &mem.id, &e),
+        })?;
     mem.metadata = final_meta;
     if crate::config::consolidate_tombstone_sources_enabled() {
         let mut tombstoned_sources = Vec::with_capacity(source_ids.len());
         for id in source_ids {
-            match store.get(ctx, id).await {
-                Ok(src) => tombstoned_sources.push(src),
-                Err(e) => {
-                    return Err(crate::store::StoreError::IntegrityFailed {
-                        detail: format!("CONSOLIDATE_TOMBSTONE_READ_FAILED: {id}: {e}"),
-                    });
+            // #9057 — unfiltered read through the concrete adapter: the
+            // trait `get` folds the just-tombstoned source into NotFound.
+            let read = store_get_any(store, id).await.map_err(|e| {
+                crate::store::StoreError::IntegrityFailed {
+                    detail: coded(CONSOLIDATE_TOMBSTONE_READ_FAILED, id, &e),
                 }
-            }
+            })?;
+            let src = require_tombstoned(id, read)
+                .map_err(|detail| crate::store::StoreError::IntegrityFailed { detail })?;
+            tombstoned_sources.push(src);
         }
         let derived_edges = derived_from_edges(mem, source_ids);
         Ok(FanoutDisposition {
@@ -525,13 +610,30 @@ mod tests {
         let ns = "fed-consolidate-2860";
         crate::db::insert(&conn, &seed_mem("src-a", ns, "A", "tenant:alice")).expect("a");
         crate::db::insert(&conn, &seed_mem("src-b", ns, "B", "tenant:alice")).expect("b");
-        let mut consolidated = seed_mem("c-2860", ns, "merged", SENDER);
-        crate::db::insert(&conn, &consolidated).expect("c");
+        let source_ids = ["src-a".to_string(), "src-b".to_string()];
+        // #9057 — run the REAL consolidate first, so the sources are
+        // tombstoned exactly as the handler leaves them before finalize
+        // (the pre-fix test seeded live sources and hid the bug).
+        let new_id = crate::db::consolidate(
+            &conn,
+            &source_ids,
+            "merged",
+            "merged summary alpha beta",
+            ns,
+            &crate::models::Tier::Long,
+            crate::db::CONSOLIDATION_SOURCE,
+            SENDER,
+            false,
+        )
+        .expect("consolidate");
+        let mut consolidated = crate::db::get(&conn, &new_id)
+            .expect("get")
+            .expect("consolidated row present");
 
         let disp = sqlite_finalize_and_disposition(
             &conn,
             &mut consolidated,
-            &["src-a".to_string(), "src-b".to_string()],
+            &source_ids,
             SENDER,
             TENANT,
             Some("a caller summary"),
@@ -561,7 +663,13 @@ mod tests {
             consolidated.metadata[META_SUMMARY_SOURCE],
             serde_json::json!(SUMMARY_SOURCE_CALLER)
         );
-        let persisted = crate::db::get(&conn, "c-2860")
+        assert!(
+            disp.tombstoned_sources
+                .iter()
+                .all(|m| m.lifecycle_state == crate::models::LifecycleState::Tombstoned),
+            "#9057: the re-broadcast sources are the tombstoned rows"
+        );
+        let persisted = crate::db::get(&conn, &new_id)
             .expect("get")
             .expect("present");
         assert_eq!(
@@ -631,17 +739,31 @@ mod tests {
             .store(&tenant_ctx, &seed_mem("s-b", "ns", "B", TENANT))
             .await
             .expect("b");
-        let mut consolidated = seed_mem("s-c", "ns", "merged", SENDER);
-        store
-            .store(&CallerContext::for_agent(SENDER), &consolidated)
+        let source_ids = ["s-a".to_string(), "s-b".to_string()];
+        // #9057 — the REAL SAL consolidate tombstones the sources first.
+        let new_id = store
+            .consolidate(
+                &tenant_ctx,
+                &source_ids,
+                "merged",
+                "merged summary alpha beta",
+                "ns",
+                &crate::models::Tier::Long,
+                crate::db::CONSOLIDATION_SOURCE,
+                SENDER,
+            )
             .await
-            .expect("c");
+            .expect("consolidate");
+        let mut consolidated = store
+            .get(&CallerContext::for_agent(SENDER), &new_id)
+            .await
+            .expect("consolidated row");
 
         let disp = store_finalize_and_disposition(
             &store,
             &tenant_ctx,
             &mut consolidated,
-            &["s-a".to_string(), "s-b".to_string()],
+            &source_ids,
             SENDER,
             TENANT,
             Some("caller text"),
@@ -651,6 +773,12 @@ mod tests {
 
         assert!(disp.deletions.is_empty());
         assert_eq!(disp.tombstoned_sources.len(), 2);
+        assert!(
+            disp.tombstoned_sources
+                .iter()
+                .all(|m| m.lifecycle_state == crate::models::LifecycleState::Tombstoned),
+            "#9057: the re-broadcast sources are the tombstoned rows"
+        );
         assert_eq!(disp.derived_edges.len(), 2);
         assert_eq!(
             consolidated.metadata[META_CONSOLIDATOR_TENANT],
@@ -698,9 +826,82 @@ mod tests {
         let err =
             sqlite_finalize_and_disposition(&conn, &mut consolidated, &[], SENDER, TENANT, None)
                 .expect_err("missing origin must fail closed");
-        assert!(
-            err.contains("CONSOLIDATE_METADATA_PERSIST_FAILED"),
-            "got {err}"
+        // #8741 round 1 (sec-F4): the exact stable code and id, no backend text.
+        assert_eq!(
+            err,
+            format!("{CONSOLIDATE_METADATA_PERSIST_FAILED}: c-ghost")
         );
+    }
+
+    /// #8741 round 1 (sec-F4) — a backend error on the persist (a read-only
+    /// connection) is the stable `CODE: <id>` only; the SQLite error text
+    /// never reaches the client-visible reason.
+    #[test]
+    fn sqlite_finalize_backend_error_is_the_bare_code_8741() {
+        let g = crate::test_support::LineageDagIsolation::new();
+        g.set_lineage_dag(false);
+        g.set_consolidate_tombstone_sources(false);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let conn = crate::db::open(&dir.path().join("t.db")).expect("open");
+        let mut consolidated = seed_mem("c-ro", "ns", "merged", SENDER);
+        crate::db::insert(&conn, &consolidated).expect("seed origin row");
+        conn.execute_batch("PRAGMA query_only = ON;")
+            .expect("query_only");
+        let err =
+            sqlite_finalize_and_disposition(&conn, &mut consolidated, &[], SENDER, TENANT, None)
+                .expect_err("a read-only persist must fail closed");
+        assert_eq!(err, format!("{CONSOLIDATE_METADATA_PERSIST_FAILED}: c-ro"));
+    }
+
+    /// #8741 round 1 (sec-F4) — a SAL finalize error with no stable code
+    /// is reported as `CONSOLIDATE_FINALIZE_FAILED: <id>`; its backend
+    /// detail stays in the log.
+    #[cfg(feature = "sal")]
+    #[test]
+    fn finalize_detail_hides_backend_text_8741() {
+        let backend = crate::store::StoreError::BackendUnavailable {
+            backend: "postgres".to_string(),
+            detail: "connection refused at db.example.invalid:5432".to_string(),
+            sqlstate: None,
+        };
+        assert_eq!(
+            finalize_detail(&backend, "m-8741"),
+            format!("{CONSOLIDATE_FINALIZE_FAILED}: m-8741")
+        );
+        let coded_err = crate::store::StoreError::IntegrityFailed {
+            detail: format!("{CONSOLIDATE_METADATA_PERSIST_FAILED}: m-8741"),
+        };
+        assert_eq!(
+            finalize_detail(&coded_err, "m-8741"),
+            format!("{CONSOLIDATE_METADATA_PERSIST_FAILED}: m-8741")
+        );
+    }
+
+    /// #9057 — a source that is present but NOT tombstoned (the origin did
+    /// not apply the tombstone disposition to it) fails closed with the
+    /// exact MISSING code: peers are never told about a state the origin
+    /// does not hold.
+    #[test]
+    fn sqlite_finalize_live_source_fails_closed_9057() {
+        let g = crate::test_support::LineageDagIsolation::new();
+        g.set_lineage_dag(true);
+        g.set_consolidate_tombstone_sources(true);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let conn = crate::db::open(&dir.path().join("t.db")).expect("open");
+        crate::db::insert(&conn, &seed_mem("live-src", "ns", "L", TENANT)).expect("live");
+        let mut consolidated = seed_mem("c-9057", "ns", "merged", SENDER);
+        crate::db::insert(&conn, &consolidated).expect("c");
+        let err = sqlite_finalize_and_disposition(
+            &conn,
+            &mut consolidated,
+            &["live-src".to_string()],
+            SENDER,
+            TENANT,
+            None,
+        )
+        .expect_err("a live source must fail closed");
+        assert_eq!(err, format!("{CONSOLIDATE_TOMBSTONE_MISSING}: live-src"));
     }
 }

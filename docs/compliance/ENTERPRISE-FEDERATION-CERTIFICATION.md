@@ -20,7 +20,7 @@ re-issue at `b0483115`, the 2026-09-11 #3595 re-issue at `ad60bead` and the orig
 mint `e22bc93c` remain as historical records. Any change to the federation wire path or the `AI_MEMORY_FED_*` surface **voids this
 certification and triggers re-cert** (see §7).
 
-## STATUS — **VOID as of 2026-10-28** (§7 fired again by #2967, `src/federation/receive_auth.rs`, recorded in the §7 firing ledger; no live claim; the certification had already EXPIRED as of 2026-10-07 when §7 fired: 4 watched federation-wire files changed after the `385da3a05` bind; re-measurement and re-issue pending under WP-B1, #6063; the last LIVE claim was the 2026-10-02 re-issue at `385da3a05`)
+## STATUS — **VOID as of 2026-11-11** (§7 fired again by #9177: `src/federation/sync.rs`, no wire field and no migration added, removed or renamed (the shipped `sync_push.deletions` array now carries up to `MAX_BULK_SIZE` erased ids per body), recorded in the §7 firing ledger; no live claim; §7 had fired before by #2967, `src/federation/receive_auth.rs`, on 2026-10-28; the certification had already EXPIRED as of 2026-10-07 when §7 fired: 4 watched federation-wire files changed after the `385da3a05` bind; re-measurement and re-issue pending under WP-B1, #6063; the last LIVE claim was the 2026-10-02 re-issue at `385da3a05`)
 
 > **Amendment (2026-10-07, #6063 WP-B1 — §7 EXPIRY RECORD, certification EXPIRED).**
 > The federation certification **expired** per §7 when four §7-watched
@@ -2082,6 +2082,35 @@ federation-wire surface changed AND cert doc re-issued/voided in the same
 change (...; banner EXPIRED - → VOID -)` and `check-cert-expiry: banner
 STATUS=VOID — the doc makes no live claim; nothing to hold it to`. The §8
 statuses below are historical records of earlier binds, not a live claim.
+
+**Re-cert trigger — FIRED by #9177 (`src/federation/sync.rs`, 2026-11-11;
+PR #9177, issue #8741).** One §7-watched path changed. The delete lane of
+the push fan-out gains `broadcast_delete_batch_quorum`, which ships up to
+`MAX_BULK_SIZE` erased ids in ONE `sync_push.deletions` body per peer
+instead of one body per id (bulk forget of N rows was N round trips per
+peer). The body is the shipped `deletions` array form the receiver already
+accepts up to its page size; a chunk larger than `MAX_BULK_SIZE` is refused
+on the origin with the exact `DELETE_BATCH_TOO_LARGE` code, never truncated.
+A peer that does not ack a chunk gets one DLQ row PER id, each with that id's
+own single-deletion body under the bare memory-id key, so the #2716
+restore-race guard reads it exactly as before. The single-id
+`broadcast_delete_quorum` sends the same body and Idempotency-Key as before.
+No `AI_MEMORY_FED_*` identifier is added, removed or renamed, no wire field
+or migration is added, and no signature check or accept/refuse rule on the
+receive side changes.
+
+*Disposition.* **This change does NOT re-mint the certification and does not
+approve its own control.** The re-issue against a new SHA stays the
+Conductor's task under
+[**#6063**](https://github.com/alphaonedev/ai-memory-mcp/issues/6063) (WP-B1);
+#9177 only records the firing. The last bound determination is still the
+2026-10-02 re-issue at `385da3a054c4f82bcdfd51ec2d8f07ca4947f9a5`. Gate output
+at this change: `scripts/check_cert_expiry.py` exits 1 with "neither its STATUS
+line nor its Binds-to line changed (banner VOID - at both ends)". The gate
+compares only the parsed banner word and the Binds-to SHA, so a doc that is
+already VOID cannot record a second firing in a form the gate accepts; the
+Conductor's ruling on that case (the #6063 re-issue, or a gate rule for a
+firing while VOID) is pending, and this record does not work around it.
 
 ---
 
