@@ -103,6 +103,9 @@ fn signal(ns: &str, to: Option<&str>, subject: &str, expires_at: Option<i64>) ->
     }
 }
 
+/// The owner every [`action`] row is stamped with.
+const ACTION_OWNER: &str = "ai:parity";
+
 fn action(ns: &str, id: &str) -> ai_memory::models::Action {
     let now = chrono::Utc::now().timestamp();
     ai_memory::models::Action {
@@ -113,7 +116,7 @@ fn action(ns: &str, id: &str) -> ai_memory::models::Action {
         title: id.to_string(),
         payload: serde_json::json!({}),
         priority: 5,
-        agent_id: Some("ai:parity".to_string()),
+        agent_id: Some(ACTION_OWNER.to_string()),
         claimed_by: None,
         vector_clock: serde_json::json!({}),
         metadata: serde_json::json!({}),
@@ -325,7 +328,9 @@ async fn pg_gc_reaps_expired_signals_3011() {
 // ─────────────────────────────────────────────────────────────────────
 
 async fn verify_add_edge_refuses_self_and_cycle(store: &dyn MemoryStore, backend: &str) {
-    let ctx = CallerContext::for_agent("ai:parity-edge");
+    // #8790: only the owner of both endpoints may add an edge, so the caller
+    // is the owner `action()` stamps.
+    let ctx = CallerContext::for_agent(ACTION_OWNER);
     let ns = fresh_name("parity-edge");
     let a = fresh_name("act-a");
     let b = fresh_name("act-b");
@@ -390,7 +395,9 @@ async fn pg_action_add_edge_refuses_self_and_cycle_3008() {
 async fn pg_action_add_edge_concurrent_opposing_arcs_cannot_both_land_3008() {
     let Some(store) = live_pg().await else { return };
     let store = std::sync::Arc::new(store);
-    let ctx = CallerContext::for_agent("ai:parity-edge-race");
+    // #8790: only the owner of both endpoints may add an edge, so the caller
+    // is the owner `action()` stamps.
+    let ctx = CallerContext::for_agent(ACTION_OWNER);
     let now = chrono::Utc::now().timestamp();
 
     // Repeat the race so a single lucky serialization cannot mask a regression.

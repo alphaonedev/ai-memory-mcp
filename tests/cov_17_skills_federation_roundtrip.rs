@@ -123,6 +123,7 @@ fn skill_export_import_roundtrip_resolves_resources_on_peer() {
         &conn_a,
         &json!({"folder_path": authored.to_str().unwrap()}),
         None,
+        &ai_memory::identity::object_owner::MutationPrincipal::from_process_env(),
     )
     .expect("node A: register");
     assert_eq!(registered_a["registered"], json!(true));
@@ -199,6 +200,7 @@ fn skill_export_import_roundtrip_resolves_resources_on_peer() {
         &conn_b,
         &json!({"folder_path": exported.to_str().unwrap()}),
         None,
+        &ai_memory::identity::object_owner::MutationPrincipal::from_process_env(),
     )
     .expect("node B: register from peer transport");
     assert_eq!(registered_b["registered"], json!(true));
@@ -298,6 +300,7 @@ fn skill_export_folder_is_self_contained_for_peer_import() {
         &conn_a,
         &json!({"folder_path": authored.to_str().unwrap()}),
         None,
+        &ai_memory::identity::object_owner::MutationPrincipal::from_process_env(),
     )
     .expect("register on a");
     let id_a = resp_a["id"].as_str().unwrap().to_string();
@@ -324,6 +327,7 @@ fn skill_export_folder_is_self_contained_for_peer_import() {
         &conn_b,
         &json!({"folder_path": exported.to_str().unwrap()}),
         None,
+        &ai_memory::identity::object_owner::MutationPrincipal::from_process_env(),
     )
     .expect("register on b from exported folder alone");
     assert_eq!(resp_b["registered"], json!(true));

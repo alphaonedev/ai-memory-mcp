@@ -330,6 +330,14 @@ pub async fn entity_register(
             // Title-collision errors carry a stable, recognisable
             // substring; surface them as 409 Conflict so callers can
             // distinguish a genuine name clash from internal failure.
+            // #8557 — a non-owner merging aliases gets the ONE owner refusal.
+            if crate::identity::object_owner::is_owner_refusal(&e) {
+                return crate::handlers::parity::owner_gate_refusal(
+                    crate::errors::msg::CALLER_DOES_NOT_OWN_OBJECT,
+                    None,
+                    crate::handlers::parity::RefusedResource::Namespace(&body.namespace),
+                );
+            }
             let msg = e.to_string();
             // #3014 — 403 ATTESTATION_FAILED under global-strict (parity with
             // the store path).

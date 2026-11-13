@@ -285,6 +285,7 @@ fn skill_retire_refuses_forged_agent_id() {
         &conn,
         &json!({"skill_id": "sk-retire-denied", "agent_id": FORGED}),
         None,
+        &ai_memory::identity::object_owner::MutationPrincipal::from_process_env(),
     )
     .expect_err("a forged agent_id must refuse the retire");
     assert_mismatch_refusal(&err, FORGED);
@@ -306,6 +307,7 @@ fn skill_retire_allows_matching_agent_id_and_stamps_the_caller() {
         &conn,
         &json!({"skill_id": "sk-retire-ok", "agent_id": CALLER, "reason": "eol"}),
         None,
+        &ai_memory::identity::object_owner::MutationPrincipal::from_process_env(),
     )
     .expect("the enforced caller may retire as itself");
     assert_eq!(out["retired_by"], json!(CALLER));
@@ -333,6 +335,7 @@ fn skill_delete_refuses_forged_agent_id() {
         &conn,
         &json!({"skill_id": "sk-del-denied", "force": true, "agent_id": FORGED}),
         None,
+        &ai_memory::identity::object_owner::MutationPrincipal::from_process_env(),
     )
     .expect_err("a forged agent_id must refuse the hard purge");
     assert_mismatch_refusal(&err, FORGED);
@@ -353,6 +356,7 @@ fn skill_delete_allows_matching_agent_id() {
         &conn,
         &json!({"skill_id": "sk-del-ok", "force": true, "agent_id": CALLER}),
         None,
+        &ai_memory::identity::object_owner::MutationPrincipal::from_process_env(),
     )
     .expect("the enforced caller may purge as itself");
     assert_eq!(
@@ -643,6 +647,7 @@ fn skill_register_refuses_forged_agent_id() {
         &conn,
         &json!({"inline_skill": minimal_skill_md("reg-denied"), "agent_id": FORGED}),
         None,
+        &ai_memory::identity::object_owner::MutationPrincipal::from_process_env(),
     )
     .expect_err("a forged agent_id must refuse the register");
     assert_mismatch_refusal(&err, FORGED);
@@ -662,6 +667,7 @@ fn skill_register_allows_matching_agent_id() {
         &conn,
         &json!({"inline_skill": minimal_skill_md("reg-ok"), "agent_id": CALLER}),
         None,
+        &ai_memory::identity::object_owner::MutationPrincipal::from_process_env(),
     )
     .expect("the enforced caller may register as itself");
     assert_eq!(out["registered"], json!(true));
@@ -684,6 +690,7 @@ fn malformed_wire_principal_refuses_instead_of_degrading_to_a_sentinel() {
         &conn,
         &json!({"skill_id": "sk-malformed", "agent_id": "has spaces;DROP"}),
         None,
+        &ai_memory::identity::object_owner::MutationPrincipal::from_process_env(),
     )
     .expect_err("a malformed wire principal must refuse, not degrade");
     assert!(

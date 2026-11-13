@@ -942,6 +942,16 @@ pub fn store_err_to_response(e: crate::store::StoreError) -> Response {
         // arm below, so `DELETE /api/v1/namespaces` on postgres named the
         // owning agent to the refused caller; the reason is the bare SSOT
         // const now and lands in the ONE closed shape.
+        // #8557 / #8790 — the stored-object owner gate
+        // (`identity::object_owner`); the only HTTP-reachable producer is
+        // entity_register, whose target is the caller-supplied namespace.
+        if reason == crate::errors::msg::CALLER_DOES_NOT_OWN_OBJECT {
+            return crate::handlers::parity::owner_gate_refusal(
+                crate::errors::msg::CALLER_DOES_NOT_OWN_OBJECT,
+                None,
+                crate::handlers::parity::RefusedResource::Namespace(target),
+            );
+        }
         if reason == crate::errors::msg::CALLER_DOES_NOT_OWN_NAMESPACE_STANDARD {
             return crate::handlers::parity::owner_gate_refusal(
                 crate::errors::msg::CALLER_DOES_NOT_OWN_NAMESPACE_STANDARD,

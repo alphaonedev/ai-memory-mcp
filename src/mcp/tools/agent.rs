@@ -3,6 +3,9 @@
 
 //! MCP agent-registration and agent-list handlers.
 
+use crate::identity::object_owner::{
+    MutationPrincipal, authorize_owner_mutation, funnel as object_funnel, owner_metadata,
+};
 use crate::mcp::param_guard;
 use crate::mcp::param_names;
 use crate::models::field_names;
@@ -17,7 +20,10 @@ use serde_json::{Value, json};
 /// # Errors
 /// Returns a substrate error string when `agent_id` / `agent_type` are
 /// missing or fail validation, when the wire `caller_agent_id` disagrees with
-/// the enforced caller (#3363), or when the storage write fails.
+/// the enforced caller (#3363), with
+/// [`crate::errors::msg::CALLER_DOES_NOT_OWN_OBJECT`] when an enforced caller
+/// re-registers an existing identity other than itself (#8775), or when the
+/// storage write fails.
 pub fn handle_agent_register(conn: &rusqlite::Connection, params: &Value) -> Result<Value, String> {
     let agent_id = params["agent_id"].as_str().ok_or("agent_id is required")?;
     let agent_type = params[param_names::AGENT_TYPE]
@@ -50,6 +56,21 @@ pub fn handle_agent_register(conn: &rusqlite::Connection, params: &Value) -> Res
     // acceptable (review).
     let existing = db::get_agent(conn, agent_id)
         .map_err(|e| crate::mcp::error_text::mcp_foreign_err("get_agent", e))?;
+    // #8775 — a roster entry is owned by its own `agent_id`: an enforced
+    // caller (`AI_MEMORY_AGENT_ID`) may re-register (refresh, or change with
+    // `update: true`) only itself, never overwrite another identity's entry.
+    // Minting a NEW entry stays as shipped (#3363): ownership is the id, so
+    // the named agent re-registers its own entry whoever minted it. The roster
+    // is readable by every caller (`memory_agent_list`), so the distinct
+    // refusal reveals nothing the caller cannot already read.
+    if existing.is_some() {
+        authorize_owner_mutation(
+            &MutationPrincipal::from_process_env(),
+            &owner_metadata(agent_id),
+            agent_id,
+            object_funnel::AGENT_REGISTER,
+        )?;
+    }
     let identity_change = existing.as_ref().is_some_and(|ex| {
         let (mut had, mut want) = (ex.capabilities.clone(), capabilities.clone());
         had.sort();

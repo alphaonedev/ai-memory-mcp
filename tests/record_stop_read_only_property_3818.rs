@@ -342,7 +342,7 @@ fn seed(conn: &rusqlite::Connection, path: &std::path::Path) -> Seed {
     let skill = handle_skill_register(
         conn,
         &json!({"inline_skill": "---\nnamespace: retns\nname: s3818\ndescription: d.\n---\n\nB.\n"}),
-        None,
+        None, &ai_memory::identity::object_owner::MutationPrincipal::from_process_env(),
     )
     .expect("register skill");
     let skill_id = skill["id"].as_str().expect("skill id").to_string();

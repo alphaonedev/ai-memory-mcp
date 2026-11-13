@@ -147,6 +147,7 @@ fn seed_skill_with_corrupted_body(db_path: &std::path::Path, name: &str) -> Stri
         &conn,
         &json!({"inline_skill": minimal_skill_md(name)}),
         None,
+        &ai_memory::identity::object_owner::MutationPrincipal::from_process_env(),
     )
     .expect("seed skill");
     let id = v["id"].as_str().unwrap().to_string();

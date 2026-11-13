@@ -25,12 +25,16 @@ use crate::models::field_names;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension as _, params};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
 use crate::identity::keypair::AgentKeypair;
+use crate::identity::object_owner::{
+    MutationPrincipal, authorize_owner_mutation, funnel as object_funnel, stamp_owner,
+    stored_owner_metadata as skill_owner_metadata,
+};
 use crate::parsing::skill_md;
 use crate::signed_events::{SignedEvent, append_signed_event_no_tx, payload_hash};
 
@@ -221,6 +225,7 @@ pub(super) fn register_core(
     resource_digests: Vec<Vec<u8>>,
     resources: &[(String, String, Vec<u8>)], // (path, kind, content)
     active_keypair: Option<&AgentKeypair>,
+    principal: &MutationPrincipal,
 ) -> Result<RegisterResult, String> {
     // Build canonical frontmatter JSON for digest computation.
     let canonical_fm = serde_json::to_vec(&json!({
@@ -285,15 +290,35 @@ pub(super) fn register_core(
     let conn: &Connection = &tx;
 
     // Find the current (non-superseded) row for this (namespace, name),
-    // carrying its `retired_at` so we can enforce the #2024 retire REFUSE.
-    let prev: Option<(String, Option<i64>)> = conn
+    // carrying its `retired_at` so we can enforce the #2024 retire REFUSE and
+    // its `metadata` (the owner stamp) for the #8772 owner gate. A store
+    // fault propagates (fail closed, per ERRORS-19) instead of reading as
+    // "no prior row", which would have minted a SECOND lineage head.
+    let prev: Option<(String, Option<i64>, String)> = conn
         .query_row(
-            "SELECT id, retired_at FROM skills \
+            "SELECT id, retired_at, metadata FROM skills \
              WHERE namespace = ?1 AND name = ?2 AND superseded_by IS NULL",
             params![namespace, name],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
-        .ok();
+        .optional()
+        .map_err(|e| {
+            crate::mcp::error_text::mcp_foreign_err("skill register prior-head SELECT", e)
+        })?;
+
+    // #8772 — superseding an existing lineage head is a mutation of that
+    // head: only its recorded owner may do it. Checked INSIDE the BEGIN
+    // IMMEDIATE tx (the owner stamp cannot change between check and write)
+    // and BEFORE the retired REFUSE, so a non-owner learns nothing about the
+    // lineage's retire state.
+    if let Some((prev_id, _, prev_metadata)) = &prev {
+        authorize_owner_mutation(
+            principal,
+            &skill_owner_metadata(prev_metadata),
+            prev_id,
+            object_funnel::SKILL_SUPERSEDE,
+        )?;
+    }
 
     // #2024 — REFUSE re-registration onto a RETIRED lineage. This runs
     // INSIDE the BEGIN IMMEDIATE tx (which took the write lock up front),
@@ -301,12 +326,12 @@ pub(super) fn register_core(
     // retire mutation serialises against us, and the RAII drop of `tx`
     // rolls back on this early return. Unretire the lineage before
     // re-registering.
-    if matches!(prev, Some((_, Some(_)))) {
+    if matches!(prev, Some((_, Some(_), _))) {
         return Err(format!(
             "skill lineage '{namespace}/{name}' is retired; unretire before re-registering"
         ));
     }
-    let prev_id: Option<String> = prev.map(|(id, _)| id);
+    let prev_id: Option<String> = prev.map(|(id, _, _)| id);
 
     // Insert new row.
     conn.execute(
@@ -415,10 +440,15 @@ pub(super) fn register_core(
 // Handler
 // ---------------------------------------------------------------------------
 
+/// MCP `memory_skill_register` substrate handler. `principal` is the resolved
+/// caller: MCP stdio and the CLI pass [`MutationPrincipal::from_process_env`]
+/// (`AI_MEMORY_AGENT_ID`), the admin-gated HTTP route
+/// [`MutationPrincipal::Granted`]; never a wire `agent_id` (#8772).
 pub fn handle_skill_register(
     conn: &Connection,
     params: &Value,
     active_keypair: Option<&AgentKeypair>,
+    principal: &MutationPrincipal,
 ) -> Result<Value, String> {
     // -----------------------------------------------------------------------
     // Input: folder_path or inline_skill
@@ -551,6 +581,12 @@ pub fn handle_skill_register(
             .flag("signed", active_keypair.is_some()),
     );
 
+    // #8772 — record the registering caller as the lineage owner
+    // (`metadata.agent_id`, outside the digest surface), the stamp every
+    // later supersede / retire / delete is gated on. The resolved caller
+    // wins over any inline frontmatter `agent_id` (the #8497 precedent).
+    stamp_owner(&mut metadata, &caller);
+
     let body_bytes = manifest.body.as_bytes();
 
     // Compute resource digests for the signing surface.
@@ -572,6 +608,7 @@ pub fn handle_skill_register(
         res_digests,
         &resource_files,
         active_keypair,
+        principal,
     )?;
 
     let digest_hex = hex::encode(&result.digest);
@@ -1026,7 +1063,13 @@ mod tests {
     #[test]
     fn rejects_missing_input() {
         let (conn, _dir) = open_db();
-        let err = handle_skill_register(&conn, &json!({}), None).unwrap_err();
+        let err = handle_skill_register(
+            &conn,
+            &json!({}),
+            None,
+            &crate::identity::object_owner::MutationPrincipal::from_process_env(),
+        )
+        .unwrap_err();
         assert!(err.contains("folder_path") || err.contains("inline_skill"));
     }
 
@@ -1034,9 +1077,13 @@ mod tests {
     fn rejects_nonexistent_folder_path() {
         let (conn, dir) = open_db();
         let bad = dir.path().join("no-such-folder");
-        let err =
-            handle_skill_register(&conn, &json!({"folder_path": bad.to_str().unwrap()}), None)
-                .unwrap_err();
+        let err = handle_skill_register(
+            &conn,
+            &json!({"folder_path": bad.to_str().unwrap()}),
+            None,
+            &crate::identity::object_owner::MutationPrincipal::from_process_env(),
+        )
+        .unwrap_err();
         assert!(err.contains("is not a directory"));
     }
 
@@ -1049,6 +1096,7 @@ mod tests {
             &conn,
             &json!({"folder_path": target.to_str().unwrap()}),
             None,
+            &crate::identity::object_owner::MutationPrincipal::from_process_env(),
         )
         .unwrap_err();
         assert!(err.contains("cannot read SKILL.md"));
@@ -1060,7 +1108,13 @@ mod tests {
     fn registers_inline_skill_minimal() {
         let (conn, _dir) = open_db();
         let inline = minimal_skill_md("inline-skill");
-        let v = handle_skill_register(&conn, &json!({"inline_skill": inline}), None).unwrap();
+        let v = handle_skill_register(
+            &conn,
+            &json!({"inline_skill": inline}),
+            None,
+            &crate::identity::object_owner::MutationPrincipal::from_process_env(),
+        )
+        .unwrap();
         assert_eq!(v["registered"], json!(true));
         assert_eq!(v["namespace"], json!("testns"));
         assert_eq!(v["name"], json!("inline-skill"));
@@ -1078,6 +1132,7 @@ mod tests {
             &conn,
             &json!({"inline_skill": minimal_skill_md("chain-me")}),
             None,
+            &crate::identity::object_owner::MutationPrincipal::from_process_env(),
         )
         .unwrap();
         let id1 = v1["id"].as_str().unwrap().to_string();
@@ -1087,6 +1142,7 @@ mod tests {
             &conn,
             &json!({"inline_skill": minimal_skill_md("chain-me")}),
             None,
+            &crate::identity::object_owner::MutationPrincipal::from_process_env(),
         )
         .unwrap();
         assert_eq!(v2["superseded_id"], json!(id1));
@@ -1100,6 +1156,7 @@ mod tests {
             &conn,
             &json!({"inline_skill": minimal_skill_md("signed-skill")}),
             Some(&kp),
+            &crate::identity::object_owner::MutationPrincipal::from_process_env(),
         )
         .unwrap();
         assert_eq!(v["signed"], json!(true));
@@ -1154,6 +1211,7 @@ mod tests {
             &conn,
             &json!({"folder_path": folder.to_str().unwrap()}),
             None,
+            &crate::identity::object_owner::MutationPrincipal::from_process_env(),
         )
         .unwrap();
         assert_eq!(v["registered"], json!(true));
@@ -1179,6 +1237,7 @@ mod tests {
             &conn,
             &json!({"folder_path": folder.to_str().unwrap()}),
             None,
+            &crate::identity::object_owner::MutationPrincipal::from_process_env(),
         )
         .unwrap();
         assert_eq!(v["registered"], json!(true));
@@ -1219,6 +1278,7 @@ mod tests {
             &conn,
             &json!({"folder_path": folder.to_str().unwrap()}),
             None,
+            &crate::identity::object_owner::MutationPrincipal::from_process_env(),
         )
         .unwrap_err();
         assert!(
@@ -1251,6 +1311,7 @@ mod tests {
             &conn,
             &json!({"folder_path": folder.to_str().unwrap()}),
             None,
+            &crate::identity::object_owner::MutationPrincipal::from_process_env(),
         )
         .unwrap_err();
         assert!(
@@ -1299,7 +1360,13 @@ mod tests {
     fn rejects_malformed_inline_skill() {
         let (conn, _dir) = open_db();
         let bad = "no frontmatter here, just body text";
-        let err = handle_skill_register(&conn, &json!({"inline_skill": bad}), None).unwrap_err();
+        let err = handle_skill_register(
+            &conn,
+            &json!({"inline_skill": bad}),
+            None,
+            &crate::identity::object_owner::MutationPrincipal::from_process_env(),
+        )
+        .unwrap_err();
         // The parser surfaces a non-empty error string.
         assert!(!err.is_empty());
     }
@@ -1476,6 +1543,7 @@ mod tests {
                 "parameters_schema": "not-an-object",
             }),
             None,
+            &crate::identity::object_owner::MutationPrincipal::from_process_env(),
         )
         .unwrap_err();
         assert!(
@@ -1503,6 +1571,7 @@ mod tests {
             &conn,
             &json!({"inline_skill": inline, "parameters_schema": schema.clone()}),
             None,
+            &crate::identity::object_owner::MutationPrincipal::from_process_env(),
         )
         .unwrap();
         let id = v["id"].as_str().unwrap();
@@ -1526,6 +1595,7 @@ mod tests {
             &conn,
             &json!({"inline_skill": minimal_skill_md("fresh-version")}),
             None,
+            &crate::identity::object_owner::MutationPrincipal::from_process_env(),
         )
         .unwrap();
         assert_eq!(v["version"], json!(1));
@@ -1538,6 +1608,7 @@ mod tests {
             &conn,
             &json!({"inline_skill": minimal_skill_md("chain-version")}),
             None,
+            &crate::identity::object_owner::MutationPrincipal::from_process_env(),
         )
         .unwrap();
         assert_eq!(v1["version"], json!(1));
@@ -1545,6 +1616,7 @@ mod tests {
             &conn,
             &json!({"inline_skill": minimal_skill_md("chain-version")}),
             None,
+            &crate::identity::object_owner::MutationPrincipal::from_process_env(),
         )
         .unwrap();
         assert_eq!(v2["version"], json!(2));
@@ -1552,6 +1624,7 @@ mod tests {
             &conn,
             &json!({"inline_skill": minimal_skill_md("chain-version")}),
             None,
+            &crate::identity::object_owner::MutationPrincipal::from_process_env(),
         )
         .unwrap();
         assert_eq!(v3["version"], json!(3));
@@ -1617,8 +1690,13 @@ mod jail_3762_tests {
             "precondition: the alias spelling and the resolved spelling differ"
         );
 
-        let err = handle_skill_register(&conn, &json!({"folder_path": folder_spelling}), None)
-            .expect_err("a folder without SKILL.md must be refused");
+        let err = handle_skill_register(
+            &conn,
+            &json!({"folder_path": folder_spelling}),
+            None,
+            &crate::identity::object_owner::MutationPrincipal::from_process_env(),
+        )
+        .expect_err("a folder without SKILL.md must be refused");
         assert!(
             !err.contains(&canon_spelling),
             "the resolved folder path must not reach the caller: {err}"

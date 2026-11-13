@@ -357,6 +357,13 @@ pub mod msg {
     /// four MCP mutation handlers (the HTTP twin lives in
     /// `handlers::parity::require_caller_owns_memory`).
     pub const CALLER_DOES_NOT_OWN_MEMORY: &str = "caller does not own this memory";
+    /// #8771 / #8772 / #8774 / #8775 / #8557 / #8790 — the ONE owner-gate
+    /// refusal for a mutation of a stored non-memory object (skill lineage,
+    /// routine, agent roster entry, entity alias set, action DAG edge) by a
+    /// resolved caller that is not its recorded owner. Raised only by
+    /// `identity::object_owner::authorize_owner_mutation_on`;
+    /// names neither the caller nor the owner (the #3407 precedent).
+    pub const CALLER_DOES_NOT_OWN_OBJECT: &str = "caller does not own this object";
     /// #939 / #3426 — the symmetric link-DELETE owner-gate refusal (either
     /// endpoint's owner may sever an edge; a caller owning neither is
     /// refused). Hoisted from the two `DELETE /api/v1/links` branches so the

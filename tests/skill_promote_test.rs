@@ -366,6 +366,7 @@ fn round_trip_promote_export_reregister_identical_digest() {
             "folder_path": export_dir.to_string_lossy(),
         }),
         None,
+        &ai_memory::identity::object_owner::MutationPrincipal::from_process_env(),
     )
     .expect("re-register");
     let digest_reregistered = rereg_payload["digest"].as_str().expect("digest");

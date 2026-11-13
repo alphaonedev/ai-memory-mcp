@@ -211,6 +211,21 @@ fn box_err<E: std::fmt::Display>(e: E) -> StoreError {
     StoreError::Backend(BoxBackendError::new(e.to_string()))
 }
 
+/// #8557 / #8790 — the stored-object owner refusal as the ONE
+/// `PermissionDenied` envelope the postgres twin returns; anything else is
+/// a backend error.
+fn owner_refusal_or_backend(e: &anyhow::Error, target: &str) -> StoreError {
+    if crate::identity::object_owner::is_owner_refusal(e) {
+        StoreError::PermissionDenied {
+            action: crate::identity::object_owner::OWNER_GATE_ACTION.to_string(),
+            target: target.to_string(),
+            reason: crate::errors::msg::CALLER_DOES_NOT_OWN_OBJECT.to_string(),
+        }
+    } else {
+        box_err(e)
+    }
+}
+
 /// #4447 — map the typed in-transaction by-id refusal onto the ONE
 /// `PermissionDenied` envelope the postgres adapter returns (error parity);
 /// anything else stays a backend detail.
@@ -2838,7 +2853,7 @@ impl MemoryStore for SqliteStore {
 
     async fn action_add_edge(
         &self,
-        _ctx: &CallerContext,
+        ctx: &CallerContext,
         from_action: &str,
         to_action: &str,
         edge_type: crate::models::EdgeType,
@@ -2846,6 +2861,15 @@ impl MemoryStore for SqliteStore {
     ) -> StoreResult<()> {
         self.gate_record_stop()?;
         let conn = self.state.lock().await;
+        // #8790 — the caller must own both existing endpoints.
+        let principal = crate::identity::object_owner::MutationPrincipal::from_context(ctx);
+        crate::identity::object_owner::authorize_action_edge(
+            &conn,
+            &principal,
+            from_action,
+            to_action,
+        )
+        .map_err(|e| owner_refusal_or_backend(&e, from_action))?;
         // #3008 — a self-edge / ordering-cycle edge is refused (would wedge the
         // frontier). The typed outcome is mapped to an integrity error here.
         match crate::actions::add_edge(&conn, from_action, to_action, edge_type, now)
@@ -4708,15 +4732,18 @@ impl MemoryStore for SqliteStore {
             reason: m.to_string(),
         })?;
         let conn = self.state.lock().await;
-        db::entity_register(
+        // #8557 — the alias merge is owner-gated on the context principal.
+        let principal = crate::identity::object_owner::MutationPrincipal::from_context(ctx);
+        db::entity_register_as(
             &conn,
             canonical_name,
             namespace,
             aliases,
             extra_metadata,
             Some(&owner),
+            &principal,
         )
-        .map_err(box_err)
+        .map_err(|e| owner_refusal_or_backend(&e, namespace))
     }
 
     /// FX-C2-batch5 — list archived memories. Thin delegate to

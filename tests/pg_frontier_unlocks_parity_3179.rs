@@ -30,6 +30,11 @@
 use ai_memory::models::{Action, ActionState, EdgeType};
 use ai_memory::store::{CallerContext, MemoryStore};
 
+/// The agent that creates, owns and drives every action in the scenario.
+/// #8790: only the owner of both endpoints may add an edge, so the rows are
+/// stamped with the same principal the [`CallerContext`] carries.
+const AGENT: &str = "ai:3179";
+
 fn action(id: &str, ns: &str, title: &str) -> Action {
     let now = chrono::Utc::now().timestamp();
     Action {
@@ -40,7 +45,7 @@ fn action(id: &str, ns: &str, title: &str) -> Action {
         title: title.to_string(),
         payload: serde_json::Value::Null,
         priority: 5,
-        agent_id: None,
+        agent_id: Some(AGENT.to_string()),
         claimed_by: None,
         vector_clock: serde_json::json!({}),
         metadata: serde_json::json!({}),
@@ -53,7 +58,7 @@ fn action(id: &str, ns: &str, title: &str) -> Action {
 /// `a --unlocks--> b`, `a` pending ⇒ `b` is NOT on the frontier and is never
 /// what `action_next` hands out; `a → done` ⇒ `b` appears.
 async fn assert_unlocks_gates_frontier(store: &dyn MemoryStore, lane: &str) {
-    let ctx = CallerContext::for_agent("ai:3179");
+    let ctx = CallerContext::for_agent(AGENT);
     let ns = format!("frontier-3179-{}", uuid::Uuid::new_v4());
     let a_id = format!("a-{}", uuid::Uuid::new_v4());
     let b_id = format!("b-{}", uuid::Uuid::new_v4());
@@ -107,7 +112,7 @@ async fn assert_unlocks_gates_frontier(store: &dyn MemoryStore, lane: &str) {
         ActionState::Done,
     ] {
         store
-            .action_transition(&ctx, &a_id, to, Some("ai:3179"), now)
+            .action_transition(&ctx, &a_id, to, Some(AGENT), now)
             .await
             .unwrap_or_else(|e| panic!("{lane}: transition a to {to:?}: {e}"));
     }

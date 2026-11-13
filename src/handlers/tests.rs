@@ -5038,13 +5038,15 @@ async fn http_entity_register_creates_then_idempotent_returns_200() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
 
-    // Second call with same canonical_name+namespace: 200 OK + created=false.
+    // Second call by the same owner with same canonical_name+namespace:
+    // 200 OK + created=false (#8557: only the recorded owner may merge).
     let resp2 = app
         .oneshot(
             axum::http::Request::builder()
                 .uri("/api/v1/entities")
                 .method("POST")
                 .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
+                .header("x-agent-id", "alice")
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )

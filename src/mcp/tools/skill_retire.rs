@@ -20,19 +20,24 @@
 //! target is idempotent: it succeeds with `affected = 0`, never an
 //! error.
 //!
-//! Authz: this is the operator-as-actor path (NO admin gate, matching
-//! `handle_skill_register`); the HTTP surface (`skill_retire_route`)
-//! layers `require_admin` on top. Every mutation runs inside one
+//! Authz: no admin gate on the MCP/CLI path, matching
+//! `handle_skill_register`; the HTTP surface (`skill_retire_route`)
+//! layers `require_admin` on top. #8771: every row a retire, unretire or
+//! purge changes must be owned by the resolved caller
+//! ([`crate::identity::object_owner::authorize_owner_mutation`]). Every mutation runs inside one
 //! `BEGIN IMMEDIATE` transaction; a daemon-signed `signed_events` row
 //! (`skill.retired` / `skill.unretired`) is appended in the same tx, and
 //! a forensic `record_decision` row is emitted before the mutation.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension as _, params};
 use serde_json::{Value, json};
 
 use crate::identity::keypair::AgentKeypair;
+use crate::identity::object_owner::{
+    MutationPrincipal, authorize_owner_mutation, funnel as object_funnel, stored_owner_metadata,
+};
 use crate::models::field_names;
 use crate::signed_events::{SignedEvent, append_signed_event_no_tx, event_types, payload_hash};
 
@@ -68,6 +73,67 @@ pub(crate) fn apply_retired_fields(conn: &Connection, skill_id: &str, response: 
 }
 
 // ---------------------------------------------------------------------------
+// #8771 owner gate over the rows a lifecycle call changes
+// ---------------------------------------------------------------------------
+
+/// #8771 — admit the lifecycle mutation only when `principal` owns every row
+/// it changes: the one version `single_id`, else every version of the
+/// `(namespace, name)` lineage. Runs on the caller's `BEGIN IMMEDIATE` tx so
+/// the rows checked are the rows mutated. A row that fails to decode aborts
+/// the call (fail closed, per ERRORS-19).
+fn gate_skill_rows(
+    txn: &Connection,
+    namespace: &str,
+    name: &str,
+    single_id: Option<&str>,
+    principal: &MutationPrincipal,
+    funnel: &'static str,
+) -> anyhow::Result<()> {
+    let rows: Vec<(String, String)> = if let Some(id) = single_id {
+        txn.query_row("SELECT id, metadata FROM skills WHERE id = ?1", [id], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .optional()
+        .map_err(|e| {
+            anyhow::anyhow!(crate::mcp::error_text::mcp_foreign_err(
+                "skill owner-gate id SELECT",
+                e
+            ))
+        })?
+        .into_iter()
+        .collect()
+    } else {
+        let mut stmt = txn
+            .prepare("SELECT id, metadata FROM skills WHERE namespace = ?1 AND name = ?2")
+            .map_err(|e| {
+                anyhow::anyhow!(crate::mcp::error_text::mcp_foreign_err(
+                    "skill owner-gate prepare",
+                    e
+                ))
+            })?;
+        stmt.query_map(params![namespace, name], |r| Ok((r.get(0)?, r.get(1)?)))
+            .map_err(|e| {
+                anyhow::anyhow!(crate::mcp::error_text::mcp_foreign_err(
+                    "skill owner-gate query",
+                    e
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| {
+                anyhow::anyhow!(crate::mcp::error_text::mcp_foreign_err(
+                    "skill owner-gate row",
+                    e
+                ))
+            })?
+    };
+    for (id, metadata) in &rows {
+        authorize_owner_mutation(principal, &stored_owner_metadata(metadata), id, funnel)
+            .map_err(crate::errors::refusal)?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Handler
 // ---------------------------------------------------------------------------
 
@@ -80,11 +146,18 @@ pub(crate) fn apply_retired_fields(conn: &Connection, skill_id: &str, response: 
 ///
 /// # Errors
 /// Returns a substrate error string when neither `skill_id` nor a
-/// `(namespace, name)` pair is supplied, or a `skill_id` names no row.
+/// `(namespace, name)` pair is supplied, or a `skill_id` names no row, and
+/// [`crate::errors::msg::CALLER_DOES_NOT_OWN_OBJECT`] when `principal` is not
+/// the recorded owner of every row the call would change (#8771).
+///
+/// `principal` is the resolved caller: MCP stdio and the CLI pass
+/// [`MutationPrincipal::from_process_env`], the admin-gated HTTP route
+/// [`MutationPrincipal::Granted`]; never a wire `agent_id`.
 pub fn handle_skill_retire(
     conn: &Connection,
     params: &Value,
     active_keypair: Option<&AgentKeypair>,
+    principal: &MutationPrincipal,
 ) -> Result<Value, String> {
     let _ = active_keypair;
 
@@ -100,27 +173,15 @@ pub fn handle_skill_retire(
     )
     .map_err(|e| e.to_string())?;
 
-    // Resolve the target: a single version by `skill_id`, else the whole
-    // (namespace, name) lineage.
+    // Validate the request shape BEFORE taking the write lock.
     let skill_id = params["skill_id"].as_str().filter(|s| !s.is_empty());
-    let (namespace, name, single_id): (String, String, Option<String>) = if let Some(id) = skill_id
-    {
-        let found: Option<(String, String)> = conn
-            .query_row(
-                "SELECT namespace, name FROM skills WHERE id = ?1",
-                [id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .ok();
-        let Some((ns, nm)) = found else {
-            return Err(crate::errors::msg::skill_not_found(id));
-        };
-        (ns, nm, Some(id.to_string()))
+    let lineage_key = if skill_id.is_some() {
+        None
     } else {
         let ns = params["namespace"].as_str().filter(|s| !s.is_empty());
         let nm = params["name"].as_str().filter(|s| !s.is_empty());
         match (ns, nm) {
-            (Some(ns), Some(nm)) => (ns.to_string(), nm.to_string(), None),
+            (Some(ns), Some(nm)) => Some((ns.to_string(), nm.to_string())),
             _ => {
                 return Err("memory_skill_retire requires either 'skill_id' or both \
                             'namespace' and 'name'"
@@ -128,8 +189,51 @@ pub fn handle_skill_retire(
             }
         }
     };
-
     let action = if unretire { "unretire" } else { "retire" };
+
+    // All reads, the #8771 owner gate and the mutations run inside ONE BEGIN
+    // IMMEDIATE tx (mirrors register_core): the write lock serialises us
+    // against a concurrent register/retire so the retire REFUSE in
+    // register_core cannot race a silent revive, the owner stamps checked are
+    // the ones the UPDATE changes (no TOCTOU), and the RAII drop of `tx`
+    // rolls back on any early `?` return.
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| {
+        crate::mcp::error_text::mcp_foreign_err("skill retire BEGIN IMMEDIATE", e)
+    })?;
+    let txn: &Connection = &tx;
+
+    // Resolve the target: a single version by `skill_id`, else the whole
+    // (namespace, name) lineage.
+    let (namespace, name, single_id): (String, String, Option<String>) = if let Some(id) = skill_id
+    {
+        let found: Option<(String, String)> = txn
+            .query_row(
+                "SELECT namespace, name FROM skills WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(|e| crate::mcp::error_text::mcp_foreign_err("skill retire id SELECT", e))?;
+        let Some((ns, nm)) = found else {
+            return Err(crate::errors::msg::skill_not_found(id));
+        };
+        (ns, nm, Some(id.to_string()))
+    } else {
+        let (ns, nm) = lineage_key.unwrap_or_default();
+        (ns, nm, None)
+    };
+
+    // #8771 — every row this call changes must be owned by the principal.
+    gate_skill_rows(
+        txn,
+        &namespace,
+        &name,
+        single_id.as_deref(),
+        principal,
+        object_funnel::SKILL_RETIRE,
+    )
+    .map_err(|e| e.to_string())?;
 
     // Forensic decision row BEFORE the mutation (mirrors skill_register).
     crate::governance::audit::record_decision(
@@ -147,16 +251,6 @@ pub fn handle_skill_retire(
             .opt_ident("skill_id", single_id.as_deref())
             .opt_commit("reason", reason),
     );
-
-    // All mutations inside ONE BEGIN IMMEDIATE tx (mirrors register_core):
-    // the write lock serialises us against a concurrent register/retire so
-    // the retire REFUSE in register_core cannot race a silent revive, and
-    // the RAII drop of `tx` rolls back on any early `?` return.
-    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
-        .map_err(|e| {
-        crate::mcp::error_text::mcp_foreign_err("skill retire BEGIN IMMEDIATE", e)
-    })?;
-    let txn: &Connection = &tx;
 
     let now_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -281,11 +375,16 @@ pub fn handle_skill_retire(
 /// # Errors
 /// Returns a substrate error string when no target is supplied, a
 /// `skill_id` names no row, the lineage does not exist (`SKILL_NOT_FOUND`),
-/// or the lineage is not retired and `force` was not set.
+/// or the lineage is not retired and `force` was not set, and
+/// [`crate::errors::msg::CALLER_DOES_NOT_OWN_OBJECT`] when `principal` is not
+/// the recorded owner of every version of the lineage (#8771).
+///
+/// `principal` is the resolved caller, as for [`handle_skill_retire`].
 pub fn handle_skill_delete(
     conn: &Connection,
     params: &Value,
     active_keypair: Option<&AgentKeypair>,
+    principal: &MutationPrincipal,
 ) -> Result<Value, String> {
     let _ = active_keypair;
 
@@ -299,26 +398,15 @@ pub fn handle_skill_delete(
     )
     .map_err(|e| e.to_string())?;
 
-    // Resolve the target lineage. A by-id request purges the WHOLE lineage
-    // that id belongs to (never a partial-chain delete).
+    // Validate the request shape BEFORE taking the write lock.
     let skill_id = params["skill_id"].as_str().filter(|s| !s.is_empty());
-    let (namespace, name): (String, String) = if let Some(id) = skill_id {
-        let found: Option<(String, String)> = conn
-            .query_row(
-                "SELECT namespace, name FROM skills WHERE id = ?1",
-                [id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .ok();
-        match found {
-            Some(t) => t,
-            None => return Err(crate::errors::msg::skill_not_found(id)),
-        }
+    let lineage_key = if skill_id.is_some() {
+        None
     } else {
         let ns = params["namespace"].as_str().filter(|s| !s.is_empty());
         let nm = params["name"].as_str().filter(|s| !s.is_empty());
         match (ns, nm) {
-            (Some(ns), Some(nm)) => (ns.to_string(), nm.to_string()),
+            (Some(ns), Some(nm)) => Some((ns.to_string(), nm.to_string())),
             _ => {
                 return Err("memory_skill_delete requires either 'skill_id' or both \
                             'namespace' and 'name'"
@@ -327,10 +415,44 @@ pub fn handle_skill_delete(
         }
     };
 
-    // Gather the lineage rows (id + digest + retired state) up front.
-    let rows: Vec<(String, Vec<u8>, Option<i64>)> = {
-        let mut stmt = conn
-            .prepare("SELECT id, digest, retired_at FROM skills WHERE namespace = ?1 AND name = ?2")
+    // #8771 — the lineage read, the owner gate, the retired-or-force gate and
+    // the DELETE all run inside ONE BEGIN IMMEDIATE tx, so the rows checked
+    // are exactly the rows purged (no TOCTOU with a concurrent register).
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| {
+        crate::mcp::error_text::mcp_foreign_err("skill delete BEGIN IMMEDIATE", e)
+    })?;
+    let txn: &Connection = &tx;
+
+    // Resolve the target lineage. A by-id request purges the WHOLE lineage
+    // that id belongs to (never a partial-chain delete).
+    let (namespace, name): (String, String) = if let Some(id) = skill_id {
+        let found: Option<(String, String)> = txn
+            .query_row(
+                "SELECT namespace, name FROM skills WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(|e| crate::mcp::error_text::mcp_foreign_err("skill_delete id SELECT", e))?;
+        match found {
+            Some(t) => t,
+            None => return Err(crate::errors::msg::skill_not_found(id)),
+        }
+    } else {
+        lineage_key.unwrap_or_default()
+    };
+
+    // Gather the lineage rows (id + digest + retired state + owner stamp).
+    // A row that fails to decode aborts the purge (fail closed, ERRORS-19):
+    // it would otherwise be deleted without its digest on the signed record
+    // and without its owner checked.
+    let rows: Vec<(String, Vec<u8>, Option<i64>, String)> = {
+        let mut stmt = txn
+            .prepare(
+                "SELECT id, digest, retired_at, metadata FROM skills \
+                 WHERE namespace = ?1 AND name = ?2",
+            )
             .map_err(|e| crate::mcp::error_text::mcp_foreign_err("skill_delete prepare", e))?;
         let out = stmt
             .query_map(params![namespace, name], |r| {
@@ -338,11 +460,12 @@ pub fn handle_skill_delete(
                     r.get::<_, String>(0)?,
                     r.get::<_, Vec<u8>>(1)?,
                     r.get::<_, Option<i64>>(2)?,
+                    r.get::<_, String>(3)?,
                 ))
             })
             .map_err(|e| crate::mcp::error_text::mcp_foreign_err("skill_delete query", e))?
-            .filter_map(Result::ok)
-            .collect();
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| crate::mcp::error_text::mcp_foreign_err("skill_delete row", e))?;
         out
     };
 
@@ -353,8 +476,22 @@ pub fn handle_skill_delete(
         )));
     }
 
+    // #8771 — a purge erases every version: the principal must own them all.
+    // Checked BEFORE the retired-or-force gate so a non-owner learns nothing
+    // about the lineage's retire state.
+    for (id, _, _, metadata) in &rows {
+        authorize_owner_mutation(
+            principal,
+            &stored_owner_metadata(metadata),
+            id,
+            object_funnel::SKILL_DELETE,
+        )?;
+    }
+
     // SAFETY GATE — require the lineage to be already RETIRED unless forced.
-    let all_retired = rows.iter().all(|(_, _, retired_at)| retired_at.is_some());
+    let all_retired = rows
+        .iter()
+        .all(|(_, _, retired_at, _)| retired_at.is_some());
     if !force && !all_retired {
         return Err(format!(
             "skill lineage '{namespace}/{name}' is not retired; retire it first \
@@ -362,8 +499,8 @@ pub fn handle_skill_delete(
         ));
     }
 
-    let skill_ids: Vec<String> = rows.iter().map(|(id, _, _)| id.clone()).collect();
-    let digests: Vec<String> = rows.iter().map(|(_, d, _)| hex::encode(d)).collect();
+    let skill_ids: Vec<String> = rows.iter().map(|(id, _, _, _)| id.clone()).collect();
+    let digests: Vec<String> = rows.iter().map(|(_, d, _, _)| hex::encode(d)).collect();
 
     // Forensic decision row BEFORE the mutation.
     crate::governance::audit::record_decision(
@@ -377,12 +514,6 @@ pub fn handle_skill_delete(
             .idents("skill_ids", &skill_ids)
             .flag("force", force),
     );
-
-    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
-        .map_err(|e| {
-        crate::mcp::error_text::mcp_foreign_err("skill delete BEGIN IMMEDIATE", e)
-    })?;
-    let txn: &Connection = &tx;
 
     // Emit the signed PURGE audit row BEFORE the delete (the row outlives
     // the erased content — signed_events has no FK to skills).
@@ -533,10 +664,10 @@ impl McpTool for SkillDeleteTool {
     fn docs() -> &'static str {
         "#2024: IRREVERSIBLE purge of the whole (namespace,name) lineage (all versions + resources). \
          Refused unless the lineage is already retired OR force=true. Emits a signed skill.purged audit row \
-         that survives the erasure. #3171: this MCP entry has NO ADMIN GATE — unlike the HTTP \
-         twin (which requires the admin role), any MCP caller may purge any lineage, and \
-         force=true also skips the retire-first requirement. Restrict access to the MCP \
-         surface itself, or split profiles, if that is not acceptable."
+         that survives the erasure. #8771: when the process identity is set \
+         (AI_MEMORY_AGENT_ID), only the recorded owner of every version may purge it \
+         (\"caller does not own this object\" otherwise); the HTTP twin requires the \
+         admin role instead."
     }
     fn input_schema() -> Value {
         crate::mcp::registry::input_schema_for::<SkillDeleteRequest>()

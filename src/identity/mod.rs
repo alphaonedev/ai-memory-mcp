@@ -186,6 +186,10 @@ pub mod pubkey_bind;
 // governing caller-scoped mutations of such rows.
 pub mod owner_stamp;
 
+// #8771 / #8772 / #8774 / #8775 — the ONE owner gate for mutations of stored
+// non-memory objects (skill lineages, routines, agent roster entries).
+pub mod object_owner;
+
 /// Environment variable override for `agent_id` (used by CLI via clap's
 /// `env = "AI_MEMORY_AGENT_ID"`; read directly for MCP fallback).
 const ENV_AGENT_ID: &str = "AI_MEMORY_AGENT_ID";

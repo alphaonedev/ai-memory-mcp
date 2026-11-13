@@ -16856,6 +16856,35 @@ async fn pg_advisory_lock_action_edges(
     pg_advisory_xact_lock_key(tx, PG_ACTION_EDGES_LOCK_KEY).await
 }
 
+/// #8557 / #8790 — the ONE owner gate (`authorize_owner_mutation_on`) on
+/// the context principal, as the `PermissionDenied` envelope the sqlite twin
+/// returns (`target` = the namespace or the `from` action the caller named).
+///
+/// # Errors
+/// `PermissionDenied` with reason `CALLER_DOES_NOT_OWN_OBJECT`.
+fn pg_owner_gate(
+    ctx: &CallerContext,
+    owner_metadata: &serde_json::Value,
+    object_id: &str,
+    funnel: &'static str,
+    target: &str,
+) -> StoreResult<()> {
+    use crate::identity::object_owner::{
+        MutationPrincipal, OWNER_GATE_ACTION, authorize_owner_mutation_on,
+    };
+    authorize_owner_mutation_on(
+        &MutationPrincipal::from_context(ctx),
+        owner_metadata,
+        object_id,
+        crate::identity::owner_stamp::MutationSite::postgres(funnel),
+    )
+    .map_err(|refusal| StoreError::PermissionDenied {
+        action: OWNER_GATE_ACTION.to_string(),
+        target: target.to_string(),
+        reason: refusal.to_string(),
+    })
+}
+
 /// v1.0.0 #3535 — the ONE single-key transaction-scoped advisory lock.
 ///
 /// Three seams serialize a whole-relation check-and-act this way (action
@@ -29354,7 +29383,7 @@ impl MemoryStore for PostgresStore {
 
     async fn action_add_edge(
         &self,
-        _ctx: &CallerContext,
+        ctx: &CallerContext,
         from_action: &str,
         to_action: &str,
         edge_type: crate::models::EdgeType,
@@ -29369,6 +29398,28 @@ impl MemoryStore for PostgresStore {
         pg_advisory_lock_action_edges(&mut tx)
             .await
             .map_err(|e| to_store_err("action_add_edge advisory lock", e))?;
+        // #8790 — the caller must own both existing endpoints (the sqlite
+        // twin's `authorize_action_edge`); a missing endpoint keeps its
+        // shipped answer from the insert below.
+        if !ctx.bypass_visibility {
+            for endpoint in [from_action, to_action] {
+                let owner: Option<Option<String>> =
+                    sqlx::query_scalar("SELECT agent_id FROM actions WHERE id = $1")
+                        .bind(endpoint)
+                        .fetch_optional(&mut *tx)
+                        .await
+                        .map_err(|e| to_store_err("action_add_edge owner lookup", e))?;
+                if let Some(owner) = owner {
+                    pg_owner_gate(
+                        ctx,
+                        &crate::identity::object_owner::optional_owner_metadata(owner.as_deref()),
+                        endpoint,
+                        crate::identity::object_owner::funnel::ACTION_ADD_EDGE,
+                        from_action,
+                    )?;
+                }
+            }
+        }
         self.add_action_edge_in_transaction(&mut tx, from_action, to_action, edge_type, now)
             .await?;
         tx.commit()
@@ -33978,6 +34029,18 @@ impl MemoryStore for PostgresStore {
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| to_store_err("entity_register prior lookup", e))?;
+
+        // #8557 — merging aliases into an EXISTING entity is owner-gated on
+        // the context principal (the sqlite twin's `entity_register_as`).
+        if let Some((prior_id, prior_meta)) = prior.as_ref() {
+            pg_owner_gate(
+                ctx,
+                prior_meta,
+                prior_id,
+                crate::identity::object_owner::funnel::ENTITY_REGISTER,
+                namespace,
+            )?;
+        }
 
         // Detect a colliding non-entity row at (title, namespace).
         // The list-then-filter above only finds entity rows; a
