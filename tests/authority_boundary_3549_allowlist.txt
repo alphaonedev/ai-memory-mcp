@@ -43,9 +43,9 @@ read	memory_checkpoint_verify	checkpoint signature verification; not memory rows
 read	memory_signal_inbox	signal substrate, recipient-bound (#3365); not memory rows
 read	memory_signal_read	signal substrate, recipient-bound (#3365); not memory rows
 read	memory_signal_thread	signal substrate, participant-bound (#3365); not memory rows
-read	memory_skill_get	skills substrate (collective artefacts, not memory rows); forensic actor caller-bound (#3363)
-read	memory_skill_list	skills substrate listing (collective artefacts); not memory rows
-read	memory_skill_resource	skill resource blob (bounded zstd, #1933); skills are collective artefacts, not memory rows
+read	memory_skill_get	skills substrate (not memory rows); scope-bound via skill_integrity::load_verified_skill `_visibility` gate (#8832); forensic actor caller-bound (#3363)
+read	memory_skill_list	skills substrate listing (not memory rows); every row scope-bound via skill_integrity::load_verified_skill `_visibility` gate (#8832)
+read	memory_skill_resource	skill resource blob (bounded zstd, #1933; not memory rows); scope-bound via skill_integrity::load_verified_skill `_visibility` gate (#8832)
 read	memory_deref	offload blob keyed by ref_id and bound to the resolved agent_id (offload.rs); not a memory-row read
 # (c) memory rows gated by a sibling predicate the inventory cannot see in the handler file
 read	memory_archive_list	owner-scoped *_for_caller twin over archived_memories (#3382) — the gate is the SAL query, not the row predicate
