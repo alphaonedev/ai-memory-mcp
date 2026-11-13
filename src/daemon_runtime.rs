@@ -550,9 +550,10 @@ pub enum Command {
     /// v0.6.3.1 (P7 / R7): operator-visible health dashboard. Reads
     /// Capabilities v2 (P1) + data integrity surfaces (P2) + recall
     /// observability (P3). With `--remote <url>` becomes a fleet doctor
-    /// at T3+. Read-only — never mutates the database. Exits 0 on a
-    /// healthy report, 2 on critical findings, and 1 on warnings when
-    /// `--fail-on-warn` is passed.
+    /// at T3+. Never changes a memory, the schema or the file set; a probe
+    /// the inference-egress posture refuses appends one signed refusal row
+    /// (#4121). Exits 0 on a healthy report, 2 on critical findings, and 1
+    /// on warnings when `--fail-on-warn` is passed.
     Doctor(DoctorCliArgs),
     /// Issue #487: emit session-boot context. Universal primitive every
     /// AI-agent integration recipe (Claude Code SessionStart hook, Cursor /
@@ -1085,37 +1086,10 @@ pub struct BenchArgs {
     pub report_only: bool,
 }
 
-/// Default `--batch` page-size hint for `ai-memory migrate`. Currently
-/// an API-compatibility hint only — see the `MAX_ROWS` note in
-/// `src/migrate.rs::migrate`.
+// #4600 — `MigrateArgs` (and its `--from-url-file` / `--to-url-file` pair)
+// lives beside its resolver in `src/migrate.rs`.
 #[cfg(feature = "sal")]
-const MIGRATE_BATCH_DEFAULT: usize = 1000;
-
-#[cfg(feature = "sal")]
-#[derive(Args)]
-pub struct MigrateArgs {
-    /// Source URL. `sqlite:///path/to/file.db` or
-    /// `postgres://user:pass@host:port/dbname`.
-    #[arg(long)]
-    pub from: String,
-    /// Destination URL. Same URL shape as `--from`.
-    #[arg(long)]
-    pub to: String,
-    /// Page-size hint. Default 1000. Retained for API compatibility —
-    /// the current migrator reads one page capped at `MAX_ROWS`
-    /// (1,000,000) and refuses loudly past it; see `src/migrate.rs`.
-    #[arg(long, default_value_t = MIGRATE_BATCH_DEFAULT)]
-    pub batch: usize,
-    /// Only migrate memories in this namespace.
-    #[arg(long)]
-    pub namespace: Option<String>,
-    /// Emit the report but do NOT write to the destination.
-    #[arg(long)]
-    pub dry_run: bool,
-    /// Emit the report as JSON rather than human-readable text.
-    #[arg(long)]
-    pub json: bool,
-}
+pub use crate::migrate::MigrateArgs;
 
 #[derive(Args)]
 pub struct ServeArgs {
@@ -1265,7 +1239,10 @@ async fn dispatch_recover_previous_session(
     // `app_config` only feeds the postgres store build, which is `sal`-only.
     #[cfg(not(feature = "sal"))]
     let _ = app_config;
-    match a.store_url.as_deref().filter(|u| u.starts_with("postgres")) {
+    // #4600 — any two set channels (FILE, ENV, flag) that differ are refused
+    // here, before any store is built or connection opened (vote 71472661).
+    let resolved = crate::store_url_writer::resolve(a.store_url.as_deref())?;
+    match resolved.as_deref().filter(|u| u.starts_with("postgres")) {
         Some(url) => {
             #[cfg(feature = "sal")]
             let c = {
@@ -2233,7 +2210,10 @@ pub async fn run(
             // routes through the SAL so the enterprise tier gets the SAME
             // verb, and the async store build happens BEFORE the stdout lock
             // is taken so no `!Send` guard is held across an `.await`.
-            match a.store_url.as_deref().filter(|u| u.starts_with("postgres")) {
+            // #4600 — any two set channels (FILE, ENV, flag) that differ are refused
+            // here, before any store is built or connection opened (vote 71472661).
+            let resolved = crate::store_url_writer::resolve(a.store_url.as_deref())?;
+            match resolved.as_deref().filter(|u| u.starts_with("postgres")) {
                 Some(url) => {
                     #[cfg(feature = "sal")]
                     {
@@ -2412,7 +2392,8 @@ pub async fn run(
             cli::schema_init::run(&a, config_default_dim, &mut out).await
         }
         Command::Doctor(a) => {
-            // P7 / R7. The doctor is read-only; it never sets
+            // P7 / R7. The doctor never migrates (its one health-pass write
+            // is the #4121 refused-probe audit row); it never sets
             // `needs_checkpoint`. We compute the exit code from the
             // overall severity and propagate it via the process-exit
             // path below so callers (CI, ops scripts) can branch on it.
@@ -3671,10 +3652,11 @@ pub async fn build_embedder(
                 }) => {
                     tracing::warn!(
                         "embedder DISABLED by inference-plane egress gate \
-                     (tier={} backend={} target={target} mode={}); {reason} \
+                     (tier={} backend={} target={} mode={}); {reason} \
                      — semantic recall degrades to keyword (#1963/#3822)",
                         feature_tier.as_str(),
                         resolved_embeddings.backend,
+                        crate::url_display::url_origin(&target),
                         mode.as_str()
                     );
                     // #1991 — audit against the operator-resolved `db_path`.
@@ -3857,7 +3839,8 @@ pub async fn build_llm_client(
             }) => {
                 tracing::warn!(
                     "L5: LLM client DISABLED by inference-plane egress gate \
-                     (tier={tier_str} backend={backend} target={target} mode={}); {reason} (#1963/#3822)",
+                     (tier={tier_str} backend={backend} target={} mode={}); {reason} (#1963/#3822)",
+                    crate::url_display::url_origin(&target),
                     mode.as_str()
                 );
                 // #1991 — audit against the operator-resolved `db_path` threaded
@@ -8795,7 +8778,21 @@ async fn cmd_migrate(args: &MigrateArgs) -> Result<()> {
     // v1.0.0 #3435 — the SOURCE is opened through the read-only,
     // never-creating funnel: a mistyped `--from` is a typed refusal, not a
     // freshly-created empty store reported as a `memories_read: 0` success.
-    let src = migrate::open_source_store(&args.from)
+    // #4600 — each endpoint comes from its plain flag or its `*-url-file`
+    // twin (5-agent vote (4d3ea1c5)); neither store-url env channel is read.
+    let from_url = migrate::resolve_endpoint(
+        "--from",
+        "--from-url-file",
+        args.from.as_deref(),
+        args.from_url_file.as_deref(),
+    )?;
+    let to_url = migrate::resolve_endpoint(
+        "--to",
+        "--to-url-file",
+        args.to.as_deref(),
+        args.to_url_file.as_deref(),
+    )?;
+    let src = migrate::open_source_store(&from_url)
         .await
         .context("open source store")?;
     let report = if args.dry_run {
@@ -8805,7 +8802,7 @@ async fn cmd_migrate(args: &MigrateArgs) -> Result<()> {
         // leave the filesystem exactly as it found it.
         migrate::plan(src.as_ref(), args.batch, args.namespace.clone()).await
     } else {
-        let dst = migrate::open_store(&args.to)
+        let dst = migrate::open_store(&to_url)
             .await
             .context("open destination store")?;
         migrate::migrate(
@@ -8820,8 +8817,8 @@ async fn cmd_migrate(args: &MigrateArgs) -> Result<()> {
     // #1579 A3 (SECURITY) — the migrate report echoes both store URLs;
     // mask the userinfo password so credentials never land in stdout /
     // captured CI logs.
-    let from_display = crate::url_display::store_url_display(&args.from);
-    let to_display = crate::url_display::store_url_display(&args.to);
+    let from_display = crate::url_display::store_url_display(&from_url);
+    let to_display = crate::url_display::store_url_display(&to_url);
     if args.json {
         let value = serde_json::json!({
             "from_url": from_display,

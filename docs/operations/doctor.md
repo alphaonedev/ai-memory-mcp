@@ -3,7 +3,7 @@ layout: doc
 ---
 # `ai-memory doctor` — operator health dashboard
 
-**Phase P7 / R7** (v0.6.3.1). Read-only health-and-fitness report for an
+**Phase P7 / R7** (v0.6.3.1). Health-and-fitness report for an
 ai-memory deployment. Runs against a local SQLite DB or, with `--remote`,
 against a live `ai-memory serve` daemon (the **fleet doctor** mode at T3+).
 
@@ -316,6 +316,13 @@ field presence and falls back gracefully when absent.
 
 - The doctor does not introduce new monitoring infrastructure (no
   Prometheus, OTel exporters). It reads existing surfaces only.
-- The doctor never writes to the database. Read-only.
+- The doctor never changes a memory, the schema or the file set. Its one
+  write: an LLM or embeddings probe that the `AI_MEMORY_INFERENCE_EGRESS`
+  posture refuses appends one signed `egress.inference_refused` row to the
+  EXISTING database (#4121); a missing database is never created (#3434),
+  and a schema stamp ahead of or behind the binary records no row. When the
+  row cannot be appended, the probe's note ends with the exact
+  `inference-egress signed refusal NOT recorded` line (#9175).
+  `--repair-schema-version` is the separate repair mode (#2555).
 - The doctor uses indexed `COUNT(*)` queries to keep its DB-lock window
   sub-millisecond on a populated store.

@@ -269,8 +269,9 @@ snapshot ([#2444](https://github.com/alphaonedev/ai-memory-mcp/issues/2444)).
 Export `AI_MEMORY_STORE_URL_FILE` (or `AI_MEMORY_STORE_URL`) in the environment of
 any backup cron on a host that might be re-pointed at Postgres, so the command
 fails loudly on the day it is: `backup` resolves the store from those channels
-itself (`src/cli/backup.rs:1112`). Do not copy the variable onto the command line
-as `--store-url "$AI_MEMORY_STORE_URL"`; that puts the password in argv.
+itself (`src/cli/backup.rs:1112`). Do not expand the variable onto the command line
+through the `--store-url` flag: the shell puts the expanded value, password included, in argv
+(the resolver ignores the flag when either channel is set, `src/store_url.rs:137`).
 
 ### 2.7 When to graduate
 
@@ -471,10 +472,11 @@ production Dockerfile. Quick summary:
 Bootstrap a fresh postgres backend with:
 
 ```bash
-ai-memory schema-init --store-url postgres://aimemory:PWD@hub.dc1.internal:5432/aimemory
+# /etc/ai-memory/store-url: one line, mode 0600:  postgres://aimemory:<password>@hub.dc1.internal:5432/aimemory
+AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url ai-memory schema-init
 ```
 
-`schema-init` has no non-argv channel for its URL (`src/cli/schema_init.rs:111-112`, tracked in [#4600](https://github.com/alphaonedev/ai-memory-mcp/issues/4600)), so the password is visible in `ps` for the seconds this one-shot command runs; run it from a single-user admin host.
+`schema-init` reads its URL from `AI_MEMORY_STORE_URL_FILE` (a `0600` file) first, then `AI_MEMORY_STORE_URL`, then `--store-url`; any two set channels (file, env, `--store-url`) that name different stores are refused by channel name before any connection, instead of one being silently picked (`src/store_url_writer.rs::resolve`, over `src/store_url.rs::resolve_store_url`), so keep the password off argv and use the file form shown above ([#4600](https://github.com/alphaonedev/ai-memory-mcp/issues/4600)).
 
 Opening the store runs the idempotent `postgres_schema.sql` bootstrap
 plus the in-process upgrade ladder to schema v91 as a side effect. The
@@ -484,7 +486,9 @@ bootstrap — see
 RDS, Cloud SQL)"](postgres-age-guide.html) for the one-time admin
 pre-create that lets a non-superuser owner role boot, and for the
 `SQLSTATE 42501` vs `0A000` diagnostics). Probe a backend BEFORE
-deploying with `ai-memory doctor`, which is read-only and reports the
+deploying with `ai-memory doctor`, which never creates or migrates the
+database (its one write is the signed refusal row of a probe the
+inference-egress posture refuses, #4121) and reports the
 "Postgres extensions (#3264)" section; `schema-init` is not a pre-deploy
 check for a failing backend, because opening the store runs the bootstrap
 and it refuses at connect with the classified remedy before any JSON is

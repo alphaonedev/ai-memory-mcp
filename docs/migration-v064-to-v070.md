@@ -341,10 +341,11 @@ the AGE projection prime, and the cutover dance.
 3. **Install the v0.7.0 binary** (per §4.3 above).
 4. **Run the in-place upgrade** against the live postgres URL:
    ```bash
-   ai-memory schema-init \
-     --store-url postgres://aimemory:PASSWORD@HOST:5432/aimemory
+   # /etc/ai-memory/store-url: one line, mode 0600, owned by the user running this command:
+   #   postgres://aimemory:PASSWORD@HOST:5432/aimemory
+   AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url ai-memory schema-init
    ```
-   `schema-init` has no non-argv channel for its URL (`src/cli/schema_init.rs:111-112`, tracked in [#4600](https://github.com/alphaonedev/ai-memory-mcp/issues/4600)), so the password is visible in `ps` for the seconds this one-shot command runs; run it from a single-user admin host.
+   `schema-init` reads its URL from `AI_MEMORY_STORE_URL_FILE` (a `0600` file) first, then `AI_MEMORY_STORE_URL`, then `--store-url`; any two set channels (file, env, `--store-url`) that name different stores are refused by channel name before any connection, instead of one being silently picked (`src/store_url_writer.rs::resolve`, over `src/store_url.rs::resolve_store_url`), so keep the password off argv and use the file form shown above ([#4600](https://github.com/alphaonedev/ai-memory-mcp/issues/4600)).
    Opening the store walks the postgres ladder up to schema v57
    idempotently, preserving data.
 5. **Verify schema parity:**
@@ -367,7 +368,8 @@ the AGE projection prime, and the cutover dance.
 ### 5.2 If you want to switch sqlite → postgres at the same time
 
 The v0.7.0 SAL trait makes sqlite ↔ postgres a one-command migration.
-Run `ai-memory migrate --from sqlite:///path/to/memory.db --to postgres://...`
+Run `ai-memory migrate --from sqlite:///path/to/memory.db --to-url-file /etc/ai-memory/store-url`
+(a `0600` file holding the `postgres://...` URL, so the password stays off argv)
 per the postgres guide. You can do it before OR after the v0.7.0 upgrade —
 the SAL boundary is byte-stable across both backends at schema v57.
 

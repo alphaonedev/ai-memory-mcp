@@ -509,7 +509,7 @@ async fn schema_init_sqlite_enumerates_and_reports() {
     let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
 
     let args = SchemaInitArgs {
-        store_url: url.clone(),
+        store_url: Some(url.clone()),
         json: true,
         embedding_dim: Some(768),
         force_reembed: false,
@@ -556,7 +556,7 @@ async fn schema_init_sqlite_human_render() {
     let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
 
     let args = SchemaInitArgs {
-        store_url: url,
+        store_url: Some(url),
         json: false,
         embedding_dim: Some(384),
         force_reembed: false,
@@ -588,7 +588,7 @@ async fn schema_init_unrecognised_scheme_bails() {
     let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
 
     let args = SchemaInitArgs {
-        store_url: "nosql://nope".to_string(),
+        store_url: Some("nosql://nope".to_string()),
         json: false,
         embedding_dim: Some(384),
         force_reembed: false,
@@ -627,7 +627,7 @@ async fn schema_init_postgres_enumerates_live_catalog() {
     let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
 
     let args = SchemaInitArgs {
-        store_url: url.clone(),
+        store_url: Some(url.clone()),
         json: true,
         embedding_dim: Some(384),
         force_reembed: false,

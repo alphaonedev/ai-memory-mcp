@@ -94,11 +94,12 @@ Before you start:
 ## Step 1 — Bootstrap the postgres schema
 
 ```bash
-ai-memory schema-init \
-  --store-url postgres://aimemory:PASSWORD@HOST:5432/aimemory
+# /etc/ai-memory/store-url: one line, mode 0600, owned by the user running this command:
+#   postgres://aimemory:PASSWORD@HOST:5432/aimemory
+AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url ai-memory schema-init
 ```
 
-`schema-init` has no non-argv channel for its URL (`src/cli/schema_init.rs:111-112`, tracked in [#4600](https://github.com/alphaonedev/ai-memory-mcp/issues/4600)), so the password is visible in `ps` for the seconds this one-shot command runs; run it from a single-user admin host.
+`schema-init` reads its URL from `AI_MEMORY_STORE_URL_FILE` (a `0600` file) first, then `AI_MEMORY_STORE_URL`, then `--store-url`; any two set channels (file, env, `--store-url`) that name different stores are refused by channel name before any connection, instead of one being silently picked (`src/store_url_writer.rs::resolve`, over `src/store_url.rs::resolve_store_url`), so keep the password off argv and use the file form shown above ([#4600](https://github.com/alphaonedev/ai-memory-mcp/issues/4600)).
 
 Idempotent on rerun. Exit code 0 + the human summary reporting
 `schema_version: 57` is the success signal (pass `--json` for the
@@ -117,10 +118,72 @@ schema initialized at <url>
 
 ## Step 2 — Dry-run the migration
 
+`migrate` never takes a password on argv in this guide: `--from` / `--to`
+put the whole URL on `/proc/<pid>/cmdline` and `ps auxww`, readable by every
+local UID ([#4600](https://github.com/alphaonedev/ai-memory-mcp/issues/4600)).
+Use `--from-url-file PATH` / `--to-url-file PATH` for any side that carries a
+password. Each side takes exactly one of the plain flag or its file flag (both,
+or neither, is refused at parse time). The file is the same one-line `0600`
+file `schema-init` reads (`/etc/ai-memory/store-url`, created in Step 1), read
+through `src/store_url.rs` `store_url_from_file`, which refuses a group- or
+world-readable mode. `migrate` does **not** read `AI_MEMORY_STORE_URL` or
+`AI_MEMORY_STORE_URL_FILE`: an exported variable can never redirect a bulk
+write to a different store, and a stale one is never silently preferred over
+your flag. A plain `--from` / `--to` that carries a password still works but
+logs a warning naming the file flag.
+
+CI (write the secret to a `0600` file, never to a flag or the job log):
+
+```yaml
+# GitHub Actions step; PG_URL is a repository secret, e.g.
+# postgres://aimemory:...@HOST:5432/aimemory
+- name: Migrate to Postgres
+  env:
+    PG_URL: ${{ secrets.PG_URL }}
+  run: |
+    umask 077
+    printf '%s\n' "$PG_URL" > "$RUNNER_TEMP/pg-url"
+    ai-memory migrate \
+      --from sqlite:///var/lib/ai-memory/ai-memory.db \
+      --to-url-file "$RUNNER_TEMP/pg-url" \
+      --dry-run
+    rm -f "$RUNNER_TEMP/pg-url"
+```
+
+Kubernetes (mount the Secret as a file, mode `0400`; there is no env channel for
+`migrate`, by design):
+
+```yaml
+apiVersion: batch/v1
+kind: Job
+metadata: { name: ai-memory-migrate }
+spec:
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: migrate
+          image: ghcr.io/alphaonedev/ai-memory:latest
+          args:
+            - migrate
+            - --from
+            - sqlite:///data/ai-memory.db
+            - --to-url-file
+            - /var/run/secrets/ai-memory/store-url
+          volumeMounts:
+            - { name: store-url, mountPath: /var/run/secrets/ai-memory, readOnly: true }
+            - { name: data, mountPath: /data, readOnly: true }
+      volumes:
+        - name: store-url
+          secret: { secretName: ai-memory-store-url, defaultMode: 0400, items: [{ key: store-url, path: store-url }] }
+        - name: data
+          persistentVolumeClaim: { claimName: ai-memory-data }
+```
+
 ```bash
 ai-memory migrate \
   --from sqlite:///$HOME/.local/share/ai-memory/memory.db \
-  --to   postgres://aimemory:PASSWORD@HOST:5432/aimemory \
+  --to-url-file /etc/ai-memory/store-url \
   --dry-run
 ```
 
@@ -158,7 +221,7 @@ API-compatibility hint only.
 ```bash
 ai-memory migrate \
   --from sqlite:///$HOME/.local/share/ai-memory/memory.db \
-  --to   postgres://aimemory:PASSWORD@HOST:5432/aimemory
+  --to-url-file /etc/ai-memory/store-url
 ```
 
 What it does (see `src/migrate.rs`):
@@ -221,7 +284,7 @@ psql 'postgres://aimemory:PASSWORD@HOST:5432/aimemory' \
 # report links_skipped == links_read and zero errors.
 ai-memory migrate \
   --from sqlite:///$HOME/.local/share/ai-memory/memory.db \
-  --to   postgres://aimemory:PASSWORD@HOST:5432/aimemory \
+  --to-url-file /etc/ai-memory/store-url \
   --dry-run --json
 ```
 
@@ -273,7 +336,7 @@ The migration tool is bidirectional. If you need to fall back:
 
 ```bash
 ai-memory migrate \
-  --from postgres://aimemory:PASSWORD@HOST:5432/aimemory \
+  --from-url-file /etc/ai-memory/store-url \
   --to   sqlite:///$HOME/.local/share/ai-memory/memory.db
 ```
 
@@ -291,11 +354,12 @@ If you're upgrading an existing v0.7-alpha postgres db (schema v15)
 to v0.7.0's v55 parity:
 
 ```bash
-ai-memory schema-init \
-  --store-url postgres://aimemory:PASSWORD@HOST:5432/aimemory
+# /etc/ai-memory/store-url: one line, mode 0600, owned by the user running this command:
+#   postgres://aimemory:PASSWORD@HOST:5432/aimemory
+AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url ai-memory schema-init
 ```
 
-`schema-init` has no non-argv channel for its URL (`src/cli/schema_init.rs:111-112`, tracked in [#4600](https://github.com/alphaonedev/ai-memory-mcp/issues/4600)), so the password is visible in `ps` for the seconds this one-shot command runs; run it from a single-user admin host.
+`schema-init` reads its URL from `AI_MEMORY_STORE_URL_FILE` (a `0600` file) first, then `AI_MEMORY_STORE_URL`, then `--store-url`; any two set channels (file, env, `--store-url`) that name different stores are refused by channel name before any connection, instead of one being silently picked (`src/store_url_writer.rs::resolve`, over `src/store_url.rs::resolve_store_url`), so keep the password off argv and use the file form shown above ([#4600](https://github.com/alphaonedev/ai-memory-mcp/issues/4600)).
 
 Opening the store walks the v15 → v55 deltas idempotently (the
 v34 → v55 layer lands via in-process `migrate_v34()…migrate_v55()`
@@ -317,7 +381,7 @@ The cleanest rollback path:
 3. **If you need to roll back** within the first 24-48h after cutover:
    - Stop the postgres-backed daemon.
    - Reverse-migrate the postgres store back onto the sqlite file
-     (`ai-memory migrate --from postgres://… --to sqlite:///…`). The
+     (`ai-memory migrate --from-url-file /etc/ai-memory/store-url --to sqlite:///…`). The
      migrator has no time-window flag — it replays the full corpus,
      and upsert-on-id semantics make re-copying unchanged rows a
      no-op, so the effective result is the post-cutover delta.

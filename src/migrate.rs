@@ -21,7 +21,7 @@
 //!
 //! ```text
 //! ai-memory migrate --from sqlite:///var/lib/ai-memory/ai-memory.db \
-//!                   --to postgres://user:pass@pg:5432/ai_memory \
+//!                   --to-url-file /etc/ai-memory/store-url \
 //!                   [--batch 1000] [--dry-run] [--namespace foo]
 //! ```
 //!
@@ -45,6 +45,107 @@ use std::collections::HashSet;
 use anyhow::{Context, Result};
 
 use crate::store::{CallerContext, Filter, MemoryStore, sqlite::SqliteStore};
+
+/// Default `--batch` page-size hint for `ai-memory migrate`. Currently
+/// an API-compatibility hint only — see the `MAX_ROWS` note in
+/// [`migrate`].
+pub const MIGRATE_BATCH_DEFAULT: usize = 1000;
+
+/// Arguments of `ai-memory migrate` (moved here from `daemon_runtime`, #4600).
+#[derive(clap::Args)]
+pub struct MigrateArgs {
+    /// Source URL. `sqlite:///path/to/file.db` or
+    /// `postgres://user:pass@host:port/dbname`. A password here is readable
+    /// through `ps`; prefer `--from-url-file`. Exactly one of `--from` /
+    /// `--from-url-file` is required.
+    #[arg(
+        long,
+        conflicts_with = "from_url_file",
+        required_unless_present = "from_url_file"
+    )]
+    pub from: Option<String>,
+    /// Read the source URL from this file (mode 0600, owner-only), keeping the
+    /// credential off argv (#4600). Same URL shape as `--from`.
+    #[arg(long)]
+    pub from_url_file: Option<std::path::PathBuf>,
+    /// Destination URL. Same URL shape as `--from`. Prefer `--to-url-file`.
+    /// Exactly one of `--to` / `--to-url-file` is required.
+    #[arg(
+        long,
+        conflicts_with = "to_url_file",
+        required_unless_present = "to_url_file"
+    )]
+    pub to: Option<String>,
+    /// Read the destination URL from this file (mode 0600, owner-only),
+    /// keeping the credential off argv (#4600). Same URL shape as `--to`.
+    #[arg(long)]
+    pub to_url_file: Option<std::path::PathBuf>,
+    /// Page-size hint. Default 1000. Retained for API compatibility —
+    /// the current migrator reads one page capped at `MAX_ROWS`
+    /// (1,000,000) and refuses loudly past it; see `src/migrate.rs`.
+    #[arg(long, default_value_t = MIGRATE_BATCH_DEFAULT)]
+    pub batch: usize,
+    /// Only migrate memories in this namespace.
+    #[arg(long)]
+    pub namespace: Option<String>,
+    /// Emit the report but do NOT write to the destination.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Emit the report as JSON rather than human-readable text.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// #4600 (CWE-214) — resolve one endpoint of `ai-memory migrate` from its
+/// plain URL flag or its `*-url-file` twin (5-agent vote (4d3ea1c5), memory
+/// 6ceaee9a).
+///
+/// `inline_flag` / `file_flag` are the flag names (`--from` / `--from-url-file`),
+/// used only in messages. Exactly one of `url` / `file` must be set (clap
+/// enforces that at parse time; this re-checks so a programmatic caller
+/// cannot reach the connect path with an ambiguous or empty endpoint, failing
+/// closed per ERRORS-01).
+///
+/// * `file` is read through [`crate::store_url::store_url_from_file`] (one
+///   open, `fstat` on that handle, group/world-readable modes refused).
+/// * `url` is accepted verbatim; when it carries a credential a warning names
+///   the file flag, because argv is world-readable through `/proc/<pid>/cmdline`.
+/// * `AI_MEMORY_STORE_URL` / `AI_MEMORY_STORE_URL_FILE` are never consulted:
+///   a stale exported destination would send a bulk upsert to the wrong store.
+///
+/// # Errors
+///
+/// Returns an error when both or neither source is given, or when the file
+/// cannot be read, has lax permissions, or is empty.
+pub fn resolve_endpoint(
+    inline_flag: &str,
+    file_flag: &str,
+    url: Option<&str>,
+    file: Option<&std::path::Path>,
+) -> Result<String> {
+    match (url, file) {
+        (Some(_), Some(_)) => {
+            anyhow::bail!("{inline_flag} and {file_flag} are mutually exclusive (#4600)")
+        }
+        (None, None) => anyhow::bail!("one of {inline_flag} or {file_flag} is required (#4600)"),
+        (None, Some(path)) => crate::store_url::store_url_from_file(path)
+            .with_context(|| format!("resolving {file_flag}")),
+        (Some(url), None) => {
+            if crate::store_url::url_carries_credentials(url) {
+                // `migrate` is a one-shot CLI verb that installs no tracing
+                // subscriber (`command_installs_console_subscriber`), so a
+                // `tracing::warn!` here would be dropped. Write the warning
+                // to stderr directly; it names the flag, never the URL.
+                eprintln!(
+                    "warning: {inline_flag} carries a password in argv, which is exposed via \
+                     world-readable /proc/<pid>/cmdline and `ps auxww` to any local UID \
+                     (#4600). Prefer {file_flag} (a 0600 file holding the URL) instead."
+                );
+            }
+            Ok(url.to_string())
+        }
+    }
+}
 
 /// One migration batch. Exposed for external callers that want to
 /// run a migration programmatically (e.g. a test harness or a

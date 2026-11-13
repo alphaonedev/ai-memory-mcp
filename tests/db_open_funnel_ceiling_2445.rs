@@ -42,7 +42,8 @@ const ALLOWLIST: &[(&str, usize, &str)] = &[
     (
         "src/storage/connection.rs",
         3,
-        "THE funnel itself — `open`, `open_read_only`, `open_unmigrated`. \
+        "THE funnel itself — `open`, `open_unmigrated`, and `open_keyed` (the one \
+         raw open behind `open_read_only` and `open_existing_unmigrated`, #9175). \
          Everything below is a bypass OF this file, which is why it is listed \
          first and why its own count is pinned.",
     ),

@@ -10,16 +10,17 @@ already has non-argv channels (``AI_MEMORY_STORE_URL_FILE`` first, then
 ``AI_MEMORY_STORE_URL``; ``src/store_url.rs`` ``resolve_store_url``), so a
 tracked doc, unit, template or script must not recommend the argv form.
 
-The gate fails when a tracked text file contains a ``--store-url`` argument
-whose value carries an inline userinfo password (``scheme://user:pass@``),
-unless:
+The gate fails when a tracked text file contains a ``--store-url`` argument,
+or a ``migrate`` ``--from`` / ``--to`` argument (#4600: those verbs take
+``--from-url-file`` / ``--to-url-file``), whose value carries an inline
+userinfo password (``scheme://user:pass@``, the user may be empty) or a libpq
+``password=`` / ``sslpassword=`` query key (the two shapes
+``url_carries_credentials`` in ``src/store_url.rs`` treats as a credential), unless:
 
   * the password is a redaction token (an ellipsis, asterisks, ``REDACTED``,
     ``<redacted>``); or
-  * the command is a verb with no non-argv channel at all. ``schema-init``
-    takes its URL ONLY on argv (``src/cli/schema_init.rs`` ``store_url:
-    String``, required); tracked as #4600. Drop the entry from
-    ``ARGV_ONLY_VERBS`` when #4600 lands.
+  * the command is a verb with no non-argv channel at all (``ARGV_ONLY_VERBS``;
+    empty since #4600 gave ``schema-init`` the file and env channels).
 
 A value such as ``"$DSN"`` is not flagged: no literal credential is tracked.
 The gate looks only at what is written in tracked files; it cannot see a
@@ -38,12 +39,13 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 
 # Verbs that offer no non-argv channel. verb -> tracking issue.
-ARGV_ONLY_VERBS = {"schema-init": "#4600"}
+ARGV_ONLY_VERBS: dict[str, str] = {}
 
 # Redaction tokens that are not a credential.
 REDACTION_TOKENS = ("...", "…", "***", "redacted", "<redacted>", "xxxx")
@@ -56,16 +58,29 @@ SELF_EXEMPT = {"scripts/check-docs-no-argv-secrets.py"}
 SKIP_PREFIXES = ("changelog.d/", "docs/reviews/", "docs/handoff/")
 SKIP_FILES = {"CHANGELOG.md"}
 
+# libpq query keys that carry a credential; mirrors LIBPQ_CREDENTIAL_QUERY_KEYS
+# in src/store_url.rs (`url_carries_credentials`), compared case-insensitively.
+CREDENTIAL_QUERY_KEYS = ("password", "sslpassword")
+
 # `--store-url`, optional `=` or whitespace / backslash-newline continuation,
-# optional opening quote, then scheme://user:PASSWORD@ (userinfo cannot contain
-# `/`, `@`, whitespace or a quote; a percent-encoded password is still literal).
+# optional opening quote, then a scheme and EITHER a userinfo password
+# (scheme://user:PASSWORD@, the user may be empty; userinfo cannot contain `/`,
+# `@`, whitespace or a quote; a percent-encoded password is still literal) OR a
+# libpq credential query key (`?password=` / `&sslpassword=`), the two shapes
+# `url_carries_credentials` (src/store_url.rs) treats as a credential (#4600).
 ARG_RE = re.compile(
-    r"--store-url(?:=|(?:\s|\\)+)"
+    r"--(?:store-url|from|to)(?:=|(?:\s|\\)+)"
     r"[\"']?"
     r"[A-Za-z][A-Za-z0-9+.\-]*://"
-    r"[^\s/@\"':]+"  # user
+    r"(?:"
+    r"[^\s/@\"':]*"  # user (may be empty)
     r":(?P<pw>[^\s/@\"']+)"  # password (non-empty)
     r"@"
+    r"|"
+    r"[^\s\"'?#]*\?(?:[^\s\"'#]*&)?"  # authority, path, earlier query pairs
+    r"(?i:" + "|".join(CREDENTIAL_QUERY_KEYS) + r")="
+    r"(?P<qpw>[^\s&\"'#]*)"  # query credential (may be empty, still flagged)
+    r")"
 )
 
 TEXT_SUFFIXES = {
@@ -98,7 +113,7 @@ def scan_text(rel: str, text: str) -> list[tuple[str, int, str]]:
     if rel in SELF_EXEMPT:
         return hits
     for m in ARG_RE.finditer(text):
-        if is_redaction(m.group("pw")):
+        if is_redaction(m.group("pw") or m.group("qpw") or ""):
             continue
         if verb_allowed(text, m.start()):
             continue
@@ -156,8 +171,9 @@ def run() -> int:
         for rel, line, snippet in hits:
             print("HIT %s:%d: %s" % (rel, line, snippet), file=sys.stderr)
         print(
-            "FAIL: check-docs-no-argv-secrets: %d tracked --store-url argument(s) carry an inline "
-            "password (#4577). Use AI_MEMORY_STORE_URL_FILE (a 0600 file); see docs/CLI_REFERENCE.md."
+            "FAIL: check-docs-no-argv-secrets: %d tracked --store-url / --from / --to argument(s) carry "
+            "an inline password (#4577 #4600). Use AI_MEMORY_STORE_URL_FILE or migrate "
+            "--from-url-file / --to-url-file (a 0600 file); see docs/CLI_REFERENCE.md."
             % len(hits),
             file=sys.stderr,
         )
@@ -174,6 +190,16 @@ RED_PROBES = {
     "shell-var": "ssh h \"ai-memory serve --store-url 'postgres://u:$PG_PW@h/d'\"",
     "continuation": "ai-memory serve \\\n  --store-url \\\n  postgres://u:hunter2@h/d",
     "other-verb": "ai-memory curator --store-url postgres://u:hunter2@h/d",
+    "schema-init-4600": "ai-memory schema-init --store-url postgres://u:hunter2@h/d",
+    "schema-init-continued-4600": "ai-memory schema-init \\\n  --store-url postgres://u:hunter2@h/d",
+    "migrate-to-4600": "ai-memory migrate --from sqlite:///a.db --to postgres://u:hunter2@h/d",
+    "migrate-from-equals-4600": "ai-memory migrate --from=postgres://u:hunter2@h/d --to-url-file f",
+    "empty-user-4600": "ai-memory serve --store-url postgres://:hunter2@h/d",
+    "query-password-4600": "ai-memory serve --store-url 'postgres://u@h/d?sslmode=require&password=hunter2'",
+    "query-password-first-4600": "ai-memory schema-init --store-url postgres://u@h/d?password=hunter2",
+    "query-sslpassword-4600": "ai-memory serve --store-url=postgres://u@h/d?sslpassword=hunter2",
+    "query-password-upper-4600": "ai-memory serve --store-url postgres://u@h/d?PASSWORD=hunter2",
+    "query-password-empty-4600": "ai-memory serve --store-url postgres://u@h/d?password=",
 }
 GREEN_PROBES = {
     "file-form": "AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url ai-memory serve",
@@ -185,9 +211,18 @@ GREEN_PROBES = {
     "ellipsis-char": "ai-memory serve --store-url postgres://user:…@h/db",
     "lookalike-flag": "wake_abab.sh --store-url-src postgres://u:p@h/d",
     "prose-mention": "the `serve --store-url` connection URL (e.g. postgres://user:pass@host/db)",
-    "argv-only-verb": "ai-memory schema-init --store-url postgres://u:hunter2@h/d",
-    "argv-only-verb-continued": "ai-memory schema-init \\\n  --store-url postgres://u:hunter2@h/d",
+    "migrate-file-form-4600": "ai-memory migrate --from sqlite:///a.db --to-url-file /etc/ai-memory/dst",
+    "migrate-no-password-4600": "ai-memory migrate --from sqlite:///a.db --to postgres://u@h/d",
+    "lookalike-from-flag-4600": "tool --from-url-file postgres://u:p@h/d",
+    "query-no-credential-4600": "ai-memory serve --store-url postgres://u@h/d?sslmode=require&user=u",
+    "query-lookalike-key-4600": "ai-memory serve --store-url postgres://u@h/d?passwordless=1&my_password=x",
+    "query-redacted-4600": "ai-memory serve --store-url postgres://u@h/d?password=REDACTED",
+    "empty-userinfo-4600": "ai-memory serve --store-url postgres://:@h/d",
 }
+
+# Input-bound probe: a long hostile line must scan in linear time.
+BOUND_PROBE_CHARS = 200_000
+BOUND_PROBE_SECONDS = 2.0
 
 
 def self_test() -> int:
@@ -201,6 +236,14 @@ def self_test() -> int:
         if got:
             print("SELF-TEST FAIL: green probe %r was flagged: %r" % (name, got), file=sys.stderr)
             bad += 1
+    hostile = "--store-url postgres://u" + "&" * BOUND_PROBE_CHARS + "?" + ":" * BOUND_PROBE_CHARS
+    started = time.monotonic()
+    scan_text("probe.md", hostile * 2)
+    elapsed = time.monotonic() - started
+    if elapsed > BOUND_PROBE_SECONDS:
+        print("SELF-TEST FAIL: %d-char probe took %.2fs (bound %.1fs)"
+              % (len(hostile) * 2, elapsed, BOUND_PROBE_SECONDS), file=sys.stderr)
+        bad += 1
     if scan_text("scripts/check-docs-no-argv-secrets.py", RED_PROBES["inline"]):
         print("SELF-TEST FAIL: self-exempt path was flagged", file=sys.stderr)
         bad += 1

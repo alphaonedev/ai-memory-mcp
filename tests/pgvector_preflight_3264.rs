@@ -182,7 +182,7 @@ async fn schema_init_json_reports_the_preflight_fields_3264() {
     let mut stderr = Vec::<u8>::new();
     let mut out = ai_memory::cli::CliOutput::from_std(&mut stdout, &mut stderr);
     let args = ai_memory::cli::schema_init::SchemaInitArgs {
-        store_url: url.clone(),
+        store_url: Some(url.clone()),
         json: true,
         embedding_dim: Some(384),
         force_reembed: false,

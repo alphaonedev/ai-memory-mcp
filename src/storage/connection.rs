@@ -1268,10 +1268,7 @@ pub fn open_read_only(path: &Path) -> Result<Connection> {
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
         | OpenFlags::SQLITE_OPEN_URI
         | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-    let conn = Connection::open_with_flags(path, flags)
-        .context("failed to open read-only database connection")?;
-    apply_sqlcipher_key(&conn)?;
-    register_valid_time_functions(&conn).context(MSG_REGISTER_VALID_TIME_FNS)?;
+    let conn = open_keyed(path, flags, "failed to open read-only database connection")?;
     conn.pragma_update(None, "busy_timeout", 5000)?;
     // #1579 B7 — mirror the writer's memory-mapped I/O budget so the
     // read-pool shares the OS page cache reservation.
@@ -1301,7 +1298,8 @@ pub const MISSING_DATABASE_REFUSAL: &str =
 
 /// Open an **existing** database read-only. A missing path is a
 /// typed refusal — never a create-and-migrate (the `boot` / `doctor`
-/// contract: ERRORS-01, the advertised "never mutates" clap docs).
+/// contract: ERRORS-01, the clap docs' "never changes a memory, the
+/// schema or the file set").
 ///
 /// # Errors
 ///
@@ -1311,16 +1309,93 @@ pub const MISSING_DATABASE_REFUSAL: &str =
 /// must not), plus every error [`open_read_only`] / the #2445/#2555/#2564
 /// guards can produce.
 pub fn open_existing_read_only(path: &Path) -> Result<Connection> {
+    open_existing_guarded(path, ExistingAccess::ReadOnly)
+}
+
+/// #9175 — open an **existing** database read-write for ONE caller-owned row
+/// append, never creating, migrating or re-stamping it: the writable twin of
+/// [`open_existing_read_only`], through the same guard
+/// ([`open_existing_guarded`]). Its one caller is the audited
+/// inference-egress refusal that `doctor` records
+/// (`crate::egress::refuse_inference_egress_audited_existing`).
+///
+/// It opens without `SQLITE_OPEN_CREATE`, so a missing path stays missing (no
+/// file, no `-wal`/`-shm` sidecar), applies no bootstrap DDL, no ladder, no
+/// trigger install and no writer pragma (`journal_mode` is left as found), and
+/// writes no lineage watermark or rollback evidence. The only write on the
+/// returned connection is the one the caller makes.
+///
+/// # Errors
+///
+/// [`MISSING_DATABASE_REFUSAL`] when `path` does not exist;
+/// [`super::schema_guard::SchemaAheadOfBinary`] when the stamp is ahead of
+/// this binary, with or without the operator hatch (an append under the hatch
+/// would not hand the database back exactly as found);
+/// [`super::schema_guard::SchemaBehindReadOnly`] when the stamp is behind (the
+/// row shape belongs to the current schema); plus the #2555 / #2564 guard
+/// refusals, the SQLCipher unlock failure and any open failure.
+pub(crate) fn open_existing_unmigrated(path: &Path) -> Result<Connection> {
+    open_existing_guarded(path, ExistingAccess::Append)
+}
+
+/// #9175 — what [`open_existing_guarded`] hands back once the guard passes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExistingAccess {
+    /// [`open_read_only`]: `query_only`, the `boot` / `doctor` read posture.
+    ReadOnly,
+    /// Read-write without create, for one caller-owned row append.
+    Append,
+}
+
+/// Busy wait for the one-row append on [`open_existing_unmigrated`].
+const EXISTING_APPEND_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// #3411 / #3434 / #9175 — the ONE guard for an existing database that a verb
+/// must not create or migrate, shared by [`open_existing_read_only`] and
+/// [`open_existing_unmigrated`]. In order: the missing-file refusal, the open,
+/// the #2445 / #2555 / #2564 stamp guards, and the schema-behind refusal. It
+/// writes nothing.
+///
+/// # Errors
+///
+/// See [`open_existing_read_only`] and [`open_existing_unmigrated`].
+fn open_existing_guarded(path: &Path, access: ExistingAccess) -> Result<Connection> {
     match path.try_exists() {
         Ok(false) => anyhow::bail!("{}: {}", MISSING_DATABASE_REFUSAL, path.display()),
         Ok(true) => {}
         Err(e) => anyhow::bail!("cannot stat {}: {e}", path.display()),
     }
-    let conn = open_read_only(path)?;
+    let conn = match access {
+        ExistingAccess::ReadOnly => open_read_only(path)?,
+        ExistingAccess::Append => {
+            use rusqlite::OpenFlags;
+            let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_URI
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+            let conn = open_keyed(path, flags, "failed to open existing database for append")?;
+            conn.busy_timeout(EXISTING_APPEND_BUSY_TIMEOUT)?;
+            conn
+        }
+    };
     let target = path.display().to_string();
     // Diagnose schema-ahead / poisoned / zeroed WITHOUT migrating so
     // boot/doctor keep the #2445/#2555/#2564 typed refusals.
-    assert_schema_not_ahead(&conn, &target)?;
+    let posture = resolve_schema_posture(&conn, &target)?;
+    let supported = super::migrations::current_schema_version();
+    // #9175 — the hatch admits a newer database on the promise that it is
+    // handed back EXACTLY as found; a read keeps that promise, an append does
+    // not. Refuse with the same typed verdict the unhatched guard returns.
+    if access == ExistingAccess::Append && posture == SchemaPosture::AheadButAuthorised {
+        let observed = probe_schema_stamp(&conn)?.version();
+        return Err(super::schema_guard::SchemaAheadOfBinary {
+            observed,
+            supported,
+            backend: BACKEND_SQLITE,
+            target: target.clone(),
+            detail: super::schema_guard::render(observed, supported, BACKEND_SQLITE, &target),
+        }
+        .into());
+    }
     // #3411 / #3434 — a stamp strictly BEHIND this binary used to be a
     // silent migrate (`db::open`). After the read-only funnel, the first
     // query against a missing column failed as raw rusqlite. Probe the
@@ -1328,10 +1403,24 @@ pub fn open_existing_read_only(path: &Path) -> Result<Connection> {
     // repair (`ai-memory migrate --in-place` / start the daemon).
     let stamp = probe_schema_stamp(&conn)?;
     let observed = stamp.version();
-    let supported = super::migrations::current_schema_version();
     if observed < supported {
         return Err(SchemaBehindReadOnly::new(observed, BACKEND_SQLITE, &target).into());
     }
+    Ok(conn)
+}
+
+/// #9175 — the ONE raw open behind [`open_read_only`] and
+/// [`open_existing_unmigrated`]: open `path` with `flags` (these callers never
+/// pass `SQLITE_OPEN_CREATE`), key it as the first operation, and register
+/// the valid-time SQL functions.
+fn open_keyed(
+    path: &Path,
+    flags: rusqlite::OpenFlags,
+    context: &'static str,
+) -> Result<Connection> {
+    let conn = Connection::open_with_flags(path, flags).context(context)?;
+    apply_sqlcipher_key(&conn)?;
+    register_valid_time_functions(&conn).context(MSG_REGISTER_VALID_TIME_FNS)?;
     Ok(conn)
 }
 
@@ -1577,6 +1666,165 @@ mod tests {
             )
             .expect("stamp readable");
         assert_eq!(still, behind, "read-only refusal must not migrate");
+    }
+
+    // ─── #9175 D-M1: open_existing_unmigrated, the writable twin ────────────
+
+    /// The sorted file names in `dir` (sidecars included).
+    fn listing_9175(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .expect("read dir")
+            .map(|e| {
+                e.expect("dir entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// A migrated database in a fresh directory, re-stamped to `stamp` when
+    /// given, closed.
+    fn stamped_db_9175(stamp: Option<i64>) -> (tempfile::TempDir, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("append.db");
+        drop(open(&path).expect("create"));
+        if let Some(version) = stamp {
+            let conn = Connection::open(&path).expect("raw reopen");
+            conn.execute("DELETE FROM schema_version", [])
+                .expect("clear stamp");
+            conn.execute(
+                "INSERT INTO schema_version (version) VALUES (?1)",
+                rusqlite::params![version],
+            )
+            .expect("plant stamp");
+        }
+        (tmp, path)
+    }
+
+    /// Assert the refused open left the directory and the file bytes as found.
+    fn assert_untouched_9175(dir: &Path, path: &Path, bytes: &[u8], files: &[String]) {
+        assert_eq!(
+            std::fs::read(path).expect("re-read"),
+            bytes,
+            "bytes unchanged"
+        );
+        assert_eq!(
+            listing_9175(dir),
+            files,
+            "no file or -wal/-shm sidecar created"
+        );
+    }
+
+    #[test]
+    fn open_existing_unmigrated_refuses_missing_path_without_a_file_9175() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let missing = tmp.path().join("no-such.db");
+        let err = open_existing_unmigrated(&missing).expect_err("missing path must refuse");
+        assert_eq!(
+            format!("{err:#}"),
+            format!("{MISSING_DATABASE_REFUSAL}: {}", missing.display())
+        );
+        assert!(
+            listing_9175(tmp.path()).is_empty(),
+            "no database file and no -wal/-shm sidecar: {:?}",
+            listing_9175(tmp.path())
+        );
+    }
+
+    #[test]
+    fn open_existing_unmigrated_refuses_schema_ahead_9175() {
+        crate::storage::schema_guard::with_hatch(None, || {
+            let ahead = crate::storage::migrations::current_schema_version() + 1;
+            let (tmp, path) = stamped_db_9175(Some(ahead));
+            let (bytes, files) = (
+                std::fs::read(&path).expect("read"),
+                listing_9175(tmp.path()),
+            );
+            let err = open_existing_unmigrated(&path).expect_err("ahead stamp must refuse");
+            let typed = crate::storage::schema_guard::schema_ahead_of(&err)
+                .expect("typed SchemaAheadOfBinary");
+            assert_eq!(typed.observed, ahead);
+            assert_eq!(
+                format!("{err:#}"),
+                crate::storage::schema_guard::render(
+                    ahead,
+                    crate::storage::migrations::current_schema_version(),
+                    BACKEND_SQLITE,
+                    &path.display().to_string()
+                )
+            );
+            assert_untouched_9175(tmp.path(), &path, &bytes, &files);
+        });
+    }
+
+    #[test]
+    fn open_existing_unmigrated_refuses_schema_ahead_under_the_hatch_9175() {
+        let ahead = crate::storage::migrations::current_schema_version() + 1;
+        let hatch = ahead.to_string();
+        crate::storage::schema_guard::with_hatch(Some(&hatch), || {
+            let (tmp, path) = stamped_db_9175(Some(ahead));
+            let (bytes, files) = (
+                std::fs::read(&path).expect("read"),
+                listing_9175(tmp.path()),
+            );
+            // The read twin admits the hatched database; the append twin does not.
+            drop(open_existing_read_only(&path).expect("hatch admits the read-only open"));
+            let err = open_existing_unmigrated(&path).expect_err("hatched ahead must refuse");
+            let typed = crate::storage::schema_guard::schema_ahead_of(&err)
+                .expect("typed SchemaAheadOfBinary");
+            assert_eq!(typed.observed, ahead);
+            assert_eq!(
+                format!("{err:#}"),
+                crate::storage::schema_guard::render(
+                    ahead,
+                    crate::storage::migrations::current_schema_version(),
+                    BACKEND_SQLITE,
+                    &path.display().to_string()
+                )
+            );
+            assert_untouched_9175(tmp.path(), &path, &bytes, &files);
+        });
+    }
+
+    #[test]
+    fn open_existing_unmigrated_refuses_schema_behind_9175() {
+        crate::storage::schema_guard::with_hatch(None, || {
+            let behind = crate::storage::migrations::current_schema_version() - 1;
+            let (tmp, path) = stamped_db_9175(Some(behind));
+            let (bytes, files) = (
+                std::fs::read(&path).expect("read"),
+                listing_9175(tmp.path()),
+            );
+            let err = open_existing_unmigrated(&path).expect_err("behind stamp must refuse");
+            let typed = crate::storage::schema_guard::schema_behind_read_only(&err)
+                .expect("typed SchemaBehindReadOnly");
+            assert_eq!(typed.observed, behind);
+            assert_eq!(
+                format!("{err:#}"),
+                SchemaBehindReadOnly::new(behind, BACKEND_SQLITE, &path.display().to_string())
+                    .detail
+            );
+            assert_untouched_9175(tmp.path(), &path, &bytes, &files);
+        });
+    }
+
+    #[test]
+    fn open_existing_unmigrated_opens_a_current_file_writable_9175() {
+        crate::storage::schema_guard::with_hatch(None, || {
+            let (_tmp, path) = stamped_db_9175(None);
+            let conn = open_existing_unmigrated(&path).expect("current stamp opens");
+            let query_only: i64 = conn
+                .pragma_query_value(None, "query_only", |row| row.get(0))
+                .expect("query_only");
+            assert_eq!(query_only, 0, "the append twin is writable");
+            let stamp: i64 = conn
+                .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
+                .expect("stamp");
+            assert_eq!(stamp, crate::storage::migrations::current_schema_version());
+        });
     }
 
     #[test]

@@ -51,7 +51,11 @@
 //! ## Anti-goals (per spec)
 //!
 //! - Do NOT add new monitoring infrastructure (no Prometheus, OTel exporters).
-//! - Do NOT make doctor write to the DB. Read-only.
+//! - Do NOT make doctor create, migrate or change the DB: it never changes a
+//!   memory, the schema or the file set. Its one write is the signed
+//!   `egress.inference_refused` row a probe the inference-egress posture
+//!   refuses appends to the EXISTING database (#4121, #9175);
+//!   `--repair-schema-version` is the separate repair mode (#2555).
 //! - Do NOT make doctor block the database. Indexed `COUNT(*)` queries only.
 
 use crate::cli::CliOutput;
@@ -783,7 +787,8 @@ fn render_hooks_human_with(
 
 /// Entry point. Returns the process exit code as a `i32` (0/1/2). The
 /// caller (daemon_runtime) must `std::process::exit(code)` after the WAL
-/// checkpoint has been skipped (doctor never writes).
+/// checkpoint has been skipped (doctor never migrates; its one write is the
+/// #4121 refused-probe audit row, appended to the existing file).
 ///
 /// # Errors
 ///
@@ -1681,7 +1686,9 @@ fn run_local(db_path: &Path, caller_agent_id: Option<&str>) -> Report {
     }
 
     // Open the connection once, READ-ONLY. A missing path is a refusal,
-    // never a create-and-migrate (#3434 — clap advertises "never mutates").
+    // never a create-and-migrate (#3434 — clap advertises "never changes a
+    // memory, the schema or the file set"; the one write is the #4121
+    // refused-probe audit row, through its own existing-file open).
     // Failures bubble into a single Critical section and the rest of the
     // report is N/A. Identity still renders (the keystore is independent
     // of the database).
@@ -1781,7 +1788,7 @@ fn run_local(db_path: &Path, caller_agent_id: Option<&str>) -> Report {
                 } else if e.to_string().contains(db::MISSING_DATABASE_REFUSAL) {
                     format!(
                         "database at {} does not exist — refusing to create it \
-                         (doctor is read-only). Every other section is N/A.",
+                         (doctor never creates the database). Every other section is N/A.",
                         db_path.display()
                     )
                 } else {
@@ -1845,8 +1852,10 @@ fn run_local(db_path: &Path, caller_agent_id: Option<&str>) -> Report {
     sections.push(section_capabilities_local());
     sections.push(section_reflection_health(&conn));
     sections.push(section_atomisation_curator_2985(&conn));
-    sections.push(section_llm_reachability_1146());
-    sections.push(section_embeddings_reachability_1598());
+    // #4121 / #4122 — a refused probe appends one signed EGRESS_INFERENCE_REFUSED
+    // row to this database (proved present at the current schema above).
+    sections.push(section_llm_reachability_1146(Some(db_path)));
+    sections.push(section_embeddings_reachability_1598(Some(db_path)));
     // v1.0.0 #3471 — the wake-hub posture. Filesystem + `getrlimit` only: the
     // hub opens no store, so this section cannot be affected by (or affect)
     // the database connection above.
@@ -4561,13 +4570,69 @@ fn section_capabilities_local() -> ReportSection {
 /// plus the HTTP status code + observed latency, so operators can
 /// see WHERE the wiring came from and WHY the probe lands where it
 /// does.
-fn section_llm_reachability_1146() -> ReportSection {
+///
+/// `audit_db` is the store a refused probe records its signed refusal in
+/// (#4122 parity with boot and `reembed`); `None` records nothing.
+fn section_llm_reachability_1146(audit_db: Option<&Path>) -> ReportSection {
     let app_config = crate::config::AppConfig::load();
     let resolved = app_config.resolve_llm(None, None, None);
-    section_llm_reachability_from_resolved(&resolved)
+    section_llm_reachability_from_resolved(&resolved, audit_db)
 }
 
-fn section_llm_reachability_from_resolved(resolved: &crate::config::ResolvedLlm) -> ReportSection {
+/// #4121 — timeout for each inference reachability probe.
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// #4121 — the section a reachability probe returns when the
+/// inference-egress posture refused its target. Nothing was sent: the
+/// admission ran before any client existed. With an `audit_db` the refusal
+/// is recorded through
+/// [`crate::egress::refuse_inference_egress_audited_existing`]: the same
+/// signed row boot and `reembed` append (#4122), on the existing file only
+/// (no create, no migration, refused on a schema stamp ahead of or behind
+/// the binary, #9175 D-M1); the row carries a hash of the target, never the
+/// URL. When the row could not be appended, the exact NOT-recorded line is
+/// appended to the note, because doctor installs no tracing subscriber
+/// (#9175 D-L2).
+fn probe_refused_section(
+    name: &str,
+    noun: &str,
+    mut facts: Vec<(String, String)>,
+    base_url: &str,
+    mode: crate::egress::InferenceEgressMode,
+    reason: String,
+    audit: (crate::egress::EgressClass, Option<&Path>),
+) -> ReportSection {
+    let unrecorded = match audit {
+        (class, Some(db)) => {
+            crate::egress::refuse_inference_egress_audited_existing(db, class, base_url, &reason)
+        }
+        (_, None) => None,
+    };
+    let mut note = format!(
+        "probe NOT sent (#4121): inference-plane egress refused the {noun} target {} under \
+         {}={}; no connection was opened and no API key left the process. {reason}",
+        crate::url_display::url_origin(base_url),
+        crate::egress::ENV_INFERENCE_EGRESS,
+        mode.as_str(),
+    );
+    if let Some(line) = unrecorded {
+        note.push(' ');
+        note.push_str(&line);
+    }
+    facts.push(("inference_egress".into(), reason));
+    facts.push(("inference_egress_mode".into(), mode.as_str().to_string()));
+    ReportSection {
+        name: name.into(),
+        severity: Severity::Warning,
+        facts,
+        note: Some(note),
+    }
+}
+
+fn section_llm_reachability_from_resolved(
+    resolved: &crate::config::ResolvedLlm,
+    audit_db: Option<&Path>,
+) -> ReportSection {
     use crate::config::{ConfigSource, KeySource};
 
     let mut facts = vec![
@@ -4587,9 +4652,10 @@ fn section_llm_reachability_from_resolved(resolved: &crate::config::ResolvedLlm)
         ),
     ];
 
-    // #3811/#3860: this probe builds its own HTTP client, so enforce the
-    // same selector gate as both LLM builders before any credential or
-    // request is attached, even when the operator supplied an explicit URL.
+    // #3811/#3860: enforce the same selector gate as both LLM builders
+    // before any credential or request is attached, even when the operator
+    // supplied an explicit URL (#4121: the client itself comes from the
+    // inference-egress admission funnel below).
     if !crate::config::is_recognized_llm_backend(&resolved.backend) {
         return ReportSection {
             name: SECTION_LLM_REACHABILITY.into(),
@@ -4655,13 +4721,26 @@ fn section_llm_reachability_from_resolved(resolved: &crate::config::ResolvedLlm)
     ));
 
     let started = std::time::Instant::now();
-    let client = match reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .connect_timeout(std::time::Duration::from_secs(5))
-        .build()
-    {
+    // #4121 — admission and the endpoint pin run BEFORE the client exists:
+    // a refused posture opens no connection and attaches no key.
+    let client = match crate::egress::admitted_blocking_client(
+        crate::egress::EgressClass::InferenceLlm,
+        &resolved.base_url,
+        PROBE_TIMEOUT,
+    ) {
         Ok(c) => c,
-        Err(e) => {
+        Err(crate::egress::AdmittedClientError::Refused { mode, reason }) => {
+            return probe_refused_section(
+                SECTION_LLM_REACHABILITY,
+                "LLM",
+                facts,
+                &resolved.base_url,
+                mode,
+                reason,
+                (crate::egress::EgressClass::InferenceLlm, audit_db),
+            );
+        }
+        Err(crate::egress::AdmittedClientError::Build(e)) => {
             facts.push((
                 "error".into(),
                 format!("{MSG_HTTP_CLIENT_BUILD_FAILED}: {e}"),
@@ -4796,7 +4875,7 @@ fn nvidia_gpu_detected() -> bool {
 /// Additionally emits the operator GPU-policy WARN
 /// ([`gpu_policy_warn_applicable`]) when the resolved backend is
 /// `ollama` on a host with no detectable NVIDIA GPU.
-fn section_embeddings_reachability_1598() -> ReportSection {
+fn section_embeddings_reachability_1598(audit_db: Option<&Path>) -> ReportSection {
     use crate::config::{AppConfig, ConfigSource, KeySource};
 
     let app_config = AppConfig::load();
@@ -4845,15 +4924,48 @@ fn section_embeddings_reachability_1598() -> ReportSection {
     }
 
     let is_api = crate::config::is_api_embed_backend(&resolved.backend);
+    // v1.0.0 #2972 — the model this binary will LOAD (the tier preset when the
+    // configured id is not constructible); the same resolver `reembed` uses.
+    let boot_model = crate::daemon_runtime::resolve_boot_embedder_model(
+        &app_config.effective_tier(None).config(),
+        &app_config,
+    );
+
+    // #3933 / #4121 — gate on TRANSPORT like boot and `reembed`: a lane that
+    // opens no socket (ollama + the local in-process MiniLM embedder) has no
+    // endpoint to probe, so nothing is admitted, refused or sent.
+    if !crate::config::embed_lane_egresses(&resolved.backend, boot_model.model) {
+        facts.push((EMBED_LANE_FACT.into(), EMBED_LANE_LOCAL.into()));
+        return finish_embeddings_section(
+            &resolved,
+            &boot_model,
+            facts,
+            Severity::Info,
+            Some(EMBED_LANE_LOCAL_NOTE.into()),
+        );
+    }
 
     let started = std::time::Instant::now();
-    let client = match reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .connect_timeout(std::time::Duration::from_secs(5))
-        .build()
-    {
+    // #4121 — admission and the endpoint pin run BEFORE the client exists:
+    // a refused posture opens no connection and attaches no key.
+    let client = match crate::egress::admitted_blocking_client(
+        crate::egress::EgressClass::InferenceEmbedding,
+        &resolved.url,
+        PROBE_TIMEOUT,
+    ) {
         Ok(c) => c,
-        Err(e) => {
+        Err(crate::egress::AdmittedClientError::Refused { mode, reason }) => {
+            return probe_refused_section(
+                SECTION_EMBEDDINGS_REACHABILITY,
+                crate::config::config_keys::SECTION_EMBEDDINGS,
+                facts,
+                &resolved.url,
+                mode,
+                reason,
+                (crate::egress::EgressClass::InferenceEmbedding, audit_db),
+            );
+        }
+        Err(crate::egress::AdmittedClientError::Build(e)) => {
             facts.push((
                 "error".into(),
                 format!("{MSG_HTTP_CLIENT_BUILD_FAILED}: {e}"),
@@ -4892,7 +5004,7 @@ fn section_embeddings_reachability_1598() -> ReportSection {
         crate::url_display::url_origin_and_path(&probe_url),
     ));
 
-    let (mut severity, mut note) = match req.send() {
+    let (severity, note) = match req.send() {
         Ok(resp) => {
             let status = resp.status();
             let elapsed_ms = started.elapsed().as_millis();
@@ -4956,6 +5068,26 @@ fn section_embeddings_reachability_1598() -> ReportSection {
         }
     };
 
+    finish_embeddings_section(&resolved, &boot_model, facts, severity, note)
+}
+
+/// #4121 — the embeddings section facts key naming the lane transport.
+const EMBED_LANE_FACT: &str = "embed_lane";
+/// #3933 — the lane value for the local in-process embedder.
+const EMBED_LANE_LOCAL: &str = "local";
+/// #3933 / #4121 — the note for a lane that opens no socket.
+const EMBED_LANE_LOCAL_NOTE: &str = "probe not needed: the embed lane is the local in-process \
+     embedder, which opens no network connection (#3933); nothing was sent";
+
+/// The model-honoured and GPU-policy findings every embeddings section
+/// carries, whether or not a probe ran.
+fn finish_embeddings_section(
+    resolved: &crate::config::ResolvedEmbeddings,
+    boot_model: &crate::daemon_runtime::BootEmbedderModel,
+    mut facts: Vec<(String, String)>,
+    mut severity: Severity,
+    mut note: Option<String>,
+) -> ReportSection {
     // v1.0.0 #2972 — the `model` fact above is the CONFIGURED id, not
     // necessarily the one this binary will LOAD. On a non-API backend
     // `Embedder::from_resolved` constructs only from the compiled
@@ -4967,10 +5099,6 @@ fn section_embeddings_reachability_1598() -> ReportSection {
     // model whenever it differs from the configured one — a doctor that
     // states a model the binary will not load is a false claim, not a
     // cosmetic gap.
-    let boot_model = crate::daemon_runtime::resolve_boot_embedder_model(
-        &app_config.effective_tier(None).config(),
-        &app_config,
-    );
     if let Some(raw) = boot_model.unhonoured_config_model.as_deref() {
         let effective = boot_model.model.map_or_else(
             || "(none — keyword-only tier)".to_string(),
@@ -8829,7 +8957,7 @@ enabled = true
         let _g = reach_env_lock().lock().unwrap_or_else(|e| e.into_inner());
         clear_llm_embed_env();
         let _scope = EnvScope::set(&[]);
-        let section = tokio::task::spawn_blocking(section_llm_reachability_1146)
+        let section = tokio::task::spawn_blocking(|| section_llm_reachability_1146(None))
             .await
             .unwrap();
         assert_eq!(section.severity, Severity::Info);
@@ -8884,7 +9012,7 @@ enabled = true
                 assert!(resolved.base_url.is_empty());
             }
             let section = tokio::task::spawn_blocking(move || {
-                section_llm_reachability_from_resolved(&resolved)
+                section_llm_reachability_from_resolved(&resolved, None)
             })
             .await
             .unwrap();
@@ -8936,7 +9064,7 @@ enabled = true
                     ("AI_MEMORY_LLM_API_KEY", "probe-key"),
                     ("AI_MEMORY_LLM_MODEL", "probe-model"),
                 ]);
-                tokio::task::spawn_blocking(section_llm_reachability_1146)
+                tokio::task::spawn_blocking(|| section_llm_reachability_1146(None))
                     .await
                     .unwrap()
             };
@@ -8950,7 +9078,7 @@ enabled = true
         let _g = reach_env_lock().lock().unwrap_or_else(|e| e.into_inner());
         clear_llm_embed_env();
         let _scope = EnvScope::set(&[]);
-        let section = tokio::task::spawn_blocking(section_embeddings_reachability_1598)
+        let section = tokio::task::spawn_blocking(|| section_embeddings_reachability_1598(None))
             .await
             .unwrap();
         assert_eq!(section.severity, Severity::Info);
@@ -8992,7 +9120,7 @@ enabled = true
                     ("AI_MEMORY_EMBED_API_KEY", "probe-key"),
                     ("AI_MEMORY_EMBED_MODEL", "probe-embed-model"),
                 ]);
-                tokio::task::spawn_blocking(section_embeddings_reachability_1598)
+                tokio::task::spawn_blocking(|| section_embeddings_reachability_1598(None))
                     .await
                     .unwrap()
             };
@@ -9818,5 +9946,51 @@ mod cov_doctor_identity_posture_3521 {
             )
             .expect("stamp readable");
         assert_eq!(still, behind, "doctor must not migrate a behind stamp");
+    }
+}
+
+/// PR #9175 r2 D-L2 — a refused probe whose signed refusal could NOT be
+/// recorded says so on doctor's own output (the report), because doctor
+/// installs no tracing subscriber and a `tracing::warn!` alone is lost.
+#[cfg(test)]
+mod audit_unrecorded_9175 {
+    use super::probe_refused_section;
+    use crate::egress::{EgressClass, InferenceEgressMode};
+
+    #[test]
+    fn refused_probe_reports_an_unrecorded_refusal_in_the_note_9175() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(".local-runs")
+            .join(format!(
+                "doctor-audit-unrecorded-9175-{}",
+                uuid::Uuid::new_v4()
+            ));
+        std::fs::create_dir_all(&dir).expect("mkdir scratch");
+        let missing = dir.join("vanished.db");
+        let target = "https://llm.example.invalid/v1";
+        let section = probe_refused_section(
+            "llm_reachability",
+            "LLM",
+            Vec::new(),
+            target,
+            InferenceEgressMode::Deny,
+            "posture refused (#9175 fixture)".to_string(),
+            (EgressClass::InferenceLlm, Some(&missing)),
+        );
+        let expected = format!(
+            "inference-egress signed refusal NOT recorded (db open failed) for {} target={}: \
+             {}: {}",
+            EgressClass::InferenceLlm.as_str(),
+            crate::url_display::url_origin(target),
+            crate::storage::MISSING_DATABASE_REFUSAL,
+            missing.display(),
+        );
+        let note = section.note.expect("a refused probe carries a note");
+        assert!(
+            note.ends_with(&format!(" {expected}")),
+            "#9175 D-L2: the unrecorded refusal is on doctor's report, exact text: {note}"
+        );
+        assert!(!missing.exists(), "#9175: the audit open creates no file");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

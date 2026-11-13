@@ -141,7 +141,7 @@ async fn run_schema_init_default(url: &str, config_default_dim: Option<u32>) -> 
     use ai_memory::cli::schema_init::{SchemaInitArgs, run as schema_init_run};
 
     let args = SchemaInitArgs {
-        store_url: url.to_string(),
+        store_url: Some(url.to_string()),
         json: true,
         // Operator omits the flag → dim resolves from `config_default_dim`.
         embedding_dim: None,

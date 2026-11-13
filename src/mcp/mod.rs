@@ -4820,7 +4820,8 @@ pub fn run_mcp_server(
             }) => {
                 eprintln!(
                     "ai-memory: embedder DISABLED by inference-plane egress gate \
-                         (target={target}); {reason} — semantic recall degrades to keyword (#1963/#3822)"
+                         (target={}); {reason} — semantic recall degrades to keyword (#1963/#3822)",
+                    crate::url_display::url_origin(&target)
                 );
                 // #3429 (sibling of #1991) — audit into the store this MCP
                 // process actually opened (`db_path`).

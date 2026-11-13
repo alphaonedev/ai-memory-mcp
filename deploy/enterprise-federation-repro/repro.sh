@@ -306,17 +306,19 @@ TOML
 # 8. schema-init over the encrypted store link (creates the app schema +
 #    AGE create_graph('memory_graph'); idempotent).
 # --------------------------------------------------------------------------
-DSN="$(store_dsn)"
 log "repro: schema-init (embedding-dim $EMBED_DIM) over verify-full TLS + client-cert mTLS"
-AI_MEMORY_NO_CONFIG=1 "$BIN" schema-init --store-url "$DSN" --embedding-dim "$EMBED_DIM"
+# #4600: schema-init reads the DSN from the 0600 $STORE_URL_FILE (written above),
+# never argv (src/cli/schema_init.rs -> src/store_url.rs resolve_store_url).
+AI_MEMORY_STORE_URL_FILE="$STORE_URL_FILE" AI_MEMORY_NO_CONFIG=1 "$BIN" schema-init --embedding-dim "$EMBED_DIM"
 
 # --------------------------------------------------------------------------
 # 9. Deterministic seed corpus (sqlite) + migrate into the pg tier verbatim.
 # --------------------------------------------------------------------------
 AI_MEMORY_BIN="$BIN" "$SELF_DIR/seed-corpus.sh"
+# #4600: the pg DSN rides the 0600 $STORE_URL_FILE via --to-url-file, never argv.
 log "repro: migrate seed corpus -> pg tier (memories + links + embeddings verbatim, #3054/#3060)"
 AI_MEMORY_NO_CONFIG=1 "$BIN" --db-passphrase-file "$DB_PASSPHRASE_FILE" \
-  migrate --from "sqlite://${SEED_DB}" --to "$DSN" --batch 1000
+  migrate --from "sqlite://${SEED_DB}" --to-url-file "$STORE_URL_FILE" --batch 1000
 
 # --------------------------------------------------------------------------
 # 10. Certified-posture readout BEFORE serving. The daemon's boot-refusing
