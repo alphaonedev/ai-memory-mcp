@@ -16588,7 +16588,8 @@ async fn pg_hard_delete_in_tx(
     // points here, so it never fabricates state for a delete that did not
     // happen — ONLY the forget-tombstone / crypto-erase below stays gated on
     // the row existing (a missing row writes no forget-tombstone: no namespace
-    // to bind — a first-arrival hole, not a resurrection of an erased row).
+    // to bind here; the federated `apply_remote_deletion` lane records the
+    // unheld id itself, #8744).
     // Pre-#3253 this sever ran pool-direct before the existence check; #3253
     // regressed it behind the leaf probe, contradicting the contract
     // `apply_remote_deletion` still documents — the #3272 audit reinstates it.
@@ -16874,6 +16875,34 @@ pub(super) async fn pg_advisory_xact_lock_key(
 ) -> Result<(), sqlx::Error> {
     sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
         .bind(key)
+        .execute(&mut **tx)
+        .await
+        .map(|_| ())
+}
+
+/// #8744 — the lock class of [`pg_lock_memory_id_in_tx`] (the first key of the
+/// two-key advisory lock; the memory id is the second).
+pub(super) const PG_MEMORY_ID_LOCK_CLASS: &str = "ai-memory.memory-id";
+
+/// #8744 — serialize every federation-receive upsert and every hard delete of
+/// one memory id. Under READ COMMITTED a hard delete cannot see (and so cannot
+/// remove) a row a concurrent receive has inserted but not committed, and the
+/// receive's tombstone probe cannot see the delete's uncommitted tombstone, so
+/// both can commit and the deleted id comes back. Taking this transaction-scoped
+/// lock as the FIRST statement of each transaction (before any row lock, so the
+/// order is the same everywhere) makes one of them commit first and the other
+/// see it. Released at commit or rollback.
+///
+/// # Errors
+///
+/// The `sqlx` error of the lock statement.
+pub(super) async fn pg_lock_memory_id_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    id: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))")
+        .bind(PG_MEMORY_ID_LOCK_CLASS)
+        .bind(id)
         .execute(&mut **tx)
         .await
         .map(|_| ())
@@ -24203,6 +24232,13 @@ impl MemoryStore for PostgresStore {
                     .begin()
                     .await
                     .map_err(|e| to_store_err("delete begin tx", e))?;
+                // #8744 — the per-id lock before any row lock (same order as
+                // `apply_remote_memory`), so a concurrent receive of this id
+                // either commits first and is deleted here, or sees the
+                // tombstone this delete commits.
+                pg_lock_memory_id_in_tx(&mut tx, id)
+                    .await
+                    .map_err(|e| to_store_err("delete id lock", e))?;
                 // #3953 — the gate of record for the IRREVERSIBLE path, on
                 // THIS tx: `SQL_DELETE_MEMORY_BY_ID` has no owner predicate,
                 // so only the probe's `FOR UPDATE` held to commit keeps a
@@ -25164,6 +25200,25 @@ impl MemoryStore for PostgresStore {
             .begin()
             .await
             .map_err(|e| to_store_err("begin apply_remote_memory tx", e))?;
+        // #8744 — per-id lock first, then the tombstone re-probe on this tx: a
+        // delete that committed after the pool probe above still wins.
+        pg_lock_memory_id_in_tx(&mut tx, &memory.id)
+            .await
+            .map_err(|e| to_store_err("apply_remote_memory id lock", e))?;
+        let tombstoned_now: bool = sqlx::query_scalar(federation_3075::SQL_FORGET_TOMBSTONE_EXISTS)
+            .bind(&memory.id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("apply_remote_memory in-tx tombstone check", e))?;
+        if tombstoned_now {
+            tracing::info!(
+                target: crate::storage::FORGET_TOMBSTONE_TRACE_TARGET,
+                memory_id = %memory.id,
+                "{}",
+                crate::storage::FORGET_TOMBSTONE_DROP_MSG
+            );
+            return Ok(memory.id.clone());
+        }
         // #2954 / #4206 — pre-image of the `(title, namespace)` row this upsert
         // may overwrite, `SELECT … FOR UPDATE` inside this tx so the probe, the
         // pre-merge snapshot and the newer-wins upsert are atomic under READ

@@ -807,6 +807,11 @@ async fn replay_ack_leaves_row_pending_when_snapshot_is_stale_2360() {
         ) -> Result<bool, String> {
             Ok(false)
         }
+
+        // #8744 — no id is erased in this harness.
+        async fn erased_memory_ids(&self, _memory_ids: &[String]) -> Result<Vec<String>, String> {
+            Ok(Vec::new())
+        }
     }
 
     let peer = PeerState {

@@ -123,8 +123,69 @@ pub fn delete_authorized(
             id,
             authorize,
         )?;
-        delete(conn, id)
+        delete_recording_unheld(conn, id)
     })
+}
+
+/// #8744 — the `namespace` recorded on a forget-tombstone written for a
+/// federated delete of an id this node does not hold. The real namespace is
+/// unknown (the `deletions[]` wire carries only the id). The leading `/` is a
+/// form `validate::validate_namespace` rejects, so no live namespace can ever
+/// equal it and nothing scoped to a real namespace can match or clear it.
+pub const UNHELD_DELETE_TOMBSTONE_NAMESPACE: &str = "/federation-unheld-delete";
+
+/// [`delete`] for the federated `deletions[]` lane when no in-transaction scope
+/// re-check is needed (the unscoped sqlite SAL adapter). Same unheld-id record
+/// as [`delete_authorized`].
+///
+/// # Errors
+///
+/// Everything [`delete`] returns, plus a failure to write the tombstone (the
+/// transaction rolls back, so the caller sees an error, never a silent gap).
+pub fn delete_federated(conn: &Connection, id: &str) -> Result<bool> {
+    crate::storage::record_stop::gate_storage_conn(conn)?;
+    in_write_txn(conn, || delete_recording_unheld(conn, id))
+}
+
+/// #8744 — delete `id`; when no live row was deleted, record the delete as a
+/// signed forget-tombstone so a store body for the id that arrives LATER (a
+/// detached POST overtaken by the delete fan-out, a DLQ replay, a catch-up
+/// page) is refused by the existing resurrection guard
+/// ([`super::FORGET_TOMBSTONE_DROP_MSG`]) instead of being applied. An id held
+/// only in `archived_memories` gets no record: that copy is not erased here and
+/// its restore lanes keep today's behaviour. Runs inside the caller's write
+/// transaction, so the probe and the insert see one state.
+fn delete_recording_unheld(conn: &Connection, id: &str) -> Result<bool> {
+    if delete(conn, id)? {
+        return Ok(true);
+    }
+    let archived: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM archived_memories WHERE id = ?1)",
+        params![id],
+        |r| r.get(0),
+    )?;
+    if archived {
+        return Ok(false);
+    }
+    let now = Utc::now().to_rfc3339();
+    let signable = forget_tombstone_signable_bytes(id, UNHELD_DELETE_TOMBSTONE_NAMESPACE, &now);
+    let signature: Option<Vec<u8>> =
+        crate::governance::audit::try_sign_audit_payload(&signable).map(|(sig, _)| sig);
+    let recorded = conn.execute(
+        "INSERT OR IGNORE INTO forget_tombstones \
+             (memory_id, namespace, forgotten_at, agent_id, signature) \
+         VALUES (?1, ?2, ?3, NULL, ?4)",
+        params![id, UNHELD_DELETE_TOMBSTONE_NAMESPACE, now, signature],
+    )?;
+    if recorded > 0 {
+        tracing::info!(
+            target: FORGET_TOMBSTONE_TRACE_TARGET,
+            memory_id = %id,
+            "federated delete for an id this node does not hold: recorded a \
+             forget-tombstone so a later, older store body is refused (#8744)"
+        );
+    }
+    Ok(false)
 }
 
 /// [`archive_memory`] for the federated `archives[]` lane, re-authorized under

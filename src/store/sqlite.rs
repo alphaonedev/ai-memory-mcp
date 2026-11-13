@@ -1966,7 +1966,8 @@ impl MemoryStore for SqliteStore {
     async fn apply_remote_deletion(&self, _ctx: &CallerContext, id: &str) -> StoreResult<bool> {
         self.gate_record_stop()?;
         let conn = self.state.lock().await;
-        db::delete(&conn, id).map_err(box_err)
+        // #8744 — an unheld id is recorded so a later, older store is refused.
+        db::delete_federated(&conn, id).map_err(box_err)
     }
 
     /// #4447 — in-transaction peer-scope re-check on the `deletions[]` lane.

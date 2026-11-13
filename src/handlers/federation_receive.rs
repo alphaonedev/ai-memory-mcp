@@ -2209,13 +2209,14 @@ pub struct SyncPushBody {
     #[serde(default)]
     pub embeddings: Vec<crate::federation::ShippedEmbedding>,
     /// Memory IDs the sender has deleted and wants propagated. Applied
-    /// via `db::delete` (sqlite) / `apply_remote_deletion` (postgres).
-    /// #3192: `db::delete` now writes a `forget_tombstones` row +
+    /// via `db::delete_authorized` (sqlite) / `apply_remote_deletion`
+    /// (postgres). #3192: the delete writes a `forget_tombstones` row +
     /// crypto-erases BEFORE the DELETE, so a later `insert_if_newer`
     /// from a peer that still holds the row is dropped (tombstone-wins).
-    /// A deletion of an id this node never held is still a no-op (no
-    /// local row, no namespace to bind a tombstone); that is a
-    /// first-arrival, not a resurrection of a locally-erased row.
+    /// #8744: a deletion of an id this node does not hold records a
+    /// signed tombstone under `UNHELD_DELETE_TOMBSTONE_NAMESPACE`, so a
+    /// store body that arrives after the delete is refused too (an id
+    /// held only in `archived_memories` is not recorded).
     #[serde(default)]
     pub deletions: Vec<String>,
     /// v0.6.2 (S29): memory IDs the sender has explicitly archived and
