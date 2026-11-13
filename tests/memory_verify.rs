@@ -69,7 +69,7 @@ struct Fixture {
 
 fn setup() -> Fixture {
     let db_tmp = TempDir::new().expect("db tempdir");
-    let keys_tmp = TempDir::new().expect("keys tempdir");
+    let keys_tmp = private_tempdir();
 
     // Point the production-code lookup path at the per-test key dir.
     // SAFETY: caller acquired `ENV_GUARD` before invoking setup.
@@ -428,4 +428,18 @@ fn missing_link_returns_err() {
         err.contains("link not found"),
         "err message should name the failure mode: {err}"
     );
+}
+
+/// #7185 - a key directory must satisfy the #3198 gate whatever the process
+/// umask, so the mode is set on the builder and the directory never exists in a
+/// umask-derived (group-writable) mode.
+fn private_tempdir() -> tempfile::TempDir {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("keydir-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    builder.tempdir().expect("private tempdir")
 }

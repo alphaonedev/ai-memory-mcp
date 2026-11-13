@@ -85,7 +85,7 @@ fn ephemeral_keypair() -> (
     ai_memory::identity::keypair::AgentKeypair,
     tempfile::TempDir,
 ) {
-    let dir = tempfile::TempDir::new().expect("keys tempdir");
+    let dir = private_tempdir();
 
     // SAFETY: caller acquired `env_var_lock` before invoking. The
     // serial-test discipline for cross-file mutation is still enforced
@@ -354,4 +354,18 @@ async fn g3_postgres_verify_link_signed_returns_verified_true() {
 
     shutdown.notify_one();
     let _ = handle.await;
+}
+
+/// #7178 - a key directory must satisfy the #3198 gate whatever the process
+/// umask, so the mode is set on the builder and the directory never exists in a
+/// umask-derived (group-writable) mode.
+fn private_tempdir() -> tempfile::TempDir {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("keydir-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    builder.tempdir().expect("private tempdir")
 }

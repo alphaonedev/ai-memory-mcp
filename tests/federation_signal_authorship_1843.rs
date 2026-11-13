@@ -390,7 +390,7 @@ async fn strict_mode_requires_enrolled_author_key_1843() {
     relax_orthogonal_gates();
 
     // Enroll "alice"'s public key in an isolated key dir; "bob" stays unenrolled.
-    let key_dir = tempfile::tempdir().expect("key dir");
+    let key_dir = private_tempdir();
     let alice = ai_memory::identity::keypair::generate("alice").expect("gen alice");
     ai_memory::identity::keypair::save(&alice, key_dir.path()).expect("save alice");
     unsafe {
@@ -425,4 +425,18 @@ async fn strict_mode_requires_enrolled_author_key_1843() {
         i(&resp, "skipped") >= 1,
         "strict mode: the unenrolled author (bob) is skipped: {resp}"
     );
+}
+
+/// #7178 - a key directory must satisfy the #3198 gate whatever the process
+/// umask, so the mode is set on the builder and the directory never exists in a
+/// umask-derived (group-writable) mode.
+fn private_tempdir() -> tempfile::TempDir {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("keydir-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    builder.tempdir().expect("private tempdir")
 }

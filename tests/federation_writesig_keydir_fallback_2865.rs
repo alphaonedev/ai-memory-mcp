@@ -68,7 +68,7 @@ fn consolidation_mem() -> Memory {
 fn resolve_seam_db_miss_falls_back_to_keydir_2865() {
     // The peer's FEDERATION identity key is cross-enrolled into the key-dir
     // (mesh cross-enrollment) but NOT DB-bound → registry miss.
-    let dir = tempfile::TempDir::new().expect("tempdir");
+    let dir = private_tempdir();
     let kp = keypair::generate(AUTHOR).expect("generate");
     keypair::save(&kp, dir.path()).expect("save keypair");
 
@@ -84,7 +84,7 @@ fn resolve_seam_db_miss_falls_back_to_keydir_2865() {
 fn resolve_seam_unenrolled_author_yields_none_2865() {
     // No DB registry key AND no key-dir entry → None (the row will stay claimed,
     // and the honored-third-party WARN can still name missing-author-key).
-    let dir = tempfile::TempDir::new().expect("tempdir");
+    let dir = private_tempdir();
     let resolved = resolve_author_bound_key_in(None, AUTHOR, dir.path());
     assert_eq!(
         resolved, None,
@@ -97,7 +97,7 @@ fn resolve_seam_db_registry_wins_over_keydir_2865() {
     // MISS-ONLY precedence: a key bound into the DB registry (e.g. the cert-round
     // author via the admin PUT route / `agents bind-key`) ALWAYS wins, so a
     // stale/rotated key-dir entry can never shadow the authoritative registry key.
-    let dir = tempfile::TempDir::new().expect("tempdir");
+    let dir = private_tempdir();
     let keydir_kp = keypair::generate(AUTHOR).expect("generate keydir");
     keypair::save(&keydir_kp, dir.path()).expect("save keydir keypair");
 
@@ -136,7 +136,7 @@ fn end_to_end_keydir_enrolled_author_reaches_agent_attested_2865() {
     // the peer cross-enrolled that key into the key-dir (no DB bind). The push
     // lane resolves the key from the key-dir and the propagated write_signature
     // verifies → agent_attested, OUT-OF-BOX.
-    let dir = tempfile::TempDir::new().expect("tempdir");
+    let dir = private_tempdir();
     let kp = keypair::generate(AUTHOR).expect("generate");
     keypair::save(&kp, dir.path()).expect("save keypair");
 
@@ -166,7 +166,7 @@ fn end_to_end_unenrolled_author_stays_claimed_2865() {
     // NOR the key-dir, the presented signature cannot be verified against any
     // key, so under the permissive default the row DEGRADES to claimed (never a
     // wrong result). This is the state the fix upgrades once the key is enrolled.
-    let dir = tempfile::TempDir::new().expect("tempdir");
+    let dir = private_tempdir();
     let kp = keypair::generate(AUTHOR).expect("generate");
     // Deliberately do NOT save the key anywhere.
 
@@ -190,7 +190,7 @@ fn end_to_end_forged_signature_rejected_regardless_of_key_source_2865() {
     // The key-dir fallback NEVER weakens verification: a forged signature against
     // the key-dir-resolved key is rejected UNCONDITIONALLY (never downgraded to
     // claimed) — the fix widens the KEY SOURCE, never the accept criterion.
-    let dir = tempfile::TempDir::new().expect("tempdir");
+    let dir = private_tempdir();
     let kp = keypair::generate(AUTHOR).expect("generate");
     keypair::save(&kp, dir.path()).expect("save keypair");
 
@@ -209,4 +209,18 @@ fn end_to_end_forged_signature_rejected_regardless_of_key_source_2865() {
         err.is_err(),
         "a forged signature must be rejected even when the key resolved via the key-dir fallback"
     );
+}
+
+/// #7178 - a key directory must satisfy the #3198 gate whatever the process
+/// umask, so the mode is set on the builder and the directory never exists in a
+/// umask-derived (group-writable) mode.
+fn private_tempdir() -> tempfile::TempDir {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("keydir-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    builder.tempdir().expect("private tempdir")
 }

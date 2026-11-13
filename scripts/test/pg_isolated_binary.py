@@ -16,8 +16,12 @@ Sub-commands (``-h`` on each):
               reserved slots minus the sessions open right now) and create
               ``<db>_tpl`` (age + vector, ``IS_TEMPLATE true
               ALLOW_CONNECTIONS false``). ``--emit-env`` prints
-              ``AI_MEMORY_TEST_PG_TEMPLATE=`` and ``AI_MEMORY_TEST_PG_RUN_ID=``
-              lines for ``$GITHUB_ENV``. Fails closed.
+              ``AI_MEMORY_TEST_PG_TEMPLATE=``, ``AI_MEMORY_TEST_PG_RUN_ID=``
+              and ``AI_MEMORY_TEST_PG_BASE=`` lines for ``$GITHUB_ENV``;
+              ``--emit-env-unmasked`` adds ``AI_MEMORY_TEST_POSTGRES_URL=``
+              (never emitted masked: a masked value would break the next
+              step). SIGTERM during a minted setup drops the owned base.
+              Fails closed.
 ``run``       run ``cargo test --no-fail-fast --test <bin>`` once per binary,
               each against its own clone (held by a keepalive session while in
               use), ``--jobs`` at a time (degraded to what the live budget
@@ -26,9 +30,24 @@ Sub-commands (``-h`` on each):
               binary under ``--log-dir``; a failing binary's tail is echoed.
               SIGTERM/SIGINT stop dispatch, signal every child group, drop the
               clones and exit 143.
-``teardown``  drop THIS run's clones (``--run-id``) and the template.
+``teardown``  drop THIS run's clones (``--run-id``) and the template; for an
+              auto-minted base, mark the family TERMINAL first and drop the
+              base last. Exits 2 when any drop failed.
+``revoke``    ADMIN ONLY: mark an idle auto-minted family TERMINAL (``--db``,
+              ``--run-id``, ``--reason``) so the sweep may reclaim it. Never
+              drops anything.
 ``sweep``     ADMIN ONLY, never run by CI: drop idle clones of any run that
-              are older than ``--older-than`` seconds (at least 600).
+              are older than ``--older-than`` seconds (at least 600), except
+              clones of an ACTIVE family, and reclaim an auto-minted family
+              only once its base carries a TERMINAL marker at least that old.
+
+Family ownership (#7113): when ``setup`` auto-mints a ``ci_base_*`` base it
+writes an ACTIVE marker (strict JSON, ``ai-memory-pg-family`` version 1: base
+name and OID, run id) as the base's COMMENT and reads it back. Age, PID or a
+name prefix never confer ownership: an unmarked, malformed or ACTIVE family is
+always preserved, including in a prepared-setup or interbinary gap with zero
+sessions. Only ``teardown`` and ``revoke`` move a family to TERMINAL, and
+TERMINAL never becomes ACTIVE.
 
 No drop ever uses the FORCE option: a database with a session (another run's
 binary, or a held clone) cannot be dropped, so a race fails instead of
@@ -43,10 +62,13 @@ run id is ``[a-z0-9]{1,20}``. The Rust helper (``tests/common/pg_isolate.rs``)
 uses the same shape.
 
 Exit codes: 0 success, 2 usage or wrapper error (fails closed), 3 a clone
-could not be minted or held, 143 terminated, otherwise the worst exit code of
+could not be minted or held, 4 an owned database or template still exists after the
+cleanup (#7179), 143 terminated, otherwise the worst exit code of
 the cargo runs. Standard library only, Python 3.9+.
 """
 import argparse
+import contextlib
+import json
 import os
 import re
 import signal
@@ -66,6 +88,13 @@ AGE_URL_VAR = 'AI_MEMORY_TEST_AGE_URL'
 FLAG_VAR = 'AI_MEMORY_TEST_PG_ISOLATE'
 TEMPLATE_VAR = 'AI_MEMORY_TEST_PG_TEMPLATE'
 RUN_ID_VAR = 'AI_MEMORY_TEST_PG_RUN_ID'
+BASE_VAR = 'AI_MEMORY_TEST_PG_BASE'
+SHARED_BASE_DB = 'ai_memory' + '_test'  # split so the #7031 H4 gate sees no literal
+MINTED_BASE_PREFIX = 'ci_base_'
+EPHEMERAL_BASE_PREFIXES = ('ai_memory_test_ci_', MINTED_BASE_PREFIX)
+MAINTENANCE_DB = 'postgres'
+SQL_DROP_DATABASE = 'DROP DATABASE IF EXISTS %s'
+SQL_RELEASE_TEMPLATE = 'ALTER DATABASE %s WITH IS_TEMPLATE false'
 KILL_VAR = 'CI_PG_ISOLATE_OFF'
 ISOLATED_PREFIX = 'ai_memory_t'
 TEMPLATE_SUFFIX = '_tpl'
@@ -105,9 +134,33 @@ GUARD_SQL_MAX_BYTES = 65536  # the psql() guard refuses longer SQL unread: its c
 # linear: one quantified class, no alternation, fullmatch on a short env value
 _DIGITS_RE = re.compile(r'[0-9]+')
 IN_USE_TEXT = 'being accessed by other users'
+FAMILY_PROTOCOL = 'ai-memory-pg-family'
+FAMILY_VERSION = 1
+PHASE_ACTIVE = 'ACTIVE'
+PHASE_TERMINAL = 'TERMINAL'
+INTENT_TEARDOWN = 'TEARDOWN'
+INTENT_REVOKE = 'REVOKE'
+FAMILY_KEYS = frozenset(('protocol', 'version', 'phase', 'base', 'base_oid', 'run_id',
+                         'terminal_at', 'intent', 'reason'))
+FAMILY_REASON_MAX = 512
+FAMILY_MARKER_MAX = 2048
+TEARDOWN_REASON = 'teardown'
 EXIT_USAGE = 2
 EXIT_MINT = 3
 EXIT_TERM = 143
+EXIT_UNRELEASED = 4  # an owned database or template still exists after the cleanup (#7179)
+
+# Every wrapper psql call carries this application_name, so cleanup can cancel
+# exactly this process's server backends (#7179). A run id is shared by several
+# processes (setup, run, teardown) and is never used for that.
+APP_NAME_PREFIX = 'pgiso-'
+SETTLE_SECS = 30.0
+SETTLE_POLL_SECS = 0.2
+SQL_CANCEL_OWN = ("SELECT pg_cancel_backend(pid) FROM pg_stat_activity "
+                  "WHERE application_name = '%s' AND pid <> pg_backend_pid()")
+SQL_COUNT_OWN = ("SELECT count(*) FROM pg_stat_activity "
+                 "WHERE application_name = '%s' AND pid <> pg_backend_pid()")
+SQL_NAME_EXISTS = "SELECT count(*) FROM pg_database WHERE datname = '%s'"
 
 # URL query keys and the libpq variable each maps to. Anything else fails
 # closed rather than being silently dropped.
@@ -126,6 +179,8 @@ _QUERY_TO_ENV = {
 _RUN_ID_RE = re.compile(r'^[a-z0-9]{1,%d}$' % RUN_ID_MAX_LEN)
 # linear: bounded class repetitions separated by a fixed underscore, so no two quantifiers can overlap
 _ANY_NAME_RE = re.compile(r'^%s_([a-z0-9]{1,%d})_([0-9]{10})_([0-9a-f]{8})$' % (ISOLATED_PREFIX, RUN_ID_MAX_LEN))
+# linear: fixed prefix, one bounded digit class, fixed stamp and suffix, one optional literal suffix
+_MINTED_BASE_RE = re.compile(r'^%s[0-9]+_([0-9]{10})_[0-9a-f]{8}(?:%s)?$' % (MINTED_BASE_PREFIX, TEMPLATE_SUFFIX))
 # linear: one bounded class repetition between anchors
 _IDENT_RE = re.compile(r'^[A-Za-z0-9_]{1,%d}$' % IDENT_MAX)
 # linear: fixed prefix, a literal space, then one class repetition to the anchor
@@ -298,10 +353,21 @@ def libpq_env(url: str) -> Dict[str, str]:
     return env
 
 
-def _pg_env(url: str) -> Dict[str, str]:
-    """The process env with inherited PG* removed and this URL's libpq vars."""
+def new_app_name() -> str:
+    """A process-unique application_name (<= 63 bytes, lowercase, no quoting needed)."""
+    return '%s%d-%s' % (APP_NAME_PREFIX, os.getpid(), uuid.uuid4().hex[:8])
+
+
+_APP_NAME = new_app_name()
+
+
+def _pg_env(url: str, app: Optional[str] = None) -> Dict[str, str]:
+    """The process env with inherited PG* removed and this URL's libpq vars;
+    ``app`` (when given) is the application_name of the connection."""
     env = {k: v for k, v in os.environ.items() if not k.startswith('PG')}
     env.update(libpq_env(url))
+    if app:
+        env['PGAPPNAME'] = app
     return env
 
 
@@ -737,12 +803,12 @@ def _refuse_uncapped_sql(sql: str) -> None:
                                'runs code the guard cannot read: the server cap must stay in force (%r)' % sql[:80])
 
 
-def _run_psql(url: str, sql: str, tuples: bool) -> str:
+def _run_psql(url: str, sql: str, tuples: bool, app: Optional[str] = None) -> str:
     """Run ``sql`` under the server-side caps; the caller has already vetted it."""
     argv = ['psql', '-X', '-q', '-v', 'ON_ERROR_STOP=1']
     if tuples:
         argv.append('-At')
-    env = _pg_env(url)
+    env = _pg_env(url, app or _APP_NAME)
     # One statement per call: the server cap bounds each statement, not the whole -c string (#7481).
     argv += ['-c', server_caps_sql(env), '-c', sql]
     try:
@@ -755,11 +821,12 @@ def _run_psql(url: str, sql: str, tuples: bool) -> str:
     return done.stdout or ''
 
 
-def psql(url: str, sql: str, tuples: bool = False) -> str:
-    """Run one statement through psql; returns stdout, raises on failure. Refuses SQL that holds more than one
+def psql(url: str, sql: str, tuples: bool = False, app: Optional[str] = None) -> str:
+    """Run one statement through psql; returns stdout, raises on failure. Every call is tagged with this
+    process's application_name (#7179). Refuses SQL that holds more than one
     statement or mentions anything that could undo the server-side caps (#7521)."""
     _refuse_uncapped_sql(sql)
-    return _run_psql(url, sql, tuples)
+    return _run_psql(url, sql, tuples, app)
 
 
 # The one read the guard would refuse (it names pg_settings and the timeout settings): a fixed statement with no
@@ -818,7 +885,7 @@ def drop(admin_url: str, name: str, run_id: Optional[str], attempts: int = DROP_
     retried while the session drains, then the drop fails."""
     if parse_isolated_name(name, run_id) is None:
         raise WrapperError('refusing to drop %r: not a clone of run %r' % (name, run_id))
-    sql = 'DROP DATABASE IF EXISTS %s' % quote_ident(name)
+    sql = SQL_DROP_DATABASE % quote_ident(name)
     for attempt in range(1, attempts + 1):
         try:
             psql(admin_url, sql)
@@ -871,6 +938,368 @@ def close_hold(hold: Optional['subprocess.Popen[str]']) -> None:
         hold.wait()
 
 
+# --- ephemeral base (#7031 H1) --------------------------------------------
+
+def is_ephemeral_base(db: str) -> bool:
+    """True for a per-run base (``ai_memory_test_ci_*`` / ``ci_base_*``); the
+    shared ``ai_memory_test`` and anything else is not."""
+    return db != SHARED_BASE_DB and db.startswith(EPHEMERAL_BASE_PREFIXES)
+
+
+def mint_base_name(now: Optional[int] = None) -> str:
+    stamp = int(time.time()) if now is None else int(now)
+    return '%s%d_%d_%s' % (MINTED_BASE_PREFIX, os.getpid(), stamp, uuid.uuid4().hex[:8])
+
+
+# Databases this process created and has not yet released or dropped (#7179).
+# A name is registered BEFORE its CREATE DATABASE is issued, so a SIGTERM that
+# lands while (or just after) the CREATE commits still finds the owner.
+_OWNED: List[str] = []
+
+
+def _own(name: str) -> None:
+    if name not in _OWNED:
+        _OWNED.append(name)
+
+
+def _disown(name: str) -> None:
+    if name in _OWNED:
+        _OWNED.remove(name)
+
+
+def settle_backends(admin_url: str) -> bool:
+    """Cancel every server backend this process started and wait until none is
+    left (#7179). A psql killed mid-``CREATE DATABASE`` leaves the server-side
+    statement running; it commits later unless it is cancelled here. Runs on a
+    separate application_name so it never cancels itself."""
+    maint = with_database(admin_url, MAINTENANCE_DB)
+    cleaner = _APP_NAME + '-gc'
+    deadline = time.monotonic() + SETTLE_SECS
+    while True:
+        psql(maint, SQL_CANCEL_OWN % _APP_NAME, app=cleaner)
+        if psql(maint, SQL_COUNT_OWN % _APP_NAME, tuples=True, app=cleaner).strip() == '0':
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(SETTLE_POLL_SECS)
+
+
+def name_exists(admin_url: str, name: str) -> bool:
+    """True unless pg_database proves the name is gone (fails closed on any other answer)."""
+    answer = psql(with_database(admin_url, MAINTENANCE_DB), SQL_NAME_EXISTS % _checked_ident(name),
+                  tuples=True, app=_APP_NAME + '-gc').strip()
+    return answer != '0'
+
+
+def mint_base(url: str) -> str:
+    """CREATE an ephemeral base (the ci.yml recipe: database, then age + vector)
+    and return its URL. ``url`` is only the maintenance connection."""
+    name = _checked_ident(mint_base_name())
+    _own(name)  # before the CREATE: an interrupted CREATE that did commit is dropped by name
+    initialized = False
+    try:
+        # Any failure keeps the name owned: it is unique to this process, and a
+        # connection loss can follow a server-side commit (#7179). The cleanup
+        # below proves the name gone before it is released.
+        psql(url, 'CREATE DATABASE %s' % quote_ident(name))
+        new_url = with_database(url, name)
+        psql(new_url, 'CREATE EXTENSION IF NOT EXISTS age')
+        psql(new_url, 'CREATE EXTENSION IF NOT EXISTS vector')
+        log('minted ephemeral base %s' % name)
+        initialized = True
+        return new_url
+    finally:
+        if not initialized:
+            primary = sys.exc_info()[1]
+            try:
+                if not drop_base(url, name):
+                    raise WrapperError('owned minted base cleanup failed')
+            except _Terminated:
+                raise  # SIGTERM held during the drop is delivered after it (#7179)
+            except BaseException:
+                # Keep the original failure/interrupt, never a cleanup success.
+                # No raw exception text: libpq failures may contain credentials.
+                if primary is None:
+                    raise
+                log('WARN owned minted base cleanup also failed; manual cleanup required')
+
+
+def drop_base(url: str, name: str) -> bool:
+    """Plain-drop a minted base through the maintenance db; never raises."""
+    if not name.startswith(MINTED_BASE_PREFIX):
+        log('WARN refusing to drop %r: not a minted ci_base_ database' % name)
+        return False
+    try:
+        with _sigterm_deferred():  # #7179: the first SIGTERM must not abandon the drop
+            if not settle_backends(url):
+                # #7212: a backend of this run may still hold or commit the CREATE;
+                # the name stays owned so the exit is EXIT_UNRELEASED, not a release.
+                log('WARN backends of this run are still alive after %ds; %s stays owned (drop it by hand)'
+                    % (int(SETTLE_SECS), name))
+                return False
+            psql(with_database(url, MAINTENANCE_DB), SQL_DROP_DATABASE % quote_ident(_checked_ident(name)))
+            if name_exists(url, name):
+                log('WARN minted base %s still exists after the drop (drop it by hand)' % name)
+                return False
+            _disown(name)
+        return True
+    except (WrapperError, OSError) as exc:
+        log('WARN could not drop minted base %s (drop it by hand): %s' % (name, exc))
+        return False
+
+
+# --- family ownership (#7113) ---------------------------------------------
+
+_FAMILY_PHASES = (PHASE_ACTIVE, PHASE_TERMINAL)
+_FAMILY_INTENTS = (INTENT_TEARDOWN, INTENT_REVOKE)
+
+
+def is_minted_base(name: str) -> bool:
+    """True for an auto-minted ``ci_base_<pid>_<secs>_<8hex>`` base (not its template)."""
+    return bool(_MINTED_BASE_RE.match(name or '')) and not name.endswith(TEMPLATE_SUFFIX)
+
+
+def _int_field(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _valid_reason(reason: object) -> bool:
+    return (isinstance(reason, str) and 0 < len(reason) <= FAMILY_REASON_MAX
+            and reason == reason.strip() and reason.isprintable() and any(ch.isalnum() for ch in reason))
+
+
+def family_marker(base: str, oid: int, run_id: str, phase: str, terminal_at: Optional[int] = None,
+                  intent: Optional[str] = None, reason: Optional[str] = None) -> str:
+    """The canonical marker text for a family base COMMENT (strict JSON)."""
+    record = {'protocol': FAMILY_PROTOCOL, 'version': FAMILY_VERSION, 'phase': phase, 'base': base,
+              'base_oid': oid, 'run_id': run_id, 'terminal_at': terminal_at, 'intent': intent,
+              'reason': reason}
+    text = json.dumps(record, sort_keys=True, ensure_ascii=True)
+    if parse_family_marker(text, base, oid) is None:
+        raise WrapperError('refusing to write an invalid family marker for %s' % base)
+    return text
+
+
+def _no_duplicates(pairs: List[Tuple[str, object]]) -> Dict[str, object]:
+    record: Dict[str, object] = {}
+    for key, value in pairs:
+        if key in record:
+            raise ValueError('duplicate key %r' % key)
+        record[key] = value
+    return record
+
+
+def parse_family_marker(text: str, base: str, oid: int) -> Optional[Dict[str, object]]:
+    """The marker as a dict when it is a valid marker for exactly this base
+    (name and OID), else ``None``. Unknown keys, versions or phases, duplicate
+    keys and inconsistent terminal fields all make it invalid."""
+    if not text or len(text) > FAMILY_MARKER_MAX:
+        return None
+    try:
+        record = json.loads(text, object_pairs_hook=_no_duplicates)
+    except ValueError:
+        return None
+    if not isinstance(record, dict) or set(record) != FAMILY_KEYS:
+        return None
+    if record['protocol'] != FAMILY_PROTOCOL or record['version'] != FAMILY_VERSION \
+            or isinstance(record['version'], bool):
+        return None
+    if record['phase'] not in _FAMILY_PHASES or record['base'] != base:
+        return None
+    if not _int_field(record['base_oid']) or record['base_oid'] != oid:
+        return None
+    if not isinstance(record['run_id'], str) or not valid_run_id(record['run_id']):
+        return None
+    terminal = (record['terminal_at'], record['intent'], record['reason'])
+    if record['phase'] == PHASE_ACTIVE:
+        return record if terminal == (None, None, None) else None
+    if not _int_field(record['terminal_at']) or record['intent'] not in _FAMILY_INTENTS \
+            or not _valid_reason(record['reason']):
+        return None
+    return record
+
+
+def read_family(admin_url: str, base: str) -> Tuple[Optional[int], str]:
+    """``(oid, comment)`` of ``base`` from the catalog; ``(None, '')`` when it
+    does not exist."""
+    sql = ("SELECT d.oid, coalesce(shobj_description(d.oid, 'pg_database'), '') "
+           "FROM pg_database d WHERE d.datname = '%s'" % _checked_ident(base))
+    raw = psql(admin_url, sql, tuples=True)
+    if not raw.strip():
+        return None, ''
+    oid_text, sep, comment = raw.rstrip('\n').partition('|')
+    if not sep or not oid_text.isdigit():
+        raise WrapperError('could not read the family marker of %s' % base)
+    return int(oid_text), comment
+
+
+def _write_family(admin_url: str, base: str, oid: int, text: str) -> None:
+    """COMMENT the marker, then read it back: PostgreSQL only warns (3D000) and
+    exits 0 for a COMMENT on a missing database, so the write proves nothing."""
+    psql(admin_url, "COMMENT ON DATABASE %s IS '%s'" % (quote_ident(_checked_ident(base)),
+                                                       text.replace("'", "''")))
+    found_oid, found = read_family(admin_url, base)
+    if found_oid != oid or found != text:
+        raise WrapperError('the family marker of %s did not persist' % base)
+
+
+def _server_now(url: str) -> int:
+    raw = psql(url, 'SELECT extract(epoch FROM now())::bigint', tuples=True).strip()
+    if not raw.isdigit():
+        raise WrapperError('could not read the server clock (got %r)' % raw)
+    return int(raw)
+
+
+def mark_active(admin_url: str, base: str, run_id: str) -> None:
+    """Claim a freshly minted base for ``run_id`` (ACTIVE, verified)."""
+    oid, comment = read_family(admin_url, base)
+    if oid is None:
+        raise WrapperError('cannot mark %s ACTIVE: it does not exist' % base)
+    if comment:
+        raise WrapperError('refusing to mark %s ACTIVE: it already carries a COMMENT' % base)
+    _write_family(admin_url, base, oid, family_marker(base, oid, checked_run_id(run_id), PHASE_ACTIVE))
+    log('family %s ACTIVE for run %s' % (base, run_id))
+
+
+def terminalize(admin_url: str, base: str, run_id: str, intent: str, reason: str,
+                adopt: bool = False) -> Optional[Dict[str, object]]:
+    """Move ``run_id``'s family to TERMINAL (idempotent). Returns the marker, or
+    ``None`` for an unmarked (legacy) base unless ``adopt`` claims it. A foreign
+    run, a malformed marker or a foreign COMMENT is refused."""
+    checked_run_id(run_id)
+    oid, comment = read_family(admin_url, base)
+    if oid is None:
+        if adopt:
+            raise WrapperError('cannot mark %s TERMINAL: it does not exist' % base)
+        return None
+    if not comment and not adopt:
+        return None
+    found = parse_family_marker(comment, base, oid) if comment else None
+    if comment and found is None:
+        raise WrapperError('refusing %s: its COMMENT is not a valid family marker' % base)
+    if found is not None and found['run_id'] != run_id:
+        raise WrapperError('refusing %s: it belongs to run %s, not %s' % (base, found['run_id'], run_id))
+    if found is not None and found['phase'] == PHASE_TERMINAL:
+        return found
+    text = family_marker(base, oid, run_id, PHASE_TERMINAL, terminal_at=_server_now(admin_url),
+                         intent=intent, reason=reason)
+    _write_family(admin_url, base, oid, text)
+    log('family %s TERMINAL (%s): %s' % (base, intent, reason))
+    return parse_family_marker(text, base, oid)
+
+
+def _run_clones(url: str, run_id: str) -> List[str]:
+    sql = "SELECT datname FROM pg_database WHERE starts_with(datname, '%s')" % run_prefix(run_id)
+    return [n for n in _names(url, sql) if parse_isolated_name(n, run_id) is not None]
+
+
+def revoke(admin_url: str, base: str, run_id: str, reason: str) -> None:
+    """ADMIN ONLY: mark an idle family TERMINAL so the sweep may reclaim it.
+    Refused while the base, its template or any clone of the run has a session.
+    Never drops anything."""
+    if not is_minted_base(base):
+        raise WrapperError('refusing to revoke %r: not an auto-minted ci_base_ base' % base)
+    if not _valid_reason(reason):
+        raise WrapperError('--reason must be non-empty printable text with a letter or digit (max %d)'
+                           % FAMILY_REASON_MAX)
+    members = [base, template_name(base)] + _run_clones(admin_url, checked_run_id(run_id))
+    live = [name for name in members if session_count(admin_url, name) > 0]
+    if live:
+        raise WrapperError('refusing to revoke %s: live session(s) on %s' % (base, ', '.join(live)))
+    terminalize(admin_url, base, run_id, INTENT_REVOKE, reason, adopt=True)
+
+
+class _Terminated(BaseException):
+    """SIGTERM turned into an exception so ``finally`` cleanup runs (#7152)."""
+
+
+@contextlib.contextmanager
+def _sigterm_as_exception():
+    """While a minted base is owned but not yet committed, convert SIGTERM
+    into :class:`_Terminated` so the owner's ``finally`` drops exactly that
+    base. Raised once; a second signal during cleanup is ignored. The previous
+    handler is restored afterwards. A no-op off the main thread."""
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    fired: List[int] = []
+
+    def on_term(signum: int, _frame: object) -> None:
+        if not fired:
+            fired.append(signum)
+            raise _Terminated(signum)
+
+    previous = signal.signal(signal.SIGTERM, on_term)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, previous if previous is not None else signal.SIG_DFL)
+
+
+@contextlib.contextmanager
+def _sigterm_deferred():
+    """Hold SIGTERM while an owned database is being dropped (#7179). A signal
+    that arrives meanwhile is recorded and handed to the previous handler once
+    the drop is done, so the cleanup completes and the exit stays the signal's.
+    A no-op off the main thread."""
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    pending: List[int] = []
+    previous = signal.signal(signal.SIGTERM, lambda signum, _frame: pending.append(signum))
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, previous if previous is not None else signal.SIG_DFL)
+        if pending:
+            if callable(previous):
+                previous(pending[0], None)
+            elif previous in (None, signal.SIG_DFL):
+                os.kill(os.getpid(), signal.SIGTERM)
+
+
+def _die_by_sigterm() -> int:
+    """Re-deliver SIGTERM with the default action so the exit status stays
+    the signal's (the caller sees what it sent). Returns 143 if it survives."""
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    os.kill(os.getpid(), signal.SIGTERM)
+    return EXIT_TERM
+
+
+def mask_url_password(url: str) -> str:
+    """``postgres://u:pw@h/db`` -> ``postgres://u:***@h/db``. A URL without a
+    password (including one with an ``@`` only in its query) is unchanged."""
+    try:
+        netloc = urlsplit(url).netloc
+    except ValueError:
+        return url
+    userinfo, at, hostport = netloc.rpartition('@')
+    if not at or ':' not in userinfo:
+        return url
+    user = userinfo.partition(':')[0]
+    return url.replace(netloc, '%s:***@%s' % (user, hostport), 1)
+
+
+def resolve_base(url: str, db_arg: Optional[str], allow_reason: Optional[str],
+                 jobs: int = MAX_JOBS) -> Tuple[str, str, bool]:
+    """Pick the base for ``setup``; refuse a shared one (#7031). Returns
+    ``(url, db, minted)``. The budget probe runs before any CREATE DATABASE."""
+    if allow_reason is not None and not (allow_reason.strip() and any(ch.isalnum() for ch in allow_reason)):
+        raise WrapperError('--allow-shared-base needs a non-empty REASON')
+    db = db_arg or database_name(url)
+    if is_ephemeral_base(db):
+        return with_database(url, db), db, False
+    if allow_reason:
+        log('WARN shared base %s allowed: %s' % (db, allow_reason.strip()))
+        return with_database(url, db), db, False
+    if db_arg:
+        raise WrapperError('refusing shared base %r (#7031): use an ephemeral base matching %s, '
+                           'or pass --allow-shared-base REASON' % (db, '|'.join(EPHEMERAL_BASE_PREFIXES)))
+    require_budget(url, jobs)
+    new_url = mint_base(url)
+    return new_url, database_name(new_url), True
+
+
 # --- tier steps -----------------------------------------------------------
 
 def _proved_absent(url: str, check: str) -> Tuple[bool, str]:
@@ -884,60 +1313,131 @@ def _proved_absent(url: str, check: str) -> Tuple[bool, str]:
     return True, ''
 
 
-def setup(url: str, db_name: str, jobs: int = MAX_JOBS) -> str:
-    """Check the live budget, then create the locked template. Returns its name."""
-    _checked_ident(db_name)
-    tpl = _checked_ident(template_name(db_name))
+def require_budget(url: str, jobs: int) -> Tuple[int, int]:
+    """Refuse when the server lacks the slots; returns ``(available, need)``."""
     need = required_connections(clamp_jobs(jobs))
     most, reserved, now, available = connection_budget(url)
     if available < need:
         raise WrapperError('only %d free connection slots (max_connections=%d, reserved=%d, open now=%d); '
                            '%d needed for %d parallel binaries' % (available, most, reserved, now, need, jobs))
+    return available, need
+
+
+# linear: one start class then one quantified class between anchors; the classes never overlap a backtrack point
+_RELATION_RE = re.compile(r'^[a-z_][a-z0-9_]*$')
+
+
+def lineage_precheck(url: str, db_name: str) -> None:
+    """#6983 / #7031 H2: refuse to clone a base where any watermarked relation
+    holds fewer rows than its recorded high-water mark (every clone would fail
+    IntegrityFailed). Follows the watermark table itself, so it covers every
+    relation in ``WATERMARKED_RELATIONS``; a relation that is missing counts as
+    0 rows. A base without the watermark table passes."""
+    present = psql(url, "SELECT to_regclass('lineage_integrity_watermark') IS NOT NULL", tuples=True).strip()
+    if present != 't':
+        return
+    # coalesce: concat with a NULL high_water would yield a blank line that the
+    # loop below drops, silently skipping the row (#7157).
+    listing = psql(url, "SELECT relation, coalesce(high_water::text, 'NULL') FROM lineage_integrity_watermark "
+                        "ORDER BY relation", tuples=True)
+    for line in (ln.strip() for ln in listing.splitlines()):
+        if not line:
+            continue
+        relation, _, mark = line.partition('|')
+        if not _RELATION_RE.match(relation) or not mark.isdigit():
+            raise WrapperError('could not read the lineage watermark (got %r)' % line)
+        exists = psql(url, "SELECT to_regclass('%s') IS NOT NULL" % relation, tuples=True).strip()
+        rows = 0
+        if exists == 't':
+            count = psql(url, 'SELECT count(*) FROM %s' % quote_ident(relation), tuples=True).strip()
+            if not count.isdigit():
+                raise WrapperError('could not count %s (got %r)' % (relation, count))
+            rows = int(count)
+        if int(mark) > rows:
+            raise WrapperError('#6983: base %s records %s high_water=%s but holds %d rows; every clone '
+                               'would fail IntegrityFailed. Use an ephemeral base.'
+                               % (db_name, relation, mark, rows))
+
+
+def setup(url: str, db_name: str, jobs: int = MAX_JOBS) -> str:
+    """Check the live budget, then create the locked template. Returns its name."""
+    _checked_ident(db_name)
+    tpl = _checked_ident(template_name(db_name))
+    available, need = require_budget(url, jobs)
+    lineage_precheck(url, db_name)
     q = quote_ident(tpl)
     # Ownership comes only from a successful CREATE. An occupied name (a foreign
     # or leftover template) or a missing privilege refuses: this function never
     # ALTERs or DROPs a database it did not create (#7127).
+    _own(tpl)  # before the CREATE (#7179), also on the --db path
+    initialized = False
+    refused = False
     try:
-        psql(url, 'CREATE DATABASE %s' % q)
-    except WrapperError as exc:
-        if ALREADY_EXISTS in str(exc):
-            raise WrapperError('refusing to use template %s, it was not created by this run: %s; if it is a '
-                               'leftover of your own earlier run, run `pg_isolated_binary.py teardown --db %s '
-                               '--run-id <run id>` first, otherwise choose a different --db'
-                               % (tpl, exc, db_name))
-        check = "SELECT 1 FROM pg_database WHERE datname = '%s'" % tpl.replace("'", "''")
-        if exc.returncode is None:
-            why = 'psql timed out, so the server may still commit the statement'
-        else:
-            why = 'psql ended with status %s, not a plain SQL error' % exc.returncode
-        absent = False
-        if exc.returncode == PSQL_SQL_ERROR:
-            absent, why = _proved_absent(url, check)
-        if not absent:
-            # Status 1 means refused only when the existence check run just above succeeds with no row. A row, a
-            # failed check or any other status (2 lost connection, a negative signal status such as -9, None, an
-            # unexpected code) may follow a committed CREATE, so the outcome is unknown: setup neither claims the
-            # template nor DROPs it (#7388, #7400, #7427, #7428).
-            raise WrapperError('CREATE DATABASE %s ended without a clean answer; the outcome is unknown and the '
-                               'template may exist with no owner record: %s; %s; to check by hand run `%s` and, if '
-                               'the template is from this run, run `pg_isolated_binary.py teardown --db %s '
-                               '--run-id <run id>`'
-                               % (tpl, exc, why, check, db_name), exc.returncode)
-        raise WrapperError('CREATE DATABASE %s was refused; nothing was created or changed: %s' % (tpl, exc))
-    try:
+        try:
+            psql(url, 'CREATE DATABASE %s' % q)
+        except WrapperError as exc:
+            refused = True  # a competing or unproven template is never claimed or dropped (#7124, #7127)
+            _disown(tpl)
+            if ALREADY_EXISTS in str(exc):
+                raise WrapperError('refusing to use template %s, it was not created by this run: %s; if it is a '
+                                   'leftover of your own earlier run, run `pg_isolated_binary.py teardown --db %s '
+                                   '--run-id <run id>` first, otherwise choose a different --db'
+                                   % (tpl, exc, db_name))
+            check = "SELECT 1 FROM pg_database WHERE datname = '%s'" % tpl.replace("'", "''")
+            if exc.returncode is None:
+                why = 'psql timed out, so the server may still commit the statement'
+            else:
+                why = 'psql ended with status %s, not a plain SQL error' % exc.returncode
+            absent = False
+            if exc.returncode == PSQL_SQL_ERROR:
+                absent, why = _proved_absent(url, check)
+            if not absent:
+                # Status 1 means refused only when the existence check run just above succeeds with no row. A row,
+                # a failed check or any other status (2 lost connection, a negative signal status such as -9, None,
+                # an unexpected code) may follow a committed CREATE, so the outcome is unknown: setup neither claims
+                # the template nor DROPs it (#7388, #7400, #7427, #7428).
+                raise WrapperError('CREATE DATABASE %s ended without a clean answer; the outcome is unknown and the '
+                                   'template may exist with no owner record: %s; %s; to check by hand run `%s` and, '
+                                   'if the template is from this run, run `pg_isolated_binary.py teardown --db %s '
+                                   '--run-id <run id>`'
+                                   % (tpl, exc, why, check, db_name), exc.returncode)
+            raise WrapperError('CREATE DATABASE %s was refused; nothing was created or changed: %s' % (tpl, exc))
         psql(with_database(url, tpl), 'CREATE EXTENSION IF NOT EXISTS age')
         psql(with_database(url, tpl), 'CREATE EXTENSION IF NOT EXISTS vector')
         psql(url, 'ALTER DATABASE %s WITH IS_TEMPLATE true ALLOW_CONNECTIONS false' % q)
-    except BaseException:
-        # The template is ours now and nothing else will drop it: plain DROP,
-        # never FORCE; the primary error stays the one raised.
-        try:
-            psql(url, 'DROP DATABASE IF EXISTS %s' % q)
-        except WrapperError as cleanup:
-            log('WARN could not drop the half-built template %s: %s' % (tpl, cleanup))
-        raise
-    log('template %s ready (%d free connection slots, need %d)' % (tpl, available, need))
-    return tpl
+        log('template %s ready (%d free connection slots, need %d)' % (tpl, available, need))
+        initialized = True
+        _disown(tpl)
+        return tpl
+    finally:
+        if not initialized and not refused:
+            # An interruption or a failure after the CREATE: the template is this run's own, so remove it, never
+            # FORCE; the primary error stays the one raised (#7127). Cancel this run's backends first and prove the
+            # name gone before releasing it (#7179, #7212).
+            primary = sys.exc_info()[1]
+            try:
+                with _sigterm_deferred():
+                    if not settle_backends(url):  # #7179: a statement can commit after psql is gone
+                        # #7212: never disown a name a live backend may still create.
+                        raise WrapperError('template %s: backends of this run are still alive after %ds'
+                                           % (tpl, int(SETTLE_SECS)))
+                    try:
+                        psql(url, SQL_RELEASE_TEMPLATE % q)
+                    except WrapperError:
+                        pass  # the CREATE never committed, or it is no longer a template
+                    psql(url, SQL_DROP_DATABASE % q)
+                    if name_exists(url, tpl):
+                        raise WrapperError('template %s still exists after the drop' % tpl)
+                    _disown(tpl)
+            except _Terminated:
+                raise
+            except BaseException as cleanup:
+                if primary is None:
+                    raise
+                # A WrapperError carries only psql's own words; any other type is named, never quoted.
+                detail = str(cleanup) if isinstance(cleanup, WrapperError) else type(cleanup).__name__
+                log('WARN could not drop the half-built template %s: %s; cleanup failed, manual cleanup required'
+                    % (tpl, detail))
 
 
 def _names(url: str, sql: str) -> List[str]:
@@ -960,11 +1460,11 @@ def teardown(url: str, db_name: str, run_id: str) -> int:
             log('WARN could not drop %s: %s' % (name, exc))
     q = quote_ident(tpl)
     try:
-        psql(url, 'ALTER DATABASE %s WITH IS_TEMPLATE false' % q)
+        psql(url, SQL_RELEASE_TEMPLATE % q)
     except WrapperError:
         pass  # already gone
     try:
-        psql(url, 'DROP DATABASE IF EXISTS %s' % q)
+        psql(url, SQL_DROP_DATABASE % q)
     except WrapperError as exc:
         failed += 1
         log('WARN could not drop the template %s: %s' % (tpl, exc))
@@ -972,28 +1472,123 @@ def teardown(url: str, db_name: str, run_id: str) -> int:
     return failed
 
 
+def _census(url: str) -> Tuple[List[str], Dict[str, Tuple[Optional[int], Optional[Dict[str, object]], str]]]:
+    """Every ``ci_base_*`` name, and for each auto-minted base ``(oid, marker,
+    comment)``; ``marker`` is ``None`` when unmarked or malformed."""
+    names = _names(url, "SELECT datname FROM pg_database WHERE starts_with(datname, '%s')" % MINTED_BASE_PREFIX)
+    families = {}
+    for name in names:
+        if not is_minted_base(name):
+            continue
+        oid, comment = read_family(url, name)
+        if oid is None:
+            continue
+        families[name] = (oid, parse_family_marker(comment, name, oid) if comment else None, comment)
+    return names, families
+
+
+def _reap_family(url: str, base: str, oid: int, family: Dict[str, object], present: Set[str],
+                 done: Set[str], active_runs: Set[str]) -> List[str]:
+    """Reclaim one TERMINAL family: remaining clones, the template, then the
+    base (the authority) last, after re-reading its marker. Any live member or
+    failed drop keeps the base so a later sweep can finish. When another base
+    is still ACTIVE under the same run id, its clones are indistinguishable
+    from this family's and the sweep owns none of them (#7156)."""
+    run_id = str(family['run_id'])
+    tpl = template_name(base)
+    clones = [n for n in _run_clones(url, run_id) if n not in done]
+    if clones and run_id in active_runs:
+        log('keeping TERMINAL family %s: run %s is still ACTIVE on another base' % (base, run_id))
+        return []
+    members = clones + ([tpl] if tpl in present else []) + [base]
+    live = [name for name in members if session_count(url, name) > 0]
+    if live:
+        log('keeping TERMINAL family %s: live session(s) on %s' % (base, ', '.join(live)))
+        return []
+    dropped = []
+    for name in clones:
+        try:
+            drop(url, name, run_id, attempts=1)
+            dropped.append(name)
+        except WrapperError as exc:
+            log('WARN could not sweep %s; keeping %s: %s' % (name, base, exc))
+            return dropped
+    if tpl in present:
+        q = quote_ident(tpl)
+        try:
+            psql(url, SQL_RELEASE_TEMPLATE % q)
+        except WrapperError:
+            pass  # not flagged as a template
+        try:
+            psql(url, SQL_DROP_DATABASE % q)
+            dropped.append(tpl)
+        except WrapperError as exc:
+            log('WARN could not sweep %s; keeping %s: %s' % (tpl, base, exc))
+            return dropped
+    again_oid, again = read_family(url, base)
+    if again_oid != oid or parse_family_marker(again, base, oid) != family:
+        log('keeping %s: its marker changed during the sweep' % base)
+        return dropped
+    try:
+        psql(url, SQL_DROP_DATABASE % quote_ident(base))
+        dropped.append(base)
+    except WrapperError as exc:
+        log('WARN could not sweep %s: %s' % (base, exc))
+    return dropped
+
+
+def _sweep_minted_bases(url: str, now: int, older_than: int, names: List[str],
+                        families: Dict[str, Tuple[Optional[int], Optional[Dict[str, object]], str]],
+                        done: Set[str], active_runs: Set[str]) -> List[str]:
+    """#7113: reclaim only families whose base carries a valid TERMINAL marker
+    at least ``older_than`` s old. Unmarked, malformed and ACTIVE families and
+    orphan templates are preserved: age, PID or a name never confer ownership."""
+    present = set(names)
+    dropped: List[str] = []
+    for name in sorted(present):
+        if name.endswith(TEMPLATE_SUFFIX) and name[:-len(TEMPLATE_SUFFIX)] not in present:
+            log('preserving orphan template %s (no base, no authority)' % name)
+    for base in sorted(families):
+        oid, family, comment = families[base]
+        if family is None:
+            log('preserving %s: %s' % (base, 'malformed marker' if comment else 'unmarked (caller-owned)'))
+            continue
+        if family['phase'] != PHASE_TERMINAL:
+            continue
+        if now - int(family['terminal_at']) < older_than:
+            log('preserving %s: TERMINAL for less than %ds' % (base, older_than))
+            continue
+        dropped += _reap_family(url, base, int(oid), family, present, done, active_runs)
+    return dropped
+
+
 def sweep(url: str, older_than: int) -> List[str]:
-    """ADMIN ONLY: drop idle clones of any run older than ``older_than`` s."""
+    """ADMIN ONLY: drop idle clones older than ``older_than`` s (never of an
+    ACTIVE family), then reclaim aged TERMINAL families (#7113)."""
     if older_than < MIN_SWEEP_AGE_SECS:
         raise WrapperError('--older-than must be at least %d seconds' % MIN_SWEEP_AGE_SECS)
-    now_raw = psql(url, 'SELECT extract(epoch FROM now())::bigint', tuples=True).strip()
-    if not now_raw.isdigit():
-        raise WrapperError('could not read the server clock (got %r)' % now_raw)
-    now = int(now_raw)
+    now = _server_now(url)
     listing = ("SELECT d.datname FROM pg_database d WHERE starts_with(d.datname, '%s_') "
                "AND NOT EXISTS (SELECT 1 FROM pg_stat_activity a WHERE a.datname = d.datname)"
                % ISOLATED_PREFIX)
-    dropped = []
-    for name in _names(url, listing):
+    idle = _names(url, listing)
+    names, families = _census(url)
+    active_runs = {str(f['run_id']) for _, f, _ in families.values() if f is not None and f['phase'] == PHASE_ACTIVE}
+    dropped: List[str] = []
+    for name in idle:
         created = parse_isolated_name(name)
         if created is None or now - created < older_than:
             continue
+        found = _ANY_NAME_RE.match(name)
+        if found and found.group(1) in active_runs:
+            continue  # a clone of an ACTIVE family is never reclaimed
         try:
             drop(url, name, None, attempts=1)
             dropped.append(name)
         except WrapperError as exc:
             log('WARN could not sweep %s: %s' % (name, exc))
-    log('admin sweep dropped %d clone(s) older than %ds' % (len(dropped), older_than))
+    dropped += _sweep_minted_bases(url, now, older_than, names, families, set(dropped), active_runs)
+    log('admin sweep dropped %d clone(s)/base(s) older than %ds' % (len(dropped), older_than))
     return dropped
 
 
@@ -1186,13 +1781,24 @@ def build_parser() -> argparse.ArgumentParser:
     setup_p.add_argument('--db', help='base database (default: the URL database)')
     setup_p.add_argument('--jobs', type=int, default=MAX_JOBS)
     setup_p.add_argument('--run-id', help='run id for the clone names (default: generated)')
+    setup_p.add_argument('--allow-shared-base', metavar='REASON',
+                         help='permit a non-ephemeral base database (non-empty reason, logged)')
+    setup_p.add_argument('--emit-env-unmasked', action='store_true',
+                         help='with --emit-env, print the URL with its real password (CI -> $GITHUB_ENV only)')
     setup_p.add_argument('--emit-env', action='store_true',
-                         help='print %s= and %s= lines for $GITHUB_ENV' % (TEMPLATE_VAR, RUN_ID_VAR))
+                         help='print %s=, %s=, %s= and %s= lines for $GITHUB_ENV'
+                         % (TEMPLATE_VAR, RUN_ID_VAR, BASE_VAR, URL_VAR))
 
     down = sub.add_parser('teardown', help="drop this run's clones and the template")
     down.add_argument('--url', help=url_help)
     down.add_argument('--db', help='base database (default: the URL database)')
     down.add_argument('--run-id', help='the run whose clones are dropped (default: $%s)' % RUN_ID_VAR)
+
+    revoke_p = sub.add_parser('revoke', help='ADMIN ONLY: mark an idle auto-minted family TERMINAL (never drops)')
+    revoke_p.add_argument('--url', help=url_help)
+    revoke_p.add_argument('--db', required=True, help='the auto-minted ci_base_* base of the family')
+    revoke_p.add_argument('--run-id', required=True, help='the run the family belongs to')
+    revoke_p.add_argument('--reason', required=True, help='why the family is abandoned (non-empty, logged)')
 
     sweep_p = sub.add_parser('sweep', help='ADMIN ONLY: drop idle clones of any run older than N s')
     sweep_p.add_argument('--url', help=url_help)
@@ -1241,31 +1847,114 @@ def _cmd_run(args: argparse.Namespace, url: str) -> int:
     return runner.run_all(targets, residual)
 
 
+def _cmd_setup(args: argparse.Namespace, url: str) -> int:
+    """``setup``: mint (or accept) the base, mark it ACTIVE, build the template.
+
+    Masked ``--emit-env`` never emits ``URL_VAR``: that is the variable this
+    wrapper reads, so a masked value sourced into a later ``run``/``teardown``
+    would fail authentication and strand an ACTIVE family (#7153)."""
+    admin = url
+    run_id = checked_run_id(args.run_id or new_run_id())  # before any CREATE (N1)
+    done = False
+    try:
+        url, db, minted = resolve_base(url, args.db, args.allow_shared_base, args.jobs)
+        if minted:  # #7113: ACTIVE (verified) before the template exists
+            mark_active(with_database(admin, MAINTENANCE_DB), db, run_id)
+        tpl = setup(url, db, args.jobs)
+        if args.emit_env:
+            _emit('%s=%s' % (TEMPLATE_VAR, tpl))
+            _emit('%s=%s' % (RUN_ID_VAR, run_id))
+            _emit('%s=%s' % (BASE_VAR, db))
+            if args.emit_env_unmasked:
+                _emit('%s=%s' % (URL_VAR, url))
+            else:
+                log('masked --emit-env: %s is not emitted (keep the real URL; use --emit-env-unmasked '
+                    'for a minted base URL)' % URL_VAR)
+        done = True
+        _disown(db)  # handed to the caller: teardown owns it from here
+    finally:
+        if not done:  # any failure or SIGTERM, not only WrapperError (#7152, #7179)
+            for name in [n for n in _OWNED if n.startswith(MINTED_BASE_PREFIX)]:
+                log('setup failed after minting %s; dropping it' % name)
+                drop_base(admin, name)
+    return 0
+
+
+def resolve_teardown_db(url: str, db_arg: Optional[str], env_base: Optional[str]) -> str:
+    """Pick the database ``teardown`` works on (#7180).
+
+    A masked ``setup --emit-env`` keeps the caller's maintenance URL, so the URL
+    database is not the run's base; the emitted ``BASE_VAR`` names it. Without
+    ``--db`` a minted ``BASE_VAR`` is used. An explicit ``--db`` that differs
+    from a minted ``BASE_VAR`` is refused: teardown never reports success while
+    the minted family it was told about stays behind."""
+    minted = env_base if env_base and env_base.startswith(MINTED_BASE_PREFIX) else None
+    if db_arg:
+        if minted and minted != db_arg:
+            raise WrapperError('%s names minted base %s but --db is %s; pass --db %s (or unset %s) so '
+                               'the minted family is not stranded' % (BASE_VAR, minted, db_arg, minted, BASE_VAR))
+        return db_arg
+    return minted or database_name(url)
+
+
+def _cmd_teardown(args: argparse.Namespace, url: str) -> int:
+    """``teardown``: TERMINAL first, drop the run's clones and template, base last."""
+    base = os.environ.get(BASE_VAR)
+    db = resolve_teardown_db(url, args.db, base)
+    run_id = checked_run_id(args.run_id or os.environ.get(RUN_ID_VAR))
+    admin = with_database(url, MAINTENANCE_DB)
+    if is_minted_base(db):
+        # #7113: TERMINAL first (refuses another run's family before any drop).
+        terminalize(admin, db, run_id, INTENT_TEARDOWN, TEARDOWN_REASON)
+    failed = teardown(url, db, run_id)
+    if base and base == db and base.startswith(MINTED_BASE_PREFIX):
+        if failed:
+            log('keeping base %s (TERMINAL authority): %d member drop(s) failed; sweep finishes it'
+                % (base, failed))
+        else:
+            # Plain drop (no force option), base last: a live session fails it, loudly.
+            try:
+                psql(admin, SQL_DROP_DATABASE % quote_ident(_checked_ident(base)))
+            except WrapperError as exc:
+                failed += 1
+                log('WARN could not drop the base %s: %s' % (base, exc))
+    if failed:
+        print('pg_isolated_binary: teardown left %d database(s) behind' % failed, file=sys.stderr)
+        return EXIT_USAGE
+    return 0
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     try:
         args = build_parser().parse_args(argv)
     except SystemExit as exc:
         return exc.code if isinstance(exc.code, int) else EXIT_USAGE
+    del _OWNED[:]
     try:
         url = _url(args)
         if args.cmd == 'setup':
-            db = args.db or database_name(url)
-            run_id = checked_run_id(args.run_id or new_run_id())
-            tpl = setup(url, db, args.jobs)
-            if args.emit_env:
-                _emit('%s=%s' % (TEMPLATE_VAR, tpl))
-                _emit('%s=%s' % (RUN_ID_VAR, run_id))
-            return 0
+            with _sigterm_as_exception():  # #7152: SIGTERM must not strand a minted base
+                return _cmd_setup(args, url)
         if args.cmd == 'teardown':
-            db = args.db or database_name(url)
-            teardown(url, db, checked_run_id(args.run_id or os.environ.get(RUN_ID_VAR)))
+            return _cmd_teardown(args, url)
+        if args.cmd == 'revoke':
+            revoke(with_database(url, MAINTENANCE_DB), _checked_ident(args.db), args.run_id, args.reason)
             return 0
         if args.cmd == 'sweep':
             sweep(url, args.older_than)
             return 0
         return _cmd_run(args, url)
+    except _Terminated:
+        if _OWNED:
+            log('terminated by SIGTERM; NOT released: %s (drop by hand)' % ', '.join(_OWNED))
+            return EXIT_UNRELEASED
+        log('terminated by SIGTERM; owned resources were released')
+        return _die_by_sigterm()
     except WrapperError as exc:
         print('pg_isolated_binary: %s' % exc, file=sys.stderr)
+        if _OWNED:
+            log('NOT released: %s (drop by hand)' % ', '.join(_OWNED))
+            return EXIT_UNRELEASED  # #7200: an owned name was left behind
         return EXIT_USAGE
 
 

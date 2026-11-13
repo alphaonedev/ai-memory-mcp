@@ -87,6 +87,53 @@ fn kp(label: &str) -> AgentKeypair {
     keypair::generate(label).expect("generate keypair")
 }
 
+/// Key directory for the cells that `keypair::save` into (#3198 gate).
+fn key_dir() -> tempfile::TempDir {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("lineage-keys-");
+    // #7158 / #7161 — the directory must satisfy the #3198 key-directory gate
+    // whatever the process umask, so the mode is set on the builder and the
+    // directory never exists in a umask-derived mode.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    builder.tempdir().expect("key dir")
+}
+
+/// #7158 / #7161 — the key fixture directory is private whatever the process
+/// umask. Under umask `0002` a umask-derived directory is mode `775` and
+/// `keypair::save` refuses it by design (#3198): the PR #7088 live-PG run
+/// failed `rotate_with_succession_end_to_end` on exactly that refusal.
+#[cfg(unix)]
+#[test]
+fn key_dir_is_mode_0700_under_umask_0002_7158_7161() {
+    use std::os::unix::fs::PermissionsExt;
+    // The umask is process-wide and this binary runs its cells concurrently
+    // by default. The flip is harmless to siblings: every key directory in
+    // this binary comes from `key_dir()`, which sets its mode explicitly, and
+    // the sqlite fixture directories are never permission-checked.
+    // SAFETY: `umask(2)` only reads and replaces the process creation mask.
+    let previous = unsafe { libc::umask(0o002) };
+    let dir = key_dir();
+    let saved = keypair::save(&kp("umask-7158"), dir.path());
+    // SAFETY: restores the mask read above; no other state is touched.
+    unsafe {
+        libc::umask(previous);
+    }
+    let mode = std::fs::metadata(dir.path())
+        .expect("stat key dir")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        mode, 0o700,
+        "key_dir must not inherit the process umask (got {mode:o})"
+    );
+    saved.expect("the #3198 key-directory gate must accept the fixture dir under umask 0002");
+}
+
 /// Raw corruption helper for adversarial lineage-verifier tests. Public bind
 /// APIs now refuse these desynchronisations by construction (#3464), so tests
 /// that exercise the deeper tamper detector must model a database attacker.
@@ -830,10 +877,7 @@ fn require_identity_lineage_fail_closes_when_missing() {
 #[test]
 fn rotate_with_succession_end_to_end() {
     let (_dir, conn) = fresh_db();
-    let key_dir = tempfile::Builder::new()
-        .prefix("lineage-keys-")
-        .tempdir()
-        .expect("key dir");
+    let key_dir = key_dir();
     db::register_agent(&conn, "rot-agent", "ai:test", &[]).expect("register");
     let k0 = kp("rot-agent");
     keypair::save(&k0, key_dir.path()).expect("save K0");
@@ -1421,8 +1465,21 @@ mod postgres_parity {
     /// sqlite twin above asserts.
     #[tokio::test]
     async fn postgres_parity_identical_verdicts() {
-        let Some(store) = connect().await else { return };
-        let Some(pool) = raw_pool().await else { return };
+        // #7031 H3: this test deletes an `agent_lineage` row (C3 rollback),
+        // which would leave the shared base's watermark above its row count
+        // (#6983). Run it in its own schema so the shared tables are untouched.
+        let Some(env) = common::postgres_env::PostgresTestEnv::new("lineage_parity_7031").await
+        else {
+            return;
+        };
+        let store = PostgresStore::connect(env.url())
+            .await
+            .expect("connect scoped schema");
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(env.url())
+            .await
+            .expect("connect scoped raw pool");
 
         let (agent_id, k0) = pg_register_and_enroll(&store).await;
         let ctx = CallerContext::for_agent(agent_id.clone());
@@ -1659,6 +1716,9 @@ mod postgres_parity {
             1,
             "refused postgres hijack leaves no history mutation"
         );
+        // #7031 N1: close both pools before the schema drop so a lazily
+        // rolled-back transaction cannot hold a lock the drop waits for.
+        env.finish(&[store.pool(), &pool]).await;
     }
 
     #[tokio::test]

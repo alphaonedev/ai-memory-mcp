@@ -19,10 +19,7 @@ use common::MultiEnvVarGuard;
 fn full_export_includes_custody_file_role_pubkeys_2245() {
     let scratch = std::env::current_dir().expect("cwd").join(".local-runs");
     std::fs::create_dir_all(&scratch).expect("scratch root");
-    let root = tempfile::Builder::new()
-        .prefix("trust-anchor-2245-")
-        .tempdir_in(&scratch)
-        .expect("scratch dir");
+    let root = private_root_in("trust-anchor-2245-", &scratch);
 
     let roles = [
         ("recorder", RECORDER_KEY_LABEL, RECORDER_KEY_DIR_ENV),
@@ -78,10 +75,7 @@ fn full_export_includes_custody_file_role_pubkeys_2245() {
 fn full_export_prefers_out_of_band_env_anchor_over_custody_file_2245() {
     let scratch = std::env::current_dir().expect("cwd").join(".local-runs");
     std::fs::create_dir_all(&scratch).expect("scratch root");
-    let root = tempfile::Builder::new()
-        .prefix("trust-anchor-env-precedence-2245-")
-        .tempdir_in(&scratch)
-        .expect("scratch dir");
+    let root = private_root_in("trust-anchor-env-precedence-2245-", &scratch);
     let custody = keypair::generate(RECORDER_KEY_LABEL).expect("generate custody key");
     keypair::save_public_only(&custody, root.path()).expect("save custody public key");
     let pinned = keypair::generate("recorder-env-pin").expect("generate env pin");
@@ -107,10 +101,7 @@ fn full_export_prefers_out_of_band_env_anchor_over_custody_file_2245() {
 fn full_export_does_not_fall_back_past_malformed_env_anchor_2245() {
     let scratch = std::env::current_dir().expect("cwd").join(".local-runs");
     std::fs::create_dir_all(&scratch).expect("scratch root");
-    let root = tempfile::Builder::new()
-        .prefix("trust-anchor-malformed-env-2245-")
-        .tempdir_in(&scratch)
-        .expect("scratch dir");
+    let root = private_root_in("trust-anchor-malformed-env-2245-", &scratch);
     let custody = keypair::generate(RECORDER_KEY_LABEL).expect("generate custody key");
     keypair::save_public_only(&custody, root.path()).expect("save custody public key");
     let recorder_dir = root.path().to_string_lossy().into_owned();
@@ -128,4 +119,17 @@ fn full_export_does_not_fall_back_past_malformed_env_anchor_2245() {
             .all(|anchor| anchor.role != "recorder"),
         "a malformed out-of-band pin must not silently fall back to custody"
     );
+}
+
+/// #7185 - the scratch root doubles as a key directory, so it is created 0700
+/// whatever the process umask and never exists in a group-writable mode.
+fn private_root_in(prefix: &str, scratch: &std::path::Path) -> tempfile::TempDir {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(prefix);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    builder.tempdir_in(scratch).expect("scratch dir")
 }

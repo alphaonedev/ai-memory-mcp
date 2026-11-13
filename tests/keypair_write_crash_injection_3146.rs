@@ -150,7 +150,7 @@ fn failing_writer_mid_save_leaves_the_original_keypair_intact_3146() {
         return;
     }
 
-    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let tmp = private_tempdir();
     let dir = tmp.path();
 
     // The sole, irreplaceable identity on disk.
@@ -222,4 +222,18 @@ fn failing_writer_mid_save_leaves_the_original_keypair_intact_3146() {
         stray.is_empty(),
         "a failed write must remove its staging file; found {stray:?}"
     );
+}
+
+/// #7185 - a key directory must satisfy the #3198 gate whatever the process
+/// umask, so the mode is set on the builder and the directory never exists in a
+/// umask-derived (group-writable) mode.
+fn private_tempdir() -> tempfile::TempDir {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("keydir-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    builder.tempdir().expect("private tempdir")
 }

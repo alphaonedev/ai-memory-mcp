@@ -41,14 +41,17 @@ without a statistically-rigorous model; it is a campaign summary.
 
 ## Deployment
 
-On each peer host:
+On each peer host, create an ephemeral database rather than using the shared base
+(#7031):
 
 ```sh
 # postgres fixture
 docker compose -f packaging/docker-compose.postgres.yml up -d
 
 # ai-memory daemon with federation
-export AI_MEMORY_STORE_URL=postgres://ai_memory:ai_memory_test@localhost:5433/ai_memory_test
+psql postgres://ai_memory:ai_memory_test@localhost:5433/postgres \
+    -c 'CREATE DATABASE ai_memory_test_chaos'
+export AI_MEMORY_STORE_URL=postgres://ai_memory:ai_memory_test@localhost:5433/ai_memory_test_chaos
 ai-memory serve \
     --host 0.0.0.0 --port 9077 \
     --tls-cert /etc/ai-memory/cert.pem \

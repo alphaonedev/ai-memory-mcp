@@ -6,6 +6,8 @@ operator rule is Python, not shell).  It carries the section the shell file woul
 * G (#6339): ci.yml runs the AGE self-heal helper as ``python3 -I`` (no sys.path[0], no PYTHON* env), because the
   helper reads the tier URL file and builds PGPASSWORD.  Pinned by test_ci_age_helper_isolated_6339.py.
 
+* H4 (#7031): the shared-database gate is clean and wired after classification.
+
 On top of those child suites it scans ci.yml as text (no YAML parser, stdlib only, Python 3.9+) for the wiring
 lines themselves, so a rename of a child suite cannot leave the workflow silently unpinned.
 
@@ -23,6 +25,8 @@ CHILD_TIMEOUT_SECS = 300
 
 AGE_SUITE = "test_ensure_age_extension_6161.py"
 SECTION_G_SUITES = ("test_ci_age_helper_isolated_6339.py",)
+SHARED_DB_GATE = "scripts/ci/check_shared_test_db_refs.py"
+SHARED_DB_GATE_CALL = "python3 -I " + SHARED_DB_GATE + " --root ."
 
 AGE_HELPER_CALL = "python3 -I scripts/ci/ensure-age-extension.py --url-file"
 AGE_GUARD = 'if [ "${CI_NODE:-}" = "macos-fed" ]; then'
@@ -71,6 +75,20 @@ class CiWorkflowInvariants6161(unittest.TestCase):
         create = first_index(lines, CREATE_EXTENSION, call)
         self.assertNotEqual(call, -1)
         self.assertNotEqual(create, -1, "CREATE EXTENSION age must follow the self-heal")
+
+    def test_shared_database_gate_is_wired_7031(self):
+        """The H4 gate remains in the classify job after its trust decision."""
+        text = CI_YML.read_text(encoding="utf-8")
+        self.assertEqual(text.count(SHARED_DB_GATE_CALL), 1)
+        self.assertLess(text.index("      - id: cls"), text.index(SHARED_DB_GATE_CALL))
+
+    def test_shared_database_gate_is_clean_7031(self):
+        """Port the H4 execution proof from the old shell invariant."""
+        done = subprocess.run(
+            [sys.executable, "-I", str(ROOT / SHARED_DB_GATE), "--root", str(ROOT)],
+            cwd=ROOT, capture_output=True, text=True,
+            timeout=CHILD_TIMEOUT_SECS, check=False)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
 
     def test_age_unit_test_step_is_wired(self):
         text = CI_YML.read_text(encoding="utf-8")
