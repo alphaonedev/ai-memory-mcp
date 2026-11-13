@@ -91,6 +91,19 @@ THE TWO PREDICATES #3556 ADDS (2026-09-21).
       <commit>`), so ancestry is not required; an unparseable banner or a
       bound SHA absent from the repository is fail-closed.
 
+THE AMENDMENT LEDGER (#6124, 2026-11-13). While STATUS is VOID or EXPIRED at
+both ends, (B) has one more honest pass: the change appends NEW dated records
+to the ledger under LEDGER_MARKER at the end of the cert doc, and those records
+together name exactly every changed watched path and every added or removed
+AI_MEMORY_FED_* identifier (a missing or an extra name fails). The ledger is
+append-only (an edited, reordered or removed base record fails), dated within
+[LEDGER_DATE_FLOOR, judged commit UTC date + LEDGER_DATE_SKEW_DAYS], and parsed
+as a canonical Markdown subset: anything unrecognised in or before the region
+is a refusal (default deny). An amendment never discharges the cert: the
+STATUS line stays byte-identical, LIVE behaviour is unchanged, and setting or
+changing Binds-to while STATUS stays VOID/EXPIRED is refused (#6774 option B
+narrowed; dropping the bind to `-` stays a voiding record).
+
 WHAT THIS DOES NOT CLAIM. A value-only edit of an existing AI_MEMORY_FED_*
 identifier in a file outside the three path watches does not trip the
 identifier check. This gate does not re-run 5.4(2)-(5); it only forces the
@@ -115,6 +128,7 @@ Exit codes: 0 clean / N/A-skip, 1 violation, 2 usage / self-test failure.
 import argparse
 import ast
 import contextlib
+import datetime
 import errno
 import os
 import re
@@ -122,6 +136,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import unicodedata
+from collections import namedtuple
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -166,9 +182,45 @@ EXPIRY_SENTENCE = (
     "expires per its §7 → re-issue or void the cert doc in this same change."
 )
 
+# Rule (B) amendment ledger (#6124). While the certification is VOID or EXPIRED at both
+# ends of the range, a federation-wire change passes only when the head doc appends new
+# dated records, under this exact marker line at the end of the doc, that name exactly the
+# changed watched paths and AI_MEMORY_FED_* identifiers. The ledger is a canonical subset
+# of Markdown: anything the parser does not positively recognise is a refusal (design B,
+# 3-agent vote 71472661).
+LEDGER_MARKER = "## Amendment ledger (rule B, append-only)"
+LEDGER_RECORD_RE = re.compile(r"### Amendment ([0-9]{4}-[0-9]{2}-[0-9]{2})")
+LEDGER_ITEM_RE = re.compile(r"- (?:id: (" + FED_ID_PATTERN + r")|path: ([!-~]+))")
+LEDGER_DATE_FLOOR = datetime.date(2026, 11, 13)
+LEDGER_DATE_SKEW_DAYS = 1  # a record may carry the judged commit's UTC date plus this
+LEDGER_MAX_DOC_BYTES = 8 * 1024 * 1024
+LEDGER_MAX_LINE_BYTES = 256
+LEDGER_STATUSES = ("VOID", "EXPIRED")
+# Unicode categories refused anywhere in the doc: controls (LF excepted), format
+# characters (zero-width, bidi, BOM), line/paragraph separators, private use, unassigned.
+LEDGER_FORBIDDEN_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp", "Co", "Cn", "Cs"})
+LEDGER_SUSPECT_RE = re.compile(r"[^\n\x20-\x7e]")
+# Leading blockquote markers, list markers and spaces: what a line is nested in.
+LEDGER_CONTAINER_RE = re.compile(r"(?:[ >]|[-*+](?=[ ]|$)|[0-9]{1,9}[.)](?=[ ]|$))*")
+LEDGER_FENCE_RE = re.compile(r"(`{3,}|~{3,})(.*)")
+LEDGER_HTML_START_RE = re.compile(r"<[A-Za-z!?/]")
+LEDGER_FRONT_MATTER = ("---", "+++")
+LedgerRecord = namedtuple("LedgerRecord", "line lines names")
+
 
 class GateError(Exception):
     """Evidence is missing or ambiguous: the gate fails closed."""
+
+
+class LedgerError(GateError):
+    """The amendment ledger on one side of the range is not in the canonical form."""
+
+    def __init__(self, reason, line, side):
+        self.reason = reason
+        self.line = line
+        self.side = side
+        where = f"at {CERT_DOC}:{line}" if line else f"in {CERT_DOC}"
+        super().__init__(f"amendment ledger ({side}): {reason} {where}")
 
 
 # ---------------------------------------------------------------------------
@@ -370,6 +422,229 @@ def fmt_banner(banner):
 
 
 # ---------------------------------------------------------------------------
+# Rule (B) amendment ledger (#6124)
+# ---------------------------------------------------------------------------
+
+
+def _strip_container(line):
+    """(prefix, rest): the leading quote/list/space markers and what follows them."""
+    end = LEDGER_CONTAINER_RE.match(line).end()
+    return line[:end], line[end:]
+
+
+def _names_amendment(rest):
+    return rest.startswith("#") and "amendment" in rest.casefold()
+
+
+def ledger_present(blob):
+    """True iff any line of BLOB (bytes) looks like a heading naming an amendment, so
+    the doc must be parsed as carrying a ledger. A doc without one has no records."""
+    for line in blob.split(b"\n"):
+        rest = line.lstrip(b" >*+-0123456789.)")
+        if rest.startswith(b"#") and b"amendment" in rest.lower():
+            return True
+    return False
+
+
+def _check_pre_region(lines, side):
+    """Refuse every construct above the marker that could hide or fake a record."""
+    if lines and lines[0] in LEDGER_FRONT_MATTER:
+        raise LedgerError("front matter on line 1 is not supported", 1, side)
+    fence = None  # (char, length, opener line number) while a fence is open
+    for number, line in enumerate(lines, 1):
+        prefix, rest = _strip_container(line)
+        found = LEDGER_FENCE_RE.fullmatch(rest)
+        if found and prefix:
+            raise LedgerError(
+                "a fence-like line inside a container or indented is not supported", number, side)
+        if fence is not None:
+            run, info = found.groups() if found else ("", "")
+            if run and run[0] == fence[0] and len(run) >= fence[1] and not info.strip(" "):
+                fence = None
+            continue
+        if found:
+            run, info = found.groups()
+            if run[0] == "`" and "`" in info:
+                raise LedgerError(
+                    "a fence opener with a backtick in its info string is not supported", number, side)
+            fence = (run[0], len(run), number)
+            continue
+        if LEDGER_HTML_START_RE.match(rest) and not (
+                rest.startswith("<!--") and rest.find("-->", 4) != -1):
+            raise LedgerError(
+                "an HTML block start is not supported (only a one-line <!-- ... --> comment)",
+                number, side)
+        if _names_amendment(rest):
+            raise LedgerError("a heading-like line naming an amendment outside the ledger", number, side)
+    if fence is not None:
+        raise LedgerError("a fence opened here is still open at the ledger marker", fence[2], side)
+    if not lines or lines[-1] != "":
+        raise LedgerError("the ledger marker must follow a blank line", len(lines) + 1, side)
+    found = sum(1 for line in lines if STATUS_LINE_RE.match(line))
+    if found != 1:
+        raise LedgerError(
+            f"the STATUS banner must appear exactly once, above the ledger (found {found})", None, side)
+
+
+def _parse_region(lines, first, side):
+    """Records of the ledger region LINES (the lines after the marker; FIRST is the
+    1-based number of LINES[0]). The grammar, with no other form accepted:
+        "" then zero or more records separated by one "" line;
+        record = "### Amendment YYYY-MM-DD", "", one or more sorted unique items;
+        item = "- id: AI_MEMORY_FED_*" or "- path: <section 7 watched path>"."""
+    records = []
+    state = "blank"
+    heading = None
+    items = []
+    for number, line in enumerate(lines, first):
+        if len(line.encode("utf-8")) > LEDGER_MAX_LINE_BYTES:
+            raise LedgerError(f"line longer than {LEDGER_MAX_LINE_BYTES} bytes", number, side)
+        if not line.isascii():
+            raise LedgerError("character outside printable ASCII in the ledger", number, side)
+        if state in ("blank", "hblank"):
+            if line != "":
+                raise LedgerError("expected a blank line", number, side)
+            state = "head" if state == "blank" else "item1"
+        elif state == "head":
+            found = LEDGER_RECORD_RE.fullmatch(line)
+            if not found:
+                raise LedgerError("expected '### Amendment YYYY-MM-DD'", number, side)
+            try:
+                day = datetime.date.fromisoformat(found.group(1))
+            except ValueError:
+                raise LedgerError(f"date {found.group(1)} is not a calendar date", number, side) from None
+            if day < LEDGER_DATE_FLOOR:
+                raise LedgerError(
+                    f"date {found.group(1)} is before the ledger floor {LEDGER_DATE_FLOOR.isoformat()}",
+                    number, side)
+            heading = (number, line, day)
+            items = []
+            state = "hblank"
+        else:  # "item1" or "items"
+            if line == "" and state == "items":
+                records.append(_record(heading, items))
+                state = "head"
+                continue
+            found = LEDGER_ITEM_RE.fullmatch(line)
+            if not found:
+                raise LedgerError(
+                    "expected an item line '- id: AI_MEMORY_FED_*' or '- path: <watched path>'",
+                    number, side)
+            path = found.group(2)
+            if path is not None and not is_watched_path(path):
+                raise LedgerError(f"path {path} is not a section 7 watched path", number, side)
+            if items and line <= items[-1]:
+                raise LedgerError(
+                    "item lines must be sorted and unique (this line is not after the previous one)",
+                    number, side)
+            items.append(line)
+            state = "items"
+    if state == "items":
+        records.append(_record(heading, items))
+    elif state == "head":
+        raise LedgerError("trailing blank line at the end of the ledger", first + len(lines) - 1, side)
+    elif state in ("hblank", "item1"):
+        raise LedgerError("the record is incomplete at the end of the file", heading[0], side)
+    return records
+
+
+def _record(heading, items):
+    names = tuple(item.split(": ", 1)[1] for item in items)
+    return LedgerRecord(heading[0], (heading[1], *items), names)
+
+
+def record_day(rec):
+    return datetime.date.fromisoformat(LEDGER_RECORD_RE.fullmatch(rec.lines[0]).group(1))
+
+
+def parse_ledger(blob, side):
+    """The records (list of LedgerRecord) of the cert doc BLOB (bytes). Every form the
+    parser does not positively recognise raises LedgerError with a reason and, where one
+    applies, a 1-based line number. Linear in the size of BLOB."""
+    if len(blob) > LEDGER_MAX_DOC_BYTES:
+        raise LedgerError(
+            f"the document is {len(blob)} bytes, over the {LEDGER_MAX_DOC_BYTES}-byte limit", None, side)
+    try:
+        text = blob.decode("utf-8", "strict")
+    except UnicodeDecodeError as exc:
+        raise LedgerError(f"not strict UTF-8 (invalid byte at offset {exc.start})", None, side) from None
+    if not text.endswith("\n"):
+        raise LedgerError("the document does not end with a line feed", None, side)
+    for suspect in LEDGER_SUSPECT_RE.finditer(text):
+        category = unicodedata.category(suspect.group())
+        if category in LEDGER_FORBIDDEN_CATEGORIES:
+            number = text.count("\n", 0, suspect.start()) + 1
+            raise LedgerError(
+                f"forbidden character U+{ord(suspect.group()):04X} ({category})", number, side)
+    lines = text.split("\n")[:-1]
+    markers = lines.count(LEDGER_MARKER)
+    if markers != 1:
+        raise LedgerError(
+            f"the ledger marker line appears {markers} times, expected exactly once", None, side)
+    at = lines.index(LEDGER_MARKER)
+    _check_pre_region(lines[:at], side)
+    return _parse_region(lines[at + 1:], at + 2, side)
+
+
+def commit_utc_date(repo, commit):
+    stamp = git_text(repo, "show", "-s", "--format=%ct", "--end-of-options", commit)
+    if not stamp.isdigit():
+        raise GateError(f"commit {commit} has an unreadable committer timestamp {stamp!r}")
+    return datetime.datetime.fromtimestamp(int(stamp), datetime.timezone.utc).date()
+
+
+def judge_ledger(repo, mb, judged):
+    """The NEW records (list) the change appends to the ledger, after proving the ledger
+    append-only and every new record dated within [floor, judged commit UTC date + 1]."""
+    base_blob = read_blob(repo, mb, CERT_DOC)
+    head_blob = read_blob(repo, judged, CERT_DOC)
+    base_on = base_blob is not None and ledger_present(base_blob)
+    head_on = head_blob is not None and ledger_present(head_blob)
+    if not base_on and not head_on:
+        return []
+    base_records = parse_ledger(base_blob, "base") if base_on else []
+    if not head_on:
+        raise LedgerError("the ledger present at the range start is missing", None, "head")
+    head_records = parse_ledger(head_blob, "head")
+    for k, old in enumerate(base_records, 1):
+        if k > len(head_records) or head_records[k - 1].lines != old.lines:
+            raise LedgerError(
+                f"record {k} of the base ledger ({old.lines[0]}) is edited, reordered or removed",
+                old.line, "head")
+    new = head_records[len(base_records):]
+    if new:
+        committed = commit_utc_date(repo, judged)
+        ceiling = committed + datetime.timedelta(days=LEDGER_DATE_SKEW_DAYS)
+        for rec in new:
+            day = record_day(rec)
+            if day > ceiling:
+                raise LedgerError(
+                    f"record dated {day.isoformat()} is after the judged commit date "
+                    f"{committed.isoformat()} plus {LEDGER_DATE_SKEW_DAYS} day", rec.line, "head")
+    return new
+
+
+def check_amendment_names(new_records, changed):
+    """The union of names in the new records must equal CHANGED exactly."""
+    named = {name for rec in new_records for name in rec.names}
+    missing = sorted(changed - named)
+    if missing:
+        raise LedgerError(
+            f"the new amendment records do not name changed {', '.join(missing)}", None, "head")
+    extra = sorted(named - changed)
+    if extra:
+        raise LedgerError(
+            f"a new amendment record names {', '.join(extra)}, which this change did not touch",
+            None, "head")
+
+
+def status_lines(repo, tree):
+    """The raw STATUS banner lines of the cert doc at TREE (bytes lines)."""
+    blob = read_blob(repo, tree, CERT_DOC) or b""
+    return [ln for ln in blob.split(b"\n") if STATUS_LINE_RE.match(ln.decode("utf-8", "replace"))]
+
+
+# ---------------------------------------------------------------------------
 # The check
 # ---------------------------------------------------------------------------
 
@@ -543,6 +818,26 @@ def _judge(repo, base, head, judged, mb, tip):
     removed = sorted(base_ids - head_ids)
     id_changed = bool(added or removed)
 
+    # #6124: on every path that touches the doc the ledger must parse, stay append-only,
+    # and its new records must name exactly what changed; a VOID/EXPIRED doc never
+    # gains or changes a bind without a re-issue (#6774 option B, narrowed).
+    new_records = []
+    banner_mb = banner_head = ("", "")
+    if cert_touched:
+        new_records = judge_ledger(repo, mb, judged)
+        if new_records:
+            check_amendment_names(new_records, set(watched) | set(added) | set(removed))
+        banner_mb = cert_banner(repo, mb)
+        banner_head = cert_banner(repo, judged)
+        kept = banner_mb[0] == banner_head[0] and banner_head[0] in LEDGER_STATUSES
+        if kept and banner_head[1] not in ("-", banner_mb[1], "DUPLICATE"):
+            verb = "set" if banner_mb[1] == "-" else "changed"
+            raise GateError(
+                f"Binds-to {verb} ({banner_mb[1]} → {banner_head[1]}) while STATUS stays "
+                f"{banner_head[0]}: an amendment never rebinds; re-issue as LIVE or drop the "
+                "bind (#6774 option B narrowed)"
+            )
+
     if not watched and not id_changed:
         ok, more = check_banner_consistency(repo, judged)
         lines = [f"{PREFIX}: PASS — federation-wire surface unchanged in {mb}..{judged}"]
@@ -551,10 +846,7 @@ def _judge(repo, base, head, judged, mb, tip):
     # (B) #3556: the hatch is a REAL re-issue/voiding only if the banner
     # (STATUS line or Binds-to line) differs between merge-base and judged.
     incidental = deleted = malformed = False
-    banner_mb = banner_head = ("", "")
     if cert_touched:
-        banner_mb = cert_banner(repo, mb)
-        banner_head = cert_banner(repo, judged)
         incidental = banner_mb == banner_head
         # #3556 ruling, fix 2: a DELETED cert doc is not a voiding record.
         deleted = banner_head == ("ABSENT", "-")
@@ -571,6 +863,21 @@ def _judge(repo, base, head, judged, mb, tip):
         )
         return ok, "\n".join([head_line] + more)
 
+    if incidental and new_records and banner_head[0] in LEDGER_STATUSES:
+        # #6124: the names already match exactly; the banner line itself must not move.
+        if status_lines(repo, mb) != status_lines(repo, judged):
+            return False, (
+                f"{PREFIX}: ERROR — the STATUS banner line changed while its word stayed "
+                f"{banner_head[0]}; an amendment keeps the banner line byte-identical (#6124)"
+            )
+        ok, more = check_banner_consistency(repo, judged)
+        head_line = (
+            f"{PREFIX}: PASS — federation-wire surface changed AND a new amendment record "
+            f"names every change ({mb}..{judged}); the certification stays {banner_head[0]} "
+            "(an amendment never discharges it, #6124)"
+        )
+        return ok, "\n".join([head_line] + more)
+
     out = [EXPIRY_SENTENCE]
     if incidental:
         out.append(
@@ -579,6 +886,13 @@ def _judge(repo, base, head, judged, mb, tip):
             "both ends) — an incidental edit is not a re-issue and not a voiding "
             "record (#3556)."
         )
+        if banner_head[0] in LEDGER_STATUSES:
+            out.append(
+                "No new dated amendment record names this change; while the "
+                "certification stays VOID/EXPIRED, a new '### Amendment YYYY-MM-DD' "
+                f"record under the '{LEDGER_MARKER}' line naming every changed path and "
+                "identifier is the only honest pass (#6124)."
+            )
     if deleted:
         out.append(
             "The cert doc is ABSENT at HEAD (deleted in this change) while the "

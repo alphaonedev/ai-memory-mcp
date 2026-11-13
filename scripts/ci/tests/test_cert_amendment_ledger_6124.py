@@ -255,7 +255,7 @@ class HonestAmendment(LedgerCase):
     def test_identifier_add_and_rename_named_passes(self):
         s = self.scene("VOID")
         files = {CONFIG_RS: f'pub const X: &str = "{NEW_ID}";\n'}
-        files[CERT_REL] = with_ledger(s.doc, record(DAY, id_item(LIVE_ID), id_item(NEW_ID)))
+        files[CERT_REL] = with_ledger(s.doc, record(DAY, id_item(NEW_ID), id_item(LIVE_ID)))
         ok, out = s.judge(s.commit(files, "rename an id + amendment"))
         self.assert_pass(ok, out, "a new amendment record names every change")
 

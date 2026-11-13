@@ -347,7 +347,8 @@ $ git diff --stat e22bc93c 580d8427
 > 2026-08-28 and 2026-09-02 amendments) was closed by #3556, which hardened
 > `check-cert-expiry.sh` so predicate (B) requires the banner itself to move
 > and predicate (C) fails a LIVE banner over watched drift. **Discharged by
-> full re-issue**, not by argument.
+> full re-issue**, not by argument. (The amendment ledger #6124 added later
+> applies only while STATUS is VOID or EXPIRED and discharges nothing; §7.)
 >
 > §5.4(2)–(5) were **re-run at `92209ad91`**, not carried forward — the same
 > batch moved `doctor --posture` check #15 (#3866) and the pg connect funnel,
@@ -1615,6 +1616,28 @@ the one-line remedy the failure names. Its reported context is declared in
 operator-gated branch-protection API call adds it to the live required
 set, the gate is a red check, not a merge block.)
 
+**Amendment ledger (rule B, #6124).** While the STATUS line says VOID or
+EXPIRED at both ends of a change, re-issue is not possible, so the banner
+cannot move. A watched-surface change then passes only if the same change
+appends one or more NEW dated records to the amendment ledger at the end
+of this document, and those records together name exactly every changed
+watched path and every added or removed `AI_MEMORY_FED_*` identifier. A
+missing name, an extra name, a record dated before 2026-11-13 or after the
+judged commit's UTC date plus one day, or an edited, reordered or removed
+earlier record fails. The ledger is append-only. An amendment never
+discharges the certification: the STATUS line stays byte-identical, LIVE
+behaviour is unchanged, and while STATUS stays VOID or EXPIRED a change that
+sets or changes the bound SHA is refused (dropping it stays a voiding
+record). The ledger is a strict subset of Markdown, and the gate refuses
+anything it does not recognise. That covers front matter, a fence still
+open at the ledger marker, a fence inside a container or indented, an HTML
+block other than a one-line comment, a heading that names an amendment
+outside the ledger, and control, format, separator, private-use or
+unassigned characters anywhere in the document. Each record is
+`### Amendment YYYY-MM-DD`, a blank line, then sorted
+`- path: <watched path>` and `- id: AI_MEMORY_FED_*` lines, with one blank
+line between records and no blank line at the end of the file.
+
 **Re-cert trigger — FIRED (12 §7-watched federation-wire files changed
 `ab6f2175` → `f32c18dad`) and DISCHARGED by re-issue (`f32c18dad`,
 2026-09-21).** Between the prior bind `ab6f2175` (2026-09-12 #3607) and the
@@ -2206,3 +2229,5 @@ ruling, ratified under adversarial review.
 | F8 — boot-refusal opt-in / unattested; doctor attests its own process; `FED_REQUIRE_POLICY_CURRENT=0` escapes | **PARTIALLY CLOSED 2026-08-13** — #2911 items 1-2 (PR #2918): posture checks #17/#18 self-attest the boot gate and pin FED-RQ-03, and `posture-hardened-boot-refusal.out` demonstrates the armed refusal. Items 3-4 (pin-file parse; doctor attests its own process) remain OPEN in #2911. |
 | F9 — campaign docs on PG16/AGE1.6.0/pgvector0.8.4 vs certified PG18.4/AGE1.7.0/pgvector0.8.5 | §3 stack-evidence note. Campaign-doc refresh: [#2913](https://github.com/alphaonedev/ai-memory-mcp/issues/2913). |
 | F10 LOWs — landing SHA, signer wording, omitted lanes, encryption-gate conflation, §4→§6 numbering | This re-issue. `docs/at-a-glance.html` v0.9-era copy: #2913 item 1 (out of this document's file set). |
+
+## Amendment ledger (rule B, append-only)
