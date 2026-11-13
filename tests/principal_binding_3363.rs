@@ -150,6 +150,8 @@ fn seed_skill(conn: &Connection, id: &str, ns: &str, name: &str) {
         rusqlite::params![id, ns, name, body_blob, digest],
     )
     .expect("seed skill row");
+    // #8834 — the get path verifies the digest; seal the fixture.
+    ai_memory::mcp::reseal_skill_digest_for_tests(conn, id).expect("reseal");
 }
 
 /// `(retired_at, retired_by)` for a seeded skill — the durable provenance the
@@ -375,6 +377,7 @@ fn skill_get_refuses_forged_agent_id() {
     let err = handle_skill_get(
         &conn,
         &json!({"skill_id": "sk-get-denied", "agent_id": FORGED}),
+        None,
     )
     .expect_err("a forged agent_id must refuse the activation");
     assert_mismatch_refusal(&err, FORGED);
@@ -390,8 +393,12 @@ fn skill_get_allows_matching_agent_id_and_stamps_the_caller() {
     let conn = common::fresh_conn();
     seed_skill(&conn, "sk-get-ok", "team/3363", "get-ok");
 
-    let out = handle_skill_get(&conn, &json!({"skill_id": "sk-get-ok", "agent_id": CALLER}))
-        .expect("the enforced caller may activate as itself");
+    let out = handle_skill_get(
+        &conn,
+        &json!({"skill_id": "sk-get-ok", "agent_id": CALLER}),
+        None,
+    )
+    .expect("the enforced caller may activate as itself");
     assert!(
         out["invocation_record"]["event_id"].is_string(),
         "the activation must still emit an invocation record, got {out}"

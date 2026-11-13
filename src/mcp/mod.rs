@@ -671,8 +671,13 @@ mod verify;
 mod skill_export;
 #[path = "tools/skill_get.rs"]
 mod skill_get;
+#[path = "tools/skill_integrity.rs"]
+mod skill_integrity;
 #[path = "tools/skill_list.rs"]
 mod skill_list;
+// #9174 R2 — the one closed vocabulary of a skill read / export failure.
+#[path = "tools/skill_read_text.rs"]
+mod skill_read_text;
 #[path = "tools/skill_register.rs"]
 mod skill_register;
 #[path = "tools/skill_resource.rs"]
@@ -851,14 +856,24 @@ pub use verify::handle_verify;
 // parity with the seven MCP `memory_skill_*` tools is the contract.
 pub use skill_compositional_context::handle_skill_compositional_context;
 pub use skill_export::{
-    DEFAULT_EXPORT_DIR_NAME, SKILLS_EXPORT_ROOT_ENV, handle_skill_export,
+    DEFAULT_EXPORT_DIR_NAME, EXPORT_FRONTMATTER_REFUSED, EXPORT_GOVERNANCE_REFUSED,
+    EXPORT_RESOURCE_PATH_REFUSED, SKILLS_EXPORT_ROOT_ENV, SkillExportClass, SkillExportFailure,
+    classify_skill_export_failure, handle_skill_export, handle_skill_export_classified,
     handle_skill_export_in_root,
 };
 pub use skill_get::handle_skill_get;
-pub use skill_list::handle_skill_list;
+// #8834 (code LOW 4) — test fixtures only; never in the release lib surface.
+#[cfg(any(test, feature = "test-support"))]
+pub use skill_integrity::reseal_skill_digest_for_tests;
+// #8832 (B-11) — the HTTP register route maps the typed refusal class to
+// its status and wire `code`.
+pub(crate) use skill_integrity::RegisterMetadataRefusal;
+pub use skill_list::{SKILL_LIST_PAGE_LIMIT, handle_skill_list};
 pub(crate) use skill_promote::handle_skill_promote_for_caller;
 pub use skill_promote::handle_skill_promote_from_reflection;
+pub use skill_read_text::SkillReadClass;
 pub use skill_register::handle_skill_register;
+pub(crate) use skill_register::handle_skill_register_as;
 pub use skill_resource::handle_skill_resource;
 pub use skill_retire::{handle_skill_delete, handle_skill_retire};
 
@@ -2997,19 +3012,26 @@ fn dispatch_memory_skill_register(ctx: &ToolDispatchCtx<'_>) -> Result<Value, St
 }
 
 fn dispatch_memory_skill_list(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
-    handle_skill_list(ctx.conn, ctx.arguments)
+    handle_skill_list(ctx.conn, ctx.arguments, ctx.authority.read_caller())
 }
 
 fn dispatch_memory_skill_get(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
-    handle_skill_get(ctx.conn, ctx.arguments)
+    handle_skill_get(ctx.conn, ctx.arguments, ctx.authority.read_caller())
 }
 
 fn dispatch_memory_skill_resource(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
-    handle_skill_resource(ctx.conn, ctx.arguments)
+    handle_skill_resource(ctx.conn, ctx.arguments, ctx.authority.read_caller())
 }
 
 fn dispatch_memory_skill_export(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
-    handle_skill_export(ctx.conn, ctx.db_path, ctx.arguments, ctx.active_keypair)
+    let caller = ctx.authority.read_caller();
+    handle_skill_export(
+        ctx.conn,
+        ctx.db_path,
+        ctx.arguments,
+        ctx.active_keypair,
+        caller,
+    )
 }
 
 fn dispatch_memory_skill_promote_from_reflection(

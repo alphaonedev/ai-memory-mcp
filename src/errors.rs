@@ -445,6 +445,118 @@ pub mod msg {
         format!("{SKILL_NOT_FOUND}: {skill_id}")
     }
 
+    /// v1.0.0 #8834 — the prefix of every skill verify-on-read failure.
+    pub const SKILL_INTEGRITY_FAILED: &str = "skill integrity check failed";
+
+    /// v1.0.0 #8834 — the fixed skill-level verify-on-read text the HTTP read
+    /// routes render for a resource-level failure (no stored path echoed).
+    #[must_use]
+    pub fn skill_integrity_failed(skill_id: impl std::fmt::Display) -> String {
+        format!("{SKILL_INTEGRITY_FAILED}: skill {skill_id}")
+    }
+
+    /// `memory_skill_resource` / `GET /skill/{id}/resource` with no path.
+    pub const SKILL_RESOURCE_PATH_REQUIRED: &str = "memory_skill_resource requires 'resource_path'";
+
+    /// The prefix of [`skill_resource_not_found`].
+    pub const SKILL_RESOURCE_NOT_FOUND: &str = "resource not found";
+
+    /// `"resource not found: skill_id={skill_id} path={path}"`.
+    #[must_use]
+    pub fn skill_resource_not_found(
+        skill_id: impl std::fmt::Display,
+        path: impl std::fmt::Display,
+    ) -> String {
+        format!("{SKILL_RESOURCE_NOT_FOUND}: skill_id={skill_id} path={path}")
+    }
+
+    /// `"resource '{path}' has no inline content (reference-only)"`.
+    #[must_use]
+    pub fn skill_resource_reference_only(path: impl std::fmt::Display) -> String {
+        format!("resource '{path}' has no inline content (reference-only)")
+    }
+
+    /// v1.0.0 #8834 — the recomputed skill digest differs from the stored one.
+    #[must_use]
+    pub fn skill_digest_mismatch(skill_id: impl std::fmt::Display) -> String {
+        format!("{SKILL_INTEGRITY_FAILED}: digest mismatch for skill {skill_id}")
+    }
+
+    /// v1.0.0 #8834 — a resource's content hashes to a different digest.
+    #[must_use]
+    pub fn skill_resource_digest_mismatch(
+        path: impl std::fmt::Display,
+        skill_id: impl std::fmt::Display,
+    ) -> String {
+        format!("{SKILL_INTEGRITY_FAILED}: resource '{path}' digest mismatch for skill {skill_id}")
+    }
+
+    /// v1.0.0 #8834 — a resource carries inline content but no stored digest.
+    #[must_use]
+    pub fn skill_resource_digest_missing(
+        path: impl std::fmt::Display,
+        skill_id: impl std::fmt::Display,
+    ) -> String {
+        format!(
+            "{SKILL_INTEGRITY_FAILED}: resource '{path}' has no stored digest for skill {skill_id}"
+        )
+    }
+
+    /// v1.0.0 #8834 — the stored signature does not verify over the digest.
+    #[must_use]
+    pub fn skill_signature_invalid(skill_id: impl std::fmt::Display) -> String {
+        format!("{SKILL_INTEGRITY_FAILED}: signature invalid for skill {skill_id}")
+    }
+
+    /// v1.0.0 #8834 — a signed skill whose signer has no enrolled public key.
+    #[must_use]
+    pub fn skill_signer_key_unavailable(skill_id: impl std::fmt::Display) -> String {
+        format!("{SKILL_INTEGRITY_FAILED}: signer public key unavailable for skill {skill_id}")
+    }
+
+    /// v1.0.0 #8834 — a row names a signing agent but carries no signature
+    /// (a stripped signature or a self-asserted signer, never a signed row).
+    #[must_use]
+    pub fn skill_signature_missing(skill_id: impl std::fmt::Display) -> String {
+        format!(
+            "{SKILL_INTEGRITY_FAILED}: signing agent named without a signature for skill {skill_id}"
+        )
+    }
+
+    /// v1.0.0 #8832 — `memory_skill_register` refuses caller-supplied metadata
+    /// that carries a key in the substrate-reserved `_` namespace other than
+    /// the top-level scope binding (any other substrate-stamped state, or a
+    /// binding nested below the top level). The key itself is not echoed: it
+    /// is caller input.
+    pub const SKILL_RESERVED_METADATA_KEY: &str = "memory_skill_register refused: metadata carries a reserved key (keys beginning with '_' are stamped by the substrate, never supplied by the caller; only a top-level '_visibility' binding exported for the registering principal is accepted)";
+
+    /// v1.0.0 #8832 — the top-level `_visibility` binding is not exactly the
+    /// shape `memory_skill_promote_from_reflection` stamps.
+    pub const SKILL_VISIBILITY_BINDING_MALFORMED: &str = "memory_skill_register refused: metadata '_visibility' must be exactly {\"scope\": <private|team|unit|org|collective>, \"agent_id\": <registering principal>} with no other key";
+
+    /// v1.0.0 #8832 — the `_visibility` binding names a principal other than
+    /// the registering one. Names the remedy (drop the binding and register
+    /// the skill as your own, whose digest then differs from the exported
+    /// one); never echoes either principal.
+    pub const SKILL_VISIBILITY_BINDING_FOREIGN: &str = "memory_skill_register refused: metadata '_visibility' is bound to a different principal; remove the '_visibility' binding and register the skill as your own (its digest then differs from the exported digest), or register it as the principal that promoted it";
+
+    /// v1.0.0 #8832 (B-9) — the binding scope is not a canonical scope token
+    /// (an unknown, differently-cased or legacy-broad token).
+    pub const SKILL_VISIBILITY_SCOPE_INVALID: &str = "memory_skill_register refused: metadata '_visibility' scope must be exactly one of private, team, unit, org, collective; unknown and legacy scope tokens are not accepted";
+
+    /// v1.0.0 #8832 (B-9) — the binding scope is one the registering
+    /// principal itself is not a member of in the skill's namespace.
+    pub const SKILL_VISIBILITY_SCOPE_NOT_MEMBER: &str = "memory_skill_register refused: metadata '_visibility' scope is one the registering principal is not a member of in this namespace; bind a scope you can read, or remove the binding";
+
+    /// v1.0.0 #8832 (B-10) — a binding needs a resolved principal: an
+    /// anonymous, host-default or reserved identity cannot own one.
+    pub const SKILL_VISIBILITY_PRINCIPAL_UNRESOLVED: &str = "memory_skill_register refused: metadata '_visibility' requires an authenticated agent identity (an anonymous, host-default or reserved identity cannot own a binding); register as your own agent id, or remove the binding";
+
+    /// v1.0.0 #8832 (B-12) — a bound register may not supersede a current
+    /// skill of the same namespace and name that is not bound to the same
+    /// principal (it would hide that skill from its readers).
+    pub const SKILL_VISIBILITY_SHADOWS_EXISTING: &str = "memory_skill_register refused: a current skill with this namespace and name is not bound to the registering principal, and a '_visibility' binding may not supersede it; register under another name, or remove the binding";
+
     /// `"pending action not found: {pending_id}"`.
     #[must_use]
     pub fn pending_action_not_found(pending_id: impl std::fmt::Display) -> String {
@@ -487,10 +599,31 @@ pub mod msg {
         format!("signature verify failed: {e}")
     }
 
+    /// Prefix shared by every stored-blob decode failure (`"zstd decompress "`).
+    /// #8834 — the HTTP skill read routes classify the family by this prefix
+    /// and never echo the rest (a resource variant names a stored path).
+    pub const ZSTD_DECOMPRESS_PREFIX: &str = "zstd decompress ";
+
     /// `"zstd decompress body: {e}"`.
     #[must_use]
     pub fn zstd_decompress_body(e: impl std::fmt::Display) -> String {
-        format!("zstd decompress body: {e}")
+        format!("{ZSTD_DECOMPRESS_PREFIX}body: {e}")
+    }
+
+    /// #9174 R2 — the caller text of a stored skill body that does not
+    /// decode; the decoder message goes to the operator log only.
+    pub const SKILL_BODY_UNDECODABLE: &str = "zstd decompress body: stored blob does not decode";
+
+    /// #9174 R2 — the caller text of a stored skill resource that does not
+    /// decode; the decoder message and the stored resource path go to the
+    /// operator log only.
+    pub const SKILL_RESOURCE_UNDECODABLE: &str =
+        "zstd decompress resource: stored blob does not decode";
+
+    /// `"zstd decompress resource '{path}': {e}"`.
+    #[must_use]
+    pub fn zstd_decompress_resource(path: &str, e: impl std::fmt::Display) -> String {
+        format!("{ZSTD_DECOMPRESS_PREFIX}resource '{path}': {e}")
     }
 
     /// `"network: {e}"`.
@@ -1095,6 +1228,12 @@ impl From<anyhow::Error> for MemoryError {
         // so the wire code does not move; the HTTP route reads the type.
         if let Some(rnf) = e.downcast_ref::<ReflectionNotFound>() {
             return Self::Refused(rnf.to_string());
+        }
+        // #8832 - a skill-register metadata refusal is our own typed root,
+        // one fixed message per class. It stays a refusal with its text
+        // unchanged; the HTTP register route downcasts the type first.
+        if let Some(r) = e.downcast_ref::<crate::mcp::RegisterMetadataRefusal>() {
+            return Self::Refused(r.message().to_owned());
         }
         // #3713 — the optimistic-concurrency conflict (`memory_update`'s
         // `expected_version`) is our own typed root; keep its text.

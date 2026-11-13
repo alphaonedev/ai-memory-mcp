@@ -17,7 +17,7 @@ v0.7.0 Grand-Slam Layer-1 + Layer-2 task chain (issues
 |---|--------|----------------------|------------------|
 | 01 | [`01-bounded-recursive-refinement.sh`](01-bounded-recursive-refinement.sh) ([md](01-bounded-recursive-refinement.md)) | Manual `memory_reflect` at depth 1/2/3, refusal at depth=4, external `verify-reflection-chain` walk-back | #655 / L1-3 |
 | 02 | [`02-curator-driven-reflection.sh`](02-curator-driven-reflection.sh) ([md](02-curator-driven-reflection.md)) | `ai-memory curator --reflect --dry-run` over a seeded namespace, inspect + verify each minted reflection | #666 / L2-1 |
-| 03 | [`03-reflection-to-skill-promote.sh`](03-reflection-to-skill-promote.sh) ([md](03-reflection-to-skill-promote.md)) | `memory_skill_promote_from_reflection` → `memory_skill_export` → optional `skills-ref validate` → re-register → **identical SHA-256 digest** | #671 / L2-6 |
+| 03 | [`03-reflection-to-skill-promote.sh`](03-reflection-to-skill-promote.sh) ([md](03-reflection-to-skill-promote.md)) | `memory_skill_promote_from_reflection` → `memory_skill_export` → optional `skills-ref validate` → re-register as the promoting principal → **identical SHA-256 digest** (another principal is refused, #8832) | #671 / L2-6 |
 | 04 | [`04-forensic-bundle.sh`](04-forensic-bundle.sh) ([md](04-forensic-bundle.md)) | `export-forensic-bundle` over a depth-2 chain → `verify-forensic-bundle` passes → tamper one byte → verify refuses | #670 / L2-5 |
 | 05 *(optional)* | [`05-autoresearch-composition.sh`](05-autoresearch-composition.sh) ([md](05-autoresearch-composition.md)) | Karpathy-style autoresearch loop: synthetic experiment observations → clustering reflection → skill promote → forensic bundle (end-to-end composition) | composition |
 

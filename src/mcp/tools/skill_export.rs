@@ -6,7 +6,9 @@
 //! Writes a skill back to a `target_folder` as a round-trip-compatible
 //! SKILL.md file (plus any attached resource files under `resources/`).
 //! Re-registering the exported folder via `memory_skill_register` produces
-//! the **identical SHA-256 digest** — the round-trip guarantee.
+//! the **identical SHA-256 digest** — the round-trip guarantee. A promoted
+//! skill keeps its `_visibility` binding, so the guarantee holds for the
+//! principal that promoted it; register refuses any other principal (#8832).
 //!
 //! A `signed_events` row is appended for the export action (Bucket 1
 //! attestation).
@@ -34,6 +36,7 @@ use rusqlite::Connection;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
+use super::skill_read_text::SkillReadClass;
 use crate::errors::msg::{SkillsJail, skills_io_kind, skills_root_label};
 use crate::identity::keypair::AgentKeypair;
 use crate::signed_events::{SignedEvent, append_signed_event, payload_hash};
@@ -324,6 +327,9 @@ fn confine_export_target(target_str: &str, root: &Path) -> Result<PathBuf, Strin
 /// `ai-memory skill export` CLI) goes through here, so the jail is not a
 /// per-surface habit.
 ///
+/// #8832 — `read_caller` is the resolved read principal; see
+/// [`handle_skill_export_in_root`].
+///
 /// # Errors
 /// A [`resolve_export_root`] refusal, or any error of
 /// [`handle_skill_export_in_root`].
@@ -332,10 +338,87 @@ pub fn handle_skill_export(
     db_path: &Path,
     params: &Value,
     active_keypair: Option<&AgentKeypair>,
+    read_caller: Option<&str>,
 ) -> Result<Value, String> {
+    handle_skill_export_classified(conn, db_path, params, active_keypair, read_caller)
+        .map_err(|failure| classify_skill_export_failure(&failure).1)
+}
+
+/// #9174 R2 — the closed failure of an export. The stored text of a failure
+/// (the loader's text, a stored resource path, a governance rule reason, a
+/// metadata serializer message) never reaches a caller: the loader text is
+/// only classified through [`SkillReadClass`], and every other stored detail
+/// goes to the operator log at the site that refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkillExportFailure {
+    /// The verified load refused `skill_id`; `raw` is classified, never
+    /// rendered.
+    Read { skill_id: String, raw: String },
+    /// A refusal whose text holds only the caller's own `skill_id` /
+    /// `target_folder`, fixed labels and an I/O failure kind (#3762).
+    Refused(String),
+}
+
+/// #9174 R2 — the class of a [`SkillExportFailure`]: the HTTP route maps it
+/// to a status, and both surfaces render the text of the same mapping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkillExportClass {
+    /// A read refusal, in the vocabulary get, resource and compose share.
+    Read(SkillReadClass<'static>),
+    /// An export refusal of the request itself.
+    Refused,
+}
+
+/// #9174 R2 — the ONE caller text of an export failure, for the MCP tool,
+/// the CLI and the HTTP route alike (#3762 parity by construction).
+#[must_use]
+pub fn classify_skill_export_failure(failure: &SkillExportFailure) -> (SkillExportClass, String) {
+    match failure {
+        SkillExportFailure::Read { skill_id, raw } => {
+            let class = SkillReadClass::classify(raw, skill_id, None);
+            if class.is_sanitized() {
+                // #1261 — the raw loader text is operator detail.
+                tracing::error!(
+                    target: crate::mcp::error_text::TRACE_TARGET,
+                    skill_id = skill_id.as_str(),
+                    error = %raw,
+                    "skill export: read failure (sanitized for the caller, #1261)"
+                );
+            }
+            (SkillExportClass::Read(class), class.caller_text(skill_id))
+        }
+        SkillExportFailure::Refused(text) => (SkillExportClass::Refused, text.clone()),
+    }
+}
+
+/// Caller text of an export that refused a STORED resource path: the path
+/// itself goes to the operator log only (#9174 R2).
+pub const EXPORT_RESOURCE_PATH_REFUSED: &str = "refusing a stored resource with an unsafe path: absolute or parent-directory \
+     components are not allowed";
+/// Caller text of an export whose governance check refused a write; the rule
+/// reason goes to the operator log only (#9174 R2).
+pub const EXPORT_GOVERNANCE_REFUSED: &str = "governance refused the export write";
+/// Caller text of an export whose stored metadata does not serialize as
+/// YAML; the serializer message goes to the operator log only (#9174 R2).
+pub const EXPORT_FRONTMATTER_REFUSED: &str =
+    "skill metadata is not YAML-representable; nothing was exported";
+
+/// #9174 R2 — [`handle_skill_export`] with the typed failure, for the HTTP
+/// route (which maps [`SkillExportClass`] to a status).
+///
+/// # Errors
+/// Every refusal of [`handle_skill_export`], typed.
+pub fn handle_skill_export_classified(
+    conn: &Connection,
+    db_path: &Path,
+    params: &Value,
+    active_keypair: Option<&AgentKeypair>,
+    read_caller: Option<&str>,
+) -> Result<Value, SkillExportFailure> {
     let configured_root = std::env::var(SKILLS_EXPORT_ROOT_ENV).ok();
-    let export_root = resolve_export_root(configured_root.as_deref(), db_path)?;
-    handle_skill_export_in_root(conn, params, active_keypair, &export_root)
+    let export_root = resolve_export_root(configured_root.as_deref(), db_path)
+        .map_err(SkillExportFailure::Refused)?;
+    export_in_root(conn, params, active_keypair, &export_root, read_caller)
 }
 
 /// #3357 — the export body, with the jail root supplied explicitly.
@@ -349,27 +432,48 @@ pub fn handle_skill_export(
 /// hatch, it only names WHICH root applies, and the confinement below is
 /// identical either way.
 ///
+/// #8832 / #8834 — the skill is loaded through the single verified read path
+/// ([`super::skill_integrity::load_verified_skill`]) for `read_caller`
+/// (`None` = the single-operator / admin-gated posture) BEFORE any
+/// filesystem write: a skill the caller may not read is not found, and a
+/// digest, resource-digest or signature failure exports nothing.
+///
 /// # Errors
 /// - An `export_root` that does not resolve to an existing directory.
 /// - `memory_skill_export requires 'skill_id'` / `'target_folder'`.
 /// - A `confine_export_target` refusal.
-/// - The skill-not-found / decompress / governance / I/O errors of the export
-///   itself.
+/// - The skill-not-found / integrity / decompress / governance / I/O errors of
+///   the export itself.
 pub fn handle_skill_export_in_root(
     conn: &Connection,
     params: &Value,
     active_keypair: Option<&AgentKeypair>,
     export_root: &Path,
+    read_caller: Option<&str>,
 ) -> Result<Value, String> {
+    export_in_root(conn, params, active_keypair, export_root, read_caller)
+        .map_err(|failure| classify_skill_export_failure(&failure).1)
+}
+
+/// The export body behind [`handle_skill_export_in_root`], with the typed
+/// failure (#9174 R2).
+fn export_in_root(
+    conn: &Connection,
+    params: &Value,
+    active_keypair: Option<&AgentKeypair>,
+    export_root: &Path,
+    read_caller: Option<&str>,
+) -> Result<Value, SkillExportFailure> {
+    let refused = |text: &str| SkillExportFailure::Refused(text.to_owned());
     let skill_id = params["skill_id"]
         .as_str()
         .filter(|s| !s.is_empty())
-        .ok_or("memory_skill_export requires 'skill_id'")?;
+        .ok_or_else(|| refused("memory_skill_export requires 'skill_id'"))?;
 
     let target_str = params[param_names::TARGET_FOLDER]
         .as_str()
         .filter(|s| !s.is_empty())
-        .ok_or("memory_skill_export requires 'target_folder'")?;
+        .ok_or_else(|| refused("memory_skill_export requires 'target_folder'"))?;
 
     // #3357 — CONFINE the caller-supplied folder before ANY filesystem I/O.
     // `target` from here on is the RESOLVED, in-root path; `target_str` is
@@ -392,10 +496,10 @@ pub fn handle_skill_export_in_root(
             error = %e,
             "cannot resolve the skills-export root"
         );
-        format!(
+        SkillExportFailure::Refused(format!(
             "{} is not a directory or does not exist",
             skills_root_label(SkillsJail::Export)
-        )
+        ))
     })?;
     if !export_root.is_dir() {
         tracing::error!(
@@ -403,73 +507,28 @@ pub fn handle_skill_export_in_root(
             root = %export_root.display(),
             "the skills-export root is not a directory"
         );
-        return Err(format!(
+        return Err(SkillExportFailure::Refused(format!(
             "{} is not a directory",
             skills_root_label(SkillsJail::Export)
-        ));
+        )));
     }
-    let target = confine_export_target(target_str, &export_root)?;
+    let target =
+        confine_export_target(target_str, &export_root).map_err(SkillExportFailure::Refused)?;
 
     // -----------------------------------------------------------------------
-    // Load skill row
+    // Load the skill through the verified read path (#8832 / #8834)
     // -----------------------------------------------------------------------
-    let row: Option<(
-        String,
-        String,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        String,
-        Vec<u8>,
-        Vec<u8>,
-        Option<String>,
-        i64,
-    )> = conn
-        .query_row(
-            "SELECT namespace, name, license, compatibility, allowed_tools, \
-                    metadata, body_blob, digest, signing_agent, created_at \
-             FROM skills WHERE id = ?1",
-            [skill_id],
-            |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                    row.get(6)?,
-                    row.get(7)?,
-                    row.get(8)?,
-                    row.get(9)?,
-                ))
-            },
-        )
-        .ok();
-
-    let Some((
-        namespace,
-        name,
-        license,
-        compatibility,
-        allowed_tools,
-        metadata,
-        body_blob,
-        digest_bytes,
-        signing_agent,
-        _created_at,
-    )) = row
-    else {
-        return Err(crate::errors::msg::skill_not_found(skill_id));
-    };
-
-    // -----------------------------------------------------------------------
-    // Decompress body
-    // -----------------------------------------------------------------------
-    // #1933 — bounded decode (anti-decompression-bomb ceiling).
-    let body_bytes = crate::mcp::skill_zstd::decode_all_bounded(body_blob.as_slice())
-        .map_err(|e| crate::errors::msg::zstd_decompress_body(e))?;
-    let body = String::from_utf8_lossy(&body_bytes);
+    // Visibility, every resource digest, the skill digest and any signature
+    // are checked here, before the first write below. The bounded (#1933)
+    // body and resource decode happens inside the verified load.
+    let skill =
+        super::skill_integrity::load_verified_skill(conn, skill_id, read_caller).map_err(|e| {
+            SkillExportFailure::Read {
+                skill_id: skill_id.to_owned(),
+                raw: String::from(e),
+            }
+        })?;
+    let body = String::from_utf8_lossy(&skill.body);
 
     // -----------------------------------------------------------------------
     // Build SKILL.md text (round-trip-stable)
@@ -481,26 +540,25 @@ pub fn handle_skill_export_in_root(
     // re-registered digest differed from the advertised identical-digest
     // round-trip; it also dropped every non-string metadata value
     // (composition declarations, parameter schemas) on export.
-    let desc_row: Option<String> = conn
-        .query_row(
-            "SELECT description FROM skills WHERE id = ?1",
-            [skill_id],
-            |row| row.get(0),
-        )
-        .ok();
-    let tools: Option<Vec<String>> = allowed_tools
-        .as_deref()
-        .and_then(|j| serde_json::from_str::<Vec<String>>(j).ok())
-        .filter(|t| !t.is_empty());
-    let meta_val = serde_json::from_str::<serde_json::Value>(&metadata).ok();
+    let tools: Option<&[String]> = skill.allowed_tools.as_deref().filter(|t| !t.is_empty());
     let frontmatter = build_frontmatter_yaml(&FrontmatterFields {
-        namespace: &namespace,
-        name: &name,
-        description: desc_row.as_deref(),
-        license: license.as_deref(),
-        compatibility: compatibility.as_deref(),
-        allowed_tools: tools.as_deref(),
-        metadata: meta_val.as_ref().and_then(serde_json::Value::as_object),
+        namespace: &skill.namespace,
+        name: &skill.name,
+        description: Some(skill.description.as_str()),
+        license: skill.license.as_deref(),
+        compatibility: skill.compatibility.as_deref(),
+        allowed_tools: tools,
+        metadata: skill.metadata.as_object(),
+    })
+    .map_err(|e| {
+        // #9174 R2 — the serializer message quotes stored metadata.
+        tracing::error!(
+            target: crate::mcp::error_text::TRACE_TARGET,
+            skill_id,
+            error = %e,
+            "skill export: stored metadata is not YAML-representable"
+        );
+        SkillExportFailure::Refused(EXPORT_FRONTMATTER_REFUSED.to_owned())
     })?;
 
     let skill_md_content = format!("---\n{frontmatter}\n---\n\n{body}");
@@ -529,9 +587,15 @@ pub fn handle_skill_export_in_root(
     // exemption, same rationale as `llm.rs`). MCP/`serve` still consult
     // the installed hook because they install it during bootstrap.
     if let Err(refusal) = crate::governance::wire_check::check(&skill_md_action) {
-        return Err(format!(
-            "governance refused SKILL.md write: {}",
-            refusal.reason
+        // #9174 R2 — the rule reason is operator text: log only.
+        tracing::error!(
+            target: crate::mcp::error_text::TRACE_TARGET,
+            requested = target_str,
+            reason = %refusal.reason,
+            "skill export: governance refused the SKILL.md write"
+        );
+        return Err(SkillExportFailure::Refused(
+            EXPORT_GOVERNANCE_REFUSED.to_owned(),
         ));
     }
     // #3762 — the `io::Error` Display carries the OS path text: log it for
@@ -545,7 +609,9 @@ pub fn handle_skill_export_in_root(
             "cannot create the export target directory"
         );
         let kind = skills_io_kind(e.kind());
-        format!("cannot create target_folder '{target_str}': {kind}")
+        SkillExportFailure::Refused(format!(
+            "cannot create target_folder '{target_str}': {kind}"
+        ))
     })?;
     // #3357 — re-assert containment AFTER the directory exists. `create_dir_all`
     // is the first moment the target is a real inode, so this closes the
@@ -563,7 +629,9 @@ pub fn handle_skill_export_in_root(
             "cannot resolve the export target after creation"
         );
         let kind = skills_io_kind(e.kind());
-        format!("cannot resolve target_folder '{target_str}' after creation: {kind}")
+        SkillExportFailure::Refused(format!(
+            "cannot resolve target_folder '{target_str}' after creation: {kind}"
+        ))
     })?;
     if !target.starts_with(&export_root) {
         tracing::error!(
@@ -572,11 +640,11 @@ pub fn handle_skill_export_in_root(
             root = %export_root.display(),
             "path-escape refused after creation (resolved target outside the jail)"
         );
-        return Err(format!(
+        return Err(SkillExportFailure::Refused(format!(
             "refusing target_folder '{target_str}': resolves outside the {} \
              (path-escape refused; set {SKILLS_EXPORT_ROOT_ENV} to export elsewhere)",
             skills_root_label(SkillsJail::Export)
-        ));
+        )));
     }
     let skill_md_path = target.join("SKILL.md");
     std::fs::write(&skill_md_path, skill_md_content.as_bytes()).map_err(|e| {
@@ -588,35 +656,19 @@ pub fn handle_skill_export_in_root(
             "cannot write the exported SKILL.md"
         );
         let kind = skills_io_kind(e.kind());
-        format!("cannot write SKILL.md for target_folder '{target_str}': {kind}")
+        SkillExportFailure::Refused(format!(
+            "cannot write SKILL.md for target_folder '{target_str}': {kind}"
+        ))
     })?;
 
     // -----------------------------------------------------------------------
     // Export resources
     // -----------------------------------------------------------------------
-    let mut res_stmt = conn
-        .prepare(
-            "SELECT resource_path, resource_kind, content_blob \
-             FROM skill_resources WHERE skill_id = ?1",
-        )
-        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("resources prepare", e))?;
-
     let mut exported_resources: Vec<String> = Vec::new();
     let resources_root = target.join("resources");
-    let rows = res_stmt
-        .query_map([skill_id], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<Vec<u8>>>(2)?,
-            ))
-        })
-        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("resources query", e))?;
-
-    for row in rows {
-        let (res_path, _kind, content_blob_opt) =
-            row.map_err(|e| crate::mcp::error_text::mcp_foreign_err("row", e))?;
-        if let Some(blob) = content_blob_opt {
+    for resource in &skill.resources {
+        let res_path = resource.path.as_str();
+        if let Some(content) = &resource.content {
             // #1453 (SEC, MED) — `res_path` is attacker-influenceable: it
             // is persisted verbatim in `skill_resources.resource_path` at
             // register time, so a poisoned skill row could carry
@@ -635,13 +687,17 @@ pub fn handle_skill_export_in_root(
                         | std::path::Component::Prefix(_)
                 )
             }) {
-                return Err(format!(
-                    "refusing resource with unsafe path '{res_path}': \
-                     absolute or parent-directory components are not allowed"
+                // #9174 R2 — the stored path goes to the operator log only.
+                tracing::error!(
+                    target: crate::mcp::error_text::TRACE_TARGET,
+                    skill_id,
+                    resource_path = res_path,
+                    "skill export: refused a stored resource with an unsafe path"
+                );
+                return Err(SkillExportFailure::Refused(
+                    EXPORT_RESOURCE_PATH_REFUSED.to_owned(),
                 ));
             }
-            let content = crate::mcp::skill_zstd::decode_all_bounded(blob.as_slice())
-                .map_err(|e| format!("decompress resource '{res_path}': {e}"))?;
             let res_file = resources_root.join(&res_path);
             // Defense-in-depth: the lexical join MUST remain inside the
             // resources root. The component check above is the
@@ -649,8 +705,14 @@ pub fn handle_skill_export_in_root(
             // any future shape (e.g. an empty / `.`-only path that
             // normalises oddly) that slips past it.
             if !res_file.starts_with(&resources_root) {
-                return Err(format!(
-                    "refusing resource '{res_path}': resolved path escapes the resources root"
+                tracing::error!(
+                    target: crate::mcp::error_text::TRACE_TARGET,
+                    skill_id,
+                    resource_path = res_path,
+                    "skill export: a stored resource path escapes the resources root"
+                );
+                return Err(SkillExportFailure::Refused(
+                    EXPORT_RESOURCE_PATH_REFUSED.to_owned(),
                 ));
             }
             // v0.7.0 (issue #691 fold-1) — per-resource FilesystemWrite
@@ -666,9 +728,15 @@ pub fn handle_skill_export_in_root(
             // Fable HIGH (#3133): CLI `skill export` one-shot — `check`, not
             // `check_governed`. See the SKILL.md write above.
             if let Err(refusal) = crate::governance::wire_check::check(&res_action) {
-                return Err(format!(
-                    "governance refused resource '{res_path}' write: {}",
-                    refusal.reason
+                tracing::error!(
+                    target: crate::mcp::error_text::TRACE_TARGET,
+                    skill_id,
+                    resource_path = res_path,
+                    reason = %refusal.reason,
+                    "skill export: governance refused a resource write"
+                );
+                return Err(SkillExportFailure::Refused(
+                    EXPORT_GOVERNANCE_REFUSED.to_owned(),
                 ));
             }
             if let Some(parent) = res_file.parent() {
@@ -680,10 +748,10 @@ pub fn handle_skill_export_in_root(
                         "cannot create the export resource directory"
                     );
                     let kind = skills_io_kind(e.kind());
-                    format!("cannot create resource directory: {kind}")
+                    SkillExportFailure::Refused(format!("cannot create resource directory: {kind}"))
                 })?;
             }
-            std::fs::write(&res_file, &content).map_err(|e| {
+            std::fs::write(&res_file, content).map_err(|e| {
                 tracing::error!(
                     target: crate::mcp::error_text::TRACE_TARGET,
                     path = %res_file.display(),
@@ -691,9 +759,9 @@ pub fn handle_skill_export_in_root(
                     "cannot write the exported resource"
                 );
                 let kind = skills_io_kind(e.kind());
-                format!("cannot write resource '{res_path}': {kind}")
+                SkillExportFailure::Refused(format!("cannot write an exported resource: {kind}"))
             })?;
-            exported_resources.push(res_path);
+            exported_resources.push(resource.path.clone());
         }
     }
 
@@ -702,8 +770,8 @@ pub fn handle_skill_export_in_root(
     // -----------------------------------------------------------------------
     let event_payload = json!({
         "skill_id": skill_id,
-        "namespace": namespace,
-        "name": name,
+        "namespace": skill.namespace,
+        "name": skill.name,
         "action": "export",
         (field_names::TARGET_FOLDER): target_str,
     });
@@ -711,7 +779,7 @@ pub fn handle_skill_export_in_root(
     let ev_hash = payload_hash(&ev_bytes);
     let agent_id = active_keypair
         .map(|kp| kp.agent_id.clone())
-        .or(signing_agent.clone())
+        .or_else(|| skill.signing_agent.clone())
         .unwrap_or_else(|| "anonymous".to_string());
     let event = SignedEvent {
         id: Uuid::new_v4().to_string(),
@@ -725,7 +793,7 @@ pub fn handle_skill_export_in_root(
     };
     let _ = append_signed_event(conn, &event);
 
-    let digest_hex: String = digest_bytes.iter().map(|b| format!("{b:02x}")).collect();
+    let digest_hex: String = skill.digest.iter().map(|b| format!("{b:02x}")).collect();
 
     let mut response = json!({
         "exported": true,
@@ -795,7 +863,15 @@ fn build_frontmatter_yaml(f: &FrontmatterFields<'_>) -> Result<String, String> {
     }
     if let Some(meta) = f.metadata {
         for (k, v) in meta {
-            if CORE_FRONTMATTER_KEYS.contains(&k.as_str()) {
+            // #8832 — the scope binding (`_visibility`) is exported: it is part
+            // of the digest, and register accepts it back for the principal it
+            // names, so the round trip keeps the identical digest and the
+            // binding. Every other `_`-prefixed key is substrate-stamped
+            // state register refuses, so an exported SKILL.md never carries it.
+            if CORE_FRONTMATTER_KEYS.contains(&k.as_str())
+                || (super::skill_integrity::is_reserved_meta_key(k)
+                    && k != super::skill_integrity::VISIBILITY_META_KEY)
+            {
                 continue;
             }
             let value = serde_yaml_ng::to_value(v)
@@ -904,7 +980,7 @@ mod tests {
             // Unreachable in practice: a missing / blank `target_folder` is
             // refused by the handler before the root is ever consulted.
             .unwrap_or_else(|| PathBuf::from("."));
-        super::handle_skill_export_in_root(conn, params, active_keypair, &root)
+        super::handle_skill_export_in_root(conn, params, active_keypair, &root, None)
     }
 
     fn open_db() -> (rusqlite::Connection, tempfile::TempDir) {
@@ -930,6 +1006,13 @@ mod tests {
             params![id, ns, name, description, body_blob, digest],
         )
         .unwrap();
+        // #8834 — the export read path verifies the digest; seal the fixture.
+        crate::mcp::reseal_skill_digest_for_tests(conn, id).expect("reseal");
+    }
+
+    /// #8834 — reseal a hand-inserted fixture (after its resources go in).
+    fn reseal(conn: &rusqlite::Connection, id: &str) {
+        crate::mcp::reseal_skill_digest_for_tests(conn, id).expect("reseal");
     }
 
     // ---- input validation ------------------------------------------------
@@ -1027,13 +1110,14 @@ mod tests {
         let id = "2bbbbbbb-0000-0000-0000-000000000002";
         conn.execute(
             "INSERT INTO skills (id, namespace, name, description, license, compatibility, \
-                                  allowed_tools, metadata, body_blob, digest, signing_agent, \
+                                  allowed_tools, metadata, body_blob, digest, \
                                   created_at) \
-             VALUES (?1, 'ns', 'name', 'desc', 'MIT', 'v1', ?2, ?3, ?4, ?5, 'agent:x', 0)",
+             VALUES (?1, 'ns', 'name', 'desc', 'MIT', 'v1', ?2, ?3, ?4, ?5, 0)",
             params![id, allowed_tools, metadata, body_blob, digest],
         )
         .unwrap();
 
+        reseal(&conn, id);
         let target = dir.path().join("export-opt");
         let v = handle_skill_export(
             &conn,
@@ -1079,6 +1163,7 @@ mod tests {
         )
         .unwrap();
 
+        reseal(&conn, id);
         let target = dir.path().join("export-res");
         let v = handle_skill_export(
             &conn,
@@ -1127,28 +1212,39 @@ mod tests {
     }
 
     #[test]
-    fn export_with_signing_agent_in_db_uses_that() {
-        // When no keypair is supplied, agent_id falls back to the
-        // skill's signing_agent column (when present).
+    fn export_refuses_a_signer_named_without_a_signature_8834() {
+        // #8834: a row that names a signer but carries no signature is a
+        // stripped signature or a self-asserted signer; export refuses it
+        // and writes nothing, so the signer never reaches the audit row.
         let (conn, dir) = open_db();
         let body_blob = zstd::encode_all(b"body".as_slice(), 3).unwrap();
         let digest = vec![0u8; 32];
         let id = "5eeee-0000-0000-0000-000000000005";
         conn.execute(
-            "INSERT INTO skills (id, namespace, name, description, metadata, body_blob, digest, signing_agent, created_at) \
-             VALUES (?1, 'ns', 'name', 'd', '{}', ?2, ?3, 'agent:from-db', 0)",
+            "INSERT INTO skills (id, namespace, name, description, metadata, body_blob, digest, created_at) \
+             VALUES (?1, 'ns', 'name', 'd', '{}', ?2, ?3, 0)",
             params![id, body_blob, digest],
         )
         .unwrap();
 
+        // The reseal clears any signer, so name one after it: the digest
+        // stays valid and only the signer claim is unbacked.
+        reseal(&conn, id);
+        conn.execute(
+            "UPDATE skills SET signing_agent = 'agent:from-db' WHERE id = ?1",
+            params![id],
+        )
+        .unwrap();
         let target = dir.path().join("export-dbagent");
-        let v = handle_skill_export(
+        let err = handle_skill_export(
             &conn,
             &json!({"skill_id": id, "target_folder": target.to_str().unwrap()}),
             None,
         )
-        .unwrap();
-        assert_eq!(v["exported"], json!(true));
+        .unwrap_err();
+        // #9174 R2 — the integrity family renders its fixed skill-level text.
+        assert_eq!(err, crate::errors::msg::skill_signature_missing(id));
+        assert!(!target.exists(), "nothing is written for a refused skill");
     }
 
     // ---- corrupt blob path ----------------------------------------------
@@ -1172,7 +1268,8 @@ mod tests {
             None,
         )
         .unwrap_err();
-        assert!(err.contains("zstd decompress body"));
+        // #9174 R2 — decoder text is operator detail: the sanitized text.
+        assert_eq!(err, crate::errors::msg::INTERNAL_SERVER_ERROR);
     }
 
     #[test]
@@ -1195,7 +1292,11 @@ mod tests {
             None,
         )
         .unwrap_err();
-        assert!(err.contains("decompress resource"));
+        assert_eq!(err, crate::errors::msg::INTERNAL_SERVER_ERROR);
+        assert!(
+            !err.contains("bad.bin"),
+            "stored path reached the caller: {err}"
+        );
     }
 
     // ---- #1453 path-traversal guard -------------------------------------
@@ -1217,6 +1318,7 @@ mod tests {
             params![id, blob, dig],
         )
         .unwrap();
+        reseal(&conn, id);
         let target = dir.path().join("export-traversal");
         let err = handle_skill_export(
             &conn,
@@ -1224,9 +1326,11 @@ mod tests {
             None,
         )
         .unwrap_err();
+        // #9174 R2 — the fixed text; the stored path goes to the log only.
+        assert_eq!(err, super::EXPORT_RESOURCE_PATH_REFUSED);
         assert!(
-            err.contains("unsafe path") && err.contains("parent-directory"),
-            "expected parent-dir refusal, got: {err}"
+            !err.contains("escape.txt"),
+            "stored path reached the caller"
         );
         // `target/resources/../escape.txt` lexically resolves to
         // `target/escape.txt` — it must NOT have been written.
@@ -1256,6 +1360,7 @@ mod tests {
             params![id, abs_str, blob, dig],
         )
         .unwrap();
+        reseal(&conn, id);
         let target = dir.path().join("export-absolute");
         let err = handle_skill_export(
             &conn,
@@ -1263,10 +1368,8 @@ mod tests {
             None,
         )
         .unwrap_err();
-        assert!(
-            err.contains("unsafe path"),
-            "expected absolute-path refusal, got: {err}"
-        );
+        assert_eq!(err, super::EXPORT_RESOURCE_PATH_REFUSED);
+        assert!(!err.contains(abs_str), "stored path reached the caller");
         assert!(
             !abs.exists(),
             "absolute-path write must not have landed: {abs:?}"
@@ -1288,6 +1391,7 @@ mod tests {
             params![id, blob, dig],
         )
         .unwrap();
+        reseal(&conn, id);
         let target = dir.path().join("export-ok");
         let v = handle_skill_export(
             &conn,
@@ -1382,7 +1486,7 @@ mod tests {
     }
 
     #[test]
-    fn export_with_malformed_metadata_skips_extra_fields() {
+    fn export_refuses_malformed_metadata_8834() {
         let (conn, dir) = open_db();
         let body_blob = zstd::encode_all(b"body".as_slice(), 3).unwrap();
         let digest = vec![0u8; 32];
@@ -1394,17 +1498,20 @@ mod tests {
         )
         .unwrap();
         let target = dir.path().join("export-bad-meta");
-        let v = handle_skill_export(
+        // #8834 — metadata (the scope binding) is digest-bound: a column that
+        // does not parse is a tampered row, refused before any write.
+        let err = handle_skill_export(
             &conn,
             &json!({"skill_id": id, "target_folder": target.to_str().unwrap()}),
             None,
         )
-        .unwrap();
-        assert_eq!(v["exported"], json!(true));
+        .unwrap_err();
+        assert_eq!(err, crate::errors::msg::skill_digest_mismatch(id));
+        assert!(!target.exists(), "nothing written for a refused skill");
     }
 
     #[test]
-    fn export_with_malformed_allowed_tools_json_skips() {
+    fn export_refuses_malformed_allowed_tools_json_8834() {
         let (conn, dir) = open_db();
         let body_blob = zstd::encode_all(b"body".as_slice(), 3).unwrap();
         let digest = vec![0u8; 32];
@@ -1415,17 +1522,18 @@ mod tests {
             params![id, body_blob, digest],
         )
         .unwrap();
+        reseal(&conn, id);
         let target = dir.path().join("export-bad-tools");
-        let v = handle_skill_export(
+        // #8834 — allowed_tools is digest-bound: a column that does not parse
+        // is a tampered row, refused before any write.
+        let err = handle_skill_export(
             &conn,
             &json!({"skill_id": id, "target_folder": target.to_str().unwrap()}),
             None,
         )
-        .unwrap();
-        assert_eq!(v["exported"], json!(true));
-        let md = std::fs::read_to_string(target.join("SKILL.md")).unwrap();
-        // No allowed_tools section should appear (parse failed).
-        assert!(!md.contains("allowed_tools:"));
+        .unwrap_err();
+        assert_eq!(err, crate::errors::msg::skill_digest_mismatch(id));
+        assert!(!target.exists(), "nothing written for a refused skill");
     }
 
     #[test]
@@ -1441,6 +1549,7 @@ mod tests {
             params![id, empty_tools, body_blob, digest],
         )
         .unwrap();
+        reseal(&conn, id);
         let target = dir.path().join("export-empty-tools");
         let _ = handle_skill_export(
             &conn,
@@ -1469,6 +1578,7 @@ mod tests {
             params![id, meta, body_blob, digest],
         )
         .unwrap();
+        reseal(&conn, id);
         let target = dir.path().join("export-meta-array");
         let _ = handle_skill_export(
             &conn,
@@ -1489,6 +1599,46 @@ mod tests {
             reparsed.metadata["tags"],
             json!(["a", "b"]),
             "array preserved"
+        );
+    }
+
+    #[test]
+    fn export_keeps_the_scope_binding_and_strips_other_reserved_keys_8832() {
+        // #8832 — the scope binding is part of the digest and register
+        // accepts it back for the principal it names, so export writes it
+        // (the promote → export → re-register digest stays identical). Every
+        // other reserved key is substrate state register refuses: stripped.
+        let (conn, dir) = open_db();
+        let body_blob = zstd::encode_all(b"body".as_slice(), 3).unwrap();
+        let digest = vec![0u8; 32];
+        let id = "ckkkk-0000-0000-0000-00000000000c";
+        let binding = json!({"scope": "private", "agent_id": "ai:owner"});
+        let meta = serde_json::json!({
+            "author": "alice",
+            "_visibility": binding,
+            "_signed_state": "x",
+        })
+        .to_string();
+        conn.execute(
+            "INSERT INTO skills (id, namespace, name, description, metadata, body_blob, digest, created_at) \
+             VALUES (?1, 'ns', 'name', 'd', ?2, ?3, ?4, 0)",
+            params![id, meta, body_blob, digest],
+        )
+        .unwrap();
+        reseal(&conn, id);
+        let target = dir.path().join("export-reserved");
+        handle_skill_export(
+            &conn,
+            &json!({"skill_id": id, "target_folder": target.to_str().unwrap()}),
+            None,
+        )
+        .unwrap();
+        let md = std::fs::read_to_string(target.join("SKILL.md")).unwrap();
+        let reparsed = crate::parsing::skill_md::parse(&md).expect("exported SKILL.md re-parses");
+        assert_eq!(
+            reparsed.metadata,
+            json!({"author": "alice", "_visibility": binding}),
+            "{md}"
         );
     }
 }
@@ -1527,6 +1677,8 @@ mod jail_3357_tests {
             params![id, body_blob, digest],
         )
         .expect("insert skill");
+        // #8834 — the export read path verifies the digest; seal the fixture.
+        crate::mcp::reseal_skill_digest_for_tests(conn, id).expect("reseal");
     }
 
     // ---- root resolution (fail-closed) ----------------------------------
@@ -1700,6 +1852,7 @@ mod jail_3357_tests {
             &json!({"skill_id": id, "target_folder": escape.to_str().expect("utf8")}),
             None,
             &root,
+            None,
         )
         .expect_err("out-of-root export must be refused");
         assert!(
@@ -1720,6 +1873,7 @@ mod jail_3357_tests {
             &json!({"skill_id": id, "target_folder": "out"}),
             None,
             &missing,
+            None,
         )
         .expect_err("an unresolvable root must fail closed");
         assert!(
@@ -1744,6 +1898,7 @@ mod jail_3357_tests {
             &json!({"skill_id": id, "target_folder": "nested/exported"}),
             None,
             &root,
+            None,
         )
         .expect("in-root relative export must succeed");
         assert_eq!(v["exported"], json!(true));
@@ -1764,6 +1919,7 @@ mod jail_3357_tests {
             &json!({"skill_id": id, "target_folder": target.to_str().expect("utf8")}),
             None,
             &root,
+            None,
         )
         .expect("in-root absolute export must succeed");
         assert_eq!(v["exported"], json!(true));
@@ -1789,6 +1945,7 @@ mod jail_3357_tests {
             &json!({"skill_id": id, "target_folder": root.to_str().expect("utf8")}),
             None,
             &root,
+            None,
         )
         .expect("the root itself must be exportable");
         assert_eq!(v["exported"], json!(true));
@@ -1831,6 +1988,8 @@ mod jail_3762_tests {
             params![id, body_blob, digest],
         )
         .expect("insert skill");
+        // #8834 — the export read path verifies the digest; seal the fixture.
+        crate::mcp::reseal_skill_digest_for_tests(conn, id).expect("reseal");
     }
 
     #[test]
@@ -1846,6 +2005,7 @@ mod jail_3762_tests {
             &json!({"skill_id": id, "target_folder": "out"}),
             None,
             &missing,
+            None,
         )
         .expect_err("an unresolvable root must fail closed");
         assert!(
@@ -1879,6 +2039,7 @@ mod jail_3762_tests {
             &json!({"skill_id": id, "target_folder": outside_spelling}),
             None,
             &root,
+            None,
         )
         .expect_err("an out-of-root target must be refused");
         assert!(
@@ -1913,6 +2074,7 @@ mod jail_3762_tests {
             &json!({"skill_id": id, "target_folder": "nested/3762-ok"}),
             None,
             &root,
+            None,
         )
         .expect("in-root relative export must succeed");
         assert_eq!(v["exported"], json!(true));
