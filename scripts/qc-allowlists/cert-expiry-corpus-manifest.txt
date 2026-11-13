@@ -81,6 +81,11 @@ case_7977_probe_mutants GREEN
 case_7988_prefix_replay GREEN
 case_7989_unreadable_escaper_source GREEN
 case_7991_exact_corpus_size GREEN
+cell_6124_edited_record_red GREEN
+cell_6124_expired_amendment_green GREEN
+cell_6124_void_amendment_green GREEN
+cell_6124_void_amendment_missing_name_red GREEN
+cell_6124_void_rebind_red GREEN
 cell_a_watched_path_red GREEN
 cell_b_watched_path_with_reissue_green GREEN
 cell_c_identifier_add_red GREEN
@@ -131,6 +136,7 @@ cell_v2_non_ancestor_bind_different_tree_red GREEN
 cell_w_unparseable_status_red GREEN
 cell_x1_decoy_status_line_red GREEN
 cell_x2_decoy_binds_line_red GREEN
+cell_x3_duplicate_status_text_pinned_red GREEN
 cell_y_cert_doc_deleted_red GREEN
 cell_z2_reformat_plus_wire_change_red GREEN
 cell_z_banner_reformat_green GREEN

@@ -2,7 +2,7 @@
 
 # ai-memory v1.0.0 — Enterprise-Federation Certification (canonical trust boundary)
 
-> **§5.4(1) canonical status.** This document is the **single canonical
+> §5.4(1) canonical status. This document is the **single canonical
 > trust-boundary statement** for the ai-memory v1.0.0 enterprise-federation
 > certified configuration. **Where any other document conflicts with this
 > one on the trust boundary, this document supersedes it** — including
@@ -22,7 +22,7 @@ certification and triggers re-cert** (see §7).
 
 ## STATUS — **VOID as of 2026-10-28** (§7 fired again by #2967, `src/federation/receive_auth.rs`, recorded in the §7 firing ledger; no live claim; the certification had already EXPIRED as of 2026-10-07 when §7 fired: 4 watched federation-wire files changed after the `385da3a05` bind; re-measurement and re-issue pending under WP-B1, #6063; the last LIVE claim was the 2026-10-02 re-issue at `385da3a05`)
 
-> **Amendment (2026-10-07, #6063 WP-B1 — §7 EXPIRY RECORD, certification EXPIRED).**
+> Amendment (2026-10-07, #6063 WP-B1 — §7 EXPIRY RECORD, certification EXPIRED).
 > The federation certification **expired** per §7 when four §7-watched
 > federation-wire files changed after the bind `385da3a05`
 > (`src/federation/mod.rs`, `src/federation/ns_meta_ancestor_gate.rs`,
@@ -38,7 +38,7 @@ certification and triggers re-cert** (see §7).
 > run after code freeze. Re-binding to a newer SHA without that re-measurement is
 > forbidden (#3899).
 >
-> **Amendment (2026-10-08, #6116 - second §7 record for the #4507 doc-comment retargets).**
+> Amendment (2026-10-08, #6116 - second §7 record for the #4507 doc-comment retargets).
 > Two §7-watched federation-wire files changed again after the 2026-10-07
 > expiry record above, through the #4507 citation-retarget chain
 > (`6c6634d66`, `015b44777`, `2a18bffe2`, merged at `cd3cb6140`):
@@ -79,7 +79,7 @@ certification and triggers re-cert** (see §7).
 > for the evidence table and the behaviour-change paragraph.
 
 > **Landing-SHA note (why the binding SHA and the SHA you are reading
-> first differ).** The certification **binds to** `e22bc93c`, but the
+> first differ).** The certification is bound to `e22bc93c`, but the
 > original artifacts — this document, the removal-proof harness, and the
 > `enterprise-deployment.md` supersession note — could not exist at
 > `e22bc93c`, because they are what got committed *on top of* it. They
@@ -347,7 +347,8 @@ $ git diff --stat e22bc93c 580d8427
 > 2026-08-28 and 2026-09-02 amendments) was closed by #3556, which hardened
 > `check-cert-expiry.sh` so predicate (B) requires the banner itself to move
 > and predicate (C) fails a LIVE banner over watched drift. **Discharged by
-> full re-issue**, not by argument.
+> full re-issue**, not by argument. (The amendment ledger #6124 added later
+> applies only while STATUS is VOID or EXPIRED and discharges nothing; §7.)
 >
 > §5.4(2)–(5) were **re-run at `92209ad91`**, not carried forward — the same
 > batch moved `doctor --posture` check #15 (#3866) and the pg connect funnel,
@@ -383,7 +384,7 @@ $ git diff --stat e22bc93c 580d8427
 > **§5.4(3)** pg+AGE and the self-hosted federation lanes are cited from CI on
 > PR #3903, whose merge commit carries this exact tree.
 >
-> **Amendment (2026-08-13 re-capture).** The original three-file,
+> Amendment (2026-08-13 re-capture). The original three-file,
 > docs/harness-only delta above describes the CERTIFICATION LANDING at
 > `580d8427` and still holds for it: the certified binary at `580d8427`
 > IS the binary at `e22bc93c`. The subsequent remediation wave
@@ -400,7 +401,7 @@ $ git diff --stat e22bc93c 580d8427
 > legs must build at the SHA `SANITIZATION.md` names, not at `e22bc93c`
 > (which yields the pre-#2918 16-check posture).
 >
-> **Amendment (2026-08-26, PR #3243).** `src/federation/receive.rs`
+> Amendment (2026-08-26, PR #3243). `src/federation/receive.rs`
 > catch-up/PULL now runs the stored-namespace probe the push lane
 > already ran fail-closed (#3195): a probe **error** skips AND halts
 > the watermark (transient → re-pull); a scope **refusal** skips
@@ -412,7 +413,7 @@ $ git diff --stat e22bc93c 580d8427
 > federation-wire path changed; this amendment discharges it. §5.4(2)–
 > (5) posture / pg+AGE / adversarial evidence is unchanged.
 >
-> **Amendment (2026-08-28, #3291 @ `eb7e7f5a`).** Two §7-watched
+> Amendment (2026-08-28, #3291 @ `eb7e7f5a`). Two §7-watched
 > federation-wire paths changed when #3291 landed:
 > `src/handlers/federation_receive.rs` and
 > `src/handlers/federation_signing_check.rs` (`+1` each). Both now
@@ -424,15 +425,15 @@ $ git diff --stat e22bc93c 580d8427
 > certified control removed. The §7 re-cert trigger fired because
 > those watched paths changed (the merge was not a PR, so
 > `check-cert-expiry.sh` first ran on the push of `eb7e7f5a`). This
-> amendment discharges it. **This amendment does NOT re-mint the
-> certification** (bind remains `e22bc93c`; the 2026-08-12 5-agent
+> amendment discharges it. This amendment does NOT re-mint the
+> certification (bind remains `e22bc93c`; the 2026-08-12 5-agent
 > adversarial ratification stands). §5.4(2)–(5) re-attested at
 > `eb7e7f5a`: posture / adversarial / removal-proof harnesses are
 > unchanged; Certified Postgres + AGE + pgvector (#2548) was GREEN on
 > parent `e41f9480` (no stack/pin/workflow change in #3291), so
 > §5.4(3) holds.
 >
-> **Amendment (2026-08-28, #3299).** The §7-watched path
+> Amendment (2026-08-28, #3299). The §7-watched path
 > `src/federation/receive_auth.rs` now screens inbound MEMORY metadata
 > with a receive-only carve-out: attestation STRING leaves under `_b64`
 > / known keys are preserved (the #1844 envelope); hostile OBJECT
@@ -441,13 +442,13 @@ $ git diff --stat e22bc93c 580d8427
 > bypass #3269 left on the memory funnel. Additive security-hardening —
 > no wire/schema/`AI_MEMORY_FED_*` identifier add/remove/rename, no
 > certified control removed. This amendment discharges the §7 trigger.
-> **This amendment does NOT re-mint the certification** (bind remains
+> This amendment does NOT re-mint the certification (bind remains
 > `e22bc93c`; the 2026-08-12 5-agent adversarial ratification stands).
 > §5.4(2)–(5) re-attested at `00dd0162`: Certified Postgres + AGE +
 > pgvector (#2548) GREEN on that tip (run 33182767671); live stack
 > 18.6 / 1.8.0 / 0.8.6. No stack/pin/workflow change.
 >
-> **Amendment (2026-08-28, Wave-2 B5).** The §7-watched paths
+> Amendment (2026-08-28, Wave-2 B5). The §7-watched paths
 > `src/handlers/federation_receive.rs` and
 > `src/handlers/federation_signing_check.rs` now refuse `/sync/push`
 > writes at ONE record-stop CHOKEPOINT (sqlite:
@@ -458,20 +459,20 @@ $ git diff --stat e22bc93c 580d8427
 > MCP-stdio write planes were still ungated — Wave-2 B6). Additive
 > security-hardening — no wire/schema/`AI_MEMORY_FED_*` identifier
 > add/remove/rename, no certified control removed. This amendment
-> discharges the §7 trigger. **This amendment does NOT re-mint the
-> certification** (bind remains `e22bc93c`; the 2026-08-12 5-agent
+> discharges the §7 trigger. This amendment does NOT re-mint the
+> certification (bind remains `e22bc93c`; the 2026-08-12 5-agent
 > adversarial ratification stands).
 >
-> **Amendment (2026-08-29, Wave-2 B10 — cert-doc honesty, not a §7
-> trigger).** Record-stop *propagation* latency is scoped: SAME-STORE
+> Amendment (2026-08-29, Wave-2 B10 — cert-doc honesty, not a §7
+> trigger). Record-stop *propagation* latency is scoped: SAME-STORE
 > (the process that engaged the stop; sqlite in-process flag) is the
 > ≤100 ms R45 actuator shape. Cross-node / postgres-pool honor is
 > bounded by `RECORD_STOP_REFRESH_TTL_MS = 1000` (~1 s, fail-closed
 > single-flight CAS, #3276). No §7-watched path and no
-> `AI_MEMORY_FED_*` identifier changed. **This amendment does NOT
-> re-mint the certification** (bind remains `e22bc93c`).
+> `AI_MEMORY_FED_*` identifier changed. This amendment does NOT
+> re-mint the certification (bind remains `e22bc93c`).
 >
-> **Amendment (2026-08-28, Wave-2 B4).** The §7-watched path
+> Amendment (2026-08-28, Wave-2 B4). The §7-watched path
 > `src/handlers/federation_receive.rs` now receive-redacts author-less
 > catchup-pull rows (`attest_inbound_pull_memory`) before apply: omitting
 > `metadata.agent_id` no longer skips the secret screen, and a
@@ -481,11 +482,11 @@ $ git diff --stat e22bc93c 580d8427
 > credential-shaped `*_b64` string leaf cannot egress on catchup-pull.
 > Additive security-hardening — no wire/schema/`AI_MEMORY_FED_*`
 > identifier add/remove/rename, no certified control removed. This
-> amendment discharges the §7 trigger. **This amendment does NOT re-mint
-> the certification** (bind remains `e22bc93c`; the 2026-08-12 5-agent
+> amendment discharges the §7 trigger. This amendment does NOT re-mint
+> the certification (bind remains `e22bc93c`; the 2026-08-12 5-agent
 > adversarial ratification stands).
 >
-> **Amendment (2026-08-28, Wave-1 C3).** Cert-doc honesty only — no
+> Amendment (2026-08-28, Wave-1 C3). Cert-doc honesty only — no
 > federation-wire / `AI_MEMORY_FED_*` identifier add/remove/rename.
 > (a) §6 now **names** equivocation runtime detection/eviction as
 > v1.x-deferred ([#2002](https://github.com/alphaonedev/ai-memory-mcp/issues/2002));
@@ -493,21 +494,21 @@ $ git diff --stat e22bc93c 580d8427
 > [`33182767671`](https://github.com/alphaonedev/ai-memory-mcp/actions/runs/33182767671)
 > (head `00dd0162`, Certified Postgres + AGE + pgvector, conclusion
 > `success`). (d) §1/§2/§7 bare-line anchors refreshed to the current
-> tree (symbols intact; numbers had rotted). **This amendment does NOT
-> re-mint the certification** (bind remains `e22bc93c`).
+> tree (symbols intact; numbers had rotted). This amendment does NOT
+> re-mint the certification (bind remains `e22bc93c`).
 >
-> **Amendment (2026-08-29, C3 follow-up — cert-55 20-check recapture).**
+> Amendment (2026-08-29, C3 follow-up — cert-55 20-check recapture).
 > Four-leg `doctor --posture enterprise-federation` evidence re-captured
 > at certified tip `23f943ca` (20 checks measured: bare 10 FAIL / 10 PASS exit 2;
 > hardened non-sqlcipher 2 FAIL / 18 PASS exit 2 with 27/27 knobs at
 > floor; boot-gate armed exit 1; sqlcipher certified 20 PASS exit 0).
 > Committed under `docs/compliance/evidence/cert-55/`. No federation-wire
-> / `AI_MEMORY_FED_*` identifier add/remove/rename. **This amendment does
-> NOT re-mint the certification** (bind remains `e22bc93c`). `cert-54/`
+> / `AI_MEMORY_FED_*` identifier add/remove/rename. This amendment does
+> NOT re-mint the certification (bind remains `e22bc93c`). `cert-54/`
 > remains the removal-proof evidence of record.
 >
-> **Amendment (2026-08-29, B17-B3 federation-wire HARDENING @
-> `eaa56647`).** Two federation-identity fail-closed paths landed with
+> Amendment (2026-08-29, B17-B3 federation-wire HARDENING @
+> `eaa56647`). Two federation-identity fail-closed paths landed with
 > B17-B3 (#3229 / #3232 / #3233 / #3234). The §7-watched path
 > `src/federation/receive.rs` now **halts the catchup watermark** on a
 > recoverable skip of a *delivered* row (namespace-scope or content
@@ -524,11 +525,11 @@ $ git diff --stat e22bc93c 580d8427
 > `e22bc93c`. The §7 re-cert trigger fired because a watched
 > federation-wire path changed (B17-B3 merged without this ledger
 > entry; `check-cert-expiry.sh` first ran on the push of `eaa56647`).
-> This amendment discharges it against `eaa56647`. **This amendment
-> does NOT re-mint the certification** (bind remains `e22bc93c`; the
+> This amendment discharges it against `eaa56647`. This amendment
+> does NOT re-mint the certification (bind remains `e22bc93c`; the
 > 2026-08-12 5-agent adversarial ratification stands).
 >
-> **Amendment (2026-09-02, #3422 @ `048ee7b9`, pushed in `e35ce473`).** The
+> Amendment (2026-09-02, #3422 @ `048ee7b9`, pushed in `e35ce473`). The
 > §7-watched path `src/handlers/federation_receive.rs` changed by **85
 > inserted lines, all inside `#[cfg(test)] mod tests`** (one regression test,
 > `pg_authored_row_reverifies_after_the_timestamptz_round_trip_3422`): no
@@ -545,14 +546,14 @@ $ git diff --stat e22bc93c 580d8427
 > on #3422). The §7 re-cert trigger fired because a watched path changed in
 > the batch push `d41050df..e35ce473` without this ledger entry
 > (`check-cert-expiry.sh`, run 33599061386). This amendment discharges it
-> against `e35ce473`. **This amendment does NOT re-mint the certification**
+> against `e35ce473`. This amendment does NOT re-mint the certification
 > (bind remains `e22bc93c`; the 2026-08-12 5-agent adversarial ratification
 > stands). §5.4(2)–(5) will be re-attested at the post-fix-wave
 > rebuild-redeploy-retest pass on f1+f2, where the full federation battery
 > re-runs on the recompiled binary; until then the Certified Postgres + AGE +
 > pgvector (#2548) workflow is GREEN on `e35ce473` (run 33599061424).
 >
-> **Amendment (2026-09-04, #3464 proof-of-possession hardening).** The
+> Amendment (2026-09-04, #3464 proof-of-possession hardening). The
 > §7-watched federation receive paths changed to remove transported agent
 > public keys as an enrollment authority and to re-verify a presented write
 > signature against the bounded historical key candidates for its signed
@@ -571,7 +572,7 @@ $ git diff --stat e22bc93c 580d8427
 > This coder change does not re-mint the certification or approve its own
 > control; the historical certification bind remains `e22bc93c`.
 >
-> **Amendment (2026-09-05, #3502 — §7 EXPIRY RECORD, certification VOID).**
+> Amendment (2026-09-05, #3502 — §7 EXPIRY RECORD, certification VOID).
 > Three §7-watched federation-wire paths changed:
 > `src/federation/receive_auth.rs`,
 > `src/handlers/federation_receive.rs` and
@@ -600,8 +601,8 @@ $ git diff --stat e22bc93c 580d8427
 > [**#3501**](https://github.com/alphaonedev/ai-memory-mcp/issues/3501).
 > Historical bind remains `e22bc93c`.
 >
-> **Amendment (2026-09-07, #3515 — test-fixture seeding, not a §7 wire
-> change; Conductor record on the READY #4 chain merge).** Two §7-watched
+> Amendment (2026-09-07, #3515 — test-fixture seeding, not a §7 wire
+> change; Conductor record on the READY #4 chain merge). Two §7-watched
 > paths changed, `src/federation/mod.rs` (+37) and
 > `src/federation/push_dlq.rs` (+6), and BOTH deltas live entirely inside
 > `#[cfg(test)]` modules (`federation::tests` and
@@ -620,8 +621,8 @@ $ git diff --stat e22bc93c 580d8427
 > pending the #3502 re-validation and re-issue tracked by #3501.**
 > Historical bind remains `e22bc93c`.
 >
-> **Amendment (2026-09-07, #3472 — wake-plane DISCLOSURE, not a §7
-> trigger).** §6 now names the v1.0.0 wake plane (EPIC #3466) as
+> Amendment (2026-09-07, #3472 — wake-plane DISCLOSURE, not a §7
+> trigger). §6 now names the v1.0.0 wake plane (EPIC #3466) as
 > transport-only, content-free, and outside this certification, and §4's
 > live-harness reconciliation records the `wake_backstop_always_armed_3472`
 > removability row (14 -> 15 live rows). **Documentation and one harness MAP
@@ -630,8 +631,8 @@ $ git diff --stat e22bc93c 580d8427
 > renamed, no schema rung was cut, and no certified control was removed or
 > weakened. The wake plane consults no federation verdict and no federation
 > verdict consults it, so the coverage claims in §1-§4 are unaffected: the
-> entry NARROWS what a reader may bet on rather than widening it. **This
-> amendment does NOT re-mint the certification** (bind remains `e22bc93c`;
+> entry NARROWS what a reader may bet on rather than widening it. This
+> amendment does NOT re-mint the certification (bind remains `e22bc93c`;
 > the 2026-08-12 5-agent adversarial ratification stands, and the #3502
 > expiry record above is untouched — re-issue remains the #3501 Conductor
 > task).
@@ -1166,7 +1167,7 @@ stack. (Those specific dated runs executed the historical **18.4 / 1.7.0 /
 0.8.7** — is the tier this same workflow asserts in-PR on `release/**` from
 the SSOT pins, per the STANDARD data-tier note below.)
 
-> **Evidence status, stated plainly (2026-08-28 Wave-1 C3).** The
+> Evidence status, stated plainly (2026-08-28 Wave-1 C3). The
 > then-current triple **PG 18.6 / AGE 1.8.0 / pgvector at 0.8.6** is executed GREEN:
 > run [`33182767671`](https://github.com/alphaonedev/ai-memory-mcp/actions/runs/33182767671)
 > (`Certified Postgres + AGE + pgvector tier (#2548)`, push of
@@ -1176,8 +1177,8 @@ the SSOT pins, per the STANDARD data-tier note below.)
 > at the superseded **18.4 / 1.7.0 / 0.8.5** round. The
 > `Assert certified stack versions` step still hard-fails on pin drift.
 
-> **pgvector pin advance from 0.8.5 to 0.8.6 (2026-08-14, honest evidence
-> status).** The certified pgvector pin was advanced from `0.8.5-1.pgdg13+1`
+> pgvector pin advance from 0.8.5 to 0.8.6 (2026-08-14, honest evidence
+> status). The certified pgvector pin was advanced from `0.8.5-1.pgdg13+1`
 > to `0.8.6-1.pgdg13+1` (operator-directed; the `0.8.5` pgdg `.deb` had
 > drifted out of the current snapshot, and `0.8.6` is what the pgdg13 repo
 > now builds). **The three GREEN runs cited above (`31601974424`,
@@ -1586,7 +1587,7 @@ is observed:**
    mismatch against those pins.
 
 **Expiry / re-cert trigger.** This certification binds to the SHA in the
-**Binds to:** line at the head of this document (historical mint `e22bc93c`;
+bound-SHA line at the head of this document (historical mint `e22bc93c`;
 the re-issue chain is recorded in the "Status at …" sections below — the
 SHA is deliberately NOT restated here, because a restated bind drifted six
 re-issues behind the head line before #3966 caught it, and the gate's
@@ -1614,6 +1615,44 @@ the one-line remedy the failure names. Its reported context is declared in
 `scripts/qc-allowlists/required-contexts-release.txt`; until the
 operator-gated branch-protection API call adds it to the live required
 set, the gate is a red check, not a merge block.)
+
+Amendment ledger (rule B, #6124). While the STATUS line says VOID or
+EXPIRED at both ends of a change, re-issue is not possible, so the banner
+cannot move. A watched-surface change then passes only if the same change
+appends one or more NEW dated records to the amendment ledger at the end
+of this document, and those records together name exactly every changed
+watched path and every added or removed `AI_MEMORY_FED_*` identifier. A
+missing name, an extra name, a record dated before 2026-11-13 or after the
+UTC date of the runner that judges the change plus one day, a record dated
+before an earlier record (equal days are allowed), or an edited, reordered or
+removed earlier record fails. The ledger is append-only. An amendment never
+discharges the certification: the STATUS word stays VOID or EXPIRED, LIVE
+behaviour is unchanged, and while both ends say VOID or EXPIRED any change
+of the bound SHA is refused, a drop to no bind included. The STATUS line is
+frozen while the certification is not LIVE: on an amendment pass it is
+byte-identical at both ends, except that the status word alone may change
+between VOID and EXPIRED (which still needs exact records); the reason for a
+change goes in the ledger record, never in the STATUS line (3-agent vote
+71472661). Before any pass decision the gate proves the banner clean at both
+ends: exactly one STATUS line and at most one Binds-to line in the strict
+form, and no other line that reads like either one. The ledger is a strict
+subset of Markdown, and the gate refuses anything it does not recognise.
+That covers front matter, a fence still open at the ledger marker, a fence
+inside a container or indented, an HTML block other than a one-line comment,
+an HTML comment left open on its line or a second comment opener on one line,
+a line over 4096 bytes above the ledger, a heading that names an amendment
+outside the ledger, a fence body, setext heading, emphasis, link reference
+definition or inline HTML naming an amendment or a status above the ledger,
+and control, format, separator, private-use or unassigned characters anywhere
+in the document. The canonical form is the marker line, a blank line, then
+the records, one blank line between records and no blank line at the end of
+the file. Each record is the heading `### Amendment YYYY-MM-DD`, a blank
+line, then its item lines in the order the gate sorts them: '- id:' lines
+before '- path:' lines, each group in ascending byte order, no duplicates.
+A '- path:' item names one section 7 watched path spelled in printable ASCII
+with no space; a watched path outside that form cannot be named and needs a
+re-issue. Example record: `### Amendment 2026-11-14`, a blank line,
+`- id: AI_MEMORY_FED_EXAMPLE_FLAG`, `- path: src/federation/peer.rs`.
 
 **Re-cert trigger — FIRED (12 §7-watched federation-wire files changed
 `ab6f2175` → `f32c18dad`) and DISCHARGED by re-issue (`f32c18dad`,
@@ -1776,8 +1815,8 @@ the shipped federation posture is UNCHANGED from `e22bc93c`.
 re-issue ([#3502](https://github.com/alphaonedev/ai-memory-mcp/issues/3502),
 2026-09-05, branch `hotfix/3502-v97-acceptance-and-attest-parity`, wire-path
 commit `7e8f96bef9c4ccd48aee7f8552fe9e7a9f327ceb`, this record its second
-commit).** This is the §7 expiry record the top-of-document **STATUS —
-VOID / EXPIRED as of 2026-09-05** banner points at.
+commit).** This is the §7 expiry record the top-of-document STATUS —
+VOID / EXPIRED as of 2026-09-05 banner points at.
 
 *Watched federation-wire paths changed (all three):*
 
@@ -2080,7 +2119,7 @@ bound determination is the 2026-10-02 re-issue at
 the last LIVE claim. Gate output at this change: `check-cert-expiry: PASS —
 federation-wire surface changed AND cert doc re-issued/voided in the same
 change (...; banner EXPIRED - → VOID -)` and `check-cert-expiry: banner
-STATUS=VOID — the doc makes no live claim; nothing to hold it to`. The §8
+STATUS (VOID) — the doc makes no live claim; nothing to hold it to`. The §8
 statuses below are historical records of earlier binds, not a live claim.
 
 ---
@@ -2093,9 +2132,9 @@ statuses below are historical records of earlier binds, not a live claim.
 > status that opens the list below is an earlier, superseded bind, and the
 > re-issues recorded in the banner and the §7 firing ledger postdate it.
 
-**Status at `f32c18dadf8a659567960747cc2802186bac9de9` (2026-09-21
+Status at `f32c18dadf8a659567960747cc2802186bac9de9` (2026-09-21
 re-issue; the v1.0.0 promotion candidate; supersedes the 2026-09-12 #3607
-bind at `ab6f2175` below).** The seven §5.4 falsifiability requirements hold
+bind at `ab6f2175` below). The seven §5.4 falsifiability requirements hold
 on this SHA — §5.4(1) canonical doc = this document (LIVE banner); §5.4(2)
 machine-checked posture = CLOSED at **22 checks** (`cert-f32c18dad/`, four
 legs re-measured on release builds of this tip, exits 2/2/1/0, certified
@@ -2108,10 +2147,10 @@ disconfirmation = §7, discharged for the 12-file wire-path drift
 `ab6f2175 → f32c18dad` by this re-issue's acceptance battery. The 2026-09-12
 #3607 bind at `ab6f2175` below is superseded and kept as history.
 
-**Status at `ab6f2175077afd47e0a0ac65d5121db97e1d22d5` (2026-09-12
+Status at `ab6f2175077afd47e0a0ac65d5121db97e1d22d5` (2026-09-12
 re-bind, [#3607](https://github.com/alphaonedev/ai-memory-mcp/issues/3607);
 #3204 federation receive/signing-check hardening now certified; supersedes the 2026-09-11
-status at `b0483115` below).** The seven §5.4 falsifiability requirements hold on this SHA —
+status at `b0483115` below). The seven §5.4 falsifiability requirements hold on this SHA —
 §5.4(1) canonical doc = this document (LIVE banner); §5.4(2) machine-checked posture =
 CLOSED at **22 checks** (`cert-3607/`, four legs re-measured on release builds of this tip);
 §5.4(7) disconfirmation = §7, discharged for the #3204 watched-path change by this re-bind's
@@ -2119,9 +2158,9 @@ both-backend acceptance battery (`docs/compliance/evidence/cert-3607/`). The 202
 re-issue at `b0483115`, the #3595 re-issue at `ad60bead` and the 2026-08-12 mint at
 `e22bc93c` remain historical ratification records (next paragraphs).
 
-**Status at `b048311595caa94db435c3dd9b59b02ea4b765f2` (2026-09-11
+Status at `b048311595caa94db435c3dd9b59b02ea4b765f2` (2026-09-11
 re-issue, [#3607](https://github.com/alphaonedev/ai-memory-mcp/issues/3607);
-#3549 authority resolver, #3553 check #21 and #3199 check #22 certified; superseded by the re-bind above).**
+#3549 authority resolver, #3553 check #21 and #3199 check #22 certified; superseded by the re-bind above).
 The seven §5.4 falsifiability requirements hold on this SHA — §5.4(1)
 canonical doc = this document (LIVE banner); §5.4(2) machine-checked posture =
 CLOSED at **22 checks** (`cert-3607/`, four legs re-measured on release
@@ -2131,9 +2170,9 @@ acceptance battery (`docs/compliance/evidence/cert-3607/`). The earlier
 same-day #3595 re-issue at `ad60bead` and the 2026-08-12 mint at `e22bc93c`
 remain historical ratification records (next paragraphs).
 
-**Status at `ad60beadf602823c4451ff82067f62091aba9a04` (2026-09-11
+Status at `ad60beadf602823c4451ff82067f62091aba9a04` (2026-09-11
 re-issue, [#3595](https://github.com/alphaonedev/ai-memory-mcp/issues/3595);
-#3582 wire contract certified; superseded by the #3607 re-issue above).** The seven §5.4 falsifiability
+#3582 wire contract certified; superseded by the #3607 re-issue above). The seven §5.4 falsifiability
 requirements hold on this SHA as follows — §5.4(1) canonical doc = this
 document (LIVE banner); §5.4(2) machine-checked posture = CLOSED at 20
 checks (`cert-55/`, unchanged count; #3582 added no posture row);
@@ -2142,10 +2181,10 @@ change by this re-issue's both-backend acceptance battery
 (`docs/compliance/evidence/cert-3595/`). The 2026-08-12 mint at
 `e22bc93c` remains the historical ratification record (next paragraph).
 
-**Status at `e22bc93c` (original artifacts at `580d8427`; this re-issue
+Status at `e22bc93c` (original artifacts at `580d8427`; this re-issue
 amended through the merged 2026-08-13 remediation wave — #2915-#2920,
 #2925-#2927, #2929 — with posture legs re-captured 2026-08-29 at
-certified tip `23f943ca`):** the
+certified tip `23f943ca`): the
 seven §5.4 falsifiability requirements are met as follows — §5.4(1)
 canonical doc = this document; §5.4(2) machine-checked posture = CLOSED
 (four-leg localhost proof **executed and committed at 20 checks** in
@@ -2206,3 +2245,5 @@ ruling, ratified under adversarial review.
 | F8 — boot-refusal opt-in / unattested; doctor attests its own process; `FED_REQUIRE_POLICY_CURRENT=0` escapes | **PARTIALLY CLOSED 2026-08-13** — #2911 items 1-2 (PR #2918): posture checks #17/#18 self-attest the boot gate and pin FED-RQ-03, and `posture-hardened-boot-refusal.out` demonstrates the armed refusal. Items 3-4 (pin-file parse; doctor attests its own process) remain OPEN in #2911. |
 | F9 — campaign docs on PG16/AGE1.6.0/pgvector0.8.4 vs certified PG18.4/AGE1.7.0/pgvector0.8.5 | §3 stack-evidence note. Campaign-doc refresh: [#2913](https://github.com/alphaonedev/ai-memory-mcp/issues/2913). |
 | F10 LOWs — landing SHA, signer wording, omitted lanes, encryption-gate conflation, §4→§6 numbering | This re-issue. `docs/at-a-glance.html` v0.9-era copy: #2913 item 1 (out of this document's file set). |
+
+## Amendment ledger (rule B, append-only)

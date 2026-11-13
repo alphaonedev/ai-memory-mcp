@@ -66,6 +66,7 @@ SENTENCE = (
 )
 MOD_RS = "src/federation/mod.rs"
 UNRELATED_RS = "src/unrelated.rs"
+RECV_6124 = "src/handlers/federation_receive.rs"  # second watched path of the #6124 cells
 LIVE_ID = "AI_MEMORY_FED_REQUIRE_SIG"
 
 
@@ -1062,6 +1063,78 @@ class Cells(CorpusBase):
         self.t.expect_green("t", "unrelated change over a VOID banner", s.repo, void, over)
         self.settle()
 
+    # #6124: while the cert stays VOID/EXPIRED, a NEW dated amendment record that names
+    # exactly the changed watched paths and FED ids is the only honest pass for rule (B).
+    LEDGER_6124 = "\n## Amendment ledger (rule B, append-only)\n"
+    DAY_6124 = "2026-11-13"
+
+    def ledger_6124(self, *records):
+        out = self.LEDGER_6124
+        for day, names in records:
+            out += f"\n### Amendment {day}\n\n" + "".join(f"- path: {n}\n" for n in sorted(names))
+        return out
+
+    def amend_6124(self, s, status, wire, records):
+        for rel in wire:
+            s.fx.write(rel, "// amended\n", append=True)
+        s.fx.banner(status, s.genesis, extra=self.ledger_6124(*records))
+        return s.fx.commit([*wire, CERT_DOC], "wire change + amendment record")
+
+    @expect(GREEN)
+    def cell_6124_void_amendment_green(self):
+        s = self.scene()
+        void = self.void_commit(s)
+        head = self.amend_6124(s, "VOID", [MOD_RS], [(self.DAY_6124, [MOD_RS])])
+        self.t.expect_green("6124a", "VOID kept + honest amendment record", s.repo, void, head, [
+            ("a new amendment record names every change", "did not report the amendment pass"),
+            ("the certification stays VOID", "did not say the certification stays VOID")])
+        self.settle()
+
+    @expect(GREEN)
+    def cell_6124_expired_amendment_green(self):
+        s = self.scene()
+        s.fx.write(MOD_RS, "// mutate\n", append=True)
+        s.fx.banner("EXPIRED", s.genesis)
+        expired = s.fx.commit([MOD_RS, CERT_DOC], "wire change + EXPIRED record")
+        head = self.amend_6124(s, "EXPIRED", [RECV_6124], [(self.DAY_6124, [RECV_6124])])
+        self.t.expect_green("6124b", "EXPIRED kept + honest amendment record", s.repo, expired,
+                            head, [("the certification stays EXPIRED",
+                                    "did not say the certification stays EXPIRED")])
+        self.settle()
+
+    @expect(GREEN)
+    def cell_6124_void_amendment_missing_name_red(self):
+        s = self.scene()
+        void = self.void_commit(s)
+        head = self.amend_6124(s, "VOID", [MOD_RS, RECV_6124], [(self.DAY_6124, [MOD_RS])])
+        self.t.expect_red("6124c", "amendment record missing a changed path", s.repo, void, head, [
+            (f"the new amendment records do not name changed {RECV_6124}",
+             "did not name the unrecorded path")])
+        self.settle()
+
+    @expect(GREEN)
+    def cell_6124_void_rebind_red(self):
+        s = self.scene()
+        void = self.void_commit(s)
+        wire = s.edit(MOD_RS, "// mutate again\n", "wire change", append=True)
+        s.fx.banner("VOID", wire, extra=self.ledger_6124((self.DAY_6124, [MOD_RS])))
+        head = s.fx.commit([CERT_DOC], "rebind while VOID")
+        self.t.expect_red("6124d", "Binds-to changed while STATUS stays VOID", s.repo, void, head, [
+            (f"Binds-to changed ({s.genesis} → {wire}) while STATUS stays VOID",
+             "did not refuse the rebind (#6774 option B narrowed)")])
+        self.settle()
+
+    @expect(GREEN)
+    def cell_6124_edited_record_red(self):
+        s = self.scene()
+        self.void_commit(s)
+        first = self.amend_6124(s, "VOID", [MOD_RS], [(self.DAY_6124, [MOD_RS])])
+        head = self.amend_6124(s, "VOID", [RECV_6124], [("2026-11-14", [MOD_RS]),
+                                                         ("2026-11-14", [RECV_6124])])
+        self.t.expect_red("6124e", "earlier amendment record edited", s.repo, first, head, [
+            ("record 1 of the base ledger", "did not refuse the edited record")])
+        self.settle()
+
     def stale_live(self, s):
         drifted = s.edit(MOD_RS, "// mutate\n", "earlier: wire change, no re-issue", append=True)
         stale = s.edit(UNRELATED_RS, "// unrelated\n", "later: unrelated over stale LIVE", append=True)
@@ -1134,6 +1207,23 @@ class Cells(CorpusBase):
         self.t.expect_red("x1", "a decoy STATUS line above the real banner", s.repo, s.base,
                           decoy, [("not carry exactly one STATUS banner line",
                                    "did not name the duplicated banner")])
+        self.settle()
+
+    @expect(GREEN)
+    def cell_x3_duplicate_status_text_pinned_red(self):
+        # #6124 F7: two strict STATUS lines keep the #3556 duplicate text verbatim; a lone
+        # decoy with no strict line reads UNPARSEABLE (pinned in test_cert_amendment_ledger_6124).
+        s = self.scene()
+        s.fx.write(MOD_RS, "// mutate\n", append=True)
+        s.fx.banner("LIVE", s.genesis)
+        s.fx.prepend(CERT_DOC, "> ## STATUS — **VOID as of 2026-01-02**")
+        decoy = s.fx.commit([MOD_RS, CERT_DOC], "violate: second strict STATUS line + wire change")
+        self.t.expect_red("x3", "a second strict STATUS line", s.repo, s.base, decoy, [
+            (f"{CERT_DOC} at HEAD has two or more STATUS banner lines; the gate reads exactly "
+             "one and will not guess which is the banner (a decoy line above the real banner "
+             "is how a stale LIVE could be read as VOID). Remove the duplicate. Fail-closed, #3556.",
+             "did not quote the #3556 duplicate text"),
+            ("(parsed: DUPLICATE ", "did not parse the banner as DUPLICATE")])
         self.settle()
 
     @expect(GREEN)
