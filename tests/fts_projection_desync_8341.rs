@@ -83,6 +83,12 @@ fn plain_row_8341(id: &str, stamp: &str) -> ai_memory::models::Memory {
     }
 }
 
+/// One named store write of a case.
+type Step8341<'a> = (
+    &'a str,
+    Box<dyn Fn(&rusqlite::Connection) -> anyhow::Result<()>>,
+);
+
 /// Each step of a case: a store write, then the FTS invariant. Returns the
 /// first violation as (step, code).
 fn run_case_8341(case: &str, recursive: bool) -> Result<(), (String, i32)> {
@@ -91,10 +97,7 @@ fn run_case_8341(case: &str, recursive: bool) -> Result<(), (String, i32)> {
         .expect("keypair")
         .public_base64();
     let stamp = ai_memory::identity::attest::now_attestable_rfc3339();
-    let mut steps: Vec<(
-        &str,
-        Box<dyn Fn(&rusqlite::Connection) -> anyhow::Result<()>>,
-    )> = Vec::new();
+    let mut steps: Vec<Step8341<'_>> = Vec::new();
     match case {
         "plain_insert_update" => {
             let row = plain_row_8341("plain-8341", &stamp);

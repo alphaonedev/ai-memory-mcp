@@ -10,8 +10,8 @@ use rusqlite::Connection;
 // Reverse the documented additive v97-v99 migrations and the v100 index
 // migration, rather than merely stamping an otherwise-current schema v96.
 const SQLITE_V96_SHAPE: &str = "
-DROP TRIGGER agent_pubkey_history_authoritative_insert_v97;
-DROP TRIGGER agent_pubkey_history_authoritative_update_v97;
+DROP TRIGGER agent_pubkey_history_projection_guard_insert;
+DROP TRIGGER agent_pubkey_history_projection_guard_update;
 DROP TABLE agent_pubkey_history;
 DROP TABLE agent_pubkey_challenges;
 DROP VIEW inbox_namespace_aliases;

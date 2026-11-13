@@ -392,13 +392,6 @@ fn sqlite_v97_backfill_ignores_noncanonical_registration_poison_3464() {
     use base64::Engine as _;
 
     let (_f, conn) = open_db();
-    conn.execute_batch(
-        "DROP TRIGGER IF EXISTS agent_pubkey_history_authoritative_insert_v97;
-         DROP TRIGGER IF EXISTS agent_pubkey_history_authoritative_update_v97;
-         DROP TABLE agent_pubkey_challenges;
-         DROP TABLE agent_pubkey_history;",
-    )
-    .expect("restore a pre-v97 identity schema");
 
     let victim = "ai:v97-backfill-victim-3464";
     let attacker_key = keypair("ai:v97-backfill-attacker-3464").public_base64();
@@ -424,6 +417,14 @@ fn sqlite_v97_backfill_ignores_noncanonical_registration_poison_3464() {
         ..ai_memory::models::Memory::default()
     };
     ai_memory::db::insert(&conn, &poison).expect("seed earlier noncanonical poison row");
+    // #8341: the rows are seeded through the tip funnels (which read the
+    // ledger to project); the pre-v97 identity schema is restored in two
+    // steps around them so the raw writes model the legacy bytes.
+    conn.execute_batch(
+        "DROP TRIGGER IF EXISTS agent_pubkey_history_projection_guard_insert;
+         DROP TRIGGER IF EXISTS agent_pubkey_history_projection_guard_update;",
+    )
+    .expect("restore pre-v97 unguarded writes");
     conn.execute(
         "UPDATE memories SET metadata = ?2, content = ?2 WHERE id = ?1",
         rusqlite::params![poison.id, poison.content],
@@ -449,6 +450,11 @@ fn sqlite_v97_backfill_ignores_noncanonical_registration_poison_3464() {
         ..ai_memory::models::Memory::default()
     };
     ai_memory::db::insert(&conn, &legitimate).expect("seed canonical registration second");
+    conn.execute_batch(
+        "DROP TABLE agent_pubkey_challenges;
+         DROP TABLE agent_pubkey_history;",
+    )
+    .expect("restore a pre-v97 identity schema");
     conn.execute(
         "UPDATE memories SET metadata = ?2, content = ?2 WHERE id = ?1",
         rusqlite::params![legitimate.id, legitimate.content],
@@ -525,8 +531,8 @@ fn sqlite_v97_migration_refuses_invalid_legacy_key_instead_of_ignoring_it_3464()
     let agent = "ai:invalid-legacy-key-3464";
     register(&conn, agent);
     conn.execute_batch(
-        "DROP TRIGGER agent_pubkey_history_authoritative_insert_v97;
-         DROP TRIGGER agent_pubkey_history_authoritative_update_v97;
+        "DROP TRIGGER agent_pubkey_history_projection_guard_insert;
+         DROP TRIGGER agent_pubkey_history_projection_guard_update;
          DROP TABLE agent_pubkey_challenges;
          DROP TABLE agent_pubkey_history;",
     )
@@ -1003,8 +1009,8 @@ fn sqlite_historical_lookup_allows_flat_only_without_history_3464() {
     // Model a legacy pre-v97 image. Current generic writes cannot create this
     // state, but the reader must retain compatibility during upgrade.
     conn.execute_batch(
-        "DROP TRIGGER agent_pubkey_history_authoritative_insert_v97;
-         DROP TRIGGER agent_pubkey_history_authoritative_update_v97;",
+        "DROP TRIGGER agent_pubkey_history_projection_guard_insert;
+         DROP TRIGGER agent_pubkey_history_projection_guard_update;",
     )
     .expect("simulate pre-v97 database without authoritative triggers");
     conn.execute(

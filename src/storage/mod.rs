@@ -930,6 +930,8 @@ pub use approval_depth::{
 };
 /// #8444 - durable Agent2Agent Task rows (SQLite SSOT; postgres twin in the store).
 pub mod a2a_tasks;
+/// #8341 - the `_agents` public-key projection every write funnel carries (v102).
+pub(crate) mod agent_projection;
 pub mod embed_skip;
 /// v1.0.0 #3288 — sqlite half of the bounded, keyset-paged admin export.
 pub mod export_page;
@@ -2360,14 +2362,21 @@ fn insert_inner(
         mem
     };
 
-    // Generic writes never carry identity authority. Sanitize at the shared
-    // SQLite write funnel so the v97 trigger remains a raw-SQL backstop.
-    let sanitized = (mem.namespace == AGENTS_NAMESPACE).then(|| {
-        let mut sanitized = mem.clone();
-        strip_unproven_agent_pubkey_binding(&mut sanitized);
-        sanitized
-    });
-    let mem = sanitized.as_ref().unwrap_or(mem);
+    // The write txn (reasons at the statement below) is taken here: #8341 adds
+    // `_agents` rows so the projection reads the ledger the statement commits on.
+    let owns_tx = (crate::encryption::encryption_enabled(None)
+        || crate::config::append_only_enabled()
+        || mem.namespace == AGENTS_NAMESPACE)
+        && conn.is_autocommit();
+    let write_txn = if owns_tx {
+        Some(connection::WriteTxn::begin(conn)?)
+    } else {
+        None
+    };
+    // Generic writes never carry identity authority (#8341): strip, then write
+    // the ledger's projection; the v102 guard aborts a write that omits it.
+    let projected = agent_projection::sanitized_projected(conn, mem)?;
+    let mem = projected.as_ref().unwrap_or(mem);
 
     let tags_json = serde_json::to_string(&mem.tags)?;
     // #1757 / #1719 item 2b — populate-on-write: advance THIS node's own
@@ -2478,15 +2487,7 @@ fn insert_inner(
     // the caller's tx. With encryption OFF and the spine OFF (the default) the
     // seal is a no-op, the version pre-probe is skipped, the reconcile returns
     // immediately, and no leaf is emitted — byte-identical to pre-#2383/#2948
-    // (no extra statements, no lock change).
-    let owns_tx = (crate::encryption::encryption_enabled(None)
-        || crate::config::append_only_enabled())
-        && conn.is_autocommit();
-    let write_txn = if owns_tx {
-        Some(connection::WriteTxn::begin(conn)?)
-    } else {
-        None
-    };
+    // (no extra statements, no lock change). `owns_tx` is computed above.
     let sealed_insert = (|| -> Result<String> {
         // #2948 — armed-only version pre-probe. `None` when the spine is OFF
         // (default → no extra read → byte-identical) or when no row currently
@@ -3318,6 +3319,9 @@ pub fn insert_with_conflict(conn: &Connection, mem: &Memory, mode: ConflictMode)
             // metadata.why_trace so the write clears this gate; an external
             // `memory_reflect` (tenant ctx) is NOT stamped and IS gated here.
             consult_why_trace_gate(mem)?;
+            // #8341 - the ledger projection (a race with a bind aborts in the guard).
+            let projected = agent_projection::projected(conn, mem)?;
+            let mem = projected.as_ref().unwrap_or(mem);
             // Existence check + INSERT must be atomic against
             // concurrent writers. We rely on the (title, namespace)
             // UNIQUE index — issue a plain INSERT WITHOUT the upsert
@@ -4430,6 +4434,11 @@ pub fn update_with_expected_version(
         ..existing.clone()
     };
     consult_governance_pre_write(&governed)?;
+    // #8341 - the ledger projection; a rebind racing the txn below aborts in the guard.
+    let projected = agent_projection::projected(conn, &governed)?;
+    let (new_content, metadata) = projected.as_ref().map_or((new_content, metadata), |p| {
+        (p.content.as_str(), &p.metadata)
+    });
 
     let tags_json = serde_json::to_string(tags)?;
     let metadata_json = serde_json::to_string(metadata)?;
@@ -4586,7 +4595,7 @@ pub fn update_with_expected_version(
                 )?;
                 Ok((true, content_changed))
             }
-            Err(rusqlite::Error::SqliteFailure(err, _))
+            Err(rusqlite::Error::SqliteFailure(err, message))
                 if err.code == rusqlite::ErrorCode::ConstraintViolation =>
             {
                 let other: Option<String> = conn
@@ -4605,7 +4614,13 @@ pub fn update_with_expected_version(
                         ),
                     }));
                 }
-                Err(anyhow::anyhow!("update failed with constraint violation"))
+                // #8341: keep the SQLite failure as the source so a v102
+                // guard's RAISE(ABORT) message (it names the repair) reaches
+                // the caller instead of being dropped (per ERRORS-11).
+                Err(
+                    anyhow::Error::new(rusqlite::Error::SqliteFailure(err, message))
+                        .context("update failed with constraint violation"),
+                )
             }
             Err(e) => Err(e.into()),
         }
@@ -10966,6 +10981,12 @@ pub fn consolidate_with_expected_versions(
         // merged metadata carries a why_trace (caller-supplied or inherited
         // from a source), else it is REFUSED under enforce.
         consult_why_trace_gate(&candidate)?;
+        // #8341 - the ledger projection, inside this write txn.
+        let projected = agent_projection::projected(conn, &candidate)?;
+        let (summary, metadata_json) = match &projected {
+            Some(p) => (p.content.as_str(), serde_json::to_string(&p.metadata)?),
+            None => (summary, metadata_json),
+        };
         // v0.9.0 G8 (#1825) — a consolidated memory is a fresh genesis, so
         // it mints its own content-id from the (plaintext) summary + the
         // candidate's genesis identity. Minted BEFORE the #228 seal swap
@@ -17302,7 +17323,8 @@ fn restore_archived_impl(
         // COALESCE handles legacy already-archived rows where the
         // v49-added columns are NULL.
         conn.execute(
-            "INSERT INTO memories
+            &format!(
+                "INSERT INTO memories
              (id, tier, namespace, title, content, tags, priority, confidence,
               source, access_count, created_at, updated_at, last_accessed_at,
               expires_at, metadata, embedding, embedding_dim, embedding_space,
@@ -17311,9 +17333,9 @@ fn restore_archived_impl(
               confidence_source, confidence_signals, confidence_decayed_at,
               mentioned_entity_id, version, lifecycle_state, encrypted_envelope,
               kind_provenance, cid, cid_genesis, valid_from, valid_until)
-             SELECT id, COALESCE(original_tier, 'long'), namespace, title, content,
+             SELECT id, COALESCE(original_tier, 'long'), namespace, title, {content},
                     tags, priority, confidence, source, access_count, created_at,
-                    ?1, last_accessed_at, ?6, metadata,
+                    ?1, last_accessed_at, ?6, {metadata},
                     -- v1.0.0 #2167 (S8) restore/migrate HEAL: keep the
                     -- archived vector ONLY when its space matches the live
                     -- active space (?5). A foreign- or NULL-space vector has
@@ -17381,6 +17403,9 @@ fn restore_archived_impl(
                     CASE WHEN cid IS NOT NULL THEN cid_genesis ELSE ?4 END,
                     valid_from, valid_until
              FROM archived_memories WHERE id = ?2",
+                content = &*agent_projection::RESTORE_CONTENT,
+                metadata = &*agent_projection::RESTORE_METADATA,
+            ),
             params![
                 now,
                 id,
@@ -17550,7 +17575,8 @@ pub fn restore_archived_for_caller(conn: &Connection, id: &str, caller: &str) ->
         // COALESCE handles legacy already-archived rows where the
         // v49-added columns are NULL.
         conn.execute(
-            "INSERT INTO memories
+            &format!(
+                "INSERT INTO memories
              (id, tier, namespace, title, content, tags, priority, confidence,
               source, access_count, created_at, updated_at, last_accessed_at,
               expires_at, metadata, embedding, embedding_dim, embedding_space,
@@ -17559,9 +17585,9 @@ pub fn restore_archived_for_caller(conn: &Connection, id: &str, caller: &str) ->
               confidence_source, confidence_signals, confidence_decayed_at,
               mentioned_entity_id, version, lifecycle_state, encrypted_envelope,
               kind_provenance, cid, cid_genesis, valid_from, valid_until)
-             SELECT id, COALESCE(original_tier, 'long'), namespace, title, content,
+             SELECT id, COALESCE(original_tier, 'long'), namespace, title, {content},
                     tags, priority, confidence, source, access_count, created_at,
-                    ?1, last_accessed_at, ?6, metadata,
+                    ?1, last_accessed_at, ?6, {metadata},
                     -- v1.0.0 #2167 (S8) restore/migrate HEAL: keep the
                     -- archived vector ONLY when its space matches the live
                     -- active space (?5). A foreign- or NULL-space vector has
@@ -17629,6 +17655,9 @@ pub fn restore_archived_for_caller(conn: &Connection, id: &str, caller: &str) ->
                     CASE WHEN cid IS NOT NULL THEN cid_genesis ELSE ?4 END,
                     valid_from, valid_until
              FROM archived_memories WHERE id = ?2",
+                content = &*agent_projection::RESTORE_CONTENT,
+                metadata = &*agent_projection::RESTORE_METADATA,
+            ),
             params![
                 now,
                 id,
@@ -18473,14 +18502,16 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
         mem
     };
 
-    // Federation writes have no identity-binding authority. Keep this at the
-    // shared newer-wins funnel as a final backstop after receive validation.
-    let sanitized = (mem.namespace == AGENTS_NAMESPACE).then(|| {
-        let mut sanitized = mem.clone();
-        strip_unproven_agent_pubkey_binding(&mut sanitized);
-        sanitized
-    });
-    let mem = sanitized.as_ref().unwrap_or(mem);
+    // Federation writes have no identity-binding authority (#8341): strip, then
+    // write the ledger's projection, read under the write txn taken here.
+    let owns_tx = conn.is_autocommit();
+    let write_txn = if owns_tx {
+        Some(connection::WriteTxn::begin(conn)?)
+    } else {
+        None
+    };
+    let projected = agent_projection::sanitized_projected(conn, mem)?;
+    let mem = projected.as_ref().unwrap_or(mem);
 
     let tags_json = serde_json::to_string(&mem.tags)?;
     let metadata_json = serde_json::to_string(&mem.metadata)?;
@@ -18543,13 +18574,7 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
     // the local row's text, and the snapshot of the text it replaces must land
     // in the same write transaction as that rewrite (probe → snapshot → upsert
     // atomic, no window in which the text is neither archived nor live). So the
-    // write lock is now taken whenever this call owns the connection.
-    let owns_tx = conn.is_autocommit();
-    let write_txn = if owns_tx {
-        Some(connection::WriteTxn::begin(conn)?)
-    } else {
-        None
-    };
+    // write lock is now taken whenever this call owns the connection (above).
     let sealed_merge = (|| -> Result<String> {
         // #2954 / #4206 — pre-image of the `(title, namespace)` row this upsert
         // may overwrite (`None` when no live row holds the slot). Read under the
@@ -18815,6 +18840,9 @@ fn overwrite_full_row_by_id(conn: &Connection, mem: &Memory) -> Result<()> {
     // REPLACE so a repeated merge of the same id is idempotent; archives the
     // CURRENT row (incl its encrypted_envelope) before the UPDATE below.
     archive_memory_insert_only(conn, &mem.id, field_names::ARCHIVE_REASON_FEDERATION_MERGE)?;
+    // #8341 - federation carries no binding authority: strip, then project.
+    let projected = agent_projection::sanitized_projected(conn, mem)?;
+    let mem = projected.as_ref().unwrap_or(mem);
 
     let tags_json = serde_json::to_string(&mem.tags)?;
     let metadata_json = serde_json::to_string(&mem.metadata)?;
@@ -34609,12 +34637,11 @@ mod tests {
             params![&keys[0], &keys[1], &keys[2]],
         )
         .unwrap();
-        conn.execute(
-            "UPDATE memories SET metadata = json_set(metadata, '$.agent_pubkey', ?3)
-             WHERE namespace = ?1 AND title = ?2",
-            params![AGENTS_NAMESPACE, title, &keys[2]],
-        )
-        .unwrap();
+        // v102 guard (#8341): seed the flat mirrors (keys[2]) as the projection.
+        use agent_projection::{CONTENT_BODY as C, META_BODY as M, with_row};
+        let (m, c) = (with_row(M, "memories."), with_row(C, "memories."));
+        let sql = format!("UPDATE memories SET metadata = {m}, content = {c} WHERE title = ?1");
+        conn.execute(&sql, params![title]).unwrap();
 
         let old = agent_pubkey_for_attestation_at(&conn, "ai:curator", "2026-01-15T00:00:00+00:00")
             .unwrap();

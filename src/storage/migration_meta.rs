@@ -439,11 +439,11 @@ pub const MIGRATION_LADDER: &[MigrationMeta] = &[
     // `CREATE INDEX IF NOT EXISTS` + `INSERT OR IGNORE` on the composite PK make
     // the whole batch re-runnable, so a crash mid-arm self-heals on the next
     // open — idempotent. No full-table rebuild. Settled literal rung;
-    // v101 now owns the moving tip.
+    // v102 now owns the moving tip (and replaces the two triggers, #8341).
     // Postgres twin is `PostgresStore::migrate_v97`.
     meta(97, "AGENT_PUBKEY_HISTORY", true, true, NoLoss, Sqlite),
     // v98: live/archive namespace alias view; rollback drops the view, NoLoss.
-    // Settled literal rung; v101 now owns the moving tip.
+    // Settled literal rung; v102 now owns the moving tip.
     meta(98, "CANONICAL_INBOX_NAMESPACE", true, true, NoLoss, Sqlite),
     // v99 (#3655): additive `sync_peer_contact` table (durable per-peer
     // contact, apart from the data watermark); rollback drops the table,
@@ -462,8 +462,20 @@ pub const MIGRATION_LADDER: &[MigrationMeta] = &[
     // the Agent2Agent standard binding, owned by the authenticated agent);
     // rollback drops the table, NoLoss (the table is new). Re-runnable
     // (`CREATE TABLE/INDEX IF NOT EXISTS`, idempotent). Postgres twin is
-    // `PostgresStore::migrate_v101`.
+    // `PostgresStore::migrate_v101`. Settled literal rung; v102 now owns the
+    // moving tip.
     meta(101, "A2A_TASKS", true, true, NoLoss, Sqlite),
+    // v102 (#8341, v1.0.0, data-integrity): the v97 projection triggers that
+    // rewrote `_agents` rows after the FTS sync are replaced by RAISE(ABORT)
+    // guards; drifted rows are reconciled to the open `agent_pubkey_history`
+    // row and `memories_fts` is rebuilt, in one transaction. Idempotent (DROP
+    // IF EXISTS, CREATE IF NOT EXISTS, a reconcile UPDATE that matches zero
+    // rows on the second pass, FTS rebuild). NOT reversible by a version
+    // lower: the reconcile writes rows of a pre-existing table. NoLoss: the
+    // values written are the ledger's, which v97 already made authoritative,
+    // and the FTS index is regenerable. Postgres twin is a version stamp
+    // (`PostgresStore::migrate_v102`).
+    meta(102, "FTS_PROJECTION_GUARD", true, false, NoLoss, Sqlite),
 ];
 
 /// Look up the metadata for a target schema version.
