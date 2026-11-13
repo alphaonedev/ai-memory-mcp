@@ -174,6 +174,18 @@ async fn unimplemented_default_arms_refuse_naming_their_capability() {
         "REOWN",
     );
     refused(s.size_gc("ns", 1_024, false).await, "SIZE_GC");
+    // #9140 / #9192 — an adapter that cannot make the nonce claim refuses, so
+    // the caller fails closed (503 `nonce_store_unavailable`, never fresh).
+    let nonce_key = ai_memory::identity::replay::NonceClaimKey::for_verifying_key(
+        &[0_u8; 32],
+        "ai:peer-9140",
+        "nonce-3521-0000000000000000",
+    )
+    .expect("nonce key in bounds");
+    refused(
+        s.federation_nonce_claim(&nonce_key).await,
+        "FEDERATION_NONCE_CLAIM",
+    );
     refused(s.delete_link(&ctx, "a", "b").await, "DELETE_LINK");
 
     // --- curator / confidence -----------------------------------------
@@ -238,6 +250,11 @@ async fn unimplemented_default_arms_refuse_naming_their_capability() {
     refused(
         s.list_memories_updated_since_counted(None, 10).await,
         "FEDERATION_LIST_SINCE",
+    );
+    // #9147 C5 — the typed-outcome apply arm fails closed like its id twin.
+    refused(
+        s.apply_remote_memory_outcome(&ctx, &mem).await,
+        "FEDERATION_APPLY_REMOTE",
     );
     refused(
         s.merge_inbound(&ctx, &mem, false).await,

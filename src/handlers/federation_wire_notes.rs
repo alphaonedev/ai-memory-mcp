@@ -28,6 +28,15 @@ pub mod wire {
     /// `X-Memory-Nonce` already consumed for this peer (#922).
     pub const NONCE_REPLAY: &str = "X-Memory-Nonce was already accepted for this peer; every \
          signed federation request needs a fresh nonce";
+    /// #9192 (C3) — the `error` tag of the 503 a receiver answers when its
+    /// durable nonce store cannot decide a verified nonce. A tag, not a note,
+    /// so it is not in [`ALL`].
+    pub const NONCE_STORE_UNAVAILABLE_ERROR: &str = "nonce_store_unavailable";
+    /// #9192 (C3) — the nonce store could not decide; nothing was admitted.
+    pub const NONCE_STORE_UNAVAILABLE: &str = "the receiver could not record X-Memory-Nonce; \
+         nothing was accepted, retry the request later";
+    /// #9192 — `X-Memory-Nonce` longer than the receiver accepts.
+    pub const NONCE_OVERSIZE: &str = "X-Memory-Nonce is longer than this receiver accepts";
     /// `X-Memory-Nonce` absent under the default strict posture (#922).
     pub const NONCE_MISSING: &str = "X-Memory-Nonce header is required on every signed federation \
          request";
@@ -68,6 +77,8 @@ pub mod wire {
     pub const ALL: &[&str] = &[
         SIG_INVALID,
         NONCE_REPLAY,
+        NONCE_STORE_UNAVAILABLE,
+        NONCE_OVERSIZE,
         NONCE_MISSING,
         SIG_NO_ENROLLED_KEY,
         SIG_MISSING,
@@ -136,7 +147,7 @@ mod tests {
     /// log still carries the hint the wire no longer does.
     #[test]
     fn wire_notes_carry_no_env_hint_and_remediations_do_3204() {
-        assert_eq!(wire::ALL.len(), 13);
+        assert_eq!(wire::ALL.len(), 15);
         for note in wire::ALL {
             assert!(!note.contains(ENV_PREFIX), "wire note leaks a knob: {note}");
             assert!(

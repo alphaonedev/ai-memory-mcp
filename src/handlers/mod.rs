@@ -71,6 +71,15 @@ pub(crate) const QUOTA_REFUSED_FIELD: &str = "quota_refused";
 /// receiver report and the quorum/DLQ ack decision cannot drift apart.
 pub(crate) const SKIPPED_FIELD: &str = "skipped";
 
+/// #9147 C5 — `merge_barrier_dropped` count field on the federation
+/// `/sync/push` response envelope (sqlite + postgres arms, success and
+/// quota-429 shapes): inbound memories the receiver merge barrier dropped
+/// (tombstoned / archived / held target; nothing written). Disjoint from
+/// `applied`, which counts only rows actually written. Not folded into
+/// `skipped`: a drop is a terminal, idempotent answer the sender must ack,
+/// whereas `skipped` makes the sender's ack classifier DLQ the push.
+pub(crate) const MERGE_BARRIER_DROPPED_FIELD: &str = "merge_barrier_dropped";
+
 /// Per-memory attestation refusals in both federation push response paths (#3502).
 pub(crate) const ATTESTATION_REJECTIONS_FIELD: &str = "attestation_rejections";
 

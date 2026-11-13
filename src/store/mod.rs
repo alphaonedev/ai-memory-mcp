@@ -2389,6 +2389,37 @@ pub trait MemoryStore: Send + Sync {
         })
     }
 
+    /// #9192 (C2 + C3) — claim one verified federation nonce in the DURABLE
+    /// store every daemon over this backend shares: `Ok(Claimed)` when this
+    /// call inserted the row (the nonce is fresh for every daemon),
+    /// `Ok(AlreadyClaimed)` when a row already existed (a replay), and `Err`
+    /// when the store could not decide (the caller answers 503; nothing is
+    /// admitted).
+    ///
+    /// Claims live for the signing key's lifetime (Ruling R, vote 71472661):
+    /// there is no prune, no cap and no delete. The decision MUST be the
+    /// engine's uniqueness constraint (one `INSERT ... ON CONFLICT DO
+    /// NOTHING` on `(key_fp, nonce_fp)`, committed before `Ok`), never a
+    /// check-then-act read. A hit in the read-only legacy v51 table is
+    /// `AlreadyClaimed` (sqlite only; the PostgreSQL v51 table never shipped).
+    ///
+    /// The default REFUSES: a backend without the durable claim cannot tell a
+    /// sibling's replay from a fresh request. It must never be softened to
+    /// `Ok(Claimed)`.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::UnsupportedCapability`] by default; adapters propagate
+    /// their backend error, including a failed commit.
+    async fn federation_nonce_claim(
+        &self,
+        _key: &crate::identity::replay::NonceClaimKey,
+    ) -> StoreResult<crate::identity::replay::NonceClaim> {
+        Err(StoreError::UnsupportedCapability {
+            capability: FEDERATION_NONCE_CLAIM_CAPABILITY.to_string(),
+        })
+    }
+
     /// #2044 (v1.0.0, #2032-A / H1 IDOR + M1 admin spoof) — bind a per-agent
     /// api-key to `agent_id` by its `sha256(token)` digest. The RAW token is
     /// NEVER passed here or stored (only its lowercase-hex sha256), so the DB
@@ -2776,6 +2807,29 @@ pub trait MemoryStore: Send + Sync {
         })
     }
 
+    /// #9147 C5 — [`apply_remote_memory`](MemoryStore::apply_remote_memory)
+    /// answering the typed [`crate::storage::InboundMergeOutcome`]: `Applied`
+    /// with the resolved id, or `Dropped` with the receiver merge barrier
+    /// (`Tombstoned` / `Archived` / `Held`) that refused the write (nothing
+    /// written). A counting caller (the federation receive tally, catch-up)
+    /// must use this, never count `apply_remote_memory`'s bare id as applied.
+    ///
+    /// Default implementation: `UnsupportedCapability`.
+    ///
+    /// # Errors
+    ///
+    /// Everything [`apply_remote_memory`](MemoryStore::apply_remote_memory)
+    /// returns.
+    async fn apply_remote_memory_outcome(
+        &self,
+        _ctx: &CallerContext,
+        _memory: &Memory,
+    ) -> StoreResult<crate::storage::InboundMergeOutcome> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "FEDERATION_APPLY_REMOTE".to_string(),
+        })
+    }
+
     /// v0.8.0 Pillar-3 (#1709 / #224) — federation conflict-path entry
     /// that field-merges a divergent same-`id` inbound row via the
     /// CRDT-lite [`crate::models::merge_memory`] reconciler instead of the
@@ -2845,6 +2899,9 @@ pub trait MemoryStore: Send + Sync {
     /// Default: `UnsupportedCapability` — an adapter that cannot re-check
     /// FAILS CLOSED rather than silently merging unchecked.
     ///
+    /// #9147 C5 — answers the typed [`crate::storage::InboundMergeOutcome`]:
+    /// a receiver merge-barrier drop is `Dropped`, never counted as applied.
+    ///
     /// # Errors
     ///
     /// Everything [`merge_inbound`](MemoryStore::merge_inbound) returns, plus a
@@ -2857,7 +2914,7 @@ pub trait MemoryStore: Send + Sync {
         _inbound: &Memory,
         _receiver_verified: bool,
         _authorize_stored: crate::storage::StoredNamespaceAuthorizer<'_>,
-    ) -> StoreResult<String> {
+    ) -> StoreResult<crate::storage::InboundMergeOutcome> {
         Err(StoreError::UnsupportedCapability {
             capability: "FEDERATION_MERGE_INBOUND_AUTHORIZED".to_string(),
         })
@@ -5879,6 +5936,9 @@ pub const EXECUTE_PENDING_ACTION: &str = "execute_pending_action";
 /// [`MemoryStore::merge_inbound_authorized`] refuses a federation merge whose
 /// locked row sits outside the pushing peer's namespace scope.
 pub const FEDERATION_MERGE_INBOUND: &str = "federation_merge_inbound";
+/// #9140 — capability tag of the default (refusing)
+/// [`MemoryStore::federation_nonce_claim`].
+pub const FEDERATION_NONCE_CLAIM_CAPABILITY: &str = "FEDERATION_NONCE_CLAIM";
 
 /// #4447 — the `action` of the [`StoreError::PermissionDenied`] envelope the
 /// `apply_remote_*_authorized` methods return when the in-transaction re-check

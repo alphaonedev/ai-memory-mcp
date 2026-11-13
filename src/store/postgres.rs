@@ -115,6 +115,8 @@ mod merge_inbound_4023;
 // restores / links) with the in-transaction peer-scope re-check. Own module:
 // postgres.rs is at its qual_10 budget.
 mod federation_by_id_4447;
+// #9147 — the receiver lifecycle merge barrier (own module: qual_10 budget).
+mod merge_barrier_9147;
 // v1.0.0 #3124 R4 — the audited `reown` sweep. Own module for the same
 // qual_10 budget reason as `parity_3064` above.
 mod governance_corrupt_4285;
@@ -819,6 +821,11 @@ const SQL_INSERT_FORGET_TOMBSTONE: &str = "INSERT INTO forget_tombstones \
      (memory_id, namespace, forgotten_at, agent_id, signature) \
      VALUES ($1, $2, $3, $4, $5) \
      ON CONFLICT (memory_id) DO NOTHING";
+/// #9192 — the at-most-once claim of one federation nonce: the PRIMARY KEY
+/// `(key_fp, nonce_fp)` of `federation_nonce_claims` (v103) decides, so two
+/// daemons over one store can never both admit it. Rows are never deleted.
+const SQL_PG_CLAIM_FEDERATION_NONCE: &str = "INSERT INTO federation_nonce_claims \
+     (key_fp, nonce_fp) VALUES ($1, $2) ON CONFLICT (key_fp, nonce_fp) DO NOTHING";
 /// #3192 / #3286 — purge the non-cascaded DLQ cleartext leak for the victim
 /// ids. `ANY($1)` binds a slice so the single-row and bulk hard-delete
 /// primitives share ONE statement pair (see [`pg_purge_dlq_dedup_in_tx`]).
@@ -1758,6 +1765,12 @@ const MIGRATION_V100_TITLE_SLOT_LIVE_ROWS: &str =
 const MIGRATION_V101_A2A_TASKS: &str =
     include_str!("../../migrations/postgres/0058_v101_a2a_tasks.sql");
 
+/// v103 (#9187): `federation_nonce_claims`, the federation nonce claim table
+/// keyed `(key_fp, nonce_fp)`. The sqlite twin is `MIGRATION_V103_SQLITE`
+/// (`migrations/sqlite/0086_v103_federation_nonce_claims.sql`).
+const MIGRATION_V103_FEDERATION_NONCE_CLAIMS: &str =
+    include_str!("../../migrations/postgres/0059_v103_federation_nonce_claims.sql");
+
 /// v0.7.0 Cluster G — shadow-mode retention + denormalised `source`
 /// column + compound `(namespace, source, observed_at)` index
 /// supporting the calibration scan (issue #767, PERF-4 + PERF-12).
@@ -2148,7 +2161,13 @@ const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
 //       has carried these since v56, so its v88 is a no-op; doc twins
 //       migrations/{postgres/0045,sqlite/0072}_v88_list_composite_indexes.sql.
 //       CURRENT_SCHEMA_VERSION stays pinned in lockstep with sqlite.
-const CURRENT_SCHEMA_VERSION: i32 = 101;
+// v103 — #9187: `federation_nonce_claims` (key_fp, nonce_fp) claim table,
+//       ladder-owned so the stamp proves the table on every database
+//       whatever binary bootstrapped it. Pure CREATE TABLE IF NOT EXISTS,
+//       no backfill. v102 is reserved for #9176 and slots in before it.
+//       Doc twin: migrations/postgres/0059_v103_federation_nonce_claims.sql.
+//       CURRENT_SCHEMA_VERSION stays pinned in lockstep with sqlite.
+const CURRENT_SCHEMA_VERSION: i32 = 103;
 
 /// PostgreSQL session-scoped advisory lock key used to serialize
 /// concurrent `migrate()` invocations across processes and across
@@ -4321,8 +4340,11 @@ impl PostgresStore {
         if current_version < 100 {
             self.migrate_v100().await?;
         }
-        if current_version < CURRENT_SCHEMA_VERSION {
+        if current_version < 101 {
             self.migrate_v101().await?;
+        }
+        if current_version < CURRENT_SCHEMA_VERSION {
+            self.migrate_v103().await?;
         }
 
         Ok(())
@@ -5359,9 +5381,10 @@ impl PostgresStore {
     /// version reach so the postgres ladder stays in lockstep with
     /// the sqlite ladder.
     ///
-    /// If a future revision elects to back the nonce cache by
-    /// postgres for fully-distributed deployments, the DDL would
-    /// land here in this same arm.
+    /// #9192 superseded this: a postgres-backed daemon now claims
+    /// federation nonces in the postgres `federation_nonce_claims`
+    /// table (v103, [`PostgresStore::migrate_v103`]); this arm stays a
+    /// version stamp so the ladder is unchanged.
     async fn migrate_v51(&self) -> StoreResult<()> {
         let mut tx = self
             .pool
@@ -7526,6 +7549,39 @@ impl PostgresStore {
         Ok(())
     }
 
+    /// v103 (#9187) - `federation_nonce_claims`, the federation nonce claim
+    /// table: the `(key_fp, nonce_fp)` PRIMARY KEY is the atomic arbiter and
+    /// the only index; rows are never pruned (additive, idempotent, no
+    /// backfill, NoLoss).
+    async fn migrate_v103(&self) -> StoreResult<()> {
+        debug_assert!(
+            MIGRATION_V103_FEDERATION_NONCE_CLAIMS.contains("federation_nonce_claims"),
+            "v103 doc twin must create federation_nonce_claims"
+        );
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v103 federation-nonce-claims migration tx", e))?;
+
+        sqlx::raw_sql(MIGRATION_V103_FEDERATION_NONCE_CLAIMS)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("apply v103 federation-nonce-claims migration", e))?;
+
+        record_schema_version(&mut tx, 103).await?;
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v103 migration", e))?;
+
+        tracing::info!(
+            target: TRACE_TARGET,
+            "schema migration v103 applied (#9187: federation_nonce_claims - the \
+             (key_fp, nonce_fp) federation nonce claim table)"
+        );
+        Ok(())
+    }
+
     async fn migrate_v98(&self) -> StoreResult<()> {
         debug_assert!(
             MIGRATION_V98_CANONICAL_INBOX_NAMESPACE.contains("archived_memories"),
@@ -8437,13 +8493,17 @@ impl PostgresStore {
         // Wave-2 B8 — sqlite `dequarantine` gates; this inner is reached
         // from the trait method AND from other pg callers (ERRORS-09).
         self.gate_record_stop().await?;
+        // #9150 — lift only a row whose stored attest level is
+        // `agent_attested` (sqlite twin: `crate::storage::dequarantine`).
         let res = sqlx::query(
             "UPDATE memories SET lifecycle_state = $1, updated_at = NOW(), version = version + 1 \
-             WHERE id = $2 AND lifecycle_state = $3",
+             WHERE id = $2 AND lifecycle_state = $3 AND metadata->>$4 = $5",
         )
         .bind(crate::models::LifecycleState::Open.as_str())
         .bind(id)
         .bind(crate::models::LifecycleState::Quarantined.as_str())
+        .bind(crate::models::field_names::ATTEST_LEVEL)
+        .bind(crate::identity::verify::AttestLevel::AgentAttested.as_str())
         .execute(&self.pool)
         .await
         .map_err(|e| to_store_err("dequarantine", e))?;
@@ -25021,9 +25081,19 @@ impl MemoryStore for PostgresStore {
 
     async fn apply_remote_memory(
         &self,
-        _ctx: &CallerContext,
+        ctx: &CallerContext,
         memory: &Memory,
     ) -> StoreResult<String> {
+        self.apply_remote_memory_outcome(ctx, memory)
+            .await
+            .map(crate::storage::InboundMergeOutcome::into_id)
+    }
+
+    async fn apply_remote_memory_outcome(
+        &self,
+        _ctx: &CallerContext,
+        memory: &Memory,
+    ) -> StoreResult<crate::storage::InboundMergeOutcome> {
         self.gate_record_stop().await?;
         // #2314 — sqlite `insert_if_newer` guard parity on the pg
         // federation-apply funnel (reached by the /sync/push receive path
@@ -25051,7 +25121,10 @@ impl MemoryStore for PostgresStore {
                 "{}",
                 crate::storage::FORGET_TOMBSTONE_DROP_MSG
             );
-            return Ok(memory.id.clone());
+            return Ok(crate::storage::InboundMergeOutcome::dropped(
+                memory.id.clone(),
+                crate::storage::ReceiverMergeBarrier::Tombstoned,
+            ));
         }
         let screened = crate::secret_screen::redact_memory_for_receive(memory);
         let memory = screened.as_ref().unwrap_or(memory);
@@ -25174,6 +25247,27 @@ impl MemoryStore for PostgresStore {
             pg_probe_federation_merge_preimage(&mut tx, &memory.title, &memory.namespace)
                 .await
                 .map_err(|e| to_store_err("apply_remote_memory merge pre-image probe", e))?;
+        // #9147 / #9149 / #9150 — the receiver lifecycle merge barrier, read
+        // under the title-slot lock just taken: a tombstoned id (re-checked
+        // here, in-tx, after the pool pre-check above), an archived id with no
+        // live row, or a held (quarantined / contaminated) row at the id or
+        // the slot drops the inbound write (idempotent no-op, nothing written).
+        if let Some(barrier) = merge_barrier_9147::pg_receiver_merge_barrier(
+            &mut tx,
+            &memory.id,
+            Some((&memory.title, &memory.namespace)),
+        )
+        .await
+        .map_err(|e| to_store_err("apply_remote_memory merge barrier probe", e))?
+        {
+            tx.rollback()
+                .await
+                .map_err(|e| to_store_err("apply_remote_memory merge barrier rollback", e))?;
+            return Ok(crate::storage::InboundMergeOutcome::dropped(
+                memory.id.clone(),
+                barrier,
+            ));
+        }
         // #4206 (the title-slot half of #1773 / #3961) — when the inbound row
         // wins the tiebreak AND its plaintext differs from the stored text,
         // snapshot the pre-merge row into `archived_memories`
@@ -25573,7 +25667,7 @@ impl MemoryStore for PostgresStore {
         tx.commit()
             .await
             .map_err(|e| to_store_err("commit apply_remote_memory tx", e))?;
-        Ok(applied_id)
+        Ok(crate::storage::InboundMergeOutcome::Applied(applied_id))
     }
 
     async fn merge_inbound(
@@ -25584,6 +25678,7 @@ impl MemoryStore for PostgresStore {
     ) -> StoreResult<String> {
         self.pg_merge_inbound(ctx, inbound, receiver_verified, None)
             .await
+            .map(crate::storage::InboundMergeOutcome::into_id)
     }
 
     async fn merge_inbound_authorized(
@@ -25592,7 +25687,7 @@ impl MemoryStore for PostgresStore {
         inbound: &Memory,
         receiver_verified: bool,
         authorize_stored: crate::storage::StoredNamespaceAuthorizer<'_>,
-    ) -> StoreResult<String> {
+    ) -> StoreResult<crate::storage::InboundMergeOutcome> {
         self.pg_merge_inbound(ctx, inbound, receiver_verified, Some(authorize_stored))
             .await
     }
@@ -26922,6 +27017,38 @@ impl MemoryStore for PostgresStore {
         .map_err(|e| to_store_err("admit attested write", e))?
         .rows_affected();
         Ok(inserted == 1)
+    }
+
+    /// #9192 — the PostgreSQL nonce claim on `federation_nonce_claims`
+    /// (v103). One `INSERT ... ON CONFLICT DO NOTHING` decides and nothing is
+    /// ever pruned, so an accepted nonce stays refused for the life of the
+    /// store. Every error, the commit included, is returned as `Err` so the
+    /// caller fails closed (`ReplayDecision::Unavailable`, 503).
+    async fn federation_nonce_claim(
+        &self,
+        key: &crate::identity::replay::NonceClaimKey,
+    ) -> StoreResult<crate::identity::replay::NonceClaim> {
+        use crate::identity::replay::NonceClaim;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("federation nonce claim begin", e))?;
+        let inserted = sqlx::query(SQL_PG_CLAIM_FEDERATION_NONCE)
+            .bind(key.key_fp().as_slice())
+            .bind(key.nonce_fp().as_slice())
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("federation nonce claim", e))?
+            .rows_affected();
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("federation nonce claim commit", e))?;
+        Ok(if inserted == 1 {
+            NonceClaim::Claimed
+        } else {
+            NonceClaim::AlreadyClaimed
+        })
     }
 
     async fn revoke_agent_pubkey(&self, _ctx: &CallerContext, agent_id: &str) -> StoreResult<()> {
@@ -41379,16 +41506,15 @@ mod tests {
             .expect("archive v1");
         assert_eq!(moved, 1);
 
-        // Re-seed the SAME id into `memories` with changed content (federation
-        // LWW insert preserves the id), then re-archive so the archive INSERT
-        // hits the ON CONFLICT (id) path.
+        // Re-seed the SAME id into `memories` with changed content through the
+        // LOCAL write path, then re-archive so the archive INSERT hits the ON
+        // CONFLICT (id) path. (#9149: the federation `merge_inbound` funnel now
+        // drops a push of an archived id, so it can no longer re-seed it.)
         let mut m2 = m1.clone();
         m2.content = "content-v2".to_string();
         m2.updated_at = (chrono::Utc::now() + chrono::Duration::seconds(5)).to_rfc3339();
-        store
-            .merge_inbound(&ctx, &m2, false)
-            .await
-            .expect("merge_inbound v2");
+        let reseeded = store.store(&ctx, &m2).await.expect("store v2");
+        assert_eq!(reseeded, id, "the local re-seed keeps the archived id");
 
         let moved = store
             .archive_by_ids(&ctx, &[id.clone()], Some("manual"))

@@ -80,6 +80,22 @@ async fn resolve_stored_namespace(
     app.store.namespace_by_id(&ns_probe_ctx, id).await
 }
 
+/// #9147 — [`resolve_stored_namespace`], falling back to the ARCHIVED copy's
+/// namespace when no live row exists: a federated deletion purges the archived
+/// copy too, so its scope must be checked rather than the id skipped as absent.
+#[cfg(feature = "sal")]
+async fn resolve_live_or_archived_namespace(
+    app: &AppState,
+    probe_principal: String,
+    id: &str,
+) -> Result<Option<String>, crate::store::StoreError> {
+    if let Some(namespace) = resolve_stored_namespace(app, probe_principal.clone(), id).await? {
+        return Ok(Some(namespace));
+    }
+    let ns_probe_ctx = crate::store::CallerContext::for_admin(probe_principal);
+    app.store.archived_namespace_by_id(&ns_probe_ctx, id).await
+}
+
 /// #3075 — the operator context the postgres federation-RECEIVE APPLY lanes use
 /// for their SAL writes.
 ///
@@ -360,6 +376,8 @@ pub(super) async fn sync_push_via_store(
         );
     }
     let mut applied = 0usize;
+    // #9147 C5 — receiver merge-barrier drops; never part of `applied`.
+    let mut merge_barrier_dropped = 0usize;
     let mut noop = 0usize;
     let mut skipped = 0usize;
     // #3699 — wire index carried per item; rendered back in wire order.
@@ -773,7 +791,14 @@ pub(super) async fn sync_push_via_store(
             )
             .await
         {
-            Ok(applied_id) => {
+            // #9147 C5 — the receiver merge barrier dropped the row (nothing
+            // written): counted apart from `applied`, and none of the
+            // applied-row side effects (dequarantine, inbox wake, embedding)
+            // run for a row that was not written.
+            Ok(crate::storage::InboundMergeOutcome::Dropped { .. }) => {
+                merge_barrier_dropped += 1;
+            }
+            Ok(crate::storage::InboundMergeOutcome::Applied(applied_id)) => {
                 applied += 1;
                 // v1.0.0 R19/A3 (#1948) — route-OUT dequarantine-on-attest
                 // (postgres twin). `PostgresStore::merge_inbound` reads the
@@ -958,6 +983,7 @@ pub(super) async fn sync_push_via_store(
                 "max": q.max,
                 "agent_id": q.agent_id,
                 "applied_before_refusal": applied,
+                (crate::handlers::MERGE_BARRIER_DROPPED_FIELD): merge_barrier_dropped,
                 (crate::handlers::QUOTA_REFUSED_FIELD): quota_refused,
                 (crate::handlers::ATTESTATION_REJECTIONS_FIELD): crate::handlers::federation_receive::rejections_in_wire_order(&attestation_rejections),
                 "reset_at": reset_at,
@@ -1030,7 +1056,10 @@ pub(super) async fn sync_push_via_store(
                 &attest_cfg,
             );
             let stored_ns = if needs_stored {
-                match resolve_stored_namespace(&app, body.sender_agent_id.clone(), del_id).await {
+                // #9147 — fall back to the archived copy (sqlite twin).
+                match resolve_live_or_archived_namespace(&app, body.sender_agent_id.clone(), del_id)
+                    .await
+                {
                     Ok(Some(namespace)) => Some(namespace),
                     Ok(None) => {
                         noop += 1;
@@ -1438,25 +1467,23 @@ pub(super) async fn sync_push_via_store(
             require_tx_sig,
         ) {
             crate::federation::receive_auth::TransitionAuthz::Accept => {
-                // #1805 — per-transition nonce anti-replay (postgres twin of the
-                // sqlite federation_receive path). The signed transition nonce
-                // was never recorded; record it in the per-peer nonce cache and
-                // refuse a replay (a captured signed op re-wrapped in a fresh
+                // #1805 / #9192 — per-transition nonce anti-replay (postgres twin
+                // of the sqlite federation_receive path). The signed transition
+                // nonce is claimed durably under the verifying key and a replay
+                // is refused (a captured signed op re-wrapped in a fresh
                 // envelope replays through CAS on a cyclic/ABA edge). Empty
                 // nonce = unsigned op → not gated. Rides #1718 / 4d3ea1c5.
                 if !op.nonce.is_empty() {
-                    use base64::Engine as _;
-                    let nstr = base64::engine::general_purpose::STANDARD.encode(&op.nonce);
-                    if matches!(
-                        app.federation_nonce_cache
-                            .record_and_check(peer_header_owned.as_deref().unwrap_or(""), &nstr),
-                        crate::identity::replay::ReplayDecision::Replay
+                    let decision = match transition_nonce_key(
+                        &op.nonce,
+                        &op.signature,
+                        enrolled.as_ref(),
+                        peer_header_owned.as_deref().unwrap_or(""),
                     ) {
-                        tracing::warn!(
-                            target: crate::federation::SIGNING_TRACE_TARGET,
-                            action_id = %op.action_id,
-                            "sync_push(store): replayed action-transition nonce refused (#1805)"
-                        );
+                        Ok(key) => Ok(NonceAuthority::for_app(&app).claim(&key).await),
+                        Err(e) => Err(e),
+                    };
+                    if transition_nonce_refused(decision, &op.action_id) {
                         skipped += 1;
                         continue;
                     }
@@ -2282,6 +2309,7 @@ pub(super) async fn sync_push_via_store(
             // is not folded into `skipped`.
             "namespace_meta_refused": namespace_meta_refused,
             "noop": noop,
+            (crate::handlers::MERGE_BARRIER_DROPPED_FIELD): merge_barrier_dropped,
             (crate::handlers::SKIPPED_FIELD): skipped,
             (crate::handlers::QUOTA_REFUSED_FIELD): quota_refused,
             (crate::handlers::ATTESTATION_REJECTIONS_FIELD): crate::handlers::federation_receive::rejections_in_wire_order(&attestation_rejections),
@@ -2528,6 +2556,258 @@ fn verify_credential_pubkey(
     }
 }
 
+/// #9192 (item 1) — the claim key of an accepted action-transition nonce.
+/// A transition whose signature verified claims in the namespace of the key
+/// that verified it, the same namespace as that key's push and GET nonces;
+/// one accepted without a verified signature (the opt-out rollout posture)
+/// claims in the envelope peer's unverified namespace.
+pub(crate) fn transition_nonce_key(
+    nonce: &[u8],
+    signature: &[u8],
+    enrolled: Option<&VerifyingKey>,
+    envelope_peer: &str,
+) -> Result<crate::identity::replay::NonceClaimKey, crate::identity::replay::NonceKeyError> {
+    use base64::Engine as _;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(nonce);
+    match enrolled {
+        Some(vk) if !signature.is_empty() => {
+            crate::identity::replay::NonceClaimKey::for_verifying_key(
+                vk.as_bytes(),
+                envelope_peer,
+                &encoded,
+            )
+        }
+        _ => crate::identity::replay::NonceClaimKey::for_unverified_peer(envelope_peer, &encoded),
+    }
+}
+
+/// #9192 — `true` when an action transition must be skipped because its
+/// nonce was replayed, out of bounds, or undecidable. decision: a per-op
+/// `Unavailable` skips the op (the per-op store-error precedent of
+/// `action_get` / `transition_cas` above it) over a whole-request 503,
+/// because rows applied earlier in the batch are already committed; the op
+/// stays unapplied and its nonce unclaimed, so the sender may retry it.
+pub(crate) fn transition_nonce_refused(
+    decision: Result<
+        crate::identity::replay::ReplayDecision,
+        crate::identity::replay::NonceKeyError,
+    >,
+    action_id: &str,
+) -> bool {
+    use crate::identity::replay::ReplayDecision;
+    match decision {
+        Ok(ReplayDecision::Fresh) => false,
+        Ok(ReplayDecision::Replay) => {
+            tracing::warn!(
+                target: crate::federation::SIGNING_TRACE_TARGET,
+                action_id = %action_id,
+                "sync_push: replayed action-transition nonce refused (#1805)"
+            );
+            true
+        }
+        Ok(ReplayDecision::Unavailable) => {
+            tracing::warn!(
+                target: crate::federation::SIGNING_TRACE_TARGET,
+                action_id = %action_id,
+                "sync_push: action-transition nonce store unavailable; op skipped (#9192)"
+            );
+            true
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: crate::federation::SIGNING_TRACE_TARGET,
+                action_id = %action_id,
+                error = %e,
+                "sync_push: action-transition nonce out of bounds; op skipped (#9192)"
+            );
+            true
+        }
+    }
+}
+
+/// #9192 (C2 + C3) — the durable store that decides a verified federation
+/// nonce, with the bounded cache in front of it. PostgreSQL daemons claim
+/// through `app.store` (the table every sibling daemon shares); sqlite
+/// daemons claim through `app.db` (the file every handle on it shares).
+/// There is no constructor without a store, so nothing can admit a nonce
+/// from memory alone.
+pub(crate) struct NonceAuthority<'a> {
+    cache: &'a crate::identity::replay::FederationNonceCache,
+    backend: NonceBackend<'a>,
+}
+
+enum NonceBackend<'a> {
+    Sqlite(&'a super::Db),
+    #[cfg(feature = "sal")]
+    Store(&'a dyn crate::store::MemoryStore),
+}
+
+impl<'a> NonceAuthority<'a> {
+    /// The authority of a running daemon: its own cache over its own store.
+    #[must_use]
+    pub(crate) fn for_app(app: &'a super::AppState) -> Self {
+        #[cfg(feature = "sal")]
+        if matches!(app.storage_backend, super::StorageBackend::Postgres) {
+            return Self {
+                cache: &app.federation_nonce_cache,
+                backend: NonceBackend::Store(app.store.as_ref()),
+            };
+        }
+        Self {
+            cache: &app.federation_nonce_cache,
+            backend: NonceBackend::Sqlite(&app.db),
+        }
+    }
+
+    /// A sqlite authority over an explicit handle (unit tests).
+    #[cfg(test)]
+    pub(crate) fn sqlite(
+        cache: &'a crate::identity::replay::FederationNonceCache,
+        db: &'a super::Db,
+    ) -> Self {
+        Self {
+            cache,
+            backend: NonceBackend::Sqlite(db),
+        }
+    }
+
+    /// Claim `key`: `Fresh` exactly once per key lifetime, `Replay` after,
+    /// `Unavailable` when the store cannot decide. Cancel-safe: the sqlite
+    /// arm runs synchronously once the handle is held, and the store arm
+    /// fills the cache only after the store answered.
+    pub(crate) async fn claim(
+        &self,
+        key: &crate::identity::replay::NonceClaimKey,
+    ) -> crate::identity::replay::ReplayDecision {
+        match self.backend {
+            NonceBackend::Sqlite(db) => {
+                let lock = db.lock().await;
+                self.cache.check_with_conn(&lock.0, key)
+            }
+            #[cfg(feature = "sal")]
+            NonceBackend::Store(store) => self.cache.check_store(store, key).await,
+        }
+    }
+}
+
+/// #9192 — refuse an `X-Memory-Nonce` longer than
+/// [`crate::identity::replay::FEDERATION_NONCE_MAX_BYTES`] before any
+/// signature work, so an oversize header costs no verify and no row.
+fn nonce_oversize_refusal(
+    route: &str,
+    nonce_header: Option<&str>,
+    peer_id: Option<&str>,
+) -> Option<Response> {
+    let nonce = nonce_header?;
+    crate::identity::replay::check_nonce_len(nonce)
+        .ok()
+        .map_or_else(
+            || {
+                tracing::warn!(
+                    target: crate::federation::SIGNING_TRACE_TARGET,
+                    tag = fed_signing::VerifyError::NonceOversize.tag(),
+                    peer_id = %peer_id.unwrap_or(""),
+                    nonce_len = nonce.len(),
+                    "{route}: X-Memory-Nonce over the receiver bound refused"
+                );
+                Some(
+                    (
+                        StatusCode::UNAUTHORIZED,
+                        Json(json!({
+                            "error": fed_signing::VerifyError::NonceOversize.tag(),
+                            "note": crate::handlers::federation_wire_notes::wire::NONCE_OVERSIZE,
+                        })),
+                    )
+                        .into_response(),
+                )
+            },
+            |()| None,
+        )
+}
+
+/// #9192 — the response for a nonce the store could not decide (C3): 503,
+/// never a replay 401 and never an admission.
+pub(crate) fn nonce_store_unavailable_response() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({
+            "error": crate::handlers::federation_wire_notes::wire::NONCE_STORE_UNAVAILABLE_ERROR,
+            "note": crate::handlers::federation_wire_notes::wire::NONCE_STORE_UNAVAILABLE,
+        })),
+    )
+        .into_response()
+}
+
+/// #9192 — the nonce-freshness gate shared by `/sync/push` and the signed
+/// `GET /sync/since`, run only AFTER the signature verified against `pk`.
+/// One namespace per verifying key (Ruling R): both routes claim in it.
+async fn nonce_freshness_gate(
+    route: &str,
+    nonce_header: Option<&str>,
+    pk: &VerifyingKey,
+    peer_id: Option<&str>,
+    authority: &NonceAuthority<'_>,
+) -> Option<Response> {
+    use crate::identity::replay::{NonceClaimKey, ReplayDecision};
+    let pid = peer_id.unwrap_or("");
+    let Some(nonce) = nonce_header.filter(|n| !n.is_empty()) else {
+        if fed_signing::require_nonce() {
+            tracing::warn!(
+                target: crate::federation::SIGNING_TRACE_TARGET,
+                tag = fed_signing::VerifyError::NonceMissing.tag(),
+                peer_id = %pid,
+                remediation = crate::handlers::federation_wire_notes::remediation::REQUIRE_NONCE,
+                "{route}: X-Memory-Nonce header absent — strict refusal"
+            );
+            return Some(
+                (
+                    StatusCode::UNAUTHORIZED,
+                    Json(json!({
+                        "error": fed_signing::VerifyError::NonceMissing.tag(),
+                        "note": crate::handlers::federation_wire_notes::wire::NONCE_MISSING,
+                    })),
+                )
+                    .into_response(),
+            );
+        }
+        tracing::warn!(
+            target: crate::federation::SIGNING_TRACE_TARGET,
+            peer_id = %pid,
+            "{route}: X-Memory-Nonce absent — permissive, accepting"
+        );
+        return None;
+    };
+    let Ok(key) = NonceClaimKey::for_verifying_key(pk.as_bytes(), pid, nonce) else {
+        // Unreachable after `nonce_oversize_refusal` and the empty filter;
+        // refuse rather than admit if the bounds ever drift apart.
+        return nonce_oversize_refusal(route, Some(nonce), peer_id)
+            .or_else(|| Some(nonce_store_unavailable_response()));
+    };
+    match authority.claim(&key).await {
+        ReplayDecision::Fresh => None,
+        ReplayDecision::Replay => {
+            tracing::warn!(
+                target: crate::federation::SIGNING_TRACE_TARGET,
+                tag = fed_signing::VerifyError::ReplayedNonce.tag(),
+                peer_id = %pid,
+                remediation = crate::handlers::federation_wire_notes::remediation::REQUIRE_NONCE,
+                "{route}: X-Memory-Nonce replay detected"
+            );
+            Some(
+                (
+                    StatusCode::UNAUTHORIZED,
+                    Json(json!({
+                        "error": fed_signing::VerifyError::ReplayedNonce.tag(),
+                        "note": crate::handlers::federation_wire_notes::wire::NONCE_REPLAY,
+                    })),
+                )
+                    .into_response(),
+            )
+        }
+        ReplayDecision::Unavailable => Some(nonce_store_unavailable_response()),
+    }
+}
+
 /// v0.7.0 #791 — verify the `X-Memory-Sig` header against the raw
 /// body bytes the receiver observed. Returns `Some(Response)` to
 /// short-circuit with a 401 when verification is required and fails;
@@ -2548,12 +2828,13 @@ fn verify_credential_pubkey(
 /// unenrolled federation pair operational while the strict-deny
 /// arms fire once an operator enrols a peer key.
 /// `AI_MEMORY_FED_REQUIRE_SIG=0` bypasses every branch.
-pub(super) fn verify_signature_or_reject(
+pub(super) async fn verify_signature_or_reject(
     headers: &HeaderMap,
     body_bytes: &[u8],
     peer_id: Option<&str>,
-    federation_nonce_cache: &crate::identity::replay::FederationNonceCache,
+    nonce_authority: &NonceAuthority<'_>,
 ) -> Option<Response> {
+    const ROUTE: &str = "sync_push";
     if !fed_signing::require_sig() {
         return None;
     }
@@ -2563,6 +2844,9 @@ pub(super) fn verify_signature_or_reject(
     let nonce_header = headers
         .get(fed_signing::NONCE_HEADER)
         .and_then(|v| v.to_str().ok());
+    if let Some(refusal) = nonce_oversize_refusal(ROUTE, nonce_header, peer_id) {
+        return Some(refusal);
+    }
     let pubkey = resolve_peer_verifying_key(
         headers,
         peer_id,
@@ -2598,62 +2882,7 @@ pub(super) fn verify_signature_or_reject(
                         .into_response(),
                 );
             }
-            // v0.7.0 #922 — apply nonce-freshness gate.
-            let pid_for_cache = peer_id.unwrap_or("");
-            match nonce_header {
-                Some(nonce) if !nonce.is_empty() => {
-                    match federation_nonce_cache.record_and_check(pid_for_cache, nonce) {
-                        crate::identity::replay::ReplayDecision::Fresh => None,
-                        crate::identity::replay::ReplayDecision::Replay => {
-                            tracing::warn!(
-                                target: crate::federation::SIGNING_TRACE_TARGET,
-                                tag = fed_signing::VerifyError::ReplayedNonce.tag(),
-                                peer_id = %pid_for_cache,
-                                remediation = crate::handlers::federation_wire_notes::remediation::REQUIRE_NONCE,
-                                "sync_push: X-Memory-Nonce replay detected"
-                            );
-                            Some(
-                                (
-                                    StatusCode::UNAUTHORIZED,
-                                    Json(json!({
-                                        "error": fed_signing::VerifyError::ReplayedNonce.tag(),
-                                        "note": crate::handlers::federation_wire_notes::wire::NONCE_REPLAY,
-                                    })),
-                                )
-                                    .into_response(),
-                            )
-                        }
-                    }
-                }
-                _ => {
-                    if fed_signing::require_nonce() {
-                        tracing::warn!(
-                            target: crate::federation::SIGNING_TRACE_TARGET,
-                            tag = fed_signing::VerifyError::NonceMissing.tag(),
-                            peer_id = %pid_for_cache,
-                            remediation = crate::handlers::federation_wire_notes::remediation::REQUIRE_NONCE,
-                            "sync_push: X-Memory-Nonce header absent — strict refusal"
-                        );
-                        Some(
-                            (
-                                StatusCode::UNAUTHORIZED,
-                                Json(json!({
-                                    "error": fed_signing::VerifyError::NonceMissing.tag(),
-                                    "note": crate::handlers::federation_wire_notes::wire::NONCE_MISSING,
-                                })),
-                            )
-                                .into_response(),
-                        )
-                    } else {
-                        tracing::warn!(
-                            target: crate::federation::SIGNING_TRACE_TARGET,
-                            peer_id = %pid_for_cache,
-                            "sync_push: X-Memory-Nonce absent — permissive, accepting"
-                        );
-                        None
-                    }
-                }
-            }
+            nonce_freshness_gate(ROUTE, nonce_header, pk, peer_id, nonce_authority).await
         }
         (Some(_), None) => {
             tracing::warn!(
@@ -2895,14 +3124,15 @@ pub(super) fn canonical_get_bytes(method: &str, path: &str, query: &str) -> Vec<
 /// arms fire once an operator enrols a peer key.
 /// `AI_MEMORY_FED_REQUIRE_SIG=0` bypasses every branch (mirrors the
 /// `/sync/push` env-var posture).
-pub(super) fn verify_get_signature_or_reject(
+pub(super) async fn verify_get_signature_or_reject(
     method: &str,
     path: &str,
     query: &str,
     headers: &HeaderMap,
     peer_id: Option<&str>,
-    federation_nonce_cache: &crate::identity::replay::FederationNonceCache,
+    nonce_authority: &NonceAuthority<'_>,
 ) -> Option<Response> {
+    const ROUTE: &str = "sync_since";
     if !fed_signing::require_sig() {
         return None;
     }
@@ -2912,6 +3142,9 @@ pub(super) fn verify_get_signature_or_reject(
     let nonce_header = headers
         .get(fed_signing::NONCE_HEADER)
         .and_then(|v| v.to_str().ok());
+    if let Some(refusal) = nonce_oversize_refusal(ROUTE, nonce_header, peer_id) {
+        return Some(refusal);
+    }
     let pubkey = resolve_peer_verifying_key(
         headers,
         peer_id,
@@ -2947,62 +3180,7 @@ pub(super) fn verify_get_signature_or_reject(
                         .into_response(),
                 );
             }
-            // Nonce-freshness gate (same shape as /sync/push).
-            let pid_for_cache = peer_id.unwrap_or("");
-            match nonce_header {
-                Some(nonce) if !nonce.is_empty() => {
-                    match federation_nonce_cache.record_and_check(pid_for_cache, nonce) {
-                        crate::identity::replay::ReplayDecision::Fresh => None,
-                        crate::identity::replay::ReplayDecision::Replay => {
-                            tracing::warn!(
-                                target: crate::federation::SIGNING_TRACE_TARGET,
-                                tag = fed_signing::VerifyError::ReplayedNonce.tag(),
-                                peer_id = %pid_for_cache,
-                                remediation = crate::handlers::federation_wire_notes::remediation::REQUIRE_NONCE,
-                                "sync_since: X-Memory-Nonce replay detected"
-                            );
-                            Some(
-                                (
-                                    StatusCode::UNAUTHORIZED,
-                                    Json(json!({
-                                        "error": fed_signing::VerifyError::ReplayedNonce.tag(),
-                                        "note": crate::handlers::federation_wire_notes::wire::NONCE_REPLAY,
-                                    })),
-                                )
-                                    .into_response(),
-                            )
-                        }
-                    }
-                }
-                _ => {
-                    if fed_signing::require_nonce() {
-                        tracing::warn!(
-                            target: crate::federation::SIGNING_TRACE_TARGET,
-                            tag = fed_signing::VerifyError::NonceMissing.tag(),
-                            peer_id = %pid_for_cache,
-                            remediation = crate::handlers::federation_wire_notes::remediation::REQUIRE_NONCE,
-                            "sync_since: X-Memory-Nonce header absent — strict refusal"
-                        );
-                        Some(
-                            (
-                                StatusCode::UNAUTHORIZED,
-                                Json(json!({
-                                    "error": fed_signing::VerifyError::NonceMissing.tag(),
-                                    "note": crate::handlers::federation_wire_notes::wire::NONCE_MISSING,
-                                })),
-                            )
-                                .into_response(),
-                        )
-                    } else {
-                        tracing::warn!(
-                            target: crate::federation::SIGNING_TRACE_TARGET,
-                            peer_id = %pid_for_cache,
-                            "sync_since: X-Memory-Nonce absent — permissive, accepting"
-                        );
-                        None
-                    }
-                }
-            }
+            nonce_freshness_gate(ROUTE, nonce_header, pk, peer_id, nonce_authority).await
         }
         (Some(_), None) => {
             tracing::warn!(
@@ -3109,8 +3287,9 @@ mod verify_arm_tests {
     //! with synthetic headers rather than going through the router.
 
     use super::{
-        allow_unenrolled_peers_enabled, canonical_get_bytes, require_peer_enrollment_enabled,
-        verify_get_signature_or_reject, verify_signature_or_reject,
+        NonceAuthority, allow_unenrolled_peers_enabled, canonical_get_bytes,
+        require_peer_enrollment_enabled, verify_get_signature_or_reject,
+        verify_signature_or_reject,
     };
     use crate::federation::signing::{
         ED25519_PREFIX, REQUIRE_NONCE_ENV, REQUIRE_SIG_ENV, SIGNATURE_HEADER,
@@ -3126,6 +3305,28 @@ mod verify_arm_tests {
     // letting a parallel run leak the flipped enrollment env across them.
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         crate::handlers::fed_env_test_lock()
+    }
+
+    /// #9140 — the verify gates are async (the shared nonce claim awaits the
+    /// store); drive one on a private current-thread runtime so the sync env
+    /// lock above is never held across an `.await`.
+    fn block_on_test<F: std::future::Future>(fut: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime")
+            .block_on(fut)
+    }
+
+    /// #9192 — a migrated in-memory handle for the sqlite nonce authority.
+    fn authority_db() -> crate::handlers::Db {
+        let conn = crate::db::open(std::path::Path::new(":memory:")).expect("db::open");
+        std::sync::Arc::new(tokio::sync::Mutex::new((
+            conn,
+            std::path::PathBuf::from(":memory:"),
+            crate::config::ResolvedTtl::default(),
+            true,
+        )))
     }
 
     fn sig_header_value() -> HeaderValue {
@@ -3240,7 +3441,14 @@ mod verify_arm_tests {
             std::env::set_var(REQUIRE_SIG_ENV, "0");
         }
         let cache = FederationNonceCache::default();
-        let out = verify_signature_or_reject(&HeaderMap::new(), b"{}", Some("peer-x"), &cache);
+        let db = authority_db();
+        let authority = NonceAuthority::sqlite(&cache, &db);
+        let out = block_on_test(verify_signature_or_reject(
+            &HeaderMap::new(),
+            b"{}",
+            Some("peer-x"),
+            &authority,
+        ));
         unsafe {
             std::env::remove_var(REQUIRE_SIG_ENV);
         }
@@ -3256,8 +3464,15 @@ mod verify_arm_tests {
         let mut headers = HeaderMap::new();
         headers.insert(SIGNATURE_HEADER, sig_header_value());
         let cache = FederationNonceCache::default();
+        let db = authority_db();
+        let authority = NonceAuthority::sqlite(&cache, &db);
         // peer-id has no on-disk key → (Some, None) arm.
-        let out = verify_signature_or_reject(&headers, b"{}", Some("no-such-peer"), &cache);
+        let out = block_on_test(verify_signature_or_reject(
+            &headers,
+            b"{}",
+            Some("no-such-peer"),
+            &authority,
+        ));
         unsafe {
             std::env::remove_var(REQUIRE_SIG_ENV);
         }
@@ -3277,8 +3492,15 @@ mod verify_arm_tests {
             std::env::remove_var("AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS");
         }
         let cache = FederationNonceCache::default();
+        let db = authority_db();
+        let authority = NonceAuthority::sqlite(&cache, &db);
         // No sig, no enrolled key, falsy opt-out → allow-with-WARN (None).
-        let out = verify_signature_or_reject(&HeaderMap::new(), b"{}", Some("unenrolled"), &cache);
+        let out = block_on_test(verify_signature_or_reject(
+            &HeaderMap::new(),
+            b"{}",
+            Some("unenrolled"),
+            &authority,
+        ));
         unsafe {
             std::env::remove_var(REQUIRE_SIG_ENV);
             std::env::remove_var("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT");
@@ -3301,7 +3523,14 @@ mod verify_arm_tests {
             std::env::set_var("AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS", "1");
         }
         let cache = FederationNonceCache::default();
-        let out = verify_signature_or_reject(&HeaderMap::new(), b"{}", Some("unenrolled"), &cache);
+        let db = authority_db();
+        let authority = NonceAuthority::sqlite(&cache, &db);
+        let out = block_on_test(verify_signature_or_reject(
+            &HeaderMap::new(),
+            b"{}",
+            Some("unenrolled"),
+            &authority,
+        ));
         unsafe {
             std::env::remove_var(REQUIRE_SIG_ENV);
             std::env::remove_var("AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS");
@@ -3324,7 +3553,14 @@ mod verify_arm_tests {
             std::env::remove_var("AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS");
         }
         let cache = FederationNonceCache::default();
-        let out = verify_signature_or_reject(&HeaderMap::new(), b"{}", Some("unenrolled"), &cache);
+        let db = authority_db();
+        let authority = NonceAuthority::sqlite(&cache, &db);
+        let out = block_on_test(verify_signature_or_reject(
+            &HeaderMap::new(),
+            b"{}",
+            Some("unenrolled"),
+            &authority,
+        ));
         unsafe {
             std::env::remove_var(REQUIRE_SIG_ENV);
         }
@@ -3339,14 +3575,16 @@ mod verify_arm_tests {
             std::env::set_var(REQUIRE_SIG_ENV, "0");
         }
         let cache = FederationNonceCache::default();
-        let out = verify_get_signature_or_reject(
+        let db = authority_db();
+        let authority = NonceAuthority::sqlite(&cache, &db);
+        let out = block_on_test(verify_get_signature_or_reject(
             "GET",
             "/api/v1/sync/since",
             "limit=10",
             &HeaderMap::new(),
             Some("peer-x"),
-            &cache,
-        );
+            &authority,
+        ));
         unsafe {
             std::env::remove_var(REQUIRE_SIG_ENV);
         }
@@ -3363,14 +3601,16 @@ mod verify_arm_tests {
         let mut headers = HeaderMap::new();
         headers.insert(SIGNATURE_HEADER, sig_header_value());
         let cache = FederationNonceCache::default();
-        let out = verify_get_signature_or_reject(
+        let db = authority_db();
+        let authority = NonceAuthority::sqlite(&cache, &db);
+        let out = block_on_test(verify_get_signature_or_reject(
             "GET",
             "/api/v1/sync/since",
             "limit=10",
             &headers,
             Some("no-such-peer"),
-            &cache,
-        );
+            &authority,
+        ));
         unsafe {
             std::env::remove_var(REQUIRE_SIG_ENV);
             std::env::remove_var(REQUIRE_NONCE_ENV);
@@ -3388,14 +3628,16 @@ mod verify_arm_tests {
             std::env::remove_var("AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS");
         }
         let cache = FederationNonceCache::default();
-        let out = verify_get_signature_or_reject(
+        let db = authority_db();
+        let authority = NonceAuthority::sqlite(&cache, &db);
+        let out = block_on_test(verify_get_signature_or_reject(
             "GET",
             "/api/v1/sync/since",
             "limit=10",
             &HeaderMap::new(),
             Some("unenrolled"),
-            &cache,
-        );
+            &authority,
+        ));
         unsafe {
             std::env::remove_var(REQUIRE_SIG_ENV);
             std::env::remove_var("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT");
@@ -3414,14 +3656,16 @@ mod verify_arm_tests {
             std::env::set_var("AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS", "1");
         }
         let cache = FederationNonceCache::default();
-        let out = verify_get_signature_or_reject(
+        let db = authority_db();
+        let authority = NonceAuthority::sqlite(&cache, &db);
+        let out = block_on_test(verify_get_signature_or_reject(
             "GET",
             "/api/v1/sync/since",
             "limit=10",
             &HeaderMap::new(),
             Some("unenrolled"),
-            &cache,
-        );
+            &authority,
+        ));
         unsafe {
             std::env::remove_var(REQUIRE_SIG_ENV);
             std::env::remove_var("AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS");

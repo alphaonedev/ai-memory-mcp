@@ -890,6 +890,275 @@ fn ladder_effect_derivation_is_not_vacuous() {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// #9187 C1 — `federation_nonce_claims` is LADDER-owned (v103), not bootstrap-only
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The #9187 federation nonce claim table, keyed `(key_fp, nonce_fp)`.
+const NONCE_TABLE: &str = "federation_nonce_claims";
+/// Its PRIMARY KEY column list — the only index the table may carry.
+const NONCE_PK_COLUMNS: &str = "(key_fp, nonce_fp)";
+/// The settled rung a database stamps BEFORE the nonce-claims rung.
+const NONCE_PRE_VERSION: i32 = 101;
+/// The ladder rung that owns `federation_nonce_claims` on postgres.
+const NONCE_LADDER_VERSION: i32 = 103;
+/// The column shape v103 must create, `name:data_type:is_nullable`, in order.
+const NONCE_COLUMNS: &[&str] = &[
+    "key_fp:bytea:NO",
+    "nonce_fp:bytea:NO",
+    "accepted_at:timestamp with time zone:NO",
+];
+/// Rows planted before the idempotency re-run: `(key_fp hex, nonce_fp hex)`.
+const NONCE_PLANTED: &[(&str, &str)] = &[
+    ("9187aa00", "00ff10203040506070"),
+    ("9187bb01", "deadbeefcafe0001"),
+];
+
+/// Every observable byte of the claim table: column definitions (with
+/// defaults), every index definition on it (`pg_get_indexdef`), every row.
+#[derive(Debug, PartialEq, Eq)]
+struct NonceSnapshot {
+    columns: Vec<String>,
+    indexes: Vec<String>,
+    rows: Vec<String>,
+}
+
+async fn nonce_snapshot(pool: &PgPool) -> NonceSnapshot {
+    let columns = sqlx::query_scalar::<_, String>(
+        "SELECT column_name || ':' || data_type || ':' || is_nullable || ':' \
+                || COALESCE(column_default, '<none>') \
+         FROM information_schema.columns \
+         WHERE table_schema = 'public' AND table_name = $1 \
+         ORDER BY ordinal_position",
+    )
+    .bind(NONCE_TABLE)
+    .fetch_all(pool)
+    .await
+    .expect("read claim table columns");
+    let rows = sqlx::query_scalar::<_, String>(
+        "SELECT encode(key_fp, 'hex') || '|' || encode(nonce_fp, 'hex') || '|' \
+                || accepted_at::text \
+         FROM federation_nonce_claims ORDER BY key_fp, nonce_fp",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("read claim table rows");
+    NonceSnapshot {
+        columns,
+        indexes: nonce_index_defs(pool).await,
+        rows,
+    }
+}
+
+async fn nonce_index_defs(pool: &PgPool) -> Vec<String> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT pg_get_indexdef(i.indexrelid) \
+         FROM pg_index i JOIN pg_class t ON t.oid = i.indrelid \
+         JOIN pg_namespace n ON n.oid = t.relnamespace \
+         WHERE n.nspname = 'public' AND t.relname = $1 \
+         ORDER BY 1",
+    )
+    .bind(NONCE_TABLE)
+    .fetch_all(pool)
+    .await
+    .expect("read claim table index definitions")
+}
+
+async fn nonce_pk_is_key_nonce(pool: &PgPool) -> bool {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM pg_index i \
+         JOIN pg_class t ON t.oid = i.indrelid \
+         JOIN pg_namespace n ON n.oid = t.relnamespace \
+         WHERE n.nspname = 'public' AND t.relname = $1 AND i.indisprimary \
+           AND pg_get_indexdef(i.indexrelid) LIKE '%' || $2",
+    )
+    .bind(NONCE_TABLE)
+    .bind(NONCE_PK_COLUMNS)
+    .fetch_one(pool)
+    .await
+    .expect("probe the claim table primary key")
+        == 1
+}
+
+async fn nonce_table_present(pool: &PgPool) -> bool {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM information_schema.tables \
+         WHERE table_schema = 'public' AND table_name = $1",
+    )
+    .bind(NONCE_TABLE)
+    .fetch_one(pool)
+    .await
+    .expect("probe information_schema.tables")
+        == 1
+}
+
+async fn stamp_version(pool: &PgPool, v: i32) {
+    sqlx::query("DELETE FROM schema_version")
+        .execute(pool)
+        .await
+        .expect("clear schema_version");
+    sqlx::query("INSERT INTO schema_version (version) VALUES ($1)")
+        .bind(v)
+        .execute(pool)
+        .await
+        .expect("stamp schema_version");
+}
+
+async fn reconnect(url: &str, why: &str) {
+    let store = PostgresStore::connect(url)
+        .await
+        .unwrap_or_else(|e| panic!("#9187: connect ({why}) must succeed: {e}"));
+    drop(store);
+}
+
+/// #9187 C1 (static half, runs without a database): the postgres LADDER — not
+/// only the every-connect bootstrap — introduces `federation_nonce_claims`, at
+/// rung v103, and no other rung claims it. Bootstrap replay alone is not a
+/// migration: a binary whose bootstrap lacks the DDL would leave a v101
+/// database without the claim table, and the stamp would lie about the shape.
+#[test]
+fn federation_nonce_claims_is_ladder_owned_at_v103() {
+    let effects = ladder_effects_by_version();
+    let eff = effects.get(&NONCE_LADDER_VERSION).unwrap_or_else(|| {
+        panic!(
+            "#9187 C1: no postgres `migrate_v{NONCE_LADDER_VERSION}` arm — `{NONCE_TABLE}` \
+             has no ladder rung and no version stamp"
+        )
+    });
+    assert!(
+        eff.tables.iter().any(|t| t == NONCE_TABLE),
+        "#9187 C1: migrate_v{NONCE_LADDER_VERSION} does not create `{NONCE_TABLE}` \
+         (derived tables: {:?})",
+        eff.tables,
+    );
+    // The PRIMARY KEY is the only index: the rung adds no secondary index.
+    assert!(
+        eff.indexes.is_empty(),
+        "#9187 C1: migrate_v{NONCE_LADDER_VERSION} must add no index beyond the \
+         PRIMARY KEY (derived indexes: {:?})",
+        eff.indexes,
+    );
+    // No OTHER rung may also claim the table: one owner per object.
+    let owners: Vec<i32> = effects
+        .iter()
+        .filter(|(_, e)| e.tables.iter().any(|t| t == NONCE_TABLE))
+        .map(|(v, _)| *v)
+        .collect();
+    assert_eq!(
+        owners,
+        vec![NONCE_LADDER_VERSION],
+        "#9187 C1: `{NONCE_TABLE}` must have exactly one ladder owner",
+    );
+}
+
+/// Why the #9187 v103 nonce-claims ladder cell refuses to run without a tier (sF6).
+const NONCE_LADDER_PG_URL_REQUIRED: &str =
+    "AI_MEMORY_TEST_POSTGRES_URL must be set for the #9187 v103 ladder cell (sF6: no vacuous pass)";
+
+/// #9187 C1 (live half): a database stamped at v101 WITHOUT the claim table
+/// ladders to EXACTLY v103 with the table, its column shape and its
+/// `(key_fp, nonce_fp)` PRIMARY KEY (the only index) present, and a second run
+/// of the v103 rung — both a plain reconnect and a forced re-run from a v101
+/// stamp over the populated table — changes no column, no index definition
+/// and no row.
+#[tokio::test]
+async fn federation_nonce_claims_ladders_from_v101_and_rerun_is_idempotent() {
+    // #9187 sF6: this binary only builds under `sal-postgres`, and every CI leg
+    // that builds it sets the URL, so a missing URL fails instead of passing.
+    let admin_url = postgres_url().expect(NONCE_LADDER_PG_URL_REQUIRED);
+    reap_stale_scratch_dbs(&admin_url).await;
+    let db = ScratchDb::create(&admin_url, "nonce9187").await;
+
+    // 1. A tip database, then rewound to "v101 without the table".
+    reconnect(&db.url, "seed").await;
+    let pool = inspect_pool(&db.url).await;
+    sqlx::query(&format!("DROP TABLE IF EXISTS {NONCE_TABLE} CASCADE"))
+        .execute(&pool)
+        .await
+        .expect("drop the claim table to synthesise the pre-v103 shape");
+    stamp_version(&pool, NONCE_PRE_VERSION).await;
+    // Non-vacuity: the synthesised database really lacks the table.
+    assert!(
+        !nonce_table_present(&pool).await,
+        "#9187: drop did not take"
+    );
+    assert!(
+        nonce_index_defs(&pool).await.is_empty(),
+        "#9187: index survived"
+    );
+    assert_eq!(schema_version_of(&pool).await, NONCE_PRE_VERSION);
+
+    // 2. Ladder it: exact stamp, table, columns and PRIMARY KEY present.
+    reconnect(&db.url, "v101 -> tip").await;
+    assert_eq!(
+        schema_version_of(&pool).await,
+        NONCE_LADDER_VERSION,
+        "#9187 C1: a v101 database did not ladder to exactly v{NONCE_LADDER_VERSION}",
+    );
+    assert!(
+        nonce_table_present(&pool).await,
+        "#9187 C1: `{NONCE_TABLE}` absent after laddering from v{NONCE_PRE_VERSION}",
+    );
+    let shape: Vec<String> = nonce_snapshot(&pool)
+        .await
+        .columns
+        .iter()
+        .map(|c| c.splitn(4, ':').take(3).collect::<Vec<_>>().join(":"))
+        .collect();
+    assert_eq!(
+        shape, NONCE_COLUMNS,
+        "#9187 C1: `{NONCE_TABLE}` has the wrong columns"
+    );
+    assert!(
+        nonce_pk_is_key_nonce(&pool).await,
+        "#9187 C1: `{NONCE_TABLE}` lacks its PRIMARY KEY {NONCE_PK_COLUMNS}",
+    );
+    assert_eq!(
+        nonce_index_defs(&pool).await.len(),
+        1,
+        "#9187 C1: the PRIMARY KEY must be the only index on `{NONCE_TABLE}`",
+    );
+
+    // 3. Populate, snapshot, then re-run twice; nothing may move.
+    for (key_hex, nonce_hex) in NONCE_PLANTED {
+        sqlx::query(
+            "INSERT INTO federation_nonce_claims (key_fp, nonce_fp) \
+             VALUES (decode($1, 'hex'), decode($2, 'hex'))",
+        )
+        .bind(key_hex)
+        .bind(nonce_hex)
+        .execute(&pool)
+        .await
+        .expect("plant a claim row");
+    }
+    let before = nonce_snapshot(&pool).await;
+    assert_eq!(
+        before.rows.len(),
+        NONCE_PLANTED.len(),
+        "#9187: planting failed"
+    );
+
+    reconnect(&db.url, "second run at tip").await;
+    assert_eq!(schema_version_of(&pool).await, NONCE_LADDER_VERSION);
+    assert_eq!(
+        nonce_snapshot(&pool).await,
+        before,
+        "#9187 C1: a second migration run at the tip changed the claim table",
+    );
+
+    stamp_version(&pool, NONCE_PRE_VERSION).await;
+    reconnect(&db.url, "forced v103 re-run over a populated table").await;
+    assert_eq!(schema_version_of(&pool).await, NONCE_LADDER_VERSION);
+    assert_eq!(
+        nonce_snapshot(&pool).await,
+        before,
+        "#9187 C1: re-running the v103 rung over a populated table changed it",
+    );
+
+    pool.close().await;
+    db.destroy().await;
+}
+
 /// Unit-pin the two pure helpers the scratch-database plumbing rests on. They
 /// run with NO database, so they hold in every CI leg — and both guard
 /// irreversible operations: a mis-parsed URL would point `CREATE/DROP DATABASE`

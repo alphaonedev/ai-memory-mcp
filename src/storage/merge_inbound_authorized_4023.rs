@@ -64,6 +64,9 @@ impl std::error::Error for InboundStoredNamespaceRefused {}
 /// authorized), and a same-`id` row appearing concurrently fails the insert
 /// on the primary key rather than being overwritten.
 ///
+/// A receiver merge-barrier drop answers [`InboundMergeOutcome::Dropped`],
+/// never an apply (#9147 C5).
+///
 /// # Errors
 ///
 /// Everything [`merge_inbound`] returns, plus a refusal (built by
@@ -74,7 +77,7 @@ pub fn merge_inbound_authorized(
     inbound: &Memory,
     receiver_verified: bool,
     authorize_stored: Option<StoredNamespaceAuthorizer<'_>>,
-) -> Result<String> {
+) -> Result<InboundMergeOutcome> {
     // Wave-2 B2 — record-stop fence on the same-id overwrite path.
     // `insert_if_newer` (no-row fall-through) already gated; the existing-row
     // branch used to bypass via `overwrite_full_row_by_id`. Federation-receive
@@ -85,14 +88,23 @@ pub fn merge_inbound_authorized(
     // against a concurrent peer push (BEGIN IMMEDIATE — same idiom as
     // `consolidate` / `size_gc`).
     let write_txn = connection::WriteTxn::begin(conn)?;
-    let tx_result = (|| -> Result<Option<String>> {
+    let tx_result = (|| -> Result<Option<InboundMergeOutcome>> {
         // Boids item 3 R2.2 (#3905) — `get_any`, not `get`: `get` hides
         // system-only rows, so a contaminated local row fell through to the
         // insert lane instead of reaching `merge_memory` (whose R2.1
         // predicate keeps the local taint). The postgres twin already reads
         // the raw row by id (`SQL_SELECT_MEMORY_ROW_BY_ID`).
-        match get_any(conn, &inbound.id)? {
-            Some(existing) => {
+        // #9187 / #3901 — the barrier decides from the row the merge really
+        // writes: the inbound id's own row, else (verified push, no live row)
+        // the quarantined title-slot holder of the same author, through the
+        // SAME pipeline as a same-id merge. Anything else falls through.
+        let target = match get_any(conn, &inbound.id)? {
+            Some(existing) => Some((existing, false)),
+            None => super::cross_id_verified_slot_holder(conn, inbound, receiver_verified)?
+                .map(|holder| (holder, true)),
+        };
+        match target {
+            Some((existing, cross_id)) => {
                 // #4023 — re-authorize the row actually being overwritten,
                 // under the write lock (the caller's pre-read may be stale).
                 if let Some(authorize) = authorize_stored
@@ -102,6 +114,17 @@ pub fn merge_inbound_authorized(
                         id: inbound.id.clone(),
                         stored_namespace: existing.namespace.clone(),
                     }));
+                }
+                // #9150 — a held (quarantined / contaminated) row is a merge
+                // barrier: the peer's LWW win must not swap content behind the
+                // hold. Read under this BEGIN IMMEDIATE lock; nothing written.
+                // The only yield is the #1948 route-OUT of a quarantine to a
+                // push THIS receiver verified, re-checked after the merge below.
+                let barrier = receiver_merge_barrier(conn, &existing.id, None)?;
+                if let Some(held) = barrier
+                    && !barrier_yields_to_verified_release(held, receiver_verified)
+                {
+                    return Ok(Some(InboundMergeOutcome::dropped(existing.id, held)));
                 }
                 // #2123 — backend parity with `PostgresStore::merge_inbound`:
                 // the same-`id` field-merge path persists via
@@ -131,14 +154,27 @@ pub fn merge_inbound_authorized(
                 // `updated_at` (the primary LWW key) to a freshness ceiling
                 // so an enrolled relay cannot win the merge by stamping a
                 // far-future timestamp. now + the attestation skew window.
-                let prepared = crate::models::clamp_inbound_updated_at(
+                let mut prepared = crate::models::clamp_inbound_updated_at(
                     sanitized,
                     &chrono::Utc::now().to_rfc3339(),
                     crate::identity::attest::ATTEST_CREATED_AT_SKEW_SECS,
                 );
                 // #224 field-wise merge — the SAME pure reconciler the
                 // postgres adapter calls in Rust (no per-backend drift).
+                // #9187 — a cross-id merge writes the slot holder's row: the unit keeps
+                // the holder's id (the signed surface excludes `id`), so the same-id
+                // reconciler's precondition holds and the merge never lands as X.
+                if cross_id {
+                    prepared.id.clone_from(&existing.id);
+                }
                 let merged = crate::models::merge_memory(&existing, &prepared);
+                // #9150 — a yielded quarantine releases the verified unit, not
+                // the LWW blend (which keeps the local `created_at`).
+                let merged = if barrier.is_some() {
+                    super::verified_release_candidate(&existing, &prepared, merged)
+                } else {
+                    merged
+                };
                 // #2863 — re-assert the receiver-VERIFIED `agent_attested` level
                 // ATOMICALLY (inside this BEGIN IMMEDIATE tx, before the
                 // content-sealing `overwrite_full_row_by_id`). `sanitize` above
@@ -149,31 +185,42 @@ pub fn merge_inbound_authorized(
                 // byte-identical to the verified inbound, restore `agent_attested`.
                 // No-op when `receiver_verified` is false (every non-receive
                 // caller) — byte-identical legacy merge.
+                // #9187 V-4 — never on a cross-id holder: the signature covered
+                // the inbound id's unit, not this node's hold on the holder.
                 let merged = crate::models::reassert_verified_attestation(
                     merged,
                     inbound,
-                    receiver_verified,
+                    receiver_verified && !cross_id,
                 );
+                // #9150 — a yielded quarantine admits ONLY the exact signed
+                // unit this receiver verified; any other merge outcome (a
+                // stale or partially-merged row) stays behind the hold.
+                if let Some(held) = barrier
+                    && !crate::models::is_verified_signed_unit(&merged, inbound, receiver_verified)
+                {
+                    return Ok(Some(InboundMergeOutcome::dropped(existing.id, held)));
+                }
                 overwrite_full_row_by_id(conn, &merged)?;
-                Ok(Some(merged.id))
+                Ok(Some(InboundMergeOutcome::Applied(merged.id)))
             }
-            // No row by this id — defer to the (title, namespace) dedup
-            // path OUTSIDE this transaction (signalled by `None`).
+            // No row by this id and no cross-id yield — defer to the
+            // (title, namespace) dedup path OUTSIDE this transaction
+            // (signalled by `None`), whose slot barrier still drops a held slot.
             None => Ok(None),
         }
     })();
 
     match tx_result {
-        Ok(Some(id)) => {
+        Ok(Some(outcome)) => {
             write_txn.commit()?;
-            Ok(id)
+            Ok(outcome)
         }
         Ok(None) => {
             // Nothing was written in the merge transaction; close it
             // cleanly and fall through to the unchanged LWW path
             // (handles fresh insert + (title, namespace) dedup-upsert).
             write_txn.commit()?;
-            insert_if_newer(conn, inbound)
+            insert_if_newer_outcome(conn, inbound)
         }
         // #4116 — settle deferred escalations, then report the REAL outcome.
         Err(e) => Err(write_txn.rollback_resolving(e)),

@@ -51,9 +51,9 @@ choice. Switch to postgres+AGE when one or more of these is true:
   sharing the same store. Postgres is the supported topology;
   sqlite-over-NFS is not.
 
-The two backends are at **schema parity at v101**
-(`CURRENT_SCHEMA_VERSION = 101` on both ladders — the postgres upgrade
-ladder ends at `migrate_v101()`).
+The two backends are at **schema parity at v103**
+(`CURRENT_SCHEMA_VERSION = 103` on both ladders — the postgres upgrade
+ladder ends at `migrate_v103()`).
 
 **Schema parity is NOT feature parity.** Some postgres ladder arms are
 version-stamp no-ops rather than real DDL, so a matching version number
@@ -345,7 +345,7 @@ What it does (see `src/cli/schema_init.rs`):
    `migrate` verb uses — the open itself runs `INIT_SCHEMA` (the
    bundled `src/store/postgres_schema.sql`, idempotent `CREATE TABLE
    IF NOT EXISTS` throughout) plus the in-process upgrade ladder up to
-   schema v101 (the current `CURRENT_SCHEMA_VERSION`) as a side effect. The
+   schema v103 (the current `CURRENT_SCHEMA_VERSION`) as a side effect. The
    `vector` (pgvector) extension is
    **required** — `CREATE EXTENSION IF NOT EXISTS vector` failing
    aborts the bootstrap.
@@ -367,7 +367,7 @@ What it does (see `src/cli/schema_init.rs`):
    true` in the JSON report).
 4. Enumerates the resulting catalog and prints the human summary
    (tables / indices / views / functions / extensions /
-   `schema_version: 101`) or the `--json` report.
+   `schema_version: 103`) or the `--json` report.
 
 Idempotent on rerun — safe to invoke from a deploy script. Exit code
 0 on success, non-zero on connection / bootstrap failure.
@@ -1179,6 +1179,41 @@ What this means for an operator:
   postgres receiver does not carry a second implementation that could
   drift from the sqlite one.
 
+### Federation nonce claims (`federation_nonce_claims`, v103, #9192)
+
+A signed federation request (`POST /sync/push` and the signed
+`GET /sync/since`) carries an `X-Memory-Nonce` with no timestamp, so the
+receiver refuses a nonce for as long as the signing key lives. Each accepted
+`(signing key, nonce)` pair is one row in `federation_nonce_claims`
+(`key_fp BYTEA, nonce_fp BYTEA, accepted_at TIMESTAMPTZ`, PRIMARY KEY
+`(key_fp, nonce_fp)`). One `INSERT ... ON CONFLICT DO NOTHING` per request,
+committed in its own transaction, decides it: one row inserted is fresh, zero
+rows is a replay (401 `x_memory_nonce_replay`). Every daemon over the same
+database shares the table, so a sibling daemon refuses a nonce the other one
+accepted. The in-process cache in front of it never decides alone.
+
+- **Rows are never pruned.** Size the database for one row per accepted
+  signed request: about 235 bytes per row on PostgreSQL 18, heap plus
+  PRIMARY KEY index (`pg_total_relation_size`, measured at 100 000 rows by
+  `tests/federation_nonce_claims_9192.rs`). A peer that polls
+  `GET /sync/since` at the default 30 s catch-up interval adds 2 880 rows a
+  day.
+- **Outage behaviour.** If the claim cannot be made or its COMMIT fails, the
+  receiver answers **503** `{"error":"nonce_store_unavailable"}`, admits
+  nothing and increments
+  `ai_memory_federation_nonce_store_unavailable_total`. The sender retries
+  with a fresh nonce.
+- **Durability.** A claim is as durable as the server's
+  `synchronous_commit` (default `on`). With `synchronous_commit = off` a
+  server crash can lose the most recent claims, and those nonces become
+  acceptable once more.
+- **Residuals.** Claims belong to one receiver database: restoring a backup
+  forgets the claims made after it, and a request captured on its way to one
+  receiver can be replayed to a different receiver that never saw it.
+- The pre-v103 PostgreSQL `federation_nonce_cache` table is not created any
+  more. A PostgreSQL database never held v51 nonce rows (v51 is a no-op stamp
+  on this backend).
+
 ## Performance notes
 
 ### pgvector HNSW
@@ -1437,7 +1472,7 @@ parity test is the gate that prevents it.
 | | sqlite | postgres |
 |---|---|---|
 | Live daemon | ✓ (default) | ✓ (Wave 3) |
-| Schema parity | v101 | v101 (`CURRENT_SCHEMA_VERSION` pinned in lockstep) |
+| Schema parity | v103 | v103 (`CURRENT_SCHEMA_VERSION` pinned in lockstep) |
 | `link()` | ✓ | ✓ (Wave 1 Stream A) |
 | `register_agent()` | ✓ | ✓ (Wave 1 Stream A) |
 | Recall 6-factor scoring (SAL `search`) | ✓ | ✓ (Wave 1 Stream A) |

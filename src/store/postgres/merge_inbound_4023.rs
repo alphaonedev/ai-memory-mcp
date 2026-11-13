@@ -25,14 +25,16 @@ impl PostgresStore {
     /// Shared body of [`MemoryStore::merge_inbound`] and (#4023)
     /// [`MemoryStore::merge_inbound_authorized`]: `authorize_stored` is `None`
     /// for the unchecked legacy entry and `Some` for the federation receive
-    /// funnel's in-transaction peer-scope re-check.
+    /// funnel's in-transaction peer-scope re-check. A receiver merge-barrier
+    /// drop answers [`crate::storage::InboundMergeOutcome::Dropped`], never an
+    /// apply (#9147 C5).
     pub(super) async fn pg_merge_inbound(
         &self,
         ctx: &CallerContext,
         inbound: &Memory,
         receiver_verified: bool,
         authorize_stored: Option<crate::storage::StoredNamespaceAuthorizer<'_>>,
-    ) -> StoreResult<String> {
+    ) -> StoreResult<crate::storage::InboundMergeOutcome> {
         self.gate_record_stop().await?;
         // v0.8.1 W2.3 (#1821 / gap G30) — resurrection guard (postgres parity
         // with the sqlite insert_if_newer gate). DROP an inbound write for a
@@ -50,7 +52,10 @@ impl PostgresStore {
                 "{}",
                 crate::storage::FORGET_TOMBSTONE_DROP_MSG
             );
-            return Ok(inbound.id.clone());
+            return Ok(crate::storage::InboundMergeOutcome::dropped(
+                inbound.id.clone(),
+                crate::storage::ReceiverMergeBarrier::Tombstoned,
+            ));
         }
 
         // v0.8.1 W1 (#1821 / gap G29) — credential REDACT on the postgres
@@ -96,14 +101,37 @@ impl PostgresStore {
             .await
             .map_err(|e| to_store_err("merge_inbound select by id", e))?;
 
-        let Some(row) = existing_row else {
-            // No row by this id — defer to the unchanged LWW path (the empty
-            // transaction is rolled back on drop).
-            drop(tx);
-            return self.apply_remote_memory(ctx, inbound).await;
+        // #9187 / #3901 — the barrier decides from the row the merge really
+        // writes: the inbound id's own row, else (verified push, no live row)
+        // the quarantined title-slot holder of the same author, through the
+        // SAME pipeline as a same-id merge (sqlite twin:
+        // `db::merge_inbound_authorized`).
+        let (row, cross_id) = match existing_row {
+            Some(row) => (row, false),
+            None => match super::merge_barrier_9147::pg_cross_id_slot_holder_row(
+                &mut tx,
+                inbound,
+                receiver_verified,
+            )
+            .await
+            .map_err(|e| to_store_err("merge_inbound cross-id slot holder", e))?
+            {
+                Some(row) => (row, true),
+                None => {
+                    // No row by this id and no cross-id yield — defer to the
+                    // unchanged LWW path (the transaction is rolled back on
+                    // drop), whose slot barrier still drops a held slot.
+                    drop(tx);
+                    return self.apply_remote_memory_outcome(ctx, inbound).await;
+                }
+            },
         };
 
         let existing = Self::row_to_memory(&row)?;
+        if cross_id && !crate::storage::is_cross_id_yield_holder(&existing, inbound) {
+            drop(tx);
+            return self.apply_remote_memory_outcome(ctx, inbound).await;
+        }
         // #4023 — re-authorize the peer's scope against the row actually being
         // overwritten, read `FOR UPDATE` under this transaction: the funnel's
         // scope gate ran on an earlier pool read, and `merge_memory` LWWs
@@ -122,6 +150,25 @@ impl PostgresStore {
                 ),
             });
         }
+        // #9150 — a held (quarantined / contaminated) row, or a tombstone /
+        // archived-only id, is a merge barrier: the peer's LWW win must not
+        // swap content behind it. Read under the `FOR UPDATE` lock above;
+        // nothing written (the transaction is rolled back on drop).
+        // The only yield is the #1948 route-OUT of a quarantine to a push
+        // THIS receiver verified, re-checked after the merge below.
+        let barrier =
+            super::merge_barrier_9147::pg_receiver_merge_barrier(&mut tx, &existing.id, None)
+                .await
+                .map_err(|e| to_store_err("merge_inbound merge barrier probe", e))?;
+        if let Some(held) = barrier
+            && !crate::storage::barrier_yields_to_verified_release(held, receiver_verified)
+        {
+            drop(tx);
+            return Ok(crate::storage::InboundMergeOutcome::dropped(
+                existing.id,
+                held,
+            ));
+        }
         // #1719 item 3a — neutralize the untrusted inbound's self-asserted
         // `metadata.attest_level` to `claimed` before merge (identical to
         // the sqlite `db::merge_inbound` boundary, no per-backend drift) so
@@ -132,12 +179,25 @@ impl PostgresStore {
         // primary LWW key) to a freshness ceiling (identical to the sqlite
         // `db::merge_inbound` boundary, no per-backend drift) so an enrolled
         // relay cannot win the merge by stamping a far-future timestamp.
-        let prepared = crate::models::clamp_inbound_updated_at(
+        let mut prepared = crate::models::clamp_inbound_updated_at(
             sanitized,
             &chrono::Utc::now().to_rfc3339(),
             crate::identity::attest::ATTEST_CREATED_AT_SKEW_SECS,
         );
+        // #9187 — a cross-id merge writes the slot holder's row: the unit keeps
+        // the holder's id (the signed surface excludes `id`), so the same-id
+        // reconciler's precondition holds and the merge never lands as X.
+        if cross_id {
+            prepared.id.clone_from(&existing.id);
+        }
         let merged = crate::models::merge_memory(&existing, &prepared);
+        // #9150 — a yielded quarantine releases the verified unit, not the LWW
+        // blend (sqlite twin: `db::merge_inbound`).
+        let merged = if barrier.is_some() {
+            crate::storage::verified_release_candidate(&existing, &prepared, merged)
+        } else {
+            merged
+        };
         // #2863 — atomic `agent_attested` re-assert (postgres twin of the sqlite
         // `db::merge_inbound` path): `sanitize` above demoted the inbound level
         // to `claimed` for the LWW tiebreak, but that must not DEMOTE a level
@@ -147,8 +207,24 @@ impl PostgresStore {
         // restored level flows into the `metadata` column encoded below, so it is
         // written in the SAME UPDATE (atomic, no crash window). No-op when
         // `receiver_verified` is false.
-        let merged =
-            crate::models::reassert_verified_attestation(merged, inbound, receiver_verified);
+        // #9187 V-4 — never on a cross-id holder: the signature covered the
+        // inbound id's unit, not this node's hold on the holder.
+        let merged = crate::models::reassert_verified_attestation(
+            merged,
+            inbound,
+            receiver_verified && !cross_id,
+        );
+        // #9150 — a yielded quarantine admits ONLY the exact signed unit this
+        // receiver verified (sqlite twin: `db::merge_inbound`).
+        if let Some(held) = barrier
+            && !crate::models::is_verified_signed_unit(&merged, inbound, receiver_verified)
+        {
+            drop(tx);
+            return Ok(crate::storage::InboundMergeOutcome::dropped(
+                existing.id,
+                held,
+            ));
+        }
 
         // Encode the JSON-shaped columns the same way the
         // `apply_remote_memory` insert path does.
@@ -290,6 +366,6 @@ impl PostgresStore {
             .await
             .map_err(|e| to_store_err("merge_inbound commit tx", e))?;
 
-        Ok(merged.id)
+        Ok(crate::storage::InboundMergeOutcome::Applied(merged.id))
     }
 }

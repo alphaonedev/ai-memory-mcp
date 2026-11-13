@@ -1605,6 +1605,22 @@ CREATE TABLE IF NOT EXISTS attested_write_ledger (
 CREATE INDEX IF NOT EXISTS idx_attested_write_ledger_seen_at
     ON attested_write_ledger(seen_at);
 
+-- v103 (#9187, v1.0.0) — FEDERATION NONCE CLAIMS. Shape: key_fp BYTEA (the
+-- push's signing-key fingerprint), nonce_fp BYTEA (its nonce fingerprint),
+-- accepted_at TIMESTAMPTZ, PRIMARY KEY (key_fp, nonce_fp). The PRIMARY KEY is
+-- the atomic arbiter: the first INSERT of a pair wins at every daemon over this
+-- store, any later one is a replay. It is the only index. Rows are never
+-- pruned: the replay window is the signing-key lifetime, because the signed
+-- nonce carries no time (see #9234). Ladder-owned by `migrate_v103`
+-- (migrations/postgres/0059_v103_federation_nonce_claims.sql); this bootstrap
+-- copy is the same idempotent CREATE TABLE IF NOT EXISTS.
+CREATE TABLE IF NOT EXISTS federation_nonce_claims (
+    key_fp      BYTEA       NOT NULL,
+    nonce_fp    BYTEA       NOT NULL,
+    accepted_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (key_fp, nonce_fp)
+);
+
 -- v96 (#3344, v1.0.0) — DURABLE EMBED SKIP LIST. Derived cache of rows that
 -- cannot be embedded under the current key material (undecryptable envelope)
 -- or that exceed the embed byte cap. Boot/backfill skip them without a

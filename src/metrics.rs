@@ -325,6 +325,10 @@ pub struct Metrics {
     /// cross-process `forensic.lock` (it could not be opened or locked).
     pub forensic_lock_unavailable: IntCounter,
 
+    /// #9192 (C3) - monotonic count of federation nonce claims refused because
+    /// the authoritative claims store could not answer (503, nothing admitted).
+    pub federation_nonce_store_unavailable: IntCounter,
+
     /// #7281 (ERRORS-19) - monotonic count of audit anchors dropped unrecorded
     /// because their append ran in a raw transaction with no `WriteTxn` frame.
     /// Under-emission only, never a false verdict; non-zero names a caller
@@ -342,6 +346,13 @@ pub struct Metrics {
     /// Paired with a per-merge WARN naming both ids at the merge site, so
     /// the divergence is never silent inside an HTTP 200.
     pub federation_cross_id_title_merge: IntCounter,
+
+    /// #9147 C5 — inbound federated upserts DROPPED by the receiver merge
+    /// barrier (nothing written), labeled by `barrier` (the closed
+    /// [`crate::storage::ReceiverMergeBarrier::as_str`] tag set). A drop is
+    /// never counted as applied; the receive response reports the same count
+    /// as `merge_barrier_dropped`.
+    pub federation_merge_barrier_dropped: IntCounterVec,
 
     /// v1.0.0 #2402 — the route-OUT twin of
     /// [`Self::federation_quarantined_unattributed`]: monotonic count of
@@ -1136,6 +1147,16 @@ impl Metrics {
             &mut err,
         );
 
+        // #9192 (C3) - a federation nonce claim the store could not decide.
+        let federation_nonce_store_unavailable = int_counter(
+            &registry,
+            "ai_memory_federation_nonce_store_unavailable_total",
+            "Monotonic count of signed federation requests refused with 503 \
+             nonce_store_unavailable because the nonce claims store could not \
+             answer; nothing was admitted or cached (#9192).",
+            &mut err,
+        );
+
         let audit_anchor_frameless_drop = int_counter(
             &registry,
             "ai_memory_audit_anchor_frameless_drop_total",
@@ -1176,6 +1197,19 @@ impl Metrics {
              Always zero when the quarantine knob is off (the singleton and team shapes unless set; the federated, hive and production shapes force it on); a \
              non-zero rate means a peer is relaying provenance-less content \
              this node is black-holing. #2966.",
+            &mut err,
+        );
+
+        // #9147 C5 — receiver merge-barrier drops (closed `barrier` labels).
+        let federation_merge_barrier_dropped = int_counter_vec(
+            &registry,
+            "ai_memory_fed_merge_barrier_dropped_total",
+            "Inbound federated upserts dropped by the receiver merge barrier \
+             (the target id is tombstoned, archived with no live row, or held \
+             in quarantine / contamination), labeled by barrier. Nothing is \
+             written and the row is never counted as applied; the receive \
+             response reports the same drops as merge_barrier_dropped.",
+            &["barrier"],
             &mut err,
         );
 
@@ -1599,8 +1633,10 @@ impl Metrics {
             federation_quarantined_unattributed,
             forensic_sink_unavailable,
             forensic_lock_unavailable,
+            federation_nonce_store_unavailable,
             audit_anchor_frameless_drop,
             federation_cross_id_title_merge,
+            federation_merge_barrier_dropped,
             operator_dequarantined,
             hnsw_evictions_total,
             hnsw_last_eviction_at_nanos,
@@ -1774,6 +1810,17 @@ pub fn inc_forensic_lock_unavailable() {
     registry().forensic_lock_unavailable.inc();
 }
 
+/// #9192 (C3) - record one federation nonce claim the store could not decide.
+pub fn inc_federation_nonce_store_unavailable() {
+    registry().federation_nonce_store_unavailable.inc();
+}
+
+/// #9192 (C3) - read [`inc_federation_nonce_store_unavailable`]'s counter.
+#[must_use]
+pub fn federation_nonce_store_unavailable_count() -> u64 {
+    registry().federation_nonce_store_unavailable.get()
+}
+
 /// #7281 - an audit anchor was dropped unrecorded (frameless raw transaction).
 pub fn inc_audit_anchor_frameless_drop() {
     registry().audit_anchor_frameless_drop.inc();
@@ -1824,6 +1871,28 @@ pub fn fed_quarantined_unattributed_count() -> u64 {
 /// caller emits the paired WARN naming both ids (`federation.cross_id_merge`).
 pub fn inc_fed_cross_id_title_merge() {
     registry().federation_cross_id_title_merge.inc();
+}
+
+/// #9147 C5 — record ONE inbound federated upsert dropped by the receiver
+/// merge barrier named by `barrier` (a
+/// [`crate::storage::ReceiverMergeBarrier::as_str`] tag). Called only by
+/// [`crate::storage::InboundMergeOutcome::dropped`], so every backend and
+/// funnel counts a drop exactly once.
+pub fn inc_fed_merge_barrier_dropped(barrier: &str) {
+    registry()
+        .federation_merge_barrier_dropped
+        .with_label_values(&[barrier])
+        .inc();
+}
+
+/// #9147 C5 — read the merge-barrier drop counter for one `barrier` label
+/// (test accessor).
+#[must_use]
+pub fn fed_merge_barrier_dropped_count(barrier: &str) -> u64 {
+    registry()
+        .federation_merge_barrier_dropped
+        .with_label_values(&[barrier])
+        .get()
 }
 
 /// #3699 — read the cross-id title-merge counter (test accessor).

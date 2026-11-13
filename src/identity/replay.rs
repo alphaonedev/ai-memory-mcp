@@ -56,11 +56,14 @@
 //!    persistence path is the precedent to mirror).
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::{Path, PathBuf};
+use std::num::NonZeroUsize;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use sha2::{Digest, Sha256};
+
+/// The tracing target of every replay-cache log line in this module.
+const REPLAY_LOG_TARGET: &str = "ai_memory::identity::replay";
 
 /// #2032 LM3 (class-a, 5-agent vote `4d3ea1c5`) — per-CALLER FIFO bound for
 /// the replay-protection cache. Mirrors [`FEDERATION_NONCE_CAPACITY_PER_PEER`]
@@ -173,7 +176,7 @@ impl ReplayCache {
                 guard.remove(&evict_id);
                 self.caller_evictions.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(
-                    target: "ai_memory::identity::replay",
+                    target: REPLAY_LOG_TARGET,
                     evicted_caller = %evict_id,
                     "ReplayCache: at caller ceiling ({}); evicted LRU caller slot to make \
                      room (#2032 LM3). Operator-visible via caller_evictions_since_boot().",
@@ -284,6 +287,12 @@ pub enum ReplayDecision {
     Fresh,
     /// Identical fingerprint has been seen before. Caller must reject.
     Replay,
+    /// #9192 (C3) — the durable nonce store could not answer (database
+    /// error, lost table, failed commit). Nothing was admitted and nothing
+    /// was cached; the caller refuses with 503 `nonce_store_unavailable`
+    /// (never with a replay 401, never by admitting the request). Only the
+    /// federation nonce paths return it; [`ReplayCache`] never does.
+    Unavailable,
 }
 
 #[cfg(test)]
@@ -560,799 +569,913 @@ mod tests {
 }
 
 // ---------------------------------------------------------------------------
-// v0.7.0 #922 — federation per-peer nonce replay cache
+// #9192 (C2 + C3) — federation nonce claims: key-lifetime replay protection
 // ---------------------------------------------------------------------------
+//
+// Ruling R (PR #9187 review r1, 3-agent vote 71472661; wire envelope #9234):
+// the signed federation nonce carries no time, so the replay window is the
+// lifetime of the signing key and an accepted nonce is NEVER forgotten. The
+// authoritative record is one row per accepted `(key_fp, nonce_fp)` pair in the
+// store's `federation_nonce_claims` table (schema v103). Its PRIMARY KEY is the
+// atomic arbiter: ONE `INSERT ... ON CONFLICT DO NOTHING` decides — one row
+// inserted means this request claimed the nonce, zero rows means some earlier
+// request (on any daemon over the store) already did, and an error means the
+// store could not answer. Nothing prunes, deletes or selects-then-inserts.
+//
+// The claim is at-most-once: a request whose claim committed but whose handler
+// then failed (or whose future was dropped) has burned its nonce, and the
+// sender must re-sign with a fresh one. That is the safe direction.
+//
+// [`FederationNonceCache`] is a BOUNDED, per-process cache in front of that
+// table and nothing more. Every check calls the store; the cache is filled only
+// after the store has answered; eviction drops cache entries, never rows.
+//
+// Growth (#9192, measured at 100 000 claim rows, PK index included): sqlite
+// 162 bytes per row (rowid table plus the PRIMARY KEY index, measured with
+// `dbstat`), PostgreSQL 18 235 bytes per row (`pg_total_relation_size`, heap
+// plus PK index). One row per accepted signed push AND per signed
+// `GET /sync/since` (a catch-up poller at one GET per peer per 30 s adds about
+// 2 880 rows per peer per day: about 0.47 MB sqlite, 0.68 MB PostgreSQL).
 
-/// v0.7.0 #922 — per-peer LRU bound.
+/// v0.7.0 #922 / #9192 — per-key bound of the in-process CACHE.
 ///
-/// v0.7.0 #1061 (Agent-2 #8) — known limitation: the per-peer cap
-/// is 10000 fingerprints with FIFO eviction. An enrolled peer
-/// (or an attacker with a past key compromise) can submit 10001
-/// fresh-nonce signed pushes to evict `nonce-0`, then re-send the
-/// captured `(body, sig, nonce-0)` tuple — no longer in cache,
-/// accepted as fresh. With Ed25519 sigs that never expire, the
-/// replay window stays open for the lifetime of the key.
-///
-/// The v0.7.0 mitigations are:
-///   - Per-peer partitioning (#922): an attacker can only flood
-///     THEIR OWN slot, not cross-peer entries (so the threat is
-///     scoped to compromised-key scenarios, not broad DoS).
-///   - Outer LRU + peer ceiling (#1038): bounds the total memory
-///     footprint at ~320 MB worst-case.
-///   - Cache capacity bumped 10× via #1033 (10000-per-peer slot
-///     size set here).
-///
-/// The deeper v0.8 fix (per Agent-2's recommendation) is to bind
-/// nonce freshness to a strictly-monotonic peer-side counter (or
-/// include a receiver clock-window) so any nonce older than the
-/// highest-seen value for the peer is refused regardless of cache
-/// membership. That requires a protocol change (peer-side
-/// counter persistence + clock-skew handling) and is tracked as
-/// a v0.8 federation hardening follow-up. For v0.7.0 the
-/// flush-attack surface is documented as a KNOWN limitation
-/// gated by per-peer-key compromise.
+/// It bounds memory only. A nonce that falls out of the cache is still
+/// refused, because every check consults the claims store (Ruling R).
 pub const FEDERATION_NONCE_CAPACITY_PER_PEER: usize = 10_000;
 
-/// v0.7.0 #1038 (Agent-5 #5) — outer-HashMap LRU bound on the
-/// `FederationNonceCache`. Each enrolled peer's slot costs
-/// ~320 KB (10k × 32-byte fingerprints in both the HashSet and
-/// the VecDeque); a long-lived daemon that rotates peers (operator
-/// adds + removes peers in `AI_MEMORY_FED_PEER_ATTESTATION`)
-/// leaves old peer-id slots resident forever pre-#1038. The
-/// ceiling caps the worst-case footprint at ~320 KB × 1024 =
-/// ~320 MB — well within process budget for any realistic
-/// deployment (operator-scale is ~10-100 peers; we leave 10× headroom).
-/// Eviction picks the least-recently-touched peer when a new peer
-/// pushes past the ceiling.
+/// v0.7.0 #922 / #9192 — number of signing-key slots the CACHE keeps before it
+/// drops the least-recently-touched slot. Dropping a slot drops cache entries,
+/// never claim rows.
 pub const FEDERATION_NONCE_MAX_PEERS: usize = 1024;
 
-/// v0.7.0 #1033 (federation parity) — same O(1) `HashSet + VecDeque`
-/// shape as `ReplayCacheInner`, applied per-peer so each peer's
-/// freshness check runs in O(1) instead of the pre-#1033 O(N) linear
-/// scan. The per-peer partitioning (already in place pre-#1033)
-/// limits cross-peer eviction so an attacker can only evict THEIR
-/// OWN entries — a weaker threat than the un-partitioned
-/// ReplayCache, but the perf gain matters under sustained federation
-/// load.
+/// #9192 item 6 — the largest `X-Memory-Nonce` (or per-op transition nonce,
+/// base64) a receiver accepts. Outbound peers send a hyphenated UUID (36 bytes)
+/// and a transition nonce is 16-32 random bytes (24-44 base64 bytes); 256 is
+/// several times the largest legitimate form and keeps a hostile peer from
+/// making the receiver hash and store an arbitrarily large header. An oversize
+/// nonce is refused with 401 BEFORE any claim, so it adds no row.
+pub const FEDERATION_NONCE_MAX_BYTES: usize = 256;
+
+/// #9192 item 1 — domain separator of the fingerprint of a verifying key.
+const NONCE_KEY_DOMAIN: &[u8] = b"ai-memory/federation-nonce-key/v1\0";
+
+/// #9192 item 1 — domain separator of the namespace of a nonce whose request
+/// was NOT signature-verified (permissive `AI_MEMORY_FED_REQUIRE_SIG=0`). It
+/// cannot collide with a key namespace (different domain, same hash).
+const NONCE_UNVERIFIED_PEER_DOMAIN: &[u8] = b"ai-memory/federation-nonce-unverified-peer/v1\0";
+
+/// #9192 — the read-only lookup in the legacy v51 `federation_nonce_cache`
+/// table: a nonce a pre-v103 receiver accepted is still a replay. That table
+/// is never written, pruned or deleted from any more.
+const SQL_LEGACY_NONCE_LOOKUP: &str =
+    "SELECT 1 FROM federation_nonce_cache WHERE peer_id = ?1 AND fingerprint = ?2";
+
+/// #9192 — the one statement that decides a sqlite claim (PK is the arbiter).
+const SQL_CLAIM_NONCE: &str = "INSERT INTO federation_nonce_claims \
+     (key_fp, nonce_fp, accepted_at) VALUES (?1, ?2, ?3) \
+     ON CONFLICT (key_fp, nonce_fp) DO NOTHING";
+
+/// #9192 — why a nonce cannot be turned into a claim key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NonceKeyError {
+    /// The nonce is empty.
+    NonceEmpty,
+    /// The nonce is longer than [`FEDERATION_NONCE_MAX_BYTES`].
+    NonceTooLong {
+        /// The refused nonce length in bytes.
+        len: usize,
+    },
+    /// The peer id does not fit the length prefix (over 4 GiB).
+    PeerIdTooLong,
+}
+
+impl std::fmt::Display for NonceKeyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NonceEmpty => f.write_str("federation nonce is empty"),
+            Self::NonceTooLong { len } => write!(
+                f,
+                "federation nonce is {len} bytes, over the {FEDERATION_NONCE_MAX_BYTES}-byte bound"
+            ),
+            Self::PeerIdTooLong => f.write_str("federation peer id does not fit a u32 length"),
+        }
+    }
+}
+
+impl std::error::Error for NonceKeyError {}
+
+/// Hash `bytes` behind its big-endian `u32` length (PERF-07: checked).
+fn update_length_prefixed(hasher: &mut Sha256, bytes: &[u8]) -> Option<()> {
+    let len = u32::try_from(bytes.len()).ok()?;
+    hasher.update(len.to_be_bytes());
+    hasher.update(bytes);
+    Some(())
+}
+
+/// Refuse an empty or oversize nonce before anything hashes or stores it.
 ///
-/// v0.7.0 #1038 — `last_touch` tracks the monotonic counter at the
-/// last `record_and_check` for this peer. The outer LRU evicts the
-/// slot with the smallest `last_touch` when at the
-/// `FEDERATION_NONCE_MAX_PEERS` ceiling. Using a u64 counter
-/// instead of `Instant` keeps the comparison O(1) and the eviction
-/// path lock-free of clock reads.
+/// # Errors
+/// [`NonceKeyError::NonceEmpty`] or [`NonceKeyError::NonceTooLong`].
+pub fn check_nonce_len(nonce: &str) -> Result<(), NonceKeyError> {
+    match nonce.len() {
+        0 => Err(NonceKeyError::NonceEmpty),
+        len if len > FEDERATION_NONCE_MAX_BYTES => Err(NonceKeyError::NonceTooLong { len }),
+        _ => Ok(()),
+    }
+}
+
+/// #9192 item 1 — the identity of one nonce claim: the namespace (`key_fp`, the
+/// fingerprint of the key that verified the request), the nonce (`nonce_fp`),
+/// and the v51 legacy fingerprint looked up read-only.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct NonceClaimKey {
+    key_fp: [u8; 32],
+    nonce_fp: [u8; 32],
+    legacy_peer_id: String,
+    legacy_fp: [u8; 32],
+}
+
+impl NonceClaimKey {
+    /// The claim key of `nonce` on a request whose signature VERIFIED against
+    /// `verifying_key` (the raw 32 Ed25519 public-key bytes). The namespace is
+    /// the key, so push and GET share it, and removing then re-adding the peer
+    /// with the same key keeps every earlier nonce refused. `peer_id` only
+    /// selects the legacy v51 rows.
+    ///
+    /// # Errors
+    /// See [`check_nonce_len`]; [`NonceKeyError::PeerIdTooLong`].
+    pub fn for_verifying_key(
+        verifying_key: &[u8; 32],
+        peer_id: &str,
+        nonce: &str,
+    ) -> Result<Self, NonceKeyError> {
+        let mut hasher = Sha256::new();
+        hasher.update(NONCE_KEY_DOMAIN);
+        hasher.update(verifying_key);
+        Self::build(hasher.finalize().into(), peer_id, nonce)
+    }
+
+    /// The claim key of `nonce` on a request that was NOT signature-verified
+    /// (the permissive posture): the namespace is the asserted peer id, under
+    /// its own domain so it can never alias a key namespace.
+    ///
+    /// # Errors
+    /// See [`check_nonce_len`]; [`NonceKeyError::PeerIdTooLong`].
+    pub fn for_unverified_peer(peer_id: &str, nonce: &str) -> Result<Self, NonceKeyError> {
+        let mut hasher = Sha256::new();
+        hasher.update(NONCE_UNVERIFIED_PEER_DOMAIN);
+        update_length_prefixed(&mut hasher, peer_id.as_bytes())
+            .ok_or(NonceKeyError::PeerIdTooLong)?;
+        Self::build(hasher.finalize().into(), peer_id, nonce)
+    }
+
+    fn build(key_fp: [u8; 32], peer_id: &str, nonce: &str) -> Result<Self, NonceKeyError> {
+        check_nonce_len(nonce)?;
+        let mut hasher = Sha256::new();
+        update_length_prefixed(&mut hasher, nonce.as_bytes())
+            .ok_or(NonceKeyError::NonceTooLong { len: nonce.len() })?;
+        let legacy_fp = legacy_fingerprint(peer_id, nonce).ok_or(NonceKeyError::PeerIdTooLong)?;
+        Ok(Self {
+            key_fp,
+            nonce_fp: hasher.finalize().into(),
+            legacy_peer_id: peer_id.to_string(),
+            legacy_fp,
+        })
+    }
+
+    /// The namespace fingerprint (`federation_nonce_claims.key_fp`).
+    #[must_use]
+    pub fn key_fp(&self) -> &[u8; 32] {
+        &self.key_fp
+    }
+
+    /// The nonce fingerprint (`federation_nonce_claims.nonce_fp`).
+    #[must_use]
+    pub fn nonce_fp(&self) -> &[u8; 32] {
+        &self.nonce_fp
+    }
+
+    /// The peer id the legacy v51 lookup is scoped to.
+    #[must_use]
+    pub fn legacy_peer_id(&self) -> &str {
+        &self.legacy_peer_id
+    }
+
+    /// The legacy v51 `federation_nonce_cache.fingerprint`.
+    #[must_use]
+    pub fn legacy_fingerprint(&self) -> &[u8; 32] {
+        &self.legacy_fp
+    }
+}
+
+/// The v51 fingerprint: `SHA-256(u32 BE len(peer) || peer || u32 BE len(nonce) || nonce)`.
+/// Kept byte-identical so the read-only legacy lookup finds pre-v103 rows.
+fn legacy_fingerprint(peer_id: &str, nonce: &str) -> Option<[u8; 32]> {
+    let mut hasher = Sha256::new();
+    update_length_prefixed(&mut hasher, peer_id.as_bytes())?;
+    update_length_prefixed(&mut hasher, nonce.as_bytes())?;
+    Some(hasher.finalize().into())
+}
+
+/// #9192 item 2 — what the claims store answered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NonceClaim {
+    /// This call inserted the row: the nonce was never accepted before.
+    Claimed,
+    /// The row (or a legacy v51 row) already exists: a replay.
+    AlreadyClaimed,
+}
+
+/// #9192 — the sqlite claim: the read-only legacy lookup, then the one
+/// deciding `INSERT ... ON CONFLICT DO NOTHING` (one row = claimed). Shared by
+/// the daemon's own connection and [`crate::store::MemoryStore::federation_nonce_claim`]
+/// on the sqlite adapter, so the backend has one decision path.
+///
+/// # Errors
+/// Propagates the `rusqlite` error; the caller maps it to
+/// [`ReplayDecision::Unavailable`] (503), never to a decision.
+pub(crate) fn claim_nonce_sqlite(
+    conn: &rusqlite::Connection,
+    key: &NonceClaimKey,
+) -> rusqlite::Result<NonceClaim> {
+    use rusqlite::OptionalExtension as _;
+    let legacy: Option<i64> = conn
+        .query_row(
+            SQL_LEGACY_NONCE_LOOKUP,
+            rusqlite::params![key.legacy_peer_id, key.legacy_fp.as_slice()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if legacy.is_some() {
+        return Ok(NonceClaim::AlreadyClaimed);
+    }
+    let inserted = conn.execute(
+        SQL_CLAIM_NONCE,
+        rusqlite::params![
+            key.key_fp.as_slice(),
+            key.nonce_fp.as_slice(),
+            chrono::Utc::now().timestamp()
+        ],
+    )?;
+    Ok(if inserted == 1 {
+        NonceClaim::Claimed
+    } else {
+        NonceClaim::AlreadyClaimed
+    })
+}
+
+/// One signing key's cached nonces (FIFO order for the per-key bound).
 #[derive(Debug, Default)]
-struct PeerNonceSlot {
+struct KeyNonceSlot {
     seen: HashSet<[u8; 32]>,
     order: VecDeque<[u8; 32]>,
     last_touch: u64,
 }
 
-/// v0.7.0 #922 — per-peer bounded FIFO cache of `(peer_id, nonce)`.
 #[derive(Debug, Default)]
-pub struct FederationNonceCache {
-    inner: Mutex<HashMap<String, PeerNonceSlot>>,
-    /// v0.7.0 #1038 — monotonic touch counter. Advances on every
-    /// `record_and_check`; each peer slot stamps its `last_touch`
-    /// with the value at insert/update time. The outer LRU
-    /// eviction picks the slot with the smallest value.
-    touch_counter: std::sync::atomic::AtomicU64,
-    /// v0.7.0 #1038 — cumulative count of peer-slot evictions
-    /// since boot. Non-zero values mean the outer LRU dropped a
-    /// peer to make room — operator-visible via `peer_evictions_since_boot()`.
-    peer_evictions: std::sync::atomic::AtomicU64,
-    /// #1255 (MED, 2026-05-25) — when `Some`, every Fresh
-    /// fingerprint is persisted to the `federation_nonce_cache`
-    /// table in the ai-memory sqlite DB on this path AND the
-    /// cache hydrates from the same table on construction. When
-    /// `None` the cache is in-memory only and a daemon restart
-    /// opens a fresh replay window (pre-#1255 behaviour, preserved
-    /// for test harnesses and for any caller that opts out).
-    db_path: Option<PathBuf>,
+struct NonceCacheState {
+    slots: HashMap<[u8; 32], KeyNonceSlot>,
+    touch: u64,
 }
 
-/// #1690 — prune the on-disk `federation_nonce_cache` to the newest
-/// `per_peer_cap` rows per peer (deleting the rest), bounding the table
-/// to the same ceiling the in-memory cache enforces. Idempotent: on an
-/// already-bounded table it deletes zero rows. Extracted as a free fn so
-/// it is testable with a small cap without seeding 10k rows. The window
-/// `ROW_NUMBER() OVER (PARTITION BY peer_id ORDER BY last_touch DESC)`
-/// keeps the most-recently-touched rows; the WITHOUT-ROWID PK
-/// `(peer_id, fingerprint)` keys the delete.
+/// #9192 — the bounded per-process cache in front of the nonce claims store.
 ///
-/// # Errors
-/// Propagates the underlying `rusqlite` error on SQL failure.
-fn prune_nonce_cache_to_per_peer_cap(
-    conn: &rusqlite::Connection,
-    per_peer_cap: usize,
-) -> rusqlite::Result<usize> {
-    #[allow(clippy::cast_possible_wrap)]
-    let cap = per_peer_cap as i64;
-    conn.execute(
-        "DELETE FROM federation_nonce_cache
-         WHERE (peer_id, fingerprint) IN (
-             SELECT peer_id, fingerprint FROM (
-                 SELECT peer_id, fingerprint,
-                        ROW_NUMBER() OVER (
-                            PARTITION BY peer_id ORDER BY last_touch DESC
-                        ) AS rn
-                 FROM federation_nonce_cache
-             ) WHERE rn > ?1
-         )",
-        rusqlite::params![cap],
-    )
+/// A check ALWAYS asks the store (`decision:` always call the store over a
+/// cache short-circuit, because a store outage must refuse a cached nonce with
+/// 503 too). The cache is filled only after the store answered `Claimed` or
+/// `AlreadyClaimed`, under one lock with no `.await` (CONCURRENCY-20), so a
+/// dropped future leaves no entry (CONCURRENCY-23 by construction:
+/// `decision:` fill-after-answer over a provisional entry plus a drop guard).
+/// A cache hit whose store answer is `Claimed` (the store lost the row, e.g.
+/// a restored database) is refused as a replay.
+#[derive(Debug)]
+pub struct FederationNonceCache {
+    /// `None` = no cache (store only).
+    per_key_cap: Option<NonZeroUsize>,
+    state: Mutex<NonceCacheState>,
+    peer_evictions: AtomicU64,
+}
+
+impl Default for FederationNonceCache {
+    fn default() -> Self {
+        Self::with_capacity(FEDERATION_NONCE_CAPACITY_PER_PEER)
+    }
 }
 
 impl FederationNonceCache {
-    /// Fresh empty cache. In-memory only — the cache resets on every
-    /// daemon restart. Prefer [`Self::new_with_db_persistence`] in
-    /// production: pre-#1255 the in-memory-only cache opened a
-    /// replay window on every restart.
+    /// A cache bounded at [`FEDERATION_NONCE_CAPACITY_PER_PEER`] per key.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// #1255 (MED, 2026-05-25) — persistence-enabled constructor.
-    ///
-    /// Opens the ai-memory sqlite DB at `db_path` (runs migrations
-    /// to ensure the `federation_nonce_cache` table is present),
-    /// rehydrates the in-memory cache from the persisted rows
-    /// (oldest `last_touch` first so the in-process LRU ordering
-    /// matches the on-disk order), and arms the cache so every
-    /// subsequent `Fresh` fingerprint is persisted to disk.
-    ///
-    /// Construction errors out if the DB cannot be opened or
-    /// migrated — operators want loud failure here, not a silent
-    /// fallback to in-memory mode that re-opens the replay window.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the DB cannot be opened or the load
-    /// query fails.
-    pub fn new_with_db_persistence(db_path: impl Into<PathBuf>) -> anyhow::Result<Self> {
-        let db_path = db_path.into();
-        let cache = Self {
-            inner: Mutex::new(HashMap::new()),
-            touch_counter: AtomicU64::new(0),
-            peer_evictions: AtomicU64::new(0),
-            db_path: Some(db_path.clone()),
-        };
-        cache.hydrate_from_disk(&db_path)?;
-        Ok(cache)
-    }
-
-    /// #1255 — read every persisted `(peer_id, fingerprint,
-    /// last_touch)` triple from disk and seed the in-memory cache.
-    /// Iterates oldest-touch first so the on-disk LRU ordering
-    /// becomes the in-process FIFO ordering for the per-peer
-    /// `VecDeque`s. The post-load `touch_counter` is bumped past
-    /// the largest observed `last_touch` so subsequent inserts
-    /// stay monotonic against the rehydrated state.
-    fn hydrate_from_disk(&self, db_path: &Path) -> anyhow::Result<()> {
-        // Use `crate::db::open` which runs migrations on first open.
-        // This guarantees the `federation_nonce_cache` table exists
-        // even on a pre-v51 DB (the v51 migration is replay-safe).
-        let conn = crate::db::open(db_path)
-            .map_err(|e| anyhow::anyhow!("FederationNonceCache: open ai-memory db: {e}"))?;
-        let mut stmt = conn.prepare(
-            "SELECT peer_id, fingerprint, last_touch
-             FROM federation_nonce_cache
-             ORDER BY last_touch ASC",
-        )?;
-        let mut max_touch: u64 = 0;
-        let rows = stmt.query_map([], |row| {
-            let peer_id: String = row.get(0)?;
-            let fp_bytes: Vec<u8> = row.get(1)?;
-            let last_touch: i64 = row.get(2)?;
-            Ok((peer_id, fp_bytes, last_touch))
-        })?;
-        let mut guard = self
-            .inner
-            .lock()
-            .map_err(|_| anyhow::anyhow!("FederationNonceCache: hydration mutex poisoned"))?;
-        for row in rows {
-            let (peer_id, fp_bytes, last_touch) = row?;
-            // Coerce the 32-byte fingerprint back from the blob.
-            // Rows with non-32-byte blobs are skipped + warn-logged —
-            // they cannot have been produced by any v0.7.x writer,
-            // so they are forensic noise we don't want to crash on.
-            let fp: [u8; 32] = match fp_bytes.as_slice().try_into() {
-                Ok(fp) => fp,
-                Err(_) => {
-                    tracing::warn!(
-                        target: "ai_memory::identity::replay",
-                        peer_id = %peer_id,
-                        len = fp_bytes.len(),
-                        "FederationNonceCache: skipping persisted row with non-32-byte \
-                         fingerprint blob (forensic noise; not produced by any v0.7.x writer)",
-                    );
-                    continue;
-                }
-            };
-            #[allow(clippy::cast_sign_loss)]
-            let touch_u64 = last_touch.max(0) as u64;
-            if touch_u64 > max_touch {
-                max_touch = touch_u64;
-            }
-            let slot = guard.entry(peer_id).or_default();
-            // Honour the per-peer cap on hydration: oldest rows are
-            // dropped silently when the on-disk persistence holds
-            // more rows than `FEDERATION_NONCE_CAPACITY_PER_PEER`.
-            // (Shouldn't happen in practice — the persistence layer
-            // mirrors the in-memory cap — but defensive on operator
-            // hand-rolled DBs.)
-            if slot.order.len() >= FEDERATION_NONCE_CAPACITY_PER_PEER {
-                if let Some(evicted) = slot.order.pop_front() {
-                    slot.seen.remove(&evicted);
-                }
-            }
-            slot.order.push_back(fp);
-            slot.seen.insert(fp);
-            slot.last_touch = touch_u64;
-        }
-        drop(guard);
-        // `rows` was consumed by the `for` loop above; dropping `stmt`
-        // releases its borrow on `conn` before the prune `execute`.
-        drop(stmt);
-
-        // #1690 — repair legacy on-disk bloat from the pre-delete-on-evict
-        // era. Before the eviction-prune fix, the table grew without
-        // bound; delete-on-evict stops FURTHER growth but never shrinks
-        // rows belonging to peers that have since gone silent, so such a
-        // DB would re-scan all of them on every boot. The in-memory cap
-        // above already bounds RAM (per-peer overflow is dropped on
-        // load), so this one-time prune converges the DISK to the same
-        // bound: keep the newest `FEDERATION_NONCE_CAPACITY_PER_PEER`
-        // rows per peer, delete the rest. Idempotent — on an
-        // already-bounded table it deletes zero rows. WITHOUT ROWID PK is
-        // (peer_id, fingerprint), so the window prune keys on that pair.
-        match prune_nonce_cache_to_per_peer_cap(&conn, FEDERATION_NONCE_CAPACITY_PER_PEER) {
-            Ok(0) => {}
-            Ok(n) => tracing::info!(
-                target: "ai_memory::identity::replay",
-                "FederationNonceCache: pruned {n} over-cap disk row(s) on hydration \
-                 (#1690 legacy-bloat repair); disk now bounded to the per-peer cap"
-            ),
-            Err(e) => tracing::warn!(
-                target: "ai_memory::identity::replay",
-                err = %e,
-                "FederationNonceCache: hydration over-cap prune failed (non-fatal; in-memory \
-                 cache still bounded)"
-            ),
-        }
-
-        // Advance the in-process touch counter past every observed
-        // last_touch so the next insert is monotonic.
-        self.touch_counter
-            .store(max_touch.saturating_add(1), Ordering::Relaxed);
-        Ok(())
-    }
-
-    /// #1255 — persist one `(peer_id, fingerprint, last_touch)`
-    /// triple to disk. Called from the Fresh arm of
-    /// `record_and_check` when `db_path.is_some()`. The INSERT OR
-    /// REPLACE shape keeps the row's `last_touch` in lockstep with
-    /// the in-memory cache on every re-touch path (currently the
-    /// `record_and_check` Fresh path only inserts; re-touch on
-    /// existing fingerprints surfaces as `Replay` and skips the
-    /// persistence call, which is fine — the original row remains).
-    /// Persistence errors are warn-logged and swallowed: an
-    /// operator-disk-full or transient db lock failure should not
-    /// be a 500 on every federated push. The in-memory cap still
-    /// holds, so a persistence outage degrades gracefully to
-    /// pre-#1255 behaviour (replay window opens on next restart).
-    fn persist_fingerprint_and_evict(
-        &self,
-        peer_id: &str,
-        fp: &[u8; 32],
-        last_touch: u64,
-        evicted_fp: Option<&[u8; 32]>,
-        evicted_peer: Option<&str>,
-    ) {
-        let Some(path) = self.db_path.as_deref() else {
-            return;
-        };
-        // `crate::db::open` runs migrations + is cheap on a warm
-        // SQLite WAL connection; the persistence rate is bounded by
-        // federated-POST throughput (sub-Hz on any realistic mesh).
-        let conn = match crate::db::open(path) {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!(
-                    target: "ai_memory::identity::replay",
-                    peer_id = %peer_id,
-                    path = %path.display(),
-                    err = %e,
-                    "FederationNonceCache: persist open failed; in-memory cache still holds \
-                     (#1255 graceful degradation)",
-                );
-                return;
-            }
-        };
-        // `i64::try_from` is safe because `touch_counter` advances
-        // at most once per record_and_check; a daemon would need to
-        // sustain >2^63 federated pushes/sec to overflow, which is
-        // not a real shape.
-        #[allow(clippy::cast_possible_wrap)]
-        let last_touch_i64 = last_touch as i64;
-        let now = chrono::Utc::now().to_rfc3339();
-        if let Err(e) = conn.execute(
-            "INSERT OR REPLACE INTO federation_nonce_cache
-             (peer_id, fingerprint, last_touch, inserted_at)
-             VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![peer_id, fp.as_slice(), last_touch_i64, now],
-        ) {
-            tracing::warn!(
-                target: "ai_memory::identity::replay",
-                peer_id = %peer_id,
-                err = %e,
-                "FederationNonceCache: persist insert failed; in-memory cache still holds \
-                 (#1255 graceful degradation)",
-            );
-        }
-        // #1690 — delete-on-evict: prune the disk rows the in-memory LRU
-        // just evicted so the table stays bounded by the same ceiling as
-        // the in-memory cache. Best-effort on the SAME connection as the
-        // INSERT above; a failed DELETE only leaves a dead row (the
-        // in-memory cap still bounds the replay check), so it is
-        // warn-logged and swallowed like the INSERT.
-        if let Some(efp) = evicted_fp {
-            if let Err(e) = conn.execute(
-                "DELETE FROM federation_nonce_cache WHERE peer_id = ?1 AND fingerprint = ?2",
-                rusqlite::params![peer_id, efp.as_slice()],
-            ) {
-                tracing::warn!(
-                    target: "ai_memory::identity::replay",
-                    peer_id = %peer_id,
-                    err = %e,
-                    "FederationNonceCache: evicted-fingerprint delete failed; disk row lingers \
-                     (#1690 graceful degradation)",
-                );
-            }
-        }
-        if let Some(ep) = evicted_peer {
-            if let Err(e) = conn.execute(
-                "DELETE FROM federation_nonce_cache WHERE peer_id = ?1",
-                rusqlite::params![ep],
-            ) {
-                tracing::warn!(
-                    target: "ai_memory::identity::replay",
-                    evicted_peer = %ep,
-                    err = %e,
-                    "FederationNonceCache: evicted-peer delete failed; disk rows linger \
-                     (#1690 graceful degradation)",
-                );
-            }
-        }
-    }
-
-    /// Check + record `(peer_id, nonce)`.
-    pub fn record_and_check(&self, peer_id: &str, nonce: &str) -> ReplayDecision {
-        use std::sync::atomic::Ordering;
-        let fp = Self::fingerprint(peer_id, nonce);
-        let mut guard = match self.inner.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
-        // #1690 — capture in-memory evictions so the disk mirror is
-        // pruned in lockstep (delete-on-evict). Without this the disk
-        // `federation_nonce_cache` table grew unbounded: every Fresh
-        // nonce INSERTs a row, but the in-memory LRU evictions (per-peer
-        // FIFO + outer peer-slot LRU) never deleted the disk counterpart,
-        // so a long-lived high-throughput peer accumulated millions of
-        // dead rows while the in-memory cache stayed bounded. Both
-        // deletes ride the SAME connection-open as the persist below
-        // (see `persist_fingerprint_and_evict`), so the hot-path disk
-        // I/O rate is unchanged.
-        let mut evicted_peer: Option<String> = None;
-        // v0.7.0 #1038 — bound the outer HashMap to
-        // `FEDERATION_NONCE_MAX_PEERS`. When the incoming peer is a
-        // NEW entry AND the map is at the ceiling, evict the
-        // least-recently-touched peer (LRU) before inserting.
-        // Skip the eviction when the peer already exists (re-touch
-        // is free).
-        if !guard.contains_key(peer_id) && guard.len() >= FEDERATION_NONCE_MAX_PEERS {
-            // Find the smallest `last_touch` to pick the LRU peer.
-            if let Some((evict_id, _)) = guard
-                .iter()
-                .min_by_key(|(_, s)| s.last_touch)
-                .map(|(k, s)| (k.clone(), s.last_touch))
-            {
-                guard.remove(&evict_id);
-                self.peer_evictions.fetch_add(1, Ordering::Relaxed);
-                tracing::warn!(
-                    target: "ai_memory::identity::replay",
-                    evicted_peer = %evict_id,
-                    "FederationNonceCache: at peer ceiling ({}); evicted LRU peer slot to make \
-                     room. Operator-visible via peer_evictions_since_boot() (#1038).",
-                    FEDERATION_NONCE_MAX_PEERS,
-                );
-                evicted_peer = Some(evict_id);
-            }
-        }
-        let touch = self.touch_counter.fetch_add(1, Ordering::Relaxed);
-        let slot = guard.entry(peer_id.to_string()).or_default();
-        slot.last_touch = touch;
-        // v0.7.0 #1033 — O(1) HashSet membership replaces O(N) scan.
-        if slot.seen.contains(&fp) {
-            return ReplayDecision::Replay;
-        }
-        let mut evicted_fp: Option<[u8; 32]> = None;
-        if slot.order.len() >= FEDERATION_NONCE_CAPACITY_PER_PEER {
-            // Keep `seen` + `order` in lockstep on FIFO eviction.
-            if let Some(evicted) = slot.order.pop_front() {
-                slot.seen.remove(&evicted);
-                evicted_fp = Some(evicted);
-            }
-        }
-        slot.order.push_back(fp);
-        slot.seen.insert(fp);
-        // Release the inner mutex before doing disk I/O so a slow
-        // SQLite WAL fsync doesn't block sibling
-        // `record_and_check` calls. The persistence call itself
-        // opens its own connection (no shared state).
-        drop(guard);
-        // #1255 — persist the new fingerprint to disk so a daemon
-        // restart doesn't re-open the replay window. #1690 — and prune
-        // the rows the in-memory cache just evicted so the disk mirror
-        // stays bounded. Both ride one connection-open; failures are
-        // warn-logged and swallowed (graceful degradation to the
-        // in-memory-only pre-#1255 posture).
-        self.persist_fingerprint_and_evict(
-            peer_id,
-            &fp,
-            touch,
-            evicted_fp.as_ref(),
-            evicted_peer.as_deref(),
-        );
-        ReplayDecision::Fresh
-    }
-
-    /// v0.7.0 #1038 — cumulative number of peer-slot evictions
-    /// (outer LRU). Non-zero means peer churn caused the outer
-    /// HashMap to hit `FEDERATION_NONCE_MAX_PEERS` and drop an
-    /// older peer's slot. Operators page on sustained growth.
+    /// A cache bounded at `per_key_cap` entries per key; `0` is valid and
+    /// means no cache (every check is decided by the store alone).
     #[must_use]
-    pub fn peer_evictions_since_boot(&self) -> u64 {
-        self.peer_evictions
-            .load(std::sync::atomic::Ordering::Relaxed)
+    pub fn with_capacity(per_key_cap: usize) -> Self {
+        Self {
+            per_key_cap: NonZeroUsize::new(per_key_cap),
+            state: Mutex::new(NonceCacheState::default()),
+            peer_evictions: AtomicU64::new(0),
+        }
     }
 
-    /// Distinct peers with at least one cached fingerprint.
+    /// Decide `key` through a sqlite connection the caller already holds (the
+    /// sqlite federation paths hold the daemon connection). Synchronous: no
+    /// `.await` exists between the claim and the cache fill.
+    #[must_use]
+    pub fn check_with_conn(
+        &self,
+        conn: &rusqlite::Connection,
+        key: &NonceClaimKey,
+    ) -> ReplayDecision {
+        let answer = claim_nonce_sqlite(conn, key)
+            .inspect_err(|e| log_store_unavailable(key, e))
+            .ok();
+        self.settle(key, answer)
+    }
+
+    /// Decide `key` through the SAL store (the PostgreSQL federation paths).
+    /// Cancel-safe: the cache is touched only after the store answered.
+    #[cfg(feature = "sal")]
+    pub async fn check_store(
+        &self,
+        store: &dyn crate::store::MemoryStore,
+        key: &NonceClaimKey,
+    ) -> ReplayDecision {
+        let answer = store
+            .federation_nonce_claim(key)
+            .await
+            .inspect_err(|e| log_store_unavailable(key, e))
+            .ok();
+        self.settle(key, answer)
+    }
+
+    /// Fold the store's answer (`None` = it could not answer) into a decision
+    /// and, only on an answer, the cache.
+    fn settle(&self, key: &NonceClaimKey, answer: Option<NonceClaim>) -> ReplayDecision {
+        let Some(answer) = answer else {
+            crate::metrics::inc_federation_nonce_store_unavailable();
+            return ReplayDecision::Unavailable;
+        };
+        let Some(cap) = self.per_key_cap else {
+            return match answer {
+                NonceClaim::Claimed => ReplayDecision::Fresh,
+                NonceClaim::AlreadyClaimed => ReplayDecision::Replay,
+            };
+        };
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let hit = state
+            .slots
+            .get(&key.key_fp)
+            .is_some_and(|slot| slot.seen.contains(&key.nonce_fp));
+        let decision = match (answer, hit) {
+            (NonceClaim::Claimed, false) => ReplayDecision::Fresh,
+            (NonceClaim::Claimed, true) | (NonceClaim::AlreadyClaimed, _) => ReplayDecision::Replay,
+        };
+        if !hit {
+            self.fill(&mut state, key, cap);
+        }
+        decision
+    }
+
+    /// Insert `key` into its slot, evicting CACHE entries only.
+    fn fill(&self, state: &mut NonceCacheState, key: &NonceClaimKey, cap: NonZeroUsize) {
+        state.touch = state.touch.saturating_add(1);
+        let touch = state.touch;
+        if !state.slots.contains_key(&key.key_fp) && state.slots.len() >= FEDERATION_NONCE_MAX_PEERS
+        {
+            let coldest = state
+                .slots
+                .iter()
+                .min_by_key(|(_, slot)| slot.last_touch)
+                .map(|(fp, _)| *fp);
+            if let Some(coldest) = coldest {
+                state.slots.remove(&coldest);
+                self.peer_evictions.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let slot = state.slots.entry(key.key_fp).or_default();
+        slot.last_touch = touch;
+        if slot.seen.insert(key.nonce_fp) {
+            slot.order.push_back(key.nonce_fp);
+        }
+        while slot.order.len() > cap.get() {
+            if let Some(oldest) = slot.order.pop_front() {
+                slot.seen.remove(&oldest);
+            }
+        }
+    }
+
+    /// Whether `key` is in the CACHE (diagnostics and tests; never a decision).
+    #[must_use]
+    pub fn is_cached(&self, key: &NonceClaimKey) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .slots
+            .get(&key.key_fp)
+            .is_some_and(|slot| slot.seen.contains(&key.nonce_fp))
+    }
+
+    /// Number of key slots in the cache.
     #[must_use]
     pub fn peer_count(&self) -> usize {
-        self.inner.lock().map(|g| g.len()).unwrap_or(0)
-    }
-
-    /// Cached fingerprints for `peer_id`.
-    #[must_use]
-    pub fn len_for_peer(&self, peer_id: &str) -> usize {
-        self.inner
+        self.state
             .lock()
-            .map(|g| g.get(peer_id).map_or(0, |s| s.order.len()))
-            .unwrap_or(0)
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .slots
+            .len()
     }
 
-    fn fingerprint(peer_id: &str, nonce: &str) -> [u8; 32] {
-        let mut hasher = Sha256::new();
-        let pid = peer_id.as_bytes();
-        let non = nonce.as_bytes();
-        #[allow(clippy::cast_possible_truncation)]
-        hasher.update((pid.len() as u32).to_be_bytes());
-        hasher.update(pid);
-        #[allow(clippy::cast_possible_truncation)]
-        hasher.update((non.len() as u32).to_be_bytes());
-        hasher.update(non);
-        hasher.finalize().into()
+    /// Cached nonces of the key whose fingerprint is `key_fp`.
+    #[must_use]
+    pub fn len_for_key(&self, key_fp: &[u8; 32]) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .slots
+            .get(key_fp)
+            .map_or(0, |slot| slot.order.len())
     }
+
+    /// Key slots dropped from the cache since boot (never claim rows).
+    #[must_use]
+    pub fn peer_evictions_since_boot(&self) -> u64 {
+        self.peer_evictions.load(Ordering::Relaxed)
+    }
+
+    /// The per-key cache bound (`0` = no cache).
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.per_key_cap.map_or(0, NonZeroUsize::get)
+    }
+}
+
+/// One WARN per claim the store could not decide (no nonce bytes logged).
+fn log_store_unavailable(key: &NonceClaimKey, err: &dyn std::fmt::Display) {
+    tracing::warn!(
+        target: REPLAY_LOG_TARGET,
+        peer_id = %key.legacy_peer_id,
+        error = %err,
+        "federation.nonce.store_unavailable: the nonce claims store could not answer; \
+         refusing with 503 and admitting nothing (#9192)"
+    );
 }
 
 #[cfg(test)]
 mod federation_nonce_cache_tests {
     use super::*;
 
-    #[test]
-    fn first_seen_returns_fresh() {
-        let cache = FederationNonceCache::new();
-        assert_eq!(cache.record_and_check("p", "n"), ReplayDecision::Fresh);
-        assert_eq!(cache.len_for_peer("p"), 1);
+    /// Seed of every nonce these unit cells mint (#9192 item 9).
+    const UNIT_SEED: &str = "nonce-9192-unit";
+    /// The cache bounds every invariant cell runs over (#9192 test a).
+    const CAPS: [usize; 4] = [0, 1, 3, FEDERATION_NONCE_CAPACITY_PER_PEER];
+    /// Two fixed verifying keys (raw Ed25519 public-key bytes).
+    const KEY_A: [u8; 32] = [0xA1; 32];
+    const KEY_B: [u8; 32] = [0xB2; 32];
+    /// The peer id the cells claim as.
+    const PEER: &str = "ai:peer-9192-unit";
+    /// The claims table (schema v103).
+    const CLAIMS_TABLE: &str = "federation_nonce_claims";
+    /// Racing claimants of one nonce (#9192 test d).
+    const RACERS: usize = 8;
+    /// The 100K-claim cell's size and wall-clock ceiling (#9192 test k). The
+    /// claims share one transaction, so the ceiling bounds the algorithm, not
+    /// the host disk's commit latency.
+    const BULK_CLAIMS: u64 = 100_000;
+    const BULK_CEILING: std::time::Duration = std::time::Duration::from_secs(300);
+    /// Growth ratchet: bytes per claim row, PRIMARY KEY index included.
+    const BYTES_PER_ROW_CEILING: u64 = 256;
+
+    /// Deterministic nonce `i` of `seed` (#9192 item 9).
+    fn test_nonce(seed: &str, i: u64) -> String {
+        format!("{seed}-{i:016x}")
     }
 
-    #[test]
-    fn exact_repeat_returns_replay() {
-        let cache = FederationNonceCache::new();
-        assert_eq!(cache.record_and_check("p", "n"), ReplayDecision::Fresh);
-        assert_eq!(cache.record_and_check("p", "n"), ReplayDecision::Replay);
-        assert_eq!(cache.len_for_peer("p"), 1);
+    fn key(verifying_key: &[u8; 32], i: u64) -> NonceClaimKey {
+        NonceClaimKey::for_verifying_key(verifying_key, PEER, &test_nonce(UNIT_SEED, i))
+            .expect("claim key")
     }
 
-    #[test]
-    fn different_peers_can_use_same_nonce() {
-        let cache = FederationNonceCache::new();
-        assert_eq!(cache.record_and_check("a", "s"), ReplayDecision::Fresh);
-        assert_eq!(cache.record_and_check("b", "s"), ReplayDecision::Fresh);
-        assert_eq!(cache.peer_count(), 2);
+    /// The `i`-th of many distinct verifying keys.
+    fn nth_key(i: u64) -> [u8; 32] {
+        let mut k = [0_u8; 32];
+        k[..8].copy_from_slice(&i.to_be_bytes());
+        k
     }
 
+    fn scratch() -> tempfile::TempDir {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".local-runs");
+        std::fs::create_dir_all(&root).expect("scratch root");
+        tempfile::Builder::new()
+            .prefix("nonce-9192-unit-")
+            .tempdir_in(&root)
+            .expect("scratch dir")
+    }
+
+    /// A migrated database file and one connection on it.
+    fn store_conn(dir: &tempfile::TempDir) -> (std::path::PathBuf, rusqlite::Connection) {
+        let path = dir.path().join("ai-memory.db");
+        let conn = crate::db::open(&path).expect("db::open");
+        (path, conn)
+    }
+
+    fn rows(conn: &rusqlite::Connection) -> i64 {
+        conn.query_row(&format!("SELECT COUNT(*) FROM {CLAIMS_TABLE}"), [], |r| {
+            r.get(0)
+        })
+        .expect("count claims")
+    }
+
+    fn as_u64(n: usize) -> u64 {
+        u64::try_from(n).expect("usize fits u64")
+    }
+
+    /// (a) + (b) — for every cache bound (0 included): cap+1 accepted nonces,
+    /// then nonce 0 is a replay; again after a restart (a fresh cache over the
+    /// same store) and after more keys than [`FEDERATION_NONCE_MAX_PEERS`].
     #[test]
-    fn fifo_eviction_at_per_peer_capacity() {
-        let cache = FederationNonceCache::new();
-        for i in 0..FEDERATION_NONCE_CAPACITY_PER_PEER {
+    fn accepted_nonce_is_refused_for_every_cap_restart_and_peer_count_9192() {
+        for cap in CAPS {
+            let dir = scratch();
+            let (_path, conn) = store_conn(&dir);
+            let cache = FederationNonceCache::with_capacity(cap);
+            assert_eq!(cache.capacity(), cap, "cap {cap}: the bound is honoured");
+            let accepted = as_u64(cap) + 1;
+            for i in 0..accepted {
+                assert_eq!(
+                    cache.check_with_conn(&conn, &key(&KEY_A, i)),
+                    ReplayDecision::Fresh,
+                    "cap {cap}: nonce {i} is fresh"
+                );
+            }
+            assert!(
+                cache.len_for_key(key(&KEY_A, 0).key_fp()) <= cap,
+                "cap {cap}: the cache stays bounded"
+            );
             assert_eq!(
-                cache.record_and_check("p", &format!("n-{i}")),
+                cache.check_with_conn(&conn, &key(&KEY_A, 0)),
+                ReplayDecision::Replay,
+                "cap {cap}: nonce 0 after cap+1 accepted nonces"
+            );
+            let restarted = FederationNonceCache::with_capacity(cap);
+            for i in [0, accepted - 1] {
+                assert_eq!(
+                    restarted.check_with_conn(&conn, &key(&KEY_A, i)),
+                    ReplayDecision::Replay,
+                    "cap {cap}: nonce {i} after a restart"
+                );
+            }
+            if cap <= 3 {
+                let peers = as_u64(FEDERATION_NONCE_MAX_PEERS) + 1;
+                for p in 1..=peers {
+                    let k = NonceClaimKey::for_verifying_key(&nth_key(p), PEER, "flood")
+                        .expect("flood key");
+                    assert_eq!(restarted.check_with_conn(&conn, &k), ReplayDecision::Fresh);
+                }
+                assert!(restarted.peer_count() <= FEDERATION_NONCE_MAX_PEERS);
+                assert_eq!(
+                    restarted.check_with_conn(&conn, &key(&KEY_A, 0)),
+                    ReplayDecision::Replay,
+                    "cap {cap}: nonce 0 after more keys than the slot bound"
+                );
+            }
+            assert_eq!(
+                rows(&conn),
+                i64::try_from(accepted).expect("i64")
+                    + if cap <= 3 {
+                        i64::try_from(FEDERATION_NONCE_MAX_PEERS).expect("i64") + 1
+                    } else {
+                        0
+                    }
+            );
+        }
+    }
+
+    /// (b) — a zero bound is a store-only checker, never an error.
+    #[test]
+    fn zero_cap_caches_nothing_and_still_refuses_9192() {
+        let dir = scratch();
+        let (_path, conn) = store_conn(&dir);
+        let cache = FederationNonceCache::with_capacity(0);
+        assert_eq!(
+            cache.check_with_conn(&conn, &key(&KEY_A, 1)),
+            ReplayDecision::Fresh
+        );
+        assert_eq!(cache.peer_count(), 0, "cap 0 keeps no slot");
+        assert!(!cache.is_cached(&key(&KEY_A, 1)));
+        assert_eq!(
+            cache.check_with_conn(&conn, &key(&KEY_A, 1)),
+            ReplayDecision::Replay
+        );
+    }
+
+    /// (c) — two handles (two daemons) over one store: whichever claims first
+    /// wins, the other refuses, and the claimant still refuses its own replay.
+    #[test]
+    fn two_handles_over_one_store_admit_a_nonce_once_9192() {
+        let dir = scratch();
+        let (path, conn_a) = store_conn(&dir);
+        let conn_b = crate::db::open(&path).expect("second handle");
+        let (a, b) = (FederationNonceCache::new(), FederationNonceCache::new());
+        for i in 0..16 {
+            let (first, second) = if i % 2 == 0 {
+                ((&a, &conn_a), (&b, &conn_b))
+            } else {
+                ((&b, &conn_b), (&a, &conn_a))
+            };
+            let k = key(&KEY_A, i);
+            assert_eq!(first.0.check_with_conn(first.1, &k), ReplayDecision::Fresh);
+            assert_eq!(
+                second.0.check_with_conn(second.1, &k),
+                ReplayDecision::Replay
+            );
+            assert_eq!(first.0.check_with_conn(first.1, &k), ReplayDecision::Replay);
+        }
+    }
+
+    /// (d) — RACERS threads, each its own connection and cache, claim one
+    /// nonce at once: exactly one Fresh, at cap 0 and at the default bound.
+    #[test]
+    fn concurrent_identical_claims_admit_exactly_one_9192() {
+        for cap in [0, FEDERATION_NONCE_CAPACITY_PER_PEER] {
+            let dir = scratch();
+            let (path, _conn) = store_conn(&dir);
+            let conns: Vec<_> = (0..RACERS)
+                .map(|_| crate::db::open(&path).expect("racer handle"))
+                .collect();
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(RACERS));
+            let handles: Vec<_> = conns
+                .into_iter()
+                .map(|conn| {
+                    let barrier = std::sync::Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        let cache = FederationNonceCache::with_capacity(cap);
+                        barrier.wait();
+                        cache.check_with_conn(&conn, &key(&KEY_A, 42))
+                    })
+                })
+                .collect();
+            let decisions: Vec<_> = handles
+                .into_iter()
+                .map(|h| h.join().expect("racer"))
+                .collect();
+            let fresh = decisions
+                .iter()
+                .filter(|d| **d == ReplayDecision::Fresh)
+                .count();
+            let replay = decisions
+                .iter()
+                .filter(|d| **d == ReplayDecision::Replay)
+                .count();
+            assert_eq!((fresh, replay), (1, RACERS - 1), "cap {cap}: {decisions:?}");
+        }
+    }
+
+    /// (e) — the store cannot answer: a new AND an already-cached nonce are
+    /// `Unavailable` (never Replay, never Fresh), the new one leaves no cache
+    /// entry, the counter moves once per refusal, and nothing is written.
+    #[test]
+    fn store_outage_is_unavailable_for_cached_and_new_nonces_9192() {
+        let dir = scratch();
+        let (_path, conn) = store_conn(&dir);
+        let cache = FederationNonceCache::new();
+        let cached = key(&KEY_A, 1);
+        assert_eq!(cache.check_with_conn(&conn, &cached), ReplayDecision::Fresh);
+        conn.execute_batch(&format!("DROP TABLE {CLAIMS_TABLE}"))
+            .expect("break the store");
+        let before = crate::metrics::federation_nonce_store_unavailable_count();
+        let fresh = key(&KEY_A, 2);
+        assert_eq!(
+            cache.check_with_conn(&conn, &cached),
+            ReplayDecision::Unavailable
+        );
+        assert_eq!(
+            cache.check_with_conn(&conn, &fresh),
+            ReplayDecision::Unavailable
+        );
+        assert!(
+            !cache.is_cached(&fresh),
+            "an unanswered claim caches nothing"
+        );
+        assert_eq!(
+            crate::metrics::federation_nonce_store_unavailable_count() - before,
+            2
+        );
+    }
+
+    /// (e) commit-error cell — the deciding INSERT itself fails (a trigger
+    /// aborts it): `Unavailable`, no row, no cache entry.
+    #[test]
+    fn failing_claim_insert_is_unavailable_and_writes_nothing_9192() {
+        let dir = scratch();
+        let (_path, conn) = store_conn(&dir);
+        conn.execute_batch(&format!(
+            "CREATE TRIGGER nonce_9192_abort BEFORE INSERT ON {CLAIMS_TABLE} \
+             BEGIN SELECT RAISE(ABORT, 'forced claim failure'); END"
+        ))
+        .expect("arm the failure");
+        let cache = FederationNonceCache::new();
+        let k = key(&KEY_A, 3);
+        assert_eq!(
+            cache.check_with_conn(&conn, &k),
+            ReplayDecision::Unavailable
+        );
+        assert!(!cache.is_cached(&k));
+        assert_eq!(rows(&conn), 0);
+        conn.execute_batch("DROP TRIGGER nonce_9192_abort")
+            .expect("disarm");
+        assert_eq!(
+            cache.check_with_conn(&conn, &k),
+            ReplayDecision::Fresh,
+            "after recovery the never-admitted nonce is claimable"
+        );
+    }
+
+    /// (j) — a nonce in the legacy v51 table is a replay; nothing is written
+    /// to either table and the legacy row is never deleted.
+    #[test]
+    fn legacy_v51_row_is_a_replay_9192() {
+        let dir = scratch();
+        let (_path, conn) = store_conn(&dir);
+        let nonce = test_nonce(UNIT_SEED, 9);
+        let k = NonceClaimKey::for_verifying_key(&KEY_A, PEER, &nonce).expect("key");
+        conn.execute(
+            "INSERT INTO federation_nonce_cache (peer_id, fingerprint, last_touch, inserted_at) \
+             VALUES (?1, ?2, 0, '2026-01-01T00:00:00+00:00')",
+            rusqlite::params![PEER, k.legacy_fingerprint().as_slice()],
+        )
+        .expect("seed a v51 row");
+        for cap in [0, FEDERATION_NONCE_CAPACITY_PER_PEER] {
+            let cache = FederationNonceCache::with_capacity(cap);
+            assert_eq!(
+                cache.check_with_conn(&conn, &k),
+                ReplayDecision::Replay,
+                "cap {cap}"
+            );
+        }
+        assert_eq!(rows(&conn), 0);
+        let legacy: i64 = conn
+            .query_row("SELECT COUNT(*) FROM federation_nonce_cache", [], |r| {
+                r.get(0)
+            })
+            .expect("legacy count");
+        assert_eq!(legacy, 1, "the legacy row is read-only");
+    }
+
+    /// The legacy fingerprint stays byte-identical to the v51 formula.
+    #[test]
+    fn legacy_fingerprint_matches_the_v51_formula_9192() {
+        let mut h = Sha256::new();
+        h.update(4_u32.to_be_bytes());
+        h.update(b"peer");
+        h.update(5_u32.to_be_bytes());
+        h.update(b"nonce");
+        let want: [u8; 32] = h.finalize().into();
+        let k = NonceClaimKey::for_unverified_peer("peer", "nonce").expect("key");
+        assert_eq!(k.legacy_fingerprint(), &want);
+    }
+
+    /// (g) + item 1 — the namespace is the key: one key under two peer ids is
+    /// one namespace; two keys are two; a verified key never aliases the
+    /// unverified-peer namespace.
+    #[test]
+    fn namespace_is_the_verifying_key_9192() {
+        let n = test_nonce(UNIT_SEED, 5);
+        let a1 = NonceClaimKey::for_verifying_key(&KEY_A, "ai:one", &n).expect("a1");
+        let a2 = NonceClaimKey::for_verifying_key(&KEY_A, "ai:two", &n).expect("a2");
+        let b = NonceClaimKey::for_verifying_key(&KEY_B, "ai:one", &n).expect("b");
+        let u = NonceClaimKey::for_unverified_peer("ai:one", &n).expect("u");
+        assert_eq!(a1.key_fp(), a2.key_fp());
+        assert_eq!(a1.nonce_fp(), a2.nonce_fp());
+        assert_ne!(a1.key_fp(), b.key_fp());
+        assert_ne!(a1.key_fp(), u.key_fp());
+        let dir = scratch();
+        let (_path, conn) = store_conn(&dir);
+        let cache = FederationNonceCache::new();
+        assert_eq!(cache.check_with_conn(&conn, &a1), ReplayDecision::Fresh);
+        assert_eq!(
+            FederationNonceCache::new().check_with_conn(&conn, &a2),
+            ReplayDecision::Replay,
+            "the same key re-added under another peer id"
+        );
+        assert_eq!(cache.check_with_conn(&conn, &b), ReplayDecision::Fresh);
+    }
+
+    /// Item 6 — the nonce bound: exactly MAX bytes is accepted, MAX+1 and an
+    /// empty nonce are typed errors.
+    #[test]
+    fn nonce_length_bound_is_exact_9192() {
+        let at = "n".repeat(FEDERATION_NONCE_MAX_BYTES);
+        let over = "n".repeat(FEDERATION_NONCE_MAX_BYTES + 1);
+        assert!(NonceClaimKey::for_verifying_key(&KEY_A, PEER, &at).is_ok());
+        assert_eq!(
+            NonceClaimKey::for_verifying_key(&KEY_A, PEER, &over),
+            Err(NonceKeyError::NonceTooLong {
+                len: FEDERATION_NONCE_MAX_BYTES + 1
+            })
+        );
+        assert_eq!(
+            NonceClaimKey::for_unverified_peer(PEER, ""),
+            Err(NonceKeyError::NonceEmpty)
+        );
+        assert_eq!(
+            check_nonce_len(&over),
+            Err(NonceKeyError::NonceTooLong {
+                len: FEDERATION_NONCE_MAX_BYTES + 1
+            })
+        );
+    }
+
+    /// FIFO and slot eviction drop CACHE entries only: an evicted nonce is
+    /// still refused because the store still holds its row.
+    #[test]
+    fn cache_eviction_never_forgets_a_claim_9192() {
+        let dir = scratch();
+        let (_path, conn) = store_conn(&dir);
+        let cache = FederationNonceCache::with_capacity(1);
+        let first = key(&KEY_A, 0);
+        assert_eq!(cache.check_with_conn(&conn, &first), ReplayDecision::Fresh);
+        assert_eq!(
+            cache.check_with_conn(&conn, &key(&KEY_A, 1)),
+            ReplayDecision::Fresh
+        );
+        assert!(!cache.is_cached(&first), "FIFO dropped the cache entry");
+        assert_eq!(cache.check_with_conn(&conn, &first), ReplayDecision::Replay);
+        let before = cache.peer_evictions_since_boot();
+        for p in 1..=as_u64(FEDERATION_NONCE_MAX_PEERS) {
+            let k = NonceClaimKey::for_verifying_key(&nth_key(p), PEER, "slot").expect("key");
+            assert_eq!(cache.check_with_conn(&conn, &k), ReplayDecision::Fresh);
+        }
+        assert!(
+            cache.peer_evictions_since_boot() > before,
+            "a slot was dropped"
+        );
+        assert_eq!(cache.check_with_conn(&conn, &first), ReplayDecision::Replay);
+    }
+
+    /// A cache hit the store answers `Claimed` for (the store lost the row,
+    /// e.g. a restored database) is refused, never admitted twice.
+    #[test]
+    fn cache_hit_with_a_lost_row_is_a_replay_9192() {
+        let dir = scratch();
+        let (_path, conn) = store_conn(&dir);
+        let cache = FederationNonceCache::new();
+        let k = key(&KEY_A, 4);
+        assert_eq!(cache.check_with_conn(&conn, &k), ReplayDecision::Fresh);
+        conn.execute_batch(&format!("DELETE FROM {CLAIMS_TABLE}"))
+            .expect("simulate a restore");
+        assert_eq!(cache.check_with_conn(&conn, &k), ReplayDecision::Replay);
+    }
+
+    /// (k) — 100 000 distinct claims on one key stay linear: every one is
+    /// fresh, one row each, under a fixed wall-clock ceiling.
+    #[test]
+    fn hundred_thousand_claims_stay_bounded_9192() {
+        let dir = scratch();
+        let (_path, conn) = store_conn(&dir);
+        let cache = FederationNonceCache::new();
+        let started = std::time::Instant::now();
+        conn.execute_batch("BEGIN").expect("batch");
+        for i in 0..BULK_CLAIMS {
+            assert_eq!(
+                cache.check_with_conn(&conn, &key(&KEY_A, i)),
                 ReplayDecision::Fresh
             );
         }
-        assert_eq!(cache.len_for_peer("p"), FEDERATION_NONCE_CAPACITY_PER_PEER);
-        assert_eq!(cache.record_and_check("p", "n-new"), ReplayDecision::Fresh);
-        assert_eq!(cache.record_and_check("p", "n-0"), ReplayDecision::Fresh);
-    }
-
-    #[test]
-    fn peer_count_evictions_counter_starts_at_zero_1038() {
-        // v0.7.0 #1038 — fresh cache reports zero peer-slot evictions.
-        let cache = FederationNonceCache::new();
-        assert_eq!(cache.peer_evictions_since_boot(), 0);
-        // Insert below the peer ceiling — no eviction.
-        for i in 0..32 {
-            let _ = cache.record_and_check(&format!("peer-{i}"), "n");
-        }
-        assert_eq!(cache.peer_count(), 32);
-        assert_eq!(cache.peer_evictions_since_boot(), 0);
-    }
-
-    #[test]
-    fn outer_lru_evicts_least_recently_touched_at_ceiling_1038() {
-        // v0.7.0 #1038 (Agent-5 #5) — when the FederationNonceCache
-        // HashMap hits FEDERATION_NONCE_MAX_PEERS, a NEW peer's
-        // insert evicts the least-recently-touched peer slot.
-        // Pre-#1038 the HashMap was unbounded; a daemon that rotated
-        // peers (operator config churn) accumulated ~320 KB per
-        // ever-enrolled peer indefinitely.
-        let cache = FederationNonceCache::new();
-        // Fill to exactly the peer ceiling.
-        for i in 0..FEDERATION_NONCE_MAX_PEERS {
-            let _ = cache.record_and_check(&format!("peer-{i}"), "n");
-        }
-        assert_eq!(cache.peer_count(), FEDERATION_NONCE_MAX_PEERS);
-        assert_eq!(cache.peer_evictions_since_boot(), 0);
-        // Touch peer-0 to make it the most-recently-touched
-        // (advances its last_touch); peer-1 is now the LRU
-        // candidate.
-        let _ = cache.record_and_check("peer-0", "n2");
-        // Push a NEW peer past the ceiling — peer-1 (the LRU)
-        // should be evicted.
-        assert_eq!(
-            cache.record_and_check("peer-new", "n"),
-            ReplayDecision::Fresh
-        );
-        assert_eq!(
-            cache.peer_count(),
-            FEDERATION_NONCE_MAX_PEERS,
-            "#1038: at ceiling the outer HashMap must stay at FEDERATION_NONCE_MAX_PEERS"
-        );
-        assert_eq!(
-            cache.peer_evictions_since_boot(),
-            1,
-            "#1038: exactly one peer-slot eviction must have fired"
-        );
-        // peer-1 (LRU) is gone — recording for it again returns
-        // Fresh (the cache forgot the prior fingerprints).
-        assert_eq!(cache.len_for_peer("peer-1"), 0);
-        // peer-0 (recently touched) is still present.
-        assert!(cache.len_for_peer("peer-0") > 0);
-    }
-
-    #[test]
-    fn re_touch_existing_peer_does_not_trigger_eviction_1038() {
-        // v0.7.0 #1038 — re-touching an existing peer at the
-        // ceiling MUST NOT trigger an eviction (LRU bookkeeping
-        // only fires on NEW peer inserts past the ceiling).
-        let cache = FederationNonceCache::new();
-        for i in 0..FEDERATION_NONCE_MAX_PEERS {
-            let _ = cache.record_and_check(&format!("peer-{i}"), "n");
-        }
-        let before = cache.peer_evictions_since_boot();
-        // Re-touch every existing peer — no NEW peer inserts.
-        for i in 0..FEDERATION_NONCE_MAX_PEERS {
-            let _ = cache.record_and_check(&format!("peer-{i}"), &format!("n2-{i}"));
-        }
-        assert_eq!(
-            cache.peer_evictions_since_boot(),
-            before,
-            "#1038: re-touching existing peers MUST NOT trigger LRU eviction"
-        );
-        assert_eq!(cache.peer_count(), FEDERATION_NONCE_MAX_PEERS);
-    }
-
-    /// #1255 (MED, 2026-05-25) — regression: a nonce that landed in
-    /// the cache before a daemon restart must STILL be rejected as
-    /// a replay after the restart. Pre-#1255 every restart opened a
-    /// fresh in-memory window, so any captured `(body, sig, nonce)`
-    /// tuple could be replayed once the daemon bounced.
-    ///
-    /// Simulates the restart by dropping the first
-    /// `FederationNonceCache` and constructing a second one against
-    /// the SAME `db_path`. The hydration step on the second cache
-    /// reloads every persisted fingerprint, so the same `(peer_id,
-    /// nonce)` MUST surface as `Replay` on the second cache.
-    #[test]
-    fn issue_1255_nonce_persists_across_recreated_cache() {
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
-        let db_path = tmp.path().to_path_buf();
-
-        // First cache — accept the nonce as Fresh, persisting it.
-        let cache_a = FederationNonceCache::new_with_db_persistence(&db_path)
-            .expect("first cache must open the DB and run v51 migration");
-        assert_eq!(
-            cache_a.record_and_check("peer-1255", "n-1255"),
-            ReplayDecision::Fresh,
-            "#1255: first observation of (peer, nonce) is Fresh"
-        );
-        // A second observation in the SAME process is Replay
-        // (in-memory cache holds independent of disk persistence).
-        assert_eq!(
-            cache_a.record_and_check("peer-1255", "n-1255"),
-            ReplayDecision::Replay,
-            "#1255: in-process re-observation is Replay (sanity)"
-        );
-        drop(cache_a);
-
-        // Second cache — simulate daemon restart against the same
-        // DB. Hydration must replay the persisted fingerprint into
-        // the in-memory set so the SAME (peer, nonce) is REJECTED.
-        let cache_b = FederationNonceCache::new_with_db_persistence(&db_path)
-            .expect("second cache must hydrate from the same DB");
-        assert_eq!(
-            cache_b.record_and_check("peer-1255", "n-1255"),
-            ReplayDecision::Replay,
-            "#1255: persistence is load-bearing — a daemon restart must NOT \
-             reopen the replay window for a previously-seen nonce"
-        );
-        // A NEW (peer, nonce) under the second cache is Fresh — the
-        // hydration didn't accidentally over-block.
-        assert_eq!(
-            cache_b.record_and_check("peer-1255", "n-different"),
-            ReplayDecision::Fresh,
-            "#1255: hydration must NOT over-block on unrelated nonces"
-        );
-        // The hydrated cache still tracks at least the one peer
-        // from before (sanity on `len_for_peer`).
+        conn.execute_batch("COMMIT").expect("commit");
+        let elapsed = started.elapsed();
         assert!(
-            cache_b.len_for_peer("peer-1255") >= 1,
-            "#1255: hydrated cache must retain the persisted fingerprint count"
+            elapsed < BULK_CEILING,
+            "{BULK_CLAIMS} claims took {elapsed:?}"
         );
-    }
-
-    /// #1690 — delete-on-evict keeps the disk `federation_nonce_cache`
-    /// table bounded by the same ceiling as the in-memory LRU. Pre-fix
-    /// the table was INSERT-only, so a long-lived high-throughput peer
-    /// grew it without bound while the in-memory cache stayed capped.
-    /// Drives the private persist+evict path directly (the per-peer FIFO
-    /// cap is 10k and the outer cap is 1024, both too large to trigger
-    /// via `record_and_check` in a unit test) and counts disk rows.
-    #[test]
-    fn issue_1690_eviction_prunes_disk_mirror() {
-        fn disk_row_count(path: &std::path::Path) -> i64 {
-            let conn = crate::db::open(path).expect("open nonce db");
-            conn.query_row("SELECT COUNT(*) FROM federation_nonce_cache", [], |r| {
-                r.get(0)
-            })
-            .expect("count rows")
-        }
-
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
-        let db_path = tmp.path().to_path_buf();
-        let cache = FederationNonceCache::new_with_db_persistence(&db_path)
-            .expect("open + migrate nonce db");
-
-        // Two fresh fingerprints for one peer → two disk rows.
-        let fp_a = FederationNonceCache::fingerprint("peer-x", "nonce-a");
-        let fp_b = FederationNonceCache::fingerprint("peer-x", "nonce-b");
-        cache.persist_fingerprint_and_evict("peer-x", &fp_a, 1, None, None);
-        cache.persist_fingerprint_and_evict("peer-x", &fp_b, 2, None, None);
-        assert_eq!(disk_row_count(&db_path), 2, "two inserts → two rows");
-
-        // Per-peer FIFO eviction: inserting fp_c while evicting fp_a must
-        // delete fp_a's disk row → still 2 rows (fp_b + fp_c), not 3.
-        let fp_c = FederationNonceCache::fingerprint("peer-x", "nonce-c");
-        cache.persist_fingerprint_and_evict("peer-x", &fp_c, 3, Some(&fp_a), None);
+        assert_eq!(rows(&conn), i64::try_from(BULK_CLAIMS).expect("i64"));
         assert_eq!(
-            disk_row_count(&db_path),
-            2,
-            "#1690: a per-peer FIFO eviction must delete the evicted disk row"
+            cache.len_for_key(key(&KEY_A, 0).key_fp()),
+            FEDERATION_NONCE_CAPACITY_PER_PEER
         );
-
-        // Add a second peer, then an outer-LRU peer eviction of peer-x
-        // must wipe ALL of peer-x's disk rows.
-        let fp_y = FederationNonceCache::fingerprint("peer-y", "n");
-        cache.persist_fingerprint_and_evict("peer-y", &fp_y, 4, None, None);
-        assert_eq!(disk_row_count(&db_path), 3, "peer-y row added → three rows");
-        let fp_z = FederationNonceCache::fingerprint("peer-z", "n");
-        cache.persist_fingerprint_and_evict("peer-z", &fp_z, 5, None, Some("peer-x"));
         assert_eq!(
-            disk_row_count(&db_path),
-            2,
-            "#1690: an outer-LRU peer eviction must delete every disk row for that peer \
-             (peer-x's 2 rows gone, peer-y + peer-z remain)"
+            cache.check_with_conn(&conn, &key(&KEY_A, 0)),
+            ReplayDecision::Replay
         );
-    }
-
-    #[test]
-    fn issue_1690_prune_nonce_cache_keeps_newest_per_peer() {
-        // #1690 — the hydration-time legacy-bloat repair keeps the newest
-        // `cap` rows per peer and deletes the rest. Tested with a small
-        // cap so we don't seed 10k rows.
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
-        let conn = crate::db::open(tmp.path()).expect("open + migrate");
-        // peer-a: 4 rows (last_touch 1..4); peer-b: 2 rows (5..6).
-        for (peer, touch) in [
-            ("peer-a", 1),
-            ("peer-a", 2),
-            ("peer-a", 3),
-            ("peer-a", 4),
-            ("peer-b", 5),
-            ("peer-b", 6),
-        ] {
-            let fp = FederationNonceCache::fingerprint(peer, &format!("n{touch}"));
-            conn.execute(
-                "INSERT INTO federation_nonce_cache (peer_id, fingerprint, last_touch, inserted_at)
-                 VALUES (?1, ?2, ?3, '2026-01-01T00:00:00Z')",
-                rusqlite::params![peer, fp.as_slice(), touch],
-            )
-            .unwrap();
-        }
-        // Prune to cap=2 per peer: peer-a drops its 2 oldest (touch 1,2),
-        // peer-b is already within cap (untouched).
-        let deleted = prune_nonce_cache_to_per_peer_cap(&conn, 2).expect("prune");
-        assert_eq!(deleted, 2, "#1690: peer-a's 2 over-cap rows deleted");
-        let a_left: i64 = conn
+        // Growth: the rowid table plus its PRIMARY KEY autoindex.
+        let bytes: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM federation_nonce_cache WHERE peer_id='peer-a'",
-                [],
+                "SELECT SUM(pgsize) FROM dbstat WHERE name = ?1 \
+                 OR name = 'sqlite_autoindex_' || ?1 || '_1'",
+                [CLAIMS_TABLE],
                 |r| r.get(0),
             )
-            .unwrap();
-        let b_left: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM federation_nonce_cache WHERE peer_id='peer-b'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(a_left, 2, "peer-a bounded to cap");
-        assert_eq!(b_left, 2, "peer-b within cap, untouched");
-        // The newest peer-a rows (touch 3,4) survived; the oldest (1,2) went.
-        let min_touch_a: i64 = conn
-            .query_row(
-                "SELECT MIN(last_touch) FROM federation_nonce_cache WHERE peer_id='peer-a'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(min_touch_a, 3, "the oldest rows were the ones pruned");
-        // Idempotent: a second prune deletes nothing.
-        assert_eq!(prune_nonce_cache_to_per_peer_cap(&conn, 2).unwrap(), 0);
-    }
-
-    /// #1255 — graceful degradation: persistence open errors do NOT
-    /// crash the cache. A broken DB path surfaces as a
-    /// constructor-time `Err`; callers (today: only the production
-    /// daemon bootstrap) get a clear error and fall back to either
-    /// retrying with the right path OR booting with the in-memory
-    /// constructor [`Self::new`].
-    #[test]
-    fn issue_1255_persistence_constructor_surfaces_open_errors() {
-        // Point at a path that cannot exist as a sqlite DB (a directory).
-        let dir = tempfile::TempDir::new().unwrap();
-        // Passing the directory itself as a path. SQLite's `open_with_flags`
-        // refuses to open a directory as a database file.
-        let res = FederationNonceCache::new_with_db_persistence(dir.path().to_path_buf());
+            .expect("dbstat");
+        let per_row = u64::try_from(bytes).expect("non-negative size") / BULK_CLAIMS;
+        eprintln!("#9192 sqlite growth: {bytes} bytes, {per_row} bytes/row, {elapsed:?}");
         assert!(
-            res.is_err(),
-            "#1255: a non-DB path must surface as a constructor Err so operators \
-             see the persistence failure rather than silently falling back"
+            per_row <= BYTES_PER_ROW_CEILING,
+            "{per_row} bytes per claim row exceeds {BYTES_PER_ROW_CEILING}"
         );
     }
 }

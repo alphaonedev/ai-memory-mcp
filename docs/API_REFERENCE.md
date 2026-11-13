@@ -1504,7 +1504,12 @@ Peer-to-peer push with timestamp-aware merge.
 ```
 
 Response includes `applied`, `noop`, `skipped`, `receiver_agent_id`,
-`receiver_clock`, and `attestation_rejections`. The latter is an array of
+`receiver_clock`, `merge_barrier_dropped`, and `attestation_rejections`.
+`merge_barrier_dropped` counts rows the receiver merge barrier dropped
+(target tombstoned, archived, quarantined or contaminated; nothing written).
+They are not part of `applied` or `skipped`, the sender acknowledges them,
+and they move `ai_memory_fed_merge_barrier_dropped_total{barrier}` (#9147).
+`attestation_rejections` is an array of
 `{memory_id, cause}` for refused memory attestations on both backends (#3502),
 where `cause` is one of `unenrolled_author_strict`,
 `no_eligible_key_at_created_at`, `missing_signature` or `forged_or_malformed`.

@@ -584,6 +584,8 @@ pub(super) async fn catchup_once_with_store(
         // all-out-of-scope window converges. The apply loops no-op on empty.
 
         let mut applied = 0usize;
+        // #9147 C5 — receiver merge-barrier drops; never part of `applied`.
+        let mut merge_barrier_dropped = 0usize;
         let mut latest_ts: Option<String> = None;
         // #1687 — once an apply fails, stop advancing the catchup watermark so
         // sync_state never moves past an un-persisted row.
@@ -699,8 +701,16 @@ pub(super) async fn catchup_once_with_store(
                 // #3631 — pre-apply inbox probe; see `applied_wake`.
                 let inbox_wake_pre =
                     crate::federation::applied_wake::probe_store(&**store, &ctx, &mem).await;
-                match store.apply_remote_memory(&ctx, &mem).await {
-                    Ok(applied_id) => {
+                match store.apply_remote_memory_outcome(&ctx, &mem).await {
+                    // #9147 C5 — a merge-barrier drop wrote nothing: it is not
+                    // applied and wakes no one, but the row is durably decided
+                    // (re-fetching it would drop it again), so the watermark
+                    // still advances past it.
+                    Ok(crate::storage::InboundMergeOutcome::Dropped { .. }) => {
+                        merge_barrier_dropped += 1;
+                        advance_catchup_watermark(&mut latest_ts, catchup_halted, &mem.updated_at);
+                    }
+                    Ok(crate::storage::InboundMergeOutcome::Applied(applied_id)) => {
                         applied += 1;
                         advance_catchup_watermark(&mut latest_ts, catchup_halted, &mem.updated_at);
                         // #3631 — wake the local recipient of a delivered
@@ -801,8 +811,16 @@ pub(super) async fn catchup_once_with_store(
                 // insert and halt at the first failure (see the SAL branch).
                 // #3631 — pre-apply inbox probe; see `applied_wake`.
                 let inbox_wake_pre = crate::federation::applied_wake::probe_sqlite(&lock.0, &mem);
-                match crate::db::insert_if_newer(&lock.0, &mem) {
-                    Ok(applied_id) => {
+                match crate::db::insert_if_newer_outcome(&lock.0, &mem) {
+                    // #9147 C5 — a merge-barrier drop wrote nothing: it is not
+                    // applied and wakes no one, but the row is durably decided
+                    // (re-fetching it would drop it again), so the watermark
+                    // still advances past it.
+                    Ok(crate::storage::InboundMergeOutcome::Dropped { .. }) => {
+                        merge_barrier_dropped += 1;
+                        advance_catchup_watermark(&mut latest_ts, catchup_halted, &mem.updated_at);
+                    }
+                    Ok(crate::storage::InboundMergeOutcome::Applied(applied_id)) => {
                         applied += 1;
                         advance_catchup_watermark(&mut latest_ts, catchup_halted, &mem.updated_at);
                         // #3631 — wake the local recipient of a delivered
@@ -830,9 +848,10 @@ pub(super) async fn catchup_once_with_store(
             }
         }
 
-        if applied > 0 {
+        if applied > 0 || merge_barrier_dropped > 0 {
             tracing::info!(
-                "catchup: applied {applied} memories from peer {} (since={})",
+                "catchup: applied {applied} memories ({merge_barrier_dropped} dropped by the \
+                 receiver merge barrier) from peer {} (since={})",
                 peer.id,
                 since_opt.as_deref().unwrap_or("<full-snapshot>"),
             );
@@ -917,6 +936,8 @@ async fn catchup_once_legacy(config: &FederationConfig, db: &crate::handlers::Db
         // consumes `next_since`. The apply loop no-ops on empty.
 
         let mut applied = 0usize;
+        // #9147 C5 — receiver merge-barrier drops; never part of `applied`.
+        let mut merge_barrier_dropped = 0usize;
         let mut latest_ts: Option<String> = None;
         // #1687 — once an apply fails, stop advancing the catchup watermark so
         // sync_state never moves past an un-persisted row.
@@ -994,8 +1015,16 @@ async fn catchup_once_legacy(config: &FederationConfig, db: &crate::handlers::Db
                 // insert and halt at the first failure (see the SAL branch).
                 // #3631 — pre-apply inbox probe; see `applied_wake`.
                 let inbox_wake_pre = crate::federation::applied_wake::probe_sqlite(&lock.0, &mem);
-                match crate::db::insert_if_newer(&lock.0, &mem) {
-                    Ok(applied_id) => {
+                match crate::db::insert_if_newer_outcome(&lock.0, &mem) {
+                    // #9147 C5 — a merge-barrier drop wrote nothing: it is not
+                    // applied and wakes no one, but the row is durably decided
+                    // (re-fetching it would drop it again), so the watermark
+                    // still advances past it.
+                    Ok(crate::storage::InboundMergeOutcome::Dropped { .. }) => {
+                        merge_barrier_dropped += 1;
+                        advance_catchup_watermark(&mut latest_ts, catchup_halted, &mem.updated_at);
+                    }
+                    Ok(crate::storage::InboundMergeOutcome::Applied(applied_id)) => {
                         applied += 1;
                         advance_catchup_watermark(&mut latest_ts, catchup_halted, &mem.updated_at);
                         // #3631 — wake the local recipient of a delivered
@@ -1023,9 +1052,10 @@ async fn catchup_once_legacy(config: &FederationConfig, db: &crate::handlers::Db
             }
         }
 
-        if applied > 0 {
+        if applied > 0 || merge_barrier_dropped > 0 {
             tracing::info!(
-                "catchup: applied {applied} memories from peer {} (since={})",
+                "catchup: applied {applied} memories ({merge_barrier_dropped} dropped by the \
+                 receiver merge barrier) from peer {} (since={})",
                 peer.id,
                 since_opt.as_deref().unwrap_or("<full-snapshot>"),
             );

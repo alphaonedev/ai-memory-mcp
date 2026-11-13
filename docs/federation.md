@@ -416,8 +416,9 @@ independently — these are layered on top.
 
 - **Per-transition replay nonce
   ([#1805](https://github.com/alphaonedev/ai-memory-mcp/issues/1805)).**
-  The signed transition nonce is recorded in the per-peer
-  `federation_nonce_cache` and a replay is refused, closing the gap
+  The signed transition nonce is claimed durably in the v103
+  `federation_nonce_claims` table, under the same verifying-key namespace as
+  the envelope nonce, and a replay is refused, closing the gap
   where a captured signed op re-wrapped in a fresh envelope could
   replay through the CAS on a cyclic/ABA edge. Empty nonce (unsigned
   op) is not gated. Wired on both the sqlite inline and postgres

@@ -414,7 +414,8 @@ fn local_marker(prior: &str) -> Value {
 
 /// A LOCAL taint survives a strictly-newer remote CLEAN row for the same id:
 /// the row stays `contaminated` and keeps its local marker (the restore
-/// anchor); the peer's content still merges (the text converges).
+/// anchor). #9150: the local hold is a merge barrier, so the peer's content
+/// does NOT merge behind it (`tests/merge_barrier_9147.rs` pins the content).
 async fn local_taint_survives_remote_clean_row(backend: &Backend) {
     let peer = uniq("ai:peer-r2");
     let ns = uniq("r2-3266");
@@ -1363,7 +1364,16 @@ mod pg_merge_race {
         let wire = memory_json(&id, &ns, &title, "new peer text", &peer, T_NEW);
         let pp = peer.clone();
         let peer_push = tokio::spawn(async move { push(&router, &pp, vec![wire]).await });
-        wait_blocked_behind(pg, pid, 1).await;
+        // #9150 — in release mode the peer reads the row `contaminated` under
+        // its `FOR UPDATE` lock: a held row is a receiver merge barrier, so the
+        // push drops WITHOUT writing and never queues behind the SHARE lock.
+        // Await it first; the release below must still see an untouched row.
+        let (early, peer_push) = if release_mode {
+            (Some(peer_push.await.expect("peer push")), None)
+        } else {
+            wait_blocked_behind(pg, pid, 1).await;
+            (None, Some(peer_push))
+        };
         let local_store = Arc::clone(&store);
         let (rid, operator) = (id.clone(), uniq("operator"));
         let actor = operator.clone();
@@ -1384,10 +1394,14 @@ mod pg_merge_race {
                 assert!(r.root_contaminated, "{r:?}");
             }
         });
-        wait_blocked_behind(pg, pid, 2).await;
+        wait_blocked_behind(pg, pid, if release_mode { 1 } else { 2 }).await;
         hold.commit().await.expect("release share lock");
         local.await.expect("local op");
-        let (status, report) = peer_push.await.expect("peer push");
+        let (status, report) = match (early, peer_push) {
+            (Some(done), _) => done,
+            (None, Some(handle)) => handle.await.expect("peer push"),
+            (None, None) => unreachable!("one of the two is always set"),
+        };
         assert!(status.is_success(), "{status} {report}");
         let got = row(&backend, &db, &store, &id).await.expect("row");
         let kinds: Vec<String> =

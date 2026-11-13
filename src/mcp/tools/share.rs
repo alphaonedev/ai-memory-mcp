@@ -41,6 +41,13 @@ pub fn shared_namespace(from_agent_id: &str, to_agent_id: &str) -> String {
     format!("_shared/{from_agent_id}\u{2192}{to_agent_id}/")
 }
 
+/// #9147 — is a source at a lifecycle state no share may copy out of
+/// (a node-local hold or a tombstone)?
+fn source_lifecycle_blocks_share(state: crate::models::LifecycleState) -> bool {
+    state == crate::models::LifecycleState::Tombstoned
+        || crate::models::crdt_merge::is_node_local_lifecycle(state)
+}
+
 /// MCP `memory_share` — copy a memory into the target agent's shared
 /// namespace.
 ///
@@ -79,7 +86,12 @@ pub fn handle_share(
     let existed = resolved.is_some();
     let Some(source) = resolved.filter(|source| {
         // Share has no namespace parameter: substrate rows are never shareable.
-        crate::visibility::is_readable_on_query(source, caller, None)
+        // #9147 — nor is a row at a terminal / hidden receiver lifecycle
+        // state: the copy is minted `open`, so sharing a quarantined,
+        // contaminated or tombstoned source would re-expose held content to
+        // the target agent. Masked exactly like an unreadable source.
+        !source_lifecycle_blocks_share(source.lifecycle_state)
+            && crate::visibility::is_readable_on_query(source, caller, None)
     }) else {
         // Audit only the DENIAL of an existing row (a genuine miss is not a
         // security event). The wire response is identical either way.
@@ -394,6 +406,47 @@ mod tests {
         );
         assert_eq!(copy.metadata["shared_to_agent_id"].as_str(), Some("ai:bob"));
         assert_eq!(copy.metadata["agent_id"].as_str(), Some("ai:bob"));
+    }
+
+    /// #9147 — a held or tombstoned source is never copied out as an `open`
+    /// row, and the refusal is the same not-found an absent id produces.
+    #[test]
+    fn share_refuses_held_or_tombstoned_source_9147() {
+        use crate::models::LifecycleState;
+        const BLOCKED: [LifecycleState; 3] = [
+            LifecycleState::Quarantined,
+            LifecycleState::Contaminated,
+            LifecycleState::Tombstoned,
+        ];
+        for state in BLOCKED {
+            let conn = fresh_conn();
+            let src = make_mem("held memo", "alice/notes", "ai:alice");
+            let src_id = db::insert(&conn, &src).expect("insert source");
+            conn.execute(
+                "UPDATE memories SET lifecycle_state = ?1 WHERE id = ?2",
+                rusqlite::params![state.as_str(), src_id],
+            )
+            .expect("hold source");
+            let params = json!({
+                "source_memory_id": src_id.clone(),
+                "target_agent_id": "ai:bob",
+            });
+            let err = handle_share(&conn, &params, Some("ai:alice")).expect_err("must refuse");
+            assert_eq!(
+                err,
+                format!("source memory {src_id} not found"),
+                "#9147: a {} source must not be shared",
+                state.as_str()
+            );
+            let copies: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM memories WHERE source = 'shared'",
+                    [],
+                    |r| r.get(0),
+                )
+                .expect("count copies");
+            assert_eq!(copies, 0, "#9147: no copy of a {} source", state.as_str());
+        }
     }
 
     #[test]

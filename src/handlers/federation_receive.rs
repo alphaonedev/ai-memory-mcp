@@ -2404,8 +2404,10 @@ async fn sync_push_write(
         &headers,
         &body_bytes,
         peer_header_owned.as_deref(),
-        &app.federation_nonce_cache,
-    ) {
+        &super::federation_signing_check::NonceAuthority::for_app(&app),
+    )
+    .await
+    {
         return rejection;
     }
 
@@ -2671,6 +2673,8 @@ async fn sync_push_write(
         return refusal;
     }
     let mut applied = 0usize;
+    // #9147 C5 — receiver merge-barrier drops; never part of `applied`.
+    let mut merge_barrier_dropped = 0usize;
     let mut noop = 0usize;
     let mut skipped = 0usize;
     // #3699 — collected with each item's WIRE index: the loop applies in causal
@@ -3093,7 +3097,14 @@ async fn sync_push_write(
             row_is_agent_attested(&to_insert),
             Some(&authorize_stored),
         ) {
-            Ok(actual_id) => {
+            // #9147 C5 — the receiver merge barrier dropped the row (nothing
+            // written): counted apart from `applied`, and none of the
+            // applied-row side effects (dequarantine, inbox wake, embedding)
+            // run for a row that was not written.
+            Ok(crate::storage::InboundMergeOutcome::Dropped { .. }) => {
+                merge_barrier_dropped += 1;
+            }
+            Ok(crate::storage::InboundMergeOutcome::Applied(actual_id)) => {
                 applied += 1;
                 // v1.0.0 R19/A3 (#1948) — route-OUT dequarantine-on-attest.
                 // Boids item 3 R2.2 (#3905 closed): `merge_inbound`'s same-id
@@ -3269,6 +3280,7 @@ async fn sync_push_write(
                 "max": q.max,
                 "agent_id": q.agent_id,
                 "applied_before_refusal": applied,
+                (crate::handlers::MERGE_BARRIER_DROPPED_FIELD): merge_barrier_dropped,
                 (crate::handlers::QUOTA_REFUSED_FIELD): quota_refused,
                 (crate::handlers::ATTESTATION_REJECTIONS_FIELD): rejections_in_wire_order(&attestation_rejections),
                 "reset_at": reset_at,
@@ -3356,7 +3368,15 @@ async fn sync_push_write(
                 &attest_cfg,
             );
             let stored_ns = if needs_stored {
-                match db::namespace_by_id(&lock.0, del_id) {
+                // #9147 — an id held only as an ARCHIVED copy is still a
+                // deletion target (the store purges it): probe the archive
+                // when no live row exists, so a scoped peer's deletion of an
+                // archived row is authorized, not skipped as absent.
+                let probe = db::namespace_by_id(&lock.0, del_id).and_then(|live| match live {
+                    Some(namespace) => Ok(Some(namespace)),
+                    None => db::archived_namespace_by_id(&lock.0, del_id),
+                });
+                match probe {
                     Ok(Some(namespace)) => Some(namespace),
                     Ok(None) => {
                         noop += 1;
@@ -4312,23 +4332,24 @@ async fn sync_push_write(
                 // nonce is signed (tamper-evident) but was never recorded, so a
                 // captured signed transition re-wrapped in a FRESH outer
                 // envelope replays through CAS on a cyclic/ABA edge (CAS is
-                // causal ordering, not anti-replay). Record it in the per-peer
-                // nonce cache (the #30 envelope-nonce store) and refuse a
+                // causal ordering, not anti-replay). Claim it durably under the
+                // verifying key (#9192, the envelope-nonce store) and refuse a
                 // repeat. Rides the #1718 / 4d3ea1c5 fail-closed posture; an
                 // empty nonce = unsigned op (heterogeneous rollout) → not gated.
                 if !op.nonce.is_empty() {
-                    use base64::Engine as _;
-                    let nstr = base64::engine::general_purpose::STANDARD.encode(&op.nonce);
-                    if matches!(
-                        app.federation_nonce_cache
-                            .record_and_check(peer_header_owned.as_deref().unwrap_or(""), &nstr),
-                        crate::identity::replay::ReplayDecision::Replay
+                    // #9192 — claimed synchronously through the held `app.db`
+                    // handle (the sqlite nonce store), never a second lock.
+                    let decision = super::federation_signing_check::transition_nonce_key(
+                        &op.nonce,
+                        &op.signature,
+                        enrolled.as_ref(),
+                        peer_header_owned.as_deref().unwrap_or(""),
+                    )
+                    .map(|key| app.federation_nonce_cache.check_with_conn(&lock.0, &key));
+                    if super::federation_signing_check::transition_nonce_refused(
+                        decision,
+                        &op.action_id,
                     ) {
-                        tracing::warn!(
-                            target: crate::federation::SIGNING_TRACE_TARGET,
-                            action_id = %op.action_id,
-                            "sync_push: replayed action-transition nonce refused (#1805)"
-                        );
                         skipped += 1;
                         continue;
                     }
@@ -4797,6 +4818,7 @@ async fn sync_push_write(
             // into `skipped`.
             "namespace_meta_refused": namespace_meta_refused,
             "noop": noop,
+            (crate::handlers::MERGE_BARRIER_DROPPED_FIELD): merge_barrier_dropped,
             (crate::handlers::SKIPPED_FIELD): skipped,
             (crate::handlers::QUOTA_REFUSED_FIELD): quota_refused,
             (crate::handlers::ATTESTATION_REJECTIONS_FIELD): rejections_in_wire_order(&attestation_rejections),

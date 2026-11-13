@@ -7,7 +7,7 @@
 //! constant, and the `migrate` function out of `src/db.rs` into
 //! this sub-module. Pure refactor — semantics unchanged. The
 //! `MAX_SUPPORTED_SCHEMA` constant in `cli::boot` must still bump
-//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 101).
+//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 103).
 //! Versions 45/46 are reserved for sibling provenance-write landings
 //! (Gaps 1+2, #884/#885); this crate jumps 44 → 47 for Gap 3 (#886).
 //! v48 (Track D #933) adds the `federation_push_dlq` table so quorum-
@@ -1002,7 +1002,7 @@ CREATE INDEX IF NOT EXISTS idx_agent_api_keys_agent ON agent_api_keys(agent_id);
 /// for schema reporting and compatibility checks. Settled ladder arms still
 /// gate on their own literal rung so adding v98 cannot make a v96 database
 /// skip v97.
-const CURRENT_SCHEMA_VERSION: i64 = 101;
+const CURRENT_SCHEMA_VERSION: i64 = 103;
 
 /// v1.0.0 #2555 — the ABSOLUTE upper ceiling for a `schema_version` stamp,
 /// the single source of truth shared by the SQL-side `CHECK` constraint (the
@@ -1552,6 +1552,10 @@ const MIGRATION_V50_SQLITE: &str =
 // + two indexes — fully idempotent.
 const MIGRATION_V51_SQLITE: &str =
     include_str!("../../migrations/sqlite/0043_v51_federation_nonce_cache.sql");
+// v1.0.0 #9187 — `federation_nonce_claims` keyed `(key_fp, nonce_fp)` (PK = atomic arbiter,
+// never pruned, #9234); additive create-if-absent, no backfill; v51 table left as it is.
+const MIGRATION_V103_SQLITE: &str =
+    include_str!("../../migrations/sqlite/0086_v103_federation_nonce_claims.sql");
 // v0.7.0 #1389 — `transcript_line_dedup` table backing the
 // sha256-keyed idempotency layer for the four-layer capture
 // architecture (L2 recover-on-boot + L3 substrate watcher + L4
@@ -4589,9 +4593,14 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             super::title_slot_archive::migrate_v100(conn)?;
         }
 
-        if version < CURRENT_SCHEMA_VERSION {
+        if version < 101 {
             // v101 (#8444): durable a2a_tasks table for the Agent2Agent binding.
             super::a2a_tasks::migrate_v101(conn)?;
+        }
+
+        if version < CURRENT_SCHEMA_VERSION {
+            // v103 (#9187) federation_nonce_claims; v102 (#9176) slots in above.
+            conn.execute_batch(MIGRATION_V103_SQLITE)?;
         }
 
         // v88 (#2578, v1.0.0: composite list/archive ordering indexes on

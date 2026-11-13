@@ -84,7 +84,7 @@ fn recheck_live(
 /// Run `f` inside one write transaction: open our own `BEGIN IMMEDIATE` when
 /// none is active, otherwise join the caller's (the unchecked writers below are
 /// transaction-aware and join ours).
-fn in_write_txn<T>(conn: &Connection, f: impl FnOnce() -> Result<T>) -> Result<T> {
+pub(super) fn in_write_txn<T>(conn: &Connection, f: impl FnOnce() -> Result<T>) -> Result<T> {
     let txn = conn
         .is_autocommit()
         .then(|| connection::WriteTxn::begin(conn))
@@ -104,12 +104,15 @@ fn in_write_txn<T>(conn: &Connection, f: impl FnOnce() -> Result<T>) -> Result<T
 }
 
 /// [`delete`] for the federated `deletions[]` lane: the row's stored namespace
-/// is re-authorized inside the delete's own write transaction.
+/// is re-authorized inside the delete's own write transaction. #9147 — the
+/// deletion also purges (and re-authorizes) every archived copy of the id and
+/// tombstones it, so no restore path can bring the deleted content back.
 ///
 /// # Errors
 ///
 /// Everything [`delete`] returns, plus an [`InboundByIdNamespaceRefused`] when
-/// the locked row is outside the peer's scope (nothing is written).
+/// the locked live or archived row is outside the peer's scope (nothing is
+/// written).
 pub fn delete_authorized(
     conn: &Connection,
     id: &str,
@@ -123,7 +126,7 @@ pub fn delete_authorized(
             id,
             authorize,
         )?;
-        delete(conn, id)
+        super::merge_barrier_9147::federated_delete_authorized_in_tx(conn, id, authorize)
     })
 }
 

@@ -306,6 +306,7 @@ async fn issue_3646_tls_auth_revocation_and_health_contract() {
             "ai_memory_record_stop_gate_indeterminate_total",
             "ai_memory_governance_check_audit_suppressed_total",
             "ai_memory_capability_expansion_audit_suppressed_total",
+            "ai_memory_federation_nonce_store_unavailable_total",
         ] {
             assert!(
                 body.contains(&format!("# TYPE {name} counter")),

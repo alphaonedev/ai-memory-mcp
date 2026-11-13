@@ -1763,6 +1763,17 @@ impl MemoryStore for SqliteStore {
         db::admit_attested_write(&conn, &fp, agent_id, created_at).map_err(box_err)
     }
 
+    /// #9192 — sqlite twin of the durable nonce claim: the same
+    /// `federation_nonce_claims` primitive the handler path runs through
+    /// `app.db`, so every handle on this file agrees.
+    async fn federation_nonce_claim(
+        &self,
+        key: &crate::identity::replay::NonceClaimKey,
+    ) -> StoreResult<crate::identity::replay::NonceClaim> {
+        let conn = self.state.lock().await;
+        crate::identity::replay::claim_nonce_sqlite(&conn, key).map_err(box_err)
+    }
+
     async fn revoke_agent_pubkey(&self, _ctx: &CallerContext, agent_id: &str) -> StoreResult<()> {
         let conn = self.state.lock().await;
         db::revoke_agent_pubkey(&conn, agent_id).map_err(box_err)
@@ -1901,6 +1912,16 @@ impl MemoryStore for SqliteStore {
         db::insert_if_newer(&conn, memory).map_err(box_err)
     }
 
+    async fn apply_remote_memory_outcome(
+        &self,
+        _ctx: &CallerContext,
+        memory: &Memory,
+    ) -> StoreResult<crate::storage::InboundMergeOutcome> {
+        self.gate_record_stop()?;
+        let conn = self.state.lock().await;
+        db::insert_if_newer_outcome(&conn, memory).map_err(box_err)
+    }
+
     async fn merge_inbound(
         &self,
         _ctx: &CallerContext,
@@ -1922,7 +1943,7 @@ impl MemoryStore for SqliteStore {
         inbound: &Memory,
         receiver_verified: bool,
         authorize_stored: crate::storage::StoredNamespaceAuthorizer<'_>,
-    ) -> StoreResult<String> {
+    ) -> StoreResult<crate::storage::InboundMergeOutcome> {
         self.gate_record_stop()?;
         // #4023 — the re-check runs inside the free-fn's BEGIN IMMEDIATE.
         let conn = self.state.lock().await;
@@ -1966,7 +1987,8 @@ impl MemoryStore for SqliteStore {
     async fn apply_remote_deletion(&self, _ctx: &CallerContext, id: &str) -> StoreResult<bool> {
         self.gate_record_stop()?;
         let conn = self.state.lock().await;
-        db::delete(&conn, id).map_err(box_err)
+        // #9147 — erase the archived copy too and tombstone the id.
+        db::federated_delete(&conn, id).map_err(box_err)
     }
 
     /// #4447 — in-transaction peer-scope re-check on the `deletions[]` lane.
@@ -6191,17 +6213,16 @@ mod tests {
             .expect("archive v1");
         assert_eq!(moved, 1);
 
-        // Re-seed the SAME id into `memories` with changed content (the
-        // federation LWW insert preserves the id), then re-archive so the
-        // archive INSERT hits the ON CONFLICT (id) path.
+        // Re-seed the SAME id into `memories` with changed content through the
+        // LOCAL write path, then re-archive so the archive INSERT hits the ON
+        // CONFLICT (id) path. (#9149: the federation `merge_inbound` funnel now
+        // drops a push of an archived id, so it can no longer re-seed it.)
         let mut m2 = m1.clone();
         m2.id = id.clone();
         m2.content = "content-v2".to_string();
         m2.updated_at = (chrono::Utc::now() + chrono::Duration::seconds(5)).to_rfc3339();
-        store
-            .merge_inbound(&ctx, &m2, false)
-            .await
-            .expect("merge_inbound v2");
+        let reseeded = store.store(&ctx, &m2).await.expect("store v2");
+        assert_eq!(reseeded, id, "the local re-seed keeps the archived id");
 
         let moved = store
             .archive_by_ids(&ctx, &[id.clone()], Some("manual"))

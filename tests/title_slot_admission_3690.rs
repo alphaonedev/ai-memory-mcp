@@ -102,13 +102,14 @@ fn conflict(err: &anyhow::Error) -> &ConflictError {
 }
 
 /// #3690 — the schema claim, on both halves the sqlite side owns: the ladder
-/// tip (v101 since #8444; the index landed at v100) carries the SHIPPED
+/// tip (v103 since #9187; the index landed at v100) carries the SHIPPED
 /// partial index.
 #[test]
 fn sqlite_schema_tip_carries_the_partial_title_slot_index_3690() {
     let (_dir, conn) = open();
     // #8444: tip pin moved 100 -> 101 with the a2a_tasks migration.
-    assert_eq!(ai_memory::storage::current_schema_version_for_tests(), 101);
+    // #9187: tip pin moved 101 -> 103 with the federation_nonce_claims migration.
+    assert_eq!(ai_memory::storage::current_schema_version_for_tests(), 103);
     let ddl: String = conn
         .query_row(
             "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_memories_title_ns'",
