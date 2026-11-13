@@ -587,6 +587,28 @@ jobs:
           # Sanity check: extensions present.
           psql -h localhost -p 5432 -U ai_memory -d ai_memory_test -c "SELECT extname FROM pg_extension ORDER BY extname;"
 
+      # #9235 — repair + preflight. `apt-get install postgresql-16-pgvector`
+      # inside the running pg-age container can upgrade `postgresql-16`
+      # (server binary, plpgsql.so) underneath the postmaster started from the
+      # image's older binary; when the pgdg `postgresql-16-pgvector` build
+      # requires a newer `postgresql-16` (first seen with 0.8.7-1.pgdg13+2,
+      # 2026-11-12) the old postmaster cannot load the new plpgsql.so and every
+      # Postgres test panics with BackendUnavailable (step exit 101). The
+      # trigger is the package build, not the runner image. Restarting the
+      # container makes the serving postmaster the binary the installed
+      # packages ship, whatever the image version; the probes then fail the job HERE with one class line
+      # (`::error::[coverage-pg] PG-ENV <reason>`) instead of in the tests. No
+      # `if:`, no `continue-on-error`: this step can never be skipped.
+      - name: PostgreSQL package repair + preflight (#9235)
+        timeout-minutes: 6
+        env:
+          PGHOST: localhost
+          PGPORT: "5432"
+          PGUSER: ai_memory
+          PGDATABASE: ai_memory_test
+          PGPASSWORD: ai_memory_test
+        run: python3 scripts/ci/pg_env_preflight.py --container pg-age --restart --label coverage-pg
+
       - name: Generate coverage JSON
         # v0.7.x (#1148) — dev profile (default) WITH env-var
         # overrides from the job-level `env:` block above
