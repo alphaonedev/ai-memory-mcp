@@ -89,6 +89,20 @@ pub(super) struct AutonomyHookOutcome {
 /// [`super::synthesis`]) and skips this loop entirely. Operators
 /// who need the old metadata-only `confirmed_contradictions` field
 /// set the policy flag to keep the previous semantics.
+/// #8758 — the rows of `existing` that may share a contradiction prompt
+/// with `mem`: never `mem` itself, and only rows in `mem`'s
+/// `(namespace, owner, scope)` partition, so another owner's content never
+/// reaches the LLM beside this one.
+fn contradiction_candidates<'e>(
+    mem: &'e Memory,
+    actual_id: &'e str,
+    existing: &'e [Memory],
+) -> impl Iterator<Item = &'e Memory> + 'e {
+    existing.iter().filter(move |cand| {
+        cand.id != actual_id && cand.id != mem.id && crate::partition::same_partition(mem, cand)
+    })
+}
+
 pub(super) fn maybe_run_autonomy_hooks(
     conn: &rusqlite::Connection,
     llm: &OllamaClient,
@@ -113,10 +127,7 @@ pub(super) fn maybe_run_autonomy_hooks(
     // classifier ONLY runs when the namespace policy explicitly
     // opts in.
     if ns_policy.effective_legacy_per_pair_classifier() {
-        for cand in existing {
-            if cand.id == actual_id || cand.id == mem.id {
-                continue;
-            }
+        for cand in contradiction_candidates(mem, actual_id, existing) {
             match llm.detect_contradiction(&mem.content, &cand.content) {
                 Ok(true) => confirmed_contradictions.push(cand.id.clone()),
                 Ok(false) => {}
@@ -197,6 +208,30 @@ pub(super) type Idx = dyn crate::hnsw::VectorSearchIndex;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #8758 — the store-time contradiction hook pairs `mem` only with rows
+    /// of its own `(namespace, owner, scope)` partition, over the full
+    /// owner x scope x namespace table; `mem` itself is never a candidate.
+    #[test]
+    fn issue_8758_contradiction_candidates_are_same_partition() {
+        use crate::curator::issue_8758_tests::{assert_pair_table, memory};
+        use crate::models::MemoryKind;
+        assert_pair_table("legacy_classifier::contradiction_candidates", |a, b| {
+            let mem = memory("new-8758", "new", a, MemoryKind::Observation, 0);
+            let existing = vec![
+                mem.clone(),
+                memory("old-8758", "old", b, MemoryKind::Observation, 0),
+            ];
+            let picked: Vec<&str> = contradiction_candidates(&mem, "new-8758", &existing)
+                .map(|c| c.id.as_str())
+                .collect();
+            assert!(
+                !picked.contains(&"new-8758"),
+                "#8758: mem paired with itself"
+            );
+            picked.contains(&"old-8758")
+        });
+    }
 
     /// #3490 — pin the internal-namespace autonomy exclusion at its pure
     /// eligibility boundary. Generic MCP writes cannot reach this branch after

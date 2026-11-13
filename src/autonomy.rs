@@ -519,17 +519,14 @@ pub(crate) fn find_consolidation_clusters(
     conn: &Connection,
     candidates: &[Memory],
 ) -> Vec<Vec<Memory>> {
-    // Group by namespace first — we never merge across namespaces.
-    let mut by_ns: std::collections::HashMap<&str, Vec<&Memory>> = std::collections::HashMap::new();
-    for m in candidates {
-        if m.namespace.starts_with('_') {
-            continue;
-        }
-        by_ns.entry(&m.namespace).or_default().push(m);
-    }
+    // Group by `(namespace, owner, scope)` partition first (#8758) — we
+    // never merge across namespaces, owners or scopes.
+    let by_partition =
+        crate::partition::group_indices_by_partition(candidates, |m| !m.namespace.starts_with('_'));
 
     let mut clusters: Vec<Vec<Memory>> = Vec::new();
-    for (_ns, group) in by_ns {
+    for idxs in by_partition.into_values() {
+        let group: Vec<&Memory> = idxs.iter().map(|&i| &candidates[i]).collect();
         let mut used = vec![false; group.len()];
         for i in 0..group.len() {
             if used[i] {
@@ -646,6 +643,11 @@ fn consolidate_cluster(
     // Skip clusters inside reserved namespaces (defensive; already
     // filtered at find_consolidation_clusters).
     if cluster.iter().any(|m| m.namespace.starts_with('_')) {
+        return Ok(None);
+    }
+    // #8758 — never one prompt or one merged row across owners or scopes
+    // (defensive; already partitioned at find_consolidation_clusters).
+    if crate::partition::single_partition(cluster).is_none() {
         return Ok(None);
     }
 
@@ -995,10 +997,14 @@ pub const ROLLBACK_PENDING_KEY: &str = "pending";
 /// The `_curator/rollback` row metadata for `entry` — ONE shape for the
 /// write-ahead row, its commit and the plain (post-hoc) entries.
 fn rollback_entry_metadata(entry: &RollbackEntry, pending: bool) -> serde_json::Value {
+    // #8758 — a rollback row holds verbatim source snapshots, so it is
+    // stamped explicitly `private` (the narrowest arm, owner `ai:curator`):
+    // never NULL and never wider than any source it copies.
     let mut meta = serde_json::json!({
         "agent_id": crate::identity::sentinels::AI_CURATOR,
         "action": entry.action_tag(),
         "why_trace": crate::storage::WHY_TRACE_SUBSTRATE_SYSTEM,
+        crate::META_KEY_SCOPE: crate::models::MemoryScope::Private.as_str(),
     });
     if pending {
         meta[ROLLBACK_PENDING_KEY] = serde_json::Value::Bool(true);

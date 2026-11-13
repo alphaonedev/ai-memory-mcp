@@ -331,7 +331,8 @@ impl<'a> ConsolidationPass<'a> {
         if ns.starts_with('_') {
             return false;
         }
-        cluster.iter().all(|m| &m.namespace == ns)
+        // #8758 — one namespace, one owner, one scope arm.
+        crate::partition::single_partition(cluster).is_some()
     }
 
     /// LLM-summarise the cluster and produce a consolidated [`Memory`].

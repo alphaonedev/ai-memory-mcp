@@ -130,7 +130,10 @@ pub(super) fn adjacent_memory(conn: &Connection, mem: &Memory) -> Result<Option<
         None,
         None, // #1834 valid_at (no as-of)
     )?;
-    Ok(batch
-        .into_iter()
-        .find(|m| m.id != mem.id && m.content.len() >= MIN_CONTENT_LEN))
+    Ok(batch.into_iter().find(|m| {
+        m.id != mem.id
+                && m.content.len() >= MIN_CONTENT_LEN
+                // #8758 — never pair rows of two owners or scopes.
+                && crate::partition::same_partition(m, mem)
+    }))
 }

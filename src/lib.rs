@@ -1059,6 +1059,8 @@ pub mod transit_encryption;
 // generated into the key directory on first boot, renewed automatically.
 /// #4356 — the ancestor-owner gate on the first bind of a namespace standard.
 pub mod ns_standard_ancestor;
+/// #8758 — the `(namespace, owner, scope)` partition autonomous passes group by.
+pub(crate) mod partition;
 pub mod tls_bootstrap;
 pub mod trust;
 pub mod validate;

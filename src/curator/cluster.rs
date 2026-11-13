@@ -167,20 +167,16 @@ impl ConsolidationClustering {
         embeddings: &[Option<Vec<f32>>],
         spaces: &[Option<String>],
     ) -> Vec<Vec<MemoryId>> {
-        // Group by namespace (carrying the original index so the aligned
-        // `embeddings` slice is addressable); never merge across namespace
-        // boundaries; skip reserved `_`-prefixed namespaces.
-        let mut by_ns: std::collections::HashMap<&str, Vec<usize>> =
-            std::collections::HashMap::new();
-        for (idx, m) in memories.iter().enumerate() {
-            if m.namespace.starts_with('_') {
-                continue;
-            }
-            by_ns.entry(&m.namespace).or_default().push(idx);
-        }
+        // Group by `(namespace, owner, scope)` partition (#8758), carrying
+        // the original index so the aligned `embeddings` slice is
+        // addressable; never merge across a partition; skip reserved
+        // `_`-prefixed namespaces.
+        let by_partition = crate::partition::group_indices_by_partition(memories, |m| {
+            !m.namespace.starts_with('_')
+        });
 
         let mut clusters: Vec<Vec<MemoryId>> = Vec::new();
-        for (_ns, idxs) in by_ns {
+        for idxs in by_partition.into_values() {
             let mut used = vec![false; idxs.len()];
             for a in 0..idxs.len() {
                 if used[a] {
