@@ -1,12 +1,14 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::handlers::identity_binding::IdentityHeaders;
+
 use crate::models::ConfidenceSource;
 use crate::models::field_names;
 use axum::{
     Json,
     extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode},
+    http::StatusCode,
     response::IntoResponse,
 };
 use chrono::Utc;
@@ -41,7 +43,7 @@ pub struct InboxQuery {
 
 pub async fn get_inbox(
     State(app): State<AppState>,
-    headers: HeaderMap,
+    headers: IdentityHeaders,
     Query(q): Query<InboxQuery>,
 ) -> impl IntoResponse {
     // #2096 (v1.0.0, #2032-A / H1 IDOR) — per-agent-key identity gate BEFORE
@@ -245,7 +247,7 @@ async fn set_namespace_standard_inner(
     app: &AppState,
     ns: &str,
     body: NamespaceStandardBody,
-    headers: Option<&HeaderMap>,
+    headers: Option<&IdentityHeaders>,
 ) -> axum::response::Response {
     // #2096 (v1.0.0, #2032-A / H1 IDOR) — per-agent-key identity gate BEFORE
     // the #929 caller-vs-recorded-owner mutation check below. A namespace
@@ -929,7 +931,7 @@ async fn set_namespace_standard_inner(
 
 pub async fn set_namespace_standard(
     State(app): State<AppState>,
-    headers: HeaderMap,
+    headers: IdentityHeaders,
     Path(ns): Path<String>,
     Json(body): Json<NamespaceStandardBody>,
 ) -> impl IntoResponse {
@@ -953,7 +955,7 @@ pub struct NamespaceStandardQuery {
 
 pub async fn get_namespace_standard(
     State(app): State<AppState>,
-    headers: HeaderMap,
+    headers: IdentityHeaders,
     Path(ns): Path<String>,
     Query(q): Query<NamespaceStandardQuery>,
 ) -> impl IntoResponse {
@@ -978,7 +980,7 @@ pub async fn get_namespace_standard(
 
 pub async fn clear_namespace_standard(
     State(app): State<AppState>,
-    headers: HeaderMap,
+    headers: IdentityHeaders,
     Path(ns): Path<String>,
 ) -> impl IntoResponse {
     clear_namespace_standard_inner(&app, &ns, Some(&headers)).await
@@ -987,7 +989,7 @@ pub async fn clear_namespace_standard(
 // Query-string forms for the S34/S35 `/api/v1/namespaces?namespace=…` shape.
 pub async fn set_namespace_standard_qs(
     State(app): State<AppState>,
-    headers: HeaderMap,
+    headers: IdentityHeaders,
     Json(body): Json<NamespaceStandardBody>,
 ) -> impl IntoResponse {
     let Some(ns) = body
@@ -1006,7 +1008,7 @@ pub async fn set_namespace_standard_qs(
 
 pub async fn get_namespace_standard_qs(
     State(app): State<AppState>,
-    headers: HeaderMap,
+    headers: IdentityHeaders,
     Query(q): Query<NamespaceStandardQuery>,
 ) -> impl IntoResponse {
     // If no namespace is supplied this shares a route with the existing
@@ -1238,7 +1240,7 @@ pub async fn get_namespace_standard_qs(
 
 pub async fn clear_namespace_standard_qs(
     State(app): State<AppState>,
-    headers: HeaderMap,
+    headers: IdentityHeaders,
     Query(q): Query<NamespaceStandardQuery>,
 ) -> impl IntoResponse {
     let Some(ns) = q.namespace else {
@@ -1260,7 +1262,7 @@ pub async fn clear_namespace_standard_qs(
 async fn clear_namespace_standard_inner(
     app: &AppState,
     ns: &str,
-    headers: Option<&HeaderMap>,
+    headers: Option<&IdentityHeaders>,
 ) -> axum::response::Response {
     // #2131 (v1.0.0, #2032-A / H1 IDOR) — per-agent-key identity gate BEFORE
     // the #929 caller-vs-recorded-owner clear check below. Sibling of the
@@ -1408,7 +1410,7 @@ pub struct SessionStartBody {
 
 pub async fn session_start(
     State(app): State<AppState>,
-    headers: HeaderMap,
+    headers: IdentityHeaders,
     Json(body): Json<SessionStartBody>,
 ) -> impl IntoResponse {
     // agent_id is optional for session_start; but if supplied it must validate.

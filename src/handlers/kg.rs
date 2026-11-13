@@ -24,6 +24,8 @@
 
 #![allow(clippy::too_many_lines)]
 
+use crate::handlers::identity_binding::IdentityHeaders;
+
 use crate::models::Memory;
 use crate::models::field_names;
 use axum::{
@@ -351,7 +353,7 @@ pub async fn entity_register(
 /// "no match" from a server error.
 pub async fn entity_get_by_alias(
     State(app): State<AppState>,
-    headers: axum::http::HeaderMap,
+    headers: IdentityHeaders,
     Query(p): Query<EntityByAliasQuery>,
 ) -> impl IntoResponse {
     let alias = p.alias.trim();
@@ -592,7 +594,7 @@ pub struct KgTimelineQuery {
 /// link assertions from `source_id` ordered by `valid_from ASC`.
 pub async fn kg_timeline(
     State(app): State<AppState>,
-    headers: axum::http::HeaderMap,
+    headers: IdentityHeaders,
     Query(p): Query<KgTimelineQuery>,
 ) -> impl IntoResponse {
     if let Err(e) = validate::validate_id(&p.source_id) {
@@ -908,7 +910,7 @@ pub struct KgInvalidateBody {
 /// existed; 404 with `{found: false}` when no link matches the triple.
 pub async fn kg_invalidate(
     State(app): State<AppState>,
-    headers: axum::http::HeaderMap,
+    headers: IdentityHeaders,
     Json(body): Json<KgInvalidateBody>,
 ) -> impl IntoResponse {
     if let Err(e) = validate::RequestValidator::validate_link_triple(
@@ -1200,7 +1202,7 @@ pub struct FindPathsBody {
 /// inclusive.
 pub async fn kg_find_paths(
     State(app): State<AppState>,
-    headers: HeaderMap,
+    headers: IdentityHeaders,
     Json(body): Json<FindPathsBody>,
 ) -> impl IntoResponse {
     if let Err(e) = validate::validate_id(&body.source_id) {
@@ -1465,7 +1467,7 @@ fn kg_row_to_node(r: &crate::store::KgQueryRow) -> crate::models::KgQueryNode {
 /// internal error).
 pub async fn kg_query(
     State(app): State<AppState>,
-    headers: HeaderMap,
+    headers: IdentityHeaders,
     Json(body): Json<KgQueryBody>,
 ) -> impl IntoResponse {
     // #2133 (v1.0.0, #2032-A / H1 IDOR) — per-agent-key identity gate BEFORE

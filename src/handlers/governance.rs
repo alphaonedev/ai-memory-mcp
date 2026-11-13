@@ -9,11 +9,13 @@
 //! to resolve). The K10 SSE approval stream lives in [`super::approvals`]
 //! because it carries its own state (subscriber map).
 
+use crate::handlers::identity_binding::IdentityHeaders;
+
 use crate::models::field_names;
 use axum::{
     Json,
     extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode},
+    http::StatusCode,
     response::IntoResponse,
 };
 use serde::Deserialize;
@@ -47,7 +49,7 @@ fn default_pending_limit() -> Option<usize> {
 
 pub async fn list_pending(
     State(app): State<AppState>,
-    headers: HeaderMap,
+    headers: IdentityHeaders,
     Query(p): Query<PendingListQuery>,
 ) -> impl IntoResponse {
     let limit = p.limit.unwrap_or(100).min(1000);
@@ -189,7 +191,7 @@ fn audit_pending_verdict(agent_id: &str, id: &str, decision: &str) {
 #[allow(clippy::too_many_lines)]
 pub async fn approve_pending(
     State(app): State<AppState>,
-    headers: HeaderMap,
+    headers: IdentityHeaders,
     Path(id): Path<String>,
     body_bytes: axum::body::Bytes,
 ) -> impl IntoResponse {
@@ -527,7 +529,7 @@ pub async fn approve_pending(
 
 pub async fn reject_pending(
     State(app): State<AppState>,
-    headers: HeaderMap,
+    headers: IdentityHeaders,
     Path(id): Path<String>,
     body_bytes: axum::body::Bytes,
 ) -> impl IntoResponse {

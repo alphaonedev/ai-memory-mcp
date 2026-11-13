@@ -44,11 +44,13 @@
 //! safe-by-default posture, every skill HTTP surface MUST be admin-
 //! only until a future cluster lands a richer skill-ACL model.
 
+use crate::handlers::identity_binding::IdentityHeaders;
+
 use crate::models::field_names;
 use axum::{
     Json,
     extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode},
+    http::StatusCode,
     response::IntoResponse,
 };
 use serde::Deserialize;
@@ -116,7 +118,7 @@ fn refuse_skills_on_postgres(
 /// `POST /api/v1/skill` — register a new skill from an inline body.
 pub async fn skill_register_route(
     State(app): State<AppState>,
-    headers: HeaderMap,
+    headers: IdentityHeaders,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     // #3183 — the skills substrate is sqlite-only; on a postgres-backed
@@ -157,7 +159,7 @@ pub struct SkillListQuery {
 
 pub async fn skill_list_route(
     State(app): State<AppState>,
-    headers: HeaderMap,
+    headers: IdentityHeaders,
     Query(q): Query<SkillListQuery>,
 ) -> impl IntoResponse {
     // #3183 — the skills substrate is sqlite-only; on a postgres-backed
@@ -210,7 +212,7 @@ pub async fn skill_list_route(
 /// `GET /api/v1/skill/{id}` — full activation payload (body included).
 pub async fn skill_get_route(
     State(app): State<AppState>,
-    headers: HeaderMap,
+    headers: IdentityHeaders,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     // #3183 — the skills substrate is sqlite-only; on a postgres-backed
@@ -262,7 +264,7 @@ pub struct SkillResourceQuery {
 
 pub async fn skill_resource_route(
     State(app): State<AppState>,
-    headers: HeaderMap,
+    headers: IdentityHeaders,
     Path(id): Path<String>,
     Query(q): Query<SkillResourceQuery>,
 ) -> impl IntoResponse {
@@ -309,7 +311,7 @@ pub struct SkillExportBody {
 
 pub async fn skill_export_route(
     State(app): State<AppState>,
-    headers: HeaderMap,
+    headers: IdentityHeaders,
     Path(id): Path<String>,
     Json(body): Json<SkillExportBody>,
 ) -> impl IntoResponse {
@@ -366,7 +368,7 @@ pub struct SkillPromoteBody {
 
 pub async fn skill_promote_route(
     State(app): State<AppState>,
-    headers: HeaderMap,
+    headers: IdentityHeaders,
     Path(id): Path<String>,
     Json(body): Json<SkillPromoteBody>,
 ) -> impl IntoResponse {
@@ -452,7 +454,7 @@ pub struct SkillComposeBody {
 
 pub async fn skill_compose_route(
     State(app): State<AppState>,
-    headers: HeaderMap,
+    headers: IdentityHeaders,
     Path(id): Path<String>,
     body: Option<Json<SkillComposeBody>>,
 ) -> impl IntoResponse {
@@ -521,7 +523,7 @@ pub struct SkillRetireBody {
 
 pub async fn skill_retire_route(
     State(app): State<AppState>,
-    headers: HeaderMap,
+    headers: IdentityHeaders,
     Path(id): Path<String>,
     body: Option<Json<SkillRetireBody>>,
 ) -> impl IntoResponse {
@@ -577,7 +579,7 @@ pub struct SkillDeleteBody {
 
 pub async fn skill_delete_route(
     State(app): State<AppState>,
-    headers: HeaderMap,
+    headers: IdentityHeaders,
     Path(id): Path<String>,
     body: Option<Json<SkillDeleteBody>>,
 ) -> impl IntoResponse {

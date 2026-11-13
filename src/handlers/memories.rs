@@ -10,6 +10,8 @@
 
 #![allow(clippy::too_many_lines)]
 
+use crate::handlers::identity_binding::IdentityHeaders;
+
 use crate::models::field_names;
 use axum::{
     Json,
@@ -32,7 +34,7 @@ use super::store_err_to_response;
 
 pub async fn get_memory(
     State(app): State<AppState>,
-    headers: HeaderMap,
+    headers: IdentityHeaders,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     if let Err(e) = validate::validate_id(&id) {
@@ -325,7 +327,7 @@ fn parse_if_match_version(headers: &HeaderMap) -> Result<Option<i64>, String> {
 pub async fn update_memory(
     State(app): State<AppState>,
     Path(id): Path<String>,
-    headers: HeaderMap,
+    headers: IdentityHeaders,
     Json(body): Json<UpdateMemory>,
 ) -> impl IntoResponse {
     let response = update_memory_write(State(app.clone()), Path(id), headers, Json(body))
@@ -343,7 +345,7 @@ pub async fn update_memory(
 async fn update_memory_write(
     State(app): State<AppState>,
     Path(id): Path<String>,
-    headers: HeaderMap,
+    headers: IdentityHeaders,
     Json(body): Json<UpdateMemory>,
 ) -> impl IntoResponse {
     let state = app.db.clone();
@@ -993,7 +995,7 @@ async fn regenerate_embedding(
 #[allow(clippy::too_many_lines)]
 pub async fn delete_memory(
     State(app): State<AppState>,
-    headers: HeaderMap,
+    headers: IdentityHeaders,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     let state = app.db.clone();
@@ -1468,7 +1470,7 @@ pub async fn delete_memory(
 #[allow(clippy::too_many_lines)]
 pub async fn promote_memory(
     State(app): State<AppState>,
-    headers: HeaderMap,
+    headers: IdentityHeaders,
     Path(id): Path<String>,
     body: axum::body::Bytes,
 ) -> impl IntoResponse {

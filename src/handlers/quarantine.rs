@@ -46,9 +46,10 @@
 //! [#2402]: https://github.com/alphaonedev/ai-memory-mcp/issues/2402
 //! [#1948]: https://github.com/alphaonedev/ai-memory-mcp/issues/1948
 
+use crate::handlers::identity_binding::IdentityHeaders;
+
 use axum::Json;
 use axum::extract::{Path, Query, State};
-use axum::http::HeaderMap;
 use axum::response::IntoResponse;
 use serde::Deserialize;
 use serde_json::json;
@@ -99,7 +100,7 @@ pub fn clamp_limit(requested: Option<i64>) -> i64 {
 /// quarantine. Admin-gated, read-only.
 pub async fn list_quarantined(
     State(app): State<AppState>,
-    headers: HeaderMap,
+    headers: IdentityHeaders,
     Query(q): Query<QuarantineListQuery>,
 ) -> impl IntoResponse {
     if let Err(resp) = crate::handlers::admin_role::require_admin(&app, &headers, LIST_ENDPOINT) {
@@ -148,7 +149,7 @@ pub async fn list_quarantined(
 /// endpoint is not returning.
 pub async fn release_quarantined(
     State(app): State<AppState>,
-    headers: HeaderMap,
+    headers: IdentityHeaders,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     // The admin gate's RETURN VALUE is the audit actor: an id that passed the

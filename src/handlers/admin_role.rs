@@ -51,8 +51,10 @@
 //! The audit fire happens BEFORE the handler observes the body so
 //! the chain entry lands even if the handler errors downstream.
 
+use crate::handlers::identity_binding::IdentityHeaders;
+
 use axum::Json;
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde_json::json;
 
@@ -148,7 +150,7 @@ pub struct PrincipalGate {
 /// Returns the typed 403 response for a claimed (unverified) admin.
 pub async fn require_key_bound_admin(
     app: &AppState,
-    headers: &HeaderMap,
+    headers: &IdentityHeaders,
     caller: &str,
     agent_id: &str,
     gate: &PrincipalGate,
@@ -403,7 +405,7 @@ pub fn is_admin_caller(state: &AppState, caller: &str) -> bool {
 /// self-asserted `X-Agent-Id` on a keyless deployment bypasses
 /// cross-tenant private-row visibility (the #1582 finding).
 #[must_use]
-pub fn is_admin_caller_trusted(state: &AppState, headers: &HeaderMap, caller: &str) -> bool {
+pub fn is_admin_caller_trusted(state: &AppState, headers: &IdentityHeaders, caller: &str) -> bool {
     // Base #1570 (H6) gate: allowlisted name + request-authn (or the legacy
     // header-trust escape hatch).
     if !(is_admin_caller(state, caller)
@@ -459,7 +461,7 @@ pub fn is_admin_caller_trusted(state: &AppState, headers: &HeaderMap, caller: &s
 /// id the handler can use for downstream calls + auditing.
 pub fn require_admin(
     state: &AppState,
-    headers: &HeaderMap,
+    headers: &IdentityHeaders,
     endpoint: &'static str,
 ) -> Result<String, Response> {
     let header_agent_id = headers

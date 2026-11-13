@@ -72,14 +72,14 @@ fn enrollment_takes_effect_without_rebuilding_state_3418() {
 
     // Before enrollment the gate is inert (empty map) and the caller is Claimed.
     assert_eq!(
-        resolve_auth_level(&registry, &headers, "alice"),
+        resolve_auth_level(&registry, &headers.clone().into(), "alice"),
         AuthLevel::Claimed
     );
     assert!(
         enforce_for_request(
             &registry,
             ai_memory::config::HttpIdentityMode::Enforce,
-            &headers,
+            &headers.clone().into(),
             "alice",
             "get_memory"
         )
@@ -94,7 +94,7 @@ fn enrollment_takes_effect_without_rebuilding_state_3418() {
     );
 
     assert_eq!(
-        resolve_auth_level(&registry, &headers, "alice"),
+        resolve_auth_level(&registry, &headers.clone().into(), "alice"),
         AuthLevel::KeyAuthenticated,
         "the freshly enrolled key must resolve with NO restart"
     );
@@ -112,7 +112,7 @@ fn revocation_takes_effect_without_a_restart_3418() {
     let registry = EnrolledAgentKeys::from_map(enrolled_map("alice-token", "alice"));
     let headers = headers_with_key("alice-token");
     assert_eq!(
-        resolve_auth_level(&registry, &headers, "alice"),
+        resolve_auth_level(&registry, &headers.clone().into(), "alice"),
         AuthLevel::KeyAuthenticated
     );
 
@@ -121,7 +121,7 @@ fn revocation_takes_effect_without_a_restart_3418() {
     assert!(registry.install(HashMap::new()), "revocation is a change");
 
     assert_eq!(
-        resolve_auth_level(&registry, &headers, "alice"),
+        resolve_auth_level(&registry, &headers.clone().into(), "alice"),
         AuthLevel::Claimed,
         "a REVOKED key must stop authenticating immediately — a revocation that \
          waits for a restart is a credential the operator believes is dead"
@@ -142,7 +142,7 @@ fn enforce_refuses_a_revoked_caller_while_others_stay_enrolled_3418() {
         enforce_for_request(
             &registry,
             ai_memory::config::HttpIdentityMode::Enforce,
-            &alice,
+            &alice.clone().into(),
             "alice",
             "get_memory"
         )
@@ -157,7 +157,7 @@ fn enforce_refuses_a_revoked_caller_while_others_stay_enrolled_3418() {
         enforce_for_request(
             &registry,
             ai_memory::config::HttpIdentityMode::Enforce,
-            &alice,
+            &alice.clone().into(),
             "alice",
             "get_memory"
         )
@@ -207,7 +207,7 @@ fn a_failed_refresh_keeps_the_last_known_snapshot_3418() {
         "a failed read installs nothing, so the generation must not move"
     );
     assert_eq!(
-        resolve_auth_level(&registry, &headers, "alice"),
+        resolve_auth_level(&registry, &headers.clone().into(), "alice"),
         AuthLevel::KeyAuthenticated,
         "the previously enrolled key must keep working across a failed refresh"
     );

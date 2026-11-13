@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security (#8590, umbrella #8493 — certificate binding reaches identity gates)
+
+- A caller bound to an agent by an active verified mTLS certificate can use the shared API key on enforced IDOR/admin routes. The legacy resolver now receives typed request certificate context and maps a binding matching the effective caller to `KeyAuthenticated`; authority/audit provenance remains `ClientCert`. Certificate/header mismatches still refuse under enforce, absent/off/unmapped bindings grant no certificate authority, and per-agent API-key fallback is preserved. No new wire header carries certificate trust.
+
 ### Security (#8574, umbrella #8493 — header-trust opt-in is bootstrap-only on credential routes)
 
 - `AI_MEMORY_ADMIN_HEADER_TRUST=1` no longer admits a claimed admin on pubkey bind, bind challenge, api-key mint and api-key revoke once any per-agent api key is enrolled, in every identity mode (403 plus a deny row, reason `header_trust_refused_registry_enrolled`); it remains the bootstrap while the registry is empty (bootstrap, or after every key is revoked), confirmed by an authoritative store read; a store error refuses, with deny reason `header_trust_refused_registry_unreadable`.

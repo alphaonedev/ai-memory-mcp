@@ -11,6 +11,8 @@
 
 #![allow(clippy::too_many_lines)]
 
+use crate::handlers::identity_binding::IdentityHeaders;
+
 use crate::models::field_names;
 use axum::{
     Json,
@@ -119,7 +121,7 @@ fn splice_recall_scope_into(req: &mut RecallRequest, app: &AppState) -> Option<S
 
 pub async fn recall_memories_get(
     State(app): State<AppState>,
-    headers: axum::http::HeaderMap,
+    headers: IdentityHeaders,
     Query(p): Query<RecallQuery>,
 ) -> impl IntoResponse {
     // #967 — marshal once into the canonical `RecallRequest`. The
@@ -236,7 +238,7 @@ pub async fn recall_memories_get(
 
 pub async fn recall_memories_post(
     State(app): State<AppState>,
-    headers: axum::http::HeaderMap,
+    headers: IdentityHeaders,
     Json(body): Json<RecallBody>,
 ) -> impl IntoResponse {
     // #967 — same DTO marshal-once shape as the GET path; the body

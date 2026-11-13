@@ -12,11 +12,13 @@
 
 #![allow(clippy::too_many_lines)]
 
+use crate::handlers::identity_binding::IdentityHeaders;
+
 use crate::models::field_names;
 use axum::{
     Json,
     extract::{Query, State},
-    http::{HeaderMap, StatusCode},
+    http::StatusCode,
     response::{IntoResponse, Response},
 };
 use serde::Deserialize;
@@ -68,7 +70,7 @@ pub struct ContradictionsQuery {
 #[allow(clippy::too_many_lines)]
 pub async fn detect_contradictions(
     State(app): State<AppState>,
-    headers: axum::http::HeaderMap,
+    headers: IdentityHeaders,
     Query(q): Query<ContradictionsQuery>,
 ) -> impl IntoResponse {
     if q.topic.is_none() && q.namespace.is_none() {
@@ -410,7 +412,7 @@ pub async fn detect_contradictions(
 
 pub async fn list_namespaces(
     State(app): State<AppState>,
-    headers: HeaderMap,
+    headers: IdentityHeaders,
     Query(q): Query<crate::handlers::inventory::ListNamespacesQuery>,
 ) -> impl IntoResponse {
     list_namespaces_with_query(app, headers, q).await
@@ -421,7 +423,7 @@ pub async fn list_namespaces(
 /// `limit`/`offset`/`prefix` when `?namespace=` is absent).
 pub(crate) async fn list_namespaces_with_query(
     app: AppState,
-    headers: HeaderMap,
+    headers: IdentityHeaders,
     q: crate::handlers::inventory::ListNamespacesQuery,
 ) -> Response {
     // #945 SECURITY-medium (Track A QC sweep, 2026-05-20) — admin-
@@ -513,7 +515,7 @@ pub struct TaxonomyQuery {
 /// flag when `limit` dropped rows from the walk.
 pub async fn get_taxonomy(
     State(app): State<AppState>,
-    headers: axum::http::HeaderMap,
+    headers: IdentityHeaders,
     Query(p): Query<TaxonomyQuery>,
 ) -> impl IntoResponse {
     // #945 SECURITY-medium (Track A QC sweep, 2026-05-20) — admin-
@@ -807,7 +809,7 @@ fn embedder_failed_response() -> axum::response::Response {
 /// threshold.
 pub async fn check_duplicate(
     State(app): State<AppState>,
-    headers: axum::http::HeaderMap,
+    headers: IdentityHeaders,
     Json(body): Json<CheckDuplicateBody>,
 ) -> impl IntoResponse {
     if let Err(e) = validate::validate_title(&body.title) {

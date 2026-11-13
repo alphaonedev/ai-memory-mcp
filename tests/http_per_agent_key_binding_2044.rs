@@ -313,7 +313,8 @@ fn enforce_for_request_is_inert_when_no_keys_enrolled() {
         HttpIdentityMode::Enforce,
     ] {
         assert!(
-            enforce_for_request(&empty, mode, &headers, "alice", "get_memory").is_none(),
+            enforce_for_request(&empty, mode, &headers.clone().into(), "alice", "get_memory")
+                .is_none(),
             "empty enrolled map must be inert in {mode:?}"
         );
     }
@@ -332,7 +333,7 @@ fn h1_m1_enforce_refuses_shared_key_named_principal_at_gate() {
     headers.insert("x-api-key", "shared-transport".parse().unwrap());
     // Shared key, acting as victim → Claimed → refused under enforce (H1 read/
     // mutate + M1 admin).
-    let level = resolve_auth_level(&map, &headers, "victim");
+    let level = resolve_auth_level(&map, &headers.clone().into(), "victim");
     assert_eq!(level, AuthLevel::Claimed);
     assert!(
         enforce_sensitive_identity(HttpIdentityMode::Enforce, level, "victim", "get_memory")
@@ -347,7 +348,7 @@ fn h1_m1_enforce_refuses_shared_key_named_principal_at_gate() {
     // alice's per-agent key acting as alice → KeyAuthenticated → allowed.
     let mut h2 = HeaderMap::new();
     h2.insert("x-api-key", "alice-key".parse().unwrap());
-    let level2 = resolve_auth_level(&map, &h2, "alice");
+    let level2 = resolve_auth_level(&map, &h2.clone().into(), "alice");
     assert_eq!(level2, AuthLevel::KeyAuthenticated);
     assert!(
         enforce_sensitive_identity(

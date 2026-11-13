@@ -40,8 +40,9 @@
 //! inbox now", never to "a message was lost" — the durable row is the
 //! record, the wake is only the prompt to go look at it.
 
+use crate::handlers::identity_binding::IdentityHeaders;
+
 use axum::extract::State;
-use axum::http::HeaderMap;
 use axum::response::IntoResponse;
 
 use super::transport::AppState;
@@ -86,7 +87,7 @@ pub fn inbox_wake_visible_to(
 /// wake metadata.
 pub async fn inbox_sse(
     State(app): State<AppState>,
-    headers: HeaderMap,
+    headers: IdentityHeaders,
 ) -> axum::response::Response {
     use axum::response::sse::{Event, KeepAlive, Sse};
     use futures_core::Stream;

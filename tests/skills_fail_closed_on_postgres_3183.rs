@@ -315,7 +315,7 @@ async fn skill_register_handler_refuses_without_the_route_gate() {
     headers.insert("x-agent-id", ADMIN.parse().expect("header value"));
     let resp = ai_memory::handlers::skill_register_route(
         axum::extract::State(app),
-        headers,
+        headers.into(),
         axum::Json(valid_register_body()),
     )
     .await

@@ -31,6 +31,8 @@
 //! Extracted from `src/handlers/mod.rs` as part of the issue #650
 //! file-architecture cleanup.
 
+use crate::handlers::identity_binding::IdentityHeaders;
+
 use crate::models::field_names;
 use axum::{
     Json,
@@ -573,7 +575,7 @@ pub(crate) fn run_http_signed_gate<F: Fn(&str)>(
 #[allow(clippy::too_many_lines)]
 pub async fn approval_decide(
     State(app): State<AppState>,
-    headers: HeaderMap,
+    headers: IdentityHeaders,
     Path(id): Path<String>,
     body_bytes: axum::body::Bytes,
 ) -> impl IntoResponse {
@@ -1094,7 +1096,7 @@ pub fn sse_event_visible_to(
 /// rows in namespaces an active K9 `Allow` rule grants them.
 pub async fn approvals_sse(
     State(app): State<AppState>,
-    headers: HeaderMap,
+    headers: IdentityHeaders,
 ) -> axum::response::Response {
     use axum::response::sse::{Event, KeepAlive, Sse};
     use futures_core::Stream;

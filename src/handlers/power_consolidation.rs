@@ -12,11 +12,13 @@
 
 #![allow(clippy::too_many_lines)]
 
+use crate::handlers::identity_binding::IdentityHeaders;
+
 use crate::models::field_names;
 use axum::{
     Json,
     extract::State,
-    http::{HeaderMap, StatusCode},
+    http::StatusCode,
     response::{IntoResponse, Response},
 };
 use serde_json::json;
@@ -319,7 +321,7 @@ async fn consolidate_fanout(
 
 pub async fn consolidate_memories(
     State(app): State<AppState>,
-    headers: HeaderMap,
+    headers: IdentityHeaders,
     Json(body): Json<ConsolidateBody>,
 ) -> impl IntoResponse {
     // #1924 (CWE-288) — consult the PRE-CONSOLIDATE enforcement gate before the
@@ -865,7 +867,7 @@ pub struct AutoTagBody {
 /// the model is slow.
 pub async fn auto_tag_handler(
     State(app): State<AppState>,
-    headers: HeaderMap,
+    headers: IdentityHeaders,
     Json(body): Json<AutoTagBody>,
 ) -> impl IntoResponse {
     if app.llm.is_none() {
@@ -1164,7 +1166,7 @@ pub struct LoadFamilyBody {
 /// - response 400: unknown family / bad namespace
 pub async fn load_family_handler(
     State(app): State<AppState>,
-    headers: HeaderMap,
+    headers: IdentityHeaders,
     Json(body): Json<LoadFamilyBody>,
 ) -> impl IntoResponse {
     use std::str::FromStr;
@@ -1342,7 +1344,7 @@ pub async fn load_family_handler(
 #[cfg(feature = "sal")]
 pub(crate) async fn load_family_rows_via_store(
     app: &AppState,
-    headers: &HeaderMap,
+    headers: &axum::http::HeaderMap,
     family_name: &str,
     namespace: Option<&str>,
     k: usize,
