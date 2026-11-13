@@ -749,6 +749,64 @@ fn signed_skill_signature_is_verified_on_read_8834() {
     drop(env);
 }
 
+/// Ed25519 signature length in bytes; the malformed forms below sit on either
+/// side of it.
+const ED25519_SIGNATURE_LEN: usize = 64;
+
+/// Round-3 LOW C (#9174): a stored signature that is empty, one byte short or
+/// one byte long is refused with the exact `signature invalid` text on every
+/// read funnel; the length never decides to skip the check.
+#[test]
+fn malformed_length_signatures_fail_closed_with_the_exact_text_8834() {
+    let env = EnvLock::new();
+    env.act_as(None);
+    let (dir, db_path) = fresh_db();
+    let key_dir = dir.path().join("keys");
+    let conn = db::open(&db_path).expect("open");
+    let id = register_signed(&conn, &key_dir, "signed-malformed-len");
+    let sig: Vec<u8> = conn
+        .query_row("SELECT signature FROM skills WHERE id = ?1", [&id], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(sig.len(), ED25519_SIGNATURE_LEN, "the corpus anchor");
+    let mut too_long = sig.clone();
+    too_long.push(0);
+    let forms: [(&str, Vec<u8>); 3] = [
+        ("empty", Vec::new()),
+        ("truncated", sig[..ED25519_SIGNATURE_LEN - 1].to_vec()),
+        ("wrong-length-long", too_long),
+    ];
+    let expected = format!("{INTEGRITY_PREFIX}: signature invalid for skill {id}");
+    for (form, bytes) in forms {
+        conn.execute(
+            "UPDATE skills SET signature = ?1 WHERE id = ?2",
+            rusqlite::params![bytes, id],
+        )
+        .unwrap();
+        let reads = vec![
+            (
+                "get",
+                mcp::handle_skill_get(&conn, &json!({ "skill_id": id }), None),
+            ),
+            (
+                "compose",
+                mcp::skill_compositional_context_for_tests(&conn, &json!({ "skill_id": id })),
+            ),
+        ];
+        for (funnel, r) in reads {
+            match r {
+                Ok(v) => panic!("{form}/{funnel}: served a malformed signature: {v}"),
+                Err(e) => assert!(
+                    e.contains(&expected),
+                    "{form}/{funnel}: expected `{expected}`, got `{e}`"
+                ),
+            }
+        }
+    }
+    drop(env);
+}
+
 /// The reviewer's M1 probes (security r1): a signed row whose signature
 /// column was cleared, and an unsigned row that names a signer, are both
 /// refused with the exact typed refusal on every read funnel, never served
