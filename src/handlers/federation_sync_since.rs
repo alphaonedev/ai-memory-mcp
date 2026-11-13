@@ -188,7 +188,12 @@ pub async fn sync_since(
     // Vec+JSON allocation (10k rows × 64 KiB `content`) before the
     // response CompressionLayer runs — an asymmetric, peer-triggered
     // memory-amplification vector. The pull page now matches the push cap.
-    let limit = q.limit.unwrap_or(500).min(app.max_page_size);
+    // #8743 — the default is the one constant both pull loops use to tell a
+    // full page (more rows may share its newest timestamp) from a short one.
+    let limit = q
+        .limit
+        .unwrap_or(crate::federation::pull_cursor::SYNC_SINCE_DEFAULT_LIMIT)
+        .min(app.max_page_size);
 
     // v0.7.0 #239 — per-peer namespace allowlist. Read the
     // `x-peer-id` header + the operator-configured attestation map
