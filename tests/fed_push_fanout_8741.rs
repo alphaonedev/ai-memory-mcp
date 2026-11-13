@@ -1218,23 +1218,20 @@ fn import_batch(ns: &str, n: usize) -> (Vec<Value>, Vec<Value>) {
     (rows, links)
 }
 
-/// Request timeout for the PostgreSQL at-cap import: the PostgreSQL import arm
-/// makes one awaited round trip per row and link, so `MAX_BULK_SIZE` of both
-/// overruns the default `DEFAULT_REQUEST_TIMEOUT_SECS` (#9209, which exists
-/// before this PR). Flip to the default timeout when #9209 lands.
-#[cfg(feature = "sal-postgres")]
-const PG_IMPORT_AT_CAP_TIMEOUT_SECS: u64 = 300;
+/// Router request timeout for the at-cap import, shared by both backends. A
+/// bulk import of `MAX_BULK_SIZE` memories plus `MAX_BULK_SIZE` links does one
+/// awaited round trip per row and link: on PostgreSQL that overruns the
+/// default `DEFAULT_REQUEST_TIMEOUT_SECS` (#9209, which exists before this
+/// PR), and on SQLite it overruns it under host IO pressure (measured io
+/// `some avg60` about 85 on the CI host, which returned 504 `request timed
+/// out`). The cell asserts the 200 at the cap, so it must not depend on the
+/// default wall-clock bound. Flip to the default timeout when #9209 lands.
+const IMPORT_AT_CAP_TIMEOUT_SECS: u64 = 300;
 
-/// The router timeout the import-bounds cell runs under: the default on
-/// SQLite, [`PG_IMPORT_AT_CAP_TIMEOUT_SECS`] on PostgreSQL (#9209).
-fn import_at_cap_timeout(backend: Backend) -> std::time::Duration {
-    match backend {
-        Backend::Sqlite => {
-            std::time::Duration::from_secs(ai_memory::config::DEFAULT_REQUEST_TIMEOUT_SECS)
-        }
-        #[cfg(feature = "sal-postgres")]
-        Backend::Postgres => std::time::Duration::from_secs(PG_IMPORT_AT_CAP_TIMEOUT_SECS),
-    }
+/// The router timeout the import-bounds cell runs under, the same on every
+/// backend ([`IMPORT_AT_CAP_TIMEOUT_SECS`]).
+fn import_at_cap_timeout(_backend: Backend) -> std::time::Duration {
+    std::time::Duration::from_secs(IMPORT_AT_CAP_TIMEOUT_SECS)
 }
 
 /// Round 2 LOW-1 — the import bounds: one past `MAX_BULK_SIZE` memories or
