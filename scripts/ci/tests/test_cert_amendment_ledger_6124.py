@@ -1219,6 +1219,15 @@ class MutationKillRows(LedgerCase):
             ok, out, f"the document is {DOC_LIMIT_BYTES + 1} bytes, over the {DOC_LIMIT_BYTES}-byte limit",
             None, "head", UNPARSEABLE_3556, "UNPARSEABLE -")
 
+    def test_ledger_size_cap_edge_is_exact(self):
+        # At gate level the banner cap refuses first; the ledger parser keeps its own cap,
+        # pinned here at the same edge.
+        rec = record(DAY, path_item(MOD_RS))
+        self.assertIsNone(ledger_error(doc_of_size(head_doc(), (rec,), DOC_LIMIT_BYTES)))
+        self.assertEqual(
+            ledger_error(doc_of_size(head_doc(), (rec,), DOC_LIMIT_BYTES + 1)),
+            (f"the document is {DOC_LIMIT_BYTES + 1} bytes, over the {DOC_LIMIT_BYTES}-byte limit", None))
+
     def test_inline_html_rows_are_refused_at_their_line(self):
         s = self.scene("VOID")
         for name, fake, reason in PRE_INLINE_ROWS:
