@@ -476,6 +476,37 @@ class RefusedAmendment(LedgerCase):
         self.assertFalse(ok, out)
         self.assertIn("(fail-closed)", out)
 
+    def test_unreadable_cert_tree_refused(self):
+        # The doc's directory object is unreadable while the diff never needs it (same
+        # tree at both ends): the banner read must refuse, never read the doc as absent.
+        s = self.scene("VOID")
+        head = s.commit({"README.md": "unrelated\n"}, "unrelated change")
+        tree = s.g("rev-parse", f"{head}:docs/compliance")
+        (s.repo / ".git" / "objects" / tree[:2] / tree[2:]).unlink()
+        ok, out = s.judge(head)
+        self.assertFalse(ok, out)
+        self.assertIn(f"{GATE_PREFIX}: ERROR — git ls-tree", out)
+        self.assertIn("(fail-closed)", out)
+
+    def test_live_with_exact_record_still_expires(self):
+        # LIVE behaviour is unchanged: an exact amendment never passes a LIVE banner.
+        s = self.scene("LIVE", bind_genesis=True)
+        ok, out = s.judge(self.wire_and_doc(s, with_ledger(s.doc, record(DAY, path_item(MOD_RS)))))
+        self.assertFalse(ok, out)
+        self.assertIn(cert.EXPIRY_SENTENCE, out)
+        self.assertNotIn("a new amendment record names every change", out)
+
+    def test_duplicate_binds_with_exact_record_refused(self):
+        # A malformed banner (two Binds-to lines) is never an amendment pass.
+        s = self.scene("VOID")
+        bind = f"**Binds to:** `{s.genesis}` (fixture bind)"
+        doc = with_ledger(s.doc.replace("**Binds to:** none (voided)", f"{bind}\n\n{bind}"),
+                          record(DAY, path_item(MOD_RS)))
+        ok, out = s.judge(self.wire_and_doc(s, doc))
+        self.assertFalse(ok, out)
+        self.assertIn("does not carry exactly one STATUS banner line", out)
+        self.assertNotIn("a new amendment record names every change", out)
+
 
 def hostile_rows():
     """(name, head doc text or bytes, exact reason, line or None). Every head adds an
