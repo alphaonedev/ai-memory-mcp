@@ -15916,9 +15916,7 @@ impl PostgresStore {
         since: Option<&str>,
         audit_pubkey: Option<&ed25519_dalek::VerifyingKey>,
     ) -> StoreResult<crate::signed_events::AuditTrailReport> {
-        use crate::signed_events::{
-            SignedEvent, TruncationCheck, ZERO_HASH, canonical_chain_bytes,
-        };
+        use crate::signed_events::{SignedEvent, ZERO_HASH, canonical_chain_bytes};
         use sha2::{Digest, Sha256};
 
         // Chain head (whole table, independent of the window).
@@ -15959,24 +15957,14 @@ impl PostgresStore {
 
         // Off-table tail-truncation verdict — the SAME shared forensic reader
         // the sqlite path uses (item 7 wired the pg chokepoint to stamp it).
-        let truncation =
-            match crate::governance::audit::last_audit_watermark(watermark_db_id.as_deref()) {
-                Some((anchored_head, _)) => {
-                    if head_sequence < anchored_head {
-                        // CONVICT on the raw (unauthenticated) anchor.
-                        TruncationCheck::Detected {
-                            anchored_head,
-                            db_head: head_sequence,
-                        }
-                    } else if exonerate_ok {
-                        TruncationCheck::NotDetected
-                    } else {
-                        // L7 — pin enrolled + anchor unauthenticated → WITHHOLD.
-                        TruncationCheck::Unknown
-                    }
-                }
-                None => TruncationCheck::Unknown,
-            };
+        // #8741 — the SHARED truncation fold (sqlite twin parity), which also
+        // yields the trusted watermark head when the verdict is NotDetected.
+        let (truncation, anchored_head) = crate::signed_events::truncation_verdict(
+            crate::governance::audit::last_audit_watermark(watermark_db_id.as_deref())
+                .map(|(anchored, _)| anchored),
+            head_sequence,
+            exonerate_ok,
+        );
 
         // Resolve the RFC3339 `since` to a sequence FLOOR (mirrors sqlite).
         let floor: i64 = match since {
@@ -16066,6 +16054,7 @@ impl PostgresStore {
             .ok()
             .flatten();
         let mut signature_failures: Vec<i64> = Vec::new();
+        let mut signature_failure_reasons: Vec<(i64, &'static str)> = Vec::new();
         let mut role_separation_failures: Vec<i64> = Vec::new();
         let mut rows_positively_verified: u64 = 0;
 
@@ -16102,8 +16091,9 @@ impl PostgresStore {
             if rv.is_verified() {
                 rows_positively_verified += 1;
             }
-            if rv.signature_failure() {
+            if let Some(reason) = rv.signature_failure_reason() {
                 signature_failures.push(seq);
+                signature_failure_reasons.push((seq, reason));
             }
             if rv.role_separation_failure() {
                 role_separation_failures.push(seq);
@@ -16350,6 +16340,8 @@ impl PostgresStore {
             head_hash,
             cause_binding,
             signature_failures,
+            signature_failure_reasons,
+            anchored_head,
             role_separation,
             lineage,
             rollback,

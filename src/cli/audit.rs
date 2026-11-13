@@ -616,6 +616,8 @@ mod bring_up_remaining_tests {
             witness: WitnessCheck::NotDetected,
             cause_binding: CauseBinding::NotDetected,
             signature_failures: vec![],
+            signature_failure_reasons: vec![],
+            anchored_head: None,
             role_separation: RoleSeparationCheck::NotDetected,
             lineage: LineageCheck::NotDetected,
             rollback: RollbackCheck::NotDetected,
@@ -1079,6 +1081,54 @@ fn resolve_path(
     resolve_audit_path(&cfg)
 }
 
+/// Reason: the flat audit log is absent while the trail is enabled (#8867).
+pub const REASON_AUDIT_LOG_MISSING: &str = "audit_log_missing";
+/// Reason: the flat audit log is empty while the trail is enabled (#8867).
+pub const REASON_AUDIT_LOG_EMPTY: &str = "audit_log_empty";
+/// Reason: the flat audit log has rows but no seq mark (#8867).
+pub const REASON_SEQ_MARK_MISSING: &str = "seq_mark_missing";
+/// Exit code of every `audit verify` finding.
+const EXIT_AUDIT_FINDING: i32 = 2;
+
+/// Emit one absence finding in the existing `audit verify` fail shape (the
+/// reason code is the `failure.kind`) and return [`EXIT_AUDIT_FINDING`].
+fn absence_finding(
+    args: &VerifyArgs,
+    out: &mut CliOutput<'_>,
+    path: &std::path::Path,
+    total_lines: u64,
+    reason: &str,
+    detail: &str,
+) -> Result<i32> {
+    if args.json {
+        writeln!(
+            out.stdout,
+            "{}",
+            serde_json::json!({
+                "status": "fail",
+                "reason": reason,
+                (field_names::TOTAL_LINES): total_lines,
+                "failure": {
+                    (field_names::LINE_NUMBER): serde_json::Value::Null,
+                    "kind": reason,
+                    "detail": detail,
+                },
+                "gaps": [],
+                "gap_count": 0,
+                "torn_lines": [],
+                "path": path.display().to_string(),
+            })
+        )?;
+    } else {
+        writeln!(
+            out.stderr,
+            "audit verify FAIL: {reason} — {detail} ({})",
+            path.display()
+        )?;
+    }
+    Ok(EXIT_AUDIT_FINDING)
+}
+
 fn run_verify(
     args: &VerifyArgs,
     cli_audit_dir: Option<&std::path::Path>,
@@ -1093,7 +1143,22 @@ fn run_verify(
         return run_forensic_verify(since, args, cli_audit_dir, app_config, out);
     }
     let path = resolve_path(app_config, cli_audit_dir, args.path.as_deref());
+    // #8867 — absence is a finding. "Nothing to verify" is green only when the
+    // flat trail is provably disabled (`[audit] enabled` false AND no seq mark
+    // left by a writer), and the output then says so.
+    let audit_enabled = app_config.effective_audit().enabled.unwrap_or(false);
+    let mark_present = crate::audit::seq_mark_path(&path).exists();
     if !path.exists() {
+        if audit_enabled || mark_present {
+            return absence_finding(
+                args,
+                out,
+                &path,
+                0,
+                REASON_AUDIT_LOG_MISSING,
+                "the audit log is absent but the trail is enabled or a writer left its seq mark",
+            );
+        }
         if args.json {
             writeln!(
                 out.stdout,
@@ -1101,14 +1166,14 @@ fn run_verify(
                 serde_json::json!({
                     "status": "ok",
                     (field_names::TOTAL_LINES): 0,
-                    "note": "audit log does not exist (audit may be disabled)",
+                    "note": "audit is disabled ([audit] enabled = false) and no log exists: nothing to verify",
                     "path": path.display().to_string(),
                 })
             )?;
         } else {
             writeln!(
                 out.stdout,
-                "audit verify: log not present at {} — nothing to check",
+                "audit verify: audit is disabled ([audit] enabled = false) and no log exists at {} — nothing to verify",
                 path.display()
             )?;
         }
@@ -1183,6 +1248,29 @@ fn run_verify(
             writeln!(out.stderr, "audit verify FAIL: {message}")?;
         }
         return Ok(2);
+    }
+    // #8867 — the seq mark is the only tail anchor of the flat log: without it
+    // a tail cut is invisible, so its absence is a finding, as is an empty log
+    // while the trail is enabled or anchored.
+    if report.total_lines == 0 && (audit_enabled || mark_present) {
+        return absence_finding(
+            args,
+            out,
+            &path,
+            0,
+            REASON_AUDIT_LOG_EMPTY,
+            "the audit log holds no rows but the trail is enabled or anchored",
+        );
+    }
+    if report.total_lines > 0 && !mark_present {
+        return absence_finding(
+            args,
+            out,
+            &path,
+            report.total_lines,
+            REASON_SEQ_MARK_MISSING,
+            "the seq mark (tail anchor) is missing, so a tail cut cannot be ruled out",
+        );
     }
     // An acknowledgement that matched nothing is reported, so a stale one
     // left in a cron line is visible rather than silently inert.
@@ -1276,7 +1364,21 @@ fn run_forensic_verify(
         .or_else(|| crate::identity::resolve_agent_id(None, None).ok())
         .unwrap_or_else(|| "ai-memory".to_string());
 
-    let public_key = crate::governance::audit::load_daemon_verifying_key(&agent_id).unwrap_or(None);
+    // #9179 r1 F3 — a key that exists but fails to load is a finding, never a
+    // silent "no key" that skips every signature check.
+    let public_key = match crate::governance::audit::load_daemon_verifying_key_strict(&agent_id) {
+        Ok(k) => k,
+        Err(e) => {
+            return forensic_finding(
+                args,
+                out,
+                since,
+                &dir,
+                REASON_KEY_LOAD_FAILED,
+                &format!("{e:#}"),
+            );
+        }
+    };
 
     let report = match crate::governance::audit::verify_since(&dir, since, public_key.as_ref()) {
         Ok(r) => r,
@@ -1299,7 +1401,7 @@ fn run_forensic_verify(
                     dir.display()
                 )?;
             }
-            return Ok(2);
+            return Ok(EXIT_AUDIT_FINDING);
         }
     };
 
@@ -1310,12 +1412,14 @@ fn run_forensic_verify(
                 "{}",
                 serde_json::json!({
                     "status": "fail",
+                    "reason": failure.reason,
                     (field_names::TOTAL_LINES): report.total_lines,
                     "unsigned_lines": report.unsigned_lines,
                     "failure": {
                         "file": failure.file.display().to_string(),
                         (field_names::LINE_NUMBER): failure.line_number,
                         "kind": format!("{:?}", failure.kind),
+                        "reason": failure.reason,
                         "detail": failure.detail,
                     },
                     "since": since,
@@ -1325,16 +1429,60 @@ fn run_forensic_verify(
         } else {
             writeln!(
                 out.stderr,
-                "forensic verify FAIL at {}:{} — {:?}: {}",
+                "forensic verify FAIL: {} at {}:{} — {:?}: {}",
+                failure.reason,
                 failure.file.display(),
                 failure.line_number,
                 failure.kind,
                 failure.detail
             )?;
         }
-        return Ok(2);
+        return Ok(EXIT_AUDIT_FINDING);
     }
 
+    // #9179 r1 F2 — absence is a finding: no forensic files at all, or none of
+    // their rows inside the window, is never "0 line(s) verified" and green.
+    if report.files_seen == 0 {
+        return forensic_finding(
+            args,
+            out,
+            since,
+            &dir,
+            REASON_FORENSIC_LOG_MISSING,
+            "no forensic day file exists in the directory",
+        );
+    }
+    if report.total_lines == 0 {
+        return forensic_finding(
+            args,
+            out,
+            since,
+            &dir,
+            REASON_FORENSIC_WINDOW_EMPTY,
+            "forensic day files exist but none of their rows is inside the window",
+        );
+    }
+    // #9179 r1 F3 — signed rows with no key to check them against were NOT
+    // verified, so the result is not green.
+    if report.signed_lines > 0 && public_key.is_none() {
+        return forensic_finding(
+            args,
+            out,
+            since,
+            &dir,
+            REASON_SIGNATURE_UNVERIFIED,
+            &format!(
+                "{} signed row(s) in the window, but no verifying key for {agent_id} is \
+                 available, so no signature was checked",
+                report.signed_lines
+            ),
+        );
+    }
+
+    // Coverage stated honestly (ruling e57fcb41 / Decision 1): the forensic
+    // chain has no tail anchor yet, so every verified row is in the
+    // unanchored tail; a cut of the newest rows or day file is not detectable.
+    let unanchored_tail = report.total_lines;
     if args.json {
         writeln!(
             out.stdout,
@@ -1343,6 +1491,8 @@ fn run_forensic_verify(
                 "status": "ok",
                 (field_names::TOTAL_LINES): report.total_lines,
                 "unsigned_lines": report.unsigned_lines,
+                "signed_lines": report.signed_lines,
+                "unanchored_tail": unanchored_tail,
                 "since": since,
                 "dir": dir.display().to_string(),
             })
@@ -1350,14 +1500,58 @@ fn run_forensic_verify(
     } else {
         writeln!(
             out.stdout,
-            "forensic verify OK: {} line(s) verified since {} ({} unsigned) at {}",
+            "forensic verify OK: {} line(s) verified since {} ({} signed, {} unsigned) at {}; \
+             unanchored_tail={unanchored_tail} (the forensic chain has no tail anchor yet: \
+             removal of the newest rows or day file is not detected)",
             report.total_lines,
             since,
+            report.signed_lines,
             report.unsigned_lines,
             dir.display()
         )?;
     }
     Ok(0)
+}
+
+/// Reason: no forensic day file exists (#9009, #9179 r1 F2).
+pub const REASON_FORENSIC_LOG_MISSING: &str = "forensic_log_missing";
+/// Reason: forensic files exist but no row is in the `--since` window.
+pub const REASON_FORENSIC_WINDOW_EMPTY: &str = "forensic_window_empty";
+/// Reason: signed rows were found but no verifying key was available.
+pub const REASON_SIGNATURE_UNVERIFIED: &str = "signature_unverified";
+/// Reason: the verifying key exists but could not be loaded.
+pub const REASON_KEY_LOAD_FAILED: &str = "key_load_failed";
+
+/// Emit one forensic absence/key finding (JSON on stdout, text on stderr) and
+/// return [`EXIT_AUDIT_FINDING`].
+fn forensic_finding(
+    args: &VerifyArgs,
+    out: &mut CliOutput<'_>,
+    since: &str,
+    dir: &std::path::Path,
+    reason: &str,
+    detail: &str,
+) -> Result<i32> {
+    if args.json {
+        writeln!(
+            out.stdout,
+            "{}",
+            serde_json::json!({
+                "status": "fail",
+                "reason": reason,
+                "detail": detail,
+                "since": since,
+                "dir": dir.display().to_string(),
+            })
+        )?;
+    } else {
+        writeln!(
+            out.stderr,
+            "forensic verify FAIL: {reason} — {detail} (dir={})",
+            dir.display()
+        )?;
+    }
+    Ok(EXIT_AUDIT_FINDING)
 }
 
 fn run_tail(
@@ -1457,7 +1651,26 @@ mod tests {
             buf.push('\n');
         }
         fs::write(&path, buf).unwrap();
+        mark_as_writer_would(&path);
         path
+    }
+
+    /// #8867: a real writer leaves the `.seq` high-water mark next to every
+    /// trail it writes, so a fixture standing for a written trail carries one
+    /// (the highest sequence in the trail, in the writer's fixed-width form).
+    fn mark_as_writer_would(trail: &Path) {
+        let highest = fs::read_to_string(trail)
+            .unwrap()
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter_map(|v| v["sequence"].as_u64())
+            .max()
+            .unwrap();
+        fs::write(
+            crate::audit::seq_mark_path(trail),
+            format!("{highest:020}\n"),
+        )
+        .unwrap();
     }
 
     fn make_event(seq: u64, prev: &str) -> AuditEvent {
@@ -1542,6 +1755,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let p = tmp.path().join("audit.log");
         fs::write(&p, crate::audit::gapped_trail_for_test()).unwrap();
+        mark_as_writer_would(&p);
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
@@ -1667,7 +1881,10 @@ mod tests {
         .unwrap();
         assert_eq!(exit, 0);
         let s = std::str::from_utf8(&stdout).unwrap();
-        assert!(s.contains("nothing to check"));
+        // #8867: green only because the trail is provably disabled, and the
+        // output says so.
+        assert!(s.contains("audit is disabled"), "{s}");
+        assert!(s.contains("nothing to verify"), "{s}");
     }
 
     #[test]
@@ -2043,7 +2260,10 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(s.trim()).unwrap();
         assert_eq!(v["status"], "ok");
         assert_eq!(v["total_lines"], 0);
-        assert!(v["note"].as_str().unwrap().contains("does not exist"));
+        assert!(
+            v["note"].as_str().unwrap().contains("audit is disabled"),
+            "{v}"
+        );
     }
 
     #[test]
@@ -2275,16 +2495,18 @@ mod tests {
             &mut out,
         )
         .unwrap();
-        assert_eq!(exit, 0);
+        // #9179 r1 F2: a directory with no forensic day file is a finding
+        // (forensic_log_missing), never an `ok` over zero rows.
+        assert_eq!(exit, EXIT_AUDIT_FINDING);
         let s = std::str::from_utf8(&stdout).unwrap();
         let v: serde_json::Value = serde_json::from_str(s.trim()).unwrap();
-        assert_eq!(v["status"], "ok");
-        assert_eq!(v["total_lines"], 0);
+        assert_eq!(v["status"], "fail");
+        assert_eq!(v["reason"], REASON_FORENSIC_LOG_MISSING);
         assert_eq!(v["since"], "2026-01-01");
     }
 
     #[test]
-    fn audit_verify_with_since_human_render_emits_summary_line() {
+    fn audit_verify_with_since_human_render_reports_log_missing_9179() {
         // Non-JSON path through run_forensic_verify when the report
         // is OK and contains zero rows (no files exist). Covers
         // lines 392-401.
@@ -2306,12 +2528,17 @@ mod tests {
             &mut out,
         )
         .unwrap();
-        assert_eq!(exit, 0);
-        let s = std::str::from_utf8(&stdout).unwrap();
-        // Human render starts with "forensic verify OK:".
-        assert!(s.starts_with("forensic verify OK:"), "got: {s}");
-        assert!(s.contains("0 line(s)"));
-        assert!(s.contains("since 2026-01-01"));
+        // #9179 r1 F2: no forensic day file is a finding on stderr, and
+        // stdout never carries an OK line.
+        assert_eq!(exit, EXIT_AUDIT_FINDING);
+        assert!(stdout.is_empty(), "no OK line on a finding");
+        let e = std::str::from_utf8(&stderr).unwrap();
+        assert!(
+            e.starts_with(&format!(
+                "forensic verify FAIL: {REASON_FORENSIC_LOG_MISSING}"
+            )),
+            "got: {e}"
+        );
     }
 
     #[test]

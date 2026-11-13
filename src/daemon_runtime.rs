@@ -2645,12 +2645,12 @@ pub async fn run(
             }
         }
         Command::VerifySignedEventsChain(a) => {
-            let stdout = std::io::stdout();
-            let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
-            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
-            match cli::verify_signed_events::run(&db_path, &a, &mut out)? {
+            // #9046 / #9179 r1 — resolve the store first: a Postgres store is
+            // walked only from a URL file, never answered from the local
+            // SQLite side file; a configured sqlite:// URL opens that file.
+            match cli::verify_signed_events::run_command(&db_path, &a, app_config, audit_pubkey)
+                .await?
+            {
                 0 => Ok(()),
                 code => std::process::exit(code),
             }
@@ -5234,31 +5234,24 @@ async fn run_verify_audit_trail(
         Some(url) if is_postgres_url(url) => {
             verify_audit_trail_postgres(url, a, app_config, audit_pubkey, &mut out).await
         }
-        Some(url) => {
-            let path = sqlite_store_url_to_path(url).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "unrecognised --store-url: {} (expected postgres://... or sqlite:///path)",
-                    crate::url_display::store_url_display(url)
-                )
-            })?;
-            crate::cli::verify_audit_trail::run(Path::new(path), a, audit_pubkey, &mut out)
-        }
+        Some(url) => match sqlite_store_url_to_path(url) {
+            Some(path) => {
+                crate::cli::verify_audit_trail::run(Path::new(path), a, audit_pubkey, &mut out)
+            }
+            // #9179 r1 — reason-coded finding, the verify-signed-events-chain twin.
+            None => crate::cli::verify_audit_trail::store_url_unrecognised(
+                a.json,
+                &crate::url_display::store_url_display(url),
+                &mut out,
+            ),
+        },
         None => crate::cli::verify_audit_trail::run(db_path, a, audit_pubkey, &mut out),
     }
 }
 
-/// Mirror [`build_store_handle`]'s `sqlite://` scheme handling so a
-/// `--store-url sqlite:///path` on `verify-audit-trail` opens the SAME
-/// file the daemon would. Returns `None` for a non-sqlite scheme.
-fn sqlite_store_url_to_path(url: &str) -> Option<&str> {
-    let path = url
-        .strip_prefix("sqlite://")
-        .or_else(|| url.strip_prefix("SQLITE://"))?;
-    Some(
-        path.strip_prefix('/')
-            .map_or(path, |p| if p.starts_with('/') { p } else { path }),
-    )
-}
+// `sqlite_store_url_to_path` lives in `cli::verify_signed_events` (SSOT,
+// #9179 r1): verify-signed-events-chain maps the same `sqlite://` forms.
+use crate::cli::verify_signed_events::sqlite_store_url_to_path;
 
 /// Postgres arm of [`run_verify_audit_trail`] — reuses the SAME
 /// no-embedder connect precedent [`build_store_handle`] uses (a verify
@@ -5274,20 +5267,12 @@ async fn verify_audit_trail_postgres(
     audit_pubkey: Option<&ed25519_dalek::VerifyingKey>,
     out: &mut cli::CliOutput<'_>,
 ) -> Result<i32> {
-    let timeout = app_config
-        .postgres_statement_timeout_secs
-        .unwrap_or(crate::store::postgres::DEFAULT_STATEMENT_TIMEOUT_SECS);
-    // #1579 A3 (SECURITY) — never echo the credential.
-    let display_url = crate::url_display::store_url_display(url);
-    tracing::info!("verify-audit-trail: opening Postgres SAL store at {display_url}");
-    let store = crate::store::postgres::PostgresStore::connect_with_dim_and_timeout(
+    let store = crate::cli::verify_signed_events::connect_postgres_for_verify(
         url,
-        crate::store::postgres::DEFAULT_EMBEDDING_DIM,
-        timeout,
-        app_config.resolve_pg_pool(),
+        app_config,
+        "verify-audit-trail",
     )
-    .await
-    .map_err(|e| anyhow::anyhow!("connect postgres adapter for verify-audit-trail: {e}"))?;
+    .await?;
     let report = store
         .verify_audit_trail(a.since.as_deref(), audit_pubkey)
         .await
@@ -12488,14 +12473,15 @@ mod tests {
     /// `verify-signed-events-chain` subcommand. We don't tamper here
     /// (the lib-side test suite owns that property); the goal is to
     /// exercise the dispatch arm so a `cargo llvm-cov` pass over the
-    /// daemon_runtime module sees it. On an empty DB the chain holds
-    /// vacuously and the subcommand exits 0, so `run()` returns
-    /// Ok(()).
+    /// daemon_runtime module sees it. A one-row chain holds and the
+    /// subcommand exits 0, so `run()` returns Ok(()).
     #[tokio::test]
     async fn test_run_dispatch_verify_signed_events_chain_command() {
         let _g = no_config_env();
         let env = TestEnv::fresh();
         let cfg = AppConfig::default();
+        // #9179 r1 code F6 — an empty store is a finding that exits the process.
+        cli::verify_signed_events::seed_one_unsigned_row_for_test(&env.db_path);
         let cli = Cli::try_parse_from([
             "ai-memory",
             "--db",
@@ -14544,7 +14530,7 @@ decision = "allow"
     }
 
     #[tokio::test]
-    async fn prb_run_verify_audit_trail_unrecognised_scheme_errs() {
+    async fn prb_run_verify_audit_trail_unrecognised_scheme_is_finding_9179() {
         let _g = crate::store_url::store_url_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -14557,7 +14543,13 @@ decision = "allow"
         let cfg = crate::config::AppConfig::default();
         let res =
             run_verify_audit_trail(&env.db_path, &prb_args(Some("mysql://h/db")), &cfg, None).await;
-        assert!(res.is_err(), "an unrecognised store-url scheme is refused");
+        // #9179 r1: a reason-coded `store_url_unrecognised` finding (exit 1),
+        // never an untyped error and never green.
+        assert_eq!(
+            res.expect("an unrecognised scheme is a finding, not an error"),
+            crate::cli::verify_audit_trail::EXIT_DIRTY,
+            "an unrecognised store-url scheme is refused with the dirty exit code"
+        );
     }
 
     #[cfg(feature = "sal-postgres")]

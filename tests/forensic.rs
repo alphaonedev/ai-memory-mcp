@@ -9,6 +9,9 @@
 //! tests from `tests/forensic/bundle_test.rs` the same way
 //! `tests/transcripts.rs` mounts `tests/transcripts/replay_test.rs`.
 
+#[path = "common/key_dir_sandbox.rs"]
+mod key_dir_sandbox;
+
 #[path = "forensic/bundle_test.rs"]
 mod bundle_test;
 

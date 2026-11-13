@@ -18,8 +18,8 @@
 //! 1. **`store_url_flag_absent_uses_sqlite_smoke`** (always runs under
 //!    the `sal-postgres` build; needs NO live DB) — proves the PR-B
 //!    dispatch refactor still routes the flag-absent case to the local
-//!    sqlite `--db`: a fresh sqlite db verifies clean (exit 0, "OK").
-//!    This is the regression pin for "the sqlite path is unchanged".
+//!    sqlite `--db`: a `--db` naming no file is a `store_missing`
+//!    finding (exit 1) and is not created (#8741 / #9046).
 //!
 //! 2. **`store_url_pg_clean_chain_verifies_exit_0`** (`#[ignore]`; live
 //!    postgres via `AI_MEMORY_TEST_POSTGRES_URL`) — seeds a couple of
@@ -62,6 +62,12 @@ use ai_memory::models::{CaptureTurnWrite, Memory};
 use ai_memory::signed_events::SignedEvent;
 use ai_memory::store::postgres::PostgresStore;
 use ai_memory::store::{CallerContext, MemoryStore};
+
+#[path = "common/pg_barrier.rs"]
+mod pg_barrier;
+
+/// Scratch-database prefix for the empty-chain cell (swept when stale).
+const SCRATCH_PREFIX: &str = "ai_memory_prb_8741";
 
 // ───────────────────────────────────────────────────────────────────
 // Fixtures
@@ -161,16 +167,62 @@ async fn seed_chain(store: &PostgresStore, agent: &str, count: i64) {
 #[test]
 fn store_url_flag_absent_uses_sqlite_smoke() {
     // No `--store-url`: the PR-B dispatch must fall through to the local
-    // sqlite `--db`. A fresh (empty) chain is trivially clean → exit 0.
+    // sqlite `--db`. #8741 / #9046 — a `--db` that names no file is a
+    // `store_missing` finding (exit 1), never an empty store this verb just
+    // created and then called clean; the verifier must not create it.
     let tmp = TempDir::new().unwrap();
     let db = tmp.path().join("prb-sqlite.db");
 
     ai_memory(&db)
         .args(["verify-audit-trail"])
         .assert()
-        .success()
-        .stdout(predicate::str::contains("verify-audit-trail OK"))
-        .stdout(predicate::str::contains("chain intact"));
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains(
+            "verify-audit-trail FAIL: store_missing",
+        ));
+    assert!(!db.exists(), "the verifier must not create the --db file");
+}
+
+// ───────────────────────────────────────────────────────────────────
+// 1b. postgres empty chain is a finding (#8741 backend parity)
+// ───────────────────────────────────────────────────────────────────
+
+/// #8741 — green means rows were checked. A postgres store with ZERO
+/// `signed_events` rows renders the same `empty_chain` finding (exit 1) as
+/// the sqlite twin, never "chain intact". Runs against a fresh scratch
+/// database so no other test's rows can make the chain non-empty.
+#[tokio::test]
+#[ignore = "requires a live postgres at AI_MEMORY_TEST_POSTGRES_URL"]
+async fn store_url_pg_empty_chain_is_a_finding_8741() {
+    let Some(url) = postgres_url() else {
+        eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+        return;
+    };
+    let scratch = pg_barrier::ScratchDb::create(&url, SCRATCH_PREFIX)
+        .await
+        .expect("create scratch database");
+    let scratch_url = scratch.url();
+    // Connecting migrates the schema, so the table exists and is empty.
+    let store = PostgresStore::connect(&scratch_url)
+        .await
+        .expect("connect scratch pg");
+    drop(store);
+
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("prb-main.db");
+    ai_memory(&db)
+        .args(["verify-audit-trail", "--store-url", &scratch_url])
+        .assert()
+        .failure()
+        .code(1)
+        .stdout(predicate::str::contains(
+            "verify-audit-trail FAIL: empty_chain",
+        ))
+        .stdout(predicate::str::contains("chain intact").not())
+        .stderr(predicate::str::contains(
+            "verify-audit-trail FAIL: empty_chain",
+        ));
 }
 
 // ───────────────────────────────────────────────────────────────────

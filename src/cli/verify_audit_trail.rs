@@ -40,6 +40,92 @@ use crate::cli::CliOutput;
 /// Shared `.context` label for the report-write paths (pm-v3.1
 /// literal de-dup — referenced at every `writeln!` site below).
 const CTX_WRITE_AUDIT_REPORT: &str = "write audit-trail report";
+const CTX_SERIALIZE_AUDIT_REPORT: &str = "serialize audit-trail report";
+
+/// Exit code for a dirty (or empty) audit trail.
+pub const EXIT_DIRTY: i32 = 1;
+/// Reason: the store holds no `signed_events` rows (#8741).
+pub const REASON_EMPTY_CHAIN: &str = "empty_chain";
+/// Reason: the `--db` file does not exist (#9046 sibling).
+pub const REASON_STORE_MISSING: &str = "store_missing";
+/// Reason: the `--since` window holds no rows while the chain head is above
+/// it (#9179 r1 F5; the twin of the `verify-signed-events-chain` reason).
+pub const REASON_HEAD_BELOW_SINCE: &str = "head_below_since";
+
+/// #9179 r1 F4 / sec F5 — emit one absence finding in the ONE absence shape of
+/// the verify commands and return [`EXIT_DIRTY`]. JSON: the report (when one
+/// exists) with `status: "fail"`, `reason`, `detail` and `chain_intact: false`
+/// on stdout, so a consumer that reads the body never sees an intact chain.
+/// Text: one FAIL line on stdout; every mode: one FAIL line on stderr. An
+/// off-table truncation conviction is still rendered (a full delete under an
+/// anchored watermark keeps its "rows removed" detail).
+fn absence_finding(
+    report: Option<&crate::signed_events::AuditTrailReport>,
+    json: bool,
+    reason: &str,
+    detail: &str,
+    out: &mut CliOutput<'_>,
+) -> Result<i32> {
+    if json {
+        let mut body = match report {
+            Some(r) => serde_json::to_value(r).context(CTX_SERIALIZE_AUDIT_REPORT)?,
+            None => serde_json::json!({}),
+        };
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert("status".into(), "fail".into());
+            obj.insert("reason".into(), reason.into());
+            obj.insert("detail".into(), detail.into());
+            obj.insert("chain_intact".into(), false.into());
+        }
+        let text = serde_json::to_string_pretty(&body).context(CTX_SERIALIZE_AUDIT_REPORT)?;
+        writeln!(out.stdout, "{text}").context(CTX_WRITE_AUDIT_REPORT)?;
+    } else {
+        writeln!(out.stdout, "verify-audit-trail FAIL: {reason}: {detail}")
+            .context(CTX_WRITE_AUDIT_REPORT)?;
+        if let Some(crate::signed_events::TruncationCheck::Detected {
+            anchored_head,
+            db_head,
+        }) = report.map(|r| &r.truncation)
+        {
+            writeln!(
+                out.stdout,
+                "  tail truncation detected: off-table anchor head={anchored_head} \
+                 but in-DB head={db_head} (at least {} trailing row(s) removed; rows \
+                 after the anchor are not tail-protected)",
+                anchored_head.saturating_sub(*db_head),
+            )
+            .context(CTX_WRITE_AUDIT_REPORT)?;
+        }
+    }
+    writeln!(out.stderr, "verify-audit-trail FAIL: {reason}: {detail}")
+        .context(CTX_WRITE_AUDIT_REPORT)?;
+    Ok(EXIT_DIRTY)
+}
+
+/// #9179 r1 — a `--store-url` (or its env / file channel) that names neither
+/// a postgres nor a `sqlite://` store is a reason-coded finding in the one
+/// absence shape (`store_url_unrecognised`, [`EXIT_DIRTY`]), the twin of the
+/// `verify-signed-events-chain` refusal, never an untyped error. `url_display`
+/// must already be credential-redacted.
+///
+/// # Errors
+///
+/// Returns an error only when the finding cannot be written.
+pub fn store_url_unrecognised(
+    json: bool,
+    url_display: &str,
+    out: &mut CliOutput<'_>,
+) -> Result<i32> {
+    let detail =
+        format!("unrecognised store URL {url_display} (expected postgres://... or sqlite:///path)");
+    absence_finding(
+        None,
+        json,
+        crate::cli::verify_signed_events::REASON_STORE_URL_UNRECOGNISED,
+        &detail,
+        out,
+    )
+}
 
 /// Arguments for `ai-memory verify-audit-trail`.
 #[derive(clap::Args, Debug)]
@@ -106,12 +192,34 @@ pub fn run(
     audit_pubkey: Option<&ed25519_dalek::VerifyingKey>,
     out: &mut CliOutput<'_>,
 ) -> Result<i32> {
+    // #9046 sibling — `db::open` creates a missing file; a typo'd `--db` is a
+    // finding, not an empty store that this verb just created.
+    if !db_path.is_file() {
+        return absence_finding(
+            None,
+            args.json,
+            REASON_STORE_MISSING,
+            &format!("no database file at {}", db_path.display()),
+            out,
+        );
+    }
     let conn =
         crate::db::open(db_path).with_context(|| format!("open db at {}", db_path.display()))?;
     let report =
         crate::signed_events::verify_audit_trail(&conn, args.since.as_deref(), audit_pubkey)
             .context("verify_audit_trail over signed_events")?;
     render(&report, args.json, out)
+}
+
+/// Rows above the last trusted off-table anchor (#9179 r1 coverage). With no
+/// anchor every row is unanchored: removing the newest rows is not detected
+/// until the per-append signed head anchor lands.
+#[must_use]
+pub fn unanchored_tail(report: &crate::signed_events::AuditTrailReport) -> i64 {
+    report
+        .head_sequence
+        .saturating_sub(report.anchored_head.unwrap_or(0))
+        .max(0)
 }
 
 /// Render an already-computed [`crate::signed_events::AuditTrailReport`]
@@ -131,15 +239,49 @@ pub fn render(
     json: bool,
     out: &mut CliOutput<'_>,
 ) -> Result<i32> {
+    // #8741 — an empty chain (head sequence 0) is a finding on BOTH backends:
+    // green means rows were checked, never "nothing to check". The library
+    // report stays vacuously clean; the CLI verdict, defined once here, does not.
+    if report.head_sequence == 0 {
+        return absence_finding(
+            Some(report),
+            json,
+            REASON_EMPTY_CHAIN,
+            "the store holds no signed_events rows (0 event(s) checked, head sequence=0)",
+            out,
+        );
+    }
+    // #9179 r1 F5 — a `--since` window past every row checks nothing while the
+    // chain has rows: that is a finding, never "chain intact (0 checked)".
+    if report.total_events == 0 {
+        return absence_finding(
+            Some(report),
+            json,
+            REASON_HEAD_BELOW_SINCE,
+            &format!(
+                "0 event(s) in the --since window but the chain head sequence={}",
+                report.head_sequence
+            ),
+            out,
+        );
+    }
     let clean = report.is_clean();
+    let tail = unanchored_tail(report);
 
     if json {
-        let json = serde_json::to_string_pretty(&report).context("serialize audit-trail report")?;
+        // #9179 r1 — the coverage figure rides the JSON body too.
+        let mut body = serde_json::to_value(report).context(CTX_SERIALIZE_AUDIT_REPORT)?;
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert("unanchored_tail".to_string(), serde_json::json!(tail));
+        }
+        let json = serde_json::to_string_pretty(&body).context(CTX_SERIALIZE_AUDIT_REPORT)?;
         writeln!(out.stdout, "{json}").context(CTX_WRITE_AUDIT_REPORT)?;
     } else if clean {
         writeln!(
             out.stdout,
-            "verify-audit-trail OK: chain intact \u{2713} ({} event(s) checked, head sequence={})",
+            "verify-audit-trail OK: chain intact \u{2713} ({} event(s) checked, head sequence={}; \
+             unanchored_tail={tail} (the newest rows above the last off-table anchor are not \
+             tail-protected yet: their removal is not detected))",
             report.total_events, report.head_sequence,
         )
         .context(CTX_WRITE_AUDIT_REPORT)?;
@@ -164,8 +306,9 @@ pub fn render(
             writeln!(
                 out.stdout,
                 "  tail truncation detected: off-table anchor head={anchored_head} \
-                 but in-DB head={db_head} ({} trailing row(s) removed)",
-                anchored_head - db_head,
+                 but in-DB head={db_head} (at least {} trailing row(s) removed; rows \
+                 after the anchor are not tail-protected)",
+                anchored_head.saturating_sub(db_head),
             )
             .context(CTX_WRITE_AUDIT_REPORT)?;
         }
@@ -361,7 +504,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_db_exits_zero_intact() {
+    fn empty_db_is_an_empty_chain_finding_8741() {
         let (_dir, path) = temp_db();
         let args = VerifyAuditTrailArgs {
             since: None,
@@ -373,10 +516,72 @@ mod tests {
         let mut buf_err = Vec::<u8>::new();
         let mut out = CliOutput::from_std(&mut buf_out, &mut buf_err);
         let code = run(&path, &args, None, &mut out).expect("run");
-        assert_eq!(code, 0, "empty chain is trivially clean");
+        // #8741 / #9179 r1 F4 — the CLI verdict for 0 rows is a finding, and the
+        // JSON body says so: status fail, the reason, chain_intact false.
+        assert_eq!(code, EXIT_DIRTY, "empty chain is a finding");
         let s = String::from_utf8(buf_out).expect("utf-8");
-        assert!(s.contains("\"chain_intact\": true"), "got: {s}");
-        assert!(s.contains("\"total_events\": 0"), "got: {s}");
+        let v: serde_json::Value = serde_json::from_str(&s).expect("json body");
+        assert_eq!(v["status"], "fail", "got: {s}");
+        assert_eq!(v["reason"], REASON_EMPTY_CHAIN, "got: {s}");
+        assert_eq!(v["chain_intact"], false, "got: {s}");
+        assert_eq!(v["total_events"], 0, "got: {s}");
+        let e = String::from_utf8(buf_err).expect("utf-8");
+        assert!(e.contains(REASON_EMPTY_CHAIN), "got: {e}");
+    }
+
+    /// #9179 r1 code F5 — a `--since` window past every row checks nothing
+    /// while the chain has rows: `head_below_since`, never "chain intact".
+    #[test]
+    fn since_past_every_row_is_head_below_since_9179() {
+        let (_dir, path) = temp_db();
+        {
+            let conn = crate::db::open(&path).expect("open");
+            append_signed_event(&conn, &fixture_event(b"p-0")).expect("append");
+        }
+        for json in [false, true] {
+            let args = VerifyAuditTrailArgs {
+                since: Some("2999-01-01T00:00:00Z".to_string()),
+                json,
+                store_url: None,
+                audit_pubkey: None,
+            };
+            let mut buf_out = Vec::<u8>::new();
+            let mut buf_err = Vec::<u8>::new();
+            let mut out = CliOutput::from_std(&mut buf_out, &mut buf_err);
+            let code = run(&path, &args, None, &mut out).expect("run");
+            assert_eq!(code, EXIT_DIRTY, "json={json}");
+            let e = String::from_utf8(buf_err).expect("utf-8");
+            assert!(
+                e.contains(&format!("FAIL: {REASON_HEAD_BELOW_SINCE}:")),
+                "json={json}: got: {e}"
+            );
+            let o = String::from_utf8(buf_out).expect("utf-8");
+            assert!(!o.contains("OK"), "json={json}: no green line: {o}");
+            if json {
+                let v: serde_json::Value = serde_json::from_str(&o).expect("json body");
+                assert_eq!(v["reason"], REASON_HEAD_BELOW_SINCE, "got: {o}");
+            }
+        }
+    }
+
+    #[test]
+    fn missing_db_is_a_store_missing_finding_9046() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("absent.db");
+        let args = VerifyAuditTrailArgs {
+            since: None,
+            json: false,
+            store_url: None,
+            audit_pubkey: None,
+        };
+        let mut buf_out = Vec::<u8>::new();
+        let mut buf_err = Vec::<u8>::new();
+        let mut out = CliOutput::from_std(&mut buf_out, &mut buf_err);
+        let code = run(&path, &args, None, &mut out).expect("run");
+        assert_eq!(code, EXIT_DIRTY);
+        let e = String::from_utf8(buf_err).expect("utf-8");
+        assert!(e.contains(REASON_STORE_MISSING), "got: {e}");
+        assert!(!path.exists(), "the verifier must not create the store");
     }
 
     #[test]
@@ -403,6 +608,9 @@ mod tests {
         let s = String::from_utf8(buf_out).expect("utf-8");
         assert!(s.contains("OK"), "got: {s}");
         assert!(s.contains("3 event(s) checked"), "got: {s}");
+        // #9179 r1 — coverage is stated: no anchor on a fresh store, so all
+        // three rows are the unanchored tail.
+        assert!(s.contains("unanchored_tail=3"), "got: {s}");
     }
 
     /// #3354 / #3479 — an unsigned prefix under an enrolled pin is the
@@ -456,4 +664,64 @@ mod tests {
     // from a `src/` file. They live in the integration test
     // `tests/verify_audit_trail_pe8.rs` instead (same split rationale
     // as `verify_signed_events.rs`).
+
+    /// #9179 r1 sec F5 — an empty chain under an anchored off-table watermark
+    /// is the `empty_chain` finding AND keeps its tail-truncation detail (a
+    /// full delete is reported as rows removed, not only as "no rows").
+    #[test]
+    fn empty_chain_under_anchored_watermark_keeps_truncation_detail_9179() {
+        let (_dir, path) = temp_db();
+        let conn = crate::db::open(&path).expect("open");
+        let mut report =
+            crate::signed_events::verify_audit_trail(&conn, None, None).expect("report");
+        assert_eq!(report.head_sequence, 0);
+        report.truncation = crate::signed_events::TruncationCheck::Detected {
+            anchored_head: 5,
+            db_head: 0,
+        };
+        let mut buf_out = Vec::<u8>::new();
+        let mut buf_err = Vec::<u8>::new();
+        let mut out = CliOutput::from_std(&mut buf_out, &mut buf_err);
+        let code = render(&report, false, &mut out).expect("render");
+        assert_eq!(code, EXIT_DIRTY);
+        let o = String::from_utf8(buf_out).expect("utf-8");
+        assert!(
+            o.contains(&format!("FAIL: {REASON_EMPTY_CHAIN}:")),
+            "got: {o}"
+        );
+        assert!(
+            o.contains("tail truncation detected: off-table anchor head=5 but in-DB head=0"),
+            "got: {o}"
+        );
+        assert!(o.contains("at least 5 trailing row(s) removed"), "got: {o}");
+        assert!(!o.contains("OK"), "no green line: {o}");
+    }
+
+    /// #9179 r1 — an unrecognised store URL is the reason-coded
+    /// `store_url_unrecognised` finding in both modes, never an untyped error.
+    #[test]
+    fn unrecognised_store_url_is_a_reason_coded_finding_9179() {
+        const REASON: &str = crate::cli::verify_signed_events::REASON_STORE_URL_UNRECOGNISED;
+        for json in [false, true] {
+            let mut buf_out = Vec::<u8>::new();
+            let mut buf_err = Vec::<u8>::new();
+            let mut out = CliOutput::from_std(&mut buf_out, &mut buf_err);
+            let code = store_url_unrecognised(json, "mysql://host/db", &mut out).expect("finding");
+            assert_eq!(code, EXIT_DIRTY, "json={json}");
+            let e = String::from_utf8(buf_err).expect("utf-8");
+            assert!(
+                e.contains(&format!("FAIL: {REASON}:")),
+                "json={json}: got: {e}"
+            );
+            let o = String::from_utf8(buf_out).expect("utf-8");
+            if json {
+                let v: serde_json::Value = serde_json::from_str(&o).expect("json body");
+                assert_eq!(v["status"], "fail", "got: {o}");
+                assert_eq!(v["reason"], REASON, "got: {o}");
+                assert_eq!(v["chain_intact"], false, "got: {o}");
+            } else {
+                assert!(o.contains(&format!("FAIL: {REASON}:")), "got: {o}");
+            }
+        }
+    }
 }

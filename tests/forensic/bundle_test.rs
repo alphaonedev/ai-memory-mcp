@@ -41,6 +41,27 @@ fn ai_memory_cmd(db_path: &std::path::Path) -> Command {
     cmd
 }
 
+/// Agent id of the operator key the CLI round-trip signs with.
+const BUNDLE_SIGNER: &str = "bundle-test-operator";
+
+/// `ai_memory_cmd` plus an isolated, provisioned operator key directory, so
+/// the exported manifest is signed and the verifier can resolve its signer.
+fn signing_cmd(db_path: &std::path::Path, key_dir: &std::path::Path) -> Command {
+    let mut cmd = ai_memory_cmd(db_path);
+    cmd.env("AI_MEMORY_KEY_DIR", key_dir);
+    cmd
+}
+
+fn provision_key_dir(tmp: &TempDir, db_path: &std::path::Path) -> std::path::PathBuf {
+    let key_dir = tmp.path().join("keys");
+    crate::key_dir_sandbox::mkdir_0700(&key_dir);
+    signing_cmd(db_path, &key_dir)
+        .args(["identity", "generate", "--agent-id", BUNDLE_SIGNER])
+        .assert()
+        .success();
+    key_dir
+}
+
 fn open_db(p: &std::path::Path) -> rusqlite::Connection {
     db::open(p).expect("db::open")
 }
@@ -97,8 +118,11 @@ fn depth2_chain_bundle_verifies_via_cli() {
     link_unsigned(&conn, &d1, &d0);
     drop(conn);
 
+    // #8851: a green verify needs an attested manifest, so the round-trip
+    // signs with a provisioned operator key.
+    let key_dir = provision_key_dir(&tmp, &db_path);
     let bundle_path = tmp.path().join("bundle.tar");
-    ai_memory_cmd(&db_path)
+    signing_cmd(&db_path, &key_dir)
         .args([
             "export-forensic-bundle",
             "--memory-id",
@@ -112,7 +136,7 @@ fn depth2_chain_bundle_verifies_via_cli() {
 
     assert!(bundle_path.exists(), "tarball must exist after export");
 
-    let assert = ai_memory_cmd(&db_path)
+    let assert = signing_cmd(&db_path, &key_dir)
         .args(["verify-forensic-bundle", bundle_path.to_str().unwrap()])
         .assert()
         .success();
@@ -121,6 +145,65 @@ fn depth2_chain_bundle_verifies_via_cli() {
     assert!(
         stdout.contains("verification OK"),
         "expected 'verification OK' in stdout, got: {stdout}"
+    );
+}
+
+/// #9179 r1 code F12 — the offline auditor's green path. An auditor who
+/// holds ONLY the signer's public key (no `.priv`, no daemon, a fresh
+/// empty database) pins it by placing `<signer>.pub` in a directory named
+/// by `AI_MEMORY_KEY_DIR`; the bundle then verifies green. Without the
+/// pinned key the same bundle exits 2 with `manifest_signer_unknown`.
+#[test]
+fn offline_auditor_pins_signer_pub_for_green_9179() {
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("ai-memory.db");
+    let conn = open_db(&db_path);
+    let d0 = insert_memory(&conn, "fb", 0, MemoryKind::Observation);
+    drop(conn);
+    let key_dir = provision_key_dir(&tmp, &db_path);
+    let bundle_path = tmp.path().join("bundle.tar");
+    signing_cmd(&db_path, &key_dir)
+        .args([
+            "export-forensic-bundle",
+            "--memory-id",
+            &d0,
+            "--output",
+            bundle_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let auditor = TempDir::new().unwrap();
+    let auditor_db = auditor.path().join("auditor.db");
+    let empty_keys = auditor.path().join("empty-keys");
+    crate::key_dir_sandbox::mkdir_0700(&empty_keys);
+    let unpinned = signing_cmd(&auditor_db, &empty_keys)
+        .args(["verify-forensic-bundle", bundle_path.to_str().unwrap()])
+        .assert()
+        .code(2);
+    let out = String::from_utf8_lossy(&unpinned.get_output().stdout).into_owned()
+        + &String::from_utf8_lossy(&unpinned.get_output().stderr);
+    assert!(
+        out.contains(bundle::REASON_MANIFEST_SIGNER_UNKNOWN),
+        "unpinned verify names the exact reason, got: {out}"
+    );
+
+    let pinned_keys = auditor.path().join("pinned-keys");
+    crate::key_dir_sandbox::mkdir_0700(&pinned_keys);
+    let pub_name = format!("{BUNDLE_SIGNER}.pub");
+    std::fs::copy(key_dir.join(&pub_name), pinned_keys.join(&pub_name)).unwrap();
+    assert!(
+        std::fs::read_dir(&pinned_keys).unwrap().count() == 1,
+        "the auditor dir holds the public key only"
+    );
+    let pinned = signing_cmd(&auditor_db, &pinned_keys)
+        .args(["verify-forensic-bundle", bundle_path.to_str().unwrap()])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&pinned.get_output().stdout).into_owned();
+    assert!(
+        stdout.contains("verification OK"),
+        "pinned public key verifies green, got: {stdout}"
     );
 }
 
@@ -282,9 +365,36 @@ fn run_verify_emits_structured_report_on_clean_bundle() {
         bundle::run_verify(&verify_args, &mut out).expect("verify")
     };
     let s = String::from_utf8(vstdout).unwrap();
-    assert_eq!(exit, 0);
-    assert!(s.contains("\"ok\": true"), "expected ok=true in JSON: {s}");
-    assert!(s.contains("verification OK"), "expected OK suffix: {s}");
+    assert!(
+        s.contains("\"tampered_files\": []"),
+        "integrity must still hold: {s}"
+    );
+    // #8851: the in-process export signs with whatever key the process key
+    // directory holds (none on a clean runner), so the roll-up is pinned to
+    // the observed attestation: green only when the signature verified,
+    // otherwise exit 2 naming the exact reason. The deterministic unsigned
+    // and signed cells run as child processes with an explicit key directory
+    // (`tests/verify_false_green_8741.rs`, `depth2_chain_bundle_verifies_via_cli`).
+    let report = bundle::verify(&bundle_path).expect("verify report");
+    match bundle::failure_reason(&report) {
+        None => {
+            assert_eq!(report.signature_status, bundle::SignatureStatus::Verified);
+            assert_eq!(exit, 0, "attested bundle exits 0: {s}");
+            assert!(s.contains("\"ok\": true"), "expected ok=true in JSON: {s}");
+        }
+        Some(reason) => {
+            assert_ne!(report.signature_status, bundle::SignatureStatus::Verified);
+            assert_eq!(exit, 2, "unattested bundle exits 2: {s}");
+            assert!(
+                s.contains("\"ok\": false"),
+                "expected ok=false in JSON: {s}"
+            );
+            assert!(
+                s.contains(&format!("verification FAILED: {reason}")),
+                "expected the {reason} reason: {s}"
+            );
+        }
+    }
 }
 
 #[test]

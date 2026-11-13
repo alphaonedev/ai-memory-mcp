@@ -1276,13 +1276,56 @@ pub fn verify(bundle_path: &Path) -> Result<VerificationReport> {
     // (an injected `edges/*.json` with `signature_hex=null` even passes
     // `verify_edge_envelope`, so it never lands in `chain_edges_failed`).
     // Treat any extra file as a hard integrity failure regardless of type.
-    report.ok = report.tampered_files.is_empty()
-        && report.missing_files.is_empty()
-        && report.extra_files.is_empty()
-        && report.chain_edges_failed.is_empty()
-        && !matches!(report.signature_status, SignatureStatus::Failed);
+    //
+    // #8851 — an unsigned manifest (signature or signer stripped) and a
+    // signer with no enrolled key are findings too: green means every
+    // signature was checked against a trusted key, so "nothing to check"
+    // can never roll up to ok. One funnel decides, `failure_reason`.
+    report.ok = failure_reason(&report).is_none();
 
     Ok(report)
+}
+
+/// Reason code for a failed bundle verification (#8851).
+pub const REASON_FILE_TAMPERED: &str = "file_tampered";
+/// Reason code: a manifest-listed file is missing from the tarball.
+pub const REASON_FILE_MISSING: &str = "file_missing";
+/// Reason code: the tarball carries a file the manifest does not list.
+pub const REASON_FILE_EXTRA: &str = "file_extra";
+/// Reason code: a reflection-chain edge failed to re-verify.
+pub const REASON_CHAIN_EDGE_FAILED: &str = "chain_edge_failed";
+/// Reason code: the manifest signature did not verify.
+pub const REASON_MANIFEST_SIGNATURE_FAILED: &str = "manifest_signature_failed";
+/// Reason code: the manifest carries no signature or no signer.
+pub const REASON_MANIFEST_SIGNATURE_ABSENT: &str = "manifest_signature_absent";
+/// Reason code: the manifest signer has no enrolled public key.
+pub const REASON_MANIFEST_SIGNER_UNKNOWN: &str = "manifest_signer_unknown";
+
+/// The single funnel that decides whether a [`VerificationReport`] is
+/// green (#8851). Returns the first failing check's reason code, in a
+/// fixed order (content integrity first, then signature), or `None`
+/// only when every file matched AND the manifest signature verified
+/// against an enrolled key.
+#[must_use]
+pub fn failure_reason(report: &VerificationReport) -> Option<&'static str> {
+    if !report.tampered_files.is_empty() {
+        return Some(REASON_FILE_TAMPERED);
+    }
+    if !report.missing_files.is_empty() {
+        return Some(REASON_FILE_MISSING);
+    }
+    if !report.extra_files.is_empty() {
+        return Some(REASON_FILE_EXTRA);
+    }
+    if !report.chain_edges_failed.is_empty() {
+        return Some(REASON_CHAIN_EDGE_FAILED);
+    }
+    match report.signature_status {
+        SignatureStatus::Verified => None,
+        SignatureStatus::Failed => Some(REASON_MANIFEST_SIGNATURE_FAILED),
+        SignatureStatus::Absent => Some(REASON_MANIFEST_SIGNATURE_ABSENT),
+        SignatureStatus::UnknownSigner => Some(REASON_MANIFEST_SIGNER_UNKNOWN),
+    }
 }
 
 /// Re-derive the canonical CBOR bytes from an [`EdgeEnvelope`] and
@@ -1364,12 +1407,15 @@ pub fn run_verify(args: &VerifyForensicBundleArgs, out: &mut CliOutput<'_>) -> R
     let report = verify(&args.bundle_path)?;
     let payload = serde_json::to_string_pretty(&report).context("serialise VerificationReport")?;
     writeln!(out.stdout, "{payload}")?;
-    if report.ok {
-        writeln!(out.stdout, "verification OK")?;
-        Ok(0)
-    } else {
-        writeln!(out.stdout, "verification FAILED")?;
-        Ok(2)
+    match failure_reason(&report) {
+        None => {
+            writeln!(out.stdout, "verification OK")?;
+            Ok(0)
+        }
+        Some(reason) => {
+            writeln!(out.stdout, "verification FAILED: {reason}")?;
+            Ok(2)
+        }
     }
 }
 
@@ -1713,28 +1759,6 @@ mod tests {
             bytes_a, bytes_b,
             "byte-identical mod timestamp is the L2-5 acceptance criterion"
         );
-    }
-
-    #[test]
-    fn verify_clean_bundle_reports_ok() {
-        let tmp = TempDir::new().unwrap();
-        let (conn, _) = open_tmp_db(&tmp);
-        let d0 = insert_mem(&conn, "ns", 0, MemoryKind::Observation);
-        let d1 = insert_mem(&conn, "ns", 1, MemoryKind::Reflection);
-        link_unsigned(&conn, &d1, &d0);
-        let args = ExportForensicBundleArgs {
-            memory_id: d1.clone(),
-            include_reflections: true,
-            include_transcripts: false,
-            include_atomisation_chain: true,
-            output: None,
-        };
-        let bundle_path = tmp.path().join("bundle.tar");
-        build(&conn, &args, &bundle_path, Some("2026-01-01T00:00:00Z")).expect("build");
-        let report = verify(&bundle_path).expect("verify");
-        assert!(report.ok, "clean bundle must verify: {report:#?}");
-        assert!(report.tampered_files.is_empty());
-        assert!(report.missing_files.is_empty());
     }
 
     #[test]
@@ -2184,35 +2208,11 @@ mod tests {
         }
     }
 
-    /// `run_verify` returns exit 0 on a clean bundle and prints
-    /// "verification OK".
-    #[test]
-    fn run_verify_clean_bundle_exit_zero() {
-        let tmp = TempDir::new().unwrap();
-        let (conn, _) = open_tmp_db(&tmp);
-        let id = insert_mem(&conn, "ns", 0, MemoryKind::Observation);
-        let args = ExportForensicBundleArgs {
-            memory_id: id,
-            include_reflections: true,
-            include_transcripts: false,
-            include_atomisation_chain: true,
-            output: None,
-        };
-        let bundle_path = tmp.path().join("ok.tar");
-        build(&conn, &args, &bundle_path, Some("2026-01-01T00:00:00Z")).expect("build");
-        let vargs = VerifyForensicBundleArgs {
-            bundle_path: bundle_path.clone(),
-        };
-        let mut stdout = Vec::<u8>::new();
-        let mut stderr = Vec::<u8>::new();
-        let code = {
-            let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
-            run_verify(&vargs, &mut out).expect("run_verify")
-        };
-        assert_eq!(code, 0);
-        let printed = String::from_utf8(stdout).unwrap();
-        assert!(printed.contains("verification OK"));
-    }
+    // The #8851 signing-outcome pins (unsigned -> exit 2 / `manifest_signature_absent`,
+    // enrolled signer -> `Verified` / exit 0) live in
+    // tests/forensic_bundle_signing_outcome_9179.rs: they need a private
+    // `AI_MEMORY_KEY_DIR`, and a process-wide env override is not allowed in
+    // the parallel lib test binary (#3475).
 
     /// `run_verify` returns exit 2 (not 1) on a tampered bundle and
     /// prints "verification FAILED".
