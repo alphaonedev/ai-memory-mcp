@@ -43,6 +43,7 @@
 //! mirroring #2088's api-key-dispatch move).
 
 use crate::models::field_names;
+use crate::url_display::db_path_display;
 use std::io::Write as _;
 use std::path::Path;
 use std::path::PathBuf;
@@ -226,7 +227,7 @@ fn resolve_store_binding(
             anyhow::bail!(
                 "--db and --store-url are mutually exclusive. \
                  Pass exactly one. Got --db={} and --store-url={}",
-                db_path.display(),
+                db_path_display(&db_path),
                 crate::url_display::store_url_display(url),
             );
         }
@@ -3955,7 +3956,7 @@ pub(crate) fn load_boot_index_entries(
         Ok(c) => c,
         Err(e) => {
             tracing::warn!(
-                db_path = %db_path.display(),
+                db_path = %db_path_display(db_path),
                 err = %e,
                 "HNSW boot warm-up: could not open DB; semantic index stays cold (#1579 B3)"
             );
@@ -5864,7 +5865,7 @@ fn governance_consultation_unavailable_inner(
     use crate::governance::agent_action::Decision as RuleDecision;
     let reason = format!(
         "governance:consultation_unavailable: rules DB at {} could not be opened at hook install",
-        rules_db_path.display(),
+        db_path_display(rules_db_path),
     );
     // Chain-log the consultation failure regardless of the open/closed
     // decision so an audit can detect that the gate ran degraded.
@@ -5882,14 +5883,14 @@ fn governance_consultation_unavailable_inner(
         tracing::warn!(
             "{surface}: hook consultation connection unavailable (rules DB at {}); \
              {ENV_GOVERNANCE_FAIL_OPEN}=1 — degrading to ALLOW (UNSAFE, legacy posture)",
-            rules_db_path.display(),
+            db_path_display(rules_db_path),
         );
         outcome
     } else {
         tracing::warn!(
             "{surface}: hook consultation connection unavailable (rules DB at {}); failing CLOSED \
              (#1455 secure default — set {ENV_GOVERNANCE_FAIL_OPEN}=1 to revert)",
-            rules_db_path.display(),
+            db_path_display(rules_db_path),
         );
         outcome
     }
@@ -6681,7 +6682,7 @@ pub async fn bootstrap_serve(
                     "v0.7.0 #1017: failed to open hook consultation connection at {}: {}; \
                      governance hooks will fail closed unless the explicit consultation-only \
                      fail-open override is enabled and durable audit admission succeeds",
-                    db_path.display(),
+                    db_path_display(db_path),
                     e,
                 );
                 None
@@ -7636,7 +7637,7 @@ pub async fn bootstrap_serve(
                 Err(e) => {
                     tracing::warn!(
                         target: "ai_memory::identity::replay",
-                        db_path = %db_path.display(),
+                        db_path = %db_path_display(db_path),
                         err = %e,
                         "#1255: FederationNonceCache persistence open failed; falling back to \
                          in-memory cache. Daemon restarts will reopen the replay window until \
@@ -8236,7 +8237,7 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
     let addr = format!("{}:{}", args.host, args.port);
     // #8444 r2: the Agent Card URL is configured or daemon-derived, never from headers.
     crate::a2a::init_card_base_url(args.tls_cert.is_some() && args.tls_key.is_some(), &addr);
-    tracing::info!("database: {}", db_path.display());
+    tracing::info!("database: {}", db_path_display(&db_path));
 
     // v1.0.0 #2166 — SIGHUP live `[llm]` reload. On unix, install a SIGHUP
     // handler that re-resolves + rebuilds the `[llm]` client and atomically
@@ -9029,6 +9030,10 @@ pub async fn sync_cycle_once(
     // `sync_state.peer_id`, every backup or every `VACUUM INTO` snapshot.
     let peer_key = crate::url_display::url_origin_and_path(peer_url);
     let peer_key = peer_key.as_str();
+    if let Some(why) = crate::url_display::durable_key_refusal(peer_url) {
+        // #6101: a redacted / unparseable URL is a non-unique key; refuse rather than share a cursor.
+        anyhow::bail!("peer {peer_key} refused: no unique sync key; {why}");
+    }
 
     // --- PULL --------------------------------------------------------
     let since = {

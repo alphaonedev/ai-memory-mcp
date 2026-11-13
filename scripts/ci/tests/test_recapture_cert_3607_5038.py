@@ -2192,13 +2192,15 @@ class ChildCwd7648(SymlinkBase):
         missing = re.search(
             r'pub fn open_existing_read_only\(path: &Path\) -> Result<Connection> \{\s*'
             r'match path\.try_exists\(\) \{\s*'
-            r'Ok\(false\) => anyhow::bail!\("([^"\n]+)", '
-            r'MISSING_DATABASE_REFUSAL, path\.display\(\)\)', connection)
+            r'Ok\(false\) => anyhow::bail!\(\s*"([^"\n]+)",\s*'
+            r'MISSING_DATABASE_REFUSAL,\s*'
+            r'crate::url_display::db_path_display\(path\)\s*\)', connection)
         diagnostic = re.search(
             r'Some\(path\) => match db::open_existing_read_only\(path\)\s*'
             r'\.and_then\(\|conn\| crate::storage::live_synchronous\(&conn\)\)\s*\{\s*'
             r'Ok\(level\) => Some\(level\),\s*Err\(e\) => \{\s*'
-            r'writeln!\(\s*out\.stderr,\s*"([^"\n]+)",\s*path\.display\(\)\s*\)\?;',
+            r'writeln!\(\s*out\.stderr,\s*"([^"\n]+)",\s*'
+            r'crate::url_display::db_path_display\(path\)\s*\)\?;',
             doctor)
         for match in (refusal, missing, diagnostic):
             self.assertIsNotNone(match, 'Rust diagnostic relationship changed; review the stub')

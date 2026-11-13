@@ -146,6 +146,15 @@ fn redact_in(value: &mut toml::Value, under_secret_key: bool) {
         toml::Value::Table(table) => {
             for (key, child) in table.iter_mut() {
                 let secret = under_secret_key || is_secret_value_key(key);
+                // #6102 — a `db` value is a database PATH or store URL, with
+                // or without `://`: it renders through the db-path funnel,
+                // never verbatim.
+                if !secret && is_db_path_key(key) {
+                    if let toml::Value::String(s) = child {
+                        *s = display_db_value(s);
+                        continue;
+                    }
+                }
                 redact_in(child, secret);
             }
         }
@@ -177,7 +186,10 @@ fn redact_in(value: &mut toml::Value, under_secret_key: bool) {
 }
 
 /// The display form of a string setting that is a URL, or `None` when the
-/// value is not URL-shaped (no `scheme://`). Store URLs (`sqlite://`,
+/// value is not URL-shaped: no `scheme://`, no [`SLASHLESS_URL_SCHEMES`]
+/// prefix, and no `scheme:` + userinfo `@` of ANY scheme (#6102: an unknown
+/// scheme such as `ftp:svc:pw@h` fails closed into the funnel instead of
+/// printing verbatim, ERRORS-01). Store URLs (`sqlite://`,
 /// `postgres://`, `postgresql://`) render through
 /// [`crate::url_display::store_url_display`] so the database name survives;
 /// every other URL renders as its origin through
@@ -185,19 +197,67 @@ fn redact_in(value: &mut toml::Value, under_secret_key: bool) {
 /// in the PATH, #3684, so the path is not shown either).
 fn display_url_value(value: &str) -> Option<String> {
     let trimmed = value.trim();
-    if !trimmed.contains("://") {
+    if !trimmed.contains("://")
+        && !has_slashless_url_scheme(trimmed)
+        && !crate::url_display::has_scheme_and_userinfo(trimmed)
+    {
         return None;
     }
     // #6102: the scheme is case-insensitive (RFC 3986 section 3.1), so
     // `POSTGRES://` is a store URL too; routing it to `url_origin` printed
     // the credential bytes of an ambiguous DSN.
     let folded = trimmed.to_ascii_lowercase();
-    if folded.starts_with(crate::store_url::SQLITE_URL_SCHEME)
-        || crate::store_url::is_postgres_url(&folded)
+    if crate::url_display::strip_sqlite_scheme(trimmed).is_some()
+        || folded.starts_with(SLASHLESS_SQLITE)
+        || folded.starts_with(SLASHLESS_POSTGRES)
     {
         return Some(crate::url_display::store_url_display(trimmed));
     }
     Some(crate::url_display::url_origin(trimmed))
+}
+
+/// Config keys whose value is a database path or store URL (#6102).
+const DB_PATH_KEYS: &[&str] = &["db"];
+
+/// Does `key` name a database path setting? Case-insensitive.
+fn is_db_path_key(key: &str) -> bool {
+    let key = key.trim();
+    DB_PATH_KEYS.iter().any(|k| key.eq_ignore_ascii_case(k))
+}
+
+/// The display form of a `db` value (#6102): the db-path funnel, then the
+/// value-shape backstop.
+fn display_db_value(value: &str) -> String {
+    let rendered = crate::url_display::db_path_display(std::path::Path::new(value.trim()));
+    crate::secret_screen::redact_for_storage(&rendered).unwrap_or(rendered)
+}
+
+/// URL schemes the WHATWG parser accepts with no `//` (`https:host`,
+/// `postgres:/user:pw@host`). A value starting with one of them is a URL
+/// even without `://`, so it renders through the funnel (#6102).
+const SLASHLESS_URL_SCHEMES: &[&str] = &[
+    "http:",
+    "https:",
+    "ws:",
+    "wss:",
+    "postgres:",
+    "postgresql:",
+    "sqlite:",
+];
+/// `sqlite:` written without its `//`.
+const SLASHLESS_SQLITE: &str = "sqlite:";
+/// `postgres:` / `postgresql:` written without the `//` (`postgres` is a
+/// prefix of `postgresql`).
+const SLASHLESS_POSTGRES: &str = "postgres";
+
+/// `true` when `value` starts with a [`SLASHLESS_URL_SCHEMES`] entry, any
+/// case. `get` keeps the slice on a char boundary (OWNERSHIP-15).
+fn has_slashless_url_scheme(value: &str) -> bool {
+    SLASHLESS_URL_SCHEMES.iter().any(|scheme| {
+        value
+            .get(..scheme.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(scheme))
+    })
 }
 
 /// Render a config table for HUMAN DISPLAY, redacted.
@@ -507,6 +567,121 @@ peers = ["https://u:PEER_CANARY@peer.internal:8443/m"]
             !rendered.contains("sslmode"),
             "the query is never rendered: {rendered}"
         );
+    }
+
+    /// #6102 — a `db` value renders through the db-path funnel with or
+    /// without `://`; a slashless URL (`https:` / `postgres:`) in any other
+    /// key renders through the URL funnel; an agent id `ai:x@host` (not a
+    /// URL scheme) is left as written. `(toml, must_contain)`.
+    #[test]
+    fn db_and_slashless_url_values_never_render_a_credential_6102() {
+        const CANARY: &str = "SLASH_CANARY";
+        // F6: the exact marker, reason included.
+        const REDACTED_DB_PATH: &str = "<redacted-db-path: '@' or '=' may delimit a credential>";
+        for (doc, want) in [
+            (
+                format!("db = \"postgres:/svc:{CANARY}@db.example/mem\""),
+                REDACTED_DB_PATH,
+            ),
+            (
+                format!("db = \"host=db.example password={CANARY}\""),
+                REDACTED_DB_PATH,
+            ),
+            (
+                format!("DB = \"svc:{CANARY}@db.example/mem\""),
+                REDACTED_DB_PATH,
+            ),
+            (
+                format!("db = \"SQLITE://svc:{CANARY}@x/db\""),
+                "sqlite://<redacted-authority>",
+            ),
+            (
+                "db = \"/var/lib/ai-memory/a.db\"".to_string(),
+                "/var/lib/ai-memory/a.db",
+            ),
+            (
+                format!("[llm]\nbase_url = \"HTTPS:svc:a@{CANARY}/x@llm.example/v1\""),
+                "https://<redacted-authority>",
+            ),
+            (
+                format!("[llm]\nbase_url = \"https:svc:{CANARY}@llm.example/v1\""),
+                "https://llm.example",
+            ),
+            (
+                format!("[federation]\nstore = \"Postgres:svc:{CANARY}@db/m\""),
+                "postgres://<redacted-authority>",
+            ),
+            // LOW-3: a scheme outside SLASHLESS_URL_SCHEMES fails closed.
+            (
+                format!("[llm]\nbase_url = \"ftp:svc:{CANARY}@llm.example/v1\""),
+                "ftp://llm.example",
+            ),
+            (
+                format!("[llm]\nbase_url = \"gopher:svc:{CANARY}@llm.example/x\""),
+                "gopher://<redacted-authority>",
+            ),
+            (
+                format!("[llm]\nbase_url = \"x-vendor+v1.2:svc:{CANARY}@llm.example\""),
+                "x-vendor+v1.2://<redacted-authority>",
+            ),
+        ] {
+            let mut value: toml::Value = toml::from_str(&doc).expect("fixture parses");
+            redact_toml_value(&mut value);
+            let rendered = toml::to_string_pretty(&value).expect("render");
+            assert!(!rendered.contains(CANARY), "{doc:?} leaked: {rendered}");
+            assert!(rendered.contains(want), "{doc:?} rendered {rendered}");
+        }
+        let mut value: toml::Value =
+            toml::from_str("agent_id = \"ai:claude@host-1\"").expect("fixture parses");
+        redact_toml_value(&mut value);
+        let rendered = toml::to_string_pretty(&value).expect("render");
+        assert!(rendered.contains("ai:claude@host-1"), "{rendered}");
+    }
+
+    /// LOW-3 (#6102): `scheme:` + userinfo of ANY RFC 3986 scheme renders
+    /// through the URL funnel, so no scheme list decides whether a
+    /// credential is printed. Generative over schemes, case and shapes.
+    #[test]
+    fn any_scheme_with_userinfo_never_renders_a_credential_6102() {
+        const CANARY: &str = "GEN_CANARY";
+        const SCHEMES: &[&str] = &[
+            "http", "https", "ftp", "ws", "wss", "gopher", "ldap", "redis", "mysql", "amqp",
+            "mongodb", "smb", "x-vendor", "a+b.c-d", "z",
+        ];
+        const SHAPES: &[&str] = &[
+            "svc:{C}@host.example/v1",
+            "/svc:{C}@host.example/v1",
+            "svc:a@{C}/x@host.example",
+            "{C}@host.example",
+            "svc:{C}@host.example:8080/p?q=1",
+        ];
+        for scheme in SCHEMES {
+            for case in [scheme.to_string(), scheme.to_ascii_uppercase()] {
+                for shape in SHAPES {
+                    let raw = format!("{case}:{}", shape.replace("{C}", CANARY));
+                    for key in ["base_url", "endpoint", "store"] {
+                        let doc = format!("[section]\n{key} = \"{raw}\"");
+                        let mut value: toml::Value = toml::from_str(&doc).expect("fixture parses");
+                        redact_toml_value(&mut value);
+                        let rendered = toml::to_string_pretty(&value).expect("render");
+                        assert!(!rendered.contains(CANARY), "{doc:?} leaked: {rendered}");
+                    }
+                }
+            }
+        }
+        // Not URLs: left as written.
+        for plain in [
+            "llama3:8b",
+            "ai:claude@host-1",
+            "no-at-sign:here",
+            "plain text",
+        ] {
+            let doc = format!("[section]\nmodel = \"{plain}\"");
+            let mut value: toml::Value = toml::from_str(&doc).expect("fixture parses");
+            redact_toml_value(&mut value);
+            let rendered = toml::to_string_pretty(&value).expect("render");
+            assert!(rendered.contains(plain), "{plain:?} rendered {rendered}");
+        }
     }
 
     #[test]

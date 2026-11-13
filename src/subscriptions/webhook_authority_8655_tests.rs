@@ -15,9 +15,25 @@ fn registration_parser_parity_8655() {
         assert_eq!(parsed.host_str(), Some(host), "connection host oracle");
         let error = validate_url_with(&url, false)
             .expect_err("#8655: registration must check the connection host");
+        // decision: assert the refusal REASON over the rendered host because
+        // a backslash-then-`@` authority is the ambiguous shape (#6101): the
+        // credential-display funnel renders it `scheme://<redacted-authority>`
+        // (its parsed host may be credential bytes), so the refusal must NOT
+        // echo the host. The reason text still proves the guard classified
+        // the connection host (loopback vs private), which is the #8655 pin.
+        let message = error.to_string();
+        let expected_reason = if host == "127.0.0.1" || host == "[::1]" {
+            "targets loopback address"
+        } else {
+            "targets private / link-local address"
+        };
         assert!(
-            error.to_string().contains(host),
-            "refusal names the parsed host"
+            message.contains(expected_reason),
+            "refusal classifies the parsed host: {message}"
+        );
+        assert!(
+            message.contains("<redacted-authority>") && !message.contains(host),
+            "ambiguous authority is redacted, not echoed: {message}"
         );
     }
 }
