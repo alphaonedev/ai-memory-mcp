@@ -547,7 +547,9 @@ def hostile_rows():
     region("nbsp_in_region", f"\n### Amendment {DAY}\n\n- path: {MOD_RS}\n",
            "character outside printable ASCII in the ledger", f"- path: {MOD_RS}")
     region("quoted_record", f"\n> ### Amendment {DAY}\n", "expected '### Amendment YYYY-MM-DD'", f"> ### Amendment {DAY}")
-    region("no_blank_after_marker", f"### Amendment {DAY}\n\n- path: {MOD_RS}\n", "expected a blank line", f"### Amendment {DAY}")
+    region("heading_trailing_text", f"\n### Amendment {DAY} closing #\n\n- path: {MOD_RS}\n",
+           "expected '### Amendment YYYY-MM-DD'", f"### Amendment {DAY} closing #")
+    region("no_blank_after_marker",f"### Amendment {DAY}\n\n- path: {MOD_RS}\n", "expected a blank line", f"### Amendment {DAY}")
     region("no_blank_after_heading", f"\n### Amendment {DAY}\n- path: {MOD_RS}\n", "expected a blank line", f"- path: {MOD_RS}")
     region("bad_calendar_date", f"\n### Amendment 2026-02-30\n\n- path: {MOD_RS}\n", "date 2026-02-30 is not a calendar date", "### Amendment 2026-02-30")
     region("unsorted_items", f"\n### Amendment {DAY}\n\n- path: {PEER_RS}\n- path: {MOD_RS}\n",
