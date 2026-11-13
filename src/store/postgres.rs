@@ -114,7 +114,8 @@ mod merge_inbound_4023;
 // v1.0.0 #4447 — the federation by-id lane write bodies (deletions / archives /
 // restores / links) with the in-transaction peer-scope re-check. Own module:
 // postgres.rs is at its qual_10 budget.
-mod federation_by_id_4447;
+mod consolidate_archive_9018;
+mod federation_by_id_4447; // #9018 archive-first consolidate source (qual_10 budget)
 // v1.0.0 #3124 R4 — the audited `reown` sweep. Own module for the same
 // qual_10 budget reason as `parity_3064` above.
 mod governance_corrupt_4285;
@@ -225,6 +226,36 @@ const SQL_ARCHIVE_SNAPSHOT_LIVE_ROW: &str = "INSERT INTO archived_memories
                         confidence_source, confidence_signals, confidence_decayed_at,
                         mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until, cid, cid_genesis
                  FROM memories WHERE id = $1";
+
+/// #9178 D (#8169, #9218) — the ONE shared last-wins snapshot of a still-live
+/// row into `archived_memories` under `reason`, inside `tx`:
+/// [`SQL_DELETE_ARCHIVED_MEMORY_BY_ID`] then [`SQL_ARCHIVE_SNAPSHOT_LIVE_ROW`]
+/// (sqlite's `INSERT OR REPLACE`). New sites call this; the inline pairs left
+/// are pinned by `tests/pg_archive_snapshot_ssot_9178.rs` and may only fall.
+///
+/// # Errors
+///
+/// Any SQL failure, labelled `<what> clear prior archive record` or
+/// `<what> archive snapshot`; the caller's transaction then rolls back.
+async fn pg_replace_archive_snapshot_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    id: &str,
+    reason: &str,
+    what: &str,
+) -> StoreResult<()> {
+    sqlx::query(SQL_DELETE_ARCHIVED_MEMORY_BY_ID)
+        .bind(id)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| to_store_err(&format!("{what} clear prior archive record"), e))?;
+    sqlx::query(SQL_ARCHIVE_SNAPSHOT_LIVE_ROW)
+        .bind(id)
+        .bind(reason)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| to_store_err(&format!("{what} archive snapshot"), e))?;
+    Ok(())
+}
 /// #2195 (data-integrity archive-parity) — LAST-WINS `ON CONFLICT` clause for
 /// the eviction / manual archive-INSERT paths (`forget`, `run_gc`, `size_gc`,
 /// `archive_by_ids`). SQLite archives via `INSERT OR REPLACE` (last-wins: a
@@ -836,6 +867,10 @@ const SQL_DELETE_DEDUP_BY_MEMORY_IDS: &str =
 /// stays refused.
 const SQL_DELETE_FORGET_TOMBSTONE_BY_MEMORY_ID: &str =
     "DELETE FROM forget_tombstones WHERE memory_id = $1";
+/// #9178 E — the consolidate archive row of an id the `RestoreSameId` arm
+/// revives. Postgres twin of the sqlite `SQL_DELETE_ARCHIVE_ROW_BY_ID_REASON`.
+const SQL_DELETE_ARCHIVE_ROW_BY_ID_REASON: &str =
+    "DELETE FROM archived_memories WHERE id = $1 AND archive_reason = $2";
 
 /// v0.9.0 G13-mem (#1859) — endpoint content-id read for the lineage-DAG
 /// `memory_links.source_cid`/`target_cid` mirror stamp.
@@ -28605,6 +28640,9 @@ impl MemoryStore for PostgresStore {
         } else {
             None
         };
+        // #9018 — audit anchors of the legacy arm's namespace-standard sever,
+        // emitted only after the COMMIT.
+        let mut sever_anchor = crate::governance::audit::PendingAuditAnchor::none();
         for (id, source_cid) in ids.iter().zip(source_cids.iter()) {
             if id == &new_id {
                 continue;
@@ -28770,22 +28808,14 @@ impl MemoryStore for PostgresStore {
                     }
                 }
             } else {
-                // LEGACY hard-DELETE path (sub-flag OFF) — byte-identical
-                // pre-#1859 behavior.
-                sqlx::query(SQL_DELETE_MEMORY_BY_ID)
-                    .bind(id)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|e| to_store_err("consolidate delete source", e))?;
-                // #1783 — remove the merged-away source's AGE projection in
-                // this tx so kg_query/find_paths don't keep a ghost edge to it.
-                if matches!(self.kg_backend, KgBackend::Age) {
-                    unproject_memory_from_age(&mut tx, id).await?;
-                }
+                // LEGACY disposition (sub-flag OFF). #9018 — archive-first,
+                // never a bare hard delete (sqlite twin: `archive_memory`).
+                let severed = self.archive_consolidate_source_in_tx(&mut tx, id).await?;
+                sever_anchor = sever_anchor.merge(severed);
             }
         }
 
-        tx.commit()
+        pg_commit_and_emit(tx, sever_anchor)
             .await
             .map_err(|e| to_store_err("consolidate commit", e))?;
         Ok(new_id)
@@ -34890,6 +34920,14 @@ impl PostgresStore {
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| to_store_err("restore clear forget tombstone", e))?;
+            // #9178 E: a live row never also keeps its consolidate archive row
+            // (sqlite twin: `SQL_DELETE_ARCHIVE_ROW_BY_ID_REASON`, same tx).
+            sqlx::query(SQL_DELETE_ARCHIVE_ROW_BY_ID_REASON)
+                .bind(&id)
+                .bind(field_names::ARCHIVE_REASON_CONSOLIDATE)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("restore clear consolidate archive row", e))?;
         }
 
         // v0.7.0 #1156 — per-namespace quota dimension (v50 PK).

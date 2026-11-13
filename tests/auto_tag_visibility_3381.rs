@@ -213,7 +213,7 @@ async fn check_visibility(mut app: AppState) {
     Mock::given(method("POST"))
         .and(path("/api/chat"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "message": {"content": "alpha\nbeta"}
+            "message": {"content": "alpha\nbeta"}, "done_reason": "stop"
         })))
         .mount(&server)
         .await;

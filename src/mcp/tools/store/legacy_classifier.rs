@@ -23,8 +23,11 @@
 //!    short-circuit reason to the response envelope as
 //!    `autonomy_hook_skipped: "<reason>"` so callers can distinguish
 //!    silent fall-through (`disabled` / `no_llm` / `content_too_short`
-//!    / `internal_namespace`) from real LLM failures (which log at
-//!    WARN but do not appear in the response).
+//!    / `internal_namespace`) from a hook that ran. A hook that ran and
+//!    FAILED (#9213) is reported separately on the response as
+//!    `autonomy_hook_degraded: [{hook, candidate_id?, reason}]` (reason
+//!    codes from `crate::llm::REPLY_FAILURE_REASONS`), with one
+//!    structured WARN per failure; it is never written to row metadata.
 //!
 //! Eligibility (mirrors the pre-#881 inline guard):
 //!
@@ -38,7 +41,7 @@ use crate::models::field_names;
 use serde_json::{Value, json};
 
 use crate::db;
-use crate::llm::OllamaClient;
+use crate::llm::{self, OllamaClient};
 use crate::models::{GovernancePolicy, Memory};
 
 use super::AUTONOMY_MIN_CONTENT_LEN;
@@ -69,6 +72,9 @@ pub(super) fn autonomy_skip_reason(
 pub(super) struct AutonomyHookOutcome {
     pub auto_tags: Vec<String>,
     pub confirmed_contradictions: Vec<String>,
+    /// #9213 — one `{hook, candidate_id?, reason}` entry per hook call that
+    /// failed; echoed as `autonomy_hook_degraded` on the response only.
+    pub degraded: Vec<Value>,
 }
 
 /// v0.6.0.0 post-store autonomy hooks. When enabled via
@@ -78,8 +84,12 @@ pub(super) struct AutonomyHookOutcome {
 /// optionally fires the legacy `detect_contradiction` per-pair loop.
 /// Persists the results into the memory's metadata.
 ///
-/// Best-effort: any LLM error is logged at WARN and does not fail
-/// the store. Skipped silently for internal/system namespaces (the
+/// Best-effort: an LLM error does not fail the store. It is recorded
+/// as a degraded outcome (#9213): one structured WARN (memory id, hook,
+/// reason code, never provider text) and one `degraded` entry the
+/// handler echoes as `autonomy_hook_degraded`. A contradiction entry
+/// names the candidate only when `read_caller` can read it. Skipped
+/// silently for internal/system namespaces (the
 /// store handler still surfaces the skip reason on the response
 /// envelope when applicable).
 ///
@@ -96,16 +106,23 @@ pub(super) fn maybe_run_autonomy_hooks(
     actual_id: &str,
     existing: &[Memory],
     ns_policy: &GovernancePolicy,
+    read_caller: Option<&str>,
 ) -> AutonomyHookOutcome {
     let mut auto_tags: Vec<String> = Vec::new();
     let mut confirmed_contradictions: Vec<String> = Vec::new();
+    let mut degraded: Vec<Value> = Vec::new();
 
     match llm.auto_tag(&mem.title, &mem.content, None) {
         Ok(tags) => {
             auto_tags = tags.into_iter().take(8).collect();
         }
         Err(e) => {
-            tracing::warn!("auto_tag hook failed for {}: {}", actual_id, e);
+            let reason = llm::record_degraded_hook(actual_id, llm::DEGRADED_HOOK_AUTO_TAG, &e);
+            degraded.push(llm::degraded_hook_entry(
+                llm::DEGRADED_HOOK_AUTO_TAG,
+                None,
+                reason,
+            ));
         }
     }
 
@@ -121,10 +138,23 @@ pub(super) fn maybe_run_autonomy_hooks(
                 Ok(true) => confirmed_contradictions.push(cand.id.clone()),
                 Ok(false) => {}
                 Err(e) => {
-                    tracing::warn!(
-                        "detect_contradiction hook failed ({actual_id} vs {}): {e}",
-                        cand.id
+                    let reason = llm::record_degraded_hook(
+                        actual_id,
+                        llm::DEGRADED_HOOK_DETECT_CONTRADICTION,
+                        &e,
                     );
+                    // Z-6: name the candidate only when the requester can
+                    // already read it through the canonical read predicate.
+                    let readable = crate::visibility::is_readable_on_query(
+                        cand,
+                        read_caller,
+                        Some(&mem.namespace),
+                    );
+                    degraded.push(llm::degraded_hook_entry(
+                        llm::DEGRADED_HOOK_DETECT_CONTRADICTION,
+                        readable.then_some(cand.id.as_str()),
+                        reason,
+                    ));
                 }
             }
         }
@@ -169,11 +199,13 @@ pub(super) fn maybe_run_autonomy_hooks(
     AutonomyHookOutcome {
         auto_tags,
         confirmed_contradictions,
+        degraded,
     }
 }
 
-/// Echo the `auto_tags` + `confirmed_contradictions` arrays on the
-/// response envelope (when non-empty). Lifted from the inline
+/// Echo the `auto_tags` + `confirmed_contradictions` arrays and the
+/// #9213 `autonomy_hook_degraded` list on the response envelope (each
+/// only when non-empty: a clean store carries no degraded key at all). Lifted from the inline
 /// response-assembly block in `handle_store` so the call site stays
 /// readable.
 pub(super) fn merge_autonomy_outcome_into_response(
@@ -186,6 +218,9 @@ pub(super) fn merge_autonomy_outcome_into_response(
     if !outcome.confirmed_contradictions.is_empty() {
         response[field_names::CONFIRMED_CONTRADICTIONS] = json!(outcome.confirmed_contradictions);
     }
+    if !outcome.degraded.is_empty() {
+        response[field_names::AUTONOMY_HOOK_DEGRADED] = json!(outcome.degraded);
+    }
 }
 
 /// HNSW vector-index marker — kept as a module-local re-export so
@@ -193,6 +228,10 @@ pub(super) fn merge_autonomy_outcome_into_response(
 /// The compiler removes the alias under `--release`.
 #[allow(dead_code)]
 pub(super) type Idx = dyn crate::hnsw::VectorSearchIndex;
+
+#[cfg(test)]
+#[path = "legacy_classifier_9213_tests.rs"]
+mod degraded_9213_tests;
 
 #[cfg(test)]
 mod tests {

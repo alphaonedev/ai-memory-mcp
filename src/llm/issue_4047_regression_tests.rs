@@ -93,9 +93,9 @@ async fn issue_4047_success_resets_and_http_status_policy_is_preserved() {
         }
         let message = json!({"content": "valid response"});
         let body = if openai {
-            json!({"choices": [{"message": message}]})
+            json!({"choices": [{"message": message, "finish_reason": "stop"}]})
         } else {
-            json!({"message": message})
+            json!({"message": message, "done": true, "done_reason": "stop"})
         };
         respond(&server, 200, body).await;
         assert_eq!(
@@ -132,9 +132,9 @@ async fn issue_4047_tool_calls_without_text_are_successful() {
         let client = client(&server, openai);
         let message = json!({"tool_calls": [{"function": {"name": "test", "arguments": "{}"}}]});
         let body = if openai {
-            json!({"choices": [{"message": message}]})
+            json!({"choices": [{"message": message, "finish_reason": "stop"}]})
         } else {
-            json!({"message": message})
+            json!({"message": message, "done": true, "done_reason": "stop"})
         };
         respond(&server, 200, body).await;
         for _ in 0..4 {

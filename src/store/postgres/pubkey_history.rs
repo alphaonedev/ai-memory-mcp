@@ -6,10 +6,11 @@
 use super::{PostgresStore, StoreError, StoreResult, to_store_err};
 
 impl PostgresStore {
-    /// Outer bind/lineage admission already refreshed the durable stop state.
+    /// Outer admission (bind/lineage here; `consolidate` for the #9018
+    /// archive-first helper) already refreshed the durable stop state.
     /// Recheck its shared flag without checking out another connection while
     /// `tx` holds the pool's last available connection.
-    fn gate_record_stop_in_transaction(&self) -> StoreResult<()> {
+    pub(super) fn gate_record_stop_in_transaction(&self) -> StoreResult<()> {
         crate::store::record_stop::gate_flag(&self.record_stop)
     }
 

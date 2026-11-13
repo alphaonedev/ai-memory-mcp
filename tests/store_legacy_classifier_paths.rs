@@ -380,7 +380,7 @@ fn autonomy_hook_auto_tag_error_arm_logs_warn_and_continues() {
             Mock::given(method("POST"))
                 .and(path("/api/chat"))
                 .respond_with(ResponseTemplate::new(200).set_body_json(
-                    json!({"message": {"content": "{\"verdicts\": []}"}, "done": true}),
+                    json!({"message": {"content": "{\"verdicts\": []}"}, "done": true, "done_reason": "stop"}),
                 ))
                 .mount(&server)
                 .await;
@@ -608,7 +608,7 @@ fn autonomy_hook_auto_tags_only_no_legacy_classifier_persists_to_metadata() {
             Mock::given(method("POST"))
                 .and(path("/api/chat"))
                 .respond_with(ResponseTemplate::new(200).set_body_json(
-                    json!({"message": {"content": "{\"verdicts\": []}"}, "done": true}),
+                    json!({"message": {"content": "{\"verdicts\": []}"}, "done": true, "done_reason": "stop"}),
                 ))
                 .mount(&server)
                 .await;
@@ -694,10 +694,9 @@ fn legacy_classifier_skips_self_id_in_candidate_loop() {
             .await;
         Mock::given(method("POST"))
             .and(path("/api/chat"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(json!({"message": {"content": "no"}, "done": true})),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"message": {"content": "no"}, "done": true, "done_reason": "stop"}),
+            ))
             .mount(&server)
             .await;
         Mock::given(method("POST"))
@@ -1179,10 +1178,9 @@ fn autonomy_hook_confirmed_contradictions_only_no_auto_tags_persists_to_metadata
         Mock::given(method("POST"))
             .and(path("/api/chat"))
             .and(body_string_contains("Generate 3-5 short tags"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(json!({"message": {"content": ""}, "done": true})),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"message": {"content": ""}, "done": true, "done_reason": "stop"}),
+            ))
             .mount(&server)
             .await;
         // contradiction prompt — return "yes" so detect_contradiction →
@@ -1192,20 +1190,18 @@ fn autonomy_hook_confirmed_contradictions_only_no_auto_tags_persists_to_metadata
         Mock::given(method("POST"))
             .and(path("/api/chat"))
             .and(body_string_contains("Do these two statements contradict"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(json!({"message": {"content": "yes"}, "done": true})),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"message": {"content": "yes"}, "done": true, "done_reason": "stop"}),
+            ))
             .mount(&server)
             .await;
         // synthesis fallback — return "yes" (kept as v0.6.x catch-all
         // for any chat path that doesn't match either matcher above).
         Mock::given(method("POST"))
             .and(path("/api/chat"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(json!({"message": {"content": "yes"}, "done": true})),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"message": {"content": "yes"}, "done": true, "done_reason": "stop"}),
+            ))
             .mount(&server)
             .await;
         server

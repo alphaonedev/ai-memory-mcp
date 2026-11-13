@@ -12,6 +12,11 @@ use clap::Args;
 use models::Tier;
 use std::path::Path;
 
+/// Byte budget of each source excerpt in an auto-consolidated summary. The
+/// cut is moved down to a char boundary (`floor_char_boundary`), so a multi-byte
+/// character at the limit never panics the slice (OWNERSHIP-15).
+const AUTO_CONSOLIDATE_EXCERPT_BYTES: usize = 200;
+
 #[derive(Args)]
 pub struct ConsolidateArgs {
     /// Comma-separated memory IDs
@@ -259,7 +264,15 @@ pub fn run_auto(
                 );
                 let content: String = group
                     .iter()
-                    .map(|m| format!("- {}: {}", m.title, &m.content[..m.content.len().min(200)]))
+                    .map(|m| {
+                        format!(
+                            "- {}: {}",
+                            m.title,
+                            &m.content[..m
+                                .content
+                                .floor_char_boundary(AUTO_CONSOLIDATE_EXCERPT_BYTES)]
+                        )
+                    })
                     .collect::<Vec<_>>()
                     .join("\n");
                 // #2121 — CLI caller-origin surface (see `run` above):

@@ -855,10 +855,9 @@ async fn autonomy_hook_executes_with_llm_success() {
     // detect_contradiction returns "no".
     Mock::given(method("POST"))
         .and(path("/api/chat"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(json!({"message": {"content": "alpha\nbeta\ngamma"}})),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            json!({"message": {"content": "alpha\nbeta\ngamma"}, "done_reason": "stop"}),
+        ))
         .mount(&server)
         .await;
 
@@ -1592,18 +1591,18 @@ async fn autonomy_hook_confirmed_contradictions_reach_response() {
         .and(path("/api/chat"))
         .and(body_string_contains("tags"))
         .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(json!({"message": {"content": "alpha\nbeta"}})),
+            ResponseTemplate::new(200).set_body_json(
+                json!({"message": {"content": "alpha\nbeta"}, "done_reason": "stop"}),
+            ),
         )
         .mount(&server)
         .await;
     Mock::given(method("POST"))
         .and(path("/api/chat"))
         .and(body_string_contains("contradict"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(json!({"message": {"content": "yes"}, "done": true})),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            json!({"message": {"content": "yes"}, "done": true, "done_reason": "stop"}),
+        ))
         .mount(&server)
         .await;
 
@@ -2206,18 +2205,18 @@ async fn legacy_classifier_handles_no_and_error_responses() {
     Mock::given(method("POST"))
         .and(path("/api/chat"))
         .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(json!({"message": {"content": "alpha\nbeta"}})),
+            ResponseTemplate::new(200).set_body_json(
+                json!({"message": {"content": "alpha\nbeta"}, "done_reason": "stop"}),
+            ),
         )
         .mount(&server_no)
         .await;
     // detect_contradiction → /api/chat → "no" → Ok(false)
     Mock::given(method("POST"))
         .and(path("/api/chat"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(json!({"message": {"content": "no"}, "done": true})),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            json!({"message": {"content": "no"}, "done": true, "done_reason": "stop"}),
+        ))
         .mount(&server_no)
         .await;
     let uri_no = server_no.uri();
@@ -2291,8 +2290,9 @@ async fn legacy_classifier_handles_no_and_error_responses() {
     Mock::given(method("POST"))
         .and(path("/api/chat"))
         .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(json!({"message": {"content": "gamma\ndelta"}})),
+            ResponseTemplate::new(200).set_body_json(
+                json!({"message": {"content": "gamma\ndelta"}, "done_reason": "stop"}),
+            ),
         )
         .mount(&server_err)
         .await;

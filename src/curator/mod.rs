@@ -1861,7 +1861,8 @@ mod tests {
                 };
                 (
                     "200 OK",
-                    serde_json::json!({"message": {"content": response}}).to_string(),
+                    serde_json::json!({"message": {"content": response}, "done_reason": "stop"})
+                        .to_string(),
                 )
             }
         } else if method == "POST" && path == "/api/generate" {

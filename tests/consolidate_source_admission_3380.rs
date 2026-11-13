@@ -292,9 +292,7 @@ async fn source_matrix(f: &Fixture) {
         }
         let a = seed(f, &ns, json!({"agent_id": CALLER, "scope": "private"})).await;
         let b = seed(f, &ns, json!({"agent_id": CALLER, "scope": "private"})).await;
-        let (status, body) = call(f, &[a, b], Some(&ns), supplied).await;
-        assert_eq!(status, StatusCode::CREATED, "owner body={body}");
-        assert_eq!(body["consolidated"], 2);
+        owner_outcome(f, &[a, b], &ns, supplied, "owner").await;
         let a = seed(
             f,
             "_agents",
@@ -307,11 +305,29 @@ async fn source_matrix(f: &Fixture) {
             json!({"agent_id": CALLER, "scope": "private"}),
         )
         .await;
-        let (status, body) = call(f, &[a, b], Some("_agents"), supplied).await;
+        owner_outcome(f, &[a, b], "_agents", supplied, "explicit substrate owner").await;
+    }
+}
+
+/// Admitted sources consolidate only with a summary. The fixture wires no
+/// LLM, so without a caller summary the request is refused with the exact
+/// #9018 error and the sources stay untouched; with one it lands as 201.
+async fn owner_outcome(f: &Fixture, ids: &[String], ns: &str, supplied: bool, label: &str) {
+    let before = snapshot(f).await;
+    let (status, body) = call(f, ids, Some(ns), supplied).await;
+    if supplied {
+        assert_eq!(status, StatusCode::CREATED, "{label} body={body}");
+        assert_eq!(body["consolidated"], 2);
+    } else {
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{label} body={body}");
         assert_eq!(
-            status,
-            StatusCode::CREATED,
-            "explicit substrate owner body={body}"
+            body,
+            json!({"error": ai_memory::errors::msg::CONSOLIDATE_SUMMARY_REQUIRED})
+        );
+        assert_eq!(
+            snapshot(f).await,
+            before,
+            "{label}: a refused consolidate must not change sources or create output"
         );
     }
 }

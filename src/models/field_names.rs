@@ -95,6 +95,13 @@ pub const ARCHIVE_REASON_SYNC_PUSH: &str = "sync_push";
 /// `overwrite_full_row_by_id`, postgres `merge_inbound`). One spelling, so the
 /// two backends cannot drift on the reason `archive list` shows.
 pub const ARCHIVE_REASON_FEDERATION_MERGE: &str = "federation_merge";
+/// #9018 — `archive_reason` for a consolidate SOURCE when the tombstone
+/// sub-flag is OFF (the legacy disposition). Before #9018 that arm
+/// hard-deleted every source with no archive row, so the merged-away text was
+/// gone for good. Both backends now move each source into `archived_memories`
+/// (plus its links) under this reason in the consolidate tx, so
+/// `archive restore` can bring it back. One spelling for both backends.
+pub const ARCHIVE_REASON_CONSOLIDATE: &str = "consolidate";
 /// `atomisation_archived_at` — wire/row field name.
 pub const ATOMISATION_ARCHIVED_AT: &str = "atomisation_archived_at";
 /// `atom_count` — wire/row field name.
@@ -202,6 +209,12 @@ pub const CONFIDENCE_SIGNALS: &str = "confidence_signals";
 pub const CONFIDENCE_SOURCE: &str = "confidence_source";
 /// `confirmed_contradictions` — wire/row field name.
 pub const CONFIRMED_CONTRADICTIONS: &str = "confirmed_contradictions";
+/// #9213 — `autonomy_hook_degraded` `memory_store` RESPONSE key (never row
+/// metadata): `[{hook, candidate_id?, reason}]`, absent when no hook degraded.
+pub const AUTONOMY_HOOK_DEGRADED: &str = "autonomy_hook_degraded";
+/// #9213 — `summary_degraded` `memory_session_start` RESPONSE key: the reason
+/// code of a failed LLM summary, absent when the summary succeeded or never ran.
+pub const SUMMARY_DEGRADED: &str = "summary_degraded";
 /// `consolidated` — wire/row field name.
 pub const CONSOLIDATED: &str = "consolidated";
 /// `content_sha256` — wire/row field name.

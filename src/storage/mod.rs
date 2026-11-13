@@ -97,6 +97,9 @@ const SQL_DELETE_DEDUP_BY_MEMORY_ID: &str =
 /// deleted id.
 const SQL_DELETE_FORGET_TOMBSTONE_BY_MEMORY_ID: &str =
     "DELETE FROM forget_tombstones WHERE memory_id = ?1";
+/// #9178 E — the consolidate archive row of an id the `RestoreSameId` arm revives.
+const SQL_DELETE_ARCHIVE_ROW_BY_ID_REASON: &str =
+    "DELETE FROM archived_memories WHERE id = ?1 AND archive_reason = ?2";
 /// #2447 — scalar namespace-by-id read for the federation receive-side
 /// namespace-scope gates (single SQL SSOT; see [`namespace_by_id`]).
 const SQL_SELECT_NAMESPACE_BY_ID: &str = "SELECT namespace FROM memories WHERE id = ?1";
@@ -2734,6 +2737,12 @@ fn insert_inner(
         // on the federation-receive funnel stays intact). Same tx as the insert.
         if matches!(conflict_arm, InsertConflictArm::RestoreSameId) {
             conn.execute(SQL_DELETE_FORGET_TOMBSTONE_BY_MEMORY_ID, params![actual_id])?;
+            // #9178 E: a live row never also keeps its consolidate archive row.
+            let reason = field_names::ARCHIVE_REASON_CONSOLIDATE;
+            conn.execute(
+                SQL_DELETE_ARCHIVE_ROW_BY_ID_REASON,
+                params![actual_id, reason],
+            )?;
         }
         // #3323 — advisory per-lineage + per-namespace token/cost accounting.
         // Metered ONLY on LOCAL authorship (`stamp_local_clock`): a
@@ -11071,13 +11080,20 @@ pub fn consolidate_with_expected_versions(
                 }
             }
         } else {
-            // LEGACY hard-DELETE path. We intentionally do NOT create
-            // derived_from links before deletion because ON DELETE CASCADE
-            // would immediately remove them; source IDs live in
-            // `metadata.derived_from` (non-navigable, plus the cid twin
+            // LEGACY disposition (tombstone sub-flag OFF). We intentionally
+            // do NOT create derived_from links before removal because ON
+            // DELETE CASCADE would immediately remove them; source IDs live
+            // in `metadata.derived_from` (non-navigable, plus the cid twin
             // above when the master flag is on) instead.
+            //
+            // #9018 — ARCHIVE-FIRST, never a bare hard delete: each source
+            // row and its links move into the archive under
+            // `archive_reason = 'consolidate'` in THIS transaction (the
+            // `delete_archive_first` precedent; `archive_memory` joins the
+            // open tx and keeps the record-stop fence), so the merged-away
+            // text stays restorable and a failure rolls the summary back too.
             for id in ids {
-                delete(conn, id)?;
+                archive_memory(conn, id, Some(field_names::ARCHIVE_REASON_CONSOLIDATE))?;
             }
         }
 

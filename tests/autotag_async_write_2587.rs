@@ -226,7 +226,9 @@ async fn start_delayed_chat_mock(delay: Duration, tags_body: &str) -> MockServer
         .and(path("/api/chat"))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_json(json!({"message": {"content": tags_body}, "done": true}))
+                .set_body_json(
+                    json!({"message": {"content": tags_body}, "done": true, "done_reason": "stop"}),
+                )
                 .set_delay(delay),
         )
         .mount(&server)
@@ -349,10 +351,9 @@ async fn autonomous_hooks_disabled_fires_zero_llm_calls_2587() {
     // below hard-fails the test if `auto_tag_async` is ever invoked.
     Mock::given(method("POST"))
         .and(path("/api/chat"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(json!({"message": {"content": "should-never-fire"}})),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            json!({"message": {"content": "should-never-fire"}, "done_reason": "stop"}),
+        ))
         .expect(0)
         .mount(&server)
         .await;

@@ -652,6 +652,22 @@ pub enum ChatOutcome {
     ToolCalls(Vec<ToolCall>),
 }
 
+/// #8945 / #8963 — reply completion status and the contradiction verdict
+/// parser live in `src/llm/reply_integrity.rs`.
+mod reply_integrity;
+/// #9213 — degraded-outcome markers of the best-effort LLM hooks.
+pub use reply_integrity::{
+    DEGRADED_HOOK_AUTO_TAG, DEGRADED_HOOK_DETECT_CONTRADICTION, DEGRADED_HOOK_SESSION_SUMMARY,
+    DEGRADED_REASON_LLM_ERROR, DEGRADED_WARN_MESSAGE, REPLY_FAILURE_REASONS, degraded_hook_entry,
+    record_degraded_hook,
+};
+pub use reply_integrity::{
+    ERR_CONTRADICTION_UNCLASSIFIABLE, ERR_OLLAMA_NO_CONTENT, ERR_OPENAI_NO_CONTENT,
+    ERR_REPLY_EMPTY, ERR_REPLY_FILTERED, ERR_REPLY_NO_STOP_REASON, ERR_REPLY_NOT_DONE,
+    ERR_REPLY_TOOL_STOP, ERR_REPLY_TRUNCATED, ERR_REPLY_UNRECOGNISED_STOP, ReplyCompletion,
+    parse_contradiction_verdict, reply_failure_reason,
+};
+
 /// #1866 — parse an assistant `message` object's `tool_calls` array into
 /// typed [`ToolCall`]s.
 ///
@@ -1841,6 +1857,48 @@ impl OllamaClient {
         }
     }
 
+    /// #8963 — accept a chat reply only when its stop reason proves it is
+    /// complete, then return its text, refusing an empty one.
+    ///
+    /// `tool_stop_ok` is true only on the tool-calling path after a
+    /// structured tool call was parsed. The endpoint answered well-formed
+    /// JSON, so the breaker records a success either way: the breaker
+    /// measures endpoint liveness, and a length-capped reply proves it.
+    ///
+    /// # Errors
+    ///
+    /// An `invalid_response` error naming the incomplete form (one of the
+    /// `ERR_REPLY_*` constants) for a truncated, filtered, unfinished,
+    /// stop-reason-less, unrecognised or empty reply, and the
+    /// `missing_content` description when the content field is absent.
+    fn accept_complete_reply(
+        &self,
+        body: &Value,
+        content: Option<&str>,
+        missing_content: &'static str,
+    ) -> Result<String> {
+        let Some(text) = content else {
+            self.note_failure();
+            return Err(self.provider.invalid_response(missing_content));
+        };
+        self.note_success();
+        self.require_complete(body, false)?;
+        if text.trim().is_empty() {
+            return Err(self.provider.invalid_response(ERR_REPLY_EMPTY));
+        }
+        Ok(text.to_string())
+    }
+
+    /// #8963 — map the body's [`ReplyCompletion`] to `Ok(())` only for a
+    /// normal stop (or a tool-call stop when `tool_stop_ok`).
+    fn require_complete(&self, body: &Value, tool_stop_ok: bool) -> Result<()> {
+        match ReplyCompletion::of(&self.provider, body) {
+            ReplyCompletion::Complete => Ok(()),
+            ReplyCompletion::ToolCalls if tool_stop_ok => Ok(()),
+            other => Err(self.provider.invalid_response(other.error_text())),
+        }
+    }
+
     /// Inspect the breaker state for tests and observability.
     #[doc(hidden)]
     pub fn circuit_breaker_open(&self) -> bool {
@@ -2097,29 +2155,19 @@ impl OllamaClient {
             }
         };
 
-        let response_text = match &self.provider {
-            LlmProvider::Ollama => body["message"]["content"]
-                .as_str()
-                .ok_or_else(|| {
-                    self.note_failure();
-                    self.provider
-                        .invalid_response("Missing 'message.content' field in chat output")
-                })?
-                .to_string(),
-            LlmProvider::OpenAiCompatible { .. } => body["choices"][0]["message"]["content"]
-                .as_str()
-                .ok_or_else(|| {
-                    self.note_failure();
-                    self.provider.invalid_response(
-                        "Missing 'choices[0].message.content' field in OpenAI-compatible \
-                         chat response",
-                    )
-                })?
-                .to_string(),
-        };
-
-        self.note_success();
-        Ok(response_text)
+        // #8963 — a reply is used only when its stop reason is a normal stop.
+        match &self.provider {
+            LlmProvider::Ollama => self.accept_complete_reply(
+                &body,
+                body["message"]["content"].as_str(),
+                ERR_OLLAMA_NO_CONTENT,
+            ),
+            LlmProvider::OpenAiCompatible { .. } => self.accept_complete_reply(
+                &body,
+                body["choices"][0]["message"]["content"].as_str(),
+                ERR_OPENAI_NO_CONTENT,
+            ),
+        }
     }
 
     /// #1866 (§11.5 B7-FC-1) — tool/function-calling variant of
@@ -2262,32 +2310,18 @@ impl OllamaClient {
         // ignored the tools) → fall back to the prose text path.
         if let Some(calls) = parse_tool_calls(message) {
             self.note_success();
+            // #8963 — a tool call cut at the token limit carries truncated
+            // arguments: only a normal or tool-call stop is dispatched.
+            self.require_complete(&body, true)?;
             return Ok(ChatOutcome::ToolCalls(calls));
         }
 
-        let response_text = match &self.provider {
-            LlmProvider::Ollama => message["content"]
-                .as_str()
-                .ok_or_else(|| {
-                    self.note_failure();
-                    self.provider
-                        .invalid_response("Missing 'message.content' field in chat output")
-                })?
-                .to_string(),
-            LlmProvider::OpenAiCompatible { .. } => message["content"]
-                .as_str()
-                .ok_or_else(|| {
-                    self.note_failure();
-                    self.provider.invalid_response(
-                        "Missing 'choices[0].message.content' field in OpenAI-compatible \
-                         chat response",
-                    )
-                })?
-                .to_string(),
+        let missing_content = match &self.provider {
+            LlmProvider::Ollama => ERR_OLLAMA_NO_CONTENT,
+            LlmProvider::OpenAiCompatible { .. } => ERR_OPENAI_NO_CONTENT,
         };
-
-        self.note_success();
-        Ok(ChatOutcome::Text(response_text))
+        self.accept_complete_reply(&body, message["content"].as_str(), missing_content)
+            .map(ChatOutcome::Text)
     }
 
     /// Uses the LLM to expand a search query into additional search terms.
@@ -2517,29 +2551,19 @@ impl OllamaClient {
             }
         };
 
-        let response_text = match &self.provider {
-            LlmProvider::Ollama => body["message"]["content"]
-                .as_str()
-                .ok_or_else(|| {
-                    self.note_failure();
-                    self.provider
-                        .invalid_response("Missing 'message.content' in chat response")
-                })?
-                .to_string(),
-            LlmProvider::OpenAiCompatible { .. } => body["choices"][0]["message"]["content"]
-                .as_str()
-                .ok_or_else(|| {
-                    self.note_failure();
-                    self.provider.invalid_response(
-                        "Missing 'choices[0].message.content' in OpenAI-compatible \
-                         chat response",
-                    )
-                })?
-                .to_string(),
-        };
-
-        self.note_success();
-        Ok(response_text)
+        // #8963 — same completeness contract as `generate_async`.
+        match &self.provider {
+            LlmProvider::Ollama => self.accept_complete_reply(
+                &body,
+                body["message"]["content"].as_str(),
+                ERR_OLLAMA_NO_CONTENT,
+            ),
+            LlmProvider::OpenAiCompatible { .. } => self.accept_complete_reply(
+                &body,
+                body["choices"][0]["message"]["content"].as_str(),
+                ERR_OPENAI_NO_CONTENT,
+            ),
+        }
     }
 
     /// v0.7.0 L15 — issue a `/api/generate` call with a fully-formed JSON
@@ -2661,17 +2685,13 @@ impl OllamaClient {
             }
         };
 
-        let response_text = parsed["response"]
-            .as_str()
-            .ok_or_else(|| {
-                self.note_failure();
-                self.provider
-                    .invalid_response("Missing 'response' field in generate output")
-            })?
-            .to_string();
-
-        self.note_success();
-        Ok(response_text)
+        // #8963 — `/api/generate` carries the same `done` / `done_reason`
+        // stop fields as `/api/chat` (this path is Ollama-only).
+        self.accept_complete_reply(
+            &parsed,
+            parsed["response"].as_str(),
+            "Missing 'response' field in generate output",
+        )
     }
 
     /// Generate an embedding vector via Ollama's /api/embed endpoint.
@@ -3173,9 +3193,12 @@ impl OllamaClient {
             .replace("{b}", mem_b);
 
         let response = self.generate_async(&prompt, None).await?;
-        let answer = response.trim().to_lowercase();
-
-        Ok(answer.starts_with("yes"))
+        // #8945 — only an unambiguous yes or no is a verdict; anything else
+        // is an error, never a silent `false` ("no contradiction").
+        parse_contradiction_verdict(&response).ok_or_else(|| {
+            self.provider
+                .invalid_response(ERR_CONTRADICTION_UNCLASSIFIABLE)
+        })
     }
 }
 
@@ -3561,7 +3584,7 @@ pub mod test_support {
                     Ok("no".to_string())
                 }
             } else {
-                Ok("Mock response for: ".to_string() + &prompt[..prompt.len().min(50)])
+                Ok("Mock response for: ".to_string() + &prompt[..prompt.floor_char_boundary(50)])
             }
         }
 
@@ -4527,7 +4550,7 @@ mod wiremock_tests {
         Mock::given(method("POST"))
             .and(path("/api/chat"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "message": {"role": "assistant", "content": "hello"},
+                "message": {"role": "assistant", "content": "hello"}, "done_reason": "stop",
                 "done": true,
             })))
             .mount(&server)
@@ -4611,7 +4634,7 @@ mod wiremock_tests {
                 "stream": false,
             })))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "message": {"role": "assistant", "content": "ok"},
+                "message": {"role": "assistant", "content": "ok"}, "done_reason": "stop",
             })))
             .mount(&server)
             .await;
@@ -4787,7 +4810,7 @@ mod wiremock_tests {
             .and(path("/api/chat"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 // Trailing newline + blank line should be filtered out.
-                "message": {"content": "term1\nterm2\nterm3\n\n"},
+                "message": {"content": "term1\nterm2\nterm3\n\n"}, "done_reason": "stop",
             })))
             .mount(&server)
             .await;
@@ -4823,7 +4846,7 @@ mod wiremock_tests {
         Mock::given(method("POST"))
             .and(path("/api/chat"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "message": {"content": "Tag1\nTAG2\ntag3"},
+                "message": {"content": "Tag1\nTAG2\ntag3"}, "done_reason": "stop",
             })))
             .mount(&server)
             .await;
@@ -4851,7 +4874,7 @@ mod wiremock_tests {
         Mock::given(method("POST"))
             .and(path("/api/chat"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "message": {"content": "yes\n"},
+                "message": {"content": "yes\n"}, "done_reason": "stop",
             })))
             .mount(&server)
             .await;
@@ -4872,7 +4895,7 @@ mod wiremock_tests {
         Mock::given(method("POST"))
             .and(path("/api/chat"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "message": {"content": "no"},
+                "message": {"content": "no"}, "done_reason": "stop",
             })))
             .mount(&server_no)
             .await;
@@ -4885,13 +4908,14 @@ mod wiremock_tests {
         .unwrap();
         assert!(!no.unwrap(), "'no' should NOT be detected as contradiction");
 
-        // Garbage input should fall through `starts_with("yes")` → false.
+        // #8945 — an unclassifiable answer is an explicit error, never a
+        // default false.
         let server_garbage = MockServer::start().await;
         mount_tags_ok(&server_garbage, json!({"models": []})).await;
         Mock::given(method("POST"))
             .and(path("/api/chat"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "message": {"content": "definitely-not-yes-or-no"},
+                "message": {"content": "definitely-not-yes-or-no"}, "done_reason": "stop",
             })))
             .mount(&server_garbage)
             .await;
@@ -4902,9 +4926,10 @@ mod wiremock_tests {
         })
         .await
         .unwrap();
-        assert!(
-            !garbage.unwrap(),
-            "garbage answer should default to non-contradiction"
+        assert_eq!(
+            garbage.map_err(|e| e.to_string()),
+            Err(super::ERR_CONTRADICTION_UNCLASSIFIABLE.to_string()),
+            "garbage answer is unclassifiable, not a default false"
         );
     }
 
@@ -4920,7 +4945,7 @@ mod wiremock_tests {
         Mock::given(method("POST"))
             .and(path("/api/chat"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "message": {"content": "yes"},
+                "message": {"content": "yes"}, "done_reason": "stop",
             })))
             .mount(&server)
             .await;
@@ -4951,7 +4976,7 @@ mod wiremock_tests {
         Mock::given(method("POST"))
             .and(path("/api/chat"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "message": {"content": "yes"},
+                "message": {"content": "yes"}, "done_reason": "stop",
             })))
             .mount(&server)
             .await;
@@ -5020,7 +5045,7 @@ mod wiremock_tests {
             .and(path("/api/chat"))
             .and(body_partial_json(json!({"model": "gemma3:4b"})))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "message": {"content": "alpha\nbeta\ngamma"},
+                "message": {"content": "alpha\nbeta\ngamma"}, "done_reason": "stop",
             })))
             .expect(1)
             .mount(&server)
@@ -5056,7 +5081,7 @@ mod wiremock_tests {
         Mock::given(method("POST"))
             .and(path("/api/chat"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "message": {"content": "one\ntwo"},
+                "message": {"content": "one\ntwo"}, "done_reason": "stop",
             })))
             .expect(1)
             .mount(&server)
@@ -5713,7 +5738,7 @@ mod perf9_async_tests {
         Mock::given(method("POST"))
             .and(path("/api/chat"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "message": {"role": "assistant", "content": "hello world"},
+                "message": {"role": "assistant", "content": "hello world"}, "done_reason": "stop",
             })))
             .mount(&server)
             .await;
@@ -5737,7 +5762,7 @@ mod perf9_async_tests {
                 ],
             })))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "message": {"content": "ok"},
+                "message": {"content": "ok"}, "done_reason": "stop",
             })))
             .mount(&server)
             .await;
@@ -5862,7 +5887,7 @@ mod perf9_async_tests {
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "choices": [{"message": {"role": "assistant", "content": "hi from openai"}}]
+                "choices": [{"message": {"role": "assistant", "content": "hi from openai"}, "finish_reason": "stop"}]
             })))
             .mount(&server)
             .await;
@@ -5953,7 +5978,9 @@ mod perf9_async_tests {
                     "tool_calls": [{
                         "function": {"name": "get_weather", "arguments": {"city": "London"}}
                     }]
-                }
+                },
+                "done": true,
+                "done_reason": "stop"
             })))
             .mount(&server)
             .await;
@@ -5981,7 +6008,7 @@ mod perf9_async_tests {
         Mock::given(method("POST"))
             .and(path("/api/chat"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "message": {"role": "assistant", "content": "{\"atoms\":[{\"text\":\"a\"}]}"}
+                "message": {"role": "assistant", "content": "{\"atoms\":[{\"text\":\"a\"}]}"}, "done_reason": "stop"
             })))
             .mount(&server)
             .await;
@@ -6009,7 +6036,9 @@ mod perf9_async_tests {
                     "role": "assistant",
                     "content": "fallback text",
                     "tool_calls": [{"function": {}}]
-                }
+                },
+                "done": true,
+                "done_reason": "stop"
             })))
             .mount(&server)
             .await;
@@ -6038,7 +6067,7 @@ mod perf9_async_tests {
                     "tool_calls": [{
                         "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"}
                     }]
-                }}]
+                }, "finish_reason": "tool_calls"}]
             })))
             .mount(&server)
             .await;
@@ -6065,7 +6094,7 @@ mod perf9_async_tests {
             .and(path("/api/chat"))
             .and(body_partial_json(json!({"stream": false})))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "message": {"role": "assistant", "content": "plain reply"}
+                "message": {"role": "assistant", "content": "plain reply"}, "done_reason": "stop"
             })))
             .mount(&server)
             .await;
@@ -6347,7 +6376,7 @@ mod perf9_async_tests {
         Mock::given(method("POST"))
             .and(path("/api/chat"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "message": {"content": "one\ntwo\n\nthree"},
+                "message": {"content": "one\ntwo\n\nthree"}, "done_reason": "stop",
             })))
             .mount(&server)
             .await;
@@ -6368,7 +6397,7 @@ mod perf9_async_tests {
         Mock::given(method("POST"))
             .and(path("/api/chat"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "message": {"content": "summarized"},
+                "message": {"content": "summarized"}, "done_reason": "stop",
             })))
             .mount(&server)
             .await;
@@ -6393,7 +6422,7 @@ mod perf9_async_tests {
         Mock::given(method("POST"))
             .and(path("/api/chat"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "message": {"content": "A\nB\nC\nD\nE\nF\nG\nH\nI\nJ"},
+                "message": {"content": "A\nB\nC\nD\nE\nF\nG\nH\nI\nJ"}, "done_reason": "stop",
             })))
             .mount(&server)
             .await;
@@ -6418,7 +6447,7 @@ mod perf9_async_tests {
             .and(path("/api/chat"))
             .and(body_partial_json(json!({"model": "fast-model"})))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "message": {"content": "a\nb\nc"},
+                "message": {"content": "a\nb\nc"}, "done_reason": "stop",
             })))
             .expect(1)
             .mount(&server)
@@ -6443,7 +6472,7 @@ mod perf9_async_tests {
         Mock::given(method("POST"))
             .and(path("/api/chat"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "message": {"content": "Yes."},
+                "message": {"content": "Yes."}, "done_reason": "stop",
             })))
             .mount(&server)
             .await;
@@ -6460,7 +6489,7 @@ mod perf9_async_tests {
         Mock::given(method("POST"))
             .and(path("/api/chat"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "message": {"content": "no, they don't"},
+                "message": {"content": "no, they don't"}, "done_reason": "stop",
             })))
             .mount(&server)
             .await;
@@ -6525,7 +6554,7 @@ mod perf9_async_tests {
         Mock::given(method("POST"))
             .and(path("/api/chat"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "message": {"content": "bridge ok"},
+                "message": {"content": "bridge ok"}, "done_reason": "stop",
             })))
             .mount(&server)
             .await;
@@ -6646,7 +6675,7 @@ mod perf9_async_tests {
         Mock::given(method("POST"))
             .and(path("/api/chat"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "message": {"content": "a\nb"},
+                "message": {"content": "a\nb"}, "done_reason": "stop",
             })))
             .mount(&server)
             .await;
@@ -6664,7 +6693,7 @@ mod perf9_async_tests {
         Mock::given(method("POST"))
             .and(path("/api/chat"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "message": {"content": "compacted"},
+                "message": {"content": "compacted"}, "done_reason": "stop",
             })))
             .mount(&server)
             .await;
@@ -6684,7 +6713,7 @@ mod perf9_async_tests {
         Mock::given(method("POST"))
             .and(path("/api/chat"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "message": {"content": "x\ny\nz"},
+                "message": {"content": "x\ny\nz"}, "done_reason": "stop",
             })))
             .mount(&server)
             .await;
@@ -6705,7 +6734,7 @@ mod perf9_async_tests {
         Mock::given(method("POST"))
             .and(path("/api/chat"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "message": {"content": "yes"},
+                "message": {"content": "yes"}, "done_reason": "stop",
             })))
             .mount(&server)
             .await;
@@ -6757,6 +6786,8 @@ mod perf9_async_tests {
             .and(path("/api/generate"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "response": "legacy text",
+                "done": true,
+                "done_reason": "stop",
             })))
             .mount(&server)
             .await;
@@ -6910,7 +6941,7 @@ mod perf9_async_tests {
             Mock::given(method("POST"))
                 .and(path("/api/chat"))
                 .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                    "message": {"content": "no-rt bridge ok"},
+                    "message": {"content": "no-rt bridge ok"}, "done_reason": "stop",
                 })))
                 .mount(&s)
                 .await;

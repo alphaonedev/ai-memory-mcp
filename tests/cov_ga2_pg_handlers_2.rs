@@ -737,36 +737,36 @@ pg_test!(pg_consolidate_pg_arm_with_summary, url, {
     assert!(body["id"].is_string());
 });
 
-pg_test!(
-    pg_consolidate_pg_arm_no_summary_deterministic_fallback,
-    url,
-    {
-        let r = pg_router(&url).await;
-        let ns = uniq_ns();
-        let id1 = seed_memory(&r, &ns, "no-summary src 1", "alpha body").await;
-        let id2 = seed_memory(&r, &ns, "no-summary src 2", "beta body").await;
-        // No summary + no LLM wired → resolve_consolidate_summary takes the
-        // deterministic title-concat fallback (fetch_consolidate_source_pairs
-        // postgres arm runs to gather the source titles).
-        let (status, body) = post_json(
-            &r,
-            "/api/v1/consolidate",
-            json!({
-                "ids": [id1, id2],
-                "title": "cov-ga2 fallback consolidated",
-                "namespace": ns,
-                "agent_id": CALLER,
-            }),
-        )
-        .await;
-        assert_eq!(status, StatusCode::CREATED, "body={body}");
-        assert_eq!(body["storage_backend"], "postgres");
-        assert!(
-            body["summary"].as_str().is_some_and(|s| !s.is_empty()),
-            "deterministic fallback summary present; body={body}"
-        );
+pg_test!(pg_consolidate_pg_arm_no_summary_is_refused_9018, url, {
+    let r = pg_router(&url).await;
+    let ns = uniq_ns();
+    let id1 = seed_memory(&r, &ns, "no-summary src 1", "alpha body").await;
+    let id2 = seed_memory(&r, &ns, "no-summary src 2", "beta body").await;
+    // No summary + no LLM wired: #9018 removed the title-concat
+    // placeholder, so after the fetch_consolidate_source_pairs postgres
+    // arm runs, resolve_consolidate_summary refuses with the exact error
+    // and both sources survive.
+    let (status, body) = post_json(
+        &r,
+        "/api/v1/consolidate",
+        json!({
+            "ids": [id1, id2],
+            "title": "cov-ga2 fallback consolidated",
+            "namespace": ns,
+            "agent_id": CALLER,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body={body}");
+    assert_eq!(
+        body,
+        json!({"error": ai_memory::errors::msg::CONSOLIDATE_SUMMARY_REQUIRED})
+    );
+    for id in [&id1, &id2] {
+        let (status, body) = get(&r, &format!("/api/v1/memories/{id}")).await;
+        assert_eq!(status, StatusCode::OK, "source {id} kept; body={body}");
     }
-);
+});
 
 pg_test!(pg_consolidate_unknown_source_id_is_404, url, {
     let r = pg_router(&url).await;

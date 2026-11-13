@@ -209,7 +209,7 @@ impl McpTool for StoreTool {
         "Store a memory; deduplicates by title+namespace."
     }
     fn docs() -> &'static str {
-        "Store a memory. Dedupes by (title, namespace). Tier defaults to mid (7d TTL); long is permanent. on_conflict: error|merge|version. scope: Task 1.5 visibility. force (#519): bypass proactive contradiction detection on near-duplicate writes."
+        "Store a memory. Dedupes by (title, namespace). Tier defaults to mid (7d TTL); long is permanent. on_conflict: error|merge|version. scope: Task 1.5 visibility. force (#519): bypass proactive contradiction detection on near-duplicate writes. Response-only hook keys: autonomy_hook_skipped (scalar eligibility skip) and autonomy_hook_degraded (#9213: [{hook, candidate_id?, reason}] when an LLM hook failed; absent when clean)."
     }
     fn input_schema() -> Value {
         crate::mcp::registry::input_schema_for::<StoreRequest>()
@@ -1224,8 +1224,8 @@ fn handle_store_inner(
     // config.toml AND an LLM is wired AND the content is long enough
     // to be meaningfully taggable, fire `auto_tag` + `detect_contradiction`
     // synchronously and persist the results into the memory's metadata.
-    // Best-effort: any LLM error is logged and does not fail the store.
-    // Skipped for internal/system namespaces to avoid feedback loops.
+    // Best-effort: an LLM error does not fail the store; it is reported as
+    // `autonomy_hook_degraded` on the response (#9213). Skipped for internal/system namespaces to avoid feedback loops.
     //
     // #881 — extracted to `super::legacy_classifier`.
     let hooks_skipped_reason = legacy_classifier::autonomy_skip_reason(
@@ -1237,13 +1237,22 @@ fn handle_store_inner(
     let autonomy_outcome = if hooks_skipped_reason.is_none()
         && let Some(llm_client) = llm
     {
+        // #9213 Z-6 — the same ENFORCED-read caller as #3712 above: a
+        // degraded contradiction entry names only a candidate it can read.
         legacy_classifier::maybe_run_autonomy_hooks(
-            conn, llm_client, &mem, &actual_id, &existing, &ns_policy,
+            conn,
+            llm_client,
+            &mem,
+            &actual_id,
+            &existing,
+            &ns_policy,
+            crate::identity::resolve_read_visibility_caller().as_deref(),
         )
     } else {
         legacy_classifier::AutonomyHookOutcome {
             auto_tags: Vec::new(),
             confirmed_contradictions: Vec::new(),
+            degraded: Vec::new(),
         }
     };
 

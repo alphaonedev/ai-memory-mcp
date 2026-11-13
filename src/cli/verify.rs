@@ -560,6 +560,9 @@ fn verify_edge(
 // Text renderer
 // ─────────────────────────────────────────────────────────────────────
 
+/// Byte budget of the id prefix printed per edge by [`render_text`].
+const EDGE_ID_PREFIX_BYTES: usize = 8;
+
 pub(super) fn render_text(report: &ChainReport, out: &mut CliOutput<'_>) -> Result<()> {
     writeln!(
         out.stdout,
@@ -586,8 +589,10 @@ pub(super) fn render_text(report: &ChainReport, out: &mut CliOutput<'_>) -> Resu
         writeln!(out.stdout, "\nedges:")?;
         for e in &report.edges {
             let status = if e.verified { "OK" } else { "FAIL" };
-            let src_short = &e.source_id[..e.source_id.len().min(8)];
-            let tgt_short = &e.target_id[..e.target_id.len().min(8)];
+            // OWNERSHIP-15: ids admit any non-control char, so the cut is
+            // moved down to a char boundary instead of slicing mid-char.
+            let src_short = &e.source_id[..e.source_id.floor_char_boundary(EDGE_ID_PREFIX_BYTES)];
+            let tgt_short = &e.target_id[..e.target_id.floor_char_boundary(EDGE_ID_PREFIX_BYTES)];
             write!(
                 out.stdout,
                 "  [{status}] {src_short} -> {tgt_short}  attest={}",
@@ -1141,6 +1146,43 @@ mod tests {
         assert!(s.contains("signed_events"), "signed_events footer: {s}");
         assert!(s.contains("ev-1"), "event id missing: {s}");
         assert!(s.contains("sig=yes"), "signature flag: {s}");
+    }
+
+    /// #9018 sibling (char-boundary class) — a multi-byte id whose byte 8
+    /// falls inside a char must render a whole-char prefix, never panic.
+    #[test]
+    fn render_text_multibyte_edge_id_does_not_panic() {
+        let multibyte_id = format!("a{}", "\u{e9}".repeat(8));
+        let report = ChainReport {
+            ok: true,
+            root_id: multibyte_id.clone(),
+            n_memories: 2,
+            chain_depth: 1,
+            edges_verified: 1,
+            edges_failed: 0,
+            edges: vec![EdgeResult {
+                source_id: multibyte_id.clone(),
+                target_id: multibyte_id,
+                signature_hex: None,
+                attest_level: "unsigned".to_string(),
+                verified: true,
+                failure_reason: None,
+            }],
+            max_reflection_depth_per_namespace: std::collections::HashMap::new(),
+            bounded_status: "within_cap".to_string(),
+            signed_events: vec![],
+            generated_at: "2026-11-11T00:00:00Z".to_string(),
+        };
+        let mut stdout = Vec::<u8>::new();
+        let mut stderr = Vec::<u8>::new();
+        let mut out = crate::cli::CliOutput::from_std(&mut stdout, &mut stderr);
+        render_text(&report, &mut out).expect("render");
+        let s = String::from_utf8(stdout).expect("utf8");
+        let prefix = format!("a{}", "\u{e9}".repeat(3));
+        assert!(
+            s.contains(&format!("{prefix} -> {prefix}")),
+            "whole-char prefix: {s}"
+        );
     }
 
     #[test]
