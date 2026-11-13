@@ -357,9 +357,7 @@ def _same_path(candidate: object, target: Path) -> bool:
 
 
 @contextlib.contextmanager
-def _swap_on_first_touch(
-    target: Path, swap: Callable[[], None], *, open_timing: str = "before"
-):
+def _swap_on_first_touch(target: Path, swap: Callable[[], None], *, open_timing: str = "before"):
     """Run `swap` at the last instant before the loader fetches the bytes.
 
     This is the TOCTOU window, made deterministic rather than raced for. The
@@ -481,9 +479,7 @@ def test_a_fifo_swapped_in_after_the_check_does_not_park_the_loader(
         nonlocal writer
         path.unlink()
         os.mkfifo(path, 0o600)
-        writer = subprocess.Popen(
-            [sys.executable, "-c", writer_src, str(path), json.dumps(theirs)]
-        )
+        writer = subprocess.Popen([sys.executable, "-c", writer_src, str(path), json.dumps(theirs)])
 
     loaded: str | None = None
     refusal = ""
@@ -676,9 +672,7 @@ def test_a_ping_is_answered_in_place_and_costs_no_inbox_read() -> None:
 def test_an_unknown_frame_kind_is_ignored_rather_than_ending_the_session() -> None:
     signals = []
     depart = Frame(Kind.DEPART, "hub", AGENT_ID, b"").encode()
-    transport = MockTransport(
-        [challenge_frame(), welcome_frame(), depart, wake_frame("row-x", 1)]
-    )
+    transport = MockTransport([challenge_frame(), welcome_frame(), depart, wake_frame("row-x", 1)])
     with pytest.raises(WakeError):
         listener(signals.append).pump(transport)
     assert [s.reason for s in signals] == [WakeReason.WELCOME, WakeReason.WAKE]

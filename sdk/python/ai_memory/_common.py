@@ -14,13 +14,23 @@ an ``await`` lives here. In particular:
 
 from __future__ import annotations
 
+import inspect
+import ipaddress
 import json
-from typing import TYPE_CHECKING, Any
+import os
+import re
+import ssl
+import stat
+import sys
+import time
+from types import TracebackType
+from typing import TYPE_CHECKING, Any, Union
 from urllib.parse import quote
 
 import httpx
 from pydantic import BaseModel
 
+from ai_memory import _acl
 from ai_memory._version import __version__ as _SDK_VERSION
 from ai_memory.errors import TransportError, raise_for_status
 from ai_memory.models import CreateMemory
@@ -51,6 +61,7 @@ def export_ceiling_from_error(exc: Exception) -> int | None:
     ceiling = payload.get("max")
     return ceiling if isinstance(ceiling, int) and ceiling > 0 else None
 
+
 #: The daemon's own default `memory_kind` when the field is absent. Kept here
 #: because a SIGNED write must sign the kind the server will actually store —
 #: leaving `kind` unset while signing a different value silently 403s.
@@ -74,28 +85,1380 @@ def encode_path_segment(value: str) -> str:
     return quote(value, safe="")
 
 
+_UNVERIFIED_MESSAGE = (
+    "verify=False is refused: it would turn the daemon's TLS listener "
+    "into an unauthenticated one (an encrypted pipe to whoever answers). "
+    "This covers any falsy or blank verify value and an SSL context that "
+    "does not verify certificates or is not provably the stock one. "
+    "Accepted verify= forms: None (the SDK default trust: a context it builds over certifi, or SSL_CERT_FILE / SSL_CERT_DIR, with the TLS 1.2 floor), True, the path of a "
+    "CA bundle file or CA directory (str or os.PathLike), or exactly an "
+    "ssl.SSLContext (not a subclass, such as truststore.SSLContext) that is "
+    "CERT_REQUIRED with check_hostname on, has no verify_flags that relax "
+    "chain validation, offers no cipher suite without server authentication "
+    "(remove them with set_ciphers('<your list>:!aNULL:!eNULL')), "
+    "allows no TLS version below 1.2 (minimum_version TLSv1_2 or higher) "
+    "and has no patched wrap_socket or "
+    "wrap_bio. Build one with ssl.create_default_context(cafile=<CA path>) "
+    "or pass verify=<CA path>, e.g. <key_dir>/tls/local-ca.pem for a "
+    "zero-config daemon (#3840, #6267, #6268)."
+)
+
+#: ``ssl.SSLContext`` attributes that decide what a handshake verifies,
+#: captured at import. A context is admitted only while every one of them is
+#: still the stock object, so a later class-level patch is caught too (#6268).
+_HANDSHAKE_ATTRIBUTES = (
+    "minimum_version",
+    "maximum_version",
+    "wrap_socket",
+    "wrap_bio",
+    "verify_mode",
+    "check_hostname",
+    "sslsocket_class",
+    "sslobject_class",
+    "verify_flags",
+    "hostname_checks_common_name",
+    "get_ciphers",
+)
+_STOCK_HANDSHAKE = {name: ssl.SSLContext.__dict__.get(name) for name in _HANDSHAKE_ATTRIBUTES}
+
+#: OpenSSL ``X509_V_FLAG_*`` bits a caller context may carry (#6375): each
+#: one leaves chain validation at least as strict as the default. Every other
+#: bit is refused, among them USE_CHECK_TIME (0x2), IGNORE_CRITICAL (0x10),
+#: ALLOW_PROXY_CERTS (0x40), NO_CHECK_TIME (0x200000) and any bit OpenSSL adds
+#: later. PARTIAL_CHAIN is admitted: Python 3.13+ ``create_default_context``
+#: sets it, and it only lets a CA the caller loaded as trusted anchor a chain.
+_ALLOWED_VERIFY_FLAGS = (
+    0x4  # CRL_CHECK (VERIFY_CRL_CHECK_LEAF)
+    | 0x8  # CRL_CHECK_ALL (with CRL_CHECK: VERIFY_CRL_CHECK_CHAIN)
+    | 0x20  # X509_STRICT
+    | 0x80  # POLICY_CHECK
+    | 0x100  # EXPLICIT_POLICY
+    | 0x200  # INHIBIT_ANY
+    | 0x400  # INHIBIT_MAP
+    | 0x1000  # EXTENDED_CRL_SUPPORT
+    | 0x2000  # USE_DELTAS
+    | 0x4000  # CHECK_SS_SIGNATURE
+    | 0x8000  # TRUSTED_FIRST
+    | 0x30000  # SUITEB_128_LOS_ONLY | SUITEB_192_LOS
+    | 0x80000  # PARTIAL_CHAIN
+    | 0x100000  # NO_ALT_CHAINS
+)
+
+
+#: The lowest TLS protocol version the SDK accepts: the context it builds
+#: sets it as ``minimum_version``, and a caller context whose range reaches
+#: below it, or ends below it, is refused (#8195, security r1 F4).
+MINIMUM_TLS_VERSION = ssl.TLSVersion.TLSv1_2
+
+
+#: The genuine ``getset_descriptor`` type, taken from a builtin no Python code can patch. A type NAME is
+#: forgeable (a plain class can be called ``getset_descriptor``), the identity of this type is not
+#: (sec r6 S1).
+_GETSET = type(type.__dict__["__dict__"])
+
+
+def _resolve_c_bound(classes: "tuple[type, ...]", name: str) -> "Any | None":
+    """The C-level ``getset_descriptor`` for ``name`` found on the MRO of ``classes``, or ``None``.
+
+    The base that holds it is found by walking the class chain itself, never through a module
+    lookup: the ``_ssl`` module binding is substitutable before this module is imported, the MRO of
+    the class the SDK constructs is not (sec r5 S1). The descriptor must be a ``getset_descriptor``
+    whose ``__objclass__`` sits on every given MRO, and every class must resolve to the same object.
+    """
+    found: "list[Any]" = []
+    for cls in classes:
+        match = None
+        for base in cls.__mro__:
+            candidate = base.__dict__.get(name)
+            if type(candidate) is _GETSET:
+                match = candidate
+                break
+        if match is None:
+            return None
+        found.append(match)
+    first = found[0]
+    if any(item is not first for item in found):
+        return None
+    if any(getattr(first, "__objclass__", None) not in cls.__mro__ for cls in classes):
+        return None
+    return first
+
+
+_C_CLASSES = (ssl.SSLContext, type(ssl.create_default_context()))
+#: The C-level bound descriptors, or ``None`` when the real class does not carry them; a ``None``
+#: makes :func:`_tls_range_is_modern` refuse every context (typed, at construction, fail closed).
+_C_MIN_VERSION = _resolve_c_bound(_C_CLASSES, "minimum_version")
+_C_MAX_VERSION = _resolve_c_bound(_C_CLASSES, "maximum_version")
+_C_VERIFY_MODE = _resolve_c_bound(_C_CLASSES, "verify_mode")
+_C_CHECK_HOSTNAME = _resolve_c_bound(_C_CLASSES, "check_hostname")
+_C_VERIFY_FLAGS = _resolve_c_bound(_C_CLASSES, "verify_flags")
+
+
+def _capture_sslobj_type() -> "Any | None":
+    """The C ``_ssl._SSLSocket`` type behind every ``SSLSocket`` and ``SSLObject``, or ``None``.
+
+    Built from a throwaway in-memory wrap through the C base class that holds the already identity-checked
+    bound descriptors, never through the ``_ssl`` module table or ``wrap_bio``; the C method refuses
+    anything but real ``MemoryBIO`` objects, so what it returns is the C type or nothing (sec r6 S1-wire).
+    """
+    if _C_MIN_VERSION is None:
+        return None
+    base = getattr(_C_MIN_VERSION, "__objclass__", None)
+    wrap = None if base is None else base.__dict__.get("_wrap_bio")
+    if wrap is None:
+        return None
+    try:
+        probe = wrap(
+            ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT), ssl.MemoryBIO(), ssl.MemoryBIO(), False, None
+        )
+    except (TypeError, ValueError, ssl.SSLError):
+        return None
+    return type(probe)
+
+
+_C_SSLOBJ = _capture_sslobj_type()
+
+
+def _c_sslobj(session: object) -> "Any | None":
+    """The C ``_SSLSocket`` object of ``session``, or ``None`` when it is not one (sec r6 S1-wire).
+
+    ``object.__getattribute__`` skips a ``__getattribute__`` override on the socket subclass; the
+    value must be an instance of the C type itself, so a Python stand-in is refused. A property that
+    hands back a different genuine C session is not reachable by a lie: it can only name a real session.
+    """
+    if type(session) is _C_SSLOBJ:
+        return session  # httpcore's sync stream hands over the C object itself
+    try:
+        raw = object.__getattribute__(session, "_sslobj")
+    except AttributeError:
+        return None
+    return raw if type(raw) is _C_SSLOBJ else None
+
+
+class _SessionFacts:
+    """What the C ``_SSLSocket`` reports about one handshake, read with its own method descriptors.
+
+    Python-level ``SSLSocket`` and ``SSLObject`` methods are replaceable by a class set before import
+    (``sslsocket_class``, ``sslobject_class``); the C descriptors are not (sec r6 S1-wire).
+    """
+
+    __slots__ = ("context", "negotiated", "peer", "version")
+
+    def __init__(self, raw: Any) -> None:
+        kind: Any = _C_SSLOBJ
+        self.context = kind.context.__get__(raw)
+        self.peer = kind.getpeercert(raw, False)
+        self.negotiated = kind.cipher(raw)
+        self.version = kind.version(raw)
+
+
+def _session_facts(session: object) -> "_SessionFacts | None":
+    """The C-level facts of ``session``, or ``None`` when it has no readable C session."""
+    raw = _c_sslobj(session)
+    if raw is None:
+        return None
+    try:
+        return _SessionFacts(raw)
+    except (TypeError, ValueError, ssl.SSLError):
+        return None
+
+
+def _c_reads_agree(context: ssl.SSLContext, python_value: object, descriptor: "Any | None") -> bool:
+    """Whether the C-level read of ``descriptor`` equals ``python_value`` (sec r5 S1, code r5 F2).
+
+    ``_STOCK_HANDSHAKE`` counts whatever was bound on ``ssl.SSLContext`` when this module was
+    imported as stock, so a property replaced before the import passes that identity check. The
+    ``getset_descriptor`` read reaches the real C state; a Python-level read that disagrees, or
+    that is not an integer, a ``bool`` or an enum member, is refused. An unresolved descriptor
+    refuses.
+    """
+    if descriptor is None:
+        return False
+    try:
+        return int(python_value) == int(descriptor.__get__(context))  # type: ignore[call-overload]
+    except (TypeError, ValueError):
+        return False
+
+
+#: Accepted ``get_ciphers()`` ``strength_bits`` floor: export and low-grade
+#: suites report fewer bits and are refused (#6305).
+_MINIMUM_SUITE_STRENGTH_BITS = 112
+
+
+def _tls_range_is_modern(context: ssl.SSLContext) -> bool:
+    """Whether ``context`` can negotiate only TLS 1.2 or newer (#8195).
+
+    Reads both bounds through the base-class descriptors. A concrete floor must
+    be ``TLSv1_2`` or higher, and a concrete ceiling too. ``MINIMUM_SUPPORTED``
+    and ``MAXIMUM_SUPPORTED`` mean "the library default": distro Pythons report
+    ``MINIMUM_SUPPORTED`` on a stock ``create_default_context()``, so refusing it
+    would refuse the documented form. What the library default can negotiate on
+    the wire is held to TLS 1.2 by :func:`_assert_negotiated_session`. Anything
+    that is not a ``TLSVersion`` is refused. Both bounds are also read through the C-level
+    ``getset_descriptor`` objects, which are immutable, and must equal the Python-level reads:
+    a descriptor patched before this module was imported counts as stock in ``_STOCK_HANDSHAKE``,
+    so this comparison is what exposes a bound that lies (sec r4 N2). The descriptors are resolved
+    from the real ``SSLContext`` MRO (:func:`_resolve_c_bound`), not from the ``_ssl`` module
+    table, which can be substituted before import (sec r5 S1); if they did not resolve, every
+    context is refused.
+    """
+    if _C_MIN_VERSION is None or _C_MAX_VERSION is None:
+        return False
+    low = ssl.SSLContext.minimum_version.__get__(context)  # type: ignore[attr-defined]
+    high = ssl.SSLContext.maximum_version.__get__(context)  # type: ignore[attr-defined]
+    if not isinstance(low, ssl.TLSVersion) or not isinstance(high, ssl.TLSVersion):
+        return False
+    if low != int(_C_MIN_VERSION.__get__(context)) or high != int(_C_MAX_VERSION.__get__(context)):
+        return False
+    if low != ssl.TLSVersion.MINIMUM_SUPPORTED and low < MINIMUM_TLS_VERSION:
+        return False
+    return high == ssl.TLSVersion.MAXIMUM_SUPPORTED or high >= MINIMUM_TLS_VERSION
+
+
+def _context_verifies(context: object) -> bool:
+    """Whether ``context`` is the stock ``ssl.SSLContext`` and verifies.
+
+    Admitted only when ALL hold (5-agent vote 4d3ea1c5, form B):
+
+    * ``type(context) is ssl.SSLContext``: a subclass, including
+      ``truststore.SSLContext``, keeps its real state on an inner object, so
+      the outer object reporting ``CERT_REQUIRED`` proves nothing (#6267);
+    * ``verify_mode``/``check_hostname`` read through the base-class
+      descriptors are ``CERT_REQUIRED`` and on (#6248), and so do the C-level
+      ``getset_descriptor`` reads of all three of ``verify_mode``,
+      ``check_hostname`` and ``verify_flags`` (code r5 F2);
+    * the instance dict shadows no ``ssl.SSLContext`` attribute, so no
+      ``context.wrap_socket = ...`` style patch reroutes the handshake (#6268);
+    * the handshake-deciding class attributes are still the objects captured
+      at import (#6268);
+    * ``verify_flags`` (base descriptor) carries only bits in
+      :data:`_ALLOWED_VERIFY_FLAGS` (#6375);
+    * its protocol range is TLS 1.2 or newer (:func:`_tls_range_is_modern`);
+    * it offers no anonymous (aNULL), NULL-encryption (eNULL) or low-strength
+      cipher suite (:func:`_suites_authenticate_server`, #6305).
+    """
+    if type(context) is not ssl.SSLContext:
+        return False
+    if any(hasattr(ssl.SSLContext, key) for key in vars(context)):
+        return False
+    if any(
+        ssl.SSLContext.__dict__.get(name) is not stock for name, stock in _STOCK_HANDSHAKE.items()
+    ):
+        return False
+    py_flags = ssl.SSLContext.verify_flags.__get__(context)  # type: ignore[attr-defined]
+    py_mode = ssl.SSLContext.verify_mode.__get__(context)  # type: ignore[attr-defined]
+    py_host = ssl.SSLContext.check_hostname.__get__(context)  # type: ignore[attr-defined]
+    if not (
+        _c_reads_agree(context, py_flags, _C_VERIFY_FLAGS)
+        and _c_reads_agree(context, py_mode, _C_VERIFY_MODE)
+        and _c_reads_agree(context, py_host, _C_CHECK_HOSTNAME)
+    ):
+        return False
+    if int(py_flags) & ~_ALLOWED_VERIFY_FLAGS:
+        return False
+    if not _tls_range_is_modern(context):
+        return False
+    if not _suites_authenticate_server(context):
+        return False
+    return bool(py_mode == ssl.CERT_REQUIRED and py_host)
+
+
+#: ``get_ciphers()`` ``auth`` values of suites that authenticate no server
+#: certificate: anonymous (aNULL, #6305). TLS 1.3 suites report ``auth-any``;
+#: their authentication is the certificate exchange. PSK and SRP suites are
+#: not listed: they cannot complete a handshake without a key or password
+#: callback, which Python exposes only from 3.13 and this SDK never installs,
+#: and distro OpenSSL builds list them in the DEFAULT set, so refusing them
+#: would refuse ``ssl.create_default_context()`` (code r1 F1).
+_UNAUTHENTICATED_SUITE_AUTH = frozenset({"auth-null"})
+
+
+def _suites_authenticate_server(context: ssl.SSLContext) -> bool:
+    """Whether ``context`` offers no anonymous, NULL-encryption or low-strength suite (#6305).
+
+    An entry without an ``auth`` value, with an anonymous one (aNULL), with no
+    ``symmetric`` cipher (eNULL) or with fewer than
+    :data:`_MINIMUM_SUITE_STRENGTH_BITS` strength bits (export and low-grade
+    classes) refuses the whole context, and so does an empty list.
+    """
+    suites = ssl.SSLContext.get_ciphers(context)
+    if not suites:
+        return False
+    for suite in suites:
+        if not isinstance(suite, dict):
+            return False
+        auth = suite.get("auth")
+        if not isinstance(auth, str) or auth in _UNAUTHENTICATED_SUITE_AUTH:
+            return False
+        if not isinstance(suite.get("symmetric"), str):
+            return False
+        strength = suite.get("strength_bits")
+        if (
+            not isinstance(strength, int)
+            or isinstance(strength, bool)
+            or strength < _MINIMUM_SUITE_STRENGTH_BITS
+        ):
+            return False
+    return True
+
+
+#: OpenSSL ``capath`` entry names: ``<subject hash>.<n>`` for a certificate,
+#: ``<subject hash>.r<n>`` for a CRL. Only these are trust input in a hashed
+#: CA directory, exactly as OpenSSL's own directory lookup reads it (#6377).
+_HASHED_CA_ENTRY = re.compile(r"[0-9a-f]{8}\.r?[0-9]+")
+
+#: Write bits that let someone other than the owner change trust input.
+_SHARED_WRITE_BITS = stat.S_IWGRP | stat.S_IWOTH
+
+
+def _shared_writable(mode: int) -> bool:
+    """Whether ``mode`` lets the group or others write (POSIX only, #6377)."""
+    return os.name != "nt" and bool(mode & _SHARED_WRITE_BITS)
+
+
+def _refuse_shared_writable(what: str, path: str, mode: int) -> None:
+    """Raise when a trust input ``path`` is group- or world-writable (#6377)."""
+    if _shared_writable(mode):
+        raise ValueError(
+            f"verify= {what} {path!r} is group- or world-writable (mode "
+            f"{stat.S_IMODE(mode):o}): anyone with that write access could change "
+            "which servers this client trusts. Remove the write bits "
+            "(chmod go-w) or pass a CA path only its owner can change (#6377)."
+        )
+
+
+def _refuse_foreign_owner(what: str, path: str, info: os.stat_result) -> None:
+    """Refuse a CA file or directory owned by anyone but this user or root (#6815).
+
+    Its owner can rewrite it whatever its mode, exactly as the owner of a
+    directory on the way can replace what is under it (3-agent vote
+    (6def5ab6), StrictModes). POSIX only.
+    """
+    if os.name == "nt" or info.st_uid in (0, os.geteuid()):
+        return
+    raise ValueError(
+        f"verify= {what} {path!r} is owned by uid {info.st_uid}: that user could "
+        "rewrite it and change which servers this client trusts. Give it to this "
+        "user or root (chown), or copy it to a file you own (#6815)."
+    )
+
+
+def _refuse_foreign_acl(what: str, path: str, fd: int) -> None:
+    """Refuse the open object ``fd`` when an extended ACL lets someone else change it (#6934).
+
+    The mode-bit rules above cannot see a macOS ACL entry such as ``everyone
+    allow add_file,delete_child``, which lets another account replace what is
+    under a ``0755`` directory or rewrite a ``0644`` file. Allow entries that
+    grant a change right (:data:`ai_memory._acl.CHANGE_RIGHTS`) to anyone but
+    this user or root are refused; an ACL that cannot be read is refused too
+    (fail closed). A no-op where the platform has no extended ACL.
+    """
+    if not _acl.reads_acls():
+        return
+    try:
+        granted = _acl.foreign_acl_rights(fd, _acl.CHANGE_RIGHTS)
+    except _acl.AclUnreadable as exc:
+        raise ValueError(
+            f"verify= {what} {path!r} carries an extended ACL that cannot be read ({exc}); "
+            "it is refused because an ACL entry could let another user change which "
+            "servers this client trusts (#6934)."
+        ) from None
+    if granted:
+        raise ValueError(
+            f"verify= {what} {path!r} carries an extended ACL granting "
+            f"{_acl.describe(granted)} to a principal other than this user or root: "
+            "that principal could change which servers this client trusts. Remove the "
+            f"entry (chmod -N {path}) or pass a CA path only its owner can change (#6934)."
+        )
+
+
+def _refuse_foreign_acl_on_directory(
+    what: str, path: str, directory: str, held: os.stat_result
+) -> None:
+    """:func:`_refuse_foreign_acl` for ``directory``, opened and bound to ``held`` (#6934).
+
+    The directory is opened once, without following a link, and must be the
+    inode ``held`` (its ``stat``) describes, so the ACL read is the ACL of the
+    directory the mode rules just judged. A directory that cannot be opened
+    cannot have its ACL read and is refused (fail closed).
+    """
+    if not _acl.reads_acls():
+        return
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = os.open(directory, flags)
+    except OSError as exc:
+        raise ValueError(
+            f"verify= {what} {path!r}: the directory {directory!r} cannot be opened to read "
+            f"its ACL ({exc.strerror}); it is refused (#6934)."
+        ) from None
+    try:
+        opened = os.fstat(fd)
+        if (opened.st_dev, opened.st_ino) != (held.st_dev, held.st_ino):
+            raise ValueError(
+                f"verify= {what} {path!r}: the directory {directory!r} changed while "
+                "its ACL was being read (#6934)."
+            )
+        _refuse_foreign_acl(what, directory, fd)
+    except OSError as exc:
+        raise ValueError(
+            f"verify= {what} {path!r}: the directory {directory!r} cannot be checked "
+            f"({exc.strerror}) (#6934)."
+        ) from None
+    finally:
+        os.close(fd)
+
+
+#: Path separators a CA path may end with; a trailing one names a directory.
+_PATH_SEPARATORS = tuple(sep for sep in (os.sep, os.altsep) if sep)
+
+
+def _refuse_untrusted_holder(
+    path: str, directory: str, entry: str, info: os.stat_result | None
+) -> None:
+    """Refuse ``directory`` when anyone but this user or root can change ``entry`` in it.
+
+    The #6377 rule for a CA file's directory, applied to every directory the
+    CA path passes through (3-agent vote (6def5ab6), #6559, #6653, #6654):
+    the directory must be owned by this user or root (OpenSSH StrictModes),
+    and must not let the group or others write, unless it is sticky and
+    ``entry`` (``info`` is its ``lstat``) belongs to this user or root, since
+    nobody else can then replace it. ``info`` is ``None`` for an entry that
+    does not exist: no sticky exception then, since anyone who can write the
+    directory can create it after this check (#6828).
+    """
+    try:
+        held = os.stat(directory)
+    except OSError as exc:
+        raise ValueError(
+            f"verify= CA path {path!r}: the directory {directory!r} holding {entry!r} "
+            f"cannot be checked ({exc.strerror}); it changed while the path was being "
+            "checked (#6829)."
+        ) from None
+    trusted = (0, os.geteuid())
+    if held.st_uid not in trusted:
+        raise ValueError(
+            f"verify= CA path {path!r} passes through the directory {directory!r}, "
+            f"owned by uid {held.st_uid} (mode {stat.S_IMODE(held.st_mode):o}): that user "
+            f"could replace {entry!r} and change which servers this client trusts. "
+            "Give the directory to this user or root (chown), or pass a CA path whose "
+            "directories only you or root own (#6653)."
+        )
+    sticky_and_owned = (
+        info is not None and bool(held.st_mode & stat.S_ISVTX) and info.st_uid in trusted
+    )
+    if _shared_writable(held.st_mode) and not sticky_and_owned:
+        if info is None:
+            what = "the missing entry"
+        else:
+            what = "the symlink" if stat.S_ISLNK(info.st_mode) else "the entry"
+        raise ValueError(
+            f"verify= CA path {path!r} passes through {what} {entry!r}, whose directory "
+            f"{directory!r} (owner uid {held.st_uid}, mode {stat.S_IMODE(held.st_mode):o}) "
+            "is group- or world-writable: anyone with that write access could replace "
+            "it and change which servers this client trusts. Remove the write bits "
+            f"(chmod go-w {directory}) or pass a CA path whose directories only their "
+            "owner can change (#6559, #6653)."
+        )
+    _refuse_foreign_acl_on_directory("CA path", path, directory, held)
+
+
+#: Symlinks followed while resolving one CA path, as Linux's MAXSYMLINKS.
+_MAX_SYMLINK_HOPS = 40
+
+
+def _checked_realpath(path: str) -> str:
+    """Resolve ``path`` component by component, refusing a directory others can change.
+
+    This is not ``os.path.realpath``: every component is resolved in order,
+    and the directory holding each one (an ancestor of the path, of a symlink
+    met on the way, or of a link's target) goes through
+    :func:`_refuse_untrusted_holder`, so whoever could swap a directory,
+    re-point a link or replace the file is refused (3-agent vote (6def5ab6),
+    #6559, #6653). A missing component ends the walk with the remainder
+    appended unchanged (a later ``..`` is NOT collapsed lexically; the kernel
+    returns ENOENT for it too), so the caller refuses the path; the directory
+    that would hold it is held to the same rule first, so nobody else can
+    create it between this walk and the open (#6828). Any component after a
+    file (``ca.pem/.``, ``ca.pem/..``) is refused, as the kernel's ENOTDIR
+    (#6811), and a directory that vanishes mid-walk is a ``ValueError``,
+    never a raw ``OSError`` (#6829).
+    """
+    if os.name == "nt":
+        return os.path.realpath(path)
+    if not os.path.isabs(path):
+        try:
+            path_from_root = os.path.join(os.getcwd(), path)
+        except OSError as exc:
+            raise ValueError(
+                f"verify= CA path {path!r} is relative and the working directory cannot "
+                f"be read ({exc.strerror}) (#6829)."
+            ) from None
+    else:
+        path_from_root = path
+    parts = [part for part in path_from_root.split(os.sep) if part]
+    resolved = os.sep
+    resolved_is_dir = True
+    hops = 0
+    while parts:
+        name = parts.pop(0)
+        if not resolved_is_dir:
+            # The kernel gives ENOTDIR for anything after a file, `.` and
+            # `..` included: `ca.pem/.` is never `ca.pem` (#6811).
+            raise ValueError(
+                f"verify= CA path {path!r}: {resolved!r} is not a directory, so no "
+                "component can follow it (ENOTDIR, #6811)."
+            )
+        if name == ".":
+            continue
+        if name == "..":
+            resolved = os.path.dirname(resolved)
+            continue
+        candidate = os.path.join(resolved, name)
+        try:
+            info = os.lstat(candidate)
+        except OSError:
+            _refuse_untrusted_holder(path, resolved, candidate, None)
+            return os.path.join(candidate, *parts)
+        _refuse_untrusted_holder(path, resolved, candidate, info)
+        if not stat.S_ISLNK(info.st_mode):
+            resolved = candidate
+            resolved_is_dir = stat.S_ISDIR(info.st_mode)
+            continue
+        hops += 1
+        if hops > _MAX_SYMLINK_HOPS:
+            raise ValueError(f"verify= CA path {path!r} has too many symlinks (#6559).")
+        try:
+            target = os.readlink(candidate)
+        except OSError as exc:
+            raise ValueError(
+                f"verify= CA path {path!r}: symlink {candidate!r} cannot be read: "
+                f"{exc.strerror} (#6559)."
+            ) from None
+        if os.path.isabs(target):
+            resolved = os.sep
+        parts = [part for part in target.split(os.sep) if part] + parts
+    return resolved
+
+
+def _pinned_base_context() -> ssl.SSLContext:
+    """``ssl.create_default_context()`` with NO trust anchors loaded (#6377).
+
+    The same steps the standard library takes for ``Purpose.SERVER_AUTH``
+    (``PROTOCOL_TLS_CLIENT``, ``CERT_REQUIRED``, ``check_hostname``, the
+    3.13+ strict and partial-chain flags, ``SSLKEYLOGFILE``), minus its
+    fallback to the system store: an empty CA directory must mean no anchor
+    at all, and ``create_default_context`` loads the system store whenever it
+    is given no CA input.
+    """
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.verify_mode = ssl.CERT_REQUIRED
+    context.check_hostname = True
+    context.minimum_version = MINIMUM_TLS_VERSION
+    if sys.version_info >= (3, 13):
+        context.verify_flags |= ssl.VERIFY_X509_PARTIAL_CHAIN | ssl.VERIFY_X509_STRICT
+    keylog = os.environ.get("SSLKEYLOGFILE")
+    if keylog and not sys.flags.ignore_environment:
+        context.keylog_filename = keylog
+    return context
+
+
+def _load_trust_file(context: ssl.SSLContext, shown: str, entry: str) -> None:
+    """Load one CA file into ``context`` NOW, after checking who can change it.
+
+    ``entry`` is resolved by :func:`_checked_realpath` (every directory on the way held to
+    #6653), opened without blocking (a FIFO
+    would otherwise hang), and must be a regular file that neither it nor its
+    directory lets the group or others rewrite; a sticky directory is
+    admitted when the file belongs to this user or root, since nobody else
+    can then replace it. The file's owner and its directory's owner must be
+    this user or root (#6815, 3-agent vote (6def5ab6)).
+
+    The opened file is then bound to the rule: ``entry`` is walked again
+    AFTER the open, and the entry that walk ends at must be the inode the
+    descriptor holds, so the checks above describe a file every directory on
+    the way still vouches for (#6828). The file is loaded by path and
+    re-checked to be the same inode afterwards, so a swap during the load is
+    refused (#6377).
+    """
+    real = _checked_realpath(entry)
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = os.open(real, flags)
+    except OSError as exc:
+        raise ValueError(
+            f"verify= CA file {shown!r} cannot be opened: {exc.strerror} (#6377)."
+        ) from None
+    try:
+        opened = os.fstat(fd)
+        if stat.S_ISREG(opened.st_mode):
+            _refuse_foreign_acl("CA file", shown, fd)
+    except OSError as exc:
+        raise ValueError(
+            f"verify= CA file {shown!r} cannot be checked ({exc.strerror}); it changed "
+            "while it was being opened (#6829)."
+        ) from None
+    finally:
+        os.close(fd)
+    if not stat.S_ISREG(opened.st_mode):
+        raise ValueError(
+            f"verify= CA entry {shown!r} is not a regular file; a hashed CA "
+            "directory may hold only certificate and CRL files (#6307, #6377)."
+        )
+    _refuse_shared_writable("CA file", real, opened.st_mode)
+    _refuse_untrusted_holder(shown, os.path.dirname(real), real, opened)
+    _refuse_foreign_owner("CA file", shown, opened)
+    walked = _checked_realpath(entry)
+    try:
+        found = os.lstat(walked)
+    except OSError:
+        found = None
+    if found is None or (found.st_dev, found.st_ino) != (opened.st_dev, opened.st_ino):
+        raise ValueError(
+            f"verify= CA file {shown!r} changed while it was being checked: the file "
+            "opened is not the one its path names now (#6828)."
+        )
+    try:
+        context.load_verify_locations(cafile=real)
+    except (ssl.SSLError, OSError) as exc:
+        raise ValueError(
+            f"verify= CA file {shown!r} holds no usable certificate: {exc} (#6377)."
+        ) from None
+    try:
+        after = os.stat(real)
+    except OSError:
+        after = None
+    if after is None or (after.st_dev, after.st_ino) != (opened.st_dev, opened.st_ino):
+        raise ValueError(f"verify= CA file {shown!r} changed while it was being read (#6377).")
+
+
+def _context_from_path(path: str, *, kind: str | None = None) -> ssl.SSLContext:
+    """A verifying context for the CA file or directory ``path`` (#6269, #6377).
+
+    The path is resolved NOW, component by component by ``_checked_realpath``,
+    refusing a directory on the way that another user could change (#6559,
+    #6653). A path that is neither
+    an existing regular file nor an existing directory (missing, FIFO, socket,
+    device) is a ``ValueError`` rather than a late ``FileNotFoundError`` or a
+    hang (#6307).
+
+    Trust is read ONCE, here. For a directory every hashed entry
+    (``<hash>.<n>``, ``<hash>.r<n>``) is loaded eagerly, so a certificate
+    added to the directory after construction is never trusted (OpenSSL's own
+    ``capath`` lookup reads the directory again on every handshake). A
+    directory, file, symlink target or target directory that the group or
+    others can write is refused (POSIX; #6377). An empty directory gives a
+    context with no anchor at all, which fails every handshake (#6269).
+
+    ``kind`` (``"file"`` or ``"directory"``) additionally requires that kind;
+    the env trust variables pass it, so ``SSL_CERT_FILE`` and ``verify=`` share
+    this one check (#6538, #6690). A path ending in a separator names a
+    directory, as it does for the kernel: ``ca.pem/`` is refused (#6690).
+    """
+    resolved = _checked_realpath(path)
+    try:
+        found: os.stat_result | None = os.stat(resolved)
+    except OSError:
+        found = None
+    mode = 0 if found is None else found.st_mode
+    if path.endswith(_PATH_SEPARATORS) and not stat.S_ISDIR(mode):
+        # A trailing separator names a directory: the kernel refuses
+        # ``ca.pem/`` (ENOTDIR) even though the walk above drops the empty
+        # last part (#6690).
+        mode = 0
+    wanted = {"file": stat.S_ISREG, "directory": stat.S_ISDIR}.get(kind or "")
+    if wanted is not None and not wanted(mode):
+        raise ValueError(
+            f"CA path {path!r} is not an existing "
+            f"{'regular file' if kind == 'file' else kind} (#6538, #6690)."
+        )
+    if stat.S_ISDIR(mode) and found is not None:
+        _refuse_shared_writable("CA directory", path, mode)
+        _refuse_foreign_owner("CA directory", path, found)
+        _refuse_foreign_acl_on_directory("CA directory", path, resolved, found)
+        context = _pinned_base_context()
+        try:
+            names = sorted(os.listdir(resolved))
+        except OSError as exc:
+            raise ValueError(
+                f"verify= CA directory {path!r} cannot be listed: {exc.strerror} (#6377)."
+            ) from None
+        for name in names:
+            if _HASHED_CA_ENTRY.fullmatch(name):
+                _load_trust_file(context, os.path.join(path, name), os.path.join(resolved, name))
+        return context
+    if stat.S_ISREG(mode):
+        context = _pinned_base_context()
+        _load_trust_file(context, path, resolved)
+        return context
+    raise ValueError(
+        "verify= names a CA path that is not an existing regular file or "
+        f"directory: {path!r}. Pass the CA bundle file or hashed CA directory "
+        "(#6269, #6307)."
+    )
+
+
+#: httpx's env trust, in its own precedence order: the variable, and whether
+#: it must name a directory (else a regular file).
+_ENV_TRUST = (("SSL_CERT_FILE", False), ("SSL_CERT_DIR", True))
+
+
+def _context_from_env() -> ssl.SSLContext | None:
+    """The env trust httpx would use for ``verify=None``/``True``, read NOW (#6538).
+
+    httpx takes ``SSL_CERT_FILE`` when it is non-empty, else ``SSL_CERT_DIR``,
+    else certifi (``None`` here). The named path is loaded through
+    :func:`_context_from_path`, so the #6377 rules hold for it: read once at
+    construction, never re-read per handshake, and refused when the group or
+    others can change it. A path that is missing or of the wrong kind is
+    refused, fail closed, where httpx 0.27 would silently fall back to
+    certifi.
+    """
+    for variable, wants_directory in _ENV_TRUST:
+        value = os.environ.get(variable, "")
+        if not value:
+            continue
+        try:
+            return _context_from_path(value, kind="directory" if wants_directory else "file")
+        except ValueError as exc:
+            raise ValueError(
+                f"{variable}={value!r}: {exc} httpx would read trust from it; point "
+                f"{variable} at a CA {'hashed directory' if wants_directory else 'bundle file'} "
+                "or unset it (#6538)."
+            ) from None
+    return None
+
+
+def _default_trust_context() -> ssl.SSLContext:
+    """The context ``verify=None`` / ``True`` uses when no env trust is set (sec r2 F1).
+
+    httpx would build its own default context from certifi with no TLS minimum. This
+    builds the same trust (certifi) on the pinned builder, so ``MINIMUM_TLS_VERSION``
+    applies, and the caller of :func:`build_httpx_kwargs` hooks and gates it like any
+    other checked context.
+    """
+    import certifi
+
+    context = _pinned_base_context()
+    try:
+        context.load_verify_locations(cafile=certifi.where())
+    except (OSError, ssl.SSLError):
+        raise ValueError(
+            "the default CA bundle (certifi) could not be loaded; pass verify=<CA path> "
+            "or reinstall certifi (#8195)."
+        ) from None
+    return context
+
+
+def _checked_verify(verify: object) -> ssl.SSLContext:
+    """Return the ONLY value ``build_httpx_kwargs`` may forward, or raise (#3840).
+
+    Forwarded to httpx: for ``None`` and ``True`` the context
+    :func:`_context_from_env` builds from ``SSL_CERT_FILE`` / ``SSL_CERT_DIR``
+    (#6538), else the certifi context :func:`_default_trust_context` builds on
+    the pinned builder, so the TLS 1.2 minimum holds for the default trust too
+    (#8195),
+    a caller context that passes :func:`_context_verifies` (exactly
+    ``ssl.SSLContext``), or a context this SDK builds itself from the resolved
+    absolute path of an existing CA file or directory (``str`` or
+    ``os.PathLike``). Never the caller's own str/path object: httpx 0.27
+    decides on its truthiness and 0.28 mishandles ``os.PathLike`` (#6248,
+    #6245). Refused, fail closed: ``False`` and every other falsy or blank
+    value, a non-stock or non-verifying context, a CA path that does not
+    exist, and any type this SDK does not document.
+    """
+    if verify is None or verify is True:
+        from_env = _context_from_env()
+        return _default_trust_context() if from_env is None else from_env
+    if isinstance(verify, ssl.SSLContext):
+        if _context_verifies(verify):
+            return verify
+        raise ValueError(_UNVERIFIED_MESSAGE)
+    if isinstance(verify, (str, os.PathLike)):
+        raw = os.fspath(verify)
+        # `str.__str__` yields an exact `str`: no overridden `strip`/`__bool__`.
+        path = str.__str__(raw) if isinstance(raw, str) else ""
+        if path.strip():
+            return _context_from_path(path)
+    raise ValueError(_UNVERIFIED_MESSAGE)
+
+
+_SESSION_MESSAGE = (
+    "verify=False equivalent refused: the TLS session negotiated for this "
+    "connection is not a verified session of the context passed as verify= "
+    "(no validated server certificate, or the handshake ran on another "
+    "context). Use ssl.create_default_context(cafile=<CA path>) or "
+    "verify=<CA path> (#6305, #6306, #6268)."
+)
+
+
+#: ``SSLObject.version()`` names of the protocol versions the SDK accepts on the wire.
+_MODERN_TLS_NAMES = frozenset({"TLSv1.2", "TLSv1.3"})
+
+
+def _assert_negotiated_session(session: object, context: ssl.SSLContext, host: str) -> None:
+    """Raise ``ValueError`` unless ``session`` is a verified session of ``context`` for ``host``.
+
+    ``session`` is the connection's ``ssl_object`` after the handshake. It must
+    exist, belong to the caller's own context object (a handshake handed to
+    another context is refused) and carry a VALIDATED peer certificate:
+    ``getpeercert()`` is empty when the chain was not verified (``CERT_NONE``,
+    ``CERT_OPTIONAL`` without a certificate, anonymous suites). The certificate
+    must also name ``host``, the host the request is addressed to, whatever
+    the context's ``check_hostname`` was at handshake time (#6350), and the
+    negotiated protocol must be TLS 1.2 or newer and the suite must carry at least
+    :data:`_MINIMUM_SUITE_STRENGTH_BITS` secret bits (no eNULL, no export grade, #6305, code r6 F1). Unlike the
+    pre-handshake predicate this inspects what actually happened on the wire,
+    so it also closes the check/use race (#6306) and auth-null suites (#6305). Every read goes
+    through the C ``_ssl._SSLSocket`` object (:func:`_session_facts`), never through the Python
+    ``SSLSocket`` / ``SSLObject`` methods a class set before import can replace (sec r6 S1-wire); on the async client the stream's ``SSLObject`` class
+    (``sslobject_class``) and factory (``wrap_bio``) are replaceable the same way, so a session whose
+    ``_sslobj`` is not the C type is refused (code r6 F1).
+    """
+    facts = _session_facts(session)
+    if facts is None or facts.context is not context:
+        raise ValueError(_SESSION_MESSAGE)
+    peer = facts.peer
+    if not isinstance(peer, dict) or not peer:
+        raise ValueError(_SESSION_MESSAGE)
+    if not _peer_matches_host(peer, host, context):
+        raise ValueError(_SESSION_MESSAGE)
+    negotiated = facts.negotiated
+    if facts.version not in _MODERN_TLS_NAMES:
+        raise ValueError(_SESSION_MESSAGE)
+    if (
+        not isinstance(negotiated, tuple)
+        or len(negotiated) != 3
+        or not isinstance(negotiated[2], int)
+        or negotiated[2] < _MINIMUM_SUITE_STRENGTH_BITS
+    ):
+        raise ValueError(_SESSION_MESSAGE)
+
+
+def _ip_or_none(value: object) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return ipaddress.ip_address(value.strip())
+    except ValueError:
+        return None
+
+
+def _dns_name_matches(pattern: object, host: str) -> bool:
+    """RFC 6125 name match: a wildcard only as the whole left-most label."""
+    if not isinstance(pattern, str):
+        return False
+    labels = pattern.rstrip(".").lower().split(".")
+    if "*" not in pattern:
+        return labels == host.split(".")
+    if labels[0] != "*" or len(labels) < 3 or any("*" in label for label in labels[1:]):
+        return False
+    host_labels = host.split(".")
+    return (
+        len(host_labels) == len(labels) and bool(host_labels[0]) and host_labels[1:] == labels[1:]
+    )
+
+
+def _peer_matches_host(peer: dict[str, Any], host: str, context: ssl.SSLContext) -> bool:
+    """Whether the validated peer certificate ``peer`` names ``host`` (#6350).
+
+    ``ssl.match_hostname`` is gone since Python 3.12, so this mirrors what
+    OpenSSL's host check does: an IP host matches only an iPAddress SAN; a DNS
+    host matches a dNSName SAN; the subject commonName is a fallback only when
+    the certificate has no dNSName SAN, the host is not an IP address and the
+    context's ``hostname_checks_common_name`` (read through the base
+    descriptor) allows it.
+    """
+    host = host.rstrip(".").lower()
+    if not host:
+        return False
+    sans = peer.get("subjectAltName", ())
+    if not isinstance(sans, tuple):
+        return False
+    entries = [entry for entry in sans if isinstance(entry, tuple) and len(entry) == 2]
+    address = _ip_or_none(host)
+    if address is not None:
+        return any(
+            kind == "IP Address" and _ip_or_none(value) == address for kind, value in entries
+        )
+    dns = [value for kind, value in entries if kind == "DNS"]
+    if dns:
+        return any(_dns_name_matches(value, host) for value in dns)
+    common_name = ssl.SSLContext.__dict__.get("hostname_checks_common_name")
+    if not isinstance(common_name, property) or common_name.fget is None:
+        return False
+    if common_name.fget(context) is not True:
+        return False
+    subject = peer.get("subject", ())
+    if not isinstance(subject, tuple):
+        return False
+    return any(
+        isinstance(attribute, tuple)
+        and len(attribute) == 2
+        and attribute[0] == "commonName"
+        and _ip_or_none(attribute[1]) is None
+        and _dns_name_matches(attribute[1], host)
+        for rdn in subject
+        if isinstance(rdn, tuple)
+        for attribute in rdn
+    )
+
+
+def _assert_leaf_current(session: object) -> None:
+    """Raise ``ValueError`` unless the peer leaf is inside its validity period now (#6375).
+
+    A belt to the ``verify_flags`` check: a flag that skips the time check can
+    be set after the per-request check and before the handshake. Only the leaf
+    is visible here. This runs on new sessions only (in the trace), never on a
+    pooled connection, whose leaf was current when it was verified.
+    """
+    facts = _session_facts(session)
+    peer = None if facts is None else facts.peer
+    if not isinstance(peer, dict):
+        raise ValueError(_SESSION_MESSAGE)
+    not_before, not_after = peer.get("notBefore"), peer.get("notAfter")
+    if not isinstance(not_before, str) or not isinstance(not_after, str):
+        raise ValueError(_SESSION_MESSAGE)
+    try:
+        start, end = ssl.cert_time_to_seconds(not_before), ssl.cert_time_to_seconds(not_after)
+    except ValueError:
+        raise ValueError(_SESSION_MESSAGE) from None
+    if not start <= time.time() <= end:
+        raise ValueError(_SESSION_MESSAGE)
+
+
+def _request_host(url: httpx.URL) -> str:
+    return url.raw_host.decode("ascii", "replace")
+
+
+def _with_trace(request: httpx.Request, trace: Any) -> None:
+    """Install ``trace`` on ``request``, chaining any trace the caller set."""
+    inherited = request.extensions.get("trace")
+
+    if inherited is None:
+        request.extensions["trace"] = trace
+        return
+
+    if inspect.iscoroutinefunction(trace):
+
+        async def chained_async(event: str, info: dict[str, Any]) -> None:
+            await trace(event, info)
+            result = inherited(event, info)
+            if inspect.isawaitable(result):
+                await result
+
+        request.extensions["trace"] = chained_async
+        return
+
+    def chained(event: str, info: dict[str, Any]) -> None:
+        trace(event, info)
+        inherited(event, info)
+
+    request.extensions["trace"] = chained
+
+
+_TLS_DONE = "start_tls.complete"
+_DIRECT_TLS = "connection"
+# The events that precede the first byte a request writes on a connection:
+# HTTP/1.1 request headers, the HTTP/2 connection preface, HTTP/2 headers.
+_FIRST_WRITE_EVENTS = frozenset(
+    {
+        "http11.send_request_headers.started",
+        "http2.send_connection_init.started",
+        "http2.send_request_headers.started",
+    }
+)
+_TUNNEL_CONNECT_EVENT = "http11.send_request_headers.started"
+# httpcore's tunnel CONNECT carries Host and Accept plus the proxy's own
+# headers; anything else (the SDK's X-API-Key / X-Agent-Id, caller extras)
+# means the request is not the bare tunnel CONNECT.
+_TUNNEL_CONNECT_HEADERS = frozenset({b"host", b"accept", b"proxy-authorization"})
+
+
+def _session_of(stream: object) -> object:
+    extra = getattr(stream, "get_extra_info", None)
+    return None if extra is None else extra("ssl_object")
+
+
+class _SessionGate:
+    """Post-handshake session check for ONE request (3-agent vote 6def5ab6).
+
+    httpcore reports every TLS handshake of a request as
+    ``<leg>.start_tls.complete``: ``connection`` for the TCP connection (the
+    origin when direct, the proxy when the proxy is ``https://``), ``proxy`` for
+    the origin session inside an HTTP CONNECT tunnel and ``socks`` for the
+    origin session over SOCKS. A session on the caller's context must be a
+    verified session on every leg. A session on another context is admitted
+    only on the ``connection`` leg, as a PENDING proxy leg: the bare tunnel
+    CONNECT may cross it, and a verified tunnelled origin session clears it;
+    any other first write while it is pending is refused. The state is per
+    request so one request's tunnel never vouches for another's proxy leg.
+    """
+
+    def __init__(self, context: ssl.SSLContext, request: httpx.Request) -> None:
+        self._context = context
+        url = request.url
+        self._host = _request_host(url)
+        self._tunnel_target = b"%b:%d" % (url.raw_host, url.port or 443)
+        self._pending: list[object] = []
+
+    def refused(self, event: str, info: dict[str, Any]) -> list[object] | None:
+        """Return the streams to close before refusing, or ``None`` to proceed."""
+        leg, _, name = event.partition(".")
+        if name == _TLS_DONE:
+            stream = info.get("return_value")
+            session = _session_of(stream)
+            facts = None if session is None else _session_facts(session)
+            if (
+                leg == _DIRECT_TLS
+                and session is not None
+                and (facts is None or facts.context is not self._context)
+            ):
+                self._pending.append(stream)
+                return None
+            try:
+                _assert_negotiated_session(session, self._context, self._host)
+                _assert_leaf_current(session)
+            except ValueError:
+                return [*self._pending, stream]
+            if leg != _DIRECT_TLS:
+                self._pending.clear()
+            return None
+        if event in _FIRST_WRITE_EVENTS and self._pending:
+            if event == _TUNNEL_CONNECT_EVENT and self._is_tunnel_connect(info.get("request")):
+                return None
+            return list(self._pending)
+        return None
+
+    def _is_tunnel_connect(self, request: object) -> bool:
+        if getattr(request, "method", None) != b"CONNECT":
+            return False
+        if getattr(getattr(request, "url", None), "target", None) != self._tunnel_target:
+            return False
+        headers = getattr(request, "headers", None)
+        if not isinstance(headers, list):
+            return False
+        return all(
+            isinstance(name, bytes) and name.lower() in _TUNNEL_CONNECT_HEADERS
+            for name, _value in headers
+        )
+
+
+def _close_quietly(stream: object) -> None:
+    close = getattr(stream, "close", None)
+    if close is None:
+        return
+    try:
+        close()
+    except OSError:
+        pass  # the refusal below is raised either way
+
+
+async def _aclose_quietly(stream: object) -> None:
+    aclose = getattr(stream, "aclose", None)
+    if aclose is None:
+        return
+    try:
+        await aclose()
+    except OSError:
+        pass  # the refusal below is raised either way
+
+
+def _session_trace(context: ssl.SSLContext, request: httpx.Request) -> Any:
+    """The per-request httpcore trace that runs :class:`_SessionGate` (sync)."""
+    gate = _SessionGate(context, request)
+
+    def _trace(event: str, info: dict[str, Any]) -> None:
+        streams = gate.refused(event, info)
+        if streams is None:
+            return
+        for stream in streams:
+            _close_quietly(stream)
+        raise ValueError(_SESSION_MESSAGE)
+
+    return _trace
+
+
+def _async_session_trace(context: ssl.SSLContext, request: httpx.Request) -> Any:
+    """The per-request httpcore trace that runs :class:`_SessionGate` (async)."""
+    gate = _SessionGate(context, request)
+
+    async def _atrace(event: str, info: dict[str, Any]) -> None:
+        streams = gate.refused(event, info)
+        if streams is None:
+            return
+        for stream in streams:
+            await _aclose_quietly(stream)
+        raise ValueError(_SESSION_MESSAGE)
+
+    return _atrace
+
+
+class _GatedTransport(httpx.BaseTransport):
+    """Installs the session trace AFTER every request event hook ran (#6537).
+
+    httpx calls a transport's ``handle_request`` once all request hooks have
+    run, so a caller hook can no longer replace or remove the trace: a trace
+    it set is chained after the SDK's. The request's own ``extensions`` dict
+    is restored afterwards, so a resent or redirected request never stacks
+    one hop's check on the next.
+    """
+
+    def __init__(self, inner: httpx.BaseTransport, context: ssl.SSLContext) -> None:
+        self._inner = inner
+        self._context = context
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        original = request.extensions
+        request.extensions = dict(original)
+        _with_trace(request, _session_trace(self._context, request))
+        try:
+            return self._inner.handle_request(request)
+        finally:
+            request.extensions = original
+
+    def close(self) -> None:
+        self._inner.close()
+
+    def __enter__(self) -> _GatedTransport:
+        self._inner.__enter__()
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None = None,
+        exc_value: BaseException | None = None,
+        traceback: TracebackType | None = None,
+    ) -> None:
+        self._inner.__exit__(exc_type, exc_value, traceback)
+
+
+class _AsyncGatedTransport(httpx.AsyncBaseTransport):
+    """The async :class:`_GatedTransport` (#6537)."""
+
+    def __init__(self, inner: httpx.AsyncBaseTransport, context: ssl.SSLContext) -> None:
+        self._inner = inner
+        self._context = context
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        original = request.extensions
+        request.extensions = dict(original)
+        _with_trace(request, _async_session_trace(self._context, request))
+        try:
+            return await self._inner.handle_async_request(request)
+        finally:
+            request.extensions = original
+
+    async def aclose(self) -> None:
+        await self._inner.aclose()
+
+    async def __aenter__(self) -> _AsyncGatedTransport:
+        await self._inner.__aenter__()
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None = None,
+        exc_value: BaseException | None = None,
+        traceback: TracebackType | None = None,
+    ) -> None:
+        await self._inner.__aexit__(exc_type, exc_value, traceback)
+
+
+_GATE_UNSUPPORTED = (
+    "verify=<ssl.SSLContext> needs the TLS session check on every transport, "
+    "and this httpx client does not expose them; pass verify= a CA file or "
+    "directory path instead (#6537)."
+)
+
+
+def gate_transports(
+    client: httpx.Client | httpx.AsyncClient,
+    kwargs: dict[str, Any],
+    verify: object,
+) -> None:
+    """Put the post-handshake session check on every transport of ``client`` (#6537).
+
+    Applies when ``kwargs`` (from :func:`build_httpx_kwargs`) forwards the
+    caller's own context. The default transport and every mounted proxy
+    transport are wrapped, so the check runs inside the transport, after all
+    request event hooks. Fails closed: if the client does not expose its
+    transports, construction is refused.
+
+    On that refusal the sync transports are closed before the raise. The
+    async ones are not: ``aclose`` needs a running event loop, which a
+    constructor called from sync code does not have, and a just-built
+    async transport has opened no connection, so dropping it leaks no
+    socket (#6693).
+    """
+    context = kwargs.get("verify")
+    sdk_built = verify is None or verify is True  # the SDK built this context itself (#8195)
+    if not (isinstance(context, ssl.SSLContext) and (context is verify or sdk_built)):
+        return
+    is_async = isinstance(client, httpx.AsyncClient)
+    base: type = httpx.AsyncBaseTransport if is_async else httpx.BaseTransport
+    gated: Any = _AsyncGatedTransport if is_async else _GatedTransport
+    transport = getattr(client, "_transport", None)
+    mounts = getattr(client, "_mounts", None)
+    wrapped: dict[Any, Any] = {}
+    supported = isinstance(transport, base) and isinstance(mounts, dict)
+    if supported and isinstance(mounts, dict):
+        for pattern, mounted in mounts.items():
+            if isinstance(mounted, base):
+                wrapped[pattern] = gated(mounted, context)
+            elif mounted is not None:
+                supported = False
+                break
+    if not supported or not isinstance(mounts, dict):
+        # A just-built client has opened no connection; its sync transports
+        # are closed anyway so nothing outlives the refusal.
+        if not is_async:
+            owned = [transport, *(mounts.values() if isinstance(mounts, dict) else ())]
+            for candidate in owned:
+                if isinstance(candidate, httpx.BaseTransport):
+                    candidate.close()
+        raise ValueError(_GATE_UNSUPPORTED)
+    client._transport = gated(transport, context)  # noqa: SLF001
+    mounts.update(wrapped)
+
+
+def _request_hooks(context: ssl.SSLContext, *, is_async: bool) -> dict[str, list[Any]]:
+    """httpx event hooks that enforce a caller-held context (#6249, #6305, #6306, #6349).
+
+    * ``request``: re-check the context before every request (early, clear
+      error). The post-handshake session check (:class:`_SessionGate`) is not
+      installed here: a caller hook appended later could replace the trace
+      (#6537). :func:`gate_transports` installs it inside every transport,
+      after all request hooks; it inspects every TLS session of the request,
+      direct, tunnelled or over SOCKS, right after its handshake and before
+      the request's first byte is written on that connection, and an
+      unverified session is closed and refused.
+    * ``response``: a backstop that inspects the connection the response came
+      over, which also covers a pooled connection and a trace event that never
+      fired. It runs after the request was written, so it refuses the result
+      but cannot un-send the request.
+
+    The caller keeps a reference to the context and may weaken it after
+    construction or between the check and the handshake; the session check
+    does not depend on the context's state at any earlier moment.
+    """
+
+    def _recheck() -> None:
+        if not _context_verifies(context):
+            raise ValueError(_UNVERIFIED_MESSAGE)
+
+    if is_async:
+
+        async def _arequest(_request: httpx.Request) -> None:
+            _recheck()
+
+        async def _aresponse(response: httpx.Response) -> None:
+            _assert_negotiated_session(
+                _session_of(response.extensions.get("network_stream")),
+                context,
+                _request_host(response.request.url),
+            )
+
+        return {"request": [_arequest], "response": [_aresponse]}
+
+    def _request(_request: httpx.Request) -> None:
+        _recheck()
+
+    def _response(response: httpx.Response) -> None:
+        _assert_negotiated_session(
+            _session_of(response.extensions.get("network_stream")),
+            context,
+            _request_host(response.request.url),
+        )
+
+    return {"request": [_request], "response": [_response]}
+
+
+def _require_https(base_url: object) -> str:
+    """Refuse every non-https base URL before anything is sent (sec r2 F2, #3824).
+
+    The in-transit standard and ``README`` ("Base URLs are ``https://`` even for
+    ``localhost``") promise https for every daemon, loopback included, so there is no
+    loopback exception. The URL is parsed with ``httpx.URL``, the parser the client sends
+    with (sec r3 F2). A ``str`` subclass could answer ``rstrip`` or ``str()`` differently from
+    its content, so the check runs on a plain ``str`` copy (``str.__str__``) and that same
+    copy is returned for the caller to send (sec r4 N1). The scheme must be
+    exactly ``https`` (``httpx`` lower-cases it), the host non-empty and no userinfo
+    present. A value that is not a ``str`` (bytes, ``httpx.URL``, a path, ``None``) is refused
+    the same way, and :func:`build_httpx_kwargs` runs this check before it touches the value
+    (code r4 F2). Every parser failure, an IDNA-invalid host included, maps to the one fixed
+    refusal, which never echoes any part of the URL (code r3 F6, code r4 F1): not the key,
+    the host, the userinfo, nor a fragment mis-parsed as a scheme.
+    """
+    admitted = False
+    plain = ""
+    if isinstance(base_url, str):
+        try:
+            plain = str.__str__(base_url)
+            parsed = httpx.URL(plain)
+            admitted = parsed.scheme == "https" and bool(parsed.host) and not parsed.userinfo
+        except (httpx.InvalidURL, ValueError, TypeError):
+            # Every parser failure, an IDNA-invalid host or an isinstance spoof included, is the one fixed refusal below;
+            # the library message is never surfaced because it can carry a decoded host label.
+            admitted = False
+    if not admitted:
+        raise ValueError(
+            "base_url refused: it must be an absolute https:// URL with a host and no userinfo; "
+            "the SDK sends the API key only over https, loopback included (#3824)."
+        )
+    return plain
+
+
 def build_httpx_kwargs(
     *,
     base_url: str,
     api_key: str | None,
     agent_id: str | None,
     timeout: float,
-    verify: bool | str | None,
+    verify: Union[bool, str, os.PathLike[str], ssl.SSLContext, None],
     cert: str | tuple[str, str] | None,
     extra_headers: dict[str, str] | None,
+    is_async: bool = False,
 ) -> dict[str, Any]:
     """Build the ``httpx.Client`` / ``httpx.AsyncClient`` kwargs.
 
     mTLS is wired through the stock httpx params:
 
-    * ``verify`` — path to the server CA bundle or ``True`` / ``False``. For a
+    * ``verify`` — path to the server CA bundle or ``True``. For a
       zero-config daemon this is ``<key_dir>/tls/local-ca.pem`` (#3782).
+      ``False`` (or any other falsy non-path value) is REFUSED — see Raises.
     * ``cert`` — client certificate; accepts a single path or ``(cert, key)``.
 
     ``api_key`` is sent as ``X-API-Key`` (the server also accepts
     ``?api_key=`` query params, but a header keeps it out of access logs).
     ``agent_id`` is sent as ``X-Agent-Id`` — the HTTP daemon's default
     agent resolution precedence is body → header → per-request anonymous.
+
+    Raises:
+        ValueError: on ``verify=False`` (#3840). Under the transit-encryption
+            standard (#3824) an unverified TLS channel is an encrypted pipe to
+            whoever answers — the man-in-the-middle exposure the #3828
+            ``http://`` refusal closes, one layer up. Accepted forms are exactly
+            ``None``, ``True``, the path of an existing CA file or directory (``str``
+            or ``os.PathLike``, resolved component by component at
+            construction, a missing component refused rather than normalised
+            away, read once then and never group- or world-writable nor under
+            a directory another user can change, #6377, #6559, #6653;
+            ``SSL_CERT_FILE`` / ``SSL_CERT_DIR`` under ``None`` or
+            ``True`` are read the same way, #6538) and
+            exactly ``ssl.SSLContext`` (never a subclass) that is
+            ``CERT_REQUIRED`` with ``check_hostname`` on, no relaxing verify
+            flag, no suite without server authentication and no replaced
+            handshake attribute. Every other value is refused. Only a checked
+            value reaches httpx: a CA path becomes a context this SDK builds
+            from the exact path string (#6248, #6245), and a caller-supplied
+            context is re-checked before every request (#6249, #6375, #6305;
+            the client does not own it, so turning verification off after
+            construction is refused) and every TLS session is checked after
+            its handshake (#6349, #6350). Both
+            clients construct through this one funnel, so the refusal lives
+            here once.
     """
     headers: dict[str, str] = {
         "User-Agent": f"ai-memory-python/{SDK_VERSION}",
@@ -108,13 +1471,21 @@ def build_httpx_kwargs(
     if extra_headers:
         headers.update(extra_headers)
 
+    plain_url = _require_https(base_url)  # first, before the value is touched (code r4 F2)
     kwargs: dict[str, Any] = {
-        "base_url": base_url.rstrip("/"),
+        "base_url": plain_url.rstrip("/"),
         "headers": headers,
         "timeout": timeout,
     }
-    if verify is not None:
-        kwargs["verify"] = verify
+    # #3840 — `False` was documented as "never pass" and forwarded untouched.
+    # httpx reads ANY falsy `verify` as "do not verify" (httpx 0.27.x does so
+    # for `""` too), and a caller-supplied `ssl.SSLContext` is used as given.
+    # Only the value `_checked_verify` returns is forwarded (#6248), and a
+    # caller-held context is re-checked on every request (#6249).
+    checked = _checked_verify(verify)
+    kwargs["verify"] = checked
+    if checked is verify or verify is None or verify is True:
+        kwargs["event_hooks"] = _request_hooks(checked, is_async=is_async)
     if cert is not None:
         kwargs["cert"] = cert
     return kwargs
@@ -195,9 +1566,7 @@ def build_create_body(
 
     if signing_key is not None:
         if supplied.get("signature"):
-            raise ValueError(
-                "pass either signing_key or an explicit signature, not both"
-            )
+            raise ValueError("pass either signing_key or an explicit signature, not both")
         agent_id = supplied.get("agent_id")
         if not agent_id:
             raise ValueError(

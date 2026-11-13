@@ -67,9 +67,11 @@ await requireProfile(client, "graph");  // throws ProfileNotLoaded if missing
 ```python
 from ai_memory import AiMemoryClient, require_profile, ProfileNotLoaded
 
-with AiMemoryClient(base_url="http://localhost:9077") as c:
+with AiMemoryClient(base_url="https://localhost:9077") as c:
     require_profile(c, "graph")  # raises ProfileNotLoaded if missing
 ```
+
+A plain `http` base URL is refused by the Python SDK at construction (a typed `ValueError`) since #8195, loopback included.
 
 ---
 

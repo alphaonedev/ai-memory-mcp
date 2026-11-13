@@ -47,13 +47,9 @@ from ai_memory.attestation import (  # after importorskip, by design
     sign_write,
 )
 
-_FIXTURE = (
-    Path(__file__).resolve().parents[2] / "fixtures" / "write_attestation_vector.json"
-)
+_FIXTURE = Path(__file__).resolve().parents[2] / "fixtures" / "write_attestation_vector.json"
 _BIND_FIXTURE = (
-    Path(__file__).resolve().parents[2]
-    / "fixtures"
-    / "bind_pubkey_possession_vector.json"
+    Path(__file__).resolve().parents[2] / "fixtures" / "bind_pubkey_possession_vector.json"
 )
 
 

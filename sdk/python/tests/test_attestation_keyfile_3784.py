@@ -122,9 +122,7 @@ def test_an_owner_only_key_still_loads_and_signs(key_file: tuple[Path, bytes]) -
 
     transcript = b"ai-memory/write/v1 control"
     signature = key.sign(transcript)
-    ed25519.Ed25519PublicKey.from_public_bytes(key.public_key_bytes()).verify(
-        signature, transcript
-    )
+    ed25519.Ed25519PublicKey.from_public_bytes(key.public_key_bytes()).verify(signature, transcript)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="mode bits and O_NOFOLLOW are POSIX-only")

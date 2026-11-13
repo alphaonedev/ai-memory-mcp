@@ -1,0 +1,205 @@
+---
+layout: doc
+---
+# ADR-003 - Python SDK TLS verification: post-handshake enforcement (vote record for 785838d82, #6308)
+
+Status: **ACCEPTED + IMPLEMENTED** (commits 785838d82, the round-4 fix and the round-5 series on `fix/6060-promo6-ssh`; round 5 below).
+
+Context: commit 785838d82 refused `CERT_OPTIONAL` contexts and added a per-request
+refusal hook (a T3 security-posture choice) without the vote that
+`4d3ea1c5` requires. This record documents the retroactive 5-agent vote
+(4d3ea1c5) that ratifies both, and the vote that selected the exact-type
+predicate plus a post-handshake check as the enforcement. Issues: #6267, #6268,
+#6305, #6306, #6308.
+
+Decision: the SDK accepts a caller `ssl.SSLContext` only when it is exactly
+`ssl.SSLContext` with stock handshake attributes, verification and hostname
+checks on, no verify flag that relaxes chain validation and no cipher suite
+without server authentication. This check runs at construction and again before
+every request, which gives an early, clear error. After every TLS handshake of a
+request (direct, through an `http://` or `https://` CONNECT proxy, or over
+SOCKS), and before that request's first byte is written on the connection, the
+SDK enforces that the negotiated session:
+- uses the caller's context object
+- carries a non-empty peer certificate that names the request host and whose
+  validity dates include now
+- negotiated a cipher with at least 112 secret bits (the same floor as the construction check)
+
+Failure closes the stream and raises `ValueError` (fail closed). A response-time
+backstop repeats the check on the connection the response came over. It covers a
+pooled connection and a trace event that never fired, but it runs after the
+request was written. The pre-send check is installed inside every transport of
+the client (the default one and each mounted proxy transport), so it runs after
+all request event hooks: a caller hook cannot replace or remove it, and a trace
+a hook sets is chained after the SDK's (#6537). A client whose transports cannot
+be wrapped is refused at construction.
+
+## Vote record
+
+# 6060 r4 vote: acceptance predicate for a caller-supplied ssl.SSLContext (#6267 #6268)
+
+Protocol: 5-agent vote (4d3ea1c5). Triggers: T1 (public SSLContext acceptance contract narrows) + T3 (fail-closed posture).
+Runner: ai:f1-fix-6060-r4. Date 2026-10-09. Base head 9c05728f0.
+
+Options:
+- A: isinstance(ctx, ssl.SSLContext) + base-descriptor CERT_REQUIRED/check_hostname + type(ctx).wrap_socket/wrap_bio are the base functions (subclasses with stock wrap methods allowed).
+- B: exact type `type(ctx) is ssl.SSLContext` + base-descriptor CERT_REQUIRED/check_hostname + no instance-__dict__ shadowing of any ssl.SSLContext attribute (wrap_socket, wrap_bio, verify_mode, check_hostname, ...). Re-run on every request.
+- C: current predicate + denylist (truststore) + wrap_* checks.
+
+| Lens | Verdict | Confidence | Top risk | Killer objection |
+|---|---|---|---|---|
+| precedent | B | 70 | truststore / subclass users hit a hard ValueError; document create_default_context / CA path | refuses the common harmless subclass; C-level state mutation after check |
+| spec-literalism | A | 66 | subclass overriding other handshake hooks (__getattribute__, sslsocket_class) | A cannot be proven complete; only B closes it |
+| client-compat | A | 66 | identity checks miss override points (__getattribute__, __class__, _ctx delegation) | same: B's closed set is easier to prove |
+| testability | B | 85 | class-level monkeypatch of ssl.SSLContext or post-check mutation; needs per-request re-check | rejects legitimate subclasses, forces create_default_context + load_verify_locations |
+| blast-radius | B | 80 | corporate truststore users; no opt-in escape hatch | over-tight, no opt-in |
+
+Tally: B 3, A 2, C 0. Verdict: B (exact type).
+
+Note against the conductor's brief: the brief spelled form A (subclass with unmodified wrap methods). The vote prefers B, so B is implemented. Both A and B refuse truststore.SSLContext; B additionally refuses subclasses with stock wrap methods because A leaves __getattribute__/sslsocket_class/metaclass holes (testability, spec-literalism, client-compat all named them). Reversibility favours B (relaxing later breaks nobody; tightening later does).
+
+Executed form: type(ctx) is ssl.SSLContext; base descriptors CERT_REQUIRED + check_hostname; no key of vars(ctx) names an attribute of ssl.SSLContext; ssl.SSLContext.wrap_socket/wrap_bio still the functions captured at import (class-level patch). Refusal message names the accepted forms and the workaround (ssl.create_default_context(cafile=...), verify=<CA path>).
+
+---
+
+# Round 2 of the vote: primary control, and ratification of 785838d82 (#6305 #6306 #6308)
+
+Protocol: 5-agent vote (4d3ea1c5). Triggers: T3 (security/governance posture: new post-handshake gate, plus retroactive ratification of 785838d82's CERT_OPTIONAL refusal and per-request refusal hook, which shipped without a vote, #6308), T6 (>=2 enforcement paths).
+Trigger: round-3 security verdict (REJECT) found that the exact-type predicate alone does not close #6305 (auth-null ciphers on a stock context), #6306 (check/use race) and the __getattribute__/sslsocket_class variants of #6268.
+
+Questions:
+- Q1: primary control. P = pre-handshake exact-type predicate only; T = post-handshake check only (negotiated ssl_object.context is the caller's context AND getpeercert() non-empty, installed per request through httpcore's trace extension at connection.start_tls.complete); B = both, predicate as the early clear-error path, trace as the enforcement.
+- Q2: ratify 785838d82's refusal of CERT_OPTIONAL contexts.
+- Q3: ratify 785838d82's per-request refusal hook.
+
+| Lens | Q1 | Q2 | Q3 | Conf | Top risk |
+|---|---|---|---|---|---|
+| precedent | B | YES | YES | 78 | trace is httpcore-specific; a skipped event must fail closed |
+| sync/async + concurrency | B | YES | YES | 72 | pooled/reused connections and HTTP/2 skip start_tls; sync vs async trace callables differ |
+| spec-literalism | B | YES | YES | 80 | trace not invoked = fail open; abort must close the connection |
+| testability | B | YES | YES | 78 | callback shape differs per httpcore version; needs canary + zero-bytes-sent assertions |
+| blast-radius | B | YES | YES | 72 | context-identity check can false-positive on wrapper contexts (dissent: lenient predicate) |
+
+Tally: Q1 B 5/0/0 (P 0, T 0); Q2 YES 5/0; Q3 YES 5/0. The blast-radius lens dissents only on keeping the exact-type predicate strict; round 1 of this vote (B 3-2) already decided that, and it stays.
+Verdict: B (both). The trace/response check is the enforcement; the predicate stays as the early path and the clear error. 785838d82's CERT_OPTIONAL refusal and per-request hook are ratified.
+
+Binding conditions taken from the voters' killer objections (all implemented and tested):
+1. Fail closed: a request that carries no completed verified handshake is refused. A response-time backstop reads network_stream's ssl_object (covers pooled connections and a trace event that never fired).
+2. Sync and async clients get matching sync/async trace callables; a caller-supplied trace extension is wrapped, never replaced.
+3. The abort closes the stream before raising, and no request byte is sent (asserted with a recording server).
+4. Canary test: the trace fires on both httpx pins; a mutation that removes the enforcement turns the tests red.
+
+---
+
+# Round 5: every session of a request, and what "verified" means (#6349 #6350 #6375 #6305 #6376 #6377)
+
+Protocol: 3-agent vote (6def5ab6), operator directive relayed by ai:god-f2. Runner: ai:f1-fix-6060-r5, 2026-10-09.
+Memory: bdb2d654 (vote record); round-4 votes 5d31459d stand.
+
+Q1 (#6349 #6376): which TLS sessions the post-handshake check acts on, and how an `https://` proxy leg is treated.
+Options: A, check every `*.start_tls.complete` session against the caller's context, and admit a session on another
+context only on `connection.start_tls` as a per-request "pending" proxy leg that a verified origin session must follow
+before any request other than the bare tunnel CONNECT is written; B, force `trust_env=False`; C, skip sessions whose
+server name differs from the request host. Lenses fail-closed security, client-compat, testability/spec: A 3, B 0, C 0.
+Verdict: A. Binding conditions: pending state per request; the CONNECT exemption admits only httpcore's own CONNECT
+(Host, Accept, Proxy-Authorization headers); the trace closes the stream itself before raising; tests drive the
+branches a real server cannot reach.
+
+Decisions below the vote threshold (recorded as `decision:` lines in the commits):
+- #6350: the peer certificate must name the request host (the URL host, not the proxy). A DNS SAN wildcard matches
+  only as the whole left-most label of a name with at least three labels (`*.example.com`, never `f*.example.com`
+  or `*.com`), and never more than one label; an IP host matches only an IP SAN; the subject
+  CN is used only when the certificate has no DNS SAN and the context's `hostname_checks_common_name` is on.
+- #6375: verify flags are an allowlist. `VERIFY_X509_PARTIAL_CHAIN` is admitted, because Python 3.13+
+  `create_default_context` sets it; a flag that relaxes validation, such as `VERIFY_X509_NO_CHECK_TIME` or
+  `VERIFY_ALLOW_PROXY_CERTS`, is refused.
+- #6305: a context offering an anonymous (auth-null), NULL-encryption (eNULL) or low-strength (under 112 bits) suite
+  is refused at construction; the error message gives the remedy string. PSK and SRP suites are NOT refused (#8195,
+  code r1 F1): they cannot complete a handshake without a key or password callback, which the SDK never installs, and
+  distro OpenSSL builds list them in `"DEFAULT"`, so refusing them refused `ssl.create_default_context()`.
+  decision: refuse by anonymous and null suite classes over refusing every non-ECDHE suite because the documented
+  happy path must pass on the distro default OpenSSL.
+- #8195 (sec r1 F4, code r1 F2): TLS 1.2 is the minimum. The SDK-built context sets `minimum_version = TLSv1_2`
+  (the constant `MINIMUM_TLS_VERSION`), and the validator refuses a caller context with a concrete `minimum_version`
+  below it or a concrete `maximum_version` below it, at construction and again on every request, sync and async.
+  decision: minimum TLS 1.2 enforced in the builder AND refused by the validator over builder-only because a
+  caller-supplied context bypasses the builder.
+  `MINIMUM_SUPPORTED` and `MAXIMUM_SUPPORTED` mean "the library default" and are admitted, because a distro Python
+  reports `MINIMUM_SUPPORTED` on a stock default context; the session gate then refuses any connection whose
+  negotiated protocol is not TLS 1.2 or 1.3.
+  decision: MINIMUM_SUPPORTED admitted at construction (library default) over refused because the Ubuntu distro
+  default context reports it and the session gate refuses any negotiated version below TLS 1.2.
+- #8195 (sec r2 F1): the TLS 1.2 minimum also holds for `verify=None` and `verify=True`. Both used to hand httpx its
+  own default context, with no minimum, no request hooks and no session gate; on a host whose OpenSSL policy permits
+  TLS 1.1 the request and its API key went out over TLS 1.1. The SDK now builds the default (certifi) context on the
+  same builder, sets `minimum_version = TLSv1_2`, and installs the request hooks and the session gate on it exactly as
+  for a caller context, sync and async.
+- #8195 (sec r2 F2): a base URL whose scheme is not `https` is refused at construction in both clients, with a typed
+  `ValueError` that echoes no part of the URL (sec r3 F2, code r3 F6): the URL is parsed with `httpx.URL`, the parser
+  the client sends with, and must carry the scheme `https`, a host and no userinfo; a whitespace-prefixed, control-
+  character, hostless or non-`str` form, and a non-ASCII host that does not IDNA-encode, is refused with the same typed error, validated before the
+  value is touched (code r4 F1, F2); a `str` subclass is checked and sent as one plain `str` copy (sec r4 N1), and a
+  TLS bound, `verify_mode`, `check_hostname` and `verify_flags` are also read through the C-level `getset_descriptor` objects, resolved from the
+  real `ssl.SSLContext` MRO, and must agree with the Python-level reads (sec r4 N2, sec r5 S1, code r5 F2). The getset objects are immutable; the lookup path to
+  them is not, which is why they come from the class chain and not from the `_ssl` module table. A candidate counts as a getset only by identity with the
+  builtin getset type (`type(type.__dict__["__dict__"])`), never by type name, which a Python class can copy (sec r6 S1). The negotiated session (version, suite, peer
+  certificate, context) is read through the C `_ssl._SSLSocket` method descriptors, not the Python `SSLSocket` or `SSLObject` methods, which a class set before the import can
+  replace (sec r6 S1-wire). On the async client the stream's `SSLObject` class (`sslobject_class`) and factory
+  (`wrap_bio`) are replaceable the same way; the gate reads the C object behind the session (`_sslobj`, checked by
+  identity with the C type) and refuses a session with no provably-C object (code r6 F1). The threat boundary is code that runs in the caller's
+  process before `ai_memory` is imported; the negotiated-session gate holds on the wire either way. ASCII label shape (length, hyphens) is not validated by the SDK; check and send agree (code r5 F4). README ("Base URLs are `https://` even for
+  `localhost`") and the in-transit standard #3824 grant no loopback exception.
+  decision: refuse every non-https base URL at construction over a warning or a loopback exception because
+  README:26-29 and the #3824 in-transit standard already promise https even for localhost.
+- #6377: `verify=<CA path>` is read once, at construction. For a directory, only the hashed entries OpenSSL's own
+  `capath` lookup reads (`<hash>.<n>`, `<hash>.r<n>`) are loaded. A group- or world-writable directory, file, symlink
+  target or target directory is refused (POSIX). An empty directory gives a context with no trust anchor, which fails
+  every handshake (#6269).
+- #6559 / #6653 / #6654 (3-agent vote (6def5ab6); Q1 3-0, Q2 2-1, Q3 2-1): every directory the path passes through,
+  an ancestor of the CA path, of a symlink met on the way, or of a link's target, is held to the rule for a CA file's
+  directory. It must be owned by this user or root (OpenSSH StrictModes), and must not be group- or world-writable
+  unless it is sticky and the entry in it belongs to this user or root (a `/tmp`-style ancestor with a private
+  subdirectory is accepted). Whoever can change such a directory can swap a subdirectory, re-point a link or replace
+  the file, and an ABA swap of an ancestor during the load is invisible to the inode re-check, so the refusal comes
+  before anything is read. The file is still loaded by path and re-checked to be the same inode afterwards (Q3).
+  Intended break: a CA path under a group-writable directory is refused, e.g. Homebrew's `/opt/homebrew/etc`
+  (`drwxrwxr-x` with group `admin`) and Intel-mac `/usr/local` trees; the error names the directory, its owner uid
+  and mode, and the fix (`chmod go-w <dir>`, or `chown` for a directory owned by another user), or copy the bundle to
+  a private directory. No parameter turns the check off.
+- #6815 (extends the same vote): the CA file itself, and a CA directory, must also be owned by this user or root.
+  Their owner can rewrite them whatever their mode, exactly as a directory's owner can replace what is under it, so
+  a CA file owned by another non-root user is refused where its directory would have been.
+- #6828 (extends the same vote): a component that does not exist yet is held to its directory's rule with no sticky
+  exception, since anyone who can write that directory can create it after the check. After the open the path is
+  walked again and must end at the inode that was opened (`st_dev`, `st_ino` against `fstat`), so a swap between
+  the walk and the open is refused before anything is read; the post-load inode re-check (#6377) remains. A
+  directory or file that vanishes during the check is a `ValueError` (#6829), and a component after a file
+  (`ca.pem/.`, `ca.pem/..`) is refused as ENOTDIR (#6811).
+
+Residuals (accepted, each with its reason):
+- The validity-date check after the handshake reads the leaf only, because `getpeercert()` returns no chain.
+  OpenSSL checks every certificate's dates during the handshake, and the flag that would turn that off
+  (`VERIFY_X509_NO_CHECK_TIME`) is refused.
+- The `https://` proxy leg is authenticated by httpx's own default context (`SSL_CERT_FILE` / `SSL_CERT_DIR` /
+  certifi), not by the caller's context. No SDK secret crosses that leg: only httpcore's CONNECT, with the caller's
+  own `Proxy-Authorization` when the proxy URL carries credentials. The origin session inside the tunnel is held to
+  the caller's context.
+- The response backstop cannot stop a request that was already written; it exists for the paths where the pre-send
+  trace did not run. The trace lives in the transport, after every request event hook (#6537).
+- `verify=None` / `verify=True` with `SSL_CERT_FILE` or `SSL_CERT_DIR` set: the SDK loads that path itself under the
+  rules above (read once, permissions checked), and refuses a missing or wrong-kind path instead of httpx 0.27's
+  silent fallback to certifi (#6538).
+- #6934 (extends the same vote; `decision: ctypes over libSystem's ACL API over refusing every extended ACL or
+  shelling out to ls, because it asks the kernel's ACL object on the descriptor already open, with no spawn and no
+  dependency`): on macOS an extended ACL can grant a right the mode bits do not show. Every CA path component and the
+  CA file are refused when an ACL ALLOW entry gives anyone but this user or root a write, append, delete,
+  delete_child, writesecurity or chown right; the owner-only credential readers refuse a foreign read right too. A
+  deny entry grants nothing and is ignored; a group principal always counts. An ACL that cannot be read is a typed
+  refusal (fail closed), never a pass. Other platforms have no extended ACL this reads. The CA file is checked with
+  `fstat` on the descriptor that was opened, the path is walked again after the open and must end at that inode
+  (`st_dev`, `st_ino`), and the file/dir mode rule above applies to each.
+- #6317 (single-correct-answer fix of the descriptor-bound standard; no vote): the owner-only credential reader never
+  reads a credential by path after checking it. Where the platform has no `O_NOFOLLOW` (Windows), the path is checked
+  with `lstat` (a symlink, FIFO, device or directory is refused before any open), opened once, and the `fstat` of that
+  descriptor must match the checked `lstat` on device, inode, owner and mode; any difference is a refusal (fail closed),
+  and the bytes are read from that descriptor.

@@ -22,7 +22,7 @@ def test_default_mission_and_phase_prompts() -> None:
     config = SwarmConfig.from_env({})
     assert config.mission == DEFAULT_MISSION
     agent = _agent(_FakeModel(Decision(None, [], {})), [])
-    agent.config = SwarmConfig(base_urls=["http://mock"], max_steps=6)
+    agent.config = SwarmConfig(base_urls=["https://mock"], max_steps=6)
     assert "Gather facts" in agent.phase_goal(1)
     assert "Build lineage" in agent.phase_goal(3)
     assert "mission-summary-" in agent.phase_goal(agent.config.max_steps)
@@ -44,7 +44,7 @@ async def test_journal_timing_and_full_tool_summary() -> None:
             return httpx.Response(200, json={"results": []})
         return httpx.Response(200, json={"messages": []})
     agent.client._client = httpx.AsyncClient(  # noqa: SLF001
-        base_url="http://mock", transport=httpx.MockTransport(handler))
+        base_url="https://mock", transport=httpx.MockTransport(handler))
     try:
         record = await agent.run_once()
     finally:
