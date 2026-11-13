@@ -538,6 +538,7 @@ Series an operator should wire alerts to (canonical registration:
 | `ai_memory_federation_peer_configured{peer}` | gauge | `1` per peer in this node's configured membership (#3654). The census: a peer that never answers is still listed. |
 | `ai_memory_federation_peer_last_attempt_timestamp_seconds{peer,direction}`, `..._last_success_timestamp_seconds{peer,direction}` | gauge | UNIX seconds, on THIS node's clock, of the last attempted and the last successful exchange with the peer. `direction` is `pull` (our catch-up of the peer) or `push` (our writes to it); a push only counts as a success when the peer applied it. Absent until first observed, never a fake `0` (#3654). |
 | `ai_memory_federation_peer_consecutive_failures{peer,direction}`, `ai_memory_federation_peer_failures_total{peer,direction,class}` | gauge, counter | Failure streak since the last success, and failures by closed-set `class` (`unauthorized`, `throttled`, `rejected`, `server_error`, `unreachable`, `bad_response`, `not_applied`, `task_failed`, `other`) (#3654). |
+| `ai_memory_federation_pull_rows_refused_total{reason}` | counter | Delivered `/sync/since` rows refused and recorded by the receiver; the pull cursor passes them. Closed-set `reason`: `unparseable_ts`, `unparseable_body`, `invalid_memory`, `namespace_scope`, `content_attestation`, `hold_stalled` (#8788/#8789). |
 | `ai_memory_federation_peer_clock_skew_seconds{peer}` | gauge | Peer clock minus local clock from the `Date` header of the peer's last catch-up (pull) response, whole seconds; absent on a node that runs no catch-up loop. Measured, never used as a freshness timestamp (#3654). |
 | `ai_memory_federation_peer_push_dlq_depth{peer}`, `..._push_dlq_oldest_failed_timestamp_seconds{peer}` | gauge | Per-peer push-DLQ backlog and its oldest pending failure, refreshed each replay tick; the oldest-failure series is absent when the backlog is empty (#3654). |
 | `ai_memory_federation_catchup_interval_seconds` | gauge | The configured catch-up cadence, so a stalled catch-up worker is alertable as `time() - last_attempt{direction="pull"}` exceeding a few intervals. Present only while a catch-up loop runs: a node with no catch-up loop exports no sample at all, never a `0` (#3654). |
@@ -1526,11 +1527,30 @@ signed-message gate over canonical GET bytes
 ### `GET /api/v1/sync/since`
 
 Query: `since` (RFC3339, optional), `limit` (default 500, max 10000),
-`peer` (attribution tag).
+`peer` (attribution tag), `after_seq` (decimal integer `>= 0`, optional;
+v1.0.0 #9082).
 
 ```json
 { "count": 5, "limit": 500, "memories": [ … ] }
 ```
+
+**Sequence walk (`after_seq`, #9082).** Every row carries `sync_seq`, a
+number the SERVING node assigns from a one-row counter on insert and on a
+real change of a replicated column (never from the row's own
+`updated_at`). With `after_seq` present the server filters by `sync_seq`
+only, so a row that arrived with an old or far-future `updated_at` is still
+served. The body then also carries `after_seq` (the value the walk started
+from: the sent value, or `0` after this node's numbering was reset),
+`next_seq` (the highest `sync_seq` the page examined before the namespace and
+visibility filters; an empty page echoes `after_seq`), `seq_epoch` (an opaque
+id of this node's numbering, regenerated on restore and re-init) and
+`next_since: null`. A puller stores `next_seq` with `seq_epoch` per peer in
+`sync_pull_seq` and restarts at `0` when the epoch changes. A malformed
+`after_seq` is refused with `400` and the exact text
+`invalid `after_seq` parameter — expected a decimal integer >= 0`. Without
+`after_seq` (or against a node built before v102, which answers without
+`next_seq`) the timestamp `since` path is unchanged. Hard deletes are not
+carried on either path.
 
 ## Import / export
 

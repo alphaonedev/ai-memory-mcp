@@ -117,7 +117,7 @@ CLI subcommands):
 | HTTP routes | **105 production `.route(...)` registrations** / 91 unique URL paths |
 | CLI subcommands | **90 default build** / **92 under `--features sal`** (the `capability init` sub-verb rides the existing `Capability` command, so the top-level count is unchanged) |
 | `MemoryKind` variants | **16** (adds v1.0.0 epistemic typing `Told` / `Instruction` / `Intervention`, [#1945](https://github.com/alphaonedev/ai-memory-mcp/issues/1945)) |
-| Schema | **v101** (`CURRENT_SCHEMA_VERSION`, both adapters). Not uniformly additive: v79–v85 are additive, **v86 and v87 rewrite stored rows**, v88 is index-only, v89 redefines the postgres FTS `tsv` generated column (derived data, no stored-row rewrite), v90–v97 add tables/columns, except that **v97 also rewrites existing `_agents` registration rows in `memories`** (removes `metadata.write_signature`, sets `attest_level=claimed`; sqlite `0081_v97_agent_pubkey_history.sql:118-140`, postgres `0054_v97_agent_pubkey_history.sql:118-132` — take a backup first) and v92 rebuilds SQLite's `schema_version` table (create + copy + drop + rename) to add its `version <= 100000` bound (postgres: `ADD CONSTRAINT`) — a version-table rebuild, not a `memories` rewrite; v98 adds legacy inbox namespace aliases; v99 (#3655) adds the per-peer contact stamp; v101 (#3690) makes the `(title, namespace)` unique index PARTIAL (`WHERE lifecycle_state <> 'tombstoned'`) so a consolidation tombstone gives its slot up — index-only, no stored-row rewrite. Per-rung detail + the true bound of the migration evidence: §"Schema ladder v78 → v101" |
+| Schema | **v102** (`CURRENT_SCHEMA_VERSION`, both adapters). Not uniformly additive: v79–v85 are additive, **v86 and v87 rewrite stored rows**, v88 is index-only, v89 redefines the postgres FTS `tsv` generated column (derived data, no stored-row rewrite), v90–v97 add tables/columns, except that **v97 also rewrites existing `_agents` registration rows in `memories`** (removes `metadata.write_signature`, sets `attest_level=claimed`; sqlite `0081_v97_agent_pubkey_history.sql:118-140`, postgres `0054_v97_agent_pubkey_history.sql:118-132` — take a backup first) and v92 rebuilds SQLite's `schema_version` table (create + copy + drop + rename) to add its `version <= 100000` bound (postgres: `ADD CONSTRAINT`) — a version-table rebuild, not a `memories` rewrite; v98 adds legacy inbox namespace aliases; v99 (#3655) adds the per-peer contact stamp; v101 (#3690) makes the `(title, namespace)` unique index PARTIAL (`WHERE lifecycle_state <> 'tombstoned'`) so a consolidation tombstone gives its slot up — index-only, no stored-row rewrite. v102 (#9082) adds the serving-assigned `memories.sync_seq` pull sequence (backfilled in `(updated_at, id)` order; a one-row counter; the `sync_pull_seq` puller cursor) so `/sync/since` serves a row whatever its own `updated_at`. Per-rung detail + the true bound of the migration evidence: §"Schema ladder v78 → v102" |
 
 ## Before upgrading — run `ai-memory config check` (#3715)
 
@@ -714,7 +714,7 @@ those two review lanes raised, and no tag has been cut.
 
 ## Schema ladder v78 → v100
 
-`CURRENT_SCHEMA_VERSION = 101` on both adapters
+`CURRENT_SCHEMA_VERSION = 102` on both adapters
 (`src/storage/migrations.rs`, `src/store/postgres.rs`); CLAUDE.md
 §Database is the SSOT. Both adapters mirror via
 `src/store/postgres.rs::{migrate_v79 … migrate_v100}`.

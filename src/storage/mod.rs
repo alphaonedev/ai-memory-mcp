@@ -975,6 +975,7 @@ pub mod schema_integrity;
 /// accounting SQLite then skips, so every surface that asks "is this database
 /// sound?" gets the same fail-closed answer.
 pub mod sqlite_integrity;
+pub mod sync_seq;
 /// v1.0.0 #3675 — moves a `sync_state` row keyed by a RAW (credential-bearing)
 /// peer URL onto its allowlist-rendered key, cursors preserved, raw row deleted.
 pub mod sync_state_rekey;
@@ -22145,8 +22146,14 @@ pub fn sync_peer_record_contact(
     Ok(())
 }
 
+/// #8743 — the pull cursor a row created by the PUSH half carries: the RFC
+/// 3339 floor, lexically below every real stamp, so it claims no pull progress.
+pub const SYNC_STATE_NO_PULL_CURSOR: &str = "0001-01-01T00:00:00Z";
+
 /// Record that local memories up to `updated_at = pushed_at` have been
 /// accepted by `peer_id`. Creates the row if it doesn't exist; monotonic.
+/// #8743 — a created row's pull cursor is [`SYNC_STATE_NO_PULL_CURSOR`],
+/// never `now`: a push must not move the pull past rows not yet received.
 #[allow(dead_code)] // called via lib crate (daemon_runtime); bin sees it as unused
 pub fn sync_state_record_push(
     conn: &Connection,
@@ -22157,14 +22164,14 @@ pub fn sync_state_record_push(
     let now = Utc::now().to_rfc3339();
     conn.execute(
         "INSERT INTO sync_state (agent_id, peer_id, last_seen_at, last_pulled_at, last_pushed_at) \
-         VALUES (?1, ?2, ?3, ?3, ?4) \
+         VALUES (?1, ?2, ?5, ?3, ?4) \
          ON CONFLICT(agent_id, peer_id) DO UPDATE SET \
             last_pushed_at = CASE \
                 WHEN excluded.last_pushed_at IS NULL THEN last_pushed_at \
                 WHEN last_pushed_at IS NULL THEN excluded.last_pushed_at \
                 WHEN excluded.last_pushed_at > last_pushed_at THEN excluded.last_pushed_at \
                 ELSE last_pushed_at END",
-        params![agent_id, peer_id, now, pushed_at],
+        params![agent_id, peer_id, now, pushed_at, SYNC_STATE_NO_PULL_CURSOR],
     )?;
     Ok(())
 }

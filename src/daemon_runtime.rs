@@ -8954,55 +8954,12 @@ where
     Ok(())
 }
 
-/// v1.0.0 #2718 / CB-14 (B-5) — the maximum a peer-advertised pull
-/// cursor may LEAD the local wall-clock before it is rejected as
-/// poisoned. The `/sync/since` `next_since` field is peer-controlled and
-/// is written straight into `sync_state` through a monotonic (refuse-to-
-/// REGRESS) upsert, so a peer answering `next_since:"9999-12-31T…"` would
-/// otherwise permanently PIN this node's cursor (every later pull returns
-/// zero rows and nothing can lower it without a manual DB edit). The
-/// bound is generous enough to absorb real NTP drift yet defeats any
-/// far-future poison.
-pub(crate) const PULL_CURSOR_FUTURE_SKEW_SECS: i64 = 300;
-
-/// v1.0.0 #2718 / CB-14 — validate a peer-advertised pull-cursor
-/// candidate BEFORE honoring it as this node's new `sync_state`
-/// watermark. `Ok(())` only when the candidate is a well-formed,
-/// non-poisoned, forward step; `Err(reason)` (a short WARN string) when
-/// the candidate:
-///   * does not parse as RFC 3339,
-///   * LEADS the local wall-clock by more than
-///     [`PULL_CURSOR_FUTURE_SKEW_SECS`] (far-future poison), or
-///   * is NOT STRICTLY greater than the current cursor (`since`).
-///
-/// The monotonic check is LEXICAL to match the downstream pipeline
-/// exactly: `sync_state_observe`'s upsert (`excluded > stored`) and the
-/// server's `updated_at > since` SQL are both lexical string compares,
-/// so a value the server considers "greater" is accepted here on the
-/// same terms — no false rejection at the tie-group boundary. The
-/// far-future bound is the one check that must parse, to compare against
-/// `now`. On rejection the caller MUST NOT advance the cursor (leave
-/// `sync_state` unchanged) — DEGRADE (re-pull the same window next
-/// cycle), never silently skip forward over undelivered rows.
-pub(crate) fn validate_pull_cursor(
-    candidate: &str,
-    current_since: Option<&str>,
-) -> Result<(), &'static str> {
-    let candidate_dt = match chrono::DateTime::parse_from_rfc3339(candidate) {
-        Ok(dt) => dt.with_timezone(&chrono::Utc),
-        Err(_) => return Err("not RFC3339"),
-    };
-    let ceiling = chrono::Utc::now() + chrono::Duration::seconds(PULL_CURSOR_FUTURE_SKEW_SECS);
-    if candidate_dt > ceiling {
-        return Err("exceeds now + skew (far-future cursor poison)");
-    }
-    if let Some(cur) = current_since
-        && candidate <= cur
-    {
-        return Err("not strictly greater than current cursor");
-    }
-    Ok(())
-}
+/// v1.0.0 #2718 / CB-14 — the pull-cursor skew bound and validator. #8743
+/// moved both into [`crate::federation::pull_cursor`], which bounds the
+/// cursor by this node's own clock; re-exported here for existing callers.
+pub(crate) use crate::federation::pull_cursor::PULL_CURSOR_FUTURE_SKEW_SECS;
+#[cfg(test)]
+pub(crate) use crate::federation::pull_cursor::validate_pull_cursor;
 
 /// Run a single sync cycle against one peer — pull then push.
 ///
@@ -9018,6 +8975,29 @@ pub async fn sync_cycle_once(
     api_key: Option<&str>,
     batch_size: usize,
 ) -> Result<()> {
+    sync_cycle_once_reporting(
+        client,
+        db_path,
+        local_agent_id,
+        peer_url,
+        api_key,
+        batch_size,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// #8743 — [`sync_cycle_once`], returning the pull window's
+/// [`crate::federation::PullOutcome`] so a caller (and the #8743 tests) can
+/// see rows that were deferred or refused instead of a bare `Ok(())`.
+pub async fn sync_cycle_once_reporting(
+    client: &reqwest::Client,
+    db_path: &Path,
+    local_agent_id: &str,
+    peer_url: &str,
+    api_key: Option<&str>,
+    batch_size: usize,
+) -> Result<crate::federation::PullOutcome> {
     let peer_url = peer_url.trim_end_matches('/');
     // #3675 / #3687 / #3711 — the peer's DURABLE identity (the `sync_state`
     // key) and its LOG label are the allowlist rendering `scheme://host
@@ -9031,7 +9011,7 @@ pub async fn sync_cycle_once(
     let peer_key = peer_key.as_str();
 
     // --- PULL --------------------------------------------------------
-    let since = {
+    let (since, seq_cursor) = {
         let conn = db::open(db_path)?;
         // #3675 — a row a pre-#3675 daemon keyed by the raw URL is moved
         // onto the rendered key (cursors folded, raw row deleted) so the
@@ -9043,15 +9023,22 @@ pub async fn sync_cycle_once(
                  URL key (#3675)"
             );
         }
-        db::sync_state_load(&conn, local_agent_id)?
+        let since = db::sync_state_load(&conn, local_agent_id)?
             .entries
             .get(peer_key)
-            .cloned()
+            .cloned();
+        // #9082 — the sequence cursor rides beside it (never seeded from it).
+        (
+            since,
+            crate::federation::pull_seq::load_cursor(&conn, local_agent_id, peer_key),
+        )
     };
 
     let mut pull_url = format!(
-        "{peer_url}/api/v1/sync/since?limit={batch_size}&peer={}",
-        urlencoding_minimal(local_agent_id)
+        "{peer_url}/api/v1/sync/since?limit={batch_size}&peer={}&{}={}",
+        urlencoding_minimal(local_agent_id),
+        field_names::AFTER_SEQ,
+        seq_cursor.after_seq()
     );
     if let Some(ref s) = since {
         pull_url.push_str("&since=");
@@ -9116,145 +9103,42 @@ pub async fn sync_cycle_once(
         db::sync_peer_record_contact(&conn, local_agent_id, peer_url, cadence)?;
     }
     let pull_count = pulled.memories.len();
-    // #2441 — advance the cursor on rows the peer EXAMINED, not on the
-    // rows it projected. The peer applies its per-peer namespace
-    // allowlist and the `scope=private` visibility filter IN MEMORY,
-    // AFTER the SQL `LIMIT`, so a window composed entirely of
-    // out-of-scope rows comes back `count: 0` behind an HTTP 200.
-    // Deriving the cursor from `memories.last()` therefore pinned it
-    // forever: the identical window was re-requested every cycle and
-    // the replica never converged, while every observable signal said
-    // "in sync". `next_since` is the peer's honest examined-watermark
-    // (and is tie-group-safe, which `memories.last()` never was);
-    // the legacy expression remains the fallback for a peer that does
-    // not yet publish the field.
-    // #2718 / CB-14 (B-5) — resolve the watermark to advance to, VALIDATING
-    // the peer-controlled candidate first. `next_since` is peer-controlled
-    // and is written straight into `sync_state` through a monotonic
-    // (refuse-to-regress) upsert, so a peer answering a far-future value
-    // would permanently PIN this node's cursor. Validate before honoring;
-    // on rejection do NOT advance (leave `sync_state` unchanged) and WARN.
-    // The pulled rows still apply below — we simply re-pull the same window
-    // next cycle rather than skipping forward over undelivered rows.
-    let advance_to: Option<String> = match pulled.next_since.as_deref() {
-        Some(candidate) => match validate_pull_cursor(candidate, since.as_deref()) {
-            Ok(()) => Some(candidate.to_string()),
-            Err(reason) => {
-                tracing::warn!(
-                    target: crate::federation::SCOPE_TRACE_TARGET,
-                    peer = %peer_key,
-                    candidate = %candidate,
-                    reason,
-                    "sync-daemon: refusing peer-advertised next_since cursor; leaving \
-                     sync_state watermark unchanged (#2718 cursor-poisoning guard)"
-                );
-                None
-            }
-        },
-        // Legacy peer that does not publish `next_since`: fall back to the
-        // examined-rows watermark, held to the SAME validation so a poisoned
-        // `memories.last().updated_at` cannot pin the cursor either.
-        None => match pulled.memories.last().map(|m| m.updated_at.as_str()) {
-            Some(fallback) => match validate_pull_cursor(fallback, since.as_deref()) {
-                Ok(()) => Some(fallback.to_string()),
-                Err(reason) => {
-                    tracing::warn!(
-                        target: crate::federation::SCOPE_TRACE_TARGET,
-                        peer = %peer_key,
-                        candidate = %fallback,
-                        reason,
-                        "sync-daemon: refusing peer memories.last() watermark; leaving \
-                         sync_state watermark unchanged (#2718 cursor-poisoning guard)"
-                    );
-                    None
-                }
-            },
-            None => None,
-        },
-    };
-
+    // #2441 / #2718 / #2714 / #3233 / #8743 — the cursor is resolved by
+    // `PullCursorTracker` from this node's clock and the rows durably
+    // applied, never from a value the peer controls: `next_since` is honoured
+    // only when it is not ahead of this node's clock and not at or past a
+    // delivered row that was not applied (#2441's examined-watermark keeps
+    // working for in-bound answers); a row stamped beyond now + skew is
+    // DEFERRED (not applied, counted, logged) and holds the cursor below it.
+    let page_limit = batch_size.min(pulled.limit);
+    // #9082 — a malformed sequence answer applies nothing, moves no cursor.
+    let seq = crate::federation::pull_seq::classify(
+        &serde_json::Value::Object(pulled.rest),
+        seq_cursor,
+        peer_key,
+    )
+    .ok_or_else(|| anyhow::anyhow!("sync-daemon: malformed sequence answer"))?;
+    let mut tracker = crate::federation::pull_seq::tracker_for(&seq, since, page_limit);
     {
         let conn = db::open(db_path)?;
-        // #2714 (CB-10, data-loss) — a transient/non-durable apply (SQLITE_BUSY
-        // and siblings) MUST NOT let the cursor advance past the un-applied row.
-        // Pre-fix this loop discarded the insert result (`let _ =`) and then
-        // advanced `sync_state` to `advance_to` UNCONDITIONALLY — and #2663's
-        // `next_since` fix made it WORSE, leaping the cursor to the peer's
-        // examined-watermark far past any individually-failed row, so one
-        // `SQLITE_BUSY` permanently dropped that row (the strict `updated_at >
-        // since` delta never re-offers it). Adopt the `catchup_halted` discipline
-        // the `serve` puller got right in #1687: halt at the first non-durable
-        // apply and advance only to the last DURABLE success, so the failed row
-        // (and everything after it) is re-pulled next cycle. `/sync/since` orders
-        // rows by `updated_at` ASC, so the pre-failure high-water is <= the
-        // failed row's timestamp — the failed row is never skipped.
-        let mut apply_halted = false;
-        let mut last_durable: Option<String> = None;
-        for mem in &pulled.memories {
-            if crate::validate::RequestValidator::validate_memory(mem).is_err() {
-                continue;
-            }
-            // #2715 (CB-11 / B-4) — per-write content attestation, the pull
-            // sibling of the `/sync/push` gate: a forged `metadata.write_signature`
-            // is refused, a valid one lands `agent_attested`, absent → `claimed`.
-            // #3233 — a delivered skip MUST halt the watermark: missing-author-key
-            // is recoverable after enrollment, and leaping `next_since` is silent
-            // inbound data loss (same disposition as the serve catchup puller).
-            let mut to_insert = mem.clone();
-            crate::handlers::federation_receive::sanitize_inbound_pull_memory(&mut to_insert);
-            let author_bound_key =
-                crate::identity::attest::presented_attestation_author_needing_bound_key(
-                    &to_insert, None,
-                )
-                .and_then(|author| {
-                    crate::handlers::federation_receive::historical_author_key_or_warn(
-                        db::agent_pubkey_for_attestation_at(&conn, author, &to_insert.created_at),
-                        author,
-                    )
-                });
-            if !crate::handlers::federation_receive::attest_inbound_pull_memory(
-                &mut to_insert,
-                author_bound_key.as_ref(),
-            ) {
-                apply_halted = true;
-                continue;
-            }
-            match db::insert_if_newer(&conn, &to_insert) {
-                Ok(_) => {
-                    if !apply_halted
-                        && last_durable
-                            .as_deref()
-                            .is_none_or(|cur| to_insert.updated_at.as_str() > cur)
-                    {
-                        last_durable = Some(to_insert.updated_at.clone());
-                    }
-                }
-                Err(e) => {
-                    apply_halted = true;
-                    tracing::warn!(
-                        target: crate::federation::SCOPE_TRACE_TARGET,
-                        peer = %peer_key,
-                        memory_id = %to_insert.id,
-                        error = %e,
-                        "sync-daemon: non-durable apply — halting cursor advance so \
-                         the un-applied row is re-pulled next cycle (#2714 row-loss guard)"
-                    );
-                }
-            }
-        }
-        // #2714 — when an apply failed this window, NEVER advance to the peer's
-        // examined-watermark (`advance_to`) past the un-applied row; advance only
-        // to the last durable success. On a clean window keep the #2441/#2663
-        // `next_since` behaviour (advance to the validated peer watermark).
-        let observe_to: Option<&str> = if apply_halted {
-            last_durable.as_deref()
-        } else {
-            advance_to.as_deref()
-        };
-        if let Some(at) = observe_to {
-            db::sync_state_observe(&conn, local_agent_id, peer_key, at)?;
-        }
+        crate::federation::pull_cursor::apply_sync_cycle_window(
+            &conn,
+            &pulled.memories,
+            &mut tracker,
+            peer_key,
+        );
+        crate::federation::pull_seq::persist_cursor(
+            &conn,
+            &mut tracker,
+            &seq,
+            pulled.next_since.as_deref(),
+            pull_count,
+            local_agent_id,
+            peer_key,
+        )?;
     }
+    let outcome = tracker.outcome();
+    crate::federation::pull_cursor::log_pull_outcome("sync-daemon", peer_key, &outcome);
 
     // --- PUSH --------------------------------------------------------
     let last_pushed = {
@@ -9333,7 +9217,7 @@ pub async fn sync_cycle_once(
     }
 
     tracing::info!("sync-daemon: peer={peer_key} pulled={pull_count} pushed={push_count}");
-    Ok(())
+    Ok(outcome)
 }
 
 /// Run the sync-daemon main loop with a programmable shutdown.
@@ -9586,14 +9470,13 @@ fn urlencoding_minimal(s: &str) -> String {
 }
 
 /// Mirrors the pre-W6 `main.rs::SyncSinceResponse` — the fields we
-/// deserialize from the peer's `/api/v1/sync/since` body. `count` and
-/// `limit` are present in the wire payload but unused on the receive
-/// side; allowed to be dead so `clippy::pedantic` doesn't trip.
+/// deserialize from the peer's `/api/v1/sync/since` body. `count` is
+/// present in the wire payload but unused on the receive side; `limit` is
+/// the page size the peer applied (#8743 page-full test).
 #[derive(serde::Deserialize)]
 struct SyncSinceResponse {
     #[allow(dead_code)]
     count: usize,
-    #[allow(dead_code)]
     limit: usize,
     memories: Vec<crate::models::Memory>,
     /// #2441 — the peer's PULL CURSOR, derived from the rows it
@@ -9604,6 +9487,10 @@ struct SyncSinceResponse {
     /// working exactly as before.
     #[serde(default)]
     next_since: Option<String>,
+    /// #9082 — every other field; the sequence walk's answer
+    /// (`next_seq` / `after_seq` / `seq_epoch`) is read from it by name.
+    #[serde(flatten)]
+    rest: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Re-export the `Instant`/`Duration` types so test crate use sites stay

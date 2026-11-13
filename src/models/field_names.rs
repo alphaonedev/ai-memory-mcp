@@ -34,6 +34,9 @@
 
 /// `access_count` — wire/row field name.
 pub const ACCESS_COUNT: &str = "access_count";
+/// `after_seq` — #9082 `/sync/since` query parameter: walk the serving
+/// node's `memories.sync_seq` strictly above this value (an `i64 >= 0`).
+pub const AFTER_SEQ: &str = "after_seq";
 /// `action_type` — wire/row field name.
 pub const ACTION_TYPE: &str = "action_type";
 /// `agent_filter` — wire/row field name.
@@ -427,6 +430,13 @@ pub const NAMESPACE_FILTER: &str = "namespace_filter";
 /// window. `null` means "do not move your cursor" (nothing was
 /// examined, or advancing could not be proven safe).
 pub const NEXT_SINCE: &str = "next_since";
+/// `next_seq` — wire field name.
+///
+/// #9082 — the `/sync/since` SEQUENCE cursor: the highest `sync_seq` the
+/// serving node EXAMINED for this page (visible or not), or the request's
+/// effective `after_seq` when the page is empty. Never the counter head, so
+/// a row committed below the head while the page was read is still walked.
+pub const NEXT_SEQ: &str = "next_seq";
 /// `observations` — wire/row field name.
 pub const OBSERVATIONS: &str = "observations";
 /// `observed_actor` — #3587 U2 line-file watch metadata: untrusted actor
@@ -501,6 +511,10 @@ pub const RULING_KEY: &str = "ruling_key";
 pub const SCHEMA_VERSION: &str = "schema_version";
 /// `scope_status` — wire/row field name.
 pub const SCOPE_STATUS: &str = "scope_status";
+/// `seq_epoch` — #9082 opaque per-database id of the serving node's
+/// `sync_seq` numbering, regenerated on restore; a puller whose stored
+/// epoch differs walks again from 0.
+pub const SEQ_EPOCH: &str = "seq_epoch";
 /// `sender_agent_id` — wire/row field name.
 pub const SENDER_AGENT_ID: &str = "sender_agent_id";
 /// `sender_policy_digest_hex` — FED-RQ-03 (#1947) federation `/sync/push`

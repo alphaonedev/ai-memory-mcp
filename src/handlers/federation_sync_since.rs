@@ -39,6 +39,16 @@ const SYNC_SINCE_NO_SCOPE_REFUSAL: &str = "sync_since: no scope allowlist for pe
      as the only guarantee, and the enterprise posture check reports it as a weakening; use it \
      only for a legacy-peer migration window.";
 
+/// The `scope_status` value of a `/sync/since` response: `legacy_bypass`
+/// when the trust-peer bypass served the rows, else `scoped`.
+fn scope_status(allow_all_legacy: bool) -> &'static str {
+    if allow_all_legacy {
+        "legacy_bypass"
+    } else {
+        "scoped"
+    }
+}
+
 /// #2441 — compute the honest PULL CURSOR for one `/sync/since` page.
 ///
 /// `examined` is the row set the SQL `LIMIT` returned, **before** the
@@ -127,6 +137,55 @@ fn warn_if_cursor_pinned(next_since: Option<&str>, raw_count: usize, limit: usiz
     }
 }
 
+/// v1.0.0 #9082 — parse the raw `after_seq` query value. Absent means the
+/// legacy `since` path; a present value must be a decimal `i64 >= 0`, and
+/// anything else (empty, negative, non-numeric, overflowing) is refused with
+/// an exact 400 so a malformed cursor never silently walks from 0.
+fn parse_after_seq(raw: Option<&str>) -> Result<Option<i64>, axum::response::Response> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    match raw.parse::<i64>() {
+        Ok(v) if v >= 0 => Ok(Some(v)),
+        _ => Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": SYNC_SINCE_BAD_AFTER_SEQ })),
+        )
+            .into_response()),
+    }
+}
+
+/// The exact 400 text for a malformed `after_seq` (#9082).
+pub const SYNC_SINCE_BAD_AFTER_SEQ: &str =
+    "invalid `after_seq` parameter — expected a decimal integer >= 0";
+
+/// v1.0.0 #9082 — read one page of the sequence walk from whichever backend
+/// serves this node. The `next_seq` it carries is computed from the rows the
+/// SQL `LIMIT` EXAMINED, before the namespace and visibility filters run.
+async fn read_seq_page(
+    app: &AppState,
+    after_seq: i64,
+    limit: usize,
+) -> Result<crate::storage::sync_seq::SeqPage, axum::response::Response> {
+    #[cfg(feature = "sal")]
+    if matches!(app.storage_backend, StorageBackend::Postgres) {
+        return app
+            .store
+            .list_memories_after_seq(after_seq, limit)
+            .await
+            .map_err(store_err_to_response);
+    }
+    let lock = app.db.lock().await;
+    crate::storage::sync_seq::memories_after_seq(&lock.0, after_seq, limit).map_err(|e| {
+        tracing::error!("sync_since: seq walk: {e}");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": crate::errors::msg::INTERNAL_SERVER_ERROR})),
+        )
+            .into_response()
+    })
+}
+
 pub async fn sync_since(
     State(app): State<AppState>,
     headers: HeaderMap,
@@ -181,6 +240,12 @@ pub async fn sync_since(
         )
             .into_response();
     }
+    // #9082 — the sequence cursor is validated with the same up-front 400
+    // discipline as `since`.
+    let after_seq = match parse_after_seq(q.after_seq.as_deref()) {
+        Ok(v) => v,
+        Err(rejection) => return rejection,
+    };
     // #1932 (CWE-770) — clamp the outbound page to the SAME
     // `app.max_page_size` (default 1000) the inbound `/sync/push` path
     // enforces, instead of a hard-coded 10_000. Pre-fix a hostile peer
@@ -188,7 +253,12 @@ pub async fn sync_since(
     // Vec+JSON allocation (10k rows × 64 KiB `content`) before the
     // response CompressionLayer runs — an asymmetric, peer-triggered
     // memory-amplification vector. The pull page now matches the push cap.
-    let limit = q.limit.unwrap_or(500).min(app.max_page_size);
+    // #8743 — the default is the one constant both pull loops use to tell a
+    // full page (more rows may share its newest timestamp) from a short one.
+    let limit = q
+        .limit
+        .unwrap_or(crate::federation::pull_cursor::SYNC_SINCE_DEFAULT_LIMIT)
+        .min(app.max_page_size);
 
     // v0.7.0 #239 — per-peer namespace allowlist. Read the
     // `x-peer-id` header + the operator-configured attestation map
@@ -346,19 +416,94 @@ pub async fn sync_since(
         }
     };
 
+    // v1.0.0 #9082 — the sequence walk. With `after_seq` present the server
+    // filters by the serving-assigned `sync_seq` ONLY (never by the row's own
+    // `updated_at`), so a row that reached this node below a puller's
+    // timestamp cursor is still served. `next_seq` comes from the rows the
+    // SQL `LIMIT` examined, before the two filters below; an empty page
+    // echoes the effective `after_seq`, never the counter head.
+    // decision (#9176 F8): no `sync_state_observe` on this path over
+    // recording a watermark because the seq walk has no timestamp watermark
+    // to record (`next_since` is null) and the puller owns its cursor
+    // (`sync_pull_seq`); `receiver_clock` keeps reflecting the since path and
+    // /sync/push only. Pinned by
+    // `seq_pull_records_no_serving_sync_state_9176`.
+    if let Some(after_seq) = after_seq {
+        // #9176 S4 / F3: the clamp is scoped to the seq walk, so `limit=0`
+        // makes the same progress on both backends there (a page of one
+        // row) while the since path keeps `limit=0` -> 0 rows.
+        let limit = crate::storage::sync_seq::clamp_seq_limit(limit);
+        let page = match read_seq_page(&app, after_seq, limit).await {
+            Ok(p) => p,
+            Err(rejection) => return rejection,
+        };
+        // #9176 S5: a row this node cannot decrypt is passed (`next_seq`
+        // moves past it) and recorded here with its seq, id and reason, the
+        // same refused-and-passed shape the puller ledger uses. Stopping
+        // `next_seq` before it would stall every puller behind one row.
+        for (seq, id) in &page.undecryptable {
+            tracing::warn!(
+                target: crate::federation::peer::FED_LOG_TARGET,
+                sync_seq = *seq,
+                memory_id = %id,
+                reason = crate::storage::sync_seq::SEQ_ROW_UNDECRYPTABLE,
+                "/sync/since seq walk passed a row it cannot decrypt; a later \
+                 write re-offers it (#9176)"
+            );
+        }
+        let total = page.memories.len();
+        let ns_filtered: Vec<Memory> = page
+            .memories
+            .into_iter()
+            .filter(|m| allowed(&m.namespace))
+            .collect();
+        let after_ns = ns_filtered.len();
+        let excluded = total.saturating_sub(after_ns);
+        let filtered: Vec<Memory> = ns_filtered.into_iter().filter(visibility_ok).collect();
+        let excluded_for_scope_private = after_ns.saturating_sub(filtered.len());
+        let earliest_updated_at = filtered.first().map(|m| m.updated_at.clone());
+        let latest_updated_at = filtered.last().map(|m| m.updated_at.clone());
+        return (
+            StatusCode::OK,
+            Json(json!({
+                "count": filtered.len(),
+                "limit": limit,
+                (field_names::UPDATED_SINCE): q.since,
+                (field_names::EARLIEST_UPDATED_AT): earliest_updated_at,
+                (field_names::LATEST_UPDATED_AT): latest_updated_at,
+                (field_names::NEXT_SINCE): serde_json::Value::Null,
+                (field_names::AFTER_SEQ): page.effective_after,
+                (field_names::NEXT_SEQ): page.next_seq,
+                (field_names::SEQ_EPOCH): page.head.epoch,
+                "memories": filtered,
+                (field_names::EXCLUDED_FOR_SCOPE): excluded,
+                (field_names::EXCLUDED_FOR_SCOPE_PRIVATE): excluded_for_scope_private,
+                (field_names::SCOPE_STATUS): scope_status(allow_all_legacy),
+            })),
+        )
+            .into_response();
+    }
+
     // v0.7.0 Wave-3 Continuation 2 — dispatch through the SAL trait
     // when postgres-backed. Heterogeneous federation (sqlite ↔ postgres)
     // rides on this single code path so the wire shape is byte-blind
     // to the underlying store.
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
-        let (mems, raw_count) = match app
-            .store
-            .list_memories_updated_since_counted(q.since.as_deref(), limit)
-            .await
-        {
-            Ok(v) => v,
-            Err(e) => return store_err_to_response(e),
+        // #9176 S4 / F3: `limit=0` serves 0 rows on every backend. The
+        // sqlite path below sends `LIMIT 0` to the database; the SAL adapters
+        // floor their limit at 1, so the postgres path would serve one row.
+        let (mems, raw_count) = if limit == 0 {
+            (Vec::new(), 0)
+        } else {
+            match app
+                .store
+                .list_memories_updated_since_counted(q.since.as_deref(), limit)
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => return store_err_to_response(e),
+            }
         };
         let total = mems.len();
         // #2441 — derive the pull cursor from rows EXAMINED, before the
@@ -393,7 +538,7 @@ pub async fn sync_since(
                 (field_names::STORAGE_BACKEND): "postgres",
                 (field_names::EXCLUDED_FOR_SCOPE): excluded,
                 (field_names::EXCLUDED_FOR_SCOPE_PRIVATE): excluded_for_scope_private,
-                (field_names::SCOPE_STATUS): if allow_all_legacy { "legacy_bypass" } else { "scoped" },
+                (field_names::SCOPE_STATUS): scope_status(allow_all_legacy),
             })),
         )
             .into_response();
@@ -492,7 +637,7 @@ pub async fn sync_since(
             "memories": mems,
             (field_names::EXCLUDED_FOR_SCOPE): excluded,
             (field_names::EXCLUDED_FOR_SCOPE_PRIVATE): excluded_for_scope_private,
-            (field_names::SCOPE_STATUS): if allow_all_legacy { "legacy_bypass" } else { "scoped" },
+            (field_names::SCOPE_STATUS): scope_status(allow_all_legacy),
         })),
     )
         .into_response()

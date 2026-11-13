@@ -1758,6 +1758,16 @@ const MIGRATION_V100_TITLE_SLOT_LIVE_ROWS: &str =
 const MIGRATION_V101_A2A_TASKS: &str =
     include_str!("../../migrations/postgres/0058_v101_a2a_tasks.sql");
 
+/// v102 (#9082): the serving-assigned change sequence (`memories.sync_seq`,
+/// the one-row `sync_seq_counter` bumped by `UPDATE ... RETURNING` at COMMIT
+/// from deferred constraint triggers, the negative in-flight placeholder, the
+/// UNIQUE index and the puller-side `sync_pull_seq` mirror). Split at
+/// `storage::sync_seq::MIGRATION_V102_ONCE_MARKER` into a run-once head and
+/// an idempotent tail. The sqlite twin is
+/// `migrations/sqlite/0086_v102_sync_seq.sql`. 5-agent vote (4d3ea1c5).
+const MIGRATION_V102_SYNC_SEQ: &str =
+    include_str!("../../migrations/postgres/0059_v102_sync_seq.sql");
+
 /// v0.7.0 Cluster G — shadow-mode retention + denormalised `source`
 /// column + compound `(namespace, source, observed_at)` index
 /// supporting the calibration scan (issue #767, PERF-4 + PERF-12).
@@ -2148,7 +2158,7 @@ const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
 //       has carried these since v56, so its v88 is a no-op; doc twins
 //       migrations/{postgres/0045,sqlite/0072}_v88_list_composite_indexes.sql.
 //       CURRENT_SCHEMA_VERSION stays pinned in lockstep with sqlite.
-const CURRENT_SCHEMA_VERSION: i32 = 101;
+const CURRENT_SCHEMA_VERSION: i32 = 102;
 
 /// PostgreSQL session-scoped advisory lock key used to serialize
 /// concurrent `migrate()` invocations across processes and across
@@ -3322,6 +3332,10 @@ impl PostgresStore {
                 // `Self::migrate` would cover the `ai-memory migrate` CLI and
                 // miss the daemon boot this issue is about.
                 store.migrate_locked_with_contention_retry().await?;
+                // #9176 F6: the boot twin of the bind in `migrate`, under the
+                // bootstrap advisory lock, so a daemon opening a restored
+                // database re-mints its epoch (both call sites, per #2614).
+                store.bind_sync_seq_node_identity().await?;
                 // v1.0.0 (#3172) — SCHEMA-masks-DATA-LOSS gate for append-only
                 // bootstrap relations (`agent_lineage`). Postgres re-creates a
                 // DROPPED bootstrap relation EMPTY via `INIT_SCHEMA`'s CREATE
@@ -3900,7 +3914,12 @@ impl PostgresStore {
 
         // Run the migration body, capturing the result so we can always
         // release the lock even on a per-migration failure.
-        let result = self.migrate_locked_with_contention_retry().await;
+        let mut result = self.migrate_locked_with_contention_retry().await;
+        if result.is_ok() {
+            // #9176 F6: under the same advisory lock, so two processes opening
+            // one restored database mint one epoch, not two.
+            result = self.bind_sync_seq_node_identity().await;
+        }
 
         // Release ALL advisory locks held in this session and CLOSE the
         // timeout-relaxed connection rather than returning it to the pool with
@@ -3908,6 +3927,82 @@ impl PostgresStore {
         release_migration_advisory_lock(lock_conn).await;
 
         result
+    }
+
+    /// #9176 F6: bind the `/sync/since` seq epoch to this database instance.
+    /// The identity is `system_identifier:timeline:database oid`; a restore
+    /// into another cluster, a PITR (new timeline) or a clone into another
+    /// database changes it, and the epoch is then re-minted so every puller
+    /// walks this peer again from seq 0 instead of skipping the rows a
+    /// lowered head re-assigns. A first bind (NULL) only records the value.
+    ///
+    /// Fails closed for data: an identity that cannot be read (a role without
+    /// `pg_control_system`) logs a WARN and keeps the epoch, which is the
+    /// pre-#9176 behaviour; it never blocks the open. Residual, documented in
+    /// the migration: a same-database `pg_restore --clean` keeps all three
+    /// parts; that restore re-mints when the operator sets `node_identity`
+    /// to any other non-NULL value (for example `'restored'`) before the
+    /// first reopen.
+    async fn bind_sync_seq_node_identity(&self) -> StoreResult<()> {
+        let identity: Option<String> = match sqlx::query_scalar(
+            "SELECT (SELECT system_identifier::text FROM pg_control_system()) \
+                 || ':' || substr(pg_walfile_name(pg_current_wal_lsn()), 1, 8) \
+                 || ':' || (SELECT oid::text FROM pg_database \
+                            WHERE datname = current_database())",
+        )
+        .fetch_one(&self.pool)
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "sync_seq: node identity unreadable; epoch kept");
+                return Ok(());
+            }
+        };
+        let Some(identity) = identity else {
+            tracing::warn!("sync_seq: node identity unreadable; epoch kept");
+            return Ok(());
+        };
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin sync_seq identity tx", e))?;
+        let stored: Option<Option<String>> = sqlx::query_scalar(
+            "SELECT node_identity FROM sync_seq_counter WHERE id = 1 FOR UPDATE",
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("read sync_seq node identity", e))?;
+        match stored {
+            // No counter row: nothing to bind (the walk fails closed on it).
+            None => {}
+            Some(Some(prev)) if prev == identity => {}
+            Some(prev) => {
+                let remint = prev.is_some();
+                let sql = if remint {
+                    "UPDATE sync_seq_counter SET node_identity = $1, \
+                       epoch = replace(gen_random_uuid()::text, '-', '') WHERE id = 1"
+                } else {
+                    "UPDATE sync_seq_counter SET node_identity = $1 WHERE id = 1"
+                };
+                sqlx::query(sql)
+                    .bind(&identity)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| to_store_err("bind sync_seq node identity", e))?;
+                if remint {
+                    tracing::warn!(
+                        "sync_seq: database instance changed since the last open; \
+                         seq epoch re-minted, pullers rewalk from 0"
+                    );
+                }
+            }
+        }
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit sync_seq identity tx", e))?;
+        Ok(())
     }
 
     /// The actual migration ladder body. Held under the
@@ -4321,8 +4416,11 @@ impl PostgresStore {
         if current_version < 100 {
             self.migrate_v100().await?;
         }
-        if current_version < CURRENT_SCHEMA_VERSION {
+        if current_version < 101 {
             self.migrate_v101().await?;
+        }
+        if current_version < CURRENT_SCHEMA_VERSION {
+            self.migrate_v102().await?;
         }
 
         Ok(())
@@ -7522,6 +7620,58 @@ impl PostgresStore {
             target: TRACE_TARGET,
             "schema migration v101 applied (#8444: a2a_tasks - durable Task rows \
              for the Agent2Agent standard binding)"
+        );
+        Ok(())
+    }
+
+    /// v102 (#9082) - the serving-assigned change sequence. One transaction:
+    /// column and backfill (the part of the file above
+    /// `MIGRATION_V102_ONCE_MARKER`), then counter, UNIQUE index, placeholder
+    /// sequence and the triggers. Re-runnable (#9176 F1): the column add and
+    /// the backfill run only while `memories.sync_seq` is absent, the twin of
+    /// the sqlite `pragma_table_info` probe, so a ladder re-run never
+    /// re-numbers an assigned value; the tail is idempotent on its own.
+    async fn migrate_v102(&self) -> StoreResult<()> {
+        let marker = crate::storage::sync_seq::MIGRATION_V102_ONCE_MARKER;
+        let (once, always) = MIGRATION_V102_SYNC_SEQ.split_once(marker).ok_or_else(|| {
+            StoreError::IntegrityFailed {
+                detail: format!("v102 migration file lost its {marker} marker"),
+            }
+        })?;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v102 sync-seq migration tx", e))?;
+
+        let has_column: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
+               WHERE table_schema = current_schema() AND table_name = 'memories' \
+                 AND column_name = 'sync_seq')",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("probe memories.sync_seq", e))?;
+        if !has_column {
+            sqlx::raw_sql(once)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("apply v102 sync_seq column and backfill", e))?;
+        }
+        sqlx::raw_sql(always)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("apply v102 sync-seq migration", e))?;
+
+        record_schema_version(&mut tx, 102).await?;
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v102 migration", e))?;
+
+        tracing::info!(
+            target: TRACE_TARGET,
+            "schema migration v102 applied (#9082: memories.sync_seq - the serving-assigned \
+             change sequence /sync/since walks by)"
         );
         Ok(())
     }
@@ -25017,6 +25167,90 @@ impl MemoryStore for PostgresStore {
             .flatten()
             .collect();
         Ok((mems, raw_count))
+    }
+
+    async fn list_memories_after_seq(
+        &self,
+        after_seq: i64,
+        limit: usize,
+    ) -> StoreResult<crate::storage::sync_seq::SeqPage> {
+        // v1.0.0 #9082 — postgres twin of `storage::sync_seq::memories_after_seq`.
+        // The head, epoch and page are read in ONE repeatable-read snapshot so
+        // `effective_after` and the page agree. `memories_sync_seq_assign` runs
+        // as a deferred constraint trigger and bumps the counter at COMMIT, so
+        // every seq at or below the committed head belongs to a committed row
+        // (or a rolled-back gap), never to a row still in flight; an in-flight
+        // row carries a negative placeholder no walk (`> after_seq >= 0`) sees.
+        if after_seq < 0 {
+            return Err(StoreError::InvalidInput {
+                detail: crate::storage::sync_seq::negative_after_seq_detail(after_seq),
+            });
+        }
+        // #9176 S4: the one clamp both backends use (`1..=10_000`).
+        let limit_i: i64 = i64::try_from(crate::storage::sync_seq::clamp_seq_limit(limit))
+            .unwrap_or(STORE_LIST_MAX_LIMIT_SAL);
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("list after seq begin", e))?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("list after seq isolation", e))?;
+        let head_row: Option<(i64, String)> =
+            sqlx::query_as("SELECT head, epoch FROM sync_seq_counter WHERE id = 1")
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("list after seq head", e))?;
+        let Some((head, epoch)) = head_row else {
+            return Err(StoreError::IntegrityFailed {
+                detail: crate::storage::sync_seq::SYNC_SEQ_COUNTER_MISSING.to_string(),
+            });
+        };
+        let effective_after = if after_seq > head { 0 } else { after_seq };
+        let cols = MEMORY_READ_COLUMNS;
+        let vis = crate::models::lifecycle_visible_clause("");
+        let vis_expr = vis.strip_prefix("AND ").unwrap_or(&vis);
+        let rows = sqlx::query(&format!(
+            "SELECT {cols}, sync_seq AS sync_seq_examined, \
+                    ({vis_expr}) AS sync_seq_visible \
+               FROM memories WHERE sync_seq > $1 ORDER BY sync_seq ASC LIMIT $2",
+        ))
+        .bind(effective_after)
+        .bind(limit_i)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("list memories after seq", e))?;
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("list after seq commit", e))?;
+        let raw_count = rows.len();
+        let mut next_seq = effective_after;
+        let mut memories = Vec::with_capacity(raw_count);
+        let mut undecryptable = Vec::new();
+        let column_err = |e| to_store_err("list after seq column", e);
+        for row in &rows {
+            next_seq = row.try_get("sync_seq_examined").map_err(column_err)?;
+            let visible: bool = row.try_get("sync_seq_visible").map_err(column_err)?;
+            if !visible {
+                continue;
+            }
+            if let Some(mem) = Self::row_to_memory_scan(row)? {
+                memories.push(mem);
+            } else {
+                let id: String = row.try_get("id").map_err(column_err)?;
+                undecryptable.push((next_seq, id));
+            }
+        }
+        Ok(crate::storage::sync_seq::SeqPage {
+            memories,
+            undecryptable,
+            raw_count,
+            next_seq,
+            effective_after,
+            head: crate::storage::sync_seq::SeqHead { head, epoch },
+        })
     }
 
     async fn apply_remote_memory(

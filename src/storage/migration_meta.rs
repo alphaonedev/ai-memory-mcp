@@ -439,11 +439,11 @@ pub const MIGRATION_LADDER: &[MigrationMeta] = &[
     // `CREATE INDEX IF NOT EXISTS` + `INSERT OR IGNORE` on the composite PK make
     // the whole batch re-runnable, so a crash mid-arm self-heals on the next
     // open — idempotent. No full-table rebuild. Settled literal rung;
-    // v101 now owns the moving tip.
+    // v102 now owns the moving tip.
     // Postgres twin is `PostgresStore::migrate_v97`.
     meta(97, "AGENT_PUBKEY_HISTORY", true, true, NoLoss, Sqlite),
     // v98: live/archive namespace alias view; rollback drops the view, NoLoss.
-    // Settled literal rung; v101 now owns the moving tip.
+    // Settled literal rung; v102 now owns the moving tip.
     meta(98, "CANONICAL_INBOX_NAMESPACE", true, true, NoLoss, Sqlite),
     // v99 (#3655): additive `sync_peer_contact` table (durable per-peer
     // contact, apart from the data watermark); rollback drops the table,
@@ -464,6 +464,17 @@ pub const MIGRATION_LADDER: &[MigrationMeta] = &[
     // (`CREATE TABLE/INDEX IF NOT EXISTS`, idempotent). Postgres twin is
     // `PostgresStore::migrate_v101`.
     meta(101, "A2A_TASKS", true, true, NoLoss, Sqlite),
+    // v102 (#9082, v1.0.0, data-integrity): the serving-assigned change
+    // sequence. Adds `memories.sync_seq` (backfilled in `(updated_at, id)`
+    // order), the one-row `sync_seq_counter`, the UNIQUE index, the assignment
+    // triggers and the puller-side `sync_pull_seq` table. Idempotent (#9176
+    // F7): the column add and the backfill run only while `sync_seq` is
+    // absent (a `pragma_table_info` probe on sqlite, `information_schema` on
+    // Postgres) and the rest is `IF NOT EXISTS`, so a re-run never
+    // re-numbers an assigned value. Not reversible (the backfill writes an
+    // existing table); nothing is destroyed, NoLoss. Postgres twin is
+    // `PostgresStore::migrate_v102`. 5-agent vote (4d3ea1c5).
+    meta(102, "SYNC_SEQ", true, false, NoLoss, Sqlite),
 ];
 
 /// Look up the metadata for a target schema version.

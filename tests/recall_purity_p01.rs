@@ -1261,7 +1261,8 @@ fn v77_migration_backfills_preexisting_rows_folded() {
     // with the v77 `folded` column present.
     let conn = db::open(&path).expect("open");
     // #8444: tip pin moved 100 -> 101 with the a2a_tasks migration.
-    assert_eq!(db::migrations::current_schema_version_for_tests(), 101);
+    // #9082: tip pin moved 101 -> 102 with the sync_seq migration.
+    assert_eq!(db::migrations::current_schema_version_for_tests(), 102);
     let version: i64 = conn
         .query_row(
             "SELECT COALESCE(MAX(version), 0) FROM schema_version",

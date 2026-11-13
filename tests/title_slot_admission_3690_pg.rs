@@ -120,8 +120,8 @@ fn conflict_id(err: &StoreError) -> &str {
     }
 }
 
-/// #3690 — the schema claim on the pg side: the ladder tip (v101 since
-/// #8444; the index landed at v100) carries the SHIPPED index (after the
+/// #3690 — the schema claim on the pg side: the ladder tip (v102 since
+/// #9082; the index landed at v100) carries the SHIPPED index (after the
 /// ladder, which runs on every connect), PARTIAL on the ONE predicate.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pg_schema_tip_carries_the_partial_title_slot_index_3690() {
@@ -131,7 +131,8 @@ async fn pg_schema_tip_carries_the_partial_title_slot_index_3690() {
         .await
         .expect("schema_version");
     // #8444: tip pin moved 100 -> 101 with the a2a_tasks migration.
-    assert_eq!(version, 101);
+    // #9082: tip pin moved 101 -> 102 with the sync_seq migration.
+    assert_eq!(version, 102);
     let indexdef: String = sqlx::query_scalar(
         "SELECT indexdef FROM pg_indexes WHERE indexname = 'memories_title_ns_uidx'",
     )

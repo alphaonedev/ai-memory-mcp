@@ -1200,6 +1200,13 @@ pub fn open(path: &Path) -> Result<Connection> {
     conn.execute_batch(SCHEMA)
         .context("failed to initialize schema")?;
     migrate(&conn)?;
+    // v1.0.0 #9082 / #9176 F6 — a restore armed a fresh sync_seq epoch for
+    // this file, or a file copied back without `ai-memory restore` carries
+    // another file's identity: re-mint the epoch so pullers rewalk it. The
+    // open-time bind is record-stop exempt (#9176 B7), so an open completes
+    // under record-stop.
+    crate::storage::sync_seq::bind_at_open(&conn, path)
+        .context("sync_seq open-time bind (#9082, #9176)")?;
     // v1.0.0 (#3172) — SCHEMA-masks-DATA-LOSS gate for APPEND-ONLY bootstrap
     // relations (`agent_lineage`), placed HERE in the open funnel rather than
     // inside `migrate`, and deliberately AFTER `execute_batch(SCHEMA)`. The
@@ -1815,6 +1822,11 @@ mod tests {
                 conn.execute(&format!("DROP INDEX IF EXISTS {ix}"), [])
                     .expect("drop index");
             }
+            // #9176 F2: the v102 `memories_sync_seq_au` trigger names listed
+            // columns; drop it before reshaping (the ladder re-run below
+            // recreates it from the idempotent v102 tail).
+            conn.execute_batch(crate::storage::sync_seq::SQL_DROP_SYNC_SEQ_TRIGGERS)
+                .expect("drop sync_seq triggers");
             for col in [
                 "mentioned_entity_id",
                 "confidence_decayed_at",

@@ -52,3 +52,4 @@ docs/reference/ARCHITECTURE_REFERENCE.md	CURRENT_SCHEMA_VERSION 83→84	#2167 pa
 docs/reference/ARCHITECTURE_REFERENCE.md	CURRENT_SCHEMA_VERSION 84→85	#2035 past bump v85 (history, the TO side is a past ladder value)
 docs/reference/ARCHITECTURE_REFERENCE.md	CURRENT_SCHEMA_VERSION 85→86	#1834 past bump v86 (history, the TO side is a past ladder value)
 docs/reference/ARCHITECTURE_REFERENCE.md	CURRENT_SCHEMA_VERSION 86→87	#2333 past bump v87 (history, the TO side is a past ladder value)
+docs/v1.0.0/release-notes.md	its bound, and v101	#9082 rung narrative: v101 rewrote the title-slot index (the tip is v102)

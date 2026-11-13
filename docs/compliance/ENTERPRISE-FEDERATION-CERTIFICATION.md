@@ -20,7 +20,7 @@ re-issue at `b0483115`, the 2026-09-11 #3595 re-issue at `ad60bead` and the orig
 mint `e22bc93c` remain as historical records. Any change to the federation wire path or the `AI_MEMORY_FED_*` surface **voids this
 certification and triggers re-cert** (see §7).
 
-## STATUS — **VOID as of 2026-10-28** (§7 fired again by #2967, `src/federation/receive_auth.rs`, recorded in the §7 firing ledger; no live claim; the certification had already EXPIRED as of 2026-10-07 when §7 fired: 4 watched federation-wire files changed after the `385da3a05` bind; re-measurement and re-issue pending under WP-B1, #6063; the last LIVE claim was the 2026-10-02 re-issue at `385da3a05`)
+## STATUS — **VOID as of 2026-11-11** (§7 fired again by #9176: `src/federation/mod.rs`, `src/federation/peer.rs`, `src/federation/pull_cursor.rs`, `src/federation/pull_seq.rs`, `src/federation/receive.rs`, `src/handlers/federation_receive.rs`, the `/sync/since` wire fields `after_seq` / `next_seq` / `seq_epoch`, migration v102 (SQLite 0086, PostgreSQL 0059), recorded in the §7 firing ledger; no live claim; the certification had already EXPIRED as of 2026-10-07 when §7 fired: 4 watched federation-wire files changed after the `385da3a05` bind; re-measurement and re-issue pending under WP-B1, #6063; the last LIVE claim was the 2026-10-02 re-issue at `385da3a05`)
 
 > **Amendment (2026-10-07, #6063 WP-B1 — §7 EXPIRY RECORD, certification EXPIRED).**
 > The federation certification **expired** per §7 when four §7-watched
@@ -2082,6 +2082,40 @@ federation-wire surface changed AND cert doc re-issued/voided in the same
 change (...; banner EXPIRED - → VOID -)` and `check-cert-expiry: banner
 STATUS=VOID — the doc makes no live claim; nothing to hold it to`. The §8
 statuses below are historical records of earlier binds, not a live claim.
+
+**Re-cert trigger — FIRED by #8743, #8788, #8789 and #9082 (`src/federation/mod.rs`,
+`src/federation/peer.rs`, `src/federation/pull_cursor.rs`, `src/federation/pull_seq.rs`, `src/federation/receive.rs`,
+`src/handlers/federation_receive.rs`, 2026-11-11; PR #9176).**
+Six §7-watched paths changed (`src/federation/peer.rs` only widens its log-target constant to
+`pub(crate)`); the seq walk is served by the unwatched
+`src/handlers/federation_sync_since.rs`, recorded here because it changes the wire. The catch-up pull cursor (serve catch-up and the sync
+daemon's `sync_cycle_once`, SQLite and PostgreSQL) is no longer derived from a
+peer-controlled timestamp: it is capped at the receiver clock, a peer row stamped beyond
+the named skew bound is deferred with a named outcome, and the cursor passes a row only
+when that row is applied or recorded as refused (WARN log, the
+`ai_memory_federation_pull_rows_refused_total{reason}` counter and an outcome entry). A
+row that fails `validate_memory` is now recorded instead of dropped silently, and one
+permanently refused row no longer halts the rows after it. The pull also gains a
+serving-assigned sequence: `/api/v1/sync/since` accepts an `after_seq` query parameter and
+answers it with `next_seq` and `seq_epoch` (a new epoch tells the puller to walk from 0),
+backed by the `memories.sync_seq` column and the `sync_seq_counter` table of migration v102
+(SQLite 0086, PostgreSQL 0059). The epoch is bound to the database instance it was minted
+on (the SQLite file inode; the PostgreSQL system identifier, timeline and database oid), so a
+database restored or cloned outside `ai-memory restore` mints a new epoch on open and every
+puller walks it again from 0. These are additive wire fields and an additive schema change;
+the `since` path and its response are unchanged. No `AI_MEMORY_FED_*` identifier is added,
+removed or renamed, and no route or signature check changes. The per-row accept/refuse checks are unchanged, with one addition: a
+row whose apply keeps failing transiently while other rows apply is refused as
+`hold_stalled` after a bounded number of windows, and recorded like any other refusal. The posture
+is strictly MORE protective: rows that were lost or silently dropped are now pulled or
+recorded.
+
+*Disposition.* **This change does NOT re-mint the certification and does not approve
+its own control.** The re-issue stays with
+[**#6063**](https://github.com/alphaonedev/ai-memory-mcp/issues/6063) (WP-B1); this entry
+only records the firing against a banner that is already VOID. The last bound
+determination remains the 2026-10-02 re-issue at
+`385da3a054c4f82bcdfd51ec2d8f07ca4947f9a5`.
 
 ---
 

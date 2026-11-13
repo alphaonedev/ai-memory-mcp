@@ -2744,6 +2744,30 @@ pub trait MemoryStore: Send + Sync {
         Ok((rows, n))
     }
 
+    /// v1.0.0 #9082 - one page of the serving-assigned change-sequence walk
+    /// (`sync_seq > after_seq`, ascending, at most `limit` rows). The page's
+    /// `next_seq` is the highest sequence EXAMINED before the visibility and
+    /// decrypt filters (an empty page echoes the effective `after_seq`, never
+    /// the counter head); a request above the head walks from 0. The caller
+    /// applies the namespace and scope filters AFTER reading `next_seq`.
+    ///
+    /// Default implementation: `UnsupportedCapability`, so an adapter
+    /// without the column never answers a seq request with a since page.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidInput` for a negative `after_seq` and `Backend` when
+    /// the store reports an error.
+    async fn list_memories_after_seq(
+        &self,
+        _after_seq: i64,
+        _limit: usize,
+    ) -> StoreResult<crate::storage::sync_seq::SeqPage> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "FEDERATION_LIST_AFTER_SEQ".to_string(),
+        })
+    }
+
     /// Apply a remote-origin memory through an idempotent
     /// "insert-if-newer" path. Returns the resolved memory id (the
     /// adapter's row id, which may differ from the supplied `memory.id`
