@@ -615,118 +615,33 @@ fn verify_resource(skill_id: &str, row: ResourceRow) -> Result<VerifiedResource,
     })
 }
 
-/// #9174 (vote C1c, ruling R1) — whether this node signs. The trigger is the
-/// node's own key material and nothing else (no env, flag or config): a node
-/// holding a private signing key signs every skill it registers, so on that
-/// node an unsigned row is a stripped signature or a row it never minted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NodeSigning {
-    /// The node holds a private signing key: every served row must verify.
-    Signing,
-    /// No keypair, or a public-only keypair: an unsigned row reads as
-    /// unsigned (`signature_verified: false`).
-    NonSigning,
-}
-
-impl NodeSigning {
-    /// The signing state of a node whose active keypair is `active_keypair`.
-    #[must_use]
-    pub fn of(active_keypair: Option<&crate::identity::keypair::AgentKeypair>) -> Self {
-        if active_keypair.is_some_and(crate::identity::keypair::AgentKeypair::can_sign) {
-            Self::Signing
-        } else {
-            Self::NonSigning
-        }
-    }
-
-    /// `true` when an unsigned row must be refused (the `require_sig` bool of
-    /// `federation::receive_auth::authorize_remote_transition`).
-    #[must_use]
-    pub const fn require_signature(self) -> bool {
-        matches!(self, Self::Signing)
-    }
-}
-
-/// #9174 — the signed state of a row that passed its digest check.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum SignedState {
-    /// The signature verified against the signer's enrolled key.
-    Verified,
-    /// No signature and no signer, on a node that does not sign.
-    Unsigned,
-}
-
-/// #9174 — why [`signed_state`] refused a row. Each variant renders exactly
-/// one `msg::` builder text, so the reason is typed, never matched on text.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum SignedStateRefusal {
-    /// A signer is named but no signature is stored (#8834).
-    SignatureMissing,
-    /// A signature is stored but no enrolled key verifies it (#8834).
-    SignerKeyUnavailable,
-    /// A presented signature does not verify: refused on every node.
-    SignatureInvalid,
-    /// An unsigned row on a signing node (vote C1c).
-    SignatureRequired,
-}
-
-impl SignedStateRefusal {
-    /// The caller text of this refusal for `skill_id`.
-    #[must_use]
-    pub(super) fn caller_text(self, skill_id: &str) -> String {
-        match self {
-            Self::SignatureMissing => msg::skill_signature_missing(skill_id),
-            Self::SignerKeyUnavailable => msg::skill_signer_key_unavailable(skill_id),
-            Self::SignatureInvalid => msg::skill_signature_invalid(skill_id),
-            Self::SignatureRequired => msg::skill_signature_required(skill_id),
-        }
-    }
-}
-
-/// #9174 — the ONE predicate that decides the signed state of a row for every
-/// read surface (get, list, resource, export, compose; MCP, HTTP and CLI all
-/// read through [`load_verified_skill`]).
-///
-/// Decision table (`require` = [`NodeSigning::require_signature`]):
-///
-/// | signature | signer                       | require=false          | require=true           |
-/// |-----------|------------------------------|------------------------|------------------------|
-/// | present   | enrolled key, verifies       | `Verified`             | `Verified`             |
-/// | present   | enrolled key, does not verify| `Err(SignatureInvalid)`| `Err(SignatureInvalid)`|
-/// | present   | absent, or key not enrolled  | `Err(SignerKeyUnavailable)` | `Err(SignerKeyUnavailable)` |
-/// | absent    | present                      | `Err(SignatureMissing)`| `Err(SignatureMissing)`|
-/// | absent    | absent                       | `Unsigned`             | `Err(SignatureRequired)` |
-///
-/// The load-bearing invariant: on a signing node no row reads as success
-/// unless its signature verified, and a presented signature that does not
-/// verify is always refused, never downgraded to unsigned (the shape of
-/// `identity::verify::attest_write`).
-///
-/// # Errors
-/// The [`SignedStateRefusal`] of the row.
-pub(super) fn signed_state(
+/// Verify the Ed25519 signature of a signed row over its digest: `Ok(false)`
+/// for an unsigned row (no signature AND no signer), `Ok(true)` for a
+/// signature that verifies. A row that names a signer but carries no
+/// signature is refused (#8834): it is either a stripped signature or a
+/// self-asserted signer, and neither may read as a signed skill.
+fn verify_signature(
+    skill_id: &str,
     digest: &[u8],
     signature: Option<&[u8]>,
     signing_agent: Option<&str>,
-    node: NodeSigning,
-) -> Result<SignedState, SignedStateRefusal> {
+) -> Result<bool, String> {
     use ed25519_dalek::Signature;
     let signing_agent = signing_agent.filter(|agent| !agent.is_empty());
     let Some(signature) = signature else {
-        return match (signing_agent, node.require_signature()) {
-            (Some(_), _) => Err(SignedStateRefusal::SignatureMissing),
-            (None, true) => Err(SignedStateRefusal::SignatureRequired),
-            (None, false) => Ok(SignedState::Unsigned),
+        return match signing_agent {
+            Some(_) => Err(msg::skill_signature_missing(skill_id)),
+            None => Ok(false),
         };
     };
     let key = signing_agent
         .and_then(crate::identity::verify::lookup_peer_public_key)
-        .ok_or(SignedStateRefusal::SignerKeyUnavailable)?;
+        .ok_or_else(|| msg::skill_signer_key_unavailable(skill_id))?;
     let signature =
-        Signature::from_slice(signature).map_err(|_| SignedStateRefusal::SignatureInvalid)?;
+        Signature::from_slice(signature).map_err(|_| msg::skill_signature_invalid(skill_id))?;
     key.verify_strict(digest, &signature)
-        .map(|()| SignedState::Verified)
-        .map_err(|_| SignedStateRefusal::SignatureInvalid)
+        .map(|()| true)
+        .map_err(|_| msg::skill_signature_invalid(skill_id))
 }
 
 /// #8832 / #8834 — load one skill for `caller`, or refuse.
@@ -741,15 +656,10 @@ pub(super) fn signed_state(
 ///   signature, a key that is unavailable to verify it, or a corrupt or
 ///   oversize stored blob or column.
 /// - [`SkillLoadError::Substrate`] when the store itself fails.
-///
-/// #9174 — `node` is the reading node's [`NodeSigning`]; the signed state is
-/// decided by [`signed_state`] alone, so on a signing node an unsigned row is
-/// refused (`Integrity`, `signature required on a signing node`).
 pub(super) fn load_verified_skill(
     conn: &Connection,
     skill_id: &str,
     caller: Option<&str>,
-    node: NodeSigning,
 ) -> Result<VerifiedSkill, SkillLoadError> {
     use SkillLoadError::{Integrity, NotFound, Substrate};
     let Some((
@@ -831,16 +741,9 @@ pub(super) fn load_verified_skill(
         return Err(Integrity(msg::skill_digest_mismatch(&id)));
     }
 
-    let signature_verified = match signed_state(
-        &digest,
-        signature.as_deref(),
-        signing_agent.as_deref(),
-        node,
-    ) {
-        Ok(SignedState::Verified) => true,
-        Ok(SignedState::Unsigned) => false,
-        Err(refusal) => return Err(Integrity(refusal.caller_text(&id))),
-    };
+    let signature_verified =
+        verify_signature(&id, &digest, signature.as_deref(), signing_agent.as_deref())
+            .map_err(Integrity)?;
     // #8834 — a signer is served only when its signature verified: no read
     // funnel can return an unverified attribution, by construction.
     let signing_agent = signing_agent.filter(|_| signature_verified);

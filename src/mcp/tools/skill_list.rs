@@ -36,14 +36,10 @@ pub const SKILL_LIST_PAGE_LIMIT: usize = 1000;
 /// Returns the substrate's error string when SQL prepare/query fails, or
 /// when the store fails while a row is verified (#8834: a store failure is a
 /// refusal, never an empty or partial list).
-///
-/// #9174 — `node` is the reading node's [`super::skill_integrity::NodeSigning`]:
-/// on a signing node an unsigned skill is left out (`signature required`).
 pub fn handle_skill_list(
     conn: &Connection,
     params: &Value,
     read_caller: Option<&str>,
-    node: super::skill_integrity::NodeSigning,
 ) -> Result<Value, String> {
     use super::skill_integrity::SkillLoadError;
     let namespace = params["namespace"].as_str().unwrap_or("%");
@@ -86,21 +82,15 @@ pub fn handle_skill_list(
     ids.truncate(SKILL_LIST_PAGE_LIMIT);
 
     let mut skills: Vec<Value> = Vec::with_capacity(ids.len());
-    // #9174 (C4) — one warning per call with the count of rows left out; the
-    // per-row reason goes to debug so a node with many unsigned rows does not
-    // flood the log on every list.
-    let mut omitted: usize = 0;
     for id in ids {
-        let skill = match super::skill_integrity::load_verified_skill(conn, &id, read_caller, node)
-        {
+        let skill = match super::skill_integrity::load_verified_skill(conn, &id, read_caller) {
             Ok(skill) => skill,
             // #8832 — a skill the caller may not read is simply not listed.
             Err(SkillLoadError::NotFound(_)) => continue,
             // #8834 — a row that fails verification is never discoverable;
             // the operator sees why in the log, the caller sees nothing.
             Err(SkillLoadError::Integrity(e)) => {
-                tracing::debug!(skill_id = %id, error = %e, "memory_skill_list omitted a skill");
-                omitted = omitted.saturating_add(1);
+                tracing::warn!(skill_id = %id, error = %e, "memory_skill_list omitted a skill");
                 continue;
             }
             // #8834 (code MEDIUM 1) — a store failure is not a verdict on
@@ -146,13 +136,6 @@ pub fn handle_skill_list(
         }
 
         skills.push(entry);
-    }
-    if omitted > 0 {
-        tracing::warn!(
-            omitted,
-            signing_node = node.require_signature(),
-            "memory_skill_list left out skills that failed integrity verification"
-        );
     }
 
     Ok(json!({
@@ -272,8 +255,7 @@ mod tests {
     #[test]
     fn empty_db_returns_empty_list() {
         let conn = open_db();
-        let v = handle_skill_list(&conn, &json!({}), None, crate::mcp::NodeSigning::NonSigning)
-            .unwrap();
+        let v = handle_skill_list(&conn, &json!({}), None).unwrap();
         assert_eq!(v["count"], json!(0));
         assert_eq!(v["skills"], json!([]));
     }
@@ -289,8 +271,7 @@ mod tests {
         )
         .unwrap();
 
-        let v = handle_skill_list(&conn, &json!({}), None, crate::mcp::NodeSigning::NonSigning)
-            .unwrap();
+        let v = handle_skill_list(&conn, &json!({}), None).unwrap();
         assert_eq!(v["count"], json!(1));
         let arr = v["skills"].as_array().unwrap();
         assert_eq!(arr[0]["id"], json!("id-new"));
@@ -302,13 +283,7 @@ mod tests {
         insert_skill(&conn, "a", "ns-a", "ska", "a", 0);
         insert_skill(&conn, "b", "ns-b", "skb", "b", 1);
 
-        let v = handle_skill_list(
-            &conn,
-            &json!({"namespace": "ns-a"}),
-            None,
-            crate::mcp::NodeSigning::NonSigning,
-        )
-        .unwrap();
+        let v = handle_skill_list(&conn, &json!({"namespace": "ns-a"}), None).unwrap();
         assert_eq!(v["count"], json!(1));
         assert_eq!(v["skills"][0]["namespace"], json!("ns-a"));
     }
@@ -319,13 +294,7 @@ mod tests {
         insert_skill(&conn, "a", "ns-a", "ska", "a", 0);
         insert_skill(&conn, "b", "ns-b", "skb", "b", 1);
 
-        let v = handle_skill_list(
-            &conn,
-            &json!({"namespace": "%"}),
-            None,
-            crate::mcp::NodeSigning::NonSigning,
-        )
-        .unwrap();
+        let v = handle_skill_list(&conn, &json!({"namespace": "%"}), None).unwrap();
         assert_eq!(v["count"], json!(2));
     }
 
@@ -335,8 +304,7 @@ mod tests {
         insert_skill(&conn, "a", "ns-a", "ska", "a", 0);
         insert_skill(&conn, "b", "ns-b", "skb", "b", 1);
 
-        let v = handle_skill_list(&conn, &json!({}), None, crate::mcp::NodeSigning::NonSigning)
-            .unwrap();
+        let v = handle_skill_list(&conn, &json!({}), None).unwrap();
         assert_eq!(v["count"], json!(2));
     }
 
@@ -346,13 +314,7 @@ mod tests {
         insert_skill(&conn, "a", "ns", "deploy-canary", "k8s canary deploy", 0);
         insert_skill(&conn, "b", "ns", "audit-logs", "fetch audit logs", 1);
 
-        let v = handle_skill_list(
-            &conn,
-            &json!({"filter": "canary"}),
-            None,
-            crate::mcp::NodeSigning::NonSigning,
-        )
-        .unwrap();
+        let v = handle_skill_list(&conn, &json!({"filter": "canary"}), None).unwrap();
         assert_eq!(v["count"], json!(1));
         assert_eq!(v["skills"][0]["id"], json!("a"));
     }
@@ -363,13 +325,7 @@ mod tests {
         insert_skill(&conn, "a", "ns", "x", "kubernetes deploy notes", 0);
         insert_skill(&conn, "b", "ns", "y", "totally different", 1);
 
-        let v = handle_skill_list(
-            &conn,
-            &json!({"filter": "kubernetes"}),
-            None,
-            crate::mcp::NodeSigning::NonSigning,
-        )
-        .unwrap();
+        let v = handle_skill_list(&conn, &json!({"filter": "kubernetes"}), None).unwrap();
         assert_eq!(v["count"], json!(1));
     }
 
@@ -378,13 +334,7 @@ mod tests {
         let conn = open_db();
         insert_skill(&conn, "a", "ns", "x", "k8s", 0);
 
-        let v = handle_skill_list(
-            &conn,
-            &json!({"filter": "no-such-text"}),
-            None,
-            crate::mcp::NodeSigning::NonSigning,
-        )
-        .unwrap();
+        let v = handle_skill_list(&conn, &json!({"filter": "no-such-text"}), None).unwrap();
         assert_eq!(v["count"], json!(0));
     }
 
@@ -405,8 +355,7 @@ mod tests {
         .unwrap();
         crate::mcp::reseal_skill_digest_for_tests(&conn, "id1").expect("reseal");
 
-        let v = handle_skill_list(&conn, &json!({}), None, crate::mcp::NodeSigning::NonSigning)
-            .unwrap();
+        let v = handle_skill_list(&conn, &json!({}), None).unwrap();
         let entry = &v["skills"][0];
         assert_eq!(entry["license"], json!("MIT"));
         assert_eq!(entry["compatibility"], json!("v1"));
@@ -423,8 +372,7 @@ mod tests {
     fn omits_empty_metadata_object() {
         let conn = open_db();
         insert_skill(&conn, "a", "ns", "x", "d", 0);
-        let v = handle_skill_list(&conn, &json!({}), None, crate::mcp::NodeSigning::NonSigning)
-            .unwrap();
+        let v = handle_skill_list(&conn, &json!({}), None).unwrap();
         let entry = &v["skills"][0];
         // metadata `{}` is omitted from the response.
         assert!(entry.get("metadata").is_none());
@@ -442,8 +390,7 @@ mod tests {
             params![body_blob, digest],
         )
         .unwrap();
-        let v = handle_skill_list(&conn, &json!({}), None, crate::mcp::NodeSigning::NonSigning)
-            .unwrap();
+        let v = handle_skill_list(&conn, &json!({}), None).unwrap();
         // #8834 — `allowed_tools` is on the digest surface: a column that
         // does not parse is a tampered row, never listed.
         assert_eq!(v["count"], json!(0));
@@ -454,13 +401,7 @@ mod tests {
         let conn = open_db();
         insert_skill(&conn, "a", "ns", "x", "d", 0);
         insert_skill(&conn, "b", "ns", "y", "e", 1);
-        let v = handle_skill_list(
-            &conn,
-            &json!({"filter": ""}),
-            None,
-            crate::mcp::NodeSigning::NonSigning,
-        )
-        .unwrap();
+        let v = handle_skill_list(&conn, &json!({"filter": ""}), None).unwrap();
         assert_eq!(v["count"], json!(2));
     }
 }

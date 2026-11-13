@@ -378,7 +378,6 @@ fn skill_get_refuses_forged_agent_id() {
         &conn,
         &json!({"skill_id": "sk-get-denied", "agent_id": FORGED}),
         None,
-        ai_memory::mcp::NodeSigning::NonSigning,
     )
     .expect_err("a forged agent_id must refuse the activation");
     assert_mismatch_refusal(&err, FORGED);
@@ -398,7 +397,6 @@ fn skill_get_allows_matching_agent_id_and_stamps_the_caller() {
         &conn,
         &json!({"skill_id": "sk-get-ok", "agent_id": CALLER}),
         None,
-        ai_memory::mcp::NodeSigning::NonSigning,
     )
     .expect("the enforced caller may activate as itself");
     assert!(

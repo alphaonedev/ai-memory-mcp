@@ -84,14 +84,10 @@ const RECALL_SATURATION: i64 = 50;
 /// Returns a substrate error string when `skill_id` is missing/invalid,
 /// the skill is not found (or not visible to `caller`, #8832), its digest
 /// or signature does not verify (#8834), or zstd body decompression fails.
-///
-/// #9174 — `node` is the reading node's [`super::skill_integrity::NodeSigning`]:
-/// on a signing node an unsigned skill is refused (`signature required`).
 pub fn handle_skill_compositional_context(
     conn: &Connection,
     params: &Value,
     caller: Option<&str>,
-    node: super::skill_integrity::NodeSigning,
 ) -> Result<Value, String> {
     let skill_id = params["skill_id"]
         .as_str()
@@ -106,7 +102,7 @@ pub fn handle_skill_compositional_context(
     //    and any signature are checked before the body is composed. The
     //    bounded (#1933) body decode happens inside the verified load.
     // -----------------------------------------------------------------------
-    let skill = super::skill_integrity::load_verified_skill(conn, skill_id, caller, node)?;
+    let skill = super::skill_integrity::load_verified_skill(conn, skill_id, caller)?;
     let body_str = String::from_utf8_lossy(&skill.body).into_owned();
     let (namespace, name) = (skill.namespace, skill.name);
     let metadata_json = skill.metadata.to_string();

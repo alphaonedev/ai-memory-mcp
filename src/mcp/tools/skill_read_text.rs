@@ -25,9 +25,6 @@ pub enum SkillReadClass<'a> {
     SignerKeyUnavailable,
     /// A row names a signer but carries no signature (#8834).
     SignatureMissing,
-    /// An unsigned row on a node that holds a private signing key (#9174,
-    /// vote C1c).
-    SignatureRequired,
     /// Every other integrity-family text: a resource-level failure names a
     /// stored resource path, so the caller gets the fixed skill-level text.
     ResourceIntegrity,
@@ -62,9 +59,6 @@ impl<'a> SkillReadClass<'a> {
         }
         if e == msg::skill_signature_missing(skill_id) {
             return Self::SignatureMissing;
-        }
-        if e == msg::skill_signature_required(skill_id) {
-            return Self::SignatureRequired;
         }
         if e.starts_with(msg::SKILL_INTEGRITY_FAILED) {
             return Self::ResourceIntegrity;
@@ -105,7 +99,6 @@ impl<'a> SkillReadClass<'a> {
             Self::SignatureInvalid => msg::skill_signature_invalid(skill_id),
             Self::SignerKeyUnavailable => msg::skill_signer_key_unavailable(skill_id),
             Self::SignatureMissing => msg::skill_signature_missing(skill_id),
-            Self::SignatureRequired => msg::skill_signature_required(skill_id),
             Self::ResourceIntegrity => msg::skill_integrity_failed(skill_id),
             Self::ResourcePathRequired => msg::SKILL_RESOURCE_PATH_REQUIRED.to_owned(),
             Self::ResourceNotFound(path) => msg::skill_resource_not_found(skill_id, path),
@@ -170,15 +163,6 @@ mod tests {
         assert_eq!(
             SkillReadClass::classify(&msg::skill_signature_missing(ID), ID, None).caller_text(ID),
             msg::skill_signature_missing(ID),
-        );
-        let required = msg::skill_signature_required(ID);
-        assert_eq!(
-            SkillReadClass::classify(&required, ID, None),
-            SkillReadClass::SignatureRequired,
-        );
-        assert_eq!(
-            SkillReadClass::classify(&required, ID, None).caller_text(ID),
-            required,
         );
     }
 }

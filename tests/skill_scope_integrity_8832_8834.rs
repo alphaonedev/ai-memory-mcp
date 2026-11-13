@@ -470,12 +470,7 @@ fn read_all_handlers(
     vec![
         (
             "get",
-            mcp::handle_skill_get(
-                conn,
-                &json!({ "skill_id": id }),
-                None,
-                ai_memory::mcp::NodeSigning::NonSigning,
-            ),
+            mcp::handle_skill_get(conn, &json!({ "skill_id": id }), None),
         ),
         (
             "resource",
@@ -483,7 +478,6 @@ fn read_all_handlers(
                 conn,
                 &json!({ "skill_id": id, "resource_path": SOURCE_0 }),
                 None,
-                ai_memory::mcp::NodeSigning::NonSigning,
             ),
         ),
         (
@@ -646,13 +640,7 @@ fn tampered_skill_is_omitted_from_list_8834() {
     env.act_as(None);
     let conn = db::open(&db_path).expect("open");
     let listed = |conn: &rusqlite::Connection| {
-        mcp::handle_skill_list(
-            conn,
-            &json!({ "namespace": NS }),
-            None,
-            ai_memory::mcp::NodeSigning::NonSigning,
-        )
-        .expect("list")["skills"]
+        mcp::handle_skill_list(conn, &json!({ "namespace": NS }), None).expect("list")["skills"]
             .as_array()
             .is_some_and(|a| {
                 a.iter()
@@ -703,15 +691,7 @@ fn signed_skill_signature_is_verified_on_read_8834() {
 
     // Intact signed skill reads.
     let ok_id = register_signed(&conn, &key_dir, "signed-ok");
-    assert!(
-        mcp::handle_skill_get(
-            &conn,
-            &json!({ "skill_id": ok_id }),
-            None,
-            ai_memory::mcp::NodeSigning::NonSigning
-        )
-        .is_ok()
-    );
+    assert!(mcp::handle_skill_get(&conn, &json!({ "skill_id": ok_id }), None).is_ok());
 
     // A flipped signature byte fails closed with the exact error.
     let sig: Vec<u8> = conn
@@ -728,13 +708,7 @@ fn signed_skill_signature_is_verified_on_read_8834() {
         rusqlite::params![forged, ok_id],
     )
     .unwrap();
-    let err = mcp::handle_skill_get(
-        &conn,
-        &json!({ "skill_id": ok_id }),
-        None,
-        ai_memory::mcp::NodeSigning::NonSigning,
-    )
-    .unwrap_err();
+    let err = mcp::handle_skill_get(&conn, &json!({ "skill_id": ok_id }), None).unwrap_err();
     assert!(
         err.contains(&format!(
             "{INTEGRITY_PREFIX}: signature invalid for skill {ok_id}"
@@ -754,13 +728,7 @@ fn signed_skill_signature_is_verified_on_read_8834() {
         [&ok_id],
     )
     .unwrap();
-    let err = mcp::handle_skill_get(
-        &conn,
-        &json!({ "skill_id": ok_id }),
-        None,
-        ai_memory::mcp::NodeSigning::NonSigning,
-    )
-    .unwrap_err();
+    let err = mcp::handle_skill_get(&conn, &json!({ "skill_id": ok_id }), None).unwrap_err();
     assert!(
         err.contains(&format!(
             "{INTEGRITY_PREFIX}: signer public key unavailable for skill {ok_id}"
@@ -771,13 +739,7 @@ fn signed_skill_signature_is_verified_on_read_8834() {
     // The signer's key no longer enrolled: fail closed, never skip.
     let gone_id = register_signed(&conn, &key_dir, "signed-gone");
     std::fs::remove_file(key_dir.join(format!("{SIGNER}.pub"))).expect("remove pub");
-    let err = mcp::handle_skill_get(
-        &conn,
-        &json!({ "skill_id": gone_id }),
-        None,
-        ai_memory::mcp::NodeSigning::NonSigning,
-    )
-    .unwrap_err();
+    let err = mcp::handle_skill_get(&conn, &json!({ "skill_id": gone_id }), None).unwrap_err();
     assert!(
         err.contains(&format!(
             "{INTEGRITY_PREFIX}: signer public key unavailable for skill {gone_id}"
@@ -833,12 +795,7 @@ fn a_signer_named_without_a_signature_is_refused_on_every_funnel_8834() {
         let reads = vec![
             (
                 "get",
-                mcp::handle_skill_get(
-                    &conn,
-                    &json!({ "skill_id": id }),
-                    None,
-                    ai_memory::mcp::NodeSigning::NonSigning,
-                ),
+                mcp::handle_skill_get(&conn, &json!({ "skill_id": id }), None),
             ),
             (
                 "export",
@@ -864,13 +821,8 @@ fn a_signer_named_without_a_signature_is_refused_on_every_funnel_8834() {
                 ),
             }
         }
-        let listed = mcp::handle_skill_list(
-            &conn,
-            &json!({ "namespace": NS }),
-            None,
-            ai_memory::mcp::NodeSigning::NonSigning,
-        )
-        .expect("list")["skills"]
+        let listed = mcp::handle_skill_list(&conn, &json!({ "namespace": NS }), None)
+            .expect("list")["skills"]
             .as_array()
             .is_some_and(|a| a.iter().any(|s| s["id"].as_str() == Some(id.as_str())));
         assert!(!listed, "list served a signer with no signature: {id}");
@@ -910,13 +862,7 @@ fn register_without_a_private_key_stores_no_signer_8834() {
         )
         .unwrap();
     assert_eq!(signer, None, "no signature produced, so no signer stored");
-    let got = mcp::handle_skill_get(
-        &conn,
-        &json!({ "skill_id": id }),
-        None,
-        ai_memory::mcp::NodeSigning::NonSigning,
-    )
-    .expect("get");
+    let got = mcp::handle_skill_get(&conn, &json!({ "skill_id": id }), None).expect("get");
     assert!(
         got.get("signing_agent").is_none_or(Value::is_null),
         "got: {got}"
@@ -1682,14 +1628,7 @@ fn a_self_binding_grants_nothing_a_plain_register_does_not_8832() {
         }
         for reader in readers {
             env.act_as(Some(reader));
-            let served = |id: &str| {
-                mcp::handle_skill_get(
-                    &conn,
-                    &json!({ "skill_id": id }),
-                    None,
-                    ai_memory::mcp::NodeSigning::NonSigning,
-                )
-            };
+            let served = |id: &str| mcp::handle_skill_get(&conn, &json!({ "skill_id": id }), None);
             let bound = served(&ids[0]).is_ok();
             let plain = served(&ids[1]).is_ok();
             assert!(
@@ -1760,13 +1699,8 @@ fn bound_register_cannot_shadow_another_principals_skill_8832() {
             "the victim stays current"
         );
         env.act_as(Some(OTHER));
-        mcp::handle_skill_get(
-            &conn,
-            &json!({ "skill_id": victim_id }),
-            None,
-            ai_memory::mcp::NodeSigning::NonSigning,
-        )
-        .expect("the other principal still reads its skill");
+        mcp::handle_skill_get(&conn, &json!({ "skill_id": victim_id }), None)
+            .expect("the other principal still reads its skill");
     }
 
     env.act_as(Some(OWNER));
@@ -1823,13 +1757,8 @@ fn list_propagates_a_store_failure_8834() {
     // The skills table answers; the per-row resource read cannot.
     conn.execute_batch("ALTER TABLE skill_resources RENAME TO skill_resources_gone_8834")
         .unwrap();
-    let err = mcp::handle_skill_list(
-        &conn,
-        &json!({ "namespace": NS }),
-        None,
-        ai_memory::mcp::NodeSigning::NonSigning,
-    )
-    .expect_err("a broken store must refuse the listing");
+    let err = mcp::handle_skill_list(&conn, &json!({ "namespace": NS }), None)
+        .expect_err("a broken store must refuse the listing");
     assert_eq!(err, "internal storage error");
     drop(env);
 }
@@ -1857,13 +1786,7 @@ fn list_is_bounded_on_a_large_store_8834() {
     // digest, distinct ids, so every copy verifies.
     clone_skill_rows(&conn, &id, ROWS - 1);
     let start = std::time::Instant::now();
-    let v = mcp::handle_skill_list(
-        &conn,
-        &json!({ "namespace": NS }),
-        None,
-        ai_memory::mcp::NodeSigning::NonSigning,
-    )
-    .expect("list");
+    let v = mcp::handle_skill_list(&conn, &json!({ "namespace": NS }), None).expect("list");
     let took = start.elapsed();
     assert_eq!(v["count"], json!(mcp::SKILL_LIST_PAGE_LIMIT));
     assert_eq!(v["truncated"], json!(true));
@@ -1874,7 +1797,6 @@ fn list_is_bounded_on_a_large_store_8834() {
         &conn,
         &json!({ "namespace": NS, "filter": "zz-no-match" }),
         None,
-        ai_memory::mcp::NodeSigning::NonSigning,
     )
     .expect("filtered list");
     assert_eq!(none["count"], json!(0));

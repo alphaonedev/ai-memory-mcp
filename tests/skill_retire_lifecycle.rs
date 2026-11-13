@@ -57,13 +57,7 @@ fn retire_hides_from_list() {
     let (_d, conn) = open_db();
     register(&conn, "hide-me");
 
-    let before = handle_skill_list(
-        &conn,
-        &json!({}),
-        None,
-        ai_memory::mcp::NodeSigning::NonSigning,
-    )
-    .unwrap();
+    let before = handle_skill_list(&conn, &json!({}), None).unwrap();
     assert_eq!(before["count"], json!(1));
 
     let r = handle_skill_retire(
@@ -76,13 +70,7 @@ fn retire_hides_from_list() {
     assert_eq!(r["action"], json!("retire"));
     assert_eq!(r["affected"], json!(1));
 
-    let after = handle_skill_list(
-        &conn,
-        &json!({}),
-        None,
-        ai_memory::mcp::NodeSigning::NonSigning,
-    )
-    .unwrap();
+    let after = handle_skill_list(&conn, &json!({}), None).unwrap();
     assert_eq!(
         after["count"],
         json!(0),
@@ -101,13 +89,7 @@ fn include_retired_shows_it() {
     )
     .unwrap();
 
-    let v = handle_skill_list(
-        &conn,
-        &json!({"include_retired": true}),
-        None,
-        ai_memory::mcp::NodeSigning::NonSigning,
-    )
-    .unwrap();
+    let v = handle_skill_list(&conn, &json!({"include_retired": true}), None).unwrap();
     assert_eq!(v["count"], json!(1));
     let entry = &v["skills"][0];
     assert_eq!(entry["retired"], json!(true));
@@ -119,13 +101,7 @@ fn skill_get_shows_retired_state() {
     let (_d, conn) = open_db();
     let id = register(&conn, "get-state");
 
-    let active = handle_skill_get(
-        &conn,
-        &json!({"skill_id": id}),
-        None,
-        ai_memory::mcp::NodeSigning::NonSigning,
-    )
-    .unwrap();
+    let active = handle_skill_get(&conn, &json!({"skill_id": id}), None).unwrap();
     assert_eq!(active["retired"], json!(false));
 
     handle_skill_retire(
@@ -135,13 +111,7 @@ fn skill_get_shows_retired_state() {
     )
     .unwrap();
 
-    let retired = handle_skill_get(
-        &conn,
-        &json!({"skill_id": id}),
-        None,
-        ai_memory::mcp::NodeSigning::NonSigning,
-    )
-    .unwrap();
+    let retired = handle_skill_get(&conn, &json!({"skill_id": id}), None).unwrap();
     assert_eq!(retired["retired"], json!(true));
     assert!(retired["retired_at"].as_i64().is_some());
     assert_eq!(retired["retire_reason"], json!("obsolete"));
@@ -184,13 +154,7 @@ fn unretire_restores() {
     )
     .unwrap();
     assert_eq!(
-        handle_skill_list(
-            &conn,
-            &json!({}),
-            None,
-            ai_memory::mcp::NodeSigning::NonSigning
-        )
-        .unwrap()["count"],
+        handle_skill_list(&conn, &json!({}), None).unwrap()["count"],
         json!(0)
     );
 
@@ -205,13 +169,7 @@ fn unretire_restores() {
     assert_eq!(un["affected"], json!(1));
 
     assert_eq!(
-        handle_skill_list(
-            &conn,
-            &json!({}),
-            None,
-            ai_memory::mcp::NodeSigning::NonSigning
-        )
-        .unwrap()["count"],
+        handle_skill_list(&conn, &json!({}), None).unwrap()["count"],
         json!(1),
         "unretire returns the skill to discovery"
     );
