@@ -432,12 +432,20 @@ class RefusedAmendment(LedgerCase):
         self.assertFalse(ok, out)
         self.assertIn("while STATUS stays VOID", out)
 
-    def test_status_line_text_change_with_record_fails(self):
+    def test_revoiding_status_prose_with_exact_record_passes(self):
+        # The #9176 shape: the STATUS prose is rewritten as a re-voiding record and the word
+        # stays VOID; with an exact amendment that is the honest pass, never a discharge.
         s = self.scene("VOID")
         doc = with_ledger(head_doc("VOID", None, " (amended)"), record(DAY, path_item(MOD_RS)))
         ok, out = s.judge(self.wire_and_doc(s, doc))
+        self.assertTrue(ok, out)
+        self.assertIn("the certification stays VOID", out)
+
+    def test_revoiding_status_prose_without_record_fails(self):
+        s = self.scene("VOID")
+        ok, out = s.judge(self.wire_and_doc(s, head_doc("VOID", None, " (amended)")))
         self.assertFalse(ok, out)
-        self.assertIn("the STATUS banner line changed while its word stayed VOID", out)
+        self.assertIn("No new dated amendment record names this change", out)
 
     def test_status_change_with_inexact_record_fails(self):
         s = self.scene("LIVE", bind_genesis=True)

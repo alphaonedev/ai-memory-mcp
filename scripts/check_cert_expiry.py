@@ -100,7 +100,7 @@ append-only (an edited, reordered or removed base record fails), dated within
 [LEDGER_DATE_FLOOR, judged commit UTC date + LEDGER_DATE_SKEW_DAYS], and parsed
 as a canonical Markdown subset: anything unrecognised in or before the region
 is a refusal (default deny). An amendment never discharges the cert: the
-STATUS line stays byte-identical, LIVE behaviour is unchanged, and setting or
+STATUS word stays VOID/EXPIRED, LIVE behaviour is unchanged, and setting or
 changing Binds-to while STATUS stays VOID/EXPIRED is refused (#6774 option B
 narrowed; dropping the bind to `-` stays a voiding record).
 
@@ -638,12 +638,6 @@ def check_amendment_names(new_records, changed):
             None, "head")
 
 
-def status_lines(repo, tree):
-    """The raw STATUS banner lines of the cert doc at TREE (bytes lines)."""
-    blob = read_blob(repo, tree, CERT_DOC) or b""
-    return [ln for ln in blob.split(b"\n") if STATUS_LINE_RE.match(ln.decode("utf-8", "replace"))]
-
-
 # ---------------------------------------------------------------------------
 # The check
 # ---------------------------------------------------------------------------
@@ -864,12 +858,8 @@ def _judge(repo, base, head, judged, mb, tip):
         return ok, "\n".join([head_line] + more)
 
     if incidental and new_records and banner_head[0] in LEDGER_STATUSES:
-        # #6124: the names already match exactly; the banner line itself must not move.
-        if status_lines(repo, mb) != status_lines(repo, judged):
-            return False, (
-                f"{PREFIX}: ERROR — the STATUS banner line changed while its word stayed "
-                f"{banner_head[0]}; an amendment keeps the banner line byte-identical (#6124)"
-            )
+        # #6124: the names already match exactly and the (word, bind) pair is unchanged, so the
+        # word stays VOID/EXPIRED; a re-voiding edit of the line's prose keeps that word.
         ok, more = check_banner_consistency(repo, judged)
         head_line = (
             f"{PREFIX}: PASS — federation-wire surface changed AND a new amendment record "

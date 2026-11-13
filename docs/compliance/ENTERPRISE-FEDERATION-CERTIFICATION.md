@@ -1625,7 +1625,7 @@ watched path and every added or removed `AI_MEMORY_FED_*` identifier. A
 missing name, an extra name, a record dated before 2026-11-13 or after the
 judged commit's UTC date plus one day, or an edited, reordered or removed
 earlier record fails. The ledger is append-only. An amendment never
-discharges the certification: the STATUS line stays byte-identical, LIVE
+discharges the certification: the STATUS word stays VOID or EXPIRED, LIVE
 behaviour is unchanged, and while STATUS stays VOID or EXPIRED a change that
 sets or changes the bound SHA is refused (dropping it stays a voiding
 record). The ledger is a strict subset of Markdown, and the gate refuses
