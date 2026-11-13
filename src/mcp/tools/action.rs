@@ -192,7 +192,27 @@ pub fn handle_action_transition(
     // `Option<&str>` precisely so no funnel can forget to ask.
     let lease = crate::actions::lease_get(conn, id)
         .map_err(|e| crate::mcp::error_text::mcp_foreign_err("lease_get", e))?;
-    crate::actions::authorize_claimed_by(claimed_by.as_deref(), lease.as_ref(), now, id)?;
+    //
+    // #8759 — the acting identity is the authenticated MCP principal
+    // (`AI_MEMORY_AGENT_ID`), never the request field: `claimed_by` naming
+    // anyone else is refused inside the shared control (fail closed on a
+    // malformed principal). With no `claimed_by` there is no claimed identity
+    // to compare, so the principal is not resolved and the lease disposition
+    // alone decides (pre-#8759 behaviour, byte-identical).
+    let authorize = |principal: crate::coordination_guard::ActingPrincipal<'_>| {
+        crate::actions::authorize_claimed_by(
+            claimed_by.as_deref(),
+            principal,
+            lease.as_ref(),
+            now,
+            id,
+        )
+    };
+    if claimed_by.is_some() {
+        crate::coordination_guard::with_mcp_principal(authorize)?;
+    } else {
+        authorize(crate::coordination_guard::ActingPrincipal::SingleOperator)?;
+    }
 
     match crate::actions::transition(conn, id, to, claimed_by.as_deref(), now)
         .map_err(|e| crate::mcp::error_text::mcp_foreign_err("as_deref", e))?
@@ -1211,6 +1231,10 @@ mod d1_6_1709_tests {
 }
 
 #[cfg(test)]
+#[path = "action_principal_8759_tests.rs"]
+mod action_principal_8759_tests;
+
+#[cfg(test)]
 mod handler_tests {
     use super::*;
 
@@ -1690,6 +1714,9 @@ mod handler_tests {
 
     #[test]
     fn transition_list_edges_roundtrip_over_mcp() {
+        // #8759 — the transition binds `claimed_by` to the MCP principal;
+        // pin the single-operator posture on this thread.
+        let _caller = crate::identity::test_agent_id::AgentIdOverride::unset();
         let conn = fresh();
         let created = handle_action_create(
             &conn,
@@ -1746,6 +1773,9 @@ mod handler_tests {
 
     #[test]
     fn transition_invalid_state_name_errors() {
+        // #8759 — the transition binds `claimed_by` to the MCP principal;
+        // pin the single-operator posture on this thread.
+        let _caller = crate::identity::test_agent_id::AgentIdOverride::unset();
         let conn = fresh();
         let created = handle_action_create(
             &conn,
@@ -1866,6 +1896,9 @@ mod handler_tests {
     /// instead of stranding it forever.
     #[test]
     fn frontier_sweeps_expired_leases_and_requeues_stranded_action_2997() {
+        // #8759 — the transition binds `claimed_by` to the MCP principal;
+        // pin the single-operator posture on this thread.
+        let _caller = crate::identity::test_agent_id::AgentIdOverride::unset();
         let conn = fresh();
         let created = handle_action_create(
             &conn,
@@ -2173,6 +2206,9 @@ mod handler_tests {
     /// agent; the append-only chain stays intact.
     #[test]
     fn transition_emits_signed_events_audit_row_1722() {
+        // #8759 — the transition binds `claimed_by` to the MCP principal;
+        // pin the single-operator posture on this thread.
+        let _caller = crate::identity::test_agent_id::AgentIdOverride::unset();
         let conn = fresh();
         let created = handle_action_create(
             &conn,
