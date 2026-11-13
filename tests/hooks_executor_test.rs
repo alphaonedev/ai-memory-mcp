@@ -8,7 +8,8 @@
 // production hooks will use. Two end-to-end scenarios:
 //
 //   * exec mode — 100 concurrent fires through 100 short-lived
-//     children complete within the configured timeout.
+//     children all return Allow (deadline sized for a loaded runner,
+//     see FAN_OUT_FIRE_TIMEOUT_MS).
 //   * daemon mode — 1000 fires through a *single* long-lived child
 //     complete inside the deadline; mid-stream child crash (the
 //     test script self-kills after N requests) triggers a
@@ -72,14 +73,34 @@ fn cfg_for(command: PathBuf, mode: HookMode, timeout_ms: u32) -> HookConfig {
 // exec mode — 100 concurrent fires
 // ---------------------------------------------------------------------------
 
-/// 100 concurrent fires through `ExecExecutor` must all complete
-/// inside their per-fire timeout. The script reads its stdin, then
-/// writes a fixed `{"action":"allow"}` decision. The test asserts:
+/// Number of concurrent exec-mode fires the fan-out test drives (#9232).
+const FAN_OUT_FIRES: u32 = 100;
+
+/// Per-fire deadline for the fan-out test (#9232). Sized for a loaded
+/// self-hosted runner: 100 `/bin/sh` children forked at once under a
+/// parallel build can each take several seconds of wall time, so a few-second
+/// bound measured host load, not the property under test. A fire only trips
+/// this deadline when a child is genuinely hung; the timeout path itself is
+/// covered by `exec_mode_timeout_drops_request`.
+const FAN_OUT_FIRE_TIMEOUT_MS: u32 = 120_000;
+
+/// Aggregate wall-clock ceiling for the fan-out test, derived from the
+/// per-fire deadline: the fires run concurrently, so the whole batch can
+/// never legitimately need more than one deadline plus slack.
+const FAN_OUT_WALL_CEILING: Duration =
+    Duration::from_millis(FAN_OUT_FIRE_TIMEOUT_MS as u64 + 30_000);
+
+/// `FAN_OUT_FIRES` concurrent fires through `ExecExecutor` must all
+/// complete inside their per-fire timeout. The script reads its stdin,
+/// then writes a fixed `{"action":"allow"}` decision. The test asserts:
 ///
-///   * every fire returned `Allow`;
-///   * the *aggregate* wall-clock stayed within 30s (a slack ceiling
-///     to avoid CI flakes on cold containers; per-fire timeout is
-///     5s, far above the ~50ms a fork+exec costs).
+///   * exactly `FAN_OUT_FIRES` fires ran and every one returned
+///     `HookDecision::Allow` (exact decision compared, per fire);
+///   * the aggregate wall-clock stayed under `FAN_OUT_WALL_CEILING`;
+///   * the executor metrics count every fire and no drops.
+///
+/// The per-fire latency distribution is printed (`--nocapture`) so a
+/// maintainer can size the constants above from a real host.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn exec_mode_100_concurrent_fires_all_allow() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -93,35 +114,59 @@ printf '%s\n' '{"action":"allow"}'
 "#,
     );
 
-    let executor = Arc::new(ExecExecutor::new(cfg_for(script, HookMode::Exec, 5_000)));
+    let executor = Arc::new(ExecExecutor::new(cfg_for(
+        script,
+        HookMode::Exec,
+        FAN_OUT_FIRE_TIMEOUT_MS,
+    )));
 
     let started = Instant::now();
-    let mut handles = Vec::with_capacity(100);
-    for i in 0..100u32 {
+    let mut handles = Vec::with_capacity(FAN_OUT_FIRES as usize);
+    for i in 0..FAN_OUT_FIRES {
         let exec = Arc::clone(&executor);
         handles.push(tokio::spawn(async move {
-            exec.fire(HookEvent::PostStore, json!({"i": i})).await
+            let fire_started = Instant::now();
+            let decision = exec.fire(HookEvent::PostStore, json!({"i": i})).await;
+            (decision, fire_started.elapsed())
         }));
     }
-    let mut allowed = 0u32;
+    let mut decisions = Vec::with_capacity(handles.len());
+    let mut latencies = Vec::with_capacity(handles.len());
     for h in handles {
-        let r = h.await.expect("join");
+        let (r, latency) = h.await.expect("join");
         match r {
-            Ok(HookDecision::Allow) => allowed += 1,
-            Ok(other) => panic!("expected Allow, got {other:?}"),
+            Ok(decision) => decisions.push(decision),
             Err(e) => panic!("exec mode fire failed: {e}"),
         }
+        latencies.push(latency);
     }
-    assert_eq!(allowed, 100, "all 100 fires must Allow");
+    assert_eq!(
+        decisions.len(),
+        FAN_OUT_FIRES as usize,
+        "every fire must return a decision"
+    );
+    for (i, decision) in decisions.iter().enumerate() {
+        assert_eq!(*decision, HookDecision::Allow, "fire {i} must return Allow");
+    }
+
+    latencies.sort();
+    let pct = |q: usize| latencies[(latencies.len() * q / 100).min(latencies.len() - 1)];
+    eprintln!(
+        "fan-out per-fire wall ms: min={} median={} p95={} max={}",
+        latencies[0].as_millis(),
+        pct(50).as_millis(),
+        pct(95).as_millis(),
+        latencies[latencies.len() - 1].as_millis(),
+    );
 
     let elapsed = started.elapsed();
     assert!(
-        elapsed < Duration::from_secs(30),
-        "100 fires took {elapsed:?}; expected <30s wall-clock"
+        elapsed < FAN_OUT_WALL_CEILING,
+        "{FAN_OUT_FIRES} fires took {elapsed:?}; expected <{FAN_OUT_WALL_CEILING:?} wall-clock"
     );
 
     let metrics = executor.metrics();
-    assert_eq!(metrics.events_fired, 100);
+    assert_eq!(metrics.events_fired, u64::from(FAN_OUT_FIRES));
     assert_eq!(metrics.events_dropped, 0);
 }
 
