@@ -72,6 +72,46 @@ pub(super) async fn pg_receiver_merge_barrier(
         .map(ReceiverMergeBarrier::Held))
 }
 
+/// #9187 / #3901 — postgres twin of
+/// [`crate::storage::cross_id_verified_slot_holder`]: the live
+/// `(title, namespace)` slot holder (read `FOR UPDATE`, under the title-slot
+/// advisory lock) a VERIFIED push of an id with no live row may merge into
+/// through the same-id pipeline. `None` (the caller keeps the
+/// `apply_remote_memory` fall-through, whose slot barrier drops) when the push
+/// is unverified, the inbound id carries its own barrier (tombstone /
+/// archived copy), or no other id holds the slot. The caller still applies
+/// [`crate::storage::is_cross_id_yield_holder`] to the decoded row
+/// (`quarantined`, same author).
+///
+/// # Errors
+///
+/// The probe's sqlx error; the caller rolls back.
+pub(super) async fn pg_cross_id_slot_holder_row(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    inbound: &Memory,
+    receiver_verified: bool,
+) -> Result<Option<sqlx::postgres::PgRow>, sqlx::Error> {
+    if !receiver_verified
+        || pg_receiver_merge_barrier(tx, &inbound.id, None)
+            .await?
+            .is_some()
+    {
+        return Ok(None);
+    }
+    let Some(pre) =
+        pg_probe_federation_merge_preimage(tx, &inbound.title, &inbound.namespace).await?
+    else {
+        return Ok(None);
+    };
+    if pre.id == inbound.id {
+        return Ok(None);
+    }
+    sqlx::query(&SQL_SELECT_MEMORY_ROW_BY_ID_FOR_UPDATE)
+        .bind(&pre.id)
+        .fetch_optional(&mut **tx)
+        .await
+}
+
 /// #9147 — the archived half of a federated deletion, inside the deletion's
 /// transaction: purge every `archived_memories` copy of `id` so no restore
 /// path can republish the deleted content, and — when no live row reached

@@ -308,9 +308,14 @@ async fn archive_barrier_cells(store: Arc<dyn MemoryStore>, view: RawView, backe
     }
 }
 
-/// #9150 — a node-local hold is a merge barrier: no push shape on any funnel
-/// changes the bytes behind the hold or lifts it, whether it names the held
-/// row by id or claims its `(title, namespace)` slot under another id.
+/// #9150 — a node-local hold is a merge barrier: no UNVERIFIED push shape on
+/// any funnel changes the bytes behind the hold or lifts it, whether it names
+/// the held row by id or claims its `(title, namespace)` slot under another
+/// id. The one exception (#1948 / #3901, pinned in
+/// `tests/merge_barrier_target_row_9187.rs`) is a push THIS receiver verified
+/// onto a `quarantined` row, by its id or, from the same author, by its slot:
+/// it applies only as the exact signed unit, the row keeps its id and stays
+/// quarantined, and a cross-id merge never carries the push's attestation.
 async fn hold_barrier_cells(store: Arc<dyn MemoryStore>, view: RawView, backend: &str) {
     for held in HELD_STATES {
         for funnel in FUNNELS {

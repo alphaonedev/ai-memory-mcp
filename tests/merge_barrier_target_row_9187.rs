@@ -232,7 +232,11 @@ impl RawView {
                     .execute(pool)
                     .await
                     .expect("raw pg hold");
-                assert_eq!(done.rows_affected(), 1, "hold must hit exactly the seeded row");
+                assert_eq!(
+                    done.rows_affected(),
+                    1,
+                    "hold must hit exactly the seeded row"
+                );
             }
         }
     }
@@ -251,7 +255,11 @@ impl Rig {
             .apply_remote_memory(&operator_ctx(), row)
             .await
             .expect("seed applies");
-        assert_eq!(applied, row.id, "{}: seed lands under its own id", self.backend);
+        assert_eq!(
+            applied, row.id,
+            "{}: seed lands under its own id",
+            self.backend
+        );
         self.view.set_state(&row.id, state).await;
     }
 
@@ -337,8 +345,11 @@ async fn class_table(rig: &Rig) {
                         let (x, y) = (uniq("x"), uniq("y"));
                         // The other-id live row: another title of the namespace.
                         let other_id = uniq("o");
-                        rig.seed(&mk_row(&other_id, &ns, &uniq("t-other"), ORIGINAL_CONTENT, 0), other)
-                            .await;
+                        rig.seed(
+                            &mk_row(&other_id, &ns, &uniq("t-other"), ORIGINAL_CONTENT, 0),
+                            other,
+                        )
+                        .await;
                         let target_id = match by {
                             MergeBy::Id => {
                                 rig.seed(&mk_row(&x, &ns, &title, ORIGINAL_CONTENT, 0), target)
@@ -356,13 +367,18 @@ async fn class_table(rig: &Rig) {
                         let (tally, outcome) = rig.push(&push, verified).await;
                         let want = expected(by, target, remnant, verified);
                         if tally != want {
-                            wrong.push(format!("{cell}: got {tally:?} want {want:?} ({outcome:?})"));
+                            wrong
+                                .push(format!("{cell}: got {tally:?} want {want:?} ({outcome:?})"));
                             continue;
                         }
                         let seen = rig.view.seen(&target_id).await;
                         let (content, state, _) = seen.live.expect("target stays live");
                         assert_eq!(state, target, "{cell}: the target keeps its lifecycle");
-                        let want_content = if want == APPLIED { PUSHED_CONTENT } else { ORIGINAL_CONTENT };
+                        let want_content = if want == APPLIED {
+                            PUSHED_CONTENT
+                        } else {
+                            ORIGINAL_CONTENT
+                        };
                         assert_eq!(content, want_content, "{cell}: target bytes");
                         let other_seen = rig.view.seen(&other_id).await;
                         assert_eq!(
@@ -390,7 +406,11 @@ async fn class_table(rig: &Rig) {
 }
 
 /// One cross-id cell: `Y` (`holder_state`) holds the slot, `X` pushes onto it.
-async fn cross_id_cell(rig: &Rig, holder_state: &str, push: impl Fn(&str, &str, &str) -> Memory) -> (Tally, Seen, String) {
+async fn cross_id_cell(
+    rig: &Rig,
+    holder_state: &str,
+    push: impl Fn(&str, &str, &str) -> Memory,
+) -> (Tally, Seen, String) {
     let ns = uniq("ns-9187-v");
     let title = uniq("t");
     let (x, y) = (uniq("x"), uniq("y"));
@@ -408,8 +428,15 @@ async fn ruling_cells(rig: &Rig) {
         inbound(x, ns, t, OLDER_OFFSET_SECS, AUTHOR)
     })
     .await;
-    assert_eq!(tally, DROPPED, "{b} V-1: an older verified unit stays behind the hold");
-    assert_eq!(seen.live.expect("Y live").0, ORIGINAL_CONTENT, "{b} V-1: Y bytes");
+    assert_eq!(
+        tally, DROPPED,
+        "{b} V-1: an older verified unit stays behind the hold"
+    );
+    assert_eq!(
+        seen.live.expect("Y live").0,
+        ORIGINAL_CONTENT,
+        "{b} V-1: Y bytes"
+    );
     // V-1: a unit without a write signature is never the verified unit.
     let (tally, _, _) = cross_id_cell(rig, QUARANTINED, |x, ns, t| {
         let mut m = inbound(x, ns, t, NEWER_OFFSET_SECS, AUTHOR);
@@ -417,37 +444,60 @@ async fn ruling_cells(rig: &Rig) {
         m
     })
     .await;
-    assert_eq!(tally, DROPPED, "{b} V-1: an unsigned unit stays behind the hold");
+    assert_eq!(
+        tally, DROPPED,
+        "{b} V-1: an unsigned unit stays behind the hold"
+    );
     // Cross-author: a verified unit of another author never rewrites Y.
     let (tally, seen, _) = cross_id_cell(rig, QUARANTINED, |x, ns, t| {
         inbound(x, ns, t, NEWER_OFFSET_SECS, OTHER_AUTHOR)
     })
     .await;
-    assert_eq!(tally, DROPPED, "{b}: another author's unit stays behind the hold");
-    assert_eq!(seen.live.expect("Y live").0, ORIGINAL_CONTENT, "{b}: Y bytes (other author)");
+    assert_eq!(
+        tally, DROPPED,
+        "{b}: another author's unit stays behind the hold"
+    );
+    assert_eq!(
+        seen.live.expect("Y live").0,
+        ORIGINAL_CONTENT,
+        "{b}: Y bytes (other author)"
+    );
     // V-2: a contaminated slot holder never yields to a verified push.
     let (tally, seen, _) = cross_id_cell(rig, CONTAMINATED, |x, ns, t| {
         inbound(x, ns, t, NEWER_OFFSET_SECS, AUTHOR)
     })
     .await;
     assert_eq!(tally, DROPPED, "{b} V-2: contaminated slot holder");
-    assert_eq!(seen.live.expect("Y live").1, CONTAMINATED, "{b} V-2: Y hold");
+    assert_eq!(
+        seen.live.expect("Y live").1,
+        CONTAMINATED,
+        "{b} V-2: Y hold"
+    );
     // V-3 / V-4: the yielded merge keeps Y quarantined, snapshots Y's
     // pre-merge bytes, and does not carry X's verified level onto Y.
     let (tally, seen, x) = cross_id_cell(rig, QUARANTINED, |x, ns, t| {
         inbound(x, ns, t, NEWER_OFFSET_SECS, AUTHOR)
     })
     .await;
-    assert_eq!(tally, APPLIED, "{b}: the verified cross-id unit applies (#3901)");
+    assert_eq!(
+        tally, APPLIED,
+        "{b}: the verified cross-id unit applies (#3901)"
+    );
     let (content, state, metadata) = seen.live.expect("Y live");
-    assert_eq!((content.as_str(), state.as_str()), (PUSHED_CONTENT, QUARANTINED), "{b}: Y after the yield");
+    assert_eq!(
+        (content.as_str(), state.as_str()),
+        (PUSHED_CONTENT, QUARANTINED),
+        "{b}: Y after the yield"
+    );
     assert_eq!(
         seen.archived_contents,
         vec![ORIGINAL_CONTENT.to_string()],
         "{b} V-3: the pre-merge bytes of Y are archived"
     );
     assert_ne!(
-        metadata.get("attest_level").and_then(serde_json::Value::as_str),
+        metadata
+            .get("attest_level")
+            .and_then(serde_json::Value::as_str),
         Some(AGENT_ATTESTED),
         "{b} V-4: X's verified attestation must not land on Y: {metadata}"
     );
@@ -457,9 +507,16 @@ async fn ruling_cells(rig: &Rig) {
     let ns = uniq("ns-9187-v2");
     let (x, y) = (uniq("x"), uniq("y"));
     let (title_x, title_y) = (uniq("tx"), uniq("ty"));
-    rig.seed(&mk_row(&x, &ns, &title_x, ORIGINAL_CONTENT, 0), CONTAMINATED).await;
-    rig.seed(&mk_row(&y, &ns, &title_y, ORIGINAL_CONTENT, 0), QUARANTINED).await;
-    let (tally, _) = rig.push(&inbound(&x, &ns, &title_y, NEWER_OFFSET_SECS, AUTHOR), true).await;
+    rig.seed(
+        &mk_row(&x, &ns, &title_x, ORIGINAL_CONTENT, 0),
+        CONTAMINATED,
+    )
+    .await;
+    rig.seed(&mk_row(&y, &ns, &title_y, ORIGINAL_CONTENT, 0), QUARANTINED)
+        .await;
+    let (tally, _) = rig
+        .push(&inbound(&x, &ns, &title_y, NEWER_OFFSET_SECS, AUTHOR), true)
+        .await;
     assert_eq!(tally, DROPPED, "{b} V-2: the same-id hold decides");
     assert_eq!(
         rig.view.seen(&y).await.live.map(|(c, s, _)| (c, s)),

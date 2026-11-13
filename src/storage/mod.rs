@@ -899,8 +899,9 @@ mod federation_by_id_4447;
 mod merge_barrier_9147;
 pub use merge_barrier_9147::{
     InboundMergeOutcome, MERGE_BARRIER_TRACE_TARGET, ReceiverMergeBarrier,
-    barrier_yields_to_verified_release, dequarantine, federated_delete, insert_if_newer,
-    receiver_merge_barrier, trace_merge_barrier_drop, verified_release_candidate,
+    barrier_yields_to_verified_release, cross_id_verified_slot_holder, dequarantine,
+    federated_delete, insert_if_newer, is_cross_id_yield_holder, receiver_merge_barrier,
+    trace_merge_barrier_drop, verified_release_candidate,
 };
 // #4206 — the title-slot pre-merge archive snapshot helpers (qual_10 split).
 mod title_slot_archive;

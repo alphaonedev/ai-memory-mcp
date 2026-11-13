@@ -224,6 +224,73 @@ pub fn barrier_yields_to_verified_release(
     receiver_verified && barrier == ReceiverMergeBarrier::Held(LifecycleState::Quarantined)
 }
 
+/// #9187 / #3901 — the live `(title, namespace)` slot holder a push of an id
+/// with NO live row would merge into, when that merge may pass the barrier
+/// under the #1948 verified-quarantine yield: the barrier is then decided from
+/// the row the merge really writes (the holder), exactly as on the same-id
+/// path, never from the inbound id.
+///
+/// `Some(holder)` only when ALL hold (anything else is `None`, and the caller
+/// keeps the `insert_if_newer` fall-through, whose slot barrier drops):
+/// * `receiver_verified` (an unverified push never yields);
+/// * the inbound id carries no barrier of its own (no tombstone, no archived
+///   copy: an id this node ended is never re-admitted through any slot);
+/// * the holder is `quarantined` (contaminated never yields) and a different
+///   id from the inbound;
+/// * the holder's stored `agent_id` equals the inbound `agent_id`, both
+///   non-empty (a verified unit of one author never rewrites another
+///   author's held row).
+///
+/// The caller must still run the same-id pipeline with the holder as the
+/// target: drop unless the merged row is the exact verified signed unit, keep
+/// the holder's id and hold, snapshot its pre-merge bytes, and never carry the
+/// inbound's verified attestation onto the holder (the signature covered the
+/// inbound id's unit, not this node's decision to contain the holder).
+///
+/// Call it inside the funnel's write transaction.
+///
+/// # Errors
+///
+/// Propagates the probe's rusqlite error (the funnel then rolls back).
+pub fn cross_id_verified_slot_holder(
+    conn: &Connection,
+    inbound: &Memory,
+    receiver_verified: bool,
+) -> Result<Option<Memory>> {
+    if !receiver_verified || receiver_merge_barrier(conn, &inbound.id, None)?.is_some() {
+        return Ok(None);
+    }
+    let Some(pre) = super::title_slot_archive::probe_federation_merge_preimage(
+        conn,
+        &inbound.title,
+        &inbound.namespace,
+    )?
+    else {
+        return Ok(None);
+    };
+    if pre.id == inbound.id {
+        return Ok(None);
+    }
+    Ok(get_any(conn, &pre.id)?.filter(|holder| is_cross_id_yield_holder(holder, inbound)))
+}
+
+/// #9187 — the backend-shared holder check of the cross-id yield: a
+/// `quarantined` holder (contaminated never yields) whose stored, non-empty
+/// `agent_id` is the author the inbound row names.
+#[must_use]
+pub fn is_cross_id_yield_holder(holder: &Memory, inbound: &Memory) -> bool {
+    fn author(m: &Memory) -> Option<&str> {
+        m.metadata
+            .get(crate::META_KEY_AGENT_ID)
+            .and_then(serde_json::Value::as_str)
+            .filter(|a| !a.is_empty())
+    }
+    holder.id != inbound.id
+        && holder.lifecycle_state == LifecycleState::Quarantined
+        && author(holder).is_some()
+        && author(holder) == author(inbound)
+}
+
 /// #9150 — the row a merge funnel writes once a quarantine barrier has
 /// yielded ([`barrier_yields_to_verified_release`]). The LWW blend of
 /// `existing` and `prepared` keeps the local `created_at` and so is never the

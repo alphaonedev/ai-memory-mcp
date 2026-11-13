@@ -94,8 +94,17 @@ pub fn merge_inbound_authorized(
         // insert lane instead of reaching `merge_memory` (whose R2.1
         // predicate keeps the local taint). The postgres twin already reads
         // the raw row by id (`SQL_SELECT_MEMORY_ROW_BY_ID`).
-        match get_any(conn, &inbound.id)? {
-            Some(existing) => {
+        // #9187 / #3901 — the barrier decides from the row the merge really
+        // writes: the inbound id's own row, else (verified push, no live row)
+        // the quarantined title-slot holder of the same author, through the
+        // SAME pipeline as a same-id merge. Anything else falls through.
+        let target = match get_any(conn, &inbound.id)? {
+            Some(existing) => Some((existing, false)),
+            None => super::cross_id_verified_slot_holder(conn, inbound, receiver_verified)?
+                .map(|holder| (holder, true)),
+        };
+        match target {
+            Some((existing, cross_id)) => {
                 // #4023 — re-authorize the row actually being overwritten,
                 // under the write lock (the caller's pre-read may be stale).
                 if let Some(authorize) = authorize_stored
@@ -145,13 +154,19 @@ pub fn merge_inbound_authorized(
                 // `updated_at` (the primary LWW key) to a freshness ceiling
                 // so an enrolled relay cannot win the merge by stamping a
                 // far-future timestamp. now + the attestation skew window.
-                let prepared = crate::models::clamp_inbound_updated_at(
+                let mut prepared = crate::models::clamp_inbound_updated_at(
                     sanitized,
                     &chrono::Utc::now().to_rfc3339(),
                     crate::identity::attest::ATTEST_CREATED_AT_SKEW_SECS,
                 );
                 // #224 field-wise merge — the SAME pure reconciler the
                 // postgres adapter calls in Rust (no per-backend drift).
+                // #9187 — a cross-id merge writes the slot holder's row: the unit keeps
+                // the holder's id (the signed surface excludes `id`), so the same-id
+                // reconciler's precondition holds and the merge never lands as X.
+                if cross_id {
+                    prepared.id.clone_from(&existing.id);
+                }
                 let merged = crate::models::merge_memory(&existing, &prepared);
                 // #9150 — a yielded quarantine releases the verified unit, not
                 // the LWW blend (which keeps the local `created_at`).
@@ -170,10 +185,12 @@ pub fn merge_inbound_authorized(
                 // byte-identical to the verified inbound, restore `agent_attested`.
                 // No-op when `receiver_verified` is false (every non-receive
                 // caller) — byte-identical legacy merge.
+                // #9187 V-4 — never on a cross-id holder: the signature covered
+                // the inbound id's unit, not this node's hold on the holder.
                 let merged = crate::models::reassert_verified_attestation(
                     merged,
                     inbound,
-                    receiver_verified,
+                    receiver_verified && !cross_id,
                 );
                 // #9150 — a yielded quarantine admits ONLY the exact signed
                 // unit this receiver verified; any other merge outcome (a
@@ -186,8 +203,9 @@ pub fn merge_inbound_authorized(
                 overwrite_full_row_by_id(conn, &merged)?;
                 Ok(Some(InboundMergeOutcome::Applied(merged.id)))
             }
-            // No row by this id — defer to the (title, namespace) dedup
-            // path OUTSIDE this transaction (signalled by `None`).
+            // No row by this id and no cross-id yield — defer to the
+            // (title, namespace) dedup path OUTSIDE this transaction
+            // (signalled by `None`), whose slot barrier still drops a held slot.
             None => Ok(None),
         }
     })();
