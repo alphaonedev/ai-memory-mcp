@@ -30,7 +30,7 @@ agent-EXTERNAL actions at write time). The forms:
 | Form | What it does | Activation gate |
 |---|---|---|
 | 1 — Online dedup-and-synthesis | One batch action-emitting LLM call BEFORE write (add/update/delete/no-op verbs). | **Always on** in MCP write path (autonomous tier) |
-| 2 — Synchronous atomise-before-embed | Source is decomposed into atoms BEFORE embedding so atoms get vectors. | **Schema always on; behavior gated on `GovernancePolicy.auto_atomise = true` + `auto_atomise_mode = "synchronous"` in a namespace standard memory, AND on a wired curator — see the note below** |
+| 2 — Synchronous atomise-before-embed | On **MCP stdio + sqlite**, a successful synchronous atomisation decomposes the source before embedding its atoms. HTTP + sqlite runs deferred; postgres does not run the atomiser. | **Schema always on; behavior gated on `GovernancePolicy.auto_atomise = true` + `auto_atomise_mode = "synchronous"` in a namespace standard memory, AND on a wired curator — see the note below** |
 | 3 — Multi-step ingest orchestrator | Prompt-cache reuse + explicit-trust deterministic-then-LLM helpers. | **Always available** as `memory_ingest_multistep` MCP tool (`Family::Power`+) |
 | 4 — Fact-provenance | `citations` + `source_uri` + `source_span` (atom-grain span) columns. | **Always on** in store schema (sqlite v38+) |
 | 5 — Confidence + shadow-mode + freshness decay | Auto-confidence calibration; shadow-mode side-by-side scoring; exponential freshness decay on recall. | **Three process-level env vars** on the MCP server + curator daemon: `AI_MEMORY_AUTO_CONFIDENCE=1`, `AI_MEMORY_CONFIDENCE_SHADOW=1`, `AI_MEMORY_CONFIDENCE_DECAY=1` |
@@ -38,6 +38,21 @@ agent-EXTERNAL actions at write time). The forms:
 | 7 — Substrate-authority at write | `check_agent_action` consulted at substrate-internal write paths AND at the four agent-EXTERNAL daemon wire-points (skill emission, federation POST, hook subprocess spawn, LLM HTTP) via `wire_check::check` — shipped v0.7.0 (#760). | **Operator key + R001–R004 signed + enabled**; the agent-EXTERNAL hook is armed only under the `serve`/curator daemon |
 
 ### What Form 2 actually requires (v1.0.0, #2983-#2987)
+
+The v1.0.0 guarantee is specific to the transport and backend:
+
+| Write surface / backend | Execution | Response evidence |
+|---|---|---|
+| MCP stdio / sqlite, configured `synchronous` | Curator runs inline; successful atoms and parent archive are visible before the response. | `atomise_mode: "synchronous"`, `atomise_outcome: "atomised"` |
+| HTTP / sqlite, configured `synchronous` | Work is deferred to the bounded worker; the response does not promise atoms already exist. | On enqueue: `atomise_mode: "deferred"`, `atomise_mode_configured: "synchronous"`, `atomise_mode_reason: "deferred_on_http"`, `atomise_outcome: "queued"` |
+| Postgres-backed daemon | The parent write is stored; the atomiser does not run. | With a wired curator: `atomise_mode: "off"`, `atomise_mode_reason: "backend_unsupported"`, `atomise_outcome: "skipped_backend_unsupported"` |
+
+A configured mode alone does not prove a split happened. Check the outcome:
+`skipped_*` and `failed` do not carry the successful Form 2 guarantee. A
+postgres daemon without a curator omits the atomisation disposition rather
+than reporting an attempted split. PostgreSQL support is tracked in
+[issue #8255](https://github.com/alphaonedev/ai-memory-mcp/issues/8255);
+the backend port requires the operator's milestone decision.
 
 Three things are load-bearing, and two of them were undocumented until
 v1.0.0:
@@ -71,6 +86,13 @@ v1.0.0:
    `atomise_outcome: "skipped_backend_unsupported"` and NEVER falls
    through to a sqlite handle — atoms landing in a different store than
    their source would be mixed-state corruption.
+
+`ai-memory doctor`'s **Atomisation Curator** note states the same
+MCP-stdio + sqlite boundary. On a postgres daemon, `capabilities.atomisation`
+marks `tool`, `cli`, `auto`, and `curator` as `"unsupported_on_postgres"`,
+sets `unsupported_on_postgres: true`, and supplies `unsupported_reason`.
+These are backend capability disclosures, not confirmation that a particular
+write produced atoms; use the store response for that check.
 
 The `deferred` mode routes through a **bounded, single-consumer
 background worker**. A full queue drops the job with a counted WARN and
