@@ -1558,6 +1558,42 @@ fn rotation_for(cfg: &LoggingConfig) -> Rotation {
 /// line with the deployment; only the secret is destroyed.
 pub const URL_PASSWORD_MASK: &str = "****";
 
+/// Delimiter between a URL scheme and its authority.
+const SCHEME_SEPARATOR: &str = "://";
+/// Delimiters ending a host/port after any userinfo has been consumed.
+const AUTHORITY_TERMINATORS: [char; 3] = ['/', '?', '#'];
+/// The generic credential noun used in compound option names.
+const CREDENTIAL_OPTION_NOUN: &str = "credential";
+/// Normalized substrings identifying credential-bearing option names.
+const CREDENTIAL_OPTION_KEYS: &[&str] = &[
+    "password",
+    "passwd",
+    "pwd",
+    "pass",
+    "pw",
+    "secret",
+    "token",
+    "apikey",
+    "apisecret",
+    CREDENTIAL_OPTION_NOUN,
+    "authorization",
+    "authtoken",
+    "bearer",
+    "accesskey",
+    "secretkey",
+    "privatekey",
+    "clientsecret",
+    "session",
+    "cookie",
+    "jwt",
+];
+/// These short names are credentials only when the whole normalized key matches.
+const EXACT_CREDENTIAL_KEYS: &[&str] = &["key", "auth"];
+/// Closing punctuation ends a keyless URL, but never an identified secret value.
+const KEYLESS_URL_TERMINATORS: [char; 3] = ['\'', ')', '>'];
+/// Credential spans stop at physical line endings unless a quote owns the span.
+const CREDENTIAL_LINE_ENDS: [char; 2] = ['\n', '\r'];
+
 /// #1579 A3 (SECURITY) — redact the userinfo *password* portion of a
 /// single URL: `postgres://user:hunter2@host:5432/db` becomes
 /// `postgres://user:****@host:5432/db`.
@@ -1580,14 +1616,14 @@ pub const URL_PASSWORD_MASK: &str = "****";
 /// through on a parse error.
 #[must_use]
 pub fn redact_url_password(url: &str) -> String {
-    let Some(scheme_end) = url.find("://") else {
+    let Some(scheme_end) = url.find(SCHEME_SEPARATOR) else {
         return url.to_string();
     };
-    let authority_start = scheme_end + 3;
+    let authority_start = scheme_end + SCHEME_SEPARATOR.len();
     let rest = &url[authority_start..];
     // The authority component ends at the first '/', '?' or '#'.
     let authority_end = rest
-        .find(['/', '?', '#'])
+        .find(AUTHORITY_TERMINATORS)
         .map_or(url.len(), |i| authority_start + i);
     let authority = &url[authority_start..authority_end];
     // Userinfo is everything before the LAST '@' in the authority
@@ -1612,45 +1648,232 @@ pub fn redact_url_password(url: &str) -> String {
 /// `sqlx::Error::Configuration("invalid url postgres://…")` whose
 /// Display interpolates the connection target). Scans the message for
 /// `scheme://` runs and masks the userinfo password inside each one;
-/// every other byte passes through unchanged.
+/// other bytes pass through unchanged unless a run exceeds the shared scanner
+/// cap, in which case its remainder is discarded and replaced with the mask.
 #[must_use]
 pub fn redact_urls_in_message(msg: &str) -> String {
+    map_url_runs(msg, |url, _| redact_url_password(url))
+}
+
+/// Render credential-bearing options and bare connection targets privately.
+/// Harmless assignments remain readable; URLs use the caller's allowlist renderer.
+/// OWNERSHIP-05: borrow the diagnostic while constructing its rendered copy.
+/// The legacy userinfo wrapper bypasses this operator-only option policy.
+pub(crate) fn map_urls_in_message(msg: &str, render: fn(&str) -> String) -> String {
+    let options = redact_connection_options(msg);
+    let text = redact_bare_targets(&options);
+    map_url_runs(&text, |url, run| render_operator_url(url, run, render))
+}
+
+/// Consume a scheme-less authority through its host, including a spaced password.
+/// URL spans are skipped as units so their userinfo is never partially rewritten.
+fn redact_bare_targets(msg: &str) -> String {
+    let mut out = String::with_capacity(msg.len());
+    let mut offset = 0;
+    let mut pending_url = next_url_span(msg);
+    let mut lookahead_end = 0;
+    let mut last_at = None;
+    while offset < msg.len() {
+        if let Some(span) = pending_url.as_ref().filter(|span| span.start == offset) {
+            out.push_str(&msg[span.clone()]);
+            offset = span.end;
+            lookahead_end = offset;
+            pending_url =
+                next_url_span(&msg[offset..]).map(|next| offset + next.start..offset + next.end);
+            continue;
+        }
+        let rest = &msg[offset..];
+        let stop = pending_url
+            .as_ref()
+            .map_or(rest.len(), |span| span.start - offset);
+        let local = &rest[..stop];
+        if offset >= lookahead_end {
+            let line_end = local.find(CREDENTIAL_LINE_ENDS).unwrap_or(local.len());
+            lookahead_end = offset + line_end;
+            last_at = local[..line_end].rfind('@').map(|at| offset + at);
+        }
+        let end = local.find(char::is_whitespace).unwrap_or(local.len());
+        let token = &local[..end];
+        let ambiguous = credentialed_authority(token)
+            && token
+                .split_once(':')
+                .is_some_and(|(_, value)| !value.is_empty());
+        let lookahead = lookahead_end - offset;
+        let at = last_at.filter(|at| *at >= offset).map(|at| at - offset);
+        let bare = ambiguous && (at.is_some() || token.contains(AUTHORITY_TERMINATORS));
+        if bare {
+            let consumed = at.map_or(end, |at| {
+                let host = at + '@'.len_utf8();
+                host + local[host..lookahead]
+                    .find(char::is_whitespace)
+                    .unwrap_or(lookahead - host)
+            });
+            out.push_str(URL_PASSWORD_MASK);
+            offset += consumed;
+        } else if end > 0 {
+            out.push_str(token);
+            offset += end;
+        } else if let Some(ch) = local.chars().next() {
+            out.push(ch);
+            offset += ch.len_utf8();
+        }
+    }
+    out
+}
+
+mod credential_scan;
+use credential_scan::redact_connection_options;
+
+/// Consume the entire ruled credential span, including whitespace and later assignments.
+fn connection_value_end(value: &str) -> usize {
+    let quote = value.chars().next().filter(|ch| matches!(*ch, '\'' | '"'));
+    let mut escaped = false;
+    for (offset, ch) in value.char_indices() {
+        if offset == 0 && quote.is_some() {
+            continue;
+        }
+        if escaped {
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if quote == Some(ch) {
+            return offset + ch.len_utf8();
+        } else if quote.is_none() && CREDENTIAL_LINE_ENDS.contains(&ch) {
+            return offset;
+        }
+    }
+    value.len()
+}
+
+/// Apply one renderer to each URL run, sharing UTF-8-safe tokenization
+/// (OWNERSHIP-15) without duplicating the URL renderer's masking policy.
+fn map_url_runs(msg: &str, render: impl Fn(&str, &url_scan::UrlRun) -> String) -> String {
     let mut out = String::with_capacity(msg.len());
     let mut rest = msg;
-    while let Some(sep) = rest.find("://") {
-        // Walk back over scheme characters already buffered.
-        let mut scheme_start = sep;
-        while scheme_start > 0 {
-            let c = rest.as_bytes()[scheme_start - 1];
-            if c.is_ascii_alphanumeric() || c == b'+' || c == b'-' || c == b'.' {
-                scheme_start -= 1;
-            } else {
-                break;
-            }
+    while let Some(run) = url_scan::next_url_run(rest) {
+        out.push_str(&rest[..run.span.start]);
+        if run.capped {
+            out.push_str(&rest[run.span.start..run.scheme_end + SCHEME_SEPARATOR.len()]);
+            out.push_str(URL_PASSWORD_MASK);
+        } else {
+            out.push_str(&render(&rest[run.span.clone()], &run));
         }
-        out.push_str(&rest[..scheme_start]);
-        // The URL run ends at the first whitespace / quote / brace /
-        // paren / comma / semicolon / angle bracket — same boundary
-        // set as `handlers::postgres_gate::sanitize_store_err_message`.
-        let url_end = rest[sep..]
-            .find(|c: char| {
-                c.is_ascii_whitespace()
-                    || matches!(
-                        c,
-                        '"' | '\'' | '`' | '{' | '}' | '(' | ')' | ',' | ';' | '<' | '>'
-                    )
-            })
-            .map_or(rest.len(), |i| sep + i);
-        out.push_str(&redact_url_password(&rest[scheme_start..url_end]));
-        rest = &rest[url_end..];
+        rest = &rest[run.span.end..];
     }
     out.push_str(rest);
     out
 }
 
+mod url_scan;
+
+/// Ownership-only callers share the same forward boundary discovery.
+fn next_url_span(text: &str) -> Option<std::ops::Range<usize>> {
+    url_scan::next_url_run(text).map(|run| run.span)
+}
+
+/// Only an authority colon identifies userinfo ambiguity; path colons do not.
+fn credentialed_authority(token: &str) -> bool {
+    token
+        .split(AUTHORITY_TERMINATORS)
+        .next()
+        .is_some_and(|authority| authority.contains(':'))
+}
+
+/// Render from boundaries already discovered by the forward scanner.
+/// OWNERSHIP-15: relative offsets retain the original UTF-8 boundaries.
+fn render_operator_url(url: &str, run: &url_scan::UrlRun, render: fn(&str) -> String) -> String {
+    let scheme_end = run.scheme_end - run.span.start;
+    let scheme = &url[..scheme_end];
+    let Some(at) = run.userinfo_end else {
+        return if run.ambiguous {
+            format!("{scheme}{SCHEME_SEPARATOR}{URL_PASSWORD_MASK}")
+        } else {
+            render(url)
+        };
+    };
+    let host_start = at + '@'.len_utf8() - run.span.start;
+    let host_end = run.host_end - run.span.start;
+    let host = &url[host_start..host_end];
+    render(&format!(
+        "{scheme}{SCHEME_SEPARATOR}{URL_PASSWORD_MASK}@{host}"
+    ))
+}
+
+#[cfg(test)]
+mod masking_cost_tests;
+
+#[cfg(test)]
+mod url_run_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn operator_numeric_password_with_path_boundary_8205() {
+        assert_eq!(
+            map_urls_in_message(
+                "connect postgres://svc:123/path note@host failed",
+                str::to_owned
+            ),
+            "connect postgres://****@host failed"
+        );
+    }
+
+    #[test]
+    fn operator_numeric_password_with_space_boundary_8205() {
+        assert_eq!(
+            map_urls_in_message("connect postgres://svc:123 note@host failed", str::to_owned),
+            "connect postgres://****@host failed"
+        );
+    }
+
+    #[test]
+    fn operator_url_authority_ruling_boundaries_8205() {
+        const PASSWORD_TAIL_8205: &str = "secret";
+        const CASES: &[(&str, &str)] = &[
+            (
+                "postgres://db.example.invalid:5432 failed for agent bot@node later",
+                "postgres://****@node later",
+            ),
+            (
+                "postgres://db.example.invalid:5432 connection refused",
+                "postgres://****",
+            ),
+            (
+                "postgres://db.example.invalid/path then see https://docs.example/x@y",
+                "postgres://db.example.invalid/path then see https://****@y",
+            ),
+            (
+                "postgres://host:5432\nagent bot@node",
+                "postgres://****\nagent bot@node",
+            ),
+            (
+                "postgres://db.example.invalid failed for agent bot@node later",
+                "postgres://db.example.invalid failed for agent bot@node later",
+            ),
+            (
+                "postgres://host:5432 next https://user:pass@other/x",
+                "postgres://****",
+            ),
+        ];
+        let ambiguous =
+            format!("postgres://user:prefix/ss {PASSWORD_TAIL_8205}@db.example.invalid");
+        let rendered = map_urls_in_message(&ambiguous, str::to_owned);
+        assert_eq!(rendered, "postgres://****@db.example.invalid");
+        assert!(
+            !rendered.contains(PASSWORD_TAIL_8205),
+            "credential tail survived the ruled span"
+        );
+        // Identity rendering isolates the ruled byte spans from URL-origin formatting.
+        for (input, expected) in CASES {
+            assert_eq!(
+                map_urls_in_message(input, str::to_owned),
+                *expected,
+                "{input}"
+            );
+        }
+    }
 
     #[test]
     fn rotation_for_default_is_daily() {

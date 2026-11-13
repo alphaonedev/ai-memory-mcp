@@ -187,7 +187,7 @@ pub fn handle_kg_invalidate(
         valid_until,
         actor.as_deref(),
     )
-    .map_err(|e| crate::mcp::error_text::mcp_foreign_err("as_deref", e))?
+    .map_err(|e| crate::mcp::error_text::mcp_foreign_err("invalidate_link", e))?
     {
         Some(res) => {
             // v0.7 J4 / G14 — emit `memory_link_invalidated` webhook

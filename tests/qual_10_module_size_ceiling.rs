@@ -34,6 +34,12 @@ use std::fs;
 /// Calibrated at FX-C4-batch2 (SHA 54713024d + this batch's
 /// additions). Bump in lockstep with growth.
 const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
+    // #8674: exact ceilings for the scanner extraction and its cost guards.
+    ("src/logging.rs", 3265),
+    ("src/logging/credential_scan.rs", 214),
+    ("src/logging/url_scan.rs", 121),
+    ("src/logging/url_run_tests.rs", 161),
+    ("src/logging/masking_cost_tests.rs", 74),
     // The five 3000+ LOC offenders from QUAL-10.
     //
     // 2026-06-01 — bumped 16_000 → 16_100 by the v0.7.0 release QC of

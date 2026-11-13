@@ -124,7 +124,9 @@ pub fn handle_skill_promote_from_reflection(
         &caller,
         read_caller.as_deref(),
     )
-    .map_err(|error| crate::mcp::error_text::mcp_foreign_err("as_deref", error))
+    .map_err(|error| {
+        crate::mcp::error_text::mcp_foreign_err("skill_promote_from_reflection", error)
+    })
 }
 
 /// Shared SQLite promotion body. HTTP preserves its authenticated actor separately

@@ -87,14 +87,24 @@ pub fn mcp_error_text(e: &MemoryError) -> String {
 /// is the whole diagnosis on an MCP stdio daemon (no `/metrics` there). An
 /// own-vocabulary result (a typed `StorageError` / governance refusal that
 /// rode an `anyhow` chain) logs at `warn`, since the caller already has it.
-pub fn log_foreign<E: Into<MemoryError>>(context: &'static str, e: E) -> MemoryError {
+pub fn log_foreign<E: Into<MemoryError> + std::fmt::Display>(
+    context: &'static str,
+    e: E,
+) -> MemoryError {
+    // ERRORS-15: preserve the source chain before the caller-safe classifier
+    // consumes it. Render URL origins from the existing allowlist (#6822),
+    // dropping credential-bearing userinfo, paths, queries and fragments.
+    let detail =
+        crate::logging::map_urls_in_message(&format!("{e:#}"), crate::url_display::url_origin);
+    // #6822 / CWE-117: string Debug escapes controls for the text formatter.
+    // Both HTTP promotion and MCP/CLI tools use these same emitters.
     let e = e.into();
     if e.is_foreign_class() {
         tracing::error!(
             target: TRACE_TARGET,
             context,
             code = e.code(),
-            detail = %e.message(),
+            detail = ?detail,
             "#3713: foreign error kept on the operator log; the caller receives the class"
         );
     } else {
@@ -102,7 +112,7 @@ pub fn log_foreign<E: Into<MemoryError>>(context: &'static str, e: E) -> MemoryE
             target: TRACE_TARGET,
             context,
             code = e.code(),
-            detail = %e.message(),
+            detail = ?detail,
             "#3713: typed refusal passed through to the caller"
         );
     }
@@ -111,7 +121,10 @@ pub fn log_foreign<E: Into<MemoryError>>(context: &'static str, e: E) -> MemoryE
 
 /// The one-token site edit: log the foreign detail for the operator and
 /// return the caller-safe text — `.map_err(|e| mcp_foreign_err("ctx", e))?`.
-pub fn mcp_foreign_err<E: Into<MemoryError>>(context: &'static str, e: E) -> String {
+pub fn mcp_foreign_err<E: Into<MemoryError> + std::fmt::Display>(
+    context: &'static str,
+    e: E,
+) -> String {
     mcp_error_text(&log_foreign(context, e))
 }
 

@@ -592,6 +592,200 @@ fn rust_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
     }
 }
 
+fn userinfo_masker_reference_3711(code: &str) -> bool {
+    const USERINFO_MASKERS: &[&str] = &["redact_url_password", "redact_urls_in_message"];
+    // Match function values and aliased imports as well as calls.
+    code.split(|ch: char| !(ch.is_alphanumeric() || ch == '_'))
+        .any(|identifier| USERINFO_MASKERS.contains(&identifier))
+}
+
+#[test]
+fn userinfo_masker_function_values_are_rejected_8205() {
+    for code in [
+        "map_urls_in_message(message, logging::redact_url_password)",
+        "let render = logging::redact_url_password;",
+        "use crate::logging::redact_url_password as render;",
+        "let render = logging::redact_urls_in_message;",
+        "logging::redact_url_password (message)",
+    ] {
+        assert!(
+            userinfo_masker_reference_3711(code),
+            "userinfo-only function reference escaped the guard: {code}"
+        );
+    }
+    assert!(
+        !userinfo_masker_reference_3711("redact_url_password_extra"),
+        "longer identifier is not the masker"
+    );
+    assert!(
+        !userinfo_masker_reference_3711("url_display::url_origin"),
+        "allowlist renderer must pass"
+    );
+}
+
+fn production_line_has_userinfo_masker_8205(line: &str) -> bool {
+    userinfo_masker_reference_3711(rust_code_before_line_comment_8205(line))
+}
+
+fn production_masker_lines_8205(source: &str) -> Vec<usize> {
+    let mut state = RustLineState8205::default();
+    source
+        .lines()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            userinfo_masker_reference_3711(state.before_comment(line)).then_some(index + 1)
+        })
+        .collect()
+}
+
+#[test]
+fn multiline_literal_continuation_masker_is_rejected_8205() {
+    let source = "let target = \"first line\nhttps://peer.example.invalid\"; let render = logging::redact_url_password;";
+    assert!(
+        !production_masker_lines_8205(source).is_empty(),
+        "r4-6: masker on a multiline literal continuation escaped the guard"
+    );
+}
+
+#[test]
+fn char_and_byte_literals_preserve_guard_state_8205() {
+    for literal in [
+        r#"'"'"#,
+        r#"b'"'"#,
+        r#"'\"'"#,
+        r#"b'\"'"#,
+        r"'\u{22}'",
+        r"'\''",
+    ] {
+        let source = format!(
+            "let quote = {literal};\nlet url = \"https://peer.example.invalid\"; let render = logging::redact_url_password;"
+        );
+        assert_eq!(
+            production_masker_lines_8205(&source),
+            vec![2],
+            "C1: char or byte literal changed string state: {literal}"
+        );
+    }
+}
+
+#[derive(Default)]
+struct RustLineState8205 {
+    quoted: bool,
+    escaped: bool,
+    raw_hashes: Option<usize>,
+}
+
+fn rust_code_before_line_comment_8205(line: &str) -> &str {
+    RustLineState8205::default().before_comment(line)
+}
+
+// A lifetime is not a char literal; consume only a complete Rust char token.
+fn char_literal_end_8205(text: &str) -> Option<usize> {
+    let mut chars = text.char_indices();
+    if chars.next()?.1 != '\'' {
+        return None;
+    }
+    let (_, value) = chars.next()?;
+    if value == '\\' {
+        let (_, escape) = chars.next()?;
+        match escape {
+            'u' => {
+                if chars.next()?.1 != '{' {
+                    return None;
+                }
+                loop {
+                    if chars.next()?.1 == '}' {
+                        break;
+                    }
+                }
+            }
+            'x' => {
+                chars.next()?;
+                chars.next()?;
+            }
+            _ => {}
+        }
+    } else if matches!(value, '\'' | '\n' | '\r') {
+        return None;
+    }
+    let (end, quote) = chars.next()?;
+    (quote == '\'').then_some(end + quote.len_utf8())
+}
+
+impl RustLineState8205 {
+    fn before_comment<'a>(&mut self, line: &'a str) -> &'a str {
+        let mut chars = line.char_indices().peekable();
+        while let Some((offset, ch)) = chars.next() {
+            if let Some(hashes) = self.raw_hashes {
+                if ch == '"'
+                    && line.as_bytes()[offset + ch.len_utf8()..]
+                        .get(..hashes)
+                        .is_some_and(|bytes| bytes.iter().all(|byte| *byte == b'#'))
+                {
+                    self.raw_hashes = None;
+                }
+                continue;
+            }
+            if self.quoted {
+                if self.escaped {
+                    self.escaped = false;
+                } else if ch == '\\' {
+                    self.escaped = true;
+                } else if ch == '"' {
+                    self.quoted = false;
+                }
+                continue;
+            }
+            if ch == '\''
+                && let Some(end) = char_literal_end_8205(&line[offset..])
+            {
+                while chars.peek().is_some_and(|(at, _)| *at < offset + end) {
+                    let _ = chars.next();
+                }
+                continue;
+            }
+            if ch == 'r' {
+                let suffix = &line[offset + ch.len_utf8()..];
+                let hashes = suffix.bytes().take_while(|byte| *byte == b'#').count();
+                if suffix.as_bytes().get(hashes) == Some(&b'"') {
+                    self.raw_hashes = Some(hashes);
+                    let _ = chars.nth(hashes);
+                }
+            } else if ch == '"' {
+                self.quoted = true;
+            } else if ch == '/' && chars.peek().is_some_and(|(_, next)| *next == '/') {
+                // OWNERSHIP-15: char_indices provides the UTF-8-safe borrowed prefix.
+                return &line[..offset];
+            }
+        }
+        line
+    }
+}
+
+#[test]
+fn userinfo_masker_after_url_literal_is_rejected_8205() {
+    for code in [
+        "let render = logging::redact_url_password;",
+        r#"let target = "https://peer.example.invalid"; let render = logging::redact_url_password;"#,
+        r##"let target = r#"https://peer.example.invalid"#; let render = logging::redact_url_password;"##,
+    ] {
+        assert!(
+            production_line_has_userinfo_masker_8205(code),
+            "userinfo masker after a URL literal escaped the production guard"
+        );
+    }
+    assert!(
+        !production_line_has_userinfo_masker_8205("// logging::redact_url_password is retired"),
+        "comment-only masker mention must be ignored"
+    );
+    assert!(
+        !production_line_has_userinfo_masker_8205(
+            "let safe = url_display::url_origin; // redact_url_password is retired"
+        ),
+        "trailing comment must be ignored"
+    );
+}
+
 #[test]
 fn no_production_site_renders_a_url_through_the_userinfo_maskers_3711() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -607,11 +801,8 @@ fn no_production_site_renders_a_url_through_the_userinfo_maskers_3711() {
             continue;
         }
         let text = std::fs::read_to_string(&file).expect("read source");
-        for (i, line) in text.lines().enumerate() {
-            let code = line.split("//").next().unwrap_or("");
-            if code.contains("redact_url_password(") || code.contains("redact_urls_in_message(") {
-                offenders.push(format!("{}:{}: {}", rel.display(), i + 1, line.trim()));
-            }
+        for line in production_masker_lines_8205(&text) {
+            offenders.push(format!("{}:{line}", rel.display()));
         }
     }
     assert!(
