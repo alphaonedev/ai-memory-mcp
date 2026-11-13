@@ -815,7 +815,9 @@ agent_pattern    = "ai:link-curator"
 decision         = "allow"
 ```
 
-**Pattern syntax:** `*` matches one `/`-delimited segment; `**` matches across `/`. An exact string is a literal match. `agent_pattern` defaults to `"*"` if omitted.
+**Pattern syntax:** in `namespace_pattern`, `*` matches one `/`-delimited segment and `**` matches across `/`. An exact string is a literal match. `agent_pattern` defaults to `"*"` if omitted.
+
+**Agent patterns (#8760):** an agent id is not `/`-segmented, so in `agent_pattern` every `*` matches any run of characters, `/` included: `"*"` and `"ai:*"` cover `ai:team/a` and SPIFFE ids as well as `ai:plain`, and an Allow `"ai:team/*"` also covers `ai:team/a/b`. Deny and Ask rules compare letters case-insensitively (a Deny on `ai:plain` also refuses `AI:PLAIN`); Allow rules compare exactly. Fail closed: a pattern that is empty, longer than 1024 bytes, or contains a character outside the agent-id alphabet (`A-Z a-z 0-9 _ - : @ . /`) plus `*`, applies to every caller as a Deny or Ask rule and to no caller as an Allow rule, and the daemon logs a warning when the rule set loads. A caller id that fails the agent-id shape check gets the same treatment.
 
 **Combination rule (deny-first):**
 

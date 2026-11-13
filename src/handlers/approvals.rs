@@ -1069,9 +1069,12 @@ pub fn sse_event_visible_to(
         return false;
     }
     let rules = crate::permissions::active_permission_rules();
+    // #8760: the same agent matcher as `Permissions::evaluate`, so an
+    // unclassifiable subscriber id or pattern never widens visibility.
+    let principal = crate::governance::agent_match::AgentPrincipal::classify(subscriber_agent);
     rules.iter().any(|r| {
         matches!(r.decision, crate::permissions::RuleDecision::Allow)
-            && crate::permissions::glob_matches(&r.agent_pattern, subscriber_agent)
+            && principal.matches(&r.agent_pattern, r.decision)
             && crate::permissions::glob_matches(&r.namespace_pattern, event_namespace)
     })
 }
