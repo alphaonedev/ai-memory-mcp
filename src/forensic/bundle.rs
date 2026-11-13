@@ -1657,67 +1657,6 @@ mod tests {
     use rusqlite::params;
     use tempfile::TempDir;
 
-    /// Hermetic key-directory scope for the #8851 signing-outcome tests (#9179).
-    ///
-    /// `sign_manifest_if_keyed` and `verify` both resolve the key store through
-    /// `default_key_dir()`, which in the lib test binary is ONE process-wide
-    /// sandbox shared by every test. Any sibling test that enrols a `daemon`
-    /// key there (`ensure_keypair`) turns a bundle the test expects to be
-    /// unsigned into a `Verified` one, so the outcome depended on test order.
-    /// This scope holds `key_dir_env_lock`, points `AI_MEMORY_KEY_DIR` at a
-    /// fresh directory of its own and restores the prior value on drop, so
-    /// exactly the keys the test enrols (none, or the one it generates) exist.
-    struct KeyDirScope {
-        _lock: std::sync::MutexGuard<'static, ()>,
-        prev: Option<std::ffi::OsString>,
-        dir: PathBuf,
-    }
-
-    impl KeyDirScope {
-        fn new() -> Self {
-            let lock = crate::identity::keypair::key_dir_env_lock()
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            // Rooted in the isolated sandbox (outside HOME by construction,
-            // #3859); a unique child per scope, never created for the empty case.
-            let dir = crate::identity::test_key_dir::install()
-                .join(format!("bundle-8851-{}", uuid::Uuid::new_v4().simple()));
-            let prev = std::env::var_os(kp_mod::KEY_DIR_ENV);
-            // SAFETY: serialised by `key_dir_env_lock`, held for this scope's life.
-            unsafe { std::env::set_var(kp_mod::KEY_DIR_ENV, &dir) };
-            Self {
-                _lock: lock,
-                prev,
-                dir,
-            }
-        }
-
-        /// Scope with NO enrolled key: a built bundle must be unsigned.
-        fn empty() -> Self {
-            Self::new()
-        }
-
-        /// Scope with exactly one enrolled signing key, `agent_id`.
-        fn with_key(agent_id: &str) -> Self {
-            let scope = Self::new();
-            let kp = kp_mod::generate(agent_id).expect("generate test key");
-            kp_mod::save(&kp, &scope.dir).expect("save test key");
-            scope
-        }
-    }
-
-    impl Drop for KeyDirScope {
-        fn drop(&mut self) {
-            // SAFETY: still holding `_lock` (fields drop after this body).
-            unsafe {
-                match &self.prev {
-                    Some(v) => std::env::set_var(kp_mod::KEY_DIR_ENV, v),
-                    None => std::env::remove_var(kp_mod::KEY_DIR_ENV),
-                }
-            }
-        }
-    }
-
     fn open_tmp_db(tmp: &TempDir) -> (rusqlite::Connection, PathBuf) {
         let p = tmp.path().join("ai-memory.db");
         let conn = db::open(&p).expect("db::open");
@@ -1819,81 +1758,6 @@ mod tests {
         assert_eq!(
             bytes_a, bytes_b,
             "byte-identical mod timestamp is the L2-5 acceptance criterion"
-        );
-    }
-
-    #[test]
-    fn verify_clean_unsigned_bundle_is_intact_but_unattested_8851() {
-        let _keys = KeyDirScope::empty();
-        let tmp = TempDir::new().unwrap();
-        let (conn, _) = open_tmp_db(&tmp);
-        let d0 = insert_mem(&conn, "ns", 0, MemoryKind::Observation);
-        let d1 = insert_mem(&conn, "ns", 1, MemoryKind::Reflection);
-        link_unsigned(&conn, &d1, &d0);
-        let args = ExportForensicBundleArgs {
-            memory_id: d1.clone(),
-            include_reflections: true,
-            include_transcripts: false,
-            include_atomisation_chain: true,
-            output: None,
-        };
-        let bundle_path = tmp.path().join("bundle.tar");
-        build(&conn, &args, &bundle_path, Some("2026-01-01T00:00:00Z")).expect("build");
-        let report = verify(&bundle_path).expect("verify");
-        // #8851: integrity holds, but an unsigned manifest is not attested,
-        // so the roll-up is a finding with its own reason.
-        assert!(report.tampered_files.is_empty());
-        assert!(report.missing_files.is_empty());
-        assert!(
-            !report.ok,
-            "unsigned bundle must not roll up ok: {report:#?}"
-        );
-        assert_eq!(
-            failure_reason(&report),
-            Some(REASON_MANIFEST_SIGNATURE_ABSENT)
-        );
-    }
-
-    /// Mirror of the unsigned pin: with exactly one enrolled key the same
-    /// bundle is signed by THAT signer and rolls up green (#8851, #9179).
-    #[test]
-    fn verify_signed_bundle_is_attested_by_enrolled_signer_8851() {
-        let _keys = KeyDirScope::with_key("bundle-signer-9179");
-        let tmp = TempDir::new().unwrap();
-        let (conn, _) = open_tmp_db(&tmp);
-        let d0 = insert_mem(&conn, "ns", 0, MemoryKind::Observation);
-        let d1 = insert_mem(&conn, "ns", 1, MemoryKind::Reflection);
-        link_unsigned(&conn, &d1, &d0);
-        let args = ExportForensicBundleArgs {
-            memory_id: d1.clone(),
-            include_reflections: true,
-            include_transcripts: false,
-            include_atomisation_chain: true,
-            output: None,
-        };
-        let bundle_path = tmp.path().join("signed.tar");
-        build(&conn, &args, &bundle_path, Some("2026-01-01T00:00:00Z")).expect("build");
-        let report = verify(&bundle_path).expect("verify");
-        assert_eq!(report.signature_status, SignatureStatus::Verified);
-        assert_eq!(
-            report.signer_agent_id.as_deref(),
-            Some("bundle-signer-9179")
-        );
-        assert_eq!(failure_reason(&report), None);
-        assert!(report.ok, "{report:#?}");
-
-        let vargs = VerifyForensicBundleArgs { bundle_path };
-        let mut stdout = Vec::<u8>::new();
-        let mut stderr = Vec::<u8>::new();
-        let code = {
-            let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
-            run_verify(&vargs, &mut out).expect("run_verify")
-        };
-        assert_eq!(code, 0);
-        assert!(
-            String::from_utf8(stdout)
-                .unwrap()
-                .contains("verification OK")
         );
     }
 
@@ -2344,41 +2208,11 @@ mod tests {
         }
     }
 
-    /// #8851: `run_verify` returns exit 2 on an intact but unsigned bundle
-    /// and names the `manifest_signature_absent` reason.
-    #[test]
-    fn run_verify_unsigned_bundle_exits_two_signature_absent_8851() {
-        let _keys = KeyDirScope::empty();
-        let tmp = TempDir::new().unwrap();
-        let (conn, _) = open_tmp_db(&tmp);
-        let id = insert_mem(&conn, "ns", 0, MemoryKind::Observation);
-        let args = ExportForensicBundleArgs {
-            memory_id: id,
-            include_reflections: true,
-            include_transcripts: false,
-            include_atomisation_chain: true,
-            output: None,
-        };
-        let bundle_path = tmp.path().join("ok.tar");
-        build(&conn, &args, &bundle_path, Some("2026-01-01T00:00:00Z")).expect("build");
-        let vargs = VerifyForensicBundleArgs {
-            bundle_path: bundle_path.clone(),
-        };
-        let mut stdout = Vec::<u8>::new();
-        let mut stderr = Vec::<u8>::new();
-        let code = {
-            let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
-            run_verify(&vargs, &mut out).expect("run_verify")
-        };
-        assert_eq!(code, 2);
-        let printed = String::from_utf8(stdout).unwrap();
-        assert!(
-            printed.contains(&format!(
-                "verification FAILED: {REASON_MANIFEST_SIGNATURE_ABSENT}"
-            )),
-            "{printed}"
-        );
-    }
+    // The #8851 signing-outcome pins (unsigned -> exit 2 / `manifest_signature_absent`,
+    // enrolled signer -> `Verified` / exit 0) live in
+    // tests/forensic_bundle_signing_outcome_9179.rs: they need a private
+    // `AI_MEMORY_KEY_DIR`, and a process-wide env override is not allowed in
+    // the parallel lib test binary (#3475).
 
     /// `run_verify` returns exit 2 (not 1) on a tampered bundle and
     /// prints "verification FAILED".
