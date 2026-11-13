@@ -104,6 +104,8 @@ pub mod funnel {
     pub const SWARM_REWIND: &str = "swarm_rewind";
     /// Store-time synthesis pool (supersede / merge candidates).
     pub const SYNTHESIS: &str = "synthesis";
+    /// Atomise (archives the source and re-owns its content as atoms, #8753).
+    pub const ATOMISE: &str = "atomise";
 }
 
 /// Where a mutation decision is taken: the backend + funnel labels carried on

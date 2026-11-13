@@ -1152,8 +1152,8 @@ pub use routine::handle_routine_create;
 // v0.7.0 ARCH-3 / FX-12 — `handle_check_duplicate` is `pub use`-exported
 // above; dispatch resolves via the crate path.
 use consolidate::handle_consolidate;
-// v0.7.0 WT-1-C — `memory_atomise` MCP tool wiring.
-use atomise::handle_atomise;
+// v0.7.0 WT-1-C — `memory_atomise` MCP tool wiring: dispatch calls
+// `atomise::handle_atomise_for_caller` by path (#8753).
 // v0.7.0 Form 5 (issue #758) — `memory_calibrate_confidence` MCP tool wiring.
 // Note: `handle_calibrate_confidence` is `pub use`-exported above for the
 // #1111 HTTP-route closeout (src/handlers/calibrate_confidence.rs needs
@@ -1179,7 +1179,7 @@ use link::{handle_get_links, handle_link};
 use list::handle_list;
 use pending::handle_pending_list;
 // v0.7.0 #1111 — `handle_subscription_dlq_list` is `pub use`-exported above.
-use persona::{handle_persona, handle_persona_generate};
+use persona::handle_persona;
 // Issue #809 — re-export handle_persona_generate as a stable pub
 // symbol so the nhi-self-persona regression test
 // (tests/issue_809_nhi_self_persona_any_agent.rs) can drive the
@@ -2588,13 +2588,16 @@ fn dispatch_memory_consolidate(ctx: &ToolDispatchCtx<'_>) -> Result<Value, Strin
 }
 
 fn dispatch_memory_atomise(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
-    handle_atomise(
+    // #8753 — the source row must pass memory_get's visibility + ownership.
+    atomise::handle_atomise_for_caller(
         ctx.conn,
         ctx.arguments,
         ctx.atomise_handler,
         ctx.tier_config.tier,
         ctx.mcp_client,
+        ctx.authority.read_caller(),
     )
+    .map_err(|e| e.to_string())
 }
 
 fn dispatch_memory_ingest_multistep(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
@@ -2942,13 +2945,16 @@ fn dispatch_memory_persona(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
 }
 
 fn dispatch_memory_persona_generate(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
-    handle_persona_generate(
+    // #8754 — only reflections memory_get shows the caller are sources.
+    persona::handle_persona_generate_inner(
         ctx.conn,
         ctx.arguments,
         ctx.llm.map(|c| c as &dyn crate::autonomy::AutonomyLlm),
         ctx.tier_config.tier,
         ctx.active_keypair,
+        persona::ReaderSource::Bound(ctx.authority.read_caller()),
     )
+    .map_err(|e| e.to_string())
 }
 
 /// v1.0.0 #3507 — resolve the calibration audience for the MCP surface.
