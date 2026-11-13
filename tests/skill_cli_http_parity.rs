@@ -830,3 +830,80 @@ fn cli_skill_register_inline_smoke_v2() {
     let text = String::from_utf8(stdout).unwrap();
     assert!(text.contains("cli-register-v2"));
 }
+
+#[path = "common/operator_log_capture.rs"]
+mod operator_capture;
+
+/// Both the HTTP and MCP promotion funnels share the escaped operator channel.
+#[test]
+fn skill_promote_logs_escape_caller_controls_6822() {
+    use std::fmt::Write as _;
+    let raw_id = operator_capture::hostile_detail();
+    // Preserve every fixture byte; URL parsing would strip LF, CR and tab.
+    let mut url_id = String::new();
+    for byte in raw_id.bytes() {
+        write!(url_id, "%{byte:02X}").expect("string formatting");
+    }
+    let (_dir, db_path) = fresh_db();
+    let (router, _db) = build_router_with_db_path(&db_path);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime");
+    let ((status, body), log) = operator_capture::captured(|| {
+        runtime.block_on(post_promote(
+            router,
+            &url_id,
+            &json!({"name": "safe-name", "description": "d"}),
+        ))
+    });
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["error"], format!("reflection not found: {raw_id}"));
+    assert_escaped_promote_log(&log, "skill_promote_route");
+
+    let conn = ai_memory::db::open(&db_path).expect("open database");
+    let (result, log) = operator_capture::captured(|| {
+        ai_memory::mcp::handle_skill_promote_from_reflection(
+            &conn,
+            &json!({"reflection_id": raw_id, "skill_name": "safe-name", "skill_description": "d"}),
+            None,
+        )
+    });
+    assert_eq!(
+        result.expect_err("missing reflection"),
+        format!("reflection not found: {raw_id}")
+    );
+    assert_escaped_promote_log(&log, "skill_promote_from_reflection");
+}
+
+fn assert_escaped_promote_log(log: &str, context: &str) {
+    let events: Vec<&str> = log
+        .lines()
+        .filter(|line| line.contains("mcp.tool.error"))
+        .collect();
+    assert_eq!(
+        events.len(),
+        1,
+        "{context}: expected exactly one mcp.tool.error event; captured log: {log:?}"
+    );
+    let diagnostic = events[0];
+    assert!(diagnostic.contains(context), "{diagnostic}");
+    for &(raw, control) in operator_capture::CONTROL_PAIRS {
+        assert!(
+            !diagnostic.contains(raw),
+            "raw U+{:04X} in operator detail",
+            u32::from(raw)
+        );
+        assert!(
+            diagnostic.contains(control),
+            "missing {control}: {diagnostic}"
+        );
+    }
+    assert!(!log.contains("caller\nforged"), "raw newline in the detail");
+    assert!(!log.chars().any(|c| c.is_control() && c != '\n'));
+    assert!(!diagnostic.contains(operator_capture::FIXTURE_PASSWORD));
+    assert!(!diagnostic.contains(operator_capture::FIXTURE_QUERY));
+    assert!(!diagnostic.contains(operator_capture::FIXTURE_FRAGMENT));
+    assert!(diagnostic.contains("https://example.invalid"));
+    assert!(!diagnostic.contains("/path"));
+}
