@@ -577,6 +577,9 @@ def hostile_rows():
                  line_no_last(inside, "```", MARKER)))
     glued = base.rstrip("\n") + "\n" + MARKER + "\n" + honest
     rows.append(("marker_without_blank_above", glued, "the ledger marker must follow a blank line", line_no(glued, MARKER)))
+    lookalike = with_ledger(base, honest).replace(MARKER, MARKER.replace("append-only", "append only"))
+    rows.append(("marker_lookalike_over_records", lookalike,
+                 "the ledger marker line appears 0 times, expected exactly once", None))
     front = "---\n" + with_ledger(base, honest)
     rows.append(("yaml_front_matter", front, "front matter on line 1 is not supported", 1))
     toml = "+++\n" + with_ledger(base, honest)
