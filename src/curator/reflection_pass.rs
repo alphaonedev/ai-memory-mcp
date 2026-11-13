@@ -81,10 +81,9 @@ use crate::models::ConfidenceSource;
 /// `Option`-shaped contract the pre-#1548 `db::get` free function
 /// returned. Any other [`StoreError`] propagates as an `anyhow` error.
 ///
-/// The curator runs as an operator-class background sweep, so the
-/// supplied `ctx` carries `bypass_visibility` (see
-/// [`curator_caller_context`]) — preserving the pre-trait raw-connection
-/// behaviour where `db::get` applied no scope=private visibility filter.
+/// Every read of the pass goes through the curator's read context (see
+/// [`curator_read_context`]), so a row the curator identity may not read
+/// is `NotFound` here, exactly as it is for any other agent (#8850).
 #[cfg(feature = "sal")]
 async fn store_get_opt(
     store: &dyn MemoryStore,
@@ -98,32 +97,42 @@ async fn store_get_opt(
     }
 }
 
-/// Build the curator's operator-class caller context. The reflection
-/// pass is a background substrate-maintenance sweep, not a tenant-facing
-/// request, so it reads every row regardless of `metadata.scope` —
-/// exactly the posture the pre-#1548 raw-`rusqlite::Connection` path had
-/// (the legacy `db::*` free functions applied no SAL visibility filter).
-/// `agent_id` carries the curator's resolved signing identity so audit
-/// trails attribute the sweep correctly.
+/// #8850 — the curator's READ context: the curator identity as an ordinary
+/// agent, with no visibility bypass.
 ///
-/// # #1720 D1 — curator read posture (decided)
-///
-/// The curator KEEPS `bypass_visibility=true` (`for_admin`) for its read
-/// pass. Under the substrate's default Op-0 posture (single-operator,
-/// trust-all reads — see `crate::identity` "Op-0 posture"), the rows the
-/// curator reads across namespaces are the operator's own; reading them
-/// to synthesise reflections is the intended maintenance behaviour, not a
-/// cross-tenant read. The cross-tenant concern only arises under an
-/// explicitly enabled enforced-multi-agent deployment, which is opt-in and
-/// out of scope for this sweep; a per-namespace exclusion / non-bypass
-/// pass for that mode is a follow-on hardening, not a fix needed today.
-/// The load-bearing #1720 curator fix is D2 (below): the sweep's OUTPUT is
-/// stamped with an explicit `collective` scope so a curator-written
-/// reflection is never an accidental `private` row that leaks under
-/// trust-all and goes operator-invisible under enforcement.
+/// Before #8850 the pass read with `for_admin` (bypass) and stamped every
+/// reflection `collective`, so a `private` or `team` observation reached
+/// every agent in the deployment as reflection content. The pass now reads
+/// only what the curator identity itself may read: collective rows, rows in
+/// a team / unit / org subtree the curator belongs to, and the curator's own
+/// private rows. A row outside that set never reaches the LLM. This is fail
+/// closed: a deployment that wants a namespace reflected makes the rows
+/// readable to the curator, it does not get a bypass.
 #[cfg(feature = "sal")]
-fn curator_caller_context(agent_id: &str) -> CallerContext {
-    CallerContext::for_admin(agent_id)
+fn curator_read_context(agent_id: &str) -> CallerContext {
+    CallerContext::for_agent(agent_id)
+}
+
+/// The curator's WRITE context, used only for the substrate
+/// [`MemoryStore::reflect`] call. The write is a substrate-maintenance
+/// operation attributed to the curator; every source it cites was first
+/// re-read through [`curator_read_context`] in
+/// [`ReflectionPass::persist`], and the reflection carries the narrowest
+/// scope of those sources, so the bypass here never widens what a reader
+/// can see.
+///
+/// #9185 (L-F, I-3): `as_agent` names the principal the sources were read
+/// as. Both backends treat an admin context that carries `as_agent` as a
+/// DERIVED write and re-verify every source inside the reflect transaction
+/// (readable by that principal, same namespace, stamped scope equal to the
+/// narrowest fresh scope), so a source narrowed or moved between `persist`'s
+/// re-read and the write refuses the reflection.
+#[cfg(feature = "sal")]
+fn curator_write_context(agent_id: &str) -> CallerContext {
+    CallerContext {
+        as_agent: Some(agent_id.to_string()),
+        ..CallerContext::for_admin(agent_id)
+    }
 }
 
 /// List up to `limit` memories in `namespace` through the SAL trait.
@@ -243,11 +252,12 @@ pub(crate) struct ReflectionPass<'a> {
     /// [`MemoryStore::reflect`]. Works against the SQLite *or* Postgres
     /// adapter (issue #1548) — the pass is backend-agnostic.
     pub(crate) store: &'a dyn MemoryStore,
-    /// Operator-class caller context (see [`curator_caller_context`]).
-    /// Carries the curator's `agent_id` and `bypass_visibility` so the
-    /// background sweep reads every row regardless of `metadata.scope`,
-    /// matching the pre-trait raw-connection behaviour.
+    /// Read context (see [`curator_read_context`]): the curator identity
+    /// with no visibility bypass. Every list / get / verify read uses it.
     pub(crate) ctx: CallerContext,
+    /// Write context (see [`curator_write_context`]), used only by the
+    /// substrate `reflect` call in [`ReflectionPass::persist`].
+    pub(crate) write_ctx: CallerContext,
     /// LLM trait object. Tests inject a deterministic stub; production
     /// passes an `&OllamaClient` (which implements [`AutonomyLlm`]).
     pub(crate) llm: &'a dyn AutonomyLlm,
@@ -289,7 +299,8 @@ impl<'a> ReflectionPass<'a> {
         );
         Self {
             store,
-            ctx: curator_caller_context(&agent_id),
+            ctx: curator_read_context(&agent_id),
+            write_ctx: curator_write_context(&agent_id),
             llm,
             keypair,
             max_depth,
@@ -414,6 +425,7 @@ impl<'a> ReflectionPass<'a> {
     /// * Tier = max of source tiers (never downgrade).
     /// * Priority = max of source priorities (the reflection inherits
     ///   the salience of its highest-priority source).
+    /// * `metadata.scope` = the narrowest source scope (#8850).
     fn summarize(&self, cluster: &[Memory]) -> Result<Memory> {
         if cluster.len() < MIN_CLUSTER_SIZE {
             anyhow::bail!(
@@ -465,21 +477,15 @@ impl<'a> ReflectionPass<'a> {
             updated_at: now,
             last_accessed_at: None,
             expires_at: None,
-            // #1720 D2 — stamp an EXPLICIT, intended scope on every
-            // curator-written reflection. Without this the metadata is
-            // empty, so `scope_idx` defaults to `private` and the row is
-            // owned by the curator (`ai:curator` / keypair id): visible to
-            // everyone TODAY under trust-all reads, but operator-INVISIBLE
-            // the moment read-path ownership filtering is enabled — the
-            // accidental-private trap #1720 closes. A reflection is a
-            // shared, attributable substrate-maintenance artifact, so it is
-            // stamped `collective`: intentionally visible to every caller
-            // in the deployment (preserving today's behaviour) AND
-            // operator-visible under enforcement. The owner stays the
-            // curator for attribution (the substrate `reflect` path stamps
-            // `metadata.agent_id` from `ReflectInput::agent_id`).
+            // #8850 — the reflection carries the MOST RESTRICTIVE scope of
+            // its sources, never a wider one. Before #8850 (and since #1720
+            // D2) every reflection was stamped `collective`, which
+            // republished `private` / `team` sources to every agent. An
+            // explicit scope is still stamped (the #1720 accidental-default
+            // concern), it is just the narrowest source scope. `persist`
+            // recomputes it from a fresh read of the sources.
             metadata: serde_json::json!({
-                "scope": crate::models::MemoryScope::Collective.as_str(),
+                (crate::META_KEY_SCOPE): crate::visibility::narrowest_scope(cluster).as_str(),
             }),
             reflection_depth: 0,
             memory_kind: MemoryKind::Reflection,
@@ -516,6 +522,32 @@ impl<'a> ReflectionPass<'a> {
             return Ok(());
         }
 
+        // #8850 — re-read every source through the curator's READ context
+        // just before the write. A source that is gone, or that the curator
+        // may no longer read, refuses the reflection with an exact error
+        // rather than citing a row the curator cannot see. The reflection's
+        // scope is recomputed from these fresh reads, so a source narrowed
+        // after `summarize` narrows the reflection too.
+        let mut fresh: Vec<Memory> = Vec::with_capacity(sources.len());
+        for id in sources {
+            match store_get_opt(self.store, &self.ctx, id).await? {
+                // #9185 (L-F) — the namespace is pinned too: a source moved to
+                // another namespace since `summarize` refuses the reflection.
+                Some(m) if m.namespace != summary.namespace => anyhow::bail!(
+                    "ReflectionPass::persist: source {id} is in namespace '{}', not '{}'; \
+                     the reflection is not written",
+                    m.namespace,
+                    summary.namespace
+                ),
+                Some(m) => fresh.push(m),
+                None => anyhow::bail!(
+                    "ReflectionPass::persist: source {id} is not readable by curator {}; \
+                     the reflection is not written",
+                    self.ctx.agent_id
+                ),
+            }
+        }
+
         // Curator-side max-depth guard. The substrate enforces the
         // namespace policy cap on top — this is the operator-supplied
         // belt-and-braces. We need to know the proposed depth before
@@ -523,12 +555,7 @@ impl<'a> ReflectionPass<'a> {
         // does (max source depth + 1) so the curator can refuse
         // *before* burning an LLM round-trip in the next cycle.
         if let Some(cap) = self.max_depth {
-            let mut max_src_depth: i32 = 0;
-            for id in sources {
-                if let Some(m) = store_get_opt(self.store, &self.ctx, id).await? {
-                    max_src_depth = max_src_depth.max(m.reflection_depth);
-                }
-            }
+            let max_src_depth = fresh.iter().map(|m| m.reflection_depth).max().unwrap_or(0);
             let new_depth =
                 u32::try_from(max_src_depth.max(0).saturating_add(1)).unwrap_or(u32::MAX);
             if new_depth > cap {
@@ -536,6 +563,20 @@ impl<'a> ReflectionPass<'a> {
                     "ReflectionPass::persist: proposed depth {new_depth} exceeds \
                      curator --max-depth {cap}"
                 );
+            }
+        }
+
+        let mut metadata = summary.metadata.clone();
+        let scope = crate::visibility::narrowest_scope(&fresh);
+        match metadata.as_object_mut() {
+            Some(obj) => {
+                obj.insert(
+                    crate::META_KEY_SCOPE.to_string(),
+                    serde_json::Value::String(scope.as_str().to_string()),
+                );
+            }
+            None => {
+                metadata = serde_json::json!({ (crate::META_KEY_SCOPE): scope.as_str() });
             }
         }
 
@@ -550,7 +591,7 @@ impl<'a> ReflectionPass<'a> {
             confidence: summary.confidence,
             source: summary.source.clone(),
             agent_id: self.agent_id(),
-            metadata: summary.metadata.clone(),
+            metadata,
         };
 
         // Issue #815 — thread the curator's signing keypair into the
@@ -561,7 +602,11 @@ impl<'a> ReflectionPass<'a> {
         // SQLite adapter sets `ReflectHooks::active_keypair`; Postgres
         // signs natively), so the wire shape is byte-identical across
         // backends.
-        match self.store.reflect(&self.ctx, &input, self.keypair).await {
+        match self
+            .store
+            .reflect(&self.write_ctx, &input, self.keypair)
+            .await
+        {
             Ok(_outcome) => Ok(()),
             Err(ReflectError::DepthExceeded {
                 attempted,
@@ -743,6 +788,26 @@ pub async fn run_reflection_pass(
     };
     report.namespaces_visited = namespaces.len();
 
+    // #9185 Y-9 — the curator reads as `for_agent`, so rows it may not read
+    // never reach the pass. The unscoped per-namespace totals let the pass log
+    // how many rows it could not see, so an empty result is observable. A
+    // failed totals read only loses the count; the pass itself is unaffected.
+    let namespace_totals: std::collections::HashMap<String, usize> =
+        match store.list_namespaces().await {
+            Ok(counts) => counts
+                .into_iter()
+                .map(|nc| (nc.namespace, nc.count))
+                .collect(),
+            Err(e) => {
+                tracing::debug!(
+                    target: REFLECTION_VISIBILITY_TRACE_TARGET,
+                    error = %e,
+                    "reflection pass: namespace totals unavailable; skipped-row count not logged"
+                );
+                std::collections::HashMap::new()
+            }
+        };
+
     for ns in &namespaces {
         if !enabled_check(ns) {
             continue;
@@ -770,6 +835,20 @@ pub async fn run_reflection_pass(
         };
         let scanned_here = candidates.len();
         report.observations_scanned += scanned_here;
+        if let Some(skipped) = visibility_skipped_count(
+            namespace_totals.get(ns.as_str()).copied(),
+            scanned_here,
+            MAX_CLUSTER_SIZE * 16,
+        ) {
+            tracing::info!(
+                target: REFLECTION_VISIBILITY_TRACE_TARGET,
+                namespace = %ns,
+                skipped,
+                visible = scanned_here,
+                curator = %pass.ctx.agent_id,
+                "{VISIBILITY_SKIPPED_LOG}"
+            );
+        }
 
         // Stage 1 — cluster.
         let clusters = pass.cluster(&candidates);
@@ -841,6 +920,34 @@ pub async fn run_reflection_pass(
 
     report.completed_at = Utc::now().to_rfc3339();
     Ok(report)
+}
+
+/// #9185 Y-9 — tracing target of the visibility-skipped count.
+pub const REFLECTION_VISIBILITY_TRACE_TARGET: &str = "curator::reflection_pass::visibility";
+
+/// #9185 Y-9 — message of the visibility-skipped count (#8850 narrowing:
+/// rows the curator may not read yield no reflection).
+pub const VISIBILITY_SKIPPED_LOG: &str =
+    "reflection pass: source rows not visible to the curator were skipped";
+
+/// #9185 Y-9 — rows of a namespace the curator's read did not return.
+///
+/// `total` is the unscoped row count of the namespace (`None` when unknown),
+/// `visible` the rows the curator listed and `limit` the list cap. The count
+/// is exact only below the cap, so a capped list yields `None`, as does a
+/// namespace with nothing hidden.
+#[must_use]
+pub fn visibility_skipped_count(
+    total: Option<usize>,
+    visible: usize,
+    limit: usize,
+) -> Option<usize> {
+    let total = total?;
+    if visible >= limit {
+        return None;
+    }
+    let skipped = total.saturating_sub(visible);
+    (skipped > 0).then_some(skipped)
 }
 
 /// Best-effort verify helper used by [`run_reflection_pass`]. Looks up
@@ -1045,7 +1152,8 @@ mod tests {
             updated_at: now,
             last_accessed_at: None,
             expires_at: None,
-            metadata: serde_json::json!({}),
+            // #8850: collective, so the curator identity may read it.
+            metadata: serde_json::json!({ (crate::META_KEY_SCOPE): "collective" }),
             reflection_depth: 0,
             memory_kind: MemoryKind::Observation,
             entity_id: None,
@@ -1299,6 +1407,12 @@ mod tests {
                 obj.insert(
                     "agent_id".to_string(),
                     serde_json::Value::String("test-agent".to_string()),
+                );
+                // #8850: the pass reads as the curator identity, so a row
+                // another agent owns must be collective for it to be read.
+                obj.insert(
+                    crate::META_KEY_SCOPE.to_string(),
+                    serde_json::Value::String("collective".to_string()),
                 );
             }
             let mem = Memory {
@@ -1573,14 +1687,14 @@ mod tests {
                 .expect("expected one reflection");
             // verify() should succeed on it.
             pass.verify(refl.id.clone()).await.unwrap();
-            // #1720 D2 — the persisted reflection carries an EXPLICIT
-            // `collective` scope (not the accidental default-private that
-            // would be operator-invisible under enforcement), and stays
-            // attributed to the curator via metadata.agent_id.
+            // #1720 D2 + #8850 — the persisted reflection carries an
+            // EXPLICIT scope, the narrowest of its sources: all three
+            // sources are collective, so the reflection is collective. It
+            // stays attributed to the curator via metadata.agent_id.
             assert_eq!(
                 refl.metadata.get("scope").and_then(|v| v.as_str()),
                 Some(crate::models::MemoryScope::Collective.as_str()),
-                "curator reflection must be stamped collective (#1720 D2); got {:?}",
+                "curator reflection over collective sources is collective (#8850); got {:?}",
                 refl.metadata.get("scope")
             );
             assert_eq!(
@@ -1629,6 +1743,12 @@ mod tests {
                 obj.insert(
                     "agent_id".to_string(),
                     serde_json::Value::String("test-agent".to_string()),
+                );
+                // #8850: the pass reads as the curator identity, so a row
+                // another agent owns must be collective for it to be read.
+                obj.insert(
+                    crate::META_KEY_SCOPE.to_string(),
+                    serde_json::Value::String("collective".to_string()),
                 );
             }
             let m = Memory {
@@ -1771,6 +1891,12 @@ mod tests {
                     obj.insert(
                         "agent_id".to_string(),
                         serde_json::Value::String("test-agent".to_string()),
+                    );
+                    // #8850: the pass reads as the curator identity, so a row
+                    // another agent owns must be collective for it to be read.
+                    obj.insert(
+                        crate::META_KEY_SCOPE.to_string(),
+                        serde_json::Value::String("collective".to_string()),
                     );
                 }
                 let m = Memory {

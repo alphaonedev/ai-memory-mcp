@@ -1272,8 +1272,8 @@ async fn dispatch_recover_previous_session(
                 let store = build_curator_store(Some(url), db_path, app_config).await?;
                 let stdout = std::io::stdout();
                 let stderr = std::io::stderr();
-                let mut so = stdout.lock();
-                let mut se = stderr.lock();
+                let mut so = stdout;
+                let mut se = stderr;
                 let mut out = cli::CliOutput::from_std(&mut so, &mut se);
                 cli::commands::recover_previous_session::run_store(store.as_ref(), a, &mut out)
                     .await?
@@ -1289,8 +1289,8 @@ async fn dispatch_recover_previous_session(
                 );
                 let stdout = std::io::stdout();
                 let stderr = std::io::stderr();
-                let mut so = stdout.lock();
-                let mut se = stderr.lock();
+                let mut so = stdout;
+                let mut se = stderr;
                 let mut out = cli::CliOutput::from_std(&mut so, &mut se);
                 cli::commands::recover_previous_session::run(db_path, a, &mut out)?
             };
@@ -1299,8 +1299,8 @@ async fn dispatch_recover_previous_session(
         None => {
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             Ok(cli::commands::recover_previous_session::run(
                 db_path, a, &mut out,
@@ -1827,8 +1827,8 @@ pub async fn run(
         Command::Store(a) => {
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             cli::store::run(
                 &db_path,
@@ -1842,88 +1842,88 @@ pub async fn run(
         Command::Update(a) => {
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             cli::update::run(&db_path, &a, j, &mut out)
         }
         Command::Recall(a) => {
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             cli::recall::run(&db_path, &a, j, app_config, &mut out)
         }
         Command::Search(a) => {
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             cli::search::run(&db_path, &a, j, &mut out)
         }
         Command::Get(a) => {
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             cli::crud::cmd_get(&db_path, &a, j, &mut out)
         }
         Command::List(a) => {
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             cli::crud::cmd_list(&db_path, &a, j, app_config, &mut out)
         }
         Command::Delete(a) => {
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             cli::crud::cmd_delete(&db_path, &a, j, cli_agent_id.as_deref(), &mut out)
         }
         Command::Promote(a) => {
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             cli::promote::cmd_promote(&db_path, &a, j, cli_agent_id.as_deref(), &mut out)
         }
         Command::Forget(a) => {
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             cli::forget::cmd_forget(&db_path, &a, j, &mut out)
         }
         Command::Link(a) => {
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             cli::link::cmd_link(&db_path, &a, j, cli_agent_id.as_deref(), &mut out)
         }
         Command::Consolidate(a) => {
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             cli::consolidate::run(&db_path, a, j, cli_agent_id.as_deref(), &mut out)
         }
         Command::Resolve(a) => {
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             cli::link::cmd_resolve(&db_path, &a, j, &mut out)
         }
@@ -1931,8 +1931,8 @@ pub async fn run(
         Command::Sync(a) => {
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             cli::sync::run(&db_path, &a, j, cli_agent_id.as_deref(), &mut out)
         }
@@ -1940,24 +1940,24 @@ pub async fn run(
         Command::AutoConsolidate(a) => {
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             cli::consolidate::run_auto(&db_path, &a, j, cli_agent_id.as_deref(), &mut out)
         }
         Command::Gc => {
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             cli::gc::run_gc(&db_path, j, app_config, &mut out)
         }
         Command::Stats => {
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             cli::gc::run_stats(&db_path, j, &mut out)
         }
@@ -1970,8 +1970,8 @@ pub async fn run(
         Command::Namespaces => {
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             cli::gc::run_namespaces(&db_path, j, &mut out)
         }
@@ -1983,8 +1983,8 @@ pub async fn run(
             // a `GovernancePolicy` to a namespace.
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             cli::namespace::run(&db_path, a, j, &mut out)
         }
@@ -1994,8 +1994,8 @@ pub async fn run(
             // (flat-field) `config.toml` to the v2 sectioned shape.
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             match cli::commands::config::run(&db_path, a, &mut out)? {
                 0 => Ok(()),
@@ -2005,8 +2005,8 @@ pub async fn run(
         Command::Export(a) => {
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             // #2490 — `export` returns a code so a PARTIAL export exits
             // non-zero (distinctly from a crash) while still emitting the
@@ -2019,8 +2019,8 @@ pub async fn run(
         Command::Import(a) => {
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             // #2490 — non-zero when the bundle could not be faithfully
             // reconstructed at the destination.
@@ -2047,8 +2047,8 @@ pub async fn run(
         Command::Mine(a) => {
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             cli::io::mine(
                 &db_path,
@@ -2062,8 +2062,8 @@ pub async fn run(
         Command::Archive(a) => {
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             cli::archive::run(&db_path, a, j, &mut out)
         }
@@ -2137,16 +2137,16 @@ pub async fn run(
             }
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             cli::agents::run_agents(&db_path, a, j, &mut out)
         }
         Command::Keys(a) => {
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             cli::keys::run(
                 &db_path,
@@ -2165,8 +2165,8 @@ pub async fn run(
             // register-recovery-key); the H1 verbs never open it.
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             cli::identity::run(&db_path, a, j, &mut out)
         }
@@ -2175,8 +2175,8 @@ pub async fn run(
             // through the bootstrap module the listener itself uses.
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             cli::tls::run(a, j, app_config, &mut out)
         }
@@ -2188,8 +2188,8 @@ pub async fn run(
             // [capabilities] config.
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             cli::capability::run(a, j, app_config, &mut out)
         }
@@ -2201,8 +2201,8 @@ pub async fn run(
             // + auto-cadence + node_id integration) targets v0.8.0.
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             cli::offload::run_offload(&db_path, &a, &mut out)
         }
@@ -2211,8 +2211,8 @@ pub async fn run(
             // `ai-memory offload`. Refuses tampered rows.
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             cli::offload::run_deref(&db_path, &a, &mut out)
         }
@@ -2222,8 +2222,8 @@ pub async fn run(
             // read verbs (list / check) work without it.
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             cli::rules::run(&db_path, a, j, &mut out)
         }
@@ -2240,8 +2240,8 @@ pub async fn run(
                         let store = build_curator_store(Some(url), &db_path, app_config).await?;
                         let stdout = std::io::stdout();
                         let stderr = std::io::stderr();
-                        let mut so = stdout.lock();
-                        let mut se = stderr.lock();
+                        let mut so = stdout;
+                        let mut se = stderr;
                         let mut out = cli::CliOutput::from_std(&mut so, &mut se);
                         cli::quarantine::run_store(
                             store.as_ref(),
@@ -2268,8 +2268,8 @@ pub async fn run(
                 None => {
                     let stdout = std::io::stdout();
                     let stderr = std::io::stderr();
-                    let mut so = stdout.lock();
-                    let mut se = stderr.lock();
+                    let mut so = stdout;
+                    let mut se = stderr;
                     let mut out = cli::CliOutput::from_std(&mut so, &mut se);
                     cli::quarantine::run(&db_path, &a, cli_agent_id.as_deref(), j, &mut out)
                 }
@@ -2280,8 +2280,8 @@ pub async fn run(
             // `enroll` requires the operator key; `list` is unprivileged.
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             cli::model_attest::run(&db_path, a, j, &mut out)
         }
@@ -2289,32 +2289,32 @@ pub async fn run(
             // v0.9.0 §25.3 S5 (RQ-10, #1878) — verify-only epoch consumer.
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             cli::epoch_apply::run(&db_path, a, j, &mut out)
         }
         Command::Pending(a) => {
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             cli::agents::run_pending(&db_path, a, j, cli_agent_id.as_deref(), &mut out)
         }
         Command::Backup(a) => {
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             cli::backup::run_backup(&db_path, &a, j, &mut out)
         }
         Command::Restore(a) => {
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             cli::backup::run_restore(&db_path, &a, j, &mut out)
         }
@@ -2371,9 +2371,14 @@ pub async fn run(
             // the blocking thread's tracing write would deadlock on the
             // ReentrantMutex (same-thread re-entry is fine; cross-thread
             // contention isn't). `--daemon` doesn't write to `out`
-            // anyway, so route it to `io::sink()` and only lock the
-            // real stdout/stderr for the modes that actually emit CLI
-            // output (`--once`, `--reflect`, `--rollback`).
+            // anyway, so route it to `io::sink()`. #8779 — the other
+            // modes (`--once`, `--reflect`, `--rollback`) also run their
+            // sweep on a `spawn_blocking` worker, so they write through
+            // the UNLOCKED `Stdout`/`Stderr` handles: each write takes
+            // the process lock only for that call, and no stdio lock is
+            // ever held across an `.await` (per CONCURRENCY-20). The
+            // ratchet `tests/stdio_lock_never_held_in_dispatch_8779.rs`
+            // keeps every dispatch arm on the unlocked handles.
             if a.daemon {
                 let mut so = std::io::sink();
                 let mut se = std::io::sink();
@@ -2382,8 +2387,8 @@ pub async fn run(
             } else {
                 let stdout = std::io::stdout();
                 let stderr = std::io::stderr();
-                let mut so = stdout.lock();
-                let mut se = stderr.lock();
+                let mut so = stdout;
+                let mut se = stderr;
                 let mut out = cli::CliOutput::from_std(&mut so, &mut se);
                 cli::curator::run(&db_path, &a, app_config, &mut out).await
             }
@@ -2395,8 +2400,8 @@ pub async fn run(
         Command::SchemaInit(a) => {
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             // #1882 — resolve the default embedding dim from the SAME
             // config-driven source `serve` uses (`resolve_configured_embedding_dim`
@@ -2429,8 +2434,8 @@ pub async fn run(
             if let Some(target) = a.repair_schema_version {
                 let stdout = std::io::stdout();
                 let stderr = std::io::stderr();
-                let mut so = stdout.lock();
-                let mut se = stderr.lock();
+                let mut so = stdout;
+                let mut se = stderr;
                 let mut out = cli::CliOutput::from_std(&mut so, &mut se);
                 let exit =
                     cli::doctor::run_repair_schema_version(&db_path_doctor, target, &mut out)?;
@@ -2447,8 +2452,8 @@ pub async fn run(
             if let Some(posture) = a.posture.clone() {
                 let stdout = std::io::stdout();
                 let stderr = std::io::stderr();
-                let mut so = stdout.lock();
-                let mut se = stderr.lock();
+                let mut so = stdout;
+                let mut se = stderr;
                 let mut out = cli::CliOutput::from_std(&mut so, &mut se);
                 let exit = cli::doctor::run_posture(
                     &posture,
@@ -2465,8 +2470,8 @@ pub async fn run(
             if a.tokens || a.raw_table {
                 let stdout = std::io::stdout();
                 let stderr = std::io::stderr();
-                let mut so = stdout.lock();
-                let mut se = stderr.lock();
+                let mut so = stdout;
+                let mut se = stderr;
                 let mut out = cli::CliOutput::from_std(&mut so, &mut se);
                 let exit = cli::doctor::run_tokens(
                     cli::doctor::TokensArgs {
@@ -2486,8 +2491,8 @@ pub async fn run(
             if a.hooks {
                 let stdout = std::io::stdout();
                 let stderr = std::io::stderr();
-                let mut so = stdout.lock();
-                let mut se = stderr.lock();
+                let mut so = stdout;
+                let mut se = stderr;
                 let mut out = cli::CliOutput::from_std(&mut so, &mut se);
                 let exit = cli::doctor::run_hooks(
                     cli::doctor::HooksReportArgs { json: a.json },
@@ -2512,8 +2517,8 @@ pub async fn run(
             let join = tokio::task::spawn_blocking(move || {
                 let stdout = std::io::stdout();
                 let stderr = std::io::stderr();
-                let mut so = stdout.lock();
-                let mut se = stderr.lock();
+                let mut so = stdout;
+                let mut se = stderr;
                 let mut out = cli::CliOutput::from_std(&mut so, &mut se);
                 cli::doctor::run(&db_path_doctor, &args, &mut out)
             })
@@ -2542,8 +2547,8 @@ pub async fn run(
             // via LM Studio / Ollama / vLLM).
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             // PR-5: a `boot` invocation is itself an audit-worthy event.
             // Emission is a no-op when audit is disabled.
@@ -2564,8 +2569,8 @@ pub async fn run(
             // is opt-in and writes a backup before mutating anything.
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             cli::install::run(&a, cli_agent_id.as_deref(), &mut out)
         }
@@ -2577,8 +2582,8 @@ pub async fn run(
             // the agent's exit code via std::process::exit.
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             let code = cli::wrap::run(&db_path, &a, app_config, &mut out)?;
             // Drop the locks/output before exit so any pending writes
@@ -2595,16 +2600,16 @@ pub async fn run(
         Command::Logs(a) => {
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             cli::logs::run(a, app_config, &mut out)
         }
         Command::Audit(a) => {
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             // #3429 — hand the audit verbs the ONE resolved store path (the
             // same `db_path` every other subcommand gets), never an
@@ -2618,8 +2623,8 @@ pub async fn run(
         Command::Governance(a) => {
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             match a.action {
                 GovernanceAction::MigrateToPermissions(args) => {
@@ -2636,8 +2641,8 @@ pub async fn run(
         Command::VerifyReflectionChain(a) => {
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             match cli::verify::run(&db_path, &a, &mut out)? {
                 0 => Ok(()),
@@ -2647,8 +2652,8 @@ pub async fn run(
         Command::VerifySignedEventsChain(a) => {
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             match cli::verify_signed_events::run(&db_path, &a, &mut out)? {
                 0 => Ok(()),
@@ -2668,8 +2673,8 @@ pub async fn run(
         Command::ExportForensicBundle(a) => {
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             match cli::export::export(&db_path, &a, &mut out)? {
                 0 => Ok(()),
@@ -2679,8 +2684,8 @@ pub async fn run(
         Command::VerifyForensicBundle(a) => {
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             match cli::export::verify(&a, &mut out)? {
                 0 => Ok(()),
@@ -2692,8 +2697,8 @@ pub async fn run(
             crate::cli::json_contract::apply_global_json_to_format(&mut a.format, j, "md", "json");
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             match cli::commands::export_reflections::run(&db_path, &a, &mut out)? {
                 0 => Ok(()),
@@ -2739,8 +2744,8 @@ pub async fn run(
         Command::Atomise(a) => {
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             match cli::commands::atomise::run(
                 &db_path,
@@ -2756,8 +2761,8 @@ pub async fn run(
         Command::Persona(a) => {
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             // v0.7.0 QW-2 — the CLI deliberately runs WITHOUT a live
             // LLM client. `--regenerate` requires one; we surface the
@@ -2773,8 +2778,8 @@ pub async fn run(
         Command::Calibrate(a) => {
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             // v0.7.0 Form 5 (issue #758) — calibration driver.
             // Currently dispatches `calibrate confidence`; future
@@ -2796,8 +2801,8 @@ pub async fn run(
         Command::Skill(a) => {
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             // v0.7.0 Cluster E API-2 (issue #767) — `ai-memory skill
             // <subcommand>`. The CLI dispatches with `active_keypair =
@@ -2816,8 +2821,8 @@ pub async fn run(
         Command::Share(a) => {
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             // v0.7.0 #1095 — `ai-memory share`. Wraps the same substrate
             // primitive (`mcp::tools::share::handle_share`) the MCP +
@@ -2832,40 +2837,40 @@ pub async fn run(
         Command::KgQuery(a) => {
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             cli::commands::kg_query::cmd_kg_query(&db_path, &a, &mut out)
         }
         Command::FindPaths(a) => {
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             cli::commands::find_paths::cmd_find_paths(&db_path, &a, &mut out)
         }
         Command::Lineage(a) => {
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             cli::commands::lineage::cmd_lineage(&db_path, &a, &mut out)
         }
         Command::RecallObservations(a) => {
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             cli::commands::recall_observations::cmd_recall_observations(&db_path, &a, &mut out)
         }
         Command::CheckDuplicate(a) => {
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             cli::commands::check_duplicate::cmd_check_duplicate(&db_path, &a, app_config, &mut out)
                 .await
@@ -2873,8 +2878,8 @@ pub async fn run(
         Command::Expand(a) => {
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             match cli::commands::expand::cmd_expand(&a, app_config, &db_path, &mut out).await? {
                 0 => Ok(()),
@@ -2884,8 +2889,8 @@ pub async fn run(
         Command::Reembed(a) => {
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             // v0.7.0 #1598 — full-corpus vector-space migration.
             // Non-zero exit codes map configuration outcomes
@@ -2898,8 +2903,8 @@ pub async fn run(
         Command::UndoEdit(a) => {
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             // #1727 — NON-DESTRUCTIVE undo of an in-place edit. Builds the
             // SAL store like the curator (--store-url postgres/sqlite, else
@@ -2924,8 +2929,8 @@ pub async fn run(
         Command::Stop(a) => {
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             // #1955 R45 — substrate record-stop actuator. Builds the SAL
             // store (--store-url postgres/sqlite, else the --db sqlite
@@ -2939,8 +2944,8 @@ pub async fn run(
         Command::Replay(a) => {
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             cli::commands::replay::cmd_replay(&db_path, &a, &mut out)
         }
@@ -2953,24 +2958,24 @@ pub async fn run(
         Command::Reflect(a) => {
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             cli::commands::reflect::cmd_reflect(&db_path, &a, &mut out)
         }
         Command::Subscribe(a) => {
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             cli::commands::subscribe::cmd_subscribe(&db_path, &a, cli_agent_id.as_deref(), &mut out)
         }
         Command::Unsubscribe(a) => {
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             cli::commands::unsubscribe::cmd_unsubscribe(
                 &db_path,
@@ -2982,8 +2987,8 @@ pub async fn run(
         Command::ListSubscriptions(a) => {
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             cli::commands::list_subscriptions::cmd_list_subscriptions(
                 &db_path,
@@ -2995,24 +3000,24 @@ pub async fn run(
         Command::SubscriptionReplay(a) => {
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             cli::commands::subscription_replay::cmd_subscription_replay(&db_path, &a, &mut out)
         }
         Command::SubscriptionDlqList(a) => {
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             cli::commands::subscription_dlq_list::cmd_subscription_dlq_list(&db_path, &a, &mut out)
         }
         Command::Notify(a) => {
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             cli::commands::notify::cmd_notify(
                 &db_path,
@@ -3027,8 +3032,8 @@ pub async fn run(
             // the global `--json` (json_contract Global).
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             cli::commands::capture_turn::cmd_capture_turn(
                 &db_path,
@@ -3054,48 +3059,48 @@ pub async fn run(
         Command::IngestMultistep(a) => {
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             cli::commands::ingest_multistep::cmd_ingest_multistep(&a, app_config, &mut out)
         }
         Command::KgInvalidate(a) => {
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             cli::commands::kg_invalidate::cmd_kg_invalidate(&db_path, &a, &mut out)
         }
         Command::KgTimeline(a) => {
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             cli::commands::kg_timeline::cmd_kg_timeline(&db_path, &a, &mut out)
         }
         Command::EntityRegister(a) => {
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             cli::commands::entity_register::cmd_entity_register(&db_path, &a, &mut out)
         }
         Command::EntityGetByAlias(a) => {
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             cli::commands::entity_get_by_alias::cmd_entity_get_by_alias(&db_path, &a, &mut out)
         }
         Command::DependentsOfInvalidated(a) => {
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             cli::commands::dependents_of_invalidated::cmd_dependents_of_invalidated(
                 &db_path, &a, &mut out,
@@ -3104,24 +3109,24 @@ pub async fn run(
         Command::SwarmRewind(a) => {
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             cli::commands::swarm_rewind::cmd_swarm_rewind(&db_path, &a, &mut out)
         }
         Command::ReflectionOrigin(a) => {
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             cli::commands::reflection_origin::cmd_reflection_origin(&db_path, &a, &mut out)
         }
         Command::QuotaStatus(a) => {
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
+            let mut so = stdout;
+            let mut se = stderr;
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             cli::commands::quota_status::cmd_quota_status(&db_path, &a, &mut out)
         }
@@ -4120,108 +4125,19 @@ use crate::identity::keypair::DAEMON_KEYPAIR_LABEL;
 ///
 /// The `asi-hard` no-signing-identity refusals above. Every other failure
 /// still degrades to unsigned-link mode and returns `Ok`.
+///
+/// #8863 — the body is the shared
+/// [`crate::identity::keypair::ensure_and_load_label_keypair_in`], so the
+/// curator (`--once`, `--reflect`) resolves the SAME one identity.
 fn ensure_and_load_daemon_keypair() -> Result<(
     Option<crate::identity::keypair::AgentKeypair>,
     Option<crate::identity::keypair::EnsureOutcome>,
 )> {
-    let dir = match crate::identity::keypair::default_key_dir() {
-        Ok(d) => d,
-        Err(e) => {
-            // #3198 — WARN, not INFO, and render the CAUSE. This arm used to
-            // mean only "the OS advertises no config directory"; since #3198 it
-            // also carries the key-directory posture REFUSAL (group- or
-            // world-writable key store). Refusing to sign with a key another
-            // local UID can swap is the correct fail-closed outcome, but at
-            // INFO it was indistinguishable from an absent HOME and sat below
-            // the default log filter — the exact silence #3147 exists to end.
-            // #3147 Fable item 3: under `asi-hard` a daemon that cannot sign
-            // must refuse to boot, not degrade to unsigned-link mode.
-            tracing::warn!(
-                "identity: no usable key directory, link/persona/witness signing is \
-                 DISABLED: {e:#}"
-            );
-            if let Some(reason) = crate::identity::keypair::no_signing_identity_refusal(
-                crate::security_profile::is_asi_hard(),
-                &format!("{e:#}"),
-            ) {
-                anyhow::bail!(reason);
-            }
-            return Ok((None, None));
-        }
-    };
-    // The `[identity].disabled` config field is not yet wired in
-    // v0.7.0; pass `false` so the helper auto-generates unless the
-    // operator pre-staged a keypair. A future config field can opt
-    // out without changing this call site.
-    let outcome = match crate::identity::keypair::ensure_keypair(DAEMON_KEYPAIR_LABEL, &dir, false)
-    {
-        Ok(o) => o,
-        Err(e) => {
-            tracing::warn!("identity: keypair auto-gen failed: {e:#}");
-            if let Some(reason) = crate::identity::keypair::no_signing_identity_refusal(
-                crate::security_profile::is_asi_hard(),
-                &format!("{e:#}"),
-            ) {
-                anyhow::bail!(reason);
-            }
-            return Ok((None, None));
-        }
-    };
-    // #3147 — public-key-without-private-key is refused under `asi-hard` and
-    // WARNed (inside `ensure_keypair`) under every other posture.
-    if let Some(reason) = crate::identity::keypair::public_only_refusal(
-        &outcome,
+    crate::identity::keypair::ensure_and_load_label_keypair_in(
+        crate::identity::keypair::default_key_dir(),
+        DAEMON_KEYPAIR_LABEL,
         crate::security_profile::is_asi_hard(),
-    ) {
-        anyhow::bail!(reason);
-    }
-    if matches!(
-        outcome,
-        crate::identity::keypair::EnsureOutcome::SkippedDisabled
-    ) {
-        return Ok((None, Some(outcome)));
-    }
-    let kp = match crate::identity::keypair::load(DAEMON_KEYPAIR_LABEL, &dir) {
-        Ok(kp) if kp.can_sign() => {
-            tracing::info!(
-                "identity: loaded signing keypair for {DAEMON_KEYPAIR_LABEL} from {}",
-                dir.display()
-            );
-            Some(kp)
-        }
-        Ok(_) => {
-            // #3147 — WARN, not INFO. "This daemon will sign nothing until an
-            // operator intervenes" is not an informational note: at INFO it sat
-            // below the default log filter of most deployments, so a lost
-            // `daemon.priv` produced no operator-visible signal at all.
-            tracing::warn!(
-                "identity: only the PUBLIC key is on disk for {DAEMON_KEYPAIR_LABEL} in {} — \
-                 link/persona/witness signing is DISABLED and will stay disabled across \
-                 restarts. See `ai-memory doctor` -> Identity (#3147).",
-                dir.display()
-            );
-            if let Some(reason) = crate::identity::keypair::no_signing_identity_refusal(
-                crate::security_profile::is_asi_hard(),
-                "only the public key is on disk",
-            ) {
-                anyhow::bail!(reason);
-            }
-            None
-        }
-        Err(e) => {
-            tracing::warn!(
-                "identity: keypair load failed for {DAEMON_KEYPAIR_LABEL}: {e:#}; link signing disabled"
-            );
-            if let Some(reason) = crate::identity::keypair::no_signing_identity_refusal(
-                crate::security_profile::is_asi_hard(),
-                &format!("{e:#}"),
-            ) {
-                anyhow::bail!(reason);
-            }
-            None
-        }
-    };
-    Ok((kp, Some(outcome)))
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -5221,8 +5137,8 @@ async fn run_verify_audit_trail(
 ) -> Result<i32> {
     let stdout = std::io::stdout();
     let stderr = std::io::stderr();
-    let mut so = stdout.lock();
-    let mut se = stderr.lock();
+    let mut so = stdout;
+    let mut se = stderr;
     let mut out = cli::CliOutput::from_std(&mut so, &mut se);
 
     // #1927 — prefer the non-argv credential channel over the
@@ -14566,8 +14482,8 @@ decision = "allow"
         let cfg = crate::config::AppConfig::default();
         let stdout = std::io::stdout();
         let stderr = std::io::stderr();
-        let mut so = stdout.lock();
-        let mut se = stderr.lock();
+        let mut so = stdout;
+        let mut se = stderr;
         let mut out = crate::cli::CliOutput::from_std(&mut so, &mut se);
         // An unreachable postgres endpoint fails at connect → Err (covers the
         // pg redact + connect + map_err arm without a live DB).

@@ -223,6 +223,9 @@ pub fn generate_scenarios() -> Vec<Scenario> {
                 metadata: serde_json::json!({
                     "agent_id": "bench-l3-lme-refl",
                     "scenario_id": scenario_id,
+                    // #8850: the curator pass reads as the curator
+                    // identity; collective rows are readable by it.
+                    "scope": "collective",
                 }),
                 reflection_depth: 0,
                 memory_kind: MemoryKind::Observation,

@@ -2622,8 +2622,16 @@ impl MemoryStore for SqliteStore {
         if ctx.bypass_visibility {
             let mut stamped = input.clone();
             crate::storage::stamp_substrate_why_trace(&mut stamped.metadata);
-            // Admin/substrate context: unscoped source read, as before (#3176).
-            db::reflect_with_hooks_for_caller(&conn, &stamped, &hooks, None)
+            match ctx.as_agent.as_deref() {
+                // #9185 (L-F, I-3) — a DERIVED write (admin write context that
+                // names the principal it read as, the curator reflection pass):
+                // re-verify every source under the write transaction.
+                Some(principal) => {
+                    db::reflect_with_hooks_derived(&conn, &stamped, &hooks, principal)
+                }
+                // Admin/substrate context: unscoped source read, as before (#3176).
+                None => db::reflect_with_hooks_for_caller(&conn, &stamped, &hooks, None),
+            }
         } else {
             // #3014 — a TENANT reflect crosses the attestation posture. The
             // production tenant reflect surfaces (MCP + HTTP-sqlite) route

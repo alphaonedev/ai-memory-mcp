@@ -132,6 +132,7 @@ fn transcript_credential_is_redacted_in_forensic_bundle_1845() {
     let mut stderr = Vec::<u8>::new();
     {
         let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
+        let _ = ai_memory::identity::test_key_dir::install(); // #9185: export may mint the daemon key
         bundle::run_export(&db_path, &args, &mut out).expect("export");
     }
 

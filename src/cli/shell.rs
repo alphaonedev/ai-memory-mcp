@@ -487,8 +487,6 @@ pub fn run(db_path: &Path) -> Result<()> {
         color::bold("ai-memory shell — type 'help' for commands, 'quit' to exit")
     );
     let stdin = std::io::stdin();
-    let stdout_handle = std::io::stdout();
-    let stderr_handle = std::io::stderr();
     loop {
         eprint!("{} ", color::cyan("memory>"));
         let mut line = String::new();
@@ -496,8 +494,11 @@ pub fn run(db_path: &Path) -> Result<()> {
             break;
         }
         let parts: Vec<&str> = line.split_whitespace().collect();
-        let mut so = stdout_handle.lock();
-        let mut se = stderr_handle.lock();
+        // #8779 — unlocked handles: `Stdout` / `Stderr` take the lock per
+        // write, so no process-global stdio lock is held while the command
+        // runs (a traced worker thread can never block on it).
+        let mut so = std::io::stdout();
+        let mut se = std::io::stderr();
         let mut out = CliOutput::from_std(&mut so, &mut se);
         let action = handle_command(&parts, &conn, &mut out);
         drop(out);

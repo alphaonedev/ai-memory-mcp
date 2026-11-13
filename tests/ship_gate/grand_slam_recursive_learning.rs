@@ -149,7 +149,9 @@ fn make_observation(namespace: &str, topic: &str, idx: usize) -> Memory {
         updated_at: now,
         last_accessed_at: None,
         expires_at: None,
-        metadata: serde_json::json!({"agent_id": "ai:l3-3"}),
+        // #8850: the pass reads as the curator identity; collective rows
+        // are readable by it.
+        metadata: serde_json::json!({"agent_id": "ai:l3-3", "scope": "collective"}),
         reflection_depth: 0,
         memory_kind: MemoryKind::Observation,
         entity_id: None,

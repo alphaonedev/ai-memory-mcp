@@ -358,7 +358,7 @@ pub async fn run(
         // edge to an identity that is not the one this process runs as.
         let db_path_owned = db_path.to_path_buf();
         let cfg_owned = cfg.clone();
-        let keypair = load_curator_keypair_best_effort();
+        let keypair = curator_signing_keypair()?;
         let report = tokio::task::spawn_blocking(move || -> Result<curator::CuratorReport> {
             let conn = db::open(&db_path_owned)?;
             // v0.9.0 §25.3 S1 (D3-012, #1870) — TOFU-capture the substrate's
@@ -502,7 +502,7 @@ async fn run_store_backed_sweep(
         crate::daemon_runtime::build_curator_store(curator_store_url(args), db_path, app_config)
             .await?;
 
-    let keypair = load_curator_keypair_best_effort();
+    let keypair = curator_signing_keypair()?;
     let feature_tier = app_config.effective_tier(None);
     let llm = build_curator_llm(feature_tier, db_path);
 
@@ -868,14 +868,15 @@ async fn run_reflect(
     // Postgres store identically to the local SQLite path.
     let store = build_reflect_store(db_path, args, app_config).await?;
 
-    // Resolve the curator's signing keypair. We rely on the
-    // process-wide identity (the same one `serve` uses) so every
-    // `reflects_on` edge attributes to the daemon's Ed25519 identity.
-    // When no keypair is configured (operator opted out via
-    // `[identity].disabled = true` or runs a one-off `--reflect`
-    // against a fresh data dir) the pass falls back to `"ai:curator"`
-    // — same fall-back the autonomy `consolidate` path uses.
-    let keypair = load_curator_keypair_best_effort();
+    // #8863 / #9185 (L-G) — resolve the curator's signing keypair: the
+    // daemon label key (`daemon.pub` / `daemon.priv`) in the default key
+    // directory, minted on first use with a WARN naming its key id and path.
+    // With it loaded, every reflection is owned by and every `reflects_on`
+    // edge is signed as the `daemon` principal. Under `asi-hard` a missing or
+    // unusable daemon key refuses the pass. In the default posture a key that
+    // cannot be minted or loaded degrades to an unsigned pass (WARN with the
+    // reason) attributed to `"ai:curator"`.
+    let keypair = curator_signing_keypair()?;
 
     let feature_tier = app_config.effective_tier(None);
     let llm = build_curator_llm(feature_tier, db_path);
@@ -1149,34 +1150,45 @@ async fn build_reflect_store(
     crate::daemon_runtime::build_curator_store(curator_store_url(args), db_path, app_config).await
 }
 
-/// Load the curator's per-process signing keypair. Best-effort — if the
-/// keypair file is missing or unreadable we return `None` and the pass
-/// stamps `ai:curator` as `agent_id`. Errors are deliberately not
-/// surfaced; an operator who wants a strict-mode "fail if keypair
-/// missing" can run `ai-memory identity list` first.
+/// #8863 — the curator's ONE signing identity for this process, resolved
+/// from the default key directory under the active security posture.
+///
+/// # Errors
+///
+/// See [`curator_signing_keypair_in`].
 #[cfg_attr(not(feature = "sal"), allow(dead_code))]
-fn load_curator_keypair_best_effort() -> Option<identity_keypair::AgentKeypair> {
-    let dir = identity_keypair::default_key_dir().ok()?;
-    // We don't know which agent_id the operator wants the curator to
-    // run as. Pick the lexicographically-first key under the key dir;
-    // operators who run multiple curators on the same host should
-    // either give each a dedicated key dir via `AI_MEMORY_KEY_DIR` or
-    // set the daemon `AI_MEMORY_AGENT_ID` env var.
-    let listed = identity_keypair::list(&dir).ok()?;
-    let first = listed.into_iter().next()?;
-    let loaded = identity_keypair::load(&first.agent_id, &dir).ok()?;
-    // v1.0.0 — the selected identity is AMBIENT (lexicographically-first key
-    // in the key dir) and it is what every row this curator signs will be
-    // attributed to, including the `__persona_*` rows the auto-persona sweep
-    // mints. An operator running several keys on one host must be able to see
-    // WHICH one the curator adopted without reverse-engineering the key dir
-    // ordering, so announce it once at load.
-    tracing::info!(
-        agent_id = %first.agent_id,
-        key_dir = %dir.display(),
-        "curator signing identity selected"
-    );
-    Some(loaded)
+fn curator_signing_keypair() -> Result<Option<identity_keypair::AgentKeypair>> {
+    curator_signing_keypair_in(
+        identity_keypair::default_key_dir(),
+        crate::security_profile::is_asi_hard(),
+    )
+}
+
+/// #8863 — resolve the curator signing identity from `dir`.
+///
+/// The curator signs and owns derived rows as the daemon identity
+/// ([`identity_keypair::DAEMON_KEYPAIR_LABEL`]), the same key the curator
+/// daemon loop signs with, minted on first use. Other agents' keys in a
+/// shared directory are never considered, so directory sort order can no
+/// longer pick the signer.
+///
+/// # Errors
+///
+/// Under `asi-hard`, the exact no-signing-identity refusal when `dir` is
+/// unusable, the curator key cannot be minted or loaded, or only its public
+/// half is on disk. The default posture degrades those arms to `Ok(None)`
+/// (unsigned) with a WARN and never falls through to another key.
+#[cfg_attr(not(feature = "sal"), allow(dead_code))]
+fn curator_signing_keypair_in(
+    dir: Result<std::path::PathBuf>,
+    asi_hard: bool,
+) -> Result<Option<identity_keypair::AgentKeypair>> {
+    Ok(identity_keypair::ensure_and_load_label_keypair_in(
+        dir,
+        identity_keypair::DAEMON_KEYPAIR_LABEL,
+        asi_hard,
+    )?
+    .0)
 }
 
 #[cfg_attr(not(feature = "sal"), allow(dead_code))]
@@ -2626,6 +2638,75 @@ mod tests {
         );
     }
 
+    /// #9185 (M-D) — one clustering observation for the sweep test.
+    #[cfg(feature = "sal")]
+    fn sweep_row_9185(ns: &str, idx: usize, metadata: serde_json::Value) -> crate::models::Memory {
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut row = crate::models::Memory::default();
+        row.id = uuid::Uuid::new_v4().to_string();
+        row.tier = crate::models::Tier::Long;
+        row.namespace = ns.to_string();
+        row.title = format!("observation sweep canary rollout strategy #{idx}");
+        row.content =
+            format!("sweep canary rollout strategy sweep canary rollout strategy row {idx}");
+        row.priority = 5;
+        row.confidence = 1.0;
+        row.source = "api".to_string();
+        row.access_count = 2;
+        row.created_at.clone_from(&now);
+        row.updated_at = now;
+        row.metadata = metadata;
+        row.memory_kind = crate::models::MemoryKind::Observation;
+        row
+    }
+
+    /// #9185 (M-D) — the daemon sweep reaches the reflection pass and its
+    /// persist path: a collective cluster yields one reflection, and another
+    /// owner's default (owner-private) cluster yields none and no error.
+    #[cfg(feature = "sal")]
+    #[tokio::test]
+    async fn store_backed_reflection_sweep_persists_readable_cluster_only_9185() {
+        const ROWS: usize = 4;
+        let env = TestEnv::fresh();
+        let open_ns = "acme/eng/sweep-collective-9185";
+        let private_ns = "acme/eng/sweep-private-9185";
+        {
+            let conn = crate::db::open(&env.db_path).expect("db::open");
+            for idx in 0..ROWS {
+                let open = sweep_row_9185(
+                    open_ns,
+                    idx,
+                    serde_json::json!({"agent_id": "acme/eng/alice", "scope": "collective"}),
+                );
+                crate::db::insert(&conn, &open).expect("seed collective");
+                let private = sweep_row_9185(
+                    private_ns,
+                    idx,
+                    serde_json::json!({"agent_id": "zeta/ops/bob"}),
+                );
+                crate::db::insert(&conn, &private).expect("seed private");
+            }
+        }
+        let store = crate::store::sqlite::SqliteStore::open(&env.db_path).expect("open store");
+        let stub = CovStubLlm;
+        let report = store_backed_reflection_sweep(
+            &store,
+            Some(&stub as &dyn crate::autonomy::AutonomyLlm),
+            None,
+            &default_args(),
+        )
+        .await;
+        assert!(report.errors.is_empty(), "errors: {:?}", report.errors);
+        assert_eq!(
+            report.reflections_persisted, 1,
+            "#9185: only the collective cluster reflects: {report:?}"
+        );
+        assert_eq!(
+            report.observations_scanned, ROWS,
+            "#9185: the owner-private rows are not visible to the sweep"
+        );
+    }
+
     #[cfg(feature = "sal")]
     #[tokio::test]
     async fn reflection_helper_with_none_llm_reports_configured_error() {
@@ -2880,11 +2961,111 @@ mod tests {
         assert!(s.contains("sources=3"));
     }
 
+    /// #8863 — a key that sorts before the curator key. Any agent that ever
+    /// opened a session can leave one of these in the shared key directory.
+    const KEY_SORTING_FIRST_8863: &str = "aaa-8863-first";
+    /// #8863 — a second ordinary agent key in the same directory.
+    const OTHER_AGENT_KEY_8863: &str = "alice-8863";
+    /// #8863 — the cause carried by an unusable key directory.
+    const UNUSABLE_KEY_DIR_CAUSE_8863: &str = "key directory refused for test 8863";
+
+    fn save_full_key_8863(dir: &Path, agent_id: &str) -> identity_keypair::AgentKeypair {
+        let kp = identity_keypair::generate(agent_id).unwrap();
+        identity_keypair::save(&kp, dir).unwrap();
+        kp
+    }
+
+    fn key_dir_8863() -> tempfile::TempDir {
+        let tmp = tempfile::TempDir::new().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        tmp
+    }
+
+    /// Signer and owner are the curator key, never the first-sorted key, under
+    /// both postures.
     #[test]
-    fn load_curator_keypair_best_effort_returns_some_or_none() {
-        // Just exercises the function. Whether it returns Some or None
-        // depends on the host's key dir contents; either outcome is OK.
-        let _ = load_curator_keypair_best_effort();
+    fn multi_key_dir_signs_as_curator_key_not_first_sorted_8863() {
+        for asi_hard in [false, true] {
+            let tmp = key_dir_8863();
+            let first = save_full_key_8863(tmp.path(), KEY_SORTING_FIRST_8863);
+            save_full_key_8863(tmp.path(), OTHER_AGENT_KEY_8863);
+            let curator = save_full_key_8863(tmp.path(), identity_keypair::DAEMON_KEYPAIR_LABEL);
+            let kp = curator_signing_keypair_in(Ok(tmp.path().to_path_buf()), asi_hard)
+                .unwrap()
+                .expect("curator key resolves");
+            assert_eq!(kp.agent_id, identity_keypair::DAEMON_KEYPAIR_LABEL);
+            assert!(kp.can_sign(), "curator key signs");
+            assert_eq!(kp.public, curator.public, "the on-disk curator key");
+            assert_ne!(kp.public, first.public, "never the first-sorted key");
+        }
+    }
+
+    /// A directory with only ordinary agent keys mints the curator key; it
+    /// never adopts the first-sorted agent key.
+    #[test]
+    fn dir_without_curator_key_mints_it_never_adopts_first_sorted_8863() {
+        let tmp = key_dir_8863();
+        let first = save_full_key_8863(tmp.path(), KEY_SORTING_FIRST_8863);
+        save_full_key_8863(tmp.path(), OTHER_AGENT_KEY_8863);
+        let kp = curator_signing_keypair_in(Ok(tmp.path().to_path_buf()), false)
+            .unwrap()
+            .expect("curator key minted");
+        assert_eq!(kp.agent_id, identity_keypair::DAEMON_KEYPAIR_LABEL);
+        assert!(kp.can_sign());
+        assert_ne!(kp.public, first.public);
+        let reloaded =
+            identity_keypair::load(identity_keypair::DAEMON_KEYPAIR_LABEL, tmp.path()).unwrap();
+        assert_eq!(reloaded.public, kp.public, "the minted key is persisted");
+    }
+
+    /// A public-only curator key fails closed with the exact refusal under
+    /// `asi-hard`, and never falls through to another key under any posture.
+    #[test]
+    fn public_only_curator_key_refused_exactly_never_falls_through_8863() {
+        let tmp = key_dir_8863();
+        save_full_key_8863(tmp.path(), KEY_SORTING_FIRST_8863);
+        let curator = identity_keypair::generate(identity_keypair::DAEMON_KEYPAIR_LABEL).unwrap();
+        identity_keypair::save_public_only(&curator, tmp.path()).unwrap();
+        let outcome = identity_keypair::EnsureOutcome::PublicOnlyDegraded {
+            pub_path: identity_keypair::agent_pub_path(
+                tmp.path(),
+                identity_keypair::DAEMON_KEYPAIR_LABEL,
+            ),
+            priv_path: identity_keypair::agent_priv_path(
+                tmp.path(),
+                identity_keypair::DAEMON_KEYPAIR_LABEL,
+            ),
+        };
+        let expected = identity_keypair::public_only_refusal(&outcome, true).unwrap();
+        let err = curator_signing_keypair_in(Ok(tmp.path().to_path_buf()), true).unwrap_err();
+        assert_eq!(format!("{err:#}"), expected);
+        let degraded = curator_signing_keypair_in(Ok(tmp.path().to_path_buf()), false).unwrap();
+        assert!(
+            degraded.is_none(),
+            "default posture degrades to unsigned, never to another key: {:?}",
+            degraded.map(|k| k.agent_id)
+        );
+    }
+
+    /// An unusable key directory fails closed with the exact refusal under
+    /// `asi-hard` and degrades to unsigned otherwise.
+    #[test]
+    fn unusable_key_dir_refused_exactly_under_asi_hard_8863() {
+        let expected =
+            identity_keypair::no_signing_identity_refusal(true, UNUSABLE_KEY_DIR_CAUSE_8863)
+                .unwrap();
+        let err =
+            curator_signing_keypair_in(Err(anyhow::anyhow!(UNUSABLE_KEY_DIR_CAUSE_8863)), true)
+                .unwrap_err();
+        assert_eq!(format!("{err:#}"), expected);
+        let degraded =
+            curator_signing_keypair_in(Err(anyhow::anyhow!(UNUSABLE_KEY_DIR_CAUSE_8863)), false)
+                .unwrap();
+        assert!(degraded.is_none());
     }
 
     #[test]

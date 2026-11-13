@@ -360,14 +360,154 @@ pub fn reflect_with_hooks(
 ///
 /// Same variants as [`reflect_with_hooks`]; a source the caller cannot see
 /// surfaces as [`ReflectError::SourceNotFound`].
-#[allow(clippy::too_many_lines)]
 pub fn reflect_with_hooks_for_caller(
     conn: &Connection,
     input: &ReflectInput,
     hooks: &ReflectHooks<'_>,
     caller: Option<&str>,
 ) -> std::result::Result<ReflectOutcome, ReflectError> {
+    let read = match caller {
+        Some(principal) => SourceRead::Tenant(principal),
+        None => SourceRead::Unscoped,
+    };
+    reflect_with_source_read(conn, input, hooks, read)
+}
+
+/// #9185 (L-F, I-3) — a DERIVED reflection: the substrate write a curator
+/// makes over rows it read as `principal`.
+///
+/// The step-2 source read is unscoped (the write context bypasses the tenant
+/// gate, as before), and INSIDE the write transaction every source is read
+/// again and checked with [`verify_derived_sources`]: each must still be
+/// readable by `principal`, live, in the target namespace, and the stamped
+/// `metadata.scope` must equal the narrowest scope of the fresh rows. Any
+/// drift between the curator's read and this write refuses the reflection
+/// and rolls the transaction back, so a derived row is never wider than its
+/// sources and never lands in another namespace.
+///
+/// # Errors
+///
+/// Same variants as [`reflect_with_hooks`]; a drifted source surfaces as
+/// [`ReflectError::Validation`] with a [`DERIVED_REFUSAL_PREFIX`] message, a
+/// source removed since the read as [`ReflectError::SourceNotFound`].
+pub fn reflect_with_hooks_derived(
+    conn: &Connection,
+    input: &ReflectInput,
+    hooks: &ReflectHooks<'_>,
+    principal: &str,
+) -> std::result::Result<ReflectOutcome, ReflectError> {
+    reflect_with_source_read(conn, input, hooks, SourceRead::Derived(principal))
+}
+
+/// How [`reflect_with_source_read`] loads and re-checks the sources.
+#[derive(Clone, Copy)]
+enum SourceRead<'a> {
+    /// Substrate / admin read (`None` caller): byte-identical to pre-#3176.
+    Unscoped,
+    /// #3176 tenant read: an unreadable source folds to `SourceNotFound`.
+    Tenant(&'a str),
+    /// #9185 derived write: unscoped read, re-verified in the write txn.
+    Derived(&'a str),
+}
+
+impl<'a> SourceRead<'a> {
+    fn tenant(self) -> Option<&'a str> {
+        match self {
+            SourceRead::Tenant(principal) => Some(principal),
+            SourceRead::Unscoped | SourceRead::Derived(_) => None,
+        }
+    }
+}
+
+/// Prefix of every #9185 write-time refusal of a derived reflection.
+pub const DERIVED_REFUSAL_PREFIX: &str = "derived reflection refused at write time";
+
+/// #9185 (L-G) — the ONE author check of a reflection, shared by the sqlite
+/// and postgres reflect funnels.
+///
+/// A wire-shaped reflection runs the full [`crate::validate::validate_agent_id`]
+/// (shape plus the #977 reserved-name reject). A DERIVED write authored by the
+/// very principal it read as (`derived_principal == Some(agent_id)`: the
+/// curator reflection pass, the only production context that sets
+/// `bypass_visibility` together with `as_agent`) runs the shape check only,
+/// the same internal-caller exemption the daemon keypair load takes, so the
+/// daemon-keyed curator can own its reflections as `daemon`. A derived write
+/// naming any other author keeps the full check.
+///
+/// # Errors
+///
+/// [`ReflectError::Validation`] with the validator's message.
+pub fn validate_reflection_author(
+    agent_id: &str,
+    derived_principal: Option<&str>,
+) -> std::result::Result<(), ReflectError> {
+    let checked = if derived_principal == Some(agent_id) {
+        crate::validate::validate_agent_id_shape(agent_id)
+    } else {
+        crate::validate::validate_agent_id(agent_id)
+    };
+    checked.map_err(|e| ReflectError::Validation(e.to_string()))
+}
+
+/// #9185 (L-F, I-3) — the ONE write-time check of a derived reflection,
+/// shared by the sqlite and postgres reflect funnels. `fresh` are the source
+/// rows read inside the write transaction, in `source_ids` order.
+///
+/// # Errors
+///
+/// [`ReflectError::Validation`] with the exact [`DERIVED_REFUSAL_PREFIX`]
+/// message naming the first source that is no longer readable by
+/// `principal`, sits in another namespace, or a scope mismatch between the
+/// stamped `metadata.scope` and the narrowest scope of `fresh`.
+pub fn verify_derived_sources(
+    principal: &str,
+    target_namespace: &str,
+    metadata: &serde_json::Value,
+    fresh: &[Memory],
+) -> std::result::Result<(), ReflectError> {
+    for m in fresh {
+        if !m.lifecycle_state.is_recall_visible()
+            || !crate::visibility::is_readable_on_query(
+                m,
+                Some(principal),
+                Some(m.namespace.as_str()),
+            )
+        {
+            return Err(ReflectError::Validation(format!(
+                "{DERIVED_REFUSAL_PREFIX}: source {} is not readable by {principal}",
+                m.id
+            )));
+        }
+        if m.namespace != target_namespace {
+            return Err(ReflectError::Validation(format!(
+                "{DERIVED_REFUSAL_PREFIX}: source {} is in namespace '{}', not '{target_namespace}'",
+                m.id, m.namespace
+            )));
+        }
+    }
+    let narrowest = crate::visibility::narrowest_scope(fresh);
+    let stamped = metadata
+        .get(crate::META_KEY_SCOPE)
+        .and_then(serde_json::Value::as_str);
+    if stamped != Some(narrowest.as_str()) {
+        return Err(ReflectError::Validation(format!(
+            "{DERIVED_REFUSAL_PREFIX}: the sources narrow to scope '{}', the reflection carries '{}'",
+            narrowest.as_str(),
+            stamped.unwrap_or("<none>")
+        )));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn reflect_with_source_read(
+    conn: &Connection,
+    input: &ReflectInput,
+    hooks: &ReflectHooks<'_>,
+    read: SourceRead<'_>,
+) -> std::result::Result<ReflectOutcome, ReflectError> {
     use crate::validate;
+    let caller = read.tenant();
     // ─── 1. Validate inputs ──────────────────────────────────────────
     validate::validate_title(&input.title).map_err(|e| ReflectError::Validation(e.to_string()))?;
     validate::validate_content(&input.content)
@@ -379,8 +519,11 @@ pub fn reflect_with_hooks_for_caller(
         .map_err(|e| ReflectError::Validation(e.to_string()))?;
     validate::validate_source(&input.source)
         .map_err(|e| ReflectError::Validation(e.to_string()))?;
-    validate::validate_agent_id(&input.agent_id)
-        .map_err(|e| ReflectError::Validation(e.to_string()))?;
+    let derived_principal = match read {
+        SourceRead::Derived(principal) => Some(principal),
+        SourceRead::Unscoped | SourceRead::Tenant(_) => None,
+    };
+    validate_reflection_author(&input.agent_id, derived_principal)?;
     if input.source_ids.is_empty() {
         return Err(ReflectError::Validation(
             "source_ids cannot be empty — a reflection must reflect on at least one source memory"
@@ -644,6 +787,20 @@ pub fn reflect_with_hooks_for_caller(
         .map_err(|e| ReflectError::Database(e.to_string()))?;
 
     let txn_result = (|| -> std::result::Result<String, ReflectError> {
+        // #9185 (L-F, I-3) — a derived write re-reads every source UNDER this
+        // write transaction (BEGIN IMMEDIATE holds the writer lock, so no
+        // other write can move or narrow a source until COMMIT) and refuses
+        // on any drift since the curator's read.
+        if let SourceRead::Derived(principal) = read {
+            let mut fresh = Vec::with_capacity(input.source_ids.len());
+            for id in &input.source_ids {
+                match get(conn, id).map_err(|e| ReflectError::Database(e.to_string()))? {
+                    Some(m) => fresh.push(m),
+                    None => return Err(ReflectError::SourceNotFound(id.clone())),
+                }
+            }
+            verify_derived_sources(principal, &target_namespace, &input.metadata, &fresh)?;
+        }
         // v0.7.0 fix campaign R1-M3 (#690) — substrate-side reflections
         // must NOT silently merge into an existing (title, namespace).
         // If a row with the same title is already present in the

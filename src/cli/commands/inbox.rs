@@ -196,8 +196,8 @@ pub async fn cmd_inbox_waiting(
     }
     let stdout = std::io::stdout();
     let stderr = std::io::stderr();
-    let mut so = stdout.lock();
-    let mut se = stderr.lock();
+    let mut so = stdout;
+    let mut se = stderr;
     let mut out = CliOutput::from_std(&mut so, &mut se);
     cmd_inbox(db_path, args, cli_agent_id, &mut out)
 }

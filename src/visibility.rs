@@ -404,6 +404,42 @@ fn classify_scope(id: &str, namespace: &str, metadata: &serde_json::Value) -> Sc
     }
 }
 
+/// #8850 — the most restrictive scope among `rows`, for a row DERIVED from
+/// them (a curator reflection, a summary).
+///
+/// Ranked through [`classify_scope`], so an absent key or an unrecognised
+/// token counts as `private` exactly as the read path treats it:
+/// `private` < `team` < `unit` < `org` < `collective` (and the closed legacy
+/// broad set). A derived row stamped with this scope is never readable by a
+/// principal who could not read every one of its sources in the same
+/// namespace. An empty slice yields `private`, the fail-closed default.
+#[must_use]
+pub fn narrowest_scope(rows: &[Memory]) -> crate::models::namespace::MemoryScope {
+    use crate::models::namespace::MemoryScope;
+    /// Breadth rank of a classified arm; lower is narrower.
+    fn breadth(arm: ScopeArm) -> usize {
+        match arm {
+            ScopeArm::OwnerPrivate => 0,
+            ScopeArm::Subtree(ancestor_idx) => ancestor_idx,
+            ScopeArm::Broad => usize::MAX,
+        }
+    }
+    let narrowest = rows
+        .iter()
+        .map(|m| classify_scope(&m.id, &m.namespace, &m.metadata))
+        .min_by_key(|arm| breadth(*arm));
+    match narrowest {
+        None | Some(ScopeArm::OwnerPrivate) => MemoryScope::Private,
+        Some(ScopeArm::Subtree(1)) => MemoryScope::Team,
+        Some(ScopeArm::Subtree(2)) => MemoryScope::Unit,
+        Some(ScopeArm::Subtree(3)) => MemoryScope::Org,
+        // `classify_scope` only yields subtree indexes 1..=3; any other
+        // index is treated as the fail-closed default.
+        Some(ScopeArm::Subtree(_)) => MemoryScope::Private,
+        Some(ScopeArm::Broad) => MemoryScope::Collective,
+    }
+}
+
 /// #3386 — visibility for a read surface that carries BOTH an enforced caller
 /// and a caller-supplied **#151 scope agent** (`as_agent`).
 ///

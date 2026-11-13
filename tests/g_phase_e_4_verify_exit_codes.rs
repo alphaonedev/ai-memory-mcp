@@ -308,6 +308,7 @@ fn forensic_bundle_tampered_file_exits_2() {
         let mut stdout = Vec::<u8>::new();
         let mut stderr = Vec::<u8>::new();
         let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
+        let _ = ai_memory::identity::test_key_dir::install(); // #9185: export may mint the daemon key
         let code = fb::run_export(&db_path, &export_args, &mut out).expect("export");
         assert_eq!(code, 0, "export must succeed on clean DB");
     }
@@ -370,6 +371,7 @@ fn forensic_bundle_clean_exits_0() {
         let mut stdout = Vec::<u8>::new();
         let mut stderr = Vec::<u8>::new();
         let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
+        let _ = ai_memory::identity::test_key_dir::install(); // #9185: export may mint the daemon key
         let code = fb::run_export(&db_path, &export_args, &mut out).expect("export");
         assert_eq!(code, 0);
     }

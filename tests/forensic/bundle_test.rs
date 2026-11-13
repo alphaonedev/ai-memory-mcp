@@ -36,7 +36,12 @@ use tempfile::TempDir;
 /// Build the `ai-memory --db <path>` command with `AI_MEMORY_NO_CONFIG=1`.
 fn ai_memory_cmd(db_path: &std::path::Path) -> Command {
     let mut cmd = Command::cargo_bin("ai-memory").unwrap();
+    // #9185: export may mint the daemon key; keep it in the test sandbox.
     cmd.env("AI_MEMORY_NO_CONFIG", "1")
+        .env(
+            "AI_MEMORY_KEY_DIR",
+            ai_memory::identity::test_key_dir::install(),
+        )
         .args(["--db", db_path.to_str().unwrap()]);
     cmd
 }
@@ -210,6 +215,7 @@ fn bundle_byte_identical_modulo_timestamp() {
         include_atomisation_chain: true,
         output: None,
     };
+    let _ = ai_memory::identity::test_key_dir::install(); // #9185: export may mint the daemon key
     let files_a = bundle::build_files(&conn, &args, Some("2026-01-01T00:00:00Z")).expect("build a");
     let files_b = bundle::build_files(&conn, &args, Some("2026-01-01T00:00:00Z")).expect("build b");
     let bytes_a = bundle::pack_to_vec(&files_a).expect("pack a");
@@ -269,6 +275,7 @@ fn run_verify_emits_structured_report_on_clean_bundle() {
     let mut stderr = Vec::<u8>::new();
     {
         let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
+        let _ = ai_memory::identity::test_key_dir::install(); // #9185: export may mint the daemon key
         bundle::run_export(&db_path, &args, &mut out).expect("export");
     }
 
@@ -313,6 +320,7 @@ fn transcripts_flag_includes_replay_union() {
     let mut stdout = Vec::<u8>::new();
     let mut stderr = Vec::<u8>::new();
     let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
+    let _ = ai_memory::identity::test_key_dir::install(); // #9185: export may mint the daemon key
     bundle::run_export(&db_path, &args, &mut out).expect("export");
 
     let bytes = std::fs::read(&bundle_path).expect("read");

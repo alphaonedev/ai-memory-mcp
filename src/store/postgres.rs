@@ -760,6 +760,11 @@ static SQL_SELECT_MEMORY_ROW_BY_ID: std::sync::LazyLock<String> = std::sync::Laz
 /// lock is held to commit, so the merge is computed from the row it overwrites.
 static SQL_SELECT_MEMORY_ROW_BY_ID_FOR_UPDATE: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| format!("{} FOR UPDATE", *SQL_SELECT_MEMORY_ROW_BY_ID));
+/// #9185 (L-F) — the derived-reflection write-time re-read: a SHARE lock held
+/// to commit, so no UPDATE can narrow or move a source between the check and
+/// the reflection INSERT (KEY SHARE alone does not block a non-key UPDATE).
+static SQL_SELECT_MEMORY_ROW_BY_ID_FOR_SHARE: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| format!("{} FOR SHARE", *SQL_SELECT_MEMORY_ROW_BY_ID));
 
 /// The same-id federation merge's full-row UPDATE (`merge_inbound`). The
 /// node-local metadata keys are overlaid from the row being updated by an
@@ -14374,8 +14379,13 @@ impl PostgresStore {
             .map_err(|e| ReflectError::Validation(e.to_string()))?;
         validate::validate_source(&input.source)
             .map_err(|e| ReflectError::Validation(e.to_string()))?;
-        validate::validate_agent_id(&input.agent_id)
-            .map_err(|e| ReflectError::Validation(e.to_string()))?;
+        // #9185 (L-G) — the SAME author check as the sqlite funnel.
+        let derived_principal = if ctx.bypass_visibility {
+            ctx.as_agent.as_deref()
+        } else {
+            None
+        };
+        crate::storage::validate_reflection_author(&input.agent_id, derived_principal)?;
         if input.source_ids.is_empty() {
             return Err(ReflectError::Validation(
                 "source_ids cannot be empty — a reflection must reflect on at least one source memory".into(),
@@ -14645,6 +14655,38 @@ impl PostgresStore {
         lock_order_4209::lock_memories_in_id_order(&mut tx, &src_locks)
             .await
             .map_err(|e| ReflectError::Database(format!("lock reflect sources: {e}")))?;
+        // #9185 (L-F, I-3) — a DERIVED write (admin write context naming the
+        // principal it read as: the curator reflection pass) re-reads every
+        // source under this tx with a SHARE lock, ascending by id like the
+        // locks above, and refuses on drift through the SAME verifier the
+        // sqlite funnel runs (`crate::storage::verify_derived_sources`).
+        if let (true, Some(principal)) = (ctx.bypass_visibility, ctx.as_agent.as_deref()) {
+            let mut ids: Vec<&str> = input.source_ids.iter().map(String::as_str).collect();
+            ids.sort_unstable();
+            let mut by_id = std::collections::HashMap::with_capacity(ids.len());
+            for id in ids {
+                let row = sqlx::query(&SQL_SELECT_MEMORY_ROW_BY_ID_FOR_SHARE)
+                    .bind(id)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(|e| ReflectError::Database(format!("re-read reflect source: {e}")))?
+                    .ok_or_else(|| ReflectError::SourceNotFound(id.to_string()))?;
+                let fresh = Self::row_to_memory(&row)
+                    .map_err(|e| ReflectError::Database(format!("re-read reflect source: {e}")))?;
+                by_id.insert(id, fresh);
+            }
+            let fresh: Vec<Memory> = input
+                .source_ids
+                .iter()
+                .filter_map(|id| by_id.remove(id.as_str()))
+                .collect();
+            crate::storage::verify_derived_sources(
+                principal,
+                &target_namespace,
+                &input.metadata,
+                &fresh,
+            )?;
+        }
 
         // APPEND-ONLY-SANCTIONED (#1823 G6 / #2948) — COW SUPERSEDE: probe the
         // existing (title, namespace) row's version BEFORE the reflection upsert

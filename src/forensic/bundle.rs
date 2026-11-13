@@ -722,39 +722,127 @@ pub fn canonical_signed_bytes(m: &Manifest) -> Vec<u8> {
     out.into_bytes()
 }
 
-/// Look for an operator keypair on disk and, if found, sign the
-/// manifest's canonical bytes. Returns `(agent_id, base64_signature)`.
-/// Returns `Ok(None)` when no key is available — that path is the
-/// "unsigned bundle" mode, which still verifies for integrity (every
-/// file's SHA-256 is recomputed and compared) but lacks operator
-/// attestation.
+/// Sign the manifest's canonical bytes with the daemon key of the default
+/// key directory under the active security posture (see
+/// [`sign_manifest_with`]). Returns `(agent_id, base64_signature)`, or
+/// `Ok(None)` with a WARN for the "unsigned bundle" mode, which still
+/// verifies for integrity (every file's SHA-256 is recomputed and compared)
+/// but lacks attestation. Under `asi-hard` the unsigned mode is a refusal.
 fn sign_manifest_if_keyed(manifest: &Manifest) -> Result<Option<(String, String)>> {
-    let key_dir = match kp_mod::default_key_dir() {
-        Ok(p) => p,
-        Err(_) => return Ok(None),
+    sign_manifest_with(
+        manifest,
+        kp_mod::default_key_dir(),
+        crate::security_profile::is_asi_hard(),
+    )
+}
+
+/// #9185 M-B: the prefix of every unsigned-bundle WARN.
+const UNSIGNED_BUNDLE_WARN: &str = "forensic: the bundle is UNSIGNED";
+
+/// #9185 M-B: the operator action every unsigned-bundle WARN names.
+const PROVISION_DAEMON_KEY_ACTION: &str =
+    "provision the daemon key with `ai-memory identity generate --agent-id daemon`";
+
+/// #9185 M-B (Y-2, Y-5): WARN that the bundle is unsigned, with the reason
+/// and the operator action, and return the unsigned outcome.
+fn unsigned_bundle(reason: &str) -> Option<(String, String)> {
+    tracing::warn!("{UNSIGNED_BUNDLE_WARN}: {reason}; {PROVISION_DAEMON_KEY_ACTION}");
+    None
+}
+
+/// #8863 / #9185 M-B — [`sign_manifest_if_keyed`] with the key directory and
+/// the posture passed in, so every arm is testable without the environment.
+///
+/// Only the daemon identity ([`kp_mod::DAEMON_KEYPAIR_LABEL`]) ever signs a
+/// forensic manifest; other agents' keys in the directory are never looked
+/// at (before #8863 the first key in sort order signed). The key is resolved
+/// through the curator's own helper,
+/// [`kp_mod::ensure_and_load_label_keypair_in`], so export and curator mint
+/// and load the one daemon key the same way (Y-1, the helper's atomic claim
+/// is Y-4):
+///
+/// - default posture: a missing daemon key is minted (WARN with key id and
+///   path, Y-2); every arm that cannot sign returns the unsigned bundle with
+///   a WARN naming the reason and the operator action (Y-5);
+/// - `asi-hard`: an unusable key directory or an unprovisioned daemon key is
+///   refused BEFORE any mint attempt, so no key file is written (Y-3), and
+///   every other unsigned arm is refused by the helper.
+///
+/// # Errors
+///
+/// Only the `asi-hard` refusals above, with the exact
+/// [`kp_mod::no_signing_identity_refusal`] / [`kp_mod::public_only_refusal`]
+/// text.
+fn sign_manifest_with(
+    manifest: &Manifest,
+    key_dir: Result<PathBuf>,
+    asi_hard: bool,
+) -> Result<Option<(String, String)>> {
+    let label = kp_mod::DAEMON_KEYPAIR_LABEL;
+    let dir = match key_dir {
+        Ok(dir) => dir,
+        Err(e) => {
+            let cause = format!("no usable key directory ({e:#})");
+            if let Some(refusal) = kp_mod::no_signing_identity_refusal(asi_hard, &cause) {
+                anyhow::bail!(refusal);
+            }
+            return Ok(unsigned_bundle(&cause));
+        }
     };
-    if !key_dir.exists() {
-        return Ok(None);
-    }
-    let entries = match kp_mod::list(&key_dir) {
-        Ok(v) => v,
-        Err(_) => return Ok(None),
-    };
-    // Find the first keypair with a private signing key on disk
-    // (operator-managed; deterministic by `agent_id` sort order).
-    let mut candidates: Vec<String> = entries.into_iter().map(|kp| kp.agent_id).collect();
-    candidates.sort();
-    for agent_id in candidates {
-        if let Ok(kp) = kp_mod::load(&agent_id, &key_dir) {
-            if let Some(signing) = kp.private.as_ref() {
-                let bytes = canonical_signed_bytes(manifest);
-                let sig = signing.sign(&bytes);
-                let sig_b64 = STANDARD_NO_PAD.encode(sig.to_bytes());
-                return Ok(Some((agent_id, sig_b64)));
+    if asi_hard {
+        let provisioned = kp_mod::agent_pub_path(&dir, label).exists()
+            || kp_mod::agent_priv_path(&dir, label).exists();
+        if !provisioned {
+            let cause = format!("no daemon signing key is provisioned in {}", dir.display());
+            if let Some(refusal) = kp_mod::no_signing_identity_refusal(true, &cause) {
+                anyhow::bail!(refusal);
             }
         }
     }
-    Ok(None)
+    let (kp, outcome) = kp_mod::ensure_and_load_label_keypair_in(Ok(dir.clone()), label, asi_hard)?;
+    let Some(kp) = kp else {
+        let reason = match outcome {
+            Some(kp_mod::EnsureOutcome::PublicOnlyDegraded { .. }) => format!(
+                "only the public {label} key is on disk in {}",
+                dir.display()
+            ),
+            Some(kp_mod::EnsureOutcome::SkippedDisabled) => {
+                format!("{label} key generation is disabled")
+            }
+            Some(_) => format!("the {label} private key in {} is unreadable", dir.display()),
+            None => format!(
+                "the {label} key in {} could not be minted or loaded",
+                dir.display()
+            ),
+        };
+        if let Some(refusal) = kp_mod::no_signing_identity_refusal(asi_hard, &reason) {
+            anyhow::bail!(refusal);
+        }
+        return Ok(unsigned_bundle(&reason));
+    };
+    if let Some(kp_mod::EnsureOutcome::Generated { pub_path }) = &outcome {
+        tracing::warn!(
+            "forensic: minted the daemon signing key {label}:{} at {} on first use; \
+             back it up, it is now the bundle attestation identity",
+            kp.public_base64(),
+            pub_path.display()
+        );
+    }
+    let Some(signing) = kp.private.as_ref() else {
+        let reason = format!(
+            "only the public {label} key is on disk in {}",
+            dir.display()
+        );
+        if let Some(refusal) = kp_mod::no_signing_identity_refusal(asi_hard, &reason) {
+            anyhow::bail!(refusal);
+        }
+        return Ok(unsigned_bundle(&reason));
+    };
+    let sig = signing.sign(&canonical_signed_bytes(manifest));
+    Ok(Some((
+        label.to_string(),
+        STANDARD_NO_PAD.encode(sig.to_bytes()),
+    )))
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -1773,6 +1861,414 @@ mod tests {
             report.tampered_files.contains(&target_key),
             "verifier must name the tampered file; got {:?}",
             report.tampered_files
+        );
+    }
+
+    /// #8863: a manifest for the signing tests.
+    fn signing_manifest_8863() -> Manifest {
+        Manifest {
+            schema_version: 1,
+            memory_id: "mem-8863".into(),
+            generated_at: "2026-01-01T00:00:00Z".into(),
+            include_reflections: false,
+            include_transcripts: false,
+            files: Vec::new(),
+            signer_agent_id: None,
+            signature: None,
+        }
+    }
+
+    /// #8863: a key that sorts before the daemon key.
+    const FIRST_SORTED_AGENT_8863: &str = "aaa-first-session";
+
+    fn key_dir_with_8863(tmp: &TempDir, agents: &[&str]) -> PathBuf {
+        let dir = tmp.path().join("keys");
+        std::fs::create_dir_all(&dir).expect("key dir");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+                .expect("chmod key dir");
+        }
+        for agent in agents {
+            let kp = kp_mod::generate(agent).expect("generate");
+            kp_mod::save(&kp, &dir).expect("save");
+        }
+        dir
+    }
+
+    #[test]
+    fn manifest_signed_by_daemon_key_not_first_sorted_8863() {
+        let tmp = TempDir::new().expect("tmp");
+        let dir = key_dir_with_8863(
+            &tmp,
+            &[FIRST_SORTED_AGENT_8863, kp_mod::DAEMON_KEYPAIR_LABEL],
+        );
+        let manifest = signing_manifest_8863();
+        let (signer, sig_b64) = sign_manifest_with(&manifest, Ok(dir.clone()), false)
+            .expect("sign")
+            .expect("daemon key present, manifest is signed");
+        assert_eq!(
+            signer,
+            kp_mod::DAEMON_KEYPAIR_LABEL,
+            "#8863: the first-sorted key must never sign a forensic manifest"
+        );
+        let daemon = kp_mod::load(kp_mod::DAEMON_KEYPAIR_LABEL, &dir).expect("load daemon");
+        let sig_bytes = STANDARD_NO_PAD.decode(sig_b64).expect("b64");
+        let sig_arr: [u8; ed25519_dalek::SIGNATURE_LENGTH] =
+            sig_bytes.as_slice().try_into().expect("sig len");
+        daemon
+            .public
+            .verify_strict(
+                &canonical_signed_bytes(&manifest),
+                &ed25519_dalek::Signature::from_bytes(&sig_arr),
+            )
+            .expect("#8863: signature verifies under the daemon public key");
+    }
+
+    /// #8863 / #9185 M-B: verify `sig_b64` over `manifest` under `dir`'s
+    /// daemon public key.
+    fn verifies_under_daemon_9185(dir: &Path, manifest: &Manifest, sig_b64: &str) -> bool {
+        let Ok(daemon) = kp_mod::load(kp_mod::DAEMON_KEYPAIR_LABEL, dir) else {
+            return false;
+        };
+        let Ok(sig_bytes) = STANDARD_NO_PAD.decode(sig_b64) else {
+            return false;
+        };
+        let Ok(sig_arr) = <[u8; ed25519_dalek::SIGNATURE_LENGTH]>::try_from(sig_bytes.as_slice())
+        else {
+            return false;
+        };
+        daemon
+            .public
+            .verify_strict(
+                &canonical_signed_bytes(manifest),
+                &ed25519_dalek::Signature::from_bytes(&sig_arr),
+            )
+            .is_ok()
+    }
+
+    /// #9185 M-B: a writer whose bytes the WARN assertions read back.
+    #[derive(Clone, Default)]
+    struct WarnSink9185(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for WarnSink9185 {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("sink").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for WarnSink9185 {
+        type Writer = WarnSink9185;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl WarnSink9185 {
+        fn subscriber(&self) -> impl tracing::Subscriber + Send + Sync + use<> {
+            tracing_subscriber::fmt()
+                .with_writer(self.clone())
+                .with_max_level(tracing::Level::WARN)
+                .with_ansi(false)
+                .finish()
+        }
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().expect("sink").clone()).unwrap_or_default()
+        }
+    }
+
+    /// #9185 M-B: the WARN every unsigned arm names.
+    const UNSIGNED_WARN_9185: &str = "forensic: the bundle is UNSIGNED";
+    /// #9185 M-B: the operator action every unsigned WARN carries.
+    const OPERATOR_ACTION_9185: &str = "identity generate --agent-id daemon";
+
+    fn daemon_key_files_9185(dir: &Path) -> (bool, bool) {
+        (
+            dir.join("daemon.pub").exists(),
+            dir.join("daemon.priv").exists(),
+        )
+    }
+
+    /// #8863 / #9185 Y-5: another agent's key is never adopted; the default
+    /// posture mints the daemon key and signs with it instead.
+    #[test]
+    fn manifest_never_signed_by_other_agents_key_8863() {
+        let tmp = TempDir::new().expect("tmp");
+        let dir = key_dir_with_8863(&tmp, &[FIRST_SORTED_AGENT_8863]);
+        let manifest = signing_manifest_8863();
+        let signed = sign_manifest_with(&manifest, Ok(dir.clone()), false).expect("sign");
+        let Some((signer, sig_b64)) = signed else {
+            panic!("#9185 Y-5: the default posture mints the daemon key and signs");
+        };
+        assert_eq!(signer, kp_mod::DAEMON_KEYPAIR_LABEL);
+        assert!(verifies_under_daemon_9185(&dir, &manifest, &sig_b64));
+        let other = kp_mod::load(FIRST_SORTED_AGENT_8863, &dir).expect("load other");
+        let sig_bytes = STANDARD_NO_PAD.decode(&sig_b64).expect("b64");
+        let sig_arr: [u8; ed25519_dalek::SIGNATURE_LENGTH] =
+            sig_bytes.as_slice().try_into().expect("sig len");
+        assert!(
+            other
+                .public
+                .verify_strict(
+                    &canonical_signed_bytes(&manifest),
+                    &ed25519_dalek::Signature::from_bytes(&sig_arr),
+                )
+                .is_err(),
+            "#8863: another agent's session key must never be the bundle signer"
+        );
+    }
+
+    /// #9185 Y-2 / Y-5 (old arm :753 / :760): no daemon key on disk under the
+    /// default posture mints one, WARNs the key id and path, and signs.
+    #[test]
+    fn bundle_mints_daemon_key_with_warn_on_first_use_9185() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "forensic::bundle::tests::bundle_mints_daemon_key_with_warn_on_first_use_9185",
+        ) {
+            return;
+        }
+        let tmp = TempDir::new().expect("tmp");
+        let dir = tmp.path().join("fresh-keys");
+        let manifest = signing_manifest_8863();
+        let sink = WarnSink9185::default();
+        let signed = tracing::subscriber::with_default(sink.subscriber(), || {
+            sign_manifest_with(&manifest, Ok(dir.clone()), false)
+        })
+        .expect("sign");
+        let Some((signer, sig_b64)) = signed else {
+            panic!("#9185 Y-5: first use mints the daemon key and signs");
+        };
+        assert_eq!(signer, kp_mod::DAEMON_KEYPAIR_LABEL);
+        assert!(verifies_under_daemon_9185(&dir, &manifest, &sig_b64));
+        let daemon = kp_mod::load(kp_mod::DAEMON_KEYPAIR_LABEL, &dir).expect("minted key");
+        let warn = sink.text();
+        assert!(
+            warn.contains("forensic: minted the daemon signing key"),
+            "#9185 Y-2: the mint WARNs; got {warn:?}"
+        );
+        assert!(
+            warn.contains(&format!("daemon:{}", daemon.public_base64())),
+            "#9185 Y-2: the mint WARN names the key id; got {warn:?}"
+        );
+        assert!(
+            warn.contains(&dir.join("daemon.pub").display().to_string()),
+            "#9185 Y-2: the mint WARN names the key path; got {warn:?}"
+        );
+    }
+
+    /// #9185 Y-5 (old arm :731): an unusable key directory under the default
+    /// posture is an unsigned bundle with a WARN naming the reason.
+    #[test]
+    fn bundle_unsigned_warns_when_key_dir_unusable_9185() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "forensic::bundle::tests::bundle_unsigned_warns_when_key_dir_unusable_9185",
+        ) {
+            return;
+        }
+        let manifest = signing_manifest_8863();
+        let sink = WarnSink9185::default();
+        let signed = tracing::subscriber::with_default(sink.subscriber(), || {
+            sign_manifest_with(&manifest, Err(anyhow!("no home directory 9185")), false)
+        })
+        .expect("default posture degrades");
+        assert_eq!(signed, None);
+        let warn = sink.text();
+        assert!(
+            warn.contains(&format!(
+                "{UNSIGNED_WARN_9185}: no usable key directory (no home directory 9185)"
+            )),
+            "#9185 Y-2: the unsigned WARN names the reason; got {warn:?}"
+        );
+        assert!(warn.contains(OPERATOR_ACTION_9185), "got {warn:?}");
+    }
+
+    /// #9185 Y-5: only the public daemon half on disk is an unsigned bundle
+    /// with a WARN naming the reason and the operator action.
+    #[test]
+    fn bundle_unsigned_warns_when_only_public_half_9185() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "forensic::bundle::tests::bundle_unsigned_warns_when_only_public_half_9185",
+        ) {
+            return;
+        }
+        let tmp = TempDir::new().expect("tmp");
+        let dir = key_dir_with_8863(&tmp, &[kp_mod::DAEMON_KEYPAIR_LABEL]);
+        std::fs::remove_file(dir.join("daemon.priv")).expect("drop priv");
+        let manifest = signing_manifest_8863();
+        let sink = WarnSink9185::default();
+        let signed = tracing::subscriber::with_default(sink.subscriber(), || {
+            sign_manifest_with(&manifest, Ok(dir.clone()), false)
+        })
+        .expect("default posture degrades");
+        assert_eq!(signed, None);
+        let warn = sink.text();
+        assert!(
+            warn.contains(&format!(
+                "{UNSIGNED_WARN_9185}: only the public daemon key is on disk in {}",
+                dir.display()
+            )),
+            "#9185 Y-2: got {warn:?}"
+        );
+        assert!(warn.contains(OPERATOR_ACTION_9185), "got {warn:?}");
+        assert_eq!(daemon_key_files_9185(&dir), (true, false), "no key minted");
+    }
+
+    /// #9185 Y-5: an unreadable daemon private key under the default posture
+    /// is an unsigned bundle with a WARN, never a silent downgrade.
+    #[test]
+    fn bundle_unsigned_warns_when_daemon_key_unreadable_9185() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "forensic::bundle::tests::bundle_unsigned_warns_when_daemon_key_unreadable_9185",
+        ) {
+            return;
+        }
+        let tmp = TempDir::new().expect("tmp");
+        let dir = key_dir_with_8863(&tmp, &[kp_mod::DAEMON_KEYPAIR_LABEL]);
+        std::fs::write(dir.join("daemon.priv"), b"not a key 9185").expect("corrupt priv");
+        let manifest = signing_manifest_8863();
+        let sink = WarnSink9185::default();
+        let signed = tracing::subscriber::with_default(sink.subscriber(), || {
+            sign_manifest_with(&manifest, Ok(dir.clone()), false)
+        })
+        .expect("default posture degrades");
+        assert_eq!(signed, None);
+        let warn = sink.text();
+        assert!(
+            warn.contains(&format!(
+                "{UNSIGNED_WARN_9185}: the daemon private key in {} is unreadable",
+                dir.display()
+            )),
+            "#9185 Y-2: got {warn:?}"
+        );
+        assert!(warn.contains(OPERATOR_ACTION_9185), "got {warn:?}");
+    }
+
+    /// #9185 Y-3: under the hardened profile with no provisioned daemon key
+    /// the export refuses BEFORE any mint, with the exact refusal text, and
+    /// no key file exists afterwards.
+    #[test]
+    fn bundle_refuses_before_mint_under_asi_hard_9185() {
+        let tmp = TempDir::new().expect("tmp");
+        let dir = tmp.path().join("unprovisioned");
+        let err = sign_manifest_with(&signing_manifest_8863(), Ok(dir.clone()), true)
+            .expect_err("#9185 Y-3: asi-hard refuses an unprovisioned daemon key");
+        let cause = format!("no daemon signing key is provisioned in {}", dir.display());
+        assert_eq!(
+            err.to_string(),
+            kp_mod::no_signing_identity_refusal(true, &cause).expect("asi-hard text")
+        );
+        assert_eq!(daemon_key_files_9185(&dir), (false, false), "no key file");
+
+        // A directory holding only another agent's key is unprovisioned too.
+        let other = key_dir_with_8863(&tmp, &[FIRST_SORTED_AGENT_8863]);
+        let err = sign_manifest_with(&signing_manifest_8863(), Ok(other.clone()), true)
+            .expect_err("#9185 Y-3: another agent's key does not provision the daemon");
+        let cause = format!(
+            "no daemon signing key is provisioned in {}",
+            other.display()
+        );
+        assert_eq!(
+            err.to_string(),
+            kp_mod::no_signing_identity_refusal(true, &cause).expect("asi-hard text")
+        );
+        assert_eq!(daemon_key_files_9185(&other), (false, false), "no key file");
+
+        // An unusable key directory refuses with the same text family.
+        let err = sign_manifest_with(
+            &signing_manifest_8863(),
+            Err(anyhow!("no home directory 9185")),
+            true,
+        )
+        .expect_err("#9185 Y-3: asi-hard refuses an unusable key directory");
+        assert_eq!(
+            err.to_string(),
+            kp_mod::no_signing_identity_refusal(
+                true,
+                "no usable key directory (no home directory 9185)"
+            )
+            .expect("asi-hard text")
+        );
+    }
+
+    /// #9185 Y-3: a provisioned daemon key signs under the hardened profile.
+    #[test]
+    fn bundle_signs_with_provisioned_key_under_asi_hard_9185() {
+        let tmp = TempDir::new().expect("tmp");
+        let dir = key_dir_with_8863(&tmp, &[kp_mod::DAEMON_KEYPAIR_LABEL]);
+        let manifest = signing_manifest_8863();
+        let (signer, sig_b64) = sign_manifest_with(&manifest, Ok(dir.clone()), true)
+            .expect("sign")
+            .expect("provisioned key signs");
+        assert_eq!(signer, kp_mod::DAEMON_KEYPAIR_LABEL);
+        assert!(verifies_under_daemon_9185(&dir, &manifest, &sig_b64));
+    }
+
+    /// #9185 Y-4: a concurrent curator resolution and export cannot produce two
+    /// daemon keys: every signature verifies under the one daemon public key
+    /// (key creation is the atomic claim of `keypair::ensure_generate`, #3772).
+    #[test]
+    fn concurrent_curator_and_export_mint_one_daemon_key_9185() {
+        const THREADS_9185: usize = 8;
+        let tmp = TempDir::new().expect("tmp");
+        let dir = tmp.path().join("raced-keys");
+        let manifest = signing_manifest_8863();
+        let barrier = std::sync::Barrier::new(THREADS_9185);
+        let results: Vec<(Option<String>, Option<String>)> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..THREADS_9185)
+                .map(|i| {
+                    let (dir, manifest, barrier) = (&dir, &manifest, &barrier);
+                    s.spawn(move || {
+                        barrier.wait();
+                        if i % 2 == 0 {
+                            let signed = sign_manifest_with(manifest, Ok(dir.clone()), false)
+                                .expect("export signs");
+                            (signed.map(|(_, sig)| sig), None)
+                        } else {
+                            let (kp, _) = kp_mod::ensure_and_load_label_keypair_in(
+                                Ok(dir.clone()),
+                                kp_mod::DAEMON_KEYPAIR_LABEL,
+                                false,
+                            )
+                            .expect("curator resolves");
+                            (None, kp.map(|k| k.public_base64()))
+                        }
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("thread"))
+                .collect()
+        });
+        let daemon = kp_mod::load(kp_mod::DAEMON_KEYPAIR_LABEL, &dir).expect("one daemon key");
+        for (sig, curator_pub) in results {
+            if let Some(pub_b64) = curator_pub {
+                assert_eq!(pub_b64, daemon.public_base64(), "#9185 Y-4: one identity");
+                continue;
+            }
+            let Some(sig) = sig else {
+                panic!("#9185 Y-4: every export signs");
+            };
+            assert!(
+                verifies_under_daemon_9185(&dir, &manifest, &sig),
+                "#9185 Y-4: every signature verifies under the one daemon key"
+            );
+        }
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .expect("read dir")
+            .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+            .filter(|n| n.starts_with("daemon."))
+            .collect();
+        let mut names = names;
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["daemon.priv".to_string(), "daemon.pub".to_string()]
         );
     }
 
