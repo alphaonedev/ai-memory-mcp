@@ -15,18 +15,24 @@ an ``await`` lives here. In particular:
 from __future__ import annotations
 
 import json
+import os
+import ssl
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
 
 import httpx
 from pydantic import BaseModel
 
+from ai_memory._tls import build_owned_context
 from ai_memory._version import __version__ as _SDK_VERSION
 from ai_memory.errors import TransportError, raise_for_status
 from ai_memory.models import CreateMemory
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from ai_memory.attestation import AgentSigningKey
+
+#: Every ``verify=`` form the clients accept (#6249 #6267 #6306).
+VerifyArg = bool | str | os.PathLike[str] | ssl.SSLContext | None
 
 # v1.0.0 #3782 — ``https`` even on loopback. Since #3705/#3709 every daemon
 # listener serves TLS and ``tls_bind_guard`` refuses to bind a plaintext one,
@@ -80,17 +86,24 @@ def build_httpx_kwargs(
     api_key: str | None,
     agent_id: str | None,
     timeout: float,
-    verify: bool | str | None,
+    verify: VerifyArg,
     cert: str | tuple[str, str] | None,
     extra_headers: dict[str, str] | None,
 ) -> dict[str, Any]:
     """Build the ``httpx.Client`` / ``httpx.AsyncClient`` kwargs.
 
-    mTLS is wired through the stock httpx params:
-
-    * ``verify`` — path to the server CA bundle or ``True`` / ``False``. For a
-      zero-config daemon this is ``<key_dir>/tls/local-ca.pem`` (#3782).
-    * ``cert`` — client certificate; accepts a single path or ``(cert, key)``.
+    TLS (#6249 #6267 #6306): ``verify`` and ``cert`` never reach httpx as
+    given. :func:`ai_memory._tls.build_owned_context` builds a frozen context
+    the SDK owns, copying the CA material out of ``verify`` (``None`` /
+    ``True``, a CA bundle path or directory, or a verifying
+    ``ssl.SSLContext`` / ``truststore.SSLContext``) and loading ``cert`` (a
+    path or ``(cert, key)``) into it; that context is httpx's ``verify``.
+    Every stricter verification setting of a caller context is carried onto
+    it or the construction is refused (``VERIFICATION_SETTINGS`` in
+    :mod:`ai_memory._tls`). ``verify=False``, a context with verification or
+    hostname checking off and every unclassifiable form raise
+    :class:`ValueError`. For a
+    zero-config daemon pass ``<key_dir>/tls/local-ca.pem`` (#3782).
 
     ``api_key`` is sent as ``X-API-Key`` (the server also accepts
     ``?api_key=`` query params, but a header keeps it out of access logs).
@@ -112,11 +125,8 @@ def build_httpx_kwargs(
         "base_url": base_url.rstrip("/"),
         "headers": headers,
         "timeout": timeout,
+        "verify": build_owned_context(verify, cert),
     }
-    if verify is not None:
-        kwargs["verify"] = verify
-    if cert is not None:
-        kwargs["cert"] = cert
     return kwargs
 
 

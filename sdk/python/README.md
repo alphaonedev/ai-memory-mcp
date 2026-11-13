@@ -42,9 +42,8 @@ so a client must be handed the CA explicitly:
 So on Linux, with no `AI_MEMORY_KEY_DIR` override, the file is
 `~/.config/ai-memory/keys/tls/local-ca.pem`.
 
-Pin it with the client's `verify=` option (the stock `httpx` parameter — it
-takes the PATH of a CA bundle). Both `AiMemoryClient` and
-`AsyncAiMemoryClient` accept it:
+Pin it with the client's `verify=` option (the PATH of a CA bundle). Both
+`AiMemoryClient` and `AsyncAiMemoryClient` accept it:
 
 ```python
 import os
@@ -61,13 +60,69 @@ with AiMemoryClient(base_url="https://localhost:9077", verify=str(ca)) as client
 
 `verify=` **replaces** the trust store with that bundle; verification stays
 full (chain + hostname — the daemon's leaf carries `localhost`, `127.0.0.1`,
-`::1` and the machine hostname as SANs). Never pass `verify=False`: that
-turns a TLS listener into an unauthenticated one. Two ways to avoid passing
-`verify=` per client:
+`::1` and the machine hostname as SANs).
 
-- install `local-ca.pem` into the OS trust store
-  (`update-ca-certificates`, `security add-trusted-cert`), or point
-  `SSL_CERT_FILE` at it;
+**The SDK never turns TLS verification off** (#6249 #6267 #6306). Whatever you
+pass, the client builds its own private, frozen TLS context, copies the CA
+certificates into it, and checks it again before every handshake. Accepted
+`verify=` forms:
+
+| `verify=` | Trust used |
+|---|---|
+| `None` / `True` (default) | `SSL_CERT_FILE`, else `SSL_CERT_DIR`, else the `certifi` bundle (the same order `httpx` uses) |
+| a `str` or `os.PathLike[str]` naming a PEM file | that bundle (a relative path is resolved when the client is built; at most 16 MiB) |
+| a `str` or `os.PathLike[str]` naming a directory | that OpenSSL `capath` directory |
+| an `ssl.SSLContext` with `CERT_REQUIRED` and `check_hostname` on | a copy of its CA certificates; later changes to your context do not reach the client |
+| a `truststore.SSLContext` with `CERT_REQUIRED` and `check_hostname` on | the platform trust store plus a copy of its CA certificates |
+
+The client's context never verifies more weakly than a context you pass.
+Each stricter setting of your `ssl.SSLContext` is carried onto the client's
+context and read back, or the client refuses to build. Carried: its CA
+certificates, `verify_flags` bits such as `VERIFY_X509_STRICT`, `options`
+bits such as `OP_NO_TLSv1_2`, a higher `minimum_version`, a lower
+`maximum_version`, a higher `security_level`, a cipher list narrowed with
+`set_ciphers()` (the client keeps the ciphers both lists share), and
+`hostname_checks_common_name` turned off. A weaker setting never lowers the
+SDK floor (the `create_default_context()` flags and options, TLS 1.2 minimum).
+
+Refused with `ValueError` when the client is built: `verify=False`, a context
+whose `verify_mode` is `CERT_NONE` or `CERT_OPTIONAL` or whose
+`check_hostname` is off, a context that asks for CRL checking, a context with no
+CA certificate the SDK can copy (certificates in a `capath` directory are
+loaded lazily and cannot be copied: pass the path instead), a context whose
+version range is empty or ends below TLS 1.2, `verify_flags` or `options` bits
+the SDK does not know, a cipher list that shares no cipher with the SDK's, a
+non-default `sni_callback`, TLS 1.3 suites narrowed with `set_ciphersuites()`
+(Python 3.15+; the SDK does not narrow its TLS 1.3 suites, so a narrower
+caller list is refused rather than dropped), a setting whose getter is missing or raises, an
+attribute of your Python's `SSLContext` that the SDK does not classify and that
+differs from a fresh default context, a `truststore.SSLContext` from a
+truststore without the 0.10.5 shape (a re-entrant `_ctx_lock` and its
+verifying socket and SSL-object classes; 0.10.4 and older are refused), a CA
+path that is missing, unreadable, larger than 16 MiB or neither a file nor a
+directory, and any other type.
+
+Never carried, because they cannot change how the server certificate is
+verified or because they only weaken it: `keylog_filename`,
+`post_handshake_auth`, `num_tickets`, the pre-shared-key callbacks, weakening
+`verify_flags` bits such as `VERIFY_X509_PARTIAL_CHAIN`, and the client
+certificate (put it in `cert=`, see mTLS below) together with
+`set_client_sigalgs` (Python 3.15+: the algorithms the client signs with for
+its own certificate, which constrains the client's side of the handshake, not
+how the server is verified). Not readable at all, so not carried (named
+residuals): the ECDH curve (`set_ecdh_curve`), the key-exchange group list
+(`set_groups`, Python 3.15+; `get_groups()` lists the groups OpenSSL
+implements, not the configured list), the signature algorithms the client
+accepts for the server's handshake signature (`set_server_sigalgs`, Python
+3.15+; this does bear on verifying the server, but there is no getter, so the
+client's context keeps OpenSSL's default list, bounded by the carried
+`security_level`) and the NPN protocol list; `httpcore` sets ALPN itself on
+every connect.
+
+Two ways to avoid passing `verify=` per client:
+
+- point `SSL_CERT_FILE` at `local-ca.pem`, or install it into the OS trust
+  store and pass `verify=truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)`;
 - run the daemon with an operator-supplied `--tls-cert`/`--tls-key` pair from
   a CA your hosts already trust, in which case no pinning is needed at all.
 
@@ -162,6 +217,9 @@ AiMemoryClient(
     cert=("/etc/ssl/client/client.pem", "/etc/ssl/client/client.key"),
 )
 ```
+
+`cert=` takes a certificate path or `(certificate, key)` (or
+`(certificate, key, password)`); it is loaded into the SDK's own TLS context.
 
 ### Agent identity (NHI)
 

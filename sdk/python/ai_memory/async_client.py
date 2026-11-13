@@ -9,8 +9,8 @@ are otherwise identical.
 
 from __future__ import annotations
 
-from types import TracebackType
 from collections.abc import AsyncIterator
+from types import TracebackType
 from typing import TYPE_CHECKING, Any
 
 import httpx
@@ -18,11 +18,12 @@ import httpx
 from ai_memory._common import (
     DEFAULT_BASE_URL,
     DEFAULT_EXPORT_PAGE_ROWS,
-    export_ceiling_from_error,
     DEFAULT_TIMEOUT,
+    VerifyArg,
     build_create_body,
     build_httpx_kwargs,
     encode_path_segment,
+    export_ceiling_from_error,
     handle_response,
     if_match_headers,
     prep_json,
@@ -62,7 +63,7 @@ class AsyncAiMemoryClient:
         api_key: str | None = None,
         agent_id: str | None = None,
         timeout: float = DEFAULT_TIMEOUT,
-        verify: bool | str | None = None,
+        verify: VerifyArg = None,
         cert: str | tuple[str, str] | None = None,
         headers: dict[str, str] | None = None,
     ) -> None:
