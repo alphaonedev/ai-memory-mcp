@@ -523,44 +523,84 @@ mod tests {
         assert_ne!(a, c, "scratch names must be unique per run");
     }
 
-    /// Waits until `relation` has at least one PENDING (ungranted) lock
-    /// request, i.e. some session is provably blocked on it.
+    /// Upper bound on the whole provocation. PostgreSQL resolves a cycle after
+    /// `deadlock_timeout` (1 s by default); this is only the fail-closed
+    /// ceiling that turns a wedged run into a named failure, never a pacing
+    /// mechanism.
+    const DEADLOCK_RESOLUTION_CEILING: Duration = Duration::from_secs(120);
+
+    /// Parties at the rendezvous that closes the lock cycle: the two sessions.
+    const CYCLE_PARTIES: usize = 2;
+
+    /// One session of the cycle, run under the shared [`TxRetry`] funnel.
     ///
-    /// This is the ORDERING primitive, not an assertion: the two sessions
-    /// must enter the cycle in a known order for the victim to be known.
-    /// It polls a catalog view rather than sleeping a guessed interval, so a
-    /// slow host makes the test slower, never flaky.
-    #[cfg(test)]
-    async fn await_pending_lock(pool: &sqlx::PgPool, relation: &str) -> bool {
-        for _ in 0..600_u32 {
-            let waiting: i64 = sqlx::query_scalar(
-                "SELECT count(*) FROM pg_locks l \
-                   JOIN pg_class c ON c.oid = l.relation \
-                  WHERE c.relname = $1 AND NOT l.granted",
-            )
-            .bind(relation)
-            .fetch_one(pool)
-            .await
-            .unwrap_or(0);
-            if waiting > 0 {
-                return true;
+    /// The transaction takes `first`, then (on its FIRST attempt only) waits
+    /// at `rendezvous` until the peer also holds ITS first lock, then
+    /// requests `second`. Retried attempts skip the rendezvous: the peer has
+    /// already left the cycle, and waiting for it again would hang.
+    ///
+    /// Returns `(attempts, attempts_failed)` for this session.
+    async fn funnel_session(
+        pool: sqlx::PgPool,
+        first: String,
+        second: String,
+        rendezvous: std::sync::Arc<tokio::sync::Barrier>,
+    ) -> (u32, u32) {
+        let mut retry = TxRetry::new("test: provoked 40P01");
+        let mut attempts = 0_u32;
+        let outcome: StoreResult<()> = loop {
+            attempts += 1;
+            let first_attempt = attempts == 1;
+            let attempt: StoreResult<()> = async {
+                let mut tx = pool
+                    .begin()
+                    .await
+                    .map_err(|e| super::super::to_store_err("t3520 begin", e))?;
+                sqlx::query(&format!("LOCK TABLE {first} IN ACCESS EXCLUSIVE MODE"))
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| super::super::to_store_err("t3520 lock first", e))?;
+                if first_attempt {
+                    // Both sessions now HOLD their first lock. The async
+                    // barrier is await-safe (CONCURRENCY-20) and releases only
+                    // when both arrive, so the cycle below is guaranteed.
+                    rendezvous.wait().await;
+                }
+                sqlx::query(&format!("LOCK TABLE {second} IN ACCESS EXCLUSIVE MODE"))
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| super::super::to_store_err("t3520 lock second", e))?;
+                tx.commit()
+                    .await
+                    .map_err(|e| super::super::to_store_err("t3520 commit", e))?;
+                Ok(())
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        false
+            .await;
+            match attempt {
+                Ok(()) => break Ok(()),
+                Err(e) => {
+                    if let Err(terminal) = retry.consider(e).await {
+                        break Err(terminal);
+                    }
+                }
+            }
+        };
+        outcome.expect("the funnel must COMMIT, not surface the deadlock");
+        (attempts, retry.attempts_failed())
     }
 
     /// TWO sessions take TWO relation locks in opposite order. PostgreSQL
     /// detects the cycle and aborts one side with `40P01`; the funnel must
     /// recognise that abort STRUCTURALLY, retry the transaction, and commit.
     ///
-    /// Determinism comes from the ordering, not from timing: the funnel
-    /// session begins WAITING first (its deadlock check therefore fires
-    /// first, and PostgreSQL aborts the process that detects the cycle), and
-    /// the peer only requests its second lock once `pg_locks` shows the
-    /// funnel is genuinely blocked. The outer bounded repeat exists so that a
-    /// host which nonetheless picks the peer as the victim re-runs the
-    /// provocation instead of reporting a false green.
+    /// The cycle is deterministic by construction, not by schedule: each
+    /// session takes its first lock, both meet at a barrier, and only then
+    /// does each request the lock the other holds. Whichever side the server
+    /// picks as the victim (that choice is the server's, and is allowed to
+    /// vary), BOTH sessions run under the funnel, so one retry is guaranteed
+    /// and no host load can make the test skip the deadlock. There is no
+    /// bounded round loop and no sleep. The "proved nothing" guard stays: it
+    /// fails closed if no session observed a retry.
     #[tokio::test]
     async fn a_live_40p01_deadlock_is_retried_by_the_funnel_and_commits_3520() {
         let Ok(url) = std::env::var("AI_MEMORY_TEST_POSTGRES_URL") else {
@@ -590,92 +630,25 @@ mod tests {
         .await
         .expect("create scratch relations");
 
-        let mut observed_retry = false;
-        let mut total_attempts = 0_u32;
-        // Bounded: each round provokes one cycle. Two rounds is already
-        // generous given the ordering guarantee below.
-        for _round in 0..4_u32 {
-            let before = retries_total();
-            let peer_pool = pool.clone();
-            let (peer_r1, peer_r2) = (r1.clone(), r2.clone());
-            let poll_pool = pool.clone();
-            let poll_r2 = r2.clone();
-
-            // PEER: holds r2, then queues for r1 — but only once the funnel
-            // is provably waiting on r2, so the funnel's deadlock check is
-            // the one that fires first and the funnel is the victim.
-            //
-            // TWO hand-offs, both catalog-observed rather than timed: the
-            // funnel may not start until the peer HOLDS r2 (otherwise there
-            // is no cycle at all), and the peer may not request r1 until the
-            // funnel is BLOCKED on r2 (otherwise the peer waits first and
-            // PostgreSQL aborts the peer instead).
-            let (holds_r2_tx, holds_r2_rx) = tokio::sync::oneshot::channel::<()>();
-            let peer = tokio::spawn(async move {
-                let mut tx = peer_pool.begin().await.expect("peer begin");
-                sqlx::query(&format!("LOCK TABLE {peer_r2} IN ACCESS EXCLUSIVE MODE"))
-                    .execute(&mut *tx)
-                    .await
-                    .expect("peer locks r2");
-                let _ = holds_r2_tx.send(());
-                let _blocked = await_pending_lock(&poll_pool, &poll_r2).await;
-                let _ = sqlx::query(&format!("LOCK TABLE {peer_r1} IN ACCESS EXCLUSIVE MODE"))
-                    .execute(&mut *tx)
-                    .await;
-                let _ = tx.commit().await;
-            });
-            if holds_r2_rx.await.is_err() {
-                let _ = peer.await;
-                continue;
-            }
-
-            // FUNNEL: the shared driver, wrapping a transaction that takes
-            // r1 then r2 — the opposite order.
-            let mut retry = TxRetry::new("test: provoked 40P01");
-            let mut attempts = 0_u32;
-            let outcome: StoreResult<()> = loop {
-                attempts += 1;
-                let attempt: StoreResult<()> = async {
-                    let mut tx = pool
-                        .begin()
-                        .await
-                        .map_err(|e| super::super::to_store_err("t3520 begin", e))?;
-                    sqlx::query(&format!("LOCK TABLE {r1} IN ACCESS EXCLUSIVE MODE"))
-                        .execute(&mut *tx)
-                        .await
-                        .map_err(|e| super::super::to_store_err("t3520 lock r1", e))?;
-                    sqlx::query(&format!("LOCK TABLE {r2} IN ACCESS EXCLUSIVE MODE"))
-                        .execute(&mut *tx)
-                        .await
-                        .map_err(|e| super::super::to_store_err("t3520 lock r2", e))?;
-                    tx.commit()
-                        .await
-                        .map_err(|e| super::super::to_store_err("t3520 commit", e))?;
-                    Ok(())
-                }
-                .await;
-                match attempt {
-                    Ok(()) => break Ok(()),
-                    Err(e) => {
-                        if let Err(terminal) = retry.consider(e).await {
-                            break Err(terminal);
-                        }
-                    }
-                }
-            };
-            let _ = peer.await;
-
-            outcome.expect("the funnel must COMMIT, not surface the deadlock");
-            total_attempts = attempts;
-            if retries_total() > before {
-                observed_retry = true;
-                assert!(
-                    attempts >= 2,
-                    "a counted retry must correspond to a re-run transaction body"
-                );
-                break;
-            }
-        }
+        let before = retries_total();
+        let rendezvous = std::sync::Arc::new(tokio::sync::Barrier::new(CYCLE_PARTIES));
+        // Opposite lock order on the two sessions: r1 then r2, and r2 then r1.
+        let side_a = tokio::spawn(funnel_session(
+            pool.clone(),
+            r1.clone(),
+            r2.clone(),
+            rendezvous.clone(),
+        ));
+        let side_b = tokio::spawn(funnel_session(
+            pool.clone(),
+            r2.clone(),
+            r1.clone(),
+            rendezvous,
+        ));
+        let joined = tokio::time::timeout(DEADLOCK_RESOLUTION_CEILING, async {
+            (side_a.await, side_b.await)
+        })
+        .await;
 
         let _ = sqlx::raw_sql(&format!(
             "DROP TABLE IF EXISTS {r1}; DROP TABLE IF EXISTS {r2};"
@@ -683,10 +656,20 @@ mod tests {
         .execute(&pool)
         .await;
 
+        let (a, b) = joined.expect("the deadlock was not resolved within the ceiling");
+        let (attempts_a, failed_a) = a.expect("session A panicked");
+        let (attempts_b, failed_b) = b.expect("session B panicked");
+        let observed_retries = failed_a + failed_b;
+
         assert!(
-            observed_retry,
-            "no 40P01 was provoked in the bounded rounds (last attempt count {total_attempts}); \
+            observed_retries > 0 && retries_total() > before,
+            "no 40P01 was provoked (attempts {attempts_a} and {attempts_b}); \
              the regression test proved nothing"
+        );
+        assert!(
+            attempts_a + attempts_b >= 3,
+            "a counted retry must correspond to a re-run transaction body \
+             (attempts {attempts_a} and {attempts_b})"
         );
     }
 }
