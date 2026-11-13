@@ -491,6 +491,8 @@ def hostile_rows():
     pre("fence_open", "```text\nhidden\n\n", "a fence opened here is still open at the ledger marker", "```text")
     pre("tilde_fence_open", "~~~~\nhidden\n\n", "a fence opened here is still open at the ledger marker", "~~~~")
     pre("longer_closer_needed", "````\n```\n\n", "a fence opened here is still open at the ledger marker", "````")
+    pre("other_char_closer", "```txt\n~~~\n\n", "a fence opened here is still open at the ledger marker", "```txt")
+    pre("closer_with_info", "~~~~~\n~~~~~ x\n\n", "a fence opened here is still open at the ledger marker", "~~~~~")
     pre("list_item_fence", "- ```\n  hidden\n\n", "a fence-like line inside a container or indented is not supported", "- ```")
     pre("indented_fence", "   ```\n\n", "a fence-like line inside a container or indented is not supported", "   ```")
     pre("indented_code_fence", "    ```\n\n", "a fence-like line inside a container or indented is not supported", "    ```")
