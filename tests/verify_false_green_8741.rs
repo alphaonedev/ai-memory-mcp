@@ -479,7 +479,39 @@ fn seq_mark(trail: &Path) -> PathBuf {
     ai_memory::audit::seq_mark_path(trail)
 }
 
+/// Drop the BSD/macOS user append-only flag (`UF_APPEND`) the audit writer
+/// sets on the trail and its sequence mark (`audit::mark_append_only`). On
+/// macOS that flag makes `open(O_TRUNC)` and `unlink` fail with
+/// `EPERM` ("Operation not permitted") for the file's own owner, so the
+/// tamper step would die before tampering (#9179 CI, macos-fed). The owner
+/// may clear a user flag, so this is the portable form of "the test owns the
+/// file": Linux and other unix targets carry no such flag here and the call is
+/// a no-op there. A missing file is fine (the tamper cases remove files).
+fn clear_user_append_flag(path: &Path) {
+    #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "openbsd"))]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("no NUL in path");
+        // SAFETY: `c_path` is a NUL-terminated string owned for the call;
+        // `chflags(path, 0)` clears the user flags of a file the test owns.
+        let rc = unsafe { libc::chflags(c_path.as_ptr(), 0) };
+        if rc != 0 {
+            let err = std::io::Error::last_os_error();
+            assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::NotFound,
+                "clear append flag on {}: {err}",
+                path.display()
+            );
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "freebsd", target_os = "openbsd")))]
+    let _ = path;
+}
+
 fn tamper_trail(trail: &Path, tamper: TrailTamper) {
+    clear_user_append_flag(trail);
+    clear_user_append_flag(&seq_mark(trail));
     let text = std::fs::read_to_string(trail).expect("read trail");
     let lines: Vec<&str> = text.lines().collect();
     assert!(
