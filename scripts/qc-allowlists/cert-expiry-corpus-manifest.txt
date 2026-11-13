@@ -136,6 +136,7 @@ cell_v2_non_ancestor_bind_different_tree_red GREEN
 cell_w_unparseable_status_red GREEN
 cell_x1_decoy_status_line_red GREEN
 cell_x2_decoy_binds_line_red GREEN
+cell_x3_duplicate_status_text_pinned_red GREEN
 cell_y_cert_doc_deleted_red GREEN
 cell_z2_reformat_plus_wire_change_red GREEN
 cell_z_banner_reformat_green GREEN

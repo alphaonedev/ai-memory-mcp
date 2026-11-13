@@ -1210,6 +1210,23 @@ class Cells(CorpusBase):
         self.settle()
 
     @expect(GREEN)
+    def cell_x3_duplicate_status_text_pinned_red(self):
+        # #6124 F7: two strict STATUS lines keep the #3556 duplicate text verbatim; a lone
+        # decoy with no strict line reads UNPARSEABLE (pinned in test_cert_amendment_ledger_6124).
+        s = self.scene()
+        s.fx.write(MOD_RS, "// mutate\n", append=True)
+        s.fx.banner("LIVE", s.genesis)
+        s.fx.prepend(CERT_DOC, "> ## STATUS — **VOID as of 2026-01-02**")
+        decoy = s.fx.commit([MOD_RS, CERT_DOC], "violate: second strict STATUS line + wire change")
+        self.t.expect_red("x3", "a second strict STATUS line", s.repo, s.base, decoy, [
+            (f"{CERT_DOC} at HEAD has two or more STATUS banner lines; the gate reads exactly "
+             "one and will not guess which is the banner (a decoy line above the real banner "
+             "is how a stale LIVE could be read as VOID). Remove the duplicate. Fail-closed, #3556.",
+             "did not quote the #3556 duplicate text"),
+            ("(parsed: DUPLICATE ", "did not parse the banner as DUPLICATE")])
+        self.settle()
+
+    @expect(GREEN)
     def cell_x2_decoy_binds_line_red(self):
         s = self.scene()
         wire = s.edit(MOD_RS, "// mutate\n", "wire change", append=True)
