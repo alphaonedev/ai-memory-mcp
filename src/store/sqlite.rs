@@ -194,6 +194,22 @@ impl SqliteStore {
         &self.path
     }
 
+    /// #9057 — unfiltered by-id read, the twin of
+    /// [`crate::store::postgres::PostgresStore::get_any`]: it returns a
+    /// tombstoned or quarantined row instead of folding it into `None`.
+    /// Reached only through the concrete adapter (`as_any().downcast_ref`),
+    /// never the `MemoryStore` trait, so it is never a caller-facing
+    /// content read; the federated consolidate finalize uses it to read
+    /// back the sources it has just tombstoned.
+    ///
+    /// # Errors
+    ///
+    /// The boxed storage error on SQL failure.
+    pub async fn get_any(&self, id: &str) -> StoreResult<Option<crate::models::Memory>> {
+        let conn = self.state.lock().await;
+        crate::storage::get_any(&conn, id).map_err(box_err)
+    }
+
     /// #1955 R45 — SAL write-funnel gate. Returns
     /// [`StoreError::Stopped`] when the record plane is stopped so the
     /// SAL surface refuses with the typed error (503) rather than the
@@ -590,6 +606,13 @@ impl MemoryStore for SqliteStore {
             | Capabilities::DURABLE
             | Capabilities::STRONG_CONSISTENCY
             | Capabilities::ATOMIC_MULTI_WRITE
+    }
+
+    // #9057 — expose the concrete adapter so the consolidate finalize can
+    // reach the unfiltered `SqliteStore::get_any` (the PostgresStore
+    // precedent, #2587).
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 
     /// v0.7.0.1 S75 — read `MAX(version)` from the live SQLite

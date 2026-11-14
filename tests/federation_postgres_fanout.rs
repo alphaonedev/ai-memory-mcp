@@ -1040,7 +1040,7 @@ async fn consolidate_fanout_postgres_quorum_met_2860() {
 /// postgres branch that returns it): when a federated postgres consolidate
 /// CANNOT reach quorum (peer down / partition), the handler must not shape
 /// the local-only write as a success. Post-#2861/#2860 it returns the
-/// id-bearing `202` `under_replicated_consolidate_response` so the caller
+/// id-bearing `202` (`consolidate_not_delivered`, #9057) so the caller
 /// can DISCOVER and reconcile the local row, rather than a success-shaped
 /// 2xx with nothing to act on.
 ///

@@ -8296,6 +8296,403 @@ impl PostgresStore {
         })
     }
 
+    /// #9023 — the PostgreSQL forget, returning the EXACT ids its
+    /// `DELETE .. RETURNING id` removed so the HTTP forget can fan the
+    /// erasure out as per-id tombstones (peers apply exactly what the
+    /// origin applied). The `MemoryStore::forget` impl delegates here and
+    /// returns the count. Reached through the concrete `PostgresStore`
+    /// (`as_any().downcast_ref`, #2587 precedent), not a new trait method.
+    ///
+    /// # Errors
+    ///
+    /// The same errors as `MemoryStore::forget`.
+    pub async fn forget_returning_ids(
+        &self,
+        _ctx: &CallerContext,
+        namespace: Option<&str>,
+        pattern: Option<&str>,
+        tier: Option<&Tier>,
+        archive: bool,
+    ) -> StoreResult<Vec<String>> {
+        self.gate_record_stop().await?;
+        if namespace.is_none() && pattern.is_none() && tier.is_none() {
+            return Err(StoreError::InvalidInput {
+                detail: crate::errors::msg::FORGET_FILTER_REQUIRED.to_string(),
+            });
+        }
+        // #3171 — REFUSE a pattern the sanitiser would silently WIDEN, exactly
+        // as the sqlite twin's `forget_fts_query` does. Defence in depth behind
+        // the HTTP boundary check: this trait method is also reachable from the
+        // CLI and curator on a `--store-url postgres://` daemon, and a bulk
+        // DELETE that is wider than the caller's pattern is unrecoverable data
+        // loss. Backend-agnostic tokeniser, so the refusal set cannot diverge.
+        if let Some(pat) = pattern
+            && let Err(reason) = crate::storage::strict_forget_tokens(pat)
+        {
+            return Err(StoreError::InvalidInput { detail: reason });
+        }
+        // #2312 — token-AND pattern semantics, matching the sqlite twin.
+        // sqlite routes the DESTRUCTIVE forget pattern through
+        // `forget_fts_query` -> `sanitize_fts_query(pat, false)` (#1601):
+        // every whitespace-separated token must match as a WHOLE token
+        // (FTS5 implicit AND) — the conservative posture the memory_forget
+        // wire contract promises ("every whitespace-separated token must
+        // match"). The previous postgres arm was `title ILIKE '%pat%' OR
+        // content ILIKE '%pat%'` — a contiguous SUBSTRING match that
+        // over-deleted (pattern "cat" reaped rows containing "education")
+        // and under-deleted (non-adjacent multi-token patterns), so the
+        // same destructive wire call deleted DIFFERENT row sets per
+        // backend. The predicate is now `tsv @@ plainto_tsquery('english',
+        // $pattern)` over the v57 stored tsvector (title + content):
+        // plainto_tsquery AND-joins every lexeme and treats its input as
+        // plain text (no operator surface — injection-safe, so the #2032
+        // LM1 escaping is no longer needed; a bare "%" or an
+        // all-punctuation pattern normalizes to the EMPTY tsquery, which
+        // matches NOTHING — the fail-safe twin of sqlite's `"_empty_"`
+        // sentinel). Documented residual: the `english` config stems and
+        // drops stopwords where FTS5 unicode61 does not, so token
+        // boundaries differ marginally across backends; both remain
+        // whole-token AND matches.
+        let tier_str = tier.map(|t| t.as_str().to_string());
+        let now = chrono::Utc::now().to_rfc3339();
+
+        // #1776 — archive + delete MUST be one transaction (mirror `run_gc` /
+        // the #1026 fix). Pre-fix the archive INSERT and the DELETE each ran on
+        // a SEPARATE pooled connection in autocommit, so a crash,
+        // statement_timeout, pool-checkout failure, OR an ordinary concurrent
+        // write landing between them could leave the archived-set and
+        // deleted-set diverging → a row DELETEd that the archive-SELECT never
+        // captured = irrecoverable loss. One tx alone does not (READ COMMITTED
+        // re-evaluates each statement's predicate); #4329 locks the victim set
+        // up front and binds the archive copy and the DELETE to those ids.
+        // v1.0.0 #3520 — routed through the shared bounded-retry funnel. This
+        // funnel touches the same relation set as `run_gc` / `size_gc`
+        // (archive-copy + link snapshot + cascade DELETE), so a concurrent
+        // bootstrap's relation-level ShareLock can make PostgreSQL pick it as
+        // the deadlock victim. `now` / `tier_str` are pinned OUTSIDE the loop so
+        // every attempt archives under the SAME stamp and the same filter; the
+        // block below has no effect outside the transaction.
+        let mut retry = tx_retry::TxRetry::new("forget archive+delete tx");
+        let deleted_ids: Vec<String> = loop {
+            let attempt: StoreResult<Vec<String>> = async {
+                let mut tx = self
+                    .pool
+                    .begin()
+                    .await
+                    .map_err(|e| to_store_err("forget begin tx", e))?;
+                // #4329 — lock the whole victim set up front, ascending by
+                // `id COLLATE "C"` (CONCURRENCY-04), and run every later
+                // statement over exactly that locked set.
+                let locked = lock_order_4329::lock_forget_set(
+                    &mut tx,
+                    namespace,
+                    tier_str.as_deref(),
+                    pattern,
+                )
+                .await?;
+
+                if archive {
+                    // Insert matching rows into archived_memories before deletion.
+                    sqlx::query(&format!(
+                        "INSERT INTO archived_memories (
+                            id, tier, namespace, title, content, tags, priority, confidence,
+                            source, access_count, created_at, updated_at, last_accessed_at,
+                            expires_at, archived_at, archive_reason, metadata,
+                            embedding, embedding_dim, embedding_space, original_tier, original_expires_at,
+                            -- #1025 (CRITICAL, 2026-05-21) — full v0.7.0 column carry.
+                            reflection_depth, atomised_into, atom_of, memory_kind,
+                            entity_id, persona_version, citations, source_uri, source_span,
+                            confidence_source, confidence_signals, confidence_decayed_at,
+                            -- #2196 - carry lifecycle_state so a non-open archived state
+                            -- survives the archive->restore round-trip (restore no longer
+                            -- COALESCEs a NULL to 'open'); mirrors the sqlite archive.
+                            mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until, cid, cid_genesis
+                        )
+                        SELECT id, tier, namespace, title, content, tags, priority, confidence,
+                               source, access_count, created_at, updated_at, last_accessed_at,
+                               expires_at, $4::timestamptz, 'forget', metadata,
+                               embedding, embedding_dim, embedding_space, tier, expires_at,
+                               reflection_depth, atomised_into, atom_of, memory_kind,
+                               entity_id, persona_version, citations, source_uri, source_span,
+                               confidence_source, confidence_signals, confidence_decayed_at,
+                               mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until, cid, cid_genesis
+                        FROM memories
+                        WHERE ($1::text IS NULL OR namespace = $1)
+                          AND ($2::text IS NULL OR tier = $2)
+                          AND ($3::text IS NULL
+                               OR tsv @@ plainto_tsquery('english', $3))
+                          AND id = ANY($5::text[])
+                        -- #2195 - LAST-WINS re-archive parity with sqlite INSERT OR REPLACE.
+                        {SQL_ARCHIVE_ON_CONFLICT_LAST_WINS}"
+                    ))
+                    .bind(namespace)
+                    .bind(tier_str.as_deref())
+                    .bind(pattern)
+                    .bind(parse_rfc3339_required(&now)?)
+                    .bind(&locked)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| to_store_err("forget archive copy", e))?;
+                }
+
+                // #1771 (5-agent vote 4d3ea1c5) — snapshot the to-be-deleted
+                // memories' `memory_links` into `archived_memory_links` BEFORE the
+                // cascade `DELETE FROM memories` reaps them (FK `ON DELETE
+                // CASCADE`). Bind the snapshot to the locked victim ids
+                // (#4329) so the snapshot and the delete pin to the same row set
+                // inside this one tx; idempotent via the PK `ON CONFLICT`. Postgres
+                // twin of the SQLite `archive_links_for_memory` snapshot.
+                //
+                // #2313 — runs ONLY when `archive`, matching the sqlite contract
+                // ("Runs only when `archive` so a hard (non-recoverable) forget
+                // keeps its documented edge-loss", src/storage/mod.rs). Pre-fix
+                // this INSERT ran unconditionally, so an erasure-intent hard
+                // forget (archive = false) permanently retained the victims' edge
+                // topology (relation, observed_by, signature, valid intervals) as
+                // orphan rows no code path ever reaps — with no archived_memories
+                // row, restore could never consume them and archive_purge never
+                // touches archived_memory_links.
+                if archive {
+                    sqlx::query(
+                        "INSERT INTO archived_memory_links (
+                             source_id, target_id, relation, created_at, valid_from,
+                             valid_until, observed_by, signature, attest_level, archived_at,
+                             source_cid, target_cid
+                         )
+                         SELECT ml.source_id, ml.target_id, ml.relation, ml.created_at,
+                                ml.valid_from, ml.valid_until, ml.observed_by, ml.signature,
+                                ml.attest_level, now(), ml.source_cid, ml.target_cid
+                         FROM memory_links ml
+                         WHERE ml.source_id = ANY($1::text[])
+                            OR ml.target_id = ANY($1::text[])
+                         ON CONFLICT (source_id, target_id, relation) DO NOTHING",
+                    )
+                    .bind(&locked)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| to_store_err("forget snapshot links", e))?;
+                }
+
+                // v0.9.0 G8 (#1825) T7 — erasure invariant (postgres parity/defence):
+                // NULL the `cid_genesis` pre-image for every row this forget will
+                // reap, BEFORE the delete, mirroring the sqlite `forget_scrub_cid_genesis`.
+                // The DELETE below hard-deletes the row so this scrub is belt-and-braces
+                // (a rollback discards both); it keeps the erase-the-pre-image contract
+                // explicit and correct should this path ever become a soft-delete. The
+                // predicate matches the DELETE's victim set EXACTLY.
+                sqlx::query(
+                    "UPDATE memories SET cid_genesis = NULL
+                     WHERE cid_genesis IS NOT NULL
+                       AND ($1::text IS NULL OR namespace = $1)
+                       AND ($2::text IS NULL OR tier = $2)
+                       AND ($3::text IS NULL
+                            OR tsv @@ plainto_tsquery('english', $3))
+                       AND id = ANY($4::text[])",
+                )
+                .bind(namespace)
+                .bind(tier_str.as_deref())
+                .bind(pattern)
+                .bind(&locked)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("forget scrub cid_genesis", e))?;
+
+                // #1956 [R56] — CRYPTO-ERASE the per-record envelope key for every
+                // crypto-erasable row (0x03 per-record or 0x05 scope, the SSOT
+                // `crate::encryption::CRYPTO_ERASABLE_ENVELOPE_VERSIONS`) this forget will reap, BEFORE the delete
+                // (postgres parity with the sqlite `crypto_erase_record_envelope`).
+                // Overwriting the envelope with the destroy marker destroys the
+                // embedded wrapped DEK so the ciphertext is cryptographically
+                // unrecoverable even by a holder of the master KEK; the marker
+                // propagates to replicas / WAL as an UPDATE ahead of the tombstoning
+                // delete. `get_byte(...,0) = ANY($6)` selects the crypto-erasable
+                // versions (0x03 per-record and 0x05 scope, the #8278 R16 SSOT) —
+                // legacy 0x02 per-agent rows have no per-record key to destroy (the
+                // honest limit) and are left for row-delete + tombstone only. The
+                // predicate matches the DELETE's victim set EXACTLY. RETURNING id so
+                // the erasure-kind of each victim is known for the attestation below.
+                let erased_ids: Vec<(String,)> = sqlx::query_as(
+                    "UPDATE memories SET encrypted_envelope = $4
+                     WHERE encrypted_envelope IS NOT NULL
+                       AND get_byte(encrypted_envelope, 0) = ANY($6::int[])
+                       AND ($1::text IS NULL OR namespace = $1)
+                       AND ($2::text IS NULL OR tier = $2)
+                       AND ($3::text IS NULL
+                            OR tsv @@ plainto_tsquery('english', $3))
+                       AND id = ANY($5::text[])
+                     RETURNING id",
+                )
+                .bind(namespace)
+                .bind(tier_str.as_deref())
+                .bind(pattern)
+                .bind(crate::encryption::crypto_erase_marker())
+                .bind(&locked)
+                .bind(crate::encryption::crypto_erasable_envelope_version_codes())
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("forget crypto-erase envelope", e))?;
+                let erased_set: std::collections::HashSet<String> =
+                    erased_ids.into_iter().map(|(id,)| id).collect();
+
+                // #1783 — RETURNING id so the deleted set is known for AGE
+                // unprojection in THIS tx (the projection commits atomically with
+                // the cascade delete; ghost edges never appear).
+                // W2.3 — RETURNING namespace + agent_id too so the FORGET tombstones
+                // can be recorded in THIS tx (the rows are gone after the DELETE).
+                let deleted: Vec<(String, String, Option<String>)> = sqlx::query_as(
+                    "DELETE FROM memories
+                     WHERE ($1::text IS NULL OR namespace = $1)
+                       AND ($2::text IS NULL OR tier = $2)
+                       AND ($3::text IS NULL
+                            OR tsv @@ plainto_tsquery('english', $3))
+                       AND id = ANY($4::text[])
+                     RETURNING id, namespace, metadata->>'agent_id'",
+                )
+                .bind(namespace)
+                .bind(tier_str.as_deref())
+                .bind(pattern)
+                .bind(&locked)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("forget delete", e))?;
+
+                if matches!(self.kg_backend, KgBackend::Age) {
+                    for (id, _, _) in &deleted {
+                        unproject_memory_from_age(&mut tx, id).await?;
+                    }
+                }
+
+                // v0.8.1 W2 (#1821 / gap G30) — postgres parity for the sqlite
+                // `purge_and_tombstone_forget`: purge the non-cascaded derived-store
+                // leaks (`federation_push_dlq` cleartext, `transcript_line_dedup`
+                // hash-oracle) AND record a FORGET tombstone per deleted id, all in
+                // THIS tx. 5-agent vote 4d3ea1c5.
+                // #7241 - audit anchors are emitted only after the COMMIT.
+                let mut anchor = crate::governance::audit::PendingAuditAnchor::none();
+                if !deleted.is_empty() {
+                    let ids: Vec<String> = deleted.iter().map(|(id, _, _)| id.clone()).collect();
+                    // #3286 — route through the shared SSOT so this forget reap and the
+                    // delete / evict primitives cannot drift on which remanence tables
+                    // a crypto-erase purges.
+                    pg_purge_dlq_dedup_in_tx(&mut tx, &ids)
+                        .await
+                        .map_err(|e| to_store_err("forget purge dlq/dedup remanence", e))?;
+                    // W2.3 SIGNED tombstones — bulk insert via UNNEST. Identity + time
+                    // + owner only (NO content). Each signs the canonical
+                    // {memory_id, namespace, forgotten_at} bytes with the daemon audit
+                    // key (unsigned when absent) — parity with the sqlite path.
+                    let now = chrono::Utc::now().to_rfc3339();
+                    let namespaces: Vec<String> = deleted.iter().map(|(_, ns, _)| ns.clone()).collect();
+                    let agents: Vec<Option<String>> = deleted.iter().map(|(_, _, a)| a.clone()).collect();
+                    let forgotten: Vec<String> = vec![now.clone(); deleted.len()];
+                    let signatures: Vec<Option<Vec<u8>>> = deleted
+                        .iter()
+                        .map(|(id, ns, _)| {
+                            let signable = crate::storage::forget_tombstone_signable_bytes(id, ns, &now);
+                            crate::governance::audit::try_sign_audit_payload(&signable).map(|(s, _)| s)
+                        })
+                        .collect();
+                    sqlx::query(
+                        "INSERT INTO forget_tombstones \
+                             (memory_id, namespace, forgotten_at, agent_id, signature) \
+                         SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::bytea[]) \
+                         ON CONFLICT (memory_id) DO NOTHING",
+                    )
+                    .bind(&ids)
+                    .bind(&namespaces)
+                    .bind(&forgotten)
+                    .bind(&agents)
+                    .bind(&signatures)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| to_store_err("forget record tombstones", e))?;
+
+                    // #1956 [R56] — signed `substrate.crypto_erase` erasure attestation
+                    // per victim IN THIS tx (postgres parity with the sqlite
+                    // `emit_crypto_erase_attestation`). Commits {id, erasure-kind,
+                    // actor, timestamp}: `key-destroyed` when the row's per-record
+                    // envelope key was destroyed above, else `row-deleted-tombstoned`
+                    // (the honest plaintext / legacy-0x02 limit). Chained + verified by
+                    // `verify_audit_trail` like every other signed event.
+                    let erase_ts = chrono::Utc::now();
+                    let erase_ts_str = erase_ts.to_rfc3339();
+                    for (id, _ns, agent) in &deleted {
+                        let kind = if erased_set.contains(id) {
+                            crate::storage::ErasureKind::KeyDestroyed
+                        } else {
+                            crate::storage::ErasureKind::RowDeletedTombstoned
+                        };
+                        let actor = agent
+                            .as_deref()
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or(crate::storage::CRYPTO_ERASE_ACTOR_FORGET);
+                        let signable =
+                            crate::storage::crypto_erase_signable_bytes(id, kind, actor, &erase_ts_str);
+                        let ph = crate::signed_events::payload_hash(&signable);
+                        let event = crate::signed_events::SignedEvent::with_daemon_signature(
+                            ph,
+                            actor.to_string(),
+                            crate::signed_events::event_types::SUBSTRATE_CRYPTO_ERASE.to_string(),
+                            erase_ts_str.clone(),
+                            None,
+                        );
+                        let appended = pg_append_signed_event_with_chain_in_tx(
+                            &mut tx,
+                            PgSignedEventInsert {
+                                id: &event.id,
+                                agent_id: &event.agent_id,
+                                event_type: &event.event_type,
+                                payload_hash: &event.payload_hash,
+                                signature: event.signature.as_deref(),
+                                attest_level: &event.attest_level,
+                                timestamp: erase_ts,
+                                cause_hash: None,
+                            },
+                        )
+                        .await
+                        .map_err(|e| to_store_err("forget crypto_erase attestation", e))?;
+                        anchor = anchor.merge(appended);
+                    }
+
+                    // APPEND-ONLY-SANCTIONED (#1823 G6) — capture-then-compact:
+                    // append ONE identity-only FORGET leaf per deleted id IN THIS
+                    // tx (the cascade DELETE already ran with RETURNING, so a
+                    // rollback discards leaf + delete together). Reuses the same
+                    // victim set as the W2.3 tombstones above; the leaf NEVER
+                    // carries content — destruction stays the right-to-be-forgotten
+                    // path.
+                    if crate::config::append_only_enabled() {
+                        for ((id, ns), agent) in ids.iter().zip(&namespaces).zip(&agents) {
+                            pg_emit_revision_leaf_if_enabled(
+                                &mut tx,
+                                id,
+                                crate::revisions::RecordKind::Forget,
+                                None,
+                                ns,
+                                agent.as_deref(),
+                                &now,
+                            )
+                            .await
+                            .map_err(|e| to_store_err("append forget revision leaf", e))?;
+                        }
+                    }
+                }
+
+                pg_commit_and_emit(tx, anchor)
+                    .await
+                    .map_err(|e| to_store_err("forget commit tx", e))?;
+                Ok(deleted.into_iter().map(|(id, _, _)| id).collect::<Vec<String>>())
+            }
+            .await;
+            match attempt {
+                Ok(v) => break v,
+                Err(e) => retry.consider(e).await?,
+            }
+        };
+
+        Ok(deleted_ids)
+    }
+
     /// v1.0.0 #3599/#3601 — UNFILTERED single-row read for AUTHZ decisions:
     /// the postgres twin of [`crate::storage::get_any`] (#3270).
     ///
@@ -8332,6 +8729,37 @@ impl PostgresStore {
             .await
             .map_err(|e| to_store_err("select by id (unfiltered)", e))?;
         row.as_ref().map(Self::row_to_memory).transpose()
+    }
+
+    /// #8741 round 1 (F8 / sec-F3) — the committed `namespace_meta` row as
+    /// the federation `NamespaceMeta` effect carries it (Postgres twin of
+    /// [`crate::storage::get_namespace_meta_entry`]): the stored
+    /// `updated_at`, never a value made up by the caller. `Ok(None)` when no
+    /// row binds a standard (absent or severed).
+    ///
+    /// # Errors
+    ///
+    /// `StoreError::BackendUnavailable` on SQL failure.
+    pub async fn get_namespace_meta_entry(
+        &self,
+        namespace: &str,
+    ) -> StoreResult<Option<crate::models::NamespaceMetaEntry>> {
+        let row: Option<(Option<String>, Option<String>, DateTime<Utc>)> = sqlx::query_as(
+            "SELECT standard_id, parent_namespace, updated_at FROM namespace_meta \
+             WHERE namespace = $1",
+        )
+        .bind(namespace)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| to_store_err("get_namespace_meta_entry", e))?;
+        Ok(row.and_then(|(standard_id, parent_namespace, updated_at)| {
+            standard_id.map(|standard_id| crate::models::NamespaceMetaEntry {
+                namespace: namespace.to_string(),
+                standard_id,
+                parent_namespace,
+                updated_at: updated_at.to_rfc3339(),
+            })
+        }))
     }
 
     /// v0.7.0 Provenance Gap 1 (issue #884) — optimistic-concurrency
@@ -27553,389 +27981,15 @@ impl MemoryStore for PostgresStore {
 
     async fn forget(
         &self,
-        _ctx: &CallerContext,
+        ctx: &CallerContext,
         namespace: Option<&str>,
         pattern: Option<&str>,
         tier: Option<&Tier>,
         archive: bool,
     ) -> StoreResult<usize> {
-        self.gate_record_stop().await?;
-        if namespace.is_none() && pattern.is_none() && tier.is_none() {
-            return Err(StoreError::InvalidInput {
-                detail: crate::errors::msg::FORGET_FILTER_REQUIRED.to_string(),
-            });
-        }
-        // #3171 — REFUSE a pattern the sanitiser would silently WIDEN, exactly
-        // as the sqlite twin's `forget_fts_query` does. Defence in depth behind
-        // the HTTP boundary check: this trait method is also reachable from the
-        // CLI and curator on a `--store-url postgres://` daemon, and a bulk
-        // DELETE that is wider than the caller's pattern is unrecoverable data
-        // loss. Backend-agnostic tokeniser, so the refusal set cannot diverge.
-        if let Some(pat) = pattern
-            && let Err(reason) = crate::storage::strict_forget_tokens(pat)
-        {
-            return Err(StoreError::InvalidInput { detail: reason });
-        }
-        // #2312 — token-AND pattern semantics, matching the sqlite twin.
-        // sqlite routes the DESTRUCTIVE forget pattern through
-        // `forget_fts_query` -> `sanitize_fts_query(pat, false)` (#1601):
-        // every whitespace-separated token must match as a WHOLE token
-        // (FTS5 implicit AND) — the conservative posture the memory_forget
-        // wire contract promises ("every whitespace-separated token must
-        // match"). The previous postgres arm was `title ILIKE '%pat%' OR
-        // content ILIKE '%pat%'` — a contiguous SUBSTRING match that
-        // over-deleted (pattern "cat" reaped rows containing "education")
-        // and under-deleted (non-adjacent multi-token patterns), so the
-        // same destructive wire call deleted DIFFERENT row sets per
-        // backend. The predicate is now `tsv @@ plainto_tsquery('english',
-        // $pattern)` over the v57 stored tsvector (title + content):
-        // plainto_tsquery AND-joins every lexeme and treats its input as
-        // plain text (no operator surface — injection-safe, so the #2032
-        // LM1 escaping is no longer needed; a bare "%" or an
-        // all-punctuation pattern normalizes to the EMPTY tsquery, which
-        // matches NOTHING — the fail-safe twin of sqlite's `"_empty_"`
-        // sentinel). Documented residual: the `english` config stems and
-        // drops stopwords where FTS5 unicode61 does not, so token
-        // boundaries differ marginally across backends; both remain
-        // whole-token AND matches.
-        let tier_str = tier.map(|t| t.as_str().to_string());
-        let now = chrono::Utc::now().to_rfc3339();
-
-        // #1776 — archive + delete MUST be one transaction (mirror `run_gc` /
-        // the #1026 fix). Pre-fix the archive INSERT and the DELETE each ran on
-        // a SEPARATE pooled connection in autocommit, so a crash,
-        // statement_timeout, pool-checkout failure, OR an ordinary concurrent
-        // write landing between them could leave the archived-set and
-        // deleted-set diverging → a row DELETEd that the archive-SELECT never
-        // captured = irrecoverable loss. One tx alone does not (READ COMMITTED
-        // re-evaluates each statement's predicate); #4329 locks the victim set
-        // up front and binds the archive copy and the DELETE to those ids.
-        // v1.0.0 #3520 — routed through the shared bounded-retry funnel. This
-        // funnel touches the same relation set as `run_gc` / `size_gc`
-        // (archive-copy + link snapshot + cascade DELETE), so a concurrent
-        // bootstrap's relation-level ShareLock can make PostgreSQL pick it as
-        // the deadlock victim. `now` / `tier_str` are pinned OUTSIDE the loop so
-        // every attempt archives under the SAME stamp and the same filter; the
-        // block below has no effect outside the transaction.
-        let mut retry = tx_retry::TxRetry::new("forget archive+delete tx");
-        let deleted_count: usize = loop {
-            let attempt: StoreResult<usize> = async {
-                let mut tx = self
-                    .pool
-                    .begin()
-                    .await
-                    .map_err(|e| to_store_err("forget begin tx", e))?;
-                // #4329 — lock the whole victim set up front, ascending by
-                // `id COLLATE "C"` (CONCURRENCY-04), and run every later
-                // statement over exactly that locked set.
-                let locked = lock_order_4329::lock_forget_set(
-                    &mut tx,
-                    namespace,
-                    tier_str.as_deref(),
-                    pattern,
-                )
-                .await?;
-
-                if archive {
-                    // Insert matching rows into archived_memories before deletion.
-                    sqlx::query(&format!(
-                        "INSERT INTO archived_memories (
-                            id, tier, namespace, title, content, tags, priority, confidence,
-                            source, access_count, created_at, updated_at, last_accessed_at,
-                            expires_at, archived_at, archive_reason, metadata,
-                            embedding, embedding_dim, embedding_space, original_tier, original_expires_at,
-                            -- #1025 (CRITICAL, 2026-05-21) — full v0.7.0 column carry.
-                            reflection_depth, atomised_into, atom_of, memory_kind,
-                            entity_id, persona_version, citations, source_uri, source_span,
-                            confidence_source, confidence_signals, confidence_decayed_at,
-                            -- #2196 - carry lifecycle_state so a non-open archived state
-                            -- survives the archive->restore round-trip (restore no longer
-                            -- COALESCEs a NULL to 'open'); mirrors the sqlite archive.
-                            mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until, cid, cid_genesis
-                        )
-                        SELECT id, tier, namespace, title, content, tags, priority, confidence,
-                               source, access_count, created_at, updated_at, last_accessed_at,
-                               expires_at, $4::timestamptz, 'forget', metadata,
-                               embedding, embedding_dim, embedding_space, tier, expires_at,
-                               reflection_depth, atomised_into, atom_of, memory_kind,
-                               entity_id, persona_version, citations, source_uri, source_span,
-                               confidence_source, confidence_signals, confidence_decayed_at,
-                               mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until, cid, cid_genesis
-                        FROM memories
-                        WHERE ($1::text IS NULL OR namespace = $1)
-                          AND ($2::text IS NULL OR tier = $2)
-                          AND ($3::text IS NULL
-                               OR tsv @@ plainto_tsquery('english', $3))
-                          AND id = ANY($5::text[])
-                        -- #2195 - LAST-WINS re-archive parity with sqlite INSERT OR REPLACE.
-                        {SQL_ARCHIVE_ON_CONFLICT_LAST_WINS}"
-                    ))
-                    .bind(namespace)
-                    .bind(tier_str.as_deref())
-                    .bind(pattern)
-                    .bind(parse_rfc3339_required(&now)?)
-                    .bind(&locked)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|e| to_store_err("forget archive copy", e))?;
-                }
-
-                // #1771 (5-agent vote 4d3ea1c5) — snapshot the to-be-deleted
-                // memories' `memory_links` into `archived_memory_links` BEFORE the
-                // cascade `DELETE FROM memories` reaps them (FK `ON DELETE
-                // CASCADE`). Bind the snapshot to the locked victim ids
-                // (#4329) so the snapshot and the delete pin to the same row set
-                // inside this one tx; idempotent via the PK `ON CONFLICT`. Postgres
-                // twin of the SQLite `archive_links_for_memory` snapshot.
-                //
-                // #2313 — runs ONLY when `archive`, matching the sqlite contract
-                // ("Runs only when `archive` so a hard (non-recoverable) forget
-                // keeps its documented edge-loss", src/storage/mod.rs). Pre-fix
-                // this INSERT ran unconditionally, so an erasure-intent hard
-                // forget (archive = false) permanently retained the victims' edge
-                // topology (relation, observed_by, signature, valid intervals) as
-                // orphan rows no code path ever reaps — with no archived_memories
-                // row, restore could never consume them and archive_purge never
-                // touches archived_memory_links.
-                if archive {
-                    sqlx::query(
-                        "INSERT INTO archived_memory_links (
-                             source_id, target_id, relation, created_at, valid_from,
-                             valid_until, observed_by, signature, attest_level, archived_at,
-                             source_cid, target_cid
-                         )
-                         SELECT ml.source_id, ml.target_id, ml.relation, ml.created_at,
-                                ml.valid_from, ml.valid_until, ml.observed_by, ml.signature,
-                                ml.attest_level, now(), ml.source_cid, ml.target_cid
-                         FROM memory_links ml
-                         WHERE ml.source_id = ANY($1::text[])
-                            OR ml.target_id = ANY($1::text[])
-                         ON CONFLICT (source_id, target_id, relation) DO NOTHING",
-                    )
-                    .bind(&locked)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|e| to_store_err("forget snapshot links", e))?;
-                }
-
-                // v0.9.0 G8 (#1825) T7 — erasure invariant (postgres parity/defence):
-                // NULL the `cid_genesis` pre-image for every row this forget will
-                // reap, BEFORE the delete, mirroring the sqlite `forget_scrub_cid_genesis`.
-                // The DELETE below hard-deletes the row so this scrub is belt-and-braces
-                // (a rollback discards both); it keeps the erase-the-pre-image contract
-                // explicit and correct should this path ever become a soft-delete. The
-                // predicate matches the DELETE's victim set EXACTLY.
-                sqlx::query(
-                    "UPDATE memories SET cid_genesis = NULL
-                     WHERE cid_genesis IS NOT NULL
-                       AND ($1::text IS NULL OR namespace = $1)
-                       AND ($2::text IS NULL OR tier = $2)
-                       AND ($3::text IS NULL
-                            OR tsv @@ plainto_tsquery('english', $3))
-                       AND id = ANY($4::text[])",
-                )
-                .bind(namespace)
-                .bind(tier_str.as_deref())
-                .bind(pattern)
-                .bind(&locked)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| to_store_err("forget scrub cid_genesis", e))?;
-
-                // #1956 [R56] — CRYPTO-ERASE the per-record envelope key for every
-                // crypto-erasable row (0x03 per-record or 0x05 scope, the SSOT
-                // `crate::encryption::CRYPTO_ERASABLE_ENVELOPE_VERSIONS`) this forget will reap, BEFORE the delete
-                // (postgres parity with the sqlite `crypto_erase_record_envelope`).
-                // Overwriting the envelope with the destroy marker destroys the
-                // embedded wrapped DEK so the ciphertext is cryptographically
-                // unrecoverable even by a holder of the master KEK; the marker
-                // propagates to replicas / WAL as an UPDATE ahead of the tombstoning
-                // delete. `get_byte(...,0) = ANY($6)` selects the crypto-erasable
-                // versions (0x03 per-record and 0x05 scope, the #8278 R16 SSOT) —
-                // legacy 0x02 per-agent rows have no per-record key to destroy (the
-                // honest limit) and are left for row-delete + tombstone only. The
-                // predicate matches the DELETE's victim set EXACTLY. RETURNING id so
-                // the erasure-kind of each victim is known for the attestation below.
-                let erased_ids: Vec<(String,)> = sqlx::query_as(
-                    "UPDATE memories SET encrypted_envelope = $4
-                     WHERE encrypted_envelope IS NOT NULL
-                       AND get_byte(encrypted_envelope, 0) = ANY($6::int[])
-                       AND ($1::text IS NULL OR namespace = $1)
-                       AND ($2::text IS NULL OR tier = $2)
-                       AND ($3::text IS NULL
-                            OR tsv @@ plainto_tsquery('english', $3))
-                       AND id = ANY($5::text[])
-                     RETURNING id",
-                )
-                .bind(namespace)
-                .bind(tier_str.as_deref())
-                .bind(pattern)
-                .bind(crate::encryption::crypto_erase_marker())
-                .bind(&locked)
-                .bind(crate::encryption::crypto_erasable_envelope_version_codes())
-                .fetch_all(&mut *tx)
-                .await
-                .map_err(|e| to_store_err("forget crypto-erase envelope", e))?;
-                let erased_set: std::collections::HashSet<String> =
-                    erased_ids.into_iter().map(|(id,)| id).collect();
-
-                // #1783 — RETURNING id so the deleted set is known for AGE
-                // unprojection in THIS tx (the projection commits atomically with
-                // the cascade delete; ghost edges never appear).
-                // W2.3 — RETURNING namespace + agent_id too so the FORGET tombstones
-                // can be recorded in THIS tx (the rows are gone after the DELETE).
-                let deleted: Vec<(String, String, Option<String>)> = sqlx::query_as(
-                    "DELETE FROM memories
-                     WHERE ($1::text IS NULL OR namespace = $1)
-                       AND ($2::text IS NULL OR tier = $2)
-                       AND ($3::text IS NULL
-                            OR tsv @@ plainto_tsquery('english', $3))
-                       AND id = ANY($4::text[])
-                     RETURNING id, namespace, metadata->>'agent_id'",
-                )
-                .bind(namespace)
-                .bind(tier_str.as_deref())
-                .bind(pattern)
-                .bind(&locked)
-                .fetch_all(&mut *tx)
-                .await
-                .map_err(|e| to_store_err("forget delete", e))?;
-
-                if matches!(self.kg_backend, KgBackend::Age) {
-                    for (id, _, _) in &deleted {
-                        unproject_memory_from_age(&mut tx, id).await?;
-                    }
-                }
-
-                // v0.8.1 W2 (#1821 / gap G30) — postgres parity for the sqlite
-                // `purge_and_tombstone_forget`: purge the non-cascaded derived-store
-                // leaks (`federation_push_dlq` cleartext, `transcript_line_dedup`
-                // hash-oracle) AND record a FORGET tombstone per deleted id, all in
-                // THIS tx. 5-agent vote 4d3ea1c5.
-                // #7241 - audit anchors are emitted only after the COMMIT.
-                let mut anchor = crate::governance::audit::PendingAuditAnchor::none();
-                if !deleted.is_empty() {
-                    let ids: Vec<String> = deleted.iter().map(|(id, _, _)| id.clone()).collect();
-                    // #3286 — route through the shared SSOT so this forget reap and the
-                    // delete / evict primitives cannot drift on which remanence tables
-                    // a crypto-erase purges.
-                    pg_purge_dlq_dedup_in_tx(&mut tx, &ids)
-                        .await
-                        .map_err(|e| to_store_err("forget purge dlq/dedup remanence", e))?;
-                    // W2.3 SIGNED tombstones — bulk insert via UNNEST. Identity + time
-                    // + owner only (NO content). Each signs the canonical
-                    // {memory_id, namespace, forgotten_at} bytes with the daemon audit
-                    // key (unsigned when absent) — parity with the sqlite path.
-                    let now = chrono::Utc::now().to_rfc3339();
-                    let namespaces: Vec<String> = deleted.iter().map(|(_, ns, _)| ns.clone()).collect();
-                    let agents: Vec<Option<String>> = deleted.iter().map(|(_, _, a)| a.clone()).collect();
-                    let forgotten: Vec<String> = vec![now.clone(); deleted.len()];
-                    let signatures: Vec<Option<Vec<u8>>> = deleted
-                        .iter()
-                        .map(|(id, ns, _)| {
-                            let signable = crate::storage::forget_tombstone_signable_bytes(id, ns, &now);
-                            crate::governance::audit::try_sign_audit_payload(&signable).map(|(s, _)| s)
-                        })
-                        .collect();
-                    sqlx::query(
-                        "INSERT INTO forget_tombstones \
-                             (memory_id, namespace, forgotten_at, agent_id, signature) \
-                         SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::bytea[]) \
-                         ON CONFLICT (memory_id) DO NOTHING",
-                    )
-                    .bind(&ids)
-                    .bind(&namespaces)
-                    .bind(&forgotten)
-                    .bind(&agents)
-                    .bind(&signatures)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|e| to_store_err("forget record tombstones", e))?;
-
-                    // #1956 [R56] — signed `substrate.crypto_erase` erasure attestation
-                    // per victim IN THIS tx (postgres parity with the sqlite
-                    // `emit_crypto_erase_attestation`). Commits {id, erasure-kind,
-                    // actor, timestamp}: `key-destroyed` when the row's per-record
-                    // envelope key was destroyed above, else `row-deleted-tombstoned`
-                    // (the honest plaintext / legacy-0x02 limit). Chained + verified by
-                    // `verify_audit_trail` like every other signed event.
-                    let erase_ts = chrono::Utc::now();
-                    let erase_ts_str = erase_ts.to_rfc3339();
-                    for (id, _ns, agent) in &deleted {
-                        let kind = if erased_set.contains(id) {
-                            crate::storage::ErasureKind::KeyDestroyed
-                        } else {
-                            crate::storage::ErasureKind::RowDeletedTombstoned
-                        };
-                        let actor = agent
-                            .as_deref()
-                            .filter(|s| !s.is_empty())
-                            .unwrap_or(crate::storage::CRYPTO_ERASE_ACTOR_FORGET);
-                        let signable =
-                            crate::storage::crypto_erase_signable_bytes(id, kind, actor, &erase_ts_str);
-                        let ph = crate::signed_events::payload_hash(&signable);
-                        let event = crate::signed_events::SignedEvent::with_daemon_signature(
-                            ph,
-                            actor.to_string(),
-                            crate::signed_events::event_types::SUBSTRATE_CRYPTO_ERASE.to_string(),
-                            erase_ts_str.clone(),
-                            None,
-                        );
-                        let appended = pg_append_signed_event_with_chain_in_tx(
-                            &mut tx,
-                            PgSignedEventInsert {
-                                id: &event.id,
-                                agent_id: &event.agent_id,
-                                event_type: &event.event_type,
-                                payload_hash: &event.payload_hash,
-                                signature: event.signature.as_deref(),
-                                attest_level: &event.attest_level,
-                                timestamp: erase_ts,
-                                cause_hash: None,
-                            },
-                        )
-                        .await
-                        .map_err(|e| to_store_err("forget crypto_erase attestation", e))?;
-                        anchor = anchor.merge(appended);
-                    }
-
-                    // APPEND-ONLY-SANCTIONED (#1823 G6) — capture-then-compact:
-                    // append ONE identity-only FORGET leaf per deleted id IN THIS
-                    // tx (the cascade DELETE already ran with RETURNING, so a
-                    // rollback discards leaf + delete together). Reuses the same
-                    // victim set as the W2.3 tombstones above; the leaf NEVER
-                    // carries content — destruction stays the right-to-be-forgotten
-                    // path.
-                    if crate::config::append_only_enabled() {
-                        for ((id, ns), agent) in ids.iter().zip(&namespaces).zip(&agents) {
-                            pg_emit_revision_leaf_if_enabled(
-                                &mut tx,
-                                id,
-                                crate::revisions::RecordKind::Forget,
-                                None,
-                                ns,
-                                agent.as_deref(),
-                                &now,
-                            )
-                            .await
-                            .map_err(|e| to_store_err("append forget revision leaf", e))?;
-                        }
-                    }
-                }
-
-                pg_commit_and_emit(tx, anchor)
-                    .await
-                    .map_err(|e| to_store_err("forget commit tx", e))?;
-                Ok(deleted.len())
-            }
-            .await;
-            match attempt {
-                Ok(v) => break v,
-                Err(e) => retry.consider(e).await?,
-            }
-        };
-
-        Ok(deleted_count)
+        self.forget_returning_ids(ctx, namespace, pattern, tier, archive)
+            .await
+            .map(|ids| ids.len())
     }
 
     async fn forget_distinct_namespaces(

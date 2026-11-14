@@ -79,67 +79,13 @@ pub(crate) fn under_replicated_response(payload: &QuorumNotMetPayload) -> axum::
     (StatusCode::ACCEPTED, Json(body)).into_response()
 }
 
-/// #2856 (federation data-integrity) — the consolidate-specific
-/// under-replication response. Sibling of [`under_replicated_response`]
-/// that ADDITIONALLY carries the created consolidated memory's `id` (and
-/// the same `{id, consolidated, summary, content, memory}` fields the
-/// success `201` body emits), so a caller whose consolidation committed
-/// LOCALLY but did not reach quorum can DISCOVER the row it must reconcile.
-///
-/// **Why a distinct helper.** `consolidate` mints a NEW substrate-derived
-/// memory attributed to the tenant consolidator, but the origin daemon
-/// cannot produce that tenant's Ed25519 signature — so under the
-/// v1.0.0-default strict `AI_MEMORY_FED_REQUIRE_WRITE_SIG` the receiver
-/// refuses the unsigned honored-third-party relay and buckets it into
-/// `skipped` inside its own 2xx. The origin then finalises a quorum MISS
-/// and returns THIS 202. Pre-#2856 the bare [`under_replicated_response`]
-/// omitted the `id`, so the caller saw a success-shaped 2xx with NO way to
-/// tell WHAT was written-locally-but-not-replicated — the "success-shaped
-/// while silently diverging" defect the North Star forbids. Emitting the
-/// `id` + the `quorum_met:false` / `durability:"local"` state makes the
-/// under-replication LOUD and RECONCILABLE (5-agent vote `4d3ea1c5`,
-/// Option A). The `202`-not-`5xx` status is preserved (W3 / gap G12): the
-/// local row IS durable.
-///
-/// True convergent replication of a tenant-attributed consolidation is a
-/// separate authorship-model decision tracked as a follow-up; this helper
-/// closes the silent-divergence + missing-`id` defect without changing the
-/// receiver gate or the row's attribution.
-pub(crate) fn under_replicated_consolidate_response(
-    payload: &QuorumNotMetPayload,
-    mem: &Memory,
-    source_count: usize,
-) -> axum::response::Response {
-    use crate::models::field_names;
-    let body = json!({
-        "id": mem.id,
-        (field_names::CONSOLIDATED): source_count,
-        "summary": mem.content,
-        // v0.7.0 L7-followup — mirror `content` + a nested `memory` dict so
-        // the caller reads the same shape as the `201` success body.
-        "content": mem.content,
-        "memory": {
-            "id": mem.id,
-            "title": mem.title,
-            "content": mem.content,
-            "namespace": mem.namespace,
-        },
-        // Replication state — LOUD + honest (never a bare success body).
-        "quorum_met": false,
-        "acks": payload.got,
-        "needed": payload.needed,
-        "reason": payload.reason,
-        "durability": "local",
-    });
-    (StatusCode::ACCEPTED, Json(body)).into_response()
-}
-
 /// Fan out a locally-committed memory to peers via quorum store. On full
 /// quorum, returns `None` (caller returns its normal 2xx success). On a
 /// quorum MISS, returns `Some(202_response)` carrying the replication
 /// state — the local commit already landed (W3/G12: a durable write is
-/// never reported as a 5xx). Network errors are logged and swallowed —
-/// the local commit already landed and the sync-daemon catches stragglers.
+/// never reported as a 5xx). A broadcast error is the same `Some(202)`:
+/// the peers received nothing, so the reply must not be a bare success
+/// (#8741 invariant 4).
 pub(crate) async fn fanout_or_pending(
     app: &AppState,
     mem: &Memory,
@@ -155,9 +101,13 @@ pub(crate) async fn fanout_or_pending(
                 Some(under_replicated_response(&payload))
             }
         },
-        Err(e) => {
-            tracing::warn!("fanout error (local committed): {e:?}");
-            None
+        // #8741 (#9152) — a broadcast that errored delivered nothing, so it
+        // is the same exact 202 as a quorum miss, never a silent success
+        // (ERRORS-19; the pre-fix arm logged and returned `None`).
+        Err(err) => {
+            tracing::warn!("fanout error (local committed): {err:?}");
+            let payload = QuorumNotMetPayload::from_err(&err);
+            Some(under_replicated_response(&payload))
         }
     }
 }
