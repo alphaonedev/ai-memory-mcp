@@ -209,7 +209,7 @@ impl McpTool for StoreTool {
         "Store a memory; deduplicates by title+namespace."
     }
     fn docs() -> &'static str {
-        "Store a memory. Dedupes by (title, namespace). Tier defaults to mid (7d TTL); long is permanent. on_conflict: error|merge|version. scope: Task 1.5 visibility. force (#519): bypass proactive contradiction detection on near-duplicate writes."
+        "Store a memory. Dedupes by (title, namespace). Tier defaults to mid (7d TTL); long is permanent. on_conflict: error|merge|version. scope: Task 1.5 visibility. force (#519): bypass proactive contradiction detection on near-duplicate writes. Receipt (create, dedupe, synthesis merge) carries embed_status (skipped|failed) and embed_status_reason (e.g. embedding_failed, no embedder configured) only when no vector is stored after a document change; both are absent otherwise."
     }
     fn input_schema() -> Value {
         crate::mcp::registry::input_schema_for::<StoreRequest>()

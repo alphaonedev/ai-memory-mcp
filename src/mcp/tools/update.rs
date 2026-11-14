@@ -129,7 +129,7 @@ impl McpTool for UpdateTool {
         "Update an existing memory by ID (only provided fields change)."
     }
     fn docs() -> &'static str {
-        "Partial update by id. Omitted fields preserved. Tier monotone-only. metadata.agent_id preserved."
+        "Partial update by id. Omitted fields preserved. Tier monotone-only. metadata.agent_id preserved. Receipt carries embed_status (skipped|failed) and embed_status_reason (e.g. embedding_failed, no embedder configured) only when a title/content change ends with no vector stored; both are absent otherwise."
     }
     fn input_schema() -> Value {
         crate::mcp::registry::input_schema_for::<UpdateRequest>()

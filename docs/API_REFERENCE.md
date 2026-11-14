@@ -653,6 +653,16 @@ Anything else is rejected with **400** (#1467 — this endpoint previously
 coerced an unknown `kind` to `observation`; it now rejects to match the
 CLI and MCP surfaces).
 
+The create receipt (including a re-store that upserts over a live
+`(title, namespace)` row) carries `embed_status` and `embed_status_reason`
+only when the write ends with no vector stored: `embed_status` is `skipped`
+or `failed`, and `embed_status_reason` is `embedding_failed` or the
+skip cause (`no embedder configured` on a content-changing update with no
+embedder). When the vector is stored, or
+there was nothing to embed, both keys are absent. The same two fields, with
+the same rule, appear on the `PUT` update receipt and on the MCP
+`memory_store` / `memory_update` receipts.
+
 #### Agent attestation (`signature` + `created_at`) — #626 Layer-3
 
 A caller MAY present a detached Ed25519 `signature` to upgrade the write
@@ -765,6 +775,7 @@ All fields optional. Tier never downgrades.
 ```
 
 - **200** on success, **409** on `(title, namespace)` collision, **404** on missing.
+- The receipt carries `embed_status` and `embed_status_reason` only when a `title` or `content` change leaves the row with no vector (`embed_status` is `skipped` or `failed`; `embed_status_reason` is `embedding_failed`, `no embedder configured`, or the skip cause). When the new vector is stored, or the document did not change, both keys are absent, exactly as on create.
 
 ### `DELETE /api/v1/memories/{id}` — delete
 

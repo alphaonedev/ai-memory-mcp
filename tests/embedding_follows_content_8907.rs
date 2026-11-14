@@ -372,6 +372,10 @@ async fn seed(fx: &Fixture, title: &str, content: &str) -> String {
     )
     .await;
     assert!(status.is_success(), "seed {title}: {status} {body}");
+    assert!(
+        body.get("embed_status").is_none() && body.get("embed_status_reason").is_none(),
+        "seed {title}: an indexed create must not carry the degraded marker: {body}"
+    );
     let id = body["id"].as_str().expect("seed id").to_string();
     let seeded = expected_vector(&fx.model, &embedding_document(title, content));
     assert_eq!(
@@ -463,21 +467,48 @@ fn http_rows(branch: Branch) {
     });
 }
 
+/// `POST /api/v1/memories/bulk` with an embedder that indexes every row: the
+/// envelope carries no degraded marker, and every row has its own vector.
+fn http_bulk_rows(branch: Branch) {
+    runtime().block_on(async {
+        let row = format!("http {branch:?} bulk");
+        let Some(fx) = fixture("e8907bulk", branch).await else {
+            eprintln!("skip {row}: AI_MEMORY_TEST_POSTGRES_URL unset");
+            return;
+        };
+        let rows = json!([
+            {"title": "bulk-8907-a", "content": OLD_CONTENT, "namespace": NAMESPACE, "tier": "mid"},
+            {"title": "bulk-8907-b", "content": NEW_CONTENT, "namespace": NAMESPACE, "tier": "mid"},
+        ]);
+        let (status, body) = send(
+            fx.router.clone(),
+            request("POST", "/api/v1/memories/bulk", &rows),
+        )
+        .await;
+        assert!(status.is_success(), "{row}: {status} {body}");
+        assert_eq!(body["created"].as_u64(), Some(2), "{row}: {body}");
+        assert_no_marker(&row, &body);
+    });
+}
+
 #[test]
 fn http_update_vector_follows_content_sqlite_8907() {
     http_rows(Branch::Sqlite);
+    http_bulk_rows(Branch::Sqlite);
 }
 
 #[cfg(feature = "sal")]
 #[test]
 fn http_update_vector_follows_content_postgres_branch_8948() {
     http_rows(Branch::FakePg);
+    http_bulk_rows(Branch::FakePg);
 }
 
 #[cfg(feature = "sal-postgres")]
 #[test]
 fn http_update_vector_follows_content_real_postgres_8948() {
     http_rows(Branch::RealPg);
+    http_bulk_rows(Branch::RealPg);
 }
 
 /// #9062 — after an update moves row A onto the query's topic, A is the
@@ -602,6 +633,10 @@ fn mcp_update_and_dedup_vector_follows_content_8907() {
                 ),
                 &embedder,
             ));
+            assert!(
+                seeded.get("embed_status").is_none() && seeded.get("embed_status_reason").is_none(),
+                "{row}: an indexed MCP create must not carry the degraded marker: {seeded}"
+            );
             let id = seeded["id"].as_str().expect("seed id").to_string();
             assert_eq!(
                 ai_memory::db::get_embedding(&conn, &id).expect("seed vector"),
@@ -742,6 +777,7 @@ fn cli_and_stdio_update_clear_the_stale_vector_8907() {
             "",
         ))
         .expect("store receipt");
+        assert_no_marker(&format!("{row} create"), &stored);
         let id = stored["id"].as_str().expect("stored id").to_string();
         {
             let conn = ai_memory::db::open(&db).expect("open db");
@@ -780,6 +816,94 @@ fn cli_and_stdio_update_clear_the_stale_vector_8907() {
             "{row}: degraded reason: {response}"
         );
     }
+}
+
+/// The degraded marker is ABSENT: the write ended with a vector stored or
+/// with nothing to embed (status Indexed), exactly as on create.
+fn assert_no_marker(row: &str, receipt: &Value) {
+    assert!(
+        receipt.get("embed_status").is_none() && receipt.get("embed_status_reason").is_none(),
+        "{row}: the receipt must not carry the degraded marker: {receipt}"
+    );
+}
+
+/// A write that leaves the document alone has nothing to embed: no marker
+/// on the CLI or the stdio MCP receipt, and the seeded vector stays.
+#[test]
+fn cli_and_stdio_priority_only_update_carries_no_marker_8907() {
+    let scratch = tempfile::tempdir_in(scratch_root()).expect("scratch");
+    let stale: Vec<f32> = vec![1.0 / (f32::from(u16::try_from(DIM).expect("dim")).sqrt()); DIM];
+    for write in [BinaryWrite::CliUpdate, BinaryWrite::StdioUpdate] {
+        let row = format!("binary priority-only {write:?}");
+        let db = scratch.path().join(format!("prio-{write:?}.db"));
+        let title = format!("bin-prio-8907-{write:?}");
+        let stored: Value = serde_json::from_str(&run_cli(
+            &db,
+            &[
+                "store",
+                "--json",
+                "--namespace",
+                NAMESPACE,
+                "--title",
+                &title,
+                "--content",
+                OLD_CONTENT,
+            ],
+            "",
+        ))
+        .expect("store receipt");
+        let id = stored["id"].as_str().expect("stored id").to_string();
+        {
+            let conn = ai_memory::db::open(&db).expect("open db");
+            ai_memory::db::set_embedding(&conn, &id, &stale, SEED_SPACE).expect("seed vector");
+        }
+        let response: Value = match write {
+            BinaryWrite::CliUpdate => serde_json::from_str(&run_cli(
+                &db,
+                &["update", &id, "--json", "--priority", "7"],
+                "",
+            ))
+            .expect("update receipt"),
+            _ => stdio_tool(&db, "memory_update", &json!({"id": id, "priority": 7})),
+        };
+        let applied = response
+            .get("memory")
+            .map_or(&response["priority"], |memory| &memory["priority"]);
+        assert_eq!(applied, 7, "{row}: the update must apply: {response}");
+        assert_no_marker(&row, &response);
+        let conn = ai_memory::db::open(&db).expect("reopen db");
+        assert_eq!(
+            ai_memory::db::get_embedding(&conn, &id).expect("read vector"),
+            Some(stale.clone()),
+            "{row}: an unchanged document must keep its vector"
+        );
+    }
+}
+
+/// CLI re-store over a live (title, namespace) with the SAME
+/// document: the upsert changes nothing to embed, so no marker either.
+#[test]
+fn cli_store_upsert_of_unchanged_document_carries_no_marker_8907() {
+    let scratch = tempfile::tempdir_in(scratch_root()).expect("scratch");
+    let db = scratch.path().join("upsert.db");
+    let args = [
+        "store",
+        "--json",
+        "--namespace",
+        NAMESPACE,
+        "--title",
+        "bin-upsert-8907",
+        "--content",
+        OLD_CONTENT,
+    ];
+    let first: Value = serde_json::from_str(&run_cli(&db, &args, "")).expect("first receipt");
+    assert_no_marker("cli create", &first);
+    let second: Value = serde_json::from_str(&run_cli(&db, &args, "")).expect("second receipt");
+    assert_eq!(
+        second["id"], first["id"],
+        "the re-store must hit the same row: {second}"
+    );
+    assert_no_marker("cli store upsert", &second);
 }
 
 // ---------------------------------------------------------------------------
