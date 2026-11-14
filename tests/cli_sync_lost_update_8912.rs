@@ -13,6 +13,10 @@
 //! (`tempfile` honours `TMPDIR`), seeds both stores through the library
 //! funnel with explicit timestamps, and asserts the destination row and the
 //! exact JSON counters.
+//!
+//! L-6: a row the sync KEPT because the destination is newer is reported
+//! through tracing only (`kept_destination`, no wire key) and is never counted
+//! as applied: the full real-run report is asserted key by key.
 
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -356,5 +360,121 @@ fn sync_8912_refused_row_is_counted_and_exits_incomplete() {
         );
         let row = live_row(dest, &id).expect("dest row kept");
         assert_eq!(row.0, "t-8912-old-title", "{direction}");
+    }
+}
+
+/// The exact JSON report of a real run whose only offered row (per leg) is
+/// KEPT because the destination copy is newer. Every key is pinned, so a kept
+/// row counted as applied (or under any other counter, or under a new wire
+/// key) fails. Text mode names the same zero.
+#[test]
+fn sync_8912_kept_destination_row_is_not_counted_as_applied() {
+    let cases: [(&str, serde_json::Value, &str); 3] = [
+        (
+            "pull",
+            serde_json::json!({
+                "direction": "pull",
+                "imported": 0,
+                "attestation_downgraded": 0,
+                "forged_signature_skipped": 0,
+                "pubkey_bindings_stripped": 0,
+                "key_history_refused": 0,
+                "skipped_by_covenant": 0,
+                "refused": 0,
+            }),
+            "pulled 0 memories from remote",
+        ),
+        (
+            "push",
+            serde_json::json!({
+                "direction": "push",
+                "exported": 0,
+                "pubkey_bindings_stripped": 0,
+                "skipped_by_covenant": 0,
+                "refused": 0,
+            }),
+            "pushed 0 memories to remote",
+        ),
+        // merge: the inbound copy is older, so the local row is KEPT (pulled 0);
+        // the outbound leg then writes that newer local row onto the older
+        // remote copy, which is a real write (pushed 1), not the kept row.
+        (
+            "merge",
+            serde_json::json!({
+                "direction": "merge",
+                "pulled": 0,
+                "pushed": 1,
+                "attestation_downgraded": 0,
+                "forged_signature_skipped": 0,
+                "pubkey_bindings_stripped": 0,
+                "key_history_refused": 0,
+                "skipped_by_covenant": 0,
+                "refused": 0,
+            }),
+            "merged: pulled 0, pushed 1",
+        ),
+    ];
+    for (direction, want, text) in cases {
+        let dir = tempfile::tempdir().expect("tempdir under TMPDIR");
+        let local = dir.path().join("local.db");
+        let remote = dir.path().join("remote.db");
+        let (dest, src) = if direction == "push" {
+            (&remote, &local)
+        } else {
+            (&local, &remote)
+        };
+        let id = uuid::Uuid::new_v4().to_string();
+        seed(dest, &mem(&id, "t-8912-kept", DEST_CONTENT, NEWER));
+        seed(src, &mem(&id, "t-8912-kept", SRC_CONTENT, OLDER));
+
+        let (code, json, stderr) = run_sync(&local, &remote, direction);
+        assert_eq!(json, want, "{direction}: full report; stderr {stderr}");
+        assert_eq!(code, 0, "{direction}: stderr {stderr}");
+        let kept = live_row(dest, &id);
+        assert_eq!(
+            kept,
+            Some((
+                "t-8912-kept".to_string(),
+                DEST_CONTENT.to_string(),
+                NEWER.to_string()
+            )),
+            "{direction}: the newer destination row is kept byte for byte"
+        );
+        if direction == "merge" {
+            let pushed = live_row(&remote, &id).map(|r| r.1);
+            assert_eq!(
+                pushed.as_deref(),
+                Some(DEST_CONTENT),
+                "merge: pushed 1 is the newer local row landing on the remote"
+            );
+        }
+
+        // Text mode: a fresh pair, same shape, plain report line.
+        let dir = tempfile::tempdir().expect("tempdir under TMPDIR");
+        let local = dir.path().join("local.db");
+        let remote = dir.path().join("remote.db");
+        let (dest, src) = if direction == "push" {
+            (&remote, &local)
+        } else {
+            (&local, &remote)
+        };
+        seed(dest, &mem(&id, "t-8912-kept", DEST_CONTENT, NEWER));
+        seed(src, &mem(&id, "t-8912-kept", SRC_CONTENT, OLDER));
+        let out = Command::new(env!("CARGO_BIN_EXE_ai-memory"))
+            .env("AI_MEMORY_NO_CONFIG", "1")
+            .env("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0")
+            .args(["--db", local.to_str().expect("utf-8 path"), "sync"])
+            .arg(&remote)
+            .args(["--direction", direction])
+            .stdin(Stdio::null())
+            .output()
+            .expect("spawn ai-memory");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(out.status.code(), Some(0), "{direction} text: {stdout}");
+        assert_eq!(
+            stdout.lines().map(str::trim_end).collect::<Vec<_>>(),
+            vec![text],
+            "{direction} text: the whole stdout report"
+        );
     }
 }
