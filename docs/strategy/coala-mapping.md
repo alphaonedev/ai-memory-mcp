@@ -89,7 +89,7 @@ CoALA acknowledged the problem and noted no agent had solved it. ai-memory's str
 2. **Hook veto.** `pre_reflect` and `pre_store` hooks refuse procedural-memory writes with typed `Deny { reason, code }` returning `ReflectError::HookVeto`.
 3. **Audited refusal.** Every depth-cap refusal writes a `reflection.depth_exceeded` row to `signed_events` under canonical-CBOR.
 4. **Operator-signed governance rules.** L1-6 `governance_rules` table; `verify_rule_signature` runs on load; bad signature refuses daemon start. MCP-side mutation is operator-only.
-5. **Identical-digest reproducibility.** L2-6 `memory_skill_promote_from_reflection` produces a SKILL.md with `derived_from_reflection_id` frontmatter; promote → export → re-register produces the IDENTICAL SHA-256 digest.
+5. **Identical-digest reproducibility.** L2-6 `memory_skill_promote_from_reflection` produces a SKILL.md with `derived_from_reflection_id` frontmatter; promote → export → re-register by the promoting principal produces the IDENTICAL SHA-256 digest (a different principal is refused, v1.0.0 #8832).
 6. **Compaction rollback.** v0.8 Pillar 2.5 Stage-6 verify+rollback means even successful procedural-memory growth is reversible.
 
 ---

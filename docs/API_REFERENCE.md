@@ -1786,6 +1786,27 @@ or hidden sources refuse before bundle/resource registration or promotion audit.
 PostgreSQL promotion remains 501 (#3183); its allowed path is not applicable until
 #2804. Unscoped substrate namespaces remain excluded.
 
+`GET /api/v1/skill/{id}`, `GET /api/v1/skill/{id}/resource`,
+`POST /api/v1/skill/{id}/export` and `POST /api/v1/skill/{id}/compose` verify the
+skill digest, every resource digest and the stored signature on each read
+(#8834) and render one closed vocabulary: `404` for `skill not found: <id>`
+(a missing skill and a skill the caller may not read alike)
+or `resource not found: skill_id=<id> path=<path>`, `400` for a verify-on-read
+failure (`skill integrity check failed: ...`, including a signer named without
+a signature; see
+[`agent-skills.md`](agent-skills.html#ed25519-attestation)) or a reference-only
+resource, and the sanitized `500` for a store or decode failure and anything
+else (#1261). Export additionally answers `400` with its own target-folder
+refusals (#3762). `signing_agent` appears in a read payload only for a
+signature that verified. `GET /api/v1/skill/list` returns at most 1000 rows
+with `truncated: true` when more matched, and answers the sanitized `500`
+when the store fails rather than an empty list. `POST /api/v1/skill` refuses
+caller-supplied metadata keys beginning with `_` with `400` (#8832), except a
+top-level `_visibility` binding in exactly the shape promote stamps for the
+authenticated admin caller; a binding naming another principal is refused
+with a message naming the remedy (see
+[`agent-skills.md`](agent-skills.html#round-trip-semantics)).
+
 
 HTTP `POST /api/v1/capture_turn` uses the HTTP-direct attestation posture (#3406): unsigned requests are refused with `403 ATTESTATION_FAILED` by default; `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0` or `false` explicitly permits them and emits an audit admission event. A presented host signature must verify against the L4 host-key allowlist **and** the resolved caller's bound public key, on both SQLite and PostgreSQL; the opt-out never relaxes these checks. The legacy envelope signs only `host_session_id`, `host_turn_index`, `role`, and `content` (NUL-separated), so it remains `signed_by_peer`, never `agent_attested`: identity, namespace, and timestamp are not signed fields. Durable `(session, turn)` deduplication makes repeats idempotent (`200`, the original memory ID, no new write); the 600-second `SignableWrite` replay ledger does not apply. MCP capture behavior is unchanged. A fully bound capture envelope is tracked separately in #3575.
 

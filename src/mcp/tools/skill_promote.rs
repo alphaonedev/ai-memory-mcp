@@ -55,7 +55,10 @@
 //! frontmatter + body + sorted resource digests) and by serializing the
 //! constructed SKILL.md in the same shape `memory_skill_export`
 //! produces it on disk. The accompanying integration test pins the
-//! contract.
+//! contract. The stamped `_visibility` binding names the promoting
+//! principal, so the identical digest holds when that principal
+//! re-registers; another principal is refused (#8832,
+//! `check_register_metadata`).
 
 use crate::mcp::param_names;
 use crate::models::field_names;
@@ -66,7 +69,8 @@ use crate::identity::keypair::AgentKeypair;
 use crate::models::{MemoryKind, MemoryLinkRelation};
 
 use super::skill_register::{
-    RegisterResult, register_core, resource_digest, validate_parameters_schema,
+    RegisterCoreError, RegisterResult, SupersedeGuard, register_core, resource_digest,
+    validate_parameters_schema,
 };
 
 /// Compiled default for `governance.skill_promotion_min_depth` when the
@@ -124,7 +128,9 @@ pub fn handle_skill_promote_from_reflection(
         &caller,
         read_caller.as_deref(),
     )
-    .map_err(|error| crate::mcp::error_text::mcp_foreign_err("as_deref", error))
+    .map_err(|error| {
+        crate::mcp::error_text::mcp_foreign_err("skill_promote_from_reflection", error)
+    })
 }
 
 /// Shared SQLite promotion body. HTTP preserves its authenticated actor separately
@@ -318,16 +324,31 @@ pub(crate) fn handle_skill_promote_for_caller(
     }
 
     // ─── 5. Metadata: provenance edge to the source reflection ─────────
+    // #8832 — the skill inherits the NARROWEST scope of the reflection and
+    // every source, owned by the promoting caller. The binding is sealed into
+    // the digest (`skill_integrity::canonical_frontmatter`) and enforced by
+    // every read funnel, so private evidence is never republished wider.
+    let scope = super::skill_integrity::narrowest_scope(
+        &reflection.namespace,
+        std::iter::once(&reflection)
+            .chain(sources.iter())
+            .map(|m| (m.namespace.as_str(), &m.metadata)),
+    );
     let mut metadata = json!({
         "derived_from_reflection_id": reflection_id,
         "original_reflection_depth": reflection.reflection_depth,
         "promoted_by": caller,
+        (super::skill_integrity::VISIBILITY_META_KEY): {
+            (crate::META_KEY_SCOPE): scope.as_str(),
+            (crate::META_KEY_AGENT_ID): caller,
+        },
     });
     // v0.9.0 §11.5 B7-SKILL (#1865) — mirror `parameters_schema` into the
     // same `skills.metadata` column `skill_register` uses, so a promoted
     // skill's schema is queryable the same way regardless of which path
     // minted the row. Additive-only: does not change the signing digest
-    // (which covers frontmatter + body + resource digests, not metadata).
+    // (which covers frontmatter + body + resource digests and, since #8832,
+    // only the `_visibility` key of metadata).
     if let Some(schema) = parameters_schema {
         if let Value::Object(ref mut map) = metadata {
             map.insert(field_names::PARAMETERS_SCHEMA.to_string(), schema.clone());
@@ -369,6 +390,9 @@ pub(crate) fn handle_skill_promote_for_caller(
         res_digests,
         &resources,
         active_keypair,
+        // #8832 — promote's binding is substrate-derived, so its supersede
+        // rule is unchanged (the shadow guard is the register path's).
+        SupersedeGuard::Unguarded,
     )
     .map_err(register_core_error)?;
 
@@ -395,7 +419,8 @@ pub(crate) fn handle_skill_promote_for_caller(
         "derived_from_reflection_id": outcome.reflection_id,
         "original_reflection_depth": outcome.reflection_depth,
         "sources_attached": outcome.sources_attached,
-        "signed": active_keypair.is_some(),
+        // #8834 — register_core signs only with a private key.
+        "signed": active_keypair.is_some_and(|kp| kp.private.is_some()),
         // v0.9.0 §11.5 B7-SKILL (#1865) — surface the version-chain
         // position (chain already existed via supersede-on-register).
         "version": outcome.version,
@@ -476,7 +501,11 @@ const RETIRED_LINEAGE_REFUSAL_SUFFIX: &str = "is retired; unretire before re-reg
 /// `register_core` string stays untyped: it is either already-sanitized
 /// `mcp_foreign_err` output or foreign serialization / compression text,
 /// and must keep classifying as foreign so it is withheld (ERRORS-15).
-fn register_core_error(msg: String) -> anyhow::Error {
+fn register_core_error(error: RegisterCoreError) -> anyhow::Error {
+    let msg = match error {
+        RegisterCoreError::Refused(refusal) => return anyhow::Error::new(refusal),
+        RegisterCoreError::Text(msg) => msg,
+    };
     if msg.starts_with("skill lineage '") && msg.ends_with(RETIRED_LINEAGE_REFUSAL_SUFFIX) {
         crate::errors::refusal(msg)
     } else {
@@ -647,7 +676,9 @@ mod tests {
     #[test]
     fn issue_6133_other_register_core_strings_stay_foreign() {
         let _agent_id_env_lock = crate::identity::agent_id_env_test_lock();
-        let foreign = register_core_error("zstd compress error: /srv/tenant/x EACCES".into());
+        let foreign = register_core_error(RegisterCoreError::Text(
+            "zstd compress error: /srv/tenant/x EACCES".into(),
+        ));
         assert_eq!(
             crate::mcp::error_text::mcp_foreign_err("issue_6133", foreign),
             crate::mcp::error_text::DB_ERROR_TEXT

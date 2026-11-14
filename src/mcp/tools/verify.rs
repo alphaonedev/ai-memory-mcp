@@ -270,7 +270,7 @@ pub fn handle_verify(
     };
 
     Ok(json!({
-        "signature_verified": verified,
+        (field_names::SIGNATURE_VERIFIED): verified,
         (field_names::ATTEST_LEVEL): attest_out.as_str(),
         "signed_by": signed_by,
         "signed_at": signed_at,

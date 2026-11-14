@@ -220,6 +220,7 @@ fn sg_sk_2_register_export_reregister_identical_digest() {
         }),
         None,
         dir_a.path(),
+        None,
     )
     .expect("export");
     assert_eq!(export_payload["exported"], true);
@@ -298,6 +299,7 @@ fn sg_sk_3_promote_from_reflection_produces_valid_agent_skills_folder() {
         }),
         None,
         dir.path(),
+        None,
     )
     .expect("export promoted skill");
     assert_eq!(export_payload["exported"], true);

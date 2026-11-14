@@ -94,6 +94,9 @@ fn insert_skill_with_metadata(
         rusqlite::params![id, namespace, name, description, metadata_json, body_blob, digest, now],
     )
     .expect("insert skill");
+    // #8834 — the read path verifies the digest (now covering metadata's
+    // scope binding); seal the hand-inserted fixture.
+    ai_memory::mcp::reseal_skill_digest_for_tests(conn, &id).expect("reseal");
     id
 }
 

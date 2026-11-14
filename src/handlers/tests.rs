@@ -388,7 +388,7 @@ async fn create_and_update_with_metadata() {
 use axum::{Router, body::Body, routing::get as axum_get, routing::post as axum_post};
 use tower::ServiceExt as _;
 
-fn test_app_state(db: Db) -> AppState {
+pub(super) fn test_app_state(db: Db) -> AppState {
     // #1751 — pin the lib-test binary to the explicit permissive
     // attestation opt-out so the unsigned HTTP create fixtures below
     // keep exercising their actual subject matter (required-default

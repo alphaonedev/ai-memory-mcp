@@ -409,12 +409,7 @@ fn pg_hard_delete_funnels_unproject_from_age_2397() {
             missing.push(format!("  {name}: function not found in {PG_ADAPTER_PATH}"));
             continue;
         };
-        // `delete` / `apply_remote_deletion` run pool-direct (no surrounding
-        // tx) and route through the `unproject_memory_ids_best_effort`
-        // wrapper, which calls the helper on their behalf.
-        let unprojects =
-            span.contains(AGE_UNPROJECT_CALL) || span.contains("unproject_memory_ids_best_effort(");
-        if !unprojects {
+        if !unprojects_or_delegates(&src, span, DELEGATION_HOPS) {
             missing.push(format!(
                 "  {name}: hard-deletes a memories row without unprojecting it \
                  from the AGE memory_graph — leaves a ghost node kg_query serves"
@@ -426,6 +421,76 @@ fn pg_hard_delete_funnels_unproject_from_age_2397() {
         "#2397 (N17): postgres hard-delete funnels missing AGE unprojection \
          (the graph projection would serve deleted state as live):\n{}",
         missing.join("\n")
+    );
+}
+
+/// How many `self.<method>(..)` delegation hops the AGE-unprojection check
+/// follows from a named funnel to the method that owns its DELETE.
+const DELEGATION_HOPS: usize = 4;
+
+/// True when `span` unprojects from AGE itself, or (#8741) holds no
+/// `DELETE FROM memories` of its own and delegates through `self.<m>(..)`
+/// to an adapter method that does. A span that DELETEs must unproject in
+/// its own body, so a sibling call can never cover for a local DELETE.
+fn unprojects_or_delegates(src: &str, span: &str, hops: usize) -> bool {
+    // `delete` / `apply_remote_deletion` run pool-direct (no surrounding
+    // tx) and route through the `unproject_memory_ids_best_effort`
+    // wrapper, which calls the helper on their behalf.
+    if span.contains(AGE_UNPROJECT_CALL) || span.contains("unproject_memory_ids_best_effort(") {
+        return true;
+    }
+    if hops == 0 || has_sql(span, "DELETE FROM memories") {
+        return false;
+    }
+    delegated_methods(span).iter().any(|callee| {
+        fn_span(src, callee).is_some_and(|inner| unprojects_or_delegates(src, inner, hops - 1))
+    })
+}
+
+/// The `self.<ident>(` method names called in `span`, in order.
+fn delegated_methods(span: &str) -> Vec<String> {
+    span.match_indices("self.")
+        .filter_map(|(at, _)| {
+            let rest = &span[at + "self.".len()..];
+            let end = rest.find(|c: char| !(c.is_alphanumeric() || c == '_'))?;
+            (end > 0 && rest[end..].starts_with('(')).then(|| rest[..end].to_string())
+        })
+        .collect()
+}
+
+/// #8741 — the delegation walk is load-bearing both ways: a delegator to an
+/// unprojecting owner passes, a delegator to a non-unprojecting method and a
+/// span with its own DELETE that only calls an unprojecting sibling fail.
+#[test]
+fn age_unprojection_follows_delegation_only_without_a_local_delete_8741() {
+    let src = concat!(
+        "    async fn thin(&self) -> R {\n",
+        "        self.owner(ctx).await\n",
+        "    }\n",
+        "    pub async fn owner(&self) -> R {\n",
+        "        sqlx::query(\"DELETE FROM memories WHERE id = $1\");\n",
+        "        unproject_memory_from_age(&mut tx, &ids).await;\n",
+        "    }\n",
+        "    async fn ghost_thin(&self) -> R {\n",
+        "        self.ghost(ctx).await\n",
+        "    }\n",
+        "    async fn ghost(&self) -> R {\n",
+        "        sqlx::query(\"DELETE FROM memories WHERE id = $1\");\n",
+        "    }\n",
+        "    async fn local_delete(&self) -> R {\n",
+        "        sqlx::query(\"DELETE FROM memories WHERE id = $1\");\n",
+        "        self.owner(ctx).await\n",
+        "    }\n",
+    );
+    let check = |name: &str| {
+        let span = fn_span(src, name).expect("fixture span");
+        unprojects_or_delegates(src, span, DELEGATION_HOPS)
+    };
+    assert!(check("thin"), "a delegator to an unprojecting owner passes");
+    assert!(!check("ghost_thin"), "a delegator to a ghost DELETE fails");
+    assert!(
+        !check("local_delete"),
+        "a local DELETE is not covered by an unprojecting sibling call"
     );
 }
 

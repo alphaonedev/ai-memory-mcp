@@ -556,14 +556,30 @@ async fn update_memory_write(
                             None,
                         )
                         .await;
-                        Json(json!(mem)).into_response()
+                        // #9087 — PG update fans out through the funnel
+                        // before it returns (pre-fix it never did).
+                        let mut receipt = json!(mem);
+                        if let Err(resp) = super::fed_fanout::fanout_into(
+                            &app,
+                            super::fed_fanout::FanoutEffect::Store(&mem),
+                            &mut receipt,
+                        )
+                        .await
+                        {
+                            return resp;
+                        }
+                        Json(receipt).into_response()
                     }
                     Err(_) => {
                         // Fallback wire shape — no `Memory` available to
                         // pull namespace/agent_id from. Dispatch is
                         // best-effort; without the namespace the event
                         // would have nowhere to anchor, so skip in this
-                        // tail.
+                        // tail. With federation the peers cannot be sent
+                        // a row the origin cannot read: exact 202 (#9087).
+                        if let Err(resp) = super::fed_fanout::readback_failed(&app, &id) {
+                            return resp;
+                        }
                         Json(json!({"updated": true, "id": id})).into_response()
                     }
                 };
@@ -846,21 +862,22 @@ async fn update_memory_write(
             // v0.6.0.1: fan out the mutation to peers so remote readers
             // see the update, not the pre-update row. insert_if_newer on
             // peers sees a newer updated_at and applies.
+            // #8741 / #9087 — the one fan-out funnel. Pre-fix a broadcast
+            // `Err` and a failed read-back were both a silent 200.
             let mut receipt = json!(mem);
-            if let (Some(fed), Some(m)) = (app.federation.as_ref(), mem.as_ref())
-                && let Ok(tracker) = crate::federation::broadcast_store_quorum(fed, m).await
-            {
-                match crate::federation::finalise_quorum(&tracker) {
-                    Ok(got) => {
-                        receipt[crate::write_receipt::QUORUM_ACKS_FIELD] = json!(got);
-                        receipt[crate::write_receipt::QUORUM_N_FIELD] = json!(fed.policy.n);
-                        receipt[crate::write_receipt::QUORUM_REQUIRED_FIELD] = json!(fed.policy.w);
-                    }
-                    Err(err) => {
-                        let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
-                        return super::under_replicated_response(&payload);
-                    }
+            let fanned = match mem.as_ref() {
+                Some(m) => {
+                    super::fed_fanout::fanout_into(
+                        &app,
+                        super::fed_fanout::FanoutEffect::Store(m),
+                        &mut receipt,
+                    )
+                    .await
                 }
+                None => super::fed_fanout::readback_failed(&app, &resolved_id),
+            };
+            if let Err(resp) = fanned {
+                return resp;
             }
             Json(receipt).into_response()
         }
@@ -1214,11 +1231,20 @@ pub async fn delete_memory(
                 let archived = target
                     .as_ref()
                     .is_some_and(|m| crate::visibility::inbox_delete_retains(&m.namespace));
-                (
-                    StatusCode::OK,
-                    Json(json!({"deleted": true, "id": id, "archived": archived})),
+                // #9005 / #9087 — the PG delete sends the deletion through
+                // the funnel before it returns (pre-fix it never did).
+                let deleted_id = target.as_ref().map_or(id.as_str(), |m| m.id.as_str());
+                let mut receipt = json!({"deleted": true, "id": id, "archived": archived});
+                if let Err(resp) = super::fed_fanout::fanout_into(
+                    &app,
+                    super::fed_fanout::FanoutEffect::Delete(deleted_id),
+                    &mut receipt,
                 )
-                    .into_response()
+                .await
+                {
+                    return resp;
+                }
+                (StatusCode::OK, Json(receipt)).into_response()
             }
             Err(e) => store_err_to_response(e),
         };
@@ -1450,16 +1476,19 @@ pub async fn delete_memory(
                 ),
             ));
             // v0.6.0.1: propagate tombstone via sync_push.deletions.
-            if let Some(fed) = app.federation.as_ref()
-                && let Ok(tracker) =
-                    crate::federation::broadcast_delete_quorum(fed, &target.id).await
-                && let Err(err) = crate::federation::finalise_quorum(&tracker)
+            // #8741 — through the one funnel (pre-fix a broadcast `Err`
+            // was a silent 200).
+            let mut receipt = json!({"deleted": true, "archived": archived});
+            if let Err(resp) = super::fed_fanout::fanout_into(
+                &app,
+                super::fed_fanout::FanoutEffect::Delete(&target.id),
+                &mut receipt,
+            )
+            .await
             {
-                // #869 — typed 503 envelope via the shared helper.
-                let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
-                return super::under_replicated_response(&payload);
+                return resp;
             }
-            Json(json!({"deleted": true, "archived": archived})).into_response()
+            Json(receipt).into_response()
         }
         _ => (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response(),
     }
@@ -1681,28 +1710,27 @@ pub async fn promote_memory(
                 // we do NOT roll back the local commit on quorum
                 // failure; the sync daemon's eventual-consistency
                 // loop catches stragglers.
-                if let Some(fed) = app.federation.as_ref() {
-                    let promoted_mem = match app.store.get(&ctx, &target.id).await {
-                        Ok(m) => Some(m),
-                        Err(_) => None,
-                    };
-                    if let Some(ref m) = promoted_mem {
-                        match crate::federation::broadcast_store_quorum(fed, m).await {
-                            Ok(tracker) => {
-                                if let Err(err) = crate::federation::finalise_quorum(&tracker) {
-                                    // #869 — typed 503 envelope via the shared helper.
-                                    let payload =
-                                        crate::federation::QuorumNotMetPayload::from_err(&err);
-                                    return super::under_replicated_response(&payload);
-                                }
-                            }
-                            Err(err) => {
-                                let payload =
-                                    crate::federation::QuorumNotMetPayload::from_err(&err);
-                                return super::under_replicated_response(&payload);
-                            }
-                        }
+                let mut receipt = json!({
+                    "promoted": true,
+                    "id": target.id,
+                    "tier": Tier::Long.as_str(),
+                    (field_names::STORAGE_BACKEND): "postgres",
+                });
+                // #8741 — the one funnel; a failed read-back is the exact
+                // 202, never a silent skip of the fan-out.
+                let fanned = match app.store.get(&ctx, &target.id).await {
+                    Ok(m) => {
+                        super::fed_fanout::fanout_into(
+                            &app,
+                            super::fed_fanout::FanoutEffect::Store(&m),
+                            &mut receipt,
+                        )
+                        .await
                     }
+                    Err(_) => super::fed_fanout::readback_failed(&app, &target.id),
+                };
+                if let Err(resp) = fanned {
+                    return resp;
                 }
                 // #950 SECURITY-medium (Track A QC sweep, 2026-05-20)
                 // — fire subscription dispatch on the postgres promote
@@ -1721,13 +1749,7 @@ pub async fn promote_memory(
                     None,
                 )
                 .await;
-                Json(json!({
-                    "promoted": true,
-                    "id": target.id,
-                    "tier": Tier::Long.as_str(),
-                    (field_names::STORAGE_BACKEND): "postgres",
-                }))
-                .into_response()
+                Json(receipt).into_response()
             }
             Err(crate::store::StoreError::NotFound { .. }) => {
                 (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response()
@@ -1947,16 +1969,25 @@ pub async fn promote_memory(
                 details,
             );
             drop(lock);
-            if let (Some(fed), Some(m)) = (app.federation.as_ref(), promoted_mem.as_ref())
-                && let Ok(tracker) = crate::federation::broadcast_store_quorum(fed, m).await
-                && let Err(err) = crate::federation::finalise_quorum(&tracker)
-            {
-                // #869 — typed 503 envelope via the shared helper.
-                let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
-                return super::under_replicated_response(&payload);
+            // #8741 — the one funnel (pre-fix a broadcast `Err` or a failed
+            // read-back was a silent 200).
+            let mut receipt =
+                json!({"promoted": true, "id": resolved_id, "tier": Tier::Long.as_str()});
+            let fanned = match promoted_mem.as_ref() {
+                Some(m) => {
+                    super::fed_fanout::fanout_into(
+                        &app,
+                        super::fed_fanout::FanoutEffect::Store(m),
+                        &mut receipt,
+                    )
+                    .await
+                }
+                None => super::fed_fanout::readback_failed(&app, &resolved_id),
+            };
+            if let Err(resp) = fanned {
+                return resp;
             }
-            Json(json!({"promoted": true, "id": resolved_id, "tier": Tier::Long.as_str()}))
-                .into_response()
+            Json(receipt).into_response()
         }
         Ok((false, _)) => {
             (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response()

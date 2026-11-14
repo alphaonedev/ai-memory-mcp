@@ -168,9 +168,7 @@ pub async fn restore_archive(
     );
     // v0.7.0 Wave-3 Continuation 3 (Phase 19) — postgres-backed daemons
     // route through the SAL `archive_restore` trait method. Federation
-    // fanout for restore stays sqlite-only (the `broadcast_restore_quorum`
-    // path uses sqlite-coupled fed-tracker state); postgres-backed
-    // operators relying on multi-node consistency should poll peers.
+    // fan-out runs through the shared funnel on this branch too (#9052).
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
         // v1.0.0 #3271 — pass the resolved `caller` (header) so the SAL
@@ -206,10 +204,20 @@ pub async fn restore_archive(
                     )
                     .await;
                 }
-                Json(
-                    json!({"restored": true, "id": id, (field_names::STORAGE_BACKEND): "postgres"}),
+                // #9052 (slip-pg-52) — the PG restore fans out through the
+                // funnel before it returns.
+                let mut receipt =
+                    json!({"restored": true, "id": id, (field_names::STORAGE_BACKEND): "postgres"});
+                if let Err(resp) = super::fed_fanout::fanout_into(
+                    &app,
+                    super::fed_fanout::FanoutEffect::Restore(&id),
+                    &mut receipt,
                 )
-                .into_response()
+                .await
+                {
+                    return resp;
+                }
+                Json(receipt).into_response()
             }
             Ok(false) => (
                 StatusCode::NOT_FOUND,
@@ -263,24 +271,19 @@ pub async fn restore_archive(
     // set (the testbook-v3 S29 assertion). Same posture as
     // `archive_by_ids`: on a quorum miss we short-circuit with 503 so
     // operators can retry.
-    if let Some(fed) = app.federation.as_ref() {
-        match crate::federation::broadcast_restore_quorum(fed, &id).await {
-            Ok(tracker) => {
-                if let Err(err) = crate::federation::finalise_quorum(&tracker) {
-                    // #869 — typed 503 envelope via the shared helper.
-                    let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
-                    return super::under_replicated_response(&payload);
-                }
-            }
-            Err(e) => {
-                // Local commit already landed — sync-daemon catches
-                // stragglers. Same posture as `fanout_or_pending`.
-                tracing::warn!("restore fanout error (local committed): {e:?}");
-            }
-        }
+    // #8741 — the one funnel (pre-fix a broadcast `Err` was warned and
+    // answered 200).
+    let mut receipt = json!({"restored": true, "id": id});
+    if let Err(resp) = super::fed_fanout::fanout_into(
+        &app,
+        super::fed_fanout::FanoutEffect::Restore(&id),
+        &mut receipt,
+    )
+    .await
+    {
+        return resp;
     }
-
-    Json(json!({"restored": true, "id": id})).into_response()
+    Json(receipt).into_response()
 }
 
 #[derive(Debug, Deserialize)]
@@ -449,13 +452,13 @@ pub struct ArchiveByIdsBody {
 /// POST /api/v1/archive — explicit archive of the given memory ids
 /// (S29). For each id:
 ///   1. Call `db::archive_memory` locally to soft-move the row.
-///   2. If federation is configured, broadcast via
-///      `broadcast_archive_quorum` so peers land in the same terminal
-///      state (row out of `memories`, row into `archived_memories`).
+///   2. If federation is configured, every archived id is broadcast via
+///      `broadcast_archive_quorum` (the `fed_fanout::fanout_bulk_into`
+///      funnel, both backends) so peers land in the same terminal state
+///      (row out of `memories`, row into `archived_memories`).
 ///
-/// On a quorum miss for ANY id, short-circuit with 503 via the shared
-/// `fanout_or_pending`-style payload. This matches the posture of the
-/// delete + consolidate fanout endpoints.
+/// On a quorum miss (or broadcast error) for ANY id the response is the
+/// exact `quorum_not_met` 202; the local archives stay committed.
 ///
 /// Response body:
 /// ```json
@@ -537,9 +540,8 @@ pub async fn archive_by_ids(
     let mut missing: Vec<String> = Vec::new();
 
     // v0.7.0 Wave-3 Continuation 3 (Phase 19) — postgres-backed daemons
-    // route through the SAL `archive_by_ids` trait method. The federation
-    // fanout stays sqlite-only; postgres operators relying on multi-node
-    // consistency should poll peers.
+    // route through the SAL `archive_by_ids` trait method. Federation
+    // fan-out runs through the shared bulk funnel on both branches (#9052).
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
         // QC P1 fix (2026-05-20): use the resolved `caller` (header) as
@@ -617,17 +619,26 @@ pub async fn archive_by_ids(
             )
             .await;
         }
-        return (
-            StatusCode::OK,
-            Json(json!({
-                "archived": archived,
-                "missing": missing,
-                "count": archived.len(),
-                "reason": reason,
-                (field_names::STORAGE_BACKEND): "postgres",
-            })),
+        // #9052 (slip-pg-52) — the PG archive fans out through the bulk
+        // funnel before it returns.
+        let mut receipt = json!({
+            "archived": archived,
+            "missing": missing,
+            "count": archived.len(),
+            "reason": reason,
+            (field_names::STORAGE_BACKEND): "postgres",
+        });
+        if let Err(resp) = super::fed_fanout::fanout_bulk_into(
+            &app,
+            super::fed_fanout::BulkEffect::Archive,
+            &archived,
+            &mut receipt,
         )
-            .into_response();
+        .await
+        {
+            return resp;
+        }
+        return (StatusCode::OK, Json(receipt)).into_response();
     }
 
     for id in &body.ids {
@@ -669,36 +680,28 @@ pub async fn archive_by_ids(
             continue;
         }
 
-        // Fanout. Mirror the shape used by the other
-        // quorum-backed write endpoints (delete, consolidate) — on a
-        // miss, surface the `quorum_not_met` payload with 503 + Retry-After.
-        if let Some(fed) = app.federation.as_ref() {
-            match crate::federation::broadcast_archive_quorum(fed, id).await {
-                Ok(tracker) => {
-                    if let Err(err) = crate::federation::finalise_quorum(&tracker) {
-                        // #869 — typed 503 envelope via the shared helper.
-                        let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
-                        return super::under_replicated_response(&payload);
-                    }
-                }
-                Err(e) => {
-                    // Local commit already landed — sync-daemon catches
-                    // stragglers. Same posture as `fanout_or_pending`.
-                    tracing::warn!("archive fanout error (local committed): {e:?}");
-                }
-            }
-        }
         archived.push(id.clone());
     }
 
-    (
-        StatusCode::OK,
-        Json(json!({
-            "archived": archived,
-            "missing": missing,
-            "count": archived.len(),
-            "reason": reason,
-        })),
+    // #8741 — every archived id fans out through the one bulk funnel,
+    // the same call the postgres branch above makes (pre-fix a broadcast
+    // `Err` was warned and answered 200, and a mid-batch miss left the
+    // rest of the batch un-archived locally).
+    let mut receipt = json!({
+        "archived": archived,
+        "missing": missing,
+        "count": archived.len(),
+        "reason": reason,
+    });
+    if let Err(resp) = super::fed_fanout::fanout_bulk_into(
+        &app,
+        super::fed_fanout::BulkEffect::Archive,
+        &archived,
+        &mut receipt,
     )
-        .into_response()
+    .await
+    {
+        return resp;
+    }
+    (StatusCode::OK, Json(receipt)).into_response()
 }

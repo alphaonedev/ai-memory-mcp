@@ -25,7 +25,7 @@ use crate::models::field_names;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension as _, params};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
@@ -204,6 +204,34 @@ pub(super) struct RegisterResult {
     pub version: i64,
 }
 
+/// Why [`register_core`] refused. A type, so the #8832 shadow refusal keeps
+/// its class and wire code on every surface (ERRORS-09) instead of being
+/// flattened to text; every other failure keeps its historic text.
+#[derive(Debug)]
+pub(super) enum RegisterCoreError {
+    /// A typed register-metadata refusal (the #8832 shadow guard).
+    Refused(super::skill_integrity::RegisterMetadataRefusal),
+    /// Every other failure, as caller-facing text.
+    Text(String),
+}
+
+impl From<String> for RegisterCoreError {
+    fn from(text: String) -> Self {
+        Self::Text(text)
+    }
+}
+
+/// Whether a register may supersede a current row bound to another
+/// principal (#8832, B-12). The register path guards; promote does not (its
+/// binding is substrate-derived from the reflection's own visibility).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SupersedeGuard {
+    /// A caller-supplied binding may supersede only its own bound lineage.
+    BoundToSamePrincipal,
+    /// The historic rule: any current row is superseded.
+    Unguarded,
+}
+
 /// Core registration logic shared by the folder and inline paths.
 ///
 /// `canonical_fm_json` is the sorted JSON encoding of the frontmatter
@@ -221,17 +249,20 @@ pub(super) fn register_core(
     resource_digests: Vec<Vec<u8>>,
     resources: &[(String, String, Vec<u8>)], // (path, kind, content)
     active_keypair: Option<&AgentKeypair>,
-) -> Result<RegisterResult, String> {
-    // Build canonical frontmatter JSON for digest computation.
-    let canonical_fm = serde_json::to_vec(&json!({
-        "namespace": namespace,
-        "name": name,
-        (field_names::DESCRIPTION): description,
-        "license": license,
-        (field_names::COMPATIBILITY): compatibility,
-        (field_names::ALLOWED_TOOLS): allowed_tools,
-    }))
-    .map_err(|e| format!("frontmatter JSON error: {e}"))?;
+    supersede_guard: SupersedeGuard,
+) -> Result<RegisterResult, RegisterCoreError> {
+    // Build canonical frontmatter JSON for digest computation. #8832 — the
+    // single canonical encoder the verified read path recomputes with, so a
+    // `_visibility` scope binding in `metadata` is sealed into the digest.
+    let canonical_fm = super::skill_integrity::canonical_frontmatter(
+        namespace,
+        name,
+        description,
+        license,
+        compatibility,
+        allowed_tools,
+        metadata,
+    )?;
 
     let digest = compute_skill_digest(&canonical_fm, body_bytes, resource_digests);
 
@@ -247,7 +278,12 @@ pub(super) fn register_core(
                 );
                 signing_key.sign(&digest).to_bytes().to_vec()
             });
-            (sig, Some(kp.agent_id.clone()))
+            // #8834 (security M1 b) — the signer is stored only beside a
+            // signature it produced: a keypair without a private key leaves
+            // the row unsigned and unattributed, never a named signer with no
+            // signature (which the verified read path refuses).
+            let agent = sig.as_ref().map(|_| kp.agent_id.clone());
+            (sig, agent)
         } else {
             (None, None)
         };
@@ -285,15 +321,18 @@ pub(super) fn register_core(
     let conn: &Connection = &tx;
 
     // Find the current (non-superseded) row for this (namespace, name),
-    // carrying its `retired_at` so we can enforce the #2024 retire REFUSE.
-    let prev: Option<(String, Option<i64>)> = conn
+    // carrying its `retired_at` so we can enforce the #2024 retire REFUSE,
+    // and its stored metadata for the #8832 shadow guard. #8832 — a read
+    // error fails closed (it no longer reads as "no current row").
+    let prev: Option<(String, Option<i64>, String)> = conn
         .query_row(
-            "SELECT id, retired_at FROM skills \
+            "SELECT id, retired_at, metadata FROM skills \
              WHERE namespace = ?1 AND name = ?2 AND superseded_by IS NULL",
             params![namespace, name],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
-        .ok();
+        .optional()
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("skill register current row", e))?;
 
     // #2024 — REFUSE re-registration onto a RETIRED lineage. This runs
     // INSIDE the BEGIN IMMEDIATE tx (which took the write lock up front),
@@ -301,12 +340,23 @@ pub(super) fn register_core(
     // retire mutation serialises against us, and the RAII drop of `tx`
     // rolls back on this early return. Unretire the lineage before
     // re-registering.
-    if matches!(prev, Some((_, Some(_)))) {
-        return Err(format!(
+    if matches!(prev, Some((_, Some(_), _))) {
+        return Err(RegisterCoreError::Text(format!(
             "skill lineage '{namespace}/{name}' is retired; unretire before re-registering"
+        )));
+    }
+    // #8832 (B-12) — a bound register never supersedes (shadows) a current
+    // row that is not bound to the same principal. Inside the IMMEDIATE tx,
+    // so the row checked is the row superseded.
+    if supersede_guard == SupersedeGuard::BoundToSamePrincipal
+        && let Some((_, _, prev_metadata)) = &prev
+        && !super::skill_integrity::bound_register_may_supersede(metadata, prev_metadata)
+    {
+        return Err(RegisterCoreError::Refused(
+            super::skill_integrity::RegisterMetadataRefusal::ShadowsExisting,
         ));
     }
-    let prev_id: Option<String> = prev.map(|(id, _)| id);
+    let prev_id: Option<String> = prev.map(|(id, _, _)| id);
 
     // Insert new row.
     conn.execute(
@@ -415,11 +465,50 @@ pub(super) fn register_core(
 // Handler
 // ---------------------------------------------------------------------------
 
+/// MCP and CLI entry. The principal a caller-supplied scope binding is held
+/// to is the process's authenticated identity (`AI_MEMORY_AGENT_ID`, else the
+/// durable host default), resolved with no request field: the same identity
+/// `memory_skill_promote_from_reflection` stamps when the request names none.
+/// #8832 (B-10) — the host default (`host:<hostname>`, which differs per
+/// host), an anonymous id and a reserved identity are not resolved
+/// principals: under them every binding is refused and a plain register
+/// is unchanged.
+///
+/// # Errors
+/// The caller-facing refusal text.
 pub fn handle_skill_register(
     conn: &Connection,
     params: &Value,
     active_keypair: Option<&AgentKeypair>,
 ) -> Result<Value, String> {
+    let principal = crate::identity::resolve_governance_subject(None, None, "register skills")
+        .map_err(|e| e.to_string())?;
+    handle_skill_register_as(conn, params, active_keypair, &principal).map_err(register_error_text)
+}
+
+/// #8832 — the caller-facing text of a failed register: a typed refusal
+/// root keeps its fixed text, a foreign root (storage, filesystem) never
+/// reaches the caller: it goes to the operator log and the caller gets the
+/// closed class text (#3713, `mcp_foreign_err`).
+fn register_error_text(e: anyhow::Error) -> String {
+    crate::mcp::error_text::mcp_foreign_err("skill register", e)
+}
+
+/// #8832 — the shared register body. `principal` is the authenticated caller
+/// context (HTTP: the admin-gated header principal; MCP and CLI: the process
+/// identity), never a request field or the skill body; a caller-supplied
+/// `_visibility` binding is accepted only when it is exactly the binding
+/// promote stamps for it ([`super::skill_integrity::check_register_metadata`]).
+///
+/// # Errors
+/// A [`crate::errors::refusal`] whose `Display` is the caller-facing text.
+pub(crate) fn handle_skill_register_as(
+    conn: &Connection,
+    params: &Value,
+    active_keypair: Option<&AgentKeypair>,
+    principal: &str,
+) -> anyhow::Result<Value> {
+    use crate::errors::refusal;
     // -----------------------------------------------------------------------
     // Input: folder_path or inline_skill
     // -----------------------------------------------------------------------
@@ -437,12 +526,13 @@ pub fn handle_skill_register(
             // symlinked entry — reading SKILL.md and resources ONLY from
             // within the canonical root. Fail closed on every ambiguity.
             let import_root_env = std::env::var(SKILLS_IMPORT_ROOT_ENV).ok();
-            let root = resolve_import_root(folder_str, import_root_env.as_deref())?;
+            let root =
+                resolve_import_root(folder_str, import_root_env.as_deref()).map_err(refusal)?;
 
             let md_path = root.join("SKILL.md");
             // SKILL.md must be a regular file inside the root — never a
             // symlink pointing back out of the jail.
-            reject_symlink_escape(&md_path, &root)?;
+            reject_symlink_escape(&md_path, &root).map_err(refusal)?;
             // #3762 — the `io::Error` Display carries the OS path text: log
             // it for the operator, render the failure class to the caller.
             let text = std::fs::read_to_string(&md_path).map_err(|e| {
@@ -454,7 +544,7 @@ pub fn handle_skill_register(
                     "cannot read SKILL.md for import"
                 );
                 let kind = crate::errors::msg::skills_io_kind(e.kind());
-                format!("cannot read SKILL.md in '{folder_str}': {kind}")
+                refusal(format!("cannot read SKILL.md in '{folder_str}': {kind}"))
             })?;
 
             // Collect resource files from a 'resources/' sub-directory.
@@ -462,25 +552,26 @@ pub fn handle_skill_register(
             let res_dir = root.join("resources");
             if res_dir.exists() {
                 // `resources` itself must not be a symlink escaping the root.
-                reject_symlink_escape(&res_dir, &root)?;
+                reject_symlink_escape(&res_dir, &root).map_err(refusal)?;
                 if res_dir.is_dir() {
                     let mut budget = ImportBudget::new();
-                    collect_resources(&res_dir, &res_dir, &mut res, &mut budget)?;
+                    collect_resources(&res_dir, &res_dir, &mut res, &mut budget)
+                        .map_err(refusal)?;
                 }
             }
             (text, res)
         } else if let Some(inline) = params["inline_skill"].as_str() {
             (inline.to_string(), Vec::new())
         } else {
-            return Err(
-                "memory_skill_register requires either 'folder_path' or 'inline_skill'".to_string(),
-            );
+            return Err(refusal(
+                "memory_skill_register requires either 'folder_path' or 'inline_skill'",
+            ));
         };
 
     // -----------------------------------------------------------------------
     // Parse + validate SKILL.md
     // -----------------------------------------------------------------------
-    let manifest = skill_md::parse(&skill_md_text)?;
+    let manifest = skill_md::parse(&skill_md_text).map_err(refusal)?;
 
     // v0.9.0 §11.5 B7-SKILL (#1865) — accept + VALIDATE `parameters_schema`
     // at REGISTER time. FAIL CLOSED here (before any DB write below): skill
@@ -491,8 +582,11 @@ pub fn handle_skill_register(
         .get(field_names::PARAMETERS_SCHEMA)
         .filter(|v| !v.is_null());
     if let Some(schema) = parameters_schema {
-        validate_parameters_schema(schema)
-            .map_err(|e| format!("parameters_schema rejected at register (fail-closed): {e}"))?;
+        validate_parameters_schema(schema).map_err(|e| {
+            refusal(format!(
+                "parameters_schema rejected at register (fail-closed): {e}"
+            ))
+        })?;
     }
     // #4065 — `memory_skill_export` now round-trips a registered schema
     // through the SKILL.md frontmatter, so a folder re-register carries it in
@@ -506,7 +600,9 @@ pub fn handle_skill_register(
             .filter(|v| !v.is_null())
     {
         validate_parameters_schema(schema).map_err(|e| {
-            format!("frontmatter parameters_schema rejected at register (fail-closed): {e}")
+            refusal(format!(
+                "frontmatter parameters_schema rejected at register (fail-closed): {e}"
+            ))
         })?;
     }
 
@@ -516,12 +612,24 @@ pub fn handle_skill_register(
     // inserted when the frontmatter's own metadata parsed to an object
     // (always true for `skill_md::parse` output) and the caller supplied
     // a schema.
+    //
     let mut metadata = manifest.metadata.clone();
     if let Some(schema) = parameters_schema {
         if let Value::Object(ref mut map) = metadata {
             map.insert(field_names::PARAMETERS_SCHEMA.to_string(), schema.clone());
         }
     }
+    // #8832 (code MEDIUM 2; 3-agent vote (71472661) B 3-0, B-8) — a key in
+    // the substrate-reserved `_` namespace is never accepted from the caller,
+    // at any depth, except the top-level scope binding in exactly the shape
+    // promote stamps for the AUTHENTICATED principal (so an exported promoted
+    // skill re-registers with an identical digest for its owner, and a
+    // binding naming anyone else is refused). One rule for every input form
+    // (folder, inline, MCP, HTTP, CLI), run on the FINAL metadata value that
+    // is stored and digested (the wire `parameters_schema` included), which
+    // then carries the principal written from the authenticated context.
+    super::skill_integrity::bind_register_metadata(&mut metadata, &manifest.namespace, principal)
+        .map_err(anyhow::Error::new)?;
 
     // #913 (security-medium / SOC2, 2026-05-19) — admin/state-change
     // audit. Skill registration mints an executable capability bundle
@@ -538,7 +646,10 @@ pub fn handle_skill_register(
         None,
         "register skills",
     )
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| refusal(e.to_string()))?;
+    // #8834 — `signed` reports what register_core does: it signs only with
+    // a private key, so a public-only keypair is an unsigned register.
+    let signs = active_keypair.is_some_and(|kp| kp.private.is_some());
     crate::governance::audit::record_decision(
         &caller,
         "allow",
@@ -548,7 +659,7 @@ pub fn handle_skill_register(
             .ident_or_commit("namespace", &manifest.namespace)
             .ident("name", &manifest.name)
             .number("resource_count", resource_files.len())
-            .flag("signed", active_keypair.is_some()),
+            .flag("signed", signs),
     );
 
     let body_bytes = manifest.body.as_bytes();
@@ -572,7 +683,12 @@ pub fn handle_skill_register(
         res_digests,
         &resource_files,
         active_keypair,
-    )?;
+        SupersedeGuard::BoundToSamePrincipal,
+    )
+    .map_err(|e| match e {
+        RegisterCoreError::Refused(r) => anyhow::Error::new(r),
+        RegisterCoreError::Text(text) => refusal(text),
+    })?;
 
     let digest_hex = hex::encode(&result.digest);
     let mut response = json!({
@@ -581,7 +697,7 @@ pub fn handle_skill_register(
         "namespace": manifest.namespace,
         "name": manifest.name,
         "digest": digest_hex,
-        "signed": active_keypair.is_some(),
+        "signed": signs,
         // v0.9.0 §11.5 B7-SKILL (#1865) — surface the version-chain
         // position; the chain itself already existed (supersede-on-
         // register), this just exposes it on the wire.
@@ -955,6 +1071,69 @@ mod d1_5_986_tests {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    /// Every `RegisterMetadataRefusal` class (the table the HTTP route maps).
+    const REGISTER_REFUSALS_8832: [crate::mcp::RegisterMetadataRefusal; 7] = {
+        use crate::mcp::RegisterMetadataRefusal as R;
+        [
+            R::ReservedKey,
+            R::MalformedBinding,
+            R::ScopeInvalid,
+            R::ForeignBinding,
+            R::ScopeNotMember,
+            R::UnresolvedPrincipal,
+            R::ShadowsExisting,
+        ]
+    };
+    /// Foreign roots a register can raise: a storage path, SQL text and an
+    /// io error naming a host path. None may reach the caller.
+    const FOREIGN_TEXTS_8832: [&str; 3] = [
+        "unable to open database file: /srv/secret/ai-memory.db",
+        "near \"SELEC\": syntax error in SELECT id FROM skills WHERE owner = 'x'",
+        "No such file or directory (os error 2): /home/operator/.skills/x",
+    ];
+
+    /// #8832 (C-2) — a foreign register failure reaches the MCP / CLI caller
+    /// as the closed storage class text; its detail stays on the log only,
+    /// also when wrapped in context.
+    #[test]
+    fn register_error_text_closes_foreign_roots_8832() {
+        for foreign in FOREIGN_TEXTS_8832 {
+            for e in [
+                anyhow::anyhow!(foreign.to_owned()),
+                anyhow::anyhow!(foreign.to_owned()).context("skill register"),
+                anyhow::Error::new(std::io::Error::other(foreign.to_owned())),
+            ] {
+                let text = register_error_text(e);
+                assert_eq!(
+                    text,
+                    crate::mcp::error_text::DB_ERROR_TEXT,
+                    "foreign={foreign}"
+                );
+                assert!(!text.contains(foreign), "foreign text leaked: {text}");
+            }
+        }
+    }
+
+    /// #8832 (C-2) — every typed refusal root keeps its fixed text byte for
+    /// byte (bare and under context), and so does an own-text `refusal`.
+    #[test]
+    fn register_error_text_keeps_typed_refusal_text_8832() {
+        for r in REGISTER_REFUSALS_8832 {
+            assert_eq!(
+                register_error_text(anyhow::Error::new(r)),
+                r.message(),
+                "{r:?}"
+            );
+            assert_eq!(
+                register_error_text(anyhow::Error::new(r).context("bind")),
+                r.message(),
+                "{r:?} under context"
+            );
+        }
+        let own = "skill manifest is missing the namespace field";
+        assert_eq!(register_error_text(crate::errors::refusal(own)), own);
+    }
 
     fn open_db() -> (rusqlite::Connection, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
