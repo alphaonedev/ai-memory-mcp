@@ -503,6 +503,8 @@ async fn update_memory_write(
         // `PostgresStore::update_with_expected_version` when a parseable
         // If-Match is present; absent/unparseable headers preserve the
         // legacy last-write-wins trait path, mirroring sqlite.
+        // #8948 — a title/content patch re-embeds after the commit.
+        let content_patched = patch.title.is_some() || patch.content.is_some();
         let update_result: Result<(), crate::store::StoreError> = {
             #[cfg(feature = "sal-postgres")]
             {
@@ -531,6 +533,11 @@ async fn update_memory_write(
                 // row" wire shape.
                 let response_body = match app.store.get(&ctx, &id).await {
                     Ok(mem) => {
+                        let embed_status = if content_patched {
+                            pg_reembed_after_update(&app, &ctx, &mem).await
+                        } else {
+                            crate::embeddings::EmbedStatus::Indexed
+                        };
                         // #950 SECURITY-medium (Track A QC sweep,
                         // 2026-05-20) — fire subscription dispatch on
                         // the postgres update path. Pre-#950 only the
@@ -559,6 +566,7 @@ async fn update_memory_write(
                         // #9087 — PG update fans out through the funnel
                         // before it returns (pre-fix it never did).
                         let mut receipt = json!(mem);
+                        crate::embeddings::attach_embed_status(&mut receipt, &embed_status);
                         if let Err(resp) = super::fed_fanout::fanout_into(
                             &app,
                             super::fed_fanout::FanoutEffect::Store(&mem),
@@ -839,22 +847,28 @@ async fn update_memory_write(
             // (title/content) changed. Without this, the semantic index keeps
             // pointing at the old vector and stale semantic recall results
             // linger even after the row is updated.
+            // #8907 — the store layer already cleared the stale vector of a
+            // changed document; this re-embed either replaces it or the
+            // response reports the row as degraded.
             let content_changed = body.title.is_some() || body.content.is_some();
             let mut lock_opt = Some(lock);
-            if content_changed
-                && let Some(ref m) = mem
-                && let Some(emb) = app.embedder.as_ref().as_ref()
-                && let Some(guard) = lock_opt.take()
-            {
-                let text = crate::embeddings::embedding_document(&m.title, &m.content);
-                regenerate_embedding(
-                    guard,
-                    emb.clone(),
-                    text,
-                    resolved_id.clone(),
-                    std::sync::Arc::clone(&app.vector_index),
-                )
-                .await;
+            let mut embed_status = crate::embeddings::EmbedStatus::Indexed;
+            if content_changed && let Some(ref m) = mem {
+                if let Some(emb) = app.embedder.as_ref().as_ref() {
+                    if let Some(guard) = lock_opt.take() {
+                        let text = crate::embeddings::embedding_document(&m.title, &m.content);
+                        embed_status = regenerate_embedding(
+                            guard,
+                            emb.clone(),
+                            text,
+                            resolved_id.clone(),
+                            std::sync::Arc::clone(&app.vector_index),
+                        )
+                        .await;
+                    }
+                } else {
+                    embed_status = crate::embeddings::no_embedder_status();
+                }
             }
             // Drop the DB lock before fanning out — peers POST back to
             // our sync_push so we'd deadlock if we held it.
@@ -879,6 +893,7 @@ async fn update_memory_write(
             if let Err(resp) = fanned {
                 return resp;
             }
+            crate::embeddings::attach_embed_status(&mut receipt, &embed_status);
             Json(receipt).into_response()
         }
         Ok((false, _)) => {
@@ -964,9 +979,65 @@ async fn update_memory_write(
 /// stale vector between the text write and the vector write — the same
 /// serialisation the pre-#4089 inline path had, without pinning a worker.
 ///
-/// An embed failure keeps the pre-#4089 behaviour (WARN, row keeps its prior
-/// vector). A task that did not complete is WARNed + counted by
-/// `embed_offload` (surface `update`).
+/// #8907 — an embed failure no longer keeps the prior vector: the store
+/// layer cleared it with the text change, this task drops the id from the
+/// vector index, and the returned degraded [`EmbedStatus`] goes on the
+/// response. A task that did not complete is WARNed + counted by
+/// `embed_offload` (surface `update`) and reported as failed.
+///
+/// [`EmbedStatus`]: crate::embeddings::EmbedStatus
+/// #8948 / #8907 — the store-trait twin of [`regenerate_embedding`] for the
+/// postgres branch, which pre-fix never re-embedded a PUT at all. The store
+/// layer already cleared the vector with the text change; this embeds the
+/// committed document and writes the vector through
+/// `MemoryStore::update_embedding`. TOCTOU: a concurrent PUT may land
+/// between the read of `mem` and the vector write, so the row is read back
+/// and, if its document is no longer the one embedded, the vector is cleared
+/// again and the write reported failed (degrade, never a stale vector).
+#[cfg(feature = "sal")]
+async fn pg_reembed_after_update(
+    app: &AppState,
+    ctx: &crate::store::CallerContext,
+    mem: &crate::models::Memory,
+) -> crate::embeddings::EmbedStatus {
+    use crate::embeddings::{EMBED_FAILED_REASON, EmbedStatus};
+    let text = crate::embeddings::embedding_document(&mem.title, &mem.content);
+    let emb = app.embedder.as_ref().as_ref();
+    let (vector, status) = super::embed_offload::reembed_changed_document(
+        crate::metrics::EMBED_SURFACE_UPDATE,
+        emb,
+        text.clone(),
+    )
+    .await;
+    let (Some(vector), Some(emb)) = (vector, emb) else {
+        return status;
+    };
+    let failed = || EmbedStatus::Failed(EMBED_FAILED_REASON.to_string());
+    let space = emb.space_fingerprint();
+    if let Err(e) = app
+        .store
+        .update_embedding(ctx, &mem.id, Some(&vector), &space)
+        .await
+    {
+        tracing::warn!("update (postgres): vector write failed for {}: {e}", mem.id);
+        return failed();
+    }
+    let still_current =
+        app.store.get(ctx, &mem.id).await.is_ok_and(|now| {
+            crate::embeddings::embedding_document(&now.title, &now.content) == text
+        });
+    if still_current {
+        return status;
+    }
+    if let Err(e) = app.store.update_embedding(ctx, &mem.id, None, &space).await {
+        tracing::warn!(
+            "update (postgres): stale vector clear failed for {}: {e}",
+            mem.id
+        );
+    }
+    failed()
+}
+
 async fn regenerate_embedding(
     guard: tokio::sync::OwnedMutexGuard<(
         rusqlite::Connection,
@@ -980,31 +1051,36 @@ async fn regenerate_embedding(
     vector_index: std::sync::Arc<
         tokio::sync::Mutex<Option<Box<dyn crate::hnsw::VectorSearchIndex>>>,
     >,
-) {
-    let _ =
-        super::embed_offload::on_blocking_pool(crate::metrics::EMBED_SURFACE_UPDATE, move || {
-            let vector = match emb.embed(&text) {
-                Ok(v) => v,
+) -> crate::embeddings::EmbedStatus {
+    use crate::embeddings::{EMBED_FAILED_REASON, EmbedStatus};
+    super::embed_offload::on_blocking_pool(crate::metrics::EMBED_SURFACE_UPDATE, move || {
+        let (vector, mut status) = crate::embeddings::embed_document_with_status(&emb, &text);
+        let vector = vector.and_then(|v| {
+            match db::set_embedding(&guard.0, &id, &v, &emb.space_fingerprint()) {
+                Ok(()) => Some(v),
                 Err(e) => {
-                    tracing::warn!("embedding regeneration failed: {e}");
-                    return;
+                    tracing::warn!("failed to refresh embedding for {id}: {e}");
+                    status = EmbedStatus::Failed(EMBED_FAILED_REASON.to_string());
+                    None
                 }
-            };
-            if let Err(e) = db::set_embedding(&guard.0, &id, &vector, &emb.space_fingerprint()) {
-                tracing::warn!("failed to refresh embedding for {id}: {e}");
             }
-            // Drop the DB guard before touching the vector index (lock order:
-            // never hold both).
-            drop(guard);
-            // A blocking-pool thread is not an async context, so the
-            // synchronous acquire is the correct form here.
-            let mut idx_lock = vector_index.blocking_lock();
-            if let Some(idx) = idx_lock.as_mut() {
-                idx.remove(&id);
-                idx.insert(id, vector);
+        });
+        // Drop the DB guard before touching the vector index (lock order:
+        // never hold both).
+        drop(guard);
+        // A blocking-pool thread is not an async context, so the
+        // synchronous acquire is the correct form here.
+        let mut idx_lock = vector_index.blocking_lock();
+        if let Some(idx) = idx_lock.as_mut() {
+            idx.remove(&id);
+            if let Some(v) = vector {
+                idx.insert(id, v);
             }
-        })
-        .await;
+        }
+        status
+    })
+    .await
+    .unwrap_or_else(|| EmbedStatus::Failed(EMBED_FAILED_REASON.to_string()))
 }
 
 #[allow(clippy::too_many_lines)]

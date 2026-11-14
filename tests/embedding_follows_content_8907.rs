@@ -320,8 +320,10 @@ impl Fixture {
                 .await
                 .expect("pg get_embedding");
         }
+        // The sqlite read is synchronous; `ready` keeps one async signature
+        // for both feature sets (the pg arm above awaits the store).
         let conn = ai_memory::db::open(&self.db_path).expect("reopen");
-        ai_memory::db::get_embedding(&conn, id).expect("read embedding")
+        std::future::ready(ai_memory::db::get_embedding(&conn, id).expect("read embedding")).await
     }
 }
 
@@ -403,6 +405,13 @@ fn runtime() -> tokio::runtime::Runtime {
 fn http_rows(branch: Branch) {
     runtime().block_on(async {
         for write in HTTP_WRITES {
+            // The fake-postgres branch runs over a `SqliteStore`, which has
+            // no STORE_WITH_EMBEDDING capability (the create handler 501s);
+            // the real-postgres branch carries the re-store row.
+            #[cfg(feature = "sal")]
+            if matches!((branch, write), (Branch::FakePg, HttpWrite::Restore)) {
+                continue;
+            }
             for outcome in OUTCOMES {
                 let row = format!("http {branch:?} {write:?} {outcome:?}");
                 let Some(fx) = fixture("e8907http", branch).await else {
@@ -425,9 +434,17 @@ fn http_rows(branch: Branch) {
                         .await
                     }
                     HttpWrite::Restore => {
+                        // `on_conflict=merge` is the re-store that upserts
+                        // over the live (title, namespace) row; the HTTP
+                        // default (`error`) refuses it with a 409, and
+                        // `force` skips the near-duplicate contradiction
+                        // gate, which a rewritten body trips by design.
+                        let mut body = memory_body(&title, &content);
+                        body["on_conflict"] = json!("merge");
+                        body["force"] = json!(true);
                         send(
                             fx.router.clone(),
-                            request("POST", "/api/v1/memories", &memory_body(&title, &content)),
+                            request("POST", "/api/v1/memories", &body),
                         )
                         .await
                     }
@@ -668,7 +685,13 @@ fn stdio_tool(db: &Path, name: &str, arguments: &Value) -> Value {
     .map(|frame| frame.to_string())
     .join("\n")
         + "\n";
-    let output = run_cli(db, &["mcp", "--profile", "full"], &frames);
+    // `--tier keyword` pins the no-embedder surface: the default MCP tier
+    // loads a local embedder, which would re-embed instead of degrading.
+    let output = run_cli(
+        db,
+        &["mcp", "--profile", "full", "--tier", "keyword"],
+        &frames,
+    );
     let response = output
         .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
@@ -746,7 +769,7 @@ fn cli_and_stdio_update_clear_the_stale_vector_8907() {
         let after = ai_memory::db::get_embedding(&conn, &id).expect("read vector");
         assert!(
             after.is_none(),
-            "{row}: the content changed with no embedder, yet the OLD vector stayed — #8907"
+            "{row}: the content changed with no embedder, yet the OLD vector stayed — #8907: {response}"
         );
         assert_eq!(
             response["embed_status"], STATUS_SKIPPED,
@@ -880,7 +903,7 @@ async fn store_rows(label: &str, store: &dyn ai_memory::store::MemoryStore) {
 #[test]
 fn store_layer_clears_vector_on_document_change_sqlite_8907() {
     let scratch = tempfile::tempdir_in(scratch_root()).expect("scratch");
-    let store = ai_memory::store::sqlite::SqliteStore::open(&scratch.path().join("store.db"))
+    let store = ai_memory::store::sqlite::SqliteStore::open(scratch.path().join("store.db"))
         .expect("open SqliteStore");
     runtime().block_on(store_rows("sqlite", &store));
 }

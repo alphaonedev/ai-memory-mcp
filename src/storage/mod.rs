@@ -2085,6 +2085,13 @@ fn emit_federation_newer_wins_supersede_leaf_if_enabled(
 /// non-naming conflict holds even against a quarantine that raced the
 /// admission probe). `prepare_cached` keys on this text, so the format runs
 /// once per process and the statement is re-parsed once per connection.
+/// #8907 — the upsert arm's vector clear: the stored row's content or
+/// envelope differs from the incoming one, so the vector describes a
+/// document that no longer exists. `IS NOT` is NULL-safe.
+const UPSERT_EMBEDDING_CLEAR: &str = "embedding = CASE WHEN memories.content IS NOT excluded.content OR memories.encrypted_envelope IS NOT excluded.encrypted_envelope THEN NULL ELSE memories.embedding END,
+                embedding_dim = CASE WHEN memories.content IS NOT excluded.content OR memories.encrypted_envelope IS NOT excluded.encrypted_envelope THEN NULL ELSE memories.embedding_dim END,
+                embedding_space = CASE WHEN memories.content IS NOT excluded.content OR memories.encrypted_envelope IS NOT excluded.encrypted_envelope THEN NULL ELSE memories.embedding_space END";
+
 static INSERT_UPSERT_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     // APPEND-ONLY-SANCTIONED (#1823 G6 / #2948 / #3690) — this static IS the
     // COW-supersede statement `insert_inner` executes; the fn carries the
@@ -2311,9 +2318,15 @@ static INSERT_UPSERT_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new
                 -- carries a non-NULL upper bound sets it; else the existing value
                 -- is kept (COALESCE, matching the Form-4/5 provenance columns).
                 valid_from = memories.valid_from,
-                valid_until = COALESCE(excluded.valid_until, memories.valid_until)
+                valid_until = COALESCE(excluded.valid_until, memories.valid_until),
+                -- #8907 — a merge that changed the document (content or its
+                -- envelope; the title is the conflict key) drops the OLD
+                -- document's vector: absent, never stale. The caller embeds
+                -- the new document afterwards or reports it degraded.
+                {embedding_clear}
              {merge_backstop}
              RETURNING id",
+        embedding_clear = UPSERT_EMBEDDING_CLEAR,
         conflict_target = crate::models::TITLE_SLOT_CONFLICT_TARGET,
         merge_backstop = crate::models::title_slot_merge_backstop("memories"),
         reopen_lifecycle = crate::models::restore_reopen_lifecycle_assignment("memories"),
@@ -4538,9 +4551,17 @@ pub fn update_with_expected_version(
                         '{}'
                     )
                 ),
-                source_uri = COALESCE(?11, source_uri), encrypted_envelope=?14, valid_until = COALESCE(?15, valid_until), version = version + 1
+                source_uri = COALESCE(?11, source_uri), encrypted_envelope=?14, valid_until = COALESCE(?15, valid_until), version = version + 1,
+                -- #8907 / #8948 — the ONE decision point: a changed embedded
+                -- document (title or content) drops the old vector, dim and
+                -- space in the same statement. The caller re-embeds the new
+                -- document or reports the row degraded; a stale vector never
+                -- outlives the text it was computed from.
+                embedding = CASE WHEN ?16 THEN NULL ELSE embedding END,
+                embedding_dim = CASE WHEN ?16 THEN NULL ELSE embedding_dim END,
+                embedding_space = CASE WHEN ?16 THEN NULL ELSE embedding_space END
              WHERE id=?12 AND (?13 IS NULL OR version = ?13)",
-            params![effective_tier.as_str(), namespace, new_title, update_content_to_store, tags_json, priority, confidence, now, expires_at, metadata_json, source_uri, id, expected_version, update_encrypted_envelope, valid_until],
+            params![effective_tier.as_str(), namespace, new_title, update_content_to_store, tags_json, priority, confidence, now, expires_at, metadata_json, source_uri, id, expected_version, update_encrypted_envelope, valid_until, content_changed],
         );
         match update_res {
             Ok(0) => {
@@ -15434,6 +15455,7 @@ fn revoke_agent_pubkey_no_tx(conn: &Connection, agent_id: &str) -> Result<()> {
                 json_remove(content,  '$.agent_pubkey', '$.pubkey_bound_at', '$.write_signature'),
                 '$.pubkey_revoked_at', ?3,
                 '$.attest_level', 'claimed'),
+            embedding = NULL, embedding_dim = NULL, embedding_space = NULL,
             updated_at = ?3
          WHERE namespace = ?1 AND title = ?2",
         params![AGENTS_NAMESPACE, &title, &now],
@@ -18883,7 +18905,11 @@ fn overwrite_full_row_by_id(conn: &Connection, mem: &Memory) -> Result<()> {
             lifecycle_state = ?27,
             encrypted_envelope = ?28,
             valid_from = ?29,
-            valid_until = ?30
+            valid_until = ?30,
+            -- #8907 — the merge changed the document: the old vector goes.
+            embedding = CASE WHEN title IS NOT ?3 OR content IS NOT ?4 OR encrypted_envelope IS NOT ?28 THEN NULL ELSE embedding END,
+            embedding_dim = CASE WHEN title IS NOT ?3 OR content IS NOT ?4 OR encrypted_envelope IS NOT ?28 THEN NULL ELSE embedding_dim END,
+            embedding_space = CASE WHEN title IS NOT ?3 OR content IS NOT ?4 OR encrypted_envelope IS NOT ?28 THEN NULL ELSE embedding_space END
          WHERE id = ?31",
         params![
             mem.tier.as_str(),

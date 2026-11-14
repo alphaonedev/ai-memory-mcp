@@ -924,17 +924,13 @@ fn handle_store_inner(
             Some(&preserved_metadata),  // metadata (agent_id preserved)
         )
         .map_err(|e| crate::mcp::error_text::mcp_foreign_err("metadata", e))?;
-        // Regenerate embedding if content changed during dedup update
-        if content_changed && let Some(emb) = embedder {
-            let text = crate::embeddings::embedding_document(&mem.title, &mem.content);
-            if let Ok(embedding) = emb.embed(&text) {
-                let _ = db::set_embedding(conn, &dup.id, &embedding, &emb.space_fingerprint());
-                if let Some(idx) = vector_index {
-                    idx.remove(&dup.id);
-                    idx.insert(dup.id.clone(), embedding);
-                }
-            }
-        }
+        // #8907 — regenerate the embedding if the dedup update changed the
+        // content; the store layer already cleared the old vector with it.
+        let embed_status = if content_changed {
+            super::update::reembed_changed_row(conn, &dup.id, embedder, vector_index)?
+        } else {
+            crate::embeddings::EmbedStatus::Indexed
+        };
         // #196: echo the preserved agent_id (original on dedup, not the caller's)
         let echoed_agent_id = preserved_metadata
             .get(param_names::AGENT_ID)
@@ -956,7 +952,7 @@ fn handle_store_inner(
             .ok()
             .flatten()
             .map_or(requested, |post| (post.tier, post.namespace));
-        return Ok(json!({
+        let mut receipt = json!({
             "id": dup.id,
             "tier": echo_tier,
             "title": mem.title,
@@ -964,7 +960,9 @@ fn handle_store_inner(
             "agent_id": echoed_agent_id,
             "duplicate": true,
             "action": "updated existing memory"
-        }));
+        });
+        crate::embeddings::attach_embed_status(&mut receipt, &embed_status);
+        return Ok(receipt);
     }
 
     // v0.7.0 (issue #519) — proactive contradiction detection. When

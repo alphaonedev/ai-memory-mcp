@@ -1010,13 +1010,7 @@ async fn fanout_and_assemble_create_response(
     }
     // v0.7.0 Round-2 F10 — surface embed_status to the caller when α's
     // `embed_with_status` reported anything other than `Indexed`.
-    if embed_status.is_degraded() {
-        response["embed_status"] = json!(embed_status.as_str());
-        let reason = embed_status.reason();
-        if !reason.is_empty() {
-            response["embed_status_reason"] = json!(reason);
-        }
-    }
+    crate::embeddings::attach_embed_status(&mut response, &embed_status);
     // #932 (v0.7.0 Track D, 2026-05-20) — fire `memory_store`
     // webhook subscribers via the canonical sqlite dispatch path.
     // Pre-#932 the HTTP `create_memory` sqlite branch invoked no
@@ -1313,41 +1307,20 @@ async fn create_memory_postgres(
     // before the SAL store so the postgres `embedding` column lands
     // populated; otherwise `recall_hybrid` filters every row out via
     // `WHERE embedding IS NOT NULL`.
-    let embedding_text = crate::embeddings::embedding_document(&mem.title, &mem.content);
     // #2167 — the vector and its embedding-space fingerprint are computed
     // together and travel together into `store_with_embedding`, so the
     // pgvector row's `embedding_space` provenance is stamped atomically with
     // the vector (never a stale/absent stamp). `None`/`None` when there is no
     // embedder or the embed call fails — no vector, no stamp.
-    let (embedding, embedding_space): (Option<Vec<f32>>, Option<String>) =
-        match app.embedder.as_ref().as_ref() {
-            None => (None, None),
-            Some(emb) => {
-                // #4089 (rust-1.98 CONCURRENCY-22) — `embed` is CPU-bound;
-                // run it on the blocking pool, never inline on this worker.
-                // Every failure degrades to (no vector, no stamp) exactly as
-                // before, and every failure is now observable: an embed
-                // error WARNs here, a task that did not complete WARNs +
-                // counts (`embed.task.failed`,
-                // `ai_memory_embed_task_failed_total{surface="create"}`) in
-                // `embed_offload`.
-                let space = emb.space_fingerprint();
-                match super::embed_offload::embed_document(
-                    crate::metrics::EMBED_SURFACE_CREATE,
-                    emb,
-                    embedding_text,
-                )
-                .await
-                {
-                    Some(Ok(v)) => (Some(v), Some(space)),
-                    Some(Err(e)) => {
-                        tracing::warn!("create (postgres): embed failed: {e} (#4089)");
-                        (None, None)
-                    }
-                    None => (None, None),
-                }
-            }
-        };
+    // #8907 — the SAME embed decision as the sqlite branch
+    // (`embed_create_before_lock`, blocking pool per #4089), so a failed
+    // embed on an upsert over a live row reports `embed_status` instead of
+    // a silent vectorless row (the upsert clears the old vector).
+    let (embedding, embed_status) = embed_create_before_lock(app, &mem.title, &mem.content).await;
+    let embedding_space: Option<String> = match (&embedding, app.embedder.as_ref().as_ref()) {
+        (Some(_), Some(emb)) => Some(emb.space_fingerprint()),
+        _ => None,
+    };
 
     // v0.7.0 Wave-3 Continuation 3 (Phase 20) — governance walk on
     // writes. Postgres branch enforces the same inheritance chain +
@@ -1624,6 +1597,8 @@ async fn create_memory_postgres(
     if let Some(d) = atomise_disposition {
         d.merge_into_response(&mut payload);
     }
+    // #8907 — sqlite parity (Round-2 F10): a degraded embed is reported.
+    crate::embeddings::attach_embed_status(&mut payload, &embed_status);
     (StatusCode::CREATED, Json(payload)).into_response()
 }
 
