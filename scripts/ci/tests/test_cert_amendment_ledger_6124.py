@@ -1296,7 +1296,11 @@ DECOYS = (
     ("parenthesised", ("## STATUS (LIVE as of 2026-11-14)",)),
     ("entity_letter", ("## STA&#84;US — **LIVE as of 2026-11-14**",)),
     ("soft_break", ("The STATUS of this certification is", "LIVE as of 2026-11-14.")),
+    # Enclosed letters (category So, not a letter): only NFKC reads them as 'status'.
+    ("enclosed_letters", ("## ⓈⓉⒶⓉⓊⓈ — **LIVE as of 2026-11-14**",)),
 )
+# A construct I4 refuses when it is new: a fence body naming an amendment.
+I4_FENCE = ("```text", "the amendment ledger record of the release", "```")
 DEEP_ENTITY = "## STA&amp;amp;amp;amp;#84;US of this note"
 D6_ROWS = (
     ("heading", "## STATUS - **LIVE as of 2026-11-14**", "expected '### Amendment YYYY-MM-DD'"),
@@ -1339,6 +1343,19 @@ class OptionBRegion(LedgerCase):
         s = self.scene("VOID", base_doc=release_shaped())
         ok, out = s.judge(self.wire_and_doc(s, on_release(s.doc, self.exact())))
         self.assert_pass(ok, out, RELEASE_PASS, "the certification stays VOID")
+
+    def test_r1_inherited_i4_construct_in_frozen_region_passes(self):
+        base = release_shaped() + "\n" + "\n".join(I4_FENCE) + "\n"
+        s = self.scene("VOID", base_doc=base)
+        ok, out = s.judge(self.wire_and_doc(s, on_release(s.doc, self.exact())))
+        self.assert_pass(ok, out, RELEASE_PASS, "the certification stays VOID")
+
+    def test_r1_new_i4_construct_at_head_refused(self):
+        s = self.scene("VOID", base_doc=release_shaped())
+        doc = on_release(s.doc + "\n" + "\n".join(I4_FENCE) + "\n", self.exact())
+        ok, out = s.judge(self.wire_and_doc(s, doc))
+        self.assertFalse(ok, out)
+        self.assertIn("a fence body naming an amendment or a status above the ledger", out)
 
     def test_r1_new_loose_line_at_head_refused(self):
         s = self.scene("VOID", base_doc=release_shaped())
