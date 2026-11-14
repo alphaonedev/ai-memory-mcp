@@ -25,9 +25,14 @@
 //!                   [--batch 1000] [--dry-run] [--namespace foo]
 //! ```
 //!
-//! Reads batches via `MemoryStore::list`, writes via `MemoryStore::store`.
-//! Each write uses the source memory's id verbatim — the adapter's
-//! upsert-on-id semantics means repeating the migration is idempotent.
+//! Reads batches via `MemoryStore::list` (live rows) and
+//! `MemoryStore::list_expired_unswept` (expired rows GC has not swept,
+//! #8888), writes via `MemoryStore::store`; archived rows page through
+//! `MemoryStore::list_archived` and land via
+//! `MemoryStore::insert_archived_row`. Each write uses the source id
+//! verbatim, so repeating the migration is idempotent. A destination row of
+//! another owner in the same id or `(title, namespace)` slot is kept and
+//! counted (`cross_owner_kept`, #8932), never merged.
 //!
 //! ## What this module does NOT do
 //!
@@ -103,6 +108,26 @@ pub struct MigrationReport {
     /// than inferring it from a silent success.
     #[serde(default)]
     pub embeddings_unattributed: usize,
+    /// #8888 — rows of the source `archived_memories` table enumerated.
+    #[serde(default)]
+    pub archived_read: usize,
+    /// #8888 — archived rows the destination accepted (new rows).
+    #[serde(default)]
+    pub archived_written: usize,
+    /// #8888 — archived rows NOT written because the destination already
+    /// held an archived row with the same id (an idempotent re-run, or a row
+    /// the destination owns; it is never overwritten). Mirrors
+    /// `links_skipped`: `archived_written + archived_skipped ==
+    /// archived_read` on success.
+    #[serde(default)]
+    pub archived_skipped: usize,
+    /// #8932 — source rows NOT written because the destination row holding
+    /// the same id or `(title, namespace)` slot belongs to another owner.
+    /// The destination row is kept byte-for-byte; the refusal is counted
+    /// here and WARNed, never folded. Success means
+    /// `memories_written + cross_owner_kept == memories_read`.
+    #[serde(default)]
+    pub cross_owner_kept: usize,
     pub batches: usize,
     pub errors: Vec<String>,
     pub dry_run: bool,
@@ -400,21 +425,7 @@ async fn run(
                 return report;
             }
             report.memories_read += 1;
-            let Some(to) = to else {
-                // Dry run — tally the id so Phase 3 can size the embedding copy.
-                migrated_ids.push(mem.id.clone());
-                continue;
-            };
-            match to.store(&ctx, mem).await {
-                Ok(_) => {
-                    report.memories_written += 1;
-                    // Only a row that actually landed can receive its
-                    // embedding in Phase 3 (a failed write leaves no
-                    // destination row to stamp).
-                    migrated_ids.push(mem.id.clone());
-                }
-                Err(e) => report.errors.push(format!("write {} failed: {e}", mem.id)),
-            }
+            write_one(to, &ctx, mem, &mut report, &mut migrated_ids).await;
         }
         // A short page means the stable-ordered offset walk has reached the
         // end of the source. `page_size >= 1`, so this always terminates.
@@ -422,6 +433,58 @@ async fn run(
             break;
         }
         offset += page_len;
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Phase 1b — expired rows GC has not swept yet (#8888). The live `list`
+    // walk filters them out, so before #8888 they never reached the
+    // destination while the report said `errors: 0`. They are durable rows
+    // until the sweep deletes them; carry them with their `expires_at`
+    // verbatim so the destination's own sweep decides their fate.
+    let mut expired_offset: usize = 0;
+    loop {
+        let page = match from
+            .list_expired_unswept(namespace_filter.as_deref(), page_size, expired_offset)
+            .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                report.errors.push(format!(
+                    "source expired-unswept list failed at offset {expired_offset}: {e}"
+                ));
+                return report;
+            }
+        };
+        let page_len = page.len();
+        report.batches += 1;
+        for mem in &page {
+            if !seen.insert(mem.id.clone()) {
+                continue;
+            }
+            if report.memories_read >= MAX_ROWS {
+                report.errors.push(format!(
+                    "source exceeds the {MAX_ROWS}-memory migrate cap; \
+                     refusing to continue rather than risk silent truncation"
+                ));
+                return report;
+            }
+            report.memories_read += 1;
+            write_one(to, &ctx, mem, &mut report, &mut migrated_ids).await;
+        }
+        if page_len < page_size {
+            break;
+        }
+        expired_offset += page_len;
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Phase 1c — archived rows (#8888). `archived_memories` is a separate
+    // table the live walk never reads. Each row is written insert-if-absent
+    // with its id, `archived_at` and `archive_reason` verbatim, so a re-run
+    // never duplicates or overwrites one.
+    if let Err(e) = migrate_archived(from, to, namespace_filter.as_deref(), &mut report).await {
+        report.errors.push(e.to_string());
+        return report;
     }
 
     // Completeness safety — never let an INCOMPLETE migrate report success.
@@ -434,11 +497,30 @@ async fn run(
     // empty error set is structurally impossible today — assert it so any
     // future regression that silently drops a write FAILS LOUDLY instead of
     // minting a false success.
-    if !dry_run && report.errors.is_empty() && report.memories_written != report.memories_read {
+    //
+    // #8888 / #8932 — the read count now covers the expired-unswept rows
+    // too, and a row kept because another owner holds its slot is a COUNTED
+    // refusal (`cross_owner_kept`), so the invariant is
+    // `written + cross_owner_kept == read`; archived rows close the same way
+    // against their own counters.
+    if !dry_run
+        && report.errors.is_empty()
+        && report.memories_written + report.cross_owner_kept != report.memories_read
+    {
         report.errors.push(format!(
-            "incomplete migrate: read {} memories but wrote {} with no \
-             recorded error — refusing to report success",
-            report.memories_read, report.memories_written
+            "incomplete migrate: read {} memories but wrote {} and kept {} \
+             foreign-owner rows with no recorded error — refusing to report success",
+            report.memories_read, report.memories_written, report.cross_owner_kept
+        ));
+    }
+    if !dry_run
+        && report.errors.is_empty()
+        && report.archived_written + report.archived_skipped != report.archived_read
+    {
+        report.errors.push(format!(
+            "incomplete migrate: read {} archived rows but wrote {} and skipped {} \
+             with no recorded error — refusing to report success",
+            report.archived_read, report.archived_written, report.archived_skipped
         ));
     }
 
@@ -660,10 +742,179 @@ async fn phase_links(
     }
 }
 
+/// Write one source memory (Phases 1 and 1b). Under `to == None` (dry run)
+/// the id is only tallied.
+///
+/// #8932 — before the write, ask the destination whether the row holding the
+/// same id or the same live `(title, namespace)` slot belongs to another
+/// owner. If it does, the source row is NOT written: the destination row is
+/// kept byte-for-byte, a WARN names the incoming id, and the refusal is
+/// counted in `cross_owner_kept` (the #3151 disposition). A destination that
+/// cannot answer the probe is an error for that row (fail closed), never a
+/// blind write.
+async fn write_one(
+    to: Option<&dyn MemoryStore>,
+    ctx: &CallerContext,
+    mem: &crate::models::Memory,
+    report: &mut MigrationReport,
+    migrated_ids: &mut Vec<String>,
+) {
+    let Some(to) = to else {
+        // Dry run — tally the id so Phase 3 can size the embedding copy.
+        migrated_ids.push(mem.id.clone());
+        return;
+    };
+    match to.foreign_slot_holder(mem).await {
+        Ok(None) => {}
+        Ok(Some(_holder)) => {
+            tracing::warn!(
+                target: "ai_memory::migrate",
+                memory_id = %mem.id,
+                "migrate kept the destination row: its slot belongs to another owner (#8932)"
+            );
+            report.cross_owner_kept += 1;
+            return;
+        }
+        Err(e) => {
+            report
+                .errors
+                .push(format!("owner probe for {} failed: {e}", mem.id));
+            return;
+        }
+    }
+    match to.store(ctx, mem).await {
+        Ok(_) => {
+            report.memories_written += 1;
+            // Only a row that actually landed can receive its embedding in
+            // Phase 3 (a failed write leaves no destination row to stamp).
+            migrated_ids.push(mem.id.clone());
+        }
+        Err(e) => report.errors.push(format!("write {} failed: {e}", mem.id)),
+    }
+}
+
+/// The source's own count of archived rows in scope, read independently of
+/// the paged listing (#8888 independent per-table count). `None` for an
+/// inbox namespace, whose listing also folds legacy alias prefixes the
+/// per-namespace count does not.
+fn archived_source_count(stats: &serde_json::Value, namespace: Option<&str>) -> Option<u64> {
+    match namespace {
+        None => stats
+            .get(crate::storage::ARCHIVED_TOTAL_KEY)
+            .and_then(serde_json::Value::as_u64),
+        Some(ns) if ns.starts_with(crate::INBOX_NAMESPACE_PREFIX) => None,
+        Some(ns) => Some(
+            stats
+                .get(crate::models::field_names::BY_NAMESPACE)
+                .and_then(serde_json::Value::as_array)
+                .and_then(|rows| {
+                    rows.iter().find(|r| {
+                        r.get("namespace").and_then(serde_json::Value::as_str) == Some(ns)
+                    })
+                })
+                .and_then(|r| r.get("count"))
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+        ),
+    }
+}
+
+/// Why the #8888 archive phase stopped: a source read failed, a source row
+/// was malformed, or the distinct rows read disagree with the source's own
+/// archive count. The caller records the text in `report.errors` and stops.
+#[derive(Debug)]
+struct ArchivePhaseError(String);
+
+impl std::fmt::Display for ArchivePhaseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ArchivePhaseError {}
+
+/// Phase 1c of [`run`] — copy the source `archived_memories` table (#8888).
+///
+/// Pages `list_archived` to exhaustion (deduplicating by id, because the
+/// listing orders by `archived_at` alone), then checks the number of
+/// distinct ids read against the source's independent `archive_stats`
+/// count, so a listing that skipped a row across a page boundary fails
+/// loudly instead of minting a short success.
+///
+/// # Errors
+///
+/// The text of the first source read failure or count mismatch; the caller
+/// records it and stops. Per-row write failures are recorded in
+/// `report.errors` and the phase continues.
+async fn migrate_archived(
+    from: &dyn MemoryStore,
+    to: Option<&dyn MemoryStore>,
+    namespace: Option<&str>,
+    report: &mut MigrationReport,
+) -> std::result::Result<(), ArchivePhaseError> {
+    let page_size = crate::storage::LIST_MAX_LIMIT;
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut offset: usize = 0;
+    loop {
+        let page = from
+            .list_archived(namespace, page_size, offset)
+            .await
+            .map_err(|e| {
+                ArchivePhaseError(format!(
+                    "source archived list failed at offset {offset}: {e}"
+                ))
+            })?;
+        let page_len = page.len();
+        for row in &page {
+            let Some(id) = row.get("id").and_then(serde_json::Value::as_str) else {
+                return Err(ArchivePhaseError(
+                    "source archived row carries no string `id`".to_string(),
+                ));
+            };
+            if !seen.insert(id.to_string()) {
+                continue;
+            }
+            report.archived_read += 1;
+            let Some(to) = to else {
+                continue;
+            };
+            match to.insert_archived_row(row).await {
+                Ok(true) => report.archived_written += 1,
+                Ok(false) => report.archived_skipped += 1,
+                Err(e) => report
+                    .errors
+                    .push(format!("write archived row {id} failed: {e}")),
+            }
+        }
+        if page_len < page_size {
+            break;
+        }
+        offset += page_len;
+    }
+    let stats = from
+        .archive_stats()
+        .await
+        .map_err(|e| ArchivePhaseError(format!("source archive_stats failed: {e}")))?;
+    if let Some(expected) = archived_source_count(&stats, namespace) {
+        let read = u64::try_from(report.archived_read).unwrap_or(u64::MAX);
+        if read != expected {
+            return Err(ArchivePhaseError(format!(
+                "incomplete migrate: the source archive holds {expected} rows but the \
+                 listing returned {read} distinct rows — refusing to report success"
+            )));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::models::{Memory, Tier};
+
+    /// #8888: a source with no expired-unswept rows still costs the Phase 1b
+    /// walk one (empty) page, which `MigrationReport::batches` counts.
+    const EXPIRED_WALK_EMPTY_PAGES_8888: usize = 1;
 
     fn sample_memory(id: &str, ns: &str, title: &str) -> Memory {
         sample_memory_at(id, ns, title, chrono::Utc::now())
@@ -761,8 +1012,9 @@ mod tests {
         assert_eq!(report.memories_read, 5);
         assert_eq!(report.memories_written, 5);
         // #1876 — migrate genuinely PAGES again: 5 rows at page_size 2 =
-        // pages of 2, 2, 1 (the last short page terminates the walk).
-        assert_eq!(report.batches, 3);
+        // pages of 2, 2, 1 (the last short page terminates the walk), plus
+        // the one empty page of the #8888 expired-unswept walk.
+        assert_eq!(report.batches, 3 + EXPIRED_WALK_EMPTY_PAGES_8888);
         assert!(report.errors.is_empty(), "errors: {:?}", report.errors);
         // Verify destination has them all.
         for i in 0..5 {
@@ -887,8 +1139,13 @@ mod tests {
         assert!(report.errors.is_empty(), "errors: {:?}", report.errors);
         assert_eq!(report.memories_read, N, "must READ every source row");
         assert_eq!(report.memories_written, N, "must WRITE every source row");
-        // 2500 rows at page_size 1000 = pages of 1000, 1000, 500.
-        assert_eq!(report.batches, 3, "must page, not single-call truncate");
+        // 2500 rows at page_size 1000 = pages of 1000, 1000, 500, plus the
+        // one empty page of the #8888 expired-unswept walk.
+        assert_eq!(
+            report.batches,
+            3 + EXPIRED_WALK_EMPTY_PAGES_8888,
+            "must page, not single-call truncate"
+        );
 
         // Independent completeness proof: the destination holds all N rows.
         let dst_count = count_ns(&dst, &ctx, "pagination-test").await;

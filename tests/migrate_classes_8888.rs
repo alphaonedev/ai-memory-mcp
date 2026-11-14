@@ -34,11 +34,15 @@ const INCOMING_CONTENT: &str = "alice's incoming source text";
 const PAGE: usize = 100;
 
 fn mem(id: &str, title: &str, content: &str, owner: &str) -> Memory {
+    mem_in(NS, id, title, content, owner)
+}
+
+fn mem_in(ns: &str, id: &str, title: &str, content: &str, owner: &str) -> Memory {
     let now = chrono::Utc::now().to_rfc3339();
     Memory {
         id: id.to_string(),
         tier: Tier::Long,
-        namespace: NS.to_string(),
+        namespace: ns.to_string(),
         title: title.to_string(),
         content: content.to_string(),
         priority: 5,
@@ -107,8 +111,10 @@ async fn issue_8888_migrate_carries_archived_and_expired_unswept_rows() {
         let conn = Connection::open(&src_path).expect("raw open src");
         let n = conn
             .execute(
-                "UPDATE memories SET expires_at = ?1 WHERE id = ?2",
-                params![PAST_EXPIRY, EXPIRED_ID],
+                // A Long row never carries an expiry (the store clears
+                // it), so the expired-unswept fixture is a Mid row.
+                "UPDATE memories SET expires_at = ?1, tier = ?2 WHERE id = ?3",
+                params![PAST_EXPIRY, Tier::Mid.as_str(), EXPIRED_ID],
             )
             .expect("expire the fixture row");
         assert_eq!(n, 1, "fixture expires exactly one row");
@@ -127,11 +133,26 @@ async fn issue_8888_migrate_carries_archived_and_expired_unswept_rows() {
     let report = ai_memory::migrate::migrate(&src, &dst, PAGE, None, false).await;
     let value = serde_json::to_value(&report).expect("report serializes");
 
-    assert!(report.errors.is_empty(), "clean migrate: {:?}", report.errors);
+    assert!(
+        report.errors.is_empty(),
+        "clean migrate: {:?}",
+        report.errors
+    );
     assert_eq!(report.memories_read, 2, "live + expired-unswept rows read");
-    assert_eq!(report.memories_written, 2, "live + expired-unswept rows written");
-    assert_eq!(report_usize(&value, "archived_read"), 1, "archived rows read");
-    assert_eq!(report_usize(&value, "archived_written"), 1, "archived rows written");
+    assert_eq!(
+        report.memories_written, 2,
+        "live + expired-unswept rows written"
+    );
+    assert_eq!(
+        report_usize(&value, "archived_read"),
+        1,
+        "archived rows read"
+    );
+    assert_eq!(
+        report_usize(&value, "archived_written"),
+        1,
+        "archived rows written"
+    );
     assert_eq!(
         count(&dst_path, "SELECT COUNT(*) FROM memories"),
         src_memories,
@@ -151,7 +172,13 @@ async fn issue_8888_migrate_carries_archived_and_expired_unswept_rows() {
             |r| r.get(0),
         )
         .expect("expired row arrived");
-    assert_eq!(expires.as_deref(), Some(PAST_EXPIRY), "expiry preserved");
+    // The store canonicalises RFC 3339 precision, so compare instants.
+    let instant = |s: &str| chrono::DateTime::parse_from_rfc3339(s).expect("rfc3339 expiry");
+    assert_eq!(
+        expires.as_deref().map(instant),
+        Some(instant(PAST_EXPIRY)),
+        "expiry preserved"
+    );
     let dst_archive_row = dst
         .list_archived(None, PAGE, 0)
         .await
@@ -159,7 +186,13 @@ async fn issue_8888_migrate_carries_archived_and_expired_unswept_rows() {
         .into_iter()
         .find(|row| row["id"] == ARCHIVED_ID)
         .expect("archived row arrived");
-    for key in ["archived_at", "archive_reason", "title", "content", "namespace"] {
+    for key in [
+        "archived_at",
+        "archive_reason",
+        "title",
+        "content",
+        "namespace",
+    ] {
         assert_eq!(
             dst_archive_row[key], src_archive_row[key],
             "archived row column `{key}` preserved"
@@ -195,17 +228,27 @@ async fn issue_8932_migrate_keeps_foreign_owner_slot_holder() {
     )
     .await
     .expect("seed source");
-    dst.store(&ctx, &mem("m-bob", SHARED_TITLE, FOREIGN_CONTENT, FOREIGN_AGENT))
-        .await
-        .expect("seed destination");
+    dst.store(
+        &ctx,
+        &mem("m-bob", SHARED_TITLE, FOREIGN_CONTENT, FOREIGN_AGENT),
+    )
+    .await
+    .expect("seed destination");
 
     let report = ai_memory::migrate::migrate(&src, &dst, PAGE, None, false).await;
     let value = serde_json::to_value(&report).expect("report serializes");
 
     assert_eq!(report.memories_read, 1);
     assert_eq!(report.memories_written, 0, "nothing folded into bob's row");
-    assert_eq!(report_usize(&value, "cross_owner_kept"), 1, "refusal counted");
-    assert!(report.errors.is_empty(), "a counted refusal is not an error");
+    assert_eq!(
+        report_usize(&value, "cross_owner_kept"),
+        1,
+        "refusal counted"
+    );
+    assert!(
+        report.errors.is_empty(),
+        "a counted refusal is not an error"
+    );
 
     let conn = Connection::open(&dst_path).expect("raw open dst");
     let (content, meta): (String, String) = conn
@@ -223,4 +266,203 @@ async fn issue_8932_migrate_keeps_foreign_owner_slot_holder() {
         1,
         "no second row minted either"
     );
+}
+
+/// Postgres cells. Each self-skips when `AI_MEMORY_TEST_POSTGRES_URL` is
+/// unset; CI v2 runs them against a per-binary clone. Ids and the namespace
+/// carry a per-run suffix so a shared database never collides, and every
+/// migrate call is scoped to that namespace.
+#[cfg(feature = "sal-postgres")]
+mod postgres_cells {
+    use super::*;
+    use ai_memory::store::postgres::PostgresStore;
+
+    fn pg_url() -> Option<String> {
+        std::env::var("AI_MEMORY_TEST_POSTGRES_URL")
+            .ok()
+            .filter(|s| !s.is_empty())
+    }
+
+    fn run_suffix() -> String {
+        uuid::Uuid::new_v4().simple().to_string()
+    }
+
+    /// #8888 on both backends: sqlite -> postgres carries the expired-unswept
+    /// and archived rows, then postgres -> sqlite carries them back, so the
+    /// postgres `list_expired_unswept`, archive read and archived insert all
+    /// run. The expiry and archive columns survive both hops.
+    #[tokio::test]
+    async fn issue_8888_migrate_carries_archived_and_expired_rows_through_postgres() {
+        let Some(url) = pg_url() else {
+            eprintln!("skipping: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let suffix = run_suffix();
+        let ns = format!("{NS}-pg-{suffix}");
+        let live_id = format!("{LIVE_ID}-{suffix}");
+        let archived_id = format!("{ARCHIVED_ID}-{suffix}");
+        let expired_id = format!("{EXPIRED_ID}-{suffix}");
+        let dir = scratch("pg-classes");
+        let src_path = dir.path().join("src.db");
+        let back_path = dir.path().join("back.db");
+        let src = SqliteStore::open(src_path.to_str().unwrap()).expect("open src");
+        let back = SqliteStore::open(back_path.to_str().unwrap()).expect("open back");
+        let pg = PostgresStore::connect(&url)
+            .await
+            .expect("connect postgres");
+        let ctx = CallerContext::for_admin(SEED_ADMIN);
+
+        for (id, title) in [
+            (&live_id, "live row"),
+            (&archived_id, "archived row"),
+            (&expired_id, "expired row"),
+        ] {
+            src.store(&ctx, &mem_in(&ns, id, title, "durable text", SOURCE_AGENT))
+                .await
+                .expect("seed source row");
+        }
+        let archived = src
+            .archive_by_ids(
+                &ctx,
+                std::slice::from_ref(&archived_id),
+                Some(ARCHIVE_REASON),
+            )
+            .await
+            .expect("archive fixture row");
+        assert_eq!(archived, 1, "fixture archives exactly one row");
+        {
+            let conn = Connection::open(&src_path).expect("raw open src");
+            let n = conn
+                .execute(
+                    "UPDATE memories SET expires_at = ?1, tier = ?2 WHERE id = ?3",
+                    params![PAST_EXPIRY, Tier::Mid.as_str(), expired_id],
+                )
+                .expect("expire the fixture row");
+            assert_eq!(n, 1, "fixture expires exactly one row");
+        }
+
+        for (hop, report) in [
+            (
+                "sqlite -> postgres",
+                ai_memory::migrate::migrate(&src, &pg, PAGE, Some(ns.clone()), false).await,
+            ),
+            (
+                "postgres -> sqlite",
+                ai_memory::migrate::migrate(&pg, &back, PAGE, Some(ns.clone()), false).await,
+            ),
+        ] {
+            let value = serde_json::to_value(&report).expect("report serializes");
+            assert!(report.errors.is_empty(), "{hop}: {:?}", report.errors);
+            assert_eq!(
+                report.memories_read, 2,
+                "{hop}: live + expired-unswept read"
+            );
+            assert_eq!(
+                report.memories_written, 2,
+                "{hop}: live + expired-unswept written"
+            );
+            assert_eq!(
+                report_usize(&value, "archived_read"),
+                1,
+                "{hop}: archived read"
+            );
+            assert_eq!(
+                report_usize(&value, "archived_written"),
+                1,
+                "{hop}: archived written"
+            );
+        }
+
+        let conn = Connection::open(&back_path).expect("raw open back");
+        let expires: Option<String> = conn
+            .query_row(
+                "SELECT expires_at FROM memories WHERE id = ?1",
+                params![expired_id],
+                |r| r.get(0),
+            )
+            .expect("expired row made the round trip");
+        let instant = |s: &str| chrono::DateTime::parse_from_rfc3339(s).expect("rfc3339 expiry");
+        assert_eq!(
+            expires.as_deref().map(instant),
+            Some(instant(PAST_EXPIRY)),
+            "expiry preserved through postgres"
+        );
+        let row = back
+            .list_archived(Some(&ns), PAGE, 0)
+            .await
+            .expect("archive listing")
+            .into_iter()
+            .find(|row| row["id"] == archived_id.as_str())
+            .expect("archived row made the round trip");
+        assert_eq!(row["archive_reason"], ARCHIVE_REASON);
+    }
+
+    /// #8932 on postgres: bob's private destination row in the same
+    /// `(title, namespace)` slot is kept and the refusal is counted.
+    #[tokio::test]
+    async fn issue_8932_migrate_keeps_foreign_owner_slot_holder_on_postgres() {
+        let Some(url) = pg_url() else {
+            eprintln!("skipping: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let suffix = run_suffix();
+        let ns = format!("{NS}-pg-foreign-{suffix}");
+        let bob_id = format!("m-bob-{suffix}");
+        let dir = scratch("pg-foreign");
+        let src_path = dir.path().join("src.db");
+        let src = SqliteStore::open(src_path.to_str().unwrap()).expect("open src");
+        let pg = PostgresStore::connect(&url)
+            .await
+            .expect("connect postgres");
+        let ctx = CallerContext::for_admin(SEED_ADMIN);
+
+        src.store(
+            &ctx,
+            &mem_in(
+                &ns,
+                &format!("m-alice-{suffix}"),
+                SHARED_TITLE,
+                INCOMING_CONTENT,
+                SOURCE_AGENT,
+            ),
+        )
+        .await
+        .expect("seed source");
+        pg.store(
+            &ctx,
+            &mem_in(&ns, &bob_id, SHARED_TITLE, FOREIGN_CONTENT, FOREIGN_AGENT),
+        )
+        .await
+        .expect("seed postgres destination");
+
+        let report = ai_memory::migrate::migrate(&src, &pg, PAGE, Some(ns.clone()), false).await;
+        let value = serde_json::to_value(&report).expect("report serializes");
+        assert_eq!(report.memories_read, 1);
+        assert_eq!(report.memories_written, 0, "nothing folded into bob's row");
+        assert_eq!(
+            report_usize(&value, "cross_owner_kept"),
+            1,
+            "refusal counted"
+        );
+        assert!(
+            report.errors.is_empty(),
+            "a counted refusal is not an error"
+        );
+
+        let kept = pg
+            .get(&ctx, &bob_id)
+            .await
+            .expect("bob's row still present");
+        assert_eq!(kept.content, FOREIGN_CONTENT, "bob's content kept");
+        assert_eq!(
+            kept.metadata["agent_id"], FOREIGN_AGENT,
+            "bob's ownership kept"
+        );
+        // `Filter` is #[non_exhaustive]: build it by field assignment.
+        let mut filter = ai_memory::store::Filter::default();
+        filter.namespace = Some(ns.clone());
+        filter.limit = PAGE;
+        let rows = pg.list(&ctx, &filter).await.expect("namespace listing");
+        assert_eq!(rows.len(), 1, "no second row minted either");
+    }
 }

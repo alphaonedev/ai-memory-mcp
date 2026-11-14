@@ -437,6 +437,34 @@ impl<'a> ContextOffloader<'a> {
     }
 }
 
+/// #8908 — the import-side integrity gate for one `offloaded_blobs` row a
+/// portability bundle carries: the zstd frame must decompress within
+/// [`MAX_DECOMPRESSED_BYTES`] to UTF-8 whose SHA-256 equals `content_sha256`,
+/// and `ref_id` must be the content address derived from that hash. The same
+/// commitments [`ContextOffloader::deref`] checks, run before the row lands.
+/// Returns the verified text so the export screen can classify it.
+///
+/// # Errors
+///
+/// [`OffloadError::IntegrityFailed`] naming `ref_id` on any disagreement,
+/// including a frame that fails to decompress or exceeds the cap.
+pub fn verify_offloaded_blob(
+    ref_id: &str,
+    content_zstd: &[u8],
+    content_sha256: &str,
+) -> std::result::Result<String, OffloadError> {
+    let failed = || OffloadError::IntegrityFailed {
+        ref_id: ref_id.to_string(),
+    };
+    let bytes = zstd_decompress(content_zstd).map_err(|_| failed())?;
+    let content = String::from_utf8(bytes).map_err(|_| failed())?;
+    let recomputed = sha256_hex(content.as_bytes());
+    if recomputed != content_sha256 || ref_id_from_sha(&recomputed) != ref_id {
+        return Err(failed());
+    }
+    Ok(content)
+}
+
 /// SHA-256 hex-string helper.
 fn sha256_hex(input: &[u8]) -> String {
     let mut hasher = Sha256::new();

@@ -449,6 +449,9 @@ pub(crate) fn import_from_str(
                  classes. Upgrade this node instead; no rows were applied"
             );
         }
+        // 3-agent vote (71472661) P-14 / P-10 — name an unknown top-level
+        // field and cross-check `class_counts` before the strict parse.
+        crate::portability::envelope_parse::check_raw_envelope(&data)?;
         let envelope: crate::portability::emit::ExportEnvelope = serde_json::from_value(data)
             .map_err(|e| {
                 anyhow::anyhow!(
@@ -494,7 +497,9 @@ pub(crate) fn import_from_str(
             + report.invalid_links_skipped
             + report.conflicts_skipped
             + report.forged_signature_skipped
-            + report.governance_rejected;
+            + report.governance_rejected
+            // #8908 — an offloaded blob that failed verification did not land.
+            + report.offloaded_blobs_refused;
         // An endpoint-missing link skip is a reconstruction FAILURE only when
         // no covenant skip fired in this bundle. Otherwise it is the
         // downstream consequence of an honoured erasure / archival — and
@@ -580,6 +585,10 @@ pub(crate) fn import_from_str(
     // happened); the durable row is kept, never overwritten. Deliberately
     // excluded from the exit-code sum so an idempotent restore exits 0.
     let mut idempotent_skipped = 0usize;
+    // #8968 — a `--on-conflict merge` collision whose destination row belongs
+    // to another owner: counted, warned, the destination row kept (the #3151
+    // disposition). Not a refusal, so it does not change the exit code.
+    let mut cross_owner_kept = 0usize;
     for mut mem in memories {
         let original_claim = mem
             .metadata
@@ -797,6 +806,10 @@ pub(crate) fn import_from_str(
         // continues; the whole import is never aborted on one row.
         match db::insert_with_conflict(&conn, &mem, conflict_mode) {
             Ok(_) => imported += 1,
+            Err(e) if crate::portability::owner_guard::is_foreign_owner_kept(&e) => {
+                errors.push(e.to_string());
+                cross_owner_kept += 1;
+            }
             Err(e) => {
                 errors.push(format!("{}: {}", mem.id, e));
                 refused += 1;
@@ -925,6 +938,9 @@ pub(crate) fn import_from_str(
                 // excluded from the exit-code sum so a restore of an unchanged
                 // corpus exits 0.
                 "idempotent_skipped": idempotent_skipped,
+                // #8968 — merge collisions with another owner's row; the
+                // destination row was kept.
+                (crate::models::field_names::CROSS_OWNER_KEPT): cross_owner_kept,
                 (models::field_names::PUBKEY_BINDINGS_STRIPPED): pubkey_bindings_stripped,
                 (models::field_names::ATTESTATION_DOWNGRADED): attestation_downgraded,
                 (models::field_names::FORGED_SIGNATURE_SKIPPED): forged_signature_skipped,
@@ -948,6 +964,13 @@ pub(crate) fn import_from_str(
                 out.stderr,
                 "warning: stripped {pubkey_bindings_stripped} imported agent public-key \
                  binding(s); use the persisted proof-of-possession or lineage bind flow"
+            )?;
+        }
+        if cross_owner_kept > 0 {
+            writeln!(
+                out.stderr,
+                "warning: kept {cross_owner_kept} destination row(s) owned by another agent; \
+                 the colliding bundle row(s) were not merged"
             )?;
         }
         if attestation_downgraded > 0 || forged_signature_skipped > 0 {

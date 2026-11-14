@@ -4759,6 +4759,32 @@ impl MemoryStore for SqliteStore {
         let conn = self.state.lock().await;
         db::archive_stats(&conn).map_err(box_err)
     }
+
+    /// #8888 — expired-but-unswept rows; thin delegate.
+    async fn list_expired_unswept(
+        &self,
+        namespace: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> StoreResult<Vec<Memory>> {
+        let conn = self.state.lock().await;
+        crate::portability::migrate_rows::sqlite_list_expired_unswept(
+            &conn, namespace, limit, offset,
+        )
+        .map_err(box_err)
+    }
+
+    /// #8888 — insert-if-absent of one archived row; thin delegate.
+    async fn insert_archived_row(&self, row: &serde_json::Value) -> StoreResult<bool> {
+        let conn = self.state.lock().await;
+        crate::portability::migrate_rows::sqlite_insert_archived_row(&conn, row).map_err(box_err)
+    }
+
+    /// #8932 / #8968 — the owner guard's probe; thin delegate.
+    async fn foreign_slot_holder(&self, memory: &Memory) -> StoreResult<Option<String>> {
+        let conn = self.state.lock().await;
+        crate::portability::owner_guard::foreign_holder(&conn, memory).map_err(box_err)
+    }
 }
 
 // #1643 — the `SqliteTransaction` placeholder (a `Transaction` impl

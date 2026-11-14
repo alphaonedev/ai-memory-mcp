@@ -27,11 +27,20 @@ use crate::portability::dto::{
     ArchivedMemoryDto, ArchivedMemoryLinkDto, ForgetTombstoneDto, GovernanceRuleDto, LineageDto,
     ModelAttestationDto, NamespaceMetaDto, RevisionDto, SignedEventDto, TrustAnchorDto,
 };
+use crate::portability::envelope_parse as ep;
+use crate::portability::extra_classes::{
+    CheckpointDto, EntityAliasDto, OffloadedBlobDto, RoutineDto, RoutineRunDto,
+};
 use crate::portability::read;
 
 /// The frozen v2 envelope `spec_version` (spec §V2-4). Replaces v1's
 /// `schema_version: "v1"` stamp; `db_schema_version` still carries the integer
 /// storage schema separately.
+///
+/// 3-agent vote (71472661) P-12: the `"2"` field set is CLOSED at v1.0.0 GA.
+/// It is exactly [`crate::portability::envelope_parse::ALWAYS_FIELDS`] plus
+/// [`crate::portability::envelope_parse::OPTIONAL_FIELDS`]; any later field
+/// addition, removal or meaning change needs `spec_version` `"3"`.
 pub const SPEC_VERSION_V2: &str = "2";
 
 /// The Portability-v2 conformance level an export ACHIEVES (spec §V2-1),
@@ -123,6 +132,34 @@ pub struct ExportEnvelope {
     /// restore can re-attach the edges an archived memory carried.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub archived_memory_links: Vec<ArchivedMemoryLinkDto>,
+    /// `expired_memories[]` (#8911) — rows whose `expires_at` has passed but
+    /// that GC has not swept yet. They cross the same screen as `memories[]`
+    /// and land with `expires_at` preserved (GC sweeps them at the
+    /// destination exactly as it would have at the source).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expired_memories: Vec<Memory>,
+    /// `checkpoints[]` (#8908) — every column, signatures byte-preserved.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checkpoints: Vec<CheckpointDto>,
+    /// `routines[]` (#8908).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub routines: Vec<RoutineDto>,
+    /// `routine_runs[]` (#8908); each run's routine rides `routines[]`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub routine_runs: Vec<RoutineRunDto>,
+    /// `entity_aliases[]` (#8908).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entity_aliases: Vec<EntityAliasDto>,
+    /// `offloaded_blobs[]` (#8908) — the zstd frame hex-encoded, committed by
+    /// `content_sha256` (re-verified at import before any write).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub offloaded_blobs: Vec<OffloadedBlobDto>,
+    /// 3-agent vote (71472661) P-9 — the rows each array class carries,
+    /// zeros included, withheld rows excluded. Always written by this
+    /// emitter; absent only on a bundle from an older build (P-10 then
+    /// refuses the bundle if it carries any of the arrays above).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub class_counts: Option<BTreeMap<String, usize>>,
     /// `true` iff the achieved [`ConformanceLevel`] is L3 (the legacy #1944
     /// bool — kept, and honestly `false` for any sub-L3 export).
     pub portability_complete: bool,
@@ -279,10 +316,48 @@ pub fn build_full_envelope_audited(
     // NOT a new envelope field — `ExportEnvelope` is parsed with
     // `deny_unknown_fields`, so adding one would make every already-shipped
     // binary refuse the new bundle (#2490 objection O2).
-    let (links, dangling_edges) = crate::export_scope::retain_resolvable_links(
-        &memories,
-        crate::storage::export_links(conn)?,
-    );
+    // #8911 — expired-but-unswept rows ride `expired_memories[]` through the
+    // SAME screen. Read AFTER `export_all`, so a row that expires between the
+    // two reads is in both sets; the id dedupe keeps it in `memories[]` only.
+    let expiry_now = chrono::Utc::now().to_rfc3339();
+    let live_ids: std::collections::HashSet<String> =
+        memories.iter().map(|m| m.id.clone()).collect();
+    let expired_read: Vec<Memory> = read::read_all_expired_memories(conn, &expiry_now)?
+        .into_iter()
+        .filter(|m| !live_ids.contains(&m.id))
+        .collect();
+    let expired_read_count = expired_read.len();
+    let (expired_memories, expired_ledger) =
+        crate::export_taxonomy::screen_memories_for_export_audited(expired_read, Some(conn));
+    merge_ledger(&mut ledger, expired_ledger);
+    // The expired rows now ride (or are withheld by class); only the ones
+    // read neither way (lifecycle-hidden) stay in the `expired` exclusion.
+    ledger.expired = ledger.expired.saturating_sub(expired_read_count);
+    let mut carried: Vec<Memory> = memories.clone();
+    carried.extend(expired_memories.iter().cloned());
+    let mut all_links = crate::storage::export_links(conn)?;
+    let mut seen_edges: std::collections::HashSet<(String, String, String)> = all_links
+        .iter()
+        .map(|l| {
+            (
+                l.source_id.clone(),
+                l.target_id.clone(),
+                l.relation.to_string(),
+            )
+        })
+        .collect();
+    for link in read::read_links_touching_expired(conn, &expiry_now)? {
+        let key = (
+            link.source_id.clone(),
+            link.target_id.clone(),
+            link.relation.to_string(),
+        );
+        if seen_edges.insert(key) {
+            all_links.push(link);
+        }
+    }
+    let (links, dangling_edges) = crate::export_scope::retain_resolvable_links(&carried, all_links);
+    drop(carried);
     ledger.dangling_link_edges = dangling_edges;
 
     // v1.0.0 #2571 — archived rows (spec §6.4) get the SAME confidentiality
@@ -297,11 +372,7 @@ pub fn build_full_envelope_audited(
     // drop exactly like it already does for `memories[]`).
     let (archived_rows, archived_ledger) =
         screen_archived_memories_for_export(read::read_all_archived_memories(conn)?, Some(conn));
-    ledger.withheld_ids.extend(archived_ledger.withheld_ids);
-    for (class, count) in archived_ledger.withheld_by_class {
-        *ledger.withheld_by_class.entry(class).or_insert(0) += count;
-    }
-    ledger.redacted_ids.extend(archived_ledger.redacted_ids);
+    merge_ledger(&mut ledger, archived_ledger);
     let archived_memories: Vec<ArchivedMemoryDto> =
         archived_rows.iter().map(ArchivedMemoryDto::from).collect();
     let namespace_meta: Vec<NamespaceMetaDto> = read::read_all_namespace_meta(conn)?
@@ -313,6 +384,11 @@ pub fn build_full_envelope_audited(
             .iter()
             .map(ArchivedMemoryLinkDto::from)
             .collect();
+
+    // #8908 — the five extra classes, screened (P-3) BEFORE the signed
+    // events are read so a refusal row the screen writes rides the export.
+    let (extra, extra_ledger) = crate::portability::extra_classes::screen_extra_classes(conn)?;
+    merge_ledger(&mut ledger, extra_ledger);
 
     // Signed classes → byte-preserved DTOs.
     let signed_events: Vec<SignedEventDto> =
@@ -387,31 +463,35 @@ pub fn build_full_envelope_audited(
         signed_level,
     );
     note(
-        "memory_revisions",
+        ep::CLASS_MEMORY_REVISIONS,
         memory_revisions.is_empty(),
         signed_level,
     );
     note(
-        "forget_tombstones",
+        ep::CLASS_FORGET_TOMBSTONES,
         forget_tombstones.is_empty(),
         ConformanceLevel::L2,
     );
     note(
-        "agent_lineage",
+        ep::CLASS_AGENT_LINEAGE,
         agent_lineage.is_empty(),
         ConformanceLevel::L2,
     );
     note(
-        "model_attestations",
+        ep::CLASS_MODEL_ATTESTATIONS,
         model_attestations.is_empty(),
         ConformanceLevel::L2,
     );
     note(
-        "governance_rules",
+        ep::CLASS_GOVERNANCE_RULES,
         governance_rules.is_empty(),
         governed_level,
     );
-    note("trust_anchors", trust_anchors.is_empty(), governed_level);
+    note(
+        ep::CLASS_TRUST_ANCHORS,
+        trust_anchors.is_empty(),
+        governed_level,
+    );
     // #2571 — archived_memories / namespace_meta / archived_memory_links
     // carry no signature to re-verify, so their level is a flat L1 (the
     // same unconditional level `memories`/`links` get above) rather than
@@ -434,6 +514,39 @@ pub fn build_full_envelope_audited(
         archived_memory_links.is_empty(),
         ConformanceLevel::L1,
     );
+    // #8908 / #8911 — the new classes carry no chain to re-verify here (the
+    // blob signature is checked by the offload verifier, not the audit
+    // chain), so they are a flat L1 like the archive classes.
+    note(
+        ep::CLASS_EXPIRED_MEMORIES,
+        expired_memories.is_empty(),
+        ConformanceLevel::L1,
+    );
+    note(
+        ep::CLASS_CHECKPOINTS,
+        extra.checkpoints.is_empty(),
+        ConformanceLevel::L1,
+    );
+    note(
+        ep::CLASS_ROUTINES,
+        extra.routines.is_empty(),
+        ConformanceLevel::L1,
+    );
+    note(
+        ep::CLASS_ROUTINE_RUNS,
+        extra.routine_runs.is_empty(),
+        ConformanceLevel::L1,
+    );
+    note(
+        ep::CLASS_ENTITY_ALIASES,
+        extra.entity_aliases.is_empty(),
+        ConformanceLevel::L1,
+    );
+    note(
+        ep::CLASS_OFFLOADED_BLOBS,
+        extra.offloaded_blobs.is_empty(),
+        ConformanceLevel::L1,
+    );
 
     // Overall = MIN across the tamper-evidence gate and the governance gate.
     // A broken source chain caps everything at L1; a missing operator anchor
@@ -447,31 +560,52 @@ pub fn build_full_envelope_audited(
     };
 
     let count = memories.len();
-    Ok((
-        ExportEnvelope {
-            spec_version: SPEC_VERSION_V2.to_string(),
-            db_schema_version: db_schema_version(conn)?,
-            source: source.to_string(),
-            exported_at: exported_at.to_string(),
-            memories,
-            links,
-            signed_events,
-            memory_revisions,
-            forget_tombstones,
-            agent_lineage,
-            model_attestations,
-            governance_rules,
-            trust_anchors,
-            archived_memories,
-            namespace_meta,
-            archived_memory_links,
-            portability_complete: conformance_level == ConformanceLevel::L3 && !ledger.is_partial(),
-            conformance_level: conformance_level.as_str().to_string(),
-            conformance_by_class: by_class,
-            count,
-        },
-        ledger,
-    ))
+    let mut envelope = ExportEnvelope {
+        spec_version: SPEC_VERSION_V2.to_string(),
+        db_schema_version: db_schema_version(conn)?,
+        source: source.to_string(),
+        exported_at: exported_at.to_string(),
+        memories,
+        links,
+        signed_events,
+        memory_revisions,
+        forget_tombstones,
+        agent_lineage,
+        model_attestations,
+        governance_rules,
+        trust_anchors,
+        archived_memories,
+        namespace_meta,
+        archived_memory_links,
+        expired_memories,
+        checkpoints: extra.checkpoints,
+        routines: extra.routines,
+        routine_runs: extra.routine_runs,
+        entity_aliases: extra.entity_aliases,
+        offloaded_blobs: extra.offloaded_blobs,
+        class_counts: None,
+        portability_complete: conformance_level == ConformanceLevel::L3 && !ledger.is_partial(),
+        conformance_level: conformance_level.as_str().to_string(),
+        conformance_by_class: by_class,
+        count,
+    };
+    envelope.class_counts = Some(crate::portability::envelope_parse::carried_counts(
+        &envelope,
+    ));
+    Ok((envelope, ledger))
+}
+
+/// Fold a per-class screen's ledger delta into the export ledger (one SSOT
+/// for the archived, expired and #8908 class screens).
+fn merge_ledger(
+    ledger: &mut crate::export_scope::ExportWithholdLedger,
+    delta: crate::export_scope::ExportWithholdLedger,
+) {
+    ledger.withheld_ids.extend(delta.withheld_ids);
+    for (class, count) in delta.withheld_by_class {
+        *ledger.withheld_by_class.entry(class).or_insert(0) += count;
+    }
+    ledger.redacted_ids.extend(delta.redacted_ids);
 }
 
 #[cfg(test)]

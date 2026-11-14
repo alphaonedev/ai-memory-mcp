@@ -73,7 +73,7 @@ use crate::storage::ConflictMode;
 /// `tracing` target for every importer WARN (the
 /// `federation_receive::ATTESTATION_TRACE_TARGET` const precedent —
 /// pm-v3.1 no-hardcoded-literals).
-const IMPORT_TRACE_TARGET: &str = "portability::import";
+pub(crate) const IMPORT_TRACE_TARGET: &str = "portability::import";
 
 /// Caller-supplied dispositions for a v2 integrity import (#2211).
 ///
@@ -270,6 +270,29 @@ pub struct ImportReport {
     /// (#3151) it is counted + warned via the matching
     /// `*_skipped_divergent` field.
     pub idempotent_rows_already_present: usize,
+    /// #8968 — memory rows NOT written under `--on-conflict merge` because
+    /// the destination row holding their `(title, namespace)` slot (or id)
+    /// belongs to another owner. The destination row is kept byte-for-byte
+    /// and a warning names the incoming id (the #3151 disposition).
+    pub cross_owner_kept: usize,
+    /// #8911 — `expired_memories[]` rows staged (expiry preserved).
+    pub expired_memories: usize,
+    /// #8908 — `checkpoints[]` rows staged.
+    pub checkpoints: usize,
+    /// #8908 — `routines[]` rows staged.
+    pub routines: usize,
+    /// #8908 — `routine_runs[]` rows staged.
+    pub routine_runs: usize,
+    /// #8908 — `entity_aliases[]` rows staged.
+    pub entity_aliases: usize,
+    /// #8908 — `offloaded_blobs[]` rows staged.
+    pub offloaded_blobs: usize,
+    /// #8908 — `offloaded_blobs[]` rows refused because the frame failed its
+    /// `content_sha256` integrity check (tampered in transit); never written.
+    pub offloaded_blobs_refused: usize,
+    /// #8908 — rows of the five #8908 classes NOT staged because the
+    /// destination holds a DIFFERENT row under the same key (kept, warned).
+    pub extra_classes_skipped_divergent: usize,
     /// `true` when the imported audit spine re-verified in the transaction.
     pub reverify_chain_ok: bool,
     /// `true` when the staged `memory_revisions` chain replayed cleanly
@@ -341,6 +364,9 @@ pub fn import_full_envelope(
             env.spec_version
         );
     }
+    // 3-agent vote (71472661) P-10 — the class_counts cross-check, before
+    // any row is touched.
+    crate::portability::envelope_parse::check_class_counts(env)?;
     let dest_schema = crate::portability::emit::db_schema_version(conn)
         .context("portability import: could not read the destination's applied schema version")?;
     if env.db_schema_version > dest_schema {
@@ -555,7 +581,14 @@ fn apply_all_classes(
     }
 
     // (2) memories (tombstoned/archived skipped; id-keyed idempotent) + links.
-    for mem in &env.memories {
+    // #8911 — `expired_memories[]` rows take the SAME lane (every gate below
+    // applies), counted under their own class.
+    let lanes = env
+        .memories
+        .iter()
+        .map(|m| (m, false))
+        .chain(env.expired_memories.iter().map(|m| (m, true)));
+    for (mem, expired_lane) in lanes {
         // #2208 — the forget covenant: a signed forget receipt is a promise.
         // The DESTINATION's `forget_tombstones` (now also holding the
         // bundle's own tombstones from step 1) is authoritative — a
@@ -710,6 +743,18 @@ fn apply_all_classes(
         // unchanged — only the raced-collision outcome flips from a silent
         // clobber to a skip.
         let fail_closed = opts.on_conflict != ConflictMode::Merge;
+        // #8968 — `Merge` upserts onto the slot holder; a holder of another
+        // owner is never replaced or merged. Keep it, count, warn, continue.
+        if !fail_closed && crate::portability::owner_guard::foreign_holder(conn, &staged)?.is_some()
+        {
+            let kept = crate::portability::owner_guard::ForeignOwnerKept {
+                incoming_id: staged.id.clone(),
+            };
+            tracing::warn!(target: IMPORT_TRACE_TARGET, "{kept}");
+            report.cross_owner_kept += 1;
+            report.warnings.push(kept.to_string());
+            continue;
+        }
         if let Some(existing_id) = collision {
             match opts.on_conflict {
                 // Legacy silent upsert-merge — the operator opted in.
@@ -749,6 +794,9 @@ fn apply_all_classes(
             crate::storage::insert_imported(conn, &staged)
         };
         match write_result {
+            Ok(_) if expired_lane => {
+                report.expired_memories += 1;
+            }
             Ok(_) => {
                 report.memories += 1;
             }
@@ -1703,6 +1751,11 @@ fn apply_all_classes(
     // destination K1-pins its OWN out-of-band enrolled keys).
     report.trust_anchors_seen = env.trust_anchors.len();
 
+    // (9) #8908 — checkpoints, routines (then their runs), entity aliases,
+    // offloaded blobs. Inside the SAME transaction, so the gates above roll
+    // these back too (P-4).
+    crate::portability::extra_classes::import_extra_classes(conn, env, opts, &mut report)?;
+
     Ok(report)
 }
 
@@ -1987,6 +2040,22 @@ mod tests {
         SignedEvent, append_signed_event, list_signed_events, payload_hash,
     };
     use std::sync::Mutex;
+
+    /// Test-only shadow of [`super::import_full_envelope`]. These unit tests build an
+    /// envelope with `build_full_envelope` and then add, drop or forge rows to probe one
+    /// gate each. The 3-agent vote (71472661) P-10 count check would refuse every such
+    /// edited bundle before the gate under test runs, so the shadow re-derives
+    /// `class_counts` from the arrays first. The P-10 refusals themselves are pinned in
+    /// `tests/portability_classes_8908.rs` and `tests/conformance_class_counts_8908.rs`.
+    fn import_full_envelope(
+        conn: &Connection,
+        env: &ExportEnvelope,
+        opts: &ImportOptions,
+    ) -> Result<ImportReport> {
+        let mut recounted = env.clone();
+        recounted.class_counts = Some(crate::portability::envelope_parse::carried_counts(env));
+        super::import_full_envelope(conn, &recounted, opts)
+    }
 
     static IMPORT_TRACE_LOG: Mutex<Vec<String>> = Mutex::new(Vec::new());
     static IMPORT_TRACE_GUARD: Mutex<()> = Mutex::new(());

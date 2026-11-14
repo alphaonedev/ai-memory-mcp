@@ -25,6 +25,9 @@
 //      embedded attestations re-encoded + verified under the embedded
 //      subject key, then the divergence key checked (same subject /
 //      epoch / head_sequence, DIFFERENT head_hash).
+//   6. Apply the importer's class_counts rule to the export-envelope
+//      bundles (vectors/export/class_counts.json) and match the answer
+//      key's accept or refuse verdict and reason (#8908).
 //
 // Usage:  node reader.mjs [--corpus DIR]
 // Exit status: 0 when every vector passes, 1 otherwise.
@@ -377,6 +380,77 @@ async function checkCorpusDigest(manifest, corpus) {
     throw new ProfileError(`corpus_digest mismatch: computed ${got}, manifest ${manifest.corpus_digest}`);
 }
 
+// --- class_counts (#8908, 3-agent vote (71472661) P-10 / P-11) ---------------
+
+// Every array class of the "2" envelope, in envelope order. Kept in this reader
+// (not taken from the answer key) so the check is independent; the key's copy
+// is cross-checked against it.
+const ARRAY_CLASSES = [
+  "memories", "links", "signed_events", "memory_revisions", "forget_tombstones",
+  "agent_lineage", "model_attestations", "governance_rules", "trust_anchors",
+  "archived_memories", "namespace_meta", "archived_memory_links", "expired_memories",
+  "checkpoints", "routines", "routine_runs", "entity_aliases", "offloaded_blobs",
+];
+// The arrays added by #8908 / #8911: a bundle carrying any of them must carry
+// class_counts too.
+const NEW_ARRAY_CLASSES = [
+  "expired_memories", "checkpoints", "routines", "routine_runs", "entity_aliases",
+  "offloaded_blobs",
+];
+const CLASS_COUNTS_FIELD = "class_counts";
+const CLASS_COUNTS_KEY = join("vectors", "export", "class_counts.json");
+
+const isPlainObject = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
+const has = (obj, k) => Object.prototype.hasOwnProperty.call(obj, k);
+
+/** Apply the importer's class_counts rule to one envelope. Returns
+ * [verdict, reason, class] in the same check order as the Rust importer
+ * (src/portability/envelope_parse.rs). */
+function classCountsVerdict(bundle) {
+  if (!isPlainObject(bundle)) return ["refuse", "not-object", null];
+  const carried = {};
+  for (const c of ARRAY_CLASSES) carried[c] = Array.isArray(bundle[c]) ? bundle[c].length : 0;
+  const declared = has(bundle, CLASS_COUNTS_FIELD) ? bundle[CLASS_COUNTS_FIELD] : null;
+  if (declared === null) {
+    for (const c of NEW_ARRAY_CLASSES) if (carried[c] > 0) return ["refuse", "class-counts-absent", c];
+    return ["accept", null, null];
+  }
+  if (!isPlainObject(declared)) return ["refuse", "class-counts-not-object", null];
+  for (const [c, n] of Object.entries(declared))
+    if (!Number.isSafeInteger(n) || n < 0) return ["refuse", "count-not-integer", c];
+  for (const c of Object.keys(declared))
+    if (!ARRAY_CLASSES.includes(c)) return ["refuse", "unknown-class", c];
+  for (const c of ARRAY_CLASSES) {
+    if (!has(declared, c)) return ["refuse", "missing-class-entry", c];
+    if (declared[c] !== carried[c]) {
+      const reason = !has(bundle, c) && declared[c] > 0 ? "dropped-class" : "count-mismatch";
+      return ["refuse", reason, c];
+    }
+  }
+  return ["accept", null, null];
+}
+
+/** Run every bundle of the class_counts answer key; returns [name, error]. */
+function checkClassCountsBundles(corpus) {
+  const key = JSON.parse(readFileSync(join(corpus, CLASS_COUNTS_KEY), "utf-8"));
+  const results = [];
+  const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+  if (!same(key.array_classes, ARRAY_CLASSES) || !same(key.new_array_classes, NEW_ARRAY_CLASSES))
+    results.push(["class-counts-class-list", "answer key class lists differ from this reader"]);
+  for (const entry of key.bundles) {
+    const bundle = JSON.parse(
+      readFileSync(join(corpus, dirname(CLASS_COUNTS_KEY), entry.file), "utf-8"),
+    );
+    const got = classCountsVerdict(bundle);
+    const want = [entry.expect, entry.reason ?? null, entry.class ?? null];
+    results.push([
+      entry.name,
+      same(got, want) ? null : `resolved ${JSON.stringify(got)} != expected ${JSON.stringify(want)}`,
+    ]);
+  }
+  return results;
+}
+
 // --- main ---------------------------------------------------------------------
 
 async function main() {
@@ -464,7 +538,23 @@ async function main() {
     }
   }
 
-  const total = manifest.vectors.length + groups.length + 1; // + corpus_digest anchor
+  let bundleResults;
+  try {
+    bundleResults = checkClassCountsBundles(corpus);
+  } catch (err) {
+    bundleResults = [["class-counts-answer-key", err.message]];
+  }
+  for (const [name, error] of bundleResults) {
+    if (error === null) {
+      console.log(`PASS ${name} [class-counts]`);
+    } else {
+      console.log(`FAIL ${name}: ${error}`);
+      failed += 1;
+    }
+  }
+
+  // + corpus_digest anchor + the class_counts bundles
+  const total = manifest.vectors.length + groups.length + 1 + bundleResults.length;
   console.log(`\n${total - failed}/${total} items passed${failed === 0 ? "" : " (FAILURES)"}`);
   return failed === 0 ? 0 : 1;
 }

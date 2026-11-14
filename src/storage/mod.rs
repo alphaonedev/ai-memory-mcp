@@ -3298,7 +3298,9 @@ pub fn insert_with_conflict(conn: &Connection, mem: &Memory, mode: ConflictMode)
     // that do not route through `insert`).
     crate::storage::record_stop::gate_storage_conn(conn)?;
     match mode {
-        ConflictMode::Merge => insert(conn, mem),
+        ConflictMode::Merge => {
+            crate::portability::owner_guard::insert_merge_owner_guarded(conn, mem)
+        }
         ConflictMode::Error => {
             // v0.7.0 L1-6 Deliverable E — fire the pre-write governance
             // hook BEFORE the existence-check `SELECT`. The Merge and
@@ -16894,7 +16896,7 @@ const SQL_SIZE_GC_NEXT_VICTIM: &str = "SELECT id, \
 // Archive operations
 // ---------------------------------------------------------------------------
 
-const ARCHIVED_TOTAL_KEY: &str = "archived_total";
+pub(crate) const ARCHIVED_TOTAL_KEY: &str = "archived_total";
 
 /// v1.0.0 #3382 — the column projection shared by every `archived_memories`
 /// listing shape. Single-sourced so the caller-scoped and unscoped variants

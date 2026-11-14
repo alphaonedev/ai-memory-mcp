@@ -54,11 +54,13 @@ const FOREIGN_CONTENT: &str = "bob private content that must never be replaced";
 /// The incoming row's content in the #8968 collision.
 const INCOMING_CONTENT: &str = "alice content that collides on the title slot";
 /// The per-row disposition text of the #8968 owner guard.
-const FOREIGN_OWNER_KEPT_MSG: &str = "skipped: the destination row holding this slot belongs to another owner; destination row kept";
+const FOREIGN_OWNER_KEPT_MSG: &str =
+    "skipped: the destination row holding this slot belongs to another owner; destination row kept";
 /// The #3150 confidentiality class a PEM private-key block screens into.
 const CLASS_PRIVATE_KEY: &str = "private_key_material";
 /// PEM armor that the export screen withholds.
-const PEM_ARMOR: &str = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\n-----END PRIVATE KEY-----";
+const PEM_ARMOR: &str =
+    "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\n-----END PRIVATE KEY-----";
 /// The #8908 100K+ bound on one class.
 const BOUND_ROWS: usize = 100_000;
 /// Wall-clock ceiling for exporting + importing [`BOUND_ROWS`] aliases in a
@@ -233,7 +235,13 @@ fn seed_new_classes(conn: &Connection) {
         "INSERT INTO routines (id, namespace, name, template, parameters, state, created_by, \
          created_at, signature, signer_pubkey, metadata) \
          VALUES ('rt-1', ?1, 'nightly', 'recall {q}', '[\"q\"]', 'frozen', ?2, ?3, ?4, ?5, '{}')",
-        params![NS, SOURCE_AGENT, CREATED_EPOCH, vec![0x01_u8; 64], vec![0x02_u8; 32]],
+        params![
+            NS,
+            SOURCE_AGENT,
+            CREATED_EPOCH,
+            vec![0x01_u8; 64],
+            vec![0x02_u8; 32]
+        ],
     )
     .expect("insert routine");
     conn.execute(
@@ -338,7 +346,11 @@ fn issue_8908_full_export_round_trips_each_new_class_byte_exact() {
     for (class, table, order_by) in NEW_CLASS_TABLES {
         let src_rows = dump_table(&src, table, order_by);
         assert_eq!(src_rows.len(), 1, "{class}: fixture seeds one row");
-        assert_eq!(array_len(&v, class), 1, "{class}: export --full carries the row");
+        assert_eq!(
+            array_len(&v, class),
+            1,
+            "{class}: export --full carries the row"
+        );
         assert_eq!(
             dump_table(&dst, table, order_by),
             src_rows,
@@ -359,7 +371,10 @@ fn vote_p9_class_counts_present_and_exact() {
         .expect("class_counts is always serialized (P-9)");
     let keys: BTreeSet<&str> = counts.keys().map(String::as_str).collect();
     let expected: BTreeSet<&str> = ARRAY_CLASSES.into_iter().collect();
-    assert_eq!(keys, expected, "class_counts covers every array class, zeros included");
+    assert_eq!(
+        keys, expected,
+        "class_counts covers every array class, zeros included"
+    );
     for class in ARRAY_CLASSES {
         assert_eq!(
             counts[class].as_u64().and_then(|n| usize::try_from(n).ok()),
@@ -386,7 +401,11 @@ fn issue_8911_full_export_carries_expired_unswept_row() {
         .and_then(Value::as_array)
         .map(|a| a.iter().filter_map(|m| m["id"].as_str()).collect())
         .unwrap_or_default();
-    assert_eq!(carried, vec!["m-expired"], "the unswept expired row rides --full");
+    assert_eq!(
+        carried,
+        vec!["m-expired"],
+        "the unswept expired row rides --full"
+    );
     let dst = fresh_db("exp-dst-");
     import_value(&dst, v, &opts(true, ConflictMode::Version));
     let landed: Option<String> = dst
@@ -396,7 +415,14 @@ fn issue_8911_full_export_carries_expired_unswept_row() {
             |r| r.get(0),
         )
         .ok();
-    assert_eq!(landed.as_deref(), Some(PAST_EXPIRY), "expired row lands with its expiry");
+    // The importer writes the canonical RFC 3339 form, so the instant is
+    // compared, not the spelling.
+    let instant = |s: &str| chrono::DateTime::parse_from_rfc3339(s).expect("rfc3339 expiry");
+    assert_eq!(
+        landed.as_deref().map(instant),
+        Some(instant(PAST_EXPIRY)),
+        "expired row lands with its expiry"
+    );
 }
 
 /// A destination holding bob's private row and an incoming alice row on the
@@ -436,9 +462,10 @@ fn issue_8968_v2_merge_import_keeps_foreign_owner_row() {
         "another owner's row is never replaced by a merge import"
     );
     assert_eq!(report["cross_owner_kept"], 1, "the kept row is counted");
-    let warned = report["warnings"]
-        .as_array()
-        .is_some_and(|w| w.iter().any(|s| s.as_str() == Some(&format!("m-alice: {FOREIGN_OWNER_KEPT_MSG}"))));
+    let warned = report["warnings"].as_array().is_some_and(|w| {
+        w.iter()
+            .any(|s| s.as_str() == Some(&format!("m-alice: {FOREIGN_OWNER_KEPT_MSG}")))
+    });
     assert!(warned, "a per-row WARN names the incoming row: {report}");
 }
 
@@ -451,7 +478,10 @@ fn issue_8968_storage_insert_with_conflict_merge_keeps_foreign_owner_row() {
         ConflictMode::Merge,
     )
     .expect_err("merging into another owner's slot is refused");
-    assert_eq!(err.to_string(), format!("m-alice: {FOREIGN_OWNER_KEPT_MSG}"));
+    assert_eq!(
+        err.to_string(),
+        format!("m-alice: {FOREIGN_OWNER_KEPT_MSG}")
+    );
     assert_eq!(
         foreign_row_content(&dst),
         (FOREIGN_CONTENT.to_owned(), FOREIGN_AGENT.to_owned())
@@ -486,7 +516,10 @@ fn issue_8968_cli_import_on_conflict_merge_keeps_foreign_owner_row() {
         "CLI --on-conflict merge never replaces another owner's row; stderr={stderr}"
     );
     let report: Value = serde_json::from_str(&stdout).expect("json report");
-    assert_eq!(report["cross_owner_kept"], 1, "counted in the report: {report}");
+    assert_eq!(
+        report["cross_owner_kept"], 1,
+        "counted in the report: {report}"
+    );
 }
 
 #[test]
@@ -508,11 +541,11 @@ fn vote_p14_unknown_top_level_field_refused_naming_the_field() {
 
 #[test]
 fn vote_p10_class_counts_refusals_apply_zero_rows() {
+    type Mutate = fn(&mut Value);
     let src = fresh_db("p10-src-");
     ai_memory::db::insert(&src, &memory("m-1", "one", "body", SOURCE_AGENT)).expect("seed");
     seed_new_classes(&src);
     let base = export_value(&src);
-    type Mutate = fn(&mut Value);
     let cases: [(&str, Mutate, String); 3] = [
         (
             "count mismatch",
@@ -540,10 +573,17 @@ fn vote_p10_class_counts_refusals_apply_zero_rows() {
         let dst_path = fresh_db_path("p10-dst-");
         let (code, _, stderr) = cli_import(&dst_path, &v.to_string(), &["--trust-source"]);
         assert_ne!(code, 0, "{name}: refused");
-        assert!(stderr.contains(&expected), "{name}: exact refusal; stderr={stderr}");
+        assert!(
+            stderr.contains(&expected),
+            "{name}: exact refusal; stderr={stderr}"
+        );
         let dst = ai_memory::db::open(&dst_path).expect("reopen");
         assert_eq!(row_count(&dst, "memories"), 0, "{name}: zero rows applied");
-        assert_eq!(row_count(&dst, "checkpoints"), 0, "{name}: zero rows applied");
+        assert_eq!(
+            row_count(&dst, "checkpoints"),
+            0,
+            "{name}: zero rows applied"
+        );
     }
 }
 
@@ -576,13 +616,22 @@ fn vote_p12_export_envelope_field_set_is_closed() {
         .collect();
     let always: BTreeSet<&str> = ALWAYS_FIELDS.into_iter().collect();
     let optional: BTreeSet<&str> = OPTIONAL_FIELDS.into_iter().collect();
-    assert!(always.is_subset(&keys), "every always-field is serialized: {keys:?}");
+    assert!(
+        always.is_subset(&keys),
+        "every always-field is serialized: {keys:?}"
+    );
     let stray: Vec<&&str> = keys
         .iter()
         .filter(|k| !always.contains(*k) && !optional.contains(*k))
         .collect();
-    assert!(stray.is_empty(), "no field outside the closed \"2\" set: {stray:?}");
-    assert!(keys.contains("class_counts"), "class_counts is part of the \"2\" set");
+    assert!(
+        stray.is_empty(),
+        "no field outside the closed \"2\" set: {stray:?}"
+    );
+    assert!(
+        keys.contains("class_counts"),
+        "class_counts is part of the \"2\" set"
+    );
 }
 
 #[test]
@@ -617,12 +666,16 @@ fn issue_8908_forged_owner_restamped_per_class() {
 
 #[test]
 fn issue_8908_offloaded_blob_failing_integrity_is_refused() {
+    type Mutate = fn(&mut Value, &str);
     let src = fresh_db("blob-src-");
     seed_new_classes(&src);
     let base = export_value(&src);
-    assert_eq!(array_len(&base, "offloaded_blobs"), 1, "the bundle carries the blob");
+    assert_eq!(
+        array_len(&base, "offloaded_blobs"),
+        1,
+        "the bundle carries the blob"
+    );
     let other_frame = hex::encode(zstd::encode_all(&b"tampered body"[..], 0).expect("zstd"));
-    type Mutate = fn(&mut Value, &str);
     let cases: [(&str, Mutate); 2] = [
         ("content hash altered", |v, _| {
             v["offloaded_blobs"][0]["content_sha256"] = json!("0".repeat(64));
@@ -636,14 +689,20 @@ fn issue_8908_offloaded_blob_failing_integrity_is_refused() {
         mutate(&mut v, &other_frame);
         let dst = fresh_db("blob-dst-");
         let report = import_value(&dst, v, &opts(true, ConflictMode::Version));
-        let ref_id = base["offloaded_blobs"][0]["ref_id"].as_str().expect("ref_id");
+        let ref_id = base["offloaded_blobs"][0]["ref_id"]
+            .as_str()
+            .expect("ref_id");
         assert_eq!(report["offloaded_blobs_refused"], 1, "{name}: counted");
         let expected = format!("offloaded blob {ref_id} integrity check failed (content tampered)");
         let warned = report["warnings"]
             .as_array()
             .is_some_and(|w| w.iter().any(|s| s.as_str() == Some(expected.as_str())));
         assert!(warned, "{name}: exact per-row refusal: {report}");
-        assert_eq!(row_count(&dst, "offloaded_blobs"), 0, "{name}: nothing written");
+        assert_eq!(
+            row_count(&dst, "offloaded_blobs"),
+            0,
+            "{name}: nothing written"
+        );
     }
 }
 
@@ -661,7 +720,11 @@ fn issue_8908_checkpoint_carrying_private_key_armor_is_withheld() {
         .and_then(Value::as_array)
         .map(|a| a.iter().filter_map(|c| c["id"].as_str()).collect())
         .unwrap_or_default();
-    assert_eq!(carried, vec!["ckpt-1"], "the clean checkpoint rides, the armored one does not");
+    assert_eq!(
+        carried,
+        vec!["ckpt-1"],
+        "the clean checkpoint rides, the armored one does not"
+    );
     assert_eq!(
         ledger.withheld_by_class.get(CLASS_PRIVATE_KEY).copied(),
         Some(1),
@@ -671,7 +734,10 @@ fn issue_8908_checkpoint_carrying_private_key_armor_is_withheld() {
         !v.to_string().contains("BEGIN PRIVATE KEY"),
         "no key armor reaches the artifact"
     );
-    assert_eq!(v["class_counts"]["checkpoints"], 1, "withheld rows are not counted (P-9)");
+    assert_eq!(
+        v["class_counts"]["checkpoints"], 1,
+        "withheld rows are not counted (P-9)"
+    );
 }
 
 #[test]
@@ -681,11 +747,17 @@ fn issue_8908_entity_aliases_100k_bound() {
         let tx = src.unchecked_transaction().expect("tx");
         {
             let mut stmt = tx
-                .prepare("INSERT INTO entity_aliases (entity_id, alias, created_at) VALUES (?1, ?2, ?3)")
+                .prepare(
+                    "INSERT INTO entity_aliases (entity_id, alias, created_at) VALUES (?1, ?2, ?3)",
+                )
                 .expect("prepare");
             for i in 0..BOUND_ROWS {
-                stmt.execute(params![format!("ent-{}", i % 97), format!("alias-{i}"), CREATED_AT])
-                    .expect("insert alias");
+                stmt.execute(params![
+                    format!("ent-{}", i % 97),
+                    format!("alias-{i}"),
+                    CREATED_AT
+                ])
+                .expect("insert alias");
             }
         }
         tx.commit().expect("commit");

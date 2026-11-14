@@ -5743,6 +5743,64 @@ pub trait MemoryStore: Send + Sync {
             capability: "ARCHIVE_STATS".to_string(),
         })
     }
+
+    /// #8888 — page the rows whose `expires_at` has passed but which GC has
+    /// not swept yet (the live `list` walk filters them out, so `migrate`
+    /// dropped them). Same lifecycle-visibility filter as `list`; ordered
+    /// `created_at ASC, id ASC` so OFFSET paging over a static source is
+    /// skip- and duplicate-free.
+    ///
+    /// Default returns `UnsupportedCapability`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Backend` for storage errors.
+    async fn list_expired_unswept(
+        &self,
+        _namespace: Option<&str>,
+        _limit: usize,
+        _offset: usize,
+    ) -> StoreResult<Vec<Memory>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "LIST_EXPIRED_UNSWEPT".to_string(),
+        })
+    }
+
+    /// #8888 — write one `archived_memories` row in the JSON shape
+    /// [`Self::list_archived`] returns, keeping its `id`, `archived_at` and
+    /// `archive_reason` verbatim. Insert-if-absent: returns `Ok(true)` when
+    /// the row was written and `Ok(false)` when the destination already held
+    /// that id (an idempotent re-run never duplicates or overwrites it).
+    ///
+    /// Default returns `UnsupportedCapability`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidInput` when a required key is missing or mistyped, and
+    /// `Backend` for storage errors.
+    async fn insert_archived_row(&self, _row: &serde_json::Value) -> StoreResult<bool> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "INSERT_ARCHIVED_ROW".to_string(),
+        })
+    }
+
+    /// #8932 / #8968 — the id of a destination row of ANOTHER owner that a
+    /// write of `memory` would replace or merge into: the row holding the
+    /// same id, else the live row holding the same `(title, namespace)`
+    /// slot, when its `metadata.agent_id` differs from the incoming one. A
+    /// row with no recorded owner is not foreign. `Ok(None)` means the write
+    /// cannot touch another owner's row.
+    ///
+    /// Default returns `UnsupportedCapability`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Backend` for storage errors.
+    async fn foreign_slot_holder(&self, _memory: &Memory) -> StoreResult<Option<String>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "FOREIGN_SLOT_HOLDER".to_string(),
+        })
+    }
 }
 
 /// v0.7.0 Wave-3 Continuation 3 (Phase 20) — action class threaded

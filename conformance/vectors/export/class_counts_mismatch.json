@@ -1,0 +1,220 @@
+{
+  "class_counts": {
+    "agent_lineage": 0,
+    "archived_memories": 0,
+    "archived_memory_links": 0,
+    "checkpoints": 0,
+    "entity_aliases": 0,
+    "expired_memories": 0,
+    "forget_tombstones": 1,
+    "governance_rules": 5,
+    "links": 0,
+    "memories": 2,
+    "memory_revisions": 1,
+    "model_attestations": 1,
+    "namespace_meta": 0,
+    "offloaded_blobs": 0,
+    "routine_runs": 0,
+    "routines": 0,
+    "signed_events": 4,
+    "trust_anchors": 1
+  },
+  "conformance_by_class": {
+    "forget_tombstones": "L2",
+    "governance_rules": "L3",
+    "links": "L1",
+    "memories": "L1",
+    "memory_revisions": "L2",
+    "model_attestations": "L2",
+    "signed_events": "L2",
+    "trust_anchors": "L3"
+  },
+  "conformance_level": "L3",
+  "count": 1,
+  "db_schema_version": 101,
+  "exported_at": "2026-07-14T00:00:00Z",
+  "forget_tombstones": [
+    {
+      "agent_id": "alice",
+      "forgotten_at": "2026-07-14T00:00:00Z",
+      "memory_id": "mem-forgotten",
+      "namespace": "ns",
+      "signature": "11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111"
+    }
+  ],
+  "governance_rules": [
+    {
+      "attest_level": "unsigned",
+      "created_at": 1700000000,
+      "created_by": "op",
+      "enabled": true,
+      "id": "R-1",
+      "kind": "namespace_deny",
+      "matcher": "secret/*",
+      "namespace": "*",
+      "reason": "no secrets",
+      "severity": "refuse"
+    },
+    {
+      "attest_level": "unsigned",
+      "created_at": 0,
+      "created_by": "system:seed",
+      "enabled": false,
+      "id": "R001",
+      "kind": "filesystem_write",
+      "matcher": "{\"glob\":\"/tmp/**\"}",
+      "namespace": "_global",
+      "reason": "Operator hard rule (#691): no /tmp writes. Use $TMPDIR or .local-runs/.",
+      "severity": "refuse"
+    },
+    {
+      "attest_level": "unsigned",
+      "created_at": 0,
+      "created_by": "system:seed",
+      "enabled": false,
+      "id": "R002",
+      "kind": "filesystem_write",
+      "matcher": "{\"glob\":\"/var/tmp/**\"}",
+      "namespace": "_global",
+      "reason": "Operator hard rule (#691): no /var/tmp writes.",
+      "severity": "refuse"
+    },
+    {
+      "attest_level": "unsigned",
+      "created_at": 0,
+      "created_by": "system:seed",
+      "enabled": false,
+      "id": "R003",
+      "kind": "filesystem_write",
+      "matcher": "{\"glob\":\"/private/tmp/**\"}",
+      "namespace": "_global",
+      "reason": "Operator hard rule (#691): no /private/tmp writes (macOS realpath of /tmp).",
+      "severity": "refuse"
+    },
+    {
+      "attest_level": "unsigned",
+      "created_at": 0,
+      "created_by": "system:seed",
+      "enabled": false,
+      "id": "R004",
+      "kind": "process_spawn",
+      "matcher": "{\"binary\":\"cargo\",\"disk_free_min_gib\":20}",
+      "namespace": "_global",
+      "reason": "Operator hard rule (#691): cargo refused on low-disk system (<20 GiB free).",
+      "severity": "refuse"
+    }
+  ],
+  "links": [],
+  "memories": [
+    {
+      "access_count": 0,
+      "cid": "b3:0902c97c82846e19d13567ef70d7782e028425bca2d21bf106a53504851d1382",
+      "citations": [],
+      "confidence": 0.9,
+      "confidence_source": "caller_provided",
+      "content": "the durable source-of-truth text that must round-trip losslessly",
+      "created_at": "2026-07-14T00:00:00Z",
+      "expires_at": "2099-01-01T00:00:00.000000Z",
+      "id": "mem-round-1",
+      "lifecycle_state": "open",
+      "memory_kind": "decision",
+      "metadata": {
+        "agent_id": "alice",
+        "version_vector": {
+          "entries": {
+            "conformance-fixture-writer": "2026-07-14T00:00:00Z"
+          }
+        }
+      },
+      "namespace": "portability",
+      "priority": 7,
+      "reflection_depth": 0,
+      "source": "system",
+      "tags": [
+        "alpha",
+        "beta"
+      ],
+      "tier": "mid",
+      "title": "durable title",
+      "updated_at": "2026-07-14T00:00:00Z",
+      "valid_from": "2026-01-01T00:00:00.000000Z",
+      "valid_until": "2027-01-01T00:00:00.000000Z",
+      "version": 1
+    }
+  ],
+  "memory_revisions": [
+    {
+      "agent_id": "alice",
+      "created_at": "2026-07-14T00:00:00Z",
+      "id": "rev-1",
+      "kind": "SUPERSEDE",
+      "memory_id": "mem-1",
+      "namespace": "ns",
+      "prev_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+      "prior_version": 1,
+      "sequence": 1
+    }
+  ],
+  "model_attestations": [
+    {
+      "agent_id": "",
+      "attest_level": "loader_observed",
+      "created_at": "2026-07-14T00:00:00Z",
+      "id": "ma-1",
+      "model_family": "gemma",
+      "model_ref": "google/gemma-4-31b",
+      "provider": "openrouter"
+    }
+  ],
+  "portability_complete": true,
+  "signed_events": [
+    {
+      "agent_id": "alice",
+      "attest_level": "unsigned",
+      "event_type": "memory_link.created",
+      "id": "evt-0",
+      "payload_hash": "169b5b823c62b64ca7e5f8456a13c8d5d06f4ece522a58bc2b8a784dcf3609b0",
+      "prev_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+      "sequence": 1,
+      "timestamp": "2026-07-14T00:00:00Z"
+    },
+    {
+      "agent_id": "alice",
+      "attest_level": "unsigned",
+      "event_type": "memory_link.created",
+      "id": "evt-1",
+      "payload_hash": "f64551fcd6f07823cb87971cfb91446425da18286b3ab1ef935e0cbd7a69f68a",
+      "prev_hash": "97793ed832ab80f509bdb549b3e016792bfdee90625f9ded84e1044dbb29c3a5",
+      "sequence": 2,
+      "timestamp": "2026-07-14T00:00:00Z"
+    },
+    {
+      "agent_id": "alice",
+      "attest_level": "unsigned",
+      "event_type": "memory_link.created",
+      "id": "evt-2",
+      "payload_hash": "3946ca64ff78d93ca61090a437cbb6b3d2ca0d488f5f9ccf3059608368b27693",
+      "prev_hash": "d9ab11b70245e74881686743f9f2aace97aec3d986860d850a7c8931d8eec288",
+      "sequence": 3,
+      "timestamp": "2026-07-14T00:00:00Z"
+    },
+    {
+      "agent_id": "alice",
+      "attest_level": "unsigned",
+      "event_type": "memory_link.created",
+      "id": "evt-3",
+      "payload_hash": "43bb00d0ce7790a53b91256b370c887b24791a5539a6fbfb70c5870e8c91ae5d",
+      "prev_hash": "e9251ac9fec2990878cad536009dd3b7555c6da2017adbeb527be084f0be5ebe",
+      "sequence": 4,
+      "timestamp": "2026-07-14T00:00:00Z"
+    }
+  ],
+  "source": "ai-memory-conformance-2030",
+  "spec_version": "2",
+  "trust_anchors": [
+    {
+      "pubkey_b64": "GX9rI-FshTLGq8g4-s1ep4m-DHaykgM0A5v6iz02jWE",
+      "role": "operator"
+    }
+  ]
+}
