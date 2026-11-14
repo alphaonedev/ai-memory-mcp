@@ -135,6 +135,7 @@ import ast
 import contextlib
 import datetime
 import errno
+import html
 import os
 import re
 import shutil
@@ -142,7 +143,7 @@ import subprocess
 import sys
 import tempfile
 import unicodedata
-from collections import namedtuple
+from collections import Counter, namedtuple
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -202,6 +203,28 @@ LOOSE_BINDS_SEP = frozenset(" -_*~`")
 LOOSE_BINDS_AFTER = frozenset(":*`")
 LOOSE_HEX = frozenset("0123456789abcdef")
 LOOSE_HEX_RUN = 7
+# Round 2 (#6124, 3-agent vote (71472661) v9274-detector, option B): the BASE end is read by
+# the strict grammar only (SCAN_STRICT); the HEAD end is read by the looser detector
+# (SCAN_LOOSE) while the certification is VOID or EXPIRED at both ends, with the base's own
+# looser-detector lines excused once each (they sit in the frozen region, so a head line
+# that is not byte-identical to one of them is still a refusal), and by the head detector
+# (SCAN_HEAD) while LIVE is at either end. The head detector adds, to the looser detector:
+# HTML entities decoded to a fixed point (more than HTML_UNESCAPE_MAX_PASSES passes is a
+# refusal), NFKC, the co-occurrence of 'status' and a status word (or 'binds') in the line
+# folded to [a-z0-9] only, the same co-occurrence across two adjacent non-blank lines (a soft
+# line break or two table rows), and any non-ASCII letter.
+SCAN_STRICT = "strict"
+SCAN_LOOSE = "loose"
+SCAN_HEAD = "head"
+HTML_UNESCAPE_MAX_PASSES = 4
+CANON_DROP_RE = re.compile(r"[^a-z0-9]+")
+CANON_STATUS = "status"
+CANON_BINDS = "binds"
+LOOSE_STATUS_REASON = "a STATUS-like line the strict grammar does not read"
+LOOSE_BINDS_REASON = "a Binds-like line the strict grammar does not read"
+NON_ASCII_LETTER_REASON = "a non-ASCII letter the head detector does not read"
+OVER_CAP_HEAD_REASON = (
+    f"a line over {BANNER_MAX_LINE_BYTES} bytes the head detector does not read")
 Banner = namedtuple("Banner", "status bound status_raw status_line token_span binds_raw problems")
 ABSENT_BANNER = Banner("ABSENT", "-", None, None, None, (), ())
 
@@ -224,6 +247,23 @@ LEDGER_DATE_SKEW_DAYS = 1  # a record may carry the runner's UTC date plus this
 LEDGER_MAX_DOC_BYTES = 8 * 1024 * 1024
 LEDGER_MAX_LINE_BYTES = 256
 LEDGER_STATUSES = ("VOID", "EXPIRED")
+# D-2: a range start with no ledger marker (the release doc) passes only when the head's
+# pre-marker region is that whole doc followed by exactly these bytes (the blank line the
+# marker must follow).
+LEDGER_JOIN = b"\n"
+REGION_FROZEN_TEXT = (
+    "the pre-marker region of {doc} (everything above the '{marker}' line) is frozen while "
+    "the certification is VOID or EXPIRED at both ends: it must be byte-identical to the range "
+    "start (only the status word of the one STATUS line may change, between VOID and EXPIRED), "
+    "and differs at {doc}:{line}; put the change in a new amendment ledger record or re-issue "
+    "the certification as LIVE (#6124, 3-agent vote (71472661) v9274-detector)"
+)
+REGION_MARKERS_TEXT = (
+    "the {side} of the range holds the '{marker}' line {count} times, so its pre-marker region "
+    "of {doc} is not defined (#6124)"
+)
+# D-6: a record item whose fold reads like a banner line is refused.
+LEDGER_ITEM_BANNER_REASON = "an item line that reads like a STATUS or Binds-to line"
 # Unicode categories refused anywhere in the doc: controls (LF excepted), format
 # characters (zero-width, bidi, BOM), line/paragraph separators, private use, unassigned.
 LEDGER_FORBIDDEN_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp", "Co", "Cn", "Cs"})
@@ -234,10 +274,11 @@ LEDGER_FENCE_RE = re.compile(r"(`{3,}|~{3,})(.*)")
 LEDGER_HTML_START_RE = re.compile(r"<[A-Za-z!?/]")
 LEDGER_FRONT_MATTER = ("---", "+++")
 LedgerRecord = namedtuple("LedgerRecord", "line lines names")
-# The canonical item order the parser enforces, named in the refusal and in the cert doc (I5).
+# The canonical item order the parser enforces, named in the refusal and in the rules doc
+# docs/compliance/CERT-AMENDMENT-LEDGER-RULES.md (I5).
 LEDGER_ITEM_ORDER = (
     "'- id:' lines before '- path:' lines, each group in ascending byte order, no duplicates")
-# F3: the path item grammar is printable ASCII without spaces; the cert doc states it.
+# F3: the path item grammar is printable ASCII without spaces; the rules doc states it.
 LEDGER_PATH_RESTRICTION = (
     "A '- path:' item names one section 7 watched path spelled in printable ASCII "
     "with no space; a watched path outside that form cannot be named and needs a re-issue.")
@@ -484,45 +525,104 @@ def binds_like(folded):
     return False
 
 
-def banner_scan(blob, capped):
-    """The Banner of the cert doc BLOB (bytes, or None when absent). Every line is read as
-    raw bytes; the strict patterns run only on a line within BANNER_MAX_LINE_BYTES, and the
-    looser detector runs on what the strict grammar did not consume. PROBLEMS lists
-    (reason, line) for every form the precondition refuses; the size cap applies when
-    CAPPED (the head), before the split."""
+def head_fold(text):
+    """(FOLDED, OVER) of TEXT for the head detector: HTML entities decoded to a fixed point,
+    NFKC, then loose_fold. OVER is True when HTML_UNESCAPE_MAX_PASSES passes do not reach
+    the fixed point (an entity nested deeper than that is itself a refusal). Linear in TEXT
+    for a bounded pass count."""
+    over = False
+    for _ in range(HTML_UNESCAPE_MAX_PASSES):
+        decoded = html.unescape(text)
+        if decoded == text:
+            break
+        text = decoded
+    else:
+        over = html.unescape(text) != text
+    return loose_fold(unicodedata.normalize("NFKC", text)), over
+
+
+def canon_status(canon):
+    return CANON_STATUS in canon and any(word in canon for word in LOOSE_STATUS_WORDS)
+
+
+def _non_ascii_letter(folded):
+    return any(ord(ch) > 0x7F and unicodedata.category(ch).startswith("L") for ch in folded)
+
+
+def _scan(blob, capped, mode, excuse):
+    """(Banner, flagged) of the cert doc BLOB. FLAGGED counts, by line bytes, the lines the
+    looser detector marked. MODE is SCAN_STRICT, SCAN_LOOSE or SCAN_HEAD; EXCUSE (a Counter
+    of line bytes, SCAN_LOOSE only) skips each listed line once."""
     if blob is None:
-        return ABSENT_BANNER
+        return ABSENT_BANNER, Counter()
     if capped and len(blob) > LEDGER_MAX_DOC_BYTES:
         reason = f"the document is {len(blob)} bytes, over the {LEDGER_MAX_DOC_BYTES}-byte limit"
-        return Banner("UNPARSEABLE", "-", None, None, None, (), ((reason, None),))
+        return Banner("UNPARSEABLE", "-", None, None, None, (), ((reason, None),)), Counter()
+    excuse = Counter(excuse or ())
+    flagged = Counter()
     statuses = []
     binds = []
     loose_status = []
     loose_binds = []
+    other = []
+    prev_canon = None
     for number, line in enumerate(blob.split(b"\n"), 1):
         rest = line
-        if len(line) <= BANNER_MAX_LINE_BYTES:
+        strict_here = False
+        over_cap = len(line) > BANNER_MAX_LINE_BYTES
+        if not over_cap:
             found = STATUS_LINE_RE.match(line)
             if found:
                 statuses.append((number, line, found.span(1)))
                 rest = line[found.end():]
+                strict_here = True
             else:
                 found = BINDS_LINE_RE.match(line)
                 if found:
                     binds.append((number, line, found.group(1).decode("ascii").lower()))
                     rest = line[found.end():]
-        folded = loose_fold(rest.decode("utf-8", "replace"))
-        if status_like(folded):
+                    strict_here = True
+        if mode == SCAN_STRICT:
+            continue
+        if mode == SCAN_HEAD:
+            if over_cap:
+                other.append((OVER_CAP_HEAD_REASON, number))
+                prev_canon = None
+                continue
+            folded, over = head_fold(rest.decode("utf-8", "replace"))
+            canon = CANON_DROP_RE.sub("", folded)
+            is_status = over or status_like(folded) or canon_status(canon)
+            is_binds = binds_like(folded) or CANON_BINDS in canon
+            # A soft line break: STATUS and a status word on two adjacent non-blank lines,
+            # neither of which reads as STATUS-like alone. A line already flagged ends the
+            # pair, so one banner-like line is reported once.
+            if not is_status and not is_binds and prev_canon is not None:
+                is_status = canon_status(prev_canon + canon)
+            if _non_ascii_letter(folded):
+                other.append((NON_ASCII_LETTER_REASON, number))
+            flagged_here = is_status or is_binds
+            prev_canon = canon if rest.strip() and not flagged_here and not strict_here else None
+        else:
+            folded = loose_fold(rest.decode("utf-8", "replace"))
+            is_status = status_like(folded)
+            is_binds = binds_like(folded)
+            if (is_status or is_binds) and excuse[line] > 0:
+                excuse[line] -= 1
+                continue
+        if is_status or is_binds:
+            flagged[line] += 1
+        if is_status:
             loose_status.append(number)
-        if binds_like(folded):
+        if is_binds:
             loose_binds.append(number)
     problems = []
     if len(statuses) > 1:
         problems.append(("a second STATUS line under the strict grammar", statuses[1][0]))
     if len(binds) > 1:
         problems.append(("a second Binds-to line under the strict grammar", binds[1][0]))
-    problems.extend(("a STATUS-like line the strict grammar does not read", n) for n in loose_status)
-    problems.extend(("a Binds-like line the strict grammar does not read", n) for n in loose_binds)
+    problems.extend((LOOSE_STATUS_REASON, n) for n in loose_status)
+    problems.extend((LOOSE_BINDS_REASON, n) for n in loose_binds)
+    problems.extend(other)
     problems.sort(key=lambda p: p[1])
     if not statuses:
         problems.append(("no STATUS line under the strict grammar", None))
@@ -540,7 +640,22 @@ def banner_scan(blob, capped):
         bound = "-"
     first = statuses[0] if statuses else (None, None, None)
     return Banner(status, bound, first[1], first[0], first[2],
-                  tuple(b[1] for b in binds), tuple(problems))
+                  tuple(b[1] for b in binds), tuple(problems)), flagged
+
+
+def banner_scan(blob, capped, mode=SCAN_LOOSE, excuse=None):
+    """The Banner of the cert doc BLOB (bytes, or None when absent). Every line is read as
+    raw bytes; the strict patterns run only on a line within BANNER_MAX_LINE_BYTES, and the
+    detector MODE runs on what the strict grammar did not consume. PROBLEMS lists
+    (reason, line) for every form the precondition refuses; the size cap applies when
+    CAPPED (the head), before the split."""
+    return _scan(blob, capped, mode, excuse)[0]
+
+
+def base_excuse(blob):
+    """The lines (Counter of line bytes) the looser detector marks in the base doc BLOB:
+    inherited history the head may carry unchanged while the region is frozen."""
+    return _scan(blob, False, SCAN_LOOSE, None)[1]
 
 
 def scan_banner(repo, tree, capped):
@@ -646,6 +761,79 @@ def frozen_status(banner_mb, banner_head):
         "range start (only the status word may change, between VOID and EXPIRED); put the "
         "reason for the change in the amendment ledger record (#6124, 3-agent vote 71472661)"
     )
+
+
+def pre_region(blob, side):
+    """(REGION, MARKED) of the cert doc BLOB: the bytes above the one exact ledger marker
+    line and True, or the whole doc and False when it has no marker. Two or more marker lines
+    leave the region undefined: GateError. Linear."""
+    marker = LEDGER_MARKER.encode("ascii")
+    offset = 0
+    found = []
+    for line in blob.split(b"\n"):
+        if line == marker:
+            found.append(offset)
+        offset += len(line) + 1
+    if len(found) > 1:
+        raise GateError(REGION_MARKERS_TEXT.format(
+            side="head" if side == "head" else "start", marker=LEDGER_MARKER,
+            count=len(found), doc=CERT_DOC))
+    if not found:
+        return blob, False
+    return blob[:found[0]], True
+
+
+def ledger_join(base_doc):
+    """D-2: the ONE byte string a range start with no marker is followed by in the head's
+    pre-marker region: the shortest that leaves the marker after a blank line."""
+    if base_doc.endswith(b"\n\n") or base_doc == b"\n":
+        return b""
+    if base_doc.endswith(b"\n"):
+        return LEDGER_JOIN
+    return LEDGER_JOIN + LEDGER_JOIN
+
+
+def frozen_region_diff(base_blob, head_blob, banner_mb, banner_head):
+    """D-1 / D-2: the 1-based line of the head doc where its pre-marker region first differs
+    from the one the range start fixes, or None when it is byte-identical. The range start
+    fixes its own pre-marker region; a start with no marker fixes its whole doc followed by
+    LEDGER_JOIN when the head holds the marker, else its whole doc. The one exception is the
+    status token of the base's strict STATUS line, which may change between VOID and EXPIRED
+    (B-2)."""
+    base_region, base_marked = pre_region(base_blob, "base")
+    head_region, head_marked = pre_region(head_blob, "head")
+    if not base_marked and head_marked:
+        base_region += ledger_join(base_region)
+    want = _region_lines(base_region)
+    got = _region_lines(head_region)
+    if banner_mb.status != banner_head.status and banner_mb.status_line is not None:
+        at = banner_mb.status_line - 1
+        lo, hi = banner_mb.token_span
+        if at < len(want) and want[at] == banner_mb.status_raw + b"\n":
+            want[at] = want[at][:lo] + banner_head.status.encode("ascii") + want[at][hi:]
+    if want == got:
+        return None
+    for number, (old, new) in enumerate(zip(want, got), 1):
+        if old != new:
+            return number
+    return min(len(want), len(got)) + 1
+
+
+def _region_lines(region):
+    """The lines of REGION (bytes), each with its line feed, so a region that ends one line
+    early (a moved marker) differs at that line and never matches a blank line."""
+    parts = region.split(b"\n")
+    lines = [part + b"\n" for part in parts[:-1]]
+    if parts[-1]:
+        lines.append(parts[-1])
+    return lines
+
+
+def check_frozen_region(base_blob, head_blob, banner_mb, banner_head):
+    """D-1: raise GateError naming the frozen region and the first differing line."""
+    line = frozen_region_diff(base_blob, head_blob, banner_mb, banner_head)
+    if line is not None:
+        raise GateError(REGION_FROZEN_TEXT.format(doc=CERT_DOC, marker=LEDGER_MARKER, line=line))
 
 
 def fmt_banner(banner):
@@ -942,6 +1130,15 @@ def _check_pre_region(lines, side):
             f"the STATUS banner must appear exactly once, above the ledger (found {found})", None, side)
 
 
+def item_reads_like_banner(line):
+    """D-6: True iff the record item LINE, folded like a head line, reads like a STATUS or
+    Binds-to line (the looser detector, or the co-occurrence in its [a-z0-9] fold)."""
+    folded = loose_fold(line)
+    canon = CANON_DROP_RE.sub("", folded)
+    return (status_like(folded) or binds_like(folded) or canon_status(canon)
+            or CANON_BINDS in canon)
+
+
 def _parse_region(lines, first, side, watched_from):
     """Records of the ledger region LINES (the lines after the marker; FIRST is the
     1-based number of LINES[0]). The grammar, with no other form accepted:
@@ -998,6 +1195,8 @@ def _parse_region(lines, first, side, watched_from):
             checked = watched_from is not None and len(records) >= watched_from
             if path is not None and checked and not is_watched_path(path):
                 raise LedgerError(f"path {path} is not a section 7 watched path", number, side)
+            if checked and item_reads_like_banner(line):
+                raise LedgerError(LEDGER_ITEM_BANNER_REASON, number, side)
             if items and line <= items[-1]:
                 raise LedgerError(
                     f"item lines must be sorted and unique ({LEDGER_ITEM_ORDER}; "
@@ -1022,12 +1221,27 @@ def record_day(rec):
     return datetime.date.fromisoformat(LEDGER_RECORD_RE.fullmatch(rec.lines[0]).group(1))
 
 
-def parse_ledger(blob, side, inherited=0):
+def _marker_offset(text):
+    """The offset of the first exact ledger marker line in TEXT, or 0 when there is none."""
+    if text.startswith(LEDGER_MARKER + "\n"):
+        return 0
+    found = text.find("\n" + LEDGER_MARKER + "\n")
+    return found + 1 if found >= 0 else 0
+
+
+def parse_ledger(blob, side, inherited=0, region_frozen=False, region_differs=False):
     """The records (list of LedgerRecord) of the cert doc BLOB (bytes). Every form the
     parser does not positively recognise raises LedgerError with a reason and, where one
     applies, a 1-based line number. Linear in the size of BLOB. The base (F5) is judged
-    for grammar only: no size cap and no watched-path check; the head checks the
-    watched-ness of the records after the INHERITED base records only."""
+    for grammar only: no size cap, no watched-path check and no pre-marker construct check
+    (I4; it is inherited history, round 2); the head checks the watched-ness of the records
+    after the INHERITED base records only. REGION_FROZEN (the head only) is True when the
+    caller has proved the head's pre-marker region byte-identical to the range start's
+    (D-1), so I4 is not re-run on bytes the range does not change. REGION_DIFFERS (the head
+    only) is True when VOID or EXPIRED holds at both ends and that region differs, so the
+    caller refuses it for the frozen region (D-1) whatever else is found; the character scan
+    then starts at the marker line, so a CR or a BOM above it is reported as the frozen-region
+    difference it is."""
     if side == "head" and len(blob) > LEDGER_MAX_DOC_BYTES:
         raise LedgerError(
             f"the document is {len(blob)} bytes, over the {LEDGER_MAX_DOC_BYTES}-byte limit", None, side)
@@ -1037,7 +1251,8 @@ def parse_ledger(blob, side, inherited=0):
         raise LedgerError(f"not strict UTF-8 (invalid byte at offset {exc.start})", None, side) from None
     if not text.endswith("\n"):
         raise LedgerError("the document does not end with a line feed", None, side)
-    for suspect in LEDGER_SUSPECT_RE.finditer(text):
+    scan_from = _marker_offset(text) if side == "head" and region_differs else 0
+    for suspect in LEDGER_SUSPECT_RE.finditer(text, scan_from):
         category = unicodedata.category(suspect.group())
         if category in LEDGER_FORBIDDEN_CATEGORIES:
             number = text.count("\n", 0, suspect.start()) + 1
@@ -1049,7 +1264,8 @@ def parse_ledger(blob, side, inherited=0):
         raise LedgerError(
             f"the ledger marker line appears {markers} times, expected exactly once", None, side)
     at = lines.index(LEDGER_MARKER)
-    _check_pre_region(lines[:at], side)
+    if side == "head" and not region_frozen:
+        _check_pre_region(lines[:at], side)
     return _parse_region(lines[at + 1:], at + 2, side, inherited if side == "head" else None)
 
 
@@ -1059,9 +1275,10 @@ def utc_today():
     return datetime.datetime.now(datetime.timezone.utc).date()
 
 
-def judge_ledger(repo, mb, judged):
+def judge_ledger(repo, mb, judged, region_frozen=False, region_differs=False):
     """The NEW records (list) the change appends to the ledger, after proving the ledger
-    append-only and every new record dated within [floor, runner UTC date + 1]."""
+    append-only and every new record dated within [floor, runner UTC date + 1].
+    REGION_FROZEN, REGION_DIFFERS: see parse_ledger."""
     base_blob = read_blob(repo, mb, CERT_DOC)
     head_blob = read_blob(repo, judged, CERT_DOC)
     base_on = base_blob is not None and ledger_present(base_blob, capped=False)
@@ -1071,7 +1288,8 @@ def judge_ledger(repo, mb, judged):
     base_records = parse_ledger(base_blob, "base") if base_on else []
     if not head_on:
         raise LedgerError("the ledger present at the range start is missing", None, "head")
-    head_records = parse_ledger(head_blob, "head", inherited=len(base_records))
+    head_records = parse_ledger(head_blob, "head", inherited=len(base_records),
+                                region_frozen=region_frozen, region_differs=region_differs)
     for k, old in enumerate(base_records, 1):
         if k > len(head_records) or head_records[k - 1].lines != old.lines:
             raise LedgerError(
@@ -1109,11 +1327,16 @@ def check_amendment_names(new_records, changed):
 # ---------------------------------------------------------------------------
 
 
-def check_banner_consistency(repo, judged):
+def check_banner_consistency(repo, judged, banner=None):
     """(C) #3556: the doc's own claim at `judged` must be true. STATUS LIVE
     bound to <sha> means no section 7 wire-surface drift between <sha> and
-    `judged`. Returns (ok, lines)."""
-    status, binds = cert_banner(repo, judged)
+    `judged`. BANNER is the head Banner the range was judged with (round 2: the
+    inherited looser-detector lines of a frozen region are excused); None reads
+    cert_banner. Returns (ok, lines)."""
+    if banner is None:
+        status, binds = cert_banner(repo, judged)
+    else:
+        status, binds = banner.status, banner.bound
     if status == "ABSENT":
         return True, [f"{PREFIX}: banner — {CERT_DOC} absent at HEAD; no live claim to check"]
     if status == "UNPARSEABLE":
@@ -1249,6 +1472,36 @@ def check_change(repo, base, head, tip=None, base_name=None):
 
 
 def _judge(repo, base, head, judged, mb, tip):
+    """Round 2 (#6124, 3-agent vote (71472661) v9274-detector, option B): the base end is
+    read by the strict grammar only; the head end by the looser detector with the base's own
+    looser lines excused while VOID or EXPIRED is at both ends (the frozen region), else by
+    the head detector. While frozen, every passing verdict also needs the head's pre-marker
+    region byte-identical to the range start's (D-1, D-2), checked last, so every earlier
+    refusal keeps its own reason."""
+    base_blob = read_blob(repo, mb, CERT_DOC)
+    head_blob = read_blob(repo, judged, CERT_DOC)
+    banner_mb = banner_scan(base_blob, capped=False, mode=SCAN_STRICT)
+    strict_head = banner_scan(head_blob, capped=True, mode=SCAN_STRICT)
+    frozen = banner_mb.status in LEDGER_STATUSES and strict_head.status in LEDGER_STATUSES
+    if frozen:
+        banner_head = banner_scan(head_blob, capped=True, mode=SCAN_LOOSE,
+                                  excuse=base_excuse(base_blob))
+        try:
+            region_same = frozen_region_diff(base_blob, head_blob, banner_mb, strict_head) is None
+        except GateError:
+            region_same = False
+    else:
+        banner_head = banner_scan(head_blob, capped=True, mode=SCAN_HEAD)
+        region_same = False
+    ok, text = _judge_banners(repo, base, head, judged, mb, tip, banner_mb, banner_head,
+                              region_same, frozen and not region_same)
+    if ok and frozen:
+        check_frozen_region(base_blob, head_blob, banner_mb, strict_head)
+    return ok, text
+
+
+def _judge_banners(repo, base, head, judged, mb, tip, banner_mb, banner_head, region_same,
+                   region_differs=False):
     watched = []
     cert_touched = False
     for p in changed_paths(repo, mb, judged):
@@ -1265,8 +1518,6 @@ def _judge(repo, base, head, judged, mb, tip):
     # I1 (#6124 round 1): ONE clean-banner precondition, before ANY pass decision, while a
     # wire change, a strict banner line change, a new ledger record or a banner-like line at
     # the head is in the range. No pass path below re-checks the banner on its own.
-    banner_mb = scan_banner(repo, mb, capped=False)
-    banner_head = scan_banner(repo, judged, capped=True)
     strict_changed = (banner_mb.status_raw, banner_mb.binds_raw) != (
         banner_head.status_raw, banner_head.binds_raw)
     # The banner is judged BEFORE the ledger, so a malformed STATUS token (B-3) is refused
@@ -1278,7 +1529,8 @@ def _judge(repo, base, head, judged, mb, tip):
         if banner_due:
             clean_banner(banner_mb, banner_head)
         if cert_touched:
-            new_records = judge_ledger(repo, mb, judged)
+            new_records = judge_ledger(repo, mb, judged, region_frozen=region_same,
+                                       region_differs=region_differs)
         if new_records and not banner_due:
             clean_banner(banner_mb, banner_head)
     except BannerError as exc:
@@ -1303,7 +1555,7 @@ def _judge(repo, base, head, judged, mb, tip):
         frozen_status(banner_mb, banner_head)
 
     if not watched and not id_changed:
-        ok, more = check_banner_consistency(repo, judged)
+        ok, more = check_banner_consistency(repo, judged, banner_head)
         lines = [f"{PREFIX}: PASS — federation-wire surface unchanged in {mb}..{judged}"]
         return ok, "\n".join(lines + more)
 
@@ -1318,7 +1570,7 @@ def _judge(repo, base, head, judged, mb, tip):
     if both_ls and cert_touched and new_records:
         # #6124: the names match exactly, the bind is unchanged and the STATUS line is
         # frozen, so the certification stays non-LIVE (a VOID <-> EXPIRED flip included).
-        ok, more = check_banner_consistency(repo, judged)
+        ok, more = check_banner_consistency(repo, judged, banner_head)
         head_line = (
             f"{PREFIX}: PASS — federation-wire surface changed AND a new amendment record "
             f"names every change ({mb}..{judged}); the certification {status_words} "
@@ -1327,7 +1579,7 @@ def _judge(repo, base, head, judged, mb, tip):
         return ok, "\n".join([head_line] + more)
 
     if cert_touched and not both_ls and not incidental and not deleted:
-        ok, more = check_banner_consistency(repo, judged)
+        ok, more = check_banner_consistency(repo, judged, banner_head)
         head_line = (
             f"{PREFIX}: PASS — federation-wire surface changed AND cert doc "
             f"re-issued/voided in the same change ({mb}..{judged}; banner "
