@@ -206,23 +206,6 @@ pub(crate) fn refuse_symlink(dest: &Path) -> Result<()> {
     }
 }
 
-/// Create a NEW owner-only file at `dest` holding `bytes`, fsynced, without
-/// following or replacing anything at the name (a timestamped backup of a
-/// config, say).
-///
-/// # Errors
-/// Something sits at `dest`, or the stage, write, fsync or publish fails.
-pub(crate) fn write_new_private(dest: &Path, what: &'static str, bytes: &[u8]) -> Result<()> {
-    let mut stage = stage_beside(dest, what)?;
-    stage.write_all(bytes)?;
-    stage
-        .file()
-        .sync_all()
-        .with_context(|| format!("fsync {}", stage.path().display()))?;
-    drop(stage.publish()?);
-    Ok(())
-}
-
 /// How many numbered names [`write_new_private_unique`] tries after `dest`.
 pub(crate) const UNIQUE_NAME_ATTEMPTS: u32 = 1000;
 
@@ -233,7 +216,7 @@ fn numbered(dest: &Path, n: u32) -> std::path::PathBuf {
     std::path::PathBuf::from(name)
 }
 
-/// [`write_new_private`] at the first FREE name of `dest`, `dest.1`,
+/// A NEW owner-only fsynced file at the first FREE name of `dest`, `dest.1`,
 /// `dest.2`, ...: two backups taken in the same clock tick keep both copies
 /// instead of the second failing (or, before #8950, overwriting the first).
 /// A symlink at any tried name is refused, never skipped. Returns the name
