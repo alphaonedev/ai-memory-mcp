@@ -26,7 +26,7 @@ use anyhow::{Result, anyhow};
 use rusqlite::Connection;
 
 use crate::identity::lineage::LineageRecord;
-use crate::models::{Memory, Tier, field_names};
+use crate::models::{Memory, MemoryLink, Tier, field_names};
 use crate::revisions::{RecordKind, RevisionLeaf};
 
 /// One `forget_tombstones` row — the signed erasure receipt (spec §V2-2.3):
@@ -254,6 +254,54 @@ pub fn read_all_archived_memories(conn: &Connection) -> Result<Vec<ArchivedMemor
         out.push(row?);
     }
     Ok(out)
+}
+
+/// #8911 — read every LIVE-table row whose `expires_at` has passed but which
+/// GC has not swept yet, as of `now` (RFC 3339). `storage::export_all` drops
+/// these in SQL, so before #8911 `export --full` silently omitted them while
+/// they still sat in the source corpus. The same fail-closed lifecycle
+/// allow-list `export_all` applies keeps quarantined and tombstoned rows out
+/// (they stay counted by `export_excluded_counts`). Ordered by `created_at`,
+/// then `id`, so the export is byte-stable.
+///
+/// # Errors
+/// The underlying `rusqlite` query fails, or a row's at-rest envelope cannot
+/// be decrypted (fail-closed, same mapper as `export_all`).
+pub fn read_all_expired_memories(conn: &Connection, now: &str) -> Result<Vec<Memory>> {
+    let lifecycle_vis = crate::models::lifecycle_visible_clause("");
+    let sql = format!(
+        "SELECT * FROM memories WHERE expires_at IS NOT NULL AND expires_at <= ?1 \
+         {lifecycle_vis} ORDER BY created_at ASC, id ASC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([now], crate::storage::row_to_memory)?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
+/// #8911 — the `memory_links` rows with at least one endpoint that is
+/// expired at `now` (both endpoints still present in `memories`). The
+/// live-row [`crate::storage::export_links`] join drops exactly these, so the
+/// `--full` envelope reads them here to carry the edges of `expired_memories`.
+/// Same column order and mapper as `export_links` (one SSOT).
+///
+/// # Errors
+/// The underlying `rusqlite` query fails.
+pub fn read_links_touching_expired(conn: &Connection, now: &str) -> Result<Vec<MemoryLink>> {
+    let mut stmt = conn.prepare(
+        "SELECT ml.source_id, ml.target_id, ml.relation, ml.created_at,
+                ml.signature, ml.observed_by, ml.valid_from, ml.valid_until,
+                ml.source_cid, ml.target_cid
+         FROM memory_links ml
+         JOIN memories ms ON ms.id = ml.source_id
+         JOIN memories mt ON mt.id = ml.target_id
+         WHERE (ms.expires_at IS NOT NULL AND ms.expires_at <= ?1)
+            OR (mt.expires_at IS NOT NULL AND mt.expires_at <= ?1)
+         ORDER BY ml.source_id, ml.target_id, ml.relation",
+    )?;
+    let rows = stmt.query_map([now], crate::storage::export_link_from_row)?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
 }
 
 /// v1.0.0 #3151 — read ONE `archived_memories` row by id through the SAME

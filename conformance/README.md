@@ -31,6 +31,7 @@ conformance/
 │   ├── lineage/                obl. 5 group members (valid / revoked / fork)
 │   ├── chain/                  obl. 2 group members (intact / deletion / truncation)
 │   └── export/                 §V2-6 envelope L1/L2/L3 round-trip fixture (JSON, #2030)
+│                               + class_counts bundles and answer key (#8908)
 └── readers/
     ├── reader.py            Python 3 reference reader (stdlib-only)
     └── reader.mjs           Node.js reference reader (stdlib-only, Node ≥ 19)
@@ -199,6 +200,7 @@ Capability matrix:
 | Group resolution: chain-verify (obl. 2) | ✅ | ✅ | ✅ |
 | Group resolution: subkey-chain / lineage structure (obl. 3 / 5) | ✅ | ✅ | ✅ |
 | Group signatures: subkey-chain + lineage Ed25519 | SKIP¹ | ✅² | ✅ |
+| Envelope `class_counts` rule (accept golden; refuse mismatch / dropped / absent) | ✅ | ✅ | ✅ |
 
 ¹ CPython's stdlib has no Ed25519; this project vendors no cryptographic
 code (the sole-authority rule), so the pure-stdlib run reports signature
@@ -244,5 +246,21 @@ it against a fresh regeneration AND round-trips it through
 the signed spine (L2) + the source-of-truth memory TEXT (L1) + governance (L3)
 per spec §V2-1. Regenerate after a spec-approved change (e.g. a schema bump) with
 `AI_MEMORY_REGEN_GOLDEN=1 cargo test --test conformance_export_roundtrip_2030`.
+
+**`class_counts` bundles (#8908, 3-agent vote (71472661) P-10 / P-11).** The
+v2 emitter always writes `class_counts`, one map naming every array class with
+the rows its array carries (PORTABILITY-V2 §V2-4). `vectors/export/` carries
+three refusal bundles derived from the golden — `class_counts_mismatch.json`
+(one count off by one), `class_dropped.json` (the `signed_events` array removed
+while its count stays) and `class_counts_absent.json` (a #8908 array present
+with no map) — and the answer key `class_counts.json`, which pins each bundle's
+`accept`/`refuse` verdict, reason code and class. BOTH readers apply the same
+rule as the Rust importer, in the same order (non-integer count, unknown class,
+then each class in envelope order: missing entry, `dropped-class` when the array
+is absent, else `count-mismatch`), and print `PASS <name> [class-counts]` only
+when their verdict matches the key. `tests/conformance_class_counts_8908.rs`
+drift-gates the derived bundles and proves the production importer refuses each
+one with its exact error; regenerate after the golden with
+`AI_MEMORY_REGEN_GOLDEN=1 cargo test --test conformance_class_counts_8908`.
 
 All groups are additive — they change no frozen bytes.

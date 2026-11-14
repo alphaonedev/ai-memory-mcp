@@ -34232,6 +34232,137 @@ impl MemoryStore for PostgresStore {
     async fn archive_stats(&self) -> StoreResult<serde_json::Value> {
         self.archive_stats_pg().await
     }
+
+    /// #8888 — Postgres twin of the sqlite expired-but-unswept page.
+    async fn list_expired_unswept(
+        &self,
+        namespace: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> StoreResult<Vec<Memory>> {
+        let limit_i =
+            i64::try_from(limit.clamp(1, crate::storage::LIST_MAX_LIMIT)).map_err(|e| {
+                StoreError::InvalidInput {
+                    detail: format!("expired page limit: {e}"),
+                }
+            })?;
+        let offset_i = i64::try_from(offset).map_err(|e| StoreError::InvalidInput {
+            detail: format!("expired page offset: {e}"),
+        })?;
+        let rows = sqlx::query(&format!(
+            "SELECT * FROM memories WHERE expires_at IS NOT NULL AND expires_at <= NOW() \
+             AND ($1::text IS NULL OR namespace = $1) {} \
+             ORDER BY created_at ASC, id ASC LIMIT $2 OFFSET $3",
+            crate::models::lifecycle_visible_clause("")
+        ))
+        .bind(namespace)
+        .bind(limit_i)
+        .bind(offset_i)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| to_store_err("list expired-unswept memories", e))?;
+        rows.iter().map(Self::row_to_memory).collect()
+    }
+
+    /// #8888 — Postgres twin of the sqlite insert-if-absent archived write.
+    async fn insert_archived_row(&self, row: &serde_json::Value) -> StoreResult<bool> {
+        let f =
+            crate::portability::migrate_rows::ArchivedRowFields::from_json(row).map_err(|e| {
+                StoreError::InvalidInput {
+                    detail: e.to_string(),
+                }
+            })?;
+        let done = sqlx::query(
+            "INSERT INTO archived_memories \
+                (id, tier, namespace, title, content, tags, priority, confidence, \
+                 source, access_count, created_at, updated_at, last_accessed_at, \
+                 expires_at, archived_at, archive_reason, metadata, reflection_depth, \
+                 memory_kind, entity_id, persona_version, citations, source_uri, \
+                 source_span, confidence_source, confidence_signals, \
+                 confidence_decayed_at, version, atomised_into, atom_of, \
+                 mentioned_entity_id) \
+             VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7,$8,$9,$10,$11::timestamptz, \
+                     $12::timestamptz,$13::timestamptz,$14::timestamptz, \
+                     $15::timestamptz,$16,$17::jsonb,$18,$19,$20,$21,$22,$23,$24,$25, \
+                     $26,$27,COALESCE($28, 1),$29,$30,$31) \
+             ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(&f.id)
+        .bind(&f.tier)
+        .bind(&f.namespace)
+        .bind(&f.title)
+        .bind(&f.content)
+        .bind(&f.tags_json)
+        .bind(f.priority)
+        .bind(f.confidence)
+        .bind(&f.source)
+        .bind(f.access_count)
+        .bind(&f.created_at)
+        .bind(&f.updated_at)
+        .bind(&f.last_accessed_at)
+        .bind(&f.expires_at)
+        .bind(&f.archived_at)
+        .bind(&f.archive_reason)
+        .bind(&f.metadata_json)
+        .bind(f.reflection_depth.unwrap_or(0))
+        .bind(&f.memory_kind)
+        .bind(&f.entity_id)
+        .bind(f.persona_version)
+        .bind(&f.citations_json)
+        .bind(&f.source_uri)
+        .bind(&f.source_span_json)
+        .bind(&f.confidence_source)
+        .bind(&f.confidence_signals_json)
+        .bind(&f.confidence_decayed_at)
+        .bind(f.version)
+        .bind(f.atomised_into)
+        .bind(&f.atom_of)
+        .bind(&f.mentioned_entity_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| to_store_err("insert archived row", e))?;
+        Ok(done.rows_affected() == 1)
+    }
+
+    /// #8932 / #8968 — Postgres twin of `owner_guard::foreign_holder`: probe
+    /// the incoming id, then the live `(title, namespace)` slot, and decide
+    /// with the SAME `holder_is_foreign` rule the sqlite guard uses.
+    async fn foreign_slot_holder(&self, memory: &Memory) -> StoreResult<Option<String>> {
+        use sqlx::Row;
+        let incoming = crate::portability::owner_guard::incoming_owner(memory);
+        let by_id = sqlx::query(crate::portability::owner_guard::PG_HOLDER_BY_ID)
+            .bind(&memory.id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| to_store_err("owner guard id probe", e))?;
+        if let Some(row) = by_id {
+            let meta: Option<serde_json::Value> = row.try_get("metadata").ok();
+            if crate::portability::owner_guard::holder_is_foreign(meta.as_ref(), incoming) {
+                return Ok(Some(memory.id.clone()));
+            }
+        }
+        let slot = sqlx::query(&format!(
+            "SELECT id, metadata FROM memories WHERE title = $1 AND namespace = $2 AND {} \
+             LIMIT 1",
+            crate::models::TITLE_SLOT_INDEX_PREDICATE
+        ))
+        .bind(&memory.title)
+        .bind(&memory.namespace)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| to_store_err("owner guard title-slot probe", e))?;
+        let Some(row) = slot else {
+            return Ok(None);
+        };
+        let id: String = row
+            .try_get("id")
+            .map_err(|e| to_store_err("owner guard slot id decode", e))?;
+        let meta: Option<serde_json::Value> = row.try_get("metadata").ok();
+        Ok(
+            crate::portability::owner_guard::holder_is_foreign(meta.as_ref(), incoming)
+                .then_some(id),
+        )
+    }
 }
 
 /// v0.7.0 Continuation 6 — adapter row-to-`QuotaStatus` projection.

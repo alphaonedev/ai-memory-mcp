@@ -531,9 +531,12 @@ pub enum Command {
     /// exceeds its budget by more than the published 10% tolerance.
     Bench(BenchArgs),
     /// v0.7: migrate memories between SAL backends. Gated behind
-    /// `--features sal`. Reads pages via `MemoryStore::list`, writes
-    /// via `MemoryStore::store`. Idempotent: source ids are preserved
-    /// and both adapters upsert on id.
+    /// `--features sal`. Carries live rows, expired rows GC has not swept
+    /// yet, archived rows (id, archived_at and archive_reason kept) and
+    /// links; the report counts the archive phase in `archived_read` and
+    /// `archived_written`. Idempotent: source ids are preserved. A destination row of
+    /// another owner holding the same id or (title, namespace) slot is kept
+    /// and counted in `cross_owner_kept`, never merged.
     #[cfg(feature = "sal")]
     Migrate(MigrateArgs),
     /// v0.7.0 Wave-1 Fix 3: bootstrap a SAL backend's schema by URL.

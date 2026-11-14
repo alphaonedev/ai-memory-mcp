@@ -31,6 +31,11 @@
 
 pub mod dto;
 pub mod emit;
+pub mod envelope_parse;
+pub mod extra_classes;
 pub mod hex_bytes;
 pub mod import;
+#[cfg(feature = "sal")]
+pub mod migrate_rows;
+pub mod owner_guard;
 pub mod read;

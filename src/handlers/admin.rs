@@ -1498,6 +1498,7 @@ pub async fn import_memories(
         let mut stored_ids: Vec<String> = Vec::new();
         let mut linked: Vec<MemoryLink> = Vec::new();
         let mut pubkey_bindings_stripped = 0usize;
+        let mut cross_owner_kept = 0usize;
         let mut errors: Vec<String> = Vec::new();
         let mut pending: Vec<serde_json::Value> = Vec::new();
         for mut mem in body.memories {
@@ -1649,6 +1650,34 @@ pub async fn import_memories(
                 }
             }
 
+            // #8968 — Postgres twin of the sqlite owner guard: probe the id
+            // and the `(title, namespace)` slot before the upsert-merge.
+            match app.store.foreign_slot_holder(&mem).await {
+                Ok(None) => {}
+                Ok(Some(_)) => {
+                    tracing::warn!(
+                        memory_id = %mem.id,
+                        "import_memories(postgres): destination row kept, the slot belongs \
+                         to another owner (#8968)"
+                    );
+                    cross_owner_kept += 1;
+                    errors.push(
+                        crate::portability::owner_guard::ForeignOwnerKept {
+                            incoming_id: mem.id.clone(),
+                        }
+                        .to_string(),
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "import_memories(postgres): owner probe failed for {}: {e}",
+                        mem.id
+                    );
+                    errors.push(super::sanitize_bulk_row_error(&e.to_string()).to_string());
+                    continue;
+                }
+            }
             match app.store.store(&ctx, &mem).await {
                 Ok(stored_id) => {
                     imported += 1;
@@ -1704,6 +1733,7 @@ pub async fn import_memories(
             "errors": errors,
             "pending": pending,
             (field_names::PUBKEY_BINDINGS_STRIPPED): pubkey_bindings_stripped,
+            (field_names::CROSS_OWNER_KEPT): cross_owner_kept,
             (field_names::STORAGE_BACKEND): "postgres",
         });
         return import_delivered(&app, effects, &unread, receipt).await;
@@ -1714,6 +1744,7 @@ pub async fn import_memories(
     let mut stored_ids: Vec<String> = Vec::new();
     let mut linked: Vec<MemoryLink> = Vec::new();
     let mut pubkey_bindings_stripped = 0usize;
+    let mut cross_owner_kept = 0usize;
     let mut errors = Vec::new();
     let mut pending: Vec<serde_json::Value> = Vec::new();
     for mut mem in body.memories {
@@ -1863,10 +1894,16 @@ pub async fn import_memories(
             }
         }
 
-        match db::insert(&lock.0, &mem) {
+        // #8968 — the upsert never replaces or merges another owner's row:
+        // counted, warned, destination row kept (the #3151 disposition).
+        match crate::portability::owner_guard::insert_merge_owner_guarded(&lock.0, &mem) {
             Ok(stored_id) => {
                 imported += 1;
                 stored_ids.push(stored_id);
+            }
+            Err(e) if crate::portability::owner_guard::is_foreign_owner_kept(&e) => {
+                cross_owner_kept += 1;
+                errors.push(e.to_string());
             }
             Err(e) => {
                 // Issue #851: db::insert errors include raw rusqlite
@@ -1919,6 +1956,7 @@ pub async fn import_memories(
         "errors": errors,
         "pending": pending,
         (field_names::PUBKEY_BINDINGS_STRIPPED): pubkey_bindings_stripped,
+        (field_names::CROSS_OWNER_KEPT): cross_owner_kept,
     });
     import_delivered(&app, effects, &unread, receipt).await
 }

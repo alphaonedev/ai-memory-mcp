@@ -49,6 +49,9 @@ pub const AGENT_PUBKEY: &str = "agent_pubkey";
 pub const PUBKEY_BOUND_AT: &str = "pubkey_bound_at";
 /// `pubkey_bindings_stripped` — import/sync report field name.
 pub const PUBKEY_BINDINGS_STRIPPED: &str = "pubkey_bindings_stripped";
+/// `cross_owner_kept` — import report field (#8968): incoming rows NOT
+/// written because the destination slot belongs to another owner.
+pub const CROSS_OWNER_KEPT: &str = "cross_owner_kept";
 /// `agent_type` — wire/row field name.
 pub const AGENT_TYPE: &str = "agent_type";
 /// `allowed_tools` — wire/row field name.

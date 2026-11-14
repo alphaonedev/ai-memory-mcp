@@ -1,0 +1,192 @@
+// Copyright 2026 AlphaOne LLC
+// SPDX-License-Identifier: Apache-2.0
+
+//! #8908 — the `class_counts` conformance bundles (3-agent vote (71472661)
+//! P-10 / P-11).
+//!
+//! The emitter writes one `class_counts` map naming every array class of the
+//! `"2"` envelope with the rows its array carries. An importer refuses the
+//! whole bundle when a count disagrees with its array, when the map names an
+//! unknown class, or when the map is absent while a #8908 / #8911 array is
+//! present. The two non-Rust readers (`conformance/readers/`) apply the same
+//! check, so the corpus carries refusal bundles derived from the committed
+//! round-trip golden plus an answer key:
+//!
+//! - `class_counts_mismatch.json` — one count off by one;
+//! - `class_dropped.json` — an array removed in transit while its count stays;
+//! - `class_counts_absent.json` — a #8908 array present, the map removed.
+//!
+//! [`refusal_bundles_match_the_golden`] derives the bundles and the answer key
+//! from `round_trip_l3.json` and byte-compares them with the committed copies
+//! (under `AI_MEMORY_REGEN_GOLDEN=1` it rewrites them).
+//! [`production_importer_refuses_each_bundle_with_exact_error`] proves the Rust
+//! gate refuses each one with its exact message and accepts the golden.
+
+#![allow(clippy::missing_panics_doc)]
+
+use std::path::PathBuf;
+
+use ai_memory::portability::envelope_parse::{
+    ARRAY_CLASSES, CLASS_COUNTS_FIELD, NEW_ARRAY_CLASSES, check_raw_envelope,
+};
+use serde_json::{Value, json};
+
+/// Regenerate-the-golden switch, matching `tests/conformance_corpus.rs`.
+const REGEN_ENV: &str = "AI_MEMORY_REGEN_GOLDEN";
+/// The corpus directory the bundles live in, relative to the crate root.
+const EXPORT_DIR_REL: &str = "conformance/vectors/export";
+/// The committed round-trip golden (`tests/conformance_export_roundtrip_2030.rs`).
+const GOLDEN_FILE: &str = "round_trip_l3.json";
+/// The answer key both readers consume.
+const ANSWER_KEY_FILE: &str = "class_counts.json";
+/// Bundle: one count off by one.
+const MISMATCH_FILE: &str = "class_counts_mismatch.json";
+/// Bundle: an array dropped while its count stays.
+const DROPPED_FILE: &str = "class_dropped.json";
+/// Bundle: a #8908 array present with no `class_counts`.
+const ABSENT_FILE: &str = "class_counts_absent.json";
+/// The class whose count the mismatch bundle bumps.
+const MISMATCH_CLASS: &str = "memories";
+/// The class the dropped bundle removes.
+const DROPPED_CLASS: &str = "signed_events";
+/// The #8908 class the absent bundle carries.
+const ABSENT_NEW_CLASS: &str = "entity_aliases";
+/// The shared refusal prefix of the Rust gate.
+const REJECTED: &str = "portability import REJECTED (fail-closed)";
+
+/// Reason codes the readers print; the answer key pins one per bundle.
+const REASON_COUNT_MISMATCH: &str = "count-mismatch";
+const REASON_DROPPED_CLASS: &str = "dropped-class";
+const REASON_ABSENT: &str = "class-counts-absent";
+
+fn export_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(EXPORT_DIR_REL)
+}
+
+fn pretty(value: &Value) -> String {
+    let mut s = serde_json::to_string_pretty(value).expect("serialize bundle");
+    s.push('\n');
+    s
+}
+
+fn golden() -> Value {
+    let path = export_dir().join(GOLDEN_FILE);
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("missing golden {}: {e}", path.display()));
+    serde_json::from_str(&text).expect("golden parses")
+}
+
+fn declared(bundle: &Value, class: &str) -> u64 {
+    bundle[CLASS_COUNTS_FIELD][class]
+        .as_u64()
+        .unwrap_or_else(|| panic!("golden class_counts must name {class}"))
+}
+
+/// The three refusal bundles, derived from the golden.
+fn derive(golden: &Value) -> [(&'static str, Value); 3] {
+    let mut mismatch = golden.clone();
+    let bumped = declared(golden, MISMATCH_CLASS) + 1;
+    mismatch[CLASS_COUNTS_FIELD][MISMATCH_CLASS] = json!(bumped);
+
+    let mut dropped = golden.clone();
+    dropped
+        .as_object_mut()
+        .expect("golden is an object")
+        .remove(DROPPED_CLASS);
+
+    let mut absent = golden.clone();
+    let obj = absent.as_object_mut().expect("golden is an object");
+    obj.remove(CLASS_COUNTS_FIELD);
+    obj.insert(
+        ABSENT_NEW_CLASS.to_string(),
+        json!([{
+            "entity_id": "entity-conformance-8908",
+            "alias": "alias-conformance-8908",
+            "created_at": "2026-07-14T00:00:00Z"
+        }]),
+    );
+    [
+        (MISMATCH_FILE, mismatch),
+        (DROPPED_FILE, dropped),
+        (ABSENT_FILE, absent),
+    ]
+}
+
+fn answer_key() -> Value {
+    json!({
+        "description": "#8908 class_counts conformance bundles (3-agent vote (71472661) P-10/P-11). \
+            A reader accepts a bundle whose class_counts names every array class with the rows \
+            its array carries, and refuses one with a count that disagrees, an unknown class, a \
+            missing class entry, or no class_counts while a new array is present. Generated by \
+            tests/conformance_class_counts_8908.rs.",
+        "array_classes": ARRAY_CLASSES,
+        "new_array_classes": NEW_ARRAY_CLASSES,
+        "bundles": [
+            {"name": "class-counts-golden-accept", "file": GOLDEN_FILE, "expect": "accept"},
+            {"name": "class-counts-mismatch-refused", "file": MISMATCH_FILE, "expect": "refuse",
+             "reason": REASON_COUNT_MISMATCH, "class": MISMATCH_CLASS},
+            {"name": "class-dropped-refused", "file": DROPPED_FILE, "expect": "refuse",
+             "reason": REASON_DROPPED_CLASS, "class": DROPPED_CLASS},
+            {"name": "class-counts-absent-refused", "file": ABSENT_FILE, "expect": "refuse",
+             "reason": REASON_ABSENT, "class": ABSENT_NEW_CLASS},
+        ],
+    })
+}
+
+#[test]
+fn refusal_bundles_match_the_golden() {
+    let golden = golden();
+    let mut files: Vec<(&str, String)> = derive(&golden)
+        .iter()
+        .map(|(name, v)| (*name, pretty(v)))
+        .collect();
+    files.push((ANSWER_KEY_FILE, pretty(&answer_key())));
+    let dir = export_dir();
+    if std::env::var(REGEN_ENV).is_ok() {
+        for (name, text) in &files {
+            std::fs::write(dir.join(name), text).expect("write bundle");
+        }
+        return;
+    }
+    for (name, text) in &files {
+        let path = dir.join(name);
+        let committed = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("missing {}: {e}", path.display()));
+        assert_eq!(
+            text, &committed,
+            "{name} drifted from the golden; regenerate with `{REGEN_ENV}=1 cargo test --test \
+             conformance_class_counts_8908` and commit conformance/vectors/export/"
+        );
+    }
+}
+
+#[test]
+fn production_importer_refuses_each_bundle_with_exact_error() {
+    let golden = golden();
+    check_raw_envelope(&golden).expect("the golden carries a matching class_counts");
+    let mismatch_rows = declared(&golden, MISMATCH_CLASS);
+    let dropped_rows = declared(&golden, DROPPED_CLASS);
+    assert!(
+        dropped_rows > 0,
+        "the golden must carry {DROPPED_CLASS} rows"
+    );
+    let expected = [
+        format!(
+            "{REJECTED}: class_counts[\"{MISMATCH_CLASS}\"] = {} but the {MISMATCH_CLASS} array \
+             carries {mismatch_rows} rows; NO rows were applied",
+            mismatch_rows + 1
+        ),
+        format!(
+            "{REJECTED}: class_counts[\"{DROPPED_CLASS}\"] = {dropped_rows} but the \
+             {DROPPED_CLASS} array carries 0 rows; NO rows were applied"
+        ),
+        format!(
+            "{REJECTED}: class_counts is absent but the bundle carries the {ABSENT_NEW_CLASS} \
+             array; NO rows were applied"
+        ),
+    ];
+    for ((name, bundle), want) in derive(&golden).iter().zip(expected) {
+        let err = check_raw_envelope(bundle).expect_err(name);
+        assert_eq!(err.to_string(), want, "{name}");
+    }
+}

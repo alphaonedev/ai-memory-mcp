@@ -101,6 +101,12 @@ const REQUIRED_VECTOR_NAMES: &[&str] = &[
     "signed/write_v2_signed",
     "signed/write_v2_tampered",
     "signed/equivocation_proof_real",
+    // #8908 (3-agent vote (71472661) P-11): both readers apply the importer's
+    // class_counts rule and refuse the count-mismatch and dropped-class bundles.
+    "class-counts-golden-accept",
+    "class-counts-mismatch-refused",
+    "class-dropped-refused",
+    "class-counts-absent-refused",
 ];
 
 /// A non-Rust reference reader: which interpreter can run it, and how to

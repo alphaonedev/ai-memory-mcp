@@ -202,12 +202,23 @@ psql 'postgres://aimemory:PASSWORD@HOST:5432/aimemory' -c "
   UNION ALL SELECT 'memory_transcripts', COUNT(*) FROM memory_transcripts;"
 ```
 
-Counts must match for `memories` and `memory_links` (the migrate tool
-copies those two tables; operational tables such as `signed_events` and
-`memory_transcripts` start fresh on the postgres side). If
-`memory_links` is short on the postgres side, you migrated against a
-pre-Wave-1 binary — re-run with the v0.7.0 binary that has Stream A's
-`migrate.rs` link-walk.
+Counts must match for `memories`, `archived_memories` and
+`memory_links` (the migrate tool copies those three tables; operational
+tables such as `signed_events` and `memory_transcripts` start fresh on
+the postgres side). `memories` includes expired rows that GC has not
+swept yet: migrate carries them with `expires_at` verbatim, so the
+destination's own sweep decides their fate (#8888). The archive phase
+reports `archived_read` and `archived_written` (plus `archived_skipped`
+for an archived id the destination already holds); a run succeeds only
+when `memories_written + cross_owner_kept == memories_read` and
+`archived_written + archived_skipped == archived_read`. A destination
+row of another owner holding the same id or the same
+`(title, namespace)` slot is kept byte-for-byte and counted in
+`cross_owner_kept` with a WARN; migrate never folds one agent's row into
+another's (#8932), so `memories` on postgres can be short of the source
+by exactly that count. If `memory_links` is short on the postgres side,
+you migrated against a pre-Wave-1 binary — re-run with the v0.7.0 binary
+that has Stream A's `migrate.rs` link-walk.
 
 ```bash
 # Schema parity.

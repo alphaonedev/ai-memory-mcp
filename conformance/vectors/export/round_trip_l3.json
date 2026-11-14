@@ -184,6 +184,26 @@
       "pubkey_b64": "GX9rI-FshTLGq8g4-s1ep4m-DHaykgM0A5v6iz02jWE"
     }
   ],
+  "class_counts": {
+    "agent_lineage": 0,
+    "archived_memories": 0,
+    "archived_memory_links": 0,
+    "checkpoints": 0,
+    "entity_aliases": 0,
+    "expired_memories": 0,
+    "forget_tombstones": 1,
+    "governance_rules": 5,
+    "links": 0,
+    "memories": 1,
+    "memory_revisions": 1,
+    "model_attestations": 1,
+    "namespace_meta": 0,
+    "offloaded_blobs": 0,
+    "routine_runs": 0,
+    "routines": 0,
+    "signed_events": 4,
+    "trust_anchors": 1
+  },
   "portability_complete": true,
   "conformance_level": "L3",
   "conformance_by_class": {

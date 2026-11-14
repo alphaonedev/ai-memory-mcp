@@ -18,6 +18,9 @@ without a cryptography library:
      outer element count.
   4. For the equivocation proof: check the divergence key (same subject /
      epoch / head_sequence, DIFFERENT head_hash).
+  5. For the export-envelope bundles (vectors/export/class_counts.json): apply
+     the importer's class_counts rule and match the answer key's accept or
+     refuse verdict and reason (#8908).
 
 Ed25519 signature verification is NOT implemented here because CPython's
 standard library has no Ed25519 primitive and this reader vendors no
@@ -421,6 +424,77 @@ def check_corpus_digest(manifest: dict, corpus: Path) -> None:
         raise ProfileError(f"corpus_digest mismatch: computed {got}, manifest {want}")
 
 
+# --- class_counts (#8908, 3-agent vote (71472661) P-10 / P-11) ---------------
+
+# Every array class of the "2" envelope, in envelope order. Kept in this reader
+# (not taken from the answer key) so the check is independent; the key's copy
+# is cross-checked against it.
+ARRAY_CLASSES = (
+    "memories", "links", "signed_events", "memory_revisions", "forget_tombstones",
+    "agent_lineage", "model_attestations", "governance_rules", "trust_anchors",
+    "archived_memories", "namespace_meta", "archived_memory_links", "expired_memories",
+    "checkpoints", "routines", "routine_runs", "entity_aliases", "offloaded_blobs",
+)
+# The arrays added by #8908 / #8911: a bundle carrying any of them must carry
+# class_counts too.
+NEW_ARRAY_CLASSES = (
+    "expired_memories", "checkpoints", "routines", "routine_runs", "entity_aliases",
+    "offloaded_blobs",
+)
+CLASS_COUNTS_FIELD = "class_counts"
+CLASS_COUNTS_KEY = Path("vectors") / "export" / "class_counts.json"
+
+
+def class_counts_verdict(bundle) -> tuple[str, str | None, str | None]:
+    """Apply the importer's class_counts rule to one envelope.
+
+    Returns ``("accept", None, None)`` or ``("refuse", reason, class)``, in the
+    same check order as the Rust importer (src/portability/envelope_parse.rs).
+    """
+    if not isinstance(bundle, dict):
+        return ("refuse", "not-object", None)
+    carried = {
+        c: len(bundle[c]) if isinstance(bundle.get(c), list) else 0 for c in ARRAY_CLASSES
+    }
+    declared = bundle.get(CLASS_COUNTS_FIELD)
+    if declared is None:
+        for c in NEW_ARRAY_CLASSES:
+            if carried[c] > 0:
+                return ("refuse", "class-counts-absent", c)
+        return ("accept", None, None)
+    if not isinstance(declared, dict):
+        return ("refuse", "class-counts-not-object", None)
+    for c, n in declared.items():
+        if isinstance(n, bool) or not isinstance(n, int) or n < 0:
+            return ("refuse", "count-not-integer", c)
+    for c in declared:
+        if c not in ARRAY_CLASSES:
+            return ("refuse", "unknown-class", c)
+    for c in ARRAY_CLASSES:
+        if c not in declared:
+            return ("refuse", "missing-class-entry", c)
+        if declared[c] != carried[c]:
+            reason = "dropped-class" if c not in bundle and declared[c] > 0 else "count-mismatch"
+            return ("refuse", reason, c)
+    return ("accept", None, None)
+
+
+def check_class_counts_bundles(corpus: Path) -> list[tuple[str, str | None]]:
+    """Run every bundle of the class_counts answer key; returns (name, error)."""
+    key = json.loads((corpus / CLASS_COUNTS_KEY).read_text())
+    results: list[tuple[str, str | None]] = []
+    if tuple(key["array_classes"]) != ARRAY_CLASSES or tuple(
+        key["new_array_classes"]
+    ) != NEW_ARRAY_CLASSES:
+        results.append(("class-counts-class-list", "answer key class lists differ from this reader"))
+    for entry in key["bundles"]:
+        bundle = json.loads((corpus / CLASS_COUNTS_KEY.parent / entry["file"]).read_text())
+        got = class_counts_verdict(bundle)
+        want = (entry["expect"], entry.get("reason"), entry.get("class"))
+        results.append((entry["name"], None if got == want else f"resolved {got!r} != expected {want!r}"))
+    return results
+
+
 def run(corpus: Path, verify) -> int:
     manifest = json.loads((corpus / "manifest.json").read_text())
     head_domain = manifest["domain_tags"]["peer_head_attestation"]
@@ -486,7 +560,19 @@ def run(corpus: Path, verify) -> int:
         notes = f" — {'; '.join(skips)}" if skips else ""
         print(f"{status} {name} [{verdict}]{notes}")
 
-    total = len(manifest["vectors"]) + len(groups) + 1  # + the corpus_digest anchor
+    try:
+        bundle_results = check_class_counts_bundles(corpus)
+    except (ValueError, KeyError, OSError) as exc:
+        bundle_results = [("class-counts-answer-key", str(exc))]
+    for name, error in bundle_results:
+        if error is None:
+            print(f"PASS {name} [class-counts]")
+        else:
+            print(f"FAIL {name}: {error}")
+            failed += 1
+
+    # + the corpus_digest anchor + the class_counts bundles
+    total = len(manifest["vectors"]) + len(groups) + 1 + len(bundle_results)
     print(f"\n{total - failed}/{total} items passed", "" if failed == 0 else "(FAILURES)")
     return 0 if failed == 0 else 1
 
