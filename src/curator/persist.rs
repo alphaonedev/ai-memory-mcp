@@ -48,19 +48,25 @@ fn metadata_object_mut<'a>(
     })
 }
 
-pub(super) fn persist_auto_tags(conn: &Connection, mem: &Memory, tags: &[String]) -> Result<()> {
-    let mut updated = mem.metadata.clone();
-    {
-        let obj = metadata_object_mut(&mut updated, &mem.id, "auto_tags")?;
-        obj.insert("auto_tags".to_string(), serde_json::json!(tags));
-        obj.insert(
-            "curated_at".to_string(),
-            serde_json::json!(chrono::Utc::now().to_rfc3339()),
-        );
-    }
+/// #4287 — the metadata a curator write-back starts from: the row's CURRENT
+/// metadata, read inside the caller's write transaction. The sweep's `mem`
+/// snapshot can be minutes old (an LLM call sits between the read and the
+/// write), so merging into `mem.metadata` and writing the whole object back
+/// replaced every key another writer had committed since — a lost update.
+/// A row that vanished meanwhile is refused, never reported as written.
+fn current_metadata(conn: &Connection, mem_id: &str, what: &str) -> Result<serde_json::Value> {
+    db::get(conn, mem_id)?.map(|m| m.metadata).ok_or_else(|| {
+        anyhow::anyhow!("refusing to write {what} for memory {mem_id}: the row no longer exists")
+    })
+}
+
+/// #4287 — write `metadata` back as the row's whole metadata object. Runs
+/// inside the caller's [`db::in_write_txn`], so nothing lands between the
+/// read in [`current_metadata`] and this UPDATE.
+fn write_metadata(conn: &Connection, mem_id: &str, metadata: &serde_json::Value) -> Result<()> {
     db::update(
         conn,
-        &mem.id,
+        mem_id,
         None,
         None,
         None,
@@ -69,9 +75,24 @@ pub(super) fn persist_auto_tags(conn: &Connection, mem: &Memory, tags: &[String]
         None,
         None,
         None,
-        Some(&updated),
+        Some(metadata),
     )?;
     Ok(())
+}
+
+pub(super) fn persist_auto_tags(conn: &Connection, mem: &Memory, tags: &[String]) -> Result<()> {
+    db::in_write_txn(conn, || {
+        let mut updated = current_metadata(conn, &mem.id, "auto_tags")?;
+        {
+            let obj = metadata_object_mut(&mut updated, &mem.id, "auto_tags")?;
+            obj.insert("auto_tags".to_string(), serde_json::json!(tags));
+            obj.insert(
+                "curated_at".to_string(),
+                serde_json::json!(chrono::Utc::now().to_rfc3339()),
+            );
+        }
+        write_metadata(conn, &mem.id, &updated)
+    })
 }
 
 pub(super) fn persist_contradiction(
@@ -79,41 +100,27 @@ pub(super) fn persist_contradiction(
     mem: &Memory,
     against_id: &str,
 ) -> Result<()> {
-    let mut updated = mem.metadata.clone();
-    {
-        let obj =
-            metadata_object_mut(&mut updated, &mem.id, field_names::CONFIRMED_CONTRADICTIONS)?;
-        let existing = obj
-            .get(field_names::CONFIRMED_CONTRADICTIONS)
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
-        let mut ids: Vec<String> = existing
-            .into_iter()
-            .filter_map(|v| v.as_str().map(String::from))
-            .collect();
-        if !ids.iter().any(|id| id == against_id) {
-            ids.push(against_id.to_string());
+    let what = field_names::CONFIRMED_CONTRADICTIONS;
+    db::in_write_txn(conn, || {
+        let mut updated = current_metadata(conn, &mem.id, what)?;
+        {
+            let obj = metadata_object_mut(&mut updated, &mem.id, what)?;
+            let existing = obj
+                .get(what)
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let mut ids: Vec<String> = existing
+                .into_iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect();
+            if !ids.iter().any(|id| id == against_id) {
+                ids.push(against_id.to_string());
+            }
+            obj.insert(what.to_string(), serde_json::json!(ids));
         }
-        obj.insert(
-            field_names::CONFIRMED_CONTRADICTIONS.to_string(),
-            serde_json::json!(ids),
-        );
-    }
-    db::update(
-        conn,
-        &mem.id,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        Some(&updated),
-    )?;
-    Ok(())
+        write_metadata(conn, &mem.id, &updated)
+    })
 }
 
 #[cfg(test)]

@@ -49,6 +49,10 @@ pub const AGENT_PUBKEY: &str = "agent_pubkey";
 pub const PUBKEY_BOUND_AT: &str = "pubkey_bound_at";
 /// `pubkey_bindings_stripped` — import/sync report field name.
 pub const PUBKEY_BINDINGS_STRIPPED: &str = "pubkey_bindings_stripped";
+/// `skipped_by_covenant` — import/sync report field name: rows the
+/// destination kept out because the id is forgotten (tombstoned) or held
+/// under covenant.
+pub const SKIPPED_BY_COVENANT: &str = "skipped_by_covenant";
 /// `agent_type` — wire/row field name.
 pub const AGENT_TYPE: &str = "agent_type";
 /// `allowed_tools` — wire/row field name.

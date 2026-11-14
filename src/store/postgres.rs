@@ -8934,8 +8934,10 @@ impl PostgresStore {
             serde_json::Value,
             String,
         )> = sqlx::query_as(
+            // #4034 — FOR UPDATE: the merge below is composed from this read,
+            // so the row is held until commit (the owner gate may be bypassed).
             "SELECT version, namespace, tier, title, memory_kind, metadata, content \
-                 FROM memories WHERE id = $1",
+                 FROM memories WHERE id = $1 FOR UPDATE",
         )
         .bind(id)
         .fetch_optional(&mut *tx)
@@ -24176,8 +24178,9 @@ impl MemoryStore for PostgresStore {
         // `install_governance_pre_write_hook` in src/daemon_runtime.rs).
         let cur: Option<(String, String, serde_json::Value, String, String, String)> =
             sqlx::query_as(
+                // #4034 — FOR UPDATE: hold the row the merge reads until commit.
                 "SELECT title, content, metadata, namespace, tier, memory_kind \
-                 FROM memories WHERE id = $1",
+                 FROM memories WHERE id = $1 FOR UPDATE",
             )
             .bind(id)
             .fetch_optional(&mut *tx)
