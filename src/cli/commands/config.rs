@@ -633,15 +633,19 @@ fn migrate(dry_run: bool, also_clean_claude_json: bool, out: &mut CliOutput) -> 
         }
     }
 
-    // Write backup.
+    // Write backup. v1.0.0 #8950 — a new owner-only file that never follows
+    // or replaces a symlink planted at the timestamped name.
     let timestamp = chrono::Utc::now().format("%Y%m%d-%H%M%S").to_string();
     let backup_path = path.with_extension(format!("toml.bak.{timestamp}"));
-    if let Err(e) = std::fs::write(&backup_path, &contents) {
+    if let Err(e) = crate::storage::snapshot_file::write_new_private(
+        &backup_path,
+        "config backup",
+        contents.as_bytes(),
+    ) {
         let _ = writeln!(
             out.stderr,
-            "ERROR: could not write backup {}: {}",
+            "ERROR: could not write backup {}: {e:#}",
             backup_path.display(),
-            e
         );
         return Ok(4);
     }
@@ -885,7 +889,12 @@ fn clean_claude_json(timestamp: &str) -> Result<Option<String>> {
     }
 
     let backup_path = format!("{}.bak.{}", path.display(), timestamp);
-    std::fs::write(&backup_path, &contents)?;
+    // v1.0.0 #8950 — never follows or replaces a link at the backup name.
+    crate::storage::snapshot_file::write_new_private(
+        Path::new(&backup_path),
+        "config backup",
+        contents.as_bytes(),
+    )?;
     std::fs::write(&path, serde_json::to_string_pretty(&value)?)?;
 
     Ok(Some(backup_path))

@@ -459,13 +459,18 @@ pub fn run(args: &InstallArgs, cli_agent_id: Option<&str>, out: &mut CliOutput<'
                 None => String::new(),
             }
         ));
-        std::fs::copy(&config_path, &backup).with_context(|| {
-            format!(
-                "backing up {} to {}",
-                config_path.display(),
-                backup.display()
-            )
-        })?;
+        // v1.0.0 #8950 — the backup is a NEW owner-only file: a symlink
+        // planted at the timestamped name is refused, never written through.
+        let original = std::fs::read(&config_path)
+            .with_context(|| format!("reading {} to back it up", config_path.display()))?;
+        crate::storage::snapshot_file::write_new_private(&backup, "install backup", &original)
+            .with_context(|| {
+                format!(
+                    "backing up {} to {}",
+                    config_path.display(),
+                    backup.display()
+                )
+            })?;
         Some(backup)
     } else {
         None
@@ -675,7 +680,8 @@ fn write_system_prompt_snippet_to(target: Target, dir: &std::path::Path) -> Resu
         .with_context(|| format!("creating snippet directory {}", dir.display()))?;
     let path = dir.join(format!("system-prompt-{}.md", target.name()));
     let body = snippet_body(target);
-    std::fs::write(&path, body)
+    // v1.0.0 #8950 — replaced by a rename; a symlink at the name is refused.
+    crate::storage::snapshot_file::write_replacing(&path, "snippet", body.as_bytes())
         .with_context(|| format!("writing snippet to {}", path.display()))?;
     Ok(path)
 }
