@@ -1484,8 +1484,11 @@ def _judge(repo, base, head, judged, mb, tip):
     strict_head = banner_scan(head_blob, capped=True, mode=SCAN_STRICT)
     frozen = banner_mb.status in LEDGER_STATUSES and strict_head.status in LEDGER_STATUSES
     if frozen:
-        banner_head = banner_scan(head_blob, capped=True, mode=SCAN_LOOSE,
-                                  excuse=base_excuse(base_blob))
+        # R-6: the base's looser excuse scan runs only within the document cap. A base over
+        # the cap cannot equal the capped head's frozen region, so the change is refused
+        # either way (without excuses its looser lines are refused first, fail closed).
+        excuse = base_excuse(base_blob) if len(base_blob) <= LEDGER_MAX_DOC_BYTES else None
+        banner_head = banner_scan(head_blob, capped=True, mode=SCAN_LOOSE, excuse=excuse)
         try:
             region_same = frozen_region_diff(base_blob, head_blob, banner_mb, strict_head) is None
         except GateError:

@@ -63,8 +63,10 @@ or Binds-to line is not a refusal there, because the frozen region keeps it unch
 
 While both ends are VOID or EXPIRED, the head is judged by the loose banner scan with the
 base's own lines excused, and then by the frozen-region compare, which runs last so that
-every earlier refusal keeps its exact reason. When either end says LIVE, no amendment
-pass is possible and the head is judged by the head detector: it reads each line after
+every earlier refusal keeps its exact reason. The base's lines are excused only while the
+base is within the 8388608-byte document limit; a larger base can never equal the capped
+head's region, so its looser lines are not excused and the change is refused. When either
+end says LIVE, no amendment pass is possible and the head is judged by the head detector: it reads each line after
 decoding HTML entities (at most 4 passes), NFKC folding, dropping every character other
 than a-z and 0-9, and joining a soft line break, and it refuses "a STATUS-like line the
 strict grammar does not read", "a Binds-like line the strict grammar does not read", "a
