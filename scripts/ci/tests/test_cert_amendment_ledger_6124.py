@@ -1592,6 +1592,23 @@ class OptionBRegion(LedgerCase):
         self.assertLess(scan_s, PARSE_BOUND_S)
         self.assertLess(diff_s, FAST_BOUND_S)
 
+    def test_r6_over_cap_base_skips_the_loose_excuse_scan(self):
+        """R-6: the base is read uncapped (strict grammar only, linear), but the looser
+        excuse scan of the base runs only while the base is within the document cap. A base
+        over the cap can never equal a capped head's frozen region, so the change is refused
+        either way, without the slowest scan."""
+        pad = "Plain prose line for the base bound.\n"
+        base = head_doc() + pad * (cert.LEDGER_MAX_DOC_BYTES // len(pad) + 1)
+        s = self.scene("VOID", base_doc=base)
+        calls = []
+        excuse = cert.base_excuse
+        self.addCleanup(setattr, cert, "base_excuse", excuse)
+        cert.base_excuse = lambda blob: calls.append(len(blob)) or excuse(blob)
+        ok, out = s.judge(self.wire_and_doc(s, with_ledger(head_doc(), self.exact())))
+        self.assertFalse(ok, out)
+        self.assertIn("is frozen while the certification is VOID or EXPIRED at both ends", out)
+        self.assertEqual(calls, [])
+
 
 class DocRecordForm(unittest.TestCase):
     """I5 / F3: the doc states the record form the parser reads."""
