@@ -296,7 +296,7 @@ impl NoFollowStage {
         use std::io::Write;
         self.file
             .write_all(bytes)
-            .with_context(|| format!("writing {}", self.name.path.display()))
+            .with_context(|| format!("staging {} {}", self.what, self.name.path.display()))
     }
 
     /// Prove the staging NAME still names the staged handle's file. `VACUUM
