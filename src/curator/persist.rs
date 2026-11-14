@@ -115,3 +115,109 @@ pub(super) fn persist_contradiction(
     )?;
     Ok(())
 }
+
+#[cfg(test)]
+mod lost_update_4287_tests {
+    use super::*;
+
+    fn seeded(conn: &Connection) -> Memory {
+        let now = chrono::Utc::now().to_rfc3339();
+        let mem = Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: crate::models::Tier::Long,
+            namespace: "curate-4287".to_string(),
+            title: "anchor-4287".to_string(),
+            content: "a".repeat(120),
+            priority: 5,
+            confidence: 1.0,
+            source: "api".to_string(),
+            created_at: now.clone(),
+            updated_at: now,
+            metadata: serde_json::json!({"note": "v0"}),
+            version: 1,
+            ..Memory::default()
+        };
+        db::insert(conn, &mem).expect("seed");
+        mem
+    }
+
+    /// Another writer commits `note = v1` after the sweep read the row.
+    fn concurrent_note_write(conn: &Connection, id: &str) {
+        let mut meta = db::get(conn, id).expect("get").expect("row").metadata;
+        meta["note"] = serde_json::json!("v1");
+        db::update(
+            conn,
+            id,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&meta),
+        )
+        .expect("concurrent write");
+    }
+
+    fn metadata(conn: &Connection, id: &str) -> serde_json::Value {
+        db::get(conn, id).expect("get").expect("row").metadata
+    }
+
+    #[test]
+    fn persist_4287_auto_tags_keeps_a_concurrent_metadata_write() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let conn = db::open(&dir.path().join("c.db")).expect("open");
+        let stale = seeded(&conn);
+        concurrent_note_write(&conn, &stale.id);
+        persist_auto_tags(&conn, &stale, &["alpha".to_string()]).expect("persist");
+        let meta = metadata(&conn, &stale.id);
+        assert_eq!(meta["note"], serde_json::json!("v1"), "lost update: {meta}");
+        assert_eq!(meta["auto_tags"], serde_json::json!(["alpha"]), "{meta}");
+    }
+
+    #[test]
+    fn persist_4287_contradiction_keeps_every_id_from_stale_snapshots() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let conn = db::open(&dir.path().join("c.db")).expect("open");
+        let stale = seeded(&conn);
+        concurrent_note_write(&conn, &stale.id);
+        // Both calls carry the SAME stale snapshot, as two sweep passes do.
+        persist_contradiction(&conn, &stale, "id-1").expect("first");
+        persist_contradiction(&conn, &stale, "id-2").expect("second");
+        persist_contradiction(&conn, &stale, "id-1").expect("dup");
+        let meta = metadata(&conn, &stale.id);
+        assert_eq!(meta["note"], serde_json::json!("v1"), "lost update: {meta}");
+        assert_eq!(
+            meta[field_names::CONFIRMED_CONTRADICTIONS],
+            serde_json::json!(["id-1", "id-2"]),
+            "{meta}"
+        );
+    }
+
+    #[test]
+    fn persist_4287_vanished_row_is_refused_not_reported_written() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let conn = db::open(&dir.path().join("c.db")).expect("open");
+        let stale = seeded(&conn);
+        assert!(db::delete(&conn, &stale.id).expect("delete"));
+        let err = persist_auto_tags(&conn, &stale, &[]).expect_err("vanished row");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "refusing to write auto_tags for memory {}: the row no longer exists",
+                stale.id
+            )
+        );
+        let err = persist_contradiction(&conn, &stale, "x").expect_err("vanished row");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "refusing to write {} for memory {}: the row no longer exists",
+                field_names::CONFIRMED_CONTRADICTIONS,
+                stale.id
+            )
+        );
+    }
+}
