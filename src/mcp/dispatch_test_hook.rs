@@ -45,6 +45,33 @@ pub fn handle_request_for_test(
     db_path: &Path,
     request: &Value,
 ) -> Value {
+    dispatch_for_test(conn, db_path, request, None)
+}
+
+/// #8907 — [`handle_request_for_test`] with a caller-supplied embedder, so a
+/// test can drive the MCP write paths (`memory_update`, `memory_store`
+/// dedup) through an armed `test_hold_hook` embedder and assert the stored
+/// vector after a failed or successful re-embed.
+///
+/// # Panics
+/// Same fixture-error panics as [`handle_request_for_test`].
+#[doc(hidden)]
+#[must_use]
+pub fn handle_request_with_embedder_for_test(
+    conn: &rusqlite::Connection,
+    db_path: &Path,
+    request: &Value,
+    embedder: &dyn crate::embeddings::Embed,
+) -> Value {
+    dispatch_for_test(conn, db_path, request, Some(embedder))
+}
+
+fn dispatch_for_test(
+    conn: &rusqlite::Connection,
+    db_path: &Path,
+    request: &Value,
+    embedder: Option<&dyn crate::embeddings::Embed>,
+) -> Value {
     let req: RpcRequest =
         serde_json::from_value(request.clone()).expect("well-formed JSON-RPC request");
     let tier_config = crate::config::FeatureTier::Keyword.config();
@@ -56,7 +83,7 @@ pub fn handle_request_for_test(
         conn,
         db_path,
         &req,
-        None,
+        embedder,
         None,
         None,
         &tier_config,

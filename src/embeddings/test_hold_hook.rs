@@ -28,7 +28,14 @@ struct Hold {
     marker: String,
     hold: Duration,
     entered: Option<Sender<()>>,
+    /// #8907 — when set, a marked embed FAILS (after any hold) instead of
+    /// returning vectors: the provider-error stand-in.
+    fail: bool,
 }
+
+/// #8907 — the error text a [`arm_fail`]-armed embed returns for a marked
+/// input, so a test can assert the exact degraded reason.
+pub const ARMED_FAILURE: &str = "test hold hook: armed embed failure";
 
 static HOLDS: LazyLock<Mutex<Vec<Hold>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 
@@ -45,8 +52,25 @@ pub fn arm(model: &str, marker: &str, hold: Duration) -> Receiver<()> {
         marker: marker.to_string(),
         hold,
         entered: Some(tx),
+        fail: false,
     });
     rx
+}
+
+/// #8907 — arm `model` so every embed whose input carries `marker` FAILS
+/// with [`ARMED_FAILURE`] (no hold, no network); unmarked inputs get the
+/// usual deterministic vectors. Re-arming a model replaces its previous
+/// hold.
+pub fn arm_fail(model: &str, marker: &str) {
+    let mut holds = HOLDS.lock().unwrap_or_else(PoisonError::into_inner);
+    holds.retain(|h| h.model != model);
+    holds.push(Hold {
+        model: model.to_string(),
+        marker: marker.to_string(),
+        hold: Duration::ZERO,
+        entered: None,
+        fail: true,
+    });
 }
 
 /// Remove the hold for `model` (idempotent).
@@ -99,13 +123,13 @@ pub(super) fn intercept(
     dim: usize,
     texts: &[&str],
 ) -> Option<anyhow::Result<Vec<Vec<f32>>>> {
-    let (hold, entered) = {
+    let (hold, entered, fail) = {
         let mut holds = HOLDS.lock().unwrap_or_else(PoisonError::into_inner);
         let h = holds.iter_mut().find(|h| h.model == model)?;
         if texts.iter().any(|t| t.contains(h.marker.as_str())) {
-            (Some(h.hold), h.entered.take())
+            (Some(h.hold), h.entered.take(), h.fail)
         } else {
-            (None, None)
+            (None, None, false)
         }
     };
     if let Some(hold) = hold {
@@ -115,6 +139,9 @@ pub(super) fn intercept(
             let _ = tx.send(());
         }
         std::thread::sleep(hold);
+    }
+    if fail {
+        return Some(Err(anyhow::anyhow!(ARMED_FAILURE)));
     }
     Some(Ok(texts.iter().map(|t| vector_for(t, dim)).collect()))
 }
