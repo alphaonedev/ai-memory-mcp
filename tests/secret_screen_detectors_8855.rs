@@ -550,3 +550,84 @@ fn cli_store_refuses_each_form_with_exact_reason_8855() {
         }
     }
 }
+
+// ── r3 host probes P1 (leading `&` after `:`) and P2 (backtick in value) ──
+
+/// Assert that each `(input, expected redaction)` pair trips exactly `kind`
+/// and that the redacted copy is exactly the expected string (no byte of
+/// the value survives).
+fn assert_redacts_exactly(kind: &'static str, rows: &[(String, String)]) {
+    for (input, expected) in rows {
+        assert_eq!(
+            kinds_of(input),
+            vec![kind],
+            "8855: {input:?} must trip {kind}"
+        );
+        assert_eq!(
+            &redacted_of(input),
+            expected,
+            "8855: redaction of {input:?}"
+        );
+    }
+}
+
+/// P1: a leading `&` after `:` is a type annotation only when a named type
+/// follows (after an optional `'lifetime ` and `mut `); anything else is a
+/// value and refuses, and a YAML anchor masks the anchored value too.
+#[test]
+fn ampersand_value_after_colon_refuses_8855() {
+    let ph = REDACTION_PLACEHOLDER;
+    assert_redacts_exactly(
+        KIND_PASSWORD,
+        &[
+            ("password: &S3cr3tValue99".into(), format!("password: {ph}")),
+            (
+                "password: &hunter2hunter2 ".into(),
+                format!("password: {ph} "),
+            ),
+            (
+                "PASSWORD: &'static-looking-secret".into(),
+                format!("PASSWORD: {ph}"),
+            ),
+            (
+                "password: &anchor Wq7sV2nB9x\nuser: bob".into(),
+                format!("password: {ph}\nuser: bob"),
+            ),
+            (
+                "db_password: &'a mut Hn4rXp7Qs2".into(),
+                format!("db_password: {ph}"),
+            ),
+        ],
+    );
+}
+
+negative_cell!(
+    neg_reference_type_annotation_forms_8855,
+    "fn f(password: &mut String, pwd: &'static str, passwd: &Option<Secret>) {}"
+);
+
+/// P2: a backtick inside an unquoted value (or a URL password) is part of
+/// the value; the whole value is masked, never only the part before it.
+#[test]
+fn backtick_inside_value_is_masked_whole_8855() {
+    let ph = REDACTION_PLACEHOLDER;
+    assert_redacts_exactly(
+        KIND_PASSWORD,
+        &[
+            ("password=abc`def123456".into(), format!("password={ph}")),
+            ("password: abc`def123456".into(), format!("password: {ph}")),
+        ],
+    );
+    assert_redacts_exactly(
+        KIND_URL,
+        &[(
+            "postgres://svc:ab`cd1234@db.internal/x".into(),
+            format!("postgres://svc:{ph}@db.internal/x"),
+        )],
+    );
+}
+
+negative_cell!(
+    neg_prose_mention_backtick_empty_value_8855,
+    "Set `password=` and `pwd:` in the file; see `redis://host:6379`."
+);
