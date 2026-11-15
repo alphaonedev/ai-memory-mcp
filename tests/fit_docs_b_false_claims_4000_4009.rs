@@ -75,3 +75,88 @@ fn tls_verbs_are_not_deferred_to_v1_0_1_4006() {
     }
     assert_absent("src/daemon_runtime.rs", "flags = plain HTTP", ISSUE);
 }
+
+/// The two operator references the #9017 cells scan for false default claims.
+const DEFAULT_CLAIM_DOCS: [&str; 2] = ["docs/SECURITY.md", "docs/CLI_REFERENCE.md"];
+
+/// Forms of the false "authenticated / encrypted / hot-reloaded by default"
+/// claim (#9017). Lowercased; each is scanned over both references after
+/// whitespace flattening, so a re-wrap cannot hide one.
+const FALSE_DEFAULT_CLAIM_FORMS: [&str; 7] = [
+    "authentication is on by default",
+    "trusts no one by default",
+    "api key + mtls gate inbound",
+    "is refused on every host",
+    "falls back to plain http",
+    "without a restart",
+    "a peer without an authorised cert can't even open a tcp connection",
+];
+
+/// Sentences `docs/SECURITY.md` must carry for the real default (#9017).
+const SECURITY_MD_DEFAULT_SENTENCES: [&str; 12] = [
+    "`resolve_tls_material` in `bootstrap_serve` (then `tls_bind_guard`)",
+    "with neither flag a singleton serves the local-CA material it generates and renews, or \
+     operator material installed by `ai-memory tls import`",
+    "then restart `serve` (#4006): operator material is read once at boot",
+    "Only the local-CA material of a singleton is renewed by the daemon itself",
+    "`serve` binds `127.0.0.1` by default and demands an API key only when top-level `api_key` \
+     is set in `config.toml`; nothing sets one by default.",
+    "a keyless bind to a loopback address serves, and the boot logs these two WARN lines (verbatim):",
+    "a keyless bind to a non-loopback address is refused at boot",
+    "with `AI_MEMORY_REQUIRE_API_KEY=1` a keyless bind is refused on every address, loopback \
+     included",
+    "client certificates apply only when `--mtls-allowlist` is passed",
+    "on the default configuration an unauthenticated local client can read and write.",
+    "Without it, `/api/v1/sync/*` accepts any client that completes TLS and passes the API-key \
+     check (none when `api_key` is unset)",
+    "When `api_key` is set, every HTTP endpoint except `/api/v1/health` enforces the key",
+];
+
+/// Sentences `docs/CLI_REFERENCE.md` `serve` must carry (#9017).
+const CLI_REFERENCE_DEFAULT_SENTENCES: [&str; 5] = [
+    "Without `api_key` the daemon authenticates no HTTP request: a keyless loopback bind serves \
+     and logs a WARN, a keyless non-loopback bind is refused at boot (exit 75), and \
+     `AI_MEMORY_REQUIRE_API_KEY=1` refuses a keyless bind on every address.",
+    "On a declared non-singleton shape (`[deployment] shape` = team / production / federated / \
+     hive, per #3700)",
+    "the TLS handshake fails for a client without an allowlisted certificate; the gate is the \
+     handshake, not TCP accept",
+    "a non-loopback bind also needs top-level `api_key` in `config.toml` (without it `serve` \
+     exits 75)",
+    "--peers https://peer-a:9077,https://peer-b:9077",
+];
+
+/// #9017 — `docs/SECURITY.md` and `docs/CLI_REFERENCE.md` state the real
+/// `serve` default: loopback, no API key unless `api_key` is set, keyless
+/// loopback serves with a WARN, keyless non-loopback exits 75, mTLS only with
+/// `--mtls-allowlist`, operator TLS material needs a restart.
+#[test]
+fn security_and_cli_reference_state_the_real_default_9017() {
+    const ISSUE: &str = "#9017";
+    for sentence in SECURITY_MD_DEFAULT_SENTENCES {
+        assert_present("docs/SECURITY.md", sentence, ISSUE);
+    }
+    for sentence in CLI_REFERENCE_DEFAULT_SENTENCES {
+        assert_present("docs/CLI_REFERENCE.md", sentence, ISSUE);
+    }
+    assert_absent(
+        "docs/SECURITY.md",
+        "a bind without `--tls-cert` + `--tls-key` is REFUSED on every host",
+        ISSUE,
+    );
+    assert_absent(
+        "docs/CLI_REFERENCE.md",
+        "On a FLEET-shaped deployment (production / federated / hive",
+        ISSUE,
+    );
+    assert_absent("docs/CLI_REFERENCE.md", "Axum-based HTTP daemon", ISSUE);
+    for rel in DEFAULT_CLAIM_DOCS {
+        let lowered = flat_text(rel).to_lowercase();
+        for form in FALSE_DEFAULT_CLAIM_FORMS {
+            assert!(
+                !lowered.contains(form),
+                "{ISSUE}: {rel} carries the false default claim form {form:?}"
+            );
+        }
+    }
+}
