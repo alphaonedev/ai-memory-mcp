@@ -1419,6 +1419,13 @@ class OptionBRegion(LedgerCase):
         ok, out = s.judge(self.wire_and_doc(s, doc))
         # #9303: a second copy of the inherited line is a region edit; it never passes.
         self.assert_region_refused(ok, out, region_first_diff(s.doc, doc))
+        # With the region identical, a second copy below the marker still finds the one
+        # excuse used up and is refused by the looser detector at its own line.
+        doc = on_release(s.doc, self.exact()) + "\n" + RELEASE_LOOSE[1] + "\n"
+        ok, out = s.judge(self.wire_and_doc(s, doc))
+        self.assertFalse(ok, out)
+        self.assertEqual(out.split("\n")[0],
+                         banner_line(LOOSE_BINDS, nth_line_no(doc, RELEASE_LOOSE[1], 2)), out)
 
     def test_r1_d5_strict_duplicate_base_refused(self):
         base = release_shaped() + "\n" + status_line("VOID") + "\n"
