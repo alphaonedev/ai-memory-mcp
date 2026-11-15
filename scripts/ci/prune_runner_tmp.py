@@ -82,6 +82,28 @@ def resolve_tmpdir(raw, roots, environ):
     return real
 
 
+def print_runner_facts(raw, roots, out):
+    """Print one ``prune-facts:`` line (print only; no decision depends on it)."""
+    resolved = symlink = allowed = "unknown"
+    if raw:
+        norm = os.path.normpath(raw)
+        real = os.path.realpath(raw)
+        resolved = real
+        symlink = "yes" if norm != real else "no"
+        allowed = "none"
+        for root in roots:
+            if Path(os.path.realpath(root)) in Path(real).parents:
+                allowed = root
+                break
+    version = sys.version.splitlines()[0]
+    print(
+        f"prune-facts: tmpdir={raw} resolved={resolved} symlink={symlink} "
+        f"allowed_root={allowed} python={version} executable={sys.executable}",
+        file=out,
+    )
+    out.flush()
+
+
 def tree_bytes(dir_fd, name):
     """Allocated bytes under ``name`` (fd based, no symlink followed)."""
     total = 0
@@ -155,6 +177,7 @@ def main(argv=None, environ=None, out=None, err=None):
     parser.add_argument("--root", action="append", default=[], help="extra allowed root (repeatable)")
     parser.add_argument("--dry-run", action="store_true", help="print what would go, delete nothing")
     args = parser.parse_args(argv)
+    print_runner_facts(environ.get("TMPDIR"), (*ALLOWED_ROOTS, *args.root), out)
     try:
         if not shutil.rmtree.avoids_symlink_attacks:
             raise Refusal("shutil.rmtree cannot avoid symlink attacks on this platform")

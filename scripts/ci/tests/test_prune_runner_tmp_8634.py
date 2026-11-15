@@ -113,7 +113,8 @@ class Base(unittest.TestCase):
         environ.update(env_extra or {})
         out, err = io.StringIO(), io.StringIO()
         rc = PRUNE.main(["--root", str(self.base), *extra], environ=environ, out=out, err=err)
-        return rc, out.getvalue(), err.getvalue()
+        kept = [ln for ln in out.getvalue().splitlines(keepends=True) if not ln.startswith("prune-facts:")]
+        return rc, "".join(kept), err.getvalue()
 
     def names(self, top=None):
         return sorted(p.name for p in (top or self.runner).iterdir())
@@ -278,7 +279,7 @@ class Refusals(Base):
         environ.update(env_extra or {})
         rc = PRUNE.main(["--root", root or str(self.base)], environ=environ, out=out, err=err)
         self.assertEqual(rc, EXIT_REFUSED, err.getvalue())
-        self.assertEqual(out.getvalue(), "")
+        self.assertEqual([ln for ln in out.getvalue().splitlines() if not ln.startswith("prune-facts:")], [])
         self.assertEqual(err.getvalue().strip(), f"prune_runner_tmp: refused: {reason}")
         if victim is not None:
             self.assertTrue(victim.exists(), "a refusal must delete nothing")
