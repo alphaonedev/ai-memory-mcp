@@ -1119,9 +1119,10 @@ class Cells(CorpusBase):
         wire = s.edit(MOD_RS, "// mutate again\n", "wire change", append=True)
         s.fx.banner("VOID", wire, extra=self.ledger_6124((self.DAY_6124, [MOD_RS])))
         head = s.fx.commit([CERT_DOC], "rebind while VOID")
+        # #9303: the Binds-to line is in the frozen pre-marker region, so the rebind is
+        # refused first for the frozen-region reason (it was refused as a rebind before).
         self.t.expect_red("6124d", "Binds-to changed while STATUS stays VOID", s.repo, void, head, [
-            (f"Binds-to changed ({s.genesis} → {wire}) while STATUS stays VOID",
-             "did not refuse the rebind (#6774 option B narrowed)")])
+            (self.REGION_6124, "did not refuse the rebind (#6774 option B narrowed)")])
         self.settle()
 
     @expect(GREEN)
