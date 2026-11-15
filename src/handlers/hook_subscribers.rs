@@ -1520,6 +1520,23 @@ pub async fn session_start(
         )
             .into_response();
     }
+    // #8947 — a body-only `agent_id` becomes the visibility caller when no
+    // header is sent, and `enforce_idor_identity` above reads only the header.
+    // Hold the body principal to the same proof as a header principal:
+    // refuse it (403 `attested_identity_required`) unless the presented key
+    // is bound to that agent. decision: refuse over ignore because the
+    // header leg already refuses and the caller learns its request was wrong.
+    if let Some(b) = body.agent_id.as_deref()
+        && let Some(resp) = crate::handlers::identity_binding::enforce_for_request(
+            &app.enrolled_agent_keys,
+            app.http_identity_mode,
+            &headers,
+            b,
+            "session_start",
+        )
+    {
+        return resp;
+    }
     let caller = header_agent_id
         .map(str::to_string)
         .or_else(|| body.agent_id.clone())
