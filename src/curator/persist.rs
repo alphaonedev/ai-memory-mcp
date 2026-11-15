@@ -48,19 +48,25 @@ fn metadata_object_mut<'a>(
     })
 }
 
-pub(super) fn persist_auto_tags(conn: &Connection, mem: &Memory, tags: &[String]) -> Result<()> {
-    let mut updated = mem.metadata.clone();
-    {
-        let obj = metadata_object_mut(&mut updated, &mem.id, "auto_tags")?;
-        obj.insert("auto_tags".to_string(), serde_json::json!(tags));
-        obj.insert(
-            "curated_at".to_string(),
-            serde_json::json!(chrono::Utc::now().to_rfc3339()),
-        );
-    }
+/// #4287 — the metadata a curator write-back starts from: the row's CURRENT
+/// metadata, read inside the caller's write transaction. The sweep's `mem`
+/// snapshot can be minutes old (an LLM call sits between the read and the
+/// write), so merging into `mem.metadata` and writing the whole object back
+/// replaced every key another writer had committed since — a lost update.
+/// A row that vanished meanwhile is refused, never reported as written.
+fn current_metadata(conn: &Connection, mem_id: &str, what: &str) -> Result<serde_json::Value> {
+    db::get(conn, mem_id)?.map(|m| m.metadata).ok_or_else(|| {
+        anyhow::anyhow!("refusing to write {what} for memory {mem_id}: the row no longer exists")
+    })
+}
+
+/// #4287 — write `metadata` back as the row's whole metadata object. Runs
+/// inside the caller's [`db::in_write_txn`], so nothing lands between the
+/// read in [`current_metadata`] and this UPDATE.
+fn write_metadata(conn: &Connection, mem_id: &str, metadata: &serde_json::Value) -> Result<()> {
     db::update(
         conn,
-        &mem.id,
+        mem_id,
         None,
         None,
         None,
@@ -69,9 +75,24 @@ pub(super) fn persist_auto_tags(conn: &Connection, mem: &Memory, tags: &[String]
         None,
         None,
         None,
-        Some(&updated),
+        Some(metadata),
     )?;
     Ok(())
+}
+
+pub(super) fn persist_auto_tags(conn: &Connection, mem: &Memory, tags: &[String]) -> Result<()> {
+    db::in_write_txn(conn, || {
+        let mut updated = current_metadata(conn, &mem.id, "auto_tags")?;
+        {
+            let obj = metadata_object_mut(&mut updated, &mem.id, "auto_tags")?;
+            obj.insert("auto_tags".to_string(), serde_json::json!(tags));
+            obj.insert(
+                "curated_at".to_string(),
+                serde_json::json!(chrono::Utc::now().to_rfc3339()),
+            );
+        }
+        write_metadata(conn, &mem.id, &updated)
+    })
 }
 
 pub(super) fn persist_contradiction(
@@ -79,39 +100,131 @@ pub(super) fn persist_contradiction(
     mem: &Memory,
     against_id: &str,
 ) -> Result<()> {
-    let mut updated = mem.metadata.clone();
-    {
-        let obj =
-            metadata_object_mut(&mut updated, &mem.id, field_names::CONFIRMED_CONTRADICTIONS)?;
-        let existing = obj
-            .get(field_names::CONFIRMED_CONTRADICTIONS)
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
-        let mut ids: Vec<String> = existing
-            .into_iter()
-            .filter_map(|v| v.as_str().map(String::from))
-            .collect();
-        if !ids.iter().any(|id| id == against_id) {
-            ids.push(against_id.to_string());
+    let what = field_names::CONFIRMED_CONTRADICTIONS;
+    db::in_write_txn(conn, || {
+        let mut updated = current_metadata(conn, &mem.id, what)?;
+        {
+            let obj = metadata_object_mut(&mut updated, &mem.id, what)?;
+            let existing = obj
+                .get(what)
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let mut ids: Vec<String> = existing
+                .into_iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect();
+            if !ids.iter().any(|id| id == against_id) {
+                ids.push(against_id.to_string());
+            }
+            obj.insert(what.to_string(), serde_json::json!(ids));
         }
-        obj.insert(
-            field_names::CONFIRMED_CONTRADICTIONS.to_string(),
-            serde_json::json!(ids),
+        write_metadata(conn, &mem.id, &updated)
+    })
+}
+
+#[cfg(test)]
+mod lost_update_4287_tests {
+    use super::*;
+
+    fn seeded(conn: &Connection) -> Memory {
+        let now = chrono::Utc::now().to_rfc3339();
+        let mem = Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: crate::models::Tier::Long,
+            namespace: "curate-4287".to_string(),
+            title: "anchor-4287".to_string(),
+            content: "a".repeat(120),
+            priority: 5,
+            confidence: 1.0,
+            source: "api".to_string(),
+            created_at: now.clone(),
+            updated_at: now,
+            metadata: serde_json::json!({"note": "v0"}),
+            version: 1,
+            ..Memory::default()
+        };
+        db::insert(conn, &mem).expect("seed");
+        mem
+    }
+
+    /// Another writer commits `note = v1` after the sweep read the row.
+    fn concurrent_note_write(conn: &Connection, id: &str) {
+        let mut meta = db::get(conn, id).expect("get").expect("row").metadata;
+        meta["note"] = serde_json::json!("v1");
+        db::update(
+            conn,
+            id,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&meta),
+        )
+        .expect("concurrent write");
+    }
+
+    fn metadata(conn: &Connection, id: &str) -> serde_json::Value {
+        db::get(conn, id).expect("get").expect("row").metadata
+    }
+
+    #[test]
+    fn persist_4287_auto_tags_keeps_a_concurrent_metadata_write() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let conn = db::open(&dir.path().join("c.db")).expect("open");
+        let stale = seeded(&conn);
+        concurrent_note_write(&conn, &stale.id);
+        persist_auto_tags(&conn, &stale, &["alpha".to_string()]).expect("persist");
+        let meta = metadata(&conn, &stale.id);
+        assert_eq!(meta["note"], serde_json::json!("v1"), "lost update: {meta}");
+        assert_eq!(meta["auto_tags"], serde_json::json!(["alpha"]), "{meta}");
+    }
+
+    #[test]
+    fn persist_4287_contradiction_keeps_every_id_from_stale_snapshots() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let conn = db::open(&dir.path().join("c.db")).expect("open");
+        let stale = seeded(&conn);
+        concurrent_note_write(&conn, &stale.id);
+        // Both calls carry the SAME stale snapshot, as two sweep passes do.
+        persist_contradiction(&conn, &stale, "id-1").expect("first");
+        persist_contradiction(&conn, &stale, "id-2").expect("second");
+        persist_contradiction(&conn, &stale, "id-1").expect("dup");
+        let meta = metadata(&conn, &stale.id);
+        assert_eq!(meta["note"], serde_json::json!("v1"), "lost update: {meta}");
+        assert_eq!(
+            meta[field_names::CONFIRMED_CONTRADICTIONS],
+            serde_json::json!(["id-1", "id-2"]),
+            "{meta}"
         );
     }
-    db::update(
-        conn,
-        &mem.id,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        Some(&updated),
-    )?;
-    Ok(())
+
+    #[test]
+    fn persist_4287_vanished_row_is_refused_not_reported_written() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let conn = db::open(&dir.path().join("c.db")).expect("open");
+        let stale = seeded(&conn);
+        assert!(db::delete(&conn, &stale.id).expect("delete"));
+        let err = persist_auto_tags(&conn, &stale, &[]).expect_err("vanished row");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "refusing to write auto_tags for memory {}: the row no longer exists",
+                stale.id
+            )
+        );
+        let err = persist_contradiction(&conn, &stale, "x").expect_err("vanished row");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "refusing to write {} for memory {}: the row no longer exists",
+                field_names::CONFIRMED_CONTRADICTIONS,
+                stale.id
+            )
+        );
+    }
 }

@@ -1934,7 +1934,11 @@ pub async fn run(
             let mut so = stdout.lock();
             let mut se = stderr.lock();
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
-            cli::sync::run(&db_path, &a, j, cli_agent_id.as_deref(), &mut out)
+            // #8912 — non-zero when the destination refused a row.
+            match cli::sync::run(&db_path, &a, j, cli_agent_id.as_deref(), &mut out)? {
+                0 => Ok(()),
+                code => std::process::exit(code),
+            }
         }
         Command::SyncDaemon(a) => cli::sync::run_daemon(&db_path, a, cli_agent_id.as_deref()).await,
         Command::AutoConsolidate(a) => {
