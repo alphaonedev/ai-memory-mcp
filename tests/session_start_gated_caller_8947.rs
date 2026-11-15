@@ -258,13 +258,33 @@ fn assert_no_b_private(raw: &str, ctx: &str) {
 /// spellings the handler accepts (exact, case variant, the caller's own id)
 /// and the ones its validator refuses (surrounding whitespace).
 async fn cell_a8947_body_leg_shared_key(router: &axum::Router) {
-    // (body agent_id, expected status, expected error code or text fragment)
-    let table: [(&str, StatusCode, &str); 5] = [
-        (AGENT_B, StatusCode::FORBIDDEN, ERR_ATTESTED_REQUIRED),
-        (AGENT_B_UPPER, StatusCode::FORBIDDEN, ERR_ATTESTED_REQUIRED),
-        (AGENT_A, StatusCode::FORBIDDEN, ERR_ATTESTED_REQUIRED),
-        (" agent-b-8947", StatusCode::BAD_REQUEST, "agent_id"),
-        ("agent-b-8947 ", StatusCode::BAD_REQUEST, "agent_id"),
+    // (body agent_id, expected status, exact expected `error`)
+    let table: [(&str, StatusCode, String); 5] = [
+        (
+            AGENT_B,
+            StatusCode::FORBIDDEN,
+            ERR_ATTESTED_REQUIRED.to_string(),
+        ),
+        (
+            AGENT_B_UPPER,
+            StatusCode::FORBIDDEN,
+            ERR_ATTESTED_REQUIRED.to_string(),
+        ),
+        (
+            AGENT_A,
+            StatusCode::FORBIDDEN,
+            ERR_ATTESTED_REQUIRED.to_string(),
+        ),
+        (
+            " agent-b-8947",
+            StatusCode::BAD_REQUEST,
+            invalid_agent_id_text(" agent-b-8947"),
+        ),
+        (
+            "agent-b-8947 ",
+            StatusCode::BAD_REQUEST,
+            invalid_agent_id_text("agent-b-8947 "),
+        ),
     ];
     for (spelling, want_status, want_err) in table {
         let (status, parsed, raw) = call(router, SHARED_KEY, None, Some(spelling)).await;
@@ -273,10 +293,10 @@ async fn cell_a8947_body_leg_shared_key(router: &axum::Router) {
             status, want_status,
             "a8947 shared-key body={spelling:?}: status; body={raw}"
         );
-        let err = parsed["error"].as_str().unwrap_or_default();
-        assert!(
-            err.contains(want_err),
-            "a8947 shared-key body={spelling:?}: want error containing {want_err:?}, got {raw}"
+        assert_eq!(
+            parsed["error"].as_str(),
+            Some(want_err.as_str()),
+            "a8947 shared-key body={spelling:?}: exact error; body={raw}"
         );
     }
 }
@@ -413,7 +433,7 @@ async fn run_rows(router: &axum::Router, label: &str, rows: &[Row]) {
         let (status, parsed, raw) = call(router, r.key, r.header, r.body).await;
         let err = parsed["error"].as_str();
         let err_ok = match r.err {
-            Some(want) => err.unwrap_or_default().contains(want),
+            Some(want) => err == Some(want),
             None => parsed["error"].is_null(),
         };
         let sees_a = raw.contains(MARKER_A_PRIVATE);
@@ -526,9 +546,14 @@ async fn call_raw(
 /// Wire `code` of the authority chokepoint's malformed-header refusal
 /// (`src/handlers/authority.rs`, `#3549`).
 const CODE_VALIDATION_FAILED: &str = "VALIDATION_FAILED";
-/// Leading text of that refusal for a whitespace `X-Agent-Id` (the rest names
-/// the offending character).
-const ERR_INVALID_AGENT_ID_PREFIX: &str = "invalid agent_id: agent_id contains invalid character";
+/// The exact `error` text an invalid agent id `id` is refused with, built from
+/// the crate's own SSOT (`errors::msg::invalid` over `validate_agent_id`), so a
+/// different refusal that merely mentions `agent_id` fails the cell (#9359).
+fn invalid_agent_id_text(id: &str) -> String {
+    let refusal = ai_memory::validate::validate_agent_id(id)
+        .expect_err("the corpus id must be one the validator refuses");
+    ai_memory::errors::msg::invalid("agent_id", refusal)
+}
 
 /// The expected error of one `e8947` cell.
 #[derive(Clone, Copy)]
@@ -538,8 +563,8 @@ enum BlankErr {
     /// `error` equals this text exactly.
     Exact(&'static str),
     /// The authority chokepoint's malformed-header 400: `code` is
-    /// [`CODE_VALIDATION_FAILED`] and `error` starts with
-    /// [`ERR_INVALID_AGENT_ID_PREFIX`].
+    /// [`CODE_VALIDATION_FAILED`] and `error` equals
+    /// [`invalid_agent_id_text`] of the header value.
     MalformedHeader,
 }
 
@@ -619,7 +644,7 @@ async fn cell_e8947_blank_header_matrix(router: &axum::Router, mode: HttpIdentit
                     BlankErr::Exact(text) => err == Some(text),
                     BlankErr::MalformedHeader => {
                         parsed["code"].as_str() == Some(CODE_VALIDATION_FAILED)
-                            && err.is_some_and(|e| e.starts_with(ERR_INVALID_AGENT_ID_PREFIX))
+                            && err == header.map(invalid_agent_id_text).as_deref()
                     }
                 };
                 let seen: Vec<&str> = ALL_PRIVATE
