@@ -1275,7 +1275,7 @@
         "src/secret_screen.rs:404 (set_screen_mode)",
         "src/config.rs:2937 (ENV_SECRET_SCREEN_MODE)"
       ],
-      "factual_description": "Pre-write credential screen for caller-origin writes. Default refuse rejects a write whose content matches a credential detector (PEM private keys, AKIA\u2026, ghp_/github_pat_, sk-/xai- keys, Bearer, JWTs \u2014 Shannon-entropy tiebreak so benign UUID/hex/base64 pass). Federation-receive / L2-recovery / internal re-store paths ALWAYS degrade refuse \u2192 redact (a refused inbound row would diverge replicas). Same screen masks forensic-bundle egress.",
+      "factual_description": "Pre-write credential screen for caller-origin writes. Default refuse rejects a write whose content matches a credential detector (PEM private keys, AKIA\u2026, ghp_/github_pat_, sk-/xai- keys, Bearer, JWTs, database/broker URL userinfo passwords, password/passwd/pwd assignments, Slack xox?- tokens, Stripe sk_live_/rk_live_ keys \u2014 Shannon-entropy tiebreak so benign UUID/hex/base64 pass). Federation-receive / L2-recovery / internal re-store paths ALWAYS degrade refuse \u2192 redact (a refused inbound row would diverge replicas). Same screen masks forensic-bundle egress.",
       "verified_in_v0_7_0": false,
       "verified_in_v1_0_0": true,
       "issue_references": [

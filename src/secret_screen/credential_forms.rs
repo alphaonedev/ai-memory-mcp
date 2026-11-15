@@ -218,6 +218,135 @@ fn skip_blanks(bytes: &[u8], mut at: usize) -> usize {
     at
 }
 
+/// Base type names (before any `<` / `[`) that mark an unquoted value after
+/// `:` as a type annotation (`password: String`), not a credential.
+const ANNOTATION_TYPE_NAMES: [&str; 16] = [
+    "String",
+    "str",
+    "string",
+    "Option",
+    "Secret",
+    "SecretString",
+    "SecretBox",
+    "Zeroizing",
+    "Vec",
+    "Box",
+    "Cow",
+    "Arc",
+    "bool",
+    "bytes",
+    "Bytes",
+    "number",
+];
+/// Rust reference-type sigil: `password: &str`, `password: &'a str`.
+const REFERENCE_TYPE_SIGIL: u8 = b'&';
+/// Prefixes of an unquoted value that reads the secret from the environment
+/// at run time instead of holding it.
+const ENV_LOOKUP_PREFIXES: [&str; 11] = [
+    "os.environ",
+    "os.getenv(",
+    "getenv(",
+    "env::var(",
+    "std::env::var(",
+    "process.env.",
+    "ENV[",
+    "ENV.fetch(",
+    "System.getenv(",
+    "Environment.GetEnvironmentVariable(",
+    "$ENV{",
+];
+/// Unquoted null literals: an absent value, not a credential.
+const NULL_LITERALS: [&str; 5] = ["null", "None", "nil", "undefined", "NULL"];
+/// Documentation ellipses standing in for an elided value.
+const ELLIPSIS_PLACEHOLDERS: [&str; 2] = ["…", "..."];
+
+/// A format-string hole: `{}` or `{IDENT}` (`password: {msg}`).
+fn is_format_hole(v: &str) -> bool {
+    v.strip_prefix('{')
+        .and_then(|rest| rest.strip_suffix('}'))
+        .is_some_and(|name| name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_'))
+}
+
+/// True when an unquoted value after `:` is a type annotation shape.
+fn is_type_annotation(v: &str) -> bool {
+    if v.as_bytes().first() == Some(&REFERENCE_TYPE_SIGIL) {
+        return true;
+    }
+    let base = v.split(['<', '[']).next().unwrap_or(v);
+    ANNOTATION_TYPE_NAMES.contains(&base)
+}
+
+/// Named non-credential shapes of an UNQUOTED assignment value. A quoted
+/// value is a literal and only [`is_placeholder_value`] applies to it.
+fn is_non_credential_unquoted(v: &str) -> bool {
+    NULL_LITERALS.contains(&v)
+        || ELLIPSIS_PLACEHOLDERS.contains(&v)
+        || is_format_hole(v)
+        || ENV_LOOKUP_PREFIXES.iter().any(|p| v.starts_with(p))
+}
+
+/// An assignment operator at `j`: `:` / `=`, plus the two-byte `:=` and
+/// `=>`. Returns the operator length, or `None` for a comparison (`==`)
+/// or any other byte.
+fn assignment_operator_len(bytes: &[u8], j: usize) -> Option<usize> {
+    match (bytes.get(j), bytes.get(j + 1)) {
+        (Some(b'='), Some(b'=')) => None,
+        (Some(b':'), Some(b'=')) | (Some(b'='), Some(b'>')) => Some(2),
+        (Some(b':' | b'='), _) => Some(1),
+        _ => None,
+    }
+}
+
+/// The value that starts at `j` (after blanks): `(start, end, quoted)`.
+/// Unquoted values stop at whitespace, `,` `;` `&`, a quote or a backtick
+/// (a markdown code span closing around `password=`). After a `:`
+/// (`after_colon`) a leading [`REFERENCE_TYPE_SIGIL`] belongs to the value
+/// (`password: &str`); after `=` it stays a query-string separator.
+fn value_at(bytes: &[u8], j: usize, after_colon: bool) -> (usize, usize, bool) {
+    let j = skip_blanks(bytes, j);
+    let quote = match bytes.get(j) {
+        Some(&q @ (b'"' | b'\'')) => Some(q),
+        _ => None,
+    };
+    let start = if quote.is_some() { j + 1 } else { j };
+    let mut end = start;
+    if after_colon && quote.is_none() && bytes.get(start) == Some(&REFERENCE_TYPE_SIGIL) {
+        end += 1;
+    }
+    while end < bytes.len() {
+        let c = bytes[end];
+        let stop = match quote {
+            Some(q) => c == q || c == b'\n',
+            None => {
+                c.is_ascii_whitespace() || matches!(c, b',' | b';' | b'&' | b'"' | b'\'' | b'`')
+            }
+        };
+        if stop {
+            break;
+        }
+        end += 1;
+    }
+    (start, end, quote.is_some())
+}
+
+/// After a type annotation ending at `from`, the `=` of an initializer on
+/// the same declaration (`password: &'static str = "x"`), if any. The walk
+/// stops at a line end, `;` `,` `)` `{` `}`, so it never leaves the
+/// declaration, and the caller resumes past it (no byte is walked twice).
+fn initializer_after(bytes: &[u8], from: usize) -> (Option<usize>, usize) {
+    let mut k = from;
+    while k < bytes.len() && !matches!(bytes[k], b'\n' | b';' | b',' | b')' | b'{' | b'}') {
+        if bytes[k] == b'=' {
+            return match assignment_operator_len(bytes, k) {
+                Some(len) => (Some(k + len), k + len),
+                None => (None, k + 2),
+            };
+        }
+        k += 1;
+    }
+    (None, k)
+}
+
 fn password_assignment_spans(content: &str) -> Vec<(usize, usize)> {
     let bytes = content.as_bytes();
     let mut spans = Vec::new();
@@ -228,49 +357,49 @@ fn password_assignment_spans(content: &str) -> Vec<(usize, usize)> {
             continue;
         };
         // Key as a word on its right side: an optional closing quote (JSON
-        // / YAML keys), optional blanks, then `:` or `=`. `passwords are`
-        // and `password_hash` fail here.
+        // / YAML keys) and subscript bracket (`config['password']`),
+        // optional blanks, then an assignment operator. `passwords are`,
+        // `password_hash` and `password == x` fail here.
         let mut j = i + key_len;
-        if j < bytes.len() && matches!(bytes[j], b'"' | b'\'') {
+        if matches!(bytes.get(j), Some(b'"' | b'\'')) {
+            j += 1;
+        }
+        if bytes.get(j) == Some(&b']') {
             j += 1;
         }
         j = skip_blanks(bytes, j);
-        if j >= bytes.len() || !matches!(bytes[j], b':' | b'=') {
-            i += key_len;
+        let Some(op_len) = assignment_operator_len(bytes, j) else {
+            i = j.max(i + key_len);
             continue;
-        }
-        // `password == x` is a comparison, not an assignment.
-        if bytes[j] == b'=' && bytes.get(j + 1) == Some(&b'=') {
-            i = j + 2;
-            continue;
-        }
-        j = skip_blanks(bytes, j + 1);
-        let quote = match bytes.get(j) {
-            Some(&q @ (b'"' | b'\'')) => {
-                j += 1;
-                Some(q)
-            }
-            _ => None,
         };
-        let value_start = j;
-        let mut value_end = j;
-        while value_end < bytes.len() {
-            let c = bytes[value_end];
-            let stop = match quote {
-                Some(q) => c == q || c == b'\n',
-                None => c.is_ascii_whitespace() || matches!(c, b',' | b';' | b'&' | b'"' | b'\''),
-            };
-            if stop {
-                break;
+        let is_colon = bytes[j] == b':' && op_len == 1;
+        let (mut start, mut end, mut quoted) = value_at(bytes, j + op_len, is_colon);
+        let mut resume = end;
+        // `password: String` is an annotation; an initializer after it
+        // (`password: String = "x"`) is the value that is screened.
+        if is_colon && !quoted && is_type_annotation(&content[start..end]) {
+            let (init, after) = initializer_after(bytes, end);
+            resume = after;
+            match init {
+                Some(at) => {
+                    (start, end, quoted) = value_at(bytes, at, false);
+                    resume = end;
+                }
+                None => {
+                    i = resume.max(i + key_len);
+                    continue;
+                }
             }
-            value_end += 1;
         }
-        let value = &content[value_start..value_end];
-        if !value.is_empty() && !is_placeholder_value(value) {
-            spans.push((value_start, value_end));
+        let value = &content[start..end];
+        let accepted = value.is_empty()
+            || is_placeholder_value(value)
+            || (!quoted && is_non_credential_unquoted(value));
+        if !accepted {
+            spans.push((start, end));
         }
         // Never re-scan the value: the cursor only moves forward.
-        i = value_end.max(i + key_len);
+        i = resume.max(i + key_len);
     }
     spans
 }

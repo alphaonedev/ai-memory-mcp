@@ -30,6 +30,14 @@
 //!   CRDT convergence or the capture-first guarantee). See
 //!   [`SecretScreenMode`].
 //!
+//! * **Credential forms without a vendor prefix (#8855).** The submodule
+//!   `credential_forms` adds four single-pass detectors run after the
+//!   prefix table: a URL userinfo password for database and broker schemes
+//!   (`postgres://user:pass@host`), a `password` / `passwd` / `pwd`
+//!   assignment (`:`, `=`, `:=`, `=>`), a Slack `xox[abprs]-` token and a
+//!   Stripe `sk_live_` / `rk_live_` key. Placeholders, type annotations,
+//!   environment lookups and comparisons are accepted by named shape only.
+//!
 //! The patterns are named consts (pm-v3.1: no scattered magic literals).
 //! This file is on the `check-vendor-literals.sh` allow-list because the
 //! detector table legitimately names vendor token prefixes (`xai-`, `sk-`,
