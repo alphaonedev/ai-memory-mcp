@@ -1625,10 +1625,7 @@ mod tests {
             let mut out = env.output();
             run_pending(&db, args, false, Some("test-agent"), &mut out)
         };
-        assert!(
-            res.is_ok(),
-            "a met signed quorum must approve on the CLI: {res:?}"
-        );
+        assert!(res.is_ok(), "a met signed quorum must approve on the CLI");
         assert!(
             env.stdout_str().contains("approved + executed"),
             "stdout must confirm approve+execute: {}",
@@ -2846,7 +2843,7 @@ mod tests {
         );
         assert!(
             !err.to_string().contains("alice"),
-            "the refusal must not name the incumbent: {err}"
+            "the refusal must not name the incumbent"
         );
         assert_eq!(
             rt.block_on(store.agent_id_for_api_key(&hash))

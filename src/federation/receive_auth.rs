@@ -2125,7 +2125,7 @@ mod tests {
                              unenrolled / whitespace-only peer must be REFUSED \
                              unconditionally — the rollout knob governs only an \
                              ENROLLED peer that declared no allowed_namespaces. \
-                             peer={peer:?} require={require} stored={stored:?}"
+                             require={require} stored={stored:?}"
                         );
                         // Same contract on the WRITE lane's shared entry point,
                         // so the two lanes cannot disagree about these shapes.
@@ -2140,7 +2140,7 @@ mod tests {
                                 require,
                             ),
                             "#2497: the write lane must refuse the same shapes \
-                             identically. peer={peer:?} require={require}"
+                             identically. require={require}"
                         );
                     }
                 }

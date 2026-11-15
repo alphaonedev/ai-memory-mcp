@@ -151,7 +151,7 @@ mod tests {
         assert!(msg.contains(CANONICAL_NAME_EMPTY), "got: {msg}");
         assert!(
             !msg.contains("title cannot be empty"),
-            "MCP validate_title prose leaked: {msg}"
+            "MCP validate_title prose"
         );
     }
 

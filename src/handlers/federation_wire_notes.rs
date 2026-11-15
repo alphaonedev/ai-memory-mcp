@@ -138,10 +138,10 @@ mod tests {
     fn wire_notes_carry_no_env_hint_and_remediations_do_3204() {
         assert_eq!(wire::ALL.len(), 13);
         for note in wire::ALL {
-            assert!(!note.contains(ENV_PREFIX), "wire note leaks a knob: {note}");
+            assert!(!note.contains(ENV_PREFIX), "wire note leaks a knob");
             assert!(
                 !note.contains("=0") && !note.contains("=1"),
-                "wire note leaks a toggle: {note}"
+                "wire note leaks a toggle"
             );
             assert!(!note.trim().is_empty());
         }

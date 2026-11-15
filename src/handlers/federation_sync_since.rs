@@ -602,7 +602,7 @@ mod refusal_hint_8290_tests {
         let text = SYNC_SINCE_NO_SCOPE_REFUSAL;
         assert!(
             !text.contains("opt out"),
-            "hint must not recommend the bypass: {text}"
+            "hint must not recommend the bypass"
         );
         assert!(
             text.contains("disables"),

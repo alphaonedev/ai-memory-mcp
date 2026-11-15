@@ -9671,7 +9671,7 @@ mod tests {
             .to_string();
         assert!(
             !leaky.contains("secretpw"),
-            "password must be redacted from the refusal, got: {leaky}"
+            "password must be redacted from the refusal"
         );
 
         // Plain filesystem paths pass through untouched.
@@ -9704,7 +9704,7 @@ mod tests {
         );
         assert!(
             !err.contains("secretpw"),
-            "password must be redacted from the refusal, got: {err}"
+            "password must be redacted from the refusal"
         );
     }
 
@@ -10099,7 +10099,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("keyless loopback {host} must warn, not bind silently"));
             assert!(
                 warning.contains("reverse proxy") && warning.contains("off-host"),
-                "warning must name the proxy hazard for {host}: {warning}"
+                "warning must name the proxy hazard for {host}"
             );
         }
     }
@@ -10146,7 +10146,7 @@ mod tests {
             assert!(
                 !err.contains("AI_MEMORY_ALLOW_PLAINTEXT_NONLOOPBACK")
                     && !err.contains("AI_MEMORY_REQUIRE_TLS"),
-                "no downgrade path may be offered: {err}"
+                "no downgrade path may be offered"
             );
         }
     }
@@ -10180,7 +10180,7 @@ mod tests {
         let w = cert_peer_binding_boot_warnings(tls::CertPeerBindingMode::Warn, false, false, true);
         assert!(
             w.iter().any(|s| s.contains("INERT") && s.contains("mTLS")),
-            "must warn mTLS-not-configured inert: {w:?}"
+            "must warn mTLS-not-configured inert"
         );
         // mTLS on but no binding map ⇒ INERT warning.
         let w =
@@ -10188,7 +10188,7 @@ mod tests {
         assert!(
             w.iter()
                 .any(|s| s.contains("INERT") && s.contains("BINDING_MAP")),
-            "must warn no-binding-map inert: {w:?}"
+            "must warn no-binding-map inert"
         );
     }
 
@@ -10202,7 +10202,7 @@ mod tests {
             let w = cert_peer_binding_boot_warnings(mode, true, true, false);
             assert!(
                 w.iter().any(|s| s.contains("spoof window is OPEN")),
-                "require_sig=0 + non-enforce must warn open window (mode {mode:?}): {w:?}"
+                "require_sig=0 + non-enforce must warn open window (mode {mode:?})"
             );
         }
         // require_sig=0 but ENFORCE closes it ⇒ no open-window warning.
@@ -10210,7 +10210,7 @@ mod tests {
             cert_peer_binding_boot_warnings(tls::CertPeerBindingMode::Enforce, true, true, false);
         assert!(
             !w.iter().any(|s| s.contains("spoof window is OPEN")),
-            "enforce must NOT warn open window: {w:?}"
+            "enforce must NOT warn open window"
         );
     }
 
@@ -10226,7 +10226,7 @@ mod tests {
             let w = boot_security_posture_warnings(host, PermissionsMode::Enforce, 0, false);
             assert!(
                 w.is_empty(),
-                "loopback {host} must emit no posture warnings, got {w:?}"
+                "loopback {host} must emit no posture warnings"
             );
         }
     }
@@ -10236,11 +10236,7 @@ mod tests {
     #[test]
     fn boot_posture_enforce_zero_rules_warns_r04() {
         let w = boot_security_posture_warnings("0.0.0.0", PermissionsMode::Enforce, 0, true);
-        assert_eq!(
-            w.len(),
-            1,
-            "only R-04 expected (attestation required), got {w:?}"
-        );
+        assert_eq!(w.len(), 1, "only R-04 expected (attestation required)");
         assert!(
             w[0].contains("R-04") && w[0].contains("UNGATED"),
             "{}",
@@ -10254,7 +10250,7 @@ mod tests {
         let w = boot_security_posture_warnings("0.0.0.0", PermissionsMode::Enforce, 1, true);
         assert!(
             w.is_empty(),
-            "enforce + rules + attestation required → no warnings, got {w:?}"
+            "enforce + rules + attestation required → no warnings"
         );
     }
 
@@ -10263,7 +10259,7 @@ mod tests {
     #[test]
     fn boot_posture_advisory_mode_no_r04() {
         let w = boot_security_posture_warnings("0.0.0.0", PermissionsMode::Advisory, 0, true);
-        assert!(w.is_empty(), "advisory mode does not trip R-04, got {w:?}");
+        assert!(w.is_empty(), "advisory mode does not trip R-04");
     }
 
     /// Non-loopback + permissive attestation (the explicit `=0` opt-out —
@@ -10291,7 +10287,7 @@ mod tests {
     #[test]
     fn boot_posture_worst_case_emits_both_r04_r12() {
         let w = boot_security_posture_warnings("0.0.0.0", PermissionsMode::Enforce, 0, false);
-        assert_eq!(w.len(), 2, "expected both R-04 and R-12, got {w:?}");
+        assert_eq!(w.len(), 2, "expected both R-04 and R-12");
         assert!(w.iter().any(|s| s.contains("R-04")));
         assert!(w.iter().any(|s| s.contains("R-12")));
     }
@@ -12784,7 +12780,7 @@ mod tests {
         }
         shutdown.notify_one();
         let res = handle.await.unwrap();
-        assert!(res.is_ok(), "serve future returned: {res:?}");
+        assert!(res.is_ok(), "the serve future must return Ok");
     }
 
     // ----- bind error surfacing ----------------------------------------
@@ -12812,7 +12808,7 @@ mod tests {
             async {},
         )
         .await;
-        assert!(res.is_err(), "expected bind error, got: {res:?}");
+        assert!(res.is_err(), "expected a bind error");
     }
 
     // ----- v0.7.0 coverage close: dispatch arms for identity/rules/governance ---
@@ -14788,7 +14784,7 @@ mod cov_boot_degrade_arms_3521 {
         .to_string();
         assert!(
             !err.contains("sup3r-s3cret"),
-            "the refusal must never echo the password back to the terminal; got: {err}"
+            "the refusal must never echo the password back to the terminal"
         );
         assert!(
             err.contains("--store-url"),

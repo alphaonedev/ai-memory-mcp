@@ -484,14 +484,20 @@ peers = ["https://u:PEER_CANARY@peer.internal:8443/m"]
         .expect("fixture parses");
         redact_toml_value(&mut value);
         let rendered = toml::to_string_pretty(&value).expect("render");
-        for secret in [
+        for (case_idx, secret) in [
             "DB_CANARY",
             "Q_CANARY",
             "LLM_CANARY",
             "T_CANARY",
             "PEER_CANARY",
-        ] {
-            assert!(!rendered.contains(secret), "{secret} leaked: {rendered}");
+        ]
+        .iter()
+        .enumerate()
+        {
+            assert!(
+                !rendered.contains(secret),
+                "canary #{case_idx} leaked into the rendered config"
+            );
         }
         assert!(
             rendered.contains("postgres://db.internal:5432/ai"),
@@ -503,10 +509,7 @@ peers = ["https://u:PEER_CANARY@peer.internal:8443/m"]
             rendered.contains("https://peer.internal:8443"),
             "{rendered}"
         );
-        assert!(
-            !rendered.contains("sslmode"),
-            "the query is never rendered: {rendered}"
-        );
+        assert!(!rendered.contains("sslmode"), "the query is never rendered");
     }
 
     #[test]
@@ -604,7 +607,10 @@ hmac_secret = "hmac-secret-must-not-leak"
             toml::from_str("api_key = 1234567890\n").expect("fixture parses");
         redact_toml_value(&mut value);
         let rendered = toml::to_string_pretty(&value).expect("render");
-        assert!(!rendered.contains("1234567890"), "{rendered}");
+        assert!(
+            !rendered.contains("1234567890"),
+            "the output must not contain the forbidden text"
+        );
     }
 
     #[test]
@@ -614,7 +620,10 @@ hmac_secret = "hmac-secret-must-not-leak"
             format!("api_key = \"{CONFIG_REDACTION_MASK}\"")
         );
         let json = redact_config_line("+      \"ANTHROPIC_API_KEY\": \"sk-must-not-leak\",");
-        assert!(!json.contains("sk-must-not-leak"), "{json}");
+        assert!(
+            !json.contains("sk-must-not-leak"),
+            "the output must not contain the forbidden text"
+        );
         assert!(json.ends_with(','), "the JSON comma must survive: {json}");
         // Pointer + ordinary values pass through untouched.
         assert_eq!(
@@ -640,8 +649,14 @@ hmac_secret = "hmac-secret-must-not-leak"
             r#"{"ANTHROPIC_API_KEY":"plain-value-3432","HMAC_SECRET":"other-plain-3432"}}}}"#
         );
         let got = redact_config_line(line);
-        assert!(!got.contains("plain-value-3432"), "leaked: {got}");
-        assert!(!got.contains("other-plain-3432"), "leaked: {got}");
+        assert!(
+            !got.contains("plain-value-3432"),
+            "the output must not contain the forbidden text"
+        );
+        assert!(
+            !got.contains("other-plain-3432"),
+            "the output must not contain the forbidden text"
+        );
         // ALLOWED: the structure and the non-secret values still read.
         assert!(got.contains(r#""ANTHROPIC_API_KEY""#), "{got}");
         assert!(got.contains(r#""HMAC_SECRET""#), "{got}");
@@ -659,7 +674,10 @@ hmac_secret = "hmac-secret-must-not-leak"
     #[test]
     fn toml_inline_table_masks_the_nested_secret_3432() {
         let got = redact_config_line(r#"auth = { user = "alice", token = "plain-inline-3432" }"#);
-        assert!(!got.contains("plain-inline-3432"), "leaked: {got}");
+        assert!(
+            !got.contains("plain-inline-3432"),
+            "the output must not contain the forbidden text"
+        );
         assert!(got.contains(r#"user = "alice""#), "{got}");
         assert!(got.contains("token = "), "{got}");
     }
@@ -695,7 +713,7 @@ hmac_secret = "hmac-secret-must-not-leak"
         let redacted = redact_parse_error(&err);
         assert!(
             !redacted.contains("987654321321"),
-            "the message body leaked the value: {redacted}"
+            "the message body leaked the value"
         );
         // ALLOWED: the class and the `expected …` tail survive.
         assert!(redacted.contains("invalid type"), "{redacted}");
@@ -707,7 +725,10 @@ hmac_secret = "hmac-secret-must-not-leak"
     #[test]
     fn unterminated_quote_masks_to_end_of_string_3432() {
         let got = mask_quoted_payloads("invalid value `dangling-secret-3432");
-        assert!(!got.contains("dangling-secret-3432"), "{got}");
+        assert!(
+            !got.contains("dangling-secret-3432"),
+            "the output must not contain the forbidden text"
+        );
         assert!(got.contains(CONFIG_REDACTION_MASK), "{got}");
     }
 
@@ -718,14 +739,14 @@ hmac_secret = "hmac-secret-must-not-leak"
         let redacted = redact_parse_error(&err);
         assert!(
             !redacted.contains("sekrit-must-not-leak"),
-            "the echoed source line leaked: {redacted}"
+            "the echoed source line"
         );
         // ALLOWED: the position survives, so the operator can still fix it.
         assert!(
             redacted.contains("line") || redacted.contains("TOML parse error"),
             "the position must survive: {redacted}"
         );
-        assert!(!redacted.contains('\n'), "must be one line: {redacted}");
+        assert!(!redacted.contains('\n'), "must be one line");
     }
 
     #[test]

@@ -502,7 +502,11 @@ mod tests {
         };
         outcome.expect("command runs");
         let token = env.stdout_str().trim().to_string();
-        assert!(token.starts_with("cap1:"), "got: {token}");
+        assert!(
+            token.starts_with("cap1:"),
+            "the minted token must carry the cap1: prefix ({} bytes printed)",
+            token.len()
+        );
         token
     }
 

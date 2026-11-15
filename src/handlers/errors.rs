@@ -505,7 +505,7 @@ mod tests {
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert!(
             !body.contains(secret),
-            "the foreign reason must not reach the caller: {body}"
+            "the foreign reason must not reach the caller"
         );
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(

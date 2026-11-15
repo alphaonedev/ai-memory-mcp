@@ -735,7 +735,7 @@ mod tests {
         for forbidden in ["body", "payload", "content", "title"] {
             assert!(
                 !rendered.contains(forbidden),
-                "a wake line must never carry a body field: {rendered}"
+                "a wake line must never carry a body field"
             );
         }
 

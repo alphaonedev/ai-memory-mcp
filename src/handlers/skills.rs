@@ -800,8 +800,14 @@ mod promote_status_4622_tests {
         for (label, err, expected) in cases {
             let body = promote_error_message(err);
             assert_eq!(body, expected, "{label}");
-            for leak in ["hunter2", "postgres://", "/var/db", "/srv/tenant", "EACCES"] {
-                assert!(!body.contains(leak), "{label}: {leak} leaked into {body}");
+            for (case_idx, leak) in ["hunter2", "postgres://", "/var/db", "/srv/tenant", "EACCES"]
+                .iter()
+                .enumerate()
+            {
+                assert!(
+                    !body.contains(leak),
+                    "{label}: fixture #{case_idx} leaked into the body"
+                );
             }
         }
     }
@@ -856,7 +862,10 @@ mod promote_status_4622_tests {
     fn issue_4622_reworded_display_keeps_404() {
         let err =
             anyhow::Error::new(ReflectionNotFound::new("x")).context("a wholly different wording");
-        assert!(!err.to_string().contains("not found"), "{err}");
+        assert!(
+            !err.to_string().contains("not found"),
+            "the output must not contain the forbidden text"
+        );
         assert_eq!(promote_error_status(&err), StatusCode::NOT_FOUND);
     }
 
@@ -1026,7 +1035,7 @@ mod skill_read_error_8834_tests {
             for (route, (status, body)) in routes {
                 assert_eq!(status, want_status, "route={route} e={e}");
                 assert_eq!(body, want_body, "route={route} e={e}");
-                assert!(!body.contains(STORED), "route={route} leaked: {body}");
+                assert!(!body.contains(STORED), "route={route}");
             }
         }
         // #9174 R2 — an export refusal is a 400 with its own fixed text, and

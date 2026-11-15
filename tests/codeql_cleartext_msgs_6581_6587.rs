@@ -972,7 +972,7 @@ const LEAKY_FORMS: &[(&str, &str)] = &[
     ),
     (
         "raw literal",
-        r##"assert!(!out.contains(SECRET), r#"leaked "{out}""#);"##,
+        "assert!(!out.contains(SECRET), r#\"leaked \"{out}\"\"#);",
     ),
     (
         "debug_assert",

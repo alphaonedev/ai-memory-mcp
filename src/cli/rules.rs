@@ -2370,7 +2370,7 @@ mod tests {
         let stderr_s = String::from_utf8_lossy(&stderr).to_string();
         assert!(
             result.is_ok(),
-            "#822: sign-seed must honor --key-dir; got err={result:?} stderr={stderr_s}"
+            "#822: sign-seed must honor --key-dir; stderr={stderr_s}"
         );
         let s = String::from_utf8(stdout).unwrap();
         assert!(s.contains("rules.sign-seed"), "got: {s}");

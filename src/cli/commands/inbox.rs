@@ -252,7 +252,10 @@ mod tests {
         assert!(stdout.contains("from=test-agent"), "got: {stdout}");
         assert!(stdout.contains("hello bob"), "got: {stdout}");
         // #3730 — no `read=` column: the inbox carries no read marker.
-        assert!(!stdout.contains("read="), "got: {stdout}");
+        assert!(
+            !stdout.contains("read="),
+            "the output must not contain the forbidden text"
+        );
     }
 
     #[test]

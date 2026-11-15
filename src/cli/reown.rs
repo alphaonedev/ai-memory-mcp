@@ -718,7 +718,7 @@ mod tests {
         assert!(s.contains("<- carol"), "got: {s}");
         assert!(
             !s.contains("not listed"),
-            "under the cap nothing is omitted: {s}"
+            "under the cap nothing is omitted"
         );
     }
 

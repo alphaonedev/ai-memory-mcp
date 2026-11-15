@@ -1975,7 +1975,7 @@ mod tests {
         let rendered = format!("{body:?}");
         assert!(
             !rendered.contains("super-secret-token"),
-            "Debug leaked the bearer token: {rendered}"
+            "Debug leaked the bearer token"
         );
         assert!(rendered.contains("<redacted>"));
     }

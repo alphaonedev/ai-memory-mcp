@@ -730,7 +730,7 @@ mod tests {
         );
         assert!(
             !stdout.contains("NOT ENFORCED"),
-            "no rule is inert in the pre-L1-6 posture; got: {stdout}"
+            "no rule is inert in the pre-L1-6 posture"
         );
     }
 
@@ -794,7 +794,10 @@ mod tests {
             stdout.contains("inert-badsig/will-repair"),
             "#3430: preview must not claim an inert row is already-on; got: {stdout}"
         );
-        assert!(!stdout.contains("already-on"), "got: {stdout}");
+        assert!(
+            !stdout.contains("already-on"),
+            "the output must not contain the forbidden text"
+        );
     }
 
     #[test]

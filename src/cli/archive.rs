@@ -379,7 +379,7 @@ mod tests {
         let stdout = env.stdout_str();
         assert!(
             !stdout.contains("\"restored\""),
-            "pre-#3414 JSON wrote restored:false and exited 0; got: {stdout}"
+            "pre-#3414 JSON wrote restored:false and exited 0"
         );
     }
 

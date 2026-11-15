@@ -1120,7 +1120,7 @@ mod tests {
         );
         assert!(
             !entries.iter().any(|n| n.contains(".priv.")),
-            "rotation must NOT copy private-key material; got {entries:?}"
+            "rotation must NOT copy private-key material"
         );
     }
 

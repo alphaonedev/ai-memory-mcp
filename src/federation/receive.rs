@@ -1501,7 +1501,7 @@ mod cov_catchup_helpers_3521 {
         let without_cursor = sync_since_url("https://peer.test", "local-1", None);
         assert!(
             !without_cursor.contains("since="),
-            "no cursor must mean no since= parameter; got {without_cursor}"
+            "no cursor must mean no since= parameter"
         );
         assert!(
             without_cursor.contains("peer=local-1"),

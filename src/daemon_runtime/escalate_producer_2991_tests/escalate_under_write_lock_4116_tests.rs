@@ -161,7 +161,7 @@ fn assert_escalation_queued<T: std::fmt::Debug>(
     );
     assert!(
         !msg.to_ascii_lowercase().contains("busy") && !msg.contains("locked"),
-        "{funnel}: must not fail on its own writer lock, got: {msg}"
+        "{funnel}: must not fail on its own writer lock"
     );
     assert!(
         elapsed < UNDER_BUSY_TIMEOUT,

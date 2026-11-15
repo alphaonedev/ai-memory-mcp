@@ -549,8 +549,7 @@ enforcement:
             !plan
                 .actions
                 .contains(&ReconcileAction::DisableStrictEnforcement),
-            "omission is UNMANAGED — it must never plan a downgrade: {:?}",
-            plan.actions
+            "omission is UNMANAGED — it must never plan a downgrade"
         );
         assert!(
             plan.actions.is_empty(),
