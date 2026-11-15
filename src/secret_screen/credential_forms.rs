@@ -153,16 +153,15 @@ fn credential_scheme_before(bytes: &[u8], sep: usize) -> bool {
         .any(|s| scheme.eq_ignore_ascii_case(s.as_bytes()))
 }
 
-/// End of the authority that starts at `from`: the first `/`, `?`, `#`,
-/// quote or ASCII whitespace, else the end of input. A backtick does not end
-/// it: a password holding one would otherwise hide its `@` and pass whole; a
-/// closing markdown backtick after the host only widens nothing (no `@`).
+/// End of the URL token that starts at `from`: the first ASCII whitespace,
+/// else the end of input. No other byte ends it (#8855): a password may hold
+/// any byte, so a per-byte terminator (`/` `?` `#` a quote) would hide its
+/// `@` and pass the URL whole. The userinfo then ends at the LAST `@` of
+/// the token; a neighbour `@` in a path, query or JSON tail only widens the
+/// mask of a line that is refused anyway.
 fn authority_end(bytes: &[u8], from: usize) -> usize {
     let mut end = from;
-    while end < bytes.len()
-        && !matches!(bytes[end], b'/' | b'?' | b'#' | b'"' | b'\'')
-        && !bytes[end].is_ascii_whitespace()
-    {
+    while end < bytes.len() && !bytes[end].is_ascii_whitespace() {
         end += 1;
     }
     end
@@ -342,12 +341,12 @@ fn assignment_operator_len(bytes: &[u8], j: usize) -> Option<usize> {
 }
 
 /// The value that starts at `j` (after blanks): `(start, end, quoted)`.
-/// Unquoted values stop at whitespace, `,` `;` `&` or a quote; a backtick
-/// stops one only at its first byte (a markdown code span closing around
-/// an empty `password=`), so a backtick inside a value never cuts the mask. After a `:`
-/// (`after_colon`) a leading [`REFERENCE_TYPE_SIGIL`] belongs to the value
-/// (`password: &str`); after `=` it stays a query-string separator.
-fn value_at(bytes: &[u8], j: usize, after_colon: bool) -> (usize, usize, bool) {
+/// The only ways a value ends (#8855): ASCII whitespace or the end of input
+/// for an unquoted value; the closing quote, a line end or the end of input
+/// for a value that OPENED with that quote. No other byte ends it, so a
+/// byte inside a credential never cuts the mask short (a per-byte
+/// terminator list fails open for every byte it forgets).
+fn value_at(bytes: &[u8], j: usize) -> (usize, usize, bool) {
     let j = skip_blanks(bytes, j);
     let quote = match bytes.get(j) {
         Some(&q @ (b'"' | b'\'')) => Some(q),
@@ -355,18 +354,11 @@ fn value_at(bytes: &[u8], j: usize, after_colon: bool) -> (usize, usize, bool) {
     };
     let start = if quote.is_some() { j + 1 } else { j };
     let mut end = start;
-    if after_colon && quote.is_none() && bytes.get(start) == Some(&REFERENCE_TYPE_SIGIL) {
-        end += 1;
-    }
     while end < bytes.len() {
         let c = bytes[end];
         let stop = match quote {
             Some(q) => c == q || c == b'\n',
-            None => {
-                c.is_ascii_whitespace()
-                    || matches!(c, b',' | b';' | b'&' | b'"' | b'\'')
-                    || (c == b'`' && end == start)
-            }
+            None => c.is_ascii_whitespace(),
         };
         if stop {
             break;
@@ -376,11 +368,31 @@ fn value_at(bytes: &[u8], j: usize, after_colon: bool) -> (usize, usize, bool) {
     (start, end, quote.is_some())
 }
 
+/// Bytes a named non-credential shape may carry at its right edge without
+/// being part of it: the closing backtick of a markdown code span
+/// (`` `pwd=…` ``) and a list separator (`password: null,`).
+const JUDGED_TRAILERS: [char; 3] = [CODE_SPAN_DELIMITER, ',', ';'];
+
 /// The unquoted value as the named-shape checks judge it: without the
-/// closing backticks of a markdown code span (`` `pwd=…` ``). The masked
-/// span still covers them, so a secret holding a backtick is masked whole.
+/// [`JUDGED_TRAILERS`] at its end. Only the judgement drops them; the
+/// masked span still covers the whole value, so a secret holding one is
+/// masked whole.
 fn judged_value(v: &str) -> &str {
-    v.trim_end_matches(CODE_SPAN_DELIMITER)
+    v.trim_end_matches(JUDGED_TRAILERS)
+}
+
+/// End of the line that holds `from`, without the trailing blanks: the
+/// mask end of a [`REFERENCE_TYPE_SIGIL`]-led value that names no type.
+fn line_content_end(bytes: &[u8], from: usize) -> usize {
+    let mut line_end = from;
+    while line_end < bytes.len() && bytes[line_end] != b'\n' {
+        line_end += 1;
+    }
+    let mut end = line_end;
+    while end > from && bytes[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    end
 }
 
 /// After a type annotation ending at `from`, the `=` of an initializer on
@@ -427,26 +439,25 @@ fn password_assignment_spans(content: &str) -> Vec<(usize, usize)> {
             continue;
         };
         let is_colon = bytes[j] == b':' && op_len == 1;
-        let (mut start, mut end, mut quoted) = value_at(bytes, j + op_len, is_colon);
+        let (mut start, mut end, mut quoted) = value_at(bytes, j + op_len);
         let mut resume = end;
         let ref_led = is_colon && !quoted && bytes.get(start) == Some(&REFERENCE_TYPE_SIGIL);
         let annotation_end = if ref_led {
             reference_annotation_end(bytes, start)
-        } else if is_colon && !quoted && is_type_annotation(judged_value(&content[start..end])) {
-            Some(end)
+        } else if is_colon && !quoted {
+            // The annotation ends at its judged edge, so an initializer
+            // search never starts past a `,` that ends the declaration.
+            let judged = judged_value(&content[start..end]);
+            is_type_annotation(judged).then_some(start + judged.len())
         } else {
             None
         };
         if ref_led && annotation_end.is_none() {
             // `&` naming no type: a credential, or a YAML anchor whose
-            // anchored value follows on the same line; mask both.
-            let (next_start, next_end, _) = value_at(bytes, end, false);
-            if next_end > next_start {
-                end = next_end;
-                resume = end;
-            }
+            // anchored value follows on the same line; mask to the line end.
+            end = line_content_end(bytes, start);
             spans.push((start, end));
-            i = resume.max(i + key_len);
+            i = end.max(resume).max(i + key_len);
             continue;
         }
         // `password: String` is an annotation; an initializer after it
@@ -456,7 +467,7 @@ fn password_assignment_spans(content: &str) -> Vec<(usize, usize)> {
             resume = after;
             match init {
                 Some(at) => {
-                    (start, end, quoted) = value_at(bytes, at, false);
+                    (start, end, quoted) = value_at(bytes, at);
                     resume = end;
                 }
                 None => {

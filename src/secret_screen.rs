@@ -233,12 +233,25 @@ fn is_token_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '+' | '/' | '.' | '=')
 }
 
+/// True for the RFC 6750 `token68` charset of a `Bearer` credential: the
+/// [`is_token_char`] set plus `~`. Only the Bearer detector uses it, so the
+/// other prefix tokens (and the JWT segment count) keep their charset.
+fn is_token68_char(c: char) -> bool {
+    is_token_char(c) || c == '~'
+}
+
 /// The contiguous token starting at byte offset `start` (over
 /// [`is_token_char`]).
 fn token_at(content: &str, start: usize) -> &str {
+    token_over(content, start, is_token_char)
+}
+
+/// The contiguous run of `is_char` bytes starting at byte offset `start`.
+/// Every accepted byte is ASCII, so the end is a char boundary.
+fn token_over(content: &str, start: usize, is_char: fn(char) -> bool) -> &str {
     let bytes = content.as_bytes();
     let mut end = start;
-    while end < bytes.len() && is_token_char(bytes[end] as char) {
+    while end < bytes.len() && is_char(bytes[end] as char) {
         end += 1;
     }
     &content[start..end]
@@ -259,7 +272,13 @@ fn redact_prefixed_tokens(
     while let Some(rel) = content[search_from..].find(prefix) {
         let pfx_start = search_from + rel;
         let token_start = pfx_start + prefix.len();
-        let token = token_at(content, token_start);
+        // A Bearer credential is token68 (`~` included), so a `~` inside
+        // it never ends the mask early (#8855).
+        let token = if prefix == BEARER_PREFIX {
+            token_over(content, token_start, is_token68_char)
+        } else {
+            token_at(content, token_start)
+        };
         // Bearer's prefix includes the space; its token starts after it.
         if token.len() >= MIN_PREFIXED_TOKEN_LEN
             && shannon_entropy_bits(token) >= MIN_TOKEN_ENTROPY_BITS
