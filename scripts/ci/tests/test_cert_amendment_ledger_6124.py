@@ -1665,12 +1665,15 @@ class OptionBRegion(LedgerCase):
         self.assertEqual(calls, [])
         # #9303: a differing region is now refused before the excuse scan, so the row
         # above no longer reaches the cap. Keep the region byte-identical and put the
-        # base over the cap below the marker: the cap alone must keep the scan from running.
-        doc = with_ledger(head_doc(), self.exact())
-        s = self.scene("VOID", base_doc=doc + pad * (cert.LEDGER_MAX_DOC_BYTES // len(pad) + 1))
+        # base over the cap below the marker (ledger records the base parser accepts): the
+        # cap alone must keep the scan from running.
+        record = self.exact()
+        rows = record * (cert.LEDGER_MAX_DOC_BYTES // len(record) + 1)
+        s = self.scene("VOID", base_doc=with_ledger(head_doc(), rows))
         del calls[:]
-        ok, out = s.judge(self.wire_and_doc(s, doc))
+        ok, out = s.judge(self.wire_and_doc(s, with_ledger(head_doc(), record)))
         self.assertFalse(ok, out)
+        self.assertIn("of the base ledger", out)
         self.assertEqual(calls, [])
 
 
