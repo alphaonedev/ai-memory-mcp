@@ -643,7 +643,7 @@ mod tests {
         assert!(msg.contains("requires smart tier"));
         assert!(msg.contains("keyword"));
         assert!(msg.contains("Upgrade your deployment"));
-        assert!(!msg.contains("memory_atomise"), "MCP tool leaked: {msg}");
+        assert!(!msg.contains("memory_atomise"), "MCP tool");
     }
 
     #[test]
@@ -671,7 +671,7 @@ mod tests {
         let msg = human_error_message(&AtomiseError::SourceTooSmall, "src-x");
         assert!(msg.contains("src-x"));
         assert!(msg.contains("--max-atom-tokens"), "got: {msg}");
-        assert!(!msg.contains("max_atom_tokens"), "MCP param leaked: {msg}");
+        assert!(!msg.contains("max_atom_tokens"), "MCP param");
     }
 
     #[test]

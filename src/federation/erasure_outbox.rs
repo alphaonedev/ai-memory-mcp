@@ -657,7 +657,7 @@ mod tests {
             texts.push(format!("{QUEUED_LAST_ERROR} (surface: {surface})"));
         }
         for text in &texts {
-            for token in [
+            for (case_idx, classifier) in [
                 "429",
                 "401",
                 "403",
@@ -667,10 +667,13 @@ mod tests {
                 "schema",
                 "id_drift",
                 "no longer in FederationConfig",
-            ] {
+            ]
+            .iter()
+            .enumerate()
+            {
                 assert!(
-                    !text.contains(token),
-                    "{text:?} must not contain the classifier token {token:?}"
+                    !text.contains(classifier),
+                    "must not contain classifier token #{case_idx}"
                 );
             }
         }

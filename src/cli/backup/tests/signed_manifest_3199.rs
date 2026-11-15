@@ -809,12 +809,15 @@ fn backup_signing_posture_row_3199() {
     let (pass, actual) = signing_posture_of(None, Ok(&operator));
     assert!(
         !pass && actual.contains("no operator public key"),
-        "{actual}"
+        "the output must not contain the forbidden text"
     );
     let (pass, actual) = signing_posture_of(Some(&anchor), Ok(&operator));
     assert!(pass && actual.contains("matches"), "{actual}");
     let (pass, actual) = signing_posture_of(Some(&anchor), Ok(&foreign));
-    assert!(!pass && actual.contains("does NOT match"), "{actual}");
+    assert!(
+        !pass && actual.contains("does NOT match"),
+        "the output must not contain the forbidden text"
+    );
     let (pass, actual) = signing_posture_of(Some(&anchor), Err(&missing));
     assert!(
         pass && actual.contains("no usable local signing key"),

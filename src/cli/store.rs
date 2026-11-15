@@ -1820,8 +1820,7 @@ mod tests {
         assert!(env.stdout_str().starts_with("stored: "));
         assert!(
             !env.stderr_str().contains("auto_atomise:"),
-            "an opted-out namespace must not gain a new stderr line: {}",
-            env.stderr_str()
+            "an opted-out namespace must not gain a new stderr line"
         );
     }
 

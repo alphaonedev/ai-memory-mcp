@@ -2947,7 +2947,7 @@ mod tests {
         let stderr = env.stderr_str();
         assert!(
             !stderr.contains("system-prompt snippet"),
-            "uninstall must not announce a snippet write; got:\n{stderr}",
+            "uninstall must not announce a snippet write",
         );
 
         unsafe {
@@ -3202,11 +3202,11 @@ mod tests {
         let stderr = env.stderr_str().to_string();
         assert!(
             !stdout.contains(INSTALL_SECRET_3432),
-            "the client config's API key leaked on STDOUT:\n{stdout}"
+            "the client config's API key leaked on STDOUT"
         );
         assert!(
             !stderr.contains(INSTALL_SECRET_3432),
-            "the client config's API key leaked on STDERR:\n{stderr}"
+            "the client config's API key leaked on STDERR"
         );
         // ALLOWED: the diff is still a diff — the structure an operator
         // reviews survives, only the value is masked.
@@ -3249,7 +3249,7 @@ mod tests {
         );
         assert!(
             !written.contains(crate::config_redact::CONFIG_REDACTION_MASK),
-            "the mask must never reach the durable file:\n{written}"
+            "the mask must never reach the durable file"
         );
     }
 
@@ -3708,8 +3708,7 @@ mod tests {
         run(&args_for_pretool_apply(path.clone()), &mut env.output()).unwrap();
         assert!(
             !env.stderr_str().contains("system-prompt snippet"),
-            "stderr should NOT mention the system-prompt snippet under --hook pretool: {}",
-            env.stderr_str()
+            "stderr should NOT mention the system-prompt snippet under --hook pretool"
         );
     }
 }

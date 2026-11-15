@@ -2231,7 +2231,7 @@ mod tests {
         assert!(s.contains("audit_log"), "got: {s}");
         assert!(
             !s.contains("alice"),
-            "#3429: show must read the RESOLVED --db, not the config store: {s}"
+            "#3429: show must read the RESOLVED --db, not the config store"
         );
         assert!(
             resolved.exists(),

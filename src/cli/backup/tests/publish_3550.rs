@@ -324,8 +324,7 @@ fn restore_refuses_to_publish_when_a_sidecar_unlink_fails_3550() {
     );
     assert!(
         !io.steps.contains(&PublishStep::Published),
-        "nothing may be published after a failed unlink: {:?}",
-        io.steps
+        "nothing may be published after a failed unlink"
     );
     assert_eq!(memory_rows(&db), 2, "the live corpus must be the old one");
     assert_eq!(restore_tmp_leftovers(db.parent().unwrap()), 0);
@@ -1515,8 +1514,7 @@ fn restore_refuses_when_the_staged_file_cannot_be_locked_3550() {
         );
         assert!(
             !io.steps.contains(&PublishStep::SidecarsCleared),
-            "no sidecar may be removed: {:?}",
-            io.steps
+            "no sidecar may be removed"
         );
         assert_eq!(io.remove_calls, 0);
         assert_eq!(memory_rows(&db), 2, "the live corpus is the old one");

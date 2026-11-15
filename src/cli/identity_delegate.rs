@@ -321,7 +321,7 @@ mod tests {
             bundle.not_before.as_str(),
             bundle.not_after.as_str(),
         ] {
-            assert!(!stamp.contains('.'), "sub-second stamp: {stamp}");
+            assert!(!stamp.contains('.'), "sub-second stamp");
         }
 
         // Truncation moves the START earlier by at most 999 ms, never later,

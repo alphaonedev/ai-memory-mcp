@@ -5497,25 +5497,16 @@ mod tests {
             "bare-base64 signature must survive receive"
         );
         let leaked = mem.metadata.to_string();
-        assert!(
-            !leaked.contains(sk),
-            "sk- under *_b64 must not persist; got {leaked}"
-        );
-        assert!(
-            !leaked.contains(ghp),
-            "ghp_ under *_b64 must not persist; got {leaked}"
-        );
-        assert!(
-            !leaked.contains(akia),
-            "AKIA under *_b64 must not persist; got {leaked}"
-        );
+        assert!(!leaked.contains(sk), "sk- under *_b64 must not persist");
+        assert!(!leaked.contains(ghp), "ghp_ under *_b64 must not persist");
+        assert!(!leaked.contains(akia), "AKIA under *_b64 must not persist");
         assert!(
             !leaked.contains("7f3a9c2e1b8d4f6a0c5e9b2d7a1f4c8e3b"),
-            "Bearer token under *_b64 must not persist; got {leaked}"
+            "Bearer token under *_b64 must not persist"
         );
         assert!(
             !leaked.contains("MIIEbody"),
-            "PEM under *_b64 must not persist; got {leaked}"
+            "PEM under *_b64 must not persist"
         );
         assert!(
             leaked.contains(crate::secret_screen::REDACTION_PLACEHOLDER),

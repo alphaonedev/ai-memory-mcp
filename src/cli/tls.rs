@@ -511,9 +511,15 @@ mod tests {
                     v.verdict.contains(fix),
                     "a refusing verdict names its fix: {v:?}"
                 );
-                assert!(!v.verdict.contains("encrypted as required"), "{v:?}");
+                assert!(
+                    !v.verdict.contains("encrypted as required"),
+                    "the output must not contain the forbidden text"
+                );
             } else {
-                assert!(!v.verdict.contains("REFUSES"), "{v:?}");
+                assert!(
+                    !v.verdict.contains("REFUSES"),
+                    "the output must not contain the forbidden text"
+                );
             }
         }
         assert_eq!(

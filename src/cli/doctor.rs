@@ -1061,9 +1061,9 @@ fn snapshot_before_repair(
         return Ok(None);
     }
     let parent = db_path.parent().map(PathBuf::from).unwrap_or_default();
-    let token = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
+    let stamp = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
     let snapshot_name =
-        format!("{file_name}.pre-repair-schema-version-v{observed}-to-v{target}-{token}.sqlite");
+        format!("{file_name}.pre-repair-schema-version-v{observed}-to-v{target}-{stamp}.sqlite");
     let snapshot_path = parent.join(snapshot_name);
     // Single-quote-escape the target for the SQL string literal (crate-derived
     // path, but doubling quotes is the correct hygiene).
@@ -5227,6 +5227,19 @@ pub(super) fn severity_max(a: Severity, b: Severity) -> Severity {
 // Remote (--remote) mode
 // ---------------------------------------------------------------------------
 
+/// The `--remote` URL for every doctor sink (the report source, a section
+/// note, an error string): `scheme://host[:port]/path`, never the userinfo,
+/// query or fragment (#6586). An ambiguous authority (#6096) renders
+/// `scheme://<redacted-authority>`, because its parsed host and path are
+/// credential bytes.
+fn remote_url_display(url: &str) -> String {
+    if crate::url_display::store_url_is_ambiguous(url) {
+        crate::url_display::store_url_display(url)
+    } else {
+        crate::url_display::url_origin_and_path(url)
+    }
+}
+
 fn run_remote(url: &str, db_path: &Path, auth: &RemoteAuth) -> Report {
     let mut sections = Vec::with_capacity(2);
 
@@ -5264,7 +5277,11 @@ fn run_remote(url: &str, db_path: &Path, auth: &RemoteAuth) -> Report {
 
     Report {
         mode: "remote".into(),
-        source: format!("{base} (local db reference: {})", db_path.display()),
+        source: format!(
+            "{} (local db reference: {})",
+            remote_url_display(base),
+            db_path.display()
+        ),
         generated_at: chrono::Utc::now().to_rfc3339(),
         sections,
         overall: Severity::Info,
@@ -5310,7 +5327,7 @@ fn http_get_json(url: &str, auth: &RemoteAuth) -> Result<Value> {
     let resp = req.send().context("HTTP GET")?;
     let status = resp.status();
     if !status.is_success() {
-        anyhow::bail!("HTTP {status} from {url}");
+        anyhow::bail!("HTTP {status} from {}", remote_url_display(url));
     }
     resp.json::<Value>().context("decoding JSON response")
 }
@@ -5394,7 +5411,7 @@ fn section_capabilities_remote(url: &str, auth: &RemoteAuth) -> ReportSection {
         Err(e) => {
             severity = Severity::Critical;
             facts.push(("error".into(), e.to_string()));
-            note = Some(format!("could not reach {url}"));
+            note = Some(format!("could not reach {}", remote_url_display(url)));
         }
     }
 
@@ -5918,8 +5935,8 @@ mod tests {
         );
         assert!(
             !fact(transit, "local_tls_material").contains("enterprise PKI required"),
-            "a singleton (fresh store, no fleet signal) may mint its local certificate: {:?}",
-            fact(transit, "local_tls_material")
+            "a singleton (fresh store, no fleet signal) may mint its local certificate: \
+             the local_tls_material fact must not demand enterprise PKI"
         );
     }
 
@@ -7675,6 +7692,202 @@ mod tests {
         assert_eq!(report.overall, Severity::Critical);
     }
 
+    /// #6586 canaries: a `--remote` URL's userinfo and query are credential
+    /// channels and must reach no doctor sink.
+    const REMOTE_USER_CANARY_6586: &str = "REMOTEUSERCANARY6586";
+    const REMOTE_PASS_CANARY_6586: &str = "REMOTEPASSCANARY6586";
+    const REMOTE_QUERY_CANARY_6586: &str = "REMOTEQUERYCANARY6586";
+
+    /// Every string a doctor report carries (source, notes, facts), joined.
+    fn report_strings_6586(report: &Report) -> String {
+        let mut all = vec![report.source.clone()];
+        for s in &report.sections {
+            all.extend(s.note.clone());
+            for (k, v) in &s.facts {
+                all.push(format!("{k}={v}"));
+            }
+        }
+        all.join("\n")
+    }
+
+    fn assert_no_remote_canary_6586(report: &Report) {
+        let all = report_strings_6586(report);
+        for (case_idx, canary) in [
+            REMOTE_USER_CANARY_6586,
+            REMOTE_PASS_CANARY_6586,
+            REMOTE_QUERY_CANARY_6586,
+        ]
+        .iter()
+        .enumerate()
+        {
+            assert!(
+                !all.contains(canary),
+                "#6586: remote canary #{case_idx} reached a doctor sink"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn remote_unreachable_note_and_source_never_render_credentials_6586() {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let url = format!(
+            "http://{REMOTE_USER_CANARY_6586}:{REMOTE_PASS_CANARY_6586}@127.0.0.1:{port}/p\
+             ?token={REMOTE_QUERY_CANARY_6586}"
+        );
+
+        let env = TestEnv::fresh();
+        let report = run_remote_in_blocking(url, env.db_path.clone()).await;
+        let cap = find(&report, "Capabilities");
+        assert_eq!(cap.severity, Severity::Critical);
+        assert_eq!(
+            cap.note.as_deref(),
+            Some(format!("could not reach http://127.0.0.1:{port}/p").as_str())
+        );
+        assert_eq!(
+            report.source,
+            format!(
+                "http://127.0.0.1:{port}/p (local db reference: {})",
+                env.db_path.display()
+            )
+        );
+        assert_no_remote_canary_6586(&report);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn remote_http_error_fact_never_renders_credentials_6586() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/capabilities"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let origin = server.uri();
+        let host_port = origin.trim_start_matches("http://");
+        let url = format!("http://{REMOTE_USER_CANARY_6586}:{REMOTE_PASS_CANARY_6586}@{host_port}");
+
+        let env = TestEnv::fresh();
+        let report = run_remote_in_blocking(url, env.db_path.clone()).await;
+        let cap = find(&report, "Capabilities");
+        assert_eq!(cap.severity, Severity::Critical);
+        let error = cap
+            .facts
+            .iter()
+            .find(|(k, _)| k == "error")
+            .map(|(_, v)| v.as_str());
+        assert_eq!(
+            error,
+            Some(
+                format!("HTTP 500 Internal Server Error from {origin}/api/v1/capabilities")
+                    .as_str()
+            )
+        );
+        assert_eq!(
+            cap.note.as_deref(),
+            Some(format!("could not reach {origin}/api/v1/capabilities").as_str())
+        );
+        assert_no_remote_canary_6586(&report);
+    }
+
+    #[test]
+    fn remote_url_display_strips_every_credential_channel_6586() {
+        let cases = [
+            ("https://peer.example:8443/m", "https://peer.example:8443/m"),
+            (
+                "https://REMOTEUSERCANARY6586:REMOTEPASSCANARY6586@peer.example/m",
+                "https://peer.example/m",
+            ),
+            (
+                "https://peer.example/m?token=REMOTEQUERYCANARY6586",
+                "https://peer.example/m",
+            ),
+            (
+                "https://peer.example/m#REMOTEQUERYCANARY6586",
+                "https://peer.example/m",
+            ),
+            // #6096 ambiguous authority: the parsed host is credential bytes.
+            (
+                "http://REMOTEUSERCANARY6586@REMOTEPASSCANARY6586/x@real.example/",
+                "http://<redacted-authority>",
+            ),
+        ];
+        for (case_idx, (input, expected)) in cases.iter().enumerate() {
+            assert_eq!(
+                remote_url_display(input),
+                *expected,
+                "#6586 remote_url_display case #{case_idx}"
+            );
+        }
+    }
+
+    /// Canary carried by the edge rows; only the documented path-token row
+    /// may render it (a peer path is operator config, #3675).
+    const REMOTE_EDGE_CANARY_8180: &str = "REMOTECANARY8180";
+
+    /// #8180 / #9307 X-5 - `(input, exact remote_url_display rendering)`:
+    /// IPv6, percent-encoded userinfo, `@` and `:` in the password, no
+    /// scheme (`user:pass@host`), scp-like, empty, whitespace, a path token
+    /// and an opaque `word:REST`.
+    const REMOTE_URL_EDGE_ROWS_8180: &[(&str, &str)] = &[
+        ("https://[::1]:8443/m", "https://[::1]:8443/m"),
+        (
+            "https://u:REMOTECANARY8180@[::1]:8443/m",
+            "https://[::1]:8443/m",
+        ),
+        (
+            "https://u%40x:p%3AREMOTECANARY8180@peer.example/m",
+            "https://peer.example/m",
+        ),
+        (
+            "https://u:p@REMOTECANARY8180@peer.example/m",
+            "https://peer.example/m",
+        ),
+        (
+            "https://u:p:REMOTECANARY8180@peer.example/m",
+            "https://peer.example/m",
+        ),
+        (
+            "svc:REMOTECANARY8180@peer.example:8080/m",
+            "<no scheme>://<unparseable>",
+        ),
+        (
+            "git@peer.example:REMOTECANARY8180.git",
+            "<no scheme>://<unparseable>",
+        ),
+        ("", "<no scheme>://<unparseable>"),
+        ("  \t ", "<no scheme>://<unparseable>"),
+        (
+            "https://peer.example/hook/REMOTECANARY8180",
+            "https://peer.example/hook/REMOTECANARY8180",
+        ),
+        ("word:REMOTECANARY8180", "<no scheme>://<unparseable>"),
+    ];
+
+    /// Index of the one row whose rendering keeps a path token by design.
+    const REMOTE_PATH_TOKEN_ROW_8180: usize = 9;
+
+    #[test]
+    fn remote_url_display_edge_rows_render_exactly_8180() {
+        let mut wrong = Vec::new();
+        for (row, (input, expected)) in REMOTE_URL_EDGE_ROWS_8180.iter().enumerate() {
+            let rendered = remote_url_display(input);
+            if row != REMOTE_PATH_TOKEN_ROW_8180 && rendered.contains(REMOTE_EDGE_CANARY_8180) {
+                wrong.push(format!("row {row}: the rendering holds the canary"));
+            } else if rendered != *expected {
+                wrong.push(format!("row {row}: got {rendered:?}, want {expected:?}"));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "remote_url_display edge rows:\n{}",
+            wrong.join("\n")
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn remote_capabilities_legacy_v1_renders_not_in_response() {
         // Legacy v0.6.3 capabilities responses don't carry the v2 fields.
@@ -8582,11 +8795,11 @@ enabled = true
             let redacted = crate::url_display::url_origin_and_path(
                 "https://alice:hunter2@peer.example/api?token=s3cr3t",
             );
-            assert!(!redacted.contains("hunter2"), "{redacted}");
             assert!(
-                !redacted.contains("s3cr3t"),
-                "query token must not survive: {redacted}"
+                !redacted.contains("hunter2"),
+                "the output must not contain the forbidden text"
             );
+            assert!(!redacted.contains("s3cr3t"), "query token must not survive");
             assert!(
                 redacted.contains("peer.example"),
                 "the peer must stay identifiable: {redacted}"
@@ -9122,7 +9335,10 @@ enabled = true
             actual.contains("agrees"),
             "live read must corroborate: {actual}"
         );
-        assert!(!stderr.contains("not observed"), "{stderr}");
+        assert!(
+            !stderr.contains("not observed"),
+            "the output must not contain the forbidden text"
+        );
 
         let missing = tmp.path().join("no-such.db");
         let (row, stderr) = row_for(Some(&missing));

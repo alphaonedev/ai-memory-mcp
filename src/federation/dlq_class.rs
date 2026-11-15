@@ -337,8 +337,8 @@ mod tests {
             SQL_LIKE_CLASS_THROTTLE.trim_end_matches('%'),
             SQL_LIKE_ANY_CLASS_TAG.trim_end_matches('%'),
         ] {
-            assert!(!pat.contains('%'), "{pat:?} must not contain %");
-            assert!(!pat.contains('_'), "{pat:?} must not contain _");
+            assert!(!pat.contains('%'), "the pattern must not contain %");
+            assert!(!pat.contains('_'), "the pattern must not contain _");
         }
     }
 

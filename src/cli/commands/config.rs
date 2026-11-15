@@ -1175,8 +1175,8 @@ mod tests {
         let body = format!("api_key = \"{S_LEGACY_TOP}\"unclosed\n");
         let (code, stdout, stderr, on_disk) = run_migrate_capture(&body, true);
         assert_eq!(code, 3, "stderr: {stderr}");
-        assert!(!stdout.contains(S_LEGACY_TOP), "leaked on stdout: {stdout}");
-        assert!(!stderr.contains(S_LEGACY_TOP), "leaked on stderr: {stderr}");
+        assert!(!stdout.contains(S_LEGACY_TOP), "leaked on");
+        assert!(!stderr.contains(S_LEGACY_TOP), "leaked on");
         assert!(stderr.contains("not valid TOML"), "{stderr}");
         assert_eq!(on_disk, body, "a parse failure must write nothing");
     }
@@ -1201,7 +1201,10 @@ mod tests {
         };
         assert_eq!(code, 3);
         let err = String::from_utf8(stderr).unwrap();
-        assert!(!err.contains(S_LEGACY_TOP), "leaked: {err}");
+        assert!(
+            !err.contains(S_LEGACY_TOP),
+            "the output must not contain the forbidden text"
+        );
         assert!(err.contains("not valid TOML"), "{err}");
         assert!(
             err.contains("line"),
@@ -1322,10 +1325,7 @@ mod tests {
             stderr.contains("does not parse") && stderr.contains("refusing to write"),
             "expected a loud parse-refusal, got: {stderr}"
         );
-        assert!(
-            !stderr.contains("OK: migrated"),
-            "must NOT claim success, got: {stderr}"
-        );
+        assert!(!stderr.contains("OK: migrated"), "must NOT claim success");
         // The original config is byte-identical (nothing was written).
         assert_eq!(
             std::fs::read_to_string(&cfg_path).unwrap(),
@@ -1554,7 +1554,7 @@ model = "grok-4.3"
         assert!(err.contains("not valid TOML"), "got: {err}");
         assert!(
             !err.contains("sekrit-must-not-leak"),
-            "toml error Display must not leak the secret, got: {err}"
+            "toml error Display must not leak the secret"
         );
     }
 
@@ -1604,10 +1604,7 @@ model = "grok-4.3"
         assert!(err.contains("`storage.db_mmap_size_byte`"), "got: {err}");
         assert!(err.contains("db_mmap_size_bytes"), "nearest sibling: {err}");
         assert!(err.contains("config check --file"), "repair hint: {err}");
-        assert!(
-            !err.contains("sekrit-must-not-leak"),
-            "secret echoed: {err}"
-        );
+        assert!(!err.contains("sekrit-must-not-leak"), "secret echoed");
         // The file is untouched — a detector never repairs.
         assert!(std::fs::read_to_string(&path).unwrap().contains("[memory]"));
     }
@@ -1779,7 +1776,7 @@ model = "grok-4.3"
         let file_origin = format!("# file {}", path.display());
         assert!(
             !text.contains("AKIAEXAMPLE3715AAAAB"),
-            "the funnel masks a credential-shaped value: {text}"
+            "the funnel masks a credential-shaped value"
         );
         assert!(
             text.contains(&format!(
@@ -1821,7 +1818,10 @@ model = "grok-4.3"
             "{text}"
         );
         // The credential: key present, bytes absent.
-        assert!(!text.contains("sk-PLAINTEXT-CREDENTIAL-3715"), "{text}");
+        assert!(
+            !text.contains("sk-PLAINTEXT-CREDENTIAL-3715"),
+            "the output must not contain the forbidden text"
+        );
         assert!(
             text.contains(&format!(
                 "api_key = {:?}  {file_origin}",
@@ -1882,7 +1882,7 @@ model = "grok-4.3"
             "{text}"
         );
         // A replacement key carries no deprecation note (absence, same manifest).
-        assert!(!text.contains("llm.model = (unset: the compiled default applies at use)  # compiled-default  # DEPRECATED"), "{text}");
+        assert!(!text.contains("llm.model = (unset: the compiled default applies at use)  # compiled-default  # DEPRECATED"), "the output must not contain the forbidden text");
 
         let bad = dir.path().join("typo.toml");
         std::fs::write(&bad, "[storage]\ndefault_namespac = \"x\"\n").unwrap();
@@ -1892,7 +1892,7 @@ model = "grok-4.3"
         assert!(err.contains("default_namespac"), "{err}");
         assert!(
             !text.contains("default_namespac"),
-            "nothing printed on refusal: {text}"
+            "nothing printed on refusal"
         );
     }
 }

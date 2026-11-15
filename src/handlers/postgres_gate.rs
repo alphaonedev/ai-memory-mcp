@@ -1195,9 +1195,18 @@ mod store_err_sanitize_tests {
     fn sanitize_redacts_postgres_url() {
         let leak = "connection failed for postgres://admin:hunter2@db.internal:5432/ai_memory";
         let clean = sanitize_store_err_message(leak);
-        assert!(!clean.contains("postgres://"), "raw scheme leaked: {clean}");
-        assert!(!clean.contains("hunter2"), "password leaked: {clean}");
-        assert!(!clean.contains("db.internal"), "host leaked: {clean}");
+        assert!(
+            !clean.contains("postgres://"),
+            "sanitize_store_err_message must strip the postgres:// scheme"
+        );
+        assert!(
+            !clean.contains("hunter2"),
+            "sanitize_store_err_message must strip the userinfo password"
+        );
+        assert!(
+            !clean.contains("db.internal"),
+            "sanitize_store_err_message must strip the URL host"
+        );
         assert!(
             clean.contains(REDACTED_URL_SENTINEL),
             "missing sentinel: {clean}"
@@ -1208,7 +1217,10 @@ mod store_err_sanitize_tests {
     fn sanitize_redacts_filesystem_path() {
         let leak = "open /var/lib/postgresql/data/global/pg_control failed";
         let clean = sanitize_store_err_message(leak);
-        assert!(!clean.contains("/var/lib"), "raw path leaked: {clean}");
+        assert!(
+            !clean.contains("/var/lib"),
+            "sanitize_store_err_message must strip the filesystem path"
+        );
         assert!(
             clean.contains(REDACTED_PATH_SENTINEL),
             "missing sentinel: {clean}"
@@ -1278,7 +1290,10 @@ mod store_err_sanitize_tests {
     fn sanitize_redacts_url_but_keeps_surrounding_non_ascii() {
         let leak = "title 'café' failed: postgres://u:p@h/db then résumé \u{4EAC}";
         let clean = sanitize_store_err_message(leak);
-        assert!(!clean.contains("postgres://"), "url leaked: {clean}");
+        assert!(
+            !clean.contains("postgres://"),
+            "sanitize_store_err_message must strip the URL between the non-ASCII runs"
+        );
         assert!(
             clean.contains(REDACTED_URL_SENTINEL),
             "no sentinel: {clean}"

@@ -647,7 +647,7 @@ mod tests {
             .await
             .unwrap();
         let result = finalise_quorum(&tracker);
-        assert!(result.is_ok(), "expected quorum met, got {result:?}");
+        assert!(result.is_ok(), "expected quorum met");
         // At least one peer called before quorum returned. With v0.6.0's
         // post-quorum detach, additional fan-outs complete in the
         // background and may or may not have landed by the time this
@@ -932,10 +932,7 @@ mod tests {
             .await
             .unwrap();
         let result = finalise_quorum(&tracker);
-        assert!(
-            result.is_ok(),
-            "majority should tolerate 1 peer down, got {result:?}"
-        );
+        assert!(result.is_ok(), "majority should tolerate 1 peer down");
     }
 
     #[test]
@@ -993,7 +990,7 @@ mod tests {
         let cfg = build_config(vec![url1, url2], 2, 2000);
         let tracker = broadcast_archive_quorum(&cfg, "mem-s29").await.unwrap();
         let result = finalise_quorum(&tracker);
-        assert!(result.is_ok(), "expected quorum met, got {result:?}");
+        assert!(result.is_ok(), "expected quorum met");
         // Let detached fanout complete so both peers are observed.
         for _ in 0..20 {
             if count1.load(Ordering::Relaxed) == 1 && count2.load(Ordering::Relaxed) == 1 {
@@ -1602,13 +1599,11 @@ mod tests {
         for peer in &cfg.peers {
             assert!(
                 peer.id.starts_with("peer-h"),
-                "peer id must carry the #2442 stable-identity prefix, got {}",
-                peer.id
+                "peer id must carry the #2442 stable-identity prefix",
             );
             assert!(
                 !crate::federation::peer::is_legacy_positional_peer_id(&peer.id),
-                "a minted peer id must never impersonate the legacy positional shape, got {}",
-                peer.id
+                "a minted peer id must never impersonate the legacy positional shape",
             );
         }
         assert_ne!(
@@ -1776,7 +1771,7 @@ mod tests {
         // Hyphen IS in the unreserved set → must NOT be percent-encoded.
         assert!(
             !encoded.contains("%2D"),
-            "hyphen must pass through unencoded: {encoded}"
+            "hyphen must pass through unencoded"
         );
     }
 
@@ -2425,8 +2420,8 @@ mod tests {
         let key = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/tls/valid_key_pkcs8.pem");
         // Sanity: fixtures exist on disk.
-        assert!(cert.exists(), "missing test fixture: {cert:?}");
-        assert!(key.exists(), "missing test fixture: {key:?}");
+        assert!(cert.exists(), "missing test fixture: valid_cert.pem");
+        assert!(key.exists(), "missing test fixture: valid_key_pkcs8.pem");
 
         let result = FederationConfig::build(
             2,
@@ -2458,7 +2453,7 @@ mod tests {
         let cert = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/tls/valid_cert.pem");
         let bogus_key = std::path::PathBuf::from("/definitely/missing/key.pem");
-        assert!(cert.exists(), "missing test fixture: {cert:?}");
+        assert!(cert.exists(), "missing test fixture: valid_cert.pem");
 
         let result = FederationConfig::build(
             2,

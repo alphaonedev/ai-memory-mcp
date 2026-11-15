@@ -1246,11 +1246,8 @@ mod tests {
         let err = String::from_utf8(stderr).unwrap();
         assert!(err.contains("ai-memory skill retire:"), "got: {err}");
         assert!(err.contains(SKILL_SELECTOR_REQUIRED), "got: {err}");
-        assert!(
-            !err.contains("memory_skill_retire"),
-            "MCP tool leaked: {err}"
-        );
-        assert!(!err.contains("skill_id"), "MCP param leaked: {err}");
+        assert!(!err.contains("memory_skill_retire"), "MCP tool");
+        assert!(!err.contains("skill_id"), "MCP param");
         assert!(stdout.is_empty());
     }
 

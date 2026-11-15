@@ -1848,7 +1848,7 @@ mod tests {
             );
             assert!(
                 !stdout.contains("unsupported by binary"),
-                "the boot-private string must be gone: {stdout}"
+                "the boot-private string must be gone"
             );
 
             let mut env = TestEnv::fresh();
@@ -1917,11 +1917,11 @@ mod tests {
         );
         assert!(
             !stdout.contains("unsupported by binary"),
-            "must not print the schema-ahead upgrade remedy for a destroyed stamp: {stdout}"
+            "must not print the schema-ahead upgrade remedy for a destroyed stamp"
         );
         assert!(
             !stdout.contains("consider upgrading"),
-            "must not tell the operator to upgrade a binary that is already current: {stdout}"
+            "must not tell the operator to upgrade a binary that is already current"
         );
     }
 
@@ -1973,7 +1973,7 @@ mod tests {
         );
         assert!(
             !stdout.contains("consider upgrading"),
-            "must not tell the operator to upgrade — no binary wrote this version: {stdout}"
+            "must not tell the operator to upgrade — no binary wrote this version"
         );
     }
 
@@ -2014,7 +2014,7 @@ mod tests {
         );
         assert!(
             !note.contains("unsupported by binary") && !note.contains("consider upgrading"),
-            "JSON note must not print the schema-ahead upgrade remedy: {note}"
+            "JSON note must not print the schema-ahead upgrade remedy"
         );
     }
 
@@ -2102,7 +2102,7 @@ mod tests {
         );
         assert!(
             !stdout.contains("consider upgrading"),
-            "must not print the schema-ahead upgrade remedy for a behind stamp: {stdout}"
+            "must not print the schema-ahead upgrade remedy for a behind stamp"
         );
         let still: i64 = rusqlite::Connection::open(&db_path)
             .expect("raw reopen")
@@ -2299,11 +2299,11 @@ mod tests {
         // The original distinctive titles MUST NOT leak.
         assert!(
             !stdout.contains("secret-subject-alpha"),
-            "title leaked despite redact_titles=true: {stdout}"
+            "title leaked despite redact_titles=true"
         );
         assert!(
             !stdout.contains("secret-subject-beta"),
-            "title leaked despite redact_titles=true: {stdout}"
+            "title leaked despite redact_titles=true"
         );
     }
 
@@ -2348,10 +2348,7 @@ mod tests {
             "title slot must carry the redaction sentinel: {row_line}"
         );
         // The original title MUST NOT leak anywhere.
-        assert!(
-            !stdout.contains("private-title"),
-            "raw title must not leak: {stdout}"
-        );
+        assert!(!stdout.contains("private-title"), "raw title must not leak");
     }
 
     #[test]
@@ -2383,7 +2380,7 @@ mod tests {
         );
         assert!(
             !stdout.contains(REDACTED_TITLE),
-            "default config must NOT redact: {stdout}"
+            "default config must NOT redact"
         );
     }
 
@@ -2561,7 +2558,7 @@ mod tests {
         // The raw subject payload must not leak anywhere in stdout.
         assert!(
             !stdout.contains("super-secret-memory-subject-content"),
-            "content leaked despite redact_titles=true: {stdout}"
+            "content leaked despite redact_titles=true"
         );
     }
 
@@ -2590,11 +2587,11 @@ mod tests {
         let stdout = std::str::from_utf8(&env.stdout).unwrap();
         assert!(
             !stdout.contains("toon-secret-subject-payload"),
-            "content leaked in toon output despite redact_titles=true: {stdout}"
+            "content leaked in toon output despite redact_titles=true"
         );
         assert!(
             !stdout.contains("toon-private-title"),
-            "title leaked in toon output despite redact_titles=true: {stdout}"
+            "title leaked in toon output despite redact_titles=true"
         );
     }
 

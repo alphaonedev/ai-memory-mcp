@@ -869,10 +869,13 @@ mod tests {
         let url =
             "postgres://svc_acct:hunter2@db.internal:5432/prod?password=hunter3&sslkey=/etc/pg/k";
         let masked = masked_report_url(url);
-        for secret in ["hunter2", "hunter3", "svc_acct", "/etc/pg/k"] {
+        for (case_idx, secret) in ["hunter2", "hunter3", "svc_acct", "/etc/pg/k"]
+            .iter()
+            .enumerate()
+        {
             assert!(
                 !masked.contains(secret),
-                "{secret:?} leaked into report url: {masked}"
+                "fixture #{case_idx} leaked into the report url"
             );
         }
         assert_eq!(masked, "postgres://db.internal:5432/prod");
@@ -1024,7 +1027,7 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("unrecognised store URL"), "got: {msg}");
         // #1579 A3 — credential must be redacted in the error.
-        assert!(!msg.contains("secret"), "credential leaked: {msg}");
+        assert!(!msg.contains("secret"), "credential");
     }
 
     // ----------------------------------------------------------------
@@ -1803,7 +1806,7 @@ mod tests {
         for postgres_only in ["pgvector:", "role:", "ag_catalog:"] {
             assert!(
                 !s.contains(postgres_only),
-                "a SQLite report must not carry the postgres-only line {postgres_only:?}: {s}"
+                "a SQLite report must not carry the postgres-only line {postgres_only:?}"
             );
         }
     }

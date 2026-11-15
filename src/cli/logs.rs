@@ -1352,10 +1352,7 @@ mod tests {
         let (s1, e1) = poll_once(dir.path(), &mut state);
         assert_eq!(s1, "late-old\n", "renamed file still drained: {s1:?}");
         assert!(e1.contains("cannot open"), "reported: {e1:?}");
-        assert!(
-            !e1.contains("following from the start"),
-            "no false note: {e1:?}"
-        );
+        assert!(!e1.contains("following from the start"), "no false note");
         let (s2, e2) = poll_once(dir.path(), &mut state);
         assert_eq!((s2.as_str(), e2.as_str()), ("", ""), "quiet and once");
         fs::set_permissions(&a, fs::Permissions::from_mode(0o644)).unwrap();
@@ -1463,14 +1460,14 @@ mod tests {
         }
         let (s1, e1) = poll_once(dir.path(), &mut state);
         assert_eq!(s1, "", "no reprint: {s1:?}");
-        assert!(!e1.contains("renamed"), "false rename claim: {e1:?}");
-        assert!(!e1.contains("rotated"), "false rotation claim: {e1:?}");
+        assert!(!e1.contains("renamed"), "false rename claim");
+        assert!(!e1.contains("rotated"), "false rotation claim");
         assert_eq!(state.offset, 8, "cursor untouched by the failure");
         make_openable(&a);
         append(&a, "three\n");
         let (s2, e2) = poll_once(dir.path(), &mut state);
         assert_eq!(s2, "three\n", "only the new line, no reprint: {s2:?}");
-        assert!(!e2.contains("rotated"), "no rotation note: {e2:?}");
+        assert!(!e2.contains("rotated"), "no rotation note");
     }
 
     /// #8118 - after a transient episode on the same file, a real rename plus
@@ -1710,7 +1707,7 @@ mod tests {
         let doc = between(src, "struct FollowState", "unreadable: Option<PathBuf>");
         assert!(
             !doc.contains("Newer log file that could not be opened"),
-            "stale field doc: {doc}"
+            "stale field doc"
         );
     }
 
@@ -2203,7 +2200,7 @@ mod tests {
         assert_eq!(s1, "next\n");
         assert_eq!(e1.matches("cannot open").count(), 1, "{e1:?}");
         assert!(e1.contains(&format!("following {}", b.display())), "{e1:?}");
-        assert!(!e1.contains("still following"), "stale name: {e1:?}");
+        assert!(!e1.contains("still following"), "stale name");
         let later: Vec<usize> = (0..3).map(|_| notes_of(dir.path(), &mut state)).collect();
         assert_eq!(later, [0, 0, 0], "no repeat after the switch");
     }
@@ -2226,7 +2223,7 @@ mod tests {
         let (s, e) = poll_once(dir.path(), &mut state);
         assert_eq!(s, "late\n", "old handle drained: {s:?}");
         assert!(e.ends_with("; still following the open file\n"), "{e:?}");
-        assert!(!e.contains("renamed"), "no unproven rename claim: {e:?}");
+        assert!(!e.contains("renamed"), "no unproven rename claim");
     }
 
     /// #8148 - the same exact tail without an inode.

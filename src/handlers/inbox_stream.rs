@@ -256,7 +256,13 @@ mod tests {
     fn frame_carries_no_body_3465() {
         let json = serde_json::to_string(&wake_for("bob")).expect("serialise");
         assert!(json.contains("content_digest"), "{json}");
-        assert!(!json.contains("payload"), "{json}");
-        assert!(!json.contains("content\":"), "{json}");
+        assert!(
+            !json.contains("payload"),
+            "the output must not contain the forbidden text"
+        );
+        assert!(
+            !json.contains("content\":"),
+            "the output must not contain the forbidden text"
+        );
     }
 }

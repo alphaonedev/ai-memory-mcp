@@ -3014,7 +3014,7 @@ mod tests {
             );
             assert!(
                 !msg.contains("hunter2"),
-                "refusal must redact the DSN password: {msg}"
+                "refusal must redact the DSN password"
             );
         }
         // SAFETY: see above.
@@ -3323,7 +3323,7 @@ mod tests {
             .expect_err("a postgres store must be refused")
             .to_string();
         assert!(err.contains("pg_dump"), "got: {err}");
-        assert!(!err.contains("hunter2"), "DSN password leaked: {err}");
+        assert!(!err.contains("hunter2"), "DSN password");
     }
 
     /// `restore` refuses the same store — the false-assurance half of #2444.
@@ -3349,7 +3349,7 @@ mod tests {
             .expect_err("restoring onto a postgres store must be refused")
             .to_string();
         assert!(err.contains("pg_dump"), "got: {err}");
-        assert!(!err.contains("hunter2"), "DSN password leaked: {err}");
+        assert!(!err.contains("hunter2"), "DSN password");
     }
 
     /// An unrecognised scheme must NOT fall back to the local `--db` file —

@@ -935,7 +935,7 @@ mod cov897_tests {
         assert_eq!(out.len(), 2, "filters byte-equal title, got {titles:?}");
         assert!(titles.contains(&"alpha"), "alpha present in {titles:?}");
         assert!(titles.contains(&"gamma"), "gamma present in {titles:?}");
-        assert!(!titles.contains(&"beta"), "beta filtered from {titles:?}");
+        assert!(!titles.contains(&"beta"), "beta filtered from");
     }
 
     #[tokio::test]

@@ -658,8 +658,11 @@ mod build_pinning_tests {
             text.contains("https://peer.example:8443/m"),
             "the refusal must NAME the peer's origin + path: {text}"
         );
-        for leaked in ["AUTH_CANARY", "QUERY_CANARY", "query_canary", "u:"] {
-            assert!(!text.contains(leaked), "leaked {leaked:?}: {text}");
+        for (case_idx, leaked) in ["AUTH_CANARY", "QUERY_CANARY", "query_canary", "u:"]
+            .iter()
+            .enumerate()
+        {
+            assert!(!text.contains(leaked), "fixture #{case_idx} leaked");
         }
     }
 
@@ -680,7 +683,7 @@ mod build_pinning_tests {
                 && text.contains("https://peer.example:8443/n"),
             "the refusal must NAME each peer's origin + path: {text}"
         );
-        for leaked in [
+        for (case_idx, leaked) in [
             "FIRST_CANARY",
             "SECOND_CANARY",
             "Q1_CANARY",
@@ -688,8 +691,11 @@ mod build_pinning_tests {
             "alice",
             "bob",
             "assword=",
-        ] {
-            assert!(!text.contains(leaked), "leaked {leaked:?}: {text}");
+        ]
+        .iter()
+        .enumerate()
+        {
+            assert!(!text.contains(leaked), "fixture #{case_idx} leaked");
         }
     }
 

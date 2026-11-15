@@ -139,8 +139,14 @@ mod tests {
             rendered.starts_with(&format!("peer {label}: ")),
             "{rendered}"
         );
-        assert!(!rendered.contains("hunter2"), "{rendered}");
-        assert!(!rendered.contains(".example"), "{rendered}");
+        assert!(
+            !rendered.contains("hunter2"),
+            "the output must not contain the forbidden text"
+        );
+        assert!(
+            !rendered.contains(".example"),
+            "the output must not contain the forbidden text"
+        );
         let fresh = super::super::freshness::snapshot_for(&peer).expect("failure recorded");
         assert_eq!(fresh.push.consecutive_failures, 1);
         assert_eq!(fresh.push.last_failure_class, Some("task_failed"));
