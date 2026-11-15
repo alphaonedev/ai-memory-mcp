@@ -166,7 +166,7 @@ fn sqlite_router(dir: &tempfile::TempDir) -> axum::Router {
     build_router(db, store, StorageBackend::Sqlite)
 }
 
-/// One session_start call. `key` is the `x-api-key` value, `x_agent` the
+/// One `session_start` call. `key` is the `x-api-key` value, `x_agent` the
 /// `X-Agent-Id` header, `body_agent` the JSON body `agent_id`.
 async fn call(
     router: &axum::Router,
