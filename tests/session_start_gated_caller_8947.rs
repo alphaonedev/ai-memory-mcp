@@ -12,7 +12,7 @@
 //! `X-Agent-Id` header, so a shared-transport-key caller that sent NO header
 //! and a body `agent_id` naming another agent got that agent's private rows.
 //!
-//! Invariant pinned here: for HTTP session_start under `enforce`, no body
+//! Invariant pinned here: for HTTP `session_start` under `enforce`, no body
 //! `agent_id` spelling can widen the result past the gated principal. A named
 //! body principal is held to the same proof as a named header principal.
 //!
