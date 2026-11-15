@@ -34,6 +34,8 @@ fn serve_help_documents_tier_resolution() {
     let assert = Command::cargo_bin("ai-memory")
         .unwrap()
         .env("AI_MEMORY_NO_CONFIG", "1")
+        .env("AI_MEMORY_EMBED_OFFLINE", "1")
+        .env("HF_HUB_OFFLINE", "1")
         .args(["serve", "--help"])
         .assert()
         .success();
@@ -67,6 +69,8 @@ fn serve_rejects_tier_flag() {
     let assert = Command::cargo_bin("ai-memory")
         .unwrap()
         .env("AI_MEMORY_NO_CONFIG", "1")
+        .env("AI_MEMORY_EMBED_OFFLINE", "1")
+        .env("HF_HUB_OFFLINE", "1")
         .args(["serve", "--tier", "autonomous"])
         .assert()
         .failure();
@@ -89,6 +93,8 @@ fn serve_help_flat() -> (String, String) {
     let assert = Command::cargo_bin("ai-memory")
         .unwrap()
         .env("AI_MEMORY_NO_CONFIG", "1")
+        .env("AI_MEMORY_EMBED_OFFLINE", "1")
+        .env("HF_HUB_OFFLINE", "1")
         .args(["serve", "--help"])
         .assert()
         .success();
@@ -150,8 +156,10 @@ const HELP_NEVER_PLAIN: &str = "never serves plaintext HTTP";
 
 /// Refusal texts the daemon prints (pinned elsewhere in
 /// `tests/transit_encryption_3705.rs`; here they prove help = behaviour).
+/// clap `requires` on each flag: the half pair is refused at parse time,
+/// naming the missing partner.
 const SAYS_NEEDS_KEY: &str = "--tls-key";
-const SAYS_ONLY_ONE: &str = "only one of --tls-cert/--tls-key was given";
+const SAYS_NEEDS_CERT: &str = "--tls-cert";
 const SAYS_ENTERPRISE_PKI: &str = "enterprise PKI";
 const SAYS_DOWNGRADE: &str = "downgrade path";
 const SAYS_REQUIRE_TLS: &str = "unset AI_MEMORY_REQUIRE_TLS";
@@ -207,8 +215,8 @@ const ROWS: [Row; 7] = [
         setup: Setup::KeyOnly,
         help: HELP_PAIRED,
         expect: Expect::Refuses {
-            exit: None,
-            says: SAYS_ONLY_ONE,
+            exit: Some(CLAP_USAGE_EXIT),
+            says: SAYS_NEEDS_CERT,
         },
     },
     Row {

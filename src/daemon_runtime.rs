@@ -12,7 +12,7 @@
 //! ## Public surface (post-W6)
 //!
 //! - [`run`] — top-level CLI dispatch (called from `main()`).
-//! - [`serve`] — full HTTP daemon body (TLS or plain).
+//! - [`serve`] — full HTTPS daemon body (in-process TLS only; #3705, #4006).
 //! - [`bootstrap_serve`] — testable struct-returning state builder.
 //! - [`build_router`] — composition wrapper around `lib::build_router`.
 //! - [`build_embedder`], [`build_vector_index`] — single canonical builders
@@ -1123,10 +1123,10 @@ pub struct ServeArgs {
     pub host: String,
     #[arg(long, default_value_t = DEFAULT_PORT)]
     pub port: u16,
-    /// Path to PEM-encoded TLS certificate (may include the full chain).
-    /// Passing both `--tls-cert` and `--tls-key` switches `serve` to
-    /// HTTPS. rustls under the hood — no OpenSSL dep. Absent both
-    /// flags = plain HTTP (same as every previous release).
+    /// PEM TLS certificate (may include the full chain), paired with `--tls-key`;
+    /// rustls, no OpenSSL. Without these flags `serve` uses material installed by
+    /// `ai-memory tls import` or generated locally for a singleton, and refuses
+    /// otherwise; it never serves plaintext HTTP (#3705, #4006).
     #[arg(long, requires = "tls_key")]
     pub tls_cert: Option<PathBuf>,
     /// Path to PEM-encoded TLS private key (PKCS#8 or RSA).
@@ -5929,17 +5929,18 @@ fn require_api_key_strict_value(value: Option<&str>) -> bool {
 /// front of the daemon, so a non-loopback bind without in-process TLS is an
 /// accepted posture.
 ///
-/// Consumed by [`tls_bind_guard`] (tranche 3): when set, a plaintext
-/// non-loopback bind is silently permitted instead of emitting the hard M2
-/// posture WARN.
+/// #3705 removed this hatch: a truthy value now refuses boot as a downgrade
+/// path ([`allow_plaintext_nonloopback_enabled`]); it never permits a
+/// plaintext bind (#4006).
 pub const ENV_ALLOW_PLAINTEXT_NONLOOPBACK: &str = "AI_MEMORY_ALLOW_PLAINTEXT_NONLOOPBACK";
 
 /// #2032 M2 (class-a, 5-agent vote `4d3ea1c5`) — env name for the
 /// fail-closed-now TLS opt-in. When truthy the operator demands in-process
 /// TLS on every bind; a plaintext bind is refused.
 ///
-/// Consumed by [`tls_bind_guard`] (tranche 3): when set, a bind without a
-/// `--tls-cert` / `--tls-key` pair is refused (fail-closed-now).
+/// Since #3705 the floor is always in force ([`require_tls_enabled`]); a
+/// falsy or unrecognised value refuses boot rather than making TLS optional
+/// (#4006).
 pub const ENV_REQUIRE_TLS: &str = "AI_MEMORY_REQUIRE_TLS";
 
 /// #2032 M2 → #3705 — the `AI_MEMORY_ALLOW_PLAINTEXT_NONLOOPBACK` hatch is a
@@ -6462,10 +6463,9 @@ pub async fn bootstrap_serve(
     tls_bind_guard(true, args.host.as_str(), args.port)?;
 
     // v1.0.0 #3474 — record whether THIS listener may carry a freshly minted
-    // bearer credential. The #2032 M2 guard above only WARNs on a plaintext
-    // non-loopback bind (and `AI_MEMORY_ALLOW_PLAINTEXT_NONLOOPBACK=1`
-    // silences even that), which is a survivable posture for content and an
-    // unsurvivable one for handing out a per-agent api-key in the clear. The
+    // bearer credential. (Before #3705 the #2032 M2 guard only WARNed on a
+    // plaintext non-loopback bind; the guard above now refuses every
+    // plaintext bind, #4006.) The
     // mint route consults this marker and refuses; the REVOKE route does not,
     // because refusing a revocation is strictly worse than performing one over
     // a channel the operator already accepted. Default is `false` (refuse), so
@@ -8126,7 +8126,8 @@ fn classify_server_failure(error: anyhow::Error) -> anyhow::Error {
 }
 
 /// Run the HTTP memory daemon. Loads TLS state, builds `AppState`, spawns
-/// lifecycle-owned workers, and binds a listener (TLS or plain HTTP). On every
+/// lifecycle-owned workers, and binds a TLS listener (never plain HTTP; #3705,
+/// #4006). On every
 /// exit path it quiesces writers, drains deferred audit, and either completes
 /// final witness/WAL certification or returns [`FatalShutdownError`].
 #[allow(clippy::too_many_lines)]

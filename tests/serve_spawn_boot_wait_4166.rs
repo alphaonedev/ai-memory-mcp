@@ -102,12 +102,6 @@ const EXEMPT: &[(&str, ExemptKind, &str)] = &[
          `.assert()`; no daemon boots",
     ),
     (
-        "cli_serve_help_text.rs",
-        ExemptKind::NoLongLivedChild,
-        "asserts `serve --help` text and a clap refusal; every spawn ends in \
-         `.assert()`, no daemon boots",
-    ),
-    (
         "credential_to_sink_3711.rs",
         ExemptKind::NoLongLivedChild,
         "serve is refused (--db with --store-url conflict) before any embedder \
