@@ -62,6 +62,7 @@
       "scripts/ci/tests/test_codeql_6163.py",
       "conformance/**",
       "scripts/ci/tests/test_check_cargo_audit_8615.py",
+      "scripts/ci/tests/test_cert_amendment_ledger_6124.py",
       "scripts/ci/tests/test_check_cert_expiry_corpus.py",
       "scripts/ci/tests/test_check_npm_audit_8615.py",
       "scripts/ci/tests/data/npm_audit_8615/**",

@@ -1476,23 +1476,34 @@ def _judge(repo, base, head, judged, mb, tip):
     read by the strict grammar only; the head end by the looser detector with the base's own
     looser lines excused while VOID or EXPIRED is at both ends (the frozen region), else by
     the head detector. While frozen, every passing verdict also needs the head's pre-marker
-    region byte-identical to the range start's (D-1, D-2), checked last, so every earlier
-    refusal keeps its own reason."""
+    region byte-identical to the range start's (D-1, D-2).
+
+    #9303: a frozen region that differs is refused FIRST, naming its first differing line,
+    before the looser banner scan, the ledger and its I4 emphasis check can refuse the same
+    input under another reason. That input was refused at every step anyway, so the order
+    changes only the reason, never the outcome. A region with no single defined boundary
+    (two marker lines, frozen_region_diff raises) is not a frozen-region difference: it keeps
+    its own reason from the ledger, and check_frozen_region below stays as the backstop."""
     base_blob = read_blob(repo, mb, CERT_DOC)
     head_blob = read_blob(repo, judged, CERT_DOC)
     banner_mb = banner_scan(base_blob, capped=False, mode=SCAN_STRICT)
     strict_head = banner_scan(head_blob, capped=True, mode=SCAN_STRICT)
     frozen = banner_mb.status in LEDGER_STATUSES and strict_head.status in LEDGER_STATUSES
     if frozen:
+        try:
+            first_diff = frozen_region_diff(base_blob, head_blob, banner_mb, strict_head)
+        except GateError:
+            first_diff, region_same = None, False
+        else:
+            region_same = first_diff is None
+        if first_diff is not None:
+            raise GateError(REGION_FROZEN_TEXT.format(doc=CERT_DOC, marker=LEDGER_MARKER,
+                                                      line=first_diff))
         # R-6: the base's looser excuse scan runs only within the document cap. A base over
-        # the cap cannot equal the capped head's frozen region, so the change is refused
-        # either way (without excuses its looser lines are refused first, fail closed).
+        # the cap gets no excuses, so any looser line in the head's pre-marker region is
+        # refused at the head, fail closed.
         excuse = base_excuse(base_blob) if len(base_blob) <= LEDGER_MAX_DOC_BYTES else None
         banner_head = banner_scan(head_blob, capped=True, mode=SCAN_LOOSE, excuse=excuse)
-        try:
-            region_same = frozen_region_diff(base_blob, head_blob, banner_mb, strict_head) is None
-        except GateError:
-            region_same = False
     else:
         banner_head = banner_scan(head_blob, capped=True, mode=SCAN_HEAD)
         region_same = False

@@ -45,6 +45,11 @@ line that differs:
 > put the change in a new amendment ledger record or re-issue the certification as LIVE
 > (#6124, 3-agent vote (71472661) v9274-detector)
 
+This reason comes first (#9303): while the region is frozen and differs, the gate names it
+before the banner, Binds-to, STATUS and ledger checks, which would otherwise refuse the
+same change under their own reason at a later line. A region that is byte-identical, or not
+frozen, is judged by those checks as before.
+
 The head of a change holds the marker line exactly once. A range start with no marker
 (the release document) passes only when the whole of it, followed by one blank line, is
 the head's pre-marker region; a start that does not end in a newline is joined with a
@@ -61,11 +66,15 @@ STATUS line and at most one Binds-to line in the strict form. A base whose STATU
 duplicated or unparseable stays refused. Older prose at the base that reads like a STATUS
 or Binds-to line is not a refusal there, because the frozen region keeps it unchanged.
 
-While both ends are VOID or EXPIRED, the head is judged by the loose banner scan with the
-base's own lines excused, and then by the frozen-region compare, which runs last so that
-every earlier refusal keeps its exact reason. The base's lines are excused only while the
-base is within the 8388608-byte document limit; a larger base can never equal the capped
-head's region, so its looser lines are not excused and the change is refused. When either
+While both ends are VOID or EXPIRED, the frozen-region compare runs first: a difference in
+the pre-marker region is refused with the frozen-region reason at the first differing line,
+before any other check. When the region is identical, or the range has no defined region
+(the marker line twice at either end), the head is judged by the loose banner scan, with the
+base's own lines excused, so every other refusal keeps its exact reason. A range with no
+defined region is not a frozen-region difference: it keeps its own reason, and the compare
+runs again after the other checks as a backstop. The loose scan's excuse runs only within
+the 8388608-byte document limit: a base over the cap gets no excuses, so any looser line in
+the head's pre-marker region is refused at the head, fail closed. When either
 end says LIVE, no amendment pass is possible and the head is judged by the head detector: it reads each line after
 decoding HTML entities (at most 4 passes), NFKC folding, dropping every character other
 than a-z and 0-9, and joining a soft line break, and it refuses "a STATUS-like line the
@@ -96,6 +105,20 @@ an item line or a blank line is refused, and an item line that reads like a bann
 is refused with "an item line that reads like a STATUS or Binds-to line". Example record:
 `### Amendment 2026-11-14`, a blank line, `- id: AI_MEMORY_FED_EXAMPLE_FLAG`, `- path:
 src/federation/peer.rs`.
+
+## Re-issue work: lines the head detector refuses (#9305)
+
+The head detector (the scan a LIVE end gets) refuses lines of the tracked
+`docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md` above the ledger marker (24
+refusals on 23 lines: `:2084` is both Binds-like and STATUS-like), so its
+result on that document is DUPLICATE at both banner fields. While the document is VOID at
+both ends these lines are frozen and excused as inherited; they are not edited here. The
+re-issue of the certification as LIVE (#6063) must rewrite each of them first, or the head
+detector refuses the re-issue. The test `test_9305_tracked_scan_head_pinned` pins this list,
+so any change to it is seen.
+
+- Binds-to-like lines: `:82`, `:289`, `:971`, `:1339`, `:1588`, `:1589`, `:1609`, `:1630`, `:1878`, `:2024`, `:2084`, `:2117`.
+- STATUS-like lines: `:1612`, `:1629`, `:1780`, `:1843`, `:1885`, `:1972`, `:2025`, `:2077`, `:2083`, `:2084`, `:2090`, `:2115`.
 
 ## Firing records written before the ledger
 

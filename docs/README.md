@@ -82,7 +82,9 @@ authoritative for its topic; this page is just the map.
   producing a wrong one. The plane is transport-only and content-free,
   and is explicitly NOT COVERED by the
   [enterprise-federation certification](compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md)
-  (§6): losing the hub degrades wake latency, never a row.
+  (§6): losing the hub degrades wake latency, never a row. The rules the
+  cert-expiry gate applies to that certification's amendment ledger are in
+  [CERT-AMENDMENT-LEDGER-RULES.md](compliance/CERT-AMENDMENT-LEDGER-RULES.md).
 - **[RUNBOOK-ollama-kv-tuning.md](RUNBOOK-ollama-kv-tuning.html)** —
   `OLLAMA_KV_CACHE_TYPE=q4_0` for 2–4× LLM memory reduction. Zero
   ai-memory code change.
