@@ -1295,10 +1295,9 @@ impl Fixture {
             return;
         }
         let conn = ai_memory::db::open(&self.db_path).expect("reopen");
-        std::future::ready(
-            ai_memory::db::set_embedding(&conn, id, vector, SEED_SPACE).expect("seed vector"),
-        )
-        .await;
+        ai_memory::db::set_embedding(&conn, id, vector, SEED_SPACE).expect("seed vector");
+        // Keeps the fn async on a build without the Postgres branch above.
+        std::future::ready(()).await;
     }
 }
 
@@ -1452,7 +1451,10 @@ fn failure_reason_rows(branch: Branch) {
             // the title pushes the embed document past the embed cap.
             let content = "x".repeat(ai_memory::models::MAX_CONTENT_SIZE);
             let doc_len = embedding_document(title, &content).len();
-            assert!(doc_len > ai_memory::embeddings::EMBED_MAX_BYTES, "{row}: {doc_len}");
+            assert!(
+                doc_len > ai_memory::embeddings::EMBED_MAX_BYTES,
+                "{row}: {doc_len}"
+            );
             let (status, receipt) = send(
                 fx.router.clone(),
                 request("POST", "/api/v1/memories", &memory_body(title, &content)),
