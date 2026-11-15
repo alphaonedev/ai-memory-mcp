@@ -140,6 +140,8 @@ def _load_gate():
 
 
 cert = _load_gate()
+# W-4 (#9321): the gate's own clock, captured before any cell pins it (None on a gate without it).
+REAL_UTC_TODAY = getattr(cert, "utc_today", None)
 
 
 def head_doc(status="VOID", binds=None, status_suffix=""):
@@ -1540,6 +1542,16 @@ class OptionBRegion(LedgerCase):
         if probe.returncode != 0:
             self.skipTest(f"release commit {RELEASE_SHA} is not in this clone")
         ok, out = cert.check_change(HARNESS_ROOT, RELEASE_SHA, "HEAD")
+        self.assert_pass(ok, out, RELEASE_PASS)
+
+    def test_w4_d3_form_range_with_todays_record_passes(self):
+        """W-4 (#9321, umbrella #8185): D-3's form (release-shaped base, one join line feed,
+        the marker, one record) whose record is dated the real UTC today. A truthful record is
+        dated today, so the judgement must not depend on the pinned test clock."""
+        today = REAL_UTC_TODAY().isoformat()
+        s = self.scene("VOID", base_doc=release_shaped())
+        head = on_release(s.doc, record(today, path_item(MOD_RS)))
+        ok, out = s.judge(self.wire_and_doc(s, head))
         self.assert_pass(ok, out, RELEASE_PASS)
 
     # D-4 ---------------------------------------------------------------------------------
