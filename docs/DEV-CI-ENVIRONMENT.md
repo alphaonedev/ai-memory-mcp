@@ -88,6 +88,31 @@ the cert SANs, catching a misrouted/MITM'd connection, not merely an untrusted o
   `brew install rust` — see §9. Host-specific paths and runner service names
   are operator-local, not published here.
 
+### 3.3 Runner `TMPDIR` prune (#8634)
+
+Tests create databases, WAL files and migration backups under the runner's
+`TMPDIR`, and a persistent runner never discards them. Every self-hosted job
+therefore runs the composite action `.github/actions/prune-runner-tmp` as the
+step right after checkout (guarded by `runner.environment == 'self-hosted'`),
+which runs `scripts/ci/prune_runner_tmp.py` with these rules:
+
+- Only DIRECT entries of the resolved `TMPDIR` whose own mtime (lstat, never a
+  symlink target) is older than one day (`MAX_AGE_SECS`) are removed. An old
+  directory goes whole, whatever its children's mtimes. A symlink is unlinked
+  and never followed, so a sibling `runner-N` directory is never touched.
+- It refuses, with a non-zero exit, nothing deleted and the reason on stderr,
+  when `TMPDIR` is unset, empty, relative, missing, not a directory, a symlink,
+  not owned by the current user, equal to `/`, `/tmp`, the home directory or the
+  workspace, or not strictly below an allowed root (`ALLOWED_ROOTS` in the
+  script, plus `--root`). A refusal fails the job, so a misconfigured runner is
+  seen.
+- A failure on one entry (permission, vanished, busy) is counted and printed
+  but does not fail the job: the step exits 0 with
+  `pruned=<n> kept=<n> failed=<n> freed_bytes=<n>`. `--dry-run` lists what
+  would go and deletes nothing.
+- It needs Python 3.12+ on the runner. The test families that leak the files
+  are fixed separately; the prune treats the symptom.
+
 ---
 
 ## 4. CI topology

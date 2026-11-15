@@ -1339,6 +1339,9 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
+      - name: Prune stale runner TMPDIR (#8634)
+        if: needs.classify.outputs.cargo_skip != 'true' && runner.environment == 'self-hosted'
+        uses: ./.github/actions/prune-runner-tmp
 
       # #8322 - ONE line naming the reason and the rules version. STEP-level:
       # this is a required matrix job (rule (b1), #2494).

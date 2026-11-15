@@ -415,8 +415,8 @@ class WorkflowWiring(unittest.TestCase):
         text = (ROOT / ACTION_PATH).read_text()
         self.assertIn("using: composite", text)
         self.assertIn("scripts/ci/prune_runner_tmp.py", text)
-        self.assertRegex(text, r"(?i)refus\w+ .*fails? the job")
-        self.assertRegex(text, r"(?i)per-entry .*does not fail")
+        self.assertRegex(text, r"(?is)refus\w+ .*fails? the job")
+        self.assertRegex(text, r"(?is)per-entry .*does not fail")
         self.assertIsNone(re.search(r"continue-on-error", text))
 
 
