@@ -31,18 +31,22 @@ use ai_memory::identity::keypair::{self, EnsureOutcome};
 /// A fresh, `0o700`, owner-only key directory under the canonicalised system
 /// temp root (matching `test_key_dir::install`'s posture, which
 /// `enforce_key_dir_secure` accepts), unique per call.
-fn secure_key_dir(tag: &str) -> PathBuf {
+fn secure_key_dir(tag: &str) -> (tempfile::TempDir, PathBuf) {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let root = std::env::temp_dir()
         .canonicalize()
         .expect("canonicalize temp dir");
     let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    let dir = root.join(format!("km-race-3772-{tag}-{}-{n}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("create key dir");
+    // #8634: the returned guard removes the directory on pass, failure and panic.
+    let guard = tempfile::Builder::new()
+        .prefix(&format!("km-race-3772-{tag}-{}-{n}-", std::process::id()))
+        .tempdir_in(&root)
+        .expect("create key dir");
+    let dir = guard.path().to_path_buf();
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
         .expect("chmod 0700 key dir");
-    dir
+    (guard, dir)
 }
 
 #[test]
@@ -52,7 +56,7 @@ fn concurrent_ensure_keypair_never_tears_the_pair_3772() {
     let agent_id = "host:race-3772";
 
     for round in 0..ROUNDS {
-        let dir = secure_key_dir(&format!("r{round}"));
+        let (_dir_guard, dir) = secure_key_dir(&format!("r{round}"));
         let barrier = Arc::new(Barrier::new(THREADS));
         let handles: Vec<_> = (0..THREADS)
             .map(|_| {
@@ -109,7 +113,5 @@ fn concurrent_ensure_keypair_never_tears_the_pair_3772() {
             loaded.public.to_bytes(),
             "round {round}: loaded private does not derive loaded public"
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

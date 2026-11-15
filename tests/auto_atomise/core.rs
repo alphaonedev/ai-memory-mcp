@@ -59,6 +59,15 @@ use rusqlite::Connection;
 mod atomise_gate;
 use atomise_gate::AtomiseGate;
 
+// #8634: process-scoped scratch dir (removed at exit) for the shared DB.
+#[path = "../common/process_scratch.rs"]
+mod process_scratch;
+
+/// Prefix of the directory holding the shared on-disk DB.
+const SHARED_DB_DIR_PREFIX: &str = "wt1d-auto-atomise-";
+/// File name of the shared DB inside that directory.
+const SHARED_DB_FILE: &str = "shared.db";
+
 // ---------------------------------------------------------------------------
 // MockCurator — programmable, deterministic.
 // ---------------------------------------------------------------------------
@@ -367,18 +376,11 @@ fn store_then_maybe_enqueue(
 fn shared_db_path() -> &'static PathBuf {
     static SHARED: OnceLock<PathBuf> = OnceLock::new();
     SHARED.get_or_init(|| {
-        let tmp = std::env::var("TMPDIR")
-            .ok()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                std::env::current_dir()
-                    .unwrap_or_else(|_| PathBuf::from("."))
-                    .join(".local-runs")
-                    .join("tmp")
-            });
-        // Ensure parent exists.
-        std::fs::create_dir_all(&tmp).ok();
-        tmp.join(format!("wt1d-auto-atomise-{}.db", uuid::Uuid::new_v4()))
+        // #8634: the DB lives INSIDE a process-scoped directory that is removed
+        // at exit, so the file and its `-wal` / `-shm` sidecars never outlive
+        // the test binary (a bare `TMPDIR/wt1d-auto-atomise-<uuid>.db` was
+        // never removed).
+        process_scratch::process_scratch_dir(SHARED_DB_DIR_PREFIX).join(SHARED_DB_FILE)
     })
 }
 

@@ -1158,3 +1158,49 @@ fn key_panic_messages_pinned_8179() {
         );
     }
 }
+
+/// Directories removed at process exit by [`process_scratch_dir`].
+static EXIT_REMOVALS: std::sync::Mutex<Vec<std::path::PathBuf>> = std::sync::Mutex::new(Vec::new());
+static EXIT_REMOVALS_REGISTERED: std::sync::Once = std::sync::Once::new();
+
+/// `atexit` hook: remove every registered directory. Never panics; a removal
+/// error is ignored (the process is exiting).
+#[cfg(unix)]
+extern "C" fn remove_exit_scratch_dirs() {
+    let dirs = match EXIT_REMOVALS.lock() {
+        Ok(mut guard) => std::mem::take(&mut *guard),
+        Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
+    };
+    for dir in dirs {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+/// #8634 class A: a fresh scratch directory for a fixture that lives for the
+/// WHOLE test process (a process-global sink or `OnceLock` that a
+/// `tempfile::TempDir` guard cannot outlive, because statics are never
+/// dropped). The directory and everything in it is removed from an `atexit`
+/// hook, which runs after a pass, a failed assertion and a panic (the harness
+/// catches the panic and exits normally); only an abort or a kill skips it.
+/// Fixtures with a normal scope use a `tempfile::TempDir` guard instead.
+pub(crate) fn process_scratch_dir(prefix: &str) -> PathBuf {
+    let dir = tempfile::Builder::new()
+        .prefix(prefix)
+        .tempdir()
+        .expect("create the process scratch dir")
+        .keep();
+    EXIT_REMOVALS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(dir.clone());
+    EXIT_REMOVALS_REGISTERED.call_once(|| {
+        #[cfg(unix)]
+        {
+            // SAFETY: `atexit` only records the function pointer; the handler
+            // is a plain `extern "C" fn` that never unwinds.
+            let rc = unsafe { libc::atexit(remove_exit_scratch_dirs) };
+            assert_eq!(rc, 0, "atexit could not register the scratch cleanup");
+        }
+    });
+    dir
+}
