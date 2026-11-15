@@ -314,7 +314,7 @@ negative_cell!(
 negative_cell!(neg_ipv6_url_8855, "http://[::1]:8080/a@b");
 negative_cell!(
     neg_stripe_prefix_inside_word_8855,
-    format!("risk{}{STRIPE_BODY}", concat!("_live_"))
+    format!("risk_live_{STRIPE_BODY}")
 );
 negative_cell!(
     neg_password_comparison_8855,
