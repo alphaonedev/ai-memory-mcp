@@ -80,7 +80,7 @@ enum Redirect {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Proxy {
     /// `.no_proxy()`.
-    NoProxy,
+    Disabled,
     /// Neither `.no_proxy()` nor `.proxy(..)`: reqwest honours the env vars.
     HonoursEnv,
     /// Set per posture by the policy itself (`policy-routed:` entries only).
@@ -104,7 +104,7 @@ impl Redirect {
 impl Proxy {
     fn as_str(self) -> &'static str {
         match self {
-            Self::NoProxy => "no_proxy",
+            Self::Disabled => "no_proxy",
             Self::HonoursEnv => "honours-env",
             Self::PostureDependent => "posture-dependent",
             Self::Unclassified => "unclassified",
@@ -132,7 +132,7 @@ fn body_facts(body: &[u8]) -> (Redirect, Proxy) {
     let no_proxy = compact.contains(".no_proxy()");
     let explicit = compact.contains(".proxy(");
     let proxy = match (no_proxy, explicit) {
-        (true, false) => Proxy::NoProxy,
+        (true, false) => Proxy::Disabled,
         (false, false) => Proxy::HonoursEnv,
         _ => Proxy::Unclassified,
     };
@@ -164,7 +164,7 @@ const ALLOWLIST: [Allowed; 10] = [
         reason: "non-inference: webhook TLS warm-up; completes a handshake only, sends no request",
         credential: "none",
         redirect: Redirect::DefaultFollow,
-        proxy: Proxy::NoProxy,
+        proxy: Proxy::Disabled,
     },
     Allowed {
         file: "src/subscriptions.rs",
@@ -173,7 +173,7 @@ const ALLOWLIST: [Allowed; 10] = [
         reason: "non-inference: webhook dispatch; SSRF address pin, no_proxy and Policy::none (#6053)",
         credential: "HMAC signature header + event body",
         redirect: Redirect::Refused,
-        proxy: Proxy::NoProxy,
+        proxy: Proxy::Disabled,
     },
     Allowed {
         file: "src/daemon_runtime.rs",
@@ -281,22 +281,22 @@ fn blank_range(out: &mut [u8], from: usize, to: usize) {
 /// A literal's delimiters are blanked too; offsets are unchanged.
 fn blank_non_code(src: &[u8]) -> Vec<u8> {
     let mut out = src.to_vec();
-    let n = src.len();
+    let len = src.len();
     let mut i = 0;
-    while i < n {
-        let b = src[i];
+    while i < len {
+        let byte = src[i];
         let next = src.get(i + 1).copied();
-        if b == b'/' && next == Some(b'/') {
+        if byte == b'/' && next == Some(b'/') {
             let end = src[i..]
                 .iter()
                 .position(|&c| c == b'\n')
-                .map_or(n, |p| i + p);
+                .map_or(len, |p| i + p);
             blank_range(&mut out, i, end);
             i = end;
-        } else if b == b'/' && next == Some(b'*') {
+        } else if byte == b'/' && next == Some(b'*') {
             let mut depth = 0usize;
             let mut j = i;
-            while j < n {
+            while j < len {
                 if src[j] == b'/' && src.get(j + 1) == Some(&b'*') {
                     depth += 1;
                     j += 2;
@@ -310,21 +310,21 @@ fn blank_non_code(src: &[u8]) -> Vec<u8> {
                     j += 1;
                 }
             }
-            blank_range(&mut out, i, j.min(n));
+            blank_range(&mut out, i, j.min(len));
             i = j;
-        } else if b == b'r' && (i == 0 || !is_ident_byte(src[i - 1]) || raw_prefix(src, i)) {
-            // Raw string `r"…"` / `r#"…"#` (also after `b` / `c`); `r#ident`
+        } else if byte == b'r' && (i == 0 || !is_ident_byte(src[i - 1]) || raw_prefix(src, i)) {
+            // Raw string `r"…"` / `r#"…"#` (also after `byte` / `c`); `r#ident`
             // (raw identifier) has no quote after the hashes and is code.
             let mut j = i + 1;
-            while j < n && src[j] == b'#' {
+            while j < len && src[j] == b'#' {
                 j += 1;
             }
-            if j < n && src[j] == b'"' {
+            if j < len && src[j] == b'"' {
                 let hashes = j - i - 1;
                 let mut k = j + 1;
                 let end = loop {
-                    if k >= n {
-                        break n;
+                    if k >= len {
+                        break len;
                     }
                     if src[k] == b'"'
                         && src[k + 1..]
@@ -334,7 +334,7 @@ fn blank_non_code(src: &[u8]) -> Vec<u8> {
                             .count()
                             == hashes
                     {
-                        break (k + 1 + hashes).min(n);
+                        break (k + 1 + hashes).min(len);
                     }
                     k += 1;
                 };
@@ -343,22 +343,22 @@ fn blank_non_code(src: &[u8]) -> Vec<u8> {
             } else {
                 i += 1;
             }
-        } else if b == b'"' {
+        } else if byte == b'"' {
             let mut j = i + 1;
-            while j < n && src[j] != b'"' {
+            while j < len && src[j] != b'"' {
                 j += if src[j] == b'\\' { 2 } else { 1 };
             }
-            let end = (j + 1).min(n);
+            let end = (j + 1).min(len);
             blank_range(&mut out, i, end);
             i = end;
-        } else if b == b'\'' {
+        } else if byte == b'\'' {
             // Char literal or lifetime / label.
             if next == Some(b'\\') {
                 let mut j = i + 2;
-                while j < n && src[j] != b'\'' {
+                while j < len && src[j] != b'\'' {
                     j += if src[j] == b'\\' { 2 } else { 1 };
                 }
-                let end = (j + 1).min(n);
+                let end = (j + 1).min(len);
                 blank_range(&mut out, i, end);
                 i = end;
             } else if let Some(lead) = next {
@@ -442,11 +442,12 @@ fn read_ident(code: &[u8], i: usize) -> Option<(String, usize)> {
     }
     let mut word = String::from_utf8_lossy(&code[i..j]).into_owned();
     // Raw identifier `r#name`.
-    if word == "r" && code.get(j) == Some(&b'#') {
-        if let Some((rest, k)) = read_ident(code, j + 1) {
-            word = rest;
-            j = k;
-        }
+    if word == "r"
+        && code.get(j) == Some(&b'#')
+        && let Some((rest, k)) = read_ident(code, j + 1)
+    {
+        word = rest;
+        j = k;
     }
     Some((word, j))
 }
@@ -637,10 +638,10 @@ fn scan_file(raw: &str) -> FileScan {
     let mut frames: Vec<Frame> = Vec::new();
     let mut pending_fn: Option<String> = None;
     let mut i = 0;
-    let n = code.len();
-    while i < n {
-        let b = code[i];
-        if b == b'#' {
+    let len = code.len();
+    while i < len {
+        let byte = code[i];
+        if byte == b'#' {
             let inner = code.get(i + 1) == Some(&b'!');
             let open = if inner { i + 2 } else { i + 1 };
             if code.get(open) == Some(&b'[') {
@@ -689,7 +690,7 @@ fn scan_file(raw: &str) -> FileScan {
             i += 1;
             continue;
         }
-        match b {
+        match byte {
             b'{' => {
                 frames.push(Frame {
                     func: pending_fn.take().map(|name| (name, i)),
@@ -716,7 +717,7 @@ fn scan_file(raw: &str) -> FileScan {
             }
             _ => {}
         }
-        if is_ident_byte(b) && (i == 0 || !is_ident_byte(code[i - 1])) {
+        if is_ident_byte(byte) && (i == 0 || !is_ident_byte(code[i - 1])) {
             if let Some(name) = out_of_line_mod(&code, i) {
                 scan.mods.push(ModDecl {
                     name,
@@ -730,12 +731,12 @@ fn scan_file(raw: &str) -> FileScan {
                 i += 1;
                 continue;
             };
-            if word == "fn" {
-                if let Some((name, k)) = read_ident(&code, skip_ws(&code, after)) {
-                    pending_fn = Some(name);
-                    i = k;
-                    continue;
-                }
+            if word == "fn"
+                && let Some((name, k)) = read_ident(&code, skip_ws(&code, after))
+            {
+                pending_fn = Some(name);
+                i = k;
+                continue;
             }
             if word == "use" {
                 let end = item_end(&code, i);
@@ -754,17 +755,18 @@ fn scan_file(raw: &str) -> FileScan {
                 i = end;
                 continue;
             }
-            // A path `a::b::c` (whitespace allowed around `::`).
+            // A path `a::byte::c` (whitespace allowed around `::`).
             let mut segments = vec![word];
             let mut j = after;
             loop {
                 let k = skip_ws(&code, j);
-                if code.get(k) == Some(&b':') && code.get(k + 1) == Some(&b':') {
-                    if let Some((seg, e)) = read_ident(&code, skip_ws(&code, k + 2)) {
-                        segments.push(seg);
-                        j = e;
-                        continue;
-                    }
+                if code.get(k) == Some(&b':')
+                    && code.get(k + 1) == Some(&b':')
+                    && let Some((seg, seg_end)) = read_ident(&code, skip_ws(&code, k + 2))
+                {
+                    segments.push(seg);
+                    j = seg_end;
+                    continue;
                 }
                 break;
             }
@@ -1111,7 +1113,10 @@ fn class_guard_detects_every_construction_form_4193() {
     // A plain import of the type is not a construction.
     let plain =
         "use reqwest::Client;\nfn f(c: &reqwest::Client) -> reqwest::ClientBuilder { todo!() }\n";
-    assert!(classify(&tree(&[("src/x.rs", plain)]), &[]).is_empty());
+    assert_eq!(
+        classify(&tree(&[("src/x.rs", plain)]), &[]),
+        Vec::<String>::new()
+    );
 }
 
 #[test]
@@ -1283,7 +1288,7 @@ const FACTS_ROWS: [FactsRow; 9] = [
         "reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).no_proxy().build()",
         "none",
         Redirect::Refused,
-        Proxy::NoProxy,
+        Proxy::Disabled,
         "non-inference: fixture",
         &[],
     ),
@@ -1302,7 +1307,7 @@ const FACTS_ROWS: [FactsRow; 9] = [
         "reqwest::Client::new()",
         "none",
         Redirect::Refused,
-        Proxy::NoProxy,
+        Proxy::Disabled,
         "non-inference: fixture",
         &[
             "facts: src/f.rs:claims declares redirect=none proxy=no_proxy, source shows redirect=default-follow proxy=honours-env",
@@ -1314,7 +1319,7 @@ const FACTS_ROWS: [FactsRow; 9] = [
         "// .no_proxy() and Policy::none()\n    reqwest::Client::new()",
         "none",
         Redirect::Refused,
-        Proxy::NoProxy,
+        Proxy::Disabled,
         "non-inference: fixture",
         &[
             "facts: src/f.rs:commented declares redirect=none proxy=no_proxy, source shows redirect=default-follow proxy=honours-env",
@@ -1407,7 +1412,10 @@ fn class_guard_checks_declared_egress_facts_against_the_source_4193() {
         redirect: Redirect::DefaultFollow,
         proxy: Proxy::HonoursEnv,
     }];
-    assert!(classify(&tree(&[("src/n.rs", nested)]), &allow).is_empty());
+    assert_eq!(
+        classify(&tree(&[("src/n.rs", nested)]), &allow),
+        Vec::<String>::new()
+    );
 }
 
 #[test]
