@@ -242,9 +242,13 @@ const ANNOTATION_TYPE_NAMES: [&str; 16] = [
 /// Rust reference-type sigil: `password: &str`, `password: &'a str`.
 const REFERENCE_TYPE_SIGIL: u8 = b'&';
 /// Prefixes of an unquoted value that reads the secret from the environment
-/// at run time instead of holding it.
-const ENV_LOOKUP_PREFIXES: [&str; 11] = [
-    "os.environ",
+/// at run time instead of holding it. Matched with `starts_with`, so every
+/// entry ends in the delimiter its lookup grammar requires (`[` `(` `.`
+/// `{`), never in an identifier byte: a bare `os.environ` would accept
+/// `os.environ_<secret>` (#8855). Pinned by the child test module.
+const ENV_LOOKUP_PREFIXES: [&str; 12] = [
+    "os.environ[",
+    "os.environ.get(",
     "os.getenv(",
     "getenv(",
     "env::var(",
