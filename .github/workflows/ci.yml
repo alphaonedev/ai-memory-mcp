@@ -2548,9 +2548,7 @@ jobs:
       # on the GitHub-hosted once leg: the runner VM is disposable and has
       # passwordless sudo; a self-hosted runner is never given root here.
       - name: Wake-hub publish hand-off as real root (two uids, #3971)
-        if: >-
-          needs.classify.outputs.cargo_skip != 'true' && matrix.once
-          && runner.os == 'Linux' && runner.environment == 'github-hosted'
+        if: ${{ needs.classify.outputs.docs_only != 'true' && needs.classify.outputs.cargo_skip != 'true' && matrix.once && runner.os == 'Linux' && runner.environment == 'github-hosted' }}
         run: sudo python3 scripts/wake_hub_publish_root_3971.py --bin target/release/ai-memory
 
       # Drop the per-job ephemeral db (created by "Configure enterprise-fed
