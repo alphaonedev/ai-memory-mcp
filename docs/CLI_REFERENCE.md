@@ -2012,7 +2012,12 @@ ai-memory wake-hub --posture                # print the resolved posture, bind n
 ai-memory wake-hub --posture --json         # machine-readable posture
 ai-memory wake-hub --health                 # probe the socket; exit 0 / 2 (#3471)
 ai-memory wake-hub --health --json          # machine-readable reachability
-ai-memory wake-hub --publish-snapshot SRC --allowlist DEST  # packaging-internal hand-off (#3971)
+```
+
+The packaging-internal hand-off (#3971):
+
+```bash
+ai-memory wake-hub --publish-snapshot SRC --allowlist DEST
 ```
 
 **`--allowlist` has two meanings.** When the hub serves or reports
