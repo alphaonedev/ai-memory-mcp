@@ -1691,12 +1691,25 @@ I4_EMPHASIS = "emphasis naming an amendment or a status above the ledger"
 # pre-marker region carries the #9177 firing at the STATUS line.
 CHAIN_TIP_9274 = "46c12050706160ca6912077464e8dd6fa7744809"
 HEAD_9274_R3 = "40cb1ad4539cd50c20125a210f454cb27c666d82"
+# X-3: CI sets CI=true; there a missing real-range commit fails the cell, never skips it.
+CI_ENV = "CI"
+REPLAY_FETCH_FLAG = "--print-replay-shas"
+# X-1 / X-2: literal first lines of the two marker refusals.
+MARKER_TWICE_HEAD_LINE = (
+    GATE_PREFIX + ": ERROR — amendment ledger (head): the ledger marker line appears 2 times, "
+    "expected exactly once in " + CERT_REL + " (fail-closed)")
+MARKERS_TWICE_START_LINE = (
+    GATE_PREFIX + ": ERROR — the start of the range holds the '" + MARKER + "' line 2 times, so "
+    "its pre-marker region of " + CERT_REL + " is not defined (#6124) (fail-closed)")
 RANGE_9274_FIRST_DIFF = TRACKED_STATUS_LINE
 # #9305: the head detector (SCAN_HEAD) on the tracked doc; every line here is re-issue work.
 TRACKED_SCAN_HEAD_PAIR = ("DUPLICATE", "DUPLICATE")
 TRACKED_BINDS_LIKE_LINES = (82, 289, 971, 1339, 1588, 1589, 1609, 1630, 1878, 2024, 2084, 2117)
 TRACKED_STATUS_LIKE_LINES = (1612, 1629, 1780, 1843, 1885, 1972, 2025, 2077, 2083, 2084, 2090,
                              2115)
+TRACKED_REFUSAL_COUNT = 24
+TRACKED_REFUSAL_LINE_COUNT = 23  # :2084 is both Binds-like and STATUS-like
+REFUSAL_COUNT_SENTENCE = "24 refusals on 23 lines"
 RULES_REISSUE_HEADING = "## Re-issue work: lines the head detector refuses (#9305)"
 # #9304: the indexes that link the cert doc also link the rules file.
 DOCS_INDEXES = ("docs/README.md", "docs/compliance/index.html")
@@ -1803,13 +1816,26 @@ class TrackedDocFrozenReason9303(LedgerCase):
         head = tracked_edit(_insert_line(TRACKED_I4_LINE, MARKER))
         ok, out = s.judge(self.wire_and_doc(s, head))
         self.assertFalse(ok, out)
-        self.assertNotIn("is frozen while the certification", out.split("\n")[0])
+        self.assertEqual(out.split("\n")[0], MARKER_TWICE_HEAD_LINE, out)
+
+    def test_9303_two_markers_at_both_ends_untouched_doc_refused(self):
+        """X-1: the backstop in _judge. Both ends hold the marker twice, the cert doc is not
+        touched, one unrelated path changes: only the backstop refuses (the early compare raises
+        and is swallowed), with the markers reason naming the range start."""
+        two = tracked_doc() + "\n" + MARKER + "\n"
+        s = self.scene("VOID", base_doc=two)
+        ok, out = s.judge(s.commit(s.touch_wire(UNRELATED_RS), "unrelated change"))
+        self.assertFalse(ok, out)
+        self.assertEqual(out.split("\n")[0], MARKERS_TWICE_START_LINE, out)
 
     def test_9303_real_range_9274_refused_as_frozen_region(self):
         for sha in (CHAIN_TIP_9274, HEAD_9274_R3):
             probe = subprocess.run(["git", "-C", str(HARNESS_ROOT), "cat-file", "-e", sha + "^{commit}"],
                                    capture_output=True, timeout=GIT_TIMEOUT_S, check=False)
             if probe.returncode != 0:
+                if os.environ.get(CI_ENV):
+                    self.fail(f"commit {sha} is not in this clone: the CI replay fetch must bring "
+                              f"it ({REPLAY_FETCH_FLAG})")
                 self.skipTest(f"commit {sha} is not in this clone")
         ok, out = cert.check_change(HARNESS_ROOT, CHAIN_TIP_9274, HEAD_9274_R3)
         self.assert_region_refused(ok, out, RANGE_9274_FIRST_DIFF)
@@ -1842,6 +1868,9 @@ class TrackedDocState9305(unittest.TestCase):
                       + [(LOOSE_STATUS, n) for n in TRACKED_STATUS_LIKE_LINES],
                       key=lambda p: (p[1], p[0] != LOOSE_STATUS))
         self.assertEqual(list(banner.problems), want)
+        # X-5: the count as well as the set: 24 refusals on 23 distinct lines.
+        self.assertEqual(len(banner.problems), TRACKED_REFUSAL_COUNT)
+        self.assertEqual(len({n for _reason, n in banner.problems}), TRACKED_REFUSAL_LINE_COUNT)
 
     def test_9305_rules_file_records_reissue_lines(self):
         text = (HARNESS_ROOT / RULES_REL).read_text(encoding="utf-8")
@@ -1849,6 +1878,9 @@ class TrackedDocState9305(unittest.TestCase):
         section = text.split(RULES_REISSUE_HEADING, 1)[1].split("\n## ", 1)[0]
         for n in sorted(set(TRACKED_BINDS_LIKE_LINES + TRACKED_STATUS_LIKE_LINES)):
             self.assertIn(f"`:{n}`", section)
+        self.assertIn(REFUSAL_COUNT_SENTENCE, " ".join(section.split()))
+        changelog = (HARNESS_ROOT / "changelog.d" / "9303.fixed.md").read_text(encoding="utf-8")
+        self.assertIn(REFUSAL_COUNT_SENTENCE, " ".join(changelog.split()))
 
     def test_9304_indexes_link_rules_file(self):
         for rel in DOCS_INDEXES:
@@ -1881,5 +1913,13 @@ class DocRecordForm(unittest.TestCase):
         self.assertIn(PATH_RESTRICTION, text)
 
 
+def replay_objects():
+    """X-3: the commits the real-range cell reads; CI fetches them like the corpus replay objects."""
+    return [CHAIN_TIP_9274, HEAD_9274_R3]
+
+
 if __name__ == "__main__":
+    if REPLAY_FETCH_FLAG in sys.argv[1:]:
+        print("\n".join(replay_objects()))
+        sys.exit(0)
     unittest.main()
