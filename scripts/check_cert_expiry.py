@@ -1500,8 +1500,8 @@ def _judge(repo, base, head, judged, mb, tip):
             raise GateError(REGION_FROZEN_TEXT.format(doc=CERT_DOC, marker=LEDGER_MARKER,
                                                       line=first_diff))
         # R-6: the base's looser excuse scan runs only within the document cap. A base over
-        # the cap gets no excuses, so any looser line in the (identical) region is refused
-        # at the head, fail closed.
+        # the cap gets no excuses, so any looser line in the head's pre-marker region is
+        # refused at the head, fail closed.
         excuse = base_excuse(base_blob) if len(base_blob) <= LEDGER_MAX_DOC_BYTES else None
         banner_head = banner_scan(head_blob, capped=True, mode=SCAN_LOOSE, excuse=excuse)
     else:

@@ -68,13 +68,13 @@ or Binds-to line is not a refusal there, because the frozen region keeps it unch
 
 While both ends are VOID or EXPIRED, the frozen-region compare runs first: a difference in
 the pre-marker region is refused with the frozen-region reason at the first differing line,
-before any other check. Only when the region is identical is the head judged by the loose
-banner scan, with the base's own lines excused, so every other refusal keeps its exact
-reason. A range whose start or head holds the marker line twice has no defined region: that
-is not a frozen-region difference, it keeps its own reason, and the compare runs again after
-the other checks as a backstop. The loose scan's excuse runs only within the 8388608-byte
-document limit: a base over the cap gets no excuses, so any looser line in the (identical)
-region is refused at the head, fail closed. When either
+before any other check. When the region is identical, or the range has no defined region
+(the marker line twice at either end), the head is judged by the loose banner scan, with the
+base's own lines excused, so every other refusal keeps its exact reason. A range with no
+defined region is not a frozen-region difference: it keeps its own reason, and the compare
+runs again after the other checks as a backstop. The loose scan's excuse runs only within
+the 8388608-byte document limit: a base over the cap gets no excuses, so any looser line in
+the head's pre-marker region is refused at the head, fail closed. When either
 end says LIVE, no amendment pass is possible and the head is judged by the head detector: it reads each line after
 decoding HTML entities (at most 4 passes), NFKC folding, dropping every character other
 than a-z and 0-9, and joining a soft line break, and it refuses "a STATUS-like line the
