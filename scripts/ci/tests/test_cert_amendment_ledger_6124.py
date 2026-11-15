@@ -1767,6 +1767,7 @@ class TrackedDocFrozenReason9303(LedgerCase):
     """#9303: on the TRACKED cert doc every frozen-region difference is refused with the
     frozen-region reason naming the first differing line, never the I4 emphasis reason."""
 
+    # guard cell: green on base c12faaf08909ce250a78040ea10f91f8b9cae56f
     def test_9303_tracked_doc_shape(self):
         lines = tracked_doc().split("\n")
         self.assertEqual(lines[TRACKED_MARKER_LINE - 1], MARKER)
@@ -1803,12 +1804,14 @@ class TrackedDocFrozenReason9303(LedgerCase):
                 ok, out = s.judge(self.wire_and_doc(s, tracked_edit(edit)))
                 self.assert_region_refused(ok, out, line)
 
+    # guard cell: green on base c12faaf08909ce250a78040ea10f91f8b9cae56f
     def test_9303_tracked_unchanged_region_exact_record_passes(self):
         s = self.tracked_scene()
         head = tracked_doc() + record(TRACKED_DAY, path_item(MOD_RS))
         ok, out = s.judge(self.wire_and_doc(s, head))
         self.assert_pass(ok, out, RELEASE_PASS, "the certification stays VOID")
 
+    # guard cell: green on base c12faaf08909ce250a78040ea10f91f8b9cae56f
     def test_9303_tracked_two_markers_keep_their_reason(self):
         """A region that is not defined (two marker lines) is not a frozen-region difference:
         it keeps its own refusal reason (I-A: reasons change only for frozen-region causes)."""
@@ -1818,6 +1821,7 @@ class TrackedDocFrozenReason9303(LedgerCase):
         self.assertFalse(ok, out)
         self.assertEqual(out.split("\n")[0], MARKER_TWICE_HEAD_LINE, out)
 
+    # guard cell: green on base c12faaf08909ce250a78040ea10f91f8b9cae56f
     def test_9303_two_markers_at_both_ends_untouched_doc_refused(self):
         """X-1: the backstop in _judge. Both ends hold the marker twice, the cert doc is not
         touched, one unrelated path changes: only the backstop refuses (the early compare raises
@@ -1840,6 +1844,7 @@ class TrackedDocFrozenReason9303(LedgerCase):
         ok, out = cert.check_change(HARNESS_ROOT, CHAIN_TIP_9274, HEAD_9274_R3)
         self.assert_region_refused(ok, out, RANGE_9274_FIRST_DIFF)
 
+    # guard cell: green on base c12faaf08909ce250a78040ea10f91f8b9cae56f
     def test_9303_tracked_region_diff_bounded(self):
         """The region compare stays linear on the tracked doc padded past 100K lines."""
         pad = "Plain prose line for the tracked bound.\n" * BIG_REGION_LINES

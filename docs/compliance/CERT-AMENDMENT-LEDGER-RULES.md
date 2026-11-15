@@ -66,11 +66,15 @@ STATUS line and at most one Binds-to line in the strict form. A base whose STATU
 duplicated or unparseable stays refused. Older prose at the base that reads like a STATUS
 or Binds-to line is not a refusal there, because the frozen region keeps it unchanged.
 
-While both ends are VOID or EXPIRED, the head is judged by the loose banner scan with the
-base's own lines excused, and then by the frozen-region compare, which runs last so that
-every earlier refusal keeps its exact reason. The base's lines are excused only while the
-base is within the 8388608-byte document limit; a larger base can never equal the capped
-head's region, so its looser lines are not excused and the change is refused. When either
+While both ends are VOID or EXPIRED, the frozen-region compare runs first: a difference in
+the pre-marker region is refused with the frozen-region reason at the first differing line,
+before any other check. Only when the region is identical is the head judged by the loose
+banner scan, with the base's own lines excused, so every other refusal keeps its exact
+reason. A range whose start or head holds the marker line twice has no defined region: that
+is not a frozen-region difference, it keeps its own reason, and the compare runs again after
+the other checks as a backstop. The loose scan's excuse runs only within the 8388608-byte
+document limit: a base over the cap gets no excuses, so any looser line in the (identical)
+region is refused at the head, fail closed. When either
 end says LIVE, no amendment pass is possible and the head is judged by the head detector: it reads each line after
 decoding HTML entities (at most 4 passes), NFKC folding, dropping every character other
 than a-z and 0-9, and joining a soft line break, and it refuses "a STATUS-like line the
@@ -104,8 +108,9 @@ src/federation/peer.rs`.
 
 ## Re-issue work: lines the head detector refuses (#9305)
 
-The head detector (the scan a LIVE end gets) refuses 24 lines of the tracked
-`docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md` above the ledger marker, so its
+The head detector (the scan a LIVE end gets) refuses lines of the tracked
+`docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md` above the ledger marker (24
+refusals on 23 lines: `:2084` is both Binds-like and STATUS-like), so its
 result on that document is DUPLICATE at both banner fields. While the document is VOID at
 both ends these lines are frozen and excused as inherited; they are not edited here. The
 re-issue of the certification as LIVE (#6063) must rewrite each of them first, or the head
