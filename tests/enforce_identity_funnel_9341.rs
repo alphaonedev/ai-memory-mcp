@@ -1,0 +1,652 @@
+// Copyright 2026 AlphaOne LLC
+// SPDX-License-Identifier: Apache-2.0
+
+//! #9341 / #8502 / #8590 — the Enforce identity funnel, behavioural cells.
+//!
+//! Invariant: under `HttpIdentityMode::Enforce` with at least one per-agent
+//! key enrolled, no request reaches a handler with a NAMED principal that is
+//! not proven (an enrolled per-agent key bound to that agent, or an mTLS
+//! client certificate mapped to that agent, #8357). A shared-key caller that
+//! names an agent is refused 403 `attested_identity_required` in ONE place
+//! (`authority_layer`), before any extractor or handler runs, on every route
+//! of [`route_table::ROUTE_TABLE`] that is not exempt.
+//!
+//! The backend is SQLite by default; with `--features sal-postgres` and
+//! `AI_MEMORY_TEST_POSTGRES_URL` set (the ci-v2-pg wrapper) the same cells run
+//! against a `PostgresStore`.
+
+#![cfg(feature = "sal")]
+#![allow(clippy::missing_panics_doc, clippy::too_many_lines)]
+
+#[path = "enforce_funnel_9341_common/route_table.rs"]
+mod route_table;
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+
+use ai_memory::config::{FeatureTier, HttpIdentityMode, ResolvedScoring, ResolvedTtl};
+use ai_memory::errors::error_codes::VALIDATION_FAILED;
+use ai_memory::handlers::identity_binding::{EnrolledAgentKeys, api_key_sha256_hex};
+use ai_memory::handlers::{ApiKeyState, AppState, Db};
+use ai_memory::mtls_agent_binding::{AgentBindingMode, ClientCertAgentBinding};
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
+use route_table::{AUDIT_UNGATED_ROUTES, ROUTE_TABLE, RouteClass, concrete_path};
+use tempfile::NamedTempFile;
+use tower::ServiceExt as _;
+
+const SHARED_KEY: &str = "shared-key-9341";
+const ALICE_KEY: &str = "alice-per-agent-key-9341";
+const BOB_KEY: &str = "bob-per-agent-key-9341";
+const ALICE: &str = "alice";
+const BOB: &str = "bob";
+/// The wire code of the one funnel refusal.
+const ATTESTED_IDENTITY_REQUIRED: &str = "attested_identity_required";
+/// The wire code `api_key_auth` returns for a per-agent key whose agent
+/// differs from the claimed header.
+const IDENTITY_BINDING_MISMATCH: &str = "identity_binding_mismatch";
+/// Per-request ceiling: a handler that blocks is a finding, never a hang.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const BODY_LIMIT: usize = 1 << 20;
+/// Ceiling on reading a response body (a stream route never ends).
+const BODY_READ_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Keeps the per-test database file alive for the router's lifetime.
+struct Fixture {
+    router: axum::Router,
+    _db_file: NamedTempFile,
+}
+
+fn enrolled(with_keys: bool) -> Arc<EnrolledAgentKeys> {
+    let mut map = HashMap::new();
+    if with_keys {
+        map.insert(api_key_sha256_hex(ALICE_KEY), ALICE.to_string());
+        map.insert(api_key_sha256_hex(BOB_KEY), BOB.to_string());
+    }
+    Arc::new(EnrolledAgentKeys::from_map(map))
+}
+
+async fn store_for(
+    db_path: &std::path::Path,
+) -> (
+    Arc<dyn ai_memory::store::MemoryStore>,
+    ai_memory::handlers::StorageBackend,
+) {
+    #[cfg(feature = "sal-postgres")]
+    if let Ok(url) = std::env::var("AI_MEMORY_TEST_POSTGRES_URL") {
+        let pg = ai_memory::store::postgres::PostgresStore::connect(&url)
+            .await
+            .expect("connect postgres");
+        return (Arc::new(pg), ai_memory::handlers::StorageBackend::Postgres);
+    }
+    (
+        Arc::new(ai_memory::store::sqlite::SqliteStore::open(db_path).expect("sqlite store")),
+        ai_memory::handlers::StorageBackend::Sqlite,
+    )
+}
+
+/// Writes in this binary exercise the identity funnel, not the #8357 body
+/// attestation gate: turn the attestation requirement off once per process
+/// (the `mtls_agent_binding_8357` precedent).
+fn permissive_attestation_for_tests() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        // SAFETY: set once, before any router of this binary reads it; no
+        // other thread of this test binary writes the environment.
+        unsafe { std::env::set_var("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0") };
+    });
+}
+
+/// Build the in-process router: shared key configured, `mode`, and (when
+/// `with_keys`) alice and bob each enrolled with a per-agent key.
+async fn build(mode: HttpIdentityMode, with_keys: bool) -> Fixture {
+    permissive_attestation_for_tests();
+    ai_memory::handlers::admin_role::mark_request_authn_configured(true);
+    let f = NamedTempFile::new().expect("tempfile");
+    let db_path = f.path().to_path_buf();
+    let conn = ai_memory::db::open(&db_path).expect("open db");
+    let db: Db = Arc::new(tokio::sync::Mutex::new((
+        conn,
+        db_path.clone(),
+        ResolvedTtl::default(),
+        true,
+    )));
+    let (store, storage_backend) = store_for(&db_path).await;
+    let keys = enrolled(with_keys);
+    let app_state = AppState {
+        db,
+        embedder: Arc::new(None),
+        vector_index: Arc::new(tokio::sync::Mutex::new(None)),
+        federation: Arc::new(None),
+        tier_config: Arc::new(FeatureTier::Keyword.config()),
+        scoring: Arc::new(ResolvedScoring::default()),
+        profile: Arc::new(ai_memory::profile::Profile::core()),
+        mcp_config: Arc::new(None),
+        active_keypair: Arc::new(None),
+        family_embeddings: Arc::new(tokio::sync::RwLock::new(Some(Vec::new()))),
+        storage_backend,
+        store,
+        llm: Arc::new(ai_memory::reload::SwappableLlm::new(None)),
+        auto_tag_model: Arc::new(None),
+        llm_call_timeout: Duration::from_secs(30),
+        replay_cache: Arc::new(ai_memory::identity::replay::ReplayCache::default()),
+        verify_require_nonce: false,
+        federation_nonce_cache: Arc::new(
+            ai_memory::identity::replay::FederationNonceCache::default(),
+        ),
+        autonomous_hooks: false,
+        auto_tag_queue: None,
+        atomise_queue: None,
+        recall_scope: Arc::new(None),
+        deferred_audit_queue: Arc::new(None),
+        admin_agent_ids: Arc::new(vec![ALICE.to_string()]),
+        rule_cache: Arc::new(ai_memory::governance::rule_cache::RuleCache::new()),
+        resolved_models: Arc::new(ai_memory::reload::Swappable::new(
+            ai_memory::config::ResolvedModels::default(),
+        )),
+        runtime: ai_memory::runtime_context::RuntimeContext::global_arc(),
+        max_page_size: ai_memory::handlers::MAX_BULK_SIZE,
+        enrolled_agent_keys: keys.clone(),
+        http_identity_mode: mode,
+    };
+    let api_key_state = ApiKeyState {
+        key: Some(SHARED_KEY.to_string()),
+        mtls_enforced: false,
+        enrolled_agent_keys: keys,
+        identity_mode: mode,
+        ..Default::default()
+    };
+    Fixture {
+        router: ai_memory::build_router(api_key_state, app_state),
+        _db_file: f,
+    }
+}
+
+/// One request's observable outcome.
+#[derive(Debug)]
+struct Outcome {
+    status: StatusCode,
+    body: serde_json::Value,
+}
+
+impl Outcome {
+    fn error_code(&self) -> &str {
+        self.body
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+    }
+    fn code(&self) -> &str {
+        self.body
+            .get("code")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+    }
+    fn is_funnel_refusal(&self) -> bool {
+        self.status == StatusCode::FORBIDDEN && self.error_code() == ATTESTED_IDENTITY_REQUIRED
+    }
+}
+
+async fn send(router: &axum::Router, req: Request<Body>) -> Outcome {
+    let fut = router.clone().oneshot(req);
+    let Ok(resp) = tokio::time::timeout(REQUEST_TIMEOUT, fut).await else {
+        return Outcome {
+            status: StatusCode::REQUEST_TIMEOUT,
+            body: serde_json::json!({"error": "test-timeout"}),
+        };
+    };
+    let resp = resp.expect("infallible router");
+    let status = resp.status();
+    // A streaming (SSE) body never ends: bound the read too and keep the
+    // status, which is all a streaming route's cell needs.
+    let bytes = match tokio::time::timeout(
+        BODY_READ_TIMEOUT,
+        axum::body::to_bytes(resp.into_body(), BODY_LIMIT),
+    )
+    .await
+    {
+        Ok(Ok(b)) => b,
+        Ok(Err(_)) | Err(_) => axum::body::Bytes::new(),
+    };
+    let body = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    Outcome { status, body }
+}
+
+/// A request to `method path` with the given key and `X-Agent-Id` values.
+fn request(
+    method: &str,
+    uri: &str,
+    key: &str,
+    agent_ids: &[&str],
+    body: Option<serde_json::Value>,
+) -> axum::http::request::Builder {
+    let mut b = Request::builder()
+        .method(method.to_ascii_uppercase().as_str())
+        .uri(uri)
+        .header("x-api-key", key);
+    for id in agent_ids {
+        b = b.header("x-agent-id", *id);
+    }
+    if body.is_some() || method != "get" {
+        b = b.header("content-type", "application/json");
+    }
+    b
+}
+
+fn body_for(method: &str, body: Option<serde_json::Value>) -> Body {
+    match (method, body) {
+        (_, Some(v)) => Body::from(v.to_string()),
+        ("get", None) => Body::empty(),
+        (_, None) => Body::from("{}"),
+    }
+}
+
+async fn send_simple(
+    router: &axum::Router,
+    method: &str,
+    uri: &str,
+    key: &str,
+    agent_ids: &[&str],
+    body: Option<serde_json::Value>,
+) -> Outcome {
+    let req = request(method, uri, key, agent_ids, body.clone())
+        .body(body_for(method, body))
+        .expect("request");
+    send(router, req).await
+}
+
+/// (1a) The table cell: under Enforce with keys enrolled, a shared-key caller
+/// naming ANOTHER enrolled agent (bob) is refused 403
+/// `attested_identity_required` on every non-exempt route, before any
+/// extractor runs (so the refusal does not depend on the body shape).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shared_key_named_agent_is_refused_on_every_gated_route_9341() {
+    let fx = build(HttpIdentityMode::Enforce, true).await;
+    let mut mismatches = Vec::new();
+    let mut audit_open = Vec::new();
+    let mut checked = 0usize;
+    for row in ROUTE_TABLE {
+        if row.class == RouteClass::Exempt {
+            continue;
+        }
+        checked += 1;
+        let out = send_simple(
+            &fx.router,
+            row.method,
+            &concrete_path(row.path),
+            SHARED_KEY,
+            &[BOB],
+            None,
+        )
+        .await;
+        if !out.is_funnel_refusal() {
+            if AUDIT_UNGATED_ROUTES.contains(&(row.name, row.method)) {
+                audit_open.push(format!("{} {}", row.name, row.method));
+            }
+            mismatches.push(format!(
+                "{} {} {} -> {} {}",
+                row.name, row.method, row.path, out.status, out.body
+            ));
+        }
+    }
+    eprintln!("#9341 audit routes honoured as bob: {}", audit_open.len());
+    for r in &audit_open {
+        eprintln!("#9341 AUDIT-OPEN {r}");
+    }
+    for m in &mismatches {
+        eprintln!("#9341 NOT-REFUSED {m}");
+    }
+    assert!(checked > 0, "the table has gated rows");
+    assert!(
+        mismatches.is_empty(),
+        "#9341: {} of {checked} gated routes did not refuse a shared-key named \
+         caller with 403 {ATTESTED_IDENTITY_REQUIRED}",
+        mismatches.len()
+    );
+}
+
+/// (1a') Exempt routes are not refused by the funnel (design point 3).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exempt_routes_are_not_refused_by_the_funnel_9341() {
+    let fx = build(HttpIdentityMode::Enforce, true).await;
+    for row in ROUTE_TABLE.iter().filter(|r| r.class == RouteClass::Exempt) {
+        let out = send_simple(
+            &fx.router,
+            row.method,
+            &concrete_path(row.path),
+            SHARED_KEY,
+            &[BOB],
+            None,
+        )
+        .await;
+        assert_ne!(
+            out.error_code(),
+            ATTESTED_IDENTITY_REQUIRED,
+            "{} {} must stay outside the funnel: {} {}",
+            row.name,
+            row.method,
+            out.status,
+            out.body
+        );
+    }
+}
+
+/// An EMPTY header stays the documented "no assertion" (the resolver's
+/// `filter(|h| !h.is_empty())` precedent), so it is not in this list.
+///
+/// (1c) The invalid-header cell: a malformed `X-Agent-Id` is a 400
+/// `VALIDATION_FAILED` on every non-exempt route, never a silent
+/// `anonymous:invalid` principal (#9342).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invalid_header_is_400_on_every_gated_route_9342() {
+    const INVALID_IDS: &[&str] = &["bad id with spaces", " bob ", "bob\tx"];
+    let fx = build(HttpIdentityMode::Enforce, true).await;
+    let mut wrong = Vec::new();
+    for row in ROUTE_TABLE.iter().filter(|r| r.class != RouteClass::Exempt) {
+        for id in INVALID_IDS {
+            let out = send_simple(
+                &fx.router,
+                row.method,
+                &concrete_path(row.path),
+                SHARED_KEY,
+                &[id],
+                None,
+            )
+            .await;
+            if out.status != StatusCode::BAD_REQUEST || out.code() != VALIDATION_FAILED {
+                wrong.push(format!(
+                    "{} {} {id:?} -> {} {}",
+                    row.name, row.method, out.status, out.body
+                ));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "#9342 invalid header not 400: {wrong:#?}");
+}
+
+/// A header naming an anonymous sentinel is a client ASSERTION, never the
+/// server-minted anonymous principal: under the funnel it is an unproven
+/// named principal and is refused before any handler (decision line in the
+/// READY file).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn client_supplied_anonymous_sentinel_is_refused_9341() {
+    let fx = build(HttpIdentityMode::Enforce, true).await;
+    let mut wrong = Vec::new();
+    for row in ROUTE_TABLE.iter().filter(|r| r.class != RouteClass::Exempt) {
+        for id in ["anonymous:req-deadbeef", "anonymous:invalid"] {
+            let out = send_simple(
+                &fx.router,
+                row.method,
+                &concrete_path(row.path),
+                SHARED_KEY,
+                &[id],
+                None,
+            )
+            .await;
+            let refused_before_handler = out.is_funnel_refusal()
+                || (out.status == StatusCode::BAD_REQUEST && out.code() == VALIDATION_FAILED);
+            if !refused_before_handler {
+                wrong.push(format!(
+                    "{} {} {id:?} -> {} {}",
+                    row.name, row.method, out.status, out.body
+                ));
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "#9341 anonymous sentinel header reached a handler: {wrong:#?}"
+    );
+}
+
+/// A present but non-UTF-8 `X-Agent-Id` is refused 400, never read as
+/// "no header" (the anonymous principal).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn non_utf8_agent_id_header_is_400_9342() {
+    let fx = build(HttpIdentityMode::Enforce, true).await;
+    for (method, path) in [
+        ("post", ai_memory::handlers::routes::SIGNALS),
+        ("get", ai_memory::handlers::routes::MEMORIES),
+    ] {
+        let req = request(method, path, SHARED_KEY, &[], None)
+            .header(
+                "x-agent-id",
+                axum::http::HeaderValue::from_bytes(b"b\xffob").expect("opaque header"),
+            )
+            .body(body_for(method, None))
+            .expect("request");
+        let out = send(&fx.router, req).await;
+        assert_eq!(
+            (out.status, out.code()),
+            (StatusCode::BAD_REQUEST, VALIDATION_FAILED),
+            "{method} {path}: {}",
+            out.body
+        );
+    }
+}
+
+/// Positive control: alice's own per-agent key acting as alice is served.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn per_agent_key_bound_caller_is_served_9341() {
+    let fx = build(HttpIdentityMode::Enforce, true).await;
+    let out = send_simple(
+        &fx.router,
+        "post",
+        route_table::concrete_path(ai_memory::handlers::routes::MEMORIES).as_str(),
+        ALICE_KEY,
+        &[ALICE],
+        Some(serde_json::json!({"title": "t-9341", "content": "c-9341", "namespace": "ns-9341"})),
+    )
+    .await;
+    assert!(
+        out.status.is_success(),
+        "alice's bound key must create: {} {}",
+        out.status,
+        out.body
+    );
+}
+
+/// Anonymous caller (no header) on an anonymous-allowed route is served.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn anonymous_caller_on_catalogue_route_is_served_9341() {
+    let fx = build(HttpIdentityMode::Enforce, true).await;
+    for row in ROUTE_TABLE
+        .iter()
+        .filter(|r| r.class == RouteClass::AnonymousAllowed)
+    {
+        let out = send_simple(&fx.router, row.method, row.path, SHARED_KEY, &[], None).await;
+        assert!(
+            !out.is_funnel_refusal(),
+            "{} anonymous must not be refused: {} {}",
+            row.name,
+            out.status,
+            out.body
+        );
+    }
+}
+
+/// Advisory mode never refuses (only Enforce does).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn advisory_mode_does_not_refuse_named_shared_key_caller_9341() {
+    let fx = build(HttpIdentityMode::Advisory, true).await;
+    let out = send_simple(
+        &fx.router,
+        "post",
+        ai_memory::handlers::routes::SIGNALS,
+        SHARED_KEY,
+        &[BOB],
+        None,
+    )
+    .await;
+    assert!(!out.is_funnel_refusal(), "{} {}", out.status, out.body);
+}
+
+/// Design point 2: Enforce with ZERO per-agent keys enrolled stays inert
+/// (#3155 boot WARN, #8552 lane): the funnel does not refuse.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inert_enforce_zero_keys_keeps_current_behaviour_9341() {
+    let fx = build(HttpIdentityMode::Enforce, false).await;
+    let out = send_simple(
+        &fx.router,
+        "post",
+        ai_memory::handlers::routes::SIGNALS,
+        SHARED_KEY,
+        &[BOB],
+        None,
+    )
+    .await;
+    assert!(!out.is_funnel_refusal(), "{} {}", out.status, out.body);
+}
+
+// ---------------------------------------------------------------- break-it
+
+/// Case variants are distinct principals and are refused the same way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn header_case_variant_is_refused_9341() {
+    let fx = build(HttpIdentityMode::Enforce, true).await;
+    for id in ["BOB", "Bob", "ALICE"] {
+        let out = send_simple(
+            &fx.router,
+            "post",
+            ai_memory::handlers::routes::SIGNALS,
+            SHARED_KEY,
+            &[id],
+            None,
+        )
+        .await;
+        assert!(out.is_funnel_refusal(), "{id}: {} {}", out.status, out.body);
+    }
+}
+
+/// Duplicate `X-Agent-Id` headers: a shared-key caller is refused whatever
+/// the order; a per-agent key whose agent differs from the FIRST value is
+/// `identity_binding_mismatch`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn duplicate_agent_id_headers_are_refused_9341() {
+    let fx = build(HttpIdentityMode::Enforce, true).await;
+    for ids in [[BOB, ALICE], [ALICE, BOB]] {
+        let out = send_simple(
+            &fx.router,
+            "post",
+            ai_memory::handlers::routes::SIGNALS,
+            SHARED_KEY,
+            &ids,
+            None,
+        )
+        .await;
+        assert!(
+            out.is_funnel_refusal(),
+            "{ids:?}: {} {}",
+            out.status,
+            out.body
+        );
+    }
+    let out = send_simple(
+        &fx.router,
+        "post",
+        ai_memory::handlers::routes::SIGNALS,
+        ALICE_KEY,
+        &[BOB, ALICE],
+        None,
+    )
+    .await;
+    assert_eq!(out.status, StatusCode::FORBIDDEN, "{}", out.body);
+    assert_eq!(out.error_code(), IDENTITY_BINDING_MISMATCH, "{}", out.body);
+}
+
+/// A per-agent key whose agent differs from the header stays
+/// `identity_binding_mismatch` (the transport rung runs first).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn per_agent_key_for_other_agent_is_binding_mismatch_9341() {
+    let fx = build(HttpIdentityMode::Enforce, true).await;
+    for row in ROUTE_TABLE.iter().filter(|r| r.class != RouteClass::Exempt) {
+        let out = send_simple(
+            &fx.router,
+            row.method,
+            &concrete_path(row.path),
+            ALICE_KEY,
+            &[BOB],
+            None,
+        )
+        .await;
+        assert_eq!(
+            (out.status, out.error_code()),
+            (StatusCode::FORBIDDEN, IDENTITY_BINDING_MISMATCH),
+            "{} {}: {}",
+            row.name,
+            row.method,
+            out.body
+        );
+    }
+}
+
+/// A body `agent_id` that differs from the proven header principal is
+/// refused, never laundered into the write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn body_agent_id_differing_from_header_is_refused_9341() {
+    let fx = build(HttpIdentityMode::Enforce, true).await;
+    let out = send_simple(
+        &fx.router,
+        "post",
+        ai_memory::handlers::routes::MEMORIES,
+        ALICE_KEY,
+        &[ALICE],
+        Some(serde_json::json!({
+            "title": "t-9341", "content": "c-9341", "namespace": "ns-9341", "agent_id": BOB
+        })),
+    )
+    .await;
+    assert_eq!(
+        (out.status, out.code()),
+        (StatusCode::FORBIDDEN, "AGENT_ID_MISMATCH"),
+        "{}",
+        out.body
+    );
+}
+
+/// #8590: a caller whose mTLS certificate is mapped to bob, presenting the
+/// shared key and naming bob, is PROVEN and is served (the cert rung counts
+/// at the funnel AND at the handler gate).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mapped_cert_with_shared_key_is_served_8590() {
+    let fx = build(HttpIdentityMode::Enforce, true).await;
+    for (method, path) in [
+        ("get", ai_memory::handlers::routes::MEMORIES),
+        ("post", ai_memory::handlers::routes::SIGNALS),
+    ] {
+        let req = request(method, path, SHARED_KEY, &[BOB], None)
+            .extension(ClientCertAgentBinding::new(
+                Some(BOB.to_string()),
+                AgentBindingMode::Enforce,
+            ))
+            .body(body_for(method, None))
+            .expect("request");
+        let out = send(&fx.router, req).await;
+        assert_ne!(
+            out.status,
+            StatusCode::FORBIDDEN,
+            "#8590 {method} {path}: a cert-proven caller must not be refused: {}",
+            out.body
+        );
+    }
+}
+
+/// An unmapped certificate under Warn binding adds no proof: the shared-key
+/// named caller is refused by the funnel.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unmapped_cert_with_shared_key_is_refused_9341() {
+    let fx = build(HttpIdentityMode::Enforce, true).await;
+    let req = request(
+        "post",
+        ai_memory::handlers::routes::SIGNALS,
+        SHARED_KEY,
+        &[BOB],
+        None,
+    )
+    .extension(ClientCertAgentBinding::new(None, AgentBindingMode::Warn))
+    .body(body_for("post", None))
+    .expect("request");
+    let out = send(&fx.router, req).await;
+    assert!(out.is_funnel_refusal(), "{} {}", out.status, out.body);
+}
