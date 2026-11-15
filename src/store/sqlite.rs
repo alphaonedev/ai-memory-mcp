@@ -5376,12 +5376,9 @@ mod tests {
 
     fn fresh_store() -> SqliteStore {
         let tmp = tempfile::NamedTempFile::new().expect("tempfile");
-        let path = tmp.path().to_path_buf();
-        // Drop the NamedTempFile guard so close() doesn't race the DB
-        // open; the path leaks but it's under the OS tmp dir which
-        // colima/macOS reaps. Tests run hermetically inside a worktree
-        // tempdir; no /tmp violation per project rule.
-        std::mem::forget(tmp);
+        // Release the NamedTempFile guard so close() doesn't race the DB
+        // open; the file and its sidecars are removed at process exit (#8634).
+        let path = crate::test_support::keep_file_until_exit(tmp);
         SqliteStore::open(&path).expect("open SqliteStore")
     }
 

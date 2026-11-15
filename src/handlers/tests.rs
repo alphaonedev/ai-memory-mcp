@@ -481,11 +481,10 @@ fn test_app_state_with_admin(db: Db, agent_id: &str) -> AppState {
 #[cfg(feature = "sal")]
 fn test_sqlite_store_handle() -> Arc<dyn crate::store::MemoryStore> {
     let tmp = tempfile::NamedTempFile::new().expect("tempfile for test SqliteStore");
-    // Keep the tempfile alive for the lifetime of the process by
-    // leaking the path — the OS reclaims it on exit. Tests that
-    // touch the trait-routed path open their own dedicated stores.
-    let path = tmp.path().to_path_buf();
-    std::mem::forget(tmp);
+    // Keep the tempfile for the lifetime of the process; it is removed at
+    // exit (#8634). Tests that touch the trait-routed path open their own
+    // dedicated stores.
+    let path = crate::test_support::keep_file_until_exit(tmp);
     Arc::new(
         crate::store::sqlite::SqliteStore::open(&path)
             .expect("open SqliteStore for test_app_state"),

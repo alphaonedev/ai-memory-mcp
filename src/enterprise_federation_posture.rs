@@ -915,7 +915,7 @@ mod tests {
     /// whole (env-isolated child) process so check #19's signing-key half stays
     /// armed. First-install-wins (`OnceLock`), mirroring the flag-on suite's
     /// `AUDIT_DIR`.
-    static POSTURE_AUDIT_DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    static POSTURE_AUDIT_DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
 
     pub(super) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         crate::config::test_env_lock()
@@ -1025,13 +1025,11 @@ mod tests {
         // (`run_env_isolated_child_or_spawn`), kept alive for the test in a
         // module-static tempdir (first-install-wins, like the flag-on suite).
         POSTURE_AUDIT_DIR.get_or_init(|| {
-            let dir = tempfile::Builder::new()
-                .prefix("ef-posture-audit-")
-                .tempdir()
-                .expect("audit tempdir");
+            // #8634: a static is never dropped, so the directory is removed
+            // by the process-exit hook instead.
+            let dir = crate::test_support::process_scratch_dir("ef-posture-audit-");
             let signing = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
-            crate::governance::audit::init(dir.path(), Some(signing))
-                .expect("install daemon audit key");
+            crate::governance::audit::init(&dir, Some(signing)).expect("install daemon audit key");
             dir
         });
         // AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT / _SIG / _NONCE /

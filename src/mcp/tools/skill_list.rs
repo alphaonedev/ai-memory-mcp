@@ -228,7 +228,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("test.db");
         let conn = crate::db::open(&path).expect("db::open");
-        std::mem::forget(dir);
+        let _ = crate::test_support::keep_dir_until_exit(dir);
         conn
     }
 

@@ -1159,40 +1159,48 @@ fn key_panic_messages_pinned_8179() {
     }
 }
 
-/// Directories removed at process exit by [`process_scratch_dir`].
+/// Paths removed at process exit by [`remove_at_exit`] (directories with their
+/// contents; files with their SQLite `-wal` / `-shm` / `-journal` sidecars).
 static EXIT_REMOVALS: std::sync::Mutex<Vec<std::path::PathBuf>> = std::sync::Mutex::new(Vec::new());
 static EXIT_REMOVALS_REGISTERED: std::sync::Once = std::sync::Once::new();
 
-/// `atexit` hook: remove every registered directory. Never panics; a removal
+/// SQLite sidecar suffixes removed next to a file registered for removal.
+const SQLITE_SIDECAR_SUFFIXES: [&str; 3] = ["-wal", "-shm", "-journal"];
+
+/// `atexit` hook: remove every registered path. Never panics; a removal
 /// error is ignored (the process is exiting).
+///
+/// Twin of the `atexit` handlers in `tests/common/process_scratch.rs` and
+/// `tests/common/tls.rs`: a change to one is made in all of them.
 #[cfg(unix)]
 extern "C" fn remove_exit_scratch_dirs() {
-    let dirs = match EXIT_REMOVALS.lock() {
+    let paths = match EXIT_REMOVALS.lock() {
         Ok(mut guard) => std::mem::take(&mut *guard),
         Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
     };
-    for dir in dirs {
-        let _ = std::fs::remove_dir_all(dir);
+    for path in paths {
+        if path.is_dir() {
+            let _ = std::fs::remove_dir_all(&path);
+        } else {
+            let _ = std::fs::remove_file(&path);
+            for suffix in SQLITE_SIDECAR_SUFFIXES {
+                let mut sidecar = path.clone().into_os_string();
+                sidecar.push(suffix);
+                let _ = std::fs::remove_file(sidecar);
+            }
+        }
     }
 }
 
-/// #8634 class A: a fresh scratch directory for a fixture that lives for the
-/// WHOLE test process (a process-global sink or `OnceLock` that a
-/// `tempfile::TempDir` guard cannot outlive, because statics are never
-/// dropped). The directory and everything in it is removed from an `atexit`
-/// hook, which runs after a pass, a failed assertion and a panic (the harness
-/// catches the panic and exits normally); only an abort or a kill skips it.
-/// Fixtures with a normal scope use a `tempfile::TempDir` guard instead.
-pub(crate) fn process_scratch_dir(prefix: &str) -> PathBuf {
-    let dir = tempfile::Builder::new()
-        .prefix(prefix)
-        .tempdir()
-        .expect("create the process scratch dir")
-        .keep();
+/// #8634 class A: arrange for `path` (a directory with everything in it, or a
+/// file with its SQLite sidecars) to be removed when the test process exits,
+/// after a pass, a failed assertion and a panic (the harness catches the panic
+/// and exits normally); only an abort or a kill skips it.
+pub(crate) fn remove_at_exit(path: &Path) {
     EXIT_REMOVALS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .push(dir.clone());
+        .push(path.to_path_buf());
     EXIT_REMOVALS_REGISTERED.call_once(|| {
         #[cfg(unix)]
         {
@@ -1202,5 +1210,101 @@ pub(crate) fn process_scratch_dir(prefix: &str) -> PathBuf {
             assert_eq!(rc, 0, "atexit could not register the scratch cleanup");
         }
     });
-    dir
+}
+
+/// #8634 class A: keep a `TempDir` alive past its guard (a fixture that hands
+/// out only a path or an open connection) and remove it at process exit.
+/// Replaces `std::mem::forget(dir)`, which never removes anything.
+pub(crate) fn keep_dir_until_exit(dir: tempfile::TempDir) -> PathBuf {
+    let path = dir.keep();
+    remove_at_exit(&path);
+    path
+}
+
+/// #8634 class A: keep a `NamedTempFile` alive past its guard (its path is
+/// re-opened as a database) and remove it, with its SQLite sidecars, at
+/// process exit. Replaces `std::mem::forget(tmp)`.
+///
+/// # Panics
+/// When the file cannot be persisted.
+pub(crate) fn keep_file_until_exit(file: tempfile::NamedTempFile) -> PathBuf {
+    let (handle, path) = file.keep().expect("keep the named temp file");
+    drop(handle);
+    remove_at_exit(&path);
+    path
+}
+
+/// #8634 class A: a fresh scratch directory for a fixture that lives for the
+/// WHOLE test process (a process-global sink or `OnceLock` that a
+/// `tempfile::TempDir` guard cannot outlive, because statics are never
+/// dropped). Removed by [`remove_at_exit`]. Fixtures with a normal scope use a
+/// `tempfile::TempDir` guard instead.
+pub(crate) fn process_scratch_dir(prefix: &str) -> PathBuf {
+    keep_dir_until_exit(
+        tempfile::Builder::new()
+            .prefix(prefix)
+            .tempdir()
+            .expect("create the process scratch dir"),
+    )
+}
+
+/// Marker that makes [`exit_removal_child_8634`] create its leak-prone
+/// fixtures; without it the child test is a no-op.
+const EXIT_REMOVAL_CHILD_ENV: &str = "AI_MEMORY_TEST_EXIT_REMOVAL_CHILD_8634";
+
+/// Child half of [`exit_removal_leaves_the_temp_root_empty_8634`]: creates one
+/// fixture of each kind and keeps all of them past their guards.
+#[test]
+fn exit_removal_child_8634() {
+    if std::env::var_os(EXIT_REMOVAL_CHILD_ENV).is_none() {
+        return;
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    let kept_dir = keep_dir_until_exit(dir);
+    assert!(kept_dir.is_dir());
+    let file = tempfile::NamedTempFile::new().expect("named temp file");
+    let kept_file = keep_file_until_exit(file);
+    // The sidecars a WAL database leaves behind next to its main file.
+    for suffix in SQLITE_SIDECAR_SUFFIXES {
+        let mut sidecar = kept_file.clone().into_os_string();
+        sidecar.push(suffix);
+        std::fs::write(sidecar, b"sidecar").expect("write sidecar");
+    }
+    let scratch = process_scratch_dir("exit-removal-8634-");
+    std::fs::write(scratch.join("inside"), b"x").expect("write inside the scratch dir");
+}
+
+/// #8634 class A: a fixture kept past its guard (the replacement for
+/// `std::mem::forget`) is removed when the process exits, so a test process
+/// leaves its `TMPDIR` empty. Runs the child test above in a subprocess whose
+/// `TMPDIR` is an empty directory of its own and lists it afterwards.
+#[test]
+fn exit_removal_leaves_the_temp_root_empty_8634() {
+    if std::env::var_os(EXIT_REMOVAL_CHILD_ENV).is_some() {
+        return;
+    }
+    let root = tempfile::tempdir().expect("child temp root");
+    let output = std::process::Command::new(std::env::current_exe().expect("test exe"))
+        .args([
+            "--exact",
+            "test_support::exit_removal_child_8634",
+            "--nocapture",
+        ])
+        .env("TMPDIR", root.path())
+        .env(EXIT_REMOVAL_CHILD_ENV, "1")
+        .output()
+        .expect("spawn the child test");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("1 passed"),
+        "the child test must run and pass: {stdout}"
+    );
+    let left: Vec<_> = std::fs::read_dir(root.path())
+        .expect("list the child temp root")
+        .map(|entry| entry.expect("entry").file_name())
+        .collect();
+    assert!(
+        left.is_empty(),
+        "#8634: the child left entries in its TMPDIR: {left:?}"
+    );
 }

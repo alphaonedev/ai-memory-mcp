@@ -55,7 +55,20 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// child is meant to be guarded.
 pub const TEST_KEY_GUARD_ENV: &str = "AI_MEMORY_TEST_KEY_GUARD";
 
-static DIRECTORY: OnceLock<tempfile::TempDir> = OnceLock::new();
+static DIRECTORY: OnceLock<PathBuf> = OnceLock::new();
+
+/// #8634 class A: statics are never dropped, so the sandbox directory is
+/// removed by an `atexit` hook (after a pass, a failed assertion and a panic;
+/// not after an abort or a kill). Self-contained on purpose: this module is
+/// part of the library and cannot reach `crate::test_support`. Twin of the
+/// handlers in `src/test_support.rs`, `tests/common/process_scratch.rs` and
+/// `tests/common/tls.rs`: a change to one is made in all of them.
+#[cfg(unix)]
+extern "C" fn remove_sandbox_directory() {
+    if let Some(dir) = DIRECTORY.get() {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
 static ARMED: AtomicBool = AtomicBool::new(false);
 static KEY_DIR_BIND: OnceLock<KeyDirEnvBind> = OnceLock::new();
 
@@ -126,9 +139,19 @@ pub fn install() -> &'static Path {
             }
             assert_isolated(dir.path());
             bind_key_dir_env(dir.path());
-            dir
+            dir.keep()
         })
-        .path();
+        .as_path();
+    #[cfg(unix)]
+    {
+        static REGISTER_REMOVAL: std::sync::Once = std::sync::Once::new();
+        REGISTER_REMOVAL.call_once(|| {
+            // SAFETY: `atexit` only records the function pointer; the handler
+            // is a plain `extern "C" fn` that never unwinds.
+            let rc = unsafe { libc::atexit(remove_sandbox_directory) };
+            assert_eq!(rc, 0, "atexit could not register the key sandbox cleanup");
+        });
+    }
     // Integration-test binaries compile this module without `cfg(test)`.
     // Re-assert so an ambient override set after the first `install()` still
     // cannot defeat the helper. Lib tests (`cfg(test)`) leave `AI_MEMORY_KEY_DIR`

@@ -651,12 +651,9 @@ fn test_default_snippet_dir() -> PathBuf {
     static DIR: OnceLock<PathBuf> = OnceLock::new();
     DIR.get_or_init(|| {
         let tmp = tempfile::tempdir().expect("tempdir for snippet test default");
-        let p = tmp.path().to_path_buf();
-        // Leak the TempDir handle: we want this path to live for the
-        // entire test binary's lifetime, not be cleaned up between
-        // tests. The OS sweeps `/tmp` on reboot.
-        std::mem::forget(tmp);
-        p
+        // Keep the directory for the entire test binary's lifetime (not
+        // cleaned up between tests); removed at process exit (#8634).
+        crate::test_support::keep_dir_until_exit(tmp)
     })
     .clone()
 }
@@ -2732,7 +2729,7 @@ mod tests {
         let snippet_path =
             write_system_prompt_snippet_to(target, &tmp_path).expect("snippet write");
         let body = fs::read_to_string(&snippet_path).expect("read snippet");
-        std::mem::forget(tmp); // path must outlive caller
+        let _ = crate::test_support::keep_dir_until_exit(tmp); // path must outlive caller
         (snippet_path, body)
     }
 
@@ -2858,7 +2855,7 @@ mod tests {
             let snippet_path =
                 write_system_prompt_snippet_to(target, &tmp_path).expect("snippet write");
             let body = fs::read_to_string(&snippet_path).expect("read snippet");
-            std::mem::forget(tmp);
+            let _ = crate::test_support::keep_dir_until_exit(tmp);
             assert!(
                 snippet_path.exists(),
                 "snippet file for {} not created",

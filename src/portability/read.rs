@@ -443,7 +443,7 @@ mod tests {
         drop(crate::db::open(&path).expect("init db"));
         // Keep the tempdir alive for the connection's lifetime by leaking it —
         // the .local-runs root is the project scratch space.
-        std::mem::forget(dir);
+        let _ = crate::test_support::keep_dir_until_exit(dir);
         crate::db::open(&path).expect("open db")
     }
 
