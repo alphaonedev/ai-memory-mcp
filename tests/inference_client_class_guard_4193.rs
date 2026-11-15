@@ -51,6 +51,92 @@ struct Allowed {
     /// Why the site is not an unrouted inference client. Starts with one of
     /// [`REASON_CLASSES`].
     reason: &'static str,
+    /// What the client carries to the remote: `none`, or which credential
+    /// and which data (X-10). Never empty.
+    credential: &'static str,
+    /// Redirect policy, read from the fn body and checked against it.
+    redirect: Redirect,
+    /// Env-proxy behaviour, read from the fn body and checked against it.
+    proxy: Proxy,
+}
+
+/// Redirect policy of a construction site's fn body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Redirect {
+    /// No `.redirect(..)`: reqwest follows up to 10 hops.
+    DefaultFollow,
+    /// `Policy::none()`.
+    Refused,
+    /// `Policy::limited(..)`.
+    Limited,
+    /// Set per posture by the policy itself (`policy-routed:` entries only).
+    PostureDependent,
+    /// Observed only: a `.redirect(..)` this scanner cannot classify, or
+    /// more than one policy in one body. Never matches a declaration.
+    Unclassified,
+}
+
+/// Env-proxy behaviour of a construction site's fn body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Proxy {
+    /// `.no_proxy()`.
+    NoProxy,
+    /// Neither `.no_proxy()` nor `.proxy(..)`: reqwest honours the env vars.
+    HonoursEnv,
+    /// Set per posture by the policy itself (`policy-routed:` entries only).
+    PostureDependent,
+    /// Observed only: an explicit `.proxy(..)`, or both forms in one body.
+    Unclassified,
+}
+
+impl Redirect {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::DefaultFollow => "default-follow",
+            Self::Refused => "none",
+            Self::Limited => "limited",
+            Self::PostureDependent => "posture-dependent",
+            Self::Unclassified => "unclassified",
+        }
+    }
+}
+
+impl Proxy {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NoProxy => "no_proxy",
+            Self::HonoursEnv => "honours-env",
+            Self::PostureDependent => "posture-dependent",
+            Self::Unclassified => "unclassified",
+        }
+    }
+}
+
+/// Read the redirect and proxy facts from one fn body (comments and
+/// literals already blanked, so prose naming a policy never counts).
+fn body_facts(body: &[u8]) -> (Redirect, Proxy) {
+    let compact: String = body
+        .iter()
+        .filter(|b| !b.is_ascii_whitespace())
+        .map(|&b| char::from(b))
+        .collect();
+    let none = compact.contains("Policy::none()");
+    let limited = compact.contains("Policy::limited(");
+    let any_redirect = compact.contains(".redirect(");
+    let redirect = match (none, limited, any_redirect) {
+        (false, false, false) => Redirect::DefaultFollow,
+        (true, false, true) => Redirect::Refused,
+        (false, true, true) => Redirect::Limited,
+        _ => Redirect::Unclassified,
+    };
+    let no_proxy = compact.contains(".no_proxy()");
+    let explicit = compact.contains(".proxy(");
+    let proxy = match (no_proxy, explicit) {
+        (true, false) => Proxy::NoProxy,
+        (false, false) => Proxy::HonoursEnv,
+        _ => Proxy::Unclassified,
+    };
+    (redirect, proxy)
 }
 
 /// The reason classes an allowlist entry may carry.
@@ -66,61 +152,91 @@ const ALLOWLIST: [Allowed; 10] = [
         file: "src/llm/egress_policy.rs",
         func: "inference_client_builder",
         count: 1,
-        reason: "policy-routed: the composition point itself; every [llm] OllamaClient constructor and both model pulls build through it",
+        reason: "policy-routed: the composition point itself; every [llm] OllamaClient constructor and both model pulls build through it; restricted postures refuse redirects and env proxies, the allow posture is tracked #9314",
+        credential: "provider bearer (when configured) + prompts and memory content",
+        redirect: Redirect::PostureDependent,
+        proxy: Proxy::PostureDependent,
     },
     Allowed {
         file: "src/subscriptions.rs",
         func: "prewarm_dispatch_tls",
         count: 1,
-        reason: "non-inference: webhook TLS warm-up; no_proxy, never carries an inference bearer",
+        reason: "non-inference: webhook TLS warm-up; completes a handshake only, sends no request",
+        credential: "none",
+        redirect: Redirect::DefaultFollow,
+        proxy: Proxy::NoProxy,
     },
     Allowed {
         file: "src/subscriptions.rs",
         func: "send",
         count: 1,
         reason: "non-inference: webhook dispatch; SSRF address pin, no_proxy and Policy::none (#6053)",
+        credential: "HMAC signature header + event body",
+        redirect: Redirect::Refused,
+        proxy: Proxy::NoProxy,
     },
     Allowed {
         file: "src/daemon_runtime.rs",
         func: "run_sync_daemon_with_shutdown",
         count: 1,
-        reason: "non-inference: sync daemon peer client (federation sync, not an LLM endpoint)",
+        reason: "non-inference: sync daemon peer client (not an LLM endpoint); default redirect and env-proxy behaviour tracked #9318",
+        credential: "x-api-key + memory rows",
+        redirect: Redirect::DefaultFollow,
+        proxy: Proxy::HonoursEnv,
     },
     Allowed {
         file: "src/federation/peer.rs",
         func: "build",
         count: 1,
         reason: "non-inference: federation peer client; Policy::none, missing no_proxy tracked #9315",
+        credential: "mTLS identity + api key + memory rows",
+        redirect: Redirect::Refused,
+        proxy: Proxy::HonoursEnv,
     },
     Allowed {
         file: "src/mcp/tools/store/transport.rs",
         func: "forward_to_http",
         count: 1,
-        reason: "non-inference: remote store transport (memory_store forwarding to a daemon)",
+        reason: "non-inference: remote store transport (memory_store forwarding to a daemon); default redirect and env-proxy behaviour tracked #9318",
+        credential: "X-Agent-Id principal header + memory body",
+        redirect: Redirect::DefaultFollow,
+        proxy: Proxy::HonoursEnv,
     },
     Allowed {
         file: "src/cli/doctor.rs",
         func: "section_llm_reachability_from_resolved",
         count: 1,
         reason: "tracked #6222 / #8191: doctor LLM reachability probe builds its own client",
+        credential: "LLM provider bearer",
+        redirect: Redirect::DefaultFollow,
+        proxy: Proxy::HonoursEnv,
     },
     Allowed {
         file: "src/cli/doctor.rs",
         func: "section_embeddings_reachability_1598",
         count: 1,
         reason: "tracked #6222 / #8191: doctor embeddings reachability probe builds its own client",
+        credential: "embeddings provider bearer",
+        redirect: Redirect::DefaultFollow,
+        proxy: Proxy::HonoursEnv,
     },
     Allowed {
         file: "src/cli/doctor.rs",
         func: "http_get_json",
         count: 1,
-        reason: "non-inference: doctor fleet JSON fetch (no inference bearer, no memory content)",
+        reason: "non-inference: doctor remote daemon JSON fetch (no inference bearer); default redirect and env-proxy behaviour tracked #9318",
+        credential: "x-api-key + optional mTLS identity",
+        redirect: Redirect::DefaultFollow,
+        proxy: Proxy::HonoursEnv,
     },
     Allowed {
         file: "src/cli/sync.rs",
         func: "build_sync_client",
         count: 1,
-        reason: "non-inference: sync CLI peer client",
+        reason: "non-inference: sync CLI peer client; default redirect and env-proxy behaviour tracked #9318",
+        credential: "optional mTLS identity; the sync loop adds x-api-key + memory rows per request",
+        redirect: Redirect::DefaultFollow,
+        proxy: Proxy::HonoursEnv,
     },
 ];
 
@@ -278,6 +394,17 @@ struct Site {
     line: usize,
     func: String,
     form: String,
+    /// Byte offset of the `{` of the innermost enclosing fn body (the key
+    /// into [`FileScan::fn_facts`]); `None` outside any fn.
+    fn_at: Option<usize>,
+}
+
+/// One brace frame of the scan.
+struct Frame {
+    /// `Some((fn name, offset of its `{`))` for a fn body.
+    func: Option<(String, usize)>,
+    /// A site was found directly in this fn (its facts are read at `}`).
+    has_site: bool,
 }
 
 /// An out-of-line `mod name;` declaration.
@@ -293,6 +420,9 @@ struct FileScan {
     sites: Vec<Site>,
     mods: Vec<ModDecl>,
     file_test_only: bool,
+    /// Redirect / proxy facts of every fn body that holds a site, keyed by
+    /// the offset of the body's `{`. A body is read once, at its `}`.
+    fn_facts: BTreeMap<usize, (Redirect, Proxy)>,
 }
 
 fn skip_ws(code: &[u8], mut i: usize) -> usize {
@@ -504,8 +634,7 @@ fn scan_file(raw: &str) -> FileScan {
     let code = blank_non_code(raw);
     let starts = line_starts(&code);
     let mut scan = FileScan::default();
-    // Brace frames: Some(fn name) for a fn body, None otherwise.
-    let mut frames: Vec<Option<String>> = Vec::new();
+    let mut frames: Vec<Frame> = Vec::new();
     let mut pending_fn: Option<String> = None;
     let mut i = 0;
     let n = code.len();
@@ -562,12 +691,21 @@ fn scan_file(raw: &str) -> FileScan {
         }
         match b {
             b'{' => {
-                frames.push(pending_fn.take());
+                frames.push(Frame {
+                    func: pending_fn.take().map(|name| (name, i)),
+                    has_site: false,
+                });
                 i += 1;
                 continue;
             }
             b'}' => {
-                frames.pop();
+                if let Some(Frame {
+                    func: Some((_, open)),
+                    has_site: true,
+                }) = frames.pop()
+                {
+                    scan.fn_facts.insert(open, body_facts(&code[open..=i]));
+                }
                 i += 1;
                 continue;
             }
@@ -605,10 +743,12 @@ fn scan_file(raw: &str) -> FileScan {
                     .trim_end_matches(';')
                     .to_string();
                 if let Some(form) = alias_form(&tree) {
+                    let (func, fn_at) = enclosing_fn(&mut frames);
                     scan.sites.push(Site {
                         line: line_of(&starts, i),
-                        func: enclosing_fn(&frames),
+                        func,
                         form,
+                        fn_at,
                     });
                 }
                 i = end;
@@ -629,10 +769,12 @@ fn scan_file(raw: &str) -> FileScan {
                 break;
             }
             if let Some(form) = construction_form(&segments) {
+                let (func, fn_at) = enclosing_fn(&mut frames);
                 scan.sites.push(Site {
                     line: line_of(&starts, i),
-                    func: enclosing_fn(&frames),
+                    func,
                     form,
+                    fn_at,
                 });
             }
             i = j;
@@ -643,12 +785,17 @@ fn scan_file(raw: &str) -> FileScan {
     scan
 }
 
-fn enclosing_fn(frames: &[Option<String>]) -> String {
-    frames
-        .iter()
-        .rev()
-        .find_map(Clone::clone)
-        .unwrap_or_else(|| "<module>".to_string())
+/// Innermost enclosing fn name and body offset; marks that frame so its
+/// facts are read when its `}` is reached.
+fn enclosing_fn(frames: &mut [Frame]) -> (String, Option<usize>) {
+    match frames.iter_mut().rev().find(|f| f.func.is_some()) {
+        Some(frame) => {
+            frame.has_site = true;
+            let (name, open) = frame.func.clone().unwrap_or_default();
+            (name, Some(open))
+        }
+        None => ("<module>".to_string(), None),
+    }
 }
 
 // ─── Tree: test-only files, classification ──────────────────────────────
@@ -757,6 +904,10 @@ fn classify(files: &[(String, String)], allow: &[Allowed]) -> Vec<String> {
             )),
             Some(_) => {}
         }
+        if let Some(sites) = found.get(&key) {
+            let facts = scans.get(entry.file).map(|s| &s.fn_facts);
+            findings.extend(facts_findings(entry, sites, facts));
+        }
     }
     for ((file, func), sites) in &found {
         if allow.iter().any(|a| a.file == file && a.func == func) {
@@ -770,6 +921,66 @@ fn classify(files: &[(String, String)], allow: &[Allowed]) -> Vec<String> {
         }
     }
     findings
+}
+
+/// X-10: an entry's declared credential / redirect / proxy facts must be
+/// what the source of every one of its sites shows, and a credentialed
+/// non-inference client that follows redirects or honours env proxies must
+/// name its tracking issue in the reason.
+fn facts_findings(
+    entry: &Allowed,
+    sites: &[&Site],
+    facts: Option<&BTreeMap<usize, (Redirect, Proxy)>>,
+) -> Vec<String> {
+    let id = format!("{}:{}", entry.file, entry.func);
+    let mut out = Vec::new();
+    if entry.credential.trim().is_empty() {
+        out.push(format!(
+            "facts: {id} credential is empty (say `none` or which)"
+        ));
+    }
+    let posture =
+        entry.redirect == Redirect::PostureDependent || entry.proxy == Proxy::PostureDependent;
+    if posture {
+        if !entry.reason.starts_with("policy-routed:") {
+            out.push(format!(
+                "facts: {id} posture-dependent facts are only for a policy-routed: entry"
+            ));
+        }
+    } else {
+        let mut observed: BTreeSet<(&str, &str)> = BTreeSet::new();
+        for site in sites {
+            let (r, p) = site
+                .fn_at
+                .and_then(|at| facts.and_then(|f| f.get(&at)).copied())
+                .unwrap_or((Redirect::Unclassified, Proxy::Unclassified));
+            observed.insert((r.as_str(), p.as_str()));
+        }
+        let declared = (entry.redirect.as_str(), entry.proxy.as_str());
+        if observed.iter().any(|o| *o != declared) {
+            let shown: Vec<String> = observed
+                .iter()
+                .map(|(r, p)| format!("redirect={r} proxy={p}"))
+                .collect();
+            out.push(format!(
+                "facts: {id} declares redirect={} proxy={}, source shows {}",
+                declared.0,
+                declared.1,
+                shown.join(" / ")
+            ));
+        }
+    }
+    let leaky = entry.redirect == Redirect::DefaultFollow || entry.proxy == Proxy::HonoursEnv;
+    if entry.reason.starts_with("non-inference:")
+        && entry.credential.trim() != "none"
+        && leaky
+        && !entry.reason.contains("tracked #")
+    {
+        out.push(format!(
+            "untracked: {id} carries a credential and follows redirects or honours env proxies; the reason must name its tracking issue"
+        ));
+    }
+    out
 }
 
 fn collect_rs(dir: &Path, root: &Path, out: &mut Vec<(String, String)>) {
@@ -1007,18 +1218,27 @@ fn class_guard_reports_unlisted_stale_count_and_reason_findings_4193() {
             func: "listed",
             count: 1,
             reason: "non-inference: fixture",
+            credential: "none",
+            redirect: Redirect::DefaultFollow,
+            proxy: Proxy::HonoursEnv,
         },
         Allowed {
             file: "src/a.rs",
             func: "gone",
             count: 1,
             reason: "tracked #0: fixture",
+            credential: "none",
+            redirect: Redirect::DefaultFollow,
+            proxy: Proxy::HonoursEnv,
         },
         Allowed {
             file: "src/a.rs",
             func: "listed",
             count: 2,
             reason: "because",
+            credential: "none",
+            redirect: Redirect::DefaultFollow,
+            proxy: Proxy::HonoursEnv,
         },
     ];
     let findings = classify(&tree(&[("src/a.rs", src)]), &allow);
@@ -1042,6 +1262,152 @@ fn class_guard_reports_unlisted_stale_count_and_reason_findings_4193() {
         );
         assert!(entry.count >= 1, "{}:{} count 0", entry.file, entry.func);
     }
+}
+
+/// One row of the X-10 facts self-test: (fn name, fn body, declared
+/// credential, redirect, proxy, reason, the findings the row must produce).
+type FactsRow = (
+    &'static str,
+    &'static str,
+    &'static str,
+    Redirect,
+    Proxy,
+    &'static str,
+    &'static [&'static str],
+);
+
+const FACTS_ROWS: [FactsRow; 9] = [
+    // Declared facts that match the source: no finding.
+    (
+        "refused",
+        "reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).no_proxy().build()",
+        "none",
+        Redirect::Refused,
+        Proxy::NoProxy,
+        "non-inference: fixture",
+        &[],
+    ),
+    (
+        "limited",
+        "reqwest::Client::builder().redirect(reqwest::redirect::Policy::limited(3)).build()",
+        "none",
+        Redirect::Limited,
+        Proxy::HonoursEnv,
+        "non-inference: fixture",
+        &[],
+    ),
+    // A declaration that claims more than the source does.
+    (
+        "claims",
+        "reqwest::Client::new()",
+        "none",
+        Redirect::Refused,
+        Proxy::NoProxy,
+        "non-inference: fixture",
+        &[
+            "facts: src/f.rs:claims declares redirect=none proxy=no_proxy, source shows redirect=default-follow proxy=honours-env",
+        ],
+    ),
+    // A policy named only in a comment is not a policy.
+    (
+        "commented",
+        "// .no_proxy() and Policy::none()\n    reqwest::Client::new()",
+        "none",
+        Redirect::Refused,
+        Proxy::NoProxy,
+        "non-inference: fixture",
+        &[
+            "facts: src/f.rs:commented declares redirect=none proxy=no_proxy, source shows redirect=default-follow proxy=honours-env",
+        ],
+    ),
+    // A redirect policy or proxy the scanner cannot classify never matches.
+    (
+        "custom",
+        "reqwest::Client::builder().redirect(p).proxy(x).build()",
+        "none",
+        Redirect::DefaultFollow,
+        Proxy::HonoursEnv,
+        "non-inference: fixture",
+        &[
+            "facts: src/f.rs:custom declares redirect=default-follow proxy=honours-env, source shows redirect=unclassified proxy=unclassified",
+        ],
+    ),
+    // A credentialed client that leaks must name its tracking issue.
+    (
+        "cred",
+        "reqwest::Client::new()",
+        "x-api-key",
+        Redirect::DefaultFollow,
+        Proxy::HonoursEnv,
+        "non-inference: fixture",
+        &[
+            "untracked: src/f.rs:cred carries a credential and follows redirects or honours env proxies; the reason must name its tracking issue",
+        ],
+    ),
+    (
+        "cred_tracked",
+        "reqwest::Client::new()",
+        "x-api-key",
+        Redirect::DefaultFollow,
+        Proxy::HonoursEnv,
+        "non-inference: fixture, tracked #1",
+        &[],
+    ),
+    // An empty credential is a finding.
+    (
+        "blank",
+        "reqwest::Client::new()",
+        " ",
+        Redirect::DefaultFollow,
+        Proxy::HonoursEnv,
+        "non-inference: fixture",
+        &[
+            "facts: src/f.rs:blank credential is empty (say `none` or which)",
+            "untracked: src/f.rs:blank carries a credential and follows redirects or honours env proxies; the reason must name its tracking issue",
+        ],
+    ),
+    // Posture-dependent is reserved for the policy-routed composition point.
+    (
+        "posture",
+        "reqwest::Client::new()",
+        "none",
+        Redirect::PostureDependent,
+        Proxy::PostureDependent,
+        "non-inference: fixture",
+        &["facts: src/f.rs:posture posture-dependent facts are only for a policy-routed: entry"],
+    ),
+];
+
+#[test]
+fn class_guard_checks_declared_egress_facts_against_the_source_4193() {
+    for (func, body, credential, redirect, proxy, reason, want) in FACTS_ROWS {
+        let src = format!("fn {func}() {{\n    let _c = {body};\n}}\n");
+        let allow = [Allowed {
+            file: "src/f.rs",
+            func,
+            count: 1,
+            reason,
+            credential,
+            redirect,
+            proxy,
+        }];
+        let findings = classify(&tree(&[("src/f.rs", &src)]), &allow);
+        let want: Vec<String> = want.iter().map(|s| (*s).to_string()).collect();
+        assert_eq!(findings, want, "row `{func}`");
+    }
+    // The facts are read from the innermost fn: an outer fn's policy does not
+    // cover a nested fn's client.
+    let nested = "fn outer() {\n    fn inner() { let _c = reqwest::Client::new(); }\n    let _p = reqwest::redirect::Policy::none();\n}\n";
+    let allow = [Allowed {
+        file: "src/n.rs",
+        func: "inner",
+        count: 1,
+        reason: "non-inference: fixture",
+        credential: "none",
+        redirect: Redirect::DefaultFollow,
+        proxy: Proxy::HonoursEnv,
+    }];
+    assert!(classify(&tree(&[("src/n.rs", nested)]), &allow).is_empty());
 }
 
 #[test]
