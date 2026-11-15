@@ -198,10 +198,7 @@ fn w1_a_symlinked_parent_directory_publishes_nothing_3971() {
     let link = sb.base.join("stage-link");
     std::os::unix::fs::symlink(&sb.stage, &link).expect("symlink");
     let src = link.join("hub-allow.json");
-    let expected = format!(
-        "directory {} is reached through a symlink",
-        link.display()
-    );
+    let expected = format!("directory {} is reached through a symlink", link.display());
     assert_refused(&sb, "symlinked parent", &src, &expected);
 }
 
@@ -536,7 +533,10 @@ fn w10_no_environment_variable_changes_the_publish_mode_3971() {
     let rows: Vec<(&str, String)> = vec![
         ("HOME", home.clone()),
         ("XDG_CONFIG_HOME", cfg),
-        ("AI_MEMORY_CONFIG", format!("{home}/.config/ai-memory/config.toml")),
+        (
+            "AI_MEMORY_CONFIG",
+            format!("{home}/.config/ai-memory/config.toml"),
+        ),
         ("AI_MEMORY_DB", db),
         ("AI_MEMORY_AGENT_ID", "ai:mallory".to_owned()),
         ("AI_MEMORY_NO_CONFIG", "0".to_owned()),
@@ -563,7 +563,11 @@ fn w10_no_environment_variable_changes_the_publish_mode_3971() {
             .expect("spawn");
         assert_eq!(out.stderr, baseline.stderr, "{key}: stderr changed");
         assert_eq!(out.stdout, baseline.stdout, "{key}: stdout changed");
-        assert_eq!(out.status.code(), baseline.status.code(), "{key}: exit changed");
+        assert_eq!(
+            out.status.code(),
+            baseline.status.code(),
+            "{key}: exit changed"
+        );
         assert_eq!(tree(&sb.base), before, "{key}: the mode wrote a file");
     }
     assert_eq!(baseline.status.code(), Some(EXIT_PUBLISH_REFUSED));

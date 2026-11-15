@@ -21,7 +21,7 @@
     "path": "src/wake_hub/delegation_verifier.rs",
     "role": "Hub routing and bounded codecs; only public verification/visibility dependencies admitted by the separate zero-authority gate.",
     "mode": "rust-production-tokens",
-    "sha256": "aa72f645c77a4c4b995f19a3cbea6830ec5a0c9412a3ca371a1431cdfa2ff1c9"
+    "sha256": "265fc2e2a8a406f1d4fc0e0a06716fe5462ef234b021eb4003907e540d6f8c56"
   },
   {
     "path": "src/wake_hub/frame.rs",
@@ -63,7 +63,7 @@
     "path": "src/wake_hub/mod.rs",
     "role": "Hub routing and bounded codecs; only public verification/visibility dependencies admitted by the separate zero-authority gate.",
     "mode": "rust-production-tokens",
-    "sha256": "756798ee1f854797dfd2e85c7a3d4629ba031864c1b31aaf7a910e6c3e878153"
+    "sha256": "867ae04c0ddef504c7d5bcc4ecbb4895b5960cb74f8c6ca128197e32eb8caa79"
   },
   {
     "path": "src/wake_hub/pending.rs",
@@ -82,6 +82,12 @@
     "role": "Hub routing and bounded codecs; only public verification/visibility dependencies admitted by the separate zero-authority gate.",
     "mode": "rust-production-tokens",
     "sha256": "e476357870df9136fd8bdbd5c1c49e17ad5aa5d40aac6e3f12e78599067c72c0"
+  },
+  {
+    "path": "src/wake_hub/snapshot_publish.rs",
+    "role": "#3971 packaging-internal hand-off of the allowlist snapshot file (no-follow walk, fstat proof, O_EXCL temp, renameat); file plane only, carries no wake content and routes nothing.",
+    "mode": "rust-production-tokens",
+    "sha256": "a098f2a894349f89856455391aa5d1568cd673b8179f869583f64130ea62451e"
   },
   {
     "path": "src/wake_hub/startup.rs",

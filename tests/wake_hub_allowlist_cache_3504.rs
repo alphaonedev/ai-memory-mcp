@@ -411,6 +411,8 @@ fn the_posture_reports_the_snapshot_age_in_both_renderings_3504() {
         // not the exit gate, so it stays false.
         require_admits: false,
         json: false,
+        // #3971's packaging-internal publish mode; not under test here.
+        publish_snapshot: None,
     };
     let cfg = resolve_config(&args, &ai_memory::config::AppConfig::default()).expect("resolve");
 
