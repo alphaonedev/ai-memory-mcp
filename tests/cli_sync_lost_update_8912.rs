@@ -499,13 +499,67 @@ const CONCURRENT_CONTENT: &str = "concurrent-writer-newer-content";
 /// 5 s `busy_timeout`, so a waiting sync is never refused.
 const LOCK_HOLD: Duration = Duration::from_millis(1500);
 
+/// N-1 — the archive reason the concurrent writer records (a genuine
+/// archival, not an `in_place_edit` snapshot).
+const CONCURRENT_ARCHIVE_REASON: &str = "8912-concurrent-archive";
+
+/// N-1 — what the second writer commits while `sync` waits for the lock.
+#[derive(Clone, Copy)]
+enum Concurrent {
+    /// A row NEWER than the source copy under the same id.
+    NewerUpdate,
+    /// A genuine archival of the id. The `merge` funnel
+    /// (`db::insert_if_newer`) re-checks `updated_at` and the forget
+    /// tombstone for the same id, but NOT the archive covenant: that check
+    /// lives only in `sync_disposition`, so this is the shape in which a
+    /// merge verdict read outside the write transaction re-admits the row.
+    Archive,
+}
+
+/// N-1 — start the blocker (`BEGIN IMMEDIATE` on `dest`), spawn a REAL
+/// `sync`, and prove it is waiting on the lock before returning both.
+fn spawn_blocked_sync(
+    direction: &str,
+    local: &Path,
+    remote: &Path,
+    dest: &Path,
+) -> (rusqlite::Connection, std::process::Child) {
+    let blocker = db::open(dest).expect("open blocker");
+    blocker
+        .execute_batch("BEGIN IMMEDIATE")
+        .expect("take the destination write lock");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ai-memory"))
+        .env("AI_MEMORY_NO_CONFIG", "1")
+        .env("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0")
+        .args([
+            "--db",
+            local.to_str().expect("utf-8 path"),
+            "--json",
+            "sync",
+        ])
+        .arg(remote)
+        .args(["--direction", direction])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ai-memory");
+    std::thread::sleep(LOCK_HOLD);
+    assert!(
+        child.try_wait().expect("poll sync").is_none(),
+        "{direction}: sync finished without waiting for the destination write lock"
+    );
+    (blocker, child)
+}
+
 /// N-1 — run a REAL `sync` while a second writer holds the destination's
 /// write lock (`BEGIN IMMEDIATE`); once `sync` is waiting, that writer commits
-/// a row NEWER than the source copy and releases the lock. The newer-wins
+/// its change (`concurrent`) and releases the lock. The newer-wins / covenant
 /// verdict and the write must be one atomic unit: a verdict read before the
 /// lock (taken from the stale pre-commit row) would let the older source copy
-/// overwrite the concurrent writer's newer row.
-fn interleave_sync(direction: &str) {
+/// overwrite the concurrent writer's newer row, or re-admit the row the
+/// concurrent writer archived.
+fn interleave_sync(direction: &str, concurrent: Concurrent) {
     let dir = tempfile::tempdir().expect("tempdir under TMPDIR");
     let local = dir.path().join("local.db");
     let remote = dir.path().join("remote.db");
@@ -520,66 +574,79 @@ fn interleave_sync(direction: &str) {
         &mem(&id, "t-8912-interleave", ORIGINAL_CONTENT, OLDER),
     );
     seed(src, &mem(&id, "t-8912-interleave", SRC_CONTENT, MID));
-    let blocker = db::open(dest).expect("open blocker");
-    blocker
-        .execute_batch("BEGIN IMMEDIATE")
-        .expect("take the destination write lock");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ai-memory"))
-        .env("AI_MEMORY_NO_CONFIG", "1")
-        .env("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0")
-        .args([
-            "--db",
-            local.to_str().expect("utf-8 path"),
-            "--json",
-            "sync",
-        ])
-        .arg(&remote)
-        .args(["--direction", direction])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn ai-memory");
-    std::thread::sleep(LOCK_HOLD);
-    assert!(
-        child.try_wait().expect("poll sync").is_none(),
-        "{direction}: sync finished without waiting for the destination write lock"
-    );
-    blocker
-        .execute(
-            "UPDATE memories SET content = ?1, updated_at = ?2, version = version + 1 \
-             WHERE id = ?3",
-            rusqlite::params![CONCURRENT_CONTENT, NEWER, id],
-        )
-        .expect("concurrent newer write");
+    let (blocker, child) = spawn_blocked_sync(direction, &local, &remote, dest);
+    match concurrent {
+        Concurrent::NewerUpdate => {
+            blocker
+                .execute(
+                    "UPDATE memories SET content = ?1, updated_at = ?2, \
+                     version = version + 1 WHERE id = ?3",
+                    rusqlite::params![CONCURRENT_CONTENT, NEWER, id],
+                )
+                .expect("concurrent newer write");
+        }
+        Concurrent::Archive => {
+            // `archive_memory` joins the blocker's open transaction (#3957).
+            let moved = db::archive_memory(&blocker, &id, Some(CONCURRENT_ARCHIVE_REASON))
+                .expect("concurrent archive");
+            assert!(moved, "{direction}: the concurrent writer archived the row");
+        }
+    }
     blocker
         .execute_batch("COMMIT")
         .expect("commit the concurrent write");
     let out = child.wait_with_output().expect("sync output");
     let stderr = String::from_utf8_lossy(&out.stderr);
-    let row = live_row(dest, &id).expect("destination row present");
-    assert_eq!(
-        row.1, CONCURRENT_CONTENT,
-        "#8912 {direction}: a write decided from a stale read overwrote the newer concurrent row"
-    );
-    assert_eq!(
-        row.2, NEWER,
-        "#8912 {direction}: the newer updated_at was reverted"
-    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    match concurrent {
+        Concurrent::NewerUpdate => {
+            let row = live_row(dest, &id).expect("destination row present");
+            assert_eq!(
+                row.1, CONCURRENT_CONTENT,
+                "#8912 {direction}: a write decided from a stale read overwrote the newer concurrent row"
+            );
+            assert_eq!(
+                row.2, NEWER,
+                "#8912 {direction}: the newer updated_at was reverted"
+            );
+        }
+        Concurrent::Archive => {
+            assert_eq!(
+                live_row(dest, &id),
+                None,
+                "#8912 {direction}: a write decided from a stale read re-admitted the row the concurrent writer archived"
+            );
+            assert!(
+                db::memory_is_genuinely_archived(&db::open(dest).expect("reopen"), &id)
+                    .expect("archive probe"),
+                "#8912 {direction}: the concurrent archival is gone"
+            );
+            let report: serde_json::Value =
+                serde_json::from_str(stdout.trim()).expect("sync --json report");
+            assert_eq!(
+                report["pulled"],
+                serde_json::json!(0),
+                "#8912 {direction}: the archived row is not counted as pulled: {report}"
+            );
+        }
+    }
     assert_eq!(out.status.code(), Some(0), "{direction}: stderr {stderr}");
 }
 
 #[test]
 fn sync_8912_interleave_pull_never_overwrites_concurrent_newer_row() {
-    interleave_sync("pull");
+    interleave_sync("pull", Concurrent::NewerUpdate);
 }
 
 #[test]
 fn sync_8912_interleave_push_never_overwrites_concurrent_newer_row() {
-    interleave_sync("push");
+    interleave_sync("push", Concurrent::NewerUpdate);
 }
 
+/// N-1 merge — the same-id newer row is masked by `insert_if_newer`'s own
+/// `updated_at` re-check, so the merge cell interleaves an ARCHIVAL, which
+/// that funnel does not re-check (see [`Concurrent::Archive`]).
 #[test]
-fn sync_8912_interleave_merge_never_overwrites_concurrent_newer_row() {
-    interleave_sync("merge");
+fn sync_8912_interleave_merge_never_readmits_concurrently_archived_row() {
+    interleave_sync("merge", Concurrent::Archive);
 }
