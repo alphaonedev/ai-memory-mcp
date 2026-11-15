@@ -1340,8 +1340,13 @@ fn scan_bytes(rel: &str, bytes: &[u8], secret_bindings: bool) -> Vec<String> {
 
 /// Every Rust file under the class roots, as `(repo-relative path, path)`.
 fn class_files() -> Vec<(String, PathBuf)> {
+    class_files_for(CLASS_ROOTS)
+}
+
+/// Every Rust file under `roots`, as `(repo-relative path, path)`.
+fn class_files_for(roots: &[&str]) -> Vec<(String, PathBuf)> {
     let mut files = Vec::new();
-    for root in CLASS_ROOTS {
+    for root in roots {
         let path = repo_path(root);
         if path.exists() {
             rust_files_under(&path, &mut files);
@@ -1743,10 +1748,10 @@ const PROBE_ROWS: &[ProbeRow] = &[
         want: &["src/cli/agents.rs:1: `assert!` message renders secret-valued `password`"],
     },
     ProbeRow {
-        id: "chain field names the chain",
+        id: "sticky taint: a field does not rename a secret receiver",
         rel: "src/cli/agents.rs",
         src: r"assert_eq!(cred.uid, 7);",
-        want: &[],
+        want: &["src/cli/agents.rs:1: `assert_eq!` operand renders secret-valued `cred`"],
     },
     ProbeRow {
         id: "chain non-revealing method",
@@ -1761,10 +1766,10 @@ const PROBE_ROWS: &[ProbeRow] = &[
         want: &[],
     },
     ProbeRow {
-        id: "chain transparent then a clean field",
+        id: "sticky taint: transparent then a field",
         rel: "src/cli/agents.rs",
         src: "assert_eq!(cred.clone().uid, 7);",
-        want: &[],
+        want: &["src/cli/agents.rs:1: `assert_eq!` operand renders secret-valued `cred`"],
     },
     ProbeRow {
         id: "chain unlisted method on a secret receiver",
@@ -1887,10 +1892,10 @@ const PROBE_ROWS: &[ProbeRow] = &[
         want: &[],
     },
     ProbeRow {
-        id: "clean redacted rendering",
+        id: "Y-2 a first-word claim is no exemption: redacted_token",
         rel: "x.rs",
         src: r#"let m = format!("bearer {}", redacted_token);"#,
-        want: &[],
+        want: &["x.rs:1: `format!` message renders secret-valued `redacted_token`"],
     },
     ProbeRow {
         id: "clean secret name inside a literal",
@@ -1898,7 +1903,282 @@ const PROBE_ROWS: &[ProbeRow] = &[
         src: r#"assert_eq!(body["token"], expected, "the token field");"#,
         want: &[],
     },
+    // #9307 delta r2 (REVIEW-9307-combined-r2 R2-1, R2-2, R2-4): every
+    // segment shape after a secret-named receiver keeps the taint.
+    ProbeRow {
+        id: "Y-1 tuple index on a secret field",
+        rel: "x.rs",
+        src: r#"assert!(ok, "x {}", cfg.api_key.0);"#,
+        want: &["x.rs:1: `assert!` message renders secret-valued `api_key`"],
+    },
+    ProbeRow {
+        id: "Y-1 tuple index on a secret root",
+        rel: "x.rs",
+        src: r#"assert!(ok, "x {}", token.0);"#,
+        want: &["x.rs:1: `assert!` message renders secret-valued `token`"],
+    },
+    ProbeRow {
+        id: "Y-1 tuple index then a transparent method",
+        rel: "x.rs",
+        src: r#"assert!(ok, "x {}", creds.0.clone());"#,
+        want: &["x.rs:1: `assert!` message renders secret-valued `creds`"],
+    },
+    ProbeRow {
+        id: "Y-1 tuple index as an assert_eq! operand",
+        rel: "x.rs",
+        src: r#"assert_eq!(cfg.api_key.0, "x");"#,
+        want: &["x.rs:1: `assert_eq!` operand renders secret-valued `api_key`"],
+    },
+    ProbeRow {
+        id: "Y-1 tuple index as a tracing field value",
+        rel: "x.rs",
+        src: r#"tracing::info!(key = %cfg.api_key.0, "x");"#,
+        want: &["x.rs:1: `info!` message renders secret-valued `api_key`"],
+    },
+    ProbeRow {
+        id: "Y-1 turbofish method on a secret receiver",
+        rel: "x.rs",
+        src: r#"assert!(ok, "x {}", api_key.parse::<String>().unwrap());"#,
+        want: &["x.rs:1: `assert!` message renders secret-valued `api_key`"],
+    },
+    ProbeRow {
+        id: "Y-1 .await on a secret receiver",
+        rel: "x.rs",
+        src: r#"assert!(ok, "x {}", bearer.await);"#,
+        want: &["x.rs:1: `assert!` message renders secret-valued `bearer`"],
+    },
+    ProbeRow {
+        id: "Y-1 ? on a secret receiver",
+        rel: "x.rs",
+        src: r#"let m = format!("x {}", token?);"#,
+        want: &["x.rs:1: `format!` message renders secret-valued `token`"],
+    },
+    ProbeRow {
+        id: "Y-1 unclassified segment on a secret receiver",
+        rel: "x.rs",
+        src: r#"assert!(ok, "x {}", token.é);"#,
+        want: &[
+            "x.rs:1: `assert!` message renders secret-valued `token` through unclassified segment `.é` (fail closed)",
+        ],
+    },
+    ProbeRow {
+        id: "Y-1 sticky taint through a field",
+        rel: "x.rs",
+        src: r#"assert!(ok, "x {}", cfg.token.value);"#,
+        want: &["x.rs:1: `assert!` message renders secret-valued `token`"],
+    },
+    ProbeRow {
+        id: "Y-1 clean: len() on a secret field",
+        rel: "x.rs",
+        src: r#"assert!(ok, "x {}", cfg.api_key.len());"#,
+        want: &[],
+    },
+    ProbeRow {
+        id: "Y-1 clean: is_empty() on a secret root",
+        rel: "x.rs",
+        src: r#"assert!(ok, "x {}", token.is_empty());"#,
+        want: &[],
+    },
+    ProbeRow {
+        id: "Y-1 clean: as_ref().is_some() on a secret field",
+        rel: "x.rs",
+        src: r#"assert!(ok, "x {}", cfg.api_key.as_ref().is_some());"#,
+        want: &[],
+    },
+    ProbeRow {
+        id: "Y-2 created_token placeholder",
+        rel: "x.rs",
+        src: r#"let m = format!("x {created_token}");"#,
+        want: &["x.rs:1: `format!` message renders secret-valued `created_token`"],
+    },
+    ProbeRow {
+        id: "Y-2 created_api_key argument",
+        rel: "x.rs",
+        src: r#"assert!(ok, "x {}", created_api_key);"#,
+        want: &["x.rs:1: `assert!` message renders secret-valued `created_api_key`"],
+    },
+    ProbeRow {
+        id: "Y-4 plural pair indexed: api_keys[0]",
+        rel: "x.rs",
+        src: r#"assert!(ok, "x {}", api_keys[0]);"#,
+        want: &["x.rs:1: `assert!` message renders secret-valued `api_keys`"],
+    },
+    ProbeRow {
+        id: "Y-4 plural pair: private_keys",
+        rel: "x.rs",
+        src: r#"let m = format!("x {private_keys:?}");"#,
+        want: &["x.rs:1: `format!` message renders secret-valued `private_keys`"],
+    },
+    ProbeRow {
+        id: "Y-4 plural pair: signing_keys",
+        rel: "x.rs",
+        src: r#"let m = format!("x {signing_keys:?}");"#,
+        want: &["x.rs:1: `format!` message renders secret-valued `signing_keys`"],
+    },
+    ProbeRow {
+        id: "Y-4 plural pair: access_keys",
+        rel: "x.rs",
+        src: r#"let m = format!("x {access_keys:?}");"#,
+        want: &["x.rs:1: `format!` message renders secret-valued `access_keys`"],
+    },
 ];
+
+/// Secret-named receivers for the generative chain cells (#9307 delta r2):
+/// one per word part family, the pairs and their plurals.
+const SECRET_NAME_CORPUS: &[&str] = &[
+    "token",
+    "secret",
+    "password",
+    "bearer",
+    "creds",
+    "apikey",
+    "api_key",
+    "api_keys",
+    "private_key",
+    "private_keys",
+    "signing_keys",
+    "access_keys",
+];
+
+/// Segments that keep a secret receiver's taint, with the tail the finding
+/// carries (an unclassified segment names itself).
+const TAINT_KEEPING_SEGMENTS: &[(&str, &str)] = &[
+    (".0", ""),
+    (".0.clone()", ""),
+    (".await", ""),
+    ("?", ""),
+    ("[0]", ""),
+    (".inner", ""),
+    (".inner.name", ""),
+    (".clone()", ""),
+    (".parse::<String>()", ""),
+    (".parse::<Vec<u8>>().unwrap()", ""),
+    (".frobnicate()", ""),
+    (".é", " through unclassified segment `.é` (fail closed)"),
+];
+
+/// Renderings of a secret receiver that reveal nothing of it.
+const TAINT_CLEARING_SEGMENTS: &[&str] = &[
+    ".len()",
+    ".is_empty()",
+    ".as_ref().is_some()",
+    ".clone().len() * 2",
+];
+
+/// Receiver prefixes the generative cells put before each corpus name.
+const RECEIVER_PREFIXES: &[&str] = &["", "cfg.", "self.inner."];
+
+/// The first words NON_SECRET_FIRST_PARTS used to clear (#9307 R2-2): no
+/// first word part clears a secret-named identifier.
+const FIRST_WORD_PROBES: &[&str] = &[
+    "has",
+    "is",
+    "num",
+    "max",
+    "min",
+    "redact",
+    "redacted",
+    "mask",
+    "masked",
+    "sanitize",
+    "sanitized",
+    "scrub",
+    "scrubbed",
+    "hash",
+    "hashed",
+    "fingerprint",
+    "require",
+    "requires",
+    "created",
+];
+
+/// Secret tails the first-word probes are joined to.
+const FIRST_WORD_TAILS: &[&str] = &["token", "api_key", "secret"];
+
+/// Generative cell over the closed segment grammar: every corpus name, in
+/// every receiver shape, followed by every taint-keeping segment, is EXACTLY
+/// one finding naming the corpus name; every taint-clearing segment is clean.
+#[test]
+fn cleartext_msgs_scanner_chain_grammar_generative() {
+    let mut wrong = Vec::new();
+    for name in SECRET_NAME_CORPUS {
+        for before in RECEIVER_PREFIXES {
+            for (segment, tail) in TAINT_KEEPING_SEGMENTS {
+                let src = format!("assert!(ok, \"x {{}}\", {before}{name}{segment});");
+                let want = vec![format!(
+                    "x.rs:1: `assert!` message renders secret-valued `{name}`{tail}"
+                )];
+                let got = scan_text("x.rs", &src, false);
+                if got != want {
+                    wrong.push(format!("{src} -> {got:?}"));
+                }
+            }
+            for segment in TAINT_CLEARING_SEGMENTS {
+                let src = format!("assert!(ok, \"x {{}}\", {before}{name}{segment});");
+                let got = scan_text("x.rs", &src, false);
+                if !got.is_empty() {
+                    wrong.push(format!("{src} -> {got:?}"));
+                }
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "chain grammar cases with the wrong findings ({}):\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+}
+
+/// Generative cell for design item 3: a first word part never clears a
+/// secret-named identifier; only a whole-name row does.
+#[test]
+fn cleartext_msgs_scanner_first_word_never_exempts() {
+    let mut wrong = Vec::new();
+    for first in FIRST_WORD_PROBES {
+        for tail in FIRST_WORD_TAILS {
+            let id = format!("{first}_{tail}");
+            let src = format!("let m = format!(\"x {{{id}}}\");");
+            let want = vec![format!(
+                "x.rs:1: `format!` message renders secret-valued `{id}`"
+            )];
+            let got = scan_text("x.rs", &src, false);
+            if got != want {
+                wrong.push(format!("{src} -> {got:?}"));
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "first-word exemptions still clear ({}):\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+}
+
+/// A class root that does not exist, for the fail-closed cell.
+const MISSING_CLASS_ROOT: &str = "src/no_such_class_root_9307";
+
+/// Design item 4: a missing class root is a panic naming it, never a
+/// silent skip that leaves every class cell passing with nothing scanned.
+#[test]
+fn cleartext_msgs_class_missing_root_fails_closed() {
+    let got = std::panic::catch_unwind(|| class_files_for(&[MISSING_CLASS_ROOT]));
+    let message = got.err().and_then(|p| p.downcast_ref::<String>().cloned());
+    assert_eq!(
+        message.as_deref(),
+        Some("class root src/no_such_class_root_9307 is missing (fail closed)")
+    );
+}
+
+/// Design item 4: every class root yields at least one Rust file.
+#[test]
+fn cleartext_msgs_class_roots_each_yield_files() {
+    for root in CLASS_ROOTS {
+        let files = class_files_for(&[root]);
+        assert!(!files.is_empty(), "class root {root} yields no Rust file");
+    }
+}
 
 /// Every probe row yields exactly its `want` findings under the class rule
 /// (the rule every file under the class roots gets).
