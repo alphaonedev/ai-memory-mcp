@@ -1610,6 +1610,186 @@ class OptionBRegion(LedgerCase):
         self.assertEqual(calls, [])
 
 
+# #9303 / #9304 / #9305: the tracked cert doc (docs/compliance/...CERTIFICATION.md at HEAD),
+# its frozen-region refusal reason, its head-detector state and the rules file's reachability.
+TRACKED_MARKER_LINE = 2210
+TRACKED_LAST_PRE_LINE = TRACKED_MARKER_LINE - 1
+TRACKED_STATUS_LINE = 23
+TRACKED_I4_LINE = 5
+TRACKED_DAY = "2026-11-14"
+TRACKED_INSERTED = "Inserted prose for the frozen-region row."
+TRACKED_APPENDED = "x"
+I4_EMPHASIS = "emphasis naming an amendment or a status above the ledger"
+# The live CI range of PR 9274 (chain tip before it, its round-3 head): the chain tip's
+# pre-marker region carries the #9177 firing at the STATUS line.
+CHAIN_TIP_9274 = "46c12050706160ca6912077464e8dd6fa7744809"
+HEAD_9274_R3 = "40cb1ad4539cd50c20125a210f454cb27c666d82"
+RANGE_9274_FIRST_DIFF = TRACKED_STATUS_LINE
+# #9305: the head detector (SCAN_HEAD) on the tracked doc; every line here is re-issue work.
+TRACKED_SCAN_HEAD_PAIR = ("DUPLICATE", "DUPLICATE")
+TRACKED_BINDS_LIKE_LINES = (82, 289, 971, 1339, 1588, 1589, 1609, 1630, 1878, 2024, 2084, 2117)
+TRACKED_STATUS_LIKE_LINES = (1612, 1629, 1780, 1843, 1885, 1972, 2025, 2077, 2083, 2084, 2090,
+                             2115)
+RULES_REISSUE_HEADING = "## Re-issue work: lines the head detector refuses (#9305)"
+# #9304: the indexes that link the cert doc also link the rules file.
+DOCS_INDEXES = ("docs/README.md", "docs/compliance/index.html")
+RULES_FILE_NAME = "CERT-AMENDMENT-LEDGER-RULES.md"
+
+
+def _edit_line(n, fn):
+    def edit(lines):
+        lines[n - 1] = fn(lines[n - 1])
+        return lines
+    return edit
+
+
+def _delete_line(n):
+    def edit(lines):
+        del lines[n - 1]
+        return lines
+    return edit
+
+
+def _insert_line(n, text):
+    def edit(lines):
+        lines.insert(n - 1, text)
+        return lines
+    return edit
+
+
+# (name, edit of the tracked doc's lines, first differing line). Every kind of D-1 difference.
+TRACKED_ROWS = (
+    ("crlf_line_3", _edit_line(3, lambda s: s + "\r"), 3),
+    ("byte_appended_status_line", _edit_line(TRACKED_STATUS_LINE, lambda s: s + TRACKED_APPENDED),
+     TRACKED_STATUS_LINE),
+    ("flip_plus_byte_status_line", _edit_line(
+        TRACKED_STATUS_LINE, lambda s: s.replace("**VOID as of", "**EXPIRED as of", 1)
+        + TRACKED_APPENDED), TRACKED_STATUS_LINE),
+    ("deleted_line_3", _delete_line(3), 3),
+    ("inserted_line_1", _insert_line(1, TRACKED_INSERTED), 1),
+    ("inserted_line_24", _insert_line(24, TRACKED_INSERTED), 24),
+    ("i4_line_edited", _edit_line(TRACKED_I4_LINE, lambda s: s + TRACKED_APPENDED), TRACKED_I4_LINE),
+    ("moved_marker", _delete_line(TRACKED_LAST_PRE_LINE), TRACKED_LAST_PRE_LINE),
+    ("last_pre_marker_line", _edit_line(TRACKED_LAST_PRE_LINE, lambda s: TRACKED_INSERTED),
+     TRACKED_LAST_PRE_LINE),
+)
+
+
+def tracked_doc():
+    return (HARNESS_ROOT / CERT_REL).read_text(encoding="utf-8")
+
+
+def tracked_edit(edit):
+    return "\n".join(edit(tracked_doc().split("\n")))
+
+
+class TrackedDocFrozenReason9303(LedgerCase):
+    """#9303: on the TRACKED cert doc every frozen-region difference is refused with the
+    frozen-region reason naming the first differing line, never the I4 emphasis reason."""
+
+    def test_9303_tracked_doc_shape(self):
+        lines = tracked_doc().split("\n")
+        self.assertEqual(lines[TRACKED_MARKER_LINE - 1], MARKER)
+        self.assertEqual(lines.count(MARKER), 1)
+        self.assertEqual(lines[TRACKED_LAST_PRE_LINE - 1], "")
+        self.assertIn("**VOID as of", lines[TRACKED_STATUS_LINE - 1])
+        # The line the old gate named: honest release bytes with I4-shaped emphasis.
+        self.assertEqual(ledger_error(tracked_doc()), (I4_EMPHASIS, TRACKED_I4_LINE))
+
+    def tracked_scene(self):
+        return self.scene("VOID", base_doc=tracked_doc())
+
+    def test_9303_tracked_rows_with_record_refused_as_frozen_region(self):
+        for name, edit, line in TRACKED_ROWS:
+            with self.subTest(row=name):
+                s = self.tracked_scene()
+                head = tracked_edit(edit) + record(TRACKED_DAY, path_item(MOD_RS))
+                ok, out = s.judge(self.wire_and_doc(s, head))
+                self.assert_region_refused(ok, out, line)
+                self.assertNotIn(I4_EMPHASIS, out)
+
+    def test_9303_tracked_rows_doc_only_refused_as_frozen_region(self):
+        for name, edit, line in TRACKED_ROWS:
+            with self.subTest(row=name):
+                s = self.tracked_scene()
+                ok, out = s.judge(s.commit({CERT_REL: tracked_edit(edit)}, "doc only"))
+                self.assert_region_refused(ok, out, line)
+                self.assertNotIn(I4_EMPHASIS, out)
+
+    def test_9303_tracked_rows_wire_without_record_refused_as_frozen_region(self):
+        for name, edit, line in TRACKED_ROWS:
+            with self.subTest(row=name):
+                s = self.tracked_scene()
+                ok, out = s.judge(self.wire_and_doc(s, tracked_edit(edit)))
+                self.assert_region_refused(ok, out, line)
+
+    def test_9303_tracked_unchanged_region_exact_record_passes(self):
+        s = self.tracked_scene()
+        head = tracked_doc() + record(TRACKED_DAY, path_item(MOD_RS))
+        ok, out = s.judge(self.wire_and_doc(s, head))
+        self.assert_pass(ok, out, RELEASE_PASS, "the certification stays VOID")
+
+    def test_9303_tracked_two_markers_keep_their_reason(self):
+        """A region that is not defined (two marker lines) is not a frozen-region difference:
+        it keeps its own refusal reason (I-A: reasons change only for frozen-region causes)."""
+        s = self.tracked_scene()
+        head = tracked_edit(_insert_line(TRACKED_I4_LINE, MARKER))
+        ok, out = s.judge(self.wire_and_doc(s, head))
+        self.assertFalse(ok, out)
+        self.assertNotIn("is frozen while the certification", out.split("\n")[0])
+
+    def test_9303_real_range_9274_refused_as_frozen_region(self):
+        for sha in (CHAIN_TIP_9274, HEAD_9274_R3):
+            probe = subprocess.run(["git", "-C", str(HARNESS_ROOT), "cat-file", "-e", sha + "^{commit}"],
+                                   capture_output=True, timeout=GIT_TIMEOUT_S, check=False)
+            if probe.returncode != 0:
+                self.skipTest(f"commit {sha} is not in this clone")
+        ok, out = cert.check_change(HARNESS_ROOT, CHAIN_TIP_9274, HEAD_9274_R3)
+        self.assert_region_refused(ok, out, RANGE_9274_FIRST_DIFF)
+
+    def test_9303_tracked_region_diff_bounded(self):
+        """The region compare stays linear on the tracked doc padded past 100K lines."""
+        pad = "Plain prose line for the tracked bound.\n" * BIG_REGION_LINES
+        lines = tracked_doc().split("\n")
+        base = "\n".join(lines[:TRACKED_LAST_PRE_LINE - 1]) + "\n" + pad + "\n".join(
+            lines[TRACKED_LAST_PRE_LINE - 1:])
+        head = base.replace("tracked bound.\n\n" + MARKER, "tracked bound!\n\n" + MARKER, 1)
+        base_b, head_b = base.encode("utf-8"), head.encode("utf-8")
+        strict = cert.banner_scan(base_b, capped=False, mode=cert.SCAN_STRICT)
+        start = time.monotonic()
+        line = cert.frozen_region_diff(base_b, head_b, strict, strict)
+        elapsed = time.monotonic() - start
+        self.assertEqual(line, TRACKED_LAST_PRE_LINE - 1 + BIG_REGION_LINES)
+        self.assertLess(elapsed, FAST_BOUND_S)
+
+
+class TrackedDocState9305(unittest.TestCase):
+    """#9305 / #9304: the tracked doc's head-detector state is pinned and recorded as
+    re-issue work; the rules file is reachable from the docs indexes."""
+
+    def test_9305_tracked_scan_head_pinned(self):
+        blob = (HARNESS_ROOT / CERT_REL).read_bytes()
+        banner = cert.banner_scan(blob, capped=True, mode=cert.SCAN_HEAD)
+        self.assertEqual((banner.status, banner.bound), TRACKED_SCAN_HEAD_PAIR)
+        want = sorted([(LOOSE_BINDS, n) for n in TRACKED_BINDS_LIKE_LINES]
+                      + [(LOOSE_STATUS, n) for n in TRACKED_STATUS_LIKE_LINES],
+                      key=lambda p: (p[1], p[0] != LOOSE_STATUS))
+        self.assertEqual(list(banner.problems), want)
+
+    def test_9305_rules_file_records_reissue_lines(self):
+        text = (HARNESS_ROOT / RULES_REL).read_text(encoding="utf-8")
+        self.assertIn(RULES_REISSUE_HEADING, text.split("\n"))
+        section = text.split(RULES_REISSUE_HEADING, 1)[1].split("\n## ", 1)[0]
+        for n in sorted(set(TRACKED_BINDS_LIKE_LINES + TRACKED_STATUS_LIKE_LINES)):
+            self.assertIn(f"`:{n}`", section)
+
+    def test_9304_indexes_link_rules_file(self):
+        for rel in DOCS_INDEXES:
+            with self.subTest(index=rel):
+                text = (HARNESS_ROOT / rel).read_text(encoding="utf-8")
+                self.assertIn(RULES_FILE_NAME, text)
+
+
 class DocRecordForm(unittest.TestCase):
     """I5 / F3: the doc states the record form the parser reads."""
 
