@@ -437,7 +437,19 @@ pub fn is_visible_to_scope_agent(mem: &Memory, as_agent: &str, caller: Option<&s
 }
 
 /// Owner / inbox-target check for a `scope=private` (or default) row.
+///
+/// #9356 (v1.0.0, security) — a blank caller (empty or whitespace only) is no
+/// principal and never matches. An absent owner / target defaults to `""`
+/// below, so without this guard caller `""` was the owner of every row whose
+/// `agent_id` is missing and the target of every row with no target agent.
+/// Fail closed: a blank caller sees no `scope=private` row on any surface that
+/// routes through this SSOT. PostgreSQL filters in SQL where an absent key is
+/// NULL and never equals `''`, so this aligns SQLite and the in-process
+/// re-checks with it.
 fn private_visible(namespace: &str, metadata: &serde_json::Value, caller: &str) -> bool {
+    if caller.trim().is_empty() {
+        return false;
+    }
     let owner = metadata
         .get(crate::META_KEY_AGENT_ID)
         .and_then(serde_json::Value::as_str)
@@ -1306,15 +1318,13 @@ mod tests {
     }
 
     #[test]
-    fn empty_owner_visible_to_empty_caller_edge_case() {
-        // The "" == "" equality is a degenerate edge case — handler
-        // callers always synthesize a non-empty principal
-        // (`anonymous:req-<uuid>` or X-Agent-Id), so this branch
-        // would only fire on a misconfigured caller chain. Document
-        // the behavior so a future refactor doesn't tighten it
-        // without understanding the call-site contract.
+    fn empty_owner_not_visible_to_empty_caller_9356() {
+        // #9356 — the "" == "" equality was reachable (session_start read
+        // the raw empty header; federation_sync_since falls back to ""), so
+        // a blank caller saw every owner-less private row. Fail closed.
         let m = mem_with_metadata(json!({"scope": "private"}));
-        assert!(is_visible_to_caller(&m, ""));
+        assert!(!is_visible_to_caller(&m, ""));
+        assert!(!is_visible_to_caller(&m, " \t"));
     }
 
     #[test]
