@@ -91,6 +91,24 @@ THE TWO PREDICATES #3556 ADDS (2026-09-21).
       <commit>`), so ancestry is not required; an unparseable banner or a
       bound SHA absent from the repository is fail-closed.
 
+THE AMENDMENT LEDGER (#6124, 2026-11-13). While STATUS is VOID or EXPIRED at
+both ends, (B) has one more honest pass: the change appends NEW dated records
+to the ledger under LEDGER_MARKER at the end of the cert doc, and those records
+together name exactly every changed watched path and every added or removed
+AI_MEMORY_FED_* identifier (a missing or an extra name fails). The ledger is
+append-only (an edited, reordered or removed base record fails), dated within
+[LEDGER_DATE_FLOOR, runner UTC date + LEDGER_DATE_SKEW_DAYS] with dates that never
+decrease, and parsed as a canonical Markdown subset: anything unrecognised in or
+before the region is a refusal (default deny). An amendment never discharges the
+cert: the STATUS word stays VOID/EXPIRED (a VOID <-> EXPIRED flip is routed here,
+never to the re-issue path), the STATUS line is frozen byte for byte except that
+token (3-agent vote 71472661, v9274-status), LIVE behaviour is unchanged, and any
+change of Binds-to while both ends are VOID/EXPIRED, a drop to `-` included, is
+refused (#6774 option B narrowed). Before ANY pass decision one clean-banner
+precondition (clean_banner) proves both ends carry exactly one strict STATUS line,
+at most one strict Binds-to line and no banner-like line the strict grammar did not
+consume.
+
 WHAT THIS DOES NOT CLAIM. A value-only edit of an existing AI_MEMORY_FED_*
 identifier in a file outside the three path watches does not trip the
 identifier check. This gate does not re-run 5.4(2)-(5); it only forces the
@@ -115,13 +133,17 @@ Exit codes: 0 clean / N/A-skip, 1 violation, 2 usage / self-test failure.
 import argparse
 import ast
 import contextlib
+import datetime
 import errno
+import html
 import os
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import unicodedata
+from collections import Counter, namedtuple
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -150,25 +172,140 @@ _S = r"[ \t\r\n\f\v]"
 # / hyphen, optional backticks, case-insensitive hex. They are anchored at line
 # start and require the heading marker / the bold "Binds to", so the section 7
 # history records that QUOTE these words in prose do not match.
+#
+# #6124 round 1 (3-agent vote 71472661, v9274-status): both patterns run on the raw BYTES
+# of one line, and only on a line of at most BANNER_MAX_LINE_BYTES, so no input reaches a
+# regex unbounded (the old Binds pattern was quadratic on a long whitespace run). The
+# STATUS token is case-sensitive from the fixed set with the fixed terminator " as of ",
+# so VOIDED, VOID-LIVE, VOIDLIVE and void never read as VOID. The Binds pattern has no
+# two adjacent optional whitespace runs (each ':' carries its own trailing run).
+_SB = rb"[ \t\r\n\f\v]"
 STATUS_LINE_RE = re.compile(
-    r"^>?" + _S + r"*#{1,3}" + _S + r"*STATUS" + _S + r"*(?:—|–|-)" + _S
-    + r"*\*\*" + _S + r"*(LIVE|VOID|EXPIRED)",
-    re.IGNORECASE,
+    rb"^>?" + _SB + rb"*#{1,3}" + _SB + rb"*(?i:STATUS)" + _SB
+    + "*(?:—|–|-)".encode("utf-8") + _SB + rb"*\*\*" + _SB
+    + rb"*(LIVE|VOID|EXPIRED)(?= as of )"
 )
 BINDS_LINE_RE = re.compile(
-    r"^>?" + _S + r"*\*\*" + _S + r"*Binds" + _S + r"+to" + _S + r"*:?" + _S
-    + r"*\*\*" + _S + r"*:?" + _S + r"*`?([0-9a-fA-F]{40})`?",
+    rb"^>?" + _SB + rb"*\*\*" + _SB + rb"*Binds" + _SB + rb"+to" + _SB + rb"*(?::" + _SB
+    + rb"*)?\*\*" + _SB + rb"*(?::" + _SB + rb"*)?`?([0-9a-fA-F]{40})`?",
     re.IGNORECASE,
 )
+BANNER_MAX_LINE_BYTES = 4096
+STATUS_TOKENS = (b"LIVE", b"VOID", b"EXPIRED")
+# The looser detector (I1): after case-folding (format characters removed, every Unicode
+# space read as a space), a line that names "status" followed only by these separators and
+# then a status word or an emphasis star, or names "bind(s) to" followed by ':', '*', '`'
+# or a run of LOOSE_HEX_RUN hex digits, is banner-like. Any such line the strict grammar
+# did not consume is a decoy and a refusal.
+LOOSE_STATUS_WORDS = ("live", "void", "expired")
+LOOSE_STATUS_SEP = frozenset(" :=—–-*_~`>|#")
+LOOSE_BINDS_SEP = frozenset(" -_*~`")
+LOOSE_BINDS_AFTER = frozenset(":*`")
+LOOSE_HEX = frozenset("0123456789abcdef")
+LOOSE_HEX_RUN = 7
+# Round 2 (#6124, 3-agent vote (71472661) v9274-detector, option B): the BASE end is read by
+# the strict grammar only (SCAN_STRICT); the HEAD end is read by the looser detector
+# (SCAN_LOOSE) while the certification is VOID or EXPIRED at both ends, with the base's own
+# looser-detector lines excused once each (they sit in the frozen region, so a head line
+# that is not byte-identical to one of them is still a refusal), and by the head detector
+# (SCAN_HEAD) while LIVE is at either end. The head detector adds, to the looser detector:
+# HTML entities decoded to a fixed point (more than HTML_UNESCAPE_MAX_PASSES passes is a
+# refusal), NFKC, the co-occurrence of 'status' and a status word (or 'binds') in the line
+# folded to [a-z0-9] only, the same co-occurrence across two adjacent non-blank lines (a soft
+# line break or two table rows), and any non-ASCII letter.
+SCAN_STRICT = "strict"
+SCAN_LOOSE = "loose"
+SCAN_HEAD = "head"
+HTML_UNESCAPE_MAX_PASSES = 4
+CANON_DROP_RE = re.compile(r"[^a-z0-9]+")
+CANON_STATUS = "status"
+CANON_BINDS = "binds"
+LOOSE_STATUS_REASON = "a STATUS-like line the strict grammar does not read"
+LOOSE_BINDS_REASON = "a Binds-like line the strict grammar does not read"
+NON_ASCII_LETTER_REASON = "a non-ASCII letter the head detector does not read"
+OVER_CAP_HEAD_REASON = (
+    f"a line over {BANNER_MAX_LINE_BYTES} bytes the head detector does not read")
+Banner = namedtuple("Banner", "status bound status_raw status_line token_span binds_raw problems")
+ABSENT_BANNER = Banner("ABSENT", "-", None, None, None, (), ())
 
 EXPIRY_SENTENCE = (
     "federation-wire surface changed → the enterprise-federation certification "
     "expires per its §7 → re-issue or void the cert doc in this same change."
 )
 
+# Rule (B) amendment ledger (#6124). While the certification is VOID or EXPIRED at both
+# ends of the range, a federation-wire change passes only when the head doc appends new
+# dated records, under this exact marker line at the end of the doc, that name exactly the
+# changed watched paths and AI_MEMORY_FED_* identifiers. The ledger is a canonical subset
+# of Markdown: anything the parser does not positively recognise is a refusal (design B,
+# 3-agent vote 71472661).
+LEDGER_MARKER = "## Amendment ledger (rule B, append-only)"
+LEDGER_RECORD_RE = re.compile(r"### Amendment ([0-9]{4}-[0-9]{2}-[0-9]{2})")
+LEDGER_ITEM_RE = re.compile(r"- (?:id: (" + FED_ID_PATTERN + r")|path: ([!-~]+))")
+LEDGER_DATE_FLOOR = datetime.date(2026, 11, 13)
+LEDGER_DATE_SKEW_DAYS = 1  # a record may carry the runner's UTC date plus this
+LEDGER_MAX_DOC_BYTES = 8 * 1024 * 1024
+LEDGER_MAX_LINE_BYTES = 256
+LEDGER_STATUSES = ("VOID", "EXPIRED")
+# D-2: a range start with no ledger marker (the release doc) passes only when the head's
+# pre-marker region is that whole doc followed by exactly these bytes (the blank line the
+# marker must follow).
+LEDGER_JOIN = b"\n"
+REGION_FROZEN_TEXT = (
+    "the pre-marker region of {doc} (everything above the '{marker}' line) is frozen while "
+    "the certification is VOID or EXPIRED at both ends: it must be byte-identical to the range "
+    "start (only the status word of the one STATUS line may change, between VOID and EXPIRED), "
+    "and differs at {doc}:{line}; put the change in a new amendment ledger record or re-issue "
+    "the certification as LIVE (#6124, 3-agent vote (71472661) v9274-detector)"
+)
+REGION_MARKERS_TEXT = (
+    "the {side} of the range holds the '{marker}' line {count} times, so its pre-marker region "
+    "of {doc} is not defined (#6124)"
+)
+# D-6: a record item whose fold reads like a banner line is refused.
+LEDGER_ITEM_BANNER_REASON = "an item line that reads like a STATUS or Binds-to line"
+# Unicode categories refused anywhere in the doc: controls (LF excepted), format
+# characters (zero-width, bidi, BOM), line/paragraph separators, private use, unassigned.
+LEDGER_FORBIDDEN_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp", "Co", "Cn", "Cs"})
+LEDGER_SUSPECT_RE = re.compile(r"[^\n\x20-\x7e]")
+# Leading blockquote markers, list markers and spaces: what a line is nested in.
+LEDGER_CONTAINER_RE = re.compile(r"(?:[ >]|[-*+](?=[ ]|$)|[0-9]{1,9}[.)](?=[ ]|$))*")
+LEDGER_FENCE_RE = re.compile(r"(`{3,}|~{3,})(.*)")
+LEDGER_HTML_START_RE = re.compile(r"<[A-Za-z!?/]")
+LEDGER_FRONT_MATTER = ("---", "+++")
+LedgerRecord = namedtuple("LedgerRecord", "line lines names")
+# The canonical item order the parser enforces, named in the refusal and in the rules doc
+# docs/compliance/CERT-AMENDMENT-LEDGER-RULES.md (I5).
+LEDGER_ITEM_ORDER = (
+    "'- id:' lines before '- path:' lines, each group in ascending byte order, no duplicates")
+# F3: the path item grammar is printable ASCII without spaces; the rules doc states it.
+LEDGER_PATH_RESTRICTION = (
+    "A '- path:' item names one section 7 watched path spelled in printable ASCII "
+    "with no space; a watched path outside that form cannot be named and needs a re-issue.")
+# I4: tokens refused inside a construct above the marker that could render as a record or
+# a banner, and the constructs' shapes (each applied only to a line already under the cap).
+PRE_REGION_TOKENS = ("amendment", "status")
+PRE_SETEXT_RE = re.compile(r" {0,3}(?:=+|-+) *")
+PRE_LINK_REF_RE = re.compile(r" {0,3}\[[^\]]*\]:")
+# A line's container prefix above the ledger: block-quote marks, indentation and list
+# bullets (nested in any order); it is blanked before the emphasis scan.
+PRE_CONTAINER_RE = re.compile(r"(?:[ \t>]|[*+-][ \t]|[0-9]{1,9}[.)][ \t])+")
+PRE_TOKEN_RE = re.compile(r"amendment|status", re.IGNORECASE)
+
 
 class GateError(Exception):
     """Evidence is missing or ambiguous: the gate fails closed."""
+
+
+class LedgerError(GateError):
+    """The amendment ledger on one side of the range is not in the canonical form."""
+
+    def __init__(self, reason, line, side):
+        self.reason = reason
+        self.line = line
+        self.side = side
+        where = f"at {CERT_DOC}:{line}" if line else f"in {CERT_DOC}"
+        super().__init__(f"amendment ledger ({side}): {reason} {where}")
 
 
 # ---------------------------------------------------------------------------
@@ -335,34 +472,368 @@ def read_blob(repo, tree, path):
     return blob.stdout
 
 
+def loose_fold(text):
+    """TEXT case-folded for the looser detector: format characters (zero-width, bidi)
+    removed and every Unicode space read as one ASCII space."""
+    kept = []
+    for ch in text:
+        if ch.isspace():
+            kept.append(" ")
+        elif unicodedata.category(ch) != "Cf":
+            kept.append(ch)
+    return "".join(kept).casefold()
+
+
+def status_like(folded):
+    """True iff FOLDED names 'status' followed only by separators and then a status word
+    or an emphasis star. Linear: each scan step moves past the previous match."""
+    at = folded.find("status")
+    while at != -1:
+        i = at + len("status")
+        star = False
+        while i < len(folded) and folded[i] in LOOSE_STATUS_SEP:
+            star = star or folded[i] == "*"
+            i += 1
+        if star or folded.startswith(LOOSE_STATUS_WORDS, i):
+            return True
+        at = folded.find("status", i)
+    return False
+
+
+def binds_like(folded):
+    """True iff FOLDED names 'bind' or 'binds', separators, 'to', then ':', '*', '`' or a
+    run of LOOSE_HEX_RUN hex digits. Linear."""
+    at = folded.find("bind")
+    while at != -1:
+        i = at + len("bind")
+        if i < len(folded) and folded[i] == "s":
+            i += 1
+        while i < len(folded) and folded[i] in LOOSE_BINDS_SEP:
+            i += 1
+        if folded.startswith("to", i):
+            j = i + 2
+            while j < len(folded) and folded[j] == " ":
+                j += 1
+            if j < len(folded) and folded[j] in LOOSE_BINDS_AFTER:
+                return True
+            k = j
+            while k < len(folded) and k - j < LOOSE_HEX_RUN and folded[k] in LOOSE_HEX:
+                k += 1
+            if k - j >= LOOSE_HEX_RUN:
+                return True
+        at = folded.find("bind", at + len("bind"))
+    return False
+
+
+def head_fold(text):
+    """(FOLDED, OVER) of TEXT for the head detector: HTML entities decoded to a fixed point,
+    NFKC, then loose_fold. OVER is True when HTML_UNESCAPE_MAX_PASSES passes do not reach
+    the fixed point (an entity nested deeper than that is itself a refusal). Linear in TEXT
+    for a bounded pass count."""
+    over = False
+    for _ in range(HTML_UNESCAPE_MAX_PASSES):
+        decoded = html.unescape(text)
+        if decoded == text:
+            break
+        text = decoded
+    else:
+        over = html.unescape(text) != text
+    return loose_fold(unicodedata.normalize("NFKC", text)), over
+
+
+def canon_status(canon):
+    return CANON_STATUS in canon and any(word in canon for word in LOOSE_STATUS_WORDS)
+
+
+def _non_ascii_letter(folded):
+    return any(ord(ch) > 0x7F and unicodedata.category(ch).startswith("L") for ch in folded)
+
+
+def _scan(blob, capped, mode, excuse):
+    """(Banner, flagged) of the cert doc BLOB. FLAGGED counts, by line bytes, the lines the
+    looser detector marked. MODE is SCAN_STRICT, SCAN_LOOSE or SCAN_HEAD; EXCUSE (a Counter
+    of line bytes, SCAN_LOOSE only) skips each listed line once."""
+    if blob is None:
+        return ABSENT_BANNER, Counter()
+    if capped and len(blob) > LEDGER_MAX_DOC_BYTES:
+        reason = f"the document is {len(blob)} bytes, over the {LEDGER_MAX_DOC_BYTES}-byte limit"
+        return Banner("UNPARSEABLE", "-", None, None, None, (), ((reason, None),)), Counter()
+    excuse = Counter(excuse or ())
+    flagged = Counter()
+    statuses = []
+    binds = []
+    loose_status = []
+    loose_binds = []
+    other = []
+    prev_canon = None
+    for number, line in enumerate(blob.split(b"\n"), 1):
+        rest = line
+        strict_here = False
+        over_cap = len(line) > BANNER_MAX_LINE_BYTES
+        if not over_cap:
+            found = STATUS_LINE_RE.match(line)
+            if found:
+                statuses.append((number, line, found.span(1)))
+                rest = line[found.end():]
+                strict_here = True
+            else:
+                found = BINDS_LINE_RE.match(line)
+                if found:
+                    binds.append((number, line, found.group(1).decode("ascii").lower()))
+                    rest = line[found.end():]
+                    strict_here = True
+        if mode == SCAN_STRICT:
+            continue
+        if mode == SCAN_HEAD:
+            if over_cap:
+                other.append((OVER_CAP_HEAD_REASON, number))
+                prev_canon = None
+                continue
+            folded, over = head_fold(rest.decode("utf-8", "replace"))
+            canon = CANON_DROP_RE.sub("", folded)
+            is_status = over or status_like(folded) or canon_status(canon)
+            is_binds = binds_like(folded) or CANON_BINDS in canon
+            # A soft line break: STATUS and a status word on two adjacent non-blank lines,
+            # neither of which reads as STATUS-like alone. A line already flagged ends the
+            # pair, so one banner-like line is reported once.
+            if not is_status and not is_binds and prev_canon is not None:
+                is_status = canon_status(prev_canon + canon)
+            if _non_ascii_letter(folded):
+                other.append((NON_ASCII_LETTER_REASON, number))
+            flagged_here = is_status or is_binds
+            prev_canon = canon if rest.strip() and not flagged_here and not strict_here else None
+        else:
+            folded = loose_fold(rest.decode("utf-8", "replace"))
+            is_status = status_like(folded)
+            is_binds = binds_like(folded)
+            if (is_status or is_binds) and excuse[line] > 0:
+                excuse[line] -= 1
+                continue
+        if is_status or is_binds:
+            flagged[line] += 1
+        if is_status:
+            loose_status.append(number)
+        if is_binds:
+            loose_binds.append(number)
+    problems = []
+    if len(statuses) > 1:
+        problems.append(("a second STATUS line under the strict grammar", statuses[1][0]))
+    if len(binds) > 1:
+        problems.append(("a second Binds-to line under the strict grammar", binds[1][0]))
+    problems.extend((LOOSE_STATUS_REASON, n) for n in loose_status)
+    problems.extend((LOOSE_BINDS_REASON, n) for n in loose_binds)
+    problems.extend(other)
+    problems.sort(key=lambda p: p[1])
+    if not statuses:
+        problems.append(("no STATUS line under the strict grammar", None))
+    if len(statuses) + len(loose_status) > 1:
+        status = "DUPLICATE"
+    elif statuses:
+        status = statuses[0][1][slice(*statuses[0][2])].decode("ascii")
+    else:
+        status = "UNPARSEABLE"
+    if len(binds) + len(loose_binds) > 1:
+        bound = "DUPLICATE"
+    elif binds and not loose_binds:
+        bound = binds[0][2]
+    else:
+        bound = "-"
+    first = statuses[0] if statuses else (None, None, None)
+    return Banner(status, bound, first[1], first[0], first[2],
+                  tuple(b[1] for b in binds), tuple(problems)), flagged
+
+
+def banner_scan(blob, capped, mode=SCAN_LOOSE, excuse=None):
+    """The Banner of the cert doc BLOB (bytes, or None when absent). Every line is read as
+    raw bytes; the strict patterns run only on a line within BANNER_MAX_LINE_BYTES, and the
+    detector MODE runs on what the strict grammar did not consume. PROBLEMS lists
+    (reason, line) for every form the precondition refuses; the size cap applies when
+    CAPPED (the head), before the split."""
+    return _scan(blob, capped, mode, excuse)[0]
+
+
+def base_excuse(blob):
+    """The lines (Counter of line bytes) the looser detector marks in the base doc BLOB:
+    inherited history the head may carry unchanged while the region is frozen."""
+    return _scan(blob, False, SCAN_LOOSE, None)[1]
+
+
+def scan_banner(repo, tree, capped):
+    return banner_scan(read_blob(repo, tree, CERT_DOC), capped)
+
+
 def cert_banner(repo, tree):
     """(STATUS, BINDS) of the cert doc at TREE.
 
-    STATUS: LIVE | VOID | EXPIRED | UNPARSEABLE (doc present, no STATUS line)
-    | DUPLICATE (two or more STATUS lines: a decoy above the real banner must
-    not be read as the banner) | ABSENT (no doc at TREE).
-    BINDS: the lowercase 40-hex bound SHA, "-" when no Binds-to line matches,
-    "DUPLICATE" when two or more do.
+    STATUS: LIVE | VOID | EXPIRED | UNPARSEABLE (doc present, no strict STATUS line)
+    | DUPLICATE (two or more STATUS lines, a STATUS-like decoy included: a decoy above the
+    real banner must not be read as the banner) | ABSENT (no doc at TREE).
+    BINDS: the lowercase 40-hex bound SHA, "-" when no strict Binds-to line matches,
+    "DUPLICATE" when two or more Binds-to or Binds-like lines do.
     """
-    blob = read_blob(repo, tree, CERT_DOC)
-    if blob is None:
-        return ("ABSENT", "-")
-    lines = blob.decode("utf-8", "replace").split("\n")
-    statuses = [m for m in (STATUS_LINE_RE.match(ln) for ln in lines) if m]
-    binds = [m for m in (BINDS_LINE_RE.match(ln) for ln in lines) if m]
-    if not statuses:
-        status = "UNPARSEABLE"
-    elif len(statuses) == 1:
-        status = statuses[0].group(1).upper()
-    else:
-        status = "DUPLICATE"
-    if not binds:
-        bound = "-"
-    elif len(binds) == 1:
-        bound = binds[0].group(1).lower()
-    else:
-        bound = "DUPLICATE"
-    return (status, bound)
+    found = scan_banner(repo, tree, capped=True)
+    return (found.status, found.bound)
+
+
+BANNER_UNPARSEABLE_TEXT = (
+    "{PREFIX}: ERROR — {CERT_DOC} at {where} has no parseable STATUS line. "
+    "Expected a line shaped like '> ## STATUS — **LIVE as of …**' "
+    "(blockquote, heading level, dash style, spacing and hex case are "
+    "tolerated). If this change reformatted the banner, restore that "
+    "shape; if it removed the banner, the document must say LIVE, VOID "
+    "or EXPIRED. Fail-closed, #3556."
+)
+BANNER_DUPLICATE_TEXT = (
+    "{PREFIX}: ERROR — {CERT_DOC} at {where} has two or more STATUS banner "
+    "lines; the gate reads exactly one and will not guess which is the "
+    "banner (a decoy line above the real banner is how a stale LIVE "
+    "could be read as VOID). Remove the duplicate. Fail-closed, #3556."
+)
+BINDS_DUPLICATE_TEXT = (
+    "{PREFIX}: ERROR — {CERT_DOC} at {where} has two or more Binds-to "
+    "lines; the gate reads exactly one and will not guess which SHA the "
+    "LIVE claim binds to. Remove the duplicate. Fail-closed, #3556."
+)
+BANNER_MALFORMED_TEXT = (
+    "The cert doc at {where} does not carry exactly one STATUS banner line "
+    "and at most one Binds-to line (parsed: {parsed}) — "
+    "the gate reads one banner and will not guess; a duplicated, look-alike or "
+    "unparseable banner is not a re-issue, not a voiding record and not an "
+    "amendment (#3556)."
+)
+
+
+def banner_text(template, where):
+    return template.format(PREFIX=PREFIX, CERT_DOC=CERT_DOC, where=where)
+
+
+class BannerError(GateError):
+    """I1: the banner at one end of the range is not exactly one clean STATUS line and
+    at most one clean Binds-to line."""
+
+    def __init__(self, reason, line, side, banner):
+        self.reason = reason
+        self.line = line
+        self.side = side
+        self.banner = banner
+        where = f"at {CERT_DOC}:{line}" if line else f"in {CERT_DOC}"
+        super().__init__(f"banner ({side}): {reason} {where}")
+
+    def lines(self):
+        where = "HEAD" if self.side == "head" else "the range start"
+        out = [f"{PREFIX}: ERROR — {self}" + " (fail-closed)"]
+        # The #3556 text follows the parsed status, so a lone decoy line (no strict line
+        # at all) reads UNPARSEABLE, never "two or more STATUS banner lines".
+        if self.banner.status == "UNPARSEABLE":
+            out.append(banner_text(BANNER_UNPARSEABLE_TEXT, where))
+        elif self.banner.status == "DUPLICATE":
+            out.append(banner_text(BANNER_DUPLICATE_TEXT, where))
+        elif "Binds" in self.reason:
+            out.append(banner_text(BINDS_DUPLICATE_TEXT, where))
+        out.append(BANNER_MALFORMED_TEXT.format(
+            where=where, parsed=fmt_banner((self.banner.status, self.banner.bound))))
+        return out
+
+
+def clean_banner(banner_mb, banner_head):
+    """I1, the ONE clean-banner precondition: at both ends the doc is absent or carries
+    exactly one strict STATUS line, at most one strict Binds-to line and no banner-like
+    line the strict grammar did not consume. Raises BannerError for the first problem."""
+    for side, banner in (("base", banner_mb), ("head", banner_head)):
+        if banner.problems:
+            reason, line = banner.problems[0]
+            raise BannerError(reason, line, side, banner)
+
+
+def frozen_status(banner_mb, banner_head):
+    """B-1 / B-2: while both ends are VOID or EXPIRED the STATUS line is frozen. It is
+    byte-identical at both ends, or only the status token differs (VOID <-> EXPIRED)."""
+    if banner_mb.status_raw == banner_head.status_raw:
+        return
+    if banner_mb.status != banner_head.status:
+        lo, hi = banner_mb.token_span
+        token = banner_head.status.encode("ascii")
+        if banner_mb.status_raw[:lo] + token + banner_mb.status_raw[hi:] == banner_head.status_raw:
+            return
+    raise GateError(
+        f"the STATUS line at {CERT_DOC}:{banner_head.status_line} is frozen while the "
+        "certification is not LIVE: on an amendment pass it must be byte-identical to the "
+        "range start (only the status word may change, between VOID and EXPIRED); put the "
+        "reason for the change in the amendment ledger record (#6124, 3-agent vote 71472661)"
+    )
+
+
+def pre_region(blob, side):
+    """(REGION, MARKED) of the cert doc BLOB: the bytes above the one exact ledger marker
+    line and True, or the whole doc and False when it has no marker. Two or more marker lines
+    leave the region undefined: GateError. Linear."""
+    marker = LEDGER_MARKER.encode("ascii")
+    offset = 0
+    found = []
+    for line in blob.split(b"\n"):
+        if line == marker:
+            found.append(offset)
+        offset += len(line) + 1
+    if len(found) > 1:
+        raise GateError(REGION_MARKERS_TEXT.format(
+            side="head" if side == "head" else "start", marker=LEDGER_MARKER,
+            count=len(found), doc=CERT_DOC))
+    if not found:
+        return blob, False
+    return blob[:found[0]], True
+
+
+def ledger_join(base_doc):
+    """D-2: the ONE byte string a range start with no marker is followed by in the head's
+    pre-marker region: the shortest that leaves the marker after a blank line."""
+    if base_doc.endswith(b"\n\n") or base_doc == b"\n":
+        return b""
+    if base_doc.endswith(b"\n"):
+        return LEDGER_JOIN
+    return LEDGER_JOIN + LEDGER_JOIN
+
+
+def frozen_region_diff(base_blob, head_blob, banner_mb, banner_head):
+    """D-1 / D-2: the 1-based line of the head doc where its pre-marker region first differs
+    from the one the range start fixes, or None when it is byte-identical. The range start
+    fixes its own pre-marker region; a start with no marker fixes its whole doc followed by
+    LEDGER_JOIN when the head holds the marker, else its whole doc. The one exception is the
+    status token of the base's strict STATUS line, which may change between VOID and EXPIRED
+    (B-2)."""
+    base_region, base_marked = pre_region(base_blob, "base")
+    head_region, head_marked = pre_region(head_blob, "head")
+    if not base_marked and head_marked:
+        base_region += ledger_join(base_region)
+    want = _region_lines(base_region)
+    got = _region_lines(head_region)
+    if banner_mb.status != banner_head.status and banner_mb.status_line is not None:
+        at = banner_mb.status_line - 1
+        lo, hi = banner_mb.token_span
+        if at < len(want) and want[at] == banner_mb.status_raw + b"\n":
+            want[at] = want[at][:lo] + banner_head.status.encode("ascii") + want[at][hi:]
+    if want == got:
+        return None
+    for number, (old, new) in enumerate(zip(want, got), 1):
+        if old != new:
+            return number
+    return min(len(want), len(got)) + 1
+
+
+def _region_lines(region):
+    """The lines of REGION (bytes), each with its line feed, so a region that ends one line
+    early (a moved marker) differs at that line and never matches a blank line."""
+    parts = region.split(b"\n")
+    lines = [part + b"\n" for part in parts[:-1]]
+    if parts[-1]:
+        lines.append(parts[-1])
+    return lines
+
+
+def check_frozen_region(base_blob, head_blob, banner_mb, banner_head):
+    """D-1: raise GateError naming the frozen region and the first differing line."""
+    line = frozen_region_diff(base_blob, head_blob, banner_mb, banner_head)
+    if line is not None:
+        raise GateError(REGION_FROZEN_TEXT.format(doc=CERT_DOC, marker=LEDGER_MARKER, line=line))
 
 
 def fmt_banner(banner):
@@ -370,33 +841,508 @@ def fmt_banner(banner):
 
 
 # ---------------------------------------------------------------------------
+# Rule (B) amendment ledger (#6124)
+# ---------------------------------------------------------------------------
+
+
+def _strip_container(line):
+    """(prefix, rest): the leading quote/list/space markers and what follows them."""
+    end = LEDGER_CONTAINER_RE.match(line).end()
+    return line[:end], line[end:]
+
+
+def _names_amendment(rest):
+    return rest.startswith("#") and "amendment" in rest.casefold()
+
+
+def ledger_present(blob, capped=True):
+    """True iff any line of BLOB (bytes) looks like a heading naming an amendment, so
+    the doc must be parsed as carrying a ledger. A doc without one has no records. When
+    CAPPED (the head), a doc over LEDGER_MAX_DOC_BYTES is present, so parse_ledger refuses
+    it on its size before any split (F4)."""
+    if capped and len(blob) > LEDGER_MAX_DOC_BYTES:
+        return True
+    for line in blob.split(b"\n"):
+        rest = line.lstrip(b" >*+-0123456789.)")
+        if rest.startswith(b"#") and b"amendment" in rest.lower():
+            return True
+    return False
+
+
+def _names_token(text):
+    folded = text.casefold()
+    return any(token in folded for token in PRE_REGION_TOKENS)
+
+
+def _blank_code_spans(line):
+    """LINE with every inline code span (a backtick run up to the next run of the same
+    length) replaced by spaces. Linear: each run is visited once per length bucket."""
+    runs = [(m.start(), m.end()) for m in re.finditer(r"`+", line)]
+    by_length = {}
+    for index, (lo, hi) in enumerate(runs):
+        by_length.setdefault(hi - lo, []).append(index)
+    cursor = dict.fromkeys(by_length, 0)
+    out = list(line)
+    index = 0
+    while index < len(runs):
+        lo, hi = runs[index]
+        bucket = by_length[hi - lo]
+        while cursor[hi - lo] < len(bucket) and bucket[cursor[hi - lo]] <= index:
+            cursor[hi - lo] += 1
+        if cursor[hi - lo] == len(bucket):
+            index += 1
+            continue
+        close = bucket[cursor[hi - lo]]
+        for k in range(lo, runs[close][1]):
+            out[k] = " "
+        index = close + 1
+    return "".join(out)
+
+
+def _is_punct(ch):
+    return unicodedata.category(ch)[0] in "PS"
+
+
+def _delimiter_runs(text):
+    """The emphasis delimiter runs of TEXT as [char, start, end, can_open, can_close]:
+    maximal runs of '*' or '_' that are not backslash-escaped, with the CommonMark
+    left/right-flanking rules ('_' may not open or close inside a word). Linear."""
+    runs = []
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch not in "*_" or (i > 0 and text[i - 1] == "\\"):
+            i += 1
+            continue
+        j = i
+        while j < len(text) and text[j] == ch:
+            j += 1
+        before = text[i - 1] if i > 0 else " "
+        after = text[j] if j < len(text) else " "
+        left = not after.isspace() and (
+            not _is_punct(after) or before.isspace() or _is_punct(before))
+        right = not before.isspace() and (
+            not _is_punct(before) or after.isspace() or _is_punct(after))
+        if ch == "*":
+            can_open, can_close = left, right
+        else:
+            can_open = left and (not right or _is_punct(before))
+            can_close = right and (not left or _is_punct(after))
+        runs.append([ch, i, j, can_open, can_close])
+        i = j
+    return runs
+
+
+def _emphasis_hit(paragraph):
+    """The line number of the first emphasis span in PARAGRAPH ((number, line) pairs)
+    that names an amendment or a status, or None. Container prefixes ('>', a list bullet)
+    are blanked and a line left empty by that ends the paragraph; code spans are blanked.
+    Delimiter runs pair as in the CommonMark process-emphasis step (nearest opener of the
+    same character, the rule of 3, partial consumption of a run, openers between a pair
+    dropped, a per-key bottom so a failed look-back is never repeated): linear in the
+    paragraph. Every byte between a paired opener and closer is emphasis; a token that
+    starts inside any such span is a hit."""
+    for pieces in _emphasis_blocks(paragraph):
+        hit = _emphasis_hit_flat(pieces)
+        if hit:
+            return hit
+    return None
+
+
+def _emphasis_blocks(paragraph):
+    """The inline blocks of PARAGRAPH as lists of (number, prepared text): code spans and
+    the container prefix blanked to spaces (same length), split where a line is empty
+    after that."""
+    blocks = []
+    pieces = []
+    for number, line in paragraph:
+        text = _blank_code_spans(line)
+        container = PRE_CONTAINER_RE.match(text)
+        if container:
+            text = " " * container.end() + text[container.end():]
+        if not text.strip():
+            if pieces:
+                blocks.append(pieces)
+            pieces = []
+            continue
+        pieces.append((number, text))
+    if pieces:
+        blocks.append(pieces)
+    return blocks
+
+
+def _emphasis_spans(pieces):
+    """(joined text, [(offset, line number)], [(opener lo, opener hi, closer lo, closer hi)])
+    for PIECES ((number, prepared text) pairs), offsets in the joined text."""
+    flat = []
+    owner = []
+    runs = []
+    offset = 0
+    for number, text in pieces:
+        for run in _delimiter_runs(text):
+            run[1] += offset
+            run[2] += offset
+            runs.append(run)
+        flat.append(text)
+        owner.append((offset, number))
+        offset += len(text) + 1
+    joined = "\n".join(flat)
+    spans = []
+    # Each run: [char, start, end, can_open, can_close, remaining, original, sequence].
+    stack = []
+    bottom = {}
+    for sequence, run in enumerate(runs):
+        run.extend([run[2] - run[1], run[2] - run[1], sequence])
+        ch, _, _, can_open, can_close = run[:5]
+        if can_close:
+            key = (ch, can_open, run[6] % 3)
+            floor = bottom.get(key, -1)
+            k = len(stack) - 1
+            while run[5] > 0 and k >= 0 and stack[k][7] > floor:
+                opener = stack[k]
+                if opener[0] != ch:
+                    k -= 1
+                    continue
+                both = (opener[3] and opener[4]) or (can_open and can_close)
+                if both and (opener[6] + run[6]) % 3 == 0 and not (
+                        opener[6] % 3 == 0 and run[6] % 3 == 0):
+                    k -= 1
+                    continue
+                used = min(2 if opener[5] >= 2 and run[5] >= 2 else 1, opener[5], run[5])
+                lo = opener[1] + opener[5] - used
+                hi = run[1] + (run[6] - run[5]) + used
+                spans.append((lo, lo + used, hi - used, hi))
+                opener[5] -= used
+                run[5] -= used
+                del stack[k + 1:]
+                if opener[5] == 0:
+                    del stack[k]
+                k = len(stack) - 1
+            if run[5] > 0:
+                bottom[key] = sequence - 1
+        if can_open and run[5] > 0:
+            stack.append(run)
+    return joined, owner, spans
+
+
+def _emphasis_hit_flat(pieces):
+    if not pieces:
+        return None
+    joined, owner, spans = _emphasis_spans(pieces)
+    cover = [0] * (len(joined) + 1)
+    for lo, _, _, hi in spans:
+        cover[lo] += 1
+        cover[hi] -= 1
+    depth = 0
+    covered = [0]  # covered[i]: how many of the first i characters are inside emphasis
+    for i in range(len(joined)):
+        depth += cover[i]
+        covered.append(covered[-1] + (depth > 0))
+    for found in PRE_TOKEN_RE.finditer(joined):
+        if covered[found.end()] > covered[found.start()]:
+            at = found.start()
+            number = pieces[0][0]
+            for start, owner_number in owner:
+                if start <= at:
+                    number = owner_number
+            return number
+    return None
+
+
+def _check_pre_region(lines, side):
+    """Refuse every construct above the marker that could hide or fake a record or a
+    banner (I4): default deny over a fixed safe subset. The per-line byte cap is checked
+    before any regex touches the line."""
+    if lines and lines[0] in LEDGER_FRONT_MATTER:
+        raise LedgerError("front matter on line 1 is not supported", 1, side)
+    for number, line in enumerate(lines, 1):
+        if len(line.encode("utf-8")) > BANNER_MAX_LINE_BYTES:
+            raise LedgerError(
+                f"line longer than {BANNER_MAX_LINE_BYTES} bytes above the ledger", number, side)
+    fence = None  # (char, length, opener line number) while a fence is open
+    paragraph = []
+    for number, line in enumerate(lines, 1):
+        if line.count("<!--") > 1:
+            raise LedgerError("a second '<!--' on one line above the ledger", number, side)
+        prefix, rest = _strip_container(line)
+        found = LEDGER_FENCE_RE.fullmatch(rest)
+        if found and prefix:
+            raise LedgerError(
+                "a fence-like line inside a container or indented is not supported", number, side)
+        if fence is not None:
+            run, info = found.groups() if found else ("", "")
+            if run and run[0] == fence[0] and len(run) >= fence[1] and not info.strip(" "):
+                fence = None
+            elif _names_token(line):
+                raise LedgerError(
+                    "a fence body naming an amendment or a status above the ledger", number, side)
+            continue
+        if found:
+            run, info = found.groups()
+            if run[0] == "`" and "`" in info:
+                raise LedgerError(
+                    "a fence opener with a backtick in its info string is not supported", number, side)
+            fence = (run[0], len(run), number)
+            hit = _emphasis_hit(paragraph)
+            if hit:
+                raise LedgerError(
+                    "emphasis naming an amendment or a status above the ledger", hit, side)
+            paragraph = []
+            continue
+        if LEDGER_HTML_START_RE.match(rest) and not (
+                rest.startswith("<!--") and rest.find("-->", 4) != -1):
+            raise LedgerError(
+                "an HTML block start is not supported (only a one-line <!-- ... --> comment)",
+                number, side)
+        if "<!--" in line and line.rfind("-->") < line.rfind("<!--"):
+            raise LedgerError("an HTML comment not closed on its line above the ledger", number, side)
+        if LEDGER_HTML_START_RE.search(_blank_code_spans(line)) and _names_token(line):
+            raise LedgerError("inline HTML naming an amendment or a status above the ledger",
+                              number, side)
+        if PRE_LINK_REF_RE.match(rest) and _names_token(line):
+            raise LedgerError(
+                "a link reference definition naming an amendment or a status above the ledger",
+                number, side)
+        if (number < len(lines) and line.strip() and PRE_SETEXT_RE.fullmatch(lines[number])
+                and _names_token(line)):
+            raise LedgerError(
+                "a setext heading naming an amendment or a status above the ledger", number, side)
+        if _names_amendment(rest):
+            raise LedgerError("a heading-like line naming an amendment outside the ledger", number, side)
+        if line.strip():
+            paragraph.append((number, line))
+        else:
+            hit = _emphasis_hit(paragraph)
+            if hit:
+                raise LedgerError(
+                    "emphasis naming an amendment or a status above the ledger", hit, side)
+            paragraph = []
+    if fence is not None:
+        raise LedgerError("a fence opened here is still open at the ledger marker", fence[2], side)
+    hit = _emphasis_hit(paragraph)
+    if hit:
+        raise LedgerError("emphasis naming an amendment or a status above the ledger", hit, side)
+    if not lines or lines[-1] != "":
+        raise LedgerError("the ledger marker must follow a blank line", len(lines) + 1, side)
+    found = sum(1 for line in lines if STATUS_LINE_RE.match(line.encode("utf-8")))
+    if found != 1:
+        raise LedgerError(
+            f"the STATUS banner must appear exactly once, above the ledger (found {found})", None, side)
+
+
+def item_reads_like_banner(line):
+    """D-6: True iff the record item LINE, folded like a head line, reads like a STATUS or
+    Binds-to line (the looser detector, or the co-occurrence in its [a-z0-9] fold)."""
+    folded = loose_fold(line)
+    canon = CANON_DROP_RE.sub("", folded)
+    return (status_like(folded) or binds_like(folded) or canon_status(canon)
+            or CANON_BINDS in canon)
+
+
+def _parse_region(lines, first, side, watched_from):
+    """Records of the ledger region LINES (the lines after the marker; FIRST is the
+    1-based number of LINES[0]). The grammar, with no other form accepted:
+        "" then zero or more records separated by one "" line;
+        record = "### Amendment YYYY-MM-DD", "", one or more sorted unique items;
+        item = "- id: AI_MEMORY_FED_*" or "- path: <section 7 watched path>".
+    Record dates never decrease (equal days allowed). A path item of record index
+    WATCHED_FROM or later must be a watched path (None: no record is checked, the base)."""
+    records = []
+    state = "blank"
+    heading = None
+    items = []
+    previous_day = None
+    for number, line in enumerate(lines, first):
+        if len(line.encode("utf-8")) > LEDGER_MAX_LINE_BYTES:
+            raise LedgerError(f"line longer than {LEDGER_MAX_LINE_BYTES} bytes", number, side)
+        if not line.isascii():
+            raise LedgerError("character outside printable ASCII in the ledger", number, side)
+        if state in ("blank", "hblank"):
+            if line != "":
+                raise LedgerError("expected a blank line", number, side)
+            state = "head" if state == "blank" else "item1"
+        elif state == "head":
+            found = LEDGER_RECORD_RE.fullmatch(line)
+            if not found:
+                raise LedgerError("expected '### Amendment YYYY-MM-DD'", number, side)
+            try:
+                day = datetime.date.fromisoformat(found.group(1))
+            except ValueError:
+                raise LedgerError(f"date {found.group(1)} is not a calendar date", number, side) from None
+            if day < LEDGER_DATE_FLOOR:
+                raise LedgerError(
+                    f"date {found.group(1)} is before the ledger floor {LEDGER_DATE_FLOOR.isoformat()}",
+                    number, side)
+            if previous_day is not None and day < previous_day:
+                raise LedgerError(
+                    f"record dated {day.isoformat()} is before the previous record dated "
+                    f"{previous_day.isoformat()}; record dates must not decrease", number, side)
+            previous_day = day
+            heading = (number, line, day)
+            items = []
+            state = "hblank"
+        else:  # "item1" or "items"
+            if line == "" and state == "items":
+                records.append(_record(heading, items))
+                state = "head"
+                continue
+            found = LEDGER_ITEM_RE.fullmatch(line)
+            if not found:
+                raise LedgerError(
+                    "expected an item line '- id: AI_MEMORY_FED_*' or '- path: <watched path>'",
+                    number, side)
+            path = found.group(2)
+            checked = watched_from is not None and len(records) >= watched_from
+            if path is not None and checked and not is_watched_path(path):
+                raise LedgerError(f"path {path} is not a section 7 watched path", number, side)
+            if checked and item_reads_like_banner(line):
+                raise LedgerError(LEDGER_ITEM_BANNER_REASON, number, side)
+            if items and line <= items[-1]:
+                raise LedgerError(
+                    f"item lines must be sorted and unique ({LEDGER_ITEM_ORDER}; "
+                    "this line is not after the previous one)", number, side)
+            items.append(line)
+            state = "items"
+    if state == "items":
+        records.append(_record(heading, items))
+    elif state == "head":
+        raise LedgerError("trailing blank line at the end of the ledger", first + len(lines) - 1, side)
+    elif state in ("hblank", "item1"):
+        raise LedgerError("the record is incomplete at the end of the file", heading[0], side)
+    return records
+
+
+def _record(heading, items):
+    names = tuple(item.split(": ", 1)[1] for item in items)
+    return LedgerRecord(heading[0], (heading[1], *items), names)
+
+
+def record_day(rec):
+    return datetime.date.fromisoformat(LEDGER_RECORD_RE.fullmatch(rec.lines[0]).group(1))
+
+
+def _marker_offset(text):
+    """The offset of the first exact ledger marker line in TEXT, or 0 when there is none."""
+    if text.startswith(LEDGER_MARKER + "\n"):
+        return 0
+    found = text.find("\n" + LEDGER_MARKER + "\n")
+    return found + 1 if found >= 0 else 0
+
+
+def parse_ledger(blob, side, inherited=0, region_frozen=False, region_differs=False):
+    """The records (list of LedgerRecord) of the cert doc BLOB (bytes). Every form the
+    parser does not positively recognise raises LedgerError with a reason and, where one
+    applies, a 1-based line number. Linear in the size of BLOB. The base (F5) is judged
+    for grammar only: no size cap, no watched-path check and no pre-marker construct check
+    (I4; it is inherited history, round 2); the head checks the watched-ness of the records
+    after the INHERITED base records only. REGION_FROZEN (the head only) is True when the
+    caller has proved the head's pre-marker region byte-identical to the range start's
+    (D-1), so I4 is not re-run on bytes the range does not change. REGION_DIFFERS (the head
+    only) is True when VOID or EXPIRED holds at both ends and that region differs, so the
+    caller refuses it for the frozen region (D-1) whatever else is found; the character scan
+    then starts at the marker line, so a CR or a BOM above it is reported as the frozen-region
+    difference it is."""
+    if side == "head" and len(blob) > LEDGER_MAX_DOC_BYTES:
+        raise LedgerError(
+            f"the document is {len(blob)} bytes, over the {LEDGER_MAX_DOC_BYTES}-byte limit", None, side)
+    try:
+        text = blob.decode("utf-8", "strict")
+    except UnicodeDecodeError as exc:
+        raise LedgerError(f"not strict UTF-8 (invalid byte at offset {exc.start})", None, side) from None
+    if not text.endswith("\n"):
+        raise LedgerError("the document does not end with a line feed", None, side)
+    scan_from = _marker_offset(text) if side == "head" and region_differs else 0
+    for suspect in LEDGER_SUSPECT_RE.finditer(text, scan_from):
+        category = unicodedata.category(suspect.group())
+        if category in LEDGER_FORBIDDEN_CATEGORIES:
+            number = text.count("\n", 0, suspect.start()) + 1
+            raise LedgerError(
+                f"forbidden character U+{ord(suspect.group()):04X} ({category})", number, side)
+    lines = text.split("\n")[:-1]
+    markers = lines.count(LEDGER_MARKER)
+    if markers != 1:
+        raise LedgerError(
+            f"the ledger marker line appears {markers} times, expected exactly once", None, side)
+    at = lines.index(LEDGER_MARKER)
+    if side == "head" and not region_frozen:
+        _check_pre_region(lines[:at], side)
+    return _parse_region(lines[at + 1:], at + 2, side, inherited if side == "head" else None)
+
+
+def utc_today():
+    """The runner's UTC date: the record date ceiling (L-1). A commit date is author-set,
+    so it is never the clock. Tests replace this function."""
+    return datetime.datetime.now(datetime.timezone.utc).date()
+
+
+def judge_ledger(repo, mb, judged, region_frozen=False, region_differs=False):
+    """The NEW records (list) the change appends to the ledger, after proving the ledger
+    append-only and every new record dated within [floor, runner UTC date + 1].
+    REGION_FROZEN, REGION_DIFFERS: see parse_ledger."""
+    base_blob = read_blob(repo, mb, CERT_DOC)
+    head_blob = read_blob(repo, judged, CERT_DOC)
+    base_on = base_blob is not None and ledger_present(base_blob, capped=False)
+    head_on = head_blob is not None and ledger_present(head_blob)
+    if not base_on and not head_on:
+        return []
+    base_records = parse_ledger(base_blob, "base") if base_on else []
+    if not head_on:
+        raise LedgerError("the ledger present at the range start is missing", None, "head")
+    head_records = parse_ledger(head_blob, "head", inherited=len(base_records),
+                                region_frozen=region_frozen, region_differs=region_differs)
+    for k, old in enumerate(base_records, 1):
+        if k > len(head_records) or head_records[k - 1].lines != old.lines:
+            raise LedgerError(
+                f"record {k} of the base ledger ({old.lines[0]}) is edited, reordered or removed",
+                old.line, "head")
+    new = head_records[len(base_records):]
+    if new:
+        today = utc_today()
+        ceiling = today + datetime.timedelta(days=LEDGER_DATE_SKEW_DAYS)
+        for rec in new:
+            day = record_day(rec)
+            if day > ceiling:
+                raise LedgerError(
+                    f"record dated {day.isoformat()} is after the runner's UTC date "
+                    f"{today.isoformat()} plus {LEDGER_DATE_SKEW_DAYS} day", rec.line, "head")
+    return new
+
+
+def check_amendment_names(new_records, changed):
+    """The union of names in the new records must equal CHANGED exactly."""
+    named = {name for rec in new_records for name in rec.names}
+    missing = sorted(changed - named)
+    if missing:
+        raise LedgerError(
+            f"the new amendment records do not name changed {', '.join(missing)}", None, "head")
+    extra = sorted(named - changed)
+    if extra:
+        raise LedgerError(
+            f"a new amendment record names {', '.join(extra)}, which this change did not touch",
+            None, "head")
+
+
+# ---------------------------------------------------------------------------
 # The check
 # ---------------------------------------------------------------------------
 
 
-def check_banner_consistency(repo, judged):
+def check_banner_consistency(repo, judged, banner=None):
     """(C) #3556: the doc's own claim at `judged` must be true. STATUS LIVE
     bound to <sha> means no section 7 wire-surface drift between <sha> and
-    `judged`. Returns (ok, lines)."""
-    status, binds = cert_banner(repo, judged)
+    `judged`. BANNER is the head Banner the range was judged with (round 2: the
+    inherited looser-detector lines of a frozen region are excused); None reads
+    cert_banner. Returns (ok, lines)."""
+    if banner is None:
+        status, binds = cert_banner(repo, judged)
+    else:
+        status, binds = banner.status, banner.bound
     if status == "ABSENT":
         return True, [f"{PREFIX}: banner — {CERT_DOC} absent at HEAD; no live claim to check"]
     if status == "UNPARSEABLE":
-        return False, [
-            f"{PREFIX}: ERROR — {CERT_DOC} at HEAD has no parseable STATUS line. "
-            "Expected a line shaped like '> ## STATUS — **LIVE as of …**' "
-            "(blockquote, heading level, dash style, spacing and hex case are "
-            "tolerated). If this change reformatted the banner, restore that "
-            "shape; if it removed the banner, the document must say LIVE, VOID "
-            "or EXPIRED. Fail-closed, #3556."
-        ]
+        return False, [banner_text(BANNER_UNPARSEABLE_TEXT, "HEAD")]
     if status == "DUPLICATE":
-        return False, [
-            f"{PREFIX}: ERROR — {CERT_DOC} at HEAD has two or more STATUS banner "
-            "lines; the gate reads exactly one and will not guess which is the "
-            "banner (a decoy line above the real banner is how a stale LIVE "
-            "could be read as VOID). Remove the duplicate. Fail-closed, #3556."
-        ]
+        return False, [banner_text(BANNER_DUPLICATE_TEXT, "HEAD")]
     if status in ("VOID", "EXPIRED"):
         return True, [
             f"{PREFIX}: banner STATUS={status} — the doc makes no live claim; "
@@ -411,11 +1357,7 @@ def check_banner_consistency(repo, judged):
             "tolerated). Fail-closed, #3556."
         ]
     if binds == "DUPLICATE":
-        return False, [
-            f"{PREFIX}: ERROR — {CERT_DOC} at HEAD has two or more Binds-to "
-            "lines; the gate reads exactly one and will not guess which SHA the "
-            "LIVE claim binds to. Remove the duplicate. Fail-closed, #3556."
-        ]
+        return False, [banner_text(BINDS_DUPLICATE_TEXT, "HEAD")]
     if not ensure_commit(repo, binds):
         return False, [
             f"{PREFIX}: ERROR — banner is LIVE bound to {binds} but that commit "
@@ -530,6 +1472,39 @@ def check_change(repo, base, head, tip=None, base_name=None):
 
 
 def _judge(repo, base, head, judged, mb, tip):
+    """Round 2 (#6124, 3-agent vote (71472661) v9274-detector, option B): the base end is
+    read by the strict grammar only; the head end by the looser detector with the base's own
+    looser lines excused while VOID or EXPIRED is at both ends (the frozen region), else by
+    the head detector. While frozen, every passing verdict also needs the head's pre-marker
+    region byte-identical to the range start's (D-1, D-2), checked last, so every earlier
+    refusal keeps its own reason."""
+    base_blob = read_blob(repo, mb, CERT_DOC)
+    head_blob = read_blob(repo, judged, CERT_DOC)
+    banner_mb = banner_scan(base_blob, capped=False, mode=SCAN_STRICT)
+    strict_head = banner_scan(head_blob, capped=True, mode=SCAN_STRICT)
+    frozen = banner_mb.status in LEDGER_STATUSES and strict_head.status in LEDGER_STATUSES
+    if frozen:
+        # R-6: the base's looser excuse scan runs only within the document cap. A base over
+        # the cap cannot equal the capped head's frozen region, so the change is refused
+        # either way (without excuses its looser lines are refused first, fail closed).
+        excuse = base_excuse(base_blob) if len(base_blob) <= LEDGER_MAX_DOC_BYTES else None
+        banner_head = banner_scan(head_blob, capped=True, mode=SCAN_LOOSE, excuse=excuse)
+        try:
+            region_same = frozen_region_diff(base_blob, head_blob, banner_mb, strict_head) is None
+        except GateError:
+            region_same = False
+    else:
+        banner_head = banner_scan(head_blob, capped=True, mode=SCAN_HEAD)
+        region_same = False
+    ok, text = _judge_banners(repo, base, head, judged, mb, tip, banner_mb, banner_head,
+                              region_same, frozen and not region_same)
+    if ok and frozen:
+        check_frozen_region(base_blob, head_blob, banner_mb, strict_head)
+    return ok, text
+
+
+def _judge_banners(repo, base, head, judged, mb, tip, banner_mb, banner_head, region_same,
+                   region_differs=False):
     watched = []
     cert_touched = False
     for p in changed_paths(repo, mb, judged):
@@ -543,31 +1518,75 @@ def _judge(repo, base, head, judged, mb, tip):
     removed = sorted(base_ids - head_ids)
     id_changed = bool(added or removed)
 
+    # I1 (#6124 round 1): ONE clean-banner precondition, before ANY pass decision, while a
+    # wire change, a strict banner line change, a new ledger record or a banner-like line at
+    # the head is in the range. No pass path below re-checks the banner on its own.
+    strict_changed = (banner_mb.status_raw, banner_mb.binds_raw) != (
+        banner_head.status_raw, banner_head.binds_raw)
+    # The banner is judged BEFORE the ledger, so a malformed STATUS token (B-3) is refused
+    # with the #3556 malformed reason, never with a ledger reason that hides it.
+    banner_due = watched or id_changed or (cert_touched and (
+        strict_changed or banner_head.problems))
+    new_records = []
+    try:
+        if banner_due:
+            clean_banner(banner_mb, banner_head)
+        if cert_touched:
+            new_records = judge_ledger(repo, mb, judged, region_frozen=region_same,
+                                       region_differs=region_differs)
+        if new_records and not banner_due:
+            clean_banner(banner_mb, banner_head)
+    except BannerError as exc:
+        return False, "\n".join(exc.lines())
+    if new_records:
+        check_amendment_names(new_records, set(watched) | set(added) | set(removed))
+    # I2 / I3: while both ends are VOID or EXPIRED, the bind never changes (a drop to "-"
+    # included) and the STATUS line is frozen (B-1, B-2); a word flip is not a re-issue.
+    both_ls = banner_mb.status in LEDGER_STATUSES and banner_head.status in LEDGER_STATUSES
+    flip = both_ls and banner_mb.status != banner_head.status
+    status_words = (f"goes {banner_mb.status} → {banner_head.status}" if flip
+                    else f"stays {banner_head.status}")
+    if cert_touched and both_ls:
+        if banner_mb.bound != banner_head.bound:
+            verb = ("set" if banner_mb.bound == "-" else
+                    "dropped" if banner_head.bound == "-" else "changed")
+            raise GateError(
+                f"Binds-to {verb} ({banner_mb.bound} → {banner_head.bound}) while STATUS "
+                f"{status_words}: an amendment never rebinds; re-issue as LIVE "
+                "(#6774 option B narrowed)"
+            )
+        frozen_status(banner_mb, banner_head)
+
     if not watched and not id_changed:
-        ok, more = check_banner_consistency(repo, judged)
+        ok, more = check_banner_consistency(repo, judged, banner_head)
         lines = [f"{PREFIX}: PASS — federation-wire surface unchanged in {mb}..{judged}"]
         return ok, "\n".join(lines + more)
 
+    pair_mb = (banner_mb.status, banner_mb.bound)
+    pair_head = (banner_head.status, banner_head.bound)
     # (B) #3556: the hatch is a REAL re-issue/voiding only if the banner
     # (STATUS line or Binds-to line) differs between merge-base and judged.
-    incidental = deleted = malformed = False
-    banner_mb = banner_head = ("", "")
-    if cert_touched:
-        banner_mb = cert_banner(repo, mb)
-        banner_head = cert_banner(repo, judged)
-        incidental = banner_mb == banner_head
-        # #3556 ruling, fix 2: a DELETED cert doc is not a voiding record.
-        deleted = banner_head == ("ABSENT", "-")
-        # #3556 ruling, fix 1: a banner the gate cannot read as exactly one
-        # STATUS line and at most one Binds-to line is not a re-issue.
-        malformed = banner_head[0] in ("DUPLICATE", "UNPARSEABLE") or banner_head[1] == "DUPLICATE"
+    incidental = cert_touched and pair_mb == pair_head
+    # #3556 ruling, fix 2: a DELETED cert doc is not a voiding record.
+    deleted = cert_touched and banner_head.status == "ABSENT"
 
-    if cert_touched and not incidental and not deleted and not malformed:
-        ok, more = check_banner_consistency(repo, judged)
+    if both_ls and cert_touched and new_records:
+        # #6124: the names match exactly, the bind is unchanged and the STATUS line is
+        # frozen, so the certification stays non-LIVE (a VOID <-> EXPIRED flip included).
+        ok, more = check_banner_consistency(repo, judged, banner_head)
+        head_line = (
+            f"{PREFIX}: PASS — federation-wire surface changed AND a new amendment record "
+            f"names every change ({mb}..{judged}); the certification {status_words} "
+            "(an amendment never discharges it, #6124)"
+        )
+        return ok, "\n".join([head_line] + more)
+
+    if cert_touched and not both_ls and not incidental and not deleted:
+        ok, more = check_banner_consistency(repo, judged, banner_head)
         head_line = (
             f"{PREFIX}: PASS — federation-wire surface changed AND cert doc "
             f"re-issued/voided in the same change ({mb}..{judged}; banner "
-            f"{fmt_banner(banner_mb)} → {fmt_banner(banner_head)})"
+            f"{fmt_banner(pair_mb)} → {fmt_banner(pair_head)})"
         )
         return ok, "\n".join([head_line] + more)
 
@@ -575,22 +1594,27 @@ def _judge(repo, base, head, judged, mb, tip):
     if incidental:
         out.append(
             "The cert doc WAS edited in this change, but neither its STATUS line "
-            f"nor its Binds-to line changed (banner {fmt_banner(banner_head)} at "
+            f"nor its Binds-to line changed (banner {fmt_banner(pair_head)} at "
             "both ends) — an incidental edit is not a re-issue and not a voiding "
             "record (#3556)."
+        )
+    if flip:
+        out.append(
+            f"The STATUS word changed {banner_mb.status} → {banner_head.status}; a change "
+            "between VOID and EXPIRED is not a re-issue and not a voiding record (#6124)."
+        )
+    if both_ls:
+        out.append(
+            "No new dated amendment record names this change; while the "
+            "certification stays VOID/EXPIRED, a new '### Amendment YYYY-MM-DD' "
+            f"record under the '{LEDGER_MARKER}' line naming every changed path and "
+            "identifier is the only honest pass (#6124)."
         )
     if deleted:
         out.append(
             "The cert doc is ABSENT at HEAD (deleted in this change) while the "
             "federation-wire surface changed — deleting the certification is not "
             "a voiding record; record VOID/EXPIRED in the document instead (#3556)."
-        )
-    if malformed:
-        out.append(
-            "The cert doc at HEAD does not carry exactly one STATUS banner line "
-            f"and at most one Binds-to line (parsed: {fmt_banner(banner_head)}) — "
-            "the gate reads one banner and will not guess; a duplicated or "
-            "unparseable banner is not a re-issue and not a voiding record (#3556)."
         )
     out.append("")
     if tip:
