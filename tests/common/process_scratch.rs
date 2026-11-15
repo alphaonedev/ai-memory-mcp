@@ -34,6 +34,9 @@ static REGISTER: Once = Once::new();
 /// Remove every registered directory. Runs from `atexit`: it must not panic,
 /// and a removal error is ignored (the directory is already gone, or the
 /// process is exiting and there is nobody to report to).
+///
+/// Twin of the `atexit` handler in `tests/common/tls.rs`
+/// (`remove_shared_leaf`): a change to one is made in both.
 extern "C" fn remove_registered() {
     let dirs = match PENDING.lock() {
         Ok(mut guard) => std::mem::take(&mut *guard),

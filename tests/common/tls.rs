@@ -248,6 +248,9 @@ static SHARED_LEAF_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new(
 /// exits (after a pass, a failed assertion or a panic; not after an abort).
 /// Self-contained on purpose: `tests/common/tls.rs` is also compiled by itself
 /// through `#[path]` and copied between trees.
+///
+/// Twin of the `atexit` handler in `tests/common/process_scratch.rs`
+/// (`remove_registered`): a change to one is made in both.
 extern "C" fn remove_shared_leaf() {
     if let Some(dir) = SHARED_LEAF_DIR.get() {
         let _ = std::fs::remove_dir_all(dir);
