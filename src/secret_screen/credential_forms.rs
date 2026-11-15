@@ -154,11 +154,13 @@ fn credential_scheme_before(bytes: &[u8], sep: usize) -> bool {
 }
 
 /// End of the authority that starts at `from`: the first `/`, `?`, `#`,
-/// quote, backtick or ASCII whitespace, else the end of input.
+/// quote or ASCII whitespace, else the end of input. A backtick does not end
+/// it: a password holding one would otherwise hide its `@` and pass whole; a
+/// closing markdown backtick after the host only widens nothing (no `@`).
 fn authority_end(bytes: &[u8], from: usize) -> usize {
     let mut end = from;
     while end < bytes.len()
-        && !matches!(bytes[end], b'/' | b'?' | b'#' | b'"' | b'\'' | b'`')
+        && !matches!(bytes[end], b'/' | b'?' | b'#' | b'"' | b'\'')
         && !bytes[end].is_ascii_whitespace()
     {
         end += 1;
@@ -267,13 +269,55 @@ fn is_format_hole(v: &str) -> bool {
         .is_some_and(|name| name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_'))
 }
 
-/// True when an unquoted value after `:` is a type annotation shape.
+/// True when an unquoted value after `:` (not led by
+/// [`REFERENCE_TYPE_SIGIL`]) is a type annotation shape.
 fn is_type_annotation(v: &str) -> bool {
-    if v.as_bytes().first() == Some(&REFERENCE_TYPE_SIGIL) {
-        return true;
-    }
     let base = v.split(['<', '[']).next().unwrap_or(v);
     ANNOTATION_TYPE_NAMES.contains(&base)
+}
+
+/// The markdown code-span delimiter.
+const CODE_SPAN_DELIMITER: char = '`';
+/// The lifetime marker of a reference type (`&'a str`).
+const LIFETIME_SIGIL: u8 = b'\'';
+/// The mutability keyword of a reference type (`&mut String`).
+const MUT_KEYWORD: &[u8] = b"mut";
+
+fn is_ident_byte(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || c == b'_'
+}
+
+fn ident_end(bytes: &[u8], mut at: usize) -> usize {
+    while at < bytes.len() && is_ident_byte(bytes[at]) {
+        at += 1;
+    }
+    at
+}
+
+/// For a value led by [`REFERENCE_TYPE_SIGIL`] at `at`: the end of the type
+/// name when the shape is `&` [`'lifetime` blanks] [`mut` blanks] NAME with
+/// NAME in [`ANNOTATION_TYPE_NAMES`]; `None` for anything else (a credential
+/// such as `&S3cr3t`, or a YAML anchor). Bounded: each byte is read once.
+fn reference_annotation_end(bytes: &[u8], at: usize) -> Option<usize> {
+    let mut k = at + 1;
+    if bytes.get(k) == Some(&LIFETIME_SIGIL) {
+        let lifetime_end = ident_end(bytes, k + 1);
+        let after = skip_blanks(bytes, lifetime_end);
+        if lifetime_end == k + 1 || after == lifetime_end {
+            return None;
+        }
+        k = after;
+    }
+    let mut_end = k + MUT_KEYWORD.len();
+    if bytes.get(k..mut_end) == Some(MUT_KEYWORD) {
+        let after = skip_blanks(bytes, mut_end);
+        if after > mut_end {
+            k = after;
+        }
+    }
+    let name_end = ident_end(bytes, k);
+    let name = std::str::from_utf8(&bytes[k..name_end]).ok()?;
+    ANNOTATION_TYPE_NAMES.contains(&name).then_some(name_end)
 }
 
 /// Named non-credential shapes of an UNQUOTED assignment value. A quoted
@@ -298,8 +342,9 @@ fn assignment_operator_len(bytes: &[u8], j: usize) -> Option<usize> {
 }
 
 /// The value that starts at `j` (after blanks): `(start, end, quoted)`.
-/// Unquoted values stop at whitespace, `,` `;` `&`, a quote or a backtick
-/// (a markdown code span closing around `password=`). After a `:`
+/// Unquoted values stop at whitespace, `,` `;` `&` or a quote; a backtick
+/// stops one only at its first byte (a markdown code span closing around
+/// an empty `password=`), so a backtick inside a value never cuts the mask. After a `:`
 /// (`after_colon`) a leading [`REFERENCE_TYPE_SIGIL`] belongs to the value
 /// (`password: &str`); after `=` it stays a query-string separator.
 fn value_at(bytes: &[u8], j: usize, after_colon: bool) -> (usize, usize, bool) {
@@ -318,7 +363,9 @@ fn value_at(bytes: &[u8], j: usize, after_colon: bool) -> (usize, usize, bool) {
         let stop = match quote {
             Some(q) => c == q || c == b'\n',
             None => {
-                c.is_ascii_whitespace() || matches!(c, b',' | b';' | b'&' | b'"' | b'\'' | b'`')
+                c.is_ascii_whitespace()
+                    || matches!(c, b',' | b';' | b'&' | b'"' | b'\'')
+                    || (c == b'`' && end == start)
             }
         };
         if stop {
@@ -327,6 +374,13 @@ fn value_at(bytes: &[u8], j: usize, after_colon: bool) -> (usize, usize, bool) {
         end += 1;
     }
     (start, end, quote.is_some())
+}
+
+/// The unquoted value as the named-shape checks judge it: without the
+/// closing backticks of a markdown code span (`` `pwd=…` ``). The masked
+/// span still covers them, so a secret holding a backtick is masked whole.
+fn judged_value(v: &str) -> &str {
+    v.trim_end_matches(CODE_SPAN_DELIMITER)
 }
 
 /// After a type annotation ending at `from`, the `=` of an initializer on
@@ -375,10 +429,30 @@ fn password_assignment_spans(content: &str) -> Vec<(usize, usize)> {
         let is_colon = bytes[j] == b':' && op_len == 1;
         let (mut start, mut end, mut quoted) = value_at(bytes, j + op_len, is_colon);
         let mut resume = end;
+        let ref_led = is_colon && !quoted && bytes.get(start) == Some(&REFERENCE_TYPE_SIGIL);
+        let annotation_end = if ref_led {
+            reference_annotation_end(bytes, start)
+        } else if is_colon && !quoted && is_type_annotation(judged_value(&content[start..end])) {
+            Some(end)
+        } else {
+            None
+        };
+        if ref_led && annotation_end.is_none() {
+            // `&` naming no type: a credential, or a YAML anchor whose
+            // anchored value follows on the same line; mask both.
+            let (next_start, next_end, _) = value_at(bytes, end, false);
+            if next_end > next_start {
+                end = next_end;
+                resume = end;
+            }
+            spans.push((start, end));
+            i = resume.max(i + key_len);
+            continue;
+        }
         // `password: String` is an annotation; an initializer after it
         // (`password: String = "x"`) is the value that is screened.
-        if is_colon && !quoted && is_type_annotation(&content[start..end]) {
-            let (init, after) = initializer_after(bytes, end);
+        if let Some(ann_end) = annotation_end {
+            let (init, after) = initializer_after(bytes, ann_end);
             resume = after;
             match init {
                 Some(at) => {
@@ -391,7 +465,11 @@ fn password_assignment_spans(content: &str) -> Vec<(usize, usize)> {
                 }
             }
         }
-        let value = &content[start..end];
+        let value = if quoted {
+            &content[start..end]
+        } else {
+            judged_value(&content[start..end])
+        };
         let accepted = value.is_empty()
             || is_placeholder_value(value)
             || (!quoted && is_non_credential_unquoted(value));
