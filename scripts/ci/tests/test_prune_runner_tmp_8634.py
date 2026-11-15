@@ -378,8 +378,49 @@ class CommandLine(Base):
         env["TMPDIR"] = str(self.runner)
         done = subprocess.run([sys.executable, "-I", str(SCRIPT), "--root", str(self.base)], env=env, capture_output=True, text=True, check=False)
         self.assertEqual((done.returncode, done.stderr), (EXIT_OK, ""))
-        self.assertRegex(done.stdout.strip(), r"^pruned=1 kept=0 failed=0 freed_bytes=\d+$")
+        self.assertRegex(done.stdout.strip().splitlines()[-1], r"^pruned=1 kept=0 failed=0 freed_bytes=\d+$")
         self.assertEqual(self.names(), [])
+
+
+class RunnerFacts(Base):
+    """The prune prints its facts line before it judges anything (#8634, b29 ca55daab)."""
+
+    def run_merged(self, tmpdir, *extra):
+        env = {k: v for k, v in os.environ.items() if k != "TMPDIR"}
+        env["TMPDIR"] = str(tmpdir)
+        done = subprocess.run([sys.executable, "-I", str(SCRIPT), *extra], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=False)
+        return done.returncode, done.stdout.splitlines()
+
+    def facts_line(self, lines):
+        found = [ln for ln in lines if ln.startswith("prune-facts:")]
+        self.assertEqual(len(found), 1, lines)
+        return found[0]
+
+    def test_facts_line_inside_allowed_root(self):
+        rc, lines = self.run_merged(self.runner, "--root", str(self.base))
+        self.assertEqual(rc, EXIT_OK)
+        expected = (
+            f"prune-facts: tmpdir={self.runner} resolved={self.runner} symlink=no "
+            f"allowed_root={self.base} python={sys.version.splitlines()[0]} executable={sys.executable}"
+        )
+        self.assertEqual(lines[0], expected)
+
+    def test_facts_line_precedes_the_refusal_outside_every_root(self):
+        rc, lines = self.run_merged(self.runner)
+        self.assertEqual(rc, EXIT_REFUSED)
+        expected = (
+            f"prune-facts: tmpdir={self.runner} resolved={self.runner} symlink=no "
+            f"allowed_root=none python={sys.version.splitlines()[0]} executable={sys.executable}"
+        )
+        self.assertEqual(lines[0], expected)
+        self.assertTrue(lines[1].startswith("prune_runner_tmp: refused: TMPDIR is outside the allowed roots"), lines)
+
+    def test_facts_line_reports_a_symlinked_component(self):
+        link = self.base / "link"
+        link.symlink_to(self.runner)
+        rc, lines = self.run_merged(link, "--root", str(self.base))
+        self.assertEqual(rc, EXIT_REFUSED)
+        self.assertIn(f"tmpdir={link} resolved={self.runner} symlink=yes ", self.facts_line(lines))
 
 
 class WorkflowWiring(unittest.TestCase):
