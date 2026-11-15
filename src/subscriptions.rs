@@ -3524,14 +3524,16 @@ mod tests {
     use tempfile::NamedTempFile;
 
     /// Stand up a fresh on-disk SQLite at a tempfile path with the
-    /// production schema applied. Returns the path and keeps the file
-    /// alive via the returned `NamedTempFile` (drop deletes it).
-    fn fresh_db() -> (NamedTempFile, std::path::PathBuf) {
-        let f = NamedTempFile::new().expect("tempfile");
-        let p = f.path().to_path_buf();
+    /// production schema applied. The file is removed, with its SQLite
+    /// sidecars, when the test process exits (#8634): the dispatch threads
+    /// these tests start outlive the test body and keep writing to the
+    /// database, so a guard dropped at the end of the test cannot be the one
+    /// that removes it.
+    fn fresh_db() -> std::path::PathBuf {
+        let p = crate::test_support::keep_file_until_exit(NamedTempFile::new().expect("tempfile"));
         // Apply schema via the production opener so migrations run.
         let _ = crate::db::open(&p).expect("db::open");
-        (f, p)
+        p
     }
 
     /// #3705 — how the in-process TLS receiver answers a delivery.
@@ -3659,7 +3661,7 @@ mod tests {
 
     #[test]
     fn insert_persists_and_list_returns_row() {
-        let (_keep, path) = fresh_db();
+        let path = fresh_db();
         let conn = Connection::open(&path).unwrap();
         let id = insert(
             &conn,
@@ -3691,7 +3693,7 @@ mod tests {
 
     #[test]
     fn insert_rejects_invalid_url() {
-        let (_keep, path) = fresh_db();
+        let path = fresh_db();
         let conn = Connection::open(&path).unwrap();
         let res = insert(
             &conn,
@@ -3710,7 +3712,7 @@ mod tests {
 
     #[test]
     fn insert_hashes_secret_before_persisting() {
-        let (_keep, path) = fresh_db();
+        let path = fresh_db();
         let conn = Connection::open(&path).unwrap();
         let plaintext = "super-shared-secret";
         let id = insert(
@@ -3740,7 +3742,7 @@ mod tests {
 
     #[test]
     fn insert_no_secret_stores_null() {
-        let (_keep, path) = fresh_db();
+        let path = fresh_db();
         let conn = Connection::open(&path).unwrap();
         let id = insert(
             &conn,
@@ -3767,7 +3769,7 @@ mod tests {
 
     #[test]
     fn delete_returns_true_when_row_removed() {
-        let (_keep, path) = fresh_db();
+        let path = fresh_db();
         let conn = Connection::open(&path).unwrap();
         let id = insert(
             &conn,
@@ -3788,14 +3790,14 @@ mod tests {
 
     #[test]
     fn delete_returns_false_when_row_missing() {
-        let (_keep, path) = fresh_db();
+        let path = fresh_db();
         let conn = Connection::open(&path).unwrap();
         assert!(!delete(&conn, "nope", None).unwrap());
     }
 
     #[test]
     fn list_orders_by_created_at_desc() {
-        let (_keep, path) = fresh_db();
+        let path = fresh_db();
         let conn = Connection::open(&path).unwrap();
         // Insert three subs with sleeps so created_at is monotonically
         // increasing (rfc3339 to second-or-better resolution).
@@ -4021,7 +4023,7 @@ mod tests {
 
     #[test]
     fn record_dispatch_increments_counts_on_success() {
-        let (_keep, path) = fresh_db();
+        let path = fresh_db();
         let id = {
             let conn = Connection::open(&path).unwrap();
             insert(
@@ -4054,7 +4056,7 @@ mod tests {
 
     #[test]
     fn record_dispatch_increments_failure_on_err() {
-        let (_keep, path) = fresh_db();
+        let path = fresh_db();
         let id = {
             let conn = Connection::open(&path).unwrap();
             insert(
@@ -4086,7 +4088,7 @@ mod tests {
 
     #[test]
     fn record_dispatch_nonexistent_id_does_not_panic() {
-        let (_keep, path) = fresh_db();
+        let path = fresh_db();
         // No subscription with this id; the UPDATE simply matches zero
         // rows. Function must not panic and must not poison the DB.
         record_dispatch(&path, "no-such-id", "cid-3659", true);
@@ -4116,7 +4118,7 @@ mod tests {
 
     #[test]
     fn load_secret_hash_returns_stored_hash() {
-        let (_keep, path) = fresh_db();
+        let path = fresh_db();
         let id = {
             let conn = Connection::open(&path).unwrap();
             insert(
@@ -4139,7 +4141,7 @@ mod tests {
 
     #[test]
     fn load_secret_hash_missing_id_errs() {
-        let (_keep, path) = fresh_db();
+        let path = fresh_db();
         // No row → query_row returns Err(QueryReturnedNoRows), which
         // is wrapped via `.context()`.
         let res = load_secret_hash(&path, "missing-id");
@@ -4150,7 +4152,7 @@ mod tests {
 
     #[test]
     fn dispatch_event_no_subs_is_noop() {
-        let (_keep, path) = fresh_db();
+        let path = fresh_db();
         let conn = Connection::open(&path).unwrap();
         // Empty subscriptions table — must return without spawning
         // any threads or panicking.
@@ -4165,7 +4167,7 @@ mod tests {
         // function returning quickly without panicking exercises the
         // matches_filters early-return branch and the `if matching.is_empty
         // { return; }` short-circuit.
-        let (_keep, path) = fresh_db();
+        let path = fresh_db();
         let conn = Connection::open(&path).unwrap();
         insert(
             &conn,
@@ -4195,7 +4197,7 @@ mod tests {
 
     #[test]
     fn dispatch_event_namespace_filter_mismatch_skips() {
-        let (_keep, path) = fresh_db();
+        let path = fresh_db();
         let conn = Connection::open(&path).unwrap();
         insert(
             &conn,
@@ -4418,7 +4420,7 @@ mod tests {
     async fn dispatch_event_e2e_increments_dispatch_count_on_2xx() {
         let receiver = spawn_tls_receiver(Reply::AckEcho).await;
 
-        let (_keep, db_path) = fresh_db();
+        let db_path = fresh_db();
         // Insert a wildcard subscription pointing at the mock.
         let id = {
             let conn = Connection::open(&db_path).unwrap();
@@ -4464,7 +4466,7 @@ mod tests {
     async fn dispatch_event_e2e_increments_failure_count_on_5xx() {
         let receiver = spawn_tls_receiver(Reply::Status(500)).await;
 
-        let (_keep, db_path) = fresh_db();
+        let db_path = fresh_db();
         let id = {
             let conn = Connection::open(&db_path).unwrap();
             let url = receiver.hook_url();
@@ -4520,7 +4522,7 @@ mod tests {
     async fn dispatch_event_e2e_signature_present_when_secret_set() {
         let receiver = spawn_tls_receiver(Reply::AckEcho).await;
 
-        let (_keep, db_path) = fresh_db();
+        let db_path = fresh_db();
         let _id = {
             let conn = Connection::open(&db_path).unwrap();
             let url = receiver.hook_url();
@@ -4662,7 +4664,7 @@ mod tests {
         // saw the POST and the body shape carries the K4 details.
         let receiver = spawn_tls_receiver(Reply::AckEcho).await;
 
-        let (_keep, db_path) = fresh_db();
+        let db_path = fresh_db();
         let url = receiver.hook_url();
         let opt_in: Vec<String> = vec!["approval_requested".to_string()];
         let sub_id = {
@@ -4766,7 +4768,7 @@ mod tests {
         // structured-opt-in branch from the K4 dispatch path. We can't
         // observe "no thread spawned" directly, but we can assert
         // dispatch_count stays at zero because no HTTP send occurred.
-        let (_keep, db_path) = fresh_db();
+        let db_path = fresh_db();
         let opt_in_other: Vec<String> = vec!["memory_store".to_string()];
         let sub_id = {
             let conn = Connection::open(&db_path).unwrap();
@@ -4822,7 +4824,7 @@ mod tests {
         // dispatching. A bogus id must NOT panic, NOT spawn a thread,
         // and NOT touch any subscriber row. Exercises the early-return
         // branches in dispatch_approval_requested.
-        let (_keep, db_path) = fresh_db();
+        let db_path = fresh_db();
         let sub_id = {
             let conn = Connection::open(&db_path).unwrap();
             insert(
@@ -4871,7 +4873,7 @@ mod tests {
     async fn k6_dispatch_persists_uuidv7_correlation_id() {
         let receiver = spawn_tls_receiver(Reply::AckEcho).await;
 
-        let (_keep, db_path) = fresh_db();
+        let db_path = fresh_db();
         let url = receiver.hook_url();
         let sub_id = {
             let conn = Connection::open(&db_path).unwrap();
@@ -4962,7 +4964,7 @@ mod tests {
         // ladder and forces the DLQ branch.
         let receiver = spawn_tls_receiver(Reply::Status(500)).await;
 
-        let (_keep, db_path) = fresh_db();
+        let db_path = fresh_db();
         let url = receiver.hook_url();
         let sub_id = {
             let conn = Connection::open(&db_path).unwrap();
@@ -5058,7 +5060,7 @@ mod tests {
         // Insert two audit rows by hand (faster than driving two full
         // dispatches) and assert the cursor filter returns only the
         // newer one.
-        let (_keep, db_path) = fresh_db();
+        let db_path = fresh_db();
         let url = "https://example.com/hook";
         let sub_id = {
             let conn = Connection::open(&db_path).unwrap();
@@ -5110,7 +5112,7 @@ mod tests {
     /// `ai_memory_subscription_dlq_overflow_total` counter.
     #[test]
     fn issue_1253_dlq_overflow_cap_refuses_past_max() {
-        let (_keep, db_path) = fresh_db();
+        let db_path = fresh_db();
         let conn = Connection::open(&db_path).unwrap();
         let sub_id = insert(
             &conn,

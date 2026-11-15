@@ -1314,29 +1314,72 @@ fn exit_removal_leaves_the_temp_root_empty_8634() {
 /// connection is closed AFTER the file is unlinked (a fixture returned as
 /// `(connection, guard)` drops the guard first, and SQLite then skips deleting
 /// the sidecars of an unlinked database). Derefs to the [`tempfile::NamedTempFile`].
-pub(crate) struct TempDbFile(tempfile::NamedTempFile);
+pub(crate) struct TempDbFile {
+    file: tempfile::NamedTempFile,
+    /// Also remove the `<file>.pre-migration-*.bak` safety snapshots a
+    /// migration writes next to the database (see [`Self::new_migrating`]).
+    sweep_migration_backups: bool,
+}
+
+/// Infix of the pre-migration safety snapshot written next to a database
+/// (`<db file name>.pre-migration-v<from>-to-v<to>-<unix nanos>.bak`).
+const PRE_MIGRATION_BACKUP_INFIX: &str = ".pre-migration-";
 
 impl TempDbFile {
     /// # Panics
     /// When the temporary file cannot be created.
     pub(crate) fn new() -> Self {
-        Self(tempfile::NamedTempFile::new().expect("tempfile for a test database"))
+        Self {
+            file: tempfile::NamedTempFile::new().expect("tempfile for a test database"),
+            sweep_migration_backups: false,
+        }
+    }
+
+    /// Like [`Self::new`], for a database that a test drives through a schema
+    /// migration: the pre-migration snapshot the migration writes next to the
+    /// file is removed with the guard too.
+    ///
+    /// # Panics
+    /// When the temporary file cannot be created.
+    pub(crate) fn new_migrating() -> Self {
+        Self {
+            sweep_migration_backups: true,
+            ..Self::new()
+        }
     }
 }
 
 impl std::ops::Deref for TempDbFile {
     type Target = tempfile::NamedTempFile;
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.file
     }
 }
 
 impl Drop for TempDbFile {
     fn drop(&mut self) {
         for suffix in SQLITE_SIDECAR_SUFFIXES {
-            let mut sidecar = self.0.path().as_os_str().to_owned();
+            let mut sidecar = self.file.path().as_os_str().to_owned();
             sidecar.push(suffix);
             let _ = std::fs::remove_file(sidecar);
+        }
+        if !self.sweep_migration_backups {
+            return;
+        }
+        let path = self.file.path();
+        let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+            return;
+        };
+        let prefix = format!("{}{PRE_MIGRATION_BACKUP_INFIX}", name.to_string_lossy());
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let entry_name = entry.file_name();
+            let entry_name = entry_name.to_string_lossy();
+            if entry_name.starts_with(&prefix) && entry_name.ends_with(".bak") {
+                let _ = std::fs::remove_file(entry.path());
+            }
         }
     }
 }
@@ -1359,4 +1402,33 @@ fn temp_db_file_removes_its_sidecars_8634() {
     for sidecar in sidecars {
         assert!(!sidecar.exists(), "{} must be removed", sidecar.display());
     }
+}
+
+/// #8634: a database driven through a schema migration leaves its
+/// `<file>.pre-migration-*.bak` snapshot behind; [`TempDbFile::new_migrating`]
+/// removes it with the guard and leaves unrelated neighbours alone.
+#[test]
+fn temp_db_file_removes_migration_backups_8634() {
+    let file = TempDbFile::new_migrating();
+    let path = file.path().to_path_buf();
+    let backup = |tail: &str| {
+        let mut name = path.clone().into_os_string();
+        name.push(tail);
+        std::path::PathBuf::from(name)
+    };
+    let snapshot = backup(".pre-migration-v34-to-v101-1794776412762060792.bak");
+    let unrelated = backup("x.pre-migration-v34-to-v101-1.bak");
+    std::fs::write(&snapshot, b"snapshot").expect("write snapshot");
+    std::fs::write(&unrelated, b"neighbour").expect("write neighbour");
+    drop(file);
+    assert!(!path.exists(), "the main file must be removed");
+    assert!(
+        !snapshot.exists(),
+        "the pre-migration snapshot must be removed"
+    );
+    assert!(
+        unrelated.exists(),
+        "a neighbour sharing only a prefix must stay"
+    );
+    std::fs::remove_file(&unrelated).expect("remove the neighbour");
 }

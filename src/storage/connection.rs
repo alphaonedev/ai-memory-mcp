@@ -1801,7 +1801,7 @@ mod tests {
     /// bootstrap used to crash on.
     #[test]
     fn open_succeeds_on_legacy_pre_v36_memories_shape() {
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let tmp = crate::test_support::TempDbFile::new_migrating();
         {
             let conn = open(tmp.path()).expect("seed: fresh open");
             for ix in [
@@ -1895,7 +1895,7 @@ mod tests {
     /// against the missing column.
     #[test]
     fn open_succeeds_on_legacy_pre_v41_shadow_shape() {
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let tmp = crate::test_support::TempDbFile::new_migrating();
         {
             let conn = open(tmp.path()).expect("seed: fresh open");
             conn.execute(

@@ -489,7 +489,7 @@ mod tests {
     /// is refused either way, which is the invariant.
     #[test]
     fn unaccounted_pages_are_refused_however_sqlite_answers_3510() {
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let tmp = crate::test_support::TempDbFile::new();
         {
             let conn = crate::db::open(tmp.path()).expect("open");
             assert!(matches!(check(&conn).expect("check"), Soundness::Sound(_)));
