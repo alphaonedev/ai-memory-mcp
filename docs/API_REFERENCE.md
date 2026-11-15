@@ -116,6 +116,24 @@ was the #874-class spoof vector):
    (`agent_id_certificate_unmapped`) under `enforce`. A body or query
    `agent_id` that differs from the certificate-bound header is then
    rejected by rule 2.
+5. **Enforce funnel (v1.0.0, #9341).** Under
+   `AI_MEMORY_HTTP_REQUIRE_ATTESTED_IDENTITY=enforce` with at least one
+   per-agent key enrolled, a request that names a principal in
+   `X-Agent-Id` without proving it is refused **403**
+   `{"error":"attested_identity_required"}` at the authority layer, before
+   any handler, on every route except the probes (`/health`, `/metrics`,
+   `/api/v1/metrics`, `/api/v1/monitoring/*`) and `/api/v1/sync/*`. Proof is
+   the agent's enrolled per-agent api-key or a client certificate mapped to
+   that agent (#8590); the shared api-key proves no principal. A header
+   naming an `anonymous:*` id is a named assertion and is refused the same
+   way. A request with no `X-Agent-Id` (or an empty one) is the anonymous
+   per-request principal and is not refused here. With zero keys enrolled
+   the funnel is inert. Operators running `enforce` with only the shared key
+   must enrol per-agent keys (`ai-memory agents bind-api-key`) or map client
+   certificates before named callers can act.
+6. A present `X-Agent-Id` that is malformed, reserved or not visible ASCII
+   is refused **400** `VALIDATION_FAILED` on every gated route (#9342); it
+   is never served as `anonymous:invalid`.
 
 Validation pattern: `^[A-Za-z0-9_\-:@./]{1,128}$`.
 
@@ -1466,7 +1484,8 @@ signature is checked; a layout 1 signature (subject `<id>` alone) is refused **4
 credential gets **403**: with a per-agent api-key whose bound agent differs from
 `X-Agent-Id` the transport middleware refuses first with
 `identity_binding_mismatch`; with the shared api-key (no per-agent binding) the
-decide gate refuses with `attested_identity_required` (#8549).
+authority-layer funnel refuses with `attested_identity_required` before the
+decide handler runs (#9341; the decide gate keeps the same refusal, #8549).
 200 if consensus reached (and the governed action is executed). 202 if
 still collecting approvers. Equivalent MCP tool: `memory_pending_approve`
 (`src/mcp/tools/pending.rs`).
@@ -1762,7 +1781,7 @@ router in `src/lib.rs`.
 | `GET`  | `/api/v1/capabilities` | Capabilities envelope (schema_version `"3"`; `Accept-Capabilities` header negotiates v1/v2). MCP: `memory_capabilities`. |
 | `POST` | `/api/v1/notify` | Agent-to-agent inbox message. Sender resolved from `X-Agent-Id` only (#901); body `agent_id` must match or 403. MCP: `memory_notify`. Every delivery is a NEW row (#3639): the stored `title` is `<subject> [<id prefix>]` (unique by construction), the caller's title is kept verbatim as `metadata.subject`, a repeated subject never merges into, overwrites or re-attributes an earlier message, and the receipt carries `id`, `title` and `subject`. |
 | `GET`  | `/api/v1/inbox` | Read the calling agent's inbox — the messages it has not yet HANDLED. Handled = the recipient deleted the message (`DELETE /api/v1/memories/{id}`, archived on this namespace, see the delete route); reads never mark anything (#1869 purity) and there is no read marker — `access_count` counts touches, never handling ([#3730](https://github.com/alphaonedev/ai-memory-mcp/issues/3730)). `unread_only` is accepted for compatibility and narrows nothing (every listed message is unhandled); `unread_count == count`. MCP: `memory_inbox`; when `AI_MEMORY_AGENT_ID` is unset, access is bound to the same process-derived identity used by `memory_notify`, and an explicit `agent_id` must match it. MCP refuses startup when `AI_MEMORY_AGENT_ID` is configured empty or malformed. An isolated single-tenant process may explicitly set `[mcp] single_tenant_trust_all = true` to restore caller-unbound inbox selection; every use emits a WARN. |
-| `GET`  | `/api/v1/inbox/stream` | v1.0.0 [#3465](https://github.com/alphaonedev/ai-memory-mcp/issues/3465) — SSE wake stream for the calling agent's OWN inbox (`handlers::inbox_sse`). One `agent_notified` frame per committed `memory_notify`, plus a synthetic `lagged` frame when a slow subscriber overruns the bounded broadcast buffer; keepalive every 15 s. Identity-bound at stream open — no delegation, no namespace widening, and an unresolved identity (absent/unreadable `X-Agent-Id`, or a self-asserted `host:` principal) gets a stream that never emits. Frames carry the inbox row id, namespace, sender, a correlation id and a `sha256:` content digest — **never the body**; the woken client reads its mail through `GET /api/v1/inbox`. Fed from the in-process wake bus, not the webhook lane. No MCP twin (SSE has no MCP transport). |
+| `GET`  | `/api/v1/inbox/stream` | v1.0.0 [#3465](https://github.com/alphaonedev/ai-memory-mcp/issues/3465) — SSE wake stream for the calling agent's OWN inbox (`handlers::inbox_sse`). One `agent_notified` frame per committed `memory_notify`, plus a synthetic `lagged` frame when a slow subscriber overruns the bounded broadcast buffer; keepalive every 15 s. Identity-bound at stream open — no delegation, no namespace widening, and an unresolved identity (absent `X-Agent-Id`, or a self-asserted `host:` principal) gets a stream that never emits; an unreadable `X-Agent-Id` is refused `400` at the authority layer (#9342). Frames carry the inbox row id, namespace, sender, a correlation id and a `sha256:` content digest — **never the body**; the woken client reads its mail through `GET /api/v1/inbox`. Fed from the in-process wake bus, not the webhook lane. No MCP twin (SSE has no MCP transport). |
 | `GET`  | `/.well-known/agent-card.json` | #8444 — Agent2Agent (A2A 1.0) Agent Card. **Authenticated callers only** (posture P1): the route sits behind the existing `api_key_auth`, so an unauthenticated GET is `401`; no exemption exists. Declares `capabilities {streaming:false, pushNotifications:false, extendedAgentCard:false, extensions:[]}`, one `supportedInterfaces` entry (`protocolBinding:"JSONRPC"`, `protocolVersion:"1.0"`, url `<base>/api/v1/a2a`, where `<base>` is the configured `AI_MEMORY_PUBLIC_URL` or else the daemon's own scheme (`https` under TLS) and bind address, never the request `Host` or `X-Forwarded-Proto`), the `apiKey` security scheme (header `x-api-key`) and one skill, `memory-inbox`. `mtls` is deliberately not declared (it would need a wider `/api/v1/sync/*` auth bypass). Served on both backends. |
 | `POST` | `/api/v1/a2a` | #8444 — the ONE Agent2Agent JSON-RPC 2.0 endpoint. Behind `api_key_auth` plus a credential-derived agent identity (fail-closed; an open/keyless server answers `401`). Methods: `SendMessage` (synchronous: the Task is `TASK_STATE_COMPLETED` in the response), `GetTask`, `ListTasks`, `CancelTask`. Declared unsupported: `SendStreamingMessage`, `SubscribeToTask`, `GetExtendedAgentCard` answer `-32004`; the four `*TaskPushNotificationConfig` methods answer `-32003`; an unknown method answers `-32601`. Requires `Content-Type: application/json`; `A2A-Version` is accepted when absent or `1.0` (anything else `-32009`) and `A2A-Version: 1.0` is returned on every response the A2A handlers produce (a `401` from the shared authentication layer is answered before the handler runs and carries none). Every inbound message is stored in the caller's `_inbox/<caller>` and stamped with `content_principal` (the authenticated agent id, never `X-Agent-Id` or the body) and `a2a_role` (untrusted label). A task owned by another caller answers `-32001` with HTTP `404`, never `403`. See *A2A error table* below and `docs/a2a-integration.md` section 10. |
 | `GET` `POST` `DELETE` | `/api/v1/skill/list`, `/api/v1/skill/register`, `/api/v1/skill/{id}`, `/api/v1/skill/{id}/resource`, `/api/v1/skill/{id}/export`, `/api/v1/skill/{id}/promote`, `/api/v1/skill/{id}/compose` | Cluster E API-2 (#767) — Agent Skills HTTP parity for the seven `memory_skill_*` MCP tools. **Admin-gated.** `…/export` writes on the daemon host and is **jailed** — see *Skills export root* below. |
