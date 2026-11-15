@@ -2499,7 +2499,7 @@ pub trait MemoryStore: Send + Sync {
     /// expensive-verify-DoS layering). v1.0.0 #3418 — read at boot AND on a
     /// bounded refresh cadence, so enrollment and REVOCATION reach a running
     /// daemon; the result funnels through
-    /// [`crate::handlers::identity_binding::apply_agent_key_refresh`], which
+    /// [`crate::handlers::identity_binding::refresh_agent_keys`], which
     /// keeps the last known snapshot when this read fails (degrade, never
     /// disarm).
     ///
