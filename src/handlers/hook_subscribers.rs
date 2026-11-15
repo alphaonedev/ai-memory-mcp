@@ -1086,6 +1086,21 @@ pub async fn get_namespace_standard_qs(
         .await;
     };
 
+    // #9355 (v1.0.0, #2032-A / H1 IDOR) — the same per-agent-key identity gate
+    // as set/clear (`set_namespace_standard_inner`, `clear_namespace_standard_inner`)
+    // BEFORE the visibility caller is resolved below. Under `enforce` a
+    // shared-key `Claimed` caller naming `X-Agent-Id: <victim>` was served the
+    // victim's `scope=private` standard. All three GET forms (path, qs, inherit)
+    // route through here. Inert for zero-config deployments.
+    if let Some(resp) = crate::handlers::identity_binding::enforce_idor_identity(
+        &app.enrolled_agent_keys,
+        app.http_identity_mode,
+        &headers,
+        "namespace_get_standard",
+    ) {
+        return resp;
+    }
+
     // v1.0.0 #2543 / #959 residual — explicit HTTP fetch of a namespace
     // standard is gated through the SAME canonical
     // `visibility::is_visible_to_caller` predicate as #2537 injection and
