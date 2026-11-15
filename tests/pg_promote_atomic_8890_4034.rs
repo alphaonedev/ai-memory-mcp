@@ -569,3 +569,117 @@ async fn pg_trait_update_archives_concurrent_content_4034() {
 async fn pg_expected_version_none_archives_concurrent_content_4034() {
     concurrent_content_write_is_archived(Funnel::ExpectedVersionNone).await;
 }
+
+// ---------------------------------------------------------------------------
+// #8890 sibling — `entity_register` writes the entity row through the store
+// funnel and then its alias rows. Both must commit together or not at all.
+// ---------------------------------------------------------------------------
+
+/// Marker raised by the alias-insert trigger the entity row is tested with.
+const ALIAS_FAILURE_MARKER: &str = "forced alias failure 8890";
+/// `to_store_err` label of the alias insert in `entity_register`.
+const ALIAS_INSERT_LABEL: &str = "entity_register populate entity_aliases";
+/// Canonical name (prefix) of the registered entity.
+const ENTITY_NAME: &str = "entity 8890";
+/// The alias that inserts cleanly before the failing one.
+const GOOD_ALIAS: &str = "alias good 8890";
+/// The alias whose insert the trigger refuses.
+const FAILING_ALIAS: &str = "alias failing 8890";
+
+async fn install_alias_failure(pool: &sqlx::PgPool, alias: &str) -> String {
+    let name = format!("fail_alias_8890_{}", suffix());
+    sqlx::query(&format!(
+        "CREATE FUNCTION {name}() RETURNS trigger LANGUAGE plpgsql AS $f$ \
+         BEGIN IF NEW.alias = '{alias}' THEN RAISE EXCEPTION '{ALIAS_FAILURE_MARKER}'; \
+         END IF; RETURN NEW; END $f$"
+    ))
+    .execute(pool)
+    .await
+    .expect("create alias failure function");
+    sqlx::query(&format!(
+        "CREATE TRIGGER {name} BEFORE INSERT ON entity_aliases \
+         FOR EACH ROW EXECUTE FUNCTION {name}()"
+    ))
+    .execute(pool)
+    .await
+    .expect("create alias failure trigger");
+    name
+}
+
+async fn drop_alias_failure(pool: &sqlx::PgPool, name: &str) {
+    let _ = sqlx::query(&format!("DROP TRIGGER IF EXISTS {name} ON entity_aliases"))
+        .execute(pool)
+        .await;
+    let _ = sqlx::query(&format!("DROP FUNCTION IF EXISTS {name}()"))
+        .execute(pool)
+        .await;
+}
+
+async fn count_aliases(pool: &sqlx::PgPool, aliases: &[&str]) -> i64 {
+    let owned: Vec<String> = aliases.iter().map(|a| (*a).to_string()).collect();
+    sqlx::query_scalar("SELECT COUNT(*) FROM entity_aliases WHERE alias = ANY($1)")
+        .bind(&owned)
+        .fetch_one(pool)
+        .await
+        .expect("count aliases")
+}
+
+#[tokio::test]
+async fn pg_entity_register_alias_failure_leaves_no_entity_8890() {
+    let Some((store, pool)) = live_pg().await else {
+        return;
+    };
+    let sfx = suffix();
+    let ns = format!("entity-8890-{sfx}");
+    let canonical = format!("{ENTITY_NAME} {sfx}");
+    let good = format!("{GOOD_ALIAS} {sfx}");
+    let failing = format!("{FAILING_ALIAS} {sfx}");
+    let trigger = install_alias_failure(&pool, &failing).await;
+
+    let result = store
+        .entity_register(
+            &admin_ctx(AUTHOR),
+            &canonical,
+            &ns,
+            &[good.clone(), failing.clone()],
+            &serde_json::json!({}),
+            Some(AUTHOR),
+        )
+        .await;
+    drop_alias_failure(&pool, &trigger).await;
+
+    match result {
+        Err(StoreError::BackendUnavailable {
+            backend,
+            detail,
+            sqlstate,
+        }) => {
+            assert_eq!(backend, "postgres", "backend of the forced failure");
+            assert_eq!(
+                sqlstate.as_deref(),
+                Some(SQLSTATE_RAISE_EXCEPTION),
+                "sqlstate of the forced failure"
+            );
+            assert!(
+                detail.starts_with(ALIAS_INSERT_LABEL) && detail.contains(ALIAS_FAILURE_MARKER),
+                "the failure must be the forced alias insert, got: {detail}"
+            );
+        }
+        other => panic!("expected the forced alias-insert failure, got {other:?}"),
+    }
+    let entity_rows = count_in_namespace(&pool, &ns).await;
+    let alias_rows = count_aliases(&pool, &[&canonical, &good, &failing]).await;
+    cleanup(&pool, &[], &[&ns]).await;
+    let _ = sqlx::query("DELETE FROM entity_aliases WHERE alias = ANY($1)")
+        .bind(vec![canonical, good, failing])
+        .execute(&pool)
+        .await;
+    assert_eq!(
+        entity_rows, NONE,
+        "#8890: a failed alias insert must roll the entity row back"
+    );
+    assert_eq!(
+        alias_rows, NONE,
+        "#8890: a failed alias insert must roll the earlier alias rows back"
+    );
+}

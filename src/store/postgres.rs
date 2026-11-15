@@ -13363,16 +13363,13 @@ impl PostgresStore {
     /// inbound path (`apply_remote_link`) is intentionally NOT routed
     /// through this gate — it mirrors sqlite's `create_link_inbound`
     /// peer-attested posture, tracked separately.
-    async fn validate_link_pre_create_pg<'e, E>(
+    async fn validate_link_pre_create_pg(
         &self,
-        owner_exec: E,
+        conn: &mut sqlx::PgConnection,
         ctx: &CallerContext,
         link: &MemoryLink,
         keypair: Option<&crate::identity::keypair::AgentKeypair>,
-    ) -> StoreResult<()>
-    where
-        E: sqlx::Executor<'e, Database = sqlx::Postgres>,
-    {
+    ) -> StoreResult<()> {
         // #3194 — K9 is evaluated for the CALLER principal, not the
         // daemon keypair the handler threads in for signing. Pre-fix
         // this used `keypair.map_or("system", |kp| kp.agent_id)`, so
@@ -13410,7 +13407,7 @@ impl PostgresStore {
                  FROM memories WHERE id = $1 FOR UPDATE",
             )
             .bind(&link.source_id)
-            .fetch_optional(owner_exec)
+            .fetch_optional(&mut *conn)
             .await
             .map_err(|e| to_store_err("resolve link source namespace", e))?;
         if !ctx.bypass_visibility
@@ -13475,7 +13472,10 @@ impl PostgresStore {
                 sqlx::query_as("SELECT id, created_at FROM memories WHERE id = $1 OR id = $2")
                     .bind(&link.source_id)
                     .bind(&link.target_id)
-                    .fetch_all(&self.pool)
+                    // #8890 — on the link's own transaction, so a promote
+                    // clone written earlier in the SAME tx is visible here
+                    // (on the pool it was invisible and the guard skipped).
+                    .fetch_all(&mut *conn)
                     .await
                     .map_err(|e| to_store_err("lineage guard created_at fetch", e))?;
             let source_at = stamps
@@ -13632,6 +13632,9 @@ impl PostgresStore {
         self.validate_link_pre_create_pg(&mut **tx, ctx, link, keypair)
             .await?;
 
+        // #8890 — the FK pre-flight and cid reads below run on `tx`, so an
+        // endpoint written earlier in the caller's transaction (the vertical
+        // promote clone) is seen.
         // FK pre-flight — mirror SQLite's explicit existence check so
         // the error message names the missing memory rather than
         // surfacing a raw `pg_class` constraint violation. Both
@@ -13639,7 +13642,7 @@ impl PostgresStore {
         let source_exists: bool =
             sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM memories WHERE id = $1)")
                 .bind(&link.source_id)
-                .fetch_one(&self.pool)
+                .fetch_one(&mut **tx)
                 .await
                 .map_err(|e| to_store_err("check source memory", e))?;
         if !source_exists {
@@ -13650,7 +13653,7 @@ impl PostgresStore {
         let target_exists: bool =
             sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM memories WHERE id = $1)")
                 .bind(&link.target_id)
-                .fetch_one(&self.pool)
+                .fetch_one(&mut **tx)
                 .await
                 .map_err(|e| to_store_err("check target memory", e))?;
         if !target_exists {
@@ -13751,13 +13754,13 @@ impl PostgresStore {
                 (
                     sqlx::query_scalar::<_, Option<String>>(SQL_SELECT_CID_BY_ID)
                         .bind(&link.source_id)
-                        .fetch_optional(&self.pool)
+                        .fetch_optional(&mut **tx)
                         .await
                         .map_err(|e| to_store_err("read source cid", e))?
                         .flatten(),
                     sqlx::query_scalar::<_, Option<String>>(SQL_SELECT_CID_BY_ID)
                         .bind(&link.target_id)
-                        .fetch_optional(&self.pool)
+                        .fetch_optional(&mut **tx)
                         .await
                         .map_err(|e| to_store_err("read target cid", e))?
                         .flatten(),
@@ -21428,9 +21431,14 @@ impl PostgresStore {
     /// `promoted_from*`, then records the clone→source `derived_from` edge. The
     /// clone's 30+-field shape comes from the SHARED
     /// [`crate::storage::build_promotion_clone`] so it cannot drift from the
-    /// sqlite primitive. The clone is persisted through the standard
-    /// [`MemoryStore::store`] funnel (fresh embedding re-derived from the
-    /// durable TEXT — the North-Star "derived artifacts are regenerable" rule).
+    /// sqlite primitive. The clone is persisted through the store funnel's
+    /// shared preamble and body ([`pg_store_prepare`] / [`pg_store_in_tx`];
+    /// fresh embedding re-derived from the durable TEXT — the North-Star
+    /// "derived artifacts are regenerable" rule).
+    ///
+    /// #8890 — the clone row and its `derived_from` edge commit in ONE
+    /// transaction: a refused or failed link rolls the clone back, so a
+    /// same-title target the clone would have merged into stays unchanged.
     async fn pg_promote_to_namespace(
         &self,
         ctx: &CallerContext,
@@ -21447,10 +21455,19 @@ impl PostgresStore {
             }
         })?;
         let clone = crate::storage::build_promotion_clone(&source, to_namespace, promoted_by);
-        let clone_id = self.store(ctx, &clone).await?;
+        self.gate_record_stop().await?;
+        let (clone, binds) = pg_store_prepare(ctx, &clone)?;
+        let clone: &Memory = &clone;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin promote tx", e))?;
+        let clone_id = pg_store_in_tx(&mut tx, ctx, clone, binds).await?;
         // Clone → source: derived_from. Distinct ids (fresh uuid), so the link
         // layer's self-link short-circuit can never fire.
-        self.link(
+        self.link_internal_in_tx(
+            &mut tx,
             ctx,
             &MemoryLink {
                 source_id: clone_id.clone(),
@@ -21465,8 +21482,14 @@ impl PostgresStore {
                 source_cid: None,
                 target_cid: None,
             },
+            None,
         )
         .await?;
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit promote tx", e))?;
+        // #3323 — meter the committed clone exactly as the store funnel does.
+        crate::cost::postgres::record_write_pg(&self.pool, clone, &clone_id).await;
         Ok(clone_id)
     }
 }
@@ -34205,7 +34228,17 @@ impl MemoryStore for PostgresStore {
             valid_from: None,
             valid_until: None,
         };
-        let written_id = self.store(ctx, &mem).await?;
+        // #8890 — the entity row and its alias rows commit in ONE
+        // transaction: a failed alias insert rolls the entity row back.
+        self.gate_record_stop().await?;
+        let (mem, binds) = pg_store_prepare(ctx, &mem)?;
+        let mem: &Memory = &mem;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin entity_register tx", e))?;
+        let written_id = pg_store_in_tx(&mut tx, ctx, mem, binds).await?;
         let created = prior.is_none();
 
         // #1654 — populate the `entity_aliases` join table. The SAL
@@ -34252,7 +34285,7 @@ impl MemoryStore for PostgresStore {
             )
             .bind(&written_id)
             .bind(stored)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| to_store_err("entity_register populate entity_aliases", e))?;
         }
@@ -34270,9 +34303,14 @@ impl MemoryStore for PostgresStore {
              ORDER BY created_at ASC, alias ASC",
         )
         .bind(&written_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await
         .map_err(|e| to_store_err("entity_register list aliases", e))?;
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit entity_register tx", e))?;
+        // #3323 — meter the committed entity row as the store funnel does.
+        crate::cost::postgres::record_write_pg(&self.pool, mem, &written_id).await;
 
         Ok(EntityRegistration {
             entity_id: written_id,
