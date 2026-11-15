@@ -1916,6 +1916,88 @@ class TrackedDocFrozenReason9303(LedgerCase):
         self.assertLess(elapsed, FAST_BOUND_S)
 
 
+# #9338: the ledger is append-only, so the tracked doc grows by one record per federation change.
+# These cells append 1, 2 and 3 later records to a COPY of the tracked doc (a scene under
+# .local-runs/, never the tracked file) and hold the tracked-doc cells to the invariant.
+TRACKED_FIRST_RECORD = "### Amendment 2026-11-14"
+APPEND_COUNTS = (1, 2, 3)
+AMENDMENT_PREFIX = "### Amendment "
+
+
+def tracked_record_days(blob):
+    """The dates of every record of the tracked doc's ledger, in order."""
+    records = cert.parse_ledger(blob if isinstance(blob, bytes) else blob.encode("utf-8"),
+                                "head", region_frozen=True)
+    return [datetime.date.fromisoformat(r.lines[0][len(AMENDMENT_PREFIX):]) for r in records]
+
+
+def tracked_last_day():
+    return tracked_record_days(tracked_doc())[-1]
+
+
+def tracked_with_appended(count, day):
+    """A copy of the tracked doc text with COUNT later records dated DAY (ISO string)."""
+    return tracked_doc() + "".join(record(day, path_item(MOD_RS)) for _ in range(count))
+
+
+def assert_tracked_ledger_shape(case, blob):
+    records = cert.parse_ledger(blob, "head", region_frozen=True)
+    case.assertEqual([r.lines[0] for r in records], [TRACKED_FIRST_RECORD])
+
+
+def judge_tracked_exact_record(case, doc):
+    """Judge one more record dated TRACKED_DAY appended to DOC (a tracked-doc copy)."""
+    s = case.scene("VOID", base_doc=doc)
+    head = doc + record(TRACKED_DAY, path_item(MOD_RS))
+    ok, out = s.judge(case.wire_and_doc(s, head))
+    case.assert_pass(ok, out, RELEASE_PASS, "the certification stays VOID")
+
+
+class TrackedLedgerAppend9338(LedgerCase):
+    """#9338: every valid append to the tracked ledger keeps the tracked-doc cells green; every
+    invalid ledger is refused with the exact reason."""
+
+    def append_day(self):
+        today = self.use_real_clock()
+        return max(tracked_last_day(), today).isoformat()
+
+    def test_9338_append_one_two_three_records_keeps_the_ledger_cells_green(self):
+        day = self.append_day()
+        for count in APPEND_COUNTS:
+            with self.subTest(appended=count):
+                doc = tracked_with_appended(count, day)
+                assert_tracked_ledger_shape(self, doc.encode("utf-8"))
+                judge_tracked_exact_record(self, doc)
+
+    def test_9338_decreasing_date_is_refused_with_the_exact_reason(self):
+        day = self.append_day()
+        last = datetime.date.fromisoformat(day)
+        earlier = (last - datetime.timedelta(days=1)).isoformat()
+        for count in APPEND_COUNTS:
+            with self.subTest(appended=count):
+                base = tracked_with_appended(count, day)
+                s = self.scene("VOID", base_doc=base)
+                head = base + record(earlier, path_item(MOD_RS))
+                ok, out = s.judge(self.wire_and_doc(s, head))
+                self.assert_refused(ok, out, reason_line(
+                    f"record dated {earlier} is before the previous record dated {day}; "
+                    "record dates must not decrease", nth_line_no(
+                        head, f"### Amendment {earlier}", head.split("\n").count(
+                            f"### Amendment {earlier}"))))
+
+    def test_9338_changed_first_record_is_refused_with_the_exact_reason(self):
+        day = self.append_day()
+        for count in APPEND_COUNTS:
+            with self.subTest(appended=count):
+                base = tracked_with_appended(count, day)
+                s = self.scene("VOID", base_doc=base)
+                head = base.replace(TRACKED_FIRST_RECORD, AMENDMENT_PREFIX + DAY, 1)
+                ok, out = s.judge(self.wire_and_doc(s, head))
+                self.assert_refused(ok, out, reason_line(
+                    f"record 1 of the base ledger ({TRACKED_FIRST_RECORD}) is edited, reordered "
+                    "or removed", line_no(base, TRACKED_FIRST_RECORD)))
+
+
 class TrackedDocState9305(unittest.TestCase):
     """#9305 / #9304: the tracked doc's head-detector state is pinned and recorded as
     re-issue work; the rules file is reachable from the docs indexes."""
