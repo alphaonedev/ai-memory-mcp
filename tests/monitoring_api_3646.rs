@@ -313,7 +313,7 @@ async fn issue_3646_tls_auth_revocation_and_health_contract() {
             );
         }
     }
-    keys.install(std::collections::HashMap::new());
+    keys.mutate(|m| *m = std::collections::HashMap::new());
     assert_eq!(
         request(&secure, STATUS_PATH, "GET", true, false).await.0,
         StatusCode::UNAUTHORIZED
