@@ -110,6 +110,15 @@ fn password_positives() -> Vec<Positive> {
         format!("Passwd = {ASSIGN_PW}"),
         format!("pwd='{ASSIGN_PW}'"),
         format!("PASSWORD:{ASSIGN_PW}"),
+        // Assignment operators beyond `:` / `=` (Go, Ruby/PHP, Python
+        // subscript): the whole value is masked, not the operator's tail.
+        format!("password := \"{ASSIGN_PW}\""),
+        format!(":password => '{ASSIGN_PW}'"),
+        format!("config['password'] = '{ASSIGN_PW}'"),
+        // A type annotation followed by an initializer is an assignment.
+        format!("const DB_PASSWORD: &str = \"{ASSIGN_PW}\";"),
+        format!("password: String = \"{ASSIGN_PW}\""),
+        format!("password: &'static str = \"{ASSIGN_PW}\";"),
     ]
     .into_iter()
     .map(|content| Positive {
@@ -310,6 +319,35 @@ negative_cell!(
 negative_cell!(
     neg_password_comparison_8855,
     "if password == expected { ok }"
+);
+// The false-positive class (r2): stored memories carry source code and docs.
+negative_cell!(
+    neg_password_not_equal_comparison_8855,
+    "if password != expected && pwd === other { ok }"
+);
+negative_cell!(
+    neg_type_annotation_8855,
+    "struct Login { password: String, pwd: Option<SecretString> }\nfn f(password: &str, passwd: &'a str) {}"
+);
+negative_cell!(
+    neg_env_lookup_8855,
+    "password = os.environ[\"DB_PASSWORD\"]\npassword = os.getenv('DB_PASSWORD')\nlet password = std::env::var(\"DB_PASSWORD\")?;\nconst password = process.env.DB_PASSWORD;\npassword: ${DB_PASSWORD}"
+);
+negative_cell!(
+    neg_empty_value_8855,
+    "password=\npwd=''\n{\"password\": \"\"}\nPrompted for the password:\n"
+);
+negative_cell!(
+    neg_null_value_8855,
+    "password: null, pwd = None, passwd: nil"
+);
+negative_cell!(
+    neg_prose_mention_8855,
+    "the query string (it is where `password=` lives) and `?sslpassword=` are dropped"
+);
+negative_cell!(
+    neg_format_and_ellipsis_placeholder_8855,
+    "refusal must redact the DSN password: {msg}\nuse `?sslpassword=…` or host=db password=... sslmode"
 );
 
 // ── Linear-time bound, adversarial per detector (100K chars) ──────────────
