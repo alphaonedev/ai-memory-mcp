@@ -178,10 +178,12 @@ fn fixture(tag: &str, mode: HttpIdentityMode, enroll_admin: bool, header_trust: 
     let dir = scratch(tag);
     let registry = Arc::new(EnrolledAgentKeys::empty());
     if enroll_admin {
-        registry.install(std::collections::HashMap::from([(
-            api_key_sha256_hex(ADMIN_TOKEN),
-            ADMIN.to_string(),
-        )]));
+        registry.mutate(|m| {
+            *m = std::collections::HashMap::from([(
+                api_key_sha256_hex(ADMIN_TOKEN),
+                ADMIN.to_string(),
+            )]);
+        });
     }
     let (state, store) = build_state(&registry, &dir, mode);
     let router = router_for(state.clone(), &registry, mode);
@@ -417,10 +419,10 @@ async fn postgres_claimed_admin_cannot_mint_but_env_principal_can_8535() {
     set_header_trust(false);
     let dir = scratch("pg");
     let registry = Arc::new(EnrolledAgentKeys::empty());
-    registry.install(std::collections::HashMap::from([(
-        api_key_sha256_hex(ADMIN_TOKEN),
-        ADMIN.to_string(),
-    )]));
+    registry.mutate(|m| {
+        *m =
+            std::collections::HashMap::from([(api_key_sha256_hex(ADMIN_TOKEN), ADMIN.to_string())]);
+    });
     let mode = HttpIdentityMode::Advisory;
     let (mut state, _store) = build_state(&registry, &dir, mode);
     let url =
@@ -463,7 +465,7 @@ async fn postgres_claimed_admin_cannot_mint_but_env_principal_can_8535() {
 
     // #8574: the opt-in is bootstrap only, while this daemon's enrolled registry is empty (bootstrap, or after every key is revoked), so it admits on an
     // EMPTY registry.
-    registry.install(std::collections::HashMap::new());
+    registry.mutate(|m| *m = std::collections::HashMap::new());
     set_header_trust(true);
     let (status, body) = mint(&router, SHARED_KEY, TARGET).await;
     set_header_trust(false);
