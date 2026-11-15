@@ -699,6 +699,129 @@ async fn postgres_an_older_load_cannot_overwrite_a_newer_one_4066() {
     an_older_load_cannot_overwrite_a_newer_one(postgres_fixture(&url).await).await;
 }
 
+// ---------------------------------------------------------------------------
+// Bind: a stale load released after a route-level bind must not drop the key
+// the bind just published (X-3, code F2). The stale read predates the durable
+// row, so publishing it would silently un-enrol a key whose mint response the
+// caller already holds.
+// ---------------------------------------------------------------------------
+
+async fn stale_refresh_released_after_a_bind_keeps_the_new_key(fx: Fixture) {
+    let c = &fx.cast;
+    let (release, stale) = barriered_load(&fx, Release::StaleRows).await;
+
+    let other_token = mint(&fx.router, &c.admin_token, &c.admin, &c.other).await;
+    assert_authenticates(&fx.router, &other_token, "the bind published the new key").await;
+    let armed = fx.registry.len();
+
+    release.send(()).expect("stale load still waiting");
+    let outcome = stale.await.expect("stale refresh task");
+    assert_eq!(
+        outcome,
+        AgentKeyRefresh::Superseded(armed),
+        "a load whose read predates a bind must be discarded"
+    );
+    assert_eq!(fx.registry.len(), armed, "the bind's map stays published");
+    assert_authenticates(
+        &fx.router,
+        &other_token,
+        "a stale load must not drop a key bound after its read",
+    )
+    .await;
+    assert_authenticates(&fx.router, &c.admin_token, "A untouched").await;
+    assert_converged(&fx).await;
+}
+
+#[tokio::test]
+async fn sqlite_stale_refresh_released_after_a_bind_keeps_the_new_key_4066() {
+    let _g = serial().await;
+    stale_refresh_released_after_a_bind_keeps_the_new_key(sqlite_fixture().await).await;
+}
+
+#[cfg(feature = "sal-postgres")]
+#[tokio::test]
+async fn postgres_stale_refresh_released_after_a_bind_keeps_the_new_key_4066() {
+    let Some(url) = postgres_url() else {
+        eprintln!(
+            "skip postgres_stale_refresh_released_after_a_bind_keeps_the_new_key_4066: \
+             AI_MEMORY_TEST_POSTGRES_URL / AI_MEMORY_TEST_PG_URL unset"
+        );
+        return;
+    };
+    let _g = serial().await;
+    stale_refresh_released_after_a_bind_keeps_the_new_key(postgres_fixture(&url).await).await;
+}
+
+// ---------------------------------------------------------------------------
+// Seq arm alone (X-3, code F2): the CLI revoke verb writes the store from
+// outside the daemon, so NO registry mutation runs and the older load's epoch
+// stays current. Only the load sequence can discard the older read; no revoke
+// route and no route follow-up refresh is involved.
+// ---------------------------------------------------------------------------
+
+async fn a_cli_revoke_racing_two_loads_keeps_the_newer_set(fx: Fixture) {
+    let c = &fx.cast;
+    let other_token = mint(&fx.router, &c.admin_token, &c.admin, &c.other).await;
+    let (release, older) = barriered_load(&fx, Release::StaleRows).await;
+
+    ai_memory::cli::agents::run_revoke_api_key(&fx.store, &c.other, true)
+        .await
+        .expect("CLI revoke-api-key");
+    let durable = read_rows(&fx.store).await.expect("durable rows").len();
+    assert_authenticates(
+        &fx.router,
+        &other_token,
+        "the CLI wrote the store only; no load has published it yet",
+    )
+    .await;
+
+    let store = Arc::clone(&fx.store);
+    let newer =
+        refresh_agent_keys(&fx.registry, move || async move { read_rows(&store).await }).await;
+    assert_eq!(
+        newer,
+        AgentKeyRefresh::Installed(durable),
+        "the newer load publishes the CLI revoke"
+    );
+    assert_refused(&fx.router, &other_token, "the newer load narrowed the map").await;
+
+    release.send(()).expect("older load still waiting");
+    let outcome = older.await.expect("older refresh task");
+    assert_eq!(
+        outcome,
+        AgentKeyRefresh::Superseded(durable),
+        "a load that began before the newer published load must be discarded"
+    );
+    assert_refused(
+        &fx.router,
+        &other_token,
+        "the older load must not re-arm the CLI-revoked key",
+    )
+    .await;
+    assert_authenticates(&fx.router, &c.admin_token, "A untouched").await;
+    assert_converged(&fx).await;
+}
+
+#[tokio::test]
+async fn sqlite_a_cli_revoke_racing_two_loads_keeps_the_newer_set_4066() {
+    let _g = serial().await;
+    a_cli_revoke_racing_two_loads_keeps_the_newer_set(sqlite_fixture().await).await;
+}
+
+#[cfg(feature = "sal-postgres")]
+#[tokio::test]
+async fn postgres_a_cli_revoke_racing_two_loads_keeps_the_newer_set_4066() {
+    let Some(url) = postgres_url() else {
+        eprintln!(
+            "skip postgres_a_cli_revoke_racing_two_loads_keeps_the_newer_set_4066: \
+             AI_MEMORY_TEST_POSTGRES_URL / AI_MEMORY_TEST_PG_URL unset"
+        );
+        return;
+    };
+    let _g = serial().await;
+    a_cli_revoke_racing_two_loads_keeps_the_newer_set(postgres_fixture(&url).await).await;
+}
+
 /// Keep the helpers referenced on a `sal`-only leg so they cannot rot.
 #[test]
 fn postgres_url_helper_is_reachable_4066() {

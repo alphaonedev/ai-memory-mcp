@@ -926,4 +926,76 @@ mod tests {
             AuthLevel::Claimed
         );
     }
+
+    fn one_key(token: &str, agent: &str) -> std::collections::HashMap<String, String> {
+        std::iter::once((api_key_sha256_hex(token), agent.to_string())).collect()
+    }
+
+    /// #4066 X-3/F3 — a ticket installs AT MOST ONCE. A second install that
+    /// presents the same (epoch, seq) is a replay of an already-published
+    /// load, so it must be refused even though no mutation and no later load
+    /// intervened. The struct literal is only writable inside this module;
+    /// outside it the ticket is consumed by value and cannot be copied.
+    #[test]
+    fn a_load_ticket_installs_at_most_once_4066() {
+        let registry = EnrolledAgentKeys::empty();
+        let first = registry.begin_load();
+        let replay = LoadTicket {
+            epoch: first.epoch,
+            seq: first.seq,
+        };
+        assert_eq!(
+            registry.install_loaded(first, one_key("tok-a", "agent-a")),
+            LoadInstall::Installed
+        );
+        assert_eq!(
+            registry.install_loaded(replay, one_key("tok-z", "agent-z")),
+            LoadInstall::Superseded,
+            "a replayed ticket must not publish a second set"
+        );
+        let published = registry.snapshot();
+        assert!(published.contains_key(&api_key_sha256_hex("tok-a")));
+        assert!(!published.contains_key(&api_key_sha256_hex("tok-z")));
+    }
+
+    /// #4066 X-4/F4 — the load sequence never wraps. With the counter at
+    /// `u64::MAX` the next ticket is EXHAUSTED: it can neither publish a load
+    /// nor apply a bind's optimistic insert, and the counter stays put rather
+    /// than wrapping to a value every later ticket would compare below.
+    #[test]
+    fn an_exhausted_load_sequence_fails_closed_4066() {
+        let registry = EnrolledAgentKeys::from_map(one_key("tok-a", "agent-a"));
+        registry
+            .next_load_seq
+            .store(u64::MAX, std::sync::atomic::Ordering::Release);
+
+        let load = registry.begin_load();
+        assert_eq!(
+            registry.install_loaded(load, one_key("tok-z", "agent-z")),
+            LoadInstall::Superseded,
+            "an exhausted ticket must not publish a load"
+        );
+        let bind = registry.begin_load();
+        assert_eq!(
+            registry.mutate_if_current(bind, |m| {
+                m.insert(api_key_sha256_hex("tok-y"), "agent-y".to_string());
+            }),
+            None,
+            "an exhausted ticket must not widen the map"
+        );
+        assert_eq!(
+            registry
+                .next_load_seq
+                .load(std::sync::atomic::Ordering::Acquire),
+            u64::MAX,
+            "the sequence must not wrap"
+        );
+        assert_eq!(*registry.snapshot(), one_key("tok-a", "agent-a"));
+        assert_eq!(registry.generation(), 0, "nothing was published");
+
+        // A MUTATION still applies: the revoke direction never depends on the
+        // sequence, so exhaustion cannot keep a revoked key alive.
+        assert!(registry.mutate(|m| m.retain(|_, a| a != "agent-a")));
+        assert!(registry.is_empty());
+    }
 }
