@@ -930,6 +930,7 @@ pub use approval_depth::{
 };
 /// #8444 - durable Agent2Agent Task rows (SQLite SSOT; postgres twin in the store).
 pub mod a2a_tasks;
+pub mod embed_cas;
 pub mod embed_skip;
 /// v1.0.0 #3288 — sqlite half of the bounded, keyset-paged admin export.
 pub mod export_page;
@@ -4285,6 +4286,7 @@ pub fn update_with_expected_version(
     };
     drop(rows);
     drop(stmt);
+    embed_cas::after_update_preread(conn, id);
 
     // v1.0.0 #1834 (pre-ship 3x7) — canonicalize the opt-in `valid_until`
     // patch at this funnel so the close instant persists in the fixed UTC

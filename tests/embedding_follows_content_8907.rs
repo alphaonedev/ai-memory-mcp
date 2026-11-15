@@ -197,12 +197,26 @@ impl Drop for Fixture {
 
 /// The router for `branch` with a stand-in embedder ARMED to fail every
 /// marked text. `None` when a real-postgres branch has no URL.
-#[cfg_attr(not(feature = "sal-postgres"), allow(clippy::unused_async))]
 async fn fixture(label: &str, branch: Branch) -> Option<Fixture> {
+    fixture_with(label, branch, Some(test_hold_hook::Effect::Fail)).await
+}
+
+/// [`fixture`] with the marked-embed `effect`; `None` = the node runs with
+/// NO embedder at all (#9284 X-3).
+#[cfg_attr(not(feature = "sal-postgres"), allow(clippy::unused_async))]
+async fn fixture_with(
+    label: &str,
+    branch: Branch,
+    effect: Option<test_hold_hook::Effect>,
+) -> Option<Fixture> {
     common::permissive_attestation_for_tests();
     let (model, marker) = unique(label);
     // Arm BEFORE the first embed: an unarmed stand-in would hit the network.
-    test_hold_hook::arm_fail(&model, &marker);
+    test_hold_hook::arm_effect(
+        &model,
+        &marker,
+        effect.unwrap_or(test_hold_hook::Effect::Fail),
+    );
     let embedder: Embedder = test_hold_hook::embedder(&model, DIM).expect("stand-in embedder");
     let f = tempfile::Builder::new()
         .prefix("e8907-")
@@ -251,7 +265,7 @@ async fn fixture(label: &str, branch: Branch) -> Option<Fixture> {
     };
     let app_state = AppState {
         db,
-        embedder: Arc::new(Some(embedder)),
+        embedder: Arc::new(effect.map(|_| embedder)),
         vector_index: Arc::new(Mutex::new(None)),
         federation: Arc::new(None),
         tier_config: Arc::new(FeatureTier::Keyword.config()),
@@ -1048,4 +1062,487 @@ fn store_layer_clears_vector_on_document_change_real_postgres_8948() {
         .expect("connect postgres adapter");
         store_rows("real-postgres", &store).await;
     });
+}
+
+// ---------------------------------------------------------------------------
+// #9284 round 1 (NOTICE-FIX-9284-r1): a second writer between the steps.
+// ---------------------------------------------------------------------------
+
+/// How long a held embed sleeps while the second writer commits.
+const HOLD: Duration = Duration::from_secs(3);
+/// The longest wait for the held embed to start.
+const ENTER_TIMEOUT: Duration = Duration::from_secs(120);
+/// The second writer's document body.
+const DOC_B: &str = "the second writer's body about plums";
+/// #9284 X-5 — the receipt reason of an embed task that did not complete.
+const REASON_TASK_INCOMPLETE: &str = "embed task did not complete";
+/// #9284 X-5 — the receipt reason of an embedder that returned no vector.
+const REASON_EMPTY_VECTOR: &str = "embedder returned empty vector";
+
+/// The second writer B on the SQLite file: a NEW content commit plus the
+/// vector of that new document, on its own connection (another process).
+fn sqlite_second_writer(db_path: &Path, id: &str, title: &str, model: &str) -> Vec<f32> {
+    let conn = ai_memory::db::open(db_path).expect("writer B opens its own connection");
+    let (found, _) = ai_memory::db::update(
+        &conn,
+        id,
+        None,
+        Some(DOC_B),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect("writer B content commit");
+    assert!(found, "writer B: the row exists");
+    let vector = expected_vector(model, &embedding_document(title, DOC_B));
+    ai_memory::db::set_embedding(&conn, id, &vector, SEED_SPACE).expect("writer B vector");
+    vector
+}
+
+/// The MCP surface: seed `title` with an unmarked body, return (db, id).
+fn mcp_seed(
+    scratch: &Path,
+    label: &str,
+    title: &str,
+    embedder: &Embedder,
+) -> (PathBuf, rusqlite::Connection, String) {
+    let db_path = scratch.join(format!("{label}.db"));
+    let conn = ai_memory::db::open(&db_path).expect("open db");
+    let seeded = tool_result(&handle_request_with_embedder_for_test(
+        &conn,
+        &db_path,
+        &call(
+            1,
+            "memory_store",
+            &json!({"title": title, "content": OLD_CONTENT, "namespace": NAMESPACE, "tier": "long"}),
+        ),
+        embedder,
+    ));
+    let id = seeded["id"].as_str().expect("seed id").to_string();
+    assert!(
+        ai_memory::db::get_embedding(&conn, &id)
+            .expect("seed vector")
+            .is_some(),
+        "{label}: the seed row must start WITH its own vector"
+    );
+    (db_path, conn, id)
+}
+
+/// The field a stale pre-read sees the other writer change.
+#[derive(Clone, Copy, Debug)]
+enum StaleField {
+    Content,
+    Title,
+}
+
+/// T-1 (X-1) — writer B commits a new document AND its vector between the
+/// update funnel's pre-read and its UPDATE; a priority-only patch computed
+/// from that stale pre-read rewrites the old document (PRE-EXISTING #9285)
+/// and must leave NO vector: B's vector belongs to B's document, not to the
+/// bytes the row now holds (I-1). The compare runs inside the UPDATE.
+#[test]
+fn stale_preread_update_leaves_no_foreign_vector_9284() {
+    let _identity = AgentIdOverride::set(AGENT);
+    let scratch = tempfile::tempdir_in(scratch_root()).expect("scratch");
+    for field in [StaleField::Content, StaleField::Title] {
+        let row = format!("stale pre-read {field:?}");
+        let (model, marker) = unique("t1");
+        test_hold_hook::arm_effect(&model, &marker, test_hold_hook::Effect::Vectors);
+        let embedder = test_hold_hook::embedder(&model, DIM).expect("embedder");
+        let title = format!("t1-9284-{field:?}");
+        let (_db, conn, id) = mcp_seed(scratch.path(), &format!("t1-{field:?}"), &title, &embedder);
+        let foreign = expected_vector(&model, DOC_B);
+        let hook_vector = foreign.clone();
+        ai_memory::storage::embed_cas::arm_after_update_preread(move |c, hook_id| {
+            let sql = match field {
+                StaleField::Content => "UPDATE memories SET content = ?1 WHERE id = ?2",
+                StaleField::Title => "UPDATE memories SET title = ?1 WHERE id = ?2",
+            };
+            c.execute(sql, rusqlite::params![DOC_B, hook_id])
+                .expect("writer B document commit");
+            ai_memory::db::set_embedding(c, hook_id, &hook_vector, SEED_SPACE)
+                .expect("writer B vector");
+        });
+        let (found, _) = ai_memory::db::update(
+            &conn,
+            &id,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(7),
+            None,
+            None,
+            None,
+        )
+        .expect("priority-only update");
+        assert!(found, "{row}: the row exists");
+        let stored = ai_memory::db::get_embedding(&conn, &id).expect("read vector");
+        assert_eq!(
+            stored, None,
+            "{row}: the row holds the pre-read document but kept writer B's vector \
+             (the clear trusted a flag from the stale pre-read) — #9284 X-1"
+        );
+        test_hold_hook::disarm(&model);
+    }
+}
+
+/// T-2 (X-2) MCP over SQLite — A's `memory_update` embeds its document;
+/// while that embed is held, B commits a new document and its vector. A's
+/// vector write must land 0 rows: B's vector is intact and A's receipt
+/// says `failed` / `embedding_failed` (I-1, I-2).
+#[test]
+fn mcp_update_second_writer_keeps_its_vector_9284() {
+    let scratch = tempfile::tempdir_in(scratch_root()).expect("scratch");
+    let (model, marker) = unique("t2mcp");
+    test_hold_hook::arm_effect(&model, &marker, test_hold_hook::Effect::Vectors);
+    let embedder = test_hold_hook::embedder(&model, DIM).expect("embedder");
+    let title = "t2-9284-mcp";
+    let (db_path, conn, id) = {
+        let _identity = AgentIdOverride::set(AGENT);
+        mcp_seed(scratch.path(), "t2-mcp", title, &embedder)
+    };
+    drop(conn);
+    let entered = test_hold_hook::arm(&model, &marker, HOLD);
+    let writer_a = {
+        let (db_path, id, marker, embedder) = (
+            db_path.clone(),
+            id.clone(),
+            marker.clone(),
+            embedder.clone(),
+        );
+        std::thread::spawn(move || {
+            let _identity = AgentIdOverride::set(AGENT);
+            let conn = ai_memory::db::open(&db_path).expect("writer A connection");
+            tool_result(&handle_request_with_embedder_for_test(
+                &conn,
+                &db_path,
+                &call(
+                    2,
+                    "memory_update",
+                    &json!({"id": id, "content": format!("{NEW_CONTENT} {marker}"), "edit_source": "agent"}),
+                ),
+                &embedder,
+            ))
+        })
+    };
+    entered
+        .recv_timeout(ENTER_TIMEOUT)
+        .expect("writer A reached its embed");
+    let vector_b = sqlite_second_writer(&db_path, &id, title, &model);
+    let receipt = writer_a.join().expect("writer A joins");
+    let conn = ai_memory::db::open(&db_path).expect("reopen");
+    assert_eq!(
+        ai_memory::db::get_embedding(&conn, &id).expect("read vector"),
+        Some(vector_b),
+        "mcp: writer A's stale vector write erased or replaced writer B's vector — #9284 X-2"
+    );
+    assert_eq!(receipt["embed_status"], STATUS_FAILED, "mcp: {receipt}");
+    assert_eq!(
+        receipt["embed_status_reason"], REASON_EMBEDDING_FAILED,
+        "mcp: {receipt}"
+    );
+    test_hold_hook::disarm(&model);
+}
+
+impl Fixture {
+    /// Writer B on the branch's own store: a new content commit and its
+    /// vector.
+    async fn second_writer(&self, id: &str, title: &str) -> Vec<f32> {
+        #[cfg(feature = "sal-postgres")]
+        if let Some(store) = &self.pg_store {
+            use ai_memory::store::{CallerContext, UpdatePatch};
+            let ctx = CallerContext::for_agent(AGENT);
+            store
+                .update(
+                    &ctx,
+                    id,
+                    UpdatePatch {
+                        content: Some(DOC_B.to_owned()),
+                        ..UpdatePatch::default()
+                    },
+                )
+                .await
+                .expect("writer B content commit");
+            let vector = expected_vector(&self.model, &embedding_document(title, DOC_B));
+            store
+                .update_embedding(&ctx, id, Some(&vector), SEED_SPACE)
+                .await
+                .expect("writer B vector");
+            return vector;
+        }
+        std::future::ready(sqlite_second_writer(&self.db_path, id, title, &self.model)).await
+    }
+
+    /// Put `vector` on `id` directly (a node with no embedder cannot).
+    async fn put_vector(&self, id: &str, vector: &[f32]) {
+        #[cfg(feature = "sal-postgres")]
+        if let Some(store) = &self.pg_store {
+            store
+                .update_embedding(
+                    &ai_memory::store::CallerContext::for_agent(AGENT),
+                    id,
+                    Some(vector),
+                    SEED_SPACE,
+                )
+                .await
+                .expect("seed vector");
+            return;
+        }
+        let conn = ai_memory::db::open(&self.db_path).expect("reopen");
+        std::future::ready(
+            ai_memory::db::set_embedding(&conn, id, vector, SEED_SPACE).expect("seed vector"),
+        )
+        .await;
+    }
+}
+
+/// T-2 (X-2) over HTTP `PUT` for one branch.
+fn http_second_writer_rows(branch: Branch) {
+    runtime().block_on(async {
+        let row = format!("http {branch:?} second writer");
+        let Some(fx) = fixture_with("t2http", branch, Some(test_hold_hook::Effect::Vectors)).await
+        else {
+            eprintln!("skip {row}: AI_MEMORY_TEST_POSTGRES_URL unset");
+            return;
+        };
+        let title = format!("t2-9284-{branch:?}");
+        let id = seed(&fx, &title, OLD_CONTENT).await;
+        let entered = test_hold_hook::arm(&fx.model, &fx.marker, HOLD);
+        let put = request(
+            "PUT",
+            &format!("/api/v1/memories/{id}"),
+            &json!({"content": format!("{NEW_CONTENT} {}", fx.marker), "agent_id": AGENT}),
+        );
+        let writer_a = tokio::spawn(send(fx.router.clone(), put));
+        entered
+            .recv_timeout(ENTER_TIMEOUT)
+            .expect("writer A reached its embed");
+        let vector_b = fx.second_writer(&id, &title).await;
+        let (status, receipt) = writer_a.await.expect("writer A joins");
+        assert!(status.is_success(), "{row}: {status} {receipt}");
+        assert_eq!(
+            fx.stored(&id).await,
+            Some(vector_b),
+            "{row}: writer A's stale vector write erased or replaced writer B's vector — #9284 X-2"
+        );
+        assert_eq!(receipt["embed_status"], STATUS_FAILED, "{row}: {receipt}");
+        assert_eq!(
+            receipt["embed_status_reason"], REASON_EMBEDDING_FAILED,
+            "{row}: {receipt}"
+        );
+    });
+}
+
+#[test]
+fn http_update_second_writer_keeps_its_vector_sqlite_9284() {
+    http_second_writer_rows(Branch::Sqlite);
+}
+
+#[cfg(feature = "sal")]
+#[test]
+fn http_update_second_writer_keeps_its_vector_postgres_branch_9284() {
+    http_second_writer_rows(Branch::FakePg);
+}
+
+#[cfg(feature = "sal-postgres")]
+#[test]
+fn http_update_second_writer_keeps_its_vector_real_postgres_9284() {
+    http_second_writer_rows(Branch::RealPg);
+}
+
+/// The HTTP write a T-3 row drives.
+#[derive(Clone, Copy, Debug)]
+enum FailureWrite {
+    Create,
+    Put,
+}
+
+/// T-3 (X-5) — one row per failure mode, the exact reason each.
+fn failure_reason_rows(branch: Branch) {
+    use test_hold_hook::Effect;
+    runtime().block_on(async {
+        let rows: [(Effect, FailureWrite, &str, &str); 4] = [
+            (
+                Effect::Panic,
+                FailureWrite::Create,
+                STATUS_FAILED,
+                REASON_TASK_INCOMPLETE,
+            ),
+            (
+                Effect::Panic,
+                FailureWrite::Put,
+                STATUS_FAILED,
+                REASON_TASK_INCOMPLETE,
+            ),
+            (
+                Effect::EmptyVector,
+                FailureWrite::Create,
+                STATUS_FAILED,
+                REASON_EMPTY_VECTOR,
+            ),
+            (
+                Effect::EmptyVector,
+                FailureWrite::Put,
+                STATUS_FAILED,
+                REASON_EMPTY_VECTOR,
+            ),
+        ];
+        for (effect, write, status_word, reason) in rows {
+            let row = format!("reason {branch:?} {effect:?} {write:?}");
+            // The fake-postgres branch has no create (501, see http_rows).
+            #[cfg(feature = "sal")]
+            if matches!((branch, write), (Branch::FakePg, FailureWrite::Create)) {
+                continue;
+            }
+            let Some(fx) = fixture_with("t3", branch, Some(effect)).await else {
+                eprintln!("skip {row}: AI_MEMORY_TEST_POSTGRES_URL unset");
+                return;
+            };
+            let title = format!("t3-9284-{effect:?}-{write:?}");
+            let content = format!("{NEW_CONTENT} {}", fx.marker);
+            let (status, receipt, id) = match write {
+                FailureWrite::Create => {
+                    let (status, receipt) = send(
+                        fx.router.clone(),
+                        request("POST", "/api/v1/memories", &memory_body(&title, &content)),
+                    )
+                    .await;
+                    let id = receipt["id"].as_str().unwrap_or_default().to_string();
+                    (status, receipt, id)
+                }
+                FailureWrite::Put => {
+                    let id = seed(&fx, &title, OLD_CONTENT).await;
+                    let (status, receipt) = send(
+                        fx.router.clone(),
+                        request(
+                            "PUT",
+                            &format!("/api/v1/memories/{id}"),
+                            &json!({"content": content, "agent_id": AGENT}),
+                        ),
+                    )
+                    .await;
+                    (status, receipt, id)
+                }
+            };
+            assert!(status.is_success(), "{row}: {status} {receipt}");
+            assert_eq!(fx.stored(&id).await, None, "{row}: a vector was stored");
+            assert_eq!(receipt["embed_status"], status_word, "{row}: {receipt}");
+            assert_eq!(receipt["embed_status_reason"], reason, "{row}: {receipt}");
+        }
+
+        // Oversize: the document exceeds the embed cap (create).
+        #[cfg(feature = "sal")]
+        let oversize_runs = !matches!(branch, Branch::FakePg);
+        #[cfg(not(feature = "sal"))]
+        let oversize_runs = true;
+        if oversize_runs {
+            let row = format!("reason {branch:?} oversize create");
+            let Some(fx) = fixture_with("t3big", branch, Some(Effect::Vectors)).await else {
+                eprintln!("skip {row}: AI_MEMORY_TEST_POSTGRES_URL unset");
+                return;
+            };
+            let title = "t3-9284-oversize";
+            let content = "x".repeat(ai_memory::embeddings::EMBED_MAX_BYTES + 1);
+            let doc_len = embedding_document(title, &content).len();
+            let (status, receipt) = send(
+                fx.router.clone(),
+                request("POST", "/api/v1/memories", &memory_body(title, &content)),
+            )
+            .await;
+            assert!(status.is_success(), "{row}: {status}");
+            let id = receipt["id"].as_str().expect("id").to_string();
+            assert_eq!(fx.stored(&id).await, None, "{row}: a vector was stored");
+            assert_eq!(receipt["embed_status"], STATUS_SKIPPED, "{row}");
+            assert_eq!(
+                receipt["embed_status_reason"],
+                format!(
+                    "content {doc_len} bytes exceeds embed cap {} bytes",
+                    ai_memory::embeddings::EMBED_MAX_BYTES
+                ),
+                "{row}"
+            );
+        }
+    });
+}
+
+#[test]
+fn http_failure_reasons_are_exact_sqlite_9284() {
+    failure_reason_rows(Branch::Sqlite);
+}
+
+#[cfg(feature = "sal")]
+#[test]
+fn http_failure_reasons_are_exact_postgres_branch_9284() {
+    failure_reason_rows(Branch::FakePg);
+}
+
+#[cfg(feature = "sal-postgres")]
+#[test]
+fn http_failure_reasons_are_exact_real_postgres_9284() {
+    failure_reason_rows(Branch::RealPg);
+}
+
+/// T-3 (X-3) — a node with NO embedder re-stores over a live row with a
+/// new body: the old vector is cleared and the receipt must say so with
+/// `skipped` / `no embedder configured` (docs/API_REFERENCE.md create
+/// receipt rule).
+fn no_embedder_upsert_rows(branch: Branch) {
+    runtime().block_on(async {
+        let row = format!("no-embedder upsert {branch:?}");
+        let Some(fx) = fixture_with("t3none", branch, None).await else {
+            eprintln!("skip {row}: AI_MEMORY_TEST_POSTGRES_URL unset");
+            return;
+        };
+        let title = format!("t3-9284-none-{branch:?}");
+        let (status, created) = send(
+            fx.router.clone(),
+            request(
+                "POST",
+                "/api/v1/memories",
+                &memory_body(&title, OLD_CONTENT),
+            ),
+        )
+        .await;
+        assert!(status.is_success(), "{row}: {status} {created}");
+        let id = created["id"].as_str().expect("id").to_string();
+        let old = expected_vector(&fx.model, &embedding_document(&title, OLD_CONTENT));
+        fx.put_vector(&id, &old).await;
+        let mut body = memory_body(&title, NEW_CONTENT);
+        body["on_conflict"] = json!("merge");
+        body["force"] = json!(true);
+        let (status, receipt) = send(
+            fx.router.clone(),
+            request("POST", "/api/v1/memories", &body),
+        )
+        .await;
+        assert!(status.is_success(), "{row}: {status} {receipt}");
+        assert_eq!(
+            receipt["id"].as_str(),
+            Some(id.as_str()),
+            "{row}: {receipt}"
+        );
+        assert_eq!(fx.stored(&id).await, None, "{row}: the old vector stayed");
+        assert_eq!(receipt["embed_status"], STATUS_SKIPPED, "{row}: {receipt}");
+        assert_eq!(
+            receipt["embed_status_reason"], REASON_NO_EMBEDDER,
+            "{row}: {receipt}"
+        );
+    });
+}
+
+#[test]
+fn http_create_upsert_without_embedder_reports_skipped_sqlite_9284() {
+    no_embedder_upsert_rows(Branch::Sqlite);
+}
+
+#[cfg(feature = "sal-postgres")]
+#[test]
+fn http_create_upsert_without_embedder_reports_skipped_real_postgres_9284() {
+    no_embedder_upsert_rows(Branch::RealPg);
 }
