@@ -355,14 +355,17 @@ class LedgerCase(unittest.TestCase):
             self.addCleanup(lambda: hasattr(cert, "utc_today") and delattr(cert, "utc_today"))
         cert.utc_today = lambda: RUNNER_TODAY
 
-    def use_real_clock(self):
+    def use_real_clock(self, today=None):
         """W-4 (#9321): the ONE mechanism for a cell that judges the real repository range or
         a record dated from the real calendar. The gate's real clock is read once here and held
         for the cell, so a midnight rollover between the read and the judgement cannot change
         the date the cell computed from. Returns that UTC date. Never loosens the gate: the
         ceiling is still today plus LEDGER_DATE_SKEW_DAYS. A pinned clock stays for synthetic
-        cells, whose dates derive from RUNNER_TODAY."""
-        today = REAL_UTC_TODAY()
+        cells, whose dates derive from RUNNER_TODAY. A cell that computes dates from the
+        calendar reads REAL_UTC_TODAY() once itself and passes that TODAY, so the pin and the
+        dates share one read and the cell still fails if this helper is re-pinned."""
+        if today is None:
+            today = REAL_UTC_TODAY()
         cert.utc_today = lambda: today
         return today
 
@@ -1560,7 +1563,9 @@ class OptionBRegion(LedgerCase):
         """W-4 (#9321, umbrella #8185): D-3's form (release-shaped base, one join line feed,
         the marker, one record) whose record is dated the real UTC today. A truthful record is
         dated today, so the judgement must not depend on the pinned test clock."""
-        today = self.use_real_clock().isoformat()
+        today = REAL_UTC_TODAY()
+        self.use_real_clock(today)
+        today = today.isoformat()
         s = self.scene("VOID", base_doc=release_shaped())
         head = on_release(s.doc, record(today, path_item(MOD_RS)))
         ok, out = s.judge(self.wire_and_doc(s, head))
@@ -1569,7 +1574,9 @@ class OptionBRegion(LedgerCase):
     def judge_dated(self, offset_days):
         """D-3's form with one record dated the real today plus OFFSET_DAYS, under the real
         clock. Returns (ok, out, head_doc, day)."""
-        day = (self.use_real_clock() + datetime.timedelta(days=offset_days)).isoformat()
+        today = REAL_UTC_TODAY()
+        self.use_real_clock(today)
+        day = (today + datetime.timedelta(days=offset_days)).isoformat()
         s = self.scene("VOID", base_doc=release_shaped())
         head = on_release(s.doc, record(day, path_item(MOD_RS)))
         ok, out = s.judge(self.wire_and_doc(s, head))
