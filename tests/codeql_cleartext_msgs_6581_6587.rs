@@ -686,7 +686,7 @@ fn needle_is_secret(needle: &str) -> bool {
     let lower = needle.to_ascii_lowercase();
     let marked = LEAK_CANARY_MARKERS.iter().any(|m| lower.contains(m));
     let kinds = classify(needle);
-    let literal_or_const = kinds.iter().any(|&k| k == Kind::Literal)
+    let literal_or_const = kinds.contains(&Kind::Literal)
         || needle
             .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
             .any(is_constant_name);
@@ -769,7 +769,7 @@ fn secret_binding_findings(rel: &str, inv: &Invocation, out: &mut Vec<String>) {
     }
 }
 
-/// `true` for a SCREAMING_CASE identifier: a constant, whose value is in
+/// `true` for a `SCREAMING_CASE` identifier: a constant, whose value is in
 /// the source and so is never a runtime secret.
 fn is_constant_name(id: &str) -> bool {
     id.bytes().any(|c| c.is_ascii_uppercase())
@@ -1331,10 +1331,8 @@ fn scan_bytes(rel: &str, bytes: &[u8], secret_bindings: bool) -> Vec<String> {
     match std::str::from_utf8(bytes) {
         Ok(src) => scan_text(rel, src, secret_bindings),
         Err(e) => {
-            let line = 1 + bytes[..e.valid_up_to()]
-                .iter()
-                .filter(|&&c| c == b'\n')
-                .count();
+            // One more line than newlines before the bad byte.
+            let line = bytes[..e.valid_up_to()].split(|&c| c == b'\n').count();
             vec![format!("{rel}:{line}: file is not UTF-8 (fail closed)")]
         }
     }
@@ -1747,7 +1745,7 @@ const PROBE_ROWS: &[ProbeRow] = &[
     ProbeRow {
         id: "chain field names the chain",
         rel: "src/cli/agents.rs",
-        src: r#"assert_eq!(cred.uid, 7);"#,
+        src: r"assert_eq!(cred.uid, 7);",
         want: &[],
     },
     ProbeRow {
@@ -1783,7 +1781,7 @@ const PROBE_ROWS: &[ProbeRow] = &[
     ProbeRow {
         id: "chain secret getter under a clean parent",
         rel: "src/cli/agents.rs",
-        src: r#"assert_eq!(parsed.credential(), other);"#,
+        src: r"assert_eq!(parsed.credential(), other);",
         want: &["src/cli/agents.rs:1: `assert_eq!` operand renders secret-valued `credential`"],
     },
     ProbeRow {
