@@ -1829,14 +1829,17 @@ class TrackedDocFrozenReason9303(LedgerCase):
         # The line the old gate named: honest release bytes with I4-shaped emphasis.
         self.assertEqual(ledger_error(tracked_doc()), (I4_EMPHASIS, TRACKED_I4_LINE))
 
-    def tracked_scene(self):
+    def tracked_scene(self, today=None):
+        if today is not None:
+            self.use_real_clock(today)  # the cell's one read, held per subtest
         return self.scene("VOID", base_doc=tracked_doc())
 
     def test_9303_tracked_rows_with_record_refused_as_frozen_region(self):
-        day = tracked_day(self.use_real_clock())
+        today = self.use_real_clock()
+        day = tracked_day(today)
         for name, edit, line in TRACKED_ROWS:
             with self.subTest(row=name):
-                s = self.tracked_scene()
+                s = self.tracked_scene(today)
                 head = tracked_edit(edit) + record(day, path_item(MOD_RS))
                 ok, out = s.judge(self.wire_and_doc(s, head))
                 self.assert_region_refused(ok, out, line)
@@ -1859,7 +1862,7 @@ class TrackedDocFrozenReason9303(LedgerCase):
 
     # guard cell: green on base c12faaf08909ce250a78040ea10f91f8b9cae56f
     def test_9303_tracked_unchanged_region_exact_record_passes(self):
-        judge_tracked_exact_record(self, tracked_doc())
+        judge_tracked_exact_record(self, tracked_doc(), self.use_real_clock())
 
     # guard cell: green on base c12faaf08909ce250a78040ea10f91f8b9cae56f
     def test_9303_tracked_two_markers_keep_their_reason(self):
@@ -1917,6 +1920,11 @@ class TrackedDocFrozenReason9303(LedgerCase):
 # .local-runs/, never the tracked file) and hold the tracked-doc cells to the invariant.
 TRACKED_FIRST_RECORD = "### Amendment 2026-11-14"
 APPEND_COUNTS = (1, 2, 3)
+ONE_DAY = datetime.timedelta(days=1)
+# Day offsets from the cell's pinned today for a run of later records: non-decreasing, not all
+# the same day, and never past today plus LEDGER_DATE_SKEW_DAYS (1). Run COUNT takes the first
+# COUNT offsets, so 2 and 3 appended records end one day after the pinned today.
+APPEND_RUN_OFFSETS = (0, 1, 1)
 AMENDMENT_PREFIX = "### Amendment "
 
 
@@ -1931,9 +1939,15 @@ def tracked_last_day():
     return tracked_record_days(tracked_doc())[-1]
 
 
-def tracked_with_appended(count, day):
-    """A copy of the tracked doc text with COUNT later records dated DAY (ISO string)."""
-    return tracked_doc() + "".join(record(day, path_item(MOD_RS)) for _ in range(count))
+def append_run_days(today, count):
+    """ISO dates of COUNT records appended after the tracked ledger: today plus the first COUNT
+    APPEND_RUN_OFFSETS days. TODAY is never earlier than the tracked last date plus one day."""
+    return [(today + datetime.timedelta(days=n)).isoformat() for n in APPEND_RUN_OFFSETS[:count]]
+
+
+def tracked_with_appended(days):
+    """A copy of the tracked doc text with one later record per ISO date in DAYS."""
+    return tracked_doc() + "".join(record(day, path_item(MOD_RS)) for day in days)
 
 
 def tracked_day(today):
@@ -1953,9 +1967,11 @@ def assert_tracked_ledger_shape(case, blob):
     case.assertEqual(days, sorted(days), "record dates must not decrease")
 
 
-def judge_tracked_exact_record(case, doc):
-    """Judge one more record, dated tracked_day(), appended to DOC (a tracked-doc copy)."""
-    day = tracked_day(case.use_real_clock())
+def judge_tracked_exact_record(case, doc, today):
+    """Judge one more record, dated tracked_day(), appended to DOC (a tracked-doc copy) under
+    the clock TODAY, which the caller read once for the cell."""
+    case.use_real_clock(today)
+    day = tracked_day(today)
     s = case.scene("VOID", base_doc=doc)
     head = doc + record(day, path_item(MOD_RS))
     ok, out = s.judge(case.wire_and_doc(s, head))
@@ -1966,24 +1982,27 @@ class TrackedLedgerAppend9338(LedgerCase):
     """#9338: every valid append to the tracked ledger keeps the tracked-doc cells green; every
     invalid ledger is refused with the exact reason."""
 
-    def append_day(self):
-        return tracked_day(self.use_real_clock())
+    def append_today(self):
+        """The cell's one clock read: the real UTC day, or the day after the tracked ledger's
+        last record when the real day is not yet past it. Pinned once for the cell."""
+        return self.use_real_clock(max(tracked_last_day() + ONE_DAY, REAL_UTC_TODAY()))
 
     def test_9338_append_one_two_three_records_keeps_the_ledger_cells_green(self):
-        day = self.append_day()
+        today = self.append_today()
         for count in APPEND_COUNTS:
             with self.subTest(appended=count):
-                doc = tracked_with_appended(count, day)
+                doc = tracked_with_appended(append_run_days(today, count))
                 assert_tracked_ledger_shape(self, doc.encode("utf-8"))
-                judge_tracked_exact_record(self, doc)
+                judge_tracked_exact_record(self, doc, today)
 
     def test_9338_decreasing_date_is_refused_with_the_exact_reason(self):
-        day = self.append_day()
-        last = datetime.date.fromisoformat(day)
-        earlier = (last - datetime.timedelta(days=1)).isoformat()
+        today = self.append_today()
         for count in APPEND_COUNTS:
             with self.subTest(appended=count):
-                base = tracked_with_appended(count, day)
+                days = append_run_days(today, count)
+                day = days[-1]
+                earlier = (datetime.date.fromisoformat(day) - ONE_DAY).isoformat()
+                base = tracked_with_appended(days)
                 s = self.scene("VOID", base_doc=base)
                 head = base + record(earlier, path_item(MOD_RS))
                 ok, out = s.judge(self.wire_and_doc(s, head))
@@ -1994,10 +2013,10 @@ class TrackedLedgerAppend9338(LedgerCase):
                             f"### Amendment {earlier}"))))
 
     def test_9338_changed_first_record_is_refused_with_the_exact_reason(self):
-        day = self.append_day()
+        today = self.append_today()
         for count in APPEND_COUNTS:
             with self.subTest(appended=count):
-                base = tracked_with_appended(count, day)
+                base = tracked_with_appended(append_run_days(today, count))
                 s = self.scene("VOID", base_doc=base)
                 head = base.replace(TRACKED_FIRST_RECORD, AMENDMENT_PREFIX + DAY, 1)
                 ok, out = s.judge(self.wire_and_doc(s, head))
