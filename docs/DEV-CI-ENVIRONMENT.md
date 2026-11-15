@@ -100,18 +100,56 @@ which runs `scripts/ci/prune_runner_tmp.py` with these rules:
   symlink target) is older than one day (`MAX_AGE_SECS`) are removed. An old
   directory goes whole, whatever its children's mtimes. A symlink is unlinked
   and never followed, so a sibling `runner-N` directory is never touched.
-- It refuses, with a non-zero exit, nothing deleted and the reason on stderr,
-  when `TMPDIR` is unset, empty, relative, missing, not a directory, a symlink,
-  not owned by the current user, equal to `/`, `/tmp`, the home directory or the
-  workspace, or not strictly below an allowed root (`ALLOWED_ROOTS` in the
-  script, plus `--root`). A refusal fails the job, so a misconfigured runner is
-  seen.
-- A failure on one entry (permission, vanished, busy) is counted and printed
-  but does not fail the job: the step exits 0 with
-  `pruned=<n> kept=<n> failed=<n> freed_bytes=<n>`. `--dry-run` lists what
-  would go and deletes nothing.
-- It needs Python 3.12+ on the runner. The test families that leak the files
-  are fixed separately; the prune treats the symptom.
+- TMPDIR is proven, by file identity (device and inode of the opened
+  directory, never by path text), to be `<runner root>/runner-<digits>`: the
+  last component must match `runner-<digits>` and the directory's parent must be
+  one of the confirmed runner roots in `ALLOWED_ROOTS` (each a named constant
+  in the script with the run that confirmed it; there is no override flag). The
+  directory is opened once with `O_NOFOLLOW` and every check and every removal
+  goes through that one descriptor. No f1 root is in the table until its
+  `prune-facts:` line is quoted, so on f1 the step refuses visibly.
+- Removal is an iterative, descriptor-relative walk (no recursion, no
+  `shutil.rmtree`), one open directory at a time, with an identity re-check
+  right before each entry is entered. A tree deeper than `MAX_TREE_DEPTH` or
+  larger than `MAX_TREE_ENTRIES` is one counted failure and stays in place. An
+  entry on another device (a mount point) is skipped, reported and never
+  entered (`skipped=<n>`).
+- Every input it cannot prove ends in a named refusal with nothing deleted. A
+  refusal prints a `::warning` annotation with the escaped reason (and the same
+  line on stderr) and the step still exits 0: it does not fail the job and does
+  not skip the steps after it, because a housekeeping step must never take down
+  the required checks. The reasons, each pinned by a test against the code:
+
+- refusal: `python <found> is older than <wanted>`
+- refusal: `this platform lacks descriptor-relative file calls`
+- refusal: `allowed root is not an absolute path: <root>`
+- refusal: `allowed root is '/'`
+- refusal: `TMPDIR is unset`
+- refusal: `TMPDIR is empty`
+- refusal: `TMPDIR is not an absolute path: <path>`
+- refusal: `TMPDIR does not exist: <path> (<why>)`
+- refusal: `TMPDIR is a symlink: <path>`
+- refusal: `TMPDIR is not a directory: <path>`
+- refusal: `TMPDIR cannot be opened: <path> (<why>)`
+- refusal: `TMPDIR changed while it was opened: <path>`
+- refusal: `TMPDIR is a forbidden path: <path>`
+- refusal: `TMPDIR is not owned by the current user: <path>`
+- refusal: `TMPDIR is not named runner-<digits>: <name>`
+- refusal: `TMPDIR is outside the allowed roots <roots>: <path>`
+- refusal: `TMPDIR contains the home directory or the workspace: <path>`
+
+- A failure on one entry (permission, vanished, busy, over a bound) is counted
+  and printed but does not fail the job: the step exits 0 with
+  `pruned=<n> kept=<n> failed=<n> freed_bytes=<n> skipped=<n>`. An unexpected
+  internal error (a defect, not a misconfiguration) names the error, prints
+  the summary with `internal_error=1` and exits 1, so the job goes red.
+  `--dry-run` lists what would go and deletes nothing.
+- Every printed name, path and message is escaped (control characters,
+  backslash, `%` and `::`), so a file name cannot inject a log line or a
+  workflow command.
+- It needs Python 3.12+ on the runner; an older interpreter ends in the
+  `python` refusal before anything newer is imported. The test families that
+  leak the files are fixed separately; the prune treats the symptom.
 
 ---
 

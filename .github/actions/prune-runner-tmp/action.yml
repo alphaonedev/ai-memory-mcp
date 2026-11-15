@@ -4,10 +4,12 @@ description: >-
   'self-hosted'). Removes direct entries of this runner's own TMPDIR whose mtime
   is older than one day (scripts/ci/prune_runner_tmp.py); never follows a
   symlink and never touches another runner's directory. A refusal (TMPDIR
-  unset, relative, a symlink, not owned by the user, outside the allowed
-  roots) fails the job so a misconfigured runner is seen. A per-entry removal
-  failure does not fail the job: the step exits 0 and prints
-  pruned=<n> kept=<n> failed=<n> freed_bytes=<n>.
+  unset, relative, a symlink, not owned by the user, not named runner-<digits>,
+  outside the confirmed runner roots) prints a ::warning annotation with the
+  reason, deletes nothing and does not fail the job or skip the steps after it
+  (ruling f23a9ae4). A per-entry removal failure does not fail the job: the step
+  exits 0 and prints pruned=<n> kept=<n> failed=<n> freed_bytes=<n> skipped=<n>.
+  An unexpected error fails the job.
 runs:
   using: composite
   steps:
