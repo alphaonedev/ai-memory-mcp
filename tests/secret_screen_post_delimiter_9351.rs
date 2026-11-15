@@ -76,13 +76,22 @@ fn assert_refused_exactly(rows: &[(String, String)]) {
             ));
         }
     }
-    assert!(misses.is_empty(), "9351: {} rows:\n{}", misses.len(), misses.join("\n"));
+    assert!(
+        misses.is_empty(),
+        "9351: {} rows:\n{}",
+        misses.len(),
+        misses.join("\n")
+    );
 }
 
 fn assert_accepted(inputs: &[&str]) {
     set_screen_mode(SecretScreenMode::Refuse);
     for input in inputs {
-        assert_eq!(kinds_of(input), Vec::<&str>::new(), "9351: {input:?} stays accepted");
+        assert_eq!(
+            kinds_of(input),
+            Vec::<&str>::new(),
+            "9351: {input:?} stays accepted"
+        );
         assert!(
             validate::validate_content(input).is_ok(),
             "9351: {input:?} passes the caller validator"
@@ -110,13 +119,19 @@ fn env_lookup_tail_after_closer_is_refused_9351() {
             format!("$ENV{{X}}{SECRET}"),
             format!("std::env::var(\"X\")??{SECRET}"),
         ] {
-            rows.push((format!("password{op}{value}{TAIL}{NEXT_LINE}"), token_masked(op)));
+            rows.push((
+                format!("password{op}{value}{TAIL}{NEXT_LINE}"),
+                token_masked(op),
+            ));
         }
         for value in [
             format!("os.environ[{SECRET}"),
             format!("getenv(\"X\" {SECRET})"),
         ] {
-            rows.push((format!("password{op}{value}{TAIL}{NEXT_LINE}"), line_masked(op)));
+            rows.push((
+                format!("password{op}{value}{TAIL}{NEXT_LINE}"),
+                line_masked(op),
+            ));
         }
         rows.push((
             format!("password{op}os.environ.get(\"X\") or \"{SECRET}\"{NEXT_LINE}"),

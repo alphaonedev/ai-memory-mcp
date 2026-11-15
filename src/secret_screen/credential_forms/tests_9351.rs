@@ -115,7 +115,11 @@ fn env_lookup_every_prefix_tail_form_is_a_finding_9351() {
                     format!("{p}\"{ENV_NAME}\"{c}{SECRET}"),
                     &token_masked,
                 ),
-                ("nested_open_bracket", format!("{p}[{SECRET}]{c}"), &token_masked),
+                (
+                    "nested_open_bracket",
+                    format!("{p}[{SECRET}]{c}"),
+                    &token_masked,
+                ),
             ];
             if !c.is_empty() {
                 forms.push(("no_closer", format!("{p}{SECRET}"), &line_masked));
@@ -264,9 +268,7 @@ fn type_annotation_every_name_bracket_form_is_a_finding_9351() {
                 ),
                 (
                     "mismatched_closer",
-                    format!(
-                        "password: {t}{o}{ENV_NAME}{wrong}{SECRET}{SAME_LINE_TAIL}{NEXT_LINE}"
-                    ),
+                    format!("password: {t}{o}{ENV_NAME}{wrong}{SECRET}{SAME_LINE_TAIL}{NEXT_LINE}"),
                     &line_masked,
                 ),
                 (
@@ -346,10 +348,16 @@ fn type_annotation_100k_and_nesting_bounded_9351() {
         misses.push(format!("100k_well_formed: kinds {kinds:?}"));
     }
     let cases = [
-        ("100k_unclosed", format!("password: Option<{args}X{NEXT_LINE}")),
+        (
+            "100k_unclosed",
+            format!("password: Option<{args}X{NEXT_LINE}"),
+        ),
         (
             "100k_open_brackets",
-            format!("password: Option{}{NEXT_LINE}", "<".repeat(BOUND_INPUT_BYTES)),
+            format!(
+                "password: Option{}{NEXT_LINE}",
+                "<".repeat(BOUND_INPUT_BYTES)
+            ),
         ),
         (
             "nesting_beyond_cap",

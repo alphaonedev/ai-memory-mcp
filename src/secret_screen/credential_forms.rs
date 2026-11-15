@@ -113,11 +113,14 @@ fn at_word_start(bytes: &[u8], at: usize) -> bool {
 /// Named placeholder shapes accepted as a value: the redaction placeholder
 /// itself (so a stored masked row re-screens clean), `<…>`, `${…}`,
 /// `$IDENT`, and a run of at least [`MIN_MASK_RUN`] `*`.
+///
+/// Each shape is judged over the WHOLE value (#9351): `<…>` holds no inner
+/// `<` / `>`, and `${…}` is exactly `${IDENT}`.
 fn is_placeholder_value(v: &str) -> bool {
     let b = v.as_bytes();
     v == REDACTION_PLACEHOLDER
-        || (b.len() >= 2 && b[0] == b'<' && b[b.len() - 1] == b'>')
-        || (v.starts_with("${") && v.ends_with('}'))
+        || shape_grammar::is_angle_placeholder(v)
+        || shape_grammar::is_brace_reference(v)
         || is_env_reference(v)
         || (b.len() >= MIN_MASK_RUN && b.iter().all(|&c| c == MASK_CHAR))
 }
@@ -242,10 +245,12 @@ const ANNOTATION_TYPE_NAMES: [&str; 16] = [
 /// Rust reference-type sigil: `password: &str`, `password: &'a str`.
 const REFERENCE_TYPE_SIGIL: u8 = b'&';
 /// Prefixes of an unquoted value that reads the secret from the environment
-/// at run time instead of holding it. Matched with `starts_with`, so every
-/// entry ends in the delimiter its lookup grammar requires (`[` `(` `.`
-/// `{`), never in an identifier byte: a bare `os.environ` would accept
-/// `os.environ_<secret>` (#8855). Pinned by the child test module.
+/// at run time instead of holding it. Every entry ends in the delimiter its
+/// lookup grammar requires (`[` `(` `.` `{`), never in an identifier byte: a
+/// bare `os.environ` would accept `os.environ_<secret>` (#8855). An entry
+/// only names the HEAD of the grammar [`shape_grammar::env_lookup_shape`]
+/// walks over the whole value (#9351); a head match alone accepts nothing.
+/// Pinned by the child test modules.
 const ENV_LOOKUP_PREFIXES: [&str; 12] = [
     "os.environ[",
     "os.environ.get(",
@@ -272,13 +277,6 @@ fn is_format_hole(v: &str) -> bool {
         .is_some_and(|name| name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_'))
 }
 
-/// True when an unquoted value after `:` (not led by
-/// [`REFERENCE_TYPE_SIGIL`]) is a type annotation shape.
-fn is_type_annotation(v: &str) -> bool {
-    let base = v.split(['<', '[']).next().unwrap_or(v);
-    ANNOTATION_TYPE_NAMES.contains(&base)
-}
-
 /// The markdown code-span delimiter.
 const CODE_SPAN_DELIMITER: char = '`';
 /// The lifetime marker of a reference type (`&'a str`).
@@ -298,9 +296,11 @@ fn ident_end(bytes: &[u8], mut at: usize) -> usize {
 }
 
 /// For a value led by [`REFERENCE_TYPE_SIGIL`] at `at`: the end of the type
-/// name when the shape is `&` [`'lifetime` blanks] [`mut` blanks] NAME with
-/// NAME in [`ANNOTATION_TYPE_NAMES`]; `None` for anything else (a credential
-/// such as `&S3cr3t`, or a YAML anchor). Bounded: each byte is read once.
+/// expression when the shape is `&` [`'lifetime` blanks] [`mut` blanks] TYPE
+/// with TYPE a whole [`shape_grammar::walk_type`] expression followed only by
+/// what [`shape_grammar::annotation_suffix_ok`] allows (#9351: `&str.x`,
+/// `&str@x` and `&String<X>x` are not annotations); `None` for anything else
+/// (a credential such as `&S3cr3t`, or a YAML anchor). Each byte is read once.
 fn reference_annotation_end(bytes: &[u8], at: usize) -> Option<usize> {
     let mut k = at + 1;
     if bytes.get(k) == Some(&LIFETIME_SIGIL) {
@@ -318,18 +318,72 @@ fn reference_annotation_end(bytes: &[u8], at: usize) -> Option<usize> {
             k = after;
         }
     }
-    let name_end = ident_end(bytes, k);
-    let name = std::str::from_utf8(&bytes[k..name_end]).ok()?;
-    ANNOTATION_TYPE_NAMES.contains(&name).then_some(name_end)
+    match shape_grammar::walk_type(bytes, k) {
+        shape_grammar::TypeWalk::End(e) if shape_grammar::annotation_suffix_ok(bytes, e) => Some(e),
+        _ => None,
+    }
 }
 
-/// Named non-credential shapes of an UNQUOTED assignment value. A quoted
-/// value is a literal and only [`is_placeholder_value`] applies to it.
+/// Named non-credential literal shapes of an UNQUOTED assignment value. A
+/// quoted value is a literal and only [`is_placeholder_value`] applies to
+/// it; an env lookup is judged by [`shape_grammar::env_lookup_shape`].
 fn is_non_credential_unquoted(v: &str) -> bool {
-    NULL_LITERALS.contains(&v)
-        || ELLIPSIS_PLACEHOLDERS.contains(&v)
-        || is_format_hole(v)
-        || ENV_LOOKUP_PREFIXES.iter().any(|p| v.starts_with(p))
+    NULL_LITERALS.contains(&v) || ELLIPSIS_PLACEHOLDERS.contains(&v) || is_format_hole(v)
+}
+
+/// What the assignment scan does with one value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Judgement {
+    /// A named non-credential shape: nothing is masked.
+    Accept,
+    /// A finding masked from the value start to this byte.
+    Mask(usize),
+}
+
+/// The opener of a `${…}` parameter reference.
+const BRACE_REFERENCE_OPEN: &str = "${";
+
+/// Judge the value at `start..end` (#9351: every shape over the WHOLE
+/// judged value). A finding whose extent the value rule cannot bound (an
+/// env lookup or `${` whose closer never appears, a lookup followed by a
+/// fallback default) is masked to the end of its line; any other finding
+/// is masked over the value.
+fn judge_value(bytes: &[u8], value: &str, start: usize, end: usize, quoted: bool) -> Judgement {
+    let line = || Judgement::Mask(line_content_end(bytes, start).max(end));
+    if holds_password_assignment(bytes, start, end) {
+        return Judgement::Mask(end);
+    }
+    if value.is_empty() || is_placeholder_value(value) {
+        return Judgement::Accept;
+    }
+    if quoted {
+        return Judgement::Mask(end);
+    }
+    match shape_grammar::env_lookup_shape(value) {
+        shape_grammar::EnvShape::Whole => {
+            // A value ending in `;` / `,` ends its statement; only an
+            // open expression can carry a fallback default.
+            let ends_statement = bytes[start..end]
+                .last()
+                .is_some_and(|&c| JUDGED_TRAILERS.contains(&char::from(c)));
+            if !ends_statement && shape_grammar::fallback_follows(bytes, end) {
+                line()
+            } else {
+                Judgement::Accept
+            }
+        }
+        shape_grammar::EnvShape::Broken { unclosed: true } => line(),
+        shape_grammar::EnvShape::Broken { unclosed: false } => Judgement::Mask(end),
+        shape_grammar::EnvShape::NotLookup
+            if value.starts_with(BRACE_REFERENCE_OPEN) && !value.contains('}') =>
+        {
+            line()
+        }
+        shape_grammar::EnvShape::NotLookup if is_non_credential_unquoted(value) => {
+            Judgement::Accept
+        }
+        shape_grammar::EnvShape::NotLookup => Judgement::Mask(end),
+    }
 }
 
 /// An assignment operator at `j`: `:` / `=`, plus the two-byte `:=` and
@@ -487,19 +541,40 @@ fn password_assignment_spans(content: &str) -> Vec<(usize, usize)> {
         let ref_led = is_colon && !quoted && bytes.get(start) == Some(&REFERENCE_TYPE_SIGIL);
         let annotation_end = if ref_led {
             reference_annotation_end(bytes, start)
-        } else if is_colon && !quoted {
-            // The annotation ends at its judged edge, so an initializer
-            // search never starts past a `,` that ends the declaration.
-            // An annotation holding a nested assignment
-            // (`Option<&pwd=X>`) is not an annotation.
-            let judged = judged_value(&content[start..end]);
-            (is_type_annotation(judged) && !holds_password_assignment(bytes, start, end))
-                .then_some(start + judged.len())
+        } else if is_colon && !quoted && !holds_password_assignment(bytes, start, end) {
+            // A whole type expression (#9351): its end is where the walk
+            // stops, so an initializer search never starts past a `,` that
+            // ends the declaration. An annotation holding a nested
+            // assignment (`Option<&pwd=X>`) is not an annotation.
+            match shape_grammar::walk_type(bytes, start) {
+                shape_grammar::TypeWalk::NotType => None,
+                shape_grammar::TypeWalk::End(e)
+                    if shape_grammar::annotation_suffix_ok(bytes, e) =>
+                {
+                    Some(e)
+                }
+                // A complete type then bytes no annotation holds: the
+                // token from the type start is the finding.
+                shape_grammar::TypeWalk::End(e) => {
+                    let mask_end = shape_grammar::token_end(bytes, e).max(end);
+                    spans.push((start, mask_end));
+                    i = mask_end.max(resume).max(i + key_len);
+                    continue;
+                }
+                // Unclosed, mismatched or over-nested: the extent is
+                // unknown, so the line is the finding.
+                shape_grammar::TypeWalk::Broken => {
+                    let mask_end = line_content_end(bytes, start).max(end);
+                    spans.push((start, mask_end));
+                    i = mask_end.max(resume).max(i + key_len);
+                    continue;
+                }
+            }
         } else {
             None
         };
         if ref_led && annotation_end.is_none() {
-            // `&` naming no type: a credential, or a YAML anchor whose
+            // `&` naming no whole type: a credential, or a YAML anchor whose
             // anchored value follows on the same line; mask to the line end.
             end = line_content_end(bytes, start);
             spans.push((start, end));
@@ -528,14 +603,12 @@ fn password_assignment_spans(content: &str) -> Vec<(usize, usize)> {
             judged_value(&content[start..end])
         };
         // A named non-credential shape is accepted only when it holds no
-        // password assignment of its own (#8855); else the whole value is
-        // masked, never the nested secret left behind.
-        let accepted = !holds_password_assignment(bytes, start, end)
-            && (value.is_empty()
-                || is_placeholder_value(value)
-                || (!quoted && is_non_credential_unquoted(value)));
-        if !accepted {
-            spans.push((start, end));
+        // password assignment of its own (#8855) and its grammar matches the
+        // whole value (#9351); else the value (or, for an unbounded shape,
+        // its line) is masked, never the nested secret left behind.
+        if let Judgement::Mask(mask_end) = judge_value(bytes, value, start, end, quoted) {
+            spans.push((start, mask_end));
+            resume = resume.max(mask_end);
         }
         // Never re-scan the value: the cursor only moves forward.
         i = resume.max(i + key_len);
@@ -598,6 +671,8 @@ fn stripe_live_key_spans(content: &str) -> Vec<(usize, usize)> {
     }
     merged
 }
+
+mod shape_grammar;
 
 #[cfg(test)]
 mod tests_9351;
