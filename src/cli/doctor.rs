@@ -5935,7 +5935,8 @@ mod tests {
         );
         assert!(
             !fact(transit, "local_tls_material").contains("enterprise PKI required"),
-            "a singleton (fresh store, no fleet signal) may mint its local certificate"
+            "a singleton (fresh store, no fleet signal) may mint its local certificate: \
+             the local_tls_material fact must not demand enterprise PKI"
         );
     }
 

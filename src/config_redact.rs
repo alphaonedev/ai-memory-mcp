@@ -739,7 +739,7 @@ hmac_secret = "hmac-secret-must-not-leak"
         let redacted = redact_parse_error(&err);
         assert!(
             !redacted.contains("sekrit-must-not-leak"),
-            "the echoed source line"
+            "redact_parse_error must drop the source line the TOML parser echoes"
         );
         // ALLOWED: the position survives, so the operator can still fix it.
         assert!(

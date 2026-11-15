@@ -80,8 +80,21 @@ fn unparseable(url: &str) -> String {
     }
 }
 
+/// `true` when `parsed` is an opaque (`cannot-be-a-base`) URL: the parser
+/// found a `word:` prefix but no authority, so the "scheme" is whatever
+/// text precedes the first `:` and the "path" is everything after it. A
+/// no-scheme `user:pass@host` parses this way with the USERNAME as the
+/// scheme and the password in the path (#8180, #9307 L2). Nothing parsed
+/// from such an input is safe to show, so every renderer sends it to
+/// [`unparseable`], which echoes only a `://`-delimited RFC 3986 scheme
+/// token and otherwise the fixed [`NO_SCHEME`] placeholder.
+fn is_opaque(parsed: &reqwest::Url) -> bool {
+    parsed.cannot_be_a_base()
+}
+
 /// `scheme://host[:port]` — the origin of `url` and nothing else. No
-/// userinfo, no path, no query, no fragment.
+/// userinfo, no path, no query, no fragment. An opaque input (no
+/// authority) renders the [`unparseable`] placeholder.
 ///
 /// Use it for a federation peer, a webhook target, an LLM / embedder base
 /// URL, an MCP forward URL — any URL that reaches a log line, a refusal,
@@ -90,6 +103,7 @@ fn unparseable(url: &str) -> String {
 pub fn url_origin(url: &str) -> String {
     let trimmed = url.trim();
     match reqwest::Url::parse(trimmed) {
+        Ok(parsed) if is_opaque(&parsed) => unparseable(trimmed),
         Ok(parsed) => {
             let host = parsed.host_str().unwrap_or(NO_HOST);
             match parsed.port() {
@@ -113,6 +127,7 @@ pub fn url_origin(url: &str) -> String {
 pub fn url_origin_and_path(url: &str) -> String {
     let trimmed = url.trim();
     match reqwest::Url::parse(trimmed) {
+        Ok(parsed) if is_opaque(&parsed) => unparseable(trimmed),
         Ok(parsed) => {
             let mut out = url_origin(trimmed);
             let path = parsed.path();
@@ -166,6 +181,9 @@ pub(crate) fn store_url_is_ambiguous(url: &str) -> bool {
 /// - A URL whose authority is ambiguous (an unencoded `/`, `?` or `#` in the
 ///   userinfo, #6096) renders `scheme://<redacted-authority>`: the parsed
 ///   host, port and path of such a URL are credential bytes.
+/// - An opaque input (no authority: `user:pass@host`, `word:REST`) renders
+///   the fixed `<no scheme>://<unparseable>` placeholder (#8180, #9307):
+///   the text before its first `:` is not a scheme anyone wrote.
 #[must_use]
 pub fn store_url_display(url: &str) -> String {
     let trimmed = url.trim();
@@ -173,6 +191,7 @@ pub fn store_url_display(url: &str) -> String {
         return trimmed.to_string();
     }
     match reqwest::Url::parse(trimmed) {
+        Ok(parsed) if is_opaque(&parsed) => unparseable(trimmed),
         Ok(parsed) => {
             if store_url_is_ambiguous(trimmed) {
                 return format!("{}://{REDACTED_AUTHORITY}", parsed.scheme());
@@ -471,7 +490,10 @@ mod tests {
             "svc:STORECANARY8180@db.example:5432/mem",
             "<no scheme>://<unparseable>",
         ),
-        ("svc@db.example:STORECANARY8180", "<no scheme>://<unparseable>"),
+        (
+            "svc@db.example:STORECANARY8180",
+            "<no scheme>://<unparseable>",
+        ),
         ("", "<no scheme>://<unparseable>"),
         (" \t \n", "<no scheme>://<unparseable>"),
         (
@@ -492,7 +514,11 @@ mod tests {
                 wrong.push(format!("row {row}: got {rendered:?}, want {expected:?}"));
             }
         }
-        assert!(wrong.is_empty(), "store_url_display edge rows:\n{}", wrong.join("\n"));
+        assert!(
+            wrong.is_empty(),
+            "store_url_display edge rows:\n{}",
+            wrong.join("\n")
+        );
     }
 
     /// #8180 / #9307 X-5 - opaque (cannot-be-a-base) inputs: the parser
