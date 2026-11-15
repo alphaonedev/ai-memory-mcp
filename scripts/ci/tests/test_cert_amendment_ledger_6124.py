@@ -355,6 +355,17 @@ class LedgerCase(unittest.TestCase):
             self.addCleanup(lambda: hasattr(cert, "utc_today") and delattr(cert, "utc_today"))
         cert.utc_today = lambda: RUNNER_TODAY
 
+    def use_real_clock(self):
+        """W-4 (#9321): the ONE mechanism for a cell that judges the real repository range or
+        a record dated from the real calendar. The gate's real clock is read once here and held
+        for the cell, so a midnight rollover between the read and the judgement cannot change
+        the date the cell computed from. Returns that UTC date. Never loosens the gate: the
+        ceiling is still today plus LEDGER_DATE_SKEW_DAYS. A pinned clock stays for synthetic
+        cells, whose dates derive from RUNNER_TODAY."""
+        today = REAL_UTC_TODAY()
+        cert.utc_today = lambda: today
+        return today
+
     def scene(self, status="VOID", bind_genesis=False, base_doc=None):
         return Scene(self.tmp, status, bind_genesis, base_doc)
 
@@ -1541,6 +1552,7 @@ class OptionBRegion(LedgerCase):
                                capture_output=True, timeout=GIT_TIMEOUT_S, check=False)
         if probe.returncode != 0:
             self.skipTest(f"release commit {RELEASE_SHA} is not in this clone")
+        self.use_real_clock()  # W-4: the real range is judged by the real calendar
         ok, out = cert.check_change(HARNESS_ROOT, RELEASE_SHA, "HEAD")
         self.assert_pass(ok, out, RELEASE_PASS)
 
@@ -1548,11 +1560,34 @@ class OptionBRegion(LedgerCase):
         """W-4 (#9321, umbrella #8185): D-3's form (release-shaped base, one join line feed,
         the marker, one record) whose record is dated the real UTC today. A truthful record is
         dated today, so the judgement must not depend on the pinned test clock."""
-        today = REAL_UTC_TODAY().isoformat()
+        today = self.use_real_clock().isoformat()
         s = self.scene("VOID", base_doc=release_shaped())
         head = on_release(s.doc, record(today, path_item(MOD_RS)))
         ok, out = s.judge(self.wire_and_doc(s, head))
         self.assert_pass(ok, out, RELEASE_PASS)
+
+    def judge_dated(self, offset_days):
+        """D-3's form with one record dated the real today plus OFFSET_DAYS, under the real
+        clock. Returns (ok, out, head_doc, day)."""
+        day = (self.use_real_clock() + datetime.timedelta(days=offset_days)).isoformat()
+        s = self.scene("VOID", base_doc=release_shaped())
+        head = on_release(s.doc, record(day, path_item(MOD_RS)))
+        ok, out = s.judge(self.wire_and_doc(s, head))
+        return ok, out, head, day
+
+    def test_w4_real_clock_today_and_next_day_pass(self):
+        for offset in range(cert.LEDGER_DATE_SKEW_DAYS + 1):
+            with self.subTest(offset=offset):
+                ok, out, _head, _day = self.judge_dated(offset)
+                self.assert_pass(ok, out, RELEASE_PASS)
+
+    def test_w4_real_clock_beyond_the_skew_is_refused_with_the_exact_reason(self):
+        offset = cert.LEDGER_DATE_SKEW_DAYS + 2  # today + 3 days
+        ok, out, head, day = self.judge_dated(offset)
+        today = (datetime.date.fromisoformat(day) - datetime.timedelta(days=offset)).isoformat()
+        self.assert_refused(ok, out, reason_line(
+            f"record dated {day} is after the runner's UTC date {today} "
+            f"plus {cert.LEDGER_DATE_SKEW_DAYS} day", line_no(head, f"### Amendment {day}")))
 
     # D-4 ---------------------------------------------------------------------------------
     def test_d4_tracked_region_pinned_to_release_doc(self):
@@ -1853,6 +1888,7 @@ class TrackedDocFrozenReason9303(LedgerCase):
                     self.fail(f"commit {sha} is not in this clone: the CI replay fetch must bring "
                               f"it ({REPLAY_FETCH_FLAG})")
                 self.skipTest(f"commit {sha} is not in this clone")
+        self.use_real_clock()  # W-4: real commits, so the real clock
         ok, out = cert.check_change(HARNESS_ROOT, CHAIN_TIP_9274, HEAD_9274_R3)
         self.assert_region_refused(ok, out, RANGE_9274_FIRST_DIFF)
 
