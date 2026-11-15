@@ -775,7 +775,10 @@ pub async fn forget_memories(
         // hardcoded `for_agent("http")` would have let any caller
         // delete memories that matched the namespace/pattern filter
         // regardless of ownership — a destructive privacy bug.
-        let ctx = crate::handlers::parity::http_caller_ctx(&headers, None);
+        let ctx = match crate::handlers::parity::http_caller_ctx_checked(&headers, None) {
+            Ok(ctx) => ctx,
+            Err(refusal) => return refusal,
+        };
         return match store_forget_ids(&app, &ctx, &body, archive_flag).await {
             Ok((n, erased)) => {
                 // #9023 (p2-siblings-06) — the erasure travels to the peers

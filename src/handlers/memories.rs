@@ -433,7 +433,10 @@ async fn update_memory_write(
         // X-Agent-Id header so update() can authorize against the
         // memory's owner. Pre-fix this hardcoded "ai:http" which made
         // every update appear as if from the legacy daemon principal.
-        let ctx = crate::handlers::parity::http_caller_ctx(&headers, None);
+        let ctx = match crate::handlers::parity::http_caller_ctx_checked(&headers, None) {
+            Ok(ctx) => ctx,
+            Err(refusal) => return refusal,
+        };
         // FBL-12 residual (#2378) — charge the storage-byte GROWTH of this
         // in-place update against the row OWNER's per-namespace storage cap
         // BEFORE the trait write lands, mirroring the sqlite branch below.

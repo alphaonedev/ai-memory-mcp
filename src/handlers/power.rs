@@ -119,7 +119,10 @@ pub async fn detect_contradictions(
         // sweep to memories the caller can actually see. Pre-fix the
         // hardcoded `for_agent("http")` caller mismatched every
         // memory's metadata.agent_id and zeroed the candidate pool.
-        let ctx = crate::handlers::parity::http_caller_ctx(&headers, None);
+        let ctx = match crate::handlers::parity::http_caller_ctx_checked(&headers, None) {
+            Ok(ctx) => ctx,
+            Err(refusal) => return refusal,
+        };
         let filter = crate::store::Filter {
             namespace: q.namespace.clone(),
             limit,
@@ -919,7 +922,11 @@ pub async fn check_duplicate(
                     // Clone the id so the SAL get does not hold a borrow of
                     // `check` across `.await` (CONCURRENCY-20 / OWNERSHIP-11).
                     let near_id = near.id.clone();
-                    let ctx = crate::handlers::parity::http_caller_ctx(&headers, None);
+                    let ctx = match crate::handlers::parity::http_caller_ctx_checked(&headers, None)
+                    {
+                        Ok(ctx) => ctx,
+                        Err(refusal) => return refusal,
+                    };
                     // SAL `get` is already visibility-filtered (unlike sqlite
                     // `db::get`): NotFound / any Err ⇒ hide. On Ok, still
                     // apply `is_visible_to_caller` so an adapter that

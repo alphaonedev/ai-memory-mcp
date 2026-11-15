@@ -1368,7 +1368,7 @@ pub(crate) async fn load_family_rows_via_store(
 
         ..Default::default()
     };
-    let ctx = crate::handlers::parity::http_caller_ctx(headers, None);
+    let ctx = crate::handlers::parity::http_caller_ctx_checked(headers, None)?;
     let narrow = |rows: Vec<Memory>| -> Vec<Memory> {
         let mut kept: Vec<Memory> = rows
             .into_iter()

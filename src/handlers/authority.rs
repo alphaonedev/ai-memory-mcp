@@ -23,6 +23,18 @@
 //! identity is NOT refused: it is the documented anonymous per-request
 //! principal, which owns nothing and sees only non-private rows.
 //!
+//! # The identity funnel (#9341)
+//!
+//! Under [`HttpIdentityMode::Enforce`] with at least one per-agent key
+//! enrolled, a request that NAMES a principal (`X-Agent-Id` present) without
+//! proving it is refused here, once, with `403 attested_identity_required`
+//! ([`refuse_unproven_named_principal`]). Proven means an enrolled per-agent
+//! key bound to that agent or a mapped mTLS certificate (#8590): the
+//! [`Binding::is_key_bound`] rungs. The shared API key is a transport
+//! credential and proves no principal. The per-handler gates stay as defence
+//! in depth. With zero keys enrolled the funnel is inert (the #1985
+//! unsatisfiable-default trap), and the exempt paths above never reach it.
+//!
 //! # What this layer does NOT do
 //!
 //! It makes no object decision (ruling 1 of the #3581 vote): which row,
@@ -41,7 +53,13 @@ use axum::{
 };
 use serde_json::json;
 
-use crate::identity::authority::{Authority, HttpAuthorityInputs};
+use crate::config::HttpIdentityMode;
+use crate::identity::authority::{Authority, Binding, HttpAuthorityInputs};
+
+/// The stable wire `error` of a funnel refusal: the SAME code the
+/// per-handler gate [`super::identity_binding::enforce_sensitive_identity`]
+/// returns, so a client sees one contract whichever gate fires first.
+pub const ATTESTED_IDENTITY_REQUIRED: &str = "attested_identity_required";
 
 /// Exact paths the resolver does not gate: the liveness / scrape probes.
 /// A probe carries no identity and MUST NOT fail on one — an orchestrator
@@ -97,11 +115,15 @@ pub async fn authority_layer(
         return next.run(req).await;
     }
 
-    let header_agent_id = req
-        .headers()
-        .get(crate::HEADER_AGENT_ID)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
+    // #9342 — a PRESENT header that is not visible ASCII is refused, never
+    // read as "no header" (which would mint the anonymous principal).
+    let header_agent_id = match req.headers().get(crate::HEADER_AGENT_ID) {
+        None => None,
+        Some(v) => match v.to_str() {
+            Ok(s) => Some(s.to_string()),
+            Err(_) => return unreadable_header_refusal(&path),
+        },
+    };
 
     // The per-agent-key principal, if the presented key is enrolled. ONE
     // snapshot (#3418) so the emptiness fact and the lookup agree.
@@ -141,8 +163,27 @@ pub async fn authority_layer(
 
     match resolved {
         Ok(authority) => {
+            if let Some(refusal) = refuse_unproven_named_principal(
+                state.app.http_identity_mode,
+                !enrolled.is_empty(),
+                header_agent_id.as_deref(),
+                &authority,
+                &path,
+            ) {
+                return refusal;
+            }
+            let cert_proven = (authority.binding() == Binding::ClientCert)
+                .then(|| authority.principal().to_string());
             req.extensions_mut().insert(authority);
-            next.run(req).await
+            match cert_proven {
+                // #8590 — the handler-side gate re-derives the caller's level
+                // from the request; scope the cert proof so it counts there.
+                Some(principal) => {
+                    super::identity_binding::with_cert_proven_principal(principal, next.run(req))
+                        .await
+                }
+                None => next.run(req).await,
+            }
         }
         Err(e) => {
             // Forensic capture BEFORE the wire 400 — the chain records the
@@ -175,6 +216,84 @@ pub async fn authority_layer(
                 .into_response()
         }
     }
+}
+
+/// #9341 — THE identity funnel. `Some(403)` when the request names a
+/// principal it has not proven, under Enforce with keys enrolled; `None`
+/// otherwise. A header naming an anonymous sentinel is a client assertion,
+/// not the server-minted anonymous principal, so it is refused too. An absent
+/// or empty header is the anonymous principal and passes (it owns nothing).
+#[must_use]
+pub fn refuse_unproven_named_principal(
+    mode: HttpIdentityMode,
+    enrolled_keys_present: bool,
+    header_agent_id: Option<&str>,
+    authority: &Authority,
+    endpoint: &str,
+) -> Option<Response> {
+    if mode != HttpIdentityMode::Enforce || !enrolled_keys_present {
+        return None;
+    }
+    let named = header_agent_id.is_some_and(|h| !h.is_empty());
+    if !named || authority.binding().is_key_bound() {
+        return None;
+    }
+    crate::governance::audit::record_decision(
+        authority.principal(),
+        "deny",
+        AUDIT_KIND_AUTHORITY,
+        "",
+        crate::governance::audit::ForensicPayload::new()
+            .ident("endpoint", endpoint)
+            .label("outcome", ATTESTED_IDENTITY_REQUIRED)
+            .label("binding", authority.binding().as_str()),
+    );
+    tracing::warn!(
+        target: super::AUTHZ_TRACE_TARGET,
+        endpoint,
+        binding = authority.binding().as_str(),
+        "#9341 enforce: refused an unproven named principal at the authority chokepoint"
+    );
+    Some(
+        (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": ATTESTED_IDENTITY_REQUIRED,
+                "message": "X-Agent-Id is self-asserted; present the agent's enrolled \
+                            per-agent api-key (X-API-Key) or a mapped client \
+                            certificate to act as this principal",
+                "endpoint": endpoint,
+            })),
+        )
+            .into_response(),
+    )
+}
+
+/// #9342 — the typed `400` for a present `X-Agent-Id` that is not visible
+/// ASCII. The raw bytes are never echoed.
+fn unreadable_header_refusal(path: &str) -> Response {
+    crate::governance::audit::record_decision(
+        "anonymous:resolve-failed",
+        "deny",
+        AUDIT_KIND_AUTHORITY,
+        "",
+        crate::governance::audit::ForensicPayload::new()
+            .ident("endpoint", path)
+            .label("outcome", "agent_id_unreadable"),
+    );
+    tracing::warn!(
+        target: super::AUTHZ_TRACE_TARGET,
+        endpoint = %path,
+        "#9342: refused a non-ASCII X-Agent-Id at the authority chokepoint"
+    );
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "code": crate::errors::error_codes::VALIDATION_FAILED,
+            "error": "X-Agent-Id must be visible ASCII",
+        })),
+    )
+        .into_response()
 }
 
 /// Read the resolved authority back out of a handler's request parts.

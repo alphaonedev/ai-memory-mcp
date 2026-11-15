@@ -539,7 +539,10 @@ pub async fn create_link(
         // attribution matches the request principal. Pre-fix this
         // hardcoded "ai:http" — every link appeared to come from the
         // legacy daemon principal regardless of caller.
-        let ctx = crate::handlers::parity::http_caller_ctx(&headers, None);
+        let ctx = match crate::handlers::parity::http_caller_ctx_checked(&headers, None) {
+            Ok(ctx) => ctx,
+            Err(refusal) => return refusal,
+        };
         return match app
             .store
             .link_signed(&ctx, &link, app.active_keypair.as_ref().as_ref())
@@ -984,7 +987,10 @@ pub async fn delete_link(
     // edge survived and the caller got a false `{"deleted": false}`.
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
-        let ctx = crate::handlers::parity::http_caller_ctx(&headers, None);
+        let ctx = match crate::handlers::parity::http_caller_ctx_checked(&headers, None) {
+            Ok(ctx) => ctx,
+            Err(refusal) => return refusal,
+        };
         // Owner-gate parity with the sqlite #939 gate below: the caller
         // must own EITHER endpoint (links are symmetric — either party
         // can sever). A missing source memory falls through to

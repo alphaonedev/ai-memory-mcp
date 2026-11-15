@@ -310,7 +310,10 @@ async fn set_namespace_standard_inner(
         // and let any MCP-via-headers=None caller claim the literal
         // principal as the daemon identity.
         let ctx = if let Some(h) = headers {
-            crate::handlers::parity::http_caller_ctx(h, None)
+            match crate::handlers::parity::http_caller_ctx_checked(h, None) {
+                Ok(ctx) => ctx,
+                Err(refusal) => return refusal,
+            }
         } else {
             crate::store::CallerContext::for_agent(&caller)
         };

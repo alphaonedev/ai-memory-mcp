@@ -661,6 +661,11 @@ pub fn resolve_auth_level_in(
     if enrolled.is_empty() {
         return AuthLevel::Claimed;
     }
+    // #8590 — a mapped mTLS certificate proved THIS principal at the
+    // authority chokepoint; it is a server-verified secret like the key.
+    if cert_proven_principal_is(caller) {
+        return AuthLevel::KeyAuthenticated;
+    }
     let token = headers
         .get(crate::HEADER_API_KEY)
         .and_then(|v| v.to_str().ok());
@@ -672,6 +677,32 @@ pub fn resolve_auth_level_in(
         Some(agent_id) if agent_id == caller => AuthLevel::KeyAuthenticated,
         _ => AuthLevel::Claimed,
     }
+}
+
+tokio::task_local! {
+    /// #8590 — the principal a mapped mTLS client certificate proved for the
+    /// request now running. Set ONLY by
+    /// [`crate::handlers::authority::authority_layer`] (via
+    /// [`with_cert_proven_principal`]) from the verified certificate binding;
+    /// no request header or body can reach it.
+    static CERT_PROVEN_PRINCIPAL: String;
+}
+
+/// Run `fut` (the rest of the request) with `principal` recorded as proven
+/// by a mapped client certificate.
+pub(crate) async fn with_cert_proven_principal<F: std::future::Future>(
+    principal: String,
+    fut: F,
+) -> F::Output {
+    CERT_PROVEN_PRINCIPAL.scope(principal, fut).await
+}
+
+/// `true` iff a mapped client certificate proved exactly `caller` for the
+/// running request. Outside a scoped request (MCP, CLI, tests) it is `false`.
+fn cert_proven_principal_is(caller: &str) -> bool {
+    CERT_PROVEN_PRINCIPAL
+        .try_with(|p| p == caller)
+        .unwrap_or(false)
 }
 
 /// #2044 — convenience wrapper: re-derive the caller's [`AuthLevel`] from the

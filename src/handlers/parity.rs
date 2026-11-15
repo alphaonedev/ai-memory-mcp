@@ -213,6 +213,41 @@ pub(crate) fn http_caller_ctx(
     crate::store::CallerContext::for_agent(resolved)
 }
 
+/// #9342 — the checked twin of [`http_caller_ctx`]: an invalid
+/// `X-Agent-Id` / body `agent_id` is a typed `400 VALIDATION_FAILED`
+/// returned to the client, never the silent `anonymous:invalid` principal.
+/// Every HTTP handler uses this one; the authority chokepoint already refuses
+/// a malformed header, so this is the defence-in-depth leg for a router built
+/// without the layer and for a malformed body id.
+///
+/// # Errors
+///
+/// The `400` response when the caller's agent id does not resolve.
+#[cfg(feature = "sal")]
+pub(crate) fn http_caller_ctx_checked(
+    headers: &axum::http::HeaderMap,
+    body_agent_id: Option<&str>,
+) -> Result<crate::store::CallerContext, axum::response::Response> {
+    use axum::response::IntoResponse as _;
+    resolve_caller_agent_id(body_agent_id, headers, None)
+        .map(crate::store::CallerContext::for_agent)
+        .map_err(|e| {
+            tracing::warn!(
+                target: "handlers::parity",
+                error = %e,
+                "#9342 http_caller_ctx_checked: refused an invalid X-Agent-Id / body.agent_id"
+            );
+            (
+                axum::http::StatusCode::BAD_REQUEST,
+                axum::Json(serde_json::json!({
+                    "code": crate::errors::error_codes::VALIDATION_FAILED,
+                    "error": e.to_string(),
+                })),
+            )
+                .into_response()
+        })
+}
+
 /// #1886 / #1911 — single SSOT for the create / bulk-create `expires_at`
 /// resolution so every backend (SQLite + Postgres, single + bulk) derives
 /// the row's expiry identically. Precedence mirrors the original sqlite
@@ -442,6 +477,46 @@ mod resolve_create_expires_at_tests {
         assert_eq!(
             resolve_create_expires_at(fixed_now(), &Tier::Short, None, None, None),
             None
+        );
+    }
+}
+
+#[cfg(all(test, feature = "sal"))]
+mod http_caller_ctx_checked_tests_9342 {
+    use super::http_caller_ctx_checked;
+    use axum::http::{HeaderMap, HeaderValue, StatusCode};
+
+    fn headers(agent: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(
+            crate::HEADER_AGENT_ID,
+            HeaderValue::from_str(agent).expect("header"),
+        );
+        h
+    }
+
+    #[test]
+    fn invalid_header_is_a_400_not_anonymous_invalid_9342() {
+        let refusal = http_caller_ctx_checked(&headers("bad id with spaces"), None)
+            .expect_err("an invalid X-Agent-Id must be refused");
+        assert_eq!(refusal.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn valid_header_resolves_to_that_principal_9342() {
+        let ctx = http_caller_ctx_checked(&headers("alice"), None).expect("valid");
+        assert_eq!(ctx.effective_principal(), "alice");
+    }
+
+    #[test]
+    fn absent_header_is_the_per_request_anonymous_principal_9342() {
+        let ctx = http_caller_ctx_checked(&HeaderMap::new(), None).expect("anonymous");
+        assert!(crate::identity::is_anonymous_request_id(
+            ctx.effective_principal()
+        ));
+        assert_ne!(
+            ctx.effective_principal(),
+            crate::identity::sentinels::ANONYMOUS_INVALID
         );
     }
 }

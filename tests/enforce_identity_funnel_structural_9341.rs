@@ -257,6 +257,25 @@ fn exempt_modules_reach_resolvers_only_at_accounted_sites_9341() {
     }
 }
 
+/// The text from the first `{` at or after `from` to its matching `}`.
+fn braced_block(s: &str, from: usize) -> &str {
+    let open = from + s[from..].find('{').expect("block");
+    let mut depth = 0usize;
+    for (i, c) in s[open..].char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &s[open..=open + i];
+                }
+            }
+            _ => {}
+        }
+    }
+    &s[open..]
+}
+
 #[test]
 fn authority_layer_calls_the_named_refusal_before_next_run_9341() {
     let src = read("src/handlers/authority.rs");
@@ -264,12 +283,29 @@ fn authority_layer_calls_the_named_refusal_before_next_run_9341() {
     let layer = prod
         .find("pub async fn authority_layer")
         .expect("authority_layer");
-    let body = &prod[layer..];
-    let refusal = body.find(FUNNEL_FN);
-    let run = body.find("next.run(");
+    let body = braced_block(&prod, layer);
+    // The ONE pass-through before the funnel is the named exemption.
+    let exempt_at = body
+        .find("if is_authority_exempt(")
+        .expect("the exemption guard");
+    let exempt = braced_block(body, exempt_at);
+    assert_eq!(
+        exempt.matches("next.run(").count(),
+        1,
+        "#9341 the exemption guard passes through exactly once"
+    );
+    let after_exempt = exempt_at + body[exempt_at..].find(exempt).expect("block") + exempt.len();
+    let rest = &body[after_exempt..];
+    let refusal = rest.find(FUNNEL_FN);
+    let runs: Vec<usize> = rest.match_indices("next.run(").map(|(i, _)| i).collect();
     assert!(
-        matches!((refusal, run), (Some(a), Some(b)) if a < b),
-        "#9341 authority_layer must call {FUNNEL_FN} before next.run (refusal {refusal:?}, run {run:?})"
+        !runs.is_empty(),
+        "#9341 authority_layer forwards the request"
+    );
+    assert!(
+        refusal.is_some_and(|a| runs.iter().all(|b| a < *b)),
+        "#9341 every non-exempt next.run in authority_layer must follow {FUNNEL_FN} \
+         (refusal {refusal:?}, runs {runs:?})"
     );
 }
 
