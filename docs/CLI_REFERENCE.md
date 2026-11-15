@@ -403,16 +403,21 @@ See `docs/API_REFERENCE.md` and the MCP section of `USER_GUIDE.md`.
 
 ### `serve`
 
-Axum-based HTTP daemon on port 9077. There is **no `--tier` flag**
+Axum-based HTTPS daemon on port 9077 (TLS on every bind, loopback
+included; it never serves plaintext HTTP). There is **no `--tier` flag**
 (tier comes from `config.toml`, #703) and **no `--api-key` flag** (the
-API key comes from the `api_key` field in `config.toml`).
+API key comes from the `api_key` field in `config.toml`). Without
+`api_key` the daemon authenticates no HTTP request: a keyless loopback
+bind serves and logs a WARN, a keyless non-loopback bind is refused at
+boot (exit 75), and `AI_MEMORY_REQUIRE_API_KEY=1` refuses a keyless bind
+on every address. The default-on API key is #2046.
 
 | Flag | Type | Default | Notes |
 |------|------|---------|-------|
-| `--host` | string | `127.0.0.1` | |
+| `--host` | string | `127.0.0.1` | Loopback by default. Without `api_key` a non-loopback address is refused at boot (exit 75) and a loopback address serves with a WARN. |
 | `--port` | u16 | `9077` | |
-| `--tls-cert`/`--tls-key` | path | — | Operator-supplied in-process HTTPS material (rustls, no OpenSSL): full chain PEM + PKCS#8 key, SANs covering every bind host. TLS itself is REQUIRED since v1.0.0 (#3705, "only encrypted data in transit"). On a SINGLETON the flags are optional — first boot generates a local CA + server certificate under `<key_dir>/tls/` and renews it (#3709 item 1). On a FLEET-shaped deployment (production / federated / hive, per #3700) operator material is REQUIRED, supplied through these flags or installed with `ai-memory tls import`: enterprise PKI is the first-class path and a fleet without operator material is refused (3x7 audit ruling — an unmanaged CA in an enterprise estate is an audit finding). A plaintext listener is refused everywhere, loopback included. |
-| `--mtls-allowlist` | path | — | SHA-256 cert-fingerprint allowlist (requires `--tls-cert`). |
+| `--tls-cert`/`--tls-key` | path | — | Operator-supplied in-process HTTPS material (rustls, no OpenSSL): full chain PEM + a PKCS#8, PKCS#1 RSA or SEC1 EC key, SANs covering every bind host. TLS itself is REQUIRED since v1.0.0 (#3705, "only encrypted data in transit"). On a SINGLETON the flags are optional — first boot generates a local CA + server certificate under `<key_dir>/tls/` and renews it (#3709 item 1). On a declared non-singleton shape (`[deployment] shape` = team / production / federated / hive, per #3700) operator material is REQUIRED, supplied through these flags or installed with `ai-memory tls import`: enterprise PKI is the first-class path and a fleet without operator material is refused (3x7 audit ruling — an unmanaged CA in an enterprise estate is an audit finding). A plaintext listener is refused everywhere, loopback included. |
+| `--mtls-allowlist` | path | — | SHA-256 cert-fingerprint allowlist (requires `--tls-cert`). When set, the TLS handshake fails for a client without an allowlisted certificate; the gate is the handshake, not TCP accept. Without it no client certificate is requested and `serve` logs a WARN; the sync endpoints still refuse a peer that is not enrolled (#1789). |
 | `--shutdown-grace-secs` | u64 | `30` | SIGINT grace period. |
 | `--quorum-writes` | usize | `0` | v0.7 federation: W, the acknowledgements required **including the local commit** (a write returns OK after the local commit plus `W-1` distinct peer acks within `--quorum-timeout-ms`; W=1 requires no remote acknowledgement). `0` = federation off. |
 | `--quorum-peers` | comma-list | — | Peer base URLs; each must expose `POST /api/v1/sync/push`. |
@@ -427,7 +432,8 @@ API key comes from the `api_key` field in `config.toml`).
 # singleton, zero-config: first boot generates <key_dir>/tls/{local-ca.pem,local-ca.key,server.pem,server.key}
 ai-memory serve
 # declared non-singleton shape ([deployment] shape = team / production / federated / hive):
-# enterprise PKI is REQUIRED —
+# enterprise PKI is REQUIRED, and
+# a non-loopback bind also needs top-level `api_key` in `config.toml` (without it `serve` exits 75) —
 ai-memory serve --host 0.0.0.0 --port 9077 \
   --tls-cert /etc/ai-memory/cert.pem \
   --tls-key /etc/ai-memory/key.pem
@@ -461,7 +467,7 @@ check-tls` are not shipped in v1.0.0, and the refusals never name them
 ```bash
 ai-memory sync /path/to/remote.db --direction merge --dry-run
 ai-memory sync-daemon \
-  --peers http://peer-a:9077,http://peer-b:9077 \
+  --peers https://peer-a:9077,https://peer-b:9077 \
   --interval 30 --batch-size 500
 ```
 

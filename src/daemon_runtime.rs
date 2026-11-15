@@ -326,7 +326,7 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Start the HTTP memory daemon.
+    /// Start the HTTPS memory daemon.
     ///
     /// **Tier resolution.** Unlike `mcp` / `store` / `recall`, the
     /// `serve` subcommand does NOT accept a `--tier` flag. The
@@ -1119,6 +1119,10 @@ pub struct MigrateArgs {
 
 #[derive(Args)]
 pub struct ServeArgs {
+    /// Address to bind. Without top-level `api_key` in `config.toml` a
+    /// non-loopback address is refused at boot (exit 75) and a loopback
+    /// address serves with no API-key authentication and logs a WARN;
+    /// `AI_MEMORY_REQUIRE_API_KEY=1` refuses a keyless bind on every address.
     #[arg(long, default_value = "127.0.0.1")]
     pub host: String,
     #[arg(long, default_value_t = DEFAULT_PORT)]
@@ -1129,18 +1133,23 @@ pub struct ServeArgs {
     /// otherwise; it never serves plaintext HTTP (#3705, #4006).
     #[arg(long, requires = "tls_key")]
     pub tls_cert: Option<PathBuf>,
-    /// Path to PEM-encoded TLS private key (PKCS#8 or RSA).
+    /// PEM TLS private key (PKCS#8, PKCS#1 RSA or SEC1 EC), paired with
+    /// `--tls-cert`; one without the other is refused at parse time.
     #[arg(long, requires = "tls_cert")]
     pub tls_key: Option<PathBuf>,
     /// Path to a file containing SHA-256 fingerprints of trusted client
     /// certificates, one per line (case-insensitive hex, optionally with
     /// `:` separators; comments start with `#`). When set, `serve`
-    /// demands client-cert mTLS on every connection and refuses any peer
-    /// whose cert fingerprint is not on the list. Requires `--tls-cert`
-    /// and `--tls-key`. This is the peer-mesh identity gate — a peer
-    /// without an authorised cert can't even open a TCP connection, let
-    /// alone hit `/sync/push`. Layer 2 of the peer-mesh crypto stack;
-    /// attested `agent_id` extraction (Layer 2b) lands post-v0.6.0.
+    /// requests a client certificate in the TLS handshake of every
+    /// connection and fails the handshake for a peer that presents none
+    /// or one whose fingerprint is not on the list, so that peer never
+    /// reaches an HTTP route such as `/sync/push`; the gate is the TLS
+    /// handshake, not TCP accept. Requires `--tls-cert` and `--tls-key`.
+    /// Without this flag no client certificate is requested and `serve`
+    /// logs a WARN; the sync endpoints still refuse a peer that is not
+    /// enrolled (#1789). Layer 2 of the peer-mesh crypto stack; the
+    /// certificate-to-agent binding (`AI_MEMORY_MTLS_AGENT_BINDING`,
+    /// #8357) builds on it.
     #[arg(long, requires = "tls_cert")]
     pub mtls_allowlist: Option<PathBuf>,
     /// Seconds to wait for in-flight requests to complete on graceful
@@ -8338,10 +8347,12 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
                 tls::load_mtls_rustls_config(cert, key, allowlist_path).await?
             } else {
                 tracing::warn!(
-                    "TLS enabled but mTLS NOT configured — sync endpoints \
-                 (/api/v1/sync/push, /api/v1/sync/since) accept any client. \
-                 Set --mtls-allowlist for production peer-mesh deployments \
-                 (red-team #231)."
+                    "TLS enabled but mTLS NOT configured — no client certificate \
+                 is requested, so the TLS transport admits any client; the sync \
+                 endpoints (/api/v1/sync/push, /api/v1/sync/since) still refuse a \
+                 peer that is not enrolled (AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS=1 \
+                 lifts that). Set --mtls-allowlist for production peer-mesh \
+                 deployments (red-team #231)."
                 );
                 tls::load_rustls_config(cert, key).await?
             };
