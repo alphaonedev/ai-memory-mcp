@@ -180,3 +180,135 @@ fn security_and_cli_reference_state_the_real_default_9017() {
         }
     }
 }
+
+/// Finding id of the first false default claim form in `lowered` (already
+/// lowercased and whitespace-flattened), or `None` when the text is clean.
+fn false_claim_form(lowered: &str) -> Option<&'static str> {
+    FALSE_DEFAULT_CLAIM_FORMS
+        .into_iter()
+        .find(|form| lowered.contains(form))
+}
+
+/// Verb inflections of "accept" the false claim "sync accepts any client"
+/// must be caught in (R2-L1, class: a literal phrase list pins one inflection).
+const ACCEPT_INFLECTIONS: [&str; 4] = ["accept", "accepts", "accepted", "accepting"];
+
+/// Object nouns of the "accept any ..." claim with the form id each maps to.
+const ACCEPT_OBJECTS: [(&str, &str); 4] = [
+    ("client", "accept any client"),
+    ("clients", "accept any client"),
+    ("peer", "accept any peer"),
+    ("peers", "accept any peer"),
+];
+
+/// Hand-written inflected mutants of the other forms: `(sentence, form id)`.
+const FALSE_DEFAULT_CLAIM_MUTANTS: [(&str, &str); 11] = [
+    (
+        "The daemon trust no one by default.",
+        "trusts no one by default",
+    ),
+    (
+        "The daemon trusted no one by default.",
+        "trusts no one by default",
+    ),
+    (
+        "The daemon falls back to plain HTTP.",
+        "falls back to plain http",
+    ),
+    (
+        "The daemon is falling back to plain HTTP.",
+        "falls back to plain http",
+    ),
+    (
+        "A keyless bind is refusing on every host.",
+        "is refused on every host",
+    ),
+    (
+        "API key + mTLS gates inbound traffic.",
+        "api key + mtls gate inbound",
+    ),
+    (
+        "It trusted peers on the mTLS allowlist.",
+        "trusts peers on the mtls allowlist",
+    ),
+    (
+        "It trusts peer on the mTLS allowlist.",
+        "trusts peers on the mtls allowlist",
+    ),
+    (
+        "An API key is required on loopback.",
+        "required on loopback",
+    ),
+    ("API keys are required on loopback.", "required on loopback"),
+    ("A key is requiring on loopback.", "required on loopback"),
+];
+
+/// Sentences that must stay legal: the quoted WARN text and the true
+/// sentences the references carry today (over-matching guard).
+const LEGAL_DEFAULT_SENTENCES: [&str; 6] = [
+    "Privileged endpoints (POST /memories, /links, /agents, /subscriptions) accept any caller \
+     that reaches this listener.",
+    "TLS enabled but mTLS NOT configured: no client certificate is requested, so the TLS \
+     transport admits any client; the sync endpoints still refuse a peer that is not enrolled.",
+    "serve never serves plaintext HTTP.",
+    "a keyless bind to a non-loopback address is refused at boot",
+    "with AI_MEMORY_REQUIRE_API_KEY=1 a keyless bind is refused on every address, loopback \
+     included",
+    "the TLS handshake also refuses a client without an allowlisted certificate",
+];
+
+/// Time ceiling for scanning a 1 MiB input (linear scan, generous for CI).
+const SCAN_CEILING: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Size of the scan-bound input, bytes.
+const SCAN_INPUT_BYTES: usize = 1 << 20;
+
+fn flat_lower(sentence: &str) -> String {
+    flat_needle(sentence).to_lowercase()
+}
+
+/// R2-L1 — every inflection of every false-claim form is a finding with its
+/// exact form id.
+#[test]
+fn false_default_claim_inflections_are_findings_r2_l1() {
+    for verb in ACCEPT_INFLECTIONS {
+        for (noun, form) in ACCEPT_OBJECTS {
+            let sentence = format!("Without an allowlist, sync {verb} any {noun}.");
+            assert_eq!(
+                false_claim_form(&flat_lower(&sentence)),
+                Some(form),
+                "R2-L1: {sentence:?} must be a finding"
+            );
+        }
+    }
+    for (sentence, form) in FALSE_DEFAULT_CLAIM_MUTANTS {
+        assert_eq!(
+            false_claim_form(&flat_lower(sentence)),
+            Some(form),
+            "R2-L1: {sentence:?} must be a finding"
+        );
+    }
+}
+
+/// R2-L1 — the legal text stays legal, and the scan is linear on a 1 MiB input.
+#[test]
+fn legal_default_sentences_are_not_findings_and_scan_is_bounded_r2_l1() {
+    for sentence in LEGAL_DEFAULT_SENTENCES {
+        assert_eq!(
+            false_claim_form(&flat_lower(sentence)),
+            None,
+            "R2-L1: {sentence:?} must stay legal"
+        );
+    }
+    let unit = "the daemon accepts a signed request from an enrolled peer. ";
+    let big = unit.repeat(SCAN_INPUT_BYTES / unit.len());
+    let start = std::time::Instant::now();
+    assert_eq!(false_claim_form(&big), None);
+    let tail = format!("{big}sync accepts any client.");
+    assert_eq!(false_claim_form(&tail), Some("accept any client"));
+    assert!(
+        start.elapsed() < SCAN_CEILING,
+        "R2-L1: 1 MiB scan took {:?}",
+        start.elapsed()
+    );
+}
