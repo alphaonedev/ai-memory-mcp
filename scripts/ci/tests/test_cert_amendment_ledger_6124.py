@@ -194,6 +194,40 @@ def line_no(text, exact):
     raise AssertionError(f"line {exact!r} not in the fixture")
 
 
+def line_after(text):
+    """1-based number of the first line after TEXT (which ends with a line feed)."""
+    return text.count("\n") + 1
+
+
+def region_first_diff(base, head):
+    """#9303 test oracle, independent of the gate: the 1-based first line where HEAD's lines
+    above its first exact MARKER line (its whole doc without one) differ from BASE's, or None.
+    A BASE with no marker is followed by one blank line when HEAD has one (D-2). Only for a
+    BASE that ends in a line feed and never flips its status word (B-2 never applies)."""
+    def lines(text):
+        raw = text if isinstance(text, bytes) else text.encode("utf-8")
+        out = []
+        for part in raw.split(b"\n")[:-1]:
+            if part == MARKER.encode("ascii"):
+                break
+            out.append(part)
+        return out
+    base_bytes = base if isinstance(base, bytes) else base.encode("utf-8")
+    head_bytes = head if isinstance(head, bytes) else head.encode("utf-8")
+    assert base_bytes.endswith(b"\n"), "oracle needs a base ending in a line feed"
+    marker = b"\n" + MARKER.encode("ascii") + b"\n"
+    want, got = lines(base_bytes), lines(head_bytes)
+    if marker not in b"\n" + base_bytes and marker in b"\n" + head_bytes \
+            and not base_bytes.endswith(b"\n\n"):
+        want.append(b"")
+    for number, (old, new) in enumerate(zip(want, got), 1):
+        if old != new:
+            return number
+    if len(want) == len(got):
+        return None
+    return min(len(want), len(got)) + 1
+
+
 def line_no_last(text, exact, before):
     """1-based number of the last line equal to EXACT above the line equal to BEFORE."""
     lines = text.split("\n")
@@ -348,6 +382,14 @@ class LedgerCase(unittest.TestCase):
         self.assertFalse(ok, out)
         self.assertIn(exact_line, out.split("\n"), out)
 
+    def assert_live_detector(self, line, reason):
+        """#9303: LINE refused by the head detector with REASON where it runs: LIVE -> VOID."""
+        s = self.scene("LIVE", bind_genesis=True)
+        doc = head_doc("VOID") + "\n" + line + "\n"
+        ok, out = s.judge(self.wire_and_doc(s, doc))
+        self.assertFalse(ok, out)
+        self.assertEqual(out.split("\n")[0], banner_line(reason, line_no(doc, line)), out)
+
     def assert_region_refused(self, ok, out, line):
         """D-1: refused, first line names the frozen region and the first differing line."""
         self.assertFalse(ok, out)
@@ -410,11 +452,8 @@ class HonestAmendment(LedgerCase):
         files = s.touch_wire()
         files[CERT_REL] = head_doc("EXPIRED", None)
         ok, out = s.judge(s.commit(files, "drop the bind"))
-        self.assertFalse(ok, out)
-        self.assertEqual(out.split("\n")[0], (
-            f"{GATE_PREFIX}: ERROR — Binds-to dropped ({s.genesis} → -) while STATUS stays "
-            "EXPIRED: an amendment never rebinds; re-issue as LIVE (#6774 option B narrowed) "
-            "(fail-closed)"), out)
+        # #9303: the bind line is in the frozen region, so the region reason names it.
+        self.assert_region_refused(ok, out, BIND_LINE_NO)
 
     def test_live_reissue_unchanged(self):
         s = self.scene("LIVE", bind_genesis=True)
@@ -436,9 +475,7 @@ class RefusedAmendment(LedgerCase):
     def test_void_without_amendment_still_fails(self):
         s = self.scene("VOID")
         ok, out = s.judge(self.wire_and_doc(s, s.doc + "An incidental prose edit.\n"))
-        self.assertFalse(ok, out)
-        self.assertIn("an incidental edit is not a re-issue and not a voiding record", out)
-        self.assertIn("No new dated amendment record names this change", out)
+        self.assert_region_refused(ok, out, line_after(s.doc))
 
     def test_missing_name_fails(self):
         s = self.scene("VOID")
@@ -506,7 +543,9 @@ class RefusedAmendment(LedgerCase):
         s = self.scene("VOID")
         first = self.first_record(s)
         ok, out = s.judge(self.wire_and_doc(s, s.doc + "Ledger dropped.\n", PEER_RS), base=first)
-        self.assert_refused(ok, out, reason_line("the ledger present at the range start is missing"))
+        # #9303: a head with no marker holds its whole doc in the region (D-1), which differs
+        # from the range start's region at the first line after it.
+        self.assert_region_refused(ok, out, line_after(s.doc))
 
     def test_doc_only_edit_of_earlier_record_fails(self):
         # #6423 / #6726: append-only holds on the doc-only path too.
@@ -567,25 +606,19 @@ class RefusedAmendment(LedgerCase):
         s = self.scene("VOID")
         doc = with_ledger(head_doc("VOID", s.genesis), record(DAY, path_item(MOD_RS)))
         ok, out = s.judge(self.wire_and_doc(s, doc))
-        self.assertFalse(ok, out)
-        self.assertEqual(out.split("\n")[0], (
-            f"{GATE_PREFIX}: ERROR — Binds-to set (- → {s.genesis}) while STATUS stays VOID: an "
-            "amendment never rebinds; re-issue as LIVE (#6774 option B narrowed) (fail-closed)"), out)
+        self.assert_region_refused(ok, out, BIND_LINE_NO)
 
     def test_rebind_change_while_expired_refused(self):
         s = self.scene("EXPIRED", bind_genesis=True)
         wire = s.commit(s.touch_wire(), "wire change")
         head = s.commit({CERT_REL: head_doc("EXPIRED", wire)}, "rebind while EXPIRED")
         ok, out = s.judge(head)
-        self.assertFalse(ok, out)
-        self.assertIn(f"{GATE_PREFIX}: ERROR — Binds-to changed ({s.genesis} → {wire}) while "
-                      "STATUS stays EXPIRED", out)
+        self.assert_region_refused(ok, out, BIND_LINE_NO)
 
     def test_doc_only_rebind_while_void_refused(self):
         s = self.scene("VOID")
         ok, out = s.judge(s.commit({CERT_REL: head_doc("VOID", s.genesis)}, "doc-only rebind"))
-        self.assertFalse(ok, out)
-        self.assertIn("while STATUS stays VOID", out)
+        self.assert_region_refused(ok, out, BIND_LINE_NO)
 
     def test_revoiding_status_prose_with_exact_record_is_refused(self):
         # The #9176 shape under the v9274-status vote (B-1, B-4): the STATUS prose is
@@ -594,14 +627,14 @@ class RefusedAmendment(LedgerCase):
         s = self.scene("VOID")
         doc = with_ledger(head_doc("VOID", None, " (amended)"), record(DAY, path_item(MOD_RS)))
         ok, out = s.judge(self.wire_and_doc(s, doc))
-        self.assertFalse(ok, out)
-        self.assertEqual(out.split("\n"), [FROZEN_LINE], out)
+        # #9303: the STATUS line is in the frozen region; the region reason names it.
+        self.assert_region_refused(ok, out, STATUS_LINE_NO)
 
     def test_revoiding_status_prose_without_record_fails(self):
         s = self.scene("VOID")
         ok, out = s.judge(self.wire_and_doc(s, head_doc("VOID", None, " (amended)")))
-        self.assertFalse(ok, out)
-        self.assertEqual(out.split("\n"), [FROZEN_LINE], out)
+        # #9303: the STATUS line is in the frozen region; the region reason names it.
+        self.assert_region_refused(ok, out, STATUS_LINE_NO)
 
     def test_status_change_with_inexact_record_fails(self):
         s = self.scene("LIVE", bind_genesis=True)
@@ -660,8 +693,9 @@ class RefusedAmendment(LedgerCase):
         doc = with_ledger(s.doc.replace(NO_BIND_LINE, f"{bind}\n\n{bind}"),
                           record(DAY, path_item(MOD_RS)))
         ok, out = s.judge(self.wire_and_doc(s, doc))
-        self.assert_banner_refused(ok, out, STRICT_BINDS_SECOND, nth_line_no(doc, bind, 2),
-                                   "head", BINDS_DUPLICATE_3556, "VOID DUPLICATE")
+        # #9303: the region differs at the bind line first, so the region is the reason.
+        self.assert_region_refused(ok, out, region_first_diff(s.doc, doc))
+        self.assertEqual(region_first_diff(s.doc, doc), BIND_LINE_NO)
 
 
 def hostile_rows():
@@ -798,12 +832,19 @@ class HostileTable(LedgerCase):
                 ok, out = s.judge(head)
                 rc = 0 if ok else 1
                 self.assertEqual(rc, 1, f"{name}: {out}")
-                # #6124 r2 (D-1): every row edits the frozen pre-marker region, so a row the
-                # parser refuses for a character there is refused at the gate as a region edit.
-                if reason.startswith("forbidden character"):
-                    expected = REGION_FROZEN_LINE.format(line=line)
-                else:
-                    expected = GATE_FIRST_LINE.get(name, reason_line(reason, line))
+                # #6124 r2 (D-1) and #9303: a row whose head region differs from the range
+                # start's is refused FIRST as a frozen-region edit at its first differing line;
+                # the parser test below keeps every row's own reason. A row with an identical
+                # region (a ledger-only row, or two markers) keeps its gate reason.
+                diff = region_first_diff(s.doc, doc)
+                # A head with no strict STATUS line is not frozen: its banner reason stays.
+                if diff is not None and name not in GATE_FIRST_LINE:
+                    self.assertEqual(out.split("\n")[0], REGION_FROZEN_LINE.format(line=diff),
+                                     f"{name}: {out}")
+                    if reason.startswith("forbidden character"):
+                        self.assertEqual(diff, line, name)
+                    continue
+                expected = GATE_FIRST_LINE.get(name, reason_line(reason, line))
                 self.assertIn(expected, out.split("\n"), f"{name}: {out}")
 
     def test_parser_refuses_each_row_without_raising_anything_else(self):
@@ -919,8 +960,13 @@ class Bounds(LedgerCase):
         ok, out = s.judge(head)
         elapsed = time.monotonic() - start
         self.assertLess(elapsed, FAST_BOUND_S, f"gate took {elapsed:.2f}s")
-        self.assert_banner_refused(ok, out, LOOSE_BINDS, line_no(doc, big), "head",
-                                   BINDS_DUPLICATE_3556, "VOID -")
+        # #9303: frozen, so the region reason comes first; at a LIVE end the head detector
+        # refuses the same 100K line by its size, under the same ceiling.
+        self.assert_region_refused(ok, out, region_first_diff(s.doc, doc))
+        start = time.monotonic()
+        self.assert_live_detector(
+            big, f"a line over {PRE_LINE_LIMIT_BYTES} bytes the head detector does not read")
+        self.assertLess(time.monotonic() - start, FAST_BOUND_S)
 
 
 PRE_REGION_S_PER_LINE = 25e-6
@@ -934,8 +980,8 @@ class BannerPrecondition(LedgerCase):
         bind = bind_line(s.genesis)
         doc = s.doc.replace(NO_BIND_LINE, f"{bind}\n\n{bind}")
         ok, out = s.judge(s.commit({CERT_REL: doc}, "doc-only: two binds"))
-        self.assert_banner_refused(ok, out, STRICT_BINDS_SECOND, nth_line_no(doc, bind, 2),
-                                   "head", BINDS_DUPLICATE_3556, "VOID DUPLICATE")
+        # #9303: a doc-only range takes the same order: the region reason first.
+        self.assert_region_refused(ok, out, BIND_LINE_NO)
 
     def test_duplicate_both_ends_with_exact_record_refused(self):
         for status, bound in (("VOID", False), ("EXPIRED", True)):
@@ -1045,8 +1091,10 @@ class PreRegion(LedgerCase):
             with self.subTest(row=name):
                 doc = with_ledger(s.doc, record(DAY, path_item(MOD_RS)), pre=block)
                 ok, out = s.judge(self.wire_and_doc(s, doc))
-                self.assertFalse(ok, out)
-                self.assertEqual(out.split("\n"), [reason_line(reason, line_no(doc, needle))], out)
+                # #9303: the gate names the region at its first new line; the parser keeps
+                # the construct's own reason and line.
+                self.assert_region_refused(ok, out, region_first_diff(s.doc, doc))
+                self.assertEqual(ledger_error(doc), (reason, line_no(doc, needle)), name)
 
     def test_banner_lookalikes_above_the_ledger_are_refused_by_the_banner(self):
         s = self.scene("VOID")
@@ -1054,8 +1102,8 @@ class PreRegion(LedgerCase):
             with self.subTest(row=name):
                 doc = with_ledger(s.doc, record(DAY, path_item(MOD_RS)), pre=fake + "\n\n")
                 ok, out = s.judge(self.wire_and_doc(s, doc))
-                self.assert_banner_refused(ok, out, LOOSE_STATUS, line_no(doc, fake), "head",
-                                           DUPLICATE_3556, "DUPLICATE -")
+                self.assert_region_refused(ok, out, line_no(doc, fake))
+                self.assert_live_detector(fake, LOOSE_STATUS)
 
     def test_hide_status_show_live_refused(self):
         s = self.scene("VOID")
@@ -1064,16 +1112,15 @@ class PreRegion(LedgerCase):
             status_line("VOID"), f"{fake}\n\n<!-- x --> <!--\n{status_line('VOID')}\n-->"),
             record(DAY, path_item(MOD_RS)))
         ok, out = s.judge(self.wire_and_doc(s, doc))
-        self.assert_banner_refused(ok, out, LOOSE_STATUS, line_no(doc, fake), "head",
-                                   DUPLICATE_3556, "DUPLICATE -")
+        self.assert_region_refused(ok, out, STATUS_LINE_NO)
 
     def test_hide_ledger_to_eof_refused(self):
         s = self.scene("VOID")
         doc = s.doc + "<!-- x --> <!--\n\n" + MARKER + "\n" + record(DAY, path_item(MOD_RS))
         ok, out = s.judge(self.wire_and_doc(s, doc))
-        self.assertFalse(ok, out)
-        self.assertEqual(out.split("\n"), [reason_line(
-            "a second '<!--' on one line above the ledger", line_no(doc, "<!-- x --> <!--"))], out)
+        self.assert_region_refused(ok, out, line_no(doc, "<!-- x --> <!--"))
+        self.assertEqual(ledger_error(doc), (
+            "a second '<!--' on one line above the ledger", line_no(doc, "<!-- x --> <!--")))
 
     def test_always_bad_pre_line_is_refused_at_every_position(self):
         base = with_ledger(head_doc("VOID"), record(DAY, path_item(MOD_RS)))
@@ -1145,16 +1192,16 @@ class VoteTally(LedgerCase):
                 doc = with_ledger(s.doc.replace(status_line("VOID"), edit(status_line("VOID"))),
                                   record(DAY, path_item(MOD_RS)))
                 ok, out = s.judge(self.wire_and_doc(s, doc))
-                self.assertFalse(ok, out)
-                self.assertEqual(out.split("\n"), [FROZEN_LINE], out)
+                # #9303: the frozen region reason names the STATUS line it differs at.
+                self.assert_region_refused(ok, out, STATUS_LINE_NO)
 
     def test_b2_flip_with_any_other_byte_changed_refused(self):
         s = self.scene("VOID")
         doc = with_ledger(head_doc("EXPIRED").replace("2026-01-01", DAY),
                           record(DAY, path_item(MOD_RS)))
         ok, out = s.judge(self.wire_and_doc(s, doc))
-        self.assertFalse(ok, out)
-        self.assertEqual(out.split("\n"), [FROZEN_LINE], out)
+        # #9303: the STATUS line is in the frozen region; the region reason names it.
+        self.assert_region_refused(ok, out, STATUS_LINE_NO)
 
     def test_b2_token_only_flip_with_exact_record_passes(self):
         s = self.scene("VOID")
@@ -1218,8 +1265,10 @@ class MutationKillRows(LedgerCase):
             with self.subTest(row=name):
                 doc = with_ledger(s.doc, record(DAY, path_item(MOD_RS)), pre=fake + "\n\n")
                 ok, out = s.judge(self.wire_and_doc(s, doc))
-                self.assert_banner_refused(ok, out, LOOSE_STATUS, line_no(doc, fake), "head",
-                                           DUPLICATE_3556, "DUPLICATE -")
+                # #9303: frozen, region first; each arm still refuses its decoy where the
+                # head detector runs (a LIVE end).
+                self.assert_region_refused(ok, out, line_no(doc, fake))
+                self.assert_live_detector(fake, LOOSE_STATUS)
 
     def test_each_loose_binds_arm_refuses_its_decoy(self):
         # Same refusal shape as the M-3 row (Bounds): the decoy's line, then the #3556
@@ -1229,8 +1278,8 @@ class MutationKillRows(LedgerCase):
             with self.subTest(row=name):
                 doc = with_ledger(s.doc, record(DAY, path_item(MOD_RS)), pre=fake + "\n\n")
                 ok, out = s.judge(self.wire_and_doc(s, doc))
-                self.assert_banner_refused(ok, out, LOOSE_BINDS, line_no(doc, fake), "head",
-                                           BINDS_DUPLICATE_3556, "VOID -")
+                self.assert_region_refused(ok, out, line_no(doc, fake))
+                self.assert_live_detector(fake, LOOSE_BINDS)
 
     def test_two_binds_like_lines_still_name_the_duplicate(self):
         s = self.scene("VOID")
@@ -1238,8 +1287,7 @@ class MutationKillRows(LedgerCase):
         doc = with_ledger(s.doc.replace(NO_BIND_LINE, bind_line(s.genesis)),
                           record(DAY, path_item(MOD_RS)), pre=fake + "\n\n")
         ok, out = s.judge(self.wire_and_doc(s, doc))
-        self.assert_banner_refused(ok, out, LOOSE_BINDS, line_no(doc, fake), "head",
-                                   BINDS_DUPLICATE_3556, "VOID DUPLICATE")
+        self.assert_region_refused(ok, out, BIND_LINE_NO)
 
     def test_size_cap_edge_is_exact(self):
         rec = record(DAY, path_item(MOD_RS))
@@ -1270,8 +1318,8 @@ class MutationKillRows(LedgerCase):
             with self.subTest(row=name):
                 doc = with_ledger(s.doc, record(DAY, path_item(MOD_RS)), pre=fake + "\n\n")
                 ok, out = s.judge(self.wire_and_doc(s, doc))
-                self.assertFalse(ok, out)
-                self.assertEqual(out.split("\n"), [reason_line(reason, line_no(doc, fake))], out)
+                self.assert_region_refused(ok, out, line_no(doc, fake))
+                self.assertEqual(ledger_error(doc), (reason, line_no(doc, fake)), name)
 
 
 # #6124 round 2, 3-agent vote (71472661) v9274-detector, option B. The base is read by the
@@ -1354,23 +1402,23 @@ class OptionBRegion(LedgerCase):
         s = self.scene("VOID", base_doc=release_shaped())
         doc = on_release(s.doc + "\n" + "\n".join(I4_FENCE) + "\n", self.exact())
         ok, out = s.judge(self.wire_and_doc(s, doc))
-        self.assertFalse(ok, out)
-        self.assertIn("a fence body naming an amendment or a status above the ledger", out)
+        # #9303: the new fence is a frozen-region edit, refused as such at its first line.
+        self.assert_region_refused(ok, out, region_first_diff(s.doc, doc))
+        self.assertEqual(ledger_error(doc)[0],
+                         "a fence body naming an amendment or a status above the ledger")
 
     def test_r1_new_loose_line_at_head_refused(self):
         s = self.scene("VOID", base_doc=release_shaped())
         doc = on_release(s.doc + "\n" + NEW_LOOSE + "\n", self.exact())
         ok, out = s.judge(self.wire_and_doc(s, doc))
-        self.assertFalse(ok, out)
-        self.assertEqual(out.split("\n")[0], banner_line(LOOSE_BINDS, line_no(doc, NEW_LOOSE)), out)
+        self.assert_region_refused(ok, out, region_first_diff(s.doc, doc))
 
     def test_r1_inherited_loose_line_excused_once_only(self):
         s = self.scene("VOID", base_doc=release_shaped())
         doc = on_release(s.doc + "\n" + RELEASE_LOOSE[1] + "\n", self.exact())
         ok, out = s.judge(self.wire_and_doc(s, doc))
-        self.assertFalse(ok, out)
-        self.assertEqual(out.split("\n")[0],
-                         banner_line(LOOSE_BINDS, nth_line_no(doc, RELEASE_LOOSE[1], 2)), out)
+        # #9303: a second copy of the inherited line is a region edit; it never passes.
+        self.assert_region_refused(ok, out, region_first_diff(s.doc, doc))
 
     def test_r1_d5_strict_duplicate_base_refused(self):
         base = release_shaped() + "\n" + status_line("VOID") + "\n"
