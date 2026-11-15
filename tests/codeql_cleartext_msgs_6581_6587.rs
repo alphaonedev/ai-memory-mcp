@@ -1759,7 +1759,13 @@ const PROBE_ROWS: &[ProbeRow] = &[
     ProbeRow {
         id: "chain transparent then non-revealing",
         rel: "src/cli/agents.rs",
-        src: r#"assert!(ok, "n {}", token.clone().len());"#,
+        src: r#"assert!(ok, "n {}", token.clone().len() * 2);"#,
+        want: &[],
+    },
+    ProbeRow {
+        id: "chain transparent then a clean field",
+        rel: "src/cli/agents.rs",
+        src: "assert_eq!(cred.clone().uid, 7);",
         want: &[],
     },
     ProbeRow {
