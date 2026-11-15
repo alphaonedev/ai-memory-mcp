@@ -111,6 +111,8 @@ pub enum ScreenOutcome {
 /// The span replacement used in REDACT mode.
 pub const REDACTION_PLACEHOLDER: &str = "[REDACTED:secret]";
 
+mod credential_forms;
+
 // ── Detector kind tags (named; surfaced in the audit row + refusal) ──────
 const KIND_PEM_PRIVATE_KEY: &str = "pem_private_key";
 const KIND_AWS_ACCESS_KEY: &str = "aws_access_key_id";
@@ -178,6 +180,12 @@ pub fn screen(content: &str) -> ScreenOutcome {
 
     // 4. JWT: three base64url segments separated by dots, each long enough.
     if let Some(after) = redact_jwts(&redacted, &mut kinds) {
+        redacted = after;
+    }
+
+    // 5. #8855 credential forms: URL userinfo password, password
+    //    assignment, Slack token, Stripe live key (single-pass scans).
+    if let Some(after) = credential_forms::redact_credential_forms(&redacted, &mut kinds) {
         redacted = after;
     }
 
