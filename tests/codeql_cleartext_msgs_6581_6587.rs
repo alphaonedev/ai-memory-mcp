@@ -22,7 +22,14 @@
 //!
 //! The scanner is a small lexer (string, raw-string, char-literal and
 //! comment aware), linear in its input; it is exercised on a table of
-//! leaky and clean forms and on a 100K+ synthetic input under a time bound.
+//! leaky and clean forms and on 100K+ synthetic inputs under a time bound.
+//!
+//! Fail closed by construction (#9307 r2 class-fix design): a member chain
+//! is matched against one closed [`Segment`] grammar with sticky secret
+//! taint, so a Rust form the grammar does not know is a finding, never a
+//! pass; name exemptions match whole identifiers, never a word part (the
+//! last-word head noun of [`NON_SECRET_LAST_PARTS`] aside); and a missing
+//! class root or root prefix fails the run instead of scanning nothing.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -179,7 +186,9 @@ const SECRET_WORD_PARTS: &[&str] = &[
 ];
 
 /// Adjacent word-part pairs that make an identifier secret-named (a lone
-/// `key` is a map key or a config key name, never a secret by itself).
+/// `key` is a map key or a config key name, never a secret by itself). Each
+/// pair is written once, singular; [`secret_pair`] derives the plural
+/// (`api_keys`, `private_keys`) with [`PLURAL_SUFFIX`].
 const SECRET_WORD_PAIRS: &[(&str, &str)] = &[
     ("api", "key"),
     ("private", "key"),
@@ -187,9 +196,15 @@ const SECRET_WORD_PAIRS: &[(&str, &str)] = &[
     ("access", "key"),
 ];
 
+/// The one plural rule for [`SECRET_WORD_PAIRS`]: the second word plus `s`.
+const PLURAL_SUFFIX: char = 's';
+
 /// A last word part that makes a secret-named identifier METADATA about
 /// the secret (its count, length, name, location, hash or state), never
-/// the secret itself.
+/// the secret itself. The last word of a `snake_case` compound is its head
+/// noun (`token_count` is a count), so this is the one word-part exemption;
+/// a first word only qualifies the head (`redacted_token` is a token) and
+/// clears nothing.
 const NON_SECRET_LAST_PARTS: &[&str] = &[
     "count",
     "len",
@@ -230,6 +245,7 @@ const NON_SECRET_LAST_PARTS: &[&str] = &[
     "policy",
     "ref",
     "fingerprint",
+    "sha256",
     "hex",
     "guard",
     "required",
@@ -242,37 +258,35 @@ const NON_SECRET_LAST_PARTS: &[&str] = &[
     "age",
 ];
 
-/// A word part anywhere in the identifier that makes it a one-way image
-/// of the secret (`token_sha256`, `api_key_digest_bound_to_another_agent`).
-const NON_SECRET_ANY_PARTS: &[&str] = &["sha256", "digest", "hash", "hashed", "fingerprint"];
+/// Whole identifiers that are secret-named by word part but provably hold
+/// no secret, each with its reason. An exemption matches the WHOLE name,
+/// never a word part (#9307 R2-2: a first-part rule cleared
+/// `created_token` along with the flag it was written for).
+const NON_SECRET_WHOLE_NAMES: &[(&str, &str)] = &[(
+    "created_root_secret",
+    "bool: whether `cli capability init` created the root secret",
+)];
 
-/// Adjacent word-part pairs that name a non-secret value: a Unix peer
-/// credential (`SO_PEERCRED` uid / pid) is not a secret.
-const NON_SECRET_WORD_PAIRS: &[(&str, &str)] = &[("peer", "cred"), ("peer", "creds")];
-
-/// A first word part that makes a secret-named identifier a predicate, a
-/// number or an already-redacted rendering.
-const NON_SECRET_FIRST_PARTS: &[&str] = &[
-    "has",
-    "is",
-    "num",
-    "max",
-    "min",
-    "redact",
-    "redacted",
-    "mask",
-    "masked",
-    "sanitize",
-    "sanitized",
-    "scrub",
-    "scrubbed",
-    "hash",
-    "hashed",
-    "fingerprint",
-    "require",
-    "requires",
-    // `created_root_secret`: a was-it-created flag (`cli capability init`).
-    "created",
+/// Whole identifiers that provably hold no secret under one source root
+/// only, each with its reason: `(root, name, reason)`. Scoped so the same
+/// name elsewhere (a `cred` holding a password) stays secret-named; a
+/// secret-named segment after it (`cred.private_key`) still taints.
+const NON_SECRET_SCOPED_NAMES: &[(&str, &str, &str)] = &[
+    (
+        "src/federation/identity/",
+        "cred",
+        "FederationCredential: the public signed claim set (subject id, pubkey, issuer, validity)",
+    ),
+    (
+        "src/federation/identity/",
+        "credential",
+        "SignedCredential::credential(): the public FederationCredential claim set",
+    ),
+    (
+        "src/handlers/federation_signing_check.rs",
+        "cred",
+        "CertChain::verify output: the public FederationCredential claim set",
+    ),
 ];
 
 /// Renderings that expose only a boolean, never the content.
@@ -682,7 +696,7 @@ fn negated_contains(cond: &str) -> Option<(&str, &str)> {
 
 /// `true` when a leak-check needle carries a secret: a secret-named value,
 /// or a literal or constant holding a [`LEAK_CANARY_MARKERS`] word.
-fn needle_is_secret(needle: &str) -> bool {
+fn needle_is_secret(rel: &str, needle: &str) -> bool {
     let lower = needle.to_ascii_lowercase();
     let marked = LEAK_CANARY_MARKERS.iter().any(|m| lower.contains(m));
     let kinds = classify(needle);
@@ -693,8 +707,8 @@ fn needle_is_secret(needle: &str) -> bool {
     (marked && literal_or_const)
         || bindings(needle)
             .into_iter()
-            .any(|id| SECRET_VALUE_BINDINGS.contains(&id) || is_secret_name(id))
-        || rendered_secret(needle).is_some()
+            .any(|id| SECRET_VALUE_BINDINGS.contains(&id) || is_secret_name(rel, id))
+        || rendered_secret(rel, needle).is_some()
 }
 
 fn leak_echo_findings(rel: &str, inv: &Invocation, out: &mut Vec<String>) {
@@ -702,13 +716,13 @@ fn leak_echo_findings(rel: &str, inv: &Invocation, out: &mut Vec<String>) {
         return;
     };
     let strict = STRICT_LEAK_ECHO_ROOTS.iter().any(|r| rel.starts_with(r));
-    if !strict && !needle_is_secret(needle) {
+    if !strict && !needle_is_secret(rel, needle) {
         return;
     }
     let hay_ids = bindings(hay);
     let needle_ids: Vec<&str> = bindings(needle)
         .into_iter()
-        .filter(|id| SECRET_VALUE_BINDINGS.contains(id) || is_secret_name(id))
+        .filter(|id| SECRET_VALUE_BINDINGS.contains(id) || is_secret_name(rel, id))
         .collect();
     for (expr, _) in interpolations(&inv.args[1..]) {
         if size_only(&expr) {
@@ -778,31 +792,39 @@ fn is_constant_name(id: &str) -> bool {
             .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == b'_')
 }
 
+/// `true` when `(w0, w1)` is a [`SECRET_WORD_PAIRS`] pair, singular or
+/// with the one [`PLURAL_SUFFIX`] rule on the second word (`api_keys`).
+fn secret_pair(w0: &str, w1: &str) -> bool {
+    SECRET_WORD_PAIRS
+        .iter()
+        .any(|(a, b)| *a == w0 && (w1 == *b || w1.strip_suffix(PLURAL_SUFFIX) == Some(*b)))
+}
+
 /// `true` when `id` names a secret value by word part (#9307 review probe
 /// b6): `api_token`, `bearer_token`, `cred_url`, `cfg.api_key`'s `api_key`,
-/// but not `token_count`, `max_tokens`, `has_secret` or `TOKEN_PREFIX`.
-fn is_secret_name(id: &str) -> bool {
-    if is_constant_name(id) {
+/// `redacted_token`, but not `token_count`, `max_tokens` or `TOKEN_PREFIX`.
+/// The only exemptions are a [`NON_SECRET_LAST_PARTS`] head noun and a
+/// [`NON_SECRET_WHOLE_NAMES`] whole identifier (anywhere, or under the
+/// root of its [`NON_SECRET_SCOPED_NAMES`] row) in the file named `rel`.
+fn is_secret_name(rel: &str, id: &str) -> bool {
+    if is_constant_name(id)
+        || NON_SECRET_WHOLE_NAMES.iter().any(|(name, _)| *name == id)
+        || NON_SECRET_SCOPED_NAMES
+            .iter()
+            .any(|(root, name, _)| *name == id && rel.starts_with(root))
+    {
         return false;
     }
     let lower = id.to_ascii_lowercase();
     let parts: Vec<&str> = lower.split('_').filter(|p| !p.is_empty()).collect();
-    let (Some(first), Some(last)) = (parts.first(), parts.last()) else {
+    let Some(last) = parts.last() else {
         return false;
     };
-    if NON_SECRET_LAST_PARTS.contains(last)
-        || NON_SECRET_FIRST_PARTS.contains(first)
-        || parts.iter().any(|p| NON_SECRET_ANY_PARTS.contains(p))
-        || parts
-            .windows(2)
-            .any(|w| NON_SECRET_WORD_PAIRS.contains(&(w[0], w[1])))
-    {
+    if NON_SECRET_LAST_PARTS.contains(last) {
         return false;
     }
     parts.iter().any(|p| SECRET_WORD_PARTS.contains(p))
-        || parts
-            .windows(2)
-            .any(|w| SECRET_WORD_PAIRS.contains(&(w[0], w[1])))
+        || parts.windows(2).any(|w| secret_pair(w[0], w[1]))
 }
 
 /// `expr` with string and char literals and comments blanked to spaces.
@@ -828,23 +850,28 @@ fn skip_ws(code: &[u8], mut i: usize) -> usize {
     i
 }
 
-/// Index just past the bracket group opening at `open` (end of input when
-/// it is unmatched; literals are already blanked).
-fn group_end(code: &[u8], open: usize) -> usize {
-    let mut depth = 0usize;
-    for (j, &c) in code.iter().enumerate().skip(open) {
+/// For every opening bracket of `code`, the index just past its group (end
+/// of input when it is unmatched; literals are already blanked); `0` at
+/// every other index. One stack pass, so each lookup is O(1) and a chain
+/// scan stays linear however many groups are left open (#9307 r2 E-d).
+fn bracket_ends(code: &[u8]) -> Vec<usize> {
+    let mut ends = vec![0; code.len()];
+    let mut open = Vec::new();
+    for (j, &c) in code.iter().enumerate() {
         match c {
-            b'(' | b'[' | b'{' => depth += 1,
+            b'(' | b'[' | b'{' => open.push(j),
             b')' | b']' | b'}' => {
-                depth = depth.saturating_sub(1);
-                if depth == 0 {
-                    return j + 1;
+                if let Some(o) = open.pop() {
+                    ends[o] = j + 1;
                 }
             }
             _ => {}
         }
     }
-    code.len()
+    for o in open {
+        ends[o] = code.len();
+    }
+    ends
 }
 
 /// End index of the identifier starting at `i`.
@@ -855,77 +882,199 @@ fn ident_end(code: &[u8], mut i: usize) -> usize {
     i
 }
 
+/// Longest `::<..>` turbofish group a method segment may carry; a longer
+/// or unclosed one is an [`Segment::Unclassified`] segment (fail closed),
+/// which also keeps the angle scan linear.
+const TURBOFISH_MAX_BYTES: usize = 256;
+
+/// One segment of a member chain (#9307 R2-1 class fix: a closed grammar).
+/// Every byte sequence after a chain's root parses to exactly one variant,
+/// and [`judge_chain`] matches the enum exhaustively, so a Rust form the
+/// grammar does not know is [`Segment::Unclassified`], never clean.
+#[derive(Debug)]
+enum Segment {
+    /// `.name` not followed by a call.
+    Field(String),
+    /// `.name(..)` or `.name::<..>(..)`; the turbofish is skipped.
+    Method { name: String, zero_args: bool },
+    /// `.0`: the tuple field of the value itself.
+    TupleIndex,
+    /// `.await`: the future's own output.
+    Await,
+    /// `?`: the `Ok` / `Some` value itself.
+    Try,
+    /// `[..]`: an element of the value itself.
+    Index,
+    /// A `.` followed by anything else; the text names the segment.
+    Unclassified(String),
+}
+
+/// Index just past the turbofish group whose `<` is at `open`, if it closes
+/// within [`TURBOFISH_MAX_BYTES`]. A `>` of `->` does not close a level.
+fn turbofish_end(code: &[u8], open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let limit = code.len().min(open.saturating_add(TURBOFISH_MAX_BYTES));
+    for j in open..limit {
+        match code[j] {
+            b'<' => depth += 1,
+            b'>' if j > 0 && code[j - 1] == b'-' => {}
+            b'>' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(j + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The raw source text of an unclassified segment starting at the `.` at
+/// `dot`: up to the next ASCII delimiter, bounded and lossy-decoded.
+fn segment_text(src: &[u8], dot: usize) -> String {
+    let tail = &src[dot..];
+    let len = tail
+        .iter()
+        .skip(1)
+        .position(|&c| c.is_ascii() && !is_ident(c))
+        .map_or(tail.len(), |p| p + 1)
+        .min(TURBOFISH_MAX_BYTES);
+    String::from_utf8_lossy(&tail[..len]).trim_end().to_owned()
+}
+
+/// The chain segment at `i` (after whitespace), with the index past it;
+/// `None` at the end of the chain (any byte that starts no segment: an
+/// operator, a separator, a `..` range, the end of input). `code` is
+/// [`code_bytes`] of `src`, index for index.
+fn next_segment(code: &[u8], src: &[u8], ends: &[usize], i: usize) -> Option<(Segment, usize)> {
+    let j = skip_ws(code, i);
+    match code.get(j)? {
+        b'?' => Some((Segment::Try, j + 1)),
+        b'[' => Some((Segment::Index, ends[j])),
+        b'.' if code.get(j + 1) == Some(&b'.') => None,
+        b'.' => {
+            let unclassified = || Some((Segment::Unclassified(segment_text(src, j)), j + 1));
+            let s = skip_ws(code, j + 1);
+            let e = ident_end(code, s);
+            if s == e || !src[j + 1..e].is_ascii() || src.get(e).is_some_and(|c| !c.is_ascii()) {
+                return unclassified();
+            }
+            let name = String::from_utf8_lossy(&code[s..e]).into_owned();
+            if name.bytes().all(|c| c.is_ascii_digit()) {
+                return Some((Segment::TupleIndex, e));
+            }
+            let mut after = skip_ws(code, e);
+            if code[after..].starts_with(b"::") {
+                let open = skip_ws(code, after + 2);
+                if code.get(open) != Some(&b'<') {
+                    return unclassified();
+                }
+                let Some(close) = turbofish_end(code, open) else {
+                    return unclassified();
+                };
+                after = skip_ws(code, close);
+                if code.get(after) != Some(&b'(') {
+                    return unclassified();
+                }
+            }
+            if code.get(after) == Some(&b'(') {
+                let close = ends[after];
+                let zero_args = code[after + 1..close.saturating_sub(1).max(after + 1)]
+                    .trim_ascii()
+                    .is_empty();
+                return Some((Segment::Method { name, zero_args }, close));
+            }
+            if name == "await" {
+                return Some((Segment::Await, e));
+            }
+            Some((Segment::Field(name), e))
+        }
+        _ => None,
+    }
+}
+
+/// What a member chain renders: nothing secret, a secret-named value, or
+/// a segment the grammar cannot classify (both of the last two are findings).
+#[derive(Debug)]
+enum ChainVerdict {
+    Clean,
+    Secret(String),
+    Unclassified {
+        taint: Option<String>,
+        segment: String,
+    },
+}
+
 /// The member-chain rule for the chain rooted at the identifier
-/// `code[start..end]`: `(secret it renders, index past the chain)`.
+/// `code[start..end]`: `(verdict, index past the chain)`. Sticky taint over
+/// the closed [`Segment`] grammar (#9307 r2 class-fix design):
 ///
-/// - A FIELD segment names the chain: `cred.uid` is judged by `uid`,
-///   `credential().issuer_id` by `issuer_id`, `cfg.api_key` by `api_key`.
-/// - A [`TRANSPARENT_METHODS`] segment keeps the receiver's name:
-///   `password.clone()` is judged by `password`.
-/// - A [`NON_REVEALING_METHODS`] segment clears it: `token.len()` is clean.
-/// - Any other method on a secret-named receiver is a finding (fail
-///   closed): `secret.frobnicate()`. On a clean receiver a zero-argument
-///   method names the chain like a field (`parsed.credential()`); one with
-///   arguments renders its own result, not a named value (its arguments
-///   are scanned as chains of their own).
+/// - The chain is tainted once its root or any segment is secret-named, and
+///   stays tainted to its end: `cred.uid` renders `cred`, `cfg.api_key.0`
+///   renders `api_key`. No later field renames it.
+/// - Only a [`NON_REVEALING_METHODS`] segment clears the taint:
+///   `token.len()`, `cfg.api_key.as_ref().is_some()` are clean.
+/// - A [`TRANSPARENT_METHODS`] segment, a tuple index, `.await`, `?` and
+///   `[..]` keep the taint. Any other method on a tainted chain is a finding.
+/// - On a clean chain a secret-named field or zero-argument method taints
+///   (`parsed.credential()`); a method with arguments renders its own
+///   result (its arguments are scanned as chains of their own).
+/// - An [`Segment::Unclassified`] segment is a finding on any chain.
 /// - Not values: a path prefix (`a::`), a macro name (`m!`), a type,
 ///   variant or constant (upper-case first letter) and a free-function
 ///   callee (`agent_id_for_api_key(&k)` renders an agent id).
-fn judge_chain(code: &[u8], start: usize, end: usize) -> (Option<String>, usize) {
+fn judge_chain(
+    rel: &str,
+    code: &[u8],
+    src: &[u8],
+    ends: &[usize],
+    start: usize,
+    end: usize,
+) -> (ChainVerdict, usize) {
     let root = String::from_utf8_lossy(&code[start..end]).into_owned();
     let mut i = end;
     let next = skip_ws(code, i);
     if code[next..].starts_with(b"::") || code[next..].starts_with(b"!") {
-        return (None, end);
+        return (ChainVerdict::Clean, end);
     }
-    let mut subject = if code.get(next) == Some(&b'(') {
-        i = group_end(code, next);
+    let mut taint = if code.get(next) == Some(&b'(') {
+        i = ends[next];
         None
-    } else if code[start].is_ascii_uppercase() {
+    } else if code[start].is_ascii_uppercase() || !is_secret_name(rel, &root) {
         None
     } else {
         Some(root)
     };
-    loop {
-        let j = skip_ws(code, i);
-        match code.get(j) {
-            Some(b'?') => i = j + 1,
-            Some(b'[') => i = group_end(code, j),
-            Some(b'.') if code.get(j + 1) != Some(&b'.') => {
-                let s = skip_ws(code, j + 1);
-                let e = ident_end(code, s);
-                if s == e {
-                    break;
+    while let Some((segment, past)) = next_segment(code, src, ends, i) {
+        i = past;
+        match segment {
+            Segment::TupleIndex | Segment::Await | Segment::Try | Segment::Index => {}
+            Segment::Field(name) => {
+                if taint.is_none() && is_secret_name(rel, &name) {
+                    taint = Some(name);
                 }
-                let name = String::from_utf8_lossy(&code[s..e]).into_owned();
-                let after = skip_ws(code, e);
-                if code.get(after) != Some(&b'(') {
-                    subject = Some(name);
-                    i = e;
-                    continue;
-                }
-                let close = group_end(code, after);
-                let zero_args = code[after + 1..close.saturating_sub(1).max(after + 1)]
-                    .trim_ascii()
-                    .is_empty();
-                let secret_receiver = subject.as_deref().is_some_and(is_secret_name);
-                if TRANSPARENT_METHODS.contains(&name.as_str()) {
-                    // The receiver's own value: keep its name.
-                } else if NON_REVEALING_METHODS.contains(&name.as_str()) {
-                    subject = None;
-                } else if secret_receiver {
-                    return (subject, close);
-                } else if zero_args {
-                    subject = Some(name);
-                } else {
-                    subject = None;
-                }
-                i = close;
             }
-            _ => break,
+            Segment::Method { name, zero_args } => {
+                if NON_REVEALING_METHODS.contains(&name.as_str()) {
+                    taint = None;
+                } else if TRANSPARENT_METHODS.contains(&name.as_str()) {
+                    // The receiver's own value: the taint stays.
+                } else if let Some(id) = taint {
+                    return (ChainVerdict::Secret(id), i);
+                } else if zero_args && is_secret_name(rel, &name) {
+                    taint = Some(name);
+                }
+            }
+            Segment::Unclassified(segment) => {
+                return (ChainVerdict::Unclassified { taint, segment }, i);
+            }
         }
     }
-    (subject.filter(|s| is_secret_name(s)), i)
+    match taint {
+        Some(id) => (ChainVerdict::Secret(id), i),
+        None => (ChainVerdict::Clean, i),
+    }
 }
 
 /// `true` for a rendering that exposes only a size or a boolean.
@@ -936,15 +1085,19 @@ fn shape_only(expr: &str) -> bool {
             .any(|s| expr.trim_end().ends_with(s))
 }
 
-/// The first secret `expr` renders under the member-chain rule
-/// ([`judge_chain`]), if any. A member segment is judged with the chain it
-/// belongs to; one that follows a parenthesised expression (`(a).token`)
-/// belongs to no identifier chain and is judged as a root (fail closed).
-fn rendered_secret(expr: &str) -> Option<String> {
+/// What the first finding of `expr` renders under the member-chain rule
+/// ([`judge_chain`]), if any: "secret-valued `x`", or that plus the
+/// unclassified segment it went through. A member segment is judged with
+/// the chain it belongs to; one that follows a parenthesised expression
+/// (`(a).token`) belongs to no identifier chain and is judged as a root
+/// (fail closed).
+fn rendered_secret(rel: &str, expr: &str) -> Option<String> {
     if shape_only(expr) {
         return None;
     }
     let code = code_bytes(expr);
+    let src = expr.as_bytes();
+    let ends = bracket_ends(&code);
     let mut chained_until = 0;
     let mut i = 0;
     while i < code.len() {
@@ -959,9 +1112,27 @@ fn rendered_secret(expr: &str) -> Option<String> {
         if (member && start < chained_until) || code[start].is_ascii_digit() {
             continue;
         }
-        let (secret, chain_end) = judge_chain(&code, start, i);
-        if secret.is_some() {
-            return secret;
+        let (verdict, chain_end) = judge_chain(rel, &code, src, &ends, start, i);
+        match verdict {
+            ChainVerdict::Clean => {}
+            ChainVerdict::Secret(id) => return Some(format!("secret-valued `{id}`")),
+            ChainVerdict::Unclassified {
+                taint: Some(id),
+                segment,
+            } => {
+                return Some(format!(
+                    "secret-valued `{id}` through unclassified segment `{segment}` (fail closed)"
+                ));
+            }
+            ChainVerdict::Unclassified {
+                taint: None,
+                segment,
+            } => {
+                let root = String::from_utf8_lossy(&code[start..i]).into_owned();
+                return Some(format!(
+                    "unclassified segment `{segment}` after `{root}` (fail closed)"
+                ));
+            }
         }
         chained_until = chained_until.max(chain_end);
     }
@@ -997,9 +1168,9 @@ fn tracing_field_value(arg: &str) -> Option<&str> {
 /// secret-named.
 fn class_findings(rel: &str, inv: &Invocation, out: &mut Vec<String>) {
     let name = inv.name.as_str();
-    let mut push = |what: &str, id: &str| {
+    let mut push = |what: &str, rendered: &str| {
         out.push(format!(
-            "{rel}:{}: `{name}!` {what} renders secret-valued `{id}`",
+            "{rel}:{}: `{name}!` {what} renders {rendered}",
             inv.line
         ));
     };
@@ -1009,7 +1180,7 @@ fn class_findings(rel: &str, inv: &Invocation, out: &mut Vec<String>) {
         inv.args.get(1..).unwrap_or_default()
     } else if OPERAND_MACROS.contains(&name) {
         for operand in inv.args.iter().take(2) {
-            if let Some(id) = rendered_secret(operand) {
+            if let Some(id) = rendered_secret(rel, operand) {
                 push("operand", &id);
             }
         }
@@ -1021,14 +1192,14 @@ fn class_findings(rel: &str, inv: &Invocation, out: &mut Vec<String>) {
             .position(|a| literal_body(a).is_some())
             .unwrap_or(inv.args.len());
         for field in &inv.args[..first_literal] {
-            if let Some(id) = tracing_field_value(field).and_then(rendered_secret) {
+            if let Some(id) = tracing_field_value(field).and_then(|v| rendered_secret(rel, v)) {
                 push("message", &id);
             }
         }
         &inv.args[first_literal..]
     };
     for (expr, _) in interpolations(msg) {
-        if let Some(id) = rendered_secret(&expr) {
+        if let Some(id) = rendered_secret(rel, &expr) {
             push("message", &id);
         }
     }
@@ -1348,9 +1519,8 @@ fn class_files_for(roots: &[&str]) -> Vec<(String, PathBuf)> {
     let mut files = Vec::new();
     for root in roots {
         let path = repo_path(root);
-        if path.exists() {
-            rust_files_under(&path, &mut files);
-        }
+        assert!(path.exists(), "class root {root} is missing (fail closed)");
+        rust_files_under(&path, &mut files);
     }
     files.sort();
     let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -1962,6 +2132,42 @@ const PROBE_ROWS: &[ProbeRow] = &[
         ],
     },
     ProbeRow {
+        id: "Y-1 unclassified segment on a clean receiver",
+        rel: "x.rs",
+        src: r#"assert!(ok, "x {}", cfg.é);"#,
+        want: &[
+            "x.rs:1: `assert!` message renders unclassified segment `.é` after `cfg` (fail closed)",
+        ],
+    },
+    ProbeRow {
+        id: "Y-1 unclosed turbofish on a secret receiver",
+        rel: "x.rs",
+        src: r#"assert!(ok, "x {}", token.parse::<Vec<u8>);"#,
+        want: &[
+            "x.rs:1: `assert!` message renders secret-valued `token` through unclassified segment `.parse` (fail closed)",
+        ],
+    },
+    ProbeRow {
+        id: "Y-6 scoped whole name clears only its root",
+        rel: "src/federation/identity/issuer.rs",
+        src: r#"assert_eq!(cred.issuer_id, "root");"#,
+        want: &[],
+    },
+    ProbeRow {
+        id: "Y-6 scoped whole name outside its root",
+        rel: "src/handlers/a2a.rs",
+        src: r#"assert_eq!(cred.issuer_id, "root");"#,
+        want: &["src/handlers/a2a.rs:1: `assert_eq!` operand renders secret-valued `cred`"],
+    },
+    ProbeRow {
+        id: "Y-6 scoped whole name keeps a later secret segment",
+        rel: "src/federation/identity/issuer.rs",
+        src: "assert_eq!(cred.private_key, k);",
+        want: &[
+            "src/federation/identity/issuer.rs:1: `assert_eq!` operand renders secret-valued `private_key`",
+        ],
+    },
+    ProbeRow {
         id: "Y-1 sticky taint through a field",
         rel: "x.rs",
         src: r#"assert!(ok, "x {}", cfg.token.value);"#,
@@ -2068,7 +2274,7 @@ const TAINT_CLEARING_SEGMENTS: &[&str] = &[
 /// Receiver prefixes the generative cells put before each corpus name.
 const RECEIVER_PREFIXES: &[&str] = &["", "cfg.", "self.inner."];
 
-/// The first words NON_SECRET_FIRST_PARTS used to clear (#9307 R2-2): no
+/// The first words `NON_SECRET_FIRST_PARTS` used to clear (#9307 R2-2): no
 /// first word part clears a secret-named identifier.
 const FIRST_WORD_PROBES: &[&str] = &[
     "has",
@@ -2178,6 +2384,18 @@ fn cleartext_msgs_class_roots_each_yield_files() {
         let files = class_files_for(&[root]);
         assert!(!files.is_empty(), "class root {root} yields no Rust file");
     }
+    // The prefix lists are judged by `starts_with`, so a stale entry would
+    // silently match nothing: each one must name a real path.
+    let prefixes = STRICT_LEAK_ECHO_ROOTS
+        .iter()
+        .copied()
+        .chain(NON_SECRET_SCOPED_NAMES.iter().map(|(root, _, _)| *root));
+    for prefix in prefixes {
+        assert!(
+            repo_path(prefix.trim_end_matches('/')).exists(),
+            "root prefix {prefix} is missing (fail closed)"
+        );
+    }
 }
 
 /// Every probe row yields exactly its `want` findings under the class rule
@@ -2223,11 +2441,43 @@ fn cleartext_msgs_scanner_linear_on_100k_mixed_forms() {
     let started = Instant::now();
     let findings = scan_text("big.rs", &big, false);
     let elapsed = started.elapsed();
+    eprintln!("E-d 100k mixed forms: {elapsed:?} (ceiling {SCAN_100K_TIME_CEILING:?})");
     assert_eq!(findings.len(), SCAN_100K_LINES, "one finding per line");
     assert!(
         elapsed < SCAN_100K_TIME_CEILING,
         "scan took {elapsed:?}, ceiling {SCAN_100K_TIME_CEILING:?}"
     );
+}
+
+/// Adversarial chain shapes for the segment grammar: unclosed turbofish
+/// groups and unclosed call groups, each repeated past 100K bytes. A scan
+/// that rescans to the end per segment or per root is quadratic on these.
+const ADVERSARIAL_CHAIN_UNITS: &[(&str, &str)] = &[
+    ("a.b::<", "unclosed turbofish"),
+    ("t.f(", "unclosed call"),
+    ("token.f::<", "unclosed turbofish on a secret receiver"),
+    ("x[", "unclosed index"),
+];
+const ADVERSARIAL_CHAIN_BYTES: usize = 120_000;
+
+#[test]
+fn cleartext_msgs_scanner_linear_on_adversarial_chains() {
+    for (unit, what) in ADVERSARIAL_CHAIN_UNITS {
+        let expr = unit.repeat(ADVERSARIAL_CHAIN_BYTES / unit.len() + 1);
+        assert!(expr.len() >= ADVERSARIAL_CHAIN_BYTES, "{what}");
+        let started = Instant::now();
+        let got = rendered_secret("x.rs", &expr);
+        let elapsed = started.elapsed();
+        eprintln!(
+            "E-d {what}: {} bytes {elapsed:?} (ceiling {SCAN_100K_TIME_CEILING:?})",
+            expr.len()
+        );
+        assert!(
+            elapsed < SCAN_100K_TIME_CEILING,
+            "{what}: {} bytes took {elapsed:?}, ceiling {SCAN_100K_TIME_CEILING:?} (got {got:?})",
+            expr.len()
+        );
+    }
 }
 
 /// Bytes that are not UTF-8: a finding naming the line, never a panic and
