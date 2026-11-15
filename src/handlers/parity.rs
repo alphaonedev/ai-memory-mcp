@@ -190,7 +190,11 @@ pub(crate) fn resolve_caller_agent_id(
 /// the SAME synthesized principal within a request scope (NOT across
 /// requests — clients that need cross-request visibility on
 /// scope=private memories MUST set `X-Agent-Id` explicitly).
-#[cfg(feature = "sal")]
+///
+/// #9342: every other handler moved to [`http_caller_ctx_checked`];
+/// the one remaining caller is the `sal-postgres` KG branch, so the
+/// legacy helper is gated on that feature.
+#[cfg(feature = "sal-postgres")]
 pub(crate) fn http_caller_ctx(
     headers: &axum::http::HeaderMap,
     body_agent_id: Option<&str>,

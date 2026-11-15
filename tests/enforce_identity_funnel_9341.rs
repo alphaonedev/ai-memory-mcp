@@ -67,6 +67,7 @@ fn enrolled(with_keys: bool) -> Arc<EnrolledAgentKeys> {
     Arc::new(EnrolledAgentKeys::from_map(map))
 }
 
+#[cfg_attr(not(feature = "sal-postgres"), allow(clippy::unused_async))]
 async fn store_for(
     db_path: &std::path::Path,
 ) -> (
@@ -186,6 +187,18 @@ impl Outcome {
     fn is_funnel_refusal(&self) -> bool {
         self.status == StatusCode::FORBIDDEN && self.error_code() == ATTESTED_IDENTITY_REQUIRED
     }
+    /// The postgres route gate's 501 for a route the postgres backend does
+    /// not serve. That gate wraps the router outside every auth layer, so no
+    /// handler runs and nothing is served: a fail-closed outcome for the
+    /// route sweeps, emitted only when the fixture runs on postgres.
+    fn is_backend_gate_refusal(&self) -> bool {
+        self.status == StatusCode::NOT_IMPLEMENTED
+            && self
+                .body
+                .get("storage_backend")
+                .and_then(serde_json::Value::as_str)
+                == Some("postgres")
+    }
 }
 
 async fn send(router: &axum::Router, req: Request<Body>) -> Outcome {
@@ -219,7 +232,7 @@ fn request(
     uri: &str,
     key: &str,
     agent_ids: &[&str],
-    body: Option<serde_json::Value>,
+    body: Option<&serde_json::Value>,
 ) -> axum::http::request::Builder {
     let mut b = Request::builder()
         .method(method.to_ascii_uppercase().as_str())
@@ -250,7 +263,7 @@ async fn send_simple(
     agent_ids: &[&str],
     body: Option<serde_json::Value>,
 ) -> Outcome {
-    let req = request(method, uri, key, agent_ids, body.clone())
+    let req = request(method, uri, key, agent_ids, body.as_ref())
         .body(body_for(method, body))
         .expect("request");
     send(router, req).await
@@ -280,7 +293,7 @@ async fn shared_key_named_agent_is_refused_on_every_gated_route_9341() {
             None,
         )
         .await;
-        if !out.is_funnel_refusal() {
+        if !out.is_funnel_refusal() && !out.is_backend_gate_refusal() {
             if AUDIT_UNGATED_ROUTES.contains(&(row.name, row.method)) {
                 audit_open.push(format!("{} {}", row.name, row.method));
             }
@@ -354,7 +367,8 @@ async fn invalid_header_is_400_on_every_gated_route_9342() {
                 None,
             )
             .await;
-            if out.status != StatusCode::BAD_REQUEST || out.code() != VALIDATION_FAILED {
+            let is_400 = out.status == StatusCode::BAD_REQUEST && out.code() == VALIDATION_FAILED;
+            if !is_400 && !out.is_backend_gate_refusal() {
                 wrong.push(format!(
                     "{} {} {id:?} -> {} {}",
                     row.name, row.method, out.status, out.body
@@ -385,6 +399,7 @@ async fn client_supplied_anonymous_sentinel_is_refused_9341() {
             )
             .await;
             let refused_before_handler = out.is_funnel_refusal()
+                || out.is_backend_gate_refusal()
                 || (out.status == StatusCode::BAD_REQUEST && out.code() == VALIDATION_FAILED);
             if !refused_before_handler {
                 wrong.push(format!(
@@ -430,13 +445,19 @@ async fn non_utf8_agent_id_header_is_400_9342() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn per_agent_key_bound_caller_is_served_9341() {
     let fx = build(HttpIdentityMode::Enforce, true).await;
+    // A per-run title: a postgres backend keeps rows between runs, and a
+    // fixed title would make the re-run a 409 rather than a positive control.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let title = format!("t-9341-{}-{nanos}", std::process::id());
     let out = send_simple(
         &fx.router,
         "post",
         route_table::concrete_path(ai_memory::handlers::routes::MEMORIES).as_str(),
         ALICE_KEY,
         &[ALICE],
-        Some(serde_json::json!({"title": "t-9341", "content": "c-9341", "namespace": "ns-9341"})),
+        Some(serde_json::json!({"title": title, "content": "c-9341", "namespace": "ns-9341"})),
     )
     .await;
     assert!(
@@ -570,6 +591,9 @@ async fn per_agent_key_for_other_agent_is_binding_mismatch_9341() {
             None,
         )
         .await;
+        if out.is_backend_gate_refusal() {
+            continue;
+        }
         assert_eq!(
             (out.status, out.error_code()),
             (StatusCode::FORBIDDEN, IDENTITY_BINDING_MISMATCH),
