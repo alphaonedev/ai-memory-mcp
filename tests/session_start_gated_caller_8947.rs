@@ -31,7 +31,15 @@
 //!     `X-Agent-Id` x body `agent_id`) table in the shipped default mode, which
 //!     the fix must leave byte-for-byte as the base answers it, and the
 //!     own-claimed-id rows under Enforce;
-//!   * `default_mode_is_the_shipped_default_8947` — names the default mode.
+//!   * `default_mode_is_the_shipped_default_8947` — names the default mode;
+//!   * `e8947_*`   — round 1 (security review H1): an EMPTY / whitespace /
+//!     absent `X-Agent-Id` with a body that names no usable principal (`{}`,
+//!     `{"agent_id":null}`, the key-case twin `{"Agent_Id":"<B>"}`), per key
+//!     kind, under Enforce and the default mode. The caller must be the
+//!     principal the gate resolved (`anonymous:req-<uuid>` for these headers),
+//!     never the raw header string. The SSOT layer of the same hole (an empty
+//!     caller matching rows with no target) is pinned separately in
+//!     `tests/visibility_blank_caller_9356.rs`.
 
 #![cfg(feature = "sal")]
 #![allow(clippy::missing_panics_doc, clippy::too_many_lines)]
@@ -65,6 +73,23 @@ const ERR_BINDING_MISMATCH: &str = "identity_binding_mismatch";
 const ERR_BODY_HEADER_MISMATCH: &str = "agent_id body parameter does not match X-Agent-Id header";
 const SESSION_LIMIT: u64 = 50;
 const BODY_LIMIT_BYTES: usize = 512 * 1024;
+/// A third owner: every seeded row has NO `target_agent_id`, the shape an empty
+/// caller matched through `target == caller` (`"" == ""`).
+const AGENT_C: &str = "agent-c-8947";
+const MARKER_C_PRIVATE: &str = "marker-8947-c-private-content";
+/// Private markers no caller in the `e8947` tables may see except its own.
+const ALL_PRIVATE: [&str; 3] = [MARKER_A_PRIVATE, MARKER_B_PRIVATE, MARKER_C_PRIVATE];
+/// `X-Agent-Id` values that name no principal.
+const HDR_EMPTY: &str = "";
+const HDR_SPACE: &str = " ";
+const HDR_TAB: &str = "\t";
+const BLANK_HEADERS: [Option<&str>; 4] = [Some(HDR_EMPTY), Some(HDR_SPACE), Some(HDR_TAB), None];
+/// Raw JSON bodies that carry no usable `agent_id` (serde reads `agent_id`
+/// only, so the key-case twin is ignored).
+const BODY_EMPTY: &str = "{}";
+const BODY_NULL_AGENT: &str = r#"{"agent_id":null}"#;
+const BODY_KEYCASE_B: &str = r#"{"Agent_Id":"agent-b-8947"}"#;
+const BLANK_BODIES: [&str; 3] = [BODY_EMPTY, BODY_NULL_AGENT, BODY_KEYCASE_B];
 
 fn memory(owner: &str, title: &str, marker: &str, shared: bool) -> Memory {
     let now = chrono::Utc::now().to_rfc3339();
@@ -92,10 +117,11 @@ fn memory(owner: &str, title: &str, marker: &str, shared: bool) -> Memory {
     }
 }
 
-fn seed_rows() -> [Memory; 3] {
+fn seed_rows() -> [Memory; 4] {
     [
         memory(AGENT_A, "a-private-8947", MARKER_A_PRIVATE, false),
         memory(AGENT_B, "b-private-8947", MARKER_B_PRIVATE, false),
+        memory(AGENT_C, "c-private-8947", MARKER_C_PRIVATE, false),
         memory(AGENT_B, "shared-8947", MARKER_SHARED, true),
     ]
 }
@@ -463,6 +489,179 @@ async fn cell_m8947_enforce_own_id_matrix(router: &axum::Router) {
     run_rows(router, "m8947 enforce own-id", &rows).await;
 }
 
+/// One `session_start` call with a RAW JSON body: `body` is parsed, the test's
+/// namespace and limit are added, and every other key (a `null` `agent_id`, the
+/// key-case twin) is sent exactly as written.
+async fn call_raw(
+    router: &axum::Router,
+    key: &str,
+    x_agent: Option<&str>,
+    body: &str,
+) -> (StatusCode, Value, String) {
+    let mut payload: Value = serde_json::from_str(body).expect("table body is JSON");
+    payload["namespace"] = json!(NAMESPACE);
+    payload["limit"] = json!(SESSION_LIMIT);
+    let mut req = Request::builder()
+        .method("POST")
+        .uri(SESSION_START_PATH)
+        .header("content-type", "application/json")
+        .header("x-api-key", key);
+    if let Some(h) = x_agent {
+        req = req.header("x-agent-id", h);
+    }
+    let resp = router
+        .clone()
+        .oneshot(req.body(Body::from(payload.to_string())).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), BODY_LIMIT_BYTES)
+        .await
+        .unwrap();
+    let raw = String::from_utf8_lossy(&bytes).into_owned();
+    let parsed = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, parsed, raw)
+}
+
+/// Wire `code` of the authority chokepoint's malformed-header refusal
+/// (`src/handlers/authority.rs`, `#3549`).
+const CODE_VALIDATION_FAILED: &str = "VALIDATION_FAILED";
+/// Leading text of that refusal for a whitespace `X-Agent-Id` (the rest names
+/// the offending character).
+const ERR_INVALID_AGENT_ID_PREFIX: &str = "invalid agent_id: agent_id contains invalid character";
+
+/// The expected error of one `e8947` cell.
+#[derive(Clone, Copy)]
+enum BlankErr {
+    /// No `error` field.
+    None,
+    /// `error` equals this text exactly.
+    Exact(&'static str),
+    /// The authority chokepoint's malformed-header 400: `code` is
+    /// [`CODE_VALIDATION_FAILED`] and `error` starts with
+    /// [`ERR_INVALID_AGENT_ID_PREFIX`].
+    MalformedHeader,
+}
+
+impl BlankErr {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Exact(text) => text,
+            Self::MalformedHeader => CODE_VALIDATION_FAILED,
+        }
+    }
+}
+
+/// The expected answer of one `e8947` cell: exact status, the error, and the
+/// private markers the caller may see.
+struct BlankWant {
+    status: StatusCode,
+    err: BlankErr,
+    own: &'static [&'static str],
+}
+
+/// The rule the `e8947` table is generated from (one rule, every cell):
+///   * shared key, header empty or absent: no header value names a principal,
+///     so the gate admits the request as the anonymous principal it resolved;
+///     the answer is 200 with the shared row and NO private row of any owner;
+///   * shared key, whitespace header: a malformed id, refused before any
+///     handler by the authority chokepoint (400 `VALIDATION_FAILED`) in every
+///     mode;
+///   * per-agent key A, header empty or absent: the transport binds the
+///     request to A (`api_key_auth` inserts `X-Agent-Id: A`), so 200 with A's
+///     own row only;
+///   * per-agent key A, whitespace header: a non-empty value that is not A;
+///     Enforce refuses it as a binding mismatch (403), the default mode
+///     corrects it to A (200 with A's own row only).
+fn blank_want(mode: HttpIdentityMode, key: &str, header: Option<&str>) -> BlankWant {
+    const A_ONLY: &[&str] = &[MARKER_A_PRIVATE];
+    let whitespace = header.is_some_and(|h| !h.is_empty());
+    match (key == KEY_A, whitespace, mode) {
+        (false, false, _) => BlankWant {
+            status: StatusCode::OK,
+            err: BlankErr::None,
+            own: &[],
+        },
+        (false, true, _) => BlankWant {
+            status: StatusCode::BAD_REQUEST,
+            err: BlankErr::MalformedHeader,
+            own: &[],
+        },
+        (true, true, HttpIdentityMode::Enforce) => BlankWant {
+            status: StatusCode::FORBIDDEN,
+            err: BlankErr::Exact(ERR_BINDING_MISMATCH),
+            own: &[],
+        },
+        (true, _, _) => BlankWant {
+            status: StatusCode::OK,
+            err: BlankErr::None,
+            own: A_ONLY,
+        },
+    }
+}
+
+/// #8947 round 1 H1: (key kind x blank header x blank body) under `mode`. No
+/// cell may return a private row the key does not prove, and every 200 still
+/// returns the shared row (the answer is filtered, not empty by accident).
+async fn cell_e8947_blank_header_matrix(router: &axum::Router, mode: HttpIdentityMode) {
+    let mut mismatches: Vec<String> = Vec::new();
+    let mut cells = 0usize;
+    for key in [SHARED_KEY, KEY_A] {
+        for header in BLANK_HEADERS {
+            for body in BLANK_BODIES {
+                cells += 1;
+                let want = blank_want(mode, key, header);
+                let (status, parsed, raw) = call_raw(router, key, header, body).await;
+                let err = parsed["error"].as_str();
+                let err_ok = match want.err {
+                    BlankErr::None => parsed["error"].is_null(),
+                    BlankErr::Exact(text) => err == Some(text),
+                    BlankErr::MalformedHeader => {
+                        parsed["code"].as_str() == Some(CODE_VALIDATION_FAILED)
+                            && err.is_some_and(|e| e.starts_with(ERR_INVALID_AGENT_ID_PREFIX))
+                    }
+                };
+                let seen: Vec<&str> = ALL_PRIVATE
+                    .iter()
+                    .copied()
+                    .filter(|m| raw.contains(m))
+                    .collect();
+                let foreign: Vec<&str> = seen
+                    .iter()
+                    .copied()
+                    .filter(|m| !want.own.contains(m))
+                    .collect();
+                let shared_ok = status != StatusCode::OK || raw.contains(MARKER_SHARED);
+                if status != want.status
+                    || !err_ok
+                    || seen != want.own
+                    || !foreign.is_empty()
+                    || !shared_ok
+                {
+                    mismatches.push(format!(
+                        "e8947 {} key={key} header={header:?} body={body}: want status={} \
+                         err={} own={:?}; got status={} err={err:?} seen={seen:?} \
+                         foreign={foreign:?} shared={shared_ok}",
+                        mode.as_str(),
+                        want.status.as_u16(),
+                        want.err.label(),
+                        want.own,
+                        status.as_u16(),
+                    ));
+                }
+            }
+        }
+    }
+    assert_eq!(cells, 2 * BLANK_HEADERS.len() * BLANK_BODIES.len());
+    assert!(
+        mismatches.is_empty(),
+        "{} of {cells} cells differ:\n{}",
+        mismatches.len(),
+        mismatches.join("\n")
+    );
+}
+
 // ---------------------------------------------------------------------------
 // SQLite cells
 // ---------------------------------------------------------------------------
@@ -525,6 +724,20 @@ async fn m8947_sqlite_enforce_own_id_matrix() {
     cell_m8947_enforce_own_id_matrix(&sqlite_router(&dir)).await;
 }
 
+#[tokio::test]
+async fn e8947_sqlite_blank_header_enforce() {
+    let dir = scratch_dir();
+    let mode = HttpIdentityMode::Enforce;
+    cell_e8947_blank_header_matrix(&sqlite_router_in_mode(&dir, mode), mode).await;
+}
+
+#[tokio::test]
+async fn e8947_sqlite_blank_header_default_mode() {
+    let dir = scratch_dir();
+    let mode = HttpIdentityMode::default();
+    cell_e8947_blank_header_matrix(&sqlite_router_in_mode(&dir, mode), mode).await;
+}
+
 // ---------------------------------------------------------------------------
 // PostgreSQL cells (isolated scratch database; self-skip without a URL)
 // ---------------------------------------------------------------------------
@@ -537,9 +750,10 @@ mod pg_barrier;
 mod postgres_cells {
     use super::{
         Arc, Db, HttpIdentityMode, MemoryStore, ResolvedTtl, StorageBackend, build_router_in_mode,
-        cell_a8947_body_leg_per_agent_key, cell_a8947_body_leg_shared_key, cell_h2135_header_leg,
-        cell_h2135_header_leg_shared_key, cell_m8947_default_mode_matrix,
-        cell_m8947_enforce_own_id_matrix, cell_positive, pg_barrier, seed_rows,
+        cell_a8947_body_leg_per_agent_key, cell_a8947_body_leg_shared_key,
+        cell_e8947_blank_header_matrix, cell_h2135_header_leg, cell_h2135_header_leg_shared_key,
+        cell_m8947_default_mode_matrix, cell_m8947_enforce_own_id_matrix, cell_positive,
+        pg_barrier, seed_rows,
     };
     use ai_memory::store::CallerContext;
     use ai_memory::store::postgres::PostgresStore;
@@ -636,5 +850,23 @@ mod postgres_cells {
             return;
         };
         cell_m8947_enforce_own_id_matrix(&router).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn e8947_pg_blank_header_enforce() {
+        let mode = HttpIdentityMode::Enforce;
+        let Some((_scratch, router)) = pg_router_in_mode(mode).await else {
+            return;
+        };
+        cell_e8947_blank_header_matrix(&router, mode).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn e8947_pg_blank_header_default_mode() {
+        let mode = HttpIdentityMode::default();
+        let Some((_scratch, router)) = pg_router_in_mode(mode).await else {
+            return;
+        };
+        cell_e8947_blank_header_matrix(&router, mode).await;
     }
 }
