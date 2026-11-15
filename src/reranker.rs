@@ -3110,6 +3110,9 @@ mod tests {
 
     #[test]
     fn pr9i_new_neural_dual_outcome() {
+        // #8634: the loader reads $HOME to place the hub cache; hold the crate env lock so a
+        // $HOME-mutating test cannot redirect a model download into its scratch dir.
+        let _env_guard = crate::config::test_env_lock();
         // Exercises CrossEncoder::new_neural() (lines 65-79). Behavior is
         // environment-dependent: with an HF cache or network the call
         // succeeds and returns Self::Neural; without either it falls back
@@ -3558,6 +3561,9 @@ mod tests {
 
     #[test]
     fn pr9i_rerank_via_score_returns_blend() {
+        // #8634: the loader reads $HOME to place the hub cache; hold the crate env lock so a
+        // $HOME-mutating test cannot redirect a model download into its scratch dir.
+        let _env_guard = crate::config::test_env_lock();
         // Even when new_neural() falls back to lexical, rerank() must
         // still produce a deterministic [0..1] blend. Pins the contract
         // for both branches of CrossEncoder::score().

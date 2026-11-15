@@ -15691,6 +15691,9 @@ fn b3_precompute_with_no_embedder_returns_empty() {
 
 #[test]
 fn b3_precompute_with_local_embedder_populates_eight_descriptors() {
+    // #8634: the loader reads $HOME to place the hub cache; hold the crate env lock so a
+    // $HOME-mutating test cannot redirect a model download into its scratch dir.
+    let _env_guard = crate::config::test_env_lock();
     // Boot with a real local embedder when the model is downloadable
     // in this environment; otherwise skip — keeps CI green on
     // sandboxed runners that block hf-hub.
