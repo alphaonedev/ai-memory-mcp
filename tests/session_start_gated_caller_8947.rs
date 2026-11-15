@@ -264,7 +264,11 @@ async fn cell_a8947_body_leg_per_agent_key(router: &axum::Router) {
 async fn cell_positive(router: &axum::Router) {
     for body_agent in [Some(AGENT_A), None] {
         let (status, _parsed, raw) = call(router, KEY_A, None, body_agent).await;
-        assert_eq!(status, StatusCode::OK, "positive A body={body_agent:?}: {raw}");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "positive A body={body_agent:?}: {raw}"
+        );
         assert!(
             raw.contains(MARKER_A_PRIVATE),
             "positive A body={body_agent:?}: A must see its own private row: {raw}"
@@ -277,7 +281,10 @@ async fn cell_positive(router: &axum::Router) {
     }
     let (status, _parsed, raw) = call(router, KEY_B, None, Some(AGENT_B)).await;
     assert_eq!(status, StatusCode::OK, "positive B: {raw}");
-    assert!(raw.contains(MARKER_B_PRIVATE), "positive B sees own row: {raw}");
+    assert!(
+        raw.contains(MARKER_B_PRIVATE),
+        "positive B sees own row: {raw}"
+    );
     assert!(
         !raw.contains(MARKER_A_PRIVATE),
         "positive B must not see A's private row: {raw}"
