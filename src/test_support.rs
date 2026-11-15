@@ -1342,10 +1342,9 @@ impl TempDbFile {
     /// # Panics
     /// When the temporary file cannot be created.
     pub(crate) fn new_migrating() -> Self {
-        Self {
-            sweep_migration_backups: true,
-            ..Self::new()
-        }
+        let mut file = Self::new();
+        file.sweep_migration_backups = true;
+        file
     }
 }
 
