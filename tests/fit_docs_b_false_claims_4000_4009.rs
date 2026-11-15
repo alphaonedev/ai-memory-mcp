@@ -82,7 +82,7 @@ const DEFAULT_CLAIM_DOCS: [&str; 2] = ["docs/SECURITY.md", "docs/CLI_REFERENCE.m
 /// Forms of the false "authenticated / encrypted / hot-reloaded by default"
 /// claim (#9017). Lowercased; each is scanned over both references after
 /// whitespace flattening, so a re-wrap cannot hide one.
-const FALSE_DEFAULT_CLAIM_FORMS: [&str; 10] = [
+const FALSE_DEFAULT_CLAIM_FORMS: [&str; 12] = [
     "authentication is on by default",
     "trusts no one by default",
     "api key + mtls gate inbound",
@@ -94,7 +94,10 @@ const FALSE_DEFAULT_CLAIM_FORMS: [&str; 10] = [
     // (#1789), not the allowlist, and an unsigned write is refused.
     "trusts peers on the mtls allowlist",
     "accept any client",
+    "accept any peer",
     "can read and write",
+    // The keyless loopback bind serves (E-e probe); an API key is not required.
+    "required on loopback",
 ];
 
 /// Sentences `docs/SECURITY.md` must carry for the real default (#9017).
@@ -171,22 +174,46 @@ fn security_and_cli_reference_state_the_real_default_9017() {
     );
     assert_absent("docs/CLI_REFERENCE.md", "Axum-based HTTP daemon", ISSUE);
     for rel in DEFAULT_CLAIM_DOCS {
-        let lowered = flat_text(rel).to_lowercase();
-        for form in FALSE_DEFAULT_CLAIM_FORMS {
-            assert!(
-                !lowered.contains(form),
-                "{ISSUE}: {rel} carries the false default claim form {form:?}"
-            );
-        }
+        let found = false_claim_form(&flat_text(rel));
+        assert!(
+            found.is_none(),
+            "{ISSUE}: {rel} carries the false default claim form {found:?}"
+        );
     }
 }
 
-/// Finding id of the first false default claim form in `lowered` (already
-/// lowercased and whitespace-flattened), or `None` when the text is clean.
-fn false_claim_form(lowered: &str) -> Option<&'static str> {
-    FALSE_DEFAULT_CLAIM_FORMS
-        .into_iter()
-        .find(|form| lowered.contains(form))
+/// Lowercased alphanumeric words of `text`, each reduced to a crude stem
+/// (one of `ing`, `ed`, `es`, `s`, `e` removed, never below three letters),
+/// so `accept`, `accepts`, `accepted` and `accepting` compare equal. Forms
+/// and documents pass through the same step, so every form is
+/// inflection-tolerant by construction, in one linear pass.
+fn stemmed_words(text: &str) -> Vec<String> {
+    const SUFFIXES: [&str; 5] = ["ing", "ed", "es", "s", "e"];
+    const MIN_STEM_LEN: usize = 3;
+    text.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(|word| {
+            SUFFIXES
+                .iter()
+                .find_map(|suffix| {
+                    word.strip_suffix(suffix)
+                        .filter(|stem| stem.chars().count() >= MIN_STEM_LEN)
+                })
+                .unwrap_or(word)
+                .to_owned()
+        })
+        .collect()
+}
+
+/// Finding id (the form literal) of the first false default claim form found
+/// in `text` as a stemmed word sequence, or `None` when the text is clean.
+fn false_claim_form(text: &str) -> Option<&'static str> {
+    let words = stemmed_words(text);
+    FALSE_DEFAULT_CLAIM_FORMS.into_iter().find(|form| {
+        let needle = stemmed_words(form);
+        !needle.is_empty() && words.windows(needle.len()).any(|window| window == needle)
+    })
 }
 
 /// Verb inflections of "accept" the false claim "sync accepts any client"
