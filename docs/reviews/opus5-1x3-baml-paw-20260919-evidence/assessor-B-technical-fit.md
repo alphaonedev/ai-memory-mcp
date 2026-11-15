@@ -61,9 +61,9 @@ sources:
 
 - **The paper is real and its result is good.** arXiv 2607.02512, *"Program-as-Weights: A Programming Paradigm
   for Fuzzy Functions"*, Zhang, Hotsko, Kim, Nie, Shieber, Deng; submitted 2 July 2026. A 4B compiler trained on
-  a 10M-example set (FuzzyBench) emits adapters for a frozen 0.6B Qwen3 interpreter; the abstract's measured
+  a 10M-example set (FuzzyBench) emits adapters for a frozen 0.6B base-model interpreter; the abstract's measured
   claim is that the 0.6B interpreter running a PAW program "matches the performance of direct prompting of
-  Qwen3-32B, while using roughly one fiftieth of the inference memory and running at 30 tokens/s on a MacBook
+  a 32B open-weights model, while using roughly one fiftieth of the inference memory and running at 30 tokens/s on a MacBook
   M3." That is a *measurement*, and it is the strongest thing in this assessment in PAW's favour.
 - **The contract is text-in / text-out.** `AGENTS.md`: "Each function takes a single text input and returns a
   single text output." Closed-vocabulary behaviour is obtained by *asking nicely in the spec* — AGENTS.md's own
@@ -84,9 +84,9 @@ sources:
 |---|---|---|---|
 | Python SDK repo | **MIT** | GitHub repo footer + Links section; README licence section says "MIT" | High |
 | `paw-core`, `paw-candle` (and siblings) | **MIT** | crates.io API: every published version 0.1.0→0.3.0 carries `license: MIT` | High |
-| Qwen3-0.6B base | **Apache-2.0** | `huggingface.co/Qwen/Qwen3-0.6B` model-card `license: apache-2.0` | High |
+| the 0.6B base model | **Apache-2.0** | `huggingface.co/<upstream-0.6B-base>` model-card `license: apache-2.0` | High |
 | GPT-2 base | **MIT** | `huggingface.co/openai-community/gpt2` model-card `license: mit` | High |
-| **`paw-4b-qwen3-0.6b` (the compiler)** | **COULD NOT BE DETERMINED** | Model card shows no YAML `license:` tag and no licence prose. It states only that "the cleaned compile/runtime code and the arXiv preprint will be public by Jul 6, 2026" | — |
+| **`paw-4b-0.6b` (the compiler)** | **COULD NOT BE DETERMINED** | Model card shows no YAML `license:` tag and no licence prose. It states only that "the cleaned compile/runtime code and the arXiv preprint will be public by Jul 6, 2026" | — |
 | **`paw-programs`, `paw-base-models`, the GGUF repos, `paw-inference-logs`** | **COULD NOT BE DETERMINED** | No licence tag visible on the org listing or the cards I read | — |
 | **The generated adapters** | **COULD NOT BE DETERMINED** | Nothing in AGENTS.md, the README, or the model cards states who owns or licenses a compiled `.paw` artefact, and `public=True` implies a publication right they have not defined | — |
 
@@ -264,7 +264,7 @@ one, the API is not.
 ### 1.7 The strongest case against my own vote
 
 1. **The paper's number is better than anything W1d will produce, and it is measured.** A 0.6B interpreter
-   matching Qwen3-32B direct prompting is a serious result. An NLI cross-encoder is a 2019-era artefact and will
+   matching a 32B open-weights model direct prompting is a serious result. An NLI cross-encoder is a 2019-era artefact and will
    be worse at the seams that are genuinely semantic — the curator merge judge is closer to "would a careful
    person merge these" than to "does A entail B", and NLI is a poor proxy for that. I am choosing a weaker model
    because its output type is honest. That is a real trade and I should name it as one.
@@ -478,7 +478,7 @@ pub enum LlmProvider {
 ```
 
 and the doc comment on the second variant enumerates what rides in it: "xAI Grok, OpenAI, Anthropic (via OpenAI
-shim), Google Gemini, DeepSeek, Kimi, Qwen, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks, LMStudio,
+shim), Google Gemini, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks, LMStudio,
 vLLM, llama.cpp server, and any other vendor following the spec." **Seventeen-plus named vendors, one variant.**
 The only per-vendor knowledge in the client is a route string and an auth header; there is no
 `match vendor { Anthropic => …, Gemini => … }` anywhere. `is_ollama_native()` (`src/llm.rs:1465`) is a single
@@ -601,7 +601,7 @@ than repair.
 
 ## 3. What I could not establish
 
-- The licence of `paw-4b-qwen3-0.6b` (the compiler), `paw-programs`, `paw-base-models`, the GGUF repos, and
+- The licence of `paw-4b-0.6b` (the compiler), `paw-programs`, `paw-base-models`, the GGUF repos, and
   `paw-inference-logs`. No `license:` tag and no licence prose on the cards I read.
 - The licence and ownership of a **generated** PAW adapter. Undefined in every source, despite `public=True`
   being the documented compile default.

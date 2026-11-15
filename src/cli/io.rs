@@ -296,6 +296,8 @@ pub fn export(db_path: &Path, args: &ExportArgs, out: &mut CliOutput<'_>) -> Res
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
             "memories": memories, "links": links, "count": memories.len(),
+            // #8444 r2 sec LOW-2: content-free A2A task rows (additive key).
+            "a2a_tasks": crate::storage::a2a_tasks::a2a_task_export(&conn)?,
             (field_names::EXPORTED_AT): Utc::now().to_rfc3339(),
             (field_names::EXPORT_SCOPE): export_scope::SCOPE_MEMORIES_LINKS,
             (field_names::PORTABILITY_COMPLETE): export_scope::PORTABILITY_COMPLETE,

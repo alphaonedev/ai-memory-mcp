@@ -29,7 +29,7 @@ const KIND_PROVENANCE_LLM: &str = "llm";
 ///
 /// `Observation` and `Reflection` exist since v0.7.0. `Persona`
 /// landed in v0.7.0 QW-2 (schema v36) as the substrate-native
-/// Tencent-pattern L3 persona artefact.
+/// System Y-pattern L3 persona artefact.
 ///
 /// v0.7.x Form 6 (issue #759) — Batman taxonomy extension. The
 /// `Concept | Entity | Claim | Relation | Event | Conversation |

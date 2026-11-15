@@ -403,7 +403,7 @@ unless the **Parallel-safe with** / **Dependencies** rows say otherwise.
 
 - **Scope:**
   - **Decision point** — EITHER:
-    (a) Ship QW-4 (Tencent's "fourth quick win"; competitive positioning beyond docs).
+    (a) Ship QW-4 (System Y's "fourth quick win"; competitive positioning beyond docs).
         Scope, design, implement, test in v0.7.0 — would push tag-cut.
     (b) Re-attribute QW-4 to Form 7 governance refusals (`MCP_MUTATION_DISABLED_ERROR` is a
         plausible QW-4 anchor) and update CHANGELOG + release-notes accordingly.

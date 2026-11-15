@@ -9,6 +9,8 @@ mod key_dir_sandbox;
 
 use std::path::PathBuf;
 use std::process::{Command, Output};
+#[path = "common/child_stdin_report.rs"]
+mod child_stdin_report;
 
 struct Fixture {
     _tmp: tempfile::TempDir,
@@ -386,7 +388,6 @@ async fn postgres_registry_controls_doctor_preview_delete_and_refusal() {
 /// orphans, and this cell finds the signing key gone after `--yes`.
 #[test]
 fn resolved_ledger_signing_key_survives_prune_3354() {
-    use std::io::Write as _;
     let f = Fixture::new();
     let signer = ai_memory::identity::resolve_agent_id(None, None).expect("resolved id");
     let params = serde_json::json!({
@@ -404,12 +405,7 @@ fn resolved_ledger_signing_key_survives_prune_3354() {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("spawn capture-turn");
-    child
-        .stdin
-        .take()
-        .expect("piped stdin")
-        .write_all(params.to_string().as_bytes())
-        .expect("write stdin");
+    child_stdin_report::send_and_close(&mut child, "stdin payload", params.to_string().as_bytes());
     let out = child.wait_with_output().expect("capture-turn output");
     assert!(
         out.status.success(),

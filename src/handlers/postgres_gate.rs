@@ -245,6 +245,10 @@ pub fn postgres_endpoint_supported(method: &axum::http::Method, path: &str) -> b
         // Boids item 3 (#3266) — rewind dispatches to `MemoryStore::swarm_rewind`.
         ("POST", super::routes::MEMORY_SWARM_REWIND) => true,
         ("POST", super::routes::NOTIFY) => true,
+        // #8444 - Agent2Agent standard binding; the handlers dispatch to
+        // `MemoryStore` a2a_task_* and `notify_stamped` on Postgres.
+        ("POST", super::routes::A2A) => true,
+        ("GET", super::routes::AGENT_CARD) => true,
         ("POST", super::routes::GC) => true,
         ("POST", super::routes::IMPORT) => true,
         ("GET", super::routes::EXPORT) => true,
@@ -643,6 +647,8 @@ pub fn path_is_registered_route(method: &axum::http::Method, path: &str) -> bool
         ("GET", super::routes::SYNC_SINCE) => true,
         // Notify / inbox / subscriptions.
         ("POST", super::routes::NOTIFY) => true,
+        ("POST", super::routes::A2A) => true,
+        ("GET", super::routes::AGENT_CARD) => true,
         ("GET", super::routes::INBOX) => true,
         ("POST", super::routes::SUBSCRIPTIONS) => true,
         ("DELETE", super::routes::SUBSCRIPTIONS) => true,

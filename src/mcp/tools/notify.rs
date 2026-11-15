@@ -49,6 +49,24 @@ pub(crate) fn handle_notify_as_sender(
     persist_notify(conn, db_path, parse_notify(params)?, resolved_ttl, sender)
 }
 
+/// #8444: the Agent2Agent standard binding writes through this funnel so the
+/// inbound message gets the SAME quota, TTL, write-event and wake handling as
+/// every other notify, with `system_metadata` (the authenticated
+/// `content_principal` and the untrusted `a2a_role` label) stamped onto the
+/// memory AT FORMATION. `sender` is the credential-bound agent id.
+pub(crate) fn handle_notify_as_sender_stamped(
+    conn: &rusqlite::Connection,
+    db_path: &std::path::Path,
+    params: &Value,
+    resolved_ttl: &crate::config::ResolvedTtl,
+    sender: &str,
+    system_metadata: &serde_json::Map<String, Value>,
+) -> Result<Value, MemoryError> {
+    let mut input = parse_notify(params)?;
+    input.system_metadata = Some(system_metadata);
+    persist_notify(conn, db_path, input, resolved_ttl, sender)
+}
+
 /// Validated notification fields; both entries validate before any write.
 struct NotifyInput<'a> {
     target: &'a str,
@@ -57,6 +75,8 @@ struct NotifyInput<'a> {
     priority: i32,
     tier: Tier,
     why_trace: Option<&'a str>,
+    /// #8444: system-stamped metadata applied at memory formation.
+    system_metadata: Option<&'a serde_json::Map<String, Value>>,
 }
 
 fn parse_notify(params: &Value) -> Result<NotifyInput<'_>, MemoryError> {
@@ -100,6 +120,7 @@ fn parse_notify(params: &Value) -> Result<NotifyInput<'_>, MemoryError> {
         why_trace: params[param_names::WHY_TRACE]
             .as_str()
             .filter(|wt| !wt.trim().is_empty()),
+        system_metadata: None,
     })
 }
 
@@ -117,6 +138,7 @@ fn persist_notify(
         priority,
         tier,
         why_trace,
+        system_metadata,
     } = input;
     let namespace = crate::inbox_namespace(target);
 
@@ -147,6 +169,12 @@ fn persist_notify(
     // the `db::insert` gate; default posture is unchanged (advisory).
     if let Some(wt) = why_trace {
         metadata[param_names::WHY_TRACE] = json!(wt);
+    }
+    // #8444: system stamps win over any same-named key.
+    if let Some(stamp) = system_metadata {
+        for (k, v) in stamp {
+            metadata[k.as_str()] = v.clone();
+        }
     }
 
     let mem = Memory {

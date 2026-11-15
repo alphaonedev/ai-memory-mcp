@@ -20,13 +20,15 @@
 //!     vocabulary: `format:"md"` there is NOT refused by the rendering-format
 //!     gate (its own handler decides).
 
-use std::io::{BufRead as _, BufReader, Write as _};
+use std::io::{BufRead as _, BufReader};
 use std::process::{Command, Stdio};
 
 use ai_memory::models::{Memory, Tier};
 use ai_memory::toon::invalid_format_msg;
 use serde_json::{Value, json};
 
+#[path = "common/child_stdin_report.rs"]
+mod child_stdin_report;
 #[path = "common/mcp_wait.rs"]
 mod mcp_wait;
 
@@ -128,8 +130,13 @@ impl Mcp {
         let mut request = request.clone();
         request["id"] = json!(self.next_id);
         self.next_id += 1;
-        writeln!(self.input, "{request}").expect("MCP request");
-        self.input.flush().expect("flush");
+        child_stdin_report::write_line_or_report(
+            &mut self.input,
+            &mut self.child,
+            None,
+            "MCP request",
+            &request.to_string(),
+        );
         loop {
             let line = mcp_wait::recv_mcp_response(&self.output, "fmt3803");
             let response: Value = serde_json::from_str(&line).expect("JSON RPC");

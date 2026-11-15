@@ -8234,6 +8234,8 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
     }
 
     let addr = format!("{}:{}", args.host, args.port);
+    // #8444 r2: the Agent Card URL is configured or daemon-derived, never from headers.
+    crate::a2a::init_card_base_url(args.tls_cert.is_some() && args.tls_key.is_some(), &addr);
     tracing::info!("database: {}", db_path.display());
 
     // v1.0.0 #2166 — SIGHUP live `[llm]` reload. On unix, install a SIGHUP
@@ -10823,7 +10825,7 @@ mod tests {
         let mut cfg = AppConfig::default();
         cfg.embeddings = Some(crate::config::EmbeddingsSection {
             backend: Some(crate::llm::BACKEND_OLLAMA.to_string()),
-            model: Some("qwen3-embedding:4b".to_string()),
+            model: Some("unlisted-embedder:4b".to_string()),
             ..crate::config::EmbeddingsSection::default()
         });
         let got = resolve_boot_embedder_model(&tier, &cfg);
@@ -10833,7 +10835,7 @@ mod tests {
         );
         assert_eq!(
             got.unhonoured_config_model.as_deref(),
-            Some("qwen3-embedding:4b"),
+            Some("unlisted-embedder:4b"),
             "#2972: the un-honoured id must be REPORTED so `reembed` can refuse before \
              replacing every vector under a model the operator never asked for"
         );
@@ -13729,10 +13731,6 @@ decision = "allow"
             "ANTHROPIC_API_KEY",
             "GEMINI_API_KEY",
             "GOOGLE_API_KEY",
-            "MOONSHOT_API_KEY",
-            "KIMI_API_KEY",
-            "DASHSCOPE_API_KEY",
-            "QWEN_API_KEY",
             "MISTRAL_API_KEY",
             "GROQ_API_KEY",
             "TOGETHER_API_KEY",

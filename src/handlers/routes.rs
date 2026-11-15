@@ -95,6 +95,10 @@ pub const METRICS: &str = "/api/v1/metrics";
 pub const NAMESPACES: &str = "/api/v1/namespaces";
 pub const NAMESPACES_NS_STANDARD: &str = "/api/v1/namespaces/{ns}/standard";
 pub const NOTIFY: &str = "/api/v1/notify";
+/// #8444: the Agent2Agent (A2A 1.0) JSON-RPC endpoint.
+pub const A2A: &str = "/api/v1/a2a";
+/// #8444: the A2A Agent Card (served behind `api_key_auth`, not public).
+pub const AGENT_CARD: &str = "/.well-known/agent-card.json";
 pub const PENDING: &str = "/api/v1/pending";
 pub const PENDING_ID_APPROVE: &str = "/api/v1/pending/{id}/approve";
 pub const PENDING_ID_REJECT: &str = "/api/v1/pending/{id}/reject";

@@ -1,6 +1,6 @@
 # Copyright 2026 AlphaOne LLC
 # SPDX-License-Identifier: Apache-2.0
-"""``Swarm`` — spawns and supervises N GLM-driven agents.
+"""``Swarm`` — spawns and supervises N Flash-driven agents.
 
 The orchestrator turns a :class:`swarm.config.SwarmConfig` into a live
 population:
@@ -43,7 +43,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 
 class Swarm:
-    """A managed population of GLM-driven agents over one or more daemons."""
+    """A managed population of Flash-driven agents over one or more daemons."""
 
     def __init__(
         self,
@@ -91,7 +91,7 @@ class Swarm:
             stable = uuid.uuid5(
                 uuid.NAMESPACE_URL, f"{self.config.namespace_prefix}:agent:{ordinal:03d}"
             )
-            agent_id = f"ai:{self.config.namespace_prefix}-glm-{stable}"
+            agent_id = f"ai:{self.config.namespace_prefix}-flash-{stable}"
             key = self._load_or_create_key(agent_id)
             self.agents.append(
                 SwarmAgent.create(
@@ -155,7 +155,7 @@ class Swarm:
                     )
                     admins[base_url] = admin
                 await admin.register_agent(
-                    agent.identity.agent_id, agent_type="ai:glm-swarm"
+                    agent.identity.agent_id, agent_type="ai:flash-swarm"
                 )
                 # #3464 — the bind runs a challenge/response, so it takes the
                 # signing key itself (the private half proves possession).

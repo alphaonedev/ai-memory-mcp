@@ -49,7 +49,12 @@ const BIND_GUARD_MARKER: &str = "without an API key";
 const FEDERATED_LINE: &str = "[deployment] shape = \"federated\"";
 const TEAM_LINE: &str = "[deployment] shape = \"team\"";
 
-const BOOT_DEADLINE: Duration = Duration::from_secs(45);
+/// Upper bound on one `serve` boot, a HANG GUARD and not a performance
+/// assertion (#4166). The wait below ends on the child's exit (reported with
+/// its captured stderr) or on `/health`; a healthy boot that is merely slow on
+/// a loaded runner must never fail the test, so the bound is generous and only
+/// trips for a daemon that neither exits nor answers.
+const BOOT_HANG_GUARD: Duration = Duration::from_secs(300);
 const PROBE_INTERVAL: Duration = Duration::from_millis(100);
 const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
@@ -92,6 +97,8 @@ fn command_with_config(root: &Path, config_body: Option<&str>) -> Command {
         .env("AI_MEMORY_DB", root.join("store.db"))
         .env("AI_MEMORY_AUDIT_DIR", root.join("audit"))
         .env("RUST_LOG", "error");
+    // #4166: one shared helper keeps every serve boot off the embedder.
+    common::serve_test_env(&mut cmd);
     cmd
 }
 
@@ -162,7 +169,7 @@ fn boot_on_loopback(mut cmd: Command, root: &Path) -> BootOutcome {
             }
         })
     });
-    let deadline = Instant::now() + BOOT_DEADLINE;
+    let deadline = Instant::now() + BOOT_HANG_GUARD;
     loop {
         if let Ok(Some(status)) = child.try_wait() {
             if let Some(h) = reader {
@@ -182,11 +189,19 @@ fn boot_on_loopback(mut cmd: Command, root: &Path) -> BootOutcome {
             let stderr = buf.lock().unwrap().clone();
             return BootOutcome::Healthy { stderr };
         }
-        assert!(
-            Instant::now() < deadline,
-            "serve neither exited nor became healthy within {BOOT_DEADLINE:?}; stderr:\n{}",
-            buf.lock().unwrap()
-        );
+        if Instant::now() >= deadline {
+            // Reap BEFORE panicking so the daemon never outlives the test.
+            let _ = child.kill();
+            let _ = child.wait();
+            if let Some(h) = reader {
+                let _ = h.join();
+            }
+            panic!(
+                "serve neither exited nor became healthy within {BOOT_HANG_GUARD:?} (hang guard); stderr:
+{}",
+                buf.lock().unwrap()
+            );
+        }
         std::thread::sleep(PROBE_INTERVAL);
     }
 }

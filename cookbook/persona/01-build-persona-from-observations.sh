@@ -37,7 +37,7 @@
 #     (gemma3:4b or compatible smart-tier model).
 #
 # Issue links
-#   QW-2 spec:        v0.7.0 Grand-Slam QW-2 (Tencent L3 persona pattern)
+#   QW-2 spec:        v0.7.0 Grand-Slam QW-2 (System Y L3 persona pattern)
 #   Substrate cap:    Persona engine in src/persona/mod.rs
 #   Recipe ticket:    QW-2
 

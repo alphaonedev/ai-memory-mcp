@@ -49,7 +49,7 @@ choreography.*  ── scripted A2A scenarios ───────────�
 * **`orchestrator.py`** — `Swarm`: keys, provisioning (register + bind pubkey),
   namespace assignment, and staggered launch of N asyncio tasks.
 * **`choreography.py`** — deterministic A2A scenarios exercising isolation,
-  attestation, quorum, and replay-guard against the live GLM-driven population.
+  attestation, quorum, and replay-guard against the live Flash-driven population.
   With several daemon URLs the agents are round-robined across INDEPENDENT data
   tiers ("modules"), so every A2A scenario runs **once per module** over that
   module's own agents; the boundary itself is probed by `cross_module_handoff`,
@@ -176,7 +176,7 @@ same plane and then prints exactly what `ai-memory inbox` prints.
 * **Exception — the Experiential AI-NHI audit runs on Grok 4.6**
   (`x-ai/grok-4.6`): the agents doing the mission, the per-agent rubric and
   the final auditor all use Grok 4.6 for that dimension only, and the result
-  is weighted above the GLM-5.3-Flash run of the same audit. A GLM run is
+  is weighted above the GLM-5.3-Flash run of the same audit. A Flash run is
   still reported when it adds value.
 * An override is only accepted with a recorded reason:
 

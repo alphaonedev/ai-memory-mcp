@@ -157,6 +157,8 @@ pub const ROUTE_SESSION_START: &str = handlers::routes::SESSION_START;
 pub const ROUTE_SYNC_PUSH: &str = handlers::routes::SYNC_PUSH;
 pub const ROUTE_SYNC_SINCE: &str = handlers::routes::SYNC_SINCE;
 pub const ROUTE_NOTIFY: &str = handlers::routes::NOTIFY;
+pub const ROUTE_A2A: &str = handlers::routes::A2A;
+pub const ROUTE_AGENT_CARD: &str = handlers::routes::AGENT_CARD;
 pub const ROUTE_INBOX: &str = handlers::routes::INBOX;
 pub const ROUTE_SUBSCRIPTIONS: &str = handlers::routes::SUBSCRIPTIONS;
 pub const ROUTE_NAMESPACES: &str = handlers::routes::NAMESPACES;
@@ -442,7 +444,11 @@ pub const META_KEY_FAMILY: &str = "family";
 // handle_swarm_rewind_http`), the admin-gated #1111 mirror of
 // `memory_swarm_rewind` on both backends. A new PATH, so
 // EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT moves by 1 as well.
-pub const EXPECTED_PRODUCTION_ROUTES_COUNT: usize = 103;
+// 2026-10-31 (#8444) - bumped 103 -> 105: `GET /.well-known/agent-card.json`
+// (`handlers::agent_card`) and `POST /api/v1/a2a` (`handlers::a2a_rpc`), the
+// Agent2Agent (A2A 1.0) standard binding; two new PATHS, so
+// EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT moves by 2 as well.
+pub const EXPECTED_PRODUCTION_ROUTES_COUNT: usize = 105;
 // 2026-06-22 (#1718 Commit C) — bumped 89 → 90: the coordination
 // action-transition write surface `POST /api/v1/actions/{id}/transition`
 // (`handlers::transition_action`) — local CAS write + W-of-N federation fanout.
@@ -484,7 +490,9 @@ pub const EXPECTED_TEST_ROUTES_COUNT: usize = 3;
 // `/api/v1/agents/{id}/api-key/revoke` (admin revoke, approval-gated).
 // #3646 adds authenticated monitoring status and numeric exposition.
 // 2026-09-24 (Boids item 3, #3266) — bumped 88 → 89: `/api/v1/memory_swarm_rewind`.
-pub const EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT: usize = 89;
+// 2026-10-31 (#8444) - bumped 89 -> 91: `/api/v1/a2a` and
+// `/.well-known/agent-card.json` (Agent2Agent standard binding).
+pub const EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT: usize = 91;
 
 // ---------------------------------------------------------------------------
 // v0.7.0 multi-agent literal-sweep (scanner A, finding F-A3.1) —
@@ -919,6 +927,8 @@ pub mod llm;
 // per-vendor substrate has one home per concern (HTTP wire shape in
 // `llm.rs`, CLI ABI in `llm_cli_wrap.rs`). The CLI-binary-name
 // detection logic that PICKS a WrapStrategy stays in `cli/wrap.rs`.
+/// #8444 - Google Agent2Agent (A2A 1.0) standard binding: pure protocol layer.
+pub mod a2a;
 pub mod llm_cli_wrap;
 pub mod log_paths;
 pub mod logging;
@@ -1524,6 +1534,8 @@ pub fn build_router_with_timeout(
             get(handlers::get_capabilities),
         )
         .route(handlers::routes::NOTIFY, post(handlers::notify))
+        .route(handlers::routes::A2A, post(handlers::a2a_rpc))
+        .route(handlers::routes::AGENT_CARD, get(handlers::agent_card))
         .route(handlers::routes::INBOX, get(handlers::get_inbox))
         // v1.0.0 #3465 — the agent-facing push side of `memory_notify`.
         // SSE over the in-process wake bus; identity-bound to the

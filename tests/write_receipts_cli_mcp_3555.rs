@@ -3,10 +3,11 @@
 //! #3555: receipts survive CLI and MCP stdio serialization.
 use serde_json::{Value, json};
 use std::{
-    io::Write as _,
     path::Path,
     process::{Command, Stdio},
 };
+#[path = "common/child_stdin_report.rs"]
+mod child_stdin_report;
 
 /// `CARGO_TARGET_DIR` is an INPUT to cargo, not something it exports to a
 /// test process, so it is unset by default on every machine; fall back to
@@ -32,12 +33,7 @@ fn run(db: &Path, sync: &str, args: &[&str], input: &str) -> String {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = command.spawn().expect("spawn isolated CLI");
-    child
-        .stdin
-        .take()
-        .expect("stdin")
-        .write_all(input.as_bytes())
-        .expect("write stdin");
+    child_stdin_report::send_and_close(&mut child, "stdin payload", input.as_bytes());
     let output = child.wait_with_output().expect("CLI output");
     assert!(
         output.status.success(),

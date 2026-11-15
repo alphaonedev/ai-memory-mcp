@@ -49,7 +49,7 @@ class CallLog:
         entry = {
             "agent_id": agent_id,
             "module": module,  # daemon base URL the call went to (multi-module runs)
-            # "agent" (the GLM loop chose it) or "harness" (a scripted
+            # "agent" (the Flash model loop chose it) or "harness" (a scripted
             # choreography/probe dispatched it AS the agent). Mission evidence
             # counts only agent-originated work (#3440).
             "origin": _call_origin,

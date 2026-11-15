@@ -96,7 +96,7 @@
   <div class="am-proof">
     <span><b>PostgreSQL 18</b> + pgvector</span>
     <span><b>Apache AGE</b> when installed</span>
-    <span><b>76 of the 89 unique paths</b> served</span>
+    <span><b>78 of the 91 unique paths</b> served</span>
     <span><b>rack-spread</b> W-of-N quorum</span>
     <span><b>wake-hub</b> per host</span>
   </div>
@@ -149,7 +149,7 @@
 <g class="rise" style="--d:0.5s"><rect class="box" x="850" y="170" width="220" height="108" rx="12"/><text class="t-m" x="866" y="194">knowledge-graph walks</text><text class="t-s" x="866" y="210">AGE detected at boot:</text><text class="t-a" x="866" y="226">Cypher projection</text><text class="t-s" x="866" y="242">otherwise: recursive CTE</text><text class="t-s" x="866" y="258">over memory_links</text></g>
 <path class="wire" d="M960 170 V136" marker-end="url(#t4r-as)"/><path class="flow slate" d="M960 170 V136"/><path class="dot slate" pathLength="100" d="M960 170 V136" style="--d:1.6s"/><text class="t-bad" x="466" y="236">no</text><path class="wire" d="M500 202 V250 H560" marker-end="url(#t4r-ab)"/><path class="flow bad" d="M500 202 V250 H560"/><path class="dot bad" pathLength="100" d="M500 202 V250 H560" style="--d:1.0s"/><g class="rise" style="--d:0.6s"><rect class="box bad" x="564" y="226" width="250" height="50" rx="10"/><text class="t-bad" x="578" y="246">registered, not yet on PG:</text><text class="t-s" x="578" y="262">uniform 501 NOT IMPLEMENTED</text></g>
 <g class="rise" style="--d:0.7s"><rect class="box" x="564" y="284" width="250" height="44" rx="10"/><text class="t-m" x="578" y="302">not a registered route:</text><text class="t-s" x="578" y="318">404, never a false 501</text></g>
-<path class="wire" d="M500 250 V306 H560" marker-end="url(#t4r-ah)"/><text class="t-slate" x="30" y="250">76 of the 89 unique paths</text><text class="t-s" x="30" y="268">are served on PostgreSQL;</text><text class="t-s" x="30" y="284">the rest fail closed and never</text><text class="t-s" x="30" y="300">touch the wrong database.</text></svg>
+<path class="wire" d="M500 250 V306 H560" marker-end="url(#t4r-ah)"/><text class="t-slate" x="30" y="250">78 of the 91 unique paths</text><text class="t-s" x="30" y="268">are served on PostgreSQL;</text><text class="t-s" x="30" y="284">the rest fail closed and never</text><text class="t-s" x="30" y="300">touch the wrong database.</text></svg>
 
   </figure>
   <p class="am-figcap"><b>Graph walks.</b> At boot the PostgreSQL store checks whether the AGE extension is installed; with it, knowledge-graph walks use a Cypher projection, without it they fall back to a recursive CTE. <code>memory_links</code> is the source of truth either way. Sources: <code>src/handlers/postgres_gate.rs</code>, <code>src/store/postgres.rs</code>; guide: <a href="kg-backend-fallback.html">graph backend fallback</a>.</p>

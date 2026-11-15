@@ -50,7 +50,6 @@
 #![cfg(feature = "sal")]
 #![allow(clippy::missing_panics_doc, clippy::too_many_lines)]
 
-use std::io::Write;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -66,6 +65,8 @@ use ai_memory::handlers::{ApiKeyState, AppState, Db, StorageBackend};
 use ai_memory::models::{ConfidenceSource, Memory, MemoryKind, Tier};
 use ai_memory::store::sqlite::SqliteStore;
 use ai_memory::store::{CallerContext, MemoryStore, StoreError};
+#[path = "common/child_stdin_report.rs"]
+mod child_stdin_report;
 
 const ALICE: &str = "ai:alice-3730-gate";
 const BOB: &str = "ai:bob-3730-gate";
@@ -226,7 +227,7 @@ fn mcp(
         .spawn()
         .expect("mcp child");
     let request = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":tool,"arguments":args}});
-    writeln!(child.stdin.take().expect("stdin"), "{request}").expect("request");
+    child_stdin_report::send_and_close(&mut child, "request", format!("{request}\n").as_bytes());
     let deadline = Instant::now() + Duration::from_secs(60);
     while child.try_wait().expect("poll").is_none() {
         assert!(Instant::now() < deadline, "MCP child timed out on {tool}");

@@ -48,7 +48,7 @@
 #![cfg(feature = "sal")]
 #![allow(clippy::needless_update)]
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -65,6 +65,8 @@ use ai_memory::federation::push_dlq::{SqliteDlqSink, replay_once};
 use ai_memory::federation::{FederationConfig, PeerEndpoint};
 use ai_memory::models::{ConfidenceSource, Memory, MemoryKind, Tier};
 use ai_memory::replication::QuorumPolicy;
+#[path = "common/child_stdin_report.rs"]
+mod child_stdin_report;
 
 const NS: &str = "erasure-2446";
 
@@ -245,7 +247,6 @@ fn mcp_tool_call(db_path: &std::path::Path, tool: &str, arguments: &serde_json::
         .spawn()
         .expect("spawn ai-memory mcp");
     {
-        let stdin = child.stdin.as_mut().expect("mcp stdin");
         let init = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -262,9 +263,11 @@ fn mcp_tool_call(db_path: &std::path::Path, tool: &str, arguments: &serde_json::
             "method": "tools/call",
             "params": {"name": tool, "arguments": arguments}
         });
-        writeln!(stdin, "{init}").expect("write initialize");
-        writeln!(stdin, "{call}").expect("write tools/call");
-        stdin.flush().expect("flush mcp stdin");
+        child_stdin_report::write_open(
+            &mut child,
+            "mcp requests",
+            format!("{init}\n{call}\n").as_bytes(),
+        );
     }
     // Close stdin so the stdio loop terminates after answering.
     drop(child.stdin.take());

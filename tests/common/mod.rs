@@ -82,6 +82,12 @@ pub mod pg_isolate;
 #[cfg(feature = "sal-postgres")]
 pub mod pg_barrier;
 
+// #8734 — the ONE declaration of `child_stdin_report.rs` for every crate that has
+// `mod common;`. A test file there writes `use common::child_stdin_report;`; a
+// crate without `mod common;` loads it through `#[path]` (std-only leaf, same
+// idiom as `mcp_wait`); `mcp_stdio_child` reaches it as `super::child_stdin_report`.
+pub mod child_stdin_report;
+
 // #3777 — the ONE lane-database predicate every guarded postgres cell calls.
 pub mod lane_db;
 
@@ -160,6 +166,22 @@ pub fn pg_test_client(agent_id: &str) -> reqwest::Client {
 /// lock for its lifetime so a panicking assertion still restores prior
 /// env state on unwind.
 static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+/// #4166: the environment every test that boots the real `ai-memory serve`
+/// must give the child, so the boot never waits on an embedder.
+///
+/// With a cleared environment and an empty `HOME` the semantic tier tries a
+/// model download (180 s timeout) before `/health` answers. On a loaded runner
+/// that outlasts any fixed boot deadline and the test fails although nothing
+/// is wrong (PR #8602 linux-fed, PR #8705 macos-fed). Offline the daemon
+/// serves keyword recall, which is the boot path these tests assert on.
+/// `tests/serve_spawn_boot_wait_4166.rs` scans the tree and fails for a serve
+/// spawn that neither calls this helper nor sets `AI_MEMORY_EMBED_OFFLINE`.
+#[allow(dead_code)] // Not every test binary that includes `common` boots serve.
+pub fn serve_test_env(cmd: &mut std::process::Command) -> &mut std::process::Command {
+    cmd.env("AI_MEMORY_EMBED_OFFLINE", "1")
+        .env("HF_HUB_OFFLINE", "1")
+}
 
 /// FX-C6 — Pin `AI_MEMORY_NO_CONFIG=1` for the lifetime of the test
 /// process before any in-process integration test transitively calls

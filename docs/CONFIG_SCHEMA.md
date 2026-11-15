@@ -33,7 +33,7 @@ db   = "<home>/.claude/ai-memory.db"
 # ---------------------------------------------------------------------
 [llm]
 backend     = "xai"           # ollama | openai | xai | anthropic | gemini |
-                              # kimi | qwen | mistral | groq |
+                              # mistral | groq |
                               # together | cerebras | openrouter |
                               # fireworks | lmstudio | vllm | openai-compatible
 model       = "grok-4.3"      # vendor-specific identifier
@@ -226,7 +226,7 @@ to certify a stack whose probed versions drift from the pins below).
 | Apache AGE | **1.8.0** | `AGE_APT_VERSION=1.8.0~rc0-2.pgdg13+1` (overlaid via pgdg apt on base `AGE_BASE_IMAGE=apache/age:release_PG18_1.7.0`; `CREATE EXTENSION age` reports extversion 1.8.0), `EXPECTED_AGE_VERSION=1.8.0` |
 | pgvector (server extension) | **0.8.7** | `PGVECTOR_APT_VERSION=0.8.7-1.pgdg13+1` |
 | pgvector (Rust binding crate) | **0.4** | `Cargo.toml` → `pgvector = "0.4"` |
-| ai-memory postgres schema | **v100** | postgres ladder pinned in lockstep with SQLite `CURRENT_SCHEMA_VERSION = 100` (`src/storage/migrations.rs`). NOTE: the `deploy/docker-1461` / `deploy/do-1461` provisioning configs are reproducibility anchors **pinned to the v0.7.0 release** (`EXPECTED_VERSION=0.7.0`, `EXPECTED_SCHEMA=57`, golden SHA), so their `57` is correct *for that pinned release* — it is not a stale copy of the current tip (`CURRENT_SCHEMA_VERSION = 100`). A deployment-validation anchor at the current schema would be a separate config. |
+| ai-memory postgres schema | **v101** | postgres ladder pinned in lockstep with SQLite `CURRENT_SCHEMA_VERSION = 101` (`src/storage/migrations.rs`). NOTE: the `deploy/docker-1461` / `deploy/do-1461` provisioning configs are reproducibility anchors **pinned to the v0.7.0 release** (`EXPECTED_VERSION=0.7.0`, `EXPECTED_SCHEMA=57`, golden SHA), so their `57` is correct *for that pinned release* — it is not a stale copy of the current tip (`CURRENT_SCHEMA_VERSION = 101`). A deployment-validation anchor at the current schema would be a separate config. |
 
 The bundled stacked image at
 [`deploy/docker-1461/Dockerfile.pg-age-vector`](../deploy/docker-1461/Dockerfile.pg-age-vector)
@@ -726,8 +726,6 @@ order:
    - `openai` → `OPENAI_API_KEY`
    - `anthropic` → `ANTHROPIC_API_KEY`
    - `gemini` → `GEMINI_API_KEY` (or `GOOGLE_API_KEY`)
-   - `kimi` / `moonshot` → `MOONSHOT_API_KEY` (or `KIMI_API_KEY`)
-   - `qwen` / `dashscope` → `DASHSCOPE_API_KEY` (or `QWEN_API_KEY`)
    - `mistral` → `MISTRAL_API_KEY`
    - `groq` → `GROQ_API_KEY`
    - `together` → `TOGETHER_API_KEY`
@@ -753,8 +751,6 @@ operator does not override:
 | `xai`            | `https://api.x.ai/v1`                             | `grok-4.3`                                      |
 | `anthropic`      | `https://api.anthropic.com/v1`                    | `claude-opus-4.7`                               |
 | `gemini`         | `https://generativelanguage.googleapis.com/v1beta/openai` | `gemini-2.0-flash`                      |
-| `kimi`/`moonshot`| `https://api.moonshot.cn/v1`                      | `moonshot-v1-8k`                                |
-| `qwen`/`dashscope`| `https://dashscope.aliyuncs.com/compatible-mode/v1` | `qwen-max`                                |
 | `mistral`        | `https://api.mistral.ai/v1`                       | `mistral-large-latest`                          |
 | `groq`           | `https://api.groq.com/openai/v1`                  | `llama-3.3-70b-versatile`                       |
 | `together`       | `https://api.together.xyz/v1`                     | `meta-llama/Llama-3.3-70B-Instruct-Turbo`       |

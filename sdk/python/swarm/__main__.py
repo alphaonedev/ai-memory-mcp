@@ -3,7 +3,7 @@
 """``python -m swarm`` — run the acceptance swarm from the environment.
 
 Reads :class:`swarm.config.SwarmConfig` from the environment, runs the live
-GLM-driven population plus the scripted choreographies, prints the coverage
+Flash-driven population plus the scripted choreographies, prints the coverage
 matrix, and exits non-zero if the manifest was not fully covered.
 
 Requires ``OPENROUTER_API_KEY`` and a reachable daemon (see ``README.md``).

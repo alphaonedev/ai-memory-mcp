@@ -31,6 +31,7 @@ use ai_memory::identity::owner_stamp::{
 };
 use ai_memory::models::{Memory, MemoryKind, Tier};
 use common::EnvVarGuard;
+use common::child_stdin_report;
 use serde_json::{Value, json};
 
 const NS: &str = "unstamped-3124";
@@ -580,9 +581,11 @@ fn mcp_call(path: &Path, home: &Path, mode: &str, tool: &str, args: &Value) -> V
     let request = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
         "params": {"name": tool, "arguments": args}});
     {
-        use std::io::Write as _;
-        let mut stdin = child.stdin.take().expect("stdin");
-        writeln!(stdin, "{request}").expect("request");
+        child_stdin_report::send_and_close(
+            &mut child,
+            "request",
+            format!("{request}\n").as_bytes(),
+        );
     }
     let output = child.wait_with_output().expect("output");
     String::from_utf8(output.stdout)

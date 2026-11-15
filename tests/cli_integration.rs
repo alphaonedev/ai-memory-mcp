@@ -13,12 +13,13 @@
 //! triggering embedder/LLM init) is bypassed. Each test gets a unique
 //! tempdir for the DB so the suite parallelises cleanly.
 
-use std::io::Write;
 use std::process::{Command as StdCommand, Stdio};
 
 use assert_cmd::Command;
 use predicates::prelude::*;
 use tempfile::TempDir;
+#[path = "common/child_stdin_report.rs"]
+mod child_stdin_report;
 
 /// Build the standard `ai-memory --db <tmp>` command shape with
 /// `AI_MEMORY_NO_CONFIG=1` set. The returned `Command` still needs the
@@ -259,10 +260,7 @@ fn store_with_stdin_content() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    {
-        let stdin = child.stdin.as_mut().unwrap();
-        stdin.write_all(b"hello-from-stdin").unwrap();
-    }
+    child_stdin_report::write_open(&mut child, "stdin payload", b"hello-from-stdin");
     let out = child.wait_with_output().unwrap();
     assert!(
         out.status.success(),
@@ -529,10 +527,7 @@ fn shell_quit_immediately() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    {
-        let stdin = child.stdin.as_mut().unwrap();
-        stdin.write_all(b"quit\n").unwrap();
-    }
+    child_stdin_report::write_open(&mut child, "stdin payload", b"quit\n");
     let out = child.wait_with_output().unwrap();
     assert!(
         out.status.success(),

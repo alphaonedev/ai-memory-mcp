@@ -42,8 +42,6 @@ avoid a circular dep — see §DRIFT for the sync risk):
 | `xai` | `grok-4.3` | `https://api.x.ai/v1` | `XAI_API_KEY` |
 | `anthropic` | `claude-opus-4.7` | `https://api.anthropic.com/v1` | `ANTHROPIC_API_KEY` |
 | `gemini` | `gemini-2.0-flash` | `…/v1beta/openai` | `GEMINI_API_KEY`,`GOOGLE_API_KEY` |
-| `kimi`/`moonshot` | `moonshot-v1-8k` | `https://api.moonshot.cn/v1` | `MOONSHOT_API_KEY`,`KIMI_API_KEY` |
-| `qwen`/`dashscope` | `qwen-max` | `…/compatible-mode/v1` | `DASHSCOPE_API_KEY`,`QWEN_API_KEY` |
 | `mistral` | `mistral-large-latest` | `https://api.mistral.ai/v1` | `MISTRAL_API_KEY` |
 | `groq` | `llama-3.3-70b-versatile` | `https://api.groq.com/openai/v1` | `GROQ_API_KEY` |
 | `together` | `meta-llama/Llama-3.3-70B-Instruct-Turbo` | `https://api.together.xyz/v1` | `TOGETHER_API_KEY` |

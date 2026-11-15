@@ -80,7 +80,7 @@ This page is the engineering-precise primer. The procurement-level
 introduction lives in [`v0.7.0/release-notes.md`](v0.7.0/release-notes.html).
 The CHANGELOG block sits under v0.7.0 in [`../CHANGELOG.md`](../CHANGELOG.md).
 The category-level comparison against other agent-memory projects
-(mem0, Letta, Tencent TencentDB Agent Memory, etc.) lives in
+(mem0, Letta, System Y, etc.) lives in
 [`positioning.md`](positioning.html).
 
 ## Conceptual model
@@ -491,6 +491,11 @@ promote) and refuses depths below
 **round-trip digest guarantee** holds: promote → export → re-register
 produces the IDENTICAL SHA-256 digest as the in-DB row — the lineage
 is preserved cryptographically across promotion and re-registration.
+The promoted skill carries a `_visibility` binding that names the
+promoting principal, so the guarantee holds when that principal
+re-registers; a different principal is refused with a message naming
+the remedies (v1.0.0 #8832, see `docs/agent-skills.md` *Round-trip
+semantics*).
 
 The reflection and every linked source must be readable by the resolved caller
 before promotion renders, audits, signs or registers the bundle (#3551).
@@ -521,6 +526,25 @@ or `grep` the directory to inspect the reflection chain without
 opening a `sqlite3` shell. The on-disk artefact is **derived** —
 the SQL row stays canonical; the directory is safe to delete and
 regenerate.
+
+On Unix, CLI and automatic exports create mode 0700 export roots and namespace
+directories owned by the current user, and atomically publish mode 0600 files.
+Existing managed directories must already have permission bits 0700 (owner only;
+a setgid bit inherited from the parent directory is accepted, as are sticky and
+setuid bits, which are ignored); the exporter refuses broader directories
+instead of changing permissions. Choose a new private root or explicitly repair
+the owned export directories before retrying an older 0755 tree. Existing
+ancestors are not changed and must remain under trusted
+control. Symlink directories and symlink/non-regular file destinations are
+refused. Ordinary `team/alpha` namespace nesting is preserved.
+Platforms without Unix permissions refuse these exports.
+Refusal cannot undo earlier disclosure. A crash can leave a private
+`.private-export-*.stage` file. Before publication, a sweep runs once per destination
+directory per CLI run and once per automatic reflection or persona export call. It removes only regular staging
+files whose modification time is older than one hour; newer or future modification
+times are retained, as are symlinks and non-regular entries. Cleanup errors warn
+without stopping export. Remove any remaining incomplete stages manually only with
+exporters stopped.
 
 ```bash
 # Bulk export, operator-driven.

@@ -7,8 +7,10 @@
 
 use ai_memory::models::{Routine, RoutineState};
 use serde_json::{Value, json};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader};
 
+#[path = "common/child_stdin_report.rs"]
+mod child_stdin_report;
 #[path = "common/mcp_wait.rs"]
 mod mcp_wait;
 
@@ -67,8 +69,13 @@ impl Mcp {
     }
 
     fn request(&mut self, request: &Value) -> Value {
-        writeln!(self.input, "{request}").expect("request");
-        self.input.flush().expect("flush");
+        child_stdin_report::write_line_or_report(
+            &mut self.input,
+            &mut self.child,
+            None,
+            "request",
+            &request.to_string(),
+        );
         loop {
             let line = mcp_wait::recv_mcp_response(&self.output, "routine authorization");
             let response: Value = serde_json::from_str(&line).expect("JSON RPC");

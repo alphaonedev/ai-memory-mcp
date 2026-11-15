@@ -120,7 +120,7 @@ The strongest argument that I am wrong:
 
 ### 3.1 What it is
 
-Compiles a natural-language spec into a small LoRA adapter (~22 MB) that runs locally on a tiny interpreter model. Paper: **"Program-as-Weights: A Programming Paradigm for Fuzzy Functions"**, Wentao Zhang, Liliana Hotsko, Woojeong Kim, Pengyu Nie, Stuart Shieber, Yuntian Deng; arXiv 2607.02512, submitted 2026-07-02, **paper licensed CC BY 4.0**. Headline result: "a 0.6B Qwen3 interpreter executing PAW programs matches the performance of direct prompting of Qwen3-32B", via "a 4B compiler trained on FuzzyBench, a 10M-example dataset."
+Compiles a natural-language spec into a small LoRA adapter (~22 MB) that runs locally on a tiny interpreter model. Paper: **"Program-as-Weights: A Programming Paradigm for Fuzzy Functions"**, Wentao Zhang, Liliana Hotsko, Woojeong Kim, Pengyu Nie, Stuart Shieber, Yuntian Deng; arXiv 2607.02512, submitted 2026-07-02, **paper licensed CC BY 4.0**. Headline result: "a 0.6B the base model interpreter executing PAW programs matches the performance of direct prompting of a 32B open-weights model", via "a 4B compiler trained on FuzzyBench, a 10M-example dataset."
 
 That result, if it holds, is genuinely interesting for us — it is the shape of the posture-2 air-gapped decider.
 
@@ -133,11 +133,11 @@ Establishing the licence of each artefact separately, as instructed:
 | `github.com/programasweights/programasweights-python` (source repo) | **MIT**, "Copyright (c) 2026 ProgramAsWeights" | fetched `raw.githubusercontent.com/.../main/LICENSE` |
 | All 11 repos in the GitHub org | **MIT** (10 with licences; `.github` shows none) | org repository listing |
 | arXiv paper text | **CC BY 4.0** | arXiv abs page |
-| `huggingface.co/programasweights/paw-4b-qwen3-0.6b` (the Standard compiler) | **NO LICENCE.** No licence field in card or YAML. `base_model: Qwen/Qwen3-4B-Instruct-2507`. | model page |
+| `huggingface.co/programasweights/paw-4b-0.6b` (the Standard compiler) | **NO LICENCE.** No licence field in card or YAML. `base_model: <upstream-4B-instruct-base>`. | model page |
 | `huggingface.co/programasweights/paw-4b-gpt2` (Compact compiler) | **NO LICENCE.** | org listing |
 | `huggingface.co/programasweights/paw-programs` (**the adapters**) | **NO LICENCE. No model card at all** ("No model card"). 433+ variants. No terms of use. | model page |
-| `huggingface.co/programasweights/paw-base-models` | **NO LICENCE.** Redistributes a Qwen3 GGUF (Q6_K, 623 MB) with no base-model attribution and no NOTICE. | model page |
-| `.../GPT2-GGUF-Q8_0`, `.../GPT2-GGUF-Q6_K`, `.../Qwen3-0.6B-GGUF-Q6_K` | **NO LICENCE** on any of the three. | org listing |
+| `huggingface.co/programasweights/paw-base-models` | **NO LICENCE.** Redistributes a base-model GGUF (Q6_K, 623 MB) with no base-model attribution and no NOTICE. | model page |
+| `.../GPT2-GGUF-Q8_0`, `.../GPT2-GGUF-Q6_K`, `.../<0.6B-base>-GGUF-Q6_K` | **NO LICENCE** on any of the three. | org listing |
 | `huggingface.co/datasets/programasweights/paw-inference-logs` | **NO LICENCE.** Empty README. | dataset page |
 | `programasweights.com` hosted API | **NO TERMS OF SERVICE, NO PRIVACY POLICY, NO ACCEPTABLE-USE POLICY located.** AGENTS.md states rate limits and `PAW_API_KEY` but **no licence statement and no data-retention or logging statement anywhere.** | AGENTS.md + site fetch + search |
 | `github.com/dynamder/paw-rs` (the Rust implementation) | **MIT** — but see §3.3, it is unaffiliated | crates.io + repo |
@@ -147,13 +147,13 @@ Establishing the licence of each artefact separately, as instructed:
 **The permissive repository licence does not rescue this.** MIT on the Python SDK licenses the loader. It grants nothing over the weights the loader loads. This is precisely the trap the brief named.
 
 **What the base models bring, and why it does not help:**
-- `Qwen/Qwen3-0.6B` — **apache-2.0** (verified on the model card). Permissive, commercial use fine.
+- `<upstream-0.6B-base>` — **apache-2.0** (verified on the model card). Permissive, commercial use fine.
 - `openai-community/gpt2` — **mit** (verified). Permissive. Its own card carries the honest caveat: *"Because large-scale language models like GPT-2 do not distinguish fact from fiction, we don't support use-cases that require the generated text to be true."* For a decider feeding a curator merge gate, that sentence should be read twice.
-- `Qwen/Qwen3-4B-Instruct-2507` (the compiler's base) — Qwen3 series is Apache-2.0.
+- `<upstream-4B-instruct-base>` (the compiler's base) — base-model series is Apache-2.0.
 
 So the *bases* are clean. **That is not the problem — and it makes the omission worse, not better.** PAW had every reason to inherit Apache-2.0/MIT and simply did not label anything. Which produces a second, sharper finding:
 
-> **`paw-base-models` and the three GGUF repos appear to redistribute Apache-2.0 Qwen3 and MIT GPT-2 derivatives with no licence file, no NOTICE, and no attribution.** Apache-2.0 §4(a)/(d) requires a redistributor to carry the licence and the NOTICE. On its face this is an upstream compliance defect in the exact artefacts we would consume. We would be taking a compliance problem into our own SBOM and inheriting somebody else's attribution failure.
+> **`paw-base-models` and the three GGUF repos appear to redistribute Apache-2.0 base-model and MIT GPT-2 derivatives with no licence file, no NOTICE, and no attribution.** Apache-2.0 §4(a)/(d) requires a redistributor to carry the licence and the NOTICE. On its face this is an upstream compliance defect in the exact artefacts we would consume. We would be taking a compliance problem into our own SBOM and inheriting somebody else's attribution failure.
 
 **Stated plainly, as the brief requires:** *the licence of the published PAW compiler, base-model mirrors, and compiled adapters could not be determined from the sources, because none is stated anywhere.* That is a finding.
 
@@ -193,13 +193,13 @@ Established via codegraph at `<home>/v07/v09-dev`.
 
 3. **`src/egress.rs` — the posture gate.** `EgressClass::InferenceLlm` (`:77`), `InferenceEgressMode::{Allow, LoopbackOnly, Deny}` (`:107`), `resolve_inference_egress_mode` (`:177`) failing closed to `Deny` on an unrecognised token with the warning *"refusing to widen inference egress on a typo... (no memory content leaves the host for inference)"*, and `EgressDecision::Refuse { class, target, reason }` (`:199`) feeding the signed refusal row. PAW's remote API is unambiguously `InferenceLlm`. Given §3.4 it should never be reachable in any posture; a "150 ms remote" option that we must permanently pin to refused is an attractive nuisance in the config surface.
 
-4. **The #3806 ruling forbids the shape of a PAW adoption.** §1, verbatim: *"the configuration must not privilege any one of them; and no provider name may be hard-coded in a control path."* The instrument is `scripts/check-vendor-literals.sh`, a CI **HARD-BLOCK** on vendor-identifier literals outside a 9-file substrate allowlist (currently `claude|openai|xai|anthropic|gemini|deepseek|groq|ollama|grok|mistral|cohere|huggingface`). §2 names the posture-2 decider as *"an NLI cross-encoder on the runtime we already ship for the reranker"* — i.e. the answer is already chosen, and it is candle, not PAW.
+4. **The #3806 ruling forbids the shape of a PAW adoption.** §1, verbatim: *"the configuration must not privilege any one of them; and no provider name may be hard-coded in a control path."* The instrument is `scripts/check-vendor-literals.sh`, a CI **HARD-BLOCK** on vendor-identifier literals outside a 9-file substrate allowlist (currently `claude|openai|xai|anthropic|gemini|groq|ollama|grok|mistral|cohere|huggingface`). §2 names the posture-2 decider as *"an NLI cross-encoder on the runtime we already ship for the reranker"* — i.e. the answer is already chosen, and it is candle, not PAW.
 
 5. **The thing we already ship that PAW would displace.** `src/reranker.rs:366` `CROSS_ENCODER_MODEL_ID = "cross-encoder/ms-marco-MiniLM-L-6-v2"`, with `CROSS_ENCODER_FALLBACK_MODEL_SUBDIR` (`:401`), `CROSS_ENCODER_WEIGHT = 0.4` (`:253`) against `ORIGINAL_WEIGHT = 0.6`, `RERANK_POOL_MAX = 20` (`:305`), and `CrossEncoder` (`:908`) with **15 callers** across `src/handlers/recall.rs`, `src/mcp/tools/recall.rs`, `src/mcp/mod.rs`, `src/bench.rs`. Feature-gated model-pulling tests already exist (`test-with-models`, "Off by default so CI doesn't download 80MB+ on every run"). We have a working, licensed, digest-attestable local-model path. PAW would be a second one, with worse paperwork.
 
 ### 3.6 Dependency weight and exit cost
 
-- **Via `paw-rs`/`paw-candle`:** 4 new crates from 1 unaffiliated maintainer, riding candle 0.10 which we already have — so the *crate* weight is genuinely light. The weight is entirely in trust and in the unlicensed ~22 MB-per-program artefacts, plus 594 MB (Qwen3 0.6B) or 134 MB (GPT-2) of interpreter, distributed across 6 release channels.
+- **Via `paw-rs`/`paw-candle`:** 4 new crates from 1 unaffiliated maintainer, riding candle 0.10 which we already have — so the *crate* weight is genuinely light. The weight is entirely in trust and in the unlicensed ~22 MB-per-program artefacts, plus 594 MB (the 0.6B base model) or 134 MB (GPT-2) of interpreter, distributed across 6 release channels.
 - **Via the Python SDK:** collides with the standing rule that **scripts are Python, production components are Rust**. A Python decider in the store/recall hot path is not a thing this product can ship.
 - **Exit cost if adopted and regretted: LOW on code, HIGH on everything else.** The code is behind `InferenceBackend`, so ripping it out is a provider deletion. But a decision-provider that has been writing verdicts into memories leaves **semantic residue in the durable text** — the classified kinds, the `contradicts` edges, the curator merges it approved. Those do not un-happen when you remove the crate. That asymmetry (cheap to remove, expensive to undo) is the real exit cost, and it argues for keeping any novel decider on a reversible, evidence-logged path regardless of which one wins.
 
@@ -221,7 +221,7 @@ The strongest argument that I am wrong:
 **I have rejected a research result on paperwork.** The paper's claim — a 0.6B interpreter matching direct prompting of a 32B model — is, if true, the single most relevant result in this assessment to our hardest unsolved problem: a genuinely capable **air-gapped, zero-socket, in-process decider** for posture 2 (`/ai-scratch/conductor/handoff/3806-REQUIREMENTS.md` §2), which today is answered by an NLI cross-encoder that will abstain far more often than a real decider would. An unlicensed artefact is a *fixable* problem — one email to Yuntian Deng at the University of Waterloo, whose entire org is MIT-licensed and whose bases are Apache-2.0 and MIT, very likely produces a licence tag within a week. A missing `license: apache-2.0` line in a YAML header is a weaker reason to walk away from a 50x parameter-efficiency result than I have made it sound. And blockers 2 and 4 are avoidable by construction: we would write our own candle loader (we already have the stack, `tokenizers` and `hf-hub` in-tree) and never touch the hosted API at all. Blocker 3 is the only deep one — and even that dissolves if we use PAW as an **offline compiler** producing a small number of adapters that we then pin, sign and ship like any other weight file, accepting slower iteration in exchange for full #654 compliance. That is a coherent design I dismissed too fast.
 
 **What would change my mind, in order:**
-1. **An explicit licence (Apache-2.0 or MIT) on `paw-programs`, `paw-4b-qwen3-0.6b` and `paw-base-models`** — necessary, and close to sufficient for reopening.
+1. **An explicit licence (Apache-2.0 or MIT) on `paw-programs`, `paw-4b-0.6b` and `paw-base-models`** — necessary, and close to sufficient for reopening.
 2. A first-party Rust runtime, or our own candle loader for the adapter format, removing the `dynamder` dependency.
 3. A published ToS and retention policy for the hosted API, plus removal or explicit consent-gating of `paw-inference-logs` — needed only if we ever wanted the remote path, which on current evidence we should not.
 4. Independent reproduction of the 0.6B-matches-32B claim on a decision-shaped task (typed verdict over a closed vocabulary), not a generation benchmark.

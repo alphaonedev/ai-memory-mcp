@@ -122,7 +122,7 @@
 | #3624 | CLOSE-ON-PROMOTION | DEFECT | LANDED-AW | `8b56f33e6` | child of #3124 | CLOSE 2/2 | 'the replicated row is persisted unstamped' |
 | #3625 | CLOSE-ON-PROMOTION | DEFECT | LANDED-AW | `562ba56cb` | child of #3124 | v1.1.1 2/2 | '--trust-source keeps the source row metadata verbatim (a source row with no agent_id lands unstamped)' |
 | #3626 | CLOSE-ON-PROMOTION | DEFECT | LANDED-AW | `effa92dd0` | child of #3124 | CLOSE 2/2 | 'a silent first-writer claim of a legacy-unowned row' |
-| #3627 | CLOSE-ON-PROMOTION | DIRECTIVE | LANDED-AW | `325ab154f` | — | CLOSE 2/2 | 'The DeepSeek provider is removed from the product and the project' — an operator directive, not a defect; admitted at source |
+| #3627 | CLOSE-ON-PROMOTION | DIRECTIVE | LANDED-AW | `325ab154f` | — | CLOSE 2/2 | 'A retired third-party LLM provider is removed from the product and the project' — an operator directive, not a defect; admitted at source |
 | #3628 | CLOSE-ON-PROMOTION | DEFECT | LANDED-AW | `da89f6ee3` | — | CLOSE 2/2 | 'An enrolled peer can therefore record an approval as ANY registered local agent' |
 | #3629 | CLOSE-ON-PROMOTION | DEFECT | LANDED-AW | `539a5b845` | — | CLOSE 2/2 | 'a scoped peer can land a cross-namespace clone' |
 | #3638 | CLOSE-ON-PROMOTION | DEFECT | LANDED-AW | `187371294 + a7e558642` | — | CLOSE 2/2 | 'reachable from a non-admin HTTP tenant with a caller-selected namespace' |
@@ -181,7 +181,7 @@
 | #3714 / #3715 | ENHANCEMENT | #3714: "**No `init`, `setup`, or wizard command exists.**" #3715: "An unknown or misspelled key in `config.toml` is silently ignored." | #3715's first item *is* a defect (a loader that accepts and drops keys is fail-open); the rest is new capability under a directive. Both landed in `fcda29523`; #3715's amend `33511ca3a` did not. |
 | #3739 | ENHANCEMENT | "The runtime fallback stays exactly as" it is — the ask is observability over a *documented* fallback | Landed (`73cbecc6a`) — and it **caused #3774**, a promotion-blocking regression. A hardening change taken inside the freeze paid for itself in a new red. |
 | #3646 | DIRECTIVE | "**Operator directive (2026-09-12): this is v1.0.0 GA scope.**" | Admitted at source with its commercial boundary written out; landed. |
-| #3627 | DIRECTIVE | "The DeepSeek provider is removed from the product and the project: zero references anywhere going forward." | Admitted at source; landed. |
+| #3627 | DIRECTIVE | "A retired third-party LLM provider is removed from the product and the project: zero references anywhere going forward." | Admitted at source; landed. |
 | #3705 | DIRECTIVE | "`require_tls_enabled()` … resolves to **`.unwrap_or(false)`**. Its own doc comment calls it a 'fail-closed opt-in (default `false`)', which is a contradiction" | Mandate *and* a fail-open default — the only directive of the three that is also a defect. Landed. |
 | #3124 | DECISION | "## What this issue decides \| One policy for BOTH backends." | A ruling, not a defect report. The parity half is the only `ga-blocker` fix on `release/v1.0.0` (`7e495768e`); the census/knob half is on `audit-wip` (`AI_MEMORY_UNSTAMPED_MUTATION` reachable from `src/cli/doctor.rs`, `src/cli/reown.rs`, `src/handlers/federation_receive.rs`, …). The stamping **migration** it specifies did not land. |
 

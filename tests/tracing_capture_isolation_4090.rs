@@ -63,7 +63,7 @@ const GUARD: &str = "run_env_isolated_child_or_spawn(";
 /// is itself listed here is followed in turn (same file).
 const HELPERS: &[(&str, &str)] = &[
     (
-        "src/cli/commands/export_reflections/private_file.rs",
+        "src/cli/commands/export_reflections/private_file/tests.rs",
         "stale_removal_failure_keeps_export_working",
     ),
     ("src/mcp/span_capture_4088_tests.rs", "run_with_capture"),

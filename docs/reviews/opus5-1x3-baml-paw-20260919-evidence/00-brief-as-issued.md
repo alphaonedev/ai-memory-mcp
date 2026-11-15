@@ -21,7 +21,7 @@ https://arxiv.org/pdf/2607.02512 , https://huggingface.co/programasweights**
 Established facts (verified by the Conductor):
 - Compiles a natural-language specification into a small LoRA adapter (~22 MB) that runs **locally**; one text
   input, one text output; positioned for "regex is not enough, a full LLM is too much".
-- Base models: Qwen3 0.6B (594 MB) standard, GPT-2 (134 MB) compact. Local inference by default, GPU where
+- Base models: the 0.6B base model (594 MB) standard, GPT-2 (134 MB) compact. Local inference by default, GPU where
   available; optional remote API (~150 ms). Context ~2048 tokens total. Compile 5-10 s, finetuned 2-5 min.
 - Python SDK, a WebAssembly/browser runtime, a CLI. **No license is stated in AGENTS.md** — establishing the
   licence is part of your job, and "could not determine" is an acceptable and valuable finding.

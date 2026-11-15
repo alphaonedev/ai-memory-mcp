@@ -5,8 +5,10 @@
 //! MCP identities are isolated in child processes, never process-global mutations.
 use ai_memory::models::{Memory, MemoryKind, MemoryLink, MemoryLinkRelation, Tier};
 use serde_json::{Value, json};
-use std::io::{BufRead as _, BufReader, Write as _};
+use std::io::{BufRead as _, BufReader};
 use std::process::{Command, Stdio};
+#[path = "../common/child_stdin_report.rs"]
+mod child_stdin_report;
 #[cfg(feature = "sal")]
 mod http;
 #[path = "../common/mcp_wait.rs"]
@@ -211,8 +213,13 @@ impl Mcp {
     }
 
     fn request(&mut self, request: &Value) -> Value {
-        writeln!(self.input, "{request}").expect("MCP request");
-        self.input.flush().expect("flush");
+        child_stdin_report::write_line_or_report(
+            &mut self.input,
+            &mut self.child,
+            None,
+            "MCP request",
+            &request.to_string(),
+        );
         loop {
             let line = mcp_wait::recv_mcp_response(&self.output, "reflection3551");
             let response: Value = serde_json::from_str(&line).expect("JSON RPC");

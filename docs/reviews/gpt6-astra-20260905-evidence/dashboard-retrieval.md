@@ -10,7 +10,7 @@ Swarm snapshot reports22/22 validated,pct100 but functional6 (:3-8), every ms0 a
 
 ## NHI mission audit: useful retrieval, unsuccessful mission, contaminated acceptance
 
-`dashboard-state.json#/nhiAudit` explicitly says primary Grok audit FAIL and secondary GLM audit FAIL for evidence quality. Eight valid agent reports give recall_usefulness_mean4.5, would_rely_on_it6, isolation_respected6, latency_acceptable0; mission_completion_rate0.0, nine facts stored, three lineage proofs, zero summaries. This is meaningful positive agent testimony about actual recall and meaningful negative task outcome in the same run. A false clean PASS must not replace either.
+`dashboard-state.json#/nhiAudit` explicitly says primary Grok audit FAIL and secondary Flash-model audit FAIL for evidence quality. Eight valid agent reports give recall_usefulness_mean4.5, would_rely_on_it6, isolation_respected6, latency_acceptable0; mission_completion_rate0.0, nine facts stored, three lineage proofs, zero summaries. This is meaningful positive agent testimony about actual recall and meaningful negative task outcome in the same run. A false clean PASS must not replace either.
 
 The corrected verdict note says a last-token parser mistook a later phrase about PASS overclaiming for a PASS verdict. Use explicit structured verdict extraction with schema validation and retain complete auditor artifacts. The dashboard correction itself is positive evidence of review honesty, not evidence that the original parsing bug remains present in current source.
 

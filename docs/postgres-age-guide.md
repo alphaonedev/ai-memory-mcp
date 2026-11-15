@@ -10,7 +10,7 @@ layout: doc
 > is the supported deployment shape.
 >
 > **It is not a parity backend, and this guide does not claim it is.** At
-> v1.0.0 postgres serves **76 of the 89** unique production HTTP paths;
+> v1.0.0 postgres serves **78 of the 91** unique production HTTP paths;
 > the other **13 return `501 NOT IMPLEMENTED`**, and the **stdio MCP path
 > is SQLite-only** (`ai-memory mcp` always opens a local rusqlite
 > connection, so a postgres deployment serves MCP clients through the
@@ -51,15 +51,15 @@ choice. Switch to postgres+AGE when one or more of these is true:
   sharing the same store. Postgres is the supported topology;
   sqlite-over-NFS is not.
 
-The two backends are at **schema parity at v100**
-(`CURRENT_SCHEMA_VERSION = 100` on both ladders — the postgres upgrade
-ladder ends at `migrate_v100()`).
+The two backends are at **schema parity at v101**
+(`CURRENT_SCHEMA_VERSION = 101` on both ladders — the postgres upgrade
+ladder ends at `migrate_v101()`).
 
 **Schema parity is NOT feature parity.** Some postgres ladder arms are
 version-stamp no-ops rather than real DDL, so a matching version number
 does not mean a matching set of tables: postgres ships no `skills` table
 (`migrate_v82` is a no-op) and no `governance_rules` table. Concretely,
-**76 of the 89 unique production HTTP paths are served on postgres and
+**78 of the 91 unique production HTTP paths are served on postgres and
 13 return a uniform `501 NOT IMPLEMENTED`** (fail-closed — never a
 silent read/write against the wrong database), and the **stdio MCP path
 is SQLite-only**. See "The 13 fully-501 paths" below for the exact
@@ -345,7 +345,7 @@ What it does (see `src/cli/schema_init.rs`):
    `migrate` verb uses — the open itself runs `INIT_SCHEMA` (the
    bundled `src/store/postgres_schema.sql`, idempotent `CREATE TABLE
    IF NOT EXISTS` throughout) plus the in-process upgrade ladder up to
-   schema v100 (the current `CURRENT_SCHEMA_VERSION`) as a side effect. The
+   schema v101 (the current `CURRENT_SCHEMA_VERSION`) as a side effect. The
    `vector` (pgvector) extension is
    **required** — `CREATE EXTENSION IF NOT EXISTS vector` failing
    aborts the bootstrap.
@@ -367,7 +367,7 @@ What it does (see `src/cli/schema_init.rs`):
    true` in the JSON report).
 4. Enumerates the resulting catalog and prints the human summary
    (tables / indices / views / functions / extensions /
-   `schema_version: 100`) or the `--json` report.
+   `schema_version: 101`) or the `--json` report.
 
 Idempotent on rerun — safe to invoke from a deploy script. Exit code
 0 on success, non-zero on connection / bootstrap failure.
@@ -691,7 +691,7 @@ The eight remaining sqlite-only surfaces land here.
 > standard endpoints" — the 501 being merely a safety net for unknown
 > or future routes. That OVERSTATED the delivered surface and is
 > **RETRACTED**. The measured, gate-pinned inventory is **76
-> pg-supported unique paths, 13 fully-501 paths, 89 unique paths
+> pg-supported unique paths, 13 fully-501 paths, 91 unique paths
 > total** (`EXPECTED_PG_SUPPORTED_UNIQUE_PATHS = 76` /
 > `EXPECTED_FULLY_501_PATHS = 13` / `EXPECTED_TOTAL_UNIQUE_PATHS = 89`,
 > `tests/pg_supported_route_inventory_gate_2799.rs`), and the
@@ -855,9 +855,9 @@ tool names is unaffected. On sqlite nothing changes.
 
 ### What still returns 501 on postgres
 
-Of the **89 unique production URL paths** (over **103 `.route(...)`
+Of the **91 unique production URL paths** (over **105 `.route(...)`
 registrations in `src/lib.rs`**, surfaced through
-`/api/v1/capabilities`), **76 are served on a postgres-backed daemon
+`/api/v1/capabilities`), **78 are served on a postgres-backed daemon
 and 13 are fully fail-closed** — every HTTP method on those 13 paths
 returns a uniform `501 NOT IMPLEMENTED`. The gate FAILS CLOSED by
 design: an un-migrated handler can never fall through to the empty
@@ -1437,7 +1437,7 @@ parity test is the gate that prevents it.
 | | sqlite | postgres |
 |---|---|---|
 | Live daemon | ✓ (default) | ✓ (Wave 3) |
-| Schema parity | v100 | v100 (`CURRENT_SCHEMA_VERSION` pinned in lockstep) |
+| Schema parity | v101 | v101 (`CURRENT_SCHEMA_VERSION` pinned in lockstep) |
 | `link()` | ✓ | ✓ (Wave 1 Stream A) |
 | `register_agent()` | ✓ | ✓ (Wave 1 Stream A) |
 | Recall 6-factor scoring (SAL `search`) | ✓ | ✓ (Wave 1 Stream A) |

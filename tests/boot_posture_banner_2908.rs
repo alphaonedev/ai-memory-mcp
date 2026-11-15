@@ -103,6 +103,9 @@ fn serve_boot_lines(needle: &str, budget: Duration) -> Vec<String> {
         // NO subscriber is installed by `main` — the exact condition under
         // which the banner used to vanish.
         .env("AI_MEMORY_NO_CONFIG", "1")
+        // #4166: the daemon behind the banner never waits on an embedder
+        // download on a loaded runner.
+        .env("AI_MEMORY_EMBED_OFFLINE", "1")
         .env("RUST_LOG", "info")
         // Arms the boot report the banner belongs to. A genuinely fresh node
         // (fresh db + fresh witness dir) boots clean under asi-hard per the

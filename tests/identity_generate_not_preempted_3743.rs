@@ -21,9 +21,10 @@
 //! directory writable) before the explicit provisioning verb — FAILS ON THE
 //! PARENT, whose remedy led with a command that fails the same way.
 
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+#[path = "common/child_stdin_report.rs"]
+mod child_stdin_report;
 
 const AGENT_ID: &str = "ai:provision-3743";
 
@@ -100,12 +101,7 @@ fn capture_turn(sb: &Sandbox) -> Output {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn capture-turn");
-    child
-        .stdin
-        .take()
-        .expect("piped stdin")
-        .write_all(params.to_string().as_bytes())
-        .expect("write stdin");
+    child_stdin_report::send_and_close(&mut child, "stdin payload", params.to_string().as_bytes());
     child.wait_with_output().expect("capture-turn output")
 }
 

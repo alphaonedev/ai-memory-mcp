@@ -4638,6 +4638,93 @@ pub trait MemoryStore: Send + Sync {
         })
     }
 
+    // ------------------------------------------------------------------
+    // #8444 - Agent2Agent (A2A 1.0) standard binding: durable Task rows.
+    // Every method is scoped by the AUTHENTICATED caller's `agent_id`.
+    // Defaults return `UnsupportedCapability`.
+    // ------------------------------------------------------------------
+
+    /// Insert a new A2A Task row owned by `task.agent_id`.
+    async fn a2a_task_insert(
+        &self,
+        _task: &crate::storage::a2a_tasks::A2aTaskRow,
+    ) -> StoreResult<()> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "A2A_TASK_INSERT".to_string(),
+        })
+    }
+
+    /// Fetch one task owned by `agent_id`; `None` for an unknown id AND for
+    /// another caller's id.
+    async fn a2a_task_get(
+        &self,
+        _agent_id: &str,
+        _id: &str,
+    ) -> StoreResult<Option<crate::storage::a2a_tasks::A2aTaskRow>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "A2A_TASK_GET".to_string(),
+        })
+    }
+
+    /// List the caller's tasks (newest update first) plus the match total.
+    async fn a2a_task_list(
+        &self,
+        _agent_id: &str,
+        _filter: &crate::storage::a2a_tasks::A2aTaskFilter,
+    ) -> StoreResult<crate::storage::a2a_tasks::A2aTaskPage> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "A2A_TASK_LIST".to_string(),
+        })
+    }
+
+    /// Atomic compare-and-set state transition; `true` for the one winner.
+    async fn a2a_task_transition(
+        &self,
+        _agent_id: &str,
+        _id: &str,
+        _from_states: &[&str],
+        _to_state: &str,
+        _update: &crate::storage::a2a_tasks::A2aTaskUpdate,
+    ) -> StoreResult<bool> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "A2A_TASK_TRANSITION".to_string(),
+        })
+    }
+
+    /// #8444 r2 - every A2A task row of every agent (content-free: ids only,
+    /// message content stays in the inbox memories), oldest first, for the
+    /// export surfaces.
+    ///
+    /// Default returns `UnsupportedCapability`.
+    async fn a2a_task_export(&self) -> StoreResult<Vec<crate::storage::a2a_tasks::A2aTaskRow>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "A2A_TASK_EXPORT".to_string(),
+        })
+    }
+
+    /// #8444 - `notify` plus caller-built system metadata stamped onto the
+    /// inbox memory AT FORMATION (the A2A standard binding stamps
+    /// `content_principal` / `a2a_role` here so the provenance is part of the
+    /// first write, not a later patch). `system_metadata == None` is exactly
+    /// [`MemoryStore::notify`].
+    ///
+    /// Default returns `UnsupportedCapability`.
+    async fn notify_stamped(
+        &self,
+        _ctx: &CallerContext,
+        _target_agent: &str,
+        _title: &str,
+        _payload: &str,
+        _priority: Option<i32>,
+        _tier: Option<&Tier>,
+        _why_trace: Option<&str>,
+        _system_metadata: Option<&serde_json::Map<String, serde_json::Value>>,
+    ) -> StoreResult<String> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "NOTIFY_STAMPED".to_string(),
+        })
+    }
+
     // ==================================================================
     // v0.7.0 Wave-3 Continuation 3 — full governance pipeline (Phase 20).
     //

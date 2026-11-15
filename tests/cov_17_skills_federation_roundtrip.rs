@@ -153,6 +153,7 @@ fn skill_export_import_roundtrip_resolves_resources_on_peer() {
         }),
         None,
         &workspace,
+        None,
     )
     .expect("node A: export");
     assert_eq!(exported_resp["exported"], json!(true));
@@ -233,6 +234,7 @@ fn skill_export_import_roundtrip_resolves_resources_on_peer() {
             "skill_id": skill_id_b,
             "resource_path": "scripts/run.sh",
         }),
+        None,
     )
     .expect("peer: resolve script resource");
     assert_eq!(script_resp["digest_verified"], json!(true));
@@ -250,6 +252,7 @@ fn skill_export_import_roundtrip_resolves_resources_on_peer() {
             "skill_id": skill_id_b,
             "resource_path": "reference/notes.md",
         }),
+        None,
     )
     .expect("peer: resolve reference resource");
     assert_eq!(reference_resp["digest_verified"], json!(true));
@@ -312,6 +315,7 @@ fn skill_export_folder_is_self_contained_for_peer_import() {
         }),
         None,
         &workspace,
+        None,
     )
     .expect("export from a");
 

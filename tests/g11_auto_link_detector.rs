@@ -18,6 +18,8 @@ use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 
 use serde_json::{Value, json};
+#[path = "common/child_stdin_report.rs"]
+mod child_stdin_report;
 
 /// Build the reference detector binary and return the absolute
 /// path to it.
@@ -91,19 +93,13 @@ fn build_detector_once() -> PathBuf {
 /// Pipe `envelope` to the detector in one-shot mode and return
 /// the parsed decision JSON.
 fn run_once(bin: &Path, envelope: &Value) -> Value {
-    use std::io::Write;
     let mut child = Command::new(bin)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn detector");
-    {
-        let stdin = child.stdin.as_mut().expect("stdin");
-        stdin
-            .write_all(envelope.to_string().as_bytes())
-            .expect("write envelope");
-    }
+    child_stdin_report::write_open(&mut child, "envelope", envelope.to_string().as_bytes());
     let output = child.wait_with_output().expect("wait detector");
     assert!(
         output.status.success(),

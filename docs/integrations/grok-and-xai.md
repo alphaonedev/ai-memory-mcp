@@ -30,9 +30,8 @@ xAI consumer apps. The integration depends on the surface.
 ## Use Grok as ai-memory's LLM backend
 
 ai-memory's `smart` and `autonomous` tiers need an LLM. xAI Grok is one
-of 15+ supported backends (see [`llm-backends.md`](llm-backends.html) for
-the full vendor matrix — OpenAI, Anthropic, Gemini, Kimi,
-Qwen, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks,
+of 13 supported backends (see [`llm-backends.md`](llm-backends.html) for
+the full vendor matrix — OpenAI, Anthropic, Gemini, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks,
 LMStudio, vLLM, llama.cpp server, local Ollama all work identically).
 
 ### Recommended path — `[llm]` section in `~/.config/ai-memory/config.toml` (#1146)

@@ -53,6 +53,10 @@ use ai_memory::models::{
 };
 use ai_memory::storage as db;
 
+#[path = "common/atomise_gate.rs"]
+mod atomise_gate;
+use atomise_gate::{AtomiseGate, GatedCurator};
+
 /// #1751 — permissive attestation opt-out, the same pin
 /// `tests/autotag_async_write_2587.rs` carries.
 fn permissive_attestation_for_tests() {
@@ -112,6 +116,25 @@ fn build_atomise_router(
     wire_worker: bool,
     calls: &Arc<Mutex<usize>>,
 ) -> (axum::Router, std::path::PathBuf) {
+    let (router, db_path, _worker) = build_atomise_router_gated(wire_llm, wire_worker, calls, None);
+    (router, db_path)
+}
+
+/// [`build_atomise_router`] with an optional #8687 gate: when `gate` is
+/// `Some`, the mock curator parks at it, so the test decides when the worker
+/// may land atoms instead of racing it. The third element is the worker's join
+/// handle (`Some` when `wire_worker`): drop the router (the queue's sole owner),
+/// then join it to know the buffered jobs have fully drained.
+fn build_atomise_router_gated(
+    wire_llm: bool,
+    wire_worker: bool,
+    calls: &Arc<Mutex<usize>>,
+    gate: Option<&AtomiseGate>,
+) -> (
+    axum::Router,
+    std::path::PathBuf,
+    Option<std::thread::JoinHandle<()>>,
+) {
     permissive_attestation_for_tests();
     let db_path = local_runs_db("http-create");
     let conn = db::open(&db_path).expect("db::open");
@@ -171,19 +194,33 @@ fn build_atomise_router(
         ),
         http_identity_mode: ai_memory::config::HttpIdentityMode::default(),
     };
+    let mut worker_handle = None;
     if wire_worker {
         let calls = Arc::clone(calls);
-        app_state.atomise_queue =
-            ai_memory::background::atomise_worker::spawn(Arc::new(move || {
-                Some(Arc::new(Atomiser::new(
+        let gate = gate.cloned();
+        let spawned = ai_memory::background::atomise_worker::spawn_joinable(Arc::new(move || {
+            let curator: Box<dyn Curator> = match &gate {
+                Some(g) => Box::new(GatedCurator::new(
                     Box::new(TwoAtomCurator {
                         calls: Arc::clone(&calls),
                     }),
-                    None,
-                    AtomiserConfig::default(),
-                    FeatureTier::Smart,
-                )))
-            }));
+                    g,
+                )),
+                None => Box::new(TwoAtomCurator {
+                    calls: Arc::clone(&calls),
+                }),
+            };
+            Some(Arc::new(Atomiser::new(
+                curator,
+                None,
+                AtomiserConfig::default(),
+                FeatureTier::Smart,
+            )))
+        }));
+        if let Some((queue, handle)) = spawned {
+            app_state.atomise_queue = Some(queue);
+            worker_handle = Some(handle);
+        }
     }
 
     let api_key_state = ApiKeyState {
@@ -196,7 +233,7 @@ fn build_atomise_router(
         ..Default::default()
     };
     let router = ai_memory::build_router(api_key_state, app_state);
-    (router, db_path)
+    (router, db_path, worker_handle)
 }
 
 fn seed_policy(db_path: &std::path::Path, ns: &str, mode: AutoAtomiseMode) {
@@ -290,7 +327,13 @@ fn count_atoms(db_path: &std::path::Path, source_id: &str) -> i64 {
 #[tokio::test(flavor = "multi_thread")]
 async fn http_create_enqueues_atomisation_and_the_worker_lands_the_atoms_2984() {
     let calls = Arc::new(Mutex::new(0usize));
-    let (router, db_path) = build_atomise_router(true, true, &calls);
+    // #8687: the worker is held behind a closed gate, so "the response did not
+    // block on the curator" is proven without racing it. `_release` opens the
+    // gate even if an assertion below panics.
+    let gate = AtomiseGate::closed();
+    let _release = gate.release_on_drop();
+    let (router, db_path, worker) = build_atomise_router_gated(true, true, &calls, Some(&gate));
+    let worker = worker.expect("atomise worker spawns");
     let ns = "atomise-2984-deferred";
     seed_policy(&db_path, ns, AutoAtomiseMode::Deferred);
 
@@ -312,23 +355,36 @@ async fn http_create_enqueues_atomisation_and_the_worker_lands_the_atoms_2984() 
     );
 
     let source_id = body["id"].as_str().expect("id").to_string();
-    // Deferred means deferred: the response did not wait on the curator.
+    // Deferred means deferred: the response came back while the curator is
+    // still parked at the closed gate (a create that blocked on the curator
+    // would never have returned). The worker has picked the job up, yet no
+    // atom can have landed and the curator has not completed a call.
+    assert!(
+        gate.wait_until_entered_async().await,
+        "the queued job must reach the worker out-of-band"
+    );
     assert_eq!(
         count_atoms(&db_path, &source_id),
         0,
-        "the create response must not have blocked on the curator"
+        "no atom may land while the curator is held behind the gate"
+    );
+    assert_eq!(
+        *calls.lock().unwrap(),
+        0,
+        "the curator has not returned yet"
     );
 
-    // …and the bounded single-consumer worker drains it out-of-band.
-    let deadline = std::time::Instant::now() + Duration::from_secs(15);
-    let mut atoms = 0;
-    while std::time::Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        atoms = count_atoms(&db_path, &source_id);
-        if atoms >= 2 {
-            break;
-        }
-    }
+    // Open the gate, drop the router (the queue's sole owner, so the channel
+    // closes) and JOIN the worker: join() returns only after every buffered job
+    // has run, so the atoms are committed with no wall-clock deadline (#2986
+    // precedent). The join runs on the blocking pool, not a runtime thread.
+    gate.open();
+    drop(router);
+    tokio::task::spawn_blocking(move || worker.join())
+        .await
+        .expect("join task runs")
+        .expect("atomise worker thread joins after draining");
+    let atoms = count_atoms(&db_path, &source_id);
     assert_eq!(
         atoms, 2,
         "the worker must land the mock curator's two atoms"

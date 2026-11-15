@@ -36,6 +36,7 @@
 //! non-Reflection rows. Tying the hook to the reflect path makes the
 //! "what counts toward cadence" question trivial.
 
+use anyhow::Context as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -305,13 +306,26 @@ fn write_persona_export(
     persona: &crate::persona::Persona,
     out_dir: &std::path::Path,
 ) -> anyhow::Result<()> {
+    use crate::cli::commands::export_reflections::private_file::{
+        PrivateExportDir, validate_component,
+    };
+
     let ns_safe = persona.namespace.replace('/', "_");
-    let ns_dir = out_dir.join(&ns_safe);
-    std::fs::create_dir_all(&ns_dir)?;
     let entity_safe = persona.entity_id.replace('/', "_");
-    let path = ns_dir.join(format!("{entity_safe}.md"));
+    validate_component(&ns_safe)?;
+    validate_component(&entity_safe)?;
+    let root = PrivateExportDir::open(out_dir)?;
+    let namespace = root
+        .namespace(std::path::Path::new(&ns_safe))
+        .with_context(|| {
+            crate::cli::commands::export_reflections::private_file::namespace_context(
+                &out_dir.join(&ns_safe),
+            )
+        })?;
+    // Same stale-stage cleanup as the reflection writers (warn-only).
+    namespace.sweep_stale_staging();
     let body = render_persona_md(persona);
-    std::fs::write(&path, body)?;
+    namespace.write(&format!("{entity_safe}.md"), body.as_bytes())?;
     Ok(())
 }
 

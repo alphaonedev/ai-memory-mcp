@@ -8,9 +8,10 @@ use ai_memory::{
     models::{Memory, Tier},
 };
 use serde_json::{Value, json};
-use std::io::Write as _;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+#[path = "common/child_stdin_report.rs"]
+mod child_stdin_report;
 
 fn call(
     path: &std::path::Path,
@@ -43,7 +44,7 @@ fn call(
         .spawn()
         .expect("mcp child");
     let request = json!({"jsonrpc":"2.0", "id":1, "method":"tools/call", "params":{"name":tool,"arguments":args}});
-    writeln!(child.stdin.take().expect("stdin"), "{request}").expect("request");
+    child_stdin_report::send_and_close(&mut child, "request", format!("{request}\n").as_bytes());
     let deadline = Instant::now() + Duration::from_secs(30);
     while child.try_wait().expect("poll").is_none() {
         if Instant::now() >= deadline {

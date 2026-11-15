@@ -60,7 +60,9 @@ fn insert_observation(conn: &rusqlite::Connection, title: &str, ns: &str, body: 
         updated_at: now,
         last_accessed_at: None,
         expires_at: None,
-        metadata: json!({}),
+        // #8832 — owned by the reflecting agent, so a bound reader (the
+        // keystone child) can read its own sources.
+        metadata: json!({ "agent_id": REFLECTION_AGENT_ID }),
         reflection_depth: 0,
         memory_kind: MemoryKind::Observation,
         entity_id: None,
@@ -93,7 +95,7 @@ fn make_reflection(
         priority: 5,
         confidence: 1.0,
         source: "cli".to_string(),
-        agent_id: "test-agent".to_string(),
+        agent_id: REFLECTION_AGENT_ID.to_string(),
         metadata: json!({}),
     };
     db::reflect(conn, &input).expect("reflect should succeed")
@@ -301,9 +303,46 @@ fn threshold_configurable_via_namespace_governance() {
     );
 }
 
+/// #8832 (B-10) — the marker env that runs the keystone body in a child.
+const KEYSTONE_CHILD_ENV_8832: &str = "AI_MEMORY_KEYSTONE_CHILD_8832";
+/// #8832 (B-10) — the resolved principal the keystone child promotes and
+/// re-registers as. Promote stamps the process identity into the skill's
+/// scope binding, and register accepts that binding only for a resolved
+/// principal, so the child pins one instead of the host default: the
+/// reflection's own agent (`make_reflection`), so promote can read it.
+const KEYSTONE_AGENT_ID_8832: &str = REFLECTION_AGENT_ID;
+/// The agent `make_reflection` reflects as.
+const REFLECTION_AGENT_ID: &str = "test-agent";
+
 #[test]
 fn round_trip_promote_export_reregister_identical_digest() {
-    // KEYSTONE ACCEPTANCE — the round-trip digest match.
+    // KEYSTONE ACCEPTANCE — the round-trip digest match. #8832 — run in a
+    // child with a resolved process identity (never a process-env mutation
+    // in this binary; precedent tests/key_dir_isolation_3355.rs).
+    if std::env::var_os(KEYSTONE_CHILD_ENV_8832).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().expect("test exe"))
+            .args([
+                "--exact",
+                "round_trip_promote_export_reregister_identical_digest",
+                "--nocapture",
+            ])
+            .env(KEYSTONE_CHILD_ENV_8832, "1")
+            .env("AI_MEMORY_AGENT_ID", KEYSTONE_AGENT_ID_8832)
+            .env("AI_MEMORY_NO_CONFIG", "1")
+            .output()
+            .expect("spawn keystone child");
+        assert!(
+            output.status.success(),
+            "keystone child failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "keystone child ran no test: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        return;
+    }
     let (conn, _path, dir) = open_test_db();
 
     let s1 = insert_observation(&conn, "src-rt-1", "ns-rt", "body 1");
@@ -335,6 +374,7 @@ fn round_trip_promote_export_reregister_identical_digest() {
         }),
         None,
         dir.path(),
+        None,
     )
     .expect("export");
     assert_eq!(export_payload["exported"], true);
@@ -544,6 +584,7 @@ fn skills_ref_validates_promoted_skill_if_installed() {
         }),
         None,
         dir.path(),
+        None,
     )
     .expect("export");
 

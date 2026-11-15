@@ -36,6 +36,7 @@ mod mcp_wait;
 // onto the release head and declares `pub mod tls;` there, so the one
 // `common::tls` path serves both trees (a second by-path declaration is the
 // clippy `duplicate_mod` lint).
+use common::child_stdin_report;
 use common::tls::{
     LOCAL_CA_CERT_FILE, LOCAL_CA_KEY_FILE, LOCAL_TLS_SUBDIR, SERVER_CERT_FILE, SERVER_KEY_FILE,
     TestTls, local_ca_client,
@@ -51,9 +52,13 @@ const BIND_GUARD_MARKER: &str = "without an API key";
 /// A valid, EMPTY peer allowlist so the #3582 gate is satisfied.
 const EMPTY_ALLOWLIST: &str = "{}";
 
-/// Base boot budget, aligned to the 60 s `tests/integration.rs` ceiling
-/// (#3615); [`boot_budget`] scales it on loaded hosts.
-const BOOT_DEADLINE: Duration = Duration::from_secs(60);
+/// Base pre-listen boot budget; [`boot_budget`] scales it on loaded hosts. A
+/// HANG GUARD and not a performance assertion (#4166): the wait ends at once
+/// on the child's exit (with its stderr) or on `/health`, so this only bounds
+/// a daemon that does neither. The spawn sets `AI_MEMORY_EMBED_OFFLINE`, so
+/// the boot never waits on an embedder download; the generous value keeps a
+/// healthy boot on a loaded runner from failing the test.
+const BOOT_DEADLINE: Duration = Duration::from_secs(180);
 const PROBE_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Base budget once the listen line is on stderr (#7341), load-scaled like
@@ -99,6 +104,8 @@ fn command_with_config(root: &Path, config_body: Option<&str>) -> Command {
         .env("AI_MEMORY_DB", root.join("store.db"))
         .env("AI_MEMORY_AUDIT_DIR", root.join("audit"))
         .env("RUST_LOG", "info");
+    // #4166: one shared helper keeps every serve boot off the embedder.
+    common::serve_test_env(&mut cmd);
     if config_body.is_none() {
         cmd.env("AI_MEMORY_NO_CONFIG", "1");
     }
@@ -475,7 +482,6 @@ fn observed_fleet_signals_never_promote_out_of_zero_config_3709() {
 /// asserted; whether a key file appears depends on the tree, not on this cell.
 #[cfg(unix)]
 fn provision_daemon_signing_key(root: &Path) {
-    use std::io::Write as _;
     let params = serde_json::json!({
         "host_session_id": "sess-3705",
         "host_turn_index": 1,
@@ -490,12 +496,7 @@ fn provision_daemon_signing_key(root: &Path) {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn capture-turn");
-    child
-        .stdin
-        .take()
-        .expect("piped stdin")
-        .write_all(params.to_string().as_bytes())
-        .expect("write stdin");
+    child_stdin_report::send_and_close(&mut child, "stdin payload", params.to_string().as_bytes());
     let out = child.wait_with_output().expect("capture-turn output");
     assert!(
         out.status.success(),

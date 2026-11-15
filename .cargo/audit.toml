@@ -23,6 +23,7 @@
 ignore = [
     "RUSTSEC-2023-0071",
     "RUSTSEC-2024-0449", # unsafe-libyaml unmaintained; review by 2027-02-01, see #8473 and #8476
+    "RUSTSEC-2026-0459", # libsqlite3-sys 0.30.1 WAL page-size read; time-boxed, NOT mitigated, see #8696
 ]
 
 # #8615: metadata lives in audit-exceptions.toml; the CI gate cross-checks both files.

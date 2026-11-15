@@ -36,6 +36,7 @@
 //!    `auto_export_reflections_to_filesystem` will see no disk writes
 //!    from this module ever.
 
+use anyhow::Context as _;
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -247,14 +248,16 @@ pub fn run_auto_export(
     let attest_level = export_reflections::summarise_attest_level(&edges);
     let payload = export_reflections::render_payload(&mem, &edges, attest_level, config.format);
 
-    let ns_dir = config
-        .out_dir
-        .join(export_reflections::sanitise_namespace_for_path(
-            &mem.namespace,
-        )?);
-    std::fs::create_dir_all(&ns_dir)?;
-    let path = ns_dir.join(format!("{}.{}", mem.id, config.format.extension()));
-    export_reflections::write_private_export(&path, payload.as_bytes())?;
+    let relative = export_reflections::sanitise_namespace_for_path(&mem.namespace)?;
+    let root = export_reflections::private_file::PrivateExportDir::open(&config.out_dir)?;
+    let namespace = root.namespace(&relative).with_context(|| {
+        export_reflections::private_file::namespace_context(&config.out_dir.join(&relative))
+    })?;
+    namespace.sweep_stale_staging();
+    namespace.write(
+        &format!("{}.{}", mem.id, config.format.extension()),
+        payload.as_bytes(),
+    )?;
     Ok(())
 }
 

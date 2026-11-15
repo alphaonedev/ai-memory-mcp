@@ -24,7 +24,7 @@
 #[path = "common/key_dir_sandbox.rs"]
 mod key_dir_sandbox;
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc;
 
@@ -33,6 +33,8 @@ use ai_memory::db;
 // #2525 — the per-response bound comes from the shared elastic helper
 // (base x `AI_MEMORY_TEST_TIMING_BUDGET_MULT`, with fail-fast child-death
 // detection) instead of the fixed 20s constant this file used to carry.
+#[path = "common/child_stdin_report.rs"]
+mod child_stdin_report;
 #[path = "common/mcp_wait.rs"]
 mod mcp_wait;
 // A realistic-looking but non-live OpenAI-style key (high entropy, sk- prefix).
@@ -42,7 +44,19 @@ const REDACTION_MARKER: &str = "[REDACTED:secret]";
 struct McpChild {
     child: Option<Child>,
     stdin: Option<ChildStdin>,
+    stderr: Option<child_stdin_report::StderrCapture>,
 }
+impl McpChild {
+    /// Write one request line; a failed write reaps the child and fails with
+    /// its exit status and stderr (#8734).
+    fn write_line(&mut self, what: &str, line: &str) {
+        let (Some(stdin), Some(child)) = (self.stdin.as_mut(), self.child.as_mut()) else {
+            panic!("{what}: the MCP child is already closed");
+        };
+        child_stdin_report::write_line_or_report(stdin, child, self.stderr.as_ref(), what, line);
+    }
+}
+
 impl Drop for McpChild {
     fn drop(&mut self) {
         drop(self.stdin.take());
@@ -103,17 +117,10 @@ fn spawn_mcp(db_path: &std::path::Path, mode: &str) -> (McpChild, mpsc::Receiver
         .expect("spawn ai-memory mcp");
     let stdin = child.stdin.take().unwrap();
     let stdout = child.stdout.take().unwrap();
-    if let Some(stderr) = child.stderr.take() {
-        std::thread::spawn(move || {
-            let mut buf = [0u8; 4096];
-            let mut s = stderr;
-            while let Ok(n) = s.read(&mut buf) {
-                if n == 0 {
-                    break;
-                }
-            }
-        });
-    }
+    let stderr = child
+        .stderr
+        .take()
+        .map(child_stdin_report::StderrCapture::drain);
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         for line in BufReader::new(stdout).lines() {
@@ -132,24 +139,24 @@ fn spawn_mcp(db_path: &std::path::Path, mode: &str) -> (McpChild, mpsc::Receiver
         McpChild {
             child: Some(child),
             stdin: Some(stdin),
+            stderr,
         },
         rx,
     )
 }
 
 fn send_and_recv(
-    stdin: &mut ChildStdin,
+    stdin: &mut McpChild,
     rx: &mpsc::Receiver<String>,
     payload: &serde_json::Value,
 ) -> serde_json::Value {
-    writeln!(stdin, "{}", serde_json::to_string(payload).unwrap()).unwrap();
-    stdin.flush().unwrap();
+    stdin.write_line("MCP request", &serde_json::to_string(payload).unwrap());
     let ctx = payload["method"].as_str().unwrap_or("<unknown method>");
     let resp = mcp_wait::recv_mcp_response(rx, ctx);
     serde_json::from_str(&resp).unwrap_or_else(|e| panic!("parse: {e}: {resp}"))
 }
 
-fn initialize(stdin: &mut ChildStdin, rx: &mpsc::Receiver<String>) {
+fn initialize(stdin: &mut McpChild, rx: &mpsc::Receiver<String>) {
     let init = send_and_recv(
         stdin,
         rx,
@@ -163,7 +170,7 @@ fn initialize(stdin: &mut ChildStdin, rx: &mpsc::Receiver<String>) {
 }
 
 fn store(
-    stdin: &mut ChildStdin,
+    stdin: &mut McpChild,
     rx: &mpsc::Receiver<String>,
     title: &str,
     content: &str,
@@ -185,7 +192,7 @@ fn store(
 // `json!` payload; taking it by value keeps the call sites readable.
 #[allow(clippy::needless_pass_by_value)]
 fn store_full(
-    stdin: &mut ChildStdin,
+    stdin: &mut McpChild,
     rx: &mpsc::Receiver<String>,
     namespace: &str,
     title: &str,
@@ -259,7 +266,7 @@ fn mcp_store_refuses_credentials_under_refuse_g29() {
     ];
     let db_path = unique_db();
     let (mut guard, rx) = spawn_mcp(&db_path, "refuse");
-    let stdin = guard.stdin.as_mut().unwrap();
+    let stdin = &mut guard;
     initialize(stdin, &rx);
     for (title, content) in cases {
         let resp = store(stdin, &rx, title, content);
@@ -280,7 +287,7 @@ fn mcp_store_refuses_credentials_under_refuse_g29() {
 fn mcp_store_allows_benign_high_entropy_under_refuse_g29() {
     let db_path = unique_db();
     let (mut guard, rx) = spawn_mcp(&db_path, "refuse");
-    let stdin = guard.stdin.as_mut().unwrap();
+    let stdin = &mut guard;
     initialize(stdin, &rx);
     let benign = "uuid 550e8400-e29b-41d4-a716-446655440000 sha aa03bc84 blob \
                   iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
@@ -302,7 +309,7 @@ fn mcp_store_allows_benign_high_entropy_under_refuse_g29() {
 fn mcp_store_redacts_under_redact_g29() {
     let db_path = unique_db();
     let (mut guard, rx) = spawn_mcp(&db_path, "redact");
-    let stdin = guard.stdin.as_mut().unwrap();
+    let stdin = &mut guard;
     initialize(stdin, &rx);
     let resp = store(
         stdin,
@@ -327,7 +334,7 @@ fn mcp_store_redacts_under_redact_g29() {
 fn mcp_store_verbatim_under_off_g29() {
     let db_path = unique_db();
     let (mut guard, rx) = spawn_mcp(&db_path, "off");
-    let stdin = guard.stdin.as_mut().unwrap();
+    let stdin = &mut guard;
     initialize(stdin, &rx);
     let content = format!("key is {FAKE_OPENAI_KEY} ok");
     let resp = store(stdin, &rx, "g29-off", &content);
@@ -700,7 +707,7 @@ fn carveout_const_matches_canonical_set_1844() {
 fn funnel_redacts_title_tag_metadata_under_redact_1844() {
     let db_path = unique_db();
     let (mut guard, rx) = spawn_mcp(&db_path, "redact");
-    let stdin = guard.stdin.as_mut().unwrap();
+    let stdin = &mut guard;
     initialize(stdin, &rx);
     let ns = "g29-1844-redact-ns";
     let resp = store_full(
@@ -747,7 +754,7 @@ fn funnel_redacts_title_tag_metadata_under_redact_1844() {
 fn mcp_store_refuses_title_credential_accepts_carveout_1844() {
     let db_path = unique_db();
     let (mut guard, rx) = spawn_mcp(&db_path, "refuse");
-    let stdin = guard.stdin.as_mut().unwrap();
+    let stdin = &mut guard;
     initialize(stdin, &rx);
 
     // Credential in the title → refused, no row.

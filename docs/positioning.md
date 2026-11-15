@@ -24,11 +24,11 @@ linked inline; the page is meant to be auditable, not aspirational.
 
 ---
 
-## Tencent TencentDB Agent Memory
+## System Y
 
 (v0.3.4, 2026-05-13 — the largest recent entrant in the category)
 
-**ICP:** OpenClaw + Hermes plugin users; individual developers on Tencent's
+**ICP:** OpenClaw + Hermes plugin users; individual developers on System Y's
 agent platforms.
 
 **Strength:** Published benchmarks (WideSearch +51.52%, SWE-bench +9.93%,
@@ -36,7 +36,7 @@ AA-LCR +7.95%, PersonaMem +59% relative). Short-term context compression via
 Mermaid canvas + node_id dereference. Layered L0→L3 semantic pyramid
 producing persona-as-artifact. White-box file-backed inspection.
 
-**Use if:** building on OpenClaw or Hermes; want Tencent Cloud-backed memory
+**Use if:** building on OpenClaw or Hermes; want cloud-backed memory
 plugin; want benchmarked OpenClaw-end-to-end pattern.
 
 **ai-memory differs:** MCP-compatible with any agent runtime; procurement-grade
@@ -150,7 +150,7 @@ agents and across organisations, audit-grade evidence trail.
 
 A two-sentence picker for the procurement officer skimming this page:
 
-- **Use Tencent TencentDB Agent Memory** if you're on OpenClaw or Hermes;
+- **Use System Y** if you're on OpenClaw or Hermes;
   they ship the best benchmarks in those frameworks today.
 - **Use mem0 or Letta** if you want a hosted/research-grade managed memory
   service and procurement / data residency are not a binding constraint.
@@ -163,15 +163,15 @@ A two-sentence picker for the procurement officer skimming this page:
   client.
 
 The categories overlap on the recall-quality axis but the optimums diverge
-quickly past that. Tencent is in OpenClaw's ecosystem; ai-memory is in
+quickly past that. System Y is in OpenClaw's ecosystem; ai-memory is in
 MCP-compatible-anywhere with attestation and federation. Different
 categories that overlap on the recall-quality axis.
 
 ---
 
-## Architectural patterns ai-memory absorbed from Tencent (v0.7.0)
+## Architectural patterns ai-memory absorbed from System Y (v0.7.0)
 
-The Tencent v0.3.4 release surfaced three patterns worth absorbing into
+The System Y v0.3.4 release surfaced three patterns worth absorbing into
 ai-memory. Each is a separate quick-win branch landing alongside this page:
 
 - **File-backed export of high-level artifacts** → QW-1

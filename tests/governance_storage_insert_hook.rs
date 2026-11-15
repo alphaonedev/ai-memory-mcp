@@ -419,7 +419,10 @@ fn spawn_healthy_serve(
     );
     for attempt in 1..=SPAWN_BIND_RETRY_ATTEMPTS {
         let port = free_port();
-        let mut child = std::process::Command::new(bin)
+        let mut cmd = std::process::Command::new(bin);
+        // #4166: the boot never waits on an embedder.
+        common::serve_test_env(&mut cmd);
+        let mut child = cmd
             .env("AI_MEMORY_NO_CONFIG", "1")
             .env("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0")
             .env("AI_MEMORY_OPERATOR_PUBKEY", pub_b64)
@@ -447,7 +450,7 @@ fn spawn_healthy_serve(
             })
         });
 
-        if wait_for_health(port, &tls) {
+        if wait_for_health(&mut child, port, &tls) {
             // Healthy: detach the stderr drainer (it ends when the child
             // is later killed and the pipe EOFs) and hand back the child.
             return (child, port, tls.clone());
@@ -489,9 +492,23 @@ const CURL_PROBE_MAX_SECS: &str = "2";
 /// test. The point is a bound that exists, not a tight one.
 const CURL_REQUEST_MAX_SECS: &str = "30";
 
-fn wait_for_health(port: u16, tls: &common::tls::TestTls) -> bool {
-    for _ in 0..100 {
-        std::thread::sleep(std::time::Duration::from_millis(100));
+/// Upper bound on one `serve` boot, a HANG GUARD and not a performance
+/// assertion (#4166). The wait ends on the child's exit or on `/health`; a
+/// healthy boot that is merely slow on a loaded runner must not fail the test.
+const BOOT_HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Pause between readiness probes.
+const READINESS_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// `true` once `/health` answers 200; `false` when the child exited or the
+/// hang guard tripped (the caller reaps the child and reports its stderr).
+fn wait_for_health(child: &mut std::process::Child, port: u16, tls: &common::tls::TestTls) -> bool {
+    let deadline = std::time::Instant::now() + BOOT_HANG_GUARD;
+    while std::time::Instant::now() < deadline {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return false;
+        }
+        std::thread::sleep(READINESS_POLL);
         if let Ok(out) = std::process::Command::new("curl")
             .args([
                 "-s",

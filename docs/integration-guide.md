@@ -25,7 +25,7 @@ the binary, ai-memory boots a per-session process, and the AI now
 has 8 to 103 advertised memory tools at its disposal (depending on the
 `--profile` flag). For AIs that don't speak MCP, the HTTP API
 covers everything the MCP surface does, plus a few more endpoints
-(103 route registrations / 89 unique URL paths).
+(105 route registrations / 91 unique URL paths).
 
 Every recipe below assumes the binary is on your `PATH`. If
 `ai-memory --version` doesn't print `1.0.0`, go back to
@@ -76,7 +76,7 @@ memory on every conversation start), see
 > documented in
 > [`docs/CLI_REFERENCE.md`](CLI_REFERENCE.html) § `mcp`.
 
-> **Using `--tier smart` or `--tier autonomous` with a non-default LLM backend?** Extend the `env` block above with `AI_MEMORY_LLM_BACKEND`, `AI_MEMORY_LLM_API_KEY`, and `AI_MEMORY_LLM_MODEL`. **Do not** rely on shell exports — MCP-spawned subprocesses don't see your interactive shell's environment ([#1144](https://github.com/alphaonedev/ai-memory-mcp/issues/1144)). Copy-pasteable recipes for every supported provider (Ollama, LMStudio, vLLM, llama.cpp server, xAI Grok, OpenAI, Anthropic, Gemini, Kimi, Qwen, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks): [`integrations/llm-backends.md`](integrations/llm-backends.html).
+> **Using `--tier smart` or `--tier autonomous` with a non-default LLM backend?** Extend the `env` block above with `AI_MEMORY_LLM_BACKEND`, `AI_MEMORY_LLM_API_KEY`, and `AI_MEMORY_LLM_MODEL`. **Do not** rely on shell exports — MCP-spawned subprocesses don't see your interactive shell's environment ([#1144](https://github.com/alphaonedev/ai-memory-mcp/issues/1144)). Copy-pasteable recipes for every supported provider (Ollama, LMStudio, vLLM, llama.cpp server, xAI Grok, OpenAI, Anthropic, Gemini, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks): [`integrations/llm-backends.md`](integrations/llm-backends.html).
 
 ### 2a. PreToolUse governance hook (gate every Bash / Edit / Write)
 
@@ -312,7 +312,7 @@ Category-1 (hook-capable) vs. Category-2 (MCP-only) matrix.
 
 ## 7. HTTP API fallback — for clients that don't speak MCP
 
-ai-memory ships an HTTP/REST daemon with **103 route registrations / 89 unique URL paths**
+ai-memory ships an HTTP/REST daemon with **105 route registrations / 91 unique URL paths**
 covering everything the MCP surface does. Use it for AI clients
 with no MCP support (most browser-based assistants), custom
 scripts, multi-host setups, and browser extensions.

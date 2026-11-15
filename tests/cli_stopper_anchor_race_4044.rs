@@ -18,7 +18,6 @@
 
 #![allow(clippy::missing_panics_doc)]
 
-use std::io::Write as _;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
@@ -27,6 +26,8 @@ use ai_memory::governance::policy_version::current_policy_version;
 use ai_memory::governance::rules_store::{self, Rule};
 use ai_memory::signed_events::event_types::GOVERNANCE_POLICY_ADVANCED;
 
+#[path = "common/child_stdin_report.rs"]
+mod child_stdin_report;
 #[path = "common/key_dir_sandbox.rs"]
 mod key_dir_sandbox;
 
@@ -143,12 +144,7 @@ fn stopper_anchor_names_the_evaluating_policy_4044() {
         "tool_name": "Write",
         "tool_input": { "file_path": "/deny4044/a/b.txt", "content": "x" }
     });
-    child
-        .stdin
-        .take()
-        .expect("stdin")
-        .write_all(event.to_string().as_bytes())
-        .expect("write event");
+    child_stdin_report::send_and_close(&mut child, "stdin payload", event.to_string().as_bytes());
     let out = child.wait_with_output().expect("child output");
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);

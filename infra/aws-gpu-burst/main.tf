@@ -13,7 +13,7 @@
 //   resource                pricing       qty   total/hr
 //   ------------------------------------------------------
 //   g5.2xlarge spot (vLLM)  ~$0.60/hr     1     $0.60
-//     (A10G 24GB VRAM, Llama-3.1-8B / Qwen2.5-7B)
+//     (A10G 24GB VRAM, Llama-3.1-8B)
 //   t3.medium (agent)       $0.0416/hr    5     $0.21
 //   t3.large (ai-memory+pg) $0.0832/hr    1     $0.08
 //   EBS gp3 (~100GB)        $0.008/hr     7     $0.06

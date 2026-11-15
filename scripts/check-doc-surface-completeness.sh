@@ -374,6 +374,7 @@ if routes_rs:
         norm_path(x)
         for x in re.findall(r'/[A-Za-z0-9_/{}:<>$.\-]*', api_doc)
         if x.startswith("/api/") or x == "/metrics" or x.startswith("/health")
+        or x.startswith("/.well-known/")  # #8444: the Agent Card route
     )
     for p in consts:
         scan_total += 1

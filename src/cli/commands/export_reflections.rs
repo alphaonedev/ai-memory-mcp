@@ -23,7 +23,6 @@
 //! delete / regenerate the directory at any time.
 
 use std::collections::HashSet;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -36,9 +35,8 @@ use crate::db;
 use crate::models::{Memory, MemoryKind};
 use crate::yaml_frontmatter::{YamlScalarKind, yaml_scalar};
 
-mod private_file;
-
-pub(crate) use private_file::write_private_export;
+pub(crate) mod private_file;
+use private_file::PrivateExportDir;
 
 /// Reflection-export subdirectory under `~/.ai-memory` — shared with the
 /// post-reflect auto-export hook (#1558 batch 6).
@@ -80,7 +78,7 @@ pub struct ExportReflectionsArgs {
     pub namespace: Option<String>,
 
     /// Output directory root. Defaults to `~/.ai-memory/reflections/`.
-    /// The directory is created if it does not exist.
+    /// Created with mode 0700; existing directories must already be private.
     #[arg(long, value_name = "PATH")]
     pub out_dir: Option<PathBuf>,
 
@@ -141,33 +139,35 @@ pub fn run(db_path: &Path, args: &ExportReflectionsArgs, out: &mut CliOutput<'_>
 
     let reflections = collect_reflections(&conn, args.namespace.as_deref(), args.since.as_deref())?;
     // ERRORS-02: validate the whole batch before creating directories or files.
-    // OWNERSHIP-15: borrow each row and retain its validated namespace path.
+    // OWNERSHIP-05: borrow each row and retain its validated namespace path.
     let mut validated = Vec::with_capacity(reflections.len());
     for mem in &reflections {
         validate_export_id(&mem.id, &mem.namespace)?;
-        let ns_dir = out_dir.join(sanitise_namespace_for_path(&mem.namespace).with_context(
-            || {
-                format!(
-                    "memory {} namespace {}: refusing export path",
-                    export_diagnostic(&mem.id),
-                    export_diagnostic(&mem.namespace)
-                )
-            },
-        )?);
-        validated.push((mem, ns_dir));
+        let relative = sanitise_namespace_for_path(&mem.namespace).with_context(|| {
+            format!(
+                "memory {} namespace {}: refusing export path",
+                export_diagnostic(&mem.id),
+                export_diagnostic(&mem.namespace)
+            )
+        })?;
+        validated.push((mem, relative));
     }
-    fs::create_dir_all(&out_dir)
-        .with_context(|| format!("creating out-dir {}", out_dir.display()))?;
+    let private_root = PrivateExportDir::open(&out_dir)
+        .with_context(|| format!("opening private out-dir {}", out_dir.display()))?;
     let mut swept_directories = HashSet::new();
-    for (mem, ns_dir) in validated {
+    for (mem, relative) in validated {
         let edges = collect_outbound_reflects_on(&conn, &mem.id)?;
         let attest_level = summarise_attest_level(&edges);
         let payload = render_payload(mem, &edges, attest_level, format);
 
-        fs::create_dir_all(&ns_dir)
-            .with_context(|| format!("creating namespace dir {}", ns_dir.display()))?;
+        let namespace = private_root
+            .namespace(&relative)
+            .with_context(|| private_file::namespace_context(&out_dir.join(&relative)))?;
+        if swept_directories.insert(relative.clone()) {
+            namespace.sweep_stale_staging();
+        }
+        let ns_dir = out_dir.join(relative);
         let filename = format!("{}.{}", mem.id, format.extension());
-        let path = ns_dir.join(&filename);
         let escaped_id = export_diagnostic(&mem.id);
         // OWNERSHIP-05/15: compare borrowed, bounded output; keep clean paths exact.
         let unquoted = escaped_id
@@ -179,12 +179,9 @@ pub fn run(db_path: &Path, args: &ExportReflectionsArgs, out: &mut CliOutput<'_>
             &escaped_id
         };
         let diagnostic_path = ns_dir.join(format!("{printed_id}.{}", format.extension()));
-        private_file::write_private_export_in_batch(
-            &path,
-            payload.as_bytes(),
-            &mut swept_directories,
-        )
-        .with_context(|| crate::errors::msg::writing(diagnostic_path.display()))?;
+        namespace
+            .write(&filename, payload.as_bytes())
+            .with_context(|| crate::errors::msg::writing(diagnostic_path.display()))?;
         summary.written += 1;
         if !args.quiet {
             writeln!(out.stdout, "wrote {}", diagnostic_path.display())?;

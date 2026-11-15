@@ -63,7 +63,7 @@ class SwarmConfig:
         base_urls: One or more daemon base URLs. A single entry is Config-1
             (one daemon); several entries are a swarm/mesh (Config-2..5). An
             agent is round-robin-assigned to one URL at spawn.
-        n_agents: Number of GLM-driven agents to spawn.
+        n_agents: Number of Flash-driven agents to spawn.
         max_steps: Hard ceiling on perceive->decide->act->record loop steps
             per agent (bounded work — no unbounded agent loops).
         stagger_secs: Delay between successive agent launches. Staggered, not

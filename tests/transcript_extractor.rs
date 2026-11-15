@@ -23,6 +23,8 @@ use std::sync::OnceLock;
 
 use ai_memory::config::{TranscriptNamespaceConfig, TranscriptsConfig};
 use serde_json::{Value, json};
+#[path = "common/child_stdin_report.rs"]
+mod child_stdin_report;
 
 /// v1.0.0 #3140 — ceiling on the nested `cargo build` for the sibling crate.
 ///
@@ -333,7 +335,6 @@ fn build_extractor_once() -> PathBuf {
 /// Pipe `envelope` to the extractor in one-shot mode and return
 /// the parsed decision JSON.
 fn run_once(bin: &Path, envelope: &Value) -> Value {
-    use std::io::Write;
     // v1.0.0 #3140 — stdout/stderr go to FILES, not pipes. `wait_with_output`
     // reads both pipes to EOF with no deadline, so an extractor that never
     // exits (or one that fills a pipe nobody drains) parks the test forever.
@@ -358,12 +359,7 @@ fn run_once(bin: &Path, envelope: &Value) -> Value {
         ))
         .spawn()
         .expect("spawn extractor");
-    {
-        let stdin = child.stdin.as_mut().expect("stdin");
-        stdin
-            .write_all(envelope.to_string().as_bytes())
-            .expect("write envelope");
-    }
+    child_stdin_report::write_open(&mut child, "envelope", envelope.to_string().as_bytes());
     // Close stdin so the extractor sees EOF and can exit.
     drop(child.stdin.take());
 

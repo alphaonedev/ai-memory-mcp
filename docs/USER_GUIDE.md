@@ -39,7 +39,7 @@ Below is an example for **Claude Code** (user scope: merge `mcpServers` into `~/
 
 > **Claude Code note:** MCP server configuration does **not** go in `settings.json` or `settings.local.json` -- those files do not support `mcpServers`.
 
-> **Tier flag:** The `--tier` flag must be passed in the args: `keyword`, `semantic` (default), `smart`, or `autonomous`. The `config.toml` tier setting is not used when launched by an AI client. Smart/autonomous tiers require an LLM backend — post-[#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067) (v0.7.0) that is local [Ollama](https://ollama.com), LMStudio, vLLM, llama.cpp server, OR any OpenAI-compatible cloud vendor (xAI / OpenAI / Anthropic / Gemini / Kimi / Qwen / Mistral / Groq / Together / Cerebras / OpenRouter / Fireworks), selected via `AI_MEMORY_LLM_BACKEND`.
+> **Tier flag:** The `--tier` flag must be passed in the args: `keyword`, `semantic` (default), `smart`, or `autonomous`. The `config.toml` tier setting is not used when launched by an AI client. Smart/autonomous tiers require an LLM backend — post-[#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067) (v0.7.0) that is local [Ollama](https://ollama.com), LMStudio, vLLM, llama.cpp server, OR any OpenAI-compatible cloud vendor (xAI / OpenAI / Anthropic / Gemini / Mistral / Groq / Together / Cerebras / OpenRouter / Fireworks), selected via `AI_MEMORY_LLM_BACKEND`.
 
 > **Other platforms** (Codex, Gemini, Cursor, Windsurf, Continue.dev, etc.): config paths vary by platform. The command and args are the same -- only the config file location differs. Refer to the [Installation Guide](INSTALL.html) for exact paths.
 
@@ -2369,6 +2369,14 @@ ai-memory man | man -l -
 ai-memory man | sudo tee /usr/local/share/man/man1/ai-memory.1 > /dev/null
 ```
 
+## Webhook delivery and proxies
+
+Webhook delivery connects directly over HTTPS and pins the addresses checked by
+the SSRF guard. It ignores `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and their
+lowercase equivalents, so a proxy cannot perform a second, unchecked DNS lookup.
+Webhook receivers must be directly reachable; redirects are refused. For a
+receiver using a private certificate authority, configure `[subscriptions] ca_cert`.
+
 ## Troubleshooting
 
 Common issues, their causes, and how to fix them.
@@ -2404,7 +2412,7 @@ Common issues, their causes, and how to fix them.
 
 **Solution:**
 1. Ensure you have internet access and can reach `huggingface.co`.
-2. If behind a corporate proxy, set `HTTPS_PROXY` before starting ai-memory.
+2. If behind a corporate proxy, set `HTTPS_PROXY` before starting ai-memory for the Hugging Face download. Webhook delivery ignores environment proxies.
 3. Wait -- the first download can take a few minutes on slow connections. Subsequent runs use the cached model.
 4. If the download is corrupted, delete the cached model directory (`~/.cache/huggingface/hub/models--sentence-transformers--all-MiniLM-L6-v2/`) and retry.
 

@@ -72,6 +72,24 @@ capabilities:
    hooks never `exec` or write to disk outside the database. Worst
    case: bad tags, spurious contradiction flags. Reversible via the
    rollback log.
+5. **Remote Agent2Agent (A2A) caller** (#8444). `POST /api/v1/a2a` and
+   `GET /.well-known/agent-card.json` are reachable by any holder of an API
+   key, and an inbound A2A message is untrusted content. Controls: both routes
+   sit behind the existing `api_key_auth` (the Agent Card is NOT served
+   unauthenticated and no auth exemption was added); every JSON-RPC method
+   needs an agent identity derived from the credential, fail-closed, so an
+   open/keyless server serves no RPC; each inbound message is stamped with the
+   AUTHENTICATED agent id as `content_principal` (never `X-Agent-Id` or the
+   request body) and the remote role string as an untrusted `a2a_role` label;
+   tasks are owned by the creating credential, and another caller's task
+   answers `-32001` with HTTP 404 (never 403) so ids do not leak; state
+   changes are atomic compare-and-set; request bodies are bounded by the
+   HTTP body limit, `pageSize` is capped, terminal tasks are retained only up
+   to a fixed per-agent bound, and `file` parts are refused. Streaming and push
+   notification delivery are not served, so there is no server-initiated
+   outbound request (no webhook SSRF surface) from this binding. The card
+   discloses no namespace, agent-id or deployment facts, and `mtls` is not
+   declared as a card scheme.
 
 Out of scope (non-goals):
 

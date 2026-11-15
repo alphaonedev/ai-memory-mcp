@@ -120,17 +120,18 @@ fn conflict_id(err: &StoreError) -> &str {
     }
 }
 
-/// #3690 — the schema claim on the pg side: the ladder tip is 100 and the
-/// SHIPPED index (after the ladder, which runs on every connect) is PARTIAL
-/// on the ONE predicate.
+/// #3690 — the schema claim on the pg side: the ladder tip (v101 since
+/// #8444; the index landed at v100) carries the SHIPPED index (after the
+/// ladder, which runs on every connect), PARTIAL on the ONE predicate.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pg_schema_v100_carries_the_partial_title_slot_index_3690() {
+async fn pg_schema_tip_carries_the_partial_title_slot_index_3690() {
     let Some(store) = connect().await else { return };
     let version: i32 = sqlx::query_scalar("SELECT MAX(version) FROM schema_version")
         .fetch_one(store.pool())
         .await
         .expect("schema_version");
-    assert_eq!(version, 100);
+    // #8444: tip pin moved 100 -> 101 with the a2a_tasks migration.
+    assert_eq!(version, 101);
     let indexdef: String = sqlx::query_scalar(
         "SELECT indexdef FROM pg_indexes WHERE indexname = 'memories_title_ns_uidx'",
     )

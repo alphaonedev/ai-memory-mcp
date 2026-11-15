@@ -130,6 +130,17 @@ fn router(app: AppState) -> axum::Router {
 }
 
 async fn request(router: &axum::Router, method: &str, path: &str, body: Value) -> Value {
+    let (status, receipt) = request_with_status(router, method, path, body).await;
+    assert!(status.is_success(), "{method} {path}: {status} {receipt}");
+    receipt
+}
+
+async fn request_with_status(
+    router: &axum::Router,
+    method: &str,
+    path: &str,
+    body: Value,
+) -> (axum::http::StatusCode, Value) {
     let response = router
         .clone()
         .oneshot(
@@ -151,8 +162,7 @@ async fn request(router: &axum::Router, method: &str, path: &str, body: Value) -
         .await
         .expect("body");
     let receipt: Value = serde_json::from_slice(&bytes).expect("receipt JSON");
-    assert!(status.is_success(), "{method} {path}: {status} {receipt}");
-    receipt
+    (status, receipt)
 }
 
 async fn exercise_local(app: AppState, fsync: &str) {
@@ -343,23 +353,40 @@ async fn exercise_quorum(mut app: AppState) {
         }),
     )
     .await;
-    assert_eq!(captured["durability_class"], "local-only", "{captured}");
-    let receipt = request(&router, "POST", "/api/v1/memories", json!({"title": uuid::Uuid::new_v4().to_string(), "content": "Quorum receipt evidence observation.", "namespace": "receipt3555"})).await;
+    // #8741 — capture_turn fans out through the push funnel, so with the
+    // peer acking it carries the same quorum receipt as a plain store.
     let backed_up =
         std::env::var("AI_MEMORY_BACKUP_POSTURE_ATTESTATION").is_ok_and(|v| v == "attested");
-    assert_eq!(
-        receipt["durability_class"],
-        if backed_up {
-            "replicated+backup"
-        } else {
-            "quorum 2-of-2"
-        },
-        "{receipt}"
-    );
+    let quorum_class = if backed_up {
+        "replicated+backup"
+    } else {
+        "quorum 2-of-2"
+    };
+    assert_eq!(captured["durability_class"], quorum_class, "{captured}");
+    assert_eq!(captured["quorum_acks"], 2, "{captured}");
+    let receipt = request(&router, "POST", "/api/v1/memories", json!({"title": uuid::Uuid::new_v4().to_string(), "content": "Quorum receipt evidence observation.", "namespace": "receipt3555"})).await;
+    assert_eq!(receipt["durability_class"], quorum_class, "{receipt}");
     assert_eq!(receipt["quorum_acks"], 2, "{receipt}");
     assert_eq!(receipt["quorum_n"], 2, "{receipt}");
     server.abort();
     let _ = server.await;
+    // #8741 — peer down: the turn is durable locally and the reply is the
+    // exact 202 under-replicated body, never a quorum receipt.
+    let (status, down) = request_with_status(
+        &router,
+        "POST",
+        "/api/v1/capture_turn",
+        json!({
+            "host_session_id": uuid::Uuid::new_v4().to_string(), "host_turn_index": 0,
+            "role": "user", "content": "A peer that is down never acknowledges a turn."
+        }),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::ACCEPTED, "{down}");
+    assert_eq!(down["quorum_met"], false, "{down}");
+    assert_eq!(down["durability"], "local", "{down}");
+    assert_eq!(down["acks"], 1, "{down}");
+    assert_eq!(down["needed"], 2, "{down}");
 }
 
 #[test]

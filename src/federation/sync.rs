@@ -914,16 +914,79 @@ pub async fn broadcast_delete_quorum(
     config: &FederationConfig,
     id: &str,
 ) -> Result<AckTracker, QuorumError> {
+    delete_quorum(config, std::slice::from_ref(&id), Some(id)).await
+}
+
+/// Detail of the `LocalWriteFailed` a batched delete returns when the
+/// caller hands it more ids than one `sync_push` body may carry (the
+/// receiver refuses a `deletions` list above its page size, default
+/// [`crate::handlers::MAX_BULK_SIZE`]). The funnel chunks before calling,
+/// so this is the fail-closed backstop, never a silent truncation.
+pub const DELETE_BATCH_TOO_LARGE: &str = "DELETE_BATCH_TOO_LARGE";
+
+/// One `sync_push` deletion body (the shipped `deletions` array form).
+fn deletion_body(config: &FederationConfig, ids: &[&str]) -> serde_json::Value {
+    serde_json::json!({
+        (field_names::SENDER_AGENT_ID): config.sender_agent_id,
+        "memories": [],
+        "deletions": ids,
+        "dry_run": false,
+    })
+}
+
+/// #8741 (F4) — fan out up to [`crate::handlers::MAX_BULK_SIZE`] tombstones
+/// in ONE `sync_push.deletions` body per peer, with the quorum contract of
+/// [`broadcast_delete_quorum`]. A peer that does not ack the chunk gets one
+/// DLQ row PER id, each carrying that id's own single-deletion body under the
+/// bare memory-id key, so the #2716 restore-race guard and the
+/// store-then-delete collision analysis above hold exactly as for the
+/// single-id lane. No Idempotency-Key rides on a chunk (the
+/// [`bulk_catchup_push`] batched precedent); a replayed deletion is
+/// idempotent on the receiver.
+/// `decision: chunked tombstone bodies over per-id pushes because N ids x
+/// peers round trips is unbounded; per-id DLQ landing keeps the bare-id key`.
+///
+/// # Errors
+///
+/// `LocalWriteFailed` naming [`DELETE_BATCH_TOO_LARGE`] for an oversized
+/// chunk, or as [`broadcast_delete_quorum`].
+pub async fn broadcast_delete_batch_quorum(
+    config: &FederationConfig,
+    ids: &[String],
+) -> Result<AckTracker, QuorumError> {
+    if ids.len() > crate::handlers::MAX_BULK_SIZE {
+        return Err(QuorumError::LocalWriteFailed {
+            detail: DELETE_BATCH_TOO_LARGE.to_string(),
+        });
+    }
+    let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+    delete_quorum(config, &ids, None).await
+}
+
+/// Shared body of the single-id and chunked delete lanes.
+async fn delete_quorum(
+    config: &FederationConfig,
+    ids: &[&str],
+    idempotency_key: Option<&str>,
+) -> Result<AckTracker, QuorumError> {
     let now = Instant::now();
     let tracker = Arc::new(Mutex::new(AckTracker::new(config.policy.clone(), now)));
     tracker.lock().await.record_local();
-
-    let body = serde_json::json!({
-        (field_names::SENDER_AGENT_ID): config.sender_agent_id,
-        "memories": [],
-        "deletions": [id],
-        "dry_run": false,
-    });
+    let Some(first_id) = ids.first().copied() else {
+        // Nothing to erase: the local record is the whole verdict.
+        return Arc::try_unwrap(tracker)
+            .map_err(|_| QuorumError::LocalWriteFailed {
+                detail: TRACKER_ARC_STILL_REFERENCED.to_string(),
+            })
+            .map(Mutex::into_inner);
+    };
+    let id = if ids.len() == 1 {
+        first_id.to_string()
+    } else {
+        format!("{first_id} (+{} more)", ids.len() - 1)
+    };
+    let idempotency_key = idempotency_key.map(str::to_string);
+    let body = deletion_body(config, ids);
 
     let mut joins: PeerTasks<(String, AckOutcome)> = PeerTasks::new();
     // #2498 — mirror of the #933 store-lane bookkeeping. Snapshot the
@@ -945,7 +1008,8 @@ pub async fn broadcast_delete_quorum(
         let endpoint = peer.clone();
         let peer_id = peer.id.clone();
         let payload = body.clone();
-        let target_id = id.to_string();
+        let target_id = first_id.to_string();
+        let key = idempotency_key.clone();
         let api_key = config.api_key.clone();
         let signing_key = config.signing_key.clone();
         joins.spawn(peer.id.clone(), async move {
@@ -954,7 +1018,7 @@ pub async fn broadcast_delete_quorum(
                 &endpoint,
                 &payload,
                 &target_id,
-                Some(&target_id),
+                key.as_deref(),
                 api_key.as_deref(),
                 signing_key.as_deref(),
             )
@@ -1092,16 +1156,33 @@ pub async fn broadcast_delete_quorum(
     // (the #2716 restore-race guard reads `row.memory_id` as a live-memory
     // lookup for delete-shaped payloads; the store-then-delete last-wins
     // collision analysis above is unchanged).
-    land_push_failures(
-        config,
-        &tracker,
-        &dispatched_peer_ids,
-        explicit_failures,
-        id,
-        &body,
-        "delete",
-    )
-    .await;
+    // #8741 (F4) — a chunk lands one row PER id with that id's own
+    // single-deletion body, so every row keeps the bare memory-id key.
+    if ids.len() == 1 {
+        land_push_failures(
+            config,
+            &tracker,
+            &dispatched_peer_ids,
+            explicit_failures,
+            first_id,
+            &body,
+            "delete",
+        )
+        .await;
+    } else {
+        for one in ids {
+            land_push_failures(
+                config,
+                &tracker,
+                &dispatched_peer_ids,
+                explicit_failures.clone(),
+                one,
+                &deletion_body(config, std::slice::from_ref(one)),
+                "delete",
+            )
+            .await;
+        }
+    }
     Ok(tracker)
 }
 

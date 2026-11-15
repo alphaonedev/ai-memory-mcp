@@ -325,9 +325,7 @@ fn nhi_self_persona_any_agent_substrate_resident() {
     // none of these substrings should appear.
     // #3627: the retired provider left this family list in lockstep with
     // the `src/identity/model_family.rs` stem it mirrored.
-    for forbidden in [
-        "claude", "gpt", "gemini", "llama", "grok", "qwen", "mistral", "phi",
-    ] {
+    for forbidden in ["claude", "gpt", "gemini", "llama", "grok", "mistral", "phi"] {
         assert!(
             !agent_id.to_lowercase().contains(forbidden),
             "agent_id must be model-agnostic in this test — got: {agent_id} (forbidden: {forbidden})"

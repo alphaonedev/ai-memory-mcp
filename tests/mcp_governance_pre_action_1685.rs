@@ -36,7 +36,7 @@
 #[path = "common/key_dir_sandbox.rs"]
 mod key_dir_sandbox;
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::mpsc;
 
@@ -45,12 +45,26 @@ use ai_memory::db;
 // #2525 — the per-response bound comes from the shared elastic helper
 // (base x `AI_MEMORY_TEST_TIMING_BUDGET_MULT`, with fail-fast child-death
 // detection) instead of the fixed 20s constant this file used to carry.
+#[path = "common/child_stdin_report.rs"]
+mod child_stdin_report;
 #[path = "common/mcp_wait.rs"]
 mod mcp_wait;
 
 struct McpChild {
     child: Option<Child>,
     stdin: Option<ChildStdin>,
+    stderr: Option<child_stdin_report::StderrCapture>,
+}
+
+impl McpChild {
+    /// Write one request line; a failed write reaps the child and fails with
+    /// its exit status and stderr (#8734).
+    fn write_line(&mut self, what: &str, line: &str) {
+        let (Some(stdin), Some(child)) = (self.stdin.as_mut(), self.child.as_mut()) else {
+            panic!("{what}: the MCP child is already closed");
+        };
+        child_stdin_report::write_line_or_report(stdin, child, self.stderr.as_ref(), what, line);
+    }
 }
 
 impl Drop for McpChild {
@@ -137,23 +151,17 @@ fn spawn_mcp(db_path: &std::path::Path) -> (McpChild, mpsc::Receiver<String>) {
 
     let stdin = child.stdin.take().unwrap();
     let stdout = child.stdout.take().unwrap();
-    if let Some(stderr) = child.stderr.take() {
-        std::thread::spawn(move || {
-            let mut buf = [0u8; 4096];
-            let mut s = stderr;
-            while let Ok(n) = s.read(&mut buf) {
-                if n == 0 {
-                    break;
-                }
-            }
-        });
-    }
+    let stderr = child
+        .stderr
+        .take()
+        .map(child_stdin_report::StderrCapture::drain);
     let (tx, rx) = mpsc::channel();
     spawn_stdout_reader(stdout, tx);
     (
         McpChild {
             child: Some(child),
             stdin: Some(stdin),
+            stderr,
         },
         rx,
     )
@@ -177,19 +185,18 @@ fn spawn_stdout_reader(stdout: ChildStdout, tx: mpsc::Sender<String>) {
 }
 
 fn send_and_recv(
-    stdin: &mut ChildStdin,
+    stdin: &mut McpChild,
     rx: &mpsc::Receiver<String>,
     payload: &serde_json::Value,
 ) -> serde_json::Value {
     let line = serde_json::to_string(payload).unwrap();
     let ctx = payload["method"].as_str().unwrap_or("<unknown method>");
-    writeln!(stdin, "{line}").expect("write to mcp stdin");
-    stdin.flush().expect("flush mcp stdin");
+    stdin.write_line("MCP request", &line);
     let resp = mcp_wait::recv_mcp_response(rx, ctx);
     serde_json::from_str(&resp).unwrap_or_else(|e| panic!("parse mcp response: {e}: {resp}"))
 }
 
-fn initialize(stdin: &mut ChildStdin, rx: &mpsc::Receiver<String>) {
+fn initialize(stdin: &mut McpChild, rx: &mpsc::Receiver<String>) {
     let init = send_and_recv(
         stdin,
         rx,
@@ -210,7 +217,7 @@ fn initialize(stdin: &mut ChildStdin, rx: &mpsc::Receiver<String>) {
 /// Register a minimal inline skill over MCP, returning its UUID (read
 /// back from the `skills` table — robust against tool-result formatting).
 fn register_skill(
-    stdin: &mut ChildStdin,
+    stdin: &mut McpChild,
     rx: &mpsc::Receiver<String>,
     db_path: &std::path::Path,
 ) -> String {
@@ -248,7 +255,7 @@ fn register_skill(
 }
 
 fn call_skill_export(
-    stdin: &mut ChildStdin,
+    stdin: &mut McpChild,
     rx: &mpsc::Receiver<String>,
     skill_id: &str,
     target: &std::path::Path,
@@ -281,7 +288,7 @@ fn mcp_skill_export_refused_by_filesystem_write_rule_1685() {
     seed_filesystem_refuse_rule(&db_path);
 
     let (mut guard, rx) = spawn_mcp(&db_path);
-    let stdin = guard.stdin.as_mut().unwrap();
+    let stdin = &mut guard;
     initialize(stdin, &rx);
     let skill_id = register_skill(stdin, &rx, &db_path);
 
@@ -329,7 +336,7 @@ fn mcp_skill_export_succeeds_without_rule_1685() {
     // No governance rule seeded.
 
     let (mut guard, rx) = spawn_mcp(&db_path);
-    let stdin = guard.stdin.as_mut().unwrap();
+    let stdin = &mut guard;
     initialize(stdin, &rx);
     let skill_id = register_skill(stdin, &rx, &db_path);
 

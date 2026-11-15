@@ -135,7 +135,7 @@ the host config.
 **Schema-drift detection.** From v0.6.3.1, boot also surfaces a
 `# ai-memory boot: warn` header when the DB's `schema_version` lies
 outside the binary's supported range. The canonical
-schema is **v100** (verified via `CURRENT_SCHEMA_VERSION` in
+schema is **v101** (verified via `CURRENT_SCHEMA_VERSION` in
 `src/storage/migrations.rs`); an older DB is brought up to that version
 via the in-process migration ladder applied on first daemon start. An agent or
 human running an older `ai-memory` binary against a newer DB (or
@@ -154,7 +154,7 @@ no black-box behaviour:
 ```text
 # ai-memory boot: ok
 #   version:    1.0.0
-#   db:         /home/u/.claude/ai-memory.db (schema=v100, 161 memories)
+#   db:         /home/u/.claude/ai-memory.db (schema=v101, 161 memories)
 #   tier:       autonomous (embedder=nomic-embed-text-v1.5, reranker=ms-marco-MiniLM-L-6-v2, llm=xai:grok-4.3)
 #   latency:    12ms
 #   namespace:  ai-memory-mcp (loaded 10 memories)
@@ -414,6 +414,42 @@ ai-memory install claude-code --hook pretool --uninstall --apply
 
 This removes only our managed entry; operator-authored PreToolUse
 entries (under different markers) are left untouched.
+
+## Running more than one ai-memory build
+
+Several ai-memory builds on one machine (a release install plus a build from
+source, or an upgrade you want to try before committing to it) must never share
+one live database file. A database records the schema version of the newest
+build that opened it, and an older build refuses a newer database instead of
+operating it. The refusal reads:
+
+```text
+database schema is AHEAD of this binary: ... this database was written by a
+newer ai-memory build (schema vN); this binary (ai-memory X.Y.Z) supports schema
+vM; upgrade ai-memory to the build that wrote this database, or open a backup
+copy with --db <copy> ...
+```
+
+The refusal is the guard working, not a fault: it leaves the file byte-identical
+and writes nothing. A newer build that opens an older database takes a
+`*.pre-migration-vFROM-to-vTO-*.bak` snapshot next to the file before the
+migration ladder runs, and the same snapshot precedes the documented
+derived-state repair when a build of the same schema version finds damaged
+derived triggers (it is taken before the ladder or repair runs, not before
+every open-time write). The snapshot carries the same permission bits as the
+database (owner-only when the mode cannot be read). On postgres the copy
+selector is `--store-url <copy-url>` instead of `--db <copy>`.
+
+Safe practice:
+
+1. Back up first with `ai-memory backup` (it keeps working against a database
+   that is ahead of the binary).
+2. Point any second or test build at a copy through the `--db <copy>` flag,
+   never at the live file.
+3. Never point a test or source build at the live database. If a refusal names
+   a newer schema, install the build that wrote the database or restore a
+   backup; do not set `AI_MEMORY_ALLOW_SCHEMA_AHEAD` to get past it unless you
+   have verified the build can safely operate that schema.
 
 ## What this does NOT solve
 

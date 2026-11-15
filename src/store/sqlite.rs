@@ -194,6 +194,22 @@ impl SqliteStore {
         &self.path
     }
 
+    /// #9057 — unfiltered by-id read, the twin of
+    /// [`crate::store::postgres::PostgresStore::get_any`]: it returns a
+    /// tombstoned or quarantined row instead of folding it into `None`.
+    /// Reached only through the concrete adapter (`as_any().downcast_ref`),
+    /// never the `MemoryStore` trait, so it is never a caller-facing
+    /// content read; the federated consolidate finalize uses it to read
+    /// back the sources it has just tombstoned.
+    ///
+    /// # Errors
+    ///
+    /// The boxed storage error on SQL failure.
+    pub async fn get_any(&self, id: &str) -> StoreResult<Option<crate::models::Memory>> {
+        let conn = self.state.lock().await;
+        crate::storage::get_any(&conn, id).map_err(box_err)
+    }
+
     /// #1955 R45 — SAL write-funnel gate. Returns
     /// [`StoreError::Stopped`] when the record plane is stopped so the
     /// SAL surface refuses with the typed error (503) rather than the
@@ -590,6 +606,13 @@ impl MemoryStore for SqliteStore {
             | Capabilities::DURABLE
             | Capabilities::STRONG_CONSISTENCY
             | Capabilities::ATOMIC_MULTI_WRITE
+    }
+
+    // #9057 — expose the concrete adapter so the consolidate finalize can
+    // reach the unfiltered `SqliteStore::get_any` (the PostgresStore
+    // precedent, #2587).
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 
     /// v0.7.0.1 S75 — read `MAX(version)` from the live SQLite
@@ -4309,6 +4332,81 @@ impl MemoryStore for SqliteStore {
         tier: Option<&Tier>,
         why_trace: Option<&str>,
     ) -> StoreResult<String> {
+        self.notify_stamped(
+            ctx,
+            target_agent,
+            title,
+            payload,
+            priority,
+            tier,
+            why_trace,
+            None,
+        )
+        .await
+    }
+
+    async fn a2a_task_insert(
+        &self,
+        task: &crate::storage::a2a_tasks::A2aTaskRow,
+    ) -> StoreResult<()> {
+        let conn = self.state.lock().await;
+        crate::storage::a2a_tasks::a2a_task_insert(&conn, task).map_err(box_err)
+    }
+
+    async fn a2a_task_get(
+        &self,
+        agent_id: &str,
+        id: &str,
+    ) -> StoreResult<Option<crate::storage::a2a_tasks::A2aTaskRow>> {
+        let conn = self.state.lock().await;
+        crate::storage::a2a_tasks::a2a_task_get(&conn, agent_id, id).map_err(box_err)
+    }
+
+    async fn a2a_task_list(
+        &self,
+        agent_id: &str,
+        filter: &crate::storage::a2a_tasks::A2aTaskFilter,
+    ) -> StoreResult<crate::storage::a2a_tasks::A2aTaskPage> {
+        let conn = self.state.lock().await;
+        crate::storage::a2a_tasks::a2a_task_list(&conn, agent_id, filter).map_err(box_err)
+    }
+
+    async fn a2a_task_transition(
+        &self,
+        agent_id: &str,
+        id: &str,
+        from_states: &[&str],
+        to_state: &str,
+        update: &crate::storage::a2a_tasks::A2aTaskUpdate,
+    ) -> StoreResult<bool> {
+        let conn = self.state.lock().await;
+        crate::storage::a2a_tasks::a2a_task_transition(
+            &conn,
+            agent_id,
+            id,
+            from_states,
+            to_state,
+            update,
+        )
+        .map_err(box_err)
+    }
+
+    async fn a2a_task_export(&self) -> StoreResult<Vec<crate::storage::a2a_tasks::A2aTaskRow>> {
+        let conn = self.state.lock().await;
+        crate::storage::a2a_tasks::a2a_task_export(&conn).map_err(box_err)
+    }
+
+    async fn notify_stamped(
+        &self,
+        ctx: &CallerContext,
+        target_agent: &str,
+        title: &str,
+        payload: &str,
+        priority: Option<i32>,
+        tier: Option<&Tier>,
+        why_trace: Option<&str>,
+        system_metadata: Option<&serde_json::Map<String, serde_json::Value>>,
+    ) -> StoreResult<String> {
         // #4338 — refuse an invalid recipient before any quota charge, write
         // or wake; the shared validator never echoes the value.
         crate::validate::validate_notify_target(target_agent).map_err(|e| {
@@ -4337,6 +4435,13 @@ impl MemoryStore for SqliteStore {
         // rationale here; see the trait docs).
         if let Some(wt) = why_trace.filter(|s| !s.trim().is_empty()) {
             metadata[crate::storage::META_KEY_WHY_TRACE] = serde_json::json!(wt);
+        }
+        // #8444 - system-stamped provenance lands at memory formation, never
+        // via a post-hoc patch. Stamps overwrite any same-named key.
+        if let Some(stamp) = system_metadata {
+            for (k, v) in stamp {
+                metadata[k.as_str()] = v.clone();
+            }
         }
         let mem = Memory {
             id: row_id,

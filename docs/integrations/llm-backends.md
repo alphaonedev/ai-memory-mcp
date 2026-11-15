@@ -5,7 +5,7 @@ layout: doc
 
 **Audience:** operators wiring ai-memory's `smart` / `autonomous` tiers to a specific LLM provider via an MCP-capable AI client (Claude Code, Claude Desktop, Cursor, Codex CLI, Cline, Continue, Zed, Windsurf, Goose, Roo Code, Aider, Cody, Gemini CLI, OpenClaw, …).
 
-**Why this page exists.** ai-memory v0.7.0 (#1067 / #1142 / #1143 / #1146) ships a provider-agnostic LLM client; v0.7.x (#1598) extends the same vendor-alias vocabulary to the embedder via the `[embeddings]` section / `AI_MEMORY_EMBED_*` env vars. **14 vendor aliases + the generic `openai-compatible` escape hatch + native Ollama = 16 acceptable values** for the backend selector — local Ollama, LMStudio, vLLM, llama.cpp server, xAI Grok, OpenAI, Anthropic, Google Gemini, Kimi/Moonshot, Qwen/Dashscope, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks. Authoritative vendor-alias list lives in `src/llm.rs::default_base_url_for_alias` (resolved by `OllamaClient::from_env`); compiled default models per backend live in `src/config.rs::backend_default_model`.
+**Why this page exists.** ai-memory v0.7.0 (#1067 / #1142 / #1143 / #1146) ships a provider-agnostic LLM client; v0.7.x (#1598) extends the same vendor-alias vocabulary to the embedder via the `[embeddings]` section / `AI_MEMORY_EMBED_*` env vars. **12 vendor aliases + the generic `openai-compatible` escape hatch + native Ollama = 14 acceptable values** for the backend selector — local Ollama, LMStudio, vLLM, llama.cpp server, xAI Grok, OpenAI, Anthropic, Google Gemini, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks. Authoritative vendor-alias list lives in `src/llm.rs::default_base_url_for_alias` (resolved by `OllamaClient::from_env`); compiled default models per backend live in `src/config.rs::backend_default_model`.
 
 ## Recommended path — `[llm]` section in `~/.config/ai-memory/config.toml` (#1146)
 
@@ -19,7 +19,7 @@ tier = "autonomous"
 db   = "~/.claude/ai-memory.db"
 
 [llm]
-backend     = "xai"                    # any of the 17 selector values listed above
+backend     = "xai"                    # any of the 13 selector values listed above
 model       = "grok-4.3"               # vendor-specific identifier
 base_url    = "https://api.x.ai/v1"   # optional; vendor-default if unset
 api_key_env = "XAI_API_KEY"            # process-env-var name (NOT the literal key)
@@ -90,6 +90,19 @@ ai-memory: embedder loaded (<embed-backend description>)
 
 The second line confirms the embedder built against the **independently-resolved** embeddings configuration (#1598: `AI_MEMORY_EMBED_*` env > `[embeddings]` section > legacy flat > compiled default — historically #1143 disambiguated the embed-client wire shape by always building a dedicated localhost-Ollama embed client beside a non-Ollama chat client; #1598 superseded that boot site, and the embedder now speaks to any #1067 alias / `openai-compatible` endpoint of its own). If embedder construction fails you instead get a loud `embedder init failed … semantic recall DEGRADED to keyword (#1143, #1593, #1598)` line — the chat LLM client is never silently reused for embeddings. If you see `llm=gemma3:4b` or another local Ollama tag when you intended a cloud backend, the `env:` block didn't land — re-check the path of the MCP config file your AI client actually reads.
 
+## Backend selection — accepted selectors
+
+A backend selector (`AI_MEMORY_LLM_BACKEND`, `AI_MEMORY_EMBED_BACKEND`,
+`[llm].backend`, `[embeddings].backend`, `[llm.auto_tag].backend`, or a
+backend passed on the command line) must be one of: `ollama`,
+`openai-compatible`, `openai`, `xai`, `anthropic`, `gemini`, `mistral`,
+`groq`, `together`, `cerebras`, `openrouter`, `fireworks`, `lmstudio`,
+`vllm`. Any other value, including a retired provider alias, is refused fail
+closed with ``LLM backend `<selector>` is not a recognized backend alias``;
+no fallback provider or default base URL is used. For an endpoint that
+speaks the OpenAI wire format, choose `openai-compatible` with an explicit
+base URL. See the [upgrade note](../MIGRATION_QUICKSTART.html#upgrade-note--retired-provider-aliases).
+
 ## The canonical recipe shape
 
 Every example below is the **`memory` MCP server entry** in your AI client's config file. The file path differs per client (Claude Code: `~/.claude.json`; Claude Desktop: `~/Library/Application Support/Claude/claude_desktop_config.json` on macOS, `%APPDATA%\Claude\claude_desktop_config.json` on Windows; Cursor: `~/.cursor/mcp.json`; Codex: `~/.codex/config.toml`; etc. — see [`platforms.md`](platforms.html) for the full path table). The **server block shape** is identical across clients (Codex uses TOML, every other client uses JSON — Codex shape shown at the end of this page).
@@ -106,8 +119,6 @@ Every example below is the **`memory` MCP server entry** in your AI client's con
 - [OpenAI](#openai)
 - [Anthropic (via OpenAI shim)](#anthropic)
 - [Google Gemini](#google-gemini)
-- [Kimi (Moonshot)](#kimi-moonshot)
-- [Qwen (DashScope)](#qwen-dashscope)
 - [Mistral](#mistral)
 - [Groq](#groq)
 - [Together AI](#together-ai)
@@ -300,46 +311,6 @@ Gemini exposes an OpenAI-compatible endpoint at `https://generativelanguage.goog
 
 Fallback env vars: `GEMINI_API_KEY`, `GOOGLE_API_KEY`. Common tags: `gemini-2.5-pro`, `gemini-2.5-flash`.
 
-## Kimi (Moonshot)
-
-```json
-{
-  "mcpServers": {
-    "memory": {
-      "command": "ai-memory",
-      "args": ["--db", "~/.claude/ai-memory.db", "mcp", "--tier", "autonomous"],
-      "env": {
-        "AI_MEMORY_LLM_BACKEND": "kimi",
-        "AI_MEMORY_LLM_API_KEY": "sk-...",
-        "AI_MEMORY_LLM_MODEL": "moonshot-v1-128k"
-      }
-    }
-  }
-}
-```
-
-The `moonshot` alias is identical to `kimi`. Fallback env vars: `MOONSHOT_API_KEY`, `KIMI_API_KEY`.
-
-## Qwen (DashScope)
-
-```json
-{
-  "mcpServers": {
-    "memory": {
-      "command": "ai-memory",
-      "args": ["--db", "~/.claude/ai-memory.db", "mcp", "--tier", "autonomous"],
-      "env": {
-        "AI_MEMORY_LLM_BACKEND": "qwen",
-        "AI_MEMORY_LLM_API_KEY": "sk-...",
-        "AI_MEMORY_LLM_MODEL": "qwen-max"
-      }
-    }
-  }
-}
-```
-
-The `dashscope` alias is identical to `qwen`. Fallback env vars: `DASHSCOPE_API_KEY`, `QWEN_API_KEY`. Common tags: `qwen-max`, `qwen-plus`, `qwen-turbo`.
-
 ## Mistral
 
 ```json
@@ -512,8 +483,6 @@ For every backend except `ollama` and `lmstudio` (which don't need a key), the A
 | `xai` | `XAI_API_KEY` |
 | `anthropic` | `ANTHROPIC_API_KEY` |
 | `gemini` | `GEMINI_API_KEY`, then `GOOGLE_API_KEY` |
-| `kimi` / `moonshot` | `MOONSHOT_API_KEY`, then `KIMI_API_KEY` |
-| `qwen` / `dashscope` | `DASHSCOPE_API_KEY`, then `QWEN_API_KEY` |
 | `mistral` | `MISTRAL_API_KEY` |
 | `groq` | `GROQ_API_KEY` |
 | `together` | `TOGETHER_API_KEY` |

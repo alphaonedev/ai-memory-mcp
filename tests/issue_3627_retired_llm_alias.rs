@@ -160,7 +160,7 @@ const HISTORICAL_RECORD_CARVE_OUTS: &[(&str, &str)] = &[
     ),
     (
         "docs/reviews/opus5-1x3-baml-paw-20260919-evidence/assessor-B-technical-fit.md",
-        "third-party tool assessment; the token appears inside a list of providers the EXTERNAL tool supports, alongside Gemini/Kimi/Qwen/Mistral/Groq — describing what that tool offers, never what this product offers",
+        "third-party tool assessment; the token appears inside a list of providers the EXTERNAL tool supports, alongside Gemini/Mistral/Groq — describing what that tool offers, never what this product offers",
     ),
 ];
 
@@ -350,10 +350,6 @@ const LLM_ENV_SURFACE: &[&str] = &[
     "ANTHROPIC_API_KEY",
     "GEMINI_API_KEY",
     "GOOGLE_API_KEY",
-    "MOONSHOT_API_KEY",
-    "KIMI_API_KEY",
-    "DASHSCOPE_API_KEY",
-    "QWEN_API_KEY",
     "MISTRAL_API_KEY",
     "GROQ_API_KEY",
     "TOGETHER_API_KEY",

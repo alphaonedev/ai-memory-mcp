@@ -369,9 +369,16 @@ fn h_control_daemon_serves_a_real_corpus_and_counts_it() {
 
 mod common;
 
+/// Hang guard for the boot wait (not a product assertion): the former
+/// one-minute deadline, now named.
+const READY_HANG_GUARD: Duration = Duration::from_mins(1);
+
 struct Daemon {
     child: Child,
     port: u16,
+    /// #4166 — the child's stderr, kept so a boot that exits early fails
+    /// with what the daemon said instead of a bare timeout.
+    stderr_log: std::path::PathBuf,
     dir: Option<tempfile::TempDir>,
 }
 
@@ -394,6 +401,9 @@ impl Daemon {
     fn start_on(db_path: &Path) -> Self {
         let port = free_port();
         let tls = common::tls::shared(&std::env::temp_dir());
+        let stderr_log = db_path.with_extension("serve-stderr.log");
+        let stderr_file = std::fs::File::create(&stderr_log)
+            .unwrap_or_else(|e| panic!("create {}: {e}", stderr_log.display()));
         let child = Command::new(env!("CARGO_BIN_EXE_ai-memory"))
             .args([
                 "serve",
@@ -412,23 +422,33 @@ impl Daemon {
             .env("AI_MEMORY_BOOT_ENABLED", "0")
             .env("RUST_LOG", "error")
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::from(stderr_file))
             .spawn()
             .expect("spawn ai-memory serve");
-        let d = Self {
+        let mut d = Self {
             child,
             port,
+            stderr_log,
             dir: None,
         };
         d.wait_ready();
         d
     }
 
-    fn wait_ready(&self) {
-        let deadline = Instant::now() + Duration::from_mins(1);
+    /// #4166 — ends on health, on the child exiting (failing with its
+    /// stderr) or on the hang guard.
+    fn wait_ready(&mut self) {
+        let deadline = Instant::now() + READY_HANG_GUARD;
         while Instant::now() < deadline {
             if let Some((200, _)) = self.try_get("/api/v1/health") {
                 return;
+            }
+            if let Some(status) = self.child.try_wait().expect("try_wait on serve child") {
+                panic!(
+                    "daemon on port {} exited before it became ready ({status}); stderr:\n{}",
+                    self.port,
+                    String::from_utf8_lossy(&std::fs::read(&self.stderr_log).unwrap_or_default())
+                );
             }
             std::thread::sleep(Duration::from_millis(100));
         }

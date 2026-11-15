@@ -959,21 +959,10 @@ pub mod signed {
             rule_id: rule_id.to_string(),
             payload: enriched,
         };
-        match crate::storage::escalation_deferral::defer_to_open_txn(conn.path(), intent) {
-            Ok(()) => Ok(pending_id),
-            Err(intent) => {
-                crate::storage::escalation_deferral::insert_pending_action_row(
-                    conn,
-                    &pending_id,
-                    action,
-                    namespace,
-                    memory_id,
-                    requested_by,
-                    &intent.payload,
-                )?;
-                Ok(pending_id)
-            }
-        }
+        // #8662 - never into a LEAKED frame: the caller would be handed a
+        // pending id with no row.
+        crate::storage::escalation_deferral::defer_or_queue(conn, intent)?;
+        Ok(pending_id)
     }
 
     /// Emit a signed, chained `approval_quorum_met` event into the audit chain

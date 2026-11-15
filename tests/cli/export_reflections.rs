@@ -157,12 +157,10 @@ fn assert_stored_namespace_refused(namespace: &str, writer: NamespaceExportWrite
             format!("memory {reflection_id:?} namespace {namespace:?}: refusing export path")
         );
     }
-    if out_dir.exists() {
-        assert!(
-            std::fs::read_dir(&out_dir).unwrap().next().is_none(),
-            "refused namespace must not create an export subtree"
-        );
-    }
+    assert!(
+        !root.exists(),
+        "refused namespace must not create the export root or its ancestors"
+    );
 }
 
 #[test]
@@ -370,6 +368,16 @@ fn plain_export_output_8605(
     let out_dir = tmp.path().join("exports");
     let path = out_dir.join(NAMESPACE).join(format!("{id}.md"));
     if matches!(destination, PlainExportDestination::Directory) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&path)
+                .unwrap();
+        }
+        #[cfg(not(unix))]
         std::fs::create_dir_all(&path).unwrap();
     }
     let output = assert_cmd::Command::cargo_bin("ai-memory")

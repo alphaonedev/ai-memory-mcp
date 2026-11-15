@@ -515,6 +515,9 @@ pub const SENDER_POLICY_SEQ: &str = "sender_policy_seq";
 pub const SHAPE: &str = "shape";
 /// `signing_agent` — wire/row field name.
 pub const SIGNING_AGENT: &str = "signing_agent";
+/// `signature_verified` — skill / memory read payload flag (#8834): whether the
+/// stored signature was verified on this read.
+pub const SIGNATURE_VERIFIED: &str = "signature_verified";
 /// `similar_count` — boot / session_start payload annotation (#3352): how
 /// many other near-duplicate rows were collapsed into this representative.
 /// Absent when the cluster is a singleton (no wire noise on the common path).
@@ -597,6 +600,9 @@ pub const TRANSCRIPTS: &str = "transcripts";
 pub const TRANSITIVE_COUNT: &str = "transitive_count";
 /// `transitive_suspects` — MCP/HTTP `memory_dependents_of_invalidated`.
 pub const TRANSITIVE_SUSPECTS: &str = "transitive_suspects";
+/// `truncated` — `memory_skill_list` response flag (#8834): the listing
+/// reached `SKILL_LIST_PAGE_LIMIT` and more rows matched.
+pub const TRUNCATED: &str = "truncated";
 /// `unread_only` — wire/row field name.
 pub const UNREAD_ONLY: &str = "unread_only";
 /// `unretired` — #2024 skill-retire lifecycle response flag (bool; the

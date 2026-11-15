@@ -439,18 +439,21 @@ def deferred_interrupts():
             raise KeyboardInterrupt
 
 
-def wait_for_probe(proc):
-    """communicate() in short slices so a recorded signal is noticed within PROBE_POLL_SECONDS."""
-    deadline = time.monotonic() + PROBE_TIMEOUT_SECONDS
+def wait_for_probe(proc, timeout_seconds=None):
+    """communicate() in short slices so a recorded signal is noticed within PROBE_POLL_SECONDS.
+
+    Returns ``(stdout, stderr)``.  ``timeout_seconds`` defaults to PROBE_TIMEOUT_SECONDS (read at call time).
+    """
+    limit = PROBE_TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds
+    deadline = time.monotonic() + limit
     while True:
         if _interrupt["pending"]:
             raise KeyboardInterrupt
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise subprocess.TimeoutExpired(proc.args, PROBE_TIMEOUT_SECONDS)
+            raise subprocess.TimeoutExpired(proc.args, limit)
         try:
-            stdout, _ = proc.communicate(timeout=min(PROBE_POLL_SECONDS, remaining))
-            return stdout
+            return proc.communicate(timeout=min(PROBE_POLL_SECONDS, remaining))
         except subprocess.TimeoutExpired:
             if proc.poll() is not None:
                 # the supervisor died before psql (e.g. SIGKILL) and psql still holds the output pipes open
@@ -520,11 +523,17 @@ def supervise_main(argv):
     return supervise(fd, seconds, argv[sep + 1:])
 
 
-def probe_lists_age(psql, url):
-    """Return True when the tier lists ``age`` in pg_available_extensions."""
-    target, password, database = probe_target(url)  # #6676: refuses a URL that names no database
-    env = psql_env(password, database)  # #6676: an allowlist; no caller PG* variable reaches psql
-    psql_argv = [psql, target, "-X", "-A", "-t", "-v", "ON_ERROR_STOP=1", "-c", PROBE_SQL]
+def run_supervised(psql_argv, env, timeout_seconds=None, what="age probe"):
+    """Run psql under the supervisor (#6517, #6505, #6337); return ``(returncode, stdout, stderr)``.
+
+    The one spawn-and-wait path for every probe of the tier: psql is the supervisor's child in its own session,
+    a recorded signal or an error stops the whole group before the exception propagates (never a psql left
+    holding PGPASSWORD), and a supervisor death kills the group.  ``returncode`` is the supervisor's: psql's own
+    exit code, ``128+N`` for a psql killed by signal N (#6643), a negative value when the supervisor itself was
+    killed.  Raises ``subprocess.TimeoutExpired`` (psql already stopped), ``KeyboardInterrupt`` (a recorded
+    signal, psql already stopped) or HelperError (``what`` names the caller in the message).
+    """
+    limit = PROBE_TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds
     with deferred_interrupts():
         # The supervisor holds the read end; the helper keeps the write end until psql is reaped.  The helper
         # dying for ANY reason closes it, and the supervisor then kills psql (#6517).
@@ -532,25 +541,25 @@ def probe_lists_age(psql, url):
         try:
             proc = subprocess.Popen(
                 [sys.executable, "-I", os.path.abspath(__file__), SUPERVISE_FLAG, str(read_fd),
-                 str(PROBE_TIMEOUT_SECONDS + SUPERVISOR_GRACE_SECONDS), "--"] + psql_argv,
+                 str(limit + SUPERVISOR_GRACE_SECONDS), "--"] + psql_argv,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace", env=env,
                 pass_fds=(read_fd,), start_new_session=True,
             )
         except ValueError as exc:
             os.close(write_fd)
             # subprocess refuses a NUL in argv or env before spawning anything.
-            raise HelperError(f"age probe refused its psql arguments ({type(exc).__name__})", EXIT_BAD_INPUT)
+            raise HelperError(f"{what} refused its psql arguments ({type(exc).__name__})", EXIT_BAD_INPUT)
         except (OSError, subprocess.SubprocessError) as exc:
             os.close(write_fd)
-            raise HelperError(f"age probe could not run psql ({type(exc).__name__})", EXIT_UNAVAILABLE)
+            raise HelperError(f"{what} could not run psql ({type(exc).__name__})", EXIT_UNAVAILABLE)
         finally:
             os.close(read_fd)
         try:
             try:
-                stdout = wait_for_probe(proc)
+                stdout, stderr = wait_for_probe(proc, limit)
             except subprocess.TimeoutExpired:
                 stop_child(proc)
-                raise HelperError("age probe could not run psql (TimeoutExpired)", EXIT_UNAVAILABLE)
+                raise
             except BaseException:
                 stop_child(proc)  # a recorded signal or error: never leave psql (and its PGPASSWORD) behind
                 raise
@@ -558,13 +567,25 @@ def probe_lists_age(psql, url):
                 kill_group(proc)  # the supervisor itself was killed: psql may still be in its group
         finally:
             os.close(write_fd)
-    if proc.returncode < 0:
+    return proc.returncode, stdout, stderr
+
+
+def probe_lists_age(psql, url):
+    """Return True when the tier lists ``age`` in pg_available_extensions."""
+    target, password, database = probe_target(url)  # #6676: refuses a URL that names no database
+    env = psql_env(password, database)  # #6676: an allowlist; no caller PG* variable reaches psql
+    psql_argv = [psql, target, "-X", "-A", "-t", "-v", "ON_ERROR_STOP=1", "-c", PROBE_SQL]
+    try:
+        returncode, stdout, _stderr = run_supervised(psql_argv, env)
+    except subprocess.TimeoutExpired:
+        raise HelperError("age probe could not run psql (TimeoutExpired)", EXIT_UNAVAILABLE)
+    if returncode < 0:
         # #6728: psql's own signals arrive as 128+N (#6643); a negative code is the supervisor's death.
-        raise HelperError(f"age probe failed: the psql supervisor was killed by signal {-proc.returncode}",
+        raise HelperError(f"age probe failed: the psql supervisor was killed by signal {-returncode}",
                           EXIT_UNAVAILABLE)
-    if proc.returncode != 0:
+    if returncode != 0:
         # psql stderr is deliberately not echoed (it can carry connection detail).
-        raise HelperError(f"age probe failed: psql exited {proc.returncode}", EXIT_UNAVAILABLE)
+        raise HelperError(f"age probe failed: psql exited {returncode}", EXIT_UNAVAILABLE)
     answer = stdout.strip()
     if answer not in ("0", "1"):
         # #6677: only a count is an answer; anything else must not read as "age missing" and trigger a restore

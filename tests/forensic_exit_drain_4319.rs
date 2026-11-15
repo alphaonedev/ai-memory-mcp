@@ -16,7 +16,7 @@
 //! queued" from a race into a certainty. Red on the carrier: with the delay,
 //! every short-lived run loses its row.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -24,6 +24,8 @@ use ai_memory::governance::audit::{
     CHAIN_HEAD_PREV_HASH, ForensicDecision, TEST_FORENSIC_WRITER_DELAY_ENV,
 };
 use serde_json::{Value, json};
+#[path = "common/child_stdin_report.rs"]
+mod child_stdin_report;
 
 /// The namespace every probe purges (the forensic row is written before the
 /// storage call, so an empty archive is fine).
@@ -183,8 +185,13 @@ fn mcp_drains_its_queued_forensic_rows_at_exit_4319() {
     let mut stdin = child.stdin.take().expect("stdin");
     let mut stdout = BufReader::new(child.stdout.take().expect("stdout"));
     let mut request = |req: &Value| -> Value {
-        writeln!(stdin, "{req}").expect("write request");
-        stdin.flush().expect("flush");
+        child_stdin_report::write_line_or_report(
+            &mut stdin,
+            &mut child,
+            None,
+            "request",
+            &req.to_string(),
+        );
         let mut line = String::new();
         stdout.read_line(&mut line).expect("read response");
         serde_json::from_str(&line).expect("json response")

@@ -82,7 +82,8 @@ const RECALL_SATURATION: i64 = 50;
 ///
 /// # Errors
 /// Returns a substrate error string when `skill_id` is missing/invalid,
-/// the skill is not found, or zstd body decompression fails.
+/// the skill is not found (or not visible to `caller`, #8832), its digest
+/// or signature does not verify (#8834), or zstd body decompression fails.
 pub fn handle_skill_compositional_context(
     conn: &Connection,
     params: &Value,
@@ -96,28 +97,15 @@ pub fn handle_skill_compositional_context(
     let budget_tokens = parse_budget_tokens(params);
 
     // -----------------------------------------------------------------------
-    // 1) Load the skill row.
+    // 1) Load the skill through the verified read path (#8832 / #8834):
+    //    the scope binding gates `caller`, and the digest, resource digests
+    //    and any signature are checked before the body is composed. The
+    //    bounded (#1933) body decode happens inside the verified load.
     // -----------------------------------------------------------------------
-    let (body, metadata_json, namespace, name) = match conn.query_row(
-        "SELECT body_blob, metadata, namespace, name FROM skills WHERE id = ?1",
-        [skill_id],
-        |row| {
-            Ok((
-                row.get::<_, Vec<u8>>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-            ))
-        },
-    ) {
-        Ok(t) => t,
-        Err(_) => return Err(crate::errors::msg::skill_not_found(skill_id)),
-    };
-
-    // #1933 — bounded decode (anti-decompression-bomb ceiling).
-    let body_bytes = crate::mcp::skill_zstd::decode_all_bounded(body.as_slice())
-        .map_err(|e| crate::errors::msg::zstd_decompress_body(e))?;
-    let body_str = String::from_utf8_lossy(&body_bytes).into_owned();
+    let skill = super::skill_integrity::load_verified_skill(conn, skill_id, caller)?;
+    let body_str = String::from_utf8_lossy(&skill.body).into_owned();
+    let (namespace, name) = (skill.namespace, skill.name);
+    let metadata_json = skill.metadata.to_string();
 
     // -----------------------------------------------------------------------
     // 2) Read composes_with_reflections from metadata.

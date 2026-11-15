@@ -3,7 +3,7 @@
 --
 -- v0.7.0 QW-2 — Persona-as-artifact substrate primitive (schema v37).
 --
--- Adds the storage for Tencent-pattern L3 personas: a Persona is a
+-- Adds the storage for System Y-pattern L3 personas: a Persona is a
 -- first-class MemoryKind variant minted by the reflection-pass curator
 -- from a cluster of reflections about a single entity. Personas are
 -- stored as memories so they ride the normal recall, signing, and
