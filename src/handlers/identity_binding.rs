@@ -213,6 +213,50 @@ impl EnrolledAgentKeys {
     pub fn generation(&self) -> u64 {
         self.generation.load(std::sync::atomic::Ordering::Acquire)
     }
+
+    /// #4066 RED stub: a ticket that orders nothing (the stale behaviour).
+    #[must_use]
+    pub fn begin_load(&self) -> LoadTicket {
+        LoadTicket { _opaque: () }
+    }
+
+    /// #4066 RED stub: the non-atomic clone → transform → install (stale).
+    pub fn mutate<F>(&self, transform: F) -> bool
+    where
+        F: FnOnce(&mut std::collections::HashMap<String, String>),
+    {
+        let mut map = (*self.snapshot()).clone();
+        transform(&mut map);
+        self.install(map)
+    }
+
+    /// #4066 RED stub: ignores the ticket and always applies (stale).
+    pub fn mutate_if_current<F>(&self, _ticket: LoadTicket, transform: F) -> Option<bool>
+    where
+        F: FnOnce(&mut std::collections::HashMap<String, String>),
+    {
+        Some(self.mutate(transform))
+    }
+}
+
+/// #4066 RED stub: an opaque load ticket.
+#[derive(Debug, Clone, Copy)]
+#[must_use]
+pub struct LoadTicket {
+    _opaque: (),
+}
+
+/// #4066 RED stub: takes a ticket, reads, then installs with no ordering
+/// guard (the stale behaviour the red cells pin).
+pub async fn refresh_agent_keys<E, F, Fut>(registry: &EnrolledAgentKeys, load: F) -> AgentKeyRefresh
+where
+    E: std::fmt::Display,
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<(String, String)>, E>>,
+{
+    let ticket = registry.begin_load();
+    let loaded = load().await;
+    apply_agent_key_refresh(registry, ticket, loaded)
 }
 
 /// Env var resolving how often the daemon re-reads `agent_api_keys`.
@@ -305,6 +349,8 @@ pub enum AgentKeyRefresh {
     /// The read FAILED. The previous snapshot is retained; carries the count
     /// that is still armed.
     KeptLastKnown(usize),
+    /// #4066 RED stub: never produced yet.
+    Superseded(usize),
 }
 
 /// The ONE place a refresh result becomes registry state.
@@ -321,6 +367,7 @@ pub enum AgentKeyRefresh {
 /// corrupt.
 pub fn apply_agent_key_refresh<E: std::fmt::Display>(
     registry: &EnrolledAgentKeys,
+    _ticket: LoadTicket,
     loaded: Result<Vec<(String, String)>, E>,
 ) -> AgentKeyRefresh {
     match loaded {

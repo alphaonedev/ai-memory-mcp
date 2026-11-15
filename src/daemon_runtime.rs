@@ -7520,7 +7520,11 @@ pub async fn bootstrap_serve(
                     let guard = refresh_db.lock().await;
                     crate::db::list_agent_api_keys(&guard.0).map_err(|e| e.to_string())
                 };
-                crate::handlers::identity_binding::apply_agent_key_refresh(&registry, loaded);
+                crate::handlers::identity_binding::apply_agent_key_refresh(
+                    &registry,
+                    registry.begin_load(),
+                    loaded,
+                );
             }
         }));
     }

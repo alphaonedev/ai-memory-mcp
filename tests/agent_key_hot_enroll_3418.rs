@@ -193,6 +193,7 @@ fn a_failed_refresh_keeps_the_last_known_snapshot_3418() {
 
     let outcome = apply_agent_key_refresh(
         &registry,
+        registry.begin_load(),
         Err::<Vec<(String, String)>, _>("store unreachable"),
     );
 
@@ -226,16 +227,24 @@ fn the_refresh_funnel_distinguishes_a_change_from_a_no_op_3418() {
     let rows = vec![(api_key_sha256_hex("alice-token"), "alice".to_string())];
 
     assert_eq!(
-        apply_agent_key_refresh(&registry, Ok::<_, String>(rows.clone())),
+        apply_agent_key_refresh(
+            &registry,
+            registry.begin_load(),
+            Ok::<_, String>(rows.clone())
+        ),
         AgentKeyRefresh::Installed(1)
     );
     assert_eq!(
-        apply_agent_key_refresh(&registry, Ok::<_, String>(rows)),
+        apply_agent_key_refresh(&registry, registry.begin_load(), Ok::<_, String>(rows)),
         AgentKeyRefresh::Unchanged(1),
         "re-reading the same set must NOT be reported as a change"
     );
     assert_eq!(
-        apply_agent_key_refresh(&registry, Ok::<_, String>(Vec::new())),
+        apply_agent_key_refresh(
+            &registry,
+            registry.begin_load(),
+            Ok::<_, String>(Vec::new())
+        ),
         AgentKeyRefresh::Installed(0),
         "a revocation that empties the set is still a change"
     );

@@ -1112,7 +1112,11 @@ async fn refresh_registry(app: &AppState, add: Option<(&str, &str)>, remove_agen
         registry.install(map);
     }
     let loaded = load_enrolled(app).await;
-    let _ = crate::handlers::identity_binding::apply_agent_key_refresh(registry, loaded);
+    let _ = crate::handlers::identity_binding::apply_agent_key_refresh(
+        registry,
+        registry.begin_load(),
+        loaded,
+    );
 }
 
 // ---------------------------------------------------------------------------
