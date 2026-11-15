@@ -61,7 +61,68 @@ const REASON_CLASSES: [&str; 3] = ["non-inference:", "policy-routed:", "tracked 
 /// verdict; its test-only entries (`daemon_runtime.rs` serve test,
 /// `test_support.rs`, `url_display.rs` test) are skipped by the scanner as
 /// `cfg(test)` code, so listing them would be a stale entry.
-const ALLOWLIST: [Allowed; 0] = [];
+const ALLOWLIST: [Allowed; 10] = [
+    Allowed {
+        file: "src/llm/egress_policy.rs",
+        func: "inference_client_builder",
+        count: 1,
+        reason: "policy-routed: the composition point itself; every [llm] OllamaClient constructor and both model pulls build through it",
+    },
+    Allowed {
+        file: "src/subscriptions.rs",
+        func: "prewarm_dispatch_tls",
+        count: 1,
+        reason: "non-inference: webhook TLS warm-up; no_proxy, never carries an inference bearer",
+    },
+    Allowed {
+        file: "src/subscriptions.rs",
+        func: "send",
+        count: 1,
+        reason: "non-inference: webhook dispatch; SSRF address pin, no_proxy and Policy::none (#6053)",
+    },
+    Allowed {
+        file: "src/daemon_runtime.rs",
+        func: "run_sync_daemon_with_shutdown",
+        count: 1,
+        reason: "non-inference: sync daemon peer client (federation sync, not an LLM endpoint)",
+    },
+    Allowed {
+        file: "src/federation/peer.rs",
+        func: "build",
+        count: 1,
+        reason: "non-inference: federation peer client; Policy::none, missing no_proxy tracked #9315",
+    },
+    Allowed {
+        file: "src/mcp/tools/store/transport.rs",
+        func: "forward_to_http",
+        count: 1,
+        reason: "non-inference: remote store transport (memory_store forwarding to a daemon)",
+    },
+    Allowed {
+        file: "src/cli/doctor.rs",
+        func: "section_llm_reachability_from_resolved",
+        count: 1,
+        reason: "tracked #6222 / #8191: doctor LLM reachability probe builds its own client",
+    },
+    Allowed {
+        file: "src/cli/doctor.rs",
+        func: "section_embeddings_reachability_1598",
+        count: 1,
+        reason: "tracked #6222 / #8191: doctor embeddings reachability probe builds its own client",
+    },
+    Allowed {
+        file: "src/cli/doctor.rs",
+        func: "http_get_json",
+        count: 1,
+        reason: "non-inference: doctor fleet JSON fetch (no inference bearer, no memory content)",
+    },
+    Allowed {
+        file: "src/cli/sync.rs",
+        func: "build_sync_client",
+        count: 1,
+        reason: "non-inference: sync CLI peer client",
+    },
+];
 
 /// Floor on the number of `.rs` files the walk must see.
 const MIN_SRC_FILES: usize = 200;
