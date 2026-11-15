@@ -594,3 +594,24 @@ fn stripe_live_key_spans(content: &str) -> Vec<(usize, usize)> {
     }
     merged
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{ENV_LOOKUP_PREFIXES, is_ident_byte};
+
+    /// #8855 class invariant: an env-lookup prefix is matched with
+    /// `starts_with`, so an entry ending in an identifier byte would accept
+    /// any value that merely extends it (`os.environ_<secret>`). Every entry
+    /// must end in the delimiter its lookup grammar requires, so a future
+    /// bare entry is red here by construction.
+    #[test]
+    fn no_env_lookup_prefix_ends_in_an_identifier_character_8855() {
+        for prefix in ENV_LOOKUP_PREFIXES {
+            let last = prefix.as_bytes().last().copied();
+            assert!(
+                last.is_some_and(|c| !is_ident_byte(c)),
+                "8855: env-lookup prefix {prefix:?} ends in an identifier character"
+            );
+        }
+    }
+}

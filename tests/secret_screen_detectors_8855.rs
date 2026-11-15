@@ -1111,3 +1111,169 @@ fn bound_100k_nested_assignment_chain_8855() {
         format!("password={REDACTION_PLACEHOLDER}")
     );
 }
+
+// ── r4c: every env-lookup prefix ends in its delimiter (ruling e50aed97) ──
+//
+// An env-lookup prefix is matched with `starts_with`. An entry that ends in
+// an identifier byte accepts any unquoted value that merely extends it
+// (`os.environ_<secret>`), so each entry must end in the delimiter its lookup
+// grammar requires. The table invariant itself is the lib cell
+// `no_env_lookup_prefix_ends_in_an_identifier_character_8855`.
+
+/// The identifier byte that extends a bare env-lookup head.
+const IDENT_EXTENSION: &str = "_";
+/// The two assignment forms each env-lookup cell runs.
+const ENV_CELL_OPERATORS: [&str; 2] = ["=", ": "];
+
+/// One `ENV_LOOKUP_PREFIXES` entry: its head without the delimiter, and the
+/// delimited lookups that must stay accepted.
+struct EnvLookupEntry {
+    head: &'static str,
+    delimited: &'static [&'static str],
+}
+
+const ENV_OS_ENVIRON: EnvLookupEntry = EnvLookupEntry {
+    head: "os.environ",
+    delimited: &["os.environ[\"X\"]", "os.environ.get(\"X\")"],
+};
+const ENV_OS_GETENV: EnvLookupEntry = EnvLookupEntry {
+    head: "os.getenv",
+    delimited: &["os.getenv(\"X\")"],
+};
+const ENV_GETENV: EnvLookupEntry = EnvLookupEntry {
+    head: "getenv",
+    delimited: &["getenv(\"X\")"],
+};
+const ENV_RUST_VAR: EnvLookupEntry = EnvLookupEntry {
+    head: "env::var",
+    delimited: &["env::var(\"X\")"],
+};
+const ENV_RUST_STD_VAR: EnvLookupEntry = EnvLookupEntry {
+    head: "std::env::var",
+    delimited: &["std::env::var(\"X\")"],
+};
+const ENV_NODE_PROCESS: EnvLookupEntry = EnvLookupEntry {
+    head: "process.env",
+    delimited: &["process.env.X"],
+};
+const ENV_RUBY_INDEX: EnvLookupEntry = EnvLookupEntry {
+    head: "ENV",
+    delimited: &["ENV[\"X\"]"],
+};
+const ENV_RUBY_FETCH: EnvLookupEntry = EnvLookupEntry {
+    head: "ENV.fetch",
+    delimited: &["ENV.fetch(\"X\")"],
+};
+const ENV_JAVA_GETENV: EnvLookupEntry = EnvLookupEntry {
+    head: "System.getenv",
+    delimited: &["System.getenv(\"X\")"],
+};
+const ENV_DOTNET_GET: EnvLookupEntry = EnvLookupEntry {
+    head: "Environment.GetEnvironmentVariable",
+    delimited: &["Environment.GetEnvironmentVariable(\"X\")"],
+};
+/// The Perl `%ENV` hash. Its bare head extended with identifier bytes
+/// (`$ENV_<x>`) is the `$IDENT` shell-reference placeholder, a separate named
+/// shape, so this entry gets a pin cell only.
+const ENV_PERL_HASH: EnvLookupEntry = EnvLookupEntry {
+    head: "$ENV",
+    delimited: &["$ENV{X}"],
+};
+
+/// The head extended with identifier bytes is masked whole and refused with
+/// the exact reason; every delimited lookup of the entry stays accepted.
+fn assert_env_lookup_cell(entry: &EnvLookupEntry) {
+    set_screen_mode(SecretScreenMode::Refuse);
+    let ph = REDACTION_PLACEHOLDER;
+    let s = ASSIGN_PW;
+    let head = entry.head;
+    for op in ENV_CELL_OPERATORS {
+        let input = format!("password{op}{head}{IDENT_EXTENSION}{s} tail");
+        assert_eq!(
+            kinds_of(&input),
+            vec![KIND_PASSWORD],
+            "8855 r4c: {input:?} must trip {KIND_PASSWORD}"
+        );
+        assert_eq!(
+            redacted_of(&input),
+            format!("password{op}{ph} tail"),
+            "8855 r4c: redaction of {input:?}"
+        );
+        let err = validate::validate_content(&input)
+            .map_err(|e| e.to_string())
+            .expect_err("8855 r4c: caller funnel must refuse");
+        assert!(
+            err.contains(&expected_reason(KIND_PASSWORD)),
+            "8855 r4c: want {KIND_PASSWORD} refusal for {input:?}, got {err:?}"
+        );
+        assert!(!err.contains(s), "8855 r4c: refusal echoed the value");
+        assert_delimited_lookups_accepted(entry, op);
+    }
+}
+
+fn assert_delimited_lookups_accepted(entry: &EnvLookupEntry, op: &str) {
+    for lookup in entry.delimited {
+        let ok = format!("password{op}{lookup} tail");
+        assert_eq!(
+            kinds_of(&ok),
+            Vec::<&str>::new(),
+            "8855 r4c: delimited lookup {ok:?} stays accepted"
+        );
+    }
+}
+
+macro_rules! env_lookup_cell {
+    ($name:ident, $entry:expr) => {
+        #[test]
+        fn $name() {
+            assert_env_lookup_cell(&$entry);
+        }
+    };
+}
+
+env_lookup_cell!(
+    env_lookup_os_environ_needs_its_delimiter_8855,
+    ENV_OS_ENVIRON
+);
+env_lookup_cell!(env_lookup_os_getenv_needs_its_delimiter_8855, ENV_OS_GETENV);
+env_lookup_cell!(env_lookup_getenv_needs_its_delimiter_8855, ENV_GETENV);
+env_lookup_cell!(env_lookup_env_var_needs_its_delimiter_8855, ENV_RUST_VAR);
+env_lookup_cell!(
+    env_lookup_std_env_var_needs_its_delimiter_8855,
+    ENV_RUST_STD_VAR
+);
+env_lookup_cell!(
+    env_lookup_process_env_needs_its_delimiter_8855,
+    ENV_NODE_PROCESS
+);
+env_lookup_cell!(
+    env_lookup_ruby_env_index_needs_its_delimiter_8855,
+    ENV_RUBY_INDEX
+);
+env_lookup_cell!(
+    env_lookup_ruby_env_fetch_needs_its_delimiter_8855,
+    ENV_RUBY_FETCH
+);
+env_lookup_cell!(
+    env_lookup_java_getenv_needs_its_delimiter_8855,
+    ENV_JAVA_GETENV
+);
+env_lookup_cell!(
+    env_lookup_dotnet_getenv_needs_its_delimiter_8855,
+    ENV_DOTNET_GET
+);
+
+/// Pin: the Perl hash lookup stays accepted; `$ENV_<x>` is the `$IDENT`
+/// placeholder shape, not this entry, and stays accepted as that shape.
+#[test]
+fn env_lookup_perl_env_hash_delimited_form_pinned_8855() {
+    for op in ENV_CELL_OPERATORS {
+        assert_delimited_lookups_accepted(&ENV_PERL_HASH, op);
+        let shell_ref = format!("password{op}{}{IDENT_EXTENSION}X tail", ENV_PERL_HASH.head);
+        assert_eq!(
+            kinds_of(&shell_ref),
+            Vec::<&str>::new(),
+            "8855 r4c: {shell_ref:?} is the $IDENT shape"
+        );
+    }
+}
