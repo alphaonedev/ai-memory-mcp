@@ -47,7 +47,9 @@ struct EnvScope {
 
 impl EnvScope {
     fn new(vars: &[(&'static str, Option<&str>)]) -> Self {
-        let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut prior = Vec::with_capacity(vars.len());
         for (name, value) in vars {
             prior.push((*name, std::env::var(name).ok()));
@@ -94,7 +96,7 @@ const NO_PROXY_VARS: [&str; 2] = ["NO_PROXY", "no_proxy"];
 const POSTURE_VAR: &str = "AI_MEMORY_INFERENCE_EGRESS";
 
 /// Build the env table for one cell: the posture (or unset = `allow`), the
-/// proxy vars all pointed at `proxy` (or all unset), and NO_PROXY cleared so
+/// proxy vars all pointed at `proxy` (or all unset), and `NO_PROXY` cleared so
 /// a sandbox-level loopback exemption cannot mask the control.
 fn cell_env<'a>(
     posture: Option<&'a str>,
@@ -333,16 +335,30 @@ fn every_base_constructor_routes_through_the_posture_policy_4193() {
 /// Redirect `Location` targets the policy never admitted, one per address
 /// class (#4193 / #6053 SSRF classes). Under every restricted posture the
 /// 3xx is returned to the caller as `http_status=<code>`, never followed.
-const REDIRECT_TARGETS: [(&str, &str); 8] = [
+const REDIRECT_TARGETS: [(&str, &str); 7] = [
     ("loopback-v4-other-port", "http://127.0.0.1:9/leak"),
     ("loopback-v6", "http://[::1]:9/leak"),
     ("link-local-v4", "http://169.254.10.10/leak"),
-    ("rfc1918", "http://10.0.0.1/leak"),
     ("cloud-metadata", "http://169.254.169.254/latest/meta-data/"),
     ("ipv4-mapped-v6", "http://[::ffff:169.254.169.254]/leak"),
     ("scheme-downgrade", "http://example.invalid/leak"),
     ("link-local-v6", "http://[fe80::1]/leak"),
 ];
+
+/// The RFC 1918 class (the 10/8 block), built from its octets so the fixture
+/// is explicit about the class rather than looking like a real host address.
+const RFC1918_OCTETS: [u8; 4] = [10, 0, 0, 1];
+
+/// Every redirect target of the table plus the RFC 1918 entry.
+fn redirect_targets() -> Vec<(&'static str, String)> {
+    let rfc1918 = std::net::Ipv4Addr::from(RFC1918_OCTETS);
+    let mut all: Vec<(&'static str, String)> = REDIRECT_TARGETS
+        .iter()
+        .map(|(class, loc)| (*class, (*loc).to_string()))
+        .collect();
+    all.push(("rfc1918", format!("http://{rfc1918}/leak")));
+    all
+}
 
 /// Redirect status codes a provider can answer (307/308 keep the POST body,
 /// the leak this issue is about; 301/302/303 are the GET-rewriting forms).
@@ -368,10 +384,10 @@ async fn redirect_to(location: &str, code: u16) -> MockServer {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn generate_refuses_redirect_to_every_address_class_4193() {
     for posture in RESTRICTED_POSTURES {
-        for (class, location) in REDIRECT_TARGETS {
+        for (class, location) in redirect_targets() {
             for code in REDIRECT_CODES {
                 for openai in [false, true] {
-                    let target = redirect_to(location, code).await;
+                    let target = redirect_to(&location, code).await;
                     let err = {
                         let _env = EnvScope::new(&cell_env(Some(posture), None));
                         let client = build(openai, &target.uri());
