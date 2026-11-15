@@ -22,7 +22,7 @@
 //!
 //! Forms this guard does NOT recognise (latent: no such site exists in
 //! `src/` today; tracked: #9314, the egress lane owes one red-first probe row
-//! each, https://github.com/alphaonedev/ai-memory-mcp/issues/9314#issuecomment-6892371185):
+//! each, <https://github.com/alphaonedev/ai-memory-mcp/issues/9314#issuecomment-6892371185>):
 //! * a typed `Default::default()` that returns a client;
 //! * a crate alias `use reqwest as X;` followed by `X::get(..)`;
 //! * UFCS `<reqwest::Client as Default>::default()`.
