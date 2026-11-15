@@ -13602,13 +13602,34 @@ impl PostgresStore {
             .begin()
             .await
             .map_err(|e| to_store_err("begin link tx", e))?;
+        let attest_level = self
+            .link_internal_in_tx(&mut tx, ctx, link, keypair)
+            .await?;
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit link tx", e))?;
+
+        Ok(attest_level)
+    }
+
+    /// #8890 — `link_internal`'s body on a caller-owned transaction: endpoint
+    /// locks, pre-create gates, FK pre-flight, insert and AGE projection, in
+    /// that order. The caller begins and commits `tx`.
+    #[allow(clippy::too_many_lines)]
+    async fn link_internal_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        ctx: &CallerContext,
+        link: &MemoryLink,
+        keypair: Option<&crate::identity::keypair::AgentKeypair>,
+    ) -> StoreResult<&'static str> {
         // #4210 — both endpoints in ascending id order BEFORE the gate's source
         // `FOR UPDATE` and the INSERT's FK key-share on the target.
         let ends = lock_order_4209::link_endpoint_locks(&link.source_id, &link.target_id);
-        lock_order_4209::lock_memories_in_id_order(&mut tx, &ends)
+        lock_order_4209::lock_memories_in_id_order(tx, &ends)
             .await
             .map_err(|e| to_store_err("lock link endpoints", e))?;
-        self.validate_link_pre_create_pg(&mut *tx, ctx, link, keypair)
+        self.validate_link_pre_create_pg(&mut **tx, ctx, link, keypair)
             .await?;
 
         // FK pre-flight — mirror SQLite's explicit existence check so
@@ -13781,7 +13802,7 @@ impl PostgresStore {
         .bind(observed_by_col)
         .bind(source_cid)
         .bind(target_cid)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await
         .map_err(|e| to_store_err("insert memory_link", e))?;
         // #3051 / Fable #3237 item 2 — ON CONFLICT DO NOTHING preserves the
@@ -13798,7 +13819,7 @@ impl PostgresStore {
             .bind(&link.source_id)
             .bind(&link.target_id)
             .bind(link.relation.as_str())
-            .fetch_optional(&mut *tx)
+            .fetch_optional(&mut **tx)
             .await
             .map_err(|e| to_store_err("read stored attest_level on link replay", e))?;
             stored
@@ -13830,7 +13851,7 @@ impl PostgresStore {
                     .bind(&link.source_id)
                     .bind(&link.target_id)
                     .bind(link.relation.as_str())
-                    .execute(&mut *tx)
+                    .execute(&mut **tx)
                     .await
                     .map_err(|e| to_store_err("enqueue kg_projection_outbox", e))?;
             } else {
@@ -13872,11 +13893,11 @@ impl PostgresStore {
                 // outer tx healthy so the relational row truly commits —
                 // making the warning below honest.
                 sqlx::query("SAVEPOINT age_link_projection")
-                    .execute(&mut *tx)
+                    .execute(&mut **tx)
                     .await
                     .map_err(|e| to_store_err("savepoint age_link_projection", e))?;
                 match project_link_into_age(
-                    &mut tx,
+                    tx,
                     &link.source_id,
                     &link.target_id,
                     link.relation.as_str(),
@@ -13888,7 +13909,7 @@ impl PostgresStore {
                 {
                     Ok(()) => {
                         sqlx::query("RELEASE SAVEPOINT age_link_projection")
-                            .execute(&mut *tx)
+                            .execute(&mut **tx)
                             .await
                             .map_err(|e| {
                                 to_store_err("release savepoint age_link_projection", e)
@@ -13896,7 +13917,7 @@ impl PostgresStore {
                     }
                     Err(e) if is_age_runtime_failure(&e) => {
                         sqlx::query("ROLLBACK TO SAVEPOINT age_link_projection")
-                            .execute(&mut *tx)
+                            .execute(&mut **tx)
                             .await
                             .map_err(|e2| {
                                 to_store_err("rollback savepoint age_link_projection", e2)
@@ -13929,7 +13950,7 @@ impl PostgresStore {
                         // and carry the `reason` field. ERRORS-19: a failure to
                         // RECORD propagates rather than committing silent drift.
                         record_failed_age_projection(
-                            &mut tx,
+                            tx,
                             "link_insert",
                             &link.source_id,
                             &link.target_id,
@@ -13942,10 +13963,6 @@ impl PostgresStore {
                 }
             }
         }
-
-        tx.commit()
-            .await
-            .map_err(|e| to_store_err("commit link tx", e))?;
 
         Ok(attest_level)
     }
@@ -21454,6 +21471,476 @@ impl PostgresStore {
     }
 }
 
+/// #8890 — the bound values the store funnel computes before its
+/// transaction opens (see [`pg_store_prepare`]).
+struct PgStoreBinds {
+    created_at: chrono::DateTime<Utc>,
+    updated_at: chrono::DateTime<Utc>,
+    last_accessed_at: Option<chrono::DateTime<Utc>>,
+    expires_at: Option<chrono::DateTime<Utc>>,
+    tags_json: serde_json::Value,
+    store_stamped_metadata: serde_json::Value,
+}
+
+/// #8890 — the store funnel's pre-transaction preamble (credential screen,
+/// governance pre-write, why_trace stamp and gate, bound values). Returns the
+/// effective memory (screened / stamped) the write and its metering use.
+fn pg_store_prepare<'m>(
+    ctx: &CallerContext,
+    memory: &'m Memory,
+) -> StoreResult<(std::borrow::Cow<'m, Memory>, PgStoreBinds)> {
+    // v0.8.1 W1 (#1821 / gap G29) — credential REDACT backstop (postgres
+    // parity with the sqlite db::insert funnel). No-op unless screening
+    // was seeded non-`off` and content carries credential material.
+    let screened = screen_storage_memory(memory);
+    let mut memory = screened.map_or(std::borrow::Cow::Borrowed(memory), std::borrow::Cow::Owned);
+    // ARCH-1 (CRITICAL) — substrate governance pre-write parity with
+    // the SQLite path. The `GOVERNANCE_PRE_WRITE` hook is consulted
+    // on EVERY substrate write path on EVERY backend; multi-tenant
+    // postgres-backed deployments would otherwise silently bypass
+    // operator-signed governance. See module-level comment in
+    // `src/storage/mod.rs` for the full layering rationale.
+    consult_governance_pre_write_pg(&memory)?;
+    // #2059/#2110 — TRACT covenant clause 1 why_trace write-gate. Keyed on
+    // the write's AUTHENTICATED ORIGIN, never the caller-controlled
+    // `memory_kind`: an authenticated SYSTEM principal
+    // (`CallerContext::bypass_visibility` — curator/autonomy self-writes,
+    // per env #48; external HTTP/MCP tenant callers can NEVER set it)
+    // records the substrate rationale so its write satisfies
+    // `AI_MEMORY_REQUIRE_WHY_TRACE` without a bypass; every tenant write is
+    // gated on PRESENCE.
+    //
+    // #2124 — stamp the SAME substrate why_trace the sqlite
+    // `SqliteStore::store` funnel stamps (src/store/sqlite.rs) BEFORE the
+    // gate, then consult the gate UNCONDITIONALLY as defense-in-depth (the
+    // substrate-origin row was stamped above so it passes trivially). Pre
+    // #2124 the pg store-family SKIPPED the gate under `bypass_visibility`
+    // WITHOUT stamping, so an internally-authored row landed with NO
+    // clause-1 rationale on postgres while sqlite recorded the substrate
+    // marker — cross-backend provenance drift. Mirrors the pg
+    // reflect/capture_turn/consolidate funnels exactly.
+    if ctx.bypass_visibility {
+        crate::storage::stamp_substrate_why_trace(&mut memory.to_mut().metadata);
+    }
+    consult_why_trace_gate_pg(&memory)?;
+
+    let created_at = parse_rfc3339_required(&memory.created_at)?;
+    let updated_at = parse_rfc3339_required(&memory.updated_at)?;
+    let last_accessed_at = parse_rfc3339_opt(memory.last_accessed_at.as_deref());
+    // v0.7.0 #1466 — backfill the tier-default expiry so a hand-built
+    // mid/short Memory with `expires_at: None` is reapable, matching the
+    // SQLite `storage::insert` chokepoint. Shared SSOT on `Memory`.
+    let expires_at = parse_rfc3339_opt(memory.effective_expires_at().as_deref());
+    let tags_json =
+        serde_json::to_value(&memory.tags).map_err(|e| StoreError::IntegrityFailed {
+            detail: serialize_err("tags", e),
+        })?;
+
+    // #1757 / #1719 item 2b — populate-on-write: advance THIS node's
+    // own component of the per-memory vector clock on the LOCAL store
+    // path (postgres twin of the sqlite `db::insert` stamp). The
+    // federation RECEIVE writes are the separate `apply_remote_memory`
+    // / `merge_inbound`, so a remote-applied row never bumps this node.
+    // ON CONFLICT updates `metadata = EXCLUDED.metadata` (agent_id
+    // preserved), so a re-store persists the advanced clock too.
+    let store_stamped_metadata = {
+        let mut m = memory.metadata.clone();
+        crate::models::stamp_version_vector(
+            &mut m,
+            crate::federation::identity::resolver::local_node_identity(),
+            &memory.updated_at,
+        );
+        m
+    };
+    Ok((
+        memory,
+        PgStoreBinds {
+            created_at,
+            updated_at,
+            last_accessed_at,
+            expires_at,
+            tags_json,
+            store_stamped_metadata,
+        },
+    ))
+}
+
+/// #8890 — the store funnel's body on a caller-owned transaction: title-slot
+/// admission, seal, upsert, envelope reconcile, revision leaf and quota, in
+/// that order. The caller begins and commits `tx`.
+#[allow(clippy::too_many_lines)]
+async fn pg_store_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    ctx: &CallerContext,
+    memory: &Memory,
+    binds: PgStoreBinds,
+) -> StoreResult<String> {
+    let PgStoreBinds {
+        created_at,
+        updated_at,
+        last_accessed_at,
+        expires_at,
+        tags_json,
+        store_stamped_metadata,
+    } = binds;
+
+    // APPEND-ONLY-SANCTIONED (#1823 G6 / #2948) — COW SUPERSEDE: probe the
+    // existing (title, namespace) row's version BEFORE the upsert so a
+    // conflict-merge that overwrites durable content in place (`content =
+    // EXCLUDED.content` below) appends ONE identity-only SUPERSEDE leaf. `None`
+    // when the spine is OFF or on a fresh INSERT (no prior row). Same tx.
+    // #3690 / #3695 — TITLE-SLOT ADMISSION (typed, unnamed refusal of a
+    // hidden holder; the LIVE holder's version as the SUPERSEDE pre-image).
+    let store_verdict = pg_title_slot_admission(
+        tx,
+        memory,
+        crate::storage::InsertConflictArm::Merge,
+        pg_admission_viewer(ctx),
+    )
+    .await?;
+    let prior_version = store_verdict.prior_version;
+
+    // Upsert contract matches SQLite: `ON CONFLICT (title, namespace)`.
+    // Backed by the UNIQUE INDEX `memories_title_ns_uidx` in
+    // postgres_schema.sql. Fix for blocker #294.
+    //
+    // Agent-id immutability (blocker #295): on conflict we preserve
+    // the ORIGINAL `metadata.agent_id` via `jsonb_set`, mirroring the
+    // SQLite `json_set` CASE clause in `crate::storage::insert`. The
+    // caller-supplied metadata otherwise wins.
+    //
+    // Tier never downgrades (blocker #296 / SQLite parity): on
+    // conflict tier takes max of existing vs new via rank mapping.
+    // v0.7.0 #900 — Form-4 fact-provenance + Form-5 confidence
+    // provenance columns ride the same INSERT so the PG store
+    // round-trips `Memory::source_uri`, `citations`, `source_span`,
+    // and the three confidence columns. Pre-#900 the INSERT only
+    // wrote 17 columns and `list_by_source_uri` / `search_with_
+    // source_uri` returned empty against PG. Pinned by
+    // `tests/store_parity_gaps.rs::pg_parity_gap_2_source_uri_column`.
+    let citations_json =
+        serde_json::to_string(&memory.citations).map_err(|e| StoreError::IntegrityFailed {
+            detail: serialize_err("citations", e),
+        })?;
+    let source_span_json = match memory.source_span {
+        Some(span) => {
+            Some(
+                serde_json::to_string(&span).map_err(|e| StoreError::IntegrityFailed {
+                    detail: serialize_err(COL_SOURCE_SPAN, e),
+                })?,
+            )
+        }
+        None => None,
+    };
+    let confidence_signals_json = match &memory.confidence_signals {
+        Some(s) => Some(
+            serde_json::to_string(s).map_err(|e| StoreError::IntegrityFailed {
+                detail: serialize_err(COL_CONFIDENCE_SIGNALS, e),
+            })?,
+        ),
+        None => None,
+    };
+    // #1383 — denormalise `mentioned_entity_id` from the row's
+    // `metadata.entity_id` / `[entity:X]` title marker so that
+    // postgres-backed reflection rows are reachable via the
+    // `memory_persona_generate` matcher (which queries
+    // `WHERE mentioned_entity_id = ?` on the partial index from
+    // schema v32). Pre-#1383 the postgres `store()` path dropped
+    // this column entirely so every postgres reflection was
+    // invisible to persona generation despite the caller passing
+    // the entity attribution correctly. Mirrors sqlite at
+    // `src/storage/mod.rs:616`. Non-reflection rows return None
+    // here, matching the sqlite behaviour.
+    let mentioned_entity_id = crate::storage::extract_mentioned_entity_id(memory);
+
+    // #228 Commit B — at-rest content encryption (postgres parity).
+    // Seal the plaintext content to the per-agent X25519 key when
+    // enabled; the `content` column then carries the empty placeholder
+    // and the ciphertext envelope lands in the `encrypted_envelope`
+    // BYTEA column (schema v68). When disabled (default) `sealed` is
+    // None: content is stored verbatim and the envelope binds NULL —
+    // byte-identical to the pre-wiring path. agent_id is the NHI
+    // provenance marker from metadata (fail-closed under an enabled
+    // gate when absent). Content-only: title/tags/metadata stay plain.
+    //
+    // v1.0.0 #2383 (N1) — sealed to the identity the SURVIVING row
+    // RETAINS, not to the incoming writer: the `ON CONFLICT` arm below
+    // keeps the existing row's `agent_id` (#1784) while taking the
+    // incoming envelope, so an incoming-keyed seal left the durable row
+    // unreadable. See `seal_content_for_upsert`. Runs on the same tx as
+    // the upsert so the pre-read and the write are one atomic unit.
+    let store_seal = seal_content_for_upsert(&mut **tx, memory).await?;
+    let store_content_to_store = store_seal.content();
+    let store_encrypted_envelope: Option<&Vec<u8>> = store_seal.envelope();
+    // v0.9.0 G8 (#1825) — stamp the content-id from the PLAINTEXT
+    // genesis identity (never the ciphertext placeholder). OMITTED from
+    // the DO UPDATE SET below so a surviving upsert-merge row keeps its
+    // own genesis cid.
+    let store_cid = crate::identity::cid::stamp_memory_cid(memory);
+
+    let id: String = sqlx::query(
+        &format!(
+        "INSERT INTO memories (
+            id, tier, namespace, title, content, tags, priority, confidence,
+            source, access_count, created_at, updated_at, last_accessed_at,
+            expires_at, metadata, reflection_depth, memory_kind,
+            citations, source_uri, source_span,
+            confidence_source, confidence_signals, confidence_decayed_at,
+            entity_id, persona_version,
+            mentioned_entity_id, lifecycle_state, encrypted_envelope,
+            cid, cid_genesis, kind_provenance,
+            valid_from, valid_until
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
+                  $18, $19, $20,
+                  $21, $22, $23,
+                  $24, $25,
+                  $26, $27, $28, $29, $30, $31, $32, $33)
+        {conflict_target} DO UPDATE SET
+            content = EXCLUDED.content,
+            -- #228 Commit B — content + envelope move together on upsert
+            -- so a re-store replaces both the placeholder and ciphertext
+            -- (encryption-off writes plaintext + NULL, clearing stale
+            -- ciphertext). Mirrors the sqlite `insert` ON CONFLICT.
+            encrypted_envelope = EXCLUDED.encrypted_envelope,
+            tier = CASE
+                WHEN tier_rank(EXCLUDED.tier) >= tier_rank(memories.tier)
+                    THEN EXCLUDED.tier
+                ELSE memories.tier
+            END,
+            tags = EXCLUDED.tags,
+            -- #1629 — sqlite `storage::insert` parity: priority +
+            -- confidence take the MAX across upsert so a re-store can
+            -- never downgrade either signal.
+            priority = GREATEST(memories.priority, EXCLUDED.priority),
+            confidence = GREATEST(memories.confidence, EXCLUDED.confidence),
+            -- #1629 — sqlite parity: source follows the incoming row.
+            source = EXCLUDED.source,
+            updated_at = EXCLUDED.updated_at,
+            -- #1629 — sqlite parity: long-tier rows pin expiry to NULL;
+            -- otherwise an incoming row that omits expiry keeps the
+            -- stored one rather than blanking it out.
+            -- v1.0.0 #2515 (GA Wave-1 data-integrity blocker) — a re-store /
+            -- upsert must FLOOR the TTL, never SHORTEN it. The bare
+            -- COALESCE(EXCLUDED.expires_at, memories.expires_at) adopted the
+            -- incoming row's expiry verbatim, so re-storing the same
+            -- (title, namespace) with an EARLIER expiry silently rolled a
+            -- live row's TTL backwards — a #1596 never-move-expiry-earlier
+            -- violation (premature GC reap / permanent link-edge loss). This
+            -- mirrors EXACTLY the shipped #2335 federation extension-FLOOR
+            -- lattice join (GREATEST over the COALESCE'd pair, both operands
+            -- funnel-canonical per #2332): the merge converges on the LATER
+            -- expiry regardless of store order. Long⇒NULL keeps the #1626
+            -- coupling. EXPLICIT shortening stays ONLY on the memory_update /
+            -- db::update path, never on this re-store funnel.
+            expires_at = CASE
+                WHEN EXCLUDED.tier = 'long' OR memories.tier = 'long' THEN NULL
+                ELSE GREATEST(COALESCE(EXCLUDED.expires_at, memories.expires_at),
+                              COALESCE(memories.expires_at, EXCLUDED.expires_at))
+            END,
+            metadata = (EXCLUDED.metadata || (
+                -- #1784 — preserve immutable provenance keys (agent_id +
+                -- consolidation derived_from / consolidated_from_agents)
+                -- from the existing row through the metadata overwrite.
+                -- `||` overlays them on top of EXCLUDED so existing wins
+                -- (the superset of the pre-#1784 agent_id-only CASE).
+                SELECT COALESCE(jsonb_object_agg(prov.k, prov.v), '{{}}'::jsonb)
+                FROM jsonb_each(memories.metadata) AS prov(k, v)
+                -- #2941 — reserved set, lockstep-gated on crate::RESERVED_UPSERT_METADATA_KEYS.
+                WHERE prov.k IN ('agent_id', 'derived_from', 'consolidated_from_agents', 'agent_pubkey', 'pubkey_bound_at')
+            )) {unstamped_owner_drop},
+            -- v0.7.0 Task 1/8 — recursion depth takes max on upsert so a
+            -- newer reflection at higher depth doesn't lose its provenance
+            -- signal when re-stored at the same (title, namespace).
+            reflection_depth = GREATEST(memories.reflection_depth, EXCLUDED.reflection_depth),
+            -- L1-1 — kind is sticky: once Reflection, always Reflection.
+            -- #1629 / QW-2 — Persona is also sticky (sqlite parity).
+            memory_kind = CASE WHEN memories.memory_kind = 'reflection' THEN 'reflection'
+                               WHEN memories.memory_kind = 'persona' THEN 'persona'
+                               ELSE EXCLUDED.memory_kind END,
+            -- v0.7.0 #900 / #1629 — Form-4 fact-provenance follows the
+            -- sqlite CASE: a non-empty incoming citations array replaces
+            -- (caller re-asserted provenance); an empty one preserves the
+            -- stored evidence instead of silently wiping it.
+            citations = CASE WHEN EXCLUDED.citations = '[]'
+                             THEN memories.citations
+                             ELSE EXCLUDED.citations END,
+            source_uri = COALESCE(EXCLUDED.source_uri, memories.source_uri),
+            source_span = COALESCE(EXCLUDED.source_span, memories.source_span),
+            -- #1629 — Form-5 sqlite parity: an explicit non-default
+            -- provenance replaces; the caller_provided default keeps the
+            -- stored (auto-derived / calibrated) signal.
+            -- v1.0.0 #2395 — the confidence field-set is ATOMIC (sqlite
+            -- twin in `storage::insert_inner`'s `upsert_sql`). `confidence`
+            -- merges by GREATEST above, so the calibration record that
+            -- DESCRIBES that number must come from the SAME operand that
+            -- won. Pre-#2395 these three used a DIFFERENT selector, so a
+            -- re-store with a LOWER confidence but a non-default source
+            -- kept the stored 0.9 and stamped the incoming label + signals
+            -- over it — durable Form-5 corruption, silent to every reader.
+            -- Selector = the GREATEST winner: > takes the incoming tuple,
+            -- < keeps the stored tuple, and an exact tie keeps the #1629
+            -- rule verbatim (explicit non-`caller_provided` replaces) but
+            -- now carries the WHOLE tuple. `=` is only the tie BRANCH of a
+            -- total order, never a logical float-equality test.
+            confidence_source = CASE WHEN EXCLUDED.confidence > memories.confidence THEN EXCLUDED.confidence_source
+                                     WHEN EXCLUDED.confidence < memories.confidence THEN memories.confidence_source
+                                     WHEN EXCLUDED.confidence_source != 'caller_provided' THEN EXCLUDED.confidence_source
+                                     ELSE memories.confidence_source END,
+            confidence_signals = CASE WHEN EXCLUDED.confidence > memories.confidence THEN EXCLUDED.confidence_signals
+                                      WHEN EXCLUDED.confidence < memories.confidence THEN memories.confidence_signals
+                                      WHEN EXCLUDED.confidence_source != 'caller_provided' THEN EXCLUDED.confidence_signals
+                                      ELSE memories.confidence_signals END,
+            confidence_decayed_at = CASE WHEN EXCLUDED.confidence > memories.confidence THEN EXCLUDED.confidence_decayed_at
+                                         WHEN EXCLUDED.confidence < memories.confidence THEN memories.confidence_decayed_at
+                                         WHEN EXCLUDED.confidence_source != 'caller_provided' THEN EXCLUDED.confidence_decayed_at
+                                         ELSE memories.confidence_decayed_at END,
+            -- #1608 / #1629 — QW-2 persona-artifact columns stay sticky:
+            -- the sqlite COALESCE order keeps the value the row was
+            -- minted with (old wins), so match it.
+            entity_id = COALESCE(memories.entity_id, EXCLUDED.entity_id),
+            persona_version = COALESCE(memories.persona_version, EXCLUDED.persona_version),
+            -- #1383 — preserve a previously-extracted attribution if
+            -- EXCLUDED is NULL (matches the sqlite ON CONFLICT clause
+            -- at `src/storage/mod.rs:689`).
+            mentioned_entity_id = COALESCE(EXCLUDED.mentioned_entity_id, memories.mentioned_entity_id),
+            -- v0.8.0 Pillar 2 (#1709) — sqlite parity: lifecycle_state
+            -- is preserved across a plain re-store (the stored value
+            -- wins) so a re-store does not reset an advanced
+            -- active/done state to the incoming open. Lifecycle
+            -- advances go through the typed `memory_update` gate.
+            lifecycle_state = memories.lifecycle_state,
+            -- #1632 (pg twin) — upsert-merge IS a mutation, so the Gap-1
+            -- optimistic-concurrency counter bumps exactly like
+            -- db::update (sqlite landed in 27b45dc2).
+            version = memories.version + 1,
+            -- v1.0.0 (#1945) — sqlite parity: the epistemic-typing
+            -- provenance follows the incoming write when present, else
+            -- keeps the stored marker (COALESCE).
+            -- v1.0.0 #2394 — the epistemic-typing provenance FOLLOWS THE
+            -- KIND THAT ACTUALLY WON. `memory_kind` above is sticky (a
+            -- stored `reflection` / `persona` is never downgraded), but the
+            -- bare COALESCE adopted the incoming provenance unconditionally,
+            -- so a row that KEPT its stored kind was relabelled with the
+            -- REJECTED write's provenance — durable metadata attesting a
+            -- kind the merge threw away. The CASE mirrors the `memory_kind`
+            -- CASE above exactly (kind unchanged -> the #1945/#2393
+            -- COALESCE; stored sticky kind survived -> keep the stored
+            -- provenance; incoming kind adopted -> its provenance verbatim,
+            -- NULL included) and is NULL-safe by construction.
+            kind_provenance = CASE WHEN EXCLUDED.memory_kind = memories.memory_kind
+                                        THEN COALESCE(EXCLUDED.kind_provenance, memories.kind_provenance)
+                                   WHEN memories.memory_kind IN ('reflection', 'persona')
+                                        THEN memories.kind_provenance
+                                   ELSE EXCLUDED.kind_provenance END,
+            -- v1.0.0 #1834 — sqlite `db::insert` parity: valid_from is
+            -- immutable (stored value wins), valid_until is caller-updatable
+            -- (COALESCE takes a fresh upper bound, else keeps existing).
+            valid_from = memories.valid_from,
+            valid_until = COALESCE(EXCLUDED.valid_until, memories.valid_until)
+        {merge_backstop}
+        RETURNING id",
+        conflict_target = crate::models::TITLE_SLOT_CONFLICT_TARGET,
+        merge_backstop = crate::models::title_slot_merge_backstop("memories"),
+        unstamped_owner_drop =
+            crate::identity::owner_stamp::pg_upsert_unstamped_owner_drop(
+                crate::identity::owner_stamp::UPSERT_SURVIVING_METADATA_COL,
+            ),
+    )
+    )
+    .bind(&memory.id)
+    .bind(memory.tier.as_str())
+    .bind(&memory.namespace)
+    .bind(&memory.title)
+    .bind(store_content_to_store)
+    .bind(&tags_json)
+    .bind(memory.priority)
+    .bind(memory.confidence)
+    .bind(&memory.source)
+    .bind(memory.access_count)
+    .bind(created_at)
+    .bind(updated_at)
+    .bind(last_accessed_at)
+    .bind(expires_at)
+    .bind(&store_stamped_metadata)
+    .bind(memory.reflection_depth)
+    .bind(memory.memory_kind.as_str())
+    .bind(&citations_json)
+    .bind(memory.source_uri.as_deref())
+    .bind(source_span_json.as_deref())
+    .bind(memory.confidence_source.as_str())
+    .bind(confidence_signals_json.as_deref())
+    .bind(memory.confidence_decayed_at.as_deref())
+    .bind(memory.entity_id.as_deref())
+    .bind(memory.persona_version)
+    .bind(mentioned_entity_id.as_deref())
+    .bind(memory.lifecycle_state.as_str())
+    .bind(store_encrypted_envelope)
+    .bind(&store_cid.cid)
+    .bind(&store_cid.genesis)
+    // v1.0.0 (#1945) — denormalised epistemic-typing provenance column
+    // ($31), derived from the `metadata.kind_provenance` carrier (sqlite
+    // `db::insert` parity via `extract_kind_provenance`).
+    .bind(crate::storage::extract_kind_provenance(memory))
+    // v1.0.0 #1834 — claim-bitemporal VALID-TIME columns ($32, $33),
+    // canonicalized to the fixed UTC rendering at this funnel
+    // (pre-ship 3x7) so the TEXT predicates compare instants correctly.
+    .bind(crate::validate::canonical_valid_time_opt(memory.valid_from.as_deref()))
+    .bind(crate::validate::canonical_valid_time_opt(memory.valid_until.as_deref()))
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|e| to_store_err("insert memory", e))?
+    // #3690 — no RETURNING row: the merge backstop fired on a HIDDEN
+    // occupant that landed after the admission probe (typed, unnamed).
+    .ok_or_else(|| StoreError::Conflict { id: String::new() })?
+    .try_get::<String, _>("id")
+    .map_err(|e| to_store_err(READ_RETURNED_ID, e))?;
+
+    // #2383 (N1) — invariant backstop: a non-NULL `encrypted_envelope`
+    // MUST open under the row's persisted `metadata.agent_id`. Same tx,
+    // so a concurrent first-creation race is repaired before any reader
+    // can observe it.
+    reconcile_envelope_owner(&mut **tx, &id, &memory.content, &store_seal).await?;
+
+    // v1.0.0 #2948 — record the COW SUPERSEDE when the upsert overwrote an
+    // existing row's durable content in place. Reached only on success; a
+    // fresh INSERT leaves `prior_version` None (no leaf). Identity-only,
+    // same tx; agent_id is the incoming memory's provenance marker.
+    if let Some(prior_version) = prior_version {
+        pg_emit_revision_leaf_if_enabled(
+            tx,
+            &id,
+            crate::revisions::RecordKind::Supersede,
+            Some(prior_version),
+            &memory.namespace,
+            Some(crate::storage::memory_agent_id(memory)).filter(|s| !s.is_empty()),
+            &memory.updated_at,
+        )
+        .await
+        .map_err(|e| to_store_err("append supersede revision leaf", e))?;
+    }
+
+    // v0.7.0.1 G1 / v0.7.0 #1156 — record quota usage in the same
+    // tx against the per-namespace accounting row (v50 PK
+    // extension). Best-effort resolution of agent_id; a missing
+    // claim falls back to the SAL `CallerContext::agent_id` so
+    // we never lose the count.
+    let quota_agent_id = resolve_quota_agent_id(ctx, &memory.metadata);
+    let bytes_added = memory_storage_bytes(memory);
+    // #2311 — tenant callers get the atomic in-tx ceiling guard (the
+    // handler's `check_memory_quota` pre-check remains only the
+    // fast-fail 429 shape); admin/curator contexts stay record-only,
+    // matching the sqlite surface-enforcement scoping.
+    record_memory_quota_in_tx(
+        tx,
+        &quota_agent_id,
+        &memory.namespace,
+        bytes_added,
+        !ctx.bypass_visibility,
+    )
+    .await?;
+    Ok(id)
+}
+
 #[async_trait]
 impl MemoryStore for PostgresStore {
     async fn write_durability(&self) -> StoreResult<crate::write_receipt::WriteDurability> {
@@ -21706,75 +22193,10 @@ impl MemoryStore for PostgresStore {
 
     async fn store(&self, ctx: &CallerContext, memory: &Memory) -> StoreResult<String> {
         self.gate_record_stop().await?;
-        // v0.8.1 W1 (#1821 / gap G29) — credential REDACT backstop (postgres
-        // parity with the sqlite db::insert funnel). No-op unless screening
-        // was seeded non-`off` and content carries credential material.
-        let screened = screen_storage_memory(memory);
-        let memory = screened.as_ref().unwrap_or(memory);
-        // ARCH-1 (CRITICAL) — substrate governance pre-write parity with
-        // the SQLite path. The `GOVERNANCE_PRE_WRITE` hook is consulted
-        // on EVERY substrate write path on EVERY backend; multi-tenant
-        // postgres-backed deployments would otherwise silently bypass
-        // operator-signed governance. See module-level comment in
-        // `src/storage/mod.rs` for the full layering rationale.
-        consult_governance_pre_write_pg(memory)?;
-        // #2059/#2110 — TRACT covenant clause 1 why_trace write-gate. Keyed on
-        // the write's AUTHENTICATED ORIGIN, never the caller-controlled
-        // `memory_kind`: an authenticated SYSTEM principal
-        // (`CallerContext::bypass_visibility` — curator/autonomy self-writes,
-        // per env #48; external HTTP/MCP tenant callers can NEVER set it)
-        // records the substrate rationale so its write satisfies
-        // `AI_MEMORY_REQUIRE_WHY_TRACE` without a bypass; every tenant write is
-        // gated on PRESENCE.
-        //
-        // #2124 — stamp the SAME substrate why_trace the sqlite
-        // `SqliteStore::store` funnel stamps (src/store/sqlite.rs) BEFORE the
-        // gate, then consult the gate UNCONDITIONALLY as defense-in-depth (the
-        // substrate-origin row was stamped above so it passes trivially). Pre
-        // #2124 the pg store-family SKIPPED the gate under `bypass_visibility`
-        // WITHOUT stamping, so an internally-authored row landed with NO
-        // clause-1 rationale on postgres while sqlite recorded the substrate
-        // marker — cross-backend provenance drift. Mirrors the pg
-        // reflect/capture_turn/consolidate funnels exactly.
-        let stamped_holder;
-        let memory = if ctx.bypass_visibility {
-            let mut m = memory.clone();
-            crate::storage::stamp_substrate_why_trace(&mut m.metadata);
-            stamped_holder = m;
-            &stamped_holder
-        } else {
-            memory
-        };
-        consult_why_trace_gate_pg(memory)?;
-
-        let created_at = parse_rfc3339_required(&memory.created_at)?;
-        let updated_at = parse_rfc3339_required(&memory.updated_at)?;
-        let last_accessed_at = parse_rfc3339_opt(memory.last_accessed_at.as_deref());
-        // v0.7.0 #1466 — backfill the tier-default expiry so a hand-built
-        // mid/short Memory with `expires_at: None` is reapable, matching the
-        // SQLite `storage::insert` chokepoint. Shared SSOT on `Memory`.
-        let expires_at = parse_rfc3339_opt(memory.effective_expires_at().as_deref());
-        let tags_json =
-            serde_json::to_value(&memory.tags).map_err(|e| StoreError::IntegrityFailed {
-                detail: serialize_err("tags", e),
-            })?;
-
-        // #1757 / #1719 item 2b — populate-on-write: advance THIS node's
-        // own component of the per-memory vector clock on the LOCAL store
-        // path (postgres twin of the sqlite `db::insert` stamp). The
-        // federation RECEIVE writes are the separate `apply_remote_memory`
-        // / `merge_inbound`, so a remote-applied row never bumps this node.
-        // ON CONFLICT updates `metadata = EXCLUDED.metadata` (agent_id
-        // preserved), so a re-store persists the advanced clock too.
-        let store_stamped_metadata = {
-            let mut m = memory.metadata.clone();
-            crate::models::stamp_version_vector(
-                &mut m,
-                crate::federation::identity::resolver::local_node_identity(),
-                &memory.updated_at,
-            );
-            m
-        };
+        // #8890 — the preamble and the in-tx body are shared with the
+        // single-transaction vertical promote; this funnel owns its tx.
+        let (memory, binds) = pg_store_prepare(ctx, memory)?;
+        let memory: &Memory = &memory;
 
         // v0.7.0.1 G1 — INSERT memories + record quota usage in a single
         // transaction so the postgres path matches the SQLite parity laid
@@ -21786,362 +22208,7 @@ impl MemoryStore for PostgresStore {
             .begin()
             .await
             .map_err(|e| to_store_err("begin store tx", e))?;
-
-        // APPEND-ONLY-SANCTIONED (#1823 G6 / #2948) — COW SUPERSEDE: probe the
-        // existing (title, namespace) row's version BEFORE the upsert so a
-        // conflict-merge that overwrites durable content in place (`content =
-        // EXCLUDED.content` below) appends ONE identity-only SUPERSEDE leaf. `None`
-        // when the spine is OFF or on a fresh INSERT (no prior row). Same tx.
-        // #3690 / #3695 — TITLE-SLOT ADMISSION (typed, unnamed refusal of a
-        // hidden holder; the LIVE holder's version as the SUPERSEDE pre-image).
-        let store_verdict = pg_title_slot_admission(
-            &mut tx,
-            memory,
-            crate::storage::InsertConflictArm::Merge,
-            pg_admission_viewer(ctx),
-        )
-        .await?;
-        let prior_version = store_verdict.prior_version;
-
-        // Upsert contract matches SQLite: `ON CONFLICT (title, namespace)`.
-        // Backed by the UNIQUE INDEX `memories_title_ns_uidx` in
-        // postgres_schema.sql. Fix for blocker #294.
-        //
-        // Agent-id immutability (blocker #295): on conflict we preserve
-        // the ORIGINAL `metadata.agent_id` via `jsonb_set`, mirroring the
-        // SQLite `json_set` CASE clause in `crate::storage::insert`. The
-        // caller-supplied metadata otherwise wins.
-        //
-        // Tier never downgrades (blocker #296 / SQLite parity): on
-        // conflict tier takes max of existing vs new via rank mapping.
-        // v0.7.0 #900 — Form-4 fact-provenance + Form-5 confidence
-        // provenance columns ride the same INSERT so the PG store
-        // round-trips `Memory::source_uri`, `citations`, `source_span`,
-        // and the three confidence columns. Pre-#900 the INSERT only
-        // wrote 17 columns and `list_by_source_uri` / `search_with_
-        // source_uri` returned empty against PG. Pinned by
-        // `tests/store_parity_gaps.rs::pg_parity_gap_2_source_uri_column`.
-        let citations_json =
-            serde_json::to_string(&memory.citations).map_err(|e| StoreError::IntegrityFailed {
-                detail: serialize_err("citations", e),
-            })?;
-        let source_span_json = match memory.source_span {
-            Some(span) => {
-                Some(
-                    serde_json::to_string(&span).map_err(|e| StoreError::IntegrityFailed {
-                        detail: serialize_err(COL_SOURCE_SPAN, e),
-                    })?,
-                )
-            }
-            None => None,
-        };
-        let confidence_signals_json = match &memory.confidence_signals {
-            Some(s) => Some(
-                serde_json::to_string(s).map_err(|e| StoreError::IntegrityFailed {
-                    detail: serialize_err(COL_CONFIDENCE_SIGNALS, e),
-                })?,
-            ),
-            None => None,
-        };
-        // #1383 — denormalise `mentioned_entity_id` from the row's
-        // `metadata.entity_id` / `[entity:X]` title marker so that
-        // postgres-backed reflection rows are reachable via the
-        // `memory_persona_generate` matcher (which queries
-        // `WHERE mentioned_entity_id = ?` on the partial index from
-        // schema v32). Pre-#1383 the postgres `store()` path dropped
-        // this column entirely so every postgres reflection was
-        // invisible to persona generation despite the caller passing
-        // the entity attribution correctly. Mirrors sqlite at
-        // `src/storage/mod.rs:616`. Non-reflection rows return None
-        // here, matching the sqlite behaviour.
-        let mentioned_entity_id = crate::storage::extract_mentioned_entity_id(memory);
-
-        // #228 Commit B — at-rest content encryption (postgres parity).
-        // Seal the plaintext content to the per-agent X25519 key when
-        // enabled; the `content` column then carries the empty placeholder
-        // and the ciphertext envelope lands in the `encrypted_envelope`
-        // BYTEA column (schema v68). When disabled (default) `sealed` is
-        // None: content is stored verbatim and the envelope binds NULL —
-        // byte-identical to the pre-wiring path. agent_id is the NHI
-        // provenance marker from metadata (fail-closed under an enabled
-        // gate when absent). Content-only: title/tags/metadata stay plain.
-        //
-        // v1.0.0 #2383 (N1) — sealed to the identity the SURVIVING row
-        // RETAINS, not to the incoming writer: the `ON CONFLICT` arm below
-        // keeps the existing row's `agent_id` (#1784) while taking the
-        // incoming envelope, so an incoming-keyed seal left the durable row
-        // unreadable. See `seal_content_for_upsert`. Runs on the same tx as
-        // the upsert so the pre-read and the write are one atomic unit.
-        let store_seal = seal_content_for_upsert(&mut *tx, memory).await?;
-        let store_content_to_store = store_seal.content();
-        let store_encrypted_envelope: Option<&Vec<u8>> = store_seal.envelope();
-        // v0.9.0 G8 (#1825) — stamp the content-id from the PLAINTEXT
-        // genesis identity (never the ciphertext placeholder). OMITTED from
-        // the DO UPDATE SET below so a surviving upsert-merge row keeps its
-        // own genesis cid.
-        let store_cid = crate::identity::cid::stamp_memory_cid(memory);
-
-        let id: String = sqlx::query(
-            &format!(
-            "INSERT INTO memories (
-                id, tier, namespace, title, content, tags, priority, confidence,
-                source, access_count, created_at, updated_at, last_accessed_at,
-                expires_at, metadata, reflection_depth, memory_kind,
-                citations, source_uri, source_span,
-                confidence_source, confidence_signals, confidence_decayed_at,
-                entity_id, persona_version,
-                mentioned_entity_id, lifecycle_state, encrypted_envelope,
-                cid, cid_genesis, kind_provenance,
-                valid_from, valid_until
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
-                      $18, $19, $20,
-                      $21, $22, $23,
-                      $24, $25,
-                      $26, $27, $28, $29, $30, $31, $32, $33)
-            {conflict_target} DO UPDATE SET
-                content = EXCLUDED.content,
-                -- #228 Commit B — content + envelope move together on upsert
-                -- so a re-store replaces both the placeholder and ciphertext
-                -- (encryption-off writes plaintext + NULL, clearing stale
-                -- ciphertext). Mirrors the sqlite `insert` ON CONFLICT.
-                encrypted_envelope = EXCLUDED.encrypted_envelope,
-                tier = CASE
-                    WHEN tier_rank(EXCLUDED.tier) >= tier_rank(memories.tier)
-                        THEN EXCLUDED.tier
-                    ELSE memories.tier
-                END,
-                tags = EXCLUDED.tags,
-                -- #1629 — sqlite `storage::insert` parity: priority +
-                -- confidence take the MAX across upsert so a re-store can
-                -- never downgrade either signal.
-                priority = GREATEST(memories.priority, EXCLUDED.priority),
-                confidence = GREATEST(memories.confidence, EXCLUDED.confidence),
-                -- #1629 — sqlite parity: source follows the incoming row.
-                source = EXCLUDED.source,
-                updated_at = EXCLUDED.updated_at,
-                -- #1629 — sqlite parity: long-tier rows pin expiry to NULL;
-                -- otherwise an incoming row that omits expiry keeps the
-                -- stored one rather than blanking it out.
-                -- v1.0.0 #2515 (GA Wave-1 data-integrity blocker) — a re-store /
-                -- upsert must FLOOR the TTL, never SHORTEN it. The bare
-                -- COALESCE(EXCLUDED.expires_at, memories.expires_at) adopted the
-                -- incoming row's expiry verbatim, so re-storing the same
-                -- (title, namespace) with an EARLIER expiry silently rolled a
-                -- live row's TTL backwards — a #1596 never-move-expiry-earlier
-                -- violation (premature GC reap / permanent link-edge loss). This
-                -- mirrors EXACTLY the shipped #2335 federation extension-FLOOR
-                -- lattice join (GREATEST over the COALESCE'd pair, both operands
-                -- funnel-canonical per #2332): the merge converges on the LATER
-                -- expiry regardless of store order. Long⇒NULL keeps the #1626
-                -- coupling. EXPLICIT shortening stays ONLY on the memory_update /
-                -- db::update path, never on this re-store funnel.
-                expires_at = CASE
-                    WHEN EXCLUDED.tier = 'long' OR memories.tier = 'long' THEN NULL
-                    ELSE GREATEST(COALESCE(EXCLUDED.expires_at, memories.expires_at),
-                                  COALESCE(memories.expires_at, EXCLUDED.expires_at))
-                END,
-                metadata = (EXCLUDED.metadata || (
-                    -- #1784 — preserve immutable provenance keys (agent_id +
-                    -- consolidation derived_from / consolidated_from_agents)
-                    -- from the existing row through the metadata overwrite.
-                    -- `||` overlays them on top of EXCLUDED so existing wins
-                    -- (the superset of the pre-#1784 agent_id-only CASE).
-                    SELECT COALESCE(jsonb_object_agg(prov.k, prov.v), '{{}}'::jsonb)
-                    FROM jsonb_each(memories.metadata) AS prov(k, v)
-                    -- #2941 — reserved set, lockstep-gated on crate::RESERVED_UPSERT_METADATA_KEYS.
-                    WHERE prov.k IN ('agent_id', 'derived_from', 'consolidated_from_agents', 'agent_pubkey', 'pubkey_bound_at')
-                )) {unstamped_owner_drop},
-                -- v0.7.0 Task 1/8 — recursion depth takes max on upsert so a
-                -- newer reflection at higher depth doesn't lose its provenance
-                -- signal when re-stored at the same (title, namespace).
-                reflection_depth = GREATEST(memories.reflection_depth, EXCLUDED.reflection_depth),
-                -- L1-1 — kind is sticky: once Reflection, always Reflection.
-                -- #1629 / QW-2 — Persona is also sticky (sqlite parity).
-                memory_kind = CASE WHEN memories.memory_kind = 'reflection' THEN 'reflection'
-                                   WHEN memories.memory_kind = 'persona' THEN 'persona'
-                                   ELSE EXCLUDED.memory_kind END,
-                -- v0.7.0 #900 / #1629 — Form-4 fact-provenance follows the
-                -- sqlite CASE: a non-empty incoming citations array replaces
-                -- (caller re-asserted provenance); an empty one preserves the
-                -- stored evidence instead of silently wiping it.
-                citations = CASE WHEN EXCLUDED.citations = '[]'
-                                 THEN memories.citations
-                                 ELSE EXCLUDED.citations END,
-                source_uri = COALESCE(EXCLUDED.source_uri, memories.source_uri),
-                source_span = COALESCE(EXCLUDED.source_span, memories.source_span),
-                -- #1629 — Form-5 sqlite parity: an explicit non-default
-                -- provenance replaces; the caller_provided default keeps the
-                -- stored (auto-derived / calibrated) signal.
-                -- v1.0.0 #2395 — the confidence field-set is ATOMIC (sqlite
-                -- twin in `storage::insert_inner`'s `upsert_sql`). `confidence`
-                -- merges by GREATEST above, so the calibration record that
-                -- DESCRIBES that number must come from the SAME operand that
-                -- won. Pre-#2395 these three used a DIFFERENT selector, so a
-                -- re-store with a LOWER confidence but a non-default source
-                -- kept the stored 0.9 and stamped the incoming label + signals
-                -- over it — durable Form-5 corruption, silent to every reader.
-                -- Selector = the GREATEST winner: > takes the incoming tuple,
-                -- < keeps the stored tuple, and an exact tie keeps the #1629
-                -- rule verbatim (explicit non-`caller_provided` replaces) but
-                -- now carries the WHOLE tuple. `=` is only the tie BRANCH of a
-                -- total order, never a logical float-equality test.
-                confidence_source = CASE WHEN EXCLUDED.confidence > memories.confidence THEN EXCLUDED.confidence_source
-                                         WHEN EXCLUDED.confidence < memories.confidence THEN memories.confidence_source
-                                         WHEN EXCLUDED.confidence_source != 'caller_provided' THEN EXCLUDED.confidence_source
-                                         ELSE memories.confidence_source END,
-                confidence_signals = CASE WHEN EXCLUDED.confidence > memories.confidence THEN EXCLUDED.confidence_signals
-                                          WHEN EXCLUDED.confidence < memories.confidence THEN memories.confidence_signals
-                                          WHEN EXCLUDED.confidence_source != 'caller_provided' THEN EXCLUDED.confidence_signals
-                                          ELSE memories.confidence_signals END,
-                confidence_decayed_at = CASE WHEN EXCLUDED.confidence > memories.confidence THEN EXCLUDED.confidence_decayed_at
-                                             WHEN EXCLUDED.confidence < memories.confidence THEN memories.confidence_decayed_at
-                                             WHEN EXCLUDED.confidence_source != 'caller_provided' THEN EXCLUDED.confidence_decayed_at
-                                             ELSE memories.confidence_decayed_at END,
-                -- #1608 / #1629 — QW-2 persona-artifact columns stay sticky:
-                -- the sqlite COALESCE order keeps the value the row was
-                -- minted with (old wins), so match it.
-                entity_id = COALESCE(memories.entity_id, EXCLUDED.entity_id),
-                persona_version = COALESCE(memories.persona_version, EXCLUDED.persona_version),
-                -- #1383 — preserve a previously-extracted attribution if
-                -- EXCLUDED is NULL (matches the sqlite ON CONFLICT clause
-                -- at `src/storage/mod.rs:689`).
-                mentioned_entity_id = COALESCE(EXCLUDED.mentioned_entity_id, memories.mentioned_entity_id),
-                -- v0.8.0 Pillar 2 (#1709) — sqlite parity: lifecycle_state
-                -- is preserved across a plain re-store (the stored value
-                -- wins) so a re-store does not reset an advanced
-                -- active/done state to the incoming open. Lifecycle
-                -- advances go through the typed `memory_update` gate.
-                lifecycle_state = memories.lifecycle_state,
-                -- #1632 (pg twin) — upsert-merge IS a mutation, so the Gap-1
-                -- optimistic-concurrency counter bumps exactly like
-                -- db::update (sqlite landed in 27b45dc2).
-                version = memories.version + 1,
-                -- v1.0.0 (#1945) — sqlite parity: the epistemic-typing
-                -- provenance follows the incoming write when present, else
-                -- keeps the stored marker (COALESCE).
-                -- v1.0.0 #2394 — the epistemic-typing provenance FOLLOWS THE
-                -- KIND THAT ACTUALLY WON. `memory_kind` above is sticky (a
-                -- stored `reflection` / `persona` is never downgraded), but the
-                -- bare COALESCE adopted the incoming provenance unconditionally,
-                -- so a row that KEPT its stored kind was relabelled with the
-                -- REJECTED write's provenance — durable metadata attesting a
-                -- kind the merge threw away. The CASE mirrors the `memory_kind`
-                -- CASE above exactly (kind unchanged -> the #1945/#2393
-                -- COALESCE; stored sticky kind survived -> keep the stored
-                -- provenance; incoming kind adopted -> its provenance verbatim,
-                -- NULL included) and is NULL-safe by construction.
-                kind_provenance = CASE WHEN EXCLUDED.memory_kind = memories.memory_kind
-                                            THEN COALESCE(EXCLUDED.kind_provenance, memories.kind_provenance)
-                                       WHEN memories.memory_kind IN ('reflection', 'persona')
-                                            THEN memories.kind_provenance
-                                       ELSE EXCLUDED.kind_provenance END,
-                -- v1.0.0 #1834 — sqlite `db::insert` parity: valid_from is
-                -- immutable (stored value wins), valid_until is caller-updatable
-                -- (COALESCE takes a fresh upper bound, else keeps existing).
-                valid_from = memories.valid_from,
-                valid_until = COALESCE(EXCLUDED.valid_until, memories.valid_until)
-            {merge_backstop}
-            RETURNING id",
-            conflict_target = crate::models::TITLE_SLOT_CONFLICT_TARGET,
-            merge_backstop = crate::models::title_slot_merge_backstop("memories"),
-            unstamped_owner_drop =
-                crate::identity::owner_stamp::pg_upsert_unstamped_owner_drop(
-                    crate::identity::owner_stamp::UPSERT_SURVIVING_METADATA_COL,
-                ),
-        )
-        )
-        .bind(&memory.id)
-        .bind(memory.tier.as_str())
-        .bind(&memory.namespace)
-        .bind(&memory.title)
-        .bind(store_content_to_store)
-        .bind(&tags_json)
-        .bind(memory.priority)
-        .bind(memory.confidence)
-        .bind(&memory.source)
-        .bind(memory.access_count)
-        .bind(created_at)
-        .bind(updated_at)
-        .bind(last_accessed_at)
-        .bind(expires_at)
-        .bind(&store_stamped_metadata)
-        .bind(memory.reflection_depth)
-        .bind(memory.memory_kind.as_str())
-        .bind(&citations_json)
-        .bind(memory.source_uri.as_deref())
-        .bind(source_span_json.as_deref())
-        .bind(memory.confidence_source.as_str())
-        .bind(confidence_signals_json.as_deref())
-        .bind(memory.confidence_decayed_at.as_deref())
-        .bind(memory.entity_id.as_deref())
-        .bind(memory.persona_version)
-        .bind(mentioned_entity_id.as_deref())
-        .bind(memory.lifecycle_state.as_str())
-        .bind(store_encrypted_envelope)
-        .bind(&store_cid.cid)
-        .bind(&store_cid.genesis)
-        // v1.0.0 (#1945) — denormalised epistemic-typing provenance column
-        // ($31), derived from the `metadata.kind_provenance` carrier (sqlite
-        // `db::insert` parity via `extract_kind_provenance`).
-        .bind(crate::storage::extract_kind_provenance(memory))
-        // v1.0.0 #1834 — claim-bitemporal VALID-TIME columns ($32, $33),
-        // canonicalized to the fixed UTC rendering at this funnel
-        // (pre-ship 3x7) so the TEXT predicates compare instants correctly.
-        .bind(crate::validate::canonical_valid_time_opt(memory.valid_from.as_deref()))
-        .bind(crate::validate::canonical_valid_time_opt(memory.valid_until.as_deref()))
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|e| to_store_err("insert memory", e))?
-        // #3690 — no RETURNING row: the merge backstop fired on a HIDDEN
-        // occupant that landed after the admission probe (typed, unnamed).
-        .ok_or_else(|| StoreError::Conflict { id: String::new() })?
-        .try_get::<String, _>("id")
-        .map_err(|e| to_store_err(READ_RETURNED_ID, e))?;
-
-        // #2383 (N1) — invariant backstop: a non-NULL `encrypted_envelope`
-        // MUST open under the row's persisted `metadata.agent_id`. Same tx,
-        // so a concurrent first-creation race is repaired before any reader
-        // can observe it.
-        reconcile_envelope_owner(&mut *tx, &id, &memory.content, &store_seal).await?;
-
-        // v1.0.0 #2948 — record the COW SUPERSEDE when the upsert overwrote an
-        // existing row's durable content in place. Reached only on success; a
-        // fresh INSERT leaves `prior_version` None (no leaf). Identity-only,
-        // same tx; agent_id is the incoming memory's provenance marker.
-        if let Some(prior_version) = prior_version {
-            pg_emit_revision_leaf_if_enabled(
-                &mut tx,
-                &id,
-                crate::revisions::RecordKind::Supersede,
-                Some(prior_version),
-                &memory.namespace,
-                Some(crate::storage::memory_agent_id(memory)).filter(|s| !s.is_empty()),
-                &memory.updated_at,
-            )
-            .await
-            .map_err(|e| to_store_err("append supersede revision leaf", e))?;
-        }
-
-        // v0.7.0.1 G1 / v0.7.0 #1156 — record quota usage in the same
-        // tx against the per-namespace accounting row (v50 PK
-        // extension). Best-effort resolution of agent_id; a missing
-        // claim falls back to the SAL `CallerContext::agent_id` so
-        // we never lose the count.
-        let quota_agent_id = resolve_quota_agent_id(ctx, &memory.metadata);
-        let bytes_added = memory_storage_bytes(memory);
-        // #2311 — tenant callers get the atomic in-tx ceiling guard (the
-        // handler's `check_memory_quota` pre-check remains only the
-        // fast-fail 429 shape); admin/curator contexts stay record-only,
-        // matching the sqlite surface-enforcement scoping.
-        record_memory_quota_in_tx(
-            &mut tx,
-            &quota_agent_id,
-            &memory.namespace,
-            bytes_added,
-            !ctx.bypass_visibility,
-        )
-        .await?;
-
+        let id = pg_store_in_tx(&mut tx, ctx, memory, binds).await?;
         tx.commit()
             .await
             .map_err(|e| to_store_err("commit store tx", e))?;
