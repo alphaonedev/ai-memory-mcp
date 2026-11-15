@@ -82,7 +82,7 @@ const DEFAULT_CLAIM_DOCS: [&str; 2] = ["docs/SECURITY.md", "docs/CLI_REFERENCE.m
 /// Forms of the false "authenticated / encrypted / hot-reloaded by default"
 /// claim (#9017). Lowercased; each is scanned over both references after
 /// whitespace flattening, so a re-wrap cannot hide one.
-const FALSE_DEFAULT_CLAIM_FORMS: [&str; 7] = [
+const FALSE_DEFAULT_CLAIM_FORMS: [&str; 10] = [
     "authentication is on by default",
     "trusts no one by default",
     "api key + mtls gate inbound",
@@ -90,10 +90,15 @@ const FALSE_DEFAULT_CLAIM_FORMS: [&str; 7] = [
     "falls back to plain http",
     "without a restart",
     "a peer without an authorised cert can't even open a tcp connection",
+    // Amendment 2 (security r1 addendum): the sync gate is peer enrollment
+    // (#1789), not the allowlist, and an unsigned write is refused.
+    "trusts peers on the mtls allowlist",
+    "accept any client",
+    "can read and write",
 ];
 
 /// Sentences `docs/SECURITY.md` must carry for the real default (#9017).
-const SECURITY_MD_DEFAULT_SENTENCES: [&str; 12] = [
+const SECURITY_MD_DEFAULT_SENTENCES: [&str; 16] = [
     "`resolve_tls_material` in `bootstrap_serve` (then `tls_bind_guard`)",
     "with neither flag a singleton serves the local-CA material it generates and renews, or \
      operator material installed by `ai-memory tls import`",
@@ -106,14 +111,26 @@ const SECURITY_MD_DEFAULT_SENTENCES: [&str; 12] = [
     "with `AI_MEMORY_REQUIRE_API_KEY=1` a keyless bind is refused on every address, loopback \
      included",
     "client certificates apply only when `--mtls-allowlist` is passed",
-    "on the default configuration an unauthenticated local client can read and write.",
-    "Without it, `/api/v1/sync/*` accepts any client that completes TLS and passes the API-key \
-     check (none when `api_key` is unset)",
+    // What an unauthenticated local client gets, as the E-e keyless loopback
+    // probe recorded it (each status is a probe line in the PR body).
+    "on the default configuration an unauthenticated local client can read: \
+     `GET /api/v1/memories` answers 200 with no header at all.",
+    "a local client that names an agent in the self-asserted `X-Agent-Id` header can also \
+     link and delete that agent's memories (`POST /api/v1/links` 201, \
+     `DELETE /api/v1/memories/{id}` 200)",
+    "An unsigned `POST /api/v1/memories` is refused `403 ATTESTATION_FAILED`",
+    "attestation and enrollment are not authentication; the default-on API key is #2046",
+    // Peer sync: the default gate is enrollment (#1789), not the allowlist.
+    "by default `/api/v1/sync/push` and `/api/v1/sync/since` refuse a peer that is not \
+     enrolled (`401 peer_not_enrolled`, #1789; `AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS=1` \
+     lifts that gate)",
+    "With `--mtls-allowlist` set, the TLS handshake also refuses a client without an \
+     allowlisted certificate; without it the TLS transport requests no client certificate",
     "When `api_key` is set, every HTTP endpoint except `/api/v1/health` enforces the key",
 ];
 
 /// Sentences `docs/CLI_REFERENCE.md` `serve` must carry (#9017).
-const CLI_REFERENCE_DEFAULT_SENTENCES: [&str; 5] = [
+const CLI_REFERENCE_DEFAULT_SENTENCES: [&str; 7] = [
     "Without `api_key` the daemon authenticates no HTTP request: a keyless loopback bind serves \
      and logs a WARN, a keyless non-loopback bind is refused at boot (exit 75), and \
      `AI_MEMORY_REQUIRE_API_KEY=1` refuses a keyless bind on every address.",
@@ -124,6 +141,9 @@ const CLI_REFERENCE_DEFAULT_SENTENCES: [&str; 5] = [
     "a non-loopback bind also needs top-level `api_key` in `config.toml` (without it `serve` \
      exits 75)",
     "--peers https://peer-a:9077,https://peer-b:9077",
+    "Without it no client certificate is requested and `serve` logs a WARN; the sync \
+     endpoints still refuse a peer that is not enrolled (#1789)",
+    "The default-on API key is #2046",
 ];
 
 /// #9017 — `docs/SECURITY.md` and `docs/CLI_REFERENCE.md` state the real

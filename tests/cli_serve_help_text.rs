@@ -154,8 +154,9 @@ const HELP_MTLS_ALLOWLIST_PARAGRAPH: &str = "Path to a file containing SHA-256 f
      the TLS handshake of every connection and fails the handshake for a peer that presents none \
      or one whose fingerprint is not on the list, so that peer never reaches an HTTP route such \
      as `/sync/push`; the gate is the TLS handshake, not TCP accept. Requires `--tls-cert` and \
-     `--tls-key`. Without this flag no client certificate is requested and `serve` logs a WARN \
-     that the sync endpoints accept any client. Layer 2 of the peer-mesh crypto stack; the \
+     `--tls-key`. Without this flag no client certificate is requested and `serve` logs a WARN; \
+     the sync endpoints still refuse a peer that is not enrolled (#1789). Layer 2 of the \
+     peer-mesh crypto stack; the \
      certificate-to-agent binding (`AI_MEMORY_MTLS_AGENT_BINDING`, #8357) builds on it";
 
 /// `(flag, pinned paragraph)` for every auth / TLS flag of `serve`.
@@ -320,6 +321,12 @@ const SAYS_REQUIRE_API_KEY: &str = "AI_MEMORY_REQUIRE_API_KEY is set";
 const SAYS_KEYLESS_WARN: &str = "API key NOT configured";
 const SAYS_MTLS_OFF_WARN: &str = "TLS enabled but mTLS NOT configured";
 const SAYS_MTLS_ON: &str = "mTLS enabled — client certs required";
+/// The mTLS-off WARN names the real sync gate, peer enrollment (#1789; the
+/// security r1 probe got `401 peer_not_enrolled` with no client certificate).
+const SAYS_SYNC_ENROLLMENT_GATE: &str = "the sync endpoints (/api/v1/sync/push, \
+     /api/v1/sync/since) still refuse a peer that is not enrolled";
+/// The retired false claim of that WARN: sync does not accept any client.
+const SAYS_SYNC_ANY_CLIENT: &str = "accept any client";
 /// The two boot WARN lines `docs/SECURITY.md` quotes verbatim.
 const KEYLESS_DOC_QUOTES: [&str; 2] = [SAYS_KEYLESS_WARN, SAYS_MTLS_OFF_WARN];
 
@@ -448,7 +455,7 @@ const ROWS: [Row; 12] = [
         help: HELP_KEYLESS_LOOPBACK,
         expect: Expect::ServesHttps {
             says: Some(SAYS_KEYLESS_WARN),
-            never: None,
+            never: Some(SAYS_SYNC_ANY_CLIENT),
             doc_quotes: &KEYLESS_DOC_QUOTES,
         },
     },
@@ -473,7 +480,7 @@ const ROWS: [Row; 12] = [
         setup: Setup::MtlsOff,
         help: HELP_MTLS_OFF,
         expect: Expect::ServesHttps {
-            says: Some(SAYS_MTLS_OFF_WARN),
+            says: Some(SAYS_SYNC_ENROLLMENT_GATE),
             never: Some(SAYS_MTLS_ON),
             doc_quotes: &[],
         },
