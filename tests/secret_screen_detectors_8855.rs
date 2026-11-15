@@ -789,3 +789,325 @@ fn bearer_token68_tilde_masked_whole_8855() {
         format!("Authorization: {REDACTION_PLACEHOLDER} sent")
     );
 }
+
+// ── r4 ruling eeda8423: quotes, terminators, callers, bounds ──────────────
+//
+// (a) a quoted value ends only at the quote it opened with: an escaped
+//     quote (`\"`, `\'`) or a doubled quote (`""`, `''`) is part of the
+//     value, and a value with no closing quote is masked to the line end;
+// (b) the only terminators are ASCII whitespace (CR and LF included);
+//     U+00A0 and U+2028 are value bytes, and every cut is on a char
+//     boundary;
+// (c) every caller of the value scans keeps its refusal (no verdict flips
+//     from refuse to pass);
+// (d) one 100K+ whitespace-free line per form under LINEAR_SCAN_CEILING;
+// (e) an accepted shape (env lookup, `<…>`, `${…}`, a type annotation)
+//     never swallows a password assignment in the same token.
+
+/// The two quote characters a value may open with.
+const QUOTE_CHARS: [char; 2] = ['"', '\''];
+/// The non-ASCII blanks that must NOT end a value (NBSP, LINE SEPARATOR).
+const NON_ASCII_BLANKS: [char; 2] = ['\u{00A0}', '\u{2028}'];
+/// The plain secret used by the caller-class and boundary cells.
+const PLAIN_VALUE: &str = concat!("abcdef", "123456");
+/// One unit of a whitespace-free 100K value (no key, no `@`).
+const BOUND_VALUE_UNIT: &str = "Ab9!x";
+
+/// (a) For each quote q, `password=q abc<esc>def123456 q tail` with an
+/// escaped (`\q`) and a doubled (`qq`) quote inside is masked whole, in the
+/// `=` and the `:` form; an escaped backslash (`\\`) still lets the quote
+/// after it close the value.
+#[test]
+fn quoted_value_escaped_and_doubled_quote_masked_whole_8855() {
+    let ph = REDACTION_PLACEHOLDER;
+    let mut rows = Vec::new();
+    for q in QUOTE_CHARS {
+        for inner in [format!("\\{q}"), format!("{q}{q}")] {
+            for op in ["=", ": "] {
+                rows.push((
+                    format!("password{op}{q}abc{inner}def123456{q} tail"),
+                    format!("password{op}{q}{ph}{q} tail"),
+                ));
+            }
+        }
+        rows.push((
+            format!("password={q}abc\\\\{q} tail"),
+            format!("password={q}{ph}{q} tail"),
+        ));
+    }
+    assert_redacts_exactly(KIND_PASSWORD, &rows);
+}
+
+/// (a) A quoted value that never closes is masked to the end of its line
+/// (LF or CRLF), never passed and never cut at an inner byte; the next line
+/// survives.
+#[test]
+fn unterminated_quoted_value_masked_to_line_end_8855() {
+    let ph = REDACTION_PLACEHOLDER;
+    let mut rows = Vec::new();
+    for q in QUOTE_CHARS {
+        rows.push((
+            format!("password={q}abc def,123 x\nnext line"),
+            format!("password={q}{ph}\nnext line"),
+        ));
+        rows.push((
+            format!("password: {q}abc\\{q}\r\nnext line"),
+            format!("password: {q}{ph}\r\nnext line"),
+        ));
+        rows.push((
+            format!("password={q}abc;def123456"),
+            format!("password={q}{ph}"),
+        ));
+    }
+    assert_redacts_exactly(KIND_PASSWORD, &rows);
+}
+
+/// (b) U+00A0 and U+2028 inside a value are value bytes in all three forms.
+#[test]
+fn non_ascii_blank_inside_value_masked_whole_8855() {
+    for blank in NON_ASCII_BLANKS {
+        let v = format!("{VALUE_HEAD}{blank}{VALUE_TAIL}");
+        for (name, kind, input, expected) in value_forms(&v) {
+            assert_eq!(kinds_of(&input), vec![kind], "8855 {name}: {input:?}");
+            assert_eq!(redacted_of(&input), expected, "8855 {name}: {input:?}");
+        }
+    }
+}
+
+/// (b) CR and LF end an unquoted value (and the URL token): the next line
+/// survives.
+#[test]
+fn cr_and_lf_end_an_unquoted_value_8855() {
+    let ph = REDACTION_PLACEHOLDER;
+    assert_redacts_exactly(
+        KIND_PASSWORD,
+        &[
+            (
+                format!("password={PLAIN_VALUE}\r\nuser bob"),
+                format!("password={ph}\r\nuser bob"),
+            ),
+            (
+                format!("password: {PLAIN_VALUE}\ruser bob"),
+                format!("password: {ph}\ruser bob"),
+            ),
+        ],
+    );
+    assert_redacts_exactly(
+        KIND_URL,
+        &[(
+            format!("postgres://svc:{PLAIN_VALUE}@db/x\r\nuser bob"),
+            format!("postgres://svc:{ph}@db/x\r\nuser bob"),
+        )],
+    );
+}
+
+/// (b) A multi-byte character directly BEFORE the terminator is masked with
+/// the value; one directly AFTER it survives. Neither slices mid-char.
+#[test]
+fn multibyte_char_at_the_cut_is_on_a_char_boundary_8855() {
+    let ph = REDACTION_PLACEHOLDER;
+    let before = format!("{PLAIN_VALUE}{MULTIBYTE_INNER}");
+    for (name, kind, input, expected) in value_forms(&before) {
+        assert_eq!(kinds_of(&input), vec![kind], "8855 {name}: {input:?}");
+        assert_eq!(redacted_of(&input), expected, "8855 {name}: {input:?}");
+    }
+    let m = MULTIBYTE_INNER;
+    assert_redacts_exactly(
+        KIND_PASSWORD,
+        &[
+            (
+                format!("password={PLAIN_VALUE} {m}tail"),
+                format!("password={ph} {m}tail"),
+            ),
+            (
+                format!("password: {PLAIN_VALUE}\n{m}tail"),
+                format!("password: {ph}\n{m}tail"),
+            ),
+            (
+                format!("password=\"{PLAIN_VALUE}{m}\"{m}tail"),
+                format!("password=\"{ph}\"{m}tail"),
+            ),
+        ],
+    );
+    assert_redacts_exactly(
+        KIND_URL,
+        &[(
+            format!("postgres://svc:{PLAIN_VALUE}{m}@db/x {m}tail"),
+            format!("postgres://svc:{ph}@db/x {m}tail"),
+        )],
+    );
+}
+
+/// (c) One row per caller class of the value scans: `value_at` after `=`,
+/// after `:`, after a type annotation's initializer (plain and `&`-led), the
+/// `&`-led credential path, and `authority_end` for a URL password. Each is
+/// refused on the caller funnel with the exact reason and masked exactly on
+/// the receive funnel.
+#[test]
+fn every_value_scan_caller_keeps_its_refusal_8855() {
+    set_screen_mode(SecretScreenMode::Refuse);
+    let ph = REDACTION_PLACEHOLDER;
+    let v = PLAIN_VALUE;
+    let rows: [(&str, &str, String, String); 6] = [
+        (
+            "value_at =",
+            KIND_PASSWORD,
+            format!("password={v} tail"),
+            format!("password={ph} tail"),
+        ),
+        (
+            "value_at :",
+            KIND_PASSWORD,
+            format!("password: {v} tail"),
+            format!("password: {ph} tail"),
+        ),
+        (
+            "value_at initializer",
+            KIND_PASSWORD,
+            format!("password: String = \"{v}\";"),
+            format!("password: String = \"{ph}\";"),
+        ),
+        (
+            "value_at ref initializer",
+            KIND_PASSWORD,
+            format!("pwd: &'static str = \"{v}\";"),
+            format!("pwd: &'static str = \"{ph}\";"),
+        ),
+        (
+            "ref-led credential",
+            KIND_PASSWORD,
+            format!("password: &{v}"),
+            format!("password: {ph}"),
+        ),
+        (
+            "authority_end",
+            KIND_URL,
+            format!("postgres://svc:{v}@db.internal/x tail"),
+            format!("postgres://svc:{ph}@db.internal/x tail"),
+        ),
+    ];
+    for (class, kind, input, expected) in rows {
+        assert_eq!(kinds_of(&input), vec![kind], "8855 {class}: {input:?}");
+        assert_eq!(redacted_of(&input), expected, "8855 {class}: {input:?}");
+        let err = validate::validate_content(&input)
+            .map_err(|e| e.to_string())
+            .expect_err("8855: caller funnel must refuse");
+        assert!(
+            err.contains(&expected_reason(kind)),
+            "8855 {class}: want {kind} refusal, got {err:?}"
+        );
+        assert!(!err.contains(v), "8855 {class}: refusal echoed the value");
+        let mem = Memory {
+            namespace: "ns-8855".to_string(),
+            title: "a clean title".to_string(),
+            content: input.clone(),
+            ..Memory::default()
+        };
+        let masked = redact_memory_for_receive(&mem)
+            .unwrap_or_else(|| panic!("8855 {class}: receive must mask {input:?}"));
+        assert_eq!(masked.content, expected, "8855 {class}: receive mask");
+    }
+}
+
+/// Screen a 100K+ input under the ceiling and return its redacted copy.
+fn bounded_redaction(input: String, kind: &'static str) -> String {
+    let o = screen_bounded(input);
+    assert_eq!(
+        hit_kinds(&o),
+        vec![kind],
+        "8855: 100K input must trip {kind}"
+    );
+    match o {
+        ScreenOutcome::Hit { redacted, .. } => redacted,
+        ScreenOutcome::Clean => panic!("8855: 100K input must be refused"),
+    }
+}
+
+/// (d) One 100K+ whitespace-free line per form (`=`, `:`, URL password),
+/// plus a 100K quoted value full of escaped and doubled quotes, each under
+/// [`LINEAR_SCAN_CEILING`] and masked whole.
+#[test]
+fn bound_100k_whitespace_free_line_per_form_8855() {
+    let ph = REDACTION_PLACEHOLDER;
+    let body = repeat_past(BOUND_VALUE_UNIT);
+    assert_eq!(
+        bounded_redaction(format!("password={body}"), KIND_PASSWORD),
+        format!("password={ph}")
+    );
+    assert_eq!(
+        bounded_redaction(format!("password:{body}"), KIND_PASSWORD),
+        format!("password:{ph}")
+    );
+    assert_eq!(
+        bounded_redaction(format!("postgres://svc:{body}@db.internal/x"), KIND_URL),
+        format!("postgres://svc:{ph}@db.internal/x")
+    );
+    let quoted = repeat_past("a\\\"b\"\"c");
+    assert_eq!(
+        bounded_redaction(format!("password=\"{quoted}\""), KIND_PASSWORD),
+        format!("password=\"{ph}\"")
+    );
+}
+
+/// (d) A URL password holding `@`, a quote, a slash and percent-encoding is
+/// masked whole.
+#[test]
+fn url_password_with_at_quote_slash_percent_masked_whole_8855() {
+    let ph = REDACTION_PLACEHOLDER;
+    assert_redacts_exactly(
+        KIND_URL,
+        &[
+            (
+                "postgres://svc:p@ss'w/rd%40x9\"q@db.internal/x tail".into(),
+                format!("postgres://svc:{ph}@db.internal/x tail"),
+            ),
+            (
+                "redis://:a%2Fb@c/d'e@cache:6379/0".into(),
+                format!("redis://:{ph}@cache:6379/0"),
+            ),
+        ],
+    );
+}
+
+/// (e) An accepted shape that holds a password assignment in the same token
+/// is not accepted: the whole value is masked, never the nested secret left.
+#[test]
+fn accepted_shape_never_swallows_a_nested_assignment_8855() {
+    let ph = REDACTION_PLACEHOLDER;
+    let s = ASSIGN_PW;
+    let heads_and_tails: [(&str, &str); 6] = [
+        ("os.environ", ""),
+        ("os.getenv(\"X\")", ""),
+        ("process.env.X", ""),
+        ("<a", ">"),
+        ("${A", "}"),
+        ("Option<", ">"),
+    ];
+    let mut rows = Vec::new();
+    for (head, tail) in heads_and_tails {
+        for sep in ["&", ",", ";"] {
+            for op in ["=", ": "] {
+                rows.push((
+                    format!("password{op}{head}{sep}pwd={s}{tail} rest"),
+                    format!("password{op}{ph} rest"),
+                ));
+            }
+        }
+    }
+    rows.push((
+        format!("password=\"<x&passwd:{s}>\" rest"),
+        format!("password=\"{ph}\" rest"),
+    ));
+    assert_redacts_exactly(KIND_PASSWORD, &rows);
+}
+
+/// (e) Bound: one 100K accepted-shape token chained with nested assignments
+/// is scanned once and masked whole.
+#[test]
+fn bound_100k_nested_assignment_chain_8855() {
+    let chain = repeat_past("&pwd=os.environ");
+    assert_eq!(
+        bounded_redaction(format!("password=os.environ{chain}"), KIND_PASSWORD),
+        format!("password={REDACTION_PLACEHOLDER}")
+    );
+}
