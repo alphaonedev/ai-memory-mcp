@@ -235,8 +235,10 @@ async fn loopback_only_client_sends_nothing_to_env_proxy_4193() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn allow_control_honours_env_proxy_4193() {
-    // Control: under `allow` the legacy client honours HTTP_PROXY, so the
-    // proxy mock sees the request and the direct target sees none.
+    // Control (current behaviour, tracked #9314): under `allow` the client
+    // still honours HTTP_PROXY, so the proxy mock sees the request and the
+    // direct target sees none. This proves the fixture detects a proxied
+    // request; it does not make the `allow` behaviour permanent.
     for (openai, health_path) in [(false, "/api/tags"), (true, "/models")] {
         let (proxy, target) = proxy_and_target(health_path).await;
         let available = {
@@ -364,8 +366,9 @@ fn redirect_targets() -> Vec<(&'static str, String)> {
 /// the leak this issue is about; 301/302/303 are the GET-rewriting forms).
 const REDIRECT_CODES: [u16; 5] = [301, 302, 303, 307, 308];
 
-/// Restricted postures: every one of them must refuse redirects + proxies.
-const RESTRICTED_POSTURES: [&str; 2] = ["loopback-only", "internal-only"];
+/// Restricted postures: every one of them must refuse redirects + proxies
+/// (`deny` included: a CLI verb still builds an inference client under it).
+const RESTRICTED_POSTURES: [&str; 3] = ["loopback-only", "deny", "internal-only"];
 
 /// The exact provider-failure token the caller sees for an unfollowed 3xx.
 fn http_status_token(code: u16) -> String {
@@ -409,6 +412,56 @@ async fn generate_refuses_redirect_to_every_address_class_4193() {
                         "#4193 {posture}/{class}/{code}: exactly one request, to the admitted origin"
                     );
                 }
+            }
+        }
+    }
+}
+
+/// `Location` SPELLINGS (not address classes): each must come back to the
+/// caller as the unfollowed 3xx under every restricted posture. A followed
+/// relative or scheme-relative form would re-enter the admitted mock (a
+/// second request), so the exact one-request count catches it.
+const LOCATION_FORMS: [(&str, &str); 6] = [
+    ("relative-path", "/leak"),
+    ("scheme-relative", "//127.0.0.1:9/leak"),
+    ("ula-v6", "http://[fd00::1]/leak"),
+    ("ipv4-mapped-loopback", "http://[::ffff:127.0.0.1]:9/leak"),
+    ("malformed-bracket", "http://[::1/leak"),
+    ("malformed-scheme", "ht tp://x/leak"),
+];
+
+/// The redirect codes of the Location-form table (307/308 keep the body).
+const LOCATION_FORM_CODES: [u16; 3] = [302, 307, 308];
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn generate_refuses_every_location_form_4193() {
+    for posture in RESTRICTED_POSTURES {
+        for (form, location) in LOCATION_FORMS {
+            for code in LOCATION_FORM_CODES {
+                let target = redirect_to(location, code).await;
+                let err = {
+                    let _env = EnvScope::new(&cell_env(Some(posture), None));
+                    build(true, &target.uri())
+                        .generate_async("p", None)
+                        .await
+                        .expect_err("a 3xx is never a completion")
+                };
+                let rendered = format!("{err:#}");
+                assert!(
+                    rendered.contains(&http_status_token(code)),
+                    "#4193 {posture}/{form}/{code}: the redirect must be returned as {}, \
+                     never followed; got: {rendered}",
+                    http_status_token(code)
+                );
+                assert!(
+                    !rendered.contains("Bearer"),
+                    "#4193 {posture}/{form}/{code}: the error never carries the bearer"
+                );
+                assert_eq!(
+                    target.received_requests().await.unwrap_or_default().len(),
+                    1,
+                    "#4193 {posture}/{form}/{code}: exactly one request, to the admitted origin"
+                );
             }
         }
     }
@@ -501,6 +554,104 @@ async fn every_proxy_var_alone_is_refused_4193() {
             );
             assert_eq!(hits(&target, "/api/tags").await, 1);
         }
+    }
+}
+
+/// The lower-case proxy variables reqwest's system matcher also reads.
+const LOWER_CASE_PROXY_VARS: [&str; 3] = ["http_proxy", "https_proxy", "all_proxy"];
+
+/// A `NO_PROXY` value that covers neither the loopback target nor the proxy:
+/// it must not change the outcome in any posture.
+const UNRELATED_NO_PROXY: &str = "example.invalid,.corp.invalid";
+
+/// The env table with ONLY the lower-case proxy variables set to `proxy`.
+fn lower_case_proxy_env<'a>(
+    posture: Option<&'a str>,
+    proxy: &'a str,
+) -> Vec<(&'static str, Option<&'a str>)> {
+    let mut vars = cell_env(posture, None);
+    for entry in &mut vars {
+        if LOWER_CASE_PROXY_VARS.contains(&entry.0) {
+            entry.1 = Some(proxy);
+        }
+    }
+    vars
+}
+
+/// The env table with every proxy variable set and `NO_PROXY` / `no_proxy`
+/// set to [`UNRELATED_NO_PROXY`].
+fn unrelated_no_proxy_env<'a>(
+    posture: Option<&'a str>,
+    proxy: &'a str,
+) -> Vec<(&'static str, Option<&'a str>)> {
+    let mut vars = cell_env(posture, Some(proxy));
+    for entry in &mut vars {
+        if NO_PROXY_VARS.contains(&entry.0) {
+            entry.1 = Some(UNRELATED_NO_PROXY);
+        }
+    }
+    vars
+}
+
+/// Expected proxy hits per posture: `allow` is the control (current
+/// behaviour, tracked #9314) that proves the fixture sees a proxied request.
+fn expected_proxy_hits(posture: Option<&str>) -> usize {
+    usize::from(posture.is_none())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lower_case_proxy_vars_only_are_refused_4193() {
+    for posture in [
+        None,
+        Some("loopback-only"),
+        Some("deny"),
+        Some("internal-only"),
+    ] {
+        let (proxy, target) = proxy_and_target("/api/tags").await;
+        let available = {
+            let _env = EnvScope::new(&lower_case_proxy_env(posture, &proxy.uri()));
+            build(false, &target.uri()).is_available_async().await
+        };
+        assert!(available, "#4193 {posture:?}: the probe answers 200");
+        let want = expected_proxy_hits(posture);
+        assert_eq!(
+            proxy.received_requests().await.unwrap_or_default().len(),
+            want,
+            "#4193 {posture:?}: lower-case proxy vars only; proxy hits"
+        );
+        assert_eq!(
+            hits(&target, "/api/tags").await,
+            1 - want,
+            "#4193 {posture:?}: direct hits"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn no_proxy_set_to_a_value_does_not_change_the_refusal_4193() {
+    for posture in [
+        None,
+        Some("loopback-only"),
+        Some("deny"),
+        Some("internal-only"),
+    ] {
+        let (proxy, target) = proxy_and_target("/api/tags").await;
+        let available = {
+            let _env = EnvScope::new(&unrelated_no_proxy_env(posture, &proxy.uri()));
+            build(false, &target.uri()).is_available_async().await
+        };
+        assert!(available, "#4193 {posture:?}: the probe answers 200");
+        let want = expected_proxy_hits(posture);
+        assert_eq!(
+            proxy.received_requests().await.unwrap_or_default().len(),
+            want,
+            "#4193 {posture:?}: NO_PROXY={UNRELATED_NO_PROXY}; proxy hits"
+        );
+        assert_eq!(
+            hits(&target, "/api/tags").await,
+            1 - want,
+            "#4193 {posture:?}: direct hits"
+        );
     }
 }
 
@@ -621,26 +772,75 @@ async fn pinned_model_pull_uses_the_pin_3822() {
 /// Bound: a pathological 100K-byte `Location` is returned, not followed,
 /// and the refusal is fast (no resolution or connect of the target).
 const LONG_LOCATION_BYTES: usize = 100_000;
+/// A long `Location` that a client WOULD follow: under the http crate's URI
+/// length limit (about 64 KiB), so a 100K form alone cannot tell "refused"
+/// from "unparseable"; this one points at a live sink.
+const FOLLOWABLE_LONG_LOCATION_BYTES: usize = 60_000;
 const LONG_LOCATION_CEILING: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn huge_location_header_is_refused_fast_4193() {
-    let location = format!("http://169.254.169.254/{}", "a".repeat(LONG_LOCATION_BYTES));
-    let target = redirect_to(&location, 307).await;
-    let started = std::time::Instant::now();
-    let err = {
-        let _env = EnvScope::new(&cell_env(Some("loopback-only"), None));
-        build(true, &target.uri())
-            .generate_async("p", None)
-            .await
-            .expect_err("a 3xx is never a completion")
-    };
-    assert!(
-        started.elapsed() < LONG_LOCATION_CEILING,
-        "#4193: refusal is bounded"
+    let sink = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"choices": []})))
+        .mount(&sink)
+        .await;
+    let followable = format!(
+        "{}/sink?pad={}",
+        sink.uri(),
+        "a".repeat(FOLLOWABLE_LONG_LOCATION_BYTES)
     );
-    assert!(
-        format!("{err:#}").contains(&http_status_token(307)),
-        "got: {err:#}"
+    let oversized = format!(
+        "{}/sink?pad={}",
+        sink.uri(),
+        "a".repeat(LONG_LOCATION_BYTES)
     );
+    for (shape, location) in [
+        ("followable-60k", followable),
+        ("oversized-100k", oversized),
+    ] {
+        let target = redirect_to(&location, 307).await;
+        let started = std::time::Instant::now();
+        let err = {
+            let _env = EnvScope::new(&cell_env(Some("loopback-only"), None));
+            build(true, &target.uri())
+                .generate_async("p", None)
+                .await
+                .expect_err("a 3xx is never a completion")
+        };
+        assert!(
+            started.elapsed() < LONG_LOCATION_CEILING,
+            "#4193 {shape}: refusal is bounded"
+        );
+        assert!(
+            format!("{err:#}").contains(&http_status_token(307)),
+            "#4193 {shape}: got: {err:#}"
+        );
+        assert_eq!(
+            hits(&sink, "/sink").await,
+            0,
+            "#4193 {shape}: the long Location is refused, never followed to the sink"
+        );
+    }
+}
+
+// ─── Leg 8: the pull bodies keep their own ceiling ───────────────────────
+
+/// Both pull bodies reuse the posture-policy client AND override its
+/// generate timeout with `PULL_TIMEOUT` (a removed override would cap a model
+/// pull at the 30 s generate ceiling).
+#[test]
+fn both_pull_bodies_pin_the_pull_timeout_4193() {
+    const PULL_CALL: &str = "self.client.post(&pull_url).timeout(PULL_TIMEOUT)";
+    let llm = read_src("src/llm.rs");
+    for pull_fn in ["fn ensure_model_async(", "fn ensure_embed_model_async("] {
+        let compact: String = fn_body(&llm, pull_fn)
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            compact.contains(PULL_CALL),
+            "#4193: {pull_fn} must call `{PULL_CALL}` (whitespace ignored)"
+        );
+    }
 }
