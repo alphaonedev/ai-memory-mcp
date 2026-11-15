@@ -1663,6 +1663,15 @@ class OptionBRegion(LedgerCase):
         self.assertFalse(ok, out)
         self.assertIn("is frozen while the certification is VOID or EXPIRED at both ends", out)
         self.assertEqual(calls, [])
+        # #9303: a differing region is now refused before the excuse scan, so the row
+        # above no longer reaches the cap. Keep the region byte-identical and put the
+        # base over the cap below the marker: the cap alone must keep the scan from running.
+        doc = with_ledger(head_doc(), self.exact())
+        s = self.scene("VOID", base_doc=doc + pad * (cert.LEDGER_MAX_DOC_BYTES // len(pad) + 1))
+        del calls[:]
+        ok, out = s.judge(self.wire_and_doc(s, doc))
+        self.assertFalse(ok, out)
+        self.assertEqual(calls, [])
 
 
 # #9303 / #9304 / #9305: the tracked cert doc (docs/compliance/...CERTIFICATION.md at HEAD),
