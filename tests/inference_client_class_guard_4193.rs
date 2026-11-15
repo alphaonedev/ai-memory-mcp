@@ -13,12 +13,21 @@
 //! `src/egress.rs`) left every behavioural cell green. This cell walks the
 //! whole source tree instead, so the class itself is guarded.
 //!
-//! Fail-closed by construction:
+//! Forms this guard recognises (it pins exactly these, it does not claim
+//! completeness over every Rust spelling):
 //! * a construction form is matched on the PATH, with or without a call
 //!   (`reqwest::Client::builder` passed as a fn value counts), and a
 //!   renaming import of a construction item (`use reqwest::Client as H`,
-//!   `use reqwest::get`) is a finding of its own, so an alias cannot hide a
-//!   site;
+//!   `use reqwest::get`) is a finding of its own;
+//!
+//! Forms this guard does NOT recognise (latent: no such site exists in
+//! `src/` today; tracked: #9314, the egress lane owes one red-first probe row
+//! each, https://github.com/alphaonedev/ai-memory-mcp/issues/9314#issuecomment-6892371185):
+//! * a typed `Default::default()` that returns a client;
+//! * a crate alias `use reqwest as X;` followed by `X::get(..)`;
+//! * UFCS `<reqwest::Client as Default>::default()`.
+//!
+//! Within the recognised forms the guard is fail-closed:
 //! * only code that is test-only in EVERY build is skipped: an item or
 //!   statement under `#[cfg(test)]` / `#[cfg(all(test, ..))]`, a file
 //!   declared `#[cfg(test)] mod x;` (and the files below it), and a file
@@ -161,7 +170,7 @@ const ALLOWLIST: [Allowed; 10] = [
         file: "src/subscriptions.rs",
         func: "prewarm_dispatch_tls",
         count: 1,
-        reason: "non-inference: webhook TLS warm-up; completes a handshake only, sends no request",
+        reason: "non-inference: webhook TLS warm-up; builds a blocking client only (src/subscriptions.rs:1578-1584), sends no request and opens no connection",
         credential: "none",
         redirect: Redirect::DefaultFollow,
         proxy: Proxy::Disabled,
@@ -1090,7 +1099,7 @@ fn class_guard_detects_every_construction_form_4193() {
             "row `{stmt}`"
         );
     }
-    // A renaming import is a finding of its own (an alias cannot hide a site).
+    // A renaming import of a construction item is a finding of its own (a recognised form; crate aliases are tracked #9314).
     for (use_line, rendered) in [
         (
             "use reqwest::Client as Http;",
