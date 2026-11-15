@@ -45,6 +45,11 @@ line that differs:
 > put the change in a new amendment ledger record or re-issue the certification as LIVE
 > (#6124, 3-agent vote (71472661) v9274-detector)
 
+This reason comes first (#9303): while the region is frozen and differs, the gate names it
+before the banner, Binds-to, STATUS and ledger checks, which would otherwise refuse the
+same change under their own reason at a later line. A region that is byte-identical, or not
+frozen, is judged by those checks as before.
+
 The head of a change holds the marker line exactly once. A range start with no marker
 (the release document) passes only when the whole of it, followed by one blank line, is
 the head's pre-marker region; a start that does not end in a newline is joined with a
@@ -96,6 +101,19 @@ an item line or a blank line is refused, and an item line that reads like a bann
 is refused with "an item line that reads like a STATUS or Binds-to line". Example record:
 `### Amendment 2026-11-14`, a blank line, `- id: AI_MEMORY_FED_EXAMPLE_FLAG`, `- path:
 src/federation/peer.rs`.
+
+## Re-issue work: lines the head detector refuses (#9305)
+
+The head detector (the scan a LIVE end gets) refuses 24 lines of the tracked
+`docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md` above the ledger marker, so its
+result on that document is DUPLICATE at both banner fields. While the document is VOID at
+both ends these lines are frozen and excused as inherited; they are not edited here. The
+re-issue of the certification as LIVE (#6063) must rewrite each of them first, or the head
+detector refuses the re-issue. The test `test_9305_tracked_scan_head_pinned` pins this list,
+so any change to it is seen.
+
+- Binds-to-like lines: `:82`, `:289`, `:971`, `:1339`, `:1588`, `:1589`, `:1609`, `:1630`, `:1878`, `:2024`, `:2084`, `:2117`.
+- STATUS-like lines: `:1612`, `:1629`, `:1780`, `:1843`, `:1885`, `:1972`, `:2025`, `:2077`, `:2083`, `:2084`, `:2090`, `:2115`.
 
 ## Firing records written before the ledger
 
