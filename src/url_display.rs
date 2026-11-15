@@ -441,6 +441,90 @@ mod tests {
         );
     }
 
+    /// Canary carried by every edge row below; no rendering may hold it
+    /// except the documented path-token row.
+    const EDGE_CANARY_8180: &str = "STORECANARY8180";
+
+    /// #8180 / #9307 X-5 - `(input, exact store_url_display rendering)` over
+    /// the edge shapes: IPv6, percent-encoded userinfo, `@` and `:` in the
+    /// password, no scheme (`user:pass@host`), scp-like, empty, whitespace,
+    /// a path token past the database segment, and an opaque `word:REST`.
+    const STORE_URL_EDGE_ROWS_8180: &[(&str, &str)] = &[
+        (
+            "postgres://svc:STORECANARY8180@[::1]:5432/mem",
+            "postgres://[::1]:5432/mem",
+        ),
+        ("postgres://[fe80::1]/mem", "postgres://[fe80::1]/mem"),
+        (
+            "postgres://s%40vc:p%3ASTORECANARY8180@db.example/mem",
+            "postgres://db.example/mem",
+        ),
+        (
+            "postgres://svc:p@STORECANARY8180@db.example/mem",
+            "postgres://db.example/mem",
+        ),
+        (
+            "postgres://svc:p:STORECANARY8180@db.example/mem",
+            "postgres://db.example/mem",
+        ),
+        (
+            "svc:STORECANARY8180@db.example:5432/mem",
+            "<no scheme>://<unparseable>",
+        ),
+        ("svc@db.example:STORECANARY8180", "<no scheme>://<unparseable>"),
+        ("", "<no scheme>://<unparseable>"),
+        (" \t \n", "<no scheme>://<unparseable>"),
+        (
+            "postgres://db.example/mem/STORECANARY8180",
+            "postgres://db.example/mem",
+        ),
+        ("svc:STORECANARY8180", "<no scheme>://<unparseable>"),
+    ];
+
+    #[test]
+    fn store_url_edge_rows_render_exactly_8180() {
+        let mut wrong = Vec::new();
+        for (row, (input, expected)) in STORE_URL_EDGE_ROWS_8180.iter().enumerate() {
+            let rendered = store_url_display(input);
+            if rendered.contains(EDGE_CANARY_8180) {
+                wrong.push(format!("row {row}: the rendering holds the canary"));
+            } else if rendered != *expected {
+                wrong.push(format!("row {row}: got {rendered:?}, want {expected:?}"));
+            }
+        }
+        assert!(wrong.is_empty(), "store_url_display edge rows:\n{}", wrong.join("\n"));
+    }
+
+    /// #8180 / #9307 X-5 - opaque (cannot-be-a-base) inputs: the parser
+    /// cannot place a host, so the text before `:` (a username in the
+    /// `user:pass@host` typo) and the path bytes after it are never shown.
+    const OPAQUE_INPUTS_8180: &[&str] = &[
+        "svc:STORECANARY8180",
+        "svc:STORECANARY8180@db.example:5432/mem",
+        "alice:STORECANARY8180@host.example:8080/p",
+        "word:STORECANARY8180/x?y#z",
+    ];
+
+    #[test]
+    fn opaque_inputs_render_the_fixed_placeholder_8180() {
+        let mut wrong = Vec::new();
+        for input in OPAQUE_INPUTS_8180 {
+            for (name, f) in [
+                ("url_origin", url_origin as fn(&str) -> String),
+                ("url_origin_and_path", url_origin_and_path),
+                ("store_url_display", store_url_display),
+            ] {
+                let rendered = f(input);
+                if rendered.contains(EDGE_CANARY_8180) {
+                    wrong.push(format!("{name}: the rendering holds the canary"));
+                } else if rendered != "<no scheme>://<unparseable>" {
+                    wrong.push(format!("{name}: got {rendered:?}"));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "opaque inputs:\n{}", wrong.join("\n"));
+    }
+
     #[test]
     fn sqlite_store_url_is_a_path_and_renders_verbatim_3711() {
         assert_eq!(

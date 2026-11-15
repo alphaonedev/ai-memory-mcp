@@ -7823,6 +7823,70 @@ mod tests {
         }
     }
 
+    /// Canary carried by the edge rows; only the documented path-token row
+    /// may render it (a peer path is operator config, #3675).
+    const REMOTE_EDGE_CANARY_8180: &str = "REMOTECANARY8180";
+
+    /// #8180 / #9307 X-5 - `(input, exact remote_url_display rendering)`:
+    /// IPv6, percent-encoded userinfo, `@` and `:` in the password, no
+    /// scheme (`user:pass@host`), scp-like, empty, whitespace, a path token
+    /// and an opaque `word:REST`.
+    const REMOTE_URL_EDGE_ROWS_8180: &[(&str, &str)] = &[
+        ("https://[::1]:8443/m", "https://[::1]:8443/m"),
+        (
+            "https://u:REMOTECANARY8180@[::1]:8443/m",
+            "https://[::1]:8443/m",
+        ),
+        (
+            "https://u%40x:p%3AREMOTECANARY8180@peer.example/m",
+            "https://peer.example/m",
+        ),
+        (
+            "https://u:p@REMOTECANARY8180@peer.example/m",
+            "https://peer.example/m",
+        ),
+        (
+            "https://u:p:REMOTECANARY8180@peer.example/m",
+            "https://peer.example/m",
+        ),
+        (
+            "svc:REMOTECANARY8180@peer.example:8080/m",
+            "<no scheme>://<unparseable>",
+        ),
+        (
+            "git@peer.example:REMOTECANARY8180.git",
+            "<no scheme>://<unparseable>",
+        ),
+        ("", "<no scheme>://<unparseable>"),
+        ("  \t ", "<no scheme>://<unparseable>"),
+        (
+            "https://peer.example/hook/REMOTECANARY8180",
+            "https://peer.example/hook/REMOTECANARY8180",
+        ),
+        ("word:REMOTECANARY8180", "<no scheme>://<unparseable>"),
+    ];
+
+    /// Index of the one row whose rendering keeps a path token by design.
+    const REMOTE_PATH_TOKEN_ROW_8180: usize = 9;
+
+    #[test]
+    fn remote_url_display_edge_rows_render_exactly_8180() {
+        let mut wrong = Vec::new();
+        for (row, (input, expected)) in REMOTE_URL_EDGE_ROWS_8180.iter().enumerate() {
+            let rendered = remote_url_display(input);
+            if row != REMOTE_PATH_TOKEN_ROW_8180 && rendered.contains(REMOTE_EDGE_CANARY_8180) {
+                wrong.push(format!("row {row}: the rendering holds the canary"));
+            } else if rendered != *expected {
+                wrong.push(format!("row {row}: got {rendered:?}, want {expected:?}"));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "remote_url_display edge rows:\n{}",
+            wrong.join("\n")
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn remote_capabilities_legacy_v1_renders_not_in_response() {
         // Legacy v0.6.3 capabilities responses don't carry the v2 fields.

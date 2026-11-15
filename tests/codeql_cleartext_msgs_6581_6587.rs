@@ -811,9 +811,17 @@ fn cleartext_msgs_sibling_doctor_remote_url() {
     ));
 }
 
-/// Class cell: the leak-echo rule over every Rust file under the roots.
-#[test]
-fn cleartext_msgs_class_leak_echo_roots() {
+/// Scan raw file bytes: the walk reads bytes, never a `String`, so a file
+/// the guard cannot decode is reported, never skipped.
+fn scan_bytes(rel: &str, bytes: &[u8], secret_bindings: bool) -> Vec<String> {
+    match std::str::from_utf8(bytes) {
+        Ok(src) => scan_text(rel, src, secret_bindings),
+        Err(e) => panic!("guard could not read {rel}: {e}"),
+    }
+}
+
+/// Every Rust file under the class roots, as `(repo-relative path, path)`.
+fn class_files() -> Vec<(String, PathBuf)> {
     let mut files = Vec::new();
     for root in CLASS_ROOTS {
         let path = repo_path(root);
@@ -822,24 +830,62 @@ fn cleartext_msgs_class_leak_echo_roots() {
         }
     }
     files.sort();
+    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    files
+        .into_iter()
+        .map(|path| {
+            let rel = path
+                .strip_prefix(&base)
+                .unwrap_or(&path)
+                .display()
+                .to_string();
+            (rel, path)
+        })
+        .collect()
+}
+
+/// Class cell: the leak-echo rule over every Rust file under the roots.
+#[test]
+fn cleartext_msgs_class_leak_echo_roots() {
+    let files = class_files();
     assert!(
         files.len() > SCANNED_FILES.len(),
         "class roots resolved to {} files",
         files.len()
     );
-    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let mut findings = Vec::new();
-    for path in &files {
-        let rel = path
-            .strip_prefix(&base)
-            .unwrap_or(path)
-            .display()
-            .to_string();
-        let src = std::fs::read_to_string(path)
-            .unwrap_or_else(|e| panic!("guard could not read {rel}: {e}"));
-        findings.extend(scan_text(&rel, &src, false));
+    for (rel, path) in &files {
+        let bytes =
+            std::fs::read(path).unwrap_or_else(|e| panic!("guard could not read {rel}: {e}"));
+        findings.extend(scan_bytes(rel, &bytes, false));
     }
     assert_no_findings(&findings);
+}
+
+/// Files the class roots must reach (#9307 review probe b3: `src/store`
+/// was outside the five roots; `tests/` was never scanned).
+const ROOT_PROBE_FILES: &[&str] = &[
+    "src/store/mod.rs",
+    "src/mcp/mod.rs",
+    "src/main.rs",
+    "tests/codeql_cleartext_msgs_6581_6587.rs",
+];
+
+#[test]
+fn cleartext_msgs_class_roots_cover_src_and_tests() {
+    let files = class_files();
+    let missing: Vec<&str> = ROOT_PROBE_FILES
+        .iter()
+        .copied()
+        .filter(|probe| {
+            assert!(repo_path(probe).is_file(), "probe file {probe} is gone");
+            !files.iter().any(|(rel, _)| rel == probe)
+        })
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "class roots do not reach: {missing:?}"
+    );
 }
 
 /// Table cell: the full secret-binding check over every scanned file, with
@@ -1128,5 +1174,239 @@ fn cleartext_msgs_scanner_linear_on_large_input() {
     assert!(
         elapsed < SCAN_TIME_CEILING,
         "scan took {elapsed:?}, ceiling {SCAN_TIME_CEILING:?}"
+    );
+}
+
+/// One self-test row: the review probe or form it pins, the fixture file
+/// name, the fixture source and the EXACT findings the class rule reports.
+struct ProbeRow {
+    id: &'static str,
+    rel: &'static str,
+    src: &'static str,
+    want: &'static [&'static str],
+}
+
+/// #9307 review probes b1..b7 (REVIEW-9307-code-r1) and one row per
+/// message-producing form the class rule classifies. A clean row has an
+/// empty `want`.
+const PROBE_ROWS: &[ProbeRow] = &[
+    ProbeRow {
+        id: "b1 format! of a credentialed url",
+        rel: "src/handlers/a2a.rs",
+        src: r#"let m = format!("dial {cred_url}");"#,
+        want: &["src/handlers/a2a.rs:1: `format!` message renders secret-valued `cred_url`"],
+    },
+    ProbeRow {
+        id: "b1 tracing::warn!",
+        rel: "src/handlers/a2a.rs",
+        src: r#"tracing::warn!("refused bearer {token}");"#,
+        want: &["src/handlers/a2a.rs:1: `warn!` message renders secret-valued `token`"],
+    },
+    ProbeRow {
+        id: "b1 anyhow::bail!",
+        rel: "src/handlers/a2a.rs",
+        src: r#"anyhow::bail!("refused bearer {token}");"#,
+        want: &["src/handlers/a2a.rs:1: `bail!` message renders secret-valued `token`"],
+    },
+    ProbeRow {
+        id: "b2 control: leak-echo assert",
+        rel: "src/handlers/a2a.rs",
+        src: r#"assert!(!out.contains(token), "leaked {out}");"#,
+        want: &["src/handlers/a2a.rs:1: `assert!` leak check echoes its haystack via `out`"],
+    },
+    ProbeRow {
+        id: "b3 leak-echo assert in src/store",
+        rel: "src/store/mod.rs",
+        src: r#"assert!(!out.contains(token), "leaked {out}");"#,
+        want: &["src/store/mod.rs:1: `assert!` leak check echoes its haystack via `out`"],
+    },
+    ProbeRow {
+        id: "b4 assert_eq! operand under the default message",
+        rel: "src/cli/agents.rs",
+        src: r#"assert_eq!(token, "y");"#,
+        want: &["src/cli/agents.rs:1: `assert_eq!` operand renders secret-valued `token`"],
+    },
+    ProbeRow {
+        id: "b5 member access cfg.api_key",
+        rel: "src/cli/agents.rs",
+        src: r#"assert!(ok, "key was {}", cfg.api_key);"#,
+        want: &["src/cli/agents.rs:1: `assert!` message renders secret-valued `api_key`"],
+    },
+    ProbeRow {
+        id: "b6 compound name api_token",
+        rel: "src/cli/agents.rs",
+        src: r#"assert!(ok, "key was {api_token}");"#,
+        want: &["src/cli/agents.rs:1: `assert!` message renders secret-valued `api_token`"],
+    },
+    ProbeRow {
+        id: "b7 find(..).is_none() leak check",
+        rel: "src/handlers/a2a.rs",
+        src: r#"assert!(out.find(token).is_none(), "leaked {out}");"#,
+        want: &["src/handlers/a2a.rs:1: `assert!` leak check echoes its haystack via `out`"],
+    },
+    ProbeRow {
+        id: "form write!",
+        rel: "x.rs",
+        src: r#"write!(f, "auth {}", self.password)?;"#,
+        want: &["x.rs:1: `write!` message renders secret-valued `password`"],
+    },
+    ProbeRow {
+        id: "form writeln!",
+        rel: "x.rs",
+        src: r#"writeln!(out, "{secret}")?;"#,
+        want: &["x.rs:1: `writeln!` message renders secret-valued `secret`"],
+    },
+    ProbeRow {
+        id: "form panic!",
+        rel: "x.rs",
+        src: r#"panic!("bad {token:?}");"#,
+        want: &["x.rs:1: `panic!` message renders secret-valued `token`"],
+    },
+    ProbeRow {
+        id: "form expect(&format!)",
+        rel: "x.rs",
+        src: r#"x.expect(&format!("no {api_key}"));"#,
+        want: &["x.rs:1: `format!` message renders secret-valued `api_key`"],
+    },
+    ProbeRow {
+        id: "form anyhow!",
+        rel: "x.rs",
+        src: r#"let e = anyhow::anyhow!("bad {}", creds);"#,
+        want: &["x.rs:1: `anyhow!` message renders secret-valued `creds`"],
+    },
+    ProbeRow {
+        id: "form ensure! leak check",
+        rel: "x.rs",
+        src: r#"anyhow::ensure!(!body.contains(token), "leaked {body}");"#,
+        want: &["x.rs:1: `ensure!` leak check echoes its haystack via `body`"],
+    },
+    ProbeRow {
+        id: "form eprintln!",
+        rel: "x.rs",
+        src: r#"eprintln!("using {passphrase}");"#,
+        want: &["x.rs:1: `eprintln!` message renders secret-valued `passphrase`"],
+    },
+    ProbeRow {
+        id: "form println! compound",
+        rel: "x.rs",
+        src: r#"println!("{}", bearer_token);"#,
+        want: &["x.rs:1: `println!` message renders secret-valued `bearer_token`"],
+    },
+    ProbeRow {
+        id: "form tracing field value",
+        rel: "x.rs",
+        src: r#"tracing::info!(peer = %t.token, "rotated");"#,
+        want: &["x.rs:1: `info!` message renders secret-valued `token`"],
+    },
+    ProbeRow {
+        id: "form tracing shorthand field",
+        rel: "x.rs",
+        src: r#"log::debug!(?password, "login");"#,
+        want: &["x.rs:1: `debug!` message renders secret-valued `password`"],
+    },
+    ProbeRow {
+        id: "form debug_assert_eq! operand",
+        rel: "x.rs",
+        src: "debug_assert_eq!(secret, other);",
+        want: &["x.rs:1: `debug_assert_eq!` operand renders secret-valued `secret`"],
+    },
+    ProbeRow {
+        id: "form unterminated format!",
+        rel: "x.rs",
+        src: r#"let m = format!("x {token}""#,
+        want: &["x.rs:1: `format!` is unterminated (fail closed)"],
+    },
+    ProbeRow {
+        id: "clean metadata suffix",
+        rel: "x.rs",
+        src: r#"let m = format!("used {token_count} of {max_tokens}");"#,
+        want: &[],
+    },
+    ProbeRow {
+        id: "clean tracing field key",
+        rel: "x.rs",
+        src: r#"tracing::warn!(token_id = %id, "rotated");"#,
+        want: &[],
+    },
+    ProbeRow {
+        id: "clean size-only operand",
+        rel: "x.rs",
+        src: "assert_eq!(token.len(), 32);",
+        want: &[],
+    },
+    ProbeRow {
+        id: "clean redacted rendering",
+        rel: "x.rs",
+        src: r#"let m = format!("bearer {}", redacted_token);"#,
+        want: &[],
+    },
+    ProbeRow {
+        id: "clean secret name inside a literal",
+        rel: "x.rs",
+        src: r#"assert_eq!(body["token"], expected, "the token field");"#,
+        want: &[],
+    },
+];
+
+/// Every probe row yields exactly its `want` findings under the class rule
+/// (the rule every file under the class roots gets).
+#[test]
+fn cleartext_msgs_scanner_probe_rows_exact() {
+    let mut wrong = Vec::new();
+    for row in PROBE_ROWS {
+        let got = scan_text(row.rel, row.src, false);
+        if got != row.want {
+            wrong.push(format!("[{}] got {got:?}", row.id));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "probe rows with the wrong findings ({}):\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+}
+
+/// 100K+ line bound: lines cycle through four message forms, one finding
+/// each, under a wall-clock ceiling generous enough for a loaded host and
+/// far below what a quadratic scan of this input takes.
+const SCAN_100K_LINES: usize = 100_000;
+const SCAN_100K_TIME_CEILING: Duration = Duration::from_secs(30);
+const MIXED_FORM_LINES: &[&str] = &[
+    "    let m = format!(\"dial {token}\");\n",
+    "    tracing::warn!(peer = %token, \"x\");\n",
+    "    assert_eq!(api_key, \"y\");\n",
+    "    assert!(out.find(secret).is_none(), \"{out}\");\n",
+];
+
+#[test]
+fn cleartext_msgs_scanner_linear_on_100k_mixed_forms() {
+    let big: String = MIXED_FORM_LINES
+        .iter()
+        .cycle()
+        .take(SCAN_100K_LINES)
+        .copied()
+        .collect();
+    assert_eq!(big.lines().count(), SCAN_100K_LINES);
+    let started = Instant::now();
+    let findings = scan_text("big.rs", &big, false);
+    let elapsed = started.elapsed();
+    assert_eq!(findings.len(), SCAN_100K_LINES, "one finding per line");
+    assert!(
+        elapsed < SCAN_100K_TIME_CEILING,
+        "scan took {elapsed:?}, ceiling {SCAN_100K_TIME_CEILING:?}"
+    );
+}
+
+/// Bytes that are not UTF-8: a finding naming the line, never a panic and
+/// never a skip.
+const NON_UTF8_FIXTURE: &[u8] = b"// ok\nlet a = 1;\n\xff\xfe\n";
+
+#[test]
+fn cleartext_msgs_scanner_reports_non_utf8_input() {
+    let got = std::panic::catch_unwind(|| scan_bytes("x.rs", NON_UTF8_FIXTURE, false));
+    assert_eq!(
+        got.ok(),
+        Some(vec!["x.rs:3: file is not UTF-8 (fail closed)".to_string()])
     );
 }
