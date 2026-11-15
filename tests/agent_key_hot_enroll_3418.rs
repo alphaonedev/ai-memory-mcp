@@ -37,8 +37,8 @@
 use std::collections::HashMap;
 
 use ai_memory::handlers::identity_binding::{
-    AgentKeyRefresh, AuthLevel, EnrolledAgentKeys, api_key_sha256_hex, apply_agent_key_refresh,
-    enforce_for_request, refresh_posture_note, resolve_agent_key_refresh_interval,
+    AgentKeyRefresh, AuthLevel, EnrolledAgentKeys, api_key_sha256_hex, enforce_for_request,
+    refresh_agent_keys, refresh_posture_note, resolve_agent_key_refresh_interval,
     resolve_auth_level,
 };
 use axum::http::HeaderMap;
@@ -89,7 +89,7 @@ fn enrollment_takes_effect_without_rebuilding_state_3418() {
 
     // Enroll — the SAME registry instance, as a live refresh would.
     assert!(
-        registry.install(enrolled_map("alice-token", "alice")),
+        registry.mutate(|m| *m = enrolled_map("alice-token", "alice")),
         "installing a different map must report a change"
     );
 
@@ -118,7 +118,10 @@ fn revocation_takes_effect_without_a_restart_3418() {
 
     // Revoke every binding — what `agents revoke-api-key` writes, as the
     // refresh loop would then observe it.
-    assert!(registry.install(HashMap::new()), "revocation is a change");
+    assert!(
+        registry.mutate(|m| *m = HashMap::new()),
+        "revocation is a change"
+    );
 
     assert_eq!(
         resolve_auth_level(&registry, &headers, "alice"),
@@ -151,7 +154,7 @@ fn enforce_refuses_a_revoked_caller_while_others_stay_enrolled_3418() {
     );
 
     // Revoke ONLY alice; bob keeps the registry armed.
-    registry.install(enrolled_map("bob-token", "bob"));
+    registry.mutate(|m| *m = enrolled_map("bob-token", "bob"));
 
     assert!(
         enforce_for_request(
@@ -171,13 +174,13 @@ fn enforce_refuses_a_revoked_caller_while_others_stay_enrolled_3418() {
 #[test]
 fn reinstalling_the_same_map_is_not_a_change_3418() {
     let registry = EnrolledAgentKeys::from_map(enrolled_map("alice-token", "alice"));
-    assert!(!registry.install(enrolled_map("alice-token", "alice")));
+    assert!(!registry.mutate(|m| *m = enrolled_map("alice-token", "alice")));
     assert_eq!(registry.generation(), 0);
 }
 
 /// DEGRADE, never disarm — driven through the REAL funnel the daemon uses.
 ///
-/// [`apply_agent_key_refresh`] is the single place a read result becomes
+/// [`refresh_agent_keys`] is the single place a read result becomes
 /// registry state, so this pins the rule for BOTH backends at once: a failed
 /// read must retain the last known snapshot. Installing an empty map on a
 /// transient store error would make `enforce_for_request` inert in every mode
@@ -185,16 +188,16 @@ fn reinstalling_the_same_map_is_not_a_change_3418() {
 /// blip on the data tier would silently downgrade an `enforce` deployment to
 /// self-asserted identity. Staleness is a bounded, observable degrade;
 /// disarming is a silent one.
-#[test]
-fn a_failed_refresh_keeps_the_last_known_snapshot_3418() {
+#[tokio::test]
+async fn a_failed_refresh_keeps_the_last_known_snapshot_3418() {
     let registry = EnrolledAgentKeys::from_map(enrolled_map("alice-token", "alice"));
     let headers = headers_with_key("alice-token");
     let generation_before = registry.generation();
 
-    let outcome = apply_agent_key_refresh(
-        &registry,
-        Err::<Vec<(String, String)>, _>("store unreachable"),
-    );
+    let outcome = refresh_agent_keys(&registry, || async {
+        Err::<Vec<(String, String)>, _>("store unreachable")
+    })
+    .await;
 
     assert_eq!(
         outcome,
@@ -220,22 +223,23 @@ fn a_failed_refresh_keeps_the_last_known_snapshot_3418() {
 
 /// The funnel reports Installed vs Unchanged, so the refresh loop logs real
 /// transitions instead of one line per poll on a fleet of daemons.
-#[test]
-fn the_refresh_funnel_distinguishes_a_change_from_a_no_op_3418() {
+#[tokio::test]
+async fn the_refresh_funnel_distinguishes_a_change_from_a_no_op_3418() {
     let registry = EnrolledAgentKeys::empty();
     let rows = vec![(api_key_sha256_hex("alice-token"), "alice".to_string())];
 
+    let first = rows.clone();
     assert_eq!(
-        apply_agent_key_refresh(&registry, Ok::<_, String>(rows.clone())),
+        refresh_agent_keys(&registry, || async { Ok::<_, String>(first) }).await,
         AgentKeyRefresh::Installed(1)
     );
     assert_eq!(
-        apply_agent_key_refresh(&registry, Ok::<_, String>(rows)),
+        refresh_agent_keys(&registry, || async { Ok::<_, String>(rows) }).await,
         AgentKeyRefresh::Unchanged(1),
         "re-reading the same set must NOT be reported as a change"
     );
     assert_eq!(
-        apply_agent_key_refresh(&registry, Ok::<_, String>(Vec::new())),
+        refresh_agent_keys(&registry, || async { Ok::<_, String>(Vec::new()) }).await,
         AgentKeyRefresh::Installed(0),
         "a revocation that empties the set is still a change"
     );
