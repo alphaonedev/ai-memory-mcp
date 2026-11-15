@@ -20,6 +20,7 @@
 
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use ai_memory::models::ConfidenceSource;
 use ai_memory::{db, models};
@@ -317,6 +318,13 @@ fn sync_8912_newer_source_still_replaces_older_destination() {
         seed(dest, &mem(&id, "t-8912-fresh", SRC_CONTENT, OLDER));
         seed(src, &mem(&id, "t-8912-fresh", DEST_CONTENT, NEWER));
         let (code, json, stderr) = run_sync(&local, &remote, direction);
+        // N-4: the surviving row first, so a red names the lost update.
+        let row = live_row(dest, &id).expect("row present");
+        assert_eq!(
+            (row.1.as_str(), row.2.as_str()),
+            (DEST_CONTENT, NEWER),
+            "{direction}: the newer source row was lost (destination kept the older copy)"
+        );
         assert_eq!(code, 0, "{direction}: stderr {stderr}");
         assert_eq!(json[written_key].as_u64(), Some(1), "{direction}: {json}");
         assert_eq!(json["refused"].as_u64(), Some(0), "{direction}: {json}");
@@ -325,9 +333,6 @@ fn sync_8912_newer_source_still_replaces_older_destination() {
             Some(0),
             "{direction}: {json}"
         );
-        let row = live_row(dest, &id).expect("row present");
-        assert_eq!(row.1, DEST_CONTENT, "{direction}: newer source must land");
-        assert_eq!(row.2, NEWER, "{direction}");
     }
 }
 
@@ -351,6 +356,13 @@ fn sync_8912_refused_row_is_counted_and_exits_incomplete() {
         seed(dest, &mem(&id, "t-8912-old-title", SRC_CONTENT, OLDER));
         seed(src, &mem(&id, "t-8912-new-title", DEST_CONTENT, NEWER));
         let (code, json, stderr) = run_sync(&local, &remote, direction);
+        // N-4: the surviving row first, so a red names the lost destination row.
+        let row = live_row(dest, &id).expect("dest row kept");
+        assert_eq!(
+            (row.0.as_str(), row.1.as_str(), row.2.as_str()),
+            ("t-8912-old-title", SRC_CONTENT, OLDER),
+            "{direction}: the refused write still replaced the destination row"
+        );
         assert_eq!(json[written_key].as_u64(), Some(0), "{direction}: {json}");
         assert_eq!(json["refused"].as_u64(), Some(1), "{direction}: {json}");
         assert_eq!(code, EXIT_INCOMPLETE, "{direction}: stderr {stderr}");
@@ -358,8 +370,6 @@ fn sync_8912_refused_row_is_counted_and_exits_incomplete() {
             stderr.contains(&format!("sync: refused memory {id}")),
             "{direction}: refused row not named on stderr: {stderr}"
         );
-        let row = live_row(dest, &id).expect("dest row kept");
-        assert_eq!(row.0, "t-8912-old-title", "{direction}");
     }
 }
 
@@ -477,4 +487,99 @@ fn sync_8912_kept_destination_row_is_not_counted_as_applied() {
             "{direction} text: the whole stdout report"
         );
     }
+}
+
+/// N-1 (NOTICE-FIX-9282-r1) — the source copy sits between the destination's
+/// original row and the concurrent writer's row.
+const MID: &str = "2026-03-01T00:00:00+00:00";
+const ORIGINAL_CONTENT: &str = "destination-original-content";
+const CONCURRENT_CONTENT: &str = "concurrent-writer-newer-content";
+/// How long the blocker holds the destination write lock while `sync` runs:
+/// long enough for the process to reach its write, well under the writer's
+/// 5 s `busy_timeout`, so a waiting sync is never refused.
+const LOCK_HOLD: Duration = Duration::from_millis(1500);
+
+/// N-1 — run a REAL `sync` while a second writer holds the destination's
+/// write lock (`BEGIN IMMEDIATE`); once `sync` is waiting, that writer commits
+/// a row NEWER than the source copy and releases the lock. The newer-wins
+/// verdict and the write must be one atomic unit: a verdict read before the
+/// lock (taken from the stale pre-commit row) would let the older source copy
+/// overwrite the concurrent writer's newer row.
+fn interleave_sync(direction: &str) {
+    let dir = tempfile::tempdir().expect("tempdir under TMPDIR");
+    let local = dir.path().join("local.db");
+    let remote = dir.path().join("remote.db");
+    let (dest, src) = if direction == "push" {
+        (&remote, &local)
+    } else {
+        (&local, &remote)
+    };
+    let id = uuid::Uuid::new_v4().to_string();
+    seed(
+        dest,
+        &mem(&id, "t-8912-interleave", ORIGINAL_CONTENT, OLDER),
+    );
+    seed(src, &mem(&id, "t-8912-interleave", SRC_CONTENT, MID));
+    let blocker = db::open(dest).expect("open blocker");
+    blocker
+        .execute_batch("BEGIN IMMEDIATE")
+        .expect("take the destination write lock");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ai-memory"))
+        .env("AI_MEMORY_NO_CONFIG", "1")
+        .env("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0")
+        .args([
+            "--db",
+            local.to_str().expect("utf-8 path"),
+            "--json",
+            "sync",
+        ])
+        .arg(&remote)
+        .args(["--direction", direction])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ai-memory");
+    std::thread::sleep(LOCK_HOLD);
+    assert!(
+        child.try_wait().expect("poll sync").is_none(),
+        "{direction}: sync finished without waiting for the destination write lock"
+    );
+    blocker
+        .execute(
+            "UPDATE memories SET content = ?1, updated_at = ?2, version = version + 1 \
+             WHERE id = ?3",
+            rusqlite::params![CONCURRENT_CONTENT, NEWER, id],
+        )
+        .expect("concurrent newer write");
+    blocker
+        .execute_batch("COMMIT")
+        .expect("commit the concurrent write");
+    let out = child.wait_with_output().expect("sync output");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let row = live_row(dest, &id).expect("destination row present");
+    assert_eq!(
+        row.1, CONCURRENT_CONTENT,
+        "#8912 {direction}: a write decided from a stale read overwrote the newer concurrent row"
+    );
+    assert_eq!(
+        row.2, NEWER,
+        "#8912 {direction}: the newer updated_at was reverted"
+    );
+    assert_eq!(out.status.code(), Some(0), "{direction}: stderr {stderr}");
+}
+
+#[test]
+fn sync_8912_interleave_pull_never_overwrites_concurrent_newer_row() {
+    interleave_sync("pull");
+}
+
+#[test]
+fn sync_8912_interleave_push_never_overwrites_concurrent_newer_row() {
+    interleave_sync("push");
+}
+
+#[test]
+fn sync_8912_interleave_merge_never_overwrites_concurrent_newer_row() {
+    interleave_sync("merge");
 }
