@@ -9,3 +9,6 @@
 
 #[path = "auto_atomise/core.rs"]
 mod core;
+
+#[path = "auto_atomise/tmp_leak_8634.rs"]
+mod tmp_leak_8634;
