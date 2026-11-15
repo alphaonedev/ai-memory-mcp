@@ -567,7 +567,10 @@ async fn sqlite_stale_refresh_cannot_undo_a_rotation_4066() {
 #[tokio::test]
 async fn postgres_stale_refresh_cannot_undo_a_rotation_4066() {
     let Some(url) = postgres_url() else {
-        eprintln!("skip postgres_stale_refresh_cannot_undo_a_rotation_4066: no PG url");
+        eprintln!(
+            "skip postgres_stale_refresh_cannot_undo_a_rotation_4066: \
+             AI_MEMORY_TEST_POSTGRES_URL / AI_MEMORY_TEST_PG_URL unset"
+        );
         return;
     };
     let _g = serial().await;
@@ -612,7 +615,10 @@ async fn sqlite_a_failed_refresh_after_a_revoke_stays_closed_4066() {
 #[tokio::test]
 async fn postgres_a_failed_refresh_after_a_revoke_stays_closed_4066() {
     let Some(url) = postgres_url() else {
-        eprintln!("skip postgres_a_failed_refresh_after_a_revoke_stays_closed_4066: no PG url");
+        eprintln!(
+            "skip postgres_a_failed_refresh_after_a_revoke_stays_closed_4066: \
+             AI_MEMORY_TEST_POSTGRES_URL / AI_MEMORY_TEST_PG_URL unset"
+        );
         return;
     };
     let _g = serial().await;
@@ -692,7 +698,10 @@ async fn sqlite_an_older_load_cannot_overwrite_a_newer_one_4066() {
 #[tokio::test]
 async fn postgres_an_older_load_cannot_overwrite_a_newer_one_4066() {
     let Some(url) = postgres_url() else {
-        eprintln!("skip postgres_an_older_load_cannot_overwrite_a_newer_one_4066: no PG url");
+        eprintln!(
+            "skip postgres_an_older_load_cannot_overwrite_a_newer_one_4066: \
+             AI_MEMORY_TEST_POSTGRES_URL / AI_MEMORY_TEST_PG_URL unset"
+        );
         return;
     };
     let _g = serial().await;
@@ -822,10 +831,16 @@ async fn postgres_a_cli_revoke_racing_two_loads_keeps_the_newer_set_4066() {
     a_cli_revoke_racing_two_loads_keeps_the_newer_set(postgres_fixture(&url).await).await;
 }
 
-/// Keep the helpers referenced on a `sal`-only leg so they cannot rot.
+/// Keep the helpers referenced on a `sal`-only leg so they cannot rot, and say
+/// out loud when the PostgreSQL twins above will skip (X-5, #9302 r1).
 #[test]
 fn postgres_url_helper_is_reachable_4066() {
-    let _ = postgres_url();
+    if postgres_url().is_none() {
+        eprintln!(
+            "skip postgres_url_helper_is_reachable_4066: \
+             AI_MEMORY_TEST_POSTGRES_URL / AI_MEMORY_TEST_PG_URL unset"
+        );
+    }
     let _ = register;
 }
 
@@ -976,36 +991,5 @@ async fn an_older_ticket_cannot_overwrite_a_newer_load_4066() {
             .snapshot()
             .contains_key(&api_key_sha256_hex("tok-a")),
         "the older read must not restore what the newer read dropped"
-    );
-}
-
-/// A bind's optimistic insert carries a ticket taken BEFORE its durable
-/// write. A revoke published in between makes it refuse (`None`): the insert
-/// could otherwise re-arm a key the revoke just removed.
-#[test]
-fn a_bind_ticket_older_than_a_revoke_does_not_rearm_4066() {
-    let registry = EnrolledAgentKeys::from_map(map_of(&[("tok-b", "agent-b")]));
-    let ticket = registry.begin_load();
-    registry.mutate(|m| m.retain(|_, a| a != "agent-a"));
-    let applied = registry.mutate_if_current(ticket, |m| {
-        m.insert(api_key_sha256_hex("tok-a"), "agent-a".to_string());
-    });
-    assert_eq!(applied, None, "a stale bind ticket must not apply");
-    assert!(
-        !registry
-            .snapshot()
-            .contains_key(&api_key_sha256_hex("tok-a"))
-    );
-
-    // A current ticket applies.
-    let ticket = registry.begin_load();
-    let applied = registry.mutate_if_current(ticket, |m| {
-        m.insert(api_key_sha256_hex("tok-a"), "agent-a".to_string());
-    });
-    assert_eq!(applied, Some(true));
-    assert!(
-        registry
-            .snapshot()
-            .contains_key(&api_key_sha256_hex("tok-a"))
     );
 }

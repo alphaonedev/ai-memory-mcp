@@ -1087,7 +1087,9 @@ async fn store_approve(app: &AppState, id: &str, approver: &str) -> Result<Appro
 // ---------------------------------------------------------------------------
 
 /// How the LIVE registry moves after a durable credential write.
-#[derive(Debug, Clone, Copy)]
+///
+/// Not `Copy`/`Clone`: a `Bind` owns its one-shot ticket (#9302 r1).
+#[derive(Debug)]
 enum RegistryChange<'a> {
     /// A bind of `digest` to `agent`. `ticket` MUST have been taken BEFORE the
     /// durable bind was written (#4066): the optimistic insert is only safe if

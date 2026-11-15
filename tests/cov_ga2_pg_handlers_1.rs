@@ -72,10 +72,12 @@ const ADMIN_TOKEN: &str = "cov-ga2-pg-admin-token-0123456789abcdef";
 /// #8494 — live registry holding the admin's enrolled per-agent key.
 fn admin_enrolled_registry() -> Arc<ai_memory::handlers::identity_binding::EnrolledAgentKeys> {
     let registry = Arc::new(ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty());
-    registry.install(std::collections::HashMap::from([(
-        ai_memory::handlers::identity_binding::api_key_sha256_hex(ADMIN_TOKEN),
-        ADMIN_AGENT.to_string(),
-    )]));
+    registry.mutate(|m| {
+        *m = std::collections::HashMap::from([(
+            ai_memory::handlers::identity_binding::api_key_sha256_hex(ADMIN_TOKEN),
+            ADMIN_AGENT.to_string(),
+        )]);
+    });
     registry
 }
 
