@@ -550,7 +550,10 @@ mod tests {
         let signed = sample(now).sign(&ca).expect("sign");
         let wire = signed.to_wire_bytes().expect("wire encode");
         let parsed = SignedCredential::from_wire_bytes(&wire).expect("wire decode");
-        assert_eq!(parsed.credential(), signed.credential());
+        assert!(
+            parsed.credential() == signed.credential(),
+            "decoded credential must match the signed one"
+        );
         parsed
             .verify_against(&ca.verifying_key(), now)
             .expect("re-parsed credential still verifies");
@@ -660,9 +663,9 @@ mod tests {
         let now = 1_900_000_000;
         let subj = subject_key(7);
         let cred = sample(now);
-        assert_eq!(
-            cred.subject_verifying_key().expect("valid point"),
-            subj.verifying_key()
+        assert!(
+            cred.subject_verifying_key().expect("valid point") == subj.verifying_key(),
+            "subject verifying key must match"
         );
     }
 
@@ -748,7 +751,10 @@ mod tests {
         let loaded = SignedCredential::load_from_path(&path)
             .expect("io ok")
             .expect("present");
-        assert_eq!(loaded.credential(), signed.credential());
+        assert!(
+            loaded.credential() == signed.credential(),
+            "loaded credential must match the signed one"
+        );
         loaded
             .verify_against(&ca.verifying_key(), now)
             .expect("loaded credential still verifies");

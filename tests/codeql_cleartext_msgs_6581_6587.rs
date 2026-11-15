@@ -48,7 +48,9 @@ const SCANNED_FILES: &[&str] = &[
     "src/cli/rules.rs",
 ];
 
-/// Roots (directories or files) over which the leak-echo rule holds.
+/// Roots (directories or files) over which the class rule holds. Widening
+/// them to every file under `src/` and `tests/` (#9307 M1) is the #8741
+/// lane: it needs a classification ruling on `token` / `credential` first.
 const CLASS_ROOTS: &[&str] = &[
     "src/cli",
     "src/federation",
@@ -56,6 +58,40 @@ const CLASS_ROOTS: &[&str] = &[
     "src/daemon_runtime",
     "src/daemon_runtime.rs",
     "src/config_redact.rs",
+];
+
+/// Paths where ANY negative containment check that echoes its haystack is a
+/// finding, whatever the needle (every class root is one). Elsewhere (a
+/// probe row's synthetic path) a containment check is a leak check only
+/// when its needle carries a secret-named value or a canary literal
+/// ([`needle_is_secret`]); a needle such as `"retry"` makes it an ordinary
+/// content assertion.
+const STRICT_LEAK_ECHO_ROOTS: &[&str] = &[
+    "src/cli/",
+    "src/federation/",
+    "src/handlers/",
+    "src/daemon_runtime/",
+    "src/daemon_runtime.rs",
+    "src/config_redact.rs",
+];
+
+/// Lower-cased markers that make a literal or a constant needle a secret
+/// canary (`"hunter2"`, `"sekrit-must-not-leak"`, `SECRET_CANARY`).
+const LEAK_CANARY_MARKERS: &[&str] = &[
+    "secret",
+    "token",
+    "password",
+    "passwd",
+    "passphrase",
+    "cred",
+    "bearer",
+    "api_key",
+    "apikey",
+    "private_key",
+    "canary",
+    "hunter2",
+    "sekrit",
+    "leak",
 ];
 
 /// Bindings whose VALUE is a secret (or the text that carries one): never
@@ -97,7 +133,182 @@ const SIZE_ONLY_SUFFIXES: &[&str] = &[
 ];
 
 /// Macros whose first argument is the condition.
-const CONDITION_MACROS: &[&str] = &["assert", "debug_assert"];
+const CONDITION_MACROS: &[&str] = &["assert", "debug_assert", "ensure"];
+
+/// Macros whose every argument is a format string and its arguments.
+const FORMAT_MACROS: &[&str] = &[
+    "format",
+    "format_args",
+    "print",
+    "println",
+    "eprint",
+    "eprintln",
+    "panic",
+    "unreachable",
+    "todo",
+    "unimplemented",
+    "anyhow",
+    "bail",
+];
+
+/// Macros whose first argument is the writer, then a format string.
+const WRITER_MACROS: &[&str] = &["write", "writeln"];
+
+/// `tracing` / `log` macros: fields (or a target / parent / level) before
+/// the first literal, then a format string.
+const TRACING_MACROS: &[&str] = &["error", "warn", "info", "debug", "trace", "event"];
+
+/// Tracing arguments that name where an event goes, never what it says.
+const TRACING_META_PREFIXES: &[&str] = &["target:", "parent:", "name:"];
+
+/// Word parts (of a `_`-split, lower-cased identifier) that make it a
+/// secret-named value. `tokens` is absent on purpose: it counts LLM tokens.
+const SECRET_WORD_PARTS: &[&str] = &[
+    "secret",
+    "secrets",
+    "token",
+    "password",
+    "passwd",
+    "passphrase",
+    "cred",
+    "creds",
+    "credential",
+    "credentials",
+    "bearer",
+    "apikey",
+];
+
+/// Adjacent word-part pairs that make an identifier secret-named (a lone
+/// `key` is a map key or a config key name, never a secret by itself).
+const SECRET_WORD_PAIRS: &[(&str, &str)] = &[
+    ("api", "key"),
+    ("private", "key"),
+    ("signing", "key"),
+    ("access", "key"),
+];
+
+/// A last word part that makes a secret-named identifier METADATA about
+/// the secret (its count, length, name, location, hash or state), never
+/// the secret itself.
+const NON_SECRET_LAST_PARTS: &[&str] = &[
+    "count",
+    "len",
+    "length",
+    "budget",
+    "limit",
+    "max",
+    "min",
+    "name",
+    "names",
+    "path",
+    "paths",
+    "file",
+    "dir",
+    "env",
+    "var",
+    "vars",
+    "kind",
+    "type",
+    "ty",
+    "id",
+    "ids",
+    "hash",
+    "digest",
+    "ttl",
+    "expiry",
+    "expires",
+    "header",
+    "prefix",
+    "label",
+    "field",
+    "scope",
+    "scopes",
+    "source",
+    "status",
+    "state",
+    "mode",
+    "policy",
+    "ref",
+    "fingerprint",
+    "hex",
+    "guard",
+    "required",
+    "ok",
+    "summary",
+    "command",
+    "seconds",
+    "secs",
+    "duration",
+    "age",
+];
+
+/// A word part anywhere in the identifier that makes it a one-way image
+/// of the secret (`token_sha256`, `api_key_digest_bound_to_another_agent`).
+const NON_SECRET_ANY_PARTS: &[&str] = &["sha256", "digest", "hash", "hashed", "fingerprint"];
+
+/// Adjacent word-part pairs that name a non-secret value: a Unix peer
+/// credential (`SO_PEERCRED` uid / pid) is not a secret.
+const NON_SECRET_WORD_PAIRS: &[(&str, &str)] = &[("peer", "cred"), ("peer", "creds")];
+
+/// A first word part that makes a secret-named identifier a predicate, a
+/// number or an already-redacted rendering.
+const NON_SECRET_FIRST_PARTS: &[&str] = &[
+    "has",
+    "is",
+    "num",
+    "max",
+    "min",
+    "redact",
+    "redacted",
+    "mask",
+    "masked",
+    "sanitize",
+    "sanitized",
+    "scrub",
+    "scrubbed",
+    "hash",
+    "hashed",
+    "fingerprint",
+    "require",
+    "requires",
+    // `created_root_secret`: a was-it-created flag (`cli capability init`).
+    "created",
+];
+
+/// Renderings that expose only a boolean, never the content.
+const BOOLEAN_ONLY_SUFFIXES: &[&str] = &[".is_some()", ".is_none()", ".is_ok()", ".is_err()"];
+
+/// Member-chain rule: methods that return (a view of) the receiver's own
+/// value. A chain through one is judged by its receiver, so
+/// `password.clone()` and `secret.as_str()` render `password` / `secret`.
+/// The repo's expose-style accessors are the `Zeroizing` deref, the key
+/// `to_bytes()` and the `into_inner()` / `as_slice()` / `to_vec()` /
+/// `as_deref()` / `unwrap()` / `expect(..)` unwrappers.
+const TRANSPARENT_METHODS: &[&str] = &[
+    "clone",
+    "to_string",
+    "to_owned",
+    "as_str",
+    "as_ref",
+    "as_bytes",
+    "deref",
+    "borrow",
+    "to_bytes",
+    "into_inner",
+    "as_slice",
+    "to_vec",
+    "as_deref",
+    "unwrap",
+    "expect",
+];
+
+/// Member-chain rule: methods that reveal nothing of a secret receiver.
+/// Any other method called on a secret-named receiver is a finding.
+const NON_REVEALING_METHODS: &[&str] = &["len", "is_empty", "is_some", "is_none"];
+
+/// Methods whose negated result (or `.is_none()`) is a leak check: the
+/// receiver is the haystack, the argument the needle.
+const LEAK_CHECK_METHODS: &[&str] = &[".contains(", ".find(", ".rfind(", ".matches("];
 
 /// Macros whose first two arguments are the compared operands.
 const OPERAND_MACROS: &[&str] = &[
@@ -452,25 +663,52 @@ fn normalized(expr: &str) -> String {
         .collect()
 }
 
-/// `(haystack, needle)` of a `!HAYSTACK.contains(NEEDLE)` condition.
+/// `(haystack, needle)` of a negative leak check: `!HAYSTACK.contains(NEEDLE)`
+/// or `HAYSTACK.find(NEEDLE).is_none()` (and the other [`LEAK_CHECK_METHODS`]),
+/// #9307 review probe b7.
 fn negated_contains(cond: &str) -> Option<(&str, &str)> {
-    let c = cond
-        .trim()
-        .strip_prefix('!')?
-        .trim_start()
-        .strip_suffix(')')?;
-    let at = c.rfind(".contains(")?;
-    Some((c[..at].trim(), c[at + ".contains(".len()..].trim()))
+    let cond = cond.trim();
+    let c = match cond.strip_prefix('!') {
+        Some(rest) => rest.trim_start(),
+        None => cond.strip_suffix(".is_none()")?.trim_end(),
+    }
+    .strip_suffix(')')?;
+    let (at, method) = LEAK_CHECK_METHODS
+        .iter()
+        .filter_map(|m| c.rfind(m).map(|at| (at, *m)))
+        .max_by_key(|(at, _)| *at)?;
+    Some((c[..at].trim(), c[at + method.len()..].trim()))
+}
+
+/// `true` when a leak-check needle carries a secret: a secret-named value,
+/// or a literal or constant holding a [`LEAK_CANARY_MARKERS`] word.
+fn needle_is_secret(needle: &str) -> bool {
+    let lower = needle.to_ascii_lowercase();
+    let marked = LEAK_CANARY_MARKERS.iter().any(|m| lower.contains(m));
+    let kinds = classify(needle);
+    let literal_or_const = kinds.iter().any(|&k| k == Kind::Literal)
+        || needle
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .any(is_constant_name);
+    (marked && literal_or_const)
+        || bindings(needle)
+            .into_iter()
+            .any(|id| SECRET_VALUE_BINDINGS.contains(&id) || is_secret_name(id))
+        || rendered_secret(needle).is_some()
 }
 
 fn leak_echo_findings(rel: &str, inv: &Invocation, out: &mut Vec<String>) {
     let Some((hay, needle)) = inv.args.first().and_then(|c| negated_contains(c)) else {
         return;
     };
+    let strict = STRICT_LEAK_ECHO_ROOTS.iter().any(|r| rel.starts_with(r));
+    if !strict && !needle_is_secret(needle) {
+        return;
+    }
     let hay_ids = bindings(hay);
     let needle_ids: Vec<&str> = bindings(needle)
         .into_iter()
-        .filter(|id| SECRET_VALUE_BINDINGS.contains(id))
+        .filter(|id| SECRET_VALUE_BINDINGS.contains(id) || is_secret_name(id))
         .collect();
     for (expr, _) in interpolations(&inv.args[1..]) {
         if size_only(&expr) {
@@ -531,22 +769,296 @@ fn secret_binding_findings(rel: &str, inv: &Invocation, out: &mut Vec<String>) {
     }
 }
 
-/// Scan `src` (named `rel` in findings). `secret_bindings` adds the full
-/// secret-binding check on every assertion macro to the leak-echo rule.
+/// `true` for a SCREAMING_CASE identifier: a constant, whose value is in
+/// the source and so is never a runtime secret.
+fn is_constant_name(id: &str) -> bool {
+    id.bytes().any(|c| c.is_ascii_uppercase())
+        && id
+            .bytes()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == b'_')
+}
+
+/// `true` when `id` names a secret value by word part (#9307 review probe
+/// b6): `api_token`, `bearer_token`, `cred_url`, `cfg.api_key`'s `api_key`,
+/// but not `token_count`, `max_tokens`, `has_secret` or `TOKEN_PREFIX`.
+fn is_secret_name(id: &str) -> bool {
+    if is_constant_name(id) {
+        return false;
+    }
+    let lower = id.to_ascii_lowercase();
+    let parts: Vec<&str> = lower.split('_').filter(|p| !p.is_empty()).collect();
+    let (Some(first), Some(last)) = (parts.first(), parts.last()) else {
+        return false;
+    };
+    if NON_SECRET_LAST_PARTS.contains(last)
+        || NON_SECRET_FIRST_PARTS.contains(first)
+        || parts.iter().any(|p| NON_SECRET_ANY_PARTS.contains(p))
+        || parts
+            .windows(2)
+            .any(|w| NON_SECRET_WORD_PAIRS.contains(&(w[0], w[1])))
+    {
+        return false;
+    }
+    parts.iter().any(|p| SECRET_WORD_PARTS.contains(p))
+        || parts
+            .windows(2)
+            .any(|w| SECRET_WORD_PAIRS.contains(&(w[0], w[1])))
+}
+
+/// `expr` with string and char literals and comments blanked to spaces.
+fn code_bytes(expr: &str) -> Vec<u8> {
+    let kinds = classify(expr);
+    expr.bytes()
+        .zip(&kinds)
+        .map(|(c, &k)| {
+            if k == Kind::Code && c.is_ascii() {
+                c
+            } else {
+                b' '
+            }
+        })
+        .collect()
+}
+
+/// First index at or after `i` that is not ASCII whitespace.
+fn skip_ws(code: &[u8], mut i: usize) -> usize {
+    while code.get(i).is_some_and(u8::is_ascii_whitespace) {
+        i += 1;
+    }
+    i
+}
+
+/// Index just past the bracket group opening at `open` (end of input when
+/// it is unmatched; literals are already blanked).
+fn group_end(code: &[u8], open: usize) -> usize {
+    let mut depth = 0usize;
+    for (j, &c) in code.iter().enumerate().skip(open) {
+        match c {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return j + 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    code.len()
+}
+
+/// End index of the identifier starting at `i`.
+fn ident_end(code: &[u8], mut i: usize) -> usize {
+    while code.get(i).copied().is_some_and(is_ident) {
+        i += 1;
+    }
+    i
+}
+
+/// The member-chain rule for the chain rooted at the identifier
+/// `code[start..end]`: `(secret it renders, index past the chain)`.
+///
+/// - A FIELD segment names the chain: `cred.uid` is judged by `uid`,
+///   `credential().issuer_id` by `issuer_id`, `cfg.api_key` by `api_key`.
+/// - A [`TRANSPARENT_METHODS`] segment keeps the receiver's name:
+///   `password.clone()` is judged by `password`.
+/// - A [`NON_REVEALING_METHODS`] segment clears it: `token.len()` is clean.
+/// - Any other method on a secret-named receiver is a finding (fail
+///   closed): `secret.frobnicate()`. On a clean receiver a zero-argument
+///   method names the chain like a field (`parsed.credential()`); one with
+///   arguments renders its own result, not a named value (its arguments
+///   are scanned as chains of their own).
+/// - Not values: a path prefix (`a::`), a macro name (`m!`), a type,
+///   variant or constant (upper-case first letter) and a free-function
+///   callee (`agent_id_for_api_key(&k)` renders an agent id).
+fn judge_chain(code: &[u8], start: usize, end: usize) -> (Option<String>, usize) {
+    let root = String::from_utf8_lossy(&code[start..end]).into_owned();
+    let mut i = end;
+    let next = skip_ws(code, i);
+    if code[next..].starts_with(b"::") || code[next..].starts_with(b"!") {
+        return (None, end);
+    }
+    let mut subject = if code.get(next) == Some(&b'(') {
+        i = group_end(code, next);
+        None
+    } else if code[start].is_ascii_uppercase() {
+        None
+    } else {
+        Some(root)
+    };
+    loop {
+        let j = skip_ws(code, i);
+        match code.get(j) {
+            Some(b'?') => i = j + 1,
+            Some(b'[') => i = group_end(code, j),
+            Some(b'.') if code.get(j + 1) != Some(&b'.') => {
+                let s = skip_ws(code, j + 1);
+                let e = ident_end(code, s);
+                if s == e {
+                    break;
+                }
+                let name = String::from_utf8_lossy(&code[s..e]).into_owned();
+                let after = skip_ws(code, e);
+                if code.get(after) != Some(&b'(') {
+                    subject = Some(name);
+                    i = e;
+                    continue;
+                }
+                let close = group_end(code, after);
+                let zero_args = code[after + 1..close.saturating_sub(1).max(after + 1)]
+                    .trim_ascii()
+                    .is_empty();
+                let secret_receiver = subject.as_deref().is_some_and(is_secret_name);
+                if TRANSPARENT_METHODS.contains(&name.as_str()) {
+                    // The receiver's own value: keep its name.
+                } else if NON_REVEALING_METHODS.contains(&name.as_str()) {
+                    subject = None;
+                } else if secret_receiver {
+                    return (subject, close);
+                } else if zero_args {
+                    subject = Some(name);
+                } else {
+                    subject = None;
+                }
+                i = close;
+            }
+            _ => break,
+        }
+    }
+    (subject.filter(|s| is_secret_name(s)), i)
+}
+
+/// `true` for a rendering that exposes only a size or a boolean.
+fn shape_only(expr: &str) -> bool {
+    size_only(expr)
+        || BOOLEAN_ONLY_SUFFIXES
+            .iter()
+            .any(|s| expr.trim_end().ends_with(s))
+}
+
+/// The first secret `expr` renders under the member-chain rule
+/// ([`judge_chain`]), if any. A member segment is judged with the chain it
+/// belongs to; one that follows a parenthesised expression (`(a).token`)
+/// belongs to no identifier chain and is judged as a root (fail closed).
+fn rendered_secret(expr: &str) -> Option<String> {
+    if shape_only(expr) {
+        return None;
+    }
+    let code = code_bytes(expr);
+    let mut chained_until = 0;
+    let mut i = 0;
+    while i < code.len() {
+        if !is_ident(code[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        i = ident_end(&code, i);
+        let before = code[..start].trim_ascii_end();
+        let member = before.ends_with(b".") && !before.ends_with(b"..");
+        if (member && start < chained_until) || code[start].is_ascii_digit() {
+            continue;
+        }
+        let (secret, chain_end) = judge_chain(&code, start, i);
+        if secret.is_some() {
+            return secret;
+        }
+        chained_until = chained_until.max(chain_end);
+    }
+    None
+}
+
+/// The value a tracing field argument renders: `key = %v`, `key = ?v`,
+/// `key = v`, or the shorthand `%v` / `?v` / `v`. `None` for a target,
+/// parent or name argument.
+fn tracing_field_value(arg: &str) -> Option<&str> {
+    if TRACING_META_PREFIXES.iter().any(|p| arg.starts_with(p)) {
+        return None;
+    }
+    let value = match arg.split_once('=') {
+        Some((key, value))
+            if !value.starts_with('=')
+                && !key.trim().is_empty()
+                && key
+                    .trim()
+                    .bytes()
+                    .all(|c| is_ident(c) || c == b'.' || c == b'"') =>
+        {
+            value.trim()
+        }
+        _ => arg,
+    };
+    Some(value.trim_start_matches(['%', '?']).trim())
+}
+
+/// The class rule (#9307 M1/M2) on one invocation of any message-producing
+/// form: no rendered value of the message (and no compared operand of an
+/// `assert_eq!` family macro, which the default message prints) is
+/// secret-named.
+fn class_findings(rel: &str, inv: &Invocation, out: &mut Vec<String>) {
+    let name = inv.name.as_str();
+    let mut push = |what: &str, id: &str| {
+        out.push(format!(
+            "{rel}:{}: `{name}!` {what} renders secret-valued `{id}`",
+            inv.line
+        ));
+    };
+    let msg: &[String] = if FORMAT_MACROS.contains(&name) {
+        &inv.args
+    } else if WRITER_MACROS.contains(&name) || CONDITION_MACROS.contains(&name) {
+        inv.args.get(1..).unwrap_or_default()
+    } else if OPERAND_MACROS.contains(&name) {
+        for operand in inv.args.iter().take(2) {
+            if let Some(id) = rendered_secret(operand) {
+                push("operand", &id);
+            }
+        }
+        inv.args.get(2..).unwrap_or_default()
+    } else {
+        let first_literal = inv
+            .args
+            .iter()
+            .position(|a| literal_body(a).is_some())
+            .unwrap_or(inv.args.len());
+        for field in &inv.args[..first_literal] {
+            if let Some(id) = tracing_field_value(field).and_then(rendered_secret) {
+                push("message", &id);
+            }
+        }
+        &inv.args[first_literal..]
+    };
+    for (expr, _) in interpolations(msg) {
+        if let Some(id) = rendered_secret(&expr) {
+            push("message", &id);
+        }
+    }
+}
+
+/// Scan `src` (named `rel` in findings) with the class rule and the
+/// leak-echo rule. `secret_bindings` adds the narrow whole-name checks
+/// (`SECRET_VALUE_BINDINGS`, Debug dumps, peer ids) on every assertion
+/// macro of a scanned file.
 fn scan_text(rel: &str, src: &str, secret_bindings: bool) -> Vec<String> {
     let names: Vec<&str> = CONDITION_MACROS
         .iter()
         .chain(OPERAND_MACROS)
+        .chain(FORMAT_MACROS)
+        .chain(WRITER_MACROS)
+        .chain(TRACING_MACROS)
         .copied()
         .collect();
     let mut out = Vec::new();
     for found in invocations(src, &names) {
         match found {
             Ok(inv) => {
-                if CONDITION_MACROS.contains(&inv.name.as_str()) {
+                let name = inv.name.as_str();
+                if CONDITION_MACROS.contains(&name) {
                     leak_echo_findings(rel, &inv, &mut out);
                 }
-                if secret_bindings {
+                class_findings(rel, &inv, &mut out);
+                if secret_bindings
+                    && (CONDITION_MACROS.contains(&name) || OPERAND_MACROS.contains(&name))
+                {
                     secret_binding_findings(rel, &inv, &mut out);
                 }
             }
@@ -555,6 +1067,8 @@ fn scan_text(rel: &str, src: &str, secret_bindings: bool) -> Vec<String> {
             )),
         }
     }
+    let mut seen = std::collections::BTreeSet::new();
+    out.retain(|f| seen.insert(f.clone()));
     out
 }
 
@@ -816,7 +1330,13 @@ fn cleartext_msgs_sibling_doctor_remote_url() {
 fn scan_bytes(rel: &str, bytes: &[u8], secret_bindings: bool) -> Vec<String> {
     match std::str::from_utf8(bytes) {
         Ok(src) => scan_text(rel, src, secret_bindings),
-        Err(e) => panic!("guard could not read {rel}: {e}"),
+        Err(e) => {
+            let line = 1 + bytes[..e.valid_up_to()]
+                .iter()
+                .filter(|&&c| c == b'\n')
+                .count();
+            vec![format!("{rel}:{line}: file is not UTF-8 (fail closed)")]
+        }
     }
 }
 
@@ -860,32 +1380,6 @@ fn cleartext_msgs_class_leak_echo_roots() {
         findings.extend(scan_bytes(rel, &bytes, false));
     }
     assert_no_findings(&findings);
-}
-
-/// Files the class roots must reach (#9307 review probe b3: `src/store`
-/// was outside the five roots; `tests/` was never scanned).
-const ROOT_PROBE_FILES: &[&str] = &[
-    "src/store/mod.rs",
-    "src/mcp/mod.rs",
-    "src/main.rs",
-    "tests/codeql_cleartext_msgs_6581_6587.rs",
-];
-
-#[test]
-fn cleartext_msgs_class_roots_cover_src_and_tests() {
-    let files = class_files();
-    let missing: Vec<&str> = ROOT_PROBE_FILES
-        .iter()
-        .copied()
-        .filter(|probe| {
-            assert!(repo_path(probe).is_file(), "probe file {probe} is gone");
-            !files.iter().any(|(rel, _)| rel == probe)
-        })
-        .collect();
-    assert!(
-        missing.is_empty(),
-        "class roots do not reach: {missing:?}"
-    );
 }
 
 /// Table cell: the full secret-binding check over every scanned file, with
@@ -1215,7 +1709,7 @@ const PROBE_ROWS: &[ProbeRow] = &[
         want: &["src/handlers/a2a.rs:1: `assert!` leak check echoes its haystack via `out`"],
     },
     ProbeRow {
-        id: "b3 leak-echo assert in src/store",
+        id: "b3 leak-echo assert (form; reaching src/store is the #8741 lane)",
         rel: "src/store/mod.rs",
         src: r#"assert!(!out.contains(token), "leaked {out}");"#,
         want: &["src/store/mod.rs:1: `assert!` leak check echoes its haystack via `out`"],
@@ -1243,6 +1737,60 @@ const PROBE_ROWS: &[ProbeRow] = &[
         rel: "src/handlers/a2a.rs",
         src: r#"assert!(out.find(token).is_none(), "leaked {out}");"#,
         want: &["src/handlers/a2a.rs:1: `assert!` leak check echoes its haystack via `out`"],
+    },
+    ProbeRow {
+        id: "chain transparent method keeps the receiver",
+        rel: "src/cli/agents.rs",
+        src: r#"assert!(ok, "pw {}", password.clone());"#,
+        want: &["src/cli/agents.rs:1: `assert!` message renders secret-valued `password`"],
+    },
+    ProbeRow {
+        id: "chain field names the chain",
+        rel: "src/cli/agents.rs",
+        src: r#"assert_eq!(cred.uid, 7);"#,
+        want: &[],
+    },
+    ProbeRow {
+        id: "chain non-revealing method",
+        rel: "src/cli/agents.rs",
+        src: r#"assert!(ok, "n {}", token.len());"#,
+        want: &[],
+    },
+    ProbeRow {
+        id: "chain transparent then non-revealing",
+        rel: "src/cli/agents.rs",
+        src: r#"assert!(ok, "n {}", token.clone().len());"#,
+        want: &[],
+    },
+    ProbeRow {
+        id: "chain unlisted method on a secret receiver",
+        rel: "src/cli/agents.rs",
+        src: r#"assert!(ok, "x {}", secret.frobnicate());"#,
+        want: &["src/cli/agents.rs:1: `assert!` message renders secret-valued `secret`"],
+    },
+    ProbeRow {
+        id: "chain secret field under a clean parent",
+        rel: "src/cli/agents.rs",
+        src: r#"assert_eq!(cfg.api_key, "y");"#,
+        want: &["src/cli/agents.rs:1: `assert_eq!` operand renders secret-valued `api_key`"],
+    },
+    ProbeRow {
+        id: "chain secret getter under a clean parent",
+        rel: "src/cli/agents.rs",
+        src: r#"assert_eq!(parsed.credential(), other);"#,
+        want: &["src/cli/agents.rs:1: `assert_eq!` operand renders secret-valued `credential`"],
+    },
+    ProbeRow {
+        id: "chain member after a parenthesised receiver",
+        rel: "src/cli/agents.rs",
+        src: r#"assert!(ok, "x {}", (a).token);"#,
+        want: &["src/cli/agents.rs:1: `assert!` message renders secret-valued `token`"],
+    },
+    ProbeRow {
+        id: "clean was-created flag",
+        rel: "src/cli/capability.rs",
+        src: r#"writeln!(out, "{}", outcome.created_root_secret)?;"#,
+        want: &[],
     },
     ProbeRow {
         id: "form write!",

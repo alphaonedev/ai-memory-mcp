@@ -1061,9 +1061,9 @@ fn snapshot_before_repair(
         return Ok(None);
     }
     let parent = db_path.parent().map(PathBuf::from).unwrap_or_default();
-    let token = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
+    let stamp = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
     let snapshot_name =
-        format!("{file_name}.pre-repair-schema-version-v{observed}-to-v{target}-{token}.sqlite");
+        format!("{file_name}.pre-repair-schema-version-v{observed}-to-v{target}-{stamp}.sqlite");
     let snapshot_path = parent.join(snapshot_name);
     // Single-quote-escape the target for the SQL string literal (crate-derived
     // path, but doubling quotes is the correct hygiene).

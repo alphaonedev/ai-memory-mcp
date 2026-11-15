@@ -716,7 +716,7 @@ mod tests {
                 },
             ),
         );
-        assert_ne!(token, narrowed, "attenuation must change the wire form");
+        assert!(token != narrowed, "attenuation must change the wire form");
         // inspect
         env.stdout.clear();
         env.stderr.clear();

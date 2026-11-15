@@ -261,7 +261,10 @@ mod tests {
         let cred = cred_for("region/nyc/node-1", 7, 1);
         let holder = OutboundCredentialHolder::new(Some(cred.clone()));
         let got = holder.current().expect("present");
-        assert_eq!(got.credential(), cred.credential());
+        assert!(
+            got.credential() == cred.credential(),
+            "held credential must be the installed one"
+        );
     }
 
     #[test]
@@ -271,7 +274,10 @@ mod tests {
         holder.store(Some(fresh.clone()));
         let got = holder.current().expect("present");
         assert_eq!(got.credential().subject_agent_id, "node-new");
-        assert_eq!(got.credential(), fresh.credential());
+        assert!(
+            got.credential() == fresh.credential(),
+            "held credential must be the fresh one"
+        );
     }
 
     #[test]
@@ -302,7 +308,10 @@ mod tests {
         let holder = OutboundCredentialHolder::with_chain(Some(leaf), vec![inter.clone()]);
         let got = holder.current_intermediates();
         assert_eq!(got.len(), 1);
-        assert_eq!(got[0].credential(), inter.credential());
+        assert!(
+            got[0].credential() == inter.credential(),
+            "held intermediate must be the installed one"
+        );
     }
 
     #[test]
@@ -313,9 +322,9 @@ mod tests {
         holder.store_intermediates(vec![inter.clone()]);
         assert_eq!(holder.current_intermediates().len(), 1);
         // The leaf slot is untouched by the intermediates swap.
-        assert_eq!(
-            holder.current().expect("leaf present").credential(),
-            leaf.credential()
+        assert!(
+            holder.current().expect("leaf present").credential() == leaf.credential(),
+            "leaf credential must be untouched"
         );
     }
 
@@ -337,9 +346,9 @@ mod tests {
         );
         // Renewing the short-lived leaf leaves the long-lived chain intact.
         assert_eq!(holder.current_intermediates().len(), 1);
-        assert_eq!(
-            holder.current_intermediates()[0].credential(),
-            inter.credential()
+        assert!(
+            holder.current_intermediates()[0].credential() == inter.credential(),
+            "intermediate must be untouched"
         );
     }
 

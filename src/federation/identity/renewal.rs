@@ -266,9 +266,9 @@ mod tests {
         let held = cred_at(1_900_000_000);
         let holder = OutboundCredentialHolder::new(Some(held.clone()));
         assert_eq!(apply_refresh(&holder, None), RenewalOutcome::Unchanged);
-        assert_eq!(
-            holder.current().expect("still held").credential(),
-            held.credential()
+        assert!(
+            holder.current().expect("still held").credential() == held.credential(),
+            "held credential must be unchanged"
         );
     }
 
@@ -280,9 +280,9 @@ mod tests {
             apply_refresh(&holder, Some(fresh.clone())),
             RenewalOutcome::Reloaded
         );
-        assert_eq!(
-            holder.current().expect("now held").credential(),
-            fresh.credential()
+        assert!(
+            holder.current().expect("now held").credential() == fresh.credential(),
+            "held credential must be the reloaded one"
         );
     }
 
