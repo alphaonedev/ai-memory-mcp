@@ -210,6 +210,47 @@ impl SqliteStore {
         crate::storage::get_any(&conn, id).map_err(box_err)
     }
 
+    /// #8907 — the stored document bytes of row `id` (`None` when absent
+    /// or not recall-visible). Concrete-adapter only, like [`Self::get_any`].
+    ///
+    /// # Errors
+    ///
+    /// The boxed storage error on SQL or fail-closed decrypt failure.
+    pub async fn read_document_snapshot(
+        &self,
+        id: &str,
+    ) -> StoreResult<Option<crate::storage::embed_cas::DocumentSnapshot>> {
+        let conn = self.state.lock().await;
+        crate::storage::embed_cas::read_document(&conn, id)
+            .map(|found| found.map(|(_, snapshot)| snapshot))
+            .map_err(box_err)
+    }
+
+    /// #8907 — the compare-and-set vector write of a re-embed: ONE
+    /// statement that lands only while row `id` still holds `expected`.
+    /// Returns the rows affected (`0` = the document moved on, nothing
+    /// written).
+    ///
+    /// # Errors
+    ///
+    /// The record-stop gate, an empty vector or space, a dimension
+    /// mismatch, or the boxed storage error.
+    pub async fn update_embedding_if_document(
+        &self,
+        id: &str,
+        embedding: &[f32],
+        space: &str,
+        expected: &crate::storage::embed_cas::DocumentSnapshot,
+    ) -> StoreResult<u64> {
+        self.gate_record_stop()?;
+        crate::store::reject_unattributed_space("update_embedding", space)?;
+        let conn = self.state.lock().await;
+        let rows =
+            crate::storage::embed_cas::write_embedding(&conn, id, embedding, space, Some(expected))
+                .map_err(box_err)?;
+        Ok(u64::try_from(rows).unwrap_or(u64::MAX))
+    }
+
     /// #1955 R45 — SAL write-funnel gate. Returns
     /// [`StoreError::Stopped`] when the record plane is stopped so the
     /// SAL surface refuses with the typed error (503) rather than the

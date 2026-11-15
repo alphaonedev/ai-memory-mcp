@@ -499,7 +499,7 @@ async fn embed_create_before_lock(
     .unwrap_or_else(|| {
         (
             None,
-            EmbedStatus::Failed("embed task did not complete".to_string()),
+            EmbedStatus::Failed(crate::embeddings::EMBED_TASK_INCOMPLETE_REASON.to_string()),
         )
     })
 }
@@ -1486,6 +1486,18 @@ async fn create_memory_postgres(
         }
     };
 
+    // #8907 X-3 — the postgres twin of the sqlite no-embedder upsert
+    // receipt: a row left with no vector says so (an unreadable vector
+    // reports skipped too, never a silent success).
+    let embed_status = if app.embedder.as_ref().as_ref().is_none()
+        && id != mem.id
+        && !matches!(app.store.get_embedding(&ctx, &id).await, Ok(Some(_)))
+    {
+        crate::embeddings::no_embedder_status()
+    } else {
+        embed_status
+    };
+
     // Local write succeeded. Audit + webhook dispatch fire on local
     // durability REGARDLESS of the quorum outcome — the local write is
     // never rolled back (ADR-0001) — then quorum gates 201 vs 503.
@@ -1972,6 +1984,16 @@ async fn create_memory_write(
     ) {
         Ok(id) => id,
         Err(resp) => return resp,
+    };
+    // #8907 X-3 — an upsert over a live row with no embedder: the receipt
+    // says so when the row ends with no vector (read under the same lock).
+    let embed_status = if app.embedder.as_ref().as_ref().is_none()
+        && actual_id != mem.id
+        && !matches!(db::get_embedding(&lock.0, &actual_id), Ok(Some(_)))
+    {
+        crate::embeddings::no_embedder_status()
+    } else {
+        embed_status
     };
 
     // Drop the DB lock before taking the vector index lock + running

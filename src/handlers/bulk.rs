@@ -624,7 +624,7 @@ async fn embed_bulk_rows(
             // embed failure (rows are still written vectorless and stay
             // keyword-recallable); `embed_offload` already warned + counted.
             None => {
-                degraded = Some("embed task did not complete".to_string());
+                degraded = Some(crate::embeddings::EMBED_TASK_INCOMPLETE_REASON.to_string());
             }
         }
     }

@@ -21484,6 +21484,74 @@ impl PostgresStore {
     }
 }
 
+/// #8907 — the compare-and-set vector write of a re-embed (I-1 of
+/// NOTICE-FIX-9284-r1). Inherent, not on the trait: the HTTP update path
+/// reaches it through [`crate::store::embed_cas`].
+impl PostgresStore {
+    /// The stored document bytes of row `id` (`None` when absent).
+    ///
+    /// # Errors
+    /// The database error.
+    pub async fn read_document_snapshot(
+        &self,
+        id: &str,
+    ) -> StoreResult<Option<crate::storage::embed_cas::DocumentSnapshot>> {
+        let row =
+            sqlx::query("SELECT title, content, encrypted_envelope FROM memories WHERE id = $1")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| to_store_err("read_document_snapshot", e))?;
+        row.map(|r| {
+            Ok(crate::storage::embed_cas::DocumentSnapshot {
+                title: r.try_get("title")?,
+                content: r.try_get("content")?,
+                envelope: r.try_get("encrypted_envelope")?,
+            })
+        })
+        .transpose()
+        .map_err(|e: sqlx::Error| to_store_err("read_document_snapshot", e))
+    }
+
+    /// ONE statement: the vector and its space land only while row `id`
+    /// still holds `expected`. Returns the rows affected; `0` means another
+    /// writer moved the document on and nothing was written.
+    ///
+    /// # Errors
+    /// The record-stop gate, an empty vector or space (#3085), or the
+    /// database error.
+    pub async fn update_embedding_if_document(
+        &self,
+        id: &str,
+        embedding: &[f32],
+        space: &str,
+        expected: &crate::storage::embed_cas::DocumentSnapshot,
+    ) -> StoreResult<u64> {
+        self.gate_record_stop().await?;
+        if embedding.is_empty() {
+            return Err(StoreError::InvalidInput {
+                detail: "update_embedding_if_document: a conditional write needs a vector (#8907)"
+                    .to_string(),
+            });
+        }
+        crate::store::reject_unattributed_space("update_embedding", space)?;
+        let done = sqlx::query(
+            "UPDATE memories SET embedding = $2, embedding_space = $3 WHERE id = $1 \
+             AND title = $4 AND content = $5 AND encrypted_envelope IS NOT DISTINCT FROM $6",
+        )
+        .bind(id)
+        .bind(pgvector::Vector::from(embedding.to_vec()))
+        .bind(space)
+        .bind(&expected.title)
+        .bind(&expected.content)
+        .bind(expected.envelope.as_deref())
+        .execute(&self.pool)
+        .await
+        .map_err(|e| to_store_err("update_embedding_if_document", e))?;
+        Ok(done.rows_affected())
+    }
+}
+
 #[async_trait]
 impl MemoryStore for PostgresStore {
     async fn write_durability(&self) -> StoreResult<crate::write_receipt::WriteDurability> {
@@ -23704,9 +23772,12 @@ impl MemoryStore for PostgresStore {
         space: &str,
     ) -> StoreResult<()> {
         self.gate_record_stop().await?;
+        // #8907 I-3 — an empty vector is "no vector": SQL NULL, never an
+        // empty value.
+        let embedding = embedding.filter(|v| !v.is_empty());
         // #3085 — a REAL vector must carry a REAL space stamp; refuse an
         // empty (unattributed) stamp before the write.
-        if embedding.is_some_and(|v| !v.is_empty()) {
+        if embedding.is_some() {
             crate::store::reject_unattributed_space("update_embedding", space)?;
         }
         let emb_pgvec = embedding.map(|v| pgvector::Vector::from(v.to_vec()));
@@ -24090,13 +24161,17 @@ impl MemoryStore for PostgresStore {
         // #2167 — one space stamps the whole batch (live-minted in one process).
         let space_str = space;
         for (id, vec) in entries {
-            let emb_pgvec = pgvector::Vector::from(vec.clone());
+            // #8907 I-3 — an empty vector is "no vector": SQL NULL for the
+            // vector and its space stamp (the sqlite twin's rule), never a
+            // zero-dim value.
+            let emb_pgvec = (!vec.is_empty()).then(|| pgvector::Vector::from(vec.clone()));
+            let space_val = emb_pgvec.as_ref().map(|_| space_str);
             let res = sqlx::query(
                 "UPDATE memories SET embedding = $2, embedding_space = $3 WHERE id = $1",
             )
             .bind(id)
             .bind(emb_pgvec)
-            .bind(space_str)
+            .bind(space_val)
             .execute(&mut *tx)
             .await
             .map_err(|e| to_store_err("set_embeddings_batch update", e))?;

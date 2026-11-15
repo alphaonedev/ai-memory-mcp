@@ -704,9 +704,12 @@ fn handle_update_inner(
 /// embed decision ([`crate::embeddings::embed_document_with_status`]). The
 /// store layer already cleared the old vector with the text change, so a
 /// failure leaves the row vectorless and the returned degraded status goes
-/// on the receipt; the vector index drops the id either way. A row whose
-/// document moved on between the read and the vector write (another
-/// process) gets its vector cleared again: degrade, never a stale vector.
+/// on the receipt; the vector index drops the id either way. The text and
+/// its stored document bytes come from ONE row read, and the vector lands
+/// through ONE compare-and-set statement
+/// ([`crate::storage::embed_cas::write_embedding`]): when another writer
+/// moved the document on, zero rows match, nothing is written (that
+/// writer's vector stays) and the receipt says `Failed` (I-1, I-2).
 pub(super) fn reembed_changed_row(
     conn: &rusqlite::Connection,
     id: &str,
@@ -714,14 +717,15 @@ pub(super) fn reembed_changed_row(
     vector_index: Option<&dyn VectorSearchIndex>,
 ) -> Result<crate::embeddings::EmbedStatus, String> {
     use crate::embeddings::{EMBED_FAILED_REASON, EmbedStatus};
+    use crate::storage::embed_cas;
     let Some(emb) = embedder else {
         return Ok(crate::embeddings::no_embedder_status());
     };
     if let Some(idx) = vector_index {
         idx.remove(id);
     }
-    let Some(m) =
-        db::get(conn, id).map_err(|e| crate::mcp::error_text::mcp_foreign_err("get", e))?
+    let Some((m, snapshot)) = embed_cas::read_document(conn, id)
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("get", e))?
     else {
         return Err(crate::errors::msg::MEMORY_NOT_FOUND.into());
     };
@@ -731,19 +735,18 @@ pub(super) fn reembed_changed_row(
         return Ok(status);
     };
     let space = emb.space_fingerprint();
-    if let Err(e) = db::set_embedding(conn, id, &vector, &space) {
-        tracing::warn!("update: vector write failed for {id}: {e}");
-        return Ok(EmbedStatus::Failed(EMBED_FAILED_REASON.to_string()));
-    }
-    let still_current = db::get(conn, id)
-        .ok()
-        .flatten()
-        .is_some_and(|now| crate::embeddings::embedding_document(&now.title, &now.content) == text);
-    if !still_current {
-        if let Err(e) = db::set_embedding(conn, id, &[], &space) {
-            tracing::warn!("update: stale vector clear failed for {id}: {e}");
+    match embed_cas::write_embedding(conn, id, &vector, &space, Some(&snapshot)) {
+        Ok(1) => {}
+        Ok(rows) => {
+            tracing::warn!(
+                "update: document of {id} moved on before its vector write ({rows} rows)"
+            );
+            return Ok(EmbedStatus::Failed(EMBED_FAILED_REASON.to_string()));
         }
-        return Ok(EmbedStatus::Failed(EMBED_FAILED_REASON.to_string()));
+        Err(e) => {
+            tracing::warn!("update: vector write failed for {id}: {e}");
+            return Ok(EmbedStatus::Failed(EMBED_FAILED_REASON.to_string()));
+        }
     }
     if let Some(idx) = vector_index {
         idx.insert(id.to_string(), vector);

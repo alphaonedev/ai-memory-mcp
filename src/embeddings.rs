@@ -785,6 +785,17 @@ pub fn oversize_embed_reason(byte_len: usize) -> Option<String> {
 /// error that is not a bounded provider diagnostic (#3648).
 pub const EMBED_FAILED_REASON: &str = "embedding_failed";
 
+/// #8907 X-5 — the `embed_status_reason` of an embed whose input is empty.
+pub const EMPTY_CONTENT_REASON: &str = "empty content";
+
+/// #8907 X-5 — the `embed_status_reason` of an embedder that answered with
+/// an empty vector (stored as no vector: NULL, I-3).
+pub const EMPTY_VECTOR_REASON: &str = "embedder returned empty vector";
+
+/// #8907 X-5 — the `embed_status_reason` of an embed whose blocking task did
+/// not complete (panicked or was cancelled), on every write surface.
+pub const EMBED_TASK_INCOMPLETE_REASON: &str = "embed task did not complete";
+
 /// #8907 — the `embed_status_reason` of a content-changing write on a
 /// surface with no embedder: the store cleared the stale vector and there
 /// is nothing to compute the new one with.
@@ -816,16 +827,13 @@ pub fn embed_document_with_status(
     text: &str,
 ) -> (Option<Vec<f32>>, EmbedStatus) {
     if text.is_empty() {
-        return (None, EmbedStatus::Skipped("empty content".to_string()));
+        return (None, EmbedStatus::Skipped(EMPTY_CONTENT_REASON.to_string()));
     }
     if let Some(reason) = oversize_embed_reason(text.len()) {
         return (None, EmbedStatus::Skipped(reason));
     }
     match embedder.embed(text) {
-        Ok(v) if v.is_empty() => (
-            None,
-            EmbedStatus::Failed("embedder returned empty vector".to_string()),
-        ),
+        Ok(v) if v.is_empty() => (None, EmbedStatus::Failed(EMPTY_VECTOR_REASON.to_string())),
         Ok(v) => (Some(v), EmbedStatus::Indexed),
         Err(e) => {
             // #3648: arbitrary local/remote error chains are not caller-safe.

@@ -88,7 +88,7 @@ pub async fn reembed_changed_document(
         (
             None,
             crate::embeddings::EmbedStatus::Failed(
-                crate::embeddings::EMBED_FAILED_REASON.to_string(),
+                crate::embeddings::EMBED_TASK_INCOMPLETE_REASON.to_string(),
             ),
         )
     })

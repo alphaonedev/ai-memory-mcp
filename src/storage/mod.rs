@@ -4280,8 +4280,8 @@ pub fn update_with_expected_version(
     // #1955 R45 — record-stop fence for the update funnel.
     crate::storage::record_stop::gate_storage_conn(conn)?;
     let mut stmt = conn.prepare_cached(SQL_SELECT_MEMORY_ROW_BY_ID)?;
-    let mut rows = stmt.query_map(params![id], row_to_memory)?;
-    let Some(Ok(existing)) = rows.next() else {
+    let mut rows = stmt.query_map(params![id], embed_cas::row_with_envelope)?;
+    let Some(Ok((existing, pre_envelope))) = rows.next() else {
         return Ok((false, false));
     };
     drop(rows);
@@ -4554,16 +4554,16 @@ pub fn update_with_expected_version(
                     )
                 ),
                 source_uri = COALESCE(?11, source_uri), encrypted_envelope=?14, valid_until = COALESCE(?15, valid_until), version = version + 1,
-                -- #8907 / #8948 — the ONE decision point: a changed embedded
-                -- document (title or content) drops the old vector, dim and
-                -- space in the same statement. The caller re-embeds the new
-                -- document or reports the row degraded; a stale vector never
-                -- outlives the text it was computed from.
-                embedding = CASE WHEN ?16 THEN NULL ELSE embedding END,
-                embedding_dim = CASE WHEN ?16 THEN NULL ELSE embedding_dim END,
-                embedding_space = CASE WHEN ?16 THEN NULL ELSE embedding_space END
+                -- #8907 / #8948 — the ONE decision point, in SQL against the
+                -- OLD row (SET sees the pre-update values): a changed document
+                -- (?16) OR a row that moved on after the pre-read (title,
+                -- content, or envelope vs the pre-read ?17) drops vector, dim
+                -- and space here. Never a stale or foreign vector (I-1).
+                embedding = CASE WHEN ?16 OR title IS NOT ?3 OR content IS NOT ?4 OR encrypted_envelope IS NOT ?17 THEN NULL ELSE embedding END,
+                embedding_dim = CASE WHEN ?16 OR title IS NOT ?3 OR content IS NOT ?4 OR encrypted_envelope IS NOT ?17 THEN NULL ELSE embedding_dim END,
+                embedding_space = CASE WHEN ?16 OR title IS NOT ?3 OR content IS NOT ?4 OR encrypted_envelope IS NOT ?17 THEN NULL ELSE embedding_space END
              WHERE id=?12 AND (?13 IS NULL OR version = ?13)",
-            params![effective_tier.as_str(), namespace, new_title, update_content_to_store, tags_json, priority, confidence, now, expires_at, metadata_json, source_uri, id, expected_version, update_encrypted_envelope, valid_until, content_changed],
+            params![effective_tier.as_str(), namespace, new_title, update_content_to_store, tags_json, priority, confidence, now, expires_at, metadata_json, source_uri, id, expected_version, update_encrypted_envelope, valid_until, content_changed, pre_envelope],
         );
         match update_res {
             Ok(0) => {
@@ -19062,10 +19062,10 @@ pub fn dim_violations(conn: &Connection) -> Result<u64> {
 /// can never hold a vector from one space and a stamp from another.
 const SQL_UPDATE_EMBEDDING_WITH_DIM: &str =
     "UPDATE memories SET embedding = ?1, embedding_dim = ?2, embedding_space = ?3 WHERE id = ?4";
-/// Degenerate empty-vector sibling of [`SQL_UPDATE_EMBEDDING_WITH_DIM`]
-/// (legacy parity: empty embeddings persist with `embedding_dim = NULL`; the
-/// space stamp is NULLed too — no vector, no provenance).
-const SQL_UPDATE_EMBEDDING_NULL_DIM: &str = "UPDATE memories SET embedding = ?1, embedding_dim = NULL, embedding_space = NULL WHERE id = ?2";
+/// Empty-vector sibling of [`SQL_UPDATE_EMBEDDING_WITH_DIM`]: #8907 I-3 —
+/// "no vector" is SQL NULL only (never a header-only BLOB); dim and space
+/// are NULLed with it — no vector, no provenance.
+const SQL_UPDATE_EMBEDDING_NULL_DIM: &str = "UPDATE memories SET embedding = NULL, embedding_dim = NULL, embedding_space = NULL WHERE id = ?1";
 
 /// v1.0.0 #3085 — SQL fragment that selects a row carrying a vector with NO
 /// provenance.
@@ -19135,48 +19135,11 @@ pub fn reject_unattributed_embedding_space(op: &str, space: &str) -> Result<()> 
 ///
 /// Returns [`EmbeddingDimMismatch`] (boxed via anyhow) when the embedding's
 /// dimensionality differs from what the namespace established, or the
-/// underlying SQLite error on failure.
+/// underlying SQLite error on failure. An empty `embedding` clears the vector
+/// to SQL NULL (#8907 I-3). Unconditional: a re-embed of a row another
+/// writer can change uses [`embed_cas::write_embedding`] with a snapshot.
 pub fn set_embedding(conn: &Connection, id: &str, embedding: &[f32], space: &str) -> Result<()> {
-    crate::storage::record_stop::gate_storage_conn(conn)?;
-    // Resolve namespace + check the dim invariant before mutating.
-    let namespace: Option<String> = conn
-        .query_row(
-            "SELECT namespace FROM memories WHERE id = ?1",
-            params![id],
-            |r| r.get(0),
-        )
-        .ok();
-    let attempted = embedding.len();
-    if attempted == 0 {
-        // Empty embeddings are a degenerate case — earlier code accepted
-        // them; preserve that to avoid breaking legacy tests but skip the
-        // dim check. The space stamp is NULLed with the (absent) vector.
-        let bytes = crate::embeddings::encode_embedding_blob(embedding);
-        conn.execute(SQL_UPDATE_EMBEDDING_NULL_DIM, params![bytes, id])?;
-        return Ok(());
-    }
-    // #3085 — a REAL vector must carry a REAL space stamp. Fail closed before
-    // the write rather than persisting the unattributed `''` state.
-    reject_unattributed_embedding_space("set_embedding", space)?;
-    if let Some(ref ns) = namespace
-        && let Some(established) = namespace_embedding_dim(conn, ns)?
-        && established != attempted
-    {
-        return Err(EmbeddingDimMismatch {
-            namespace: ns.clone(),
-            established,
-            attempted,
-        }
-        .into());
-    }
-    let bytes = crate::embeddings::encode_embedding_blob(embedding);
-    let dim_i64 = i64::try_from(attempted).unwrap_or(i64::MAX);
-    // #2167 — vector + dim + space stamped atomically in one statement.
-    conn.execute(
-        SQL_UPDATE_EMBEDDING_WITH_DIM,
-        params![bytes, dim_i64, space, id],
-    )?;
-    Ok(())
+    embed_cas::write_embedding(conn, id, embedding, space, None).map(drop)
 }
 
 /// v0.7.0 Wave-2 A5 (issue #853) — batched embedding writer.
@@ -19272,8 +19235,7 @@ pub fn set_embeddings_batch(
         for (id, embedding) in entries {
             let attempted = embedding.len();
             if attempted == 0 {
-                let bytes = crate::embeddings::encode_embedding_blob(embedding);
-                rows_updated += update_empty.execute(params![bytes, id])?;
+                rows_updated += update_empty.execute(params![id])?;
                 continue;
             }
             if let Some(Some(ns)) = ns_by_id.get(id) {
@@ -19924,11 +19886,11 @@ pub fn set_embeddings_batch_reembed(
         let mut update = conn.prepare(SQL_UPDATE_EMBEDDING_WITH_DIM)?;
         let mut update_empty = conn.prepare(SQL_UPDATE_EMBEDDING_NULL_DIM)?;
         for (id, embedding) in entries {
-            let bytes = crate::embeddings::encode_embedding_blob(embedding);
             if embedding.is_empty() {
-                // Legacy degenerate-case parity with `set_embedding`.
-                rows_updated += update_empty.execute(params![bytes, id])?;
+                // #8907 I-3 — the clear is SQL NULL, as in `set_embedding`.
+                rows_updated += update_empty.execute(params![id])?;
             } else {
+                let bytes = crate::embeddings::encode_embedding_blob(embedding);
                 let dim_i64 = i64::try_from(embedding.len()).unwrap_or(i64::MAX);
                 // #2167 — RE-STAMP the target fingerprint atomically as the
                 // sanctioned G4-bypass replaces each vector (§7): interruption

@@ -1448,8 +1448,11 @@ fn failure_reason_rows(branch: Branch) {
                 return;
             };
             let title = "t3-9284-oversize";
-            let content = "x".repeat(ai_memory::embeddings::EMBED_MAX_BYTES + 1);
+            // The content sits AT the store's content cap (a valid write);
+            // the title pushes the embed document past the embed cap.
+            let content = "x".repeat(ai_memory::models::MAX_CONTENT_SIZE);
             let doc_len = embedding_document(title, &content).len();
+            assert!(doc_len > ai_memory::embeddings::EMBED_MAX_BYTES, "{row}: {doc_len}");
             let (status, receipt) = send(
                 fx.router.clone(),
                 request("POST", "/api/v1/memories", &memory_body(title, &content)),
