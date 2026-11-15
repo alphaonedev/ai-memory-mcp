@@ -340,12 +340,23 @@ fn assignment_operator_len(bytes: &[u8], j: usize) -> Option<usize> {
     }
 }
 
+/// The escape byte inside a quoted value: `\q` and `\\` never close it.
+const QUOTE_ESCAPE: u8 = b'\\';
+
+fn is_line_end(c: u8) -> bool {
+    matches!(c, b'\n' | b'\r')
+}
+
 /// The value that starts at `j` (after blanks): `(start, end, quoted)`.
 /// The only ways a value ends (#8855): ASCII whitespace or the end of input
-/// for an unquoted value; the closing quote, a line end or the end of input
-/// for a value that OPENED with that quote. No other byte ends it, so a
-/// byte inside a credential never cuts the mask short (a per-byte
-/// terminator list fails open for every byte it forgets).
+/// for an unquoted value; for a value that OPENED with a quote, only that
+/// quote, a line end (LF or CR) or the end of input. Inside a quoted value
+/// an escaped byte ([`QUOTE_ESCAPE`] then any byte but a line end) and a
+/// doubled quote are part of the value, so `"a\"b"` and `'a''b'` are masked
+/// whole. No other byte ends a value, so a byte inside a credential never
+/// cuts the mask short (a per-byte terminator list fails open for every
+/// byte it forgets). Every end is an ASCII byte or the end of input, so it
+/// is a char boundary; each byte is read once.
 fn value_at(bytes: &[u8], j: usize) -> (usize, usize, bool) {
     let j = skip_blanks(bytes, j);
     let quote = match bytes.get(j) {
@@ -356,16 +367,55 @@ fn value_at(bytes: &[u8], j: usize) -> (usize, usize, bool) {
     let mut end = start;
     while end < bytes.len() {
         let c = bytes[end];
-        let stop = match quote {
-            Some(q) => c == q || c == b'\n',
-            None => c.is_ascii_whitespace(),
-        };
-        if stop {
-            break;
+        match quote {
+            None if c.is_ascii_whitespace() => break,
+            None => end += 1,
+            Some(_) if is_line_end(c) => break,
+            Some(q) => {
+                let next = bytes.get(end + 1).copied();
+                let escaped = c == QUOTE_ESCAPE && next.is_some_and(|n| !is_line_end(n));
+                if escaped || (c == q && next == Some(q)) {
+                    end += 2;
+                } else if c == q {
+                    break;
+                } else {
+                    end += 1;
+                }
+            }
         }
-        end += 1;
     }
     (start, end, quote.is_some())
+}
+
+/// The operator after a password key that ends at `key_end`: an optional
+/// closing quote (JSON / YAML keys) and subscript bracket
+/// (`config['password']`), optional blanks, then an assignment operator.
+/// Returns the operator position and its length (`None` when there is no
+/// operator, so `passwords are`, `password_hash` and `password == x` fail).
+fn operator_after_key(bytes: &[u8], key_end: usize) -> (usize, Option<usize>) {
+    let mut j = key_end;
+    if matches!(bytes.get(j), Some(b'"' | b'\'')) {
+        j += 1;
+    }
+    if bytes.get(j) == Some(&b']') {
+        j += 1;
+    }
+    j = skip_blanks(bytes, j);
+    (j, assignment_operator_len(bytes, j))
+}
+
+/// True when `bytes[start..end]` holds a password assignment of its own
+/// (`os.environ&pwd=X`, `<x&passwd:X>`). Such a value is never accepted as
+/// a named non-credential shape: the shape would otherwise swallow the
+/// nested secret, since the outer scan resumes past the whole value. One
+/// forward walk; the blanks after a key are walked at most once more.
+fn holds_password_assignment(bytes: &[u8], start: usize, end: usize) -> bool {
+    (start..end).any(|k| {
+        password_key_len_at(bytes, k).is_some_and(|key_len| {
+            let (op_at, op_len) = operator_after_key(bytes, k + key_len);
+            op_len.is_some() && op_at < end
+        })
+    })
 }
 
 /// Bytes a named non-credential shape may carry at its right edge without
@@ -422,19 +472,8 @@ fn password_assignment_spans(content: &str) -> Vec<(usize, usize)> {
             i += 1;
             continue;
         };
-        // Key as a word on its right side: an optional closing quote (JSON
-        // / YAML keys) and subscript bracket (`config['password']`),
-        // optional blanks, then an assignment operator. `passwords are`,
-        // `password_hash` and `password == x` fail here.
-        let mut j = i + key_len;
-        if matches!(bytes.get(j), Some(b'"' | b'\'')) {
-            j += 1;
-        }
-        if bytes.get(j) == Some(&b']') {
-            j += 1;
-        }
-        j = skip_blanks(bytes, j);
-        let Some(op_len) = assignment_operator_len(bytes, j) else {
+        let (j, op_len) = operator_after_key(bytes, i + key_len);
+        let Some(op_len) = op_len else {
             i = j.max(i + key_len);
             continue;
         };
@@ -447,8 +486,11 @@ fn password_assignment_spans(content: &str) -> Vec<(usize, usize)> {
         } else if is_colon && !quoted {
             // The annotation ends at its judged edge, so an initializer
             // search never starts past a `,` that ends the declaration.
+            // An annotation holding a nested assignment
+            // (`Option<&pwd=X>`) is not an annotation.
             let judged = judged_value(&content[start..end]);
-            is_type_annotation(judged).then_some(start + judged.len())
+            (is_type_annotation(judged) && !holds_password_assignment(bytes, start, end))
+                .then_some(start + judged.len())
         } else {
             None
         };
@@ -481,9 +523,13 @@ fn password_assignment_spans(content: &str) -> Vec<(usize, usize)> {
         } else {
             judged_value(&content[start..end])
         };
-        let accepted = value.is_empty()
-            || is_placeholder_value(value)
-            || (!quoted && is_non_credential_unquoted(value));
+        // A named non-credential shape is accepted only when it holds no
+        // password assignment of its own (#8855); else the whole value is
+        // masked, never the nested secret left behind.
+        let accepted = !holds_password_assignment(bytes, start, end)
+            && (value.is_empty()
+                || is_placeholder_value(value)
+                || (!quoted && is_non_credential_unquoted(value)));
         if !accepted {
             spans.push((start, end));
         }
