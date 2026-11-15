@@ -11681,8 +11681,10 @@ legacy_scoring = false
         let _g = env_var_lock();
         // Use a temp dir as $HOME so we don't clobber a real config.
         let tmp = tempfile::tempdir().unwrap();
-        // SAFETY: env mutation serialised by `_g`.
-        unsafe { std::env::set_var("HOME", tmp.path()) };
+        // #8634: restore HOME on drop (also on panic); a HOME left pointing at this
+        // removed tempdir let a later model download recreate it under TMPDIR.
+        let home_guard = crate::test_support::EnvGuard::capture("HOME");
+        home_guard.set(tmp.path().to_str().expect("utf-8 tempdir"));
         // First call writes the file.
         AppConfig::write_default_if_missing();
         let expected = AppConfig::config_path().unwrap();
@@ -11701,6 +11703,8 @@ legacy_scoring = false
         // M9 — process-wide serialization via env_var_lock.
         let _g = env_var_lock();
         let prev_xdg = std::env::var("XDG_CONFIG_HOME").ok();
+        // #8634: restore HOME on drop (also on panic); the test used to leave it at /some/home.
+        let _home_guard = crate::test_support::EnvGuard::capture("HOME");
         // SAFETY: env mutation serialised by `_g`.
         unsafe {
             // Clear XDG_CONFIG_HOME so `dirs::config_dir()` falls back to
@@ -12675,8 +12679,9 @@ legacy_scoring = false
         // mid-mutation.
         let _g = env_var_lock();
         let tmp = tempfile::tempdir().expect("tempdir");
-        // SAFETY: env mutation serialised by `_g`.
-        unsafe { std::env::set_var("HOME", tmp.path()) };
+        // #8634: restore HOME on drop (also on panic), see the sibling test above.
+        let home_guard = crate::test_support::EnvGuard::capture("HOME");
+        home_guard.set(tmp.path().to_str().expect("utf-8 tempdir"));
         AppConfig::write_default_if_missing();
         let written = AppConfig::config_path().expect("config_path resolves");
         let contents = std::fs::read_to_string(&written).expect("default toml written");
