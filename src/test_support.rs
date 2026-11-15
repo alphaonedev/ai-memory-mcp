@@ -1308,3 +1308,55 @@ fn exit_removal_leaves_the_temp_root_empty_8634() {
         "#8634: the child left entries in its TMPDIR: {left:?}"
     );
 }
+
+/// #8634 class A: a temporary SQLite database file that also removes the
+/// `-wal` / `-shm` / `-journal` sidecars a connection leaves behind when the
+/// connection is closed AFTER the file is unlinked (a fixture returned as
+/// `(connection, guard)` drops the guard first, and SQLite then skips deleting
+/// the sidecars of an unlinked database). Derefs to the [`tempfile::NamedTempFile`].
+pub(crate) struct TempDbFile(tempfile::NamedTempFile);
+
+impl TempDbFile {
+    /// # Panics
+    /// When the temporary file cannot be created.
+    pub(crate) fn new() -> Self {
+        Self(tempfile::NamedTempFile::new().expect("tempfile for a test database"))
+    }
+}
+
+impl std::ops::Deref for TempDbFile {
+    type Target = tempfile::NamedTempFile;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Drop for TempDbFile {
+    fn drop(&mut self) {
+        for suffix in SQLITE_SIDECAR_SUFFIXES {
+            let mut sidecar = self.0.path().as_os_str().to_owned();
+            sidecar.push(suffix);
+            let _ = std::fs::remove_file(sidecar);
+        }
+    }
+}
+
+/// #8634: the sidecars of a database whose connection outlives its
+/// [`TempDbFile`] guard are removed with the guard.
+#[test]
+fn temp_db_file_removes_its_sidecars_8634() {
+    let file = TempDbFile::new();
+    let path = file.path().to_path_buf();
+    let mut sidecars = Vec::new();
+    for suffix in SQLITE_SIDECAR_SUFFIXES {
+        let mut sidecar = path.clone().into_os_string();
+        sidecar.push(suffix);
+        std::fs::write(&sidecar, b"x").expect("write sidecar");
+        sidecars.push(std::path::PathBuf::from(sidecar));
+    }
+    drop(file);
+    assert!(!path.exists(), "the main file must be removed");
+    for sidecar in sidecars {
+        assert!(!sidecar.exists(), "{} must be removed", sidecar.display());
+    }
+}

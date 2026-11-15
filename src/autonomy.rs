@@ -1842,8 +1842,8 @@ mod tests {
         }
     }
 
-    fn setup_conn() -> (tempfile::NamedTempFile, Connection) {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+    fn setup_conn() -> (crate::test_support::TempDbFile, Connection) {
+        let tmp = crate::test_support::TempDbFile::new();
         let conn = db::open(tmp.path()).unwrap();
         (tmp, conn)
     }
