@@ -26,7 +26,12 @@
 //! same assertions on an isolated scratch database):
 //!   * `a8947_*`   — the body leg, a table over id spellings;
 //!   * `positive_*` — the owner still gets its own rows, shared rows stay visible;
-//!   * `h2135_*`   — the header leg.
+//!   * `h2135_*`   — the header leg;
+//!   * `m8947_*`   — mode coverage and own-id pins: the full (key kind x
+//!     `X-Agent-Id` x body `agent_id`) table in the shipped default mode, which
+//!     the fix must leave byte-for-byte as the base answers it, and the
+//!     own-claimed-id rows under Enforce;
+//!   * `default_mode_is_the_shipped_default_8947` — names the default mode.
 
 #![cfg(feature = "sal")]
 #![allow(clippy::missing_panics_doc, clippy::too_many_lines)]
@@ -96,7 +101,14 @@ fn seed_rows() -> [Memory; 3] {
 }
 
 /// Enforce router with per-agent keys for A and B plus a shared transport key.
-fn build_router(db: Db, store: Arc<dyn MemoryStore>, backend: StorageBackend) -> axum::Router {
+/// The same router in an explicit identity mode (both `AppState` and
+/// `ApiKeyState` carry it, as the daemon wires them).
+fn build_router_in_mode(
+    db: Db,
+    store: Arc<dyn MemoryStore>,
+    backend: StorageBackend,
+    mode: HttpIdentityMode,
+) -> axum::Router {
     ai_memory::handlers::admin_role::mark_request_authn_configured(true);
     let mut enrolled = HashMap::new();
     enrolled.insert(api_key_sha256_hex(KEY_A), AGENT_A.to_string());
@@ -136,19 +148,23 @@ fn build_router(db: Db, store: Arc<dyn MemoryStore>, backend: StorageBackend) ->
         runtime: ai_memory::runtime_context::RuntimeContext::global_arc(),
         max_page_size: ai_memory::handlers::MAX_BULK_SIZE,
         enrolled_agent_keys: enrolled.clone(),
-        http_identity_mode: HttpIdentityMode::Enforce,
+        http_identity_mode: mode,
     };
     let api_key_state = ApiKeyState {
         key: Some(SHARED_KEY.to_string()),
         mtls_enforced: false,
         enrolled_agent_keys: enrolled,
-        identity_mode: HttpIdentityMode::Enforce,
+        identity_mode: mode,
         ..Default::default()
     };
     ai_memory::build_router(api_key_state, app_state)
 }
 
 fn sqlite_router(dir: &tempfile::TempDir) -> axum::Router {
+    sqlite_router_in_mode(dir, HttpIdentityMode::Enforce)
+}
+
+fn sqlite_router_in_mode(dir: &tempfile::TempDir, mode: HttpIdentityMode) -> axum::Router {
     let db_path = dir.path().join("session-start-8947.db");
     let conn = ai_memory::db::open(&db_path).expect("db::open");
     for m in seed_rows() {
@@ -163,7 +179,7 @@ fn sqlite_router(dir: &tempfile::TempDir) -> axum::Router {
     )));
     let store: Arc<dyn MemoryStore> =
         Arc::new(ai_memory::store::sqlite::SqliteStore::open(&db_path).expect("open SqliteStore"));
-    build_router(db, store, StorageBackend::Sqlite)
+    build_router_in_mode(db, store, StorageBackend::Sqlite, mode)
 }
 
 /// One `session_start` call. `key` is the `x-api-key` value, `x_agent` the
@@ -321,6 +337,132 @@ async fn cell_h2135_header_leg_shared_key(router: &axum::Router) {
     }
 }
 
+/// One request of a (mode x key kind x header x body) table with its expected
+/// answer: exact status, exact error code or text (`None` = no error field), and
+/// whether the rows of A and B appear in the response.
+struct Row {
+    key: &'static str,
+    header: Option<&'static str>,
+    body: Option<&'static str>,
+    status: StatusCode,
+    err: Option<&'static str>,
+    sees_a: bool,
+    sees_b: bool,
+}
+
+const fn row(
+    key: &'static str,
+    header: Option<&'static str>,
+    body: Option<&'static str>,
+    status: StatusCode,
+    err: Option<&'static str>,
+    sees_a: bool,
+    sees_b: bool,
+) -> Row {
+    Row {
+        key,
+        header,
+        body,
+        status,
+        err,
+        sees_a,
+        sees_b,
+    }
+}
+
+const NONE: Option<&str> = None;
+const HDR_A: Option<&str> = Some(AGENT_A);
+const HDR_B: Option<&str> = Some(AGENT_B);
+
+/// Run every row of `rows` against `router`; `label` names the table in
+/// failures. Every row is checked and every mismatch is reported together, so a
+/// failing run names each differing row, not only the first.
+async fn run_rows(router: &axum::Router, label: &str, rows: &[Row]) {
+    let mut mismatches: Vec<String> = Vec::new();
+    for r in rows {
+        let ctx = format!(
+            "{label} key={} header={:?} body={:?}",
+            r.key, r.header, r.body
+        );
+        let (status, parsed, raw) = call(router, r.key, r.header, r.body).await;
+        let err = parsed["error"].as_str();
+        let err_ok = match r.err {
+            Some(want) => err.unwrap_or_default().contains(want),
+            None => parsed["error"].is_null(),
+        };
+        let sees_a = raw.contains(MARKER_A_PRIVATE);
+        let sees_b = raw.contains(MARKER_B_PRIVATE);
+        // A caller whose key proves A (or that is refused) never sees B.
+        let b_leak = sees_b && (r.key == KEY_A || status != StatusCode::OK);
+        if status != r.status || !err_ok || sees_a != r.sees_a || sees_b != r.sees_b || b_leak {
+            mismatches.push(format!(
+                "{ctx}: want status={} err={:?} a={} b={}; got status={} err={err:?} a={sees_a} b={sees_b}",
+                r.status.as_u16(),
+                r.err,
+                r.sees_a,
+                r.sees_b,
+                status.as_u16(),
+            ));
+        }
+    }
+    assert!(
+        mismatches.is_empty(),
+        "{} of {} rows differ:\n{}",
+        mismatches.len(),
+        rows.len(),
+        mismatches.join("\n")
+    );
+}
+
+/// The shipped default mode answers every (key kind x header x body) request
+/// exactly as the base did: the #8947 fix only acts under Enforce. The shared
+/// key rows that show a private row are the documented Advisory behaviour (a
+/// merely-claimed principal draws a warning, not a refusal).
+async fn cell_m8947_default_mode_matrix(router: &axum::Router) {
+    let ok = StatusCode::OK;
+    let bad = StatusCode::BAD_REQUEST;
+    let mismatch = Some(ERR_BODY_HEADER_MISMATCH);
+    let rows = [
+        row(SHARED_KEY, NONE, NONE, ok, None, false, false),
+        row(SHARED_KEY, NONE, HDR_A, ok, None, true, false),
+        row(SHARED_KEY, NONE, HDR_B, ok, None, false, true),
+        row(SHARED_KEY, HDR_A, NONE, ok, None, true, false),
+        row(SHARED_KEY, HDR_A, HDR_A, ok, None, true, false),
+        row(SHARED_KEY, HDR_A, HDR_B, bad, mismatch, false, false),
+        row(SHARED_KEY, HDR_B, NONE, ok, None, false, true),
+        row(SHARED_KEY, HDR_B, HDR_A, bad, mismatch, false, false),
+        row(SHARED_KEY, HDR_B, HDR_B, ok, None, false, true),
+        row(KEY_A, NONE, NONE, ok, None, true, false),
+        row(KEY_A, NONE, HDR_A, ok, None, true, false),
+        row(KEY_A, NONE, HDR_B, bad, mismatch, false, false),
+        row(KEY_A, HDR_A, NONE, ok, None, true, false),
+        row(KEY_A, HDR_A, HDR_A, ok, None, true, false),
+        row(KEY_A, HDR_A, HDR_B, bad, mismatch, false, false),
+        row(KEY_A, HDR_B, NONE, ok, None, true, false),
+        row(KEY_A, HDR_B, HDR_A, ok, None, true, false),
+        row(KEY_A, HDR_B, HDR_B, bad, mismatch, false, false),
+    ];
+    run_rows(router, "m8947 default-mode", &rows).await;
+}
+
+/// Under Enforce a caller naming ITS OWN claimed id: a per-agent key for A keeps
+/// working with the id in the header, the body, or both; a shared key proves no
+/// agent, so every spelling that names one is refused.
+async fn cell_m8947_enforce_own_id_matrix(router: &axum::Router) {
+    let ok = StatusCode::OK;
+    let denied = StatusCode::FORBIDDEN;
+    let attested = Some(ERR_ATTESTED_REQUIRED);
+    let rows = [
+        row(KEY_A, HDR_A, HDR_A, ok, None, true, false),
+        row(KEY_A, NONE, HDR_A, ok, None, true, false),
+        row(KEY_A, HDR_A, NONE, ok, None, true, false),
+        row(SHARED_KEY, HDR_A, HDR_A, denied, attested, false, false),
+        row(SHARED_KEY, NONE, HDR_A, denied, attested, false, false),
+        row(SHARED_KEY, HDR_A, NONE, denied, attested, false, false),
+    ];
+    run_rows(router, "m8947 enforce own-id", &rows).await;
+}
+
 // ---------------------------------------------------------------------------
 // SQLite cells
 // ---------------------------------------------------------------------------
@@ -361,6 +503,28 @@ async fn h2135_sqlite_shared_key_header_is_refused() {
     cell_h2135_header_leg_shared_key(&sqlite_router(&dir)).await;
 }
 
+#[test]
+fn default_mode_is_the_shipped_default_8947() {
+    // `HttpIdentityMode` derives `Default` with `#[default] Advisory`
+    // (src/config.rs); the matrix below is built from `default()`, never a
+    // hard-coded variant.
+    assert_eq!(HttpIdentityMode::default(), HttpIdentityMode::Advisory);
+    assert_eq!(HttpIdentityMode::default().as_str(), "advisory");
+}
+
+#[tokio::test]
+async fn m8947_sqlite_default_mode_matrix_is_unchanged() {
+    let dir = scratch_dir();
+    let router = sqlite_router_in_mode(&dir, HttpIdentityMode::default());
+    cell_m8947_default_mode_matrix(&router).await;
+}
+
+#[tokio::test]
+async fn m8947_sqlite_enforce_own_id_matrix() {
+    let dir = scratch_dir();
+    cell_m8947_enforce_own_id_matrix(&sqlite_router(&dir)).await;
+}
+
 // ---------------------------------------------------------------------------
 // PostgreSQL cells (isolated scratch database; self-skip without a URL)
 // ---------------------------------------------------------------------------
@@ -372,9 +536,10 @@ mod pg_barrier;
 #[cfg(feature = "sal-postgres")]
 mod postgres_cells {
     use super::{
-        Arc, Db, MemoryStore, ResolvedTtl, StorageBackend, build_router,
+        Arc, Db, HttpIdentityMode, MemoryStore, ResolvedTtl, StorageBackend, build_router_in_mode,
         cell_a8947_body_leg_per_agent_key, cell_a8947_body_leg_shared_key, cell_h2135_header_leg,
-        cell_h2135_header_leg_shared_key, cell_positive, pg_barrier, seed_rows,
+        cell_h2135_header_leg_shared_key, cell_m8947_default_mode_matrix,
+        cell_m8947_enforce_own_id_matrix, cell_positive, pg_barrier, seed_rows,
     };
     use ai_memory::store::CallerContext;
     use ai_memory::store::postgres::PostgresStore;
@@ -390,6 +555,12 @@ mod postgres_cells {
     }
 
     async fn pg_router() -> Option<(pg_barrier::ScratchDb, axum::Router)> {
+        pg_router_in_mode(HttpIdentityMode::Enforce).await
+    }
+
+    async fn pg_router_in_mode(
+        mode: HttpIdentityMode,
+    ) -> Option<(pg_barrier::ScratchDb, axum::Router)> {
         permissive_attestation_for_tests();
         let Ok(url) = std::env::var("AI_MEMORY_TEST_POSTGRES_URL") else {
             eprintln!("SKIP: AI_MEMORY_TEST_POSTGRES_URL not set");
@@ -414,7 +585,7 @@ mod postgres_cells {
             ResolvedTtl::default(),
             true,
         )));
-        let router = build_router(db, store, StorageBackend::Postgres);
+        let router = build_router_in_mode(db, store, StorageBackend::Postgres, mode);
         Some((scratch, router))
     }
 
@@ -449,5 +620,21 @@ mod postgres_cells {
         };
         cell_h2135_header_leg(&router).await;
         cell_h2135_header_leg_shared_key(&router).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn m8947_pg_default_mode_matrix_is_unchanged() {
+        let Some((_scratch, router)) = pg_router_in_mode(HttpIdentityMode::default()).await else {
+            return;
+        };
+        cell_m8947_default_mode_matrix(&router).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn m8947_pg_enforce_own_id_matrix() {
+        let Some((_scratch, router)) = pg_router().await else {
+            return;
+        };
+        cell_m8947_enforce_own_id_matrix(&router).await;
     }
 }
