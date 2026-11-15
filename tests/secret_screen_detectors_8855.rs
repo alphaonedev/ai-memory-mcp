@@ -631,3 +631,161 @@ negative_cell!(
     neg_prose_mention_backtick_empty_value_8855,
     "Set `password=` and `pwd:` in the file; see `redis://host:6379`."
 );
+
+// ── r4 class invariant: no byte inside a value ends it early ──────────────
+//
+// For EVERY printable ASCII byte b (and one multi-byte character) a value
+// `abc<b>def123456` in the `=` form, the `:` form and as a URL password is
+// refused, and the redacted copy holds no byte of the value. A value ends
+// only at whitespace, the end of the line, or the closing quote of a value
+// that opened with that same quote.
+
+/// Every printable non-blank ASCII byte (0x21 `!` through 0x7E `~`).
+const INNER_BYTE_RANGE: std::ops::RangeInclusive<u8> = 0x21..=0x7E;
+/// The value bytes before the probed byte.
+const VALUE_HEAD: &str = "abc";
+/// The value bytes after the probed byte (the secret tail).
+const VALUE_TAIL: &str = "def123456";
+/// Context after the value, separated by a blank: it must survive.
+const AFTER_VALUE: &str = " tail";
+/// The multi-byte probe (3-byte UTF-8 code point).
+const MULTIBYTE_INNER: char = '密';
+
+/// The three value forms: `(name, kind, content for value v, expected
+/// redaction)`.
+fn value_forms(v: &str) -> [(&'static str, &'static str, String, String); 3] {
+    let ph = REDACTION_PLACEHOLDER;
+    [
+        (
+            "equals",
+            KIND_PASSWORD,
+            format!("password={v}{AFTER_VALUE}"),
+            format!("password={ph}{AFTER_VALUE}"),
+        ),
+        (
+            "colon",
+            KIND_PASSWORD,
+            format!("password: {v}{AFTER_VALUE}"),
+            format!("password: {ph}{AFTER_VALUE}"),
+        ),
+        (
+            "url_password",
+            KIND_URL,
+            format!("postgres://svc:{v}@db.internal/x{AFTER_VALUE}"),
+            format!("postgres://svc:{ph}@db.internal/x{AFTER_VALUE}"),
+        ),
+    ]
+}
+
+/// Run one form over every byte of [`INNER_BYTE_RANGE`]; return the bytes
+/// (as chars) whose refusal kind or exact redaction is wrong.
+fn failing_inner_bytes(form: &str) -> Vec<char> {
+    let mut failing = Vec::new();
+    for b in INNER_BYTE_RANGE {
+        let v = format!("{VALUE_HEAD}{}{VALUE_TAIL}", char::from(b));
+        for (name, kind, input, expected) in value_forms(&v) {
+            if name != form {
+                continue;
+            }
+            if kinds_of(&input) != vec![kind] || redacted_of(&input) != expected {
+                failing.push(char::from(b));
+            }
+        }
+    }
+    failing
+}
+
+#[test]
+fn inner_byte_class_equals_form_masked_whole_8855() {
+    let failing = failing_inner_bytes("equals");
+    assert!(
+        failing.is_empty(),
+        "8855: `password=abc<b>def123456` cut early for bytes {failing:?}"
+    );
+}
+
+#[test]
+fn inner_byte_class_colon_form_masked_whole_8855() {
+    let failing = failing_inner_bytes("colon");
+    assert!(
+        failing.is_empty(),
+        "8855: `password: abc<b>def123456` cut early for bytes {failing:?}"
+    );
+}
+
+#[test]
+fn inner_byte_class_url_password_masked_whole_8855() {
+    let failing = failing_inner_bytes("url_password");
+    assert!(
+        failing.is_empty(),
+        "8855: URL password `abc<b>def123456` cut early for bytes {failing:?}"
+    );
+}
+
+/// Char boundary: a multi-byte code point inside the value never panics a
+/// slice and never ends the value.
+#[test]
+fn inner_multibyte_char_masked_whole_8855() {
+    let v = format!("{VALUE_HEAD}{MULTIBYTE_INNER}{VALUE_TAIL}");
+    for (name, kind, input, expected) in value_forms(&v) {
+        assert_eq!(kinds_of(&input), vec![kind], "8855 {name}: {input:?}");
+        assert_eq!(redacted_of(&input), expected, "8855 {name}: {input:?}");
+    }
+}
+
+/// The whitespace end is honoured: the token after a blank is context, not
+/// value (every form above asserts [`AFTER_VALUE`] survives), and a value
+/// that OPENED with a quote still ends at that same quote.
+#[test]
+fn quoted_value_ends_at_its_own_quote_8855() {
+    let ph = REDACTION_PLACEHOLDER;
+    assert_redacts_exactly(
+        KIND_PASSWORD,
+        &[
+            (
+                "password=\"abc'def,123\" user=bob".into(),
+                format!("password=\"{ph}\" user=bob"),
+            ),
+            (
+                "password: 'abc\"def;123' user=bob".into(),
+                format!("password: '{ph}' user=bob"),
+            ),
+        ],
+    );
+}
+
+/// `unit` repeated until the result is longer than [`BOUND_INPUT_CHARS`].
+fn repeat_past(unit: &str) -> String {
+    unit.repeat(BOUND_INPUT_CHARS / unit.len() + 1)
+}
+
+/// Linear bound for the whitespace-ended value scans: one 100K value made
+/// of every former terminator byte, and one 100K URL authority made of the
+/// bytes that used to end it.
+#[test]
+fn bound_100k_inner_terminator_bytes_8855() {
+    let ph = REDACTION_PLACEHOLDER;
+    let body = repeat_past("a,b;c&d\"e'f`g/h?i#j");
+    let o = screen_bounded(format!("password={body}"));
+    assert_eq!(hit_kinds(&o), vec![KIND_PASSWORD]);
+    match o {
+        ScreenOutcome::Hit { redacted, .. } => assert_eq!(redacted, format!("password={ph}")),
+        ScreenOutcome::Clean => panic!("8855: 100K value must be refused"),
+    }
+    let authority = repeat_past("u:/?#'\"@");
+    let o = screen_bounded(format!("postgres://{authority}h"));
+    assert_eq!(hit_kinds(&o), vec![KIND_URL]);
+}
+
+/// Sibling (parent `Bearer` detector): an RFC 6750 token68 value may hold
+/// `~`; the token must be masked whole, never cut at it.
+#[test]
+fn bearer_token68_tilde_masked_whole_8855() {
+    let token = concat!("Qm9vX2FiY2RlZjEy", "~", "MzQ1Njc4OTBhYmNk", "~", "ZWZnaGk");
+    let input = format!("Authorization: Bearer {token} sent");
+    assert_eq!(kinds_of(&input), vec!["bearer_token"], "8855: {input:?}");
+    assert_eq!(
+        redacted_of(&input),
+        format!("Authorization: {REDACTION_PLACEHOLDER} sent")
+    );
+}
