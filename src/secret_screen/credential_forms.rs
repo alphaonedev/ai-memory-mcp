@@ -600,6 +600,9 @@ fn stripe_live_key_spans(content: &str) -> Vec<(usize, usize)> {
 }
 
 #[cfg(test)]
+mod tests_9351;
+
+#[cfg(test)]
 mod tests {
     use super::{ENV_LOOKUP_PREFIXES, is_ident_byte};
 
