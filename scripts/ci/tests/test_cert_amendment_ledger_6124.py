@@ -483,8 +483,7 @@ class HonestAmendment(LedgerCase):
         self.assertTrue(cert.ledger_present(blob))
         # #6124 r2 (D-1, D-4): the region above the marker is the release doc, held byte-frozen
         # by the gate, so the parser reads it as a frozen region; the ledger holds ONE record.
-        records = cert.parse_ledger(blob, "head", region_frozen=True)
-        self.assertEqual([r.lines[0] for r in records], ["### Amendment 2026-11-14"])
+        assert_tracked_ledger_shape(self, blob)
 
 
 class RefusedAmendment(LedgerCase):
@@ -1737,7 +1736,6 @@ TRACKED_MARKER_LINE = 2210
 TRACKED_LAST_PRE_LINE = TRACKED_MARKER_LINE - 1
 TRACKED_STATUS_LINE = 23
 TRACKED_I4_LINE = 5
-TRACKED_DAY = "2026-11-14"
 TRACKED_INSERTED = "Inserted prose for the frozen-region row."
 TRACKED_APPENDED = "x"
 I4_EMPHASIS = "emphasis naming an amendment or a status above the ledger"
@@ -1835,10 +1833,11 @@ class TrackedDocFrozenReason9303(LedgerCase):
         return self.scene("VOID", base_doc=tracked_doc())
 
     def test_9303_tracked_rows_with_record_refused_as_frozen_region(self):
+        day = tracked_day(self.use_real_clock())
         for name, edit, line in TRACKED_ROWS:
             with self.subTest(row=name):
                 s = self.tracked_scene()
-                head = tracked_edit(edit) + record(TRACKED_DAY, path_item(MOD_RS))
+                head = tracked_edit(edit) + record(day, path_item(MOD_RS))
                 ok, out = s.judge(self.wire_and_doc(s, head))
                 self.assert_region_refused(ok, out, line)
                 self.assertNotIn(I4_EMPHASIS, out)
@@ -1860,10 +1859,7 @@ class TrackedDocFrozenReason9303(LedgerCase):
 
     # guard cell: green on base c12faaf08909ce250a78040ea10f91f8b9cae56f
     def test_9303_tracked_unchanged_region_exact_record_passes(self):
-        s = self.tracked_scene()
-        head = tracked_doc() + record(TRACKED_DAY, path_item(MOD_RS))
-        ok, out = s.judge(self.wire_and_doc(s, head))
-        self.assert_pass(ok, out, RELEASE_PASS, "the certification stays VOID")
+        judge_tracked_exact_record(self, tracked_doc())
 
     # guard cell: green on base c12faaf08909ce250a78040ea10f91f8b9cae56f
     def test_9303_tracked_two_markers_keep_their_reason(self):
@@ -1940,15 +1936,28 @@ def tracked_with_appended(count, day):
     return tracked_doc() + "".join(record(day, path_item(MOD_RS)) for _ in range(count))
 
 
+def tracked_day(today):
+    """The day a record appended to the tracked doc carries: the later of the tracked ledger's
+    last record date and TODAY (the real UTC day read once from the W-4 clock helper)."""
+    return max(tracked_last_day(), today).isoformat()
+
+
 def assert_tracked_ledger_shape(case, blob):
+    """The historical anchor stays pinned, every record parses and dates do not decrease; the
+    record COUNT is not pinned, because the ledger is append-only (#9338)."""
     records = cert.parse_ledger(blob, "head", region_frozen=True)
-    case.assertEqual([r.lines[0] for r in records], [TRACKED_FIRST_RECORD])
+    case.assertGreaterEqual(len(records), 1)
+    case.assertEqual(records[0].lines[0], TRACKED_FIRST_RECORD)
+    days = tracked_record_days(blob)
+    case.assertEqual(len(days), len(records))
+    case.assertEqual(days, sorted(days), "record dates must not decrease")
 
 
 def judge_tracked_exact_record(case, doc):
-    """Judge one more record dated TRACKED_DAY appended to DOC (a tracked-doc copy)."""
+    """Judge one more record, dated tracked_day(), appended to DOC (a tracked-doc copy)."""
+    day = tracked_day(case.use_real_clock())
     s = case.scene("VOID", base_doc=doc)
-    head = doc + record(TRACKED_DAY, path_item(MOD_RS))
+    head = doc + record(day, path_item(MOD_RS))
     ok, out = s.judge(case.wire_and_doc(s, head))
     case.assert_pass(ok, out, RELEASE_PASS, "the certification stays VOID")
 
@@ -1958,8 +1967,7 @@ class TrackedLedgerAppend9338(LedgerCase):
     invalid ledger is refused with the exact reason."""
 
     def append_day(self):
-        today = self.use_real_clock()
-        return max(tracked_last_day(), today).isoformat()
+        return tracked_day(self.use_real_clock())
 
     def test_9338_append_one_two_three_records_keeps_the_ledger_cells_green(self):
         day = self.append_day()
