@@ -930,6 +930,7 @@ pub use approval_depth::{
 };
 /// #8444 - durable Agent2Agent Task rows (SQLite SSOT; postgres twin in the store).
 pub mod a2a_tasks;
+pub mod embed_cas;
 pub mod embed_skip;
 /// v1.0.0 #3288 — sqlite half of the bounded, keyset-paged admin export.
 pub mod export_page;
@@ -2085,6 +2086,13 @@ fn emit_federation_newer_wins_supersede_leaf_if_enabled(
 /// non-naming conflict holds even against a quarantine that raced the
 /// admission probe). `prepare_cached` keys on this text, so the format runs
 /// once per process and the statement is re-parsed once per connection.
+/// #8907 — the upsert arm's vector clear: the stored row's content or
+/// envelope differs from the incoming one, so the vector describes a
+/// document that no longer exists. `IS NOT` is NULL-safe.
+const UPSERT_EMBEDDING_CLEAR: &str = "embedding = CASE WHEN memories.content IS NOT excluded.content OR memories.encrypted_envelope IS NOT excluded.encrypted_envelope THEN NULL ELSE memories.embedding END,
+                embedding_dim = CASE WHEN memories.content IS NOT excluded.content OR memories.encrypted_envelope IS NOT excluded.encrypted_envelope THEN NULL ELSE memories.embedding_dim END,
+                embedding_space = CASE WHEN memories.content IS NOT excluded.content OR memories.encrypted_envelope IS NOT excluded.encrypted_envelope THEN NULL ELSE memories.embedding_space END";
+
 static INSERT_UPSERT_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     // APPEND-ONLY-SANCTIONED (#1823 G6 / #2948 / #3690) — this static IS the
     // COW-supersede statement `insert_inner` executes; the fn carries the
@@ -2311,9 +2319,15 @@ static INSERT_UPSERT_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new
                 -- carries a non-NULL upper bound sets it; else the existing value
                 -- is kept (COALESCE, matching the Form-4/5 provenance columns).
                 valid_from = memories.valid_from,
-                valid_until = COALESCE(excluded.valid_until, memories.valid_until)
+                valid_until = COALESCE(excluded.valid_until, memories.valid_until),
+                -- #8907 — a merge that changed the document (content or its
+                -- envelope; the title is the conflict key) drops the OLD
+                -- document's vector: absent, never stale. The caller embeds
+                -- the new document afterwards or reports it degraded.
+                {embedding_clear}
              {merge_backstop}
              RETURNING id",
+        embedding_clear = UPSERT_EMBEDDING_CLEAR,
         conflict_target = crate::models::TITLE_SLOT_CONFLICT_TARGET,
         merge_backstop = crate::models::title_slot_merge_backstop("memories"),
         reopen_lifecycle = crate::models::restore_reopen_lifecycle_assignment("memories"),
@@ -4266,12 +4280,13 @@ pub fn update_with_expected_version(
     // #1955 R45 — record-stop fence for the update funnel.
     crate::storage::record_stop::gate_storage_conn(conn)?;
     let mut stmt = conn.prepare_cached(SQL_SELECT_MEMORY_ROW_BY_ID)?;
-    let mut rows = stmt.query_map(params![id], row_to_memory)?;
-    let Some(Ok(existing)) = rows.next() else {
+    let mut rows = stmt.query_map(params![id], embed_cas::row_with_envelope)?;
+    let Some(Ok((existing, pre_envelope))) = rows.next() else {
         return Ok((false, false));
     };
     drop(rows);
     drop(stmt);
+    embed_cas::after_update_preread(conn, id);
 
     // v1.0.0 #1834 (pre-ship 3x7) — canonicalize the opt-in `valid_until`
     // patch at this funnel so the close instant persists in the fixed UTC
@@ -4538,9 +4553,17 @@ pub fn update_with_expected_version(
                         '{}'
                     )
                 ),
-                source_uri = COALESCE(?11, source_uri), encrypted_envelope=?14, valid_until = COALESCE(?15, valid_until), version = version + 1
+                source_uri = COALESCE(?11, source_uri), encrypted_envelope=?14, valid_until = COALESCE(?15, valid_until), version = version + 1,
+                -- #8907 / #8948 — the ONE decision point, in SQL against the
+                -- OLD row (SET sees the pre-update values): a changed document
+                -- (?16) OR a row that moved on after the pre-read (title,
+                -- content, or envelope vs the pre-read ?17) drops vector, dim
+                -- and space here. Never a stale or foreign vector (I-1).
+                embedding = CASE WHEN ?16 OR title IS NOT ?3 OR content IS NOT ?4 OR encrypted_envelope IS NOT ?17 THEN NULL ELSE embedding END,
+                embedding_dim = CASE WHEN ?16 OR title IS NOT ?3 OR content IS NOT ?4 OR encrypted_envelope IS NOT ?17 THEN NULL ELSE embedding_dim END,
+                embedding_space = CASE WHEN ?16 OR title IS NOT ?3 OR content IS NOT ?4 OR encrypted_envelope IS NOT ?17 THEN NULL ELSE embedding_space END
              WHERE id=?12 AND (?13 IS NULL OR version = ?13)",
-            params![effective_tier.as_str(), namespace, new_title, update_content_to_store, tags_json, priority, confidence, now, expires_at, metadata_json, source_uri, id, expected_version, update_encrypted_envelope, valid_until],
+            params![effective_tier.as_str(), namespace, new_title, update_content_to_store, tags_json, priority, confidence, now, expires_at, metadata_json, source_uri, id, expected_version, update_encrypted_envelope, valid_until, content_changed, pre_envelope],
         );
         match update_res {
             Ok(0) => {
@@ -15434,6 +15457,7 @@ fn revoke_agent_pubkey_no_tx(conn: &Connection, agent_id: &str) -> Result<()> {
                 json_remove(content,  '$.agent_pubkey', '$.pubkey_bound_at', '$.write_signature'),
                 '$.pubkey_revoked_at', ?3,
                 '$.attest_level', 'claimed'),
+            embedding = NULL, embedding_dim = NULL, embedding_space = NULL,
             updated_at = ?3
          WHERE namespace = ?1 AND title = ?2",
         params![AGENTS_NAMESPACE, &title, &now],
@@ -18883,7 +18907,11 @@ fn overwrite_full_row_by_id(conn: &Connection, mem: &Memory) -> Result<()> {
             lifecycle_state = ?27,
             encrypted_envelope = ?28,
             valid_from = ?29,
-            valid_until = ?30
+            valid_until = ?30,
+            -- #8907 — the merge changed the document: the old vector goes.
+            embedding = CASE WHEN title IS NOT ?3 OR content IS NOT ?4 OR encrypted_envelope IS NOT ?28 THEN NULL ELSE embedding END,
+            embedding_dim = CASE WHEN title IS NOT ?3 OR content IS NOT ?4 OR encrypted_envelope IS NOT ?28 THEN NULL ELSE embedding_dim END,
+            embedding_space = CASE WHEN title IS NOT ?3 OR content IS NOT ?4 OR encrypted_envelope IS NOT ?28 THEN NULL ELSE embedding_space END
          WHERE id = ?31",
         params![
             mem.tier.as_str(),
@@ -19034,10 +19062,10 @@ pub fn dim_violations(conn: &Connection) -> Result<u64> {
 /// can never hold a vector from one space and a stamp from another.
 const SQL_UPDATE_EMBEDDING_WITH_DIM: &str =
     "UPDATE memories SET embedding = ?1, embedding_dim = ?2, embedding_space = ?3 WHERE id = ?4";
-/// Degenerate empty-vector sibling of [`SQL_UPDATE_EMBEDDING_WITH_DIM`]
-/// (legacy parity: empty embeddings persist with `embedding_dim = NULL`; the
-/// space stamp is NULLed too — no vector, no provenance).
-const SQL_UPDATE_EMBEDDING_NULL_DIM: &str = "UPDATE memories SET embedding = ?1, embedding_dim = NULL, embedding_space = NULL WHERE id = ?2";
+/// Empty-vector sibling of [`SQL_UPDATE_EMBEDDING_WITH_DIM`]: #8907 I-3 —
+/// "no vector" is SQL NULL only (never a header-only BLOB); dim and space
+/// are NULLed with it — no vector, no provenance.
+const SQL_UPDATE_EMBEDDING_NULL_DIM: &str = "UPDATE memories SET embedding = NULL, embedding_dim = NULL, embedding_space = NULL WHERE id = ?1";
 
 /// v1.0.0 #3085 — SQL fragment that selects a row carrying a vector with NO
 /// provenance.
@@ -19107,48 +19135,11 @@ pub fn reject_unattributed_embedding_space(op: &str, space: &str) -> Result<()> 
 ///
 /// Returns [`EmbeddingDimMismatch`] (boxed via anyhow) when the embedding's
 /// dimensionality differs from what the namespace established, or the
-/// underlying SQLite error on failure.
+/// underlying SQLite error on failure. An empty `embedding` clears the vector
+/// to SQL NULL (#8907 I-3). Unconditional: a re-embed of a row another
+/// writer can change uses [`embed_cas::write_embedding`] with a snapshot.
 pub fn set_embedding(conn: &Connection, id: &str, embedding: &[f32], space: &str) -> Result<()> {
-    crate::storage::record_stop::gate_storage_conn(conn)?;
-    // Resolve namespace + check the dim invariant before mutating.
-    let namespace: Option<String> = conn
-        .query_row(
-            "SELECT namespace FROM memories WHERE id = ?1",
-            params![id],
-            |r| r.get(0),
-        )
-        .ok();
-    let attempted = embedding.len();
-    if attempted == 0 {
-        // Empty embeddings are a degenerate case — earlier code accepted
-        // them; preserve that to avoid breaking legacy tests but skip the
-        // dim check. The space stamp is NULLed with the (absent) vector.
-        let bytes = crate::embeddings::encode_embedding_blob(embedding);
-        conn.execute(SQL_UPDATE_EMBEDDING_NULL_DIM, params![bytes, id])?;
-        return Ok(());
-    }
-    // #3085 — a REAL vector must carry a REAL space stamp. Fail closed before
-    // the write rather than persisting the unattributed `''` state.
-    reject_unattributed_embedding_space("set_embedding", space)?;
-    if let Some(ref ns) = namespace
-        && let Some(established) = namespace_embedding_dim(conn, ns)?
-        && established != attempted
-    {
-        return Err(EmbeddingDimMismatch {
-            namespace: ns.clone(),
-            established,
-            attempted,
-        }
-        .into());
-    }
-    let bytes = crate::embeddings::encode_embedding_blob(embedding);
-    let dim_i64 = i64::try_from(attempted).unwrap_or(i64::MAX);
-    // #2167 — vector + dim + space stamped atomically in one statement.
-    conn.execute(
-        SQL_UPDATE_EMBEDDING_WITH_DIM,
-        params![bytes, dim_i64, space, id],
-    )?;
-    Ok(())
+    embed_cas::write_embedding(conn, id, embedding, space, None).map(drop)
 }
 
 /// v0.7.0 Wave-2 A5 (issue #853) — batched embedding writer.
@@ -19244,8 +19235,7 @@ pub fn set_embeddings_batch(
         for (id, embedding) in entries {
             let attempted = embedding.len();
             if attempted == 0 {
-                let bytes = crate::embeddings::encode_embedding_blob(embedding);
-                rows_updated += update_empty.execute(params![bytes, id])?;
+                rows_updated += update_empty.execute(params![id])?;
                 continue;
             }
             if let Some(Some(ns)) = ns_by_id.get(id) {
@@ -19896,11 +19886,11 @@ pub fn set_embeddings_batch_reembed(
         let mut update = conn.prepare(SQL_UPDATE_EMBEDDING_WITH_DIM)?;
         let mut update_empty = conn.prepare(SQL_UPDATE_EMBEDDING_NULL_DIM)?;
         for (id, embedding) in entries {
-            let bytes = crate::embeddings::encode_embedding_blob(embedding);
             if embedding.is_empty() {
-                // Legacy degenerate-case parity with `set_embedding`.
-                rows_updated += update_empty.execute(params![bytes, id])?;
+                // #8907 I-3 — the clear is SQL NULL, as in `set_embedding`.
+                rows_updated += update_empty.execute(params![id])?;
             } else {
+                let bytes = crate::embeddings::encode_embedding_blob(embedding);
                 let dim_i64 = i64::try_from(embedding.len()).unwrap_or(i64::MAX);
                 // #2167 — RE-STAMP the target fingerprint atomically as the
                 // sanctioned G4-bypass replaces each vector (§7): interruption

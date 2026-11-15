@@ -236,6 +236,20 @@ const SQL_ARCHIVE_SNAPSHOT_LIVE_ROW: &str = "INSERT INTO archived_memories
 /// the sqlite last-wins contract byte-for-byte. `id` (the conflict key) is not
 /// updated. Shared const so the identical clause is not duplicated across the
 /// four sites (also keeps `scripts/check-hardcoded-literals.sh` green).
+/// #8907 / #8948 — the `(title, namespace)` upsert arm's "the document
+/// changed" predicate (content or its at-rest envelope; the title is the
+/// conflict key). NULL-safe. Sqlite twin: `storage::UPSERT_EMBEDDING_CLEAR`.
+const PG_UPSERT_DOCUMENT_CHANGED: &str = "(memories.content IS DISTINCT FROM EXCLUDED.content \
+     OR memories.encrypted_envelope IS DISTINCT FROM EXCLUDED.encrypted_envelope)";
+/// #8907 / #8948 — SET fragment for an upsert arm that writes no vector:
+/// a changed document drops the OLD document's vector and its space stamp
+/// (absent, never stale); the caller embeds the new document afterwards or
+/// reports the write degraded. The predicate is [`PG_UPSERT_DOCUMENT_CHANGED`]
+/// spelled out (const strings cannot be concatenated).
+const PG_UPSERT_EMBEDDING_CLEAR: &str = "embedding = CASE WHEN (memories.content IS DISTINCT FROM EXCLUDED.content \
+     OR memories.encrypted_envelope IS DISTINCT FROM EXCLUDED.encrypted_envelope) THEN NULL ELSE memories.embedding END, \
+     embedding_space = CASE WHEN (memories.content IS DISTINCT FROM EXCLUDED.content \
+     OR memories.encrypted_envelope IS DISTINCT FROM EXCLUDED.encrypted_envelope) THEN NULL ELSE memories.embedding_space END";
 const SQL_ARCHIVE_ON_CONFLICT_LAST_WINS: &str = "ON CONFLICT (id) DO UPDATE SET \
      tier = EXCLUDED.tier, namespace = EXCLUDED.namespace, title = EXCLUDED.title, \
      content = EXCLUDED.content, tags = EXCLUDED.tags, priority = EXCLUDED.priority, \
@@ -783,7 +797,16 @@ static SQL_MERGE_INBOUND_FULL_ROW_UPDATE: std::sync::LazyLock<String> =
                 -- `content = $5` (both come from the already-resolved `merged`
                 -- row); an encryption-off merge writes plaintext + NULL,
                 -- clearing any stale ciphertext.
-                encrypted_envelope = $31
+                encrypted_envelope = $31,
+                -- #8907 / #8948 — the merge changed the document: the old
+                -- vector and its stamp go (sqlite twin
+                -- `overwrite_full_row_by_id`).
+                embedding = CASE WHEN title IS DISTINCT FROM $4 OR content IS DISTINCT FROM $5
+                                      OR encrypted_envelope IS DISTINCT FROM $31
+                                 THEN NULL ELSE embedding END,
+                embedding_space = CASE WHEN title IS DISTINCT FROM $4 OR content IS DISTINCT FROM $5
+                                            OR encrypted_envelope IS DISTINCT FROM $31
+                                       THEN NULL ELSE embedding_space END
              WHERE id = $1",
             metadata = crate::models::crdt_merge::pg_node_local_overlay("$15::jsonb"),
         )
@@ -9181,7 +9204,13 @@ impl PostgresStore {
                     ELSE COALESCE($12, expires_at)
                 END,
                 updated_at = NOW(),
-                version = version + 1
+                version = version + 1,
+                -- #8907 / #8948 — the document changed ($15): the OLD
+                -- document's vector goes (sqlite twin in
+                -- `update_with_expected_version`); the caller re-embeds or
+                -- reports the write degraded.
+                embedding = CASE WHEN $15::BOOLEAN THEN NULL ELSE embedding END,
+                embedding_space = CASE WHEN $15::BOOLEAN THEN NULL ELSE embedding_space END
              WHERE id = $1
                AND ($11::BIGINT IS NULL OR version = $11::BIGINT)",
         )
@@ -9222,6 +9251,7 @@ impl PostgresStore {
         .bind(crate::validate::canonical_valid_time_opt(
             patch.valid_until.as_deref(),
         ))
+        .bind(content_changed)
         .execute(&mut *tx)
         .await
         .map_err(|e| to_store_err("update_with_expected_version", e))?
@@ -15142,6 +15172,8 @@ impl PostgresStore {
                       $17, $18, $19, $20)
             {conflict_target} DO UPDATE SET
                 content = EXCLUDED.content,
+                -- #8907 / #8948 — a merge that changed the document drops the old vector.
+                {PG_UPSERT_EMBEDDING_CLEAR},
                 -- #2292 — content + envelope move together (store() parity).
                 encrypted_envelope = EXCLUDED.encrypted_envelope,
                 tier = CASE
@@ -21452,6 +21484,74 @@ impl PostgresStore {
     }
 }
 
+/// #8907 — the compare-and-set vector write of a re-embed (I-1 of
+/// NOTICE-FIX-9284-r1). Inherent, not on the trait: the HTTP update path
+/// reaches it through [`crate::store::embed_cas`].
+impl PostgresStore {
+    /// The stored document bytes of row `id` (`None` when absent).
+    ///
+    /// # Errors
+    /// The database error.
+    pub async fn read_document_snapshot(
+        &self,
+        id: &str,
+    ) -> StoreResult<Option<crate::storage::embed_cas::DocumentSnapshot>> {
+        let row =
+            sqlx::query("SELECT title, content, encrypted_envelope FROM memories WHERE id = $1")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| to_store_err("read_document_snapshot", e))?;
+        row.map(|r| {
+            Ok(crate::storage::embed_cas::DocumentSnapshot {
+                title: r.try_get("title")?,
+                content: r.try_get("content")?,
+                envelope: r.try_get("encrypted_envelope")?,
+            })
+        })
+        .transpose()
+        .map_err(|e: sqlx::Error| to_store_err("read_document_snapshot", e))
+    }
+
+    /// ONE statement: the vector and its space land only while row `id`
+    /// still holds `expected`. Returns the rows affected; `0` means another
+    /// writer moved the document on and nothing was written.
+    ///
+    /// # Errors
+    /// The record-stop gate, an empty vector or space (#3085), or the
+    /// database error.
+    pub async fn update_embedding_if_document(
+        &self,
+        id: &str,
+        embedding: &[f32],
+        space: &str,
+        expected: &crate::storage::embed_cas::DocumentSnapshot,
+    ) -> StoreResult<u64> {
+        self.gate_record_stop().await?;
+        if embedding.is_empty() {
+            return Err(StoreError::InvalidInput {
+                detail: "update_embedding_if_document: a conditional write needs a vector (#8907)"
+                    .to_string(),
+            });
+        }
+        crate::store::reject_unattributed_space("update_embedding", space)?;
+        let done = sqlx::query(
+            "UPDATE memories SET embedding = $2, embedding_space = $3 WHERE id = $1 \
+             AND title = $4 AND content = $5 AND encrypted_envelope IS NOT DISTINCT FROM $6",
+        )
+        .bind(id)
+        .bind(pgvector::Vector::from(embedding.to_vec()))
+        .bind(space)
+        .bind(&expected.title)
+        .bind(&expected.content)
+        .bind(expected.envelope.as_deref())
+        .execute(&self.pool)
+        .await
+        .map_err(|e| to_store_err("update_embedding_if_document", e))?;
+        Ok(done.rows_affected())
+    }
+}
+
 #[async_trait]
 impl MemoryStore for PostgresStore {
     async fn write_durability(&self) -> StoreResult<crate::write_receipt::WriteDurability> {
@@ -21898,6 +21998,8 @@ impl MemoryStore for PostgresStore {
                       $26, $27, $28, $29, $30, $31, $32, $33)
             {conflict_target} DO UPDATE SET
                 content = EXCLUDED.content,
+                -- #8907 / #8948 — a merge that changed the document drops the old vector.
+                {PG_UPSERT_EMBEDDING_CLEAR},
                 -- #228 Commit B — content + envelope move together on upsert
                 -- so a re-store replaces both the placeholder and ciphertext
                 -- (encryption-off writes plaintext + NULL, clearing stale
@@ -22495,6 +22597,8 @@ impl MemoryStore for PostgresStore {
             &format!(
             " {conflict_target} DO UPDATE SET
                 content = EXCLUDED.content,
+                -- #8907 / #8948 — a merge that changed the document drops the old vector.
+                {PG_UPSERT_EMBEDDING_CLEAR},
                 -- #2288 — content + envelope move together on upsert (sqlite +
                 -- `store()` parity): a re-store replaces both the placeholder
                 -- and the ciphertext, and an encryption-off write clears any
@@ -22962,6 +23066,8 @@ impl MemoryStore for PostgresStore {
                       $24, $25, $26, $27, $28)
             {conflict_target} DO UPDATE SET
                 content = EXCLUDED.content,
+                -- #8907 / #8948 — a merge that changed the document drops the old vector.
+                {PG_UPSERT_EMBEDDING_CLEAR},
                 -- #2292 — content + envelope move together (store()/store_batch
                 -- parity); an encryption-off re-store clears any stale envelope.
                 encrypted_envelope = EXCLUDED.encrypted_envelope,
@@ -23359,6 +23465,8 @@ impl MemoryStore for PostgresStore {
                       $24, $25, $26, $27, $28)
             {conflict_target} DO UPDATE SET
                 content = EXCLUDED.content,
+                -- #8907 / #8948 — a merge that changed the document drops the old vector.
+                {PG_UPSERT_EMBEDDING_CLEAR},
                 -- #2292 — content + envelope move together (store() parity).
                 encrypted_envelope = EXCLUDED.encrypted_envelope,
                 tier = CASE
@@ -23664,9 +23772,12 @@ impl MemoryStore for PostgresStore {
         space: &str,
     ) -> StoreResult<()> {
         self.gate_record_stop().await?;
+        // #8907 I-3 — an empty vector is "no vector": SQL NULL, never an
+        // empty value.
+        let embedding = embedding.filter(|v| !v.is_empty());
         // #3085 — a REAL vector must carry a REAL space stamp; refuse an
         // empty (unattributed) stamp before the write.
-        if embedding.is_some_and(|v| !v.is_empty()) {
+        if embedding.is_some() {
             crate::store::reject_unattributed_space("update_embedding", space)?;
         }
         let emb_pgvec = embedding.map(|v| pgvector::Vector::from(v.to_vec()));
@@ -24050,13 +24161,17 @@ impl MemoryStore for PostgresStore {
         // #2167 — one space stamps the whole batch (live-minted in one process).
         let space_str = space;
         for (id, vec) in entries {
-            let emb_pgvec = pgvector::Vector::from(vec.clone());
+            // #8907 I-3 — an empty vector is "no vector": SQL NULL for the
+            // vector and its space stamp (the sqlite twin's rule), never a
+            // zero-dim value.
+            let emb_pgvec = (!vec.is_empty()).then(|| pgvector::Vector::from(vec.clone()));
+            let space_val = emb_pgvec.as_ref().map(|_| space_str);
             let res = sqlx::query(
                 "UPDATE memories SET embedding = $2, embedding_space = $3 WHERE id = $1",
             )
             .bind(id)
             .bind(emb_pgvec)
-            .bind(space_str)
+            .bind(space_val)
             .execute(&mut *tx)
             .await
             .map_err(|e| to_store_err("set_embeddings_batch update", e))?;
@@ -24436,7 +24551,11 @@ impl MemoryStore for PostgresStore {
                 -- IMMUTABLE (absent from this SET). TEXT RFC3339.
                 valid_until = COALESCE($12, valid_until),
                 version = version + 1,
-                updated_at = NOW()
+                updated_at = NOW(),
+                -- #8907 / #8948 — the document changed ($14): the OLD
+                -- document's vector goes (twin of the If-Match funnel).
+                embedding = CASE WHEN $14::BOOLEAN THEN NULL ELSE embedding END,
+                embedding_space = CASE WHEN $14::BOOLEAN THEN NULL ELSE embedding_space END
              WHERE id = $1",
         )
         .bind(id)
@@ -24475,6 +24594,7 @@ impl MemoryStore for PostgresStore {
         // `$3 IS NULL` CASE leaves the existing envelope untouched on a
         // metadata-only patch, so this NULL only lands when content IS patched.
         .bind(upd_encrypted_envelope)
+        .bind(content_changed)
         .execute(&mut *tx)
         .await
         .map_err(|e| to_store_err("update", e))?
@@ -27032,7 +27152,10 @@ impl MemoryStore for PostgresStore {
         // UPDATE rewrites the registration row's content in the same tx as
         // the history append and identity-only SUPERSEDE leaf.
         sqlx::query(
-            "UPDATE memories SET metadata = $3, content = $4, updated_at = $5::timestamptz
+            "UPDATE memories SET metadata = $3, content = $4, updated_at = $5::timestamptz,
+                    -- #8907 — a rewritten document drops its old vector.
+                    embedding = CASE WHEN content IS DISTINCT FROM $4 THEN NULL ELSE embedding END,
+                    embedding_space = CASE WHEN content IS DISTINCT FROM $4 THEN NULL ELSE embedding_space END
              WHERE namespace = $1 AND title = $2",
         )
         .bind(AGENTS_NAMESPACE)
@@ -27437,7 +27560,10 @@ impl MemoryStore for PostgresStore {
         // revoke UPDATE rewrites the registration row's content; wrap it in
         // the same transaction as the history close and identity-only leaf.
         sqlx::query(
-            "UPDATE memories SET metadata = $3, content = $4, updated_at = $5::timestamptz
+            "UPDATE memories SET metadata = $3, content = $4, updated_at = $5::timestamptz,
+                    -- #8907 — a rewritten document drops its old vector.
+                    embedding = CASE WHEN content IS DISTINCT FROM $4 THEN NULL ELSE embedding END,
+                    embedding_space = CASE WHEN content IS DISTINCT FROM $4 THEN NULL ELSE embedding_space END
              WHERE namespace = $1 AND title = $2",
         )
         .bind(AGENTS_NAMESPACE)
@@ -27772,7 +27898,10 @@ impl MemoryStore for PostgresStore {
         // UPDATE shape as bind_agent_pubkey, including the flag-gated
         // identity-only supersede leaf below.
         sqlx::query(
-            "UPDATE memories SET metadata = $3, content = $4, updated_at = $5::timestamptz
+            "UPDATE memories SET metadata = $3, content = $4, updated_at = $5::timestamptz,
+                    -- #8907 — a rewritten document drops its old vector.
+                    embedding = CASE WHEN content IS DISTINCT FROM $4 THEN NULL ELSE embedding END,
+                    embedding_space = CASE WHEN content IS DISTINCT FROM $4 THEN NULL ELSE embedding_space END
              WHERE namespace = $1 AND title = $2",
         )
         .bind(AGENTS_NAMESPACE)
@@ -28528,6 +28657,8 @@ impl MemoryStore for PostgresStore {
                     ELSE memories.tier
                 END,
                 content = EXCLUDED.content,
+                -- #8907 / #8948 — a merge that changed the document drops the old vector.
+                {PG_UPSERT_EMBEDDING_CLEAR},
                 -- #2292 — content + envelope move together (store() parity).
                 encrypted_envelope = EXCLUDED.encrypted_envelope,
                 tags = EXCLUDED.tags,
@@ -34697,15 +34828,23 @@ impl PostgresStore {
                                              ELSE memories.confidence_decayed_at END,
                 entity_id = COALESCE(memories.entity_id, EXCLUDED.entity_id),
                 persona_version = COALESCE(memories.persona_version, EXCLUDED.persona_version),
-                embedding = COALESCE(EXCLUDED.embedding, memories.embedding),
+                -- #8907 / #8948 — an incoming vector (the NEW document's)
+                -- wins; with none, a changed document drops the old vector
+                -- (absent, never stale) and an unchanged one keeps it.
+                embedding = CASE
+                    WHEN EXCLUDED.embedding IS NOT NULL THEN EXCLUDED.embedding
+                    WHEN {PG_UPSERT_DOCUMENT_CHANGED} THEN NULL
+                    ELSE memories.embedding
+                END,
                 -- #2167 — the stamp travels WITH the vector on the upsert-
                 -- merge arm too: when the incoming vector replaces the
                 -- stored one, its space replaces the stored stamp; when the
-                -- incoming vector is NULL (COALESCE keeps the old vector),
-                -- the old stamp is kept. A same-dim model swap-back can
-                -- therefore never leave a stamp attesting a foreign vector.
+                -- old vector is kept, the old stamp is kept. A same-dim
+                -- model swap-back can therefore never leave a stamp
+                -- attesting a foreign vector.
                 embedding_space = CASE
                     WHEN EXCLUDED.embedding IS NOT NULL THEN EXCLUDED.embedding_space
+                    WHEN {PG_UPSERT_DOCUMENT_CHANGED} THEN NULL
                     ELSE memories.embedding_space
                 END,
                 -- #1383 — preserve a previously-extracted attribution

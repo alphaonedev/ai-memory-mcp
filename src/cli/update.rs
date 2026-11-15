@@ -213,7 +213,7 @@ pub fn run(
     // optimistic-concurrency gate is reachable from CLI when the
     // operator passes `--expected-version`. Legacy behaviour (no
     // expected_version) preserved by passing `None`.
-    let (found, _content_changed) = db::update_with_expected_version(
+    let (found, content_changed) = db::update_with_expected_version(
         &conn,
         &resolved_id,
         args.title.as_deref(),
@@ -254,9 +254,18 @@ pub fn run(
                 None,
             ),
         ));
+        // #8907 — the CLI carries no embedder: a title/content change left
+        // the row vectorless (the store cleared the old vector with the
+        // text), and the receipt says so.
+        let embed_status = if content_changed {
+            crate::embeddings::no_embedder_status()
+        } else {
+            crate::embeddings::EmbedStatus::Indexed
+        };
         if json_out {
             let mut receipt = serde_json::to_value(&mem)?;
             crate::write_receipt::WriteDurability::sqlite(&conn)?.attach(&mut receipt)?;
+            crate::embeddings::attach_embed_status(&mut receipt, &embed_status);
             writeln!(out.stdout, "{}", serde_json::to_string(&receipt)?)?;
         } else {
             let durability = crate::write_receipt::WriteDurability::sqlite(&conn)?;
@@ -265,6 +274,9 @@ pub fn run(
                 "updated: {} [{}] {durability}",
                 mem.id, mem.title
             )?;
+            if embed_status.is_degraded() {
+                writeln!(out.stderr, "embed_status: {embed_status}")?;
+            }
         }
     }
     Ok(())

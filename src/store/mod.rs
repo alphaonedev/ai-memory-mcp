@@ -51,6 +51,9 @@
 
 pub mod sqlite;
 
+/// v1.0.0 #8907 — the compare-and-set vector write of a re-embed.
+pub mod embed_cas;
+
 #[cfg(feature = "sal-postgres")]
 pub mod postgres;
 

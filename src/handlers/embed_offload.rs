@@ -67,6 +67,33 @@ pub async fn embed_document(
     on_blocking_pool(surface, move || emb.embed(&text)).await
 }
 
+/// #8907 / #8948 — re-embed a CHANGED document through the one embed
+/// decision ([`crate::embeddings::embed_document_with_status`]) on the
+/// blocking pool. No embedder is `Skipped(no embedder configured)`; a task
+/// that did not complete is `Failed`, the same degrade as an embed error.
+#[cfg(feature = "sal")]
+pub async fn reembed_changed_document(
+    surface: &'static str,
+    emb: Option<&Embedder>,
+    text: String,
+) -> (Option<Vec<f32>>, crate::embeddings::EmbedStatus) {
+    let Some(emb) = emb.cloned() else {
+        return (None, crate::embeddings::no_embedder_status());
+    };
+    on_blocking_pool(surface, move || {
+        crate::embeddings::embed_document_with_status(&emb, &text)
+    })
+    .await
+    .unwrap_or_else(|| {
+        (
+            None,
+            crate::embeddings::EmbedStatus::Failed(
+                crate::embeddings::EMBED_TASK_INCOMPLETE_REASON.to_string(),
+            ),
+        )
+    })
+}
+
 /// The recall query embedding through the bounded #2577 funnel
 /// ([`crate::embeddings::recall_query_embedding`]: cache, budget, degrade)
 /// on the blocking pool. `None` means keyword-only recall, exactly as when

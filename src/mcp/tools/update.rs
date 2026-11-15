@@ -129,7 +129,7 @@ impl McpTool for UpdateTool {
         "Update an existing memory by ID (only provided fields change)."
     }
     fn docs() -> &'static str {
-        "Partial update by id. Omitted fields preserved. Tier monotone-only. metadata.agent_id preserved."
+        "Partial update by id. Omitted fields preserved. Tier monotone-only. metadata.agent_id preserved. Receipt carries embed_status (skipped|failed) and embed_status_reason (e.g. embedding_failed, no embedder configured) only when a title/content change ends with no vector stored; both are absent otherwise."
     }
     fn input_schema() -> Value {
         crate::mcp::registry::input_schema_for::<UpdateRequest>()
@@ -538,31 +538,19 @@ fn handle_update_inner(
             edit_source,
         )
         .map_err(conflict_or_string)?;
-        // Re-embed the NEW row when content changed.
-        if let Some(emb) = embedder {
-            let new_id = &result.new_id;
-            let mem = db::get(conn, new_id)
-                .map_err(|e| crate::mcp::error_text::mcp_foreign_err("get", e))?;
-            if let Some(ref m) = mem {
-                let text = crate::embeddings::embedding_document(&m.title, &m.content);
-                if let Ok(embedding) = emb.embed(&text) {
-                    let _ = db::set_embedding(conn, new_id, &embedding, &emb.space_fingerprint());
-                    if let Some(idx) = vector_index {
-                        idx.remove(new_id);
-                        idx.insert(new_id.clone(), embedding);
-                    }
-                }
-            }
-        }
+        // #8907 — the NEW row is minted vectorless; embed its document.
+        let embed_status = reembed_changed_row(conn, &result.new_id, embedder, vector_index)?;
         let new_mem = db::get(conn, &result.new_id)
             .map_err(|e| crate::mcp::error_text::mcp_foreign_err("get", e))?;
-        return Ok(json!({
+        let mut receipt = json!({
             "updated": true,
             "edit_source": edit_source.as_str(),
             "memory": new_mem,
             "superseded_id": result.archived_id,
             "new_id": result.new_id,
-        }));
+        });
+        crate::embeddings::attach_embed_status(&mut receipt, &embed_status);
+        return Ok(receipt);
     }
 
     // FBL-12 (v1.0.0 pre-ship 3x7) — charge the storage-byte GROWTH of
@@ -693,29 +681,77 @@ fn handle_update_inner(
         return Err(crate::errors::msg::MEMORY_NOT_FOUND.into());
     }
 
-    // Regenerate embedding when title or content changed
-    if content_changed && let Some(emb) = embedder {
-        let mem = db::get(conn, &resolved_id)
-            .map_err(|e| crate::mcp::error_text::mcp_foreign_err("get", e))?;
-        if let Some(ref m) = mem {
-            let text = crate::embeddings::embedding_document(&m.title, &m.content);
-            if let Ok(embedding) = emb.embed(&text) {
-                let _ = db::set_embedding(conn, &resolved_id, &embedding, &emb.space_fingerprint());
-                if let Some(idx) = vector_index {
-                    idx.remove(&resolved_id);
-                    idx.insert(resolved_id.clone(), embedding);
-                }
-            }
-        }
-    }
+    // #8907 — regenerate the embedding when title or content changed; the
+    // store layer already cleared the old vector with the text.
+    let embed_status = if content_changed {
+        reembed_changed_row(conn, &resolved_id, embedder, vector_index)?
+    } else {
+        crate::embeddings::EmbedStatus::Indexed
+    };
 
     let mem = db::get(conn, &resolved_id)
         .map_err(|e| crate::mcp::error_text::mcp_foreign_err("get", e))?;
-    Ok(json!({
+    let mut receipt = json!({
         "updated": true,
         "edit_source": edit_source.as_str(),
         "memory": mem,
-    }))
+    });
+    crate::embeddings::attach_embed_status(&mut receipt, &embed_status);
+    Ok(receipt)
+}
+
+/// #8907 — re-embed row `id` after its document changed, through the one
+/// embed decision ([`crate::embeddings::embed_document_with_status`]). The
+/// store layer already cleared the old vector with the text change, so a
+/// failure leaves the row vectorless and the returned degraded status goes
+/// on the receipt; the vector index drops the id either way. The text and
+/// its stored document bytes come from ONE row read, and the vector lands
+/// through ONE compare-and-set statement
+/// ([`crate::storage::embed_cas::write_embedding`]): when another writer
+/// moved the document on, zero rows match, nothing is written (that
+/// writer's vector stays) and the receipt says `Failed` (I-1, I-2).
+pub(super) fn reembed_changed_row(
+    conn: &rusqlite::Connection,
+    id: &str,
+    embedder: Option<&dyn Embed>,
+    vector_index: Option<&dyn VectorSearchIndex>,
+) -> Result<crate::embeddings::EmbedStatus, String> {
+    use crate::embeddings::{EMBED_FAILED_REASON, EmbedStatus};
+    use crate::storage::embed_cas;
+    let Some(emb) = embedder else {
+        return Ok(crate::embeddings::no_embedder_status());
+    };
+    if let Some(idx) = vector_index {
+        idx.remove(id);
+    }
+    let Some((m, snapshot)) = embed_cas::read_document(conn, id)
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("get", e))?
+    else {
+        return Err(crate::errors::msg::MEMORY_NOT_FOUND.into());
+    };
+    let text = crate::embeddings::embedding_document(&m.title, &m.content);
+    let (vector, status) = crate::embeddings::embed_document_with_status(emb, &text);
+    let Some(vector) = vector else {
+        return Ok(status);
+    };
+    let space = emb.space_fingerprint();
+    match embed_cas::write_embedding(conn, id, &vector, &space, Some(&snapshot)) {
+        Ok(1) => {}
+        Ok(rows) => {
+            tracing::warn!(
+                "update: document of {id} moved on before its vector write ({rows} rows)"
+            );
+            return Ok(EmbedStatus::Failed(EMBED_FAILED_REASON.to_string()));
+        }
+        Err(e) => {
+            tracing::warn!("update: vector write failed for {id}: {e}");
+            return Ok(EmbedStatus::Failed(EMBED_FAILED_REASON.to_string()));
+        }
+    }
+    if let Some(idx) = vector_index {
+        idx.insert(id.to_string(), vector);
+    }
+    Ok(status)
 }
 
 /// v0.7.0 Provenance Gap 1 (#884) — emit a structured CONFLICT

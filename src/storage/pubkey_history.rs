@@ -197,6 +197,7 @@ pub(super) fn bind_agent_pubkey_no_tx(
                 '$.agent_pubkey', ?3,
                 '$.pubkey_bound_at', ?4,
                 '$.attest_level', 'claimed'),
+            embedding = NULL, embedding_dim = NULL, embedding_space = NULL,
             updated_at = ?4
          WHERE namespace = ?1 AND title = ?2",
         params![AGENTS_NAMESPACE, &title, pubkey_b64, &now],

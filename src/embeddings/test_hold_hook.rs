@@ -28,7 +28,29 @@ struct Hold {
     marker: String,
     hold: Duration,
     entered: Option<Sender<()>>,
+    /// #8907 — what a marked embed does after any hold.
+    effect: Effect,
 }
+
+/// #8907 — the outcome of a marked embed on an armed model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Effect {
+    /// Deterministic vectors (the default of [`arm`]).
+    Vectors,
+    /// The provider-error stand-in: [`ARMED_FAILURE`].
+    Fail,
+    /// The provider answers with one EMPTY vector per input.
+    EmptyVector,
+    /// The embed panics, so the blocking task never completes.
+    Panic,
+}
+
+/// #8907 — the panic text of an [`Effect::Panic`] embed.
+pub const ARMED_PANIC: &str = "test hold hook: armed embed panic";
+
+/// #8907 — the error text a [`arm_fail`]-armed embed returns for a marked
+/// input, so a test can assert the exact degraded reason.
+pub const ARMED_FAILURE: &str = "test hold hook: armed embed failure";
 
 static HOLDS: LazyLock<Mutex<Vec<Hold>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 
@@ -45,8 +67,32 @@ pub fn arm(model: &str, marker: &str, hold: Duration) -> Receiver<()> {
         marker: marker.to_string(),
         hold,
         entered: Some(tx),
+        effect: Effect::Vectors,
     });
     rx
+}
+
+/// #8907 — arm `model` so every embed whose input carries `marker` FAILS
+/// with [`ARMED_FAILURE`] (no hold, no network); unmarked inputs get the
+/// usual deterministic vectors. Re-arming a model replaces its previous
+/// hold.
+pub fn arm_fail(model: &str, marker: &str) {
+    arm_effect(model, marker, Effect::Fail);
+}
+
+/// #8907 — arm `model` so every embed whose input carries `marker` has
+/// `effect` (no hold, no network); unmarked inputs get the usual
+/// deterministic vectors. Re-arming a model replaces its previous hold.
+pub fn arm_effect(model: &str, marker: &str, effect: Effect) {
+    let mut holds = HOLDS.lock().unwrap_or_else(PoisonError::into_inner);
+    holds.retain(|h| h.model != model);
+    holds.push(Hold {
+        model: model.to_string(),
+        marker: marker.to_string(),
+        hold: Duration::ZERO,
+        entered: None,
+        effect,
+    });
 }
 
 /// Remove the hold for `model` (idempotent).
@@ -99,13 +145,13 @@ pub(super) fn intercept(
     dim: usize,
     texts: &[&str],
 ) -> Option<anyhow::Result<Vec<Vec<f32>>>> {
-    let (hold, entered) = {
+    let (hold, entered, effect) = {
         let mut holds = HOLDS.lock().unwrap_or_else(PoisonError::into_inner);
         let h = holds.iter_mut().find(|h| h.model == model)?;
         if texts.iter().any(|t| t.contains(h.marker.as_str())) {
-            (Some(h.hold), h.entered.take())
+            (Some(h.hold), h.entered.take(), h.effect)
         } else {
-            (None, None)
+            (None, None, Effect::Vectors)
         }
     };
     if let Some(hold) = hold {
@@ -116,5 +162,10 @@ pub(super) fn intercept(
         }
         std::thread::sleep(hold);
     }
-    Some(Ok(texts.iter().map(|t| vector_for(t, dim)).collect()))
+    match effect {
+        Effect::Vectors => Some(Ok(texts.iter().map(|t| vector_for(t, dim)).collect())),
+        Effect::Fail => Some(Err(anyhow::anyhow!(ARMED_FAILURE))),
+        Effect::EmptyVector => Some(Ok(texts.iter().map(|_| Vec::new()).collect())),
+        Effect::Panic => panic!("{ARMED_PANIC}"),
+    }
 }

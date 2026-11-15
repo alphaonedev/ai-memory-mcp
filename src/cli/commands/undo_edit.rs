@@ -114,7 +114,7 @@ pub async fn cmd_undo_edit(
         .await?;
 
     if args.json {
-        let payload = json!({
+        let mut payload = json!({
             "id": outcome.id,
             "applied": outcome.applied,
             "dry_run": args.dry_run,
@@ -125,6 +125,18 @@ pub async fn cmd_undo_edit(
             "before_content": outcome.before_content,
             "after_content": outcome.after_content,
         });
+        // #8907 — an applied undo that changed the document left the row
+        // vectorless (the store cleared the vector with the text); this CLI
+        // carries no embedder, so the receipt says so.
+        if outcome.applied
+            && (outcome.before_title != outcome.after_title
+                || outcome.before_content != outcome.after_content)
+        {
+            crate::embeddings::attach_embed_status(
+                &mut payload,
+                &crate::embeddings::no_embedder_status(),
+            );
+        }
         writeln!(out.stdout, "{}", serde_json::to_string_pretty(&payload)?)?;
         return Ok(0);
     }

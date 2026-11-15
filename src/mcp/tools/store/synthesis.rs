@@ -432,7 +432,12 @@ pub(super) fn apply_synthesis_updates_and_deletes(
     let Ok(write_txn) = crate::storage::connection::WriteTxn::begin(conn) else {
         return Ok(None);
     };
-    let mut deferred_index_ops: Vec<(String, Vec<f32>)> = Vec::new();
+    // #8907 — `Some(vec)` swaps the id's index entry for the new document's
+    // vector; `None` drops it (the re-embed degraded and the store layer
+    // already cleared the row's old vector with the text).
+    let mut deferred_index_ops: Vec<(String, Option<Vec<f32>>)> = Vec::new();
+    // #8907 — the first degraded re-embed of this merge goes on the receipt.
+    let mut embed_status = crate::embeddings::EmbedStatus::Indexed;
 
     // Issue #1239 — counter into `outcome.updates` so subsequent
     // iterations of a multi-update verdict (COR-5) mint distinct ids
@@ -473,14 +478,17 @@ pub(super) fn apply_synthesis_updates_and_deletes(
                 return Ok(None);
             }
         };
-        if content_changed && let Some(emb) = embedder {
-            let text = crate::embeddings::embedding_document(&target.title, &merged_content);
-            if let Ok(embedding) = emb.embed(&text) {
-                let _ = db::set_embedding(conn, cand_id, &embedding, &emb.space_fingerprint());
-                if vector_index.is_some() {
-                    // #1700 — defer the in-memory index swap until after COMMIT.
-                    deferred_index_ops.push((cand_id.to_string(), embedding));
-                }
+        if content_changed {
+            // #8907 — the one embed decision; `db::update` already cleared
+            // the old vector in the same statement as the text change.
+            let text = crate::embeddings::embedding_document(&target.title, merged_content);
+            let (vector, status) = synthesis_reembed(conn, cand_id, embedder, &text);
+            if status.is_degraded() && !embed_status.is_degraded() {
+                embed_status = status;
+            }
+            if vector_index.is_some() {
+                // #1700 — defer the in-memory index swap until after COMMIT.
+                deferred_index_ops.push((cand_id.to_string(), vector));
             }
         }
 
@@ -589,7 +597,9 @@ pub(super) fn apply_synthesis_updates_and_deletes(
     if let Some(idx) = vector_index {
         for (id, embedding) in deferred_index_ops {
             idx.remove(&id);
-            idx.insert(id, embedding);
+            if let Some(embedding) = embedding {
+                idx.insert(id, embedding);
+            }
         }
     }
 
@@ -619,7 +629,38 @@ pub(super) fn apply_synthesis_updates_and_deletes(
         resp["synthesis_failed"] = json!(true);
         resp["synthesis_failed_reason"] = json!(reason);
     }
+    crate::embeddings::attach_embed_status(&mut resp, &embed_status);
     Ok(Some(resp))
+}
+
+/// #8907 — re-embed synthesis target `id` (inside the merge transaction)
+/// after its content changed. Returns the vector the deferred index swap
+/// installs (`None` = drop the id) and the status for the receipt. With no
+/// embedder, or a failed embed or vector write, the row stays vectorless:
+/// the store layer cleared its old vector with the text change.
+fn synthesis_reembed(
+    conn: &rusqlite::Connection,
+    id: &str,
+    embedder: Option<&dyn crate::embeddings::Embed>,
+    text: &str,
+) -> (Option<Vec<f32>>, crate::embeddings::EmbedStatus) {
+    let Some(emb) = embedder else {
+        return (None, crate::embeddings::no_embedder_status());
+    };
+    let (vector, status) = crate::embeddings::embed_document_with_status(emb, text);
+    let Some(vector) = vector else {
+        return (None, status);
+    };
+    if let Err(e) = db::set_embedding(conn, id, &vector, &emb.space_fingerprint()) {
+        tracing::warn!(target: "synthesis", "synthesis vector write failed for {id}: {e}");
+        return (
+            None,
+            crate::embeddings::EmbedStatus::Failed(
+                crate::embeddings::EMBED_FAILED_REASON.to_string(),
+            ),
+        );
+    }
+    (Some(vector), status)
 }
 
 /// Apply pending delete verdicts when no update fired — the store
@@ -799,5 +840,131 @@ mod tests {
             .is_ok(),
             "None caller is the single-operator trust-all default"
         );
+    }
+
+    /// The merged document a synthesis update writes over the target.
+    const MERGED_8907: &str = "merged body: the deploy moved to the new cluster";
+
+    /// #8907 cells: which embedder the merge runs with.
+    #[derive(Debug, Clone, Copy)]
+    enum Emb8907 {
+        Works,
+        Fails,
+        Absent,
+    }
+
+    /// Seed one target with the OLD document's vector (DB and index), run a
+    /// one-update synthesis merge, and return (stored vector, receipt,
+    /// index hit for the target's new-document vector, expected new vector).
+    fn synthesis_cell_8907(
+        cell: Emb8907,
+    ) -> (
+        Option<Vec<f32>>,
+        Value,
+        bool,
+        Vec<f32>,
+        tempfile::NamedTempFile,
+    ) {
+        use crate::embeddings::Embed;
+        use crate::embeddings::test_support::{FailingEmbedder, MockEmbedder};
+        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let conn = db::open(tmp.path()).expect("db::open");
+        let mock = MockEmbedder::new_local().expect("mock embedder");
+        let now = chrono::Utc::now().to_rfc3339();
+        let target = Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            namespace: "syn-8907".to_string(),
+            title: "deploy target".to_string(),
+            content: "old body: the deploy runs on the old cluster".to_string(),
+            created_at: now.clone(),
+            updated_at: now,
+            metadata: json!({ crate::META_KEY_AGENT_ID: "ai:test" }),
+            ..Memory::default()
+        };
+        let id = db::insert(&conn, &target).expect("insert target");
+        let target = db::get(&conn, &id).expect("get").expect("seeded");
+        let old = mock
+            .embed(&crate::embeddings::embedding_document(
+                &target.title,
+                &target.content,
+            ))
+            .expect("old vector");
+        db::set_embedding(&conn, &id, &old, &mock.space_fingerprint()).expect("old vector set");
+        let index = crate::hnsw::VectorIndex::empty();
+        index.insert(id.clone(), old);
+        let incoming = Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            title: "incoming fact".to_string(),
+            ..target.clone()
+        };
+        let outcome = SynthesisOutcome {
+            updates: vec![(id.clone(), MERGED_8907.to_string())],
+            ..SynthesisOutcome::empty()
+        };
+        let failing = FailingEmbedder;
+        let embedder: Option<&dyn Embed> = match cell {
+            Emb8907::Works => Some(&mock),
+            Emb8907::Fails => Some(&failing),
+            Emb8907::Absent => None,
+        };
+        let receipt = apply_synthesis_updates_and_deletes(
+            &conn,
+            &incoming,
+            std::slice::from_ref(&target),
+            embedder,
+            Some(&index),
+            &outcome,
+            None,
+            None,
+        )
+        .expect("merge applies")
+        .expect("primary update echoes a receipt");
+        let expected = mock
+            .embed(&crate::embeddings::embedding_document(
+                &target.title,
+                MERGED_8907,
+            ))
+            .expect("new vector");
+        let stored = db::get_embedding(&conn, &id).expect("read vector");
+        let indexed = index.search(&expected, 5).iter().any(|h| h.id == id);
+        (stored, receipt, indexed, expected, tmp)
+    }
+
+    /// #8907 — a synthesis merge that changes a target's content leaves the
+    /// row with the NEW document's vector, or with none and a degraded
+    /// receipt; never the OLD vector, in the DB or in the vector index.
+    #[test]
+    fn synthesis_merge_vector_follows_content_8907() {
+        for cell in [Emb8907::Works, Emb8907::Fails, Emb8907::Absent] {
+            let (stored, receipt, indexed, expected, _tmp) = synthesis_cell_8907(cell);
+            match cell {
+                Emb8907::Works => {
+                    assert_eq!(
+                        stored,
+                        Some(expected),
+                        "{cell:?}: not the merged document's vector"
+                    );
+                    assert!(indexed, "{cell:?}: the index lost the merged row");
+                    assert!(receipt.get("embed_status").is_none(), "{cell:?}: {receipt}");
+                }
+                Emb8907::Fails | Emb8907::Absent => {
+                    assert!(
+                        stored.is_none(),
+                        "{cell:?}: the OLD vector stayed on the row"
+                    );
+                    assert!(!indexed, "{cell:?}: the index still holds the row");
+                    let (status, reason) = if matches!(cell, Emb8907::Fails) {
+                        ("failed", crate::embeddings::EMBED_FAILED_REASON)
+                    } else {
+                        ("skipped", crate::embeddings::NO_EMBEDDER_REASON)
+                    };
+                    assert_eq!(receipt["embed_status"], status, "{cell:?}: {receipt}");
+                    assert_eq!(
+                        receipt["embed_status_reason"], reason,
+                        "{cell:?}: {receipt}"
+                    );
+                }
+            }
+        }
     }
 }

@@ -781,6 +781,96 @@ pub fn oversize_embed_reason(byte_len: usize) -> Option<String> {
         .then(|| format!("content {byte_len} bytes exceeds embed cap {EMBED_MAX_BYTES} bytes"))
 }
 
+/// #8907 — the caller-safe `embed_status_reason` of an embedder runtime
+/// error that is not a bounded provider diagnostic (#3648).
+pub const EMBED_FAILED_REASON: &str = "embedding_failed";
+
+/// #8907 X-5 — the `embed_status_reason` of an embed whose input is empty.
+pub const EMPTY_CONTENT_REASON: &str = "empty content";
+
+/// #8907 X-5 — the `embed_status_reason` of an embedder that answered with
+/// an empty vector (stored as no vector: NULL, I-3).
+pub const EMPTY_VECTOR_REASON: &str = "embedder returned empty vector";
+
+/// #8907 X-5 — the `embed_status_reason` of an embed whose blocking task did
+/// not complete (panicked or was cancelled), on every write surface.
+pub const EMBED_TASK_INCOMPLETE_REASON: &str = "embed task did not complete";
+
+/// #8907 — the `embed_status_reason` of a content-changing write on a
+/// surface with no embedder: the store cleared the stale vector and there
+/// is nothing to compute the new one with.
+pub const NO_EMBEDDER_REASON: &str = "no embedder configured";
+
+/// #8907 — the status a content-changing write reports when the surface
+/// has no embedder (the stale vector is cleared, none replaces it).
+#[must_use]
+pub fn no_embedder_status() -> EmbedStatus {
+    EmbedStatus::Skipped(NO_EMBEDDER_REASON.to_string())
+}
+
+/// #8907 / #8948 — the ONE embed decision every write funnels through, over
+/// any [`Embed`] implementor (the production [`Embedder`], the MCP `dyn
+/// Embed` handle, a test seam). [`Embedder::embed_with_status`] delegates
+/// here, so the store path and every content-changing update path share one
+/// classification:
+///
+/// * Empty input → `(None, Skipped("empty content"))`
+/// * Input larger than [`EMBED_MAX_BYTES`] → `(None, Skipped(reason))`
+/// * Embedder errors or returns an empty vector → `(None, Failed(reason))`
+/// * Otherwise → `(Some(vec), Indexed)`
+///
+/// A caller that gets `None` back must leave the row WITHOUT a vector (the
+/// store layer already cleared it on a content change) and report the
+/// outcome with [`attach_embed_status`]; it never keeps the old vector.
+pub fn embed_document_with_status(
+    embedder: &dyn Embed,
+    text: &str,
+) -> (Option<Vec<f32>>, EmbedStatus) {
+    if text.is_empty() {
+        return (None, EmbedStatus::Skipped(EMPTY_CONTENT_REASON.to_string()));
+    }
+    if let Some(reason) = oversize_embed_reason(text.len()) {
+        return (None, EmbedStatus::Skipped(reason));
+    }
+    match embedder.embed(text) {
+        Ok(v) if v.is_empty() => (None, EmbedStatus::Failed(EMPTY_VECTOR_REASON.to_string())),
+        Ok(v) => (Some(v), EmbedStatus::Indexed),
+        Err(e) => {
+            // #3648: arbitrary local/remote error chains are not caller-safe.
+            // Downcast only the bounded provider diagnostic; discard all contexts.
+            let reason = e
+                .downcast_ref::<crate::llm::ProviderError>()
+                .map_or_else(|| EMBED_FAILED_REASON.to_string(), ToString::to_string);
+            // Provider errors are sanitized upstream; preserve local causes for operators.
+            tracing::warn!(target: "embeddings.degrade", reason = %format_args!("{e:#}"), "embed_with_status: embedder failed");
+            (None, EmbedStatus::Failed(reason))
+        }
+    }
+}
+
+/// #8907 — stamp the degraded-embedding marker on a write response: the
+/// `embed_status` / `embed_status_reason` keys the HTTP create path has
+/// always emitted (`handlers/create.rs`), now shared by every update path.
+/// A no-op for [`EmbedStatus::Indexed`] and for a non-object response.
+pub fn attach_embed_status(response: &mut serde_json::Value, status: &EmbedStatus) {
+    if !status.is_degraded() {
+        return;
+    }
+    if let Some(obj) = response.as_object_mut() {
+        obj.insert(
+            "embed_status".to_string(),
+            serde_json::Value::from(status.as_str()),
+        );
+        let reason = status.reason();
+        if !reason.is_empty() {
+            obj.insert(
+                "embed_status_reason".to_string(),
+                serde_json::Value::from(reason),
+            );
+        }
+    }
+}
+
 /// v0.7.0 L0.7 — minimal dyn-compatible trait that abstracts "produces
 /// embedding vectors" away from the concrete [`Embedder`] enum.
 ///
@@ -1565,29 +1655,7 @@ impl Embedder {
     /// Callers that don't care about the status keep using
     /// [`Embedder::embed`]; this is the new opt-in API.
     pub fn embed_with_status(&self, text: &str) -> (Option<Vec<f32>>, EmbedStatus) {
-        if text.is_empty() {
-            return (None, EmbedStatus::Skipped("empty content".to_string()));
-        }
-        if let Some(reason) = oversize_embed_reason(text.len()) {
-            return (None, EmbedStatus::Skipped(reason));
-        }
-        match self.embed(text) {
-            Ok(v) if v.is_empty() => (
-                None,
-                EmbedStatus::Failed("embedder returned empty vector".to_string()),
-            ),
-            Ok(v) => (Some(v), EmbedStatus::Indexed),
-            Err(e) => {
-                // #3648: arbitrary local/remote error chains are not caller-safe.
-                // Downcast only the bounded provider diagnostic; discard all contexts.
-                let reason = e
-                    .downcast_ref::<crate::llm::ProviderError>()
-                    .map_or_else(|| "embedding_failed".to_string(), ToString::to_string);
-                // Provider errors are sanitized upstream; preserve local causes for operators.
-                tracing::warn!(target: "embeddings.degrade", reason = %format_args!("{e:#}"), "embed_with_status: embedder failed");
-                (None, EmbedStatus::Failed(reason))
-            }
-        }
+        embed_document_with_status(self, text)
     }
 
     fn embed_local(
