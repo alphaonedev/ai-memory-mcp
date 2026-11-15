@@ -222,7 +222,7 @@ every transit surface consults it.
 
 | surface | funnel | behaviour since #3705 |
 |---|---|---|
-| the daemon listener — every API route, MCP-over-HTTP, `/metrics` | `tls_bind_guard` in `bootstrap_serve` | a bind without `--tls-cert` + `--tls-key` is REFUSED on every host, loopback included; the refusal names the plaintext path |
+| the daemon listener — every API route, MCP-over-HTTP, `/metrics` | `resolve_tls_material` in `bootstrap_serve` (then `tls_bind_guard`) | TLS on every host, loopback included, and no path serves plaintext: `--tls-cert` + `--tls-key` serve that pair; with neither flag a singleton serves the local-CA material it generates and renews, or operator material installed by `ai-memory tls import`; no in-process TLS material (a declared non-singleton shape without operator material, expired operator material, half a pair) is REFUSED at boot |
 | outbound federation peers (`--quorum-peers`, `sync-daemon --peers`) | `tls::validate_peer_url_scheme` | every `http://` peer is REFUSED, loopback included |
 | webhook targets | `subscriptions::validate_url` (create AND dispatch) | every `http://` target is REFUSED, loopback included; https only — a receiver behind a private PKI is trusted via `[subscriptions] ca_cert` (a PEM the dispatcher adds to the public roots; unreadable/unparseable refuses boot) |
 | PostgreSQL store DSN | `PostgresStore` connect funnel | a DSN that does not pin `sslmode=verify-full` (last `sslmode` wins) is REFUSED before a socket opens |
@@ -281,11 +281,10 @@ Operators with their own PKI pass `--tls-cert`/`--tls-key`; the local CA
 is then not consulted for the listener. Every refusal names its fix, and
 names only what exists in this release: the `--tls-cert`/`--tls-key` flags,
 the `sslmode=verify-full&sslrootcert=<ca.crt>` DSN parameters, and the files
-under `<key_dir>/tls/`. The `ai-memory tls init|import|renew` and
-`ai-memory db check-tls` verbs are #3709 items 2–4 (v1.0.1, a separate
-branch); a refusal never points at a verb that does not ship with it. Until
-they land, first-boot generation (singleton) and `--tls-cert`/`--tls-key`
-are the two paths.
+under `<key_dir>/tls/`, and the `ai-memory tls` verbs. v1.0.0 ships
+`ai-memory tls init`, `tls import`, and `tls status` (#3709 item 2); `tls
+renew` and `ai-memory db check-tls` are not shipped in v1.0.0, and a refusal
+never points at a verb that does not ship (#4006).
 
 #### Bring your own certificate (enterprise PKI) — the fleet path
 
@@ -305,15 +304,18 @@ by the bundled clients on that host — never by a peer).
   `localhost` if anything dials loopback). Wildcards are acceptable where
   your PKI policy allows them.
 - **How it is supplied.** `--tls-cert <fullchain.pem>` (leaf first, then
-  intermediates, PEM) and `--tls-key <key.pem>` (PKCS#8 PEM; SEC1/RSA
-  are accepted). The key file must be owner-only (`chmod 0600`), the
+  intermediates, PEM) and `--tls-key <key.pem>` (PKCS#8 PEM; PKCS#1 RSA
+  and SEC1 EC are accepted). The key file must be owner-only (`chmod 0600`), the
   directory `0700`; the daemon refuses lax modes the same way it refuses a
   lax key directory (#3198).
-- **Rotation.** Replace the files in place and restart, or use
-  `--tls-cert <fullchain.pem> --tls-key <key.pem>` (an `ai-memory tls import` verb is #3709 item 2, v1.0.1, separate
-  owner) which validates the pair and hands it to the daily reload task so
-  the listener picks the new material up without a restart. Expiry shows in
-  `ai-memory doctor` (`local_tls_material`) before it bites.
+- **Rotation.** Re-run `ai-memory tls import` with `--cert <fullchain.pem>`
+  and `--key <key.pem>` (it validates the pair the way the listener will
+  before installing it under `<key_dir>/tls/`), or replace the files passed
+  to `--tls-cert`/`--tls-key`, then restart `serve` (#4006): operator
+  material is read once at boot. Only the local-CA material of a singleton
+  is renewed by the daemon itself (a daily task that hot-reloads the
+  listener). Expiry shows in `ai-memory doctor` (`local_tls_material`)
+  before it bites.
 - **What refuses.** A `serve` under a declared non-singleton shape without
   operator material is refused at boot
   (`transit_encryption::fleet_needs_enterprise_pki_refusal`, naming the
@@ -354,8 +356,8 @@ by the bundled clients on that host — never by a peer).
 │ (Claude Code)│  stdio JSON-RPC     │ daemon /     │
 ├──────────────┤                     │ MCP server / │
 │ HTTP client  │────────────────────▶│ CLI          │
-│ (SDK, curl)  │  API key + mTLS     │              │
-├──────────────┤   mTLS + sync       └──────┬───────┘
+│ (SDK, curl)  │  TLS; key if set    │              │
+├──────────────┤   TLS + enrollment  └──────┬───────┘
 │ peer daemon  │◀────────────────────┐      │
 └──────────────┘                     │      │ SQLite mutex
                                      │      ▼
@@ -368,9 +370,45 @@ by the bundled clients on that host — never by a peer).
 
 - **MCP (stdio)**: trusts the parent process. Run as the same user
   as the MCP client. No authentication needed.
-- **HTTP daemon**: trusts no one by default. API key + mTLS gate
-  inbound.
-- **Peer sync**: trusts peers on the mTLS allowlist.
+- **HTTP daemon, default bind**: `serve` binds `127.0.0.1` by default
+  and demands an API key only when top-level `api_key` is set in
+  `config.toml`; nothing sets one by default.
+- **HTTP daemon, keyless loopback**: a keyless bind to a loopback
+  address serves, and the boot logs these two WARN lines (verbatim):
+
+```text
+API key NOT configured — daemon bound to loopback "127.0.0.1". Privileged endpoints (POST /memories, /links, /agents, /subscriptions) accept any caller that reaches this listener. #1458: a reverse proxy, --network=host container, or socat forward presents loopback to the daemon while exposing it off-host, re-opening this keyless write surface — set top-level `api_key = "..."` (or AI_MEMORY_REQUIRE_API_KEY=1 to hard-require it) for any deployment that is not strictly single-tenant on this host. /approve and /reject remain HMAC-gated regardless.
+TLS enabled but mTLS NOT configured — no client certificate is requested, so the TLS transport admits any client; the sync endpoints (/api/v1/sync/push, /api/v1/sync/since) still refuse a peer that is not enrolled (AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS=1 lifts that). Set --mtls-allowlist for production peer-mesh deployments (red-team #231).
+```
+
+- **HTTP daemon, keyless non-loopback**: a keyless bind to a
+  non-loopback address is refused at boot (`refusing to bind to
+  non-loopback address ... without an API key`), exit 75 (`EX_TEMPFAIL`).
+- **HTTP daemon, hard requirement**: with `AI_MEMORY_REQUIRE_API_KEY=1`
+  a keyless bind is refused on every address, loopback included
+  (`AI_MEMORY_REQUIRE_API_KEY is set`), exit 75.
+- **HTTP daemon, mTLS**: client certificates apply only when
+  `--mtls-allowlist` is passed (with `--tls-cert` and `--tls-key`).
+- **HTTP daemon, what that means**: on the default configuration an
+  unauthenticated local client can read: `GET /api/v1/memories` answers
+  200 with no header at all. `X-Agent-Id` is self-asserted when no
+  `api_key` is set, so a local client that names an agent in the
+  self-asserted `X-Agent-Id` header can also link and delete that
+  agent's memories (`POST /api/v1/links` 201,
+  `DELETE /api/v1/memories/{id}` 200). An unsigned
+  `POST /api/v1/memories` is refused `403 ATTESTATION_FAILED` by agent
+  attestation (`AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0` lifts it), and
+  `POST /api/v1/agents` and `POST /api/v1/subscriptions` without an
+  agent header are refused 403, so the first WARN line above states the
+  keyless surface more broadly than a probe finds it. Even so,
+  attestation and enrollment are not authentication; the default-on API
+  key is #2046. Set `api_key` on anything but a single-user host.
+- **Peer sync**: by default `/api/v1/sync/push` and `/api/v1/sync/since`
+  refuse a peer that is not enrolled (`401 peer_not_enrolled`, #1789;
+  `AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS=1` lifts that gate). With
+  `--mtls-allowlist` set, the TLS handshake also refuses a client
+  without an allowlisted certificate; without it the TLS transport
+  requests no client certificate.
 - **Governance**: trusts registered agents for approvals. Adding an
   approver is the only way in.
 
@@ -385,7 +423,8 @@ Set via the `api_key` field in `config.toml` (`serve` has no
 api_key = "long-random-string"   # e.g. pwgen -s 48 1
 ```
 
-Every HTTP endpoint except `/api/v1/health` enforces the key (when
+When `api_key` is set, every HTTP endpoint except `/api/v1/health`
+enforces the key (when
 the mTLS allowlist is enforced, the `/api/v1/sync/*` federation
 endpoints additionally bypass the key check — they have already
 cleared a stronger transport gate; see #702 and

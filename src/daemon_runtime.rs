@@ -12,7 +12,7 @@
 //! ## Public surface (post-W6)
 //!
 //! - [`run`] — top-level CLI dispatch (called from `main()`).
-//! - [`serve`] — full HTTP daemon body (TLS or plain).
+//! - [`serve`] — full HTTPS daemon body (in-process TLS only; #3705, #4006).
 //! - [`bootstrap_serve`] — testable struct-returning state builder.
 //! - [`build_router`] — composition wrapper around `lib::build_router`.
 //! - [`build_embedder`], [`build_vector_index`] — single canonical builders
@@ -326,7 +326,7 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Start the HTTP memory daemon.
+    /// Start the HTTPS memory daemon.
     ///
     /// **Tier resolution.** Unlike `mcp` / `store` / `recall`, the
     /// `serve` subcommand does NOT accept a `--tier` flag. The
@@ -1119,28 +1119,37 @@ pub struct MigrateArgs {
 
 #[derive(Args)]
 pub struct ServeArgs {
+    /// Address to bind. Without top-level `api_key` in `config.toml` a
+    /// non-loopback address is refused at boot (exit 75) and a loopback
+    /// address serves with no API-key authentication and logs a WARN;
+    /// `AI_MEMORY_REQUIRE_API_KEY=1` refuses a keyless bind on every address.
     #[arg(long, default_value = "127.0.0.1")]
     pub host: String,
     #[arg(long, default_value_t = DEFAULT_PORT)]
     pub port: u16,
-    /// Path to PEM-encoded TLS certificate (may include the full chain).
-    /// Passing both `--tls-cert` and `--tls-key` switches `serve` to
-    /// HTTPS. rustls under the hood — no OpenSSL dep. Absent both
-    /// flags = plain HTTP (same as every previous release).
+    /// PEM TLS certificate (may include the full chain), paired with `--tls-key`;
+    /// rustls, no OpenSSL. Without these flags `serve` uses material installed by
+    /// `ai-memory tls import` or generated locally for a singleton, and refuses
+    /// otherwise; it never serves plaintext HTTP (#3705, #4006).
     #[arg(long, requires = "tls_key")]
     pub tls_cert: Option<PathBuf>,
-    /// Path to PEM-encoded TLS private key (PKCS#8 or RSA).
+    /// PEM TLS private key (PKCS#8, PKCS#1 RSA or SEC1 EC), paired with
+    /// `--tls-cert`; one without the other is refused at parse time.
     #[arg(long, requires = "tls_cert")]
     pub tls_key: Option<PathBuf>,
     /// Path to a file containing SHA-256 fingerprints of trusted client
     /// certificates, one per line (case-insensitive hex, optionally with
     /// `:` separators; comments start with `#`). When set, `serve`
-    /// demands client-cert mTLS on every connection and refuses any peer
-    /// whose cert fingerprint is not on the list. Requires `--tls-cert`
-    /// and `--tls-key`. This is the peer-mesh identity gate — a peer
-    /// without an authorised cert can't even open a TCP connection, let
-    /// alone hit `/sync/push`. Layer 2 of the peer-mesh crypto stack;
-    /// attested `agent_id` extraction (Layer 2b) lands post-v0.6.0.
+    /// requests a client certificate in the TLS handshake of every
+    /// connection and fails the handshake for a peer that presents none
+    /// or one whose fingerprint is not on the list, so that peer never
+    /// reaches an HTTP route such as `/sync/push`; the gate is the TLS
+    /// handshake, not TCP accept. Requires `--tls-cert` and `--tls-key`.
+    /// Without this flag no client certificate is requested and `serve`
+    /// logs a WARN; the sync endpoints still refuse a peer that is not
+    /// enrolled (#1789). Layer 2 of the peer-mesh crypto stack; the
+    /// certificate-to-agent binding (`AI_MEMORY_MTLS_AGENT_BINDING`,
+    /// #8357) builds on it.
     #[arg(long, requires = "tls_cert")]
     pub mtls_allowlist: Option<PathBuf>,
     /// Seconds to wait for in-flight requests to complete on graceful
@@ -5929,17 +5938,18 @@ fn require_api_key_strict_value(value: Option<&str>) -> bool {
 /// front of the daemon, so a non-loopback bind without in-process TLS is an
 /// accepted posture.
 ///
-/// Consumed by [`tls_bind_guard`] (tranche 3): when set, a plaintext
-/// non-loopback bind is silently permitted instead of emitting the hard M2
-/// posture WARN.
+/// #3705 removed this hatch: a truthy value now refuses boot as a downgrade
+/// path ([`allow_plaintext_nonloopback_enabled`]); it never permits a
+/// plaintext bind (#4006).
 pub const ENV_ALLOW_PLAINTEXT_NONLOOPBACK: &str = "AI_MEMORY_ALLOW_PLAINTEXT_NONLOOPBACK";
 
 /// #2032 M2 (class-a, 5-agent vote `4d3ea1c5`) — env name for the
 /// fail-closed-now TLS opt-in. When truthy the operator demands in-process
 /// TLS on every bind; a plaintext bind is refused.
 ///
-/// Consumed by [`tls_bind_guard`] (tranche 3): when set, a bind without a
-/// `--tls-cert` / `--tls-key` pair is refused (fail-closed-now).
+/// Since #3705 the floor is always in force ([`require_tls_enabled`]); a
+/// falsy or unrecognised value refuses boot rather than making TLS optional
+/// (#4006).
 pub const ENV_REQUIRE_TLS: &str = "AI_MEMORY_REQUIRE_TLS";
 
 /// #2032 M2 → #3705 — the `AI_MEMORY_ALLOW_PLAINTEXT_NONLOOPBACK` hatch is a
@@ -6462,10 +6472,9 @@ pub async fn bootstrap_serve(
     tls_bind_guard(true, args.host.as_str(), args.port)?;
 
     // v1.0.0 #3474 — record whether THIS listener may carry a freshly minted
-    // bearer credential. The #2032 M2 guard above only WARNs on a plaintext
-    // non-loopback bind (and `AI_MEMORY_ALLOW_PLAINTEXT_NONLOOPBACK=1`
-    // silences even that), which is a survivable posture for content and an
-    // unsurvivable one for handing out a per-agent api-key in the clear. The
+    // bearer credential. (Before #3705 the #2032 M2 guard only WARNed on a
+    // plaintext non-loopback bind; the guard above now refuses every
+    // plaintext bind, #4006.) The
     // mint route consults this marker and refuses; the REVOKE route does not,
     // because refusing a revocation is strictly worse than performing one over
     // a channel the operator already accepted. Default is `false` (refuse), so
@@ -8127,7 +8136,8 @@ fn classify_server_failure(error: anyhow::Error) -> anyhow::Error {
 }
 
 /// Run the HTTP memory daemon. Loads TLS state, builds `AppState`, spawns
-/// lifecycle-owned workers, and binds a listener (TLS or plain HTTP). On every
+/// lifecycle-owned workers, and binds a TLS listener (never plain HTTP; #3705,
+/// #4006). On every
 /// exit path it quiesces writers, drains deferred audit, and either completes
 /// final witness/WAL certification or returns [`FatalShutdownError`].
 #[allow(clippy::too_many_lines)]
@@ -8338,10 +8348,12 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
                 tls::load_mtls_rustls_config(cert, key, allowlist_path).await?
             } else {
                 tracing::warn!(
-                    "TLS enabled but mTLS NOT configured — sync endpoints \
-                 (/api/v1/sync/push, /api/v1/sync/since) accept any client. \
-                 Set --mtls-allowlist for production peer-mesh deployments \
-                 (red-team #231)."
+                    "TLS enabled but mTLS NOT configured — no client certificate \
+                 is requested, so the TLS transport admits any client; the sync \
+                 endpoints (/api/v1/sync/push, /api/v1/sync/since) still refuse a \
+                 peer that is not enrolled (AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS=1 \
+                 lifts that). Set --mtls-allowlist for production peer-mesh \
+                 deployments (red-team #231)."
                 );
                 tls::load_rustls_config(cert, key).await?
             };
