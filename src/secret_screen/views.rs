@@ -233,3 +233,56 @@ pub(super) fn screen_with_views(content: &str, pass: Pass) -> (Vec<&'static str>
     }
     (kinds, redacted)
 }
+
+#[cfg(test)]
+mod tests_8855_r2 {
+    //! Ruling (e) in isolation: a pass that reports a hit but leaves the
+    //! secret in its redacted copy (an incomplete detector) must not yield a
+    //! storable copy. Mutating the re-screen away turns
+    //! `e_rescreen_refuses_incomplete_redaction_8855` red.
+
+    use super::{KIND_RESIDUAL, REDACTION_PLACEHOLDER, screen_with_views};
+
+    /// The kind the synthetic passes report.
+    const KIND_SYNTHETIC: &str = "synthetic_hit";
+    /// The marker the synthetic passes treat as credential material.
+    const MARKER: &str = "MARKER";
+    /// Text around the marker.
+    const INPUT: &str = "before MARKER after";
+
+    /// Reports a hit and returns the text unchanged (the redaction misses).
+    fn leaky_pass(text: &str) -> (Vec<&'static str>, String) {
+        let kinds = if text.contains(MARKER) {
+            vec![KIND_SYNTHETIC]
+        } else {
+            Vec::new()
+        };
+        (kinds, text.to_string())
+    }
+
+    /// Reports a hit and masks the marker (a complete redaction).
+    fn complete_pass(text: &str) -> (Vec<&'static str>, String) {
+        if text.contains(MARKER) {
+            (
+                vec![KIND_SYNTHETIC],
+                text.replace(MARKER, REDACTION_PLACEHOLDER),
+            )
+        } else {
+            (Vec::new(), text.to_string())
+        }
+    }
+
+    #[test]
+    fn e_rescreen_refuses_incomplete_redaction_8855() {
+        let (kinds, copy) = screen_with_views(INPUT, leaky_pass);
+        assert_eq!(kinds, vec![KIND_RESIDUAL, KIND_SYNTHETIC]);
+        assert_eq!(copy, REDACTION_PLACEHOLDER);
+    }
+
+    #[test]
+    fn e_rescreen_keeps_a_complete_redaction_8855() {
+        let (kinds, copy) = screen_with_views(INPUT, complete_pass);
+        assert_eq!(kinds, vec![KIND_SYNTHETIC]);
+        assert_eq!(copy, INPUT.replace(MARKER, REDACTION_PLACEHOLDER));
+    }
+}
