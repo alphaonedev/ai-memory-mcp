@@ -786,11 +786,12 @@ async fn b3_anonymous_shared_key_reads_no_private_row_writes_nothing_named_9341(
     // Every path parameter names the seeded row, so `/memories/{id}`-shaped
     // routes probe exactly the private row.
     let uri_for = |row: &RouteRow| {
-        let mut uri = concrete_path_naming(row.path, &seeded_id);
+        let uri = concrete_path_naming(row.path, &seeded_id);
         if row.method == "get" {
-            uri.push_str(&format!("?namespace={ns}&q={marker}&query={marker}"));
+            format!("{uri}?namespace={ns}&q={marker}&query={marker}")
+        } else {
+            uri
         }
-        uri
     };
     // The body names the row id under every key a body-addressed route reads,
     // so POST routes that take the id in the body probe the private row too.
@@ -964,7 +965,7 @@ async fn b3_anonymous_shared_key_reads_no_private_row_writes_nothing_named_9341(
         };
         let mut uri = concrete_path_naming(row.path, fresh_id);
         if row.method == "get" {
-            uri.push_str(&format!("?namespace={ns}&q={marker}&query={marker}"));
+            uri = format!("{uri}?namespace={ns}&q={marker}&query={marker}");
         }
         let out = send_simple(
             &fx.router,
