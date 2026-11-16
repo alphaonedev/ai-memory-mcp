@@ -1524,7 +1524,7 @@ fn s1b_key_field_scanner_self_test_9354() {
 }
 
 /// Number of s1b syntax-form cells (asserted in s1b).
-const SCANNER_FORM_CELLS_COUNT: usize = 34;
+const SCANNER_FORM_CELLS_COUNT: usize = 36;
 /// s1b syntax-form cells (name, synthetic source, 1-based lines that must be
 /// reported). Every syntax that binds or reads the `key` field of the guarded
 /// type is a read; a construction, the struct declaration and an `impl` body
@@ -1637,6 +1637,16 @@ const SCANNER_FORM_CELLS: [(&str, &str, &[usize]); SCANNER_FORM_CELLS_COUNT] = [
         "unclassified-group-fails-closed",
         "ApiKeyState { key: k, mtls_enforced: m }",
         &[1],
+    ),
+    (
+        "macro-pattern",
+        "let t = matches!(s, ApiKeyState { key: None, mtls_enforced: true });\nassert!(matches!(o, Some(ApiKeyState { key: Some(_), mtls_enforced: _ })));",
+        &[1, 2],
+    ),
+    (
+        "macro-construction-with-update",
+        "let v = vec![ApiKeyState { key: k, ..Default::default() }];",
+        &[],
     ),
     ("raw-ident-field", "let k = s.r#key.clone();", &[1]),
     (
