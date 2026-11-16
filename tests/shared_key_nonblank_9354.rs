@@ -1444,12 +1444,16 @@ fn key_field_read_lines(blanked: &str, guarded_type: &str) -> Vec<usize> {
         }
         let before = skip_ws_back(&c, i);
         let return_type = before >= 2 && c[before - 2] == '-' && c[before - 1] == '>';
-        let prefix = stmt_prefix(&c, i);
-        if return_type
-            || ["impl", "struct", "enum", "union"]
-                .iter()
-                .any(|w| has_word(&prefix, w))
-        {
+        // An item header names the type right after its keyword (`struct T {`,
+        // `impl T {`) or after the `for` of `impl Trait for T {`; a `for` loop
+        // statement never holds `impl`. A keyword elsewhere in the statement
+        // (`fn f(g: impl Fn(), T { key, .. }: T)`) is not a header.
+        let item_header = match ident_before(&c, before).map(|(_, w)| w).as_deref() {
+            Some("struct" | "impl") => true,
+            Some("for") => has_word(&stmt_prefix(&c, i), "impl"),
+            _ => false,
+        };
+        if return_type || item_header {
             continue;
         }
         let close = matching_close(&c, open);
@@ -1534,7 +1538,7 @@ fn s1b_key_field_scanner_self_test_9354() {
 }
 
 /// Number of s1b syntax-form cells (asserted in s1b).
-const SCANNER_FORM_CELLS_COUNT: usize = 38;
+const SCANNER_FORM_CELLS_COUNT: usize = 39;
 /// s1b syntax-form cells (name, synthetic source, 1-based lines that must be
 /// reported). Every syntax that binds or reads the `key` field of the guarded
 /// type is a read; a construction, the struct declaration and an `impl` body
@@ -1667,6 +1671,11 @@ const SCANNER_FORM_CELLS: [(&str, &str, &[usize]); SCANNER_FORM_CELLS_COUNT] = [
         "item-word-earlier-in-statement",
         "let n = ApiKeyState::default(); let _ = |union: u8, ApiKeyState { key: k, mtls_enforced: _ }: ApiKeyState| k;",
         &[1],
+    ),
+    (
+        "impl-headers-with-method-named-key",
+        "impl ApiKeyState {\n fn key(&self) -> u8 { 0 }\n}\nimpl Tr for ApiKeyState {\n fn key(&self) -> u8 { 0 }\n}",
+        &[],
     ),
     ("raw-ident-field", "let k = s.r#key.clone();", &[1]),
     (
