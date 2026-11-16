@@ -972,6 +972,52 @@ pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+/// #9354 — a configured shared key, non-empty after `str::trim` by
+/// construction: the private field is reachable only through [`Self::new`],
+/// so no compare site can hold a blank expected key (per ERRORS-09).
+#[derive(Clone, Copy)]
+pub(crate) struct ConfiguredKey<'a>(&'a str);
+
+impl<'a> ConfiguredKey<'a> {
+    /// `None` for a key that is empty or whitespace (Unicode `White_Space`,
+    /// so U+00A0 too). A non-blank key is kept byte for byte, padding included.
+    pub(crate) fn new(raw: &'a str) -> Option<Self> {
+        (!raw.trim().is_empty()).then_some(Self(raw))
+    }
+
+    /// Constant-time compare of a presented credential with this key.
+    pub(crate) fn matches(self, presented: &str) -> bool {
+        constant_time_eq(presented.as_bytes(), self.0.as_bytes())
+    }
+}
+
+impl ApiKeyState {
+    /// #9354 — the configured shared key, `None` when unset or blank. The one
+    /// read of the raw `key` field for a credential compare.
+    pub(crate) fn configured_key(&self) -> Option<ConfiguredKey<'_>> {
+        self.key.as_deref().and_then(ConfiguredKey::new)
+    }
+}
+
+/// #9354 (ruling 28907a4f) — the boot WARN for a configured `api_key` that is
+/// blank. It names the remedy and never carries the configured value.
+pub(crate) const BLANK_KEY_BOOT_WARN: &str = "#9354: api_key is configured but blank (empty or \
+whitespace) and is treated as no shared key: HTTP API-key auth is off and a non-loopback bind is \
+refused; remedy: set top-level `api_key = \"...\"` to a non-blank secret, or remove the blank value";
+
+/// #9354 — the daemon boot normalizer (#1903 precedent): a blank configured
+/// key is no shared key, so the keyless bind guard applies, and the operator
+/// is told so with [`BLANK_KEY_BOOT_WARN`]. Decision: blank is "no key" at
+/// boot (never a key that matches a blank header) because the bind guard
+/// then refuses a routable bind; past boot, a blank key is refused closed.
+pub(crate) fn boot_shared_key(configured: Option<&str>) -> Option<String> {
+    let key = configured.and_then(ConfiguredKey::new);
+    if configured.is_some() && key.is_none() {
+        tracing::warn!("{BLANK_KEY_BOOT_WARN}");
+    }
+    key.map(|k| k.0.to_string())
+}
+
 /// #2502 — peer source for auth-failure backoff: the TCP peer IP from
 /// `ConnectInfo` (wired by `into_make_service_with_connect_info` in `serve`).
 /// NEVER a client header: the tree has no trusted-proxy setting, so a
@@ -1041,10 +1087,12 @@ pub async fn api_key_auth(
     if let Err(resp) = crate::mtls_agent_binding::bind_request(&mut req) {
         return resp;
     }
-    let Some(ref expected) = auth.key else {
-        // No API key configured — allow all requests
+    // No API key configured — allow all requests. #9354 — a key that is
+    // present but blank is NOT "no key": it falls through and is refused
+    // closed below (it never matches; only an enrolled per-agent key admits).
+    if auth.key.is_none() {
         return next.run(req).await.into_response();
-    };
+    }
 
     // Exempt health endpoint
     if req.uri().path() == super::routes::HEALTH
@@ -1161,7 +1209,8 @@ pub async fn api_key_auth(
     // now instead of at the next restart. That is the security half: an
     // enrollment that lags is an inconvenience, a revocation that lags is a
     // credential an operator believes is dead.
-    let is_global = constant_time_eq(token.as_bytes(), expected.as_bytes());
+    // #9354 — the typed key: a blank configured key is `None`, never a match.
+    let is_global = auth.configured_key().is_some_and(|k| k.matches(&token));
     let token_hash = super::identity_binding::api_key_sha256_hex(&token);
     let per_agent: Option<String> = if is_global {
         None
@@ -1662,6 +1711,30 @@ mod transport_helpers_tests {
         assert!(!constant_time_eq(b"abc", b"abd"));
         assert!(!constant_time_eq(b"abc", b"abcd"));
         assert!(constant_time_eq(b"", b""));
+    }
+
+    /// #9354 — a blank key cannot be constructed, so it can never be the
+    /// expected key of a compare; a non-blank key is kept byte for byte.
+    #[test]
+    fn configured_key_refuses_blank_by_construction_9354() {
+        const BLANK: [&str; 5] = ["", " ", "\t", " \n ", "\u{00a0}"];
+        const PADDED: &str = "  k9354  ";
+        for blank in BLANK {
+            assert!(
+                ConfiguredKey::new(blank).is_none(),
+                "{blank:?} must be refused"
+            );
+            let state = ApiKeyState {
+                key: Some(blank.to_string()),
+                ..Default::default()
+            };
+            assert!(state.configured_key().is_none(), "{blank:?} is no key");
+        }
+        let padded = ConfiguredKey::new(PADDED).expect("non-blank key");
+        assert!(padded.matches(PADDED));
+        assert!(!padded.matches(PADDED.trim()));
+        assert!(!padded.matches(""));
+        assert!(ApiKeyState::default().configured_key().is_none());
     }
 
     #[test]

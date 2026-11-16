@@ -6409,7 +6409,7 @@ pub async fn bootstrap_serve(
     refuse_postgres_store_url_without_feature(None)?;
 
     let normalized_api_key: Option<String> =
-        app_config.api_key.clone().filter(|k| !k.trim().is_empty());
+        crate::handlers::transport::boot_shared_key(app_config.api_key.as_deref());
     match api_key_bind_guard(
         normalized_api_key.is_some(),
         args.host.as_str(),

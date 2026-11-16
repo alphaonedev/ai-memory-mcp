@@ -90,9 +90,9 @@ pub(crate) async fn access(State(state): State<AccessState>, req: Request, next:
     if restricted && (!health || !read) {
         return refusal(StatusCode::FORBIDDEN, "monitoring_scope_refused");
     }
-    let global = token
-        .zip(state.auth.key.as_deref())
-        .is_some_and(|(a, b)| super::transport::constant_time_eq(a.as_bytes(), b.as_bytes()));
+    // #9354 — the typed key: a blank configured key is no key, never a match.
+    let shared = state.auth.configured_key();
+    let global = token.is_some_and(|t| shared.is_some_and(|k| k.matches(t)));
     // Revoked/unresolved keys cannot fall through an auth-off deployment.
     // Once health-only scopes exist, all non-probe requests need a resolved
     // transport principal, even when the legacy shared key is unconfigured.
