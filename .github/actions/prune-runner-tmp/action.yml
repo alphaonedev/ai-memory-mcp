@@ -12,9 +12,7 @@ description: >-
   one ::warning annotation with the count and the first 5 names (escaped; the
   line states when the list is cut) (ruling 7af294fb). A tree over the depth or
   entry bound is one counted failure, counted before anything under it is
-  removed; a mount point (Linux mount table, re-read before each removal) is
-  never entered or removed, and a mount table that cannot be read (macOS among
-  them) is a refusal. The platform check makes one real
+  removed; a mount point is never entered. The platform check makes one real
   descriptor-relative call of each needed function in a probe directory it
   removes again. The prune-facts line also goes to the job summary. An
   unexpected error fails the job.
