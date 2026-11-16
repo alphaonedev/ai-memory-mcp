@@ -139,6 +139,7 @@ NON_CREATING_PROBE_CALLS = ("open", "lstat")  # probe calls that make nothing: a
 READ_ONLY_PROBE_LINE = "prune_runner_tmp: probe cannot write ({why}); the read-only probe passed, pruning goes on"
 READ_ONLY_MISSING_WHY = "not in os.supports_dir_fd"
 DIR_MOVED_DURING_COUNT = "directory moved during count"
+DIR_MOVED_DURING_REMOVAL = "directory moved during removal"
 ENTRY_CHANGED = "entry changed since scan"
 SUMMARY_SYMLINK_WHY = "Too many levels of symbolic links"
 CUTOFF_NOW = 2_000_000_000  # an integer clock, so an mtime exactly at the cutoff is exact
@@ -1902,6 +1903,143 @@ class RoundOneFixes(Base):
                 self.assertTrue(victim.exists())
                 victim.unlink()
 
+    def test_read_only_probe_refuses_when_a_call_returns_for_an_absent_name(self):
+        """Round 2 L1: lstat, unlink and rmdir of the absent name must FAIL with ENOENT; a call that returns
+        has not done the call (a platform that ignores dir_fd), so the probe refuses with the exact reason."""
+        absent = PRUNE.PROBE_ABSENT_SUFFIX
+        for attr in ("lstat", "unlink", "rmdir"):
+            with self.subTest(call=attr):
+                self.clear_runner()
+                victim = self.make_file("old.db", OLD_AGE_SECS)
+                canary = self.make_file("young.db", YOUNG_AGE_SECS)
+                real = getattr(os, attr)
+
+                def returning(name, *args, _real=real, **kwargs):
+                    if str(name).endswith(absent):
+                        return None
+                    return _real(name, *args, **kwargs)
+
+                with self.cannot_write("mkdir", errno.ENOSPC), mock.patch.object(PRUNE.os, attr, returning), \
+                        mock.patch.object(os, "supports_dir_fd", os.supports_dir_fd | {returning}):
+                    rc, out, err = self.run_prune(self.runner)
+                reason = (f"this platform lacks a working descriptor-relative call: os.{attr} raised ProbeMismatch "
+                          f"(os.{attr} of a name that does not exist returned)")
+                self.assertEqual((rc, out), (EXIT_REFUSED, ""))
+                self.assertEqual(err, f"prune_runner_tmp: refused: {reason}\n")
+                self.assertEqual(self.annotations, [ANNOTATION_PREFIX + reason])
+                self.assertTrue(victim.exists(), "nothing is deleted after the refusal")
+                self.assertTrue(canary.exists())
+                victim.unlink()
+                canary.unlink()
+
+    def refused_read_only_probe(self, reason, patches):
+        """Run the prune with the probe unable to write (ENOSPC on mkdir) under ``patches``; assert the refusal."""
+        victim = self.make_file("old.db", OLD_AGE_SECS)
+        with patches, self.cannot_write("mkdir", errno.ENOSPC):  # patches outermost: they restore last
+            rc, out, err = self.run_prune(self.runner)
+        self.assertEqual((rc, out), (EXIT_REFUSED, ""))
+        self.assertEqual(err, f"prune_runner_tmp: refused: {reason}\n")
+        self.assertEqual(self.annotations, [ANNOTATION_PREFIX + reason])
+        self.assertTrue(victim.exists(), "nothing is deleted after the refusal")
+        victim.unlink()
+
+    def test_read_only_probe_refuses_a_call_that_is_not_implemented_with_the_exact_reason(self):
+        """Round 2 siblings of L1: NotImplementedError and TypeError from lstat, unlink or rmdir are refusals."""
+        for attr in ("lstat", "unlink", "rmdir"):
+            for exc in (NotImplementedError("no dir_fd"), TypeError("no dir_fd")):
+                with self.subTest(call=attr, exc=type(exc).__name__):
+                    self.clear_runner()
+                    real = getattr(os, attr)
+
+                    def raising(name, *args, _real=real, _exc=exc, **kwargs):
+                        if str(name).endswith(PRUNE.PROBE_ABSENT_SUFFIX):
+                            raise _exc
+                        return _real(name, *args, **kwargs)
+
+                    patches = contextlib.ExitStack()
+                    patches.enter_context(mock.patch.object(PRUNE.os, attr, raising))
+                    patches.enter_context(mock.patch.object(os, "supports_dir_fd", os.supports_dir_fd | {raising}))
+                    self.refused_read_only_probe(
+                        f"this platform lacks a working descriptor-relative call: os.{attr} raised "
+                        f"{type(exc).__name__} (no dir_fd)", patches)
+
+    def test_read_only_probe_refuses_a_scandir_of_the_directory_that_fails(self):
+        """Round 2 siblings of L1: the probe's last step, a scandir of the held directory, must list."""
+        real = os.scandir
+        for exc in (OSError(errno.EIO, os.strerror(errno.EIO)), NotImplementedError("no scandir"), TypeError("no scandir")):
+            with self.subTest(exc=type(exc).__name__):
+                self.clear_runner()
+                state = {"calls": 0}
+
+                def failing_once(target, _exc=exc, _state=state):
+                    if isinstance(target, int) and _state["calls"] == 0:
+                        _state["calls"] += 1
+                        raise _exc
+                    return real(target)
+
+                patches = contextlib.ExitStack()
+                patches.enter_context(mock.patch.object(PRUNE.os, "scandir", failing_once))
+                patches.enter_context(mock.patch.object(os, "supports_fd", os.supports_fd | {failing_once}))
+                shown = os.strerror(errno.EIO) if isinstance(exc, OSError) else "no scandir"
+                self.refused_read_only_probe(
+                    f"this platform lacks a working descriptor-relative call: os.scandir raised {type(exc).__name__} "
+                    f"({shown})", patches)
+
+    def test_read_only_probe_names_the_follow_symlinks_miss_and_the_first_miss_in_table_order(self):
+        """Round 2 siblings of L1: the os.stat follow_symlinks row refuses, and with two calls missing the
+        first one of the probe's table is the one named."""
+        miss = "this platform lacks a working descriptor-relative call: os.{name} raised ProbeMismatch (os.{name} {why})"
+        no_follow = {fn for fn in os.supports_follow_symlinks if fn is not os.stat}
+        no_unlink = {fn for fn in os.supports_dir_fd if fn is not os.unlink}
+        no_scandir = {fn for fn in os.supports_fd if fn is not os.scandir}
+        cases = (
+            ("follow_symlinks row", miss.format(name="stat", why="not in os.supports_follow_symlinks"),
+             (("supports_follow_symlinks", no_follow),)),
+            ("unlink before scandir", miss.format(name="unlink", why=READ_ONLY_MISSING_WHY),
+             (("supports_dir_fd", no_unlink), ("supports_fd", no_scandir))),
+        )
+        for label, reason, tables in cases:
+            with self.subTest(case=label):
+                self.clear_runner()
+                patches = contextlib.ExitStack()
+                for table, value in tables:
+                    patches.enter_context(mock.patch.object(os, table, value))
+                self.refused_read_only_probe(reason, patches)
+
+    def test_tree_deepened_past_the_bound_during_removal_is_a_counted_failure(self):
+        """Round 2 siblings of L2: the depth bound is re-checked by the removal pass (a tree that deepens
+        after the count), in the dry run as in the real run."""
+        bound = 2
+        results = {}
+        for mode, extra in (("dry", ("--dry-run",)), ("real", ())):
+            with self.subTest(mode=mode):
+                self.clear_runner()
+                top = self.runner / "deepening"
+                (top / "a" / "b").mkdir(parents=True)
+                (top / "a" / "b" / "f").write_bytes(b"x")
+                age(top, OLD_AGE_SECS)
+                b_ident = self.ident(top / "a" / "b")
+                real_list = PRUNE.list_level
+                state = {"grown": False}
+
+                def deepen(dir_fd, *rest, _top=top, _state=state, _b=b_ident, **kwargs):
+                    info = os.fstat(dir_fd)
+                    if kwargs.get("remove") and not _state["grown"] and (info.st_dev, info.st_ino) == _b:
+                        _state["grown"] = True
+                        (_top / "a" / "b" / "c").mkdir()
+                    return real_list(dir_fd, *rest, **kwargs)
+
+                with mock.patch.object(PRUNE, "MAX_TREE_DEPTH", bound), mock.patch.object(PRUNE, "list_level", deepen):
+                    rc, out, err = self.run_prune(self.runner, *extra)
+                self.assertTrue(state["grown"])
+                self.assertEqual(rc, EXIT_OK)
+                self.assertEqual(err.splitlines(),
+                                 [f"prune_runner_tmp: failed to remove deepening: deeper than {bound} levels"])
+                self.assertRegex(out.splitlines()[-1], r"^pruned=0 kept=0 failed=1 freed_bytes=\d+ skipped=0$")
+                self.assertTrue((top / "a" / "b" / "c").is_dir(), "the level over the bound is never entered")
+                results[mode] = (rc, re.sub(r"freed_bytes=\d+", "freed_bytes=N", out.splitlines()[-1]), err)
+        self.assertEqual(results.get("dry"), results.get("real"))
+
     def test_probe_error_that_is_not_cannot_write_stays_a_refusal(self):
         victim = self.make_file("old.db", OLD_AGE_SECS)
         with self.cannot_write("mkdir", errno.EACCES):
@@ -2016,6 +2154,47 @@ class RoundOneFixes(Base):
                 would = sorted(ln[len("would-remove "):] for ln in dry_out.splitlines() if ln.startswith("would-remove "))
                 self.assertEqual(would, sorted(top_before - set(self.names())),
                                  "would-remove names exactly what the real run removes")
+
+    def test_dry_run_reports_the_same_counts_and_reason_when_a_directory_moves_mid_walk(self):
+        """Round 2 L2: the removal pass's up-walk identity check runs in the dry run too; a dry run that
+        skipped it would say pruned=1 where the real run says failed=1."""
+        for label, during_count, reason in (("during removal", False, DIR_MOVED_DURING_REMOVAL),
+                                            ("during count", True, DIR_MOVED_DURING_COUNT)):
+            results = {}
+            for mode, extra in (("dry", ("--dry-run",)), ("real", ())):
+                with self.subTest(case=label, mode=mode):
+                    self.clear_runner()
+                    top = self.runner / "top"
+                    (top / "a" / "b").mkdir(parents=True)
+                    (top / "a" / "b" / "f").write_bytes(b"x")
+                    age(top, OLD_AGE_SECS)
+                    outside = self.base / f"outside-{mode}-{int(during_count)}"
+                    outside.mkdir()
+                    (outside / "keep").write_bytes(b"keep")
+                    b_ident = self.ident(top / "a" / "b")
+                    real_list = PRUNE.list_level
+                    state = {"moved": False}
+
+                    def move_b(dir_fd, *rest, _during_count=during_count, _top=top, _outside=outside,
+                               _state=state, _b=b_ident, **kwargs):
+                        pending = real_list(dir_fd, *rest, **kwargs)
+                        counting = not kwargs.get("remove", True)
+                        info = os.fstat(dir_fd)
+                        if counting == _during_count and not _state["moved"] and (info.st_dev, info.st_ino) == _b:
+                            _state["moved"] = True
+                            os.rename(_top / "a" / "b", _outside / "b")
+                        return pending
+
+                    with mock.patch.object(PRUNE, "list_level", move_b):
+                        rc, out, err = self.run_prune(self.runner, *extra)
+                    self.assertTrue(state["moved"])
+                    self.assertEqual(rc, EXIT_OK)
+                    self.assertEqual(err.splitlines(), [f"prune_runner_tmp: failed to remove top: {reason}"])
+                    self.assertRegex(out.splitlines()[-1], r"^pruned=0 kept=0 failed=1 freed_bytes=\d+ skipped=0$")
+                    self.assertEqual((outside / "keep").read_bytes(), b"keep")
+                    self.assertEqual(len(self.annotations), 1)
+                    results[mode] = (rc, re.sub(r"freed_bytes=\d+", "freed_bytes=N", out.splitlines()[-1]), err)
+            self.assertEqual(results.get("dry"), results.get("real"), label)
 
     # decision 6 (SEC L2): the counting walk verifies the identity of the directory it returns to
     def test_directory_moved_during_count_stops_the_entry_with_the_exact_reason(self):
