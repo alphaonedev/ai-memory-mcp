@@ -195,7 +195,13 @@ which runs `scripts/ci/prune_runner_tmp.py` with these rules:
   surrogates (U+D800 to U+DFFF), U+2028 and U+2029 become `\uNNNN`. So a file
   name cannot inject a log line or a workflow command.
 - It needs Python 3.12+ on the runner; an older interpreter ends in the
-  `python` refusal before anything newer is imported. The test families that
+  `python` refusal before anything newer is imported. The shared annotation
+  module is read only from `workflow_annotation.py` next to the script's real
+  file (never through the import search path, so a module of that name in the
+  cwd, TMPDIR or PYTHONPATH is never run); when that file cannot be read, raises
+  while loading or lacks a name the script uses, the step prints the fixed
+  warning `prune_runner_tmp: refused: shared module workflow_annotation.py next
+  to the script cannot be loaded`, exits 0 and deletes nothing. The test families that
   leak the files are fixed separately; the prune treats the symptom.
 
 ---

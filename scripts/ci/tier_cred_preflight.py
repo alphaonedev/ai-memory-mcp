@@ -46,8 +46,24 @@ import subprocess
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import workflow_annotation as wa  # noqa: E402
+
+def _load_workflow_annotation():
+    """The shared module next to this file's real path, by path only, never through sys.path (#9365)."""
+    import importlib.util
+    import os
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "workflow_annotation.py")
+    loaded = sys.modules.get("workflow_annotation")
+    if loaded is not None and os.path.realpath(getattr(loaded, "__file__", None) or "") == path:
+        return loaded
+    spec = importlib.util.spec_from_file_location("workflow_annotation", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)  # an absent or broken file raises here: a loud failure, never a fallback
+    if loaded is None:
+        sys.modules["workflow_annotation"] = module
+    return module
+
+
+wa = _load_workflow_annotation()
 
 EXIT_OK = 0
 EXIT_UNAVAILABLE = 1

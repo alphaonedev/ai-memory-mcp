@@ -140,7 +140,8 @@ def single_line(value) -> str:
 
     The selector is materialised from the base commit as a closed set of files, so it cannot import
     ``scripts/ci/workflow_annotation.py`` from the PR tree; this mirrors that module's ``env_file_value``
-    (a parity cell in ``test_ci_annotation_escape_9365.py`` pins the two together).
+    (a parity cell in the #9365 annotation-escape test module pins the two together; the module is named
+    here without its file name so the impact read-set scanner never takes this text for a read of it).
     """
     return "".join(" " if char in LINE_BREAK_CHARS
                    else "\\u%04x" % ord(char) if 0xD800 <= ord(char) <= 0xDFFF else char

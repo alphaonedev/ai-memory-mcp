@@ -156,9 +156,19 @@ def _wa() -> Any:
     """The shared workflow-command module (#9365), loaded on first use from ``scripts/ci`` next to this directory."""
     global _ANNOTATION_MODULE
     if _ANNOTATION_MODULE is None:
-        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'ci'))
-        import workflow_annotation
-        _ANNOTATION_MODULE = workflow_annotation
+        # By path only, never through sys.path (#9365): a same-named module in the cwd or PYTHONPATH is never run.
+        import importlib.util
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), 'ci', 'workflow_annotation.py')
+        loaded = sys.modules.get('workflow_annotation')
+        if loaded is not None and os.path.realpath(getattr(loaded, '__file__', None) or '') == path:
+            _ANNOTATION_MODULE = loaded
+        else:
+            spec = importlib.util.spec_from_file_location('workflow_annotation', path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)  # an absent or broken file raises here, never a fallback
+            if loaded is None:
+                sys.modules['workflow_annotation'] = module
+            _ANNOTATION_MODULE = module
     return _ANNOTATION_MODULE
 
 

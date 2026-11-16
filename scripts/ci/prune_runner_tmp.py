@@ -58,16 +58,65 @@ interpreters so the version refusal can run.
 """
 import sys
 
-# The shared module parses on old interpreters, so the version refusal below can still print through it. It is
-# loaded without an import statement: the floor check must precede every import except sys (pinned by a test).
-sys.path.insert(0, __file__.rpartition("/")[0] or ".")
-wa = __import__("workflow_annotation")
-safe_text = wa.safe_value  # the tests and the call sites below use it as a module attribute
-
 MIN_PYTHON = (3, 12)
 EXIT_OK = 0
 EXIT_ERROR = 1
 PROG = "prune_runner_tmp"
+SHARED_MODULE_FILE = "workflow_annotation.py"
+SHARED_MODULE_USED = ("safe_value", "render", "join", "annotation")  # every name this script takes from it
+LOAD_CANNOT_READ = "cannot be read"
+LOAD_RAISED = "raised while loading"
+LOAD_LACKS = "lacks "
+
+
+def load_shared_module(script_path):
+    """Return ``(module, None)`` for the shared module next to ``script_path``'s real file, else ``(None, cause)``.
+
+    The module is read from that one file and run in a fresh module object that is never put in ``sys.modules``:
+    no import statement (the floor check below precedes every import except sys, pinned by a test), no finder and
+    no ``sys.path`` lookup, nothing added to ``sys.path``. A module of the same name planted in the cwd, TMPDIR or
+    PYTHONPATH, next to a symlink to this script, or already imported, is never the code this deleting tool runs.
+    It parses on old interpreters, so the version refusal below can still print through it (#9365).
+    """
+    paths = (sys.modules.get("os") or __import__("os")).path  # os is loaded before any script runs (frozen)
+    try:
+        path = paths.join(paths.dirname(paths.realpath(script_path)), SHARED_MODULE_FILE)
+        with open(path, "rb") as handle:
+            source = handle.read()
+    except (OSError, TypeError, ValueError):
+        return None, LOAD_CANNOT_READ
+    module = type(sys)(SHARED_MODULE_FILE[:-3])
+    module.__file__ = path
+    try:
+        exec(compile(source, path, "exec", dont_inherit=True), module.__dict__)
+    except (Exception, SystemExit):  # any failure of the sibling, a SyntaxError or a sys.exit in it included
+        return None, LOAD_RAISED
+    for name in SHARED_MODULE_USED:
+        if not callable(getattr(module, name, None)):
+            return None, LOAD_LACKS + name
+    return module, None
+
+
+wa, LOAD_FAILURE = load_shared_module(globals().get("__file__"))
+safe_text = getattr(wa, "safe_value", None)  # the tests and the call sites below use it as a module attribute
+
+
+def load_refused(out, err):
+    """The load refusal: one fixed stderr line and one fixed annotation, both built without the shared module.
+
+    It mirrors the version refusal (exit 0, not counted, nothing pruned): a sibling that cannot be loaded is a
+    broken checkout, not a runner that could not be proven safe.
+    """
+    print(f"{PROG}: refused: shared module {SHARED_MODULE_FILE} next to the script cannot be loaded ({LOAD_FAILURE})",
+          file=err)
+    print("::warning title=prune_runner_tmp refused::prune_runner_tmp: refused: shared module workflow_annotation.py"
+          " next to the script cannot be loaded", file=out)
+    out.flush()
+    return EXIT_OK
+
+
+if __name__ == "__main__" and wa is None:
+    sys.exit(load_refused(sys.stdout, sys.stderr))
 
 
 def python_refusal(version_info):
@@ -855,6 +904,8 @@ def refused(reason, out, err):
 def main(argv=None, environ=None, out=None, err=None):
     environ = os.environ if environ is None else environ
     out, err = out or sys.stdout, err or sys.stderr
+    if wa is None:  # an in-process caller of a copy whose sibling did not load: the same refusal, nothing pruned
+        return load_refused(out, err)
     parser = argparse.ArgumentParser(prog=PROG, description=__doc__.split("\n")[0])
     parser.add_argument("--dry-run", action="store_true", help="print what would go, delete nothing")
     args = parser.parse_args(argv)
