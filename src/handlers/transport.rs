@@ -999,6 +999,25 @@ impl ApiKeyState {
     }
 }
 
+/// #9354 (ruling 28907a4f) — the boot WARN for a configured `api_key` that is
+/// blank. It names the remedy and never carries the configured value.
+pub(crate) const BLANK_KEY_BOOT_WARN: &str = "#9354: api_key is configured but blank (empty or \
+whitespace) and is treated as no shared key: HTTP API-key auth is off and a non-loopback bind is \
+refused; remedy: set top-level `api_key = \"...\"` to a non-blank secret, or remove the blank value";
+
+/// #9354 — the daemon boot normalizer (#1903 precedent): a blank configured
+/// key is no shared key, so the keyless bind guard applies, and the operator
+/// is told so with [`BLANK_KEY_BOOT_WARN`]. Decision: blank is "no key" at
+/// boot (never a key that matches a blank header) because the bind guard
+/// then refuses a routable bind; past boot, a blank key is refused closed.
+pub(crate) fn boot_shared_key(configured: Option<&str>) -> Option<String> {
+    let key = configured.and_then(ConfiguredKey::new);
+    if configured.is_some() && key.is_none() {
+        tracing::warn!("{BLANK_KEY_BOOT_WARN}");
+    }
+    key.map(|k| k.0.to_string())
+}
+
 /// #2502 — peer source for auth-failure backoff: the TCP peer IP from
 /// `ConnectInfo` (wired by `into_make_service_with_connect_info` in `serve`).
 /// NEVER a client header: the tree has no trusted-proxy setting, so a
