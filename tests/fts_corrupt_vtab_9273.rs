@@ -300,9 +300,9 @@ struct Probe9273<'c> {
     cells: Vec<String>,
 }
 
-impl Probe9273<'_> {
-    fn new<'c>(conn: &'c rusqlite::Connection, label: String) -> Probe9273<'c> {
-        Probe9273 {
+impl<'c> Probe9273<'c> {
+    fn new(conn: &'c rusqlite::Connection, label: String) -> Self {
+        Self {
             conn,
             label,
             violations: Vec::new(),
@@ -840,8 +840,7 @@ fn trigger_body_9273(sql: &str) -> String {
     let cleaned: String = body
         .chars()
         .map(|c| match c {
-            '"' | '`' | '[' | ']' => ' ',
-            '(' | ')' | ';' | ',' => ' ',
+            '"' | '`' | '[' | ']' | '(' | ')' | ';' | ',' => ' ',
             other => other,
         })
         .collect();
