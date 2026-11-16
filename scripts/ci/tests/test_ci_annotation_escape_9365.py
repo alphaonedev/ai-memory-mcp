@@ -799,7 +799,7 @@ SIBLING_SCRIPTS = {
     "scripts/ci/pg_env_preflight.py": (),
     "scripts/ci/shared_cargo_target.py": (),
     "scripts/ci/tier_cred_preflight.py": ("scripts/ci/ensure-age-extension.py",),
-    "scripts/ci/pg_isolate_split.py": ("scripts/ci/partition_test_binaries.py",),
+    "scripts/ci/pg_isolate_split.py": ("scripts/ci/partition_test_binaries.py", "scripts/ci/pg_isolate_serial_residual.txt"),
     "scripts/ci/prune_runner_artifacts.py": ("scripts/ci/shared_cargo_target.py",),
     "scripts/ci/sccache_env.py": ("scripts/ci/shared_cargo_target.py",),
 }
@@ -854,12 +854,16 @@ class SiblingLoadInvariant(unittest.TestCase):
         base, repo, plants, marker = self.layout(rel, with_shared=False)
         spec = importlib.util.spec_from_file_location("pg_isolated_binary_load_9365", str(repo / rel))
         module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
         sys.path.insert(0, str(plants))  # what a PYTHONPATH plant looks like in-process
         try:
             before_path, before_modules = list(sys.path), set(sys.modules)
-            with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(OSError):
-                module._emit("NAME=value")
+            # eager since ruling bcd0a15c: the absent module ends the import with the fixed refusal, never a plant
+            with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()) as err, \
+                    self.assertRaises(SystemExit) as raised:
+                spec.loader.exec_module(module)
+            self.assertEqual(raised.exception.code, NON_GATE_LOAD_EXIT_CODES[rel])
+            self.assertEqual(out.getvalue(), "")
+            self.assertEqual(err.getvalue(), sibling_load_lines(rel, "FileNotFoundError")[1])
             self.assertEqual(sys.path, before_path)
             self.assertNotIn(SHARED_MODULE_NAME[:-3], set(sys.modules) - before_modules)
         finally:
@@ -1152,6 +1156,419 @@ class GateLoadFailsClosed(unittest.TestCase):
                         self.assertEqual(err, GATE_LOAD_STDERR_LINE.format(prog=prog, cause=cause) + "\n")
                         for marker in GATE_PASS_MARKERS:
                             self.assertNotIn(marker, out + err)
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# The 8 non-gate siblings (conductor ruling bcd0a15c): a failed load of ANY kind ends the process non-zero with one
+# fixed ::error literal built without the module, and the script does none of its work. Each code is the script's
+# WA_EXIT_LOAD_REFUSED; the comment says what the other codes mean to the calling step, so the new one collides with
+# none of them. "at 55b6a5d2" is what the same cell gave on the base of this lane (plain python3, every kind).
+# ---------------------------------------------------------------------------------------------------------------
+# At 55b6a5d2, unless a script's comment says otherwise ("BASE"): absent, unreadable, syntax error and raises ended the
+# process by raw traceback, rc 1, last line e.g. "FileNotFoundError: [Errno 2] No such file or directory: '<path>'";
+# sys.exit(0) at load ended it rc 0 with NO output; sys.exit(3) rc 3 with no output; nothing checked the attributes.
+NON_GATE_LOAD_EXIT_CODES = {
+    # 0 ok, 2 refused, 3 bad cap, 4 unreadable, 5 usage. BASE; a missing attribute ran on to the sweep
+    # (rc 2 "refused: <target> ...")
+    "scripts/ci-sweep-target.py": 6,
+    # 0 green, 1 cannot dispatch or a red nightly (the report step files the issue), 2 argparse usage.
+    # BASE; a missing attribute gave rc 0 with no output (report)
+    "scripts/ci/ci_full_nightly.py": 3,
+    # 0 resolved, 1 base rejected, 2 argparse usage. BASE; a missing attribute gave rc 1
+    # "AttributeError: module 'workflow_annotation' has no attribute 'env_file_value'"
+    "scripts/ci/impact/base_sha.py": 3,
+    # 0 ok, 2 usage or a refused home. BASE; a missing attribute gave rc 1 "AttributeError: module
+    # 'workflow_annotation' has no attribute 'env_file_value'" AFTER it had created the target directories
+    "scripts/ci/shared_cargo_target.py": 3,
+    # 0 ok, 2 usage, 3 sccache missing, 4 wrong cache. BASE; a missing attribute RAN sccache from PATH, then rc 4
+    # "sccache_env: sccache --show-stats names no cache location (port 4227); refusing"
+    "scripts/ci/sccache_env.py": 5,
+    # 0 ok, 2 fail closed or argparse usage. Not BASE: its by-name partition_test_binaries import loaded first, so six
+    # kinds gave rc 2 "partition_test_binaries: refused: shared module workflow_annotation.py next to the script cannot
+    # be loaded (<cause>)" (another script's line); a missing attribute gave rc 0, no output, the split files WRITTEN
+    "scripts/ci/pg_isolate_split.py": 3,
+    # 0 ok, 2 usage. BASE; a missing attribute gave rc 1
+    # "AttributeError: module 'workflow_annotation' has no attribute 'log_line'"
+    "scripts/ci/prune_runner_artifacts.py": 3,
+    # 0 ok, 2 usage, 3 mint, 143 terminated, 124/137 the watchdog (ci.yml), else cargo's own code (101, 1, 128+n);
+    # the load runs before any child, so 4 is never a cargo code here. Not BASE: the load was lazy (_wa() :152-172), so
+    # this cell gave rc 2 "pg_isolated_binary: set AI_MEMORY_TEST_POSTGRES_URL (or pass --url for local admin use)"
+    # for every kind; a failed load surfaced only at the first annotation, by traceback or a silent sys.exit(0)
+    "scripts/test/pg_isolated_binary.py": 4,
+}
+# setup --emit-env sends stdout into $GITHUB_ENV: the refusal goes to stderr there, never into the env file
+SIBLING_LOAD_ERROR_TO_STDERR = frozenset({"scripts/test/pg_isolated_binary.py"})
+SIBLING_LOAD_BREAKS = {  # failure kind -> (the planted shared module, None = absent and "" = mode 0; the cause named)
+    "absent": (None, "FileNotFoundError"),
+    "unreadable": ("", "PermissionError"),
+    "syntax error": ("def broken(:\n", "SyntaxError"),
+    "raises at load": ("raise RuntimeError('planted load failure')\n", "RuntimeError"),
+    "sys.exit(0) at load": ("import sys\nsys.exit(0)\n", "SystemExit"),
+    "sys.exit(3) at load": ("import sys\nsys.exit(3)\n", "SystemExit"),
+    "required attribute missing": ("UNRELATED_NAME = 1\n", "AttributeError"),
+}
+GATE_ONLY_NEW_BREAKS = ("raises at load", "sys.exit(3) at load", "required attribute missing")
+HOSTILE_CAUSE_SOURCE = "raise type('x\\n::error::pwn', (Exception,), {})()\n"
+FALLBACK_CAUSE = "BaseException"
+WORK_RUNNER_NAME = "runner-9365"
+WORK_FAKE_TOOL = "sccache"  # a PATH stand-in that only records that it ran: a run after a failed load is work
+WORK_BUILD_JSON_LINE = ('{"reason": "compiler-artifact", "executable": "/fx/deps/t9365", "profile": {"test": true},'
+                        ' "target": {"kind": ["test"], "name": "t9365", "src_path": "tests/t9365.rs"}}')
+WORK_SWEEP_CAP_BYTES = "1"  # below the 5-byte canary: a sweep that runs removes it
+
+
+def sibling_load_lines(rel, cause):
+    """(stdout, stderr) a failed load of ``rel`` must print: the cause line, then the one fixed ::error line."""
+    prog = Path(rel).stem
+    cause_line = GATE_LOAD_STDERR_LINE.format(prog=prog, cause=cause) + "\n"
+    error_line = GATE_LOAD_ERROR_LINE.format(prog=prog) + "\n"
+    if rel in SIBLING_LOAD_ERROR_TO_STDERR:
+        return "", cause_line + error_line
+    return error_line, cause_line
+
+
+def sibling_work_argv(rel, fx):
+    """Arguments under which ``rel`` does observable work (files under ``fx``) when its load passes; no network."""
+    out = str(fx / "github-file")
+    home, target, work = fx / "home", fx / "target", fx / "work"
+    return {
+        "scripts/ci-sweep-target.py": ["--target", str(target), "--max-bytes", WORK_SWEEP_CAP_BYTES],
+        "scripts/ci/ci_full_nightly.py": ["report", "--repo", "owner/name", "--ref", "main", "--job-result", "success",
+                                          "--conclusion", "success"],
+        "scripts/ci/impact/base_sha.py": ["--repo", str(home), "--github-output", out],
+        "scripts/ci/shared_cargo_target.py": ["--home", str(home), "--runner-name", WORK_RUNNER_NAME, "--github-env",
+                                              out],
+        "scripts/ci/sccache_env.py": ["--home", str(home), "--github-env", out],
+        "scripts/ci/pg_isolate_split.py": ["--build-json", str(fx / "build.json"), "--serial-file",
+                                           str(fx / "serial.txt"), "--out-dir", str(fx / "split-out")],
+        "scripts/ci/prune_runner_artifacts.py": ["--work-root", str(work), "--workspace", str(work / "ws"),
+                                                 "--protected-root", str(fx / "protected"), "--dry-run"],
+        "scripts/test/pg_isolated_binary.py": ["setup", "--emit-env", "--db", "ai_memory_9365"],
+    }.get(rel, ["--help"])
+
+
+def tree_state(root, skip):
+    """Every path under ``root`` (outside ``skip``) with its bytes, so any file the script writes shows up."""
+    state = {}
+    for path in sorted(root.rglob("*")):
+        if skip in path.parents or path == skip:
+            continue
+        state[path.relative_to(root).as_posix()] = path.read_bytes() if path.is_file() else b"<dir>"
+    return state
+
+
+def sibling_load_run(base, rel, source, flags, script_root=None):
+    """Run a fixture copy of ``rel`` with its shared module planted as ``source``; (rc, out, err, before, after)."""
+    repo = base / "repo"
+    for item in (rel, *SIBLING_SCRIPTS.get(rel, ()), SHARED_MODULE_PATH):
+        (repo / item).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile((script_root or REPO) / item if item != SHARED_MODULE_PATH else REPO / item, repo / item)
+    shared = repo / SHARED_MODULE_PATH
+    if source is None:
+        shared.unlink()
+    elif source == "":
+        shared.chmod(0)
+    else:
+        shared.write_text(source, encoding="utf-8")
+    fx = base / "fx"
+    for sub in ("home", "target", "work/ws", "protected", "cwd", "bin"):
+        (fx / sub).mkdir(parents=True, exist_ok=True)
+    (fx / "target" / "canary").write_text("kept\n", encoding="utf-8")
+    (fx / "github-file").write_text("", encoding="utf-8")
+    (fx / "build.json").write_text(WORK_BUILD_JSON_LINE + "\n", encoding="utf-8")
+    (fx / "serial.txt").write_text("", encoding="utf-8")
+    fake_tool = fx / "bin" / WORK_FAKE_TOOL
+    fake_tool.write_text("#!%s\nopen(%r, 'a').write('ran\\n')\n" % (sys.executable, str(fx / "tool-ran")),
+                         encoding="utf-8")
+    fake_tool.chmod(0o755)
+    env = {"PATH": str(fx / "bin"), "LANG": "C.UTF-8", "PYTHONDONTWRITEBYTECODE": "1", "TMPDIR": str(fx / "cwd"),
+           "HOME": str(fx / "home"), "GITHUB_ENV": str(fx / "github-file"), "GITHUB_OUTPUT": str(fx / "github-file")}
+    before = tree_state(fx, fx / "cwd")
+    proc = subprocess.run([sys.executable, *flags, str(repo / rel), *sibling_work_argv(rel, fx)], capture_output=True,
+                          env=env, cwd=str(fx / "cwd"), timeout=SUBPROCESS_TIMEOUT_SECS, check=False)
+    after = tree_state(fx, fx / "cwd")
+    if source == "":
+        shared.chmod(0o600)
+    return (proc.returncode, proc.stdout.decode("utf-8", "replace"), proc.stderr.decode("utf-8", "replace"), before,
+            after)
+
+
+class SiblingLoadFailsClosed(unittest.TestCase):
+    """Table: 8 non-gate siblings x 7 failure kinds x (plain, -I, -S) on fixture copies (ruling bcd0a15c)."""
+
+    def cell(self, rel, kind, flags):
+        base = scratch_dir("sibling-fail-closed")
+        self.addCleanup(shutil.rmtree, str(base), True)
+        source, cause = SIBLING_LOAD_BREAKS[kind]
+        rc, out, err, before, after = sibling_load_run(base, rel, source, flags)
+        want_out, want_err = sibling_load_lines(rel, cause)
+        code = NON_GATE_LOAD_EXIT_CODES.get(rel, GATE_LOAD_EXIT_CODES.get(rel))
+        self.assertNotEqual(rc, EXIT_OK_CODE, (out, err[-2000:]))
+        self.assertEqual(rc, code, err[-2000:])
+        self.assertEqual(out, want_out)
+        self.assertEqual(err, want_err)
+        self.assertEqual(after, before, "the script did work after a failed load")
+
+    def test_failed_load_of_any_kind_fails_each_sibling_closed_9365(self):
+        if os.geteuid() == 0:
+            self.skipTest("root reads a mode-0 file")
+        self.assertEqual(len(NON_GATE_LOAD_EXIT_CODES), 8)
+        for rel in NON_GATE_LOAD_EXIT_CODES:
+            for kind in SIBLING_LOAD_BREAKS:
+                for label, flags in PYTHON_FLAG_SETS:
+                    with self.subTest(script=rel, kind=kind, flags=label):
+                        self.cell(rel, kind, flags)
+
+    def test_the_one_shape_gives_the_gates_the_new_kinds_too_9365(self):
+        """The five gates under the kinds their 60-row table lacks: same exit code, same two lines."""
+        if os.geteuid() == 0:
+            self.skipTest("root reads a mode-0 file")
+        for rel in GATE_LOAD_EXIT_CODES:
+            for kind in GATE_ONLY_NEW_BREAKS:
+                for label, flags in PYTHON_FLAG_SETS:
+                    with self.subTest(script=rel, kind=kind, flags=label):
+                        self.cell(rel, kind, flags)
+
+    def test_a_hostile_exception_name_never_reaches_a_line_start_9365(self):
+        """An exception class named with a newline and '::error::' is named as BaseException, never printed."""
+        for rel in (*GATE_LOAD_EXIT_CODES, *NON_GATE_LOAD_EXIT_CODES):
+            with self.subTest(script=rel):
+                base = scratch_dir("sibling-hostile-cause")
+                self.addCleanup(shutil.rmtree, str(base), True)
+                rc, out, err, before, after = sibling_load_run(base, rel, HOSTILE_CAUSE_SOURCE, ())
+                want_out, want_err = sibling_load_lines(rel, FALLBACK_CAUSE)
+                self.assertEqual((rc, out, err), (NON_GATE_LOAD_EXIT_CODES.get(rel, GATE_LOAD_EXIT_CODES.get(rel)),
+                                                  want_out, want_err))
+                self.assertEqual(after, before)
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# One loader shape (ruling bcd0a15c). decision: the inlined loader in every script over a shared helper because the
+# helper would itself have to be loaded by path with the same code, which moves the shape without removing it.
+# Detection method: ast. The walk covers every .py under scripts/ (tests and the shared module itself excluded); a
+# script REFERENCES the module when an import, a name, an attribute or a string that is not a docstring contains
+# ``workflow_annotation``. Such a script must hold the WA_* settings, exactly one ``_load_workflow_annotation`` and
+# exactly one module-level ``try`` whose ast equals the canonical source below (the ::error literal is compared
+# separately, against the script's WA_PROG), no other reference to the module, no other call of the loader, no
+# non-stdlib import and no ``sys.path`` use before that ``try``, and every ``wa.<name>`` it uses in WA_REQUIRED.
+# ---------------------------------------------------------------------------------------------------------------
+LOADER_SCAN_ROOT = REPO / "scripts"
+SHARED_STEM = SHARED_MODULE_NAME[:-3]
+LOADER_NAME = "_load_workflow_annotation"
+ERROR_LINE_PLACEHOLDER = "WA_ERROR_LINE"
+LOADER_SHAPE_EXCEPTIONS = {
+    # The single named exception: its floor check (Python >= 3.12) runs before every import, so its load is a
+    # function called after the check, executes a fresh module object never put in sys.modules and checks
+    # SHARED_MODULE_USED; by ruling bcd0a15c a failed load stays a ::warning, exit 0, nothing pruned.
+    "scripts/ci/prune_runner_tmp.py": "floor check first; warning, exit 0, prunes nothing (ruling bcd0a15c)",
+}
+WA_SETTINGS = ("WA_PROG", "WA_RELATIVE_PATH", "WA_REQUIRED", "WA_EXIT_LOAD_REFUSED", "WA_ERROR_TO_STDERR")
+CANONICAL_LOADER_SOURCE = textwrap.dedent('''\
+    def _load_workflow_annotation():
+        """The shared module at WA_RELATIVE_PATH from this file's real directory, by path only, never through
+        sys.path; every name in WA_REQUIRED must be a callable of it (#9365, one shape in every script)."""
+        import importlib.util
+        import os
+        path = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), WA_RELATIVE_PATH))
+        loaded = sys.modules.get("workflow_annotation")
+        if loaded is not None and os.path.realpath(getattr(loaded, "__file__", None) or "") == path:
+            module = loaded
+        else:
+            spec = importlib.util.spec_from_file_location("workflow_annotation", path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)  # absent, unreadable or broken: it raises here, the try below catches it
+        missing = [name for name in WA_REQUIRED if not callable(getattr(module, name, None))]
+        if missing:
+            raise AttributeError("workflow_annotation.py lacks " + ", ".join(missing))
+        if loaded is None:
+            sys.modules["workflow_annotation"] = module
+        return module
+
+
+    try:
+        wa = _load_workflow_annotation()
+    except (Exception, SystemExit) as exc:  # any failed load: one fixed line built without the module, then exit
+        wa_cause = type(exc).__name__
+        print("%s: refused: shared module workflow_annotation.py next to the script cannot be loaded (%s)"
+              % (WA_PROG, wa_cause if wa_cause.isidentifier() else "BaseException"), file=sys.stderr, flush=True)
+        print(WA_ERROR_LINE, file=sys.stderr if WA_ERROR_TO_STDERR else sys.stdout, flush=True)
+        sys.exit(WA_EXIT_LOAD_REFUSED)
+    ''')
+
+
+def _docstring_ids(tree):
+    ids = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.body:
+            first = node.body[0]
+            if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant) and isinstance(first.value.value, str):
+                ids.add(id(first.value))
+    return ids
+
+
+def shared_module_references(tree):
+    """Nodes that name the shared module: imports, names, attributes, non-docstring strings."""
+    docstrings = _docstring_ids(tree)
+    found = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import) and any(SHARED_STEM in alias.name for alias in node.names):
+            found.append(node)
+        elif isinstance(node, ast.ImportFrom) and (SHARED_STEM in (node.module or "")
+                                                   or any(SHARED_STEM in alias.name for alias in node.names)):
+            found.append(node)
+        elif isinstance(node, ast.Name) and SHARED_STEM in node.id:
+            found.append(node)
+        elif isinstance(node, ast.Attribute) and SHARED_STEM in node.attr:
+            found.append(node)
+        elif (isinstance(node, ast.Constant) and isinstance(node.value, str) and SHARED_STEM in node.value
+              and id(node) not in docstrings):
+            found.append(node)
+    return found
+
+
+def _canonical_nodes():
+    tree = ast.parse(CANONICAL_LOADER_SOURCE)
+    return ast.dump(tree.body[0]), ast.dump(tree.body[1])
+
+
+def _is_load_try(node):
+    return (isinstance(node, ast.Try) and len(node.body) == 1 and isinstance(node.body[0], ast.Assign)
+            and isinstance(node.body[0].value, ast.Call) and isinstance(node.body[0].value.func, ast.Name)
+            and node.body[0].value.func.id == LOADER_NAME)
+
+
+def loader_shape_violations(rel, source):
+    """Every way ``source`` (at scripts-relative ``rel``) departs from the one shape; [] when it conforms or never
+    references the shared module."""
+    tree = ast.parse(source)
+    references = shared_module_references(tree)
+    if not references or rel in LOADER_SHAPE_EXCEPTIONS:
+        return []
+    problems = []
+    canonical_def, canonical_try = _canonical_nodes()
+    defs = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == LOADER_NAME]
+    tries = [node for node in tree.body if _is_load_try(node)]
+    if len(defs) != 1:
+        problems.append(f"{rel}: {len(defs)} module-level {LOADER_NAME} definitions (want 1)")
+    elif ast.dump(defs[0]) != canonical_def:
+        problems.append(f"{rel}:{defs[0].lineno}: {LOADER_NAME} differs from the canonical loader")
+    if len(tries) != 1:
+        problems.append(f"{rel}: {len(tries)} module-level load try blocks (want 1)")
+        return problems
+    load_try = tries[0]
+    settings = {}
+    for node in tree.body[:tree.body.index(load_try)]:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            settings[node.targets[0].id] = node.value
+    for name in WA_SETTINGS:
+        if name not in settings:
+            problems.append(f"{rel}: {name} is not set before the load try")
+    error_literal = None
+    handler = load_try.handlers[0] if len(load_try.handlers) == 1 else None
+    try:
+        call = handler.body[2].value
+        if isinstance(call.args[0], ast.Constant) and isinstance(call.args[0].value, str):
+            error_literal = call.args[0].value
+            call.args[0] = ast.Name(id=ERROR_LINE_PLACEHOLDER, ctx=ast.Load())
+    except (AttributeError, IndexError, TypeError):
+        pass
+    if ast.dump(load_try) != canonical_try:
+        problems.append(f"{rel}:{load_try.lineno}: the load try differs from the canonical one")
+    prog = settings.get("WA_PROG")
+    if not (isinstance(prog, ast.Constant) and prog.value == Path(rel).stem):
+        problems.append(f"{rel}: WA_PROG is not the literal {Path(rel).stem!r}")
+    elif error_literal != GATE_LOAD_ERROR_LINE.format(prog=prog.value):
+        problems.append(f"{rel}: the ::error line is not the fixed literal for {prog.value}")
+    rel_path = settings.get("WA_RELATIVE_PATH")
+    if not (isinstance(rel_path, ast.Constant) and isinstance(rel_path.value, str)
+            and os.path.normpath(os.path.join(os.path.dirname(rel), rel_path.value)) == SHARED_MODULE_PATH):
+        problems.append(f"{rel}: WA_RELATIVE_PATH does not name {SHARED_MODULE_PATH}")
+    required = settings.get("WA_REQUIRED")
+    names = ([elt.value for elt in required.elts if isinstance(elt, ast.Constant)]
+             if isinstance(required, ast.Tuple) else [])
+    if not names or len(names) != len(required.elts):
+        problems.append(f"{rel}: WA_REQUIRED is not a non-empty tuple of literal names")
+    used = {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name) and node.value.id == "wa"}
+    if used - set(names):
+        problems.append(f"{rel}: wa.{', wa.'.join(sorted(used - set(names)))} not in WA_REQUIRED")
+    to_stderr = settings.get("WA_ERROR_TO_STDERR")
+    if not (isinstance(to_stderr, ast.Constant) and isinstance(to_stderr.value, bool)):
+        problems.append(f"{rel}: WA_ERROR_TO_STDERR is not a literal bool")
+    inside = {id(node) for root in (*defs, load_try) for node in ast.walk(root)}
+    for node in references:
+        if id(node) not in inside:
+            problems.append(f"{rel}:{node.lineno}: references the shared module outside the one loader")
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == LOADER_NAME
+                and id(node) not in inside):
+            problems.append(f"{rel}:{node.lineno}: calls {LOADER_NAME} outside the load try")
+    for node in tree.body[:tree.body.index(load_try)]:
+        for inner in ast.walk(node):
+            if isinstance(inner, ast.Import):
+                modules = [alias.name for alias in inner.names]
+            elif isinstance(inner, ast.ImportFrom):
+                modules = [inner.module or ""]
+            else:
+                modules = []
+            for module in modules:
+                if module.split(".")[0] not in sys.stdlib_module_names and module != "__future__":
+                    problems.append(f"{rel}:{inner.lineno}: imports {module} before the load try")
+            if (isinstance(inner, ast.Attribute) and inner.attr == "path" and isinstance(inner.value, ast.Name)
+                    and inner.value.id == "sys"):
+                problems.append(f"{rel}:{inner.lineno}: uses sys.path before the load try")
+    return problems
+
+
+def loader_scan_files(root):
+    """Every script under ``root`` the one-shape rule covers (tests and the shared module itself excluded)."""
+    return [path for path in sorted(root.rglob("*.py"))
+            if "tests" not in path.relative_to(root).parts and path.name != SHARED_MODULE_NAME]
+
+
+class LoaderShape(unittest.TestCase):
+    """Structural cell: every script under scripts/ that names the shared module loads it by the one shape."""
+
+    def test_every_script_naming_the_shared_module_has_the_one_shape_9365(self):
+        problems, conforming = [], set()
+        for path in loader_scan_files(LOADER_SCAN_ROOT):
+            rel = path.relative_to(REPO).as_posix()
+            source = path.read_text(encoding="utf-8")
+            found = loader_shape_violations(rel, source)
+            problems.extend(found)
+            if not found and shared_module_references(ast.parse(source)) and rel not in LOADER_SHAPE_EXCEPTIONS:
+                conforming.add(rel)
+        self.assertEqual(problems, [])
+        self.assertEqual(conforming, set(GATE_LOAD_EXIT_CODES) | set(NON_GATE_LOAD_EXIT_CODES))
+
+    def test_the_shape_check_flags_every_other_way_to_load_9365(self):
+        """Mutants of a conforming script: each other load form is a violation (the check is not vacuous)."""
+        rel = "scripts/ci/shared_cargo_target.py"
+        source = (REPO / rel).read_text(encoding="utf-8")
+        self.assertEqual(loader_shape_violations(rel, source), [])
+        mutants = {
+            "import by name": source + "\nimport workflow_annotation\n",
+            "sys.path insert": source.replace("import argparse\n", "import argparse\nimport sys\n"
+                                              "sys.path.insert(0, '.')\n", 1),
+            "dunder import": source + "\nwa = __import__('workflow_annotation')\n",
+            "second loader call": source + "\nwa = _load_workflow_annotation()\n",
+            "exit 0 on failure": source.replace("sys.exit(WA_EXIT_LOAD_REFUSED)", "sys.exit(0)", 1),
+            "no required check": source.replace("    if missing:\n", "    if False:\n", 1),
+            "interpolated error line": source.replace(
+                'print("::error title=shared_cargo_target refused::', 'print("::error title=%s refused::' % "x", 1),
+        }
+        for label, mutant in mutants.items():
+            with self.subTest(mutant=label):
+                self.assertNotEqual(mutant, source, "the mutant did not change the script")
+                self.assertNotEqual(loader_shape_violations(rel, mutant), [])
+        no_references = "import os\nprint(os.sep)\n"
+        self.assertEqual(loader_shape_violations("scripts/ci/new_tool.py", no_references), [])
+        self.assertNotEqual(loader_shape_violations("scripts/ci/new_tool.py", "import workflow_annotation\n"), [])
+
+    def test_prune_runner_tmp_is_the_single_named_exception_9365(self):
+        self.assertEqual(set(LOADER_SHAPE_EXCEPTIONS), {"scripts/ci/" + PRUNE_SCRIPT_NAME})
+        source = (CI_DIR / PRUNE_SCRIPT_NAME).read_text(encoding="utf-8")
+        self.assertTrue(shared_module_references(ast.parse(source)), "the exception must still name the module")
 
 
 if __name__ == "__main__":
