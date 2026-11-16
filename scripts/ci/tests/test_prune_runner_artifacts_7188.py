@@ -6,15 +6,19 @@
 The helper prunes stale per-job artifacts after a self-hosted job and must
 NEVER list, let alone delete, the per-runner cargo target ROOT
 (every runner's target) passed as --protected-root. Every tree is
-built under <repo>/.local-runs/, never a tmp path.
+built under its own temporary directory (TMPDIR, else <repo>/.local-runs/),
+never a hard-coded tmp path, so no verdict depends on the checkout path
+(#8634: a checkout directory named `runner-<n>` must pass).
 
 Run: python3 -m unittest discover -s scripts/ci/tests
 Python 3.9+, standard library only.
 """
+import atexit
 import io
 import os
 import shutil
 import sys
+import tempfile
 import time
 import unittest
 import unittest.mock as mock
@@ -22,7 +26,20 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[3]
-SCRATCH = REPO / ".local-runs" / "prune-7188"
+
+
+def _scratch_base():
+    """TMPDIR when set (the lane scratch), else the gitignored in-repo directory."""
+    env_tmp = os.environ.get("TMPDIR")
+    base = Path(env_tmp) if env_tmp else REPO / ".local-runs"
+    base.mkdir(parents=True, exist_ok=True)
+    return base
+
+
+# #8634 class B: the whole layout lives under this per-process temporary
+# directory, never under the checkout path.
+SCRATCH = Path(tempfile.mkdtemp(prefix="prune-7188-", dir=_scratch_base()))
+atexit.register(shutil.rmtree, SCRATCH, ignore_errors=True)
 # A real directory that resolves to one path component on Linux and macOS.
 SINGLE_COMPONENT_ROOT = "/usr"
 MIN_COMPONENT_ROOT = "/usr/bin"
@@ -460,7 +477,12 @@ class PerRunnerRoot(Fixture):
         self.assertTrue(self.runner_2.exists())
         self.assertTrue(self.root.exists())
         self.assertFalse(self.old_tmp.exists())
-        self.assertNotIn("runner-", out.getvalue())
+        # The sibling runner trees are never listed; the match is on THIS cell's
+        # own layout, so the checkout path may itself contain "runner-" (#8634).
+        for sibling in (self.runner_1, self.runner_2):
+            runner_tree = sibling.parent.parent
+            self.assertTrue(runner_tree.name.startswith("runner-"))
+            self.assertNotIn(str(runner_tree), out.getvalue())
 
     def test_old_flag_name_is_gone(self):
         with self.assertRaises(SystemExit) as ctx:

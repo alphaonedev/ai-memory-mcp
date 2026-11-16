@@ -3446,8 +3446,7 @@ mod sal_boundary_961_tests {
         // return `None` and the call-site's unwrap_or_else fallback
         // fires.
         let tmp = tempfile::NamedTempFile::new().expect("tempfile");
-        let path = tmp.path().to_path_buf();
-        std::mem::forget(tmp);
+        let path = crate::test_support::keep_file_until_exit(tmp);
         let store = crate::store::sqlite::SqliteStore::open(&path).expect("open SqliteStore");
         let policy_opt = store
             .resolve_governance_policy("any/ns")

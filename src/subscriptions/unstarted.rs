@@ -266,11 +266,14 @@ impl DispatchDrainReport {
 mod tests {
     use super::*;
 
-    fn fresh_db() -> (tempfile::NamedTempFile, PathBuf) {
-        let f = tempfile::NamedTempFile::new().expect("tempfile");
-        let p = f.path().to_path_buf();
+    /// The file is removed, with its SQLite sidecars, when the test process
+    /// exits (#8634): a delivery thread started by a test can outlive it.
+    fn fresh_db() -> PathBuf {
+        let p = crate::test_support::keep_file_until_exit(
+            tempfile::NamedTempFile::new().expect("tempfile"),
+        );
         let _ = crate::db::open(&p).expect("db::open");
-        (f, p)
+        p
     }
 
     fn delivery(db_path: &std::path::Path, n: u8) -> UnstartedDelivery {
@@ -304,7 +307,7 @@ mod tests {
     /// DLQ row carries the full payload with the closed-vocabulary reason.
     #[test]
     fn sweep_records_only_unclaimed_and_a_swept_delivery_is_never_claimed_3979() {
-        let (_keep, db) = fresh_db();
+        let db = fresh_db();
         let registry = Registry::new();
         let started = registry.register(delivery(&db, 1));
         let queued = registry.register(delivery(&db, 2));

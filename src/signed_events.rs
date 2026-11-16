@@ -3770,7 +3770,8 @@ mod tests {
     #[test]
     fn issue_1925_verify_chain_catches_head_identity_tamper_e2e() {
         if !crate::governance::audit::audit_key_is_installed() {
-            let dir = std::env::temp_dir().join(format!("aim-1925-{}", Uuid::new_v4()));
+            // #8634: the audit sink is process-global, so its dir is removed at process exit.
+            let dir = crate::test_support::process_scratch_dir("aim-1925-");
             let sk = ed25519_dalek::SigningKey::from_bytes(&[3u8; 32]);
             crate::governance::audit::init(&dir, Some(sk)).expect("install audit key");
         }

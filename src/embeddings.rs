@@ -3423,7 +3423,12 @@ fn load_from_fallback_succeeds_when_files_present() {
     // covers this file's tests).
     let _guard = crate::config::test_env_lock();
 
-    let tmp = std::env::temp_dir().join(format!("ai-memory-w12h-fallback-{}", std::process::id()));
+    // #8634: RAII scratch dir, removed on pass, assertion failure and panic.
+    let _tmp_guard = tempfile::Builder::new()
+        .prefix("ai-memory-w12h-fallback-")
+        .tempdir()
+        .expect("scratch dir");
+    let tmp = _tmp_guard.path().to_path_buf();
     let model_dir = tmp.join(
         ".cache/huggingface/hub/models--sentence-transformers--all-MiniLM-L6-v2/snapshots/main",
     );
@@ -3444,7 +3449,6 @@ fn load_from_fallback_succeeds_when_files_present() {
             None => std::env::remove_var("HOME"),
         }
     }
-    let _ = std::fs::remove_dir_all(&tmp);
     let (cfg, tok, w) = result.expect("placeholder files satisfy load_from_fallback");
     assert!(cfg.ends_with("config.json"));
     assert!(tok.ends_with("tokenizer.json"));
@@ -3462,11 +3466,12 @@ fn offline_env_skips_network_and_errors_fast_on_empty_cache() {
     // against the reranker tests, not just within this file.
     let _guard = crate::config::test_env_lock();
 
-    let tmp = std::env::temp_dir().join(format!(
-        "ai-memory-1501-offline-{}-{}",
-        std::process::id(),
-        uuid::Uuid::new_v4()
-    ));
+    // #8634: RAII scratch dir, removed on pass, assertion failure and panic.
+    let _tmp_guard = tempfile::Builder::new()
+        .prefix("ai-memory-1501-offline-")
+        .tempdir()
+        .expect("scratch dir");
+    let tmp = _tmp_guard.path().to_path_buf();
     std::fs::create_dir_all(&tmp).expect("mk empty home");
     // f1 goal4 — the test OWNS every variable the offline resolver reads, and
     // restores them on Drop (also on a panic): `HOME`, `HF_HOME` (the hub root
@@ -3510,7 +3515,6 @@ fn offline_env_skips_network_and_errors_fast_on_empty_cache() {
     // Restore env before any assertion that could panic (Drop covers a panic
     // above).
     drop(restore);
-    let _ = std::fs::remove_dir_all(&tmp);
     let msg = match result {
         Ok(_) => panic!("empty cache + offline must error (degrades to keyword)"),
         Err(e) => e.to_string(),

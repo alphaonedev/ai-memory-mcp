@@ -3110,6 +3110,9 @@ mod tests {
 
     #[test]
     fn pr9i_new_neural_dual_outcome() {
+        // #8634: the loader reads $HOME to place the hub cache; hold the crate env lock so a
+        // $HOME-mutating test cannot redirect a model download into its scratch dir.
+        let _env_guard = crate::config::test_env_lock();
         // Exercises CrossEncoder::new_neural() (lines 65-79). Behavior is
         // environment-dependent: with an HF cache or network the call
         // succeeds and returns Self::Neural; without either it falls back
@@ -3141,14 +3144,12 @@ mod tests {
         // per file can never serialize against another file's tests).
         let _guard = crate::config::test_env_lock();
 
-        let tmp = std::env::temp_dir().join(format!(
-            "ai-memory-2086-reranker-empty-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
+        // #8634: RAII scratch dir, removed on pass, assertion failure and panic.
+        let _tmp_guard = tempfile::Builder::new()
+            .prefix("ai-memory-2086-reranker-empty-")
+            .tempdir()
+            .expect("scratch dir");
+        let tmp = _tmp_guard.path().to_path_buf();
         std::fs::create_dir_all(&tmp).expect("mk empty home");
         let prev_home = std::env::var("HOME").ok();
         // SAFETY: serialized via LOCK above; no other thread mutates HOME
@@ -3163,7 +3164,6 @@ mod tests {
                 None => std::env::remove_var("HOME"),
             }
         }
-        let _ = std::fs::remove_dir_all(&tmp);
         let err = result.expect_err("uncached pre-stage dir must bail, not silently fetch");
         let msg = err.to_string();
         assert!(
@@ -3189,14 +3189,12 @@ mod tests {
         // $HOME mutation serializes cross-module, not just within this file.
         let _guard = crate::config::test_env_lock();
 
-        let tmp = std::env::temp_dir().join(format!(
-            "ai-memory-2086-reranker-prestaged-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
+        // #8634: RAII scratch dir, removed on pass, assertion failure and panic.
+        let _tmp_guard = tempfile::Builder::new()
+            .prefix("ai-memory-2086-reranker-prestaged-")
+            .tempdir()
+            .expect("scratch dir");
+        let tmp = _tmp_guard.path().to_path_buf();
         let model_dir = tmp.join(CROSS_ENCODER_FALLBACK_MODEL_SUBDIR);
         std::fs::create_dir_all(&model_dir).expect("mk pre-stage model dir");
         for name in [
@@ -3218,7 +3216,6 @@ mod tests {
                 None => std::env::remove_var("HOME"),
             }
         }
-        let _ = std::fs::remove_dir_all(&tmp);
         let (config, tokenizer, weights) =
             result.expect("pre-staged cross-encoder files must resolve");
         assert!(config.ends_with(crate::embeddings::HF_CONFIG_FILE));
@@ -3236,14 +3233,12 @@ mod tests {
         // lexical.
         let _guard = crate::config::test_env_lock();
 
-        let tmp = std::env::temp_dir().join(format!(
-            "ai-memory-2114-reranker-online-cache-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
+        // #8634: RAII scratch dir, removed on pass, assertion failure and panic.
+        let _tmp_guard = tempfile::Builder::new()
+            .prefix("ai-memory-2114-reranker-online-cache-")
+            .tempdir()
+            .expect("scratch dir");
+        let tmp = _tmp_guard.path().to_path_buf();
         // Build the hf-hub repo dir (grandparent of the `snapshots/main` leaf)
         // WITHOUT a `snapshots/main` — only a commit-hash leaf + `refs/main`,
         // exactly what an online fetch leaves behind.
@@ -3277,7 +3272,6 @@ mod tests {
                 None => std::env::remove_var("HOME"),
             }
         }
-        let _ = std::fs::remove_dir_all(&tmp);
         let (config, tokenizer, weights) =
             result.expect("online-populated snapshots/<hash>/ cache must resolve offline");
         assert!(
@@ -3299,14 +3293,12 @@ mod tests {
         // $HOME mutation serializes cross-module, not just within this file.
         let _guard = crate::config::test_env_lock();
 
-        let tmp = std::env::temp_dir().join(format!(
-            "ai-memory-2086-resolve-offline-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
+        // #8634: RAII scratch dir, removed on pass, assertion failure and panic.
+        let _tmp_guard = tempfile::Builder::new()
+            .prefix("ai-memory-2086-resolve-offline-")
+            .tempdir()
+            .expect("scratch dir");
+        let tmp = _tmp_guard.path().to_path_buf();
         std::fs::create_dir_all(&tmp).expect("mk empty home");
         let prev_home = std::env::var("HOME").ok();
         let prev_off = std::env::var("AI_MEMORY_EMBED_OFFLINE").ok();
@@ -3330,7 +3322,6 @@ mod tests {
                 None => std::env::remove_var("AI_MEMORY_EMBED_OFFLINE"),
             }
         }
-        let _ = std::fs::remove_dir_all(&tmp);
         let msg = match result {
             Ok(_) => panic!("empty pre-stage dir + offline must error (no silent network fetch)"),
             Err(e) => e.to_string(),
@@ -3570,6 +3561,9 @@ mod tests {
 
     #[test]
     fn pr9i_rerank_via_score_returns_blend() {
+        // #8634: the loader reads $HOME to place the hub cache; hold the crate env lock so a
+        // $HOME-mutating test cannot redirect a model download into its scratch dir.
+        let _env_guard = crate::config::test_env_lock();
         // Even when new_neural() falls back to lexical, rerank() must
         // still produce a deterministic [0..1] blend. Pins the contract
         // for both branches of CrossEncoder::score().

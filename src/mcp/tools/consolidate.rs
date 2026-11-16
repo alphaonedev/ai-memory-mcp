@@ -426,8 +426,8 @@ mod tests {
     use crate::storage as db;
     use serde_json::json;
 
-    fn fresh_db() -> (rusqlite::Connection, tempfile::NamedTempFile) {
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+    fn fresh_db() -> (rusqlite::Connection, crate::test_support::TempDbFile) {
+        let tmp = crate::test_support::TempDbFile::new();
         let conn = db::open(tmp.path()).expect("db::open");
         (conn, tmp)
     }

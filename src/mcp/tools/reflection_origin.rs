@@ -137,14 +137,15 @@ mod tests {
     use super::*;
     use crate::storage as db;
 
-    fn fresh_db() -> rusqlite::Connection {
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
-        db::open(tmp.path()).expect("db::open")
+    fn fresh_db() -> (rusqlite::Connection, crate::test_support::TempDbFile) {
+        let tmp = crate::test_support::TempDbFile::new();
+        let conn = db::open(tmp.path()).expect("db::open");
+        (conn, tmp)
     }
 
     #[test]
     fn handle_unknown_id_returns_not_found() {
-        let conn = fresh_db();
+        let (conn, _tmp) = fresh_db();
         let err =
             handle_reflection_origin(&conn, &json!({"memory_id": "nope-id"}), None).unwrap_err();
         assert!(err.contains("not found"), "expected not-found error: {err}");
@@ -152,14 +153,14 @@ mod tests {
 
     #[test]
     fn handle_missing_param_returns_error() {
-        let conn = fresh_db();
+        let (conn, _tmp) = fresh_db();
         let err = handle_reflection_origin(&conn, &json!({}), None).unwrap_err();
         assert!(err.contains("memory_id"), "expected param error: {err}");
     }
 
     #[test]
     fn handle_non_reflection_returns_envelope_with_flag() {
-        let conn = fresh_db();
+        let (conn, _tmp) = fresh_db();
         // Insert a plain memory (depth = 0).
         let now = chrono::Utc::now().to_rfc3339();
         let mem = crate::models::Memory {

@@ -19,7 +19,12 @@ use ai_memory::embeddings::Embedder;
 
 #[test]
 fn staged_cache_resolves_hf_home_refs_main_to_commit_snapshot_3788() {
-    let base = std::env::temp_dir().join(format!("ai-memory-3788-{}", uuid::Uuid::new_v4()));
+    // #8634: RAII scratch dir, removed on pass, assertion failure and panic.
+    let base_guard = tempfile::Builder::new()
+        .prefix("ai-memory-3788-")
+        .tempdir()
+        .expect("scratch dir");
+    let base = base_guard.path().to_path_buf();
     let repo_rel = "hub/models--sentence-transformers--all-MiniLM-L6-v2";
     let files = ["config.json", "tokenizer.json", "model.safetensors"];
 
@@ -78,7 +83,6 @@ fn staged_cache_resolves_hf_home_refs_main_to_commit_snapshot_3788() {
         Some(v) => set("HOME", std::path::Path::new(&v)),
         None => unset("HOME"),
     }
-    let _ = std::fs::remove_dir_all(&base);
 
     let (c, t, w) = via_hf.expect("HF_HOME refs/main -> snapshots/<commit> must resolve");
     assert!(

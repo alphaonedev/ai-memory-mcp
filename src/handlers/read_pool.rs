@@ -301,8 +301,8 @@ mod tests {
 
     /// Build a FILE-backed `Db` (the read-pool is disabled for `:memory:`
     /// because separate connections to `:memory:` see separate databases).
-    fn file_db() -> (tempfile::NamedTempFile, Db) {
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+    fn file_db() -> (crate::test_support::TempDbFile, Db) {
+        let tmp = crate::test_support::TempDbFile::new();
         let conn = crate::storage::open(tmp.path()).expect("open writer");
         let db: Db = Arc::new(TokioMutex::new((
             conn,

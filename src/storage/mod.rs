@@ -32446,10 +32446,13 @@ mod tests {
         // db (which is at v15), inserting a link with NULL valid_from,
         // rolling schema_version back to 14, and re-opening to force
         // the v15 block to re-execute the backfill UPDATE.
-        let path = std::env::temp_dir().join(format!(
-            "ai_memory_v15_backfill_{}.db",
-            uuid::Uuid::new_v4()
-        ));
+        // #8634: the db sits INSIDE an RAII dir, so the file and its `-wal` /
+        // `-shm` sidecars are removed on pass, failure and panic.
+        let scratch = tempfile::Builder::new()
+            .prefix("ai_memory_v15_backfill_")
+            .tempdir()
+            .expect("scratch dir");
+        let path = scratch.path().join("backfill.db");
         {
             let conn = open(&path).unwrap();
             let src = make_memory("src", "test", Tier::Long, 5);
@@ -32480,7 +32483,6 @@ mod tests {
             backfilled.is_some(),
             "expected valid_from to be backfilled, got NULL"
         );
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

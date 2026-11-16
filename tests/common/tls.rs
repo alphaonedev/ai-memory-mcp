@@ -240,12 +240,45 @@ pub fn local_ca_client(key_dir: &Path, deadline: Duration) -> Option<reqwest::bl
     }
 }
 
+/// The process-wide leaf directory, removed by the `atexit` hook below.
+static SHARED_LEAF_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// #8634 class A: statics are never dropped, so the shared leaf's directory
+/// (and the `cert.pem` / `key.pem` in it) is removed when the test process
+/// exits (after a pass, a failed assertion or a panic; not after an abort).
+/// Self-contained on purpose: `tests/common/tls.rs` is also compiled by itself
+/// through `#[path]` and copied between trees.
+///
+/// Twin of the `atexit` handler in `tests/common/process_scratch.rs`
+/// (`remove_registered`): a change to one is made in both.
+extern "C" fn remove_shared_leaf() {
+    if let Some(dir) = SHARED_LEAF_DIR.get() {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+fn remove_shared_leaf_at_exit(dir: PathBuf) {
+    if SHARED_LEAF_DIR.set(dir).is_ok() {
+        #[cfg(unix)]
+        {
+            // SAFETY: `atexit` only records the function pointer; the handler
+            // is a plain `extern "C" fn` that never unwinds.
+            let rc = unsafe { libc::atexit(remove_shared_leaf) };
+            assert_eq!(rc, 0, "atexit could not register the TLS leaf cleanup");
+        }
+    }
+}
+
 /// A process-wide leaf for suites whose helpers only carry a port
 /// (`curl_get(port, path)` and friends): minted once per test binary under
 /// `dir`, shared by every spawn in that binary.
 pub fn shared(dir: &Path) -> &'static TestTls {
     static SHARED: std::sync::OnceLock<TestTls> = std::sync::OnceLock::new();
-    SHARED.get_or_init(|| TestTls::generate(&dir.join(format!("tls-{}", std::process::id()))))
+    SHARED.get_or_init(|| {
+        let leaf_dir = dir.join(format!("tls-{}", std::process::id()));
+        remove_shared_leaf_at_exit(leaf_dir.clone());
+        TestTls::generate(&leaf_dir)
+    })
 }
 
 /// Convenience for `Arc`-sharing across spawned tasks.
