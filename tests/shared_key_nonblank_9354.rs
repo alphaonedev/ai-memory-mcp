@@ -20,8 +20,11 @@
 //! path keeps its precedent (blank = no shared key, pinned in b1 and b2) and
 //! says so at boot with one WARN naming the remedy (b3).
 //!
-//! Blank corpus: `str::trim` strips Unicode `White_Space`, so U+00A0 (NBSP) is
-//! blank too (pinned in p5).
+//! Blank corpus: `str::trim` strips Unicode `White_Space`, so U+00A0 (NBSP),
+//! CR, U+2003, U+3000, U+0085, U+2028 and U+1680 are blank too (pinned per
+//! member in p5); U+200B and U+FEFF are not `White_Space` and are real keys
+//! (p6). No panic or assert message in this file formats a key value: a case
+//! is named by its label only.
 //!
 //! Backends: the shared-key gate runs before any handler and reads no store;
 //! the harness opens SQLite only because `AppState` needs one. Backend parity
@@ -45,15 +48,37 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tower::ServiceExt as _;
 
 /// Configured shared keys that are blank after `str::trim` (label, value).
-const BLANK_KEYS: [(&str, &str); 5] = [
+/// `str::trim` strips Unicode `White_Space`, so every member is blank to the
+/// product (`ConfiguredKey::new` returns `None`); p5 pins that per member.
+const BLANK_KEYS: [(&str, &str); 11] = [
     ("empty", ""),
     ("space", " "),
     ("tab", "\t"),
     ("space-newline-space", " \n "),
     ("nbsp", "\u{00a0}"),
+    // CR alone: blank; a header cannot carry it (HeaderValue refuses CR).
+    ("cr", "\r"),
+    // U+2003 EM SPACE: Unicode White_Space, blank.
+    ("em-space", "\u{2003}"),
+    // U+3000 IDEOGRAPHIC SPACE: Unicode White_Space, blank.
+    ("ideographic-space", "\u{3000}"),
+    // U+0085 NEXT LINE: Unicode White_Space, blank.
+    ("next-line", "\u{0085}"),
+    // U+2028 LINE SEPARATOR: Unicode White_Space, blank.
+    ("line-separator", "\u{2028}"),
+    // U+1680 OGHAM SPACE MARK: Unicode White_Space, blank.
+    ("ogham-space", "\u{1680}"),
 ];
+/// Keys that look blank to a human but are NOT `White_Space` for `str::trim`:
+/// the product treats each as a real, non-blank key (label, value). A zero
+/// width space and a BOM are not blank; a header cannot carry either (they are
+/// not visible ASCII), so such a key can never be matched and fails closed.
+const NON_BLANK_LOOKALIKES: [(&str, &str); 2] =
+    [("zero-width-space", "\u{200b}"), ("bom", "\u{feff}")];
 /// U+00A0 NO-BREAK SPACE, Unicode `White_Space`.
 const NBSP: &str = "\u{00a0}";
+/// CR alone (blank; refused by a header).
+const CR: &str = "\r";
 /// A value the HTTP stack cannot carry in a header (LF).
 const SPACE_NEWLINE_SPACE: &[u8] = b" \n ";
 const MODES: [HttpIdentityMode; 3] = [
@@ -65,6 +90,8 @@ const MODES: [HttpIdentityMode; 3] = [
 const REAL_KEY: &str = "shared-real-key-9354";
 /// A real key with surrounding whitespace: compared byte for byte, as today.
 const PADDED_KEY: &str = "  shared-real-key-9354  ";
+/// A real key with INNER spaces: non-blank, compared byte for byte.
+const INNER_SPACE_KEY: &str = "real key 9354 with inner spaces";
 const AGENT_A: &str = "ai:alice-9354";
 const KEY_A: &str = "alice-per-agent-token-9354";
 const READ_ROUTE: &str = "/api/v1/memories";
@@ -83,11 +110,159 @@ const TCP_READY_ATTEMPTS: u32 = 200;
 const TCP_READY_STEP: Duration = Duration::from_millis(25);
 const TCP_IO_CEILING: Duration = Duration::from_secs(20);
 const BODY_LIMIT: usize = 1 << 20;
-/// Literal the structural cell (s1) forbids outside the transport module:
-/// a read of the raw constructor-facing `ApiKeyState::key` field.
-const RAW_KEY_READ: &str = "auth.key.";
-const TRANSPORT_SOURCE: &str = "src/handlers/transport.rs";
 const SRC_DIR: &str = "src";
+/// Every read of a field named `key` in `src/**/*.rs` (comments and string
+/// literals blanked; `transport.rs` included) must be one of these exact
+/// (file, trimmed line, why) entries, so a new raw read of the shared key under
+/// any binding name fails s1 until a reviewer admits it here. Entries about
+/// `ApiKeyState::key` are the accessor, the presence checks and unit-test
+/// asserts; the others are unrelated structs that merely name a field `key`.
+/// Number of allowlisted reads (asserted against the scan in s1).
+const ALLOWED_KEY_FIELD_READS_COUNT: usize = 28;
+const ALLOWED_KEY_FIELD_READS: [(&str, &str, &str); ALLOWED_KEY_FIELD_READS_COUNT] = [
+    (
+        "src/handlers/transport.rs",
+        "self.key.as_deref().and_then(ConfiguredKey::new)",
+        "ApiKeyState: the one typed accessor",
+    ),
+    (
+        "src/handlers/transport.rs",
+        "if auth.key.is_none() {",
+        "ApiKeyState: presence check, the unset-key early return",
+    ),
+    (
+        "src/daemon_runtime.rs",
+        "if api_key_state.key.is_some() {",
+        "ApiKeyState: presence check (boot posture)",
+    ),
+    (
+        "src/daemon_runtime.rs",
+        "crate::handlers::admin_role::mark_request_authn_configured(api_key_state.key.is_some());",
+        "ApiKeyState: presence check (boot posture)",
+    ),
+    (
+        "src/daemon_runtime.rs",
+        "&& api_key_state.key.is_none()",
+        "ApiKeyState: presence check (boot posture)",
+    ),
+    (
+        "src/daemon_runtime.rs",
+        "assert_eq!(bs.api_key_state.key.as_deref(), Some(\"test-key\"));",
+        "ApiKeyState: unit-test assert on the booted key",
+    ),
+    (
+        "src/daemon_runtime.rs",
+        "assert_eq!(bs.api_key_state.key.as_deref(), Some(\"s3cret\"));",
+        "ApiKeyState: unit-test assert on the booted key",
+    ),
+    (
+        "src/daemon_runtime.rs",
+        "assert_eq!(bs.api_key_state.key.as_deref(), Some(\"only-tls\"));",
+        "ApiKeyState: unit-test assert on the booted key",
+    ),
+    (
+        "src/daemon_runtime.rs",
+        "assert_eq!(bs.api_key_state.key.as_deref(), Some(\"fed-key\"));",
+        "ApiKeyState: unit-test assert on the booted key",
+    ),
+    (
+        "src/cli/store.rs",
+        "Some(v) => unsafe { std::env::set_var(self.key, v) },",
+        "unrelated: env guard field",
+    ),
+    (
+        "src/cli/store.rs",
+        "None => unsafe { std::env::remove_var(self.key) },",
+        "unrelated: env guard field",
+    ),
+    (
+        "src/test_support.rs",
+        "std::env::set_var(self.key, v);",
+        "unrelated: env guard field",
+    ),
+    (
+        "src/test_support.rs",
+        "std::env::remove_var(self.key);",
+        "unrelated: env guard field",
+    ),
+    (
+        "src/test_support.rs",
+        "std::env::set_var(self.key, v);",
+        "unrelated: env guard field",
+    ),
+    (
+        "src/test_support.rs",
+        "std::env::remove_var(self.key);",
+        "unrelated: env guard field",
+    ),
+    (
+        "src/config/deprecated_keys.rs",
+        "if !present.iter().any(|p| p == row.key) {",
+        "unrelated: deprecated-key row",
+    ),
+    (
+        "src/config/deprecated_keys.rs",
+        "f.row.key,",
+        "unrelated: deprecated-key row",
+    ),
+    (
+        "src/config/deprecated_keys.rs",
+        "f.row.key,",
+        "unrelated: deprecated-key row",
+    ),
+    (
+        "src/config/deprecated_keys.rs",
+        "DEPRECATED_KEYS.iter().find(|r| r.key == key)",
+        "unrelated: deprecated-key row",
+    ),
+    (
+        "src/config/deprecated_keys.rs",
+        "accepted.iter().any(|k| k == row.key),",
+        "unrelated: deprecated-key row",
+    ),
+    (
+        "src/config/deprecated_keys.rs",
+        "row.key",
+        "unrelated: deprecated-key row",
+    ),
+    (
+        "src/config/deprecated_keys.rs",
+        "assert!(!row.replacement.is_empty(), \"{}\", row.key);",
+        "unrelated: deprecated-key row",
+    ),
+    (
+        "src/config/deprecated_keys.rs",
+        "assert!(version_triple(row.deprecated_in).is_some(), \"{}\", row.key);",
+        "unrelated: deprecated-key row",
+    ),
+    (
+        "src/config/deprecated_keys.rs",
+        "assert!(version_triple(r).is_some(), \"{}\", row.key);",
+        "unrelated: deprecated-key row",
+    ),
+    (
+        "src/config/deprecated_keys.rs",
+        "assert_eq!(c.deprecated[0].row.key, \"llm_model\");",
+        "unrelated: deprecated-key row",
+    ),
+    (
+        "src/store/mod.rs",
+        ".get(&self.key)",
+        "unrelated: metadata map key",
+    ),
+    (
+        "src/store/postgres.rs",
+        ".map(|m| (m.key.clone(), m.value.clone()));",
+        "unrelated: metadata row",
+    ),
+    (
+        "src/store/sqlite.rs",
+        ".map(|m| (m.key.as_str(), m.value.as_str()));",
+        "unrelated: metadata row",
+    ),
+];
+/// Source type whose `key` field the ratchet guards (destructuring check).
+const KEY_STATE_TYPE: &str = "ApiKeyState";
 
 /// The `X-API-Key` header of one request.
 #[derive(Clone, Copy, Debug)]
@@ -547,10 +722,32 @@ async fn p1_real_key_authenticates_and_blank_header_is_refused_9354() {
 }
 
 /// p2 — pin: surrounding whitespace on a real key is compared byte for byte,
-/// as today (no trimming of a non-blank key).
+/// as today (no trimming of a non-blank key), and a key with inner spaces is a
+/// valid non-blank key that admits itself and refuses its space-stripped form.
 #[tokio::test]
 async fn p2_padded_real_key_is_compared_verbatim_9354() {
     for posture in postures() {
+        let app = router(Entry::LibBuildRouter, Some(INNER_SPACE_KEY), posture);
+        let (status, body) = send(&app, READ_ROUTE, Some(INNER_SPACE_KEY.as_bytes()))
+            .await
+            .expect("carried");
+        assert!(
+            admitted(status, &body),
+            "{posture:?}: the inner-space key byte for byte must admit: {status} {body}"
+        );
+        let stripped = INNER_SPACE_KEY.replace(' ', "");
+        let (status, body) = send(&app, READ_ROUTE, Some(stripped.as_bytes()))
+            .await
+            .expect("carried");
+        assert_eq!(
+            status, REFUSAL_STATUS,
+            "{posture:?}: inner-space key, spaces removed: {body}"
+        );
+        assert_eq!(
+            body,
+            refusal_body(),
+            "{posture:?}: inner-space key stripped"
+        );
         let app = router(Entry::LibBuildRouter, Some(PADDED_KEY), posture);
         let (status, body) = send(&app, READ_ROUTE, Some(PADDED_KEY.as_bytes()))
             .await
@@ -622,14 +819,25 @@ async fn p4_huge_blank_header_refused_in_bounded_time_9354() {
     }
 }
 
-/// p5 — pin the blank corpus: `str::trim` strips NBSP (Unicode `White_Space`),
-/// NBSP rides in a header but is not a visible-ASCII token, and LF cannot be
-/// carried at all.
+/// p5 — pin the blank corpus per member: every `BLANK_KEYS` member is blank to
+/// `str::trim` (the product's one blank test, `ConfiguredKey::new`), exactly
+/// the table below; NBSP rides in a header but is not a visible-ASCII token;
+/// LF and CR cannot be carried at all.
 #[test]
 fn p5_blank_corpus_pins_9354() {
     for (label, blank) in BLANK_KEYS {
         assert!(blank.trim().is_empty(), "{label} must be blank after trim");
     }
+    for (label, key) in NON_BLANK_LOOKALIKES {
+        assert!(
+            !key.trim().is_empty(),
+            "{label} is not White_Space and must stay a non-blank key"
+        );
+    }
+    assert!(
+        !INNER_SPACE_KEY.trim().is_empty() && INNER_SPACE_KEY.trim() == INNER_SPACE_KEY,
+        "a key with inner spaces is non-blank and needs no trimming"
+    );
     assert!(NBSP.trim().is_empty(), "str::trim strips U+00A0");
     let nbsp = HeaderValue::from_bytes(NBSP.as_bytes()).expect("NBSP bytes ride in a header");
     assert!(nbsp.to_str().is_err(), "NBSP is not a visible-ASCII token");
@@ -637,6 +845,53 @@ fn p5_blank_corpus_pins_9354() {
         HeaderValue::from_bytes(SPACE_NEWLINE_SPACE).is_err(),
         "LF cannot be carried in a header"
     );
+    assert!(
+        HeaderValue::from_bytes(CR.as_bytes()).is_err(),
+        "CR cannot be carried in a header"
+    );
+}
+
+/// p6 — the not-`White_Space` lookalikes (U+200B, U+FEFF) are real keys: the
+/// router holds them as the configured key, and since no header can carry the
+/// bytes (not visible ASCII) every request is refused with the exact refusal;
+/// that is fail-closed, never an admit. The boot path keeps them verbatim.
+#[tokio::test]
+async fn p6_non_whitespace_lookalikes_are_non_blank_keys_9354() {
+    for posture in postures() {
+        for (label, key) in NON_BLANK_LOOKALIKES {
+            let app = router(Entry::LibBuildRouter, Some(key), posture);
+            for case in HEADER_CASES {
+                let Some((status, body)) = send(&app, READ_ROUTE, header_value(case, key)).await
+                else {
+                    continue;
+                };
+                assert_eq!(
+                    status, REFUSAL_STATUS,
+                    "{posture:?} key={label} {case:?}: {body}"
+                );
+                assert_eq!(body, refusal_body(), "{posture:?} key={label} {case:?}");
+            }
+        }
+    }
+    for (label, key) in NON_BLANK_LOOKALIKES {
+        let path = scratch_db();
+        let tls = tls_helper::TestTls::generate(&path.with_extension("tls9354"));
+        let args = loopback_args("127.0.0.1", &tls);
+        let cfg = ai_memory::config::AppConfig {
+            api_key: Some(key.to_string()),
+            ..Default::default()
+        };
+        let bs = ai_memory::daemon_runtime::bootstrap_serve(&path, &args, &cfg)
+            .await
+            .unwrap_or_else(|e| panic!("{label}: loopback boot: {e:#}"));
+        assert!(
+            bs.api_key_state.key.as_deref() == Some(key),
+            "{label}: the boot path keeps a non-blank key verbatim"
+        );
+        for h in bs.task_handles {
+            h.abort();
+        }
+    }
 }
 
 fn loopback_args(host: &str, tls: &tls_helper::TestTls) -> ai_memory::daemon_runtime::ServeArgs {
@@ -684,7 +939,10 @@ async fn b1_boot_blank_key_is_no_shared_key_9354() {
             .await
             .unwrap_or_else(|e| panic!("{label}: loopback boot: {e:#}"));
         let expected = (label == "real").then_some(REAL_KEY);
-        assert_eq!(bs.api_key_state.key.as_deref(), expected, "{label}");
+        assert!(
+            bs.api_key_state.key.as_deref() == expected,
+            "{label}: the booted shared key is not the expected one"
+        );
         for h in bs.task_handles {
             h.abort();
         }
@@ -739,7 +997,7 @@ impl std::io::Write for Capture {
 
 /// Boot on loopback with `api_key`, capturing every event of the boot; the
 /// router is built from the booted state exactly as `serve` composes it.
-async fn boot_capturing(api_key: Option<&str>) -> (String, axum::Router) {
+async fn boot_capturing(label: &str, api_key: Option<&str>) -> (String, axum::Router) {
     let path = scratch_db();
     let tls = tls_helper::TestTls::generate(&path.with_extension("tls9354"));
     let args = loopback_args("127.0.0.1", &tls);
@@ -758,7 +1016,7 @@ async fn boot_capturing(api_key: Option<&str>) -> (String, axum::Router) {
         let _default = tracing::subscriber::set_default(subscriber);
         ai_memory::daemon_runtime::bootstrap_serve(&path, &args, &cfg).await
     }
-    .unwrap_or_else(|e| panic!("{api_key:?}: loopback boot: {e:#}"));
+    .unwrap_or_else(|e| panic!("{label}: loopback boot: {e:#}"));
     for h in bs.task_handles {
         h.abort();
     }
@@ -779,22 +1037,24 @@ async fn boot_capturing(api_key: Option<&str>) -> (String, axum::Router) {
 /// key get no such WARN).
 #[tokio::test]
 async fn b3_boot_blank_key_warns_with_remedy_and_probes_stay_reachable_9354() {
-    let (unset_logs, unset_app) = boot_capturing(None).await;
+    // Messages name the case, never the key and never the boot log (a boot log
+    // of a keyed daemon is not guaranteed free of configuration values).
+    let (unset_logs, unset_app) = boot_capturing("unset", None).await;
     assert!(
         !unset_logs.contains(BLANK_KEY_BOOT_WARN),
-        "unset key: {unset_logs}"
+        "unset key: no boot WARN expected"
     );
-    let (real_logs, _) = boot_capturing(Some(REAL_KEY)).await;
+    let (real_logs, _) = boot_capturing("real", Some(REAL_KEY)).await;
     assert!(
         !real_logs.contains(BLANK_KEY_BOOT_WARN),
-        "real key: {real_logs}"
+        "real key: no boot WARN expected"
     );
     for (label, blank) in BLANK_KEYS {
-        let (logs, app) = boot_capturing(Some(blank)).await;
+        let (logs, app) = boot_capturing(label, Some(blank)).await;
         assert_eq!(
             logs.matches(BLANK_KEY_BOOT_WARN).count(),
             1,
-            "{label}: one boot WARN with the remedy: {logs}"
+            "{label}: one boot WARN with the remedy"
         );
         for path in [ai_memory::handlers::routes::HEALTH, STATUS_PATH] {
             for case in HEADER_CASES {
@@ -822,33 +1082,356 @@ async fn b3_boot_blank_key_warns_with_remedy_and_probes_stay_reachable_9354() {
     }
 }
 
-/// s1 — structural ratchet: outside the transport module no source reads the
-/// raw constructor-facing `ApiKeyState::key` string to authenticate; every
-/// shared-key read goes through the typed constructor there.
+/// Blank every comment and string/char literal of Rust source (newlines kept,
+/// so line numbers hold). Handles `//`, nested `/* */`, `"..."` with escapes
+/// (multi-line too), raw strings `r#"..."#`, char literals and lifetimes.
+fn blank_literals_and_comments(src: &str) -> String {
+    let c: Vec<char> = src.chars().collect();
+    let mut out = String::with_capacity(src.len());
+    let blank = |ch: char| if ch == '\n' { '\n' } else { ' ' };
+    let mut i = 0;
+    while i < c.len() {
+        let rest_is =
+            |at: usize, pat: &str| c[at..].iter().take(pat.len()).collect::<String>() == pat;
+        if rest_is(i, "//") {
+            while i < c.len() && c[i] != '\n' {
+                out.push(' ');
+                i += 1;
+            }
+        } else if rest_is(i, "/*") {
+            let mut depth = 0usize;
+            while i < c.len() {
+                if rest_is(i, "/*") {
+                    depth += 1;
+                    out.push_str("  ");
+                    i += 2;
+                } else if rest_is(i, "*/") {
+                    depth -= 1;
+                    out.push_str("  ");
+                    i += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                } else {
+                    out.push(blank(c[i]));
+                    i += 1;
+                }
+            }
+        } else if c[i] == 'r'
+            && (i == 0 || !(c[i - 1].is_alphanumeric() || c[i - 1] == '_'))
+            && (rest_is(i, "r\"") || rest_is(i, "r#"))
+        {
+            let mut j = i + 1;
+            let mut hashes = 0usize;
+            while j < c.len() && c[j] == '#' {
+                hashes += 1;
+                j += 1;
+            }
+            if j < c.len() && c[j] == '"' {
+                let end = format!("\"{}", "#".repeat(hashes));
+                let mut k = j + 1;
+                while k < c.len() && !rest_is(k, &end) {
+                    k += 1;
+                }
+                let stop = (k + end.len()).min(c.len());
+                out.extend(c[i..stop].iter().map(|&ch| blank(ch)));
+                i = stop;
+            } else {
+                out.push(c[i]);
+                i += 1;
+            }
+        } else if c[i] == '"' {
+            out.push(' ');
+            i += 1;
+            while i < c.len() && c[i] != '"' {
+                if c[i] == '\\' && i + 1 < c.len() {
+                    out.push(' ');
+                    i += 1;
+                }
+                out.push(blank(c[i]));
+                i += 1;
+            }
+            out.push(' ');
+            i += 1;
+        } else if c[i] == '\'' {
+            if i + 1 < c.len() && c[i + 1] == '\\' {
+                let mut k = i + 2;
+                while k < c.len() && c[k] != '\'' {
+                    k += 1;
+                }
+                let stop = (k + 1).min(c.len());
+                out.extend(c[i..stop].iter().map(|&ch| blank(ch)));
+                i = stop;
+            } else if i + 2 < c.len() && c[i + 2] == '\'' {
+                out.push_str("   ");
+                i += 3;
+            } else {
+                out.push(c[i]);
+                i += 1;
+            }
+        } else {
+            out.push(c[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+fn is_ident(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '_'
+}
+
+/// 1-based line numbers (of comment/literal-blanked source) that read a field
+/// named `key` under ANY binding name: `<expr>.key` not followed by `(` (so a
+/// `.key()` method is not a field), and a destructuring of the guarded type
+/// that names `key` (`let T { key, .. } = ..`, a `match` arm, a parameter).
+/// Construction (`T { key: .., ..Default::default() }`) is not a read.
+fn key_field_read_lines(blanked: &str, guarded_type: &str) -> Vec<usize> {
+    let c: Vec<char> = blanked.chars().collect();
+    let line_of = |at: usize| c[..at].iter().filter(|&&ch| ch == '\n').count() + 1;
+    let word_at = |at: usize, w: &str| {
+        let n = w.chars().count();
+        c.len() >= at + n
+            && c[at..at + n].iter().collect::<String>() == w
+            && (at == 0 || !is_ident(c[at - 1]))
+            && c.get(at + n).is_none_or(|&ch| !is_ident(ch))
+    };
+    let mut lines = Vec::new();
+    let mut i = 0;
+    while i < c.len() {
+        if c[i] == '.'
+            && (i == 0 || c[i - 1] != '.')
+            && c[i + 1..].starts_with(&['k', 'e', 'y'])
+            && c.get(i + 4).is_none_or(|&ch| !is_ident(ch))
+        {
+            let mut k = i + 4;
+            while k < c.len() && c[k].is_whitespace() {
+                k += 1;
+            }
+            if c.get(k) != Some(&'(') {
+                lines.push(line_of(i));
+            }
+        }
+        if word_at(i, guarded_type) {
+            let mut k = i + guarded_type.chars().count();
+            while k < c.len() && c[k].is_whitespace() {
+                k += 1;
+            }
+            if c.get(k) == Some(&'{') {
+                let open = k;
+                let mut depth = 0usize;
+                let mut close = open;
+                while close < c.len() {
+                    match c[close] {
+                        '{' => depth += 1,
+                        '}' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    close += 1;
+                }
+                let names_key = (open..close).any(|at| word_at(at, "key"));
+                let mut after = close + 1;
+                while after < c.len() && c[after].is_whitespace() {
+                    after += 1;
+                }
+                let next = c.get(after).copied();
+                let next2 = c.get(after + 1).copied();
+                let assigned = next == Some('=') && next2 != Some('=');
+                let arm = next == Some('=') && next2 == Some('>');
+                let param = next == Some(':') && next2 != Some(':');
+                let stmt_start = c[..i]
+                    .iter()
+                    .rposition(|&ch| matches!(ch, ';' | '{' | '}'))
+                    .map_or(0, |at| at + 1);
+                let prefix: String = c[stmt_start..i].iter().collect();
+                let let_pattern = prefix.split(|ch: char| !is_ident(ch)).any(|w| w == "let")
+                    && !prefix.contains('=');
+                if names_key && (assigned || arm || param || let_pattern) {
+                    lines.push(line_of(i));
+                }
+            }
+        }
+        i += 1;
+    }
+    lines.dedup();
+    lines
+}
+
+/// s1b — the s1 scanner finds what it must (alias bindings, multi-line chains,
+/// comparisons, destructuring in `let`, `match` arm and parameter) and nothing
+/// else (strings, comments, construction, a `.key()` method).
 #[test]
-fn s1_no_raw_shared_key_read_outside_transport_9354() {
+fn s1b_key_field_scanner_self_test_9354() {
+    let hits = |src: &str| key_field_read_lines(&blank_literals_and_comments(src), KEY_STATE_TYPE);
+    assert_eq!(
+        hits("let a = &state.auth;\ntoken.zip(a.key.as_deref());"),
+        vec![2]
+    );
+    assert_eq!(hits("let k = s\n    .key\n    .clone();"), vec![2]);
+    assert_eq!(hits("if x.key == y {}"), vec![1]);
+    assert_eq!(hits("let ApiKeyState { key, .. } = s;"), vec![1]);
+    assert_eq!(
+        hits("match s {\n ApiKeyState { key: k, .. } => k,\n}"),
+        vec![2]
+    );
+    assert_eq!(
+        hits("fn f(ApiKeyState { key, .. }: ApiKeyState) {}"),
+        vec![1]
+    );
+    assert_eq!(
+        hits("let r#\"a.key.b\"#; // z.key.c\n/* y.key.d */ \"x.key.e\";"),
+        Vec::<usize>::new()
+    );
+    assert_eq!(
+        hits("let s = ApiKeyState { key: None, ..Default::default() };"),
+        Vec::<usize>::new()
+    );
+    assert_eq!(hits("let k = t.key();"), Vec::<usize>::new());
+    assert_eq!(hits("let r = 0..key;"), Vec::<usize>::new());
+    assert_eq!(hits("let c = '\\''; let l: &'a str = s.key;"), vec![1]);
+}
+
+/// Every read of a `key` field in `src/**/*.rs`, transport.rs included, as
+/// `relative/path: trimmed original line` (comments and literals blanked
+/// before matching, the original line quoted).
+fn key_field_reads_in_src() -> Vec<String> {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let transport = root.join(TRANSPORT_SOURCE);
     let mut stack = vec![root.join(SRC_DIR)];
-    let mut hits = Vec::new();
+    let mut reads = Vec::new();
     while let Some(dir) = stack.pop() {
         for entry in std::fs::read_dir(&dir).expect("read src dir") {
             let path = entry.expect("dir entry").path();
             if path.is_dir() {
                 stack.push(path);
-            } else if path.extension().is_some_and(|e| e == "rs") && path != transport {
+            } else if path.extension().is_some_and(|e| e == "rs") {
                 let source = std::fs::read_to_string(&path).expect("read source");
-                for (i, line) in source.lines().enumerate() {
-                    if line.contains(RAW_KEY_READ) {
-                        hits.push(format!("{}:{}: {}", path.display(), i + 1, line.trim()));
-                    }
+                let rel = path
+                    .strip_prefix(root)
+                    .expect("under root")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let originals: Vec<&str> = source.lines().collect();
+                for line in
+                    key_field_read_lines(&blank_literals_and_comments(&source), KEY_STATE_TYPE)
+                {
+                    reads.push(format!("{rel}: {}", originals[line - 1].trim()));
                 }
             }
         }
     }
+    reads.sort();
+    reads
+}
+
+/// s1 — structural ratchet over the whole of `src/`: the set of reads of a
+/// field named `key` (any binding name, transport.rs included) is exactly
+/// `ALLOWED_KEY_FIELD_READS`; a new raw read of `ApiKeyState::key` fails here
+/// until it is admitted by name, so a compare can only go through
+/// `ApiKeyState::configured_key`.
+#[test]
+fn s1_no_raw_shared_key_read_outside_allowlist_9354() {
+    let found = key_field_reads_in_src();
+    let mut allowed: Vec<String> = ALLOWED_KEY_FIELD_READS
+        .iter()
+        .map(|(file, line, _why)| format!("{file}: {line}"))
+        .collect();
+    allowed.sort();
+    let unlisted: Vec<&String> = found.iter().filter(|f| !allowed.contains(f)).collect();
+    let stale: Vec<&String> = allowed.iter().filter(|a| !found.contains(a)).collect();
     assert!(
-        hits.is_empty(),
-        "raw shared-key reads:\n{}",
-        hits.join("\n")
+        unlisted.is_empty() && stale.is_empty(),
+        "key field reads not in the allowlist:\n{}\nallowlist entries with no read:\n{}",
+        unlisted
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        stale
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+    assert_eq!(found.len(), ALLOWED_KEY_FIELD_READS_COUNT);
+    assert_eq!(found, allowed, "exact multiset of key field reads");
+}
+
+/// Every unset-key request: entries x postures x headers.
+const UNSET_HEADERS: [HeaderCase; 3] = [HeaderCase::Absent, HeaderCase::Empty, HeaderCase::Space];
+/// A header no configured key could equal.
+const UNSET_GARBAGE: &[u8] = b"garbage-9354";
+const ENTRIES: [Entry; 4] = [
+    Entry::LibBuildRouter,
+    Entry::LibBuildRouterWithTimeout,
+    Entry::DaemonBuildRouter,
+    Entry::Middleware,
+];
+
+/// c7 — no key setting at all behaves exactly as before in every identity
+/// mode: for each entry the (status, body) is identical in Off, Advisory and
+/// Enforce, enrolled or not, for every header, and equals the entry's no-auth
+/// baseline (Off, no header); the bare middleware is exactly `200 "ok"`'s
+/// pass-through. Never the refusal.
+#[tokio::test]
+async fn c7_unset_key_behaves_as_before_in_every_mode_9354() {
+    let mut off_contract = Vec::new();
+    let mut carried = 0usize;
+    for entry in ENTRIES {
+        let baseline_posture = Posture {
+            mode: HttpIdentityMode::Off,
+            enrolled: false,
+        };
+        let baseline_app = router(entry, None, baseline_posture);
+        let baseline = send(&baseline_app, READ_ROUTE, None)
+            .await
+            .expect("carried");
+        assert!(
+            admitted(baseline.0, &baseline.1) && baseline.1 != refusal_body(),
+            "{entry:?}: the unset-key baseline must pass through: {} {}",
+            baseline.0,
+            baseline.1
+        );
+        if matches!(entry, Entry::Middleware) {
+            assert_eq!(
+                baseline.0,
+                StatusCode::OK,
+                "bare middleware pass-through status"
+            );
+        }
+        for posture in postures() {
+            let app = router(entry, None, posture);
+            let garbage = [UNSET_GARBAGE];
+            let headers = UNSET_HEADERS
+                .iter()
+                .map(|case| header_value(*case, ""))
+                .chain(garbage.iter().map(|g| Some(*g)));
+            for header in headers {
+                let (status, body) = send(&app, READ_ROUTE, header).await.expect("carried");
+                carried += 1;
+                if (status, &body) != (baseline.0, &baseline.1) {
+                    off_contract.push(format!(
+                        "{entry:?} {posture:?} header={}: {status} {body}",
+                        header.map_or(0, <[u8]>::len)
+                    ));
+                }
+            }
+        }
+    }
+    assert_eq!(
+        carried, UNSET_EXPECTED_REQUESTS,
+        "every unset-key request is carried"
+    );
+    assert!(
+        off_contract.is_empty(),
+        "unset key: {} of {carried} requests differ from the no-auth baseline:\n{}",
+        off_contract.len(),
+        off_contract.join("\n")
     );
 }
+/// 4 entries x 6 postures x 4 headers (absent, empty, space, garbage).
+const UNSET_EXPECTED_REQUESTS: usize = 96;
