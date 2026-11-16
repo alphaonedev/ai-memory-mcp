@@ -114,13 +114,22 @@ which runs `scripts/ci/prune_runner_tmp.py` with these rules:
   levels or with more than `MAX_TREE_ENTRIES` entries is one counted failure,
   counted before anything under it is removed (a first pass counts, the second
   removes; a tree that grows past a bound between the two passes stops there,
-  partly removed, and is one counted failure). A directory on another device,
-  or on Linux on another mount than `TMPDIR` (the `mnt_id:` line of
-  `/proc/self/fdinfo/<fd>`, so a bind mount of the same device is caught too),
-  is skipped, reported and never entered (`skipped=<n>`); a mount id that
-  cannot be read is a skip and a counted failure. On macOS there is no
-  `/proc` and the standard library has no mount id, so the device check is the
-  strongest one there.
+  partly removed, and is one counted failure). An entry on another device is
+  skipped, reported and never entered (`skipped=<n>`). A path that is a mount
+  point is neither entered nor removed, whatever its device: the mount table
+  (`/proc/self/mountinfo`, field 5, octal escapes such as `\040` decoded, so a
+  bind mount of the same device is caught too) is read once at start, before
+  and after each directory is opened, and again directly before each unlink
+  and each rmdir; the path is matched at the canonical path of `TMPDIR`, which
+  must open to the same directory. A table that cannot be read during the walk
+  leaves that entry untouched and is a counted failure; one that cannot be read
+  or parsed at start (missing, not readable, a malformed line, larger than
+  `MOUNTINFO_MAX_BYTES`) is a refusal. macOS has no reader in the script, so on
+  f1 the step refuses and never prunes blind. Still open: a process with mount
+  rights on the runner host (root, or the owner of a user namespace) can mount
+  between the last check and the unlink or rmdir; the kernel refuses to unlink
+  or rmdir a mount point itself (`EBUSY`), so that window cannot remove the
+  mount point, only race what is below it.
 - The platform check is functional: inside the proven directory the script
   makes a probe directory `.prune-probe-<pid>-<hex>` and a file in it, and
   makes one real descriptor-relative call of each needed function (`os.mkdir`,
@@ -138,7 +147,8 @@ which runs `scripts/ci/prune_runner_tmp.py` with these rules:
 
 - refusal: `python <found> is older than <wanted>`
 - refusal: `this platform lacks a working descriptor-relative call: <call> raised <error> (<why>)`
-- refusal: `the mount id of TMPDIR cannot be read: <why>`
+- refusal: `the mount table cannot be read: <why>`
+- refusal: `TMPDIR is not the directory at its canonical path: <path>`
 - refusal: `allowed root is not an absolute path: <root>`
 - refusal: `allowed root is '/'`
 - refusal: `TMPDIR is unset`
