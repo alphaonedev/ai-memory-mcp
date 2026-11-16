@@ -866,5 +866,226 @@ class SiblingLoadInvariant(unittest.TestCase):
         self.assertFalse(marker.exists(), "pg_isolated_binary ran the planted module")
 
 
+# ---------------------------------------------------------------------------------------------------------------
+# Floor order (#9365, conductor ruling 598d069e): below MIN_PYTHON the prune tool runs nothing but its own top lines
+# and the version refusal (no sibling load, no ``__import__``, no os lookup); at or above the floor the load runs
+# after the check and an os.py planted in the cwd, the script's directory or on PYTHONPATH never runs (plain, -I, -S).
+# decision: the version is forced the way the 8634 suite forces it (``sys.version_info`` replaced in a guard process,
+# test_python_floor_refusal_is_a_warning_and_exit_zero_in_the_process_guard) over a real old interpreter because no
+# Python below 3.12 is installed on the fleet nodes; the guard runs the file with ``exec`` instead of runpy so
+# runpy's own imports do not hide an os lookup of the script under -S.
+# ---------------------------------------------------------------------------------------------------------------
+
+FLOOR_GUARD = textwrap.dedent("""\
+    import builtins, sys
+    path, version = sys.argv[1], eval(sys.argv[2])
+    sys.argv[1:] = []
+    sys.version_info = version
+    seen = []
+    real_import = builtins.__import__
+    def recording_import(name, *args, **kwargs):
+        seen.append(name)
+        return real_import(name, *args, **kwargs)
+    builtins.__import__ = recording_import
+    with open(path, "rb") as handle:
+        code = compile(handle.read(), path, "exec", dont_inherit=True)
+    try:
+        exec(code, {"__name__": "__main__", "__file__": path, "__builtins__": builtins})
+    except SystemExit as exc:
+        builtins.__import__ = real_import
+        print("exit", exc.code)
+    builtins.__import__ = real_import
+    print("imports", ",".join(seen))
+    print("os loaded", "os" in sys.modules)
+    """)
+VERSION_ANNOTATION_HEAD = "::warning title=prune_runner_tmp refused::prune_runner_tmp: refused: "
+VERSION_STDERR_HEAD = "prune_runner_tmp: refused: "
+FLOOR_TEXT = " is older than 3.12"
+LONG_VERSION_DIGITS = 1200
+# The version refusal at 0f1ec1b7 (captured through the 8634 process guard, python3 -I): stdout annotation, stderr.
+VERSION_REFUSAL_AT_0F1EC1B7 = {
+    (2, 7, 18, "final", 0): (VERSION_ANNOTATION_HEAD + "python 2.7.18" + FLOOR_TEXT,
+                             VERSION_STDERR_HEAD + "python 2.7.18" + FLOOR_TEXT),
+    (3, 8, 0, "final", 0): (VERSION_ANNOTATION_HEAD + "python 3.8.0" + FLOOR_TEXT,
+                            VERSION_STDERR_HEAD + "python 3.8.0" + FLOOR_TEXT),
+    (3, 11, 9, "final", 0): (VERSION_ANNOTATION_HEAD + "python 3.11.9" + FLOOR_TEXT,
+                             VERSION_STDERR_HEAD + "python 3.11.9" + FLOOR_TEXT),
+    # hostile parts (only a forced version_info can hold them): every ':', '%', control, '\\' and U+2028 escaped
+    (3, 11, "9::x%0A\n\\ ", "final", 0): (
+        VERSION_ANNOTATION_HEAD + "python 3.11.9\\x3a\\x3ax\\x250A\\x0a\\\\\\u2028" + FLOOR_TEXT,
+        VERSION_STDERR_HEAD + "python 3.11.9::x%0A\n\\ " + FLOOR_TEXT),
+    # longer than the 1000-char line bound: cut at 997 characters plus "..."
+    (3, 11, "9" * LONG_VERSION_DIGITS, "final", 0): (
+        (VERSION_ANNOTATION_HEAD + "python 3.11." + "9" * LONG_VERSION_DIGITS)[:LINE_BOUND_CHARS - 3] + "...",
+        VERSION_STDERR_HEAD + "python 3.11." + "9" * LONG_VERSION_DIGITS + FLOOR_TEXT),
+}
+NORMAL_VERSIONS = ((2, 7, 18, "final", 0), (3, 8, 0, "final", 0), (3, 11, 9, "final", 0))
+OS_PLANT_NAME = "os.py"
+PYTHON_FLAG_SETS = (("plain", ()), ("-I", ("-I",)), ("-S", ("-S",)))
+OS_PLANT_PLACES = ("cwd", "script dir", "PYTHONPATH")
+ALL_CODEPOINTS = 0x110000
+# Present at base 32eca860: these import shared_cargo_target by name through sys.path[0], so under -I (no script
+# directory on sys.path) even the clean run fails; that load site is issue 9399's. The os.py cell still holds for them:
+# the planted run equals the clean run and the plant never runs.
+SIBLINGS_LOADING_A_SIBLING_BY_NAME = frozenset({"scripts/ci/prune_runner_artifacts.py", "scripts/ci/sccache_env.py"})
+
+
+def os_plant_source(marker):
+    """A planted ``os``: it records that it ran and stops the process; it never imports anything."""
+    return (f"with open({str(marker)!r}, 'a') as _marker_file:\n    _marker_file.write('planted os ran\\n')\n"
+            f"raise SystemExit({PLANT_EXIT_CODE})\n")
+
+
+class PruneFloorOrder(unittest.TestCase):
+    """Below the floor nothing but the top lines and the version refusal runs; the bytes are those of 0f1ec1b7."""
+
+    def fixture(self, sibling="real"):
+        base = scratch_dir("prune-floor")
+        self.addCleanup(shutil.rmtree, str(base), True)
+        return PruneFixture(base, sibling)
+
+    def run_floor(self, fix, version, flags=("-I",)):
+        proc = subprocess.run([sys.executable, *flags, "-c", FLOOR_GUARD, str(fix.script), repr(version)],
+                              capture_output=True, cwd=str(fix.cwd), timeout=SUBPROCESS_TIMEOUT_SECS, check=False,
+                              env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "LANG": "C.UTF-8",
+                                   "TMPDIR": str(fix.runner), "PYTHONDONTWRITEBYTECODE": "1"})
+        return proc.returncode, proc.stdout.decode("utf-8", "surrogateescape"), proc.stderr.decode("utf-8", "surrogateescape")
+
+    def test_old_version_never_loads_the_sibling_or_looks_up_os_9365(self):
+        """Order cell: a marker-writing sibling stays unexecuted; the only import is sys; os is never loaded (-S)."""
+        for flags in (("-I",), ("-I", "-S")):
+            with self.subTest(flags=flags):
+                fix = self.fixture(sibling="absent")
+                fix.sibling.write_text(plant_source(fix.marker, functional=True), encoding="utf-8")
+                rc, out, err = self.run_floor(fix, (3, 11, 9, "final", 0), flags)
+                annotation, stderr_line = VERSION_REFUSAL_AT_0F1EC1B7[(3, 11, 9, "final", 0)]
+                self.assertFalse(fix.marker.exists(), "the old-version path executed the sibling module")
+                self.assertEqual(err, stderr_line + "\n")
+                want = [annotation, "exit 0", "imports sys"]
+                if "-S" in flags:  # without site nothing has loaded os before the script: the script must not either
+                    want.append("os loaded False")
+                self.assertEqual(out.splitlines()[:len(want)], want, out[-2000:])
+                self.assertEqual(rc, EXIT_OK_CODE)
+                self.assertTrue(fix.canaries_present(), "the refusal pruned")
+
+    def test_load_and_every_dunder_import_follow_the_floor_check_9365(self):
+        """Static cell (ast, by line number): the load call and every ``__import__(`` sit after the floor check."""
+        source = (CI_DIR / PRUNE_SCRIPT_NAME).read_text(encoding="utf-8")
+        tree = ast.parse(source, feature_version=(3, 8))
+        floor = next(node for node in tree.body if isinstance(node, ast.If) and "python_refusal" in ast.unparse(node.test))
+        calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)]
+        loads = [node.lineno for node in calls if node.func.id == "load_shared_module"]
+        dunder = [node.lineno for node in calls if node.func.id == "__import__"]
+        self.assertEqual(len(loads), 1, loads)
+        self.assertTrue(dunder, "the os fallback is kept behind the floor (ruling 598d069e), not removed")
+        late = [line for line in loads + dunder if line <= floor.end_lineno]
+        self.assertEqual(late, [], f"floor check ends at line {floor.end_lineno}; these run before it: {late}")
+        for node in tree.body[:tree.body.index(floor)]:
+            for inner in ast.walk(node):
+                self.assertFalse(isinstance(inner, ast.Attribute) and ast.unparse(inner).startswith("wa."),
+                                 f"line {inner.lineno}: the version refusal path uses the shared module")
+
+    def test_version_refusal_bytes_match_0f1ec1b7_with_and_without_the_sibling_9365(self):
+        for sibling in ("real", "absent"):
+            for version, (annotation, stderr_line) in VERSION_REFUSAL_AT_0F1EC1B7.items():
+                with self.subTest(sibling=sibling, version=version[:2] + (str(version[2])[:20],)):
+                    fix = self.fixture(sibling=sibling)
+                    rc, out, err = self.run_floor(fix, version)
+                    self.assertEqual(rc, EXIT_OK_CODE, err[-2000:])
+                    self.assertEqual(err, stderr_line + "\n")
+                    self.assertEqual(out.splitlines()[:2], [annotation, "exit 0"], out[-2000:])
+                    self.assertLessEqual(len(out.splitlines()[0]), LINE_BOUND_CHARS)
+                    self.assertTrue(fix.canaries_present(), "the refusal pruned")
+
+    def test_8634_process_guard_form_still_prints_the_refusal_9365(self):
+        """The runpy guard of the 8634 suite (with the sibling absent): the same line, exit 0."""
+        fix = self.fixture(sibling="absent")
+        guard = ("import sys, runpy\nsys.version_info = (3, 11, 9, 'final', 0)\ntry:\n"
+                 "    runpy.run_path(sys.argv[1], run_name='__main__')\nexcept SystemExit as exc:\n    print('exit', exc.code)\n")
+        done = subprocess.run([sys.executable, "-I", "-c", guard, str(fix.script)], capture_output=True, text=True,
+                              check=False, timeout=SUBPROCESS_TIMEOUT_SECS)
+        annotation, stderr_line = VERSION_REFUSAL_AT_0F1EC1B7[(3, 11, 9, "final", 0)]
+        self.assertEqual((done.stdout, done.stderr), (annotation + "\nexit 0\n", stderr_line + "\n"))
+
+    def test_local_version_escape_equals_safe_value_for_every_code_point_9365(self):
+        """The refusal's own escaper is byte-equal to the shared ``safe_value`` over all code points, in bounded time."""
+        prune = load_module(CI_DIR / PRUNE_SCRIPT_NAME, "prune_runner_tmp_floor_9365")
+        shared = load_module(CI_DIR / SHARED_MODULE_NAME, "workflow_annotation_floor_9365")
+        corpus = "".join(chr(code) for code in range(ALL_CODEPOINTS)) + "::" * HUGE_VALUE_CHARS
+        started = time.monotonic()
+        mine = prune.version_text(corpus)
+        self.assertLess(time.monotonic() - started, HUGE_WALL_CLOCK_SECS)
+        self.assertEqual(mine, shared.safe_value(corpus))
+        for value in HOSTILE.values():
+            self.assertEqual(prune.version_text(value), shared.safe_value(value))
+        for version in VERSION_REFUSAL_AT_0F1EC1B7:
+            reason = prune.python_refusal(version)
+            via_module = shared.annotation("warning", shared.render("{prog}: refused: {reason}", prog="prune_runner_tmp",
+                                                                    reason=reason), title="prune_runner_tmp refused")
+            self.assertEqual(prune.version_refusal_annotation(reason), via_module)
+
+
+class OsPlantNeverRuns(unittest.TestCase):
+    """At or above the floor an os.py in the cwd, the script's directory or on PYTHONPATH never runs (ruling 598d069e)."""
+
+    def prune_fixture(self):
+        base = scratch_dir("prune-os-plant")
+        self.addCleanup(shutil.rmtree, str(base), True)
+        return PruneFixture(base)
+
+    @staticmethod
+    def place(fix, where):
+        return {"cwd": fix.cwd, "script dir": fix.ci, "PYTHONPATH": fix.plants}[where]
+
+    def prune_run(self, where, flags, planted):
+        fix = self.prune_fixture()
+        if planted:
+            (self.place(fix, where) / OS_PLANT_NAME).write_text(os_plant_source(fix.marker), encoding="utf-8")
+        rc, out, err = fix.run(args=(), flags=flags, pythonpath=fix.plants if where == "PYTHONPATH" else None)
+        left = sorted(path.relative_to(fix.root).as_posix() for path in fix.root.rglob("*"))
+        return fix.marker.exists(), (rc, out.replace(str(fix.base), "<base>").splitlines(), left)
+
+    def test_prune_os_plant_nine_runs_9365(self):
+        for where in OS_PLANT_PLACES:
+            for label, flags in PYTHON_FLAG_SETS:
+                with self.subTest(where=where, flags=label):
+                    _, clean = self.prune_run(where, flags, planted=False)
+                    ran, planted = self.prune_run(where, flags, planted=True)
+                    self.assertFalse(ran, f"os.py in the {where} ran ({label}): {planted}")
+                    self.assertEqual(clean[0], EXIT_OK_CODE, clean)
+                    self.assertEqual(clean[2], sorted([FIXTURE_RUNNER_NAME, "outside-canary"]), "old entries pruned")
+                    self.assertEqual(planted, clean)
+
+    def test_sibling_scripts_os_plant_table_9365(self):
+        """Table over the 13 sibling scripts of 0f1ec1b7: ``--help`` with an os.py plant equals the clean run."""
+        scripts = (*SIBLING_SCRIPTS, "scripts/test/pg_isolated_binary.py")
+        self.assertEqual(len(scripts), 13)
+        layout = SiblingLoadInvariant.layout
+        for rel in scripts:
+            for where in OS_PLANT_PLACES:
+                for label, flags in PYTHON_FLAG_SETS:
+                    with self.subTest(script=rel, where=where, flags=label):
+                        results = []
+                        for planted in (False, True):
+                            base, repo, plants, marker = layout(self, rel, with_shared=True)
+                            (plants / SHARED_MODULE_NAME).unlink()
+                            cwd = base / "cwd"
+                            cwd.mkdir()
+                            target = {"cwd": cwd, "script dir": (repo / rel).parent, "PYTHONPATH": plants}[where]
+                            if planted:
+                                (target / OS_PLANT_NAME).write_text(os_plant_source(marker), encoding="utf-8")
+                            env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "LANG": "C.UTF-8",
+                                   "PYTHONDONTWRITEBYTECODE": "1", "TMPDIR": str(cwd), "PYTHONPATH": str(plants)}
+                            proc = subprocess.run([sys.executable, *flags, str(repo / rel), "--help"],
+                                                  capture_output=True, env=env, cwd=str(cwd),
+                                                  timeout=SUBPROCESS_TIMEOUT_SECS, check=False)
+                            self.assertFalse(marker.exists(), f"os.py in the {where} ran for {rel} ({label})")
+                            results.append((proc.returncode, proc.stdout.replace(str(base).encode(), b"<base>"),
+                                            proc.stderr.replace(str(base).encode(), b"<base>")))
+                        if not (label == "-I" and rel in SIBLINGS_LOADING_A_SIBLING_BY_NAME):
+                            self.assertEqual(results[0][0], EXIT_OK_CODE, results[0])
+                        self.assertEqual(results[1], results[0])
+
+
 if __name__ == "__main__":
     unittest.main()
