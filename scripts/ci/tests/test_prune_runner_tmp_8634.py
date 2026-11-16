@@ -124,6 +124,23 @@ LEFTOVER_LINE_RE = r"^prune_runner_tmp: probe directory left in place: " + PROBE
 SKIP_MOUNT_POINT = "a mount point, not entered"
 SKIP_MOUNT_UNREADABLE = "mount id unreadable, not entered"
 SUMMARY_ENV = "GITHUB_STEP_SUMMARY"
+# Round 1 of PR 9383 (b29 8734d28b): every place the walk declines to go is a counted failure with one annotation.
+SKIP_OTHER_DEVICE = "on another device, not entered"
+MOUNT_DIFFERS_REASON = "TMPDIR is not on its runner root's mount: {path}"
+PLATFORM_UNVERIFIABLE_REASON = "this platform cannot verify mount identity: {platform}"
+COUNTED_REFUSAL_SUMMARY = "pruned=0 kept=0 failed=1 freed_bytes=0 skipped=0"
+VERIFIABLE_PLATFORMS = ("linux", "darwin")
+UNVERIFIABLE_PLATFORMS = ("freebsd14", "sunos5", "cygwin", "aix7", "win32", "linux-gnu", "darwin2")
+# errno -> strerror of a probe that cannot write (decision 3): the prune goes on after a read-only probe.
+CANNOT_WRITE_ERRNOS = {errno.ENOSPC: "No space left on device", errno.EDQUOT: "Disk quota exceeded",
+                       errno.EROFS: "Read-only file system"}
+CREATING_CALLS = ("mkdir", "file-create")
+READ_ONLY_PROBE_LINE = "prune_runner_tmp: probe cannot write ({why}); the read-only probe passed, pruning goes on"
+READ_ONLY_MISSING_WHY = "not in os.supports_dir_fd"
+DIR_MOVED_DURING_COUNT = "directory moved during count"
+ENTRY_CHANGED = "entry changed since scan"
+SUMMARY_SYMLINK_WHY = "Too many levels of symbolic links"
+CUTOFF_NOW = 2_000_000_000  # an integer clock, so an mtime exactly at the cutoff is exact
 
 PRUNE = None
 CHK = None
@@ -150,6 +167,23 @@ def setUpModule():
     CHK = _load("check_pg_preflight_workflows", CHECKER)
     if SCRIPT.exists():
         PRUNE = _load("prune_runner_tmp", SCRIPT)
+
+
+def remove_scratch(top, base):
+    """Remove a fixture tree below ``base`` without recursion (os.walk is iterative on 3.12) and without PATH."""
+    top = Path(top)
+    if not top.resolve().is_relative_to(Path(base).resolve()) or not top.exists():
+        return
+    for dirpath, dirnames, filenames in os.walk(top, topdown=False, followlinks=False):
+        for name in filenames:
+            os.unlink(os.path.join(dirpath, name))
+        for name in dirnames:
+            full = os.path.join(dirpath, name)
+            if os.path.islink(full):
+                os.unlink(full)
+            else:
+                os.rmdir(full)
+    os.rmdir(top)
 
 
 def age(path, secs):
@@ -467,12 +501,15 @@ class EntryKinds(Base):
         out, err = io.StringIO(), io.StringIO()
         tally = PRUNE.Tally(err)
         PRUNE.prune(fd, info.st_dev + 1, False, time.time(), out, tally)
-        self.assertEqual((tally.pruned, tally.failed, tally.skipped), (0, 0, len(made)))
+        self.assertEqual((tally.pruned, tally.failed, tally.skipped), (0, len(made), len(made)))
         self.assertEqual(snapshot(self.runner), before)
         lines = err.getvalue().splitlines()
-        self.assertEqual(len(lines), len(made))
-        for line in lines:
-            self.assertRegex(line, r"^prune_runner_tmp: skipped k-\w+: on another device, not entered$")
+        self.assertEqual(len(lines), 2 * len(made))
+        names = sorted(path.name for path in made.values())
+        self.assertEqual(sorted(lines), sorted(
+            [f"prune_runner_tmp: skipped {name}: {SKIP_OTHER_DEVICE}" for name in names]
+            + [f"prune_runner_tmp: failed to remove {name}: {SKIP_OTHER_DEVICE}" for name in names]))
+        self.assertEqual(tally.first_failed, names[:ANNOTATION_NAMES_SHOWN])
 
     def test_other_device_entry_nested_in_an_old_directory_is_skipped_never_entered(self):
         holder = self.runner / "holder"
@@ -492,8 +529,9 @@ class EntryKinds(Base):
             return real_list(dir_fd, *rest, **kwargs)
 
         with mock.patch.object(PRUNE, "list_level", mark_children_foreign):
-            with self.assertRaises(OSError):
+            with self.assertRaises(PRUNE.NotEntered) as caught:
                 PRUNE.remove_tree(fd, "holder", scanned, info.st_dev + 1, tally)
+        self.assertEqual((caught.exception.reason, caught.exception.nested), (SKIP_OTHER_DEVICE, True))
         self.assertEqual(tally.skipped, 2)
         self.assertTrue((holder / "mount" / "precious" / "data").exists())
         self.assertTrue(holder.exists())
@@ -814,6 +852,8 @@ class MountCrossing(Base):
 
     def stale_holder(self):
         holder = self.runner / "holder"
+        if holder.exists():
+            remove_scratch(holder, self.base)
         (holder / "inner" / "precious").mkdir(parents=True)
         (holder / "inner" / "precious" / "data").write_bytes(b"precious")
         (holder / "plain.db").write_bytes(b"p")
@@ -831,8 +871,10 @@ class MountCrossing(Base):
         with self.mount_id_override(self.ident(holder), value=-1):
             rc, out, err = self.run_prune(self.runner)
         self.assertEqual(rc, EXIT_OK)
-        self.assertEqual(err.splitlines(), [f"prune_runner_tmp: skipped holder: {SKIP_MOUNT_POINT}"])
-        self.assertIn("pruned=0 kept=0 failed=0 freed_bytes=0 skipped=1", out)
+        self.assertEqual(err.splitlines(), [f"prune_runner_tmp: skipped holder: {SKIP_MOUNT_POINT}",
+                                            f"prune_runner_tmp: failed to remove holder: {SKIP_MOUNT_POINT}"])
+        self.assertIn("pruned=0 kept=0 failed=1 freed_bytes=0 skipped=1", out)
+        self.assertEqual(self.annotations, [failed_line(1, ["holder"])])
         self.assertEqual((holder / "inner" / "precious" / "data").read_bytes(), b"precious")
         self.assertTrue((holder / "plain.db").exists(), "nothing below a mount point is deleted")
 
@@ -860,7 +902,8 @@ class MountCrossing(Base):
                     rc, out, err = self.run_prune(self.runner)
                 self.assertEqual(rc, EXIT_OK)
                 name = target.name
-                failed_text = f"{name}: {SKIP_MOUNT_UNREADABLE}"
+                # F6: a top-level entry's failure line never repeats its own name
+                failed_text = SKIP_MOUNT_UNREADABLE if where == "top" else f"{name}: {SKIP_MOUNT_UNREADABLE}"
                 self.assertEqual(
                     err.splitlines(),
                     [
@@ -872,7 +915,8 @@ class MountCrossing(Base):
                 self.assertEqual((holder / "inner" / "precious" / "data").read_bytes(), b"precious")
                 if where == "top":
                     self.assertTrue((holder / "plain.db").exists())
-                subprocess.run(["rm", "-rf", str(holder)], check=True)
+                self.assertEqual(self.annotations, [failed_line(1, ["holder"])])
+                remove_scratch(holder, self.base)
 
     def test_unreadable_root_mount_id_is_a_refusal(self):
         victim = self.make_file("old.db", OLD_AGE_SECS)
@@ -883,7 +927,8 @@ class MountCrossing(Base):
         with mock.patch.object(PRUNE, "mount_id", unreadable):
             rc, out, err = self.run_prune(self.runner)
         reason = MOUNT_UNREADABLE_REASON.format(why="fdinfo has no mnt_id line")
-        self.assertEqual((rc, out), (EXIT_REFUSED, ""))
+        self.assertEqual((rc, out), (EXIT_REFUSED, COUNTED_REFUSAL_SUMMARY + "\n"))
+        self.assertEqual(self.annotations, [ANNOTATION_PREFIX + reason])
         self.assertEqual(err.rstrip("\n"), f"prune_runner_tmp: refused: {reason}")
         self.assertTrue(victim.exists())
 
@@ -1082,7 +1127,7 @@ class Robustness(Base):
     def test_deep_tree_is_removed_without_recursion(self):
         top = self.runner / "deep"
         top.mkdir()
-        self.addCleanup(lambda: subprocess.run(["rm", "-rf", str(top)], check=False))
+        self.addCleanup(remove_scratch, top, self.base)
         fd = os.open(top, os.O_RDONLY | os.O_DIRECTORY)
         for _ in range(DEEP_LEVELS):
             os.mkdir("d", dir_fd=fd)
@@ -1100,7 +1145,7 @@ class Robustness(Base):
     def test_tree_deeper_than_the_depth_bound_is_one_counted_failure_left_in_place(self):
         top = self.runner / "deep"
         top.mkdir()
-        self.addCleanup(lambda: subprocess.run(["rm", "-rf", str(top)], check=False))
+        self.addCleanup(remove_scratch, top, self.base)
         fd = os.open(top, os.O_RDONLY | os.O_DIRECTORY)
         for _ in range(12):
             os.mkdir("d", dir_fd=fd)
@@ -1596,6 +1641,460 @@ class FailureAnnotation(Base):
         self.assertIsNone(PRUNE.failed_annotation(0, []))
 
 
+class RoundOneFixes(Base):
+    """PR 9383 round 1 (b29 8734d28b): every decision is taken on the validated object; one cell per finding."""
+
+    def mount_override(self, target, value=None, unreadable=False):
+        return MountCrossing.mount_id_override(self, target, value=value, unreadable=unreadable)
+
+    def ident(self, path):
+        info = os.lstat(path)
+        return (info.st_dev, info.st_ino)
+
+    def clear_runner(self):
+        """Each table row starts from an empty runner dir, whatever the row before it left."""
+        for child in self.runner.iterdir():
+            if child.is_dir() and not child.is_symlink():
+                remove_scratch(child, self.base)
+            else:
+                child.unlink()
+
+    # decision 1 (SEC M1): the TMPDIR fd and its runner root fd are on one mount, checked before anything is opened
+    def test_tmpdir_on_another_mount_than_its_root_is_a_counted_refusal(self):
+        if not sys.platform.startswith("linux"):
+            self.skipTest(f"mount ids come from /proc/self/fdinfo on Linux only (platform {sys.platform})")
+        cases = (
+            ("mnt_id differs", {"value": -7}, MOUNT_DIFFERS_REASON.format(path=self.runner)),
+            ("root mnt_id unreadable", {"unreadable": True},
+             MOUNT_UNREADABLE_REASON.format(why="fdinfo has no mnt_id line")),
+        )
+        for label, override, reason in cases:
+            with self.subTest(case=label):
+                self.clear_runner()
+                victim = self.make_file("old.db", OLD_AGE_SECS)
+                opened_under = []
+                real_mkdir = os.mkdir
+
+                def spy_mkdir(name, *args, **kwargs):
+                    opened_under.append(name)
+                    return real_mkdir(name, *args, **kwargs)
+
+                with self.mount_override(self.ident(self.root), **override), \
+                        mock.patch.object(PRUNE.os, "mkdir", spy_mkdir):
+                    rc, out, err = self.run_prune(self.runner)
+                self.assertEqual((rc, out), (EXIT_REFUSED, COUNTED_REFUSAL_SUMMARY + "\n"))
+                self.assertEqual(err, f"prune_runner_tmp: refused: {reason}\n")
+                self.assertEqual(self.annotations, [ANNOTATION_PREFIX + reason])
+                self.assertEqual(opened_under, [], "nothing is made or opened under TMPDIR before the mount check")
+                self.assertTrue(victim.exists())
+                victim.unlink()
+
+    def test_tmpdir_on_another_device_than_its_root_is_a_counted_refusal(self):
+        """decision 1, Darwin form: st_dev of the root fd (fstat of '..') against the TMPDIR fd."""
+        victim = self.make_file("old.db", OLD_AGE_SECS)
+        root_ident = self.ident(self.root)
+        real_fstat = os.fstat
+
+        def other_device(fd):
+            info = real_fstat(fd)
+            if (info.st_dev, info.st_ino) != root_ident:
+                return info
+            values = list(info)
+            values[stat.ST_DEV] = info.st_dev + 1
+            return os.stat_result(values)
+
+        with mock.patch.object(PRUNE.os, "fstat", other_device):
+            rc, out, err = self.run_prune(self.runner)
+        reason = MOUNT_DIFFERS_REASON.format(path=self.runner)
+        self.assertEqual((rc, out), (EXIT_REFUSED, COUNTED_REFUSAL_SUMMARY + "\n"))
+        self.assertEqual(err, f"prune_runner_tmp: refused: {reason}\n")
+        self.assertEqual(self.annotations, [ANNOTATION_PREFIX + reason])
+        self.assertTrue(victim.exists())
+
+    def test_bind_mount_over_the_runner_dir_is_refused_and_its_source_survives(self):
+        """unshare-gated (real mount, no root): a directory outside the root bind-mounted over runner-1."""
+        unshare, mount = shutil.which("unshare"), shutil.which("mount")
+        if not sys.platform.startswith("linux") or unshare is None or mount is None:
+            self.skipTest(f"bind-mount cell needs Linux unshare and mount (platform {sys.platform}, "
+                          f"unshare {unshare}, mount {mount})")
+        probe = subprocess.run([unshare, "-r", "-m", mount, "--bind", str(self.base), str(self.home)],
+                               capture_output=True, text=True, check=False, timeout=BIND_HELPER_TIMEOUT_SECS)
+        if probe.returncode != 0:
+            self.skipTest(f"unshare -r -m bind mount unavailable here: rc={probe.returncode} {probe.stderr.strip()}")
+        source = self.base / "bindsrc"
+        source.mkdir()
+        canary = self.make_file("canary", OLD_AGE_SECS, source, data=b"canary")
+        helper = self.base / "bind-helper.py"
+        helper.write_text(
+            "import importlib.util, subprocess, sys\n"
+            "mount, source, target, script, root = sys.argv[1:6]\n"
+            "subprocess.run([mount, '--bind', source, target], check=True)\n"
+            "spec = importlib.util.spec_from_file_location('p', script)\n"
+            "mod = importlib.util.module_from_spec(spec)\n"
+            "spec.loader.exec_module(mod)\n"
+            "mod.ALLOWED_ROOTS = (root,)\n"
+            "sys.exit(mod.main([]))\n"
+        )
+        env = {k: v for k, v in os.environ.items() if k not in ("TMPDIR", SUMMARY_ENV)}
+        env["TMPDIR"] = str(self.runner)
+        done = subprocess.run(
+            [unshare, "-r", "-m", sys.executable, "-I", str(helper), mount, str(source), str(self.runner),
+             str(SCRIPT), str(self.root)],
+            env=env, capture_output=True, text=True, check=False, timeout=BIND_HELPER_TIMEOUT_SECS,
+        )
+        reason = MOUNT_DIFFERS_REASON.format(path=self.runner)
+        self.assertEqual(done.returncode, EXIT_REFUSED, done.stderr)
+        self.assertEqual(done.stderr, f"prune_runner_tmp: refused: {reason}\n")
+        self.assertIn(COUNTED_REFUSAL_SUMMARY, done.stdout.splitlines())
+        self.assertIn(ANNOTATION_PREFIX + reason, done.stdout.splitlines())
+        self.assertEqual(canary.read_bytes(), b"canary", "the bind source outside the root survives")
+
+    # decision 2 (SEC L1, CODE F4): every not-entered place is a counted failure with one annotation
+    def test_every_not_entered_reason_is_a_counted_failure_with_one_annotation(self):
+        if not sys.platform.startswith("linux"):
+            self.skipTest(f"mount ids come from /proc/self/fdinfo on Linux only (platform {sys.platform})")
+        cases = (
+            ("top mount point", "", {"value": -1}, SKIP_MOUNT_POINT, "holder", SKIP_MOUNT_POINT),
+            ("top unreadable", "", {"unreadable": True}, SKIP_MOUNT_UNREADABLE, "holder", SKIP_MOUNT_UNREADABLE),
+            ("nested mount point", "inner", {"value": -1}, SKIP_MOUNT_POINT, "inner", f"inner: {SKIP_MOUNT_POINT}"),
+            ("nested unreadable", "inner", {"unreadable": True}, SKIP_MOUNT_UNREADABLE, "inner",
+             f"inner: {SKIP_MOUNT_UNREADABLE}"),
+        )
+        for label, below, override, skip_reason, skipped_name, failed_text in cases:
+            with self.subTest(case=label):
+                self.clear_runner()
+                holder = MountCrossing.stale_holder(self)
+                target = holder / below if below else holder
+                with self.mount_override(self.ident(target), **override):
+                    rc, out, err = self.run_prune(self.runner)
+                self.assertEqual(rc, EXIT_OK)
+                self.assertEqual(err.splitlines(), [f"prune_runner_tmp: skipped {skipped_name}: {skip_reason}",
+                                                    f"prune_runner_tmp: failed to remove holder: {failed_text}"])
+                self.assertRegex(out, r"^pruned=0 kept=0 failed=1 freed_bytes=\d+ skipped=1\n$")
+                self.assertEqual(self.annotations, [failed_line(1, ["holder"])])
+                self.assertEqual((holder / "inner" / "precious" / "data").read_bytes(), b"precious")
+                remove_scratch(holder, self.base)
+
+    def test_nested_other_device_entry_fails_its_top_level_entry_with_the_exact_line(self):
+        holder = self.runner / "holder"
+        (holder / "dev").mkdir(parents=True)
+        (holder / "dev" / "data").write_bytes(b"precious")
+        age(holder, OLD_AGE_SECS)
+        fd, info = self.open_runner()
+        dev_ident = self.ident(holder / "dev")
+        real_list = PRUNE.list_level
+
+        def foreign_dev(dir_fd, root_dev, *rest, **kwargs):
+            here = os.fstat(dir_fd)
+            if (here.st_dev, here.st_ino) == self.ident(holder):
+                with mock.patch.object(PRUNE.os, "scandir", foreign_scandir):
+                    return real_list(dir_fd, root_dev, *rest, **kwargs)
+            return real_list(dir_fd, root_dev, *rest, **kwargs)
+
+        real_scandir = os.scandir
+
+        class Entry:
+            def __init__(self, entry):
+                self.entry, self.name = entry, entry.name
+
+            def stat(self, follow_symlinks=False):
+                found = self.entry.stat(follow_symlinks=follow_symlinks)
+                if (found.st_dev, found.st_ino) != dev_ident:
+                    return found
+                values = list(found)
+                values[stat.ST_DEV] = found.st_dev + 1
+                return os.stat_result(values)
+
+        @contextlib.contextmanager
+        def foreign_scandir(target):
+            with real_scandir(target) as scan:
+                yield [Entry(entry) for entry in scan]
+
+        out, err = io.StringIO(), io.StringIO()
+        tally = PRUNE.Tally(err)
+        with mock.patch.object(PRUNE, "list_level", foreign_dev):
+            PRUNE.prune(fd, info.st_dev, False, time.time(), out, tally)
+        self.assertEqual(err.getvalue().splitlines(), [f"prune_runner_tmp: skipped dev: {SKIP_OTHER_DEVICE}",
+                                                       f"prune_runner_tmp: failed to remove holder: dev: {SKIP_OTHER_DEVICE}"])
+        self.assertEqual((tally.pruned, tally.failed, tally.skipped), (0, 1, 1))
+        self.assertEqual((holder / "dev" / "data").read_bytes(), b"precious")
+
+    # decision 3 (CODE F1): a probe that cannot write probes read-only and the prune goes on
+    def cannot_write(self, which, code):
+        """Make the probe's creating call ``which`` raise OSError(``code``); the replacement stays in supports_dir_fd."""
+        attr = "mkdir" if which == "mkdir" else "open"
+        real = getattr(os, attr)
+
+        def failing(name, *args, **kwargs):
+            creating = attr == "mkdir" or (len(args) > 0 and args[0] & os.O_CREAT)
+            if kwargs.get("dir_fd") is not None and creating and str(name).startswith(PRUNE.PROBE_PREFIX[:6]):
+                raise OSError(code, os.strerror(code))
+            return real(name, *args, **kwargs)
+
+        stack = contextlib.ExitStack()
+        stack.enter_context(mock.patch.object(PRUNE.os, attr, failing))
+        if real in os.supports_dir_fd:
+            stack.enter_context(mock.patch.object(os, "supports_dir_fd", os.supports_dir_fd | {failing}))
+        return stack
+
+    def test_probe_that_cannot_write_runs_read_only_and_prunes(self):
+        for which in CREATING_CALLS:
+            for code, why in CANNOT_WRITE_ERRNOS.items():
+                with self.subTest(call=which, errno=errno.errorcode[code]):
+                    self.clear_runner()
+                    victim = self.make_file("old.db", OLD_AGE_SECS)
+                    young = self.make_file("young.db", YOUNG_AGE_SECS)
+                    with self.cannot_write(which, code):
+                        rc, out, err = self.run_prune(self.runner)
+                    self.assertEqual(rc, EXIT_OK)
+                    self.assertEqual(err, READ_ONLY_PROBE_LINE.format(why=why) + "\n")
+                    self.assertRegex(out, r"^pruned=1 kept=1 failed=0 freed_bytes=\d+ skipped=0\n$")
+                    self.assertEqual(self.annotations, [])
+                    self.assertFalse(victim.exists(), "a full disk is the case the tool exists for")
+                    self.assertEqual(self.names(), ["young.db"], "no probe directory is left")
+                    young.unlink()
+
+    def test_read_only_probe_accepts_erofs_from_an_absent_name_only_when_the_cause_was_erofs(self):
+        real_unlink = os.unlink
+
+        def erofs_unlink(name, *args, **kwargs):
+            if str(name).endswith("-absent"):
+                raise OSError(errno.EROFS, os.strerror(errno.EROFS))
+            return real_unlink(name, *args, **kwargs)
+
+        for code, outcome in ((errno.EROFS, "prunes"), (errno.ENOSPC, "refuses")):
+            with self.subTest(cause=errno.errorcode[code]):
+                self.clear_runner()
+                victim = self.make_file("old.db", OLD_AGE_SECS)
+                with self.cannot_write("mkdir", code), mock.patch.object(PRUNE.os, "unlink", erofs_unlink), \
+                        mock.patch.object(os, "supports_dir_fd", os.supports_dir_fd | {erofs_unlink}):
+                    rc, out, err = self.run_prune(self.runner)
+                self.assertEqual(rc, EXIT_OK)
+                if outcome == "prunes":
+                    self.assertEqual(err, READ_ONLY_PROBE_LINE.format(why=CANNOT_WRITE_ERRNOS[code]) + "\n")
+                    self.assertFalse(victim.exists())
+                else:
+                    reason = ("this platform lacks a working descriptor-relative call: os.unlink raised OSError "
+                              f"({os.strerror(errno.EROFS)})")
+                    self.assertEqual(err, f"prune_runner_tmp: refused: {reason}\n")
+                    self.assertEqual(self.annotations, [ANNOTATION_PREFIX + reason])
+                    self.assertTrue(victim.exists())
+                    victim.unlink()
+
+    def test_read_only_probe_refuses_when_a_needed_call_lacks_dir_fd(self):
+        for missing in ("open", "stat", "unlink", "rmdir"):
+            with self.subTest(missing=missing):
+                self.clear_runner()
+                victim = self.make_file("old.db", OLD_AGE_SECS)
+                without = {fn for fn in os.supports_dir_fd if fn is not getattr(os, missing)}
+                with self.cannot_write("mkdir", errno.ENOSPC), mock.patch.object(os, "supports_dir_fd", without):
+                    rc, out, err = self.run_prune(self.runner)
+                reason = (f"this platform lacks a working descriptor-relative call: os.{missing} raised ProbeMismatch "
+                          f"(os.{missing} {READ_ONLY_MISSING_WHY})")
+                self.assertEqual((rc, out), (EXIT_REFUSED, ""))
+                self.assertEqual(err, f"prune_runner_tmp: refused: {reason}\n")
+                self.assertEqual(self.annotations, [ANNOTATION_PREFIX + reason])
+                self.assertTrue(victim.exists())
+                victim.unlink()
+
+    def test_probe_error_that_is_not_cannot_write_stays_a_refusal(self):
+        victim = self.make_file("old.db", OLD_AGE_SECS)
+        with self.cannot_write("mkdir", errno.EACCES):
+            rc, out, err = self.run_prune(self.runner)
+        reason = ("this platform lacks a working descriptor-relative call: os.mkdir raised PermissionError "
+                  f"({os.strerror(errno.EACCES)})")
+        self.assertEqual((rc, out), (EXIT_REFUSED, ""))
+        self.assertEqual(err, f"prune_runner_tmp: refused: {reason}\n")
+        self.assertTrue(victim.exists())
+
+    # decision 4 (CODE F3): only Linux and Darwin can verify mount identity; any other platform refuses loudly
+    def test_platform_other_than_linux_and_darwin_is_a_counted_refusal(self):
+        for platform in UNVERIFIABLE_PLATFORMS:
+            with self.subTest(platform=platform):
+                self.clear_runner()
+                victim = self.make_file("old.db", OLD_AGE_SECS)
+                with mock.patch.object(PRUNE.sys, "platform", platform):
+                    rc, out, err = self.run_prune(self.runner)
+                reason = PLATFORM_UNVERIFIABLE_REASON.format(platform=platform)
+                self.assertEqual((rc, out), (EXIT_REFUSED, COUNTED_REFUSAL_SUMMARY + "\n"))
+                self.assertEqual(err, f"prune_runner_tmp: refused: {reason}\n")
+                self.assertEqual(self.annotations, [ANNOTATION_PREFIX + reason])
+                self.assertTrue(victim.exists())
+                victim.unlink()
+
+    def test_mount_id_on_an_unverifiable_platform_is_unreadable_never_none(self):
+        fd, _info = self.open_runner()
+        for platform in UNVERIFIABLE_PLATFORMS:
+            with self.subTest(platform=platform), mock.patch.object(PRUNE.sys, "platform", platform):
+                with self.assertRaises(PRUNE.MountIdUnreadable):
+                    PRUNE.mount_id(fd)
+
+    def test_linux_and_darwin_are_not_refused(self):
+        for platform in VERIFIABLE_PLATFORMS:
+            if platform == "linux" and not sys.platform.startswith("linux"):
+                continue
+            with self.subTest(platform=platform):
+                self.clear_runner()
+                victim = self.make_file("old.db", OLD_AGE_SECS)
+                with mock.patch.object(PRUNE.sys, "platform", platform):
+                    rc, out, err = self.run_prune(self.runner)
+                self.assertEqual((rc, err, self.annotations), (EXIT_OK, "", []))
+                self.assertRegex(out, r"^pruned=1 kept=0 failed=0 freed_bytes=\d+ skipped=0\n$")
+                self.assertFalse(victim.exists())
+
+    # decision 5 (CODE F2): the dry run takes the real run's decision path up to the unlink
+    def test_dry_run_decides_exactly_like_the_real_run(self):
+        linux = sys.platform.startswith("linux")
+
+        def bound_case():
+            holder = self.runner / "holder"
+            holder.mkdir()
+            for index in range(3):
+                (holder / f"f{index}").write_bytes(b"x")
+            age(holder, OLD_AGE_SECS)
+            return contextlib.ExitStack(), mock.patch.object(PRUNE, "MAX_TREE_ENTRIES", 2)
+
+        def mount_case(unreadable):
+            def build():
+                holder = MountCrossing.stale_holder(self)
+                kwargs = {"unreadable": True} if unreadable else {"value": -1}
+                return contextlib.ExitStack(), self.mount_override(self.ident(holder / "inner"), **kwargs)
+            return build
+
+        def plain_case():
+            self.make_file("old.db", OLD_AGE_SECS)
+            self.make_tree("old-dir", OLD_AGE_SECS)
+            self.make_file("young.db", YOUNG_AGE_SECS)
+            return contextlib.ExitStack(), contextlib.nullcontext()
+
+        cases = [("entry bound", bound_case), ("plain", plain_case)]
+        if linux:
+            cases += [("nested mount point", mount_case(False)), ("nested mnt_id unreadable", mount_case(True))]
+        for label, build in cases:
+            with self.subTest(case=label):
+                self.clear_runner()
+                _stack, patch = build()
+                before = snapshot(self.runner)
+                top_before = set(self.names())
+                with patch:
+                    dry_rc, dry_out, dry_err = self.run_prune(self.runner, "--dry-run")
+                    self.assertEqual(snapshot(self.runner), before, "the dry run deletes nothing")
+                    real_rc, real_out, real_err = self.run_prune(self.runner)
+                facts = lambda text: re.sub(r"freed_bytes=\d+", "freed_bytes=N", text.splitlines()[-1])
+                self.assertEqual((dry_rc, dry_err, facts(dry_out)), (real_rc, real_err, facts(real_out)))
+                would = sorted(ln[len("would-remove "):] for ln in dry_out.splitlines() if ln.startswith("would-remove "))
+                self.assertEqual(would, sorted(top_before - set(self.names())),
+                                 "would-remove names exactly what the real run removes")
+
+    # decision 6 (SEC L2): the counting walk verifies the identity of the directory it returns to
+    def test_directory_moved_during_count_stops_the_entry_with_the_exact_reason(self):
+        top = self.runner / "top"
+        (top / "a" / "b").mkdir(parents=True)
+        (top / "a" / "b" / "f").write_bytes(b"x")
+        (top / "a" / "keep.db").write_bytes(b"k")
+        age(top, OLD_AGE_SECS)
+        outside = self.base / "outside"
+        outside.mkdir()
+        (outside / "keep").write_bytes(b"keep")
+        b_ident = self.ident(top / "a" / "b")
+        outside_ident = self.ident(outside)
+        real_list = PRUNE.list_level
+        state = {"moved": False, "listed": []}
+
+        def move_b(dir_fd, *rest, **kwargs):
+            info = os.fstat(dir_fd)
+            state["listed"].append((info.st_dev, info.st_ino))
+            pending = real_list(dir_fd, *rest, **kwargs)
+            if not kwargs.get("remove", True) and not state["moved"] and (info.st_dev, info.st_ino) == b_ident:
+                state["moved"] = True
+                os.rename(top / "a" / "b", outside / "b")
+            return pending
+
+        with mock.patch.object(PRUNE, "list_level", move_b):
+            rc, out, err = self.run_prune(self.runner)
+        self.assertTrue(state["moved"])
+        self.assertEqual(rc, EXIT_OK)
+        self.assertEqual(err.splitlines(), [f"prune_runner_tmp: failed to remove top: {DIR_MOVED_DURING_COUNT}"])
+        self.assertRegex(out, r"^pruned=0 kept=0 failed=1 freed_bytes=0 skipped=0\n$")
+        self.assertNotIn(outside_ident, state["listed"])
+        self.assertEqual((outside / "keep").read_bytes(), b"keep")
+        self.assertEqual((outside / "b" / "f").read_bytes(), b"x")
+        self.assertEqual((top / "a" / "keep.db").read_bytes(), b"k", "nothing is removed after a move in the count")
+
+    # decision 7 (CODE F5): one cell per surviving mutant
+    def test_inner_directory_swapped_between_listing_and_open_is_refused(self):
+        """F5 :567: the open_checked re-check, not the top-level one, catches an inner swap in the removal pass."""
+        top = self.runner / "top"
+        (top / "sub").mkdir(parents=True)
+        (top / "sub" / "f.db").write_bytes(b"f")
+        age(top, OLD_AGE_SECS)
+        elsewhere = self.base / "elsewhere"
+        top_ident = self.ident(top)
+        real_list = PRUNE.list_level
+        state = {"swapped": False}
+
+        def swap_sub(dir_fd, *rest, **kwargs):
+            pending = real_list(dir_fd, *rest, **kwargs)
+            info = os.fstat(dir_fd)
+            if kwargs.get("remove") and not state["swapped"] and (info.st_dev, info.st_ino) == top_ident:
+                state["swapped"] = True
+                os.rename(top / "sub", elsewhere)
+                (top / "sub").mkdir()
+                (top / "sub" / "impostor-live").write_bytes(b"live")
+            return pending
+
+        with mock.patch.object(PRUNE, "list_level", swap_sub):
+            rc, out, err = self.run_prune(self.runner)
+        self.assertTrue(state["swapped"])
+        self.assertEqual(rc, EXIT_OK)
+        self.assertEqual(err.splitlines(), [f"prune_runner_tmp: failed to remove top: {ENTRY_CHANGED}"])
+        self.assertRegex(out, r"^pruned=0 kept=0 failed=1 freed_bytes=\d+ skipped=0\n$")
+        self.assertEqual((top / "sub" / "impostor-live").read_bytes(), b"live")
+
+    def test_job_summary_that_is_a_symlink_is_not_written_through(self):
+        """F5 :115: O_NOFOLLOW on GITHUB_STEP_SUMMARY; the link target keeps its bytes."""
+        target = self.base / "summary-target"
+        target.write_bytes(b"original")
+        link = self.base / "summary-link"
+        link.symlink_to(target)
+        rc, out, err = self.run_prune(self.runner, env_extra={SUMMARY_ENV: str(link)})
+        self.assertEqual(rc, EXIT_OK)
+        self.assertEqual(err, SUMMARY_UNWRITABLE_LINE.format(why=SUMMARY_SYMLINK_WHY) + "\n")
+        self.assertEqual(target.read_bytes(), b"original")
+
+    def test_tree_one_level_over_the_depth_bound_loses_nothing(self):
+        """F5 :632: the count pass stops at MAX+1 before the removal pass unlinks the files on its way down."""
+        bound = 3
+        top = self.runner / "over"
+        level = top
+        for depth in range(bound + 2):
+            level.mkdir()
+            (level / f"f{depth}.db").write_bytes(b"x")
+            level = level / "d"
+        age(top, OLD_AGE_SECS)
+        before = snapshot(top)
+        with mock.patch.object(PRUNE, "MAX_TREE_DEPTH", bound):
+            rc, out, err = self.run_prune(self.runner)
+        self.assertEqual(rc, EXIT_OK)
+        self.assertEqual(err.splitlines(), [f"prune_runner_tmp: failed to remove over: deeper than {bound} levels"])
+        self.assertRegex(out, r"^pruned=0 kept=0 failed=1 freed_bytes=0 skipped=0\n$")
+        self.assertEqual(snapshot(top), before, "no file on the way down is removed")
+
+    def test_entry_exactly_at_the_cutoff_is_kept(self):
+        """F5 :724: mtime == now - MAX_AGE_SECS is kept; one second older goes."""
+        cutoff = CUTOFF_NOW - PRUNE.MAX_AGE_SECS
+        at = self.runner / "at-cutoff.db"
+        older = self.runner / "older.db"
+        for path, mtime in ((at, cutoff), (older, cutoff - 1)):
+            path.write_bytes(b"x")
+            os.utime(path, (mtime, mtime))
+        with mock.patch.object(PRUNE.time, "time", return_value=float(CUTOFF_NOW)):
+            rc, out, err = self.run_prune(self.runner)
+        self.assertEqual((rc, err), (EXIT_OK, ""))
+        self.assertRegex(out, r"^pruned=1 kept=1 failed=0 freed_bytes=\d+ skipped=0\n$")
+        self.assertEqual(self.names(), ["at-cutoff.db"])
+
+
 class RootsAndFloor(unittest.TestCase):
     """The roots are named constants with evidence, the floor check runs before newer code, docs match the code."""
 
@@ -1650,7 +2149,11 @@ class RootsAndFloor(unittest.TestCase):
         indirect = {"python"}
         self.assertEqual(used | indirect, set(PRUNE.REFUSAL_REASONS))
         self.assertNotIn("Refusal(f", self.source)
-        self.assertNotIn("supports_dir_fd", self.source, "D-H1: the platform check is functional, never a table")
+        tree = ast.parse(self.source)
+        users = {node.name for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
+                 and "supports_dir_fd" in ast.unparse(node)}
+        self.assertEqual(users, {"probe_read_only"},
+                         "D-H1: the platform check is functional; the table is only the cannot-write fallback (decision 3)")
 
     def test_bounds_text_says_counted_before_anything_is_removed_everywhere(self):
         """D-L3: the docstring, the exception, the docs and the action all state the count-first bound."""
