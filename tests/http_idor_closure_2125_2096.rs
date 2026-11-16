@@ -55,16 +55,16 @@ fn build_router(mode: HttpIdentityMode) -> (axum::Router, NamedTempFile) {
     build_router_with(mode, enrolled)
 }
 
-/// Build a router in `mode` with NO per-agent keys enrolled. The identity
-/// gate is fully inert in this posture (the zero-config single-operator
-/// deployment) regardless of `mode` — this is the path the third pass must
-/// preserve for the newly-gated #2135/#2137/#2138/#2140 routes.
+/// Build a router in `mode` with NO per-agent keys enrolled. Under Enforce
+/// the #9341 funnel still refuses a named unproven caller here (3-agent vote
+/// (71472661) B-1); the per-handler gates and the #2140 body binding stay
+/// dormant in this posture.
 fn build_router_zero_enroll(mode: HttpIdentityMode) -> (axum::Router, NamedTempFile) {
     build_router_with(mode, HashMap::new())
 }
 
 /// Shared router builder — `enrolled` is the `sha256(token) → agent_id` map
-/// (empty for the zero-enrollment inert path).
+/// (empty for the zero-enrollment posture).
 fn build_router_with(
     mode: HttpIdentityMode,
     enrolled: HashMap<String, String>,
@@ -336,15 +336,58 @@ async fn advisory_shared_key_victim_spoof_is_not_403_on_every_route() {
     }
 }
 
-/// Under `enforce`, with NO per-agent keys enrolled, the identity gate is
-/// fully INERT on every route — a shared-key caller forging
-/// `X-Agent-Id: <victim>` never trips `attested_identity_required`. This is
-/// the zero-config single-operator posture the third pass MUST preserve for
-/// the newly-gated #2135/#2137/#2138/#2140 routes (the fix stays dormant
-/// until an operator enrolls at least one per-agent key).
+/// The funnel's refusal code (`authority::refuse_unproven_named_principal`).
+const ATTESTED_IDENTITY_REQUIRED: &str = "attested_identity_required";
+
+/// #9341 B-1 (3-agent vote (71472661)): the exact status the ANONYMOUS
+/// shared-key caller (no `X-Agent-Id`; the server-minted principal that owns
+/// nothing) gets on each row of [`routes`] under Enforce with zero per-agent
+/// keys enrolled. Same order as [`routes`]; never the identity 403.
+const ZERO_ENROLL_ANONYMOUS_STATUS: &[(&str, &str, u16)] = &[
+    ("POST", "/api/v1/links", 404),
+    ("DELETE", "/api/v1/links", 404),
+    ("POST", "/api/v1/kg/invalidate", 404),
+    ("POST", "/api/v1/archive", 200),
+    ("POST", "/api/v1/archive/mem-victim-0001/restore", 404),
+    ("GET", "/api/v1/links/mem-victim-0001", 200),
+    ("GET", "/api/v1/memories/mem-victim-0001/lineage", 404),
+    ("GET", "/api/v1/entities/by_alias?alias=secret", 200),
+    ("GET", "/api/v1/contradictions?namespace=victimns", 200),
+    ("POST", "/api/v1/check_duplicate", 503),
+    ("GET", "/api/v1/pending", 200),
+    ("POST", "/api/v1/consolidate", 404),
+    ("GET", "/api/v1/inbox", 200),
+    ("GET", "/api/v1/kg/timeline?source_id=mem-victim-0001", 404),
+    ("DELETE", "/api/v1/subscriptions?id=sub-1", 200),
+    ("GET", "/api/v1/subscriptions", 200),
+    ("POST", "/api/v1/namespaces/victimns/standard", 201),
+    ("POST", "/api/v1/memory_replay", 400),
+    ("POST", "/api/v1/memory_subscription_replay", 400),
+    ("POST", "/api/v1/memory_subscription_dlq_list", 200),
+    ("DELETE", "/api/v1/namespaces/victimns/standard", 200),
+    ("DELETE", "/api/v1/namespaces?namespace=victimns", 200),
+    ("DELETE", "/api/v1/archive?older_than_days=3650", 200),
+    ("POST", "/api/v1/kg/query", 200),
+    ("POST", "/api/v1/kg/find_paths", 200),
+    ("POST", "/api/v1/namespaces", 201),
+    ("POST", "/api/v1/session/start", 200),
+    ("POST", "/api/v1/memory_load_family", 200),
+    ("POST", "/api/v1/memory_smart_load", 400),
+    ("POST", "/api/v1/quota/status", 403),
+    ("POST", "/api/v1/memory_reflect", 400),
+];
+
+/// #9341 B-1 (3-agent vote (71472661)), state "no keys enrolled, shared key
+/// configured": under Enforce a shared-key caller NAMING a principal it cannot
+/// prove (`X-Agent-Id: <victim>`) is refused `403 attested_identity_required`
+/// on EVERY route, and the anonymous shared-key caller (no `X-Agent-Id`, the
+/// server-minted principal, vote Q1-sub A1) passes the funnel and gets the
+/// route's own answer, pinned per row. Before the vote this table proved the
+/// opposite (zero enrollment made the gate inert).
 #[tokio::test]
-async fn zero_enrollment_identity_gate_is_inert_on_every_route() {
+async fn zero_enrollment_enforce_refuses_named_and_serves_anonymous_on_every_route_9341() {
     let _dir = fresh_dir();
+    let mut anonymous_seen: Vec<(&str, &str, u16)> = Vec::new();
     for (method, uri, body) in routes() {
         let (router, _f) = build_router_zero_enroll(HttpIdentityMode::Enforce);
         let resp = router
@@ -353,12 +396,35 @@ async fn zero_enrollment_identity_gate_is_inert_on_every_route() {
             .unwrap();
         let status = resp.status();
         let text = body_text(resp).await;
-        assert!(
-            !(status == StatusCode::FORBIDDEN && text.contains("attested_identity_required")),
-            "third pass: {method} {uri} must NOT identity-403 with zero per-agent \
-             keys enrolled, even under enforce (got {status}, body={text})"
+        let code = serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_string));
+        assert_eq!(
+            (status, code.as_deref()),
+            (StatusCode::FORBIDDEN, Some(ATTESTED_IDENTITY_REQUIRED)),
+            "#9341 B-1: {method} {uri} must refuse the named unproven caller \
+             X-Agent-Id:{VICTIM} under enforce with zero keys enrolled (body={text})"
         );
+
+        let (router, _f) = build_router_zero_enroll(HttpIdentityMode::Enforce);
+        let resp = router
+            .oneshot(req(method, uri, SHARED_KEY, None, body.as_ref()))
+            .await
+            .unwrap();
+        let status = resp.status();
+        let text = body_text(resp).await;
+        assert!(
+            !text.contains(ATTESTED_IDENTITY_REQUIRED),
+            "#9341 A1: {method} {uri} must not identity-refuse the anonymous \
+             shared-key caller (got {status}, body={text})"
+        );
+        anonymous_seen.push((method, uri, status.as_u16()));
     }
+    assert_eq!(
+        anonymous_seen.as_slice(),
+        ZERO_ENROLL_ANONYMOUS_STATUS,
+        "#9341 A1: the anonymous caller's per-route answers"
+    );
 }
 
 // ── #2140 memory_reflect — the forged-BODY vector ────────────────────────
@@ -399,13 +465,15 @@ async fn reflect_forged_body_agent_id_is_refused_under_enforce() {
     let text = body_text(resp).await;
     assert_eq!(
         status,
-        StatusCode::BAD_REQUEST,
-        "#2140: a reflect with a forged body agent_id and no matching header \
-         must be refused (got {status}, body={text})"
+        StatusCode::FORBIDDEN,
+        "#2140 / PR 9390 H1: a reflect with a forged body agent_id and no \
+         matching header is refused by the Enforce funnel (got {status}, body={text})"
     );
-    assert!(
-        text.contains("agent_id_body_header_mismatch"),
-        "#2140: the refusal must be the header-authoritative identity binding, \
+    let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+    assert_eq!(
+        v.get("error").and_then(serde_json::Value::as_str),
+        Some(ATTESTED_IDENTITY_REQUIRED),
+        "#2140 / PR 9390 H1: the refusal must be the funnel's identity refusal, \
          not an incidental substrate error (body={text})"
     );
 }
@@ -492,24 +560,71 @@ fn seed_observation(db_path: &std::path::Path, namespace: &str, title: &str) -> 
     ai_memory::db::insert(&conn, &mem).expect("insert observation")
 }
 
-/// #2156 (Fable round-3 BLOCKING regression on cfc157d7): with ZERO per-agent
-/// keys enrolled the #2140 body-`agent_id` binding must be INERT — a reflect
-/// supplying `agent_id` only in the BODY with NO `X-Agent-Id` header (the
-/// shipped, header-optional #1317 wire contract and the PR's own
-/// "inert out of the box" guarantee) PASSES THROUGH to the substrate and
-/// succeeds, byte-identical to pre-#2140. The binding gates on the SAME
-/// enrollment condition (`enrolled_agent_keys.is_empty()`) that keeps
-/// `enforce_idor_identity` dormant, so there is no second, divergent notion
-/// of "enrolled". The predecessor test
-/// (`reflect_zero_enrollment_gate_inert_body_binding_still_refuses`) encoded
-/// the breaking behavior — asserting refusal under zero enrollment — and was
-/// inverted here; the enforce+enrolled #2140 closure is pinned by
-/// `reflect_forged_body_agent_id_is_refused_under_enforce` above.
+/// #2156 (Fable round-3 BLOCKING regression on cfc157d7) under ADVISORY:
+/// with ZERO per-agent keys enrolled the #2140 body-`agent_id` binding stays
+/// INERT. A reflect supplying `agent_id` only in the BODY with NO
+/// `X-Agent-Id` header (the shipped, header-optional #1317 wire contract)
+/// PASSES THROUGH to the substrate and succeeds. Before #9341 this cell ran
+/// under Enforce; the 3-agent vote (71472661) B-1 makes Enforce refuse the
+/// body claim too (`reflect_zero_enrollment_enforce_refuses_body_named_author_9341`),
+/// so the #1317 pass-through is pinned on the posture that still serves it.
 #[tokio::test]
-async fn reflect_zero_enrollment_body_binding_is_inert_and_preserves_1317() {
+async fn reflect_zero_enrollment_advisory_body_binding_is_inert_and_preserves_1317() {
+    let (status, text) = zero_enroll_body_only_reflect(HttpIdentityMode::Advisory).await;
+    assert!(
+        !text.contains("agent_id_body_header_mismatch"),
+        "#2156: the body binding must be INERT under advisory with zero \
+         per-agent keys enrolled (body={text})"
+    );
+    assert!(
+        !text.contains(ATTESTED_IDENTITY_REQUIRED),
+        "#2140: advisory never identity-refuses (body={text})"
+    );
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "#2156/#1317: a header-less body-agent_id reflect must pass through \
+         and succeed under advisory with zero enrollment (got {status}, body={text})"
+    );
+    let resp_json: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+    assert!(
+        resp_json
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .is_some(),
+        "#1317: the pass-through reflect must return the canonical {{id}} \
+         envelope (body={text})"
+    );
+}
+
+/// #9341 B-1 (3-agent vote (71472661)): under Enforce with zero keys enrolled
+/// the anonymous shared-key caller may not author a reflection as a named
+/// agent through the BODY `agent_id` (the header funnel's anonymous carve-out
+/// admits it, so the body binding must refuse). Same refusal as the enrolled
+/// posture (`reflect_forged_body_agent_id_is_refused_under_enforce`).
+#[tokio::test]
+async fn reflect_zero_enrollment_enforce_refuses_body_named_author_9341() {
+    let (status, text) = zero_enroll_body_only_reflect(HttpIdentityMode::Enforce).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "#9341 B-1 / PR 9390 H1: a body-only agent_id:{VICTIM} reflect from the \
+         anonymous caller must be refused under enforce with zero keys (body={text})"
+    );
+    let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+    assert_eq!(
+        v.get("error").and_then(serde_json::Value::as_str),
+        Some(ATTESTED_IDENTITY_REQUIRED),
+        "#9341 B-1 / PR 9390 H1: the refusal is the Enforce funnel's (body={text})"
+    );
+}
+
+/// Drive one header-less, body-`agent_id:<victim>` reflect against a
+/// zero-enrollment router in `mode`; returns the status and body text.
+async fn zero_enroll_body_only_reflect(mode: HttpIdentityMode) -> (StatusCode, String) {
     use serde_json::json;
     let _dir = fresh_dir();
-    let (router, f) = build_router_zero_enroll(HttpIdentityMode::Enforce);
+    let (router, f) = build_router_zero_enroll(mode);
     let src_id = seed_observation(f.path(), "ns-2156-inert", "src-observation-2156");
     let body = json!({
         "source_ids": [src_id],
@@ -529,31 +644,5 @@ async fn reflect_zero_enrollment_body_binding_is_inert_and_preserves_1317() {
         .await
         .unwrap();
     let status = resp.status();
-    let text = body_text(resp).await;
-    assert!(
-        !text.contains("agent_id_body_header_mismatch"),
-        "#2156: the body binding must be INERT with zero per-agent keys \
-         enrolled — the #1317 body-only agent_id path must not be refused \
-         as a header mismatch (body={text})"
-    );
-    assert!(
-        !text.contains("attested_identity_required"),
-        "#2140: the per-agent identity gate must stay inert with zero \
-         enrollment (body={text})"
-    );
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "#2156/#1317: a header-less body-agent_id reflect must pass through \
-         and succeed under zero enrollment (got {status}, body={text})"
-    );
-    let resp_json: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
-    assert!(
-        resp_json
-            .get("id")
-            .and_then(serde_json::Value::as_str)
-            .is_some(),
-        "#1317: the pass-through reflect must return the canonical {{id}} \
-         envelope (body={text})"
-    );
+    (status, body_text(resp).await)
 }

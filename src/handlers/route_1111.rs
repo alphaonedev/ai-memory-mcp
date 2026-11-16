@@ -446,6 +446,7 @@ async fn smart_load_http_via_store(
 pub async fn handle_reflect_http(
     State(app): State<AppState>,
     headers: HeaderMap,
+    authority: Option<axum::Extension<crate::identity::authority::Authority>>,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
     // #2140 (v1.0.0, #2032-A / H1 IDOR) — per-agent-key identity gate. Under
@@ -479,17 +480,40 @@ pub async fn handle_reflect_http(
     // deployment) and the PR's inert-out-of-the-box guarantee. Under an
     // enrolled posture the binding stays ACTIVE and still refuses the #2140
     // no-header + body-`agent_id:<victim>` forge vector.
+    //
+    // #9341 B-1 (3-agent vote (71472661)), moved onto the shared helper by
+    // PR 9390 H1: under Enforce (any key count) a body name is the same claim
+    // as a header name. It must name the PROVEN principal, else the funnel's
+    // 403; the reflection is then authored as `authority.principal()`.
     let mut body = body;
-    if !app.enrolled_agent_keys.is_empty() {
-        let body_agent = body.get("agent_id").and_then(Value::as_str);
-        let caller =
+    let bound = match crate::handlers::authority::bind_request_named_principal(
+        app.http_identity_mode,
+        authority.as_ref().map(|e| &e.0),
+        headers
+            .get(crate::HEADER_API_KEY)
+            .and_then(|v| v.to_str().ok()),
+        body.get("agent_id").and_then(Value::as_str),
+        crate::handlers::routes::MEMORY_REFLECT,
+    ) {
+        crate::handlers::authority::RequestPrincipal::Funnel(p) => Some(p),
+        crate::handlers::authority::RequestPrincipal::Refused(resp) => return resp,
+        // #2156 — Off / Advisory with keys enrolled keep the header-
+        // authoritative resolver binding; zero keys keep the body as is.
+        crate::handlers::authority::RequestPrincipal::Unchanged
+            if !app.enrolled_agent_keys.is_empty() =>
+        {
+            let body_agent = body.get("agent_id").and_then(Value::as_str);
             match crate::handlers::parity::resolve_caller_agent_id(body_agent, &headers, None) {
-                Ok(id) => id,
+                Ok(id) => Some(id),
                 Err(e) => return err_response(e),
-            };
-        if let Some(obj) = body.as_object_mut() {
-            obj.insert("agent_id".to_string(), Value::String(caller));
+            }
         }
+        crate::handlers::authority::RequestPrincipal::Unchanged => None,
+    };
+    if let Some(caller) = bound
+        && let Some(obj) = body.as_object_mut()
+    {
+        obj.insert("agent_id".to_string(), Value::String(caller));
     }
     // #3423 — resolve the AUTHENTICATED caller ONCE, here, for BOTH backends.
     //
@@ -766,13 +790,24 @@ pub async fn handle_reflect_http(
 
 /// `POST /api/v1/memory_recall_observations` — Provenance Gap 3
 /// recall-consumption observation read. Read-only over the
-/// `recall_observations` table; no caller-ownership gate (already
-/// scoped per-row by `agent_id`).
+/// `recall_observations` table. #9366: a row is returned only to the
+/// principal whose `agent_id` it carries, or to an enrolled admin; the
+/// scope is the request authority's (an anonymous principal owns no row).
 pub async fn handle_recall_observations_http(
     State(app): State<AppState>,
+    authority: Option<axum::Extension<crate::identity::authority::Authority>>,
     _headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
+    // Fail closed without the authority layer (a scaffold router): a fresh
+    // anonymous principal, which owns no row, never the whole ledger.
+    let anonymous;
+    let scope = if let Some(axum::Extension(a)) = &authority {
+        crate::observations::ObservationScope::for_authority(a)
+    } else {
+        anonymous = crate::identity::anonymous_request_id();
+        crate::observations::ObservationScope::Agent(&anonymous)
+    };
     // Postgres SAL path (#1549): read the recall-consumption ledger
     // through `MemoryStore::list_recall_observations`. Mirrors the
     // sqlite MCP path's filter parsing + `{observations, count}` shape.
@@ -803,7 +838,7 @@ pub async fn handle_recall_observations_http(
             });
         return match app
             .store
-            .list_recall_observations(recall_id, consumed, since, until, limit)
+            .list_recall_observations(scope, recall_id, consumed, since, until, limit)
             .await
         {
             Ok(rows) => {
@@ -823,7 +858,7 @@ pub async fn handle_recall_observations_http(
         };
     }
     let lock = app.db.lock().await;
-    let result = crate::mcp::handle_recall_observations(&lock.0, &body);
+    let result = crate::mcp::handle_recall_observations(&lock.0, &body, scope);
     drop(lock);
     match result {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),

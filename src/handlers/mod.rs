@@ -105,6 +105,7 @@ pub mod a2a;
 pub mod accept_provenance;
 pub mod admin;
 pub mod admin_role;
+pub mod advisory_identity_report;
 pub mod agent_api_key;
 pub mod approvals;
 pub mod archive;

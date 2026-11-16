@@ -197,8 +197,11 @@ pub struct HttpAuthorityInputs<'a> {
     pub key_bound_principal: Option<&'a str>,
     /// The #2044 tri-state identity posture.
     pub identity_mode: HttpIdentityMode,
-    /// `true` when at least one per-agent key is enrolled. The #2044 gate is
-    /// INERT in every mode while this is `false` (the #1985 trap).
+    /// `true` when at least one per-agent key is enrolled. The #2044 admin
+    /// gate is INERT in every mode while this is `false` (the #1985 trap);
+    /// the layer funnel
+    /// `crate::handlers::authority::refuse_unproven_named_principal` still refuses an
+    /// unproven named caller under `enforce` before it is consulted (#9341).
     pub enrolled_keys_present: bool,
     /// The operator's admin allowlist (`[admin] agent_ids` /
     /// `AI_MEMORY_ADMIN_AGENT_IDS`).

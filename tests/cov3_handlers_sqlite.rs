@@ -537,7 +537,7 @@ async fn link_delete_unknown_field_is_400() {
 }
 
 #[tokio::test]
-async fn link_delete_nonexistent_source_returns_deleted_false() {
+async fn link_delete_nonexistent_source_returns_404_not_found_8994() {
     let (r, _t) = sqlite_router();
     let (status, body) = delete_json(
         &r,
@@ -545,8 +545,10 @@ async fn link_delete_nonexistent_source_returns_deleted_false() {
         json!({"source_id": "ghostsrc", "target_id": "ghosttgt", "relation": "related_to"}),
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["deleted"], false);
+    // #8994 / #9043 — neither endpoint exists: the link's not-found shape,
+    // nothing written (pre-fix: 200 {"deleted": false}).
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body, json!({"error": "not found"}));
 }
 
 #[tokio::test]

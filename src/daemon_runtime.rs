@@ -7528,9 +7528,10 @@ pub async fn bootstrap_serve(
 
     // #3155 — an operator who deliberately set
     // `AI_MEMORY_HTTP_REQUIRE_ATTESTED_IDENTITY=enforce` with ZERO enrolled
-    // per-agent keys gets a control that is fully inert (the #1985
-    // unsatisfiable-default trap makes inert-when-empty correct), and used to
-    // get no signal at all that it was disarmed. Boot now says so — WARN under
+    // per-agent keys used to get no signal at all about that posture. Since
+    // #9341 B-1 the funnel refuses every unproven named caller in it, so only
+    // the anonymous principal and certificate-mapped callers are served. Boot
+    // says so — WARN under
     // the default posture (never a silently-tightened default), REFUSE under
     // `asi-hard`, which does not permit a security control to be disabled.
     // Same shape as the #1570 admin-gate boot WARN below and the #3065 gate

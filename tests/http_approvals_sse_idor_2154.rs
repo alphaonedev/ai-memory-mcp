@@ -216,30 +216,67 @@ async fn approvals_sse_per_agent_key_principal_opens_stream() {
 }
 
 // ---------------------------------------------------------------------------
-// (3) Zero-enrollment — gate fully inert; stream opens (no regression).
+// (3) Zero-enrollment under Enforce: #9341 B-1 (3-agent vote (71472661)).
+// The funnel refuses a NAMED unproven caller even with no per-agent key
+// enrolled; the anonymous shared-key caller (server-minted principal that
+// owns nothing) still opens the stream.
 // ---------------------------------------------------------------------------
 
+/// Self-asserted operator id the pre-vote test opened the stream with.
+const ZERO_ENROLL_NAMED_CALLER: &str = "ai:operator@host";
+/// The funnel's refusal code (`authority::refuse_unproven_named_principal`).
+const ATTESTED_IDENTITY_REQUIRED: &str = "attested_identity_required";
+
 #[tokio::test]
-async fn approvals_sse_zero_enrollment_gate_inert_opens_under_enforce() {
+async fn approvals_sse_zero_enrollment_enforce_refuses_named_and_opens_anonymous_9341() {
     let _dir = fresh_dir();
-    // enforce mode but NO per-agent keys enrolled → the whole #2044 gate is
-    // inert (empty enrolled map short-circuits to None). A legitimate
-    // single-operator subscriber presenting the shared key + its own
-    // self-asserted X-Agent-Id opens the stream exactly as before the fix.
     let (router, _app, _f) = build_router(HttpIdentityMode::Enforce, false);
-    let req = Request::builder()
+    let named = Request::builder()
         .method("GET")
         .uri(APPROVALS_STREAM)
         .header("x-api-key", SHARED_KEY)
-        .header("x-agent-id", "ai:operator@host")
+        .header("x-agent-id", ZERO_ENROLL_NAMED_CALLER)
         .body(Body::empty())
         .unwrap();
-    let resp = router.oneshot(req).await.unwrap();
+    let resp = router.clone().oneshot(named).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "#9341 B-1: a named unproven caller is refused under enforce with zero \
+         per-agent keys enrolled"
+    );
+    let ct = resp
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    assert!(
+        !ct.contains("text/event-stream"),
+        "#9341 B-1: a refused open must NOT establish an event-stream (got {ct:?})"
+    );
+    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .expect("collect body");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("json refusal body");
+    assert_eq!(
+        json.get("error").and_then(serde_json::Value::as_str),
+        Some(ATTESTED_IDENTITY_REQUIRED),
+        "#9341 B-1: the refusal is the funnel's error code"
+    );
+
+    let anonymous = Request::builder()
+        .method("GET")
+        .uri(APPROVALS_STREAM)
+        .header("x-api-key", SHARED_KEY)
+        .body(Body::empty())
+        .unwrap();
+    let resp = router.oneshot(anonymous).await.unwrap();
     assert_eq!(
         resp.status(),
         StatusCode::OK,
-        "#2154: with zero per-agent keys enrolled the gate is inert even under \
-         enforce — the SSE stream must open (no regression)"
+        "#9341 A1: the anonymous shared-key caller passes the funnel and opens \
+         the stream"
     );
     let ct = resp
         .headers()
@@ -248,6 +285,6 @@ async fn approvals_sse_zero_enrollment_gate_inert_opens_under_enforce() {
         .unwrap_or("");
     assert!(
         ct.contains("text/event-stream"),
-        "#2154: zero-enrollment open must establish the SSE handshake (got {ct:?})"
+        "#9341 A1: the anonymous open must establish the SSE handshake (got {ct:?})"
     );
 }

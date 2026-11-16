@@ -95,8 +95,14 @@ pub fn cmd_recall_observations(
         params["limit"] = json!(l);
     }
 
-    let envelope = crate::mcp::handle_recall_observations(&conn, &params)
-        .map_err(|e| anyhow::anyhow!("recall-observations: {e}"))?;
+    // #9366 — the CLI opens the database file itself (local operator): the
+    // whole ledger, the same trust-all scope as MCP stdio with no identity.
+    let envelope = crate::mcp::handle_recall_observations(
+        &conn,
+        &params,
+        crate::observations::ObservationScope::All,
+    )
+    .map_err(|e| anyhow::anyhow!("recall-observations: {e}"))?;
 
     if args.json {
         writeln!(out.stdout, "{}", serde_json::to_string(&envelope)?)?;

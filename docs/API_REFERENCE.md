@@ -116,6 +116,42 @@ was the #874-class spoof vector):
    (`agent_id_certificate_unmapped`) under `enforce`. A body or query
    `agent_id` that differs from the certificate-bound header is then
    rejected by rule 2.
+5. **Enforce funnel (v1.0.0, #9341).** Under
+   `AI_MEMORY_HTTP_REQUIRE_ATTESTED_IDENTITY=enforce` with at least one
+   per-agent key enrolled, a request that names a principal in
+   `X-Agent-Id` without proving it is refused **403**
+   `{"error":"attested_identity_required"}` at the authority layer, before
+   any handler, on every route except the probes (`/health`, `/metrics`,
+   `/api/v1/metrics`, `/api/v1/monitoring/*`) and `/api/v1/sync/*`. Proof is
+   the agent's enrolled per-agent api-key or a client certificate mapped to
+   that agent (#8590); the shared api-key proves no principal. A header
+   naming an `anonymous:*` id is a named assertion and is refused the same
+   way. A request with no `X-Agent-Id` (or an empty one) is the anonymous
+   per-request principal and is not refused here. The refusal holds with or
+   without enrolled per-agent keys and with or without a configured shared
+   key (3-agent vote (71472661)). Operators running `enforce` with only the
+   shared key must enrol per-agent keys (`ai-memory agents bind-api-key`) or
+   map client certificates before named callers can act, or select
+   `advisory`. Under `advisory` the request is served and reported: a WARN
+   once per (presented key, claimed id) with the id escaped, plus a counter;
+   nothing is persisted.
+   **Body and query principal claims (PR 9390).** Under `enforce`, with any
+   number of per-agent keys enrolled (including zero), a request body
+   `agent_id` on `POST /api/v1/session/start` and `POST /api/v1/memory_reflect`
+   is held to the same rule: absent, the request acts as the authority
+   principal (the proven agent, or the server-minted anonymous principal of
+   a shared-key caller); equal to the PROVEN principal, it is accepted;
+   anything else (a shared-key or anonymous caller naming an agent, or a
+   proven caller naming a different agent) is refused with the same **403**
+   `{"error":"attested_identity_required"}` before any read or write. Every
+   other body or query `agent_id` / `as_agent` either must equal the
+   header-resolved caller (mismatch refused) or names another agent as data
+   (a share recipient, a list filter); none becomes the acting principal.
+   Under `advisory` the body claim is served and reported like the header
+   claim; `off` is unchanged.
+6. A present `X-Agent-Id` that is malformed, reserved or not visible ASCII
+   is refused **400** `VALIDATION_FAILED` on every gated route (#9342); it
+   is never served as `anonymous:invalid`.
 
 Validation pattern: `^[A-Za-z0-9_\-:@./]{1,128}$`.
 
@@ -752,9 +788,12 @@ Query params: `direction` (`ancestors` default, or `descendants`),
 ```
 
 Tombstoned ancestors are included (a consolidated-away source is still
-an ancestor). A root the caller cannot see is **404** (postgres) /
-**403** (sqlite owner-mismatch) — not an existence oracle on postgres
-(`NotFound` folds hidden + missing). An unknown `direction` is **400**.
+an ancestor). A root the caller cannot read and a root that does not
+exist both answer **404** `{"error": "source memory not found", "id": …}`,
+byte-identical on SQLite and PostgreSQL, so the route is not an existence
+oracle ([#8994](https://github.com/alphaonedev/ai-memory-mcp/issues/8994);
+before, SQLite answered 403 for an unreadable root and an empty 200 walk
+for an absent one). An unknown `direction` is **400**.
 
 ### `PUT /api/v1/memories/{id}` — update
 
@@ -765,6 +804,10 @@ All fields optional. Tier never downgrades.
 ```
 
 - **200** on success, **409** on `(title, namespace)` collision, **404** on missing.
+- A row the caller cannot read answers exactly like a missing id (**404**),
+  on both backends; **403** `NOT_OWNER` is kept for a row the caller can read
+  but does not own ([#8994](https://github.com/alphaonedev/ai-memory-mcp/issues/8994)).
+  `DELETE /api/v1/memories/{id}` follows the same rule.
 
 ### `DELETE /api/v1/memories/{id}` — delete
 
@@ -1011,6 +1054,16 @@ Immediate garbage collection. Empty body. **Admin-gated**. Returns
 { "source_id": "abc", "target_id": "def", "relation": "supersedes" }
 ```
 
+A source the caller cannot read answers exactly like an absent source:
+**404** `{"error": "source memory not found", "source_id": …}` on both
+backends, before any target or ownership check, and nothing is written
+([#8994](https://github.com/alphaonedev/ai-memory-mcp/issues/8994)).
+A target in a substrate namespace the caller cannot read answers exactly
+like a target id that names no row: **404** `{"error": "not found"}` on
+both backends, and nothing is written (before, SQLite answered **403**
+`caller cannot see the link target` for the hidden target and **500** for
+the absent one) ([#8994](https://github.com/alphaonedev/ai-memory-mcp/issues/8994)).
+
 Relations (nine at v0.8.0; was six at v0.7.0, four at v0.6.x): `related_to`, `supersedes`, `contradicts`, `derived_from`, `reflects_on` (recursive-learning Task 1/8), `derives_from` (WT-1-A atomisation — atom row → parent memory), `decomposes_into`, `depends_on`, `advances` (the last three are the v0.8.0 Pillar-2 typed-cognition Goal/Plan/Step relations, #1709). Canonical enum in `src/models/link.rs::MemoryLinkRelation` (`COUNT = 9`).
 
 ### `GET /api/v1/links/{id}`
@@ -1053,9 +1106,15 @@ and removes every relation between that pair (`MemoryStore::delete_link`).
 ```
 
 Response: `{"deleted": true}` when at least one row was removed,
-`{"deleted": false}` when the pair had no edge (including a missing
-source — not 404, so this is not an existence oracle). **403** when the
-caller owns neither endpoint. Never a count — `deleted` is a **bool**.
+`{"deleted": false}` when the caller may sever the pair but it had no
+edge. When the caller can read neither endpoint (absent or not visible)
+the answer is **404** `{"error": "not found"}` and nothing is written,
+byte-identical for a private pair and a pair of ids that name no rows, on
+both backends ([#8994](https://github.com/alphaonedev/ai-memory-mcp/issues/8994),
+[#9043](https://github.com/alphaonedev/ai-memory-mcp/issues/9043); before,
+a missing source answered `200 {"deleted": false}` and PostgreSQL let an
+unreadable source fall through to the delete). **403** when the caller
+can read an endpoint but owns neither. Never a count — `deleted` is a **bool**.
 
 ### `POST /api/v1/links/verify`
 
@@ -1206,11 +1265,25 @@ optional), `limit` (1-1000, default 200).
 }
 ```
 
+A source that does not exist, and a source the caller cannot read and is
+not admitted to, both answer **404** `{"found": false, "source_id": …,
+"error": "source memory not found"}` on both backends; a source the caller
+can read but does not own keeps **403**
+([#8994](https://github.com/alphaonedev/ai-memory-mcp/issues/8994)).
+
 ### `POST /api/v1/kg/invalidate`
 
 Mark a link superseded by setting `valid_until`. **Does NOT delete**
 the link — historical queries pinned to `valid_at < now` still see
-it. Idempotent.
+it. Idempotent. A source the caller cannot read answers the same
+not-found body as an absent source on both backends; **403** is kept for a
+readable source the caller does not own
+([#8994](https://github.com/alphaonedev/ai-memory-mcp/issues/8994)).
+An agent the source row is addressed to (`target_agent_id`, or its
+`_inbox/<agent>` namespace) keeps the right to invalidate the row's edges
+even where it cannot read the row on SQLite; on PostgreSQL such a row in a
+team, unit or org subtree outside the caller's ancestry answers the
+not-found body, as before this change.
 
 ```json
 {
@@ -1466,7 +1539,8 @@ signature is checked; a layout 1 signature (subject `<id>` alone) is refused **4
 credential gets **403**: with a per-agent api-key whose bound agent differs from
 `X-Agent-Id` the transport middleware refuses first with
 `identity_binding_mismatch`; with the shared api-key (no per-agent binding) the
-decide gate refuses with `attested_identity_required` (#8549).
+authority-layer funnel refuses with `attested_identity_required` before the
+decide handler runs (#9341; the decide gate keeps the same refusal, #8549).
 200 if consensus reached (and the governed action is executed). 202 if
 still collecting approvers. Equivalent MCP tool: `memory_pending_approve`
 (`src/mcp/tools/pending.rs`).
@@ -1753,7 +1827,7 @@ router in `src/lib.rs`.
 | `POST` | `/api/v1/kg/find_paths` | KG chain-walk over HTTP; relational recursive-CTE (bounded BFS) on SQLite **and** Postgres (not AGE Cypher — #2582 / #3297). |
 | `POST` | `/api/v1/find_paths` | Alias for `/api/v1/kg/find_paths` (#934 — legacy callers). |
 | `POST` | `/api/v1/links/verify` | Ed25519 link verification surface — wire shape: `{verified, attest_level, signature_present, observed_by, source_id, target_id, relation, findings}`. |
-| `DELETE` | `/api/v1/links` | Delete a link. Returns `{"deleted": true}` (bool — at least one row removed) or `{"deleted": false}`. |
+| `DELETE` | `/api/v1/links` | Delete a link. Returns `{"deleted": true}` (bool — at least one row removed) or `{"deleted": false}`; `404 {"error": "not found"}` when the caller can read neither endpoint (#8994). |
 | `GET`  | `/api/v1/contradictions` | Detect contradiction candidates (similar titles in a namespace). |
 | `POST` | `/api/v1/memory_load_family` | HTTP parity for the always-on `memory_load_family` MCP loader. |
 | `POST` | `/api/v1/capture_turn` | #1416 — L4 layered-capture HTTP mirror of MCP `memory_capture_turn` (idempotent per-turn write via `MemoryStore::capture_turn_idempotent`). |
@@ -1762,11 +1836,11 @@ router in `src/lib.rs`.
 | `GET`  | `/api/v1/capabilities` | Capabilities envelope (schema_version `"3"`; `Accept-Capabilities` header negotiates v1/v2). MCP: `memory_capabilities`. |
 | `POST` | `/api/v1/notify` | Agent-to-agent inbox message. Sender resolved from `X-Agent-Id` only (#901); body `agent_id` must match or 403. MCP: `memory_notify`. Every delivery is a NEW row (#3639): the stored `title` is `<subject> [<id prefix>]` (unique by construction), the caller's title is kept verbatim as `metadata.subject`, a repeated subject never merges into, overwrites or re-attributes an earlier message, and the receipt carries `id`, `title` and `subject`. |
 | `GET`  | `/api/v1/inbox` | Read the calling agent's inbox — the messages it has not yet HANDLED. Handled = the recipient deleted the message (`DELETE /api/v1/memories/{id}`, archived on this namespace, see the delete route); reads never mark anything (#1869 purity) and there is no read marker — `access_count` counts touches, never handling ([#3730](https://github.com/alphaonedev/ai-memory-mcp/issues/3730)). `unread_only` is accepted for compatibility and narrows nothing (every listed message is unhandled); `unread_count == count`. MCP: `memory_inbox`; when `AI_MEMORY_AGENT_ID` is unset, access is bound to the same process-derived identity used by `memory_notify`, and an explicit `agent_id` must match it. MCP refuses startup when `AI_MEMORY_AGENT_ID` is configured empty or malformed. An isolated single-tenant process may explicitly set `[mcp] single_tenant_trust_all = true` to restore caller-unbound inbox selection; every use emits a WARN. |
-| `GET`  | `/api/v1/inbox/stream` | v1.0.0 [#3465](https://github.com/alphaonedev/ai-memory-mcp/issues/3465) — SSE wake stream for the calling agent's OWN inbox (`handlers::inbox_sse`). One `agent_notified` frame per committed `memory_notify`, plus a synthetic `lagged` frame when a slow subscriber overruns the bounded broadcast buffer; keepalive every 15 s. Identity-bound at stream open — no delegation, no namespace widening, and an unresolved identity (absent/unreadable `X-Agent-Id`, or a self-asserted `host:` principal) gets a stream that never emits. Frames carry the inbox row id, namespace, sender, a correlation id and a `sha256:` content digest — **never the body**; the woken client reads its mail through `GET /api/v1/inbox`. Fed from the in-process wake bus, not the webhook lane. No MCP twin (SSE has no MCP transport). |
+| `GET`  | `/api/v1/inbox/stream` | v1.0.0 [#3465](https://github.com/alphaonedev/ai-memory-mcp/issues/3465) — SSE wake stream for the calling agent's OWN inbox (`handlers::inbox_sse`). One `agent_notified` frame per committed `memory_notify`, plus a synthetic `lagged` frame when a slow subscriber overruns the bounded broadcast buffer; keepalive every 15 s. Identity-bound at stream open — no delegation, no namespace widening, and an unresolved identity (absent `X-Agent-Id`, or a self-asserted `host:` principal) gets a stream that never emits; an unreadable `X-Agent-Id` is refused `400` at the authority layer (#9342). Frames carry the inbox row id, namespace, sender, a correlation id and a `sha256:` content digest — **never the body**; the woken client reads its mail through `GET /api/v1/inbox`. Fed from the in-process wake bus, not the webhook lane. No MCP twin (SSE has no MCP transport). |
 | `GET`  | `/.well-known/agent-card.json` | #8444 — Agent2Agent (A2A 1.0) Agent Card. **Authenticated callers only** (posture P1): the route sits behind the existing `api_key_auth`, so an unauthenticated GET is `401`; no exemption exists. Declares `capabilities {streaming:false, pushNotifications:false, extendedAgentCard:false, extensions:[]}`, one `supportedInterfaces` entry (`protocolBinding:"JSONRPC"`, `protocolVersion:"1.0"`, url `<base>/api/v1/a2a`, where `<base>` is the configured `AI_MEMORY_PUBLIC_URL` or else the daemon's own scheme (`https` under TLS) and bind address, never the request `Host` or `X-Forwarded-Proto`), the `apiKey` security scheme (header `x-api-key`) and one skill, `memory-inbox`. `mtls` is deliberately not declared (it would need a wider `/api/v1/sync/*` auth bypass). Served on both backends. |
 | `POST` | `/api/v1/a2a` | #8444 — the ONE Agent2Agent JSON-RPC 2.0 endpoint. Behind `api_key_auth` plus a credential-derived agent identity (fail-closed; an open/keyless server answers `401`). Methods: `SendMessage` (synchronous: the Task is `TASK_STATE_COMPLETED` in the response), `GetTask`, `ListTasks`, `CancelTask`. Declared unsupported: `SendStreamingMessage`, `SubscribeToTask`, `GetExtendedAgentCard` answer `-32004`; the four `*TaskPushNotificationConfig` methods answer `-32003`; an unknown method answers `-32601`. Requires `Content-Type: application/json`; `A2A-Version` is accepted when absent or `1.0` (anything else `-32009`) and `A2A-Version: 1.0` is returned on every response the A2A handlers produce (a `401` from the shared authentication layer is answered before the handler runs and carries none). Every inbound message is stored in the caller's `_inbox/<caller>` and stamped with `content_principal` (the authenticated agent id, never `X-Agent-Id` or the body) and `a2a_role` (untrusted label). A task owned by another caller answers `-32001` with HTTP `404`, never `403`. See *A2A error table* below and `docs/a2a-integration.md` section 10. |
 | `GET` `POST` `DELETE` | `/api/v1/skill/list`, `/api/v1/skill/register`, `/api/v1/skill/{id}`, `/api/v1/skill/{id}/resource`, `/api/v1/skill/{id}/export`, `/api/v1/skill/{id}/promote`, `/api/v1/skill/{id}/compose` | Cluster E API-2 (#767) — Agent Skills HTTP parity for the seven `memory_skill_*` MCP tools. **Admin-gated.** `…/export` writes on the daemon host and is **jailed** — see *Skills export root* below. |
-| `POST` | `/api/v1/memory_smart_load`, `/api/v1/memory_reflect`, `/api/v1/memory_recall_observations`, `/api/v1/memory_reflection_origin`, `/api/v1/memory_dependents_of_invalidated`, `/api/v1/memory_export_reflection`, `/api/v1/memory_atomise`, `/api/v1/memory_calibrate_confidence`, `/api/v1/memory_verify`, `/api/v1/memory_replay`, `/api/v1/memory_subscription_replay`, `/api/v1/memory_subscription_dlq_list`, `/api/v1/memory_rule_list`, `/api/v1/memory_check_agent_action` | #1111 — 14 thin HTTP wrappers around the same-named MCP substrate handlers (`src/handlers/route_1111.rs`); wire envelopes are byte-equal across MCP and HTTP. `memory_subscription_replay` events carry `delivery_status`: `ack` / `failed` are terminal; **`pending` means no terminal status was recorded — including a delivery that settled but whose terminal status write failed** ([#3659](https://github.com/alphaonedev/ai-memory-mcp/issues/3659)), so the field alone cannot separate in-flight from lost; a row still `pending` past the 60 s settle window is the lost case (`doctor` warns; the reliable write is [#3735](https://github.com/alphaonedev/ai-memory-mcp/issues/3735)). **`/api/v1/memory_calibrate_confidence` is a caller-scoped aggregate ([#3507](https://github.com/alphaonedev/ai-memory-mcp/issues/3507)):** the report's `baselines` NAME namespaces, so the sweep is computed only over rows the caller can read, using the store's own visibility predicates (subtree scopes, owner-keyed `scope=private`, substrate exclusion) on BOTH backends. `X-Agent-Id` is REQUIRED — an absent header answers `403`, never the pre-#3507 corpus-wide sweep, because the shared resolver would otherwise synthesize a per-request `anonymous:req-…` that owns no rows. An admin caller (the existing `is_admin_caller_trusted` gate) keeps the global aggregate; every other caller is scoped, and for a scoped caller the sweep is strictly read-only (the `recall_outcome` backfill is admin-only, so `consumption_utility` may report `null`). |
+| `POST` | `/api/v1/memory_smart_load`, `/api/v1/memory_reflect`, `/api/v1/memory_recall_observations`, `/api/v1/memory_reflection_origin`, `/api/v1/memory_dependents_of_invalidated`, `/api/v1/memory_export_reflection`, `/api/v1/memory_atomise`, `/api/v1/memory_calibrate_confidence`, `/api/v1/memory_verify`, `/api/v1/memory_replay`, `/api/v1/memory_subscription_replay`, `/api/v1/memory_subscription_dlq_list`, `/api/v1/memory_rule_list`, `/api/v1/memory_check_agent_action` | #1111 — 14 thin HTTP wrappers around the same-named MCP substrate handlers (`src/handlers/route_1111.rs`); wire envelopes are byte-equal across MCP and HTTP. **`/api/v1/memory_recall_observations` is scoped to the caller ([#9366](https://github.com/alphaonedev/ai-memory-mcp/issues/9366)):** a ledger row is returned only to the agent it belongs to (`agent_id` equal to the request principal) or to an admin caller; the anonymous shared-key caller, which owns nothing, reads no row, and rows with no `agent_id` are visible to an admin only. The MCP tool applies the same scope from the session authority; the CLI (local operator on its own file) lists every row. The route answers `501` on PostgreSQL (postgres route gate). `memory_subscription_replay` events carry `delivery_status`: `ack` / `failed` are terminal; **`pending` means no terminal status was recorded — including a delivery that settled but whose terminal status write failed** ([#3659](https://github.com/alphaonedev/ai-memory-mcp/issues/3659)), so the field alone cannot separate in-flight from lost; a row still `pending` past the 60 s settle window is the lost case (`doctor` warns; the reliable write is [#3735](https://github.com/alphaonedev/ai-memory-mcp/issues/3735)). **`/api/v1/memory_calibrate_confidence` is a caller-scoped aggregate ([#3507](https://github.com/alphaonedev/ai-memory-mcp/issues/3507)):** the report's `baselines` NAME namespaces, so the sweep is computed only over rows the caller can read, using the store's own visibility predicates (subtree scopes, owner-keyed `scope=private`, substrate exclusion) on BOTH backends. `X-Agent-Id` is REQUIRED — an absent header answers `403`, never the pre-#3507 corpus-wide sweep, because the shared resolver would otherwise synthesize a per-request `anonymous:req-…` that owns no rows. An admin caller (the existing `is_admin_caller_trusted` gate) keeps the global aggregate; every other caller is scoped, and for a scoped caller the sweep is strictly read-only (the `recall_outcome` backfill is admin-only, so `consumption_utility` may report `null`). |
 | `GET`  | `/api/v1/admin/quarantine` | v1.0.0 [#2402](https://github.com/alphaonedev/ai-memory-mcp/issues/2402) — list the memories currently held in federation quarantine (`handlers::list_quarantined`). **Admin-gated.** Identifying metadata ONLY (id, namespace, title, source, kind, timestamps) — never `content`: a quarantined row is untrusted input by construction and its content may be an at-rest seal sentinel. `?namespace=` narrows, `?limit=` pages (clamped to 1000). |
 | `POST` | `/api/v1/admin/quarantine/{id}/release` | v1.0.0 [#2402](https://github.com/alphaonedev/ai-memory-mcp/issues/2402) — release one quarantined memory back to `lifecycle_state=open` (`handlers::release_quarantined`), the operator half of the [#1948](https://github.com/alphaonedev/ai-memory-mcp/issues/1948) route-OUT contract that shipped with no caller. **Admin-gated**; the audit actor is the principal `require_admin` RETURNS — an id it admits only when it is on the admin allowlist AND the deployment has request authentication configured (#1570), and, under the `enforce` identity-binding posture, only when it is key-attested to a per-agent api key (#2044). The handler never reads `X-Agent-Id` itself. Appends a `memory.dequarantined` signed audit row in the SAME transaction as the state change on both backends. Boids item 3 R2.5 ([#3266](https://github.com/alphaonedev/ai-memory-mcp/issues/3266)): the SAME route also releases a `contaminated` row — chosen by the state observed under the row lock, never by the caller — restoring the recorded `metadata.contamination.prior_lifecycle_state` when it is a visible state (else `open`), removing the marker, and appending a signed `swarm.decontaminate` event (payload binds the released prior / `contaminated_from` / `stamped_at`) instead of `memory.dequarantined`; the response shape is unchanged. Idempotent: an id that is neither quarantined nor contaminated answers `200 {"released": false}` and writes nothing (deliberately not `404` — that would leak the existence of rows this surface does not return). |
 | `POST` | `/api/v1/memory_swarm_rewind` | v1.0.0 Boids item 3 ([#3266](https://github.com/alphaonedev/ai-memory-mcp/issues/3266), 5-agent vote `4d3ea1c5`) — **admin-only** cascade rewind, served on BOTH backends (the MCP tool is stdio/SQLite-only and the CLI refuses a Postgres store, so this is the Postgres path). Body `{to, max_depth?, freeze_routines?, dry_run?}`; `to` is a memory id (in any lifecycle state) or a checkpoint id naming a root; `max_depth` is clamped to the lineage ceiling. Contaminates the root and its bounded `derives_from` descendants, freezes the named routines, and appends ONE signed `swarm.rewind` event in one transaction; idempotent (a re-run reports `already_rewound`, no second event); `dry_run` writes nothing. `issued_by` is the server-resolved admin principal, never `X-Agent-Id` (non-admin → `403`). Record-stopped → `503 RECORD_STOPPED`. Envelope is byte-equal to the MCP tool's. Containment is NODE-LOCAL at GA: no peer fan-out. |

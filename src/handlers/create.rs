@@ -114,7 +114,12 @@ pub(crate) async fn resolve_pre_event_namespaces(
     let mut out: Vec<String> = Vec::new();
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
-        let ctx = crate::handlers::parity::http_caller_ctx(headers, None);
+        // #9342 — an unresolvable caller resolves NO namespace, which the
+        // dispatcher turns into the fail-closed refusal documented above;
+        // never the silent `anonymous:invalid` principal.
+        let Ok(ctx) = crate::handlers::parity::http_caller_ctx_checked(headers, None) else {
+            return Vec::new();
+        };
         for id in ids {
             if let Ok(mem) = app.store.get(&ctx, id).await
                 && !out.contains(&mem.namespace)

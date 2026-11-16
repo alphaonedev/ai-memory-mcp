@@ -411,7 +411,9 @@ async fn http_anchor_contract_matrix(
     for (anchor, expected) in [
         (&own, StatusCode::OK),
         (&other, StatusCode::NOT_FOUND),
-        (&foreign_owned, StatusCode::FORBIDDEN),
+        // #8994 — `foreign_owned` is a PRIVATE row of another agent: the
+        // caller cannot read it, so it answers like an absent id (pre-#8994: 403).
+        (&foreign_owned, StatusCode::NOT_FOUND),
         (&unowned, StatusCode::OK),
     ] {
         let response = router
@@ -440,13 +442,28 @@ async fn http_anchor_contract_matrix(
             );
         } else if anchor == &other {
             assert_eq!(body["found"], false, "hidden substrate envelope");
+        } else if anchor == &foreign_owned {
+            assert_eq!(
+                body,
+                json!({
+                    "found": false,
+                    "source_id": foreign_owned,
+                    "error": ai_memory::errors::msg::SOURCE_MEMORY_NOT_FOUND,
+                }),
+                "#8994: a private foreign anchor answers the exact absent-source body"
+            );
         }
     }
+    // #8994: a hidden substrate target answers exactly like a target id that
+    // names no row (the one not-found body), so neither leaks existence.
+    let absent_target = "00000000-0000-4000-8000-000000008994".to_string();
+    let not_found_8994 = json!({"error": "not found"});
     for (target, expected) in [
         (&unowned, StatusCode::CREATED),
         (&empty_owner, StatusCode::CREATED),
         (&own, StatusCode::CREATED),
-        (&other, StatusCode::FORBIDDEN),
+        (&other, StatusCode::NOT_FOUND),
+        (&absent_target, StatusCode::NOT_FOUND),
         (&foreign_owned, StatusCode::CREATED),
     ] {
         let response = router
@@ -475,5 +492,9 @@ async fn http_anchor_contract_matrix(
             "link target {target}: {}",
             String::from_utf8_lossy(&bytes)
         );
+        if expected == StatusCode::NOT_FOUND {
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body, not_found_8994, "#8994 link target {target}");
+        }
     }
 }

@@ -866,6 +866,39 @@ pub async fn postgres_route_gate(
 /// error path.
 #[cfg(feature = "sal")]
 #[must_use]
+pub fn store_err_to_response_for(
+    e: crate::store::StoreError,
+    visibility: crate::handlers::parity::RowVisibility,
+) -> Response {
+    use crate::handlers::parity::{RefusedResource, RowVisibility, not_visible_refusal};
+    use crate::store::StoreError;
+    // #8994 — the adapter's owner gate decides on the RAW row, so it
+    // refuses a row the caller cannot even read with the same
+    // `PermissionDenied` it uses for a visible row of another owner. A
+    // handler that knows (from its visibility-scoped lookup) the row is not
+    // visible renders that refusal as the route's not-found shape, so a
+    // private id answers byte-identically to an id that names no row.
+    //
+    // PR 9390 M1 — EVERY refusal reason on a row the caller cannot read is
+    // rendered as not-found, not only the two owner reasons: the adapter's
+    // unstamped-row refusal (#1628 "memory has no agent_id stamp") named a
+    // hidden unstamped row with a 403 while an absent id answered 404.
+    if visibility == RowVisibility::NotVisible
+        && let StoreError::PermissionDenied { target, reason, .. } = &e
+    {
+        if reason == crate::errors::msg::CALLER_NOT_SOURCE_MEMORY_OWNER {
+            return not_visible_refusal(RefusedResource::SourceMemory(target));
+        }
+        return not_visible_refusal(RefusedResource::Memory(target));
+    }
+    store_err_to_response(e)
+}
+
+/// Map a [`crate::store::StoreError`] to its HTTP response (the
+/// visibility-blind form; see [`store_err_to_response_for`] for a route
+/// that knows whether the caller can read the addressed row).
+#[cfg(feature = "sal")]
+#[must_use]
 pub fn store_err_to_response(e: crate::store::StoreError) -> Response {
     use crate::store::StoreError;
     // #4400 — the audit-trail latch: a retryable 503 that carries its own

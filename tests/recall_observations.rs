@@ -57,7 +57,16 @@ fn gap3_recall_writes_one_observation_per_candidate() {
     let written = observations::record_recall(&conn, "r1", &candidates).expect("record");
     assert_eq!(written, 5, "five candidates ⇒ five rows");
 
-    let rows = observations::list_observations(&conn, Some("r1"), None, None, None, 100).unwrap();
+    let rows = observations::list_observations(
+        &conn,
+        ai_memory::observations::ObservationScope::All,
+        Some("r1"),
+        None,
+        None,
+        None,
+        100,
+    )
+    .unwrap();
     assert_eq!(rows.len(), 5);
     // Pin retriever + rank + score per row.
     let by_id: std::collections::HashMap<_, _> =
@@ -112,7 +121,16 @@ fn gap3_store_or_link_cite_flips_consumed_true() {
     });
     observations::try_mark_consumed_from_params(&conn, &params_value, "consumer");
 
-    let rows = observations::list_observations(&conn, Some("r1"), None, None, None, 100).unwrap();
+    let rows = observations::list_observations(
+        &conn,
+        ai_memory::observations::ObservationScope::All,
+        Some("r1"),
+        None,
+        None,
+        None,
+        100,
+    )
+    .unwrap();
     let by_id: std::collections::HashMap<_, _> =
         rows.iter().map(|o| (o.memory_id.clone(), o)).collect();
     assert!(
@@ -244,8 +262,16 @@ fn gap3_since_filter_excludes_older_rows() {
     )
     .unwrap();
     let cutoff = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
-    let recent =
-        observations::list_observations(&conn, None, None, Some(&cutoff), None, 100).expect("list");
+    let recent = observations::list_observations(
+        &conn,
+        ai_memory::observations::ObservationScope::All,
+        None,
+        None,
+        Some(&cutoff),
+        None,
+        100,
+    )
+    .expect("list");
     assert_eq!(
         recent.len(),
         1,
@@ -287,9 +313,16 @@ fn gap3_until_filter_excludes_newer_rows() {
         }],
     )
     .unwrap();
-    let old_only =
-        observations::list_observations(&conn, None, None, None, Some("2022-01-01T00:00:00Z"), 100)
-            .expect("list");
+    let old_only = observations::list_observations(
+        &conn,
+        ai_memory::observations::ObservationScope::All,
+        None,
+        None,
+        None,
+        Some("2022-01-01T00:00:00Z"),
+        100,
+    )
+    .expect("list");
     assert_eq!(
         old_only.len(),
         1,
@@ -306,8 +339,16 @@ fn gap3_record_recall_zero_candidates_is_noop_returning_zero() {
     let conn = fresh_db();
     let written = observations::record_recall(&conn, "r-empty", &[]).expect("ok");
     assert_eq!(written, 0);
-    let rows = observations::list_observations(&conn, Some("r-empty"), None, None, None, 10)
-        .expect("list");
+    let rows = observations::list_observations(
+        &conn,
+        ai_memory::observations::ObservationScope::All,
+        Some("r-empty"),
+        None,
+        None,
+        None,
+        10,
+    )
+    .expect("list");
     assert!(rows.is_empty());
 }
 
@@ -369,6 +410,7 @@ fn gap3_mcp_tool_since_filter_executes_branch() {
     let resp = handle_recall_observations(
         &conn,
         &serde_json::json!({"recall_id": "r-since", "since": cutoff}),
+        ai_memory::observations::ObservationScope::All,
     )
     .expect("mcp ok");
     assert_eq!(resp["count"].as_u64(), Some(1));
@@ -393,12 +435,14 @@ fn gap3_mcp_tool_until_filter_executes_branch() {
     let resp = handle_recall_observations(
         &conn,
         &serde_json::json!({"recall_id": "r-until", "until": "2099-01-01T00:00:00Z"}),
+        ai_memory::observations::ObservationScope::All,
     )
     .expect("mcp ok");
     assert_eq!(resp["count"].as_u64(), Some(1));
     let resp2 = handle_recall_observations(
         &conn,
         &serde_json::json!({"recall_id": "r-until", "until": "1900-01-01T00:00:00Z"}),
+        ai_memory::observations::ObservationScope::All,
     )
     .expect("mcp ok");
     assert_eq!(resp2["count"].as_u64(), Some(0));
@@ -451,6 +495,7 @@ fn gap3_mcp_tool_limit_param_caps_response() {
     let resp = handle_recall_observations(
         &conn,
         &serde_json::json!({"recall_id": "r-lim", "limit": 2}),
+        ai_memory::observations::ObservationScope::All,
     )
     .expect("mcp ok");
     assert_eq!(resp["count"].as_u64(), Some(2));
@@ -459,6 +504,7 @@ fn gap3_mcp_tool_limit_param_caps_response() {
     let resp_clamp = handle_recall_observations(
         &conn,
         &serde_json::json!({"recall_id": "r-lim", "limit": 99_999}),
+        ai_memory::observations::ObservationScope::All,
     )
     .expect("mcp ok");
     assert_eq!(resp_clamp["count"].as_u64(), Some(5));
@@ -493,8 +539,16 @@ fn gap3_mcp_tool_handles_consumed_false_filter() {
     // The unconsumed-only filter routes through the MCP tool. The
     // public surface is `list_observations` because the MCP wrapper
     // is pub(super); pin the substrate-equivalent contract.
-    let pending =
-        observations::list_observations(&conn, None, Some(false), None, None, 100).expect("list");
+    let pending = observations::list_observations(
+        &conn,
+        ai_memory::observations::ObservationScope::All,
+        None,
+        Some(false),
+        None,
+        None,
+        100,
+    )
+    .expect("list");
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].memory_id, "m2");
 }
@@ -557,8 +611,16 @@ fn gap3_recall_observations_mcp_tool_filters_compose() {
         .to_string();
     assert_ne!(recall_id, "");
     // Recall must have written at least one observation row.
-    let written = observations::list_observations(&conn, Some(&recall_id), None, None, None, 100)
-        .expect("list");
+    let written = observations::list_observations(
+        &conn,
+        ai_memory::observations::ObservationScope::All,
+        Some(&recall_id),
+        None,
+        None,
+        None,
+        100,
+    )
+    .expect("list");
     assert!(
         !written.is_empty(),
         "recall must write one observation per candidate"

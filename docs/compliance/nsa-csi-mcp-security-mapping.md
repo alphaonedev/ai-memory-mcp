@@ -88,9 +88,15 @@ an enrolled per-agent API key (schema v83 `agent_api_keys`, `sha256(token) →
 agent_id`) binds the header, and the IDOR-sensitive single-row read/mutate
 routes, the bulk read surfaces, the approvals SSE stream, and `require_admin`
 refuse a merely-*claimed* named principal with `403 attested_identity_required`.
+Since #9341 the HTTP authority layer applies the same refusal once, before any
+handler, on every route except the probes and `/api/v1/sync/*`, so no route
+serves a shared-key caller as a named agent; a mapped mTLS certificate counts
+as proof (#8590). Under `enforce` that refusal holds whether or not any
+per-agent key is enrolled (3-agent vote (71472661)); `advisory` serves and
+reports the caller (a deduplicated WARN plus a counter, nothing persisted).
 That control is real, it is tested, and it closes the concern —
-**under `AI_MEMORY_HTTP_REQUIRE_ATTESTED_IDENTITY=enforce` with per-agent keys
-enrolled.**
+**under `AI_MEMORY_HTTP_REQUIRE_ATTESTED_IDENTITY=enforce`**, where named
+callers act only once per-agent keys are enrolled or certificates mapped.
 
 The shipped default is `advisory` with zero keys enrolled, and in that posture
 the project's own CHANGELOG records the consequence verbatim: *"Out of the box

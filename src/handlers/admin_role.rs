@@ -488,7 +488,7 @@ pub fn require_admin(
             // so the forensic chain captures the rejected probe
             // BEFORE the wire 400.
             crate::governance::audit::record_decision(
-                "anonymous:resolve-failed",
+                crate::identity::sentinels::ANONYMOUS_RESOLVE_FAILED,
                 "deny",
                 "admin_role",
                 "",

@@ -341,6 +341,64 @@ fn unknown_link_body_fields(raw: &serde_json::Value) -> Option<Vec<String>> {
     }
 }
 
+/// #8994 — `Some(404)` when the caller cannot READ the `create_link`
+/// source (absent or not visible), answered in the ONE source not-found
+/// shape on both backends; `None` lets the handler continue. The daemon
+/// principal reads every row. A lookup fault is a 500/sanitised store
+/// error, never an admission.
+async fn create_link_source_not_visible(
+    app: &AppState,
+    headers: &axum::http::HeaderMap,
+    source_id: &str,
+) -> Option<axum::response::Response> {
+    use crate::handlers::parity::{RefusedResource, RowVisibility, not_visible_refusal};
+    let caller = match crate::handlers::parity::resolve_caller_agent_id(None, headers, None) {
+        Ok(caller) => caller,
+        Err(error) => {
+            return Some((StatusCode::BAD_REQUEST, Json(json!({"error": error}))).into_response());
+        }
+    };
+    if caller == sentinels::DAEMON_PRINCIPAL {
+        return None;
+    }
+    #[cfg(feature = "sal")]
+    if matches!(app.storage_backend, StorageBackend::Postgres) {
+        let ctx = match crate::handlers::parity::http_caller_ctx_checked(headers, None) {
+            Ok(ctx) => ctx,
+            Err(refusal) => return Some(refusal),
+        };
+        return match app.store.get(&ctx, source_id).await {
+            Ok(_) => None,
+            Err(crate::store::StoreError::NotFound { .. }) => Some(not_visible_refusal(
+                RefusedResource::SourceMemory(source_id),
+            )),
+            Err(e) => Some(store_err_to_response(e)),
+        };
+    }
+    let lock = app.db.lock().await;
+    let visibility = match db::get(&lock.0, source_id) {
+        // PR 9390 M1 — an UNSTAMPED row is decided by visibility first like
+        // any other row: a hidden unstamped source answers like an absent
+        // one. A VISIBLE unstamped source then meets the #3124 owner gate
+        // below (`AI_MEMORY_UNSTAMPED_MUTATION`) exactly as before #8994.
+        Ok(Some(mem)) => RowVisibility::of(&mem, &caller),
+        Ok(None) => RowVisibility::NotVisible,
+        Err(e) => {
+            tracing::error!("create_link: source visibility lookup failed: {e}");
+            return Some(
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": crate::errors::msg::INTERNAL_SERVER_ERROR})),
+                )
+                    .into_response(),
+            );
+        }
+    };
+    drop(lock);
+    (visibility == RowVisibility::NotVisible)
+        .then(|| not_visible_refusal(RefusedResource::SourceMemory(source_id)))
+}
+
 pub async fn create_link(
     State(app): State<AppState>,
     headers: axum::http::HeaderMap,
@@ -448,6 +506,15 @@ pub async fn create_link(
         return resp;
     }
 
+    // #8994 — source VISIBILITY before anything that could answer
+    // differently for a private source and an absent one (the target
+    // probe below, the owner gate, the adapter's link gate). A source the
+    // caller cannot read gets the SAME not-found answer as an id that
+    // names no row, on both backends; nothing is written.
+    if let Some(refusal) = create_link_source_not_visible(&app, &headers, &source_id).await {
+        return refusal;
+    }
+
     // #3498 amendment: HTTP checks target visibility only for substrate rows.
     // Ordinary targets retain the #939/#941 source-ownership write authority.
     if relation != crate::models::MemoryLinkRelation::Supersedes.as_str() {
@@ -481,19 +548,24 @@ pub async fn create_link(
                 Err(error) => return crate::handlers::errors::handler_error_500(&error),
             }
         };
-        if target.as_ref().is_some_and(|mem| {
+        // #8994 — a substrate target the caller cannot read answers EXACTLY
+        // like a target id that names no row: the one not-found refusal, on
+        // both backends, before the quota charge and the link write. The
+        // postgres read above already answers an absent id with that 404;
+        // the sqlite arm now does too (it used to fall through to the
+        // writer and surface the foreign-key failure as a 500).
+        let hidden_or_absent = target.as_ref().is_none_or(|mem| {
             crate::visibility::is_substrate_namespace(&mem.namespace)
                 && !crate::visibility::is_readable_on_query(
                     mem,
                     Some(&caller),
                     Some(&mem.namespace),
                 )
-        }) {
-            return (
-                StatusCode::FORBIDDEN,
-                Json(json!({"error": "caller cannot see the link target"})),
-            )
-                .into_response();
+        });
+        if hidden_or_absent {
+            return crate::handlers::parity::not_visible_refusal(
+                crate::handlers::parity::RefusedResource::Memory(&target_id),
+            );
         }
     }
 
@@ -539,7 +611,10 @@ pub async fn create_link(
         // attribution matches the request principal. Pre-fix this
         // hardcoded "ai:http" — every link appeared to come from the
         // legacy daemon principal regardless of caller.
-        let ctx = crate::handlers::parity::http_caller_ctx(&headers, None);
+        let ctx = match crate::handlers::parity::http_caller_ctx_checked(&headers, None) {
+            Ok(ctx) => ctx,
+            Err(refusal) => return refusal,
+        };
         return match app
             .store
             .link_signed(&ctx, &link, app.active_keypair.as_ref().as_ref())
@@ -666,11 +741,9 @@ pub async fn create_link(
     let source_mem = match db::get(&lock.0, &source_id) {
         Ok(Some(m)) => m,
         Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({"error": crate::errors::msg::SOURCE_MEMORY_NOT_FOUND, "source_id": source_id})),
-            )
-                .into_response();
+            return crate::handlers::parity::not_visible_refusal(
+                crate::handlers::parity::RefusedResource::SourceMemory(&source_id),
+            );
         }
         Err(e) => {
             tracing::error!("create_link: source lookup failed: {e}");
@@ -984,60 +1057,39 @@ pub async fn delete_link(
     // edge survived and the caller got a false `{"deleted": false}`.
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
-        let ctx = crate::handlers::parity::http_caller_ctx(&headers, None);
-        // Owner-gate parity with the sqlite #939 gate below: the caller
-        // must own EITHER endpoint (links are symmetric — either party
-        // can sever). A missing source memory falls through to
-        // delete_link, which reports `deleted:false` (the pair can't
-        // hold an edge), mirroring the sqlite missing-source path.
-        match app.store.get(&ctx, &source_id).await {
-            Ok(source_mem) => {
-                let source_owner =
-                    crate::identity::owner_stamp::OwnerStamp::of(&source_mem.metadata)
-                        .owner_for_display()
-                        .to_string();
-                let target_meta = app
-                    .store
-                    .get(&ctx, &target_id)
-                    .await
-                    .ok()
-                    .map(|m| m.metadata);
-                let target_mem_owner = target_meta.as_ref().map(|m| {
-                    crate::identity::owner_stamp::OwnerStamp::of(m)
-                        .owner_for_display()
-                        .to_string()
-                });
-                // #3124 — the ONE predicate, link-delete (symmetric) form.
-                if caller != sentinels::DAEMON_PRINCIPAL
-                    && !crate::identity::owner_stamp::unlink_admitted(
-                        &source_mem.metadata,
-                        target_meta.as_ref(),
-                        &source_id,
-                        &caller,
-                        crate::identity::owner_stamp::MutationSite::postgres(
-                            crate::identity::owner_stamp::funnel::UNLINK,
-                        ),
-                    )
-                {
-                    tracing::warn!(
-                        target: super::AUTHZ_TRACE_TARGET,
-                        "DELETE /api/v1/links 403 (postgres): caller {caller} owns neither source {source_owner} nor target {} (source_id={source_id})",
-                        target_mem_owner.as_deref().unwrap_or("")
-                    );
-                    // #3426 — leak-resistant refusal: both endpoint owners
-                    // stay in the AUTHZ trace line above, never on the wire.
-                    return crate::handlers::parity::owner_gate_refusal(
-                        crate::errors::msg::CALLER_NOT_LINK_ENDPOINT_OWNER,
-                        Some(caller.as_str()),
-                        crate::handlers::parity::RefusedResource::Link {
-                            source_id: &source_id,
-                            target_id: &target_id,
-                        },
-                    );
-                }
-            }
-            Err(crate::store::StoreError::NotFound { .. }) => {}
+        let ctx = match crate::handlers::parity::http_caller_ctx_checked(&headers, None) {
+            Ok(ctx) => ctx,
+            Err(refusal) => return refusal,
+        };
+        // #8994 / #9043 — the ONE unlink gate shared with the sqlite
+        // branch below. Both lookups are visibility-scoped (`ctx`), so a
+        // row the caller cannot read comes back `NotFound` exactly like an
+        // absent one; when neither endpoint is visible the gate answers
+        // the link's not-found shape and NOTHING is deleted. Pre-fix a
+        // `NotFound` source fell through to `delete_link` (#9043).
+        let source_mem = match app.store.get(&ctx, &source_id).await {
+            Ok(m) => Some(m),
+            Err(crate::store::StoreError::NotFound { .. }) => None,
             Err(e) => return store_err_to_response(e),
+        };
+        let target_mem = match app.store.get(&ctx, &target_id).await {
+            Ok(m) => Some(m),
+            Err(crate::store::StoreError::NotFound { .. }) => None,
+            Err(e) => return store_err_to_response(e),
+        };
+        if let Some(refusal) = crate::handlers::parity::unlink_gate(
+            source_mem.as_ref(),
+            target_mem
+                .as_ref()
+                .map(|m| (m, crate::handlers::parity::RowVisibility::Visible)),
+            &source_id,
+            &target_id,
+            &caller,
+            crate::identity::owner_stamp::MutationSite::postgres(
+                crate::identity::owner_stamp::funnel::UNLINK,
+            ),
+        ) {
+            return refusal;
         }
         return match app.store.delete_link(&ctx, &source_id, &target_id).await {
             Ok(removed) => Json(json!({"deleted": removed})).into_response(),
@@ -1055,22 +1107,20 @@ pub async fn delete_link(
     // nature of a link delete — either party can sever), inbox
     // carve-out on either endpoint, legacy "daemon" sentinel, legacy
     // unowned rows.
+    // #8994 / #9043 — the source counts only when the caller can READ it;
+    // the target is handed in with its visibility so the ownership
+    // predicate keeps seeing it. Neither endpoint visible answers the
+    // link's not-found shape (identical for a private and an absent pair)
+    // and NOTHING is deleted; pre-fix an absent source fell through to
+    // `db::delete_link` and answered `200 {"deleted": false}`.
     let lock = app.db.lock().await;
-    let source_mem = match db::get(&lock.0, &source_id) {
-        Ok(Some(m)) => Some(m),
-        // #939 followup (2026-05-20) — when the source memory does
-        // not exist, fall through to the substrate `db::delete_link`
-        // which will report `deleted: false` (the canonical
-        // legacy contract — non-existent source is not an
-        // existence-leak the gate needs to protect; the link itself
-        // can't exist either, so the delete is a no-op the caller
-        // gets to learn about). Pre-followup the handler 404'd here,
-        // which broke the test surface that exercises the
-        // `deleted: false` semantic.
-        Ok(None) => None,
+    let lookup = db::get(&lock.0, &source_id)
+        .and_then(|src| db::get(&lock.0, &target_id).map(|tgt| (src, tgt)));
+    let (source_mem, target_mem) = match lookup {
+        Ok(pair) => pair,
         Err(e) => {
             drop(lock);
-            tracing::error!("delete_link: source lookup failed: {e}");
+            tracing::error!("delete_link: endpoint lookup failed: {e}");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": crate::errors::msg::INTERNAL_SERVER_ERROR})),
@@ -1078,60 +1128,24 @@ pub async fn delete_link(
                 .into_response();
         }
     };
-    // Owner gate only fires when the source memory actually exists.
-    // Missing-source path falls through to the substrate (delete-
-    // returns-false) below.
-    let source_mem = match source_mem {
-        Some(m) => m,
-        None => {
-            let delete_result = db::delete_link(&lock.0, &source_id, &target_id);
-            drop(lock);
-            return match delete_result {
-                Ok(removed) => Json(json!({"deleted": removed})).into_response(),
-                Err(e) => crate::handlers::errors::handler_error_500(&e),
-            };
-        }
-    };
-    let target_meta = db::get(&lock.0, &target_id)
-        .ok()
-        .flatten()
-        .map(|m| m.metadata);
-    let target_mem_owner = target_meta.as_ref().map(|m| {
-        crate::identity::owner_stamp::OwnerStamp::of(m)
-            .owner_for_display()
-            .to_string()
+    let visible_source = source_mem.as_ref().filter(|m| {
+        crate::handlers::parity::RowVisibility::of(m, &caller)
+            == crate::handlers::parity::RowVisibility::Visible
     });
-    let source_owner = crate::identity::owner_stamp::OwnerStamp::of(&source_mem.metadata)
-        .owner_for_display()
-        .to_string();
-    // #3124 — the ONE predicate, link-delete (symmetric) form.
-    if caller != sentinels::DAEMON_PRINCIPAL
-        && !crate::identity::owner_stamp::unlink_admitted(
-            &source_mem.metadata,
-            target_meta.as_ref(),
-            &source_id,
-            &caller,
-            crate::identity::owner_stamp::MutationSite::sqlite(
-                crate::identity::owner_stamp::funnel::UNLINK,
-            ),
-        )
-    {
+    if let Some(refusal) = crate::handlers::parity::unlink_gate(
+        visible_source,
+        target_mem
+            .as_ref()
+            .map(|m| (m, crate::handlers::parity::RowVisibility::of(m, &caller))),
+        &source_id,
+        &target_id,
+        &caller,
+        crate::identity::owner_stamp::MutationSite::sqlite(
+            crate::identity::owner_stamp::funnel::UNLINK,
+        ),
+    ) {
         drop(lock);
-        tracing::warn!(
-            target: super::AUTHZ_TRACE_TARGET,
-            "DELETE /api/v1/links 403: caller {caller} owns neither source {source_owner} nor target {} (source_id={source_id})",
-            target_mem_owner.as_deref().unwrap_or("")
-        );
-        // #3426 — leak-resistant refusal: both endpoint owners stay in the
-        // AUTHZ trace line above, never on the wire.
-        return crate::handlers::parity::owner_gate_refusal(
-            crate::errors::msg::CALLER_NOT_LINK_ENDPOINT_OWNER,
-            Some(caller.as_str()),
-            crate::handlers::parity::RefusedResource::Link {
-                source_id: &source_id,
-                target_id: &target_id,
-            },
-        );
+        return refusal;
     }
 
     let delete_result = db::delete_link(&lock.0, &source_id, &target_id);
@@ -1403,24 +1417,17 @@ pub async fn get_lineage(
                         (!caller_is_admin).then_some(caller.as_str()),
                         Some(&mem.namespace),
                     ) {
-                        return (
-                            StatusCode::FORBIDDEN,
-                            Json(json!({
-                                "error": crate::errors::msg::CALLER_NOT_SOURCE_MEMORY_OWNER
-                            })),
-                        )
-                            .into_response();
+                        // #8994 — an unreadable root answers exactly like an
+                        // absent one (pre-fix: 403, an existence oracle).
+                        return crate::handlers::parity::not_visible_refusal(
+                            crate::handlers::parity::RefusedResource::LineageRoot(&id),
+                        );
                     }
                 }
                 Err(crate::store::StoreError::NotFound { .. }) => {
-                    return (
-                        StatusCode::NOT_FOUND,
-                        Json(json!({
-                            "error": crate::errors::msg::SOURCE_MEMORY_NOT_FOUND,
-                            "id": id,
-                        })),
-                    )
-                        .into_response();
+                    return crate::handlers::parity::not_visible_refusal(
+                        crate::handlers::parity::RefusedResource::LineageRoot(&id),
+                    );
                 }
                 Err(e) => return store_err_to_response(e),
             }
@@ -1464,26 +1471,19 @@ pub async fn get_lineage(
     // `db::get` return `Ok(None)` for hidden (tombstoned / quarantined) rows,
     // so the old `if let Ok(Some(mem))` chain skipped the gate for a hidden
     // root and a non-owner walked it. Reading unfiltered keeps a hidden row
-    // owner-checked (non-owner → 403; the owner keeps access to their own
-    // tombstoned root's conserved lineage). A genuinely-absent root still
-    // proceeds to the empty walk (unchanged); a lookup error fails closed.
+    // owner-checked (the owner keeps access to their own tombstoned root's
+    // conserved lineage); a lookup error fails closed.
+    // #8994 — a root the caller cannot read AND an absent root both answer
+    // the postgres branch's ONE not-found shape (pre-fix: 403 for the
+    // former and an empty 200 walk for the latter, an existence oracle).
     {
-        match db::get_any(&lock.0, &id) {
-            Ok(Some(mem))
-                if !crate::visibility::is_readable_on_query(
-                    &mem,
-                    (!caller_is_admin).then_some(caller.as_str()),
-                    Some(&mem.namespace),
-                ) =>
-            {
-                drop(lock);
-                return (
-                    StatusCode::FORBIDDEN,
-                    Json(json!({"error": crate::errors::msg::CALLER_NOT_SOURCE_MEMORY_OWNER})),
-                )
-                    .into_response();
-            }
-            Ok(_) => {}
+        let root_visible = match db::get_any(&lock.0, &id) {
+            Ok(Some(mem)) => crate::visibility::is_readable_on_query(
+                &mem,
+                (!caller_is_admin).then_some(caller.as_str()),
+                Some(&mem.namespace),
+            ),
+            Ok(None) => false,
             Err(e) => {
                 drop(lock);
                 tracing::error!("get_lineage: root ownership lookup failed: {e}");
@@ -1493,6 +1493,12 @@ pub async fn get_lineage(
                 )
                     .into_response();
             }
+        };
+        if !root_visible {
+            drop(lock);
+            return crate::handlers::parity::not_visible_refusal(
+                crate::handlers::parity::RefusedResource::LineageRoot(&id),
+            );
         }
     }
     let walk = if direction == crate::mcp::LINEAGE_DIRECTION_DESCENDANTS {

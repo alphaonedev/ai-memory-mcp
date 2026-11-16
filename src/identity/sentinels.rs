@@ -36,6 +36,12 @@ pub const DAEMON_PRINCIPAL: &str = "daemon";
 /// stored `metadata.agent_id`.
 pub const ANONYMOUS_INVALID: &str = "anonymous:invalid";
 
+/// Audit-trail actor recorded when the HTTP caller-authority resolver
+/// refuses a request before any principal exists (a malformed or
+/// unreadable `X-Agent-Id`, #984 / #9342). It is an audit label only and
+/// is never stamped on a row.
+pub const ANONYMOUS_RESOLVE_FAILED: &str = "anonymous:resolve-failed";
+
 /// Legacy unowned-marker / system principal stamped on legacy-rewrite
 /// rows by `handlers/hook_subscribers.rs`; also matched as the
 /// unowned-marker sentinel in cross-tenant gates.

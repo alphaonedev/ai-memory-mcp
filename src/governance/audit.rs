@@ -1135,6 +1135,17 @@ impl ForensicPayload {
         self.push(key, ForensicField::Commitment(text.as_bytes().to_vec()))
     }
 
+    /// PR 9390 L1 — an identifier the caller CLAIMED and did not prove,
+    /// recorded as data next to the actor that really acted (never as the
+    /// actor). See [`claimed_ident_field`]; `None` renders `null`.
+    pub fn opt_claimed_ident(self, key: &'static str, claimed: Option<&str>) -> Self {
+        let field = claimed.map_or(
+            ForensicField::Value(serde_json::Value::Null),
+            claimed_ident_field,
+        );
+        self.push(key, field)
+    }
+
     /// Optional free-form text as a commitment; `None` renders `null`.
     pub fn opt_commit(self, key: &'static str, text: Option<&str>) -> Self {
         let field = text.map_or(ForensicField::Value(serde_json::Value::Null), |t| {
@@ -1176,6 +1187,52 @@ fn is_forensic_ident(s: &str) -> bool {
             crate::secret_screen::screen(s),
             crate::secret_screen::ScreenOutcome::Clean
         )
+}
+
+/// Marker ending a claimed identifier that [`escape_claimed_ident`] cut.
+pub const FORENSIC_CLAIMED_CUT_MARKER: &str = "...(cut)";
+
+/// PR 9390 L1 — `claimed` as written to a forensic row: every control byte,
+/// newline, quote, backslash and non-ASCII character escaped with
+/// `char::escape_default` (so the result is printable ASCII and one line),
+/// cut on an escape boundary so the result is at most
+/// [`FORENSIC_IDENT_MAX_LEN`] bytes, a cut ending with
+/// [`FORENSIC_CLAIMED_CUT_MARKER`]. Linear in the bytes kept: it stops
+/// reading at the first char that would pass the limit.
+#[must_use]
+pub fn escape_claimed_ident(claimed: &str) -> String {
+    let budget = FORENSIC_IDENT_MAX_LEN - FORENSIC_CLAIMED_CUT_MARKER.len();
+    let mut out = String::with_capacity(claimed.len().min(FORENSIC_IDENT_MAX_LEN));
+    // The length of `out` at the last char boundary that still leaves room
+    // for the cut marker.
+    let mut cut_at = 0;
+    for c in claimed.chars() {
+        let piece = c.escape_default();
+        if out.len() + piece.len() > FORENSIC_IDENT_MAX_LEN {
+            // `out` is ASCII, so every byte offset is a char boundary.
+            out.truncate(cut_at);
+            out.push_str(FORENSIC_CLAIMED_CUT_MARKER);
+            return out;
+        }
+        out.extend(piece);
+        if out.len() <= budget {
+            cut_at = out.len();
+        }
+    }
+    out
+}
+
+/// The field for a claimed identifier: the [`escape_claimed_ident`] text,
+/// or a commitment when that text trips the secret screen (a credential
+/// pasted into an id field is never written verbatim).
+fn claimed_ident_field(claimed: &str) -> ForensicField {
+    let escaped = escape_claimed_ident(claimed);
+    match crate::secret_screen::screen(&escaped) {
+        crate::secret_screen::ScreenOutcome::Clean => ForensicField::Value(escaped.into()),
+        crate::secret_screen::ScreenOutcome::Hit { .. } => {
+            ForensicField::Commitment(claimed.as_bytes().to_vec())
+        }
+    }
 }
 
 fn ident_field(s: &str) -> ForensicField {
@@ -5339,6 +5396,9 @@ pub(crate) fn forensic_sink_test_lock() -> &'static std::sync::Mutex<()> {
 
 #[cfg(test)]
 mod chain_4304_tests;
+
+#[cfg(test)]
+mod claimed_ident_9390_tests;
 
 #[cfg(test)]
 mod writer_spawn_tests_3164 {

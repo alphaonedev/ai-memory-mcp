@@ -4,19 +4,17 @@
 //! #3155 (v1.0.0, security) — `AI_MEMORY_HTTP_REQUIRE_ATTESTED_IDENTITY=enforce`
 //! must not be SILENTLY inert when no per-agent keys are enrolled.
 //!
-//! `enforce_for_request` returns `None` on an empty enrolled map in EVERY mode,
-//! and that is deliberate: the #1985 unsatisfiable-default trap means an
-//! `enforce` posture which refused every named caller when nobody COULD be
-//! key-attested would brick the deployment. The defect is not the inertness,
-//! it is that an operator who DELIBERATELY selected `enforce` got no signal at
-//! all — no boot WARN, no readiness flag — so a deployment could believe it was
-//! refusing spoofed `X-Agent-Id` headers while serving every one of them `200`.
+//! `enforce_for_request` (the per-handler gate) returns `None` on an empty
+//! enrolled map in EVERY mode. #3155 made the `enforce` + zero-keys posture
+//! visible at boot. Since #9341 B-1 (3-agent vote (71472661)) the authority
+//! funnel refuses every unproven NAMED caller in that posture, so the boot
+//! verdict says so instead of calling the posture inert.
 //!
-//! This file pins BOTH halves of the contract:
+//! This file pins:
 //!
-//! 1. the request-path behaviour is UNCHANGED (an empty enrolled map is still
-//!    inert in every mode) — a documented default is never silently tightened;
-//! 2. boot now produces a verdict for exactly the silently-disarmed
+//! 1. the per-handler gate stays inert on an empty map (the funnel refusal is
+//!    pinned in `tests/http_idor_closure_2125_2096.rs`);
+//! 2. boot produces a verdict for exactly the `enforce` + zero-keys
 //!    combination, which the daemon renders as a WARN by default and as a
 //!    refusal under `asi-hard`.
 //!
@@ -39,8 +37,13 @@ fn enforce_with_zero_enrolled_keys_is_reported_at_boot_3155() {
         "the verdict must name the knob the operator set, got: {reason}"
     );
     assert!(
-        reason.contains("INERT"),
-        "the verdict must say plainly that the control is not armed, got: {reason}"
+        reason.contains("attested_identity_required"),
+        "#9341 B-1: the verdict must say named callers are refused, got: {reason}"
+    );
+    assert!(
+        !reason.contains("INERT"),
+        "#9341 B-1: the funnel refuses named callers with zero keys; the verdict \
+         must not call the posture inert, got: {reason}"
     );
     assert!(
         reason.contains("advisory"),
@@ -73,11 +76,13 @@ fn only_the_enforce_posture_produces_a_verdict_3155() {
     }
 }
 
-/// The documented request-path contract is NOT changed by #3155. This is the
-/// "never silently tighten a documented default" half: the fix adds a boot
-/// SIGNAL, it does not start refusing requests that were served before.
+/// The PER-HANDLER gate (`enforce_for_request`) stays inert with an empty
+/// map. The named-caller refusal for this posture lives in the authority
+/// funnel since #9341 B-1 (3-agent vote (71472661)) and is pinned route by
+/// route in `tests/http_idor_closure_2125_2096.rs`
+/// `zero_enrollment_enforce_refuses_named_and_serves_anonymous_on_every_route_9341`.
 #[test]
-fn an_empty_enrolled_map_stays_inert_on_the_request_path_3155() {
+fn an_empty_enrolled_map_keeps_the_per_handler_gate_inert_3155() {
     let enrolled = ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty();
     let mut headers = axum::http::HeaderMap::new();
     headers.insert("x-agent-id", "boss".parse().expect("header value"));

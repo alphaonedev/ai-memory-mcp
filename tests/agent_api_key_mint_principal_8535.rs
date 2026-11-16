@@ -304,10 +304,13 @@ async fn claimed_admin_header_cannot_mint_under_enforce_empty_registry_8535() {
         0,
         "registry stays empty"
     );
+    // 3-agent vote (71472661) B-1: under Enforce the authority layer refuses
+    // the self-asserted admin header before the mint handler runs, keys
+    // enrolled or not, so the recorded denial is the funnel's.
     let audit = forensic_text(&audit_dir);
     assert!(
-        audit.contains(MINT_ACTION) && audit.contains(DENY_REASON),
-        "{audit}"
+        audit.contains("\"attested_identity_required\""),
+        "funnel refusal reason must be recorded exactly: {audit}"
     );
 }
 

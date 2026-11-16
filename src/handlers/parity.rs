@@ -190,7 +190,11 @@ pub(crate) fn resolve_caller_agent_id(
 /// the SAME synthesized principal within a request scope (NOT across
 /// requests — clients that need cross-request visibility on
 /// scope=private memories MUST set `X-Agent-Id` explicitly).
-#[cfg(feature = "sal")]
+///
+/// #9342: every other handler moved to [`http_caller_ctx_checked`];
+/// the one remaining caller is the `sal-postgres` KG branch, so the
+/// legacy helper is gated on that feature.
+#[cfg(feature = "sal-postgres")]
 pub(crate) fn http_caller_ctx(
     headers: &axum::http::HeaderMap,
     body_agent_id: Option<&str>,
@@ -211,6 +215,41 @@ pub(crate) fn http_caller_ctx(
         crate::identity::sentinels::ANONYMOUS_INVALID.to_string()
     });
     crate::store::CallerContext::for_agent(resolved)
+}
+
+/// #9342 — the checked twin of [`http_caller_ctx`]: an invalid
+/// `X-Agent-Id` / body `agent_id` is a typed `400 VALIDATION_FAILED`
+/// returned to the client, never the silent `anonymous:invalid` principal.
+/// Every HTTP handler uses this one; the authority chokepoint already refuses
+/// a malformed header, so this is the defence-in-depth leg for a router built
+/// without the layer and for a malformed body id.
+///
+/// # Errors
+///
+/// The `400` response when the caller's agent id does not resolve.
+#[cfg(feature = "sal")]
+pub(crate) fn http_caller_ctx_checked(
+    headers: &axum::http::HeaderMap,
+    body_agent_id: Option<&str>,
+) -> Result<crate::store::CallerContext, axum::response::Response> {
+    use axum::response::IntoResponse as _;
+    resolve_caller_agent_id(body_agent_id, headers, None)
+        .map(crate::store::CallerContext::for_agent)
+        .map_err(|e| {
+            tracing::warn!(
+                target: "handlers::parity",
+                error = %e,
+                "#9342 http_caller_ctx_checked: refused an invalid X-Agent-Id / body.agent_id"
+            );
+            (
+                axum::http::StatusCode::BAD_REQUEST,
+                axum::Json(serde_json::json!({
+                    "code": crate::errors::error_codes::VALIDATION_FAILED,
+                    "error": e.to_string(),
+                })),
+            )
+                .into_response()
+        })
 }
 
 /// #1886 / #1911 — single SSOT for the create / bulk-create `expires_at`
@@ -446,6 +485,46 @@ mod resolve_create_expires_at_tests {
     }
 }
 
+#[cfg(all(test, feature = "sal"))]
+mod http_caller_ctx_checked_tests_9342 {
+    use super::http_caller_ctx_checked;
+    use axum::http::{HeaderMap, HeaderValue, StatusCode};
+
+    fn headers(agent: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(
+            crate::HEADER_AGENT_ID,
+            HeaderValue::from_str(agent).expect("header"),
+        );
+        h
+    }
+
+    #[test]
+    fn invalid_header_is_a_400_not_anonymous_invalid_9342() {
+        let refusal = http_caller_ctx_checked(&headers("bad id with spaces"), None)
+            .expect_err("an invalid X-Agent-Id must be refused");
+        assert_eq!(refusal.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn valid_header_resolves_to_that_principal_9342() {
+        let ctx = http_caller_ctx_checked(&headers("alice"), None).expect("valid");
+        assert_eq!(ctx.effective_principal(), "alice");
+    }
+
+    #[test]
+    fn absent_header_is_the_per_request_anonymous_principal_9342() {
+        let ctx = http_caller_ctx_checked(&HeaderMap::new(), None).expect("anonymous");
+        assert!(crate::identity::is_anonymous_request_id(
+            ctx.effective_principal()
+        ));
+        assert_ne!(
+            ctx.effective_principal(),
+            crate::identity::sentinels::ANONYMOUS_INVALID
+        );
+    }
+}
+
 #[cfg(test)]
 mod require_caller_owns_memory_tests {
     use super::*;
@@ -457,7 +536,7 @@ mod require_caller_owns_memory_tests {
             crate::identity::owner_stamp::funnel::UPDATE,
         );
 
-    fn mem_with(metadata: serde_json::Value) -> Memory {
+    pub(super) fn mem_with(metadata: serde_json::Value) -> Memory {
         Memory {
             cid: None,
             valid_from: None,
@@ -552,16 +631,53 @@ mod require_caller_owns_memory_tests {
         assert!(body.get("owner").is_none());
     }
 
-    /// #3124 rule (e) census — the pre-#3124 pin: an unstamped row passes
-    /// the HTTP gate. It is the `warn` (default) posture; the `refuse` twin
-    /// below is the single cross-backend policy's other half.
+    /// #3124 rule (e) census — the pre-#3124 pin: an unstamped row the
+    /// caller can READ passes the HTTP gate. It is the `warn` (default)
+    /// posture; the `refuse` twin below is the single cross-backend
+    /// policy's other half. PR 9390: the row is `collective` because an
+    /// unstamped `private` row is hidden from bob (cell below).
     #[test]
     fn legacy_unowned_passes() {
         use crate::identity::owner_stamp::UnstampedMutationMode::Warn;
-        let mem = mem_with(json!({}));
+        let mem = mem_with(json!({"scope": "collective"}));
         assert!(require_caller_owns_memory_with_mode(&mem, "bob", false, SITE, Warn).is_none());
-        let mem = mem_with(json!({"agent_id": ""}));
+        let mem = mem_with(json!({"agent_id": "", "scope": "collective"}));
         assert!(require_caller_owns_memory_with_mode(&mem, "bob", false, SITE, Warn).is_none());
+    }
+
+    /// PR 9390 (security M1) — an UNSTAMPED row gets the same visibility
+    /// verdict as a stamped one, BEFORE the #3124 posture: a private
+    /// unstamped row (missing scope is private) answers bob the read
+    /// path's 404 in both postures, byte-equal to a hidden stamped row,
+    /// never an admission and never the 403 that confirms the id.
+    #[tokio::test]
+    async fn unstamped_private_row_is_hidden_before_the_posture_9390() {
+        use crate::identity::owner_stamp::UnstampedMutationMode::{Refuse, Warn};
+        let hidden_body = axum::body::to_bytes(hidden_row_refusal().into_body(), 4096)
+            .await
+            .map(|b| b.to_vec())
+            .unwrap_or_default();
+        for meta in [
+            json!({}),
+            json!({"scope": "private"}),
+            json!({"agent_id": "", "scope": "private"}),
+            json!({"agent_id": null}),
+        ] {
+            for mode in [Warn, Refuse] {
+                let mem = mem_with(meta.clone());
+                let resp = require_caller_owns_memory_with_mode(&mem, "bob", false, SITE, mode)
+                    .unwrap_or_else(|| panic!("{meta} {mode:?}: hidden row admitted"));
+                assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{meta} {mode:?}");
+                let body = axum::body::to_bytes(resp.into_body(), 4096)
+                    .await
+                    .map(|b| b.to_vec())
+                    .unwrap_or_default();
+                assert_eq!(body, hidden_body, "{meta} {mode:?}: one hidden-row body");
+            }
+        }
+        // The daemon reads every row and stays admitted.
+        let mem = mem_with(json!({"scope": "private"}));
+        assert!(require_caller_owns_memory_with_mode(&mem, "daemon", false, SITE, Warn).is_none());
     }
 
     #[test]
@@ -704,16 +820,28 @@ pub(crate) fn require_caller_owns_memory_with_mode(
     mode: crate::identity::owner_stamp::UnstampedMutationMode,
 ) -> Option<axum::response::Response> {
     use crate::identity::owner_stamp::{OwnerStamp, REASON_UNSTAMPED_REFUSED};
-    if caller == crate::identity::sentinels::DAEMON_PRINCIPAL
-        || crate::identity::owner_stamp::metadata_admits_mutation_with_mode(
-            &mem.metadata,
-            &mem.id,
-            caller,
-            allow_inbox,
-            site,
-            mode,
-        )
+    if caller == crate::identity::sentinels::DAEMON_PRINCIPAL {
+        return None;
+    }
+    // PR 9390 M1 — the visibility verdict comes FIRST for an unstamped row:
+    // the #3124 `warn` posture admits an unstamped row for any caller, so
+    // pre-fix a row the caller cannot read was written (PUT / DELETE /
+    // promote) and answered 2xx where an absent id answered 404. A hidden
+    // row now answers exactly like an absent one and nothing is written; a
+    // VISIBLE unstamped row still meets the #3124 gate below unchanged.
+    if OwnerStamp::of(&mem.metadata).is_unstamped()
+        && !crate::visibility::is_readable_on_query(mem, Some(caller), Some(&mem.namespace))
     {
+        return Some(hidden_row_refusal());
+    }
+    if crate::identity::owner_stamp::metadata_admits_mutation_with_mode(
+        &mem.metadata,
+        &mem.id,
+        caller,
+        allow_inbox,
+        site,
+        mode,
+    ) {
         return None;
     }
     let stamp = OwnerStamp::of(&mem.metadata);
@@ -789,6 +917,9 @@ pub enum RefusedResource<'a> {
     /// #3407 — the webhook subscription the caller asked to remove, echoed
     /// as `id` (the same key the success envelope uses).
     Subscription(&'a str),
+    /// #8994 — the root row of a lineage walk, echoed as `id` (the key the
+    /// lineage success envelope uses).
+    LineageRoot(&'a str),
 }
 
 impl RefusedResource<'_> {
@@ -811,7 +942,7 @@ impl RefusedResource<'_> {
             Self::Namespace(namespace) => {
                 body.insert("namespace".to_string(), json!(namespace));
             }
-            Self::Subscription(id) => {
+            Self::Subscription(id) | Self::LineageRoot(id) => {
                 body.insert("id".to_string(), json!(id));
             }
         }
@@ -891,4 +1022,345 @@ fn owner_gate_refusal_body(
 #[must_use]
 pub fn hidden_row_refusal() -> axum::response::Response {
     (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response()
+}
+
+/// #8994 — whether the caller may READ a row an id-addressed route found.
+///
+/// A route that finds a row the caller cannot read must answer exactly as
+/// it answers for an id that names no row at all; otherwise the answer is
+/// an existence oracle for private rows. The verdict is the canonical read
+/// funnel (#3348/#3549) with the row's own namespace named, the same
+/// predicate [`require_caller_owns_memory_with_mode`] consults. The daemon
+/// principal reads everything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowVisibility {
+    /// The caller may read the row; an ownership refusal stays `403`.
+    Visible,
+    /// The caller may not read the row (or no row exists): the route
+    /// answers its own not-found shape via [`not_visible_refusal`].
+    NotVisible,
+}
+
+impl RowVisibility {
+    /// The read-funnel verdict for `mem` as seen by `caller`.
+    #[must_use]
+    pub fn of(mem: &Memory, caller: &str) -> Self {
+        if caller == crate::identity::sentinels::DAEMON_PRINCIPAL
+            || crate::visibility::is_readable_on_query(mem, Some(caller), Some(&mem.namespace))
+        {
+            Self::Visible
+        } else {
+            Self::NotVisible
+        }
+    }
+
+    /// The verdict from a visibility-scoped lookup (the postgres
+    /// `store.get` with the caller's context): a row it returned is
+    /// visible, a row it did not return is not.
+    #[must_use]
+    pub fn from_scoped_lookup(found: bool) -> Self {
+        if found {
+            Self::Visible
+        } else {
+            Self::NotVisible
+        }
+    }
+}
+
+/// #8994 — the ONE not-found answer per refused resource, used for a row
+/// that does not exist AND for a row the caller cannot read, on both
+/// backends, so the two cases are byte-identical on the wire.
+///
+/// - [`RefusedResource::SourceMemory`]: `404 {"error": SOURCE_MEMORY_NOT_FOUND, "source_id"}`
+/// - [`RefusedResource::LineageRoot`]: `404 {"error": SOURCE_MEMORY_NOT_FOUND, "id"}`
+/// - every other resource: [`hidden_row_refusal`] (`404 {"error": "not found"}`)
+///
+/// Every echoed id was supplied by the caller, so it discloses nothing.
+#[must_use]
+pub fn not_visible_refusal(resource: RefusedResource<'_>) -> axum::response::Response {
+    match resource {
+        RefusedResource::SourceMemory(_) | RefusedResource::LineageRoot(_) => {
+            let mut body = serde_json::Map::new();
+            body.insert(
+                "error".to_string(),
+                json!(crate::errors::msg::SOURCE_MEMORY_NOT_FOUND),
+            );
+            resource.write_into(&mut body);
+            (StatusCode::NOT_FOUND, Json(serde_json::Value::Object(body))).into_response()
+        }
+        RefusedResource::Memory(_)
+        | RefusedResource::Link { .. }
+        | RefusedResource::Namespace(_)
+        | RefusedResource::Subscription(_) => hidden_row_refusal(),
+    }
+}
+
+/// #8994 / #9043 — the one unlink gate both backends of `DELETE
+/// /api/v1/links` consult.
+///
+/// `source` is the source row **only when the caller can read it** (`None`
+/// for a source that is absent OR not visible). `target` is the target row
+/// when one was found, with its [`RowVisibility`]; a visibility-scoped
+/// lookup (postgres) only ever hands in visible targets. The ownership
+/// predicate sees the target row whatever its visibility, so hiding a row
+/// never widens an admission.
+///
+/// - daemon: admitted (`None`);
+/// - neither endpoint visible: [`not_visible_refusal`] for the link, so a
+///   private pair answers like a decoy pair and nothing is written;
+/// - the source visible: the canonical `unlink_admitted` predicate;
+/// - the source absent or not visible: the same [`not_visible_refusal`]
+///   whatever the target (PR 9390 L3: pre-fix the owner of the target was
+///   admitted, so it could remove a link from another agent's hidden source
+///   and learn the source exists);
+/// - otherwise `403 NOT_OWNER` with [`crate::errors::msg::CALLER_NOT_LINK_ENDPOINT_OWNER`].
+#[must_use]
+pub fn unlink_gate(
+    source: Option<&Memory>,
+    target: Option<(&Memory, RowVisibility)>,
+    source_id: &str,
+    target_id: &str,
+    caller: &str,
+    site: crate::identity::owner_stamp::MutationSite,
+) -> Option<axum::response::Response> {
+    use crate::identity::owner_stamp::unlink_admitted;
+    if caller == crate::identity::sentinels::DAEMON_PRINCIPAL {
+        return None;
+    }
+    let resource = RefusedResource::Link {
+        source_id,
+        target_id,
+    };
+    let Some(src) = source else {
+        return Some(not_visible_refusal(resource));
+    };
+    let admitted = unlink_admitted(
+        &src.metadata,
+        target.map(|(t, _)| &t.metadata),
+        source_id,
+        caller,
+        site,
+    );
+    if admitted {
+        return None;
+    }
+    tracing::warn!(
+        target: super::AUTHZ_TRACE_TARGET,
+        "DELETE /api/v1/links 403: caller {caller} owns neither endpoint \
+         (source_id={source_id}, target_id={target_id})"
+    );
+    Some(owner_gate_refusal(
+        crate::errors::msg::CALLER_NOT_LINK_ENDPOINT_OWNER,
+        Some(caller),
+        resource,
+    ))
+}
+
+#[cfg(test)]
+mod not_visible_refusal_tests_8994 {
+    use super::*;
+    use serde_json::json;
+
+    const SITE: crate::identity::owner_stamp::MutationSite =
+        crate::identity::owner_stamp::MutationSite::sqlite(
+            crate::identity::owner_stamp::funnel::UNLINK,
+        );
+    const OWNER: &str = "ai:alice";
+    const STRANGER: &str = "ai:mallory";
+
+    fn mem(id: &str, owner: &str, scope: &str) -> Memory {
+        let mut m = super::require_caller_owns_memory_tests::mem_with(json!({
+            "agent_id": owner,
+            "scope": scope,
+        }));
+        m.id = id.to_string();
+        m
+    }
+
+    async fn body_of(resp: axum::response::Response) -> (StatusCode, Vec<u8>) {
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .map(|b| b.to_vec())
+            .unwrap_or_default();
+        (status, bytes)
+    }
+
+    #[test]
+    fn visibility_follows_the_canonical_read_predicate() {
+        let private = mem("p", OWNER, "private");
+        let collective = mem("c", OWNER, "collective");
+        assert_eq!(RowVisibility::of(&private, OWNER), RowVisibility::Visible);
+        assert_eq!(
+            RowVisibility::of(&private, STRANGER),
+            RowVisibility::NotVisible
+        );
+        assert_eq!(
+            RowVisibility::of(&collective, STRANGER),
+            RowVisibility::Visible
+        );
+        assert_eq!(
+            RowVisibility::of(&private, crate::identity::sentinels::DAEMON_PRINCIPAL),
+            RowVisibility::Visible
+        );
+        assert_eq!(
+            RowVisibility::from_scoped_lookup(true),
+            RowVisibility::Visible
+        );
+        assert_eq!(
+            RowVisibility::from_scoped_lookup(false),
+            RowVisibility::NotVisible
+        );
+    }
+
+    #[tokio::test]
+    async fn not_visible_refusal_bodies_are_exact() {
+        let (s, b) = body_of(not_visible_refusal(RefusedResource::SourceMemory("x1"))).await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+        let v: serde_json::Value = serde_json::from_slice(&b).unwrap_or_default();
+        assert_eq!(
+            v,
+            json!({"error": crate::errors::msg::SOURCE_MEMORY_NOT_FOUND, "source_id": "x1"})
+        );
+        let (s, b) = body_of(not_visible_refusal(RefusedResource::LineageRoot("r1"))).await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+        let v: serde_json::Value = serde_json::from_slice(&b).unwrap_or_default();
+        assert_eq!(
+            v,
+            json!({"error": crate::errors::msg::SOURCE_MEMORY_NOT_FOUND, "id": "r1"})
+        );
+        for resource in [
+            RefusedResource::Memory("m1"),
+            RefusedResource::Link {
+                source_id: "a",
+                target_id: "b",
+            },
+        ] {
+            let (s, b) = body_of(not_visible_refusal(resource)).await;
+            assert_eq!(s, StatusCode::NOT_FOUND);
+            let (hs, hb) = body_of(hidden_row_refusal()).await;
+            assert_eq!((s, b), (hs, hb), "one hidden-row shape for {resource:?}");
+        }
+    }
+
+    /// The private pair and the decoy pair are byte-identical for a
+    /// stranger; a visible pair the stranger does not own keeps 403.
+    #[tokio::test]
+    async fn unlink_gate_private_pair_equals_decoy_pair() {
+        let src = mem("s", OWNER, "private");
+        let tgt = mem("t", OWNER, "private");
+        let private = unlink_gate(
+            None,
+            Some((&tgt, RowVisibility::of(&tgt, STRANGER))),
+            "s",
+            "t",
+            STRANGER,
+            SITE,
+        );
+        let decoy = unlink_gate(None, None, "s", "t", STRANGER, SITE);
+        let (ps, pb) =
+            body_of(private.unwrap_or_else(|| (StatusCode::OK, "").into_response())).await;
+        let (ds, db) = body_of(decoy.unwrap_or_else(|| (StatusCode::OK, "").into_response())).await;
+        assert_eq!(ps, StatusCode::NOT_FOUND);
+        assert_eq!((ps, pb), (ds, db));
+
+        let csrc = mem("s", OWNER, "collective");
+        let refused = unlink_gate(Some(&csrc), None, "s", "t", STRANGER, SITE);
+        let (rs, _) =
+            body_of(refused.unwrap_or_else(|| (StatusCode::OK, "").into_response())).await;
+        assert_eq!(rs, StatusCode::FORBIDDEN, "visible but not owned keeps 403");
+
+        assert!(
+            unlink_gate(
+                Some(&src),
+                Some((&tgt, RowVisibility::Visible)),
+                "s",
+                "t",
+                OWNER,
+                SITE
+            )
+            .is_none()
+        );
+        assert!(
+            unlink_gate(
+                None,
+                None,
+                "s",
+                "t",
+                crate::identity::sentinels::DAEMON_PRINCIPAL,
+                SITE
+            )
+            .is_none()
+        );
+    }
+
+    /// PR 9390 (code L3) — a source the caller cannot see answers like
+    /// `(None, None)` even when the caller owns (and sees) the target:
+    /// the target owner deleting the edge would be a 200-versus-404
+    /// existence oracle on the hidden source.
+    #[tokio::test]
+    async fn unlink_gate_hidden_source_owned_target_equals_decoy_9390() {
+        let decoy = unlink_gate(None, None, "s", "t", STRANGER, SITE);
+        let (ds, db) = body_of(decoy.unwrap_or_else(|| (StatusCode::OK, "").into_response())).await;
+        assert_eq!(ds, StatusCode::NOT_FOUND);
+        for scope in ["private", "collective"] {
+            let tgt = mem("t", STRANGER, scope);
+            let hidden_source = unlink_gate(
+                None,
+                Some((&tgt, RowVisibility::of(&tgt, STRANGER))),
+                "s",
+                "t",
+                STRANGER,
+                SITE,
+            );
+            let (hs, hb) =
+                body_of(hidden_source.unwrap_or_else(|| (StatusCode::OK, "").into_response()))
+                    .await;
+            assert_eq!(
+                (hs, hb),
+                (ds, db.clone()),
+                "{scope} owned target, hidden source answers like the decoy pair"
+            );
+        }
+    }
+
+    /// PR 9390 M1 — a refusal on a row the caller cannot read renders as
+    /// not-found for EVERY reason (the PostgreSQL #1628 unstamped reasons
+    /// included), byte-equal to the owner-reason refusal.
+    #[cfg(feature = "sal")]
+    #[tokio::test]
+    async fn not_visible_refusal_hides_every_reason_9390() {
+        use crate::store::StoreError;
+        let deny = |reason: &str| StoreError::PermissionDenied {
+            action: "update".into(),
+            target: "row-9390".into(),
+            reason: reason.into(),
+        };
+        let (ws, wb) = body_of(super::super::store_err_to_response_for(
+            deny(crate::errors::msg::CALLER_DOES_NOT_OWN_MEMORY),
+            RowVisibility::NotVisible,
+        ))
+        .await;
+        assert_eq!(ws, StatusCode::NOT_FOUND);
+        for reason in [
+            "memory has no agent_id stamp; tenant writes refused (use admin path)",
+            "memory has no agent_id stamp; tenant deletes refused (use admin path)",
+            "memory has no agent_id stamp; tenant archives refused (use admin path)",
+            "any other refusal reason",
+        ] {
+            let (s, b) = body_of(super::super::store_err_to_response_for(
+                deny(reason),
+                RowVisibility::NotVisible,
+            ))
+            .await;
+            assert_eq!((s, b), (ws, wb.clone()), "{reason}");
+            // A visible row keeps its 403: the refusal is about ownership.
+            let (vs, _) = body_of(super::super::store_err_to_response_for(
+                deny(reason),
+                RowVisibility::Visible,
+            ))
+            .await;
+            assert_eq!(vs, StatusCode::FORBIDDEN, "{reason}");
+        }
+    }
 }

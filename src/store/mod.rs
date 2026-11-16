@@ -3807,6 +3807,7 @@ pub trait MemoryStore: Send + Sync {
     /// `UnsupportedCapability`.
     async fn list_recall_observations(
         &self,
+        _scope: crate::observations::ObservationScope<'_>,
         _recall_id: Option<&str>,
         _consumed: Option<bool>,
         _since: Option<&str>,
@@ -6608,9 +6609,16 @@ mod tests {
             StoreError::UnsupportedCapability { .. }
         ));
         assert!(matches!(
-            s.list_recall_observations(None, None, None, None, 10)
-                .await
-                .unwrap_err(),
+            s.list_recall_observations(
+                crate::observations::ObservationScope::All,
+                None,
+                None,
+                None,
+                None,
+                10
+            )
+            .await
+            .unwrap_err(),
             StoreError::UnsupportedCapability { .. }
         ));
         assert!(matches!(

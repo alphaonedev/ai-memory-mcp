@@ -5824,7 +5824,7 @@ async fn http_delete_link_rejects_self_link() {
 }
 
 #[tokio::test]
-async fn http_delete_link_returns_deleted_false_when_missing() {
+async fn http_delete_link_returns_404_not_found_when_missing_8994() {
     let state = test_state();
     let app = Router::new()
         .route("/api/v1/links", axum::routing::delete(delete_link))
@@ -5845,12 +5845,14 @@ async fn http_delete_link_returns_deleted_false_when_missing() {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
+    // #8994 / #9043 — neither endpoint exists: the link's not-found shape,
+    // nothing written (pre-fix: 200 {"deleted": false}).
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
         .await
         .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(v["deleted"], serde_json::json!(false));
+    assert_eq!(v, serde_json::json!({"error": "not found"}));
 }
 
 #[tokio::test]
@@ -6197,7 +6199,20 @@ async fn http_lineage_private_root_refused_for_stranger_1859() {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    // #8994 — an unreadable root answers exactly like an absent one
+    // (pre-fix: 403 {"error": CALLER_NOT_SOURCE_MEMORY_OWNER}).
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        v,
+        serde_json::json!({
+            "error": crate::errors::msg::SOURCE_MEMORY_NOT_FOUND,
+            "id": id,
+        })
+    );
 
     let resp = app
         .oneshot(
@@ -6309,10 +6324,23 @@ async fn http_lineage_tombstoned_root_conserved_for_owner_refused_for_stranger_3
         )
         .await
         .unwrap();
+    // #8994 — refused with the ONE not-found shape an absent root gets
+    // (pre-fix: 403, which confirmed the tombstoned root exists).
     assert_eq!(
         resp.status(),
-        StatusCode::FORBIDDEN,
+        StatusCode::NOT_FOUND,
         "stranger must be refused a hidden root's lineage"
+    );
+    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        v,
+        serde_json::json!({
+            "error": crate::errors::msg::SOURCE_MEMORY_NOT_FOUND,
+            "id": root,
+        })
     );
 
     // Owner: conserved lineage of their own tombstoned root (200 + ancestor).
@@ -16661,6 +16689,7 @@ struct B17B2FaultStore {
     probe_fault: bool,
     delete_calls: std::sync::atomic::AtomicUsize,
     forget_calls: std::sync::atomic::AtomicUsize,
+    update_calls: std::sync::atomic::AtomicUsize,
 }
 
 #[cfg(feature = "sal")]
@@ -16671,6 +16700,7 @@ impl B17B2FaultStore {
             probe_fault: false,
             delete_calls: std::sync::atomic::AtomicUsize::new(0),
             forget_calls: std::sync::atomic::AtomicUsize::new(0),
+            update_calls: std::sync::atomic::AtomicUsize::new(0),
         }
     }
     fn probe_fault() -> Self {
@@ -16679,6 +16709,7 @@ impl B17B2FaultStore {
             probe_fault: true,
             delete_calls: std::sync::atomic::AtomicUsize::new(0),
             forget_calls: std::sync::atomic::AtomicUsize::new(0),
+            update_calls: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 }
@@ -16716,6 +16747,8 @@ impl crate::store::MemoryStore for B17B2FaultStore {
         _id: &str,
         _patch: crate::store::UpdatePatch,
     ) -> crate::store::StoreResult<()> {
+        self.update_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(())
     }
     async fn delete(
@@ -16904,6 +16937,44 @@ async fn postgres_delete_pre_get_fault_is_503_and_does_not_delete_3228() {
         store.delete_calls.load(Ordering::SeqCst),
         0,
         "#3228: delete must not run after a pre-get fault"
+    );
+}
+
+/// PR 9390 L2 — a store error on the PUT pre-get is the error, never "not
+/// visible": the route answers the backend's 503 and the update never runs.
+#[cfg(feature = "sal")]
+#[tokio::test]
+async fn postgres_update_pre_get_fault_is_503_and_does_not_update_9390() {
+    use std::sync::atomic::Ordering;
+    let store = Arc::new(B17B2FaultStore::get_fault());
+    let app = Router::new()
+        .route("/api/v1/memories/{id}", axum::routing::put(update_memory))
+        .with_state(b17_b2_state_with_store(
+            store.clone(),
+            StorageBackend::Postgres,
+            vec!["alice".to_string()],
+        ));
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/api/v1/memories/mem-9390")
+                .method("PUT")
+                .header("x-agent-id", "alice")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"content":"overwrite-9390"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "PR 9390 L2: a pre-get fault answers its own status"
+    );
+    assert_eq!(
+        store.update_calls.load(Ordering::SeqCst),
+        0,
+        "PR 9390 L2: update must not run after a pre-get fault"
     );
 }
 

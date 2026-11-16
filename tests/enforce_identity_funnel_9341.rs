@@ -1,0 +1,2323 @@
+// Copyright 2026 AlphaOne LLC
+// SPDX-License-Identifier: Apache-2.0
+
+//! #9341 / #8502 / #8590 — the Enforce identity funnel, behavioural cells.
+//!
+//! Invariant: under `HttpIdentityMode::Enforce` with at least one per-agent
+//! key enrolled, no request reaches a handler with a NAMED principal that is
+//! not proven (an enrolled per-agent key bound to that agent, or an mTLS
+//! client certificate mapped to that agent, #8357). A shared-key caller that
+//! names an agent is refused 403 `attested_identity_required` in ONE place
+//! (`authority_layer`), before any extractor or handler runs, on every route
+//! of [`route_table::ROUTE_TABLE`] that is not exempt.
+//!
+//! The backend is SQLite by default; with `--features sal-postgres` and
+//! `AI_MEMORY_TEST_POSTGRES_URL` set (the ci-v2-pg wrapper) the same cells run
+//! against a `PostgresStore`.
+
+#![cfg(feature = "sal")]
+#![allow(clippy::missing_panics_doc, clippy::too_many_lines)]
+
+#[path = "enforce_funnel_9341_common/route_table.rs"]
+mod route_table;
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+
+use ai_memory::config::{FeatureTier, HttpIdentityMode, ResolvedScoring, ResolvedTtl};
+use ai_memory::errors::error_codes::VALIDATION_FAILED;
+use ai_memory::handlers::identity_binding::{EnrolledAgentKeys, api_key_sha256_hex};
+use ai_memory::handlers::{ApiKeyState, AppState, Db};
+use ai_memory::mtls_agent_binding::{AgentBindingMode, ClientCertAgentBinding};
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
+use route_table::{AUDIT_UNGATED_ROUTES, ROUTE_TABLE, RouteClass, RouteRow, concrete_path};
+use tempfile::NamedTempFile;
+use tower::ServiceExt as _;
+
+const SHARED_KEY: &str = "shared-key-9341";
+const ALICE_KEY: &str = "alice-per-agent-key-9341";
+const BOB_KEY: &str = "bob-per-agent-key-9341";
+const ALICE: &str = "alice";
+const BOB: &str = "bob";
+/// #9366: an enrolled admin that is neither alice nor bob.
+const CAROL_KEY: &str = "carol-admin-per-agent-key-9366";
+const CAROL: &str = "carol";
+/// B-3: a well-formed id no row carries, for the input-echo control.
+const B3_DECOY_ID: &str = "00000000-0000-4000-8000-000000009366";
+/// The wire code of the one funnel refusal.
+const ATTESTED_IDENTITY_REQUIRED: &str = "attested_identity_required";
+/// The wire code `api_key_auth` returns for a per-agent key whose agent
+/// differs from the claimed header.
+const IDENTITY_BINDING_MISMATCH: &str = "identity_binding_mismatch";
+/// Per-request ceiling: a handler that blocks is a finding, never a hang.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const BODY_LIMIT: usize = 1 << 20;
+/// Ceiling on reading a response body (a stream route never ends).
+const BODY_READ_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Keeps the per-test database file alive for the router's lifetime.
+struct Fixture {
+    router: axum::Router,
+    /// The router's own store, for seeding rows HTTP refuses to write
+    /// (substrate namespaces) and for reading back what a refusal wrote.
+    store: Arc<dyn ai_memory::store::MemoryStore>,
+    /// Which backend `store` is (the #3124 unstamped posture differs).
+    backend: ai_memory::handlers::StorageBackend,
+    _db_file: NamedTempFile,
+}
+
+fn enrolled(with_keys: bool) -> Arc<EnrolledAgentKeys> {
+    let mut map = HashMap::new();
+    if with_keys {
+        map.insert(api_key_sha256_hex(ALICE_KEY), ALICE.to_string());
+        map.insert(api_key_sha256_hex(BOB_KEY), BOB.to_string());
+        map.insert(api_key_sha256_hex(CAROL_KEY), CAROL.to_string());
+    }
+    Arc::new(EnrolledAgentKeys::from_map(map))
+}
+
+#[cfg_attr(not(feature = "sal-postgres"), allow(clippy::unused_async))]
+async fn store_for(
+    db_path: &std::path::Path,
+) -> (
+    Arc<dyn ai_memory::store::MemoryStore>,
+    ai_memory::handlers::StorageBackend,
+) {
+    #[cfg(feature = "sal-postgres")]
+    if let Ok(url) = std::env::var("AI_MEMORY_TEST_POSTGRES_URL") {
+        let pg = ai_memory::store::postgres::PostgresStore::connect(&url)
+            .await
+            .expect("connect postgres");
+        return (Arc::new(pg), ai_memory::handlers::StorageBackend::Postgres);
+    }
+    (
+        Arc::new(ai_memory::store::sqlite::SqliteStore::open(db_path).expect("sqlite store")),
+        ai_memory::handlers::StorageBackend::Sqlite,
+    )
+}
+
+/// Writes in this binary exercise the identity funnel, not the #8357 body
+/// attestation gate: turn the attestation requirement off once per process
+/// (the `mtls_agent_binding_8357` precedent).
+fn permissive_attestation_for_tests() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        // SAFETY: set once, before any router of this binary reads it; no
+        // other thread of this test binary writes the environment.
+        unsafe { std::env::set_var("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0") };
+    });
+}
+
+/// Build the in-process router: shared key configured, `mode`, and (when
+/// `with_keys`) alice and bob each enrolled with a per-agent key.
+async fn build(mode: HttpIdentityMode, with_keys: bool) -> Fixture {
+    build_with(mode, with_keys, Some(SHARED_KEY)).await
+}
+
+/// The fixture with the shared key configured (`Some`) or not (`None`).
+async fn build_with(mode: HttpIdentityMode, with_keys: bool, shared_key: Option<&str>) -> Fixture {
+    build_with_admin(mode, with_keys, shared_key, ALICE).await
+}
+
+/// [`build_with`] with `admin` as the one allowlisted admin id.
+async fn build_with_admin(
+    mode: HttpIdentityMode,
+    with_keys: bool,
+    shared_key: Option<&str>,
+    admin: &str,
+) -> Fixture {
+    permissive_attestation_for_tests();
+    ai_memory::handlers::admin_role::mark_request_authn_configured(true);
+    let f = NamedTempFile::new().expect("tempfile");
+    let db_path = f.path().to_path_buf();
+    let conn = ai_memory::db::open(&db_path).expect("open db");
+    let db: Db = Arc::new(tokio::sync::Mutex::new((
+        conn,
+        db_path.clone(),
+        ResolvedTtl::default(),
+        true,
+    )));
+    let (store, storage_backend) = store_for(&db_path).await;
+    let keys = enrolled(with_keys);
+    let app_state = AppState {
+        db,
+        embedder: Arc::new(None),
+        vector_index: Arc::new(tokio::sync::Mutex::new(None)),
+        federation: Arc::new(None),
+        tier_config: Arc::new(FeatureTier::Keyword.config()),
+        scoring: Arc::new(ResolvedScoring::default()),
+        profile: Arc::new(ai_memory::profile::Profile::core()),
+        mcp_config: Arc::new(None),
+        active_keypair: Arc::new(None),
+        family_embeddings: Arc::new(tokio::sync::RwLock::new(Some(Vec::new()))),
+        storage_backend,
+        store: store.clone(),
+        llm: Arc::new(ai_memory::reload::SwappableLlm::new(None)),
+        auto_tag_model: Arc::new(None),
+        llm_call_timeout: Duration::from_secs(30),
+        replay_cache: Arc::new(ai_memory::identity::replay::ReplayCache::default()),
+        verify_require_nonce: false,
+        federation_nonce_cache: Arc::new(
+            ai_memory::identity::replay::FederationNonceCache::default(),
+        ),
+        autonomous_hooks: false,
+        auto_tag_queue: None,
+        atomise_queue: None,
+        recall_scope: Arc::new(None),
+        deferred_audit_queue: Arc::new(None),
+        admin_agent_ids: Arc::new(vec![admin.to_string()]),
+        rule_cache: Arc::new(ai_memory::governance::rule_cache::RuleCache::new()),
+        resolved_models: Arc::new(ai_memory::reload::Swappable::new(
+            ai_memory::config::ResolvedModels::default(),
+        )),
+        runtime: ai_memory::runtime_context::RuntimeContext::global_arc(),
+        max_page_size: ai_memory::handlers::MAX_BULK_SIZE,
+        enrolled_agent_keys: keys.clone(),
+        http_identity_mode: mode,
+    };
+    let api_key_state = ApiKeyState {
+        key: shared_key.map(str::to_string),
+        mtls_enforced: false,
+        enrolled_agent_keys: keys,
+        identity_mode: mode,
+        ..Default::default()
+    };
+    Fixture {
+        router: ai_memory::build_router(api_key_state, app_state),
+        store,
+        backend: storage_backend,
+        _db_file: f,
+    }
+}
+
+/// One request's observable outcome.
+#[derive(Debug)]
+struct Outcome {
+    status: StatusCode,
+    body: serde_json::Value,
+}
+
+impl Outcome {
+    fn error_code(&self) -> &str {
+        self.body
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+    }
+    fn code(&self) -> &str {
+        self.body
+            .get("code")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+    }
+    fn is_funnel_refusal(&self) -> bool {
+        self.status == StatusCode::FORBIDDEN && self.error_code() == ATTESTED_IDENTITY_REQUIRED
+    }
+    /// The postgres route gate's 501 for a route the postgres backend does
+    /// not serve. That gate wraps the router outside every auth layer, so no
+    /// handler runs and nothing is served: a fail-closed outcome for the
+    /// route sweeps, emitted only when the fixture runs on postgres.
+    fn is_backend_gate_refusal(&self) -> bool {
+        self.status == StatusCode::NOT_IMPLEMENTED
+            && self
+                .body
+                .get("storage_backend")
+                .and_then(serde_json::Value::as_str)
+                == Some("postgres")
+    }
+}
+
+async fn send(router: &axum::Router, req: Request<Body>) -> Outcome {
+    let fut = router.clone().oneshot(req);
+    let Ok(resp) = tokio::time::timeout(REQUEST_TIMEOUT, fut).await else {
+        return Outcome {
+            status: StatusCode::REQUEST_TIMEOUT,
+            body: serde_json::json!({"error": "test-timeout"}),
+        };
+    };
+    let resp = resp.expect("infallible router");
+    let status = resp.status();
+    // A streaming (SSE) body never ends: bound the read too and keep the
+    // status, which is all a streaming route's cell needs.
+    let bytes = match tokio::time::timeout(
+        BODY_READ_TIMEOUT,
+        axum::body::to_bytes(resp.into_body(), BODY_LIMIT),
+    )
+    .await
+    {
+        Ok(Ok(b)) => b,
+        Ok(Err(_)) | Err(_) => axum::body::Bytes::new(),
+    };
+    let body = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    Outcome { status, body }
+}
+
+/// A request to `method path` with the given key and `X-Agent-Id` values.
+fn request(
+    method: &str,
+    uri: &str,
+    key: &str,
+    agent_ids: &[&str],
+    body: Option<&serde_json::Value>,
+) -> axum::http::request::Builder {
+    let mut b = Request::builder()
+        .method(method.to_ascii_uppercase().as_str())
+        .uri(uri);
+    if !key.is_empty() {
+        b = b.header("x-api-key", key);
+    }
+    for id in agent_ids {
+        b = b.header("x-agent-id", *id);
+    }
+    if body.is_some() || method != "get" {
+        b = b.header("content-type", "application/json");
+    }
+    b
+}
+
+fn body_for(method: &str, body: Option<serde_json::Value>) -> Body {
+    match (method, body) {
+        (_, Some(v)) => Body::from(v.to_string()),
+        ("get", None) => Body::empty(),
+        (_, None) => Body::from("{}"),
+    }
+}
+
+async fn send_simple(
+    router: &axum::Router,
+    method: &str,
+    uri: &str,
+    key: &str,
+    agent_ids: &[&str],
+    body: Option<serde_json::Value>,
+) -> Outcome {
+    let req = request(method, uri, key, agent_ids, body.as_ref())
+        .body(body_for(method, body))
+        .expect("request");
+    send(router, req).await
+}
+
+/// [`concrete_path`] with every `{id}` segment naming `id` (other params
+/// keep the placeholder, so a namespace echo is not mistaken for a row read).
+fn concrete_path_naming(path: &str, id: &str) -> String {
+    concrete_path(path)
+        .split('/')
+        .zip(path.split('/'))
+        .map(|(concrete, raw)| if raw == "{id}" { id } else { concrete })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// (1a) The table cell: under Enforce with keys enrolled, a shared-key caller
+/// naming ANOTHER enrolled agent (bob) is refused 403
+/// `attested_identity_required` on every non-exempt route, before any
+/// extractor runs (so the refusal does not depend on the body shape).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shared_key_named_agent_is_refused_on_every_gated_route_9341() {
+    let fx = build(HttpIdentityMode::Enforce, true).await;
+    let mut mismatches = Vec::new();
+    let mut audit_open = Vec::new();
+    let mut checked = 0usize;
+    for row in ROUTE_TABLE {
+        if row.class == RouteClass::Exempt {
+            continue;
+        }
+        checked += 1;
+        let out = send_simple(
+            &fx.router,
+            row.method,
+            &concrete_path(row.path),
+            SHARED_KEY,
+            &[BOB],
+            None,
+        )
+        .await;
+        if !out.is_funnel_refusal() && !out.is_backend_gate_refusal() {
+            if AUDIT_UNGATED_ROUTES.contains(&(row.name, row.method)) {
+                audit_open.push(format!("{} {}", row.name, row.method));
+            }
+            mismatches.push(format!(
+                "{} {} {} -> {} {}",
+                row.name, row.method, row.path, out.status, out.body
+            ));
+        }
+    }
+    eprintln!("#9341 audit routes honoured as bob: {}", audit_open.len());
+    for r in &audit_open {
+        eprintln!("#9341 AUDIT-OPEN {r}");
+    }
+    for m in &mismatches {
+        eprintln!("#9341 NOT-REFUSED {m}");
+    }
+    assert!(checked > 0, "the table has gated rows");
+    assert!(
+        mismatches.is_empty(),
+        "#9341: {} of {checked} gated routes did not refuse a shared-key named \
+         caller with 403 {ATTESTED_IDENTITY_REQUIRED}",
+        mismatches.len()
+    );
+}
+
+/// (1a') Exempt routes are not refused by the funnel (design point 3).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exempt_routes_are_not_refused_by_the_funnel_9341() {
+    let fx = build(HttpIdentityMode::Enforce, true).await;
+    for row in ROUTE_TABLE.iter().filter(|r| r.class == RouteClass::Exempt) {
+        let out = send_simple(
+            &fx.router,
+            row.method,
+            &concrete_path(row.path),
+            SHARED_KEY,
+            &[BOB],
+            None,
+        )
+        .await;
+        assert_ne!(
+            out.error_code(),
+            ATTESTED_IDENTITY_REQUIRED,
+            "{} {} must stay outside the funnel: {} {}",
+            row.name,
+            row.method,
+            out.status,
+            out.body
+        );
+    }
+}
+
+/// An EMPTY header stays the documented "no assertion" (the resolver's
+/// `filter(|h| !h.is_empty())` precedent), so it is not in this list.
+///
+/// (1c) The invalid-header cell: a malformed `X-Agent-Id` is a 400
+/// `VALIDATION_FAILED` on every non-exempt route, never a silent
+/// `anonymous:invalid` principal (#9342).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invalid_header_is_400_on_every_gated_route_9342() {
+    const INVALID_IDS: &[&str] = &["bad id with spaces", " bob ", "bob\tx"];
+    let fx = build(HttpIdentityMode::Enforce, true).await;
+    let mut wrong = Vec::new();
+    for row in ROUTE_TABLE.iter().filter(|r| r.class != RouteClass::Exempt) {
+        for id in INVALID_IDS {
+            let out = send_simple(
+                &fx.router,
+                row.method,
+                &concrete_path(row.path),
+                SHARED_KEY,
+                &[id],
+                None,
+            )
+            .await;
+            let is_400 = out.status == StatusCode::BAD_REQUEST && out.code() == VALIDATION_FAILED;
+            if !is_400 && !out.is_backend_gate_refusal() {
+                wrong.push(format!(
+                    "{} {} {id:?} -> {} {}",
+                    row.name, row.method, out.status, out.body
+                ));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "#9342 invalid header not 400: {wrong:#?}");
+}
+
+/// A header naming an anonymous sentinel is a client ASSERTION, never the
+/// server-minted anonymous principal: under the funnel it is an unproven
+/// named principal and is refused before any handler (decision line in the
+/// READY file).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn client_supplied_anonymous_sentinel_is_refused_9341() {
+    let fx = build(HttpIdentityMode::Enforce, true).await;
+    let mut wrong = Vec::new();
+    for row in ROUTE_TABLE.iter().filter(|r| r.class != RouteClass::Exempt) {
+        for id in ["anonymous:req-deadbeef", "anonymous:invalid"] {
+            let out = send_simple(
+                &fx.router,
+                row.method,
+                &concrete_path(row.path),
+                SHARED_KEY,
+                &[id],
+                None,
+            )
+            .await;
+            let refused_before_handler = out.is_funnel_refusal()
+                || out.is_backend_gate_refusal()
+                || (out.status == StatusCode::BAD_REQUEST && out.code() == VALIDATION_FAILED);
+            if !refused_before_handler {
+                wrong.push(format!(
+                    "{} {} {id:?} -> {} {}",
+                    row.name, row.method, out.status, out.body
+                ));
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "#9341 anonymous sentinel header reached a handler: {wrong:#?}"
+    );
+}
+
+/// A present but non-UTF-8 `X-Agent-Id` is refused 400, never read as
+/// "no header" (the anonymous principal).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn non_utf8_agent_id_header_is_400_9342() {
+    let fx = build(HttpIdentityMode::Enforce, true).await;
+    for (method, path) in [
+        ("post", ai_memory::handlers::routes::SIGNALS),
+        ("get", ai_memory::handlers::routes::MEMORIES),
+    ] {
+        let req = request(method, path, SHARED_KEY, &[], None)
+            .header(
+                "x-agent-id",
+                axum::http::HeaderValue::from_bytes(b"b\xffob").expect("opaque header"),
+            )
+            .body(body_for(method, None))
+            .expect("request");
+        let out = send(&fx.router, req).await;
+        assert_eq!(
+            (out.status, out.code()),
+            (StatusCode::BAD_REQUEST, VALIDATION_FAILED),
+            "{method} {path}: {}",
+            out.body
+        );
+    }
+}
+
+/// Positive control: alice's own per-agent key acting as alice is served.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn per_agent_key_bound_caller_is_served_9341() {
+    let fx = build(HttpIdentityMode::Enforce, true).await;
+    // A per-run title: a postgres backend keeps rows between runs, and a
+    // fixed title would make the re-run a 409 rather than a positive control.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let title = format!("t-9341-{}-{nanos}", std::process::id());
+    let out = send_simple(
+        &fx.router,
+        "post",
+        route_table::concrete_path(ai_memory::handlers::routes::MEMORIES).as_str(),
+        ALICE_KEY,
+        &[ALICE],
+        Some(serde_json::json!({"title": title, "content": "c-9341", "namespace": "ns-9341"})),
+    )
+    .await;
+    assert!(
+        out.status.is_success(),
+        "alice's bound key must create: {} {}",
+        out.status,
+        out.body
+    );
+}
+
+/// Anonymous caller (no header) on an anonymous-allowed route is served.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn anonymous_caller_on_catalogue_route_is_served_9341() {
+    let fx = build(HttpIdentityMode::Enforce, true).await;
+    for row in ROUTE_TABLE
+        .iter()
+        .filter(|r| r.class == RouteClass::AnonymousAllowed)
+    {
+        let out = send_simple(&fx.router, row.method, row.path, SHARED_KEY, &[], None).await;
+        assert!(
+            !out.is_funnel_refusal(),
+            "{} anonymous must not be refused: {} {}",
+            row.name,
+            out.status,
+            out.body
+        );
+    }
+}
+
+/// Advisory mode never refuses (only Enforce does).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn advisory_mode_does_not_refuse_named_shared_key_caller_9341() {
+    let fx = build(HttpIdentityMode::Advisory, true).await;
+    let out = send_simple(
+        &fx.router,
+        "post",
+        ai_memory::handlers::routes::SIGNALS,
+        SHARED_KEY,
+        &[BOB],
+        None,
+    )
+    .await;
+    assert!(!out.is_funnel_refusal(), "{} {}", out.status, out.body);
+}
+
+// ---------------------------------------------------------------- break-it
+
+/// Case variants are distinct principals and are refused the same way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn header_case_variant_is_refused_9341() {
+    let fx = build(HttpIdentityMode::Enforce, true).await;
+    for id in ["BOB", "Bob", "ALICE"] {
+        let out = send_simple(
+            &fx.router,
+            "post",
+            ai_memory::handlers::routes::SIGNALS,
+            SHARED_KEY,
+            &[id],
+            None,
+        )
+        .await;
+        assert!(out.is_funnel_refusal(), "{id}: {} {}", out.status, out.body);
+    }
+}
+
+/// Duplicate `X-Agent-Id` headers: a shared-key caller is refused whatever
+/// the order; a per-agent key whose agent differs from the FIRST value is
+/// `identity_binding_mismatch`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn duplicate_agent_id_headers_are_refused_9341() {
+    let fx = build(HttpIdentityMode::Enforce, true).await;
+    for ids in [[BOB, ALICE], [ALICE, BOB]] {
+        let out = send_simple(
+            &fx.router,
+            "post",
+            ai_memory::handlers::routes::SIGNALS,
+            SHARED_KEY,
+            &ids,
+            None,
+        )
+        .await;
+        assert!(
+            out.is_funnel_refusal(),
+            "{ids:?}: {} {}",
+            out.status,
+            out.body
+        );
+    }
+    let out = send_simple(
+        &fx.router,
+        "post",
+        ai_memory::handlers::routes::SIGNALS,
+        ALICE_KEY,
+        &[BOB, ALICE],
+        None,
+    )
+    .await;
+    assert_eq!(out.status, StatusCode::FORBIDDEN, "{}", out.body);
+    assert_eq!(out.error_code(), IDENTITY_BINDING_MISMATCH, "{}", out.body);
+}
+
+/// A per-agent key whose agent differs from the header stays
+/// `identity_binding_mismatch` (the transport rung runs first).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn per_agent_key_for_other_agent_is_binding_mismatch_9341() {
+    let fx = build(HttpIdentityMode::Enforce, true).await;
+    for row in ROUTE_TABLE.iter().filter(|r| r.class != RouteClass::Exempt) {
+        let out = send_simple(
+            &fx.router,
+            row.method,
+            &concrete_path(row.path),
+            ALICE_KEY,
+            &[BOB],
+            None,
+        )
+        .await;
+        if out.is_backend_gate_refusal() {
+            continue;
+        }
+        assert_eq!(
+            (out.status, out.error_code()),
+            (StatusCode::FORBIDDEN, IDENTITY_BINDING_MISMATCH),
+            "{} {}: {}",
+            row.name,
+            row.method,
+            out.body
+        );
+    }
+}
+
+/// A body `agent_id` that differs from the proven header principal is
+/// refused, never laundered into the write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn body_agent_id_differing_from_header_is_refused_9341() {
+    let fx = build(HttpIdentityMode::Enforce, true).await;
+    let out = send_simple(
+        &fx.router,
+        "post",
+        ai_memory::handlers::routes::MEMORIES,
+        ALICE_KEY,
+        &[ALICE],
+        Some(serde_json::json!({
+            "title": "t-9341", "content": "c-9341", "namespace": "ns-9341", "agent_id": BOB
+        })),
+    )
+    .await;
+    assert_eq!(
+        (out.status, out.code()),
+        (StatusCode::FORBIDDEN, "AGENT_ID_MISMATCH"),
+        "{}",
+        out.body
+    );
+}
+
+/// #8590: a caller whose mTLS certificate is mapped to bob, presenting the
+/// shared key and naming bob, is PROVEN and is served (the cert rung counts
+/// at the funnel AND at the handler gate).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mapped_cert_with_shared_key_is_served_8590() {
+    let fx = build(HttpIdentityMode::Enforce, true).await;
+    for (method, path) in [
+        ("get", ai_memory::handlers::routes::MEMORIES),
+        ("post", ai_memory::handlers::routes::SIGNALS),
+    ] {
+        let req = request(method, path, SHARED_KEY, &[BOB], None)
+            .extension(ClientCertAgentBinding::new(
+                Some(BOB.to_string()),
+                AgentBindingMode::Enforce,
+            ))
+            .body(body_for(method, None))
+            .expect("request");
+        let out = send(&fx.router, req).await;
+        assert_ne!(
+            out.status,
+            StatusCode::FORBIDDEN,
+            "#8590 {method} {path}: a cert-proven caller must not be refused: {}",
+            out.body
+        );
+    }
+}
+
+/// An unmapped certificate under Warn binding adds no proof: the shared-key
+/// named caller is refused by the funnel.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unmapped_cert_with_shared_key_is_refused_9341() {
+    let fx = build(HttpIdentityMode::Enforce, true).await;
+    let req = request(
+        "post",
+        ai_memory::handlers::routes::SIGNALS,
+        SHARED_KEY,
+        &[BOB],
+        None,
+    )
+    .extension(ClientCertAgentBinding::new(None, AgentBindingMode::Warn))
+    .body(body_for("post", None))
+    .expect("request");
+    let out = send(&fx.router, req).await;
+    assert!(out.is_funnel_refusal(), "{} {}", out.status, out.body);
+}
+
+// ------------------------------------------- 3-agent vote (71472661) cells
+
+/// Per-run unique suffix: a postgres backend keeps rows between runs.
+fn run_suffix() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    format!("{}-{nanos}", std::process::id())
+}
+
+/// B-1: one state of the four (per-agent keys enrolled or not, shared key
+/// configured or not). A named, unproven caller is refused 403
+/// `attested_identity_required` in every one.
+async fn assert_named_unproven_refused(with_keys: bool, shared_key: Option<&str>) {
+    let fx = build_with(HttpIdentityMode::Enforce, with_keys, shared_key).await;
+    let out = send_simple(
+        &fx.router,
+        "post",
+        ai_memory::handlers::routes::SIGNALS,
+        shared_key.unwrap_or(""),
+        &[BOB],
+        None,
+    )
+    .await;
+    assert_eq!(
+        out.status,
+        StatusCode::FORBIDDEN,
+        "B-1 keys={with_keys} shared={}: {}",
+        shared_key.is_some(),
+        out.body
+    );
+    assert_eq!(out.error_code(), ATTESTED_IDENTITY_REQUIRED, "{}", out.body);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn b1_enforce_keys_enrolled_shared_key_refuses_named_9341() {
+    assert_named_unproven_refused(true, Some(SHARED_KEY)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn b1_enforce_no_keys_shared_key_refuses_named_9341() {
+    assert_named_unproven_refused(false, Some(SHARED_KEY)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn b1_enforce_keys_enrolled_no_shared_key_refuses_named_9341() {
+    assert_named_unproven_refused(true, None).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn b1_enforce_no_keys_no_shared_key_refuses_named_9341() {
+    assert_named_unproven_refused(false, None).await;
+}
+
+/// B-3: under Enforce the anonymous shared-key caller (no `X-Agent-Id`),
+/// swept over EVERY non-exempt route of the router-pinned table, never sees
+/// alice's private row and never writes a row attributed to a named agent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn b3_anonymous_shared_key_reads_no_private_row_writes_nothing_named_9341() {
+    let fx = build(HttpIdentityMode::Enforce, true).await;
+    let suffix = run_suffix();
+    let marker = format!("private-marker-9341-{suffix}");
+    let ns = format!("ns-b3-9341-{suffix}");
+    let seeded = send_simple(
+        &fx.router,
+        "post",
+        &concrete_path(ai_memory::handlers::routes::MEMORIES),
+        ALICE_KEY,
+        &[ALICE],
+        Some(serde_json::json!({
+            "title": marker, "content": marker, "namespace": ns, "scope": "private",
+        })),
+    )
+    .await;
+    assert!(
+        seeded.status.is_success(),
+        "seed: {} {}",
+        seeded.status,
+        seeded.body
+    );
+    // The row id, never the marker: a search route echoes its query string,
+    // so the marker in a response body is not by itself a read of the row.
+    let seeded_id = seeded
+        .body
+        .get("id")
+        .or_else(|| seeded.body.pointer("/memory/id"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| panic!("seed returns the row id: {}", seeded.body))
+        .to_string();
+
+    let gated = || ROUTE_TABLE.iter().filter(|r| r.class != RouteClass::Exempt);
+    // Every path parameter names the seeded row, so `/memories/{id}`-shaped
+    // routes probe exactly the private row.
+    let uri_for = |row: &RouteRow| {
+        let uri = concrete_path_naming(row.path, &seeded_id);
+        if row.method == "get" {
+            format!("{uri}?namespace={ns}&q={marker}&query={marker}")
+        } else {
+            uri
+        }
+    };
+    // The body names the row id under every key a body-addressed route reads,
+    // so POST routes that take the id in the body probe the private row too.
+    let probe_body_for = |id: &str| {
+        serde_json::json!({
+            "namespace": ns, "query": marker, "q": marker, "context": marker,
+            "id": id, "memory_id": id, "ids": [id],
+        })
+    };
+    let probe_body = probe_body_for(&seeded_id);
+    // Positive control, read-only first: the GET sweep as alice DOES return
+    // her row, so the probe is sensitive and an empty leak list is evidence.
+    let mut owner_reads = 0usize;
+    for row in gated().filter(|r| r.method == "get") {
+        let out = send_simple(
+            &fx.router,
+            row.method,
+            &uri_for(row),
+            ALICE_KEY,
+            &[ALICE],
+            Some(probe_body.clone()),
+        )
+        .await;
+        owner_reads += usize::from(out.body.to_string().contains(&seeded_id));
+    }
+    assert!(
+        owner_reads > 0,
+        "B-3 probe is blind: alice reads her row nowhere"
+    );
+
+    let mut leaks = Vec::new();
+    let mut backend_gated = Vec::new();
+    let mut echoes = Vec::new();
+    let mut checked = 0usize;
+    for row in gated() {
+        checked += 1;
+        let out = send_simple(
+            &fx.router,
+            row.method,
+            &uri_for(row),
+            SHARED_KEY,
+            &[],
+            Some(probe_body.clone()),
+        )
+        .await;
+        // Classified, never skipped silently: the postgres route gate serves
+        // nothing, so the row is fail-closed on that backend, not probed.
+        if out.is_backend_gate_refusal() {
+            backend_gated.push((row.name, row.method, uri_for(row)));
+            continue;
+        }
+        let seen = out.body.to_string();
+        if seen.contains(&seeded_id) {
+            // An input echo is not a read: the same route answers a decoy id
+            // of the same shape byte-identically once both ids are masked.
+            let decoy = send_simple(
+                &fx.router,
+                row.method,
+                &uri_for(row).replace(&seeded_id, B3_DECOY_ID),
+                SHARED_KEY,
+                &[],
+                Some(probe_body_for(B3_DECOY_ID)),
+            )
+            .await;
+            if seen.replace(&seeded_id, "<ID>")
+                == decoy.body.to_string().replace(B3_DECOY_ID, "<ID>")
+            {
+                echoes.push(row.name);
+                continue;
+            }
+            leaks.push(format!(
+                "{} {} -> {} {}",
+                row.name,
+                row.method,
+                out.status,
+                out.body.to_string().chars().take(600).collect::<String>()
+            ));
+        }
+    }
+    assert!(checked > 0, "the table has gated rows");
+    assert!(
+        leaks.is_empty(),
+        "B-3 private row read anonymously: {leaks:?}"
+    );
+    // A postgres 501 is classified, never assumed: every row answered that
+    // way must be one the postgres route gate itself declares unsupported
+    // (so no handler ran and nothing was served), and the recall-observations
+    // route, the #9366 leak, is served on both backends so it is probed.
+    let undeclared: Vec<_> = backend_gated
+        .iter()
+        .filter(|(_, method, uri)| {
+            let method = axum::http::Method::from_bytes(method.to_ascii_uppercase().as_bytes())
+                .expect("route-table method");
+            let path = uri.split('?').next().unwrap_or(uri);
+            ai_memory::handlers::postgres_gate::postgres_endpoint_supported(&method, path)
+        })
+        .collect();
+    assert!(
+        undeclared.is_empty(),
+        "B-3: a 501 on a route the postgres gate declares served: {undeclared:?}"
+    );
+    assert!(
+        !backend_gated
+            .iter()
+            .any(|(name, _, _)| *name == "MEMORY_RECALL_OBSERVATIONS"),
+        "B-3: the recall-observations route must be probed on both backends: {backend_gated:?}"
+    );
+    eprintln!("B-3 backend-gated (postgres 501): {backend_gated:?}");
+    eprintln!("B-3 input echoes (decoy-identical): {echoes:?}");
+
+    // Nothing the anonymous sweep sent (DELETE/PUT/PATCH included) touched the
+    // private row: alice still reads it back unchanged.
+    let after = send_simple(
+        &fx.router,
+        "get",
+        &concrete_path_naming(ai_memory::handlers::routes::MEMORIES_ID, &seeded_id),
+        ALICE_KEY,
+        &[ALICE],
+        None,
+    )
+    .await;
+    assert!(
+        after.status.is_success() && after.body.to_string().contains(&marker),
+        "B-3 anonymous sweep changed alice's private row: {} {}",
+        after.status,
+        after.body
+    );
+
+    // Every row in the namespace, as alice sees it: only her seed is named.
+    let listed = send_simple(
+        &fx.router,
+        "get",
+        &format!(
+            "{}?namespace={ns}",
+            concrete_path(ai_memory::handlers::routes::MEMORIES)
+        ),
+        ALICE_KEY,
+        &[ALICE],
+        None,
+    )
+    .await;
+    let rows = listed
+        .body
+        .get("memories")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let named_foreign: Vec<String> = rows
+        .iter()
+        .filter(|m| m.get("title").and_then(serde_json::Value::as_str) != Some(marker.as_str()))
+        .filter_map(|m| {
+            let owner = m
+                .pointer("/metadata/agent_id")
+                .and_then(serde_json::Value::as_str)?;
+            (owner == ALICE || owner == BOB).then(|| owner.to_string())
+        })
+        .collect();
+    assert!(
+        named_foreign.is_empty(),
+        "B-3 anonymous sweep wrote rows attributed to a named agent: {named_foreign:?}"
+    );
+
+    // Blindness census: per route, alice probes a FRESH private row of her
+    // own with the same shapes. A route that does not return the id even to
+    // its owner cannot show a leak, so it is reported (READY `b3-blind:`).
+    let mut blind = Vec::new();
+    for (census_idx, row) in gated().enumerate() {
+        let fresh = send_simple(
+            &fx.router,
+            "post",
+            &concrete_path(ai_memory::handlers::routes::MEMORIES),
+            ALICE_KEY,
+            &[ALICE],
+            Some(serde_json::json!({
+                "title": format!("{marker}-census-{census_idx}-{}-{}", row.name, row.method),
+                "content": marker,
+                "namespace": ns, "scope": "private",
+            })),
+        )
+        .await;
+        let Some(fresh_id) = fresh.body.get("id").and_then(serde_json::Value::as_str) else {
+            panic!("census seed: {} {}", fresh.status, fresh.body);
+        };
+        let mut uri = concrete_path_naming(row.path, fresh_id);
+        if row.method == "get" {
+            uri = format!("{uri}?namespace={ns}&q={marker}&query={marker}");
+        }
+        let out = send_simple(
+            &fx.router,
+            row.method,
+            &uri,
+            ALICE_KEY,
+            &[ALICE],
+            Some(probe_body_for(fresh_id)),
+        )
+        .await;
+        if !out.body.to_string().contains(fresh_id) {
+            blind.push(format!(
+                "{} {} {}",
+                row.name,
+                row.method,
+                out.status.as_u16()
+            ));
+        }
+    }
+    eprintln!(
+        "B-3 blind (owner reads no id here): {} {blind:?}",
+        blind.len()
+    );
+}
+
+/// #9366 direct cell: a recall-observation row is returned only to the
+/// principal it belongs to, or to an admin. alice recalls her private row;
+/// alice reads exactly her rows, bob and the anonymous shared-key caller read
+/// zero of them, the enrolled admin carol reads all of them, on both backends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recall_observations_rows_scoped_to_owner_or_admin_9366() {
+    let fx = build_with_admin(HttpIdentityMode::Enforce, true, Some(SHARED_KEY), CAROL).await;
+    let suffix = run_suffix();
+    let marker = format!("obs-marker-9366-{suffix}");
+    let ns = format!("ns-obs-9366-{suffix}");
+    let seeded = send_simple(
+        &fx.router,
+        "post",
+        &concrete_path(ai_memory::handlers::routes::MEMORIES),
+        ALICE_KEY,
+        &[ALICE],
+        Some(serde_json::json!({
+            "title": marker, "content": marker, "namespace": ns, "scope": "private",
+        })),
+    )
+    .await;
+    let seeded_id = seeded
+        .body
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| panic!("seed: {} {}", seeded.status, seeded.body))
+        .to_string();
+    let recalled = send_simple(
+        &fx.router,
+        "get",
+        &format!(
+            "{}?context={marker}&namespace={ns}",
+            ai_memory::handlers::routes::RECALL
+        ),
+        ALICE_KEY,
+        &[ALICE],
+        None,
+    )
+    .await;
+    assert!(
+        recalled.status.is_success(),
+        "recall: {} {}",
+        recalled.status,
+        recalled.body
+    );
+
+    // (rows naming alice's seeded memory, rows owned by alice, total rows),
+    // all counted inside this cell's own namespace (a postgres database is
+    // shared by every cell of the binary), plus the rows owned by alice
+    // anywhere in the answer.
+    let read_as = |key: &'static str, ids: &'static [&'static str]| {
+        let router = fx.router.clone();
+        let seeded_id = seeded_id.clone();
+        let ns = ns.clone();
+        async move {
+            let out = send_simple(
+                &router,
+                "post",
+                ai_memory::handlers::routes::MEMORY_RECALL_OBSERVATIONS,
+                key,
+                ids,
+                Some(serde_json::json!({})),
+            )
+            .await;
+            assert_eq!(out.status, StatusCode::OK, "{key}: {}", out.body);
+            let rows = out.body["observations"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            let alice_anywhere = rows
+                .iter()
+                .filter(|r| r["agent_id"].as_str() == Some(ALICE))
+                .count();
+            let in_ns: Vec<&serde_json::Value> = rows
+                .iter()
+                .filter(|r| r["namespace"].as_str() == Some(ns.as_str()))
+                .collect();
+            let of = |f: &str, v: &str| in_ns.iter().filter(|r| r[f].as_str() == Some(v)).count();
+            (
+                (
+                    of("memory_id", &seeded_id),
+                    of("agent_id", ALICE),
+                    in_ns.len(),
+                ),
+                alice_anywhere,
+            )
+        }
+    };
+    let (alice, _) = read_as(ALICE_KEY, &[ALICE]).await;
+    let (bob, bob_alice_rows) = read_as(BOB_KEY, &[BOB]).await;
+    let (anonymous, anonymous_alice_rows) = read_as(SHARED_KEY, &[]).await;
+    let (admin, _) = read_as(CAROL_KEY, &[CAROL]).await;
+    assert_eq!(
+        alice,
+        (1, 1, 1),
+        "alice reads exactly her one observation row"
+    );
+    assert_eq!(bob, (0, 0, 0), "bob reads none of alice's rows");
+    assert_eq!(bob_alice_rows, 0, "bob reads no row of alice anywhere");
+    assert_eq!(anonymous, (0, 0, 0), "the anonymous caller reads no row");
+    assert_eq!(
+        anonymous_alice_rows, 0,
+        "the anonymous caller reads no row of alice anywhere"
+    );
+    assert_eq!(admin, (1, 1, 1), "the admin reads every row");
+}
+
+/// B-8: Advisory with the shared key and a named id is served (reported,
+/// not refused) and the report counter rises.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn b8_advisory_named_shared_key_is_counted_not_refused_9341() {
+    let fx = build(HttpIdentityMode::Advisory, true).await;
+    let before = ai_memory::handlers::advisory_identity_report::advisory_unproven_total();
+    let claimed = format!("bob-b8-{}", run_suffix());
+    let out = send_simple(
+        &fx.router,
+        "post",
+        ai_memory::handlers::routes::SIGNALS,
+        SHARED_KEY,
+        &[claimed.as_str()],
+        None,
+    )
+    .await;
+    assert!(!out.is_funnel_refusal(), "{} {}", out.status, out.body);
+    let after = ai_memory::handlers::advisory_identity_report::advisory_unproven_total();
+    assert!(after > before, "B-8 counter must rise: {before} -> {after}");
+    // Deterministic under parallel cells (the counter is process-wide): the
+    // layer recorded exactly this (key, claimed id) pair, so it is not due.
+    assert!(
+        ai_memory::handlers::advisory_identity_report::observe_unproven_claim(SHARED_KEY, &claimed)
+            .is_none(),
+        "B-8: the authority layer did not report the Advisory claim"
+    );
+}
+
+/// B-8 break-it: control bytes, newline, ANSI escape and quotes come out
+/// escaped; a 100K id is cut to the constant within a time ceiling.
+#[test]
+fn b8_claimed_id_is_escaped_and_bounded_9341() {
+    use ai_memory::handlers::advisory_identity_report::{
+        CLAIMED_ID_LOG_MAX_CHARS, claimed_id_for_log,
+    };
+    const HUGE_ID_LEN: usize = 100_000;
+    const ESCAPE_CEILING: Duration = Duration::from_millis(50);
+    for hostile in [
+        "a\u{0}b",
+        "a\nINFO forged",
+        "a\u{1b}[31mred",
+        "a\"b\\c",
+        "a\tb\r",
+    ] {
+        let shown = claimed_id_for_log(hostile);
+        assert!(
+            shown.bytes().all(|b| (0x20..0x7f).contains(&b)),
+            "{hostile:?} -> {shown:?}"
+        );
+        assert!(
+            !shown.contains('\n') && !shown.contains('\u{1b}'),
+            "{shown:?}"
+        );
+    }
+    let huge = "x".repeat(HUGE_ID_LEN);
+    let t = std::time::Instant::now();
+    let shown = claimed_id_for_log(&huge);
+    assert!(t.elapsed() < ESCAPE_CEILING, "{:?}", t.elapsed());
+    assert!(
+        shown.len() <= CLAIMED_ID_LOG_MAX_CHARS * 4 + 16,
+        "{}",
+        shown.len()
+    );
+    assert!(shown.ends_with("...(cut)"), "{shown}");
+}
+
+/// B-8 dedup: the WARN is due once per (key, claimed id); the counter counts
+/// every call; the set never grows past its cap.
+#[test]
+fn b8_dedup_per_key_and_claimed_id_is_bounded_9341() {
+    use ai_memory::handlers::advisory_identity_report::{
+        ADVISORY_UNPROVEN_DEDUP_CAP, advisory_unproven_total, observe_unproven_claim,
+    };
+    let suffix = run_suffix();
+    if std::env::var_os(B8_CAP_CHILD_ENV_9390).is_some() {
+        // Child process only: cycle more ids than the cap. Once full, nothing
+        // new is due. Run here, never in the shared test process, because a
+        // saturated set makes every later observation in this binary vacuous
+        // (PR 9390 H1: it hid the Off / Advisory body-claim cells).
+        let due = (0..=ADVISORY_UNPROVEN_DEDUP_CAP * 2)
+            .filter(|i| observe_unproven_claim("k-cycle", &format!("c-{suffix}-{i}")).is_some())
+            .count();
+        assert!(
+            due <= ADVISORY_UNPROVEN_DEDUP_CAP,
+            "dedup set must be bounded: {due}"
+        );
+        return;
+    }
+    let claimed = format!("dedup-{suffix}");
+    let before = advisory_unproven_total();
+    assert!(observe_unproven_claim("k1", &claimed).is_some());
+    assert!(
+        observe_unproven_claim("k1", &claimed).is_none(),
+        "same pair twice"
+    );
+    assert!(
+        observe_unproven_claim("k2", &claimed).is_some(),
+        "other key is a new pair"
+    );
+    assert!(advisory_unproven_total() >= before + 3);
+    let exe = std::env::current_exe().expect("test binary path");
+    let child = std::process::Command::new(exe)
+        .args([
+            "--exact",
+            "b8_dedup_per_key_and_claimed_id_is_bounded_9341",
+            "--test-threads=1",
+        ])
+        .env(B8_CAP_CHILD_ENV_9390, "1")
+        .output()
+        .expect("spawn the cap child");
+    let stdout = String::from_utf8_lossy(&child.stdout);
+    assert!(
+        child.status.success() && stdout.contains("1 passed"),
+        "B-8 cap child: {stdout} {}",
+        String::from_utf8_lossy(&child.stderr)
+    );
+}
+
+/// Set only in the B-8 cap child process (see above).
+const B8_CAP_CHILD_ENV_9390: &str = "AI_MEMORY_TEST_B8_CAP_CHILD_9390";
+
+/// True while the process-wide Advisory dedup set can still record a new
+/// pair; a full set reports nothing new, so a cell observing it would pass
+/// or fail vacuously.
+fn advisory_dedup_unsaturated_9390() -> bool {
+    ai_memory::handlers::advisory_identity_report::observe_unproven_claim(
+        "h1-9390-saturation-probe",
+        &run_suffix(),
+    )
+    .is_some()
+}
+
+// ---------------------------------------------------------------------------
+// #8994 — no existence oracle on an id-addressed mutation or link route.
+//
+// Invariant, both backends: a caller who is neither the owner nor an admin
+// gets the SAME status and body (the id replaced by a placeholder) for a real
+// private id and for a decoy id that names no row, that answer is the route's
+// 404 not-found, and nothing is written. A row the caller CAN see but may not
+// modify keeps its 403 NOT_OWNER (pinned separately below).
+// ---------------------------------------------------------------------------
+
+/// The decoy endpoint every link-shaped probe names on the far side of the edge.
+const DECOY_TARGET_8994: &str = "00000000-0000-4000-8000-000000008994";
+/// The placeholder the probe ids are folded to before two answers are compared.
+const ID_PLACEHOLDER_8994: &str = "<id>";
+/// The relation every link-shaped probe names (validated, closed set).
+const RELATION_8994: &str = "related_to";
+/// The body a non-owner PUT sends; never lands on a row it cannot see.
+const OVERWRITE_8994: &str = "overwritten-by-a-non-owner-8994";
+
+/// One id-addressed route of the #8994 table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Probe8994 {
+    PutMemory,
+    DeleteMemory,
+    Lineage,
+    KgInvalidate,
+    LinkDelete,
+    LinkCreate,
+}
+
+const PROBES_8994: [Probe8994; 6] = [
+    Probe8994::PutMemory,
+    Probe8994::DeleteMemory,
+    Probe8994::Lineage,
+    Probe8994::KgInvalidate,
+    Probe8994::LinkDelete,
+    Probe8994::LinkCreate,
+];
+
+/// The two non-owner, non-admin callers: another named agent with its own
+/// valid key, and the anonymous shared-key caller.
+const CALLERS_8994: [(&str, &str, &[&str]); 2] =
+    [("bob", BOB_KEY, &[BOB]), ("anonymous", SHARED_KEY, &[])];
+
+impl Probe8994 {
+    /// `(method, uri, body)` addressing `id` (and `target` for an edge).
+    fn request(self, id: &str, target: &str) -> (&'static str, String, Option<serde_json::Value>) {
+        use ai_memory::handlers::routes;
+        let edge =
+            serde_json::json!({"source_id": id, "target_id": target, "relation": RELATION_8994});
+        match self {
+            Self::PutMemory => (
+                "put",
+                concrete_path_naming(routes::MEMORIES_ID, id),
+                Some(serde_json::json!({"content": OVERWRITE_8994})),
+            ),
+            Self::DeleteMemory => (
+                "delete",
+                concrete_path_naming(routes::MEMORIES_ID, id),
+                None,
+            ),
+            Self::Lineage => (
+                "get",
+                concrete_path_naming(routes::MEMORIES_ID_LINEAGE, id),
+                None,
+            ),
+            Self::KgInvalidate => ("post", routes::KG_INVALIDATE.to_string(), Some(edge)),
+            Self::LinkDelete => ("delete", routes::LINKS.to_string(), Some(edge)),
+            Self::LinkCreate => ("post", routes::LINKS.to_string(), Some(edge)),
+        }
+    }
+
+    /// The exact 404 body a missing (or invisible) id gets, placeholder-folded.
+    fn not_found_body(self) -> serde_json::Value {
+        use ai_memory::errors::msg::SOURCE_MEMORY_NOT_FOUND;
+        match self {
+            Self::PutMemory | Self::DeleteMemory | Self::LinkDelete => {
+                serde_json::json!({"error": "not found"})
+            }
+            Self::Lineage => {
+                serde_json::json!({"error": SOURCE_MEMORY_NOT_FOUND, "id": ID_PLACEHOLDER_8994})
+            }
+            Self::KgInvalidate => serde_json::json!({
+                "found": false, "source_id": ID_PLACEHOLDER_8994,
+                "target_id": DECOY_TARGET_8994, "relation": RELATION_8994,
+                "error": SOURCE_MEMORY_NOT_FOUND,
+            }),
+            Self::LinkCreate => serde_json::json!({
+                "error": SOURCE_MEMORY_NOT_FOUND, "source_id": ID_PLACEHOLDER_8994,
+            }),
+        }
+    }
+}
+
+/// `body` with every occurrence of `id` replaced by the placeholder.
+fn fold_id_8994(body: &serde_json::Value, id: &str) -> serde_json::Value {
+    let text = body.to_string().replace(id, ID_PLACEHOLDER_8994);
+    serde_json::from_str(&text).unwrap_or_else(|e| panic!("refold {text}: {e}"))
+}
+
+/// alice seeds one row in `ns` with `scope` and returns its id.
+async fn seed_8994(fx: &Fixture, ns: &str, scope: &str, marker: &str) -> String {
+    seed_as_8994(fx, (ALICE_KEY, ALICE), ns, scope, marker).await
+}
+
+/// `who` (its key and id) seeds one row in `ns` with `scope`; returns its id.
+async fn seed_as_8994(
+    fx: &Fixture,
+    who: (&str, &str),
+    ns: &str,
+    scope: &str,
+    marker: &str,
+) -> String {
+    let seeded = send_simple(
+        &fx.router,
+        "post",
+        &concrete_path(ai_memory::handlers::routes::MEMORIES),
+        who.0,
+        &[who.1],
+        Some(serde_json::json!({
+            "title": marker, "content": marker, "namespace": ns, "scope": scope,
+        })),
+    )
+    .await;
+    assert!(
+        seeded.status.is_success(),
+        "seed {scope}: {} {}",
+        seeded.status,
+        seeded.body
+    );
+    seeded
+        .body
+        .get("id")
+        .or_else(|| seeded.body.pointer("/memory/id"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| panic!("seed returns the row id: {}", seeded.body))
+        .to_string()
+}
+
+/// alice's own read of `id`: still present, content untouched.
+async fn assert_untouched_8994(fx: &Fixture, id: &str, marker: &str) {
+    let read = send_simple(
+        &fx.router,
+        "get",
+        &concrete_path_naming(ai_memory::handlers::routes::MEMORIES_ID, id),
+        ALICE_KEY,
+        &[ALICE],
+        None,
+    )
+    .await;
+    assert_eq!(
+        read.status,
+        StatusCode::OK,
+        "owner re-read {id}: {}",
+        read.body
+    );
+    let content = read
+        .body
+        .get("content")
+        .or_else(|| read.body.pointer("/memory/content"))
+        .and_then(serde_json::Value::as_str);
+    assert_eq!(
+        content,
+        Some(marker),
+        "no non-owner write landed on {id}: {}",
+        read.body
+    );
+}
+
+/// #8994 — the invariant over the whole route table, both callers: a private
+/// row of alice answers exactly like a decoy id, with the route's 404 body.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn private_id_answers_like_a_decoy_on_every_id_route_8994() {
+    let fx = build(HttpIdentityMode::Enforce, true).await;
+    let suffix = run_suffix();
+    let ns = format!("ns-oracle-8994-{suffix}");
+    let marker = format!("private-marker-8994-{suffix}");
+    let private_id = seed_8994(&fx, &ns, "private", &marker).await;
+
+    let mut oracles = Vec::new();
+    for (who, key, ids) in CALLERS_8994 {
+        for probe in PROBES_8994 {
+            let mut folded = Vec::with_capacity(2);
+            for id in [private_id.as_str(), B3_DECOY_ID] {
+                let (method, uri, body) = probe.request(id, DECOY_TARGET_8994);
+                let out = send_simple(&fx.router, method, &uri, key, ids, body).await;
+                folded.push((out.status, fold_id_8994(&out.body, id)));
+            }
+            let (real, decoy) = (&folded[0], &folded[1]);
+            let expected = (StatusCode::NOT_FOUND, probe.not_found_body());
+            if real != decoy || *real != expected {
+                oracles.push(format!(
+                    "{who} {probe:?}: private -> {} {} | decoy -> {} {}",
+                    real.0, real.1, decoy.0, decoy.1
+                ));
+            }
+        }
+    }
+    assert!(oracles.is_empty(), "#8994 existence oracle: {oracles:#?}");
+    assert_untouched_8994(&fx, &private_id, &marker).await;
+}
+
+/// #8994 — the fix must not turn a legitimate 403 into a 404: a row bob CAN
+/// see (alice's collective row) but does not own keeps 403 `NOT_OWNER` on every
+/// mutation route, the lineage read of it is served, and nothing is written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn visible_row_of_another_owner_keeps_403_not_owner_8994() {
+    let fx = build(HttpIdentityMode::Enforce, true).await;
+    let suffix = run_suffix();
+    let ns = format!("ns-visible-8994-{suffix}");
+    let marker = format!("collective-marker-8994-{suffix}");
+    let source = seed_8994(&fx, &ns, "collective", &marker).await;
+    let target = seed_8994(&fx, &ns, "collective", &format!("{marker}-target")).await;
+
+    let mut wrong = Vec::new();
+    for probe in PROBES_8994 {
+        let (method, uri, body) = probe.request(&source, &target);
+        let out = send_simple(&fx.router, method, &uri, BOB_KEY, &[BOB], body).await;
+        let ok = if probe == Probe8994::Lineage {
+            out.status == StatusCode::OK
+        } else {
+            out.status == StatusCode::FORBIDDEN
+                && out.body["code"].as_str() == Some(ai_memory::errors::error_codes::NOT_OWNER)
+        };
+        if !ok {
+            wrong.push(format!("{probe:?}: {} {}", out.status, out.body));
+        }
+    }
+    assert!(wrong.is_empty(), "#8994 visible-row answers: {wrong:#?}");
+    assert_untouched_8994(&fx, &source, &marker).await;
+}
+
+/// The substrate namespace alice's private target row lives in (#3498).
+fn substrate_ns_8994(suffix: &str) -> String {
+    format!("_inbox/{ALICE}-8994-{suffix}")
+}
+
+/// #8994 / #3498 — `POST /api/v1/links` from bob's own source to a PRIVATE
+/// substrate row of alice answers exactly like a link to a decoy target id
+/// (same status, same body once the target id is folded), and no edge is
+/// written. Pre-fix the substrate target got `403 {"error": "caller cannot
+/// see the link target"}` while the decoy got the absent-target answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn private_substrate_target_answers_like_a_decoy_target_8994() {
+    let fx = build(HttpIdentityMode::Enforce, true).await;
+    let suffix = run_suffix();
+    let ns = format!("ns-target-8994-{suffix}");
+    let source = seed_as_8994(
+        &fx,
+        (BOB_KEY, BOB),
+        &ns,
+        "collective",
+        &format!("bob-source-8994-{suffix}"),
+    )
+    .await;
+    // HTTP refuses a caller write into a substrate namespace, so the hidden
+    // target is seeded through the router's own store (both backends).
+    let hidden_ns = substrate_ns_8994(&suffix);
+    let now = chrono::Utc::now().to_rfc3339();
+    let hidden_row = ai_memory::models::Memory {
+        id: uuid::Uuid::new_v4().to_string(),
+        namespace: hidden_ns.clone(),
+        title: format!("alice-substrate-8994-{suffix}"),
+        content: format!("alice-substrate-8994-{suffix}"),
+        created_at: now.clone(),
+        updated_at: now,
+        metadata: serde_json::json!({
+            "agent_id": ALICE, "scope": "private", "target_agent_id": ALICE,
+        }),
+        ..ai_memory::models::Memory::default()
+    };
+    let hidden = fx
+        .store
+        .store(
+            &ai_memory::store::CallerContext::for_admin("fixture-8994"),
+            &hidden_row,
+        )
+        .await
+        .expect("seed the hidden substrate target");
+
+    let mut folded = Vec::with_capacity(2);
+    for target in [hidden.as_str(), DECOY_TARGET_8994] {
+        let out = send_simple(
+            &fx.router,
+            "post",
+            ai_memory::handlers::routes::LINKS,
+            BOB_KEY,
+            &[BOB],
+            Some(serde_json::json!({
+                "source_id": source, "target_id": target, "relation": RELATION_8994,
+            })),
+        )
+        .await;
+        folded.push((out.status, fold_id_8994(&out.body, target)));
+    }
+    assert_eq!(
+        folded[0], folded[1],
+        "#8994 link-target oracle: private substrate target vs decoy target"
+    );
+    assert!(
+        !folded[0].0.is_success(),
+        "a link to a target bob cannot see is refused: {:?}",
+        folded[0]
+    );
+
+    let written = fx
+        .store
+        .get_links_for_anchor(&source)
+        .await
+        .expect("read the source's links");
+    assert!(
+        written.iter().all(|l| l.target_id != hidden),
+        "no edge to the hidden target was written: {written:?}"
+    );
+}
+
+/// Seed, through the router's store, a private row of alice addressed to
+/// bob (`target_agent_id = bob`) in `ns`, plus a `related_to` edge from it to
+/// a fresh collective row of alice; returns `(source, target)`.
+async fn seed_inbox_edge_8994(fx: &Fixture, ns: &str, marker: &str) -> (String, String) {
+    let target = seed_8994(
+        fx,
+        &format!("ns-inbox-target-8994-{marker}"),
+        "collective",
+        &format!("{marker}-target"),
+    )
+    .await;
+    let now = chrono::Utc::now().to_rfc3339();
+    let row = ai_memory::models::Memory {
+        id: uuid::Uuid::new_v4().to_string(),
+        namespace: ns.to_string(),
+        title: format!("{marker}-inbox"),
+        content: format!("{marker}-inbox"),
+        created_at: now.clone(),
+        updated_at: now.clone(),
+        metadata: serde_json::json!({
+            "agent_id": ALICE, "scope": "private", "target_agent_id": BOB,
+        }),
+        ..ai_memory::models::Memory::default()
+    };
+    let ctx = ai_memory::store::CallerContext::for_admin("fixture-8994");
+    let source = fx
+        .store
+        .store(&ctx, &row)
+        .await
+        .expect("seed the inbox row");
+    let link = ai_memory::models::MemoryLink {
+        source_id: source.clone(),
+        target_id: target.clone(),
+        relation: RELATION_8994.parse().expect("closed relation"),
+        created_at: now,
+        signature: None,
+        observed_by: None,
+        valid_from: None,
+        valid_until: None,
+        attest_level: None,
+        source_cid: None,
+        target_cid: None,
+    };
+    fx.store
+        .link(&ctx, &link)
+        .await
+        .expect("seed the inbox edge");
+    (source, target)
+}
+
+/// #8994 open concern (vote-e DONE): the inbox-target caller of
+/// `kg_invalidate`. Before e1714cb5's fix the SQLite arm read the row with no
+/// visibility check and the owner gate admitted the inbox target; the
+/// postgres arm read it caller-scoped, where `target_agent_id == caller`
+/// is visible. After the fix both arms still serve bob, for an ordinary
+/// namespace and for his `_inbox/` substrate namespace.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inbox_target_keeps_kg_invalidate_8994() {
+    let fx = build(HttpIdentityMode::Enforce, true).await;
+    let suffix = run_suffix();
+    for (cell, ns) in [format!("ns-inbox-8994-{suffix}"), format!("_inbox/{BOB}")]
+        .into_iter()
+        .enumerate()
+    {
+        let (source, target) =
+            seed_inbox_edge_8994(&fx, &ns, &format!("inbox-8994-{suffix}-{cell}")).await;
+        let out = send_simple(
+            &fx.router,
+            "post",
+            ai_memory::handlers::routes::KG_INVALIDATE,
+            BOB_KEY,
+            &[BOB],
+            Some(serde_json::json!({
+                "source_id": source, "target_id": target, "relation": RELATION_8994,
+            })),
+        )
+        .await;
+        assert_eq!(
+            (out.status, out.body["found"].clone()),
+            (StatusCode::OK, serde_json::Value::Bool(true)),
+            "inbox target {ns}: {}",
+            out.body
+        );
+    }
+}
+
+/// #8994 item-4 edge: a `scope=team` row of alice addressed to bob, where
+/// bob is OUTSIDE the team subtree, so he cannot read it. Before e1714cb5's
+/// fix the SQLite arm read it unscoped and the owner gate admitted the inbox
+/// target (200); the postgres arm's caller-scoped read never found it (404).
+/// The fix must not refuse the SQLite caller it admitted before; postgres
+/// keeps its pre-fix answer (filed as a parity row, not changed here).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unreadable_inbox_target_keeps_its_pre_fix_kg_invalidate_answer_8994() {
+    let fx = build(HttpIdentityMode::Enforce, true).await;
+    let suffix = run_suffix();
+    let ns = format!("org8994/unit8994/team8994/alice-{suffix}");
+    let target = seed_8994(
+        &fx,
+        &format!("ns-team-target-8994-{suffix}"),
+        "collective",
+        &format!("team-8994-{suffix}-target"),
+    )
+    .await;
+    let now = chrono::Utc::now().to_rfc3339();
+    let row = ai_memory::models::Memory {
+        id: uuid::Uuid::new_v4().to_string(),
+        namespace: ns,
+        title: format!("team-8994-{suffix}"),
+        content: format!("team-8994-{suffix}"),
+        created_at: now.clone(),
+        updated_at: now.clone(),
+        metadata: serde_json::json!({
+            "agent_id": ALICE, "scope": "team", "target_agent_id": BOB,
+        }),
+        ..ai_memory::models::Memory::default()
+    };
+    let ctx = ai_memory::store::CallerContext::for_admin("fixture-8994");
+    let source = fx.store.store(&ctx, &row).await.expect("seed the team row");
+    let link = ai_memory::models::MemoryLink {
+        source_id: source.clone(),
+        target_id: target.clone(),
+        relation: RELATION_8994.parse().expect("closed relation"),
+        created_at: now,
+        signature: None,
+        observed_by: None,
+        valid_from: None,
+        valid_until: None,
+        attest_level: None,
+        source_cid: None,
+        target_cid: None,
+    };
+    fx.store
+        .link(&ctx, &link)
+        .await
+        .expect("seed the team edge");
+    let out = send_simple(
+        &fx.router,
+        "post",
+        ai_memory::handlers::routes::KG_INVALIDATE,
+        BOB_KEY,
+        &[BOB],
+        Some(serde_json::json!({
+            "source_id": source, "target_id": target, "relation": RELATION_8994,
+        })),
+    )
+    .await;
+    let expected = if std::env::var("AI_MEMORY_TEST_POSTGRES_URL").is_ok() {
+        (StatusCode::NOT_FOUND, serde_json::Value::Bool(false))
+    } else {
+        (StatusCode::OK, serde_json::Value::Bool(true))
+    };
+    assert_eq!(
+        (out.status, out.body["found"].clone()),
+        expected,
+        "team-scoped inbox target: {}",
+        out.body
+    );
+}
+
+// ---------------------------------------------------------------------------
+// PR 9390 round-1 H1: a principal NAMED IN THE BODY under Enforce.
+//
+// The class invariant: under Enforce (any number of enrolled keys, zero
+// included) the principal a handler acts as is the funnel principal
+// (`Authority::principal()`: proven, or server-minted for the anonymous
+// shared-key caller) and nothing the caller names in a body field. One cell
+// per swept site (`session_start`, `reflect`) and state.
+// ---------------------------------------------------------------------------
+
+/// The two handlers that turned a body `agent_id` into the acting caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum H1Site9390 {
+    SessionStart,
+    Reflect,
+}
+
+impl H1Site9390 {
+    const fn path(self) -> &'static str {
+        match self {
+            Self::SessionStart => ai_memory::handlers::routes::SESSION_START,
+            Self::Reflect => ai_memory::handlers::routes::MEMORY_REFLECT,
+        }
+    }
+
+    /// The request body; `named` is the body `agent_id` (absent when `None`).
+    fn body(self, ns: &str, source_id: &str, named: Option<&str>) -> serde_json::Value {
+        let mut v = match self {
+            Self::SessionStart => serde_json::json!({"namespace": ns, "limit": 50}),
+            Self::Reflect => serde_json::json!({
+                "source_ids": [source_id],
+                "title": format!("h1-9390 reflection {}", run_suffix()),
+                "content": "h1-9390 reflection content of enough length to be accepted",
+                "namespace": ns,
+            }),
+        };
+        if let (Some(id), Some(obj)) = (named, v.as_object_mut()) {
+            obj.insert("agent_id".into(), serde_json::json!(id));
+        }
+        v
+    }
+}
+
+/// One `scope=private` row owned by `owner`, written through the store (with
+/// zero keys enrolled no HTTP caller can prove `owner` to write it).
+async fn seed_private_9390(fx: &Fixture, owner: &str, ns: &str, marker: &str) -> String {
+    let now = chrono::Utc::now().to_rfc3339();
+    let row = ai_memory::models::Memory {
+        id: uuid::Uuid::new_v4().to_string(),
+        namespace: ns.to_string(),
+        title: marker.to_string(),
+        content: marker.to_string(),
+        created_at: now.clone(),
+        updated_at: now,
+        metadata: serde_json::json!({"agent_id": owner, "scope": "private"}),
+        ..ai_memory::models::Memory::default()
+    };
+    let ctx = ai_memory::store::CallerContext::for_admin("fixture-9390");
+    fx.store
+        .store(&ctx, &row)
+        .await
+        .expect("seed the private row")
+}
+
+/// Every row in `ns`, read past the visibility filter: the "nothing was
+/// written" read-back.
+async fn ns_rows_9390(fx: &Fixture, ns: &str) -> usize {
+    let ctx = ai_memory::store::CallerContext::for_admin("fixture-9390");
+    let mut filter = ai_memory::store::Filter::default();
+    filter.namespace = Some(ns.to_string());
+    filter.limit = 1000;
+    fx.store.list(&ctx, &filter).await.expect("list ns").len()
+}
+
+/// The funnel's own refusal on `site`'s route: the same route asked with a
+/// self-asserted `X-Agent-Id`, refused by the authority layer.
+async fn funnel_refusal_body_9390(fx: &Fixture, site: H1Site9390) -> serde_json::Value {
+    let out = send_simple(&fx.router, "post", site.path(), SHARED_KEY, &[BOB], None).await;
+    assert!(
+        out.is_funnel_refusal(),
+        "H1 reference: the funnel refuses a header name on {site:?}: {} {}",
+        out.status,
+        out.body
+    );
+    out.body
+}
+
+/// Enforce, shared key, NO header, body names alice: the funnel's exact 403,
+/// alice's private marker is not served, and no row was written.
+async fn assert_h1_body_claim_refused_9390(site: H1Site9390, with_keys: bool) {
+    let fx = build(HttpIdentityMode::Enforce, with_keys).await;
+    let suffix = run_suffix();
+    let marker = format!("h1-private-marker-9390-{suffix}");
+    let ns = format!("ns-h1-9390-{suffix}");
+    let source = seed_private_9390(&fx, ALICE, &ns, &marker).await;
+    let before = ns_rows_9390(&fx, &ns).await;
+    let out = send_simple(
+        &fx.router,
+        "post",
+        site.path(),
+        SHARED_KEY,
+        &[],
+        Some(site.body(&ns, &source, Some(ALICE))),
+    )
+    .await;
+    let expected = funnel_refusal_body_9390(&fx, site).await;
+    assert_eq!(
+        (out.status, &out.body),
+        (StatusCode::FORBIDDEN, &expected),
+        "H1 {site:?} keys={with_keys}: a body-named principal must get the funnel's 403"
+    );
+    assert!(
+        !out.body.to_string().contains(&marker),
+        "H1 {site:?} keys={with_keys}: alice's private row served: {}",
+        out.body
+    );
+    assert_eq!(
+        ns_rows_9390(&fx, &ns).await,
+        before,
+        "H1 {site:?} keys={with_keys}: the refused request wrote a row"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn h1_session_start_body_claim_no_keys_refused_9390() {
+    assert_h1_body_claim_refused_9390(H1Site9390::SessionStart, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn h1_session_start_body_claim_keys_enrolled_refused_9390() {
+    assert_h1_body_claim_refused_9390(H1Site9390::SessionStart, true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn h1_reflect_body_claim_no_keys_refused_9390() {
+    assert_h1_body_claim_refused_9390(H1Site9390::Reflect, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn h1_reflect_body_claim_keys_enrolled_refused_9390() {
+    assert_h1_body_claim_refused_9390(H1Site9390::Reflect, true).await;
+}
+
+/// Enforce, alice PROVEN (her per-agent key), body names bob: the funnel's
+/// exact 403, nothing written.
+async fn assert_h1_proven_other_refused_9390(site: H1Site9390) {
+    let fx = build(HttpIdentityMode::Enforce, true).await;
+    let suffix = run_suffix();
+    let marker = format!("h1-proven-other-9390-{suffix}");
+    let ns = format!("ns-h1po-9390-{suffix}");
+    let source = seed_private_9390(&fx, ALICE, &ns, &marker).await;
+    let before = ns_rows_9390(&fx, &ns).await;
+    let out = send_simple(
+        &fx.router,
+        "post",
+        site.path(),
+        ALICE_KEY,
+        &[ALICE],
+        Some(site.body(&ns, &source, Some(BOB))),
+    )
+    .await;
+    let expected = funnel_refusal_body_9390(&fx, site).await;
+    assert_eq!(
+        (out.status, &out.body),
+        (StatusCode::FORBIDDEN, &expected),
+        "H1 {site:?}: a proven caller naming another id must get the funnel's 403"
+    );
+    assert_eq!(
+        ns_rows_9390(&fx, &ns).await,
+        before,
+        "H1 {site:?}: row written"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn h1_session_start_proven_caller_naming_other_refused_9390() {
+    assert_h1_proven_other_refused_9390(H1Site9390::SessionStart).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn h1_reflect_proven_caller_naming_other_refused_9390() {
+    assert_h1_proven_other_refused_9390(H1Site9390::Reflect).await;
+}
+
+/// Enforce, alice proven, body names alice (and, separately, no body id):
+/// served as today, and `session_start` returns her own private row.
+async fn assert_h1_proven_self_served_9390(site: H1Site9390) {
+    let fx = build(HttpIdentityMode::Enforce, true).await;
+    let suffix = run_suffix();
+    let marker = format!("h1-proven-self-9390-{suffix}");
+    let ns = format!("ns-h1ps-9390-{suffix}");
+    let source = seed_private_9390(&fx, ALICE, &ns, &marker).await;
+    for named in [Some(ALICE), None] {
+        let out = send_simple(
+            &fx.router,
+            "post",
+            site.path(),
+            ALICE_KEY,
+            &[ALICE],
+            Some(site.body(&ns, &source, named)),
+        )
+        .await;
+        assert_eq!(
+            out.status,
+            StatusCode::OK,
+            "H1 {site:?} named={named:?}: the proven caller is served: {}",
+            out.body
+        );
+        if site == H1Site9390::SessionStart {
+            assert!(
+                out.body.to_string().contains(&marker),
+                "H1 {site:?} named={named:?}: alice reads her own private row: {}",
+                out.body
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn h1_session_start_proven_caller_naming_itself_served_9390() {
+    assert_h1_proven_self_served_9390(H1Site9390::SessionStart).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn h1_reflect_proven_caller_naming_itself_served_9390() {
+    assert_h1_proven_self_served_9390(H1Site9390::Reflect).await;
+}
+
+/// Off and Advisory keep today's answer for the zero-key body-only caller
+/// (served as the named agent); Advisory also REPORTS the body claim (the
+/// V-4 line), exactly as it reports a self-asserted header.
+async fn assert_h1_off_advisory_unchanged_9390(site: H1Site9390, mode: HttpIdentityMode) {
+    let fx = build(mode, false).await;
+    let suffix = run_suffix();
+    let named = format!("dora-h1-9390-{suffix}");
+    let marker = format!("h1-unchanged-9390-{suffix}");
+    let ns = format!("ns-h1u-9390-{suffix}");
+    let source = seed_private_9390(&fx, &named, &ns, &marker).await;
+    assert!(
+        advisory_dedup_unsaturated_9390(),
+        "H1 {site:?} {mode:?}: the Advisory dedup set is saturated; the report \
+         observation below would be vacuous"
+    );
+    let out = send_simple(
+        &fx.router,
+        "post",
+        site.path(),
+        SHARED_KEY,
+        &[],
+        Some(site.body(&ns, &source, Some(&named))),
+    )
+    .await;
+    assert_eq!(
+        out.status,
+        StatusCode::OK,
+        "H1 {site:?} {mode:?}: today's body-only contract is served: {}",
+        out.body
+    );
+    if site == H1Site9390::SessionStart {
+        assert!(
+            out.body.to_string().contains(&marker),
+            "H1 {site:?} {mode:?}: today's body-only caller reads as the named agent: {}",
+            out.body
+        );
+    }
+    let reported =
+        ai_memory::handlers::advisory_identity_report::observe_unproven_claim(SHARED_KEY, &named)
+            .is_none();
+    assert_eq!(
+        reported,
+        mode == HttpIdentityMode::Advisory,
+        "H1 {site:?} {mode:?}: the body claim is reported under Advisory only"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn h1_session_start_off_unchanged_9390() {
+    assert_h1_off_advisory_unchanged_9390(H1Site9390::SessionStart, HttpIdentityMode::Off).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn h1_session_start_advisory_reports_body_claim_9390() {
+    assert_h1_off_advisory_unchanged_9390(H1Site9390::SessionStart, HttpIdentityMode::Advisory)
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn h1_reflect_off_unchanged_9390() {
+    assert_h1_off_advisory_unchanged_9390(H1Site9390::Reflect, HttpIdentityMode::Off).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn h1_reflect_advisory_reports_body_claim_9390() {
+    assert_h1_off_advisory_unchanged_9390(H1Site9390::Reflect, HttpIdentityMode::Advisory).await;
+}
+
+// ---------------------------------------------------------------------------
+// PR 9390 round-1 notice, item 1 (M1) — an UNSTAMPED row the caller cannot
+// read answers exactly like an absent id on every id-addressed route, and
+// nothing is written. The #3124 owner gate still decides a VISIBLE unstamped
+// row (see `unstamped_policy_3124`). KgInvalidate is #9389, not swept here.
+// ---------------------------------------------------------------------------
+
+/// One id-addressed route the unstamped sweep probes (PR 9390 M1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unstamped9390 {
+    Put,
+    Delete,
+    Promote,
+    Lineage,
+    LinkCreate,
+    LinkDelete,
+    KgTimeline,
+}
+
+const UNSTAMPED_PROBES_9390: [Unstamped9390; 7] = [
+    Unstamped9390::Put,
+    Unstamped9390::Delete,
+    Unstamped9390::Promote,
+    Unstamped9390::Lineage,
+    Unstamped9390::LinkCreate,
+    Unstamped9390::LinkDelete,
+    Unstamped9390::KgTimeline,
+];
+
+impl Unstamped9390 {
+    fn request(self, id: &str) -> (&'static str, String, Option<serde_json::Value>) {
+        use ai_memory::handlers::routes;
+        let edge = serde_json::json!({
+            "source_id": id, "target_id": DECOY_TARGET_8994, "relation": RELATION_8994,
+        });
+        match self {
+            Self::Put => Probe8994::PutMemory.request(id, DECOY_TARGET_8994),
+            Self::Delete => Probe8994::DeleteMemory.request(id, DECOY_TARGET_8994),
+            Self::Lineage => Probe8994::Lineage.request(id, DECOY_TARGET_8994),
+            Self::Promote => (
+                "post",
+                concrete_path_naming(routes::MEMORIES_ID_PROMOTE, id),
+                None,
+            ),
+            Self::LinkCreate => ("post", routes::LINKS.to_string(), Some(edge)),
+            Self::LinkDelete => ("delete", routes::LINKS.to_string(), Some(edge)),
+            Self::KgTimeline => (
+                "get",
+                format!("{}?source_id={id}", routes::KG_TIMELINE),
+                None,
+            ),
+        }
+    }
+}
+
+/// An UNSTAMPED (no `agent_id`) row with `metadata`, written through the
+/// store: no HTTP caller can write a row without its owner stamp.
+async fn seed_unstamped_9390(
+    fx: &Fixture,
+    ns: &str,
+    marker: &str,
+    metadata: serde_json::Value,
+) -> String {
+    let now = chrono::Utc::now().to_rfc3339();
+    let row = ai_memory::models::Memory {
+        id: uuid::Uuid::new_v4().to_string(),
+        namespace: ns.to_string(),
+        title: marker.to_string(),
+        content: marker.to_string(),
+        created_at: now.clone(),
+        updated_at: now,
+        metadata,
+        ..ai_memory::models::Memory::default()
+    };
+    let ctx = ai_memory::store::CallerContext::for_admin("fixture-9390");
+    fx.store
+        .store(&ctx, &row)
+        .await
+        .expect("seed the unstamped row")
+}
+
+/// PR 9390 M1 — the invariant over both non-owner callers: a hidden
+/// UNSTAMPED row answers like a decoy id (404, same body once the id is
+/// folded) and the row is untouched afterwards. Each (caller, route) probe
+/// gets its OWN fresh hidden row, so a write that lands (a DELETE) cannot
+/// make a later probe vacuous.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unstamped_private_row_answers_like_a_decoy_9390() {
+    let fx = build(HttpIdentityMode::Enforce, true).await;
+    let suffix = run_suffix();
+    let ns = format!("ns-unstamped-9390-{suffix}");
+    let ctx = ai_memory::store::CallerContext::for_admin("fixture-9390");
+    let mut oracles = Vec::new();
+    let mut writes = Vec::new();
+    for (who, key, ids) in CALLERS_8994 {
+        for probe in UNSTAMPED_PROBES_9390 {
+            let marker = format!("unstamped-marker-9390-{suffix}-{who}-{probe:?}");
+            let hidden =
+                seed_unstamped_9390(&fx, &ns, &marker, serde_json::json!({"scope": "private"}))
+                    .await;
+            let tier = fx.store.get(&ctx, &hidden).await.expect("seeded").tier;
+            let mut folded = Vec::with_capacity(2);
+            for id in [hidden.as_str(), B3_DECOY_ID] {
+                let (method, uri, body) = probe.request(id);
+                let out = send_simple(&fx.router, method, &uri, key, ids, body).await;
+                folded.push((out.status, fold_id_8994(&out.body, id)));
+            }
+            let (real, decoy) = (&folded[0], &folded[1]);
+            if real != decoy || real.0 != StatusCode::NOT_FOUND {
+                oracles.push(format!(
+                    "{who} {probe:?}: unstamped -> {} {} | decoy -> {} {}",
+                    real.0, real.1, decoy.0, decoy.1
+                ));
+            }
+            match fx.store.get(&ctx, &hidden).await {
+                Ok(row) if row.content == marker && row.tier == tier => {}
+                Ok(row) => writes.push(format!("{who} {probe:?}: row changed ({:?})", row.tier)),
+                Err(e) => writes.push(format!("{who} {probe:?}: row gone ({e})")),
+            }
+        }
+    }
+    assert!(
+        oracles.is_empty(),
+        "PR 9390 M1 unstamped oracle: {oracles:#?}"
+    );
+    assert!(
+        writes.is_empty(),
+        "PR 9390 M1 hidden unstamped row written: {writes:#?}"
+    );
+}
+
+/// PR 9390 M1 — the visibility verdict does not widen into the visible case:
+/// a VISIBLE (collective) unstamped row is still decided by the #3124 owner
+/// gate, so under the default warn posture bob's PUT on it is served.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unstamped_visible_row_keeps_the_3124_gate_9390() {
+    let fx = build(HttpIdentityMode::Enforce, true).await;
+    let suffix = run_suffix();
+    let ns = format!("ns-unstamped-visible-9390-{suffix}");
+    let marker = format!("unstamped-visible-9390-{suffix}");
+    let row = seed_unstamped_9390(
+        &fx,
+        &ns,
+        &marker,
+        serde_json::json!({"scope": "collective"}),
+    )
+    .await;
+    let (method, uri, body) = Unstamped9390::Put.request(&row);
+    let out = send_simple(&fx.router, method, &uri, BOB_KEY, &[BOB], body).await;
+    // #3124 is per backend and unchanged by PR 9390: SQLite `warn` admits
+    // the visible unstamped row, PostgreSQL refuses it with its own 403
+    // (never the not-found shape, which is for rows the caller cannot read).
+    let want = match fx.backend {
+        ai_memory::handlers::StorageBackend::Postgres => StatusCode::FORBIDDEN,
+        ai_memory::handlers::StorageBackend::Sqlite => StatusCode::OK,
+    };
+    assert_eq!(
+        out.status, want,
+        "a visible unstamped row keeps the #3124 gate: {}",
+        out.body
+    );
+}
+
+// ---------------------------------------------------------------------------
+// PR 9390 round-1 notice, item 4 (L3) — DELETE /links whose SOURCE is hidden
+// and whose TARGET the caller owns answers like a decoy source, and the link
+// survives.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unlink_hidden_source_owned_target_answers_like_a_decoy_9390() {
+    use ai_memory::handlers::routes;
+    let fx = build(HttpIdentityMode::Enforce, true).await;
+    let suffix = run_suffix();
+    let ns = format!("ns-unlink-9390-{suffix}");
+    let marker = format!("unlink-marker-9390-{suffix}");
+    let source = seed_8994(&fx, &ns, "private", &marker).await;
+    let target = seed_as_8994(
+        &fx,
+        (BOB_KEY, BOB),
+        &ns,
+        "collective",
+        &format!("{marker}-bob"),
+    )
+    .await;
+    let edge = |src: &str| serde_json::json!({"source_id": src, "target_id": target, "relation": RELATION_8994});
+    let linked = send_simple(
+        &fx.router,
+        "post",
+        routes::LINKS,
+        ALICE_KEY,
+        &[ALICE],
+        Some(edge(&source)),
+    )
+    .await;
+    assert!(
+        linked.status.is_success(),
+        "alice links her private row to bob's: {} {}",
+        linked.status,
+        linked.body
+    );
+
+    let mut folded = Vec::with_capacity(2);
+    for src in [source.as_str(), B3_DECOY_ID] {
+        let out = send_simple(
+            &fx.router,
+            "delete",
+            routes::LINKS,
+            BOB_KEY,
+            &[BOB],
+            Some(edge(src)),
+        )
+        .await;
+        folded.push((out.status, fold_id_8994(&out.body, src)));
+    }
+    assert_eq!(
+        folded[0], folded[1],
+        "PR 9390 L3: a hidden source with an owned target answers like a decoy source"
+    );
+    assert_eq!(folded[0].0, StatusCode::NOT_FOUND, "{:?}", folded[0]);
+    // The link survived: its owner can still remove it.
+    let owner = send_simple(
+        &fx.router,
+        "delete",
+        routes::LINKS,
+        ALICE_KEY,
+        &[ALICE],
+        Some(edge(&source)),
+    )
+    .await;
+    assert!(
+        owner.status.is_success(),
+        "the link survived bob's refused unlink: {} {}",
+        owner.status,
+        owner.body
+    );
+}
+
+// ---------------------------------------------------------------------------
+// PR 9390 round-1 notice, item 6 (H1 hint) — with ZERO keys enrolled under
+// Enforce, no route reaches a handler acting as a caller-chosen principal:
+// a header name is refused on every gated route, and a body / query name
+// sent by the anonymous caller never reads bob's private row nor writes a
+// row stamped as bob.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn zero_keys_no_route_acts_as_a_caller_chosen_principal_9390() {
+    let fx = build(HttpIdentityMode::Enforce, false).await;
+    let suffix = run_suffix();
+    let ns = format!("ns-zero-keys-9390-{suffix}");
+    let marker = format!("zero-keys-marker-9390-{suffix}");
+    seed_private_9390(&fx, BOB, &ns, &marker).await;
+
+    let mut served = Vec::new();
+    let mut checked = 0usize;
+    for row in ROUTE_TABLE {
+        if row.class == RouteClass::Exempt {
+            continue;
+        }
+        checked += 1;
+        let path = concrete_path(row.path);
+        let header = send_simple(&fx.router, row.method, &path, SHARED_KEY, &[BOB], None).await;
+        if !header.is_funnel_refusal() && !header.is_backend_gate_refusal() {
+            served.push(format!(
+                "header {} {} -> {}",
+                row.method, path, header.status
+            ));
+        }
+        let sep = if path.contains('?') { '&' } else { '?' };
+        let uri = format!("{path}{sep}agent_id={BOB}&as_agent={BOB}&namespace={ns}");
+        let body = serde_json::json!({
+            "agent_id": BOB, "as_agent": BOB, "namespace": ns, "query": marker,
+            "context": marker, "title": format!("{marker}-claimed"),
+            "content": format!("{marker}-claimed"),
+        });
+        let claimed = send_simple(&fx.router, row.method, &uri, SHARED_KEY, &[], Some(body)).await;
+        if claimed.body.to_string().contains(&format!("\"{marker}\"")) {
+            served.push(format!("body {} {} read bob's row", row.method, path));
+        }
+    }
+    let ctx = ai_memory::store::CallerContext::for_admin("fixture-9390");
+    let mut filter = ai_memory::store::Filter::default();
+    filter.namespace = Some(ns.clone());
+    filter.limit = 1000;
+    let stamped_bob = fx
+        .store
+        .list(&ctx, &filter)
+        .await
+        .expect("list ns")
+        .into_iter()
+        .filter(|m| m.metadata.get("agent_id").and_then(|v| v.as_str()) == Some(BOB))
+        .count();
+    assert!(checked > 0, "the table has gated rows");
+    assert!(
+        served.is_empty(),
+        "zero keys, caller-chosen principal served: {served:#?}"
+    );
+    assert_eq!(stamped_bob, 1, "only the seeded row is stamped as bob");
+}

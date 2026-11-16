@@ -433,7 +433,10 @@ async fn update_memory_write(
         // X-Agent-Id header so update() can authorize against the
         // memory's owner. Pre-fix this hardcoded "ai:http" which made
         // every update appear as if from the legacy daemon principal.
-        let ctx = crate::handlers::parity::http_caller_ctx(&headers, None);
+        let ctx = match crate::handlers::parity::http_caller_ctx_checked(&headers, None) {
+            Ok(ctx) => ctx,
+            Err(refusal) => return refusal,
+        };
         // FBL-12 residual (#2378) — charge the storage-byte GROWTH of this
         // in-place update against the row OWNER's per-namespace storage cap
         // BEFORE the trait write lands, mirroring the sqlite branch below.
@@ -445,7 +448,19 @@ async fn update_memory_write(
         // immutable row owner (`metadata.agent_id`) + effective namespace;
         // a legacy-unowned row (empty owner) is uncharged, mirroring the
         // create path. SAL new-operation recipe (prescribed precedent).
-        let existing_for_quota = app.store.get(&ctx, &id).await.ok();
+        // PR 9390 L2 (ERRORS-19) — only NotFound means "not visible"; any
+        // other store error (I/O, lock, decode) is the error, answered with
+        // its own status before anything is written.
+        let existing_for_quota = match app.store.get(&ctx, &id).await {
+            Ok(existing) => Some(existing),
+            Err(crate::store::StoreError::NotFound { .. }) => None,
+            Err(e) => {
+                return super::store_err_to_response_for(
+                    e,
+                    crate::handlers::parity::RowVisibility::from_scoped_lookup(false),
+                );
+            }
+        };
         let quota_charge: Option<(String, String, i64)> = match existing_for_quota.as_ref() {
             Some(existing) => {
                 let owner = existing
@@ -489,7 +504,12 @@ async fn update_memory_write(
                         // QuotaExceeded → 429 (full envelope) and every
                         // other charge error → its typed status, both via
                         // the shared `store_err_to_response` mapper.
-                        Err(e) => return store_err_to_response(e),
+                        Err(e) => {
+                            return super::store_err_to_response_for(
+                                e,
+                                crate::handlers::parity::RowVisibility::Visible,
+                            );
+                        }
                     }
                 }
             }
@@ -634,7 +654,14 @@ async fn update_memory_write(
                     )
                         .into_response();
                 }
-                store_err_to_response(e)
+                // #8994 — the scoped pre-get above decides visibility: a row
+                // the caller cannot read answers like an absent id.
+                super::store_err_to_response_for(
+                    e,
+                    crate::handlers::parity::RowVisibility::from_scoped_lookup(
+                        existing_for_quota.is_some(),
+                    ),
+                )
             }
         };
     }
@@ -706,7 +733,18 @@ async fn update_memory_write(
     // compatibility for boot-time / hook-driven updates that don't
     // route through X-Agent-Id (the audit chain captures the daemon-
     // origin path via signed_events).
-    let existing_for_authz = db::get(&lock.0, &resolved_id).ok().flatten();
+    // PR 9390 L2 (ERRORS-19) — a lookup error is a 500, never "no row".
+    let existing_for_authz = match db::get(&lock.0, &resolved_id) {
+        Ok(existing) => existing,
+        Err(e) => {
+            tracing::error!("update_memory: owner lookup failed: {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": crate::errors::msg::INTERNAL_SERVER_ERROR})),
+            )
+                .into_response();
+        }
+    };
     if let Some(ref existing) = existing_for_authz {
         // #954 (Track A QC sweep, 2026-05-20) — delegated to the
         // canonical DRY helper. The previous inline check has been
@@ -1246,7 +1284,12 @@ pub async fn delete_memory(
                 }
                 (StatusCode::OK, Json(receipt)).into_response()
             }
-            Err(e) => store_err_to_response(e),
+            // #8994 — the scoped pre-get decides visibility: a row the
+            // caller cannot read answers like an absent id.
+            Err(e) => super::store_err_to_response_for(
+                e,
+                crate::handlers::parity::RowVisibility::from_scoped_lookup(target.is_some()),
+            ),
         };
     }
 

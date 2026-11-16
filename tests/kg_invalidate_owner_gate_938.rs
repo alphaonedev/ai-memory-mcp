@@ -37,16 +37,21 @@
 //!
 //! Tests:
 //!
-//! 1. `bob_cannot_invalidate_alice_link_938` — alice owns a source
-//!    memory and a `:related_to` edge from it; bob's POST returns
-//!    HTTP 403 and the link's `valid_until` remains NULL.
-//! 2. `owner_can_invalidate_own_link_938` — alice's POST against her
+//! 1. `bob_cannot_invalidate_alice_link_938` — alice owns a private
+//!    source memory and a `:related_to` edge from it; bob cannot read
+//!    the source, so his POST gets the absent-source 404, equal to the
+//!    answer for a decoy id (#8994), and the link's `valid_until`
+//!    remains NULL.
+//! 2. `bob_cannot_invalidate_visible_alice_link_938` — the source is a
+//!    collective row bob can read but does not own: HTTP 403
+//!    `NOT_OWNER`, the link's `valid_until` remains NULL.
+//! 3. `owner_can_invalidate_own_link_938` — alice's POST against her
 //!    own link returns HTTP 200 + `found: true` and the link's
 //!    `valid_until` is now stamped.
-//! 3. `missing_source_returns_404_938` — POST against a non-existent
+//! 4. `missing_source_returns_404_938` — POST against a non-existent
 //!    source returns HTTP 404 (mirrors the canonical missing-source
 //!    envelope, not a 500).
-//! 4. `inbox_target_can_invalidate_938` — when the source memory is
+//! 5. `inbox_target_can_invalidate_938` — when the source memory is
 //!    a `_inbox/<recipient>` row (`metadata.target_agent_id` set), the
 //!    recipient can invalidate edges anchored to it (same semantic
 //!    as `store::is_visible_to_caller`).
@@ -248,22 +253,66 @@ async fn bob_cannot_invalidate_alice_link_938() {
 
     let router = build_router_fixture(db_path);
     let (status, body) = invalidate_as(&router, "bob", &alice_src, &alice_tgt, "related_to").await;
+    // #8994 — alice's unscoped source is private to her, so bob cannot read
+    // it: the refusal is the absent-source 404, byte-equal to the answer for
+    // a decoy id once the id is folded (no existence oracle). A source bob
+    // CAN read but does not own keeps 403 NOT_OWNER
+    // (`bob_cannot_invalidate_visible_alice_link_938`).
+    let decoy_src = uuid::Uuid::new_v4().to_string();
+    let (decoy_status, decoy_body) =
+        invalidate_as(&router, "bob", &decoy_src, &alice_tgt, "related_to").await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "#938 / #8994: bob (cannot read the source) MUST get the absent-source 404; body={body}"
+    );
+    assert_eq!(
+        (status, fold_id_938(&body, &alice_src)),
+        (decoy_status, fold_id_938(&decoy_body, &decoy_src)),
+        "#8994: a private source MUST answer exactly like a decoy id"
+    );
+    // #3426 — no part of the refusal may name the owner.
+    assert!(
+        !body.to_string().contains("alice"),
+        "#938 / #3426: no part of the refusal may name the owner; body={body}"
+    );
+    assert!(
+        link_valid_until(db_path, &alice_src, &alice_tgt, "related_to").is_none(),
+        "#938: link valid_until MUST remain NULL after bob's refused POST"
+    );
+}
+
+/// The refusal body with the probed source id replaced by a fixed token, so a
+/// real id and a decoy id can be compared byte for byte (#8994).
+fn fold_id_938(body: &Value, id: &str) -> String {
+    body.to_string().replace(id, "<source-id>")
+}
+
+#[tokio::test]
+async fn bob_cannot_invalidate_visible_alice_link_938() {
+    let f = NamedTempFile::new().expect("tempfile");
+    let db_path = f.path();
+    // A collective row is readable by bob but owned by alice: the refusal is
+    // the #938 owner gate, 403 NOT_OWNER, never the #8994 404.
+    let scope = json!({"scope": "collective"});
+    let alice_src = seed_memory(db_path, "alice", "shared-938/e", &scope);
+    let alice_tgt = seed_memory(db_path, "alice", "shared-938/e", &scope);
+    seed_link(db_path, &alice_src, &alice_tgt, "related_to");
+
+    let router = build_router_fixture(db_path);
+    let (status, body) = invalidate_as(&router, "bob", &alice_src, &alice_tgt, "related_to").await;
     assert_eq!(
         status,
         StatusCode::FORBIDDEN,
-        "#938: bob (non-owner) MUST be refused with HTTP 403; body={body}"
+        "#938: bob (reader, non-owner) MUST be refused with HTTP 403; body={body}"
     );
     assert_eq!(
         body["caller"].as_str(),
         Some("bob"),
         "#938: 403 envelope must echo the rejected caller; body={body}"
     );
-    // #3426 — INVERTED. The 403 envelope previously echoed the source
-    // row's OWNING agent id back to a caller that is not entitled to the
-    // row, an identity oracle across tenants. The owner now goes only to
-    // the server-side `ai_memory::authz` trace line; the refusal is built
-    // by `parity::owner_gate_refusal`, which does not take an owner
-    // parameter at all, so the field cannot come back.
+    // #3426 — the refusal is built by `parity::owner_gate_refusal`, which
+    // takes no owner parameter, so the owning agent id cannot come back.
     assert!(
         body.get("owner").is_none(),
         "#938 / #3426: refusal MUST NOT disclose the owning agent id; body={body}"
