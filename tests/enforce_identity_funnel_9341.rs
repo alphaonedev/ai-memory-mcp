@@ -876,17 +876,12 @@ async fn b3_anonymous_shared_key_reads_no_private_row_writes_nothing_named_9341(
         leaks.is_empty(),
         "B-3 private row read anonymously: {leaks:?}"
     );
-    if on_postgres() {
-        assert!(
-            backend_gated.contains(&"MEMORY_RECALL_OBSERVATIONS"),
-            "B-3 on postgres: the recall-observations route is classified 501: {backend_gated:?}"
-        );
-    } else {
-        assert!(
-            backend_gated.is_empty(),
-            "B-3 on sqlite: no route answers the postgres 501: {backend_gated:?}"
-        );
-    }
+    // Both backends serve every gated route (the recall-observations route is
+    // not 501-gated on postgres), so no row is classified backend-gated.
+    assert!(
+        backend_gated.is_empty(),
+        "B-3: no route answers the postgres 501: {backend_gated:?}"
+    );
     eprintln!("B-3 backend-gated (postgres 501): {backend_gated:?}");
     eprintln!("B-3 input echoes (decoy-identical): {echoes:?}");
 
@@ -994,8 +989,7 @@ async fn b3_anonymous_shared_key_reads_no_private_row_writes_nothing_named_9341(
 /// #9366 direct cell: a recall-observation row is returned only to the
 /// principal it belongs to, or to an admin. alice recalls her private row;
 /// alice reads exactly her rows, bob and the anonymous shared-key caller read
-/// zero of them, the enrolled admin carol reads all of them. On postgres the
-/// route is gated 501 for every caller (fail closed, nothing served).
+/// zero of them, the enrolled admin carol reads all of them, on both backends.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn recall_observations_rows_scoped_to_owner_or_admin_9366() {
     let fx = build_with_admin(HttpIdentityMode::Enforce, true, Some(SHARED_KEY), CAROL).await;
@@ -1038,10 +1032,14 @@ async fn recall_observations_rows_scoped_to_owner_or_admin_9366() {
         recalled.body
     );
 
-    // (rows naming alice's seeded memory, rows owned by alice, total rows)
+    // (rows naming alice's seeded memory, rows owned by alice, total rows),
+    // all counted inside this cell's own namespace (a postgres database is
+    // shared by every cell of the binary), plus the rows owned by alice
+    // anywhere in the answer.
     let read_as = |key: &'static str, ids: &'static [&'static str]| {
         let router = fx.router.clone();
         let seeded_id = seeded_id.clone();
+        let ns = ns.clone();
         async move {
             let out = send_simple(
                 &router,
@@ -1052,45 +1050,47 @@ async fn recall_observations_rows_scoped_to_owner_or_admin_9366() {
                 Some(serde_json::json!({})),
             )
             .await;
-            if on_postgres() {
-                assert!(
-                    out.is_backend_gate_refusal(),
-                    "pg: {} {}",
-                    out.status,
-                    out.body
-                );
-                return None;
-            }
             assert_eq!(out.status, StatusCode::OK, "{key}: {}", out.body);
             let rows = out.body["observations"]
                 .as_array()
                 .cloned()
                 .unwrap_or_default();
-            let of = |f: &str, v: &str| rows.iter().filter(|r| r[f].as_str() == Some(v)).count();
-            Some((
-                of("memory_id", &seeded_id),
-                of("agent_id", ALICE),
-                rows.len(),
-            ))
+            let alice_anywhere = rows
+                .iter()
+                .filter(|r| r["agent_id"].as_str() == Some(ALICE))
+                .count();
+            let in_ns: Vec<&serde_json::Value> = rows
+                .iter()
+                .filter(|r| r["namespace"].as_str() == Some(ns.as_str()))
+                .collect();
+            let of = |f: &str, v: &str| in_ns.iter().filter(|r| r[f].as_str() == Some(v)).count();
+            (
+                (
+                    of("memory_id", &seeded_id),
+                    of("agent_id", ALICE),
+                    in_ns.len(),
+                ),
+                alice_anywhere,
+            )
         }
     };
-    let alice = read_as(ALICE_KEY, &[ALICE]).await;
-    let bob = read_as(BOB_KEY, &[BOB]).await;
-    let anonymous = read_as(SHARED_KEY, &[]).await;
-    let admin = read_as(CAROL_KEY, &[CAROL]).await;
-    let Some(alice) = alice else { return };
+    let (alice, _) = read_as(ALICE_KEY, &[ALICE]).await;
+    let (bob, bob_alice_rows) = read_as(BOB_KEY, &[BOB]).await;
+    let (anonymous, anonymous_alice_rows) = read_as(SHARED_KEY, &[]).await;
+    let (admin, _) = read_as(CAROL_KEY, &[CAROL]).await;
     assert_eq!(
         alice,
         (1, 1, 1),
         "alice reads exactly her one observation row"
     );
-    assert_eq!(bob, Some((0, 0, 0)), "bob reads none of alice's rows");
+    assert_eq!(bob, (0, 0, 0), "bob reads none of alice's rows");
+    assert_eq!(bob_alice_rows, 0, "bob reads no row of alice anywhere");
+    assert_eq!(anonymous, (0, 0, 0), "the anonymous caller reads no row");
     assert_eq!(
-        anonymous,
-        Some((0, 0, 0)),
-        "the anonymous caller reads no row"
+        anonymous_alice_rows, 0,
+        "the anonymous caller reads no row of alice anywhere"
     );
-    assert_eq!(admin, Some((1, 1, 1)), "the admin reads every row");
+    assert_eq!(admin, (1, 1, 1), "the admin reads every row");
 }
 
 /// `true` when this binary's store is postgres (the [`store_for`] predicate).
@@ -1192,4 +1192,225 @@ fn b8_dedup_per_key_and_claimed_id_is_bounded_9341() {
         due <= ADVISORY_UNPROVEN_DEDUP_CAP,
         "dedup set must be bounded: {due}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// #8994 — no existence oracle on an id-addressed mutation or link route.
+//
+// Invariant, both backends: a caller who is neither the owner nor an admin
+// gets the SAME status and body (the id replaced by a placeholder) for a real
+// private id and for a decoy id that names no row, that answer is the route's
+// 404 not-found, and nothing is written. A row the caller CAN see but may not
+// modify keeps its 403 NOT_OWNER (pinned separately below).
+// ---------------------------------------------------------------------------
+
+/// The decoy endpoint every link-shaped probe names on the far side of the edge.
+const DECOY_TARGET_8994: &str = "00000000-0000-4000-8000-000000008994";
+/// The placeholder the probe ids are folded to before two answers are compared.
+const ID_PLACEHOLDER_8994: &str = "<id>";
+/// The relation every link-shaped probe names (validated, closed set).
+const RELATION_8994: &str = "related_to";
+/// The body a non-owner PUT sends; never lands on a row it cannot see.
+const OVERWRITE_8994: &str = "overwritten-by-a-non-owner-8994";
+
+/// One id-addressed route of the #8994 table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Probe8994 {
+    PutMemory,
+    DeleteMemory,
+    Lineage,
+    KgInvalidate,
+    LinkDelete,
+    LinkCreate,
+}
+
+const PROBES_8994: [Probe8994; 6] = [
+    Probe8994::PutMemory,
+    Probe8994::DeleteMemory,
+    Probe8994::Lineage,
+    Probe8994::KgInvalidate,
+    Probe8994::LinkDelete,
+    Probe8994::LinkCreate,
+];
+
+/// The two non-owner, non-admin callers: another named agent with its own
+/// valid key, and the anonymous shared-key caller.
+const CALLERS_8994: [(&str, &str, &[&str]); 2] =
+    [("bob", BOB_KEY, &[BOB]), ("anonymous", SHARED_KEY, &[])];
+
+impl Probe8994 {
+    /// `(method, uri, body)` addressing `id` (and `target` for an edge).
+    fn request(self, id: &str, target: &str) -> (&'static str, String, Option<serde_json::Value>) {
+        use ai_memory::handlers::routes;
+        let edge =
+            serde_json::json!({"source_id": id, "target_id": target, "relation": RELATION_8994});
+        match self {
+            Self::PutMemory => (
+                "put",
+                concrete_path_naming(routes::MEMORIES_ID, id),
+                Some(serde_json::json!({"content": OVERWRITE_8994})),
+            ),
+            Self::DeleteMemory => (
+                "delete",
+                concrete_path_naming(routes::MEMORIES_ID, id),
+                None,
+            ),
+            Self::Lineage => (
+                "get",
+                concrete_path_naming(routes::MEMORIES_ID_LINEAGE, id),
+                None,
+            ),
+            Self::KgInvalidate => ("post", routes::KG_INVALIDATE.to_string(), Some(edge)),
+            Self::LinkDelete => ("delete", routes::LINKS.to_string(), Some(edge)),
+            Self::LinkCreate => ("post", routes::LINKS.to_string(), Some(edge)),
+        }
+    }
+
+    /// The exact 404 body a missing (or invisible) id gets, placeholder-folded.
+    fn not_found_body(self) -> serde_json::Value {
+        use ai_memory::errors::msg::SOURCE_MEMORY_NOT_FOUND;
+        match self {
+            Self::PutMemory | Self::DeleteMemory | Self::LinkDelete => {
+                serde_json::json!({"error": "not found"})
+            }
+            Self::Lineage => {
+                serde_json::json!({"error": SOURCE_MEMORY_NOT_FOUND, "id": ID_PLACEHOLDER_8994})
+            }
+            Self::KgInvalidate => serde_json::json!({
+                "found": false, "source_id": ID_PLACEHOLDER_8994,
+                "target_id": DECOY_TARGET_8994, "relation": RELATION_8994,
+                "error": SOURCE_MEMORY_NOT_FOUND,
+            }),
+            Self::LinkCreate => serde_json::json!({
+                "error": SOURCE_MEMORY_NOT_FOUND, "source_id": ID_PLACEHOLDER_8994,
+            }),
+        }
+    }
+}
+
+/// `body` with every occurrence of `id` replaced by the placeholder.
+fn fold_id_8994(body: &serde_json::Value, id: &str) -> serde_json::Value {
+    let text = body.to_string().replace(id, ID_PLACEHOLDER_8994);
+    serde_json::from_str(&text).unwrap_or_else(|e| panic!("refold {text}: {e}"))
+}
+
+/// alice seeds one row in `ns` with `scope` and returns its id.
+async fn seed_8994(fx: &Fixture, ns: &str, scope: &str, marker: &str) -> String {
+    let seeded = send_simple(
+        &fx.router,
+        "post",
+        &concrete_path(ai_memory::handlers::routes::MEMORIES),
+        ALICE_KEY,
+        &[ALICE],
+        Some(serde_json::json!({
+            "title": marker, "content": marker, "namespace": ns, "scope": scope,
+        })),
+    )
+    .await;
+    assert!(
+        seeded.status.is_success(),
+        "seed {scope}: {} {}",
+        seeded.status,
+        seeded.body
+    );
+    seeded
+        .body
+        .get("id")
+        .or_else(|| seeded.body.pointer("/memory/id"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| panic!("seed returns the row id: {}", seeded.body))
+        .to_string()
+}
+
+/// alice's own read of `id`: still present, content untouched.
+async fn assert_untouched_8994(fx: &Fixture, id: &str, marker: &str) {
+    let read = send_simple(
+        &fx.router,
+        "get",
+        &concrete_path_naming(ai_memory::handlers::routes::MEMORIES_ID, id),
+        ALICE_KEY,
+        &[ALICE],
+        None,
+    )
+    .await;
+    assert_eq!(
+        read.status,
+        StatusCode::OK,
+        "owner re-read {id}: {}",
+        read.body
+    );
+    let content = read
+        .body
+        .get("content")
+        .or_else(|| read.body.pointer("/memory/content"))
+        .and_then(serde_json::Value::as_str);
+    assert_eq!(
+        content,
+        Some(marker),
+        "no non-owner write landed on {id}: {}",
+        read.body
+    );
+}
+
+/// #8994 — the invariant over the whole route table, both callers: a private
+/// row of alice answers exactly like a decoy id, with the route's 404 body.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn private_id_answers_like_a_decoy_on_every_id_route_8994() {
+    let fx = build(HttpIdentityMode::Enforce, true).await;
+    let suffix = run_suffix();
+    let ns = format!("ns-oracle-8994-{suffix}");
+    let marker = format!("private-marker-8994-{suffix}");
+    let private_id = seed_8994(&fx, &ns, "private", &marker).await;
+
+    let mut oracles = Vec::new();
+    for (who, key, ids) in CALLERS_8994 {
+        for probe in PROBES_8994 {
+            let mut folded = Vec::with_capacity(2);
+            for id in [private_id.as_str(), B3_DECOY_ID] {
+                let (method, uri, body) = probe.request(id, DECOY_TARGET_8994);
+                let out = send_simple(&fx.router, method, &uri, key, ids, body).await;
+                folded.push((out.status, fold_id_8994(&out.body, id)));
+            }
+            let (real, decoy) = (&folded[0], &folded[1]);
+            let expected = (StatusCode::NOT_FOUND, probe.not_found_body());
+            if real != decoy || *real != expected {
+                oracles.push(format!(
+                    "{who} {probe:?}: private -> {} {} | decoy -> {} {}",
+                    real.0, real.1, decoy.0, decoy.1
+                ));
+            }
+        }
+    }
+    assert!(oracles.is_empty(), "#8994 existence oracle: {oracles:#?}");
+    assert_untouched_8994(&fx, &private_id, &marker).await;
+}
+
+/// #8994 — the fix must not turn a legitimate 403 into a 404: a row bob CAN
+/// see (alice's collective row) but does not own keeps 403 NOT_OWNER on every
+/// mutation route, the lineage read of it is served, and nothing is written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn visible_row_of_another_owner_keeps_403_not_owner_8994() {
+    let fx = build(HttpIdentityMode::Enforce, true).await;
+    let suffix = run_suffix();
+    let ns = format!("ns-visible-8994-{suffix}");
+    let marker = format!("collective-marker-8994-{suffix}");
+    let source = seed_8994(&fx, &ns, "collective", &marker).await;
+    let target = seed_8994(&fx, &ns, "collective", &format!("{marker}-target")).await;
+
+    let mut wrong = Vec::new();
+    for probe in PROBES_8994 {
+        let (method, uri, body) = probe.request(&source, &target);
+        let out = send_simple(&fx.router, method, &uri, BOB_KEY, &[BOB], body).await;
+        let ok = if probe == Probe8994::Lineage {
+            out.status == StatusCode::OK
+        } else {
+            out.status == StatusCode::FORBIDDEN
+                && out.body["code"].as_str() == Some(ai_memory::errors::error_codes::NOT_OWNER)
+        };
+        if !ok {
+            wrong.push(format!("{probe:?}: {} {}", out.status, out.body));
+        }
+    }
+    assert!(wrong.is_empty(), "#8994 visible-row answers: {wrong:#?}");
+    assert_untouched_8994(&fx, &source, &marker).await;
 }
