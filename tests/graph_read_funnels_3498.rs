@@ -454,11 +454,16 @@ async fn http_anchor_contract_matrix(
             );
         }
     }
+    // #8994: a hidden substrate target answers exactly like a target id that
+    // names no row (the one not-found body), so neither leaks existence.
+    let absent_target = "00000000-0000-4000-8000-000000008994".to_string();
+    let not_found_8994 = json!({"error": "not found"});
     for (target, expected) in [
         (&unowned, StatusCode::CREATED),
         (&empty_owner, StatusCode::CREATED),
         (&own, StatusCode::CREATED),
-        (&other, StatusCode::FORBIDDEN),
+        (&other, StatusCode::NOT_FOUND),
+        (&absent_target, StatusCode::NOT_FOUND),
         (&foreign_owned, StatusCode::CREATED),
     ] {
         let response = router
@@ -487,5 +492,9 @@ async fn http_anchor_contract_matrix(
             "link target {target}: {}",
             String::from_utf8_lossy(&bytes)
         );
+        if expected == StatusCode::NOT_FOUND {
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body, not_found_8994, "#8994 link target {target}");
+        }
     }
 }

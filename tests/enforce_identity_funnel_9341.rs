@@ -60,6 +60,9 @@ const BODY_READ_TIMEOUT: Duration = Duration::from_millis(500);
 /// Keeps the per-test database file alive for the router's lifetime.
 struct Fixture {
     router: axum::Router,
+    /// The router's own store, for seeding rows HTTP refuses to write
+    /// (substrate namespaces) and for reading back what a refusal wrote.
+    store: Arc<dyn ai_memory::store::MemoryStore>,
     _db_file: NamedTempFile,
 }
 
@@ -148,7 +151,7 @@ async fn build_with_admin(
         active_keypair: Arc::new(None),
         family_embeddings: Arc::new(tokio::sync::RwLock::new(Some(Vec::new()))),
         storage_backend,
-        store,
+        store: store.clone(),
         llm: Arc::new(ai_memory::reload::SwappableLlm::new(None)),
         auto_tag_model: Arc::new(None),
         llm_call_timeout: Duration::from_secs(30),
@@ -181,6 +184,7 @@ async fn build_with_admin(
     };
     Fixture {
         router: ai_memory::build_router(api_key_state, app_state),
+        store,
         _db_file: f,
     }
 }
@@ -1291,12 +1295,23 @@ fn fold_id_8994(body: &serde_json::Value, id: &str) -> serde_json::Value {
 
 /// alice seeds one row in `ns` with `scope` and returns its id.
 async fn seed_8994(fx: &Fixture, ns: &str, scope: &str, marker: &str) -> String {
+    seed_as_8994(fx, (ALICE_KEY, ALICE), ns, scope, marker).await
+}
+
+/// `who` (its key and id) seeds one row in `ns` with `scope`; returns its id.
+async fn seed_as_8994(
+    fx: &Fixture,
+    who: (&str, &str),
+    ns: &str,
+    scope: &str,
+    marker: &str,
+) -> String {
     let seeded = send_simple(
         &fx.router,
         "post",
         &concrete_path(ai_memory::handlers::routes::MEMORIES),
-        ALICE_KEY,
-        &[ALICE],
+        who.0,
+        &[who.1],
         Some(serde_json::json!({
             "title": marker, "content": marker, "namespace": ns, "scope": scope,
         })),
@@ -1408,4 +1423,88 @@ async fn visible_row_of_another_owner_keeps_403_not_owner_8994() {
     }
     assert!(wrong.is_empty(), "#8994 visible-row answers: {wrong:#?}");
     assert_untouched_8994(&fx, &source, &marker).await;
+}
+
+/// The substrate namespace alice's private target row lives in (#3498).
+fn substrate_ns_8994(suffix: &str) -> String {
+    format!("_inbox/{ALICE}-8994-{suffix}")
+}
+
+/// #8994 / #3498 — `POST /api/v1/links` from bob's own source to a PRIVATE
+/// substrate row of alice answers exactly like a link to a decoy target id
+/// (same status, same body once the target id is folded), and no edge is
+/// written. Pre-fix the substrate target got `403 {"error": "caller cannot
+/// see the link target"}` while the decoy got the absent-target answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn private_substrate_target_answers_like_a_decoy_target_8994() {
+    let fx = build(HttpIdentityMode::Enforce, true).await;
+    let suffix = run_suffix();
+    let ns = format!("ns-target-8994-{suffix}");
+    let source = seed_as_8994(
+        &fx,
+        (BOB_KEY, BOB),
+        &ns,
+        "collective",
+        &format!("bob-source-8994-{suffix}"),
+    )
+    .await;
+    // HTTP refuses a caller write into a substrate namespace, so the hidden
+    // target is seeded through the router's own store (both backends).
+    let hidden_ns = substrate_ns_8994(&suffix);
+    let now = chrono::Utc::now().to_rfc3339();
+    let hidden_row = ai_memory::models::Memory {
+        id: uuid::Uuid::new_v4().to_string(),
+        namespace: hidden_ns.clone(),
+        title: format!("alice-substrate-8994-{suffix}"),
+        content: format!("alice-substrate-8994-{suffix}"),
+        created_at: now.clone(),
+        updated_at: now,
+        metadata: serde_json::json!({
+            "agent_id": ALICE, "scope": "private", "target_agent_id": ALICE,
+        }),
+        ..ai_memory::models::Memory::default()
+    };
+    let hidden = fx
+        .store
+        .store(
+            &ai_memory::store::CallerContext::for_admin("fixture-8994"),
+            &hidden_row,
+        )
+        .await
+        .expect("seed the hidden substrate target");
+
+    let mut folded = Vec::with_capacity(2);
+    for target in [hidden.as_str(), DECOY_TARGET_8994] {
+        let out = send_simple(
+            &fx.router,
+            "post",
+            ai_memory::handlers::routes::LINKS,
+            BOB_KEY,
+            &[BOB],
+            Some(serde_json::json!({
+                "source_id": source, "target_id": target, "relation": RELATION_8994,
+            })),
+        )
+        .await;
+        folded.push((out.status, fold_id_8994(&out.body, target)));
+    }
+    assert_eq!(
+        folded[0], folded[1],
+        "#8994 link-target oracle: private substrate target vs decoy target"
+    );
+    assert!(
+        !folded[0].0.is_success(),
+        "a link to a target bob cannot see is refused: {:?}",
+        folded[0]
+    );
+
+    let written = fx
+        .store
+        .get_links_for_anchor(&source)
+        .await
+        .expect("read the source's links");
+    assert!(
+        written.iter().all(|l| l.target_id != hidden),
+        "no edge to the hidden target was written: {written:?}"
+    );
 }

@@ -544,19 +544,24 @@ pub async fn create_link(
                 Err(error) => return crate::handlers::errors::handler_error_500(&error),
             }
         };
-        if target.as_ref().is_some_and(|mem| {
+        // #8994 — a substrate target the caller cannot read answers EXACTLY
+        // like a target id that names no row: the one not-found refusal, on
+        // both backends, before the quota charge and the link write. The
+        // postgres read above already answers an absent id with that 404;
+        // the sqlite arm now does too (it used to fall through to the
+        // writer and surface the foreign-key failure as a 500).
+        let hidden_or_absent = target.as_ref().is_none_or(|mem| {
             crate::visibility::is_substrate_namespace(&mem.namespace)
                 && !crate::visibility::is_readable_on_query(
                     mem,
                     Some(&caller),
                     Some(&mem.namespace),
                 )
-        }) {
-            return (
-                StatusCode::FORBIDDEN,
-                Json(json!({"error": "caller cannot see the link target"})),
-            )
-                .into_response();
+        });
+        if hidden_or_absent {
+            return crate::handlers::parity::not_visible_refusal(
+                crate::handlers::parity::RefusedResource::Memory(&target_id),
+            );
         }
     }
 
