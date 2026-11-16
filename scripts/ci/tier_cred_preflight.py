@@ -32,6 +32,8 @@ system is starting up``) arrives in the server's ``lc_messages``.  On a tier tha
 the leg still fails closed, only without the distinct reason).  psql runs through the shared supervisor of
 ``ensure-age-extension.py`` (#6252, #6337, #6517): SIGTERM, SIGINT, the timeout or the death of this process stops
 psql, so no psql is left holding ``PGPASSWORD``.
+A shared ``workflow_annotation.py`` next to this file that cannot be loaded is exit 1 with one fixed ``::error``
+line built without it, before anything is read (#9365).
 psql's stderr is never echoed (it can carry connection detail); every output line is one GitHub ``::error::`` or
 plain notice line built from constants, the URL file path and ``$RUNNER_NAME``.  The classification is a fixed set
 of substring tests, linear in the stderr length.
@@ -63,12 +65,20 @@ def _load_workflow_annotation():
     return module
 
 
-wa = _load_workflow_annotation()
-
 EXIT_OK = 0
 EXIT_UNAVAILABLE = 1
 EXIT_BAD_INPUT = 2
 EXIT_MISMATCH = 3
+
+try:
+    wa = _load_workflow_annotation()
+except (Exception, SystemExit) as exc:  # a gate fails closed, loudly and without the module (#9365, ruling 0011e5e0)
+    print("tier_cred_preflight: refused: shared module workflow_annotation.py next to the script"
+          " cannot be loaded (%s)" % type(exc).__name__, file=sys.stderr, flush=True)
+    print("::error title=tier_cred_preflight refused::tier_cred_preflight: refused: shared module"
+          " workflow_annotation.py next to the script cannot be loaded", flush=True)
+    sys.exit(EXIT_UNAVAILABLE)
+
 
 DEFAULT_TIMEOUT_SECONDS = 60
 PROBE_SQL = "SELECT 1"

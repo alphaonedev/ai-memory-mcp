@@ -4,7 +4,8 @@
 Waits (bounded) while the 1-minute load average exceeds ``ratio x cores``, then
 proceeds. It NEVER fails on load alone: after ``--max-wait-secs`` it prints a
 ``::warning::`` and exits 0, so a busy host delays a leg but never turns it red.
-Exit 2 is reserved for bad arguments.
+Exit 2 is reserved for bad arguments. Exit 3: the shared workflow_annotation.py
+next to this file cannot be loaded (a broken checkout, one ``::error`` line, #9365).
 
 Usage: python3 scripts/ci/load_gate.py --label "<os>/<tier>" [--max-ratio 1.5]
        [--max-wait-secs 1200] [--poll-secs 30]
@@ -33,7 +34,16 @@ def _load_workflow_annotation():
     return module
 
 
-wa = _load_workflow_annotation()
+EXIT_LOAD_REFUSED = 3  # the shared module cannot be loaded (0 = proceed, 2 = bad arguments)
+
+try:
+    wa = _load_workflow_annotation()
+except (Exception, SystemExit) as exc:  # a gate fails closed, loudly and without the module (#9365, ruling 0011e5e0)
+    print("load_gate: refused: shared module workflow_annotation.py next to the script"
+          " cannot be loaded (%s)" % type(exc).__name__, file=sys.stderr, flush=True)
+    print("::error title=load_gate refused::load_gate: refused: shared module"
+          " workflow_annotation.py next to the script cannot be loaded", flush=True)
+    sys.exit(EXIT_LOAD_REFUSED)
 
 TAG = '[#6795 load gate]'
 

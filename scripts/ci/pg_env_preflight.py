@@ -21,7 +21,9 @@ What it does:
      EXISTS age;`.
   4. On the first failure prints exactly one class line
      `::error::[<label>] PG-ENV <reason>` and exits 3.  Never a silent
-     skip, never exit 0 on a failed probe.
+     skip, never exit 0 on a failed probe.  A shared workflow_annotation.py
+     next to this file that cannot be loaded is the same exit 3, with one
+     fixed `::error` line built without it (#9365).
 
 Connection data comes from libpq environment variables (PGHOST, PGPORT,
 PGUSER, PGDATABASE, PGPASSWORD, PGSSLMODE, PGSSLROOTCERT); nothing
@@ -56,14 +58,22 @@ def _load_workflow_annotation():
     return module
 
 
-wa = _load_workflow_annotation()
+EXIT_OK = 0
+EXIT_PG_ENV = 3
+
+try:
+    wa = _load_workflow_annotation()
+except (Exception, SystemExit) as exc:  # a gate fails closed, loudly and without the module (#9365, ruling 0011e5e0)
+    print("pg_env_preflight: refused: shared module workflow_annotation.py next to the script"
+          " cannot be loaded (%s)" % type(exc).__name__, file=sys.stderr, flush=True)
+    print("::error title=pg_env_preflight refused::pg_env_preflight: refused: shared module"
+          " workflow_annotation.py next to the script cannot be loaded", flush=True)
+    sys.exit(EXIT_PG_ENV)
 
 DEFAULT_LABEL = "coverage-pg"
 DEFAULT_PSQL = "psql"
 DEFAULT_PKG_GLOB = "postgresql-16*"
 IMAGE_VERSION_ENV = "ImageVersion"
-EXIT_OK = 0
-EXIT_PG_ENV = 3
 PROBE_TIMEOUT_SECS = 60
 DOCKER_TIMEOUT_SECS = 180
 DEFAULT_WAIT_SECS = 120

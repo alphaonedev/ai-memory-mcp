@@ -19,7 +19,9 @@ SIGTERM/SIGINT/SIGHUP are forwarded to COMMAND's process group (then SIGKILL aft
 a grace period) and the lock is released in ``finally``.
 
 Exit codes: the child's code; 2 bad arguments; 3 no slot free within the wait
-budget (COMMAND never ran); 128+signal when COMMAND died from a signal.
+budget (COMMAND never ran); 4 the shared workflow_annotation.py next to this file
+cannot be loaded (COMMAND never ran, one ``::error`` line, #9365); 128+signal when
+COMMAND died from a signal.
 Python 3.9+, standard library only.
 """
 import argparse
@@ -49,7 +51,16 @@ def _load_workflow_annotation():
     return module
 
 
-wa = _load_workflow_annotation()
+EXIT_LOAD_REFUSED = 4  # the shared module cannot be loaded (2 = bad arguments, 3 = no slot, else the child's)
+
+try:
+    wa = _load_workflow_annotation()
+except (Exception, SystemExit) as exc:  # a gate fails closed, loudly and without the module (#9365, ruling 0011e5e0)
+    print("host_semaphore: refused: shared module workflow_annotation.py next to the script"
+          " cannot be loaded (%s)" % type(exc).__name__, file=sys.stderr, flush=True)
+    print("::error title=host_semaphore refused::host_semaphore: refused: shared module"
+          " workflow_annotation.py next to the script cannot be loaded", flush=True)
+    sys.exit(EXIT_LOAD_REFUSED)
 
 SEMAPHORE_SLOTS_DEFAULT = 2
 SEMAPHORE_MAX_WAIT_SECS_DEFAULT = 3600

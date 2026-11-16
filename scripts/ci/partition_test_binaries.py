@@ -38,7 +38,9 @@ Fail closed (exit 2, ``::error::`` on stderr) when:
   lib Postgres test would otherwise run in a parallel shard against the shared
   database);
 * a target name contains a character outside ``[A-Za-z0-9_.-]`` (the shell
-  consumer word-splits the lines).
+  consumer word-splits the lines);
+* the shared ``workflow_annotation.py`` next to this file cannot be loaded (the
+  fixed ``::error`` line then goes to stdout and the cause to stderr, #9365).
 
 Python 3.9+, standard library only.
 """
@@ -67,7 +69,16 @@ def _load_workflow_annotation():
     return module
 
 
-wa = _load_workflow_annotation()
+EXIT_FAIL_CLOSED = 2  # every fail-closed condition, a shared module that cannot be loaded included
+
+try:
+    wa = _load_workflow_annotation()
+except (Exception, SystemExit) as exc:  # a gate fails closed, loudly and without the module (#9365, ruling 0011e5e0)
+    print("partition_test_binaries: refused: shared module workflow_annotation.py next to the script"
+          " cannot be loaded (%s)" % type(exc).__name__, file=sys.stderr, flush=True)
+    print("::error title=partition_test_binaries refused::partition_test_binaries: refused: shared module"
+          " workflow_annotation.py next to the script cannot be loaded", flush=True)
+    sys.exit(EXIT_FAIL_CLOSED)
 
 # Class (a) evidence. Scout report CI-SHARD-SCOUT-2026-10-09, plus the shared
 # lane-database helpers under tests/common that only Postgres cells use.
@@ -1350,7 +1361,7 @@ def main(argv=None):
         return run(args)
     except PartitionError as exc:
         print(wa.annotation("error", "[#6344 shard] %s" % exc), file=sys.stderr)
-        return 2
+        return EXIT_FAIL_CLOSED
 
 
 if __name__ == '__main__':
