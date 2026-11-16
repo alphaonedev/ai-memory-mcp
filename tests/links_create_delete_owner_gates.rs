@@ -179,17 +179,48 @@ async fn delete_link_as(
     (status, v)
 }
 
+async fn get_links_as(router: &axum::Router, caller: &str, id: &str) -> (StatusCode, Value) {
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!("/api/v1/links/{id}"))
+        .header("x-agent-id", caller)
+        .body(Body::empty())
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), ai_memory::TEST_BODY_READ_CAP)
+        .await
+        .unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
 #[tokio::test]
 async fn bob_cannot_create_link_rooted_at_alice_memory_941() {
     let tmp = NamedTempFile::new().expect("tempfile");
     let alice_src = seed_memory(tmp.path(), "ai:alice", "link-gate/test", &json!({}));
     let target = seed_memory(tmp.path(), "ai:alice", "link-gate/test", &json!({}));
     let router = build_router_fixture(tmp.path());
-    let (status, _body) = post_link_as(&router, "ai:bob", &alice_src, &target).await;
+    let (status, body) = post_link_as(&router, "ai:bob", &alice_src, &target).await;
+    // #8994 — alice's PRIVATE source is not readable by bob, so the refusal
+    // is the one source not-found answer an absent id gets (pre-#8994 a
+    // 403, an existence oracle). The link is still refused and not written.
     assert_eq!(
-        status,
-        StatusCode::FORBIDDEN,
+        (status, &body),
+        (
+            StatusCode::NOT_FOUND,
+            &json!({"error": "source memory not found", "source_id": alice_src})
+        ),
         "bob must NOT be able to create a link rooted at alice's source memory"
+    );
+    let (owner_view, links) = get_links_as(&router, "ai:alice", &alice_src).await;
+    assert_eq!(owner_view, StatusCode::OK, "{links}");
+    assert_eq!(
+        links["links"].as_array().map(Vec::len),
+        Some(0),
+        "nothing written: {links}"
     );
 }
 
@@ -215,11 +246,20 @@ async fn bob_cannot_delete_alice_link_939() {
     let router = build_router_fixture(tmp.path());
     let (s1, _) = post_link_as(&router, "ai:alice", &alice_src, &alice_tgt).await;
     assert_eq!(s1, StatusCode::CREATED);
-    let (s2, _) = delete_link_as(&router, "ai:bob", &alice_src, &alice_tgt).await;
+    let (s2, body) = delete_link_as(&router, "ai:bob", &alice_src, &alice_tgt).await;
+    // #8994 / #9043 — bob can read neither private endpoint, so the refusal
+    // is the link's not-found answer (pre-#8994 a 403); nothing is deleted.
     assert_eq!(
-        s2,
-        StatusCode::FORBIDDEN,
+        (s2, &body),
+        (StatusCode::NOT_FOUND, &json!({"error": "not found"})),
         "bob owns neither endpoint → must NOT delete"
+    );
+    let (owner_view, links) = get_links_as(&router, "ai:alice", &alice_src).await;
+    assert_eq!(owner_view, StatusCode::OK, "{links}");
+    assert_eq!(
+        links["links"].as_array().map(Vec::len),
+        Some(1),
+        "the link survives: {links}"
     );
 }
 

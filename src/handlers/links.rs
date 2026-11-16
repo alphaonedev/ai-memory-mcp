@@ -377,6 +377,14 @@ async fn create_link_source_not_visible(
     }
     let lock = app.db.lock().await;
     let visibility = match db::get(&lock.0, source_id) {
+        // An UNSTAMPED row has no owner whose existence could leak; the
+        // #3124 owner gate below decides it (`AI_MEMORY_UNSTAMPED_MUTATION`)
+        // exactly as before #8994, so legacy unowned rows keep linking.
+        Ok(Some(mem))
+            if crate::identity::owner_stamp::OwnerStamp::of(&mem.metadata).is_unstamped() =>
+        {
+            RowVisibility::Visible
+        }
         Ok(Some(mem)) => RowVisibility::of(&mem, &caller),
         Ok(None) => RowVisibility::NotVisible,
         Err(e) => {
