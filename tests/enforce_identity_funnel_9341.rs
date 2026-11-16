@@ -102,6 +102,11 @@ fn permissive_attestation_for_tests() {
 /// Build the in-process router: shared key configured, `mode`, and (when
 /// `with_keys`) alice and bob each enrolled with a per-agent key.
 async fn build(mode: HttpIdentityMode, with_keys: bool) -> Fixture {
+    build_with(mode, with_keys, Some(SHARED_KEY)).await
+}
+
+/// The fixture with the shared key configured (`Some`) or not (`None`).
+async fn build_with(mode: HttpIdentityMode, with_keys: bool, shared_key: Option<&str>) -> Fixture {
     permissive_attestation_for_tests();
     ai_memory::handlers::admin_role::mark_request_authn_configured(true);
     let f = NamedTempFile::new().expect("tempfile");
@@ -152,7 +157,7 @@ async fn build(mode: HttpIdentityMode, with_keys: bool) -> Fixture {
         http_identity_mode: mode,
     };
     let api_key_state = ApiKeyState {
-        key: Some(SHARED_KEY.to_string()),
+        key: shared_key.map(str::to_string),
         mtls_enforced: false,
         enrolled_agent_keys: keys,
         identity_mode: mode,
@@ -236,8 +241,10 @@ fn request(
 ) -> axum::http::request::Builder {
     let mut b = Request::builder()
         .method(method.to_ascii_uppercase().as_str())
-        .uri(uri)
-        .header("x-api-key", key);
+        .uri(uri);
+    if !key.is_empty() {
+        b = b.header("x-api-key", key);
+    }
     for id in agent_ids {
         b = b.header("x-agent-id", *id);
     }
@@ -503,23 +510,6 @@ async fn advisory_mode_does_not_refuse_named_shared_key_caller_9341() {
     assert!(!out.is_funnel_refusal(), "{} {}", out.status, out.body);
 }
 
-/// Design point 2: Enforce with ZERO per-agent keys enrolled stays inert
-/// (#3155 boot WARN, #8552 lane): the funnel does not refuse.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn inert_enforce_zero_keys_keeps_current_behaviour_9341() {
-    let fx = build(HttpIdentityMode::Enforce, false).await;
-    let out = send_simple(
-        &fx.router,
-        "post",
-        ai_memory::handlers::routes::SIGNALS,
-        SHARED_KEY,
-        &[BOB],
-        None,
-    )
-    .await;
-    assert!(!out.is_funnel_refusal(), "{} {}", out.status, out.body);
-}
-
 // ---------------------------------------------------------------- break-it
 
 /// Case variants are distinct principals and are refused the same way.
@@ -673,4 +663,245 @@ async fn unmapped_cert_with_shared_key_is_refused_9341() {
     .expect("request");
     let out = send(&fx.router, req).await;
     assert!(out.is_funnel_refusal(), "{} {}", out.status, out.body);
+}
+
+// ------------------------------------------- 3-agent vote (71472661) cells
+
+/// Per-run unique suffix: a postgres backend keeps rows between runs.
+fn run_suffix() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    format!("{}-{nanos}", std::process::id())
+}
+
+/// B-1: one state of the four (per-agent keys enrolled or not, shared key
+/// configured or not). A named, unproven caller is refused 403
+/// `attested_identity_required` in every one.
+async fn assert_named_unproven_refused(with_keys: bool, shared_key: Option<&str>) {
+    let fx = build_with(HttpIdentityMode::Enforce, with_keys, shared_key).await;
+    let out = send_simple(
+        &fx.router,
+        "post",
+        ai_memory::handlers::routes::SIGNALS,
+        shared_key.unwrap_or(""),
+        &[BOB],
+        None,
+    )
+    .await;
+    assert_eq!(
+        out.status,
+        StatusCode::FORBIDDEN,
+        "B-1 keys={with_keys} shared={}: {}",
+        shared_key.is_some(),
+        out.body
+    );
+    assert_eq!(out.error_code(), ATTESTED_IDENTITY_REQUIRED, "{}", out.body);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn b1_enforce_keys_enrolled_shared_key_refuses_named_9341() {
+    assert_named_unproven_refused(true, Some(SHARED_KEY)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn b1_enforce_no_keys_shared_key_refuses_named_9341() {
+    assert_named_unproven_refused(false, Some(SHARED_KEY)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn b1_enforce_keys_enrolled_no_shared_key_refuses_named_9341() {
+    assert_named_unproven_refused(true, None).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn b1_enforce_no_keys_no_shared_key_refuses_named_9341() {
+    assert_named_unproven_refused(false, None).await;
+}
+
+/// B-3: under Enforce the anonymous shared-key caller (no `X-Agent-Id`),
+/// swept over EVERY non-exempt route of the router-pinned table, never sees
+/// alice's private row and never writes a row attributed to a named agent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn b3_anonymous_shared_key_reads_no_private_row_writes_nothing_named_9341() {
+    let fx = build(HttpIdentityMode::Enforce, true).await;
+    let suffix = run_suffix();
+    let marker = format!("private-marker-9341-{suffix}");
+    let ns = format!("ns-b3-9341-{suffix}");
+    let seeded = send_simple(
+        &fx.router,
+        "post",
+        &concrete_path(ai_memory::handlers::routes::MEMORIES),
+        ALICE_KEY,
+        &[ALICE],
+        Some(serde_json::json!({
+            "title": marker, "content": marker, "namespace": ns, "scope": "private",
+        })),
+    )
+    .await;
+    assert!(
+        seeded.status.is_success(),
+        "seed: {} {}",
+        seeded.status,
+        seeded.body
+    );
+    // The row id, never the marker: a search route echoes its query string,
+    // so the marker in a response body is not by itself a read of the row.
+    let seeded_id = seeded
+        .body
+        .get("id")
+        .or_else(|| seeded.body.pointer("/memory/id"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| panic!("seed returns the row id: {}", seeded.body))
+        .to_string();
+
+    let mut leaks = Vec::new();
+    let mut checked = 0usize;
+    for row in ROUTE_TABLE.iter().filter(|r| r.class != RouteClass::Exempt) {
+        checked += 1;
+        let mut uri = concrete_path(row.path);
+        if row.method == "get" {
+            uri.push_str(&format!("?namespace={ns}&q={marker}&query={marker}"));
+        }
+        let out = send_simple(
+            &fx.router,
+            row.method,
+            &uri,
+            SHARED_KEY,
+            &[],
+            Some(serde_json::json!({"namespace": ns, "query": marker, "q": marker})),
+        )
+        .await;
+        if out.body.to_string().contains(&seeded_id) {
+            leaks.push(format!("{} {} -> {}", row.name, row.method, out.status));
+        }
+    }
+    assert!(checked > 0, "the table has gated rows");
+    assert!(
+        leaks.is_empty(),
+        "B-3 private row read anonymously: {leaks:?}"
+    );
+
+    // Every row in the namespace, as alice sees it: only her seed is named.
+    let listed = send_simple(
+        &fx.router,
+        "get",
+        &format!(
+            "{}?namespace={ns}",
+            concrete_path(ai_memory::handlers::routes::MEMORIES)
+        ),
+        ALICE_KEY,
+        &[ALICE],
+        None,
+    )
+    .await;
+    let rows = listed
+        .body
+        .get("memories")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let named_foreign: Vec<String> = rows
+        .iter()
+        .filter(|m| m.get("title").and_then(serde_json::Value::as_str) != Some(marker.as_str()))
+        .filter_map(|m| {
+            let owner = m
+                .pointer("/metadata/agent_id")
+                .and_then(serde_json::Value::as_str)?;
+            (owner == ALICE || owner == BOB).then(|| owner.to_string())
+        })
+        .collect();
+    assert!(
+        named_foreign.is_empty(),
+        "B-3 anonymous sweep wrote rows attributed to a named agent: {named_foreign:?}"
+    );
+}
+
+/// B-8: Advisory with the shared key and a named id is served (reported,
+/// not refused) and the report counter rises.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn b8_advisory_named_shared_key_is_counted_not_refused_9341() {
+    let fx = build(HttpIdentityMode::Advisory, true).await;
+    let before = ai_memory::handlers::advisory_identity_report::advisory_unproven_total();
+    let claimed = format!("bob-b8-{}", run_suffix());
+    let out = send_simple(
+        &fx.router,
+        "post",
+        ai_memory::handlers::routes::SIGNALS,
+        SHARED_KEY,
+        &[claimed.as_str()],
+        None,
+    )
+    .await;
+    assert!(!out.is_funnel_refusal(), "{} {}", out.status, out.body);
+    let after = ai_memory::handlers::advisory_identity_report::advisory_unproven_total();
+    assert!(after > before, "B-8 counter must rise: {before} -> {after}");
+}
+
+/// B-8 break-it: control bytes, newline, ANSI escape and quotes come out
+/// escaped; a 100K id is cut to the constant within a time ceiling.
+#[test]
+fn b8_claimed_id_is_escaped_and_bounded_9341() {
+    use ai_memory::handlers::advisory_identity_report::{
+        CLAIMED_ID_LOG_MAX_CHARS, claimed_id_for_log,
+    };
+    const HUGE_ID_LEN: usize = 100_000;
+    const ESCAPE_CEILING: Duration = Duration::from_millis(50);
+    for hostile in [
+        "a\u{0}b",
+        "a\nINFO forged",
+        "a\u{1b}[31mred",
+        "a\"b\\c",
+        "a\tb\r",
+    ] {
+        let shown = claimed_id_for_log(hostile);
+        assert!(
+            shown.bytes().all(|b| (0x20..0x7f).contains(&b)),
+            "{hostile:?} -> {shown:?}"
+        );
+        assert!(
+            !shown.contains('\n') && !shown.contains('\u{1b}'),
+            "{shown:?}"
+        );
+    }
+    let huge = "x".repeat(HUGE_ID_LEN);
+    let t = std::time::Instant::now();
+    let shown = claimed_id_for_log(&huge);
+    assert!(t.elapsed() < ESCAPE_CEILING, "{:?}", t.elapsed());
+    assert!(
+        shown.len() <= CLAIMED_ID_LOG_MAX_CHARS * 4 + 16,
+        "{}",
+        shown.len()
+    );
+    assert!(shown.ends_with("...(cut)"), "{shown}");
+}
+
+/// B-8 dedup: the WARN is due once per (key, claimed id); the counter counts
+/// every call; the set never grows past its cap.
+#[test]
+fn b8_dedup_per_key_and_claimed_id_is_bounded_9341() {
+    use ai_memory::handlers::advisory_identity_report::{
+        ADVISORY_UNPROVEN_DEDUP_CAP, advisory_unproven_total, observe_unproven_claim,
+    };
+    let suffix = run_suffix();
+    let claimed = format!("dedup-{suffix}");
+    let before = advisory_unproven_total();
+    assert!(observe_unproven_claim("k1", &claimed).is_some());
+    assert!(
+        observe_unproven_claim("k1", &claimed).is_none(),
+        "same pair twice"
+    );
+    assert!(
+        observe_unproven_claim("k2", &claimed).is_some(),
+        "other key is a new pair"
+    );
+    assert!(advisory_unproven_total() >= before + 3);
+    // Cycle more ids than the cap: once full, nothing new is due.
+    let due = (0..=ADVISORY_UNPROVEN_DEDUP_CAP * 2)
+        .filter(|i| observe_unproven_claim("k-cycle", &format!("c-{suffix}-{i}")).is_some())
+        .count();
+    assert!(
+        due <= ADVISORY_UNPROVEN_DEDUP_CAP,
+        "dedup set must be bounded: {due}"
+    );
 }
