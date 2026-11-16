@@ -766,13 +766,24 @@ pub async fn handle_reflect_http(
 
 /// `POST /api/v1/memory_recall_observations` — Provenance Gap 3
 /// recall-consumption observation read. Read-only over the
-/// `recall_observations` table; no caller-ownership gate (already
-/// scoped per-row by `agent_id`).
+/// `recall_observations` table. #9366: a row is returned only to the
+/// principal whose `agent_id` it carries, or to an enrolled admin; the
+/// scope is the request authority's (an anonymous principal owns no row).
 pub async fn handle_recall_observations_http(
     State(app): State<AppState>,
+    authority: Option<axum::Extension<crate::identity::authority::Authority>>,
     _headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
+    // Fail closed without the authority layer (a scaffold router): a fresh
+    // anonymous principal, which owns no row, never the whole ledger.
+    let anonymous;
+    let scope = if let Some(axum::Extension(a)) = &authority {
+        crate::observations::ObservationScope::for_authority(a)
+    } else {
+        anonymous = crate::identity::anonymous_request_id();
+        crate::observations::ObservationScope::Agent(&anonymous)
+    };
     // Postgres SAL path (#1549): read the recall-consumption ledger
     // through `MemoryStore::list_recall_observations`. Mirrors the
     // sqlite MCP path's filter parsing + `{observations, count}` shape.
@@ -803,7 +814,7 @@ pub async fn handle_recall_observations_http(
             });
         return match app
             .store
-            .list_recall_observations(recall_id, consumed, since, until, limit)
+            .list_recall_observations(scope, recall_id, consumed, since, until, limit)
             .await
         {
             Ok(rows) => {
@@ -823,7 +834,7 @@ pub async fn handle_recall_observations_http(
         };
     }
     let lock = app.db.lock().await;
-    let result = crate::mcp::handle_recall_observations(&lock.0, &body);
+    let result = crate::mcp::handle_recall_observations(&lock.0, &body, scope);
     drop(lock);
     match result {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),

@@ -256,11 +256,19 @@ fn recall_observations_tiebreak_is_rank_then_memory_id_2615() {
     insert("mD", 9, "2026-02-02T00:00:01.000Z");
 
     let order = |conn: &Connection| -> Vec<(String, i64)> {
-        observations::list_observations(conn, Some("rid"), None, None, None, 100)
-            .expect("list_observations")
-            .into_iter()
-            .map(|o| (o.memory_id, o.rank))
-            .collect()
+        observations::list_observations(
+            conn,
+            ai_memory::observations::ObservationScope::All,
+            Some("rid"),
+            None,
+            None,
+            None,
+            100,
+        )
+        .expect("list_observations")
+        .into_iter()
+        .map(|o| (o.memory_id, o.rank))
+        .collect()
     };
 
     let run1 = order(&conn);

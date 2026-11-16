@@ -144,7 +144,14 @@ async fn exercise_sal_surface(store: &dyn MemoryStore) {
     // exercises the read path AND the recall_id predicate.
     let absent_recall = format!("sal-cov-absent-recall-{}", uuid_like());
     let obs = store
-        .list_recall_observations(Some(&absent_recall), None, None, None, 50)
+        .list_recall_observations(
+            ai_memory::observations::ObservationScope::All,
+            Some(&absent_recall),
+            None,
+            None,
+            None,
+            50,
+        )
         .await
         .expect("list_recall_observations ok");
     assert!(
@@ -173,7 +180,14 @@ async fn exercise_sal_surface(store: &dyn MemoryStore) {
         "one identity-stamped ledger row written via the SAL trait"
     );
     let listed = store
-        .list_recall_observations(Some(&rid), None, None, None, 10)
+        .list_recall_observations(
+            ai_memory::observations::ObservationScope::All,
+            Some(&rid),
+            None,
+            None,
+            None,
+            10,
+        )
         .await
         .expect("list after record ok");
     assert_eq!(listed.len(), 1, "the written row is listed");
@@ -205,7 +219,14 @@ async fn exercise_sal_surface(store: &dyn MemoryStore) {
         .expect("mark_recall_consumed ok");
     assert_eq!(flipped, 1, "the owning agent's citation flips the row");
     let consumed = store
-        .list_recall_observations(Some(&rid), Some(true), None, None, 10)
+        .list_recall_observations(
+            ai_memory::observations::ObservationScope::All,
+            Some(&rid),
+            Some(true),
+            None,
+            None,
+            10,
+        )
         .await
         .expect("list consumed ok");
     assert_eq!(

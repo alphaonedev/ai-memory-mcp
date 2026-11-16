@@ -1676,7 +1676,9 @@ fn dispatch_memory_recall(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
 /// v0.7.0 Gap 3 (#886) — read-side dispatch for the
 /// `memory_recall_observations` tool.
 fn dispatch_memory_recall_observations(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
-    handle_recall_observations(ctx.conn, ctx.arguments)
+    // #9366 — the caller's own rows unless admin / trust-all local operator.
+    let scope = crate::observations::ObservationScope::for_authority(ctx.authority);
+    handle_recall_observations(ctx.conn, ctx.arguments, scope)
 }
 
 /// v0.8.0 Pillar 1 (#1709) — dispatch for `memory_action_create`.

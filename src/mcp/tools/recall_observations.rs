@@ -12,11 +12,14 @@ use serde_json::{Value, json};
 pub(crate) const DEFAULT_LIMIT: usize = 200;
 pub(crate) const MAX_LIMIT: usize = 1000;
 
-/// MCP handler. Filters compose with AND. Returns the ledger rows
-/// most-recent-first, JSON-shaped via `observations::Observation`.
+/// MCP handler. Filters compose with AND inside `scope` (#9366: a row is
+/// returned only to the principal it belongs to, or to an admin). Returns
+/// the ledger rows most-recent-first, JSON-shaped via
+/// `observations::Observation`.
 pub fn handle_recall_observations(
     conn: &rusqlite::Connection,
     params: &Value,
+    scope: observations::ObservationScope<'_>,
 ) -> Result<Value, String> {
     let recall_id = params
         .get("recall_id")
@@ -40,8 +43,9 @@ pub fn handle_recall_observations(
         .and_then(|n| usize::try_from(n).ok())
         .map_or(DEFAULT_LIMIT, |n| n.min(MAX_LIMIT));
 
-    let rows = observations::list_observations(conn, recall_id, consumed, since, until, limit)
-        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("list_observations", e))?;
+    let rows =
+        observations::list_observations(conn, scope, recall_id, consumed, since, until, limit)
+            .map_err(|e| crate::mcp::error_text::mcp_foreign_err("list_observations", e))?;
     let count = rows.len();
     Ok(json!({
         (crate::models::field_names::OBSERVATIONS): rows,
@@ -185,11 +189,20 @@ mod tests {
         .unwrap();
         mark_consumed(&conn, "r1", &["m1"], "consumer").unwrap();
 
-        let r = handle_recall_observations(&conn, &json!({"recall_id": "r1"})).expect("ok");
+        let r = handle_recall_observations(
+            &conn,
+            &json!({"recall_id": "r1"}),
+            observations::ObservationScope::All,
+        )
+        .expect("ok");
         assert_eq!(r["count"].as_u64(), Some(2));
 
-        let only_consumed =
-            handle_recall_observations(&conn, &json!({"consumed": true})).expect("ok");
+        let only_consumed = handle_recall_observations(
+            &conn,
+            &json!({"consumed": true}),
+            observations::ObservationScope::All,
+        )
+        .expect("ok");
         assert_eq!(only_consumed["count"].as_u64(), Some(1));
         assert_eq!(
             only_consumed["observations"][0]["memory_id"].as_str(),

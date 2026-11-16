@@ -2684,6 +2684,7 @@ impl MemoryStore for SqliteStore {
 
     async fn list_recall_observations(
         &self,
+        scope: crate::observations::ObservationScope<'_>,
         recall_id: Option<&str>,
         consumed: Option<bool>,
         since: Option<&str>,
@@ -2691,8 +2692,10 @@ impl MemoryStore for SqliteStore {
         limit: usize,
     ) -> StoreResult<Vec<crate::observations::Observation>> {
         let conn = self.state.lock().await;
-        crate::observations::list_observations(&conn, recall_id, consumed, since, until, limit)
-            .map_err(box_err)
+        crate::observations::list_observations(
+            &conn, scope, recall_id, consumed, since, until, limit,
+        )
+        .map_err(box_err)
     }
 
     async fn record_recall_observation(
@@ -5928,7 +5931,14 @@ mod tests {
             .expect("default recall records the ledger");
         assert!(!recorded.is_empty(), "default recall must hit the row");
         let after_default = store
-            .list_recall_observations(None, None, None, None, 100)
+            .list_recall_observations(
+                crate::observations::ObservationScope::All,
+                None,
+                None,
+                None,
+                None,
+                100,
+            )
             .await
             .expect("list after default");
         assert_eq!(
@@ -5950,7 +5960,14 @@ mod tests {
             .await
             .expect("skipped recall");
         let after_skip = store
-            .list_recall_observations(None, None, None, None, 100)
+            .list_recall_observations(
+                crate::observations::ObservationScope::All,
+                None,
+                None,
+                None,
+                None,
+                100,
+            )
             .await
             .expect("list after skip");
         assert_eq!(

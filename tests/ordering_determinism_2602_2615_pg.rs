@@ -295,7 +295,14 @@ async fn pg_recall_observations_tiebreak_matches_sqlite_across_recall_ids_2615()
 
     // Unfiltered read (`recall_id = None`) — the surface B2 targets.
     let pg_order: Vec<(String, String)> = store
-        .list_recall_observations(None, None, None, None, 100)
+        .list_recall_observations(
+            ai_memory::observations::ObservationScope::All,
+            None,
+            None,
+            None,
+            None,
+            100,
+        )
         .await
         .expect("pg list_recall_observations")
         .into_iter()
@@ -334,12 +341,19 @@ async fn pg_recall_observations_tiebreak_matches_sqlite_across_recall_ids_2615()
             )
             .expect("seed sqlite observation");
     }
-    let sqlite_order: Vec<(String, String)> =
-        ai_memory::observations::list_observations(&sconn, None, None, None, None, 100)
-            .expect("sqlite list_observations")
-            .into_iter()
-            .map(|o| (o.memory_id, o.recall_id))
-            .collect();
+    let sqlite_order: Vec<(String, String)> = ai_memory::observations::list_observations(
+        &sconn,
+        ai_memory::observations::ObservationScope::All,
+        None,
+        None,
+        None,
+        None,
+        100,
+    )
+    .expect("sqlite list_observations")
+    .into_iter()
+    .map(|o| (o.memory_id, o.recall_id))
+    .collect();
 
     assert_eq!(
         sqlite_order,

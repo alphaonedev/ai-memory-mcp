@@ -264,16 +264,54 @@ pub struct Observation {
     pub folded: bool,
 }
 
+/// #9366 — WHOSE recall-observation rows a ledger read may return. Every
+/// listing surface (HTTP route, MCP tool, CLI, the `MemoryStore` read) names
+/// one, so no caller reaches the ledger unscoped by omission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObservationScope<'a> {
+    /// Every row: an enrolled admin, the MCP stdio local operator (the
+    /// single-tenant trust-all posture, #1468) or the CLI on its own file.
+    All,
+    /// Only the rows whose `agent_id` is this principal. A legacy row with a
+    /// `NULL` `agent_id` belongs to no principal and is never returned here.
+    Agent(&'a str),
+}
+
+impl<'a> ObservationScope<'a> {
+    /// The scope the resolved request authority is entitled to: `All` for an
+    /// enrolled admin or the trust-all local operator, otherwise the
+    /// principal's own rows (an HTTP anonymous principal owns none).
+    #[must_use]
+    pub fn for_authority(authority: &'a crate::identity::authority::Authority) -> Self {
+        if authority.is_admin() || authority.read_caller().is_none() {
+            Self::All
+        } else {
+            Self::Agent(authority.principal())
+        }
+    }
+
+    /// The `agent_id` the read is filtered on (`None` = every row).
+    #[must_use]
+    pub fn agent_filter(self) -> Option<&'a str> {
+        match self {
+            Self::All => None,
+            Self::Agent(agent) => Some(agent),
+        }
+    }
+}
+
 /// Read-side query for the `memory_recall_observations` MCP tool.
 ///
-/// Filters compose with AND. Every field is optional; passing all
-/// `None`s returns the full ledger (capped by `limit`, default 200).
+/// Filters compose with AND, inside `scope` (#9366). Every filter is
+/// optional; all `None`s return the whole ledger `scope` admits (capped by
+/// `limit`, default 200).
 ///
 /// # Errors
 ///
 /// Returns the underlying `rusqlite::Error` on SQL failure.
 pub fn list_observations(
     conn: &Connection,
+    scope: ObservationScope<'_>,
     recall_id: Option<&str>,
     consumed: Option<bool>,
     since: Option<&str>,
@@ -288,6 +326,10 @@ pub fn list_observations(
           WHERE 1=1",
     );
     let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    if let Some(agent) = scope.agent_filter() {
+        sql.push_str(" AND agent_id = ?");
+        binds.push(Box::new(agent.to_string()));
+    }
     if let Some(rid) = recall_id {
         sql.push_str(" AND recall_id = ?");
         binds.push(Box::new(rid.to_string()));
@@ -481,7 +523,16 @@ mod tests {
         let n = record_recall(&conn, "r1", &candidates).expect("record");
         assert_eq!(n, 2);
 
-        let obs = list_observations(&conn, Some("r1"), None, None, None, 10).expect("list");
+        let obs = list_observations(
+            &conn,
+            ObservationScope::All,
+            Some("r1"),
+            None,
+            None,
+            None,
+            10,
+        )
+        .expect("list");
         assert_eq!(obs.len(), 2);
         assert!(obs.iter().any(|o| o.memory_id == "m1"));
         assert!(obs.iter().any(|o| o.memory_id == "m2"));
@@ -528,7 +579,16 @@ mod tests {
         )
         .expect("record");
 
-        let obs = list_observations(&conn, Some("r1"), None, None, None, 10).expect("list");
+        let obs = list_observations(
+            &conn,
+            ObservationScope::All,
+            Some("r1"),
+            None,
+            None,
+            None,
+            10,
+        )
+        .expect("list");
         assert_eq!(obs.len(), 1);
         let o = &obs[0];
         assert_eq!(o.agent_id.as_deref(), Some("ai:cert-fed-proxy"));
@@ -578,7 +638,16 @@ mod tests {
         let flipped = mark_consumed(&conn, "r1", &["m1", "m3"], "consumer").expect("mark");
         assert_eq!(flipped, 2);
 
-        let obs = list_observations(&conn, Some("r1"), None, None, None, 10).expect("list");
+        let obs = list_observations(
+            &conn,
+            ObservationScope::All,
+            Some("r1"),
+            None,
+            None,
+            None,
+            10,
+        )
+        .expect("list");
         let m1 = obs.iter().find(|o| o.memory_id == "m1").unwrap();
         let m2 = obs.iter().find(|o| o.memory_id == "m2").unwrap();
         let m3 = obs.iter().find(|o| o.memory_id == "m3").unwrap();
@@ -698,17 +767,43 @@ mod tests {
 
         // Per-recall filter:
         assert_eq!(
-            list_observations(&conn, Some("r1"), None, None, None, 10)
-                .unwrap()
-                .len(),
+            list_observations(
+                &conn,
+                ObservationScope::All,
+                Some("r1"),
+                None,
+                None,
+                None,
+                10
+            )
+            .unwrap()
+            .len(),
             2
         );
         // Consumed=true ⇒ only the one flipped row.
-        let only_consumed = list_observations(&conn, None, Some(true), None, None, 10).unwrap();
+        let only_consumed = list_observations(
+            &conn,
+            ObservationScope::All,
+            None,
+            Some(true),
+            None,
+            None,
+            10,
+        )
+        .unwrap();
         assert_eq!(only_consumed.len(), 1);
         assert_eq!(only_consumed[0].memory_id, "m1");
         // Consumed=false ⇒ the remaining two.
-        let only_pending = list_observations(&conn, None, Some(false), None, None, 10).unwrap();
+        let only_pending = list_observations(
+            &conn,
+            ObservationScope::All,
+            None,
+            Some(false),
+            None,
+            None,
+            10,
+        )
+        .unwrap();
         assert_eq!(only_pending.len(), 2);
     }
 
@@ -738,9 +833,17 @@ mod tests {
         let replay = mark_consumed_guarded(&conn, "r1", &["m1"], "consumer", Some("bob")).unwrap();
         assert_eq!(replay, 0, "cross-agent replay rejected");
         assert_eq!(
-            list_observations(&conn, Some("r1"), Some(true), None, None, 10)
-                .unwrap()
-                .len(),
+            list_observations(
+                &conn,
+                ObservationScope::All,
+                Some("r1"),
+                Some(true),
+                None,
+                None,
+                10
+            )
+            .unwrap()
+            .len(),
             0,
             "no consumed row after a rejected replay"
         );

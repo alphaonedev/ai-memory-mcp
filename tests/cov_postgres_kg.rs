@@ -325,7 +325,14 @@ async fn reflect_mints_reflection_and_origin() {
 
     // list_recall_observations is a read-only ledger scan.
     let _ = store
-        .list_recall_observations(None, None, None, None, 10)
+        .list_recall_observations(
+            ai_memory::observations::ObservationScope::All,
+            None,
+            None,
+            None,
+            None,
+            10,
+        )
         .await
         .expect("list_recall_observations");
 }

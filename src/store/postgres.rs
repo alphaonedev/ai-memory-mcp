@@ -28923,6 +28923,7 @@ impl MemoryStore for PostgresStore {
 
     async fn list_recall_observations(
         &self,
+        scope: crate::observations::ObservationScope<'_>,
         recall_id: Option<&str>,
         consumed: Option<bool>,
         since: Option<&str>,
@@ -28939,6 +28940,10 @@ impl MemoryStore for PostgresStore {
                     agent_id, namespace, folded \
                FROM recall_observations WHERE TRUE",
         );
+        // #9366 — a row is returned only to its own agent (or to `All`).
+        if let Some(agent) = scope.agent_filter() {
+            qb.push(" AND agent_id = ").push_bind(agent.to_string());
+        }
         if let Some(rid) = recall_id {
             qb.push(" AND recall_id = ").push_bind(rid.to_string());
         }
