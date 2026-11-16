@@ -30,6 +30,14 @@
 //!   CRDT convergence or the capture-first guarantee). See
 //!   [`SecretScreenMode`].
 //!
+//! * **Credential forms without a vendor prefix (#8855).** The submodule
+//!   `credential_forms` adds four single-pass detectors run after the
+//!   prefix table: a URL userinfo password for database and broker schemes
+//!   (`postgres://user:pass@host`), a `password` / `passwd` / `pwd`
+//!   assignment (`:`, `=`, `:=`, `=>`), a Slack `xox[abprs]-` token and a
+//!   Stripe `sk_live_` / `rk_live_` key. Placeholders, type annotations,
+//!   environment lookups and comparisons are accepted by named shape only.
+//!
 //! The patterns are named consts (pm-v3.1: no scattered magic literals).
 //! This file is on the `check-vendor-literals.sh` allow-list because the
 //! detector table legitimately names vendor token prefixes (`xai-`, `sk-`,
@@ -111,6 +119,37 @@ pub enum ScreenOutcome {
 /// The span replacement used in REDACT mode.
 pub const REDACTION_PLACEHOLDER: &str = "[REDACTED:secret]";
 
+mod credential_forms;
+mod views;
+
+pub use views::{
+    KIND_DEPTH_BOUND, KIND_RESIDUAL, KIND_SIZE_BOUND, MAX_NESTED_SCREEN_DEPTH,
+    MAX_VIEW_SCREEN_BYTES,
+};
+
+/// #8855 round 2 (ruling (e)) — a write funnel's refusal of a row whose
+/// redacted copy still screens as a hit ([`KIND_RESIDUAL`]). No row is
+/// stored from such a copy; the [`std::fmt::Display`] text is the exact
+/// reason the funnels return.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResidualRefusal {
+    /// The sorted, deduplicated kinds of every residual field.
+    pub kinds: Vec<&'static str>,
+}
+
+impl std::fmt::Display for ResidualRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "content rejected: credential material remains after redaction ({}); \
+             the write is refused and no row is stored",
+            self.kinds.join(", ")
+        )
+    }
+}
+
+impl std::error::Error for ResidualRefusal {}
+
 // ── Detector kind tags (named; surfaced in the audit row + refusal) ──────
 const KIND_PEM_PRIVATE_KEY: &str = "pem_private_key";
 const KIND_AWS_ACCESS_KEY: &str = "aws_access_key_id";
@@ -146,8 +185,26 @@ const AWS_KEY_BODY_LEN: usize = 16;
 /// entropy + length check confirms the candidate is a real secret (entropy
 /// is never a standalone trigger). Returns [`ScreenOutcome::Clean`] when
 /// nothing fires.
+///
+/// #8855 round 2: fail closed by construction. The redacted copy and its
+/// decoded views (escapes, invisible characters, fullwidth / homoglyph
+/// letters, `%XX`) are screened again (see [`views`]); a copy that still
+/// screens as a hit is reported with [`KIND_RESIDUAL`] and becomes the
+/// placeholder whole, and the write funnels refuse it
+/// ([`ResidualRefusal`]).
 #[must_use]
 pub fn screen(content: &str) -> ScreenOutcome {
+    let (kinds, redacted) = views::screen_with_views(content, screen_once);
+    if kinds.is_empty() {
+        ScreenOutcome::Clean
+    } else {
+        ScreenOutcome::Hit { kinds, redacted }
+    }
+}
+
+/// One pass of every detector over `content`: the kinds found (unsorted)
+/// and the redacted copy.
+fn screen_once(content: &str) -> (Vec<&'static str>, String) {
     let mut kinds: Vec<&'static str> = Vec::new();
     let mut redacted = content.to_string();
 
@@ -181,13 +238,13 @@ pub fn screen(content: &str) -> ScreenOutcome {
         redacted = after;
     }
 
-    if kinds.is_empty() {
-        ScreenOutcome::Clean
-    } else {
-        kinds.sort_unstable();
-        kinds.dedup();
-        ScreenOutcome::Hit { kinds, redacted }
+    // 5. #8855 credential forms: URL userinfo password, password
+    //    assignment, Slack token, Stripe live key (single-pass scans).
+    if let Some(after) = credential_forms::redact_credential_forms(&redacted, &mut kinds) {
+        redacted = after;
     }
+
+    (kinds, redacted)
 }
 
 /// Shannon entropy (bits/char) of a token's byte distribution.
@@ -217,12 +274,25 @@ fn is_token_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '+' | '/' | '.' | '=')
 }
 
+/// True for the RFC 6750 `token68` charset of a `Bearer` credential: the
+/// [`is_token_char`] set plus `~`. Only the Bearer detector uses it, so the
+/// other prefix tokens (and the JWT segment count) keep their charset.
+fn is_token68_char(c: char) -> bool {
+    is_token_char(c) || c == '~'
+}
+
 /// The contiguous token starting at byte offset `start` (over
 /// [`is_token_char`]).
 fn token_at(content: &str, start: usize) -> &str {
+    token_over(content, start, is_token_char)
+}
+
+/// The contiguous run of `is_char` bytes starting at byte offset `start`.
+/// Every accepted byte is ASCII, so the end is a char boundary.
+fn token_over(content: &str, start: usize, is_char: fn(char) -> bool) -> &str {
     let bytes = content.as_bytes();
     let mut end = start;
-    while end < bytes.len() && is_token_char(bytes[end] as char) {
+    while end < bytes.len() && is_char(bytes[end] as char) {
         end += 1;
     }
     &content[start..end]
@@ -243,7 +313,13 @@ fn redact_prefixed_tokens(
     while let Some(rel) = content[search_from..].find(prefix) {
         let pfx_start = search_from + rel;
         let token_start = pfx_start + prefix.len();
-        let token = token_at(content, token_start);
+        // A Bearer credential is token68 (`~` included), so a `~` inside
+        // it never ends the mask early (#8855).
+        let token = if prefix == BEARER_PREFIX {
+            token_over(content, token_start, is_token68_char)
+        } else {
+            token_at(content, token_start)
+        };
         // Bearer's prefix includes the space; its token starts after it.
         if token.len() >= MIN_PREFIXED_TOKEN_LEN
             && shannon_entropy_bits(token) >= MIN_TOKEN_ENTROPY_BITS
@@ -513,12 +589,21 @@ pub fn screen_for_caller(content: &str) -> Result<(), SecretRefusal> {
 /// below explicitly.
 #[must_use]
 pub fn redact_for_storage(content: &str) -> Option<String> {
+    redact_string_noting(content, &mut Vec::new())
+}
+
+/// [`redact_for_storage`], noting the kinds of a residual hit (one that
+/// carries [`KIND_RESIDUAL`]) in `residual` for the checked funnels.
+fn redact_string_noting(content: &str, residual: &mut Vec<&'static str>) -> Option<String> {
     if screen_mode() == SecretScreenMode::Off {
         return None;
     }
     match screen(content) {
         ScreenOutcome::Clean => None,
         ScreenOutcome::Hit { kinds, redacted } => {
+            if kinds.contains(&KIND_RESIDUAL) {
+                residual.extend(kinds.iter().copied());
+            }
             tracing::warn!(
                 target: "secret.redacted",
                 kinds = ?kinds,
@@ -700,8 +785,20 @@ fn receive_carveout_string_is_attestation_leaf(s: &str) -> bool {
 /// path keeps the caller's original value (zero rebuild). `mode` selects
 /// whether the name carve-out is honoured (see [`CarveOutMode`]).
 fn redact_value_leaves(val: &serde_json::Value, mode: CarveOutMode) -> Option<serde_json::Value> {
+    redact_value_leaves_noting(val, mode, &mut Vec::new())
+}
+
+/// [`redact_value_leaves`], noting residual kinds (see
+/// [`redact_string_noting`]).
+fn redact_value_leaves_noting(
+    val: &serde_json::Value,
+    mode: CarveOutMode,
+    residual: &mut Vec<&'static str>,
+) -> Option<serde_json::Value> {
     match val {
-        serde_json::Value::String(s) => redact_for_storage(s).map(serde_json::Value::String),
+        serde_json::Value::String(s) => {
+            redact_string_noting(s, residual).map(serde_json::Value::String)
+        }
         serde_json::Value::Object(map) => {
             let mut changed = false;
             let mut out = serde_json::Map::with_capacity(map.len());
@@ -727,7 +824,7 @@ fn redact_value_leaves(val: &serde_json::Value, mode: CarveOutMode) -> Option<se
                 } else {
                     mode
                 };
-                if let Some(red) = redact_value_leaves(v, child_mode) {
+                if let Some(red) = redact_value_leaves_noting(v, child_mode, residual) {
                     changed = true;
                     out.insert(k.clone(), red);
                 } else {
@@ -740,7 +837,7 @@ fn redact_value_leaves(val: &serde_json::Value, mode: CarveOutMode) -> Option<se
             let mut changed = false;
             let mut out = Vec::with_capacity(arr.len());
             for v in arr {
-                if let Some(red) = redact_value_leaves(v, mode) {
+                if let Some(red) = redact_value_leaves_noting(v, mode, residual) {
                     changed = true;
                     out.push(red);
                 } else {
@@ -772,10 +869,11 @@ fn redact_json_for_receive(val: &serde_json::Value) -> Option<serde_json::Value>
 /// EVERY cleartext-indexed field the screen historically missed — `content`,
 /// `title`, each `tag`, and `metadata` string-leaf values (minus the
 /// [`METADATA_SCREEN_CARVE_OUT_KEYS`] carve-out) — rebuilding the row only
-/// when something changed. NEVER refuses, so the federation-receive /
-/// L2-recovery / internal re-store funnels preserve CRDT convergence + the
-/// capture-first guarantee. Returns `None` (zero-copy) when the row is clean
-/// or screening is `Off`. The single helper both storage backends share.
+/// when something changed. It never refuses by itself; the write funnels of
+/// both backends call [`redact_memory_for_storage_checked`], which refuses
+/// a row whose redacted copy still screens as a hit (#8855 round 2, ruling
+/// (e)). Returns `None` (zero-copy) when the row is clean or screening is
+/// `Off`.
 #[must_use]
 pub fn redact_memory_for_storage(mem: &crate::models::Memory) -> Option<crate::models::Memory> {
     if screen_mode() == SecretScreenMode::Off {
@@ -800,19 +898,69 @@ pub fn redact_memory_for_receive(mem: &crate::models::Memory) -> Option<crate::m
     redact_memory_with_carveout(mem, CarveOutMode::ReceiveAttestationLeaves)
 }
 
+/// #8855 round 2 (ruling (e)) — [`redact_memory_for_storage`] for the
+/// write funnels: `Err` when any field's redacted copy (content, title, a
+/// tag, a metadata leaf) still screens as a hit, so no row is stored from
+/// it. `Ok(None)` when the row is clean or screening is `Off`.
+///
+/// # Errors
+/// [`ResidualRefusal`] naming every residual kind.
+pub fn redact_memory_for_storage_checked(
+    mem: &crate::models::Memory,
+) -> Result<Option<crate::models::Memory>, ResidualRefusal> {
+    redact_memory_checked(mem, CarveOutMode::TrustedByName)
+}
+
+/// #8855 round 2 (ruling (e)) — [`redact_memory_for_receive`] for the
+/// federation-receive funnels; same refusal as
+/// [`redact_memory_for_storage_checked`].
+///
+/// # Errors
+/// [`ResidualRefusal`] naming every residual kind.
+pub fn redact_memory_for_receive_checked(
+    mem: &crate::models::Memory,
+) -> Result<Option<crate::models::Memory>, ResidualRefusal> {
+    redact_memory_checked(mem, CarveOutMode::ReceiveAttestationLeaves)
+}
+
+fn redact_memory_checked(
+    mem: &crate::models::Memory,
+    meta_mode: CarveOutMode,
+) -> Result<Option<crate::models::Memory>, ResidualRefusal> {
+    if screen_mode() == SecretScreenMode::Off {
+        return Ok(None);
+    }
+    let mut residual = Vec::new();
+    let screened = redact_memory_noting(mem, meta_mode, &mut residual);
+    if residual.is_empty() {
+        return Ok(screened);
+    }
+    residual.sort_unstable();
+    residual.dedup();
+    Err(ResidualRefusal { kinds: residual })
+}
+
 fn redact_memory_with_carveout(
     mem: &crate::models::Memory,
     meta_mode: CarveOutMode,
 ) -> Option<crate::models::Memory> {
-    let content = redact_for_storage(&mem.content);
-    let title = redact_for_storage(&mem.title);
+    redact_memory_noting(mem, meta_mode, &mut Vec::new())
+}
+
+fn redact_memory_noting(
+    mem: &crate::models::Memory,
+    meta_mode: CarveOutMode,
+    residual: &mut Vec<&'static str>,
+) -> Option<crate::models::Memory> {
+    let content = redact_string_noting(&mem.content, residual);
+    let title = redact_string_noting(&mem.title, residual);
     let tags: Option<Vec<String>> = {
         let mut changed = false;
         let rebuilt: Vec<String> = mem
             .tags
             .iter()
             .map(|t| {
-                redact_for_storage(t).map_or_else(
+                redact_string_noting(t, residual).map_or_else(
                     || t.clone(),
                     |red| {
                         changed = true;
@@ -826,7 +974,7 @@ fn redact_memory_with_carveout(
     let metadata = if screen_mode() == SecretScreenMode::Off {
         None
     } else {
-        redact_value_leaves(&mem.metadata, meta_mode)
+        redact_value_leaves_noting(&mem.metadata, meta_mode, residual)
     };
 
     if content.is_none() && title.is_none() && tags.is_none() && metadata.is_none() {

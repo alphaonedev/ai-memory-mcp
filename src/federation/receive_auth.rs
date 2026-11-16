@@ -800,8 +800,14 @@ pub fn evaluate_inbound_policy_freshness(
 ///
 /// Returns `true` when the screen mutated the SIGNED surface (any presented
 /// raw-bytes `write_signature` was dropped alongside).
+///
+/// #8855 round 2 (ruling (e)): a row whose redacted copy still screens as a
+/// hit is left unchanged here, so the insert funnel refuses it with the
+/// exact reason instead of storing the placeholder copy.
 pub fn redact_inbound_before_attestation(mem: &mut crate::models::Memory) -> bool {
-    let screened = crate::secret_screen::redact_memory_for_receive(mem);
+    let Ok(screened) = crate::secret_screen::redact_memory_for_receive_checked(mem) else {
+        return false;
+    };
     apply_screened_inbound(mem, screened)
 }
 

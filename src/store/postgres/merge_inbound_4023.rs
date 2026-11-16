@@ -55,9 +55,13 @@ impl PostgresStore {
 
         // v0.8.1 W1 (#1821 / gap G29) — credential REDACT on the postgres
         // federation RECEIVE funnel (parity with sqlite insert_if_newer).
-        // ALWAYS redact, NEVER refuse — a rejected inbound row would diverge
-        // replicas. No-op unless screening was seeded non-`off`.
-        let screened = crate::secret_screen::redact_memory_for_receive(inbound);
+        // Redacts; #8855 round 2 (e) refuses only a row whose redacted copy
+        // still screens as a hit. No-op unless screening was seeded non-`off`.
+        let screened = crate::secret_screen::redact_memory_for_receive_checked(inbound).map_err(
+            |refusal| StoreError::InvalidInput {
+                detail: refusal.to_string(),
+            },
+        )?;
         let inbound = screened.as_ref().unwrap_or(inbound);
         // ARCH-1 parity (mirrors apply_remote_memory) — a federation-
         // pushed row must clear the same pre-write governance hook as a

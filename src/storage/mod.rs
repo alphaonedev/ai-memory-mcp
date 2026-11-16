@@ -2348,12 +2348,13 @@ fn insert_inner(
     // backstop on the local-authorship funnel. Caller-origin writes are
     // REFUSED earlier (validate_*); any secret reaching here is from an
     // internal re-store path (curator / autonomy) that bypasses validation,
-    // so it is masked, never refused (preserving the internal write). #1844
+    // so it is masked; #8855 round 2 (e) refuses a residual copy. #1844
     // extends the mask from `content` to title / tags / metadata string-leaf
     // values (minus the crypto/system carve-out). No-op unless
     // `AI_MEMORY_SECRET_SCREEN_MODE` was seeded non-`off`.
     let redacted_mem;
-    let mem = if let Some(redacted) = crate::secret_screen::redact_memory_for_storage(mem) {
+    let mem = if let Some(redacted) = crate::secret_screen::redact_memory_for_storage_checked(mem)?
+    {
         redacted_mem = redacted;
         &redacted_mem
     } else {
@@ -18458,15 +18459,16 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
     }
 
     // v0.8.1 W1 (#1821 / gap G29) + #1844 — credential REDACT on the
-    // federation RECEIVE funnel. ALWAYS redact, NEVER refuse: a refused
-    // inbound row would diverge replicas (the merge primitive), so a relayed
-    // secret is masked, not rejected. #1844 extends the mask from `content`
+    // federation RECEIVE funnel. A relayed secret is masked; #8855 round 2
+    // (e) refuses only a row whose redacted copy still screens as a hit (no
+    // row is stored from it, on either backend). #1844: mask from `content`
     // to title / tags / metadata string-leaf values. #3299: receive uses
     // `redact_memory_for_receive` so attestation STRING leaves survive but
     // hostile `*_b64` OBJECT subtrees are screened.
     // No-op unless screening was seeded non-`off`.
     let redacted_mem;
-    let mem = if let Some(redacted) = crate::secret_screen::redact_memory_for_receive(mem) {
+    let mem = if let Some(redacted) = crate::secret_screen::redact_memory_for_receive_checked(mem)?
+    {
         redacted_mem = redacted;
         &redacted_mem
     } else {
