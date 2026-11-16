@@ -115,14 +115,30 @@ PROBE_NAME_RE = r"\.prune-probe-[0-9]+-[0-9a-f]+"
 SYSTEM_PYTHON = Path("/usr/bin/python3")
 PROBE_ERROR = "dir_fd unavailable on this platform"
 PLATFORM_REASON = "this platform lacks a working descriptor-relative call: {call} raised NotImplementedError (" + PROBE_ERROR + ")"
-MOUNT_UNREADABLE_REASON = "the mount id of TMPDIR cannot be read: {why}"
+MOUNT_TABLE_REASON = "the mount table cannot be read: {why}"
+CANONICAL_ELSEWHERE_REASON = "TMPDIR is not the directory at its canonical path: {path}"
 RESOLVES_ELSEWHERE_REASON = "TMPDIR resolves elsewhere than its normalized path: {path}"
 SUMMARY_UNWRITABLE_LINE = "prune_runner_tmp: job summary not written: {why}"
 BIND_HELPER_TIMEOUT_SECS = 120
 LEFTOVER_LINE_RE = r"^prune_runner_tmp: probe directory left in place: " + PROBE_NAME_RE + "$"
-# D-M1: skip reasons and the counted failure text of a directory the walk does not enter.
-SKIP_MOUNT_POINT = "a mount point, not entered"
-SKIP_MOUNT_UNREADABLE = "mount id unreadable, not entered"
+# D-M1 (ruling b29 ed0d39b5): skip reasons of a path the walk neither enters nor removes.
+SKIP_MOUNT_POINT = "a mount point, not entered or removed"
+SKIP_MOUNT_UNREADABLE = "mount table unreadable, not entered or removed"
+# A mount table fixture: one valid root line, then one line per mount point (field 5 escaped as the kernel does).
+MOUNT_ROOT_LINE = "1 0 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw"
+MOUNT_LINE = "{id} 1 8:1 /src {point} rw,relatime - ext4 /dev/sda1 rw"
+MOUNT_ESCAPES = {"\\": "\\134", " ": "\\040", "\t": "\\011", "\n": "\\012"}
+MOUNT_DEPTH_N = 6
+MALFORMED_MOUNT_LINES = (
+    "36 35 98:0 /mnt1 /mnt2 rw",  # too few fields
+    "36 35 98:0 /mnt1 /mnt2 rw noatime master:1 ext3 /dev/root rw",  # no separator
+    "x6 35 98:0 /mnt1 /mnt2 rw - ext3 /dev/root rw",  # mount id not a number
+    "36 35 98-0 /mnt1 /mnt2 rw - ext3 /dev/root rw",  # device not major:minor
+    "36 35 98:0 /mnt1 /mnt\\x2 rw - ext3 /dev/root rw",  # backslash that is no octal escape
+    "36 35 98:0 /mnt1 /mnt\\400 rw - ext3 /dev/root rw",  # octal escape past one byte
+    "36 35 98:0 /mnt1 mnt2 rw - ext3 /dev/root rw",  # relative mount point
+    "",  # an empty line inside the table
+)
 SUMMARY_ENV = "GITHUB_STEP_SUMMARY"
 
 PRUNE = None
@@ -466,7 +482,7 @@ class EntryKinds(Base):
         fd, info = self.open_runner()
         out, err = io.StringIO(), io.StringIO()
         tally = PRUNE.Tally(err)
-        PRUNE.prune(fd, info.st_dev + 1, False, time.time(), out, tally)
+        PRUNE.prune(fd, info.st_dev + 1, False, time.time(), out, tally, PRUNE.MountGuard(str(self.runner)))
         self.assertEqual((tally.pruned, tally.failed, tally.skipped), (0, 0, len(made)))
         self.assertEqual(snapshot(self.runner), before)
         lines = err.getvalue().splitlines()
@@ -493,7 +509,8 @@ class EntryKinds(Base):
 
         with mock.patch.object(PRUNE, "list_level", mark_children_foreign):
             with self.assertRaises(OSError):
-                PRUNE.remove_tree(fd, "holder", scanned, info.st_dev + 1, tally)
+                PRUNE.remove_tree(fd, "holder", scanned, info.st_dev + 1, tally, PRUNE.MountGuard(str(self.runner)),
+                                  str(holder))
         self.assertEqual(tally.skipped, 2)
         self.assertTrue((holder / "mount" / "precious" / "data").exists())
         self.assertTrue(holder.exists())
@@ -791,26 +808,29 @@ class PlatformProbe(Base):
                 victim.unlink()
 
 
+def mount_table(*points, extra=()):
+    """The bytes of a mountinfo fixture naming ``points`` as mount points (escaped as the kernel escapes field 5)."""
+    lines = [MOUNT_ROOT_LINE]
+    for number, point in enumerate(points, start=2):
+        escaped = "".join(MOUNT_ESCAPES.get(char, char) for char in str(point))
+        lines.append(MOUNT_LINE.format(id=number, point=escaped))
+    return ("\n".join([*lines, *extra]) + "\n").encode()
+
+
 class MountCrossing(Base):
-    """D-M1: the walk never enters a directory that is a mount point, whatever its st_dev, and never deletes through one."""
+    """D-M1 (ruling b29 ed0d39b5): a path that is a mount point is neither entered nor removed, whatever its st_dev;
+    the mount table is read again directly before each removal; a table that cannot be read is a refusal."""
 
-    def mount_id_override(self, target, value=None, unreadable=False):
-        """Patch mount_id so the directory with identity ``target`` reads as another mount (or as unreadable)."""
-        real = PRUNE.mount_id
+    def setUp(self):
+        super().setUp()
+        self.table = self.base / "mountinfo"
+        self.table.write_bytes(mount_table())
+        patch = mock.patch.object(PRUNE, "MOUNTINFO_PATH", str(self.table), create=True)  # create: red on the base
+        patch.start()
+        self.addCleanup(patch.stop)
 
-        def fake(fd):
-            info = os.fstat(fd)
-            if (info.st_dev, info.st_ino) == target:
-                if unreadable:
-                    raise PRUNE.MountIdUnreadable("fdinfo has no mnt_id line")
-                return value
-            return real(fd)
-
-        return mock.patch.object(PRUNE, "mount_id", fake)
-
-    def ident(self, path):
-        info = os.lstat(path)
-        return (info.st_dev, info.st_ino)
+    def mounts(self, *points):
+        self.table.write_bytes(mount_table(*points))
 
     def stale_holder(self):
         holder = self.runner / "holder"
@@ -820,72 +840,224 @@ class MountCrossing(Base):
         age(holder, OLD_AGE_SECS)
         return holder
 
-    def test_root_mount_id_is_read_on_linux(self):
-        if not sys.platform.startswith("linux"):
-            self.skipTest(f"mount ids come from /proc/self/fdinfo on Linux only (platform {sys.platform})")
-        fd, _info = self.open_runner()
-        self.assertIsInstance(PRUNE.mount_id(fd), int)
+    def assert_refused(self, why, victim):
+        rc, out, err = self.run_prune(self.runner)
+        reason = PRUNE.safe_text(MOUNT_TABLE_REASON.format(why=why)).replace("\\x3a", ":", 1)
+        self.assertEqual((rc, out), (EXIT_REFUSED, ""))
+        self.assertEqual(err.rstrip("\n"), f"prune_runner_tmp: refused: {reason}")
+        self.assertEqual(self.annotations, [f"::warning title=prune_runner_tmp refused::prune_runner_tmp: refused: {reason}"])
+        self.assertTrue(victim.exists(), "a refusal removes nothing")
+        self.assertEqual([n for n in self.names() if n.startswith(".prune-probe-")], [], "no probe made before the refusal")
 
-    def test_top_level_mount_point_is_skipped_never_entered(self):
+    def test_mount_point_at_depth_one_is_never_entered_or_removed(self):
         holder = self.stale_holder()
-        with self.mount_id_override(self.ident(holder), value=-1):
-            rc, out, err = self.run_prune(self.runner)
+        self.mounts(holder)
+        rc, out, err = self.run_prune(self.runner)
         self.assertEqual(rc, EXIT_OK)
         self.assertEqual(err.splitlines(), [f"prune_runner_tmp: skipped holder: {SKIP_MOUNT_POINT}"])
         self.assertIn("pruned=0 kept=0 failed=0 freed_bytes=0 skipped=1", out)
         self.assertEqual((holder / "inner" / "precious" / "data").read_bytes(), b"precious")
         self.assertTrue((holder / "plain.db").exists(), "nothing below a mount point is deleted")
 
-    def test_nested_mount_point_is_skipped_and_its_parent_counted(self):
+    def test_top_level_file_mount_point_is_never_removed(self):
+        victim = self.make_file("bound.db", OLD_AGE_SECS)
+        self.mounts(victim)
+        rc, out, err = self.run_prune(self.runner)
+        self.assertEqual(rc, EXIT_OK)
+        self.assertEqual(err.splitlines(), [f"prune_runner_tmp: skipped bound.db: {SKIP_MOUNT_POINT}"])
+        self.assertIn("pruned=0 kept=0 failed=0 freed_bytes=0 skipped=1", out)
+        self.assertTrue(victim.exists())
+
+    def test_mount_point_at_depth_n_is_skipped_and_its_parent_counted(self):
         holder = self.stale_holder()
-        with self.mount_id_override(self.ident(holder / "inner"), value=-1):
-            rc, out, err = self.run_prune(self.runner)
+        deep = holder
+        for level in range(MOUNT_DEPTH_N):
+            deep = deep / f"d{level}"
+        (deep / "keep").mkdir(parents=True)
+        (deep / "keep" / "data").write_bytes(b"deep")
+        age(holder, OLD_AGE_SECS)
+        self.mounts(deep / "keep")
+        rc, out, err = self.run_prune(self.runner)
         self.assertEqual(rc, EXIT_OK)
         self.assertEqual(
             err.splitlines(),
             [
-                f"prune_runner_tmp: skipped inner: {SKIP_MOUNT_POINT}",
-                f"prune_runner_tmp: failed to remove holder: inner: {SKIP_MOUNT_POINT}",
+                f"prune_runner_tmp: skipped keep: {SKIP_MOUNT_POINT}",
+                f"prune_runner_tmp: failed to remove holder: keep: {SKIP_MOUNT_POINT}",
             ],
         )
         self.assertRegex(out, r"pruned=0 kept=0 failed=1 freed_bytes=\d+ skipped=1")
-        self.assertEqual((holder / "inner" / "precious" / "data").read_bytes(), b"precious")
+        self.assertEqual((deep / "keep" / "data").read_bytes(), b"deep")
+        self.assertFalse((holder / "plain.db").exists(), "what is not below the mount point is removed")
+        self.assertFalse((holder / "inner").exists())
 
-    def test_unreadable_mount_id_is_a_skip_and_a_counted_failure_never_an_entry(self):
-        for where in ("top", "nested"):
-            with self.subTest(where=where):
-                holder = self.stale_holder()
-                target = holder if where == "top" else holder / "inner"
-                with self.mount_id_override(self.ident(target), unreadable=True):
-                    rc, out, err = self.run_prune(self.runner)
+    def test_mount_point_with_escaped_characters_is_decoded_and_honoured(self):
+        for name in ("with space", "tab\there", "back\\slash", "new\nline"):
+            with self.subTest(name=name):
+                holder = self.runner / "holder"
+                (holder / name).mkdir(parents=True)
+                (holder / name / "data").write_bytes(b"kept")
+                age(holder, OLD_AGE_SECS)
+                self.mounts(holder / name)
+                rc, out, err = self.run_prune(self.runner)
                 self.assertEqual(rc, EXIT_OK)
-                name = target.name
-                failed_text = f"{name}: {SKIP_MOUNT_UNREADABLE}"
+                shown = PRUNE.safe_text(name)
                 self.assertEqual(
                     err.splitlines(),
                     [
-                        f"prune_runner_tmp: skipped {name}: {SKIP_MOUNT_UNREADABLE}",
-                        f"prune_runner_tmp: failed to remove holder: {failed_text}",
+                        f"prune_runner_tmp: skipped {shown}: {SKIP_MOUNT_POINT}",
+                        f"prune_runner_tmp: failed to remove holder: {shown}: {SKIP_MOUNT_POINT}",
                     ],
                 )
-                self.assertRegex(out, r"pruned=0 kept=0 failed=1 freed_bytes=\d+ skipped=1")
-                self.assertEqual((holder / "inner" / "precious" / "data").read_bytes(), b"precious")
-                if where == "top":
-                    self.assertTrue((holder / "plain.db").exists())
-                subprocess.run(["rm", "-rf", str(holder)], check=True)
+                self.assertEqual((holder / name / "data").read_bytes(), b"kept")
+                shutil.rmtree(holder)
 
-    def test_unreadable_root_mount_id_is_a_refusal(self):
-        victim = self.make_file("old.db", OLD_AGE_SECS)
+    def test_parser_decodes_every_kernel_escape_exactly(self):
+        data = mount_table("/r/a b", "/r/t\tc", "/r/n\nd", "/r/b\\e")
+        self.assertEqual(PRUNE.parse_mount_points(data), {"/", "/r/a b", "/r/t\tc", "/r/n\nd", "/r/b\\e"})
+        self.assertIn(b"/r/a\\040b", data)
 
-        def unreadable(fd):
-            raise PRUNE.MountIdUnreadable("fdinfo has no mnt_id line")
+    def test_mount_point_appearing_between_listing_and_unlink_is_not_removed(self):
+        """The re-check: the table is read again directly before each unlink and rmdir."""
+        holder = self.stale_holder()
+        real_list = PRUNE.list_level
 
-        with mock.patch.object(PRUNE, "mount_id", unreadable):
+        def mount_after_listing(dir_fd, dir_path, *rest, **kwargs):
+            pending = real_list(dir_fd, dir_path, *rest, **kwargs)
+            if kwargs.get("remove") and dir_path == str(holder):
+                self.mounts(holder / "plain.db")
+            return pending
+
+        with mock.patch.object(PRUNE, "list_level", mount_after_listing):
+            # the listing above already unlinked plain.db; list again with the mount in place first
+            self.mounts(holder / "plain.db")
             rc, out, err = self.run_prune(self.runner)
-        reason = MOUNT_UNREADABLE_REASON.format(why="fdinfo has no mnt_id line")
+        self.assertEqual(rc, EXIT_OK)
+        self.assertIn(f"prune_runner_tmp: skipped plain.db: {SKIP_MOUNT_POINT}", err.splitlines())
+        self.assertTrue((holder / "plain.db").exists())
+
+    def test_mount_appearing_after_the_unlink_check_point_is_seen_by_the_next_check(self):
+        """A mount table that changes during the removal pass: every unlink and rmdir reads it again."""
+        holder = self.runner / "holder"
+        holder.mkdir()
+        for index in range(3):
+            (holder / f"f{index}.db").write_bytes(b"x")
+        age(holder, OLD_AGE_SECS)
+        real_unlink = os.unlink
+        state = {"unlinks": 0}
+
+        def unlink_then_mount(name, *args, **kwargs):
+            result = real_unlink(name, *args, **kwargs)
+            if str(name).startswith("f"):
+                state["unlinks"] += 1
+                if state["unlinks"] == 1:
+                    self.mounts(*(holder / f"f{index}.db" for index in range(3)), holder)
+            return result
+
+        with mock.patch.object(PRUNE.os, "unlink", unlink_then_mount):
+            rc, out, err = self.run_prune(self.runner)
+        self.assertEqual(rc, EXIT_OK)
+        self.assertEqual(state["unlinks"], 1, "after the table changed no further entry was unlinked")
+        self.assertEqual(len(list(holder.iterdir())), 2)
+        self.assertIn(f"prune_runner_tmp: skipped holder: {SKIP_MOUNT_POINT}", err.splitlines())
+        self.assertTrue(holder.is_dir(), "the directory that became a mount point is not removed")
+
+    def test_mount_made_between_the_check_and_the_open_is_seen_after_the_open(self):
+        holder = self.stale_holder()
+        real_open = os.open
+
+        def open_then_mount(path, *args, **kwargs):
+            if path == "inner":
+                self.mounts(holder / "inner")
+            return real_open(path, *args, **kwargs)
+
+        with mock.patch.object(PRUNE.os, "open", open_then_mount):
+            rc, out, err = self.run_prune(self.runner)
+        self.assertEqual(rc, EXIT_OK)
+        self.assertIn(f"prune_runner_tmp: skipped inner: {SKIP_MOUNT_POINT}", err.splitlines())
+        self.assertEqual((holder / "inner" / "precious" / "data").read_bytes(), b"precious")
+
+    def test_dry_run_does_not_list_a_mount_point(self):
+        holder = self.stale_holder()
+        self.make_file("old.db", OLD_AGE_SECS)
+        self.mounts(holder)
+        rc, out, err = self.run_prune(self.runner, "--dry-run")
+        self.assertEqual(rc, EXIT_OK)
+        self.assertIn("would-remove old.db", out.splitlines())
+        self.assertNotIn("would-remove holder", out.splitlines())
+        self.assertEqual(err.splitlines(), [f"prune_runner_tmp: skipped holder: {SKIP_MOUNT_POINT}"])
+
+    def test_table_unreadable_during_the_walk_is_a_skip_and_a_counted_failure(self):
+        holder = self.stale_holder()
+        real_list = PRUNE.list_level
+
+        def vanish(dir_fd, *rest, **kwargs):
+            if kwargs.get("remove"):
+                self.table.unlink(missing_ok=True)
+            return real_list(dir_fd, *rest, **kwargs)
+
+        with mock.patch.object(PRUNE, "list_level", vanish):
+            rc, out, err = self.run_prune(self.runner)
+        self.assertEqual(rc, EXIT_OK)
+        self.assertEqual(err.splitlines()[0], f"prune_runner_tmp: skipped plain.db: {SKIP_MOUNT_UNREADABLE}")
+        self.assertRegex(out, r"pruned=0 kept=0 failed=1 freed_bytes=0 skipped=\d+")
+        self.assertTrue((holder / "plain.db").exists())
+        self.assertEqual((holder / "inner" / "precious" / "data").read_bytes(), b"precious")
+
+    def test_missing_table_is_a_refusal(self):
+        victim = self.make_file("old.db", OLD_AGE_SECS)
+        self.table.unlink()
+        self.assert_refused(f"{self.table} (No such file or directory)", victim)
+
+    def test_unreadable_table_is_a_refusal(self):
+        if os.geteuid() == 0:
+            self.skipTest("root reads a mode-000 file; the permission cell needs a non-root user")
+        victim = self.make_file("old.db", OLD_AGE_SECS)
+        self.table.chmod(0)
+        self.addCleanup(self.table.chmod, 0o600)
+        self.assert_refused(f"{self.table} (Permission denied)", victim)
+
+    def test_malformed_table_is_a_refusal_for_every_malformed_form(self):
+        victim = self.make_file("old.db", OLD_AGE_SECS)
+        for line in MALFORMED_MOUNT_LINES:
+            with self.subTest(line=line):
+                self.table.write_bytes(mount_table(extra=(line, MOUNT_ROOT_LINE)))
+                self.assert_refused(f"malformed line 2 of {self.table}", victim)
+
+    def test_empty_or_oversized_table_is_a_refusal(self):
+        victim = self.make_file("old.db", OLD_AGE_SECS)
+        self.table.write_bytes(b"")
+        self.assert_refused(f"no mount line in {self.table}", victim)
+        self.mounts()
+        with mock.patch.object(PRUNE, "MOUNTINFO_MAX_BYTES", 8):
+            self.assert_refused(f"{self.table} is larger than 8 bytes", victim)
+
+    def test_platform_without_a_mount_table_reader_refuses_never_prunes_blind(self):
+        victim = self.make_file("old.db", OLD_AGE_SECS)
+        with mock.patch.object(PRUNE.sys, "platform", "darwin"):
+            self.assert_refused("no mount table reader for platform darwin", victim)
+
+    def test_tmpdir_not_at_its_canonical_path_is_refused(self):
+        victim = self.make_file("old.db", OLD_AGE_SECS)
+        sibling = self.root / "runner-2"
+        sibling.mkdir()
+        with mock.patch.object(PRUNE.os.path, "realpath", lambda path: str(sibling)):
+            rc, out, err = self.run_prune(self.runner)
+        reason = PRUNE.safe_text(CANONICAL_ELSEWHERE_REASON.format(path=sibling)).replace("\\x3a", ":", 1)
         self.assertEqual((rc, out), (EXIT_REFUSED, ""))
         self.assertEqual(err.rstrip("\n"), f"prune_runner_tmp: refused: {reason}")
         self.assertTrue(victim.exists())
+
+    def test_mount_points_are_matched_at_the_canonical_path_through_a_symlinked_ancestor(self):
+        """A TMPDIR spelled through a symlinked ancestor is still checked at the path mountinfo names."""
+        holder = self.stale_holder()
+        alias = self.base / "alias"
+        alias.symlink_to(self.root)
+        self.mounts(holder)
+        rc, out, err = self.run_prune(alias / "runner-1")
+        self.assertEqual(rc, EXIT_OK, err)
+        self.assertEqual(err.splitlines(), [f"prune_runner_tmp: skipped holder: {SKIP_MOUNT_POINT}"])
+        self.assertTrue((holder / "plain.db").exists())
 
     def test_same_device_bind_mount_inside_a_stale_entry_is_never_entered(self):
         """unshare-gated: a real bind mount of a directory outside the root, same st_dev, inside a stale entry."""
@@ -935,6 +1107,7 @@ class MountCrossing(Base):
         )
         self.assertRegex(done.stdout, r"(?m)^pruned=0 kept=0 failed=1 freed_bytes=\d+ skipped=1$")
         self.assertTrue((stale / "m").is_dir())
+        self.assertFalse((stale / "f.db").exists(), "the rest of the stale entry is removed")
 
 
 class RootForms(Base):
