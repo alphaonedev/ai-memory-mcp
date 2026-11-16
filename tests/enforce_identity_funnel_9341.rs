@@ -32,7 +32,7 @@ use ai_memory::handlers::{ApiKeyState, AppState, Db};
 use ai_memory::mtls_agent_binding::{AgentBindingMode, ClientCertAgentBinding};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use route_table::{AUDIT_UNGATED_ROUTES, ROUTE_TABLE, RouteClass, concrete_path};
+use route_table::{AUDIT_UNGATED_ROUTES, ROUTE_TABLE, RouteClass, RouteRow, concrete_path};
 use tempfile::NamedTempFile;
 use tower::ServiceExt as _;
 
@@ -274,6 +274,17 @@ async fn send_simple(
         .body(body_for(method, body))
         .expect("request");
     send(router, req).await
+}
+
+/// [`concrete_path`] with every `{id}` segment naming `id` (other params
+/// keep the placeholder, so a namespace echo is not mistaken for a row read).
+fn concrete_path_naming(path: &str, id: &str) -> String {
+    concrete_path(path)
+        .split('/')
+        .zip(path.split('/'))
+        .map(|(concrete, raw)| if raw == "{id}" { id } else { concrete })
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// (1a) The table cell: under Enforce with keys enrolled, a shared-key caller
@@ -755,31 +766,83 @@ async fn b3_anonymous_shared_key_reads_no_private_row_writes_nothing_named_9341(
         .unwrap_or_else(|| panic!("seed returns the row id: {}", seeded.body))
         .to_string();
 
-    let mut leaks = Vec::new();
-    let mut checked = 0usize;
-    for row in ROUTE_TABLE.iter().filter(|r| r.class != RouteClass::Exempt) {
-        checked += 1;
-        let mut uri = concrete_path(row.path);
+    let gated = || ROUTE_TABLE.iter().filter(|r| r.class != RouteClass::Exempt);
+    // Every path parameter names the seeded row, so `/memories/{id}`-shaped
+    // routes probe exactly the private row.
+    let uri_for = |row: &RouteRow| {
+        let mut uri = concrete_path_naming(row.path, &seeded_id);
         if row.method == "get" {
             uri.push_str(&format!("?namespace={ns}&q={marker}&query={marker}"));
         }
+        uri
+    };
+    let probe_body = serde_json::json!({"namespace": ns, "query": marker, "q": marker});
+
+    // Positive control: the same read sweep as alice DOES return her row, so
+    // the probe is sensitive and an empty leak list below is evidence.
+    let mut owner_reads = 0usize;
+    for row in gated().filter(|r| r.method == "get") {
         let out = send_simple(
             &fx.router,
             row.method,
-            &uri,
+            &uri_for(row),
+            ALICE_KEY,
+            &[ALICE],
+            Some(probe_body.clone()),
+        )
+        .await;
+        owner_reads += usize::from(out.body.to_string().contains(&seeded_id));
+    }
+    assert!(
+        owner_reads > 0,
+        "B-3 probe is blind: alice reads her row nowhere"
+    );
+
+    let mut leaks = Vec::new();
+    let mut checked = 0usize;
+    for row in gated() {
+        checked += 1;
+        let out = send_simple(
+            &fx.router,
+            row.method,
+            &uri_for(row),
             SHARED_KEY,
             &[],
-            Some(serde_json::json!({"namespace": ns, "query": marker, "q": marker})),
+            Some(probe_body.clone()),
         )
         .await;
         if out.body.to_string().contains(&seeded_id) {
-            leaks.push(format!("{} {} -> {}", row.name, row.method, out.status));
+            leaks.push(format!(
+                "{} {} -> {} {}",
+                row.name,
+                row.method,
+                out.status,
+                out.body.to_string().chars().take(600).collect::<String>()
+            ));
         }
     }
     assert!(checked > 0, "the table has gated rows");
     assert!(
         leaks.is_empty(),
         "B-3 private row read anonymously: {leaks:?}"
+    );
+
+    // Nothing the anonymous sweep sent (DELETE/PUT/PATCH included) touched the
+    // private row: alice still reads it back unchanged.
+    let after = send_simple(
+        &fx.router,
+        "get",
+        &concrete_path_naming(ai_memory::handlers::routes::MEMORIES_ID, &seeded_id),
+        ALICE_KEY,
+        &[ALICE],
+        None,
+    )
+    .await;
+    assert!(
+        after.status.is_success() && after.body.to_string().contains(&marker),
+        "B-3 anonymous sweep changed alice's private row: {} {}",
+        after.status,
+        after.body
     );
 
     // Every row in the namespace, as alice sees it: only her seed is named.
