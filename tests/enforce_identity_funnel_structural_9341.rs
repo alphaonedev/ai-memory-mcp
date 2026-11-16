@@ -691,3 +691,43 @@ fn claim_scanner_sees_every_shape_it_pins_9390() {
     let got: Vec<String> = claim_reading_fns(src).into_iter().collect();
     assert_eq!(got, vec!["a", "b", "c"]);
 }
+
+/// The funnel's ONE exemption from the named-principal refusal, verbatim.
+const FUNNEL_EXEMPTION_9390: &str = "if !named || authority.binding().is_key_bound() {";
+
+/// PR 9390 round-1 L4: the funnel exempts a named caller ONLY when its
+/// binding is key-bound. Any widening (a `Binding::Claimed` arm, an `||`
+/// on another binding, a second early `return None` after `named` is
+/// computed) changes this block and goes red here.
+#[test]
+fn funnel_exempts_only_key_bound_bindings_9390() {
+    let src = read("src/handlers/authority.rs");
+    let prod = strip_line_comments(&production_part(&src));
+    let at = prod
+        .find("pub fn refuse_unproven_named_principal")
+        .expect("refuse_unproven_named_principal");
+    let body = braced_block(&prod, at);
+    let named_at = body
+        .find("let named = ")
+        .expect("the funnel computes `named`");
+    let after_named = &body[named_at..];
+    let exemptions: Vec<&str> = after_named
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("if "))
+        .collect();
+    assert_eq!(
+        exemptions.first().copied(),
+        Some(FUNNEL_EXEMPTION_9390),
+        "PR 9390 L4: the first branch after `named` must be exactly {FUNNEL_EXEMPTION_9390:?}"
+    );
+    assert_eq!(
+        after_named.matches("return None").count(),
+        1,
+        "PR 9390 L4: exactly one pass-through after `named` (the key-bound exemption)"
+    );
+    assert!(
+        !body.contains("Binding::"),
+        "PR 9390 L4: the funnel names no binding variant; it asks is_key_bound() only"
+    );
+}

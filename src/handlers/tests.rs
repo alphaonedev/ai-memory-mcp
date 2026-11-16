@@ -16689,6 +16689,7 @@ struct B17B2FaultStore {
     probe_fault: bool,
     delete_calls: std::sync::atomic::AtomicUsize,
     forget_calls: std::sync::atomic::AtomicUsize,
+    update_calls: std::sync::atomic::AtomicUsize,
 }
 
 #[cfg(feature = "sal")]
@@ -16699,6 +16700,7 @@ impl B17B2FaultStore {
             probe_fault: false,
             delete_calls: std::sync::atomic::AtomicUsize::new(0),
             forget_calls: std::sync::atomic::AtomicUsize::new(0),
+            update_calls: std::sync::atomic::AtomicUsize::new(0),
         }
     }
     fn probe_fault() -> Self {
@@ -16707,6 +16709,7 @@ impl B17B2FaultStore {
             probe_fault: true,
             delete_calls: std::sync::atomic::AtomicUsize::new(0),
             forget_calls: std::sync::atomic::AtomicUsize::new(0),
+            update_calls: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 }
@@ -16744,6 +16747,8 @@ impl crate::store::MemoryStore for B17B2FaultStore {
         _id: &str,
         _patch: crate::store::UpdatePatch,
     ) -> crate::store::StoreResult<()> {
+        self.update_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(())
     }
     async fn delete(
@@ -16932,6 +16937,44 @@ async fn postgres_delete_pre_get_fault_is_503_and_does_not_delete_3228() {
         store.delete_calls.load(Ordering::SeqCst),
         0,
         "#3228: delete must not run after a pre-get fault"
+    );
+}
+
+/// PR 9390 L2 — a store error on the PUT pre-get is the error, never "not
+/// visible": the route answers the backend's 503 and the update never runs.
+#[cfg(feature = "sal")]
+#[tokio::test]
+async fn postgres_update_pre_get_fault_is_503_and_does_not_update_9390() {
+    use std::sync::atomic::Ordering;
+    let store = Arc::new(B17B2FaultStore::get_fault());
+    let app = Router::new()
+        .route("/api/v1/memories/{id}", axum::routing::put(update_memory))
+        .with_state(b17_b2_state_with_store(
+            store.clone(),
+            StorageBackend::Postgres,
+            vec!["alice".to_string()],
+        ));
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/api/v1/memories/mem-9390")
+                .method("PUT")
+                .header("x-agent-id", "alice")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"content":"overwrite-9390"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "PR 9390 L2: a pre-get fault answers its own status"
+    );
+    assert_eq!(
+        store.update_calls.load(Ordering::SeqCst),
+        0,
+        "PR 9390 L2: update must not run after a pre-get fault"
     );
 }
 

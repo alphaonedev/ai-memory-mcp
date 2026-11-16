@@ -411,4 +411,162 @@ mod tests {
         assert!(!is_authority_exempt(crate::handlers::routes::STATS));
         assert!(!is_authority_exempt("/api/v1/memories/abc"));
     }
+
+    /// The `authority` rows of the sink in `dir` whose `endpoint` is `ep`.
+    fn authority_rows_9390(
+        dir: &std::path::Path,
+        ep: &str,
+    ) -> Vec<crate::governance::audit::ForensicDecision> {
+        let mut rows = Vec::new();
+        for entry in std::fs::read_dir(dir).expect("sink dir").flatten() {
+            let body = std::fs::read_to_string(entry.path()).unwrap_or_default();
+            for line in body.lines().filter(|l| !l.trim().is_empty()) {
+                if let Ok(row) =
+                    serde_json::from_str::<crate::governance::audit::ForensicDecision>(line)
+                    && row.kind == AUDIT_KIND_AUTHORITY
+                    && row.payload.get("endpoint").and_then(|v| v.as_str()) == Some(ep)
+                {
+                    rows.push(row);
+                }
+            }
+        }
+        rows
+    }
+
+    fn inputs_9390<'a>(
+        header: Option<&'a str>,
+        key_bound: Option<&'a str>,
+        admins: &'a [String],
+    ) -> HttpAuthorityInputs<'a> {
+        HttpAuthorityInputs {
+            header_agent_id: header,
+            key_bound_principal: key_bound,
+            identity_mode: HttpIdentityMode::Enforce,
+            enrolled_keys_present: false,
+            admin_allowlist: admins,
+            header_trusted: true,
+        }
+    }
+
+    /// PR 9390 L1 — a funnel refusal never names the claimed, unproven agent
+    /// as the actor: the actor is the server-minted anonymous principal (or
+    /// the key-bound principal when one is proven), and the claim is the
+    /// separate `claimed_agent_id`, escaped (newline, control byte) and cut.
+    #[test]
+    fn refusal_audit_actor_is_never_the_claimed_id_9390() {
+        use crate::governance::audit;
+        let _sink = audit::forensic_sink_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().expect("sink dir");
+        audit::shutdown();
+        audit::init(tmp.path(), None).expect("sink init");
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let ep = |case: &str| format!("/api/v1/audit-9390-{case}-{run}");
+        let admins: Vec<String> = Vec::new();
+
+        // (a) header path: a shared-key caller names bob.
+        let header_bob =
+            Authority::resolve_http(inputs_9390(Some("bob"), None, &admins)).expect("resolve");
+        assert!(
+            refuse_unproven_named_principal(
+                HttpIdentityMode::Enforce,
+                Some("bob"),
+                &header_bob,
+                &ep("header"),
+            )
+            .is_some()
+        );
+        // (b) body path: the anonymous caller names "bob\n<BEL>x" in a body.
+        let anon = Authority::resolve_http(inputs_9390(None, None, &admins)).expect("resolve");
+        let hostile = "bob\n\u{7}x";
+        assert!(matches!(
+            bind_request_named_principal(
+                HttpIdentityMode::Enforce,
+                Some(&anon),
+                None,
+                Some(hostile),
+                &ep("body"),
+            ),
+            RequestPrincipal::Refused(_)
+        ));
+        // (c) proven alice names bob in a body.
+        let alice = Authority::resolve_http(inputs_9390(Some("alice"), Some("alice"), &admins))
+            .expect("resolve");
+        assert!(matches!(
+            bind_request_named_principal(
+                HttpIdentityMode::Enforce,
+                Some(&alice),
+                None,
+                Some("bob"),
+                &ep("proven"),
+            ),
+            RequestPrincipal::Refused(_)
+        ));
+        // (d) no authority at all (scaffold router) names bob.
+        assert!(matches!(
+            bind_request_named_principal(
+                HttpIdentityMode::Enforce,
+                None,
+                None,
+                Some("bob"),
+                &ep("none"),
+            ),
+            RequestPrincipal::Refused(_)
+        ));
+        // (e) a 100K claim: cut, bounded, linear.
+        let long = "z".repeat(100_000);
+        let started = std::time::Instant::now();
+        assert!(matches!(
+            bind_request_named_principal(
+                HttpIdentityMode::Enforce,
+                Some(&anon),
+                None,
+                Some(&long),
+                &ep("long"),
+            ),
+            RequestPrincipal::Refused(_)
+        ));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "a 100K claim is refused in bounded time: {:?}",
+            started.elapsed()
+        );
+        audit::shutdown();
+
+        let one = |case: &str| {
+            let rows = authority_rows_9390(tmp.path(), &ep(case));
+            assert_eq!(rows.len(), 1, "{case}: exactly one refusal row: {rows:?}");
+            let row = rows.into_iter().next().expect("one row");
+            let claimed = row
+                .payload
+                .get("claimed_agent_id")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            (row.actor, claimed)
+        };
+        let (actor, claimed) = one("header");
+        assert!(
+            crate::identity::is_anonymous_request_id(&actor) && actor != "bob",
+            "header refusal actor is server-minted, not the claim: {actor}"
+        );
+        assert_eq!(claimed, serde_json::json!("bob"));
+        let (actor, claimed) = one("body");
+        assert_eq!(actor, anon.principal(), "body refusal actor");
+        assert_eq!(claimed, serde_json::json!("bob\\n\\u{7}x"));
+        let (actor, claimed) = one("proven");
+        assert_eq!(actor, "alice", "a proven caller stays the actor");
+        assert_eq!(claimed, serde_json::json!("bob"));
+        let (actor, claimed) = one("none");
+        assert_eq!(actor, crate::identity::sentinels::ANONYMOUS_RESOLVE_FAILED);
+        assert_eq!(claimed, serde_json::json!("bob"));
+        let (actor, claimed) = one("long");
+        assert_eq!(actor, anon.principal());
+        let shown = claimed.as_str().unwrap_or_default().to_string();
+        assert!(
+            shown.len() <= 256 && shown.ends_with("...(cut)") && shown.starts_with("zzz"),
+            "a long claim is cut to the ident length: {} bytes",
+            shown.len()
+        );
+    }
 }

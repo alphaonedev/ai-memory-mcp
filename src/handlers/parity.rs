@@ -631,16 +631,53 @@ mod require_caller_owns_memory_tests {
         assert!(body.get("owner").is_none());
     }
 
-    /// #3124 rule (e) census — the pre-#3124 pin: an unstamped row passes
-    /// the HTTP gate. It is the `warn` (default) posture; the `refuse` twin
-    /// below is the single cross-backend policy's other half.
+    /// #3124 rule (e) census — the pre-#3124 pin: an unstamped row the
+    /// caller can READ passes the HTTP gate. It is the `warn` (default)
+    /// posture; the `refuse` twin below is the single cross-backend
+    /// policy's other half. PR 9390: the row is `collective` because an
+    /// unstamped `private` row is hidden from bob (cell below).
     #[test]
     fn legacy_unowned_passes() {
         use crate::identity::owner_stamp::UnstampedMutationMode::Warn;
-        let mem = mem_with(json!({}));
+        let mem = mem_with(json!({"scope": "collective"}));
         assert!(require_caller_owns_memory_with_mode(&mem, "bob", false, SITE, Warn).is_none());
-        let mem = mem_with(json!({"agent_id": ""}));
+        let mem = mem_with(json!({"agent_id": "", "scope": "collective"}));
         assert!(require_caller_owns_memory_with_mode(&mem, "bob", false, SITE, Warn).is_none());
+    }
+
+    /// PR 9390 (security M1) — an UNSTAMPED row gets the same visibility
+    /// verdict as a stamped one, BEFORE the #3124 posture: a private
+    /// unstamped row (missing scope is private) answers bob the read
+    /// path's 404 in both postures, byte-equal to a hidden stamped row,
+    /// never an admission and never the 403 that confirms the id.
+    #[tokio::test]
+    async fn unstamped_private_row_is_hidden_before_the_posture_9390() {
+        use crate::identity::owner_stamp::UnstampedMutationMode::{Refuse, Warn};
+        let hidden_body = axum::body::to_bytes(hidden_row_refusal().into_body(), 4096)
+            .await
+            .map(|b| b.to_vec())
+            .unwrap_or_default();
+        for meta in [
+            json!({}),
+            json!({"scope": "private"}),
+            json!({"agent_id": "", "scope": "private"}),
+            json!({"agent_id": null}),
+        ] {
+            for mode in [Warn, Refuse] {
+                let mem = mem_with(meta.clone());
+                let resp = require_caller_owns_memory_with_mode(&mem, "bob", false, SITE, mode)
+                    .unwrap_or_else(|| panic!("{meta} {mode:?}: hidden row admitted"));
+                assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{meta} {mode:?}");
+                let body = axum::body::to_bytes(resp.into_body(), 4096)
+                    .await
+                    .map(|b| b.to_vec())
+                    .unwrap_or_default();
+                assert_eq!(body, hidden_body, "{meta} {mode:?}: one hidden-row body");
+            }
+        }
+        // The daemon reads every row and stays admitted.
+        let mem = mem_with(json!({"scope": "private"}));
+        assert!(require_caller_owns_memory_with_mode(&mem, "daemon", false, SITE, Warn).is_none());
     }
 
     #[test]
@@ -1242,5 +1279,75 @@ mod not_visible_refusal_tests_8994 {
             )
             .is_none()
         );
+    }
+
+    /// PR 9390 (code L3) — a source the caller cannot see answers like
+    /// `(None, None)` even when the caller owns (and sees) the target:
+    /// the target owner deleting the edge would be a 200-versus-404
+    /// existence oracle on the hidden source.
+    #[tokio::test]
+    async fn unlink_gate_hidden_source_owned_target_equals_decoy_9390() {
+        let decoy = unlink_gate(None, None, "s", "t", STRANGER, SITE);
+        let (ds, db) = body_of(decoy.unwrap_or_else(|| (StatusCode::OK, "").into_response())).await;
+        assert_eq!(ds, StatusCode::NOT_FOUND);
+        for scope in ["private", "collective"] {
+            let tgt = mem("t", STRANGER, scope);
+            let hidden_source = unlink_gate(
+                None,
+                Some((&tgt, RowVisibility::of(&tgt, STRANGER))),
+                "s",
+                "t",
+                STRANGER,
+                SITE,
+            );
+            let (hs, hb) =
+                body_of(hidden_source.unwrap_or_else(|| (StatusCode::OK, "").into_response()))
+                    .await;
+            assert_eq!(
+                (hs, hb),
+                (ds, db.clone()),
+                "{scope} owned target, hidden source answers like the decoy pair"
+            );
+        }
+    }
+
+    /// PR 9390 M1 — a refusal on a row the caller cannot read renders as
+    /// not-found for EVERY reason (the PostgreSQL #1628 unstamped reasons
+    /// included), byte-equal to the owner-reason refusal.
+    #[cfg(feature = "sal")]
+    #[tokio::test]
+    async fn not_visible_refusal_hides_every_reason_9390() {
+        use crate::store::StoreError;
+        let deny = |reason: &str| StoreError::PermissionDenied {
+            action: "update".into(),
+            target: "row-9390".into(),
+            reason: reason.into(),
+        };
+        let (ws, wb) = body_of(super::super::store_err_to_response_for(
+            deny(crate::errors::msg::CALLER_DOES_NOT_OWN_MEMORY),
+            RowVisibility::NotVisible,
+        ))
+        .await;
+        assert_eq!(ws, StatusCode::NOT_FOUND);
+        for reason in [
+            "memory has no agent_id stamp; tenant writes refused (use admin path)",
+            "memory has no agent_id stamp; tenant deletes refused (use admin path)",
+            "memory has no agent_id stamp; tenant archives refused (use admin path)",
+            "any other refusal reason",
+        ] {
+            let (s, b) = body_of(super::super::store_err_to_response_for(
+                deny(reason),
+                RowVisibility::NotVisible,
+            ))
+            .await;
+            assert_eq!((s, b), (ws, wb.clone()), "{reason}");
+            // A visible row keeps its 403: the refusal is about ownership.
+            let (vs, _) = body_of(super::super::store_err_to_response_for(
+                deny(reason),
+                RowVisibility::Visible,
+            ))
+            .await;
+            assert_eq!(vs, StatusCode::FORBIDDEN, "{reason}");
+        }
     }
 }

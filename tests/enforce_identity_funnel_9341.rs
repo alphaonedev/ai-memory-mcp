@@ -63,6 +63,8 @@ struct Fixture {
     /// The router's own store, for seeding rows HTTP refuses to write
     /// (substrate namespaces) and for reading back what a refusal wrote.
     store: Arc<dyn ai_memory::store::MemoryStore>,
+    /// Which backend `store` is (the #3124 unstamped posture differs).
+    backend: ai_memory::handlers::StorageBackend,
     _db_file: NamedTempFile,
 }
 
@@ -185,6 +187,7 @@ async fn build_with_admin(
     Fixture {
         router: ai_memory::build_router(api_key_state, app_state),
         store,
+        backend: storage_backend,
         _db_file: f,
     }
 }
@@ -2016,4 +2019,305 @@ async fn h1_reflect_off_unchanged_9390() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn h1_reflect_advisory_reports_body_claim_9390() {
     assert_h1_off_advisory_unchanged_9390(H1Site9390::Reflect, HttpIdentityMode::Advisory).await;
+}
+
+// ---------------------------------------------------------------------------
+// PR 9390 round-1 notice, item 1 (M1) — an UNSTAMPED row the caller cannot
+// read answers exactly like an absent id on every id-addressed route, and
+// nothing is written. The #3124 owner gate still decides a VISIBLE unstamped
+// row (see `unstamped_policy_3124`). KgInvalidate is #9389, not swept here.
+// ---------------------------------------------------------------------------
+
+/// One id-addressed route the unstamped sweep probes (PR 9390 M1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unstamped9390 {
+    Put,
+    Delete,
+    Promote,
+    Lineage,
+    LinkCreate,
+    LinkDelete,
+    KgTimeline,
+}
+
+const UNSTAMPED_PROBES_9390: [Unstamped9390; 7] = [
+    Unstamped9390::Put,
+    Unstamped9390::Delete,
+    Unstamped9390::Promote,
+    Unstamped9390::Lineage,
+    Unstamped9390::LinkCreate,
+    Unstamped9390::LinkDelete,
+    Unstamped9390::KgTimeline,
+];
+
+impl Unstamped9390 {
+    fn request(self, id: &str) -> (&'static str, String, Option<serde_json::Value>) {
+        use ai_memory::handlers::routes;
+        let edge = serde_json::json!({
+            "source_id": id, "target_id": DECOY_TARGET_8994, "relation": RELATION_8994,
+        });
+        match self {
+            Self::Put => Probe8994::PutMemory.request(id, DECOY_TARGET_8994),
+            Self::Delete => Probe8994::DeleteMemory.request(id, DECOY_TARGET_8994),
+            Self::Lineage => Probe8994::Lineage.request(id, DECOY_TARGET_8994),
+            Self::Promote => (
+                "post",
+                concrete_path_naming(routes::MEMORIES_ID_PROMOTE, id),
+                None,
+            ),
+            Self::LinkCreate => ("post", routes::LINKS.to_string(), Some(edge)),
+            Self::LinkDelete => ("delete", routes::LINKS.to_string(), Some(edge)),
+            Self::KgTimeline => (
+                "get",
+                format!("{}?source_id={id}", routes::KG_TIMELINE),
+                None,
+            ),
+        }
+    }
+}
+
+/// An UNSTAMPED (no `agent_id`) row with `metadata`, written through the
+/// store: no HTTP caller can write a row without its owner stamp.
+async fn seed_unstamped_9390(
+    fx: &Fixture,
+    ns: &str,
+    marker: &str,
+    metadata: serde_json::Value,
+) -> String {
+    let now = chrono::Utc::now().to_rfc3339();
+    let row = ai_memory::models::Memory {
+        id: uuid::Uuid::new_v4().to_string(),
+        namespace: ns.to_string(),
+        title: marker.to_string(),
+        content: marker.to_string(),
+        created_at: now.clone(),
+        updated_at: now,
+        metadata,
+        ..ai_memory::models::Memory::default()
+    };
+    let ctx = ai_memory::store::CallerContext::for_admin("fixture-9390");
+    fx.store
+        .store(&ctx, &row)
+        .await
+        .expect("seed the unstamped row")
+}
+
+/// PR 9390 M1 — the invariant over both non-owner callers: a hidden
+/// UNSTAMPED row answers like a decoy id (404, same body once the id is
+/// folded) and the row is untouched afterwards. Each (caller, route) probe
+/// gets its OWN fresh hidden row, so a write that lands (a DELETE) cannot
+/// make a later probe vacuous.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unstamped_private_row_answers_like_a_decoy_9390() {
+    let fx = build(HttpIdentityMode::Enforce, true).await;
+    let suffix = run_suffix();
+    let ns = format!("ns-unstamped-9390-{suffix}");
+    let ctx = ai_memory::store::CallerContext::for_admin("fixture-9390");
+    let mut oracles = Vec::new();
+    let mut writes = Vec::new();
+    for (who, key, ids) in CALLERS_8994 {
+        for probe in UNSTAMPED_PROBES_9390 {
+            let marker = format!("unstamped-marker-9390-{suffix}-{who}-{probe:?}");
+            let hidden =
+                seed_unstamped_9390(&fx, &ns, &marker, serde_json::json!({"scope": "private"}))
+                    .await;
+            let tier = fx.store.get(&ctx, &hidden).await.expect("seeded").tier;
+            let mut folded = Vec::with_capacity(2);
+            for id in [hidden.as_str(), B3_DECOY_ID] {
+                let (method, uri, body) = probe.request(id);
+                let out = send_simple(&fx.router, method, &uri, key, ids, body).await;
+                folded.push((out.status, fold_id_8994(&out.body, id)));
+            }
+            let (real, decoy) = (&folded[0], &folded[1]);
+            if real != decoy || real.0 != StatusCode::NOT_FOUND {
+                oracles.push(format!(
+                    "{who} {probe:?}: unstamped -> {} {} | decoy -> {} {}",
+                    real.0, real.1, decoy.0, decoy.1
+                ));
+            }
+            match fx.store.get(&ctx, &hidden).await {
+                Ok(row) if row.content == marker && row.tier == tier => {}
+                Ok(row) => writes.push(format!("{who} {probe:?}: row changed ({:?})", row.tier)),
+                Err(e) => writes.push(format!("{who} {probe:?}: row gone ({e})")),
+            }
+        }
+    }
+    assert!(
+        oracles.is_empty(),
+        "PR 9390 M1 unstamped oracle: {oracles:#?}"
+    );
+    assert!(
+        writes.is_empty(),
+        "PR 9390 M1 hidden unstamped row written: {writes:#?}"
+    );
+}
+
+/// PR 9390 M1 — the visibility verdict does not widen into the visible case:
+/// a VISIBLE (collective) unstamped row is still decided by the #3124 owner
+/// gate, so under the default warn posture bob's PUT on it is served.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unstamped_visible_row_keeps_the_3124_gate_9390() {
+    let fx = build(HttpIdentityMode::Enforce, true).await;
+    let suffix = run_suffix();
+    let ns = format!("ns-unstamped-visible-9390-{suffix}");
+    let marker = format!("unstamped-visible-9390-{suffix}");
+    let row = seed_unstamped_9390(
+        &fx,
+        &ns,
+        &marker,
+        serde_json::json!({"scope": "collective"}),
+    )
+    .await;
+    let (method, uri, body) = Unstamped9390::Put.request(&row);
+    let out = send_simple(&fx.router, method, &uri, BOB_KEY, &[BOB], body).await;
+    // #3124 is per backend and unchanged by PR 9390: SQLite `warn` admits
+    // the visible unstamped row, PostgreSQL refuses it with its own 403
+    // (never the not-found shape, which is for rows the caller cannot read).
+    let want = match fx.backend {
+        ai_memory::handlers::StorageBackend::Postgres => StatusCode::FORBIDDEN,
+        ai_memory::handlers::StorageBackend::Sqlite => StatusCode::OK,
+    };
+    assert_eq!(
+        out.status, want,
+        "a visible unstamped row keeps the #3124 gate: {}",
+        out.body
+    );
+}
+
+// ---------------------------------------------------------------------------
+// PR 9390 round-1 notice, item 4 (L3) — DELETE /links whose SOURCE is hidden
+// and whose TARGET the caller owns answers like a decoy source, and the link
+// survives.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unlink_hidden_source_owned_target_answers_like_a_decoy_9390() {
+    use ai_memory::handlers::routes;
+    let fx = build(HttpIdentityMode::Enforce, true).await;
+    let suffix = run_suffix();
+    let ns = format!("ns-unlink-9390-{suffix}");
+    let marker = format!("unlink-marker-9390-{suffix}");
+    let source = seed_8994(&fx, &ns, "private", &marker).await;
+    let target = seed_as_8994(
+        &fx,
+        (BOB_KEY, BOB),
+        &ns,
+        "collective",
+        &format!("{marker}-bob"),
+    )
+    .await;
+    let edge = |src: &str| serde_json::json!({"source_id": src, "target_id": target, "relation": RELATION_8994});
+    let linked = send_simple(
+        &fx.router,
+        "post",
+        routes::LINKS,
+        ALICE_KEY,
+        &[ALICE],
+        Some(edge(&source)),
+    )
+    .await;
+    assert!(
+        linked.status.is_success(),
+        "alice links her private row to bob's: {} {}",
+        linked.status,
+        linked.body
+    );
+
+    let mut folded = Vec::with_capacity(2);
+    for src in [source.as_str(), B3_DECOY_ID] {
+        let out = send_simple(
+            &fx.router,
+            "delete",
+            routes::LINKS,
+            BOB_KEY,
+            &[BOB],
+            Some(edge(src)),
+        )
+        .await;
+        folded.push((out.status, fold_id_8994(&out.body, src)));
+    }
+    assert_eq!(
+        folded[0], folded[1],
+        "PR 9390 L3: a hidden source with an owned target answers like a decoy source"
+    );
+    assert_eq!(folded[0].0, StatusCode::NOT_FOUND, "{:?}", folded[0]);
+    // The link survived: its owner can still remove it.
+    let owner = send_simple(
+        &fx.router,
+        "delete",
+        routes::LINKS,
+        ALICE_KEY,
+        &[ALICE],
+        Some(edge(&source)),
+    )
+    .await;
+    assert!(
+        owner.status.is_success(),
+        "the link survived bob's refused unlink: {} {}",
+        owner.status,
+        owner.body
+    );
+}
+
+// ---------------------------------------------------------------------------
+// PR 9390 round-1 notice, item 6 (H1 hint) — with ZERO keys enrolled under
+// Enforce, no route reaches a handler acting as a caller-chosen principal:
+// a header name is refused on every gated route, and a body / query name
+// sent by the anonymous caller never reads bob's private row nor writes a
+// row stamped as bob.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn zero_keys_no_route_acts_as_a_caller_chosen_principal_9390() {
+    let fx = build(HttpIdentityMode::Enforce, false).await;
+    let suffix = run_suffix();
+    let ns = format!("ns-zero-keys-9390-{suffix}");
+    let marker = format!("zero-keys-marker-9390-{suffix}");
+    seed_private_9390(&fx, BOB, &ns, &marker).await;
+
+    let mut served = Vec::new();
+    let mut checked = 0usize;
+    for row in ROUTE_TABLE {
+        if row.class == RouteClass::Exempt {
+            continue;
+        }
+        checked += 1;
+        let path = concrete_path(row.path);
+        let header = send_simple(&fx.router, row.method, &path, SHARED_KEY, &[BOB], None).await;
+        if !header.is_funnel_refusal() && !header.is_backend_gate_refusal() {
+            served.push(format!(
+                "header {} {} -> {}",
+                row.method, path, header.status
+            ));
+        }
+        let sep = if path.contains('?') { '&' } else { '?' };
+        let uri = format!("{path}{sep}agent_id={BOB}&as_agent={BOB}&namespace={ns}");
+        let body = serde_json::json!({
+            "agent_id": BOB, "as_agent": BOB, "namespace": ns, "query": marker,
+            "context": marker, "title": format!("{marker}-claimed"),
+            "content": format!("{marker}-claimed"),
+        });
+        let claimed = send_simple(&fx.router, row.method, &uri, SHARED_KEY, &[], Some(body)).await;
+        if claimed.body.to_string().contains(&format!("\"{marker}\"")) {
+            served.push(format!("body {} {} read bob's row", row.method, path));
+        }
+    }
+    let ctx = ai_memory::store::CallerContext::for_admin("fixture-9390");
+    let mut filter = ai_memory::store::Filter::default();
+    filter.namespace = Some(ns.clone());
+    filter.limit = 1000;
+    let stamped_bob = fx
+        .store
+        .list(&ctx, &filter)
+        .await
+        .expect("list ns")
+        .into_iter()
+        .filter(|m| m.metadata.get("agent_id").and_then(|v| v.as_str()) == Some(BOB))
+        .count();
+    assert!(checked > 0, "the table has gated rows");
+    assert!(
+        served.is_empty(),
+        "zero keys, caller-chosen principal served: {served:#?}"
+    );
+    assert_eq!(stamped_bob, 1, "only the seeded row is stamped as bob");
 }
