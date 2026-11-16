@@ -1338,7 +1338,7 @@ fn guarded_impl_bodies(c: &[char], names: &[String]) -> Vec<(usize, usize)> {
 /// Is the item spanning `start..end` a pattern (`Some(true)`), an expression
 /// (`Some(false)`), or unknown (`None`), judged by its neighbours? An item
 /// with no decisive neighbour inside `( )`, `[ ]` or a `Path { }` takes the
-/// verdict of that enclosing item.
+/// verdict of that enclosing item; inside a macro invocation it is unknown.
 fn pattern_position(c: &[char], mut start: usize, mut end: usize) -> Option<bool> {
     loop {
         let next = skip_ws(c, end);
@@ -1379,6 +1379,15 @@ fn pattern_position(c: &[char], mut start: usize, mut end: usize) -> Option<bool
             _ => {}
         }
         let open = enclosing_open(c, start)?;
+        // A macro invocation (`name!(`, `name![`, `name!{`) takes any grammar
+        // (`matches!(s, T { key: None, .. })` is a pattern), so an item
+        // inside one is unknown.
+        if skip_ws_back(c, open)
+            .checked_sub(1)
+            .is_some_and(|at| c[at] == '!')
+        {
+            return None;
+        }
         end = matching_close(c, open) + 1;
         start = match ident_before(c, open) {
             Some((at, _)) => at,
@@ -1399,7 +1408,8 @@ fn pattern_position(c: &[char], mut start: usize, mut end: usize) -> Option<bool
 /// rest or a pattern position (`let`, `for .. in`, closure and fn parameters,
 /// `match` arms and guards, `if let`, `while let`, destructuring assignment,
 /// nested in a tuple, slice, tuple-struct or struct pattern) is a read, and a
-/// group that is neither is a read too (fail closed). The struct declaration,
+/// group that is neither (a block tail, any item inside a macro invocation
+/// such as `matches!`) is a read too (fail closed). The struct declaration,
 /// an `impl` header and a `-> T {` fn body are not groups of the type.
 fn key_field_read_lines(blanked: &str, guarded_type: &str) -> Vec<usize> {
     let c: Vec<char> = blanked.chars().collect();
