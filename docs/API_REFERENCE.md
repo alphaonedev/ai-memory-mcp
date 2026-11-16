@@ -1044,6 +1044,11 @@ A source the caller cannot read answers exactly like an absent source:
 **404** `{"error": "source memory not found", "source_id": …}` on both
 backends, before any target or ownership check, and nothing is written
 ([#8994](https://github.com/alphaonedev/ai-memory-mcp/issues/8994)).
+A target in a substrate namespace the caller cannot read answers exactly
+like a target id that names no row: **404** `{"error": "not found"}` on
+both backends, and nothing is written (before, SQLite answered **403**
+`caller cannot see the link target` for the hidden target and **500** for
+the absent one) ([#8994](https://github.com/alphaonedev/ai-memory-mcp/issues/8994)).
 
 Relations (nine at v0.8.0; was six at v0.7.0, four at v0.6.x): `related_to`, `supersedes`, `contradicts`, `derived_from`, `reflects_on` (recursive-learning Task 1/8), `derives_from` (WT-1-A atomisation — atom row → parent memory), `decomposes_into`, `depends_on`, `advances` (the last three are the v0.8.0 Pillar-2 typed-cognition Goal/Plan/Step relations, #1709). Canonical enum in `src/models/link.rs::MemoryLinkRelation` (`COUNT = 9`).
 
@@ -1260,6 +1265,11 @@ it. Idempotent. A source the caller cannot read answers the same
 not-found body as an absent source on both backends; **403** is kept for a
 readable source the caller does not own
 ([#8994](https://github.com/alphaonedev/ai-memory-mcp/issues/8994)).
+An agent the source row is addressed to (`target_agent_id`, or its
+`_inbox/<agent>` namespace) keeps the right to invalidate the row's edges
+even where it cannot read the row on SQLite; on PostgreSQL such a row in a
+team, unit or org subtree outside the caller's ancestry answers the
+not-found body, as before this change.
 
 ```json
 {
