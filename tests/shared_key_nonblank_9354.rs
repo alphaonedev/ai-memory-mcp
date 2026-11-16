@@ -1373,10 +1373,8 @@ fn pattern_position(c: &[char], mut start: usize, mut end: usize) -> Option<bool
             Some('=') if !matches!(prev2, Some('=' | '!' | '<' | '>')) => return Some(false),
             _ => {}
         }
-        match ident_before(c, before).map(|(_, w)| w).as_deref() {
-            Some("let" | "for") => return Some(true),
-            Some("return") => return Some(false),
-            _ => {}
+        if ident_before(c, before).is_some_and(|(_, w)| w == "return") {
+            return Some(false);
         }
         let open = enclosing_open(c, start)?;
         // A macro invocation (`name!(`, `name![`, `name!{`) takes any grammar
@@ -1538,7 +1536,7 @@ fn s1b_key_field_scanner_self_test_9354() {
 }
 
 /// Number of s1b syntax-form cells (asserted in s1b).
-const SCANNER_FORM_CELLS_COUNT: usize = 39;
+const SCANNER_FORM_CELLS_COUNT: usize = 51;
 /// s1b syntax-form cells (name, synthetic source, 1-based lines that must be
 /// reported). Every syntax that binds or reads the `key` field of the guarded
 /// type is a read; a construction, the struct declaration and an `impl` body
@@ -1676,6 +1674,66 @@ const SCANNER_FORM_CELLS: [(&str, &str, &[usize]); SCANNER_FORM_CELLS_COUNT] = [
         "impl-headers-with-method-named-key",
         "impl ApiKeyState {\n fn key(&self) -> u8 { 0 }\n}\nimpl Tr for ApiKeyState {\n fn key(&self) -> u8 { 0 }\n}",
         &[],
+    ),
+    (
+        "return-type-body-names-key",
+        "fn make(k: u8) -> ApiKeyState {\n    let key = k;\n    build(key)\n}",
+        &[],
+    ),
+    (
+        "rest-in-expression-position-fails-closed",
+        "let v = ApiKeyState { key, .. };",
+        &[1],
+    ),
+    (
+        "destructuring-assignment-in-arm",
+        "match t { _ => ApiKeyState { key: k, mtls_enforced: _ } = s, }",
+        &[1],
+    ),
+    (
+        "typed-closure-param-in-call",
+        "s = f(move |a: u8, ApiKeyState { key: k, mtls_enforced: _ }: ApiKeyState| k);",
+        &[1],
+    ),
+    (
+        "closure-last-param-in-call",
+        "s = f(|a, ApiKeyState { key: k, mtls_enforced: _ }| k);",
+        &[1],
+    ),
+    (
+        "closure-first-param-in-call",
+        "s = f(|ApiKeyState { key: k, mtls_enforced: _ }, b| k);",
+        &[1],
+    ),
+    (
+        "for-tuple-in-arm",
+        "match t { _ => for (ApiKeyState { key: k, mtls_enforced: _ }, b) in v {} }",
+        &[1],
+    ),
+    (
+        "guarded-arm-in-let-match",
+        "let r = match t { ApiKeyState { key: k, mtls_enforced: _ } if k.is_some() => 1, _ => 0 };",
+        &[1],
+    ),
+    (
+        "construction-as-arm-body",
+        "match x { _ => ApiKeyState { key: k, mtls_enforced: m }, }",
+        &[],
+    ),
+    (
+        "construction-assigned-as-block-tail",
+        "fn f() { s = ApiKeyState { key: k, mtls_enforced: m } }",
+        &[],
+    ),
+    (
+        "construction-returned-as-block-tail",
+        "fn f() { return ApiKeyState { key: k, mtls_enforced: m } }",
+        &[],
+    ),
+    (
+        "block-tail-in-let-fails-closed",
+        "let v = { ApiKeyState { key: k, mtls_enforced: m } };",
+        &[1],
     ),
     ("raw-ident-field", "let k = s.r#key.clone();", &[1]),
     (
