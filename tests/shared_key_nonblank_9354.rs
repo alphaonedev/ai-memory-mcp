@@ -1294,22 +1294,22 @@ fn guarded_names(c: &[char], guarded_type: &str) -> Vec<String> {
             if let Some(alias) = ident_at(c, skip_ws(c, after + 2)) {
                 names.push(alias);
             }
-        } else if word == "type" {
-            if let Some(alias) = ident_at(c, after) {
-                let from = after + alias.chars().count();
-                let semi = c[from..]
-                    .iter()
-                    .position(|&ch| ch == ';')
-                    .map_or(c.len(), |p| from + p);
-                let rhs: String = c[from..semi]
-                    .iter()
-                    .filter(|ch| !ch.is_whitespace())
-                    .collect();
-                if let Some(target) = rhs.strip_prefix('=') {
-                    if target == guarded_type || target.ends_with(&path_suffix) {
-                        names.push(alias);
-                    }
-                }
+        } else if word == "type"
+            && let Some(alias) = ident_at(c, after)
+        {
+            let from = after + alias.chars().count();
+            let semi = c[from..]
+                .iter()
+                .position(|&ch| ch == ';')
+                .map_or(c.len(), |p| from + p);
+            let rhs: String = c[from..semi]
+                .iter()
+                .filter(|ch| !ch.is_whitespace())
+                .collect();
+            if let Some(target) = rhs.strip_prefix('=')
+                && (target == guarded_type || target.ends_with(&path_suffix))
+            {
+                names.push(alias);
             }
         }
     }
