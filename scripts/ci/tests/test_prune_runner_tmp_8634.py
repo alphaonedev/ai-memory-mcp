@@ -965,15 +965,19 @@ class MountCrossing(Base):
     def test_mount_made_between_the_check_and_the_open_is_seen_after_the_open(self):
         holder = self.stale_holder()
         real_open = os.open
+        opens = {"inner": 0}
 
         def open_then_mount(path, *args, **kwargs):
             if path == "inner":
-                self.mounts(holder / "inner")
+                opens["inner"] += 1
+                if opens["inner"] == 2:  # the removal pass: its check before the open has already passed
+                    self.mounts(holder / "inner")
             return real_open(path, *args, **kwargs)
 
         with mock.patch.object(PRUNE.os, "open", open_then_mount):
             rc, out, err = self.run_prune(self.runner)
         self.assertEqual(rc, EXIT_OK)
+        self.assertEqual(opens["inner"], 2, "the count pass and the removal pass each opened it once")
         self.assertIn(f"prune_runner_tmp: skipped inner: {SKIP_MOUNT_POINT}", err.splitlines())
         self.assertEqual((holder / "inner" / "precious" / "data").read_bytes(), b"precious")
 
