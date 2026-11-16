@@ -110,10 +110,26 @@ which runs `scripts/ci/prune_runner_tmp.py` with these rules:
   `prune-facts:` line is quoted, so on f1 the step refuses visibly.
 - Removal is an iterative, descriptor-relative walk (no recursion, no
   `shutil.rmtree`), one open directory at a time, with an identity re-check
-  right before each entry is entered. A tree deeper than `MAX_TREE_DEPTH` or
-  larger than `MAX_TREE_ENTRIES` is one counted failure and stays in place. An
-  entry on another device (a mount point) is skipped, reported and never
-  entered (`skipped=<n>`).
+  right before each entry is entered. A tree deeper than `MAX_TREE_DEPTH`
+  levels or with more than `MAX_TREE_ENTRIES` entries is one counted failure,
+  counted before anything under it is removed (a first pass counts, the second
+  removes; a tree that grows past a bound between the two passes stops there,
+  partly removed, and is one counted failure). A directory on another device,
+  or on Linux on another mount than `TMPDIR` (the `mnt_id:` line of
+  `/proc/self/fdinfo/<fd>`, so a bind mount of the same device is caught too),
+  is skipped, reported and never entered (`skipped=<n>`); a mount id that
+  cannot be read is a skip and a counted failure. On macOS there is no
+  `/proc` and the standard library has no mount id, so the device check is the
+  strongest one there.
+- The platform check is functional: inside the proven directory the script
+  makes a probe directory `.prune-probe-<pid>-<hex>` and a file in it, and
+  makes one real descriptor-relative call of each needed function (`os.mkdir`,
+  `os.open`, `os.lstat`, `os.scandir`, `os.unlink`, `os.rmdir`). The refusal
+  names the first call that fails. The probe removes what it made, also under
+  `--dry-run`; a probe it cannot remove is named on stderr.
+- The `prune-facts:` line also goes to the job summary (`GITHUB_STEP_SUMMARY`)
+  when that is set, escaped the same way; a summary it cannot write is named on
+  stderr and changes no exit code.
 - Every input it cannot prove ends in a named refusal with nothing deleted. A
   refusal prints a `::warning` annotation with the escaped reason (and the same
   line on stderr) and the step still exits 0: it does not fail the job and does
@@ -121,7 +137,8 @@ which runs `scripts/ci/prune_runner_tmp.py` with these rules:
   the required checks. The reasons, each pinned by a test against the code:
 
 - refusal: `python <found> is older than <wanted>`
-- refusal: `this platform lacks descriptor-relative file calls`
+- refusal: `this platform lacks a working descriptor-relative call: <call> raised <error> (<why>)`
+- refusal: `the mount id of TMPDIR cannot be read: <why>`
 - refusal: `allowed root is not an absolute path: <root>`
 - refusal: `allowed root is '/'`
 - refusal: `TMPDIR is unset`
@@ -132,6 +149,7 @@ which runs `scripts/ci/prune_runner_tmp.py` with these rules:
 - refusal: `TMPDIR is not a directory: <path>`
 - refusal: `TMPDIR cannot be opened: <path> (<why>)`
 - refusal: `TMPDIR changed while it was opened: <path>`
+- refusal: `TMPDIR resolves elsewhere than its normalized path: <path>`
 - refusal: `TMPDIR is a forbidden path: <path>`
 - refusal: `TMPDIR is not owned by the current user: <path>`
 - refusal: `TMPDIR is not named runner-<digits>: <name>`
@@ -148,7 +166,7 @@ which runs `scripts/ci/prune_runner_tmp.py` with these rules:
   the summary with `internal_error=1` and exits 1, so the job goes red.
   `--dry-run` lists what would go and deletes nothing.
 - Every printed name, path and message is escaped (control characters,
-  backslash, `%` and `::`), so a file name cannot inject a log line or a
+  backslash, `%` and every `:`), so a file name cannot inject a log line or a
   workflow command.
 - It needs Python 3.12+ on the runner; an older interpreter ends in the
   `python` refusal before anything newer is imported. The test families that

@@ -216,6 +216,17 @@ class Base(unittest.TestCase):
         kept = [ln for ln in lines if not ln.startswith(("prune-facts:", "::"))]
         return rc, "".join(kept), err.getvalue()
 
+    def deny_unlink(self):
+        """Every unlink of an entry fails with EACCES; the platform probe's own file (D-H1) is not an entry."""
+        real_unlink = os.unlink
+
+        def denied(name, *args, **kwargs):
+            if str(name) == PRUNE.PROBE_FILE:
+                return real_unlink(name, *args, **kwargs)
+            raise PermissionError(13, "denied")
+
+        return mock.patch.object(PRUNE.os, "unlink", denied)
+
     def run_cli(self, tmpdir, *extra, interpreter=None, summary=None):
         """Run the script as a process; allowed roots patched by a tiny wrapper, never by a flag."""
         wrapper = self.base / "wrapper.py"
@@ -383,7 +394,7 @@ class PruneRules(Base):
         state = {"hit": False}
 
         def flaky(name, *args, **kwargs):
-            if not state["hit"]:
+            if not state["hit"] and str(name) != PRUNE.PROBE_FILE:  # the probe's own file is no entry
                 state["hit"] = True
                 real_unlink(name, *args, **kwargs)
                 raise FileNotFoundError(2, "vanished", name)
@@ -1295,7 +1306,7 @@ class Robustness(Base):
     def test_failure_lines_are_capped(self):
         for index in range(FAILURE_FLOOD):
             self.make_file(f"f{index}", OLD_AGE_SECS)
-        with mock.patch.object(PRUNE.os, "unlink", side_effect=PermissionError(13, "denied")):
+        with self.deny_unlink():
             rc, out, err = self.run_prune(self.runner)
         self.assertEqual(rc, EXIT_OK)
         self.assertEqual(err.count("failed to remove"), PRUNE.MAX_FAILURE_LINES)
@@ -1320,7 +1331,7 @@ class Scale(Base):
             elapsed = time.monotonic() - started
         self.assertEqual((rc, err), (EXIT_OK, ""))
         self.assertEqual(out.strip(), f"pruned={MANY_ENTRIES // 2} kept={MANY_ENTRIES // 2} failed=0 freed_bytes=0 skipped=0")
-        self.assertEqual(spy.call_count, 1, "one scandir pass over TMPDIR")
+        self.assertEqual(spy.call_count, 2, "one scandir pass over TMPDIR plus the probe's one over its own directory")
         self.assertLess(elapsed, MANY_ENTRIES_CEILING_SECS)
         self.assertEqual(len(os.listdir(self.runner)), MANY_ENTRIES // 2)
 
@@ -1466,7 +1477,7 @@ class ExitCodes(Base):
 
     def test_counted_failures_exit_zero_with_one_warning_annotation(self):
         self.make_file("old.db", OLD_AGE_SECS)
-        with mock.patch.object(PRUNE.os, "unlink", side_effect=PermissionError(13, "denied")):
+        with self.deny_unlink():
             rc, out, err = self.run_prune(self.runner)
         self.assertEqual(rc, EXIT_OK)
         self.assertEqual(self.annotations, [failed_line(1, ["old.db"])])
@@ -1502,7 +1513,7 @@ class FailureAnnotation(Base):
     def run_failing(self, names):
         for name in names:
             self.make_file(name, OLD_AGE_SECS)
-        with mock.patch.object(PRUNE.os, "unlink", side_effect=PermissionError(13, "denied")):
+        with self.deny_unlink():
             return self.run_prune(self.runner)
 
     def only_annotation(self, out, err):
@@ -1552,7 +1563,7 @@ class FailureAnnotation(Base):
                 path = os.path.join(os.fsencode(self.runner), os.fsencode(raw))
                 Path(os.fsdecode(path)).write_bytes(b"x")
                 os.utime(path, (time.time() - OLD_AGE_SECS,) * 2)
-                with mock.patch.object(PRUNE.os, "unlink", side_effect=PermissionError(13, "denied")):
+                with self.deny_unlink():
                     rc, out, err = self.run_prune(self.runner)
                 self.assertEqual(rc, EXIT_OK)
                 self.assertEqual(self.only_annotation(out, err), failed_line(1, [escaped]))
