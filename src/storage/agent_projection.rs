@@ -41,6 +41,10 @@ pub(crate) const MISMATCH_MESSAGE: &str = "agent_projection_guard: _agents write
 #[cfg(test)]
 pub(crate) const NON_OBJECT_MESSAGE: &str = "agent_projection_guard: bound _agents registration content is not a JSON object; re-register the agent (register_agent) to rebuild it";
 
+/// #9405 - the refusal when the projection is read on an autocommit
+/// connection, i.e. outside the write transaction that writes the row.
+pub(crate) const PROJECTION_OUTSIDE_TXN_MESSAGE: &str = "agent projection read outside a write transaction (#9405): the projection and the row write must share one transaction";
+
 /// Guard trigger names (v102). They replace the v97
 /// `agent_pubkey_history_authoritative_{insert,update}_v97` rewriters.
 #[cfg(test)]
@@ -189,6 +193,12 @@ pub(crate) fn projected(conn: &Connection, mem: &Memory) -> Result<Option<Memory
     if mem.namespace != AGENTS_NAMESPACE {
         return Ok(None);
     }
+    // #9405 - the projection is only sound under the write transaction that
+    // writes the row; on an autocommit connection a bind / rebind / revoke
+    // could commit between this read and the write. Fail closed.
+    if conn.is_autocommit() {
+        anyhow::bail!(PROJECTION_OUTSIDE_TXN_MESSAGE);
+    }
     let metadata = serde_json::to_string(&mem.metadata).context("agent projection: metadata")?;
     let (mismatch, meta, content): (i64, String, String) = conn
         .query_row(
@@ -335,6 +345,51 @@ mod tests {
             MIGRATION_V102_SQLITE.matches(FTS_REBUILD_SQL).count(),
             2,
             "0086 rebuilds memories_fts before and after the reconcile"
+        );
+    }
+
+    /// #9405 structural cell. Rule: `projected` (and so `sanitized_projected`)
+    /// refuses an `_agents` row on an autocommit connection, so no funnel can
+    /// read the projection outside a write transaction. Limit: it detects ANY
+    /// open transaction (`!is_autocommit`), not that the transaction is
+    /// IMMEDIATE or is the one the row write commits in; the two-connection
+    /// race cells in tests/agent_projection_txn_9405_9406.rs hold that half.
+    #[test]
+    fn projection_outside_a_write_txn_is_refused_9405() {
+        let conn = crate::storage::open(std::path::Path::new(":memory:")).expect("open");
+        let agent = "ai:projection-txn-9405";
+        let id = crate::storage::register_agent(&conn, agent, "test", &[]).expect("register");
+        let row = crate::storage::get(&conn, &id)
+            .expect("get")
+            .expect("registration row");
+        assert!(conn.is_autocommit());
+        for (what, outcome) in [
+            ("projected", projected(&conn, &row).map(|_| ())),
+            (
+                "sanitized_projected",
+                sanitized_projected(&conn, &row).map(|_| ()),
+            ),
+        ] {
+            assert_eq!(
+                outcome.map_err(|e| e.to_string()),
+                Err(PROJECTION_OUTSIDE_TXN_MESSAGE.to_string()),
+                "{what} on an autocommit connection"
+            );
+        }
+        let mut other = row.clone();
+        other.namespace = "not-agents".to_string();
+        assert!(
+            projected(&conn, &other).expect("non-_agents row").is_none(),
+            "a non-_agents row needs no projection and no transaction"
+        );
+        let inside = crate::storage::in_write_txn(&conn, || {
+            assert!(!conn.is_autocommit());
+            projected(&conn, &row).map(|p| p.is_none())
+        })
+        .expect("projection inside a write transaction");
+        assert!(
+            inside,
+            "a freshly registered row already carries the projection"
         );
     }
 }

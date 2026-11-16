@@ -28,6 +28,10 @@
 -- encryption: content '' plus an envelope) cannot have its content mirror read
 -- by SQL; Rust projects the plaintext before sealing, so a sealed row passes
 -- when its metadata pair equals the open history row.
+--
+-- The update guard's `UPDATE OF` list names every column its WHEN clause and
+-- body read (#9406): metadata, content, title, namespace AND
+-- encrypted_envelope, so an envelope-only unseal of a bound row is re-checked.
 
 DROP TRIGGER IF EXISTS agent_pubkey_history_authoritative_insert_v97;
 DROP TRIGGER IF EXISTS agent_pubkey_history_authoritative_update_v97;
@@ -75,7 +79,7 @@ BEGIN
 END;
 
 CREATE TRIGGER IF NOT EXISTS agent_pubkey_history_projection_guard_update
-AFTER UPDATE OF metadata, content, title, namespace ON memories
+AFTER UPDATE OF metadata, content, title, namespace, encrypted_envelope ON memories
 WHEN (NEW.namespace = '_agents' AND (
          json_extract(NEW.metadata, '$.agent_pubkey') IS NOT (SELECT pubkey_b64 FROM agent_pubkey_history WHERE agent_id = substr(NEW.title, length('agent:') + 1) AND superseded_at IS NULL) OR
          json_extract(NEW.metadata, '$.pubkey_bound_at') IS NOT (SELECT bound_at FROM agent_pubkey_history WHERE agent_id = substr(NEW.title, length('agent:') + 1) AND superseded_at IS NULL) OR
