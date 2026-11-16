@@ -41,6 +41,11 @@ const ALICE_KEY: &str = "alice-per-agent-key-9341";
 const BOB_KEY: &str = "bob-per-agent-key-9341";
 const ALICE: &str = "alice";
 const BOB: &str = "bob";
+/// #9366: an enrolled admin that is neither alice nor bob.
+const CAROL_KEY: &str = "carol-admin-per-agent-key-9366";
+const CAROL: &str = "carol";
+/// B-3: a well-formed id no row carries, for the input-echo control.
+const B3_DECOY_ID: &str = "00000000-0000-4000-8000-000000009366";
 /// The wire code of the one funnel refusal.
 const ATTESTED_IDENTITY_REQUIRED: &str = "attested_identity_required";
 /// The wire code `api_key_auth` returns for a per-agent key whose agent
@@ -63,6 +68,7 @@ fn enrolled(with_keys: bool) -> Arc<EnrolledAgentKeys> {
     if with_keys {
         map.insert(api_key_sha256_hex(ALICE_KEY), ALICE.to_string());
         map.insert(api_key_sha256_hex(BOB_KEY), BOB.to_string());
+        map.insert(api_key_sha256_hex(CAROL_KEY), CAROL.to_string());
     }
     Arc::new(EnrolledAgentKeys::from_map(map))
 }
@@ -107,6 +113,16 @@ async fn build(mode: HttpIdentityMode, with_keys: bool) -> Fixture {
 
 /// The fixture with the shared key configured (`Some`) or not (`None`).
 async fn build_with(mode: HttpIdentityMode, with_keys: bool, shared_key: Option<&str>) -> Fixture {
+    build_with_admin(mode, with_keys, shared_key, ALICE).await
+}
+
+/// [`build_with`] with `admin` as the one allowlisted admin id.
+async fn build_with_admin(
+    mode: HttpIdentityMode,
+    with_keys: bool,
+    shared_key: Option<&str>,
+    admin: &str,
+) -> Fixture {
     permissive_attestation_for_tests();
     ai_memory::handlers::admin_role::mark_request_authn_configured(true);
     let f = NamedTempFile::new().expect("tempfile");
@@ -146,7 +162,7 @@ async fn build_with(mode: HttpIdentityMode, with_keys: bool, shared_key: Option<
         atomise_queue: None,
         recall_scope: Arc::new(None),
         deferred_audit_queue: Arc::new(None),
-        admin_agent_ids: Arc::new(vec![ALICE.to_string()]),
+        admin_agent_ids: Arc::new(vec![admin.to_string()]),
         rule_cache: Arc::new(ai_memory::governance::rule_cache::RuleCache::new()),
         resolved_models: Arc::new(ai_memory::reload::Swappable::new(
             ai_memory::config::ResolvedModels::default(),
@@ -776,10 +792,17 @@ async fn b3_anonymous_shared_key_reads_no_private_row_writes_nothing_named_9341(
         }
         uri
     };
-    let probe_body = serde_json::json!({"namespace": ns, "query": marker, "q": marker});
-
-    // Positive control: the same read sweep as alice DOES return her row, so
-    // the probe is sensitive and an empty leak list below is evidence.
+    // The body names the row id under every key a body-addressed route reads,
+    // so POST routes that take the id in the body probe the private row too.
+    let probe_body_for = |id: &str| {
+        serde_json::json!({
+            "namespace": ns, "query": marker, "q": marker, "context": marker,
+            "id": id, "memory_id": id, "ids": [id],
+        })
+    };
+    let probe_body = probe_body_for(&seeded_id);
+    // Positive control, read-only first: the GET sweep as alice DOES return
+    // her row, so the probe is sensitive and an empty leak list is evidence.
     let mut owner_reads = 0usize;
     for row in gated().filter(|r| r.method == "get") {
         let out = send_simple(
@@ -799,6 +822,8 @@ async fn b3_anonymous_shared_key_reads_no_private_row_writes_nothing_named_9341(
     );
 
     let mut leaks = Vec::new();
+    let mut backend_gated = Vec::new();
+    let mut echoes = Vec::new();
     let mut checked = 0usize;
     for row in gated() {
         checked += 1;
@@ -811,7 +836,31 @@ async fn b3_anonymous_shared_key_reads_no_private_row_writes_nothing_named_9341(
             Some(probe_body.clone()),
         )
         .await;
-        if out.body.to_string().contains(&seeded_id) {
+        // Classified, never skipped silently: the postgres route gate serves
+        // nothing, so the row is fail-closed on that backend, not probed.
+        if out.is_backend_gate_refusal() {
+            backend_gated.push(row.name);
+            continue;
+        }
+        let seen = out.body.to_string();
+        if seen.contains(&seeded_id) {
+            // An input echo is not a read: the same route answers a decoy id
+            // of the same shape byte-identically once both ids are masked.
+            let decoy = send_simple(
+                &fx.router,
+                row.method,
+                &uri_for(row).replace(&seeded_id, B3_DECOY_ID),
+                SHARED_KEY,
+                &[],
+                Some(probe_body_for(B3_DECOY_ID)),
+            )
+            .await;
+            if seen.replace(&seeded_id, "<ID>")
+                == decoy.body.to_string().replace(B3_DECOY_ID, "<ID>")
+            {
+                echoes.push(row.name);
+                continue;
+            }
             leaks.push(format!(
                 "{} {} -> {} {}",
                 row.name,
@@ -826,6 +875,19 @@ async fn b3_anonymous_shared_key_reads_no_private_row_writes_nothing_named_9341(
         leaks.is_empty(),
         "B-3 private row read anonymously: {leaks:?}"
     );
+    if on_postgres() {
+        assert!(
+            backend_gated.contains(&"MEMORY_RECALL_OBSERVATIONS"),
+            "B-3 on postgres: the recall-observations route is classified 501: {backend_gated:?}"
+        );
+    } else {
+        assert!(
+            backend_gated.is_empty(),
+            "B-3 on sqlite: no route answers the postgres 501: {backend_gated:?}"
+        );
+    }
+    eprintln!("B-3 backend-gated (postgres 501): {backend_gated:?}");
+    eprintln!("B-3 input echoes (decoy-identical): {echoes:?}");
 
     // Nothing the anonymous sweep sent (DELETE/PUT/PATCH included) touched the
     // private row: alice still reads it back unchanged.
@@ -878,6 +940,160 @@ async fn b3_anonymous_shared_key_reads_no_private_row_writes_nothing_named_9341(
         named_foreign.is_empty(),
         "B-3 anonymous sweep wrote rows attributed to a named agent: {named_foreign:?}"
     );
+
+    // Blindness census: per route, alice probes a FRESH private row of her
+    // own with the same shapes. A route that does not return the id even to
+    // its owner cannot show a leak, so it is reported (READY `b3-blind:`).
+    let mut blind = Vec::new();
+    for row in gated() {
+        let fresh = send_simple(
+            &fx.router,
+            "post",
+            &concrete_path(ai_memory::handlers::routes::MEMORIES),
+            ALICE_KEY,
+            &[ALICE],
+            Some(serde_json::json!({
+                "title": format!("{marker}-{}", row.name), "content": marker,
+                "namespace": ns, "scope": "private",
+            })),
+        )
+        .await;
+        let Some(fresh_id) = fresh.body.get("id").and_then(serde_json::Value::as_str) else {
+            panic!("census seed: {} {}", fresh.status, fresh.body);
+        };
+        let mut uri = concrete_path_naming(row.path, fresh_id);
+        if row.method == "get" {
+            uri.push_str(&format!("?namespace={ns}&q={marker}&query={marker}"));
+        }
+        let out = send_simple(
+            &fx.router,
+            row.method,
+            &uri,
+            ALICE_KEY,
+            &[ALICE],
+            Some(probe_body_for(fresh_id)),
+        )
+        .await;
+        if !out.body.to_string().contains(fresh_id) {
+            blind.push(format!(
+                "{} {} {}",
+                row.name,
+                row.method,
+                out.status.as_u16()
+            ));
+        }
+    }
+    eprintln!(
+        "B-3 blind (owner reads no id here): {} {blind:?}",
+        blind.len()
+    );
+}
+
+/// #9366 direct cell: a recall-observation row is returned only to the
+/// principal it belongs to, or to an admin. alice recalls her private row;
+/// alice reads exactly her rows, bob and the anonymous shared-key caller read
+/// zero of them, the enrolled admin carol reads all of them. On postgres the
+/// route is gated 501 for every caller (fail closed, nothing served).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recall_observations_rows_scoped_to_owner_or_admin_9366() {
+    let fx = build_with_admin(HttpIdentityMode::Enforce, true, Some(SHARED_KEY), CAROL).await;
+    let suffix = run_suffix();
+    let marker = format!("obs-marker-9366-{suffix}");
+    let ns = format!("ns-obs-9366-{suffix}");
+    let seeded = send_simple(
+        &fx.router,
+        "post",
+        &concrete_path(ai_memory::handlers::routes::MEMORIES),
+        ALICE_KEY,
+        &[ALICE],
+        Some(serde_json::json!({
+            "title": marker, "content": marker, "namespace": ns, "scope": "private",
+        })),
+    )
+    .await;
+    let seeded_id = seeded
+        .body
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| panic!("seed: {} {}", seeded.status, seeded.body))
+        .to_string();
+    let recalled = send_simple(
+        &fx.router,
+        "get",
+        &format!(
+            "{}?context={marker}&namespace={ns}",
+            ai_memory::handlers::routes::RECALL
+        ),
+        ALICE_KEY,
+        &[ALICE],
+        None,
+    )
+    .await;
+    assert!(
+        recalled.status.is_success(),
+        "recall: {} {}",
+        recalled.status,
+        recalled.body
+    );
+
+    // (rows naming alice's seeded memory, rows owned by alice, total rows)
+    let read_as = |key: &'static str, ids: &'static [&'static str]| {
+        let router = fx.router.clone();
+        let seeded_id = seeded_id.clone();
+        async move {
+            let out = send_simple(
+                &router,
+                "post",
+                ai_memory::handlers::routes::MEMORY_RECALL_OBSERVATIONS,
+                key,
+                ids,
+                Some(serde_json::json!({})),
+            )
+            .await;
+            if on_postgres() {
+                assert!(
+                    out.is_backend_gate_refusal(),
+                    "pg: {} {}",
+                    out.status,
+                    out.body
+                );
+                return None;
+            }
+            assert_eq!(out.status, StatusCode::OK, "{key}: {}", out.body);
+            let rows = out.body["observations"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            let of = |f: &str, v: &str| rows.iter().filter(|r| r[f].as_str() == Some(v)).count();
+            Some((
+                of("memory_id", &seeded_id),
+                of("agent_id", ALICE),
+                rows.len(),
+            ))
+        }
+    };
+    let alice = read_as(ALICE_KEY, &[ALICE]).await;
+    let bob = read_as(BOB_KEY, &[BOB]).await;
+    let anonymous = read_as(SHARED_KEY, &[]).await;
+    let admin = read_as(CAROL_KEY, &[CAROL]).await;
+    let Some(alice) = alice else { return };
+    assert_eq!(
+        alice,
+        (1, 1, 1),
+        "alice reads exactly her one observation row"
+    );
+    assert_eq!(bob, Some((0, 0, 0)), "bob reads none of alice's rows");
+    assert_eq!(
+        anonymous,
+        Some((0, 0, 0)),
+        "the anonymous caller reads no row"
+    );
+    assert_eq!(admin, Some((1, 1, 1)), "the admin reads every row");
+}
+
+/// `true` when this binary's store is postgres (the [`store_for`] predicate).
+fn on_postgres() -> bool {
+    cfg!(feature = "sal-postgres") && std::env::var("AI_MEMORY_TEST_POSTGRES_URL").is_ok()
 }
 
 /// B-8: Advisory with the shared key and a named id is served (reported,
