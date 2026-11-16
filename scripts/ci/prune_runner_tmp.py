@@ -206,7 +206,7 @@ def refuse(key, **fields):
 
 
 def safe_text(text):
-    """Escape control characters, backslashes, ``%`` and every ``:`` so a name cannot inject a log line or workflow command.
+    """Escape backslash, ``%``, every ``:``, U+0000-U+001F, U+007F-U+009F, surrogates, U+2028 and U+2029 so a name cannot inject a log line or workflow command.
 
     Every ``:`` becomes ``\\x3a`` (one pass, no later replace), so no run of colons of any length survives (D-L1).
     """

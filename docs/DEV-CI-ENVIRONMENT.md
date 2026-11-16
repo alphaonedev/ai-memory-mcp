@@ -165,9 +165,10 @@ which runs `scripts/ci/prune_runner_tmp.py` with these rules:
   internal error (a defect, not a misconfiguration) names the error, prints
   the summary with `internal_error=1` and exits 1, so the job goes red.
   `--dry-run` lists what would go and deletes nothing.
-- Every printed name, path and message is escaped (control characters,
-  backslash, `%` and every `:`), so a file name cannot inject a log line or a
-  workflow command.
+- Every printed name, path and message is escaped: backslash, `%` and every
+  `:` become `\xNN`; U+0000 to U+001F and U+007F to U+009F become `\xNN`;
+  surrogates (U+D800 to U+DFFF), U+2028 and U+2029 become `\uNNNN`. So a file
+  name cannot inject a log line or a workflow command.
 - It needs Python 3.12+ on the runner; an older interpreter ends in the
   `python` refusal before anything newer is imported. The test families that
   leak the files are fixed separately; the prune treats the symptom.
