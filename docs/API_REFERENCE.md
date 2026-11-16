@@ -127,10 +127,14 @@ was the #874-class spoof vector):
    that agent (#8590); the shared api-key proves no principal. A header
    naming an `anonymous:*` id is a named assertion and is refused the same
    way. A request with no `X-Agent-Id` (or an empty one) is the anonymous
-   per-request principal and is not refused here. With zero keys enrolled
-   the funnel is inert. Operators running `enforce` with only the shared key
-   must enrol per-agent keys (`ai-memory agents bind-api-key`) or map client
-   certificates before named callers can act.
+   per-request principal and is not refused here. The refusal holds with or
+   without enrolled per-agent keys and with or without a configured shared
+   key (3-agent vote (71472661)). Operators running `enforce` with only the
+   shared key must enrol per-agent keys (`ai-memory agents bind-api-key`) or
+   map client certificates before named callers can act, or select
+   `advisory`. Under `advisory` the request is served and reported: a WARN
+   once per (presented key, claimed id) with the id escaped, plus a counter;
+   nothing is persisted.
 6. A present `X-Agent-Id` that is malformed, reserved or not visible ASCII
    is refused **400** `VALIDATION_FAILED` on every gated route (#9342); it
    is never served as `anonymous:invalid`.

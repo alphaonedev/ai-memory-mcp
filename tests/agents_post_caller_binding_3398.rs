@@ -122,7 +122,7 @@ fn router_from(app_state: AppState, enrolled: Arc<EnrolledAgentKeys>) -> axum::R
 }
 
 fn sqlite_router() -> (axum::Router, NamedTempFile) {
-    sqlite_router_with_keys(Arc::new(EnrolledAgentKeys::empty()))
+    sqlite_router_with_keys(test_keys())
 }
 
 fn sqlite_router_with_keys(enrolled: Arc<EnrolledAgentKeys>) -> (axum::Router, NamedTempFile) {
@@ -148,11 +148,28 @@ fn sqlite_router_with_keys(enrolled: Arc<EnrolledAgentKeys>) -> (axum::Router, N
     )
 }
 
+/// The per-agent key enrolled for `agent_id` by [`test_keys`].
+///
+/// 3-agent vote (71472661) B-1: under Enforce the authority layer refuses a
+/// header-named caller that presents only the shared key, keys enrolled or
+/// not. These cells pin the #3398 handler binding under Enforce, so each named
+/// caller proves its id with its own enrolled key and reaches the handler; an
+/// unnamed caller keeps the shared key (the anonymous principal).
+fn presented_key(agent_id: Option<&str>) -> String {
+    match agent_id {
+        Some(ALICE) => "alice-test-token".to_string(),
+        Some(ADMIN) => "admin-test-token".to_string(),
+        Some(MALLORY) => "mallory-test-token".to_string(),
+        Some(other) => format!("{other}-test-token"),
+        None => "roster-test-shared-key".to_string(),
+    }
+}
+
 fn req(method: &str, uri: &str, agent_id: Option<&str>, body: Option<&Value>) -> Request<Body> {
     let mut b = Request::builder()
         .method(method)
         .uri(uri)
-        .header(ai_memory::HEADER_API_KEY, "roster-test-shared-key");
+        .header(ai_memory::HEADER_API_KEY, presented_key(agent_id).as_str());
     if let Some(a) = agent_id {
         b = b.header("x-agent-id", a);
     }
@@ -254,8 +271,8 @@ async fn postgres_refresh_admin_write_and_refusal_body_preserve_roster() {
         eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL unset (no live postgres tier)");
         return;
     };
-    let router = pg_router(&url).await;
     let agent = format!("ai:control-{}", uuid::Uuid::new_v4().simple());
+    let router = pg_router_with_keys(&url, test_keys_with(&[&agent])).await;
     assert_roster_control(&router, &agent).await;
 }
 
@@ -392,7 +409,7 @@ async fn sqlite_body_validation_still_precedes_the_binding() {
 
 #[cfg(feature = "sal-postgres")]
 async fn pg_router(url: &str) -> axum::Router {
-    pg_router_with_keys(url, Arc::new(EnrolledAgentKeys::empty())).await
+    pg_router_with_keys(url, test_keys()).await
 }
 
 #[cfg(feature = "sal-postgres")]
@@ -425,8 +442,8 @@ async fn postgres_self_register_emits_the_same_registered_field_as_sqlite() {
         eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL unset (no live postgres tier)");
         return;
     };
-    let router = pg_router(&url).await;
     let agent = format!("ai:roster-pg-{}", uuid::Uuid::new_v4().simple());
+    let router = pg_router_with_keys(&url, test_keys_with(&[&agent])).await;
 
     let (status, v) = call(
         &router,
@@ -482,20 +499,25 @@ async fn postgres_cross_register_by_a_non_admin_is_refused() {
 }
 
 fn test_keys() -> Arc<EnrolledAgentKeys> {
+    test_keys_with(&[])
+}
+
+/// [`test_keys`] plus one enrolled key per id in `extra` (the postgres cells
+/// name fresh per-run ids), each keyed as [`presented_key`] presents it.
+fn test_keys_with(extra: &[&str]) -> Arc<EnrolledAgentKeys> {
     Arc::new(EnrolledAgentKeys::from_map(
-        [
-            ("alice-test-token", ALICE),
-            ("admin-test-token", ADMIN),
-            ("mallory-test-token", MALLORY),
-        ]
-        .into_iter()
-        .map(|(token, agent)| {
-            (
-                ai_memory::handlers::identity_binding::api_key_sha256_hex(token),
-                agent.to_string(),
-            )
-        })
-        .collect(),
+        [ALICE, ADMIN, MALLORY]
+            .into_iter()
+            .chain(extra.iter().copied())
+            .map(|agent| {
+                (
+                    ai_memory::handlers::identity_binding::api_key_sha256_hex(&presented_key(
+                        Some(agent),
+                    )),
+                    agent.to_string(),
+                )
+            })
+            .collect(),
     ))
 }
 

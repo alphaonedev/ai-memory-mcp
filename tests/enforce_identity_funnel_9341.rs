@@ -836,6 +836,13 @@ async fn b8_advisory_named_shared_key_is_counted_not_refused_9341() {
     assert!(!out.is_funnel_refusal(), "{} {}", out.status, out.body);
     let after = ai_memory::handlers::advisory_identity_report::advisory_unproven_total();
     assert!(after > before, "B-8 counter must rise: {before} -> {after}");
+    // Deterministic under parallel cells (the counter is process-wide): the
+    // layer recorded exactly this (key, claimed id) pair, so it is not due.
+    assert!(
+        ai_memory::handlers::advisory_identity_report::observe_unproven_claim(SHARED_KEY, &claimed)
+            .is_none(),
+        "B-8: the authority layer did not report the Advisory claim"
+    );
 }
 
 /// B-8 break-it: control bytes, newline, ANSI escape and quotes come out

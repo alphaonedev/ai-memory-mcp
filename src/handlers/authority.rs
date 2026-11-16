@@ -25,15 +25,17 @@
 //!
 //! # The identity funnel (#9341)
 //!
-//! Under [`HttpIdentityMode::Enforce`] with at least one per-agent key
-//! enrolled, a request that NAMES a principal (`X-Agent-Id` present) without
+//! Under [`HttpIdentityMode::Enforce`] (per-agent keys enrolled or not, the
+//! shared key configured or not; 3-agent vote (71472661) B-1), a request
+//! that NAMES a principal (`X-Agent-Id` present) without
 //! proving it is refused here, once, with `403 attested_identity_required`
 //! ([`refuse_unproven_named_principal`]). Proven means an enrolled per-agent
 //! key bound to that agent or a mapped mTLS certificate (#8590): the
 //! [`Binding::is_key_bound`] rungs. The shared API key is a transport
 //! credential and proves no principal. The per-handler gates stay as defence
-//! in depth. With zero keys enrolled the funnel is inert (the #1985
-//! unsatisfiable-default trap), and the exempt paths above never reach it.
+//! in depth. The exempt paths above never reach it. Under Advisory the same
+//! request is served and REPORTED (deduplicated WARN plus a counter, nothing
+//! persisted: [`super::advisory_identity_report`]).
 //!
 //! # What this layer does NOT do
 //!
@@ -165,13 +167,21 @@ pub async fn authority_layer(
         Ok(authority) => {
             if let Some(refusal) = refuse_unproven_named_principal(
                 state.app.http_identity_mode,
-                !enrolled.is_empty(),
                 header_agent_id.as_deref(),
                 &authority,
                 &path,
             ) {
                 return refusal;
             }
+            super::advisory_identity_report::report_unproven_named_principal(
+                state.app.http_identity_mode,
+                req.headers()
+                    .get(crate::HEADER_API_KEY)
+                    .and_then(|v| v.to_str().ok()),
+                header_agent_id.as_deref(),
+                &authority,
+                &path,
+            );
             let cert_proven = (authority.binding() == Binding::ClientCert)
                 .then(|| authority.principal().to_string());
             req.extensions_mut().insert(authority);
@@ -219,19 +229,21 @@ pub async fn authority_layer(
 }
 
 /// #9341 — THE identity funnel. `Some(403)` when the request names a
-/// principal it has not proven, under Enforce with keys enrolled; `None`
+/// principal it has not proven, under Enforce (keys enrolled or not); `None`
 /// otherwise. A header naming an anonymous sentinel is a client assertion,
 /// not the server-minted anonymous principal, so it is refused too. An absent
 /// or empty header is the anonymous principal and passes (it owns nothing).
 #[must_use]
 pub fn refuse_unproven_named_principal(
     mode: HttpIdentityMode,
-    enrolled_keys_present: bool,
     header_agent_id: Option<&str>,
     authority: &Authority,
     endpoint: &str,
 ) -> Option<Response> {
-    if mode != HttpIdentityMode::Enforce || !enrolled_keys_present {
+    // 3-agent vote (71472661) B-1: Enforce refuses in all four states (keys
+    // enrolled or not, shared key configured or not); only a per-agent key
+    // or a mapped certificate proves a name.
+    if mode != HttpIdentityMode::Enforce {
         return None;
     }
     let named = header_agent_id.is_some_and(|h| !h.is_empty());
