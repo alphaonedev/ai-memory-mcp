@@ -89,6 +89,10 @@ RUNNER_DIR_PATTERN = re.compile(r"runner-[0-9]+")
 FORBIDDEN_PATHS = ("/", "/tmp", "/var/tmp", "/private/tmp")
 DISK_BLOCK_BYTES = 512
 MAX_FAILURE_LINES = 20
+MAX_ANNOTATION_NAMES = 5  # names listed in the counted-failures annotation
+MAX_ANNOTATION_NAME_CHARS = 120  # raw characters of one name before it is cut
+MAX_ANNOTATION_CHARS = 1000  # the whole annotation line, escapes included
+ANNOTATION_CUT_MARK = "..."
 DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
 FACTS_PREFIX = "prune-facts:"
 
@@ -148,6 +152,26 @@ def safe_text(text):
         else:
             pieces.append(char)
     return "".join(pieces).replace("::", "\\x3a:")
+
+
+def failed_annotation(count, names):
+    """The one ``::warning`` line for ``count`` entries that could not be removed; None when ``count`` is 0.
+
+    ``names`` are the first MAX_ANNOTATION_NAMES failed names in sorted order. Every name goes
+    through ``safe_text`` (finding L4), so the only ``::`` in the line is the command's own.
+    """
+    if count <= 0:
+        return None
+    shown = []
+    for name in list(names)[:MAX_ANNOTATION_NAMES]:
+        cut = len(name) > MAX_ANNOTATION_NAME_CHARS
+        shown.append(safe_text(name[:MAX_ANNOTATION_NAME_CHARS]) + (ANNOTATION_CUT_MARK if cut else ""))
+    line = f"::warning title={PROG} failed::{PROG}: failed={count} not removed: " + ", ".join(shown)
+    if count > MAX_ANNOTATION_NAMES:
+        line += f" (list cut at {MAX_ANNOTATION_NAMES} of {count})"
+    if len(line) > MAX_ANNOTATION_CHARS:
+        line = line[: MAX_ANNOTATION_CHARS - len(ANNOTATION_CUT_MARK)] + ANNOTATION_CUT_MARK
+    return line
 
 
 def file_id(info):
@@ -304,11 +328,13 @@ class Tally:
     def __init__(self, err):
         self.pruned = self.kept = self.failed = self.skipped = self.freed = 0
         self.tree_entries = 0
+        self.first_failed = []  # the MAX_ANNOTATION_NAMES smallest failed names, sorted
         self.internal_error = False
         self.err = err
 
     def fail(self, name, exc):
         self.failed += 1
+        self.first_failed = sorted([*self.first_failed, name])[:MAX_ANNOTATION_NAMES]
         if self.failed <= MAX_FAILURE_LINES:
             print(safe_text(f"{PROG}: failed to remove {name}: {exc}"), file=self.err)
 
@@ -487,6 +513,11 @@ def main(argv=None, environ=None, out=None, err=None):
         if dir_fd is not None:
             os.close(dir_fd)
     print(tally.summary(), file=out)
+    if not tally.internal_error:
+        annotation = failed_annotation(tally.failed, tally.first_failed)
+        if annotation:
+            print(annotation, file=out)
+    out.flush()
     return EXIT_ERROR if tally.internal_error else EXIT_OK
 
 

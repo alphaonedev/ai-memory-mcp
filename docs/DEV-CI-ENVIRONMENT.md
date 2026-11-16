@@ -140,7 +140,10 @@ which runs `scripts/ci/prune_runner_tmp.py` with these rules:
 
 - A failure on one entry (permission, vanished, busy, over a bound) is counted
   and printed but does not fail the job: the step exits 0 with
-  `pruned=<n> kept=<n> failed=<n> freed_bytes=<n> skipped=<n>`. An unexpected
+  `pruned=<n> kept=<n> failed=<n> freed_bytes=<n> skipped=<n>` and one
+  `::warning` annotation `failed=<n> not removed: <first 5 names, sorted>`
+  (`(list cut at 5 of <n>)` when more failed; names escaped, line bounded at
+  1000 characters). An unexpected
   internal error (a defect, not a misconfiguration) names the error, prints
   the summary with `internal_error=1` and exits 1, so the job goes red.
   `--dry-run` lists what would go and deletes nothing.

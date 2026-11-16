@@ -8,8 +8,9 @@ description: >-
   outside the confirmed runner roots) prints a ::warning annotation with the
   reason, deletes nothing and does not fail the job or skip the steps after it
   (ruling f23a9ae4). A per-entry removal failure does not fail the job: the step
-  exits 0 and prints pruned=<n> kept=<n> failed=<n> freed_bytes=<n> skipped=<n>.
-  An unexpected error fails the job.
+  exits 0, prints pruned=<n> kept=<n> failed=<n> freed_bytes=<n> skipped=<n> and
+  one ::warning annotation with the count and the first 5 names (escaped; the
+  line states when the list is cut) (ruling 7af294fb). An unexpected error fails the job.
 runs:
   using: composite
   steps:
