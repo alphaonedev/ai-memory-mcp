@@ -82,10 +82,33 @@ HOSTILE_NAMES = (
     "line sep",
     "bad\udcff\nname",
 )
+FAILED_TITLE = "::warning title=prune_runner_tmp failed::prune_runner_tmp: "
+ANNOTATION_NAMES_SHOWN = 5
+ANNOTATION_MAX_CHARS = 1000
+ANNOTATION_NAME_MAX_CHARS = 120
+ANNOTATION_CUT_MARK = "..."
+# raw entry name -> the exact text the annotation carries for it
+ANNOTATION_ESCAPES = {
+    "::error::x": "\\x3a:error\\x3a:x",
+    "%0A::set-output": "\\x250A\\x3a:set-output",
+    "%0D": "\\x250D",
+    "a\nb": "a\\x0ab",
+    "a\rb": "a\\x0db",
+    "::": "\\x3a:",
+    "bad\udcffx": "bad\\udcffx",
+}
 ALLOWED_LINE_PREFIXES = ("would-remove ", "pruned=", "prune_runner_tmp: ", "prune-facts: ", ANNOTATION_PREFIX)
 
 PRUNE = None
 CHK = None
+
+
+def failed_line(count, shown, cut=False):
+    """The one annotation line the counted-failure outcome prints, spelled out independently of the script."""
+    text = f"{FAILED_TITLE}failed={count} not removed: " + ", ".join(shown)
+    if cut:
+        text += f" (list cut at {ANNOTATION_NAMES_SHOWN} of {count})"
+    return text
 
 
 def _load(name, path):
@@ -982,12 +1005,12 @@ class ExitCodes(Base):
                 self.assertNotIn("pruned=", out)
                 self.assertTrue(victim.exists())
 
-    def test_counted_failures_exit_zero_with_the_count_and_no_annotation(self):
+    def test_counted_failures_exit_zero_with_one_warning_annotation(self):
         self.make_file("old.db", OLD_AGE_SECS)
         with mock.patch.object(PRUNE.os, "unlink", side_effect=PermissionError(13, "denied")):
             rc, out, err = self.run_prune(self.runner)
         self.assertEqual(rc, EXIT_OK)
-        self.assertEqual(self.annotations, [])
+        self.assertEqual(self.annotations, [failed_line(1, ["old.db"])])
         self.assertIn("pruned=0 kept=0 failed=1", out)
         self.assertIn("failed to remove old.db: [Errno 13] denied", err)
 
@@ -1012,6 +1035,95 @@ class ExitCodes(Base):
         done = subprocess.run([sys.executable, "-I", "-c", guard, str(SCRIPT)], capture_output=True, text=True, check=False)
         self.assertIn(ANNOTATION_PREFIX + "python 3.11.9 is older than 3.12\n", done.stdout)
         self.assertIn("exit 0", done.stdout)
+
+
+class FailureAnnotation(Base):
+    """Counted failures: one ``::warning`` line, the count and the first names, escaped and bounded (ruling 7af294fb)."""
+
+    def run_failing(self, names):
+        for name in names:
+            self.make_file(name, OLD_AGE_SECS)
+        with mock.patch.object(PRUNE.os, "unlink", side_effect=PermissionError(13, "denied")):
+            return self.run_prune(self.runner)
+
+    def only_annotation(self, out, err):
+        self.assertEqual(len(self.annotations), 1, self.annotations)
+        for line in (out + err).splitlines():
+            if line.startswith("::"):
+                self.assertEqual(line, self.annotations[0])
+        return self.annotations[0]
+
+    def test_constants_are_the_named_bounds(self):
+        self.assertEqual(PRUNE.MAX_ANNOTATION_NAMES, ANNOTATION_NAMES_SHOWN)
+        self.assertEqual(PRUNE.MAX_ANNOTATION_CHARS, ANNOTATION_MAX_CHARS)
+        self.assertEqual(PRUNE.MAX_ANNOTATION_NAME_CHARS, ANNOTATION_NAME_MAX_CHARS)
+
+    def test_one_and_five_failures_list_every_name_in_sorted_order(self):
+        for count in (1, ANNOTATION_NAMES_SHOWN):
+            with self.subTest(count=count):
+                names = [f"f{index}.db" for index in reversed(range(count))]
+                rc, out, err = self.run_failing(names)
+                self.assertEqual(rc, EXIT_OK)
+                self.assertEqual(self.only_annotation(out, err), failed_line(count, sorted(names)))
+                for name in names:
+                    (self.runner / name).unlink()
+
+    def test_six_and_many_failures_state_the_count_and_that_the_list_is_cut(self):
+        for count in (ANNOTATION_NAMES_SHOWN + 1, 40):
+            with self.subTest(count=count):
+                names = [f"f{index:03d}.db" for index in reversed(range(count))]
+                rc, out, err = self.run_failing(names)
+                self.assertEqual(rc, EXIT_OK)
+                shown = sorted(names)[:ANNOTATION_NAMES_SHOWN]
+                self.assertEqual(self.only_annotation(out, err), failed_line(count, shown, cut=True))
+                self.assertIn(f"failed={count} ", out)
+                for name in names:
+                    (self.runner / name).unlink()
+
+    def test_failure_flood_still_prints_one_bounded_annotation(self):
+        names = [f"f{index:05d}" for index in range(FAILURE_FLOOD)]
+        rc, out, err = self.run_failing(names)
+        self.assertEqual(rc, EXIT_OK)
+        line = self.only_annotation(out, err)
+        self.assertEqual(line, failed_line(FAILURE_FLOOD, sorted(names)[:ANNOTATION_NAMES_SHOWN], cut=True))
+
+    def test_hostile_names_reach_the_runner_as_exact_escaped_text(self):
+        for raw, escaped in ANNOTATION_ESCAPES.items():
+            with self.subTest(raw=raw):
+                path = os.path.join(os.fsencode(self.runner), os.fsencode(raw))
+                Path(os.fsdecode(path)).write_bytes(b"x")
+                os.utime(path, (time.time() - OLD_AGE_SECS,) * 2)
+                with mock.patch.object(PRUNE.os, "unlink", side_effect=PermissionError(13, "denied")):
+                    rc, out, err = self.run_prune(self.runner)
+                self.assertEqual(rc, EXIT_OK)
+                self.assertEqual(self.only_annotation(out, err), failed_line(1, [escaped]))
+                for line in (out + err).splitlines():
+                    self.assertEqual(line.startswith("::"), line == self.annotations[0], repr(line))
+                os.unlink(path)
+
+    def test_builder_bounds_a_4096_byte_name_and_the_whole_line(self):
+        long_name = "a" * 4096
+        line = PRUNE.failed_annotation(1, [long_name])
+        want = failed_line(1, ["a" * ANNOTATION_NAME_MAX_CHARS + ANNOTATION_CUT_MARK])
+        self.assertEqual(line, want)
+        control_heavy = ["\n" * 4096] * ANNOTATION_NAMES_SHOWN
+        line = PRUNE.failed_annotation(9, control_heavy)
+        self.assertEqual(len(line), ANNOTATION_MAX_CHARS)
+        self.assertTrue(line.endswith(ANNOTATION_CUT_MARK))
+        self.assertNotIn("\n", line)
+        self.assertEqual([ln for ln in line.splitlines() if ln.startswith("::")], [line])
+
+    def test_builder_escapes_every_hostile_name_and_non_utf8_bytes(self):
+        names = list(ANNOTATION_ESCAPES) + [os.fsdecode(b"raw\xffbyte")]
+        line = PRUNE.failed_annotation(len(names), names[:ANNOTATION_NAMES_SHOWN])
+        self.assertEqual(len(line.splitlines()), 1)
+        body = line[len(FAILED_TITLE):]
+        self.assertNotIn("::", body)
+        self.assertNotIn("%0", body.replace("\\x250", ""))
+        self.assertTrue(line.isascii() or "\udcff" not in line)
+
+    def test_no_failures_means_no_annotation(self):
+        self.assertIsNone(PRUNE.failed_annotation(0, []))
 
 
 class RootsAndFloor(unittest.TestCase):
