@@ -84,6 +84,7 @@ if __name__ == "__main__" and python_refusal(sys.version_info) is not None:
     sys.exit(EXIT_OK)
 
 import argparse  # noqa: E402  (the floor check above must run before anything newer is needed)
+import errno  # noqa: E402
 import os  # noqa: E402
 import re  # noqa: E402
 import stat  # noqa: E402
@@ -123,7 +124,11 @@ FDINFO_DIR = "/proc/self/fdinfo"  # Linux: one file per open fd; its mnt_id line
 FDINFO_MOUNT_FIELD = "mnt_id:"
 FDINFO_MAX_BYTES = 65536
 FDINFO_FLAGS = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
-LINUX_PLATFORM_PREFIX = "linux"
+PLATFORM_LINUX = "linux"  # sys.platform, compared exactly: mount identity is the fd's mnt_id from fdinfo
+PLATFORM_DARWIN = "darwin"  # sys.platform, compared exactly: mount identity is the fd's st_dev (no ctypes)
+VERIFIABLE_PLATFORMS = (PLATFORM_LINUX, PLATFORM_DARWIN)  # decision 4: any other platform is a counted refusal
+CANNOT_WRITE_ERRNOS = frozenset({errno.ENOSPC, errno.EDQUOT, errno.EROFS})  # decision 3: a full or read-only disk
+PROBE_ABSENT_SUFFIX = "-absent"  # the read-only probe's name that is never created
 SKIP_OTHER_DEVICE = "on another device, not entered"
 SKIP_MOUNT_POINT = "a mount point, not entered"
 SKIP_MOUNT_UNREADABLE = "mount id unreadable, not entered"
@@ -134,6 +139,8 @@ REFUSAL_REASONS = {
     "python": "python {found} is older than {wanted}",
     "platform": "this platform lacks a working descriptor-relative call: {call} raised {error} ({why})",
     "mount_unreadable": "the mount id of TMPDIR cannot be read: {why}",
+    "mount_differs": "TMPDIR is not on its runner root's mount: {path}",
+    "platform_unverifiable": "this platform cannot verify mount identity: {platform}",
     "root_relative": "allowed root is not an absolute path: {root}",
     "root_slash": "allowed root is '/'",
     "unset": "TMPDIR is unset",
@@ -153,8 +160,15 @@ REFUSAL_REASONS = {
 }
 
 
+# Refusals about a runner that exists but cannot be proven safe: each is also one counted failure
+# (decisions 1 and 4), so the summary reads failed=1 next to the one refusal annotation.
+COUNTED_REFUSALS = frozenset({"mount_unreadable", "mount_differs", "platform_unverifiable"})
+
+
 class Refusal(Exception):
-    """TMPDIR cannot be pruned; the message is the exact reason."""
+    """TMPDIR cannot be pruned; the message is the exact reason; ``counted`` adds one counted failure."""
+
+    counted = False
 
 
 class EntryChanged(OSError):
@@ -170,13 +184,15 @@ class MountIdUnreadable(OSError):
 
 
 class NotEntered(OSError):
-    """A directory the walk does not enter: ``reason`` is the exact skip text; ``counted`` adds a counted failure."""
+    """A place the walk does not enter (decision 2): one skip line, and always one counted failure.
 
-    def __init__(self, name, reason, counted):
+    ``reason`` is the exact skip text.
+    """
+
+    def __init__(self, name, reason):
         super().__init__(f"{name}: {reason}")
         self.name = name
         self.reason = reason
-        self.counted = counted
         self.nested = False  # set when the directory is below a top-level entry
         self.escaped = f"{safe_text(name)}: {reason}"  # the reason is a constant; only the name is escaped
 
@@ -202,7 +218,9 @@ class PlatformMissing(Exception):
 
 def refuse(key, **fields):
     """Build the Refusal for reason ``key`` with ``fields`` escaped for the log."""
-    return Refusal(REFUSAL_REASONS[key].format(**{k: safe_text(v) for k, v in fields.items()}))
+    refusal = Refusal(REFUSAL_REASONS[key].format(**{k: safe_text(v) for k, v in fields.items()}))
+    refusal.counted = key in COUNTED_REFUSALS
+    return refusal
 
 
 def safe_text(text):
@@ -370,14 +388,32 @@ def prove_runner_dir(dir_fd, info, path, known_roots, roots, environ):
     except (NotImplementedError, TypeError) as exc:
         raise PlatformMissing("os.open", exc) from exc
     try:
-        parent_id = file_id(os.fstat(parent_fd))
+        parent = os.fstat(parent_fd)
+        if file_id(parent) not in known_roots:
+            raise refuse("outside_roots", roots=list(roots), path=os.path.realpath(path))
+        same_mount_as_root(parent_fd, parent, dir_fd, info, path)
     finally:
         os.close(parent_fd)
-    if parent_id not in known_roots:
-        raise refuse("outside_roots", roots=list(roots), path=os.path.realpath(path))
     for name_ in guarded_paths(environ):
         if file_id(info) in ancestor_ids(name_):
             raise refuse("contains", path=path)
+
+
+def same_mount_as_root(parent_fd, parent, dir_fd, info, path):
+    """SEC M1 (decision 1): TMPDIR's fd must be on the mount of its validated runner root fd.
+
+    Checked before anything is made or opened under TMPDIR. A directory mounted over runner-<n> still has
+    the root as its ``..``, so the root identity alone does not prove it. st_dev on every platform, and on
+    Linux the fdinfo mnt_id of both fds (a same-device bind mount); unreadable or different is a refusal.
+    """
+    if parent.st_dev != info.st_dev:
+        raise refuse("mount_differs", path=path)
+    try:
+        root_mnt, here = mount_id(parent_fd), mount_id(dir_fd)
+    except MountIdUnreadable as exc:
+        raise refuse("mount_unreadable", why=str(exc)) from exc
+    if root_mnt != here:
+        raise refuse("mount_differs", path=path)
 
 
 class ProbeMismatch(OSError):
@@ -394,15 +430,19 @@ def probe_platform(dir_fd, err):
     """
     name = f"{PROBE_PREFIX}{os.getpid()}-{os.urandom(PROBE_RANDOM_BYTES).hex()}"
     call = "os.mkdir"
+    creating = True  # only mkdir and the file create can fail for want of space (decision 3)
+    cannot_write = None
     made_dir = made_file = False
     sub_fd = None
     try:
         os.mkdir(name, PROBE_DIR_MODE, dir_fd=dir_fd)
         made_dir = True
-        call = "os.open"
+        call, creating = "os.open", False
         sub_fd = os.open(name, DIR_FLAGS, dir_fd=dir_fd)
+        creating = True
         os.close(os.open(PROBE_FILE, PROBE_FILE_FLAGS, PROBE_FILE_MODE, dir_fd=sub_fd))
         made_file = True
+        creating = False
         call = "os.lstat"
         seen = os.lstat(name, dir_fd=dir_fd)
         if not stat.S_ISDIR(seen.st_mode) or file_id(seen) != file_id(os.fstat(sub_fd)):
@@ -420,10 +460,59 @@ def probe_platform(dir_fd, err):
         call = "os.rmdir"
         os.rmdir(name, dir_fd=dir_fd)
         made_dir = False
-    except (NotImplementedError, TypeError, OSError) as exc:
+    except OSError as exc:
+        if not (creating and exc.errno in CANNOT_WRITE_ERRNOS):
+            raise PlatformMissing(call, exc) from exc
+        cannot_write = exc
+    except (NotImplementedError, TypeError) as exc:
         raise PlatformMissing(call, exc) from exc
     finally:
         cleanup_probe(dir_fd, name, sub_fd, made_dir, made_file, err)
+    if cannot_write is not None:
+        probe_read_only(dir_fd, name + PROBE_ABSENT_SUFFIX, cannot_write.errno)
+        why = safe_text(cannot_write.strerror or cannot_write)
+        print(f"{PROG}: probe cannot write ({why}); the read-only probe passed, pruning goes on", file=err)
+
+
+def probe_read_only(dir_fd, absent, cause):
+    """CODE F1 (decision 3): the probe when the disk cannot take a file; it creates nothing.
+
+    Every descriptor-relative function the walk uses must be in os.supports_dir_fd (os.stat also in
+    os.supports_follow_symlinks, os.scandir in os.supports_fd); then lstat, unlink and rmdir of the name
+    ``absent``, which does not exist, must fail with ENOENT (a read-only file system may answer EROFS when
+    EROFS was the cause), and scandir of ``dir_fd`` must list. Raises PlatformMissing naming the first miss.
+    """
+    needed = (
+        ("os.open", os.open, os.supports_dir_fd, "os.supports_dir_fd"),
+        ("os.stat", os.stat, os.supports_dir_fd, "os.supports_dir_fd"),
+        ("os.unlink", os.unlink, os.supports_dir_fd, "os.supports_dir_fd"),
+        ("os.rmdir", os.rmdir, os.supports_dir_fd, "os.supports_dir_fd"),
+        ("os.stat", os.stat, os.supports_follow_symlinks, "os.supports_follow_symlinks"),
+        ("os.scandir", os.scandir, os.supports_fd, "os.supports_fd"),
+    )
+    for label, function, table, table_name in needed:
+        if function not in table:
+            raise PlatformMissing(label, ProbeMismatch(f"{label} not in {table_name}"))
+    allowed = {errno.ENOENT} | ({errno.EROFS} if cause == errno.EROFS else set())
+    for label, call in (
+        ("os.lstat", lambda: os.lstat(absent, dir_fd=dir_fd)),
+        ("os.unlink", lambda: os.unlink(absent, dir_fd=dir_fd)),
+        ("os.rmdir", lambda: os.rmdir(absent, dir_fd=dir_fd)),
+    ):
+        try:
+            call()
+        except OSError as exc:
+            if exc.errno in allowed:
+                continue
+            raise PlatformMissing(label, exc) from exc
+        except (NotImplementedError, TypeError) as exc:
+            raise PlatformMissing(label, exc) from exc
+        raise PlatformMissing(label, ProbeMismatch(f"{label} of a name that does not exist returned"))
+    try:
+        with os.scandir(dir_fd) as scan:
+            next(scan, None)
+    except (NotImplementedError, TypeError, OSError) as exc:
+        raise PlatformMissing("os.scandir", exc) from exc
 
 
 def cleanup_probe(dir_fd, name, sub_fd, made_dir, made_file, err):
@@ -443,12 +532,16 @@ def cleanup_probe(dir_fd, name, sub_fd, made_dir, made_file, err):
 
 
 def mount_id(fd):
-    """The mount id of open ``fd``: the ``mnt_id:`` line of /proc/self/fdinfo/<fd> on Linux, None elsewhere.
+    """The mount id of open ``fd``: the ``mnt_id:`` line of /proc/self/fdinfo/<fd> on Linux, None on Darwin
+    (where st_dev per fd is the identity).
 
-    Raises MountIdUnreadable when that line cannot be read on Linux (fail closed: never "same mount").
+    Raises MountIdUnreadable when that line cannot be read on Linux, and on every other platform (CODE F3:
+    fail closed, never "same mount").
     """
-    if not sys.platform.startswith(LINUX_PLATFORM_PREFIX):
+    if sys.platform == PLATFORM_DARWIN:
         return None
+    if sys.platform != PLATFORM_LINUX:
+        raise MountIdUnreadable(f"no mount id reader on {sys.platform}")
     try:
         info_fd = os.open(f"{FDINFO_DIR}/{int(fd)}", FDINFO_FLAGS)
         try:
@@ -535,7 +628,9 @@ class Tally:
         self.failed += 1
         self.first_failed = sorted([*self.first_failed, name])[:MAX_ANNOTATION_NAMES]
         if self.failed <= MAX_FAILURE_LINES:
-            print(f"{PROG}: failed to remove {safe_text(name)}: {error_text(exc)}", file=self.err)
+            # CODE F6: a top-level entry not entered is named once; its text is the constant reason alone
+            text = exc.reason if isinstance(exc, NotEntered) and not exc.nested and exc.name == name else error_text(exc)
+            print(f"{PROG}: failed to remove {safe_text(name)}: {text}", file=self.err)
 
     def skip(self, name, reason=SKIP_OTHER_DEVICE):
         self.skipped += 1
@@ -569,21 +664,22 @@ def open_checked(parent_fd, name, expected, root_mnt):
         try:
             here = mount_id(dir_fd)
         except MountIdUnreadable as exc:
-            raise NotEntered(name, SKIP_MOUNT_UNREADABLE, counted=True) from exc
+            raise NotEntered(name, SKIP_MOUNT_UNREADABLE) from exc
         if here != root_mnt:
-            raise NotEntered(name, SKIP_MOUNT_POINT, counted=False)
+            raise NotEntered(name, SKIP_MOUNT_POINT)
     except BaseException:
         os.close(dir_fd)
         raise
     return dir_fd
 
 
-def list_level(dir_fd, root_dev, tally, errors, remove=True):
+def list_level(dir_fd, root_dev, tally, errors, remove=True, dry_run=False):
     """List an open directory; return its subdirectories as (name, lstat) pairs.
 
     ``remove=False`` is the count pass: every entry is counted against MAX_TREE_ENTRIES, nothing is
     removed or printed. ``remove=True`` unlinks the non-directories; the bound is a backstop there
-    against entries added after the count (TreeTooLarge stops the walk at once).
+    against entries added after the count (TreeTooLarge stops the walk at once). ``dry_run`` takes the
+    removal pass's decisions and prints its lines, and stops short of the unlink (decision 5).
     """
     pending = []
     try:
@@ -599,12 +695,14 @@ def list_level(dir_fd, root_dev, tally, errors, remove=True):
         try:
             info = entry.stat(follow_symlinks=False)
             if info.st_dev != root_dev:
+                foreign = NotEntered(entry.name, SKIP_OTHER_DEVICE)
+                foreign.nested = True  # decision 2: one skip line and a counted failure of its top-level entry
                 if remove:
-                    tally.skip(entry.name)
-                errors.append(OSError(f"{entry.name} is on another device"))
+                    tally.skip(entry.name, foreign.reason)
+                errors.append(foreign)
             elif stat.S_ISDIR(info.st_mode):
                 pending.append((entry.name, info))
-            elif remove:
+            elif remove and not dry_run:
                 os.unlink(entry.name, dir_fd=dir_fd)
                 tally.freed += info.st_blocks * DISK_BLOCK_BYTES
         except OSError as exc:
@@ -618,15 +716,18 @@ def count_tree(parent_fd, name, scanned, root_dev, root_mnt, tally):
     errors = []
     dir_fd = open_checked(parent_fd, name, entry_id(scanned), root_mnt)
     try:
-        stack = [list_level(dir_fd, root_dev, tally, errors, remove=False)]
+        # SEC L2 (decision 6): each level keeps its identity; the step up by ".." must land on it
+        stack = [(file_id(os.fstat(dir_fd)), list_level(dir_fd, root_dev, tally, errors, remove=False))]
         while stack:
-            pending = stack[-1]
+            pending = stack[-1][1]
             if not pending:
                 stack.pop()
                 if stack:
                     up_fd = os.open("..", DIR_FLAGS, dir_fd=dir_fd)
                     os.close(dir_fd)
                     dir_fd = up_fd
+                    if file_id(os.fstat(dir_fd)) != stack[-1][0]:
+                        raise EntryChanged("directory moved during count")
                 continue
             child_name, child_info = pending.pop()
             if len(stack) > MAX_TREE_DEPTH:
@@ -637,14 +738,14 @@ def count_tree(parent_fd, name, scanned, root_dev, root_mnt, tally):
                 continue  # not entered here; the removal pass reports it
             os.close(dir_fd)
             dir_fd = child_fd
-            stack.append(list_level(dir_fd, root_dev, tally, errors, remove=False))
+            stack.append((file_id(os.fstat(dir_fd)), list_level(dir_fd, root_dev, tally, errors, remove=False)))
     finally:
         os.close(dir_fd)
 
 
-def remove_tree(parent_fd, name, scanned, root_dev, tally, root_mnt=None):
+def remove_tree(parent_fd, name, scanned, root_dev, tally, root_mnt=None, dry_run=False):
     """Remove directory ``name`` below ``parent_fd``: counted first, then iterative, one open directory at a
-    time, never leaving ``root_dev`` or the root's mount."""
+    time, never leaving ``root_dev`` or the root's mount. ``dry_run`` walks the same path and removes nothing."""
     if root_mnt is None:
         root_mnt = mount_id(parent_fd)
     count_tree(parent_fd, name, scanned, root_dev, root_mnt, tally)
@@ -652,7 +753,7 @@ def remove_tree(parent_fd, name, scanned, root_dev, tally, root_mnt=None):
     tally.tree_entries = 0
     dir_fd = open_checked(parent_fd, name, entry_id(scanned), root_mnt)
     try:
-        stack = [Level(name, scanned, list_level(dir_fd, root_dev, tally, errors, remove=True))]
+        stack = [Level(name, scanned, list_level(dir_fd, root_dev, tally, errors, remove=True, dry_run=dry_run))]
         while True:
             level = stack[-1]
             if level.pending:
@@ -671,7 +772,8 @@ def remove_tree(parent_fd, name, scanned, root_dev, tally, root_mnt=None):
                     continue
                 os.close(dir_fd)
                 dir_fd = child_fd
-                stack.append(Level(child_name, child_info, list_level(dir_fd, root_dev, tally, errors, remove=True)))
+                stack.append(Level(child_name, child_info,
+                                   list_level(dir_fd, root_dev, tally, errors, remove=True, dry_run=dry_run)))
                 continue
             stack.pop()
             if not stack:
@@ -681,6 +783,8 @@ def remove_tree(parent_fd, name, scanned, root_dev, tally, root_mnt=None):
             dir_fd = up_fd
             if file_id(os.fstat(dir_fd)) != stack[-1].file_id:
                 raise EntryChanged("directory moved during removal")
+            if dry_run:
+                continue
             try:
                 os.rmdir(level.name, dir_fd=dir_fd)
                 tally.freed += level.blocks * DISK_BLOCK_BYTES
@@ -688,11 +792,12 @@ def remove_tree(parent_fd, name, scanned, root_dev, tally, root_mnt=None):
                 errors.append(exc)
         os.close(dir_fd)
         dir_fd = None
-        try:
-            os.rmdir(name, dir_fd=parent_fd)
-            tally.freed += level.blocks * DISK_BLOCK_BYTES
-        except OSError as exc:
-            errors.append(exc)
+        if not dry_run:
+            try:
+                os.rmdir(name, dir_fd=parent_fd)
+                tally.freed += level.blocks * DISK_BLOCK_BYTES
+            except OSError as exc:
+                errors.append(exc)
     finally:
         if dir_fd is not None:
             os.close(dir_fd)
@@ -700,13 +805,18 @@ def remove_tree(parent_fd, name, scanned, root_dev, tally, root_mnt=None):
         raise errors[0]
 
 
-def remove_entry(dir_fd, name, scanned, root_dev, tally, root_mnt=None):
-    """Remove one top-level entry after an identity re-check; raise OSError on any failure."""
+def remove_entry(dir_fd, name, scanned, root_dev, tally, root_mnt=None, dry_run=False):
+    """Remove one top-level entry after an identity re-check; raise OSError on any failure.
+
+    ``dry_run`` makes every decision of the real run and stops short of the unlink (decision 5).
+    """
     now_info = os.lstat(name, dir_fd=dir_fd)
     if entry_id(now_info) != entry_id(scanned):
         raise EntryChanged("entry changed since scan")
     if stat.S_ISDIR(now_info.st_mode):
-        remove_tree(dir_fd, name, now_info, root_dev, tally, root_mnt)
+        remove_tree(dir_fd, name, now_info, root_dev, tally, root_mnt, dry_run=dry_run)
+        return
+    if dry_run:
         return
     os.unlink(name, dir_fd=dir_fd)
     tally.freed += now_info.st_blocks * DISK_BLOCK_BYTES
@@ -725,30 +835,33 @@ def prune(dir_fd, root_dev, dry_run, now, out, tally, root_mnt=None):
                     tally.kept += 1
                     continue
                 if info.st_dev != root_dev:
-                    tally.skip(entry.name)
-                    continue
+                    raise NotEntered(entry.name, SKIP_OTHER_DEVICE)
+                remove_entry(dir_fd, entry.name, info, root_dev, tally, root_mnt, dry_run)
                 if dry_run:
                     print(f"would-remove {safe_text(entry.name)}", file=out)
-                else:
-                    remove_entry(dir_fd, entry.name, info, root_dev, tally, root_mnt)
                 tally.pruned += 1
-            except NotEntered as exc:
-                if not exc.nested:  # the top-level entry itself is not entered
+            except NotEntered as exc:  # decision 2: every place not entered is one skip line and one counted failure
+                if not exc.nested:  # the top-level entry itself is not entered; its nested skip is printed already
                     tally.skip(entry.name, exc.reason)
-                    if exc.counted:
-                        tally.fail(entry.name, exc)
-                else:
-                    tally.fail(entry.name, exc)
+                tally.fail(entry.name, exc)
             except OSError as exc:  # one failed entry, counted
                 tally.fail(entry.name, exc)
 
 
 def refused(reason, out, err):
-    """Print one refusal (stderr line and warning annotation); a refusal exits 0 and deletes nothing."""
+    """Print one refusal (stderr line and warning annotation); a refusal exits 0 and deletes nothing.
+
+    A counted refusal (COUNTED_REFUSALS) also prints the summary with failed=1, so the runner that could
+    not be proven safe shows as a counted failure next to its one annotation.
+    """
     print(f"{PROG}: refused: {reason}", file=err)
+    if getattr(reason, "counted", False):
+        tally = Tally(err)
+        tally.failed = 1
+        print(tally.summary(), file=out)
     print(refusal_annotation(reason), file=out)
     out.flush()
-    return EXIT_OK
+    return EXIT_OK  # ruling f23a9ae4: a refusal is green with its warning; only an internal error is red
 
 
 def main(argv=None, environ=None, out=None, err=None):
@@ -766,6 +879,8 @@ def main(argv=None, environ=None, out=None, err=None):
             reason = python_refusal(sys.version_info)
             if reason:
                 raise Refusal(reason)
+            if sys.platform not in VERIFIABLE_PLATFORMS:  # CODE F3 (decision 4): no mount identity, no prune
+                raise refuse("platform_unverifiable", platform=sys.platform)
             dir_fd, info = open_runner_dir(raw, ALLOWED_ROOTS, environ)
             root_mnt = root_mount_id(dir_fd)
             probe_platform(dir_fd, err)

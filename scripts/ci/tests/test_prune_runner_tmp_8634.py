@@ -1690,20 +1690,24 @@ class RoundOneFixes(Base):
                 victim.unlink()
 
     def test_tmpdir_on_another_device_than_its_root_is_a_counted_refusal(self):
-        """decision 1, Darwin form: st_dev of the root fd (fstat of '..') against the TMPDIR fd."""
-        victim = self.make_file("old.db", OLD_AGE_SECS)
-        root_ident = self.ident(self.root)
-        real_fstat = os.fstat
+        """decision 1, Darwin form: the TMPDIR fd's st_dev against the root fd's (fstat of '..').
 
-        def other_device(fd):
-            info = real_fstat(fd)
-            if (info.st_dev, info.st_ino) != root_ident:
+        A volume mounted over runner-<n> has its own st_dev while '..' still is the root, so the TMPDIR
+        identity is shifted to another device (fstat and lstat agree, as they do on a real mount).
+        """
+        victim = self.make_file("old.db", OLD_AGE_SECS)
+        runner_ident = self.ident(self.runner)
+        real_fstat, real_lstat = os.fstat, os.lstat
+
+        def shifted(info):
+            if (info.st_dev, info.st_ino) != runner_ident:
                 return info
             values = list(info)
             values[stat.ST_DEV] = info.st_dev + 1
             return os.stat_result(values)
 
-        with mock.patch.object(PRUNE.os, "fstat", other_device):
+        with mock.patch.object(PRUNE.os, "fstat", lambda fd: shifted(real_fstat(fd))), \
+                mock.patch.object(PRUNE.os, "lstat", lambda path, **kw: shifted(real_lstat(path, **kw))):
             rc, out, err = self.run_prune(self.runner)
         reason = MOUNT_DIFFERS_REASON.format(path=self.runner)
         self.assertEqual((rc, out), (EXIT_REFUSED, COUNTED_REFUSAL_SUMMARY + "\n"))
