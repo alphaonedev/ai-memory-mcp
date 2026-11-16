@@ -1910,7 +1910,7 @@ async fn h1_reflect_proven_caller_naming_other_refused_9390() {
 }
 
 /// Enforce, alice proven, body names alice (and, separately, no body id):
-/// served as today, and session_start returns her own private row.
+/// served as today, and `session_start` returns her own private row.
 async fn assert_h1_proven_self_served_9390(site: H1Site9390) {
     let fx = build(HttpIdentityMode::Enforce, true).await;
     let suffix = run_suffix();
