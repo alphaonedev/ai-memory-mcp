@@ -752,12 +752,38 @@ pub fn enforce_idor_identity(
     headers: &axum::http::HeaderMap,
     endpoint: &str,
 ) -> Option<Response> {
+    admit_idor_identity(enrolled, mode, headers, endpoint).err()
+}
+
+/// #8947 (v1.0.0, security) — [`enforce_idor_identity`] that also hands back
+/// the principal it judged.
+///
+/// A handler that gates on the header and then re-reads the raw header string
+/// for its visibility caller acts as a DIFFERENT principal than the one the
+/// gate admitted: an empty `X-Agent-Id` is resolved to the anonymous request id
+/// for the gate, but the raw read yields `""`. One resolution point cannot
+/// disagree with itself, so the caller a handler acts as comes from here.
+///
+/// # Errors
+///
+/// The refusal [`Response`] of [`enforce_for_request`] (403 under `enforce`
+/// for a shared-key caller acting as a named principal).
+#[must_use = "the Ok principal is the only caller the gate judged; an Err is a refusal to return"]
+pub fn admit_idor_identity(
+    enrolled: &EnrolledAgentKeys,
+    mode: HttpIdentityMode,
+    headers: &axum::http::HeaderMap,
+    endpoint: &str,
+) -> Result<String, Response> {
     let header_agent_id = headers
         .get(crate::HEADER_AGENT_ID)
         .and_then(|v| v.to_str().ok());
     let caller = crate::identity::resolve_http_agent_id(None, header_agent_id)
         .unwrap_or_else(|_| crate::identity::anonymous_request_id());
-    enforce_for_request(enrolled, mode, headers, &caller, endpoint)
+    match enforce_for_request(enrolled, mode, headers, &caller, endpoint) {
+        Some(refusal) => Err(refusal),
+        None => Ok(caller),
+    }
 }
 
 /// #2044 — the shared IDOR/admin identity gate.
