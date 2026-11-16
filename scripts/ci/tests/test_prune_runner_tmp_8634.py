@@ -135,6 +135,7 @@ UNVERIFIABLE_PLATFORMS = ("freebsd14", "sunos5", "cygwin", "aix7", "win32", "lin
 CANNOT_WRITE_ERRNOS = {errno.ENOSPC: "No space left on device", errno.EDQUOT: "Disk quota exceeded",
                        errno.EROFS: "Read-only file system"}
 CREATING_CALLS = ("mkdir", "file-create")
+NON_CREATING_PROBE_CALLS = ("open", "lstat")  # probe calls that make nothing: a full-disk errno there is a broken call
 READ_ONLY_PROBE_LINE = "prune_runner_tmp: probe cannot write ({why}); the read-only probe passed, pruning goes on"
 READ_ONLY_MISSING_WHY = "not in os.supports_dir_fd"
 DIR_MOVED_DURING_COUNT = "directory moved during count"
@@ -1910,6 +1911,32 @@ class RoundOneFixes(Base):
         self.assertEqual((rc, out), (EXIT_REFUSED, ""))
         self.assertEqual(err, f"prune_runner_tmp: refused: {reason}\n")
         self.assertTrue(victim.exists())
+
+    def test_full_disk_errno_from_a_call_that_creates_nothing_stays_a_refusal(self):
+        """Only mkdir and the file create can fail for want of space: ENOSPC from the open of the probe
+        directory or its lstat is a broken call, never the read-only path."""
+        for attr in NON_CREATING_PROBE_CALLS:
+            with self.subTest(call=attr):
+                self.clear_runner()
+                victim = self.make_file("old.db", OLD_AGE_SECS)
+                real = getattr(os, attr)
+
+                def failing(name, *args, _real=real, **kwargs):
+                    creating = bool(args) and isinstance(args[0], int) and args[0] & os.O_CREAT
+                    if kwargs.get("dir_fd") is not None and not creating and str(name).startswith(PRUNE.PROBE_PREFIX):
+                        raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
+                    return _real(name, *args, **kwargs)
+
+                with mock.patch.object(PRUNE.os, attr, failing), \
+                        mock.patch.object(os, "supports_dir_fd", os.supports_dir_fd | {failing}):
+                    rc, out, err = self.run_prune(self.runner)
+                reason = (f"this platform lacks a working descriptor-relative call: os.{attr} raised OSError "
+                          f"({os.strerror(errno.ENOSPC)})")
+                self.assertEqual((rc, out), (EXIT_REFUSED, ""))
+                self.assertEqual(err, f"prune_runner_tmp: refused: {reason}\n")
+                self.assertEqual(self.annotations, [ANNOTATION_PREFIX + reason])
+                self.assertTrue(victim.exists())
+                victim.unlink()
 
     # decision 4 (CODE F3): only Linux and Darwin can verify mount identity; any other platform refuses loudly
     def test_platform_other_than_linux_and_darwin_is_a_counted_refusal(self):
