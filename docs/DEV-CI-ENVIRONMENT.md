@@ -204,6 +204,22 @@ which runs `scripts/ci/prune_runner_tmp.py` with these rules:
   warning `prune_runner_tmp: refused: shared module workflow_annotation.py next
   to the script cannot be loaded`, exits 0 and deletes nothing. The test families that
   leak the files are fixed separately; the prune treats the symptom.
+- Every other CI script that uses that module (the five gates `load_gate`,
+  `pg_env_preflight`, `tier_cred_preflight`, `host_semaphore`,
+  `partition_test_binaries`, and `ci-sweep-target`, `ci_full_nightly`,
+  `impact/base_sha`, `shared_cargo_target`, `sccache_env`, `pg_isolate_split`,
+  `prune_runner_artifacts`, `scripts/test/pg_isolated_binary`) loads it by one
+  shape, by path, before any other work: a failed load of any kind (absent,
+  unreadable, syntax error, an exception or `sys.exit` with any code while
+  loading, a required name missing) fails the step closed with the fixed line
+  `::error title=<script> refused::<script>: refused: shared module
+  workflow_annotation.py next to the script cannot be loaded` and the script's
+  own refusal exit code, before it writes any file, `GITHUB_ENV` or
+  `GITHUB_OUTPUT` line or runs any command (`pg_isolated_binary` prints that
+  line on stderr, since its stdout feeds `GITHUB_ENV`). The `LoaderShape` cell
+  of `scripts/ci/tests/test_ci_annotation_escape_9365.py` fails on any script
+  under `scripts/` that names the module and loads it another way;
+  `prune_runner_tmp` is its one named exception.
 
 ---
 

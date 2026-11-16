@@ -35,22 +35,43 @@ from pathlib import Path
 
 
 def _load_workflow_annotation():
-    """The shared module next to this file's real path, by path only, never through sys.path (#9365)."""
+    """The shared module at WA_RELATIVE_PATH from this file's real directory, by path only, never through
+    sys.path; every name in WA_REQUIRED must be a callable of it (#9365, one shape in every script)."""
     import importlib.util
     import os
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "workflow_annotation.py")
+    path = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), WA_RELATIVE_PATH))
     loaded = sys.modules.get("workflow_annotation")
     if loaded is not None and os.path.realpath(getattr(loaded, "__file__", None) or "") == path:
-        return loaded
-    spec = importlib.util.spec_from_file_location("workflow_annotation", path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)  # an absent or broken file raises here: a loud failure, never a fallback
+        module = loaded
+    else:
+        spec = importlib.util.spec_from_file_location("workflow_annotation", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)  # absent, unreadable or broken: it raises here, the try below catches it
+    missing = [name for name in WA_REQUIRED if not callable(getattr(module, name, None))]
+    if missing:
+        raise AttributeError("workflow_annotation.py lacks " + ", ".join(missing))
     if loaded is None:
         sys.modules["workflow_annotation"] = module
     return module
 
 
-wa = _load_workflow_annotation()
+# The one shared-module load shape of scripts/ (#9365, ruling bcd0a15c; LoaderShape pins it).
+WA_PROG = "shared_cargo_target"
+WA_RELATIVE_PATH = "workflow_annotation.py"
+WA_REQUIRED = ("env_file_value",)
+WA_EXIT_LOAD_REFUSED = 3  # a failed shared-module load; no other meaning in this script
+WA_ERROR_TO_STDERR = False
+
+try:
+    wa = _load_workflow_annotation()
+except (Exception, SystemExit) as exc:  # any failed load: one fixed line built without the module, then exit
+    wa_cause = type(exc).__name__
+    print("%s: refused: shared module workflow_annotation.py next to the script cannot be loaded (%s)"
+          % (WA_PROG, wa_cause if wa_cause.isidentifier() else "BaseException"), file=sys.stderr, flush=True)
+    print("::error title=shared_cargo_target refused::shared_cargo_target: refused: shared module workflow_annotation.py"
+          " next to the script cannot be loaded",
+          file=sys.stderr if WA_ERROR_TO_STDERR else sys.stdout, flush=True)
+    sys.exit(WA_EXIT_LOAD_REFUSED)
 
 TARGET_ROOT_RELATIVE = Path(".cache") / "ai-memory-ci" / "cargo-target"
 ENV_NAME = "CARGO_TARGET_DIR"

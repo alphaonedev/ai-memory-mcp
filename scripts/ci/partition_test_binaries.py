@@ -54,16 +54,21 @@ from pathlib import Path
 
 
 def _load_workflow_annotation():
-    """The shared module next to this file's real path, by path only, never through sys.path (#9365)."""
+    """The shared module at WA_RELATIVE_PATH from this file's real directory, by path only, never through
+    sys.path; every name in WA_REQUIRED must be a callable of it (#9365, one shape in every script)."""
     import importlib.util
     import os
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "workflow_annotation.py")
+    path = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), WA_RELATIVE_PATH))
     loaded = sys.modules.get("workflow_annotation")
     if loaded is not None and os.path.realpath(getattr(loaded, "__file__", None) or "") == path:
-        return loaded
-    spec = importlib.util.spec_from_file_location("workflow_annotation", path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)  # an absent or broken file raises here: a loud failure, never a fallback
+        module = loaded
+    else:
+        spec = importlib.util.spec_from_file_location("workflow_annotation", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)  # absent, unreadable or broken: it raises here, the try below catches it
+    missing = [name for name in WA_REQUIRED if not callable(getattr(module, name, None))]
+    if missing:
+        raise AttributeError("workflow_annotation.py lacks " + ", ".join(missing))
     if loaded is None:
         sys.modules["workflow_annotation"] = module
     return module
@@ -71,14 +76,23 @@ def _load_workflow_annotation():
 
 EXIT_FAIL_CLOSED = 2  # every fail-closed condition, a shared module that cannot be loaded included
 
+# The one shared-module load shape of scripts/ (#9365, ruling bcd0a15c; LoaderShape pins it).
+WA_PROG = "partition_test_binaries"
+WA_RELATIVE_PATH = "workflow_annotation.py"
+WA_REQUIRED = ("annotation",)
+WA_EXIT_LOAD_REFUSED = EXIT_FAIL_CLOSED  # the gate's own refusal code, unchanged
+WA_ERROR_TO_STDERR = False
+
 try:
     wa = _load_workflow_annotation()
-except (Exception, SystemExit) as exc:  # a gate fails closed, loudly and without the module (#9365, ruling 0011e5e0)
-    print("partition_test_binaries: refused: shared module workflow_annotation.py next to the script"
-          " cannot be loaded (%s)" % type(exc).__name__, file=sys.stderr, flush=True)
-    print("::error title=partition_test_binaries refused::partition_test_binaries: refused: shared module"
-          " workflow_annotation.py next to the script cannot be loaded", flush=True)
-    sys.exit(EXIT_FAIL_CLOSED)
+except (Exception, SystemExit) as exc:  # any failed load: one fixed line built without the module, then exit
+    wa_cause = type(exc).__name__
+    print("%s: refused: shared module workflow_annotation.py next to the script cannot be loaded (%s)"
+          % (WA_PROG, wa_cause if wa_cause.isidentifier() else "BaseException"), file=sys.stderr, flush=True)
+    print("::error title=partition_test_binaries refused::partition_test_binaries: refused: shared module workflow_annotation.py"
+          " next to the script cannot be loaded",
+          file=sys.stderr if WA_ERROR_TO_STDERR else sys.stdout, flush=True)
+    sys.exit(WA_EXIT_LOAD_REFUSED)
 
 # Class (a) evidence. Scout report CI-SHARD-SCOUT-2026-10-09, plus the shared
 # lane-database helpers under tests/common that only Postgres cells use.

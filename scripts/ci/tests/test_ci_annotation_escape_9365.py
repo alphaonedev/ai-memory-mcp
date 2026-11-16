@@ -1463,6 +1463,10 @@ def loader_shape_violations(rel, source):
     for name in WA_SETTINGS:
         if name not in settings:
             problems.append(f"{rel}: {name} is not set before the load try")
+    # the loader, the load try and the WA_RELATIVE_PATH value are the only places that may name the module
+    inside = {id(node) for root in (*defs, load_try, *([settings["WA_RELATIVE_PATH"]]
+                                                     if "WA_RELATIVE_PATH" in settings else []))
+              for node in ast.walk(root)}
     error_literal = None
     handler = load_try.handlers[0] if len(load_try.handlers) == 1 else None
     try:
@@ -1495,7 +1499,6 @@ def loader_shape_violations(rel, source):
     to_stderr = settings.get("WA_ERROR_TO_STDERR")
     if not (isinstance(to_stderr, ast.Constant) and isinstance(to_stderr.value, bool)):
         problems.append(f"{rel}: WA_ERROR_TO_STDERR is not a literal bool")
-    inside = {id(node) for root in (*defs, load_try) for node in ast.walk(root)}
     for node in references:
         if id(node) not in inside:
             problems.append(f"{rel}:{node.lineno}: references the shared module outside the one loader")
