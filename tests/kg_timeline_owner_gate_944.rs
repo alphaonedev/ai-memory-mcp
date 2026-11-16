@@ -33,10 +33,12 @@
 //!
 //! Tests:
 //!
-//! 1. `bob_cannot_read_alice_timeline_944` — alice owns a source
-//!    memory and a `:related_to` edge from it; bob's GET returns
-//!    HTTP 403 and the response body does NOT contain the timeline
-//!    rows.
+//! 1. `bob_cannot_read_alice_timeline_944` — alice owns a PRIVATE source
+//!    memory and a `:related_to` edge from it; bob cannot read the row, so
+//!    his GET returns the absent-source HTTP 404, byte-identical to a decoy
+//!    id (#8994). `bob_cannot_read_alice_collective_timeline_keeps_403_8994`
+//!    pins the HTTP 403 envelope for a row bob can read but does not own;
+//!    neither body contains the timeline rows.
 //! 2. `owner_can_read_own_timeline_944` — alice's GET against her
 //!    own source returns HTTP 200 + the events array (count >= 1).
 //! 3. `missing_source_returns_404_944` — GET against a non-existent
@@ -200,6 +202,55 @@ async fn bob_cannot_read_alice_timeline_944() {
     let f = NamedTempFile::new().expect("tempfile");
     let db_path = f.path();
     let alice_src = seed_memory(db_path, "alice", "shared-944/a", &json!({}));
+    let alice_tgt = seed_memory(db_path, "alice", "shared-944/a", &json!({}));
+    seed_link(db_path, &alice_src, &alice_tgt, "related_to");
+
+    let router = build_router_fixture(db_path);
+    let (status, body) = timeline_as(&router, "bob", &alice_src).await;
+    // #8994 — alice's row is PRIVATE (no scope), so bob cannot read it: the
+    // refusal is the absent-source answer, byte-identical to a decoy id, and
+    // never the 403 that would confirm the row exists (pre-#8994: 403).
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "#944 / #8994: bob (non-owner, cannot read) MUST get the absent-source 404; body={body}"
+    );
+    assert_eq!(
+        body,
+        json!({
+            "found": false,
+            "source_id": alice_src,
+            "error": ai_memory::errors::msg::SOURCE_MEMORY_NOT_FOUND,
+        }),
+        "#944 / #8994: the refusal is the exact absent-source body, with no owner and no events"
+    );
+    let decoy = uuid::Uuid::new_v4().to_string();
+    let (decoy_status, decoy_body) = timeline_as(&router, "bob", &decoy).await;
+    assert_eq!(
+        decoy_status, status,
+        "#8994: private id and decoy id share one status"
+    );
+    assert_eq!(
+        decoy_body,
+        json!({
+            "found": false,
+            "source_id": decoy,
+            "error": ai_memory::errors::msg::SOURCE_MEMORY_NOT_FOUND,
+        }),
+        "#8994: private id and decoy id share one body shape"
+    );
+}
+
+#[tokio::test]
+async fn bob_cannot_read_alice_collective_timeline_keeps_403_8994() {
+    let f = NamedTempFile::new().expect("tempfile");
+    let db_path = f.path();
+    let alice_src = seed_memory(
+        db_path,
+        "alice",
+        "shared-944/a",
+        &json!({"scope": "collective"}),
+    );
     let alice_tgt = seed_memory(db_path, "alice", "shared-944/a", &json!({}));
     seed_link(db_path, &alice_src, &alice_tgt, "related_to");
 

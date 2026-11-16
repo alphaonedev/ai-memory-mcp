@@ -774,9 +774,12 @@ Query params: `direction` (`ancestors` default, or `descendants`),
 ```
 
 Tombstoned ancestors are included (a consolidated-away source is still
-an ancestor). A root the caller cannot see is **404** (postgres) /
-**403** (sqlite owner-mismatch) — not an existence oracle on postgres
-(`NotFound` folds hidden + missing). An unknown `direction` is **400**.
+an ancestor). A root the caller cannot read and a root that does not
+exist both answer **404** `{"error": "source memory not found", "id": …}`,
+byte-identical on SQLite and PostgreSQL, so the route is not an existence
+oracle ([#8994](https://github.com/alphaonedev/ai-memory-mcp/issues/8994);
+before, SQLite answered 403 for an unreadable root and an empty 200 walk
+for an absent one). An unknown `direction` is **400**.
 
 ### `PUT /api/v1/memories/{id}` — update
 
@@ -787,6 +790,10 @@ All fields optional. Tier never downgrades.
 ```
 
 - **200** on success, **409** on `(title, namespace)` collision, **404** on missing.
+- A row the caller cannot read answers exactly like a missing id (**404**),
+  on both backends; **403** `NOT_OWNER` is kept for a row the caller can read
+  but does not own ([#8994](https://github.com/alphaonedev/ai-memory-mcp/issues/8994)).
+  `DELETE /api/v1/memories/{id}` follows the same rule.
 
 ### `DELETE /api/v1/memories/{id}` — delete
 
@@ -1033,6 +1040,11 @@ Immediate garbage collection. Empty body. **Admin-gated**. Returns
 { "source_id": "abc", "target_id": "def", "relation": "supersedes" }
 ```
 
+A source the caller cannot read answers exactly like an absent source:
+**404** `{"error": "source memory not found", "source_id": …}` on both
+backends, before any target or ownership check, and nothing is written
+([#8994](https://github.com/alphaonedev/ai-memory-mcp/issues/8994)).
+
 Relations (nine at v0.8.0; was six at v0.7.0, four at v0.6.x): `related_to`, `supersedes`, `contradicts`, `derived_from`, `reflects_on` (recursive-learning Task 1/8), `derives_from` (WT-1-A atomisation — atom row → parent memory), `decomposes_into`, `depends_on`, `advances` (the last three are the v0.8.0 Pillar-2 typed-cognition Goal/Plan/Step relations, #1709). Canonical enum in `src/models/link.rs::MemoryLinkRelation` (`COUNT = 9`).
 
 ### `GET /api/v1/links/{id}`
@@ -1075,9 +1087,15 @@ and removes every relation between that pair (`MemoryStore::delete_link`).
 ```
 
 Response: `{"deleted": true}` when at least one row was removed,
-`{"deleted": false}` when the pair had no edge (including a missing
-source — not 404, so this is not an existence oracle). **403** when the
-caller owns neither endpoint. Never a count — `deleted` is a **bool**.
+`{"deleted": false}` when the caller may sever the pair but it had no
+edge. When the caller can read neither endpoint (absent or not visible)
+the answer is **404** `{"error": "not found"}` and nothing is written,
+byte-identical for a private pair and a pair of ids that name no rows, on
+both backends ([#8994](https://github.com/alphaonedev/ai-memory-mcp/issues/8994),
+[#9043](https://github.com/alphaonedev/ai-memory-mcp/issues/9043); before,
+a missing source answered `200 {"deleted": false}` and PostgreSQL let an
+unreadable source fall through to the delete). **403** when the caller
+can read an endpoint but owns neither. Never a count — `deleted` is a **bool**.
 
 ### `POST /api/v1/links/verify`
 
@@ -1228,11 +1246,20 @@ optional), `limit` (1-1000, default 200).
 }
 ```
 
+A source that does not exist, and a source the caller cannot read and is
+not admitted to, both answer **404** `{"found": false, "source_id": …,
+"error": "source memory not found"}` on both backends; a source the caller
+can read but does not own keeps **403**
+([#8994](https://github.com/alphaonedev/ai-memory-mcp/issues/8994)).
+
 ### `POST /api/v1/kg/invalidate`
 
 Mark a link superseded by setting `valid_until`. **Does NOT delete**
 the link — historical queries pinned to `valid_at < now` still see
-it. Idempotent.
+it. Idempotent. A source the caller cannot read answers the same
+not-found body as an absent source on both backends; **403** is kept for a
+readable source the caller does not own
+([#8994](https://github.com/alphaonedev/ai-memory-mcp/issues/8994)).
 
 ```json
 {
@@ -1776,7 +1803,7 @@ router in `src/lib.rs`.
 | `POST` | `/api/v1/kg/find_paths` | KG chain-walk over HTTP; relational recursive-CTE (bounded BFS) on SQLite **and** Postgres (not AGE Cypher — #2582 / #3297). |
 | `POST` | `/api/v1/find_paths` | Alias for `/api/v1/kg/find_paths` (#934 — legacy callers). |
 | `POST` | `/api/v1/links/verify` | Ed25519 link verification surface — wire shape: `{verified, attest_level, signature_present, observed_by, source_id, target_id, relation, findings}`. |
-| `DELETE` | `/api/v1/links` | Delete a link. Returns `{"deleted": true}` (bool — at least one row removed) or `{"deleted": false}`. |
+| `DELETE` | `/api/v1/links` | Delete a link. Returns `{"deleted": true}` (bool — at least one row removed) or `{"deleted": false}`; `404 {"error": "not found"}` when the caller can read neither endpoint (#8994). |
 | `GET`  | `/api/v1/contradictions` | Detect contradiction candidates (similar titles in a namespace). |
 | `POST` | `/api/v1/memory_load_family` | HTTP parity for the always-on `memory_load_family` MCP loader. |
 | `POST` | `/api/v1/capture_turn` | #1416 — L4 layered-capture HTTP mirror of MCP `memory_capture_turn` (idempotent per-turn write via `MemoryStore::capture_turn_idempotent`). |

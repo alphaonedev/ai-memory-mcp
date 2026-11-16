@@ -411,7 +411,9 @@ async fn http_anchor_contract_matrix(
     for (anchor, expected) in [
         (&own, StatusCode::OK),
         (&other, StatusCode::NOT_FOUND),
-        (&foreign_owned, StatusCode::FORBIDDEN),
+        // #8994 — `foreign_owned` is a PRIVATE row of another agent: the
+        // caller cannot read it, so it answers like an absent id (pre-#8994: 403).
+        (&foreign_owned, StatusCode::NOT_FOUND),
         (&unowned, StatusCode::OK),
     ] {
         let response = router
@@ -440,6 +442,16 @@ async fn http_anchor_contract_matrix(
             );
         } else if anchor == &other {
             assert_eq!(body["found"], false, "hidden substrate envelope");
+        } else if anchor == &foreign_owned {
+            assert_eq!(
+                body,
+                json!({
+                    "found": false,
+                    "source_id": foreign_owned,
+                    "error": ai_memory::errors::msg::SOURCE_MEMORY_NOT_FOUND,
+                }),
+                "#8994: a private foreign anchor answers the exact absent-source body"
+            );
         }
     }
     for (target, expected) in [

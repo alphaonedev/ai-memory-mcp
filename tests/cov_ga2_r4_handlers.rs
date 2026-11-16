@@ -1127,10 +1127,11 @@ async fn links_delete_invalid_triple_is_400() {
 }
 
 #[tokio::test]
-async fn links_delete_missing_source_is_deleted_false() {
+async fn links_delete_missing_source_is_404_not_found_8994() {
     let (r, _t, _db) = sqlite_router();
-    // No such source memory → falls through to db::delete_link returning
-    // deleted:false (the missing-source arm).
+    // #8994 / #9043 — neither endpoint exists, so the unlink gate answers
+    // the link's not-found shape and writes nothing (pre-fix: 200
+    // {"deleted": false}, the same answer a private pair got as 403).
     let (status, body) = delete_as(
         &r,
         "/api/v1/links",
@@ -1138,8 +1139,8 @@ async fn links_delete_missing_source_is_deleted_false() {
         &json!({"source_id": "ghostsrc", "target_id": "ghosttgt", "relation": "related_to"}),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "body={body}");
-    assert_eq!(body["deleted"], false);
+    assert_eq!(status, StatusCode::NOT_FOUND, "body={body}");
+    assert_eq!(body, json!({"error": "not found"}));
 }
 
 #[tokio::test]

@@ -601,6 +601,35 @@ pub struct KgTimelineQuery {
     pub limit: Option<usize>,
 }
 
+/// #8994 — the `kg_timeline` source lookup shared by both backends: an
+/// unreadable SUBSTRATE row folds into "absent" (`None`, pre-existing); any
+/// other row yields its owner, link target and the caller's visibility of
+/// it, so the owner gate can answer an unreadable refused row exactly like
+/// an absent one.
+fn kg_timeline_source(
+    mem: &Memory,
+    caller: &str,
+) -> Option<(String, String, super::RowVisibility)> {
+    let visibility = super::RowVisibility::of(mem, caller);
+    if crate::visibility::is_substrate_namespace(&mem.namespace)
+        && visibility == super::RowVisibility::NotVisible
+    {
+        return None;
+    }
+    let field = |key: &str| {
+        mem.metadata
+            .get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    Some((
+        field("agent_id"),
+        field(field_names::TARGET_AGENT_ID),
+        visibility,
+    ))
+}
+
 /// `GET /api/v1/kg/timeline?source_id=<>&since=<>&until=<>&limit=<>` —
 /// REST mirror of the MCP `memory_kg_timeline` tool. Returns outbound
 /// link assertions from `source_id` ordered by `valid_from ASC`.
@@ -678,22 +707,7 @@ pub async fn kg_timeline(
     // SQLite scratch connection (which made every postgres-backed
     // kg_timeline call return 404 regardless of the actual memory's
     // existence in the live store).
-    let extract_owner_target = |mem: &Memory| -> (String, String) {
-        let owner = mem
-            .metadata
-            .get("agent_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let target = mem
-            .metadata
-            .get(field_names::TARGET_AGENT_ID)
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        (owner, target)
-    };
-    let source_owner: Option<(String, String)> = {
+    let source_owner: Option<(String, String, super::RowVisibility)> = {
         #[cfg(feature = "sal")]
         if matches!(app.storage_backend, StorageBackend::Postgres) {
             // #3498/#944: inspect the anchor before the handler's owner gate;
@@ -701,13 +715,7 @@ pub async fn kg_timeline(
             // This context is confined to this lookup, never to the traversal.
             let ctx = crate::store::CallerContext::for_admin(&caller);
             match app.store.get(&ctx, &p.source_id).await {
-                Ok(mem) => (!crate::visibility::is_substrate_namespace(&mem.namespace)
-                    || crate::visibility::is_readable_on_query(
-                        &mem,
-                        (caller != sentinels::DAEMON_PRINCIPAL).then_some(caller.as_str()),
-                        Some(&mem.namespace),
-                    ))
-                .then(|| extract_owner_target(&mem)),
+                Ok(mem) => kg_timeline_source(&mem, &caller),
                 Err(e) => {
                     let msg = format!("{e:?}");
                     if msg.contains("NotFound") || msg.contains("not found") {
@@ -725,13 +733,7 @@ pub async fn kg_timeline(
         } else {
             let lock = app.db.lock().await;
             match db::get(&lock.0, &p.source_id) {
-                Ok(Some(mem)) => (!crate::visibility::is_substrate_namespace(&mem.namespace)
-                    || crate::visibility::is_readable_on_query(
-                        &mem,
-                        (caller != sentinels::DAEMON_PRINCIPAL).then_some(caller.as_str()),
-                        Some(&mem.namespace),
-                    ))
-                .then(|| extract_owner_target(&mem)),
+                Ok(Some(mem)) => kg_timeline_source(&mem, &caller),
                 Ok(None) => None,
                 Err(e) => {
                     tracing::error!("kg_timeline: source lookup failed: {e}");
@@ -747,13 +749,7 @@ pub async fn kg_timeline(
         {
             let lock = app.db.lock().await;
             match db::get(&lock.0, &p.source_id) {
-                Ok(Some(mem)) => (!crate::visibility::is_substrate_namespace(&mem.namespace)
-                    || crate::visibility::is_readable_on_query(
-                        &mem,
-                        (caller != sentinels::DAEMON_PRINCIPAL).then_some(caller.as_str()),
-                        Some(&mem.namespace),
-                    ))
-                .then(|| extract_owner_target(&mem)),
+                Ok(Some(mem)) => kg_timeline_source(&mem, &caller),
                 Ok(None) => None,
                 Err(e) => {
                     tracing::error!("kg_timeline: source lookup failed: {e}");
@@ -766,8 +762,8 @@ pub async fn kg_timeline(
             }
         }
     };
-    let Some((owner, target)) = source_owner else {
-        return (
+    let not_found = || {
+        (
             StatusCode::NOT_FOUND,
             Json(json!({
                 "found": false,
@@ -775,7 +771,10 @@ pub async fn kg_timeline(
                 "error": crate::errors::msg::SOURCE_MEMORY_NOT_FOUND,
             })),
         )
-            .into_response();
+            .into_response()
+    };
+    let Some((owner, target, visibility)) = source_owner else {
+        return not_found();
     };
     let is_unowned_legacy = owner.is_empty();
     if !is_unowned_legacy
@@ -783,6 +782,11 @@ pub async fn kg_timeline(
         && target != caller
         && caller != sentinels::DAEMON_PRINCIPAL
     {
+        // #8994 — a refused caller who cannot even read the source gets the
+        // absent-source answer, never the 403 that would confirm the row.
+        if visibility == super::RowVisibility::NotVisible {
+            return not_found();
+        }
         tracing::warn!(
             target: super::AUTHZ_TRACE_TARGET,
             "GET /api/v1/kg/timeline 403: caller {caller} != owner {owner} (source_id={})",
@@ -1039,9 +1043,17 @@ pub async fn kg_invalidate(
             }
         } else {
             let lock = app.db.lock().await;
+            // #8994 — a source the caller cannot read folds into the SAME
+            // not-found answer as an absent one (the postgres branch's
+            // caller-scoped `get` already does so); pre-fix it reached the
+            // 403 owner gate below, an existence oracle.
             match db::get(&lock.0, &body.source_id) {
-                Ok(Some(mem)) => Some(extract_owner_target(&mem)),
-                Ok(None) => None,
+                Ok(Some(mem))
+                    if super::RowVisibility::of(&mem, &caller) == super::RowVisibility::Visible =>
+                {
+                    Some(extract_owner_target(&mem))
+                }
+                Ok(_) => None,
                 Err(e) => {
                     tracing::error!("kg_invalidate: source lookup failed: {e}");
                     return (
@@ -1055,9 +1067,17 @@ pub async fn kg_invalidate(
         #[cfg(not(feature = "sal"))]
         {
             let lock = app.db.lock().await;
+            // #8994 — a source the caller cannot read folds into the SAME
+            // not-found answer as an absent one (the postgres branch's
+            // caller-scoped `get` already does so); pre-fix it reached the
+            // 403 owner gate below, an existence oracle.
             match db::get(&lock.0, &body.source_id) {
-                Ok(Some(mem)) => Some(extract_owner_target(&mem)),
-                Ok(None) => None,
+                Ok(Some(mem))
+                    if super::RowVisibility::of(&mem, &caller) == super::RowVisibility::Visible =>
+                {
+                    Some(extract_owner_target(&mem))
+                }
+                Ok(_) => None,
                 Err(e) => {
                     tracing::error!("kg_invalidate: source lookup failed: {e}");
                     return (

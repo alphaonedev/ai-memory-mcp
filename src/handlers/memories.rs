@@ -637,7 +637,14 @@ async fn update_memory_write(
                     )
                         .into_response();
                 }
-                store_err_to_response(e)
+                // #8994 — the scoped pre-get above decides visibility: a row
+                // the caller cannot read answers like an absent id.
+                super::store_err_to_response_for(
+                    e,
+                    crate::handlers::parity::RowVisibility::from_scoped_lookup(
+                        existing_for_quota.is_some(),
+                    ),
+                )
             }
         };
     }
@@ -1249,7 +1256,12 @@ pub async fn delete_memory(
                 }
                 (StatusCode::OK, Json(receipt)).into_response()
             }
-            Err(e) => store_err_to_response(e),
+            // #8994 — the scoped pre-get decides visibility: a row the
+            // caller cannot read answers like an absent id.
+            Err(e) => super::store_err_to_response_for(
+                e,
+                crate::handlers::parity::RowVisibility::from_scoped_lookup(target.is_some()),
+            ),
         };
     }
 

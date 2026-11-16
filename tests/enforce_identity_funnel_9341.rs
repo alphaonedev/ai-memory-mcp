@@ -1093,11 +1093,6 @@ async fn recall_observations_rows_scoped_to_owner_or_admin_9366() {
     assert_eq!(admin, (1, 1, 1), "the admin reads every row");
 }
 
-/// `true` when this binary's store is postgres (the [`store_for`] predicate).
-fn on_postgres() -> bool {
-    cfg!(feature = "sal-postgres") && std::env::var("AI_MEMORY_TEST_POSTGRES_URL").is_ok()
-}
-
 /// B-8: Advisory with the shared key and a named id is served (reported,
 /// not refused) and the report counter rises.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1386,7 +1381,7 @@ async fn private_id_answers_like_a_decoy_on_every_id_route_8994() {
 }
 
 /// #8994 — the fix must not turn a legitimate 403 into a 404: a row bob CAN
-/// see (alice's collective row) but does not own keeps 403 NOT_OWNER on every
+/// see (alice's collective row) but does not own keeps 403 `NOT_OWNER` on every
 /// mutation route, the lineage read of it is served, and nothing is written.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn visible_row_of_another_owner_keeps_403_not_owner_8994() {

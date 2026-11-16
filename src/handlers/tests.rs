@@ -5824,7 +5824,7 @@ async fn http_delete_link_rejects_self_link() {
 }
 
 #[tokio::test]
-async fn http_delete_link_returns_deleted_false_when_missing() {
+async fn http_delete_link_returns_404_not_found_when_missing_8994() {
     let state = test_state();
     let app = Router::new()
         .route("/api/v1/links", axum::routing::delete(delete_link))
@@ -5845,12 +5845,14 @@ async fn http_delete_link_returns_deleted_false_when_missing() {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
+    // #8994 / #9043 — neither endpoint exists: the link's not-found shape,
+    // nothing written (pre-fix: 200 {"deleted": false}).
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
         .await
         .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(v["deleted"], serde_json::json!(false));
+    assert_eq!(v, serde_json::json!({"error": "not found"}));
 }
 
 #[tokio::test]
@@ -6197,7 +6199,20 @@ async fn http_lineage_private_root_refused_for_stranger_1859() {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    // #8994 — an unreadable root answers exactly like an absent one
+    // (pre-fix: 403 {"error": CALLER_NOT_SOURCE_MEMORY_OWNER}).
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        v,
+        serde_json::json!({
+            "error": crate::errors::msg::SOURCE_MEMORY_NOT_FOUND,
+            "id": id,
+        })
+    );
 
     let resp = app
         .oneshot(
@@ -6309,10 +6324,23 @@ async fn http_lineage_tombstoned_root_conserved_for_owner_refused_for_stranger_3
         )
         .await
         .unwrap();
+    // #8994 — refused with the ONE not-found shape an absent root gets
+    // (pre-fix: 403, which confirmed the tombstoned root exists).
     assert_eq!(
         resp.status(),
-        StatusCode::FORBIDDEN,
+        StatusCode::NOT_FOUND,
         "stranger must be refused a hidden root's lineage"
+    );
+    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        v,
+        serde_json::json!({
+            "error": crate::errors::msg::SOURCE_MEMORY_NOT_FOUND,
+            "id": root,
+        })
     );
 
     // Owner: conserved lineage of their own tombstoned root (200 + ancestor).

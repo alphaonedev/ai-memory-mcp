@@ -843,20 +843,27 @@ async fn create_link_source_not_found_returns_404() {
 }
 
 #[tokio::test]
-async fn create_link_not_owner_returns_403() {
+async fn create_link_private_source_not_owner_returns_404_8994() {
     let (r, _f, db) = build_router(StorageBackend::Sqlite);
-    // Source owned by "owner-a"; caller "intruder" is neither owner nor
-    // target nor daemon → the #941 ownership gate refuses.
+    // Source owned by "owner-a" and PRIVATE (no scope); caller "intruder" is
+    // neither owner nor target nor daemon and cannot read it. #8994: the
+    // refusal is the absent-source answer, never the #941 403 that would
+    // confirm the row exists (pre-#8994: 403).
     let src = seed_owned_memory(&db, "cov-link", "owner-a").await;
     let tgt = seed_owned_memory(&db, "cov-link", "owner-a").await;
-    let (status, _v) = post_as(
+    let (status, v) = post_as(
         &r,
         "/api/v1/links",
         "intruder",
         json!({"source_id": src, "target_id": tgt, "relation": "related_to"}),
     )
     .await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(status, StatusCode::NOT_FOUND, "{v}");
+    assert_eq!(
+        v,
+        json!({"error": "source memory not found", "source_id": src}),
+        "{v}"
+    );
 }
 
 #[tokio::test]
@@ -925,10 +932,11 @@ async fn delete_link_invalid_triple_returns_400() {
 }
 
 #[tokio::test]
-async fn delete_link_missing_source_returns_deleted_false() {
+async fn delete_link_missing_source_returns_404_not_found_8994() {
     let (r, _f, _db) = build_router(StorageBackend::Sqlite);
-    // Source memory doesn't exist → fall through to substrate delete,
-    // which reports deleted:false (no owner gate fires).
+    // #8994 / #9043 — neither endpoint exists: the unlink gate answers the
+    // link's not-found shape and nothing is deleted (pre-fix: 200
+    // {"deleted": false}).
     let (status, v) = delete_as(
         &r,
         "/api/v1/links",
@@ -936,23 +944,27 @@ async fn delete_link_missing_source_returns_deleted_false() {
         json!({"source_id": "ghostsrc", "target_id": "ghosttgt", "relation": "related_to"}),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{v}");
-    assert_eq!(v["deleted"], json!(false), "{v}");
+    assert_eq!(status, StatusCode::NOT_FOUND, "{v}");
+    assert_eq!(v, json!({"error": "not found"}), "{v}");
 }
 
 #[tokio::test]
-async fn delete_link_not_owner_returns_403() {
+async fn delete_link_private_endpoints_not_owner_returns_404_8994() {
     let (r, _f, db) = build_router(StorageBackend::Sqlite);
+    // Both endpoints are PRIVATE rows of "del-owner"; "del-intruder" can read
+    // neither. #8994 / #9043: the unlink gate answers the link's not-found
+    // shape and nothing is deleted (pre-#8994: 403).
     let src = seed_owned_memory(&db, "cov-del", "del-owner").await;
     let tgt = seed_owned_memory(&db, "cov-del", "del-owner").await;
-    let (status, _v) = delete_as(
+    let (status, v) = delete_as(
         &r,
         "/api/v1/links",
         "del-intruder",
         json!({"source_id": src, "target_id": tgt, "relation": "related_to"}),
     )
     .await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(status, StatusCode::NOT_FOUND, "{v}");
+    assert_eq!(v, json!({"error": "not found"}), "{v}");
 }
 
 #[tokio::test]
