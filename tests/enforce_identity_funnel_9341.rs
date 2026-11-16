@@ -1508,3 +1508,163 @@ async fn private_substrate_target_answers_like_a_decoy_target_8994() {
         "no edge to the hidden target was written: {written:?}"
     );
 }
+
+/// Seed, through the router's store, a private row of alice addressed to
+/// bob (`target_agent_id = bob`) in `ns`, plus a `related_to` edge from it to
+/// a fresh collective row of alice; returns `(source, target)`.
+async fn seed_inbox_edge_8994(fx: &Fixture, ns: &str, marker: &str) -> (String, String) {
+    let target = seed_8994(
+        fx,
+        &format!("ns-inbox-target-8994-{marker}"),
+        "collective",
+        &format!("{marker}-target"),
+    )
+    .await;
+    let now = chrono::Utc::now().to_rfc3339();
+    let row = ai_memory::models::Memory {
+        id: uuid::Uuid::new_v4().to_string(),
+        namespace: ns.to_string(),
+        title: format!("{marker}-inbox"),
+        content: format!("{marker}-inbox"),
+        created_at: now.clone(),
+        updated_at: now.clone(),
+        metadata: serde_json::json!({
+            "agent_id": ALICE, "scope": "private", "target_agent_id": BOB,
+        }),
+        ..ai_memory::models::Memory::default()
+    };
+    let ctx = ai_memory::store::CallerContext::for_admin("fixture-8994");
+    let source = fx
+        .store
+        .store(&ctx, &row)
+        .await
+        .expect("seed the inbox row");
+    let link = ai_memory::models::MemoryLink {
+        source_id: source.clone(),
+        target_id: target.clone(),
+        relation: RELATION_8994.parse().expect("closed relation"),
+        created_at: now,
+        signature: None,
+        observed_by: None,
+        valid_from: None,
+        valid_until: None,
+        attest_level: None,
+        source_cid: None,
+        target_cid: None,
+    };
+    fx.store
+        .link(&ctx, &link)
+        .await
+        .expect("seed the inbox edge");
+    (source, target)
+}
+
+/// #8994 open concern (vote-e DONE): the inbox-target caller of
+/// `kg_invalidate`. Before e1714cb5's fix the SQLite arm read the row with no
+/// visibility check and the owner gate admitted the inbox target; the
+/// postgres arm read it caller-scoped, where `target_agent_id == caller`
+/// is visible. After the fix both arms still serve bob, for an ordinary
+/// namespace and for his `_inbox/` substrate namespace.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inbox_target_keeps_kg_invalidate_8994() {
+    let fx = build(HttpIdentityMode::Enforce, true).await;
+    let suffix = run_suffix();
+    for (cell, ns) in [format!("ns-inbox-8994-{suffix}"), format!("_inbox/{BOB}")]
+        .into_iter()
+        .enumerate()
+    {
+        let (source, target) =
+            seed_inbox_edge_8994(&fx, &ns, &format!("inbox-8994-{suffix}-{cell}")).await;
+        let out = send_simple(
+            &fx.router,
+            "post",
+            ai_memory::handlers::routes::KG_INVALIDATE,
+            BOB_KEY,
+            &[BOB],
+            Some(serde_json::json!({
+                "source_id": source, "target_id": target, "relation": RELATION_8994,
+            })),
+        )
+        .await;
+        assert_eq!(
+            (out.status, out.body["found"].clone()),
+            (StatusCode::OK, serde_json::Value::Bool(true)),
+            "inbox target {ns}: {}",
+            out.body
+        );
+    }
+}
+
+/// #8994 item-4 edge: a `scope=team` row of alice addressed to bob, where
+/// bob is OUTSIDE the team subtree, so he cannot read it. Before e1714cb5's
+/// fix the SQLite arm read it unscoped and the owner gate admitted the inbox
+/// target (200); the postgres arm's caller-scoped read never found it (404).
+/// The fix must not refuse the SQLite caller it admitted before; postgres
+/// keeps its pre-fix answer (filed as a parity row, not changed here).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unreadable_inbox_target_keeps_its_pre_fix_kg_invalidate_answer_8994() {
+    let fx = build(HttpIdentityMode::Enforce, true).await;
+    let suffix = run_suffix();
+    let ns = format!("org8994/unit8994/team8994/alice-{suffix}");
+    let target = seed_8994(
+        &fx,
+        &format!("ns-team-target-8994-{suffix}"),
+        "collective",
+        &format!("team-8994-{suffix}-target"),
+    )
+    .await;
+    let now = chrono::Utc::now().to_rfc3339();
+    let row = ai_memory::models::Memory {
+        id: uuid::Uuid::new_v4().to_string(),
+        namespace: ns,
+        title: format!("team-8994-{suffix}"),
+        content: format!("team-8994-{suffix}"),
+        created_at: now.clone(),
+        updated_at: now.clone(),
+        metadata: serde_json::json!({
+            "agent_id": ALICE, "scope": "team", "target_agent_id": BOB,
+        }),
+        ..ai_memory::models::Memory::default()
+    };
+    let ctx = ai_memory::store::CallerContext::for_admin("fixture-8994");
+    let source = fx.store.store(&ctx, &row).await.expect("seed the team row");
+    let link = ai_memory::models::MemoryLink {
+        source_id: source.clone(),
+        target_id: target.clone(),
+        relation: RELATION_8994.parse().expect("closed relation"),
+        created_at: now,
+        signature: None,
+        observed_by: None,
+        valid_from: None,
+        valid_until: None,
+        attest_level: None,
+        source_cid: None,
+        target_cid: None,
+    };
+    fx.store
+        .link(&ctx, &link)
+        .await
+        .expect("seed the team edge");
+    let out = send_simple(
+        &fx.router,
+        "post",
+        ai_memory::handlers::routes::KG_INVALIDATE,
+        BOB_KEY,
+        &[BOB],
+        Some(serde_json::json!({
+            "source_id": source, "target_id": target, "relation": RELATION_8994,
+        })),
+    )
+    .await;
+    let expected = if std::env::var("AI_MEMORY_TEST_POSTGRES_URL").is_ok() {
+        (StatusCode::NOT_FOUND, serde_json::Value::Bool(false))
+    } else {
+        (StatusCode::OK, serde_json::Value::Bool(true))
+    };
+    assert_eq!(
+        (out.status, out.body["found"].clone()),
+        expected,
+        "team-scoped inbox target: {}",
+        out.body
+    );
+}

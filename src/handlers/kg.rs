@@ -1043,17 +1043,19 @@ pub async fn kg_invalidate(
             }
         } else {
             let lock = app.db.lock().await;
-            // #8994 — a source the caller cannot read folds into the SAME
-            // not-found answer as an absent one (the postgres branch's
-            // caller-scoped `get` already does so); pre-fix it reached the
-            // 403 owner gate below, an existence oracle.
+            // #8994 — a source the caller cannot read AND may not mutate
+            // folds into the SAME not-found answer as an absent one; pre-fix
+            // it reached the 403 owner gate below, an existence oracle. A
+            // source the owner gate admits (an inbox target outside a team
+            // subtree) keeps the answer it had before the fix.
             match db::get(&lock.0, &body.source_id) {
-                Ok(Some(mem))
-                    if super::RowVisibility::of(&mem, &caller) == super::RowVisibility::Visible =>
-                {
-                    Some(extract_owner_target(&mem))
+                Ok(Some(mem)) => {
+                    let verdict = extract_owner_target(&mem);
+                    (verdict.2
+                        || super::RowVisibility::of(&mem, &caller) == super::RowVisibility::Visible)
+                        .then_some(verdict)
                 }
-                Ok(_) => None,
+                Ok(None) => None,
                 Err(e) => {
                     tracing::error!("kg_invalidate: source lookup failed: {e}");
                     return (
@@ -1067,17 +1069,19 @@ pub async fn kg_invalidate(
         #[cfg(not(feature = "sal"))]
         {
             let lock = app.db.lock().await;
-            // #8994 — a source the caller cannot read folds into the SAME
-            // not-found answer as an absent one (the postgres branch's
-            // caller-scoped `get` already does so); pre-fix it reached the
-            // 403 owner gate below, an existence oracle.
+            // #8994 — a source the caller cannot read AND may not mutate
+            // folds into the SAME not-found answer as an absent one; pre-fix
+            // it reached the 403 owner gate below, an existence oracle. A
+            // source the owner gate admits (an inbox target outside a team
+            // subtree) keeps the answer it had before the fix.
             match db::get(&lock.0, &body.source_id) {
-                Ok(Some(mem))
-                    if super::RowVisibility::of(&mem, &caller) == super::RowVisibility::Visible =>
-                {
-                    Some(extract_owner_target(&mem))
+                Ok(Some(mem)) => {
+                    let verdict = extract_owner_target(&mem);
+                    (verdict.2
+                        || super::RowVisibility::of(&mem, &caller) == super::RowVisibility::Visible)
+                        .then_some(verdict)
                 }
-                Ok(_) => None,
+                Ok(None) => None,
                 Err(e) => {
                     tracing::error!("kg_invalidate: source lookup failed: {e}");
                     return (
