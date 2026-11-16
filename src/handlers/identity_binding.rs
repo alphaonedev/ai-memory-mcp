@@ -716,8 +716,10 @@ fn cert_proven_principal_is(caller: &str) -> bool {
 /// keeps `advisory` (the v1.0.0 default) zero-WARN for a single-operator
 /// deployment AND stops `enforce` from bricking every named caller when nobody
 /// could possibly be key-attested (the #1985 unsatisfiable-default trap).
-/// Enforcement (advisory WARN / enforce 403) only engages once at least one
-/// per-agent key exists.
+/// This per-handler gate (advisory WARN / enforce 403) only engages once at
+/// least one per-agent key exists. Since #9341 B-1 (3-agent vote (71472661))
+/// the authority-layer funnel refuses an unproven named caller under
+/// `enforce` with zero keys enrolled, before any handler runs.
 #[must_use]
 pub fn enforce_for_request(
     enrolled: &EnrolledAgentKeys,
@@ -736,17 +738,15 @@ pub fn enforce_for_request(
 /// #3155 (v1.0.0, security) — boot-time verdict on whether an `enforce`
 /// identity gate is actually ARMED.
 ///
-/// [`enforce_for_request`] returns `None` on an EMPTY enrolled map in every
-/// mode, and that is deliberate (the #1985 unsatisfiable-default trap: an
-/// `enforce` posture that bricked every named caller when nobody COULD be
-/// key-attested would be worse than useless). The defect #3155 closes is that
-/// an operator who DELIBERATELY selected `enforce` got no signal whatsoever
-/// that the control was disarmed — no boot WARN, no readiness flag — so a
-/// deployment could believe it was refusing spoofed `X-Agent-Id` headers while
-/// serving every one of them `200`.
+/// [`enforce_for_request`] (the per-handler gate) returns `None` on an EMPTY
+/// enrolled map in every mode. Since #9341 (3-agent vote (71472661) B-1) the
+/// authority-layer funnel refuses an unproven named caller under `enforce`
+/// with zero keys enrolled too, so this posture serves only the anonymous
+/// principal and certificate-mapped callers. #3155 made the posture visible
+/// at boot; the verdict now says what the posture does.
 ///
-/// Returns `Some(reason)` only for the one silently-disarmed combination
-/// (`enforce` + zero enrolled per-agent keys). The caller decides severity by
+/// Returns `Some(reason)` only for the `enforce` + zero enrolled per-agent
+/// keys combination. The caller decides severity by
 /// posture: WARN under the default (this changes NO request-path behaviour and
 /// must not silently tighten a documented contract), REFUSE under `asi-hard`,
 /// whose contract is that no security control may be disabled. Pure, so the
@@ -757,13 +757,12 @@ pub fn inert_enforce_boot_reason(mode: HttpIdentityMode, enrolled_count: usize) 
         return None;
     }
     Some(format!(
-        "{}=enforce is set but ZERO per-agent api-keys are enrolled, so the identity gate \
-         is INERT: every IDOR-sensitive read/mutate and every admin request is served on a \
-         self-asserted X-Agent-Id header exactly as it would be with the gate off. \
-         Enforcement engages only once at least one per-agent key exists (#1985 — an \
-         enforce posture that refused every caller when nobody could be key-attested would \
-         brick the deployment). Enrol keys with `ai-memory agents bind-api-key <agent-id>`, \
-         or set {}=advisory to match the posture you actually have (#3155).",
+        "{}=enforce is set but ZERO per-agent api-keys are enrolled, so no caller can prove \
+         a named identity with a key: every request that names a principal (X-Agent-Id) \
+         without a mapped client certificate is refused 403 attested_identity_required, and \
+         only the anonymous principal (which owns nothing) is served (#9341). Enrol keys \
+         with `ai-memory agents bind-api-key <agent-id>`, map client certificates, or set \
+         {}=advisory to serve and report named callers instead (#3155).",
         crate::config::ENV_HTTP_ATTESTED_IDENTITY,
         crate::config::ENV_HTTP_ATTESTED_IDENTITY,
     ))

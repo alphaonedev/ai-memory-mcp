@@ -479,8 +479,15 @@ pub async fn handle_reflect_http(
     // deployment) and the PR's inert-out-of-the-box guarantee. Under an
     // enrolled posture the binding stays ACTIVE and still refuses the #2140
     // no-header + body-`agent_id:<victim>` forge vector.
+    //
+    // #9341 B-1 (3-agent vote (71472661)): under Enforce the binding is
+    // ACTIVE with zero keys enrolled too. The funnel refuses an unproven
+    // HEADER name in every Enforce state; a body name is the same claim, and
+    // the anonymous caller owns nothing, so it may not author as `<victim>`.
     let mut body = body;
-    if !app.enrolled_agent_keys.is_empty() {
+    if !app.enrolled_agent_keys.is_empty()
+        || app.http_identity_mode == crate::config::HttpIdentityMode::Enforce
+    {
         let body_agent = body.get("agent_id").and_then(Value::as_str);
         let caller =
             match crate::handlers::parity::resolve_caller_agent_id(body_agent, &headers, None) {
