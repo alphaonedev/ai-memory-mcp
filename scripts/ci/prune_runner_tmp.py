@@ -62,6 +62,55 @@ MIN_PYTHON = (3, 12)
 EXIT_OK = 0
 EXIT_ERROR = 1
 PROG = "prune_runner_tmp"
+VERSION_REFUSAL_MAX_CHARS = 1000  # workflow_annotation.MAX_ANNOTATION_CHARS: the whole line, escapes included
+VERSION_REFUSAL_CUT_MARK = "..."  # workflow_annotation.ANNOTATION_CUT_MARK
+
+
+def python_refusal(version_info):
+    """Return the refusal text when the interpreter is older than MIN_PYTHON, else None."""
+    if tuple(version_info[:2]) < MIN_PYTHON:
+        found = ".".join(str(part) for part in version_info[:3])
+        wanted = ".".join(str(part) for part in MIN_PYTHON)
+        return f"python {found} is older than {wanted}"
+    return None
+
+
+def version_text(text):
+    """``workflow_annotation.safe_value`` restated for the version refusal, which runs before that module is loaded.
+
+    Backslash doubles; ``%``, every ``:``, C0/C1 controls and DEL become ``\\xNN``; surrogates and U+2028/9 become
+    ``\\uNNNN``; every other character stays. A test pins it byte-equal to ``safe_value`` over every code point.
+    """
+    pieces = []
+    for char in str(text):
+        code = ord(char)
+        if char == "\\":
+            pieces.append("\\\\")
+        elif char in "%:" or code < 0x20 or 0x7F <= code <= 0x9F:
+            pieces.append("\\x%02x" % code)
+        elif 0xD800 <= code <= 0xDFFF or code in (0x2028, 0x2029):
+            pieces.append("\\u%04x" % code)
+        else:
+            pieces.append(char)
+    return "".join(pieces)
+
+
+def version_refusal_annotation(reason):
+    """The version refusal's annotation, byte-equal to the shared module's ``annotation``/``render`` line, built without it."""
+    # the fixed text is annotation("warning", render("{prog}: refused: {reason}", ...), title=f"{PROG} refused")
+    line = "::warning title=prune_runner_tmp refused::prune_runner_tmp: refused: " + version_text(reason)
+    if len(line) > VERSION_REFUSAL_MAX_CHARS:
+        line = line[: VERSION_REFUSAL_MAX_CHARS - len(VERSION_REFUSAL_CUT_MARK)] + VERSION_REFUSAL_CUT_MARK
+    return line
+
+
+# The floor check runs before the shared module is loaded and before any name lookup but sys (ruling 598d069e):
+# below MIN_PYTHON nothing else of this file runs.
+if __name__ == "__main__" and python_refusal(sys.version_info) is not None:
+    sys.stderr.write(f"{PROG}: refused: {python_refusal(sys.version_info)}\n")
+    sys.stdout.write(version_refusal_annotation(python_refusal(sys.version_info)) + "\n")
+    sys.exit(EXIT_OK)
+
 SHARED_MODULE_FILE = "workflow_annotation.py"
 SHARED_MODULE_USED = ("safe_value", "render", "join", "annotation")  # every name this script takes from it
 LOAD_CANNOT_READ = "cannot be read"
@@ -73,12 +122,12 @@ def load_shared_module(script_path):
     """Return ``(module, None)`` for the shared module next to ``script_path``'s real file, else ``(None, cause)``.
 
     The module is read from that one file and run in a fresh module object that is never put in ``sys.modules``:
-    no import statement (the floor check below precedes every import except sys, pinned by a test), no finder and
+    no import statement (the floor check above precedes every import except sys, pinned by a test), no finder and
     no ``sys.path`` lookup, nothing added to ``sys.path``. A module of the same name planted in the cwd, TMPDIR or
     PYTHONPATH, next to a symlink to this script, or already imported, is never the code this deleting tool runs.
-    It parses on old interpreters, so the version refusal below can still print through it (#9365).
+    It runs only after the floor check (#9365, ruling 598d069e), where os is a frozen module.
     """
-    paths = (sys.modules.get("os") or __import__("os")).path  # os is loaded before any script runs (frozen)
+    paths = (sys.modules.get("os") or __import__("os")).path  # at or above the floor os is frozen (since 3.11)
     try:
         path = paths.join(paths.dirname(paths.realpath(script_path)), SHARED_MODULE_FILE)
         with open(path, "rb") as handle:
@@ -119,25 +168,11 @@ if __name__ == "__main__" and wa is None:
     sys.exit(load_refused(sys.stdout, sys.stderr))
 
 
-def python_refusal(version_info):
-    """Return the refusal text when the interpreter is older than MIN_PYTHON, else None."""
-    if tuple(version_info[:2]) < MIN_PYTHON:
-        found = ".".join(str(part) for part in version_info[:3])
-        wanted = ".".join(str(part) for part in MIN_PYTHON)
-        return f"python {found} is older than {wanted}"
-    return None
-
-
 def refusal_annotation(reason):
     """The workflow annotation for a refusal; ``reason`` is the raw text (a ``Refusal`` gives its ``raw``)."""
     raw = getattr(reason, "raw", reason)
     return wa.annotation("warning", wa.render("{prog}: refused: {reason}", prog=PROG, reason=raw), title=f"{PROG} refused")
 
-
-if __name__ == "__main__" and python_refusal(sys.version_info) is not None:
-    sys.stderr.write(f"{PROG}: refused: {python_refusal(sys.version_info)}\n")
-    sys.stdout.write(refusal_annotation(python_refusal(sys.version_info)) + "\n")
-    sys.exit(EXIT_OK)
 
 import argparse  # noqa: E402  (the floor check above must run before anything newer is needed)
 import errno  # noqa: E402

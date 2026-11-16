@@ -52,8 +52,11 @@ CI_DIR = REPO / "scripts" / "ci"
 SCRATCH_ROOT = REPO / ".local-runs" / "ci-annotation-escape-9365"
 SCAN_ROOTS = (REPO / "scripts", REPO / ".github")
 SHARED_MODULE_NAME = "workflow_annotation.py"
-# single_line is the base-selector's own copy of env_file_value (see test_single_line_matches_env_file_value_9365)
-SHARED_FIELD_FUNCTIONS = frozenset({"safe_text", "property_value", "annotation", "log_line", "env_file_value", "single_line"})
+# single_line is the base-selector's own copy of env_file_value (see test_single_line_matches_env_file_value_9365);
+# version_text is prune_runner_tmp's own copy of safe_value for the version refusal, which runs before the shared
+# module is loaded (see test_local_version_escape_equals_safe_value_for_every_code_point_9365)
+SHARED_FIELD_FUNCTIONS = frozenset({"safe_text", "property_value", "annotation", "log_line", "env_file_value", "single_line",
+                                    "version_text"})
 COMMAND_RE = re.compile(r"(?m)^::[a-z][a-z-]*")
 HEREDOC_RE = re.compile(r"python3?[^\n<]*<<-?\s*'?(\w+)'?[^\n]*\n(.*?)\n\s*\1\s*$", re.S | re.M)
 
@@ -980,10 +983,9 @@ class PruneFloorOrder(unittest.TestCase):
         self.assertTrue(dunder, "the os fallback is kept behind the floor (ruling 598d069e), not removed")
         late = [line for line in loads + dunder if line <= floor.end_lineno]
         self.assertEqual(late, [], f"floor check ends at line {floor.end_lineno}; these run before it: {late}")
-        for node in tree.body[:tree.body.index(floor)]:
-            for inner in ast.walk(node):
-                self.assertFalse(isinstance(inner, ast.Attribute) and ast.unparse(inner).startswith("wa."),
-                                 f"line {inner.lineno}: the version refusal path uses the shared module")
+        early = [inner.lineno for node in tree.body[:tree.body.index(floor) + 1] for inner in ast.walk(node)
+                 if isinstance(inner, ast.Name) and inner.id == "wa"]
+        self.assertEqual(early, [], "the version refusal path uses the shared module at these lines")
 
     def test_version_refusal_bytes_match_0f1ec1b7_with_and_without_the_sibling_9365(self):
         for sibling in ("real", "absent"):
