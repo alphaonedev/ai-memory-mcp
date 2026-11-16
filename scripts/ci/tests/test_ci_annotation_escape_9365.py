@@ -508,5 +508,363 @@ class TemplateRendering(unittest.TestCase):
         self.assertEqual(shared.join(", ", [inner, "x:y"]), "a\\\\b, x\\x3ay")
 
 
+# ---------------------------------------------------------------------------------------------------------------
+# Load invariant (#9365 load lane): a script runs exactly the ``workflow_annotation.py`` next to its own real file.
+#
+# Class: a tool (here first of all a deleting tool) loads code by NAME through a search path. Invariant for all
+# inputs: whatever the cwd, TMPDIR, PYTHONPATH, a relative or symlinked invocation path, the module the script runs
+# is the file next to the script's real path; for prune_runner_tmp a sibling that is absent, unreadable or fails to
+# load is one loud refusal (exit 0, one fixed ``::warning`` line built without the module) that prunes nothing.
+# A module of the same name already in ``sys.modules`` cannot reach a subprocess, so the subprocess cells do not
+# model it; the in-process cells below pin that the load neither reads nor writes ``sys.modules``/``sys.path``.
+# decision: cells live in this file over test_prune_runner_tmp_8634.py because that file's diff against 32eca860
+# stays empty and the class (load by name) spans every 9365 sibling, not only the prune tool.
+# ---------------------------------------------------------------------------------------------------------------
+
+PRUNE_SCRIPT_NAME = "prune_runner_tmp.py"
+REAL_RUNNER_ROOT_LINE = 'F2_RUNNER_ROOT = "/ai-scratch/runner-tmp"'
+REAL_RUNNER_ROOT_LITERAL = '"/ai-scratch/runner-tmp"'
+FIXTURE_RUNNER_NAME = "runner-1"
+OLD_ENTRY_AGE_SECS = 3 * 86400
+HOSTILE_ENTRY_NAME = "old::entry%0A"  # escaped only by the real safe_value; the plant's identity escaper leaves it
+LOAD_REFUSAL_ANNOTATION = ("::warning title=prune_runner_tmp refused::prune_runner_tmp: refused: shared module "
+                           "workflow_annotation.py next to the script cannot be loaded")
+LOAD_REFUSAL_STDERR = ("prune_runner_tmp: refused: shared module workflow_annotation.py next to the script cannot be "
+                       "loaded ({cause})")
+PRUNE_USED_NAMES = ("safe_value", "render", "join", "annotation")
+PLANT_EXIT_CODE = 97
+EXIT_OK_CODE = 0  # every prune refusal exits 0 (ruling f23a9ae4)
+
+
+def plant_source(marker, functional):
+    """A planted ``workflow_annotation``: it records that it ran; functional plants also escape nothing."""
+    head = f"with open({str(marker)!r}, 'a') as _marker_file:\n    _marker_file.write('planted module ran\\n')\n"
+    if not functional:
+        return head + f"raise SystemExit({PLANT_EXIT_CODE})\n"
+    return head + textwrap.dedent("""\
+        def safe_value(text):
+            return str(text)
+        safe_text = safe_value
+        def render(template, **values):
+            return template.format(**values)
+        def join(separator, parts):
+            return separator.join(str(part) for part in parts)
+        def annotation(command, message, max_chars=1000, **properties):
+            props = ",".join(f"{key}={value}" for key, value in properties.items())
+            return f"::{command}{' ' + props if props else ''}::{message}"
+        def property_value(text):
+            return str(text)
+        def log_line(text):
+            return str(text)
+        def env_file_value(value):
+            return str(value)
+        def end_group_line():
+            return "::endgroup::"
+        """)
+
+
+def set_old(path):
+    stamp = time.time() - OLD_ENTRY_AGE_SECS
+    os.utime(path, (stamp, stamp), follow_symlinks=False)
+
+
+class PruneFixture:
+    """A fixture checkout (scripts/ci) whose prune copy only knows the fixture root, plus canaries."""
+
+    def __init__(self, base, sibling="real"):
+        self.base = base
+        self.root = base / "root"
+        self.runner = self.root / FIXTURE_RUNNER_NAME
+        self.runner.mkdir(parents=True)
+        self.inside = self.runner / "old-canary"
+        self.hostile = self.runner / HOSTILE_ENTRY_NAME
+        self.outside = self.root / "outside-canary"
+        for canary in (self.inside, self.hostile, self.outside):
+            canary.write_text("canary\n")
+            set_old(canary)
+        self.repo = base / "repo"
+        self.ci = self.repo / "scripts" / "ci"
+        self.ci.mkdir(parents=True)
+        source = (CI_DIR / PRUNE_SCRIPT_NAME).read_text(encoding="utf-8")
+        if source.count(REAL_RUNNER_ROOT_LINE) != 1:
+            raise AssertionError("the prune script's root line moved; the fixture refuses to run it")
+        source = source.replace(REAL_RUNNER_ROOT_LINE, f"F2_RUNNER_ROOT = {str(self.root)!r}")
+        if REAL_RUNNER_ROOT_LITERAL in source:  # HARD SAFETY: the copy must not know any real runner root
+            raise AssertionError("the prune copy still names the real runner root")
+        self.script = self.ci / PRUNE_SCRIPT_NAME
+        self.script.write_text(source, encoding="utf-8")
+        self.sibling = self.ci / SHARED_MODULE_NAME
+        if sibling == "real":
+            shutil.copyfile(CI_DIR / SHARED_MODULE_NAME, self.sibling)
+        self.cwd = base / "cwd"
+        self.cwd.mkdir()
+        self.plants = base / "plants"
+        self.plants.mkdir()
+        self.marker = base / "planted-module-ran"
+
+    def run(self, argv0=None, args=("--dry-run",), cwd=None, pythonpath=None, isolated=False, flags=None):
+        env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "LANG": "C.UTF-8", "TMPDIR": str(self.runner),
+               "PYTHONDONTWRITEBYTECODE": "1"}
+        if pythonpath is not None:
+            env["PYTHONPATH"] = str(pythonpath)
+        flags = list(flags) if flags is not None else ["-I"] if isolated else []
+        proc = subprocess.run([sys.executable, *flags, str(argv0 or self.script), *args], capture_output=True,
+                              env=env, cwd=str(cwd or self.cwd), timeout=SUBPROCESS_TIMEOUT_SECS, check=False)
+        return (proc.returncode, proc.stdout.decode("utf-8", "surrogateescape"),
+                proc.stderr.decode("utf-8", "surrogateescape"))
+
+    def plant(self, directory, functional=True):
+        path = Path(directory) / SHARED_MODULE_NAME
+        path.write_text(plant_source(self.marker, functional), encoding="utf-8")
+        return path
+
+    def canaries_present(self):
+        return all(path.exists() for path in (self.inside, self.hostile, self.outside))
+
+
+class PruneLoadInvariant(unittest.TestCase):
+    """prune_runner_tmp runs only the sibling next to its real file; a failed load refuses and prunes nothing."""
+
+    def fixture(self, sibling="real"):
+        base = scratch_dir("prune-load")
+        self.addCleanup(shutil.rmtree, str(base), True)
+        return PruneFixture(base, sibling)
+
+    def assert_clean_dry_run(self, result, fix):
+        rc, out, err = result
+        self.assertEqual(rc, EXIT_OK_CODE, err[-2000:])
+        shared = load_module(CI_DIR / SHARED_MODULE_NAME, "workflow_annotation_9365_load_oracle")
+        self.assertNotEqual(shared.safe_value(HOSTILE_ENTRY_NAME), HOSTILE_ENTRY_NAME)
+        self.assertIn("would-remove " + shared.safe_value(HOSTILE_ENTRY_NAME), out.splitlines(), out[-2000:])
+        self.assertFalse(fix.marker.exists(), "the planted module ran")
+        self.assertTrue(fix.canaries_present())
+
+    def assert_plant_ignored(self, fix, plant_dir, **run):
+        """Clean run, then the same run with a functional plant: no marker, byte-identical output."""
+        placeholder = Path(plant_dir) / SHARED_MODULE_NAME
+        placeholder.write_text("# inert placeholder of the planted module, same name and age class\n")
+        clean = fix.run(**run)
+        self.assert_clean_dry_run(clean, fix)
+        fix.plant(plant_dir)
+        planted = fix.run(**run)
+        self.assertFalse(fix.marker.exists(), "the planted module ran: " + planted[1][-2000:])
+        self.assertEqual(planted, clean)
+
+    def test_plant_in_cwd_is_never_loaded_9365(self):
+        fix = self.fixture()
+        self.assert_plant_ignored(fix, fix.cwd)
+
+    def test_plant_in_tmpdir_is_never_loaded_9365(self):
+        fix = self.fixture()
+        self.assert_plant_ignored(fix, fix.runner)
+
+    def test_plant_on_pythonpath_is_never_loaded_9365(self):
+        fix = self.fixture()
+        self.assert_plant_ignored(fix, fix.plants, pythonpath=fix.plants)
+
+    def test_relative_invocation_from_script_dir_loads_the_sibling_9365(self):
+        fix = self.fixture()
+        self.assert_plant_ignored(fix, fix.plants, argv0=PRUNE_SCRIPT_NAME, cwd=fix.ci, pythonpath=fix.plants)
+
+    def test_relative_invocation_from_repo_root_with_cwd_plant_9365(self):
+        fix = self.fixture()
+        self.assert_plant_ignored(fix, fix.repo, argv0="scripts/ci/" + PRUNE_SCRIPT_NAME, cwd=fix.repo,
+                                  pythonpath=fix.repo)
+
+    def test_workflow_form_isolated_with_cwd_plant_9365(self):
+        fix = self.fixture()
+        self.assert_plant_ignored(fix, fix.cwd, isolated=True)
+
+    def test_symlinked_invocation_loads_only_the_real_files_sibling_9365(self):
+        # decision: the real file's directory is the only source over a refusal for a symlinked path because the
+        # action may legitimately reach the script through a symlinked checkout and the real sibling is the vetted one
+        fix = self.fixture()
+        link_dir = fix.base / "linkdir"
+        link_dir.mkdir()
+        (link_dir / PRUNE_SCRIPT_NAME).symlink_to(fix.script)
+        for label, argv0, cwd in (("absolute link", link_dir / PRUNE_SCRIPT_NAME, fix.cwd),
+                                  ("relative link", PRUNE_SCRIPT_NAME, link_dir)):
+            with self.subTest(label):
+                fix.marker.unlink(missing_ok=True)
+                self.assert_plant_ignored(fix, link_dir, argv0=argv0, cwd=cwd)
+                (link_dir / SHARED_MODULE_NAME).unlink()
+
+    def test_isolated_and_no_site_runs_match_the_plain_run_9365(self):
+        """b29 ruling 3c1d3cbb: ``-I`` and ``-S`` behave as the plain run (exit, lines, pruned set); cwd plant inert."""
+        results = {}
+        for label, flags in (("plain", []), ("-I", ["-I"]), ("-S", ["-S"])):
+            fix = self.fixture()
+            fix.plant(fix.cwd)
+            rc, out, err = fix.run(args=(), flags=flags)  # a real prune of the fixture runner dir
+            self.assertFalse(fix.marker.exists(), f"{label}: the planted module ran")
+            left = sorted(path.relative_to(fix.root).as_posix() for path in fix.root.rglob("*"))
+            results[label] = (rc, out.replace(str(fix.base), "<base>").splitlines(), left)
+        self.assertEqual(results["plain"][0], EXIT_OK_CODE, results["plain"])
+        self.assertEqual(results["plain"][2], sorted([FIXTURE_RUNNER_NAME, "outside-canary"]), "the old entries are pruned")
+        self.assertEqual(results["-I"], results["plain"])
+        self.assertEqual(results["-S"], results["plain"])
+
+    def assert_load_refusal(self, fix, cause, **run):
+        rc, out, err = fix.run(args=(), **run)  # a real prune: a refusal that went on would remove the canaries
+        self.assertEqual(rc, EXIT_OK_CODE, err[-2000:])
+        self.assertEqual(out, LOAD_REFUSAL_ANNOTATION + "\n")
+        self.assertEqual(err, LOAD_REFUSAL_STDERR.format(cause=cause) + "\n")
+        self.assertTrue(fix.canaries_present(), "the refusal pruned")
+        self.assertFalse(fix.marker.exists(), "the planted module ran")
+        self.assertEqual(sorted(p.name for p in fix.runner.iterdir()), sorted([fix.inside.name, fix.hostile.name]))
+
+    def test_absent_sibling_is_a_loud_refusal_9365(self):
+        fix = self.fixture(sibling="absent")
+        self.assert_load_refusal(fix, "cannot be read")
+        self.assert_load_refusal(fix, "cannot be read", isolated=True)
+
+    def test_absent_sibling_with_pythonpath_plant_is_a_refusal_not_the_plant_9365(self):
+        fix = self.fixture(sibling="absent")
+        fix.plant(fix.plants)
+        fix.plant(fix.cwd)
+        self.assert_load_refusal(fix, "cannot be read", pythonpath=fix.plants)
+
+    def test_unreadable_sibling_is_a_loud_refusal_9365(self):
+        fix = self.fixture()
+        fix.sibling.chmod(0)
+        self.addCleanup(fix.sibling.chmod, 0o600)
+        if os.access(str(fix.sibling), os.R_OK):
+            self.skipTest("running as a user who reads mode-0 files")
+        self.assert_load_refusal(fix, "cannot be read")
+
+    def test_sibling_that_is_a_directory_is_a_loud_refusal_9365(self):
+        fix = self.fixture(sibling="absent")
+        fix.sibling.mkdir()
+        self.assert_load_refusal(fix, "cannot be read")
+
+    def test_sibling_raising_at_load_is_a_loud_refusal_9365(self):
+        bodies = {
+            "exception": "raise RuntimeError('boom')\n",
+            "system exit 0": "import sys\nsys.exit(0)\n",
+            "syntax error": "def broken(:\n",
+            "null byte": "x = 1\0\n",
+            "non utf-8": "x = '\udcff'\n",
+        }
+        for label, body in bodies.items():
+            with self.subTest(label):
+                fix = self.fixture(sibling="absent")
+                fix.sibling.write_bytes(body.encode("utf-8", "surrogateescape"))
+                self.assert_load_refusal(fix, "raised while loading")
+
+    def test_sibling_missing_a_used_attribute_is_a_loud_refusal_9365(self):
+        real = (CI_DIR / SHARED_MODULE_NAME).read_text(encoding="utf-8")
+        for name in PRUNE_USED_NAMES:
+            with self.subTest(name):
+                fix = self.fixture(sibling="absent")
+                fix.sibling.write_text(real + f"\ndel {name}\n", encoding="utf-8")
+                self.assert_load_refusal(fix, "lacks " + name)
+
+    def test_load_leaves_sys_path_and_sys_modules_alone_in_process_9365(self):
+        fix = self.fixture()
+        fix.plant(fix.plants)
+        before_path, before_modules = list(sys.path), set(sys.modules)
+        spec = importlib.util.spec_from_file_location("prune_runner_tmp_load_9365", str(fix.script))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        self.assertEqual(sys.path, before_path)
+        self.assertEqual(set(sys.modules) - before_modules, set())
+        self.assertEqual(os.path.realpath(module.wa.__file__), os.path.realpath(str(fix.sibling)))
+        self.assertFalse(fix.marker.exists())
+
+    def test_main_in_process_with_absent_sibling_refuses_and_prunes_nothing_9365(self):
+        fix = self.fixture(sibling="absent")
+        spec = importlib.util.spec_from_file_location("prune_runner_tmp_absent_9365", str(fix.script))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        out, err = io.StringIO(), io.StringIO()
+        rc = module.main([], {"TMPDIR": str(fix.runner)}, out, err)
+        self.assertEqual(rc, EXIT_OK_CODE)
+        self.assertEqual(out.getvalue(), LOAD_REFUSAL_ANNOTATION + "\n")
+        self.assertEqual(err.getvalue(), LOAD_REFUSAL_STDERR.format(cause="cannot be read") + "\n")
+        self.assertTrue(fix.canaries_present())
+
+
+# The 9365 siblings: every script whose sys.path/import lines for the shared module the 9365 commits added, with
+# the sibling modules (loaded by name, present at base 32eca860) its fixture copy needs.
+SIBLING_SCRIPTS = {
+    "scripts/ci-sweep-target.py": (),
+    "scripts/ci/ci_full_nightly.py": (),
+    "scripts/ci/host_semaphore.py": (),
+    "scripts/ci/impact/base_sha.py": (),
+    "scripts/ci/load_gate.py": (),
+    "scripts/ci/partition_test_binaries.py": (),
+    "scripts/ci/pg_env_preflight.py": (),
+    "scripts/ci/shared_cargo_target.py": (),
+    "scripts/ci/tier_cred_preflight.py": ("scripts/ci/ensure-age-extension.py",),
+    "scripts/ci/pg_isolate_split.py": ("scripts/ci/partition_test_binaries.py",),
+    "scripts/ci/prune_runner_artifacts.py": ("scripts/ci/shared_cargo_target.py",),
+    "scripts/ci/sccache_env.py": ("scripts/ci/shared_cargo_target.py",),
+}
+SHARED_MODULE_PATH = "scripts/ci/" + SHARED_MODULE_NAME
+
+
+class SiblingLoadInvariant(unittest.TestCase):
+    """Every 9365 sibling loads the shared module by its file path next to the real script, never by name."""
+
+    def layout(self, rel_script, with_shared):
+        base = scratch_dir("sibling-load")
+        self.addCleanup(shutil.rmtree, str(base), True)
+        repo = base / "repo"
+        for rel in (rel_script, *SIBLING_SCRIPTS.get(rel_script, ()), *((SHARED_MODULE_PATH,) if with_shared else ())):
+            (repo / rel).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(REPO / rel, repo / rel)
+        plants = base / "plants"
+        plants.mkdir()
+        marker = base / "planted-module-ran"
+        (plants / SHARED_MODULE_NAME).write_text(plant_source(marker, functional=False), encoding="utf-8")
+        return base, repo, plants, marker
+
+    @staticmethod
+    def run_help(argv0, cwd, pythonpath):
+        env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "LANG": "C.UTF-8", "PYTHONPATH": str(pythonpath),
+               "PYTHONDONTWRITEBYTECODE": "1", "TMPDIR": str(cwd)}
+        proc = subprocess.run([sys.executable, str(argv0), "--help"], capture_output=True, env=env, cwd=str(cwd),
+                              timeout=SUBPROCESS_TIMEOUT_SECS, check=False)
+        return proc.returncode, proc.stdout.decode("utf-8", "replace"), proc.stderr.decode("utf-8", "replace")
+
+    def test_absent_shared_module_never_falls_through_to_a_pythonpath_plant_9365(self):
+        for rel in SIBLING_SCRIPTS:
+            with self.subTest(rel):
+                base, repo, plants, marker = self.layout(rel, with_shared=False)
+                rc, out, err = self.run_help(repo / rel, plants, plants)
+                self.assertFalse(marker.exists(), f"{rel} ran the planted module (rc {rc})")
+                self.assertNotEqual(rc, PLANT_EXIT_CODE)
+                self.assertNotEqual(rc, EXIT_OK_CODE, "a missing shared module is a loud failure")
+
+    def test_symlinked_invocation_never_loads_a_plant_next_to_the_link_9365(self):
+        for rel in SIBLING_SCRIPTS:
+            with self.subTest(rel):
+                base, repo, plants, marker = self.layout(rel, with_shared=True)
+                link = plants / Path(rel).name
+                link.symlink_to(repo / rel)
+                rc, out, err = self.run_help(link, plants, base)
+                self.assertFalse(marker.exists(), f"{rel} through a symlink ran the planted module (rc {rc})")
+                self.assertEqual(rc, EXIT_OK_CODE, err[-2000:])
+
+    def test_pg_isolated_binary_loads_by_path_and_leaves_sys_path_alone_9365(self):
+        rel = "scripts/test/pg_isolated_binary.py"
+        base, repo, plants, marker = self.layout(rel, with_shared=False)
+        spec = importlib.util.spec_from_file_location("pg_isolated_binary_load_9365", str(repo / rel))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        sys.path.insert(0, str(plants))  # what a PYTHONPATH plant looks like in-process
+        try:
+            before_path, before_modules = list(sys.path), set(sys.modules)
+            with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(OSError):
+                module._emit("NAME=value")
+            self.assertEqual(sys.path, before_path)
+            self.assertNotIn(SHARED_MODULE_NAME[:-3], set(sys.modules) - before_modules)
+        finally:
+            sys.path.remove(str(plants))
+            if marker.exists():  # the plant ran (red): drop whatever it left so later cells see the real module
+                sys.modules.pop(SHARED_MODULE_NAME[:-3], None)
+        self.assertFalse(marker.exists(), "pg_isolated_binary ran the planted module")
+
+
 if __name__ == "__main__":
     unittest.main()
