@@ -482,5 +482,31 @@ class ScriptBehaviour(CommandAssertions):
                 self.assertEqual(len(lines), 2, lines)
 
 
+class TemplateRendering(unittest.TestCase):
+    """``render`` / ``join`` / ``SafeText``: the template's own colons stay, every value colon is escaped (#9365, #8634)."""
+
+    HOSTILE_VALUES = ("a:b", "::error::x", ":::", "%0A", "line\nbreak", "back\\slash", "\udc80")
+
+    def test_render_escapes_every_value_and_keeps_the_template_9365(self):
+        shared = load_module(CI_DIR / SHARED_MODULE_NAME, "workflow_annotation_9365_render")
+        for value in self.HOSTILE_VALUES:
+            with self.subTest(value=value):
+                text = shared.render("prog: refused: {value}", value=value)
+                self.assertIsInstance(text, shared.SafeText)
+                self.assertTrue(text.startswith("prog: refused: "), text)
+                tail = text[len("prog: refused: "):]
+                self.assertNotIn(":", tail)
+                self.assertNotIn("\n", tail)
+                self.assertEqual(tail, shared.safe_value(value))
+
+    def test_plain_str_is_escaped_and_safetext_is_not_escaped_twice_9365(self):
+        shared = load_module(CI_DIR / SHARED_MODULE_NAME, "workflow_annotation_9365_twice")
+        inner = shared.render("{v}", v="a\\b")
+        self.assertEqual(shared.annotation("warning", inner), "::warning::a\\\\b")
+        self.assertEqual(shared.annotation("warning", "a\\b"), "::warning::a\\\\b")
+        self.assertEqual(shared.render("{v}", v=inner), inner)
+        self.assertEqual(shared.join(", ", [inner, "x:y"]), "a\\\\b, x\\x3ay")
+
+
 if __name__ == "__main__":
     unittest.main()
