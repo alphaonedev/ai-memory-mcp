@@ -58,7 +58,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Dict, IO, List, Optional, Set, Tuple
+from typing import Any, Dict, IO, List, Optional, Set, Tuple
 from urllib.parse import parse_qsl, unquote, urlsplit
 
 URL_VAR = 'AI_MEMORY_TEST_POSTGRES_URL'
@@ -149,9 +149,22 @@ def _out(line: str) -> None:
         print(line, flush=True)
 
 
+_ANNOTATION_MODULE: Optional[Any] = None
+
+
+def _wa() -> Any:
+    """The shared workflow-command module (#9365), loaded on first use from ``scripts/ci`` next to this directory."""
+    global _ANNOTATION_MODULE
+    if _ANNOTATION_MODULE is None:
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'ci'))
+        import workflow_annotation
+        _ANNOTATION_MODULE = workflow_annotation
+    return _ANNOTATION_MODULE
+
+
 def _emit(line: str) -> None:
-    """One ``KEY=value`` line for ``$GITHUB_ENV`` (stdout, nothing else)."""
-    print(line, flush=True)
+    """One ``KEY=value`` line for ``$GITHUB_ENV`` (stdout, nothing else; never a second entry)."""
+    print(_wa().env_file_value(line), flush=True)
 
 
 def log(msg: str) -> None:
@@ -1077,14 +1090,14 @@ class Runner:
     def _report(self, label: str, rc: int, log_path: Path) -> None:
         if rc == 0:
             results = [ln for ln in _tail(log_path, 10_000) if 'test result:' in ln]
-            _out('[pg_isolated_binary] PASS %s (log %s)' % (label, log_path))
+            _out(_wa().log_line('[pg_isolated_binary] PASS %s (log %s)' % (label, log_path)))
             for line in results:
-                _out('  ' + line)
+                _out(_wa().log_line('  ' + line))
             return
-        _out('::group::FAIL %s (exit %d), last %d lines of %s' % (label, rc, LOG_TAIL_LINES, log_path))
+        _out(_wa().annotation('group', 'FAIL %s (exit %d), last %d lines of %s' % (label, rc, LOG_TAIL_LINES, log_path)))
         for line in _tail(log_path, LOG_TAIL_LINES):
-            _out(line)
-        _out('::endgroup::')
+            _out(_wa().log_line(line))
+        _out(_wa().end_group_line())
 
     def run_one(self, target: List[str], isolate: bool = True) -> int:
         """One binary: mint + hold a clone, cargo test it, release, drop."""
@@ -1228,7 +1241,7 @@ def _cmd_run(args: argparse.Namespace, url: str) -> int:
     available = connection_budget(url)[3]
     width = width_for(available, args.jobs)
     if width < clamp_jobs(args.jobs):
-        log('::warning::only %d free connection slots: width degraded to %d' % (available, width))
+        log(_wa().annotation('warning', 'only %d free connection slots: width degraded to %d' % (available, width)))
     env = dict(os.environ)
     env[URL_VAR] = url
     runner = Runner(cargo, args.test_arg, env, tpl, run_id, url, args.log_dir or _default_log_dir(), width)

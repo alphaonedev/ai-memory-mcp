@@ -52,7 +52,8 @@ CI_DIR = REPO / "scripts" / "ci"
 SCRATCH_ROOT = REPO / ".local-runs" / "ci-annotation-escape-9365"
 SCAN_ROOTS = (REPO / "scripts", REPO / ".github")
 SHARED_MODULE_NAME = "workflow_annotation.py"
-SHARED_FIELD_FUNCTIONS = frozenset({"safe_text", "property_value", "annotation", "log_line", "env_file_value"})
+# single_line is the base-selector's own copy of env_file_value (see test_single_line_matches_env_file_value_9365)
+SHARED_FIELD_FUNCTIONS = frozenset({"safe_text", "property_value", "annotation", "log_line", "env_file_value", "single_line"})
 COMMAND_RE = re.compile(r"(?m)^::[a-z][a-z-]*")
 HEREDOC_RE = re.compile(r"python3?[^\n<]*<<-?\s*'?(\w+)'?[^\n]*\n(.*?)\n\s*\1\s*$", re.S | re.M)
 
@@ -71,7 +72,7 @@ HOSTILE = {
     "percent": "100%25",
     "long_name": "n" * 4096,
     "non_utf8": os.fsdecode(b"bad\xff\xfe::x"),
-    "separators": "a ::error::b\x85::error::c",
+    "separators": "a\u2028::error::b\x85::error::c",
 }
 FILE_NAME_CORPUS = ("command", "raw_newline", "raw_cr", "colons", "percent", "non_utf8")
 
@@ -372,7 +373,7 @@ class ScriptBehaviour(CommandAssertions):
                     "--build-json", str(missing), "--serial-file", str(self.tmp / "s"),
                     "--out-dir", str(self.tmp / "o")])
                 self.assertEqual(rc, 2, err[-500:])
-                self.assert_commands(out + err, ["error"], oracle_escape(str(missing))[:200])
+                self.assert_commands(out + err, ["error"], oracle_escape(repr(str(missing))))  # the OSError text carries the repr
 
     def test_partition_test_binaries_error_9365(self):
         for key in FILE_NAME_CORPUS:
@@ -391,8 +392,8 @@ class ScriptBehaviour(CommandAssertions):
         for key in FILE_NAME_CORPUS:
             value = HOSTILE[key]
             with self.subTest(key):
-                home = self.tmp / ("home-" + key)
-                base = home / ("targets-" + value)
+                home = self.tmp / ("home-" + value)
+                base = home / ".cache" / "ai-memory-ci" / "cargo-target"
                 base.mkdir(parents=True)
                 work = home / "work"
                 work.mkdir(exist_ok=True)
@@ -458,6 +459,14 @@ class ScriptBehaviour(CommandAssertions):
                 out_file.write_text("")
                 nightly.write_output(str(out_file), {"conclusion": value})
                 self.assertEqual(len(out_file.read_text(errors="surrogateescape").splitlines()), 1)
+
+    def test_single_line_matches_env_file_value_9365(self):
+        common = load_module(CI_DIR / "impact" / "common.py", "impact_common_9365")
+        shared = load_module(CI_DIR / SHARED_MODULE_NAME, "workflow_annotation_9365")
+        for key, value in self.hostile_values():
+            with self.subTest(key):
+                self.assertEqual(common.single_line(value), shared.env_file_value(value))
+                self.assertEqual(len(common.single_line(value).splitlines()), 1)
 
     def test_shared_cargo_target_env_file_9365(self):
         for key in ("raw_newline", "raw_cr", "command"):

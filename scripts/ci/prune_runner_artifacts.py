@@ -57,6 +57,13 @@ import time
 from pathlib import Path
 
 import shared_cargo_target as shared
+import workflow_annotation as wa
+
+
+def log(text, file=None):
+    """One plain log line; an untrusted path in it can never start a workflow command or add a line (#9365)."""
+    print(wa.log_line(text), file=file)
+
 
 SECS_PER_DAY = 86400
 TEMP_DIR_NAME = "_temp"
@@ -103,7 +110,7 @@ def _protect_unresolvable_child(child):
     """Lexical protection for a protected-root child that does not resolve (#7284 S2)."""
     if child not in UNRESOLVABLE_WARNED:
         UNRESOLVABLE_WARNED.add(child)
-        print("protected root child unresolvable: %s" % child, file=sys.stderr)
+        log("protected root child unresolvable: %s" % child, file=sys.stderr)
     return Path(os.path.abspath(child))
 
 
@@ -209,7 +216,7 @@ def scan(work_root, workspace, protected_root, max_age_days, now):
         try:
             entries = sorted(workspace.iterdir())
         except OSError as err:
-            print("could not list %s: %s" % (workspace, err), file=sys.stderr)
+            log("could not list %s: %s" % (workspace, err), file=sys.stderr)
             entries = []
         for entry in entries:
             if not entry.name.startswith(TMP_PREFIX):
@@ -220,7 +227,7 @@ def scan(work_root, workspace, protected_root, max_age_days, now):
                 elif entry.is_dir():
                     found.append(entry)
             except OSError as err:
-                print("skipped unreadable %s: %s" % (entry, err), file=sys.stderr)
+                log("skipped unreadable %s: %s" % (entry, err), file=sys.stderr)
     temp_root = Path(work_root) / TEMP_DIR_NAME
     if temp_root.is_symlink():
         skipped.append(temp_root)
@@ -228,7 +235,7 @@ def scan(work_root, workspace, protected_root, max_age_days, now):
         try:
             entries = sorted(temp_root.iterdir())
         except OSError as err:
-            print("could not list %s: %s" % (temp_root, err), file=sys.stderr)
+            log("could not list %s: %s" % (temp_root, err), file=sys.stderr)
             entries = []
         for entry in entries:
             try:
@@ -237,11 +244,11 @@ def scan(work_root, workspace, protected_root, max_age_days, now):
                 elif entry.is_dir() and is_old(entry, max_age_days, now):
                     found.append(entry)
             except OSError as err:
-                print("skipped unreadable %s: %s" % (entry, err), file=sys.stderr)
+                log("skipped unreadable %s: %s" % (entry, err), file=sys.stderr)
     keep = []
     for path in found:
         if is_protected(path, protected_root):
-            print("skipped protected %s" % path)
+            log("skipped protected %s" % path)
         else:
             keep.append(path)
     return keep, skipped
@@ -406,14 +413,14 @@ def sweep_stale_evicting(base, now, dry_run=False):
             if entry.is_symlink() or not entry.is_dir() or entry.lstat().st_mtime > cutoff:
                 continue
             if dry_run:
-                print("would sweep stale %s" % entry)
+                log("would sweep stale %s" % entry)
                 continue
             shutil.rmtree(entry)
         except OSError as err:
-            print("could not sweep %s: %s" % (entry, err), file=sys.stderr)
+            log("could not sweep %s: %s" % (entry, err), file=sys.stderr)
             continue
         swept += 1
-        print("swept stale %s" % entry)
+        log("swept stale %s" % entry)
     return swept
 
 
@@ -434,11 +441,11 @@ def evict_idle_targets(evict_root, runner_name, home, idle_days, floor_gib, now,
     """
     problem = eviction_problem(evict_root, runner_name, home)
     if problem:
-        print("prune_runner_artifacts: skipping eviction: %s" % problem, file=sys.stderr)
+        log("prune_runner_artifacts: skipping eviction: %s" % problem, file=sys.stderr)
         return EXIT_OK
     base = resolve(evict_root)
     if not base.is_dir():
-        print("eviction summary: 0 evicted, root %s does not exist" % evict_root)
+        log("eviction summary: 0 evicted, root %s does not exist" % evict_root)
         return EXIT_OK
     cutoff = now - idle_days * SECS_PER_DAY
     busy_cutoff = now - BUSY_MTIME_MINUTES * SECS_PER_MINUTE
@@ -461,21 +468,21 @@ def evict_idle_targets(evict_root, runner_name, home, idle_days, floor_gib, now,
         if state["lock_timeout"]:
             return
         if path.is_symlink() or path.parent != base:
-            print("skipped unsafe %s" % path)
+            log("skipped unsafe %s" % path)
             return
         if dry_run:
             if is_busy(path):
                 state["busy"] += 1
-                print("skipped busy %s" % path)
+                log("skipped busy %s" % path)
                 return
-            print("would evict %s (%s)" % (path, reason))
+            log("would evict %s (%s)" % (path, reason))
             state["evicted"] += 1
             return
         renamed = base / ("%s%s-%d" % (EVICTING_PREFIX, path.name, os.getpid()))
         with shared.evict_lock(base, lock_timeout) as held:
             if not held:
                 state["lock_timeout"] = True
-                print("prune_runner_artifacts: skipping eviction: lock %s not taken within %s s"
+                log("prune_runner_artifacts: skipping eviction: lock %s not taken within %s s"
                       % (base / shared.EVICT_LOCK_NAME, lock_timeout), file=sys.stderr)
                 return
             # The decision is made again under the lock: a job start holds the
@@ -483,23 +490,23 @@ def evict_idle_targets(evict_root, runner_name, home, idle_days, floor_gib, now,
             # can appear in a target we are about to move.
             if path.is_symlink() or is_busy(path):
                 state["busy"] += 1
-                print("skipped busy %s" % path)
+                log("skipped busy %s" % path)
                 return
             try:
                 os.rename(path, renamed)
                 os.utime(renamed)
             except OSError as err:
                 state["failed"] += 1
-                print("could not evict %s: %s" % (path, err), file=sys.stderr)
+                log("could not evict %s: %s" % (path, err), file=sys.stderr)
                 return
         try:
             shutil.rmtree(renamed)
         except OSError as err:
             state["failed"] += 1
-            print("could not evict %s: %s" % (path, err), file=sys.stderr)
+            log("could not evict %s: %s" % (path, err), file=sys.stderr)
             return
         state["evicted"] += 1
-        print("evicted %s (%s)" % (path, reason))
+        log("evicted %s (%s)" % (path, reason))
 
     sweep_stale_evicting(base, now, dry_run=dry_run)
     remaining = []
@@ -507,7 +514,7 @@ def evict_idle_targets(evict_root, runner_name, home, idle_days, floor_gib, now,
         try:
             idle = newest_mtime(entry, newer_than=cutoff) <= cutoff
         except OSError as err:
-            print("skipped unreadable %s: %s" % (entry, err), file=sys.stderr)
+            log("skipped unreadable %s: %s" % (entry, err), file=sys.stderr)
             continue
         if idle:
             remove(entry, "idle over %d days" % idle_days)
@@ -519,7 +526,7 @@ def evict_idle_targets(evict_root, runner_name, home, idle_days, floor_gib, now,
             try:
                 ranked.append((newest_mtime(entry, max_entries=WALK_ENTRY_CAP), entry))
             except OSError as err:
-                print("skipped unreadable %s: %s" % (entry, err), file=sys.stderr)
+                log("skipped unreadable %s: %s" % (entry, err), file=sys.stderr)
         ranked.sort()
         for _, entry in ranked:
             if state["lock_timeout"]:
@@ -528,9 +535,9 @@ def evict_idle_targets(evict_root, runner_name, home, idle_days, floor_gib, now,
                 break
             remove(entry, "below the %d GiB free-space floor" % floor_gib)
         if not dry_run and free_bytes(base) < floor_bytes:
-            print("::warning::free space under %s is below the %d GiB floor and no idle "
-                  "sibling target is left to evict" % (base, floor_gib))
-    print("eviction summary: %d evicted, %d failed, %d busy skipped, %d GiB free (floor %d GiB)" % (
+            print(wa.annotation("warning", "free space under %s is below the %d GiB floor and no idle "
+                                "sibling target is left to evict" % (base, floor_gib)))
+    log("eviction summary: %d evicted, %d failed, %d busy skipped, %d GiB free (floor %d GiB)" % (
         state["evicted"], state["failed"], state["busy"],
         free_bytes(base) // BYTES_PER_GIB, floor_gib))
     return EXIT_OK
@@ -563,28 +570,28 @@ def prune_all(args):
         args.work_root, args.workspace, args.protected_root, args.max_age_days, time.time()
     )
     for link in skipped:
-        print("skipped symlink %s" % link)
+        log("skipped symlink %s" % link)
     for path in candidates:
         if path.is_symlink():
             continue
         if is_protected(path, args.protected_root):
-            print("skipped protected %s" % path)
+            log("skipped protected %s" % path)
             continue
         if not is_within(path, args.work_root):
-            print("skipped outside root %s" % path)
+            log("skipped outside root %s" % path)
             continue
         if args.dry_run:
-            print("would remove %s" % path)
+            log("would remove %s" % path)
             continue
         try:
             status, why = remove_candidate(path, args.work_root, args.protected_root)
             if status == "removed":
-                print("removed %s" % path)
+                log("removed %s" % path)
             else:
-                print("skipped %s: %s" % (path, why))
+                log("skipped %s: %s" % (path, why))
         except (OSError, RuntimeError) as err:
             failures += 1
-            print("could not remove %s: %s" % (path, err), file=sys.stderr)
+            log("could not remove %s: %s" % (path, err), file=sys.stderr)
     return failures
 
 
@@ -607,22 +614,22 @@ def main(argv=None):
         )
         out_of_tree = not problem and is_out_of_tree(args.work_root, args.protected_root)
     except (OSError, RuntimeError) as err:
-        print("prune_runner_artifacts: refusing: unresolvable path: %s" % err, file=sys.stderr)
+        log("prune_runner_artifacts: refusing: unresolvable path: %s" % err, file=sys.stderr)
         return EXIT_USAGE
     if problem:
-        print("prune_runner_artifacts: refusing: %s" % problem, file=sys.stderr)
+        log("prune_runner_artifacts: refusing: %s" % problem, file=sys.stderr)
         return EXIT_USAGE
     if out_of_tree:
-        print("protected root %s is outside the work root; nothing to protect" % args.protected_root)
+        log("protected root %s is outside the work root; nothing to protect" % args.protected_root)
     failures = 0
     try:
         failures = prune_all(args)
     except (OSError, RuntimeError) as err:
         # r3 F1: fail closed on deletion, soft on the exit code.
         failures += 1
-        print("prune_runner_artifacts: aborted: %s" % err, file=sys.stderr)
+        log("prune_runner_artifacts: aborted: %s" % err, file=sys.stderr)
     if failures:
-        print("prune_runner_artifacts: %d removal(s) failed" % failures, file=sys.stderr)
+        log("prune_runner_artifacts: %d removal(s) failed" % failures, file=sys.stderr)
     if args.evict_root:
         # #7199 + r3 F1: eviction never reds the job; an error is reported.
         try:
@@ -632,7 +639,7 @@ def main(argv=None):
                 args.free_floor_gib, time.time(), dry_run=args.dry_run,
             )
         except (OSError, RuntimeError) as err:
-            print("prune_runner_artifacts: eviction aborted: %s" % err, file=sys.stderr)
+            log("prune_runner_artifacts: eviction aborted: %s" % err, file=sys.stderr)
     return EXIT_OK
 
 

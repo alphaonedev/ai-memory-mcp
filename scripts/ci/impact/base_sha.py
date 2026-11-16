@@ -34,6 +34,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import workflow_annotation as wa  # noqa: E402
+
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 REF_RE = re.compile(r"^[A-Za-z0-9._][A-Za-z0-9._/-]*$")
 HEADS_PREFIX = "refs/heads/"
@@ -126,7 +129,7 @@ def resolve(repo, env):
 
 
 def emit(sha, reason, output_path):
-    lines = "sha=%s\nreason=%s\n" % (sha, reason)
+    lines = "sha=%s\nreason=%s\n" % (wa.env_file_value(sha), wa.env_file_value(reason))
     sys.stdout.write(lines)
     if output_path:
         with open(output_path, "a") as handle:

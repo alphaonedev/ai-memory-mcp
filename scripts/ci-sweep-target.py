@@ -98,6 +98,9 @@ import stat
 import sys
 import time
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "ci"))
+import workflow_annotation as wa  # noqa: E402
+
 DEBUG_DIR_NAME = "debug"
 SWEPT_SUBDIRS = ("deps", "incremental", "build", ".fingerprint")
 WORKSPACE_ENV = "GITHUB_WORKSPACE"
@@ -204,7 +207,7 @@ def escape_line(text):
 
 def annotate_warning(message):
     """Print a GitHub Actions ``::warning::`` annotation on stdout (one line)."""
-    print("::warning::ci-sweep-target: {}".format(escape_line(message)))
+    print(wa.annotation("warning", "ci-sweep-target: {}".format(message)))
 
 
 def configure_output():

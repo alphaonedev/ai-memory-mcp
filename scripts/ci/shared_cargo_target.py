@@ -33,6 +33,9 @@ import sys
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import workflow_annotation as wa  # noqa: E402
+
 TARGET_ROOT_RELATIVE = Path(".cache") / "ai-memory-ci" / "cargo-target"
 ENV_NAME = "CARGO_TARGET_DIR"
 ROOT_ENV_NAME = "AI_MEMORY_CI_TARGET_ROOT"
@@ -173,8 +176,8 @@ def main(argv=None):
         write_in_use_marker(path, args.runner_name)
     if args.github_env:
         with open(args.github_env, "a", encoding="utf-8") as handle:
-            handle.write("%s=%s\n" % (ENV_NAME, path))
-            handle.write("%s=%s\n" % (ROOT_ENV_NAME, target_root_dir(home)))
+            handle.write("%s=%s\n" % (ENV_NAME, wa.env_file_value(path)))
+            handle.write("%s=%s\n" % (ROOT_ENV_NAME, wa.env_file_value(target_root_dir(home))))
     print(path)
     return EXIT_OK
 

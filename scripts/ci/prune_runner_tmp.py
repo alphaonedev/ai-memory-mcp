@@ -42,6 +42,12 @@ interpreters so the version refusal can run.
 """
 import sys
 
+# The shared module parses on old interpreters, so the version refusal below can still print through it. It is
+# loaded without an import statement: the floor check must precede every import except sys (pinned by a test).
+sys.path.insert(0, __file__.rpartition("/")[0] or ".")
+wa = __import__("workflow_annotation")
+safe_text = wa.safe_text  # the tests and the call sites below use it as a module attribute
+
 MIN_PYTHON = (3, 12)
 EXIT_OK = 0
 EXIT_ERROR = 1
@@ -58,8 +64,9 @@ def python_refusal(version_info):
 
 
 def refusal_annotation(reason):
-    """The workflow annotation for a refusal; ``reason`` is already escaped."""
-    return f"::warning title={PROG} refused::{PROG}: refused: {reason}"
+    """The workflow annotation for a refusal; ``reason`` is the raw text (a ``Refusal`` gives its ``raw``)."""
+    raw = getattr(reason, "raw", reason)
+    return wa.annotation("warning", f"{PROG}: refused: {raw}", title=f"{PROG} refused")
 
 
 if __name__ == "__main__" and python_refusal(sys.version_info) is not None:
@@ -91,8 +98,8 @@ DISK_BLOCK_BYTES = 512
 MAX_FAILURE_LINES = 20
 MAX_ANNOTATION_NAMES = 5  # names listed in the counted-failures annotation
 MAX_ANNOTATION_NAME_CHARS = 120  # raw characters of one name before it is cut
-MAX_ANNOTATION_CHARS = 1000  # the whole annotation line, escapes included
-ANNOTATION_CUT_MARK = "..."
+MAX_ANNOTATION_CHARS = wa.MAX_ANNOTATION_CHARS  # the whole annotation line, escapes included
+ANNOTATION_CUT_MARK = wa.ANNOTATION_CUT_MARK
 DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
 FACTS_PREFIX = "prune-facts:"
 
@@ -120,7 +127,11 @@ REFUSAL_REASONS = {
 
 
 class Refusal(Exception):
-    """TMPDIR cannot be pruned; the message is the exact reason."""
+    """TMPDIR cannot be pruned; the message is the exact reason (escaped for stderr), ``raw`` the unescaped one."""
+
+    def __init__(self, message, raw=None):
+        super().__init__(message)
+        self.raw = message if raw is None else raw
 
 
 class EntryChanged(OSError):
@@ -133,45 +144,27 @@ class TreeTooLarge(OSError):
 
 def refuse(key, **fields):
     """Build the Refusal for reason ``key`` with ``fields`` escaped for the log."""
-    return Refusal(REFUSAL_REASONS[key].format(**{k: safe_text(v) for k, v in fields.items()}))
-
-
-def safe_text(text):
-    """Escape control characters, backslashes, ``%`` and ``::`` so a name cannot inject a log line or workflow command."""
-    pieces = []
-    for char in str(text):
-        code = ord(char)
-        if char == "\\":
-            pieces.append("\\\\")
-        elif char == "%":
-            pieces.append("\\x25")
-        elif code < 0x20 or 0x7F <= code <= 0x9F:
-            pieces.append(f"\\x{code:02x}")
-        elif 0xD800 <= code <= 0xDFFF or code in (0x2028, 0x2029):
-            pieces.append(f"\\u{code:04x}")
-        else:
-            pieces.append(char)
-    return "".join(pieces).replace("::", "\\x3a:")
+    template = REFUSAL_REASONS[key]
+    return Refusal(template.format(**{k: safe_text(v) for k, v in fields.items()}),
+                   raw=template.format(**{k: str(v) for k, v in fields.items()}))
 
 
 def failed_annotation(count, names):
     """The one ``::warning`` line for ``count`` entries that could not be removed; None when ``count`` is 0.
 
     ``names`` are the first MAX_ANNOTATION_NAMES failed names in sorted order. Every name goes
-    through ``safe_text`` (finding L4), so the only ``::`` in the line is the command's own.
+    through ``safe_text`` inside ``wa.annotation`` (finding L4), so the only ``::`` in the line is the command's own.
     """
     if count <= 0:
         return None
     shown = []
     for name in list(names)[:MAX_ANNOTATION_NAMES]:
         cut = len(name) > MAX_ANNOTATION_NAME_CHARS
-        shown.append(safe_text(name[:MAX_ANNOTATION_NAME_CHARS]) + (ANNOTATION_CUT_MARK if cut else ""))
-    line = f"::warning title={PROG} failed::{PROG}: failed={count} not removed: " + ", ".join(shown)
+        shown.append(name[:MAX_ANNOTATION_NAME_CHARS] + (ANNOTATION_CUT_MARK if cut else ""))
+    message = f"{PROG}: failed={count} not removed: " + ", ".join(shown)
     if count > MAX_ANNOTATION_NAMES:
-        line += f" (list cut at {MAX_ANNOTATION_NAMES} of {count})"
-    if len(line) > MAX_ANNOTATION_CHARS:
-        line = line[: MAX_ANNOTATION_CHARS - len(ANNOTATION_CUT_MARK)] + ANNOTATION_CUT_MARK
-    return line
+        message += f" (list cut at {MAX_ANNOTATION_NAMES} of {count})"
+    return wa.annotation("warning", message, max_chars=MAX_ANNOTATION_CHARS, title=f"{PROG} failed")
 
 
 def file_id(info):

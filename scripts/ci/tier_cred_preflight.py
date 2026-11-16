@@ -46,6 +46,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import workflow_annotation as wa  # noqa: E402
+
 EXIT_OK = 0
 EXIT_UNAVAILABLE = 1
 EXIT_BAD_INPUT = 2
@@ -144,7 +147,7 @@ def classify(rc, stderr):
 def reason_line(reason, url_file, runner, rc):
     """The one ``::error::`` line for a failure: constants, the URL file path and the runner name only."""
     detail = MESSAGES[reason].format(url_file=url_file, rc=rc)
-    return f"::error::enterprise-fed tier pre-flight on {runner}: {reason} ({ISSUE}): {detail}"
+    return wa.annotation("error", f"enterprise-fed tier pre-flight on {runner}: {reason} ({ISSUE}): {detail}")
 
 
 def parse_args(argv):
@@ -193,12 +196,12 @@ def main(argv=None):
     except KeyboardInterrupt:  # a signal outside the supervised run: nothing to stop, still a failed pre-flight
         reason, code, rc = INTERRUPTED_REASON, EXIT_UNAVAILABLE, None
     if code == EXIT_OK:
-        print(f"enterprise-fed tier pre-flight on {runner}: {OK_REASON} ({args.url_file})")
+        print(wa.log_line(f"enterprise-fed tier pre-flight on {runner}: {OK_REASON} ({args.url_file})"))
     elif reason in MESSAGES:
         print(reason_line(reason, args.url_file, runner, rc))
     else:
         # a refusal from the URL helper or a local psql problem: its message names keys and paths only
-        print(f"::error::enterprise-fed tier pre-flight on {runner}: {reason} ({ISSUE})")
+        print(wa.annotation("error", f"enterprise-fed tier pre-flight on {runner}: {reason} ({ISSUE})"))
     sys.stdout.flush()
     return code
 

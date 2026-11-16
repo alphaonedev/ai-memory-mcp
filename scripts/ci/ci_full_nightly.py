@@ -22,7 +22,11 @@ import re
 import subprocess
 import sys
 import time
+from pathlib import Path
 from typing import Callable, List, Optional, Tuple
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import workflow_annotation as wa  # noqa: E402
 
 WORKFLOW_FILE = "ci.yml"
 ISSUE_LABEL = "ci-full-red"
@@ -163,7 +167,7 @@ def write_output(path: Optional[str], values: dict) -> None:
         return
     with open(path, "a") as handle:
         for key, value in values.items():
-            handle.write("%s=%s\n" % (key, str(value).replace("\n", " ")))
+            handle.write("%s=%s\n" % (key, wa.env_file_value(value)))
 
 
 def main(argv: Optional[List[str]] = None) -> int:

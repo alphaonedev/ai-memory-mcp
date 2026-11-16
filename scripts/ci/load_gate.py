@@ -16,6 +16,9 @@ import os
 import sys
 import time
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import workflow_annotation as wa  # noqa: E402
+
 TAG = '[#6795 load gate]'
 
 
@@ -27,14 +30,14 @@ def should_wait(load, cores, ratio):
 
 
 def format_notice(label, load, cores, ratio, waited):
-    return "::notice::%s '%s': load=%.2f cores=%d ratio=%s waited=%ds" % (
-        TAG, label, load, cores, ratio, waited)
+    return wa.annotation("notice", "%s '%s': load=%.2f cores=%d ratio=%s waited=%ds" % (
+        TAG, label, load, cores, ratio, waited))
 
 
 def _plain(label, load, cores, ratio, waited):
     """Intermediate poll line: plain log text, not an annotation (GitHub caps annotations per step)."""
-    return "%s '%s': waiting, load=%.2f cores=%d ratio=%s waited=%ds" % (
-        TAG, label, load, cores, ratio, waited)
+    return wa.log_line("%s '%s': waiting, load=%.2f cores=%d ratio=%s waited=%ds" % (
+        TAG, label, load, cores, ratio, waited))
 
 
 def run(label, max_ratio, max_wait_secs, poll_secs, cores, load_fn, sleep_fn):
@@ -43,15 +46,15 @@ def run(label, max_ratio, max_wait_secs, poll_secs, cores, load_fn, sleep_fn):
     try:
         load = load_fn()
     except (OSError, AttributeError) as exc:
-        print('::warning::%s %r: cannot read the load average (%s); proceeding without the gate'
-              % (TAG, label, exc), flush=True)
+        print(wa.annotation("warning", "%s '%s': cannot read the load average (%s); proceeding without the gate"
+                            % (TAG, label, exc)), flush=True)
         return 0
     print(format_notice(label, load, cores, max_ratio, waited), flush=True)
     while should_wait(load, cores, max_ratio):
         if waited >= max_wait_secs:
-            print('::warning::%s %r: load=%.2f still above %s x %d cores after %ds; '
-                  'proceeding anyway (the gate never fails on load alone)'
-                  % (TAG, label, load, max_ratio, cores, waited), flush=True)
+            print(wa.annotation("warning", "%s '%s': load=%.2f still above %s x %d cores after %ds; "
+                                "proceeding anyway (the gate never fails on load alone)"
+                                % (TAG, label, load, max_ratio, cores, waited)), flush=True)
             break
         step = min(poll_secs, max_wait_secs - waited)
         sleep_fn(step)
@@ -59,8 +62,8 @@ def run(label, max_ratio, max_wait_secs, poll_secs, cores, load_fn, sleep_fn):
         try:
             load = load_fn()
         except (OSError, AttributeError) as exc:
-            print('::warning::%s %r: load average became unreadable (%s); proceeding'
-                  % (TAG, label, exc), flush=True)
+            print(wa.annotation("warning", "%s '%s': load average became unreadable (%s); proceeding"
+                                % (TAG, label, exc)), flush=True)
             return 0
         if should_wait(load, cores, max_ratio):
             print(_plain(label, load, cores, max_ratio, waited), flush=True)

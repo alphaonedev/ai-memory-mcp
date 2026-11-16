@@ -25,6 +25,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import partition_test_binaries as ptb  # noqa: E402
+import workflow_annotation as wa  # noqa: E402
 
 
 class SplitError(Exception):
@@ -88,7 +89,7 @@ def main(argv=None):
         static = load_static_residual(args.static_residual)
         targets, residual, other = split(serial, exes, static)
     except (OSError, ptb.PartitionError, SplitError) as exc:
-        print('::error::pg_isolate_split: %s' % exc, file=sys.stderr)
+        print(wa.annotation("error", "pg_isolate_split: %s" % exc), file=sys.stderr)
         return 2
     out = Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)

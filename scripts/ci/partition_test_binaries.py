@@ -50,6 +50,9 @@ import re
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import workflow_annotation as wa  # noqa: E402
+
 # Class (a) evidence. Scout report CI-SHARD-SCOUT-2026-10-09, plus the shared
 # lane-database helpers under tests/common that only Postgres cells use.
 PG_RE = re.compile(
@@ -1330,7 +1333,7 @@ def main(argv=None):
     try:
         return run(args)
     except PartitionError as exc:
-        print('::error::[#6344 shard] %s' % exc, file=sys.stderr)
+        print(wa.annotation("error", "[#6344 shard] %s" % exc), file=sys.stderr)
         return 2
 
 

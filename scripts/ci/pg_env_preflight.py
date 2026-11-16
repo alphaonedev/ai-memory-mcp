@@ -38,6 +38,10 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable, Sequence
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import workflow_annotation as wa  # noqa: E402
 
 DEFAULT_LABEL = "coverage-pg"
 DEFAULT_PSQL = "psql"
@@ -92,7 +96,7 @@ def default_runner(argv: Sequence[str]) -> subprocess.CompletedProcess:
 
 def class_line(label: str, reason: str) -> str:
     """The single, machine-readable failure line."""
-    return f"::error::[{label}] PG-ENV {reason}"
+    return wa.annotation("error", f"[{label}] PG-ENV {reason}")
 
 
 def _detail(proc: subprocess.CompletedProcess) -> str:

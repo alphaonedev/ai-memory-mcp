@@ -9,6 +9,7 @@ from typing import Dict, List, Optional, Pattern
 IMPACT_DIR = Path(__file__).resolve().parent
 RULES_PATH = IMPACT_DIR / "rules.json"
 SCHEMA_VERSION = 1
+LINE_BREAK_CHARS = "\n\r\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029"
 ALL_KEY = "ALL"
 EVENT_PULL_REQUEST = "pull_request"
 EXIT_OK = 0
@@ -132,3 +133,15 @@ def open_existing_db(path: Path) -> sqlite3.Connection:
 def load_settings(con: sqlite3.Connection) -> Dict[str, object]:
     """Return the settings table decoded from JSON."""
     return {k: json.loads(v) for k, v in con.execute("select key, value from settings")}
+
+
+def single_line(value) -> str:
+    """A ``KEY=value`` output-file value on one line (#9365).
+
+    The selector is materialised from the base commit as a closed set of files, so it cannot import
+    ``scripts/ci/workflow_annotation.py`` from the PR tree; this mirrors that module's ``env_file_value``
+    (a parity cell in ``test_ci_annotation_escape_9365.py`` pins the two together).
+    """
+    return "".join(" " if char in LINE_BREAK_CHARS
+                   else "\\u%04x" % ord(char) if 0xD800 <= ord(char) <= 0xDFFF else char
+                   for char in str(value))

@@ -32,6 +32,9 @@ import sys
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import workflow_annotation as wa  # noqa: E402
+
 SEMAPHORE_SLOTS_DEFAULT = 2
 SEMAPHORE_MAX_WAIT_SECS_DEFAULT = 3600
 SEMAPHORE_POLL_SECS_DEFAULT = 30
@@ -167,18 +170,18 @@ def main(argv=None):
     slot_dir.mkdir(parents=True, exist_ok=True)
     got = acquire(slot_dir, args.slots, args.label, args.max_wait_secs, args.poll_secs)
     if got is None:
-        print("::error::%s %r: no slot free after %ds (all %d slots busy on this host)"
-              % (TAG, args.label, args.max_wait_secs, args.slots), flush=True)
+        print(wa.annotation("error", "%s '%s': no slot free after %ds (all %d slots busy on this host)"
+                            % (TAG, args.label, args.max_wait_secs, args.slots)), flush=True)
         return EXIT_NO_SLOT
     index, fd, waited = got
     try:
         load, cores = load_and_cores()
-        print("::notice::%s %r: slot %d of %d acquired after %ds (load=%.2f cores=%d)"
-              % (TAG, args.label, index, args.slots, waited, load, cores), flush=True)
+        print(wa.annotation("notice", "%s '%s': slot %d of %d acquired after %ds (load=%.2f cores=%d)"
+                            % (TAG, args.label, index, args.slots, waited, load, cores)), flush=True)
         return run_child(command)
     finally:
         os.close(fd)
-        print("%s %r: slot %d of %d released" % (TAG, args.label, index, args.slots), flush=True)
+        print(wa.log_line("%s '%s': slot %d of %d released" % (TAG, args.label, index, args.slots)), flush=True)
 
 
 if __name__ == '__main__':

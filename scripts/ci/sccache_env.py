@@ -43,6 +43,7 @@ import time
 from pathlib import Path
 
 import shared_cargo_target as shared
+import workflow_annotation as wa
 
 SCCACHE_BINARY = "sccache"
 CACHE_ROOT_RELATIVE = shared.TARGET_ROOT_RELATIVE.parent
@@ -226,7 +227,7 @@ def main(argv=None):
             "SCCACHE_IDLE_TIMEOUT", "SCCACHE_IGNORE_SERVER_IO_ERROR"))
     with open(args.github_env, "a", encoding="utf-8") as handle:
         for name, value in values:
-            handle.write("%s=%s\n" % (name, value))
+            handle.write("%s=%s\n" % (name, wa.env_file_value(value)))
     print("sccache_env: %s, dir %s, cap %s, port %d" % (
         binary, cache_dir, SCCACHE_CACHE_SIZE, SCCACHE_SERVER_PORT))
     return EXIT_OK
