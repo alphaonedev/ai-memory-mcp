@@ -79,12 +79,20 @@ def version_text(text):
     """``workflow_annotation.safe_value`` restated for the version refusal, which runs before that module is loaded.
 
     Backslash doubles; ``%``, every ``:``, C0/C1 controls and DEL become ``\\xNN``; surrogates and U+2028/9 become
-    ``\\uNNNN``; every other character stays. A test pins it byte-equal to ``safe_value`` over every code point.
+    ``\\uNNNN``; a ``#`` that is last or precedes ``#``/``[`` becomes ``\\x23`` and a ``[`` that follows ``#``
+    becomes ``\\x5b`` (no v1 ``##[`` command, #9365); every other character stays. A test pins it byte-equal to
+    ``safe_value`` over every code point.
     """
+    text = str(text)
+    last = len(text) - 1
     pieces = []
-    for char in str(text):
+    for index, char in enumerate(text):
         code = ord(char)
-        if char == "\\":
+        if char == "#" and (index == last or text[index + 1] in "#["):
+            pieces.append("\\x23")
+        elif char == "[" and index > 0 and text[index - 1] == "#":
+            pieces.append("\\x5b")
+        elif char == "\\":
             pieces.append("\\\\")
         elif char in "%:" or code < 0x20 or 0x7F <= code <= 0x9F:
             pieces.append("\\x%02x" % code)
@@ -112,7 +120,7 @@ if __name__ == "__main__" and python_refusal(sys.version_info) is not None:
     sys.exit(EXIT_OK)
 
 SHARED_MODULE_FILE = "workflow_annotation.py"
-SHARED_MODULE_USED = ("safe_value", "render", "join", "annotation")  # every name this script takes from it
+SHARED_MODULE_USED = ("safe_value", "render", "join", "annotation", "log_line")  # every name this script takes from it
 LOAD_CANNOT_READ = "cannot be read"
 LOAD_RAISED = "raised while loading"
 LOAD_LACKS = "lacks "
@@ -662,7 +670,7 @@ def print_runner_facts(raw, roots, out):
         )
     except Exception as exc:  # print-only helper: never change the exit code
         line = f"{FACTS_PREFIX} error={type(exc).__name__}"
-    print(line, file=out)
+    print(wa.log_line(line), file=out)
     out.flush()
     return line
 
@@ -702,12 +710,12 @@ class Tally:
         if self.failed <= MAX_FAILURE_LINES:
             # CODE F6: a top-level entry not entered is named once; its text is the constant reason alone
             text = exc.reason if isinstance(exc, NotEntered) and not exc.nested and exc.name == name else error_text(exc)
-            print(f"{PROG}: failed to remove {safe_text(name)}: {text}", file=self.err)
+            print(wa.log_line(f"{PROG}: failed to remove {safe_text(name)}: {text}"), file=self.err)
 
     def skip(self, name, reason=SKIP_OTHER_DEVICE):
         self.skipped += 1
         if self.skipped <= MAX_FAILURE_LINES:
-            print(f"{PROG}: skipped {safe_text(name)}: {reason}", file=self.err)
+            print(wa.log_line(f"{PROG}: skipped {safe_text(name)}: {reason}"), file=self.err)
 
     def summary(self):
         text = f"pruned={self.pruned} kept={self.kept} failed={self.failed} freed_bytes={self.freed} skipped={self.skipped}"
@@ -926,11 +934,11 @@ def refused(reason, out, err):
     A counted refusal (COUNTED_REFUSALS) also prints the summary with failed=1, so the runner that could
     not be proven safe shows as a counted failure next to its one annotation.
     """
-    print(f"{PROG}: refused: {reason}", file=err)
+    print(wa.log_line(f"{PROG}: refused: {reason}"), file=err)
     if getattr(reason, "counted", False):
         tally = Tally(err)
         tally.failed = 1
-        print(tally.summary(), file=out)
+        print(wa.log_line(tally.summary()), file=out)
     print(refusal_annotation(reason), file=out)
     out.flush()
     return EXIT_OK  # ruling f23a9ae4: a refusal is green with its warning; only an internal error is red
@@ -965,11 +973,11 @@ def main(argv=None, environ=None, out=None, err=None):
         prune(dir_fd, info.st_dev, args.dry_run, time.time(), out, tally, root_mnt)
     except Exception as exc:  # internal error: named, no traceback, the job goes red (exit 1)
         tally.internal_error = True
-        print(f"{PROG}: internal error, pruning stopped: {type(exc).__name__}: {safe_text(exc)}", file=err)
+        print(wa.log_line(f"{PROG}: internal error, pruning stopped: {type(exc).__name__}: {safe_text(exc)}"), file=err)
     finally:
         if dir_fd is not None:
             os.close(dir_fd)
-    print(tally.summary(), file=out)
+    print(wa.log_line(tally.summary()), file=out)
     if not tally.internal_error:
         annotation = failed_annotation(tally.failed, tally.first_failed)
         if annotation:

@@ -123,7 +123,7 @@ def _load_workflow_annotation():
 # The one shared-module load shape of scripts/ (#9365, ruling bcd0a15c; LoaderShape pins it).
 WA_PROG = "ci-sweep-target"
 WA_RELATIVE_PATH = "ci/workflow_annotation.py"
-WA_REQUIRED = ("annotation",)
+WA_REQUIRED = ("annotation", "log_line")
 WA_EXIT_LOAD_REFUSED = 6  # a failed shared-module load (0 ok, 2 refused, 3 bad cap, 4 unreadable, 5 usage)
 WA_ERROR_TO_STDERR = False
 
@@ -564,7 +564,7 @@ def sweep(real_target, args, warnings, handles):
     """Scan, then delete oldest first; return (exit_code_or_None, before, remaining, removed)."""
     entries = collect_entries(real_target, warnings, handles)
     for line in warnings:
-        print("warning: {}".format(escape_line(line)), file=sys.stderr)
+        print(wa.log_line("warning: {}".format(escape_line(line))), file=sys.stderr)
     before = sum(item[4] for item in entries)
     remaining = before
     removed = 0
@@ -583,8 +583,8 @@ def sweep(real_target, args, warnings, handles):
                 remove_entry(sdir, name, freed)
             except (OSError, RecursionError) as exc:
                 remaining -= freed[0]
-                print("warning: cannot remove {}: {} ({} bytes of it were deleted)".format(
-                    escape_line(path), escape_line(exc), freed[0]), file=sys.stderr)
+                print(wa.log_line("warning: cannot remove {}: {} ({} bytes of it were deleted)".format(
+                    escape_line(path), escape_line(exc), freed[0])), file=sys.stderr)
                 continue
         remaining -= size
         removed += 1
@@ -622,8 +622,8 @@ def main(argv=None):
     if args.lock and not args.allow_root:
         parser.error("--lock is only valid with --allow-root")
     if args.max_bytes <= 0:
-        print("usage: --max-bytes must be a positive integer, got {}".format(
-            args.max_bytes), file=sys.stderr)
+        print(wa.log_line("usage: --max-bytes must be a positive integer, got {}".format(
+            args.max_bytes)), file=sys.stderr)
         return EXIT_BAD_CAP
 
     real_target = os.path.realpath(args.target)
@@ -631,15 +631,15 @@ def main(argv=None):
         workspace = os.environ.get(WORKSPACE_ENV)
         real_ws = os.path.realpath(workspace) if workspace else None
         if real_ws is None or not is_under(real_target, real_ws):
-            print("refused: {} is not under {} (use --allow-root)".format(
-                escape_line(real_target), WORKSPACE_ENV), file=sys.stderr)
+            print(wa.log_line("refused: {} is not under {} (use --allow-root)".format(
+                escape_line(real_target), WORKSPACE_ENV)), file=sys.stderr)
             return EXIT_REFUSED
     else:
         real_root = os.path.realpath(args.within)
         if (real_root == os.sep or real_target == real_root
                 or not is_under(real_target, real_root)):
-            print("refused: resolved target {} is not strictly inside resolved --within "
-                  "root {}".format(escape_line(real_target), escape_line(real_root)),
+            print(wa.log_line("refused: resolved target {} is not strictly inside resolved --within "
+                  "root {}".format(escape_line(real_target), escape_line(real_root))),
                   file=sys.stderr)
             return EXIT_REFUSED
 
@@ -651,8 +651,8 @@ def main(argv=None):
         lock_dir, lock_name = os.path.split(os.path.abspath(args.lock))
         if (not lock_name or lock_name in (".", "..")
                 or os.path.realpath(lock_dir) != real_root):
-            print("refused: --lock {} is not a file directly inside the resolved --within "
-                  "root {}".format(escape_line(args.lock), escape_line(real_root)),
+            print(wa.log_line("refused: --lock {} is not a file directly inside the resolved --within "
+                  "root {}".format(escape_line(args.lock), escape_line(real_root))),
                   file=sys.stderr)
             return EXIT_REFUSED
         wait_started = time.monotonic()
@@ -662,9 +662,9 @@ def main(argv=None):
         lock_wait = lock_taken_at - wait_started
         if lock_fd is None:
             annotate_warning("{}; sweep skipped, target uncapped this run".format(skip_reason))
-            print("ci-sweep-target: sweep skipped ({}) target={} lock_wait={:.2f} "
+            print(wa.log_line("ci-sweep-target: sweep skipped ({}) target={} lock_wait={:.2f} "
                   "lock_held=0.00".format(escape_line(skip_reason), escape_line(real_target),
-                                     lock_wait))
+                                     lock_wait)))
             return EXIT_OK
 
     warnings = []
@@ -672,7 +672,7 @@ def main(argv=None):
     try:
         code, before, remaining, removed = sweep(real_target, args, warnings, handles)
     except Refused as exc:
-        print("refused: {}".format(escape_line(exc)), file=sys.stderr)
+        print(wa.log_line("refused: {}".format(escape_line(exc))), file=sys.stderr)
         return EXIT_REFUSED
     finally:
         for fd in handles:
@@ -684,10 +684,10 @@ def main(argv=None):
         if lock_fd is not None:
             os.close(lock_fd)  # closing the descriptor releases the flock
             lock_held = time.monotonic() - lock_taken_at
-    print("ci-sweep-target: target={} cap={} before={} after={} removed={} freed={} "
+    print(wa.log_line("ci-sweep-target: target={} cap={} before={} after={} removed={} freed={} "
           "lock_wait={:.2f} lock_held={:.2f}{}".format(
               escape_line(real_target), args.max_bytes, before, remaining, removed, before - remaining,
-              lock_wait, lock_held, " (dry-run)" if args.dry_run else ""))
+              lock_wait, lock_held, " (dry-run)" if args.dry_run else "")))
     return code
 
 

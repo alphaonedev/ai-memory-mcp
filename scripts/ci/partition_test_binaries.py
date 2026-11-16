@@ -79,7 +79,7 @@ EXIT_FAIL_CLOSED = 2  # every fail-closed condition, a shared module that cannot
 # The one shared-module load shape of scripts/ (#9365, ruling bcd0a15c; LoaderShape pins it).
 WA_PROG = "partition_test_binaries"
 WA_RELATIVE_PATH = "workflow_annotation.py"
-WA_REQUIRED = ("annotation",)
+WA_REQUIRED = ("annotation", "log_line")
 WA_EXIT_LOAD_REFUSED = EXIT_FAIL_CLOSED  # the gate's own refusal code, unchanged
 WA_ERROR_TO_STDERR = False
 
@@ -1348,11 +1348,11 @@ def run(args):
                     for e in exes if e.kind != 'lib'},
     }
     (out_dir / 'manifest.json').write_text(json.dumps(manifest, indent=1, sort_keys=True) + '\n')
-    print('[#6344] shards: serial=%d parallel_1=%d parallel_2=%d of %d executables; '
+    print(wa.log_line('[#6344] shards: serial=%d parallel_1=%d parallel_2=%d of %d executables; '
           'estimate serial=%.0fs parallel=%.0fs/%.0fs (per-binary min(tests, 3) threads; ideal %.0fs/%.0fs)'
           % (manifest['counts']['serial'], manifest['counts']['parallel_1'], manifest['counts']['parallel_2'],
              len(exes), totals['serial'], totals['parallel_1_est'], totals['parallel_2_est'],
-             totals['parallel_1'] / 3, totals['parallel_2'] / 3))
+             totals['parallel_1'] / 3, totals['parallel_2'] / 3)))
     return 0
 
 

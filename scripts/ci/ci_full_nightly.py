@@ -49,7 +49,7 @@ def _load_workflow_annotation():
 # The one shared-module load shape of scripts/ (#9365, ruling bcd0a15c; LoaderShape pins it).
 WA_PROG = "ci_full_nightly"
 WA_RELATIVE_PATH = "workflow_annotation.py"
-WA_REQUIRED = ("env_file_value",)
+WA_REQUIRED = ("env_file_value", "log_line")
 WA_EXIT_LOAD_REFUSED = 3  # a failed shared-module load; no other meaning in this script
 WA_ERROR_TO_STDERR = False
 
@@ -192,7 +192,7 @@ def report(gh: Runner, repo: str, job_result: str, conclusion: str, run_url: str
         code, out = gh(["issue", "comment", str(number), "--repo", repo,
                         "--body", body])
     if code != 0:
-        print("ci-full: could not file the issue: %s" % out.strip()[-200:],
+        print(wa.log_line("ci-full: could not file the issue: %s" % out.strip()[-200:]),
               file=sys.stderr)
     return EXIT_FAIL
 
@@ -225,11 +225,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         try:
             result = dispatch_and_wait(gh_runner, args.repo, args.ref)
         except (NightlyError, ValueError) as exc:
-            print("ci-full: %s" % exc, file=sys.stderr)
+            print(wa.log_line("ci-full: %s" % exc), file=sys.stderr)
             return EXIT_FAIL
         write_output(args.github_output, {"conclusion": result["conclusion"],
                                           "run_url": result["url"]})
-        print("ci-full: run %s concluded %s" % (result["run_id"], result["conclusion"]))
+        print(wa.log_line("ci-full: run %s concluded %s" % (result["run_id"], result["conclusion"])))
         return EXIT_OK
     return report(gh_runner, args.repo, args.job_result, args.conclusion,
                   args.run_url, args.ref)

@@ -6,15 +6,23 @@ line or change the command's properties. Every script goes through this module:
 
 * ``annotation(command, message, **properties)``: the whole line, exactly one line, at most
   ``MAX_ANNOTATION_CHARS`` long, message through ``safe_text``, property values through ``property_value``.
-* ``safe_text(text)``: message text. Control characters, backslash, ``%``, surrogates, U+2028/9 and ``::``
-  become visible backslash escapes, so the value cannot carry a line break, a ``%0A`` the runner would
-  decode, or a ``::``.
+* ``safe_text(text)``: message text. Control characters, backslash, ``%``, surrogates and U+2028/9 become
+  visible backslash escapes; in every run of colons each ``:`` followed by ``:`` becomes ``\\x3a``; a ``#``
+  that is last or precedes ``#``/``[`` becomes ``\\x23`` and a ``[`` that follows ``#`` becomes ``\\x5b``. So
+  the result holds no line break, no ``%`` (nothing the runner percent-decodes), no ``::`` and no ``##[``; no
+  ``##[`` forms with a literal or escaped value after it, and before it only a literal ending in ``##`` could
+  complete one (none exists in the scripts: the stream ratchet's literal cell).
+* Runner rule (actions/runner ``src/Runner.Common/ActionCommand.cs``): the v2 form is a line that starts with
+  ``::`` after leading whitespace (``TryParseV2``); the v1 form is ``##[`` ANYWHERE in the line (``TryParse``,
+  ``IndexOf("##[")``, no trim). ``annotation``, ``render``, ``join`` and ``log_line`` also break every ``##[``
+  of the finished line.
 * ``property_value(text)``: ``safe_text`` plus ``,`` and ``:`` escaped, because the runner ends a property
   at ``,`` and the command at ``::`` (rule source: the GitHub Actions workflow-commands documentation and
   the runner's ``ActionCommand`` parser: message data escapes ``%``, CR, LF; property values also escape
   ``:`` and ``,``).
 * ``log_line(text)``: a plain log line that carries untrusted text (a path in ``removed <path>``): line
-  breaks become escapes and a leading ``::`` is neutralised; every other byte (ANSI colour included) is kept.
+  breaks become escapes, a leading ``::`` is neutralised and every ``##[`` becomes ``##\\x5b``; every other
+  byte (ANSI colour included) is kept.
 * ``env_file_value(value)``: a value for a ``KEY=value`` line of ``$GITHUB_OUTPUT`` / ``$GITHUB_ENV`` /
   ``$GITHUB_STEP_SUMMARY``; every line break becomes a space so the value can never add a second entry.
 
@@ -30,14 +38,38 @@ LEADING_COMMAND = "::"
 NEUTRALISED_COMMAND = "\\x3a:"
 LINE_BREAK_CHARS = "\n\r\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029"
 PROPERTY_ESCAPES = ((":", "\\x3a"), (",", "\\x2c"))
+# v1 form: the runner reads ``##[`` ANYWHERE in a stdout/stderr line as a command (ActionCommand.TryParse:
+# message.IndexOf("##["), no trim); v2 form: ``::`` at the start after TrimStart (TryParseV2).
+V1_COMMAND_PREFIX = "##["
+V1_NEUTRALISED_PREFIX = "##\\x5b"
+V1_BREAK_AFTER_HASH = "#["
+ESCAPED_COLON = "\\x3a"
+ESCAPED_HASH = "\\x23"
+ESCAPED_BRACKET = "\\x5b"
 
 
 def safe_text(text):
-    """Escape control characters, backslashes, ``%`` and ``::`` so a name cannot inject a log line or workflow command."""
+    """Escape control characters, backslashes, ``%``, colon runs and ``##[`` pieces so a value cannot start a command.
+
+    Each rule is decided on the raw characters, so it holds wherever the result is placed: a ``:`` followed by ``:``
+    becomes ``\\x3a`` (no ``::`` is left in any run of colons); a ``#`` that is the last character or precedes ``#`` or
+    ``[`` becomes ``\\x23``, and a ``[`` that follows ``#`` becomes ``\\x5b``. So no ``##[`` is left inside, none forms
+    with a following literal or a following escaped value, and a leading ``[`` stays readable (``[Errno 13]``,
+    ``[label]``): only a literal ending in ``##`` before the value could complete one, and the stream ratchet keeps
+    every such literal out of the scripts. No escape contains ``#``, ``[`` or ``:``.
+    """
+    text = str(text)
+    last = len(text) - 1
     pieces = []
-    for char in str(text):
+    for index, char in enumerate(text):
         code = ord(char)
-        if char == "\\":
+        if char == ":" and index < last and text[index + 1] == ":":
+            pieces.append(ESCAPED_COLON)
+        elif char == "#" and (index == last or text[index + 1] in V1_BREAK_AFTER_HASH):
+            pieces.append(ESCAPED_HASH)
+        elif char == "[" and index > 0 and text[index - 1] == "#":
+            pieces.append(ESCAPED_BRACKET)
+        elif char == "\\":
             pieces.append("\\\\")
         elif char == "%":
             pieces.append("\\x25")
@@ -47,12 +79,17 @@ def safe_text(text):
             pieces.append("\\u%04x" % code)
         else:
             pieces.append(char)
-    return "".join(pieces).replace("::", "\\x3a:")
+    return "".join(pieces)
+
+
+def _break_v1(line):
+    """``line`` with every ``##[`` turned into ``##\\x5b``: one pass, the replacement adds no ``[``, so none is left."""
+    return line.replace(V1_COMMAND_PREFIX, V1_NEUTRALISED_PREFIX)
 
 
 def safe_value(text):
     """A value embedded in a script-chosen template: ``safe_text`` with EVERY ``:`` escaped (one pass, so no run survives)."""
-    return safe_text(text).replace(":", "\\x3a")
+    return safe_text(text).replace(":", ESCAPED_COLON)
 
 
 class SafeText(str):
@@ -67,12 +104,13 @@ def render(template, **values):
     The template is a literal the script wrote (its own ``:`` stay). Every value goes through ``safe_value``
     unless it already is ``SafeText``. A plain ``str`` is never trusted.
     """
-    return SafeText(template.format(**{k: v if isinstance(v, SafeText) else safe_value(v) for k, v in values.items()}))
+    filled = template.format(**{k: v if isinstance(v, SafeText) else safe_value(v) for k, v in values.items()})
+    return SafeText(_break_v1(filled))
 
 
 def join(separator, parts):
     """``separator`` (a script literal) between ``parts``; each part is ``SafeText`` or is escaped with ``safe_value``."""
-    return SafeText(separator.join(p if isinstance(p, SafeText) else safe_value(p) for p in parts))
+    return SafeText(_break_v1(separator.join(p if isinstance(p, SafeText) else safe_value(p) for p in parts)))
 
 
 def property_value(text):
@@ -99,7 +137,7 @@ def annotation(command, message, max_chars=MAX_ANNOTATION_CHARS, **properties):
         keys.append("%s=%s" % (key, property_value(value)))
     if keys:
         head += " " + ",".join(keys)
-    line = head + "::" + (message if isinstance(message, SafeText) else safe_text(message))
+    line = _break_v1(head + "::" + (message if isinstance(message, SafeText) else safe_text(message)))
     if len(line) > max_chars:
         line = line[: max_chars - len(ANNOTATION_CUT_MARK)] + ANNOTATION_CUT_MARK
     return line
@@ -111,7 +149,7 @@ def end_group_line():
 
 
 def log_line(text):
-    """A plain log line that may carry untrusted text: no line break inside, no leading ``::``."""
+    """A plain log line that may carry untrusted text: no line break inside, no leading ``::``, no ``##[`` anywhere."""
     pieces = []
     for char in str(text):
         if char in LINE_BREAK_CHARS:
@@ -122,7 +160,7 @@ def log_line(text):
     if line.lstrip().startswith(LEADING_COMMAND):
         start = line.index(LEADING_COMMAND)
         line = line[:start] + NEUTRALISED_COMMAND + line[start + len(LEADING_COMMAND):]
-    return line
+    return _break_v1(line)
 
 
 def env_file_value(value):

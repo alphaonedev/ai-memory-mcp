@@ -86,7 +86,8 @@ def oracle_escape(text):
     """The escape rule of #8634 (finding L4), restated: what a variable value must look like in a message.
 
     #9365 r2: a ``:`` followed by ``:`` (so no run of colons keeps a ``::``), a ``#`` that is last or precedes ``#``
-    or ``[``, and a ``[`` that is first or follows ``#`` (so no ``##[`` forms inside or at either edge) are escaped.
+    or ``[``, and a ``[`` that follows ``#`` (so no ``##[`` forms inside or before what follows) are escaped. A
+    leading ``[`` stays (``[Errno 13]``); the left edge is held by the no-``##``-literal cell of the stream ratchet.
     """
     out = []
     text = str(text)
@@ -98,7 +99,7 @@ def oracle_escape(text):
             out.append("\\x3a")
         elif char == "#" and after in ("", "#", "["):
             out.append("\\x23")
-        elif char == "[" and before in ("", "#"):
+        elif char == "[" and before == "#":
             out.append("\\x5b")
         elif char == "\\":
             out.append("\\\\")
@@ -552,7 +553,7 @@ LOAD_REFUSAL_ANNOTATION = ("::warning title=prune_runner_tmp refused::prune_runn
                            "workflow_annotation.py next to the script cannot be loaded")
 LOAD_REFUSAL_STDERR = ("prune_runner_tmp: refused: shared module workflow_annotation.py next to the script cannot be "
                        "loaded ({cause})")
-PRUNE_USED_NAMES = ("safe_value", "render", "join", "annotation")
+PRUNE_USED_NAMES = ("safe_value", "render", "join", "annotation", "log_line")
 PLANT_EXIT_CODE = 97
 EXIT_OK_CODE = 0  # every prune refusal exits 0 (ruling f23a9ae4)
 
@@ -1627,14 +1628,15 @@ V1_HOSTILE = {
 V1_SPLIT_PAIRS = (("#", "#[error]x"), ("##", "[error]x"), ("a#", "#["), ("#", "["), ("x##", "[y"), ("", "##[e]"))
 V1_HUGE_CHARS = 120_000  # the 100K+ size cell
 V1_HUGE_WALL_CLOCK_SECS = 5.0
-# exact outputs, written out by hand from the rule (escape the "#" that is last or precedes "#"/"[", the "[" that is
-# first or follows "#", the ":" that precedes ":"), independent of the module's code
+# exact outputs, written out by hand from the rule (escape the "#" that is last or precedes "#"/"[", the "[" that
+# follows "#", the ":" that precedes ":"), independent of the module's code
 V1_SAFE_TEXT_EXACT = {
     "##[error]x": "\\x23\\x23\\x5berror]x",
     "a ##[warning]b": "a \\x23\\x23\\x5bwarning]b",
     "###[error]x": "\\x23\\x23\\x23\\x5berror]x",
     "####[[error]x": "\\x23\\x23\\x23\\x23\\x5b[error]x",
-    "[error]x": "\\x5berror]x",
+    "[error]x": "[error]x",
+    "[Errno 13] denied": "[Errno 13] denied",
     "abc#": "abc\\x23",
     "::::x:::": "\\x3a\\x3a\\x3a:x\\x3a\\x3a:",
     "a\n##[error]x": "a\\x0a\\x23\\x23\\x5berror]x",
@@ -1655,10 +1657,13 @@ V1_LOG_LINE_EXACT = {
 V1_ANNOTATION_EXACT = (
     (("warning", "##[error]x"), {}, "::warning::\\x23\\x23\\x5berror]x"),
     (("error", "m"), {"title": "##[e]"}, "::error title=\\x23\\x23\\x5be]::m"),
+    (("error", "[coverage-pg] PG-ENV x"), {}, "::error::[coverage-pg] PG-ENV x"),
+    (("notice", "[#7914 semaphore] 'T': slot"), {}, "::notice::[#7914 semaphore] 'T': slot"),
 )
-V1_JOIN_EXACT = ((("", ["#", "#", "[x"]), "\\x23\\x23\\x5bx"), ((", ", ["a#", "[b"]), "a\\x23, \\x5bb"))
+V1_JOIN_EXACT = ((("", ["#", "#", "[x"]), "\\x23\\x23[x"), ((", ", ["a#", "[b"]), "a\\x23, [b"))
 V1_RENDER_EXACT = (
     (("{a}{b}", {"a": "#", "b": "#[x"}), "\\x23\\x23\\x5bx"),
+    (("{p}: {why}", {"p": "p", "why": "[Errno 13] denied"}), "p: [Errno 13] denied"),
     (("##{v}", {"v": "[error]"}), "##\\x5berror]"),
     (("{v}[e]", {"v": "##"}), "\\x23\\x23[e]"),
     (("##[{v}", {"v": "x"}), "##\\x5bx"),
@@ -2006,6 +2011,24 @@ class StreamRatchet(unittest.TestCase):
                   "out(wa.annotation('warning', 'x'))\nout(note(3))\n"
                   "print('%s: %d items' % (PROG, len([])))\nsys.stderr.write(wa.log_line(PROG) + '\\n')\n")
         self.assertEqual(stream_violations("sample", sample), [])
+
+    def test_no_literal_ends_in_a_double_hash_9365(self):
+        """The left edge of ``safe_text``: a value keeps a leading ``[``, so no script literal may end in ``##``."""
+        found = []
+        for rel in STREAM_SCRIPTS:
+            found.extend(double_hash_literals(rel, (REPO / rel).read_text(encoding="utf-8")))
+        self.assertEqual(found, [], "\n".join(found))
+        self.assertEqual(double_hash_literals("m", "print(f'x ##{wa.safe_text(v)}')\n"), ["m:1 literal ends in ##"])
+        self.assertEqual(double_hash_literals("m", "print('PR #' + wa.safe_text(v))\n"), [])
+
+
+def double_hash_literals(rel, source):
+    """Every constant string part (f-string parts too) that ends in ``##``: it would meet a value's leading ``[``."""
+    return ["%s:%d literal ends in ##" % (rel, node.lineno) for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value.endswith(DOUBLE_HASH)]
+
+
+DOUBLE_HASH = "##"
 
 
 if __name__ == "__main__":

@@ -197,7 +197,7 @@ def _emit(line: str) -> None:
 def log(msg: str) -> None:
     """Diagnostics go to stderr so ``--emit-env`` stdout stays clean."""
     with _PRINT_LOCK:
-        print('[pg_isolated_binary] ' + msg, file=sys.stderr, flush=True)
+        print(wa.log_line('[pg_isolated_binary] ' + msg), file=sys.stderr, flush=True)
 
 
 # --- names and URLs -------------------------------------------------------
@@ -1053,9 +1053,10 @@ def _tail(path: Path, lines: int) -> List[str]:
 
 
 def _stderr_note(text: str) -> None:
-    """Best-effort stderr line: a closed stderr must not stop the signal loop (#7915)."""
+    """Best-effort stderr line (``text`` without its newline, through ``log_line``, #9365): a closed stderr
+    must not stop the signal loop (#7915)."""
     try:
-        sys.stderr.write(text)
+        sys.stderr.write(wa.log_line(text) + "\n")
     except (OSError, ValueError):
         return
 
@@ -1098,7 +1099,7 @@ class Runner:
                 continue  # the group already exited: nothing to signal
             except PermissionError as exc:
                 # A group the wrapper may not signal can leak: say so (#7892).
-                _stderr_note("pg_isolated_binary: cannot signal child group %d with %s: %s\n"
+                _stderr_note("pg_isolated_binary: cannot signal child group %d with %s: %s"
                              % (pid, signal.Signals(sig).name, exc.strerror or exc))
 
     def _spawn(self, argv: List[str], env: Dict[str, str], out: IO[str]) -> 'subprocess.Popen[str]':
@@ -1305,7 +1306,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             return 0
         return _cmd_run(args, url)
     except WrapperError as exc:
-        print('pg_isolated_binary: %s' % exc, file=sys.stderr)
+        print(wa.log_line('pg_isolated_binary: %s' % exc), file=sys.stderr)
         return EXIT_USAGE
 
 

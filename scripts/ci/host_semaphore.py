@@ -122,12 +122,12 @@ def acquire(slot_dir, slots, label, max_wait, poll, sleep_fn=time.sleep):
         step = min(poll, max_wait - waited)
         sleep_fn(step)
         waited += step
-        print('%s %r: waiting for a slot of %d, waited=%ds' % (TAG, label, slots, waited), flush=True)
+        print(wa.log_line('%s %r: waiting for a slot of %d, waited=%ds' % (TAG, label, slots, waited)), flush=True)
 
 
 def _note(message):
     """Record a tolerated condition on stderr (#7929), never silently."""
-    print('%s note: %s' % (TAG, message), file=sys.stderr, flush=True)
+    print(wa.log_line('%s note: %s' % (TAG, message)), file=sys.stderr, flush=True)
 
 
 def _signal_group(pgid, sig):
