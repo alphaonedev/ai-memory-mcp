@@ -945,7 +945,7 @@ async fn b3_anonymous_shared_key_reads_no_private_row_writes_nothing_named_9341(
     // own with the same shapes. A route that does not return the id even to
     // its owner cannot show a leak, so it is reported (READY `b3-blind:`).
     let mut blind = Vec::new();
-    for row in gated() {
+    for (census_idx, row) in gated().enumerate() {
         let fresh = send_simple(
             &fx.router,
             "post",
@@ -953,7 +953,8 @@ async fn b3_anonymous_shared_key_reads_no_private_row_writes_nothing_named_9341(
             ALICE_KEY,
             &[ALICE],
             Some(serde_json::json!({
-                "title": format!("{marker}-{}", row.name), "content": marker,
+                "title": format!("{marker}-census-{census_idx}-{}-{}", row.name, row.method),
+                "content": marker,
                 "namespace": ns, "scope": "private",
             })),
         )
