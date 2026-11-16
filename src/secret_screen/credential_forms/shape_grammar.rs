@@ -14,7 +14,7 @@
 
 use super::{
     ANNOTATION_TYPE_NAMES, ENV_LOOKUP_PREFIXES, JUDGED_TRAILERS, LIFETIME_SIGIL, ident_end,
-    is_ident_byte, skip_blanks,
+    is_ident_byte,
 };
 
 /// Bracket depth past which a type expression is not accepted. Real types
@@ -24,11 +24,6 @@ const MAX_TYPE_NESTING: usize = 64;
 const PATH_SEPARATOR: &[u8] = b"::";
 /// The Rust `?` operator that may follow a closed lookup once.
 const TRY_OPERATOR: u8 = b'?';
-/// Fallback operators that put a default after a lookup (`x or "d"`,
-/// `x || "d"`, `x ?? "d"`, `x ?: "d"`, Perl `x // "d"`).
-const FALLBACK_OPERATORS: [&[u8]; 4] = [b"||", b"??", b"?:", b"//"];
-/// The Python / Ruby / Perl word fallback operator.
-const FALLBACK_WORD: &[u8] = b"or";
 /// Closers of an enclosing construct that may follow an annotation
 /// (`fn f(pwd: &str)`, `Vec<&str>`, `{ pwd: String }`).
 const ENCLOSING_CLOSERS: [u8; 4] = [b')', b'>', b']', b'}'];
@@ -102,19 +97,6 @@ pub(super) fn env_lookup_shape(v: &str) -> EnvShape {
             unclosed: !rest.contains(&closer),
         },
     }
-}
-
-/// True when a fallback operator follows the value that ends at `end`, on
-/// the same line after blanks: the lookup then carries a default whose
-/// extent is expression grammar, so the line is a finding.
-pub(super) fn fallback_follows(bytes: &[u8], end: usize) -> bool {
-    let at = skip_blanks(bytes, end);
-    let rest = bytes.get(at..).unwrap_or_default();
-    FALLBACK_OPERATORS.iter().any(|op| rest.starts_with(op))
-        || (rest.starts_with(FALLBACK_WORD)
-            && !rest
-                .get(FALLBACK_WORD.len())
-                .is_some_and(|&c| is_ident_byte(c)))
 }
 
 /// How a type expression starting at a position walks.

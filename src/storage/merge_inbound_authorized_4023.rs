@@ -110,13 +110,13 @@ pub fn merge_inbound_authorized(
                 // this funnel consulted NEITHER the pre-write governance hook
                 // NOR the covenant clause-1 inbound why_trace gate NOR the
                 // secret screen, while the postgres twin runs all three.
-                // Screen first (ALWAYS redact, NEVER refuse — a refused
-                // inbound row would diverge replicas, env #95), then consult
+                // Screen first (redact; #8855 round 2 (e) refuses only a
+                // copy that still screens as a hit, env #95), then consult
                 // governance (refusal rolls the merge back, postgres parity),
                 // then the never-refuse inbound why_trace gate (advisory
                 // WARN + forensic record only — CRDT convergence is the
                 // load-bearing property of the merge primitive).
-                let screened = crate::secret_screen::redact_memory_for_receive(inbound);
+                let screened = crate::secret_screen::redact_memory_for_receive_checked(inbound)?;
                 let inbound = screened.as_ref().unwrap_or(inbound);
                 consult_governance_pre_write(inbound)?;
                 consult_why_trace_gate_inbound(inbound);

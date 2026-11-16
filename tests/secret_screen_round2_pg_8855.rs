@@ -10,13 +10,12 @@
 #![cfg(feature = "sal-postgres")]
 
 use ai_memory::models::{ConfidenceSource, Memory, MemoryKind, Tier};
-use ai_memory::secret_screen::{SecretScreenMode, set_screen_mode};
+use ai_memory::secret_screen::{KIND_RESIDUAL, SecretScreenMode, set_screen_mode};
 use ai_memory::store::postgres::PostgresStore;
 use ai_memory::store::{CallerContext, MemoryStore, StoreError};
 use sha2::{Digest, Sha256};
 
 const PW: &str = concat!("Xk9m", "Q2vLp7Rw");
-const KIND_RESIDUAL: &str = "redaction_residual";
 const KIND_PASSWORD: &str = "password_assignment";
 
 fn residual_reason(kinds: &[&str]) -> String {
@@ -29,7 +28,7 @@ fn residual_reason(kinds: &[&str]) -> String {
 
 fn tag(cell: &str, input: &str) -> String {
     let digest = Sha256::digest(input.as_bytes());
-    let hex: String = digest.iter().take(6).map(|b| format!("{b:02x}")).collect();
+    let hex = hex::encode(&digest[..6]);
     format!("cell={cell} sha256={hex}")
 }
 

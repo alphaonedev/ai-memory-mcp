@@ -25,14 +25,11 @@ use std::time::{Duration, Instant};
 use ai_memory::db;
 use ai_memory::models::{ConfidenceSource, Memory, MemoryKind, Tier};
 use ai_memory::secret_screen::{
-    REDACTION_PLACEHOLDER, ScreenOutcome, SecretScreenMode, screen, set_screen_mode,
+    KIND_DEPTH_BOUND, KIND_RESIDUAL, KIND_SIZE_BOUND, MAX_NESTED_SCREEN_DEPTH,
+    MAX_VIEW_SCREEN_BYTES, REDACTION_PLACEHOLDER, ScreenOutcome, SecretScreenMode, screen,
+    set_screen_mode,
 };
 use sha2::{Digest, Sha256};
-
-/// Unescape levels the screen resolves (ruling (d)); the fix exports it.
-const MAX_NESTED_SCREEN_DEPTH: usize = 4;
-/// Largest content the escaped and canonical views are built for.
-const MAX_VIEW_SCREEN_BYTES: usize = 1 << 20;
 
 /// Security-lens synthetic password.
 const PW: &str = concat!("Xk9m", "Q2vLp7Rw");
@@ -52,12 +49,6 @@ const FUNNEL_WRITE_CEILING: Duration = Duration::from_secs(4);
 /// The size of the bound inputs.
 const BOUND_INPUT_CHARS: usize = 100_000;
 
-/// The kind a re-screen that still hits adds (ruling (e)).
-const KIND_RESIDUAL: &str = "redaction_residual";
-/// The kind a nested value past [`MAX_NESTED_SCREEN_DEPTH`] adds (ruling (d)).
-const KIND_DEPTH_BOUND: &str = "nested_depth_bound";
-/// The kind a nested value past [`MAX_VIEW_SCREEN_BYTES`] adds (ruling (d)).
-const KIND_SIZE_BOUND: &str = "nested_size_bound";
 const KIND_PASSWORD: &str = "password_assignment";
 
 /// The exact refusal reason a write funnel returns for a residual.
@@ -73,7 +64,7 @@ fn residual_reason(kinds: &[&str]) -> String {
 /// message carries.
 fn tag(cell: &str, input: &str) -> String {
     let digest = Sha256::digest(input.as_bytes());
-    let hex: String = digest.iter().take(6).map(|b| format!("{b:02x}")).collect();
+    let hex = hex::encode(&digest[..6]);
     format!("cell={cell} sha256={hex}")
 }
 

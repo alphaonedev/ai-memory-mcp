@@ -35,10 +35,10 @@ use sha2::{Digest, Sha256};
 
 /// `sha256=<first 12 hex>` of an input: the only identification a failure
 /// message carries, so no secret-shaped fixture reaches test output
-/// (engineering-standards, secrets in output; CodeQL cleartext logging).
+/// (engineering-standards, secrets in output; `CodeQL` cleartext logging).
 fn tag(input: &str) -> String {
     let digest = Sha256::digest(input.as_bytes());
-    let hex: String = digest.iter().take(6).map(|b| format!("{b:02x}")).collect();
+    let hex = hex::encode(&digest[..6]);
     format!("sha256={hex}")
 }
 
@@ -304,20 +304,8 @@ negative_cell!(
     neg_angle_password_placeholder_8855,
     "postgres://admin:<password>@host/db and <password>"
 );
-negative_cell!(neg_password_your_password_8855, "password: <your-password>");
+
 negative_cell!(neg_password_masked_8855, "password=********");
-negative_cell!(
-    neg_env_brace_reference_8855,
-    "password=${DB_PASSWORD} or ${DB_PASSWORD}"
-);
-negative_cell!(
-    neg_env_dollar_reference_8855,
-    "password=$PASSWORD or $PASSWORD"
-);
-negative_cell!(
-    neg_stripe_test_key_8855,
-    format!("{}{STRIPE_BODY}", concat!("sk", "_test_"))
-);
 negative_cell!(
     neg_bare_word_password_in_prose_8855,
     "reset the password before the passwords are rotated"
@@ -361,8 +349,57 @@ negative_cell!(
     "the query string (it is where `password=` lives) and `?sslpassword=` are dropped"
 );
 negative_cell!(
-    neg_format_and_ellipsis_placeholder_8855,
-    "refusal must redact the DSN password: {msg}\nuse `?sslpassword=…` or host=db password=... sslmode"
+    neg_ellipsis_placeholder_8855,
+    "use `?sslpassword=…` or host=db password=... sslmode"
+);
+
+// ── Round-2 tightenings (#8855 r2 design call, fail closed by construction)
+//
+// Each input below was an accepted negative before round 2. Invariant (b)
+// accepts only a value proven a pure reference with no literal part, so
+// each is now a finding: an angle value and a brace value are literal text
+// (`<{PW}>` is in the attack table), a fallback (`or`) is a finding even
+// between two references, and a Stripe test-mode secret key is a secret key.
+
+macro_rules! tightened_cell {
+    ($name:ident, $input:expr, $kind:expr) => {
+        #[test]
+        fn $name() {
+            let input: String = $input.to_string();
+            assert_eq!(
+                kinds_of(&input),
+                vec![$kind],
+                "8855 r2: {} is a finding",
+                tag(&input)
+            );
+        }
+    };
+}
+
+tightened_cell!(
+    r2_angle_value_after_key_8855,
+    "password: <your-password>",
+    KIND_PASSWORD
+);
+tightened_cell!(
+    r2_brace_value_after_key_8855,
+    "refusal must redact the DSN password: {msg}",
+    KIND_PASSWORD
+);
+tightened_cell!(
+    r2_brace_reference_fallback_8855,
+    "password=${DB_PASSWORD} or ${DB_PASSWORD}",
+    KIND_PASSWORD
+);
+tightened_cell!(
+    r2_dollar_reference_fallback_8855,
+    "password=$PASSWORD or $PASSWORD",
+    KIND_PASSWORD
+);
+tightened_cell!(
+    r2_stripe_test_secret_key_8855,
+    format!("{}{STRIPE_BODY}", concat!("sk", "_test_")),
+    KIND_STRIPE
 );
 
 // ── Linear-time bound, adversarial per detector (100K chars) ──────────────
@@ -580,12 +617,12 @@ fn assert_redacts_exactly(kind: &'static str, rows: &[(String, String)]) {
             kinds_of(input),
             vec![kind],
             "8855: {} must trip {kind}",
-            tag(&input)
+            tag(input)
         );
         assert!(
             &redacted_of(input) == expected,
             "8855: redaction of {}",
-            tag(&input)
+            tag(input)
         );
     }
 }
@@ -667,6 +704,10 @@ const VALUE_HEAD: &str = "abc";
 const VALUE_TAIL: &str = "def123456";
 /// Context after the value, separated by a blank: it must survive.
 const AFTER_VALUE: &str = " tail";
+/// Bracket openers: a value that leaves one open runs on past its blank, so
+/// the assignment forms mask the line from the value (#9351 ruling, a
+/// round-2 tightening of the exact form above).
+const UNCLOSED_OPENERS: [u8; 3] = *b"([{";
 /// The multi-byte probe (3-byte UTF-8 code point).
 const MULTIBYTE_INNER: char = '密';
 
@@ -706,6 +747,11 @@ fn failing_inner_bytes(form: &str) -> Vec<char> {
             if name != form {
                 continue;
             }
+            let expected = if UNCLOSED_OPENERS.contains(&b) && name != "url_password" {
+                expected.replace(AFTER_VALUE, "")
+            } else {
+                expected
+            };
             if kinds_of(&input) != vec![kind] || redacted_of(&input) != expected {
                 failing.push(char::from(b));
             }
@@ -960,9 +1006,15 @@ fn multibyte_char_at_the_cut_is_on_a_char_boundary_8855() {
                 format!("password: {PLAIN_VALUE}\n{m}tail"),
                 format!("password: {ph}\n{m}tail"),
             ),
+            // r2 tightening: bytes glued to the closing quote are one shell
+            // word with the quoted part, so the line from the value is masked.
             (
                 format!("password=\"{PLAIN_VALUE}{m}\"{m}tail"),
-                format!("password=\"{ph}\"{m}tail"),
+                format!("password=\"{ph}"),
+            ),
+            (
+                format!("password=\"{PLAIN_VALUE}{m}\" {m}tail"),
+                format!("password=\"{ph}\" {m}tail"),
             ),
         ],
     );

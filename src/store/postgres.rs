@@ -2618,11 +2618,15 @@ const REASON_UNSTAMPED_TENANT_ARCHIVE: &str =
 /// redacted clone when [`crate::secret_screen::redact_memory_for_storage`]
 /// detects credential material in `content`, `title`, any `tag`, or a
 /// metadata string-leaf value (minus the crypto/system carve-out), else
-/// `None` (caller keeps the original `&Memory`). NEVER refuses — the
-/// caller-origin REFUSE happens earlier in `validate::*`; the funnel only
-/// masks (federation / recovery / internal paths must converge).
-fn screen_storage_memory(memory: &Memory) -> Option<Memory> {
-    crate::secret_screen::redact_memory_for_storage(memory)
+/// `None` (caller keeps the original `&Memory`). #8855 round 2 (ruling
+/// (e)): a row whose redacted copy still screens as a hit is refused with
+/// `StoreError::InvalidInput` (the exact reason), so no row is stored.
+fn screen_storage_memory(memory: &Memory) -> StoreResult<Option<Memory>> {
+    crate::secret_screen::redact_memory_for_storage_checked(memory).map_err(|refusal| {
+        StoreError::InvalidInput {
+            detail: refusal.to_string(),
+        }
+    })
 }
 
 impl PostgresStore {
@@ -21707,7 +21711,7 @@ impl MemoryStore for PostgresStore {
         // v0.8.1 W1 (#1821 / gap G29) — credential REDACT backstop (postgres
         // parity with the sqlite db::insert funnel). No-op unless screening
         // was seeded non-`off` and content carries credential material.
-        let screened = screen_storage_memory(memory);
+        let screened = screen_storage_memory(memory)?;
         let memory = screened.as_ref().unwrap_or(memory);
         // ARCH-1 (CRITICAL) — substrate governance pre-write parity with
         // the SQLite path. The `GOVERNANCE_PRE_WRITE` hook is consulted
@@ -22191,10 +22195,15 @@ impl MemoryStore for PostgresStore {
         // or no row carries a secret; only materializes a screened copy on a
         // hit.
         let screened_holder;
-        let memories: &[Memory] = if memories.iter().any(|m| screen_storage_memory(m).is_some()) {
+        let screened_rows = memories
+            .iter()
+            .map(screen_storage_memory)
+            .collect::<StoreResult<Vec<_>>>()?;
+        let memories: &[Memory] = if screened_rows.iter().any(Option::is_some) {
             screened_holder = memories
                 .iter()
-                .map(|m| screen_storage_memory(m).unwrap_or_else(|| m.clone()))
+                .zip(screened_rows)
+                .map(|(m, s)| s.unwrap_or_else(|| m.clone()))
                 .collect::<Vec<_>>();
             &screened_holder
         } else {
@@ -25459,8 +25468,8 @@ impl MemoryStore for PostgresStore {
         // inbound write for a tombstoned id (tombstone-wins) so a stale
         // peer cannot revive a forgotten/GDPR-erased row via LWW —
         // idempotent no-op return, logged for audit. (b) G29 credential
-        // REDACT: ALWAYS redact, NEVER refuse (a refused inbound row
-        // would diverge replicas; no-op unless screening was seeded
+        // REDACT: redact; #8855 round 2 (e) refuses only a copy that
+        // still screens as a hit (no-op unless screening was seeded
         // non-`off`). Wave-2 B4 — use `redact_memory_for_receive`
         // (ReceiveAttestationLeaves), matching `merge_inbound`. The
         // pre-B4 TrustedByName carve-out
@@ -25481,7 +25490,12 @@ impl MemoryStore for PostgresStore {
             );
             return Ok(memory.id.clone());
         }
-        let screened = crate::secret_screen::redact_memory_for_receive(memory);
+        let screened =
+            crate::secret_screen::redact_memory_for_receive_checked(memory).map_err(|refusal| {
+                StoreError::InvalidInput {
+                    detail: refusal.to_string(),
+                }
+            })?;
         let memory = screened.as_ref().unwrap_or(memory);
         // ARCH-1 (CRITICAL) — substrate governance pre-write parity.
         // Federation-pushed memories must clear the same pre-write
@@ -34459,7 +34473,7 @@ impl PostgresStore {
         self.gate_record_stop().await?;
         // v0.8.1 W1 (#1821 / gap G29) — credential REDACT backstop (postgres
         // parity); masks before the embedding + bind. No-op unless seeded.
-        let screened = screen_storage_memory(memory);
+        let screened = screen_storage_memory(memory)?;
         let memory = screened.as_ref().unwrap_or(memory);
         // ARCH-1 (CRITICAL) — substrate governance pre-write parity.
         // The semantic-recall write path MUST consult the hook just

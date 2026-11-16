@@ -1271,15 +1271,16 @@
         "filter_monitor_output_pipelines"
       ],
       "verified_at_paths": [
-        "src/secret_screen.rs:140 (pub fn screen)",
-        "src/secret_screen.rs:404 (set_screen_mode)",
-        "src/config.rs:2937 (ENV_SECRET_SCREEN_MODE)"
+        "src/secret_screen.rs:196 (pub fn screen)",
+        "src/secret_screen.rs:509 (set_screen_mode)",
+        "src/config.rs:5051 (ENV_SECRET_SCREEN_MODE)"
       ],
-      "factual_description": "Pre-write credential screen for caller-origin writes. Default refuse rejects a write whose content matches a credential detector (PEM private keys, AKIA\u2026, ghp_/github_pat_, sk-/xai- keys, Bearer, JWTs, database/broker URL userinfo passwords, password/passwd/pwd assignments, Slack xox?- tokens, Stripe sk_live_/rk_live_ keys \u2014 Shannon-entropy tiebreak so benign UUID/hex/base64 pass). Federation-receive / L2-recovery / internal re-store paths ALWAYS degrade refuse \u2192 redact (a refused inbound row would diverge replicas). Same screen masks forensic-bundle egress.",
+      "factual_description": "Pre-write credential screen for caller-origin writes. Default refuse rejects a write whose content matches a credential detector (PEM private keys, AKIA\u2026, ghp_/github_pat_, sk-/xai- keys, Bearer, JWTs, URL userinfo passwords for any RFC 3986 scheme, values of any key whose normalised name contains password/passwd/pwd unless the whole value is a pure reference, Slack xox?-/xapp- tokens and webhook paths, Stripe sk_/rk_ live and test keys and whsec_ secrets \u2014 Shannon-entropy tiebreak so benign UUID/hex/base64 pass; escaped, percent-encoded, invisible-character and homoglyph forms are screened again in decoded views, and a redacted copy that still screens as a hit refuses the write on both backends and on federation receive). Federation-receive / L2-recovery / internal re-store paths ALWAYS degrade refuse \u2192 redact (a refused inbound row would diverge replicas). Same screen masks forensic-bundle egress.",
       "verified_in_v0_7_0": false,
       "verified_in_v1_0_0": true,
       "issue_references": [
-        "#1821"
+        "#1821",
+        "#8855"
       ]
     },
     {

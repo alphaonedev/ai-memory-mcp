@@ -415,12 +415,30 @@ fn placeholder_shapes_judge_the_whole_value_9351() {
     for (name, input, expected, kind) in rows {
         check_masked(&mut misses, name, &input, &expected, kind);
     }
-    for input in [
-        "password=${DB_PASSWORD}",
-        "password: <your-password>",
-        "postgres://u:${DB_PASS}@db/x",
-        "password=${DB_PASSWORD} or ${DB_PASSWORD}",
+    // #8855 r2 tightening (invariant (b)): an angle value is literal text and
+    // a fallback is a finding even between two references; both were
+    // accepted controls before round 2.
+    for (name, input, expected) in [
+        (
+            "r2_angle_value",
+            "password: <your-password>".to_string(),
+            format!("password: {ph}"),
+        ),
+        (
+            "r2_reference_fallback",
+            "password=${DB_PASSWORD} or ${DB_PASSWORD}".to_string(),
+            format!("password={ph}"),
+        ),
     ] {
+        check_masked(
+            &mut misses,
+            name,
+            &input,
+            &expected,
+            KIND_PASSWORD_ASSIGNMENT,
+        );
+    }
+    for input in ["password=${DB_PASSWORD}", "postgres://u:${DB_PASS}@db/x"] {
         check_accepted(&mut misses, "placeholder_control", input);
     }
     assert_no_misses("placeholders", &misses);
