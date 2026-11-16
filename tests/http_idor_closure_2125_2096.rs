@@ -465,13 +465,15 @@ async fn reflect_forged_body_agent_id_is_refused_under_enforce() {
     let text = body_text(resp).await;
     assert_eq!(
         status,
-        StatusCode::BAD_REQUEST,
-        "#2140: a reflect with a forged body agent_id and no matching header \
-         must be refused (got {status}, body={text})"
+        StatusCode::FORBIDDEN,
+        "#2140 / PR 9390 H1: a reflect with a forged body agent_id and no \
+         matching header is refused by the Enforce funnel (got {status}, body={text})"
     );
-    assert!(
-        text.contains("agent_id_body_header_mismatch"),
-        "#2140: the refusal must be the header-authoritative identity binding, \
+    let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+    assert_eq!(
+        v.get("error").and_then(serde_json::Value::as_str),
+        Some(ATTESTED_IDENTITY_REQUIRED),
+        "#2140 / PR 9390 H1: the refusal must be the funnel's identity refusal, \
          not an incidental substrate error (body={text})"
     );
 }
@@ -605,13 +607,15 @@ async fn reflect_zero_enrollment_enforce_refuses_body_named_author_9341() {
     let (status, text) = zero_enroll_body_only_reflect(HttpIdentityMode::Enforce).await;
     assert_eq!(
         status,
-        StatusCode::BAD_REQUEST,
-        "#9341 B-1: a body-only agent_id:{VICTIM} reflect from the anonymous \
-         caller must be refused under enforce with zero keys (body={text})"
+        StatusCode::FORBIDDEN,
+        "#9341 B-1 / PR 9390 H1: a body-only agent_id:{VICTIM} reflect from the \
+         anonymous caller must be refused under enforce with zero keys (body={text})"
     );
-    assert!(
-        text.contains("agent_id_body_header_mismatch"),
-        "#9341 B-1: the refusal is the header-authoritative body binding (body={text})"
+    let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+    assert_eq!(
+        v.get("error").and_then(serde_json::Value::as_str),
+        Some(ATTESTED_IDENTITY_REQUIRED),
+        "#9341 B-1 / PR 9390 H1: the refusal is the Enforce funnel's (body={text})"
     );
 }
 
