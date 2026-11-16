@@ -295,33 +295,53 @@ struct Probe9273<'c> {
     conn: &'c rusqlite::Connection,
     label: String,
     violations: Vec<String>,
+    /// One line per (case, setting, funnel): the write result and the
+    /// integrity-check result, printed as the funnel table.
+    cells: Vec<String>,
 }
 
 impl Probe9273<'_> {
+    fn new<'c>(conn: &'c rusqlite::Connection, label: String) -> Probe9273<'c> {
+        Probe9273 {
+            conn,
+            label,
+            violations: Vec::new(),
+            cells: Vec::new(),
+        }
+    }
+
     /// Run one write path: the write must not fail with 267, and the FTS5
     /// integrity-check must pass after it. Returns the write's value on `Ok`.
     fn step<T>(&mut self, path: &str, result: anyhow::Result<T>) -> Option<T> {
-        let value = match result {
-            Ok(value) => Some(value),
+        let (value, write) = match result {
+            Ok(value) => (Some(value), "ok".to_string()),
             Err(e) => {
                 let code = sqlite_code_9273(&e);
                 self.violations.push(format!(
                     "{} {path}: write failed (sqlite code {code:?}): {e:#}",
                     self.label
                 ));
-                None
+                (None, format!("err({code:?})"))
             }
         };
-        if let Err(code) = fts_check_9273(self.conn) {
-            self.violations.push(format!(
-                "{} {path}+integrity-check: code {code}",
-                self.label
-            ));
-            // Re-derive the index so the next path is judged on its own.
-            self.conn
-                .execute_batch("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')")
-                .expect("rebuild between paths");
-        }
+        let fts = match fts_check_9273(self.conn) {
+            Ok(()) => "ok".to_string(),
+            Err(code) => {
+                self.violations.push(format!(
+                    "{} {path}+integrity-check: code {code}",
+                    self.label
+                ));
+                // Re-derive the index so the next path is judged on its own.
+                self.conn
+                    .execute_batch("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')")
+                    .expect("rebuild between paths");
+                code.to_string()
+            }
+        };
+        self.cells.push(format!(
+            "cell-9273 | {} | {path} | write={write} | integrity-check={fts}",
+            self.label
+        ));
         value
     }
 }
@@ -581,6 +601,105 @@ fn bound_registration_write_paths_9273(p: &mut Probe9273<'_>) {
         "restore_archived(_agents)",
         ai_memory::db::restore_archived(conn, PLANT_ID_9273),
     );
+    bound_registration_lifecycle_paths_9273(p, &legitimate, &attacker_key);
+}
+
+/// The registration lifecycle funnels of #9259 / #9260 and the v97 AFTER
+/// INSERT rewriter (0081:154-224): register refresh, same-key rebind,
+/// portability import, delete then re-insert while the history row is open,
+/// revoke, and a lineage-authorised key rotation (genesis then succession).
+fn bound_registration_lifecycle_paths_9273(
+    p: &mut Probe9273<'_>,
+    legitimate: &ai_memory::identity::keypair::AgentKeypair,
+    attacker_key: &str,
+) {
+    let conn = p.conn;
+    p.step(
+        "register_agent(_agents refresh)",
+        ai_memory::db::register_agent(conn, VICTIM_9273, "test", &[]),
+    );
+    p.step(
+        "bind_agent_pubkey_with_keypair(same key, #9259)",
+        ai_memory::db::bind_agent_pubkey_with_keypair(conn, VICTIM_9273, legitimate),
+    );
+    if let Ok(mut federated) = federated_row_9273(conn, attacker_key) {
+        federated.updated_at = "2099-09-01T00:00:00Z".to_string();
+        p.step(
+            "import_full_envelope(_agents newer)",
+            ai_memory::portability::import::import_full_envelope(
+                conn,
+                &envelope_9273(vec![federated]),
+                &ai_memory::portability::import::ImportOptions {
+                    caller_agent_id: CONSOLIDATOR_9273.to_string(),
+                    ..ai_memory::portability::import::ImportOptions::default()
+                },
+            ),
+        );
+    }
+    p.step(
+        "delete(_agents)",
+        ai_memory::db::delete(conn, PLANT_ID_9273),
+    );
+    p.step(
+        "insert(_agents, history open: v97 AFTER INSERT rewriter)",
+        ai_memory::db::insert(conn, &planted_row_9273(attacker_key)),
+    );
+    p.step(
+        "revoke_agent_pubkey",
+        ai_memory::db::revoke_agent_pubkey(conn, VICTIM_9273),
+    );
+    // Key rotation is lineage-authorised (#1949): enroll a genesis, then
+    // append a succession, which rebinds the _agents row to the new key.
+    let k0 = ai_memory::identity::keypair::generate(ROTATED_9273).expect("keypair");
+    let recovery = ai_memory::identity::keypair::generate(ROTATED_9273)
+        .expect("keypair")
+        .public_base64();
+    p.step(
+        "register_agent(rotation agent)",
+        ai_memory::db::register_agent(conn, ROTATED_9273, "test", &[]),
+    );
+    p.step(
+        "enroll_lineage(genesis bind)",
+        ai_memory::db::enroll_lineage(conn, ROTATED_9273, &k0, Some(&recovery)).map(drop),
+    );
+    let k1 = ai_memory::identity::keypair::generate(ROTATED_9273).expect("keypair");
+    p.step(
+        "append_succession(key rotation)",
+        ai_memory::db::append_succession(conn, ROTATED_9273, &k0, &k1.public_base64(), None)
+            .map(drop),
+    );
+}
+
+/// The agent whose key the lifecycle cells rotate through lineage.
+const ROTATED_9273: &str = "ai:rotation-9273";
+
+fn envelope_9273(
+    memories: Vec<ai_memory::models::Memory>,
+) -> ai_memory::portability::emit::ExportEnvelope {
+    let count = memories.len();
+    ai_memory::portability::emit::ExportEnvelope {
+        spec_version: ai_memory::portability::emit::SPEC_VERSION_V2.to_string(),
+        // 0 <= any destination schema, so the newer-producer gate never fires.
+        db_schema_version: 0,
+        source: "issue-9273-test".into(),
+        exported_at: FAR_FUTURE_9273.into(),
+        memories,
+        links: Vec::new(),
+        signed_events: Vec::new(),
+        memory_revisions: Vec::new(),
+        forget_tombstones: Vec::new(),
+        agent_lineage: Vec::new(),
+        model_attestations: Vec::new(),
+        governance_rules: Vec::new(),
+        trust_anchors: Vec::new(),
+        archived_memories: Vec::new(),
+        namespace_meta: Vec::new(),
+        archived_memory_links: Vec::new(),
+        portability_complete: false,
+        conformance_level: "L1".into(),
+        conformance_by_class: std::collections::BTreeMap::new(),
+        count,
+    }
 }
 
 /// The class invariant over every product write path to `memories`, with
@@ -597,12 +716,11 @@ fn every_write_path_keeps_memories_fts_in_step_9273() {
     for recursive in [false, true] {
         for (case, run) in CASES_9273 {
             let (_f, conn) = open_db_9273(recursive);
-            let mut probe = Probe9273 {
-                conn: &conn,
-                label: format!("{case} recursive={recursive}"),
-                violations: Vec::new(),
-            };
+            let mut probe = Probe9273::new(&conn, format!("{case} recursive={recursive}"));
             run(&mut probe);
+            for cell in &probe.cells {
+                eprintln!("{cell}");
+            }
             violations.append(&mut probe.violations);
         }
     }
@@ -668,4 +786,292 @@ fn integrity_check_is_bounded_over_100k_rows_9273() {
         elapsed < BOUND_CHECK_MS_9273,
         "integrity-check over {rows} rows took {elapsed} ms (ceiling {BOUND_CHECK_MS_9273})"
     );
+    // The repair the v102 migration runs (twice) and the doctor row names.
+    let started = std::time::Instant::now();
+    conn.execute_batch(REBUILD_9273).expect("rebuild");
+    let rebuild_ms = started.elapsed().as_millis();
+    eprintln!("9273 rebuild over {rows} rows: {rebuild_ms} ms");
+    assert!(
+        rebuild_ms < BOUND_CHECK_MS_9273,
+        "rebuild over {rows} rows took {rebuild_ms} ms (ceiling {BOUND_CHECK_MS_9273})"
+    );
+    assert_eq!(fts_check_9273(&conn), Ok(()));
+}
+
+// ---------------------------------------------------------------------------
+// Schema invariant: no trigger on `memories` other than the FTS5 sync
+// triggers writes `memories` or `memories_fts`. A trigger that rewrites the row
+// from inside a `memories` trigger runs before or after the FTS sync and the
+// index stops matching the table (the v97 shape). Guards may only RAISE.
+// ---------------------------------------------------------------------------
+
+const REBUILD_9273: &str = "INSERT INTO memories_fts(memories_fts) VALUES('rebuild')";
+/// The external-content sync triggers: the only triggers allowed to write the
+/// index, and they never write `memories`.
+const FTS_SYNC_TRIGGERS_9273: [&str; 3] = ["memories_ai", "memories_ad", "memories_au"];
+/// Statement shapes that write `memories` (any UPDATE / INSERT / REPLACE /
+/// DELETE form) after normalisation.
+const MEMORIES_WRITES_9273: [&str; 3] =
+    ["INTO MEMORIES ", "MEMORIES SET ", "DELETE FROM MEMORIES "];
+const INDEX_WRITES_9273: [&str; 3] = [
+    "INTO MEMORIES_FTS ",
+    "MEMORIES_FTS SET ",
+    "DELETE FROM MEMORIES_FTS ",
+];
+const V97_MIGRATION_SQL_9273: &str =
+    include_str!("../migrations/sqlite/0081_v97_agent_pubkey_history.sql");
+const V97_TRIGGERS_9273: [&str; 2] = [
+    "agent_pubkey_history_authoritative_insert_v97",
+    "agent_pubkey_history_authoritative_update_v97",
+];
+const GUARD_TRIGGERS_9273: [&str; 2] = [
+    "agent_pubkey_history_projection_guard_insert",
+    "agent_pubkey_history_projection_guard_update",
+];
+/// The ladder rung of the v102 guard migration (0086).
+const GUARD_RUNG_9273: i64 = 102;
+
+/// The trigger body (after BEGIN), upper case, with quoting, punctuation and
+/// the `main.` schema prefix removed and whitespace collapsed, padded so every
+/// needle can end in a space.
+fn trigger_body_9273(sql: &str) -> String {
+    let upper = sql.to_ascii_uppercase();
+    let body = upper.find("BEGIN").map_or("", |at| &upper[at..]);
+    let cleaned: String = body
+        .chars()
+        .map(|c| match c {
+            '"' | '`' | '[' | ']' => ' ',
+            '(' | ')' | ';' | ',' => ' ',
+            other => other,
+        })
+        .collect();
+    let collapsed = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    format!("{} ", collapsed.replace("MAIN . ", "").replace("MAIN.", ""))
+}
+
+/// The class violations of one trigger on `memories`, by name.
+fn trigger_violation_9273(name: &str, sql: &str) -> Option<String> {
+    let body = trigger_body_9273(sql);
+    let writes_row = MEMORIES_WRITES_9273.iter().any(|n| body.contains(n));
+    let writes_index = INDEX_WRITES_9273.iter().any(|n| body.contains(n));
+    let sync = FTS_SYNC_TRIGGERS_9273.contains(&name);
+    match (sync, writes_row, writes_index) {
+        (_, true, _) => Some(format!("{name}: writes memories from a memories trigger")),
+        (false, _, true) => Some(format!("{name}: writes memories_fts outside the FTS sync")),
+        _ => None,
+    }
+}
+
+fn memories_trigger_violations_9273(conn: &rusqlite::Connection) -> Vec<String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT name, sql FROM sqlite_master
+              WHERE type = 'trigger' AND tbl_name = 'memories' ORDER BY name",
+        )
+        .expect("prepare");
+    let triggers: Vec<(String, String)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .expect("query")
+        .collect::<Result<_, _>>()
+        .expect("rows");
+    triggers
+        .iter()
+        .filter_map(|(name, sql)| trigger_violation_9273(name, sql))
+        .collect()
+}
+
+/// The invariant over the schema `db::open` builds: red when any later
+/// migration adds a trigger on `memories` that rewrites the row or the index
+/// (the v97 shape, M2 in the PR body), green on v102.
+#[test]
+fn no_memories_trigger_writes_the_row_or_the_index_9273() {
+    let (_f, conn) = open_db_9273(false);
+    let violations = memories_trigger_violations_9273(&conn);
+    assert!(
+        violations.is_empty(),
+        "memories triggers outside the class invariant: {violations:?}"
+    );
+    for sync in FTS_SYNC_TRIGGERS_9273 {
+        let present: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'trigger' AND name = ?1",
+                [sync],
+                |r| r.get(0),
+            )
+            .expect("sync trigger");
+        assert_eq!(present, 1, "{sync} keeps the index in step");
+    }
+}
+
+/// Mutation proof of the checker: each planted unguarded trigger, created after
+/// the FTS triggers, is named exactly; a RAISE-only guard is not.
+#[test]
+fn trigger_invariant_flags_every_planted_rewriter_9273() {
+    const PLANTED_9273: [(&str, &str); 4] = [
+        (
+            "planted_insert_rewriter_9273",
+            "CREATE TRIGGER planted_insert_rewriter_9273 AFTER INSERT ON memories BEGIN
+                 UPDATE OR IGNORE \"memories\" SET content = NEW.content || '' WHERE id = NEW.id;
+             END;",
+        ),
+        (
+            "planted_update_rewriter_9273",
+            "CREATE TRIGGER planted_update_rewriter_9273 AFTER UPDATE OF content ON memories BEGIN
+                 UPDATE memories
+                    SET title = NEW.title WHERE id = NEW.id;
+             END;",
+        ),
+        (
+            "planted_index_writer_9273",
+            "CREATE TRIGGER planted_index_writer_9273 AFTER UPDATE ON memories BEGIN
+                 INSERT INTO memories_fts(rowid, title, content, tags) VALUES (NEW.rowid, NEW.title, NEW.content, NEW.tags);
+             END;",
+        ),
+        (
+            "planted_replace_9273",
+            "CREATE TRIGGER planted_replace_9273 BEFORE DELETE ON memories BEGIN
+                 REPLACE INTO memories(id) SELECT OLD.id;
+             END;",
+        ),
+    ];
+    for (name, sql) in PLANTED_9273 {
+        let (_f, conn) = open_db_9273(false);
+        conn.execute_batch(sql).expect("plant");
+        let violations = memories_trigger_violations_9273(&conn);
+        assert_eq!(violations.len(), 1, "{name}: {violations:?}");
+        assert!(
+            violations[0].starts_with(&format!("{name}: ")),
+            "{violations:?}"
+        );
+    }
+    let (_f, conn) = open_db_9273(false);
+    conn.execute_batch(
+        "CREATE TRIGGER planted_guard_9273 AFTER UPDATE ON memories BEGIN
+             SELECT RAISE(ABORT, 'guard only') WHERE NEW.title = 'never-9273';
+         END;",
+    )
+    .expect("plant guard");
+    assert_eq!(
+        memories_trigger_violations_9273(&conn),
+        Vec::<String>::new()
+    );
+    for name in V97_TRIGGERS_9273 {
+        let sql = v97_trigger_sql_9273(name);
+        assert!(
+            trigger_violation_9273(name, sql).is_some(),
+            "{name} is the class"
+        );
+    }
+}
+
+/// One `CREATE TRIGGER ... END;` statement of the v97 migration text.
+fn v97_trigger_sql_9273(name: &str) -> &'static str {
+    let head = format!("CREATE TRIGGER IF NOT EXISTS {name}");
+    let start = V97_MIGRATION_SQL_9273
+        .find(&head)
+        .expect("v97 trigger in 0081");
+    let tail = &V97_MIGRATION_SQL_9273[start..];
+    let end = tail.find("END;").expect("v97 trigger END") + "END;".len();
+    &tail[..end]
+}
+
+type Snapshot9273 = (Vec<(String, String, String, String)>, Vec<String>);
+
+fn snapshot_9273(conn: &rusqlite::Connection) -> Snapshot9273 {
+    let mut rows = conn
+        .prepare("SELECT id, title, content, metadata FROM memories ORDER BY id")
+        .expect("prepare");
+    let rows: Vec<(String, String, String, String)> = rows
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        .expect("query")
+        .collect::<Result<_, _>>()
+        .expect("rows");
+    let mut triggers = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'trigger' ORDER BY name")
+        .expect("prepare");
+    let triggers: Vec<String> = triggers
+        .query_map([], |r| r.get(0))
+        .expect("query")
+        .collect::<Result<_, _>>()
+        .expect("rows");
+    (rows, triggers)
+}
+
+fn rewind_below_guard_9273(conn: &rusqlite::Connection) {
+    conn.execute_batch(&format!(
+        "DELETE FROM schema_version; INSERT INTO schema_version(version) VALUES ({});",
+        GUARD_RUNG_9273 - 1
+    ))
+    .expect("rewind below the v102 rung");
+}
+
+/// A store written by the base (v97 rewriters live, no guards) through the
+/// base update and insert funnels holds a desynced index; opening it with the
+/// fixed binary runs v102, which repairs it, and a second upgrade changes
+/// nothing.
+#[test]
+fn upgrade_repairs_a_store_corrupted_by_the_base_path_9273() {
+    let f = tempfile::NamedTempFile::new().expect("tempfile");
+    let attacker_key = ai_memory::identity::keypair::generate(ATTACKER_9273)
+        .expect("keypair")
+        .public_base64();
+    {
+        let conn = ai_memory::db::open(f.path()).expect("db::open");
+        ai_memory::db::insert(
+            &conn,
+            &plain_row_9273(PLAIN_A_9273, "plain kept", "kept body"),
+        )
+        .expect("plain row");
+        ai_memory::db::insert(&conn, &planted_row_9273(&attacker_key)).expect("plant");
+        let legitimate = ai_memory::identity::keypair::generate(VICTIM_9273).expect("keypair");
+        ai_memory::db::bind_agent_pubkey_with_keypair(&conn, VICTIM_9273, &legitimate)
+            .expect("bind");
+        // The base schema: guards absent, v97 rewriters present.
+        for guard in GUARD_TRIGGERS_9273 {
+            conn.execute_batch(&format!("DROP TRIGGER IF EXISTS {guard};"))
+                .expect("drop guard");
+        }
+        for name in V97_TRIGGERS_9273 {
+            conn.execute_batch(v97_trigger_sql_9273(name))
+                .expect("v97 trigger");
+        }
+        // The base update funnel wrote the caller's content unprojected.
+        let mirror = serde_json::json!({"agent_id": VICTIM_9273, "note": "base9273"}).to_string();
+        conn.execute(
+            "UPDATE memories SET content = ?1 WHERE id = ?2",
+            rusqlite::params![mirror, PLANT_ID_9273],
+        )
+        .expect("base update path");
+        assert_eq!(
+            fts_check_9273(&conn),
+            Err(SQLITE_CORRUPT_VTAB_9273),
+            "fixture: the base update path desyncs the index"
+        );
+        rewind_below_guard_9273(&conn);
+    }
+    let conn = ai_memory::db::open(f.path()).expect("upgrade");
+    let after_upgrade = fts_check_9273(&conn);
+    eprintln!("9273 upgrade of a base-corrupted store: integrity-check {after_upgrade:?}");
+    assert_eq!(after_upgrade, Ok(()), "v102 rebuilt memories_fts");
+    assert_eq!(
+        memories_trigger_violations_9273(&conn),
+        Vec::<String>::new()
+    );
+    let first = snapshot_9273(&conn);
+    for name in V97_TRIGGERS_9273 {
+        assert!(!first.1.iter().any(|t| t == name), "{name} dropped");
+    }
+    for guard in GUARD_TRIGGERS_9273 {
+        assert!(first.1.iter().any(|t| t == guard), "{guard} installed");
+    }
+    // Idempotent: a reopen and a re-run of the rung change nothing.
+    drop(conn);
+    let conn = ai_memory::db::open(f.path()).expect("reopen");
+    assert_eq!(snapshot_9273(&conn), first, "reopen is a no-op");
+    rewind_below_guard_9273(&conn);
+    drop(conn);
+    let conn = ai_memory::db::open(f.path()).expect("re-run v102");
+    assert_eq!(snapshot_9273(&conn), first, "re-running v102 is a no-op");
+    assert_eq!(fts_check_9273(&conn), Ok(()));
+    eprintln!("9273 v102 re-run on the repaired store: snapshot unchanged, integrity-check ok");
 }
