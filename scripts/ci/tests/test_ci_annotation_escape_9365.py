@@ -1089,5 +1089,70 @@ class OsPlantNeverRuns(unittest.TestCase):
                         self.assertEqual(results[1], results[0])
 
 
+# The five gates (ruling 0011e5e0): a failed load of the shared module fails the step with the gate's fail-closed
+# exit code, one fixed ::error line built without the module and one stderr line naming the cause; nothing else.
+GATE_LOAD_EXIT_CODES = {
+    "scripts/ci/load_gate.py": 3,  # EXIT_LOAD_REFUSED (0 = proceed, 2 = bad arguments)
+    "scripts/ci/pg_env_preflight.py": 3,  # EXIT_PG_ENV
+    "scripts/ci/tier_cred_preflight.py": 1,  # EXIT_UNAVAILABLE
+    "scripts/ci/host_semaphore.py": 4,  # EXIT_LOAD_REFUSED (3 = no slot; any other code is the child's)
+    "scripts/ci/partition_test_binaries.py": 2,  # EXIT_FAIL_CLOSED
+}
+GATE_LOAD_ERROR_LINE = ("::error title={prog} refused::{prog}: refused: shared module workflow_annotation.py next to "
+                        "the script cannot be loaded")
+GATE_LOAD_STDERR_LINE = ("{prog}: refused: shared module workflow_annotation.py next to the script cannot be loaded "
+                         "({cause})")
+GATE_LOAD_BREAKS = {  # break name -> (how the fixture copy of the shared module is broken, the cause named)
+    "absent": (None, "FileNotFoundError"),
+    "unreadable": ("", "PermissionError"),
+    "syntax error": ("def broken(:\n", "SyntaxError"),
+    "sys.exit(0) in it": ("import sys\nsys.exit(0)\n", "SystemExit"),
+}
+GATE_PASS_MARKERS = ("usage:", "::notice", "::warning")
+
+
+class GateLoadFailsClosed(unittest.TestCase):
+    """A gate whose shared module cannot be loaded exits non-zero with one loud ::error line (ruling 0011e5e0)."""
+
+    def gate_run(self, rel, broken, cause_source, flags):
+        base = scratch_dir("gate-load")
+        self.addCleanup(shutil.rmtree, str(base), True)
+        repo = base / "repo"
+        for item in (rel, *SIBLING_SCRIPTS[rel], SHARED_MODULE_PATH):
+            (repo / item).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(REPO / item, repo / item)
+        shared = repo / SHARED_MODULE_PATH
+        if cause_source is None:
+            shared.unlink()
+        elif broken == "unreadable":
+            shared.chmod(0)
+            self.addCleanup(shared.chmod, 0o600)
+        else:
+            shared.write_text(cause_source, encoding="utf-8")
+        cwd = base / "cwd"
+        cwd.mkdir()
+        env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "LANG": "C.UTF-8", "PYTHONDONTWRITEBYTECODE": "1",
+               "TMPDIR": str(cwd)}
+        proc = subprocess.run([sys.executable, *flags, str(repo / rel), "--help"], capture_output=True, env=env,
+                              cwd=str(cwd), timeout=SUBPROCESS_TIMEOUT_SECS, check=False)
+        return proc.returncode, proc.stdout.decode("utf-8", "replace"), proc.stderr.decode("utf-8", "replace")
+
+    def test_failed_load_fails_each_gate_closed_9365(self):
+        if os.geteuid() == 0:
+            self.skipTest("root reads a mode-0 file")
+        for rel, code in GATE_LOAD_EXIT_CODES.items():
+            prog = Path(rel).stem
+            for broken, (source, cause) in GATE_LOAD_BREAKS.items():
+                for label, flags in PYTHON_FLAG_SETS:
+                    with self.subTest(gate=prog, broken=broken, flags=label):
+                        rc, out, err = self.gate_run(rel, broken, source, flags)
+                        self.assertNotEqual(rc, EXIT_OK_CODE, (out, err[-2000:]))
+                        self.assertEqual(rc, code, err[-2000:])
+                        self.assertEqual(out, GATE_LOAD_ERROR_LINE.format(prog=prog) + "\n")
+                        self.assertEqual(err, GATE_LOAD_STDERR_LINE.format(prog=prog, cause=cause) + "\n")
+                        for marker in GATE_PASS_MARKERS:
+                            self.assertNotIn(marker, out + err)
+
+
 if __name__ == "__main__":
     unittest.main()
