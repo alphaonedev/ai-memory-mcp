@@ -71,8 +71,10 @@ const BLANK_KEYS: [(&str, &str); 11] = [
 ];
 /// Keys that look blank to a human but are NOT `White_Space` for `str::trim`:
 /// the product treats each as a real, non-blank key (label, value). A zero
-/// width space and a BOM are not blank; a header cannot carry either (they are
-/// not visible ASCII), so such a key can never be matched and fails closed.
+/// width space and a BOM are not blank. A header does carry their UTF-8 bytes
+/// (`HeaderValue::from_bytes` accepts them as obs-text), but both gates read
+/// `x-api-key` with `HeaderValue::to_str`, which refuses any byte that is not
+/// visible ASCII, so such a key is never matched and every request fails closed.
 const NON_BLANK_LOOKALIKES: [(&str, &str); 2] =
     [("zero-width-space", "\u{200b}"), ("bom", "\u{feff}")];
 /// U+00A0 NO-BREAK SPACE, Unicode `White_Space`.
@@ -851,20 +853,26 @@ fn p5_blank_corpus_pins_9354() {
     );
 }
 
+/// 6 postures x 2 lookalike keys x 4 headers (absent, empty, space, the key).
+const LOOKALIKE_EXPECTED_REQUESTS: usize = 48;
+
 /// p6 — the not-`White_Space` lookalikes (U+200B, U+FEFF) are real keys: the
-/// router holds them as the configured key, and since no header can carry the
-/// bytes (not visible ASCII) every request is refused with the exact refusal;
-/// that is fail-closed, never an admit. The boot path keeps them verbatim.
+/// router holds them as the configured key. Every header case is carried (the
+/// `SameAsKey` header holds the key's own UTF-8 bytes as obs-text), and every
+/// request is refused with the exact refusal because both gates read the
+/// header with `HeaderValue::to_str`, which refuses those bytes: fail-closed,
+/// never an admit, in every identity mode. The boot path keeps them verbatim.
 #[tokio::test]
 async fn p6_non_whitespace_lookalikes_are_non_blank_keys_9354() {
+    let mut carried = 0usize;
     for posture in postures() {
         for (label, key) in NON_BLANK_LOOKALIKES {
             let app = router(Entry::LibBuildRouter, Some(key), posture);
             for case in HEADER_CASES {
-                let Some((status, body)) = send(&app, READ_ROUTE, header_value(case, key)).await
-                else {
-                    continue;
-                };
+                let (status, body) = send(&app, READ_ROUTE, header_value(case, key))
+                    .await
+                    .unwrap_or_else(|| panic!("{posture:?} key={label} {case:?}: carried"));
+                carried += 1;
                 assert_eq!(
                     status, REFUSAL_STATUS,
                     "{posture:?} key={label} {case:?}: {body}"
@@ -873,6 +881,10 @@ async fn p6_non_whitespace_lookalikes_are_non_blank_keys_9354() {
             }
         }
     }
+    assert_eq!(
+        carried, LOOKALIKE_EXPECTED_REQUESTS,
+        "every lookalike request is carried"
+    );
     for (label, key) in NON_BLANK_LOOKALIKES {
         let path = scratch_db();
         let tls = tls_helper::TestTls::generate(&path.with_extension("tls9354"));
@@ -1084,7 +1096,9 @@ async fn b3_boot_blank_key_warns_with_remedy_and_probes_stay_reachable_9354() {
 
 /// Blank every comment and string/char literal of Rust source (newlines kept,
 /// so line numbers hold). Handles `//`, nested `/* */`, `"..."` with escapes
-/// (multi-line too), raw strings `r#"..."#`, char literals and lifetimes.
+/// (multi-line too, and the `b"..."` / `c"..."` forms), raw strings
+/// `r#"..."#` with their `br` / `cr` forms, char literals (`'\''` included),
+/// byte chars and lifetimes.
 fn blank_literals_and_comments(src: &str) -> String {
     let c: Vec<char> = src.chars().collect();
     let mut out = String::with_capacity(src.len());
@@ -1118,7 +1132,9 @@ fn blank_literals_and_comments(src: &str) -> String {
                 }
             }
         } else if c[i] == 'r'
-            && (i == 0 || !(c[i - 1].is_alphanumeric() || c[i - 1] == '_'))
+            && (i == 0
+                || !is_ident(c[i - 1])
+                || (matches!(c[i - 1], 'b' | 'c') && (i < 2 || !is_ident(c[i - 2]))))
             && (rest_is(i, "r\"") || rest_is(i, "r#"))
         {
             let mut j = i + 1;
@@ -1155,7 +1171,9 @@ fn blank_literals_and_comments(src: &str) -> String {
             i += 1;
         } else if c[i] == '\'' {
             if i + 1 < c.len() && c[i + 1] == '\\' {
-                let mut k = i + 2;
+                // The escaped char sits at i + 2 (`'\''` escapes a quote),
+                // so the closing quote is searched from i + 3.
+                let mut k = i + 3;
                 while k < c.len() && c[k] != '\'' {
                     k += 1;
                 }
@@ -1181,90 +1199,286 @@ fn is_ident(ch: char) -> bool {
     ch.is_alphanumeric() || ch == '_'
 }
 
+/// The identifier that starts at `at` (not preceded by an ident char), if any.
+fn ident_at(c: &[char], at: usize) -> Option<String> {
+    let starts = c.get(at).is_some_and(|&ch| is_ident(ch)) && (at == 0 || !is_ident(c[at - 1]));
+    starts.then(|| c[at..].iter().take_while(|&&ch| is_ident(ch)).collect())
+}
+
+/// Index of the first char at or after `at` that is not whitespace.
+fn skip_ws(c: &[char], mut at: usize) -> usize {
+    while at < c.len() && c[at].is_whitespace() {
+        at += 1;
+    }
+    at
+}
+
+/// Index just past the last char before `end` that is not whitespace.
+fn skip_ws_back(c: &[char], mut end: usize) -> usize {
+    while end > 0 && c[end - 1].is_whitespace() {
+        end -= 1;
+    }
+    end
+}
+
+/// The identifier that ends right before `end` (whitespace skipped), with its
+/// start index.
+fn ident_before(c: &[char], end: usize) -> Option<(usize, String)> {
+    let stop = skip_ws_back(c, end);
+    let mut start = stop;
+    while start > 0 && is_ident(c[start - 1]) {
+        start -= 1;
+    }
+    (start < stop).then(|| (start, c[start..stop].iter().collect()))
+}
+
+/// Index of the bracket that closes the one opened at `open` (`{`, `(` and
+/// `[` counted together), or `c.len()` when it never closes.
+fn matching_close(c: &[char], open: usize) -> usize {
+    let mut depth = 0usize;
+    for (at, &ch) in c.iter().enumerate().skip(open) {
+        match ch {
+            '{' | '(' | '[' => depth += 1,
+            '}' | ')' | ']' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return at;
+                }
+            }
+            _ => {}
+        }
+    }
+    c.len()
+}
+
+/// Index of the innermost unclosed `{`, `(` or `[` before `at`, if any.
+fn enclosing_open(c: &[char], at: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for back in (0..at).rev() {
+        match c[back] {
+            '}' | ')' | ']' => depth += 1,
+            '{' | '(' | '[' => match depth.checked_sub(1) {
+                Some(outer) => depth = outer,
+                None => return Some(back),
+            },
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The statement text before `at` (since the last `;`, `{` or `}`).
+fn stmt_prefix(c: &[char], at: usize) -> String {
+    let start = c[..at]
+        .iter()
+        .rposition(|&ch| matches!(ch, ';' | '{' | '}'))
+        .map_or(0, |p| p + 1);
+    c[start..at].iter().collect()
+}
+
+fn has_word(text: &str, word: &str) -> bool {
+    text.split(|ch: char| !is_ident(ch)).any(|w| w == word)
+}
+
+/// Every name of the guarded type in one source: the type itself, each
+/// `use .. T as X` rename and each `type X = T;` / `type X = path::T;` alias.
+fn guarded_names(c: &[char], guarded_type: &str) -> Vec<String> {
+    let path_suffix = format!("::{guarded_type}");
+    let mut names = vec![guarded_type.to_string()];
+    for at in 0..c.len() {
+        let Some(word) = ident_at(c, at) else {
+            continue;
+        };
+        let after = skip_ws(c, at + word.chars().count());
+        if word == guarded_type && ident_at(c, after).as_deref() == Some("as") {
+            if let Some(alias) = ident_at(c, skip_ws(c, after + 2)) {
+                names.push(alias);
+            }
+        } else if word == "type" {
+            if let Some(alias) = ident_at(c, after) {
+                let from = after + alias.chars().count();
+                let semi = c[from..]
+                    .iter()
+                    .position(|&ch| ch == ';')
+                    .map_or(c.len(), |p| from + p);
+                let rhs: String = c[from..semi]
+                    .iter()
+                    .filter(|ch| !ch.is_whitespace())
+                    .collect();
+                if let Some(target) = rhs.strip_prefix('=') {
+                    if target == guarded_type || target.ends_with(&path_suffix) {
+                        names.push(alias);
+                    }
+                }
+            }
+        }
+    }
+    names
+}
+
+/// Bodies `(open, close)` of every `impl` whose self type is a guarded name
+/// (`impl T {` and `impl Trait for T {`): inside them `Self` is the type.
+fn guarded_impl_bodies(c: &[char], names: &[String]) -> Vec<(usize, usize)> {
+    let mut bodies = Vec::new();
+    for at in 0..c.len() {
+        let Some(word) = ident_at(c, at) else {
+            continue;
+        };
+        let open = skip_ws(c, at + word.chars().count());
+        if names.contains(&word)
+            && c.get(open) == Some(&'{')
+            && has_word(&stmt_prefix(c, at), "impl")
+        {
+            bodies.push((open, matching_close(c, open)));
+        }
+    }
+    bodies
+}
+
+/// Is the item spanning `start..end` a pattern (`Some(true)`), an expression
+/// (`Some(false)`), or unknown (`None`), judged by its neighbours? An item
+/// with no decisive neighbour inside `( )`, `[ ]` or a `Path { }` takes the
+/// verdict of that enclosing item.
+fn pattern_position(c: &[char], mut start: usize, mut end: usize) -> Option<bool> {
+    loop {
+        let next = skip_ws(c, end);
+        let after = c.get(next).copied();
+        let after2 = c.get(next + 1).copied();
+        match after {
+            Some('=') if after2 != Some('=') => return Some(true),
+            Some(':') if after2 != Some(':') => return Some(true),
+            Some('|' | '@') => return Some(true),
+            Some(';' | '.' | '?') => return Some(false),
+            _ => {}
+        }
+        if matches!(ident_at(c, next).as_deref(), Some("in" | "if")) {
+            return Some(true);
+        }
+        let mut before = skip_ws_back(c, start);
+        loop {
+            if before > 0 && c[before - 1] == '&' {
+                before = skip_ws_back(c, before - 1);
+                continue;
+            }
+            match ident_before(c, before) {
+                Some((at, w)) if w == "mut" || w == "ref" => before = skip_ws_back(c, at),
+                _ => break,
+            }
+        }
+        let prev = before.checked_sub(1).map(|at| c[at]);
+        let prev2 = before.checked_sub(2).map(|at| c[at]);
+        match prev {
+            Some('|' | '@') => return Some(true),
+            Some('>') if prev2 == Some('=') => return Some(false),
+            Some('=') if !matches!(prev2, Some('=' | '!' | '<' | '>')) => return Some(false),
+            _ => {}
+        }
+        match ident_before(c, before).map(|(_, w)| w).as_deref() {
+            Some("let" | "for") => return Some(true),
+            Some("return") => return Some(false),
+            _ => {}
+        }
+        let open = enclosing_open(c, start)?;
+        end = matching_close(c, open) + 1;
+        start = match ident_before(c, open) {
+            Some((at, _)) => at,
+            None if c[open] == '{' => return None,
+            None => open,
+        };
+    }
+}
+
 /// 1-based line numbers (of comment/literal-blanked source) that read a field
-/// named `key` under ANY binding name: `<expr>.key` not followed by `(` (so a
-/// `.key()` method is not a field), and a destructuring of the guarded type
-/// that names `key` (`let T { key, .. } = ..`, a `match` arm, a parameter).
-/// Construction (`T { key: .., ..Default::default() }`) is not a read.
+/// named `key` under ANY binding name, in every syntax: `<expr>.key` and
+/// `<expr>.r#key` (whitespace allowed after the dot) not followed by `(` (so a
+/// `.key()` method is not a field), and every brace group of the guarded type
+/// (the type, a `use .. as` or `type` alias of it, `Self` inside its `impl`)
+/// that names `key`, unless it is provably a construction: a functional
+/// update `..base`, or an expression position (after a single `=`, `=>` or
+/// `return`, before `;`, `.` or `?`, as an argument of such an item). A `..`
+/// rest or a pattern position (`let`, `for .. in`, closure and fn parameters,
+/// `match` arms and guards, `if let`, `while let`, destructuring assignment,
+/// nested in a tuple, slice, tuple-struct or struct pattern) is a read, and a
+/// group that is neither is a read too (fail closed). The struct declaration,
+/// an `impl` header and a `-> T {` fn body are not groups of the type.
 fn key_field_read_lines(blanked: &str, guarded_type: &str) -> Vec<usize> {
     let c: Vec<char> = blanked.chars().collect();
     let line_of = |at: usize| c[..at].iter().filter(|&&ch| ch == '\n').count() + 1;
-    let word_at = |at: usize, w: &str| {
-        let n = w.chars().count();
-        c.len() >= at + n
-            && c[at..at + n].iter().collect::<String>() == w
-            && (at == 0 || !is_ident(c[at - 1]))
-            && c.get(at + n).is_none_or(|&ch| !is_ident(ch))
-    };
+    let names = guarded_names(&c, guarded_type);
+    let impl_bodies = guarded_impl_bodies(&c, &names);
     let mut lines = Vec::new();
-    let mut i = 0;
-    while i < c.len() {
-        if c[i] == '.'
-            && (i == 0 || c[i - 1] != '.')
-            && c[i + 1..].starts_with(&['k', 'e', 'y'])
-            && c.get(i + 4).is_none_or(|&ch| !is_ident(ch))
-        {
-            let mut k = i + 4;
-            while k < c.len() && c[k].is_whitespace() {
-                k += 1;
+    for i in 0..c.len() {
+        if c[i] == '.' && (i == 0 || c[i - 1] != '.') && c.get(i + 1) != Some(&'.') {
+            let mut k = skip_ws(&c, i + 1);
+            if c.get(k) == Some(&'r') && c.get(k + 1) == Some(&'#') {
+                k += 2;
             }
-            if c.get(k) != Some(&'(') {
+            if c[k..].starts_with(&['k', 'e', 'y'])
+                && c.get(k + 3).is_none_or(|&ch| !is_ident(ch))
+                && c.get(skip_ws(&c, k + 3)) != Some(&'(')
+            {
                 lines.push(line_of(i));
             }
         }
-        if word_at(i, guarded_type) {
-            let mut k = i + guarded_type.chars().count();
-            while k < c.len() && c[k].is_whitespace() {
-                k += 1;
-            }
-            if c.get(k) == Some(&'{') {
-                let open = k;
-                let mut depth = 0usize;
-                let mut close = open;
-                while close < c.len() {
-                    match c[close] {
-                        '{' => depth += 1,
-                        '}' => {
-                            depth -= 1;
-                            if depth == 0 {
-                                break;
-                            }
-                        }
-                        _ => {}
-                    }
-                    close += 1;
-                }
-                let names_key = (open..close).any(|at| word_at(at, "key"));
-                let mut after = close + 1;
-                while after < c.len() && c[after].is_whitespace() {
-                    after += 1;
-                }
-                let next = c.get(after).copied();
-                let next2 = c.get(after + 1).copied();
-                let assigned = next == Some('=') && next2 != Some('=');
-                let arm = next == Some('=') && next2 == Some('>');
-                let param = next == Some(':') && next2 != Some(':');
-                let stmt_start = c[..i]
+        let Some(word) = ident_at(&c, i) else {
+            continue;
+        };
+        let guarded = names.contains(&word)
+            || (word == "Self"
+                && impl_bodies
                     .iter()
-                    .rposition(|&ch| matches!(ch, ';' | '{' | '}'))
-                    .map_or(0, |at| at + 1);
-                let prefix: String = c[stmt_start..i].iter().collect();
-                let let_pattern = prefix.split(|ch: char| !is_ident(ch)).any(|w| w == "let")
-                    && !prefix.contains('=');
-                if names_key && (assigned || arm || param || let_pattern) {
-                    lines.push(line_of(i));
+                    .any(|&(open, close)| open < i && i < close));
+        let open = skip_ws(&c, i + word.chars().count());
+        if !guarded || c.get(open) != Some(&'{') {
+            continue;
+        }
+        let before = skip_ws_back(&c, i);
+        let return_type = before >= 2 && c[before - 2] == '-' && c[before - 1] == '>';
+        let prefix = stmt_prefix(&c, i);
+        if return_type
+            || ["impl", "struct", "enum", "union"]
+                .iter()
+                .any(|w| has_word(&prefix, w))
+        {
+            continue;
+        }
+        let close = matching_close(&c, open);
+        let mut depth = 0usize;
+        let (mut names_key, mut rest, mut update) = (false, false, false);
+        for at in open..close {
+            match c[at] {
+                '{' | '(' | '[' => depth += 1,
+                '}' | ')' | ']' => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+            if depth != 1 {
+                continue;
+            }
+            names_key |= ident_at(&c, at).as_deref() == Some("key");
+            let lead = c[..skip_ws_back(&c, at)].last().copied();
+            if c[at..].starts_with(&['.', '.']) && matches!(lead, Some(',' | '{')) {
+                if c.get(skip_ws(&c, at + 2)) == Some(&'}') {
+                    rest = true;
+                } else {
+                    update = true;
                 }
             }
         }
-        i += 1;
+        let read =
+            names_key && (rest || (!update && pattern_position(&c, i, close + 1) != Some(false)));
+        if read {
+            lines.push(line_of(i));
+        }
     }
     lines.dedup();
     lines
 }
 
 /// s1b — the s1 scanner finds what it must (alias bindings, multi-line chains,
-/// comparisons, destructuring in `let`, `match` arm and parameter) and nothing
-/// else (strings, comments, construction, a `.key()` method).
+/// comparisons, every destructuring form in `SCANNER_FORM_CELLS`, a group it
+/// cannot classify) and nothing else (strings and chars of every literal form,
+/// comments, construction, the declaration, an `impl` header, a `.key()`
+/// method).
 #[test]
 fn s1b_key_field_scanner_self_test_9354() {
     let hits = |src: &str| key_field_read_lines(&blank_literals_and_comments(src), KEY_STATE_TYPE);
