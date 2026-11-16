@@ -250,35 +250,115 @@ pub fn refuse_unproven_named_principal(
     if !named || authority.binding().is_key_bound() {
         return None;
     }
-    crate::governance::audit::record_decision(
+    Some(attested_identity_refusal(
         authority.principal(),
+        authority.binding().as_str(),
+        endpoint,
+    ))
+}
+
+/// #9341 — the one `403 attested_identity_required` the funnel answers, with
+/// its forensic record and WARN. [`refuse_unproven_named_principal`] (header)
+/// and [`bind_request_named_principal`] (body / query) share it so a refusal
+/// is byte for byte the same whichever field named the principal.
+fn attested_identity_refusal(actor: &str, binding: &'static str, endpoint: &str) -> Response {
+    crate::governance::audit::record_decision(
+        actor,
         "deny",
         AUDIT_KIND_AUTHORITY,
         "",
         crate::governance::audit::ForensicPayload::new()
             .ident("endpoint", endpoint)
             .label("outcome", ATTESTED_IDENTITY_REQUIRED)
-            .label("binding", authority.binding().as_str()),
+            .label("binding", binding),
     );
     tracing::warn!(
         target: super::AUTHZ_TRACE_TARGET,
         endpoint,
-        binding = authority.binding().as_str(),
+        binding,
         "#9341 enforce: refused an unproven named principal at the authority chokepoint"
     );
-    Some(
-        (
-            StatusCode::FORBIDDEN,
-            Json(json!({
-                "error": ATTESTED_IDENTITY_REQUIRED,
-                "message": "X-Agent-Id is self-asserted; present the agent's enrolled \
-                            per-agent api-key (X-API-Key) or a mapped client \
-                            certificate to act as this principal",
-                "endpoint": endpoint,
-            })),
-        )
-            .into_response(),
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({
+            "error": ATTESTED_IDENTITY_REQUIRED,
+            "message": "X-Agent-Id is self-asserted; present the agent's enrolled \
+                        per-agent api-key (X-API-Key) or a mapped client \
+                        certificate to act as this principal",
+            "endpoint": endpoint,
+        })),
     )
+        .into_response()
+}
+
+/// What [`bind_request_named_principal`] decided for a principal a request
+/// names in its BODY or QUERY (PR 9390 H1).
+#[derive(Debug)]
+pub enum RequestPrincipal {
+    /// Enforce: act as exactly this principal, the funnel's
+    /// `authority.principal()` (proven, or server-minted anonymous).
+    Funnel(String),
+    /// Off / Advisory: the handler keeps its pre-#9341 resolution unchanged.
+    Unchanged,
+    /// Enforce: the named principal is not the proven one; answer this, the
+    /// funnel's exact refusal, before any read or write.
+    Refused(Response),
+}
+
+/// PR 9390 H1 — THE one way a handler turns a principal named in a request
+/// BODY or QUERY field into the principal it acts as.
+///
+/// Under [`HttpIdentityMode::Enforce`] (any key count, zero included): an
+/// absent or empty claim yields the funnel principal; a claim EQUAL to a
+/// PROVEN principal ([`Binding::is_key_bound`]) yields it; anything else (the
+/// anonymous shared-key caller naming an id, a proven caller naming a
+/// different id, no resolved authority at all) is refused with the funnel's
+/// `403`. A body name is the same claim as a header name, so it gets the same
+/// answer. Under Advisory the claim is reported exactly as a header claim is
+/// (V-4) and the handler is left unchanged; under Off nothing happens.
+#[must_use]
+pub fn bind_request_named_principal(
+    mode: HttpIdentityMode,
+    authority: Option<&Authority>,
+    presented_key: Option<&str>,
+    claimed: Option<&str>,
+    endpoint: &str,
+) -> RequestPrincipal {
+    let claimed = claimed.filter(|c| !c.is_empty());
+    match mode {
+        HttpIdentityMode::Off => RequestPrincipal::Unchanged,
+        HttpIdentityMode::Advisory => {
+            if let Some(authority) = authority {
+                super::advisory_identity_report::report_unproven_named_principal(
+                    mode,
+                    presented_key,
+                    claimed,
+                    authority,
+                    endpoint,
+                );
+            }
+            RequestPrincipal::Unchanged
+        }
+        HttpIdentityMode::Enforce => match (authority, claimed) {
+            (Some(a), None) => RequestPrincipal::Funnel(a.principal().to_string()),
+            (Some(a), Some(c)) if a.binding().is_key_bound() && c == a.principal() => {
+                RequestPrincipal::Funnel(a.principal().to_string())
+            }
+            (Some(a), Some(_)) => RequestPrincipal::Refused(attested_identity_refusal(
+                a.principal(),
+                a.binding().as_str(),
+                endpoint,
+            )),
+            // A router without the authority layer (test scaffolds only):
+            // nothing is proven, so a named claim is refused, fail closed.
+            (None, Some(_)) => RequestPrincipal::Refused(attested_identity_refusal(
+                crate::identity::sentinels::ANONYMOUS_RESOLVE_FAILED,
+                "none",
+                endpoint,
+            )),
+            (None, None) => RequestPrincipal::Unchanged,
+        },
+    }
 }
 
 /// #9342 — the typed `400` for a present `X-Agent-Id` that is not visible

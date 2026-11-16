@@ -1471,6 +1471,7 @@ pub struct SessionStartBody {
 pub async fn session_start(
     State(app): State<AppState>,
     headers: HeaderMap,
+    authority: Option<axum::Extension<crate::identity::authority::Authority>>,
     Json(body): Json<SessionStartBody>,
 ) -> impl IntoResponse {
     // agent_id is optional for session_start; but if supplied it must validate.
@@ -1483,6 +1484,23 @@ pub async fn session_start(
         )
             .into_response();
     }
+    // PR 9390 H1 — under Enforce the body `agent_id` is a claim like the
+    // header: it must name the PROVEN principal, else the funnel's 403, before
+    // the read below. The caller is then `authority.principal()` and nothing
+    // else. Off / Advisory keep the header -> body -> anonymous contract.
+    let funnel_caller = match crate::handlers::authority::bind_request_named_principal(
+        app.http_identity_mode,
+        authority.as_ref().map(|e| &e.0),
+        headers
+            .get(crate::HEADER_API_KEY)
+            .and_then(|v| v.to_str().ok()),
+        body.agent_id.as_deref(),
+        crate::handlers::routes::SESSION_START,
+    ) {
+        crate::handlers::authority::RequestPrincipal::Funnel(p) => Some(p),
+        crate::handlers::authority::RequestPrincipal::Unchanged => None,
+        crate::handlers::authority::RequestPrincipal::Refused(resp) => return resp,
+    };
     // #2135 (v1.0.0, #2032-A / H1 IDOR) — per-agent-key identity gate BEFORE
     // the session-start read resolves + applies its `scope=private` visibility
     // filter. Pre-fix, a shared-transport-key caller forging `X-Agent-Id:
@@ -1534,6 +1552,8 @@ pub async fn session_start(
     if let Some(l) = body.limit {
         params["limit"] = json!(l);
     }
+    // PR 9390 H1 — under Enforce the acting principal is the funnel's.
+    let caller = funnel_caller.unwrap_or(caller);
 
     // FBL-09 (v1.0.0 pre-ship 3x7) — serve session_start context from the
     // CONFIGURED store on a postgres-backed daemon. Pre-fix this handler

@@ -135,6 +135,20 @@ was the #874-class spoof vector):
    `advisory`. Under `advisory` the request is served and reported: a WARN
    once per (presented key, claimed id) with the id escaped, plus a counter;
    nothing is persisted.
+   **Body and query principal claims (PR 9390).** Under `enforce`, with any
+   number of per-agent keys enrolled (including zero), a request body
+   `agent_id` on `POST /api/v1/session/start` and `POST /api/v1/memory_reflect`
+   is held to the same rule: absent, the request acts as the authority
+   principal (the proven agent, or the server-minted anonymous principal of
+   a shared-key caller); equal to the PROVEN principal, it is accepted;
+   anything else (a shared-key or anonymous caller naming an agent, or a
+   proven caller naming a different agent) is refused with the same **403**
+   `{"error":"attested_identity_required"}` before any read or write. Every
+   other body or query `agent_id` / `as_agent` either must equal the
+   header-resolved caller (mismatch refused) or names another agent as data
+   (a share recipient, a list filter); none becomes the acting principal.
+   Under `advisory` the body claim is served and reported like the header
+   claim; `off` is unchanged.
 6. A present `X-Agent-Id` that is malformed, reserved or not visible ASCII
    is refused **400** `VALIDATION_FAILED` on every gated route (#9342); it
    is never served as `anonymous:invalid`.

@@ -17,6 +17,11 @@
 //! 5. a handler still calls the silent-fallback `http_caller_ctx(` (#9342)
 //!    instead of `http_caller_ctx_checked(` (kg.rs excepted: lane
 //!    entity-register-owner-gate-r2 owns that file).
+//! 6. (PR 9390 H1) a handler function reads a principal claim from a
+//!    request BODY or QUERY field (`body.agent_id`, `q.as_agent`, ...) and is
+//!    not classed in [`CLAIM_READ_SITES`], or a row classed `Funnel` stops
+//!    calling [`BODY_FUNNEL_FN`] before its first store read. A new claim
+//!    read cannot land without a reviewer-visible class and reason.
 
 #![allow(clippy::missing_panics_doc)]
 
@@ -345,4 +350,344 @@ fn no_handler_uses_the_silent_anonymous_invalid_fallback_9342() {
         offenders.is_empty(),
         "#9342 http_caller_ctx( falls back to anonymous:invalid; use http_caller_ctx_checked( : {offenders:?}"
     );
+}
+
+/// PR 9390 H1 — the one helper that turns a body / query principal claim
+/// into the acting principal under Enforce.
+const BODY_FUNNEL_FN: &str = "bind_request_named_principal(";
+/// Request-binding names whose `.agent_id` (etc.) is a claim from the wire.
+const CLAIM_BINDERS: &[&str] = &["body", "p", "q", "req", "query", "params", "input", "b"];
+/// Principal-shaped request fields.
+const CLAIM_FIELDS: &[&str] = &["agent_id", "as_agent", "target_agent_id", "owner", "caller"];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaimClass {
+    /// The claim can become the acting principal: it goes through
+    /// [`BODY_FUNNEL_FN`] before any read.
+    Funnel,
+    /// The claim is only a refinement checked against the header-resolved
+    /// caller (mismatch refused); it never becomes the actor.
+    Refinement,
+    /// The claim names ANOTHER agent as data (a target, a subject, a filter).
+    Data,
+    /// The route is exempt from the funnel (federation peer auth).
+    Exempt,
+}
+
+/// Every handler function reading a body / query principal claim, with its
+/// class and why. `(file, fn, class, reason)`.
+const CLAIM_READ_SITES: &[(&str, &str, ClaimClass, &str)] = &[
+    (
+        "src/handlers/hook_subscribers.rs",
+        "session_start",
+        ClaimClass::Funnel,
+        "H1: body agent_id was the visibility caller",
+    ),
+    (
+        "src/handlers/route_1111.rs",
+        "handle_reflect_http",
+        ClaimClass::Funnel,
+        "B-1: body agent_id authors the reflection",
+    ),
+    (
+        "src/handlers/route_1111.rs",
+        "reflect_write_admission_pg",
+        ClaimClass::Refinement,
+        "input is parsed from the body AFTER the funnel overwrote agent_id",
+    ),
+    (
+        "src/handlers/route_1111.rs",
+        "reflect_depth_approval_gate_pg",
+        ClaimClass::Refinement,
+        "input is parsed from the body AFTER the funnel overwrote agent_id",
+    ),
+    (
+        "src/handlers/route_1111.rs",
+        "handle_replay_http",
+        ClaimClass::Refinement,
+        "resolve_caller_agent_id: header-authoritative, body must match",
+    ),
+    (
+        "src/handlers/route_1111.rs",
+        "handle_subscription_replay_http",
+        ClaimClass::Refinement,
+        "resolve_caller_agent_id: header-authoritative, body must match",
+    ),
+    (
+        "src/handlers/route_1111.rs",
+        "handle_subscription_dlq_list_http",
+        ClaimClass::Refinement,
+        "resolve_caller_agent_id: header-authoritative, body must match",
+    ),
+    (
+        "src/handlers/subscriptions.rs",
+        "subscribe",
+        ClaimClass::Refinement,
+        "body agent_id must equal the header-resolved caller",
+    ),
+    (
+        "src/handlers/subscriptions.rs",
+        "unsubscribe",
+        ClaimClass::Refinement,
+        "query agent_id must equal the header-resolved caller",
+    ),
+    (
+        "src/handlers/subscriptions.rs",
+        "list_subscriptions",
+        ClaimClass::Refinement,
+        "query agent_id must equal the header-resolved caller",
+    ),
+    (
+        "src/handlers/subscriptions.rs",
+        "notify",
+        ClaimClass::Refinement,
+        "body agent_id must match the caller; target_agent_id is the recipient (data)",
+    ),
+    (
+        "src/handlers/hook_subscribers.rs",
+        "get_inbox",
+        ClaimClass::Refinement,
+        "resolve_caller_agent_id: header-authoritative, query must match",
+    ),
+    (
+        "src/handlers/power_consolidation.rs",
+        "consolidate_memories",
+        ClaimClass::Refinement,
+        "body agent_id must equal the header-resolved caller",
+    ),
+    (
+        "src/handlers/create.rs",
+        "resolve_create_metadata",
+        ClaimClass::Refinement,
+        "#907: body agent_id must equal the header-resolved caller",
+    ),
+    (
+        "src/handlers/memories.rs",
+        "update_memory_write",
+        ClaimClass::Refinement,
+        "body agent_id must match the X-Agent-Id caller",
+    ),
+    (
+        "src/handlers/kg.rs",
+        "entity_register",
+        ClaimClass::Refinement,
+        "resolve_caller_agent_id: header-authoritative, body must match",
+    ),
+    (
+        "src/handlers/admin.rs",
+        "quota_status_handler",
+        ClaimClass::Refinement,
+        "#909: body agent_id must equal the header caller",
+    ),
+    (
+        "src/handlers/admin.rs",
+        "register_agent",
+        ClaimClass::Data,
+        "body agent_id is the agent being registered; refused unless it is the caller or admin",
+    ),
+    (
+        "src/handlers/recall.rs",
+        "recall_memories_get",
+        ClaimClass::Refinement,
+        "as_agent must equal the header-resolved caller",
+    ),
+    (
+        "src/handlers/recall.rs",
+        "recall_memories_post",
+        ClaimClass::Refinement,
+        "as_agent must equal the header-resolved caller",
+    ),
+    (
+        "src/handlers/recall.rs",
+        "recall_response",
+        ClaimClass::Refinement,
+        "as_agent was checked against the caller by both recall entries",
+    ),
+    (
+        "src/handlers/memories_query.rs",
+        "list_memories",
+        ClaimClass::Data,
+        "agent_id is a row-author FILTER; visibility uses the header caller",
+    ),
+    (
+        "src/handlers/memories_query.rs",
+        "search_memories",
+        ClaimClass::Refinement,
+        "#1922: as_agent must equal the header caller (403); agent_id is a filter",
+    ),
+    (
+        "src/handlers/parity.rs",
+        "http_caller_ctx",
+        ClaimClass::Refinement,
+        "wraps resolve_caller_agent_id",
+    ),
+    (
+        "src/handlers/parity.rs",
+        "http_caller_ctx_checked",
+        ClaimClass::Refinement,
+        "wraps resolve_caller_agent_id",
+    ),
+    (
+        "src/handlers/share.rs",
+        "share_memory",
+        ClaimClass::Data,
+        "target_agent_id is the share recipient",
+    ),
+    (
+        "src/handlers/federation_receive.rs",
+        "sync_push_write",
+        ClaimClass::Exempt,
+        "sync/push: the peer is authenticated by key + signature",
+    ),
+    (
+        "src/handlers/federation_signing_check.rs",
+        "sync_push_via_store",
+        ClaimClass::Exempt,
+        "sync/push: the peer is authenticated by key + signature",
+    ),
+];
+
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// The `fn` names in `prod` whose bodies read a request principal claim.
+fn claim_reading_fns(prod: &str) -> BTreeSet<String> {
+    let bytes = prod.as_bytes();
+    let fns: Vec<(usize, &str)> = prod
+        .match_indices("fn ")
+        .filter(|(i, _)| *i == 0 || !is_ident_byte(bytes[i - 1]))
+        .filter_map(|(i, _)| {
+            let rest = &prod[i + 3..];
+            let end = rest.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))?;
+            (end > 0).then(|| (i, &rest[..end]))
+        })
+        .collect();
+    let owner = |at: usize| {
+        fns.iter()
+            .rev()
+            .find(|(i, _)| *i < at)
+            .map(|(_, n)| (*n).to_string())
+    };
+    let mut out = BTreeSet::new();
+    for binder in CLAIM_BINDERS {
+        for field in CLAIM_FIELDS {
+            for pat in [
+                format!("{binder}.{field}"),
+                format!("{binder}.get(\"{field}\")"),
+            ] {
+                for (at, _) in prod.match_indices(pat.as_str()) {
+                    let before_ok =
+                        at == 0 || !(is_ident_byte(bytes[at - 1]) || bytes[at - 1] == b'.');
+                    let end = at + pat.len();
+                    let after = prod[end..].trim_start();
+                    let after_ok = pat.ends_with(')')
+                        || !(prod.as_bytes().get(end).is_some_and(|b| is_ident_byte(*b))
+                            || after.starts_with('('));
+                    if before_ok
+                        && after_ok
+                        && let Some(name) = owner(at)
+                    {
+                        out.insert(name);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+fn handler_files() -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut stack = vec![root().join("src/handlers")];
+    while let Some(d) = stack.pop() {
+        for entry in fs::read_dir(&d).expect("read_dir") {
+            let p = entry.expect("entry").path();
+            if p.is_dir() {
+                stack.push(p);
+                continue;
+            }
+            if p.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let rel = p
+                .strip_prefix(root())
+                .expect("under root")
+                .to_string_lossy()
+                .replace('\\', "/");
+            let src = fs::read_to_string(&p).expect("read");
+            out.push((rel, strip_line_comments(&production_part(&src))));
+        }
+    }
+    out.sort();
+    out
+}
+
+#[test]
+fn every_body_or_query_principal_claim_is_classed_9390() {
+    let mut found = BTreeSet::new();
+    for (rel, prod) in handler_files() {
+        for name in claim_reading_fns(&prod) {
+            found.insert((rel.clone(), name));
+        }
+    }
+    let table: BTreeSet<(String, String)> = CLAIM_READ_SITES
+        .iter()
+        .map(|(f, n, _, _)| ((*f).to_string(), (*n).to_string()))
+        .collect();
+    assert_eq!(
+        table.len(),
+        CLAIM_READ_SITES.len(),
+        "duplicate CLAIM_READ_SITES row"
+    );
+    let unclassed: Vec<_> = found.difference(&table).collect();
+    let stale: Vec<_> = table.difference(&found).collect();
+    assert!(
+        unclassed.is_empty() && stale.is_empty(),
+        "PR 9390 H1: a handler reads a body/query principal claim without a class \
+         (route it through {BODY_FUNNEL_FN} or class it with a reason): {unclassed:?}; \
+         stale rows: {stale:?}"
+    );
+}
+
+#[test]
+fn funnel_class_sites_call_the_body_funnel_before_any_read_9390() {
+    const READS: &[&str] = &[
+        "app.store.",
+        "handle_session_start(",
+        "handle_reflect_caller(",
+        "app.db.lock()",
+    ];
+    for (file, name, class, _) in CLAIM_READ_SITES {
+        if *class != ClaimClass::Funnel {
+            continue;
+        }
+        let prod = strip_line_comments(&production_part(&read(file)));
+        let start = prod
+            .find(&format!("fn {name}("))
+            .unwrap_or_else(|| panic!("{file}: fn {name}"));
+        let body = braced_block(&prod, start);
+        let funnel = body
+            .find(BODY_FUNNEL_FN)
+            .unwrap_or_else(|| panic!("PR 9390 H1: {file}::{name} must call {BODY_FUNNEL_FN}"));
+        for read in READS {
+            if let Some(at) = body.find(read) {
+                assert!(
+                    funnel < at,
+                    "PR 9390 H1: {file}::{name} reads ({read}) before {BODY_FUNNEL_FN}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn claim_scanner_sees_every_shape_it_pins_9390() {
+    let src = "fn a() { let x = body.agent_id.clone(); }\n\
+               fn b() { let y = q.as_agent; }\n\
+               fn c() { body.get(\"agent_id\").and_then(f); }\n\
+               fn d() { let z = nobody.agent_id; let w = body.agent_ids; let v = self.body.agent_id; }\n\
+               fn e() { body.agent_id(); }";
+    let got: Vec<String> = claim_reading_fns(src).into_iter().collect();
+    assert_eq!(got, vec!["a", "b", "c"]);
 }

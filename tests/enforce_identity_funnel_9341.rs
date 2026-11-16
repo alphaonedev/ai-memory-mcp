@@ -1188,6 +1188,20 @@ fn b8_dedup_per_key_and_claimed_id_is_bounded_9341() {
         ADVISORY_UNPROVEN_DEDUP_CAP, advisory_unproven_total, observe_unproven_claim,
     };
     let suffix = run_suffix();
+    if std::env::var_os(B8_CAP_CHILD_ENV_9390).is_some() {
+        // Child process only: cycle more ids than the cap. Once full, nothing
+        // new is due. Run here, never in the shared test process, because a
+        // saturated set makes every later observation in this binary vacuous
+        // (PR 9390 H1: it hid the Off / Advisory body-claim cells).
+        let due = (0..=ADVISORY_UNPROVEN_DEDUP_CAP * 2)
+            .filter(|i| observe_unproven_claim("k-cycle", &format!("c-{suffix}-{i}")).is_some())
+            .count();
+        assert!(
+            due <= ADVISORY_UNPROVEN_DEDUP_CAP,
+            "dedup set must be bounded: {due}"
+        );
+        return;
+    }
     let claimed = format!("dedup-{suffix}");
     let before = advisory_unproven_total();
     assert!(observe_unproven_claim("k1", &claimed).is_some());
@@ -1200,14 +1214,36 @@ fn b8_dedup_per_key_and_claimed_id_is_bounded_9341() {
         "other key is a new pair"
     );
     assert!(advisory_unproven_total() >= before + 3);
-    // Cycle more ids than the cap: once full, nothing new is due.
-    let due = (0..=ADVISORY_UNPROVEN_DEDUP_CAP * 2)
-        .filter(|i| observe_unproven_claim("k-cycle", &format!("c-{suffix}-{i}")).is_some())
-        .count();
+    let exe = std::env::current_exe().expect("test binary path");
+    let child = std::process::Command::new(exe)
+        .args([
+            "--exact",
+            "b8_dedup_per_key_and_claimed_id_is_bounded_9341",
+            "--test-threads=1",
+        ])
+        .env(B8_CAP_CHILD_ENV_9390, "1")
+        .output()
+        .expect("spawn the cap child");
+    let stdout = String::from_utf8_lossy(&child.stdout);
     assert!(
-        due <= ADVISORY_UNPROVEN_DEDUP_CAP,
-        "dedup set must be bounded: {due}"
+        child.status.success() && stdout.contains("1 passed"),
+        "B-8 cap child: {stdout} {}",
+        String::from_utf8_lossy(&child.stderr)
     );
+}
+
+/// Set only in the B-8 cap child process (see above).
+const B8_CAP_CHILD_ENV_9390: &str = "AI_MEMORY_TEST_B8_CAP_CHILD_9390";
+
+/// True while the process-wide Advisory dedup set can still record a new
+/// pair; a full set reports nothing new, so a cell observing it would pass
+/// or fail vacuously.
+fn advisory_dedup_unsaturated_9390() -> bool {
+    ai_memory::handlers::advisory_identity_report::observe_unproven_claim(
+        "h1-9390-saturation-probe",
+        &run_suffix(),
+    )
+    .is_some()
 }
 
 // ---------------------------------------------------------------------------
@@ -1924,6 +1960,11 @@ async fn assert_h1_off_advisory_unchanged_9390(site: H1Site9390, mode: HttpIdent
     let marker = format!("h1-unchanged-9390-{suffix}");
     let ns = format!("ns-h1u-9390-{suffix}");
     let source = seed_private_9390(&fx, &named, &ns, &marker).await;
+    assert!(
+        advisory_dedup_unsaturated_9390(),
+        "H1 {site:?} {mode:?}: the Advisory dedup set is saturated; the report \
+         observation below would be vacuous"
+    );
     let out = send_simple(
         &fx.router,
         "post",
