@@ -123,7 +123,7 @@ pub async fn authority_layer(
         None => None,
         Some(v) => match v.to_str() {
             Ok(s) => Some(s.to_string()),
-            Err(_) => return unreadable_header_refusal(&path),
+            Err(_) => return unreadable_header_refusal(&path, v.as_bytes()),
         },
     };
 
@@ -195,36 +195,58 @@ pub async fn authority_layer(
                 None => next.run(req).await,
             }
         }
-        Err(e) => {
-            // Forensic capture BEFORE the wire 400 — the chain records the
-            // rejected probe exactly as `require_admin` did when it was the
-            // first gate a malformed header met (#984).
-            crate::governance::audit::record_decision(
-                crate::identity::sentinels::ANONYMOUS_RESOLVE_FAILED,
-                "deny",
-                AUDIT_KIND_AUTHORITY,
-                "",
-                crate::governance::audit::ForensicPayload::new()
-                    .ident("endpoint", &path)
-                    .label("outcome", "agent_id_resolve_failed")
-                    // The error text can echo the hostile header value.
-                    .commit("reason", &e.to_string()),
-            );
-            tracing::warn!(
-                target: super::AUTHZ_TRACE_TARGET,
-                endpoint = %path,
-                error = %e,
-                "#3549: request refused at the authority chokepoint"
-            );
-            (
-                StatusCode::BAD_REQUEST,
-                Json(json!({
-                    "code": crate::errors::error_codes::VALIDATION_FAILED,
-                    "error": e.to_string(),
-                })),
-            )
-                .into_response()
-        }
+        Err(e) => resolve_failed_refusal(&path, header_agent_id.as_deref(), &e.to_string()),
+    }
+}
+
+/// The audit payload key that carries the agent id a refused request CLAIMED
+/// (PR 9390 L1). The row's `actor` is never the claim: it is the
+/// server-minted anonymous principal, the proven principal, or a sentinel.
+pub const AUDIT_FIELD_CLAIMED_AGENT_ID: &str = "claimed_agent_id";
+
+/// #3549 — the typed `400` for a header the authority cannot resolve.
+/// Forensic capture BEFORE the wire 400 — the chain records the rejected
+/// probe exactly as `require_admin` did when it was the first gate a
+/// malformed header met (#984); the claim is escaped and cut (PR 9390 L1).
+fn resolve_failed_refusal(path: &str, claimed: Option<&str>, error: &str) -> Response {
+    crate::governance::audit::record_decision(
+        crate::identity::sentinels::ANONYMOUS_RESOLVE_FAILED,
+        "deny",
+        AUDIT_KIND_AUTHORITY,
+        "",
+        crate::governance::audit::ForensicPayload::new()
+            .ident("endpoint", path)
+            .label("outcome", "agent_id_resolve_failed")
+            .opt_claimed_ident(AUDIT_FIELD_CLAIMED_AGENT_ID, claimed)
+            // The error text can echo the hostile header value.
+            .commit("reason", error),
+    );
+    tracing::warn!(
+        target: super::AUTHZ_TRACE_TARGET,
+        endpoint = %path,
+        error = %error,
+        "#3549: request refused at the authority chokepoint"
+    );
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "code": crate::errors::error_codes::VALIDATION_FAILED,
+            "error": error,
+        })),
+    )
+        .into_response()
+}
+
+/// The audit actor for a refusal of `authority`'s request (PR 9390 L1): the
+/// proven principal when the binding proves one; otherwise the server-minted
+/// anonymous principal. A `Claimed` principal that is not server-minted shape
+/// (a header claim) is never the actor: a fresh anonymous id is minted.
+fn refusal_actor(authority: &Authority) -> String {
+    let principal = authority.principal();
+    if authority.binding().is_key_bound() || crate::identity::is_anonymous_request_id(principal) {
+        principal.to_string()
+    } else {
+        crate::identity::anonymous_request_id()
     }
 }
 
@@ -250,8 +272,11 @@ pub fn refuse_unproven_named_principal(
     if !named || authority.binding().is_key_bound() {
         return None;
     }
+    // PR 9390 L1 — the header principal IS the claim, so the actor is a
+    // freshly minted anonymous principal and the claim is its own field.
     Some(attested_identity_refusal(
-        authority.principal(),
+        &crate::identity::anonymous_request_id(),
+        header_agent_id,
         authority.binding().as_str(),
         endpoint,
     ))
@@ -260,8 +285,14 @@ pub fn refuse_unproven_named_principal(
 /// #9341 — the one `403 attested_identity_required` the funnel answers, with
 /// its forensic record and WARN. [`refuse_unproven_named_principal`] (header)
 /// and [`bind_request_named_principal`] (body / query) share it so a refusal
-/// is byte for byte the same whichever field named the principal.
-fn attested_identity_refusal(actor: &str, binding: &'static str, endpoint: &str) -> Response {
+/// is byte for byte the same whichever field named the principal. `actor` is
+/// the proven or server-minted principal, never `claimed` (PR 9390 L1).
+fn attested_identity_refusal(
+    actor: &str,
+    claimed: Option<&str>,
+    binding: &'static str,
+    endpoint: &str,
+) -> Response {
     crate::governance::audit::record_decision(
         actor,
         "deny",
@@ -270,7 +301,8 @@ fn attested_identity_refusal(actor: &str, binding: &'static str, endpoint: &str)
         crate::governance::audit::ForensicPayload::new()
             .ident("endpoint", endpoint)
             .label("outcome", ATTESTED_IDENTITY_REQUIRED)
-            .label("binding", binding),
+            .label("binding", binding)
+            .opt_claimed_ident(AUDIT_FIELD_CLAIMED_AGENT_ID, claimed),
     );
     tracing::warn!(
         target: super::AUTHZ_TRACE_TARGET,
@@ -344,15 +376,17 @@ pub fn bind_request_named_principal(
             (Some(a), Some(c)) if a.binding().is_key_bound() && c == a.principal() => {
                 RequestPrincipal::Funnel(a.principal().to_string())
             }
-            (Some(a), Some(_)) => RequestPrincipal::Refused(attested_identity_refusal(
-                a.principal(),
+            (Some(a), Some(c)) => RequestPrincipal::Refused(attested_identity_refusal(
+                &refusal_actor(a),
+                Some(c),
                 a.binding().as_str(),
                 endpoint,
             )),
             // A router without the authority layer (test scaffolds only):
             // nothing is proven, so a named claim is refused, fail closed.
-            (None, Some(_)) => RequestPrincipal::Refused(attested_identity_refusal(
+            (None, Some(c)) => RequestPrincipal::Refused(attested_identity_refusal(
                 crate::identity::sentinels::ANONYMOUS_RESOLVE_FAILED,
+                Some(c),
                 "none",
                 endpoint,
             )),
@@ -362,8 +396,10 @@ pub fn bind_request_named_principal(
 }
 
 /// #9342 — the typed `400` for a present `X-Agent-Id` that is not visible
-/// ASCII. The raw bytes are never echoed.
-fn unreadable_header_refusal(path: &str) -> Response {
+/// ASCII. The raw bytes are never echoed on the wire; the audit row carries
+/// them lossily decoded, escaped and cut as `claimed_agent_id` (PR 9390 L1).
+fn unreadable_header_refusal(path: &str, raw: &[u8]) -> Response {
+    let claimed = String::from_utf8_lossy(raw);
     crate::governance::audit::record_decision(
         crate::identity::sentinels::ANONYMOUS_RESOLVE_FAILED,
         "deny",
@@ -371,7 +407,8 @@ fn unreadable_header_refusal(path: &str) -> Response {
         "",
         crate::governance::audit::ForensicPayload::new()
             .ident("endpoint", path)
-            .label("outcome", "agent_id_unreadable"),
+            .label("outcome", "agent_id_unreadable")
+            .opt_claimed_ident(AUDIT_FIELD_CLAIMED_AGENT_ID, Some(&claimed)),
     );
     tracing::warn!(
         target: super::AUTHZ_TRACE_TARGET,
@@ -532,6 +569,9 @@ mod tests {
             "a 100K claim is refused in bounded time: {:?}",
             started.elapsed()
         );
+        // (f) #9342: a non-ASCII header; (g) #3549: an unresolvable header.
+        let _ = unreadable_header_refusal(&ep("unreadable"), b"bob\xff\n");
+        let _ = resolve_failed_refusal(&ep("resolve"), Some("bad id\t"), "invalid");
         audit::shutdown();
 
         let one = |case: &str| {
@@ -568,5 +608,11 @@ mod tests {
             "a long claim is cut to the ident length: {} bytes",
             shown.len()
         );
+        let (actor, claimed) = one("unreadable");
+        assert_eq!(actor, crate::identity::sentinels::ANONYMOUS_RESOLVE_FAILED);
+        assert_eq!(claimed, serde_json::json!("bob\\u{fffd}\\n"));
+        let (actor, claimed) = one("resolve");
+        assert_eq!(actor, crate::identity::sentinels::ANONYMOUS_RESOLVE_FAILED);
+        assert_eq!(claimed, serde_json::json!("bad id\\t"));
     }
 }

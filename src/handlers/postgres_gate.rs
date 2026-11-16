@@ -878,15 +878,18 @@ pub fn store_err_to_response_for(
     // handler that knows (from its visibility-scoped lookup) the row is not
     // visible renders that refusal as the route's not-found shape, so a
     // private id answers byte-identically to an id that names no row.
+    //
+    // PR 9390 M1 — EVERY refusal reason on a row the caller cannot read is
+    // rendered as not-found, not only the two owner reasons: the adapter's
+    // unstamped-row refusal (#1628 "memory has no agent_id stamp") named a
+    // hidden unstamped row with a 403 while an absent id answered 404.
     if visibility == RowVisibility::NotVisible
         && let StoreError::PermissionDenied { target, reason, .. } = &e
     {
-        if reason == crate::errors::msg::CALLER_DOES_NOT_OWN_MEMORY {
-            return not_visible_refusal(RefusedResource::Memory(target));
-        }
         if reason == crate::errors::msg::CALLER_NOT_SOURCE_MEMORY_OWNER {
             return not_visible_refusal(RefusedResource::SourceMemory(target));
         }
+        return not_visible_refusal(RefusedResource::Memory(target));
     }
     store_err_to_response(e)
 }

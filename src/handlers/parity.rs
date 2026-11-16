@@ -820,16 +820,28 @@ pub(crate) fn require_caller_owns_memory_with_mode(
     mode: crate::identity::owner_stamp::UnstampedMutationMode,
 ) -> Option<axum::response::Response> {
     use crate::identity::owner_stamp::{OwnerStamp, REASON_UNSTAMPED_REFUSED};
-    if caller == crate::identity::sentinels::DAEMON_PRINCIPAL
-        || crate::identity::owner_stamp::metadata_admits_mutation_with_mode(
-            &mem.metadata,
-            &mem.id,
-            caller,
-            allow_inbox,
-            site,
-            mode,
-        )
+    if caller == crate::identity::sentinels::DAEMON_PRINCIPAL {
+        return None;
+    }
+    // PR 9390 M1 — the visibility verdict comes FIRST for an unstamped row:
+    // the #3124 `warn` posture admits an unstamped row for any caller, so
+    // pre-fix a row the caller cannot read was written (PUT / DELETE /
+    // promote) and answered 2xx where an absent id answered 404. A hidden
+    // row now answers exactly like an absent one and nothing is written; a
+    // VISIBLE unstamped row still meets the #3124 gate below unchanged.
+    if OwnerStamp::of(&mem.metadata).is_unstamped()
+        && !crate::visibility::is_readable_on_query(mem, Some(caller), Some(&mem.namespace))
     {
+        return Some(hidden_row_refusal());
+    }
+    if crate::identity::owner_stamp::metadata_admits_mutation_with_mode(
+        &mem.metadata,
+        &mem.id,
+        caller,
+        allow_inbox,
+        site,
+        mode,
+    ) {
         return None;
     }
     let stamp = OwnerStamp::of(&mem.metadata);
@@ -1097,7 +1109,10 @@ pub fn not_visible_refusal(resource: RefusedResource<'_>) -> axum::response::Res
 /// - neither endpoint visible: [`not_visible_refusal`] for the link, so a
 ///   private pair answers like a decoy pair and nothing is written;
 /// - the source visible: the canonical `unlink_admitted` predicate;
-/// - only the target visible: admitted only when the caller owns the target;
+/// - the source absent or not visible: the same [`not_visible_refusal`]
+///   whatever the target (PR 9390 L3: pre-fix the owner of the target was
+///   admitted, so it could remove a link from another agent's hidden source
+///   and learn the source exists);
 /// - otherwise `403 NOT_OWNER` with [`crate::errors::msg::CALLER_NOT_LINK_ENDPOINT_OWNER`].
 #[must_use]
 pub fn unlink_gate(
@@ -1108,7 +1123,7 @@ pub fn unlink_gate(
     caller: &str,
     site: crate::identity::owner_stamp::MutationSite,
 ) -> Option<axum::response::Response> {
-    use crate::identity::owner_stamp::{OwnerStamp, unlink_admitted};
+    use crate::identity::owner_stamp::unlink_admitted;
     if caller == crate::identity::sentinels::DAEMON_PRINCIPAL {
         return None;
     }
@@ -1116,18 +1131,16 @@ pub fn unlink_gate(
         source_id,
         target_id,
     };
-    let visible_target = target.filter(|(_, vis)| *vis == RowVisibility::Visible);
-    let admitted = match (source, visible_target) {
-        (None, None) => return Some(not_visible_refusal(resource)),
-        (Some(src), _) => unlink_admitted(
-            &src.metadata,
-            target.map(|(t, _)| &t.metadata),
-            source_id,
-            caller,
-            site,
-        ),
-        (None, Some((tgt, _))) => OwnerStamp::of(&tgt.metadata).is_owned_by(caller),
+    let Some(src) = source else {
+        return Some(not_visible_refusal(resource));
     };
+    let admitted = unlink_admitted(
+        &src.metadata,
+        target.map(|(t, _)| &t.metadata),
+        source_id,
+        caller,
+        site,
+    );
     if admitted {
         return None;
     }

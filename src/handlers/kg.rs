@@ -777,6 +777,15 @@ pub async fn kg_timeline(
         return not_found();
     };
     let is_unowned_legacy = owner.is_empty();
+    // PR 9390 M1 — an unowned (unstamped) source the caller cannot read
+    // answers like an absent one; pre-fix the unowned carve-out skipped the
+    // visibility verdict and served the hidden row's timeline.
+    if is_unowned_legacy
+        && visibility == super::RowVisibility::NotVisible
+        && caller != sentinels::DAEMON_PRINCIPAL
+    {
+        return not_found();
+    }
     if !is_unowned_legacy
         && owner != caller
         && target != caller
