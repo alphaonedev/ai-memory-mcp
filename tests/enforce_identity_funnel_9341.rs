@@ -1685,3 +1685,294 @@ async fn unreadable_inbox_target_keeps_its_pre_fix_kg_invalidate_answer_8994() {
         out.body
     );
 }
+
+// ---------------------------------------------------------------------------
+// PR 9390 round-1 H1: a principal NAMED IN THE BODY under Enforce.
+//
+// The class invariant: under Enforce (any number of enrolled keys, zero
+// included) the principal a handler acts as is the funnel principal
+// (`Authority::principal()`: proven, or server-minted for the anonymous
+// shared-key caller) and nothing the caller names in a body field. One cell
+// per swept site (`session_start`, `reflect`) and state.
+// ---------------------------------------------------------------------------
+
+/// The two handlers that turned a body `agent_id` into the acting caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum H1Site9390 {
+    SessionStart,
+    Reflect,
+}
+
+impl H1Site9390 {
+    const fn path(self) -> &'static str {
+        match self {
+            Self::SessionStart => ai_memory::handlers::routes::SESSION_START,
+            Self::Reflect => ai_memory::handlers::routes::MEMORY_REFLECT,
+        }
+    }
+
+    /// The request body; `named` is the body `agent_id` (absent when `None`).
+    fn body(self, ns: &str, source_id: &str, named: Option<&str>) -> serde_json::Value {
+        let mut v = match self {
+            Self::SessionStart => serde_json::json!({"namespace": ns, "limit": 50}),
+            Self::Reflect => serde_json::json!({
+                "source_ids": [source_id],
+                "title": format!("h1-9390 reflection {}", run_suffix()),
+                "content": "h1-9390 reflection content of enough length to be accepted",
+                "namespace": ns,
+            }),
+        };
+        if let (Some(id), Some(obj)) = (named, v.as_object_mut()) {
+            obj.insert("agent_id".into(), serde_json::json!(id));
+        }
+        v
+    }
+}
+
+/// One `scope=private` row owned by `owner`, written through the store (with
+/// zero keys enrolled no HTTP caller can prove `owner` to write it).
+async fn seed_private_9390(fx: &Fixture, owner: &str, ns: &str, marker: &str) -> String {
+    let now = chrono::Utc::now().to_rfc3339();
+    let row = ai_memory::models::Memory {
+        id: uuid::Uuid::new_v4().to_string(),
+        namespace: ns.to_string(),
+        title: marker.to_string(),
+        content: marker.to_string(),
+        created_at: now.clone(),
+        updated_at: now,
+        metadata: serde_json::json!({"agent_id": owner, "scope": "private"}),
+        ..ai_memory::models::Memory::default()
+    };
+    let ctx = ai_memory::store::CallerContext::for_admin("fixture-9390");
+    fx.store
+        .store(&ctx, &row)
+        .await
+        .expect("seed the private row")
+}
+
+/// Every row in `ns`, read past the visibility filter: the "nothing was
+/// written" read-back.
+async fn ns_rows_9390(fx: &Fixture, ns: &str) -> usize {
+    let ctx = ai_memory::store::CallerContext::for_admin("fixture-9390");
+    let mut filter = ai_memory::store::Filter::default();
+    filter.namespace = Some(ns.to_string());
+    filter.limit = 1000;
+    fx.store.list(&ctx, &filter).await.expect("list ns").len()
+}
+
+/// The funnel's own refusal on `site`'s route: the same route asked with a
+/// self-asserted `X-Agent-Id`, refused by the authority layer.
+async fn funnel_refusal_body_9390(fx: &Fixture, site: H1Site9390) -> serde_json::Value {
+    let out = send_simple(&fx.router, "post", site.path(), SHARED_KEY, &[BOB], None).await;
+    assert!(
+        out.is_funnel_refusal(),
+        "H1 reference: the funnel refuses a header name on {site:?}: {} {}",
+        out.status,
+        out.body
+    );
+    out.body
+}
+
+/// Enforce, shared key, NO header, body names alice: the funnel's exact 403,
+/// alice's private marker is not served, and no row was written.
+async fn assert_h1_body_claim_refused_9390(site: H1Site9390, with_keys: bool) {
+    let fx = build(HttpIdentityMode::Enforce, with_keys).await;
+    let suffix = run_suffix();
+    let marker = format!("h1-private-marker-9390-{suffix}");
+    let ns = format!("ns-h1-9390-{suffix}");
+    let source = seed_private_9390(&fx, ALICE, &ns, &marker).await;
+    let before = ns_rows_9390(&fx, &ns).await;
+    let out = send_simple(
+        &fx.router,
+        "post",
+        site.path(),
+        SHARED_KEY,
+        &[],
+        Some(site.body(&ns, &source, Some(ALICE))),
+    )
+    .await;
+    let expected = funnel_refusal_body_9390(&fx, site).await;
+    assert_eq!(
+        (out.status, &out.body),
+        (StatusCode::FORBIDDEN, &expected),
+        "H1 {site:?} keys={with_keys}: a body-named principal must get the funnel's 403"
+    );
+    assert!(
+        !out.body.to_string().contains(&marker),
+        "H1 {site:?} keys={with_keys}: alice's private row served: {}",
+        out.body
+    );
+    assert_eq!(
+        ns_rows_9390(&fx, &ns).await,
+        before,
+        "H1 {site:?} keys={with_keys}: the refused request wrote a row"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn h1_session_start_body_claim_no_keys_refused_9390() {
+    assert_h1_body_claim_refused_9390(H1Site9390::SessionStart, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn h1_session_start_body_claim_keys_enrolled_refused_9390() {
+    assert_h1_body_claim_refused_9390(H1Site9390::SessionStart, true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn h1_reflect_body_claim_no_keys_refused_9390() {
+    assert_h1_body_claim_refused_9390(H1Site9390::Reflect, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn h1_reflect_body_claim_keys_enrolled_refused_9390() {
+    assert_h1_body_claim_refused_9390(H1Site9390::Reflect, true).await;
+}
+
+/// Enforce, alice PROVEN (her per-agent key), body names bob: the funnel's
+/// exact 403, nothing written.
+async fn assert_h1_proven_other_refused_9390(site: H1Site9390) {
+    let fx = build(HttpIdentityMode::Enforce, true).await;
+    let suffix = run_suffix();
+    let marker = format!("h1-proven-other-9390-{suffix}");
+    let ns = format!("ns-h1po-9390-{suffix}");
+    let source = seed_private_9390(&fx, ALICE, &ns, &marker).await;
+    let before = ns_rows_9390(&fx, &ns).await;
+    let out = send_simple(
+        &fx.router,
+        "post",
+        site.path(),
+        ALICE_KEY,
+        &[ALICE],
+        Some(site.body(&ns, &source, Some(BOB))),
+    )
+    .await;
+    let expected = funnel_refusal_body_9390(&fx, site).await;
+    assert_eq!(
+        (out.status, &out.body),
+        (StatusCode::FORBIDDEN, &expected),
+        "H1 {site:?}: a proven caller naming another id must get the funnel's 403"
+    );
+    assert_eq!(
+        ns_rows_9390(&fx, &ns).await,
+        before,
+        "H1 {site:?}: row written"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn h1_session_start_proven_caller_naming_other_refused_9390() {
+    assert_h1_proven_other_refused_9390(H1Site9390::SessionStart).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn h1_reflect_proven_caller_naming_other_refused_9390() {
+    assert_h1_proven_other_refused_9390(H1Site9390::Reflect).await;
+}
+
+/// Enforce, alice proven, body names alice (and, separately, no body id):
+/// served as today, and session_start returns her own private row.
+async fn assert_h1_proven_self_served_9390(site: H1Site9390) {
+    let fx = build(HttpIdentityMode::Enforce, true).await;
+    let suffix = run_suffix();
+    let marker = format!("h1-proven-self-9390-{suffix}");
+    let ns = format!("ns-h1ps-9390-{suffix}");
+    let source = seed_private_9390(&fx, ALICE, &ns, &marker).await;
+    for named in [Some(ALICE), None] {
+        let out = send_simple(
+            &fx.router,
+            "post",
+            site.path(),
+            ALICE_KEY,
+            &[ALICE],
+            Some(site.body(&ns, &source, named)),
+        )
+        .await;
+        assert_eq!(
+            out.status,
+            StatusCode::OK,
+            "H1 {site:?} named={named:?}: the proven caller is served: {}",
+            out.body
+        );
+        if site == H1Site9390::SessionStart {
+            assert!(
+                out.body.to_string().contains(&marker),
+                "H1 {site:?} named={named:?}: alice reads her own private row: {}",
+                out.body
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn h1_session_start_proven_caller_naming_itself_served_9390() {
+    assert_h1_proven_self_served_9390(H1Site9390::SessionStart).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn h1_reflect_proven_caller_naming_itself_served_9390() {
+    assert_h1_proven_self_served_9390(H1Site9390::Reflect).await;
+}
+
+/// Off and Advisory keep today's answer for the zero-key body-only caller
+/// (served as the named agent); Advisory also REPORTS the body claim (the
+/// V-4 line), exactly as it reports a self-asserted header.
+async fn assert_h1_off_advisory_unchanged_9390(site: H1Site9390, mode: HttpIdentityMode) {
+    let fx = build(mode, false).await;
+    let suffix = run_suffix();
+    let named = format!("dora-h1-9390-{suffix}");
+    let marker = format!("h1-unchanged-9390-{suffix}");
+    let ns = format!("ns-h1u-9390-{suffix}");
+    let source = seed_private_9390(&fx, &named, &ns, &marker).await;
+    let out = send_simple(
+        &fx.router,
+        "post",
+        site.path(),
+        SHARED_KEY,
+        &[],
+        Some(site.body(&ns, &source, Some(&named))),
+    )
+    .await;
+    assert_eq!(
+        out.status,
+        StatusCode::OK,
+        "H1 {site:?} {mode:?}: today's body-only contract is served: {}",
+        out.body
+    );
+    if site == H1Site9390::SessionStart {
+        assert!(
+            out.body.to_string().contains(&marker),
+            "H1 {site:?} {mode:?}: today's body-only caller reads as the named agent: {}",
+            out.body
+        );
+    }
+    let reported =
+        ai_memory::handlers::advisory_identity_report::observe_unproven_claim(SHARED_KEY, &named)
+            .is_none();
+    assert_eq!(
+        reported,
+        mode == HttpIdentityMode::Advisory,
+        "H1 {site:?} {mode:?}: the body claim is reported under Advisory only"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn h1_session_start_off_unchanged_9390() {
+    assert_h1_off_advisory_unchanged_9390(H1Site9390::SessionStart, HttpIdentityMode::Off).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn h1_session_start_advisory_reports_body_claim_9390() {
+    assert_h1_off_advisory_unchanged_9390(H1Site9390::SessionStart, HttpIdentityMode::Advisory)
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn h1_reflect_off_unchanged_9390() {
+    assert_h1_off_advisory_unchanged_9390(H1Site9390::Reflect, HttpIdentityMode::Off).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn h1_reflect_advisory_reports_body_claim_9390() {
+    assert_h1_off_advisory_unchanged_9390(H1Site9390::Reflect, HttpIdentityMode::Advisory).await;
+}
