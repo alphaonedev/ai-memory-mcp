@@ -17,7 +17,8 @@
 //! a request whose `X-API-Key` is empty or whitespace never authenticates, in
 //! every identity mode. A blank value at a non-normalizing constructor is
 //! refused closed (it is no key, and nothing compares against it); the boot
-//! path keeps its precedent (blank = no shared key, pinned in b1 and b2).
+//! path keeps its precedent (blank = no shared key, pinned in b1 and b2) and
+//! says so at boot with one WARN naming the remedy (b3).
 //!
 //! Blank corpus: `str::trim` strips Unicode `White_Space`, so U+00A0 (NBSP) is
 //! blank too (pinned in p5).
@@ -710,6 +711,114 @@ async fn b2_boot_blank_key_on_routable_bind_refuses_9354() {
             msg.contains("refusing to bind") && msg.contains("non-loopback"),
             "{label}: {msg}"
         );
+    }
+}
+
+/// The exact boot WARN for a blank configured `api_key` (ruling 28907a4f): it
+/// says what happened and names the remedy; it never carries the key value.
+const BLANK_KEY_BOOT_WARN: &str = "#9354: api_key is configured but blank (empty or whitespace) and is \
+treated as no shared key: HTTP API-key auth is off and a non-loopback bind is refused; remedy: set \
+top-level `api_key = \"...\"` to a non-blank secret, or remove the blank value";
+
+/// A `tracing` writer into a shared buffer.
+#[derive(Clone, Default)]
+struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for Capture {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Boot on loopback with `api_key`, capturing every event of the boot; the
+/// router is built from the booted state exactly as `serve` composes it.
+async fn boot_capturing(api_key: Option<&str>) -> (String, axum::Router) {
+    let path = scratch_db();
+    let tls = tls_helper::TestTls::generate(&path.with_extension("tls9354"));
+    let args = loopback_args("127.0.0.1", &tls);
+    let cfg = ai_memory::config::AppConfig {
+        api_key: api_key.map(str::to_string),
+        ..Default::default()
+    };
+    let sink = Capture::default();
+    let writer = sink.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || writer.clone())
+        .with_max_level(tracing::Level::WARN)
+        .with_ansi(false)
+        .finish();
+    let bs = {
+        let _default = tracing::subscriber::set_default(subscriber);
+        ai_memory::daemon_runtime::bootstrap_serve(&path, &args, &cfg).await
+    }
+    .unwrap_or_else(|e| panic!("{api_key:?}: loopback boot: {e:#}"));
+    for h in bs.task_handles {
+        h.abort();
+    }
+    let logs = String::from_utf8_lossy(
+        &sink
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
+    .to_string();
+    let app = ai_memory::daemon_runtime::build_router(bs.app_state, bs.api_key_state);
+    (logs, app)
+}
+
+/// b3 — ruling 28907a4f: a daemon configured with a blank key starts, with
+/// exactly one boot WARN naming the remedy, and its health and monitoring
+/// probes answer exactly as on a daemon with no key (an unset key and a real
+/// key get no such WARN).
+#[tokio::test]
+async fn b3_boot_blank_key_warns_with_remedy_and_probes_stay_reachable_9354() {
+    let (unset_logs, unset_app) = boot_capturing(None).await;
+    assert!(
+        !unset_logs.contains(BLANK_KEY_BOOT_WARN),
+        "unset key: {unset_logs}"
+    );
+    let (real_logs, _) = boot_capturing(Some(REAL_KEY)).await;
+    assert!(
+        !real_logs.contains(BLANK_KEY_BOOT_WARN),
+        "real key: {real_logs}"
+    );
+    for (label, blank) in BLANK_KEYS {
+        let (logs, app) = boot_capturing(Some(blank)).await;
+        assert_eq!(
+            logs.matches(BLANK_KEY_BOOT_WARN).count(),
+            1,
+            "{label}: one boot WARN with the remedy: {logs}"
+        );
+        for path in [ai_memory::handlers::routes::HEALTH, STATUS_PATH] {
+            for case in HEADER_CASES {
+                let header = header_value(case, blank);
+                let Some((status, body)) = send(&app, path, header).await else {
+                    continue;
+                };
+                let (unset_status, unset_body) = send(&unset_app, path, header)
+                    .await
+                    .expect("carried on the unset daemon too");
+                // A success body carries live figures; a refusal body is exact.
+                assert_eq!(
+                    (status, status.is_success() || body == unset_body),
+                    (unset_status, true),
+                    "{label} {path} {case:?}: a probe must answer as with no key: \
+                     {body} vs {unset_body}"
+                );
+                assert_ne!(body, refusal_body(), "{label} {path} {case:?}");
+            }
+        }
+        let (status, body) = send(&app, ai_memory::handlers::routes::HEALTH, None)
+            .await
+            .expect("carried");
+        assert!(status.is_success(), "{label}: liveness: {status} {body}");
     }
 }
 
