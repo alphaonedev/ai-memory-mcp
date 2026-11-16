@@ -200,7 +200,7 @@ pub async fn authority_layer(
             // rejected probe exactly as `require_admin` did when it was the
             // first gate a malformed header met (#984).
             crate::governance::audit::record_decision(
-                "anonymous:resolve-failed",
+                crate::identity::sentinels::ANONYMOUS_RESOLVE_FAILED,
                 "deny",
                 AUDIT_KIND_AUTHORITY,
                 "",
@@ -285,7 +285,7 @@ pub fn refuse_unproven_named_principal(
 /// ASCII. The raw bytes are never echoed.
 fn unreadable_header_refusal(path: &str) -> Response {
     crate::governance::audit::record_decision(
-        "anonymous:resolve-failed",
+        crate::identity::sentinels::ANONYMOUS_RESOLVE_FAILED,
         "deny",
         AUDIT_KIND_AUTHORITY,
         "",
