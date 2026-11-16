@@ -57,7 +57,9 @@ SHARED_MODULE_NAME = "workflow_annotation.py"
 # module is loaded (see test_local_version_escape_equals_safe_value_for_every_code_point_9365)
 SHARED_FIELD_FUNCTIONS = frozenset({"safe_text", "property_value", "annotation", "log_line", "env_file_value", "single_line",
                                     "version_text"})
-COMMAND_RE = re.compile(r"(?m)^::[a-z][a-z-]*")
+# v2 form: "::name" at a line start; v1 form: "##[" anywhere in a line (actions/runner ActionCommand.TryParse uses
+# message.IndexOf("##[") with no trim; TryParseV2 uses message.TrimStart().StartsWith("::"))
+COMMAND_RE = re.compile(r"(?m)^::[a-z][a-z-]*|##\[")
 HEREDOC_RE = re.compile(r"python3?[^\n<]*<<-?\s*'?(\w+)'?[^\n]*\n(.*?)\n\s*\1\s*$", re.S | re.M)
 
 LINE_BOUND_CHARS = 1000
@@ -81,11 +83,24 @@ FILE_NAME_CORPUS = ("command", "raw_newline", "raw_cr", "colons", "percent", "no
 
 
 def oracle_escape(text):
-    """The escape rule of #8634 (finding L4), restated: what a variable value must look like in a message."""
+    """The escape rule of #8634 (finding L4), restated: what a variable value must look like in a message.
+
+    #9365 r2: a ``:`` followed by ``:`` (so no run of colons keeps a ``::``), a ``#`` that is last or precedes ``#``
+    or ``[``, and a ``[`` that is first or follows ``#`` (so no ``##[`` forms inside or at either edge) are escaped.
+    """
     out = []
-    for char in str(text):
+    text = str(text)
+    for index, char in enumerate(text):
         code = ord(char)
-        if char == "\\":
+        after = text[index + 1:index + 2]
+        before = text[index - 1:index] if index else ""
+        if char == ":" and after == ":":
+            out.append("\\x3a")
+        elif char == "#" and after in ("", "#", "["):
+            out.append("\\x23")
+        elif char == "[" and before in ("", "#"):
+            out.append("\\x5b")
+        elif char == "\\":
             out.append("\\\\")
         elif char == "%":
             out.append("\\x25")
@@ -95,7 +110,7 @@ def oracle_escape(text):
             out.append("\\u%04x" % code)
         else:
             out.append(char)
-    return "".join(out).replace("::", "\\x3a:")
+    return "".join(out)
 
 
 def scratch_dir(label):
@@ -275,6 +290,9 @@ class RatchetTests(unittest.TestCase):
         self.assertEqual(len(self.violations(sample, "sample")), 2)
         sample = ast.parse('def f(exc):\n    print("::error::x" + safe_text(exc))\n    print("::notice::fixed")\n')
         self.assertEqual(self.violations(sample, "sample"), [])
+        # the v1 form anywhere in a literal is a command too (#9365 r2 finding 1)
+        sample = ast.parse('def f(exc):\n    print("x ##[error]%s" % exc)\n    print(f"y ##[warning]{exc}")\n')
+        self.assertEqual(len(self.violations(sample, "sample")), 2)
 
 
 class ScriptBehaviour(CommandAssertions):
@@ -1572,6 +1590,422 @@ class LoaderShape(unittest.TestCase):
         self.assertEqual(set(LOADER_SHAPE_EXCEPTIONS), {"scripts/ci/" + PRUNE_SCRIPT_NAME})
         source = (CI_DIR / PRUNE_SCRIPT_NAME).read_text(encoding="utf-8")
         self.assertTrue(shared_module_references(ast.parse(source)), "the exception must still name the module")
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# v1 workflow-command form (#9365 r2, finding 1 of REVIEW-9400-combined-r1).
+#
+# Runner rule (actions/runner src/Runner.Common/ActionCommand.cs, read 2026-11-16; ActionCommandManager tries
+# TryParseV2 first, then TryParse): v2 = ``message.TrimStart()`` then ``StartsWith("::")``; v1 = ``message.IndexOf("##[")``
+# ANYWHERE in the line, no trim, then ``IndexOf(']')``. The runner reads stdout and stderr lines alike, so both count.
+# Invariant for every value v: every line a public emitting function of the module returns for v (a) starts a
+# workflow command only with the fixed head the module wrote, (b) holds no ``##[`` at all (the module never intends
+# a v1 command) and no ``::`` that came from v at the trimmed line start, (c) is one line by ``str.splitlines``.
+# ---------------------------------------------------------------------------------------------------------------
+
+V1_PREFIX = "##["
+V1_HOSTILE = {
+    "v1_start": "##[error]x",
+    "v1_mid": "a ##[warning]b",
+    "v1_after_space": " \t\u00a0##[error]x",
+    "v1_triple_hash": "###[error]x",
+    "v1_quad_hash_double_bracket": "####[[error]x",
+    "v1_lead_bracket": "[error]x",
+    "v1_tail_hash": "abc#",
+    "v1_tail_double_hash": "abc##",
+    "v1_with_v2": "::##[error]::x",
+    "v1_v2_inside": "##[error]::error::x",
+    "v1_percent": "%23%23[error]%0A##[error]",
+    "v1_cr": "a\r##[error]x",
+    "v1_lf": "a\n##[error]x",
+    "v1_u2028": "a\u2028##[error]x\u2029##[warning]y",
+    "v1_nul": "a\x00##[error]x",
+    "v1_backslash": "\\##[error]x",
+    "colon_run": "::::x:::",
+    "benign_hash": "PR #9365 [ok]",
+}
+V1_SPLIT_PAIRS = (("#", "#[error]x"), ("##", "[error]x"), ("a#", "#["), ("#", "["), ("x##", "[y"), ("", "##[e]"))
+V1_HUGE_CHARS = 120_000  # the 100K+ size cell
+V1_HUGE_WALL_CLOCK_SECS = 5.0
+# exact outputs, written out by hand from the rule (escape the "#" that is last or precedes "#"/"[", the "[" that is
+# first or follows "#", the ":" that precedes ":"), independent of the module's code
+V1_SAFE_TEXT_EXACT = {
+    "##[error]x": "\\x23\\x23\\x5berror]x",
+    "a ##[warning]b": "a \\x23\\x23\\x5bwarning]b",
+    "###[error]x": "\\x23\\x23\\x23\\x5berror]x",
+    "####[[error]x": "\\x23\\x23\\x23\\x23\\x5b[error]x",
+    "[error]x": "\\x5berror]x",
+    "abc#": "abc\\x23",
+    "::::x:::": "\\x3a\\x3a\\x3a:x\\x3a\\x3a:",
+    "a\n##[error]x": "a\\x0a\\x23\\x23\\x5berror]x",
+    "%23%23[error]": "\\x2523\\x2523[error]",
+    "PR #9365 [ok]": "PR #9365 [ok]",
+}
+V1_SAFE_VALUE_EXACT = {"##[e]:x": "\\x23\\x23\\x5be]\\x3ax", "a::b#": "a\\x3a\\x3ab\\x23"}
+V1_PROPERTY_EXACT = {"a,b:##[": "a\\x2cb\\x3a\\x23\\x23\\x5b"}
+V1_LOG_LINE_EXACT = {
+    "##[error]x": "##\\x5berror]x",
+    "removed /w/a ##[warning]b": "removed /w/a ##\\x5bwarning]b",
+    "###[e]": "###\\x5be]",
+    "  ::##[e]": "  \\x3a:##\\x5be]",
+    "a\n##[e]": "a\\x0a##\\x5be]",
+    "##[a]##[b]": "##\\x5ba]##\\x5bb]",
+    "PR #9365 [ok]": "PR #9365 [ok]",
+}
+V1_ANNOTATION_EXACT = (
+    (("warning", "##[error]x"), {}, "::warning::\\x23\\x23\\x5berror]x"),
+    (("error", "m"), {"title": "##[e]"}, "::error title=\\x23\\x23\\x5be]::m"),
+)
+V1_JOIN_EXACT = ((("", ["#", "#", "[x"]), "\\x23\\x23\\x5bx"), ((", ", ["a#", "[b"]), "a\\x23, \\x5bb"))
+V1_RENDER_EXACT = (
+    (("{a}{b}", {"a": "#", "b": "#[x"}), "\\x23\\x23\\x5bx"),
+    (("##{v}", {"v": "[error]"}), "##\\x5berror]"),
+    (("{v}[e]", {"v": "##"}), "\\x23\\x23[e]"),
+    (("##[{v}", {"v": "x"}), "##\\x5bx"),
+)
+V1_ENV_FILE_EXACT = {"##[error]x\n": "##[error]x "}  # a KEY=value file line keeps the bytes (data, not a log line)
+# which public functions emit a log or annotation line and which only build a $GITHUB_* file value
+V1_FILE_ONLY_FUNCTIONS = frozenset({"env_file_value"})
+
+
+def runner_would_parse(line):
+    """True when the runner rule above reads ``line`` as a workflow command (v2 by Python's wider lstrip set)."""
+    return line.lstrip().startswith("::") or V1_PREFIX in line
+
+
+class V1FormNeutralised(unittest.TestCase):
+    """Every public emitting function of the module, over the v1 corpus, exact and by property (#9365 r2)."""
+
+    @classmethod
+    def setUpClass(cls):
+        import inspect
+        cls.wa = load_module(CI_DIR / SHARED_MODULE_NAME, "workflow_annotation_9365_v1")
+        cls.public = sorted(name for name, obj in vars(cls.wa).items()
+                            if not name.startswith("_") and inspect.isfunction(obj))
+
+    def cells(self):
+        """name -> (value -> list of emitted lines, the fixed command head the module may write or None)."""
+        wa = self.wa
+        return {
+            "safe_text": (lambda v: [wa.safe_text(v)], None),
+            "safe_value": (lambda v: [wa.safe_value(v)], None),
+            "property_value": (lambda v: [wa.property_value(v)], None),
+            "log_line": (lambda v: [wa.log_line(v)], None),
+            "render": (lambda v: [wa.render("{prog}: refused: {v}", prog="p", v=v), wa.render("{v}", v=v)], None),
+            "join": (lambda v: [wa.join(", ", [v, v]), wa.join("", [v, "x", v])], None),
+            "annotation": (lambda v: [wa.annotation("warning", v, title=v),
+                                      wa.annotation("error", wa.render("##{v}", v=v))], ("::warning", "::error")),
+            "end_group_line": (lambda v: [wa.end_group_line()], ("::endgroup::",)),
+            "env_file_value": (lambda v: [wa.env_file_value(v)], None),
+        }
+
+    def corpus(self):
+        values = list(V1_HOSTILE.values()) + list(HOSTILE.values())
+        values += [a + b for a, b in V1_SPLIT_PAIRS]
+        return values
+
+    def test_every_public_function_has_a_cell_9365(self):
+        self.assertEqual(self.public, sorted(self.cells()), "a new public function needs a v1 cell")
+
+    def assert_line_safe(self, name, line, heads):
+        self.assertEqual(len(line.splitlines()), 1 if line else 0, (name, line[:200]))
+        if name in V1_FILE_ONLY_FUNCTIONS:
+            return
+        self.assertNotIn(V1_PREFIX, line, (name, line[:200]))
+        if line.lstrip().startswith("::"):
+            self.assertTrue(heads and any(line.startswith(head) for head in heads), (name, line[:200]))
+            second = line.find("::", 2)  # the command's own second "::" (absent when a long property was cut)
+            if heads != ("::endgroup::",) and second != -1:
+                self.assertFalse(runner_would_parse(line[second + 2:]), (name, line[:200]))
+
+    def test_no_value_starts_a_command_through_any_function_9365(self):
+        for name, (emit, heads) in self.cells().items():
+            for value in self.corpus():
+                with self.subTest(function=name, value=value[:40]):
+                    for line in emit(value):
+                        self.assert_line_safe(name, line, heads)
+
+    def test_split_values_joined_by_the_module_never_build_the_v1_form_9365(self):
+        wa = self.wa
+        for left, right in V1_SPLIT_PAIRS:
+            with self.subTest(pair=(left, right)):
+                for line in (wa.join("", [left, right]), wa.render("{a}{b}", a=left, b=right),
+                             wa.safe_text(left) + wa.safe_text(right), wa.annotation("notice", left + right),
+                             wa.log_line(left + right)):
+                    self.assertNotIn(V1_PREFIX, line)
+
+    def test_exact_outputs_9365(self):
+        wa = self.wa
+        for function, table in ((wa.safe_text, V1_SAFE_TEXT_EXACT), (wa.safe_value, V1_SAFE_VALUE_EXACT),
+                                (wa.property_value, V1_PROPERTY_EXACT), (wa.log_line, V1_LOG_LINE_EXACT),
+                                (wa.env_file_value, V1_ENV_FILE_EXACT)):
+            for value, expected in table.items():
+                with self.subTest(function=function.__name__, value=value):
+                    self.assertEqual(function(value), expected)
+        for args, kwargs, expected in V1_ANNOTATION_EXACT:
+            with self.subTest(annotation=args):
+                self.assertEqual(wa.annotation(*args, **kwargs), expected)
+        for (separator, parts), expected in V1_JOIN_EXACT:
+            with self.subTest(join=parts):
+                self.assertEqual(wa.join(separator, parts), expected)
+        for (template, values), expected in V1_RENDER_EXACT:
+            with self.subTest(render=template):
+                self.assertEqual(wa.render(template, **values), expected)
+        self.assertEqual(wa.end_group_line(), "::endgroup::")
+
+    def test_safe_text_leaves_no_double_colon_9365(self):
+        """The docstring's claim (finding 2): no ``::`` survives ``safe_text`` for any run of colons."""
+        for count in range(1, 12):
+            with self.subTest(colons=count):
+                self.assertNotIn("::", self.wa.safe_text(":" * count))
+                self.assertNotIn("::", self.wa.safe_text("a" + ":" * count + "b"))
+
+    def test_huge_v1_input_is_linear_and_bounded_9365(self):
+        wa = self.wa
+        value = (V1_PREFIX * (V1_HUGE_CHARS // len(V1_PREFIX) + 1))[:V1_HUGE_CHARS]
+        started = time.monotonic()
+        lines = [wa.safe_text(value), wa.log_line(value), wa.annotation("warning", value),
+                 wa.join("", [value, value]), wa.render("{v}", v=value)]
+        self.assertLess(time.monotonic() - started, V1_HUGE_WALL_CLOCK_SECS)
+        for line in lines:
+            self.assertNotIn(V1_PREFIX, line)
+        self.assertLessEqual(len(lines[2]), LINE_BOUND_CHARS)
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Stream ratchet (#9365 r2): in the 14 scripts every print()/sys.std*.write() argument is a literal, a shared-module
+# call, or a value the AST can trace to one. The runner parses ``##[`` anywhere in a stdout or stderr line, so a raw
+# variable in any printed line is a command carrier. Exempt: the canonical load try (it runs before the module
+# exists; LoaderShape pins its exact AST and its only variable is an identifier-checked type name).
+# Blind spots (stated): a value written to a stream through another module; ``exec``/``eval``; output of a child
+# process the script lets through unchanged (cargo, psql: the child's own lines, not the script's text).
+# ---------------------------------------------------------------------------------------------------------------
+
+STREAM_SCRIPTS = tuple(sorted(set(GATE_LOAD_EXIT_CODES) | set(NON_GATE_LOAD_EXIT_CODES) | {"scripts/ci/" + PRUNE_SCRIPT_NAME}))
+STREAM_SHARED_CALLS = SHARED_FIELD_FUNCTIONS | {"safe_value", "render", "join", "end_group_line"}
+STREAM_NUMBER_CALLS = frozenset({"len", "int", "float", "round", "abs"})  # return a number for any argument
+STREAM_TRACE_DEPTH = 6
+STREAM_SCRIPT_COUNT = 14
+STREAM_MODULE_VARS = frozenset({"wa"})  # the name every script binds the loaded module to
+# Runs before the shared module exists, so it cannot use it; each output is fixed text pinned by its own test:
+# prune_runner_tmp's floor check (VERSION_REFUSAL_AT_0F1EC1B7 cells) and load refusal (SiblingLoadFailsClosed, P1).
+STREAM_PRELOAD_FUNCTIONS = {"scripts/ci/prune_runner_tmp.py": frozenset({"load_refused"})}
+STREAM_PRELOAD_GUARD_CALL = "python_refusal"  # a module-level ``if`` that calls it is the floor check
+
+
+class StreamTracer:
+    """Decide, from one file's AST alone, whether an expression's text can only come from literals or the module."""
+
+    def __init__(self, tree, rel=""):
+        self.tree = tree
+        self.parents = {}
+        for parent in ast.walk(tree):
+            for child in ast.iter_child_nodes(parent):
+                self.parents[child] = parent
+        self.functions = {}
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                self.functions.setdefault(node.name, []).append(node)
+        self.exempt = set()
+        preload = STREAM_PRELOAD_FUNCTIONS.get(rel, frozenset())
+        for node in tree.body:
+            is_floor = isinstance(node, ast.If) and any(
+                isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name) and sub.func.id == STREAM_PRELOAD_GUARD_CALL
+                for sub in ast.walk(node.test))
+            is_preload = isinstance(node, ast.FunctionDef) and node.name in preload
+            if _is_load_try(node) or is_floor or is_preload:
+                self.exempt.update(id(sub) for sub in ast.walk(node))
+        # a bare name bound at module level to ``getattr(wa, "<shared function>", ...)`` is that shared function
+        self.shared_aliases = set()
+        for node in tree.body:
+            if (isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
+                    and isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name)
+                    and node.value.func.id == "getattr" and len(node.value.args) >= 2
+                    and isinstance(node.value.args[0], ast.Name) and node.value.args[0].id in STREAM_MODULE_VARS
+                    and isinstance(node.value.args[1], ast.Constant)
+                    and node.value.args[1].value in STREAM_SHARED_CALLS):
+                self.shared_aliases.add(node.targets[0].id)
+
+    def enclosing_function(self, node):
+        node = self.parents.get(node)
+        while node is not None and not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            node = self.parents.get(node)
+        return node
+
+    @staticmethod
+    def call_name(call):
+        func = call.func
+        return func.id if isinstance(func, ast.Name) else func.attr if isinstance(func, ast.Attribute) else None
+
+    def ok(self, node, depth=0):
+        if depth > STREAM_TRACE_DEPTH:
+            return False
+        nxt = depth + 1
+        if isinstance(node, ast.Constant):
+            return True
+        if isinstance(node, ast.JoinedStr):
+            return all(self.ok(part.value if isinstance(part, ast.FormattedValue) else part, nxt) for part in node.values)
+        if isinstance(node, ast.BinOp):
+            return self.ok(node.left, nxt) and self.ok(node.right, nxt)
+        if isinstance(node, ast.UnaryOp):
+            return self.ok(node.operand, nxt)
+        if isinstance(node, (ast.Tuple, ast.List)):
+            return all(self.ok(elt, nxt) for elt in node.elts)
+        if isinstance(node, ast.BoolOp):
+            return all(self.ok(value, nxt) for value in node.values)
+        if isinstance(node, ast.IfExp):
+            return self.ok(node.body, nxt) and self.ok(node.orelse, nxt)
+        if isinstance(node, ast.Compare):
+            return True  # a bool
+        if isinstance(node, ast.Call):
+            return self.call_ok(node, nxt)
+        if isinstance(node, ast.Name):
+            return self.name_ok(node, nxt)
+        return False
+
+    def call_ok(self, call, depth):
+        name = self.call_name(call)
+        func = call.func
+        if (isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name) and func.value.id in STREAM_MODULE_VARS
+                and name in STREAM_SHARED_CALLS):
+            return True
+        if isinstance(func, ast.Name) and name in self.shared_aliases:
+            return True
+        if isinstance(call.func, ast.Name) and name in STREAM_NUMBER_CALLS:
+            return True
+        if (name == "format" and isinstance(call.func, ast.Attribute) and self.ok(call.func.value, depth)
+                and all(self.ok(arg, depth) for arg in call.args) and all(self.ok(kw.value, depth) for kw in call.keywords)):
+            return True
+        defs = self.functions.get(name)
+        if not defs or not (isinstance(call.func, ast.Name) or (isinstance(call.func, ast.Attribute)
+                                                                 and isinstance(call.func.value, ast.Name)
+                                                                 and call.func.value.id == "self")):
+            return False
+        for func in defs:
+            returns = [node for node in ast.walk(func) if isinstance(node, ast.Return)]
+            if not returns or not all(ret.value is None or self.ok(ret.value, depth) for ret in returns):
+                return False
+        return True
+
+    def bindings(self, scope, name):
+        """Every node that binds ``name`` in ``scope`` (a function, or the module): values, or None for a form we cannot trace."""
+        found = []
+        body = scope.body if isinstance(scope, ast.Module) else [scope]
+        for root in body:
+            for node in ast.walk(root):
+                if node is not scope and isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+                    if isinstance(scope, ast.Module):
+                        continue
+                if isinstance(node, ast.Assign):
+                    for target in node.targets:
+                        if isinstance(target, ast.Name) and target.id == name:
+                            found.append(node.value)
+                        elif any(isinstance(sub, ast.Name) and sub.id == name for sub in ast.walk(target)):
+                            found.append(None)
+                elif isinstance(node, (ast.AnnAssign, ast.AugAssign)) and isinstance(node.target, ast.Name) \
+                        and node.target.id == name:
+                    found.append(node.value if isinstance(node, ast.AnnAssign) else None)
+                elif isinstance(node, (ast.For, ast.comprehension, ast.With, ast.ExceptHandler, ast.NamedExpr)):
+                    targets = ([node.target] if isinstance(node, (ast.For, ast.comprehension, ast.NamedExpr))
+                               else [item.optional_vars for item in node.items] if isinstance(node, ast.With)
+                               else [])
+                    if isinstance(node, ast.ExceptHandler) and node.name == name:
+                        found.append(None)
+                    for target in targets:
+                        if target is not None and any(isinstance(sub, ast.Name) and sub.id == name
+                                                      for sub in ast.walk(target)):
+                            found.append(None)
+        return found
+
+    def name_ok(self, node, depth):
+        func = self.enclosing_function(node)
+        if func is not None:
+            params = [arg.arg for arg in func.args.posonlyargs + func.args.args + func.args.kwonlyargs]
+            if node.id in params:
+                return self.param_ok(func, node.id, depth)
+            local = self.bindings(func, node.id)
+            if local:
+                return all(value is not None and self.ok(value, depth) for value in local)
+        module_level = self.bindings(self.tree, node.id)
+        return bool(module_level) and all(value is not None and self.ok(value, depth) for value in module_level)
+
+    def param_ok(self, func, param, depth):
+        """Every in-file call of ``func`` passes a traceable value for ``param`` (no caller in the file: not traceable)."""
+        positional = [arg.arg for arg in func.args.posonlyargs + func.args.args]
+        if positional and positional[0] == "self":
+            positional = positional[1:]
+        index = positional.index(param) if param in positional else None
+        default = None
+        defaults = func.args.defaults
+        all_args = func.args.posonlyargs + func.args.args
+        if param in [arg.arg for arg in all_args[len(all_args) - len(defaults):]]:
+            default = defaults[[arg.arg for arg in all_args[len(all_args) - len(defaults):]].index(param)]
+        calls = [node for node in ast.walk(self.tree) if isinstance(node, ast.Call) and self.call_name(node) == func.name]
+        if not calls:
+            return False
+        for call in calls:
+            given = [kw.value for kw in call.keywords if kw.arg == param]
+            if not given and index is not None and index < len(call.args):
+                given = [call.args[index]]
+            if any(isinstance(arg, ast.Starred) for arg in call.args):
+                return False
+            if not given:
+                if default is None or not self.ok(default, depth):
+                    return False
+                continue
+            if not self.ok(given[0], depth):
+                return False
+        return True
+
+
+def stream_violations(rel, source):
+    """Every print()/sys.stdout.write()/sys.stderr.write() argument in ``source`` that is not traceable."""
+    tree = ast.parse(source)
+    tracer = StreamTracer(tree, rel)
+    found = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or id(node) in tracer.exempt:
+            continue
+        func = node.func
+        is_print = isinstance(func, ast.Name) and func.id == "print"
+        is_write = (isinstance(func, ast.Attribute) and func.attr == "write" and isinstance(func.value, ast.Attribute)
+                    and func.value.attr in ("stdout", "stderr") and isinstance(func.value.value, ast.Name)
+                    and func.value.value.id == "sys")
+        if not (is_print or is_write):
+            continue
+        for arg in node.args:
+            if isinstance(arg, ast.Starred) or not tracer.ok(arg):
+                found.append("%s:%d %s" % (rel, node.lineno, ast.unparse(arg)[:80]))
+    return found
+
+
+class StreamRatchet(unittest.TestCase):
+    def test_the_fourteen_scripts_print_only_traceable_text_9365(self):
+        self.assertEqual(len(STREAM_SCRIPTS), STREAM_SCRIPT_COUNT)
+        found = []
+        for rel in STREAM_SCRIPTS:
+            found.extend(stream_violations(rel, (REPO / rel).read_text(encoding="utf-8")))
+        self.assertEqual(found, [], "\n".join(found))
+
+    def test_the_ratchet_catches_a_raw_print_in_every_script_9365(self):
+        """Mutant per script: one raw print of a variable carrying ``##[`` is a violation in each of the 14."""
+        for rel in STREAM_SCRIPTS:
+            source = (REPO / rel).read_text(encoding="utf-8")
+            for label, extra in (("print", "\ndef _mut9365(value):\n    print(value)\n\n_mut9365('##[error]x')\n"
+                                           "_mut9365(str(object()))\n"),
+                                 ("format", "\ndef _mut9365(value):\n    print('x %s' % value, file=sys.stderr)\n\n"
+                                            "_mut9365(sys.argv[0])\n"),
+                                 ("write", "\nsys.stdout.write(sys.argv[0] + '\\n')\n")):
+                with self.subTest(script=rel, mutant=label):
+                    self.assertNotEqual(stream_violations(rel, source + extra), [])
+
+    def test_the_ratchet_accepts_module_built_and_literal_lines_9365(self):
+        sample = ("PROG = 'p'\n"
+                  "def out(line):\n    print(line)\n"
+                  "def note(n):\n    return wa.log_line('n=%s' % n)\n"
+                  "out(wa.annotation('warning', 'x'))\nout(note(3))\n"
+                  "print('%s: %d items' % (PROG, len([])))\nsys.stderr.write(wa.log_line(PROG) + '\\n')\n")
+        self.assertEqual(stream_violations("sample", sample), [])
 
 
 if __name__ == "__main__":
