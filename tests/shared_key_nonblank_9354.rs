@@ -1294,7 +1294,174 @@ fn s1b_key_field_scanner_self_test_9354() {
     assert_eq!(hits("let k = t.key();"), Vec::<usize>::new());
     assert_eq!(hits("let r = 0..key;"), Vec::<usize>::new());
     assert_eq!(hits("let c = '\\''; let l: &'a str = s.key;"), vec![1]);
+    let wrong: Vec<String> = SCANNER_FORM_CELLS
+        .iter()
+        .filter_map(|&(name, src, want)| {
+            let got = hits(src);
+            (got != want).then(|| format!("{name}: want {want:?} got {got:?}"))
+        })
+        .collect();
+    assert_eq!(SCANNER_FORM_CELLS.len(), SCANNER_FORM_CELLS_COUNT);
+    assert!(
+        wrong.is_empty(),
+        "s1b scanner cells wrong:\n{}",
+        wrong.join("\n")
+    );
 }
+
+/// Number of s1b syntax-form cells (asserted in s1b).
+const SCANNER_FORM_CELLS_COUNT: usize = 34;
+/// s1b syntax-form cells (name, synthetic source, 1-based lines that must be
+/// reported). Every syntax that binds or reads the `key` field of the guarded
+/// type is a read; a construction, the struct declaration and an `impl` body
+/// are not; a brace group of the guarded type that names `key` and is neither
+/// provably a pattern nor provably a construction is a read (fail closed).
+/// The literal cells hide a `.key` in each Rust string / char form and put a
+/// real read after it, so a lexer that misreads the literal loses the read.
+const SCANNER_FORM_CELLS: [(&str, &str, &[usize]); SCANNER_FORM_CELLS_COUNT] = [
+    (
+        "self-destructure-in-impl",
+        "impl ApiKeyState {\n fn raw(&self) -> Option<&str> {\n  let Self { key, .. } = self;\n  key.as_deref()\n }\n}",
+        &[3],
+    ),
+    (
+        "self-closure-in-impl",
+        "impl ApiKeyState {\n fn f(v: Vec<Self>) { v.into_iter().map(|Self { key, .. }| key); }\n}",
+        &[2],
+    ),
+    (
+        "self-in-trait-impl",
+        "impl Drop for ApiKeyState {\n fn drop(&mut self) { let Self { key, .. } = self; }\n}",
+        &[2],
+    ),
+    (
+        "self-match-arm-in-impl",
+        "impl ApiKeyState {\n fn f(&self) -> bool {\n  match self {\n   Self { key: Some(_), .. } => true,\n   _ => false,\n  }\n }\n}",
+        &[4],
+    ),
+    (
+        "closure-param",
+        "let k = Some(s).map(|ApiKeyState { key, .. }| key);",
+        &[1],
+    ),
+    (
+        "closure-param-ref",
+        "xs.iter().map(|&ApiKeyState { ref key, .. }| key);",
+        &[1],
+    ),
+    (
+        "for-pattern",
+        "for ApiKeyState { key, .. } in states {}",
+        &[1],
+    ),
+    (
+        "for-tuple-pattern",
+        "for (ApiKeyState { key, .. }, n) in pairs {}",
+        &[1],
+    ),
+    (
+        "match-arm-wrapped",
+        "match o {\n Some(ApiKeyState { key, .. }) => key,\n None => None,\n}",
+        &[2],
+    ),
+    (
+        "match-arm-guard",
+        "match s {\n ApiKeyState { key, .. } if flag => 1,\n _ => 0,\n}",
+        &[2],
+    ),
+    (
+        "if-let",
+        "if let Some(ApiKeyState { key, .. }) = o {}",
+        &[1],
+    ),
+    (
+        "while-let",
+        "while let Some(ApiKeyState { key, .. }) = it.next() {}",
+        &[1],
+    ),
+    (
+        "fn-param-tuple",
+        "fn f((ApiKeyState { key, .. }, n): (ApiKeyState, u8)) {}",
+        &[1],
+    ),
+    (
+        "renamed-binding",
+        "let ApiKeyState { key: k, .. } = s;",
+        &[1],
+    ),
+    (
+        "nested-binding",
+        "let Outer { inner: ApiKeyState { key, .. }, .. } = o;",
+        &[1],
+    ),
+    (
+        "tuple-struct-wrapping",
+        "let Wrap(ApiKeyState { key, .. }) = w;",
+        &[1],
+    ),
+    (
+        "all-fields-pattern",
+        "let ApiKeyState { key, mtls_enforced, enrolled_agent_keys, identity_mode, auth_backoff } = s;",
+        &[1],
+    ),
+    (
+        "destructuring-assignment",
+        "ApiKeyState { key, .. } = s;",
+        &[1],
+    ),
+    (
+        "alias-use-as",
+        "use crate::handlers::ApiKeyState as Aks;\nfn f(s: Aks) { let Aks { key, .. } = s; }",
+        &[2],
+    ),
+    (
+        "alias-type",
+        "type Aks = crate::handlers::ApiKeyState;\nfn f(s: Aks) { let Aks { key, .. } = s; }",
+        &[2],
+    ),
+    (
+        "unclassified-group-fails-closed",
+        "ApiKeyState { key: k, mtls_enforced: m }",
+        &[1],
+    ),
+    ("raw-ident-field", "let k = s.r#key.clone();", &[1]),
+    (
+        "raw-ident-pattern",
+        "let ApiKeyState { r#key, .. } = s;",
+        &[1],
+    ),
+    ("dot-then-newline", "let k = s.\n    key.clone();", &[1]),
+    ("dot-then-space", "let k = s . key;", &[1]),
+    ("byte-raw-string", "let a = br\"\\\";\nlet k = s.key;", &[2]),
+    (
+        "byte-raw-hash-string",
+        "let a = br#\"a \" b.key\"#;\nlet k = s.key;",
+        &[2],
+    ),
+    ("c-raw-string", "let a = cr\"\\\";\nlet k = s.key;", &[2]),
+    (
+        "byte-string-escape",
+        "let a = b\"\\\".key\";\nlet k = s.key;",
+        &[2],
+    ),
+    ("c-string", "let a = c\"x.key\";\nlet k = s.key;", &[2]),
+    (
+        "char-escaped-quote",
+        "let q = ['\\'','\"'];\nlet k = s.key;",
+        &[2],
+    ),
+    ("byte-char-quote", "let q = b'\"';\nlet k = s.key;", &[2]),
+    (
+        "self-of-other-impl-is-not-guarded",
+        "impl Other {\n fn f(s: Self) { let Self { key, .. } = s; }\n}",
+        &[],
+    ),
+    (
+        "declaration-impl-and-constructions",
+        "pub struct ApiKeyState {\n pub key: Option<String>,\n}\nimpl ApiKeyState {\n fn new(key: Option<String>) -> Self { Self { key, ..Default::default() } }\n}\nlet s = ApiKeyState { key: Some(k), mtls_enforced: m, enrolled_agent_keys: e, identity_mode: i, auth_backoff: b };\nlet t = ApiKeyState { key: None, ..Default::default() };\nf(ApiKeyState { key: k, mtls_enforced: m });\nlet n = Some(ApiKeyState { key: k, mtls_enforced: m })?;",
+        &[],
+    ),
+];
 
 /// Every read of a `key` field in `src/**/*.rs`, transport.rs included, as
 /// `relative/path: trimmed original line` (comments and literals blanked
