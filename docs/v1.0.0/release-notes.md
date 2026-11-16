@@ -751,7 +751,15 @@ after `memories_fts` had indexed it), reconciles every drifted `_agents`
 registration row to the open `agent_pubkey_history` row, installs
 RAISE(ABORT) guards and rebuilds `memories_fts`
 (`migrations/sqlite/0086_v102_fts_projection_guard.sql`); postgres only
-stamps the version.
+stamps the version. **Rolling back across v102 is refused, not silent:** a
+binary built before v102 (schema v101) opening a v102 database prints
+`database schema is AHEAD of this binary: <db> (<backend>) is on schema v102
+... this binary ... supports schema v101; upgrade ai-memory to the build that
+wrote this database, or open a backup copy ...`
+(`src/storage/schema_guard.rs` `render`) and writes nothing; the daemon
+(`serve`) exits 75 (EX_TEMPFAIL), a one-shot CLI command exits 1. Take a
+backup (`ai-memory backup`) before upgrading so a rollback has a v101 copy
+to open.
 The v86 and v87 rungs are
 instant/value-preserving, idempotent, and fail-safe on an unparseable
 value (left byte-untouched rather than destroyed), but they are row
