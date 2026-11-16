@@ -108,12 +108,47 @@ which runs `scripts/ci/prune_runner_tmp.py` with these rules:
   directory is opened once with `O_NOFOLLOW` and every check and every removal
   goes through that one descriptor. No f1 root is in the table until its
   `prune-facts:` line is quoted, so on f1 the step refuses visibly.
+- Before anything is made or opened under TMPDIR, its descriptor must be on
+  the mount of its runner root's descriptor (the `..` of TMPDIR): the same
+  device on every platform, and on Linux also the same `mnt_id:`. A directory
+  or volume mounted over `runner-<digits>` still has the root as its `..`, so
+  the root identity alone does not prove it. A different or unreadable mount
+  is a refusal that is also one counted failure (`failed=1`).
+- Only Linux and macOS (`sys.platform` exactly `linux` or `darwin`) can
+  prove mount identity; on any other platform the step refuses and counts one
+  failure.
 - Removal is an iterative, descriptor-relative walk (no recursion, no
   `shutil.rmtree`), one open directory at a time, with an identity re-check
-  right before each entry is entered. A tree deeper than `MAX_TREE_DEPTH` or
-  larger than `MAX_TREE_ENTRIES` is one counted failure and stays in place. An
-  entry on another device (a mount point) is skipped, reported and never
-  entered (`skipped=<n>`).
+  right before each entry is entered. A tree deeper than `MAX_TREE_DEPTH`
+  levels or with more than `MAX_TREE_ENTRIES` entries is one counted failure,
+  counted before anything under it is removed (a first pass counts, the second
+  removes; a tree that grows past a bound between the two passes stops there,
+  partly removed, and is one counted failure). A directory on another device,
+  or on Linux on another mount than `TMPDIR` (the `mnt_id:` line of
+  `/proc/self/fdinfo/<fd>`, so a bind mount of the same device is caught too),
+  is skipped, reported and never entered. Every place it does not enter, at
+  the top level or below it, is one `skipped` line and one counted failure of
+  its top-level entry, so it is in the `::warning` annotation; a mount id that
+  cannot be read is the same. On macOS there is no
+  `/proc` and the standard library has no mount id, so the device check is the
+  strongest one there.
+- The platform check is functional: inside the proven directory the script
+  makes a probe directory `.prune-probe-<pid>-<hex>` and a file in it, and
+  makes one real descriptor-relative call of each needed function (`os.mkdir`,
+  `os.open`, `os.lstat`, `os.scandir`, `os.unlink`, `os.rmdir`). The refusal
+  names the first call that fails. The probe removes what it made, also under
+  `--dry-run`; a probe it cannot remove is named on stderr. When the probe
+  cannot write because the disk is full, over quota or read-only (`ENOSPC`,
+  `EDQUOT`, `EROFS`), it probes again without creating anything: each needed
+  function must be in `os.supports_dir_fd` (`os.stat` also in
+  `os.supports_follow_symlinks`, `os.scandir` in `os.supports_fd`), and lstat,
+  unlink and rmdir of a name that does not exist must answer `ENOENT`. The
+  stderr line `probe cannot write (<why>); the read-only probe passed, pruning
+  goes on` names it and the prune runs, because a full disk is the case the
+  step exists for.
+- The `prune-facts:` line also goes to the job summary (`GITHUB_STEP_SUMMARY`)
+  when that is set, escaped the same way; a summary it cannot write is named on
+  stderr and changes no exit code.
 - Every input it cannot prove ends in a named refusal with nothing deleted. A
   refusal prints a `::warning` annotation with the escaped reason (and the same
   line on stderr) and the step still exits 0: it does not fail the job and does
@@ -121,7 +156,10 @@ which runs `scripts/ci/prune_runner_tmp.py` with these rules:
   the required checks. The reasons, each pinned by a test against the code:
 
 - refusal: `python <found> is older than <wanted>`
-- refusal: `this platform lacks descriptor-relative file calls`
+- refusal: `this platform lacks a working descriptor-relative call: <call> raised <error> (<why>)`
+- refusal: `the mount id of TMPDIR cannot be read: <why>`
+- refusal: `TMPDIR is not on its runner root's mount: <path>`
+- refusal: `this platform cannot verify mount identity: <platform>`
 - refusal: `allowed root is not an absolute path: <root>`
 - refusal: `allowed root is '/'`
 - refusal: `TMPDIR is unset`
@@ -132,6 +170,7 @@ which runs `scripts/ci/prune_runner_tmp.py` with these rules:
 - refusal: `TMPDIR is not a directory: <path>`
 - refusal: `TMPDIR cannot be opened: <path> (<why>)`
 - refusal: `TMPDIR changed while it was opened: <path>`
+- refusal: `TMPDIR resolves elsewhere than its normalized path: <path>`
 - refusal: `TMPDIR is a forbidden path: <path>`
 - refusal: `TMPDIR is not owned by the current user: <path>`
 - refusal: `TMPDIR is not named runner-<digits>: <name>`
@@ -146,10 +185,15 @@ which runs `scripts/ci/prune_runner_tmp.py` with these rules:
   1000 characters). An unexpected
   internal error (a defect, not a misconfiguration) names the error, prints
   the summary with `internal_error=1` and exits 1, so the job goes red.
-  `--dry-run` lists what would go and deletes nothing.
-- Every printed name, path and message is escaped (control characters,
-  backslash, `%` and `::`), so a file name cannot inject a log line or a
-  workflow command.
+  `--dry-run` takes the same decisions as the real run (identity re-checks,
+  the count pass and its bounds, the mount and device checks, every skipped
+  and failed line) and stops short of each unlink and rmdir; it lists
+  `would-remove <name>` for each entry the real run would remove and deletes
+  nothing.
+- Every printed name, path and message is escaped: backslash, `%` and every
+  `:` become `\xNN`; U+0000 to U+001F and U+007F to U+009F become `\xNN`;
+  surrogates (U+D800 to U+DFFF), U+2028 and U+2029 become `\uNNNN`. So a file
+  name cannot inject a log line or a workflow command.
 - It needs Python 3.12+ on the runner; an older interpreter ends in the
   `python` refusal before anything newer is imported. The test families that
   leak the files are fixed separately; the prune treats the symptom.

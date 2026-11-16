@@ -50,6 +50,31 @@ def safe_text(text):
     return "".join(pieces).replace("::", "\\x3a:")
 
 
+def safe_value(text):
+    """A value embedded in a script-chosen template: ``safe_text`` with EVERY ``:`` escaped (one pass, so no run survives)."""
+    return safe_text(text).replace(":", "\\x3a")
+
+
+class SafeText(str):
+    """Text this module already escaped (built only by ``render`` and ``join``); ``annotation`` does not escape it again."""
+
+    __slots__ = ()
+
+
+def render(template, **values):
+    """Fill the script-chosen ``template`` with ``values`` and return it as ``SafeText``.
+
+    The template is a literal the script wrote (its own ``:`` stay). Every value goes through ``safe_value``
+    unless it already is ``SafeText``. A plain ``str`` is never trusted.
+    """
+    return SafeText(template.format(**{k: v if isinstance(v, SafeText) else safe_value(v) for k, v in values.items()}))
+
+
+def join(separator, parts):
+    """``separator`` (a script literal) between ``parts``; each part is ``SafeText`` or is escaped with ``safe_value``."""
+    return SafeText(separator.join(p if isinstance(p, SafeText) else safe_value(p) for p in parts))
+
+
 def property_value(text):
     """A property value (``title=``, ``file=``): ``safe_text`` plus ``:`` and ``,`` escaped."""
     escaped = safe_text(text)
@@ -74,7 +99,7 @@ def annotation(command, message, max_chars=MAX_ANNOTATION_CHARS, **properties):
         keys.append("%s=%s" % (key, property_value(value)))
     if keys:
         head += " " + ",".join(keys)
-    line = head + "::" + safe_text(message)
+    line = head + "::" + (message if isinstance(message, SafeText) else safe_text(message))
     if len(line) > max_chars:
         line = line[: max_chars - len(ANNOTATION_CUT_MARK)] + ANNOTATION_CUT_MARK
     return line

@@ -216,9 +216,10 @@ pub async fn sync_since(
     //   2. `X-Agent-Id` (the daemon principal of the syncing process,
     //      mirroring the side-effect write path at line ~169 below).
     //   3. Empty string ("") — opaque/unknown caller; the visibility
-    //      helper denies every scope=private row to a "" caller that
-    //      isn't the (also-empty) owner, which is the correct
-    //      default-deny posture.
+    //      helper denies every scope=private row to a blank caller,
+    //      including owner-less and target-less rows (#9356: a blank
+    //      caller is no principal and never matches), which is the
+    //      correct default-deny posture.
     //   0. #8357 — when the mTLS client certificate is bound to an agent
     //      by `AI_MEMORY_MTLS_AGENT_BINDING_MAP`, THAT agent is the caller
     //      (a certificate cannot pull as an id it is not bound to).
