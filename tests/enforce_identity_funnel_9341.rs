@@ -844,7 +844,7 @@ async fn b3_anonymous_shared_key_reads_no_private_row_writes_nothing_named_9341(
         // Classified, never skipped silently: the postgres route gate serves
         // nothing, so the row is fail-closed on that backend, not probed.
         if out.is_backend_gate_refusal() {
-            backend_gated.push(row.name);
+            backend_gated.push((row.name, row.method, uri_for(row)));
             continue;
         }
         let seen = out.body.to_string();
@@ -880,11 +880,28 @@ async fn b3_anonymous_shared_key_reads_no_private_row_writes_nothing_named_9341(
         leaks.is_empty(),
         "B-3 private row read anonymously: {leaks:?}"
     );
-    // Both backends serve every gated route (the recall-observations route is
-    // not 501-gated on postgres), so no row is classified backend-gated.
+    // A postgres 501 is classified, never assumed: every row answered that
+    // way must be one the postgres route gate itself declares unsupported
+    // (so no handler ran and nothing was served), and the recall-observations
+    // route, the #9366 leak, is served on both backends so it is probed.
+    let undeclared: Vec<_> = backend_gated
+        .iter()
+        .filter(|(_, method, uri)| {
+            let method = axum::http::Method::from_bytes(method.to_ascii_uppercase().as_bytes())
+                .expect("route-table method");
+            let path = uri.split('?').next().unwrap_or(uri);
+            ai_memory::handlers::postgres_gate::postgres_endpoint_supported(&method, path)
+        })
+        .collect();
     assert!(
-        backend_gated.is_empty(),
-        "B-3: no route answers the postgres 501: {backend_gated:?}"
+        undeclared.is_empty(),
+        "B-3: a 501 on a route the postgres gate declares served: {undeclared:?}"
+    );
+    assert!(
+        !backend_gated
+            .iter()
+            .any(|(name, _, _)| *name == "MEMORY_RECALL_OBSERVATIONS"),
+        "B-3: the recall-observations route must be probed on both backends: {backend_gated:?}"
     );
     eprintln!("B-3 backend-gated (postgres 501): {backend_gated:?}");
     eprintln!("B-3 input echoes (decoy-identical): {echoes:?}");

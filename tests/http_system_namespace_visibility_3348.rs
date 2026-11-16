@@ -712,10 +712,12 @@ async fn graph_http_matrix_3498(f: &Fixture) {
         )
         .await;
         if target == &f.other_inbox {
+            // #8994: a substrate target the caller cannot read answers exactly
+            // like an absent target, so the refusal discloses no row.
             assert_eq!(
-                status,
-                StatusCode::FORBIDDEN,
-                "substrate link refused: {body}"
+                (status, &body),
+                (StatusCode::NOT_FOUND, &json!({"error": "not found"})),
+                "substrate link refused like an absent target: {body}"
             );
         } else {
             assert!(status.is_success(), "ordinary link admitted: {body}");
