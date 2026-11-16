@@ -31,6 +31,16 @@ use ai_memory::secret_screen::{
     redact_memory_for_storage, screen, set_screen_mode,
 };
 use ai_memory::validate;
+use sha2::{Digest, Sha256};
+
+/// `sha256=<first 12 hex>` of an input: the only identification a failure
+/// message carries, so no secret-shaped fixture reaches test output
+/// (engineering-standards, secrets in output; CodeQL cleartext logging).
+fn tag(input: &str) -> String {
+    let digest = Sha256::digest(input.as_bytes());
+    let hex: String = digest.iter().take(6).map(|b| format!("{b:02x}")).collect();
+    format!("sha256={hex}")
+}
 
 // ── Detector kind tags (the exact names the refusal reason carries) ──────
 const KIND_URL: &str = "url_userinfo_password";
@@ -190,18 +200,20 @@ fn assert_detects(rows: &[Positive]) {
         assert_eq!(
             kinds_of(&row.content),
             vec![row.kind],
-            "8855: {:?} must trip exactly {}",
-            row.content,
+            "8855: {} must trip exactly {}",
+            tag(&row.content),
             row.kind
         );
         let r = redacted_of(&row.content);
         assert!(
             !r.contains(&row.secret),
-            "8855: secret survived redaction: {r}"
+            "8855: secret survived redaction: {}",
+            tag(&row.content)
         );
         assert!(
             r.contains(REDACTION_PLACEHOLDER),
-            "8855: no placeholder: {r}"
+            "8855: no placeholder: {}",
+            tag(&row.content)
         );
     }
 }
@@ -234,21 +246,24 @@ fn stripe_live_key_detected_8855() {
 #[test]
 fn redaction_keeps_context_and_is_idempotent_8855() {
     let c = format!("postgres://svc:{URL_PW}@db.internal/mem");
-    assert_eq!(
-        redacted_of(&c),
-        format!("postgres://svc:{REDACTION_PLACEHOLDER}@db.internal/mem")
+    assert!(
+        redacted_of(&c) == format!("postgres://svc:{REDACTION_PLACEHOLDER}@db.internal/mem"),
+        "8855: redaction mismatch {}",
+        tag(&c)
     );
     let c = format!("export PGPASSWORD={ASSIGN_PW} && psql");
-    assert_eq!(
-        redacted_of(&c),
-        format!("export PGPASSWORD={REDACTION_PLACEHOLDER} && psql")
+    assert!(
+        redacted_of(&c) == format!("export PGPASSWORD={REDACTION_PLACEHOLDER} && psql"),
+        "8855: redaction mismatch {}",
+        tag(&c)
     );
     for row in all_positives() {
         let once = redacted_of(&row.content);
         assert_eq!(
             kinds_of(&once),
             Vec::<&str>::new(),
-            "8855: re-screen of {once:?} must be clean"
+            "8855: re-screen of {} must be clean",
+            tag(&once)
         );
     }
 }
@@ -260,10 +275,10 @@ macro_rules! negative_cell {
         #[test]
         fn $name() {
             let input: String = $input.to_string();
-            assert_eq!(
-                screen(&input),
-                ScreenOutcome::Clean,
-                "8855: {input:?} must stay accepted"
+            assert!(
+                screen(&input) == ScreenOutcome::Clean,
+                "8855: {} must stay accepted",
+                tag(&input)
             );
         }
     };
@@ -479,16 +494,17 @@ fn storage_and_receive_funnels_mask_each_form_8855() {
             ("storage", redact_memory_for_storage(&mem)),
             ("receive", redact_memory_for_receive(&mem)),
         ] {
-            let m = out.unwrap_or_else(|| panic!("8855 {path}: {:?} must be masked", row.content));
+            let m =
+                out.unwrap_or_else(|| panic!("8855 {path}: {} must be masked", tag(&row.content)));
             assert!(
                 !m.content.contains(&row.secret),
                 "8855 {path}: secret persisted: {}",
-                m.content
+                tag(&row.content)
             );
             assert!(
                 m.content.contains(REDACTION_PLACEHOLDER),
-                "8855 {path}: {}",
-                m.content
+                "8855 {path}: no placeholder: {}",
+                tag(&row.content)
             );
         }
     }
@@ -534,8 +550,10 @@ fn cli_store_refuses_each_form_with_exact_reason_8855() {
         );
         assert!(
             stderr.contains(&expected_reason(row.kind)),
-            "8855 CLI: exact reason for {} missing; stderr: {stderr}",
-            row.kind
+            "8855 CLI: exact reason for {} missing; stderr len {}; {}",
+            row.kind,
+            stderr.len(),
+            tag(&row.content)
         );
         assert!(
             !stderr.contains(&row.secret) && !stdout.contains(&row.secret),
@@ -561,12 +579,13 @@ fn assert_redacts_exactly(kind: &'static str, rows: &[(String, String)]) {
         assert_eq!(
             kinds_of(input),
             vec![kind],
-            "8855: {input:?} must trip {kind}"
+            "8855: {} must trip {kind}",
+            tag(&input)
         );
-        assert_eq!(
-            &redacted_of(input),
-            expected,
-            "8855: redaction of {input:?}"
+        assert!(
+            &redacted_of(input) == expected,
+            "8855: redaction of {}",
+            tag(&input)
         );
     }
 }
@@ -728,8 +747,12 @@ fn inner_byte_class_url_password_masked_whole_8855() {
 fn inner_multibyte_char_masked_whole_8855() {
     let v = format!("{VALUE_HEAD}{MULTIBYTE_INNER}{VALUE_TAIL}");
     for (name, kind, input, expected) in value_forms(&v) {
-        assert_eq!(kinds_of(&input), vec![kind], "8855 {name}: {input:?}");
-        assert_eq!(redacted_of(&input), expected, "8855 {name}: {input:?}");
+        assert_eq!(kinds_of(&input), vec![kind], "8855 {name}: {}", tag(&input));
+        assert!(
+            redacted_of(&input) == expected,
+            "8855 {name}: {}",
+            tag(&input)
+        );
     }
 }
 
@@ -783,10 +806,16 @@ fn bound_100k_inner_terminator_bytes_8855() {
 fn bearer_token68_tilde_masked_whole_8855() {
     let token = concat!("Qm9vX2FiY2RlZjEy", "~", "MzQ1Njc4OTBhYmNk", "~", "ZWZnaGk");
     let input = format!("Authorization: Bearer {token} sent");
-    assert_eq!(kinds_of(&input), vec!["bearer_token"], "8855: {input:?}");
     assert_eq!(
-        redacted_of(&input),
-        format!("Authorization: {REDACTION_PLACEHOLDER} sent")
+        kinds_of(&input),
+        vec!["bearer_token"],
+        "8855: {}",
+        tag(&input)
+    );
+    assert!(
+        redacted_of(&input) == format!("Authorization: {REDACTION_PLACEHOLDER} sent"),
+        "8855: redaction mismatch {}",
+        tag(&input)
     );
 }
 
@@ -868,8 +897,12 @@ fn non_ascii_blank_inside_value_masked_whole_8855() {
     for blank in NON_ASCII_BLANKS {
         let v = format!("{VALUE_HEAD}{blank}{VALUE_TAIL}");
         for (name, kind, input, expected) in value_forms(&v) {
-            assert_eq!(kinds_of(&input), vec![kind], "8855 {name}: {input:?}");
-            assert_eq!(redacted_of(&input), expected, "8855 {name}: {input:?}");
+            assert_eq!(kinds_of(&input), vec![kind], "8855 {name}: {}", tag(&input));
+            assert!(
+                redacted_of(&input) == expected,
+                "8855 {name}: {}",
+                tag(&input)
+            );
         }
     }
 }
@@ -908,8 +941,12 @@ fn multibyte_char_at_the_cut_is_on_a_char_boundary_8855() {
     let ph = REDACTION_PLACEHOLDER;
     let before = format!("{PLAIN_VALUE}{MULTIBYTE_INNER}");
     for (name, kind, input, expected) in value_forms(&before) {
-        assert_eq!(kinds_of(&input), vec![kind], "8855 {name}: {input:?}");
-        assert_eq!(redacted_of(&input), expected, "8855 {name}: {input:?}");
+        assert_eq!(kinds_of(&input), vec![kind], "8855 {name}: {}", tag(&input));
+        assert!(
+            redacted_of(&input) == expected,
+            "8855 {name}: {}",
+            tag(&input)
+        );
     }
     let m = MULTIBYTE_INNER;
     assert_redacts_exactly(
@@ -987,8 +1024,17 @@ fn every_value_scan_caller_keeps_its_refusal_8855() {
         ),
     ];
     for (class, kind, input, expected) in rows {
-        assert_eq!(kinds_of(&input), vec![kind], "8855 {class}: {input:?}");
-        assert_eq!(redacted_of(&input), expected, "8855 {class}: {input:?}");
+        assert_eq!(
+            kinds_of(&input),
+            vec![kind],
+            "8855 {class}: {}",
+            tag(&input)
+        );
+        assert!(
+            redacted_of(&input) == expected,
+            "8855 {class}: {}",
+            tag(&input)
+        );
         let err = validate::validate_content(&input)
             .map_err(|e| e.to_string())
             .expect_err("8855: caller funnel must refuse");
@@ -1004,8 +1050,8 @@ fn every_value_scan_caller_keeps_its_refusal_8855() {
             ..Memory::default()
         };
         let masked = redact_memory_for_receive(&mem)
-            .unwrap_or_else(|| panic!("8855 {class}: receive must mask {input:?}"));
-        assert_eq!(masked.content, expected, "8855 {class}: receive mask");
+            .unwrap_or_else(|| panic!("8855 {class}: receive must mask {}", tag(&input)));
+        assert!(masked.content == expected, "8855 {class}: receive mask");
     }
 }
 
@@ -1192,19 +1238,21 @@ fn assert_env_lookup_cell(entry: &EnvLookupEntry) {
         assert_eq!(
             kinds_of(&input),
             vec![KIND_PASSWORD],
-            "8855 r4c: {input:?} must trip {KIND_PASSWORD}"
+            "8855 r4c: {} must trip {KIND_PASSWORD}",
+            tag(&input)
         );
-        assert_eq!(
-            redacted_of(&input),
-            format!("password{op}{ph} tail"),
-            "8855 r4c: redaction of {input:?}"
+        assert!(
+            redacted_of(&input) == format!("password{op}{ph} tail"),
+            "8855 r4c: redaction of {}",
+            tag(&input)
         );
         let err = validate::validate_content(&input)
             .map_err(|e| e.to_string())
             .expect_err("8855 r4c: caller funnel must refuse");
         assert!(
             err.contains(&expected_reason(KIND_PASSWORD)),
-            "8855 r4c: want {KIND_PASSWORD} refusal for {input:?}, got {err:?}"
+            "8855 r4c: want {KIND_PASSWORD} refusal for {}, got {err:?}",
+            tag(&input)
         );
         assert!(!err.contains(s), "8855 r4c: refusal echoed the value");
         assert_delimited_lookups_accepted(entry, op);
