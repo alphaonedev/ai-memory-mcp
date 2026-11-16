@@ -1534,7 +1534,7 @@ fn s1b_key_field_scanner_self_test_9354() {
 }
 
 /// Number of s1b syntax-form cells (asserted in s1b).
-const SCANNER_FORM_CELLS_COUNT: usize = 36;
+const SCANNER_FORM_CELLS_COUNT: usize = 38;
 /// s1b syntax-form cells (name, synthetic source, 1-based lines that must be
 /// reported). Every syntax that binds or reads the `key` field of the guarded
 /// type is a read; a construction, the struct declaration and an `impl` body
@@ -1657,6 +1657,16 @@ const SCANNER_FORM_CELLS: [(&str, &str, &[usize]); SCANNER_FORM_CELLS_COUNT] = [
         "macro-construction-with-update",
         "let v = vec![ApiKeyState { key: k, ..Default::default() }];",
         &[],
+    ),
+    (
+        "impl-trait-param-before-pattern",
+        "fn f(g: impl Fn(), ApiKeyState { key, mtls_enforced }: ApiKeyState) {}",
+        &[1],
+    ),
+    (
+        "item-word-earlier-in-statement",
+        "let n = ApiKeyState::default(); let _ = |union: u8, ApiKeyState { key: k, mtls_enforced: _ }: ApiKeyState| k;",
+        &[1],
     ),
     ("raw-ident-field", "let k = s.r#key.clone();", &[1]),
     (
