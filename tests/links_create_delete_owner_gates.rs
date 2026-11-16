@@ -266,15 +266,31 @@ async fn bob_cannot_delete_alice_link_939() {
 #[tokio::test]
 async fn either_endpoint_owner_can_delete_link_939() {
     let tmp = NamedTempFile::new().expect("tempfile");
-    let alice_src = seed_memory(tmp.path(), "ai:alice", "link-gate/del2", &json!({}));
+    // The source must be READABLE by bob: PR 9390 L3 refuses a target owner
+    // whose source is hidden with the decoy not-found answer (pinned in
+    // tests/enforce_identity_funnel_9341.rs, the L3 cell), so symmetric
+    // severance is exercised on a collective source alice owns.
+    let alice_src = seed_memory(
+        tmp.path(),
+        "ai:alice",
+        "link-gate/del2",
+        &json!({"scope": "collective"}),
+    );
     let bob_tgt = seed_memory(tmp.path(), "ai:bob", "link-gate/del2", &json!({}));
     let router = build_router_fixture(tmp.path());
     let (s1, _) = post_link_as(&router, "ai:alice", &alice_src, &bob_tgt).await;
     assert_eq!(s1, StatusCode::CREATED);
-    let (s2, _) = delete_link_as(&router, "ai:bob", &alice_src, &bob_tgt).await;
+    let (s2, body) = delete_link_as(&router, "ai:bob", &alice_src, &bob_tgt).await;
     assert_eq!(
-        s2,
-        StatusCode::OK,
-        "bob owns the target → symmetric severance permitted"
+        (s2, &body),
+        (StatusCode::OK, &json!({"deleted": true})),
+        "bob owns the target of a visible source → symmetric severance permitted"
+    );
+    let (owner_view, links) = get_links_as(&router, "ai:alice", &alice_src).await;
+    assert_eq!(owner_view, StatusCode::OK, "{links}");
+    assert_eq!(
+        links["links"].as_array().map(Vec::len),
+        Some(0),
+        "the link is gone: {links}"
     );
 }
