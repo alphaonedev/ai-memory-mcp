@@ -2311,13 +2311,40 @@ jobs:
             pid_2=$!
             ( while true; do
                 sleep 300 >/dev/null 2>&1
-                # #9430: the log tails are pull-request text; workflow_annotation.render escapes each once, so no line
-                # break, %, :: or ##[ of a log tail reaches the runner through this notice (the raw shard logs printed
-                # below are #9433). Bound: 3 x 90 bytes x <= 6 escape chars + template. `cut -b` cuts bytes on GNU, uutils
-                # and BSD cut in any locale; argv is re-read as UTF-8 (surrogateescape, so a stray byte shows as \udcXX)
-                # and the line is written as UTF-8. set -e is live here: a failed call is reported on stderr and that
-                # report cannot fail (`|| true`), so no failure of the notice ends the loop or changes the step result.
-                python3 -I -c 'import os, sys; sys.path.insert(0, "scripts/ci"); import workflow_annotation as wa; sys.argv[1:] = [os.fsencode(v).decode("utf-8", "surrogateescape") for v in sys.argv[1:]]; sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace"); print(wa.annotation("notice", wa.render("[#6344] progress | serial: {s} | parallel_1: {p1} | parallel_2: {p2}", s=sys.argv[1], p1=sys.argv[2], p2=sys.argv[3]), max_chars=2 * wa.MAX_ANNOTATION_CHARS), flush=True)' "$(tail -n 1 "$sd/serial.log" 2>/dev/null | cut -b1-90)" "$(tail -n 1 "$sd/parallel_1.log" 2>/dev/null | cut -b1-90)" "$(tail -n 1 "$sd/parallel_2.log" 2>/dev/null | cut -b1-90)" || { echo "[#6344] progress notice not written: python3 exited $?" >&2 || true; }
+                # #9430: the last lines of the shard logs are pull-request text. The one python3 -I call below reads them itself
+                # (no host text tool: uutils tail 0.10.0 loses bytes at 64 KiB, uutils and BSD cut -c cut characters): each log
+                # path is opened rb, non-blocking, and read only when fstat says it is a regular file (missing, unreadable, a
+                # directory, a FIFO or a device gives an empty field); at most READ_BYTES are read back from the end; the field
+                # is the last line cut to CUT_BYTES bytes, or the last CUT_BYTES bytes read when that window holds no line feed.
+                # workflow_annotation.render escapes each field once, so no line break, %, :: or ##[ of a log line reaches the
+                # runner through this notice (the raw shard logs printed below are #9433); a cut inside a multi-byte character
+                # shows as \udcXX and the line is written as UTF-8. set -e is live here: a failed call is reported on stderr and
+                # that report cannot fail (`|| true`), so no failure of the notice ends the loop or changes the step result.
+                python3 -I -c 'if True:
+                    import os, stat, sys
+                    sys.path.insert(0, "scripts/ci")
+                    import workflow_annotation as wa
+                    READ_BYTES = 8192  # bytes read back from the end of each log, never more
+                    CUT_BYTES = 90  # bytes kept of each last line
+                    def last_line(path):
+                        try:
+                            with open(path, "rb", opener=lambda name, flags: os.open(name, flags | os.O_NONBLOCK | os.O_NOCTTY)) as log:
+                                info = os.fstat(log.fileno())
+                                if not stat.S_ISREG(info.st_mode):
+                                    return b""
+                                start = max(0, info.st_size - READ_BYTES)
+                                log.seek(start)
+                                window = log.read(READ_BYTES)
+                        except OSError:
+                            return b""
+                        body = window[:-1] if window.endswith(b"\n") else window
+                        newline = body.rfind(b"\n")
+                        if newline < 0 and start > 0:
+                            return body[-CUT_BYTES:]
+                        return body[newline + 1:][:CUT_BYTES]
+                    sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
+                    s, p1, p2 = (last_line(path).decode("utf-8", "surrogateescape") for path in sys.argv[1:4])
+                    print(wa.annotation("notice", wa.render("[#6344] progress | serial: {s} | parallel_1: {p1} | parallel_2: {p2}", s=s, p1=p1, p2=p2), max_chars=2 * wa.MAX_ANNOTATION_CHARS), flush=True)' "$sd/serial.log" "$sd/parallel_1.log" "$sd/parallel_2.log" || { echo "[#6344] progress notice not written: python3 exited $?" >&2 || true; }
               done ) &
             hb=$!
             # Wait on each PID separately: a bare `wait` discards the exit codes.

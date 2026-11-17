@@ -918,7 +918,7 @@ class ProgressNotice(unittest.TestCase):
                                     "parallel_2": b"\x00test\x00a ... \x00ok\x00"})
         match = self.byte_notice("content", result, expected)
         self.assertEqual(match.group("serial"), "test a ... ok\\x0d")
-        self.assertEqual(match.group("parallel_1"), "\\x3a:error\\x3a:forged-by-test-output")
+        self.assertEqual(match.group("parallel_1"), "\\x3a\\x3aerror\\x3a\\x3aforged-by-test-output")
         self.assertEqual(match.group("parallel_2"), "\\x00test\\x00a ... \\x00ok\\x00")
 
     def test_9430_reader_missing_unreadable_and_directory_give_empty_field(self):
