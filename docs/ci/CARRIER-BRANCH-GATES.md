@@ -203,9 +203,12 @@ constant hides the growth.
   held: ...` as a notice, or fails the step with `::error::[#9229 margin]
   '<label>' lost the suite margin: ...` (exit 3) when the wall used more than
   80 percent even though every test passed, or when the watchdog killed it.
-  The invocation's own non-zero exit (101, 124) wins over the gate's, and the
-  #6202 / #1492 telemetry notices print on every path before either is
-  returned. Every such red carries
+  The invocation's own non-zero exit (101, 124) wins over the gate's. The
+  #1492 notice prints on every path that reaches the timed run, and the #6202
+  notice only for a passing `run_tests` invocation (never in `run_doc_tests`);
+  both print before either exit is returned. A failed prebuild (`cargo test
+  --no-run`) returns its own code before the timer, the gate and the notices.
+  Every such red carries
   `this red is issue #9229 (the cost of the sqlite suite), not a failure of the
   change under test` and then the binary still running and the slowest
   binaries of that invocation (`slowest binaries: none profiled` without a
@@ -215,7 +218,7 @@ constant hides the growth.
   overflow digits, NUL bytes, empty or 100K+ line logs, malformed arguments);
   malformed input is exit 2 with a named error, never a traceback or a pass.
   No `#9229` annotation contains a percent sign (the 9365 escaper turns it
-  into `%25`), so every percentage is written as `N percent`.
+  into `\x25`), so every percentage is written as `N percent`.
 - **Whole-suite ceiling** (ruling cdfe800f). Four budgets of 2100 s must not
   become a silent 8400 s suite: the sum of the full suite's invocations is
   checked against one constant, `WHOLE_SUITE_CEILING_SECS` (3600 s). Before
@@ -268,4 +271,6 @@ and plan, the step executed with a stub cargo, wiring pins) and
 code propagation site of the step, each mutant proven red; each shard failing
 in turn ends the step with 101; sum completeness; a hostile input corpus with a
 time bound; the one boundary at 1679 / 1680 / 1681 s and 3600 / 3601 s; no
-percent sign in any annotation; telemetry on every path).
+percent sign in any annotation; the #1492 notice on every path that reaches
+the timed run). The stub cargo of both files advances a clock file by a fixed
+number of seconds per timed run, so the tests assert exact non-zero walls.
