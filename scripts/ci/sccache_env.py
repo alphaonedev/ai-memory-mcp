@@ -42,7 +42,47 @@ import sys
 import time
 from pathlib import Path
 
-import shared_cargo_target as shared
+
+def _load_workflow_annotation():
+    """The shared module at WA_RELATIVE_PATH from this file's real directory, by path only, never through
+    sys.path; every name in WA_REQUIRED must be a callable of it (#9365, one shape in every script)."""
+    import importlib.util
+    import os
+    path = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), WA_RELATIVE_PATH))
+    loaded = sys.modules.get("workflow_annotation")
+    if loaded is not None and os.path.realpath(getattr(loaded, "__file__", None) or "") == path:
+        module = loaded
+    else:
+        spec = importlib.util.spec_from_file_location("workflow_annotation", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)  # absent, unreadable or broken: it raises here, the try below catches it
+    missing = [name for name in WA_REQUIRED if not callable(getattr(module, name, None))]
+    if missing:
+        raise AttributeError("workflow_annotation.py lacks " + ", ".join(missing))
+    if loaded is None:
+        sys.modules["workflow_annotation"] = module
+    return module
+
+
+# The one shared-module load shape of scripts/ (#9365, ruling bcd0a15c; LoaderShape pins it).
+WA_PROG = "sccache_env"
+WA_RELATIVE_PATH = "workflow_annotation.py"
+WA_REQUIRED = ("env_file_value", "log_line")
+WA_EXIT_LOAD_REFUSED = 5  # a failed shared-module load (2 usage, 3 sccache missing, 4 wrong cache)
+WA_ERROR_TO_STDERR = False
+
+try:
+    wa = _load_workflow_annotation()
+except (Exception, SystemExit) as exc:  # any failed load: one fixed line built without the module, then exit
+    wa_cause = type(exc).__name__
+    print("%s: refused: shared module workflow_annotation.py next to the script cannot be loaded (%s)"
+          % (WA_PROG, wa_cause if wa_cause.isidentifier() else "BaseException"), file=sys.stderr, flush=True)
+    print("::error title=sccache_env refused::sccache_env: refused: shared module workflow_annotation.py"
+          " next to the script cannot be loaded",
+          file=sys.stderr if WA_ERROR_TO_STDERR else sys.stdout, flush=True)
+    sys.exit(WA_EXIT_LOAD_REFUSED)
+
+import shared_cargo_target as shared  # noqa: E402  (after the load try: a failed load ends here first, #9365)
 
 SCCACHE_BINARY = "sccache"
 CACHE_ROOT_RELATIVE = shared.TARGET_ROOT_RELATIVE.parent
@@ -147,10 +187,10 @@ def print_stats():
             timeout=STATS_TIMEOUT_SECS, check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as err:
-        print("sccache_env: could not read stats: %s" % err)
+        print(wa.log_line("sccache_env: could not read stats: %s" % err))
         return EXIT_OK
     for line in summarise_stats(result.stdout):
-        print(line)
+        print(wa.log_line(line))
     return EXIT_OK
 
 
@@ -182,7 +222,7 @@ def stop_server(home, runner_name):
     try:
         run_sccache(binary, ["--stop-server"], env)
     except (OSError, subprocess.TimeoutExpired) as err:
-        print("sccache_env: could not stop the CI server: %s" % err)
+        print(wa.log_line("sccache_env: could not stop the CI server: %s" % err))
         return EXIT_OK
     print("sccache_env: stopped the CI server on port %d" % SCCACHE_SERVER_PORT)
     return EXIT_OK
@@ -202,7 +242,7 @@ def main(argv=None):
         return print_stats()
     home = Path(args.home)
     if not home.is_absolute() or str(home) in ("/", ""):
-        print("sccache_env: refusing home %r" % args.home, file=sys.stderr)
+        print(wa.log_line("sccache_env: refusing home %r" % args.home), file=sys.stderr)
         return EXIT_USAGE
     if args.stop:
         return stop_server(home, args.runner_name)
@@ -218,7 +258,7 @@ def main(argv=None):
     env = ci_server_env(os.environ, cache_dir, cache_root / SCCACHE_ERROR_LOG_NAME)
     problem = start_and_verify(binary, env, cache_dir)
     if problem:
-        print("sccache_env: %s; refusing" % problem, file=sys.stderr)
+        print(wa.log_line("sccache_env: %s; refusing" % problem), file=sys.stderr)
         return EXIT_WRONG_CACHE
     values = (("RUSTC_WRAPPER", binary),) + tuple(
         (name, env[name]) for name in (
@@ -226,9 +266,9 @@ def main(argv=None):
             "SCCACHE_IDLE_TIMEOUT", "SCCACHE_IGNORE_SERVER_IO_ERROR"))
     with open(args.github_env, "a", encoding="utf-8") as handle:
         for name, value in values:
-            handle.write("%s=%s\n" % (name, value))
-    print("sccache_env: %s, dir %s, cap %s, port %d" % (
-        binary, cache_dir, SCCACHE_CACHE_SIZE, SCCACHE_SERVER_PORT))
+            handle.write("%s=%s\n" % (name, wa.env_file_value(value)))
+    print(wa.log_line("sccache_env: %s, dir %s, cap %s, port %d" % (
+        binary, cache_dir, SCCACHE_CACHE_SIZE, SCCACHE_SERVER_PORT)))
     return EXIT_OK
 
 

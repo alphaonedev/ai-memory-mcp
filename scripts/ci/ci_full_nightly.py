@@ -24,6 +24,46 @@ import sys
 import time
 from typing import Callable, List, Optional, Tuple
 
+
+def _load_workflow_annotation():
+    """The shared module at WA_RELATIVE_PATH from this file's real directory, by path only, never through
+    sys.path; every name in WA_REQUIRED must be a callable of it (#9365, one shape in every script)."""
+    import importlib.util
+    import os
+    path = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), WA_RELATIVE_PATH))
+    loaded = sys.modules.get("workflow_annotation")
+    if loaded is not None and os.path.realpath(getattr(loaded, "__file__", None) or "") == path:
+        module = loaded
+    else:
+        spec = importlib.util.spec_from_file_location("workflow_annotation", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)  # absent, unreadable or broken: it raises here, the try below catches it
+    missing = [name for name in WA_REQUIRED if not callable(getattr(module, name, None))]
+    if missing:
+        raise AttributeError("workflow_annotation.py lacks " + ", ".join(missing))
+    if loaded is None:
+        sys.modules["workflow_annotation"] = module
+    return module
+
+
+# The one shared-module load shape of scripts/ (#9365, ruling bcd0a15c; LoaderShape pins it).
+WA_PROG = "ci_full_nightly"
+WA_RELATIVE_PATH = "workflow_annotation.py"
+WA_REQUIRED = ("env_file_value", "log_line")
+WA_EXIT_LOAD_REFUSED = 3  # a failed shared-module load; no other meaning in this script
+WA_ERROR_TO_STDERR = False
+
+try:
+    wa = _load_workflow_annotation()
+except (Exception, SystemExit) as exc:  # any failed load: one fixed line built without the module, then exit
+    wa_cause = type(exc).__name__
+    print("%s: refused: shared module workflow_annotation.py next to the script cannot be loaded (%s)"
+          % (WA_PROG, wa_cause if wa_cause.isidentifier() else "BaseException"), file=sys.stderr, flush=True)
+    print("::error title=ci_full_nightly refused::ci_full_nightly: refused: shared module workflow_annotation.py"
+          " next to the script cannot be loaded",
+          file=sys.stderr if WA_ERROR_TO_STDERR else sys.stdout, flush=True)
+    sys.exit(WA_EXIT_LOAD_REFUSED)
+
 WORKFLOW_FILE = "ci.yml"
 ISSUE_LABEL = "ci-full-red"
 ISSUE_LABEL_COLOR = "B60205"
@@ -152,7 +192,7 @@ def report(gh: Runner, repo: str, job_result: str, conclusion: str, run_url: str
         code, out = gh(["issue", "comment", str(number), "--repo", repo,
                         "--body", body])
     if code != 0:
-        print("ci-full: could not file the issue: %s" % out.strip()[-200:],
+        print(wa.log_line("ci-full: could not file the issue: %s" % out.strip()[-200:]),
               file=sys.stderr)
     return EXIT_FAIL
 
@@ -163,7 +203,7 @@ def write_output(path: Optional[str], values: dict) -> None:
         return
     with open(path, "a") as handle:
         for key, value in values.items():
-            handle.write("%s=%s\n" % (key, str(value).replace("\n", " ")))
+            handle.write("%s=%s\n" % (key, wa.env_file_value(value)))
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -185,11 +225,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         try:
             result = dispatch_and_wait(gh_runner, args.repo, args.ref)
         except (NightlyError, ValueError) as exc:
-            print("ci-full: %s" % exc, file=sys.stderr)
+            print(wa.log_line("ci-full: %s" % exc), file=sys.stderr)
             return EXIT_FAIL
         write_output(args.github_output, {"conclusion": result["conclusion"],
                                           "run_url": result["url"]})
-        print("ci-full: run %s concluded %s" % (result["run_id"], result["conclusion"]))
+        print(wa.log_line("ci-full: run %s concluded %s" % (result["run_id"], result["conclusion"])))
         return EXIT_OK
     return report(gh_runner, args.repo, args.job_result, args.conclusion,
                   args.run_url, args.ref)
