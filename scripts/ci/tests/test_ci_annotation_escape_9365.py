@@ -2557,5 +2557,392 @@ class CleanBytesAndBoundary(unittest.TestCase):
             self.assertEqual(finished_line_command_count(line), 1 if index == 2 else 0, "huge-%d" % index)
 
 
+# ---------------------------------------------------------------------------------------------------------------
+# PR 9400 CodeQL alerts (ruling 96789bdf, fixed by code, never dismissed). Four shapes: py/loop-variable-capture,
+# py/empty-except, py/unused-import, py/print-during-import. The ast check below finds the four shapes in the files
+# of this PR that CodeQL reads; the table cells prove every boundary cell runs with the values of its own iteration.
+# ---------------------------------------------------------------------------------------------------------------
+R3_BOUNDARY_DISTINCT_FLOOR = 51  # distinct finished lines of the 100 boundary cells, measured with each cell called in place
+CODEQL_SCOPE_FILES = ("scripts/ci/tests/test_ci_annotation_escape_9365.py", "scripts/ci/partition_test_binaries.py",
+                      "scripts/ci/shared_cargo_target.py")
+CODEQL_SHAPES = ("unused-import", "empty-except", "loop-variable-capture", "print-during-import")
+CODEQL_SYNTHETIC = {  # shape -> a source that must be found
+    "unused-import": "import threading\n",
+    "empty-except": "try:\n    pass\nexcept ValueError:\n    pass\n",
+    "loop-variable-capture": "def make():\n    for n in range(3):\n        yield lambda: n\n",
+    "print-during-import": "import sys\nprint('x', file=sys.stderr)\n",
+}
+CODEQL_CLEAN_SYNTHETIC = ("import os\n\n\ndef f():\n    for n in range(3):\n        yield lambda n=n: os.sep + str(n)\n"
+                        "\n\ndef g():\n    try:\n        return 1\n    except ValueError:\n        return 2\n")
+
+
+def _stored_names(node):
+    return {n.id for n in ast.walk(node) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
+
+
+def codeql_shape_findings(source):
+    """(line, shape) for each of the four CodeQL alert shapes in ``source`` (a deterministic stand-in for the suite)."""
+    tree = ast.parse(source)
+    found = []
+    imported = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                imported[(alias.asname or alias.name).split(".")[0]] = node.lineno
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                imported[alias.asname or alias.name] = node.lineno
+    used = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
+    found += [(line, "unused-import") for name, line in imported.items() if name not in used and name != "annotations"]
+    found += [(node.lineno, "empty-except") for node in ast.walk(tree)
+              if isinstance(node, ast.ExceptHandler) and all(isinstance(stmt, ast.Pass) for stmt in node.body)]
+
+    def visit(node, loop_names):
+        for child in ast.iter_child_nodes(node):
+            names = loop_names
+            if isinstance(child, (ast.For, ast.AsyncFor)):
+                names = names | _stored_names(child.target) | {n for stmt in child.body for n in _stored_names(stmt)}
+            if isinstance(child, (ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp)):
+                names = names | {n for gen in child.generators for n in _stored_names(gen.target)}
+            if isinstance(child, (ast.Lambda, ast.FunctionDef)) and loop_names:
+                args = child.args
+                bound = {a.arg for a in args.posonlyargs + args.args + args.kwonlyargs}
+                body = child.body if isinstance(child.body, list) else [child.body]
+                reads = {n.id for stmt in body for n in ast.walk(stmt) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)}
+                if (reads & loop_names) - bound:
+                    found.append((child.lineno, "loop-variable-capture"))
+                visit(child, set())
+                continue
+            visit(child, names)
+
+    visit(tree, set())
+    for stmt in tree.body:
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        if isinstance(stmt, ast.If) and "__main__" in ast.dump(stmt.test):
+            continue
+        for node in ast.walk(stmt):
+            if isinstance(node, (ast.FunctionDef, ast.Lambda, ast.ClassDef)):
+                break
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "print":
+                found.append((node.lineno, "print-during-import"))
+    return sorted(found)
+
+
+class CodeqlAlertShapes(unittest.TestCase):
+    """The class lock for the 16 alerts of PR 9400: none of the four shapes in a file this PR touches."""
+
+    def test_the_check_finds_each_shape_and_passes_clean_code_9365(self):
+        for shape, source in CODEQL_SYNTHETIC.items():
+            with self.subTest(shape=shape):
+                self.assertIn(shape, [kind for _, kind in codeql_shape_findings(source)])
+        self.assertEqual(codeql_shape_findings(CODEQL_CLEAN_SYNTHETIC), [])
+
+    def test_the_files_of_the_pr_hold_none_of_the_four_alert_shapes_9365(self):
+        for rel in CODEQL_SCOPE_FILES:
+            with self.subTest(file=rel):
+                self.assertEqual(codeql_shape_findings((REPO / rel).read_text(encoding="utf-8")), [])
+
+
+class BoundaryTableBinding(unittest.TestCase):
+    """Every cell of the boundary table runs with the values of its own iteration, whatever the consumer does."""
+
+    def test_collecting_the_table_first_gives_the_lines_of_calling_each_cell_in_place_9365(self):
+        in_place = [(cell, function, thunk()) for cell, function, thunk in boundary_cells()]
+        collected = list(boundary_cells())
+        after_collect = [(cell, function, thunk()) for cell, function, thunk in collected]
+        self.assertEqual(len(collected), R3_BOUNDARY_CELLS)
+        self.assertEqual(after_collect, in_place)
+
+    def test_the_boundary_table_has_at_least_the_floor_of_distinct_outputs_9365(self):
+        collected = list(boundary_cells())
+        outputs = [thunk() for _, _, thunk in collected]
+        self.assertGreaterEqual(len(set(outputs)), R3_BOUNDARY_DISTINCT_FLOOR, "distinct boundary outputs")
+
+
+# The two scripts other scripts and tests import (partition_test_binaries, shared_cargo_target): importing one prints
+# nothing and never exits; running one with a shared module that cannot be loaded refuses with the SAME bytes and
+# exit code as at ae6967af, before any work; a caller that skips require_workflow_annotation() meets a named error.
+DEFERRED_SCRIPTS = {"scripts/ci/partition_test_binaries.py": (2, ["--out-dir", "OUT"]),
+                    "scripts/ci/shared_cargo_target.py": (3, ["--home", "rel-home", "--runner-name", "a"])}
+DEFERRED_BREAKS = {"absent": None, "unreadable": "", "syntax error": "def broken(:\n",
+                   "sys.exit(0) in it": "import sys\nsys.exit(0)\n", "raises at load": "raise ValueError('x')\n",
+                   "required attribute missing": "def other():\n    pass\n"}
+DEFERRED_ERROR_NAME = "SharedModuleNotLoadedError"
+DEFERRED_REQUIRE_NAME = "require_workflow_annotation"
+DEFERRED_LOAD_AT_AE6967AF = {('partition_test_binaries', 'absent', 'help'): (2,
+                                                 '::error title=partition_test_binaries '
+                                                 'refused::partition_test_binaries: refused: shared module '
+                                                 'workflow_annotation.py next to the script cannot be loaded\n',
+                                                 'partition_test_binaries: refused: shared module '
+                                                 'workflow_annotation.py next to the script cannot be loaded '
+                                                 '(FileNotFoundError)\n'),
+ ('partition_test_binaries', 'absent', 'work'): (2,
+                                                 '::error title=partition_test_binaries '
+                                                 'refused::partition_test_binaries: refused: shared module '
+                                                 'workflow_annotation.py next to the script cannot be loaded\n',
+                                                 'partition_test_binaries: refused: shared module '
+                                                 'workflow_annotation.py next to the script cannot be loaded '
+                                                 '(FileNotFoundError)\n'),
+ ('partition_test_binaries', 'raises at load', 'help'): (2,
+                                                         '::error title=partition_test_binaries '
+                                                         'refused::partition_test_binaries: refused: shared module '
+                                                         'workflow_annotation.py next to the script cannot be '
+                                                         'loaded\n',
+                                                         'partition_test_binaries: refused: shared module '
+                                                         'workflow_annotation.py next to the script cannot be loaded '
+                                                         '(ValueError)\n'),
+ ('partition_test_binaries', 'raises at load', 'work'): (2,
+                                                         '::error title=partition_test_binaries '
+                                                         'refused::partition_test_binaries: refused: shared module '
+                                                         'workflow_annotation.py next to the script cannot be '
+                                                         'loaded\n',
+                                                         'partition_test_binaries: refused: shared module '
+                                                         'workflow_annotation.py next to the script cannot be loaded '
+                                                         '(ValueError)\n'),
+ ('partition_test_binaries', 'required attribute missing', 'help'): (2,
+                                                                     '::error title=partition_test_binaries '
+                                                                     'refused::partition_test_binaries: refused: '
+                                                                     'shared module workflow_annotation.py next to '
+                                                                     'the script cannot be loaded\n',
+                                                                     'partition_test_binaries: refused: shared '
+                                                                     'module workflow_annotation.py next to the '
+                                                                     'script cannot be loaded (AttributeError)\n'),
+ ('partition_test_binaries', 'required attribute missing', 'work'): (2,
+                                                                     '::error title=partition_test_binaries '
+                                                                     'refused::partition_test_binaries: refused: '
+                                                                     'shared module workflow_annotation.py next to '
+                                                                     'the script cannot be loaded\n',
+                                                                     'partition_test_binaries: refused: shared '
+                                                                     'module workflow_annotation.py next to the '
+                                                                     'script cannot be loaded (AttributeError)\n'),
+ ('partition_test_binaries', 'syntax error', 'help'): (2,
+                                                       '::error title=partition_test_binaries '
+                                                       'refused::partition_test_binaries: refused: shared module '
+                                                       'workflow_annotation.py next to the script cannot be loaded\n',
+                                                       'partition_test_binaries: refused: shared module '
+                                                       'workflow_annotation.py next to the script cannot be loaded '
+                                                       '(SyntaxError)\n'),
+ ('partition_test_binaries', 'syntax error', 'work'): (2,
+                                                       '::error title=partition_test_binaries '
+                                                       'refused::partition_test_binaries: refused: shared module '
+                                                       'workflow_annotation.py next to the script cannot be loaded\n',
+                                                       'partition_test_binaries: refused: shared module '
+                                                       'workflow_annotation.py next to the script cannot be loaded '
+                                                       '(SyntaxError)\n'),
+ ('partition_test_binaries', 'sys.exit(0) in it', 'help'): (2,
+                                                            '::error title=partition_test_binaries '
+                                                            'refused::partition_test_binaries: refused: shared '
+                                                            'module workflow_annotation.py next to the script cannot '
+                                                            'be loaded\n',
+                                                            'partition_test_binaries: refused: shared module '
+                                                            'workflow_annotation.py next to the script cannot be '
+                                                            'loaded (SystemExit)\n'),
+ ('partition_test_binaries', 'sys.exit(0) in it', 'work'): (2,
+                                                            '::error title=partition_test_binaries '
+                                                            'refused::partition_test_binaries: refused: shared '
+                                                            'module workflow_annotation.py next to the script cannot '
+                                                            'be loaded\n',
+                                                            'partition_test_binaries: refused: shared module '
+                                                            'workflow_annotation.py next to the script cannot be '
+                                                            'loaded (SystemExit)\n'),
+ ('partition_test_binaries', 'unreadable', 'help'): (2,
+                                                     '::error title=partition_test_binaries '
+                                                     'refused::partition_test_binaries: refused: shared module '
+                                                     'workflow_annotation.py next to the script cannot be loaded\n',
+                                                     'partition_test_binaries: refused: shared module '
+                                                     'workflow_annotation.py next to the script cannot be loaded '
+                                                     '(PermissionError)\n'),
+ ('partition_test_binaries', 'unreadable', 'work'): (2,
+                                                     '::error title=partition_test_binaries '
+                                                     'refused::partition_test_binaries: refused: shared module '
+                                                     'workflow_annotation.py next to the script cannot be loaded\n',
+                                                     'partition_test_binaries: refused: shared module '
+                                                     'workflow_annotation.py next to the script cannot be loaded '
+                                                     '(PermissionError)\n'),
+ ('shared_cargo_target', 'absent', 'help'): (3,
+                                             '::error title=shared_cargo_target refused::shared_cargo_target: '
+                                             'refused: shared module workflow_annotation.py next to the script '
+                                             'cannot be loaded\n',
+                                             'shared_cargo_target: refused: shared module workflow_annotation.py '
+                                             'next to the script cannot be loaded (FileNotFoundError)\n'),
+ ('shared_cargo_target', 'absent', 'work'): (3,
+                                             '::error title=shared_cargo_target refused::shared_cargo_target: '
+                                             'refused: shared module workflow_annotation.py next to the script '
+                                             'cannot be loaded\n',
+                                             'shared_cargo_target: refused: shared module workflow_annotation.py '
+                                             'next to the script cannot be loaded (FileNotFoundError)\n'),
+ ('shared_cargo_target', 'raises at load', 'help'): (3,
+                                                     '::error title=shared_cargo_target '
+                                                     'refused::shared_cargo_target: refused: shared module '
+                                                     'workflow_annotation.py next to the script cannot be loaded\n',
+                                                     'shared_cargo_target: refused: shared module '
+                                                     'workflow_annotation.py next to the script cannot be loaded '
+                                                     '(ValueError)\n'),
+ ('shared_cargo_target', 'raises at load', 'work'): (3,
+                                                     '::error title=shared_cargo_target '
+                                                     'refused::shared_cargo_target: refused: shared module '
+                                                     'workflow_annotation.py next to the script cannot be loaded\n',
+                                                     'shared_cargo_target: refused: shared module '
+                                                     'workflow_annotation.py next to the script cannot be loaded '
+                                                     '(ValueError)\n'),
+ ('shared_cargo_target', 'required attribute missing', 'help'): (3,
+                                                                 '::error title=shared_cargo_target '
+                                                                 'refused::shared_cargo_target: refused: shared '
+                                                                 'module workflow_annotation.py next to the script '
+                                                                 'cannot be loaded\n',
+                                                                 'shared_cargo_target: refused: shared module '
+                                                                 'workflow_annotation.py next to the script cannot '
+                                                                 'be loaded (AttributeError)\n'),
+ ('shared_cargo_target', 'required attribute missing', 'work'): (3,
+                                                                 '::error title=shared_cargo_target '
+                                                                 'refused::shared_cargo_target: refused: shared '
+                                                                 'module workflow_annotation.py next to the script '
+                                                                 'cannot be loaded\n',
+                                                                 'shared_cargo_target: refused: shared module '
+                                                                 'workflow_annotation.py next to the script cannot '
+                                                                 'be loaded (AttributeError)\n'),
+ ('shared_cargo_target', 'syntax error', 'help'): (3,
+                                                   '::error title=shared_cargo_target refused::shared_cargo_target: '
+                                                   'refused: shared module workflow_annotation.py next to the script '
+                                                   'cannot be loaded\n',
+                                                   'shared_cargo_target: refused: shared module '
+                                                   'workflow_annotation.py next to the script cannot be loaded '
+                                                   '(SyntaxError)\n'),
+ ('shared_cargo_target', 'syntax error', 'work'): (3,
+                                                   '::error title=shared_cargo_target refused::shared_cargo_target: '
+                                                   'refused: shared module workflow_annotation.py next to the script '
+                                                   'cannot be loaded\n',
+                                                   'shared_cargo_target: refused: shared module '
+                                                   'workflow_annotation.py next to the script cannot be loaded '
+                                                   '(SyntaxError)\n'),
+ ('shared_cargo_target', 'sys.exit(0) in it', 'help'): (3,
+                                                        '::error title=shared_cargo_target '
+                                                        'refused::shared_cargo_target: refused: shared module '
+                                                        'workflow_annotation.py next to the script cannot be '
+                                                        'loaded\n',
+                                                        'shared_cargo_target: refused: shared module '
+                                                        'workflow_annotation.py next to the script cannot be loaded '
+                                                        '(SystemExit)\n'),
+ ('shared_cargo_target', 'sys.exit(0) in it', 'work'): (3,
+                                                        '::error title=shared_cargo_target '
+                                                        'refused::shared_cargo_target: refused: shared module '
+                                                        'workflow_annotation.py next to the script cannot be '
+                                                        'loaded\n',
+                                                        'shared_cargo_target: refused: shared module '
+                                                        'workflow_annotation.py next to the script cannot be loaded '
+                                                        '(SystemExit)\n'),
+ ('shared_cargo_target', 'unreadable', 'help'): (3,
+                                                 '::error title=shared_cargo_target refused::shared_cargo_target: '
+                                                 'refused: shared module workflow_annotation.py next to the script '
+                                                 'cannot be loaded\n',
+                                                 'shared_cargo_target: refused: shared module workflow_annotation.py '
+                                                 'next to the script cannot be loaded (PermissionError)\n'),
+ ('shared_cargo_target', 'unreadable', 'work'): (3,
+                                                 '::error title=shared_cargo_target refused::shared_cargo_target: '
+                                                 'refused: shared module workflow_annotation.py next to the script '
+                                                 'cannot be loaded\n',
+                                                 'shared_cargo_target: refused: shared module workflow_annotation.py '
+                                                 'next to the script cannot be loaded (PermissionError)\n')}  # (script, break, arguments) -> (rc, stdout, stderr)
+
+
+FORGOT_PROBE = textwrap.dedent("""\
+    import sys
+    sys.path.insert(0, sys.argv[1])
+    import {mod} as m
+    try:
+        m.wa.log_line("x")
+    except Exception as exc:
+        print("before:", type(exc).__name__)
+    m.{require}()
+    print("after:", m.wa.log_line("x"))
+    """)
+MAIN_PROBE = textwrap.dedent("""\
+    import sys
+    sys.path.insert(0, sys.argv[1])
+    import {mod} as m
+    print("imported-ok")
+    try:
+        m.main(sys.argv[2:])
+    except SystemExit as exc:
+        print("exit:", exc.code)
+    """)
+
+
+class DeferredLoadOfImportedScripts(unittest.TestCase):
+    def fixture(self, rel, source):
+        base = scratch_dir("deferred-load")
+        self.addCleanup(shutil.rmtree, str(base), True)
+        repo = base / "repo"
+        for item in (rel, SHARED_MODULE_PATH):
+            (repo / item).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(REPO / item, repo / item)
+        shared = repo / SHARED_MODULE_PATH
+        if source is None:
+            shared.unlink()
+        elif source == "":
+            shared.chmod(0)
+            self.addCleanup(shared.chmod, 0o600)
+        else:
+            shared.write_text(source, encoding="utf-8")
+        cwd = base / "cwd"
+        cwd.mkdir()
+        return repo, cwd
+
+    def run_py(self, args, cwd, flags=("-I",)):
+        env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "LANG": "C.UTF-8", "PYTHONDONTWRITEBYTECODE": "1",
+               "TMPDIR": str(cwd)}
+        proc = subprocess.run([sys.executable, *flags, *args], capture_output=True, env=env, cwd=str(cwd),
+                              stdin=subprocess.DEVNULL, timeout=SUBPROCESS_TIMEOUT_SECS, check=False)
+        return proc.returncode, proc.stdout.decode("utf-8", "replace"), proc.stderr.decode("utf-8", "replace")
+
+    def test_importing_prints_nothing_and_never_exits_for_every_break_9365(self):
+        if os.geteuid() == 0:
+            self.skipTest("root reads a mode-0 file")
+        for rel in DEFERRED_SCRIPTS:
+            stem = Path(rel).stem
+            for label, source in {"present": (REPO / SHARED_MODULE_PATH).read_text(encoding="utf-8"), **DEFERRED_BREAKS}.items():
+                with self.subTest(script=stem, shared=label):
+                    repo, cwd = self.fixture(rel, source)
+                    code = "import sys\nsys.path.insert(0, %r)\nimport %s\nprint('imported-ok')\n" % (str(repo / "scripts" / "ci"), stem)
+                    self.assertEqual(self.run_py(["-c", code], cwd), (0, "imported-ok\n", ""))
+
+    def test_running_with_a_broken_shared_module_refuses_with_the_bytes_of_ae6967af_9365(self):
+        if os.geteuid() == 0:
+            self.skipTest("root reads a mode-0 file")
+        for (stem, label, kind), expected in DEFERRED_LOAD_AT_AE6967AF.items():
+            rel = "scripts/ci/%s.py" % stem
+            with self.subTest(script=stem, shared=label, args=kind):
+                repo, cwd = self.fixture(rel, DEFERRED_BREAKS[label])
+                args = ["--help"] if kind == "help" else [a.replace("OUT", str(cwd / "o")) for a in DEFERRED_SCRIPTS[rel][1]]
+                got = self.run_py([str(repo / rel), *args], cwd, flags=())
+                self.assertEqual(got, expected)
+                self.assertEqual(got[0], DEFERRED_SCRIPTS[rel][0])
+
+    def test_main_called_in_process_loads_before_any_work_and_refuses_9365(self):
+        for rel, (code, args) in DEFERRED_SCRIPTS.items():
+            stem = Path(rel).stem
+            with self.subTest(script=stem):
+                repo, cwd = self.fixture(rel, None)
+                probe = MAIN_PROBE.format(mod=stem)
+                rc, out, err = self.run_py(["-c", probe, str(repo / "scripts" / "ci"), *[a.replace("OUT", str(cwd / "o")) for a in args]], cwd)
+                self.assertEqual(rc, 0, err)
+                self.assertEqual(out.splitlines()[0], "imported-ok")
+                self.assertEqual(out.splitlines()[-1], "exit: %d" % code)
+                self.assertFalse((cwd / "o").exists(), "work ran before the refusal")
+                self.assertIn("cannot be loaded (FileNotFoundError)", err)
+
+    def test_a_caller_that_skips_the_load_meets_a_named_error_not_an_unloaded_helper_9365(self):
+        for rel in DEFERRED_SCRIPTS:
+            stem = Path(rel).stem
+            with self.subTest(script=stem):
+                repo, cwd = self.fixture(rel, (REPO / SHARED_MODULE_PATH).read_text(encoding="utf-8"))
+                probe = FORGOT_PROBE.format(mod=stem, require=DEFERRED_REQUIRE_NAME)
+                rc, out, err = self.run_py(["-c", probe, str(repo / "scripts" / "ci")], cwd)
+                self.assertEqual(rc, 0, err)
+                self.assertEqual(out.splitlines()[0], "before: " + DEFERRED_ERROR_NAME)
+                self.assertTrue(out.splitlines()[1].startswith("after: "), out)
+
+
 if __name__ == "__main__":
     unittest.main()
