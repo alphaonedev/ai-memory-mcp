@@ -236,6 +236,13 @@ class ProgressNotice(unittest.TestCase):
         result, expected = self.run_heartbeat("big", {shard: big for shard in SHARD_LOGS})
         self.assert_one_notice("big", result, expected)
 
+    def test_worst_case_escape_growth_is_not_cut(self):
+        # Each byte of an invalid UTF-8 run becomes a 6-char surrogate escape: the longest growth there is.
+        worst = {"serial": b"\xff" * (2 * CUT_BYTES), "parallel_1": b"\x80" * (2 * CUT_BYTES),
+                 "parallel_2": b":" * (2 * CUT_BYTES)}
+        result, expected = self.run_heartbeat("worst", worst)
+        self.assert_one_notice("worst", result, expected)
+
     def test_empty_and_missing_logs(self):
         result, expected = self.run_heartbeat("empty", {"serial": b"", "parallel_1": None, "parallel_2": b"\n"})
         self.assertEqual(expected, {shard: b"" for shard in SHARD_LOGS})
