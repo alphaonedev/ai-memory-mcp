@@ -193,13 +193,31 @@ constant hides the growth.
   `run_shard`, whose chains share one shrinking budget). `python3
   scripts/ci/suite_budget.py timer`, started beside the watchdogged `cargo
   test`, prints `::error::[#9229 margin] '<label>' lost the suite margin while
-  still running (#9229): ...` at 80 % of the budget (1680 s of 2100 s). After
+  still running: ...` at 80 % of the budget (1680 s of 2100 s). After
   the invocation, `suite_budget.py gate` prints `margin held: ...` as a notice,
   or fails the step with `::error::[#9229 margin] '<label>' lost the suite
-  margin (#9229): ...` (exit 3) when the wall used more than 80 % even though
-  every test passed, or when the watchdog killed it; the error names the
-  binary still running and the slowest binaries of that invocation. Malformed
+  margin: ...` (exit 3) when the wall used more than 80 % even though
+  every test passed, or when the watchdog killed it. Every such red carries
+  `this red is issue #9229 (the cost of the sqlite suite), not a failure of the
+  change under test` and then the binary still running and the slowest
+  binaries of that invocation (`slowest binaries: none profiled` without a
+  log), so a lane whose PR it fails on does not read it as its own defect. The
+  gate covers the two impact-selected sqlite invocations as well. Malformed
   input is exit 2 with a named error, never a pass.
+- **Whole-suite ceiling** (ruling cdfe800f). Four budgets of 2100 s must not
+  become a silent 8400 s suite: the sum of the full suite's invocations is
+  checked against one constant, `WHOLE_SUITE_CEILING_SECS` (3600 s). Before
+  the first invocation `suite_budget.py suite-plan` reads the timeout of job
+  `check` for the running leg from `ci.yml` (`timeout-minutes`, or the
+  matrix leg's `timeout`) and requires the ceiling plus the same 20 % margin
+  to fit it (at most 4560 s of the 95-minute ubuntu-latest leg, 3840 s of the
+  80-minute macos-fed leg); a ceiling that cannot fit is a named red (exit 3)
+  before any test runs, never a job kill, and an absent or unreadable timeout
+  is exit 2. Each gated invocation appends `<seconds><TAB><label>` to
+  `SUITE_SECONDS_FILE`; after the last one `suite_budget.py suite-sum` prints
+  the sum and each invocation's seconds, and a sum over the ceiling is a named
+  red (exit 3). Missing, empty, non-numeric, negative or duplicated seconds are
+  exit 2 with a named reason. The unsharded fallback is checked the same way.
 - **Shards.** The full suite runs as four sequential invocations of the same
   test set as one `cargo test`, each with its own budget: `--lib` (lib unit
   tests), then every other target of cargo's default test selection (bins,
@@ -226,4 +244,5 @@ constant hides the growth.
 
 Unit tests: `scripts/ci/tests/test_suite_budget_9229.py` (judge table and
 boundary, CLI texts, timer, profile with a 200k-line time bound, shard
-derivation, the step executed with a stub cargo, wiring pins).
+derivation and its two parts over the real manifest, the whole-suite ceiling
+and plan, the step executed with a stub cargo, wiring pins).

@@ -26,11 +26,24 @@ Subcommands:
   ``doctest``, a target name outside ``[A-Za-z0-9_-]``, a required feature of another package) is
   exit 2, and the step then runs the unsharded suite instead (fail closed to full coverage).
 
+* ``suite-plan --workflow F --job J --node N --tier T``: before the first invocation of the full suite. The
+  whole-suite ceiling ``WHOLE_SUITE_CEILING_SECS`` plus the same ``MARGIN_PCT`` margin must fit the timeout of
+  job J as the workflow F states it (``timeout-minutes``, or the ``timeout`` of the matrix leg N, T when the
+  job reads ``${{ matrix.timeout }}``). A ceiling that cannot fit is ``EXIT_MARGIN_LOST`` at derivation, so
+  the suite is red before it runs, never killed by the job cap.
+* ``suite-sum --seconds F``: after the last invocation. F holds one ``<seconds><TAB><label>`` line per
+  invocation (the step appends them); their sum over ``WHOLE_SUITE_CEILING_SECS`` is ``EXIT_MARGIN_LOST``
+  with every invocation's seconds printed (ruling b29 cdfe800f: four budgets of 2100 s must not become a
+  silent 8400 s suite).
+
 ``--log-offset N`` (gate, timer) reads the log from byte N: the step appends every invocation to one
 log, so each gate profiles only its own invocation.
 
-Exit codes: 0 ok, 2 malformed input (argparse usage too), 3 margin lost,
-4 the shared workflow_annotation.py next to this file cannot be loaded.
+Every margin red names issue #9229 and the slowest binaries, so a lane does not read it as its own defect.
+
+Exit codes: 0 ok, 2 malformed input (argparse usage too), 3 margin lost (an invocation, the whole suite, or
+a whole-suite plan that cannot fit the job), 4 the shared workflow_annotation.py next to this file cannot be
+loaded.
 Malformed input is always red with a named error, never a silent pass.
 
 Python 3.12+, standard library only.
@@ -95,6 +108,18 @@ MARGIN_PCT = 20
 MIN_MARGIN_PCT = 1
 MAX_MARGIN_PCT = 99
 WATCHDOG_KILL_CODES = (124, 137)  # GNU timeout: TERM fired / KILL after --kill-after
+# The most seconds the invocations of the sqlite full suite may sum to (ruling b29 cdfe800f). It fits both
+# sqlite legs with the margin: 80 % of the 80-minute macos-fed job is 3840 s, of the 95-minute ubuntu-latest
+# job 4560 s (suite-plan checks the running leg). The measured unsharded suite is about 2000 s on ubuntu-latest.
+WHOLE_SUITE_CEILING_SECS = 3600
+# Carried by every margin red, so another lane reads it as the suite's cost, not as its own failure.
+ISSUE_NOTE = "this red is issue #9229 (the cost of the sqlite suite), not a failure of the change under test"
+NO_PROFILE = "slowest binaries: none profiled"
+_SECONDS_RE = re.compile(r"[0-9]{1,9}")
+_NEGATIVE_RE = re.compile(r"-[0-9]{1,9}")
+_MINUTES_RE = re.compile(r"[1-9][0-9]{0,3}")
+_MATRIX_TIMEOUT_RE = re.compile(r"\$\{\{\s*matrix\.timeout\s*\}\}")
+_KEY_RE = re.compile(r"^( *)(- )?([A-Za-z_][A-Za-z0-9_-]*):(?: +(.*?))?\s*$")
 # Binaries named in a red message: enough to point at the cost, bounded so the annotation stays one line.
 SLOWEST_NAMED = 5
 PROFILE_TOP_DEFAULT = 25
@@ -358,22 +383,22 @@ def run_shard_args(metadata_path, features, part_text="1/1"):
 
 
 def slowest_summary(rows, count=SLOWEST_NAMED):
-    """'last started X; slowest: a 120s, b 90s' from profile rows (empty string when no rows)."""
+    """'still running X; slowest binaries: a 120s, b 90s' from profile rows (NO_PROFILE when no rows)."""
     if not rows:
-        return ""
+        return NO_PROFILE
     parts = []
     running = [r for r in rows if r["status"] == "running"]
     if running:
         parts.append("still running %s" % running[-1]["name"])
     ranked = sorted(rows, key=lambda r: r["secs"], reverse=True)[:count]
-    parts.append("slowest: " + ", ".join("%s %ds" % (r["name"], int(r["secs"])) for r in ranked))
+    parts.append("slowest binaries: " + ", ".join("%s %ds" % (r["name"], int(r["secs"])) for r in ranked))
     return "; ".join(parts)
 
 
 def run_gate(label, elapsed, budget, rc, margin_pct, log, log_offset=0):
     try:
         verdict, message = judge(elapsed, budget, rc, margin_pct)
-        detail = ""
+        detail = NO_PROFILE
         if verdict != "ok" and log:
             detail = slowest_summary(profile_lines(read_log(log, log_offset)))
     except MalformedInput as exc:
@@ -383,10 +408,8 @@ def run_gate(label, elapsed, budget, rc, margin_pct, log, log_offset=0):
     if verdict == "ok":
         print(wa.annotation("notice", "%s '%s': margin held: %s" % (TAG, label, message)), flush=True)
         return EXIT_OK
-    text = "%s '%s' lost the suite margin (#9229): %s" % (TAG, label, message)
-    if detail:
-        text += "; " + detail
-    print(wa.annotation("error", text), flush=True)
+    print(wa.annotation("error", "%s '%s' lost the suite margin: %s; %s; %s"
+                        % (TAG, label, message, ISSUE_NOTE, detail)), flush=True)
     return EXIT_MARGIN_LOST
 
 
@@ -404,19 +427,172 @@ def run_timer(label, budget, margin_pct, log, log_offset=0, sleep_fn=time.sleep,
         if left <= 0:
             break
         sleep_fn(min(left, 60))
-    detail = ""
+    detail = NO_PROFILE
     if log:
         try:
             detail = slowest_summary(profile_lines(read_log(log, log_offset), now=clock()))
         except MalformedInput:
-            detail = "the suite log cannot be read"
-    text = ("%s '%s' lost the suite margin while still running (#9229): %ds of the %ds budget used, the "
-            "required margin is %d%% (%ds); the watchdog kills it at %ds unless it ends first"
-            % (TAG, label, deadline, budget, margin_pct, budget - deadline, budget))
-    if detail:
-        text += "; " + detail
-    print(wa.annotation("error", text), flush=True)
+            detail = "the suite log cannot be read; " + NO_PROFILE
+    print(wa.annotation("error", "%s '%s' lost the suite margin while still running: %ds of the %ds budget used, "
+                        "the required margin is %d%% (%ds); the watchdog kills it at %ds unless it ends first; "
+                        "%s; %s" % (TAG, label, deadline, budget, margin_pct, budget - deadline, budget,
+                                    ISSUE_NOTE, detail)), flush=True)
     return EXIT_MARGIN_LOST
+
+
+def _read_text(path, what):
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return handle.read()
+    except (OSError, ValueError) as exc:  # UnicodeDecodeError is a ValueError
+        raise MalformedInput("the %s cannot be read (%s)" % (what, type(exc).__name__)) from None
+
+
+def _job_block(text, job):
+    """The lines of job ``job`` under the top-level ``jobs:`` key (two-space indent, as ci.yml writes it)."""
+    lines = text.splitlines()
+    try:
+        start = lines.index("jobs:")
+    except ValueError:
+        raise MalformedInput("the workflow has no job %r" % (job,)) from None
+    header = "  %s:" % job
+    for i in range(start + 1, len(lines)):
+        line = lines[i]
+        if line and not line.startswith(" ") and not line.startswith("#"):
+            break  # left the jobs: mapping
+        if line.rstrip() == header:
+            block = []
+            for nxt in lines[i + 1:]:
+                if nxt and not nxt.startswith("   ") and not nxt.lstrip().startswith("#"):
+                    break
+                block.append(nxt)
+            return block
+    raise MalformedInput("the workflow has no job %r" % (job,))
+
+
+def _value(raw):
+    """A plain YAML scalar as ci.yml writes it: trailing comment and one pair of quotes stripped."""
+    raw = re.sub(r"\s+#.*$", "", raw or "").strip()
+    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "'\"":
+        raw = raw[1:-1]
+    return raw
+
+
+def _matrix_legs(block):
+    """The mappings of ``strategy.matrix.include`` in a job block, each as {key: value}."""
+    legs, inside, include_indent, item_indent = [], False, 0, None
+    for line in block:
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        m = _KEY_RE.match(line)
+        indent = len(line) - len(line.lstrip(" "))
+        if not inside:
+            if m and not m.group(2) and m.group(3) == "include" and not m.group(4):
+                inside, include_indent = True, indent
+            continue
+        if indent <= include_indent and not line.lstrip().startswith("- "):
+            break
+        if not m:
+            continue
+        if m.group(2):
+            item_indent = indent + 2
+            legs.append({m.group(3): _value(m.group(4))})
+        elif legs and indent == item_indent:
+            legs[-1][m.group(3)] = _value(m.group(4))
+    return legs
+
+
+def job_timeout_secs(text, job, node, tier):
+    """Seconds of the timeout of ``job`` in the workflow ``text`` for the matrix leg (node, tier)."""
+    block = _job_block(text, job)
+    stated = [m for m in (_KEY_RE.match(line) for line in block)
+              if m and not m.group(2) and len(m.group(1)) == 4 and m.group(3) == "timeout-minutes"]
+    if not stated:
+        raise MalformedInput("job %r has no timeout-minutes" % (job,))
+    value = _value(stated[0].group(4))
+    if _MINUTES_RE.fullmatch(value):
+        return int(value) * 60
+    if not _MATRIX_TIMEOUT_RE.fullmatch(value):
+        raise MalformedInput("job %r timeout-minutes %r is neither an integer of minutes nor ${{ matrix.timeout }}"
+                             % (job, value))
+    where = "node=%s tier=%s" % (node, tier)
+    legs = [leg for leg in _matrix_legs(block) if leg.get("node") == node and leg.get("tier") == tier]
+    if not legs:
+        raise MalformedInput("job %r has no matrix leg %s" % (job, where))
+    if len(legs) > 1:
+        raise MalformedInput("job %r has %d matrix legs %s" % (job, len(legs), where))
+    minutes = legs[0].get("timeout")
+    if minutes is None:
+        raise MalformedInput("matrix leg %s of job %r has no timeout" % (where, job))
+    if not _MINUTES_RE.fullmatch(minutes):
+        raise MalformedInput("matrix leg %s of job %r timeout %r is not a positive integer of minutes"
+                             % (where, job, minutes))
+    return int(minutes) * 60
+
+
+def run_suite_plan(workflow_path, job, node, tier, ceiling=WHOLE_SUITE_CEILING_SECS, margin_pct=MARGIN_PCT):
+    try:
+        secs = job_timeout_secs(_read_text(workflow_path, "workflow file"), job, node, tier)
+        room = margin_deadline(secs, margin_pct)
+    except MalformedInput as exc:
+        print(wa.annotation("error", "%s whole-suite plan: malformed input: %s; refusing to pass (#9229)"
+                            % (TAG, exc)), flush=True)
+        return EXIT_MALFORMED
+    where = "the %d-minute timeout of job '%s' (node=%s tier=%s) with the required %d%% margin (at most %ds)" \
+        % (secs // 60, job, node, tier, margin_pct, room)
+    if ceiling > room:
+        print(wa.annotation("error", "%s whole-suite plan refused: the %ds whole-suite ceiling "
+                            "(WHOLE_SUITE_CEILING_SECS) does not fit %s; %s; cut the suite cost or shard it, do not "
+                            "raise the ceiling" % (TAG, ceiling, where, ISSUE_NOTE)), flush=True)
+        return EXIT_MARGIN_LOST
+    print(wa.annotation("notice", "%s whole-suite plan: the %ds whole-suite ceiling fits %s"
+                        % (TAG, ceiling, where)), flush=True)
+    return EXIT_OK
+
+
+def parse_seconds(text):
+    """[(label, seconds)] from '<seconds><TAB><label>' lines, in order; anything else is MalformedInput."""
+    rows, seen = [], set()
+    lines = text.split("\n") if text else []
+    if lines and not lines[-1]:
+        lines.pop()  # the newline that ends the last line
+    for number, line in enumerate(lines, 1):
+        secs, tab, label = line.partition("\t")
+        if not tab or not label:
+            raise MalformedInput("invocation seconds line %d is not '<seconds><TAB><label>'" % number)
+        if _NEGATIVE_RE.fullmatch(secs):
+            raise MalformedInput("invocation seconds line %d has a negative seconds value %s" % (number, secs))
+        if not _SECONDS_RE.fullmatch(secs):
+            raise MalformedInput("invocation seconds line %d has a non-numeric seconds value %r"
+                                 % (number, secs[:40]))
+        if label in seen:
+            raise MalformedInput("invocation seconds line %d repeats the invocation %r" % (number, label))
+        seen.add(label)
+        rows.append((label, int(secs)))
+    if not rows:
+        raise MalformedInput("the invocation seconds file records no invocation")
+    return rows
+
+
+def run_suite_sum(seconds_path, ceiling=WHOLE_SUITE_CEILING_SECS):
+    try:
+        rows = parse_seconds(_read_text(seconds_path, "invocation seconds file"))
+    except MalformedInput as exc:
+        print(wa.annotation("error", "%s whole sqlite suite: malformed input: %s; refusing to pass (#9229)"
+                            % (TAG, exc)), flush=True)
+        return EXIT_MALFORMED
+    total = sum(secs for _, secs in rows)
+    each = ", ".join("%s %ds" % (label, secs) for label, secs in rows)
+    if total > ceiling:
+        print(wa.annotation("error", "%s whole sqlite suite lost its ceiling: %d invocations ran %ds, over the %ds "
+                            "whole-suite ceiling (WHOLE_SUITE_CEILING_SECS); per invocation: %s; %s; cut the suite "
+                            "cost or shard it, do not raise the ceiling" % (TAG, len(rows), total, ceiling, each,
+                                                                             ISSUE_NOTE)), flush=True)
+        return EXIT_MARGIN_LOST
+    print(wa.annotation("notice", "%s whole sqlite suite: %d invocations ran %ds of the %ds whole-suite ceiling "
+                        "(WHOLE_SUITE_CEILING_SECS); per invocation: %s" % (TAG, len(rows), total, ceiling, each)),
+          flush=True)
+    return EXIT_OK
 
 
 def run_profile(log, top):
@@ -466,6 +642,13 @@ def main(argv=None):
     s.add_argument("--metadata", required=True)
     s.add_argument("--features", default="")
     s.add_argument("--part", default="1/1")
+    w = sub.add_parser("suite-plan")
+    w.add_argument("--workflow", required=True)
+    w.add_argument("--job", required=True)
+    w.add_argument("--node", required=True)
+    w.add_argument("--tier", required=True)
+    u = sub.add_parser("suite-sum")
+    u.add_argument("--seconds", required=True)
     args = p.parse_args(argv)
     if args.cmd == "gate":
         return run_gate(args.label, args.elapsed, args.budget, args.rc, args.margin_pct, args.log,
@@ -474,6 +657,10 @@ def main(argv=None):
         return run_timer(args.label, args.budget, args.margin_pct, args.log, args.log_offset)
     if args.cmd == "shard-args":
         return run_shard_args(args.metadata, args.features, args.part)
+    if args.cmd == "suite-plan":
+        return run_suite_plan(args.workflow, args.job, args.node, args.tier)
+    if args.cmd == "suite-sum":
+        return run_suite_sum(args.seconds)
     return run_profile(args.log, args.top)
 
 

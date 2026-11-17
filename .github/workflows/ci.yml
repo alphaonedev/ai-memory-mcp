@@ -2109,6 +2109,7 @@ jobs:
             elapsed=$(( $(date +%s) - started ))
             if [ -n "$timer_pid" ]; then
               { kill "$timer_pid"; wait "$timer_pid"; } 2>/dev/null || true
+              if [ -n "${SUITE_SECONDS_FILE:-}" ]; then printf '%s\t%s\n' "$elapsed" "$label" >> "$SUITE_SECONDS_FILE"; fi
               python3 -I scripts/ci/suite_budget.py gate --label "$label" --elapsed "$elapsed" --budget "$WATCHDOG_SECS" --rc "$rc" --log "$RESULT_LOG" --log-offset "$log_offset" || gate_rc=$?
             fi
             if [ "$rc" -eq 0 ] && [ "$gate_rc" -ne 0 ]; then return "$gate_rc"; fi
@@ -2175,6 +2176,7 @@ jobs:
             elapsed=$(( $(date +%s) - started ))
             if [ -n "$timer_pid" ]; then
               { kill "$timer_pid"; wait "$timer_pid"; } 2>/dev/null || true
+              if [ -n "${SUITE_SECONDS_FILE:-}" ]; then printf '%s\t%s\n' "$elapsed" "$label" >> "$SUITE_SECONDS_FILE"; fi
               python3 -I scripts/ci/suite_budget.py gate --label "$label" --elapsed "$elapsed" --budget "$WATCHDOG_SECS" --rc "$rc" --log "$RESULT_LOG" --log-offset "$log_offset" || gate_rc=$?
             fi
             if [ "$rc" -eq 0 ] && [ "$gate_rc" -ne 0 ]; then return "$gate_rc"; fi
@@ -2193,9 +2195,17 @@ jobs:
           # not stop the later ones (#2500 evidence, precedent run_shard); the function
           # returns the first failure. When a derivation is refused it warns and runs
           # the one unsharded invocation, gated (fail closed to full coverage).
+          # Whole-suite ceiling (ruling b29 cdfe800f): suite-plan first proves the one
+          # WHOLE_SUITE_CEILING_SECS plus the margin fits this job's timeout as this file
+          # states it (red before any test, never a job kill); each gated invocation
+          # appends its seconds to SUITE_SECONDS_FILE (a local, so the run_tests calls
+          # see it), and suite-sum judges their sum after the last one.
           run_sqlite_full_suite() {
             local rc=0 r=0 meta="${RUNNER_TEMP:-.}/suite-9229-metadata.json" list="${RUNNER_TEMP:-.}/suite-9229-shard.txt"
             local part_1=() part_2=() line
+            local SUITE_SECONDS_FILE="${RUNNER_TEMP:-.}/suite-9229-seconds.txt"
+            python3 -I scripts/ci/suite_budget.py suite-plan --workflow .github/workflows/ci.yml --job check --node "${CI_NODE:-unknown}" --tier "${TIER:-sqlite}" || return "$?"
+            : > "$SUITE_SECONDS_FILE"
             if cargo metadata --no-deps --format-version 1 > "$meta"; then
               if python3 -I scripts/ci/suite_budget.py shard-args --metadata "$meta" --part 1/2 > "$list"; then
                 while IFS= read -r line; do part_1+=("$line"); done < "$list"
@@ -2205,13 +2215,14 @@ jobs:
               fi
             fi
             if [ "${#part_1[@]}" -eq 0 ] || [ "${#part_2[@]}" -eq 0 ]; then
-              SUITE_MARGIN_GATE=1 run_tests "full suite (cargo test)" $FEAT $TAIL
-              return
+              SUITE_MARGIN_GATE=1 run_tests "full suite (cargo test)" $FEAT $TAIL || rc=$?
+            else
+              SUITE_MARGIN_GATE=1 run_tests "full suite shard 1/4: lib unit tests" $FEAT --lib $TAIL || rc=$?
+              SUITE_MARGIN_GATE=1 run_tests "full suite shard 2/4: bins, integration tests and tested examples, part 1/2" $FEAT "${part_1[@]}" $TAIL || { r=$?; [ "$rc" -ne 0 ] || rc=$r; }
+              SUITE_MARGIN_GATE=1 run_tests "full suite shard 3/4: bins, integration tests and tested examples, part 2/2" $FEAT "${part_2[@]}" $TAIL || { r=$?; [ "$rc" -ne 0 ] || rc=$r; }
+              SUITE_MARGIN_GATE=1 run_doc_tests "full suite shard 4/4: doc tests" $FEAT $TAIL || { r=$?; [ "$rc" -ne 0 ] || rc=$r; }
             fi
-            SUITE_MARGIN_GATE=1 run_tests "full suite shard 1/4: lib unit tests" $FEAT --lib $TAIL || rc=$?
-            SUITE_MARGIN_GATE=1 run_tests "full suite shard 2/4: bins, integration tests and tested examples, part 1/2" $FEAT "${part_1[@]}" $TAIL || { r=$?; [ "$rc" -ne 0 ] || rc=$r; }
-            SUITE_MARGIN_GATE=1 run_tests "full suite shard 3/4: bins, integration tests and tested examples, part 2/2" $FEAT "${part_2[@]}" $TAIL || { r=$?; [ "$rc" -ne 0 ] || rc=$r; }
-            SUITE_MARGIN_GATE=1 run_doc_tests "full suite shard 4/4: doc tests" $FEAT $TAIL || { r=$?; [ "$rc" -ne 0 ] || rc=$r; }
+            python3 -I scripts/ci/suite_budget.py suite-sum --seconds "$SUITE_SECONDS_FILE" || { r=$?; [ "$rc" -ne 0 ] || rc=$r; }
             return "$rc"
           }
           # #6383 / #6386 — class (a) binaries when the opt-in lane is on:

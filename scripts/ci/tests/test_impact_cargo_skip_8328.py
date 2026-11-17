@@ -525,6 +525,10 @@ def run_whole_step(impact, docs_only="false", tier="sqlite"):
         (work / "scripts" / "ci").mkdir(parents=True)
         for rel in MARGIN_GATE_SCRIPTS:
             shutil.copyfile(str(REPO / rel), str(work / rel))
+        # #9229 cdfe800f: the full suite's whole-suite plan reads the job timeout of the running
+        # leg from ci.yml in the working directory, so the scratch tree carries it and a real leg.
+        (work / ".github" / "workflows").mkdir(parents=True)
+        shutil.copyfile(str(CI_YML), str(work / ".github" / "workflows" / "ci.yml"))
         (work / "bin").mkdir()
         argv_log = work / "cargo-argv.jsonl"
         fake = work / "bin" / "cargo"
@@ -532,7 +536,7 @@ def run_whole_step(impact, docs_only="false", tier="sqlite"):
         fake.chmod(0o755)
         env = {k: v for k, v in os.environ.items() if k not in STEP_ENV_DROP}
         env.update(PATH="%s%s%s" % (work / "bin", os.pathsep, os.environ.get("PATH", "")),
-                   TEST_IMPACT=impact, DOCS_ONLY=docs_only, TIER=tier, CI_NODE="probe",
+                   TEST_IMPACT=impact, DOCS_ONLY=docs_only, TIER=tier, CI_NODE="ubuntu-latest",
                    HOST_SEMAPHORE_SLOTS="0", JOB_TIMEOUT_MIN="60", AI_MEMORY_NO_CONFIG="1",
                    RUNNER_TEMP=str(work), GITHUB_ENV=str(work / "github-env"))
         res = subprocess.run(RUNNER_BASH + [consumer_step_body()], cwd=str(work), env=env,
