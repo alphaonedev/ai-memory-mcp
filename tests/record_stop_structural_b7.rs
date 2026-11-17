@@ -1216,7 +1216,17 @@ fn parse_src(raw: &str) -> ParsedSrc {
 /// module, e.g. `versioned_update_txn.rs`) is gated when its ONE call site in
 /// `src/` sits in a fn that calls the record-stop gate BEFORE that call line.
 /// Fails closed: `pub`/`pub(crate)` visibility, zero or several call sites, a
-/// caller outside any fn, or a gate after the call all leave it ungated.
+/// caller outside any fn, or a gate after the call all leave it ungated. Every
+/// mention of the bare identifier in `src/` (call, path-qualified call, `use ...
+/// as` alias, fn-pointer value) counts as a call site, so any extra route to the
+/// body leaves it ungated (mutants m3, m5, m6 of #9404).
+///
+/// Limit (control flow): the line-order check cannot see whether the gate
+/// RUNS before the call. A gate call inside an `if false { .. }` block, or one
+/// placed after an early `return` on the path that still reaches the call, is
+/// credited. The pre-existing same-span credit (`span_has_gate`, line 694, used
+/// for every gated write fn) has the same limit; both are the base scanner's
+/// text-level behaviour (tracked as `b7-scanner-control-flow`).
 fn sole_caller_is_gated(parsed: &[ParsedSrc], decl_line: &str, name: &str) -> bool {
     if !decl_line.trim_start().starts_with("pub(super) ") {
         return false;
@@ -1241,6 +1251,10 @@ fn sole_caller_is_gated(parsed: &[ParsedSrc], decl_line: &str, name: &str) -> bo
     let masked: Vec<&str> = f.masked.iter().map(String::as_str).collect();
     (s..*k).any(|g| line_calls_gate(masked[g], &f.wrappers))
 }
+
+/// #9405 - the exact set of write-SQL fns the sole-caller credit may cover. A
+/// second credited fn is a red test: add it here only after reviewing it.
+const SOLE_CALLER_CREDITED_FNS: &[&str] = &["update_with_expected_version_in_txn"];
 
 #[test]
 fn record_stop_write_sql_fns_are_gated_or_allowlisted_b7() {
@@ -1268,6 +1282,7 @@ fn record_stop_write_sql_fns_are_gated_or_allowlisted_b7() {
         .collect();
 
     let mut ungated: Vec<(String, String, usize)> = Vec::new();
+    let mut credited_by_sole_caller: Vec<String> = Vec::new();
     let mut gated_hits: HashMap<String, bool> = MUST_BE_GATED
         .iter()
         .map(|n| ((*n).to_string(), false))
@@ -1343,6 +1358,7 @@ fn record_stop_write_sql_fns_are_gated_or_allowlisted_b7() {
                 continue;
             }
             if sole_caller_is_gated(&parsed, lines[start], name) {
+                credited_by_sole_caller.push(name.clone());
                 continue;
             }
             if allow.contains(&key) {
@@ -1351,6 +1367,12 @@ fn record_stop_write_sql_fns_are_gated_or_allowlisted_b7() {
             ungated.push((rel.clone(), name.clone(), start + 1));
         }
     }
+
+    credited_by_sole_caller.sort();
+    assert_eq!(
+        credited_by_sole_caller, SOLE_CALLER_CREDITED_FNS,
+        "the sole-caller credit covers exactly SOLE_CALLER_CREDITED_FNS"
+    );
 
     let mut missing_required = Vec::new();
     for (name, hit) in &gated_hits {
