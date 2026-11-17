@@ -1083,9 +1083,9 @@ class OsPlantNeverRuns(unittest.TestCase):
                     self.assertEqual(planted, clean)
 
     def test_sibling_scripts_os_plant_table_9365(self):
-        """Table over the 13 sibling scripts of 0f1ec1b7: ``--help`` with an os.py plant equals the clean run."""
+        """Table over the 14 sibling scripts (the 13 of 0f1ec1b7 plus suite_budget of #9229): ``--help`` with an os.py plant equals the clean run."""
         scripts = (*SIBLING_SCRIPTS, "scripts/test/pg_isolated_binary.py")
-        self.assertEqual(len(scripts), 13)
+        self.assertEqual(len(scripts), 14)
         layout = SiblingLoadInvariant.layout
         for rel in scripts:
             for where in OS_PLANT_PLACES:
@@ -1821,7 +1821,7 @@ STREAM_SCRIPTS = tuple(sorted(set(GATE_LOAD_EXIT_CODES) | set(NON_GATE_LOAD_EXIT
 STREAM_SHARED_CALLS = SHARED_FIELD_FUNCTIONS | {"safe_value", "render", "join", "end_group_line"}
 STREAM_NUMBER_CALLS = frozenset({"len", "int", "float", "round", "abs"})  # return a number for any argument
 STREAM_TRACE_DEPTH = 6
-STREAM_SCRIPT_COUNT = 14
+STREAM_SCRIPT_COUNT = 15  # 14 + suite_budget (#9229)
 STREAM_MODULE_VARS = frozenset({"wa"})  # the name every script binds the loaded module to
 # Runs before the shared module exists, so it cannot use it; each output is fixed text pinned by its own test:
 # prune_runner_tmp's floor check (VERSION_REFUSAL_AT_0F1EC1B7 cells) and load refusal (SiblingLoadFailsClosed, P1).
@@ -2018,7 +2018,7 @@ def stream_violations(rel, source):
 
 
 class StreamRatchet(unittest.TestCase):
-    def test_the_fourteen_scripts_print_only_traceable_text_9365(self):
+    def test_the_fifteen_scripts_print_only_traceable_text_9365(self):
         self.assertEqual(len(STREAM_SCRIPTS), STREAM_SCRIPT_COUNT)
         found = []
         for rel in STREAM_SCRIPTS:

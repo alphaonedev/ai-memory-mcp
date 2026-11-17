@@ -264,6 +264,15 @@ class Profile(unittest.TestCase):
         rows = self.sb.profile_lines(lines)
         self.assertEqual([(r["name"], r["secs"]) for r in rows], [("tests/a.rs", 2.25), ("ai_memory", 11.0)])
 
+    def test_previous_end_notice_before_any_binary_is_not_the_end(self):
+        # The offset is measured while the previous invocation's notice may still be in the tee pipe.
+        lines = ["::notice::[#1492] 'shard 1' ran 400s of the 2100s per-invocation watchdog budget (19% used)",
+                 "     Running tests/a.rs (target/debug/deps/a-1)",
+                 "test result: ok. 1 passed; 0 failed; finished in 3.00s",
+                 "::notice::[#1492] 'shard 2' ran 4s of the 2100s per-invocation watchdog budget (0% used)",
+                 "     Running tests/after_end.rs (x)"]
+        self.assertEqual([(r["name"], r["secs"]) for r in self.sb.profile_lines(lines)], [("tests/a.rs", 3.0)])
+
     def test_scan_is_linear_on_a_large_log(self):
         lines = []
         for i in range(SCAN_LINES // 2):
@@ -373,6 +382,60 @@ class ShardArgs(unittest.TestCase):
                     self.sb.shard_args(meta)
                 self.assertIn(words, str(caught.exception))
 
+    def test_parts_partition_the_second_shard_exactly(self):
+        """Generative: for every target count and part count the parts are disjoint, cover every pair once,
+        keep each flag with its name, and differ in size by at most one target."""
+        lib = {"kind": ["lib"], "name": "ai_memory", "test": True, "doctest": True}
+        for count in range(1, 40):
+            targets = [lib] + [{"kind": ["test"], "name": "t%03d" % i, "test": True} for i in range(count)]
+            full = self.sb.shard_args(metadata(targets=targets))
+            want = list(zip(full[0::2], full[1::2]))
+            for parts in range(1, self.sb.MAX_PARTS + 1):
+                with self.subTest(count=count, parts=parts):
+                    if parts > count:
+                        with self.assertRaises(self.sb.MalformedInput) as caught:
+                            self.sb.shard_args(metadata(targets=targets), part=(parts, parts))
+                        self.assertIn("selects no target", str(caught.exception))
+                        continue
+                    got, sizes = [], []
+                    for k in range(1, parts + 1):
+                        args = self.sb.shard_args(metadata(targets=targets), part=(k, parts))
+                        pairs = list(zip(args[0::2], args[1::2]))
+                        self.assertTrue(all(f == "--test" for f, _ in pairs))
+                        got.extend(pairs)
+                        sizes.append(len(pairs))
+                    self.assertEqual(sorted(got), sorted(want))
+                    self.assertLessEqual(max(sizes) - min(sizes), 1)
+
+    def test_part_is_round_robin_in_manifest_order(self):
+        self.assertEqual(self.sb.shard_args(metadata(), part=(1, 2)),
+                         ["--bin", "ai-memory", "--test", "beta_9229"])
+        self.assertEqual(self.sb.shard_args(metadata(), part=(2, 2)), ["--test", "alpha", "--example", "ex_tested"])
+        self.assertEqual(self.sb.shard_args(metadata(), part=(1, 1)), DEFAULT_SHARD)
+
+    def test_malformed_part_is_refused(self):
+        for text, words in (("0/2", "part '0/2' is outside 1..N"), ("3/2", "part '3/2' is outside 1..N"),
+                            ("1/0", "part '1/0' is outside"), ("1/17", "part '1/17' is outside"),
+                            ("1", "part '1' is not K/N"), ("a/b", "part 'a/b' is not K/N"),
+                            ("1/2/3", "is not K/N"), ("-1/2", "is not K/N"), (" 1/2", "is not K/N"),
+                            ("1/" + "9" * 5000, "is not K/N")):
+            with self.subTest(text=text[:20]):
+                with self.assertRaises(self.sb.MalformedInput) as caught:
+                    self.sb.parse_part(text)
+                self.assertIn(words, str(caught.exception))
+        self.assertEqual(self.sb.parse_part("2/2"), (2, 2))
+
+    def test_cli_part_and_bad_part(self):
+        with scratch() as d:
+            good = Path(d) / "m.json"
+            good.write_text(json.dumps(metadata()), encoding="utf-8")
+            rc, out, _ = run_main(self.sb, ["shard-args", "--metadata", str(good), "--part", "2/2"])
+            self.assertEqual((rc, out.splitlines()), (0, ["--test", "alpha", "--example", "ex_tested"]))
+            rc, out, err = run_main(self.sb, ["shard-args", "--metadata", str(good), "--part", "5/2"])
+            self.assertEqual((rc, out), (2, ""))
+            self.assertIn("::warning::[#9229 margin] shard-args: part '5/2' is outside 1..N", err)
+            self.assertIn("the full suite runs unsharded (#9229)", err)
+
     def test_unknown_requested_feature_is_refused(self):
         with self.assertRaises(self.sb.MalformedInput) as caught:
             self.sb.shard_args(metadata(), ["nope"])
@@ -437,11 +500,16 @@ class Wiring(unittest.TestCase):
     def test_sqlite_full_suite_is_sharded_and_gated(self):
         body = function_body(CI, "run_sqlite_full_suite")
         self.assertIn("scripts/ci/suite_budget.py shard-args", body)
-        for label in ('"full suite shard 1/3: lib unit tests" $FEAT --lib $TAIL',
-                      '"full suite shard 3/3: doc tests" $FEAT $TAIL',
-                      '"full suite (cargo test)" $FEAT $TAIL'):
+        for label in ('"full suite shard 1/4: lib unit tests" $FEAT --lib $TAIL',
+                      '"full suite shard 2/4: bins, integration tests and tested examples, part 1/2" $FEAT '
+                      '"${part_1[@]}" $TAIL',
+                      '"full suite shard 3/4: bins, integration tests and tested examples, part 2/2" $FEAT '
+                      '"${part_2[@]}" $TAIL',
+                      '"full suite shard 4/4: doc tests" $FEAT $TAIL',
+                      '"full suite (cargo test)" $FEAT $TAIL',
+                      "--part 1/2", "--part 2/2"):
             self.assertIn(label, body)
-        self.assertEqual(body.count("SUITE_MARGIN_GATE=1 run_"), 4)
+        self.assertEqual(body.count("SUITE_MARGIN_GATE=1 run_"), 5)
 
     def test_enterprise_shard_chains_carry_no_margin_gate(self):
         for fn in ("run_shard", "run_sharded"):
@@ -501,16 +569,18 @@ class StepExec(unittest.TestCase):
             lines = calls.read_text().splitlines() if calls.exists() else []
             return r, lines
 
-    def test_full_suite_runs_three_gated_shards(self):
+    def test_full_suite_runs_four_gated_shards(self):
         r, calls = self.run_step(meta=metadata())
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         timed = [c for c in calls if c.startswith("test ") and "--no-run" not in c]
         self.assertEqual(timed, ["test --no-fail-fast --lib",
-                                 "test --no-fail-fast " + " ".join(DEFAULT_SHARD),
+                                 "test --no-fail-fast --bin ai-memory --test beta_9229",
+                                 "test --no-fail-fast --test alpha --example ex_tested",
                                  "test --doc --no-fail-fast"])
-        for label in ("full suite shard 1/3: lib unit tests",
-                      "full suite shard 2/3: bins, integration tests and tested examples",
-                      "full suite shard 3/3: doc tests"):
+        for label in ("full suite shard 1/4: lib unit tests",
+                      "full suite shard 2/4: bins, integration tests and tested examples, part 1/2",
+                      "full suite shard 3/4: bins, integration tests and tested examples, part 2/2",
+                      "full suite shard 4/4: doc tests"):
             self.assertIn("::notice::[#9229 margin] '%s': margin held: wall 0s of the 2100s budget" % label,
                           r.stdout)
 
@@ -522,8 +592,17 @@ class StepExec(unittest.TestCase):
         self.assertIn("::warning::[#9229 margin] shard-args: ", r.stdout + r.stderr)
         self.assertIn("::notice::[#9229 margin] 'full suite (cargo test)': margin held", r.stdout)
 
+    def test_a_part_that_selects_nothing_falls_back_to_the_one_gated_invocation(self):
+        lib = {"kind": ["lib"], "name": "ai_memory", "test": True, "doctest": True}
+        r, calls = self.run_step(meta=metadata(targets=[lib, {"kind": ["test"], "name": "only", "test": True}]))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        timed = [c for c in calls if c.startswith("test ") and "--no-run" not in c]
+        self.assertEqual(timed, ["test --no-fail-fast"])
+        self.assertIn("::warning::[#9229 margin] shard-args: the second shard part 2/2 selects no target",
+                      r.stdout + r.stderr)
+
     def test_impact_path_is_gated_too(self):
-        r, _ = self.run_step(meta=metadata(), impact="alpha")
+        r, _ = self.run_step(meta=metadata(), impact="recall_observability")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("::notice::[#9229 margin] 'cargo test --lib': margin held", r.stdout)
 
