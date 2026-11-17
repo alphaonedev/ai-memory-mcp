@@ -1538,3 +1538,323 @@ fn repair_call_sites_are_migrate_only_4324() {
         "#4324: expected exactly 2 migrate call sites (open-time repair + ladder tail), got {sites:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #9414 — the gate is credited only where it provably runs before the write,
+// and every literal form of the edition is classified (never guessed).
+// ---------------------------------------------------------------------------
+
+/// #9414 — the verdict a unit cell asserts: `Ok(gated)` for the one fn named
+/// `fn_name` in `src`, or the tokenizer finding (`line N: <reason>`).
+fn b7_try_verdict(src: &str, fn_name: &str) -> Result<bool, String> {
+    Ok(fn_body_has_gate(src, fn_name))
+}
+
+/// #9414 — a write fn named `w` whose body is `body` (one statement per line).
+fn b7_plant(body: &str) -> String {
+    format!(
+        "pub fn w(conn: &Connection, id: &str) -> Result<(bool, bool)> {{\n{body}\n    \
+         conn.execute(\"UPDATE t SET a = 1 WHERE id = ?1\", [id])?;\n    Ok((true, true))\n}}\n"
+    )
+}
+
+/// #9414 control-flow table: `(label, body, credited)`. m7a / m7b / m2 are
+/// the issue's mutants; every `false` row is a gate the scanner cannot prove
+/// runs before the write.
+const B7_CONTROL_FLOW_ROWS_9414: &[(&str, &str, bool)] = &[
+    ("plain gate first", "    gate_storage_conn(conn)?;", true),
+    (
+        "gate in an if condition",
+        "    if record_stop_status(conn)? {\n        return Ok((false, false));\n    }",
+        true,
+    ),
+    (
+        "conditional early return before the gate",
+        "    if id.is_empty() {\n        return Ok((false, false));\n    }\n    gate_storage_conn(conn)?;",
+        true,
+    ),
+    (
+        "? before the gate",
+        "    let _n = id.parse::<i64>()?;\n    gate_storage_conn(conn)?;",
+        true,
+    ),
+    (
+        "m7a gate inside if false",
+        "    if false {\n        gate_storage_conn(conn)?;\n    }",
+        false,
+    ),
+    (
+        "m7b gate after an early return in the same block",
+        "    if id.is_empty() {\n        return Ok((false, false));\n        gate_storage_conn(conn)?;\n    }",
+        false,
+    ),
+    (
+        "m2 gate after the write transaction",
+        "    let out = in_write_txn(conn, || {\n        conn.execute(\"UPDATE t SET b = 2\", [])?;\n        Ok(())\n    });\n    gate_storage_conn(conn)?;\n    out?;",
+        false,
+    ),
+    (
+        "gate only in a nested fn",
+        "    fn inner(conn: &Connection) -> Result<()> {\n        gate_storage_conn(conn)\n    }",
+        false,
+    ),
+    (
+        "gate in an uncalled closure",
+        "    let _later = || gate_storage_conn(conn);",
+        false,
+    ),
+    (
+        "gate in a braced closure",
+        "    let _later = move || {\n        gate_storage_conn(conn)\n    };",
+        false,
+    ),
+    (
+        "gate under a cfg attribute",
+        "    #[cfg(test)]\n    gate_storage_conn(conn)?;",
+        false,
+    ),
+    (
+        "gate behind a short circuit",
+        "    let _ = id.is_empty() && gate_storage_conn(conn).is_ok();",
+        false,
+    ),
+    (
+        "gate in an else branch",
+        "    if id.is_empty() {\n        let _ = 1;\n    } else {\n        gate_storage_conn(conn)?;\n    }",
+        false,
+    ),
+    (
+        "gate after a depth-1 return",
+        "    return Ok((false, false));\n    gate_storage_conn(conn)?;",
+        false,
+    ),
+    (
+        "gate inside a macro argument",
+        "    debug_assert!(gate_storage_conn(conn).is_ok());",
+        false,
+    ),
+];
+
+#[test]
+fn b7_gate_is_credited_only_where_it_runs_before_the_write_9414() {
+    let mut wrong = Vec::new();
+    for (label, body, credited) in B7_CONTROL_FLOW_ROWS_9414 {
+        let got = b7_try_verdict(&b7_plant(body), "w");
+        if got != Ok(*credited) {
+            wrong.push(format!("{label}: expected Ok({credited}), got {got:?}"));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "#9414 control-flow rows misjudged:\n  {}",
+        wrong.join("\n  ")
+    );
+}
+
+/// #9414 literal-form table: `(label, statement hiding a gate-looking text,
+/// statement with the same form and no gate text)`. The first must never be
+/// credited; the second, followed by a real gate, must be. `None` = the form
+/// cannot carry the gate text.
+const B7_LITERAL_FORM_ROWS_9414: &[(&str, Option<&str>, &str)] = &[
+    (
+        "string with escapes",
+        Some(r#"    let _ = "gate_storage_conn(conn)?; } \" {";"#),
+        r#"    let _ = "} \" {";"#,
+    ),
+    (
+        "raw string",
+        Some(r#"    let _ = r"gate_storage_conn(conn)?; }\";"#),
+        r#"    let _ = r"\";"#,
+    ),
+    (
+        "raw string with two #",
+        Some(r###"    let _ = r##"gate_storage_conn(conn)?; "# }"##;"###),
+        r###"    let _ = r##"" "# }"##;"###,
+    ),
+    (
+        "byte string",
+        Some(r#"    let _ = b"gate_storage_conn(conn)?; } \"";"#),
+        r#"    let _ = b"}\"";"#,
+    ),
+    (
+        "raw byte string",
+        Some(r##"    let _ = br#"gate_storage_conn(conn)?; }"#;"##),
+        r#"    let _ = br"\";"#,
+    ),
+    (
+        "C string",
+        Some(r#"    let _ = c"gate_storage_conn(conn)?; } \"";"#),
+        r#"    let _ = c"}\"";"#,
+    ),
+    (
+        "raw C string with #",
+        Some(r##"    let _ = cr#"gate_storage_conn(conn)?; }"#;"##),
+        r##"    let _ = cr#"\"#;"##,
+    ),
+    (
+        "raw C string ending in a backslash (9414 comment 6948153318)",
+        Some(r#"    let _ = cr"gate_storage_conn(conn)?; }\";"#),
+        r#"    let _ = cr"\";"#,
+    ),
+    ("char brace", None, "    let _ = '{';"),
+    ("char quote", None, "    let _ = '\"';"),
+    ("char escaped quote", None, r"    let _ = '\'';"),
+    ("byte char", None, "    let _ = b'\"';"),
+    ("lifetime", None, "    let _: &'static str = \"}\";"),
+    ("raw identifier", None, "    let r#match = \"}\";"),
+    (
+        "numbers",
+        None,
+        "    let _ = (1_000_u32, 0x1F, 1.5e-3, 2..3);",
+    ),
+    (
+        "line comment",
+        Some("    // gate_storage_conn(conn)?; }"),
+        "    // }",
+    ),
+    (
+        "nested block comment",
+        Some("    /* /* gate_storage_conn(conn)?; */ } */"),
+        "    /* /* } */ { */",
+    ),
+    (
+        "doc comment",
+        Some("    /// gate_storage_conn(conn)?; }"),
+        "    /// }",
+    ),
+];
+
+#[test]
+fn b7_literal_forms_never_hide_or_fake_a_gate_9414() {
+    let mut wrong = Vec::new();
+    for (label, hiding, plain) in B7_LITERAL_FORM_ROWS_9414 {
+        if let Some(h) = hiding {
+            let got = b7_try_verdict(&b7_plant(h), "w");
+            if got != Ok(false) {
+                wrong.push(format!("{label} (gate text in the form): got {got:?}"));
+            }
+        }
+        let real = format!("{plain}\n    gate_storage_conn(conn)?;");
+        let got = b7_try_verdict(&b7_plant(&real), "w");
+        if got != Ok(true) {
+            wrong.push(format!("{label} (real gate after the form): got {got:?}"));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "#9414 literal-form rows misjudged:\n  {}",
+        wrong.join("\n  ")
+    );
+}
+
+/// #9414 — forms the tokenizer cannot classify: `(label, statement, exact
+/// finding)`. Each is a finding naming the line (the plant's body starts on
+/// line 2), never skipped and never read as code.
+const B7_UNCLASSIFIABLE_ROWS_9414: &[(&str, &str, &str)] = &[
+    (
+        "reserved string prefix",
+        "    let _ = f\"gate_storage_conn(conn)\";",
+        "line 2: reserved literal prefix",
+    ),
+    (
+        "reserved guarded string",
+        "    let _ = #\"gate_storage_conn(conn)\"#;",
+        "line 2: reserved guarded string literal",
+    ),
+    (
+        "unterminated block comment",
+        "    /* gate_storage_conn(conn)?;",
+        "line 2: unterminated block comment",
+    ),
+    (
+        "char literal with two characters",
+        "    let _ = 'ab';",
+        "line 2: char literal with more than one character",
+    ),
+    (
+        "character outside the grammar",
+        "    let _ = `gate_storage_conn(conn)`;",
+        "line 2: unclassifiable character",
+    ),
+];
+
+#[test]
+fn b7_unclassifiable_form_is_a_finding_9414() {
+    let mut wrong = Vec::new();
+    for (label, stmt, finding) in B7_UNCLASSIFIABLE_ROWS_9414 {
+        let got = b7_try_verdict(&b7_plant(stmt), "w");
+        if got != Err((*finding).to_string()) {
+            wrong.push(format!("{label}: expected Err({finding:?}), got {got:?}"));
+        }
+    }
+    let hashes = "#".repeat(B7_RAW_HASH_OVER_LIMIT_9414);
+    let over = format!("    let _ = r{hashes}\"x\"{hashes};");
+    let got = b7_try_verdict(&b7_plant(&over), "w");
+    let want = "line 2: raw string delimiter has more than 255 #";
+    if got != Err(want.to_string()) {
+        wrong.push(format!(
+            "256 # raw string: expected Err({want:?}), got {got:?}"
+        ));
+    }
+    assert!(
+        wrong.is_empty(),
+        "#9414 unclassifiable rows misjudged:\n  {}",
+        wrong.join("\n  ")
+    );
+}
+
+/// #9414 — one more `#` than a raw string delimiter may carry (rustc: 255).
+const B7_RAW_HASH_OVER_LIMIT_9414: usize = 256;
+/// #9414 — size of the generated input of the linear bound.
+const B7_LINEAR_BOUND_BYTES_9414: usize = 100_000;
+/// #9414 — wall-clock ceiling for scanning that input (debug build).
+const B7_LINEAR_BOUND_CEILING_9414: std::time::Duration = std::time::Duration::from_secs(3);
+
+#[test]
+fn b7_scan_is_linear_on_a_100k_input_9414() {
+    // Every literal form, a deep brace nest, and a long quote run inside a
+    // raw string with many `#` (the shape that is quadratic in a naive
+    // closing-delimiter search).
+    let mut body = String::new();
+    let quotes = format!(
+        "    let _ = r{h}\"{q}\"{h};\n",
+        h = "#".repeat(200),
+        q = "\"#".repeat(400)
+    );
+    while body.len() < B7_LINEAR_BOUND_BYTES_9414 {
+        for (_, hiding, plain) in B7_LITERAL_FORM_ROWS_9414 {
+            body.push_str(hiding.unwrap_or(plain));
+            body.push('\n');
+        }
+        body.push_str(&quotes);
+        body.push_str("    { { { { let _ = '}'; } } } }\n");
+    }
+    body.push_str("    gate_storage_conn(conn)?;");
+    let src = b7_plant(&body);
+    assert!(
+        src.len() >= B7_LINEAR_BOUND_BYTES_9414,
+        "generated input too small"
+    );
+    let started = std::time::Instant::now();
+    let got = b7_try_verdict(&src, "w");
+    let took = started.elapsed();
+    assert_eq!(
+        got,
+        Ok(true),
+        "#9414 100K input: the trailing gate must be credited"
+    );
+    assert!(
+        took <= B7_LINEAR_BOUND_CEILING_9414,
+        "#9414 100K input took {took:?}, ceiling {B7_LINEAR_BOUND_CEILING_9414:?}"
+    );
+}
+
+#[test]
+fn b7_absent_fn_is_never_gated_9414() {
+    // Fail closed: a fn the scanner cannot find is not gated.
+    assert_eq!(
+        b7_try_verdict(&b7_plant("    gate_storage_conn(conn)?;"), "no_such_fn"),
+        Ok(false),
+        "#9414 an absent fn must read as ungated"
+    );
+}
