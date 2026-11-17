@@ -16,6 +16,8 @@ F. Every invocation prints its #6202 / #1492 notices, also when a gate red retur
    `cargo metadata` warns before the gated, summed fallback runs.
 G. A short row count after a non-zero rc (an invocation that ended before its gate) is one notice naming rc,
    k and N, no margin-class error, and the first failing rc unchanged; with rc 0 it stays the malformed red.
+H. No #9229 message carries text the interpreter or the standard library chose: one fixed reason per except
+   site for every member of its tuple, one exact gate-owned line per usage-error kind.
 
 The step harness runs the real step text with Python stubs for cargo and date (a frozen clock that the stub
 cargo advances by the planned seconds of each invocation) and the real suite_budget.py.
@@ -79,10 +81,24 @@ OVERFLOW_DIGITS = "9" * 5000  # past every integer bound and past Python's int s
 FLOAT_OVERFLOW = "9" * 400  # float() of it is inf
 NON_ASCII_DIGITS = "١٢"  # Arabic-Indic 12: int() accepts it, the gate must not
 NUL_BYTES = "\x00" * 64
-DEEP_JSON = "[" * 100_000  # the decoder answers RecursionError or JSONDecodeError, by interpreter and host
-# The two reasons the on-disk deep input may carry; the RecursionError branch is also forced on every interpreter
-# by test_the_recursion_branch_is_forced (a patched decoder), the JSONDecodeError branch by the NUL and empty rows.
-DEEP_JSON_REASONS = ("RecursionError", "JSONDecodeError")
+DEEP_JSON = "[" * 100_000  # the decoder raises RecursionError or JSONDecodeError, by interpreter and host
+# H. No #9229 message carries text the interpreter or the standard library chose (ruling b7d69f55): every except
+# site prints ONE fixed reason for every member of its tuple, and a usage error is one exact gate-owned line per
+# kind, so the deep input and a bad argument read the same on every runner image.
+JSON_REFUSED = "unreadable, not UTF-8, or not JSON within the decoder's depth"
+TEXT_REFUSED = "unreadable or not UTF-8"
+LOG_REFUSED = "cannot be opened or read"
+INTERNAL_ERROR_LINE = "::error::[#9229 margin] suite_budget: internal error; refusing to pass (#9229)\n"
+BAD_ARGS = "::error::[#9229 margin] suite_budget: malformed arguments: "
+INT_ARG_REFUSED = "argument %s: not an integer of at most 18 ASCII digits"
+ARG_REFUSED = "argument %s: missing, or not one of its allowed values"
+ARG_LIST_REFUSED = ("the argument list is not a suite_budget command line (a required argument is missing, or one is "
+                    "unknown)")
+# Exception names and messages the interpreter, the standard library or argparse choose.
+INTERPRETER_TEXT_RE = re.compile(
+    r"[A-Za-z]*(?:Error|Exception)\b|Errno|the following arguments are required|invalid choice|unrecognized "
+    r"arguments|expected one argument|usage:|Expecting value|invalid start byte|recursion depth|No such file|"
+    r"Permission denied|Is a directory|Input/output error|embedded null")
 HOSTILE_LINES = 120_000  # a 100K+ line input
 LONG_LINE_CHARS = 100_000  # one 100K-character line
 CORPUS_CEILING_SECS = 10.0  # linear work over the corpus; the quadratic YAML scalar regexes took minutes
@@ -517,7 +533,8 @@ def run_unjudged(step_text, n, k, rc):
     """(exit code, output, stub invocation count) of the real run_sqlite_full_suite of ``step_text``."""
     rcs, rows = unjudged_plan(n, k, rc)
     text = UNJUDGED_HARNESS % {"rcs": " ".join(map(str, rcs)), "rows": " ".join(map(str, rows)),
-                               "secs": UNJUDGED_ROW_SECS, "body": base.function_body(step_text, "run_sqlite_full_suite")}
+                               "secs": UNJUDGED_ROW_SECS,
+                               "body": base.function_body(step_text, "run_sqlite_full_suite")}
     code, out, _, _ = run_step(text, metadata_rc=0 if n == 4 else EXIT_TEST_FAILED)
     return code, out, len(re.findall(r"^stub invocation \d+: ", out, re.M))
 
@@ -593,6 +610,100 @@ class UnjudgedSum(unittest.TestCase):
                 self.assertEqual([l for l in out.splitlines() if l.startswith(MARGIN_ERROR_PREFIX)], [])
 
 
+def call_main(sb, argv):
+    """(rc, stdout + stderr) of sb.main(argv); a traceback or a SystemExit is reported as the rc."""
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        try:
+            rc = sb.main(argv)
+        except SystemExit as exc:
+            rc = "SystemExit %r" % (exc.code,)
+        except BaseException:  # a traceback is the defect under test
+            rc = "traceback: " + traceback.format_exc(limit=1).splitlines()[-1]
+    return rc, out.getvalue() + err.getvalue()
+
+
+class OddNameError(Exception):
+    """An exception class the gate has never seen: its name must not reach the backstop line."""
+
+
+# Members forced at each except site by a stub loader (class H). Each one carries the interpreter's own message.
+OPEN_FAILURES = (FileNotFoundError(2, "No such file or directory"), PermissionError(13, "Permission denied"),
+                 IsADirectoryError(21, "Is a directory"), OSError(5, "Input/output error"))
+TEXT_FAILURES = (UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"), ValueError("embedded null byte"))
+DECODE_FAILURES = (RecursionError("maximum recursion depth exceeded"), json.JSONDecodeError("Expecting value", "", 0),
+                   ValueError("Expecting value"))
+BACKSTOP_FAILURES = (KeyError("synthetic"), TypeError("unsupported operand"), RuntimeError("x"),
+                     ZeroDivisionError("division by zero"), OddNameError("x"))
+STUB_PATH = "stub-input.txt"  # never opened: the stub loader raises before any read
+SHARD_LINE = ("::warning::[#9229 margin] shard-args: cargo metadata %s cannot be read as JSON (%s); the full suite "
+              "runs unsharded (#9229)\n" % (STUB_PATH, JSON_REFUSED))
+PLAN_LINE = ("::error::[#9229 margin] whole-suite plan: malformed input: the workflow file cannot be read (%s); "
+             "refusing to pass (#9229)\n" % TEXT_REFUSED)
+GATE_LOG_LINE = ("::error::[#9229 margin] 'x': malformed gate input: log %s %s; refusing to pass (#9229)\n"
+                 % (STUB_PATH, LOG_REFUSED))
+PROFILE_LOG_LINE = "[#9229 margin] profile: log %s %s\n" % (STUB_PATH, LOG_REFUSED)
+SHARD_ARGV = ["shard-args", "--metadata", STUB_PATH]
+PLAN_ARGV = ["suite-plan", "--workflow", STUB_PATH, "--job", "check", "--node", "n", "--tier", "t"]
+GATE_LOG_ARGV = ["gate", "--label", "x", "--elapsed", str(SLOW), "--budget", str(BUDGET), "--rc", "0", "--log",
+                 STUB_PATH]
+GATE_OK = ["gate", "--label", "x", "--elapsed", "1", "--budget", str(BUDGET), "--rc", "0"]
+# (cell, argv, exact stdout + stderr): one line per usage-error kind, never argparse's wording.
+USAGE_CELLS = (
+    ("usage: integer refused", GATE_OK[:4] + ["ten"] + GATE_OK[5:], INT_ARG_REFUSED % "--elapsed"),
+    ("usage: integer past 18 digits", GATE_OK[:4] + [OVERFLOW_DIGITS] + GATE_OK[5:], INT_ARG_REFUSED % "--elapsed"),
+    ("usage: integer value missing", GATE_OK[:-1], INT_ARG_REFUSED % "--rc"),
+    ("usage: text value missing", ["gate", "--label"], ARG_REFUSED % "--label"),
+    ("usage: unknown subcommand", ["nope"], ARG_REFUSED % "cmd"),
+    ("usage: required arguments missing", ["gate", "--label", "x"], ARG_LIST_REFUSED),
+    ("usage: no subcommand", [], ARG_LIST_REFUSED),
+    ("usage: unknown option", GATE_OK + ["--bogus"], ARG_LIST_REFUSED),
+    ("usage: extra positional", ["profile", "--log", STUB_PATH, "extra"], ARG_LIST_REFUSED),
+)
+
+
+def interpreter_cells(sb):
+    """(cell, argv, exact output, patches): every member of every except tuple of suite_budget.py, forced by a
+    stub loader, and every usage-error kind on the real parser. The expected output is one fixed line."""
+    cells = []
+    for exc in OPEN_FAILURES:
+        stub = mock.patch.object(sb, "open", create=True, side_effect=exc)
+        name = type(exc).__name__
+        cells += [("shard-args open %s" % name, SHARD_ARGV, SHARD_LINE, stub),
+                  ("suite-plan open %s" % name, PLAN_ARGV, PLAN_LINE, stub),
+                  ("gate log open %s" % name, GATE_LOG_ARGV, GATE_LOG_LINE, stub),
+                  ("profile log open %s" % name, ["profile", "--log", STUB_PATH], PROFILE_LOG_LINE, stub)]
+    for exc in TEXT_FAILURES:
+        stub = mock.patch.object(sb, "_read_bounded", side_effect=exc)
+        name = type(exc).__name__
+        cells += [("shard-args text %s" % name, SHARD_ARGV, SHARD_LINE, stub),
+                  ("suite-plan text %s" % name, PLAN_ARGV, PLAN_LINE, stub)]
+    for exc in DECODE_FAILURES:
+        stub = (mock.patch.object(sb, "_read_bounded", return_value="{}"),
+                mock.patch.object(sb.json, "loads", side_effect=exc))
+        cells.append(("shard-args decode %s" % type(exc).__name__, SHARD_ARGV, SHARD_LINE, stub))
+    for exc in BACKSTOP_FAILURES:
+        stub = mock.patch.object(sb, "run_suite_sum", side_effect=exc)
+        cells.append(("backstop %s" % type(exc).__name__, ["suite-sum", "--expect", "1", "1\tlib"],
+                      INTERNAL_ERROR_LINE, stub))
+    for cell, argv, reason in USAGE_CELLS:
+        cells.append((cell, argv, BAD_ARGS + reason + "; refusing to pass (#9229)\n", ()))
+    return cells
+
+
+def interpreter_text_failures(sb):
+    """Names of the class H cells whose output is not exactly their one line, exit 2, free of interpreter text."""
+    failed = []
+    for cell, argv, expected, stubs in interpreter_cells(sb):
+        with contextlib.ExitStack() as stack:
+            for stub in (stubs if isinstance(stubs, tuple) else (stubs,)):
+                stack.enter_context(stub)
+            rc, out = call_main(sb, argv)
+        if rc != EXIT_MALFORMED or out != expected or INTERPRETER_TEXT_RE.search(out):
+            failed.append(cell)
+    return failed
+
+
 class InputTotality(unittest.TestCase):
     """Class C (F2): exit 0, 2 or 3 with a named reason for every input, never a traceback, in linear time."""
 
@@ -623,6 +734,7 @@ class InputTotality(unittest.TestCase):
             self.assertEqual(rc, rc_expected, out[-2000:])
             self.assertIn(reason, out)
             self.assertNotIn("internal error", out)  # the backstop is never what a corpus row reaches
+            self.assertNotRegex(out, INTERPRETER_TEXT_RE)
             self.assertLess(took, CORPUS_CEILING_SECS)
 
     def test_hostile_corpus(self):
@@ -657,14 +769,15 @@ class InputTotality(unittest.TestCase):
                 ("gate: float overflow in the log", gate + ["--elapsed", str(SLOW), "--log", str(Path(d) / "c.log")],
                  EXIT_MARGIN_LOST, "slowest binaries: tests/overflow_bin.rs 0s"),
                 ("gate: overflow digits", gate + ["--elapsed", OVERFLOW_DIGITS], EXIT_MALFORMED,
-                 bad_args + "argument --elapsed: not an integer of at most 18 ASCII digits: %r" % OVERFLOW_DIGITS[:40]),
+                 bad_args + INT_ARG_REFUSED % "--elapsed" + "; refusing to pass (#9229)"),
                 ("gate: non-ASCII digits", gate + ["--elapsed", NON_ASCII_DIGITS], EXIT_MALFORMED,
-                 bad_args + "argument --elapsed: not an integer of at most 18 ASCII digits: %r" % NON_ASCII_DIGITS),
+                 bad_args + INT_ARG_REFUSED % "--elapsed" + "; refusing to pass (#9229)"),
                 ("gate: empty integer", gate + ["--elapsed", ""], EXIT_MALFORMED,
-                 bad_args + "argument --elapsed: not an integer of at most 18 ASCII digits: ''"),
+                 bad_args + INT_ARG_REFUSED % "--elapsed" + "; refusing to pass (#9229)"),
                 ("gate: missing argument", ["gate", "--label", "x"], EXIT_MALFORMED,
-                 bad_args + "the following arguments are required: --elapsed, --budget, --rc"),
-                ("gate: unknown subcommand", ["nope"], EXIT_MALFORMED, bad_args + "argument cmd: invalid choice"),
+                 bad_args + ARG_LIST_REFUSED + "; refusing to pass (#9229)"),
+                ("gate: unknown subcommand", ["nope"], EXIT_MALFORMED,
+                 bad_args + ARG_REFUSED % "cmd" + "; refusing to pass (#9229)"),
                 ("gate: timer rc out of range", gate + ["--elapsed", "10", "--timer-rc", "7"], EXIT_MALFORMED,
                  "malformed gate input: the margin timer ended with rc 7 (143 when killed before its deadline, 3 "
                  "when it reported the lost margin)"),
@@ -674,9 +787,9 @@ class InputTotality(unittest.TestCase):
                 ("timer: zero budget", ["timer", "--label", "x", "--budget", "0"], EXIT_MALFORMED,
                  "malformed timer input: budget must be a positive integer of seconds, got 0"),
                 ("shard-args: NUL bytes", ["shard-args", "--metadata", self.write(d, "nul.json", NUL_BYTES)],
-                 EXIT_MALFORMED, "cannot be read as JSON (JSONDecodeError)"),
+                 EXIT_MALFORMED, "cannot be read as JSON (%s); the full suite runs unsharded" % JSON_REFUSED),
                 ("shard-args: empty", ["shard-args", "--metadata", self.write(d, "empty.json", "")], EXIT_MALFORMED,
-                 "cannot be read as JSON (JSONDecodeError)"),
+                 "cannot be read as JSON (%s); the full suite runs unsharded" % JSON_REFUSED),
                 ("shard-args: unhashable kind",
                  ["shard-args", "--metadata", self.write(d, "kind.json", json.dumps(base.metadata(
                      targets=[{"kind": [["lib"]], "name": "x", "test": True, "doctest": True}])))], EXIT_MALFORMED,
@@ -702,18 +815,17 @@ class InputTotality(unittest.TestCase):
             self.assert_deep_json_row(self.write(d, "deep.json", DEEP_JSON))
 
     def assert_deep_json_row(self, path):
-        """The deep input fails closed with exactly one of DEEP_JSON_REASONS: a full-line match, nothing looser."""
+        """The deep input fails closed with the ONE fixed reason on every interpreter: a full-line match."""
         argv = ["shard-args", "--metadata", path]
         start = time.monotonic()
         rc, out = self.call(argv)
         took = time.monotonic() - start
-        reasons = "|".join(re.escape(r) for r in DEEP_JSON_REASONS)
-        line = ("^::warning::\\[#9229 margin\\] shard-args: cargo metadata %s cannot be read as JSON \\((?:%s)\\); "
-                "the full suite runs unsharded \\(#9229\\)$" % (re.escape(path), reasons))
+        line = ("::warning::[#9229 margin] shard-args: cargo metadata %s cannot be read as JSON (%s); the full suite "
+                "runs unsharded (#9229)" % (path, JSON_REFUSED))
         with self.subTest(row="shard-args: deep JSON"):
             self.assertEqual(rc, EXIT_MALFORMED, out[-2000:])
-            self.assertRegex(out, re.compile(line, re.M))
-            self.assertNotIn("internal error", out)
+            self.assertEqual(out.splitlines(), [line])
+            self.assertNotRegex(out, INTERPRETER_TEXT_RE)
             self.assertLess(took, CORPUS_CEILING_SECS)
 
     def test_the_recursion_branch_is_forced(self):
@@ -721,8 +833,11 @@ class InputTotality(unittest.TestCase):
             path = self.write(d, "ok.json", json.dumps(base.metadata()))
             with mock.patch.object(self.sb.json, "loads", side_effect=RecursionError):
                 self.assert_row("shard-args: decoder recursion", ["shard-args", "--metadata", path], EXIT_MALFORMED,
-                                "cargo metadata %s cannot be read as JSON (RecursionError); the full suite runs "
-                                "unsharded (#9229)" % path)
+                                "cargo metadata %s cannot be read as JSON (%s); the full suite runs "
+                                "unsharded (#9229)" % (path, JSON_REFUSED))
+
+    def test_every_except_member_and_usage_kind_is_one_fixed_line(self):
+        self.assertEqual(interpreter_text_failures(self.sb), [])
 
     def test_size_bound_refuses_larger_inputs(self):
         with base.scratch() as d:
@@ -767,8 +882,7 @@ class InputTotality(unittest.TestCase):
         finally:
             self.sb.run_suite_sum = saved
         self.assertEqual(rc, EXIT_MALFORMED)
-        self.assertEqual(out, "::error::[#9229 margin] suite_budget: internal error (KeyError); refusing to pass "
-                              "(#9229)\n")
+        self.assertEqual(out, INTERNAL_ERROR_LINE)
 
 
 REAL_TIME_BUDGET = 5  # WATCHDOG_SECS of the real-time boundary run: margin deadline 4 s

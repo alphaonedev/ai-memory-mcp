@@ -184,14 +184,14 @@ class GateCli(unittest.TestCase):
         self.assertEqual(rc, 2)
         self.assertEqual(err, "")
         self.assertEqual(out, "::error::[#9229 margin] suite_budget: malformed arguments: argument --elapsed: not an "
-                              "integer of at most 18 ASCII digits: 'ten'; refusing to pass (#9229)\n")
+                              "integer of at most 18 ASCII digits; refusing to pass (#9229)\n")
 
     def test_unreadable_log_or_bad_offset_on_a_lost_margin_is_malformed(self):
         with scratch() as d:
             log = Path(d) / "short.log"
             log.write_text("x\n", encoding="utf-8")
             rows = (
-                (("--log", str(Path(d) / "absent.log")), "cannot be read (FileNotFoundError)"),
+                (("--log", str(Path(d) / "absent.log")), "absent.log cannot be opened or read; refusing to pass"),
                 (("--log", str(log), "--log-offset", "99"), "log offset 99 is past the end of"),
                 (("--log", str(log), "--log-offset", "-1"), "log offset must be a non-negative integer, got -1"),
             )
@@ -473,8 +473,8 @@ class ShardArgs(unittest.TestCase):
             rc, out, _ = run_main(self.sb, ["shard-args", "--metadata", str(good)])
             self.assertEqual(rc, 0)
             self.assertEqual(out.splitlines(), DEFAULT_SHARD)
-            for body, words in (("", "cannot be read as JSON (JSONDecodeError)"), ("{", "cannot be read as JSON"),
-                                (None, "cannot be read as JSON (FileNotFoundError)")):
+            refused = "cannot be read as JSON (unreadable, not UTF-8, or not JSON within the decoder's depth); the full"
+            for body, words in (("", refused), ("{", refused), (None, refused)):
                 bad = Path(d) / "bad.json"
                 if bad.exists():
                     bad.unlink()
@@ -607,7 +607,7 @@ class WholeSuite(unittest.TestCase):
 
     def test_absent_or_unreadable_job_timeout_is_named_never_a_pass(self):
         rows = (
-            (None, {}, "the workflow file cannot be read (FileNotFoundError)"),
+            (None, {}, "the workflow file cannot be read (unreadable or not UTF-8)"),
             ("jobs:\n  lint:\n    timeout-minutes: 5\n", {}, "the workflow has no job 'check'"),
             ("check:\n  timeout-minutes: 5\n", {}, "the workflow has no job 'check'"),
             (workflow().replace("    timeout-minutes: ${{ matrix.timeout }}\n", ""), {},
@@ -640,7 +640,7 @@ class WholeSuite(unittest.TestCase):
             rc, out, _ = run_main(self.sb, ["suite-plan", "--workflow", str(bad), "--job", "check", "--node",
                                             "ubuntu-latest", "--tier", "sqlite"])
             self.assertEqual(rc, 2)
-            self.assertIn("malformed input: the workflow file cannot be read (UnicodeDecodeError)", out)
+            self.assertIn("malformed input: the workflow file cannot be read (unreadable or not UTF-8); refusing", out)
 
 
 def function_body(text, name):
