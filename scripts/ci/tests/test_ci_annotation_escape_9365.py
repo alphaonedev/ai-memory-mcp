@@ -1214,6 +1214,34 @@ NON_GATE_LOAD_EXIT_CODES = {
     # this cell gave rc 2 "pg_isolated_binary: set AI_MEMORY_TEST_POSTGRES_URL (or pass --url for local admin use)"
     # for every kind; a failed load surfaced only at the first annotation, by traceback or a silent sys.exit(0)
     "scripts/test/pg_isolated_binary.py": 4,
+    # 0 clean, 1 findings or a bad report. Not BASE: the script wrote fd 1/2 with print and had no shared-module load (#9365 lane b)
+    "scripts/ci/check_cargo_audit.py": 3,
+    # 0 clean, 1 open alerts or an unreadable listing, 2 argparse usage. Not BASE: the script wrote fd 1/2 with print and had no shared-module load (#9365 lane b)
+    "scripts/ci/check_codeql_alerts.py": 3,
+    # 0 clean, 1 problems, 2 argparse usage. Not BASE: the script wrote fd 1/2 with print and had no shared-module load (#9365 lane b)
+    "scripts/ci/check_debt_doc_anchors.py": 3,
+    # 0 clean, 1 findings, 2 usage. Not BASE: the script wrote fd 1/2 with print and had no shared-module load (#9365 lane b)
+    "scripts/ci/check_docs_private_paths.py": 3,
+    # 0 ok, 1 hits, 2 usage, 3 stale allow list. Not BASE: the script wrote fd 1/2 with print and had no shared-module load (#9365 lane b)
+    "scripts/ci/check_no_cn_ai_vendor.py": 4,
+    # 0 clean, 1 findings or a bad report, 2 argparse usage. Not BASE: the script wrote fd 1/2 with print and had no shared-module load (#9365 lane b)
+    "scripts/ci/check_npm_audit.py": 3,
+    # 0 clean, 1 violations, 2 argparse usage. Not BASE: the script wrote fd 1/2 with print and had no shared-module load (#9365 lane b)
+    "scripts/ci/check_pg_isolate_invariants.py": 3,
+    # 0 clean, 1 problems, 2 argparse usage. Not BASE: the script wrote fd 1/2 with print and had no shared-module load (#9365 lane b)
+    "scripts/ci/check_pg_preflight_workflows.py": 3,
+    # 0 no ids, 1 suspected ids, 2 input/output error or argparse usage. Not BASE: the script wrote fd 1/2 with print and had no shared-module load (#9365 lane b)
+    "scripts/ci/check_pr_body_ids.py": 3,
+    # 0 ok, 1 self-test failed, 2 environment, 3 fixture present. Not BASE: the script wrote fd 1/2 with print and had no shared-module load (#9365 lane b)
+    "scripts/ci/check_test_env_lock_harness.py": 4,
+    # 0 classified (or none), 2 argparse usage. Not BASE: the script wrote fd 1/2 with print and had no shared-module load (#9365 lane b)
+    "scripts/ci/ci_failure_class.py": 3,
+    # 0 available, 1 unavailable, 2 bad input, 127/128+n child or signal. Not BASE: the script wrote fd 1/2 with print and had no shared-module load (#9365 lane b)
+    "scripts/ci/ensure-age-extension.py": 3,
+    # 0 ok, 1 match, 2 defect. Not BASE: the script wrote fd 1/2 with print and had no shared-module load (#9365 lane b)
+    "scripts/ci/manifest_owned_paths.py": 3,
+    # 0 ok, 65 refused, 70 tool failure, 2 argparse usage. Not BASE: the script wrote fd 1/2 with print and had no shared-module load (#9365 lane b)
+    "scripts/ci/pr_retarget_check.py": 3,
 }
 # setup --emit-env sends stdout into $GITHUB_ENV: the refusal goes to stderr there, never into the env file
 SIBLING_LOAD_ERROR_TO_STDERR = frozenset({"scripts/test/pg_isolated_binary.py"})
@@ -1331,7 +1359,7 @@ class SiblingLoadFailsClosed(unittest.TestCase):
     def test_failed_load_of_any_kind_fails_each_sibling_closed_9365(self):
         if os.geteuid() == 0:
             self.skipTest("root reads a mode-0 file")
-        self.assertEqual(len(NON_GATE_LOAD_EXIT_CODES), 8)
+        self.assertEqual(len(NON_GATE_LOAD_EXIT_CODES), 22)
         for rel in NON_GATE_LOAD_EXIT_CODES:
             for kind in SIBLING_LOAD_BREAKS:
                 for label, flags in PYTHON_FLAG_SETS:
@@ -1702,6 +1730,15 @@ V1_ENV_FILE_EXACT = {"##[error]x\n": "##[error]x "}  # a KEY=value file line kee
 V1_FILE_ONLY_FUNCTIONS = frozenset({"env_file_value"})
 
 
+def emitted_lines(write, stream="stdout"):
+    """The lines ``write()`` puts on ``stream`` through the module's emitters, split at line feeds only."""
+    buffer = io.StringIO()
+    redirect = contextlib.redirect_stdout if stream == "stdout" else contextlib.redirect_stderr
+    with redirect(buffer):
+        write()
+    return buffer.getvalue().split("\n")
+
+
 def runner_would_parse(line):
     """True when the runner rule above reads ``line`` as a workflow command (v2 by Python's wider lstrip set)."""
     return line.lstrip().startswith("::") or V1_PREFIX in line
@@ -1731,6 +1768,15 @@ class V1FormNeutralised(unittest.TestCase):
                                       wa.annotation("error", wa.render("##{v}", v=v))], ("::warning", "::error")),
             "end_group_line": (lambda v: [wa.end_group_line()], ("::endgroup::",)),
             "env_file_value": (lambda v: [wa.env_file_value(v)], None),
+            # the checked-raw-write form (#9365 lane b): the text a script writes itself, every line neutralised
+            "neutral_lines": (lambda v: wa.neutral_lines(v + "\n" + v + "\n").splitlines(), None),
+            # the stream emitters (#9365 lane b): every written line, split at the real line feeds they keep
+            "emit_to": (lambda v: emitted_lines(lambda: wa.emit_to(sys.stdout, v, "t", sep=v, end=v)), None),
+            "out": (lambda v: emitted_lines(lambda: wa.out(v, end=v)), None),
+            "err": (lambda v: emitted_lines(lambda: wa.err(v, v), stream="stderr"), None),
+            "main": (lambda v: emitted_lines(lambda: (wa.main(["log", "--message=" + v]),
+                                                      wa.main(["warning", "--title=" + v, "--message=" + v]))),
+                     ("::warning",)),
         }
 
     def corpus(self):
@@ -1807,7 +1853,7 @@ class V1FormNeutralised(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------------------------------------------
-# Stream ratchet (#9365 r2): in the 14 scripts every print()/sys.std*.write() argument is a literal, a shared-module
+# Stream ratchet (#9365 r2): in every STREAM_SCRIPTS script every print()/sys.std*.write() argument is a literal, a shared-module
 # call, or a value the AST can trace to one. The runner parses ``##[`` anywhere in a stdout or stderr line, so a raw
 # variable in any printed line is a command carrier. Exempt: the canonical load try (it runs before the module
 # exists; LoaderShape pins its exact AST and its only variable is an identifier-checked type name).
@@ -1819,13 +1865,14 @@ STREAM_SCRIPTS = tuple(sorted(set(GATE_LOAD_EXIT_CODES) | set(NON_GATE_LOAD_EXIT
 STREAM_SHARED_CALLS = SHARED_FIELD_FUNCTIONS | {"safe_value", "render", "join", "end_group_line"}
 STREAM_NUMBER_CALLS = frozenset({"len", "int", "float", "round", "abs"})  # return a number for any argument
 STREAM_TRACE_DEPTH = 6
-STREAM_SCRIPT_COUNT = 14
+STREAM_SCRIPT_COUNT = 28  # 14 at 6007d779, then the 14 scripts outside scripts/ci/impact routed in #9365 PR-1a
 STREAM_MODULE_VARS = frozenset({"wa"})  # the name every script binds the loaded module to
 # Runs before the shared module exists, so it cannot use it; each output is fixed text pinned by its own test:
 # prune_runner_tmp's floor check (VERSION_REFUSAL_AT_0F1EC1B7 cells) and load refusal (SiblingLoadFailsClosed, P1).
 STREAM_PRELOAD_FUNCTIONS = {"scripts/ci/prune_runner_tmp.py": frozenset({"load_refused"}),
                             "scripts/ci/partition_test_binaries.py": frozenset({"require_workflow_annotation"}),
-                            "scripts/ci/shared_cargo_target.py": frozenset({"require_workflow_annotation"})}
+                            "scripts/ci/shared_cargo_target.py": frozenset({"require_workflow_annotation"}),
+                            "scripts/ci/ensure-age-extension.py": frozenset({"require_workflow_annotation"})}
 STREAM_PRELOAD_GUARD_CALL = "python_refusal"  # a module-level ``if`` that calls it is the floor check
 
 
@@ -2016,7 +2063,7 @@ def stream_violations(rel, source):
 
 
 class StreamRatchet(unittest.TestCase):
-    def test_the_fourteen_scripts_print_only_traceable_text_9365(self):
+    def test_the_routed_scripts_print_only_traceable_text_9365(self):
         self.assertEqual(len(STREAM_SCRIPTS), STREAM_SCRIPT_COUNT)
         found = []
         for rel in STREAM_SCRIPTS:
@@ -2024,7 +2071,7 @@ class StreamRatchet(unittest.TestCase):
         self.assertEqual(found, [], "\n".join(found))
 
     def test_the_ratchet_catches_a_raw_print_in_every_script_9365(self):
-        """Mutant per script: one raw print of a variable carrying ``##[`` is a violation in each of the 14."""
+        """Mutant per script: one raw print of a variable carrying ``##[`` is a violation in each STREAM_SCRIPTS row."""
         for rel in STREAM_SCRIPTS:
             source = (REPO / rel).read_text(encoding="utf-8")
             for label, extra in (("print", "\ndef _mut9365(value):\n    print(value)\n\n_mut9365('##[error]x')\n"
@@ -2993,8 +3040,9 @@ class DeferredLoadOfImportedScripts(unittest.TestCase):
 # by hasattr and by getattr with a default, a silent fallback after a forgotten load).
 SENTINEL_CLASS_NAME = "_NotLoaded"
 SENTINEL_VARIABLE = "wa"
-SENTINEL_SCRIPTS = {"scripts/ci/partition_test_binaries.py": frozenset({"annotation", "log_line"}),
-                    "scripts/ci/shared_cargo_target.py": frozenset({"env_file_value", "log_line"})}
+SENTINEL_SCRIPTS = {"scripts/ci/partition_test_binaries.py": frozenset({"annotation", "err", "log_line", "out"}),
+                    "scripts/ci/shared_cargo_target.py": frozenset({"env_file_value", "err", "log_line", "out"}),
+                    "scripts/ci/ensure-age-extension.py": frozenset({"err", "out"})}
 SENTINEL_MEMBER_KIND = "method"  # every use of ``wa.<name>`` in both scripts is a call, so every member is a method
 SENTINEL_MESSAGE = ("workflow_annotation.py is not loaded; call require_workflow_annotation() first (wanted %s)")
 SENTINEL_ABSENT_NAME = "no_such_name_9365"
