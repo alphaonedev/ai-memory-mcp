@@ -38,7 +38,9 @@ Fail closed (exit 2, ``::error::`` on stderr) when:
   lib Postgres test would otherwise run in a parallel shard against the shared
   database);
 * a target name contains a character outside ``[A-Za-z0-9_.-]`` (the shell
-  consumer word-splits the lines).
+  consumer word-splits the lines);
+* the shared ``workflow_annotation.py`` next to this file cannot be loaded (the
+  fixed ``::error`` line then goes to stdout and the cause to stderr, #9365).
 
 Python 3.9+, standard library only.
 """
@@ -49,6 +51,74 @@ import os
 import re
 import sys
 from pathlib import Path
+
+
+def _load_workflow_annotation():
+    """The shared module at WA_RELATIVE_PATH from this file's real directory, by path only, never through
+    sys.path; every name in WA_REQUIRED must be a callable of it (#9365, one shape in every script)."""
+    import importlib.util
+    import os
+    path = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), WA_RELATIVE_PATH))
+    loaded = sys.modules.get("workflow_annotation")
+    if loaded is not None and os.path.realpath(getattr(loaded, "__file__", None) or "") == path:
+        module = loaded
+    else:
+        spec = importlib.util.spec_from_file_location("workflow_annotation", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)  # absent, unreadable or broken: it raises here, the try below catches it
+    missing = [name for name in WA_REQUIRED if not callable(getattr(module, name, None))]
+    if missing:
+        raise AttributeError("workflow_annotation.py lacks " + ", ".join(missing))
+    if loaded is None:
+        sys.modules["workflow_annotation"] = module
+    return module
+
+
+EXIT_FAIL_CLOSED = 2  # every fail-closed condition, a shared module that cannot be loaded included
+
+# The one shared-module load shape of scripts/ (#9365, ruling bcd0a15c; LoaderShape pins it).
+WA_PROG = "partition_test_binaries"
+WA_RELATIVE_PATH = "workflow_annotation.py"
+WA_REQUIRED = ("annotation", "log_line")
+WA_EXIT_LOAD_REFUSED = EXIT_FAIL_CLOSED  # the gate's own refusal code, unchanged
+WA_ERROR_TO_STDERR = False
+
+
+class SharedModuleNotLoadedError(RuntimeError):
+    """A function that needs workflow_annotation.py ran before require_workflow_annotation() loaded it."""
+
+
+class _NotLoaded:
+    """The state of ``wa`` until the load ran: one explicit member per name this script uses from the shared module
+    (a test pins the set against the ast), each a named error, never a half-working helper. No __getattr__, so
+    hasattr and getattr with a default cannot turn a forgotten load into a silent fallback."""
+
+    _WANTED = ("workflow_annotation.py is not loaded; call require_workflow_annotation() "
+              "first (wanted %s)")
+
+    def annotation(self, *args, **kwargs):
+        raise SharedModuleNotLoadedError(self._WANTED % "annotation")
+
+    def log_line(self, *args, **kwargs):
+        raise SharedModuleNotLoadedError(self._WANTED % "log_line")
+
+
+wa = _NotLoaded()
+
+
+def require_workflow_annotation():
+    """Load the shared module into ``wa`` or refuse: main calls it before any work, so importing prints nothing."""
+    global wa
+    try:
+        wa = _load_workflow_annotation()
+    except (Exception, SystemExit) as exc:  # any failed load: one fixed line built without the module, then exit
+        wa_cause = type(exc).__name__
+        print("%s: refused: shared module workflow_annotation.py next to the script cannot be loaded (%s)"
+              % (WA_PROG, wa_cause if wa_cause.isidentifier() else "BaseException"), file=sys.stderr, flush=True)
+        print("::error title=partition_test_binaries refused::partition_test_binaries: refused: shared module workflow_annotation.py"
+              " next to the script cannot be loaded",
+              file=sys.stderr if WA_ERROR_TO_STDERR else sys.stdout, flush=True)
+        sys.exit(WA_EXIT_LOAD_REFUSED)
 
 # Class (a) evidence. Scout report CI-SHARD-SCOUT-2026-10-09, plus the shared
 # lane-database helpers under tests/common that only Postgres cells use.
@@ -1304,11 +1374,11 @@ def run(args):
                     for e in exes if e.kind != 'lib'},
     }
     (out_dir / 'manifest.json').write_text(json.dumps(manifest, indent=1, sort_keys=True) + '\n')
-    print('[#6344] shards: serial=%d parallel_1=%d parallel_2=%d of %d executables; '
+    print(wa.log_line('[#6344] shards: serial=%d parallel_1=%d parallel_2=%d of %d executables; '
           'estimate serial=%.0fs parallel=%.0fs/%.0fs (per-binary min(tests, 3) threads; ideal %.0fs/%.0fs)'
           % (manifest['counts']['serial'], manifest['counts']['parallel_1'], manifest['counts']['parallel_2'],
              len(exes), totals['serial'], totals['parallel_1_est'], totals['parallel_2_est'],
-             totals['parallel_1'] / 3, totals['parallel_2'] / 3))
+             totals['parallel_1'] / 3, totals['parallel_2'] / 3)))
     return 0
 
 
@@ -1326,12 +1396,13 @@ def build_parser():
 
 
 def main(argv=None):
+    require_workflow_annotation()
     args = build_parser().parse_args(argv)
     try:
         return run(args)
     except PartitionError as exc:
-        print('::error::[#6344 shard] %s' % exc, file=sys.stderr)
-        return 2
+        print(wa.annotation("error", "[#6344 shard] %s" % exc), file=sys.stderr)
+        return EXIT_FAIL_CLOSED
 
 
 if __name__ == '__main__':

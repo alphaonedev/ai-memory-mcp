@@ -1,0 +1,24 @@
+name: Prune runner TMPDIR (#8634)
+description: >-
+  Self-hosted runners only (the caller gates it with runner.environment ==
+  'self-hosted'). Removes direct entries of this runner's own TMPDIR whose mtime
+  is older than one day (scripts/ci/prune_runner_tmp.py); never follows a
+  symlink and never touches another runner's directory. A refusal (TMPDIR
+  unset, relative, a symlink, not owned by the user, not named runner-<digits>,
+  outside the confirmed runner roots) prints a ::warning annotation with the
+  reason, deletes nothing and does not fail the job or skip the steps after it
+  (ruling f23a9ae4). A per-entry removal failure does not fail the job: the step
+  exits 0, prints pruned=<n> kept=<n> failed=<n> freed_bytes=<n> skipped=<n> and
+  one ::warning annotation with the count and the first 5 names (escaped; the
+  line states when the list is cut) (ruling 7af294fb). A tree over the depth or
+  entry bound is one counted failure, counted before anything under it is
+  removed; a mount point is never entered. The platform check makes one real
+  descriptor-relative call of each needed function in a probe directory it
+  removes again. The prune-facts line also goes to the job summary. An
+  unexpected error fails the job.
+runs:
+  using: composite
+  steps:
+    - name: Prune stale TMPDIR entries
+      shell: bash
+      run: python3 -I "${GITHUB_ACTION_PATH}/../../../scripts/ci/prune_runner_tmp.py"

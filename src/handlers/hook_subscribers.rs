@@ -1086,6 +1086,21 @@ pub async fn get_namespace_standard_qs(
         .await;
     };
 
+    // #9355 (v1.0.0, #2032-A / H1 IDOR) — the same per-agent-key identity gate
+    // as set/clear (`set_namespace_standard_inner`, `clear_namespace_standard_inner`)
+    // BEFORE the visibility caller is resolved below. Under `enforce` a
+    // shared-key `Claimed` caller naming `X-Agent-Id: <victim>` was served the
+    // victim's `scope=private` standard. All three GET forms (path, qs, inherit)
+    // route through here. Inert for zero-config deployments.
+    if let Some(resp) = crate::handlers::identity_binding::enforce_idor_identity(
+        &app.enrolled_agent_keys,
+        app.http_identity_mode,
+        &headers,
+        "namespace_get_standard",
+    ) {
+        return resp;
+    }
+
     // v1.0.0 #2543 / #959 residual — explicit HTTP fetch of a namespace
     // standard is gated through the SAME canonical
     // `visibility::is_visible_to_caller` predicate as #2537 injection and
@@ -1488,14 +1503,20 @@ pub async fn session_start(
     // the enrolled-keys map, hence the `State<AppState>` signature (was
     // `State<Db>`, which cannot reach `enrolled_agent_keys`). Inert for
     // zero-config deployments.
-    if let Some(resp) = crate::handlers::identity_binding::enforce_idor_identity(
+    //
+    // #8947 — the gate also returns the principal it judged, and that principal
+    // (not the raw header string) is the visibility caller below: an empty
+    // header resolves to `anonymous:req-<uuid>` for the gate, so acting as `""`
+    // afterwards would be a second, unjudged principal.
+    let header_caller = match crate::handlers::identity_binding::admit_idor_identity(
         &app.enrolled_agent_keys,
         app.http_identity_mode,
         &headers,
         "session_start",
     ) {
-        return resp;
-    }
+        Ok(caller) => caller,
+        Err(refusal) => return refusal,
+    };
     let header_agent_id = headers
         .get(crate::HEADER_AGENT_ID)
         .and_then(|v| v.to_str().ok());
@@ -1520,10 +1541,37 @@ pub async fn session_start(
         )
             .into_response();
     }
-    let caller = header_agent_id
-        .map(str::to_string)
-        .or_else(|| body.agent_id.clone())
-        .unwrap_or_else(crate::identity::anonymous_request_id);
+    // #8947 — a body-only `agent_id` becomes the visibility caller when no
+    // header is sent, and `enforce_idor_identity` above reads only the header.
+    // Hold the body principal to the same proof as a header principal:
+    // refuse it (403 `attested_identity_required`) unless the presented key
+    // is bound to that agent. decision: refuse over ignore because the
+    // header leg already refuses and the caller learns its request was wrong.
+    if let Some(b) = body.agent_id.as_deref()
+        && let Some(resp) = crate::handlers::identity_binding::enforce_for_request(
+            &app.enrolled_agent_keys,
+            app.http_identity_mode,
+            &headers,
+            b,
+            "session_start",
+        )
+    {
+        return resp;
+    }
+    // #8947 — precedence header → body → anonymous, where "header" is the
+    // gate-resolved principal. Only a request that sends no header (or an empty
+    // one) and a body `agent_id` acts as the body principal, which the body leg
+    // above already held to key proof. decision: visibility caller = the
+    // gate-resolved principal over a 400 for an empty header, because the gate
+    // already resolves empty to anonymous and one resolution point cannot
+    // disagree with itself (conductor ruling f8e1e39a).
+    let caller = match (
+        header_agent_id.filter(|h| !h.is_empty()),
+        body.agent_id.clone(),
+    ) {
+        (None, Some(body_caller)) => body_caller,
+        _ => header_caller,
+    };
     let mut params = json!({});
     if let Some(ref n) = body.namespace {
         params["namespace"] = json!(n);

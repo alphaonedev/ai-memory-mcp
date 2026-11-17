@@ -88,6 +88,139 @@ the cert SANs, catching a misrouted/MITM'd connection, not merely an untrusted o
   `brew install rust` — see §9. Host-specific paths and runner service names
   are operator-local, not published here.
 
+### 3.3 Runner `TMPDIR` prune (#8634)
+
+Tests create databases, WAL files and migration backups under the runner's
+`TMPDIR`, and a persistent runner never discards them. Every self-hosted job
+therefore runs the composite action `.github/actions/prune-runner-tmp` as the
+step right after checkout (guarded by `runner.environment == 'self-hosted'`),
+which runs `scripts/ci/prune_runner_tmp.py` with these rules:
+
+- Only DIRECT entries of the resolved `TMPDIR` whose own mtime (lstat, never a
+  symlink target) is older than one day (`MAX_AGE_SECS`) are removed. An old
+  directory goes whole, whatever its children's mtimes. A symlink is unlinked
+  and never followed, so a sibling `runner-N` directory is never touched.
+- TMPDIR is proven, by file identity (device and inode of the opened
+  directory, never by path text), to be `<runner root>/runner-<digits>`: the
+  last component must match `runner-<digits>` and the directory's parent must be
+  one of the confirmed runner roots in `ALLOWED_ROOTS` (each a named constant
+  in the script with the run that confirmed it; there is no override flag). The
+  directory is opened once with `O_NOFOLLOW` and every check and every removal
+  goes through that one descriptor. No f1 root is in the table until its
+  `prune-facts:` line is quoted, so on f1 the step refuses visibly.
+- Before anything is made or opened under TMPDIR, its descriptor must be on
+  the mount of its runner root's descriptor (the `..` of TMPDIR): the same
+  device on every platform, and on Linux also the same `mnt_id:`. A directory
+  or volume mounted over `runner-<digits>` still has the root as its `..`, so
+  the root identity alone does not prove it. A different or unreadable mount
+  is a refusal that is also one counted failure (`failed=1`).
+- Only Linux and macOS (`sys.platform` exactly `linux` or `darwin`) can
+  prove mount identity; on any other platform the step refuses and counts one
+  failure.
+- Removal is an iterative, descriptor-relative walk (no recursion, no
+  `shutil.rmtree`), one open directory at a time, with an identity re-check
+  right before each entry is entered. A tree deeper than `MAX_TREE_DEPTH`
+  levels or with more than `MAX_TREE_ENTRIES` entries is one counted failure,
+  counted before anything under it is removed (a first pass counts, the second
+  removes; a tree that grows past a bound between the two passes stops there,
+  partly removed, and is one counted failure). A directory on another device,
+  or on Linux on another mount than `TMPDIR` (the `mnt_id:` line of
+  `/proc/self/fdinfo/<fd>`, so a bind mount of the same device is caught too),
+  is skipped, reported and never entered. Every place it does not enter, at
+  the top level or below it, is one `skipped` line and one counted failure of
+  its top-level entry, so it is in the `::warning` annotation; a mount id that
+  cannot be read is the same. On macOS there is no
+  `/proc` and the standard library has no mount id, so the device check is the
+  strongest one there.
+- The platform check is functional: inside the proven directory the script
+  makes a probe directory `.prune-probe-<pid>-<hex>` and a file in it, and
+  makes one real descriptor-relative call of each needed function (`os.mkdir`,
+  `os.open`, `os.lstat`, `os.scandir`, `os.unlink`, `os.rmdir`). The refusal
+  names the first call that fails. The probe removes what it made, also under
+  `--dry-run`; a probe it cannot remove is named on stderr. When the probe
+  cannot write because the disk is full, over quota or read-only (`ENOSPC`,
+  `EDQUOT`, `EROFS`), it probes again without creating anything: each needed
+  function must be in `os.supports_dir_fd` (`os.stat` also in
+  `os.supports_follow_symlinks`, `os.scandir` in `os.supports_fd`), and lstat,
+  unlink and rmdir of a name that does not exist must answer `ENOENT`. The
+  stderr line `probe cannot write (<why>); the read-only probe passed, pruning
+  goes on` names it and the prune runs, because a full disk is the case the
+  step exists for.
+- The `prune-facts:` line also goes to the job summary (`GITHUB_STEP_SUMMARY`)
+  when that is set, escaped the same way; a summary it cannot write is named on
+  stderr and changes no exit code.
+- Every input it cannot prove ends in a named refusal with nothing deleted. A
+  refusal prints a `::warning` annotation with the escaped reason (and the same
+  line on stderr) and the step still exits 0: it does not fail the job and does
+  not skip the steps after it, because a housekeeping step must never take down
+  the required checks. The reasons, each pinned by a test against the code:
+
+- refusal: `python <found> is older than <wanted>`
+- refusal: `this platform lacks a working descriptor-relative call: <call> raised <error> (<why>)`
+- refusal: `the mount id of TMPDIR cannot be read: <why>`
+- refusal: `TMPDIR is not on its runner root's mount: <path>`
+- refusal: `this platform cannot verify mount identity: <platform>`
+- refusal: `allowed root is not an absolute path: <root>`
+- refusal: `allowed root is '/'`
+- refusal: `TMPDIR is unset`
+- refusal: `TMPDIR is empty`
+- refusal: `TMPDIR is not an absolute path: <path>`
+- refusal: `TMPDIR does not exist: <path> (<why>)`
+- refusal: `TMPDIR is a symlink: <path>`
+- refusal: `TMPDIR is not a directory: <path>`
+- refusal: `TMPDIR cannot be opened: <path> (<why>)`
+- refusal: `TMPDIR changed while it was opened: <path>`
+- refusal: `TMPDIR resolves elsewhere than its normalized path: <path>`
+- refusal: `TMPDIR is a forbidden path: <path>`
+- refusal: `TMPDIR is not owned by the current user: <path>`
+- refusal: `TMPDIR is not named runner-<digits>: <name>`
+- refusal: `TMPDIR is outside the allowed roots <roots>: <path>`
+- refusal: `TMPDIR contains the home directory or the workspace: <path>`
+
+- A failure on one entry (permission, vanished, busy, over a bound) is counted
+  and printed but does not fail the job: the step exits 0 with
+  `pruned=<n> kept=<n> failed=<n> freed_bytes=<n> skipped=<n>` and one
+  `::warning` annotation `failed=<n> not removed: <first 5 names, sorted>`
+  (`(list cut at 5 of <n>)` when more failed; names escaped, line bounded at
+  1000 characters). An unexpected
+  internal error (a defect, not a misconfiguration) names the error, prints
+  the summary with `internal_error=1` and exits 1, so the job goes red.
+  `--dry-run` takes the same decisions as the real run (identity re-checks,
+  the count pass and its bounds, the mount and device checks, every skipped
+  and failed line) and stops short of each unlink and rmdir; it lists
+  `would-remove <name>` for each entry the real run would remove and deletes
+  nothing.
+- Every printed name, path and message is escaped: backslash, `%` and every
+  `:` become `\xNN`; U+0000 to U+001F and U+007F to U+009F become `\xNN`;
+  surrogates (U+D800 to U+DFFF), U+2028 and U+2029 become `\uNNNN`. So a file
+  name cannot inject a log line or a workflow command.
+- It needs Python 3.12+ on the runner; an older interpreter ends in the
+  `python` refusal before anything newer is imported and before the shared
+  annotation module is loaded (the refusal line is built without it). That
+  module is read only from `workflow_annotation.py` next to the script's real
+  file (never through the import search path, so a module of that name in the
+  cwd, TMPDIR or PYTHONPATH is never run); when that file cannot be read, raises
+  while loading or lacks a name the script uses, the step prints the fixed
+  warning `prune_runner_tmp: refused: shared module workflow_annotation.py next
+  to the script cannot be loaded`, exits 0 and deletes nothing. The test families that
+  leak the files are fixed separately; the prune treats the symptom.
+- Every other CI script that uses that module (the five gates `load_gate`,
+  `pg_env_preflight`, `tier_cred_preflight`, `host_semaphore`,
+  `partition_test_binaries`, and `ci-sweep-target`, `ci_full_nightly`,
+  `impact/base_sha`, `shared_cargo_target`, `sccache_env`, `pg_isolate_split`,
+  `prune_runner_artifacts`, `scripts/test/pg_isolated_binary`) loads it by one
+  shape, by path, before any other work: a failed load of any kind (absent,
+  unreadable, syntax error, an exception or `sys.exit` with any code while
+  loading, a required name missing) fails the step closed with the fixed line
+  `::error title=<script> refused::<script>: refused: shared module
+  workflow_annotation.py next to the script cannot be loaded` and the script's
+  own refusal exit code, before it writes any file, `GITHUB_ENV` or
+  `GITHUB_OUTPUT` line or runs any command (`pg_isolated_binary` prints that
+  line on stderr, since its stdout feeds `GITHUB_ENV`). The `LoaderShape` cell
+  of `scripts/ci/tests/test_ci_annotation_escape_9365.py` fails on any script
+  under `scripts/` that names the module and loads it another way;
+  `prune_runner_tmp` is its one named exception.
+
 ---
 
 ## 4. CI topology

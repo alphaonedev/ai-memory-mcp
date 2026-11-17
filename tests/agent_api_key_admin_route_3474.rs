@@ -214,12 +214,12 @@ fn fixture(tag: &str, admins: &[&str]) -> Fixture {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         seeded.clear();
         seeded.extend(admins.iter().map(|a| (*a).to_string()));
-        registry.install(
-            admins
+        registry.mutate(|m| {
+            *m = admins
                 .iter()
                 .map(|a| (api_key_sha256_hex(&admin_key(a)), (*a).to_string()))
-                .collect(),
-        );
+                .collect();
+        });
     }
     let app_state = AppState {
         db,
@@ -1087,7 +1087,7 @@ async fn an_approved_revoke_that_became_the_last_key_is_refused_at_apply_3529() 
         api_key_sha256_hex(&admin_key(APPROVER)),
         APPROVER.to_string(),
     );
-    fx.registry.install(map);
+    fx.registry.mutate(|m| *m = map);
     assert_eq!(fx.store.list_agent_api_keys().await.expect("list").len(), 1);
 
     // A DIFFERENT registered approver presents the approval. Refused.
@@ -1648,7 +1648,8 @@ async fn opt_in_arm_still_admits_a_claimed_admin_8535() {
     // Opt-in on an EMPTY registry (bootstrap, or after every key is revoked): admitted.
     // The registry check is an authoritative store read (#8574), so the store
     // rows go too (every key revoked), not only the in-memory snapshot.
-    fx.registry.install(std::collections::HashMap::new());
+    fx.registry
+        .mutate(|m| *m = std::collections::HashMap::new());
     ai_memory::db::open(&fx.db_path)
         .expect("open for revoke-all")
         .execute_batch("DELETE FROM agent_api_keys")

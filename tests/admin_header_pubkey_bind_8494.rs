@@ -151,10 +151,10 @@ fn router_for(state: AppState, registry: &Arc<EnrolledAgentKeys>) -> axum::Route
 fn fixture(tag: &str) -> Fixture {
     let dir = scratch(tag);
     let registry = Arc::new(EnrolledAgentKeys::empty());
-    registry.install(std::collections::HashMap::from([(
-        api_key_sha256_hex(ADMIN_TOKEN),
-        ADMIN.to_string(),
-    )]));
+    registry.mutate(|m| {
+        *m =
+            std::collections::HashMap::from([(api_key_sha256_hex(ADMIN_TOKEN), ADMIN.to_string())]);
+    });
     let (state, db_path) = build_state(&registry, &dir);
     let router = router_for(state.clone(), &registry);
     Fixture {
@@ -384,10 +384,10 @@ async fn postgres_claimed_admin_header_cannot_bind_a_pubkey_8494() {
     let _g = serial().await;
     let dir = scratch("pg-claimed");
     let registry = Arc::new(EnrolledAgentKeys::empty());
-    registry.install(std::collections::HashMap::from([(
-        api_key_sha256_hex(ADMIN_TOKEN),
-        ADMIN.to_string(),
-    )]));
+    registry.mutate(|m| {
+        *m =
+            std::collections::HashMap::from([(api_key_sha256_hex(ADMIN_TOKEN), ADMIN.to_string())]);
+    });
     let (mut state, _db_path) = build_state(&registry, &dir);
     let url =
         std::env::var("AI_MEMORY_TEST_POSTGRES_URL").expect("own PG URL required; no soft skip");

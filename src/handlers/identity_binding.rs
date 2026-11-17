@@ -126,12 +126,106 @@ pub fn api_key_sha256_hex(token: &str) -> String {
 ///
 /// `generation` increments on every INSTALLED change, so boot, doctor and the
 /// refresh loop can report "the posture actually moved" rather than "we asked".
+///
+/// # Loads are ordered against mutations and against each other (v1.0.0 #4066)
+///
+/// Whole-map replacement alone does not order a store READ against the
+/// publication of its result. A refresh that read the key set BEFORE a revoke
+/// committed could publish that set AFTER the revoke narrowed the map, and so
+/// re-arm a credential the revoke response had just called dead. Three rules
+/// close that, all enforced under the ONE write lock that publishes the map:
+///
+/// * every MUTATION ([`Self::mutate`], and the bind path's crate-internal
+///   `mutate_if_current`) bumps a mutation `epoch` in the same critical
+///   section that publishes its map, so a transform is an atomic
+///   read-modify-write rather than a clone that a concurrent writer can
+///   overwrite;
+/// * every LOAD goes through [`refresh_agent_keys`], the ONLY load funnel
+///   reachable from outside this module: it takes the load ticket BEFORE it
+///   calls the closure that starts the store read, and publishes through a
+///   private install that DISCARDS a read a mutation has overtaken (epoch
+///   moved). The ticket type, the ticket mint and the install are not public,
+///   so no caller outside this module can mint a ticket after its read;
+/// * the ticket also carries a load sequence number, and a load whose ticket
+///   is not NEWER than the newest load already published is discarded too, so
+///   two concurrent loads cannot install an older set over a newer one and
+///   one ticket cannot publish twice.
+///
+/// A discarded load is a degrade (the registry keeps the newer map, which
+/// already reflects the durable write) — never a resurrection. The sequence is
+/// taken before the read starts, so it orders when reads BEGAN: a later-begun
+/// read that is slow to start is discarded in favour of an earlier-begun one
+/// that published first, and the next periodic refresh reads again.
 #[derive(Debug)]
 pub struct EnrolledAgentKeys {
-    inner: std::sync::RwLock<std::sync::Arc<std::collections::HashMap<String, String>>>,
+    inner: std::sync::RwLock<Published>,
+    /// The next load sequence number `begin_load` hands out.
+    next_load_seq: std::sync::atomic::AtomicU64,
     generation: std::sync::atomic::AtomicU64,
     pub(crate) monitoring: super::monitoring::MonitoringConfig,
     pub(crate) monitoring_tls: bool,
+}
+
+/// The first load sequence number handed out. Published state starts at
+/// [`NO_LOAD_PUBLISHED`], strictly below it, so the first load is never
+/// mistaken for an older one.
+const FIRST_LOAD_SEQ: u64 = 1;
+
+/// `Published::last_load_seq` before any load has published.
+const NO_LOAD_PUBLISHED: u64 = 0;
+
+/// The sequence a ticket carries once `next_load_seq` cannot advance
+/// (PERF-02: `checked_add`, never a silent wrap). It is never handed out as a
+/// live sequence — the counter stops AT it — and every ticket carrying it is
+/// refused by both the load install and the bind insert, so exhaustion
+/// fails CLOSED: loads and optimistic binds stop publishing, while revokes
+/// (plain mutations) keep narrowing the map.
+const LOAD_SEQ_EXHAUSTED: u64 = u64::MAX;
+
+/// The published registry state: the map, the mutation epoch it was published
+/// at, and the sequence of the newest load that published. Kept behind ONE
+/// lock so every ticket comparison and the publication are a single critical
+/// section (#4066).
+#[derive(Debug)]
+struct Published {
+    map: std::sync::Arc<std::collections::HashMap<String, String>>,
+    epoch: u64,
+    last_load_seq: u64,
+}
+
+/// Proof of WHEN a registry load began: the mutation epoch observed and the
+/// load sequence number taken before the store read started (v1.0.0 #4066).
+///
+/// What the code enforces (round-1 review of #9302):
+///
+/// * the type is crate-private and its fields are module-private, so only
+///   `EnrolledAgentKeys::begin_load` (visible to `crate::handlers` only, for
+///   the bind path's pre-write ticket) mints one;
+/// * a LOAD ticket is only ever minted inside [`refresh_agent_keys`], before
+///   its read closure is called, so no code outside this module can pair a
+///   ticket with a read that began earlier;
+/// * it is neither `Copy` nor `Clone`, and the install and the bind insert
+///   take it BY VALUE, so one ticket is spent at most once; the install also
+///   refuses a sequence that is not newer than the last published load, so a
+///   ticket rebuilt inside this module cannot publish twice either.
+#[derive(Debug)]
+#[must_use = "a load ticket only protects a load that publishes through it"]
+pub(crate) struct LoadTicket {
+    epoch: u64,
+    seq: u64,
+}
+
+/// What `EnrolledAgentKeys::install_loaded` did with a loaded map.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoadInstall {
+    /// The loaded map differed and is now published.
+    Installed,
+    /// The loaded map equals the published one; nothing changed.
+    Unchanged,
+    /// A mutation, or a load that began later, was published after this
+    /// load's ticket was taken, so the read may predate a durable revoke. It
+    /// was DISCARDED (#4066).
+    Superseded,
 }
 
 impl EnrolledAgentKeys {
@@ -139,7 +233,12 @@ impl EnrolledAgentKeys {
     #[must_use]
     pub fn from_map(map: std::collections::HashMap<String, String>) -> Self {
         Self {
-            inner: std::sync::RwLock::new(std::sync::Arc::new(map)),
+            inner: std::sync::RwLock::new(Published {
+                map: std::sync::Arc::new(map),
+                epoch: 0,
+                last_load_seq: NO_LOAD_PUBLISHED,
+            }),
+            next_load_seq: std::sync::atomic::AtomicU64::new(FIRST_LOAD_SEQ),
             generation: std::sync::atomic::AtomicU64::new(0),
             monitoring: super::monitoring::MonitoringConfig::default(),
             monitoring_tls: false,
@@ -174,26 +273,152 @@ impl EnrolledAgentKeys {
     #[must_use]
     pub fn snapshot(&self) -> std::sync::Arc<std::collections::HashMap<String, String>> {
         match self.inner.read() {
-            Ok(g) => std::sync::Arc::clone(&g),
-            Err(poisoned) => std::sync::Arc::clone(&poisoned.into_inner()),
+            Ok(g) => std::sync::Arc::clone(&g.map),
+            Err(poisoned) => std::sync::Arc::clone(&poisoned.into_inner().map),
         }
     }
 
-    /// Install a freshly-loaded map. Returns `true` when the contents actually
-    /// CHANGED, so callers can log a real transition instead of every poll.
-    pub fn install(&self, map: std::collections::HashMap<String, String>) -> bool {
-        let mut guard = match self.inner.write() {
+    /// The publication lock, recovering from poison (CONCURRENCY-18: the auth
+    /// path must not turn an unrelated panic into an outage).
+    fn write_published(&self) -> std::sync::RwLockWriteGuard<'_, Published> {
+        match self.inner.write() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
-        };
-        if **guard == map {
+        }
+    }
+
+    /// Publish `map` under an already-held write guard and bump the epoch.
+    /// Returns whether the contents changed. The epoch moves even when they
+    /// did not: a mutation is ordered against in-flight loads by the fact that
+    /// it HAPPENED, not by whether this process's view moved (#4066).
+    ///
+    /// The epoch only ever needs inequality with a ticket taken earlier, so it
+    /// wraps (PERF-04): 2^64 mutations between one ticket and its install is
+    /// not reachable.
+    fn publish_mutation(
+        &self,
+        mut guard: std::sync::RwLockWriteGuard<'_, Published>,
+        map: std::collections::HashMap<String, String>,
+    ) -> bool {
+        guard.epoch = guard.epoch.wrapping_add(1);
+        if *guard.map == map {
             return false;
         }
-        *guard = std::sync::Arc::new(map);
+        guard.map = std::sync::Arc::new(map);
         drop(guard);
         self.generation
             .fetch_add(1, std::sync::atomic::Ordering::Release);
         true
+    }
+
+    /// Atomic read-modify-write of the published map (#4066).
+    ///
+    /// `transform` runs on a copy of the CURRENT map while the publication lock
+    /// is held, so two concurrent transforms serialise instead of each cloning
+    /// the same snapshot and the later install silently undoing the earlier
+    /// one. Keep `transform` short and non-blocking: it runs under the lock the
+    /// request auth path reads through.
+    ///
+    /// A mutation is not a LOAD: it carries no store read, so it cannot
+    /// publish a stale read. It bumps the epoch, which supersedes every load
+    /// whose ticket predates it. Returns `true` when the contents actually
+    /// CHANGED, so callers can log a real transition.
+    pub fn mutate(
+        &self,
+        transform: impl FnOnce(&mut std::collections::HashMap<String, String>),
+    ) -> bool {
+        let guard = self.write_published();
+        let mut next = (*guard.map).clone();
+        transform(&mut next);
+        self.publish_mutation(guard, next)
+    }
+
+    /// [`Self::mutate`], but only when no mutation has been published since
+    /// `ticket` was taken. Returns `None` (nothing applied) when one has.
+    ///
+    /// This is the WIDENING form: a bind takes its ticket BEFORE its durable
+    /// write, and applies its insert here afterwards. If a revoke's transform
+    /// landed in between, the insert could re-arm a key the revoke already
+    /// removed, so it is refused and the caller falls back to an
+    /// authoritative load instead. An exhausted ticket
+    /// ([`LOAD_SEQ_EXHAUSTED`]) is refused too: fail closed, never widen.
+    pub(super) fn mutate_if_current(
+        &self,
+        ticket: LoadTicket,
+        transform: impl FnOnce(&mut std::collections::HashMap<String, String>),
+    ) -> Option<bool> {
+        let guard = self.write_published();
+        if ticket.seq == LOAD_SEQ_EXHAUSTED || guard.epoch != ticket.epoch {
+            return None;
+        }
+        let mut next = (*guard.map).clone();
+        transform(&mut next);
+        Some(self.publish_mutation(guard, next))
+    }
+
+    /// Take a [`LoadTicket`]. MUST be called before the store read or durable
+    /// write it guards starts. Inside this module only [`refresh_agent_keys`]
+    /// calls it for a load (before its read closure runs); outside it, the
+    /// one caller family is the bind path in `agent_api_key.rs`, which takes
+    /// its ticket before the durable bind and can only spend it on
+    /// `mutate_if_current` — it cannot publish a load.
+    ///
+    /// The sequence number is unique per ticket: one atomic
+    /// read-modify-write (CONCURRENCY-09) with `checked_add` (PERF-02). At
+    /// `u64::MAX` the counter stays put and the ticket carries
+    /// [`LOAD_SEQ_EXHAUSTED`], which every consumer refuses (fail closed).
+    pub(super) fn begin_load(&self) -> LoadTicket {
+        let seq = match self.next_load_seq.try_update(
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+            |seq| seq.checked_add(1),
+        ) {
+            Ok(seq) => seq,
+            Err(_) => {
+                tracing::error!(
+                    target: crate::handlers::HTTP_AUTH_TRACE_TARGET,
+                    "#4066: per-agent api-key load sequence exhausted; refusing every \
+                     load and optimistic bind until restart (revokes still apply)"
+                );
+                LOAD_SEQ_EXHAUSTED
+            }
+        };
+        let epoch = match self.inner.read() {
+            Ok(g) => g.epoch,
+            Err(poisoned) => poisoned.into_inner().epoch,
+        };
+        LoadTicket { epoch, seq }
+    }
+
+    /// Publish a LOADED map, unless a mutation or a load that began no
+    /// earlier already published (#4066).
+    ///
+    /// The ticket is compared under the same write lock that publishes, so no
+    /// mutation or load can slip between the check and the install. A load
+    /// does not bump the epoch: it reports the store, it does not change it.
+    /// `<=` (not `<`) refuses a sequence that already published, so a ticket
+    /// installs at most once; an exhausted ticket is refused outright.
+    fn install_loaded(
+        &self,
+        ticket: LoadTicket,
+        map: std::collections::HashMap<String, String>,
+    ) -> LoadInstall {
+        let mut guard = self.write_published();
+        if ticket.seq == LOAD_SEQ_EXHAUSTED
+            || guard.epoch != ticket.epoch
+            || ticket.seq <= guard.last_load_seq
+        {
+            return LoadInstall::Superseded;
+        }
+        guard.last_load_seq = ticket.seq;
+        if *guard.map == map {
+            return LoadInstall::Unchanged;
+        }
+        guard.map = std::sync::Arc::new(map);
+        drop(guard);
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        LoadInstall::Installed
     }
 
     /// Number of currently enrolled keys.
@@ -213,6 +438,27 @@ impl EnrolledAgentKeys {
     pub fn generation(&self) -> u64 {
         self.generation.load(std::sync::atomic::Ordering::Acquire)
     }
+}
+
+/// Run ONE ordered registry refresh: take the load ticket, THEN start the
+/// store read, then publish through the one result-to-state funnel (#4066).
+///
+/// `load` is a closure returning the read future rather than the future
+/// itself, so the read cannot have begun before the ticket exists — the
+/// ordering the staleness check depends on is structural, not a convention.
+/// This is the ONLY way to publish a load from outside this module: the
+/// ticket mint, the ticket type and the install are not public. Every
+/// refresh path (the background loop on both backends, the admin handlers
+/// and the tests) goes through here.
+pub async fn refresh_agent_keys<E, F, Fut>(registry: &EnrolledAgentKeys, load: F) -> AgentKeyRefresh
+where
+    E: std::fmt::Display,
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<(String, String)>, E>>,
+{
+    let ticket = registry.begin_load();
+    let loaded = load().await;
+    apply_agent_key_refresh(registry, ticket, loaded)
 }
 
 /// Env var resolving how often the daemon re-reads `agent_api_keys`.
@@ -288,7 +534,7 @@ pub fn refresh_posture_note(interval: Option<std::time::Duration>) -> String {
 }
 
 /// What one pass of the live-refresh loop DID — the observable outcome of
-/// [`apply_agent_key_refresh`].
+/// [`refresh_agent_keys`].
 ///
 /// Returned (rather than only logged) so the refresh contract is testable
 /// without standing up a daemon: "a failed read keeps the last known set" is a
@@ -305,6 +551,11 @@ pub enum AgentKeyRefresh {
     /// The read FAILED. The previous snapshot is retained; carries the count
     /// that is still armed.
     KeptLastKnown(usize),
+    /// The read was overtaken: a mutation (a revoke, a rotation, a bind) or a
+    /// load that began later published after this read began, so the read may
+    /// predate a durable change. It was DISCARDED and the newer map kept
+    /// (#4066). Carries the count that is still armed.
+    Superseded(usize),
 }
 
 /// The ONE place a refresh result becomes registry state.
@@ -319,24 +570,43 @@ pub enum AgentKeyRefresh {
 /// downgrade an `enforce` deployment to self-asserted identity. Staleness is a
 /// bounded, observable degrade; disarming is a silent one. Degrade, never
 /// corrupt.
-pub fn apply_agent_key_refresh<E: std::fmt::Display>(
+///
+/// **A read that a later publication overtook is DISCARDED** (#4066): `ticket`
+/// must have been taken before the read began ([`refresh_agent_keys`], its
+/// only caller, does that), and `EnrolledAgentKeys::install_loaded` refuses
+/// it once a mutation or a load that began no earlier has published. A stale
+/// read can therefore never re-arm a key a revoke or rotation already
+/// removed. Private: a caller outside this module cannot pair a ticket with a
+/// read it started earlier (round-1 review of #9302).
+fn apply_agent_key_refresh<E: std::fmt::Display>(
     registry: &EnrolledAgentKeys,
+    ticket: LoadTicket,
     loaded: Result<Vec<(String, String)>, E>,
 ) -> AgentKeyRefresh {
     match loaded {
         Ok(rows) => {
             let map: std::collections::HashMap<String, String> = rows.into_iter().collect();
             let count = map.len();
-            if registry.install(map) {
-                tracing::info!(
-                    target: crate::handlers::HTTP_AUTH_TRACE_TARGET,
-                    "#3418: per-agent api-key registry refreshed — {count} enrolled \
-                     (generation {})",
-                    registry.generation()
-                );
-                AgentKeyRefresh::Installed(count)
-            } else {
-                AgentKeyRefresh::Unchanged(count)
+            match registry.install_loaded(ticket, map) {
+                LoadInstall::Installed => {
+                    tracing::info!(
+                        target: crate::handlers::HTTP_AUTH_TRACE_TARGET,
+                        "#3418: per-agent api-key registry refreshed — {count} enrolled \
+                         (generation {})",
+                        registry.generation()
+                    );
+                    AgentKeyRefresh::Installed(count)
+                }
+                LoadInstall::Unchanged => AgentKeyRefresh::Unchanged(count),
+                LoadInstall::Superseded => {
+                    let kept = registry.len();
+                    tracing::debug!(
+                        target: crate::handlers::HTTP_AUTH_TRACE_TARGET,
+                        "#4066: per-agent api-key load overtaken by a newer publication; \
+                         discarded, keeping the newer enrolled set ({kept} keys)"
+                    );
+                    AgentKeyRefresh::Superseded(kept)
+                }
             }
         }
         Err(e) => {
@@ -482,12 +752,38 @@ pub fn enforce_idor_identity(
     headers: &axum::http::HeaderMap,
     endpoint: &str,
 ) -> Option<Response> {
+    admit_idor_identity(enrolled, mode, headers, endpoint).err()
+}
+
+/// #8947 (v1.0.0, security) — [`enforce_idor_identity`] that also hands back
+/// the principal it judged.
+///
+/// A handler that gates on the header and then re-reads the raw header string
+/// for its visibility caller acts as a DIFFERENT principal than the one the
+/// gate admitted: an empty `X-Agent-Id` is resolved to the anonymous request id
+/// for the gate, but the raw read yields `""`. One resolution point cannot
+/// disagree with itself, so the caller a handler acts as comes from here.
+///
+/// # Errors
+///
+/// The refusal [`Response`] of [`enforce_for_request`] (403 under `enforce`
+/// for a shared-key caller acting as a named principal).
+#[must_use = "the Ok principal is the only caller the gate judged; an Err is a refusal to return"]
+pub fn admit_idor_identity(
+    enrolled: &EnrolledAgentKeys,
+    mode: HttpIdentityMode,
+    headers: &axum::http::HeaderMap,
+    endpoint: &str,
+) -> Result<String, Response> {
     let header_agent_id = headers
         .get(crate::HEADER_AGENT_ID)
         .and_then(|v| v.to_str().ok());
     let caller = crate::identity::resolve_http_agent_id(None, header_agent_id)
         .unwrap_or_else(|_| crate::identity::anonymous_request_id());
-    enforce_for_request(enrolled, mode, headers, &caller, endpoint)
+    match enforce_for_request(enrolled, mode, headers, &caller, endpoint) {
+        Some(refusal) => Err(refusal),
+        None => Ok(caller),
+    }
 }
 
 /// #2044 — the shared IDOR/admin identity gate.
@@ -701,6 +997,110 @@ mod tests {
         assert_eq!(
             resolve_auth_level(&map, &headers, "alice"),
             AuthLevel::Claimed
+        );
+    }
+
+    fn one_key(token: &str, agent: &str) -> std::collections::HashMap<String, String> {
+        std::iter::once((api_key_sha256_hex(token), agent.to_string())).collect()
+    }
+
+    /// #4066 X-3/F3 — a ticket installs AT MOST ONCE. A second install that
+    /// presents the same (epoch, seq) is a replay of an already-published
+    /// load, so it must be refused even though no mutation and no later load
+    /// intervened. The struct literal is only writable inside this module;
+    /// outside it the ticket is consumed by value and cannot be copied.
+    #[test]
+    fn a_load_ticket_installs_at_most_once_4066() {
+        let registry = EnrolledAgentKeys::empty();
+        let first = registry.begin_load();
+        let replay = LoadTicket {
+            epoch: first.epoch,
+            seq: first.seq,
+        };
+        assert_eq!(
+            registry.install_loaded(first, one_key("tok-a", "agent-a")),
+            LoadInstall::Installed
+        );
+        assert_eq!(
+            registry.install_loaded(replay, one_key("tok-z", "agent-z")),
+            LoadInstall::Superseded,
+            "a replayed ticket must not publish a second set"
+        );
+        let published = registry.snapshot();
+        assert!(published.contains_key(&api_key_sha256_hex("tok-a")));
+        assert!(!published.contains_key(&api_key_sha256_hex("tok-z")));
+    }
+
+    /// #4066 X-4/F4 — the load sequence never wraps. With the counter at
+    /// `u64::MAX` the next ticket is EXHAUSTED: it can neither publish a load
+    /// nor apply a bind's optimistic insert, and the counter stays put rather
+    /// than wrapping to a value every later ticket would compare below.
+    #[test]
+    fn an_exhausted_load_sequence_fails_closed_4066() {
+        let registry = EnrolledAgentKeys::from_map(one_key("tok-a", "agent-a"));
+        registry
+            .next_load_seq
+            .store(u64::MAX, std::sync::atomic::Ordering::Release);
+
+        let load = registry.begin_load();
+        assert_eq!(
+            registry.install_loaded(load, one_key("tok-z", "agent-z")),
+            LoadInstall::Superseded,
+            "an exhausted ticket must not publish a load"
+        );
+        let bind = registry.begin_load();
+        assert_eq!(
+            registry.mutate_if_current(bind, |m| {
+                m.insert(api_key_sha256_hex("tok-y"), "agent-y".to_string());
+            }),
+            None,
+            "an exhausted ticket must not widen the map"
+        );
+        assert_eq!(
+            registry
+                .next_load_seq
+                .load(std::sync::atomic::Ordering::Acquire),
+            u64::MAX,
+            "the sequence must not wrap"
+        );
+        assert_eq!(*registry.snapshot(), one_key("tok-a", "agent-a"));
+        assert_eq!(registry.generation(), 0, "nothing was published");
+
+        // A MUTATION still applies: the revoke direction never depends on the
+        // sequence, so exhaustion cannot keep a revoked key alive.
+        assert!(registry.mutate(|m| m.retain(|_, a| a != "agent-a")));
+        assert!(registry.is_empty());
+    }
+
+    /// #4066 — a bind's optimistic insert carries a ticket taken BEFORE its
+    /// durable write. A revoke published in between makes it refuse (`None`):
+    /// the insert could otherwise re-arm a key the revoke just removed. Lives
+    /// here since round 1 of #9302: the ticket mint is not public.
+    #[test]
+    fn a_bind_ticket_older_than_a_revoke_does_not_rearm_4066() {
+        let registry = EnrolledAgentKeys::from_map(one_key("tok-b", "agent-b"));
+        let ticket = registry.begin_load();
+        registry.mutate(|m| m.retain(|_, a| a != "agent-a"));
+        let applied = registry.mutate_if_current(ticket, |m| {
+            m.insert(api_key_sha256_hex("tok-a"), "agent-a".to_string());
+        });
+        assert_eq!(applied, None, "a stale bind ticket must not apply");
+        assert!(
+            !registry
+                .snapshot()
+                .contains_key(&api_key_sha256_hex("tok-a"))
+        );
+
+        // A current ticket applies.
+        let ticket = registry.begin_load();
+        let applied = registry.mutate_if_current(ticket, |m| {
+            m.insert(api_key_sha256_hex("tok-a"), "agent-a".to_string());
+        });
+        assert_eq!(applied, Some(true));
+        assert!(
+            registry
+                .snapshot()
+                .contains_key(&api_key_sha256_hex("tok-a"))
         );
     }
 }

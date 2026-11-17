@@ -19,7 +19,9 @@ SIGTERM/SIGINT/SIGHUP are forwarded to COMMAND's process group (then SIGKILL aft
 a grace period) and the lock is released in ``finally``.
 
 Exit codes: the child's code; 2 bad arguments; 3 no slot free within the wait
-budget (COMMAND never ran); 128+signal when COMMAND died from a signal.
+budget (COMMAND never ran); 4 the shared workflow_annotation.py next to this file
+cannot be loaded (COMMAND never ran, one ``::error`` line, #9365); 128+signal when
+COMMAND died from a signal.
 Python 3.9+, standard library only.
 """
 import argparse
@@ -31,6 +33,48 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+
+
+def _load_workflow_annotation():
+    """The shared module at WA_RELATIVE_PATH from this file's real directory, by path only, never through
+    sys.path; every name in WA_REQUIRED must be a callable of it (#9365, one shape in every script)."""
+    import importlib.util
+    import os
+    path = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), WA_RELATIVE_PATH))
+    loaded = sys.modules.get("workflow_annotation")
+    if loaded is not None and os.path.realpath(getattr(loaded, "__file__", None) or "") == path:
+        module = loaded
+    else:
+        spec = importlib.util.spec_from_file_location("workflow_annotation", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)  # absent, unreadable or broken: it raises here, the try below catches it
+    missing = [name for name in WA_REQUIRED if not callable(getattr(module, name, None))]
+    if missing:
+        raise AttributeError("workflow_annotation.py lacks " + ", ".join(missing))
+    if loaded is None:
+        sys.modules["workflow_annotation"] = module
+    return module
+
+
+EXIT_LOAD_REFUSED = 4  # the shared module cannot be loaded (2 = bad arguments, 3 = no slot, else the child's)
+
+# The one shared-module load shape of scripts/ (#9365, ruling bcd0a15c; LoaderShape pins it).
+WA_PROG = "host_semaphore"
+WA_RELATIVE_PATH = "workflow_annotation.py"
+WA_REQUIRED = ("annotation", "log_line")
+WA_EXIT_LOAD_REFUSED = EXIT_LOAD_REFUSED  # the gate's own refusal code, unchanged
+WA_ERROR_TO_STDERR = False
+
+try:
+    wa = _load_workflow_annotation()
+except (Exception, SystemExit) as exc:  # any failed load: one fixed line built without the module, then exit
+    wa_cause = type(exc).__name__
+    print("%s: refused: shared module workflow_annotation.py next to the script cannot be loaded (%s)"
+          % (WA_PROG, wa_cause if wa_cause.isidentifier() else "BaseException"), file=sys.stderr, flush=True)
+    print("::error title=host_semaphore refused::host_semaphore: refused: shared module workflow_annotation.py"
+          " next to the script cannot be loaded",
+          file=sys.stderr if WA_ERROR_TO_STDERR else sys.stdout, flush=True)
+    sys.exit(WA_EXIT_LOAD_REFUSED)
 
 SEMAPHORE_SLOTS_DEFAULT = 2
 SEMAPHORE_MAX_WAIT_SECS_DEFAULT = 3600
@@ -78,12 +122,12 @@ def acquire(slot_dir, slots, label, max_wait, poll, sleep_fn=time.sleep):
         step = min(poll, max_wait - waited)
         sleep_fn(step)
         waited += step
-        print('%s %r: waiting for a slot of %d, waited=%ds' % (TAG, label, slots, waited), flush=True)
+        print(wa.log_line('%s %r: waiting for a slot of %d, waited=%ds' % (TAG, label, slots, waited)), flush=True)
 
 
 def _note(message):
     """Record a tolerated condition on stderr (#7929), never silently."""
-    print('%s note: %s' % (TAG, message), file=sys.stderr, flush=True)
+    print(wa.log_line('%s note: %s' % (TAG, message)), file=sys.stderr, flush=True)
 
 
 def _signal_group(pgid, sig):
@@ -167,18 +211,18 @@ def main(argv=None):
     slot_dir.mkdir(parents=True, exist_ok=True)
     got = acquire(slot_dir, args.slots, args.label, args.max_wait_secs, args.poll_secs)
     if got is None:
-        print("::error::%s %r: no slot free after %ds (all %d slots busy on this host)"
-              % (TAG, args.label, args.max_wait_secs, args.slots), flush=True)
+        print(wa.annotation("error", "%s '%s': no slot free after %ds (all %d slots busy on this host)"
+                            % (TAG, args.label, args.max_wait_secs, args.slots)), flush=True)
         return EXIT_NO_SLOT
     index, fd, waited = got
     try:
         load, cores = load_and_cores()
-        print("::notice::%s %r: slot %d of %d acquired after %ds (load=%.2f cores=%d)"
-              % (TAG, args.label, index, args.slots, waited, load, cores), flush=True)
+        print(wa.annotation("notice", "%s '%s': slot %d of %d acquired after %ds (load=%.2f cores=%d)"
+                            % (TAG, args.label, index, args.slots, waited, load, cores)), flush=True)
         return run_child(command)
     finally:
         os.close(fd)
-        print("%s %r: slot %d of %d released" % (TAG, args.label, index, args.slots), flush=True)
+        print(wa.log_line("%s '%s': slot %d of %d released" % (TAG, args.label, index, args.slots)), flush=True)
 
 
 if __name__ == '__main__':

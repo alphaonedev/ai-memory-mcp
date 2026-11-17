@@ -861,6 +861,9 @@ jobs:
       # #7988: case_7988_prefix_replay reads the PR 7393 commits the probes were verified against.
       - name: Fetch the corpus replay objects (#7988)
         run: python3 -I scripts/ci/tests/test_check_cert_expiry_corpus.py --print-replay-shas | xargs git fetch --no-tags --depth=1 origin
+      # #9303: test_9303_real_range_9274_refused_as_frozen_region reads the PR 9274 range and fails, never skips, when a commit is missing.
+      - name: Fetch the amendment ledger replay objects (#9303)
+        run: python3 -I scripts/ci/tests/test_cert_amendment_ledger_6124.py --print-replay-shas | xargs git fetch --no-tags --depth=1 origin
       - name: Shard partition and wiring unit tests (#6344)
         run: python3 -m unittest discover -s scripts/ci/tests
       - name: AGE self-heal helper unit test (#6161)
@@ -1336,6 +1339,9 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
+      - name: Prune stale runner TMPDIR (#8634)
+        if: needs.classify.outputs.cargo_skip != 'true' && runner.environment == 'self-hosted'
+        uses: ./.github/actions/prune-runner-tmp
 
       # #8322 - ONE line naming the reason and the rules version. STEP-level:
       # this is a required matrix job (rule (b1), #2494).
