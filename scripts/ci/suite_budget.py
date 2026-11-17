@@ -294,8 +294,8 @@ def read_log(path, offset=0):
                 raise MalformedInput("log offset %d is past the end of %s (%d bytes)" % (offset, path, size))
             handle.seek(max(offset, size - MAX_LOG_BYTES))
             data = handle.read()
-    except OSError as exc:
-        raise MalformedInput("log %s cannot be read (%s)" % (path, type(exc).__name__)) from None
+    except OSError:  # one fixed reason: no #9229 message carries interpreter or stdlib text (R2-6)
+        raise MalformedInput("log %s cannot be opened or read" % (path,)) from None
     return data.decode("utf-8", "replace").splitlines()
 
 
@@ -403,9 +403,9 @@ def run_shard_args(metadata_path, features, part_text="1/1"):
             metadata = json.loads(_read_bounded(metadata_path))
         except _TooLarge as exc:
             raise MalformedInput("cargo metadata %s cannot be read as JSON (%s)" % (metadata_path, exc)) from None
-        except (OSError, ValueError, RecursionError) as exc:  # UnicodeDecodeError is a ValueError
-            raise MalformedInput("cargo metadata %s cannot be read as JSON (%s)"
-                                 % (metadata_path, type(exc).__name__)) from None
+        except (OSError, ValueError, RecursionError):  # UnicodeDecodeError is a ValueError; one fixed reason
+            raise MalformedInput("cargo metadata %s cannot be read as JSON (unreadable, not UTF-8, or not JSON "
+                                 "within the decoder's depth)" % (metadata_path,)) from None
         args = shard_args(metadata, requested, parse_part(part_text))
     except MalformedInput as exc:
         print(wa.annotation("warning", "%s shard-args: %s; the full suite runs unsharded (#9229)" % (TAG, exc)),
@@ -514,8 +514,8 @@ def _read_text(path, what):
         return _read_bounded(path)
     except _TooLarge as exc:
         raise MalformedInput("the %s cannot be read (%s)" % (what, exc)) from None
-    except (OSError, ValueError) as exc:  # UnicodeDecodeError is a ValueError
-        raise MalformedInput("the %s cannot be read (%s)" % (what, type(exc).__name__)) from None
+    except (OSError, ValueError):  # UnicodeDecodeError is a ValueError; one fixed reason
+        raise MalformedInput("the %s cannot be read (unreadable or not UTF-8)" % (what,)) from None
 
 
 def _job_block(text, job):
@@ -696,11 +696,21 @@ class _BadArguments(Exception):
     """An argparse error, reported as a named exit EXIT_MALFORMED instead of argparse's usage text."""
 
 
+_ARG_NAME_RE = re.compile(r"--[a-z][a-z-]{0,30}|cmd")  # the option names this parser defines, and its subcommand
+
+
 class _Parser(argparse.ArgumentParser):
-    """ArgumentParser whose errors are a named #9229 annotation (subparsers inherit the class)."""
+    """ArgumentParser whose errors are a named #9229 annotation (subparsers inherit the class): one exact gate
+    line per usage-error kind, never argparse's wording, which differs by interpreter (R2-7)."""
 
     def error(self, message):
-        raise _BadArguments(message)
+        name = getattr(sys.exception(), "argument_name", None)  # set by argparse for one named argument
+        if not isinstance(name, str) or not _ARG_NAME_RE.fullmatch(name):
+            raise _BadArguments("the argument list is not a suite_budget command line (a required argument is "
+                                "missing, or one is unknown)")
+        if any(name in a.option_strings and a.type is _int_arg for a in self._actions):
+            raise _BadArguments("argument %s: not an integer of at most %d ASCII digits" % (name, INT_ARG_MAX_DIGITS))
+        raise _BadArguments("argument %s: missing, or not one of its allowed values" % name)
 
 
 def _ignore_sigterm():
@@ -765,9 +775,8 @@ def main(argv=None):
         print(wa.annotation("error", "%s suite_budget: malformed arguments: %s; refusing to pass (#9229)"
                             % (TAG, exc)), flush=True)
         return EXIT_MALFORMED
-    except Exception as exc:  # the backstop: an unforeseen input is a named red, never exit 1
-        print(wa.annotation("error", "%s suite_budget: internal error (%s); refusing to pass (#9229)"
-                            % (TAG, type(exc).__name__)), flush=True)
+    except Exception:  # the backstop: an unforeseen input is a named red, never exit 1
+        print(wa.annotation("error", "%s suite_budget: internal error; refusing to pass (#9229)" % TAG), flush=True)
         return EXIT_MALFORMED
 
 

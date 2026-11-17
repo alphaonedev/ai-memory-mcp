@@ -217,7 +217,15 @@ constant hides the growth.
   subcommand ends 0, 2 or 3 with a named reason for any input (invalid dates,
   overflow digits, NUL bytes, empty or 100K+ line logs, malformed arguments);
   malformed input is exit 2 with a named error, never a traceback or a pass.
-  No `#9229` annotation contains a percent sign (the 9365 escaper turns it
+  Each reason is the gate's own fixed text, with no exception class name,
+  standard-library message or argparse wording, so a line reads the same on
+  every runner image: an unreadable file is `cannot be opened or read` or
+  `unreadable or not UTF-8`, a bad cargo metadata file is `unreadable, not
+  UTF-8, or not JSON within the decoder's depth`, a bad argument is one line
+  per kind (`argument --elapsed: not an integer of at most 18 ASCII digits`,
+  `argument cmd: missing, or not one of its allowed values`, or `the argument
+  list is not a suite_budget command line`) and an unforeseen exception is
+  `internal error`. No `#9229` annotation contains a percent sign (the 9365 escaper turns it
   into `\x25`), so every percentage is written as `N percent`.
 - **Whole-suite ceiling** (ruling cdfe800f). Four budgets of 2100 s must not
   become a silent 8400 s suite: the sum of the full suite's invocations is

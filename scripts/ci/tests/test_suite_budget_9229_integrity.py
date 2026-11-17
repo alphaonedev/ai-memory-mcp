@@ -704,6 +704,35 @@ def interpreter_text_failures(sb):
     return failed
 
 
+
+# Mutants of suite_budget.py for class H: (name, old text, new text, a cell that must turn red).
+INTERPRETER_MUTANTS = (
+    ("class name back in the log reason", '"log %s cannot be opened or read" % (path,)',
+     '"log %s cannot be opened or read (%s)" % (path, type(sys.exception()).__name__)', "gate log open OSError"),
+    ("class name back in the decoder reason", '"within the decoder\'s depth)" % (metadata_path,)',
+     '"within the decoder\'s depth) %s" % (metadata_path, type(sys.exception()).__name__)',
+     "shard-args decode RecursionError"),
+    ("class name back in the backstop", '"%s suite_budget: internal error; refusing to pass (#9229)" % TAG',
+     '"%s suite_budget: internal error (%s); refusing to pass (#9229)" % (TAG, type(sys.exception()).__name__)',
+     "backstop KeyError"),
+    ("ArgumentParser.error override removed", "    def error(self, message):",
+     "    def _error_removed(self, message):", "usage: unknown subcommand"),
+)
+
+
+def load_mutant(d, old, new):
+    """suite_budget.py with one edit, next to a copy of workflow_annotation.py in ``d``, loaded by path."""
+    source = base.SCRIPT.read_text(encoding="utf-8")
+    if source.count(old) != 1:
+        raise AssertionError("mutant anchor %r: %d hits" % (old, source.count(old)))
+    shutil.copy(base.SCRIPT.parent / "workflow_annotation.py", Path(d) / "workflow_annotation.py")
+    path = Path(d) / "suite_budget.py"
+    path.write_text(source.replace(old, new), encoding="utf-8")
+    spec = importlib.util.spec_from_file_location("suite_budget_9229_mutant", str(path))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
 class InputTotality(unittest.TestCase):
     """Class C (F2): exit 0, 2 or 3 with a named reason for every input, never a traceback, in linear time."""
 
@@ -838,6 +867,11 @@ class InputTotality(unittest.TestCase):
 
     def test_every_except_member_and_usage_kind_is_one_fixed_line(self):
         self.assertEqual(interpreter_text_failures(self.sb), [])
+
+    def test_each_interpreter_text_mutant_is_red(self):
+        for name, old_text, new_text, cell in INTERPRETER_MUTANTS:
+            with self.subTest(mutant=name), base.scratch() as d:
+                self.assertIn(cell, interpreter_text_failures(load_mutant(d, old_text, new_text)))
 
     def test_size_bound_refuses_larger_inputs(self):
         with base.scratch() as d:
