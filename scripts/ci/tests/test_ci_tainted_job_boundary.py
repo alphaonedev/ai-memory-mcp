@@ -221,6 +221,38 @@ WF_LEAKY_CHECKOUT = HEADER + """\
         run: cargo build
 """
 
+WF_LATE_CHECKOUT = HEADER + """\
+  late:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Build
+        run: cargo build
+      - name: Second checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          path: other
+"""
+
+# Expression text -> names a secret or the job token.
+SECRET_EXPR_CASES = (
+    ("${{ secrets.TOKEN }}", True),
+    ("${{ secrets['TOKEN'] }}", True),
+    ("${{ toJSON(secrets) }}", True),
+    ("${{ github.token }}", True),
+    ("${{ github['token'] }}", True),
+    ("${{ format('{0}', secrets.A) }}", True),
+    ("${{ fromJSON('{\"a\": 1}').a && secrets.B }}", True),
+    ("${{ Secrets.C }}", True),
+    ("${{ secrets.A", True),
+    ("${{ github.sha }} secrets.A", False),
+    ("${{ github.event.pull_request.base.sha }}", False),
+    ("${{ matrix.os }}", False),
+)
+
 WF_PR_TARGET_BASE = """\
 on: pull_request_target
 permissions:
@@ -503,6 +535,17 @@ class SyntheticCorpusVerdicts(unittest.TestCase):
         result = _scan({SYNTH: WF_LEAKY_CHECKOUT})
         self.assertEqual({(v.step, v.klass) for v in result.violations}, {("Checkout", "i")})
 
+    def test_9452_checkout_after_pr_code_is_class_i(self) -> None:
+        _need_module(self)
+        result = _scan({SYNTH: WF_LATE_CHECKOUT})
+        self.assertEqual({(v.step, v.klass) for v in result.violations}, {("Second checkout", "i")})
+
+    def test_9452_secret_reference_forms(self) -> None:
+        _need_module(self)
+        for text, expected in SECRET_EXPR_CASES:
+            with self.subTest(text=text):
+                self.assertIs(tb._has_secret_ref(text), expected)
+
     def test_9452_pull_request_target_base_checkout_runs_no_pr_code(self) -> None:
         _need_module(self)
         result = _scan({SYNTH: WF_PR_TARGET_BASE})
@@ -761,6 +804,15 @@ class Bounds(unittest.TestCase):
         self.assertGreater(len(text), RUN_TEXT_BYTES_LARGE)
         start = time.monotonic()
         self.assertFalse(tb._shell_runs_pr_code(text, tb._ShellCtx(False)))
+        self.assertLess(time.monotonic() - start, RUN_TEXT_CEILING_S)
+
+    def test_9452_many_unterminated_expressions_under_ceiling(self) -> None:
+        _need_module(self)
+        text = "${{ a " * (RUN_TEXT_BYTES_LARGE // 6 + 1)
+        start = time.monotonic()
+        self.assertFalse(tb._has_secret_ref(text))
+        with self.assertRaises(tb.Unclassifiable):
+            tb._expr_free(text)
         self.assertLess(time.monotonic() - start, RUN_TEXT_CEILING_S)
 
     def test_9452_oversized_yaml_is_refused(self) -> None:

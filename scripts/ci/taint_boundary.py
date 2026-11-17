@@ -96,9 +96,11 @@ KNOWN_ACTIONS: dict[str, ActionFacts] = {
 }
 
 GITHUB_HOSTED_LABEL_RE = re.compile(r"^(ubuntu|macos|windows)-(latest|\d+(\.\d+)?)(-(arm|arm64|large|xlarge|intel))?$")
-SECRET_REF_RE = re.compile(r"\$\{\{[^}]*?\b(secrets\.[A-Za-z0-9_]+|secrets\[|github\.token\b|toJSON\(\s*secrets\s*\))")
+EXPR_OPEN = "${{"
+EXPR_CLOSE = "}}"
+# Searched inside one `${{ }}` body only (see _has_secret_ref).
+SECRET_REF_RE = re.compile(r"\bsecrets\b|\bgithub\s*(\.\s*token\b|\[\s*['\"]token['\"]\s*\])", re.I)
 STEP_OUTPUT_REF_RE = re.compile(r"\bsteps\.([A-Za-z0-9_-]+)\.outputs\b")
-EXPR_REF_RE = re.compile(r"\$\{\{(.*?)\}\}", re.S)
 EVENT_EQ_RE = re.compile(r"^github\.event_name\s*==\s*'([a-z_]+)'$")
 MATRIX_RUNS_ON_RE = re.compile(r"^\$\{\{\s*(fromJSON\(\s*)?matrix\.([A-Za-z0-9_-]+)\s*\)?\s*\}\}$")
 CHECKOUT_IN_RUN_RE = re.compile(r"\bgit\s+(?:-\S+\s+)*(checkout|switch|worktree|fetch|pull)\b")
@@ -1056,8 +1058,37 @@ class _Step:
     index: int
 
 
+def _split_expressions(text: str) -> tuple[list[str], list[str]]:
+    """Split text into the literal parts and the ``${{ }}`` bodies in one linear pass.
+
+    An unterminated expression keeps the rest of the text as its body (fail closed).
+    """
+    literals: list[str] = []
+    bodies: list[str] = []
+    pos = 0
+    while True:
+        start = text.find(EXPR_OPEN, pos)
+        if start < 0:
+            literals.append(text[pos:])
+            return literals, bodies
+        literals.append(text[pos:start])
+        end = text.find(EXPR_CLOSE, start + len(EXPR_OPEN))
+        if end < 0:
+            bodies.append(text[start + len(EXPR_OPEN):])
+            return literals, bodies
+        bodies.append(text[start + len(EXPR_OPEN):end])
+        pos = end + len(EXPR_CLOSE)
+
+
 def _expr_free(text: str) -> str:
-    return EXPR_REF_RE.sub(EXPR_PLACEHOLDER, text)
+    literals, bodies = _split_expressions(text)
+    if len(bodies) >= len(literals):
+        raise Unclassifiable("unterminated `${{` expression")
+    return EXPR_PLACEHOLDER.join(literals)
+
+
+def _has_secret_ref(text: str) -> bool:
+    return any(SECRET_REF_RE.search(body) for body in _split_expressions(text)[1])
 
 
 def _workflow_events(doc: dict[str, object], label: str) -> set[str]:
@@ -1289,7 +1320,7 @@ def _checkout_tree(step: dict[str, object], events: set[str]) -> str:
 
 def _secret_in(step: dict[str, object]) -> bool:
     parts = [step.get("env"), step.get("with"), step.get("run")]
-    return bool(SECRET_REF_RE.search(_dump(parts)))
+    return _has_secret_ref(_dump(parts))
 
 
 def _analyse_job(wf: str, job_id: str, job: dict[str, object], doc: dict[str, object], events: set[str],
@@ -1336,7 +1367,7 @@ def _analyse_job(wf: str, job_id: str, job: dict[str, object], doc: dict[str, ob
             found.append(v)
 
     # (i) a secret at or after the taint point.
-    if SECRET_REF_RE.search(_dump([job.get("env"), doc.get("env")])):
+    if _has_secret_ref(_dump([job.get("env"), doc.get("env")])):
         add(taint, CLASS_SECRET, "job or workflow env holds a secret for a tainted job")
     for step in leaky_checkouts:
         add(step, CLASS_SECRET, "checkout keeps the token in the workspace for later pull-request code")
@@ -1345,7 +1376,10 @@ def _analyse_job(wf: str, job_id: str, job: dict[str, object], doc: dict[str, ob
         uses = step.body.get("uses")
         default_token = isinstance(uses, str) and not uses.startswith(LOCAL_PREFIX) and \
             KNOWN_ACTIONS.get(_action_name(uses), ActionFacts()).default_token
-        if _secret_in(step.body) or default_token:
+        # A checkout after the taint point hands its token to git inside a workspace that
+        # pull-request code has already run in, whatever `persist-credentials` says.
+        late_checkout = step is not taint and isinstance(uses, str) and _action_name(uses) == CHECKOUT_ACTION
+        if _secret_in(step.body) or default_token or late_checkout:
             add(step, CLASS_SECRET, "secret or token used after pull-request code ran")
             token_users.append(step)
     # (ii) a write token in a tainted job.
@@ -1405,11 +1439,8 @@ def _analyse_workflow(name: str, text: str, workflows: dict[str, str], actions: 
                                   result, _job_events(job, events), inner_prefix, depth + 1)
                 result.verdicts[key] = "reusable"
                 continue
-            before = len(result.violations)
-            verdict = _analyse_job(key[0], key[1], job, doc, events, actions, repo_files, downloads, result)
-            for v in result.violations[before:]:
-                assert v.workflow == key[0]
-            result.verdicts[key] = verdict
+            result.verdicts[key] = _analyse_job(key[0], key[1], job, doc, events, actions, repo_files,
+                                                downloads, result)
         except Unclassifiable as exc:
             result.unclassifiable.append(str(exc))
             result.verdicts[key] = "unclassifiable"
