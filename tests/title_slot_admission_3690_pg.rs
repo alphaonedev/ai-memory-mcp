@@ -20,6 +20,9 @@ use ai_memory::models::{ConfidenceSource, LifecycleState, Memory, MemoryKind, Ti
 use ai_memory::store::postgres::PostgresStore;
 use ai_memory::store::{CallerContext, MemoryStore, StoreError};
 
+mod common;
+use common::pg_barrier::ScratchDb;
+
 fn mem(id: &str, ns: &str, title: &str, content: &str) -> Memory {
     let now = chrono::Utc::now().to_rfc3339();
     Memory {
@@ -828,4 +831,185 @@ async fn pg_refused_conflict_keeps_its_typed_shape_and_a_visible_occupant_keeps_
         "alice's text",
         "never written into"
     );
+}
+
+// ------------------------------------------------- #8341 INV-4: pg tsv parity
+
+const TSV_SCRATCH_PREFIX: &str = "ai_memory_tsv8341_";
+/// The v101 shape: v102 is stamp-only on postgres, so dropping its stamp is
+/// the whole of the v101-equivalent rewind.
+const V101_EQUIVALENT: i32 = 101;
+const V102_TIP: i32 = 102;
+const TSV_AMENDED_TITLE: &str = "plain ascii";
+/// `(title, content)`; titles are unique so they key the snapshot.
+const TSV_CORPUS: [(&str, &str); 5] = [
+    ("plain ascii", "the quick brown fox jumps over the lazy dog"),
+    ("Unicode Title Éé", "café naïve straße 東京 São Paulo"),
+    ("punctuation", "a-b c_d e.f 'quoted' \"double\" 50% x/y"),
+    (
+        "agent shaped",
+        r#"{"agent_pubkey":"key-8341","pubkey_bound_at":"2026-01-01T00:00:00Z"}"#,
+    ),
+    ("empty body", ""),
+];
+const TSV_LONG_TITLE: &str = "long body";
+const TSV_LONG_WORDS: usize = 4_000;
+
+async fn tsv_pool(url: &str) -> sqlx::PgPool {
+    sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .acquire_timeout(std::time::Duration::from_secs(15))
+        .connect(url)
+        .await
+        .expect("pool connect")
+}
+
+/// Raw writes, so the v101-equivalent store is written without the binary's
+/// ladder: what is compared is the database-side `tsv` projection.
+async fn write_tsv_corpus(pool: &sqlx::PgPool, ns: &str) {
+    let long: String = (0..TSV_LONG_WORDS)
+        .map(|i| format!("word{i}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let rows = TSV_CORPUS
+        .iter()
+        .map(|(t, c)| ((*t).to_string(), (*c).to_string()))
+        .chain(std::iter::once((TSV_LONG_TITLE.to_string(), long)));
+    for (title, content) in rows {
+        sqlx::query(
+            "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, \
+             confidence, source, metadata, access_count, created_at, updated_at) \
+             VALUES ($1, 'long', $2, $3, $4, '[]', 5, 1.0, 'api', '{}', 0, \
+             '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .bind(fresh_name("tsv8341"))
+        .bind(ns)
+        .bind(&title)
+        .bind(&content)
+        .execute(pool)
+        .await
+        .expect("insert corpus row");
+    }
+    sqlx::query(
+        "UPDATE memories SET content = content || ' amended' WHERE namespace = $1 AND title = $2",
+    )
+    .bind(ns)
+    .bind(TSV_AMENDED_TITLE)
+    .execute(pool)
+    .await
+    .expect("amend one row");
+}
+
+/// `(title, content, tsv)` of every row of `ns`, ordered by title.
+async fn tsv_snapshot(pool: &sqlx::PgPool, ns: &str) -> Vec<(String, String, String)> {
+    sqlx::query_as(
+        "SELECT title, content, tsv::text FROM memories WHERE namespace = $1 ORDER BY title",
+    )
+    .bind(ns)
+    .fetch_all(pool)
+    .await
+    .expect("tsv snapshot")
+}
+
+/// The user triggers on `memories` and the `tsv` column definition: v102
+/// must change neither.
+async fn tsv_catalog(pool: &sqlx::PgPool) -> (Vec<(String, String)>, Option<String>) {
+    let triggers = sqlx::query_as(
+        "SELECT tgname::text, pg_get_triggerdef(oid) FROM pg_trigger \
+         WHERE tgrelid = 'memories'::regclass AND NOT tgisinternal ORDER BY 1",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("memories triggers");
+    let generation = sqlx::query_scalar(
+        "SELECT generation_expression::text FROM information_schema.columns \
+         WHERE table_schema = current_schema() AND table_name = 'memories' AND column_name = 'tsv'",
+    )
+    .fetch_optional(pool)
+    .await
+    .expect("tsv column")
+    .flatten();
+    (triggers, generation)
+}
+
+async fn max_version(pool: &sqlx::PgPool) -> i32 {
+    sqlx::query_scalar("SELECT MAX(version) FROM schema_version")
+        .fetch_one(pool)
+        .await
+        .expect("schema_version")
+}
+
+/// #8341 INV-4 - the v102 rung is stamp-only on postgres: rows written at the
+/// v101-equivalent store keep a byte-identical `tsv` across the v102 ladder,
+/// and the same corpus written at v102 projects the identical `tsv`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pg_tsv_rows_are_identical_at_v101_equivalent_and_v102_8341() {
+    let Some(admin_url) = common::postgres_url() else {
+        eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+        return;
+    };
+    let scratch = ScratchDb::create(&admin_url, TSV_SCRATCH_PREFIX)
+        .await
+        .expect("scratch db");
+    let url = scratch.url();
+    drop(PostgresStore::connect(&url).await.expect("greenfield"));
+    let pool = tsv_pool(&url).await;
+    assert_eq!(max_version(&pool).await, V102_TIP);
+    let catalog_v102 = tsv_catalog(&pool).await;
+
+    sqlx::query("DELETE FROM schema_version WHERE version = $1")
+        .bind(V102_TIP)
+        .execute(&pool)
+        .await
+        .expect("rewind to v101");
+    assert_eq!(max_version(&pool).await, V101_EQUIVALENT);
+    let (ns_v101, ns_v102) = (fresh_name("tsv-v101"), fresh_name("tsv-v102"));
+    write_tsv_corpus(&pool, &ns_v101).await;
+    let at_v101 = tsv_snapshot(&pool, &ns_v101).await;
+    assert_eq!(
+        at_v101.len(),
+        TSV_CORPUS.len() + 1,
+        "every corpus row lands"
+    );
+    // tsv = to_tsvector('english', title || content || tags): every row
+    // carries at least its title lexemes, so none is empty.
+    assert!(
+        at_v101.iter().all(|(_, _, tsv)| !tsv.is_empty()),
+        "every row projects a non-empty tsv: {at_v101:?}"
+    );
+    let amended = at_v101
+        .iter()
+        .find(|(t, _, _)| t == TSV_AMENDED_TITLE)
+        .expect("amended row");
+    assert!(amended.1.ends_with(" amended"), "{amended:?}");
+    assert!(amended.2.contains("'fox'"), "{amended:?}");
+    assert!(
+        amended.2.contains("'amend'"),
+        "the update re-projects: {amended:?}"
+    );
+
+    drop(
+        PostgresStore::connect(&url)
+            .await
+            .expect("ladder re-runs v102"),
+    );
+    assert_eq!(max_version(&pool).await, V102_TIP);
+    assert_eq!(
+        tsv_snapshot(&pool, &ns_v101).await,
+        at_v101,
+        "the v102 rung must not rewrite any v101 row's tsv"
+    );
+    assert_eq!(
+        tsv_catalog(&pool).await,
+        catalog_v102,
+        "v102 changes no memories trigger and not the tsv expression"
+    );
+
+    write_tsv_corpus(&pool, &ns_v102).await;
+    assert_eq!(
+        tsv_snapshot(&pool, &ns_v102).await,
+        at_v101,
+        "the same corpus projects the identical tsv at v101 and v102"
+    );
+    pool.close().await;
 }
