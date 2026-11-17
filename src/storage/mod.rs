@@ -4277,32 +4277,24 @@ pub fn update_with_expected_version(
     // UPDATE SET list, so it is always preserved (the genesis assertion instant).
     valid_until: Option<&str>,
 ) -> Result<(bool, bool)> {
-    // #1955 R45 — record-stop fence for the update funnel.
-    crate::storage::record_stop::gate_storage_conn(conn)?;
-    // #9405 - every read the write depends on (the stored row, the `_agents`
-    // ledger projection, the sealed-row probe) and the UPDATE run in ONE
-    // write transaction (BEGIN IMMEDIATE, or the caller's): a bind / rebind /
-    // revoke cannot commit between the projection read and the row write.
-    // decision: project inside the transaction over retrying on guard abort,
-    // because the retry hides the race and the invariant is one transaction.
-    connection::in_write_txn(conn, || {
-        versioned_update_txn::update_with_expected_version_in_txn(
-            conn,
-            id,
-            title,
-            content,
-            tier,
-            namespace,
-            tags,
-            priority,
-            confidence,
-            expires_at,
-            metadata,
-            source_uri,
-            expected_version,
-            valid_until,
-        )
-    })
+    // #9273 - the record-stop gate, the write transaction and the UPDATE
+    // live in ONE fn span in the child module (B7 gate-in-span invariant).
+    versioned_update_txn::update_with_expected_version_in_txn(
+        conn,
+        id,
+        title,
+        content,
+        tier,
+        namespace,
+        tags,
+        priority,
+        confidence,
+        expires_at,
+        metadata,
+        source_uri,
+        expected_version,
+        valid_until,
+    )
 }
 
 /// v0.7.0 Provenance Gap 5 (issue #888) — append-and-archive result
