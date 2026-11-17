@@ -39,10 +39,10 @@ RED_CELLS = {
     # off the AST line numbers: an earlier comment must not excuse a silent handler.
     "form feeds before a silent handler": ("s = '\x0c\x0c\x0c'  # c\ntry:\n    f()\nexcept OSError:\n    pass\n",
                                            "silent handler"),
-    # The tokenizer also ends a line at a lone \r: splitting only at \n would make the whole source one line, so
-    # an earlier comment would excuse the silent handler.
-    "lone carriage returns before a silent handler": ("x = 1  # c\rtry:\r    f()\rexcept OSError:\r    pass\r",
-                                                      "silent handler"),
+    # The tokenizer also ends a line at a lone \r: splitting only at \n would fold the handler into one line, so
+    # the window would land on the later commented lines and excuse the silent handler.
+    "lone carriage returns in a silent handler": ("try:\r    f()\rexcept OSError:\r    pass\na = 1  # c\nb = 2  # d\n",
+                                                  "silent handler"),
 }
 GREEN_CELLS = {
     "comment on the pass": "try:\n    f()\nexcept OSError:\n    pass  # absent is fine\n",
