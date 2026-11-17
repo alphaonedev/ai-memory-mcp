@@ -89,11 +89,18 @@ class SharedModuleNotLoadedError(RuntimeError):
 
 
 class _NotLoaded:
-    """The state of ``wa`` until the load ran: any use is a named error, never a half-working helper."""
+    """The state of ``wa`` until the load ran: one explicit member per name this script uses from the shared module
+    (a test pins the set against the ast), each a named error, never a half-working helper. No __getattr__, so
+    hasattr and getattr with a default cannot turn a forgotten load into a silent fallback."""
 
-    def __getattr__(self, name):
-        raise SharedModuleNotLoadedError("workflow_annotation.py is not loaded; call require_workflow_annotation() "
-                                         "first (wanted %s)" % name)
+    _WANTED = ("workflow_annotation.py is not loaded; call require_workflow_annotation() "
+              "first (wanted %s)")
+
+    def annotation(self, *args, **kwargs):
+        raise SharedModuleNotLoadedError(self._WANTED % "annotation")
+
+    def log_line(self, *args, **kwargs):
+        raise SharedModuleNotLoadedError(self._WANTED % "log_line")
 
 
 wa = _NotLoaded()
