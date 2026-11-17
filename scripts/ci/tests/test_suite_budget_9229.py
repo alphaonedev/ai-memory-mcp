@@ -26,6 +26,7 @@ import textwrap
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parents[3]
 SCRIPT = REPO / "scripts" / "ci" / "suite_budget.py"
@@ -39,6 +40,11 @@ ISSUE_NOTE = "this red is issue #9229 (the cost of the sqlite suite), not a fail
 SCAN_LINES = 200_000  # a log larger than any real sqlite suite log (about 53k lines at the kill)
 SCAN_CEILING_SECS = 20.0  # linear scan of SCAN_LINES; a quadratic scan takes minutes
 STEP_TIMEOUT_SECS = 120
+REAL_MANIFEST_TEST = "test_every_tested_target_of_the_real_manifest_is_selected_once"
+CI_ENV = "GITHUB_ACTIONS"
+# The text of the red a CI leg without cargo gets: a skip there would hide the real-manifest check.
+CI_NO_CARGO_MSG = "the real-manifest check cannot run on a CI leg without cargo: install cargo or fix PATH"
+NO_CARGO_SKIP_MSG = "cargo metadata unavailable: no cargo on PATH"
 
 
 def load():
@@ -517,6 +523,30 @@ def workflow(job_timeout="${{ matrix.timeout }}", legs=(("ubuntu-latest", "sqlit
         line = "" if timeout is None else "            timeout: %s  # minutes\n" % timeout
         body += LEG % {"node": node, "tier": tier, "timeout": line}
     return LEGS_FIXTURE % {"job_timeout": job_timeout, "legs": body}
+
+
+class RealManifestCheckOnCi(unittest.TestCase):
+    """The real-manifest cell is never silently skipped on a CI leg (#9229)."""
+
+    def run_real_manifest_cell(self, environ):
+        case = ShardArgs(REAL_MANIFEST_TEST)
+        result = unittest.TestResult()
+        with mock.patch.dict(os.environ, environ), mock.patch.object(shutil, "which", return_value=None):
+            if CI_ENV not in environ:
+                os.environ.pop(CI_ENV, None)
+            case.run(result)
+        return result
+
+    def test_ci_leg_without_cargo_fails_with_the_named_message(self):
+        result = self.run_real_manifest_cell({CI_ENV: "true"})
+        self.assertEqual(result.skipped, [])
+        self.assertEqual(len(result.failures), 1, result.errors)
+        self.assertTrue(result.failures[0][1].rstrip().endswith("AssertionError: " + CI_NO_CARGO_MSG))
+
+    def test_host_without_the_ci_variable_and_without_cargo_skips_as_before(self):
+        result = self.run_real_manifest_cell({})
+        self.assertEqual((result.failures, result.errors), ([], []))
+        self.assertEqual([reason for _, reason in result.skipped], [NO_CARGO_SKIP_MSG])
 
 
 class WholeSuite(unittest.TestCase):
