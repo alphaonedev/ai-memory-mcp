@@ -108,6 +108,7 @@ STUB_CARGO = '''#!%(python)s -I
 """Stub cargo of the step harness: logs its arguments and follows the plans in its directory."""
 import os
 import sys
+import time
 from pathlib import Path
 
 d = Path(%(dir)r)
@@ -141,6 +142,16 @@ if args[:1] == ["test"]:
         forged.write_text("1\\tforged lib\\n1\\tforged part 1\\n1\\tforged part 2\\n")
     clock = d / "clock"
     clock.write_text(str(int(clock.read_text()) + secs))
+    runs = sum(1 for line in (d / "cargo.calls").read_text().splitlines()
+               if line.startswith("test") and "--no-run" not in line.split())
+    marked = d / "timer.index"
+    if marked.exists() and runs == int(marked.read_text()):
+        # The stubbed timer of this invocation fires "during" the run: the run ends only once it has
+        # exited, as a real timer past its deadline would (on a loaded host its start can lag the run).
+        waited = 0
+        while not (d / "timer.done").exists() and waited < 600:
+            time.sleep(0.05)
+            waited += 1
     print("stub cargo test: %%ds rc %%d" %% (secs, rc))
     sys.exit(rc)
 sys.exit(0)
@@ -167,6 +178,7 @@ import sys
 args = sys.argv[1:]
 if "timer" in args and "--label" in args and %(marker)r in args[args.index("--label") + 1]:
     print("::error::stub timer fired: " + args[args.index("--label") + 1], flush=True)
+    open(%(done)r, "w").close()
     sys.exit(3)
 os.execv(%(python)r, [%(python)r] + args)
 '''
@@ -199,7 +211,11 @@ def run_step(text, runs=(), prebuild=(), metadata_rc=0, meta="default", impact="
         _write_exec(bindir / "date", STUB_DATE % {"python": sys.executable, "epoch": FAKE_EPOCH,
                                                   "clock": str(d / "clock"), "real": REAL_DATE})
         if timer_fires is not None:
-            _write_exec(bindir / "python3", STUB_PYTHON % {"python": sys.executable, "marker": timer_fires})
+            _write_exec(bindir / "python3", STUB_PYTHON % {"python": sys.executable, "marker": timer_fires,
+                                                           "done": str(d / "timer.done")})
+            shard = re.search(r"shard ([0-9])/", timer_fires)
+            if shard:  # the stub cargo of that invocation returns only after the stubbed timer exited
+                (d / "timer.index").write_text(shard.group(1))
         script = d / "step.sh"
         script.write_text("#!/bin/bash\n" + text + "\n", encoding="utf-8")
         env = dict(os.environ)
