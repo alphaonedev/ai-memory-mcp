@@ -185,6 +185,10 @@ HB_PID_LINE = "hb=$!"
 HB_KILL_LINE = 'kill "$hb" 2>/dev/null || true'
 HB_WAIT_LINE = 'wait "$hb" 2>/dev/null || true'
 MIN_ITERATIONS = 3
+# await-ticks waits for the tails of one iteration past MIN_ITERATIONS: the loop is sequential, so the tails of
+# iteration k + 1 start only after the python3 call and fallback of iteration k are done, and the kill cannot
+# land between the last counted tail and its python3 call.
+AWAIT_ITERATIONS = MIN_ITERATIONS + 1
 FAILING_STUB_RC = 1
 PASSING_STUB_RC = 0
 SHELL_SIGNAL_RC_BASE = 128  # bash reports a child killed by signal N as 128 + N
@@ -641,7 +645,7 @@ class ProgressNotice(unittest.TestCase):
         env = dict(os.environ, PATH=str(stub_dir), HB_CALLS=str(calls), HB_TAILS=str(tails),
                    HB_REAL_TAIL=shutil.which("tail"), HB_STUB_RC=str(stub_rc), HB_STUB_MODE=stub_mode,
                    HB_TICK=str(STUB_TICK_SECS), HB_DEADLINE=str(AWAIT_DEADLINE_SECS),
-                   HB_MIN=str(MIN_ITERATIONS * len(SHARD_LOGS)))
+                   HB_MIN=str(AWAIT_ITERATIONS * len(SHARD_LOGS)))
         env["HB_CALLS_WAIT"] = env["HB_TAILS"]
         result = subprocess.run([shutil.which(STEP_SHELL_COMMAND[0]), *STEP_SHELL_COMMAND[1:], str(script)],
                                 cwd=str(REPO), env=env, capture_output=True, timeout=RUN_CEILING_SECS, check=False)
