@@ -2313,7 +2313,7 @@ jobs:
                 sleep 300 >/dev/null 2>&1
                 # #9430: the last lines of the shard logs are pull-request text. The one python3 -I call below reads them itself
                 # (no host text tool: uutils tail 0.10.0 loses bytes at 64 KiB, uutils and BSD cut -c cut characters): each log
-                # path is opened rb, non-blocking, and read only when fstat says it is a regular file (missing, unreadable, a
+                # path is opened rb with O_NONBLOCK and read only when fstat says it is a regular file (missing, unreadable, a
                 # directory, a FIFO or a device gives an empty field); at most READ_BYTES are read back from the end; the field
                 # is the last line cut to CUT_BYTES bytes, or the last CUT_BYTES bytes read when that window holds no line feed.
                 # workflow_annotation.render escapes each field once, so no line break, %, :: or ##[ of a log line reaches the
