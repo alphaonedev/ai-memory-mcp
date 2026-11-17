@@ -52,6 +52,13 @@ use serde_json::json;
 /// documented schema SSOT, NOT a bare literal scattered through asserts.
 const V064_BASELINE_SCHEMA_VERSION: i64 = 33;
 
+/// The v102 (#8341) abort guards on `memories`; their bodies read
+/// `NEW.encrypted_envelope`, so a column-absent rewind drops them first.
+const V102_PROJECTION_GUARD_TRIGGERS: [&str; 2] = [
+    "agent_pubkey_history_projection_guard_insert",
+    "agent_pubkey_history_projection_guard_update",
+];
+
 /// The closed-taxonomy relation used for the seeded edges. Any member of
 /// the v0.7.0 `MemoryLinkRelation` taxonomy works; `related_to` is the
 /// neutral choice and avoids the directional semantics of `supersedes` /
@@ -324,6 +331,14 @@ fn v064_legacy_rows_physically_lacking_v070_columns_upgrade_losslessly() {
             conn.execute(&format!("DROP INDEX IF EXISTS {idx}"), [])
                 .unwrap_or_else(|e| panic!("drop index {idx}: {e}"));
         }
+        // A real v0.6.4 database carries none of the v102 projection guards
+        // (#8341), and SQLite re-checks every trigger body on DROP COLUMN:
+        // the guards read NEW.encrypted_envelope, so they go first. The
+        // ladder re-installs them on the re-open (asserted below).
+        for trigger in V102_PROJECTION_GUARD_TRIGGERS {
+            conn.execute(&format!("DROP TRIGGER IF EXISTS {trigger}"), [])
+                .unwrap_or_else(|e| panic!("drop trigger {trigger}: {e}"));
+        }
         let droppable_v070_columns = [
             "atomised_into",         // v36 (index dropped above)
             "entity_id",             // v37
@@ -365,6 +380,18 @@ fn v064_legacy_rows_physically_lacking_v070_columns_upgrade_losslessly() {
         "upgrade of a column-absent legacy DB must reach the v0.7.0 head"
     );
 
+    // The v102 rung re-installed both projection guards dropped above.
+    for trigger in V102_PROJECTION_GUARD_TRIGGERS {
+        let present: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name = ?1",
+                [trigger],
+                |r| r.get(0),
+            )
+            .expect("read sqlite_master");
+        assert_eq!(present, 1, "the v102 ladder must re-install {trigger}");
+    }
+
     // Columns re-added.
     for col in ["entity_id", "citations", "confidence_source", "version"] {
         assert!(
@@ -396,6 +423,49 @@ fn v064_legacy_rows_physically_lacking_v070_columns_upgrade_losslessly() {
             "re-added v38 citations column must backfill legacy row {id} to empty"
         );
     }
+
+    assert_guards_enforce_after_upgrade(&conn);
+}
+
+/// The re-installed v102 guards enforce on the upgraded legacy store: the
+/// trigger body aborts a forged key, and the `UPDATE OF` list re-checks an
+/// envelope-only unseal (#9406). Exact RAISE texts from 0086.
+fn assert_guards_enforce_after_upgrade(conn: &Connection) {
+    const AGENT: &str = "ai:legacy-upgrade-guard-8341";
+    const MISMATCH_MESSAGE: &str = "agent_projection_guard: _agents write does not carry the authoritative agent_pubkey_history projection (metadata and content agent_pubkey/pubkey_bound_at must equal the open history row)";
+    const NON_OBJECT_MESSAGE: &str = "agent_projection_guard: bound _agents registration content is not a JSON object; re-register the agent (register_agent) to rebuild it";
+    db::register_agent(conn, AGENT, "test", &[]).expect("register on the upgraded store");
+    let kp = ai_memory::identity::keypair::generate(AGENT).expect("keypair");
+    db::bind_agent_pubkey_with_keypair(conn, AGENT, &kp).expect("bind on the upgraded store");
+    let title = ai_memory::models::agent_registration_title(AGENT);
+    let ns = ai_memory::models::AGENTS_NAMESPACE;
+    let raw = |err: &rusqlite::Error| match err {
+        rusqlite::Error::SqliteFailure(_, Some(message)) => Some(message.clone()),
+        _ => None,
+    };
+
+    let forged = conn
+        .execute(
+            "UPDATE memories SET metadata = json_set(metadata, '$.agent_pubkey', 'forged-8341')
+              WHERE namespace = ?1 AND title = ?2",
+            rusqlite::params![ns, &title],
+        )
+        .expect_err("the re-installed update guard must abort a forged key");
+    assert_eq!(raw(&forged).as_deref(), Some(MISMATCH_MESSAGE));
+
+    conn.execute(
+        "UPDATE memories SET content = '', encrypted_envelope = X'00'
+          WHERE namespace = ?1 AND title = ?2",
+        rusqlite::params![ns, &title],
+    )
+    .expect("a sealed row with the ledger pair passes");
+    let unseal = conn
+        .execute(
+            "UPDATE memories SET encrypted_envelope = NULL WHERE namespace = ?1 AND title = ?2",
+            rusqlite::params![ns, &title],
+        )
+        .expect_err("UPDATE OF encrypted_envelope must re-check an unseal on the upgraded store");
+    assert_eq!(raw(&unseal).as_deref(), Some(NON_OBJECT_MESSAGE));
 }
 
 /// True when `table.column` exists, via `PRAGMA table_info`.
