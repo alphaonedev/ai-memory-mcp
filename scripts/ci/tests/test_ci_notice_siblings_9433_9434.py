@@ -102,7 +102,7 @@ MIB_CEILING_SECS = 20.0
 
 # #9433 (ruling (a) 2): the impact print at the base a028c45e was this one line between the span anchors.
 BASE_SHA = "a028c45e55c7817b88c4b139347f407387e4a02c"
-BASE_IMPACT_SPAN = "          sed -n '1,200{s/::/: :/g;p}' \"$impact_log\"\n"
+BASE_IMPACT_SPAN = "sed -n '1,200{s/::/: :/g;p}' \"$impact_log\"\n"
 # (base rc, head rc) of the impact print, measured with GNU sed 4.9 at the base. "unreadable" differs:
 # sed exits 2, the head print exits 1; the conductor rules which one is right (needs-conductor in READY).
 # Until then the measured pair is pinned so any change of either is red.

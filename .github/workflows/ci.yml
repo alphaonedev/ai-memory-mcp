@@ -698,14 +698,27 @@ jobs:
           docs_only=false
           cargo_skip=false
           cargo_skip_reason="classifier-error-fail-closed cargo_skip-rules"
-          trust_dir="${RUNNER_TEMP:-.}/impact-trusted"
+          trust_dir=""
+          # #9434: the trust directory is private (mktemp -d makes it mode 700) and never
+          # under the workspace: RUNNER_TEMP, else TMPDIR, each resolved with pwd -P;
+          # neither outside the workspace = no trusted copy (fail closed below).
+          trust_ws=$(pwd -P)
+          for trust_parent in "${RUNNER_TEMP:-}" "${TMPDIR:-/tmp}"; do
+            [ -n "$trust_parent" ] || continue
+            trust_real=$(cd "$trust_parent" 2>/dev/null && pwd -P) || continue
+            case "$trust_real/" in "$trust_ws"/*) continue ;; esac
+            if trust_dir=$(mktemp -d "$trust_real/impact-trusted.XXXXXXXX" 2>/dev/null); then break; fi
+            trust_dir=""
+          done
           trust_impact="$trust_dir/scripts/ci/impact"
           trust_ref=$(git merge-base HEAD "$cls_base" 2>/dev/null || echo "$cls_base")
-          mkdir -p "$trust_impact"
-          trusted=true
-          for trust_file in __init__.py common.py cargo_skip.py rules.json; do
-            git show "${trust_ref}:scripts/ci/impact/${trust_file}" > "$trust_impact/$trust_file" 2>/dev/null || trusted=false
-          done
+          trusted=false
+          if [ -n "$trust_dir" ] && mkdir -p "$trust_impact"; then
+            trusted=true
+            for trust_file in __init__.py common.py cargo_skip.py rules.json; do
+              git show "${trust_ref}:scripts/ci/impact/${trust_file}" > "$trust_impact/$trust_file" 2>/dev/null || trusted=false
+            done
+          fi
           skip_out="${RUNNER_TEMP:-.}/cargo-skip.out"
           : > "$skip_out"
           if [ "$trusted" != "true" ]; then
@@ -732,7 +745,7 @@ jobs:
           trust_wa="$trust_ci/workflow_annotation.py"
           wa_rel="${trust_ci#"$trust_dir"/}/workflow_annotation.py"
           wa_ok=false
-          if git show "${trust_ref}:${wa_rel}" > "$trust_wa" 2>/dev/null; then wa_ok=true; fi
+          if [ -n "$trust_dir" ] && git show "${trust_ref}:${wa_rel}" > "$trust_wa" 2>/dev/null; then wa_ok=true; fi
           wa_prog='if True:
             import importlib.util, os, sys
             spec = importlib.util.spec_from_file_location("workflow_annotation", sys.argv[1])
@@ -756,9 +769,13 @@ jobs:
           # kernel CSPRNG, made here, never shown before the stop line.
           list_tok=$(python3 -I -c 'import secrets; print(secrets.token_hex(16))' 2>/dev/null) || list_tok=""
           if [[ "$list_tok" =~ ^[0-9a-f]{32}$ ]]; then
+            # finally form: a print that fails half-way still gets a newline and the
+            # end line; the step then exits with the print's code, as `echo` did.
+            list_rc=0
             echo "::stop-commands::${list_tok}"
-            printf '%s\n' "$changed"
+            printf '%s\n' "$changed" || { list_rc=$?; echo || :; }
             echo "::${list_tok}::"
+            (exit "$list_rc")
           else
             echo "::notice::[#9433] changed-file list not printed: no stop-commands token could be made (fail closed; the classification is unchanged)"
           fi
@@ -846,7 +863,8 @@ jobs:
           # The first 200 lines are printed with every "::" spaced to ": :" (as the
           # sed this replaces did) and every "##[" (the legacy command form, read
           # anywhere in a line) spaced to "# #["; Python, so a missing final
-          # newline is added and the next line always starts its own line.
+          # newline is added and the next line always starts its own line. A missing
+          # log exits 2, as sed did (#9433 ruling (a) 2).
           impact_print_rc=0
           python3 -I -c 'if True:
             import sys
@@ -862,7 +880,7 @@ jobs:
                         last = line[-1:]
             except OSError as err:
                 sys.stderr.write("[#9433] impact log not readable: %s\n" % err.strerror)
-                sys.exit(1)
+                sys.exit(2 if isinstance(err, FileNotFoundError) else 1)
             finally:
                 if last != b"\n":
                     out.write(b"\n")
@@ -2383,7 +2401,8 @@ jobs:
               # #9433: a shard log is written by PR-run tests. It is printed only between
               # ::stop-commands::<token> and ::<token>::, the token 128 bits from the
               # kernel CSPRNG, new per block, never shown before the stop line. No token:
-              # a fixed notice, no raw log. The exit code stays that of `cat`.
+              # a fixed notice, no raw log. The exit code stays that of `cat`. A copy that
+              # fails half-way gets a newline, so the end line starts its own line.
               local shard_tok shard_rc
               echo "::group::[#6344] ${n} shard output"
               shard_tok=$(python3 -I -c 'import secrets; print(secrets.token_hex(16))' 2>/dev/null) || shard_tok=""
@@ -2405,7 +2424,7 @@ jobs:
                   finally:
                       if last != b"\n":
                           out.write(b"\n")
-                      out.flush()' "$sd/$n.log" || shard_rc=$?
+                      out.flush()' "$sd/$n.log" || { shard_rc=$?; echo || :; }
                 echo "::${shard_tok}::"
               else
                 echo "::notice::[#9433] ${n} shard output not printed: no stop-commands token could be made (fail closed; the step result is unchanged)"
