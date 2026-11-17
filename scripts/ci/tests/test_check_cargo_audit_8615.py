@@ -35,6 +35,7 @@ EXCEPTIONS = [
 # #8695 (CI red) is resolved here; the exception tracks the removal issue #8696 (code guard #8697).
 # Policy files only; the report fixtures predate the advisory.
 POLICY_ONLY_8695 = ("RUSTSEC-2026-0459", "libsqlite3-sys", "0.30.1", 8696)
+POLICY_ONLY_9420 = ("RUSTSEC-2026-0543", "chrono", "0.4.44", 9421)
 REASON_TERMS_8695 = ("-wal", "page size", "migrate --from", "restore", "local", "links", "sqlcipher",
                      "libsqlite3-sys >= 0.39", "Not mitigated", "#8696", "#8697", "--db")
 
@@ -288,7 +289,7 @@ class CargoAudit8615Tests(unittest.TestCase):
         identities = [(entry["id"], entry["package"], entry["version"], entry["issue"])
                       for entry in entries]
         expected = [(entry["id"], entry["package"], entry["version"], entry["issue"])
-                    for entry in EXCEPTIONS] + [POLICY_ONLY_8695]
+                    for entry in EXCEPTIONS] + [POLICY_ONLY_8695, POLICY_ONLY_9420]
         self.assertEqual(identities, expected)
         GATE.exception_index(entries, TODAY)
         for entry in entries:
