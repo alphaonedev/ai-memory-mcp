@@ -254,10 +254,10 @@ fn changes(toks: &[String]) -> (Vec<(usize, Change)>, TriggerPositions, TriggerP
             if at(toks, j, "temp") || at(toks, j, "temporary") {
                 j += 1;
             }
-            if at(toks, j, "trigger") {
-                if let Some((name, _)) = object_name(toks, skip_if_exists(toks, j + 1)) {
-                    created.entry(name).or_default().push(i);
-                }
+            if at(toks, j, "trigger")
+                && let Some((name, _)) = object_name(toks, skip_if_exists(toks, j + 1))
+            {
+                created.entry(name).or_default().push(i);
             }
         }
         i += 1;
@@ -312,10 +312,10 @@ fn scan(sql: &str, guards: &[Guard]) -> Vec<Violation> {
 fn trigger_tables(toks: &[String]) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     for (i, tok) in toks.iter().enumerate() {
-        if matches!(tok.as_str(), "on" | "from" | "join" | "into" | "update") {
-            if let Some((name, _)) = object_name(toks, i + 1) {
-                out.insert(name);
-            }
+        if matches!(tok.as_str(), "on" | "from" | "join" | "into" | "update")
+            && let Some((name, _)) = object_name(toks, i + 1)
+        {
+            out.insert(name);
         }
     }
     out
