@@ -110,7 +110,7 @@ def inside_state(root, candidate):
             return "unresolvable", "MISMATCH"
         return ("dir" if stat.S_ISDIR(raw.st_mode) else "file"), ""
     except (FileNotFoundError, NotADirectoryError):
-        pass
+        pass  # an absent target is the "missing" verdict returned below
     except OSError as err:
         if err.errno is None:
             return "unresolvable", "OSError"
@@ -123,7 +123,7 @@ def inside_state(root, candidate):
             return "unresolvable", "ELOOP"
         return "unresolvable", raw_failure_label(candidate)
     except ValueError:
-        pass
+        pass  # a path that cannot be resolved inside the root is the "missing" verdict below
     return "missing", ""
 
 

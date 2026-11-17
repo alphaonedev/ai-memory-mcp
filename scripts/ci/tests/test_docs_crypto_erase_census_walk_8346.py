@@ -5806,7 +5806,7 @@ class DocsCryptoEraseCensusWalk8346(unittest.TestCase):
                     if codecs.lookup(arg.value).name in names:
                         return True
                 except (LookupError, ValueError):
-                    pass
+                    pass  # an unknown codec name is not one of `names`; the next argument is checked
         return False
 
     @classmethod
