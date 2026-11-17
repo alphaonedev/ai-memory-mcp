@@ -18,6 +18,7 @@ import io
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -31,7 +32,7 @@ SCRIPT = REPO / "scripts" / "ci" / "suite_budget.py"
 CI = (REPO / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
 
 BUDGET = 2100  # the ubuntu-latest sqlite per-invocation watchdog budget (ci.yml WATCHDOG_SECS)
-DEADLINE = 1680  # 80 % of BUDGET: the last second of wall that still holds the 20 % margin
+DEADLINE = 1680  # 80 percent of BUDGET: the last second of wall that still holds the 20 percent margin
 CEILING = 3600  # WHOLE_SUITE_CEILING_SECS: the most seconds the invocations of the sqlite full suite may sum to
 # The text every margin red carries, so a lane reads it as the suite's cost, not its own failure (cdfe800f).
 ISSUE_NOTE = "this red is issue #9229 (the cost of the sqlite suite), not a failure of the change under test"
@@ -76,11 +77,12 @@ class Judge(unittest.TestCase):
     def test_table(self):
         rows = (
             # elapsed, rc, verdict, words in the message
-            (0, 0, "ok", "wall 0s of the 2100s budget (0% used, 2100s left; required margin 20% = 420s)"),
-            (1593, 0, "ok", "1593s of the 2100s budget (75% used"),
-            (DEADLINE, 0, "ok", "1680s of the 2100s budget (80% used, 420s left"),
-            (DEADLINE + 1, 0, "margin-lost", "passed but used 1681s of the 2100s budget (80%, 419s left); the "
-                                             "required margin is 20% (420s, so at most 1680s of wall)"),
+            (0, 0, "ok", "wall 0s of the 2100s budget (0 percent used, 2100s left; required margin 20 percent = 420s)"),
+            (1593, 0, "ok", "1593s of the 2100s budget (75 percent used"),
+            (DEADLINE, 0, "ok", "1680s of the 2100s budget (80 percent used, 420s left"),
+            (DEADLINE + 1, 0, "margin-lost", "passed but used 1681s of the 2100s budget (80 percent, 419s left); "
+                                             "the required margin is 20 percent (420s, so at most 1680s of "
+                                             "wall)"),
             (2099, 0, "margin-lost", "passed but used 2099s"),
             (1000, 101, "ok", "1000s of the 2100s budget"),
             (DEADLINE + 1, 101, "margin-lost", "failed (rc 101) but used 1681s"),
@@ -136,13 +138,13 @@ class GateCli(unittest.TestCase):
         rc, out, _ = self.gate()
         self.assertEqual(rc, 0)
         self.assertEqual(out, "::notice::[#9229 margin] 'full suite shard 2/3': margin held: wall 1000s of the "
-                              "2100s budget (47\\x25 used, 1100s left; required margin 20\\x25 = 420s)\n")
+                              "2100s budget (47 percent used, 1100s left; required margin 20 percent = 420s)\n")
 
     def test_margin_lost_after_a_pass_is_the_named_red(self):
         rc, out, _ = self.gate(elapsed=1700)
         self.assertEqual(rc, 3)
         self.assertEqual(out, "::error::[#9229 margin] 'full suite shard 2/3' lost the suite margin: passed "
-                              "but used 1700s of the 2100s budget (80\\x25, 400s left); the required margin is 20\\x25 "
+                              "but used 1700s of the 2100s budget (80 percent, 400s left); the required margin is 20 percent "
                               "(420s, so at most 1680s of wall); cut the suite cost or shard it, do not raise "
                               "the budget; " + ISSUE_NOTE + "; slowest binaries: none profiled\n")
 
@@ -178,9 +180,11 @@ class GateCli(unittest.TestCase):
                 self.assertIn("refusing to pass (#9229)", out)
 
     def test_non_integer_argument_is_usage_exit_2(self):
-        rc, _, err = run_main(self.sb, ["gate", "--label", "x", "--elapsed", "ten", "--budget", "1", "--rc", "0"])
+        rc, out, err = run_main(self.sb, ["gate", "--label", "x", "--elapsed", "ten", "--budget", "1", "--rc", "0"])
         self.assertEqual(rc, 2)
-        self.assertIn("not an integer: 'ten'", err)
+        self.assertEqual(err, "")
+        self.assertEqual(out, "::error::[#9229 margin] suite_budget: malformed arguments: argument --elapsed: not an "
+                              "integer of at most 18 ASCII digits: 'ten'; refusing to pass (#9229)\n")
 
     def test_unreadable_log_or_bad_offset_on_a_lost_margin_is_malformed(self):
         with scratch() as d:
@@ -214,13 +218,17 @@ class Timer(unittest.TestCase):
         with contextlib.redirect_stdout(out):
             rc = self.sb.run_timer("full suite shard 2/3", BUDGET, 20, "", sleep_fn=sleep, clock=lambda: now[0])
         self.assertEqual(rc, 3)
-        self.assertEqual(now[0] - 10_000.0, DEADLINE)
-        self.assertLess(DEADLINE, BUDGET)
+        # One boundary with the gate (F3): 1680 s still holds the margin, so the timer fires at 1681 s.
+        self.assertEqual(now[0] - 10_000.0, DEADLINE + 1)
+        self.assertEqual(self.sb.judge(DEADLINE, BUDGET, 0)[0], "ok")
+        self.assertEqual(self.sb.judge(DEADLINE + 1, BUDGET, 0)[0], "margin-lost")
+        self.assertLess(DEADLINE + 1, BUDGET)
         self.assertLessEqual(max(slept), 60)
         self.assertEqual(out.getvalue(), "::error::[#9229 margin] 'full suite shard 2/3' lost the suite margin while "
-                                         "still running: 1680s of the 2100s budget used, the required "
-                                         "margin is 20\\x25 (420s); the watchdog kills it at 2100s unless it ends "
-                                         "first; " + ISSUE_NOTE + "; slowest binaries: none profiled\n")
+                                         "still running: 1681s of the 2100s budget used, over the 1680s margin "
+                                         "deadline; the required margin is 20 percent (420s); the watchdog kills it "
+                                         "at 2100s unless it ends first; " + ISSUE_NOTE
+                                         + "; slowest binaries: none profiled\n")
 
     def test_in_flight_red_names_the_running_binary(self):
         with scratch() as d:
@@ -525,23 +533,19 @@ class WholeSuite(unittest.TestCase):
         # The four per-invocation budgets must not become a silent 8400 s suite.
         self.assertLess(CEILING, 4 * BUDGET)
 
-    def seconds(self, d, body):
-        path = Path(d) / "seconds.txt"
-        if body is not None:
-            path.write_text(body, encoding="utf-8")
-        return run_main(self.sb, ["suite-sum", "--seconds", str(path)])
+    def seconds(self, rows, expect=None):
+        expect = len(rows) if expect is None else expect
+        return run_main(self.sb, ["suite-sum", "--expect", str(expect), "--", *rows])
 
     def test_sum_within_the_ceiling_is_a_notice(self):
-        with scratch() as d:
-            rc, out, _ = self.seconds(d, "600\tlib\n1500\tpart 1/2\n1400\tpart 2/2\n100\tdoc tests\n")
+        rc, out, _ = self.seconds(["600\tlib", "1500\tpart 1/2", "1400\tpart 2/2", "100\tdoc tests"])
         self.assertEqual(rc, 0)
         self.assertEqual(out, "::notice::[#9229 margin] whole sqlite suite: 4 invocations ran 3600s of the 3600s "
                               "whole-suite ceiling (WHOLE_SUITE_CEILING_SECS); per invocation: lib 600s, part 1/2 "
                               "1500s, part 2/2 1400s, doc tests 100s\n")
 
     def test_sum_over_the_ceiling_is_the_named_red_with_each_invocation(self):
-        with scratch() as d:
-            rc, out, _ = self.seconds(d, "600\tlib\n1500\tpart 1/2\n1401\tpart 2/2\n100\tdoc tests\n")
+        rc, out, _ = self.seconds(["600\tlib", "1500\tpart 1/2", "1401\tpart 2/2", "100\tdoc tests"])
         self.assertEqual(rc, 3)
         self.assertEqual(out, "::error::[#9229 margin] whole sqlite suite lost its ceiling: 4 invocations ran 3601s, "
                               "over the 3600s whole-suite ceiling (WHOLE_SUITE_CEILING_SECS); per invocation: lib "
@@ -550,27 +554,24 @@ class WholeSuite(unittest.TestCase):
 
     def test_malformed_seconds_are_named_never_a_pass(self):
         rows = (
-            (None, "the invocation seconds file cannot be read (FileNotFoundError)"),
-            ("", "the invocation seconds file records no invocation"),
-            ("100\tlib\nten\tdoc tests\n", "invocation seconds line 2 has a non-numeric seconds value 'ten'"),
-            ("100\tlib\n1.5\tdoc\n", "invocation seconds line 2 has a non-numeric seconds value '1.5'"),
-            ("\tlib\n", "invocation seconds line 1 has a non-numeric seconds value ''"),
-            ("-5\tlib\n", "invocation seconds line 1 has a negative seconds value -5"),
-            ("100\tlib\n200\tpart\n300\tlib\n", "invocation seconds line 3 repeats the invocation 'lib'"),
-            ("100 lib\n", "invocation seconds line 1 is not '<seconds><TAB><label>'"),
-            ("100\t\n", "invocation seconds line 1 is not '<seconds><TAB><label>'"),
-            ("100\tlib\n\n", "invocation seconds line 2 is not '<seconds><TAB><label>'"),
+            # rows, expected count (None = as many as given), reason
+            ([], 1, "expected 1 invocation rows, found 0"),
+            ([], 0, "the expected invocation count must be a positive integer, got 0"),
+            (["100\tlib", "ten\tdoc tests"], None, "invocation row 2 has a non-numeric seconds value 'ten'"),
+            (["100\tlib", "1.5\tdoc"], None, "invocation row 2 has a non-numeric seconds value '1.5'"),
+            (["\tlib"], None, "invocation row 1 has a non-numeric seconds value ''"),
+            (["-5\tlib"], None, "invocation row 1 has a negative seconds value -5"),
+            (["100\tlib", "200\tpart", "300\tlib"], None, "invocation row 3 repeats the invocation 'lib'"),
+            (["100 lib"], None, "invocation row 1 is not '<seconds><TAB><label>'"),
+            (["100\t"], None, "invocation row 1 is not '<seconds><TAB><label>'"),
+            (["100\tlib", ""], None, "invocation row 2 is not '<seconds><TAB><label>'"),
         )
-        with scratch() as d:
-            for body, reason in rows:
-                with self.subTest(body=body):
-                    path = Path(d) / "seconds.txt"
-                    if path.exists():
-                        path.unlink()
-                    rc, out, _ = self.seconds(d, body)
-                    self.assertEqual(rc, 2)
-                    self.assertEqual(out, "::error::[#9229 margin] whole sqlite suite: malformed input: %s; "
-                                          "refusing to pass (#9229)\n" % reason)
+        for given, expect, reason in rows:
+            with self.subTest(rows=given, expect=expect):
+                rc, out, _ = self.seconds(given, expect)
+                self.assertEqual(rc, 2)
+                self.assertEqual(out, "::error::[#9229 margin] whole sqlite suite: malformed input: %s; "
+                                      "refusing to pass (#9229)\n" % reason)
 
     def plan(self, d, text, node="ubuntu-latest", tier="sqlite"):
         path = Path(d) / "ci.yml"
@@ -587,7 +588,7 @@ class WholeSuite(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(out, "::notice::[#9229 margin] whole-suite plan: the 3600s whole-suite ceiling fits the "
                               "95-minute timeout of job 'check' (node=ubuntu-latest tier=sqlite) with the required "
-                              "20\\x25 margin (at most 4560s)\n")
+                              "20 percent margin (at most 4560s)\n")
 
     def test_a_ceiling_that_cannot_fit_the_job_is_a_named_red_at_derivation(self):
         with scratch() as d:
@@ -595,10 +596,10 @@ class WholeSuite(unittest.TestCase):
             self.assertEqual(rc, 3)
             self.assertEqual(out, "::error::[#9229 margin] whole-suite plan refused: the 3600s whole-suite ceiling "
                                   "(WHOLE_SUITE_CEILING_SECS) does not fit the 74-minute timeout of job 'check' "
-                                  "(node=ubuntu-latest tier=sqlite) with the required 20\\x25 margin (at most 3552s); "
+                                  "(node=ubuntu-latest tier=sqlite) with the required 20 percent margin (at most 3552s); "
                                   + ISSUE_NOTE + "; cut the suite cost or shard it, do not raise the ceiling\n")
             rc, _, _ = self.plan(d, workflow(legs=(("ubuntu-latest", "sqlite", "75"),)))
-            self.assertEqual(rc, 0)  # 75 min = 4500 s, 80 % = 3600 s: the ceiling exactly fits
+            self.assertEqual(rc, 0)  # 75 min = 4500 s, 80 percent = 3600 s: the ceiling exactly fits
             rc, out, _ = self.plan(d, workflow(job_timeout="80"))
             self.assertEqual(rc, 0)  # a literal job timeout is read as it stands
             self.assertIn("fits the 80-minute timeout of job 'check'", out)
@@ -691,7 +692,10 @@ class Wiring(unittest.TestCase):
         self.assertLess(body.rindex("SUITE_MARGIN_GATE=1 run_"), total)
         for fn in ("run_tests", "run_doc_tests"):
             with self.subTest(fn=fn):
-                self.assertIn("\"$elapsed\" \"$label\" >> \"$SUITE_SECONDS_FILE\"", function_body(CI, fn))
+                self.assertIn('SUITE_SECONDS+=("${elapsed}"$\'\\t\'"${label}")', function_body(CI, fn))
+        self.assertIn('local -a SUITE_SECONDS=()', body)
+        self.assertIn('suite-sum --expect "$expect" -- ${SUITE_SECONDS[@]+"${SUITE_SECONDS[@]}"}', body)
+        self.assertNotIn("SUITE_SECONDS_FILE", CI)
 
     def test_enterprise_shard_chains_carry_no_margin_gate(self):
         for fn in ("run_shard", "run_sharded"):
@@ -703,19 +707,38 @@ class Wiring(unittest.TestCase):
         self.assertIn("              WATCHDOG_SECS=2400\n", CI)
 
 
-STUB_CARGO = """#!/bin/sh
-echo "$@" >> "%(calls)s"
-if [ "$1" = metadata ]; then
-  if [ -f "%(meta)s" ]; then cat "%(meta)s"; fi
-fi
-exit 0
+STUB_CARGO = """#!%(python)s
+\"\"\"Stub cargo: records its arguments; `metadata` prints the fixture when one exists.\"\"\"
+import sys
+from pathlib import Path
+with open(%(calls)r, "a", encoding="utf-8") as calls:
+    calls.write(" ".join(sys.argv[1:]) + "\\n")
+if sys.argv[1:2] == ["metadata"] and Path(%(meta)r).is_file():
+    sys.stdout.write(Path(%(meta)r).read_text(encoding="utf-8"))
+sys.exit(0)
 """
-STUB_PYTHON = """#!/bin/sh
-for a in "$@"; do
-  if [ "$a" = gate ]; then echo "stub gate red"; exit 3; fi
-done
-exec "%(python)s" "$@"
+STUB_PYTHON = """#!%(python)s
+\"\"\"Stub python3: every suite_budget.py gate call is red (exit 3); any other call runs the real interpreter.\"\"\"
+import os
+import sys
+if "gate" in sys.argv[1:]:
+    print("stub gate red", flush=True)
+    sys.exit(3)
+os.execv(%(python)r, [%(python)r] + sys.argv[1:])
 """
+# The step measures each invocation with `date +%s`; a frozen clock makes the expected walls exact (0s) at any
+# host load, where the real clock let a stub start cross a second boundary.
+FROZEN_EPOCH = 1_800_000_000
+STUB_DATE = """#!%(python)s
+\"\"\"Stub date: +%%s answers the frozen clock; every other form is the real date.\"\"\"
+import os
+import sys
+if sys.argv[1:] == ["+%%s"]:
+    print(%(epoch)d)
+    sys.exit(0)
+os.execv(%(real)r, [%(real)r] + sys.argv[1:])
+"""
+SUM_RE =re.compile(r"^::(?:notice|error)::\[#9229 margin\] whole sqlite suite(?: lost its ceiling)?: .*$", re.M)
 
 
 class StepExec(unittest.TestCase):
@@ -731,8 +754,12 @@ class StepExec(unittest.TestCase):
             if meta is not None:
                 meta_path.write_text(json.dumps(meta), encoding="utf-8")
             stub = bindir / "cargo"
-            stub.write_text(STUB_CARGO % {"calls": calls, "meta": meta_path})
+            stub.write_text(STUB_CARGO % {"python": sys.executable, "calls": str(calls), "meta": str(meta_path)})
             stub.chmod(0o755)
+            date = bindir / "date"
+            date.write_text(STUB_DATE % {"python": sys.executable, "epoch": FROZEN_EPOCH,
+                                         "real": shutil.which("date")})
+            date.chmod(0o755)
             if red_gate:
                 py = bindir / "python3"
                 py.write_text(STUB_PYTHON % {"python": sys.executable})
@@ -743,14 +770,16 @@ class StepExec(unittest.TestCase):
             env.update({
                 "PATH": "%s:%s" % (bindir, env.get("PATH", "")),
                 "AI_MEMORY_NO_CONFIG": "1", "TIER": "sqlite", "CI_NODE": node,
-                "TEST_IMPACT": impact, "JOB_TIMEOUT_MIN": "95", "JOB_T0": str(int(time.time())),
+                "TEST_IMPACT": impact, "JOB_TIMEOUT_MIN": "95", "JOB_T0": str(FROZEN_EPOCH),
                 "RUNNER_TEMP": str(d), "GITHUB_ENV": str(d / "env"),
             })
             r = subprocess.run(["bash", str(script)], cwd=str(REPO), env=env, capture_output=True, text=True,
                                timeout=STEP_TIMEOUT_SECS)
             lines = calls.read_text().splitlines() if calls.exists() else []
-            seconds = d / "suite-9229-seconds.txt"
-            self.seconds = seconds.read_text().splitlines() if seconds.exists() else None
+            # The step keeps the seconds in shell memory (S1): the suite-sum line is the record of the rows.
+            self.assertEqual(sorted(p.name for p in d.iterdir() if "seconds" in p.name), [])
+            sums = SUM_RE.findall(r.stdout)
+            self.sum_line = sums[0] if len(sums) == 1 else None
             return r, lines
 
     def test_full_suite_runs_four_gated_shards(self):
@@ -767,10 +796,12 @@ class StepExec(unittest.TestCase):
                       "full suite shard 4/4: doc tests"):
             self.assertIn("::notice::[#9229 margin] '%s': margin held: wall 0s of the 2100s budget" % label,
                           r.stdout)
-        self.assertEqual(self.seconds, ["0\tfull suite shard 1/4: lib unit tests",
-                                        "0\tfull suite shard 2/4: bins, integration tests and tested examples, part 1/2",
-                                        "0\tfull suite shard 3/4: bins, integration tests and tested examples, part 2/2",
-                                        "0\tfull suite shard 4/4: doc tests"])
+        self.assertEqual(self.sum_line, "::notice::[#9229 margin] whole sqlite suite: 4 invocations ran 0s of the "
+                                        "3600s whole-suite ceiling (WHOLE_SUITE_CEILING_SECS); per invocation: "
+                                        "full suite shard 1/4: lib unit tests 0s, "
+                                        "full suite shard 2/4: bins, integration tests and tested examples, part 1/2 0s, "
+                                        "full suite shard 3/4: bins, integration tests and tested examples, part 2/2 0s, "
+                                        "full suite shard 4/4: doc tests 0s")
         self.assertIn("::notice::[#9229 margin] whole-suite plan: the 3600s whole-suite ceiling fits the 95-minute "
                       "timeout of job 'check'", r.stdout)
         self.assertIn("::notice::[#9229 margin] whole sqlite suite: 4 invocations ran 0s of the 3600s whole-suite "
@@ -787,7 +818,9 @@ class StepExec(unittest.TestCase):
         self.assertIn("::warning::[#9229 margin] shard-args: ", r.stdout + r.stderr)
         self.assertIn("::notice::[#9229 margin] 'full suite (cargo test)': margin held", r.stdout)
         # The fallback keeps the gate, the doc tests (inside the one cargo test) and the whole-suite ceiling.
-        self.assertEqual(self.seconds, ["0\tfull suite (cargo test)"])
+        self.assertEqual(self.sum_line, "::notice::[#9229 margin] whole sqlite suite: 1 invocations ran 0s of the "
+                                        "3600s whole-suite ceiling (WHOLE_SUITE_CEILING_SECS); per invocation: "
+                                        "full suite (cargo test) 0s")
         self.assertIn("::notice::[#9229 margin] whole sqlite suite: 1 invocations ran 0s", r.stdout)
 
     def test_a_part_that_selects_nothing_falls_back_to_the_one_gated_invocation(self):
@@ -809,7 +842,10 @@ class StepExec(unittest.TestCase):
         self.assertEqual(r.returncode, 3, r.stdout + r.stderr)  # exit 3 reaches the step, never swallowed
         self.assertIn("stub gate red", r.stdout)
         # A red gate does not stop the later invocations or the whole-suite sum.
-        self.assertEqual(len(self.seconds), 4)
+        self.assertIsNotNone(self.sum_line)
+        self.assertIn("whole sqlite suite: 4 invocations ran 0s", self.sum_line)
+        self.assertEqual(self.sum_line.count("full suite shard "), 4)
+        self.assertEqual(r.stdout.count("stub gate red"), 4)
         self.assertIn("whole sqlite suite: 4 invocations ran", r.stdout)
 
     def test_a_plan_that_cannot_be_derived_is_red_before_any_test(self):

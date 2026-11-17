@@ -387,7 +387,7 @@ class SumCompleteness(unittest.TestCase):
         self.sb = base.load()
 
     def sum(self, rows, expect):
-        return base.run_main(self.sb, ["suite-sum", "--expect", str(expect)] + list(rows))
+        return base.run_main(self.sb, ["suite-sum", "--expect", str(expect), "--"] + list(rows))
 
     def malformed(self, reason):
         return "::error::[#9229 margin] whole sqlite suite: malformed input: %s; refusing to pass (#9229)\n" % reason
