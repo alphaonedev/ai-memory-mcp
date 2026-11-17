@@ -723,13 +723,40 @@ jobs:
             truetrue|falsetrue|falsefalse) ;;
             *) docs_only=false; cargo_skip=false; cargo_skip_reason="classifier-error-fail-closed cargo_skip-rules" ;;
           esac
+          # #9434: the reason can carry PR file names. It reaches the log only through
+          # the escaper of the TRUSTED tree (trust_ref, as for the classifier above),
+          # loaded by file path, never the workspace copy; else a fixed notice.
+          trust_wa="$trust_dir/scripts/ci/workflow_annotation.py"
+          wa_ok=false
+          if git show "${trust_ref}:scripts/ci/workflow_annotation.py" > "$trust_wa" 2>/dev/null; then wa_ok=true; fi
+          wa_prog='import importlib.util, os, sys
+          spec = importlib.util.spec_from_file_location("workflow_annotation", sys.argv[1])
+          wa = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(wa)
+          reason = os.fsencode(sys.argv[3]).decode("utf-8", "surrogateescape")
+          sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
+          print(wa.annotation("notice", wa.render(sys.argv[2], reason=reason)), flush=True)'
           if [ "$cargo_skip" = "true" ]; then
-            echo "::notice::cargo_skip=true ($cargo_skip_reason) - cargo legs no-op"
+            if [ "$wa_ok" != "true" ] || ! python3 -I -c "$wa_prog" "$trust_wa" "cargo_skip=true ({reason}) - cargo legs no-op" "$cargo_skip_reason"; then
+              echo "::notice::cargo_skip=true (reason not shown: the trusted escaper did not run) - cargo legs no-op"
+            fi
           else
-            echo "::notice::cargo_skip=false ($cargo_skip_reason) - running full pipeline"
+            if [ "$wa_ok" != "true" ] || ! python3 -I -c "$wa_prog" "$trust_wa" "cargo_skip=false ({reason}) - running full pipeline" "$cargo_skip_reason"; then
+              echo "::notice::cargo_skip=false (reason not shown: the trusted escaper did not run) - running full pipeline"
+            fi
           fi
           echo "--- Changed files vs classification base $cls_base ($(echo "$changed" | wc -l) files) ---"
-          echo "$changed"
+          # #9433 class: file names are PR bytes. They are printed only between
+          # ::stop-commands::<token> and ::<token>::; the token is 128 bits from the
+          # kernel CSPRNG, made here, never shown before the stop line.
+          list_tok=$(python3 -I -c 'import secrets; print(secrets.token_hex(16))' 2>/dev/null) || list_tok=""
+          if [[ "$list_tok" =~ ^[0-9a-f]{32}$ ]]; then
+            echo "::stop-commands::${list_tok}"
+            printf '%s\n' "$changed"
+            echo "::${list_tok}::"
+          else
+            echo "::notice::[#9433] changed-file list not printed: no stop-commands token could be made (fail closed; the classification is unchanged)"
+          fi
 
           # #8328 round 3 (REVIEW-8328-code-r2 F1, REVIEW-8328-security-r2 F1,
           # #8338): this step runs NO command from the workspace, so nothing a
@@ -810,7 +837,38 @@ jobs:
           : > "$impact_log"
           selector_rc=0
           GITHUB_OUTPUT="$impact_out" scripts/ci-test-impact.sh "$IMPACT_BASE" "HEAD" "$CLS_BASE" > "$impact_log" 2>&1 || selector_rc=$?
-          sed -n '1,200{s/::/: :/g;p}' "$impact_log"
+          # #9433 class: the selector runs from the PR tree, so its log is PR bytes.
+          # The first 200 lines (":" ":" spaced as before) are printed only inside a
+          # stop-commands block with a CSPRNG token; Python, not sed, so a missing final
+          # newline is added and the end marker always starts its own line.
+          impact_tok=$(python3 -I -c 'import secrets; print(secrets.token_hex(16))' 2>/dev/null) || impact_tok=""
+          impact_print_rc=0
+          if [[ "$impact_tok" =~ ^[0-9a-f]{32}$ ]]; then
+            echo "::stop-commands::${impact_tok}"
+            python3 -I -c 'import sys
+          out = sys.stdout.buffer
+          last = b"\n"
+          try:
+              with open(sys.argv[1], "rb") as log:
+                  for count, line in enumerate(log):
+                      if count >= 200:
+                          break
+                      line = line.replace(b"::", b": :")
+                      out.write(line)
+                      last = line[-1:]
+          except OSError as err:
+              sys.stderr.write("[#9433] impact log not readable: %s\n" % err.strerror)
+              sys.exit(1)
+          finally:
+              if last != b"\n":
+                  out.write(b"\n")
+              out.flush()' "$impact_log" || impact_print_rc=$?
+            echo "::${impact_tok}::"
+          else
+            echo "::notice::[#9433] impact selector log not printed: no stop-commands token could be made (fail closed; the selection is unchanged)"
+            : < "$impact_log" || impact_print_rc=$?
+          fi
+          (exit "$impact_print_rc")
           # Allow-list: four keys, plain values. Any other line (a multi-line
           # value opener, a blank line, a foreign key, a control character)
           # makes the whole emission untrusted. The reason may also carry the
@@ -1658,7 +1716,9 @@ jobs:
           # sanitised matrix leg keeps the two enterprise-fed legs distinct and
           # never sharing a name with the cert-postgres-age job.
           leg_sanitized="$(printf '%s' "$LEG" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9' '_')"
-          CI_FED_DB="$(printf '%s' "ai_memory_test_ci_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}_${leg_sanitized}" | cut -c1-59)"
+          # #9433 sibling: cut in BYTES by Python (the PG name bound is bytes; uutils
+          # `cut -c` counts characters, GNU `cut -c` bytes).
+          CI_FED_DB="$(python3 -I -c 'import os, sys; sys.stdout.buffer.write(os.fsencode(sys.argv[1])[:59])' "ai_memory_test_ci_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}_${leg_sanitized}")"
           # Compute-once, pass to the cleanup step via $GITHUB_ENV so create
           # and drop use the byte-identical name.
           echo "CI_FED_DB=$CI_FED_DB" >> "$GITHUB_ENV"
@@ -2321,9 +2381,38 @@ jobs:
             kill "$hb" 2>/dev/null || true
             wait "$hb" 2>/dev/null || true
             for n in serial parallel_1 parallel_2; do
+              # #9433: a shard log is written by PR-run tests. It is printed only between
+              # ::stop-commands::<token> and ::<token>::, the token 128 bits from the
+              # kernel CSPRNG, new per block, never shown before the stop line. No token:
+              # a fixed notice, no raw log. The exit code stays that of `cat`.
+              local shard_tok shard_rc
               echo "::group::[#6344] ${n} shard output"
-              cat "$sd/$n.log"
+              shard_tok=$(python3 -I -c 'import secrets; print(secrets.token_hex(16))' 2>/dev/null) || shard_tok=""
+              shard_rc=0
+              if [[ "$shard_tok" =~ ^[0-9a-f]{32}$ ]]; then
+                echo "::stop-commands::${shard_tok}"
+                python3 -I -c 'import sys
+          out = sys.stdout.buffer
+          last = b"\n"
+          try:
+              with open(sys.argv[1], "rb") as log:
+                  while chunk := log.read(1 << 20):
+                      out.write(chunk)
+                      last = chunk[-1:]
+          except OSError as err:
+              sys.stderr.write("[#9433] shard log not readable: %s\n" % err.strerror)
+              sys.exit(1)
+          finally:
+              if last != b"\n":
+                  out.write(b"\n")
+              out.flush()' "$sd/$n.log" || shard_rc=$?
+                echo "::${shard_tok}::"
+              else
+                echo "::notice::[#9433] ${n} shard output not printed: no stop-commands token could be made (fail closed; the step result is unchanged)"
+                : < "$sd/$n.log" || shard_rc=$?
+              fi
               echo "::endgroup::"
+              (exit "$shard_rc")
             done
             echo "::notice::[#6344] shard exit codes: serial=${rc_s} parallel_1=${rc_1} parallel_2=${rc_2}"
             for n in "$rc_s" "$rc_1" "$rc_2"; do
