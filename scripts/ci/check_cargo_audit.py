@@ -14,6 +14,46 @@ import sys
 import tempfile
 import tomllib
 
+
+def _load_workflow_annotation():
+    """The shared module at WA_RELATIVE_PATH from this file's real directory, by path only, never through
+    sys.path; every name in WA_REQUIRED must be a callable of it (#9365, one shape in every script)."""
+    import importlib.util
+    import os
+    path = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), WA_RELATIVE_PATH))
+    loaded = sys.modules.get("workflow_annotation")
+    if loaded is not None and os.path.realpath(getattr(loaded, "__file__", None) or "") == path:
+        module = loaded
+    else:
+        spec = importlib.util.spec_from_file_location("workflow_annotation", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)  # absent, unreadable or broken: it raises here, the try below catches it
+    missing = [name for name in WA_REQUIRED if not callable(getattr(module, name, None))]
+    if missing:
+        raise AttributeError("workflow_annotation.py lacks " + ", ".join(missing))
+    if loaded is None:
+        sys.modules["workflow_annotation"] = module
+    return module
+
+
+# The one shared-module load shape of scripts/ (#9365, ruling bcd0a15c; LoaderShape pins it).
+WA_PROG = "check_cargo_audit"
+WA_RELATIVE_PATH = "workflow_annotation.py"
+WA_REQUIRED = ("err", "out")
+WA_EXIT_LOAD_REFUSED = 3  # a failed shared-module load; no other meaning in this script
+WA_ERROR_TO_STDERR = False
+
+try:
+    wa = _load_workflow_annotation()
+except (Exception, SystemExit) as exc:  # any failed load: one fixed line built without the module, then exit
+    wa_cause = type(exc).__name__
+    print("%s: refused: shared module workflow_annotation.py next to the script cannot be loaded (%s)"
+          % (WA_PROG, wa_cause if wa_cause.isidentifier() else "BaseException"), file=sys.stderr, flush=True)
+    print("::error title=check_cargo_audit refused::check_cargo_audit: refused: shared module workflow_annotation.py"
+          " next to the script cannot be loaded",
+          file=sys.stderr if WA_ERROR_TO_STDERR else sys.stdout, flush=True)
+    sys.exit(WA_EXIT_LOAD_REFUSED)
+
 ROOT = Path(__file__).resolve().parents[2]
 POLICY = ROOT / ".cargo/audit.toml"
 EXCEPTIONS_POLICY = ROOT / ".cargo/audit-exceptions.toml"
@@ -246,11 +286,11 @@ def main(argv=None, *, today=None):
         # Do not echo external stderr/report text: it may contain local configuration.
         detail = str(error) if type(error) is ValueError else type(error).__name__
         messages = detail.splitlines()
-        print(f"Cargo audit ratchet: rejected; {len(messages)} diagnostic(s)", flush=True)
+        wa.out(f"Cargo audit ratchet: rejected; {len(messages)} diagnostic(s)", flush=True)
         for message in messages:
-            print(f"Cargo audit ratchet failed: {message}", file=sys.stderr)
+            wa.err(f"Cargo audit ratchet failed: {message}")
         return EXIT_FAILURE
-    print(f"Cargo audit ratchet: {crate_count} crates; {vulnerabilities} vulnerabilities; "
+    wa.out(f"Cargo audit ratchet: {crate_count} crates; {vulnerabilities} vulnerabilities; "
           f"{warnings} warnings; {len(entries)} tracked exceptions; 0 unaccepted advisories")
     return EXIT_SUCCESS
 

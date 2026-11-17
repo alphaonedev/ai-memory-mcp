@@ -69,7 +69,7 @@ EXIT_PG_ENV = 3
 # The one shared-module load shape of scripts/ (#9365, ruling bcd0a15c; LoaderShape pins it).
 WA_PROG = "pg_env_preflight"
 WA_RELATIVE_PATH = "workflow_annotation.py"
-WA_REQUIRED = ("annotation", "log_line")
+WA_REQUIRED = ("annotation", "log_line", "out")
 WA_EXIT_LOAD_REFUSED = EXIT_PG_ENV  # the gate's own refusal code, unchanged
 WA_ERROR_TO_STDERR = False
 
@@ -160,7 +160,7 @@ def run_psql(runner: Runner, psql: str, sql: str) -> tuple[bool, str, str]:
 
 def print_environment(runner: Runner, container: str | None, pkg_glob: str) -> None:
     """Print the runner image version and installed postgresql-16* versions."""
-    print(wa.log_line(f"runner {IMAGE_VERSION_ENV}={os.environ.get(IMAGE_VERSION_ENV, 'unset')}"))
+    wa.out(wa.log_line(f"runner {IMAGE_VERSION_ENV}={os.environ.get(IMAGE_VERSION_ENV, 'unset')}"))
     dpkg = ["dpkg-query", "-W", "-f", "${Package} ${Version}\\n", pkg_glob]
     argv = ["docker", "exec", container, *dpkg] if container else dpkg
     try:
@@ -171,10 +171,10 @@ def print_environment(runner: Runner, container: str | None, pkg_glob: str) -> N
         ok, out = False, ""
     where = f"container {container}" if container else "runner"
     if not ok or not out:
-        print(wa.log_line(f"pkg ({where}): unavailable"))
+        wa.out(wa.log_line(f"pkg ({where}): unavailable"))
         return
     for line in out.splitlines():
-        print(wa.log_line(f"pkg ({where}): {line}"))
+        wa.out(wa.log_line(f"pkg ({where}): {line}"))
 
 
 def restart_container(runner: Runner, container: str) -> bool:
@@ -219,8 +219,8 @@ def preflight(
 
     def fail(reason: str, detail: str = "") -> int:
         if detail:
-            print(wa.log_line(f"detail: {detail}"))
-        print(class_line(label, reason))
+            wa.out(wa.log_line(f"detail: {detail}"))
+        wa.out(class_line(label, reason))
         return EXIT_PG_ENV
 
     try:
@@ -234,12 +234,12 @@ def preflight(
             reachable, version, detail = run_psql(runner, psql, SQL_CONNECT)
         if not reachable:
             return fail(REASON_UNREACHABLE, detail)
-        print(wa.log_line(f"server_version={version}"))
+        wa.out(wa.log_line(f"server_version={version}"))
         for name, sql, reason in PROBES:
             ok, _out, detail = run_psql(runner, psql, sql)
             if not ok:
                 return fail(reason, detail)
-            print(wa.log_line(f"probe {name}: ok"))
+            wa.out(wa.log_line(f"probe {name}: ok"))
     except PsqlMissingError:
         return fail(REASON_PSQL_MISSING)
     return EXIT_OK

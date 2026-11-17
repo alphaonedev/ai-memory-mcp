@@ -79,7 +79,7 @@ EXIT_FAIL_CLOSED = 2  # every fail-closed condition, a shared module that cannot
 # The one shared-module load shape of scripts/ (#9365, ruling bcd0a15c; LoaderShape pins it).
 WA_PROG = "partition_test_binaries"
 WA_RELATIVE_PATH = "workflow_annotation.py"
-WA_REQUIRED = ("annotation", "log_line")
+WA_REQUIRED = ("annotation", "err", "log_line", "out")
 WA_EXIT_LOAD_REFUSED = EXIT_FAIL_CLOSED  # the gate's own refusal code, unchanged
 WA_ERROR_TO_STDERR = False
 
@@ -101,6 +101,12 @@ class _NotLoaded:
 
     def log_line(self, *args, **kwargs):
         raise SharedModuleNotLoadedError(self._WANTED % "log_line")
+
+    def err(self, *args, **kwargs):
+        raise SharedModuleNotLoadedError(self._WANTED % "err")
+
+    def out(self, *args, **kwargs):
+        raise SharedModuleNotLoadedError(self._WANTED % "out")
 
 
 wa = _NotLoaded()
@@ -1374,7 +1380,7 @@ def run(args):
                     for e in exes if e.kind != 'lib'},
     }
     (out_dir / 'manifest.json').write_text(json.dumps(manifest, indent=1, sort_keys=True) + '\n')
-    print(wa.log_line('[#6344] shards: serial=%d parallel_1=%d parallel_2=%d of %d executables; '
+    wa.out(wa.log_line('[#6344] shards: serial=%d parallel_1=%d parallel_2=%d of %d executables; '
           'estimate serial=%.0fs parallel=%.0fs/%.0fs (per-binary min(tests, 3) threads; ideal %.0fs/%.0fs)'
           % (manifest['counts']['serial'], manifest['counts']['parallel_1'], manifest['counts']['parallel_2'],
              len(exes), totals['serial'], totals['parallel_1_est'], totals['parallel_2_est'],
@@ -1401,7 +1407,7 @@ def main(argv=None):
     try:
         return run(args)
     except PartitionError as exc:
-        print(wa.annotation("error", "[#6344 shard] %s" % exc), file=sys.stderr)
+        wa.err(wa.annotation("error", "[#6344 shard] %s" % exc))
         return EXIT_FAIL_CLOSED
 
 

@@ -11,6 +11,46 @@ import re
 import subprocess
 import sys
 
+
+def _load_workflow_annotation():
+    """The shared module at WA_RELATIVE_PATH from this file's real directory, by path only, never through
+    sys.path; every name in WA_REQUIRED must be a callable of it (#9365, one shape in every script)."""
+    import importlib.util
+    import os
+    path = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), WA_RELATIVE_PATH))
+    loaded = sys.modules.get("workflow_annotation")
+    if loaded is not None and os.path.realpath(getattr(loaded, "__file__", None) or "") == path:
+        module = loaded
+    else:
+        spec = importlib.util.spec_from_file_location("workflow_annotation", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)  # absent, unreadable or broken: it raises here, the try below catches it
+    missing = [name for name in WA_REQUIRED if not callable(getattr(module, name, None))]
+    if missing:
+        raise AttributeError("workflow_annotation.py lacks " + ", ".join(missing))
+    if loaded is None:
+        sys.modules["workflow_annotation"] = module
+    return module
+
+
+# The one shared-module load shape of scripts/ (#9365, ruling bcd0a15c; LoaderShape pins it).
+WA_PROG = "check_npm_audit"
+WA_RELATIVE_PATH = "workflow_annotation.py"
+WA_REQUIRED = ("err", "out")
+WA_EXIT_LOAD_REFUSED = 3  # a failed shared-module load; no other meaning in this script
+WA_ERROR_TO_STDERR = False
+
+try:
+    wa = _load_workflow_annotation()
+except (Exception, SystemExit) as exc:  # any failed load: one fixed line built without the module, then exit
+    wa_cause = type(exc).__name__
+    print("%s: refused: shared module workflow_annotation.py next to the script cannot be loaded (%s)"
+          % (WA_PROG, wa_cause if wa_cause.isidentifier() else "BaseException"), file=sys.stderr, flush=True)
+    print("::error title=check_npm_audit refused::check_npm_audit: refused: shared module workflow_annotation.py"
+          " next to the script cannot be loaded",
+          file=sys.stderr if WA_ERROR_TO_STDERR else sys.stdout, flush=True)
+    sys.exit(WA_EXIT_LOAD_REFUSED)
+
 DEFAULT_PREFIX = Path("sdk/typescript")
 AUDIT_TIMEOUT_SECONDS = 120
 AUDIT_REPORT_VERSION = 2
@@ -312,7 +352,7 @@ def main(argv=None):
         if result.returncode != expected_status:
             raise AuditError("unexpected npm rc", **report_identity(vulnerabilities, versions))
     except AuditError as error:
-        print(f"npm audit gate rejected report: {error}", file=sys.stderr)
+        wa.err(f"npm audit gate rejected report: {error}")
         return 1
     except (OSError, UnicodeError, subprocess.TimeoutExpired, ValueError) as error:
         # External exception messages can contain registry data, paths or credentials.
@@ -324,13 +364,13 @@ def main(argv=None):
             reason = "malformed report encoding (UnicodeError)"
         else:
             reason = "malformed report (ValueError)"
-        print(f"npm audit gate rejected report: {AuditError(reason, **identity)}", file=sys.stderr)
+        wa.err(f"npm audit gate rejected report: {AuditError(reason, **identity)}")
         return 1
     except Exception as error:  # noqa: BLE001 - fail closed with one fixed line, no traceback
         reason = f"unexpected gate error ({type(error).__name__})"
-        print(f"npm audit gate rejected report: {AuditError(reason, **identity)}", file=sys.stderr)
+        wa.err(f"npm audit gate rejected report: {AuditError(reason, **identity)}")
         return 1
-    print(f"npm audit gate: accepted {accepted} tracked advisories across {len(vulnerabilities)} reported packages")
+    wa.out(f"npm audit gate: accepted {accepted} tracked advisories across {len(vulnerabilities)} reported packages")
     return 0
 
 

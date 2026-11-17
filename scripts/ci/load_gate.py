@@ -44,7 +44,7 @@ EXIT_LOAD_REFUSED = 3  # the shared module cannot be loaded (0 = proceed, 2 = ba
 # The one shared-module load shape of scripts/ (#9365, ruling bcd0a15c; LoaderShape pins it).
 WA_PROG = "load_gate"
 WA_RELATIVE_PATH = "workflow_annotation.py"
-WA_REQUIRED = ("annotation", "log_line")
+WA_REQUIRED = ("annotation", "log_line", "out")
 WA_EXIT_LOAD_REFUSED = EXIT_LOAD_REFUSED  # the gate's own refusal code, unchanged
 WA_ERROR_TO_STDERR = False
 
@@ -86,13 +86,13 @@ def run(label, max_ratio, max_wait_secs, poll_secs, cores, load_fn, sleep_fn):
     try:
         load = load_fn()
     except (OSError, AttributeError) as exc:
-        print(wa.annotation("warning", "%s '%s': cannot read the load average (%s); proceeding without the gate"
+        wa.out(wa.annotation("warning", "%s '%s': cannot read the load average (%s); proceeding without the gate"
                             % (TAG, label, exc)), flush=True)
         return 0
-    print(format_notice(label, load, cores, max_ratio, waited), flush=True)
+    wa.out(format_notice(label, load, cores, max_ratio, waited), flush=True)
     while should_wait(load, cores, max_ratio):
         if waited >= max_wait_secs:
-            print(wa.annotation("warning", "%s '%s': load=%.2f still above %s x %d cores after %ds; "
+            wa.out(wa.annotation("warning", "%s '%s': load=%.2f still above %s x %d cores after %ds; "
                                 "proceeding anyway (the gate never fails on load alone)"
                                 % (TAG, label, load, max_ratio, cores, waited)), flush=True)
             break
@@ -102,12 +102,12 @@ def run(label, max_ratio, max_wait_secs, poll_secs, cores, load_fn, sleep_fn):
         try:
             load = load_fn()
         except (OSError, AttributeError) as exc:
-            print(wa.annotation("warning", "%s '%s': load average became unreadable (%s); proceeding"
+            wa.out(wa.annotation("warning", "%s '%s': load average became unreadable (%s); proceeding"
                                 % (TAG, label, exc)), flush=True)
             return 0
         if should_wait(load, cores, max_ratio):
-            print(_plain(label, load, cores, max_ratio, waited), flush=True)
-    print(format_notice(label, load, cores, max_ratio, waited), flush=True)
+            wa.out(_plain(label, load, cores, max_ratio, waited), flush=True)
+    wa.out(format_notice(label, load, cores, max_ratio, waited), flush=True)
     return 0
 
 

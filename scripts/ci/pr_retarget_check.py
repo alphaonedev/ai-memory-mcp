@@ -33,6 +33,46 @@ import subprocess
 import sys
 from pathlib import Path
 
+
+def _load_workflow_annotation():
+    """The shared module at WA_RELATIVE_PATH from this file's real directory, by path only, never through
+    sys.path; every name in WA_REQUIRED must be a callable of it (#9365, one shape in every script)."""
+    import importlib.util
+    import os
+    path = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), WA_RELATIVE_PATH))
+    loaded = sys.modules.get("workflow_annotation")
+    if loaded is not None and os.path.realpath(getattr(loaded, "__file__", None) or "") == path:
+        module = loaded
+    else:
+        spec = importlib.util.spec_from_file_location("workflow_annotation", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)  # absent, unreadable or broken: it raises here, the try below catches it
+    missing = [name for name in WA_REQUIRED if not callable(getattr(module, name, None))]
+    if missing:
+        raise AttributeError("workflow_annotation.py lacks " + ", ".join(missing))
+    if loaded is None:
+        sys.modules["workflow_annotation"] = module
+    return module
+
+
+# The one shared-module load shape of scripts/ (#9365, ruling bcd0a15c; LoaderShape pins it).
+WA_PROG = "pr_retarget_check"
+WA_RELATIVE_PATH = "workflow_annotation.py"
+WA_REQUIRED = ("err", "out")
+WA_EXIT_LOAD_REFUSED = 3  # a failed shared-module load; no other meaning in this script
+WA_ERROR_TO_STDERR = False
+
+try:
+    wa = _load_workflow_annotation()
+except (Exception, SystemExit) as exc:  # any failed load: one fixed line built without the module, then exit
+    wa_cause = type(exc).__name__
+    print("%s: refused: shared module workflow_annotation.py next to the script cannot be loaded (%s)"
+          % (WA_PROG, wa_cause if wa_cause.isidentifier() else "BaseException"), file=sys.stderr, flush=True)
+    print("::error title=pr_retarget_check refused::pr_retarget_check: refused: shared module workflow_annotation.py"
+          " next to the script cannot be loaded",
+          file=sys.stderr if WA_ERROR_TO_STDERR else sys.stdout, flush=True)
+    sys.exit(WA_EXIT_LOAD_REFUSED)
+
 EX_OK, EX_REFUSE, EX_TOOL = 0, 65, 70
 WORKFLOWS = ("ci.yml", "coverage.yml")
 PAGE = 100
@@ -154,7 +194,7 @@ def check(repo, pr, head, json_dir):
     events = fetch_timeline(repo, pr, json_dir)
     changes = [e for e in events if isinstance(e, dict) and e.get("event") == "base_ref_changed"]
     if not changes:
-        print("retarget-check: no base change")
+        wa.out("retarget-check: no base change")
         return EX_OK
     # decision (round 5, REVIEW-8332-code-r4 F1, REVIEW-8332-security-r4 S8): ANY base change without a
     # usable created_at refuses (exit 70); dropping it would compare the runs against an older retarget.
@@ -166,14 +206,14 @@ def check(repo, pr, head, json_dir):
         runs = [r for r in fetch_runs(repo, head, workflow, json_dir) if isinstance(r, dict)]
         newer = [r for r in runs if parse_stamp(r.get("createdAt"), f"{workflow} run") > latest]
         if not newer:
-            print(f"REFUSE: base retargeted at {stamp} after the latest pull_request run of {workflow}; "
+            wa.out(f"REFUSE: base retargeted at {stamp} after the latest pull_request run of {workflow}; "
                   "push a new head so CI classifies against the current base (#7072, #8332)")
             stale = True
         else:
             ids.append(f"{workflow}={','.join(str(r.get('databaseId')) for r in newer)}")
     if stale:
         return EX_REFUSE
-    print(f"retarget-check: base changed at {stamp}; newer runs: {' '.join(ids)}")
+    wa.out(f"retarget-check: base changed at {stamp}; newer runs: {' '.join(ids)}")
     return EX_OK
 
 
@@ -187,7 +227,7 @@ def main(argv=None):
     try:
         return check(args.repo, args.pr, args.head, args.json_dir)
     except ToolError as exc:
-        print(f"retarget-check: tool error: {exc}", file=sys.stderr)
+        wa.err(f"retarget-check: tool error: {exc}")
         return EX_TOOL
 
 

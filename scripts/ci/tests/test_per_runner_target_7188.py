@@ -37,6 +37,46 @@ import time
 import unittest
 from pathlib import Path
 
+
+def _load_workflow_annotation():
+    """The shared module at WA_RELATIVE_PATH from this file's real directory, by path only, never through
+    sys.path; every name in WA_REQUIRED must be a callable of it (#9365, one shape in every script)."""
+    import importlib.util
+    import os
+    path = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), WA_RELATIVE_PATH))
+    loaded = sys.modules.get("workflow_annotation")
+    if loaded is not None and os.path.realpath(getattr(loaded, "__file__", None) or "") == path:
+        module = loaded
+    else:
+        spec = importlib.util.spec_from_file_location("workflow_annotation", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)  # absent, unreadable or broken: it raises here, the try below catches it
+    missing = [name for name in WA_REQUIRED if not callable(getattr(module, name, None))]
+    if missing:
+        raise AttributeError("workflow_annotation.py lacks " + ", ".join(missing))
+    if loaded is None:
+        sys.modules["workflow_annotation"] = module
+    return module
+
+
+# The one shared-module load shape of scripts/ (#9365, ruling bcd0a15c; LoaderShape pins it).
+WA_PROG = "test_per_runner_target_7188"
+WA_RELATIVE_PATH = "../workflow_annotation.py"
+WA_REQUIRED = ("out",)
+WA_EXIT_LOAD_REFUSED = 3  # a failed shared-module load; no other meaning in this script
+WA_ERROR_TO_STDERR = False
+
+try:
+    wa = _load_workflow_annotation()
+except (Exception, SystemExit) as exc:  # any failed load: one fixed line built without the module, then exit
+    wa_cause = type(exc).__name__
+    print("%s: refused: shared module workflow_annotation.py next to the script cannot be loaded (%s)"
+          % (WA_PROG, wa_cause if wa_cause.isidentifier() else "BaseException"), file=sys.stderr, flush=True)
+    print("::error title=test_per_runner_target_7188 refused::test_per_runner_target_7188: refused: shared module workflow_annotation.py"
+          " next to the script cannot be loaded",
+          file=sys.stderr if WA_ERROR_TO_STDERR else sys.stdout, flush=True)
+    sys.exit(WA_EXIT_LOAD_REFUSED)
+
 REPO = Path(__file__).resolve().parents[3]
 HELPER = REPO / "scripts" / "ci" / "shared_cargo_target.py"
 SCRATCH = REPO / ".local-runs" / "per-runner-7188"
@@ -225,7 +265,7 @@ def prove_defect():
         ran = run_e3(scratch / "e3", shared, shared)
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
-    print("E3 shared-target leg: MARK_A=%s MARK_B=%s" % ("A" in ran, "B" in ran))
+    wa.out("E3 shared-target leg: MARK_A=%s MARK_B=%s" % ("A" in ran, "B" in ran))
     return 0 if ran == {"B"} else 1
 
 

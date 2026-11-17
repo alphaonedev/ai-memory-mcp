@@ -22,6 +22,46 @@ from pathlib import Path, PurePosixPath
 import re
 import sys
 
+
+def _load_workflow_annotation():
+    """The shared module at WA_RELATIVE_PATH from this file's real directory, by path only, never through
+    sys.path; every name in WA_REQUIRED must be a callable of it (#9365, one shape in every script)."""
+    import importlib.util
+    import os
+    path = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), WA_RELATIVE_PATH))
+    loaded = sys.modules.get("workflow_annotation")
+    if loaded is not None and os.path.realpath(getattr(loaded, "__file__", None) or "") == path:
+        module = loaded
+    else:
+        spec = importlib.util.spec_from_file_location("workflow_annotation", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)  # absent, unreadable or broken: it raises here, the try below catches it
+    missing = [name for name in WA_REQUIRED if not callable(getattr(module, name, None))]
+    if missing:
+        raise AttributeError("workflow_annotation.py lacks " + ", ".join(missing))
+    if loaded is None:
+        sys.modules["workflow_annotation"] = module
+    return module
+
+
+# The one shared-module load shape of scripts/ (#9365, ruling bcd0a15c; LoaderShape pins it).
+WA_PROG = "check_docs_private_paths"
+WA_RELATIVE_PATH = "workflow_annotation.py"
+WA_REQUIRED = ("err", "out")
+WA_EXIT_LOAD_REFUSED = 3  # a failed shared-module load; no other meaning in this script
+WA_ERROR_TO_STDERR = False
+
+try:
+    wa = _load_workflow_annotation()
+except (Exception, SystemExit) as exc:  # any failed load: one fixed line built without the module, then exit
+    wa_cause = type(exc).__name__
+    print("%s: refused: shared module workflow_annotation.py next to the script cannot be loaded (%s)"
+          % (WA_PROG, wa_cause if wa_cause.isidentifier() else "BaseException"), file=sys.stderr, flush=True)
+    print("::error title=check_docs_private_paths refused::check_docs_private_paths: refused: shared module workflow_annotation.py"
+          " next to the script cannot be loaded",
+          file=sys.stderr if WA_ERROR_TO_STDERR else sys.stdout, flush=True)
+    sys.exit(WA_EXIT_LOAD_REFUSED)
+
 DEFAULT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_ALLOW_FILE = Path(__file__).with_name("docs_private_path_allow.json")
 DEFAULT_EXCEPTIONS_FILE = Path(__file__).with_name("docs_private_path_exceptions.json")
@@ -464,13 +504,13 @@ def main(argv: list[str] | None = None) -> int:
             if not matches:
                 continue
             for match in matches:
-                print(f"{relative}:{match.line}: private-home-prefix")
+                wa.out(f"{relative}:{match.line}: private-home-prefix")
             total += len(matches)
             changes.append((path, redact(text, matches).encode("utf-8", "surrogateescape")))
         unused = [(entry.path, entry.line) for entry in exceptions
                   if (entry.path, entry.line) not in used]
         for relative, number in unused:
-            print(f"{relative}:{number}: unused exact-line exception")
+            wa.out(f"{relative}:{number}: unused exact-line exception")
         remaining = 0
         if args.fix and not unused:
             for path, replacement in changes:
@@ -480,14 +520,14 @@ def main(argv: list[str] | None = None) -> int:
                                       allowed, by_path.get(relative))
                 remaining += len(matches)
                 for match in matches:
-                    print(f"{relative}:{match.line}: private-home-prefix")
+                    wa.out(f"{relative}:{match.line}: private-home-prefix")
         label = "redacted" if args.fix and not unused else "findings"
-        print(f"docs-private-paths: {label}={total} files={len(changes)} scanned={len(documents)} "
+        wa.out(f"docs-private-paths: {label}={total} files={len(changes)} scanned={len(documents)} "
               f"exceptions_used={len(used)} exceptions_unused={len(unused)} "
               f"remaining={remaining}")
         return EXIT_FINDINGS if unused or remaining or (total and not args.fix) else EXIT_CLEAN
     except (OSError, ValueError) as error:
-        print(f"docs-private-paths: {error}", file=sys.stderr)
+        wa.err(f"docs-private-paths: {error}")
         return EXIT_USAGE
 
 

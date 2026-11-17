@@ -52,7 +52,7 @@ class Run(unittest.TestCase):
             try:
                 last[0] = next(it)
             except StopIteration:
-                pass
+                pass  # the scripted loads ran out: the fake keeps returning the last one
             return last[0]
 
         out = io.StringIO()

@@ -284,7 +284,7 @@ def scrape_metrics(ips: dict, api_key: str, port: int,
                 try:
                     vals[metric] = vals.get(metric, 0.0) + float(parts[1])
                 except ValueError:
-                    pass
+                    pass  # a non-numeric sample is not a federation count; the metric keeps its running sum
         out[name] = vals
     return out
 

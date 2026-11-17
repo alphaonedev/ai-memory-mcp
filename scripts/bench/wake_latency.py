@@ -610,7 +610,7 @@ class SseArm:
         try:
             resp.close()
         except OSError:
-            pass
+            pass  # the stream is being torn down; a failed close leaves nothing to release
         session.close()
 
     def _on_block(self, block: bytes, stamp: float) -> None:
@@ -1423,7 +1423,7 @@ def self_test() -> int:
         Session("https://127.0.0.1:9443")
         check(False, "https without --tls-ca must be refused")
     except HarnessError:
-        pass
+        pass  # the refusal is the expected outcome
     try:
         Session("http://127.0.0.1:9077")
         check(False, "a plaintext http base URL must be refused")

@@ -58,7 +58,7 @@ def _load_workflow_annotation():
 # The one shared-module load shape of scripts/ (#9365, ruling bcd0a15c; LoaderShape pins it).
 WA_PROG = "shared_cargo_target"
 WA_RELATIVE_PATH = "workflow_annotation.py"
-WA_REQUIRED = ("env_file_value", "log_line")
+WA_REQUIRED = ("env_file_value", "err", "log_line", "out")
 WA_EXIT_LOAD_REFUSED = 3  # a failed shared-module load; no other meaning in this script
 WA_ERROR_TO_STDERR = False
 
@@ -80,6 +80,12 @@ class _NotLoaded:
 
     def log_line(self, *args, **kwargs):
         raise SharedModuleNotLoadedError(self._WANTED % "log_line")
+
+    def err(self, *args, **kwargs):
+        raise SharedModuleNotLoadedError(self._WANTED % "err")
+
+    def out(self, *args, **kwargs):
+        raise SharedModuleNotLoadedError(self._WANTED % "out")
 
 
 wa = _NotLoaded()
@@ -221,28 +227,27 @@ def main(argv=None):
     args = parser.parse_args(argv)
     home = Path(args.home)
     if not home.is_absolute() or str(home) in ("/", ""):
-        print(wa.log_line("shared_cargo_target: refusing home %r" % args.home), file=sys.stderr)
+        wa.err(wa.log_line("shared_cargo_target: refusing home %r" % args.home))
         return EXIT_USAGE
     try:
         path = runner_target_dir(home, args.runner_name)
     except ValueError as err:
-        print(wa.log_line("shared_cargo_target: refusing: %s" % err), file=sys.stderr)
+        wa.err(wa.log_line("shared_cargo_target: refusing: %s" % err))
         return EXIT_USAGE
     root = target_root_dir(home)
     root.mkdir(parents=True, exist_ok=True)
     with evict_lock(root, args.lock_timeout) as held:
         if not held:
             # A job start never fails or deadlocks on the lock (#7292).
-            print(wa.log_line("shared_cargo_target: warning: eviction lock %s not taken within %s s; "
-                  "proceeding without it" % (root / EVICT_LOCK_NAME, args.lock_timeout)),
-                  file=sys.stderr)
+            wa.err(wa.log_line("shared_cargo_target: warning: eviction lock %s not taken within %s s; "
+                  "proceeding without it" % (root / EVICT_LOCK_NAME, args.lock_timeout)))
         path.mkdir(parents=True, exist_ok=True)
         write_in_use_marker(path, args.runner_name)
     if args.github_env:
         with open(args.github_env, "a", encoding="utf-8") as handle:
             handle.write("%s=%s\n" % (ENV_NAME, wa.env_file_value(path)))
             handle.write("%s=%s\n" % (ROOT_ENV_NAME, wa.env_file_value(target_root_dir(home))))
-    print(wa.log_line(path))
+    wa.out(wa.log_line(path))
     return EXIT_OK
 
 

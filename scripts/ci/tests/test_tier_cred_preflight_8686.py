@@ -191,7 +191,7 @@ def kill_quietly(pid):
     try:
         os.kill(pid, signal.SIGKILL)
     except OSError:
-        pass
+        pass  # the child already exited; there is nothing left to kill
 
 
 def write_exe(path, text):
