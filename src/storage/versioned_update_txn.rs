@@ -11,12 +11,15 @@
 
 use super::*;
 
-/// #9405 / #9273 - the gated body of [`update_with_expected_version`]: the
-/// record-stop gate runs first (before any transaction is opened, so a stopped
-/// store refuses without taking the write lock), then the reads and the UPDATE
-/// run inside one write transaction and see one snapshot under the write lock.
+/// #9405 / #9273 - the gated body of [`update_with_expected_version`]. It
+/// does not need the caller to hold a transaction: the record-stop gate
+/// runs first (before any transaction is opened, so a stopped store refuses
+/// without taking the write lock), then the fn itself opens a write
+/// transaction (or joins the caller's) and runs the reads and the UPDATE in
+/// it, so they see one snapshot under the write lock. A refusal leaves a
+/// caller's transaction open for the caller to roll back.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-pub(super) fn update_with_expected_version_in_txn(
+pub(super) fn update_with_expected_version_gated(
     conn: &Connection,
     id: &str,
     title: Option<&str>,

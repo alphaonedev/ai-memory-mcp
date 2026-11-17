@@ -23,7 +23,7 @@ use std::path::Path;
 /// (file under src/, enclosing fn or const/static, raw write count).
 ///
 /// Projecting funnels: `insert_inner` via `INSERT_UPSERT_SQL`,
-/// `insert_with_conflict`, `update_with_expected_version_in_txn` (#9405),
+/// `insert_with_conflict`, `update_with_expected_version_gated` (#9405),
 /// `consolidate_with_expected_versions` (insert), `restore_archived_impl`,
 /// `restore_archived_for_caller`, `insert_if_newer` via `INSERT_IF_NEWER_SQL`,
 /// `overwrite_full_row_by_id`, `bind_agent_pubkey_no_tx` (ledger values),
@@ -77,7 +77,7 @@ const PINNED_WRITE_SITES_8341: &[(&str, &str, usize)] = &[
     ("storage/pubkey_history.rs", "bind_agent_pubkey_no_tx", 1),
     (
         "storage/versioned_update_txn.rs",
-        "update_with_expected_version_in_txn",
+        "update_with_expected_version_gated",
         1,
     ),
     ("store/sqlite.rs", "reclassify_memory_kind", 1),
