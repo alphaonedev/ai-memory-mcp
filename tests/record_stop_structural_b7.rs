@@ -28,10 +28,18 @@
 //!
 //! This is a TEXTUAL scanner, so it proves less than a reader may assume:
 //!
-//! - **Reachability is not checked.** A gate call anywhere in the
-//!   function body counts, including one inside a closure that is never
-//!   invoked or a branch that never runs. A gate that is present but
-//!   unreachable reads as gated.
+//! - **Reachability is lexical (#9414).** A gate call is credited only in a
+//!   statement with no closure, attribute, short circuit, `else` or
+//!   macro-argument prefix, after no early exit in its block or an enclosing
+//!   one, and only when it DOMINATES every own write-SQL line: its block
+//!   encloses the write's block and it comes first ([`span_gate_credit`]).
+//!   A gate-only wrapper needs that gate at brace depth 1 of the body.
+//!   Every other gate is a "conditional gate" and needs a reviewed fix or
+//!   ALLOWLIST row. Values are not evaluated: a callee that never returns or
+//!   a gate whose result is discarded still reads as gated.
+//! - **Every byte is classified (#9414).** Comments and literals are read by
+//!   the one tokenizer in `tests/common/rust_tokens.rs`; a form it cannot
+//!   classify fails the scan naming file:line.
 //! - **Macro-generated code is invisible.** Write SQL or a gate call
 //!   produced by a macro expansion is never seen.
 //! - **Enclosing function is lexical.** Write SQL is attributed to the
@@ -50,6 +58,8 @@ use std::collections::{HashMap, HashSet};
 #[path = "common/cfg_test_modules.rs"]
 mod cfg_test_modules;
 use cfg_test_modules::cfg_test_declared_files;
+#[path = "common/rust_tokens.rs"]
+mod rust_tokens;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -446,156 +456,14 @@ fn rel_src(path: &Path, root: &Path) -> String {
         .replace('\\', "/")
 }
 
-/// R4-G2 — a copy of `text` in which every comment and every string / char
-/// literal body is blanked to spaces, line structure preserved (an escaped
-/// newline inside a string keeps its `\n`). Function boundaries (braces,
-/// `;`) and gate CALLS are read from this mask, so a brace, a `fn`, or a
-/// gate name inside a comment or a string literal can neither end a body
-/// nor count as a gate (before R4-G2 `// TODO: gate_record_stop();` and a
-/// `const EXPLANATION: &str = "gate_record_stop ..."` both "gated" an
-/// ungated write fn). Handles `//`, nested `/* */`, `"…"` with escapes, raw
-/// strings `r#"…"#` (and `br`), and char literals vs lifetimes.
-fn code_mask(text: &str) -> String {
-    let c: Vec<char> = text.chars().collect();
-    let mut out = String::with_capacity(text.len());
-    let blank = |out: &mut String, ch: char| out.push(if ch == '\n' { '\n' } else { ' ' });
-    let is_ident = |ch: char| ch.is_alphanumeric() || ch == '_';
-    let mut i = 0;
-    while i < c.len() {
-        let ch = c[i];
-        let next = c.get(i + 1).copied();
-        if ch == '/' && next == Some('/') {
-            while i < c.len() && c[i] != '\n' {
-                blank(&mut out, c[i]);
-                i += 1;
-            }
-            continue;
-        }
-        if ch == '/' && next == Some('*') {
-            let mut depth = 0usize;
-            while i < c.len() {
-                if c[i] == '/' && c.get(i + 1) == Some(&'*') {
-                    depth += 1;
-                    out.push_str("  ");
-                    i += 2;
-                } else if c[i] == '*' && c.get(i + 1) == Some(&'/') {
-                    depth -= 1;
-                    out.push_str("  ");
-                    i += 2;
-                    if depth == 0 {
-                        break;
-                    }
-                } else {
-                    blank(&mut out, c[i]);
-                    i += 1;
-                }
-            }
-            continue;
-        }
-        let prev_ident = i > 0 && is_ident(c[i - 1]);
-        // Raw string: r"…", r#"…"#, br#"…"# (not an identifier ending in r).
-        let raw_at = if ch == 'r' && !prev_ident {
-            Some(i + 1)
-        } else if ch == 'b' && next == Some('r') && !prev_ident {
-            Some(i + 2)
-        } else {
-            None
-        };
-        if let Some(mut j) = raw_at {
-            let mut hashes = 0usize;
-            while c.get(j) == Some(&'#') {
-                hashes += 1;
-                j += 1;
-            }
-            if c.get(j) == Some(&'"') {
-                for &k in &c[i..=j] {
-                    out.push(k);
-                }
-                i = j + 1;
-                while i < c.len() {
-                    if c[i] == '"' && (1..=hashes).all(|h| c.get(i + h) == Some(&'#')) {
-                        out.push('"');
-                        out.extend(std::iter::repeat_n('#', hashes));
-                        i += 1 + hashes;
-                        break;
-                    }
-                    blank(&mut out, c[i]);
-                    i += 1;
-                }
-                continue;
-            }
-        }
-        if ch == '"' {
-            out.push('"');
-            i += 1;
-            while i < c.len() {
-                if c[i] == '\\' {
-                    blank(&mut out, c[i]);
-                    if let Some(&e) = c.get(i + 1) {
-                        blank(&mut out, e);
-                    }
-                    i += 2;
-                    continue;
-                }
-                if c[i] == '"' {
-                    out.push('"');
-                    i += 1;
-                    break;
-                }
-                blank(&mut out, c[i]);
-                i += 1;
-            }
-            continue;
-        }
-        if ch == '\'' {
-            // Char literal ('x', '\n', '\u{..}') vs lifetime ('a).
-            let is_char = next == Some('\\') || c.get(i + 2) == Some(&'\'');
-            if is_char {
-                out.push('\'');
-                i += 1;
-                while i < c.len() {
-                    if c[i] == '\\' {
-                        out.push_str("  ");
-                        i += 2;
-                        continue;
-                    }
-                    if c[i] == '\'' {
-                        out.push('\'');
-                        i += 1;
-                        break;
-                    }
-                    blank(&mut out, c[i]);
-                    i += 1;
-                }
-                continue;
-            }
-        }
-        out.push(ch);
-        i += 1;
-    }
-    out
-}
-
-/// R4-G2 — does this MASKED line CALL a gate? A marker counts only as an
-/// identifier (not a suffix of a longer one, not followed by more
-/// identifier characters) immediately followed by `(` or a `::<` turbofish.
-/// A bare mention (a doc link, a fn pointer) is not a call.
-fn line_calls_gate(masked: &str, wrappers: &[String]) -> bool {
-    let is_ident = |ch: char| ch.is_alphanumeric() || ch == '_';
-    GATE_MARKERS
-        .iter()
-        .copied()
-        .chain(wrappers.iter().map(String::as_str))
-        .any(|g| {
-            masked.match_indices(g).any(|(pos, _)| {
-                let before_ok = masked[..pos]
-                    .chars()
-                    .next_back()
-                    .is_none_or(|ch| !is_ident(ch));
-                let after = &masked[pos + g.len()..];
-                before_ok && (after.starts_with('(') || after.starts_with("::<"))
-            })
-        })
+/// #9414 — a copy of `text` in which every comment and every literal body is
+/// blanked to spaces, line structure preserved, built on the ONE tokenizer
+/// in `tests/common/rust_tokens.rs` (replacing the R4-G2 hand masker, which
+/// did not know `c` / `cr` strings: in `cr"\"` it read `\"` as an escape and
+/// masked real code up to the next quote). A form the tokenizer cannot
+/// classify is an `Err("line N: <reason>")`, a scan FINDING, never code.
+fn code_mask(text: &str) -> Result<String, String> {
+    rust_tokens::code_mask(text).map_err(|e| e.to_string())
 }
 
 /// R4-G2 — same-file gate WRAPPERS: a fn named `<marker>_<suffix>` (e.g.
@@ -603,7 +471,7 @@ fn line_calls_gate(masked: &str, wrappers: &[String]) -> bool {
 /// a gate only when its OWN span calls a gate (a marker or an already
 /// proven wrapper). Pre-R4-G2 any identifier merely CONTAINING a marker
 /// counted, proven or not.
-fn gate_wrappers(masked: &[&str], spans: &[(usize, usize, String)]) -> Vec<String> {
+fn gate_wrappers(lines: &[&str], masked: &[&str], spans: &[(usize, usize, String)]) -> Vec<String> {
     let mut wrappers: Vec<String> = Vec::new();
     loop {
         let before = wrappers.len();
@@ -611,7 +479,9 @@ fn gate_wrappers(masked: &[&str], spans: &[(usize, usize, String)]) -> Vec<Strin
             let named = GATE_MARKERS
                 .iter()
                 .any(|g| name.strip_prefix(g).is_some_and(|r| r.starts_with('_')));
-            if named && !wrappers.contains(name) && span_has_gate(masked, spans, *s, *e, &wrappers)
+            if named
+                && !wrappers.contains(name)
+                && span_has_gate(lines, masked, spans, *s, *e, &wrappers)
             {
                 wrappers.push(name.clone());
             }
@@ -689,21 +559,204 @@ fn enclosing_span(spans: &[(usize, usize, String)], idx: usize) -> Option<&(usiz
         .max_by_key(|(s, _, _)| *s)
 }
 
-/// Does span `(s, e)` itself CALL a gate? Lines of NESTED fn spans are
-/// excluded — a nested helper's gate is the helper's, not the outer fn's.
+/// #9414 — why span `(s, e)` is or is not credited with a gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GateCredit {
+    /// A gate call that provably runs before the span's first write.
+    Credited,
+    /// Gate calls exist, but none provably runs first (0-based line of the
+    /// first one): nested block, closure, attribute, short circuit, macro
+    /// argument, after a depth-1 exit, or after the first write.
+    Conditional(usize),
+    /// No gate call at all.
+    Absent,
+}
+
+/// #9414 — words that leave the fn body at brace depth 1 (and the macros
+/// that diverge when invoked with `!`).
+const EARLY_EXIT_WORDS: &[&str] = &["return", "break", "continue"];
+const DIVERGING_MACROS: &[&str] = &["panic", "unreachable", "todo", "unimplemented", "bail"];
+/// #9414 — a gate whose statement prefix (depth-1 code since the statement
+/// began) holds one of these may not run: `else`, an `async` / `move` block
+/// or closure.
+const CONDITIONAL_PREFIX_WORDS: &[&str] = &["else", "async", "move"];
+/// #9414 — the same for punctuation: closure params and `||` (`|`), an
+/// attribute such as `#[cfg(test)]` (`#`), `&&`, a match arm (`=>`) and a
+/// macro argument (`!(` / `![`).
+const CONDITIONAL_PREFIX_PUNCT: &[&str] = &["|", "#", "&&", "=>", "!(", "!["];
+
+fn prefix_is_unconditional(prefix: &str) -> bool {
+    !CONDITIONAL_PREFIX_PUNCT.iter().any(|p| prefix.contains(p))
+        && !prefix
+            .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .any(|w| CONDITIONAL_PREFIX_WORDS.contains(&w))
+}
+
+/// #9414 — 0-based lines of the write-SQL lines that belong to span
+/// `(s, e)` itself (not to a nested fn).
+fn own_writes(lines: &[&str], spans: &[(usize, usize, String)], s: usize, e: usize) -> Vec<usize> {
+    (s..e)
+        .filter(|&k| {
+            lines.get(k).is_some_and(|l| write_sql_line(l))
+                && enclosing_span(spans, k).is_some_and(|(ss, se, _)| *ss == s && *se == e)
+        })
+        .collect()
+}
+
+/// #9414 — the control-flow credit of span `(s, e)` (masked lines). A gate
+/// CALL (a marker or proven wrapper followed by `(` or `::<`) is VALID when
+/// its statement prefix in its own block is unconditional and no early exit
+/// ran earlier in that block or an enclosing one. The span is credited when
+/// every own write-SQL line is DOMINATED by a valid gate (the gate's block
+/// encloses the write's block and the gate's line comes first) or, for a
+/// span with no own write (a wrapper), when a valid gate sits at brace depth
+/// 1 of the body. A gate in an `if false` block, a closure, after an early
+/// return or after the write therefore never counts. Anything else with a
+/// gate call is [`GateCredit::Conditional`].
+fn span_gate_credit(
+    lines: &[&str],
+    masked: &[&str],
+    spans: &[(usize, usize, String)],
+    s: usize,
+    e: usize,
+    wrappers: &[String],
+) -> GateCredit {
+    struct Level {
+        id: usize,
+        prefix: String,
+        stmt_exits: bool,
+        exited: bool,
+    }
+    let writes = own_writes(lines, spans, s, e);
+    let mut write_blocks: Vec<(usize, Vec<usize>)> = Vec::new();
+    let mut valid_gates: Vec<(usize, Vec<usize>)> = Vec::new();
+    let mut first_gate = None;
+    let mut stack: Vec<Level> = Vec::new();
+    let mut next_id = 0usize;
+    let mut paren = 0i64;
+    let mut opened = false;
+    'lines: for k in s..e.min(masked.len()) {
+        if opened && writes.contains(&k) {
+            write_blocks.push((k, stack.iter().map(|l| l.id).collect()));
+        }
+        let chars: Vec<char> = masked[k].chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            let ch = chars[i];
+            if !opened {
+                match ch {
+                    '(' | '[' => paren += 1,
+                    ')' | ']' => paren -= 1,
+                    '{' if paren == 0 => {
+                        opened = true;
+                        stack.push(Level {
+                            id: next_id,
+                            prefix: String::new(),
+                            stmt_exits: false,
+                            exited: false,
+                        });
+                        next_id += 1;
+                    }
+                    ';' if paren == 0 => return GateCredit::Absent,
+                    _ => {}
+                }
+                i += 1;
+                continue;
+            }
+            let Some(top) = stack.last_mut() else {
+                break 'lines;
+            };
+            if ch.is_alphabetic() || ch == '_' {
+                let st = i;
+                while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                    i += 1;
+                }
+                let word: String = chars[st..i].iter().collect();
+                let next = chars.get(i).copied();
+                let turbofish = next == Some(':')
+                    && chars.get(i + 1) == Some(&':')
+                    && chars.get(i + 2) == Some(&'<');
+                if EARLY_EXIT_WORDS.contains(&word.as_str())
+                    || (next == Some('!') && DIVERGING_MACROS.contains(&word.as_str()))
+                {
+                    top.stmt_exits = true;
+                }
+                let is_gate = (next == Some('(') || turbofish)
+                    && (GATE_MARKERS.contains(&word.as_str()) || wrappers.contains(&word));
+                if is_gate {
+                    first_gate.get_or_insert(k);
+                    let valid =
+                        prefix_is_unconditional(&top.prefix) && !stack.iter().any(|l| l.exited);
+                    if valid {
+                        valid_gates.push((k, stack.iter().map(|l| l.id).collect()));
+                    }
+                }
+                if let Some(top) = stack.last_mut() {
+                    top.prefix.push_str(&word);
+                    top.prefix.push(' ');
+                }
+                continue;
+            }
+            match ch {
+                '{' => {
+                    stack.push(Level {
+                        id: next_id,
+                        prefix: String::new(),
+                        stmt_exits: false,
+                        exited: false,
+                    });
+                    next_id += 1;
+                }
+                '}' => {
+                    stack.pop();
+                    let Some(top) = stack.last_mut() else {
+                        break 'lines;
+                    };
+                    top.exited |= top.stmt_exits;
+                    top.stmt_exits = false;
+                    top.prefix.clear();
+                }
+                ';' => {
+                    top.exited |= top.stmt_exits;
+                    top.stmt_exits = false;
+                    top.prefix.clear();
+                }
+                c if !c.is_whitespace() => top.prefix.push(c),
+                _ => {}
+            }
+            i += 1;
+        }
+        if let Some(top) = stack.last_mut() {
+            top.prefix.push(' ');
+        }
+    }
+    let credited = if writes.is_empty() {
+        valid_gates.iter().any(|(_, ids)| ids.len() == 1)
+    } else {
+        writes.len() == write_blocks.len()
+            && write_blocks.iter().all(|(wk, wids)| {
+                valid_gates
+                    .iter()
+                    .any(|(gk, gids)| gk < wk && wids.starts_with(gids))
+            })
+    };
+    match (credited, first_gate) {
+        (true, _) => GateCredit::Credited,
+        (false, Some(at)) => GateCredit::Conditional(at),
+        (false, None) => GateCredit::Absent,
+    }
+}
+
+/// Is span `(s, e)` credited with a gate ([`span_gate_credit`])?
 fn span_has_gate(
+    lines: &[&str],
     masked: &[&str],
     spans: &[(usize, usize, String)],
     s: usize,
     e: usize,
     wrappers: &[String],
 ) -> bool {
-    (s..e).any(|k| {
-        let nested = spans
-            .iter()
-            .any(|(ns, ne, _)| *ns > s && *ne <= e && *ns <= k && k < *ne);
-        !nested && line_calls_gate(masked[k], wrappers)
-    })
+    span_gate_credit(lines, masked, spans, s, e, wrappers) == GateCredit::Credited
 }
 
 /// #4052 — gate verdict of EVERY production function named exactly `fn_name`
@@ -716,16 +769,28 @@ fn fn_gate_verdicts(
     fn_name: &str,
     start_of: impl Fn(&str) -> Option<(usize, String)>,
 ) -> Vec<bool> {
+    try_fn_gate_verdicts(src, fn_name, start_of).unwrap_or_else(|finding| {
+        panic!("#9414 B7 tokenizer finding in the `{fn_name}` source: {finding}")
+    })
+}
+
+/// #9414 — [`fn_gate_verdicts`] with the tokenizer finding as the error.
+fn try_fn_gate_verdicts(
+    src: &str,
+    fn_name: &str,
+    start_of: impl Fn(&str) -> Option<(usize, String)>,
+) -> Result<Vec<bool>, String> {
     let text = join_string_continuations(strip_test_mod(src));
-    let mask = code_mask(&text);
+    let mask = code_mask(&text)?;
+    let lines: Vec<&str> = text.lines().collect();
     let masked: Vec<&str> = mask.lines().collect();
     let spans = fn_spans(&masked, start_of);
-    let wrappers = gate_wrappers(&masked, &spans);
-    spans
+    let wrappers = gate_wrappers(&lines, &masked, &spans);
+    Ok(spans
         .iter()
         .filter(|(_, _, n)| n == fn_name)
-        .map(|(s, e, _)| span_has_gate(&masked, &spans, *s, *e, &wrappers))
-        .collect()
+        .map(|(s, e, _)| span_has_gate(&lines, &masked, &spans, *s, *e, &wrappers))
+        .collect())
 }
 
 /// Parity-side read: is `fn_name` gated in `src`? Fails CLOSED — every
@@ -774,10 +839,11 @@ fn ungated_write_fns_for(
     classify: impl Fn(&str) -> bool,
 ) -> Vec<String> {
     let lines: Vec<&str> = text.lines().collect();
-    let mask = code_mask(text);
+    let mask =
+        code_mask(text).unwrap_or_else(|finding| panic!("#9414 B7 tokenizer finding: {finding}"));
     let masked: Vec<&str> = mask.lines().collect();
     let spans = fn_spans(&masked, start_of);
-    let wrappers = gate_wrappers(&masked, &spans);
+    let wrappers = gate_wrappers(&lines, &masked, &spans);
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     for (idx, line) in lines.iter().enumerate() {
@@ -793,7 +859,7 @@ fn ungated_write_fns_for(
         if !seen.insert(name.clone()) {
             continue;
         }
-        if !span_has_gate(&masked, &spans, *start, *end, &wrappers) {
+        if !span_has_gate(&lines, &masked, &spans, *start, *end, &wrappers) {
             out.push(name.clone());
         }
     }
@@ -1217,6 +1283,9 @@ fn record_stop_write_sql_fns_are_gated_or_allowlisted_b7() {
         .collect();
 
     let mut ungated: Vec<(String, String, usize)> = Vec::new();
+    let mut findings: Vec<String> = Vec::new();
+    let mut scanned_files = 0usize;
+    let mut gated_fns = 0usize;
     let mut gated_hits: HashMap<String, bool> = MUST_BE_GATED
         .iter()
         .map(|n| ((*n).to_string(), false))
@@ -1236,10 +1305,19 @@ fn record_stop_write_sql_fns_are_gated_or_allowlisted_b7() {
         // Pair every write-SQL line with the nearest preceding `fn`
         // (impl methods sit at indent 4; do not swallow them as nested
         // inside an earlier indent-0 helper).
-        let mask = code_mask(&text);
+        // #9414: a form the tokenizer cannot classify is a finding naming
+        // file:line; the file is never skipped and never read as code.
+        let mask = match code_mask(&text) {
+            Ok(m) => m,
+            Err(finding) => {
+                findings.push(format!("{rel}: {finding}"));
+                continue;
+            }
+        };
+        scanned_files += 1;
         let masked: Vec<&str> = mask.lines().collect();
         let spans = fn_spans(&masked, is_fn_start);
-        let wrappers = gate_wrappers(&masked, &spans);
+        let wrappers = gate_wrappers(&lines, &masked, &spans);
         let mut seen: HashSet<(String, String)> = HashSet::new();
         for (idx, line) in lines.iter().enumerate() {
             if !write_sql_line(line) {
@@ -1285,7 +1363,9 @@ fn record_stop_write_sql_fns_are_gated_or_allowlisted_b7() {
             {
                 continue;
             }
-            if span_has_gate(&masked, &spans, start, end, &wrappers) {
+            let credit = span_gate_credit(&lines, &masked, &spans, start, end, &wrappers);
+            if credit == GateCredit::Credited {
+                gated_fns += 1;
                 if let Some(flag) = gated_hits.get_mut(name) {
                     *flag = true;
                 }
@@ -1294,9 +1374,22 @@ fn record_stop_write_sql_fns_are_gated_or_allowlisted_b7() {
             if allow.contains(&key) {
                 continue;
             }
-            ungated.push((rel.clone(), name.clone(), start + 1));
+            let why = match credit {
+                GateCredit::Conditional(at) => format!("conditional gate at line {}", at + 1),
+                _ => "no gate".to_string(),
+            };
+            ungated.push((rel.clone(), format!("{name} ({why})"), start + 1));
         }
     }
+
+    assert!(
+        findings.is_empty(),
+        "#9414 B7 tokenizer findings (unclassifiable forms):\n  {}",
+        findings.join("\n  ")
+    );
+    // #9414 fail closed: an empty scan or zero credited gates is a failure.
+    assert!(scanned_files > 0, "#9414 B7 scanned no source file");
+    assert!(gated_fns > 0, "#9414 B7 credited no gated fn");
 
     let mut missing_required = Vec::new();
     for (name, hit) in &gated_hits {
@@ -1547,7 +1640,8 @@ fn repair_call_sites_are_migrate_only_4324() {
 /// #9414 — the verdict a unit cell asserts: `Ok(gated)` for the one fn named
 /// `fn_name` in `src`, or the tokenizer finding (`line N: <reason>`).
 fn b7_try_verdict(src: &str, fn_name: &str) -> Result<bool, String> {
-    Ok(fn_body_has_gate(src, fn_name))
+    let v = try_fn_gate_verdicts(src, fn_name, is_fn_start)?;
+    Ok(!v.is_empty() && v.iter().all(|g| *g))
 }
 
 /// #9414 — a write fn named `w` whose body is `body` (one statement per line).
@@ -1846,6 +1940,15 @@ fn b7_scan_is_linear_on_a_100k_input_9414() {
     assert!(
         took <= B7_LINEAR_BOUND_CEILING_9414,
         "#9414 100K input took {took:?}, ceiling {B7_LINEAR_BOUND_CEILING_9414:?}"
+    );
+    // Op-count bound: one step per char plus at most RAW_HASH_LIMIT per
+    // quote inside a raw string, so steps <= (RAW_HASH_LIMIT + 1) * bytes.
+    let (tokens, steps) = rust_tokens::tokenize_steps(&src);
+    assert!(tokens.is_ok(), "#9414 100K input must tokenize: {tokens:?}");
+    let ceiling = u64::try_from((rust_tokens::RAW_HASH_LIMIT + 1) * src.len()).unwrap_or(u64::MAX);
+    assert!(
+        steps <= ceiling,
+        "#9414 100K input took {steps} steps, ceiling {ceiling}"
     );
 }
 
