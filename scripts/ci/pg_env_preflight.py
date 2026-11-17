@@ -21,7 +21,9 @@ What it does:
      EXISTS age;`.
   4. On the first failure prints exactly one class line
      `::error::[<label>] PG-ENV <reason>` and exits 3.  Never a silent
-     skip, never exit 0 on a failed probe.
+     skip, never exit 0 on a failed probe.  A shared workflow_annotation.py
+     next to this file that cannot be loaded is the same exit 3, with one
+     fixed `::error` line built without it (#9365).
 
 Connection data comes from libpq environment variables (PGHOST, PGPORT,
 PGUSER, PGDATABASE, PGPASSWORD, PGSSLMODE, PGSSLROOTCERT); nothing
@@ -39,12 +41,53 @@ import sys
 import time
 from collections.abc import Callable, Sequence
 
+
+def _load_workflow_annotation():
+    """The shared module at WA_RELATIVE_PATH from this file's real directory, by path only, never through
+    sys.path; every name in WA_REQUIRED must be a callable of it (#9365, one shape in every script)."""
+    import importlib.util
+    import os
+    path = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), WA_RELATIVE_PATH))
+    loaded = sys.modules.get("workflow_annotation")
+    if loaded is not None and os.path.realpath(getattr(loaded, "__file__", None) or "") == path:
+        module = loaded
+    else:
+        spec = importlib.util.spec_from_file_location("workflow_annotation", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)  # absent, unreadable or broken: it raises here, the try below catches it
+    missing = [name for name in WA_REQUIRED if not callable(getattr(module, name, None))]
+    if missing:
+        raise AttributeError("workflow_annotation.py lacks " + ", ".join(missing))
+    if loaded is None:
+        sys.modules["workflow_annotation"] = module
+    return module
+
+
+EXIT_OK = 0
+EXIT_PG_ENV = 3
+
+# The one shared-module load shape of scripts/ (#9365, ruling bcd0a15c; LoaderShape pins it).
+WA_PROG = "pg_env_preflight"
+WA_RELATIVE_PATH = "workflow_annotation.py"
+WA_REQUIRED = ("annotation", "log_line")
+WA_EXIT_LOAD_REFUSED = EXIT_PG_ENV  # the gate's own refusal code, unchanged
+WA_ERROR_TO_STDERR = False
+
+try:
+    wa = _load_workflow_annotation()
+except (Exception, SystemExit) as exc:  # any failed load: one fixed line built without the module, then exit
+    wa_cause = type(exc).__name__
+    print("%s: refused: shared module workflow_annotation.py next to the script cannot be loaded (%s)"
+          % (WA_PROG, wa_cause if wa_cause.isidentifier() else "BaseException"), file=sys.stderr, flush=True)
+    print("::error title=pg_env_preflight refused::pg_env_preflight: refused: shared module workflow_annotation.py"
+          " next to the script cannot be loaded",
+          file=sys.stderr if WA_ERROR_TO_STDERR else sys.stdout, flush=True)
+    sys.exit(WA_EXIT_LOAD_REFUSED)
+
 DEFAULT_LABEL = "coverage-pg"
 DEFAULT_PSQL = "psql"
 DEFAULT_PKG_GLOB = "postgresql-16*"
 IMAGE_VERSION_ENV = "ImageVersion"
-EXIT_OK = 0
-EXIT_PG_ENV = 3
 PROBE_TIMEOUT_SECS = 60
 DOCKER_TIMEOUT_SECS = 180
 DEFAULT_WAIT_SECS = 120
@@ -92,7 +135,7 @@ def default_runner(argv: Sequence[str]) -> subprocess.CompletedProcess:
 
 def class_line(label: str, reason: str) -> str:
     """The single, machine-readable failure line."""
-    return f"::error::[{label}] PG-ENV {reason}"
+    return wa.annotation("error", f"[{label}] PG-ENV {reason}")
 
 
 def _detail(proc: subprocess.CompletedProcess) -> str:
@@ -117,7 +160,7 @@ def run_psql(runner: Runner, psql: str, sql: str) -> tuple[bool, str, str]:
 
 def print_environment(runner: Runner, container: str | None, pkg_glob: str) -> None:
     """Print the runner image version and installed postgresql-16* versions."""
-    print(f"runner {IMAGE_VERSION_ENV}={os.environ.get(IMAGE_VERSION_ENV, 'unset')}")
+    print(wa.log_line(f"runner {IMAGE_VERSION_ENV}={os.environ.get(IMAGE_VERSION_ENV, 'unset')}"))
     dpkg = ["dpkg-query", "-W", "-f", "${Package} ${Version}\\n", pkg_glob]
     argv = ["docker", "exec", container, *dpkg] if container else dpkg
     try:
@@ -128,10 +171,10 @@ def print_environment(runner: Runner, container: str | None, pkg_glob: str) -> N
         ok, out = False, ""
     where = f"container {container}" if container else "runner"
     if not ok or not out:
-        print(f"pkg ({where}): unavailable")
+        print(wa.log_line(f"pkg ({where}): unavailable"))
         return
     for line in out.splitlines():
-        print(f"pkg ({where}): {line}")
+        print(wa.log_line(f"pkg ({where}): {line}"))
 
 
 def restart_container(runner: Runner, container: str) -> bool:
@@ -176,7 +219,7 @@ def preflight(
 
     def fail(reason: str, detail: str = "") -> int:
         if detail:
-            print(f"detail: {detail}")
+            print(wa.log_line(f"detail: {detail}"))
         print(class_line(label, reason))
         return EXIT_PG_ENV
 
@@ -191,12 +234,12 @@ def preflight(
             reachable, version, detail = run_psql(runner, psql, SQL_CONNECT)
         if not reachable:
             return fail(REASON_UNREACHABLE, detail)
-        print(f"server_version={version}")
+        print(wa.log_line(f"server_version={version}"))
         for name, sql, reason in PROBES:
             ok, _out, detail = run_psql(runner, psql, sql)
             if not ok:
                 return fail(reason, detail)
-            print(f"probe {name}: ok")
+            print(wa.log_line(f"probe {name}: ok"))
     except PsqlMissingError:
         return fail(REASON_PSQL_MISSING)
     return EXIT_OK

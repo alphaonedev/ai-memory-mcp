@@ -239,7 +239,7 @@ def write_outputs(result: dict, out: Optional[Path], github_output: Optional[Pat
         domains = domain_outputs(result, known_jobs or result["jobs"], enforce)
         lines += ["%s=%s" % (job, value) for job, value in domains.items()]
         with open(str(github_output), "a") as handle:
-            handle.write("\n".join(lines) + "\n")
+            handle.write("\n".join(common.single_line(line) for line in lines) + "\n")
 
 
 def main(argv: Optional[List[str]] = None) -> int:

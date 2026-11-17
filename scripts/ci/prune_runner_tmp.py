@@ -62,6 +62,8 @@ MIN_PYTHON = (3, 12)
 EXIT_OK = 0
 EXIT_ERROR = 1
 PROG = "prune_runner_tmp"
+VERSION_REFUSAL_MAX_CHARS = 1000  # workflow_annotation.MAX_ANNOTATION_CHARS: the whole line, escapes included
+VERSION_REFUSAL_CUT_MARK = "..."  # workflow_annotation.ANNOTATION_CUT_MARK
 
 
 def python_refusal(version_info):
@@ -73,15 +75,112 @@ def python_refusal(version_info):
     return None
 
 
-def refusal_annotation(reason):
-    """The workflow annotation for a refusal; ``reason`` is already escaped."""
-    return f"::warning title={PROG} refused::{PROG}: refused: {reason}"
+def version_text(text):
+    """``workflow_annotation.safe_value`` restated for the version refusal, which runs before that module is loaded.
+
+    Backslash doubles; ``%``, every ``:``, C0/C1 controls and DEL become ``\\xNN``; surrogates and U+2028/9 become
+    ``\\uNNNN``; a ``#`` that is last or precedes ``#``/``[`` becomes ``\\x23`` and a ``[`` that follows ``#``
+    becomes ``\\x5b`` (no v1 ``##[`` command, #9365); every other character stays. A test pins it byte-equal to
+    ``safe_value`` over every code point.
+    """
+    text = str(text)
+    last = len(text) - 1
+    pieces = []
+    for index, char in enumerate(text):
+        code = ord(char)
+        if char == "#" and (index == last or text[index + 1] in "#["):
+            pieces.append("\\x23")
+        elif char == "[" and index > 0 and text[index - 1] == "#":
+            pieces.append("\\x5b")
+        elif char == "\\":
+            pieces.append("\\\\")
+        elif char in "%:" or code < 0x20 or 0x7F <= code <= 0x9F:
+            pieces.append("\\x%02x" % code)
+        elif 0xD800 <= code <= 0xDFFF or code in (0x2028, 0x2029):
+            pieces.append("\\u%04x" % code)
+        else:
+            pieces.append(char)
+    return "".join(pieces)
 
 
+def version_refusal_annotation(reason):
+    """The version refusal's annotation, byte-equal to the shared module's ``annotation``/``render`` line, built without it."""
+    # the fixed text is annotation("warning", render("{prog}: refused: {reason}", ...), title=f"{PROG} refused")
+    line = "::warning title=prune_runner_tmp refused::prune_runner_tmp: refused: " + version_text(reason)
+    if len(line) > VERSION_REFUSAL_MAX_CHARS:
+        line = line[: VERSION_REFUSAL_MAX_CHARS - len(VERSION_REFUSAL_CUT_MARK)] + VERSION_REFUSAL_CUT_MARK
+    return line
+
+
+# The floor check runs before the shared module is loaded and before any name lookup but sys (ruling 598d069e):
+# below MIN_PYTHON nothing else of this file runs.
 if __name__ == "__main__" and python_refusal(sys.version_info) is not None:
     sys.stderr.write(f"{PROG}: refused: {python_refusal(sys.version_info)}\n")
-    sys.stdout.write(refusal_annotation(python_refusal(sys.version_info)) + "\n")
+    sys.stdout.write(version_refusal_annotation(python_refusal(sys.version_info)) + "\n")
     sys.exit(EXIT_OK)
+
+SHARED_MODULE_FILE = "workflow_annotation.py"
+SHARED_MODULE_USED = ("safe_value", "render", "join", "annotation", "log_line")  # every name this script takes from it
+LOAD_CANNOT_READ = "cannot be read"
+LOAD_RAISED = "raised while loading"
+LOAD_LACKS = "lacks "
+
+
+def load_shared_module(script_path):
+    """Return ``(module, None)`` for the shared module next to ``script_path``'s real file, else ``(None, cause)``.
+
+    The module is read from that one file and run in a fresh module object that is never put in ``sys.modules``:
+    no import statement (the floor check above precedes every import except sys, pinned by a test), no finder and
+    no ``sys.path`` lookup, nothing added to ``sys.path``. A module of the same name planted in the cwd, TMPDIR or
+    PYTHONPATH, next to a symlink to this script, or already imported, is never the code this deleting tool runs.
+    It runs only after the floor check (#9365, ruling 598d069e), where os is a frozen module.
+    """
+    paths = (sys.modules.get("os") or __import__("os")).path  # at or above the floor os is frozen (since 3.11)
+    try:
+        path = paths.join(paths.dirname(paths.realpath(script_path)), SHARED_MODULE_FILE)
+        with open(path, "rb") as handle:
+            source = handle.read()
+    except (OSError, TypeError, ValueError):
+        return None, LOAD_CANNOT_READ
+    module = type(sys)(SHARED_MODULE_FILE[:-3])
+    module.__file__ = path
+    try:
+        exec(compile(source, path, "exec", dont_inherit=True), module.__dict__)
+    except (Exception, SystemExit):  # any failure of the sibling, a SyntaxError or a sys.exit in it included
+        return None, LOAD_RAISED
+    for name in SHARED_MODULE_USED:
+        if not callable(getattr(module, name, None)):
+            return None, LOAD_LACKS + name
+    return module, None
+
+
+wa, LOAD_FAILURE = load_shared_module(globals().get("__file__"))
+safe_text = getattr(wa, "safe_value", None)  # the tests and the call sites below use it as a module attribute
+
+
+def load_refused(out, err):
+    """The load refusal: one fixed stderr line and one fixed annotation, both built without the shared module.
+
+    It mirrors the version refusal (exit 0, not counted, nothing pruned): a sibling that cannot be loaded is a
+    broken checkout, not a runner that could not be proven safe.
+    """
+    print(f"{PROG}: refused: shared module {SHARED_MODULE_FILE} next to the script cannot be loaded ({LOAD_FAILURE})",
+          file=err)
+    print("::warning title=prune_runner_tmp refused::prune_runner_tmp: refused: shared module workflow_annotation.py"
+          " next to the script cannot be loaded", file=out)
+    out.flush()
+    return EXIT_OK
+
+
+if __name__ == "__main__" and wa is None:
+    sys.exit(load_refused(sys.stdout, sys.stderr))
+
+
+def refusal_annotation(reason):
+    """The workflow annotation for a refusal; ``reason`` is the raw text (a ``Refusal`` gives its ``raw``)."""
+    raw = getattr(reason, "raw", reason)
+    return wa.annotation("warning", wa.render("{prog}: refused: {reason}", prog=PROG, reason=raw), title=f"{PROG} refused")
+
 
 import argparse  # noqa: E402  (the floor check above must run before anything newer is needed)
 import errno  # noqa: E402
@@ -166,9 +265,14 @@ COUNTED_REFUSALS = frozenset({"mount_unreadable", "mount_differs", "platform_unv
 
 
 class Refusal(Exception):
-    """TMPDIR cannot be pruned; the message is the exact reason; ``counted`` adds one counted failure."""
+    """TMPDIR cannot be pruned; the message is the exact reason (escaped for stderr), ``raw`` the same text as
+    ``SafeText`` for the annotation; ``counted`` adds one counted failure."""
 
     counted = False
+
+    def __init__(self, message, raw=None):
+        super().__init__(message)
+        self.raw = message if raw is None else raw
 
 
 class EntryChanged(OSError):
@@ -218,32 +322,10 @@ class PlatformMissing(Exception):
 
 def refuse(key, **fields):
     """Build the Refusal for reason ``key`` with ``fields`` escaped for the log."""
-    refusal = Refusal(REFUSAL_REASONS[key].format(**{k: safe_text(v) for k, v in fields.items()}))
+    template = REFUSAL_REASONS[key]
+    refusal = Refusal(template.format(**{k: safe_text(v) for k, v in fields.items()}), raw=wa.render(template, **fields))
     refusal.counted = key in COUNTED_REFUSALS
     return refusal
-
-
-def safe_text(text):
-    """Escape backslash, ``%``, every ``:``, U+0000-U+001F, U+007F-U+009F, surrogates, U+2028 and U+2029 so a name cannot inject a log line or workflow command.
-
-    Every ``:`` becomes ``\\x3a`` (one pass, no later replace), so no run of colons of any length survives (D-L1).
-    """
-    pieces = []
-    for char in str(text):
-        code = ord(char)
-        if char == "\\":
-            pieces.append("\\\\")
-        elif char == "%":
-            pieces.append("\\x25")
-        elif char == ":":
-            pieces.append("\\x3a")
-        elif code < 0x20 or 0x7F <= code <= 0x9F:
-            pieces.append(f"\\x{code:02x}")
-        elif 0xD800 <= code <= 0xDFFF or code in (0x2028, 0x2029):
-            pieces.append(f"\\u{code:04x}")
-        else:
-            pieces.append(char)
-    return "".join(pieces)
 
 
 def failed_annotation(count, names):
@@ -257,13 +339,11 @@ def failed_annotation(count, names):
     shown = []
     for name in list(names)[:MAX_ANNOTATION_NAMES]:
         cut = len(name) > MAX_ANNOTATION_NAME_CHARS
-        shown.append(safe_text(name[:MAX_ANNOTATION_NAME_CHARS]) + (ANNOTATION_CUT_MARK if cut else ""))
-    line = f"::warning title={PROG} failed::{PROG}: failed={count} not removed: " + ", ".join(shown)
+        shown.append(wa.render("{name}" + (ANNOTATION_CUT_MARK if cut else ""), name=name[:MAX_ANNOTATION_NAME_CHARS]))
+    message = wa.render("{prog}: failed={count} not removed: {names}", prog=PROG, count=count, names=wa.join(", ", shown))
     if count > MAX_ANNOTATION_NAMES:
-        line += f" (list cut at {MAX_ANNOTATION_NAMES} of {count})"
-    if len(line) > MAX_ANNOTATION_CHARS:
-        line = line[: MAX_ANNOTATION_CHARS - len(ANNOTATION_CUT_MARK)] + ANNOTATION_CUT_MARK
-    return line
+        message = wa.render("{message} (list cut at {limit} of {count})", message=message, limit=MAX_ANNOTATION_NAMES, count=count)
+    return wa.annotation("warning", message, max_chars=MAX_ANNOTATION_CHARS, title=f"{PROG} failed")
 
 
 def file_id(info):
@@ -590,7 +670,7 @@ def print_runner_facts(raw, roots, out):
         )
     except Exception as exc:  # print-only helper: never change the exit code
         line = f"{FACTS_PREFIX} error={type(exc).__name__}"
-    print(line, file=out)
+    print(wa.log_line(line), file=out)
     out.flush()
     return line
 
@@ -630,12 +710,12 @@ class Tally:
         if self.failed <= MAX_FAILURE_LINES:
             # CODE F6: a top-level entry not entered is named once; its text is the constant reason alone
             text = exc.reason if isinstance(exc, NotEntered) and not exc.nested and exc.name == name else error_text(exc)
-            print(f"{PROG}: failed to remove {safe_text(name)}: {text}", file=self.err)
+            print(wa.log_line(f"{PROG}: failed to remove {safe_text(name)}: {text}"), file=self.err)
 
     def skip(self, name, reason=SKIP_OTHER_DEVICE):
         self.skipped += 1
         if self.skipped <= MAX_FAILURE_LINES:
-            print(f"{PROG}: skipped {safe_text(name)}: {reason}", file=self.err)
+            print(wa.log_line(f"{PROG}: skipped {safe_text(name)}: {reason}"), file=self.err)
 
     def summary(self):
         text = f"pruned={self.pruned} kept={self.kept} failed={self.failed} freed_bytes={self.freed} skipped={self.skipped}"
@@ -854,11 +934,11 @@ def refused(reason, out, err):
     A counted refusal (COUNTED_REFUSALS) also prints the summary with failed=1, so the runner that could
     not be proven safe shows as a counted failure next to its one annotation.
     """
-    print(f"{PROG}: refused: {reason}", file=err)
+    print(wa.log_line(f"{PROG}: refused: {reason}"), file=err)
     if getattr(reason, "counted", False):
         tally = Tally(err)
         tally.failed = 1
-        print(tally.summary(), file=out)
+        print(wa.log_line(tally.summary()), file=out)
     print(refusal_annotation(reason), file=out)
     out.flush()
     return EXIT_OK  # ruling f23a9ae4: a refusal is green with its warning; only an internal error is red
@@ -867,6 +947,8 @@ def refused(reason, out, err):
 def main(argv=None, environ=None, out=None, err=None):
     environ = os.environ if environ is None else environ
     out, err = out or sys.stdout, err or sys.stderr
+    if wa is None:  # an in-process caller of a copy whose sibling did not load: the same refusal, nothing pruned
+        return load_refused(out, err)
     parser = argparse.ArgumentParser(prog=PROG, description=__doc__.split("\n")[0])
     parser.add_argument("--dry-run", action="store_true", help="print what would go, delete nothing")
     args = parser.parse_args(argv)
@@ -891,11 +973,11 @@ def main(argv=None, environ=None, out=None, err=None):
         prune(dir_fd, info.st_dev, args.dry_run, time.time(), out, tally, root_mnt)
     except Exception as exc:  # internal error: named, no traceback, the job goes red (exit 1)
         tally.internal_error = True
-        print(f"{PROG}: internal error, pruning stopped: {type(exc).__name__}: {safe_text(exc)}", file=err)
+        print(wa.log_line(f"{PROG}: internal error, pruning stopped: {type(exc).__name__}: {safe_text(exc)}"), file=err)
     finally:
         if dir_fd is not None:
             os.close(dir_fd)
-    print(tally.summary(), file=out)
+    print(wa.log_line(tally.summary()), file=out)
     if not tally.internal_error:
         annotation = failed_annotation(tally.failed, tally.first_failed)
         if annotation:

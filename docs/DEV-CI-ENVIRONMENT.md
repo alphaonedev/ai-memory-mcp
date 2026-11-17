@@ -195,8 +195,31 @@ which runs `scripts/ci/prune_runner_tmp.py` with these rules:
   surrogates (U+D800 to U+DFFF), U+2028 and U+2029 become `\uNNNN`. So a file
   name cannot inject a log line or a workflow command.
 - It needs Python 3.12+ on the runner; an older interpreter ends in the
-  `python` refusal before anything newer is imported. The test families that
+  `python` refusal before anything newer is imported and before the shared
+  annotation module is loaded (the refusal line is built without it). That
+  module is read only from `workflow_annotation.py` next to the script's real
+  file (never through the import search path, so a module of that name in the
+  cwd, TMPDIR or PYTHONPATH is never run); when that file cannot be read, raises
+  while loading or lacks a name the script uses, the step prints the fixed
+  warning `prune_runner_tmp: refused: shared module workflow_annotation.py next
+  to the script cannot be loaded`, exits 0 and deletes nothing. The test families that
   leak the files are fixed separately; the prune treats the symptom.
+- Every other CI script that uses that module (the five gates `load_gate`,
+  `pg_env_preflight`, `tier_cred_preflight`, `host_semaphore`,
+  `partition_test_binaries`, and `ci-sweep-target`, `ci_full_nightly`,
+  `impact/base_sha`, `shared_cargo_target`, `sccache_env`, `pg_isolate_split`,
+  `prune_runner_artifacts`, `scripts/test/pg_isolated_binary`) loads it by one
+  shape, by path, before any other work: a failed load of any kind (absent,
+  unreadable, syntax error, an exception or `sys.exit` with any code while
+  loading, a required name missing) fails the step closed with the fixed line
+  `::error title=<script> refused::<script>: refused: shared module
+  workflow_annotation.py next to the script cannot be loaded` and the script's
+  own refusal exit code, before it writes any file, `GITHUB_ENV` or
+  `GITHUB_OUTPUT` line or runs any command (`pg_isolated_binary` prints that
+  line on stderr, since its stdout feeds `GITHUB_ENV`). The `LoaderShape` cell
+  of `scripts/ci/tests/test_ci_annotation_escape_9365.py` fails on any script
+  under `scripts/` that names the module and loads it another way;
+  `prune_runner_tmp` is its one named exception.
 
 ---
 
