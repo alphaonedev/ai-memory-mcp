@@ -338,9 +338,10 @@ class ShardArgs(unittest.TestCase):
     def test_every_tested_target_of_the_real_manifest_is_selected_once(self):
         with scratch() as d:
             meta = Path(d) / "m.json"
-            proc = subprocess.run(["cargo", "metadata", "--no-deps", "--format-version", "1", "--offline"],
-                                  cwd=str(REPO), stdout=meta.open("w"), stderr=subprocess.PIPE, timeout=120,
-                                  check=False)
+            with meta.open("w", encoding="utf-8") as out:
+                proc = subprocess.run(["cargo", "metadata", "--no-deps", "--format-version", "1", "--offline"],
+                                      cwd=str(REPO), stdout=out, stderr=subprocess.PIPE, timeout=120,
+                                      check=False)
             if proc.returncode != 0:
                 self.skipTest("cargo metadata unavailable: %s" % proc.stderr[-200:])
             data = json.loads(meta.read_text(encoding="utf-8"))
