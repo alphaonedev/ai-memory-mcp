@@ -346,6 +346,8 @@ class ShardArgs(unittest.TestCase):
     def test_every_tested_target_of_the_real_manifest_is_selected_once(self):
         with scratch() as d:
             meta = Path(d) / "m.json"
+            if shutil.which("cargo") is None:  # a host without a toolchain (the bare runner image) skips the same way
+                self.skipTest("cargo metadata unavailable: no cargo on PATH")
             with meta.open("w", encoding="utf-8") as out:
                 proc = subprocess.run(["cargo", "metadata", "--no-deps", "--format-version", "1", "--offline"],
                                       cwd=str(REPO), stdout=out, stderr=subprocess.PIPE, timeout=120,
