@@ -93,9 +93,25 @@ LOG_CORPUS = {
     "cr_only": b"ok\r::error::a\r::warning::b\r",
     "no_final_newline": b"line one\n::error::tail",
     "mib_line": b"A" * MIB + b"::error::x\n",
+    "mib_no_newline_at_all": b"A" * MIB + b"::error::x##[group]y",
+    "crlf": b"ok\r\n::error::a\r\n##[group]b\r\n",
     "non_utf8": b"\xff\xfe::error::x\n",
     "empty": b"",
 }
+MIB_CEILING_SECS = 20.0
+
+# #9433 (ruling (a) 2): the impact print at the base a028c45e was this one line between the span anchors.
+BASE_SHA = "a028c45e55c7817b88c4b139347f407387e4a02c"
+BASE_IMPACT_SPAN = "          sed -n '1,200{s/::/: :/g;p}' \"$impact_log\"\n"
+# (base rc, head rc) of the impact print, measured with GNU sed 4.9 at the base. "unreadable" differs:
+# sed exits 2, the head print exits 1; the conductor rules which one is right (needs-conductor in READY).
+# Until then the measured pair is pinned so any change of either is red.
+IMPACT_RC_TABLE = {"readable": (0, 0), "missing": (2, 2), "unreadable": (2, 1)}
+IMPACT_RC_PENDING_RULING = frozenset({"unreadable"})
+TRUST_DIR_MODE = 0o700
+TRUST_FILES = {"__init__.py": b"", "common.py": b"# trusted common 9434\n",
+               "cargo_skip.py": b"# trusted decider 9434\n", "rules.json": b"{}\n"}
+PARTIAL_PRINT = b"partial-print-no-newline::error::x"
 
 CHANGED_CORPUS = {
     "v2_name": "src/a.rs\n::error::x\nsrc/b.rs",
@@ -112,8 +128,8 @@ def load_workflow_annotation():
     return module
 
 
-def step_run(job, key):
-    workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+def step_run(job, key, workflow_text=None):
+    workflow = yaml.safe_load(workflow_text if workflow_text is not None else WORKFLOW.read_text(encoding="utf-8"))
     for step in workflow["jobs"][job]["steps"]:
         if step.get("id") == key or step.get("name") == key:
             return step["run"]
@@ -146,9 +162,26 @@ def changed_span():
                 lambda l: l.strip().startswith("# #8328 round 3 (REVIEW-8328-code-r2"))
 
 
-def impact_span():
-    return span(step_run(*IMPACT), lambda l: 'scripts/ci-test-impact.sh "$IMPACT_BASE"' in l,
+def impact_span(workflow_text=None):
+    return span(step_run(*IMPACT, workflow_text=workflow_text),
+                lambda l: 'scripts/ci-test-impact.sh "$IMPACT_BASE"' in l,
                 lambda l: l.strip().startswith("# Allow-list: four keys"), start_inclusive=False)
+
+
+def trust_setup_span():
+    """The cls trust-directory setup: from ``trust_dir=`` to the ``skip_out=`` line."""
+    return span(step_run(*CLS), lambda l: l.strip().startswith("trust_dir="),
+                lambda l: l.strip().startswith("skip_out="))
+
+
+def base_workflow_text():
+    """ci.yml at the base a028c45e when the object is in the clone, else None (a shallow clone)."""
+    probe = subprocess.run([GIT, "-C", str(REPO), "cat-file", "-e", BASE_SHA + ":.github/workflows/ci.yml"],
+                           capture_output=True, timeout=RUN_TIMEOUT_SECS, check=False)
+    if probe.returncode != 0:
+        return None
+    return subprocess.run([GIT, "-C", str(REPO), "show", BASE_SHA + ":.github/workflows/ci.yml"],
+                          capture_output=True, text=True, timeout=RUN_TIMEOUT_SECS, check=True).stdout
 
 
 def shard_span():
@@ -252,16 +285,23 @@ def run_bash(script, cwd, env_extra=None, locale="C.UTF-8", path=None):
 
 
 def git(cwd, *args):
-    subprocess.run([GIT, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "commit.gpgsign=false",
-                    *args], cwd=str(cwd), check=True, capture_output=True, timeout=RUN_TIMEOUT_SECS)
+    # A throwaway identity with no mail domain: the fixture repo is never pushed.
+    subprocess.run([GIT, "-c", "user.name=fixture-9433", "-c", "user.email=fixture-9433", "-c",
+                    "commit.gpgsign=false", "-c", "core.hooksPath=" + os.devnull, *args], cwd=str(cwd),
+                   check=True, capture_output=True, timeout=RUN_TIMEOUT_SECS)
 
 
-def make_trusted_repo(root, with_escaper=True):
-    """A git repo whose base commit holds the escaper; HEAD replaces it with a hostile workspace copy."""
-    repo = root / "repo"
-    (repo / "scripts" / "ci").mkdir(parents=True)
+def make_trusted_repo(root, with_escaper=True, escaper_text=None, name="repo"):
+    """A git repo whose base commit holds the escaper (or ``escaper_text``) and the trusted classifier files;
+    HEAD replaces the escaper with a hostile workspace copy."""
+    repo = root / name
+    (repo / "scripts" / "ci" / "impact").mkdir(parents=True)
     git(repo, "init", "-q")
-    if with_escaper:
+    for trust_file, content in TRUST_FILES.items():
+        (repo / "scripts" / "ci" / "impact" / trust_file).write_bytes(content)
+    if escaper_text is not None:
+        (repo / "scripts" / "ci" / "workflow_annotation.py").write_text(escaper_text, encoding="utf-8")
+    elif with_escaper:
         shutil.copyfile(ANNOTATION_MODULE, repo / "scripts" / "ci" / "workflow_annotation.py")
     (repo / "README.md").write_text("base\n", encoding="utf-8")
     git(repo, "add", "-A")
@@ -290,14 +330,39 @@ class NoticeEscape9434(unittest.TestCase):
     def tearDownClass(cls):
         cls.box.close()
 
-    def run_notice(self, cargo_skip, reason, locale="C.UTF-8", path=None, base=None):
+    def run_notice(self, cargo_skip, reason, locale="C.UTF-8", path=None, base=None, repo=None,
+                   escaper_path_is_dir=False):
         trust_dir = self.box.root / ("trusted-%d" % time.monotonic_ns())
         (trust_dir / "scripts" / "ci" / "impact").mkdir(parents=True)
+        if escaper_path_is_dir:
+            # a failed write: the escaper's target in the trust directory cannot be written
+            (trust_dir / "scripts" / "ci" / "workflow_annotation.py").mkdir()
         prelude = ('cargo_skip="$STUB_SKIP"; cargo_skip_reason="$STUB_REASON"; trust_dir="$STUB_TRUST_DIR"; '
                    'trust_impact="$trust_dir/scripts/ci/impact"; trust_ref="$STUB_REF"\n')
-        return run_bash(prelude + self.span, self.repo, locale=locale, path=path, env_extra={
+        return run_bash(prelude + self.span, repo or self.repo, locale=locale, path=path, env_extra={
             "STUB_SKIP": cargo_skip, "STUB_REASON": reason, "STUB_TRUST_DIR": str(trust_dir),
             "STUB_REF": base or self.base})
+
+    def test_escaper_show_write_load_failures_never_use_the_workspace_copy(self):
+        """Ruling (a) 1: a failed git show, a failed write, a failed load: the fixed notice, never the
+        workspace copy (which, in every form, is the hostile WORKSPACE-ESCAPER-USED module)."""
+        box = Sandbox()
+        try:
+            no_escaper, no_escaper_base = make_trusted_repo(box.root, with_escaper=False, name="show")
+            broken, broken_base = make_trusted_repo(box.root, escaper_text="def annotation(:\n", name="load")
+            forms = {
+                "show_fails": dict(repo=no_escaper, base=no_escaper_base),
+                "write_fails": dict(escaper_path_is_dir=True),
+                "load_fails": dict(repo=broken, base=broken_base),
+            }
+            for form, kwargs in forms.items():
+                for cargo_skip in ("true", "false"):
+                    with self.subTest(form=form, cargo_skip=cargo_skip):
+                        result, _ = self.run_notice(cargo_skip, REASON_CORPUS["v1_command"], **kwargs)
+                        self.assertNotIn(b"WORKSPACE-ESCAPER-USED", result.stdout + result.stderr)
+                        self.assert_one_notice(result, NOTICE_FALLBACK[cargo_skip])
+        finally:
+            box.close()
 
     def expected(self, cargo_skip, reason):
         template = NOTICE_TRUE_TEMPLATE if cargo_skip == "true" else NOTICE_FALSE_TEMPLATE
@@ -371,6 +436,87 @@ class NoticeEscape9434(unittest.TestCase):
                         self.assert_one_notice(result, NOTICE_FALLBACK[cargo_skip])
 
 
+class TrustDir9434(unittest.TestCase):
+    """Ruling (a) 1: the cls trust directory is private (mode 700) and never under the workspace."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.box = Sandbox()
+        cls.repo, cls.base = make_trusted_repo(cls.box.root)
+        cls.span = trust_setup_span()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.box.close()
+
+    def run_setup(self, runner_temp, tmpdir):
+        """Run the real setup lines in the repo (the workspace); return (rc, trust_dir, trusted)."""
+        env = {"TMPDIR": str(tmpdir)}
+        if runner_temp is not None:
+            env["RUNNER_TEMP"] = str(runner_temp)
+        script = ('cls_base="$STUB_BASE"\n' + self.span
+                  + 'printf "TRUST_DIR=%s\\nTRUSTED=%s\\n" "$trust_dir" "$trusted"\n')
+        result, _ = run_bash(script, self.repo, env_extra={**env, "STUB_BASE": self.base})
+        values = dict(line.split("=", 1) for line in result.stdout.decode().splitlines() if "=" in line)
+        return result, values.get("TRUST_DIR"), values.get("TRUSTED")
+
+    def assert_nothing_in_workspace(self):
+        planted = [p for p in self.repo.rglob("*") if "impact-trusted" in p.name]
+        self.assertEqual(planted, [], "a trust directory was made under the workspace")
+
+    def assert_private_outside(self, trust_dir, parent):
+        path = Path(trust_dir)
+        self.assertTrue(path.is_dir(), trust_dir)
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), TRUST_DIR_MODE, "trust directory mode")
+        real = path.resolve()
+        self.assertEqual(real.parent, Path(parent).resolve(), "trust directory not directly under %s" % parent)
+        self.assertFalse(real.is_relative_to(self.repo.resolve()), "trust directory under the workspace")
+        for trust_file, content in TRUST_FILES.items():
+            self.assertEqual((path / "scripts" / "ci" / "impact" / trust_file).read_bytes(), content, trust_file)
+
+    def test_trust_dir_is_mode_700_under_runner_temp(self):
+        runner_temp = self.box.root / "runner-temp"
+        runner_temp.mkdir()
+        result, trust_dir, trusted = self.run_setup(runner_temp, self.box.root)
+        self.assertEqual(result.returncode, 0, result.stderr[-400:])
+        self.assertEqual(trusted, "true")
+        self.assert_private_outside(trust_dir, runner_temp)
+        self.assert_nothing_in_workspace()
+
+    def test_trust_dir_is_never_under_the_workspace(self):
+        outside = self.box.root / "outside-tmp"
+        outside.mkdir()
+        inside = self.repo / "inside"
+        inside.mkdir(exist_ok=True)
+        link = self.box.root / "link-into-workspace"
+        if not link.exists():
+            link.symlink_to(inside, target_is_directory=True)
+        cases = {
+            "runner_temp_is_the_workspace": (self.repo, outside, outside),
+            "runner_temp_inside_the_workspace": (inside, outside, outside),
+            "runner_temp_symlink_into_the_workspace": (link, outside, outside),
+            "runner_temp_unset": (None, outside, outside),
+        }
+        for name, (runner_temp, tmpdir, parent) in cases.items():
+            with self.subTest(case=name):
+                result, trust_dir, trusted = self.run_setup(runner_temp, tmpdir)
+                self.assertEqual(result.returncode, 0, result.stderr[-400:])
+                self.assertEqual(trusted, "true")
+                self.assert_private_outside(trust_dir, parent)
+                self.assert_nothing_in_workspace()
+
+    def test_no_private_place_outside_the_workspace_fails_closed(self):
+        inside = self.repo / "inside"
+        inside.mkdir(exist_ok=True)
+        for name, runner_temp in (("runner_temp_unset", None), ("runner_temp_is_the_workspace", self.repo),
+                                  ("runner_temp_missing", self.box.root / "no-such-dir")):
+            with self.subTest(case=name):
+                result, trust_dir, trusted = self.run_setup(runner_temp, inside)
+                self.assertEqual(result.returncode, 0, result.stderr[-400:])
+                self.assertEqual((trust_dir, trusted), ("", "false"))
+                self.assert_nothing_in_workspace()
+
+
 class ShardLogs9433(unittest.TestCase):
     """#9433: each shard log reaches the runner only between stop-commands markers."""
 
@@ -411,7 +557,8 @@ class ShardLogs9433(unittest.TestCase):
             self.assertTrue(out.startswith(group, pos), "group line of %s missing at %d: %r" % (shard, pos, out[pos:pos + 120]))
             pos += len(group)
             readable = isinstance(content, bytes)
-            token, pos = take_block(self, out, pos, content if readable else b"")
+            # a failed print ends with a newline from the step, so the end line starts its own line
+            token, pos = take_block(self, out, pos, content if readable else b"\n")
             tokens.append(token)
             self.assertTrue(out.startswith(b"::endgroup::\n", pos), "endgroup of %s missing" % shard)
             pos += len(b"::endgroup::\n")
@@ -438,7 +585,8 @@ class ShardLogs9433(unittest.TestCase):
         for name, content in LOG_CORPUS.items():
             with self.subTest(log=name):
                 logs = {shard: content for shard in SHARDS}
-                result, _ = self.run_shards(logs)
+                result, took = self.run_shards(logs)
+                self.assertLess(took, MIB_CEILING_SECS)
                 self.check_run(logs, result)
 
     def test_hostile_log_corpus_c_locale(self):
@@ -487,6 +635,22 @@ class ShardLogs9433(unittest.TestCase):
                 self.assertEqual(result.stdout, want + (AFTER_MARK + "\n").encode())
                 self.assertEqual(result.returncode, 0)
 
+    def test_print_that_fails_half_way_still_ends_the_block(self):
+        """Ruling (a) 3: the copy dies mid-line (no finally of its own runs); the end line still starts its own
+        line and the step exit code is that of the failed print (base: ``cat`` failing under -e = 1)."""
+        body = ("import os, secrets\n"
+                "if any('secrets' in a for a in sys.argv):\n    print(secrets.token_hex(16))\n"
+                "else:\n    os.write(1, %r)\n    os._exit(1)" % PARTIAL_PRINT)
+        logs = {shard: b"::error::x\n" for shard in SHARDS}
+        result, _ = self.run_shards(logs, path=self.box.shim_bin("shard-half-way", body))
+        out = result.stdout
+        group = ("::group::[#6344] %s shard output\n" % SHARDS[0]).encode()
+        self.assertTrue(out.startswith(group), out[:120])
+        _, pos = take_block(self, out, len(group), PARTIAL_PRINT)
+        self.assertEqual(out[pos:], b"::endgroup::\n")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(runner_commands(out)[1], False, "the runner would stay in stop-commands mode")
+
 
 class ClassSiblings9433(unittest.TestCase):
     """The same class at the changed-file list (cls), the selector log (impact) and the fed db name cut."""
@@ -523,6 +687,65 @@ class ClassSiblings9433(unittest.TestCase):
         header_end = result.stdout.index(b"\n") + 1
         self.assertEqual(result.stdout[header_end:], CHANGED_FALLBACK)
 
+    def run_changed(self, changed, prelude_extra=""):
+        """The changed-list span with ``changed`` read from a file (a 1 MiB value is over the argv limit)."""
+        value = self.box.root / ("changed-%d" % time.monotonic_ns())
+        value.write_bytes(changed)
+        prelude = (prelude_extra + 'changed=$(cat "$STUB_CHANGED_FILE"); '
+                   'cls_base=0123456789abcdef0123456789abcdef01234567\n')
+        return run_bash(prelude + changed_span(), self.box.root, env_extra={"STUB_CHANGED_FILE": str(value)})
+
+    def test_changed_list_of_one_mib_without_a_newline(self):
+        changed = b"src/" + b"A" * MIB + b"::error::x##[group]y"
+        result, took = self.run_changed(changed)
+        self.assertLess(took, MIB_CEILING_SECS)
+        self.assertEqual(result.returncode, 0, result.stderr[-400:])
+        out = result.stdout
+        _, end = take_block(self, out, out.index(b"\n") + 1, changed)
+        self.assertEqual(out[end:], b"")
+        self.assertEqual(runner_commands(out)[1], False)
+
+    def test_changed_list_print_that_fails_half_way_still_ends_the_block(self):
+        """Ruling (a) 3: the print writes part of a line and fails; the end line still starts its own line and
+        the step exit code is that of the failed print (base: ``echo "$changed"`` failing under -e = 1)."""
+        fail = "printf() { builtin printf '%%s' '%s'; return 1; }\n" % PARTIAL_PRINT.decode()
+        result, _ = self.run_changed(CHANGED_CORPUS["v2_name"].encode(), prelude_extra=fail)
+        out = result.stdout
+        _, end = take_block(self, out, out.index(b"\n") + 1, PARTIAL_PRINT)
+        self.assertEqual(out[end:], b"")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(runner_commands(out)[1], False)
+
+    def test_impact_print_exit_code_equals_the_base(self):
+        """Ruling (a) 2: the BASE step text (a028c45e) and the HEAD step text against a readable, a missing and
+        an unreadable log; exit codes pinned per IMPACT_RC_TABLE (equal, except a case pending the ruling)."""
+        base_text = base_workflow_text()
+        if base_text is not None:
+            self.assertEqual(impact_span(base_text), BASE_IMPACT_SPAN, "the base step text is not the pinned one")
+        readable = self.box.root / "impact-rc-readable.log"
+        readable.write_bytes(b"selected ##[error]x\n::error::y\n")
+        unreadable = self.box.root / "impact-rc-unreadable.log"
+        unreadable.write_bytes(b"::error::hidden\n")
+        unreadable.chmod(0)
+        self.assertNotEqual(os.geteuid(), 0, "run as a user that mode 000 denies (root reads it)")
+        logs = {"readable": readable, "missing": self.box.root / "impact-rc-missing.log", "unreadable": unreadable}
+        for name, log in logs.items():
+            with self.subTest(log=name):
+                got = []
+                outs = []
+                for text in (BASE_IMPACT_SPAN, impact_span()):
+                    result, _ = run_bash('impact_log="$STUB_LOG"\n' + text + 'echo "%s"\n' % AFTER_MARK,
+                                         self.box.root, env_extra={"STUB_LOG": str(log)})
+                    got.append(result.returncode)
+                    outs.append(result.stdout)
+                self.assertEqual(tuple(got), IMPACT_RC_TABLE[name], "(base rc, head rc) for a %s log" % name)
+                if name not in IMPACT_RC_PENDING_RULING:
+                    self.assertEqual(got[0], got[1], "head exit code differs from the base for a %s log" % name)
+                if name == "readable":
+                    self.assertEqual(outs[0], outs[1].replace(b"# #[", b"##["))
+                else:
+                    self.assertEqual(outs, [b"", b""], "a failing print must print nothing and stop the step")
+
     @staticmethod
     def impact_expected(log):
         """The first 200 LF lines, "##[" -> "# #[" and "::" -> ": :" left to right, final newline added."""
@@ -542,6 +765,8 @@ class ClassSiblings9433(unittest.TestCase):
             "cr_only": b"a\r##[error]b\r::error::c\r",
             "non_utf8": b"\xff##[error]\xfe::error::x\n",
             "large": b"##[" * (LARGE_VALUE_BYTES // 3) + b"\n",
+            "mib_no_newline_at_all": b"##[" + b"A" * MIB + b"::error::x",
+            "crlf": b"a\r\n::error::b\r\n##[group]c\r\n",
             "empty": b"",
         }
         for name, log in corpus.items():
