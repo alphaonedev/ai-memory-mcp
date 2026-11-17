@@ -1192,6 +1192,56 @@ fn b7_gate_must_be_called_by_the_target_itself_r4_g2() {
     );
 }
 
+/// One production source file prepared for call-site analysis (#9405).
+struct ParsedSrc {
+    masked: Vec<String>,
+    spans: Vec<(usize, usize, String)>,
+    wrappers: Vec<String>,
+}
+
+fn parse_src(raw: &str) -> ParsedSrc {
+    let text = join_string_continuations(strip_test_mod(raw));
+    let mask = code_mask(&text);
+    let masked: Vec<&str> = mask.lines().collect();
+    let spans = fn_spans(&masked, is_fn_start);
+    let wrappers = gate_wrappers(&masked, &spans);
+    ParsedSrc {
+        masked: masked.iter().map(|l| (*l).to_string()).collect(),
+        spans,
+        wrappers,
+    }
+}
+
+/// #9405 - a `pub(super)` write fn (an in-transaction body moved into a child
+/// module, e.g. `versioned_update_txn.rs`) is gated when its ONE call site in
+/// `src/` sits in a fn that calls the record-stop gate BEFORE that call line.
+/// Fails closed: `pub`/`pub(crate)` visibility, zero or several call sites, a
+/// caller outside any fn, or a gate after the call all leave it ungated.
+fn sole_caller_is_gated(parsed: &[ParsedSrc], decl_line: &str, name: &str) -> bool {
+    if !decl_line.trim_start().starts_with("pub(super) ") {
+        return false;
+    }
+    let mut hits: Vec<(&ParsedSrc, usize)> = Vec::new();
+    for f in parsed {
+        for (k, l) in f.masked.iter().enumerate() {
+            if is_fn_start(l).is_some_and(|(_, n)| n == name) {
+                continue;
+            }
+            if mentions_bare_ident(l, name) {
+                hits.push((f, k));
+            }
+        }
+    }
+    let [(f, k)] = hits.as_slice() else {
+        return false;
+    };
+    let Some(&(s, _, _)) = enclosing_span(&f.spans, *k) else {
+        return false;
+    };
+    let masked: Vec<&str> = f.masked.iter().map(String::as_str).collect();
+    (s..*k).any(|g| line_calls_gate(masked[g], &f.wrappers))
+}
+
 #[test]
 fn record_stop_write_sql_fns_are_gated_or_allowlisted_b7() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -1203,6 +1253,7 @@ fn record_stop_write_sql_fns_are_gated_or_allowlisted_b7() {
         .filter_map(|p| Some((rel_src(p, root), fs::read_to_string(p).ok()?)))
         .collect();
     let test_only = cfg_test_declared_files(&sources);
+    let parsed: Vec<ParsedSrc> = sources.iter().map(|(_, s)| parse_src(s)).collect();
 
     let allow: HashSet<(String, String)> = include_str!("record_stop_b7_allowlist.txt")
         .lines()
@@ -1291,6 +1342,9 @@ fn record_stop_write_sql_fns_are_gated_or_allowlisted_b7() {
                 }
                 continue;
             }
+            if sole_caller_is_gated(&parsed, lines[start], name) {
+                continue;
+            }
             if allow.contains(&key) {
                 continue;
             }
@@ -1347,6 +1401,73 @@ fn record_stop_write_sql_fns_are_gated_or_allowlisted_b7() {
         parity_fail.is_empty(),
         "B7 pg/sqlite gate parity failures:\n  {}",
         parity_fail.join("\n  ")
+    );
+}
+
+/// #9405 — `update_with_expected_version_in_txn` moved out of the gated funnel
+/// `update_with_expected_version` into `src/storage/versioned_update_txn.rs`; the
+/// scanner credits it through `sole_caller_is_gated` (no ALLOWLIST row) only while
+/// (a) the funnel still gates, (b) the gate precedes the call, (c) the funnel is the body's only call site in `src/`, and
+/// (d) the body stays `pub(super)` so nothing outside `crate::storage` reaches it.
+#[test]
+fn moved_versioned_update_body_stays_behind_the_gated_funnel_9405() {
+    const BODY: &str = "update_with_expected_version_in_txn";
+    const FUNNEL: &str = "update_with_expected_version";
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    walk_rs(&root.join("src"), &mut files);
+    let mut call_sites: Vec<String> = Vec::new();
+    for path in &files {
+        let rel = rel_src(path, root);
+        let Ok(raw) = fs::read_to_string(path) else {
+            continue;
+        };
+        let text = join_string_continuations(strip_test_mod(&raw));
+        let mask = code_mask(&text);
+        for (i, l) in mask.lines().enumerate() {
+            if l.contains(&format!("{BODY}(")) && !l.contains(&format!("fn {BODY}")) {
+                call_sites.push(format!("{rel}:{}", i + 1));
+            }
+        }
+    }
+    let [sole_caller] = call_sites.as_slice() else {
+        panic!("{BODY} must have exactly one caller (the gated funnel): {call_sites:?}");
+    };
+    assert!(
+        sole_caller.starts_with("src/storage/mod.rs:"),
+        "the sole caller must be the funnel in src/storage/mod.rs: {call_sites:?}"
+    );
+
+    let mod_raw = fs::read_to_string(root.join("src/storage/mod.rs")).expect("storage/mod.rs");
+    let text = join_string_continuations(strip_test_mod(&mod_raw));
+    let mask = code_mask(&text);
+    let masked: Vec<&str> = mask.lines().collect();
+    let spans = fn_spans(&masked, is_fn_start);
+    let wrappers = gate_wrappers(&masked, &spans);
+    let funnel: Vec<&(usize, usize, String)> =
+        spans.iter().filter(|(_, _, n)| n == FUNNEL).collect();
+    let [funnel_span] = funnel.as_slice() else {
+        panic!("exactly one {FUNNEL} definition");
+    };
+    let (s, e) = (funnel_span.0, funnel_span.1);
+    let gate_line = (s..e)
+        .find(|&k| line_calls_gate(masked[k], &wrappers))
+        .unwrap_or_else(|| panic!("{FUNNEL} no longer calls the record-stop gate"));
+    let call_line = (s..e)
+        .find(|&k| masked[k].contains(&format!("{BODY}(")))
+        .unwrap_or_else(|| panic!("{FUNNEL} no longer calls {BODY}"));
+    assert!(
+        gate_line < call_line,
+        "{FUNNEL}: the gate (line {}) must precede the {BODY} call (line {})",
+        gate_line + 1,
+        call_line + 1
+    );
+
+    let body_src = fs::read_to_string(root.join("src/storage/versioned_update_txn.rs"))
+        .expect("versioned_update_txn.rs");
+    assert!(
+        body_src.contains(&format!("pub(super) fn {BODY}(")),
+        "{BODY} must stay pub(super)"
     );
 }
 
