@@ -595,6 +595,140 @@ fn prefix_is_unconditional(prefix: &str) -> bool {
             .any(|w| CONDITIONAL_PREFIX_WORDS.contains(&w))
 }
 
+/// #9414 ruling 1 condition 1 — the shape of one gate call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GateShape {
+    /// A direct statement of its block: `<path>gate(..)?;` or
+    /// `<path>gate(..).await?;`.
+    Direct,
+    /// The result is dropped: `let _ = ..`, `.ok()`, `unwrap_or..`.
+    Discarded,
+    /// Any other position (if / match / while condition, call or macro
+    /// argument, binding, mapped result, no `?`).
+    Conditional,
+}
+
+/// #9414 — words that may not appear in the statement prefix of a direct
+/// gate (the prefix of a direct gate is a bare path: identifiers, `::`, `.`).
+const NOT_DIRECT_PREFIX_WORDS: &[&str] = &[
+    "let", "return", "if", "match", "while", "for", "loop", "else", "async", "move", "break",
+    "continue", "unsafe", "fn",
+];
+/// #9414 — the only tails a direct gate may have after its call parens.
+const DIRECT_GATE_TAILS: &[&str] = &["?", ".await?"];
+/// #9414 — tails that drop the gate's result.
+const DISCARD_TAILS: &[&str] = &[".ok()", "unwrap_or"];
+/// #9414 — the forward read of one gate call stops after this many chars and
+/// the gate is then `Conditional` (fail closed, and the scan stays linear).
+const GATE_SHAPE_SCAN_LIMIT: usize = 4096;
+/// #9414 — a block opened in a statement holding one of these words runs
+/// later, repeatedly or never (loop, closure, async block, nested fn): a
+/// gate inside it is a conditional gate for the fn.
+const DEFERRED_BLOCK_WORDS: &[&str] = &["loop", "while", "for", "async", "move", "fn"];
+/// #9414 — statement heads whose `|` is an operator or pattern, not a
+/// closure.
+const PIPE_NOT_CLOSURE_HEADS: &[&str] = &["if", "match", "else"];
+
+fn prefix_words(prefix: &str) -> impl Iterator<Item = &str> {
+    prefix
+        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .filter(|w| !w.is_empty())
+}
+
+/// #9414 — does a `{` opened after statement prefix `prefix` start a
+/// deferred block (see [`DEFERRED_BLOCK_WORDS`])?
+fn block_is_deferred(prefix: &str) -> bool {
+    if prefix_words(prefix).any(|w| DEFERRED_BLOCK_WORDS.contains(&w)) {
+        return true;
+    }
+    prefix.contains('|')
+        && !prefix_words(prefix)
+            .next()
+            .is_some_and(|w| PIPE_NOT_CLOSURE_HEADS.contains(&w))
+}
+
+/// #9414 — the [`GateShape`] of the gate call whose name ends at char `i` of
+/// masked line `k` (`prefix`: the statement prefix before the name). Reads
+/// forward over the call's turbofish and parens, then the tail up to the
+/// statement end.
+fn gate_shape(masked: &[&str], k: usize, i: usize, e: usize, prefix: &str) -> GateShape {
+    let squeezed: String = prefix.chars().filter(|c| !c.is_whitespace()).collect();
+    if squeezed.starts_with("let_=") {
+        return GateShape::Discarded;
+    }
+    let direct_prefix = prefix
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '_' || c == ':' || c == '.' || c.is_whitespace())
+        && !prefix_words(prefix).any(|w| NOT_DIRECT_PREFIX_WORDS.contains(&w))
+        && (squeezed.is_empty() || squeezed.ends_with("::") || squeezed.ends_with('.'));
+    let mut chars = masked
+        .iter()
+        .take(e)
+        .skip(k)
+        .enumerate()
+        .flat_map(|(n, l)| {
+            let skip = if n == 0 { i } else { 0 };
+            l.chars().skip(skip).chain(std::iter::once(' '))
+        })
+        .filter(|c| !c.is_whitespace())
+        .take(GATE_SHAPE_SCAN_LIMIT);
+    // turbofish `::<..>` then the call parens
+    let mut depth = 0i64;
+    let mut angle = 0i64;
+    let mut in_call = false;
+    for c in chars.by_ref() {
+        match c {
+            '<' if !in_call => angle += 1,
+            '>' if !in_call => angle -= 1,
+            '(' if angle == 0 => {
+                in_call = true;
+                depth += 1;
+            }
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => {
+                depth -= 1;
+                if in_call && depth == 0 {
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    if !in_call || depth != 0 {
+        return GateShape::Conditional;
+    }
+    let mut tail = String::new();
+    let mut term = None;
+    for c in chars {
+        match c {
+            '(' | '[' | '{' if depth == 0 && c == '{' => {
+                term = Some(c);
+                break;
+            }
+            '(' | '[' => depth += 1,
+            ')' | ']' | '}' if depth == 0 => {
+                term = Some(c);
+                break;
+            }
+            ')' | ']' => depth -= 1,
+            ';' | ',' if depth == 0 => {
+                term = Some(c);
+                break;
+            }
+            _ => {}
+        }
+        tail.push(c);
+    }
+    if DISCARD_TAILS.iter().any(|t| tail.contains(t)) {
+        return GateShape::Discarded;
+    }
+    if direct_prefix && term == Some(';') && DIRECT_GATE_TAILS.contains(&tail.as_str()) {
+        GateShape::Direct
+    } else {
+        GateShape::Conditional
+    }
+}
+
 /// #9414 — 0-based lines of the write-SQL lines that belong to span
 /// `(s, e)` itself (not to a nested fn).
 fn own_writes(lines: &[&str], spans: &[(usize, usize, String)], s: usize, e: usize) -> Vec<usize> {
@@ -629,11 +763,20 @@ fn span_gate_credit(
         prefix: String,
         stmt_exits: bool,
         exited: bool,
+        /// #9414 condition 1: a loop, closure, async block or nested fn body.
+        deferred: bool,
+        /// #9414 condition 5: the label of this block or loop, and whether
+        /// a `break` to it ran before the current position.
+        label: Option<String>,
+        broken: bool,
+        /// A label read in the current statement, for the next `{`.
+        pending_label: Option<String>,
     }
     let writes = own_writes(lines, spans, s, e);
     let mut write_blocks: Vec<(usize, Vec<usize>)> = Vec::new();
-    let mut valid_gates: Vec<(usize, Vec<usize>)> = Vec::new();
-    let mut first_gate = None;
+    // (line, block ids, valid for a write span, valid for a wrapper span)
+    let mut valid_gates: Vec<(usize, Vec<usize>, bool, bool)> = Vec::new();
+    let mut first_gate: Option<(usize, GateShape)> = None;
     let mut stack: Vec<Level> = Vec::new();
     let mut next_id = 0usize;
     let mut paren = 0i64;
@@ -657,6 +800,10 @@ fn span_gate_credit(
                             prefix: String::new(),
                             stmt_exits: false,
                             exited: false,
+                            deferred: false,
+                            label: None,
+                            broken: false,
+                            pending_label: None,
                         });
                         next_id += 1;
                     }
@@ -669,6 +816,37 @@ fn span_gate_credit(
             let Some(top) = stack.last_mut() else {
                 break 'lines;
             };
+            if ch == '\''
+                && chars
+                    .get(i + 1)
+                    .is_some_and(|c| c.is_alphabetic() || *c == '_')
+            {
+                // #9414 condition 5: a label definition or a labelled break.
+                let st = i + 1;
+                i = st;
+                while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                    i += 1;
+                }
+                let name: String = chars[st..i].iter().collect();
+                let after_break = prefix_words(&top.prefix).last() == Some("break");
+                if after_break {
+                    if let Some(target) = stack
+                        .iter_mut()
+                        .rev()
+                        .find(|l| l.label.as_deref() == Some(&name))
+                    {
+                        target.broken = true;
+                    }
+                } else if chars.get(i) == Some(&':') && chars.get(i + 1) != Some(&':') {
+                    top.pending_label = Some(name.clone());
+                }
+                if let Some(top) = stack.last_mut() {
+                    top.prefix.push('\'');
+                    top.prefix.push_str(&name);
+                    top.prefix.push(' ');
+                }
+                continue;
+            }
             if ch.is_alphabetic() || ch == '_' {
                 let st = i;
                 while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
@@ -687,11 +865,21 @@ fn span_gate_credit(
                 let is_gate = (next == Some('(') || turbofish)
                     && (GATE_MARKERS.contains(&word.as_str()) || wrappers.contains(&word));
                 if is_gate {
-                    first_gate.get_or_insert(k);
-                    let valid =
-                        prefix_is_unconditional(&top.prefix) && !stack.iter().any(|l| l.exited);
-                    if valid {
-                        valid_gates.push((k, stack.iter().map(|l| l.id).collect()));
+                    let shape = gate_shape(masked, k, i, e, &top.prefix);
+                    let unconditional = prefix_is_unconditional(&top.prefix);
+                    first_gate.get_or_insert((k, shape));
+                    let no_exit = !stack.iter().any(|l| l.exited);
+                    let for_wrapper = unconditional && no_exit;
+                    let for_write = shape == GateShape::Direct
+                        && no_exit
+                        && !stack.iter().any(|l| l.deferred || l.broken);
+                    if for_wrapper || for_write {
+                        valid_gates.push((
+                            k,
+                            stack.iter().map(|l| l.id).collect(),
+                            for_write,
+                            for_wrapper,
+                        ));
                     }
                 }
                 if let Some(top) = stack.last_mut() {
@@ -702,11 +890,17 @@ fn span_gate_credit(
             }
             match ch {
                 '{' => {
+                    let deferred = block_is_deferred(&top.prefix);
+                    let label = top.pending_label.take();
                     stack.push(Level {
                         id: next_id,
                         prefix: String::new(),
                         stmt_exits: false,
                         exited: false,
+                        deferred,
+                        label,
+                        broken: false,
+                        pending_label: None,
                     });
                     next_id += 1;
                 }
@@ -718,11 +912,13 @@ fn span_gate_credit(
                     top.exited |= top.stmt_exits;
                     top.stmt_exits = false;
                     top.prefix.clear();
+                    top.pending_label = None;
                 }
                 ';' => {
                     top.exited |= top.stmt_exits;
                     top.stmt_exits = false;
                     top.prefix.clear();
+                    top.pending_label = None;
                 }
                 c if !c.is_whitespace() => top.prefix.push(c),
                 _ => {}
@@ -734,18 +930,21 @@ fn span_gate_credit(
         }
     }
     let credited = if writes.is_empty() {
-        valid_gates.iter().any(|(_, ids)| ids.len() == 1)
+        valid_gates
+            .iter()
+            .any(|(_, ids, _, wrapper)| *wrapper && ids.len() == 1)
     } else {
         writes.len() == write_blocks.len()
             && write_blocks.iter().all(|(wk, wids)| {
                 valid_gates
                     .iter()
-                    .any(|(gk, gids)| gk < wk && wids.starts_with(gids))
+                    .any(|(gk, gids, write, _)| *write && gk < wk && wids.starts_with(gids))
             })
     };
     match (credited, first_gate) {
         (true, _) => GateCredit::Credited,
-        (false, Some(at)) => GateCredit::Conditional(at),
+        (false, Some((at, GateShape::Discarded))) => GateCredit::Discarded(at),
+        (false, Some((at, _))) => GateCredit::Conditional(at),
         (false, None) => GateCredit::Absent,
     }
 }
@@ -1377,10 +1576,7 @@ fn record_stop_write_sql_fns_are_gated_or_allowlisted_b7() {
             if allow.contains(&key) {
                 continue;
             }
-            let why = match credit {
-                GateCredit::Conditional(at) => format!("conditional gate at line {}", at + 1),
-                _ => "no gate".to_string(),
-            };
+            let why = b7_credit_reason(credit);
             ungated.push((rel.clone(), format!("{name} ({why})"), start + 1));
         }
     }
@@ -1408,14 +1604,11 @@ fn record_stop_write_sql_fns_are_gated_or_allowlisted_b7() {
         .collect();
     extra.sort();
 
+    // #9414: both lists in one failure, so one run names every site.
     assert!(
-        missing_required.is_empty(),
-        "B7 required functions are not gated: {}",
-        missing_required.join(", ")
-    );
-    assert!(
-        extra.is_empty(),
-        "B7 structural completeness: write-SQL functions are neither gated nor allowlisted:\n  {}\n(add a gate or a reviewed ALLOWLIST row)",
+        missing_required.is_empty() && extra.is_empty(),
+        "B7 required functions are not gated: {}\nB7 structural completeness: write-SQL functions are neither gated nor allowlisted:\n  {}\n(add a gate or a reviewed ALLOWLIST row)",
+        missing_required.join(", "),
         extra.join("\n  ")
     );
 
@@ -1777,9 +1970,7 @@ fn b7_try_reason(src: &str, fn_name: &str) -> Result<String, String> {
         .iter()
         .filter(|(_, _, n)| n == fn_name)
         .map(|(s, e, _)| {
-            b7_credit_reason(span_gate_credit(
-                &lines, &masked, &spans, *s, *e, &wrappers,
-            ))
+            b7_credit_reason(span_gate_credit(&lines, &masked, &spans, *s, *e, &wrappers))
         })
         .collect();
     if reasons.is_empty() {
@@ -1791,7 +1982,9 @@ fn b7_try_reason(src: &str, fn_name: &str) -> Result<String, String> {
 /// #9414 — `pub fn w` with exactly `body` (no write appended; line 1 is the
 /// signature, so the body's first line is line 2).
 fn b7_fn(body: &str) -> String {
-    format!("pub fn w(conn: &Connection, id: &str) -> Result<(bool, bool)> {{\n{body}\n    Ok((true, true))\n}}\n")
+    format!(
+        "pub fn w(conn: &Connection, id: &str) -> Result<(bool, bool)> {{\n{body}\n    Ok((true, true))\n}}\n"
+    )
 }
 
 /// #9414 ruling 1 (dominance rule) condition table:
@@ -2094,7 +2287,9 @@ fn b7_gate_conditions_of_the_dominance_rule_9414() {
     for (cond, label, body, target, want) in B7_CONDITION_ROWS_9414 {
         let got = b7_try_reason(&b7_fn(body), target);
         if got.as_deref() != Ok(*want) {
-            wrong.push(format!("condition {cond} {label}: expected {want:?}, got {got:?}"));
+            wrong.push(format!(
+                "condition {cond} {label}: expected {want:?}, got {got:?}"
+            ));
         }
     }
     for c in B7_RULED_CONDITIONS_9414 {
@@ -2144,7 +2339,9 @@ fn b7_allowlist_rows_are_counted_and_ruled_rows_cite_their_issue_9414() {
             .copied()
             .collect();
         assert!(
-            reason.iter().any(|l| l.contains(B7_RULED_ALLOWLIST_ISSUE_9414)),
+            reason
+                .iter()
+                .any(|l| l.contains(B7_RULED_ALLOWLIST_ISSUE_9414)),
             "#9414 ruled allowlist row `{row}` has no reason citing {B7_RULED_ALLOWLIST_ISSUE_9414}"
         );
     }

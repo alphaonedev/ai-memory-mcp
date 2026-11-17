@@ -162,11 +162,12 @@ src/store/postgres.rs	pg_apply_entitled_attestation_in_tx
 src/store/postgres/lifecycle_tx_3152.rs	apply_lifecycle_patch_in_tx
 # #4078 repair (reviewed): runs only inside the migrate/open repair transaction; visibility pub(super) (#4324) so only crate::storage migrate callers can reach it; clears a regenerable cache (embed_skip), no durable text. Deliberately NOT routed through the record-stop gate: a repair inside the ladder must not consult it.
 src/storage/embed_skip.rs	repair_sqlite_after_trigger_gap
-# #9414 conditional gate (reviewed 2026-11-17): the gate runs under `if !dry_run { .. }`
-# and the dry-run path returns the plan before any UPDATE (src/storage/mod.rs:20098 gate,
-# :20146 `if dry_run { return Ok(report); }`; src/store/postgres/reown_3124.rs:52 gate and
-# :100 its dry-run return). The control-flow rule cannot prove the value-level link
-# (dry_run false <=> the write runs), so the row names it; a refactor that hoists the
-# gate removes both rows (to-file in the #9414 READY).
+# #9414 conditional gate (ruled by the conductor 2026-11-17, ruling 1): the gate runs under
+# `if !dry_run { .. }` (src/storage/mod.rs:20098) and the dry-run path returns the plan
+# before any UPDATE (:20146). Removed by issue #9438 (lane reown-dry-run-split: the dry
+# run becomes its own fn and the gate a direct statement), which deletes this row.
 src/storage/mod.rs	reown
+# #9414 conditional gate (ruled by the conductor 2026-11-17, ruling 1): the pg twin of
+# `reown`; gate under `if !dry_run` (src/store/postgres/reown_3124.rs:52), dry-run return
+# at :100. Removed by issue #9438 (lane reown-dry-run-split), which deletes this row.
 src/store/postgres/reown_3124.rs	reown_pg
