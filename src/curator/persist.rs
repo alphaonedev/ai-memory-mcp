@@ -125,6 +125,12 @@ fn write_metadata(conn: &Connection, mem_id: &str, metadata: &serde_json::Value)
 pub(super) fn persist_auto_tags(conn: &Connection, mem: &Memory, tags: &[String]) -> Result<()> {
     db::in_write_txn(conn, || {
         let current = current_row(conn, &mem.id, "auto_tags")?;
+        // #9300 — the tags were computed from the snapshot's title + content.
+        refuse_if_stale(
+            current.title != mem.title || current.content != mem.content,
+            &mem.id,
+            "auto_tags",
+        )?;
         let mut updated = current.metadata;
         {
             let obj = metadata_object_mut(&mut updated, &mem.id, "auto_tags")?;
@@ -150,6 +156,9 @@ pub(super) fn persist_contradiction(
     let against_id = against.id.as_str();
     db::in_write_txn(conn, || {
         let current = current_row(conn, &mem.id, what)?;
+        refuse_if_stale(current.content != mem.content, &mem.id, what)?;
+        let current_against = current_row(conn, against_id, what)?;
+        refuse_if_stale(current_against.content != against.content, against_id, what)?;
         let mut updated = current.metadata;
         {
             let obj = metadata_object_mut(&mut updated, &mem.id, what)?;
