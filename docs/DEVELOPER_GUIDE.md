@@ -1075,6 +1075,31 @@ ai-memory completions fish
 7. **Add the MCP tool** (post-v0.7.0 #987 D1.x): define `<ToolName>Request` (schemars `JsonSchema` derive; NO `deny_unknown_fields` per the #1052 wire-truthfulness pin) + `<ToolName>Tool` (zero-sized) with `impl McpTool` in `src/mcp/tools/<name>.rs`; register ONE `RegisteredTool::of::<…>()` line in `registered_tools()` in `src/mcp/registry.rs`; add a `tool_names::*` const + `ALL` slice entry (census/pin tests track the count automatically against `Profile::full().expected_tool_count()`); add the handler + dispatch arm in `src/mcp/mod.rs::handle_request()`; add a `d1_6_987_tests` parity-test mod. The pre-D1.6 step "add JSON definition in `tool_definitions()`" is gone — `tool_definitions()` is now a four-line iteration.
 8. **Add tests** under `tests/` (integration) and in the module's unit-test suite
 
+### Adding a schema migration (SQLite)
+
+SQLite migrations live in `migrations/sqlite/NNNN_*.sql` and run from
+`migrate()` in `src/storage/migrations.rs` inside one exclusive write
+transaction (`WriteTxn::begin_exclusive`), so one migration file either
+applies whole or not at all.
+
+**Guard triggers.** Some triggers on `memories` are guards: their body
+calls `RAISE(...)` (today `agent_pubkey_history_projection_guard_insert` and
+`agent_pubkey_history_projection_guard_update`, installed by
+`0086_v102_fts_projection_guard.sql`). SQLite re-checks every trigger body
+on `ALTER TABLE ... DROP COLUMN` and `RENAME COLUMN`, and moves or drops
+triggers silently on `RENAME TO` and `DROP TABLE`. The rule:
+
+- A migration that drops, renames or rebuilds a column or a table that a
+  guard trigger names MUST `DROP TRIGGER` that guard before the change and
+  `CREATE TRIGGER` it again after the change, in the same migration file.
+- Do not remove or widen a guard's `UPDATE OF` column list to get past the
+  drop error: the explicit list is the reviewed write-cost design.
+- The guarded names are not a hand-kept list. The structural test
+  `tests/migration_guard_trigger_rebuild_8341.rs` derives them from the
+  trigger definitions in `sqlite_master` and fails on any migration after
+  0086 that breaks this rule. A fixture that rewinds a store to an older
+  shape follows the same rule (see `tests/migrate_v064_to_v070_lossless.rs`).
+
 ## Testing
 
 The project has **1,886 lib tests + 49+ integration tests at 93.84% line coverage** as of v0.6.3.1 (was 1,600 lib / 93.08% on v0.6.3). v0.6.3 baseline numbers are frozen on the [evidence page](https://alphaonedev.github.io/ai-memory-mcp/evidence.html); v0.6.3.1 deltas are documented in the release notes. Modules each carry their own unit-test suite; integration tests live under `tests/`.
