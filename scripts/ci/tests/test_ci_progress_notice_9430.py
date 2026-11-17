@@ -232,7 +232,9 @@ PATH_TOOLS = ("cut",)  # linked into the stub PATH; tail is wrapped, sleep stubb
 
 # Class A: a cut that behaves like uutils / BSD cut (characters for -c in a UTF-8 locale, bytes for -b).
 CHAR_CUT_STUB = """#!{exe} -I
-import os, re, sys
+import os, re, signal, sys
+# A native cut dies silently on SIGPIPE when its reader is gone (the killed heartbeat loop); Python ignores it.
+signal.signal(signal.SIGPIPE, signal.SIG_DFL)
 match = re.fullmatch(r"-([bc])1-([0-9]+)", sys.argv[1]) if len(sys.argv) == 2 else None
 if match is None:
     sys.stderr.write("cut stub: unsupported arguments %r\\n" % (sys.argv[1:],))
