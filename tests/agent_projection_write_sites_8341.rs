@@ -74,8 +74,12 @@ const PINNED_WRITE_SITES_8341: &[(&str, &str, usize)] = &[
     ("storage/mod.rs", "swarm_rewind", 1),
     ("storage/mod.rs", "touch", 1),
     ("storage/mod.rs", "touch_many", 1),
-    ("storage/mod.rs", "update_with_expected_version_in_txn", 1),
     ("storage/pubkey_history.rs", "bind_agent_pubkey_no_tx", 1),
+    (
+        "storage/versioned_update_txn.rs",
+        "update_with_expected_version_in_txn",
+        1,
+    ),
     ("store/sqlite.rs", "reclassify_memory_kind", 1),
     ("store/sqlite/owner_gate_txn_3957.rs", "arm_interloper", 1),
 ];
