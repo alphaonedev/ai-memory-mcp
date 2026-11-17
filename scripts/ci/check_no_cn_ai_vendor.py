@@ -33,6 +33,46 @@ import sys
 from collections import namedtuple
 from pathlib import Path
 
+
+def _load_workflow_annotation():
+    """The shared module at WA_RELATIVE_PATH from this file's real directory, by path only, never through
+    sys.path; every name in WA_REQUIRED must be a callable of it (#9365, one shape in every script)."""
+    import importlib.util
+    import os
+    path = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), WA_RELATIVE_PATH))
+    loaded = sys.modules.get("workflow_annotation")
+    if loaded is not None and os.path.realpath(getattr(loaded, "__file__", None) or "") == path:
+        module = loaded
+    else:
+        spec = importlib.util.spec_from_file_location("workflow_annotation", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)  # absent, unreadable or broken: it raises here, the try below catches it
+    missing = [name for name in WA_REQUIRED if not callable(getattr(module, name, None))]
+    if missing:
+        raise AttributeError("workflow_annotation.py lacks " + ", ".join(missing))
+    if loaded is None:
+        sys.modules["workflow_annotation"] = module
+    return module
+
+
+# The one shared-module load shape of scripts/ (#9365, ruling bcd0a15c; LoaderShape pins it).
+WA_PROG = "check_no_cn_ai_vendor"
+WA_RELATIVE_PATH = "workflow_annotation.py"
+WA_REQUIRED = ("err", "out")
+WA_EXIT_LOAD_REFUSED = 4  # a failed shared-module load; no other meaning in this script
+WA_ERROR_TO_STDERR = False
+
+try:
+    wa = _load_workflow_annotation()
+except (Exception, SystemExit) as exc:  # any failed load: one fixed line built without the module, then exit
+    wa_cause = type(exc).__name__
+    print("%s: refused: shared module workflow_annotation.py next to the script cannot be loaded (%s)"
+          % (WA_PROG, wa_cause if wa_cause.isidentifier() else "BaseException"), file=sys.stderr, flush=True)
+    print("::error title=check_no_cn_ai_vendor refused::check_no_cn_ai_vendor: refused: shared module workflow_annotation.py"
+          " next to the script cannot be loaded",
+          file=sys.stderr if WA_ERROR_TO_STDERR else sys.stdout, flush=True)
+    sys.exit(WA_EXIT_LOAD_REFUSED)
+
 DEFAULT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_ALLOW_FILE = Path(__file__).with_name("cn_ai_vendor_allow.json")
 
@@ -137,7 +177,7 @@ def list_files(root):
         if names:
             return sorted(n for n in names if (root / n).is_file())
     except (subprocess.CalledProcessError, FileNotFoundError):
-        pass
+        pass  # no git or not a work tree: the directory walk below lists the files instead
     found = []
     stack = [root]
     while stack:
@@ -298,16 +338,16 @@ def main(argv=None):
         allow = load_allow(args.allow_file)
         result = run_scan(args.root.resolve(), allow)
     except (OSError, ValueError) as err:
-        print(f"check_no_cn_ai_vendor: {err}", file=sys.stderr)
+        wa.err(f"check_no_cn_ai_vendor: {err}")
         return EXIT_USAGE
     hits = result.hits
     if not args.count_only:
         for rel, number, label in hits:
-            print(f"{rel}:{number}: barred name `{label}`")
+            wa.out(f"{rel}:{number}: barred name `{label}`")
     for message in result.stale:
-        print(message, file=sys.stderr)
-    print(f"skipped binary: {result.skipped_binary}")
-    print(f"hits: {len(hits)}")
+        wa.err(message)
+    wa.out(f"skipped binary: {result.skipped_binary}")
+    wa.out(f"hits: {len(hits)}")
     if hits:
         return EXIT_HITS
     return EXIT_STALE if result.stale else EXIT_OK

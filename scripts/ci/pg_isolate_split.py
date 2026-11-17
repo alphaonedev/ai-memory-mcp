@@ -48,7 +48,7 @@ def _load_workflow_annotation():
 # The one shared-module load shape of scripts/ (#9365, ruling bcd0a15c; LoaderShape pins it).
 WA_PROG = "pg_isolate_split"
 WA_RELATIVE_PATH = "workflow_annotation.py"
-WA_REQUIRED = ("annotation",)
+WA_REQUIRED = ("annotation", "err", "out")
 WA_EXIT_LOAD_REFUSED = 3  # a failed shared-module load; no other meaning in this script
 WA_ERROR_TO_STDERR = False
 
@@ -128,14 +128,14 @@ def main(argv=None):
         static = load_static_residual(args.static_residual)
         targets, residual, other = split(serial, exes, static)
     except (OSError, ptb.PartitionError, SplitError) as exc:
-        print(wa.annotation("error", "pg_isolate_split: %s" % exc), file=sys.stderr)
+        wa.err(wa.annotation("error", "pg_isolate_split: %s" % exc))
         return 2
     out = Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)
     (out / 'iso_targets.txt').write_text(''.join(l + '\n' for l in targets))
     (out / 'iso_residual.txt').write_text(''.join(n + '\n' for n in residual))
     (out / 'iso_other.txt').write_text(''.join(l + '\n' for l in other))
-    print('pg_isolate_split: %d pooled, %d residual-serial, %d other' % (len(targets) - len(residual), len(residual), len(other)))
+    wa.out('pg_isolate_split: %d pooled, %d residual-serial, %d other' % (len(targets) - len(residual), len(residual), len(other)))
     return 0
 
 

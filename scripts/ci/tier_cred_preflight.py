@@ -78,7 +78,7 @@ EXIT_MISMATCH = 3
 # The one shared-module load shape of scripts/ (#9365, ruling bcd0a15c; LoaderShape pins it).
 WA_PROG = "tier_cred_preflight"
 WA_RELATIVE_PATH = "workflow_annotation.py"
-WA_REQUIRED = ("annotation", "log_line")
+WA_REQUIRED = ("annotation", "log_line", "out")
 WA_EXIT_LOAD_REFUSED = EXIT_UNAVAILABLE  # the gate's own refusal code, unchanged
 WA_ERROR_TO_STDERR = False
 
@@ -236,13 +236,13 @@ def main(argv=None):
     except KeyboardInterrupt:  # a signal outside the supervised run: nothing to stop, still a failed pre-flight
         reason, code, rc = INTERRUPTED_REASON, EXIT_UNAVAILABLE, None
     if code == EXIT_OK:
-        print(wa.log_line(f"enterprise-fed tier pre-flight on {runner}: {OK_REASON} ({args.url_file})"))
+        wa.out(wa.log_line(f"enterprise-fed tier pre-flight on {runner}: {OK_REASON} ({args.url_file})"))
     elif reason in MESSAGES:
-        print(reason_line(reason, args.url_file, runner, rc))
+        wa.out(reason_line(reason, args.url_file, runner, rc))
     else:
         # a refusal from the URL helper or a local psql problem: its message names keys and paths only
-        print(wa.annotation("error", f"enterprise-fed tier pre-flight on {runner}: {reason} ({ISSUE})"))
-    sys.stdout.flush()
+        wa.out(wa.annotation("error", f"enterprise-fed tier pre-flight on {runner}: {reason} ({ISSUE})"))
+    wa.out(end="", flush=True)
     return code
 
 

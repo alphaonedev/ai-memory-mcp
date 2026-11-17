@@ -551,7 +551,7 @@ def probe_platform(dir_fd, err):
     if cannot_write is not None:
         probe_read_only(dir_fd, name + PROBE_ABSENT_SUFFIX, cannot_write.errno)
         why = safe_text(cannot_write.strerror or cannot_write)
-        print(f"{PROG}: probe cannot write ({why}); the read-only probe passed, pruning goes on", file=err)
+        wa.emit_to(err, f"{PROG}: probe cannot write ({why}); the read-only probe passed, pruning goes on")
 
 
 def probe_read_only(dir_fd, absent, cause):
@@ -602,13 +602,13 @@ def cleanup_probe(dir_fd, name, sub_fd, made_dir, made_file, err):
             try:
                 os.unlink(PROBE_FILE, dir_fd=sub_fd)
             except (NotImplementedError, TypeError, OSError):
-                pass
+                pass  # unlink failed: the rmdir below then fails and names the leftover (#8219)
         os.close(sub_fd)
     if made_dir:
         try:
             os.rmdir(name, dir_fd=dir_fd)
         except (NotImplementedError, TypeError, OSError):
-            print(f"{PROG}: probe directory left in place: {safe_text(name)}", file=err)
+            wa.emit_to(err, f"{PROG}: probe directory left in place: {safe_text(name)}")
 
 
 def mount_id(fd):
@@ -670,7 +670,7 @@ def print_runner_facts(raw, roots, out):
         )
     except Exception as exc:  # print-only helper: never change the exit code
         line = f"{FACTS_PREFIX} error={type(exc).__name__}"
-    print(wa.log_line(line), file=out)
+    wa.emit_to(out, wa.log_line(line))
     out.flush()
     return line
 
@@ -691,7 +691,7 @@ def write_job_summary(line, environ, err):
         finally:
             os.close(summary_fd)
     except OSError as exc:
-        print(f"{PROG}: job summary not written: {safe_text(exc.strerror or exc)}", file=err)
+        wa.emit_to(err, f"{PROG}: job summary not written: {safe_text(exc.strerror or exc)}")
 
 
 class Tally:
@@ -710,12 +710,12 @@ class Tally:
         if self.failed <= MAX_FAILURE_LINES:
             # CODE F6: a top-level entry not entered is named once; its text is the constant reason alone
             text = exc.reason if isinstance(exc, NotEntered) and not exc.nested and exc.name == name else error_text(exc)
-            print(wa.log_line(f"{PROG}: failed to remove {safe_text(name)}: {text}"), file=self.err)
+            wa.emit_to(self.err, wa.log_line(f"{PROG}: failed to remove {safe_text(name)}: {text}"))
 
     def skip(self, name, reason=SKIP_OTHER_DEVICE):
         self.skipped += 1
         if self.skipped <= MAX_FAILURE_LINES:
-            print(wa.log_line(f"{PROG}: skipped {safe_text(name)}: {reason}"), file=self.err)
+            wa.emit_to(self.err, wa.log_line(f"{PROG}: skipped {safe_text(name)}: {reason}"))
 
     def summary(self):
         text = f"pruned={self.pruned} kept={self.kept} failed={self.failed} freed_bytes={self.freed} skipped={self.skipped}"
@@ -918,7 +918,7 @@ def prune(dir_fd, root_dev, dry_run, now, out, tally, root_mnt=None):
                     raise NotEntered(entry.name, SKIP_OTHER_DEVICE)
                 remove_entry(dir_fd, entry.name, info, root_dev, tally, root_mnt, dry_run)
                 if dry_run:
-                    print(f"would-remove {safe_text(entry.name)}", file=out)
+                    wa.emit_to(out, f"would-remove {safe_text(entry.name)}")
                 tally.pruned += 1
             except NotEntered as exc:  # decision 2: every place not entered is one skip line and one counted failure
                 if not exc.nested:  # the top-level entry itself is not entered; its nested skip is printed already
@@ -934,19 +934,24 @@ def refused(reason, out, err):
     A counted refusal (COUNTED_REFUSALS) also prints the summary with failed=1, so the runner that could
     not be proven safe shows as a counted failure next to its one annotation.
     """
-    print(wa.log_line(f"{PROG}: refused: {reason}"), file=err)
+    wa.emit_to(err, wa.log_line(f"{PROG}: refused: {reason}"))
     if getattr(reason, "counted", False):
         tally = Tally(err)
         tally.failed = 1
-        print(wa.log_line(tally.summary()), file=out)
-    print(refusal_annotation(reason), file=out)
+        wa.emit_to(out, wa.log_line(tally.summary()))
+    wa.emit_to(out, refusal_annotation(reason))
     out.flush()
     return EXIT_OK  # ruling f23a9ae4: a refusal is green with its warning; only an internal error is red
 
 
+def default_streams(out, err):
+    """The caller's streams, else the process ones; every write to them goes through wa.emit_to (#9365)."""
+    return out or sys.stdout, err or sys.stderr
+
+
 def main(argv=None, environ=None, out=None, err=None):
     environ = os.environ if environ is None else environ
-    out, err = out or sys.stdout, err or sys.stderr
+    out, err = default_streams(out, err)
     if wa is None:  # an in-process caller of a copy whose sibling did not load: the same refusal, nothing pruned
         return load_refused(out, err)
     parser = argparse.ArgumentParser(prog=PROG, description=__doc__.split("\n")[0])
@@ -973,15 +978,15 @@ def main(argv=None, environ=None, out=None, err=None):
         prune(dir_fd, info.st_dev, args.dry_run, time.time(), out, tally, root_mnt)
     except Exception as exc:  # internal error: named, no traceback, the job goes red (exit 1)
         tally.internal_error = True
-        print(wa.log_line(f"{PROG}: internal error, pruning stopped: {type(exc).__name__}: {safe_text(exc)}"), file=err)
+        wa.emit_to(err, wa.log_line(f"{PROG}: internal error, pruning stopped: {type(exc).__name__}: {safe_text(exc)}"))
     finally:
         if dir_fd is not None:
             os.close(dir_fd)
-    print(wa.log_line(tally.summary()), file=out)
+    wa.emit_to(out, wa.log_line(tally.summary()))
     if not tally.internal_error:
         annotation = failed_annotation(tally.failed, tally.first_failed)
         if annotation:
-            print(annotation, file=out)
+            wa.emit_to(out, annotation)
     out.flush()
     return EXIT_ERROR if tally.internal_error else EXIT_OK
 

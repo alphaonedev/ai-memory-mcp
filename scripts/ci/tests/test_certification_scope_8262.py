@@ -131,6 +131,46 @@ import sys
 import unicodedata
 import unittest
 
+
+def _load_workflow_annotation():
+    """The shared module at WA_RELATIVE_PATH from this file's real directory, by path only, never through
+    sys.path; every name in WA_REQUIRED must be a callable of it (#9365, one shape in every script)."""
+    import importlib.util
+    import os
+    path = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), WA_RELATIVE_PATH))
+    loaded = sys.modules.get("workflow_annotation")
+    if loaded is not None and os.path.realpath(getattr(loaded, "__file__", None) or "") == path:
+        module = loaded
+    else:
+        spec = importlib.util.spec_from_file_location("workflow_annotation", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)  # absent, unreadable or broken: it raises here, the try below catches it
+    missing = [name for name in WA_REQUIRED if not callable(getattr(module, name, None))]
+    if missing:
+        raise AttributeError("workflow_annotation.py lacks " + ", ".join(missing))
+    if loaded is None:
+        sys.modules["workflow_annotation"] = module
+    return module
+
+
+# The one shared-module load shape of scripts/ (#9365, ruling bcd0a15c; LoaderShape pins it).
+WA_PROG = "test_certification_scope_8262"
+WA_RELATIVE_PATH = "../workflow_annotation.py"
+WA_REQUIRED = ("out",)
+WA_EXIT_LOAD_REFUSED = 3  # a failed shared-module load; no other meaning in this script
+WA_ERROR_TO_STDERR = False
+
+try:
+    wa = _load_workflow_annotation()
+except (Exception, SystemExit) as exc:  # any failed load: one fixed line built without the module, then exit
+    wa_cause = type(exc).__name__
+    print("%s: refused: shared module workflow_annotation.py next to the script cannot be loaded (%s)"
+          % (WA_PROG, wa_cause if wa_cause.isidentifier() else "BaseException"), file=sys.stderr, flush=True)
+    print("::error title=test_certification_scope_8262 refused::test_certification_scope_8262: refused: shared module workflow_annotation.py"
+          " next to the script cannot be loaded",
+          file=sys.stderr if WA_ERROR_TO_STDERR else sys.stdout, flush=True)
+    sys.exit(WA_EXIT_LOAD_REFUSED)
+
 ROOT = pathlib.Path(__file__).resolve().parents[3]
 PINS_REL = "scripts/ci/tests/data/certification_scope_8262_pins.json"
 CERT_REL = "docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md"
@@ -3278,6 +3318,6 @@ class CertificationScope8262(unittest.TestCase):
 
 if __name__ == "__main__":
     if sys.argv[1:] == ["--emit-pins"]:
-        sys.stdout.write(emit_pins(current_units(), current_headings()))
+        wa.out(emit_pins(current_units(), current_headings()), end="")
         sys.exit(0)
     unittest.main()

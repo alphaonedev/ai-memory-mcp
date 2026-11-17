@@ -36,6 +36,46 @@ import signal
 import subprocess
 import sys
 
+
+def _load_workflow_annotation():
+    """The shared module at WA_RELATIVE_PATH from this file's real directory, by path only, never through
+    sys.path; every name in WA_REQUIRED must be a callable of it (#9365, one shape in every script)."""
+    import importlib.util
+    import os
+    path = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), WA_RELATIVE_PATH))
+    loaded = sys.modules.get("workflow_annotation")
+    if loaded is not None and os.path.realpath(getattr(loaded, "__file__", None) or "") == path:
+        module = loaded
+    else:
+        spec = importlib.util.spec_from_file_location("workflow_annotation", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)  # absent, unreadable or broken: it raises here, the try below catches it
+    missing = [name for name in WA_REQUIRED if not callable(getattr(module, name, None))]
+    if missing:
+        raise AttributeError("workflow_annotation.py lacks " + ", ".join(missing))
+    if loaded is None:
+        sys.modules["workflow_annotation"] = module
+    return module
+
+
+# The one shared-module load shape of scripts/ (#9365, ruling bcd0a15c; LoaderShape pins it).
+WA_PROG = "check_test_env_lock_harness"
+WA_RELATIVE_PATH = "workflow_annotation.py"
+WA_REQUIRED = ("err",)
+WA_EXIT_LOAD_REFUSED = 4  # a failed shared-module load; no other meaning in this script
+WA_ERROR_TO_STDERR = False
+
+try:
+    wa = _load_workflow_annotation()
+except (Exception, SystemExit) as exc:  # any failed load: one fixed line built without the module, then exit
+    wa_cause = type(exc).__name__
+    print("%s: refused: shared module workflow_annotation.py next to the script cannot be loaded (%s)"
+          % (WA_PROG, wa_cause if wa_cause.isidentifier() else "BaseException"), file=sys.stderr, flush=True)
+    print("::error title=check_test_env_lock_harness refused::check_test_env_lock_harness: refused: shared module workflow_annotation.py"
+          " next to the script cannot be loaded",
+          file=sys.stderr if WA_ERROR_TO_STDERR else sys.stdout, flush=True)
+    sys.exit(WA_EXIT_LOAD_REFUSED)
+
 EXIT_OK = 0
 EXIT_FAIL = 1
 EXIT_ENV = 2
@@ -75,12 +115,12 @@ def is_fixture_name(name):
     return any(fnmatch.fnmatchcase(name, pat) for pat in FIXTURE_GLOBS)
 
 
-def precheck(root, out=sys.stderr):
-    """Return EXIT_FIXTURE and name the first fixture, else EXIT_OK."""
+def precheck(root):
+    """Return EXIT_FIXTURE and name the first fixture on stderr, else EXIT_OK."""
     found = find_fixtures(root)
     if not found:
         return EXIT_OK
-    print("self-test fixture present: %s" % found[0].relative_to(Path(root)), file=out)
+    wa.err("self-test fixture present: %s" % found[0].relative_to(Path(root)))
     return EXIT_FIXTURE
 
 
@@ -133,7 +173,7 @@ def _raise_interrupted(signum, _frame):
 
 def _stderr_note(message):
     """Write one ``NOTE:`` line to stderr (looked up at call time, so it can be captured)."""
-    print("NOTE: %s" % message, file=sys.stderr)
+    wa.err("NOTE: %s" % message)
 
 
 def _run_child(argv, cwd):
@@ -199,7 +239,7 @@ def main(argv=None):
     root = Path(args.root).resolve()
     gate = args.gate
     if not (root / gate).is_file():
-        print("ERROR: %s not found under %s" % (gate, root), file=sys.stderr)
+        wa.err("ERROR: %s not found under %s" % (gate, root))
         return EXIT_ENV
     try:
         if args.command == "census":
@@ -213,7 +253,7 @@ def main(argv=None):
         return run_isolated(
             root, lambda c: ["bash", INTERRUPT_HARNESS] + extra, "interrupt")
     except (RuntimeError, OSError) as err:
-        print("ERROR: %s" % err, file=sys.stderr)
+        wa.err("ERROR: %s" % err)
         return EXIT_ENV
 
 

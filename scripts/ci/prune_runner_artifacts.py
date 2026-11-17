@@ -81,7 +81,7 @@ def _load_workflow_annotation():
 # The one shared-module load shape of scripts/ (#9365, ruling bcd0a15c; LoaderShape pins it).
 WA_PROG = "prune_runner_artifacts"
 WA_RELATIVE_PATH = "workflow_annotation.py"
-WA_REQUIRED = ("annotation", "env_file_value", "log_line")
+WA_REQUIRED = ("annotation", "env_file_value", "err", "log_line", "out")
 WA_EXIT_LOAD_REFUSED = 3  # a failed shared-module load; no other meaning in this script
 WA_ERROR_TO_STDERR = False
 
@@ -99,9 +99,10 @@ except (Exception, SystemExit) as exc:  # any failed load: one fixed line built 
 import shared_cargo_target as shared  # noqa: E402  (after the load try: a failed load ends here first, #9365)
 
 
-def log(text, file=None):
-    """One plain log line; an untrusted path in it can never start a workflow command or add a line (#9365)."""
-    print(wa.log_line(text), file=file)
+def log(text, to_stderr=False):
+    """One plain log line (stdout, or stderr with ``to_stderr``); an untrusted path in it can never start a workflow
+    command or add a line (#9365)."""
+    (wa.err if to_stderr else wa.out)(wa.log_line(text))
 
 
 SECS_PER_DAY = 86400
@@ -149,7 +150,7 @@ def _protect_unresolvable_child(child):
     """Lexical protection for a protected-root child that does not resolve (#7284 S2)."""
     if child not in UNRESOLVABLE_WARNED:
         UNRESOLVABLE_WARNED.add(child)
-        log("protected root child unresolvable: %s" % child, file=sys.stderr)
+        log("protected root child unresolvable: %s" % child, to_stderr=True)
     return Path(os.path.abspath(child))
 
 
@@ -255,7 +256,7 @@ def scan(work_root, workspace, protected_root, max_age_days, now):
         try:
             entries = sorted(workspace.iterdir())
         except OSError as err:
-            log("could not list %s: %s" % (workspace, err), file=sys.stderr)
+            log("could not list %s: %s" % (workspace, err), to_stderr=True)
             entries = []
         for entry in entries:
             if not entry.name.startswith(TMP_PREFIX):
@@ -266,7 +267,7 @@ def scan(work_root, workspace, protected_root, max_age_days, now):
                 elif entry.is_dir():
                     found.append(entry)
             except OSError as err:
-                log("skipped unreadable %s: %s" % (entry, err), file=sys.stderr)
+                log("skipped unreadable %s: %s" % (entry, err), to_stderr=True)
     temp_root = Path(work_root) / TEMP_DIR_NAME
     if temp_root.is_symlink():
         skipped.append(temp_root)
@@ -274,7 +275,7 @@ def scan(work_root, workspace, protected_root, max_age_days, now):
         try:
             entries = sorted(temp_root.iterdir())
         except OSError as err:
-            log("could not list %s: %s" % (temp_root, err), file=sys.stderr)
+            log("could not list %s: %s" % (temp_root, err), to_stderr=True)
             entries = []
         for entry in entries:
             try:
@@ -283,7 +284,7 @@ def scan(work_root, workspace, protected_root, max_age_days, now):
                 elif entry.is_dir() and is_old(entry, max_age_days, now):
                     found.append(entry)
             except OSError as err:
-                log("skipped unreadable %s: %s" % (entry, err), file=sys.stderr)
+                log("skipped unreadable %s: %s" % (entry, err), to_stderr=True)
     keep = []
     for path in found:
         if is_protected(path, protected_root):
@@ -456,7 +457,7 @@ def sweep_stale_evicting(base, now, dry_run=False):
                 continue
             shutil.rmtree(entry)
         except OSError as err:
-            log("could not sweep %s: %s" % (entry, err), file=sys.stderr)
+            log("could not sweep %s: %s" % (entry, err), to_stderr=True)
             continue
         swept += 1
         log("swept stale %s" % entry)
@@ -480,7 +481,7 @@ def evict_idle_targets(evict_root, runner_name, home, idle_days, floor_gib, now,
     """
     problem = eviction_problem(evict_root, runner_name, home)
     if problem:
-        log("prune_runner_artifacts: skipping eviction: %s" % problem, file=sys.stderr)
+        log("prune_runner_artifacts: skipping eviction: %s" % problem, to_stderr=True)
         return EXIT_OK
     base = resolve(evict_root)
     if not base.is_dir():
@@ -522,7 +523,7 @@ def evict_idle_targets(evict_root, runner_name, home, idle_days, floor_gib, now,
             if not held:
                 state["lock_timeout"] = True
                 log("prune_runner_artifacts: skipping eviction: lock %s not taken within %s s"
-                      % (base / shared.EVICT_LOCK_NAME, lock_timeout), file=sys.stderr)
+                      % (base / shared.EVICT_LOCK_NAME, lock_timeout), to_stderr=True)
                 return
             # The decision is made again under the lock: a job start holds the
             # same lock around its marker write, so after this check no marker
@@ -536,13 +537,13 @@ def evict_idle_targets(evict_root, runner_name, home, idle_days, floor_gib, now,
                 os.utime(renamed)
             except OSError as err:
                 state["failed"] += 1
-                log("could not evict %s: %s" % (path, err), file=sys.stderr)
+                log("could not evict %s: %s" % (path, err), to_stderr=True)
                 return
         try:
             shutil.rmtree(renamed)
         except OSError as err:
             state["failed"] += 1
-            log("could not evict %s: %s" % (path, err), file=sys.stderr)
+            log("could not evict %s: %s" % (path, err), to_stderr=True)
             return
         state["evicted"] += 1
         log("evicted %s (%s)" % (path, reason))
@@ -553,7 +554,7 @@ def evict_idle_targets(evict_root, runner_name, home, idle_days, floor_gib, now,
         try:
             idle = newest_mtime(entry, newer_than=cutoff) <= cutoff
         except OSError as err:
-            log("skipped unreadable %s: %s" % (entry, err), file=sys.stderr)
+            log("skipped unreadable %s: %s" % (entry, err), to_stderr=True)
             continue
         if idle:
             remove(entry, "idle over %d days" % idle_days)
@@ -565,7 +566,7 @@ def evict_idle_targets(evict_root, runner_name, home, idle_days, floor_gib, now,
             try:
                 ranked.append((newest_mtime(entry, max_entries=WALK_ENTRY_CAP), entry))
             except OSError as err:
-                log("skipped unreadable %s: %s" % (entry, err), file=sys.stderr)
+                log("skipped unreadable %s: %s" % (entry, err), to_stderr=True)
         ranked.sort()
         for _, entry in ranked:
             if state["lock_timeout"]:
@@ -574,7 +575,7 @@ def evict_idle_targets(evict_root, runner_name, home, idle_days, floor_gib, now,
                 break
             remove(entry, "below the %d GiB free-space floor" % floor_gib)
         if not dry_run and free_bytes(base) < floor_bytes:
-            print(wa.annotation("warning", "free space under %s is below the %d GiB floor and no idle "
+            wa.out(wa.annotation("warning", "free space under %s is below the %d GiB floor and no idle "
                                 "sibling target is left to evict" % (base, floor_gib)))
     log("eviction summary: %d evicted, %d failed, %d busy skipped, %d GiB free (floor %d GiB)" % (
         state["evicted"], state["failed"], state["busy"],
@@ -630,7 +631,7 @@ def prune_all(args):
                 log("skipped %s: %s" % (path, why))
         except (OSError, RuntimeError) as err:
             failures += 1
-            log("could not remove %s: %s" % (path, err), file=sys.stderr)
+            log("could not remove %s: %s" % (path, err), to_stderr=True)
     return failures
 
 
@@ -653,10 +654,10 @@ def main(argv=None):
         )
         out_of_tree = not problem and is_out_of_tree(args.work_root, args.protected_root)
     except (OSError, RuntimeError) as err:
-        log("prune_runner_artifacts: refusing: unresolvable path: %s" % err, file=sys.stderr)
+        log("prune_runner_artifacts: refusing: unresolvable path: %s" % err, to_stderr=True)
         return EXIT_USAGE
     if problem:
-        log("prune_runner_artifacts: refusing: %s" % problem, file=sys.stderr)
+        log("prune_runner_artifacts: refusing: %s" % problem, to_stderr=True)
         return EXIT_USAGE
     if out_of_tree:
         log("protected root %s is outside the work root; nothing to protect" % args.protected_root)
@@ -666,9 +667,9 @@ def main(argv=None):
     except (OSError, RuntimeError) as err:
         # r3 F1: fail closed on deletion, soft on the exit code.
         failures += 1
-        log("prune_runner_artifacts: aborted: %s" % err, file=sys.stderr)
+        log("prune_runner_artifacts: aborted: %s" % err, to_stderr=True)
     if failures:
-        log("prune_runner_artifacts: %d removal(s) failed" % failures, file=sys.stderr)
+        log("prune_runner_artifacts: %d removal(s) failed" % failures, to_stderr=True)
     if args.evict_root:
         # #7199 + r3 F1: eviction never reds the job; an error is reported.
         try:
@@ -678,7 +679,7 @@ def main(argv=None):
                 args.free_floor_gib, time.time(), dry_run=args.dry_run,
             )
         except (OSError, RuntimeError) as err:
-            log("prune_runner_artifacts: eviction aborted: %s" % err, file=sys.stderr)
+            log("prune_runner_artifacts: eviction aborted: %s" % err, to_stderr=True)
     return EXIT_OK
 
 

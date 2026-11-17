@@ -67,7 +67,7 @@ def _load_workflow_annotation():
 # The one shared-module load shape of scripts/ (#9365, ruling bcd0a15c; LoaderShape pins it).
 WA_PROG = "sccache_env"
 WA_RELATIVE_PATH = "workflow_annotation.py"
-WA_REQUIRED = ("env_file_value", "log_line")
+WA_REQUIRED = ("env_file_value", "err", "log_line", "out")
 WA_EXIT_LOAD_REFUSED = 5  # a failed shared-module load (2 usage, 3 sccache missing, 4 wrong cache)
 WA_ERROR_TO_STDERR = False
 
@@ -173,11 +173,11 @@ def start_and_verify(binary, env, cache_dir):
 def print_stats():
     binary = resolve_sccache()
     if binary is None:
-        print("sccache_env: sccache not on PATH, no stats")
+        wa.out("sccache_env: sccache not on PATH, no stats")
         return EXIT_OK
     if os.environ.get("SCCACHE_SERVER_PORT") != str(SCCACHE_SERVER_PORT):
         # The sccache step was skipped or refused: never print the dev server's counters.
-        print("sccache_env: CI sccache not configured for this job, no stats")
+        wa.out("sccache_env: CI sccache not configured for this job, no stats")
         return EXIT_OK
     env = dict(os.environ)
     env["SCCACHE_SERVER_PORT"] = str(SCCACHE_SERVER_PORT)
@@ -187,10 +187,10 @@ def print_stats():
             timeout=STATS_TIMEOUT_SECS, check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as err:
-        print(wa.log_line("sccache_env: could not read stats: %s" % err))
+        wa.out(wa.log_line("sccache_env: could not read stats: %s" % err))
         return EXIT_OK
     for line in summarise_stats(result.stdout):
-        print(wa.log_line(line))
+        wa.out(wa.log_line(line))
     return EXIT_OK
 
 
@@ -215,16 +215,16 @@ def stop_server(home, runner_name):
     if binary is None:
         return EXIT_OK
     if sibling_job_running(home, runner_name, time.time()):
-        print("sccache_env: a sibling job is running, leaving the CI server up")
+        wa.out("sccache_env: a sibling job is running, leaving the CI server up")
         return EXIT_OK
     env = dict(os.environ)
     env["SCCACHE_SERVER_PORT"] = str(SCCACHE_SERVER_PORT)
     try:
         run_sccache(binary, ["--stop-server"], env)
     except (OSError, subprocess.TimeoutExpired) as err:
-        print(wa.log_line("sccache_env: could not stop the CI server: %s" % err))
+        wa.out(wa.log_line("sccache_env: could not stop the CI server: %s" % err))
         return EXIT_OK
-    print("sccache_env: stopped the CI server on port %d" % SCCACHE_SERVER_PORT)
+    wa.out("sccache_env: stopped the CI server on port %d" % SCCACHE_SERVER_PORT)
     return EXIT_OK
 
 
@@ -242,7 +242,7 @@ def main(argv=None):
         return print_stats()
     home = Path(args.home)
     if not home.is_absolute() or str(home) in ("/", ""):
-        print(wa.log_line("sccache_env: refusing home %r" % args.home), file=sys.stderr)
+        wa.err(wa.log_line("sccache_env: refusing home %r" % args.home))
         return EXIT_USAGE
     if args.stop:
         return stop_server(home, args.runner_name)
@@ -250,7 +250,7 @@ def main(argv=None):
         parser.error("--github-env is required unless --stats or --stop is given")
     binary = resolve_sccache()
     if binary is None:
-        print("sccache_env: sccache not found on PATH; refusing a cold build", file=sys.stderr)
+        wa.err("sccache_env: sccache not found on PATH; refusing a cold build")
         return EXIT_MISSING
     cache_root = home / CACHE_ROOT_RELATIVE
     cache_dir = cache_root / SCCACHE_DIR_NAME
@@ -258,7 +258,7 @@ def main(argv=None):
     env = ci_server_env(os.environ, cache_dir, cache_root / SCCACHE_ERROR_LOG_NAME)
     problem = start_and_verify(binary, env, cache_dir)
     if problem:
-        print(wa.log_line("sccache_env: %s; refusing" % problem), file=sys.stderr)
+        wa.err(wa.log_line("sccache_env: %s; refusing" % problem))
         return EXIT_WRONG_CACHE
     values = (("RUSTC_WRAPPER", binary),) + tuple(
         (name, env[name]) for name in (
@@ -267,7 +267,7 @@ def main(argv=None):
     with open(args.github_env, "a", encoding="utf-8") as handle:
         for name, value in values:
             handle.write("%s=%s\n" % (name, wa.env_file_value(value)))
-    print(wa.log_line("sccache_env: %s, dir %s, cap %s, port %d" % (
+    wa.out(wa.log_line("sccache_env: %s, dir %s, cap %s, port %d" % (
         binary, cache_dir, SCCACHE_CACHE_SIZE, SCCACHE_SERVER_PORT)))
     return EXIT_OK
 

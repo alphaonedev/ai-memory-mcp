@@ -140,6 +140,73 @@ import threading
 import time
 from urllib.parse import unquote, urlsplit
 
+
+def _load_workflow_annotation():
+    """The shared module at WA_RELATIVE_PATH from this file's real directory, by path only, never through
+    sys.path; every name in WA_REQUIRED must be a callable of it (#9365, one shape in every script)."""
+    import importlib.util
+    import os
+    path = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), WA_RELATIVE_PATH))
+    loaded = sys.modules.get("workflow_annotation")
+    if loaded is not None and os.path.realpath(getattr(loaded, "__file__", None) or "") == path:
+        module = loaded
+    else:
+        spec = importlib.util.spec_from_file_location("workflow_annotation", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)  # absent, unreadable or broken: it raises here, the try below catches it
+    missing = [name for name in WA_REQUIRED if not callable(getattr(module, name, None))]
+    if missing:
+        raise AttributeError("workflow_annotation.py lacks " + ", ".join(missing))
+    if loaded is None:
+        sys.modules["workflow_annotation"] = module
+    return module
+
+
+# The one shared-module load shape of scripts/ (#9365, ruling bcd0a15c; LoaderShape pins it).
+WA_PROG = "ensure-age-extension"
+WA_RELATIVE_PATH = "workflow_annotation.py"
+WA_REQUIRED = ("err", "out")
+WA_EXIT_LOAD_REFUSED = 3  # a failed shared-module load; no other meaning in this script
+WA_ERROR_TO_STDERR = False
+
+
+class SharedModuleNotLoadedError(RuntimeError):
+    """A function that needs workflow_annotation.py ran before require_workflow_annotation() loaded it."""
+
+
+class _NotLoaded:
+    """The state of ``wa`` until the load ran: one explicit member per name this script uses from the shared module
+    (a test pins the set against the ast), each a named error, never a half-working helper. No __getattr__, so
+    hasattr and getattr with a default cannot turn a forgotten load into a silent fallback."""
+
+    _WANTED = ("workflow_annotation.py is not loaded; call require_workflow_annotation() "
+              "first (wanted %s)")
+
+    def err(self, *args, **kwargs):
+        raise SharedModuleNotLoadedError(self._WANTED % "err")
+
+    def out(self, *args, **kwargs):
+        raise SharedModuleNotLoadedError(self._WANTED % "out")
+
+
+wa = _NotLoaded()
+
+
+def require_workflow_annotation():
+    """Load the shared module into ``wa`` or refuse: main calls it before any work, so importing prints nothing."""
+    global wa
+    try:
+        wa = _load_workflow_annotation()
+    except (Exception, SystemExit) as exc:  # any failed load: one fixed line built without the module, then exit
+        wa_cause = type(exc).__name__
+        print("%s: refused: shared module workflow_annotation.py next to the script cannot be loaded (%s)"
+              % (WA_PROG, wa_cause if wa_cause.isidentifier() else "BaseException"), file=sys.stderr, flush=True)
+        print("::error title=ensure-age-extension refused::ensure-age-extension: refused: shared module workflow_annotation.py"
+              " next to the script cannot be loaded",
+              file=sys.stderr if WA_ERROR_TO_STDERR else sys.stdout, flush=True)
+        sys.exit(WA_EXIT_LOAD_REFUSED)
+
+
 EXIT_OK = 0
 EXIT_UNAVAILABLE = 1
 EXIT_BAD_INPUT = 2
@@ -790,7 +857,7 @@ def run(args):
     url = read_url(args.url_file)
     dests = dest_dirs(args.pg_config)
     if healthy(args, dests, url):
-        print("age extension available (no restore needed)")
+        wa.out("age extension available (no restore needed)")
         return
     sources = load_sources(args.age_dir)
     try:
@@ -798,23 +865,24 @@ def run(args):
     except OSError as exc:
         # Another runner may have completed the same restore concurrently.
         if healthy(args, dests, url):
-            print("age extension available (restored concurrently by another run)")
+            wa.out("age extension available (restored concurrently by another run)")
             return
         raise HelperError(f"age restore failed: {exc.strerror or exc}", EXIT_UNAVAILABLE)
     if not healthy(args, dests, url):
         raise HelperError("age extension still unavailable after restore from " + str(args.age_dir), EXIT_UNAVAILABLE)
-    print(f"age extension restored from {args.age_dir} and available")
+    wa.out(f"age extension restored from {args.age_dir} and available")
 
 
 def main(argv=None):
+    require_workflow_annotation()
     install_interrupt_handlers()  # every catchable signal ends like SIGINT; the probe stops psql first
     try:
         run(parse_args(argv))
     except HelperError as exc:
-        print(f"ensure-age-extension: {exc}", file=sys.stderr)
+        wa.err(f"ensure-age-extension: {exc}")
         return exc.code
     except KeyboardInterrupt:
-        print("ensure-age-extension: interrupted", file=sys.stderr)
+        wa.err("ensure-age-extension: interrupted")
         return EXIT_UNAVAILABLE
     return EXIT_OK
 

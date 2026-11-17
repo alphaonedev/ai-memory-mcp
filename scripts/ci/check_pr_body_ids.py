@@ -19,6 +19,46 @@ from pathlib import Path
 import re
 import sys
 
+
+def _load_workflow_annotation():
+    """The shared module at WA_RELATIVE_PATH from this file's real directory, by path only, never through
+    sys.path; every name in WA_REQUIRED must be a callable of it (#9365, one shape in every script)."""
+    import importlib.util
+    import os
+    path = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), WA_RELATIVE_PATH))
+    loaded = sys.modules.get("workflow_annotation")
+    if loaded is not None and os.path.realpath(getattr(loaded, "__file__", None) or "") == path:
+        module = loaded
+    else:
+        spec = importlib.util.spec_from_file_location("workflow_annotation", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)  # absent, unreadable or broken: it raises here, the try below catches it
+    missing = [name for name in WA_REQUIRED if not callable(getattr(module, name, None))]
+    if missing:
+        raise AttributeError("workflow_annotation.py lacks " + ", ".join(missing))
+    if loaded is None:
+        sys.modules["workflow_annotation"] = module
+    return module
+
+
+# The one shared-module load shape of scripts/ (#9365, ruling bcd0a15c; LoaderShape pins it).
+WA_PROG = "check_pr_body_ids"
+WA_RELATIVE_PATH = "workflow_annotation.py"
+WA_REQUIRED = ("neutral_lines",)
+WA_EXIT_LOAD_REFUSED = 3  # a failed shared-module load; no other meaning in this script
+WA_ERROR_TO_STDERR = False
+
+try:
+    wa = _load_workflow_annotation()
+except (Exception, SystemExit) as exc:  # any failed load: one fixed line built without the module, then exit
+    wa_cause = type(exc).__name__
+    print("%s: refused: shared module workflow_annotation.py next to the script cannot be loaded (%s)"
+          % (WA_PROG, wa_cause if wa_cause.isidentifier() else "BaseException"), file=sys.stderr, flush=True)
+    print("::error title=check_pr_body_ids refused::check_pr_body_ids: refused: shared module workflow_annotation.py"
+          " next to the script cannot be loaded",
+          file=sys.stderr if WA_ERROR_TO_STDERR else sys.stdout, flush=True)
+    sys.exit(WA_EXIT_LOAD_REFUSED)
+
 MIN_ID_DIGITS = 11
 SUSPECT_PATTERN = re.compile(r"(?<!\w)[0-9]{" + str(MIN_ID_DIGITS) + r",}(?!\w)")
 CAP_ASSIGNMENT_PATTERN = re.compile(
@@ -143,7 +183,7 @@ def write_output(stream, payload):
 def report_error(message):
     """Attempt one diagnostic; a broken diagnostic destination is also closed."""
     try:
-        write_output(sys.stderr, message + "\n")
+        write_output(sys.stderr, wa.neutral_lines(message + "\n"))
     except (OSError, UnicodeError):
         close_failed_stream(sys.stderr)
 
@@ -161,12 +201,24 @@ class OutputParser(argparse.ArgumentParser):
         if message:
             stream = file
             try:
-                write_output(stream, message)
+                write_output(stream, wa.neutral_lines(message))  # argparse echoes argv values in its errors
             except (OSError, UnicodeError):
                 close_failed_stream(stream)
                 if stream is not sys.stderr:
                     report_error("check_pr_body_ids: output error")
                 raise SystemExit(EXIT_ERROR)
+
+
+def write_report(report):
+    """Write the report lines (PR body text, neutralised) to stdout in one checked raw write; False on failure."""
+    try:
+        output = require_open_stream(sys.stdout).buffer
+        write_output(output, wa.neutral_lines("\n".join(report) + "\n").encode("utf-8"))
+    except OSError:
+        close_failed_stream(sys.stdout)
+        report_error("check_pr_body_ids: output error")
+        return False
+    return True
 
 
 def main(argv=None):
@@ -193,12 +245,7 @@ def main(argv=None):
         return EXIT_ERROR
     offending, hit_count = scan_body(body)
     report = offending + [f"suspected_ids={hit_count} offending_lines={len(offending)}"]
-    try:
-        output = require_open_stream(sys.stdout).buffer
-        write_output(output, ("\n".join(report) + "\n").encode("utf-8"))
-    except OSError:
-        close_failed_stream(sys.stdout)
-        report_error("check_pr_body_ids: output error")
+    if not write_report(report):
         return EXIT_ERROR
     return EXIT_SUSPECTS if hit_count else EXIT_OK
 

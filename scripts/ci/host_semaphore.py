@@ -61,7 +61,7 @@ EXIT_LOAD_REFUSED = 4  # the shared module cannot be loaded (2 = bad arguments, 
 # The one shared-module load shape of scripts/ (#9365, ruling bcd0a15c; LoaderShape pins it).
 WA_PROG = "host_semaphore"
 WA_RELATIVE_PATH = "workflow_annotation.py"
-WA_REQUIRED = ("annotation", "log_line")
+WA_REQUIRED = ("annotation", "err", "log_line", "out")
 WA_EXIT_LOAD_REFUSED = EXIT_LOAD_REFUSED  # the gate's own refusal code, unchanged
 WA_ERROR_TO_STDERR = False
 
@@ -122,12 +122,12 @@ def acquire(slot_dir, slots, label, max_wait, poll, sleep_fn=time.sleep):
         step = min(poll, max_wait - waited)
         sleep_fn(step)
         waited += step
-        print(wa.log_line('%s %r: waiting for a slot of %d, waited=%ds' % (TAG, label, slots, waited)), flush=True)
+        wa.out(wa.log_line('%s %r: waiting for a slot of %d, waited=%ds' % (TAG, label, slots, waited)), flush=True)
 
 
 def _note(message):
     """Record a tolerated condition on stderr (#7929), never silently."""
-    print(wa.log_line('%s note: %s' % (TAG, message)), file=sys.stderr, flush=True)
+    wa.err(wa.log_line('%s note: %s' % (TAG, message)), flush=True)
 
 
 def _signal_group(pgid, sig):
@@ -211,18 +211,18 @@ def main(argv=None):
     slot_dir.mkdir(parents=True, exist_ok=True)
     got = acquire(slot_dir, args.slots, args.label, args.max_wait_secs, args.poll_secs)
     if got is None:
-        print(wa.annotation("error", "%s '%s': no slot free after %ds (all %d slots busy on this host)"
+        wa.out(wa.annotation("error", "%s '%s': no slot free after %ds (all %d slots busy on this host)"
                             % (TAG, args.label, args.max_wait_secs, args.slots)), flush=True)
         return EXIT_NO_SLOT
     index, fd, waited = got
     try:
         load, cores = load_and_cores()
-        print(wa.annotation("notice", "%s '%s': slot %d of %d acquired after %ds (load=%.2f cores=%d)"
+        wa.out(wa.annotation("notice", "%s '%s': slot %d of %d acquired after %ds (load=%.2f cores=%d)"
                             % (TAG, args.label, index, args.slots, waited, load, cores)), flush=True)
         return run_child(command)
     finally:
         os.close(fd)
-        print(wa.log_line("%s '%s': slot %d of %d released" % (TAG, args.label, index, args.slots)), flush=True)
+        wa.out(wa.log_line("%s '%s': slot %d of %d released" % (TAG, args.label, index, args.slots)), flush=True)
 
 
 if __name__ == '__main__':

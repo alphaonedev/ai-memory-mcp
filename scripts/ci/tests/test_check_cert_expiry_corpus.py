@@ -50,6 +50,46 @@ import types
 import unittest
 from pathlib import Path
 
+
+def _load_workflow_annotation():
+    """The shared module at WA_RELATIVE_PATH from this file's real directory, by path only, never through
+    sys.path; every name in WA_REQUIRED must be a callable of it (#9365, one shape in every script)."""
+    import importlib.util
+    import os
+    path = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), WA_RELATIVE_PATH))
+    loaded = sys.modules.get("workflow_annotation")
+    if loaded is not None and os.path.realpath(getattr(loaded, "__file__", None) or "") == path:
+        module = loaded
+    else:
+        spec = importlib.util.spec_from_file_location("workflow_annotation", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)  # absent, unreadable or broken: it raises here, the try below catches it
+    missing = [name for name in WA_REQUIRED if not callable(getattr(module, name, None))]
+    if missing:
+        raise AttributeError("workflow_annotation.py lacks " + ", ".join(missing))
+    if loaded is None:
+        sys.modules["workflow_annotation"] = module
+    return module
+
+
+# The one shared-module load shape of scripts/ (#9365, ruling bcd0a15c; LoaderShape pins it).
+WA_PROG = "test_check_cert_expiry_corpus"
+WA_RELATIVE_PATH = "../workflow_annotation.py"
+WA_REQUIRED = ("err", "out")
+WA_EXIT_LOAD_REFUSED = 3  # a failed shared-module load; no other meaning in this script
+WA_ERROR_TO_STDERR = False
+
+try:
+    wa = _load_workflow_annotation()
+except (Exception, SystemExit) as exc:  # any failed load: one fixed line built without the module, then exit
+    wa_cause = type(exc).__name__
+    print("%s: refused: shared module workflow_annotation.py next to the script cannot be loaded (%s)"
+          % (WA_PROG, wa_cause if wa_cause.isidentifier() else "BaseException"), file=sys.stderr, flush=True)
+    print("::error title=test_check_cert_expiry_corpus refused::test_check_cert_expiry_corpus: refused: shared module workflow_annotation.py"
+          " next to the script cannot be loaded",
+          file=sys.stderr if WA_ERROR_TO_STDERR else sys.stdout, flush=True)
+    sys.exit(WA_EXIT_LOAD_REFUSED)
+
 HARNESS_ROOT = Path(__file__).resolve().parents[3]
 GATE_PATH = HARNESS_ROOT / "scripts" / "check_cert_expiry.py"
 MANIFEST_FILE = HARNESS_ROOT / "scripts" / "qc-allowlists" / "cert-expiry-corpus-manifest.txt"
@@ -140,9 +180,9 @@ class SelfTest:
         self.failed = False
 
     def fail(self, msg, out=None):
-        print(f"self-test FAILED {msg}", file=sys.stderr)
+        wa.err(f"self-test FAILED {msg}")
         if out:
-            print(out, file=sys.stderr)
+            wa.err(out)
         self.failed = True
 
     def expect_red(self, label, desc, repo, base, head, needles, tip=None):
@@ -366,7 +406,7 @@ def deep_scratch_violation(tmp):
     try:
         deep_scratch(tmp, 10)
     except OSError:
-        pass
+        pass  # the expected refusal; the else branch reports a missing one
     else:
         return "deep_scratch with a target shorter than its base did not fail"
     left = sorted(p.name for p in tmp.glob("gitshim-deep.*"))
@@ -732,7 +772,7 @@ def run_cells(t, cells):
             if tag == "path-max-restore" and not res.startswith(PATH_MAX_LEAK_PREFIX):
                 tag = "path-max-fallback"  # the fallback check runs inside the restore cell
             t.fail(f"({tag}, #6145): {res}")
-            print("check-cert-expiry self-test: FAIL", file=sys.stderr)
+            wa.err("check-cert-expiry self-test: FAIL")
             return 2
     return None
 
@@ -1594,8 +1634,8 @@ class Cells(CorpusBase):
                 self.t.fail("(o): THIS change trips the cert-expiry gate without touching the "
                             "cert doc:", out)
         else:
-            print("self-test NOTE (o): skipped own-PR check (no origin/release/v1.0.0 "
-                  "and no @{upstream})", file=sys.stderr)
+            wa.err("self-test NOTE (o): skipped own-PR check (no origin/release/v1.0.0 "
+                  "and no @{upstream})")
         self.settle()
 
     # ---- the #6145 git-shim and scratch cells ------------------------------
@@ -2326,7 +2366,7 @@ class Corpus(CorpusBase):
         an unfixed generator also carries. An unreadable object fails the case; the CI step that
         runs this fetches them with --print-replay-shas."""
         lines, wrong, unreadable = prefix_replay_report(HARNESS_ROOT, self.tmp)
-        print("\n".join(lines), file=sys.stderr)
+        wa.err("\n".join(lines))
         self.assertEqual(unreadable, [], "replay objects are missing from this checkout: " + "; ".join(unreadable))
         self.assertEqual(wrong, [], "probes that do not discriminate: " + "; ".join(wrong))
         self.assertGreaterEqual(len(lines), 2 * len(PREFIX_REPLAY))
@@ -2841,7 +2881,7 @@ class Ratchet(unittest.TestCase):
     def test_manifest_ratchet(self):
         problems, notes = ratchet_decision(HARNESS_ROOT, MANIFEST, read_manifest(MANIFEST_FILE), os.environ)
         for note in notes:
-            print(note, file=sys.stderr)
+            wa.err(note)
         self.assertEqual(problems, [], "\n".join(problems))
 
     def test_manifest_never_claims_an_open_issue(self):
@@ -3042,7 +3082,7 @@ def main(argv=None):
     `--self-test` runner (#6445)."""
     args = list(sys.argv[1:] if argv is None else argv)
     if REPLAY_FETCH_FLAG in args:
-        print("\n".join(replay_objects()))
+        wa.out("\n".join(replay_objects()))
         return 0
     machine = "--machine" in args
     suite = load_tests(unittest.defaultTestLoader, None, None)
@@ -3053,10 +3093,10 @@ def main(argv=None):
     bad = list(result.failures) + list(result.errors)
     for case, trace in bad:
         reason = trace.strip().splitlines()[-1] if trace.strip() else "failed"
-        print(f"CORPUS-FAIL {case.id().rsplit('.', 1)[-1]}: {reason[:300]}")
+        wa.out(f"CORPUS-FAIL {case.id().rsplit('.', 1)[-1]}: {reason[:300]}")
     for case in result.unexpectedSuccesses:
-        print(f"CORPUS-FAIL {case.id().rsplit('.', 1)[-1]}: expected to fail (RED) but passed")
-    print(f"CORPUS-SUMMARY ran={result.testsRun} failed={len(bad) + len(result.unexpectedSuccesses)}")
+        wa.out(f"CORPUS-FAIL {case.id().rsplit('.', 1)[-1]}: expected to fail (RED) but passed")
+    wa.out(f"CORPUS-SUMMARY ran={result.testsRun} failed={len(bad) + len(result.unexpectedSuccesses)}")
     return 0 if result.wasSuccessful() else 1
 
 
