@@ -4,8 +4,10 @@
 Class invariant: every sqlite test invocation of the `Run tests (impact-aware)` step ends with at least
 MARGIN_PCT percent of its per-invocation watchdog budget left; losing it is a named red even when every test
 passed, and the still-running case is a named red at the margin deadline, before the watchdog kills it. The
-full suite runs as three sequential invocations (lib, the other test targets, doc tests) derived from cargo
-metadata, and anything the derivation cannot judge falls back to the one unsharded invocation.
+full suite runs as four sequential invocations (lib, the other test targets in two round-robin parts, doc
+tests) derived from cargo metadata, and anything the derivation cannot judge falls back to the one unsharded
+invocation. The whole-suite ceiling (ruling b29 cdfe800f) bounds the sum of those invocations, and that
+ceiling with the same margin must fit the timeout of the enclosing job as ci.yml states it.
 
 Run: python3 -m unittest discover -s scripts/ci/tests
 Standard library only.
@@ -30,6 +32,9 @@ CI = (REPO / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
 
 BUDGET = 2100  # the ubuntu-latest sqlite per-invocation watchdog budget (ci.yml WATCHDOG_SECS)
 DEADLINE = 1680  # 80 % of BUDGET: the last second of wall that still holds the 20 % margin
+CEILING = 3600  # WHOLE_SUITE_CEILING_SECS: the most seconds the invocations of the sqlite full suite may sum to
+# The text every margin red carries, so a lane reads it as the suite's cost, not its own failure (cdfe800f).
+ISSUE_NOTE = "this red is issue #9229 (the cost of the sqlite suite), not a failure of the change under test"
 SCAN_LINES = 200_000  # a log larger than any real sqlite suite log (about 53k lines at the kill)
 SCAN_CEILING_SECS = 20.0  # linear scan of SCAN_LINES; a quadratic scan takes minutes
 STEP_TIMEOUT_SECS = 120
@@ -136,10 +141,10 @@ class GateCli(unittest.TestCase):
     def test_margin_lost_after_a_pass_is_the_named_red(self):
         rc, out, _ = self.gate(elapsed=1700)
         self.assertEqual(rc, 3)
-        self.assertEqual(out, "::error::[#9229 margin] 'full suite shard 2/3' lost the suite margin (#9229): passed "
+        self.assertEqual(out, "::error::[#9229 margin] 'full suite shard 2/3' lost the suite margin: passed "
                               "but used 1700s of the 2100s budget (80\\x25, 400s left); the required margin is 20\\x25 "
                               "(420s, so at most 1680s of wall); cut the suite cost or shard it, do not raise "
-                              "the budget\n")
+                              "the budget; " + ISSUE_NOTE + "; slowest binaries: none profiled\n")
 
     def test_kill_names_the_slowest_binaries_of_its_own_invocation(self):
         with scratch() as d:
@@ -155,8 +160,8 @@ class GateCli(unittest.TestCase):
                                    elapsed=2100, rc=124)
         self.assertEqual(rc, 3)
         self.assertIn("killed by the watchdog (rc 124) after 2100s of the 2100s budget", out)
-        self.assertIn("still running tests/hung.rs", out)
-        self.assertIn("slowest: tests/slow_one.rs 1500s", out)
+        self.assertIn("do not raise the budget; " + ISSUE_NOTE + "; still running tests/hung.rs; slowest binaries: "
+                      "tests/slow_one.rs 1500s", out)
         self.assertNotIn("src/lib.rs", out)
 
     def test_malformed_input_exits_2_with_a_named_error(self):
@@ -213,9 +218,9 @@ class Timer(unittest.TestCase):
         self.assertLess(DEADLINE, BUDGET)
         self.assertLessEqual(max(slept), 60)
         self.assertEqual(out.getvalue(), "::error::[#9229 margin] 'full suite shard 2/3' lost the suite margin while "
-                                         "still running (#9229): 1680s of the 2100s budget used, the required "
+                                         "still running: 1680s of the 2100s budget used, the required "
                                          "margin is 20\\x25 (420s); the watchdog kills it at 2100s unless it ends "
-                                         "first\n")
+                                         "first; " + ISSUE_NOTE + "; slowest binaries: none profiled\n")
 
     def test_in_flight_red_names_the_running_binary(self):
         with scratch() as d:
@@ -347,6 +352,15 @@ class ShardArgs(unittest.TestCase):
                       if t["test"] and not set(t["kind"]) & self.sb._LIB_KINDS
                       and "custom-build" not in t["kind"] and not t.get("required-features"))
         self.assertEqual(sorted(names), want)
+        # The two round-robin parts the step runs: every target of the default selection exactly once,
+        # none dropped and none twice, each name still behind its own kind flag.
+        whole = list(zip(args[0::2], args[1::2]))
+        part_1, part_2 = (self.sb.shard_args(data, part=(k, 2)) for k in (1, 2))
+        pairs = list(zip(part_1[0::2], part_1[1::2])) + list(zip(part_2[0::2], part_2[1::2]))
+        self.assertEqual(len(pairs), len(set(pairs)))
+        self.assertEqual(sorted(pairs), sorted(whole))
+        self.assertEqual(sorted(n for _, n in pairs), want)
+        self.assertLessEqual(abs(len(part_1) - len(part_2)), 2)
 
     def test_malformed_metadata_is_refused(self):
         lib = {"kind": ["lib"], "name": "ai_memory", "test": True, "doctest": True}
@@ -465,6 +479,166 @@ class ShardArgs(unittest.TestCase):
                     self.assertIn(words, err)
                     self.assertIn("the full suite runs unsharded (#9229)", err)
 
+LEGS_FIXTURE = """jobs:
+  lint:
+    timeout-minutes: 15
+  check:
+    name: Check (${{ matrix.leg }})
+    timeout-minutes: %(job_timeout)s
+    strategy:
+      matrix:
+        include:
+%(legs)s    steps:
+      - name: Run tests (impact-aware)
+  other:
+    timeout-minutes: 5
+"""
+LEG = """          - leg: %(node)s,%(tier)s
+            node: %(node)s
+            tier: %(tier)s
+%(timeout)s"""
+
+
+def workflow(job_timeout="${{ matrix.timeout }}", legs=(("ubuntu-latest", "sqlite", "95"),)):
+    body = ""
+    for node, tier, timeout in legs:
+        line = "" if timeout is None else "            timeout: %s  # minutes\n" % timeout
+        body += LEG % {"node": node, "tier": tier, "timeout": line}
+    return LEGS_FIXTURE % {"job_timeout": job_timeout, "legs": body}
+
+
+class WholeSuite(unittest.TestCase):
+    """Ruling b29 cdfe800f: one named ceiling for the sum of the full-suite invocations, and that ceiling plus
+    the same margin fits the timeout of the enclosing job as ci.yml states it."""
+
+    def setUp(self):
+        self.sb = load()
+
+    def test_named_ceiling_fits_every_sqlite_leg_of_the_real_workflow(self):
+        self.assertEqual(self.sb.WHOLE_SUITE_CEILING_SECS, CEILING)
+        for node, minutes in (("ubuntu-latest", 95), ("macos-fed", 80)):
+            with self.subTest(node=node):
+                secs = self.sb.job_timeout_secs(CI, "check", node, "sqlite")
+                self.assertEqual(secs, minutes * 60)
+                self.assertLessEqual(CEILING, self.sb.margin_deadline(secs))
+        # The four per-invocation budgets must not become a silent 8400 s suite.
+        self.assertLess(CEILING, 4 * BUDGET)
+
+    def seconds(self, d, body):
+        path = Path(d) / "seconds.txt"
+        if body is not None:
+            path.write_text(body, encoding="utf-8")
+        return run_main(self.sb, ["suite-sum", "--seconds", str(path)])
+
+    def test_sum_within_the_ceiling_is_a_notice(self):
+        with scratch() as d:
+            rc, out, _ = self.seconds(d, "600\tlib\n1500\tpart 1/2\n1400\tpart 2/2\n100\tdoc tests\n")
+        self.assertEqual(rc, 0)
+        self.assertEqual(out, "::notice::[#9229 margin] whole sqlite suite: 4 invocations ran 3600s of the 3600s "
+                              "whole-suite ceiling (WHOLE_SUITE_CEILING_SECS); per invocation: lib 600s, part 1/2 "
+                              "1500s, part 2/2 1400s, doc tests 100s\n")
+
+    def test_sum_over_the_ceiling_is_the_named_red_with_each_invocation(self):
+        with scratch() as d:
+            rc, out, _ = self.seconds(d, "600\tlib\n1500\tpart 1/2\n1401\tpart 2/2\n100\tdoc tests\n")
+        self.assertEqual(rc, 3)
+        self.assertEqual(out, "::error::[#9229 margin] whole sqlite suite lost its ceiling: 4 invocations ran 3601s, "
+                              "over the 3600s whole-suite ceiling (WHOLE_SUITE_CEILING_SECS); per invocation: lib "
+                              "600s, part 1/2 1500s, part 2/2 1401s, doc tests 100s; " + ISSUE_NOTE + "; cut the "
+                              "suite cost or shard it, do not raise the ceiling\n")
+
+    def test_malformed_seconds_are_named_never_a_pass(self):
+        rows = (
+            (None, "the invocation seconds file cannot be read (FileNotFoundError)"),
+            ("", "the invocation seconds file records no invocation"),
+            ("100\tlib\nten\tdoc tests\n", "invocation seconds line 2 has a non-numeric seconds value 'ten'"),
+            ("100\tlib\n1.5\tdoc\n", "invocation seconds line 2 has a non-numeric seconds value '1.5'"),
+            ("\tlib\n", "invocation seconds line 1 has a non-numeric seconds value ''"),
+            ("-5\tlib\n", "invocation seconds line 1 has a negative seconds value -5"),
+            ("100\tlib\n200\tpart\n300\tlib\n", "invocation seconds line 3 repeats the invocation 'lib'"),
+            ("100 lib\n", "invocation seconds line 1 is not '<seconds><TAB><label>'"),
+            ("100\t\n", "invocation seconds line 1 is not '<seconds><TAB><label>'"),
+            ("100\tlib\n\n", "invocation seconds line 2 is not '<seconds><TAB><label>'"),
+        )
+        with scratch() as d:
+            for body, reason in rows:
+                with self.subTest(body=body):
+                    path = Path(d) / "seconds.txt"
+                    if path.exists():
+                        path.unlink()
+                    rc, out, _ = self.seconds(d, body)
+                    self.assertEqual(rc, 2)
+                    self.assertEqual(out, "::error::[#9229 margin] whole sqlite suite: malformed input: %s; "
+                                          "refusing to pass (#9229)\n" % reason)
+
+    def plan(self, d, text, node="ubuntu-latest", tier="sqlite"):
+        path = Path(d) / "ci.yml"
+        if path.exists():
+            path.unlink()
+        if text is not None:
+            path.write_text(text, encoding="utf-8")
+        return run_main(self.sb, ["suite-plan", "--workflow", str(path), "--job", "check", "--node", node,
+                                  "--tier", tier])
+
+    def test_plan_of_the_real_workflow_fits(self):
+        rc, out, _ = run_main(self.sb, ["suite-plan", "--workflow", str(REPO / ".github" / "workflows" / "ci.yml"),
+                                        "--job", "check", "--node", "ubuntu-latest", "--tier", "sqlite"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(out, "::notice::[#9229 margin] whole-suite plan: the 3600s whole-suite ceiling fits the "
+                              "95-minute timeout of job 'check' (node=ubuntu-latest tier=sqlite) with the required "
+                              "20\\x25 margin (at most 4560s)\n")
+
+    def test_a_ceiling_that_cannot_fit_the_job_is_a_named_red_at_derivation(self):
+        with scratch() as d:
+            rc, out, _ = self.plan(d, workflow(legs=(("ubuntu-latest", "sqlite", "74"),)))
+            self.assertEqual(rc, 3)
+            self.assertEqual(out, "::error::[#9229 margin] whole-suite plan refused: the 3600s whole-suite ceiling "
+                                  "(WHOLE_SUITE_CEILING_SECS) does not fit the 74-minute timeout of job 'check' "
+                                  "(node=ubuntu-latest tier=sqlite) with the required 20\\x25 margin (at most 3552s); "
+                                  + ISSUE_NOTE + "; cut the suite cost or shard it, do not raise the ceiling\n")
+            rc, _, _ = self.plan(d, workflow(legs=(("ubuntu-latest", "sqlite", "75"),)))
+            self.assertEqual(rc, 0)  # 75 min = 4500 s, 80 % = 3600 s: the ceiling exactly fits
+            rc, out, _ = self.plan(d, workflow(job_timeout="80"))
+            self.assertEqual(rc, 0)  # a literal job timeout is read as it stands
+            self.assertIn("fits the 80-minute timeout of job 'check'", out)
+
+    def test_absent_or_unreadable_job_timeout_is_named_never_a_pass(self):
+        rows = (
+            (None, {}, "the workflow file cannot be read (FileNotFoundError)"),
+            ("jobs:\n  lint:\n    timeout-minutes: 5\n", {}, "the workflow has no job 'check'"),
+            ("check:\n  timeout-minutes: 5\n", {}, "the workflow has no job 'check'"),
+            (workflow().replace("    timeout-minutes: ${{ matrix.timeout }}\n", ""), {},
+             "job 'check' has no timeout-minutes"),
+            (workflow(job_timeout="soon"), {},
+             "job 'check' timeout-minutes 'soon' is neither an integer of minutes nor ${{ matrix.timeout }}"),
+            (workflow(job_timeout="0"), {},
+             "job 'check' timeout-minutes '0' is neither an integer of minutes nor ${{ matrix.timeout }}"),
+            (workflow(), {"node": "macos-fed"}, "job 'check' has no matrix leg node=macos-fed tier=sqlite"),
+            (workflow(legs=(("ubuntu-latest", "sqlite", None),)), {},
+             "matrix leg node=ubuntu-latest tier=sqlite of job 'check' has no timeout"),
+            (workflow(legs=(("ubuntu-latest", "sqlite", "ninety"),)), {},
+             "matrix leg node=ubuntu-latest tier=sqlite of job 'check' timeout 'ninety' is not a positive "
+             "integer of minutes"),
+            (workflow(legs=(("ubuntu-latest", "sqlite", "-95"),)), {},
+             "matrix leg node=ubuntu-latest tier=sqlite of job 'check' timeout '-95' is not a positive "
+             "integer of minutes"),
+            (workflow(legs=(("ubuntu-latest", "sqlite", "95"), ("ubuntu-latest", "sqlite", "60"))), {},
+             "job 'check' has 2 matrix legs node=ubuntu-latest tier=sqlite"),
+        )
+        with scratch() as d:
+            for text, kwargs, reason in rows:
+                with self.subTest(reason=reason):
+                    rc, out, _ = self.plan(d, text, **kwargs)
+                    self.assertEqual(rc, 2)
+                    self.assertEqual(out, "::error::[#9229 margin] whole-suite plan: malformed input: %s; "
+                                          "refusing to pass (#9229)\n" % reason)
+            bad = Path(d) / "ci.yml"
+            bad.write_bytes(b"\xff\xfe jobs:\n")
+            rc, out, _ = run_main(self.sb, ["suite-plan", "--workflow", str(bad), "--job", "check", "--node",
+                                            "ubuntu-latest", "--tier", "sqlite"])
+            self.assertEqual(rc, 2)
+            self.assertIn("malformed input: the workflow file cannot be read (UnicodeDecodeError)", out)
+
 
 def function_body(text, name):
     m = re.search(r"^(\s*)%s\(\) \{\n" % re.escape(name), text, re.M)
@@ -510,6 +684,13 @@ class Wiring(unittest.TestCase):
                       "--part 1/2", "--part 2/2"):
             self.assertIn(label, body)
         self.assertEqual(body.count("SUITE_MARGIN_GATE=1 run_"), 5)
+        plan = body.index("scripts/ci/suite_budget.py suite-plan")
+        total = body.index("scripts/ci/suite_budget.py suite-sum")
+        self.assertLess(plan, body.index("SUITE_MARGIN_GATE=1 run_"))
+        self.assertLess(body.rindex("SUITE_MARGIN_GATE=1 run_"), total)
+        for fn in ("run_tests", "run_doc_tests"):
+            with self.subTest(fn=fn):
+                self.assertIn("\"$elapsed\" \"$label\" >> \"$SUITE_SECONDS_FILE\"", function_body(CI, fn))
 
     def test_enterprise_shard_chains_carry_no_margin_gate(self):
         for fn in ("run_shard", "run_sharded"):
@@ -539,7 +720,7 @@ exec "%(python)s" "$@"
 class StepExec(unittest.TestCase):
     """Runs the extracted step with a stub cargo (precedent test_ci_test_step_exec_6795)."""
 
-    def run_step(self, meta=None, impact="__ALL__", red_gate=False):
+    def run_step(self, meta=None, impact="__ALL__", red_gate=False, node="ubuntu-latest"):
         with scratch() as d:
             d = Path(d)
             calls = d / "cargo.calls"
@@ -560,13 +741,15 @@ class StepExec(unittest.TestCase):
             env = dict(os.environ)
             env.update({
                 "PATH": "%s:%s" % (bindir, env.get("PATH", "")),
-                "AI_MEMORY_NO_CONFIG": "1", "TIER": "sqlite", "CI_NODE": "ubuntu-latest",
+                "AI_MEMORY_NO_CONFIG": "1", "TIER": "sqlite", "CI_NODE": node,
                 "TEST_IMPACT": impact, "JOB_TIMEOUT_MIN": "95", "JOB_T0": str(int(time.time())),
                 "RUNNER_TEMP": str(d), "GITHUB_ENV": str(d / "env"),
             })
             r = subprocess.run(["bash", str(script)], cwd=str(REPO), env=env, capture_output=True, text=True,
                                timeout=STEP_TIMEOUT_SECS)
             lines = calls.read_text().splitlines() if calls.exists() else []
+            seconds = d / "suite-9229-seconds.txt"
+            self.seconds = seconds.read_text().splitlines() if seconds.exists() else None
             return r, lines
 
     def test_full_suite_runs_four_gated_shards(self):
@@ -583,6 +766,17 @@ class StepExec(unittest.TestCase):
                       "full suite shard 4/4: doc tests"):
             self.assertIn("::notice::[#9229 margin] '%s': margin held: wall 0s of the 2100s budget" % label,
                           r.stdout)
+        self.assertEqual(self.seconds, ["0\tfull suite shard 1/4: lib unit tests",
+                                        "0\tfull suite shard 2/4: bins, integration tests and tested examples, part 1/2",
+                                        "0\tfull suite shard 3/4: bins, integration tests and tested examples, part 2/2",
+                                        "0\tfull suite shard 4/4: doc tests"])
+        self.assertIn("::notice::[#9229 margin] whole-suite plan: the 3600s whole-suite ceiling fits the 95-minute "
+                      "timeout of job 'check'", r.stdout)
+        self.assertIn("::notice::[#9229 margin] whole sqlite suite: 4 invocations ran 0s of the 3600s whole-suite "
+                      "ceiling", r.stdout)
+        self.assertLess(r.stdout.index("whole-suite plan"), r.stdout.index("'full suite shard 1/4"))
+        self.assertLess(r.stdout.index("'full suite shard 4/4: doc tests': margin held"),
+                        r.stdout.index("whole sqlite suite: 4 invocations"))
 
     def test_underivable_shards_fall_back_to_the_one_gated_invocation(self):
         r, calls = self.run_step(meta=None)
@@ -591,6 +785,9 @@ class StepExec(unittest.TestCase):
         self.assertEqual(timed, ["test --no-fail-fast"])
         self.assertIn("::warning::[#9229 margin] shard-args: ", r.stdout + r.stderr)
         self.assertIn("::notice::[#9229 margin] 'full suite (cargo test)': margin held", r.stdout)
+        # The fallback keeps the gate, the doc tests (inside the one cargo test) and the whole-suite ceiling.
+        self.assertEqual(self.seconds, ["0\tfull suite (cargo test)"])
+        self.assertIn("::notice::[#9229 margin] whole sqlite suite: 1 invocations ran 0s", r.stdout)
 
     def test_a_part_that_selects_nothing_falls_back_to_the_one_gated_invocation(self):
         lib = {"kind": ["lib"], "name": "ai_memory", "test": True, "doctest": True}
@@ -608,8 +805,18 @@ class StepExec(unittest.TestCase):
 
     def test_a_red_gate_fails_the_step_even_when_cargo_passed(self):
         r, calls = self.run_step(meta=metadata(), red_gate=True)
-        self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(r.returncode, 3, r.stdout + r.stderr)  # exit 3 reaches the step, never swallowed
         self.assertIn("stub gate red", r.stdout)
+        # A red gate does not stop the later invocations or the whole-suite sum.
+        self.assertEqual(len(self.seconds), 4)
+        self.assertIn("whole sqlite suite: 4 invocations ran", r.stdout)
+
+    def test_a_plan_that_cannot_be_derived_is_red_before_any_test(self):
+        r, calls = self.run_step(meta=metadata(), node="nowhere")
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("::error::[#9229 margin] whole-suite plan: malformed input: job 'check' has no matrix leg "
+                      "node=nowhere tier=sqlite; refusing to pass (#9229)", r.stdout)
+        self.assertEqual([c for c in calls if c.startswith("test ")], [])
 
 
 if __name__ == "__main__":
