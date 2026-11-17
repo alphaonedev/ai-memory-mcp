@@ -42,7 +42,6 @@ import subprocess
 import sys
 import tempfile
 import textwrap
-import threading
 import time
 import unittest
 from pathlib import Path
@@ -344,7 +343,7 @@ class ScriptBehaviour(CommandAssertions):
         module = load_module(CI_DIR / "load_gate.py", "load_gate_9365")
         for key, value in self.hostile_values():
             with self.subTest(key):
-                def unreadable():
+                def unreadable(value=value):
                     raise OSError(value)
 
                 buf = io.StringIO()
@@ -353,7 +352,7 @@ class ScriptBehaviour(CommandAssertions):
                 self.assert_commands(buf.getvalue(), ["warning"])
                 readings = iter([100.0, 100.0])
 
-                def high():
+                def high(readings=readings):
                     return next(readings)
 
                 buf = io.StringIO()
@@ -362,7 +361,7 @@ class ScriptBehaviour(CommandAssertions):
                 self.assert_commands(buf.getvalue(), ["notice", "warning", "notice"])
                 calls = []
 
-                def flaky():
+                def flaky(calls=calls, value=value):
                     calls.append(1)
                     if len(calls) > 1:
                         raise OSError(value)
@@ -1376,6 +1375,8 @@ LOADER_SCAN_ROOT = REPO / "scripts"
 SHARED_STEM = SHARED_MODULE_NAME[:-3]
 LOADER_NAME = "_load_workflow_annotation"
 ERROR_LINE_PLACEHOLDER = "WA_ERROR_LINE"
+REQUIRE_NAME = "require_workflow_annotation"
+DEFERRED_SUPPORT_CLASSES = frozenset({"SharedModuleNotLoadedError", "_NotLoaded"})
 LOADER_SHAPE_EXCEPTIONS = {
     # The single named exception: its floor check (Python >= 3.12) runs before every import, so its load is a
     # function called after the check, executes a fresh module object never put in sys.modules and checks
@@ -1468,6 +1469,14 @@ def loader_shape_violations(rel, source):
     canonical_def, canonical_try = _canonical_nodes()
     defs = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == LOADER_NAME]
     tries = [node for node in tree.body if _is_load_try(node)]
+    container = None  # the importable scripts load inside require_workflow_annotation(), which main calls first
+    requires = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == REQUIRE_NAME]
+    if not tries and len(requires) == 1:
+        inner = [node for node in requires[0].body if _is_load_try(node)]
+        shaped = (len(requires[0].body) == 3 and isinstance(requires[0].body[1], ast.Global)
+                  and requires[0].body[1].names == ["wa"] and requires[0].body[2] is (inner[0] if inner else None))
+        if len(inner) == 1 and shaped:
+            tries, container = inner, requires[0]
     if len(defs) != 1:
         problems.append(f"{rel}: {len(defs)} module-level {LOADER_NAME} definitions (want 1)")
     elif ast.dump(defs[0]) != canonical_def:
@@ -1477,16 +1486,32 @@ def loader_shape_violations(rel, source):
         return problems
     load_try = tries[0]
     settings = {}
-    for node in tree.body[:tree.body.index(load_try)]:
+    anchor = container if container is not None else load_try
+    for node in tree.body[:tree.body.index(anchor)]:
         if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
             settings[node.targets[0].id] = node.value
     for name in WA_SETTINGS:
         if name not in settings:
             problems.append(f"{rel}: {name} is not set before the load try")
     # the loader, the load try and the WA_RELATIVE_PATH value are the only places that may name the module
-    inside = {id(node) for root in (*defs, load_try, *([settings["WA_RELATIVE_PATH"]]
-                                                     if "WA_RELATIVE_PATH" in settings else []))
-              for node in ast.walk(root)}
+    roots = [*defs, load_try, *([settings["WA_RELATIVE_PATH"]] if "WA_RELATIVE_PATH" in settings else [])]
+    if container is not None:
+        mains = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "main"]
+        first = mains[0].body[0] if len(mains) == 1 and mains[0].body else None
+        if not (isinstance(first, ast.Expr) and isinstance(first.value, ast.Call)
+                and isinstance(first.value.func, ast.Name) and first.value.func.id == REQUIRE_NAME):
+            problems.append(f"{rel}: main does not call {REQUIRE_NAME}() as its first statement")
+        else:
+            roots.append(first)
+        roots += [node for node in tree.body if isinstance(node, ast.ClassDef) and node.name in DEFERRED_SUPPORT_CLASSES]
+        roots += [node for node in tree.body if isinstance(node, ast.Assign) and len(node.targets) == 1
+                  and isinstance(node.targets[0], ast.Name) and node.targets[0].id == "wa"
+                  and ast.dump(node.value) == ast.dump(ast.parse("_NotLoaded()").body[0].value)]
+        roots.append(container)
+        if sum(1 for node in ast.walk(tree) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+               and node.func.id == REQUIRE_NAME) != 1:
+            problems.append(f"{rel}: {REQUIRE_NAME}() is not called exactly once")
+    inside = {id(node) for root in roots for node in ast.walk(root)}
     error_literal = None
     handler = load_try.handlers[0] if len(load_try.handlers) == 1 else None
     try:
@@ -1495,7 +1520,7 @@ def loader_shape_violations(rel, source):
             error_literal = call.args[0].value
             call.args[0] = ast.Name(id=ERROR_LINE_PLACEHOLDER, ctx=ast.Load())
     except (AttributeError, IndexError, TypeError):
-        pass
+        problems.append(f"{rel}:{load_try.lineno}: the load try has no readable ::error line")
     if ast.dump(load_try) != canonical_try:
         problems.append(f"{rel}:{load_try.lineno}: the load try differs from the canonical one")
     prog = settings.get("WA_PROG")
@@ -1526,7 +1551,7 @@ def loader_shape_violations(rel, source):
         if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == LOADER_NAME
                 and id(node) not in inside):
             problems.append(f"{rel}:{node.lineno}: calls {LOADER_NAME} outside the load try")
-    for node in tree.body[:tree.body.index(load_try)]:
+    for node in tree.body[:tree.body.index(anchor)]:
         for inner in ast.walk(node):
             if isinstance(inner, ast.Import):
                 modules = [alias.name for alias in inner.names]
@@ -1577,6 +1602,9 @@ class LoaderShape(unittest.TestCase):
             "second loader call": source + "\nwa = _load_workflow_annotation()\n",
             "exit 0 on failure": source.replace("sys.exit(WA_EXIT_LOAD_REFUSED)", "sys.exit(0)", 1),
             "no required check": source.replace("    if missing:\n", "    if False:\n", 1),
+            "load at import time": source + "\nrequire_workflow_annotation()\n",
+            "main without the load": source.replace("def main(argv=None):\n    require_workflow_annotation()\n",
+                                                    "def main(argv=None):\n", 1),
             "interpolated error line": source.replace(
                 'print("::error title=shared_cargo_target refused::', 'print("::error title=%s refused::' % "x", 1),
         }
@@ -1795,7 +1823,9 @@ STREAM_SCRIPT_COUNT = 14
 STREAM_MODULE_VARS = frozenset({"wa"})  # the name every script binds the loaded module to
 # Runs before the shared module exists, so it cannot use it; each output is fixed text pinned by its own test:
 # prune_runner_tmp's floor check (VERSION_REFUSAL_AT_0F1EC1B7 cells) and load refusal (SiblingLoadFailsClosed, P1).
-STREAM_PRELOAD_FUNCTIONS = {"scripts/ci/prune_runner_tmp.py": frozenset({"load_refused"})}
+STREAM_PRELOAD_FUNCTIONS = {"scripts/ci/prune_runner_tmp.py": frozenset({"load_refused"}),
+                            "scripts/ci/partition_test_binaries.py": frozenset({"require_workflow_annotation"}),
+                            "scripts/ci/shared_cargo_target.py": frozenset({"require_workflow_annotation"})}
 STREAM_PRELOAD_GUARD_CALL = "python_refusal"  # a module-level ``if`` that calls it is the floor check
 
 
@@ -2399,19 +2429,19 @@ def boundary_cells():
             for lit in R3_BOUNDARY_LITERALS:
                 base = "b-v%r-l%s-p%r" % (tail, lit, prefix)
                 value = "x" + tail
-                yield base + "-render", "render", lambda: wa.render(prefix + "{v}" + lit, v=value)
-                yield base + "-join", "join", lambda: wa.join(lit, [prefix + value, "y"])
-                yield base + "-annotation", "annotation", lambda: wa.annotation("warning", wa.render("{v}" + lit, v=value))
-                yield base + "-annotation-title", "annotation", lambda: wa.annotation("warning", "m", title=value + lit)
-                yield base + "-log", "log_line", lambda: wa.log_line(prefix + value + lit)
+                yield base + "-render", "render", lambda prefix=prefix, lit=lit, value=value: wa.render(prefix + "{v}" + lit, v=value)
+                yield base + "-join", "join", lambda prefix=prefix, lit=lit, value=value: wa.join(lit, [prefix + value, "y"])
+                yield base + "-annotation", "annotation", lambda lit=lit, value=value: wa.annotation("warning", wa.render("{v}" + lit, v=value))
+                yield base + "-annotation-title", "annotation", lambda lit=lit, value=value: wa.annotation("warning", "m", title=value + lit)
+                yield base + "-log", "log_line", lambda prefix=prefix, lit=lit, value=value: wa.log_line(prefix + value + lit)
         for tail in R3_BOUNDARY_LITERAL_TAILS:
             for value in R3_BOUNDARY_VALUES:
                 base = "b-l%r-v%s-p%r" % (tail, value, prefix)
-                yield base + "-render", "render", lambda: wa.render(prefix + "x" + tail + "{v}", v=value)
-                yield base + "-join", "join", lambda: wa.join("x" + tail, [prefix + "a", value])
-                yield base + "-annotation", "annotation", lambda: wa.annotation("warning", wa.render("x" + tail + "{v}", v=value))
-                yield base + "-annotation-title", "annotation", lambda: wa.annotation("warning", "m", title="x" + tail + value)
-                yield base + "-log", "log_line", lambda: wa.log_line(prefix + "x" + tail + value)
+                yield base + "-render", "render", lambda prefix=prefix, tail=tail, value=value: wa.render(prefix + "x" + tail + "{v}", v=value)
+                yield base + "-join", "join", lambda prefix=prefix, tail=tail, value=value: wa.join("x" + tail, [prefix + "a", value])
+                yield base + "-annotation", "annotation", lambda tail=tail, value=value: wa.annotation("warning", wa.render("x" + tail + "{v}", v=value))
+                yield base + "-annotation-title", "annotation", lambda tail=tail, value=value: wa.annotation("warning", "m", title="x" + tail + value)
+                yield base + "-log", "log_line", lambda prefix=prefix, tail=tail, value=value: wa.log_line(prefix + "x" + tail + value)
 
 
 class CleanBytesAndBoundary(unittest.TestCase):

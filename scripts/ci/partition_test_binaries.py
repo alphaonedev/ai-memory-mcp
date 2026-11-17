@@ -83,16 +83,35 @@ WA_REQUIRED = ("annotation", "log_line")
 WA_EXIT_LOAD_REFUSED = EXIT_FAIL_CLOSED  # the gate's own refusal code, unchanged
 WA_ERROR_TO_STDERR = False
 
-try:
-    wa = _load_workflow_annotation()
-except (Exception, SystemExit) as exc:  # any failed load: one fixed line built without the module, then exit
-    wa_cause = type(exc).__name__
-    print("%s: refused: shared module workflow_annotation.py next to the script cannot be loaded (%s)"
-          % (WA_PROG, wa_cause if wa_cause.isidentifier() else "BaseException"), file=sys.stderr, flush=True)
-    print("::error title=partition_test_binaries refused::partition_test_binaries: refused: shared module workflow_annotation.py"
-          " next to the script cannot be loaded",
-          file=sys.stderr if WA_ERROR_TO_STDERR else sys.stdout, flush=True)
-    sys.exit(WA_EXIT_LOAD_REFUSED)
+
+class SharedModuleNotLoadedError(RuntimeError):
+    """A function that needs workflow_annotation.py ran before require_workflow_annotation() loaded it."""
+
+
+class _NotLoaded:
+    """The state of ``wa`` until the load ran: any use is a named error, never a half-working helper."""
+
+    def __getattr__(self, name):
+        raise SharedModuleNotLoadedError("workflow_annotation.py is not loaded; call require_workflow_annotation() "
+                                         "first (wanted %s)" % name)
+
+
+wa = _NotLoaded()
+
+
+def require_workflow_annotation():
+    """Load the shared module into ``wa`` or refuse: main calls it before any work, so importing prints nothing."""
+    global wa
+    try:
+        wa = _load_workflow_annotation()
+    except (Exception, SystemExit) as exc:  # any failed load: one fixed line built without the module, then exit
+        wa_cause = type(exc).__name__
+        print("%s: refused: shared module workflow_annotation.py next to the script cannot be loaded (%s)"
+              % (WA_PROG, wa_cause if wa_cause.isidentifier() else "BaseException"), file=sys.stderr, flush=True)
+        print("::error title=partition_test_binaries refused::partition_test_binaries: refused: shared module workflow_annotation.py"
+              " next to the script cannot be loaded",
+              file=sys.stderr if WA_ERROR_TO_STDERR else sys.stdout, flush=True)
+        sys.exit(WA_EXIT_LOAD_REFUSED)
 
 # Class (a) evidence. Scout report CI-SHARD-SCOUT-2026-10-09, plus the shared
 # lane-database helpers under tests/common that only Postgres cells use.
@@ -1370,6 +1389,7 @@ def build_parser():
 
 
 def main(argv=None):
+    require_workflow_annotation()
     args = build_parser().parse_args(argv)
     try:
         return run(args)

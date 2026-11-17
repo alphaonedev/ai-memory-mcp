@@ -62,16 +62,35 @@ WA_REQUIRED = ("env_file_value", "log_line")
 WA_EXIT_LOAD_REFUSED = 3  # a failed shared-module load; no other meaning in this script
 WA_ERROR_TO_STDERR = False
 
-try:
-    wa = _load_workflow_annotation()
-except (Exception, SystemExit) as exc:  # any failed load: one fixed line built without the module, then exit
-    wa_cause = type(exc).__name__
-    print("%s: refused: shared module workflow_annotation.py next to the script cannot be loaded (%s)"
-          % (WA_PROG, wa_cause if wa_cause.isidentifier() else "BaseException"), file=sys.stderr, flush=True)
-    print("::error title=shared_cargo_target refused::shared_cargo_target: refused: shared module workflow_annotation.py"
-          " next to the script cannot be loaded",
-          file=sys.stderr if WA_ERROR_TO_STDERR else sys.stdout, flush=True)
-    sys.exit(WA_EXIT_LOAD_REFUSED)
+
+class SharedModuleNotLoadedError(RuntimeError):
+    """A function that needs workflow_annotation.py ran before require_workflow_annotation() loaded it."""
+
+
+class _NotLoaded:
+    """The state of ``wa`` until the load ran: any use is a named error, never a half-working helper."""
+
+    def __getattr__(self, name):
+        raise SharedModuleNotLoadedError("workflow_annotation.py is not loaded; call require_workflow_annotation() "
+                                         "first (wanted %s)" % name)
+
+
+wa = _NotLoaded()
+
+
+def require_workflow_annotation():
+    """Load the shared module into ``wa`` or refuse: main calls it before any work, so importing prints nothing."""
+    global wa
+    try:
+        wa = _load_workflow_annotation()
+    except (Exception, SystemExit) as exc:  # any failed load: one fixed line built without the module, then exit
+        wa_cause = type(exc).__name__
+        print("%s: refused: shared module workflow_annotation.py next to the script cannot be loaded (%s)"
+              % (WA_PROG, wa_cause if wa_cause.isidentifier() else "BaseException"), file=sys.stderr, flush=True)
+        print("::error title=shared_cargo_target refused::shared_cargo_target: refused: shared module workflow_annotation.py"
+              " next to the script cannot be loaded",
+              file=sys.stderr if WA_ERROR_TO_STDERR else sys.stdout, flush=True)
+        sys.exit(WA_EXIT_LOAD_REFUSED)
 
 TARGET_ROOT_RELATIVE = Path(".cache") / "ai-memory-ci" / "cargo-target"
 ENV_NAME = "CARGO_TARGET_DIR"
@@ -182,6 +201,7 @@ def runner_target_dir(home, runner_name):
 
 
 def main(argv=None):
+    require_workflow_annotation()
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--home", default=str(Path.home()), help="runner user home")
     parser.add_argument("--runner-name", default=None, help="runner name (required)")
