@@ -2313,7 +2313,9 @@ jobs:
                 sleep 300 >/dev/null 2>&1
                 # #9430: the log tails are pull-request text; workflow_annotation.render escapes each once, so no line
                 # break, %, :: or ##[ of a test log reaches the runner. Bound: 3 x 90 bytes x <= 6 escape chars + template.
-                python3 -I -c 'import sys; sys.path.insert(0, "scripts/ci"); import workflow_annotation as wa; print(wa.annotation("notice", wa.render("[#6344] progress | serial: {s} | parallel_1: {p1} | parallel_2: {p2}", s=sys.argv[1], p1=sys.argv[2], p2=sys.argv[3]), max_chars=2 * wa.MAX_ANNOTATION_CHARS), flush=True)' "$(tail -n 1 "$sd/serial.log" 2>/dev/null | cut -c1-90)" "$(tail -n 1 "$sd/parallel_1.log" 2>/dev/null | cut -c1-90)" "$(tail -n 1 "$sd/parallel_2.log" 2>/dev/null | cut -c1-90)"
+                # `cut -c` cuts bytes: argv is re-read as UTF-8 (surrogateescape, so a stray byte shows as \udcXX) and the
+                # line is written as UTF-8 in any locale. set -e is live here: a failed call is reported, never ends the loop.
+                python3 -I -c 'import os, sys; sys.path.insert(0, "scripts/ci"); import workflow_annotation as wa; sys.argv[1:] = [os.fsencode(v).decode("utf-8", "surrogateescape") for v in sys.argv[1:]]; sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace"); print(wa.annotation("notice", wa.render("[#6344] progress | serial: {s} | parallel_1: {p1} | parallel_2: {p2}", s=sys.argv[1], p1=sys.argv[2], p2=sys.argv[3]), max_chars=2 * wa.MAX_ANNOTATION_CHARS), flush=True)' "$(tail -n 1 "$sd/serial.log" 2>/dev/null | cut -c1-90)" "$(tail -n 1 "$sd/parallel_1.log" 2>/dev/null | cut -c1-90)" "$(tail -n 1 "$sd/parallel_2.log" 2>/dev/null | cut -c1-90)" || echo "[#6344] progress notice not written: python3 exited $?" >&2
               done ) &
             hb=$!
             # Wait on each PID separately: a bare `wait` discards the exit codes.

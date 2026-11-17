@@ -20,6 +20,12 @@ logs in a scratch directory. Lines are split with ``str.splitlines`` (a superset
 CRLF split); a line is a command when it starts with ``::`` after leading whitespace (runner TryParseV2) or
 holds ``##[`` anywhere (runner TryParse).
 
+Byte class (cells a-c, the generative cell, under the C.UTF-8, C, POSIX, unset and a Latin-1 locale): every byte
+string of a log tail gives exit 0, an empty stderr and exactly one valid UTF-8 ``::notice::`` line; a byte that is
+not part of a whole UTF-8 character shows as the escape ``\\udcXX``. Cell d runs the step's own heartbeat lines under
+the step's shell options (``bash --noprofile --norc -eo pipefail`` + ``set -euo pipefail``) with a python3 stub that
+exits 1 and asserts the loop keeps going and the step's exit code is unchanged.
+
 Run: python3 -m unittest scripts/ci/tests/test_ci_progress_notice_9430.py
 """
 
@@ -28,6 +34,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -101,6 +108,92 @@ OTHER_LINES = {
     "escape_lookalike": b"\\x0d::warning::forged \\u2028",
 }
 
+# Byte class (#9430 bytes lane): `cut -c` cuts BYTES, so a tail can end inside a UTF-8 character and a test can
+# print any byte. The python call re-reads argv as UTF-8 with surrogateescape and writes UTF-8 whatever the
+# locale, so a byte that is not part of a whole UTF-8 character reaches the notice in the ESCAPED form
+# ``\udcXX`` (its surrogateescape code point, written by workflow_annotation.safe_text); control bytes are
+# escaped as ``\xHH``; a whole UTF-8 character is written as itself.
+LATIN1_LOCALE = "en_US.ISO-8859-1"  # a non-UTF-8 locale, built with localedef into the scratch directory
+LOCALEDEF_SOURCE = ("-i", "en_US", "-f", "ISO-8859-1")
+UNSET_LOCALE = "unset"  # LANG, LANGUAGE and every LC_* removed from the environment
+LOCALES = ("C.UTF-8", "C", "POSIX", UNSET_LOCALE, LATIN1_LOCALE)
+GENERATIVE_LOCALES = ("C.UTF-8", LATIN1_LOCALE)
+LOCALE_ENV_KEYS = ("LANG", "LANGUAGE", "LOCPATH")
+SURROGATE_ESCAPE = "\\udc%02x"
+BYTE_FILLER = "test store tests a ... ok"  # no ':', '#', '%', '\\' or control byte: kept verbatim by render
+MULTIBYTE_CHARS = {"2byte_U+00E9": "é", "3byte_U+20AC": "€", "4byte_U+1F600": "\U0001f600"}
+WHOLE_CHAR_LEAD = 10  # a whole character this far before the cut is written as itself
+LONE_BYTE = 0xFF
+CONTINUATION_BYTE = 0x80
+NUL_BYTE = 0x00  # excluded from the generative cell: argv is a C string, it cannot carry NUL
+BYTE_VALUES = 256
+PRINTABLE_ASCII = range(0x20, 0x7F)
+EXPECTED_LINES = 1
+
+# Cell (d): the heartbeat loop under the step's own shell options, with a python3 stub that fails.
+STEP_SHELL = "bash"
+STEP_SHELL_COMMAND = ("bash", "--noprofile", "--norc", "-eo", "pipefail")  # GitHub's command for `shell: bash`
+STEP_OPTIONS_LINE = "set -euo pipefail"  # first line of the step's run text
+HB_PID_LINE = "hb=$!"
+HB_KILL_LINE = 'kill "$hb" 2>/dev/null || true'
+HB_WAIT_LINE = 'wait "$hb" 2>/dev/null || true'
+MIN_ITERATIONS = 3
+FAILING_STUB_RC = 1
+PASSING_STUB_RC = 0
+STUB_TICK_SECS = 0.02  # the stub sleep, for `sleep 300`
+AWAIT_DEADLINE_SECS = 5.0
+STEP_END_MARKER = "step-reached-end"
+FALLBACK_RE = re.compile(r"\[#6344\] progress notice not written: python3 exited (?P<rc>\d+)")
+PYTHON3_STUB = """#!{exe} -I
+import os, sys
+with open(os.environ["HB_CALLS"], "a") as calls:
+    calls.write("call\\n")
+sys.exit(int(os.environ["HB_STUB_RC"]))
+"""
+SLEEP_STUB = """#!{exe} -I
+import os, time
+time.sleep(float(os.environ["HB_TICK"]))
+"""
+AWAIT_STUB = """#!{exe} -I
+import os, time
+deadline = time.monotonic() + float(os.environ["HB_DEADLINE"])
+while time.monotonic() < deadline:
+    try:
+        with open(os.environ["HB_CALLS"]) as calls:
+            if calls.read().count("\\n") >= int(os.environ["HB_MIN"]):
+                break
+    except FileNotFoundError:
+        pass
+    time.sleep(0.01)
+"""
+
+
+def multibyte_cases():
+    """(name, last-line bytes, expected serial field) for a 2-, 3- and 4-byte character straddling byte 90."""
+    cases = []
+    for char_name, char in MULTIBYTE_CHARS.items():
+        encoded = char.encode()
+        for kept in range(1, len(encoded)):
+            line = ("a" * (CUT_BYTES - kept) + char + "zz").encode()
+            field = "a" * (CUT_BYTES - kept) + "".join(SURROGATE_ESCAPE % byte for byte in encoded[:kept])
+            cases.append(("%s/kept_%d_of_%d" % (char_name, kept, len(encoded)), line, field))
+        whole = "a" * WHOLE_CHAR_LEAD + char + "zz"
+        cases.append(("%s/whole" % char_name, whole.encode(), whole))
+    return cases
+
+
+def lone_byte_cases(value):
+    """(name, last-line bytes, expected serial field) for one byte at the start, middle and end of the filler."""
+    raw = bytes([value])
+    escaped = SURROGATE_ESCAPE % value
+    mid = len(BYTE_FILLER) // 2
+    filler = BYTE_FILLER.encode()
+    return [
+        ("start", raw + filler, escaped + BYTE_FILLER),
+        ("middle", filler[:mid] + raw + filler[mid:], BYTE_FILLER[:mid] + escaped + BYTE_FILLER[mid:]),
+        ("end", filler + raw, BYTE_FILLER + escaped),
+    ]
+
 
 def hostile_line(form, brk, position):
     """One last log line: a line break and a command form at the start, middle or end of a test line."""
@@ -147,6 +240,35 @@ def heartbeat_body():
     raise AssertionError("no heartbeat loop holds %r" % HEARTBEAT_MARKER)
 
 
+def heartbeat_step():
+    """The one ci.yml step that holds the progress heartbeat, as parsed by PyYAML."""
+    workflow = yaml.safe_load(CI_YML.read_text())
+    steps = [step for job in workflow["jobs"].values() for step in job.get("steps", [])
+             if HEARTBEAT_MARKER in (step.get("run") or "")]
+    if len(steps) != 1:
+        raise AssertionError("expected one ci.yml step with %r, found %d" % (HEARTBEAT_MARKER, len(steps)))
+    return steps[0]
+
+
+def heartbeat_lifecycle(run_text):
+    """The step's own lines that start, kill and reap the heartbeat: the whole loop (sleep included) + `hb=$!`, then
+    the kill and wait lines. Each is taken verbatim from the run text."""
+    lines = run_text.split("\n")
+    stripped = [line.strip() for line in lines]
+    for start, line in enumerate(stripped):
+        if line != LOOP_OPEN:
+            continue
+        end = stripped.index(LOOP_CLOSE, start)
+        if not any(HEARTBEAT_MARKER in body_line for body_line in lines[start:end]):
+            continue
+        if stripped[end + 1] != HB_PID_LINE:
+            raise AssertionError("the heartbeat loop is not followed by %r" % HB_PID_LINE)
+        kill = stripped.index(HB_KILL_LINE, end)
+        reap = stripped.index(HB_WAIT_LINE, kill)
+        return "\n".join(lines[start:end + 2]), lines[kill], lines[reap]
+    raise AssertionError("no heartbeat loop holds %r" % HEARTBEAT_MARKER)
+
+
 def unescape(text):
     """Undo the workflow_annotation escapes once (``\\\\``, ``\\xHH``, ``\\uHHHH``) and return the bytes."""
     def one(match):
@@ -181,14 +303,31 @@ class ProgressNotice(unittest.TestCase):
         if str(cls.scratch).startswith(str(SCRATCH_PARENT)):
             shutil.rmtree(cls.scratch, ignore_errors=True)
 
-    def run_heartbeat(self, name, logs):
+    def locale_env(self, locale):
+        """The environment for one locale cell; the Latin-1 locale is built once with localedef (fails, never skips)."""
+        env = {key: value for key, value in os.environ.items()
+               if key not in LOCALE_ENV_KEYS and not key.startswith("LC_")}
+        if locale == UNSET_LOCALE:
+            return env
+        env["LC_ALL"] = locale
+        if locale == LATIN1_LOCALE:
+            locpath = self.scratch / "locales"
+            if not (locpath / LATIN1_LOCALE).is_dir():
+                locpath.mkdir(exist_ok=True)
+                built = subprocess.run(["localedef", *LOCALEDEF_SOURCE, str(locpath / LATIN1_LOCALE)],
+                                       capture_output=True, text=True, check=False)
+                self.assertEqual(built.returncode, 0, "localedef %s: %s" % (" ".join(LOCALEDEF_SOURCE), built.stderr))
+            env["LOCPATH"] = str(locpath)
+        return env
+
+    def run_heartbeat(self, name, logs, locale="C.UTF-8"):
         """Write `logs` ({shard: bytes or None for a missing file}), run the loop body once, return the output."""
         shard_dir = self.scratch / re.sub(r"[^A-Za-z0-9_]", "_", name)
         shard_dir.mkdir()
         for shard, content in logs.items():
             if content is not None:
                 (shard_dir / ("%s.log" % shard)).write_bytes(content)
-        env = dict(os.environ, LC_ALL="C.UTF-8")
+        env = self.locale_env(locale)
         script = "sd=%s\n%s\n" % (shlex.quote(str(shard_dir)), self.body)
         started = time.monotonic()
         result = subprocess.run(["bash", "-c", script], cwd=str(REPO), env=env, capture_output=True,
@@ -247,6 +386,128 @@ class ProgressNotice(unittest.TestCase):
         result, expected = self.run_heartbeat("empty", {"serial": b"", "parallel_1": None, "parallel_2": b"\n"})
         self.assertEqual(expected, {shard: b"" for shard in SHARD_LOGS})
         self.assert_one_notice("empty", result, expected)
+
+    # ---- byte class (#9430 bytes lane) ----
+
+    def byte_notice(self, name, result, expected):
+        """rc 0, empty stderr, stdout exactly one valid UTF-8 line with the fixed prefix; return the parsed match."""
+        self.assertEqual(result.returncode, 0, "%s: rc, stderr %r" % (name, result.stderr))
+        self.assertEqual(result.stderr, b"", "%s: stderr must be empty (no traceback, no fallback)" % name)
+        try:
+            text = result.stdout.decode("utf-8")
+        except UnicodeDecodeError as error:
+            self.fail("%s: stdout is not valid UTF-8 (%s): %r" % (name, error, result.stdout))
+        self.assertTrue(text.endswith("\n"), "%s: %r" % (name, text))
+        self.assertEqual(text.count("\n"), EXPECTED_LINES, "%s: %r" % (name, text))
+        self.assertEqual(len(text.splitlines()), EXPECTED_LINES, "%s: %r" % (name, text))
+        line = text[:-1]
+        self.assertTrue(line.startswith(NOTICE_PREFIX), "%s: %r" % (name, line))
+        match = NOTICE_RE.fullmatch(line)
+        self.assertIsNotNone(match, "%s: %r" % (name, line))
+        for shard in SHARD_LOGS:
+            self.assertEqual(unescape(match.group(shard)), expected[shard], "%s: %s data of %r" % (name, shard, line))
+        return match
+
+    def run_byte_cells(self, cell, cases, locales):
+        """Run `cases` ([(name, last-line bytes, expected serial field or None)]) three per run, under each locale."""
+        for locale in locales:
+            for index in range(0, len(cases), len(SHARD_LOGS)):
+                group = cases[index:index + len(SHARD_LOGS)]
+                while len(group) < len(SHARD_LOGS):
+                    group.append(("filler", BYTE_FILLER.encode(), BYTE_FILLER))
+                name = "%s/%s/%s" % (cell, locale, "+".join(case[0] for case in group))
+                logs = {shard: b"running 3 tests\n" + case[1] + b"\n" for shard, case in zip(SHARD_LOGS, group)}
+                with self.subTest(name):
+                    result, expected = self.run_heartbeat("%s_%s_%03d" % (cell, locale, index), logs, locale)
+                    match = self.byte_notice(name, result, expected)
+                    for shard, case in zip(SHARD_LOGS, group):
+                        if case[2] is not None:
+                            self.assertEqual(match.group(shard), case[2], "%s: %s field" % (name, shard))
+                        else:
+                            outside = [char for char in match.group(shard) if ord(char) not in PRINTABLE_ASCII]
+                            self.assertEqual(outside, [], "%s: %s field %r" % (name, shard, match.group(shard)))
+
+    def test_9430_bytes_a_multibyte_cut_at_byte_90(self):
+        # The dangling lead bytes of a cut character appear escaped as \udcXX; a whole character as itself.
+        self.run_byte_cells("a", multibyte_cases(), LOCALES)
+
+    def test_9430_bytes_b_lone_ff(self):
+        self.run_byte_cells("b", lone_byte_cases(LONE_BYTE), LOCALES)
+
+    def test_9430_bytes_c_continuation_run(self):
+        run = bytes([CONTINUATION_BYTE]) * CUT_BYTES
+        self.assertNotIn(b"\x00", run)
+        self.assertEqual(len(run), CUT_BYTES)
+        cases = [("run_0x80_x90", run, (SURROGATE_ESCAPE % CONTINUATION_BYTE) * CUT_BYTES)]
+        self.run_byte_cells("c", cases, LOCALES)
+
+    def test_9430_bytes_generative_every_single_byte(self):
+        # Every byte value but NUL (argv is a C string and cannot carry it; bash drops NUL from a command
+        # substitution, covered by OTHER_LINES["nul_then_cr"]) at the start, middle and end of a line. Exact data
+        # round trip, and every character of the field is printable ASCII: a lone byte is never written raw.
+        cases = []
+        for value in range(BYTE_VALUES):
+            if value == NUL_BYTE:
+                continue
+            for position, line, _field in lone_byte_cases(value):
+                cases.append(("0x%02x_%s" % (value, position), line, None))
+        self.assertEqual(len(cases), (BYTE_VALUES - 1) * len(POSITIONS))
+        self.run_byte_cells("g", cases, GENERATIVE_LOCALES)
+
+    def run_lifecycle(self, name, stub_rc):
+        """Run the step's heartbeat start/kill/reap lines under the step's shell options with stubbed python3/sleep."""
+        step = heartbeat_step()
+        loop, kill_line, wait_line = heartbeat_lifecycle(step["run"])
+        cell_dir = self.scratch / name
+        stub_dir = cell_dir / "bin"
+        stub_dir.mkdir(parents=True)
+        for stub_name, source in (("python3", PYTHON3_STUB), ("sleep", SLEEP_STUB), ("await-ticks", AWAIT_STUB)):
+            stub = stub_dir / stub_name
+            stub.write_text(source.format(exe=sys.executable))
+            stub.chmod(0o755)
+        calls = cell_dir / "calls"
+        script = cell_dir / "step.sh"
+        script.write_text("\n".join([
+            STEP_OPTIONS_LINE,
+            "heartbeat_cell() {",
+            "  local sd=\"$1\" hb",
+            loop,
+            "  await-ticks",
+            kill_line,
+            wait_line,
+            "}",
+            "heartbeat_cell %s" % shlex.quote(str(cell_dir)),
+            "echo %s" % STEP_END_MARKER,
+            "",
+        ]))
+        env = dict(os.environ, PATH="%s:%s" % (stub_dir, os.environ["PATH"]), HB_CALLS=str(calls),
+                   HB_STUB_RC=str(stub_rc), HB_TICK=str(STUB_TICK_SECS), HB_DEADLINE=str(AWAIT_DEADLINE_SECS),
+                   HB_MIN=str(MIN_ITERATIONS))
+        result = subprocess.run([*STEP_SHELL_COMMAND, str(script)], cwd=str(REPO), env=env, capture_output=True,
+                                timeout=RUN_CEILING_SECS, check=False)
+        count = calls.read_text().count("\n") if calls.exists() else 0
+        return step, result, count
+
+    def test_9430_bytes_d_failed_call_keeps_loop_and_step_rc(self):
+        step, control, control_calls = self.run_lifecycle("d_control", PASSING_STUB_RC)
+        self.assertEqual(step.get("shell"), STEP_SHELL)
+        self.assertEqual(step["run"].split("\n")[0], STEP_OPTIONS_LINE)
+        self.assertEqual(control.returncode, 0, control.stderr)
+        self.assertEqual(control.stdout.decode().splitlines(), [STEP_END_MARKER])
+        self.assertEqual(control.stderr, b"")
+        self.assertGreaterEqual(control_calls, MIN_ITERATIONS)
+        _step, failing, failing_calls = self.run_lifecycle("d_failing", FAILING_STUB_RC)
+        self.assertGreaterEqual(failing_calls, MIN_ITERATIONS,
+                                "a failing python3 call ended the heartbeat loop after %d call(s)" % failing_calls)
+        self.assertEqual(failing.returncode, control.returncode, failing.stderr)
+        self.assertEqual(failing.stdout, control.stdout)
+        errors = failing.stderr.decode().splitlines()
+        self.assertGreaterEqual(len(errors), MIN_ITERATIONS - 1, errors)
+        for error in errors:
+            match = FALLBACK_RE.fullmatch(error)
+            self.assertIsNotNone(match, "stderr line %r" % error)
+            self.assertEqual(match.group("rc"), str(FAILING_STUB_RC))
+        self.assertEqual(command_lines(failing.stdout + failing.stderr), [])
 
 
 if __name__ == "__main__":
