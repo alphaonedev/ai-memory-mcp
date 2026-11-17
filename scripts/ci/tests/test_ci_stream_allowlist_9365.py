@@ -969,6 +969,13 @@ class ExactListCells(unittest.TestCase):
                          ["x.yml: 'echo \"::warning::$name\"': 2 such lines, the row says 1"])
         self.assertEqual(yaml_exempt_problems(base, {("x.yml", self.WF_LINE): (2, YAML_PR4_REASON)}), [])
 
+    def test_a_yaml_row_above_its_line_count_is_red_9365(self):
+        # The count is an equality: a row that says more copies than the workflow holds must be lowered.
+        base = self.tree("over", {"x.yml": "    run: |\n      %s\n" % self.WF_LINE})
+        rows = {("x.yml", self.WF_LINE): (2, YAML_PR4_REASON)}
+        self.assertEqual(yaml_exempt_problems(base, rows),
+                         ["x.yml: 'echo \"::warning::$name\"': 1 such lines, the row says 2"])
+
     def test_a_line_separator_does_not_split_a_workflow_line_9365(self):
         # YAML and the runner end a line only at \r\n, \r or \n. str.splitlines() also splits at \u2028, so one
         # physical line holding a listed line twice would pass as two copies of the listed line.
