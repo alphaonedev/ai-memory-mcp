@@ -425,6 +425,128 @@ fn v064_legacy_rows_physically_lacking_v070_columns_upgrade_losslessly() {
     }
 
     assert_guards_enforce_after_upgrade(&conn);
+    drop(conn);
+    replay_9273_on_upgraded_store(&path);
+}
+
+/// `SQLITE_CORRUPT_VTAB` (`SQLITE_CORRUPT | (1 << 8)`), the #9273 code.
+const SQLITE_CORRUPT_VTAB_UPG: i32 = 267;
+const INTEGRITY_CHECK_UPG: &str =
+    "INSERT INTO memories_fts(memories_fts, rank) VALUES('integrity-check', 1)";
+/// Fresh random keys per replay (the tokens of a base64 key decide whether a
+/// later FTS5 'delete' trips over a desync), per `recursive_triggers` setting.
+const REPLAYS_UPG: usize = 4;
+const FAR_FUTURE_UPG: &str = "2099-01-01T00:00:00Z";
+
+fn fts_check_upg(conn: &Connection) -> Result<(), i32> {
+    match conn.execute_batch(INTEGRITY_CHECK_UPG) {
+        Ok(()) => Ok(()),
+        Err(rusqlite::Error::SqliteFailure(e, _)) => Err(e.extended_code),
+        Err(other) => panic!("integrity-check failed with a non-SQLite error: {other}"),
+    }
+}
+
+fn sqlite_code_upg(err: &anyhow::Error) -> Option<i32> {
+    err.chain()
+        .find_map(|cause| match cause.downcast_ref::<rusqlite::Error>() {
+            Some(rusqlite::Error::SqliteFailure(e, _)) => Some(e.extended_code),
+            _ => None,
+        })
+}
+
+/// One replay of the #9273 CI sequence (plant a flat-bound roster row, bind
+/// the legitimate key, merge the federated copy through `insert_if_newer`)
+/// on an already-open connection, with the FTS5 integrity-check after every
+/// step. Returns the first violation as `(step, code)`.
+fn replay_9273_sequence_upg(conn: &Connection, tag: &str) -> Result<(), (&'static str, i32)> {
+    use ai_memory::models::field_names;
+    let victim = format!("ai:legacy-upgrade-victim-{tag}");
+    let plant_id = format!("legacy-upgrade-plant-{tag}");
+    let attacker_key =
+        ai_memory::identity::keypair::generate(&format!("ai:legacy-upgrade-attacker-{tag}"))
+            .expect("keypair")
+            .public_base64();
+    let as_code = |step: &'static str, e: &anyhow::Error| {
+        let code = sqlite_code_upg(e).unwrap_or_else(|| panic!("{step}: non-SQLite error {e:#}"));
+        (step, code)
+    };
+    let created = ai_memory::identity::attest::now_attestable_rfc3339();
+    let metadata = json!({
+        "agent_id": victim,
+        (field_names::AGENT_PUBKEY): attacker_key,
+        (field_names::PUBKEY_BOUND_AT): created,
+        (field_names::WRITE_SIGNATURE): "forged-carried-signature",
+        (field_names::ATTEST_LEVEL): "agent_attested",
+    });
+    let planted = Memory {
+        id: plant_id.clone(),
+        tier: Tier::Long,
+        namespace: ai_memory::models::AGENTS_NAMESPACE.to_string(),
+        title: ai_memory::models::agent_registration_title(&victim),
+        content: serde_json::to_string(&metadata).expect("mirror"),
+        created_at: created.clone(),
+        updated_at: created,
+        metadata,
+        ..Memory::default()
+    };
+    db::insert(conn, &planted).map_err(|e| as_code("insert", &e))?;
+    fts_check_upg(conn).map_err(|code| ("insert+integrity-check", code))?;
+    let legitimate = ai_memory::identity::keypair::generate(&victim).expect("keypair");
+    db::bind_agent_pubkey_with_keypair(conn, &victim, &legitimate)
+        .map_err(|e| as_code("bind", &e))?;
+    fts_check_upg(conn).map_err(|code| ("bind+integrity-check", code))?;
+    let mut federated = db::get(conn, &plant_id)
+        .expect("read bound row")
+        .expect("bound row present");
+    federated.updated_at = FAR_FUTURE_UPG.to_string();
+    federated
+        .metadata
+        .as_object_mut()
+        .expect("metadata object")
+        .insert(
+            field_names::AGENT_PUBKEY.to_string(),
+            serde_json::Value::String(attacker_key),
+        );
+    federated.content = serde_json::to_string(&federated.metadata).expect("mirror");
+    db::insert_if_newer(conn, &federated).map_err(|e| as_code("insert_if_newer", &e))?;
+    fts_check_upg(conn).map_err(|code| ("insert_if_newer+integrity-check", code))?;
+    Ok(())
+}
+
+/// Ruling b430ff48 item 3: the guards the v102 rung re-installed on the
+/// upgraded legacy store keep `memories_fts` in step under the #9273 replay,
+/// `recursive_triggers` OFF (production default) and ON, and the index passes
+/// its integrity-check after every step. Any violation is the defect; a
+/// violation must be the exact code 267.
+fn replay_9273_on_upgraded_store(path: &std::path::Path) {
+    let mut violations = Vec::new();
+    for recursive in [false, true] {
+        let conn = db::open(path).expect("re-open the upgraded legacy store");
+        let pragma = if recursive {
+            "PRAGMA recursive_triggers=ON"
+        } else {
+            "PRAGMA recursive_triggers=OFF"
+        };
+        conn.execute_batch(pragma).expect("recursive_triggers");
+        fts_check_upg(&conn).expect("the upgraded store's index passes before the replay");
+        for replay in 0..REPLAYS_UPG {
+            let tag = format!("{recursive}-{replay}");
+            if let Err((step, code)) = replay_9273_sequence_upg(&conn, &tag) {
+                assert_eq!(
+                    code, SQLITE_CORRUPT_VTAB_UPG,
+                    "recursive={recursive} replay={replay} {step}"
+                );
+                violations.push(format!(
+                    "recursive={recursive} replay={replay} at {step}: code {code}"
+                ));
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "memories_fts out of step on the upgraded legacy store:\n{}",
+        violations.join("\n")
+    );
 }
 
 /// The re-installed v102 guards enforce on the upgraded legacy store: the
