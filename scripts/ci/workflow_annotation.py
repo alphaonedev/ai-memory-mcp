@@ -8,10 +8,11 @@ line or change the command's properties. Every script goes through this module:
   ``MAX_ANNOTATION_CHARS`` long, message through ``safe_text``, property values through ``property_value``.
 * ``safe_text(text)``: message text. Control characters, backslash, ``%``, surrogates and U+2028/9 become
   visible backslash escapes; in every run of colons each ``:`` followed by ``:`` becomes ``\\x3a``; a ``#``
-  that is last or precedes ``#``/``[`` becomes ``\\x23`` and a ``[`` that follows ``#`` becomes ``\\x5b``. So
-  the result holds no line break, no ``%`` (nothing the runner percent-decodes), no ``::`` and no ``##[``; no
-  ``##[`` forms with a literal or escaped value after it, and before it only a literal ending in ``##`` could
-  complete one (none exists in the scripts: the stream ratchet's literal cell).
+  that precedes ``#``/``[`` becomes ``\\x23`` and a ``[`` that follows ``#`` becomes ``\\x5b``. So the result
+  holds no line break, no ``%`` (nothing the runner percent-decodes), no ``::`` and no ``##[``. A ``#`` that
+  ends the value is kept (``C#``, ``issue #``): a ``##[`` that forms across a boundary (a value ending in ``#``
+  before a literal or value that starts ``#[``, or a literal ending in ``##`` before a value that starts ``[``)
+  is broken where the line is finished, by ``annotation``, ``render``, ``join`` and ``log_line``.
 * Runner rule (actions/runner ``src/Runner.Common/ActionCommand.cs``): the v2 form is a line that starts with
   ``::`` after leading whitespace (``TryParseV2``); the v1 form is ``##[`` ANYWHERE in the line (``TryParse``,
   ``IndexOf("##[")``, no trim). ``annotation``, ``render``, ``join`` and ``log_line`` also break every ``##[``
@@ -52,11 +53,11 @@ def safe_text(text):
     """Escape control characters, backslashes, ``%``, colon runs and ``##[`` pieces so a value cannot start a command.
 
     Each rule is decided on the raw characters, so it holds wherever the result is placed: a ``:`` followed by ``:``
-    becomes ``\\x3a`` (no ``::`` is left in any run of colons); a ``#`` that is the last character or precedes ``#`` or
-    ``[`` becomes ``\\x23``, and a ``[`` that follows ``#`` becomes ``\\x5b``. So no ``##[`` is left inside, none forms
-    with a following literal or a following escaped value, and a leading ``[`` stays readable (``[Errno 13]``,
-    ``[label]``): only a literal ending in ``##`` before the value could complete one, and the stream ratchet keeps
-    every such literal out of the scripts. No escape contains ``#``, ``[`` or ``:``.
+    becomes ``\\x3a`` (no ``::`` is left in any run of colons); a ``#`` that precedes ``#`` or ``[`` becomes ``\\x23``,
+    and a ``[`` that follows ``#`` becomes ``\\x5b``. So no ``##[`` is left inside and a leading ``[`` stays readable
+    (``[Errno 13]``, ``[label]``). A value that ends in ``#`` keeps it (``C#``): a ``##[`` that forms across a boundary
+    is broken by the finishing functions (``_break_v1``), and the stream ratchet keeps literals ending in ``##`` out of
+    the scripts. No escape contains ``#``, ``[`` or ``:``.
     """
     text = str(text)
     last = len(text) - 1
@@ -65,7 +66,7 @@ def safe_text(text):
         code = ord(char)
         if char == ":" and index < last and text[index + 1] == ":":
             pieces.append(ESCAPED_COLON)
-        elif char == "#" and (index == last or text[index + 1] in V1_BREAK_AFTER_HASH):
+        elif char == "#" and index < last and text[index + 1] in V1_BREAK_AFTER_HASH:
             pieces.append(ESCAPED_HASH)
         elif char == "[" and index > 0 and text[index - 1] == "#":
             pieces.append(ESCAPED_BRACKET)
