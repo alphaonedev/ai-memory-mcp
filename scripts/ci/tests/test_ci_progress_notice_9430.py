@@ -7,13 +7,48 @@ Class: text a pull request controls (the last line of a shard test log) is echoe
 workflow-command line. A line break inside that text ends the notice and the runner parses the rest as a
 new command made of pull-request data (``::warning::``, ``::add-mask::``, ``::stop-commands::``, ``##[...]``).
 
-Invariant for all inputs: whatever bytes the three shard logs hold, the progress heartbeat writes exactly one
-line the runner can parse as a command; it starts with the fixed ``::notice::`` prefix, holds no ``%`` (nothing
-the runner percent-decodes), and after one unescape of the ``scripts/ci/workflow_annotation.py`` escapes each
-data field equals, byte for byte, the first 90 bytes of the log's last line (``tail -n 1 <log> | cut -b1-90``; bash
-command substitution drops NUL bytes and trailing newlines, so the oracle does too). The oracle is computed in Python
-from the log bytes (``last_line[:CUT_BYTES]``), never by running the host's ``cut``: uutils ``cut`` (the ubuntu-26.04
-runner) and BSD ``cut`` cut characters for ``-c`` in a UTF-8 locale, so only ``-b`` gives the same bytes everywhere.
+Invariant for all inputs: whatever the three shard log paths hold (any bytes, any size, a missing or unreadable file,
+a directory, a FIFO, a device), the progress heartbeat writes exactly one line the runner can parse as a command,
+never blocks and never ends the loop; the line starts with the fixed ``::notice::`` prefix, holds no ``%`` (nothing
+the runner percent-decodes), and after one unescape of the ``scripts/ci/workflow_annotation.py`` escapes each data
+field equals, byte for byte, the bounded last line of its log cut to CUT_BYTES (``bounded_field``):
+
+- the reader reads back at most READ_BOUND bytes from the end of a regular file (opened ``rb`` with ``O_NONBLOCK``,
+  ``fstat`` + ``S_ISREG`` on the open file; anything else is an empty field);
+- last line = the bytes after the last line feed that is not the final byte; when the line starts inside the window
+  (or the window starts at byte 0) the field is its first CUT_BYTES bytes, otherwise (the window holds no line feed
+  before the final byte) the field is the last CUT_BYTES bytes of the window, its final line feed dropped;
+- NUL, CR and every other byte are kept and escaped (no shell command substitution is on the path any more).
+
+The oracle is computed in Python from the whole log bytes (``bounded_field``), never by a host tool, and every
+heartbeat cell runs with a PATH that holds only ``python3``, so the notice cannot depend on a host text tool. The
+host text tools met while this class was open (#9430, each named with its evidence line):
+
+- GNU coreutils on f2: ``tail (GNU coreutils) 9.4`` / ``cut (GNU coreutils) 9.4``; ``tail -n 1`` returned every probe
+  case whole and ``cut -c`` cut bytes in every locale.
+- uutils coreutils on the ubuntu-26.04 runner image: ``tail (uutils coreutils) 0.10.0`` / ``cut (uutils coreutils)
+  0.10.0``; ``tail -n 1`` of a one-line file of exactly 65536 bytes printed 0 bytes and of a 1 MiB one-line file with
+  no final newline 983040 bytes; ``printf 'aaaa\\xc3\\xa9z\\n' | LC_ALL=C.UTF-8 cut -c1-5`` printed
+  ``a a a a 303 251`` (characters, not bytes).
+- BSD text_cmds on f1 (macOS 27.0.1): ``what /usr/bin/cut`` -> ``PROGRAM:cut  PROJECT:text_cmds-199`` (tail the same
+  project); ``printf 'aaaa\\303\\251z\\n' | LC_ALL=en_US.UTF-8 cut -c1-5`` printed ``a a a a é`` (characters);
+  ``tail -n 1`` of a one-line 65536-byte file printed 65536 bytes.
+
+Host-tool differences found, the reason the notice reads the logs itself (conductor word a3ff9997):
+
+=============================  ==========================  =============================================================
+difference                     implementation              evidence line
+=============================  ==========================  =============================================================
+``cut -c`` cuts characters     uutils 0.10.0 (runner)      ``printf 'aaaa\\xc3\\xa9z\\n' | LC_ALL=C.UTF-8 cut -c1-5`` ->
+                                                           ``a a a a 303 251`` (6 bytes, not 5)
+``cut -c`` cuts characters     BSD text_cmds-199 (f1)      ``printf 'aaaa\\303\\251z\\n' | LC_ALL=en_US.UTF-8 cut -c1-5`` ->
+                                                           ``a a a a é``
+``tail -n 1`` loses bytes      uutils 0.10.0 (runner)      one-line 65536-byte file -> 0 bytes; 1 MiB one-line file, no
+at 64 KiB                                                  final newline -> 983040 bytes
+=============================  ==========================  =============================================================
+
+``test_9430_fix_no_host_text_tool_between_call_and_args`` holds that the step text from the ``python3 -I`` call to the
+end of its arguments names no host text tool; the 90-byte cut is the named constant CUT_BYTES inside the python call.
 
 The test parses ci.yml with PyYAML (required, as in test_pgbouncer_smoke_compose_4734.py), takes the
 ``run`` text of the one step that holds the ``[#6344] progress`` heartbeat, cuts the body of its
@@ -27,11 +62,16 @@ string of a log tail gives exit 0, an empty stderr and exactly one valid UTF-8 `
 not part of a whole UTF-8 character shows as the escape ``\\udcXX``. Cell d runs the step's own heartbeat lines under
 the step's shell options (``bash --noprofile --norc -eo pipefail`` + ``set -euo pipefail``) once per failure form of
 the notice command (python3 exits 1, is killed by a signal, is missing, stderr is closed, stdout is closed) and asserts
-the loop keeps going, the step's exit code is unchanged and the fallback writes to stderr only, never a command.
+the loop keeps going, the step's exit code is unchanged and the fallback writes to stderr only, never a command. The
+lifecycle cells count loop passes with the stubbed ``sleep`` (one per pass), with only stubs on PATH.
 
-Fix-r1 cells: the exact heartbeat text (``cut -b1-90`` on each of the three tails, ``python3 -I -c``, the fallback
-that cannot fail); a ``cut`` stub that cuts characters for ``-c`` in a UTF-8 locale (uutils / BSD behaviour) placed
-first on PATH; planted ``sitecustomize``, ``usercustomize``, ``os`` and ``workflow_annotation`` modules on
+Fix-r1 cells: the exact heartbeat text (one ``python3 -I -c`` call whose argv is the three log paths, the named read
+bound and cut constants, ``rb`` + ``O_NONBLOCK`` + ``S_ISREG``, ``scripts/ci`` the only added path, no host text tool,
+the fallback that cannot fail); hostile ``tail`` / ``cut`` / ``sed`` / ... stubs first on PATH are never run; the
+reader cells (sizes 0, 1, 65535-65537, READ_BOUND - 1 .. + 1, 1 MiB, each with and without a final line feed; missing,
+unreadable, FIFO with and without a writer, directory, character device, a log that grows between ticks,
+CRLF, a ``::error::`` line, NUL bytes, a cut inside a multi-byte sequence at either end, a sparse 2 GiB log under an
+address-space ceiling, which the kernel may not apply on macOS); planted ``sitecustomize``, ``usercustomize``, ``os`` and ``workflow_annotation`` modules on
 PYTHONPATH, in the user site and in the working directory that ``-I`` keeps out; the exact worst-case line length.
 
 Run: python3 -m unittest scripts/ci/tests/test_ci_progress_notice_9430.py
@@ -49,7 +89,9 @@ import unittest
 from pathlib import Path
 
 import importlib.util
+import resource
 import signal
+import stat
 
 import yaml  # required: the guard fails, never skips, without it
 
@@ -83,7 +125,8 @@ NOTICE_RE = re.compile(
 V2_COMMAND = "::"
 V1_COMMAND = "##["
 RUNNER_PERCENT = "%"
-CUT_BYTES = 90  # the heartbeat keeps the first 90 bytes of each last line (`cut -b1-90`: bytes on GNU, uutils, BSD)
+CUT_BYTES = 90  # the reader keeps 90 bytes of each last line (CUT_BYTES in the step's python call)
+READ_BOUND = 8192  # the reader reads back at most this many bytes from the end of each log (READ_BYTES in the step)
 ESCAPE_RE = re.compile(r"\\(?:(\\)|x([0-9a-f]{2})|u([0-9a-f]{4}))")
 
 RUN_CEILING_SECS = 10.0  # one heartbeat run, every input size below included
@@ -149,15 +192,20 @@ MULTIBYTE_CHARS = {"2byte_U+00E9": "é", "3byte_U+20AC": "€", "4byte_U+1F600":
 WHOLE_CHAR_LEAD = 10  # a whole character this far before the cut is written as itself
 LONE_BYTE = 0xFF
 CONTINUATION_BYTE = 0x80
-NUL_BYTE = 0x00  # excluded from the generative cell: argv is a C string, it cannot carry NUL
-BYTE_VALUES = 256
+BYTE_VALUES = 256  # every byte value, NUL included: the reader gets bytes from the file, never through argv
 PRINTABLE_ASCII = range(0x20, 0x7F)
 EXPECTED_LINES = 1
 
-# Fix-r1 (class A, B, C): the exact heartbeat text. A `-c` cut is byte-exact only on GNU cut, so a `-c` mutant would
-# survive on a GNU host without the exact-string cell; the char-cut stub cell kills it on any host.
-TAIL_CUT = '"$(tail -n 1 "$sd/%%s.log" 2>/dev/null | cut -b1-%d)"' % CUT_BYTES
-CHAR_CUT = "cut -c"
+# Fix-r1 (class A, B, C): the exact heartbeat text. The log PATHS are the argv of the one python3 call; no host text
+# tool is on the notice path (uutils tail 0.10.0 loses bytes at 64 KiB, uutils and BSD cut -c cut characters).
+LOG_ARGV = " ".join('"$sd/%s.log"' % shard for shard in SHARD_LOGS)
+READ_BOUND_RE = re.compile(r"^\s*READ_BYTES = ([0-9]+)\s*(?:#.*)?$", re.MULTILINE)
+CUT_BYTES_RE = re.compile(r"^\s*CUT_BYTES = ([0-9]+)\s*(?:#.*)?$", re.MULTILINE)
+READER_FORMS = ('"rb"', "os.O_NONBLOCK", "os.fstat(", "stat.S_ISREG(", "except OSError:")
+ADDED_PATH = 'sys.path.insert(0, "scripts/ci")'
+SYS_PATH = "sys.path"
+COMMAND_SUBSTITUTION = "$("
+HOST_TEXT_TOOLS = ("tail", "cut", "sed", "head", "awk", "grep", "cat", "tr", "dd", "od", "perl", "xargs")
 PYTHON_ISOLATED = "python3 -I -c '"
 PYTHON_NOT_ISOLATED = "python3 -c '"
 FALLBACK_TEXT = '|| { echo "[#6344] progress notice not written: python3 exited $?" >&2 || true; }'
@@ -168,9 +216,8 @@ NOTICE_MAX_CHARS = 2 * wa.MAX_ANNOTATION_CHARS  # the bound the heartbeat passes
 
 # Class D: the exact worst case. Each field is CUT_BYTES of the byte whose escape is longest; the line is the empty
 # template plus that growth for every field, and must stay under NOTICE_MAX_CHARS with no cut mark.
-FIRST_NON_NUL_BYTE = 0x01
 BYTE_ESCAPE_CHARS = {value: len(wa.safe_value(bytes([value]).decode("utf-8", "surrogateescape")))
-                     for value in range(FIRST_NON_NUL_BYTE, BYTE_VALUES)}
+                     for value in range(BYTE_VALUES)}
 MAX_ESCAPE_CHARS = max(BYTE_ESCAPE_CHARS.values())
 WORST_BYTE = min(value for value, chars in BYTE_ESCAPE_CHARS.items() if chars == MAX_ESCAPE_CHARS)
 TEMPLATE_LINE_CHARS = len(wa.annotation("notice", wa.render(NOTICE_TEMPLATE, s="", p1="", p2=""),
@@ -179,15 +226,16 @@ WORST_LINE_CHARS = TEMPLATE_LINE_CHARS + len(SHARD_LOGS) * CUT_BYTES * MAX_ESCAP
 
 # Cell (d): the heartbeat loop under the step's own shell options, with a python3 stub that fails.
 STEP_SHELL = "bash"
+BASH = shutil.which(STEP_SHELL)  # resolved on the host PATH; the heartbeat runs get a PATH with only python3
 STEP_SHELL_COMMAND = ("bash", "--noprofile", "--norc", "-eo", "pipefail")  # GitHub's command for `shell: bash`
 STEP_OPTIONS_LINE = "set -euo pipefail"  # first line of the step's run text
 HB_PID_LINE = "hb=$!"
 HB_KILL_LINE = 'kill "$hb" 2>/dev/null || true'
 HB_WAIT_LINE = 'wait "$hb" 2>/dev/null || true'
 MIN_ITERATIONS = 3
-# await-ticks waits for the tails of one iteration past MIN_ITERATIONS: the loop is sequential, so the tails of
-# iteration k + 1 start only after the python3 call and fallback of iteration k are done, and the kill cannot
-# land between the last counted tail and its python3 call.
+# Each loop pass starts with one (stubbed) sleep; await-ticks waits for the sleep of one pass past MIN_ITERATIONS: the
+# loop is sequential, so pass k + 1 sleeps only after the python3 call and fallback of pass k are done, and passes
+# completed = sleeps - 1.
 AWAIT_ITERATIONS = MIN_ITERATIONS + 1
 FAILING_STUB_RC = 1
 PASSING_STUB_RC = 0
@@ -197,8 +245,8 @@ STUB_TICK_SECS = 0.02  # the stub sleep, for `sleep 300`
 AWAIT_DEADLINE_SECS = 5.0
 STEP_END_MARKER = "step-reached-end"
 FALLBACK_RE = re.compile(r"\[#6344\] progress notice not written: python3 exited (?P<rc>\d+)")
-# Every python3 call writes one line to HB_CALLS; the tail wrapper counts loop iterations (3 tails each) in every
-# form, python3 missing included.
+# Every python3 call writes one line to HB_CALLS; the sleep stub counts loop passes in every form, python3 missing
+# included.
 PYTHON3_STUB = """#!{exe} -I
 import os, signal, sys
 with open(os.environ["HB_CALLS"], "a") as calls:
@@ -206,12 +254,6 @@ with open(os.environ["HB_CALLS"], "a") as calls:
 if os.environ["HB_STUB_MODE"] == "signal":
     os.kill(os.getpid(), signal.SIGKILL)
 sys.exit(int(os.environ["HB_STUB_RC"]))
-"""
-TAIL_STUB = """#!{exe} -I
-import os, sys
-with open(os.environ["HB_TAILS"], "a") as tails:
-    tails.write("tail\\n")
-os.execv(os.environ["HB_REAL_TAIL"], ["tail", *sys.argv[1:]])
 """
 # python3 per failure form: "stub" (PYTHON3_STUB), "absent" (no python3 on PATH), "real" (the interpreter itself).
 PY_STUB = "stub"
@@ -228,32 +270,33 @@ FAILURE_FORMS = {
     "stderr_closed": (PY_STUB, "exit", FAILING_STUB_RC, CLOSE_STDERR, None, False),
     "stdout_closed": (PY_REAL, "exit", FAILING_STUB_RC, CLOSE_STDOUT, FAILING_STUB_RC, True),
 }
-PATH_TOOLS = ("cut",)  # linked into the stub PATH; tail is wrapped, sleep stubbed, the rest are bash builtins
 
-# Class A: a cut that behaves like uutils / BSD cut (characters for -c in a UTF-8 locale, bytes for -b).
-CHAR_CUT_STUB = """#!{exe} -I
-import os, re, signal, sys
-# A native cut dies silently on SIGPIPE when its reader is gone (the killed heartbeat loop); Python ignores it.
-signal.signal(signal.SIGPIPE, signal.SIG_DFL)
-match = re.fullmatch(r"-([bc])1-([0-9]+)", sys.argv[1]) if len(sys.argv) == 2 else None
-if match is None:
-    sys.stderr.write("cut stub: unsupported arguments %r\\n" % (sys.argv[1:],))
-    sys.exit(2)
-mode, width = match.group(1), int(match.group(2))
-# LC_ALL, then LANG: the stub interpreter itself sets LC_CTYPE=C.UTF-8 under a C or unset locale (PEP 538 coercion).
-locale = os.environ.get("LC_ALL") or os.environ.get("LANG") or ""
-utf8 = re.search(r"utf-?8", locale, re.IGNORECASE) is not None
-data = sys.stdin.buffer.read()
-lines = data.split(b"\\n")
-if data.endswith(b"\\n"):
-    lines.pop()
-for line in lines:
-    if mode == "c" and utf8:
-        line = line.decode("utf-8", "surrogateescape")[:width].encode("utf-8", "surrogateescape")
-    else:
-        line = line[:width]
-    sys.stdout.buffer.write(line + b"\\n")
+# Class A: a hostile host text tool. Each stub records that it ran and prints a forged command; the notice must not
+# run any of them (every heartbeat cell has only python3 on PATH; this cell puts the stubs first).
+HOST_TOOL_STUB = """#!{exe} -I
+import os, sys
+with open(os.path.join(os.environ["HB_TOOL_MARKERS"], "ran-" + os.path.basename(sys.argv[0])), "w") as marker:
+    marker.write("ran\\n")
+sys.stdout.write("::warning::forged-by-host-tool\\n")
 """
+
+# Reader cells (RULING b2bb1090 section B). Sizes of a one-line log, each with and without a final line feed.
+SIZE_CELLS = (0, 1, 65535, 65536, 65537, READ_BOUND - 1, READ_BOUND, READ_BOUND + 1, BIG_LINE_BYTES)
+# A header line before a last line that fills the window to within a byte of the bound (the line-start edge).
+EDGE_SIZES = (READ_BOUND - 2, READ_BOUND - 1, READ_BOUND, READ_BOUND + 1)
+EDGE_HEADER = b"running 3 tests\n"
+SIZE_PATTERN = bytes(range(0x21, 0x7F))  # printable, no line feed, a distinct byte at every offset mod 94
+SPARSE_LOG_BYTES = 2 * 1024 * 1024 * 1024
+SPARSE_TAIL = b"\ntest sparse::tail ... ok\n"
+ADDRESS_SPACE_CEILING = 512 * 1024 * 1024  # RLIMIT_AS of the heartbeat run on the sparse log (reading it whole fails)
+CHAR_DEVICE = Path("/dev/zero")  # an endless character device behind a log path
+UNREADABLE_MODE = 0o000
+FIFO_DATA = b"::error::forged-through-a-fifo\n"
+GROW_STEPS = (b"test a ... ok\n", b"::error::forged-mid-line", b" ok\n::warning::next\n", b"x" * (2 * READ_BOUND))
+CRLF_LOG = b"running 3 tests\r\ntest a ... ok\r\n"
+ERROR_ONLY_LOG = b"running 3 tests\n::error::forged-by-test-output\n"
+NUL_LOG = b"running 3 tests\n\x00test\x00a ... \x00ok\x00\n"
+LONG_MULTIBYTE_LOG = b"a" * READ_BOUND + "é".encode() + b"b" * (CUT_BYTES - 1)  # the last-90 window cuts the é
 
 # Class C: modules -I must keep out. Each writes a marker named after itself when it runs.
 PLANT_SOURCE = """import os as _os
@@ -267,6 +310,8 @@ PLANTED_IN_CWD = ("workflow_annotation", "sitecustomize", "os")
 PLANTS_LIVE_WITHOUT_ISOLATION = ("sitecustomize", "usercustomize")
 SLEEP_STUB = """#!{exe} -I
 import os, time
+with open(os.environ["HB_SLEEPS"], "a") as sleeps:
+    sleeps.write("sleep\\n")
 time.sleep(float(os.environ["HB_TICK"]))
 """
 AWAIT_STUB = """#!{exe} -I
@@ -392,19 +437,42 @@ def last_line(data):
     return lines[-1] if lines else b""
 
 
-def selected_text(log_path):
-    """Oracle, in Python from the bytes: what `$(tail -n 1 <log> | cut -b1-90)` hands the heartbeat, i.e. the first
-    CUT_BYTES bytes of the last line with NUL bytes and trailing LFs dropped. A missing log selects nothing."""
-    data = log_path.read_bytes() if log_path.exists() else b""
-    return last_line(data)[:CUT_BYTES].replace(b"\x00", b"").rstrip(b"\n")
+def bounded_field(data):
+    """Oracle, from the WHOLE log bytes (not a re-implementation of the reader's window walk): the field the reader
+    gives for a regular file holding `data`. The last line (without its final line feed) is whole in the read-back
+    window when the file fits the window or the line feed before the line lies inside it; then the field is its first
+    CUT_BYTES bytes. Otherwise the window holds no line feed before its final byte and the field is the last
+    CUT_BYTES bytes of the line. Every byte is kept (NUL and CR included)."""
+    line = last_line(data)
+    final_newline = int(data.endswith(b"\n"))
+    if len(data) <= READ_BOUND or len(line) + final_newline + 1 <= READ_BOUND:
+        return line[:CUT_BYTES]
+    return line[-CUT_BYTES:]
 
 
-def host_cut(data, locale_env):
-    """What the host's `tail -n 1 | cut -b1-90` selects for `data` in one locale (cross-check, never the oracle)."""
-    tail = subprocess.run(["tail", "-n", "1"], input=data, env=locale_env, capture_output=True, check=True).stdout
-    cut = subprocess.run(["cut", "-b1-%d" % CUT_BYTES], input=tail, env=locale_env, capture_output=True,
-                         check=True).stdout
-    return cut.replace(b"\x00", b"").rstrip(b"\n")
+def oracle_field(log_path):
+    """The expected field for one log path: empty for a missing, unreadable or non-regular path (a directory, a
+    FIFO, a device), else ``bounded_field`` of its bytes."""
+    try:
+        info = os.stat(log_path)
+    except OSError:
+        return b""
+    if not stat.S_ISREG(info.st_mode) or not os.access(log_path, os.R_OK):
+        return b""
+    return bounded_field(log_path.read_bytes())
+
+
+def size_line(size):
+    """A one-line log body of `size` bytes with no line feed and a distinct byte at every offset."""
+    return (SIZE_PATTERN * (size // len(SIZE_PATTERN) + 1))[:size]
+
+
+def address_space_ceiling():
+    """preexec_fn of the sparse-log run: cap the address space (setrlimit failure tolerated, see the module doc)."""
+    try:
+        resource.setrlimit(resource.RLIMIT_AS, (ADDRESS_SPACE_CEILING, ADDRESS_SPACE_CEILING))
+    except (OSError, ValueError):
+        pass
 
 
 def command_lines(output):
@@ -420,10 +488,19 @@ class ProgressNotice(unittest.TestCase):
         cls.body = heartbeat_body(cls.step["run"])
         SCRATCH_PARENT.mkdir(exist_ok=True)
         cls.scratch = Path(tempfile.mkdtemp(prefix="progress-notice-9430-", dir=str(SCRATCH_PARENT)))
+        # The PATH of every heartbeat run: python3 only, so a host text tool on the notice path fails on every host.
+        cls.python_bin = cls.scratch / "python-only-bin"
+        cls.python_bin.mkdir()
+        (cls.python_bin / "python3").symlink_to(sys.executable)
 
     @classmethod
     def tearDownClass(cls):
         if str(cls.scratch).startswith(str(SCRATCH_PARENT)):
+            for path in cls.scratch.rglob("*"):
+                if path.is_dir() and not path.is_symlink():
+                    path.chmod(0o755)
+                elif path.is_file() and not path.is_symlink():
+                    path.chmod(0o644)
             shutil.rmtree(cls.scratch, ignore_errors=True)
 
     def locale_env(self, locale):
@@ -443,25 +520,49 @@ class ProgressNotice(unittest.TestCase):
             env["LOCPATH"] = str(locpath)
         return env
 
+    def shard_dir(self, name):
+        """A new, empty shard directory for one cell."""
+        shard_dir = self.scratch / re.sub(r"[^A-Za-z0-9_]", "_", name)
+        shard_dir.mkdir()
+        return shard_dir
+
+    def run_bounded(self, name, argv, cwd, env, preexec_fn=None):
+        """Run `argv` in its own session under the wall ceiling; on a timeout kill the whole group and fail."""
+        started = time.monotonic()
+        with subprocess.Popen(argv, cwd=str(cwd), env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, start_new_session=True, preexec_fn=preexec_fn) as process:
+            try:
+                stdout, stderr = process.communicate(timeout=RUN_CEILING_SECS)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.communicate()
+                self.fail("%s: the heartbeat run passed the %.0f s wall ceiling (blocked)" % (name, RUN_CEILING_SECS))
+        self.assertLess(time.monotonic() - started, RUN_CEILING_SECS, name)
+        return subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
+
+    def run_in(self, name, shard_dir, locale="C.UTF-8", body=None, cwd=REPO, extra_env=None, expected=None,
+               preexec_fn=None):
+        """Run the loop body once against `shard_dir` (PATH = python3 only unless `extra_env` sets it).
+
+        Returns (result, expected); `expected` defaults to the oracle field of each log path at the end of the run."""
+        env = self.locale_env(locale)
+        env["PATH"] = str(self.python_bin)
+        env.update(extra_env or {})
+        script = "sd=%s\n%s\n" % (shlex.quote(str(shard_dir)), self.body if body is None else body)
+        result = self.run_bounded(name, [BASH, "-c", script], cwd, env, preexec_fn)
+        if expected is None:
+            expected = {shard: oracle_field(shard_dir / ("%s.log" % shard)) for shard in SHARD_LOGS}
+        return result, expected
+
     def run_heartbeat(self, name, logs, locale="C.UTF-8", body=None, cwd=REPO, extra_env=None):
         """Write `logs` ({shard: bytes or None for a missing file}), run the loop body once, return the output.
 
         `body` defaults to the step's own loop body; `extra_env` is merged over the locale environment."""
-        shard_dir = self.scratch / re.sub(r"[^A-Za-z0-9_]", "_", name)
-        shard_dir.mkdir()
+        shard_dir = self.shard_dir(name)
         for shard, content in logs.items():
             if content is not None:
                 (shard_dir / ("%s.log" % shard)).write_bytes(content)
-        env = self.locale_env(locale)
-        env.update(extra_env or {})
-        script = "sd=%s\n%s\n" % (shlex.quote(str(shard_dir)), self.body if body is None else body)
-        started = time.monotonic()
-        result = subprocess.run(["bash", "-c", script], cwd=str(cwd), env=env, capture_output=True,
-                                timeout=RUN_CEILING_SECS, check=False)
-        elapsed = time.monotonic() - started
-        self.assertLess(elapsed, RUN_CEILING_SECS, name)
-        expected = {shard: selected_text(shard_dir / ("%s.log" % shard)) for shard in SHARD_LOGS}
-        return result, expected
+        return self.run_in(name, shard_dir, locale, body, cwd, extra_env)
 
     def assert_one_notice(self, name, result, expected):
         output = result.stdout + result.stderr
@@ -494,15 +595,19 @@ class ProgressNotice(unittest.TestCase):
         self.assertEqual(expected["serial"], line[:CUT_BYTES])
         self.assert_one_notice("oracle", result, expected)
 
-    def test_9430_fix_host_cut_b_agrees_with_python_oracle_in_every_locale(self):
-        # Cross-check only: the oracle is Python; the host's `cut -b` must select the same bytes in every locale.
-        lines = [case[1] for case in multibyte_cases()] + [bytes([LONE_BYTE]) * (2 * CUT_BYTES)]
-        for locale in LOCALES:
-            env = self.locale_env(locale)
-            for index, line in enumerate(lines):
-                data = b"running 3 tests\n" + line + b"\n"
-                with self.subTest(locale=locale, line=index):
-                    self.assertEqual(host_cut(data, env), last_line(data)[:CUT_BYTES])
+    def test_9430_fix_reader_field_is_locale_independent(self):
+        # The cut is by bytes in Python: the same logs give the same notice bytes in every locale, equal to the oracle.
+        lines = [case[1] for case in multibyte_cases()] + [bytes([LONE_BYTE]) * (2 * CUT_BYTES), LONG_MULTIBYTE_LOG]
+        for index, line in enumerate(lines):
+            logs = {shard: b"running 3 tests\n" + line + b"\n" for shard in SHARD_LOGS}
+            outputs = {}
+            for locale in LOCALES:
+                name = "locale_%s_%03d" % (locale, index)
+                with self.subTest(name):
+                    result, expected = self.run_heartbeat(name, logs, locale)
+                    self.byte_notice(name, result, expected)
+                    outputs[locale] = result.stdout
+            self.assertEqual(len(set(outputs.values())), 1, "line %d: %r" % (index, outputs))
 
     def test_one_megabyte_single_line_within_ceiling(self):
         unit = b"\r::warning::forged-by-test-output ##[error]x %0A "
@@ -520,7 +625,7 @@ class ProgressNotice(unittest.TestCase):
 
     def test_9430_fix_worst_case_reaches_exact_bound(self):
         # Class D: every field at the longest escape reaches WORST_LINE_CHARS exactly (below NOTICE_MAX_CHARS, no cut
-        # mark); one byte more per field (bound + 1 input byte) changes nothing, because only CUT_BYTES reach python.
+        # mark); one byte more per field (bound + 1 input byte) changes nothing, because the reader keeps CUT_BYTES.
         self.assertLess(WORST_LINE_CHARS, NOTICE_MAX_CHARS)
         for extra in (0, 1):
             logs = {shard: bytes([WORST_BYTE]) * (CUT_BYTES + extra) + b"\n" for shard in SHARD_LOGS}
@@ -594,30 +699,28 @@ class ProgressNotice(unittest.TestCase):
         self.run_byte_cells("c", cases, LOCALES)
 
     def test_9430_bytes_generative_every_single_byte(self):
-        # Every byte value but NUL (argv is a C string and cannot carry it; bash drops NUL from a command
-        # substitution, covered by OTHER_LINES["nul_then_cr"]) at the start, middle and end of a line. Exact data
-        # round trip, and every character of the field is printable ASCII: a lone byte is never written raw.
+        # Every byte value, NUL included (the reader takes the bytes from the file, not through argv), at the start,
+        # middle and end of a line. Exact data round trip, and every character of the field is printable ASCII: a lone
+        # byte is never written raw.
         cases = []
         for value in range(BYTE_VALUES):
-            if value == NUL_BYTE:
-                continue
             for position, line, _field in lone_byte_cases(value):
                 cases.append(("0x%02x_%s" % (value, position), line, None))
-        self.assertEqual(len(cases), (BYTE_VALUES - 1) * len(POSITIONS))
+        self.assertEqual(len(cases), BYTE_VALUES * len(POSITIONS))
         self.run_byte_cells("g", cases, GENERATIVE_LOCALES)
 
     def run_lifecycle(self, name, stub_rc, python3=PY_STUB, stub_mode="exit", redirect=CLOSE_NONE):
         """Run the step's heartbeat start/kill/reap lines under the step's shell options with stubbed python3/sleep.
 
-        PATH holds only the stub directory (python3 per `python3`, a counting tail wrapper, sleep, await-ticks and
-        a link to the host cut). `redirect` is applied to the call of the heartbeat function (closed stderr or
-        stdout reach the loop and the notice command). Returns (step, result, python3 calls, loop iterations)."""
+        PATH holds only the stub directory (python3 per `python3`, a sleep that counts loop passes, await-ticks).
+        `redirect` is applied to the call of the heartbeat function (closed stderr or stdout reach the loop and the
+        notice command). Returns (step, result, python3 calls, completed loop passes)."""
         step = self.step
         loop, kill_line, wait_line = heartbeat_lifecycle(step["run"])
         cell_dir = self.scratch / name
         stub_dir = cell_dir / "bin"
         stub_dir.mkdir(parents=True)
-        stubs = [("sleep", SLEEP_STUB), ("await-ticks", AWAIT_STUB), ("tail", TAIL_STUB)]
+        stubs = [("sleep", SLEEP_STUB), ("await-ticks", AWAIT_STUB)]
         if python3 == PY_STUB:
             stubs.append(("python3", PYTHON3_STUB))
         for stub_name, source in stubs:
@@ -626,10 +729,8 @@ class ProgressNotice(unittest.TestCase):
             stub.chmod(0o755)
         if python3 == PY_REAL:
             (stub_dir / "python3").symlink_to(sys.executable)
-        for tool in PATH_TOOLS:
-            (stub_dir / tool).symlink_to(shutil.which(tool))
         calls = cell_dir / "calls"
-        tails = cell_dir / "tails"
+        sleeps = cell_dir / "sleeps"
         script = cell_dir / "step.sh"
         script.write_text("\n".join([
             STEP_OPTIONS_LINE,
@@ -644,15 +745,14 @@ class ProgressNotice(unittest.TestCase):
             "echo %s" % STEP_END_MARKER,
             "",
         ]))
-        env = dict(os.environ, PATH=str(stub_dir), HB_CALLS=str(calls), HB_TAILS=str(tails),
-                   HB_REAL_TAIL=shutil.which("tail"), HB_STUB_RC=str(stub_rc), HB_STUB_MODE=stub_mode,
-                   HB_TICK=str(STUB_TICK_SECS), HB_DEADLINE=str(AWAIT_DEADLINE_SECS),
-                   HB_MIN=str(AWAIT_ITERATIONS * len(SHARD_LOGS)))
-        env["HB_CALLS_WAIT"] = env["HB_TAILS"]
-        result = subprocess.run([shutil.which(STEP_SHELL_COMMAND[0]), *STEP_SHELL_COMMAND[1:], str(script)],
-                                cwd=str(REPO), env=env, capture_output=True, timeout=RUN_CEILING_SECS, check=False)
+        env = dict(os.environ, PATH=str(stub_dir), HB_CALLS=str(calls), HB_SLEEPS=str(sleeps),
+                   HB_STUB_RC=str(stub_rc), HB_STUB_MODE=stub_mode, HB_TICK=str(STUB_TICK_SECS),
+                   HB_DEADLINE=str(AWAIT_DEADLINE_SECS), HB_MIN=str(AWAIT_ITERATIONS))
+        env["HB_CALLS_WAIT"] = env["HB_SLEEPS"]
+        result = self.run_bounded(name, [shutil.which(STEP_SHELL_COMMAND[0]), *STEP_SHELL_COMMAND[1:], str(script)],
+                                  REPO, env)
         count = calls.read_text().count("\n") if calls.exists() else 0
-        iterations = (tails.read_text().count("\n") if tails.exists() else 0) // len(SHARD_LOGS)
+        iterations = max(0, (sleeps.read_text().count("\n") if sleeps.exists() else 0) - 1)
         return step, result, count, iterations
 
     def test_9430_bytes_d_failed_call_keeps_loop_and_step_rc(self):
@@ -679,47 +779,204 @@ class ProgressNotice(unittest.TestCase):
 
     # ---- fix-r1 cells (class A, B, C) ----
 
-    def test_9430_fix_heartbeat_text_pins_cut_b_isolated_python_and_fallback(self):
-        # Exact strings: a `-c` cut, a python3 without -I or a fallback that can fail is red here on every host.
-        notice_lines = [line.strip() for line in self.body.split("\n") if HEARTBEAT_MARKER in line
-                        and not line.strip().startswith("#")]
-        self.assertEqual(len(notice_lines), 1, notice_lines)
-        line = notice_lines[0]
-        self.assertTrue(line.startswith(PYTHON_ISOLATED), line[:40])
-        self.assertIn(NOTICE_TEMPLATE, line)
-        self.assertIn(NOTICE_MAX_CHARS_TEXT, line)
-        for shard in SHARD_LOGS:
-            self.assertEqual(line.count(TAIL_CUT % shard), 1, shard)
-        self.assertNotIn(CHAR_CUT, self.body)
-        self.assertTrue(line.endswith(FALLBACK_TEXT), line[-120:])
-        fallback = line[-len(FALLBACK_TEXT):]
+    def notice_command(self):
+        """(the whole notice command, its python program): from ``python3 -I -c '`` to the end of the fallback."""
+        self.assertEqual(self.body.count(PYTHON_ISOLATED), 1, "one isolated python3 call in the loop")
+        command = self.body[self.body.index(PYTHON_ISOLATED):]
+        tail = "' %s %s" % (LOG_ARGV, FALLBACK_TEXT)
+        self.assertTrue(command.rstrip().endswith(tail), command[-200:])
+        command = command.rstrip()
+        program = command[len(PYTHON_ISOLATED):len(command) - len(tail)]
+        return command, program
+
+    def test_9430_fix_heartbeat_text_pins_reader_isolated_python_and_fallback(self):
+        # Exact strings: the log PATHS are the argv of the one `python3 -I` call; a host text tool, a command
+        # substitution, a python3 without -I, an unnamed bound or a fallback that can fail is red here on every host.
+        command, program = self.notice_command()
+        self.assertNotIn("'", program)
+        self.assertNotIn(COMMAND_SUBSTITUTION, command)
+        self.assertEqual([int(value) for value in READ_BOUND_RE.findall(program)], [READ_BOUND])
+        self.assertEqual([int(value) for value in CUT_BYTES_RE.findall(program)], [CUT_BYTES])
+        self.assertLess(CUT_BYTES, READ_BOUND)
+        for form in READER_FORMS:
+            self.assertIn(form, program)
+        self.assertEqual(program.count(ADDED_PATH), 1)
+        self.assertEqual(program.count(SYS_PATH), 1, "scripts/ci is the only added path")
+        self.assertIn(NOTICE_TEMPLATE, program)
+        self.assertEqual(program.count(NOTICE_MAX_CHARS_TEXT), 1)
+        code_lines = [line for line in self.body.split("\n") if not line.strip().startswith("#")]
+        for tool in HOST_TEXT_TOOLS:
+            pattern = re.compile(r"(?<![\w./-])%s(?![\w-])" % re.escape(tool))
+            self.assertEqual([line for line in code_lines if pattern.search(line)], [], tool)
+        fallback = command[-len(FALLBACK_TEXT):]
+        self.assertEqual(fallback, FALLBACK_TEXT)
         self.assertEqual(fallback.count(FALLBACK_STDERR), 1)
         self.assertNotIn(V2_COMMAND, fallback)
         self.assertNotIn(V1_COMMAND, fallback)
 
-    def test_9430_fix_char_cutting_cut_first_on_path(self):
-        # Class A: with a cut that cuts characters for -c in a UTF-8 locale (uutils on ubuntu-26.04, BSD on macOS)
-        # first on PATH, every multibyte cell keeps exactly the first CUT_BYTES bytes, in every locale.
-        stub_dir = self.scratch / "char_cut_bin"
+    def test_9430_fix_no_host_text_tool_between_call_and_args(self):
+        # Conductor word a3ff9997, addition (1): the text from `python3 -I` to the end of its three arguments (the
+        # program and the log paths, fallback excluded) names no host text tool and holds no pipe or substitution.
+        command, program = self.notice_command()
+        call = command[:len(command) - len(FALLBACK_TEXT)].rstrip()
+        self.assertTrue(call.endswith(LOG_ARGV), call[-120:])
+        for tool in HOST_TEXT_TOOLS:
+            self.assertIsNone(re.search(r"(?<![\w./-])%s(?![\w-])" % re.escape(tool), call), tool)
+        self.assertEqual(call[len(PYTHON_ISOLATED) + len(program):], "' " + LOG_ARGV)  # no shell pipe after it
+        self.assertNotIn("`", call)
+        self.assertNotIn(COMMAND_SUBSTITUTION, call)
+
+    def test_9430_fix_hostile_host_text_tools_first_on_path_never_run(self):
+        # Class A: hostile tail / cut / sed / ... stubs first on PATH (each prints a forged command and records that it
+        # ran): none runs, and every multibyte cell keeps its exact bytes, in every locale.
+        stub_dir = self.scratch / "host_tool_bin"
+        markers = self.scratch / "host_tool_markers"
         stub_dir.mkdir()
-        stub = stub_dir / "cut"
-        stub.write_text(CHAR_CUT_STUB.format(exe=sys.executable))
-        stub.chmod(0o755)
-        extra_env = {"PATH": "%s:%s" % (stub_dir, os.environ["PATH"])}
+        markers.mkdir()
+        for tool in HOST_TEXT_TOOLS:
+            stub = stub_dir / tool
+            stub.write_text(HOST_TOOL_STUB.format(exe=sys.executable))
+            stub.chmod(0o755)
+        extra_env = {"PATH": "%s:%s" % (stub_dir, self.python_bin), "HB_TOOL_MARKERS": str(markers)}
         cases = multibyte_cases()
         for locale in LOCALES:
             for index in range(0, len(cases), len(SHARD_LOGS)):
                 group = cases[index:index + len(SHARD_LOGS)]
                 while len(group) < len(SHARD_LOGS):
                     group.append(("filler", BYTE_FILLER.encode(), BYTE_FILLER))
-                name = "charcut/%s/%s" % (locale, "+".join(case[0] for case in group))
+                name = "hosttool/%s/%s" % (locale, "+".join(case[0] for case in group))
                 logs = {shard: b"running 3 tests\n" + case[1] + b"\n" for shard, case in zip(SHARD_LOGS, group)}
                 with self.subTest(name):
-                    result, expected = self.run_heartbeat("charcut_%s_%03d" % (locale, index), logs, locale,
+                    result, expected = self.run_heartbeat("hosttool_%s_%03d" % (locale, index), logs, locale,
                                                           extra_env=extra_env)
                     match = self.byte_notice(name, result, expected)
                     for shard, case in zip(SHARD_LOGS, group):
                         self.assertEqual(match.group(shard), case[2], "%s: %s field" % (name, shard))
+        self.assertEqual(sorted(path.name for path in markers.iterdir()), [])
+
+    # ---- reader cells (RULING b2bb1090 section B) ----
+
+    def test_9430_reader_oracle_fixed_points(self):
+        # The oracle against hand-written values, so it is not only checked against the reader.
+        self.assertEqual(bounded_field(b""), b"")
+        self.assertEqual(bounded_field(b"\n"), b"")
+        self.assertEqual(bounded_field(b"a\nb"), b"b")
+        self.assertEqual(bounded_field(b"a\nb\n"), b"b")
+        self.assertEqual(bounded_field(b"a\n\n"), b"")
+        self.assertEqual(bounded_field(b"a\r\nb\r\n"), b"b\r")
+        line = size_line(READ_BOUND + 1)
+        self.assertEqual(bounded_field(line), line[-CUT_BYTES:])
+        self.assertEqual(bounded_field(line + b"\n"), line[-CUT_BYTES:])
+        self.assertEqual(bounded_field(line[:READ_BOUND]), line[:CUT_BYTES])
+        self.assertEqual(bounded_field(line[:READ_BOUND] + b"\n"), line[-CUT_BYTES - 1:-1])
+        self.assertEqual(bounded_field(b"h\n" + line[:READ_BOUND - 1]), line[:CUT_BYTES])
+        self.assertEqual(bounded_field(b"h\n" + line[:READ_BOUND - 1] + b"\n"), line[READ_BOUND - 1 - CUT_BYTES:
+                                                                                         READ_BOUND - 1])
+        self.assertNotEqual(line[:CUT_BYTES], line[-CUT_BYTES:])
+
+    def run_reader_cases(self, cell, cases):
+        """Run `cases` ([(name, whole log bytes)]) three per run; exact field per log, rc 0, empty stderr."""
+        for index in range(0, len(cases), len(SHARD_LOGS)):
+            group = list(cases[index:index + len(SHARD_LOGS)])
+            while len(group) < len(SHARD_LOGS):
+                group.append(("filler", BYTE_FILLER.encode() + b"\n"))
+            name = "%s/%s" % (cell, "+".join(case[0] for case in group))
+            with self.subTest(name):
+                result, expected = self.run_heartbeat("%s_%03d" % (cell, index),
+                                                      {shard: case[1] for shard, case in zip(SHARD_LOGS, group)})
+                self.byte_notice(name, result, expected)
+
+    def test_9430_reader_sizes_with_and_without_final_newline(self):
+        cases = []
+        for size in SIZE_CELLS:
+            line = size_line(size)
+            cases.append(("one_line_%d" % size, line))
+            cases.append(("one_line_%d_lf" % size, line + b"\n"))
+        for size in EDGE_SIZES:
+            line = size_line(size - len(EDGE_HEADER))
+            cases.append(("header_total_%d" % size, EDGE_HEADER + line))
+            cases.append(("header_total_%d_lf" % size, EDGE_HEADER + line + b"\n"))
+        self.assertEqual(len(cases), 2 * (len(SIZE_CELLS) + len(EDGE_SIZES)))
+        self.run_reader_cases("sizes", cases)
+
+    def test_9430_reader_window_without_newline_gives_last_cut_bytes(self):
+        # The read-back window holds no line feed (a line longer than READ_BOUND): the field is the last CUT_BYTES
+        # bytes read, final line feed dropped; with a multi-byte character cut at the start of those bytes.
+        line = size_line(READ_BOUND + CUT_BYTES)
+        result, expected = self.run_heartbeat("no_newline", {"serial": line, "parallel_1": line + b"\n",
+                                                             "parallel_2": LONG_MULTIBYTE_LOG})
+        self.assertEqual(expected, {"serial": line[-CUT_BYTES:], "parallel_1": line[-CUT_BYTES:],
+                                    "parallel_2": LONG_MULTIBYTE_LOG[-CUT_BYTES:]})
+        match = self.byte_notice("no_newline", result, expected)
+        self.assertEqual(match.group("parallel_2"), SURROGATE_ESCAPE % "é".encode()[1] + "b" * (CUT_BYTES - 1))
+
+    def test_9430_reader_content_cells(self):
+        # CRLF last line (CR kept and escaped), a last line of only ::error:: text, NUL bytes kept and escaped.
+        result, expected = self.run_heartbeat("content", {"serial": CRLF_LOG, "parallel_1": ERROR_ONLY_LOG,
+                                                          "parallel_2": NUL_LOG})
+        self.assertEqual(expected, {"serial": b"test a ... ok\r", "parallel_1": b"::error::forged-by-test-output",
+                                    "parallel_2": b"\x00test\x00a ... \x00ok\x00"})
+        match = self.byte_notice("content", result, expected)
+        self.assertEqual(match.group("serial"), "test a ... ok\\x0d")
+        self.assertEqual(match.group("parallel_1"), "\\x3a:error\\x3a:forged-by-test-output")
+        self.assertEqual(match.group("parallel_2"), "\\x00test\\x00a ... \\x00ok\\x00")
+
+    def test_9430_reader_missing_unreadable_and_directory_give_empty_field(self):
+        shard_dir = self.shard_dir("kinds")
+        unreadable = shard_dir / "parallel_1.log"
+        unreadable.write_bytes(ERROR_ONLY_LOG)
+        unreadable.chmod(UNREADABLE_MODE)
+        # Precondition, asserted (never skipped): the cell must run as a user the mode keeps out (not root).
+        self.assertFalse(os.access(unreadable, os.R_OK), "the unreadable cell needs a non-root user")
+        (shard_dir / "parallel_2.log").mkdir()
+        result, expected = self.run_in("kinds", shard_dir)
+        self.assertEqual(expected, {shard: b"" for shard in SHARD_LOGS})
+        self.byte_notice("kinds", result, expected)
+
+    def test_9430_reader_fifo_and_device_never_block(self):
+        # A FIFO with no writer (an open without O_NONBLOCK blocks), a FIFO whose writer holds data, and a log path
+        # that is a character device: empty fields, rc 0, inside the wall ceiling.
+        shard_dir = self.shard_dir("fifo")
+        os.mkfifo(shard_dir / "serial.log")
+        os.mkfifo(shard_dir / "parallel_1.log")
+        (shard_dir / "parallel_2.log").symlink_to(CHAR_DEVICE)
+        writer = os.open(shard_dir / "parallel_1.log", os.O_RDWR | os.O_NONBLOCK)
+        try:
+            os.write(writer, FIFO_DATA)
+            result, expected = self.run_in("fifo", shard_dir)
+        finally:
+            os.close(writer)
+        self.assertEqual(expected, {shard: b"" for shard in SHARD_LOGS})
+        self.byte_notice("fifo", result, expected)
+
+    def test_9430_reader_log_that_grows_between_ticks(self):
+        shard_dir = self.shard_dir("grows")
+        data = b""
+        for tick, step in enumerate(GROW_STEPS):
+            data += step
+            for shard in SHARD_LOGS:
+                with open(shard_dir / ("%s.log" % shard), "ab") as log:
+                    log.write(step)
+            name = "grows_tick_%d" % tick
+            with self.subTest(name):
+                result, expected = self.run_in(name, shard_dir)
+                self.assertEqual(expected["serial"], bounded_field(data))
+                self.byte_notice(name, result, expected)
+
+    def test_9430_reader_sparse_log_is_read_back_bounded(self):
+        # A 2 GiB sparse log (NUL bytes then one line) under an address-space ceiling: a reader that reads the whole
+        # file runs out of memory; the bounded reader gives the last line.
+        shard_dir = self.shard_dir("sparse")
+        for shard in SHARD_LOGS:
+            path = shard_dir / ("%s.log" % shard)
+            with open(path, "wb") as log:
+                log.truncate(SPARSE_LOG_BYTES - len(SPARSE_TAIL))
+                log.seek(0, os.SEEK_END)
+                log.write(SPARSE_TAIL)
+            self.assertEqual(path.stat().st_size, SPARSE_LOG_BYTES)
+        expected = {shard: SPARSE_TAIL.strip(b"\n") for shard in SHARD_LOGS}
+        result, expected = self.run_in("sparse", shard_dir, expected=expected, preexec_fn=address_space_ceiling)
+        self.byte_notice("sparse", result, expected)
 
     def test_9430_fix_every_failure_form_keeps_loop_and_step_rc(self):
         # Class B: no failure form of the notice command ends the loop or changes the step result, and the fallback
