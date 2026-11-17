@@ -14,6 +14,8 @@ D. One boundary: the timer and the gate share margin_lost(); no invocation gets 
 E. No #9229 annotation carries a percent sign or its escaped form.
 F. Every invocation prints its #6202 / #1492 notices, also when a gate red returns early, and a failed
    `cargo metadata` warns before the gated, summed fallback runs.
+G. A short row count after a non-zero rc (an invocation that ended before its gate) is one notice naming rc,
+   k and N, no margin-class error, and the first failing rc unchanged; with rc 0 it stays the malformed red.
 
 The step harness runs the real step text with Python stubs for cargo and date (a frozen clock that the stub
 cargo advances by the planned seconds of each invocation) and the real suite_budget.py.
@@ -450,6 +452,124 @@ class SumCompleteness(unittest.TestCase):
         self.assertIn("whole sqlite suite: 4 invocations ran 40s of the 3600s whole-suite ceiling "
                       "(WHOLE_SUITE_CEILING_SECS); per invocation: %s 10s, %s 10s, %s 10s, %s 10s"
                       % tuple(LABEL_SHARD[k] for k in range(1, 5)), out)
+
+
+# Class G (PR 9422 r2 R2-2): an invocation that ends before its gate (a failed prebuild returns before the
+# SUITE_SECONDS row) leaves fewer than N rows. With a non-zero rc already set the sum is not judged: exactly one
+# notice naming rc, k and N, no error of the margin class, and the first failing rc unchanged. With rc 0 a short
+# row count stays the named malformed-input red, exit 2 (the S1 guard).
+UNJUDGED_RCS = (0, EXIT_TEST_FAILED, EXIT_MALFORMED, EXIT_WATCHDOG)
+UNJUDGED_NS = (4, 1)  # the sharded path (4 invocations) and the unsharded fallback (1)
+UNJUDGED_LATER_RC = 1  # what every invocation after the first failing one returns; it must never win
+UNJUDGED_ROW_SECS = 10
+MARGIN_ERROR_PREFIX = "::error::[#9229 margin]"
+
+
+def unjudged_notice(rc, kept, expect):
+    return ("::notice::[#9229 margin] whole sqlite suite: not judged, an invocation ended before its gate "
+            "(rc %d); %d of %d invocation rows kept (#9229)" % (rc, kept, expect))
+
+
+def short_count_error(kept, expect):
+    return ("::error::[#9229 margin] whole sqlite suite: malformed input: expected %d invocation rows, found %d; "
+            "refusing to pass (#9229)" % (expect, kept))
+
+
+# Row: (name, N, k rows kept, rc of the first ending invocation, the one exact whole-suite line, step exit code).
+UNJUDGED_TABLE = tuple(
+    ("N=%d k=%d rc=%d" % (n, k, rc), n, k, rc,
+     unjudged_notice(rc, k, n) if rc else short_count_error(k, n), rc if rc else EXIT_MALFORMED)
+    for n in UNJUDGED_NS for k in range(n) for rc in UNJUDGED_RCS)
+UNJUDGED_TABLE_COUNT = 20  # pinned: (4 + 1) values of k times 4 values of rc
+
+# Stubs for the callees of the real run_sqlite_full_suite: invocation i keeps a row when STUB_ROWS[i] is 1 and
+# returns STUB_RCS[i]. SUITE_SECONDS is the caller's local (bash dynamic scope), as in run_tests.
+UNJUDGED_HARNESS = '''STUB_RCS=(%(rcs)s)
+STUB_ROWS=(%(rows)s)
+STUB_NEXT=0
+_stub_invocation() {
+  local label="$1" i="$STUB_NEXT"
+  STUB_NEXT=$((i + 1))
+  if [ "${STUB_ROWS[$i]}" = 1 ]; then SUITE_SECONDS+=("%(secs)d"$'\\t'"${label}"); fi
+  echo "stub invocation $((i + 1)): ${label}"
+  return "${STUB_RCS[$i]}"
+}
+run_tests() { _stub_invocation "$1"; }
+run_doc_tests() { _stub_invocation "$1"; }
+run_sqlite_full_suite() {
+%(body)s
+}
+run_sqlite_full_suite
+exit "$?"
+'''
+
+
+def unjudged_plan(n, k, rc):
+    """(rcs, rows) of the n invocations: k keep a row and pass, the next ends with rc and no row, later ones
+    keep no row and return UNJUDGED_LATER_RC (0 when rc is 0)."""
+    later = UNJUDGED_LATER_RC if rc else 0
+    rcs = [0] * k + [rc] + [later] * (n - k - 1)
+    rows = [1] * k + [0] * (n - k)
+    return rcs, rows
+
+
+def run_unjudged(step_text, n, k, rc):
+    """(exit code, output, stub invocation count) of the real run_sqlite_full_suite of ``step_text``."""
+    rcs, rows = unjudged_plan(n, k, rc)
+    text = UNJUDGED_HARNESS % {"rcs": " ".join(map(str, rcs)), "rows": " ".join(map(str, rows)),
+                               "secs": UNJUDGED_ROW_SECS, "body": base.function_body(step_text, "run_sqlite_full_suite")}
+    code, out, _, _ = run_step(text, metadata_rc=0 if n == 4 else EXIT_TEST_FAILED)
+    return code, out, len(re.findall(r"^stub invocation \d+: ", out, re.M))
+
+
+def unjudged_results(step_text):
+    """{row name: run_unjudged result} over UNJUDGED_TABLE, in parallel."""
+    with concurrent.futures.ThreadPoolExecutor(max_workers=STEP_WORKERS) as pool:
+        jobs = {row[0]: pool.submit(run_unjudged, step_text, row[1], row[2], row[3]) for row in UNJUDGED_TABLE}
+        return {name: job.result() for name, job in jobs.items()}
+
+
+def unjudged_failures(results):
+    """{row name: why} for every UNJUDGED_TABLE row whose result breaks the invariant."""
+    failures = {}
+    for name, n, k, rc, line, exit_expected in UNJUDGED_TABLE:
+        code, out, invocations = results[name]
+        suite_lines = [l for l in out.splitlines() if "whole sqlite suite" in l]
+        margin_errors = [l for l in out.splitlines() if l.startswith(MARGIN_ERROR_PREFIX)]
+        if invocations != n:
+            failures[name] = "ran %d invocations, expected %d" % (invocations, n)
+        elif code != exit_expected:
+            failures[name] = "exit %d, expected %d" % (code, exit_expected)
+        elif suite_lines != [line]:
+            failures[name] = "whole-suite lines %r, expected [%r]" % (suite_lines, line)
+        elif margin_errors != ([] if rc else [line]):
+            failures[name] = "margin-class errors %r" % margin_errors
+    return failures
+
+
+class UnjudgedSum(unittest.TestCase):
+    """Class G (R2-2): a short row count after a failure is one notice, never a second margin-class red."""
+
+    def test_table_has_its_pinned_count(self):
+        self.assertEqual(len(UNJUDGED_TABLE), UNJUDGED_TABLE_COUNT)
+        self.assertEqual(len({row[0] for row in UNJUDGED_TABLE}), UNJUDGED_TABLE_COUNT)
+
+    def test_every_row_prints_its_one_line_and_exit_code(self):
+        results = unjudged_results(base.step_script())
+        failures = unjudged_failures(results)
+        for name, _, _, _, _, _ in UNJUDGED_TABLE:
+            with self.subTest(row=name):
+                self.assertNotIn(name, failures, results[name][1][-3000:])
+
+    def test_a_failed_prebuild_on_the_real_step_is_one_notice(self):
+        results = _scenario_results()
+        for scenario in ("prebuild1", "prebuild4"):
+            with self.subTest(scenario=scenario):
+                rc, out, _, _ = results[("step", scenario)]
+                self.assertEqual(rc, EXIT_TEST_FAILED, out[-3000:])
+                self.assertEqual([l for l in out.splitlines() if "whole sqlite suite" in l],
+                                 [unjudged_notice(EXIT_TEST_FAILED, 3, 4)])
+                self.assertEqual([l for l in out.splitlines() if l.startswith(MARGIN_ERROR_PREFIX)], [])
 
 
 class InputTotality(unittest.TestCase):
