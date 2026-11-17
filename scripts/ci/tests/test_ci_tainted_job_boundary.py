@@ -34,7 +34,7 @@ try:
 except ImportError:
     pyyaml = None
 
-ALLOW_PIN_EXPECTED = 6
+ALLOW_PIN_EXPECTED = 12
 JOB_COUNT_LARGE = 200
 LARGE_SCAN_CEILING_S = 10.0
 RUN_TEXT_BYTES_LARGE = 120_000
@@ -235,6 +235,94 @@ WF_LATE_CHECKOUT = HEADER + """\
         with:
           persist-credentials: false
           path: other
+"""
+
+# Ruling 04701c74: a host-resident credential read after pull-request code is (i) on a
+# host runner; the same read on a GitHub-hosted VM reaches no resident credential.
+WF_HOST_CREDENTIAL = HEADER + """\
+  host:
+    runs-on: linux-fed
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Before
+        run: test -r "$HOME/.netrc"
+      - name: Build
+        run: cargo build
+      - name: Read url
+        run: |
+          url_file="$HOME/.ai-memory-ci-fed-url"
+          test -r "$url_file"
+      - name: Read pgpass
+        run: cat ~/.pgpass
+      - name: Toolchain
+        run: ls "$HOME/.cargo/bin"
+  hosted:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Build
+        run: cargo build
+      - name: Read pgpass
+        run: cat ~/.pgpass
+"""
+
+# Text -> names a host-resident credential.
+HOST_CREDENTIAL_CASES = (
+    ('url_file="$HOME/.ai-memory-ci-fed-url"', True),
+    ("cat ${HOME}/.pgpass", True),
+    ("cat ~/.netrc", True),
+    ("cp ~/.ssh/id_ed25519 .", True),
+    ("cat $HOME/.aws/credentials", True),
+    ("cat ~/.docker/config.json", True),
+    ("cat ~/.config/gh/hosts.yml", True),
+    ("cat $HOME/.git-credentials", True),
+    ("cat $HOME/.vault-token", True),
+    ("cat $HOME/.PGPASS", True),
+    ("curl --unix-socket /var/run/docker.sock http://x/info", True),
+    ("sudo -u postgres psql -c 'select 1'", True),
+    ("psql -h 127.0.0.1 -U postgres -c 'select 1'", True),
+    ('ls "$HOME/.cargo/bin"', False),
+    ('mkdir -p "$HOME/.local/bin"', False),
+    ("du -sh ~/.cache/huggingface", False),
+    ("cat ./.pgpass-example", False),
+    ("psql -U app -d proof", False),
+)
+
+# Ruling 04701c74: a write to GITHUB_ENV or GITHUB_PATH in a job holding a pull-request tree
+# is the taint point, and every later step (actions and cleanup) is tainted.
+WF_ENV_FILE = HEADER + """\
+  envfile:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Set env
+        run: echo "X=$(cat pr.txt)" >> "$GITHUB_ENV"
+      - name: Comment
+        uses: marocchino/sticky-pull-request-comment@v2
+      - name: Cleanup
+        if: always()
+        env:
+          T: ${{ secrets.T }}
+        run: echo done
+  pathfile:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Add path
+        run: echo "$PWD/bin" >> "${GITHUB_PATH}"
+      - name: Cleanup
+        if: always()
+        env:
+          T: ${{ secrets.T }}
+        run: echo done
 """
 
 # Expression text -> names a secret or the job token.
@@ -539,6 +627,28 @@ class SyntheticCorpusVerdicts(unittest.TestCase):
         _need_module(self)
         result = _scan({SYNTH: WF_LATE_CHECKOUT})
         self.assertEqual({(v.step, v.klass) for v in result.violations}, {("Second checkout", "i")})
+
+    def test_9452_host_resident_credential_read_after_pr_code_is_class_i(self) -> None:
+        _need_module(self)
+        result = _scan({SYNTH: WF_HOST_CREDENTIAL})
+        got = {(v.job, v.step, v.klass) for v in result.violations}
+        self.assertEqual(got, {("host", "Build", "iv"), ("host", "Read url", "i"), ("host", "Read pgpass", "i")})
+        self.assertEqual(result.verdicts[(SYNTH, "hosted")], "clean")
+
+    def test_9452_host_credential_path_forms(self) -> None:
+        _need_module(self)
+        for text, expected in HOST_CREDENTIAL_CASES:
+            with self.subTest(text=text):
+                self.assertIs(tb._host_credential_in({"run": text}), expected)
+
+    def test_9452_env_file_write_taints_every_later_step(self) -> None:
+        _need_module(self)
+        result = _scan({SYNTH: WF_ENV_FILE})
+        self.assertEqual(result.unclassifiable, [])
+        self.assertEqual(result.taint_steps[(SYNTH, "envfile")], "Set env")
+        self.assertEqual(result.taint_steps[(SYNTH, "pathfile")], "Add path")
+        got = {(v.job, v.step, v.klass) for v in result.violations}
+        self.assertEqual(got, {("envfile", "Comment", "i"), ("envfile", "Cleanup", "i"), ("pathfile", "Cleanup", "i")})
 
     def test_9452_secret_reference_forms(self) -> None:
         _need_module(self)
@@ -864,7 +974,7 @@ class RealWorkflows(unittest.TestCase):
                     ("postgres-ignored.yml", "postgres-ignored")):
             with self.subTest(job=key):
                 self.assertEqual(result.taint_steps[key], "Prune stale runner TMPDIR (#8634)")
-                self.assertEqual(result.verdicts[key], "iv")
+                self.assertEqual(result.verdicts[key], "i,iv")
 
     def test_9452_real_hit_verdicts(self) -> None:
         _need_module(self)
@@ -875,9 +985,9 @@ class RealWorkflows(unittest.TestCase):
             ("c8-precheck.yml", "required-contexts-gate"): "i",
             ("coverage.yml", "per-module-thresholds"): "i,ii",
             ("ci.yml", "classify"): "iii",
-            ("ci.yml", "check"): "iv",
-            ("cert-postgres-age.yml", "cert-postgres-age"): "iv",
-            ("postgres-ignored.yml", "postgres-ignored"): "iv",
+            ("ci.yml", "check"): "i,iv",
+            ("cert-postgres-age.yml", "cert-postgres-age"): "i,iv",
+            ("postgres-ignored.yml", "postgres-ignored"): "i,iv",
         })
 
     @unittest.skipUnless(pyyaml is not None, "PyYAML not installed: parity oracle skipped")

@@ -105,6 +105,27 @@ EVENT_EQ_RE = re.compile(r"^github\.event_name\s*==\s*'([a-z_]+)'$")
 MATRIX_RUNS_ON_RE = re.compile(r"^\$\{\{\s*(fromJSON\(\s*)?matrix\.([A-Za-z0-9_-]+)\s*\)?\s*\}\}$")
 CHECKOUT_IN_RUN_RE = re.compile(r"\bgit\s+(?:-\S+\s+)*(checkout|switch|worktree|fetch|pull)\b")
 BASE_MATERIALISE_RE = re.compile(r"\bgit\s+(?:--?\S+\s+)*show\b|\bgit\(\s*\"show\"")
+# Ruling 04701c74: (i) covers every credential the job can reach, including credentials
+# resident on a self-hosted host. Detection is textual over the step's run, with and env:
+#  - a home-directory dot path (`$HOME/.`, `${HOME}/.`, `~/.`) whose first component is a
+#    known credential store, or whose name carries a credential word (url, pass, token,
+#    secret, cred, key, auth);
+#  - the runner host's container socket and a local database superuser.
+# Limits: a path assembled from variables that never spells the home prefix and the name in
+# one place, a credential held in the runner service's own environment, and an absolute
+# `/home/<user>/` path are not seen; the OS boundary facts of #9455
+# (trusted_home_credentials_unreadable) remain the structural answer for those.
+HOST_CREDENTIAL_RE = re.compile(
+    r"(?:\$\{?HOME\}?|~)/\.(?:"
+    r"(?:pgpass|netrc|git-credentials|ssh|aws|kube|gnupg|docker/config\.json|config/(?:gh|copr|git/credentials))\b"
+    r"|[\w.-]*(?:url|pass|token|secret|cred|key|auth)[\w.-]*)"
+    r"|/var/run/docker\.sock|\bsudo\s+(?:-\S+\s+)*-u\s+postgres\b|\bpsql\b[^\n]*\s-U\s*postgres\b",
+    re.I)
+# Ruling 04701c74: a write to these runner command files at or after the taint point carries
+# pull-request control into every later step of the job (actions and cleanup included); in
+# a job holding a pull-request tree a write before any other pull-request code is itself
+# the taint point, because the value may be read from the pull-request tree.
+ENV_FILE_WRITE_RE = re.compile(r"\$\{?(?:GITHUB_ENV|GITHUB_PATH)\b")
 
 
 # Persistent-runner OS boundary facts (issue #9455, 3-agent vote (71472661) T-1/T-4). A
@@ -128,7 +149,7 @@ class AllowRow:
     issue: int | None
 
 
-# The six hits of the survey at a028c45e. Removing a row is the fix lane's job; adding a
+# The six hits of the survey at a028c45e plus the six host-credential reads. Removing a row is the fix lane's job; adding a
 # row needs an issue number from the deputy (the pin moves with it).
 TAINT_ALLOW: tuple[AllowRow, ...] = (
     AllowRow("ci.yml", "classify", "id:impact", (CLASS_GATE_OUTPUT,), 9454),
@@ -142,8 +163,19 @@ TAINT_ALLOW: tuple[AllowRow, ...] = (
              (CLASS_PERSISTENT_STATE,), 9455),
     AllowRow("coverage.yml", "per-module-thresholds", "Post coverage to PR (sticky) (#1993)",
              (CLASS_WRITE_TOKEN, CLASS_SECRET), 9456),
+    # Ruling 04701c74: a host-resident credential read after pull-request code is (i); the
+    # per-run pull-request-tier credential lands under #9455.
+    AllowRow("ci.yml", "check", "Configure enterprise-fed tier (per-job ephemeral db, enterprise-fed legs only)",
+             (CLASS_SECRET,), 9455),
+    AllowRow("ci.yml", "check", "Cleanup enterprise-fed ephemeral db", (CLASS_SECRET,), 9455),
+    AllowRow("cert-postgres-age.yml", "cert-postgres-age", "Point at the native enterprise-fed tier (per-job ephemeral db)",
+             (CLASS_SECRET,), 9455),
+    AllowRow("cert-postgres-age.yml", "cert-postgres-age", "Cleanup enterprise-fed ephemeral db", (CLASS_SECRET,), 9455),
+    AllowRow("postgres-ignored.yml", "postgres-ignored", "Point at the native enterprise-fed tier (per-job ephemeral db)",
+             (CLASS_SECRET,), 9455),
+    AllowRow("postgres-ignored.yml", "postgres-ignored", "Cleanup enterprise-fed ephemeral db", (CLASS_SECRET,), 9455),
 )
-TAINT_ALLOW_PIN = 6
+TAINT_ALLOW_PIN = 12
 
 
 class Unclassifiable(Exception):
@@ -1209,6 +1241,11 @@ def _boundary_holds(label: str, repo_files: frozenset[str]) -> bool:
     return isinstance(proof, str) and proof in repo_files
 
 
+def _leg_hosted(leg: tuple[str, ...]) -> bool:
+    hosted = [lab for lab in leg if GITHUB_HOSTED_LABEL_RE.match(lab)]
+    return bool(hosted) and len(hosted) == len(leg)
+
+
 def _leg_persistent(leg: tuple[str, ...], repo_files: frozenset[str]) -> bool:
     hosted = [lab for lab in leg if GITHUB_HOSTED_LABEL_RE.match(lab)]
     if hosted and len(hosted) == len(leg):
@@ -1323,6 +1360,11 @@ def _secret_in(step: dict[str, object]) -> bool:
     return _has_secret_ref(_dump(parts))
 
 
+def _host_credential_in(step: dict[str, object]) -> bool:
+    parts = [step.get("env"), step.get("with"), step.get("run")]
+    return HOST_CREDENTIAL_RE.search(_dump(parts)) is not None
+
+
 def _analyse_job(wf: str, job_id: str, job: dict[str, object], doc: dict[str, object], events: set[str],
                  actions: dict[str, str], repo_files: frozenset[str], downloads: bool,
                  result: ScanResult) -> str:
@@ -1352,7 +1394,8 @@ def _analyse_job(wf: str, job_id: str, job: dict[str, object], doc: dict[str, ob
             continue
         if run and CHECKOUT_IN_RUN_RE.search(str(run)) and job_events & PR_CODE_EVENTS:
             pr_tree = True
-        if pr_tree and taint is None and _step_runs_pr_code(step, job, doc, materialised, label):
+        if pr_tree and taint is None and (ENV_FILE_WRITE_RE.search(_dump([body.get("run"), body.get("with")]))
+                                          or _step_runs_pr_code(step, job, doc, materialised, label)):
             taint = step
             break
     if taint is None:
@@ -1372,6 +1415,7 @@ def _analyse_job(wf: str, job_id: str, job: dict[str, object], doc: dict[str, ob
     for step in leaky_checkouts:
         add(step, CLASS_SECRET, "checkout keeps the token in the workspace for later pull-request code")
     token_users: list[_Step] = []
+    host_resident = not all(_leg_hosted(leg) for leg in legs)
     for step in after:
         uses = step.body.get("uses")
         default_token = isinstance(uses, str) and not uses.startswith(LOCAL_PREFIX) and \
@@ -1382,6 +1426,10 @@ def _analyse_job(wf: str, job_id: str, job: dict[str, object], doc: dict[str, ob
         if _secret_in(step.body) or default_token or late_checkout:
             add(step, CLASS_SECRET, "secret or token used after pull-request code ran")
             token_users.append(step)
+        # A GitHub-hosted VM is fresh per job and holds no resident credential; any other
+        # leg is a host that may. The boundary facts do not clear this: the step still reads.
+        if host_resident and _host_credential_in(step.body):
+            add(step, CLASS_SECRET, "host-resident credential read after pull-request code ran")
     # (ii) a write token in a tainted job.
     if _has_write(perms):
         add(token_users[0] if token_users else taint, CLASS_WRITE_TOKEN, "job token has a write scope")
