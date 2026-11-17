@@ -406,7 +406,7 @@ pub fn run_once(
             match llm_client.detect_contradiction(&mem.content, &sibling.content) {
                 Ok(true) => {
                     if !cfg.dry_run
-                        && let Err(e) = persist_contradiction(conn, mem, &sibling.id)
+                        && let Err(e) = persist_contradiction(conn, mem, &sibling)
                     {
                         report
                             .errors
@@ -1479,13 +1479,22 @@ mod tests {
         let mem = make_test_memory("curate-test", "anchor", &"a".repeat(120));
         db::insert(&conn, &mem).unwrap();
 
-        persist_contradiction(&conn, &mem, "id-1").unwrap();
+        // #9300 — the contradicting rows are real rows (their content is
+        // re-checked inside the write txn); their ids are what is recorded.
+        let mut one = make_test_memory("curate-test", "contra-1", &"b".repeat(120));
+        one.id = "id-1".to_string();
+        let mut two = make_test_memory("curate-test", "contra-2", &"c".repeat(120));
+        two.id = "id-2".to_string();
+        db::insert(&conn, &one).unwrap();
+        db::insert(&conn, &two).unwrap();
+
+        persist_contradiction(&conn, &mem, &one).unwrap();
         // Re-read to pick up the now-populated metadata for the second call.
         let mid = db::get(&conn, &mem.id).unwrap().unwrap();
-        persist_contradiction(&conn, &mid, "id-2").unwrap();
+        persist_contradiction(&conn, &mid, &two).unwrap();
         // Duplicate id-1 → no-op (still 2 entries).
         let mid2 = db::get(&conn, &mem.id).unwrap().unwrap();
-        persist_contradiction(&conn, &mid2, "id-1").unwrap();
+        persist_contradiction(&conn, &mid2, &one).unwrap();
 
         let updated = db::get(&conn, &mem.id).unwrap().unwrap();
         let ids = updated
@@ -3029,7 +3038,9 @@ mod tests {
             "error must name the refused write: {tag_err}"
         );
 
-        let contra_err = persist_contradiction(&conn, &mem, "other-id")
+        let other = make_eligible_memory("meta-ns", "contradicting-row");
+        db::insert(&conn, &other).unwrap();
+        let contra_err = persist_contradiction(&conn, &mem, &other)
             .expect_err("non-object metadata must be refused, not silently dropped");
         assert!(
             contra_err.to_string().contains("array"),
