@@ -488,6 +488,7 @@ class ShardArgs(unittest.TestCase):
                     self.assertIn(words, err)
                     self.assertIn("the full suite runs unsharded (#9229)", err)
 
+
 LEGS_FIXTURE = """jobs:
   lint:
     timeout-minutes: 15
@@ -708,11 +709,14 @@ class Wiring(unittest.TestCase):
 
 
 STUB_CARGO = """#!%(python)s
-\"\"\"Stub cargo: records its arguments; `metadata` prints the fixture when one exists.\"\"\"
+\"\"\"Stub cargo: records its arguments; each timed `test` run advances the clock file; `metadata` prints the fixture.\"\"\"
 import sys
 from pathlib import Path
 with open(%(calls)r, "a", encoding="utf-8") as calls:
     calls.write(" ".join(sys.argv[1:]) + "\\n")
+if sys.argv[1:2] == ["test"] and "--no-run" not in sys.argv[1:]:
+    clock = Path(%(clock)r)
+    clock.write_text(str(int(clock.read_text()) + %(secs)d))
 if sys.argv[1:2] == ["metadata"] and Path(%(meta)r).is_file():
     sys.stdout.write(Path(%(meta)r).read_text(encoding="utf-8"))
 sys.exit(0)
@@ -726,19 +730,23 @@ if "gate" in sys.argv[1:]:
     sys.exit(3)
 os.execv(%(python)r, [%(python)r] + sys.argv[1:])
 """
-# The step measures each invocation with `date +%s`; a frozen clock makes the expected walls exact (0s) at any
-# host load, where the real clock let a stub start cross a second boundary.
+# The step measures each invocation with `date +%s`. The stub clock is a file: the stub date answers the frozen epoch
+# plus the file, and every timed stub-cargo `test` run adds CARGO_RUN_SECS to it (the clock-file method of the
+# integrity test file), so each invocation's wall is exactly CARGO_RUN_SECS at any host load and a step that stops
+# reading the clock for any invocation shows a different, exact number.
 FROZEN_EPOCH = 1_800_000_000
+CARGO_RUN_SECS = 10
 STUB_DATE = """#!%(python)s
-\"\"\"Stub date: +%%s answers the frozen clock; every other form is the real date.\"\"\"
+\"\"\"Stub date: +%%s answers the frozen epoch plus the clock file; every other form is the real date.\"\"\"
 import os
 import sys
+from pathlib import Path
 if sys.argv[1:] == ["+%%s"]:
-    print(%(epoch)d)
+    print(%(epoch)d + int(Path(%(clock)r).read_text()))
     sys.exit(0)
 os.execv(%(real)r, [%(real)r] + sys.argv[1:])
 """
-SUM_RE =re.compile(r"^::(?:notice|error)::\[#9229 margin\] whole sqlite suite(?: lost its ceiling)?: .*$", re.M)
+SUM_RE = re.compile(r"^::(?:notice|error)::\[#9229 margin\] whole sqlite suite(?: lost its ceiling)?: .*$", re.M)
 
 
 class StepExec(unittest.TestCase):
@@ -754,11 +762,14 @@ class StepExec(unittest.TestCase):
             if meta is not None:
                 meta_path.write_text(json.dumps(meta), encoding="utf-8")
             stub = bindir / "cargo"
-            stub.write_text(STUB_CARGO % {"python": sys.executable, "calls": str(calls), "meta": str(meta_path)})
+            clock = d / "clock"
+            clock.write_text("0")
+            stub.write_text(STUB_CARGO % {"python": sys.executable, "calls": str(calls), "meta": str(meta_path),
+                                          "clock": str(clock), "secs": CARGO_RUN_SECS})
             stub.chmod(0o755)
             date = bindir / "date"
             date.write_text(STUB_DATE % {"python": sys.executable, "epoch": FROZEN_EPOCH,
-                                         "real": shutil.which("date")})
+                                         "clock": str(clock), "real": shutil.which("date")})
             date.chmod(0o755)
             if red_gate:
                 py = bindir / "python3"
@@ -794,17 +805,17 @@ class StepExec(unittest.TestCase):
                       "full suite shard 2/4: bins, integration tests and tested examples, part 1/2",
                       "full suite shard 3/4: bins, integration tests and tested examples, part 2/2",
                       "full suite shard 4/4: doc tests"):
-            self.assertIn("::notice::[#9229 margin] '%s': margin held: wall 0s of the 2100s budget" % label,
-                          r.stdout)
-        self.assertEqual(self.sum_line, "::notice::[#9229 margin] whole sqlite suite: 4 invocations ran 0s of the "
+            self.assertIn("::notice::[#9229 margin] '%s': margin held: wall %ds of the 2100s budget"
+                          % (label, CARGO_RUN_SECS), r.stdout)
+        self.assertEqual(self.sum_line, "::notice::[#9229 margin] whole sqlite suite: 4 invocations ran 40s of the "
                                         "3600s whole-suite ceiling (WHOLE_SUITE_CEILING_SECS); per invocation: "
-                                        "full suite shard 1/4: lib unit tests 0s, "
-                                        "full suite shard 2/4: bins, integration tests and tested examples, part 1/2 0s, "
-                                        "full suite shard 3/4: bins, integration tests and tested examples, part 2/2 0s, "
-                                        "full suite shard 4/4: doc tests 0s")
+                                        "full suite shard 1/4: lib unit tests 10s, "
+                                        "full suite shard 2/4: bins, integration tests and tested examples, part 1/2 10s, "
+                                        "full suite shard 3/4: bins, integration tests and tested examples, part 2/2 10s, "
+                                        "full suite shard 4/4: doc tests 10s")
         self.assertIn("::notice::[#9229 margin] whole-suite plan: the 3600s whole-suite ceiling fits the 95-minute "
                       "timeout of job 'check'", r.stdout)
-        self.assertIn("::notice::[#9229 margin] whole sqlite suite: 4 invocations ran 0s of the 3600s whole-suite "
+        self.assertIn("::notice::[#9229 margin] whole sqlite suite: 4 invocations ran 40s of the 3600s whole-suite "
                       "ceiling", r.stdout)
         self.assertLess(r.stdout.index("whole-suite plan"), r.stdout.index("'full suite shard 1/4"))
         self.assertLess(r.stdout.index("'full suite shard 4/4: doc tests': margin held"),
@@ -816,12 +827,12 @@ class StepExec(unittest.TestCase):
         timed = [c for c in calls if c.startswith("test ") and "--no-run" not in c]
         self.assertEqual(timed, ["test --no-fail-fast"])
         self.assertIn("::warning::[#9229 margin] shard-args: ", r.stdout + r.stderr)
-        self.assertIn("::notice::[#9229 margin] 'full suite (cargo test)': margin held", r.stdout)
+        self.assertIn("::notice::[#9229 margin] 'full suite (cargo test)': margin held: wall 10s of the 2100s budget", r.stdout)
         # The fallback keeps the gate, the doc tests (inside the one cargo test) and the whole-suite ceiling.
-        self.assertEqual(self.sum_line, "::notice::[#9229 margin] whole sqlite suite: 1 invocations ran 0s of the "
+        self.assertEqual(self.sum_line, "::notice::[#9229 margin] whole sqlite suite: 1 invocations ran 10s of the "
                                         "3600s whole-suite ceiling (WHOLE_SUITE_CEILING_SECS); per invocation: "
-                                        "full suite (cargo test) 0s")
-        self.assertIn("::notice::[#9229 margin] whole sqlite suite: 1 invocations ran 0s", r.stdout)
+                                        "full suite (cargo test) 10s")
+        self.assertIn("::notice::[#9229 margin] whole sqlite suite: 1 invocations ran 10s", r.stdout)
 
     def test_a_part_that_selects_nothing_falls_back_to_the_one_gated_invocation(self):
         lib = {"kind": ["lib"], "name": "ai_memory", "test": True, "doctest": True}
@@ -835,7 +846,7 @@ class StepExec(unittest.TestCase):
     def test_impact_path_is_gated_too(self):
         r, _ = self.run_step(meta=metadata(), impact="recall_observability")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        self.assertIn("::notice::[#9229 margin] 'cargo test --lib': margin held", r.stdout)
+        self.assertIn("::notice::[#9229 margin] 'cargo test --lib': margin held: wall 10s of the 2100s budget", r.stdout)
 
     def test_a_red_gate_fails_the_step_even_when_cargo_passed(self):
         r, calls = self.run_step(meta=metadata(), red_gate=True)
@@ -843,7 +854,7 @@ class StepExec(unittest.TestCase):
         self.assertIn("stub gate red", r.stdout)
         # A red gate does not stop the later invocations or the whole-suite sum.
         self.assertIsNotNone(self.sum_line)
-        self.assertIn("whole sqlite suite: 4 invocations ran 0s", self.sum_line)
+        self.assertIn("whole sqlite suite: 4 invocations ran 40s", self.sum_line)
         self.assertEqual(self.sum_line.count("full suite shard "), 4)
         self.assertEqual(r.stdout.count("stub gate red"), 4)
         self.assertIn("whole sqlite suite: 4 invocations ran", r.stdout)
