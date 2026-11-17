@@ -16,10 +16,12 @@ Subcommands:
   invocation; sleeps to the margin deadline and, if still alive there, prints
   the in-flight ``::error::`` (the caller kills it when the suite ends first).
 * ``profile --log F [--top N]``: per-binary seconds of a cargo test log, ranked.
-* ``shard-args --metadata F [--features LIST]``: the second shard of the full suite. The full
-  ``cargo test`` runs as three sequential invocations, each under its own watchdog budget and this
+* ``shard-args --metadata F [--features LIST] [--part K/N]``: the second shard of the full suite.
+  The full ``cargo test`` runs as sequential invocations, each under its own watchdog budget and this
   gate: ``--lib``, then the arguments printed here (one per line: every non-lib target cargo's
   default selection runs, i.e. ``test = true`` and its required features enabled), then ``--doc``.
+  ``--part K/N`` prints the K-th of N round-robin parts of that list (manifest order), so N
+  invocations together run every target exactly once.
   Anything the derivation cannot judge (no single default package, a lib without ``test`` or
   ``doctest``, a target name outside ``[A-Za-z0-9_-]``, a required feature of another package) is
   exit 2, and the step then runs the unsharded suite instead (fail closed to full coverage).
@@ -70,7 +72,7 @@ EXIT_LOAD_REFUSED = 4  # the shared module cannot be loaded
 # The one shared-module load shape of scripts/ (#9365, ruling bcd0a15c; LoaderShape pins it).
 WA_PROG = "suite_budget"
 WA_RELATIVE_PATH = "workflow_annotation.py"
-WA_REQUIRED = ("annotation", "log_line")
+WA_REQUIRED = ("annotation", "log_line", "safe_value")
 WA_EXIT_LOAD_REFUSED = EXIT_LOAD_REFUSED
 WA_ERROR_TO_STDERR = False
 
@@ -110,6 +112,9 @@ _TARGET_NAME_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_-]{0,199}")  # no leading 
 _FEATURE_NAME_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.+-]{0,200}")
 # Target kinds the second shard selects, with the cargo flag that names one target of the kind.
 _SHARD_KIND_FLAGS = {"bin": "--bin", "test": "--test", "example": "--example", "bench": "--bench"}
+# Parts the second shard can be cut into (--part K/N); more is never needed for one package.
+MAX_PARTS = 16
+_PART_RE = re.compile(r"([0-9]{1,2})/([0-9]{1,2})")
 _LIB_KINDS = frozenset(("lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro"))
 
 
@@ -188,13 +193,14 @@ def profile_lines(lines, now=None):
     libtest's own ``finished in``. The LAST result line inside a binary is its own: a lib test that re-runs
     the binary as a child (env-isolated tests) prints the child's result line earlier. A binary with no
     result line is ``running`` (the kill or the in-flight point). The ``[#1492] ... watchdog budget`` notice
-    ends the invocation, so job-teardown lines after a kill are not charged to the last binary.
+    after a binary started ends the invocation (one before any binary is the previous invocation's, still in
+    the pipe when the caller measured the log offset), so job-teardown lines after a kill are not charged to the last binary.
     """
     rows, current, last_ts = [], None, None
     for raw in lines:
         ts, text = _parse_ts(raw.rstrip("\n"))
         text = _ANSI_RE.sub("", text)
-        if _END_RE.search(text):
+        if _END_RE.search(text) and current is not None:  # an earlier invocation's notice before any binary
             if ts is not None:
                 last_ts = ts
             break
@@ -264,7 +270,18 @@ def _enabled_features(features, requested):
     return enabled
 
 
-def shard_args(metadata, requested_features=()):
+def parse_part(text):
+    """``K/N`` with 1 <= K <= N <= MAX_PARTS, as a tuple; anything else is MalformedInput."""
+    m = _PART_RE.fullmatch(text) if isinstance(text, str) else None
+    if m is None:
+        raise MalformedInput("part %r is not K/N" % (text[:40] if isinstance(text, str) else text,))
+    k, n = int(m.group(1)), int(m.group(2))
+    if not 1 <= k <= n <= MAX_PARTS:
+        raise MalformedInput("part %r is outside 1..N with N at most %d" % (text, MAX_PARTS))
+    return k, n
+
+
+def shard_args(metadata, requested_features=(), part=(1, 1)):
     """Cargo target arguments of the second shard: every non-lib target cargo's default selection runs.
 
     ``metadata`` is the parsed ``cargo metadata --no-deps --format-version 1``. The partition is exact by
@@ -313,12 +330,15 @@ def shard_args(metadata, requested_features=()):
         args.extend((_SHARD_KIND_FLAGS[kinds[0]], name))
     if libs != 1:
         raise MalformedInput("the package must have exactly one lib target, found %d" % libs)
-    if not args:
-        raise MalformedInput("the second shard selects no target")
-    return args
+    k, n = part
+    pairs = list(zip(args[0::2], args[1::2]))[k - 1::n]  # round-robin: parts are disjoint and complete
+    if not pairs:
+        raise MalformedInput("the second shard selects no target" if n == 1
+                             else "the second shard part %d/%d selects no target" % (k, n))
+    return [item for pair in pairs for item in pair]
 
 
-def run_shard_args(metadata_path, features):
+def run_shard_args(metadata_path, features, part_text="1/1"):
     requested = [f for f in re.split(r"[ ,]+", features.strip()) if f] if features else []
     try:
         try:
@@ -327,13 +347,13 @@ def run_shard_args(metadata_path, features):
         except (OSError, ValueError) as exc:
             raise MalformedInput("cargo metadata %s cannot be read as JSON (%s)"
                                  % (metadata_path, type(exc).__name__)) from None
-        args = shard_args(metadata, requested)
+        args = shard_args(metadata, requested, parse_part(part_text))
     except MalformedInput as exc:
         print(wa.annotation("warning", "%s shard-args: %s; the full suite runs unsharded (#9229)" % (TAG, exc)),
               file=sys.stderr, flush=True)
         return EXIT_MALFORMED
-    for arg in args:
-        print(arg)
+    for arg in args:  # flags and [A-Za-z0-9_-] names, so safe_value is the identity on them
+        print(wa.safe_value(arg))
     return EXIT_OK
 
 
@@ -445,6 +465,7 @@ def main(argv=None):
     s = sub.add_parser("shard-args")
     s.add_argument("--metadata", required=True)
     s.add_argument("--features", default="")
+    s.add_argument("--part", default="1/1")
     args = p.parse_args(argv)
     if args.cmd == "gate":
         return run_gate(args.label, args.elapsed, args.budget, args.rc, args.margin_pct, args.log,
@@ -452,7 +473,7 @@ def main(argv=None):
     if args.cmd == "timer":
         return run_timer(args.label, args.budget, args.margin_pct, args.log, args.log_offset)
     if args.cmd == "shard-args":
-        return run_shard_args(args.metadata, args.features)
+        return run_shard_args(args.metadata, args.features, args.part)
     return run_profile(args.log, args.top)
 
 

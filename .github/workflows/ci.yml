@@ -2090,12 +2090,28 @@ jobs:
             # (folded into $FEAT/$TAIL there), so these two cargo lines stay the
             # exact `... "$@" ...` shape the #2657 / #2500 invariant gates pin.
             started=$(date +%s)
+            # #9229 suite margin gate, opt-in by the SUITE_MARGIN_GATE=1 prefix of the sqlite
+            # dispatch (never inside run_shard: its chains share one shrinking budget). The
+            # timer prints the named red at (100 - 20)% of the budget while cargo still runs,
+            # BEFORE the watchdog kill; the gate after the run judges the wall (a pass that
+            # used more than that is a red too). Logic: scripts/ci/suite_budget.py.
+            local timer_pid="" log_offset=0 gate_rc=0
+            if [ "${SUITE_MARGIN_GATE:-0}" = "1" ]; then
+              log_offset=$(( $(wc -c < "$RESULT_LOG" 2>/dev/null || echo 0) + 0 ))
+              python3 -I scripts/ci/suite_budget.py timer --label "$label" --budget "$WATCHDOG_SECS" --log "$RESULT_LOG" --log-offset "$log_offset" &
+              timer_pid=$!
+            fi
             if [ -n "$TIMEOUT_BIN" ]; then
               "$TIMEOUT_BIN" --signal=TERM --kill-after=60 "$WATCHDOG_SECS" cargo test --no-fail-fast "$@" || rc=$?
             else
               cargo test --no-fail-fast "$@" || rc=$?
             fi
             elapsed=$(( $(date +%s) - started ))
+            if [ -n "$timer_pid" ]; then
+              { kill "$timer_pid"; wait "$timer_pid"; } 2>/dev/null || true
+              python3 -I scripts/ci/suite_budget.py gate --label "$label" --elapsed "$elapsed" --budget "$WATCHDOG_SECS" --rc "$rc" --log "$RESULT_LOG" --log-offset "$log_offset" || gate_rc=$?
+            fi
+            if [ "$rc" -eq 0 ] && [ "$gate_rc" -ne 0 ]; then return "$gate_rc"; fi
             # #6202 — make the margin visible in EVERY green run so the budget
             # is re-tuned from data, not from the next surprise kill.
             if [ "$rc" -eq 0 ]; then
@@ -2144,16 +2160,58 @@ jobs:
             # is the plain `--no-run` of the same feature set (lib + doc deps).
             cargo test --no-run "$@" || return "$?"
             started=$(date +%s)
+            # #9229: the same opt-in suite margin gate as run_tests.
+            local timer_pid="" log_offset=0 gate_rc=0
+            if [ "${SUITE_MARGIN_GATE:-0}" = "1" ]; then
+              log_offset=$(( $(wc -c < "$RESULT_LOG" 2>/dev/null || echo 0) + 0 ))
+              python3 -I scripts/ci/suite_budget.py timer --label "$label" --budget "$WATCHDOG_SECS" --log "$RESULT_LOG" --log-offset "$log_offset" &
+              timer_pid=$!
+            fi
             if [ -n "$TIMEOUT_BIN" ]; then
               "$TIMEOUT_BIN" --signal=TERM --kill-after=60 "$WATCHDOG_SECS" cargo test --doc --no-fail-fast "$@" || rc=$?
             else
               cargo test --doc --no-fail-fast "$@" || rc=$?
             fi
             elapsed=$(( $(date +%s) - started ))
+            if [ -n "$timer_pid" ]; then
+              { kill "$timer_pid"; wait "$timer_pid"; } 2>/dev/null || true
+              python3 -I scripts/ci/suite_budget.py gate --label "$label" --elapsed "$elapsed" --budget "$WATCHDOG_SECS" --rc "$rc" --log "$RESULT_LOG" --log-offset "$log_offset" || gate_rc=$?
+            fi
+            if [ "$rc" -eq 0 ] && [ "$gate_rc" -ne 0 ]; then return "$gate_rc"; fi
             echo "::notice::[#1492] '${label}' ran ${elapsed}s of the ${WATCHDOG_SECS}s per-invocation watchdog budget (tier=${TIER:-sqlite} node=${CI_NODE:-unknown})"
             if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
               echo "::error::[#1492 watchdog] '${label}' exceeded the ${WATCHDOG_SECS}s per-invocation timeout (tier=${TIER:-sqlite}) and was terminated."
             fi
+            return "$rc"
+          }
+          # #9229 — the sqlite full suite as four sequential invocations, each under its
+          # own per-invocation budget and the margin gate: lib unit tests (--lib), every
+          # other target of cargo's default test selection (derived from cargo metadata
+          # by suite_budget.py shard-args, so a new tests/*.rs is never missed) in two
+          # round-robin parts, then doc tests. Same test set as one `cargo test`;
+          # ceilings unchanged, check names unchanged (same step). A failed shard does
+          # not stop the later ones (#2500 evidence, precedent run_shard); the function
+          # returns the first failure. When a derivation is refused it warns and runs
+          # the one unsharded invocation, gated (fail closed to full coverage).
+          run_sqlite_full_suite() {
+            local rc=0 r=0 meta="${RUNNER_TEMP:-.}/suite-9229-metadata.json" list="${RUNNER_TEMP:-.}/suite-9229-shard.txt"
+            local part_1=() part_2=() line
+            if cargo metadata --no-deps --format-version 1 > "$meta"; then
+              if python3 -I scripts/ci/suite_budget.py shard-args --metadata "$meta" --part 1/2 > "$list"; then
+                while IFS= read -r line; do part_1+=("$line"); done < "$list"
+              fi
+              if python3 -I scripts/ci/suite_budget.py shard-args --metadata "$meta" --part 2/2 > "$list"; then
+                while IFS= read -r line; do part_2+=("$line"); done < "$list"
+              fi
+            fi
+            if [ "${#part_1[@]}" -eq 0 ] || [ "${#part_2[@]}" -eq 0 ]; then
+              SUITE_MARGIN_GATE=1 run_tests "full suite (cargo test)" $FEAT $TAIL
+              return
+            fi
+            SUITE_MARGIN_GATE=1 run_tests "full suite shard 1/4: lib unit tests" $FEAT --lib $TAIL || rc=$?
+            SUITE_MARGIN_GATE=1 run_tests "full suite shard 2/4: bins, integration tests and tested examples, part 1/2" $FEAT "${part_1[@]}" $TAIL || { r=$?; [ "$rc" -ne 0 ] || rc=$r; }
+            SUITE_MARGIN_GATE=1 run_tests "full suite shard 3/4: bins, integration tests and tested examples, part 2/2" $FEAT "${part_2[@]}" $TAIL || { r=$?; [ "$rc" -ne 0 ] || rc=$r; }
+            SUITE_MARGIN_GATE=1 run_doc_tests "full suite shard 4/4: doc tests" $FEAT $TAIL || { r=$?; [ "$rc" -ne 0 ] || rc=$r; }
             return "$rc"
           }
           # #6383 / #6386 — class (a) binaries when the opt-in lane is on:
@@ -2402,7 +2460,7 @@ jobs:
               if [ "${TIER:-sqlite}" = "enterprise-fed" ]; then
                 run_sharded "full suite (sharded cargo test)" 1
               else
-                run_tests "full suite (cargo test)" $FEAT $TAIL
+                run_sqlite_full_suite
               fi
               ;;
             *)
@@ -2417,13 +2475,13 @@ jobs:
                 done
                 run_sharded "impact-selected (sharded: ${TEST_IMPACT})" 0 "${ARGS[@]}"
               else
-                run_tests "cargo test --lib" $FEAT --lib $TAIL
+                SUITE_MARGIN_GATE=1 run_tests "cargo test --lib" $FEAT --lib $TAIL
                 # Dispatch each impacted tests/*.rs binary
                 ARGS=()
                 for t in "${impact_words[@]}"; do
                   ARGS+=(--test "$t")
                 done
-                run_tests "impact-selected integration binaries (${TEST_IMPACT})" $FEAT "${ARGS[@]}" $TAIL
+                SUITE_MARGIN_GATE=1 run_tests "impact-selected integration binaries (${TEST_IMPACT})" $FEAT "${ARGS[@]}" $TAIL
               fi
               ;;
           esac
