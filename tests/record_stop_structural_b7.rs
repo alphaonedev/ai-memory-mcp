@@ -568,6 +568,9 @@ enum GateCredit {
     /// first one): nested block, closure, attribute, short circuit, macro
     /// argument, after a depth-1 exit, or after the first write.
     Conditional(usize),
+    /// #9414 the first gate call drops its result (`let _ =`, `.ok()`,
+    /// `unwrap_or..`; 0-based line).
+    Discarded(usize),
     /// No gate call at all.
     Absent,
 }
@@ -1660,7 +1663,7 @@ const B7_CONTROL_FLOW_ROWS_9414: &[(&str, &str, bool)] = &[
     (
         "gate in an if condition",
         "    if record_stop_status(conn)? {\n        return Ok((false, false));\n    }",
-        true,
+        false,
     ),
     (
         "conditional early return before the gate",
@@ -1743,6 +1746,408 @@ fn b7_gate_is_credited_only_where_it_runs_before_the_write_9414() {
         "#9414 control-flow rows misjudged:\n  {}",
         wrong.join("\n  ")
     );
+}
+
+/// #9414 — the exact B7 finding text for a credit (the main scan prints the
+/// same text after the fn name): `credited`, `conditional gate at line N`,
+/// `discarded gate at line N` or `no gate` (1-based lines).
+fn b7_credit_reason(credit: GateCredit) -> String {
+    match credit {
+        GateCredit::Credited => B7_REASON_CREDITED_9414.to_string(),
+        GateCredit::Conditional(at) => format!("conditional gate at line {}", at + 1),
+        GateCredit::Discarded(at) => format!("discarded gate at line {}", at + 1),
+        GateCredit::Absent => B7_REASON_NO_GATE_9414.to_string(),
+    }
+}
+
+const B7_REASON_CREDITED_9414: &str = "credited";
+const B7_REASON_NO_GATE_9414: &str = "no gate";
+
+/// #9414 — the finding text of every fn named `fn_name` in `src`, joined by
+/// `; ` (or the tokenizer finding). `src` gets the same preprocessing as the
+/// main scan.
+fn b7_try_reason(src: &str, fn_name: &str) -> Result<String, String> {
+    let text = join_string_continuations(strip_test_mod(src));
+    let mask = code_mask(&text)?;
+    let lines: Vec<&str> = text.lines().collect();
+    let masked: Vec<&str> = mask.lines().collect();
+    let spans = fn_spans(&masked, is_fn_start);
+    let wrappers = gate_wrappers(&lines, &masked, &spans);
+    let reasons: Vec<String> = spans
+        .iter()
+        .filter(|(_, _, n)| n == fn_name)
+        .map(|(s, e, _)| {
+            b7_credit_reason(span_gate_credit(
+                &lines, &masked, &spans, *s, *e, &wrappers,
+            ))
+        })
+        .collect();
+    if reasons.is_empty() {
+        return Ok(B7_REASON_NO_GATE_9414.to_string());
+    }
+    Ok(reasons.join("; "))
+}
+
+/// #9414 — `pub fn w` with exactly `body` (no write appended; line 1 is the
+/// signature, so the body's first line is line 2).
+fn b7_fn(body: &str) -> String {
+    format!("pub fn w(conn: &Connection, id: &str) -> Result<(bool, bool)> {{\n{body}\n    Ok((true, true))\n}}\n")
+}
+
+/// #9414 ruling 1 (dominance rule) condition table:
+/// `(condition, label, body of `pub fn w`, fn to judge, exact finding text)`.
+/// Condition 1: the gate is a direct statement `<path>gate(..)?;` (or
+/// `.await?;`); anything else is `conditional gate`, a dropped result is
+/// `discarded gate`. 2: every write after the gate, inside its block.
+/// 3: a write in a closure / async block / nested fn defined before the gate.
+/// 4: an exit before the gate only when no write precedes it. 5: a labelled
+/// break that jumps over the gate.
+const B7_CONDITION_ROWS_9414: &[(u8, &str, &str, &str, &str)] = &[
+    (
+        1,
+        "direct gate",
+        "    gate_storage_conn(conn)?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "credited",
+    ),
+    (
+        1,
+        "direct gate through a path",
+        "    crate::storage::record_stop::gate_storage_conn(conn)?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "credited",
+    ),
+    (
+        1,
+        "direct awaited gate",
+        "    store.gate_record_stop().await?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "credited",
+    ),
+    (
+        1,
+        "gate in an if condition",
+        "    if gate_storage_conn(conn).is_err() {\n        return Ok((false, false));\n    }\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        1,
+        "gate as an if-let scrutinee",
+        "    if let Err(e) = gate_storage_conn(conn) {\n        return Err(e);\n    }\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        1,
+        "gate as a match scrutinee",
+        "    match gate_storage_conn(conn) {\n        Ok(()) => {}\n        Err(e) => return Err(e),\n    }\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        1,
+        "gate in a match arm",
+        "    match id.len() {\n        0 => gate_storage_conn(conn)?,\n        _ => {}\n    }\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 3",
+    ),
+    (
+        1,
+        "gate in a loop body with the write",
+        "    loop {\n        gate_storage_conn(conn)?;\n        conn.execute(\"UPDATE t SET a = 1\", [])?;\n        break;\n    }",
+        "w",
+        "conditional gate at line 3",
+    ),
+    (
+        1,
+        "gate in a while condition",
+        "    while gate_storage_conn(conn).is_ok() {\n        conn.execute(\"UPDATE t SET a = 1\", [])?;\n        break;\n    }",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        1,
+        "gate in a closure with the write",
+        "    let run = |c: &Connection| -> Result<()> {\n        gate_storage_conn(c)?;\n        c.execute(\"UPDATE t SET a = 1\", [])?;\n        Ok(())\n    };\n    run(conn)?;",
+        "w",
+        "conditional gate at line 3",
+    ),
+    (
+        1,
+        "gate in an async block with the write",
+        "    let fut = async {\n        gate_storage_conn(conn)?;\n        conn.execute(\"UPDATE t SET a = 1\", [])?;\n        Ok::<(), Error>(())\n    };\n    block_on(fut)?;",
+        "w",
+        "conditional gate at line 3",
+    ),
+    (
+        1,
+        "gate in a macro argument",
+        "    log_err!(gate_storage_conn(conn)?);\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        1,
+        "gate in a call argument",
+        "    wrap(gate_storage_conn(conn))?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        1,
+        "gate in a tuple binding",
+        "    let _pair = (gate_storage_conn(conn)?, 1);\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        1,
+        "gate result mapped before ?",
+        "    gate_storage_conn(conn).map_err(Error::from)?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        1,
+        "gate without ?",
+        "    gate_storage_conn(conn);\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        1,
+        "let _ = gate",
+        "    let _ = gate_storage_conn(conn);\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "discarded gate at line 2",
+    ),
+    (
+        1,
+        "gate .ok()",
+        "    gate_storage_conn(conn).ok();\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "discarded gate at line 2",
+    ),
+    (
+        1,
+        "gate unwrap_or",
+        "    gate_storage_conn(conn).unwrap_or(());\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "discarded gate at line 2",
+    ),
+    (
+        2,
+        "write before the gate",
+        "    conn.execute(\"UPDATE t SET b = 2\", [])?;\n    gate_storage_conn(conn)?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 3",
+    ),
+    (
+        2,
+        "write outside the gate's block",
+        "    if !id.is_empty() {\n        gate_storage_conn(conn)?;\n    }\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 3",
+    ),
+    (
+        2,
+        "gate and write in one if-let block",
+        "    if let Some(_x) = id.chars().next() {\n        gate_storage_conn(conn)?;\n        conn.execute(\"UPDATE t SET a = 1\", [])?;\n    }",
+        "w",
+        "credited",
+    ),
+    (
+        3,
+        "write in a closure defined before the gate",
+        "    let f = || conn.execute(\"UPDATE t SET b = 2\", []);\n    gate_storage_conn(conn)?;\n    f()?;",
+        "w",
+        "conditional gate at line 3",
+    ),
+    (
+        3,
+        "write in a braced closure defined before the gate",
+        "    let f = || {\n        conn.execute(\"UPDATE t SET b = 2\", [])\n    };\n    gate_storage_conn(conn)?;\n    f()?;",
+        "w",
+        "conditional gate at line 5",
+    ),
+    (
+        3,
+        "write in an async block defined before the gate",
+        "    let fut = async {\n        conn.execute(\"UPDATE t SET b = 2\", [])\n    };\n    gate_storage_conn(conn)?;\n    block_on(fut)?;",
+        "w",
+        "conditional gate at line 5",
+    ),
+    (
+        3,
+        "write in a nested fn defined before the gate",
+        "    fn inner(conn: &Connection) -> Result<usize> {\n        conn.execute(\"UPDATE t SET b = 2\", [])\n    }\n    gate_storage_conn(conn)?;\n    inner(conn)?;",
+        "inner",
+        "no gate",
+    ),
+    (
+        4,
+        "return before the gate, no write before",
+        "    if id.is_empty() {\n        return Ok((false, false));\n    }\n    gate_storage_conn(conn)?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "credited",
+    ),
+    (
+        4,
+        "return before the gate after a write",
+        "    conn.execute(\"UPDATE t SET b = 2\", [])?;\n    if id.is_empty() {\n        return Ok((false, false));\n    }\n    gate_storage_conn(conn)?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 6",
+    ),
+    (
+        4,
+        "break before the gate, no write before",
+        "    for x in id.chars() {\n        if x == 'a' {\n            break;\n        }\n    }\n    gate_storage_conn(conn)?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "credited",
+    ),
+    (
+        4,
+        "break before the gate after a write",
+        "    for x in id.chars() {\n        conn.execute(\"UPDATE t SET b = 2\", [])?;\n        if x == 'a' {\n            break;\n        }\n    }\n    gate_storage_conn(conn)?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 8",
+    ),
+    (
+        4,
+        "continue before the gate, no write before",
+        "    for x in id.chars() {\n        if x == 'a' {\n            continue;\n        }\n    }\n    gate_storage_conn(conn)?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "credited",
+    ),
+    (
+        4,
+        "continue before the gate after a write",
+        "    for x in id.chars() {\n        conn.execute(\"UPDATE t SET b = 2\", [])?;\n        if x == 'a' {\n            continue;\n        }\n    }\n    gate_storage_conn(conn)?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 8",
+    ),
+    (
+        4,
+        "? before the gate, no write before",
+        "    let _n = id.parse::<i64>()?;\n    gate_storage_conn(conn)?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "credited",
+    ),
+    (
+        4,
+        "? before the gate after a write",
+        "    conn.execute(\"UPDATE t SET b = 2\", [])?;\n    let _n = id.parse::<i64>()?;\n    gate_storage_conn(conn)?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 4",
+    ),
+    (
+        4,
+        "diverging macro before the gate, no write before",
+        "    if id.is_empty() {\n        panic!(\"empty id\");\n    }\n    gate_storage_conn(conn)?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "credited",
+    ),
+    (
+        4,
+        "diverging macro before the gate after a write",
+        "    conn.execute(\"UPDATE t SET b = 2\", [])?;\n    if id.is_empty() {\n        panic!(\"empty id\");\n    }\n    gate_storage_conn(conn)?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 6",
+    ),
+    (
+        4,
+        "unconditional return directly before the gate",
+        "    return Ok((false, false));\n    gate_storage_conn(conn)?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 3",
+    ),
+    (
+        5,
+        "labelled block break jumps over the gate",
+        "    'pre: {\n        if id.is_empty() {\n            break 'pre;\n        }\n        gate_storage_conn(conn)?;\n    }\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 6",
+    ),
+    (
+        5,
+        "labelled loop break jumps over the gate",
+        "    'outer: loop {\n        if id.is_empty() {\n            break 'outer;\n        }\n        gate_storage_conn(conn)?;\n        break;\n    }\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 6",
+    ),
+    (
+        5,
+        "labelled block break that lands before the gate",
+        "    'pre: {\n        if id.is_empty() {\n            break 'pre;\n        }\n    }\n    gate_storage_conn(conn)?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "credited",
+    ),
+];
+
+/// #9414 — the conditions the ruling numbers (each has at least one row).
+const B7_RULED_CONDITIONS_9414: &[u8] = &[1, 2, 3, 4, 5];
+
+#[test]
+fn b7_gate_conditions_of_the_dominance_rule_9414() {
+    let mut wrong = Vec::new();
+    for (cond, label, body, target, want) in B7_CONDITION_ROWS_9414 {
+        let got = b7_try_reason(&b7_fn(body), target);
+        if got.as_deref() != Ok(*want) {
+            wrong.push(format!("condition {cond} {label}: expected {want:?}, got {got:?}"));
+        }
+    }
+    for c in B7_RULED_CONDITIONS_9414 {
+        if !B7_CONDITION_ROWS_9414.iter().any(|r| r.0 == *c) {
+            wrong.push(format!("condition {c}: no row"));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "#9414 dominance-rule condition rows misjudged:\n  {}",
+        wrong.join("\n  ")
+    );
+}
+
+/// #9414 — the allowlist row count, pinned: a new row without a change here
+/// is red.
+const B7_ALLOWLIST_ROW_COUNT_9414: usize = 74;
+/// #9414 — rows the ruling accepted only with a reason citing the filed
+/// product change that removes them.
+const B7_RULED_ALLOWLIST_ROWS_9414: &[(&str, &str)] = &[
+    ("src/storage/mod.rs", "reown"),
+    ("src/store/postgres/reown_3124.rs", "reown_pg"),
+];
+const B7_RULED_ALLOWLIST_ISSUE_9414: &str = "#9438";
+
+#[test]
+fn b7_allowlist_rows_are_counted_and_ruled_rows_cite_their_issue_9414() {
+    let txt = include_str!("record_stop_b7_allowlist.txt");
+    let rows: Vec<&str> = txt
+        .lines()
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect();
+    assert_eq!(
+        rows.len(),
+        B7_ALLOWLIST_ROW_COUNT_9414,
+        "#9414 B7 allowlist row count changed; a row needs a reviewed count change"
+    );
+    let lines: Vec<&str> = txt.lines().collect();
+    for (file, name) in B7_RULED_ALLOWLIST_ROWS_9414 {
+        let row = format!("{file}\t{name}");
+        let at = lines.iter().position(|l| *l == row);
+        assert!(at.is_some(), "#9414 ruled allowlist row `{row}` is missing");
+        let reason: Vec<&str> = lines[..at.unwrap_or(0)]
+            .iter()
+            .rev()
+            .take_while(|l| l.starts_with('#') || !l.contains('\t'))
+            .copied()
+            .collect();
+        assert!(
+            reason.iter().any(|l| l.contains(B7_RULED_ALLOWLIST_ISSUE_9414)),
+            "#9414 ruled allowlist row `{row}` has no reason citing {B7_RULED_ALLOWLIST_ISSUE_9414}"
+        );
+    }
 }
 
 /// #9414 literal-form table: `(label, statement hiding a gate-looking text,
