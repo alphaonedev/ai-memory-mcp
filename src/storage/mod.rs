@@ -6753,8 +6753,8 @@ pub fn verify_forget_receipt(
 ///
 /// # Errors
 ///
-/// Never errors on a missing row / NULL (those map to `Ok(None)`);
-/// reserved `Result` for a future hard-SQL surface.
+/// A missing row / NULL map to `Ok(None)`; a query or decode error is
+/// propagated (#9435), never folded into "no genesis".
 pub fn read_cid_genesis(conn: &Connection, id: &str) -> Result<Option<Vec<u8>>> {
     use rusqlite::OptionalExtension;
     let genesis = conn
@@ -6763,8 +6763,7 @@ pub fn read_cid_genesis(conn: &Connection, id: &str) -> Result<Option<Vec<u8>>> 
             params![id],
             |r| r.get::<_, Option<Vec<u8>>>(0),
         )
-        .optional()
-        .unwrap_or(None)
+        .optional()?
         .flatten();
     Ok(genesis)
 }
@@ -9451,12 +9450,12 @@ pub fn find_synthesis_candidates(
 /// (`memories.cid`), or `None` when the row is absent or carries no cid
 /// (legacy / pre-v74). Used to stamp the lineage-DAG `source_cid` /
 /// `target_cid` mirror columns on link write.
-pub(crate) fn read_memory_cid(conn: &Connection, id: &str) -> Option<String> {
-    conn.query_row("SELECT cid FROM memories WHERE id = ?1", params![id], |r| {
+pub(crate) fn read_memory_cid(conn: &Connection, id: &str) -> Result<Option<String>> {
+    use rusqlite::OptionalExtension;
+    let cid = conn.query_row("SELECT cid FROM memories WHERE id = ?1", params![id], |r| {
         r.get::<_, Option<String>>(0)
-    })
-    .ok()
-    .flatten()
+    });
+    Ok(cid.optional()?.flatten())
 }
 
 /// v0.9.0 G13-mem (#1859) — is a would-be lineage edge FORWARD (i.e. does
@@ -9484,27 +9483,31 @@ pub(crate) fn read_memory_cid(conn: &Connection, id: &str) -> Option<String> {
 /// check ([`lineage_would_close_cycle`]): the edge is "forward" (rejected) iff
 /// it would close a cycle, and a clean non-cycle same-instant edge is still
 /// admitted, so legitimate same-batch DAG construction is preserved.
-fn lineage_edge_is_forward(conn: &Connection, source_id: &str, target_id: &str) -> bool {
-    let read_created_at = |id: &str| -> Option<String> {
-        conn.query_row(
-            "SELECT created_at FROM memories WHERE id = ?1",
-            params![id],
-            |r| r.get::<_, String>(0),
-        )
-        .ok()
+fn lineage_edge_is_forward(conn: &Connection, source_id: &str, target_id: &str) -> Result<bool> {
+    use rusqlite::OptionalExtension;
+    // #9435 — a query / decode error is an `Err` (the link is stopped), never
+    // "not forward" (which would ADMIT the edge); only an absent row is `None`.
+    let read_created_at = |id: &str| -> Result<Option<String>> {
+        Ok(conn
+            .query_row(
+                "SELECT created_at FROM memories WHERE id = ?1",
+                params![id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?)
     };
     let (Some(source_at), Some(target_at)) =
-        (read_created_at(source_id), read_created_at(target_id))
+        (read_created_at(source_id)?, read_created_at(target_id)?)
     else {
-        return false;
+        return Ok(false);
     };
     let (Ok(source_t), Ok(target_t)) = (
         chrono::DateTime::parse_from_rfc3339(&source_at),
         chrono::DateTime::parse_from_rfc3339(&target_at),
     ) else {
-        return false;
+        return Ok(false);
     };
-    match target_t.cmp(&source_t) {
+    Ok(match target_t.cmp(&source_t) {
         // Target genuinely newer than source: the forward (older -> newer)
         // direction that would let the graph cycle. Reject.
         std::cmp::Ordering::Greater => true,
@@ -9514,7 +9517,7 @@ fn lineage_edge_is_forward(conn: &Connection, source_id: &str, target_id: &str) 
         // strict `>` fast path would admit BOTH directions. Refuse only the
         // cycle-closing edge; a clean non-cycle same-instant edge is allowed.
         std::cmp::Ordering::Equal => lineage_would_close_cycle(conn, source_id, target_id),
-    }
+    })
 }
 
 /// #3041 — would adding the lineage edge `source_id` -> `target_id` (child ->
@@ -9682,7 +9685,7 @@ pub fn validate_link_pre_create(
         && crate::config::lineage_dag_enabled()
         && crate::models::MemoryLinkRelation::from_str(relation)
             .is_some_and(crate::models::MemoryLinkRelation::is_lineage)
-        && lineage_edge_is_forward(conn, source_id, target_id)
+        && lineage_edge_is_forward(conn, source_id, target_id)?
     {
         // Reuse the LINK_CYCLE_ERR_PREFIX envelope (HTTP 409 CONFLICT).
         return Err(anyhow::Error::new(StorageError::LinkReflectionCycle {
@@ -10087,8 +10090,8 @@ pub fn create_link_signed_with_window(
     let (source_cid, target_cid): (Option<String>, Option<String>) =
         if crate::config::lineage_dag_enabled() {
             (
-                read_memory_cid(conn, source_id),
-                read_memory_cid(conn, target_id),
+                read_memory_cid(conn, source_id)?,
+                read_memory_cid(conn, target_id)?,
             )
         } else {
             (None, None)

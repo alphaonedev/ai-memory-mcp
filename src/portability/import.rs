@@ -846,12 +846,14 @@ fn apply_all_classes(
         let (source_cid, target_cid): (Option<String>, Option<String>) =
             if crate::config::lineage_dag_enabled() {
                 (
-                    link.source_cid
-                        .clone()
-                        .or_else(|| crate::storage::read_memory_cid(conn, &link.source_id)),
-                    link.target_cid
-                        .clone()
-                        .or_else(|| crate::storage::read_memory_cid(conn, &link.target_id)),
+                    link.source_cid.clone().map_or_else(
+                        || crate::storage::read_memory_cid(conn, &link.source_id),
+                        |c| Ok(Some(c)),
+                    )?,
+                    link.target_cid.clone().map_or_else(
+                        || crate::storage::read_memory_cid(conn, &link.target_id),
+                        |c| Ok(Some(c)),
+                    )?,
                 )
             } else {
                 (None, None)
