@@ -47,6 +47,13 @@ CI_NO_CARGO_MSG = "the real-manifest check cannot run on a CI leg without cargo:
 NO_CARGO_SKIP_MSG = "cargo metadata unavailable: no cargo on PATH"
 
 
+def manifest_check_gap(environ, detail):
+    """What a test does when the real-manifest check cannot run: ("fail", text) on a CI leg, ("skip", text) elsewhere."""
+    if environ.get(CI_ENV) == "true":
+        return "fail", CI_NO_CARGO_MSG if detail is None else "%s (%s)" % (CI_NO_CARGO_MSG, detail)
+    return "skip", "cargo metadata unavailable: %s" % ("no cargo on PATH" if detail is None else detail)
+
+
 def load():
     spec = importlib.util.spec_from_file_location("suite_budget_9229", str(SCRIPT))
     module = importlib.util.module_from_spec(spec)
@@ -349,17 +356,23 @@ class ShardArgs(unittest.TestCase):
         self.assertEqual(self.sb.shard_args(metadata(), ["sal-postgres"]),
                          DEFAULT_SHARD[:6] + ["--test", "gated"] + DEFAULT_SHARD[6:])
 
+    def fail_or_skip(self, gap):
+        kind, text = gap
+        if kind == "fail":
+            self.fail(text)
+        self.skipTest(text)
+
     def test_every_tested_target_of_the_real_manifest_is_selected_once(self):
         with scratch() as d:
             meta = Path(d) / "m.json"
-            if shutil.which("cargo") is None:  # a host without a toolchain (the bare runner image) skips the same way
-                self.skipTest("cargo metadata unavailable: no cargo on PATH")
+            if shutil.which("cargo") is None:  # a host without a toolchain skips; a CI leg fails
+                self.fail_or_skip(manifest_check_gap(os.environ, None))
             with meta.open("w", encoding="utf-8") as out:
                 proc = subprocess.run(["cargo", "metadata", "--no-deps", "--format-version", "1", "--offline"],
                                       cwd=str(REPO), stdout=out, stderr=subprocess.PIPE, timeout=120,
                                       check=False)
             if proc.returncode != 0:
-                self.skipTest("cargo metadata unavailable: %s" % proc.stderr[-200:])
+                self.fail_or_skip(manifest_check_gap(os.environ, proc.stderr[-200:]))
             data = json.loads(meta.read_text(encoding="utf-8"))
         args = self.sb.shard_args(data)
         names = args[1::2]
@@ -547,6 +560,24 @@ class RealManifestCheckOnCi(unittest.TestCase):
         result = self.run_real_manifest_cell({})
         self.assertEqual((result.failures, result.errors), ([], []))
         self.assertEqual([reason for _, reason in result.skipped], [NO_CARGO_SKIP_MSG])
+
+    def test_ci_leg_with_failing_cargo_metadata_fails_and_other_host_skips(self):
+        failed = subprocess.CompletedProcess([], 1, stderr=b"boom")
+        for environ, want in (({CI_ENV: "true"}, "fail"), ({}, "skip")):
+            case = ShardArgs(REAL_MANIFEST_TEST)
+            result = unittest.TestResult()
+            with mock.patch.dict(os.environ, environ), mock.patch.object(shutil, "which", return_value="cargo"), \
+                    mock.patch.object(subprocess, "run", return_value=failed):
+                if not environ:
+                    os.environ.pop(CI_ENV, None)
+                case.run(result)
+            if want == "fail":
+                self.assertEqual(result.skipped, [])
+                self.assertTrue(result.failures[0][1].rstrip().endswith(
+                    "AssertionError: %s (b'boom')" % CI_NO_CARGO_MSG))
+            else:
+                self.assertEqual((result.failures, result.errors), ([], []))
+                self.assertEqual([r for _, r in result.skipped], ["cargo metadata unavailable: b'boom'"])
 
 
 class WholeSuite(unittest.TestCase):
