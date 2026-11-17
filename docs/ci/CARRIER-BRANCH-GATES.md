@@ -236,7 +236,13 @@ constant hides the growth.
   a named red (exit 3). N is the number of invocations the step ran (4 for the
   shards, 1 for the fallback); a row count other than N, an empty, non-numeric
   or negative seconds value, or a duplicated label is exit 2 with a named
-  reason. The unsharded fallback is checked the same way.
+  reason. The unsharded fallback is checked the same way. An invocation that
+  ended before its gate (a failed prebuild) keeps no row: when the step's
+  exit code is already non-zero and fewer than N rows were kept, the sum is
+  not judged and the step prints one notice, `::notice::[#9229 margin] whole
+  sqlite suite: not judged, an invocation ended before its gate (rc <rc>);
+  <k> of <N> invocation rows kept (#9229)`, and ends with the first failing
+  code unchanged; with exit code 0 a short count stays the exit-2 red.
 - **Shards.** The full suite runs as four sequential invocations of the same
   test set as one `cargo test`, each with its own budget: `--lib` (lib unit
   tests), then every other target of cargo's default test selection (bins,

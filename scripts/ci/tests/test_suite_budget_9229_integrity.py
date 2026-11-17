@@ -547,6 +547,19 @@ def unjudged_failures(results):
     return failures
 
 
+UNJUDGED_CONDITION = 'if [ "$rc" -ne 0 ] && [ "${#SUITE_SECONDS[@]}" -lt "$expect" ]; then'
+UNJUDGED_NOTICE_ARGS = '"$rc" "${#SUITE_SECONDS[@]}" "$expect"'
+SUITE_SUM_CALL = ('python3 -I scripts/ci/suite_budget.py suite-sum --expect "$expect" -- '
+                  '${SUITE_SECONDS[@]+"${SUITE_SECONDS[@]}"}')
+# Row: (name, anchor unique in run_sqlite_full_suite, operation, replacement, a row name that must turn red).
+UNJUDGED_MUTANTS = (
+    ("notice branch taken on rc 0", UNJUDGED_CONDITION, "replace",
+     'if [ "${#SUITE_SECONDS[@]}" -lt "$expect" ]; then', "N=4 k=2 rc=0"),
+    ("error still printed on rc 101", UNJUDGED_NOTICE_ARGS, "append", "; " + SUITE_SUM_CALL, "N=4 k=2 rc=101"),
+    ("rc overwritten by 2", UNJUDGED_NOTICE_ARGS, "append", "; rc=2", "N=4 k=2 rc=101"),
+)
+
+
 class UnjudgedSum(unittest.TestCase):
     """Class G (R2-2): a short row count after a failure is one notice, never a second margin-class red."""
 
@@ -560,6 +573,14 @@ class UnjudgedSum(unittest.TestCase):
         for name, _, _, _, _, _ in UNJUDGED_TABLE:
             with self.subTest(row=name):
                 self.assertNotIn(name, failures, results[name][1][-3000:])
+
+    def test_each_mutant_of_the_branch_is_red(self):
+        text = base.step_script()
+        for name, anchor, op, replacement, must_fail in UNJUDGED_MUTANTS:
+            with self.subTest(mutant=name):
+                failures = unjudged_failures(unjudged_results(mutate(text, "run_sqlite_full_suite", anchor, op,
+                                                                     replacement)))
+                self.assertIn(must_fail, failures, "mutant survived")
 
     def test_a_failed_prebuild_on_the_real_step_is_one_notice(self):
         results = _scenario_results()
