@@ -13,8 +13,8 @@ of GitHub Actions) against stub inputs. Expected values are computed in Python; 
 * #9433 ``check``/``Run tests (impact-aware)``: each shard log is printed between ``::stop-commands::<token>`` and
   ``::<token>::``; the token is 32 lowercase hex from the CSPRNG, new per block and per run, never shown earlier.
   Without a token the log is not printed (a fixed notice) and the exit code stays the base behaviour.
-* Siblings of the class in ci.yml: the changed-file list of ``cls`` and the PR-tree selector log of ``impact``
-  (same stop-commands block), and the enterprise-fed database name, which is cut in BYTES by Python (uutils
+* Siblings of the class in ci.yml: the changed-file list of ``cls`` (same stop-commands block), the PR-tree
+  selector log of ``impact`` (first 200 lines, ``::`` and ``##[`` spaced as the sed it replaces spaced ``::``), and the enterprise-fed database name, which is cut in BYTES by Python (uutils
   ``cut -c`` cuts characters, GNU ``cut -c`` cuts bytes).
 """
 
@@ -69,8 +69,7 @@ SHARD_FALLBACK = ("::notice::[#9433] %s shard output not printed: no stop-comman
                   "(fail closed; the step result is unchanged)\n")
 CHANGED_FALLBACK = (b"::notice::[#9433] changed-file list not printed: no stop-commands token could be made "
                     b"(fail closed; the classification is unchanged)\n")
-IMPACT_FALLBACK = (b"::notice::[#9433] impact selector log not printed: no stop-commands token could be made "
-                   b"(fail closed; the selection is unchanged)\n")
+IMPACT_LINES = 200
 
 REASON_CORPUS = {
     "v2_command": b"rust-observable-path ::error::x cargo_skip-rules-v3",
@@ -524,41 +523,53 @@ class ClassSiblings9433(unittest.TestCase):
         header_end = result.stdout.index(b"\n") + 1
         self.assertEqual(result.stdout[header_end:], CHANGED_FALLBACK)
 
-    def impact_expected(self, log):
+    @staticmethod
+    def impact_expected(log):
+        """The first 200 LF lines, "##[" -> "# #[" and "::" -> ": :" left to right, final newline added."""
         lines = log.split(b"\n")
         kept = [line + b"\n" for line in lines[:-1]] + ([lines[-1]] if lines[-1] else [])
-        shown = b"".join(line.replace(b"::", b": :") for line in kept[:200])
-        return shown
+        shown = b"".join(line.replace(b"##[", b"# #[").replace(b"::", b": :") for line in kept[:IMPACT_LINES])
+        return shown + (b"\n" if shown and not shown.endswith(b"\n") else b"")
 
-    def test_selector_log_is_inside_a_block(self):
+    def test_selector_log_is_spaced(self):
         corpus = {
             "v1_anywhere": b"selected: x ##[error]y\n",
+            "v1_repeated_hash": b"###[error]x ####[group]y\n",
             "v2_line": b"::error::x\n",
-            "hex_end": b"::" + GUESSED_HEX_TOKEN + b"::\n##[group]z\n",
+            "v2_triple_colon": b":::error::x\n  ::warning::y\n",
             "no_final_newline": b"a\n##[error]tail",
-            "over_200_lines": b"".join(b"line %d ##[error]\n" % i for i in range(250)),
-            "cr_only": b"a\r##[error]b\r",
+            "over_200_lines": b"".join(b"line %d ##[error] ::error::\n" % i for i in range(250)),
+            "cr_only": b"a\r##[error]b\r::error::c\r",
+            "non_utf8": b"\xff##[error]\xfe::error::x\n",
+            "large": b"##[" * (LARGE_VALUE_BYTES // 3) + b"\n",
+            "empty": b"",
         }
         for name, log in corpus.items():
-            with self.subTest(log=name):
-                log_file = self.box.root / ("impact-%s.log" % name)
-                log_file.write_bytes(log)
-                result, _ = run_bash('impact_log="$STUB_LOG"\n' + impact_span(), self.box.root,
-                                     env_extra={"STUB_LOG": str(log_file)})
-                self.assertEqual(result.returncode, 0)
-                _, end = take_block(self, result.stdout, 0, self.impact_expected(log))
-                self.assertEqual(result.stdout[end:], b"")
-                commands, stopped = runner_commands(result.stdout)
-                self.assertFalse(stopped)
-                self.assertTrue(all(c.startswith(("::stop-commands::", "<end ")) for c in commands), commands)
+            for locale in LOCALES:
+                with self.subTest(log=name, locale=locale):
+                    log_file = self.box.root / ("impact-%s.log" % name)
+                    log_file.write_bytes(log)
+                    result, took = run_bash('impact_log="$STUB_LOG"\n' + impact_span(), self.box.root,
+                                            locale=locale, env_extra={"STUB_LOG": str(log_file)})
+                    self.assertLess(took, LARGE_VALUE_CEILING_SECS)
+                    self.assertEqual(result.returncode, 0, result.stderr[-400:])
+                    self.assertEqual(result.stdout, self.impact_expected(log))
+                    self.assertEqual(runner_commands(result.stdout), ([], False))
 
-    def test_selector_log_without_token(self):
-        log_file = self.box.root / "impact-notoken.log"
-        log_file.write_bytes(b"##[error]x\n")
-        result, _ = run_bash('impact_log="$STUB_LOG"\n' + impact_span(), self.box.root,
-                             path=self.box.shim_bin("impact", "sys.exit(1)"), env_extra={"STUB_LOG": str(log_file)})
-        self.assertEqual(result.returncode, 0)
-        self.assertEqual(result.stdout, IMPACT_FALLBACK)
+    def test_selector_log_unreadable_fails_like_sed(self):
+        for name, python in (("directory", None), ("python_rc_1", "sys.exit(1)")):
+            with self.subTest(case=name):
+                log_file = self.box.root / ("impact-bad-%s.log" % name)
+                if python is None:
+                    log_file.mkdir()
+                    path = None
+                else:
+                    log_file.write_bytes(b"##[error]x\n::error::y\n")
+                    path = self.box.shim_bin("impact-" + name, python)
+                result, _ = run_bash('impact_log="$STUB_LOG"\n' + impact_span(), self.box.root, path=path,
+                                     env_extra={"STUB_LOG": str(log_file)})
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, b"")
 
     def test_fed_db_name_is_cut_in_bytes(self):
         run_id = "1234567890" + "é" * 30

@@ -726,16 +726,21 @@ jobs:
           # #9434: the reason can carry PR file names. It reaches the log only through
           # the escaper of the TRUSTED tree (trust_ref, as for the classifier above),
           # loaded by file path, never the workspace copy; else a fixed notice.
-          trust_wa="$trust_dir/scripts/ci/workflow_annotation.py"
+          # Paths are derived from trust_impact: the escaper is read from the git
+          # object of trust_ref into the trust directory, never from the workspace.
+          trust_ci="${trust_impact%/impact}"
+          trust_wa="$trust_ci/workflow_annotation.py"
+          wa_rel="${trust_ci#"$trust_dir"/}/workflow_annotation.py"
           wa_ok=false
-          if git show "${trust_ref}:scripts/ci/workflow_annotation.py" > "$trust_wa" 2>/dev/null; then wa_ok=true; fi
-          wa_prog='import importlib.util, os, sys
-          spec = importlib.util.spec_from_file_location("workflow_annotation", sys.argv[1])
-          wa = importlib.util.module_from_spec(spec)
-          spec.loader.exec_module(wa)
-          reason = os.fsencode(sys.argv[3]).decode("utf-8", "surrogateescape")
-          sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
-          print(wa.annotation("notice", wa.render(sys.argv[2], reason=reason)), flush=True)'
+          if git show "${trust_ref}:${wa_rel}" > "$trust_wa" 2>/dev/null; then wa_ok=true; fi
+          wa_prog='if True:
+            import importlib.util, os, sys
+            spec = importlib.util.spec_from_file_location("workflow_annotation", sys.argv[1])
+            wa = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(wa)
+            reason = os.fsencode(sys.argv[3]).decode("utf-8", "surrogateescape")
+            sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
+            print(wa.annotation("notice", wa.render(sys.argv[2], reason=reason)), flush=True)'
           if [ "$cargo_skip" = "true" ]; then
             if [ "$wa_ok" != "true" ] || ! python3 -I -c "$wa_prog" "$trust_wa" "cargo_skip=true ({reason}) - cargo legs no-op" "$cargo_skip_reason"; then
               echo "::notice::cargo_skip=true (reason not shown: the trusted escaper did not run) - cargo legs no-op"
@@ -838,36 +843,30 @@ jobs:
           selector_rc=0
           GITHUB_OUTPUT="$impact_out" scripts/ci-test-impact.sh "$IMPACT_BASE" "HEAD" "$CLS_BASE" > "$impact_log" 2>&1 || selector_rc=$?
           # #9433 class: the selector runs from the PR tree, so its log is PR bytes.
-          # The first 200 lines (":" ":" spaced as before) are printed only inside a
-          # stop-commands block with a CSPRNG token; Python, not sed, so a missing final
-          # newline is added and the end marker always starts its own line.
-          impact_tok=$(python3 -I -c 'import secrets; print(secrets.token_hex(16))' 2>/dev/null) || impact_tok=""
+          # The first 200 lines are printed with every "::" spaced to ": :" (as the
+          # sed this replaces did) and every "##[" (the legacy command form, read
+          # anywhere in a line) spaced to "# #["; Python, so a missing final
+          # newline is added and the next line always starts its own line.
           impact_print_rc=0
-          if [[ "$impact_tok" =~ ^[0-9a-f]{32}$ ]]; then
-            echo "::stop-commands::${impact_tok}"
-            python3 -I -c 'import sys
-          out = sys.stdout.buffer
-          last = b"\n"
-          try:
-              with open(sys.argv[1], "rb") as log:
-                  for count, line in enumerate(log):
-                      if count >= 200:
-                          break
-                      line = line.replace(b"::", b": :")
-                      out.write(line)
-                      last = line[-1:]
-          except OSError as err:
-              sys.stderr.write("[#9433] impact log not readable: %s\n" % err.strerror)
-              sys.exit(1)
-          finally:
-              if last != b"\n":
-                  out.write(b"\n")
-              out.flush()' "$impact_log" || impact_print_rc=$?
-            echo "::${impact_tok}::"
-          else
-            echo "::notice::[#9433] impact selector log not printed: no stop-commands token could be made (fail closed; the selection is unchanged)"
-            : < "$impact_log" || impact_print_rc=$?
-          fi
+          python3 -I -c 'if True:
+            import sys
+            out = sys.stdout.buffer
+            last = b"\n"
+            try:
+                with open(sys.argv[1], "rb") as log:
+                    for count, line in enumerate(log):
+                        if count >= 200:
+                            break
+                        line = line.replace(b"##[", b"# #[").replace(b"::", b": :")
+                        out.write(line)
+                        last = line[-1:]
+            except OSError as err:
+                sys.stderr.write("[#9433] impact log not readable: %s\n" % err.strerror)
+                sys.exit(1)
+            finally:
+                if last != b"\n":
+                    out.write(b"\n")
+                out.flush()' "$impact_log" || impact_print_rc=$?
           (exit "$impact_print_rc")
           # Allow-list: four keys, plain values. Any other line (a multi-line
           # value opener, a blank line, a foreign key, a control character)
@@ -2391,21 +2390,22 @@ jobs:
               shard_rc=0
               if [[ "$shard_tok" =~ ^[0-9a-f]{32}$ ]]; then
                 echo "::stop-commands::${shard_tok}"
-                python3 -I -c 'import sys
-          out = sys.stdout.buffer
-          last = b"\n"
-          try:
-              with open(sys.argv[1], "rb") as log:
-                  while chunk := log.read(1 << 20):
-                      out.write(chunk)
-                      last = chunk[-1:]
-          except OSError as err:
-              sys.stderr.write("[#9433] shard log not readable: %s\n" % err.strerror)
-              sys.exit(1)
-          finally:
-              if last != b"\n":
-                  out.write(b"\n")
-              out.flush()' "$sd/$n.log" || shard_rc=$?
+                python3 -I -c 'if True:
+                  import sys
+                  out = sys.stdout.buffer
+                  last = b"\n"
+                  try:
+                      with open(sys.argv[1], "rb") as log:
+                          while chunk := log.read(1 << 20):
+                              out.write(chunk)
+                              last = chunk[-1:]
+                  except OSError as err:
+                      sys.stderr.write("[#9433] shard log not readable: %s\n" % err.strerror)
+                      sys.exit(1)
+                  finally:
+                      if last != b"\n":
+                          out.write(b"\n")
+                      out.flush()' "$sd/$n.log" || shard_rc=$?
                 echo "::${shard_tok}::"
               else
                 echo "::notice::[#9433] ${n} shard output not printed: no stop-commands token could be made (fail closed; the step result is unchanged)"
