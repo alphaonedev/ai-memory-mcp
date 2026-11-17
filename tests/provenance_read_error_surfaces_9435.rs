@@ -153,3 +153,111 @@ fn link_unreadable_created_at_is_err_not_admitted() {
         "unexpected error text: {err:#}"
     );
 }
+
+// ---- PostgreSQL twin: consolidate source cid read -------------------------
+
+#[cfg(feature = "sal-postgres")]
+#[path = "common/pg_barrier.rs"]
+mod pg_barrier;
+
+#[cfg(feature = "sal-postgres")]
+mod pg_twin {
+    use ai_memory::models::{Memory, Tier};
+    use ai_memory::store::postgres::PostgresStore;
+    use ai_memory::store::{CallerContext, MemoryStore};
+
+    use super::pg_barrier;
+
+    const SCRATCH_PREFIX: &str = "prov9435";
+    const SOURCE_COUNT: usize = 2;
+    const AGENT: &str = "ai:test@host";
+    /// A NON-NULL integer in `memories.cid`: a NULL would decode (sqlx skips the type check on NULL).
+    const POISON_CID_SQL: &str = "ALTER TABLE memories ALTER COLUMN cid TYPE integer USING 1";
+    const NULL_CID_SQL: &str = "UPDATE memories SET cid = NULL";
+    const ERR_PG_CID_DECODE: &str = "backend unavailable: postgres: read source cid: error occurred while decoding column \"cid\": mismatched types; Rust type `core::option::Option<alloc::string::String>` (as SQL type `TEXT`) is not compatible with SQL type `INT4`";
+
+    fn mem(id: &str, ns: &str) -> Memory {
+        Memory {
+            id: id.to_string(),
+            namespace: ns.to_string(),
+            title: format!("t {id}"),
+            content: format!("content {id}"),
+            created_at: super::NEWER_STAMP.to_string(),
+            updated_at: super::NEWER_STAMP.to_string(),
+            metadata: serde_json::json!({ "agent_id": AGENT }),
+            ..Memory::default()
+        }
+    }
+
+    async fn seeded(url: &str) -> (pg_barrier::ScratchDb, PostgresStore, Vec<String>, String) {
+        let scratch = pg_barrier::ScratchDb::create(url, SCRATCH_PREFIX)
+            .await
+            .expect("create scratch database");
+        let store = PostgresStore::connect(&scratch.url())
+            .await
+            .expect("connect scratch database");
+        let ctx = CallerContext::for_agent(AGENT);
+        let ns = format!("prov-9435-{}", uuid::Uuid::new_v4());
+        let mut ids = Vec::new();
+        for _ in 0..SOURCE_COUNT {
+            let id = uuid::Uuid::new_v4().to_string();
+            store
+                .store(&ctx, &mem(&id, &ns))
+                .await
+                .expect("store source");
+            ids.push(id);
+        }
+        (scratch, store, ids, ns)
+    }
+
+    async fn run_consolidate(
+        store: &PostgresStore,
+        ids: &[String],
+        ns: &str,
+    ) -> Result<String, ai_memory::store::StoreError> {
+        let ctx = CallerContext::for_agent(AGENT);
+        store
+            .consolidate(
+                &ctx,
+                ids,
+                "merged",
+                "merged body",
+                ns,
+                &Tier::Long,
+                "consolidation",
+                AGENT,
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn pg_consolidate_unreadable_source_cid_is_err() {
+        let Ok(url) = std::env::var("AI_MEMORY_TEST_POSTGRES_URL") else {
+            return;
+        };
+        let (_scratch, store, ids, ns) = seeded(&url).await;
+        sqlx::query(POISON_CID_SQL)
+            .execute(store.pool())
+            .await
+            .expect("poison cid column");
+        let err = run_consolidate(&store, &ids, &ns)
+            .await
+            .expect_err("cid decode error must surface");
+        assert_eq!(err.to_string(), ERR_PG_CID_DECODE);
+    }
+
+    #[tokio::test]
+    async fn pg_consolidate_null_source_cid_is_ok() {
+        let Ok(url) = std::env::var("AI_MEMORY_TEST_POSTGRES_URL") else {
+            return;
+        };
+        let (_scratch, store, ids, ns) = seeded(&url).await;
+        sqlx::query(NULL_CID_SQL)
+            .execute(store.pool())
+            .await
+            .expect("null cids");
+        run_consolidate(&store, &ids, &ns)
+            .await
+            .expect("NULL source cids consolidate cleanly");
+    }
+}
