@@ -105,11 +105,8 @@ impl Lexer<'_> {
     }
 
     fn fail(&self, at: usize, reason: &'static str) -> TokenError {
-        let line = self.src.as_bytes()[..at]
-            .iter()
-            .filter(|b| **b == b'\n')
-            .count()
-            + 1;
+        // One more segment than newlines before `at`: the 1-based line.
+        let line = self.src.as_bytes()[..at].split(|b| *b == b'\n').count();
         TokenError { line, reason }
     }
 

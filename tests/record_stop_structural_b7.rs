@@ -39,7 +39,7 @@
 //!   a gate whose result is discarded still reads as gated.
 //! - **Every byte is classified (#9414).** Comments and literals are read by
 //!   the one tokenizer in `tests/common/rust_tokens.rs`; a form it cannot
-//!   classify fails the scan naming file:line.
+//!   classify fails the scan naming `file:line`.
 //! - **Macro-generated code is invisible.** Write SQL or a gate call
 //!   produced by a macro expansion is never seen.
 //! - **Enclosing function is lexical.** Write SQL is attributed to the
@@ -635,11 +635,11 @@ fn span_gate_credit(
     let mut next_id = 0usize;
     let mut paren = 0i64;
     let mut opened = false;
-    'lines: for k in s..e.min(masked.len()) {
+    'lines: for (k, row) in masked.iter().enumerate().take(e).skip(s) {
         if opened && writes.contains(&k) {
             write_blocks.push((k, stack.iter().map(|l| l.id).collect()));
         }
-        let chars: Vec<char> = masked[k].chars().collect();
+        let chars: Vec<char> = row.chars().collect();
         let mut i = 0;
         while i < chars.len() {
             let ch = chars[i];
