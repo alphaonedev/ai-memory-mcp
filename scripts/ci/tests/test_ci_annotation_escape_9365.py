@@ -2595,12 +2595,19 @@ class CleanBytesAndBoundary(unittest.TestCase):
 R3_BOUNDARY_DISTINCT_FLOOR = 51  # distinct finished lines of the 100 boundary cells, measured with each cell called in place
 CODEQL_SCOPE_FILES = ("scripts/ci/tests/test_ci_annotation_escape_9365.py", "scripts/ci/partition_test_binaries.py",
                       "scripts/ci/shared_cargo_target.py")
-CODEQL_SHAPES = ("unused-import", "empty-except", "loop-variable-capture", "print-during-import")
+CODEQL_SHAPES = ("unused-import", "empty-except", "loop-variable-capture", "print-during-import",
+                 "unexpected-raise-in-special-method")
+# py/unexpected-raise-in-special-method (alerts 892, 893): the exception a special method may raise, by method.
+SPECIAL_METHOD_RAISES = {"__getattr__": "AttributeError", "__getattribute__": "AttributeError",
+                         "__eq__": "TypeError", "__ne__": "TypeError", "__hash__": "TypeError",
+                         "__bool__": "TypeError", "__lt__": "TypeError", "__le__": "TypeError",
+                         "__gt__": "TypeError", "__ge__": "TypeError"}
 CODEQL_SYNTHETIC = {  # shape -> a source that must be found
     "unused-import": "import threading\n",
     "empty-except": "try:\n    pass\nexcept ValueError:\n    pass\n",
     "loop-variable-capture": "def make():\n    for n in range(3):\n        yield lambda: n\n",
     "print-during-import": "import sys\nprint('x', file=sys.stderr)\n",
+    "unexpected-raise-in-special-method": "class C:\n    def __getattr__(self, name):\n        raise RuntimeError(name)\n",
 }
 CODEQL_CLEAN_SYNTHETIC = ("import os\n\n\ndef f():\n    for n in range(3):\n        yield lambda n=n: os.sep + str(n)\n"
                         "\n\ndef g():\n    try:\n        return 1\n    except ValueError:\n        return 2\n")
@@ -2646,6 +2653,12 @@ def codeql_shape_findings(source):
             visit(child, names)
 
     visit(tree, set())
+    for cls in (n for n in ast.walk(tree) if isinstance(n, ast.ClassDef)):
+        for method in (m for m in cls.body if isinstance(m, ast.FunctionDef) and m.name in SPECIAL_METHOD_RAISES):
+            for stmt in (n for n in ast.walk(method) if isinstance(n, ast.Raise) and n.exc is not None):
+                exc = stmt.exc.func if isinstance(stmt.exc, ast.Call) else stmt.exc
+                if not (isinstance(exc, ast.Name) and exc.id == SPECIAL_METHOD_RAISES[method.name]):
+                    found.append((stmt.lineno, "unexpected-raise-in-special-method"))
     for stmt in tree.body:
         if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             continue
@@ -2972,6 +2985,113 @@ class DeferredLoadOfImportedScripts(unittest.TestCase):
                 self.assertEqual(rc, 0, err)
                 self.assertEqual(out.splitlines()[0], "before: " + DEFERRED_ERROR_NAME)
                 self.assertTrue(out.splitlines()[1].startswith("after: "), out)
+
+
+# The not-loaded sentinel (alerts 892 and 893 of PR 9400, py/unexpected-raise-in-special-method). The sentinel has one
+# explicit member per name the script uses from the shared module, each raising the named error with the wanted name;
+# no class of the two scripts defines __getattr__ or __getattribute__ (an AttributeError subclass would be swallowed
+# by hasattr and by getattr with a default, a silent fallback after a forgotten load).
+SENTINEL_CLASS_NAME = "_NotLoaded"
+SENTINEL_VARIABLE = "wa"
+SENTINEL_SCRIPTS = {"scripts/ci/partition_test_binaries.py": frozenset({"annotation", "log_line"}),
+                    "scripts/ci/shared_cargo_target.py": frozenset({"env_file_value", "log_line"})}
+SENTINEL_MEMBER_KIND = "method"  # every use of ``wa.<name>`` in both scripts is a call, so every member is a method
+SENTINEL_MESSAGE = ("workflow_annotation.py is not loaded; call require_workflow_annotation() first (wanted %s)")
+SENTINEL_ABSENT_NAME = "no_such_name_9365"
+SENTINEL_FORBIDDEN_METHODS = frozenset({"__getattr__", "__getattribute__"})
+SENTINEL_CALLS = ((), ("error", "text"), ("value",))
+
+
+def sentinel_uses(tree):
+    """{name: kind} of every ``wa.<name>``: kind is ``method`` when it is the callee of a call, else ``value``."""
+    callees = {id(node.func) for node in ast.walk(tree) if isinstance(node, ast.Call)}
+    uses = {}
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == SENTINEL_VARIABLE):
+            kind = "method" if id(node) in callees else "value"
+            uses[node.attr] = kind if uses.get(node.attr, kind) == kind else "value"
+    return uses
+
+
+def sentinel_members(tree):
+    """{name: kind} of the public members of the sentinel class: ``method``, ``property`` or ``value``."""
+    classes = [n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == SENTINEL_CLASS_NAME]
+    members = {}
+    for node in classes[0].body if classes else []:
+        if isinstance(node, ast.FunctionDef) and not node.name.startswith("_"):
+            props = any(isinstance(d, ast.Name) and d.id == "property" for d in node.decorator_list)
+            members[node.name] = "property" if props else "method"
+        elif isinstance(node, ast.Assign):
+            members.update({t.id: "value" for t in node.targets if isinstance(t, ast.Name) and not t.id.startswith("_")})
+    return members
+
+
+def classes_defining(tree, names):
+    """(line, class, method) for every method of every class in ``tree`` whose name is in ``names``."""
+    return [(m.lineno, cls.name, m.name) for cls in ast.walk(tree) if isinstance(cls, ast.ClassDef)
+            for m in cls.body if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef)) and m.name in names]
+
+
+class NotLoadedSentinel(unittest.TestCase):
+    """Using the shared module before require_workflow_annotation() fails loudly for every name, never a fallback."""
+
+    def tree(self, rel):
+        return ast.parse((REPO / rel).read_text(encoding="utf-8"))
+
+    def fresh_module(self, rel):
+        spec = importlib.util.spec_from_file_location("sentinel_cell_" + Path(rel).stem, str(REPO / rel))
+        module = importlib.util.module_from_spec(spec)
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(buffer):
+            spec.loader.exec_module(module)
+        self.assertEqual(buffer.getvalue(), "")
+        return module
+
+    def test_every_member_raises_the_named_error_with_the_wanted_name_before_the_load_9365(self):
+        for rel, names in SENTINEL_SCRIPTS.items():
+            module = self.fresh_module(rel)
+            for name in sorted(names):
+                for args in SENTINEL_CALLS:
+                    with self.subTest(script=Path(rel).stem, member=name, args=args):
+                        with self.assertRaises(module.SharedModuleNotLoadedError) as caught:
+                            getattr(module.wa, name)(*args)
+                        self.assertIs(type(caught.exception), module.SharedModuleNotLoadedError)
+                        self.assertEqual(str(caught.exception), SENTINEL_MESSAGE % name)
+
+    def test_the_sentinel_member_set_equals_the_ast_set_of_wa_uses_of_each_script_9365(self):
+        for rel, names in SENTINEL_SCRIPTS.items():
+            with self.subTest(script=Path(rel).stem):
+                tree = self.tree(rel)
+                uses = sentinel_uses(tree)
+                self.assertEqual(set(uses), set(names), "the table and the ast uses differ")
+                self.assertEqual(sentinel_members(tree), uses, "a use without a member of its kind")
+                self.assertEqual({SENTINEL_MEMBER_KIND}, set(uses.values()))
+                module = self.fresh_module(rel)
+                self.assertEqual(set(module.WA_REQUIRED), set(names))
+
+    def test_no_class_of_the_two_scripts_defines_getattr_or_getattribute_9365(self):
+        for rel in SENTINEL_SCRIPTS:
+            with self.subTest(script=Path(rel).stem):
+                self.assertEqual(classes_defining(self.tree(rel), SENTINEL_FORBIDDEN_METHODS), [])
+        planted = "class C:\n    def __getattr__(self, n):\n        raise AttributeError(n)\n"
+        self.assertEqual(classes_defining(ast.parse(planted), SENTINEL_FORBIDDEN_METHODS), [(2, "C", "__getattr__")])
+
+    def test_hasattr_and_getattr_with_a_default_cannot_hide_a_forgotten_load_9365(self):
+        shared = self.fresh_module("scripts/ci/workflow_annotation.py")
+        public = sorted(n for n, v in vars(shared).items() if not n.startswith("_") and type(v).__name__ == "function"
+                        and getattr(v, "__module__", None) == shared.__name__)
+        for rel, names in SENTINEL_SCRIPTS.items():
+            module = self.fresh_module(rel)
+            for name in [SENTINEL_ABSENT_NAME, *[n for n in public if n not in names]]:
+                with self.subTest(script=Path(rel).stem, unused=name):
+                    self.assertFalse(hasattr(module.wa, name))
+                    self.assertIsNone(getattr(module.wa, name, None))
+            for name in sorted(names):
+                with self.subTest(script=Path(rel).stem, used=name):
+                    member = getattr(module.wa, name, None)
+                    self.assertIsNotNone(member)
+                    with self.assertRaises(module.SharedModuleNotLoadedError):
+                        member()
 
 
 if __name__ == "__main__":
