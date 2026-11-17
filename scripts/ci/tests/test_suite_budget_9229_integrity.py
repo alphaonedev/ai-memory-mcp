@@ -27,6 +27,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -34,6 +35,7 @@ import time
 import traceback
 import unittest
 from pathlib import Path
+from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 
@@ -75,7 +77,10 @@ OVERFLOW_DIGITS = "9" * 5000  # past every integer bound and past Python's int s
 FLOAT_OVERFLOW = "9" * 400  # float() of it is inf
 NON_ASCII_DIGITS = "١٢"  # Arabic-Indic 12: int() accepts it, the gate must not
 NUL_BYTES = "\x00" * 64
-DEEP_JSON = "[" * 100_000  # json.load raises RecursionError, not ValueError
+DEEP_JSON = "[" * 100_000  # the decoder answers RecursionError or JSONDecodeError, by interpreter and host
+# The two reasons the on-disk deep input may carry; the RecursionError branch is also forced on every interpreter
+# by test_the_recursion_branch_is_forced (a patched decoder), the JSONDecodeError branch by the NUL and empty rows.
+DEEP_JSON_REASONS = ("RecursionError", "JSONDecodeError")
 HOSTILE_LINES = 120_000  # a 100K+ line input
 LONG_LINE_CHARS = 100_000  # one 100K-character line
 CORPUS_CEILING_SECS = 10.0  # linear work over the corpus; the quadratic YAML scalar regexes took minutes
@@ -527,8 +532,6 @@ class InputTotality(unittest.TestCase):
                  bad_args + "argument --budget: not an integer of at most 18 ASCII digits"),
                 ("timer: zero budget", ["timer", "--label", "x", "--budget", "0"], EXIT_MALFORMED,
                  "malformed timer input: budget must be a positive integer of seconds, got 0"),
-                ("shard-args: deep JSON", ["shard-args", "--metadata", self.write(d, "deep.json", DEEP_JSON)],
-                 EXIT_MALFORMED, "cannot be read as JSON (RecursionError)"),
                 ("shard-args: NUL bytes", ["shard-args", "--metadata", self.write(d, "nul.json", NUL_BYTES)],
                  EXIT_MALFORMED, "cannot be read as JSON (JSONDecodeError)"),
                 ("shard-args: empty", ["shard-args", "--metadata", self.write(d, "empty.json", "")], EXIT_MALFORMED,
@@ -555,6 +558,30 @@ class InputTotality(unittest.TestCase):
             )
             for name, argv, rc_expected, reason in rows:
                 self.assert_row(name, argv, rc_expected, reason)
+            self.assert_deep_json_row(self.write(d, "deep.json", DEEP_JSON))
+
+    def assert_deep_json_row(self, path):
+        """The deep input fails closed with exactly one of DEEP_JSON_REASONS: a full-line match, nothing looser."""
+        argv = ["shard-args", "--metadata", path]
+        start = time.monotonic()
+        rc, out = self.call(argv)
+        took = time.monotonic() - start
+        reasons = "|".join(re.escape(r) for r in DEEP_JSON_REASONS)
+        line = ("^::warning::\\[#9229 margin\\] shard-args: cargo metadata %s cannot be read as JSON \\((?:%s)\\); "
+                "the full suite runs unsharded \\(#9229\\)$" % (re.escape(path), reasons))
+        with self.subTest(row="shard-args: deep JSON"):
+            self.assertEqual(rc, EXIT_MALFORMED, out[-2000:])
+            self.assertRegex(out, re.compile(line, re.M))
+            self.assertNotIn("internal error", out)
+            self.assertLess(took, CORPUS_CEILING_SECS)
+
+    def test_the_recursion_branch_is_forced(self):
+        with base.scratch() as d:
+            path = self.write(d, "ok.json", json.dumps(base.metadata()))
+            with mock.patch.object(self.sb.json, "loads", side_effect=RecursionError):
+                self.assert_row("shard-args: decoder recursion", ["shard-args", "--metadata", path], EXIT_MALFORMED,
+                                "cargo metadata %s cannot be read as JSON (RecursionError); the full suite runs "
+                                "unsharded (#9229)" % path)
 
     def test_size_bound_refuses_larger_inputs(self):
         with base.scratch() as d:
