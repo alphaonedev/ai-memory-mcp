@@ -85,9 +85,10 @@ FILE_NAME_CORPUS = ("command", "raw_newline", "raw_cr", "colons", "percent", "no
 def oracle_escape(text):
     """The escape rule of #8634 (finding L4), restated: what a variable value must look like in a message.
 
-    #9365 r2: a ``:`` followed by ``:`` (so no run of colons keeps a ``::``), a ``#`` that is last or precedes ``#``
-    or ``[``, and a ``[`` that follows ``#`` (so no ``##[`` forms inside or before what follows) are escaped. A
-    leading ``[`` stays (``[Errno 13]``); the left edge is held by the no-``##``-literal cell of the stream ratchet.
+    #9365 r3: a ``:`` followed by ``:`` (so no run of colons keeps a ``::``), a ``#`` that precedes ``#`` or ``[``, and
+    a ``[`` that follows ``#`` (so no ``##[`` forms inside) are escaped; a ``#`` that is the last character is NOT (``C#``
+    stays ``C#``). A leading ``[`` stays (``[Errno 13]``); a ``##[`` that forms across a boundary is broken where the
+    line is finished (annotation, render, join, log_line), and the stream ratchet keeps literals ending in ``##`` out.
     """
     out = []
     text = str(text)
@@ -97,7 +98,7 @@ def oracle_escape(text):
         before = text[index - 1:index] if index else ""
         if char == ":" and after == ":":
             out.append("\\x3a")
-        elif char == "#" and after in ("", "#", "["):
+        elif char == "#" and after in ("#", "["):
             out.append("\\x23")
         elif char == "[" and before == "#":
             out.append("\\x5b")
@@ -1628,7 +1629,7 @@ V1_HOSTILE = {
 V1_SPLIT_PAIRS = (("#", "#[error]x"), ("##", "[error]x"), ("a#", "#["), ("#", "["), ("x##", "[y"), ("", "##[e]"))
 V1_HUGE_CHARS = 120_000  # the 100K+ size cell
 V1_HUGE_WALL_CLOCK_SECS = 5.0
-# exact outputs, written out by hand from the rule (escape the "#" that is last or precedes "#"/"[", the "[" that
+# exact outputs, written out by hand from the rule (escape the "#" that precedes "#"/"[", the "[" that
 # follows "#", the ":" that precedes ":"), independent of the module's code
 V1_SAFE_TEXT_EXACT = {
     "##[error]x": "\\x23\\x23\\x5berror]x",
@@ -1637,13 +1638,13 @@ V1_SAFE_TEXT_EXACT = {
     "####[[error]x": "\\x23\\x23\\x23\\x23\\x5b[error]x",
     "[error]x": "[error]x",
     "[Errno 13] denied": "[Errno 13] denied",
-    "abc#": "abc\\x23",
+    "abc#": "abc#",
     "::::x:::": "\\x3a\\x3a\\x3a:x\\x3a\\x3a:",
     "a\n##[error]x": "a\\x0a\\x23\\x23\\x5berror]x",
     "%23%23[error]": "\\x2523\\x2523[error]",
     "PR #9365 [ok]": "PR #9365 [ok]",
 }
-V1_SAFE_VALUE_EXACT = {"##[e]:x": "\\x23\\x23\\x5be]\\x3ax", "a::b#": "a\\x3a\\x3ab\\x23"}
+V1_SAFE_VALUE_EXACT = {"##[e]:x": "\\x23\\x23\\x5be]\\x3ax", "a::b#": "a\\x3a\\x3ab#"}
 V1_PROPERTY_EXACT = {"a,b:##[": "a\\x2cb\\x3a\\x23\\x23\\x5b"}
 V1_LOG_LINE_EXACT = {
     "##[error]x": "##\\x5berror]x",
@@ -1660,12 +1661,12 @@ V1_ANNOTATION_EXACT = (
     (("error", "[coverage-pg] PG-ENV x"), {}, "::error::[coverage-pg] PG-ENV x"),
     (("notice", "[#7914 semaphore] 'T': slot"), {}, "::notice::[#7914 semaphore] 'T': slot"),
 )
-V1_JOIN_EXACT = ((("", ["#", "#", "[x"]), "\\x23\\x23[x"), ((", ", ["a#", "[b"]), "a\\x23, [b"))
+V1_JOIN_EXACT = ((("", ["#", "#", "[x"]), "##\\x5bx"), ((", ", ["a#", "[b"]), "a#, [b"))
 V1_RENDER_EXACT = (
-    (("{a}{b}", {"a": "#", "b": "#[x"}), "\\x23\\x23\\x5bx"),
+    (("{a}{b}", {"a": "#", "b": "#[x"}), "#\\x23\\x5bx"),
     (("{p}: {why}", {"p": "p", "why": "[Errno 13] denied"}), "p: [Errno 13] denied"),
     (("##{v}", {"v": "[error]"}), "##\\x5berror]"),
-    (("{v}[e]", {"v": "##"}), "\\x23\\x23[e]"),
+    (("{v}[e]", {"v": "##"}), "\\x23#[e]"),
     (("##[{v}", {"v": "x"}), "##\\x5bx"),
 )
 V1_ENV_FILE_EXACT = {"##[error]x\n": "##[error]x "}  # a KEY=value file line keeps the bytes (data, not a log line)
@@ -2029,6 +2030,531 @@ def double_hash_literals(rel, source):
 
 
 DOUBLE_HASH = "##"
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# r3 (#9365, REVIEW-9400-combined-r2 finding 1): the left edge is held where the line is finished, not by the last
+# character of a value. Two invariants, one named predicate (``finished_line_command_count``) used by every cell:
+#   INV-A clean bytes: a value with no workflow-command piece (no ``##``, ``#[``, ``::``, line break, ``%``,
+#         backslash or control character) prints byte for byte as at 70fee6a4 through every public function and
+#         every script path. The expected bytes are FROZEN constants (``CLEAN_BASELINE_70FEE6A4``), computed once at
+#         authoring time from the saved 70fee6a4 module and tree: the old module is not in the tree, so a test that
+#         loaded it could not run, and a frozen table cannot drift with the code under test.
+#   INV-B no command across a boundary: a value ending in ``#`` or ``##`` followed by a literal or a value that
+#         starts with ``[`` or ``#[``, at line start and mid line, through every finishing function (annotation,
+#         render, join, log_line): zero finished lines parse as a workflow command.
+# ---------------------------------------------------------------------------------------------------------------
+
+R3_SEED = 9_365_003  # the seeded mixer below (a named constant; the corpus is reproducible from it)
+R3_FUZZ_VALUES = 400
+R3_FUZZ_MAX_FRAGMENTS = 12
+R3_FUZZ_FRAGMENTS = ("#", "##", "[", "]", "::", ":", "\n", "\r", " ", "\x85", "a", " ", "error", "%0A", "\\")
+R3_E2E_VALUE_COUNT = 60
+R3_E2E_PATHS = ("shared_cargo_target --runner-name", "shared_cargo_target --home", "sccache_env --home")
+R3_HOME_PREFIX = "rel-"  # a relative home is refused before any work, so a value there never touches a disk
+R3_TAILS = ("#", "##", "##[", "")
+R3_HEADS = ("#[{c}]x", "[{c}]x", "##[{c}]x", "{c}]x", "::{c}::x", ":{c}::x")
+R3_BREAKS = ("\n", "\r", "\r\n", " ", "\x85")
+R3_COMMANDS = ("error", "warning", "group", "endgroup", "add-mask", "set-output", "stop-commands")
+R3_PROBE1_VALUE_COUNT = len(R3_TAILS) * len(R3_HEADS) * len(R3_BREAKS) * len(R3_COMMANDS) * 3  # 2520
+R3_PROBE1_PAIR_COUNT = len(R3_TAILS) * 2 * len(R3_HEADS) * len(R3_COMMANDS)  # 336
+R3_BOUNDARY_VALUE_TAILS = ("#", "##")
+R3_BOUNDARY_LITERALS = ("[x]", "#[x]")
+R3_BOUNDARY_PREFIXES = ("", "note: ")  # line start and mid line
+R3_BOUNDARY_LITERAL_TAILS = ("#", "##")
+R3_BOUNDARY_VALUES = ("[x]", "#[x]", "[x]#")
+R3_CLEAN_EQUAL_CELLS = 168  # 14 clean values x (9 module functions + 3 script paths)
+R3_HAZARD_CELLS = 24  # 2 hazard-piece values x 12
+R3_CLEAN_TABLE_CELLS = 192  # the reviewer's table: 16 values x 12
+R3_PROBE1_CELLS = 26880  # 2520 values x 10 emissions + 336 pairs x 5
+R3_BOUNDARY_CELLS = 100  # 2 prefixes x (2 tails x 2 literals + 2 literal tails x 3 values) x 5 functions
+R3_FUZZ_CELLS = 4000  # 400 values x 10 emissions
+R3_E2E_RUNS = 180  # 60 values x 3 script paths
+
+CLEAN_BASELINE_70FEE6A4 = {'C#': {'module': {'safe_text': 'C#',
+                   'safe_value': 'C#',
+                   'property_value': 'C#',
+                   'log_line': 'C#',
+                   'render': 'p: refused: C#',
+                   'join': 'C#, C#',
+                   'annotation': '::warning title=C#::C#',
+                   'end_group_line': '::endgroup::',
+                   'env_file_value': 'C#'},
+        'scripts': {'shared_cargo_target --runner-name': (2,
+                                                          '',
+                                                          'shared_cargo_target: refusing: invalid runner name '
+                                                          "'C#'\n"),
+                    'shared_cargo_target --home': (2, '', "shared_cargo_target: refusing home 'rel-C#'\n"),
+                    'sccache_env --home': (2, '', "sccache_env: refusing home 'rel-C#'\n")}},
+ 'C# and F#': {'module': {'safe_text': 'C# and F#',
+                          'safe_value': 'C# and F#',
+                          'property_value': 'C# and F#',
+                          'log_line': 'C# and F#',
+                          'render': 'p: refused: C# and F#',
+                          'join': 'C# and F#, C# and F#',
+                          'annotation': '::warning title=C# and F#::C# and F#',
+                          'end_group_line': '::endgroup::',
+                          'env_file_value': 'C# and F#'},
+               'scripts': {'shared_cargo_target --runner-name': (2,
+                                                                 '',
+                                                                 'shared_cargo_target: refusing: invalid runner name '
+                                                                 "'C# and F#'\n"),
+                           'shared_cargo_target --home': (2,
+                                                          '',
+                                                          "shared_cargo_target: refusing home 'rel-C# and F#'\n"),
+                           'sccache_env --home': (2, '', "sccache_env: refusing home 'rel-C# and F#'\n")}},
+ 'issue #': {'module': {'safe_text': 'issue #',
+                        'safe_value': 'issue #',
+                        'property_value': 'issue #',
+                        'log_line': 'issue #',
+                        'render': 'p: refused: issue #',
+                        'join': 'issue #, issue #',
+                        'annotation': '::warning title=issue #::issue #',
+                        'end_group_line': '::endgroup::',
+                        'env_file_value': 'issue #'},
+             'scripts': {'shared_cargo_target --runner-name': (2,
+                                                               '',
+                                                               'shared_cargo_target: refusing: invalid runner name '
+                                                               "'issue #'\n"),
+                         'shared_cargo_target --home': (2, '', "shared_cargo_target: refusing home 'rel-issue #'\n"),
+                         'sccache_env --home': (2, '', "sccache_env: refusing home 'rel-issue #'\n")}},
+ 'PR #123': {'module': {'safe_text': 'PR #123',
+                        'safe_value': 'PR #123',
+                        'property_value': 'PR #123',
+                        'log_line': 'PR #123',
+                        'render': 'p: refused: PR #123',
+                        'join': 'PR #123, PR #123',
+                        'annotation': '::warning title=PR #123::PR #123',
+                        'end_group_line': '::endgroup::',
+                        'env_file_value': 'PR #123'},
+             'scripts': {'shared_cargo_target --runner-name': (2,
+                                                               '',
+                                                               'shared_cargo_target: refusing: invalid runner name '
+                                                               "'PR #123'\n"),
+                         'shared_cargo_target --home': (2, '', "shared_cargo_target: refusing home 'rel-PR #123'\n"),
+                         'sccache_env --home': (2, '', "sccache_env: refusing home 'rel-PR #123'\n")}},
+ '[Errno 13] x': {'module': {'safe_text': '[Errno 13] x',
+                             'safe_value': '[Errno 13] x',
+                             'property_value': '[Errno 13] x',
+                             'log_line': '[Errno 13] x',
+                             'render': 'p: refused: [Errno 13] x',
+                             'join': '[Errno 13] x, [Errno 13] x',
+                             'annotation': '::warning title=[Errno 13] x::[Errno 13] x',
+                             'end_group_line': '::endgroup::',
+                             'env_file_value': '[Errno 13] x'},
+                  'scripts': {'shared_cargo_target --runner-name': (2,
+                                                                    '',
+                                                                    'shared_cargo_target: refusing: invalid runner '
+                                                                    "name '[Errno 13] x'\n"),
+                              'shared_cargo_target --home': (2,
+                                                             '',
+                                                             "shared_cargo_target: refusing home 'rel-[Errno 13] "
+                                                             "x'\n"),
+                              'sccache_env --home': (2, '', "sccache_env: refusing home 'rel-[Errno 13] x'\n")}},
+ '[coverage-pg]': {'module': {'safe_text': '[coverage-pg]',
+                              'safe_value': '[coverage-pg]',
+                              'property_value': '[coverage-pg]',
+                              'log_line': '[coverage-pg]',
+                              'render': 'p: refused: [coverage-pg]',
+                              'join': '[coverage-pg], [coverage-pg]',
+                              'annotation': '::warning title=[coverage-pg]::[coverage-pg]',
+                              'end_group_line': '::endgroup::',
+                              'env_file_value': '[coverage-pg]'},
+                   'scripts': {'shared_cargo_target --runner-name': (2,
+                                                                     '',
+                                                                     'shared_cargo_target: refusing: invalid runner '
+                                                                     "name '[coverage-pg]'\n"),
+                               'shared_cargo_target --home': (2,
+                                                              '',
+                                                              'shared_cargo_target: refusing home '
+                                                              "'rel-[coverage-pg]'\n"),
+                               'sccache_env --home': (2, '', "sccache_env: refusing home 'rel-[coverage-pg]'\n")}},
+ 'a#b': {'module': {'safe_text': 'a#b',
+                    'safe_value': 'a#b',
+                    'property_value': 'a#b',
+                    'log_line': 'a#b',
+                    'render': 'p: refused: a#b',
+                    'join': 'a#b, a#b',
+                    'annotation': '::warning title=a#b::a#b',
+                    'end_group_line': '::endgroup::',
+                    'env_file_value': 'a#b'},
+         'scripts': {'shared_cargo_target --runner-name': (2,
+                                                           '',
+                                                           'shared_cargo_target: refusing: invalid runner name '
+                                                           "'a#b'\n"),
+                     'shared_cargo_target --home': (2, '', "shared_cargo_target: refusing home 'rel-a#b'\n"),
+                     'sccache_env --home': (2, '', "sccache_env: refusing home 'rel-a#b'\n")}},
+ 'x[0]': {'module': {'safe_text': 'x[0]',
+                     'safe_value': 'x[0]',
+                     'property_value': 'x[0]',
+                     'log_line': 'x[0]',
+                     'render': 'p: refused: x[0]',
+                     'join': 'x[0], x[0]',
+                     'annotation': '::warning title=x[0]::x[0]',
+                     'end_group_line': '::endgroup::',
+                     'env_file_value': 'x[0]'},
+          'scripts': {'shared_cargo_target --runner-name': (2,
+                                                            '',
+                                                            'shared_cargo_target: refusing: invalid runner name '
+                                                            "'x[0]'\n"),
+                      'shared_cargo_target --home': (2, '', "shared_cargo_target: refusing home 'rel-x[0]'\n"),
+                      'sccache_env --home': (2, '', "sccache_env: refusing home 'rel-x[0]'\n")}},
+ '/home/runner/work/ai-memory/x y': {'module': {'safe_text': '/home/runner/work/ai-memory/x y',
+                                                'safe_value': '/home/runner/work/ai-memory/x y',
+                                                'property_value': '/home/runner/work/ai-memory/x y',
+                                                'log_line': '/home/runner/work/ai-memory/x y',
+                                                'render': 'p: refused: /home/runner/work/ai-memory/x y',
+                                                'join': '/home/runner/work/ai-memory/x y, '
+                                                        '/home/runner/work/ai-memory/x y',
+                                                'annotation': '::warning title=/home/runner/work/ai-memory/x '
+                                                              'y::/home/runner/work/ai-memory/x y',
+                                                'end_group_line': '::endgroup::',
+                                                'env_file_value': '/home/runner/work/ai-memory/x y'},
+                                     'scripts': {'shared_cargo_target --runner-name': (2,
+                                                                                       '',
+                                                                                       'shared_cargo_target: '
+                                                                                       'refusing: invalid runner '
+                                                                                       'name '
+                                                                                       "'/home/runner/work/ai-memory/x "
+                                                                                       "y'\n"),
+                                                 'shared_cargo_target --home': (2,
+                                                                                '',
+                                                                                'shared_cargo_target: refusing home '
+                                                                                "'rel-/home/runner/work/ai-memory/x "
+                                                                                "y'\n"),
+                                                 'sccache_env --home': (2,
+                                                                        '',
+                                                                        'sccache_env: refusing home '
+                                                                        "'rel-/home/runner/work/ai-memory/x y'\n")}},
+ 'C:\\Users\\runner\\_work': {'module': {'safe_text': 'C:\\\\Users\\\\runner\\\\_work',
+                                         'safe_value': 'C\\x3a\\\\Users\\\\runner\\\\_work',
+                                         'property_value': 'C\\x3a\\\\Users\\\\runner\\\\_work',
+                                         'log_line': 'C:\\Users\\runner\\_work',
+                                         'render': 'p: refused: C\\x3a\\\\Users\\\\runner\\\\_work',
+                                         'join': 'C\\x3a\\\\Users\\\\runner\\\\_work, '
+                                                 'C\\x3a\\\\Users\\\\runner\\\\_work',
+                                         'annotation': '::warning '
+                                                       'title=C\\x3a\\\\Users\\\\runner\\\\_work::C:\\\\Users\\\\runner\\\\_work',
+                                         'end_group_line': '::endgroup::',
+                                         'env_file_value': 'C:\\Users\\runner\\_work'},
+                              'scripts': {'shared_cargo_target --runner-name': (2,
+                                                                                '',
+                                                                                'shared_cargo_target: refusing: '
+                                                                                'invalid runner name '
+                                                                                "'C:\\\\Users\\\\runner\\\\_work'\n"),
+                                          'shared_cargo_target --home': (2,
+                                                                         '',
+                                                                         'shared_cargo_target: refusing home '
+                                                                         "'rel-C:\\\\Users\\\\runner\\\\_work'\n"),
+                                          'sccache_env --home': (2,
+                                                                 '',
+                                                                 'sccache_env: refusing home '
+                                                                 "'rel-C:\\\\Users\\\\runner\\\\_work'\n")}},
+ 'café 日本語 😀': {'module': {'safe_text': 'café 日本語 😀',
+                           'safe_value': 'café 日本語 😀',
+                           'property_value': 'café 日本語 😀',
+                           'log_line': 'café 日本語 😀',
+                           'render': 'p: refused: café 日本語 😀',
+                           'join': 'café 日本語 😀, café 日本語 😀',
+                           'annotation': '::warning title=café 日本語 😀::café 日本語 😀',
+                           'end_group_line': '::endgroup::',
+                           'env_file_value': 'café 日本語 😀'},
+                'scripts': {'shared_cargo_target --runner-name': (2,
+                                                                  '',
+                                                                  'shared_cargo_target: refusing: invalid runner '
+                                                                  "name 'café 日本語 😀'\n"),
+                            'shared_cargo_target --home': (2,
+                                                           '',
+                                                           "shared_cargo_target: refusing home 'rel-café 日本語 😀'\n"),
+                            'sccache_env --home': (2, '', "sccache_env: refusing home 'rel-café 日本語 😀'\n")}},
+ 'issue #9365 [ok]': {'module': {'safe_text': 'issue #9365 [ok]',
+                                 'safe_value': 'issue #9365 [ok]',
+                                 'property_value': 'issue #9365 [ok]',
+                                 'log_line': 'issue #9365 [ok]',
+                                 'render': 'p: refused: issue #9365 [ok]',
+                                 'join': 'issue #9365 [ok], issue #9365 [ok]',
+                                 'annotation': '::warning title=issue #9365 [ok]::issue #9365 [ok]',
+                                 'end_group_line': '::endgroup::',
+                                 'env_file_value': 'issue #9365 [ok]'},
+                      'scripts': {'shared_cargo_target --runner-name': (2,
+                                                                        '',
+                                                                        'shared_cargo_target: refusing: invalid '
+                                                                        "runner name 'issue #9365 [ok]'\n"),
+                                  'shared_cargo_target --home': (2,
+                                                                 '',
+                                                                 "shared_cargo_target: refusing home 'rel-issue "
+                                                                 "#9365 [ok]'\n"),
+                                  'sccache_env --home': (2,
+                                                         '',
+                                                         "sccache_env: refusing home 'rel-issue #9365 [ok]'\n")}},
+ 'label: value': {'module': {'safe_text': 'label: value',
+                             'safe_value': 'label\\x3a value',
+                             'property_value': 'label\\x3a value',
+                             'log_line': 'label: value',
+                             'render': 'p: refused: label\\x3a value',
+                             'join': 'label\\x3a value, label\\x3a value',
+                             'annotation': '::warning title=label\\x3a value::label: value',
+                             'end_group_line': '::endgroup::',
+                             'env_file_value': 'label: value'},
+                  'scripts': {'shared_cargo_target --runner-name': (2,
+                                                                    '',
+                                                                    'shared_cargo_target: refusing: invalid runner '
+                                                                    "name 'label: value'\n"),
+                              'shared_cargo_target --home': (2,
+                                                             '',
+                                                             "shared_cargo_target: refusing home 'rel-label: "
+                                                             "value'\n"),
+                              'sccache_env --home': (2, '', "sccache_env: refusing home 'rel-label: value'\n")}},
+ '50% done': {'module': {'safe_text': '50\\x25 done',
+                         'safe_value': '50\\x25 done',
+                         'property_value': '50\\x25 done',
+                         'log_line': '50% done',
+                         'render': 'p: refused: 50\\x25 done',
+                         'join': '50\\x25 done, 50\\x25 done',
+                         'annotation': '::warning title=50\\x25 done::50\\x25 done',
+                         'end_group_line': '::endgroup::',
+                         'env_file_value': '50% done'},
+              'scripts': {'shared_cargo_target --runner-name': (2,
+                                                                '',
+                                                                'shared_cargo_target: refusing: invalid runner name '
+                                                                "'50% done'\n"),
+                          'shared_cargo_target --home': (2,
+                                                         '',
+                                                         "shared_cargo_target: refusing home 'rel-50% done'\n"),
+                          'sccache_env --home': (2, '', "sccache_env: refusing home 'rel-50% done'\n")}}}
+
+HAZARD_PIECE_EXPECTED = {'a##b': {'module': {'safe_text': 'a\\x23#b',
+                     'safe_value': 'a\\x23#b',
+                     'property_value': 'a\\x23#b',
+                     'log_line': 'a##b',
+                     'render': 'p: refused: a\\x23#b',
+                     'join': 'a\\x23#b, a\\x23#b',
+                     'annotation': '::warning title=a\\x23#b::a\\x23#b',
+                     'end_group_line': '::endgroup::',
+                     'env_file_value': 'a##b'},
+          'scripts': {'shared_cargo_target --runner-name': (2,
+                                                            '',
+                                                            'shared_cargo_target: refusing: invalid runner name '
+                                                            "'a##b'\n"),
+                      'shared_cargo_target --home': (2, '', "shared_cargo_target: refusing home 'rel-a##b'\n"),
+                      'sccache_env --home': (2, '', "sccache_env: refusing home 'rel-a##b'\n")}},
+ 'x#[0]': {'module': {'safe_text': 'x\\x23\\x5b0]',
+                      'safe_value': 'x\\x23\\x5b0]',
+                      'property_value': 'x\\x23\\x5b0]',
+                      'log_line': 'x#[0]',
+                      'render': 'p: refused: x\\x23\\x5b0]',
+                      'join': 'x\\x23\\x5b0], x\\x23\\x5b0]',
+                      'annotation': '::warning title=x\\x23\\x5b0]::x\\x23\\x5b0]',
+                      'end_group_line': '::endgroup::',
+                      'env_file_value': 'x#[0]'},
+           'scripts': {'shared_cargo_target --runner-name': (2,
+                                                             '',
+                                                             'shared_cargo_target: refusing: invalid runner name '
+                                                             "'x#[0]'\n"),
+                       'shared_cargo_target --home': (2, '', "shared_cargo_target: refusing home 'rel-x#[0]'\n"),
+                       'sccache_env --home': (2, '', "sccache_env: refusing home 'rel-x#[0]'\n")}}}
+
+
+def finished_line_command_count(line):
+    """The ONE predicate of every r3 cell: how many workflow commands the runner reads in a finished line.
+
+    Strict reading of actions/runner ActionCommand.cs: v1 = every ``##[`` anywhere (no trim); v2 = every piece
+    (Python ``splitlines``, wider than the runner's \\r \\n set) whose left-stripped text starts with ``::``.
+    """
+    return line.count(V1_PREFIX) + sum(1 for piece in line.splitlines() if piece.lstrip().startswith("::"))
+
+
+def probe1_values():
+    """The reviewer's probe-1 corpus as values: tail x head x break x command, in three placements."""
+    for tail in R3_TAILS:
+        for head in R3_HEADS:
+            for brk in R3_BREAKS:
+                for command in R3_COMMANDS:
+                    text = head.format(c=command)
+                    yield "t%r-h%s-b%r-c%s-start" % (tail, head[:3], brk, command), tail + text
+                    yield "t%r-h%s-b%r-c%s-mid" % (tail, head[:3], brk, command), "a" + brk + tail + text
+                    yield "t%r-h%s-b%r-c%s-split" % (tail, head[:3], brk, command), tail + brk + text
+
+
+def probe1_pairs():
+    for tail in R3_TAILS:
+        for prefix in ("", "a"):
+            for head in R3_HEADS:
+                for command in R3_COMMANDS:
+                    yield "pair-t%r-p%r-h%s-c%s" % (tail, prefix, head[:3], command), prefix + tail, head.format(c=command)
+
+
+def fuzz_values():
+    import random
+    rng = random.Random(R3_SEED)
+    for index in range(R3_FUZZ_VALUES):
+        yield "fuzz-%d" % index, "".join(rng.choice(R3_FUZZ_FRAGMENTS) for _ in range(rng.randint(1, R3_FUZZ_MAX_FRAGMENTS)))
+
+
+def boundary_cells():
+    """Value-then-literal and literal-then-value at line start and mid line: (cell id, finishing function, thunk)."""
+    wa = load_module(CI_DIR / SHARED_MODULE_NAME, "workflow_annotation_9365_r3_boundary")
+    for prefix in R3_BOUNDARY_PREFIXES:
+        for tail in R3_BOUNDARY_VALUE_TAILS:
+            for lit in R3_BOUNDARY_LITERALS:
+                base = "b-v%r-l%s-p%r" % (tail, lit, prefix)
+                value = "x" + tail
+                yield base + "-render", "render", lambda: wa.render(prefix + "{v}" + lit, v=value)
+                yield base + "-join", "join", lambda: wa.join(lit, [prefix + value, "y"])
+                yield base + "-annotation", "annotation", lambda: wa.annotation("warning", wa.render("{v}" + lit, v=value))
+                yield base + "-annotation-title", "annotation", lambda: wa.annotation("warning", "m", title=value + lit)
+                yield base + "-log", "log_line", lambda: wa.log_line(prefix + value + lit)
+        for tail in R3_BOUNDARY_LITERAL_TAILS:
+            for value in R3_BOUNDARY_VALUES:
+                base = "b-l%r-v%s-p%r" % (tail, value, prefix)
+                yield base + "-render", "render", lambda: wa.render(prefix + "x" + tail + "{v}", v=value)
+                yield base + "-join", "join", lambda: wa.join("x" + tail, [prefix + "a", value])
+                yield base + "-annotation", "annotation", lambda: wa.annotation("warning", wa.render("x" + tail + "{v}", v=value))
+                yield base + "-annotation-title", "annotation", lambda: wa.annotation("warning", "m", title="x" + tail + value)
+                yield base + "-log", "log_line", lambda: wa.log_line(prefix + "x" + tail + value)
+
+
+class CleanBytesAndBoundary(unittest.TestCase):
+    """INV-A and INV-B over the reviewer's corpora; every failure message carries a cell id, never a value dump."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.wa = load_module(CI_DIR / SHARED_MODULE_NAME, "workflow_annotation_9365_r3")
+
+    def module_cells(self, value):
+        wa = self.wa
+        return {"safe_text": wa.safe_text(value), "safe_value": wa.safe_value(value),
+                "property_value": wa.property_value(value), "log_line": wa.log_line(value),
+                "render": wa.render("{prog}: refused: {v}", prog="p", v=value), "join": wa.join(", ", [value, value]),
+                "annotation": wa.annotation("warning", value, title=value), "end_group_line": wa.end_group_line(),
+                "env_file_value": wa.env_file_value(value)}
+
+    def script_cells(self, value):
+        scratch = scratch_dir("r3-clean")
+        argv = {"shared_cargo_target --runner-name": ("shared_cargo_target.py", ["--home", str(scratch / "no-home"), "--runner-name", value], True),
+                "shared_cargo_target --home": ("shared_cargo_target.py", ["--home", R3_HOME_PREFIX + value], True),
+                "sccache_env --home": ("sccache_env.py", ["--home", R3_HOME_PREFIX + value], False)}
+        return {name: run_script(CI_DIR / script, args, isolated=iso) for name, (script, args, iso) in argv.items()}
+
+    def test_clean_values_are_byte_equal_to_70fee6a4_9365(self):
+        """The 16-value x (9 functions + 3 script paths) table: 14 clean values equal the frozen baseline."""
+        cells = 0
+        for value, baseline in CLEAN_BASELINE_70FEE6A4.items():
+            got_module, got_scripts = self.module_cells(value), self.script_cells(value)
+            for name, expected in baseline["module"].items():
+                cells += 1
+                self.assertEqual(got_module[name], expected, "clean cell %s/%s" % (name, ascii(value)))
+            for name, expected in baseline["scripts"].items():
+                cells += 1
+                self.assertEqual(tuple(got_scripts[name]), tuple(expected), "clean cell %s/%s" % (name, ascii(value)))
+        self.assertEqual(cells, R3_CLEAN_EQUAL_CELLS)
+
+    def test_hazard_piece_values_change_exactly_as_designed_9365(self):
+        """``a##b`` and ``x#[0]`` hold a ``##``/``#[`` piece, so they are escaped: 24 cells with their exact bytes."""
+        cells = 0
+        for value, expected in HAZARD_PIECE_EXPECTED.items():
+            got_module, got_scripts = self.module_cells(value), self.script_cells(value)
+            for name, want in expected["module"].items():
+                cells += 1
+                self.assertEqual(got_module[name], want, "hazard cell %s/%s" % (name, ascii(value)))
+            for name, want in expected["scripts"].items():
+                cells += 1
+                self.assertEqual(tuple(got_scripts[name]), tuple(want), "hazard cell %s/%s" % (name, ascii(value)))
+        self.assertEqual(cells, R3_HAZARD_CELLS)
+        self.assertEqual(R3_CLEAN_EQUAL_CELLS + R3_HAZARD_CELLS, R3_CLEAN_TABLE_CELLS)
+
+    def test_trailing_hash_is_not_escaped_9365(self):
+        for value in ("C#", "C# and F#", "issue #", "abc##", "#"):
+            with self.subTest(value=value):
+                self.assertFalse(self.wa.safe_text(value).endswith("\\x23"), ascii(value))
+        self.assertEqual(self.wa.safe_text("C#"), "C#")
+        self.assertEqual(self.wa.annotation("warning", "C#", title="C#"), "::warning title=C#::C#")
+        self.assertEqual(self.wa.safe_text("abc##"), "abc\\x23#")
+
+    def emissions(self, value):
+        wa = self.wa
+        return [("safe_text", wa.safe_text(value), 0), ("safe_value", wa.safe_value(value), 0),
+                ("property_value", wa.property_value(value), 0), ("log_line", wa.log_line(value), 0),
+                ("render1", wa.render("{prog}: refused: {v}", prog="p", v=value), 0), ("render2", wa.render("{v}", v=value), 0),
+                ("join1", wa.join(", ", [value, value]), 0), ("join2", wa.join("", [value, "x", value]), 0),
+                ("annotation-msg", wa.annotation("warning", value), 1),
+                ("annotation-title", wa.annotation("error", "m", title=value), 1)]
+
+    def check_emissions(self, cell, emissions):
+        bad = []
+        for name, line, expected in emissions:
+            if finished_line_command_count(line) != expected or len(line.splitlines()) > 1:
+                bad.append("%s/%s" % (cell, name))
+        return bad
+
+    def test_probe1_corpus_through_every_finishing_function_parses_no_command_9365(self):
+        """Values: 2520 x 10 emissions; pairs: 336 x 5 emissions. Zero finished lines parse as a command."""
+        wa, bad, values, pairs, cells = self.wa, [], 0, 0, 0
+        for cell, value in probe1_values():
+            values += 1
+            emissions = self.emissions(value)
+            cells += len(emissions)
+            bad += self.check_emissions(cell, emissions)
+        for cell, left, right in probe1_pairs():
+            pairs += 1
+            emissions = [("join", wa.join("", [left, right]), 0), ("render", wa.render("{a}{b}", a=left, b=right), 0),
+                         ("safe+safe", wa.safe_text(left) + wa.safe_text(right), 0),
+                         ("annotation", wa.annotation("notice", left + right), 1), ("log_line", wa.log_line(left + right), 0)]
+            cells += len(emissions)
+            bad += self.check_emissions(cell, emissions)
+        self.assertEqual((values, pairs, cells), (R3_PROBE1_VALUE_COUNT, R3_PROBE1_PAIR_COUNT, R3_PROBE1_CELLS))
+        self.assertEqual(bad, [], bad[:10])
+
+    def test_boundary_table_parses_no_command_9365(self):
+        bad, cells = [], 0
+        for cell, function, thunk in boundary_cells():
+            cells += 1
+            line = thunk()
+            expected = 1 if function == "annotation" else 0
+            if finished_line_command_count(line) != expected or len(line.splitlines()) > 1:
+                bad.append(cell)
+        self.assertEqual(cells, R3_BOUNDARY_CELLS)
+        self.assertEqual(bad, [], bad[:10])
+
+    def test_seeded_fuzz_through_every_finishing_function_parses_no_command_9365(self):
+        bad, count, cells = [], 0, 0
+        for cell, value in fuzz_values():
+            count += 1
+            emissions = self.emissions(value)
+            cells += len(emissions)
+            bad += self.check_emissions(cell, emissions)
+        self.assertEqual((count, cells), (R3_FUZZ_VALUES, R3_FUZZ_CELLS))
+        self.assertEqual(bad, [], bad[:10])
+
+    def test_the_predicate_reads_what_the_runner_reads_9365(self):
+        for line, count in (("plain", 0), ("a ##[error]x", 1), ("##[a]##[b]", 2), ("  ::error::x", 1), (" ::x", 1),
+                            ("a\n::error::x", 1), ("a ::error::x", 1), ("a::b", 0), ("x#[e]", 0), ("##\\x5be]", 0)):
+            with self.subTest(line=line):
+                self.assertEqual(finished_line_command_count(line), count)
+
+    def test_end_to_end_scripts_print_no_command_for_the_seeded_corpus_9365(self):
+        """3 script paths x 60 seeded probe-1 values: no stdout/stderr line holds ``##[`` or starts ``::``."""
+        import random
+        pool = [value for _, value in probe1_values()]
+        sample = random.Random(R3_SEED).sample(pool, R3_E2E_VALUE_COUNT)
+        runs, bad = 0, []
+        for index, value in enumerate(sample):
+            for name, (rc, out, err) in self.script_cells(value).items():
+                runs += 1
+                if finished_line_command_count(out) or finished_line_command_count(err):
+                    bad.append("e2e-%d/%s" % (index, name))
+        self.assertEqual(runs, R3_E2E_RUNS)
+        self.assertEqual(bad, [], bad[:10])
+
+    def test_huge_hash_runs_stay_linear_9365(self):
+        wa = self.wa
+        value = "#" * HUGE_VALUE_CHARS
+        started = time.monotonic()
+        lines = [wa.safe_text(value), wa.log_line(value + "[x]"), wa.annotation("warning", value + "[x]"),
+                 wa.join("", [value, "[x]"]), wa.render("{v}[x]", v=value)]
+        self.assertLess(time.monotonic() - started, HUGE_WALL_CLOCK_SECS)
+        for index, line in enumerate(lines):
+            self.assertEqual(finished_line_command_count(line), 1 if index == 2 else 0, "huge-%d" % index)
 
 
 if __name__ == "__main__":
