@@ -215,6 +215,48 @@ pub(crate) fn write_new_private(dest: &Path, what: &'static str, bytes: &[u8]) -
     Ok(())
 }
 
+/// How many numbered names [`write_new_private_unique`] tries after `dest`.
+pub(crate) const UNIQUE_NAME_ATTEMPTS: u32 = 1000;
+
+/// `dest` with `.{n}` appended to its file name.
+fn numbered(dest: &Path, n: u32) -> std::path::PathBuf {
+    let mut name = dest.as_os_str().to_owned();
+    name.push(format!(".{n}"));
+    std::path::PathBuf::from(name)
+}
+
+/// [`write_new_private`] at the first FREE name of `dest`, `dest.1`,
+/// `dest.2`, ...: two backups taken in the same clock tick keep both copies
+/// instead of the second failing (or, before #8950, overwriting the first).
+/// A symlink at any tried name is refused, never skipped. Returns the name
+/// written.
+///
+/// # Errors
+/// A symlink sits at a tried name, all [`UNIQUE_NAME_ATTEMPTS`] numbered
+/// names are taken, or the stage, write, fsync or publish fails.
+pub(crate) fn write_new_private_unique(
+    dest: &Path,
+    what: &'static str,
+    bytes: &[u8],
+) -> Result<std::path::PathBuf> {
+    for n in 0..=UNIQUE_NAME_ATTEMPTS {
+        let candidate = if n == 0 {
+            dest.to_path_buf()
+        } else {
+            numbered(dest, n)
+        };
+        refuse_symlink(&candidate)?;
+        if std::fs::symlink_metadata(&candidate).is_err() {
+            write_new_private(&candidate, what, bytes)?;
+            return Ok(candidate);
+        }
+    }
+    anyhow::bail!(
+        "refusing to write {what} {}: it and {UNIQUE_NAME_ATTEMPTS} numbered names beside it are taken",
+        dest.display()
+    )
+}
+
 /// Replace the product-owned file at `dest` with `bytes` (owner-only,
 /// fsynced) by a rename, refusing a symlink at the name instead of following
 /// or replacing it. A regular file there is replaced; an absent one created.

@@ -460,18 +460,24 @@ pub fn run(args: &InstallArgs, cli_agent_id: Option<&str>, out: &mut CliOutput<'
             }
         ));
         // v1.0.0 #8950 — the backup is a NEW owner-only file: a symlink
-        // planted at the timestamped name is refused, never written through.
+        // planted at the timestamped name is refused, never written through;
+        // a backup already taken in the same millisecond keeps its copy and
+        // this one takes the next numbered name.
         let original = std::fs::read(&config_path)
             .with_context(|| format!("reading {} to back it up", config_path.display()))?;
-        crate::storage::snapshot_file::write_new_private(&backup, "install backup", &original)
-            .with_context(|| {
-                format!(
-                    "backing up {} to {}",
-                    config_path.display(),
-                    backup.display()
-                )
-            })?;
-        Some(backup)
+        let written = crate::storage::snapshot_file::write_new_private_unique(
+            &backup,
+            "install backup",
+            &original,
+        )
+        .with_context(|| {
+            format!(
+                "backing up {} to {}",
+                config_path.display(),
+                backup.display()
+            )
+        })?;
+        Some(written)
     } else {
         None
     };

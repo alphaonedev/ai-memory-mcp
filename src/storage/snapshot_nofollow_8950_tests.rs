@@ -6,7 +6,7 @@
 
 use super::snapshot_file::{
     SYMLINK_REFUSAL_TAIL, refuse_occupied, refuse_symlink, stage_beside, symlink_refusal,
-    write_new_private, write_replacing,
+    write_new_private, write_new_private_unique, write_replacing,
 };
 use std::path::{Path, PathBuf};
 
@@ -505,6 +505,63 @@ fn vacuum_into_routes_through_the_no_follow_helper_8950() {
                 text.contains("snapshot_file::"),
                 "#8950: {rel} runs VACUUM INTO without the snapshot_file helper"
             );
+        }
+    }
+}
+
+/// A backup taken twice in the same tick keeps both copies: the second takes
+/// the next numbered name and the first is never replaced.
+#[test]
+fn unique_backup_keeps_both_same_tick_copies_8950() {
+    let dir = scratch();
+    let dest = dir.path().join("config.toml.bak.20261114T183444.962Z");
+    let first = write_new_private_unique(&dest, "install backup", b"one").expect("first");
+    let second = write_new_private_unique(&dest, "install backup", b"two").expect("second");
+    assert_eq!(first, dest);
+    let mut numbered = dest.as_os_str().to_owned();
+    numbered.push(".1");
+    assert_eq!(second, PathBuf::from(numbered));
+    assert_eq!(std::fs::read(&first).expect("first bytes"), b"one");
+    assert_eq!(std::fs::read(&second).expect("second bytes"), b"two");
+    for written in [&first, &second] {
+        let meta = std::fs::symlink_metadata(written).expect("meta");
+        assert!(
+            meta.file_type().is_file(),
+            "{}: not a regular file",
+            written.display()
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        }
+    }
+}
+
+/// A symlink planted at the wanted name or at a numbered name is refused with
+/// the exact refusal, and its target is untouched.
+#[cfg(unix)]
+#[test]
+fn unique_backup_refuses_planted_symlink_rows_8950() {
+    for row in ROWS {
+        for numbered_slot in [false, true] {
+            let dir = scratch();
+            let dest = dir.path().join("config.toml.bak.20261114-183444");
+            let link = if numbered_slot {
+                std::fs::write(&dest, b"taken").expect("taken");
+                let mut n = dest.as_os_str().to_owned();
+                n.push(".1");
+                PathBuf::from(n)
+            } else {
+                dest.clone()
+            };
+            let target = plant(dir.path(), &link, row);
+            let err = write_new_private_unique(&dest, "config backup", b"new")
+                .expect_err("a planted symlink must be refused");
+            let msg = format!("{err:#}");
+            assert_eq!(msg, symlink_refusal(&link), "{row:?}/{numbered_slot}");
+            assert!(msg.ends_with(SYMLINK_REFUSAL_TAIL));
+            assert_target_untouched(&target, row, &format!("{row:?}/{numbered_slot}"));
         }
     }
 }
