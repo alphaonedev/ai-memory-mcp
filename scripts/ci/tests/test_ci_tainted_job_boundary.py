@@ -35,14 +35,19 @@ try:
 except ImportError:
     pyyaml = None
 
-# 13 allow rows plus 11 open rows (ruling 59117c3e); the pin only goes down.
-ALLOW_PIN_EXPECTED = 24
+# Three row kinds, three pins (FINAL efb2b9e8, correction 0773f6ce); each pin only goes down.
+# Kind violation: the 13 rows before PR 9508 plus 4 class (iii) rows of #9553.
+ALLOW_PIN_EXPECTED = 17
 ALLOW_ROW_COUNT = 13
+NEW_VIOLATION_ROW_COUNT = 4
+OPEN_PIN_EXPECTED = 41
+NOT_ANALYSED_PIN_EXPECTED = 3
 JOB_COUNT_LARGE = 200
 LARGE_SCAN_CEILING_S = 10.0
 RUN_TEXT_BYTES_LARGE = 120_000
 RUN_TEXT_CEILING_S = 5.0
-FIX_ISSUES = frozenset({9454, 9455, 9456, 9471})
+FIX_ISSUES = frozenset({9454, 9455, 9456, 9471, 9553})
+NEW_VIOLATION_ISSUE = 9553
 RUNNER_ISSUE = 9455
 SYNTH = "synthetic.yml"
 # The step key of an R2 (iv) violation: the job's `runs-on`, not one of its steps.
@@ -687,34 +692,176 @@ SHELL_CASES = (
     ("psql -tAY", "psql option '-tAY' is not on the closed option list"),
 )
 
-# Real Unclassifiable forms at this checkout (ruling b44e2422: a finding, never clean, and no
-# allow row): (workflow, job, step label, exact reason). Each is a `new-finding` of PR 9508.
+# Real forms at this checkout, every one the scan reaches to a fixpoint (FACTS of ruling
+# f367b2f1): (workflow, job, step label, exact reason). Kind unclassifiable: 41 forms, one open
+# row each; these jobs are NOT shown to hold the boundary.
 REAL_UNCLASSIFIABLE = (
-    ("batman-mode-acceptance.yml", "rust-integration",
-     "Assert binary refuses /tmp write under R001 end-to-end", "command word '$BIN' is not a literal word"),
-    ("batman-mode-acceptance.yml", "bash-integration",
-     "Install sqlite3 + jq (bounded+retry", "command word 'apt-get' is not on the closed command list"),
-    ("cert-postgres-age.yml", "cert-postgres-age",
-     "Ensure AGE + vector extensions present (best-effort \u2014 tier is pre-provisioned)",
-     "command word '$PSQL' is not a literal word"),
-    ("ci.yml", "select", "Materialise the base selector (#8240)",
-     "python module 'os' is not on the closed module list"),
-    ("ci.yml", "classify", "id:cls",
-     "interpreter path '$trust_impact/cargo_skip.py' is neither in the workspace nor bound to base content"),
-    ("ci.yml", "check", "Free disk before tests (hosted image only,",
-     "command word 'apt-get' is not on the closed command list"),
-    ("ci.yml", "ci-gate", "Materialise the base gate (#8240)",
-     "python module 'os' is not on the closed module list"),
-    ("coverage.yml", "classify", "id:cls",
-     "interpreter path '$trust_impact/cargo_skip.py' is neither in the workspace nor bound to base content"),
-    ("coverage.yml", "per-module-thresholds", "Free disk + add swap (#1148 belt-and-suspenders, aggressive)",
-     "command word 'apt-get' is not on the closed command list"),
-    ("mobile-runtime.yml", "ios-simulator", "Boot iOS Simulator (best-available iPhone)",
-     "command word 'xcrun' is not on the closed command list"),
-    ("mobile-runtime.yml", "android-emulator", "Enable KVM",
-     "command word 'udevadm' is not on the closed command list"),
+    (
+        'batman-mode-acceptance.yml', 'bash-integration', 'Install sqlite3 + jq (bounded+retry',
+        "command word 'apt-get' is not on the closed command list",
+    ),
+    (
+        'batman-mode-acceptance.yml', 'rust-integration', 'Assert binary refuses /tmp write under R001 end-to-end',
+        "command word '$BIN' is not a literal word",
+    ),
+    (
+        'cert-postgres-age.yml', 'cert-postgres-age',
+        'Assert certified stack versions (cert evidence, hard-fail on drift)',
+        "command word '$PSQL' is not a literal word",
+    ),
+    (
+        'cert-postgres-age.yml', 'cert-postgres-age',
+        'Ensure AGE + vector extensions present (best-effort — tier is pre-provisioned)',
+        "command word '$PSQL' is not a literal word",
+    ),
+    ('cert-postgres-age.yml', 'cert-postgres-age', 'Run', "command word '--test' is not on the closed command list"),
+    (
+        'ci.yml', 'check', 'Free disk before tests (hosted image only,',
+        "command word 'apt-get' is not on the closed command list",
+    ),
+    (
+        'ci.yml', 'check', 'Free disk before tests (hosted image only,',
+        "command word 'fallocate' is not on the closed command list",
+    ),
+    (
+        'ci.yml', 'check', 'Free disk before tests (hosted image only,',
+        "command word 'mkswap' is not on the closed command list",
+    ),
+    (
+        'ci.yml', 'check', 'Free disk before tests (hosted image only,',
+        "command word 'swapon' is not on the closed command list",
+    ),
+    ('ci.yml', 'check', 'Run tests (impact-aware)', "command word '$TIMEOUT_BIN' is not a literal word"),
+    ('ci.yml', 'check', 'Run tests (impact-aware)', "command word '$l' is not a literal word"),
+    ('ci.yml', 'check', 'Run tests (impact-aware)', "command word '$tflag' is not a literal word"),
+    ('ci.yml', 'check', 'Run tests (impact-aware)', "command word '--lib' is not on the closed command list"),
+    ('ci.yml', 'check', 'Run tests (impact-aware)', "command word '--skip' is not on the closed command list"),
+    ('ci.yml', 'check', 'Run tests (impact-aware)', "command word '--test' is not on the closed command list"),
+    (
+        'ci.yml', 'ci-gate', 'Fold job results (base gate)',
+        "interpreter path '$RUNNER_TEMP/impact-base/impact/gate.py' is neither in the workspace nor bound to base content",
+    ),
+    ('ci.yml', 'ci-gate', 'Materialise the base gate (#8240)', 'python code uses a dunder name'),
+    ('ci.yml', 'ci-gate', 'Materialise the base gate (#8240)', "python module 'os' is not on the closed module list"),
+    (
+        'ci.yml', 'ci-gate', 'Materialise the base gate (#8240)',
+        "python module 'shutil' is not on the closed module list",
+    ),
+    (
+        'ci.yml', 'ci-gate', 'Materialise the base gate (#8240)',
+        "python module 'subprocess' is not on the closed module list",
+    ),
+    (
+        'ci.yml', 'classify', 'id:cls',
+        "interpreter path '$trust_impact/cargo_skip.py' is neither in the workspace nor bound to base content",
+    ),
+    (
+        'ci.yml', 'select', 'Build impact index',
+        "interpreter path '$RUNNER_TEMP/impact-base/impact/build_index.py' is neither in the workspace nor bound to base content",
+    ),
+    ('ci.yml', 'select', 'Materialise the base selector (#8240)', 'python code uses a dunder name'),
+    (
+        'ci.yml', 'select', 'Materialise the base selector (#8240)',
+        "python module 'os' is not on the closed module list",
+    ),
+    (
+        'ci.yml', 'select', 'Materialise the base selector (#8240)',
+        "python module 'shutil' is not on the closed module list",
+    ),
+    (
+        'ci.yml', 'select', 'Materialise the base selector (#8240)',
+        "python module 'subprocess' is not on the closed module list",
+    ),
+    (
+        'ci.yml', 'select', 'Select jobs',
+        "interpreter path '$RUNNER_TEMP/impact-base/impact/select.py' is neither in the workspace nor bound to base content",
+    ),
+    (
+        'ci.yml', 'select', 'Select the full matrix (base selector unavailable)',
+        "python module 'os' is not on the closed module list",
+    ),
+    (
+        'coverage.yml', 'classify', 'id:cls',
+        "interpreter path '$trust_impact/cargo_skip.py' is neither in the workspace nor bound to base content",
+    ),
+    (
+        'coverage.yml', 'per-module-thresholds', 'Free disk + add swap (#1148 belt-and-suspenders, aggressive)',
+        "command word 'apt-get' is not on the closed command list",
+    ),
+    (
+        'coverage.yml', 'per-module-thresholds', 'Free disk + add swap (#1148 belt-and-suspenders, aggressive)',
+        "command word 'fallocate' is not on the closed command list",
+    ),
+    (
+        'coverage.yml', 'per-module-thresholds', 'Free disk + add swap (#1148 belt-and-suspenders, aggressive)',
+        "command word 'mkswap' is not on the closed command list",
+    ),
+    (
+        'coverage.yml', 'per-module-thresholds', 'Free disk + add swap (#1148 belt-and-suspenders, aggressive)',
+        "command word 'swapon' is not on the closed command list",
+    ),
+    (
+        'coverage.yml', 'per-module-thresholds', 'Install jq + postgresql-client (bounded+retry',
+        "command word 'apt-get' is not on the closed command list",
+    ),
+    (
+        'coverage.yml', 'per-module-thresholds', 'Install mold linker (#1148, pinned+bounded',
+        "command word 'apt-get' is not on the closed command list",
+    ),
+    (
+        'coverage.yml', 'per-module-thresholds', 'Install mold linker (#1148, pinned+bounded',
+        "command word 'mold' is not on the closed command list",
+    ),
+    (
+        'mobile-runtime.yml', 'android-emulator', 'Boot Android emulator + run tests',
+        "command word 'adb' is not on the closed command list",
+    ),
+    (
+        'mobile-runtime.yml', 'android-emulator', 'Enable KVM',
+        "command word 'udevadm' is not on the closed command list",
+    ),
+    (
+        'mobile-runtime.yml', 'ios-simulator', 'Boot iOS Simulator (best-available iPhone)',
+        "command word 'xcrun' is not on the closed command list",
+    ),
+    (
+        'mobile-runtime.yml', 'ios-simulator', 'Run mobile_runtime tests on iOS Simulator',
+        "command word 'xcrun' is not on the closed command list",
+    ),
+    (
+        'mobile-runtime.yml', 'ios-simulator', 'Shut down simulator',
+        "command word 'xcrun' is not on the closed command list",
+    ),
+)
+# Kind not-analysed: (workflow, job, step label, exact reason, the line of what is not analysed).
+REAL_NOT_ANALYSED = (
+    (
+        'ci.yml', 'check', 'Run tests (impact-aware)', 'arithmetic expansion holding a command substitution',
+        'the command substitution inside the arithmetic expansion is not analysed',
+    ),
+    (
+        'ci.yml', 'check', 'Run tests (impact-aware)', "timeout option '--version' is not on the closed option list",
+        "command 'timeout': the rest of this command is not analysed after this form",
+    ),
+    (
+        'coverage.yml', 'per-module-thresholds', 'Install jq + postgresql-client (bounded+retry',
+        "psql option '--version' is not on the closed option list",
+        "command 'psql': the rest of this command is not analysed after this form",
+    ),
+)
+# The four violations reached once the covered forms no longer stop their jobs, without a row
+# before PR 9508: (workflow, job, step label, class, detail); kind violation, #9553, gate step.
+REAL_NEW_VIOLATIONS = (
+    ('ci.yml', 'classify', 'id:cls', 'iii', 'job output set at or after pull-request code ran'),
+    ('ci.yml', 'select', 'Select jobs', 'iii', 'job output set at or after pull-request code ran'),
+    (
+        'ci.yml', 'select', 'Select the full matrix (base selector unavailable)', 'iii',
+        'job output set at or after pull-request code ran',
+    ),
+    ('coverage.yml', 'classify', 'id:cls', 'iii', 'job output set at or after pull-request code ran'),
 )
 REAL_UNCLASSIFIABLE_JOBS = frozenset((wf, job) for wf, job, _, _ in REAL_UNCLASSIFIABLE)
+REAL_FORM_JOB_COUNT = 11
 PRUNE_STEP = "Prune stale runner TMPDIR (#8634)"
 WORKFLOW_CALL_ONLY = "workflow_call-only workflow has no caller in this repository"
 
@@ -973,9 +1120,15 @@ class AllowTable(unittest.TestCase):
     def test_9452_real_allow_table_is_pinned_and_names_fix_issues(self) -> None:
         _need_module(self)
         self.assertEqual(tb.TAINT_ALLOW_PIN, ALLOW_PIN_EXPECTED)
-        self.assertEqual(len(tb.TAINT_ALLOW), ALLOW_ROW_COUNT)
-        self.assertEqual(len(tb.TAINT_ALLOW) + len(tb.OPEN_ROWS), ALLOW_PIN_EXPECTED)
+        self.assertEqual(len(tb.TAINT_ALLOW), ALLOW_ROW_COUNT + NEW_VIOLATION_ROW_COUNT)
+        self.assertEqual(len(tb.TAINT_ALLOW), ALLOW_PIN_EXPECTED)
+        self.assertEqual((tb.OPEN_ROW_PIN, tb.NOT_ANALYSED_PIN), (OPEN_PIN_EXPECTED, NOT_ANALYSED_PIN_EXPECTED))
         self.assertEqual({row.issue for row in tb.TAINT_ALLOW}, FIX_ISSUES)
+        new = [r for r in tb.TAINT_ALLOW if r.issue == NEW_VIOLATION_ISSUE]
+        self.assertEqual(sorted((r.workflow, r.job, r.step, r.classes) for r in new),
+                         sorted((wf, job, step, (klass,)) for wf, job, step, klass, _ in REAL_NEW_VIOLATIONS))
+        # The 13 rows before PR 9508 keep their issues and are not gate steps; the 4 new rows are.
+        self.assertEqual([r.gate_step for r in tb.TAINT_ALLOW], [r.issue == NEW_VIOLATION_ISSUE for r in tb.TAINT_ALLOW])
 
     def test_9452_new_workflow_with_a_violating_job_and_no_row_fails(self) -> None:
         _need_module(self)
@@ -1164,18 +1317,32 @@ class Bounds(unittest.TestCase):
 class RealWorkflows(unittest.TestCase):
     """The invariant over every real workflow at the checkout, and the real step texts."""
 
-    def test_9452_every_real_job_holds_the_boundary_or_has_an_open_row(self) -> None:
+    def test_9452_every_real_job_holds_the_boundary_or_has_a_row_of_each_finding(self) -> None:
         _need_module(self)
         workflows, actions, files = _real()
-        self.assertEqual(tb.check(tb.scan_texts(workflows, actions, files, open_rows=tb.OPEN_ROWS)), [])
+        self.assertEqual(tb.check_repo(tb.scan_texts(workflows, actions, files)), [])
 
-    def test_9452_without_open_rows_every_real_form_is_a_finding(self) -> None:
+    def test_9452_without_form_rows_every_real_form_is_a_finding(self) -> None:
         _need_module(self)
         workflows, actions, files = _real()
         problems = tb.check(tb.scan_texts(workflows, actions, files))
         self.assertEqual(sorted(p for p in problems if p.startswith("unclassifiable: ")),
                          sorted(f"unclassifiable: {wf}/{job}: step {step!r}: {reason}"
                                 for wf, job, step, reason in REAL_UNCLASSIFIABLE))
+        self.assertEqual(sorted(p for p in problems if p.startswith("not-analysed form without a row: ")),
+                         sorted(f"not-analysed form without a row: {wf}/{job}: step {step!r}: {reason}: {note}"
+                                for wf, job, step, reason, note in REAL_NOT_ANALYSED))
+        self.assertEqual(len(problems), len(REAL_UNCLASSIFIABLE) + len(REAL_NOT_ANALYSED))
+
+    def test_9452_without_the_new_violation_rows_each_is_a_finding(self) -> None:
+        _need_module(self)
+        workflows, actions, files = _real()
+        result = tb.scan_texts(workflows, actions, files)
+        old = tuple(r for r in tb.TAINT_ALLOW if r.issue != NEW_VIOLATION_ISSUE)
+        problems = tb.check(result, old, len(old), tb.OPEN_ROWS, tb.OPEN_ROW_PIN, tb.NOT_ANALYSED_ROWS,
+                            tb.NOT_ANALYSED_PIN)
+        self.assertEqual(problems, sorted(f"violation class ({klass}) without an allow row: {wf}/{job}/{step}: {detail}"
+                                          for wf, job, step, klass, detail in REAL_NEW_VIOLATIONS))
 
     def test_9452_every_allow_row_names_a_real_step(self) -> None:
         _need_module(self)
@@ -1209,10 +1376,10 @@ class RealWorkflows(unittest.TestCase):
         _need_module(self)
         workflows, actions, files = _real()
         result = tb.scan_texts(workflows, actions, files)
-        # Its base copy imports a module off the closed list: a finding (REAL_UNCLASSIFIABLE).
+        # Its base copy imports a module off the closed list: a form of kind unclassifiable.
         self.assertEqual(result.verdicts[("ci.yml", "select")], "unclassifiable")
         self.assertIn("ci.yml/select: step 'Materialise the base selector (#8240)': "
-                      "python module 'os' is not on the closed module list", result.unclassifiable)
+                      "python module 'os' is not on the closed module list", [f.message() for f in result.forms])
 
     def test_9452_real_prune_step_is_the_taint_point_of_the_persistent_jobs(self) -> None:
         _need_module(self)
@@ -1223,7 +1390,8 @@ class RealWorkflows(unittest.TestCase):
             with self.subTest(job=key):
                 # The prune step runs a workspace script through GITHUB_ACTION_PATH: listed, never
                 # a finding of its own.
-                self.assertEqual([u for u in result.unclassifiable if PRUNE_STEP in u], [])
+                self.assertEqual([u for u in result.unclassifiable + [f.message() for f in result.forms]
+                                  if PRUNE_STEP in u], [])
                 if key in REAL_UNCLASSIFIABLE_JOBS:
                     self.assertEqual(result.verdicts[key], "unclassifiable")
                     continue
@@ -1245,11 +1413,21 @@ class RealWorkflows(unittest.TestCase):
         _need_module(self)
         workflows, actions, files = _real()
         result = tb.scan_texts(workflows, actions, files)
-        self.assertEqual(sorted(result.unclassifiable),
+        self.assertEqual(result.unclassifiable, [])
+        self.assertEqual(sorted(f.message() for f in result.forms if f.note is None),
                          sorted(f"{wf}/{job}: step {step!r}: {reason}" for wf, job, step, reason in REAL_UNCLASSIFIABLE))
-        # No allow row names an unclassifiable form (ruling b44e2422).
+        self.assertEqual(sorted((f.message(), f.note) for f in result.forms if f.note is not None),
+                         sorted((f"{wf}/{job}: step {step!r}: {reason}", note)
+                                for wf, job, step, reason, note in REAL_NOT_ANALYSED))
+        self.assertEqual(len({(f.workflow, f.job) for f in result.forms}), REAL_FORM_JOB_COUNT)
+        self.assertEqual(set(result.open_jobs), REAL_UNCLASSIFIABLE_JOBS)
+        # A violation row never names a form: the steps they share are the four #9553 class (iii)
+        # rows, a different kind with its own pin.
         rows = {(r.workflow, r.job, r.step) for r in tb.TAINT_ALLOW}
-        self.assertEqual({(wf, job, step) for wf, job, step, _ in REAL_UNCLASSIFIABLE} & rows, set())
+        self.assertEqual({(wf, job, step) for wf, job, step, _ in REAL_UNCLASSIFIABLE} & rows,
+                         {("ci.yml", "classify", "id:cls"), ("coverage.yml", "classify", "id:cls"),
+                          ("ci.yml", "select", "Select jobs"),
+                          ("ci.yml", "select", "Select the full matrix (base selector unavailable)")})
 
     @unittest.skipUnless(pyyaml is not None, "PyYAML not installed: parity oracle skipped")
     def test_9452_subset_parser_matches_pyyaml_on_every_real_file(self) -> None:

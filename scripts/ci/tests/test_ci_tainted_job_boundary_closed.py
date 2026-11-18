@@ -46,7 +46,7 @@ SCAN_CEILING_S = 5.0
 ADVERSARIAL_BYTES = 120_000
 MAX_NESTING = 64
 MAX_YAML_BYTES = 8 * 1024 * 1024
-FIX_ISSUES = frozenset({9454, 9455, 9456, 9471})
+FIX_ISSUES = frozenset({9454, 9455, 9456, 9471, 9553})
 UNCLASSIFIABLE_PREFIX = "unclassifiable: "
 # The hosted job and step that already run the scripts/ci unit tests (I-6).
 HOST_WORKFLOW = "ci.yml"
@@ -57,7 +57,7 @@ HOSTED_LABEL = "ubuntu-latest"
 # The module-level patterns that remain, by name; a new pattern needs a review and a time cell.
 REGEX_NAMES_EXPECTED = frozenset({
     "GITHUB_HOSTED_LABEL_RE", "SECRET_REF_RE", "EVENT_EQ_RE", "ENV_FILE_WRITE_RE",
-    "BLOCK_HEADER_RE", "NAME_RE",
+    "BLOCK_HEADER_RE", "NAME_RE", "QUOTED_RE",
 })
 REMOVED_NAMES = ("BASE_MATERIALISE_RE", "CHECKOUT_IN_RUN_RE", "RUNNER_BOUNDARY_FACTS", "VERSION_ARGS",
                  "HOST_CREDENTIAL_RE", "MATRIX_RUNS_ON_RE", "STEP_OUTPUT_REF_RE")
@@ -87,6 +87,11 @@ def _run_step(name: str, run: str, env: str = "") -> str:
 
 def _scan(text: str, extra: dict[str, str] | None = None) -> object:
     return tb.scan_texts(dict({SYNTH: text}, **(extra or {})), {}, frozenset())
+
+
+def _found(result: object) -> list[str]:
+    """Every form the scan found: a stop (no sink) or a recorded form a row can cover."""
+    return result.unclassifiable + [f.message() for f in result.forms]
 
 
 def _problems(text: str, extra: dict[str, str] | None = None) -> list[str]:
@@ -373,7 +378,7 @@ class PerStepTaint(unittest.TestCase):
         for run in BOUND_TEMP_RUNS:
             with self.subTest(run=run):
                 result = _scan(_wf(CHECKOUT + _run_step("S", run, BASE_ENV) + SECRET_STEP))
-                self.assertEqual(result.unclassifiable, [])
+                self.assertEqual(_found(result), [])
                 self.assertEqual(result.verdicts[(SYNTH, JOB)], "no-pr-code")
 
     def test_9452_a_bind_in_one_step_says_nothing_about_the_next(self) -> None:
@@ -484,6 +489,17 @@ class LinearScanners(unittest.TestCase):
             with self.subTest(head=text[:24]):
                 self.assertGreater(len(text), ADVERSARIAL_BYTES)
                 self._timed(_classify, text)
+
+    def test_9452_reason_class_scan_under_ceiling(self) -> None:
+        _need_module(self)
+        n = ADVERSARIAL_BYTES
+        for reason in ("'" + "\\'" * (n // 2) + "'", '"' + "a" * n, "`" * (n + 1), "'a' " * (n // 4 + 1),
+                       "command word " + "'" * n):
+            with self.subTest(head=reason[:24]):
+                self.assertGreater(len(reason), ADVERSARIAL_BYTES)
+                start = time.monotonic()
+                tb.form_class(reason)
+                self.assertLess(time.monotonic() - start, SCAN_CEILING_S)
 
     def test_9452_host_credential_scan_under_ceiling(self) -> None:
         _need_module(self)
@@ -619,7 +635,7 @@ class HostedGuard(unittest.TestCase):
         self.assertIs(tb._shell_runs_pr_code(HOST_COMMAND), True)
         result = tb.scan_texts(workflows, actions, files)
         host_prefix = f"{HOST_WORKFLOW}/{HOST_JOB}: step {HOST_STEP!r}"
-        self.assertEqual([u for u in result.unclassifiable if u.startswith(host_prefix)], [])
+        self.assertEqual([u for u in _found(result) if u.startswith(host_prefix)], [])
         self.assertEqual([v for v in result.violations if (v.workflow, v.job, v.step) == (HOST_WORKFLOW, HOST_JOB, HOST_STEP)],
                          [])
 
@@ -664,7 +680,7 @@ class ListEntryActionPath(unittest.TestCase):
         for run in ACTION_PATH_PR_CODE:
             with self.subTest(run=run):
                 result = _composite_scan(run)
-                self.assertEqual(result.unclassifiable, [])
+                self.assertEqual(_found(result), [])
                 # The taint point is the outer step that calls the action.
                 self.assertEqual(result.taint_steps[(SYNTH, JOB)], ACTION_STEP)
                 self.assertEqual(result.verdicts[(SYNTH, JOB)], "i")
@@ -675,8 +691,7 @@ class ListEntryActionPath(unittest.TestCase):
             with self.subTest(run=run):
                 result = _composite_scan(run)
                 reason = f"interpreter path {path!r} is neither in the workspace nor bound to base content"
-                self.assertEqual(result.unclassifiable,
-                                 [f"{SYNTH}/{JOB}: step '{ACTION_STEP} > Inner': {reason}"])
+                self.assertEqual(_found(result), [f"{SYNTH}/{JOB}: step '{ACTION_STEP} > Inner': {reason}"])
 
     def test_9452_action_path_outside_a_composite_has_no_meaning(self) -> None:
         _need_module(self)
@@ -774,7 +789,7 @@ class MutationPinnedGuards(unittest.TestCase):
         }
         steps = CHECKOUT + f"      - name: {ACTION_STEP}\n        uses: ./{ACTION_DIR}\n" + SECRET_STEP
         result = tb.scan_texts({SYNTH: _wf(steps)}, actions, frozenset())
-        self.assertEqual(result.unclassifiable, [])
+        self.assertEqual(_found(result), [])
         self.assertEqual(result.verdicts[(SYNTH, JOB)], "i")
 
     def test_9452_a_base_ref_that_can_be_empty_binds_only_with_a_guard(self) -> None:
@@ -788,7 +803,7 @@ class MutationPinnedGuards(unittest.TestCase):
             with self.subTest(on=on, ref=ref):
                 steps = CHECKOUT + _run_step("S", BASE_COPY_RUN.format(ref=ref), BASE_REF_ENV) + SECRET_STEP
                 result = _scan(_wf(steps, on=on))
-                self.assertEqual(result.unclassifiable, [])
+                self.assertEqual(_found(result), [])
                 self.assertEqual(result.verdicts[(SYNTH, JOB)], "no-pr-code")
 
     def test_9452_oversized_file_is_refused_before_any_read(self) -> None:
