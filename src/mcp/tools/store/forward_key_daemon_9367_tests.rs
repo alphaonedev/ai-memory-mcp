@@ -17,6 +17,13 @@
 //! The PostgreSQL cell runs under `sal-postgres` against the database named
 //! by `AI_MEMORY_TEST_POSTGRES_URL` (a minted ci-v2-pg database) and reports
 //! a skip when the variable is unset, as every postgres cell of this crate.
+//!
+//! No cell writes the process environment (#3475, gate arm (d)): each cell
+//! re-runs itself in children started from a CLEAN environment that holds
+//! exactly the variables the phase needs (`test_support::spawn_test_child`,
+//! the #3152 precedent). The daemon cell runs its unset phase in one child and
+//! its two keyed phases in a second child whose start state names the key
+//! file; the parent only spawns and checks.
 
 use super::*;
 use crate::identity::test_agent_id::AgentIdOverride;
@@ -53,22 +60,75 @@ fn scratch(cell: &str) -> std::path::PathBuf {
     dir
 }
 
-fn key_file(dir: &std::path::Path, key: &str) -> std::path::PathBuf {
+/// In a keyed child: write `<key>\n` mode 0600 at the path its start
+/// environment names in [`KEY_FILE_ENV`]; return that path.
+fn child_key_file(key: &str) -> std::path::PathBuf {
     use std::os::unix::fs::PermissionsExt as _;
-    let path = dir.join("agent.token");
+    let path = std::path::PathBuf::from(
+        std::env::var_os(KEY_FILE_ENV).expect("the parent names the key file"),
+    );
     std::fs::write(&path, format!("{key}\n")).expect("write token file");
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
     path
 }
 
-fn set_env(name: &str, value: &std::ffi::OsStr) {
-    // SAFETY: the cell runs alone in its own re-exec'd child process.
-    unsafe { std::env::set_var(name, value) };
+/// This module's path inside the lib test binary.
+const MODULE: &str = "mcp::store::transport::forward_key_daemon_9367_tests";
+/// Marks the clean child a cell spawns for itself; never set in a parent.
+const CHILD_ROLE_ENV: &str = "AI_MEMORY_TEST_FORWARD_KEY_DAEMON_CHILD_9367";
+/// The key file name inside a cell's scratch dir.
+const TOKEN_NAME: &str = "agent.token";
+/// The permissive attestation posture the daemon cell starts its children in.
+const ATTESTATION_OFF: &str = "0";
+
+/// `true` in the child a cell spawned for itself.
+fn is_child() -> bool {
+    std::env::var_os(CHILD_ROLE_ENV).is_some()
 }
 
-fn unset_env(name: &str) {
-    // SAFETY: as `set_env`.
-    unsafe { std::env::remove_var(name) };
+/// Run `test` of this module again in a child whose environment is CLEAN
+/// plus exactly `env` and the role marker; the child must pass and must have
+/// run that one test (a filter that matches nothing also exits 0).
+fn run_in_child(test: &str, env: &[(&str, &str)]) {
+    let mut vars = vec![(CHILD_ROLE_ENV, "1")];
+    vars.extend_from_slice(env);
+    let out = crate::test_support::spawn_test_child(&format!("{MODULE}::{test}"), &vars);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "{test} child failed:\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+    );
+    assert!(
+        stdout.contains("1 passed") && !stdout.contains("0 passed"),
+        "{test} child ran no test:\n{stdout}"
+    );
+}
+
+/// Run `test` in a clean child whose environment names
+/// `<scratch(cell)>/agent.token` in [`KEY_FILE_ENV`] plus `extra`, then drop
+/// the scratch dir.
+fn run_keyed_child(test: &str, cell: &str, extra: &[(&str, &str)]) {
+    let dir = scratch(cell);
+    let path = dir.join(TOKEN_NAME);
+    let path = path.to_str().expect("utf-8 scratch path");
+    let mut env = vec![(KEY_FILE_ENV, path)];
+    env.extend_from_slice(extra);
+    run_in_child(test, &env);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Parent role of the daemon cell: phase 1 in a clean child with the key
+/// variable unset, phases 2-3 in a clean child that names a key path; both
+/// start with the permissive attestation posture plus `extra`.
+fn daemon_children(test: &str, extra: &[(&str, &str)]) {
+    let mut env = vec![(
+        crate::identity::attest::ENV_REQUIRE_AGENT_ATTESTATION,
+        ATTESTATION_OFF,
+    )];
+    env.extend_from_slice(extra);
+    run_in_child(test, &env);
+    run_keyed_child(test, "daemon", &env);
 }
 
 /// The daemon's auth layer: no key at all, or a shared transport key plus
@@ -256,28 +316,31 @@ fn store_params(tag: &str) -> Value {
 /// (its own sqlite file, or the one minted postgres database).
 fn daemon_cell(fresh: &dyn Fn(&str) -> Backend) {
     let _id = AgentIdOverride::set(AGENT);
-    let dir = scratch("daemon");
     // The forwarded store is an unsigned HTTP-direct write; the daemon's
     // compiled default requires attestation on that surface (#1985), so the
     // cells model the permissive posture, as the HTTP receipt cells do
     // (tests/write_receipts_http_3555.rs). The key path is what is tested.
-    set_env(
-        crate::identity::attest::ENV_REQUIRE_AGENT_ATTESTATION,
-        std::ffi::OsStr::new("0"),
+    // The posture is the child's start state (`daemon_children`).
+    assert_eq!(
+        std::env::var(crate::identity::attest::ENV_REQUIRE_AGENT_ATTESTATION).as_deref(),
+        Ok(ATTESTATION_OFF),
+        "the child starts in the permissive posture"
     );
 
-    // 1. Variable UNSET, daemon without an api key: today's forward.
-    unset_env(KEY_FILE_ENV);
-    let backend = fresh("unset");
-    let url = spawn_daemon(backend.clone(), auth(None));
-    let before = rows(&backend);
-    forward_store_to_http(&url, &store_params("unset"), Some("ai:test"))
-        .unwrap_or_else(|e| panic!("unset variable must forward as today: {e}"));
-    assert_eq!(rows(&backend), before + 1, "unset: the row is written");
+    if std::env::var_os(KEY_FILE_ENV).is_none() {
+        // 1. Variable UNSET, daemon without an api key: today's forward.
+        let backend = fresh("unset");
+        let url = spawn_daemon(backend.clone(), auth(None));
+        let before = rows(&backend);
+        forward_store_to_http(&url, &store_params("unset"), Some("ai:test"))
+            .unwrap_or_else(|e| panic!("unset variable must forward as today: {e}"));
+        assert_eq!(rows(&backend), before + 1, "unset: the row is written");
+        return;
+    }
 
     // 2. Key bound to the explicit agent id: accepted, row written.
     let key = synthetic_key();
-    set_env(KEY_FILE_ENV, key_file(&dir, &key).as_os_str());
+    child_key_file(&key);
     let backend = fresh("bound");
     let url = spawn_daemon(backend.clone(), auth(Some((&key, AGENT))));
     let before = rows(&backend);
@@ -322,15 +385,14 @@ fn daemon_cell(fresh: &dyn Fn(&str) -> Backend) {
         assert!(!err.contains(&key), "{site}: key bytes in the error");
     }
     assert_eq!(rows(&backend), before, "a refused key writes zero rows");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn sqlite_daemon_keyed_forward_9367() {
+    const TEST: &str = "sqlite_daemon_keyed_forward_9367";
     let _lock = crate::identity::agent_id_env_test_lock();
-    if crate::config::run_env_isolated_child_or_spawn(
-        "mcp::store::transport::forward_key_daemon_9367_tests::sqlite_daemon_keyed_forward_9367",
-    ) {
+    if !is_child() {
+        daemon_children(TEST, &[]);
         return;
     }
     let dbs = scratch("sqlite-dbs");
@@ -366,17 +428,22 @@ fn raw_post(base: &str, path: &str, key: &str, body: &Value) -> (String, String)
 /// forwarder names the daemon's code, never "refused the key".
 #[test]
 fn default_attestation_daemon_refuses_keyed_forward_9367() {
+    const TEST: &str = "default_attestation_daemon_refuses_keyed_forward_9367";
     let _lock = crate::identity::agent_id_env_test_lock();
-    if crate::config::run_env_isolated_child_or_spawn(
-        "mcp::store::transport::forward_key_daemon_9367_tests::default_attestation_daemon_refuses_keyed_forward_9367",
-    ) {
+    if !is_child() {
+        // The child's clean environment holds no attestation setting: the
+        // daemon runs on its compiled default.
+        run_keyed_child(TEST, "default-attest", &[]);
         return;
     }
     let _id = AgentIdOverride::set(AGENT);
-    unset_env(crate::identity::attest::ENV_REQUIRE_AGENT_ATTESTATION);
-    let dir = scratch("default-attest");
+    assert!(
+        std::env::var_os(crate::identity::attest::ENV_REQUIRE_AGENT_ATTESTATION).is_none(),
+        "the child starts on the compiled attestation default"
+    );
     let key = synthetic_key();
-    set_env(KEY_FILE_ENV, key_file(&dir, &key).as_os_str());
+    let path = child_key_file(&key);
+    let dir = path.parent().expect("key file dir");
     let backend = Backend::Sqlite(dir.join("default.db"));
     let url = spawn_daemon(backend.clone(), auth(Some((&key, AGENT))));
     let before = rows(&backend);
@@ -405,24 +472,25 @@ fn default_attestation_daemon_refuses_keyed_forward_9367() {
     );
     assert!(!err.contains(&key), "key bytes in the error");
     assert_eq!(rows(&backend), before, "the refused store writes zero rows");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[cfg(feature = "sal-postgres")]
 #[test]
 fn postgres_daemon_keyed_forward_9367() {
+    const TEST: &str = "postgres_daemon_keyed_forward_9367";
+    // The minted PostgreSQL database (never printed). Named inside the cell so
+    // the CI partition selects this one test, not the module, for the PG leg.
+    const PG_URL_ENV: &str = "AI_MEMORY_TEST_POSTGRES_URL";
     let _lock = crate::identity::agent_id_env_test_lock();
-    if crate::config::run_env_isolated_child_or_spawn(
-        "mcp::store::transport::forward_key_daemon_9367_tests::postgres_daemon_keyed_forward_9367",
-    ) {
-        return;
-    }
-    let Some(url) = std::env::var("AI_MEMORY_TEST_POSTGRES_URL")
-        .ok()
-        .filter(|u| !u.is_empty())
-    else {
-        eprintln!("postgres_daemon_keyed_forward_9367: AI_MEMORY_TEST_POSTGRES_URL unset; skipped");
+    let Some(url) = std::env::var(PG_URL_ENV).ok().filter(|u| !u.is_empty()) else {
+        assert!(!is_child(), "the parent passes the database to its child");
+        eprintln!("{TEST}: {PG_URL_ENV} unset; skipped");
         return;
     };
+    if !is_child() {
+        // The clean child gets the minted database by name, never on stdout.
+        daemon_children(TEST, &[(PG_URL_ENV, url.as_str())]);
+        return;
+    }
     daemon_cell(&|_| Backend::Postgres(url.clone()));
 }

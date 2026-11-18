@@ -11,10 +11,12 @@
 //! with the variable UNSET, is the request of today. Set but unusable: a named
 //! local error before any request leaves the process.
 //!
-//! Every cell mutates process environment, so each one re-runs itself alone in
-//! a re-exec'd child (`run_env_isolated_child_or_spawn`); the parent returns.
-//! Keys are synthetic and generated per cell; no key byte is in a test name or
-//! a fixture path.
+//! No cell writes the process environment (#3475, gate arm (d)): each cell
+//! re-runs itself in a child started from a CLEAN environment that holds
+//! exactly the variables the cell needs (`test_support::spawn_test_child`,
+//! the #3152 precedent), so the variable under test is the child's start
+//! state; the parent only spawns and checks. Keys are synthetic and generated
+//! per cell inside the child; no key byte is in a test name or a fixture path.
 
 use super::*;
 use crate::identity::test_agent_id::AgentIdOverride;
@@ -64,20 +66,71 @@ fn scratch(cell: &str) -> std::path::PathBuf {
 /// Write `contents` to `<dir>/agent.token` with `mode`; return the path.
 fn token_file(dir: &std::path::Path, contents: &[u8], mode: u32) -> std::path::PathBuf {
     use std::os::unix::fs::PermissionsExt as _;
-    let path = dir.join("agent.token");
+    let path = dir.join(TOKEN_NAME);
     std::fs::write(&path, contents).expect("write token file");
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).expect("chmod");
     path
 }
 
-fn set_env(name: &str, value: &std::ffi::OsStr) {
-    // SAFETY: the cell runs alone in its own re-exec'd child process.
-    unsafe { std::env::set_var(name, value) };
+/// This module's path inside the lib test binary.
+const MODULE: &str = "mcp::store::transport::forward_key_9367_tests";
+/// Marks the clean child a cell spawns for itself; never set in a parent.
+const CHILD_ROLE_ENV: &str = "AI_MEMORY_TEST_FORWARD_KEY_CHILD_9367";
+/// The key file name inside a cell's scratch dir.
+const TOKEN_NAME: &str = "agent.token";
+
+/// `true` in the child a cell spawned for itself.
+fn is_child() -> bool {
+    std::env::var_os(CHILD_ROLE_ENV).is_some()
 }
 
-fn unset_env(name: &str) {
-    // SAFETY: as `set_env`.
-    unsafe { std::env::remove_var(name) };
+/// Run `test` of this module again in a child whose environment is CLEAN
+/// plus exactly `env` and the role marker; the child must pass and must have
+/// run that one test (a filter that matches nothing also exits 0).
+fn run_in_child(test: &str, env: &[(&str, &str)]) {
+    let mut vars = vec![(CHILD_ROLE_ENV, "1")];
+    vars.extend_from_slice(env);
+    let out = crate::test_support::spawn_test_child(&format!("{MODULE}::{test}"), &vars);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "{test} child failed:\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+    );
+    assert!(
+        stdout.contains("1 passed") && !stdout.contains("0 passed"),
+        "{test} child ran no test:\n{stdout}"
+    );
+}
+
+/// Parent role: run `test` in a clean child whose environment names
+/// `<scratch(cell)>/agent.token` in [`KEY_FILE_ENV`] (plus `extra`), then drop
+/// the scratch dir, and return `true` (the caller returns). Child role:
+/// `false`, and the caller runs the cell body.
+fn keyed_child_or_spawn(test: &str, cell: &str, extra: &[(&str, &str)]) -> bool {
+    if is_child() {
+        return false;
+    }
+    let dir = scratch(cell);
+    let path = dir.join(TOKEN_NAME);
+    let path = path.to_str().expect("utf-8 scratch path");
+    let mut env = vec![(KEY_FILE_ENV, path)];
+    env.extend_from_slice(extra);
+    run_in_child(test, &env);
+    let _ = std::fs::remove_dir_all(&dir);
+    true
+}
+
+/// In a keyed child: the key file path its start environment names.
+fn child_key_path() -> std::path::PathBuf {
+    std::path::PathBuf::from(std::env::var_os(KEY_FILE_ENV).expect("the parent names the key file"))
+}
+
+/// In a keyed child: write `<key>\n` mode 0600 at [`child_key_path`].
+fn child_key_file(key: &str) -> std::path::PathBuf {
+    let path = child_key_path();
+    let dir = path.parent().expect("key file dir");
+    token_file(dir, format!("{key}\n").as_bytes(), 0o600)
 }
 
 /// Accept connections on loopback forever, answer each with the next canned
@@ -161,12 +214,15 @@ macro_rules! forward_each {
 #[test]
 fn unset_variable_sends_no_api_key_and_no_new_error_9367() {
     let _lock = crate::identity::agent_id_env_test_lock();
-    if crate::config::run_env_isolated_child_or_spawn(
-        "mcp::store::transport::forward_key_9367_tests::unset_variable_sends_no_api_key_and_no_new_error_9367",
-    ) {
+    if !is_child() {
+        // The child's clean environment does not hold the variable.
+        run_in_child("unset_variable_sends_no_api_key_and_no_new_error_9367", &[]);
         return;
     }
-    unset_env(KEY_FILE_ENV);
+    assert!(
+        std::env::var_os(KEY_FILE_ENV).is_none(),
+        "the child starts unset"
+    );
     let _id = AgentIdOverride::set(AGENT);
     let (url, rx) = server(vec![OK_200.to_string()]);
     for (site, result) in forward_each!(&url) {
@@ -193,15 +249,15 @@ fn unset_variable_sends_no_api_key_and_no_new_error_9367() {
 #[test]
 fn set_variable_sends_the_file_key_on_every_site_9367() {
     let _lock = crate::identity::agent_id_env_test_lock();
-    if crate::config::run_env_isolated_child_or_spawn(
-        "mcp::store::transport::forward_key_9367_tests::set_variable_sends_the_file_key_on_every_site_9367",
+    if keyed_child_or_spawn(
+        "set_variable_sends_the_file_key_on_every_site_9367",
+        "sends",
+        &[],
     ) {
         return;
     }
     let key = synthetic_key();
-    let dir = scratch("sends");
-    let path = token_file(&dir, format!("{key}\n").as_bytes(), 0o600);
-    set_env(KEY_FILE_ENV, path.as_os_str());
+    child_key_file(&key);
     let _id = AgentIdOverride::set(AGENT);
     let (url, rx) = server(vec![OK_200.to_string()]);
     for (site, result) in forward_each!(&url) {
@@ -220,7 +276,6 @@ fn set_variable_sends_the_file_key_on_every_site_9367() {
             Some("x-agent-id: ai:alice")
         );
     }
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// K-2 FINAL — variable SET but the file is missing, a directory, empty,
@@ -229,79 +284,58 @@ fn set_variable_sends_the_file_key_on_every_site_9367() {
 /// hatch of `bind-api-key` does not open the forwarder.
 #[test]
 fn set_but_unusable_file_is_a_named_local_error_per_form_9367() {
+    const TEST: &str = "set_but_unusable_file_is_a_named_local_error_per_form_9367";
     let _lock = crate::identity::agent_id_env_test_lock();
-    if crate::config::run_env_isolated_child_or_spawn(
-        "mcp::store::transport::forward_key_9367_tests::set_but_unusable_file_is_a_named_local_error_per_form_9367",
-    ) {
+    if !is_child() {
+        // One clean child with the hatch unset (every form), one with it set
+        // (the lax-mode forms): the hatch is the child's start state.
+        for extra in [&[][..], &[(LAX_HATCH_ENV, "1")][..]] {
+            assert!(keyed_child_or_spawn(TEST, "forms", extra), "parent role");
+        }
         return;
     }
+    let hatch = std::env::var_os(LAX_HATCH_ENV).is_some();
     let key = synthetic_key();
-    let dir = scratch("forms");
+    let path = child_key_path();
+    let dir = path.parent().expect("key file dir").to_path_buf();
     let _id = AgentIdOverride::set(AGENT);
-    let oversize = vec![b'a'; OVERSIZE_BYTES];
-    let missing = dir.join("absent.token");
-    let not_regular = dir.join("a-directory");
-    std::fs::create_dir_all(&not_regular).expect("mkdir");
-    let cases: Vec<(&str, std::path::PathBuf, bool, &str)> = vec![
-        (
+    let mut forms: Vec<(&str, FormFile, &str)> = Vec::new();
+    if !hatch {
+        forms.push((
             "missing",
-            missing,
-            false,
+            FormFile::Absent,
             "is set but the file does not exist",
-        ),
-        (
+        ));
+        forms.push((
             "directory",
-            not_regular,
-            false,
+            FormFile::Directory,
             "is set but the path is not a regular file",
-        ),
-        (
+        ));
+        forms.push((
             "empty",
-            token_file(&dir.join(""), b"  \n", 0o600),
-            false,
+            FormFile::File(b"  \n".to_vec(), 0o600),
             "is set but the file is empty",
-        ),
-    ];
-    let mut forms = cases;
-    let malformed_dir = dir.join("malformed");
-    std::fs::create_dir_all(&malformed_dir).expect("mkdir");
-    forms.push((
-        "malformed",
-        token_file(
-            &malformed_dir,
-            format!("{key} trailing\n").as_bytes(),
-            0o600,
-        ),
-        false,
-        "is set but the file does not hold one api key (printable ASCII, no spaces)",
-    ));
-    let oversize_dir = dir.join("oversize");
-    std::fs::create_dir_all(&oversize_dir).expect("mkdir");
-    forms.push((
-        "oversize",
-        token_file(&oversize_dir, &oversize, 0o600),
-        false,
-        "is set but the file is larger than",
-    ));
-    for (n, mode) in [0o640_u32, 0o604, 0o644].into_iter().enumerate() {
-        let lax_dir = dir.join(format!("lax-{n}"));
-        std::fs::create_dir_all(&lax_dir).expect("mkdir");
-        for hatch in [false, true] {
-            forms.push((
-                "lax-mode",
-                token_file(&lax_dir, format!("{key}\n").as_bytes(), mode),
-                hatch,
-                "is set but the file is readable by group or others (chmod 0600)",
-            ));
-        }
+        ));
+        forms.push((
+            "malformed",
+            FormFile::File(format!("{key} trailing\n").into_bytes(), 0o600),
+            "is set but the file does not hold one api key (printable ASCII, no spaces)",
+        ));
+        forms.push((
+            "oversize",
+            FormFile::File(vec![b'a'; OVERSIZE_BYTES], 0o600),
+            "is set but the file is larger than",
+        ));
     }
-    for (form, path, hatch, want) in forms {
-        set_env(KEY_FILE_ENV, path.as_os_str());
-        if hatch {
-            set_env(LAX_HATCH_ENV, std::ffi::OsStr::new("1"));
-        } else {
-            unset_env(LAX_HATCH_ENV);
-        }
+    for mode in [0o640_u32, 0o604, 0o644] {
+        forms.push((
+            "lax-mode",
+            FormFile::File(format!("{key}\n").into_bytes(), mode),
+            "is set but the file is readable by group or others (chmod 0600)",
+        ));
+    }
+    for (form, file, want) in forms {
+        place_form(&dir, &path, &file);
         let (url, rx) = server(vec![OK_200.to_string()]);
         let started = Instant::now();
         for (site, result) in forward_each!(&url) {
@@ -335,7 +369,29 @@ fn set_but_unusable_file_is_a_named_local_error_per_form_9367() {
             "{form}: a request left the process: {requests:?}"
         );
     }
-    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// What the forms cell puts at the one key path its child was started with.
+enum FormFile {
+    /// Nothing at the path.
+    Absent,
+    /// A directory at the path.
+    Directory,
+    /// A regular file with these bytes and this mode.
+    File(Vec<u8>, u32),
+}
+
+/// Replace whatever is at `path` (inside `dir`) with `file`.
+fn place_form(dir: &std::path::Path, path: &std::path::Path, file: &FormFile) {
+    let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_dir(path);
+    match file {
+        FormFile::Absent => {}
+        FormFile::Directory => std::fs::create_dir(path).expect("mkdir"),
+        FormFile::File(bytes, mode) => {
+            token_file(dir, bytes, *mode);
+        }
+    }
 }
 
 /// K-3 / V-2 — the forward client follows no redirect: a 307 to another
@@ -344,15 +400,15 @@ fn set_but_unusable_file_is_a_named_local_error_per_form_9367() {
 #[test]
 fn redirect_to_another_origin_is_not_followed_9367() {
     let _lock = crate::identity::agent_id_env_test_lock();
-    if crate::config::run_env_isolated_child_or_spawn(
-        "mcp::store::transport::forward_key_9367_tests::redirect_to_another_origin_is_not_followed_9367",
+    if keyed_child_or_spawn(
+        "redirect_to_another_origin_is_not_followed_9367",
+        "redirect",
+        &[],
     ) {
         return;
     }
     let key = synthetic_key();
-    let dir = scratch("redirect");
-    let path = token_file(&dir, format!("{key}\n").as_bytes(), 0o600);
-    set_env(KEY_FILE_ENV, path.as_os_str());
+    child_key_file(&key);
     let _id = AgentIdOverride::set(AGENT);
     let (other, other_rx) = server(vec![OK_200.to_string()]);
     let redirect = format!(
@@ -381,7 +437,6 @@ fn redirect_to_another_origin_is_not_followed_9367() {
         drain(&other_rx).is_empty(),
         "the redirect target got a request"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// K-5 / V-4 — a daemon 403 on a keyed forward (the key is bound to another
@@ -390,15 +445,11 @@ fn redirect_to_another_origin_is_not_followed_9367() {
 #[test]
 fn keyed_403_is_a_named_error_with_no_retry_9367() {
     let _lock = crate::identity::agent_id_env_test_lock();
-    if crate::config::run_env_isolated_child_or_spawn(
-        "mcp::store::transport::forward_key_9367_tests::keyed_403_is_a_named_error_with_no_retry_9367",
-    ) {
+    if keyed_child_or_spawn("keyed_403_is_a_named_error_with_no_retry_9367", "deny", &[]) {
         return;
     }
     let key = synthetic_key();
-    let dir = scratch("deny");
-    let path = token_file(&dir, format!("{key}\n").as_bytes(), 0o600);
-    set_env(KEY_FILE_ENV, path.as_os_str());
+    child_key_file(&key);
     let _id = AgentIdOverride::set(AGENT);
     let (url, rx) = server(vec![DENY_403.to_string()]);
     for (site, result) in forward_each!(&url) {
@@ -424,7 +475,6 @@ fn keyed_403_is_a_named_error_with_no_retry_9367() {
             .all(|r| header_line(r, crate::HEADER_API_KEY).is_some()),
         "every request carried the key"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// One canned JSON response with an exact `Content-Length`.
@@ -449,15 +499,15 @@ fn refused_suffix() -> String {
 #[test]
 fn keyed_refusal_text_only_for_a_credential_refusal_9367() {
     let _lock = crate::identity::agent_id_env_test_lock();
-    if crate::config::run_env_isolated_child_or_spawn(
-        "mcp::store::transport::forward_key_9367_tests::keyed_refusal_text_only_for_a_credential_refusal_9367",
+    if keyed_child_or_spawn(
+        "keyed_refusal_text_only_for_a_credential_refusal_9367",
+        "gates",
+        &[],
     ) {
         return;
     }
     let key = synthetic_key();
-    let dir = scratch("gates");
-    let path = token_file(&dir, format!("{key}\n").as_bytes(), 0o600);
-    set_env(KEY_FILE_ENV, path.as_os_str());
+    child_key_file(&key);
     let _id = AgentIdOverride::set(AGENT);
     let attest = format!(
         r#"{{"code":"{}","error":"attestation failed"}}"#,
@@ -545,7 +595,6 @@ fn keyed_refusal_text_only_for_a_credential_refusal_9367() {
             "{case}: one request per site, no retry"
         );
     }
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// V-3 — with a key, `X-Agent-Id` comes only from the explicit process
@@ -554,15 +603,15 @@ fn keyed_refusal_text_only_for_a_credential_refusal_9367() {
 #[test]
 fn keyed_forward_without_explicit_identity_is_refused_9367() {
     let _lock = crate::identity::agent_id_env_test_lock();
-    if crate::config::run_env_isolated_child_or_spawn(
-        "mcp::store::transport::forward_key_9367_tests::keyed_forward_without_explicit_identity_is_refused_9367",
+    if keyed_child_or_spawn(
+        "keyed_forward_without_explicit_identity_is_refused_9367",
+        "noid",
+        &[],
     ) {
         return;
     }
     let key = synthetic_key();
-    let dir = scratch("noid");
-    let path = token_file(&dir, format!("{key}\n").as_bytes(), 0o600);
-    set_env(KEY_FILE_ENV, path.as_os_str());
+    child_key_file(&key);
     let _id = AgentIdOverride::unset();
     let (url, rx) = server(vec![OK_200.to_string()]);
     for (site, result) in forward_each!(&url) {
@@ -576,7 +625,6 @@ fn keyed_forward_without_explicit_identity_is_refused_9367() {
         );
     }
     assert!(drain(&rx).is_empty(), "no request left the process");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// K-6 — the three forward sites go through the one funnel: the production
