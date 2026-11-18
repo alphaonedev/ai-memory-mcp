@@ -52,6 +52,13 @@ use serde_json::json;
 /// documented schema SSOT, NOT a bare literal scattered through asserts.
 const V064_BASELINE_SCHEMA_VERSION: i64 = 33;
 
+/// The v102 (#8341) abort guards on `memories`; their bodies read
+/// `NEW.encrypted_envelope`, so a column-absent rewind drops them first.
+const V102_PROJECTION_GUARD_TRIGGERS: [&str; 2] = [
+    "agent_pubkey_history_projection_guard_insert",
+    "agent_pubkey_history_projection_guard_update",
+];
+
 /// The closed-taxonomy relation used for the seeded edges. Any member of
 /// the v0.7.0 `MemoryLinkRelation` taxonomy works; `related_to` is the
 /// neutral choice and avoids the directional semantics of `supersedes` /
@@ -324,6 +331,14 @@ fn v064_legacy_rows_physically_lacking_v070_columns_upgrade_losslessly() {
             conn.execute(&format!("DROP INDEX IF EXISTS {idx}"), [])
                 .unwrap_or_else(|e| panic!("drop index {idx}: {e}"));
         }
+        // A real v0.6.4 database carries none of the v102 projection guards
+        // (#8341), and SQLite re-checks every trigger body on DROP COLUMN:
+        // the guards read NEW.encrypted_envelope, so they go first. The
+        // ladder re-installs them on the re-open (asserted below).
+        for trigger in V102_PROJECTION_GUARD_TRIGGERS {
+            conn.execute(&format!("DROP TRIGGER IF EXISTS {trigger}"), [])
+                .unwrap_or_else(|e| panic!("drop trigger {trigger}: {e}"));
+        }
         let droppable_v070_columns = [
             "atomised_into",         // v36 (index dropped above)
             "entity_id",             // v37
@@ -365,6 +380,18 @@ fn v064_legacy_rows_physically_lacking_v070_columns_upgrade_losslessly() {
         "upgrade of a column-absent legacy DB must reach the v0.7.0 head"
     );
 
+    // The v102 rung re-installed both projection guards dropped above.
+    for trigger in V102_PROJECTION_GUARD_TRIGGERS {
+        let present: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name = ?1",
+                [trigger],
+                |r| r.get(0),
+            )
+            .expect("read sqlite_master");
+        assert_eq!(present, 1, "the v102 ladder must re-install {trigger}");
+    }
+
     // Columns re-added.
     for col in ["entity_id", "citations", "confidence_source", "version"] {
         assert!(
@@ -396,6 +423,171 @@ fn v064_legacy_rows_physically_lacking_v070_columns_upgrade_losslessly() {
             "re-added v38 citations column must backfill legacy row {id} to empty"
         );
     }
+
+    assert_guards_enforce_after_upgrade(&conn);
+    drop(conn);
+    replay_9273_on_upgraded_store(&path);
+}
+
+/// `SQLITE_CORRUPT_VTAB` (`SQLITE_CORRUPT | (1 << 8)`), the #9273 code.
+const SQLITE_CORRUPT_VTAB_UPG: i32 = 267;
+const INTEGRITY_CHECK_UPG: &str =
+    "INSERT INTO memories_fts(memories_fts, rank) VALUES('integrity-check', 1)";
+/// Fresh random keys per replay (the tokens of a base64 key decide whether a
+/// later FTS5 'delete' trips over a desync), per `recursive_triggers` setting.
+const REPLAYS_UPG: usize = 4;
+const FAR_FUTURE_UPG: &str = "2099-01-01T00:00:00Z";
+
+fn fts_check_upg(conn: &Connection) -> Result<(), i32> {
+    match conn.execute_batch(INTEGRITY_CHECK_UPG) {
+        Ok(()) => Ok(()),
+        Err(rusqlite::Error::SqliteFailure(e, _)) => Err(e.extended_code),
+        Err(other) => panic!("integrity-check failed with a non-SQLite error: {other}"),
+    }
+}
+
+fn sqlite_code_upg(err: &anyhow::Error) -> Option<i32> {
+    err.chain()
+        .find_map(|cause| match cause.downcast_ref::<rusqlite::Error>() {
+            Some(rusqlite::Error::SqliteFailure(e, _)) => Some(e.extended_code),
+            _ => None,
+        })
+}
+
+/// One replay of the #9273 CI sequence (plant a flat-bound roster row, bind
+/// the legitimate key, merge the federated copy through `insert_if_newer`)
+/// on an already-open connection, with the FTS5 integrity-check after every
+/// step. Returns the first violation as `(step, code)`.
+fn replay_9273_sequence_upg(conn: &Connection, tag: &str) -> Result<(), (&'static str, i32)> {
+    use ai_memory::models::field_names;
+    let victim = format!("ai:legacy-upgrade-victim-{tag}");
+    let plant_id = format!("legacy-upgrade-plant-{tag}");
+    let attacker_key =
+        ai_memory::identity::keypair::generate(&format!("ai:legacy-upgrade-attacker-{tag}"))
+            .expect("keypair")
+            .public_base64();
+    let as_code = |step: &'static str, e: &anyhow::Error| {
+        let code = sqlite_code_upg(e).unwrap_or_else(|| panic!("{step}: non-SQLite error {e:#}"));
+        (step, code)
+    };
+    let created = ai_memory::identity::attest::now_attestable_rfc3339();
+    let metadata = json!({
+        "agent_id": victim,
+        (field_names::AGENT_PUBKEY): attacker_key,
+        (field_names::PUBKEY_BOUND_AT): created,
+        (field_names::WRITE_SIGNATURE): "forged-carried-signature",
+        (field_names::ATTEST_LEVEL): "agent_attested",
+    });
+    let planted = Memory {
+        id: plant_id.clone(),
+        tier: Tier::Long,
+        namespace: ai_memory::models::AGENTS_NAMESPACE.to_string(),
+        title: ai_memory::models::agent_registration_title(&victim),
+        content: serde_json::to_string(&metadata).expect("mirror"),
+        created_at: created.clone(),
+        updated_at: created,
+        metadata,
+        ..Memory::default()
+    };
+    db::insert(conn, &planted).map_err(|e| as_code("insert", &e))?;
+    fts_check_upg(conn).map_err(|code| ("insert+integrity-check", code))?;
+    let legitimate = ai_memory::identity::keypair::generate(&victim).expect("keypair");
+    db::bind_agent_pubkey_with_keypair(conn, &victim, &legitimate)
+        .map_err(|e| as_code("bind", &e))?;
+    fts_check_upg(conn).map_err(|code| ("bind+integrity-check", code))?;
+    let mut federated = db::get(conn, &plant_id)
+        .expect("read bound row")
+        .expect("bound row present");
+    federated.updated_at = FAR_FUTURE_UPG.to_string();
+    federated
+        .metadata
+        .as_object_mut()
+        .expect("metadata object")
+        .insert(
+            field_names::AGENT_PUBKEY.to_string(),
+            serde_json::Value::String(attacker_key),
+        );
+    federated.content = serde_json::to_string(&federated.metadata).expect("mirror");
+    db::insert_if_newer(conn, &federated).map_err(|e| as_code("insert_if_newer", &e))?;
+    fts_check_upg(conn).map_err(|code| ("insert_if_newer+integrity-check", code))?;
+    Ok(())
+}
+
+/// Ruling b430ff48 item 3: the guards the v102 rung re-installed on the
+/// upgraded legacy store keep `memories_fts` in step under the #9273 replay,
+/// `recursive_triggers` OFF (production default) and ON, and the index passes
+/// its integrity-check after every step. Any violation is the defect; a
+/// violation must be the exact code 267.
+fn replay_9273_on_upgraded_store(path: &std::path::Path) {
+    let mut violations = Vec::new();
+    for recursive in [false, true] {
+        let conn = db::open(path).expect("re-open the upgraded legacy store");
+        let pragma = if recursive {
+            "PRAGMA recursive_triggers=ON"
+        } else {
+            "PRAGMA recursive_triggers=OFF"
+        };
+        conn.execute_batch(pragma).expect("recursive_triggers");
+        fts_check_upg(&conn).expect("the upgraded store's index passes before the replay");
+        for replay in 0..REPLAYS_UPG {
+            let tag = format!("{recursive}-{replay}");
+            if let Err((step, code)) = replay_9273_sequence_upg(&conn, &tag) {
+                assert_eq!(
+                    code, SQLITE_CORRUPT_VTAB_UPG,
+                    "recursive={recursive} replay={replay} {step}"
+                );
+                violations.push(format!(
+                    "recursive={recursive} replay={replay} at {step}: code {code}"
+                ));
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "memories_fts out of step on the upgraded legacy store:\n{}",
+        violations.join("\n")
+    );
+}
+
+/// The re-installed v102 guards enforce on the upgraded legacy store: the
+/// trigger body aborts a forged key, and the `UPDATE OF` list re-checks an
+/// envelope-only unseal (#9406). Exact RAISE texts from 0086.
+fn assert_guards_enforce_after_upgrade(conn: &Connection) {
+    const AGENT: &str = "ai:legacy-upgrade-guard-8341";
+    const MISMATCH_MESSAGE: &str = "agent_projection_guard: _agents write does not carry the authoritative agent_pubkey_history projection (metadata and content agent_pubkey/pubkey_bound_at must equal the open history row)";
+    const NON_OBJECT_MESSAGE: &str = "agent_projection_guard: bound _agents registration content is not a JSON object; re-register the agent (register_agent) to rebuild it";
+    db::register_agent(conn, AGENT, "test", &[]).expect("register on the upgraded store");
+    let kp = ai_memory::identity::keypair::generate(AGENT).expect("keypair");
+    db::bind_agent_pubkey_with_keypair(conn, AGENT, &kp).expect("bind on the upgraded store");
+    let title = ai_memory::models::agent_registration_title(AGENT);
+    let ns = ai_memory::models::AGENTS_NAMESPACE;
+    let raw = |err: &rusqlite::Error| match err {
+        rusqlite::Error::SqliteFailure(_, Some(message)) => Some(message.clone()),
+        _ => None,
+    };
+
+    let forged = conn
+        .execute(
+            "UPDATE memories SET metadata = json_set(metadata, '$.agent_pubkey', 'forged-8341')
+              WHERE namespace = ?1 AND title = ?2",
+            rusqlite::params![ns, &title],
+        )
+        .expect_err("the re-installed update guard must abort a forged key");
+    assert_eq!(raw(&forged).as_deref(), Some(MISMATCH_MESSAGE));
+
+    conn.execute(
+        "UPDATE memories SET content = '', encrypted_envelope = X'00'
+          WHERE namespace = ?1 AND title = ?2",
+        rusqlite::params![ns, &title],
+    )
+    .expect("a sealed row with the ledger pair passes");
+    let unseal = conn
+        .execute(
+            "UPDATE memories SET encrypted_envelope = NULL WHERE namespace = ?1 AND title = ?2",
+            rusqlite::params![ns, &title],
+        )
+        .expect_err("UPDATE OF encrypted_envelope must re-check an unseal on the upgraded store");
+    assert_eq!(raw(&unseal).as_deref(), Some(NON_OBJECT_MESSAGE));
 }
 
 /// True when `table.column` exists, via `PRAGMA table_info`.

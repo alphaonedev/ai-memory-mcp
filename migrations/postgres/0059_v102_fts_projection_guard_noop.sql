@@ -1,0 +1,29 @@
+-- Copyright 2026 AlphaOne LLC
+-- SPDX-License-Identifier: Apache-2.0
+--
+-- v1.0.0 #8341 - schema v102 is a POSTGRES NO-OP.
+--
+-- v102 replaces the SQLite v97 AFTER triggers that rewrote an `_agents`
+-- registration row after the `memories_fts` sync trigger had indexed it
+-- (a nested UPDATE under `recursive_triggers = OFF` leaves the FTS5 index
+-- holding the pre-rewrite text: SQLITE_CORRUPT_VTAB on the next delete or
+-- integrity check). The SQLite arm drops those triggers, reconciles every
+-- drifted row to the open `agent_pubkey_history` row, installs RAISE(ABORT)
+-- guards and rebuilds the FTS index
+-- (`migrations/sqlite/0086_v102_fts_projection_guard.sql`).
+--
+-- Postgres has no such drift to repair. Its v97 projection is a BEFORE
+-- trigger that edits NEW before the row is stored
+-- (`0054_v97_agent_pubkey_history.sql`), and its full-text index is the
+-- stored generated `tsv` column (`0046_v89_tsv_include_tags.sql`), which
+-- is computed from the stored row itself. There is no second index for a
+-- rewrite to fall out of step with. The backends differ in disposition:
+-- SQLite aborts a write that does not carry the authoritative projection;
+-- Postgres corrects it in the BEFORE trigger.
+--
+-- The postgres arm (`src/store/postgres.rs::migrate_v102`) only stamps the
+-- literal version, per the v56 version-stamp precedent. This file exists for
+-- `scripts/check-migration-ladder.sh` rule (d): the highest-prefix
+-- `migrations/postgres/` file must carry the `_v102_` tag that matches
+-- `CURRENT_SCHEMA_VERSION`, the v89 doc-twin precedent in reverse
+-- (`migrations/sqlite/0073_v89_tsv_tags_noop.sql`).

@@ -896,6 +896,8 @@ pub use merge_inbound_authorized_4023::{
 mod federation_by_id_4447;
 // #4206 — the title-slot pre-merge archive snapshot helpers (qual_10 split).
 mod title_slot_archive;
+// #9405 / #9273 — gated `update_with_expected_version` body: gate, then open or join the txn.
+mod versioned_update_txn;
 pub use federation_by_id_4447::{
     ByIdNamespaceAuthorizer, InboundByIdNamespaceRefused, archive_memory_authorized,
     create_link_inbound_authorized, delete_authorized, inbound_by_id_namespace_refused,
@@ -930,6 +932,8 @@ pub use approval_depth::{
 };
 /// #8444 - durable Agent2Agent Task rows (SQLite SSOT; postgres twin in the store).
 pub mod a2a_tasks;
+/// #8341 - the `_agents` public-key projection every write funnel carries (v102).
+pub(crate) mod agent_projection;
 pub mod embed_skip;
 /// v1.0.0 #3288 — sqlite half of the bounded, keyset-paged admin export.
 pub mod export_page;
@@ -2360,14 +2364,21 @@ fn insert_inner(
         mem
     };
 
-    // Generic writes never carry identity authority. Sanitize at the shared
-    // SQLite write funnel so the v97 trigger remains a raw-SQL backstop.
-    let sanitized = (mem.namespace == AGENTS_NAMESPACE).then(|| {
-        let mut sanitized = mem.clone();
-        strip_unproven_agent_pubkey_binding(&mut sanitized);
-        sanitized
-    });
-    let mem = sanitized.as_ref().unwrap_or(mem);
+    // The write txn (reasons at the statement below) is taken here: #8341 adds
+    // `_agents` rows so the projection reads the ledger the statement commits on.
+    let owns_tx = (crate::encryption::encryption_enabled(None)
+        || crate::config::append_only_enabled()
+        || mem.namespace == AGENTS_NAMESPACE)
+        && conn.is_autocommit();
+    let write_txn = if owns_tx {
+        Some(connection::WriteTxn::begin(conn)?)
+    } else {
+        None
+    };
+    // Generic writes never carry identity authority (#8341): strip, then write
+    // the ledger's projection; the v102 guard aborts a write that omits it.
+    let projected = agent_projection::sanitized_projected(conn, mem)?;
+    let mem = projected.as_ref().unwrap_or(mem);
 
     let tags_json = serde_json::to_string(&mem.tags)?;
     // #1757 / #1719 item 2b — populate-on-write: advance THIS node's own
@@ -2478,15 +2489,7 @@ fn insert_inner(
     // the caller's tx. With encryption OFF and the spine OFF (the default) the
     // seal is a no-op, the version pre-probe is skipped, the reconcile returns
     // immediately, and no leaf is emitted — byte-identical to pre-#2383/#2948
-    // (no extra statements, no lock change).
-    let owns_tx = (crate::encryption::encryption_enabled(None)
-        || crate::config::append_only_enabled())
-        && conn.is_autocommit();
-    let write_txn = if owns_tx {
-        Some(connection::WriteTxn::begin(conn)?)
-    } else {
-        None
-    };
+    // (no extra statements, no lock change). `owns_tx` is computed above.
     let sealed_insert = (|| -> Result<String> {
         // #2948 — armed-only version pre-probe. `None` when the spine is OFF
         // (default → no extra read → byte-identical) or when no row currently
@@ -3318,130 +3321,141 @@ pub fn insert_with_conflict(conn: &Connection, mem: &Memory, mode: ConflictMode)
             // metadata.why_trace so the write clears this gate; an external
             // `memory_reflect` (tenant ctx) is NOT stamped and IS gated here.
             consult_why_trace_gate(mem)?;
-            // Existence check + INSERT must be atomic against
-            // concurrent writers. We rely on the (title, namespace)
-            // UNIQUE index — issue a plain INSERT WITHOUT the upsert
-            // tail, let SQLite enforce the constraint, and translate
-            // the constraint violation into a typed error.
-            //
-            // The SELECT before INSERT is intentionally kept as an
-            // up-front read so the typed error message can carry the
-            // existing row's id. Two queries open a TOCTOU window
-            // (another writer slots in between SELECT and INSERT and
-            // we return Error pointing at the *wrong* existing id) —
-            // but the constraint violation on the subsequent INSERT
-            // still fires loud, and the caller's retry sees the new
-            // state. Reading the id is best-effort context for the
-            // diagnostic.
-            if let Some(existing_id) =
-                find_by_title_namespace(conn, &mem.title, &mem.namespace, None)?
-            {
-                return Err(ConflictError {
-                    existing_id,
-                    title: mem.title.clone(),
-                    namespace: mem.namespace.clone(),
-                }
-                .into());
-            }
-            let tags_json = serde_json::to_string(&mem.tags)?;
-            let metadata_json = serde_json::to_string(&mem.metadata)?;
-            // v0.7.0 Form 4 — encode citations + source_span for the
-            // schema v38 TEXT columns. Mirrors the encode in
-            // `insert(...)` above; the ConflictMode::Error path lands
-            // here on the first-write happy path and must persist the
-            // provenance columns the caller supplied.
-            let citations_json = serde_json::to_string(&mem.citations)?;
-            let source_span_json = match mem.source_span {
-                Some(span) => Some(serde_json::to_string(&span)?),
-                None => None,
-            };
-            // v0.7.0 Form 5 — encode confidence-provenance fields for
-            // the schema v39 TEXT columns. Mirrors the encode in
-            // `insert(...)` above.
-            let confidence_signals_json = match &mem.confidence_signals {
-                Some(s) => Some(serde_json::to_string(s)?),
-                None => None,
-            };
-            // v0.7.0 polish PERF-8 (#781) — same denormalised mention
-            // tag wired here so the ConflictMode::Error path (used by
-            // `storage::reflect`) populates the indexed column on the
-            // first-write happy path; otherwise the auto-persona matcher
-            // would miss every reflection minted via reflect.
-            let mentioned_entity_id = extract_mentioned_entity_id(mem);
-            // #228 Commit B — at-rest content encryption on the
-            // ConflictMode::Error first-write path (used by db::reflect).
-            // Mirrors `insert`: seal content to the per-agent key when
-            // enabled, store the placeholder + envelope; None (default)
-            // stores plaintext verbatim with a NULL envelope.
-            //
-            // v1.0.0 #2383 (N1) — DELIBERATELY still the INCOMING agent id,
-            // NOT `seal_content_for_upsert`. This statement has NO `ON
-            // CONFLICT` arm: it REFUSES a `(title, namespace)` duplicate
-            // outright, so the row it writes is always a fresh genesis row
-            // whose retained `agent_id` IS the incoming one. There is no
-            // existing-wins overlay here and therefore no identity to
-            // reconcile against — adding the pre-read would be a pure cost.
-            let agent_id = memory_agent_id(mem);
-            let sealed = seal_content_guarded(conn, &mem.content, agent_id)?;
-            let content_to_store = sealed
-                .as_ref()
-                .map_or(mem.content.as_str(), |(_, ph)| ph.as_str());
-            let encrypted_envelope: Option<&[u8]> = sealed.as_ref().map(|(env, _)| env.as_slice());
-            // v0.9.0 G8 (#1825) — stamp the content-id from the PLAINTEXT
-            // genesis identity (never the ciphertext placeholder). This is
-            // a genesis INSERT (refuses duplicates), so the pair always
-            // lands.
-            let cid_stamp = crate::identity::cid::stamp_memory_cid(mem);
-            // v0.7.0 L1-1 wave merge — include the `memory_kind` column.
-            // This INSERT path was added by the fix-campaign R1-M3
-            // (ConflictMode::Error refuses duplicates) and originally
-            // omitted the new L1-1 column because L1-1 was authored
-            // against the pre-fix-campaign storage layer. Without
-            // memory_kind here, a `db::reflect` call (which uses
-            // `insert_with_conflict(.., ConflictMode::Error)`) loses
-            // its `MemoryKind::Reflection` typing and the stored row
-            // falls back to the column DEFAULT 'observation'.
-            let actual_id: String = conn.query_row(
-                "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, expires_at, metadata, reflection_depth, memory_kind, entity_id, persona_version, citations, source_uri, source_span, confidence_source, confidence_signals, confidence_decayed_at, mentioned_entity_id, lifecycle_state, encrypted_envelope, cid, cid_genesis, valid_from, valid_until)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32)
-                 RETURNING id",
-                params![
-                    mem.id, mem.tier.as_str(), mem.namespace, mem.title, content_to_store,
-                    tags_json, mem.priority, mem.confidence, mem.source, mem.access_count,
-                    mem.created_at, mem.updated_at, mem.last_accessed_at,
-                    // v1.0.0 #2332 (FBL-02) — canonical fixed-UTC expiry
-                    // rendering (the v86 valid_* precedent below).
-                    crate::validate::canonical_valid_time_opt(mem.effective_expires_at().as_deref()),
-                    metadata_json, mem.reflection_depth, mem.memory_kind.as_str(),
-                    mem.entity_id, mem.persona_version,
-                    citations_json, mem.source_uri, source_span_json,
-                    mem.confidence_source.as_str(), confidence_signals_json, mem.confidence_decayed_at,
-                    mentioned_entity_id, mem.lifecycle_state.as_str(), encrypted_envelope,
-                    cid_stamp.cid, cid_stamp.genesis,
-                    // v1.0.0 #1834 — claim-bitemporal validity, canonicalized
-                    // to the fixed UTC rendering at this funnel (pre-ship 3x7)
-                    // so the TEXT predicates compare instants correctly.
-                    crate::validate::canonical_valid_time_opt(mem.valid_from.as_deref()),
-                    crate::validate::canonical_valid_time_opt(mem.valid_until.as_deref()),
-                ],
-                |r| r.get(0),
-            ).map_err(|e| {
-                // Translate a UNIQUE constraint violation that
-                // raced past the SELECT into the typed error so
-                // callers see the same shape on TOCTOU as on the
-                // happy path.
-                let msg = e.to_string();
-                if msg.contains("UNIQUE constraint failed") {
-                    anyhow::Error::new(ConflictError {
-                        existing_id: String::new(),
+            // #9405 - the ledger projection, the existence check and the
+            // INSERT are ONE write transaction (BEGIN IMMEDIATE when the
+            // caller holds none): a bind / rebind / revoke cannot commit
+            // between the projection read and the row write, so the v102
+            // guard never aborts a legitimate write on a stale projection.
+            // decision: project inside the transaction over retrying on
+            // guard abort, because the retry hides the race and the
+            // invariant is one transaction.
+            connection::in_write_txn(conn, || -> Result<String> {
+                // #8341 - the ledger projection, read inside the row's txn.
+                let projected = agent_projection::projected(conn, mem)?;
+                let mem = projected.as_ref().unwrap_or(mem);
+                // Existence check + INSERT must be atomic against
+                // concurrent writers. We rely on the (title, namespace)
+                // UNIQUE index — issue a plain INSERT WITHOUT the upsert
+                // tail, let SQLite enforce the constraint, and translate
+                // the constraint violation into a typed error.
+                //
+                // The SELECT before INSERT is kept as an up-front read so the
+                // typed error message can carry the existing row's id. #9405:
+                // it runs inside the same write transaction as the projection
+                // and the INSERT, so no other writer slots in between; the
+                // UNIQUE translation below stays as the belt for a caller that
+                // joined a deferred transaction.
+                if let Some(existing_id) =
+                    find_by_title_namespace(conn, &mem.title, &mem.namespace, None)?
+                {
+                    return Err(ConflictError {
+                        existing_id,
                         title: mem.title.clone(),
                         namespace: mem.namespace.clone(),
-                    })
-                } else {
-                    e.into()
+                    }
+                    .into());
                 }
-            })?;
-            Ok(actual_id)
+                let tags_json = serde_json::to_string(&mem.tags)?;
+                let metadata_json = serde_json::to_string(&mem.metadata)?;
+                // v0.7.0 Form 4 — encode citations + source_span for the
+                // schema v38 TEXT columns. Mirrors the encode in
+                // `insert(...)` above; the ConflictMode::Error path lands
+                // here on the first-write happy path and must persist the
+                // provenance columns the caller supplied.
+                let citations_json = serde_json::to_string(&mem.citations)?;
+                let source_span_json = match mem.source_span {
+                    Some(span) => Some(serde_json::to_string(&span)?),
+                    None => None,
+                };
+                // v0.7.0 Form 5 — encode confidence-provenance fields for
+                // the schema v39 TEXT columns. Mirrors the encode in
+                // `insert(...)` above.
+                let confidence_signals_json = match &mem.confidence_signals {
+                    Some(s) => Some(serde_json::to_string(s)?),
+                    None => None,
+                };
+                // v0.7.0 polish PERF-8 (#781) — same denormalised mention
+                // tag wired here so the ConflictMode::Error path (used by
+                // `storage::reflect`) populates the indexed column on the
+                // first-write happy path; otherwise the auto-persona matcher
+                // would miss every reflection minted via reflect.
+                let mentioned_entity_id = extract_mentioned_entity_id(mem);
+                // #228 Commit B — at-rest content encryption on the
+                // ConflictMode::Error first-write path (used by db::reflect).
+                // Mirrors `insert`: seal content to the per-agent key when
+                // enabled, store the placeholder + envelope; None (default)
+                // stores plaintext verbatim with a NULL envelope.
+                //
+                // v1.0.0 #2383 (N1) — DELIBERATELY still the INCOMING agent id,
+                // NOT `seal_content_for_upsert`. This statement has NO `ON
+                // CONFLICT` arm: it REFUSES a `(title, namespace)` duplicate
+                // outright, so the row it writes is always a fresh genesis row
+                // whose retained `agent_id` IS the incoming one. There is no
+                // existing-wins overlay here and therefore no identity to
+                // reconcile against — adding the pre-read would be a pure cost.
+                let agent_id = memory_agent_id(mem);
+                let sealed = seal_content_guarded(conn, &mem.content, agent_id)?;
+                let content_to_store = sealed
+                    .as_ref()
+                    .map_or(mem.content.as_str(), |(_, ph)| ph.as_str());
+                let encrypted_envelope: Option<&[u8]> =
+                    sealed.as_ref().map(|(env, _)| env.as_slice());
+                // v0.9.0 G8 (#1825) — stamp the content-id from the PLAINTEXT
+                // genesis identity (never the ciphertext placeholder). This is
+                // a genesis INSERT (refuses duplicates), so the pair always
+                // lands.
+                let cid_stamp = crate::identity::cid::stamp_memory_cid(mem);
+                // v0.7.0 L1-1 wave merge — include the `memory_kind` column.
+                // This INSERT path was added by the fix-campaign R1-M3
+                // (ConflictMode::Error refuses duplicates) and originally
+                // omitted the new L1-1 column because L1-1 was authored
+                // against the pre-fix-campaign storage layer. Without
+                // memory_kind here, a `db::reflect` call (which uses
+                // `insert_with_conflict(.., ConflictMode::Error)`) loses
+                // its `MemoryKind::Reflection` typing and the stored row
+                // falls back to the column DEFAULT 'observation'.
+                let actual_id: String = conn.query_row(
+                    "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, expires_at, metadata, reflection_depth, memory_kind, entity_id, persona_version, citations, source_uri, source_span, confidence_source, confidence_signals, confidence_decayed_at, mentioned_entity_id, lifecycle_state, encrypted_envelope, cid, cid_genesis, valid_from, valid_until)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32)
+                     RETURNING id",
+                    params![
+                        mem.id, mem.tier.as_str(), mem.namespace, mem.title, content_to_store,
+                        tags_json, mem.priority, mem.confidence, mem.source, mem.access_count,
+                        mem.created_at, mem.updated_at, mem.last_accessed_at,
+                        // v1.0.0 #2332 (FBL-02) — canonical fixed-UTC expiry
+                        // rendering (the v86 valid_* precedent below).
+                        crate::validate::canonical_valid_time_opt(mem.effective_expires_at().as_deref()),
+                        metadata_json, mem.reflection_depth, mem.memory_kind.as_str(),
+                        mem.entity_id, mem.persona_version,
+                        citations_json, mem.source_uri, source_span_json,
+                        mem.confidence_source.as_str(), confidence_signals_json, mem.confidence_decayed_at,
+                        mentioned_entity_id, mem.lifecycle_state.as_str(), encrypted_envelope,
+                        cid_stamp.cid, cid_stamp.genesis,
+                        // v1.0.0 #1834 — claim-bitemporal validity, canonicalized
+                        // to the fixed UTC rendering at this funnel (pre-ship 3x7)
+                        // so the TEXT predicates compare instants correctly.
+                        crate::validate::canonical_valid_time_opt(mem.valid_from.as_deref()),
+                        crate::validate::canonical_valid_time_opt(mem.valid_until.as_deref()),
+                    ],
+                    |r| r.get(0),
+                ).map_err(|e| {
+                    // Translate a UNIQUE constraint violation that
+                    // raced past the SELECT into the typed error so
+                    // callers see the same shape on TOCTOU as on the
+                    // happy path.
+                    let msg = e.to_string();
+                    if msg.contains("UNIQUE constraint failed") {
+                        anyhow::Error::new(ConflictError {
+                            existing_id: String::new(),
+                            title: mem.title.clone(),
+                            namespace: mem.namespace.clone(),
+                        })
+                    } else {
+                        e.into()
+                    }
+                })?;
+                Ok(actual_id)
+            })
         }
         ConflictMode::Version => {
             let resolved_title = next_versioned_title(conn, &mem.title, &mem.namespace)?;
@@ -4242,7 +4256,7 @@ pub fn update(
 /// * [`VersionConflict`] — when `expected_version` is `Some` and the
 ///   stored value has drifted.
 /// * Other rusqlite errors bubble up from the prepare/execute pair.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 pub fn update_with_expected_version(
     conn: &Connection,
     id: &str,
@@ -4263,358 +4277,24 @@ pub fn update_with_expected_version(
     // UPDATE SET list, so it is always preserved (the genesis assertion instant).
     valid_until: Option<&str>,
 ) -> Result<(bool, bool)> {
-    // #1955 R45 — record-stop fence for the update funnel.
-    crate::storage::record_stop::gate_storage_conn(conn)?;
-    // #4034 — the pre-read, the merge and the write are ONE write
-    // transaction, so a commit between the read and the write is never
-    // overwritten by a stale snapshot (the inner `in_write_txn` joins).
-    connection::in_write_txn(conn, || -> Result<(bool, bool)> {
-        let mut stmt = conn.prepare_cached(SQL_SELECT_MEMORY_ROW_BY_ID)?;
-        let mut rows = stmt.query_map(params![id], row_to_memory)?;
-        let Some(Ok(existing)) = rows.next() else {
-            return Ok((false, false));
-        };
-        drop(rows);
-        drop(stmt);
-
-        // v1.0.0 #1834 (pre-ship 3x7) — canonicalize the opt-in `valid_until`
-        // patch at this funnel so the close instant persists in the fixed UTC
-        // rendering the TEXT predicates compare correctly (a `Z`/offset-rendered
-        // close would otherwise mis-order against a canonical `valid_at`).
-        let valid_until_canon = crate::validate::canonical_valid_time_opt(valid_until);
-        let valid_until = valid_until_canon.as_deref();
-
-        // v0.7.0 Provenance Gap 1 (#884) — pre-check optimistic gate.
-        // The same predicate is also asserted atomically inside the
-        // UPDATE statement below so a racing writer that slipped in
-        // between the SELECT and the UPDATE still fails CONFLICT.
-        if let Some(expected) = expected_version
-            && existing.version != expected
-        {
-            return Err(VersionConflict {
-                id: existing.id.clone(),
-                expected,
-                current: existing.version,
-            }
-            .into());
-        }
-
-        let new_title = title.unwrap_or(&existing.title);
-        let new_content = content.unwrap_or(&existing.content);
-        let content_changed = new_title != existing.title || new_content != existing.content;
-
-        // Tier downgrade protection: never downgrade, consistent with insert path.
-        let effective_tier = match (tier, &existing.tier) {
-            (Some(requested), existing_tier) => match (existing_tier, requested) {
-                (Tier::Long, _) => &Tier::Long,         // long never downgrades
-                (Tier::Mid, Tier::Short) => &Tier::Mid, // mid never downgrades to short
-                (_, requested) => requested,            // upgrades and same-tier are fine
-            },
-            (None, existing_tier) => existing_tier,
-        };
-
-        let namespace = namespace.unwrap_or(&existing.namespace);
-        let tags = tags.unwrap_or(&existing.tags);
-        let priority = priority.unwrap_or(existing.priority);
-        let confidence = confidence.unwrap_or(existing.confidence);
-        // Treat empty string as None (clear expiry) — don't store "" in the DB
-        let expires_at = match expires_at {
-            Some("" | "null") => None,
-            Some(v) => Some(v),
-            None => existing.expires_at.as_deref(),
-        };
-        // v1.0.0 #2331 (FBL-01) — the #1626 tier→long ⇒ expires_at = NULL
-        // coupling, sqlite parity with BOTH postgres update funnels
-        // (`update_with_expected_version_once` + the trait `update`) and with
-        // this file's own insert ON CONFLICT arm / fold auto-promote / both
-        // promote surfaces. When the EFFECTIVE tier is Long the merged expiry
-        // is forced NULL — overriding a caller-supplied patch value AND the
-        // existing row's stale short/mid TTL — because the GC reap predicate
-        // is tier-blind (`expires_at IS NOT NULL AND expires_at < now`), so a
-        // leftover TTL on a promoted "permanent" row would archive it (or
-        // hard-delete + crypto-erase it under archive_on_gc=false) at the
-        // stale deadline. Silent destruction of a documented-permanent row is
-        // a direct North-Star data-integrity violation.
-        let expires_at = if matches!(*effective_tier, Tier::Long) {
-            None
-        } else {
-            expires_at
-        };
-        // v1.0.0 #2332 (FBL-02) — canonicalize the merged expiry (caller patch
-        // OR carried-forward stored value) to the fixed-UTC v86 rendering so
-        // the lexicographic expiry predicates (GC / recall / touch-fold MAX
-        // floors) compare chronologically. Unparseable values pass through
-        // byte-for-byte (fail-safe). Also heals a legacy offset rendering on
-        // the existing row the first time the row is patched.
-        let expires_canon = crate::validate::canonical_valid_time_opt(expires_at);
-        let expires_at = expires_canon.as_deref();
-        // #2060 — TRACT covenant clause 2: authorship-immutability gate.
-        // Consult BEFORE the shadow below so we see the caller's RAW patch
-        // metadata (not whatever an upstream `preserve_provenance_keys` call
-        // may have already restored to `existing`'s value).
-        consult_authorship_immutable_gate(
-            existing.metadata.get("agent_id").and_then(|v| v.as_str()),
-            metadata,
-        )?;
-        let metadata = metadata.unwrap_or(&existing.metadata);
-        // #3420 (security-high) — reconcile the row's ATTESTATION with the signed
-        // envelope this update is about to write. `PUT /memories/{id}` (and the MCP
-        // / CLI twins, which all funnel here) can rewrite `title`, `content` and
-        // `namespace` — all INSIDE the signed `SignableWrite` envelope — while
-        // #3015 preserves `metadata.attest_level` / `metadata.write_signature`
-        // across the patch. The combination persisted a row asserting
-        // `agent_attested` beside a signature that can never again be re-derived
-        // from it: unverifiable by construction, yet believed by every trust
-        // surface that reads `attest_level`. The shared entitlement funnel keeps
-        // the stored attestation while the envelope is intact, drops it to
-        // `claimed` (signature removed) when the envelope is rewritten, and never
-        // lets an update MINT one from caller-supplied metadata. `created_at` /
-        // `kind` / `agent_id` are not patchable on this in-place funnel, so they
-        // are the same on both sides — passed explicitly so the envelope field set
-        // is stated in full at the site.
-        let existing_agent_id = metadata_agent_id_slot(&existing.metadata).unwrap_or("");
-        let attest_entitled = crate::identity::attest::entitled_update_attestation(
-            &existing.metadata,
-            crate::identity::attest::SignedEnvelopeFields {
-                agent_id: existing_agent_id,
-                namespace: &existing.namespace,
-                title: &existing.title,
-                kind: existing.memory_kind.as_str(),
-                created_at: &existing.created_at,
-                content: &existing.content,
-            },
-            crate::identity::attest::SignedEnvelopeFields {
-                agent_id: existing_agent_id,
-                namespace,
-                title: new_title,
-                kind: existing.memory_kind.as_str(),
-                created_at: &existing.created_at,
-                content: new_content,
-            },
-        );
-        let attest_reconciled =
-            crate::identity::attest::apply_entitled_attestation(metadata, &attest_entitled);
-        if attest_reconciled.is_some() {
-            tracing::warn!(
-                target: "ai_memory::storage::update",
-                memory_id = %existing.id,
-                downgrade = attest_entitled.is_downgrade_from(&existing.metadata),
-                "update reconciled the row's attestation: the persisted \
-                 attest_level/write_signature are the substrate-entitled pair for the \
-                 post-update signed envelope, not the caller-supplied or stale ones (#3420)"
-            );
-        }
-        let metadata = attest_reconciled.as_ref().unwrap_or(metadata);
-
-        // #1451 (SEC, HIGH) — substrate governance pre-write gate on the
-        // optimistic-update path. The insert/supersede/consolidate/restore
-        // paths all consult GOVERNANCE_PRE_WRITE; update was the lone gap,
-        // so a refuse rule could be evaded by storing benign content then
-        // updating it into the refused namespace/tier/title. Build the
-        // post-merge row and consult BEFORE any SQL touches the DB; a
-        // refusal returns the typed GovernanceRefusal with no row mutated.
-        let governed = Memory {
-            tier: effective_tier.clone(),
-            namespace: namespace.to_string(),
-            title: new_title.to_string(),
-            content: new_content.to_string(),
-            tags: tags.clone(),
-            priority,
-            confidence,
-            expires_at: expires_at.map(str::to_string),
-            metadata: metadata.clone(),
-            source_uri: source_uri
-                .map(str::to_string)
-                .or_else(|| existing.source_uri.clone()),
-            // v1.0.0 #1834 — reflect the post-merge valid_until for governance
-            // (valid_from is carried immutably by the `..existing` spread).
-            valid_until: valid_until
-                .map(str::to_string)
-                .or_else(|| existing.valid_until.clone()),
-            ..existing.clone()
-        };
-        consult_governance_pre_write(&governed)?;
-
-        let tags_json = serde_json::to_string(tags)?;
-        let metadata_json = serde_json::to_string(metadata)?;
-        let now = Utc::now().to_rfc3339();
-
-        // #228 Commit B — at-rest content encryption on the in-place update
-        // path. Seal the effective NEW content (post-merge) to the per-agent
-        // key when enabled; the `content` column then holds the placeholder
-        // and `encrypted_envelope` the ciphertext. When disabled (default),
-        // `sealed` is None so we write the plaintext verbatim and set the
-        // envelope to NULL (clearing any stale ciphertext under encryption-off
-        // — byte-identical to the pre-wiring path where the column was always
-        // NULL). Both columns are SET together so content + envelope can never
-        // desynchronize.
-        //
-        // v1.0.0 #2383 (N1) — the seal key is the agent id the row will RETAIN,
-        // resolved the same way the SQL below resolves it: `json_patch(?10,
-        // <existing agent_id/derived_from/consolidated_from_agents>)` overlays
-        // the STORED row's provenance on top of the patch (existing-wins,
-        // #2106), so a patch that carries a different agent_id — or omits the
-        // key entirely — must NOT change which per-agent key the ciphertext is
-        // sealed to. Pre-#2383 this read the patch's metadata, so an omitting
-        // patch sealed to `""` (a hard fail-closed error on an encrypted
-        // deployment) and a differing one produced the #2383 unreadable row.
-        let update_agent_id = metadata_agent_id_slot(&existing.metadata)
-            .or_else(|| metadata_agent_id_slot(metadata))
-            .unwrap_or("");
-        let update_sealed = seal_content_guarded(conn, new_content, update_agent_id)?;
-        let update_content_to_store = update_sealed
-            .as_ref()
-            .map_or(new_content, |(_, ph)| ph.as_str());
-        let update_encrypted_envelope: Option<&[u8]> =
-            update_sealed.as_ref().map(|(env, _)| env.as_slice());
-
-        // Ultrareview #354: rely on the UNIQUE INDEX on (title, namespace)
-        // to enforce collision atomically at the DB layer. The previous
-        // check-then-update sequence had a race — another transaction
-        // could insert a colliding row between the SELECT and the UPDATE,
-        // and the UPDATE would surface as a generic SQLite constraint
-        // error to the caller. Now the collision check is inline: the
-        // UPDATE fails with a well-scoped UniqueViolation, and we re-
-        // query the colliding row's id only on that specific error for
-        // the friendly message.
-        //
-        // v0.7.0 Provenance Gap 1 (#884) — UPDATE re-asserts
-        // `expected_version` atomically and bumps `version + 1` on
-        // success so a racing caller that read the SAME expected_version
-        // sees a CONFLICT (their WHERE clause no longer matches the
-        // bumped value). When `expected_version` is NULL the
-        // `?12 IS NULL` predicate short-circuits the gate.
-        // v0.7.0 Provenance Gap 2 (#906) — `source_uri` is an opt-in patch
-        // field. When `None`, the COALESCE keeps the stored value (a
-        // patch that doesn't touch source_uri must NOT blank it out).
-        // When `Some(uri)`, the row's source_uri is rewritten verbatim
-        // (rename / scheme migration / bad-data correction).
-        // #1725 (v0.8.0) — lossless default update path. The
-        // archive-of-prior-content + the in-place UPDATE must run atomically
-        // so a mid-failure — or a version-conflict UPDATE that matches 0 rows
-        // — rolls BOTH back, leaving the OLD content live (no orphan archive
-        // row). The prior content is snapshotted BEFORE the UPDATE overwrites
-        // it, under `archive_reason='in_place_edit'` with the SAME memory_id,
-        // and ONLY when title/content actually changed (metadata / tag /
-        // priority patches don't touch content, so they don't archive).
-        //
-        // Transaction-aware: some callers already hold an open transaction —
-        // the synthesis merge path (`src/mcp/tools/store/synthesis.rs`) wraps
-        // candidate updates + provenance rows in ONE `BEGIN IMMEDIATE`. A
-        // nested `BEGIN` there fails with "cannot start a transaction within a
-        // transaction", so we open our own tx ONLY when none is active
-        // (`is_autocommit()` is true only outside a transaction); when the
-        // caller owns the tx, the archive + UPDATE run inside it and the
-        // caller's commit/rollback covers atomicity. #3152 — that join is what
-        // lets a caller fold a lifecycle transition into the SAME transaction.
-        connection::in_write_txn(conn, || -> Result<(bool, bool)> {
-            if content_changed {
-                archive_memory_insert_only(
-                    conn,
-                    id,
-                    crate::models::field_names::ARCHIVE_REASON_IN_PLACE_EDIT,
-                )?;
-            }
-            // #2106 review items 1+2 — preserve the immutable provenance keys
-            // (agent_id + the consolidation derived_from / consolidated_from_agents
-            // arrays) across the in-place metadata overwrite, mirroring both the
-            // `insert` ON CONFLICT arm (#1784) and the postgres
-            // `update_with_expected_version_once` CASE overlay so effective
-            // protection is IDENTICAL across backends. `json_patch(?10, <existing
-            // provenance>)` overlays the OLD row's provenance object on top of the
-            // patch (existing-wins) — the bare-column reference `metadata` inside
-            // `json_each` resolves to the pre-UPDATE value in a SQLite UPDATE. This
-            // closes the omission-erasure hole (#2106 item 2): a full-object
-            // metadata patch that OMITS agent_id no longer silently WIPES the
-            // stored author — it is preserved (erasure being strictly worse than
-            // a rewrite, which the clause-2 gate above already refuses).
-            let update_res = conn.execute(
-            "UPDATE memories SET tier=?1, namespace=?2, title=?3, content=?4, tags=?5, priority=?6, confidence=?7, updated_at=?8, expires_at=?9,
-                metadata = json_patch(
-                    ?10,
-                    COALESCE(
-                        -- #2941 — same reserved set as the insert funnel: a
-                        -- full-object metadata patch that OMITS the pubkey pair
-                        -- must not silently unbind the agent's key either.
-                        (SELECT json_group_object(key, value)
-                         FROM json_each(metadata)
-                         WHERE key IN ('agent_id', 'derived_from', 'consolidated_from_agents', 'agent_pubkey', 'pubkey_bound_at')),
-                        '{}'
-                    )
-                ),
-                source_uri = COALESCE(?11, source_uri), encrypted_envelope=?14, valid_until = COALESCE(?15, valid_until), version = version + 1
-             WHERE id=?12 AND (?13 IS NULL OR version = ?13)",
-            params![effective_tier.as_str(), namespace, new_title, update_content_to_store, tags_json, priority, confidence, now, expires_at, metadata_json, source_uri, id, expected_version, update_encrypted_envelope, valid_until],
-        );
-            match update_res {
-                Ok(0) => {
-                    // Either the row vanished between SELECT and UPDATE, or
-                    // the version drifted (racing writer slipped in). When
-                    // expected_version was supplied, re-read so the CONFLICT
-                    // envelope carries the current stored value. Returning an
-                    // Err here rolls the tx back, reverting the archive so a
-                    // version-conflict snapshots nothing.
-                    if let Some(expected) = expected_version {
-                        let current_version: Option<i64> = conn
-                            .query_row(
-                                "SELECT version FROM memories WHERE id = ?1",
-                                params![id],
-                                |r| r.get(0),
-                            )
-                            .ok();
-                        if let Some(current) = current_version {
-                            return Err(VersionConflict {
-                                id: id.to_string(),
-                                expected,
-                                current,
-                            }
-                            .into());
-                        }
-                    }
-                    Ok((false, false))
-                }
-                Ok(_) => {
-                    // APPEND-ONLY-SANCTIONED (#1823 G6) — COW SUPERSEDE: the
-                    // in-place UPDATE (same id) is the convergence-proven
-                    // path-a supersede. Append ONE identity-only SUPERSEDE leaf
-                    // in THIS tx; prior content lives only in the in_place_edit
-                    // archive snapshot above, never in the leaf.
-                    crate::revisions::emit_revision_leaf_if_enabled(
-                        conn,
-                        id,
-                        crate::revisions::RecordKind::Supersede,
-                        expected_version,
-                        namespace,
-                        Some(update_agent_id).filter(|s| !s.is_empty()),
-                        &now,
-                    )?;
-                    Ok((true, content_changed))
-                }
-                Err(rusqlite::Error::SqliteFailure(err, _))
-                    if err.code == rusqlite::ErrorCode::ConstraintViolation =>
-                {
-                    let other: Option<String> = conn
-                    .query_row(
-                        "SELECT id FROM memories WHERE title = ?1 AND namespace = ?2 AND id != ?3",
-                        params![new_title, namespace, id],
-                        |r| r.get(0),
-                    )
-                    .ok();
-                    if let Some(other_id) = other {
-                        // #962 typed envelope — UniqueConflict surfaces as
-                        // `MemoryError::Conflict` (HTTP 409).
-                        return Err(anyhow::Error::new(StorageError::UniqueConflict {
-                            reason: format!(
-                                "title '{new_title}' already exists in namespace '{namespace}' (memory {other_id})"
-                            ),
-                        }));
-                    }
-                    Err(anyhow::anyhow!("update failed with constraint violation"))
-                }
-                Err(e) => Err(e.into()),
-            }
-        })
-    })
+    // #9273 - the record-stop gate, the write transaction and the UPDATE
+    // live in ONE fn span in the child module (B7 gate-in-span invariant).
+    versioned_update_txn::update_with_expected_version_gated(
+        conn,
+        id,
+        title,
+        content,
+        tier,
+        namespace,
+        tags,
+        priority,
+        confidence,
+        expires_at,
+        metadata,
+        source_uri,
+        expected_version,
+        valid_until,
+    )
 }
 
 /// v0.7.0 Provenance Gap 5 (issue #888) — append-and-archive result
@@ -10959,6 +10639,12 @@ pub fn consolidate_with_expected_versions(
         // merged metadata carries a why_trace (caller-supplied or inherited
         // from a source), else it is REFUSED under enforce.
         consult_why_trace_gate(&candidate)?;
+        // #8341 - the ledger projection, inside this write txn.
+        let projected = agent_projection::projected(conn, &candidate)?;
+        let (summary, metadata_json) = match &projected {
+            Some(p) => (p.content.as_str(), serde_json::to_string(&p.metadata)?),
+            None => (summary, metadata_json),
+        };
         // v0.9.0 G8 (#1825) — a consolidated memory is a fresh genesis, so
         // it mints its own content-id from the (plaintext) summary + the
         // candidate's genesis identity. Minted BEFORE the #228 seal swap
@@ -17295,7 +16981,8 @@ fn restore_archived_impl(
         // COALESCE handles legacy already-archived rows where the
         // v49-added columns are NULL.
         conn.execute(
-            "INSERT INTO memories
+            &format!(
+                "INSERT INTO memories
              (id, tier, namespace, title, content, tags, priority, confidence,
               source, access_count, created_at, updated_at, last_accessed_at,
               expires_at, metadata, embedding, embedding_dim, embedding_space,
@@ -17304,9 +16991,9 @@ fn restore_archived_impl(
               confidence_source, confidence_signals, confidence_decayed_at,
               mentioned_entity_id, version, lifecycle_state, encrypted_envelope,
               kind_provenance, cid, cid_genesis, valid_from, valid_until)
-             SELECT id, COALESCE(original_tier, 'long'), namespace, title, content,
+             SELECT id, COALESCE(original_tier, 'long'), namespace, title, {content},
                     tags, priority, confidence, source, access_count, created_at,
-                    ?1, last_accessed_at, ?6, metadata,
+                    ?1, last_accessed_at, ?6, {metadata},
                     -- v1.0.0 #2167 (S8) restore/migrate HEAL: keep the
                     -- archived vector ONLY when its space matches the live
                     -- active space (?5). A foreign- or NULL-space vector has
@@ -17374,6 +17061,9 @@ fn restore_archived_impl(
                     CASE WHEN cid IS NOT NULL THEN cid_genesis ELSE ?4 END,
                     valid_from, valid_until
              FROM archived_memories WHERE id = ?2",
+                content = &*agent_projection::RESTORE_CONTENT,
+                metadata = &*agent_projection::RESTORE_METADATA,
+            ),
             params![
                 now,
                 id,
@@ -17543,7 +17233,8 @@ pub fn restore_archived_for_caller(conn: &Connection, id: &str, caller: &str) ->
         // COALESCE handles legacy already-archived rows where the
         // v49-added columns are NULL.
         conn.execute(
-            "INSERT INTO memories
+            &format!(
+                "INSERT INTO memories
              (id, tier, namespace, title, content, tags, priority, confidence,
               source, access_count, created_at, updated_at, last_accessed_at,
               expires_at, metadata, embedding, embedding_dim, embedding_space,
@@ -17552,9 +17243,9 @@ pub fn restore_archived_for_caller(conn: &Connection, id: &str, caller: &str) ->
               confidence_source, confidence_signals, confidence_decayed_at,
               mentioned_entity_id, version, lifecycle_state, encrypted_envelope,
               kind_provenance, cid, cid_genesis, valid_from, valid_until)
-             SELECT id, COALESCE(original_tier, 'long'), namespace, title, content,
+             SELECT id, COALESCE(original_tier, 'long'), namespace, title, {content},
                     tags, priority, confidence, source, access_count, created_at,
-                    ?1, last_accessed_at, ?6, metadata,
+                    ?1, last_accessed_at, ?6, {metadata},
                     -- v1.0.0 #2167 (S8) restore/migrate HEAL: keep the
                     -- archived vector ONLY when its space matches the live
                     -- active space (?5). A foreign- or NULL-space vector has
@@ -17622,6 +17313,9 @@ pub fn restore_archived_for_caller(conn: &Connection, id: &str, caller: &str) ->
                     CASE WHEN cid IS NOT NULL THEN cid_genesis ELSE ?4 END,
                     valid_from, valid_until
              FROM archived_memories WHERE id = ?2",
+                content = &*agent_projection::RESTORE_CONTENT,
+                metadata = &*agent_projection::RESTORE_METADATA,
+            ),
             params![
                 now,
                 id,
@@ -18466,14 +18160,16 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
         mem
     };
 
-    // Federation writes have no identity-binding authority. Keep this at the
-    // shared newer-wins funnel as a final backstop after receive validation.
-    let sanitized = (mem.namespace == AGENTS_NAMESPACE).then(|| {
-        let mut sanitized = mem.clone();
-        strip_unproven_agent_pubkey_binding(&mut sanitized);
-        sanitized
-    });
-    let mem = sanitized.as_ref().unwrap_or(mem);
+    // Federation writes have no identity-binding authority (#8341): strip, then
+    // write the ledger's projection, read under the write txn taken here.
+    let owns_tx = conn.is_autocommit();
+    let write_txn = if owns_tx {
+        Some(connection::WriteTxn::begin(conn)?)
+    } else {
+        None
+    };
+    let projected = agent_projection::sanitized_projected(conn, mem)?;
+    let mem = projected.as_ref().unwrap_or(mem);
 
     let tags_json = serde_json::to_string(&mem.tags)?;
     let metadata_json = serde_json::to_string(&mem.metadata)?;
@@ -18536,13 +18232,7 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
     // the local row's text, and the snapshot of the text it replaces must land
     // in the same write transaction as that rewrite (probe → snapshot → upsert
     // atomic, no window in which the text is neither archived nor live). So the
-    // write lock is now taken whenever this call owns the connection.
-    let owns_tx = conn.is_autocommit();
-    let write_txn = if owns_tx {
-        Some(connection::WriteTxn::begin(conn)?)
-    } else {
-        None
-    };
+    // write lock is now taken whenever this call owns the connection (above).
     let sealed_merge = (|| -> Result<String> {
         // #2954 / #4206 — pre-image of the `(title, namespace)` row this upsert
         // may overwrite (`None` when no live row holds the slot). Read under the
@@ -18808,6 +18498,9 @@ fn overwrite_full_row_by_id(conn: &Connection, mem: &Memory) -> Result<()> {
     // REPLACE so a repeated merge of the same id is idempotent; archives the
     // CURRENT row (incl its encrypted_envelope) before the UPDATE below.
     archive_memory_insert_only(conn, &mem.id, field_names::ARCHIVE_REASON_FEDERATION_MERGE)?;
+    // #8341 - federation carries no binding authority: strip, then project.
+    let projected = agent_projection::sanitized_projected(conn, mem)?;
+    let mem = projected.as_ref().unwrap_or(mem);
 
     let tags_json = serde_json::to_string(&mem.tags)?;
     let metadata_json = serde_json::to_string(&mem.metadata)?;
@@ -34602,12 +34295,11 @@ mod tests {
             params![&keys[0], &keys[1], &keys[2]],
         )
         .unwrap();
-        conn.execute(
-            "UPDATE memories SET metadata = json_set(metadata, '$.agent_pubkey', ?3)
-             WHERE namespace = ?1 AND title = ?2",
-            params![AGENTS_NAMESPACE, title, &keys[2]],
-        )
-        .unwrap();
+        // v102 guard (#8341): seed the flat mirrors (keys[2]) as the projection.
+        use agent_projection::{CONTENT_BODY as C, META_BODY as M, with_row};
+        let (m, c) = (with_row(M, "memories."), with_row(C, "memories."));
+        let sql = format!("UPDATE memories SET metadata = {m}, content = {c} WHERE title = ?1");
+        conn.execute(&sql, params![title]).unwrap();
 
         let old = agent_pubkey_for_attestation_at(&conn, "ai:curator", "2026-01-15T00:00:00+00:00")
             .unwrap();
