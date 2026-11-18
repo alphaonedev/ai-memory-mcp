@@ -19,11 +19,18 @@
 //! (a title-only patch) is spawned; the cell waits until a backend is blocked
 //! behind B (`pg_blocking_pids`), then commits B and joins A.
 //!
-//! * locked: A's decide-read waits for B, so A's prior-content snapshot
+//! * locked: A waits for B at its decide-read (the barrier records the
+//!   statement A is blocked on and every cell asserts it is the
+//!   `... FOR UPDATE` read), so A's prior-content snapshot
 //!   (`archive_reason = in_place_edit`) holds B's content and A's version
 //!   lands on top of B's.
-//! * lock removed: A reads the pre-B row, snapshots the ORIGINAL content and
-//!   blocks only at the UPDATE, so undoing A would revert B's committed write.
+//! * L2 lock removed: A reads the pre-B row, snapshots the ORIGINAL content
+//!   and blocks only at the UPDATE, so undoing A would revert B's write.
+//! * L1 lock removed: A blocks only at its version-guarded UPDATE (#1641,
+//!   `version = $11` with the pre-read version), which then matches 0 rows,
+//!   rolls back and is retried on a fresh read, so the stored row is the same
+//!   as with the lock; the only observable difference is where A waits,
+//!   which is why the blocked statement is asserted.
 //!
 //! Run through the ci-v2-pg per-binary wrapper (one cloned database per
 //! binary); skipped when `AI_MEMORY_TEST_POSTGRES_URL` is unset, as in
@@ -62,7 +69,10 @@ const BARRIER_POLL: Duration = Duration::from_millis(20);
 const B_WRITE_SQL: &str = "UPDATE memories SET content = $2, version = version + 1 WHERE id = $1";
 const BACKEND_PID_SQL: &str = "SELECT pg_backend_pid()";
 const BLOCKED_BEHIND_SQL: &str =
-    "SELECT pid FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid)) LIMIT 1";
+    "SELECT query FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid)) LIMIT 1";
+/// The tail both decide-reads share: A must be waiting on the held read, not
+/// on its UPDATE.
+const DECIDE_READ_TAIL: &str = "FROM memories WHERE id = $1 FOR UPDATE";
 const LIVE_ROW_SQL: &str = "SELECT title, content, version FROM memories WHERE id = $1";
 const SNAPSHOT_SQL: &str =
     "SELECT content FROM archived_memories WHERE id = $1 AND archive_reason = $2";
@@ -115,17 +125,18 @@ fn title_patch() -> UpdatePatch {
     }
 }
 
-/// Block until some backend waits directly on `holder_pid`.
-async fn wait_blocked_by(pg: &PostgresStore, holder_pid: i32) {
+/// Block until some backend waits directly on `holder_pid`; return the
+/// statement that backend is blocked on.
+async fn wait_blocked_by(pg: &PostgresStore, holder_pid: i32) -> String {
     let end = pg_barrier::deadline();
     loop {
-        let waiter: Option<i32> = sqlx::query_scalar(BLOCKED_BEHIND_SQL)
+        let waiter: Option<String> = sqlx::query_scalar(BLOCKED_BEHIND_SQL)
             .bind(holder_pid)
             .fetch_optional(pg.pool())
             .await
             .expect("barrier probe");
-        if waiter.is_some() {
-            return;
+        if let Some(statement) = waiter {
+            return statement;
         }
         assert!(
             tokio::time::Instant::now() < end,
@@ -136,8 +147,8 @@ async fn wait_blocked_by(pg: &PostgresStore, holder_pid: i32) {
 }
 
 /// Run writer A (`write`) against an open writer-B transaction, commit B once
-/// A is blocked behind it, and return A's result.
-async fn race_against_b<T, F>(pg: &PostgresStore, id: &str, write: F) -> T
+/// A is blocked behind it, and return A's result and the statement A waited on.
+async fn race_against_b<T, F>(pg: &PostgresStore, id: &str, write: F) -> (T, String)
 where
     T: Send + 'static,
     F: std::future::Future<Output = T> + Send + 'static,
@@ -157,12 +168,23 @@ where
     assert_eq!(touched, 1, "tx B must lock the seeded row");
 
     let writer = tokio::spawn(write);
-    wait_blocked_by(pg, b_pid).await;
+    let blocked_on = wait_blocked_by(pg, b_pid).await;
     b.commit().await.expect("tx B commit");
-    tokio::time::timeout(pg_barrier::barrier_budget(), writer)
+    let result = tokio::time::timeout(pg_barrier::barrier_budget(), writer)
         .await
         .expect("writer A finishes after B commits")
-        .expect("writer A task")
+        .expect("writer A task");
+    (result, blocked_on)
+}
+
+/// A waited for B at its decide-read, so the read the write is computed from
+/// was held (not at the UPDATE after a stale read).
+fn assert_waited_on_decide_read(blocked_on: &str) {
+    assert!(
+        blocked_on.starts_with("SELECT ") && blocked_on.ends_with(DECIDE_READ_TAIL),
+        "writer A must wait for B at its `... {DECIDE_READ_TAIL}` decide-read; \
+         it waited on: {blocked_on}"
+    );
 }
 
 /// Live row (title, content, version) and the in_place_edit snapshot content.
@@ -191,13 +213,14 @@ async fn l2_trait_update_read_lock_snapshots_committed_concurrent_write_9282() {
     let id = seed(&pg).await;
     let store = Arc::clone(&pg);
     let a_id = id.clone();
-    let result = race_against_b(&pg, &id, async move {
+    let (result, blocked_on) = race_against_b(&pg, &id, async move {
         store
             .update(&CallerContext::for_admin(OPERATOR), &a_id, title_patch())
             .await
             .map_err(|e| e.to_string())
     })
     .await;
+    assert_waited_on_decide_read(&blocked_on);
     if let Err(e) = result {
         panic!("writer A trait update must succeed on top of B: {e}");
     }
@@ -225,7 +248,7 @@ async fn l1_expected_version_read_lock_applies_on_top_of_committed_write_9282() 
     let id = seed(&pg).await;
     let store = Arc::clone(&pg);
     let a_id = id.clone();
-    let result = race_against_b(&pg, &id, async move {
+    let (result, blocked_on) = race_against_b(&pg, &id, async move {
         store
             .update_with_expected_version(
                 &CallerContext::for_admin(OPERATOR),
@@ -237,6 +260,7 @@ async fn l1_expected_version_read_lock_applies_on_top_of_committed_write_9282() 
             .map_err(|e| e.to_string())
     })
     .await;
+    assert_waited_on_decide_read(&blocked_on);
     let new_version = match result {
         Ok(v) => v,
         Err(e) => panic!("writer A last-write-wins update must apply on top of B: {e}"),
