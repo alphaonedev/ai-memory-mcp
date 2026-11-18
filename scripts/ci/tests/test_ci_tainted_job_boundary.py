@@ -35,7 +35,9 @@ try:
 except ImportError:
     pyyaml = None
 
-ALLOW_PIN_EXPECTED = 13
+# 13 allow rows plus 11 open rows (ruling 59117c3e); the pin only goes down.
+ALLOW_PIN_EXPECTED = 24
+ALLOW_ROW_COUNT = 13
 JOB_COUNT_LARGE = 200
 LARGE_SCAN_CEILING_S = 10.0
 RUN_TEXT_BYTES_LARGE = 120_000
@@ -971,7 +973,8 @@ class AllowTable(unittest.TestCase):
     def test_9452_real_allow_table_is_pinned_and_names_fix_issues(self) -> None:
         _need_module(self)
         self.assertEqual(tb.TAINT_ALLOW_PIN, ALLOW_PIN_EXPECTED)
-        self.assertEqual(len(tb.TAINT_ALLOW), ALLOW_PIN_EXPECTED)
+        self.assertEqual(len(tb.TAINT_ALLOW), ALLOW_ROW_COUNT)
+        self.assertEqual(len(tb.TAINT_ALLOW) + len(tb.OPEN_ROWS), ALLOW_PIN_EXPECTED)
         self.assertEqual({row.issue for row in tb.TAINT_ALLOW}, FIX_ISSUES)
 
     def test_9452_new_workflow_with_a_violating_job_and_no_row_fails(self) -> None:
@@ -1164,7 +1167,15 @@ class RealWorkflows(unittest.TestCase):
     def test_9452_every_real_job_holds_the_boundary_or_has_an_open_row(self) -> None:
         _need_module(self)
         workflows, actions, files = _real()
-        self.assertEqual(tb.check(tb.scan_texts(workflows, actions, files)), [])
+        self.assertEqual(tb.check(tb.scan_texts(workflows, actions, files, open_rows=tb.OPEN_ROWS)), [])
+
+    def test_9452_without_open_rows_every_real_form_is_a_finding(self) -> None:
+        _need_module(self)
+        workflows, actions, files = _real()
+        problems = tb.check(tb.scan_texts(workflows, actions, files))
+        self.assertEqual(sorted(p for p in problems if p.startswith("unclassifiable: ")),
+                         sorted(f"unclassifiable: {wf}/{job}: step {step!r}: {reason}"
+                                for wf, job, step, reason in REAL_UNCLASSIFIABLE))
 
     def test_9452_every_allow_row_names_a_real_step(self) -> None:
         _need_module(self)
