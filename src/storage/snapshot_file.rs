@@ -154,11 +154,13 @@ pub(crate) mod seam {
     use std::cell::{Cell, RefCell};
     use std::path::{Path, PathBuf};
 
-    /// Where the hook runs: before the writer fills the snapshot, and after.
+    /// Where the hook runs: before the writer fills the snapshot, after, and
+    /// (with the STAGING name as the path) right after a successful link.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(crate) enum Point {
         Fill,
         Filled,
+        Linked,
     }
 
     type Hook = Box<dyn FnMut(Point, &Path)>;
@@ -204,6 +206,73 @@ pub(crate) mod seam {
         LINK_ERRNO
             .with(Cell::get)
             .map(std::io::Error::from_raw_os_error)
+    }
+}
+
+/// The "name taken" answer of a publish: a symlink there is refused with
+/// [`symlink_refusal`], anything else means try the next name.
+fn name_taken(dest: &Path) -> Result<bool> {
+    refuse_symlink(dest)?;
+    Ok(false)
+}
+
+/// A `link(2)` failure that means the filesystem has no hard links, the only
+/// one that may fall back (to [`rename_no_replace`]). Non-unix: none does.
+fn no_hard_links(err: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        matches!(
+            err.raw_os_error(),
+            Some(libc::EPERM | libc::EOPNOTSUPP | libc::ENOSYS)
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = err;
+        false
+    }
+}
+
+/// Rename `staged` to `dest` ATOMICALLY refusing an existing `dest` (`EEXIST`):
+/// Linux `renameat2(RENAME_NOREPLACE)`, macOS `renamex_np(RENAME_EXCL)`. Any
+/// other platform has no such call and refuses (`Unsupported`).
+fn rename_no_replace(staged: &Path, dest: &Path) -> std::io::Result<()> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let c_path = |p: &Path| {
+            std::ffi::CString::new(p.as_os_str().as_bytes())
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+        };
+        let (from, to) = (c_path(staged)?, c_path(dest)?);
+        // SAFETY: `from` and `to` are NUL-terminated C strings that outlive
+        // the call; the call reads them and touches no Rust memory.
+        #[cfg(target_os = "linux")]
+        let rc = unsafe {
+            libc::renameat2(
+                libc::AT_FDCWD,
+                from.as_ptr(),
+                libc::AT_FDCWD,
+                to.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        // SAFETY: as above.
+        #[cfg(target_os = "macos")]
+        let rc = unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL) };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (staged, dest);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "no atomic no-replace rename on this platform",
+        ))
     }
 }
 
@@ -414,7 +483,10 @@ impl NoFollowStage {
 
     /// Prove the staging NAME still names the staged handle's file. `VACUUM
     /// INTO` writes by name, so a name swapped for a symlink (or another file)
-    /// after the create must not be published.
+    /// after the create must not be published. Unix compares the
+    /// (device, inode) pair of the name and the handle. Non-unix has no inode
+    /// to compare: it checks only that the name is a regular file (not a
+    /// symlink), so a swapped regular file there is not detected.
     ///
     /// # Errors
     /// The name is gone, is a symlink, or names a different file.
@@ -449,12 +521,15 @@ impl NoFollowStage {
     /// Publish the staged file at the destination WITHOUT replacing anything
     /// there: a hard link (`link(2)` fails on any existing entry, a dangling
     /// symlink included, and never follows it), then the staging name is
-    /// dropped. A filesystem with no hard links falls back to a re-checked
-    /// rename. The caller fsyncs the directory. Returns the handle.
+    /// dropped (best effort). Only a link failure that means "no hard links
+    /// here" (`EPERM`, `EOPNOTSUPP`, `ENOSYS`) falls back, and only to an
+    /// atomic no-replace rename ([`rename_no_replace`]); a platform without
+    /// one, and every other errno, is refused. The caller fsyncs the
+    /// directory. Returns the handle.
     ///
     /// # Errors
     /// The identity check fails, something sits at the destination, or the
-    /// link, rename or unlink fails (the staging name is then removed).
+    /// link (or its no-replace fallback) fails; the staging name is removed.
     pub(crate) fn publish(mut self) -> Result<std::fs::File> {
         let dest = self.dest.clone();
         if !self.publish_at(&dest)? {
@@ -468,20 +543,39 @@ impl NoFollowStage {
     }
 
     /// ONE no-follow, create-new `link(2)` at `dest`; `Ok(false)`: name taken.
+    /// I-2: nothing that exists at `dest` is replaced, for any errno.
     fn publish_at(&mut self, dest: &Path) -> Result<bool> {
         self.verify_identity()?;
         match link_no_replace(&self.name.path, dest) {
-            Ok(()) => std::fs::remove_file(&self.name.path).with_context(|| {
-                format!("removing the staging name {}", self.name.path.display())
-            })?,
-            Err(_) if std::fs::symlink_metadata(dest).is_ok() => {
-                refuse_symlink(dest)?;
-                return Ok(false);
+            Ok(()) => {
+                // X-5: the file is published; a staging name that will not go
+                // away now is retried by Drop and never fails the publish.
+                #[cfg(test)]
+                seam::fire(seam::Point::Linked, &self.name.path);
+                if std::fs::remove_file(&self.name.path).is_ok() {
+                    self.name.armed = false;
+                }
+                Ok(true)
             }
-            Err(_) => std::fs::rename(&self.name.path, dest)
-                .with_context(|| format!("publishing {}", dest.display()))?,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => name_taken(dest),
+            Err(e) if no_hard_links(&e) => match rename_no_replace(&self.name.path, dest) {
+                Ok(()) => {
+                    self.name.armed = false;
+                    Ok(true)
+                }
+                Err(r) if r.kind() == std::io::ErrorKind::AlreadyExists => name_taken(dest),
+                Err(r) => Err(anyhow::Error::new(r).context(format!(
+                    "refusing to publish {} {}: no hard links here (the link failed: {e}) \
+                     and the no-replace rename failed (#8950)",
+                    self.what,
+                    dest.display()
+                ))),
+            },
+            Err(e) => Err(anyhow::Error::new(e).context(format!(
+                "refusing to publish {} {}: the link failed and no fallback applies (#8950)",
+                self.what,
+                dest.display()
+            ))),
         }
-        self.name.armed = false;
-        Ok(true)
     }
 }

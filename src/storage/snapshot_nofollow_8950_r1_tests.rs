@@ -310,6 +310,28 @@ fn publish_eexist_is_name_taken_8950() {
     assert_eq!(std::fs::read(&dest).expect("entry"), VICTIM_BYTES);
 }
 
+/// X-5: the link succeeded, so a staging name that cannot be removed (a
+/// non-empty directory now sits there) does not fail the publish.
+#[test]
+fn publish_survives_a_failing_staging_unlink_8950() {
+    let dir = scratch();
+    let dest = dir.path().join("snap.db");
+    let mut stage = stage_beside(&dest, "repair snapshot").expect("stage");
+    stage.write_all(b"staged").expect("write");
+    seam::set_hook(|point, staged| {
+        if point == seam::Point::Linked {
+            std::fs::remove_file(staged).expect("unlink staged");
+            std::fs::create_dir(staged).expect("dir at the staging name");
+            std::fs::write(staged.join("keep"), b"x").expect("non-empty");
+        }
+    });
+    let published = stage.publish();
+    seam::reset();
+    let handle = published.expect("a published file must not fail on the staging unlink");
+    drop(handle);
+    assert_eq!(std::fs::read(&dest).expect("published"), b"staged");
+}
+
 fn backup_names(dest: &Path, upto: u32) -> Vec<PathBuf> {
     let mut names = vec![dest.to_path_buf()];
     names.extend((1..=upto).map(|n| PathBuf::from(format!("{}.{n}", dest.display()))));
