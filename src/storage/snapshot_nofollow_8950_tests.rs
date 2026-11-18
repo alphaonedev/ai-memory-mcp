@@ -6,8 +6,8 @@
 
 use super::snapshot_file::{
     SYMLINK_REFUSAL_TAIL, UNIQUE_NAME_ATTEMPTS, refuse_occupied, refuse_symlink,
-    settle_mode_to_source, stage_beside, symlink_refusal, write_new_private,
-    write_new_private_unique, write_replacing,
+    settle_mode_to_source, stage_beside, symlink_refusal, write_new_private_unique,
+    write_replacing,
 };
 use std::path::{Path, PathBuf};
 
@@ -230,7 +230,7 @@ fn refuse_occupied_regular_file_names_it_8950() {
 }
 
 /// Row table for the derived-name sites (config / install backups):
-/// `write_new_private` refuses every plant with the exact error, writes
+/// `write_new_private_unique` refuses every plant with the exact error, writes
 /// nothing through it and leaves no staging entry.
 #[cfg(unix)]
 #[test]
@@ -241,7 +241,7 @@ fn write_new_private_refuses_planted_rows_8950() {
         let dir = tmp.path();
         let dest = dir.join("config.toml.bak.20261114-000000");
         let target = plant(dir, &dest, p);
-        let err = write_new_private(&dest, "config backup", b"secret-config")
+        let err = write_new_private_unique(&dest, "config backup", b"secret-config")
             .expect_err("a planted link must refuse");
         assert_eq!(err.to_string(), symlink_refusal(&dest), "{row}");
         assert_target_untouched(&target, p, &row);
@@ -403,7 +403,7 @@ const RAW_WRITE_CENSUS_8950: &[(&str, usize)] = &[
     ("src/recover/watcher.rs", 2),
     ("src/reranker.rs", 3),
     ("src/storage/migrations.rs", 1),
-    ("src/storage/snapshot_file.rs", 2),
+    ("src/storage/snapshot_file.rs", 3),
     ("src/storage/sqlite_integrity.rs", 1),
     ("src/store_url.rs", 1),
     ("src/test_support.rs", 6),
@@ -585,11 +585,7 @@ fn settle_mode_refuses_symlink_swapped_in_8950() {
     let err = settle_mode_to_source(&target, &source).expect_err("swapped-in symlink");
     assert_eq!(format!("{err:#}"), symlink_refusal(&target));
     let meta = std::fs::metadata(&victim).expect("victim");
-    assert_eq!(
-        meta.permissions().mode() & 0o777,
-        VICTIM_MODE,
-        "target mode changed"
-    );
+    assert_eq!(meta.permissions().mode() & 0o777, VICTIM_MODE);
 }
 
 /// S-4: the name and all numbered names taken, the next one is refused with
@@ -605,10 +601,8 @@ fn unique_backup_refuses_name_past_the_last_numbered_8950() {
     }
     let err = write_new_private_unique(&dest, "install backup", b"new").expect_err("all taken");
     let tail = format!("it and {UNIQUE_NAME_ATTEMPTS} numbered names beside it are taken");
-    let want = format!(
-        "refusing to write install backup {}: {tail}",
-        dest.display()
-    );
+    let shown = dest.display();
+    let want = format!("refusing to write install backup {shown}: {tail}");
     assert_eq!(format!("{err:#}"), want);
     assert!(std::fs::symlink_metadata(name(UNIQUE_NAME_ATTEMPTS + 1)).is_err());
     let entries = u32::try_from(std::fs::read_dir(dir.path()).expect("dir").count());
