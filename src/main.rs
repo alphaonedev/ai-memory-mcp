@@ -67,6 +67,17 @@ fn main() -> Result<()> {
     // `--db-passphrase-file`.
     let cli = Cli::parse();
 
+    // #3971 W-3 / W-10 — the packaging-internal snapshot hand-off runs as
+    // root, so it is the FIRST action after parsing: before the config,
+    // logging, audit, key material or any store is touched, and with no
+    // environment variable read. clap has already refused it beside any other
+    // wake-hub mode or serving flag.
+    if let daemon_runtime::Command::WakeHub(args) = &cli.command
+        && let (Some(source), Some(dest)) = (&args.publish_snapshot, &args.allowlist)
+    {
+        std::process::exit(ai_memory::cli::wake_hub::run_publish_snapshot(source, dest));
+    }
+
     // #3329 / TASK-01 — config-path advisories are emitted before tracing is
     // initialised, so an explicitly quiet boot seeds the one-way suppression
     // latch before config resolution. Path selection remains unchanged.

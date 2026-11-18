@@ -24,7 +24,7 @@ Group=ai-memory-hub
 #
 # WITHOUT --allowlist the hub admits NOBODY (fail-closed by design). The
 # #3504 refresher derives the snapshot as User=ai-memory (it MUST open
-# the store) then install(1)s it 0600 owned by ai-memory-hub into this
+# the store) then publishes it 0600 owned by ai-memory-hub into this
 # runtime directory, because AllowlistFile::load_from_file requires the
 # file be owned by THIS uid at exact mode 0600.
 EnvironmentFile=-/etc/ai-memory/wake-hub.env
@@ -127,7 +127,7 @@ RuntimeDirectory=ai-memory-hub
 RuntimeDirectoryMode=0700
 # CHOSEN: keep the allowlist in /run/ai-memory-hub and PRESERVE the directory
 # across stops. Without this, systemd removes the runtime directory when the
-# unit stops, deleting the snapshot the refresher install(1)s at
+# unit stops, deleting the snapshot the refresher publishes at
 # /run/ai-memory-hub/hub-allow.json -- and a hub that starts with no
 # allowlist admits NOBODY. Honest bound: /run is a tmpfs, so `preserve`
 # survives a stop/restart but NOT a reboot. The refresher's OnBootSec=15s

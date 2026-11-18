@@ -167,9 +167,23 @@ fn refresher_stays_the_store_opener_and_installs_as_the_hub_uid_3578() {
         trimmed_lines(&unit).any(|l| l == "User=ai-memory"),
         "refresher must keep User=ai-memory — it opens the store"
     );
+    // #3971: the root hand-off is the no-follow, atomic publish mode with an
+    // emptied environment, never install(1), which dereferences its source.
     assert!(
-        unit.contains("ExecStartPost=+/usr/bin/install -o ai-memory-hub"),
-        "refresher must install(1) the snapshot as the hub uid (0600 owner check)"
+        unit.contains(
+            "ExecStartPost=+/usr/bin/env -i AI_MEMORY_NO_CONFIG=1 /usr/bin/ai-memory wake-hub"
+        ),
+        "refresher must hand the snapshot over with `wake-hub --publish-snapshot` under env -i"
+    );
+    assert!(
+        unit.contains("--publish-snapshot /var/lib/ai-memory/hub-allow.json"),
+        "refresher must publish the staged snapshot it derived"
+    );
+    assert!(
+        !trimmed_lines(&unit)
+            .filter(|l| l.starts_with("ExecStartPost="))
+            .any(|l| l.contains("install")),
+        "no ExecStartPost may install(1) the snapshot (CWE-59, not atomic)"
     );
     assert!(
         unit.contains("/run/ai-memory-hub/hub-allow.json"),

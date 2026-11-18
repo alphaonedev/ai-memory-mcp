@@ -2640,6 +2640,15 @@ jobs:
         if: needs.classify.outputs.cargo_skip != 'true' && matrix.once
         run: cargo build --release
 
+      # #3971 W-5 — the wake-hub snapshot hand-off runs as REAL root across
+      # two uids, exactly as the packaged refresher unit runs it (`env -i`),
+      # with a symlink swap, a stalled FIFO and a polluted environment. Only
+      # on the GitHub-hosted once leg: the runner VM is disposable and has
+      # passwordless sudo; a self-hosted runner is never given root here.
+      - name: Wake-hub publish hand-off as real root (two uids, #3971)
+        if: ${{ needs.classify.outputs.cargo_skip != 'true' && matrix.once && runner.os == 'Linux' && runner.environment == 'github-hosted' }}
+        run: sudo python3 scripts/wake_hub_publish_root_3971.py --bin target/release/ai-memory
+
       # Drop the per-job ephemeral db (created by "Configure enterprise-fed
       # tier" above). always() so a failed/cancelled test run still reclaims
       # it. Guarded on CI_FED_DB so it no-ops on the sqlite legs (where it was

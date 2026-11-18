@@ -103,6 +103,7 @@ pub mod metrics;
 pub mod pending;
 pub mod routing;
 pub mod server;
+pub mod snapshot_publish;
 pub mod startup;
 
 pub use server::WakeHub;

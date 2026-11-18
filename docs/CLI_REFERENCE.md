@@ -2014,6 +2014,45 @@ ai-memory wake-hub --health                 # probe the socket; exit 0 / 2 (#347
 ai-memory wake-hub --health --json          # machine-readable reachability
 ```
 
+The packaging-internal hand-off (#3971):
+
+```bash
+ai-memory wake-hub --publish-snapshot SRC --allowlist DEST
+```
+
+**`--allowlist` has two meanings.** When the hub serves or reports
+(`--posture`, `--health`, no mode flag) it is the snapshot path the hub
+**reads**. With `--publish-snapshot` it is the **destination** the snapshot is
+written to.
+
+**`--publish-snapshot SRC` is a packaging-internal interface** (#3971). It is
+the root step of `ai-memory-wake-hub-refresh.service`
+(`ExecStartPost=+/usr/bin/env -i AI_MEMORY_NO_CONFIG=1 /usr/bin/ai-memory
+wake-hub --publish-snapshot … --allowlist …`), which moves the refresher's
+staged snapshot across the uid boundary into the hub's runtime directory. Its
+**argument shape and exit codes are stable for units**: `0` published, `1`
+refused (nothing published, the previous snapshot untouched), `2` usage error.
+**Its output text is not stable**; do not parse it. The mode is the first action
+after argument parsing: it opens no config, store, key, log or socket and reads
+no environment variable. It is refused beside any other wake-hub mode or
+serving flag (`--socket`, `--hub-id`, `--max-connections`, `--posture`,
+`--health`, `--require-admits`, `--json`) and requires `--allowlist`. It
+walks both paths from `/` without following a symlink at any level, and
+refuses with one named reason unless:
+
+- the source directory belongs to a non-root uid, the destination directory
+  belongs to a different uid, and neither is group- or world-writable;
+- the source, checked through its own open descriptor, is a regular file with
+  one link, mode exactly `0600`, owned by its directory's owner and at most
+  1 MiB;
+- the snapshot passes the hub's own validation (format version, freshness,
+  keys).
+
+It then writes the snapshot to an `O_EXCL` temp file in the destination
+directory, gives that inode to the directory's owner at `0600`, `fsync`s it,
+renames it over the old snapshot and `fsync`s the directory, so a hub reading
+concurrently sees the whole old snapshot or the whole new one.
+
 A Unix-domain-socket switch (mode **0600**, inside an owner-only **0700**
 directory, peer credentials checked with `SO_PEERCRED` on Linux and
 `LOCAL_PEERPID` + `getpeereid` on macOS) that pushes a bounded, **content-free
@@ -2185,8 +2224,8 @@ optional, and it is not a thing to do by hand. Ship it as a job:
 exactly this command, and both write to the path the hub units READ —
 `/run/ai-memory-hub/hub-allow.json` on Linux (the `$ALLOWLIST` that
 `ai-memory-wake-hub.service` passes to `--allowlist`; the refresher
-derives as `User=ai-memory` then `install(1)`s the file 0600 owned by
-`ai-memory-hub`) and
+derives as `User=ai-memory` then hands the file to `ai-memory-hub` at 0600
+with `wake-hub --publish-snapshot`, below) and
 `~/.ai-memory/hub-allow.json` on macOS. Pointing the refresher anywhere else
 leaves a hub reading a file nobody writes. Because `/run` is a tmpfs the
 snapshot does not survive a reboot, so the first post-boot refresh

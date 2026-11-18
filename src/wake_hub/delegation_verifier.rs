@@ -1180,6 +1180,11 @@ pub struct AllowlistFile {
 /// an EXISTING field, which this is not.
 pub const ALLOWLIST_FILE_VERSION: u32 = 2;
 
+/// Byte ceiling of an allowlist snapshot. One definition shared by the hub's
+/// reader and the privileged publisher (#3971), so the publisher can never
+/// hand over a file the hub would refuse for its size.
+pub(crate) const MAX_ALLOWLIST_BYTES: u64 = 1_048_576;
+
 impl AllowlistCache {
     /// Load a derived allowlist from disk.
     ///
@@ -1261,7 +1266,6 @@ impl AllowlistCache {
         use anyhow::{Context, bail};
         use std::io::Read as _;
 
-        const MAX_ALLOWLIST_BYTES: u64 = 1_048_576;
         let mut raw = String::new();
         file.take(MAX_ALLOWLIST_BYTES + 1)
             .read_to_string(&mut raw)?;

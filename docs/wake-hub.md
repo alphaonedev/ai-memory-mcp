@@ -790,9 +790,9 @@ missed tick costs nothing, writing to the SAME path the hub reads:
 ai-memory identity hub-cache \
     --include-agent <each agent that may listen> \
     --out /var/lib/ai-memory/hub-allow.json
-# The shipped refresher then install(1)s that file 0600 owned by
-# ai-memory-hub into /run/ai-memory-hub/hub-allow.json — the hub uid
-# must own the snapshot at exact mode 0600.
+# The shipped refresher then hands that file to ai-memory-hub at 0600 in
+# /run/ai-memory-hub/hub-allow.json with `wake-hub --publish-snapshot`
+# (below); the hub uid must own the snapshot at exact mode 0600.
 
 # macOS (the path dev.alphaone.ai-memory.wake-hub.plist reads)
 ai-memory identity hub-cache \
@@ -808,8 +808,42 @@ is refused. On Linux the hub runtime directory is created `0700` by the hub
 unit (`RuntimeDirectory=ai-memory-hub`, `User=ai-memory-hub`,
 `RuntimeDirectoryPreserve=yes`). The refresher is a DISTINCT user
 (`User=ai-memory`) because it opens the store; it cannot write the 0700 hub
-directory, so `ExecStartPost=+/usr/bin/install -o ai-memory-hub …` is the
-hand-off that satisfies the hub's owner-only 0600 allowlist gate (#3578).
+directory, so a root `ExecStartPost=+` step is the hand-off that satisfies
+the hub's owner-only 0600 allowlist gate (#3578).
+
+**The root hand-off is `wake-hub --publish-snapshot` (#3971).** The shipped
+line is
+
+```ini
+ExecStartPost=+/usr/bin/env -i AI_MEMORY_NO_CONFIG=1 /usr/bin/ai-memory wake-hub \
+    --publish-snapshot /var/lib/ai-memory/hub-allow.json \
+    --allowlist /run/ai-memory-hub/hub-allow.json
+```
+
+It is the only line of the package that runs as root. It replaced
+`install(1)`, which dereferenced a source path the `ai-memory` uid can
+rewrite (CWE-59) and unlinked the destination before re-creating it (not
+atomic). `--publish-snapshot` is a **packaging-internal interface**: its
+argument shape and exit codes (`0` published, `1` refused with nothing
+published, `2` usage) are stable for units; its output text is not. Note that
+`--allowlist` means two things: the path the hub **reads** when it serves or
+reports, and the **destination** written when `--publish-snapshot` is given.
+
+The mode is the first action after argument parsing and opens nothing but its
+two paths: no config, store, key, log or socket, and no environment variable
+changes it (`env -i` empties the environment anyway). It walks both paths from
+`/` with `O_NOFOLLOW`, so a symlink at any level is refused, and refuses with
+one named reason unless the staging directory belongs to a non-root uid, the
+hub directory belongs to a different uid, and neither is group- or
+world-writable. The staged file is proven through its own descriptor (regular,
+one link, mode `0600`, owned by the staging directory's owner, at most 1 MiB;
+a FIFO is refused without blocking), then validated with the hub's own reader.
+The snapshot is written to an `O_EXCL` temp file in the hub directory, given
+to the directory's owner at `0600`, `fsync`ed, renamed over the old snapshot
+and the directory `fsync`ed. A refusal publishes nothing: the previous
+snapshot stays and ages out, which refuses hellos rather than admitting
+anything new. The two-uid real-root proof runs in CI
+(`scripts/wake_hub_publish_root_3971.py`).
 
 **Grant the database's DIRECTORY, not the database file.** The systemd
 refresher runs under `ProtectSystem=strict`, so every path it writes has to be
@@ -1177,7 +1211,7 @@ and fails the unit only if the hub is still unreachable after that. A
 single-shot probe would fail every start and, with `Restart=on-failure`,
 convert a healthy host into a restart loop. The unit also sets
 `RuntimeDirectoryPreserve=yes`, so the allowlist snapshot the refresher
-install(1)s at `/run/ai-memory-hub/hub-allow.json` survives a stop or restart
+publishes at `/run/ai-memory-hub/hub-allow.json` survives a stop or restart
 instead of being deleted with the runtime directory — which would leave the
 restarted hub admitting nobody. `/run` is a tmpfs, so that path still does not
 survive a **reboot**; republish it after boot.

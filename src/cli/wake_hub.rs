@@ -67,9 +67,31 @@ pub struct WakeHubArgs {
     pub max_connections: Option<usize>,
     /// Derived allowlist cache: the agents permitted to join, with their
     /// ENROLLED public keys. Public material only, 0600, refreshed out of band
-    /// from ai-memory. Without it the hub admits nobody.
+    /// from ai-memory. Without it the hub admits nobody. When serving or
+    /// reporting this is the path the hub READS; with `--publish-snapshot` it
+    /// is the DESTINATION the snapshot is written to.
     #[arg(long, value_name = "PATH")]
     pub allowlist: Option<PathBuf>,
+    /// Packaging-internal (#3971): publish the refresher's staged snapshot at
+    /// PATH to `--allowlist` across the uid boundary, without following any
+    /// symlink and by atomic rename, then exit. Opens no config, store, key,
+    /// log or socket. The argument shape and the exit codes (0 published,
+    /// `1` refused, `2` usage) are stable for units; the output text is not.
+    #[arg(
+        long,
+        value_name = "PATH",
+        requires = "allowlist",
+        conflicts_with_all = [
+            "socket",
+            "hub_id",
+            "max_connections",
+            "posture",
+            "health",
+            "require_admits",
+            "json",
+        ]
+    )]
+    pub publish_snapshot: Option<PathBuf>,
     /// Print the resolved posture (socket path, limits, identity state) and
     /// exit WITHOUT binding. Safe to run against a host already serving a hub.
     #[arg(long)]
@@ -480,6 +502,42 @@ impl IdentityPosture {
 /// is structurally blind to.
 pub const EXIT_ADMITS_NOBODY: i32 = 3;
 
+/// Process exit when `--publish-snapshot` refuses: nothing was published and
+/// the previous snapshot is untouched (#3971). clap usage errors (a refused
+/// flag combination) exit `2`.
+pub const EXIT_PUBLISH_REFUSED: i32 = 1;
+
+/// The prefix of every `--publish-snapshot` refusal line on stderr.
+pub const PUBLISH_REFUSED_PREFIX: &str = "wake-hub: --publish-snapshot refused:";
+
+/// Run the packaging-internal `--publish-snapshot SRC --allowlist DEST` mode
+/// and return the process exit code. Called by `main` as its FIRST action
+/// after argument parsing, before config, logging, audit or key material is
+/// touched (#3971 W-3 / W-10); it reads no environment variable.
+///
+/// Prints one report line to stdout on success, or one refusal line naming
+/// the exact reason to stderr.
+pub fn run_publish_snapshot(source: &std::path::Path, dest: &std::path::Path) -> i32 {
+    use std::io::Write as _;
+    match crate::wake_hub::snapshot_publish::publish_snapshot(source, dest) {
+        Ok(report) => {
+            // A failed stdout write is not a failed publish: the rename is done.
+            let _ = writeln!(
+                std::io::stdout(),
+                "wake-hub: published {} agent(s) to {} (owner uid {}, mode 0600)",
+                report.agents,
+                dest.display(),
+                report.owner_uid
+            );
+            0
+        }
+        Err(err) => {
+            let _ = writeln!(std::io::stderr(), "{PUBLISH_REFUSED_PREFIX} {err:#}");
+            EXIT_PUBLISH_REFUSED
+        }
+    }
+}
+
 /// Bind and serve until SIGINT / SIGTERM, or run one of the non-binding
 /// reporting modes.
 ///
@@ -491,6 +549,11 @@ pub const EXIT_ADMITS_NOBODY: i32 = 3;
 /// Propagates every start-up refusal from [`WakeHub::bind`], and write failures
 /// from the reporting modes.
 pub async fn dispatch(args: &WakeHubArgs, app_config: &AppConfig) -> Result<i32> {
+    // `main` short-circuits this mode before config is loaded; a library
+    // caller that reaches here still gets the same config-free publish.
+    if let (Some(source), Some(dest)) = (&args.publish_snapshot, &args.allowlist) {
+        return Ok(run_publish_snapshot(source, dest));
+    }
     let cfg = resolve_config(args, app_config)?;
     if args.posture || args.health {
         let stdout = std::io::stdout();
@@ -575,6 +638,7 @@ mod tests {
             health: false,
             require_admits: false,
             json: false,
+            publish_snapshot: None,
         }
     }
 
