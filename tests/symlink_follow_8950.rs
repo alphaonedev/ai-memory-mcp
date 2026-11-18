@@ -61,7 +61,7 @@ fn assert_refused(tmp: &TempDir, db: &Path, backups: &Path, planted: &[(PathBuf,
     let stderr = String::from_utf8_lossy(&output.stderr);
     let refused = planted.iter().any(|(link, _)| {
         stderr.contains(&format!(
-            "refusing to write {}: a symlink sits at that path and would be followed (#8950)",
+            "refusing to write {}: {TAIL}",
             link.display()
         ))
     });
