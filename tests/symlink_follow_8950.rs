@@ -59,12 +59,9 @@ fn assert_refused(tmp: &TempDir, db: &Path, backups: &Path, planted: &[(PathBuf,
         "a planted symlink must fail the backup"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let refused = planted.iter().any(|(link, _)| {
-        stderr.contains(&format!(
-            "refusing to write {}: {TAIL}",
-            link.display()
-        ))
-    });
+    let refused = planted
+        .iter()
+        .any(|(link, _)| stderr.contains(&format!("refusing to write {}: {TAIL}", link.display())));
     assert!(refused, "exact refusal expected on stderr, got: {stderr}");
     assert!(
         output.stdout.is_empty(),
