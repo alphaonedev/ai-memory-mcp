@@ -12,9 +12,13 @@
 //! ## Exit codes
 //!
 //! - `0` — chain fully verified (or no signatures present and
-//!   `bounded_status != "exceeded_cap"`).
-//! - `1` — at least one edge failed signature verification, or the
-//!   chain exceeds its namespace `max_reflection_depth` cap.
+//!   `bounded_status != "exceeded_cap"`), and the root's content-id is
+//!   verified or was not checked (no genesis or no cid).
+//! - `1` — the root memory was not found (#3436).
+//! - `2` — verification failed: at least one edge failed signature
+//!   verification, the chain exceeds its namespace
+//!   `max_reflection_depth` cap, or (#9505) the root's content-id
+//!   genesis mismatches its cid or cannot be read.
 //!
 //! ## Output formats
 //!
@@ -159,19 +163,116 @@ pub struct SignedEventSummary {
     pub signature_present: bool,
 }
 
+/// #9505 — why the root's `cid_genesis` could not be read. Fixed labels
+/// only: the storage error's own text is never printed, so no stored bytes
+/// and no path reach the operator's streams.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GenesisReadErrorClass {
+    /// The stored value is not a BLOB (wrong SQLite type or a failed
+    /// conversion).
+    DecodeError,
+    /// The provenance column or the schema stamp is not in the shape this
+    /// binary expects (#9496).
+    SchemaFault,
+    /// Any other storage error.
+    StorageError,
+}
+
+impl GenesisReadErrorClass {
+    /// Classify a failed `read_cid_genesis` by the error's type, never its
+    /// text.
+    fn of(err: &anyhow::Error) -> Self {
+        if err
+            .downcast_ref::<crate::storage::schema_guard::ProvenanceReadFault>()
+            .is_some()
+        {
+            return Self::SchemaFault;
+        }
+        match err.downcast_ref::<rusqlite::Error>() {
+            Some(
+                rusqlite::Error::InvalidColumnType(..)
+                | rusqlite::Error::FromSqlConversionFailure(..),
+            ) => Self::DecodeError,
+            _ => Self::StorageError,
+        }
+    }
+
+    /// The label printed in text mode and serialised in JSON mode.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::DecodeError => "decode_error",
+            Self::SchemaFault => "schema_fault",
+            Self::StorageError => "storage_error",
+        }
+    }
+}
+
+/// #9505 — the root memory's content-id verdict (3-agent vote (71472661),
+/// B + J1). A root that was not checked (no genesis, or no cid) has NO
+/// value: `ChainReport::root_cid` is `None` and the field is omitted from
+/// the JSON. `Mismatch` and `Unreadable` fail the chain.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum RootCidCheck {
+    /// The stored genesis is the pre-image of the root's cid.
+    Verified { cid: String },
+    /// The stored genesis was read and is NOT the pre-image of the cid.
+    Mismatch { cid: String },
+    /// The stored genesis could not be read.
+    Unreadable { error_class: GenesisReadErrorClass },
+}
+
+impl RootCidCheck {
+    /// `true` only for [`RootCidCheck::Verified`].
+    #[must_use]
+    pub const fn passes(&self) -> bool {
+        matches!(self, Self::Verified { .. })
+    }
+}
+
+/// #9505 — read the root's genesis and decide its content-id state. Runs
+/// BEFORE anything is printed. A read error is `Unreadable` whether or not
+/// the row carries a cid (fail closed: a column that does not decode is
+/// itself evidence); a NULL genesis or a NULL cid is "not checked".
+fn check_root_cid(conn: &Connection, root: &crate::models::Memory) -> Option<RootCidCheck> {
+    match crate::db::read_cid_genesis(conn, &root.id) {
+        Err(err) => Some(RootCidCheck::Unreadable {
+            error_class: GenesisReadErrorClass::of(&err),
+        }),
+        Ok(None) => None,
+        Ok(Some(genesis)) => {
+            let cid = root.cid.as_deref()?;
+            Some(if crate::identity::cid::verify_cid(cid, &genesis).is_ok() {
+                RootCidCheck::Verified {
+                    cid: cid.to_string(),
+                }
+            } else {
+                RootCidCheck::Mismatch {
+                    cid: cid.to_string(),
+                }
+            })
+        }
+    }
+}
+
 /// Full chain-integrity report — the `AgenticMem Attest` tier evidence
 /// packet.
 #[derive(Debug, Serialize)]
 pub struct ChainReport {
     /// v0.7.0 G-PHASE-E-4 (#709) — top-line PASS/FAIL flag for the
     /// chain. `true` when every edge verified AND no namespace
-    /// exceeded its governance cap. Surfaced as the first field on
-    /// the JSON wire shape so external auditors / CI scripts can
-    /// `jq '.ok'` instead of recomputing the predicate from `edges_failed`
-    /// + `bounded_status`. The shell exit code mirrors this field: `0`
-    /// when `ok = true`, `2` when `ok = false` (matching the
+    /// exceeded its governance cap AND (#9505) the root content-id
+    /// check, when it ran (`root_cid` set), is `verified`: a root
+    /// genesis that mismatches or cannot be read makes it `false`.
+    /// Surfaced as the first field on the JSON wire shape so external
+    /// auditors / CI scripts can `jq '.ok'` instead of recomputing the
+    /// predicate. The shell exit code mirrors this field: `0` when
+    /// `ok = true`, `2` when `ok = false` (matching the
     /// `verify-forensic-bundle` exit convention, also raised to `2`
-    /// in #709).
+    /// in #709). The verb sets it ONCE, after the root check and before
+    /// anything is printed ([`ChainReport::with_root_cid`]).
     pub ok: bool,
     /// Root memory id supplied on the command line.
     pub root_id: String,
@@ -192,11 +293,30 @@ pub struct ChainReport {
     /// `"exceeded_cap"` when at least one did, or
     /// `"no_cap_configured"` when no governance policy rows exist.
     pub bounded_status: String,
+    /// #9505 — the root content-id verdict. Additive and optional: `None`
+    /// (not checked) is omitted from the JSON, and the forensic-bundle
+    /// builder never sets it, so `verification.json` is unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub root_cid: Option<RootCidCheck>,
     /// Optional `signed_events` entries when `--include-signed-events`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub signed_events: Vec<SignedEventSummary>,
     /// RFC3339 timestamp of report generation.
     pub generated_at: String,
+}
+
+impl ChainReport {
+    /// #9505 — record the root content-id verdict and fold it into the ONE
+    /// final `ok`: a `Mismatch` or `Unreadable` root makes `ok` false; a root
+    /// that was not checked (`None`) leaves it as the chain walk set it.
+    #[must_use]
+    pub fn with_root_cid(mut self, check: Option<RootCidCheck>) -> Self {
+        if let Some(verdict) = &check {
+            self.ok = self.ok && verdict.passes();
+        }
+        self.root_cid = check;
+        self
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -469,6 +589,7 @@ pub fn build_chain_report_at(
         edges,
         max_reflection_depth_per_namespace: max_depth_per_ns,
         bounded_status,
+        root_cid: None,
         signed_events,
         generated_at,
     })
@@ -563,15 +684,32 @@ fn verify_edge(
 pub(super) fn render_text(report: &ChainReport, out: &mut CliOutput<'_>) -> Result<()> {
     writeln!(
         out.stdout,
-        "verify-reflection-chain: root={} memories={} depth={} edges={} failed={}",
+        "verify-reflection-chain: root={} memories={} depth={} edges={} failed={} ok={}",
         report.root_id,
         report.n_memories,
         report.chain_depth,
         report.edges.len(),
         report.edges_failed,
+        report.ok,
     )?;
     writeln!(out.stdout, "bounded_status: {}", report.bounded_status)?;
     writeln!(out.stdout, "generated_at:   {}", report.generated_at)?;
+    // v0.9.0 G8 (#1825) / #9505 — the root's content-id verdict, decided
+    // before this function runs. Not checked = no line.
+    match &report.root_cid {
+        Some(RootCidCheck::Verified { cid }) => {
+            writeln!(out.stdout, "cid_verified:   true ({cid})")?
+        }
+        Some(RootCidCheck::Mismatch { cid }) => {
+            writeln!(out.stdout, "cid_verified:   false ({cid})")?;
+        }
+        Some(RootCidCheck::Unreadable { error_class }) => writeln!(
+            out.stdout,
+            "cid_verified:   unreadable ({})",
+            error_class.label()
+        )?,
+        None => {}
+    }
 
     if !report.max_reflection_depth_per_namespace.is_empty() {
         writeln!(out.stdout, "\nmax_reflection_depth per namespace:")?;
@@ -668,10 +806,9 @@ pub fn run(db_path: &Path, args: &VerifyChainArgs, out: &mut CliOutput<'_>) -> R
     // FAILED (#709). "I could not find it" and "I checked it and it is
     // broken" are different answers and a script must be able to tell them
     // apart.
-    if crate::db::get(&conn, &args.memory_id)
-        .context("resolve verify-reflection-chain root")?
-        .is_none()
-    {
+    let Some(root) =
+        crate::db::get(&conn, &args.memory_id).context("resolve verify-reflection-chain root")?
+    else {
         if json {
             let payload = serde_json::json!({
                 "ok": false,
@@ -688,24 +825,33 @@ pub fn run(db_path: &Path, args: &VerifyChainArgs, out: &mut CliOutput<'_>) -> R
             )?;
         }
         return Ok(1);
-    }
+    };
 
-    let report = build_chain_report(&conn, &args.memory_id, args.include_signed_events)?;
+    // #9505 (3-agent vote (71472661), B + J1) — the root content-id check
+    // runs BEFORE anything is printed, in both modes, and folds into the ONE
+    // final `ok` that the summary, the JSON and the exit code all read. The
+    // root row is the one resolved above: no second read, nothing swallowed.
+    let report = build_chain_report(&conn, &args.memory_id, args.include_signed_events)?
+        .with_root_cid(check_root_cid(&conn, &root));
 
     if json {
         let payload = serde_json::to_string_pretty(&report).context("serialise chain report")?;
         writeln!(out.stdout, "{payload}")?;
     } else {
         render_text(&report, out)?;
-        // v0.9.0 G8 (#1825) — per-memory cid_verified line for the root.
-        if let Some(genesis) = crate::db::read_cid_genesis(&conn, &args.memory_id)? {
-            if let Some(mem) = crate::db::get(&conn, &args.memory_id)? {
-                if let Some(cid) = mem.cid.as_deref() {
-                    let ok = crate::identity::cid::verify_cid(cid, &genesis).is_ok();
-                    writeln!(out.stdout, "cid_verified:   {ok} ({cid})")?;
-                }
-            }
-        }
+    }
+    match &report.root_cid {
+        Some(RootCidCheck::Mismatch { cid }) => writeln!(
+            out.stderr,
+            "verify-reflection-chain: root content-id mismatch (cid {cid}): the stored genesis \
+             is not the pre-image of the cid; verification failed"
+        )?,
+        Some(RootCidCheck::Unreadable { error_class }) => writeln!(
+            out.stderr,
+            "verify-reflection-chain: root content-id genesis unreadable ({}); verification failed",
+            error_class.label()
+        )?,
+        Some(RootCidCheck::Verified { .. }) | None => {}
     }
 
     // v0.9.0 G8 (#1825) — opt-in fleet-wide cid sweep.
@@ -728,8 +874,11 @@ pub fn run(db_path: &Path, args: &VerifyChainArgs, out: &mut CliOutput<'_>) -> R
     }
 
     // Exit code mirrors `report.ok`. The predicate is
-    // `edges_failed == 0 && bounded_status != "exceeded_cap"`, which is
-    // already cached on `report.ok` at construction time.
+    // `edges_failed == 0 && bounded_status != "exceeded_cap"` AND (#9505)
+    // a checked root content-id is `verified` (a mismatch or an unreadable
+    // genesis is a failed verification, exit 2, never the generic `Err`
+    // path, which `main` turns into exit 1 = NOT FOUND's code). It is set
+    // once, by `with_root_cid`, before anything was printed.
     if report.ok { Ok(0) } else { Ok(2) }
 }
 
@@ -1116,6 +1265,7 @@ mod tests {
             }],
             max_reflection_depth_per_namespace: ns,
             bounded_status: "within_cap".to_string(),
+            root_cid: None,
             signed_events: vec![SignedEventSummary {
                 memory_id: "agent-x".to_string(),
                 event_id: "ev-1".to_string(),
@@ -1153,6 +1303,7 @@ mod tests {
             edges: vec![],
             max_reflection_depth_per_namespace: std::collections::HashMap::new(),
             bounded_status: "no_cap_configured".to_string(),
+            root_cid: None,
             signed_events: vec![SignedEventSummary {
                 memory_id: "agent-y".to_string(),
                 event_id: "ev-2".to_string(),
