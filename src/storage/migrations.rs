@@ -1164,31 +1164,14 @@ pub(super) fn snapshot_before_migration(
     );
     let snapshot_path = parent.join(snapshot_name);
 
-    // Single-quote-escape the target for the SQL string literal (the path
-    // is crate-derived, but doubling quotes is the correct hygiene).
-    let target = snapshot_path.to_string_lossy().replace('\'', "''");
-    // #8679: owner-only target first, source's mode after, removed on any failure.
-    snapshot_file::create_private_target(&snapshot_path)?;
-    #[cfg(test)]
-    snapshot_file::seam::fire(snapshot_file::seam::Point::Fill, &snapshot_path);
-    let written = conn
-        .execute(&format!("VACUUM INTO '{target}'"), [])
-        .map_err(anyhow::Error::from)
-        .inspect(|_| {
-            #[cfg(test)]
-            snapshot_file::seam::fire(snapshot_file::seam::Point::Filled, &snapshot_path);
-        })
-        .and_then(|_| snapshot_file::settle_mode_to_source(&snapshot_path, &db_path))
-        .with_context(|| {
-            format!(
-                "pre-migration snapshot (v{from_version}→v{to_version}) failed; \
-                 refusing to mutate schema without a recoverable backup"
-            )
-        });
-    if let Err(err) = written {
-        snapshot_file::discard(&snapshot_path);
-        return Err(err);
-    }
+    // #8679 / #8950: staged privately, mode through the handle, published by
+    // a no-replace link; a failure leaves nothing at the snapshot name.
+    snapshot_file::vacuum_into_private(conn, &snapshot_path, &db_path).with_context(|| {
+        format!(
+            "pre-migration snapshot (v{from_version}→v{to_version}) failed; \
+             refusing to mutate schema without a recoverable backup"
+        )
+    })?;
 
     Ok(Some(snapshot_path))
 }

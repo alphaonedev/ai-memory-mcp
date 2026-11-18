@@ -6,17 +6,17 @@
 //! `VACUUM INTO` creates its target with the process umask, so a snapshot of an
 //! owner-only (0600) database could land world-readable. The snapshot is a
 //! full copy of the durable tier and must be exactly as private as its source.
-//! The target is therefore created first, owner-only, with `create_new`
-//! (`O_EXCL`: never follows a planted symlink, never reuses a file), handed to
-//! `VACUUM INTO` as the empty file SQLite accepts, and only then settled to the
-//! source's permission bits. Any failure removes the file and surfaces as an
-//! error so the migration does not proceed without a private snapshot (fail
-//! closed). The same backup precedent is `backup.rs` `PRIVATE_FILE_MODE`.
+//! [`vacuum_into_private`] therefore fills an owner-only file staged in a
+//! private (0700) directory ([`stage_beside`]), settles the source's permission
+//! bits through the staged HANDLE, and publishes it by a no-replace link. Any
+//! failure removes the staged file and surfaces as an error so the migration
+//! does not proceed without a private snapshot (fail closed).
 //!
 //! #8950 - the same module is the ONE no-follow write path for a file the
 //! product creates at a predictable name ([`stage_beside`] then
 //! [`NoFollowStage::publish`]): nothing that sits at the destination name, a
-//! symlink above all, is ever followed or replaced.
+//! symlink above all, is ever followed, chmod-ed or replaced. Nothing here
+//! writes or chmods a final name BY NAME.
 
 use anyhow::{Context, Result};
 use std::path::Path;
@@ -28,56 +28,62 @@ const OWNER_ONLY_MODE: u32 = 0o600;
 #[cfg(unix)]
 const PERMISSION_BITS: u32 = 0o777;
 
-/// Create the empty snapshot target, owner-only, failing if it already exists.
-pub(super) fn create_private_target(target: &Path) -> Result<()> {
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options
-            .mode(OWNER_ONLY_MODE)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-    }
-    options
-        .open(target)
-        .map(drop)
-        .with_context(|| format!("create pre-migration snapshot target {}", target.display()))
-}
+/// The `what` of the pre-migration snapshot in every refusal.
+const PRE_MIGRATION_WHAT: &str = "pre-migration snapshot";
 
-/// Give the finished snapshot the source database's permission bits.
+/// `VACUUM INTO` the database behind `conn` as a NEW snapshot at `dest`
+/// (#8679 mode, #8950 no-follow): staged privately beside `dest`, filled by
+/// name only inside the private staging directory, the staged name proven to
+/// still be the staged file, the source's mode set through the handle,
+/// fsynced, then published without replacing anything at `dest`.
 ///
-/// An unreadable source mode yields owner-only (the stricter answer).
-pub(super) fn settle_mode_to_source(target: &Path, source: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        let mode = std::fs::metadata(source).map_or(OWNER_ONLY_MODE, |meta| {
-            meta.permissions().mode() & PERMISSION_BITS
-        });
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-            .open(target)
-            .map_err(|e| match refuse_symlink(target) {
-                Err(refusal) => refusal,
-                Ok(()) => anyhow::Error::new(e).context(format!("opening {}", target.display())),
-            })?;
-        file.set_permissions(std::fs::Permissions::from_mode(mode))
-            .with_context(|| format!("set pre-migration snapshot mode on {}", target.display()))?;
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (target, source);
-    }
+/// # Errors
+/// Something sits at `dest`, the stage, `VACUUM INTO`, mode, fsync or
+/// identity check fails, or the publish is refused.
+pub(super) fn vacuum_into_private(
+    conn: &rusqlite::Connection,
+    dest: &Path,
+    source: &Path,
+) -> Result<()> {
+    let stage = stage_beside(dest, PRE_MIGRATION_WHAT)?;
+    #[cfg(test)]
+    seam::fire(seam::Point::Fill, dest);
+    // Single-quote-escape the target for the SQL string literal (the path is
+    // crate-derived, but doubling quotes is the correct hygiene).
+    let staged = stage.path().to_string_lossy().replace('\'', "''");
+    conn.execute(&format!("VACUUM INTO '{staged}'"), [])
+        .with_context(|| format!("VACUUM INTO the staged {}", stage.path().display()))?;
+    #[cfg(test)]
+    seam::fire(seam::Point::Filled, dest);
+    stage.verify_identity()?;
+    settle_mode_to_source(stage.file(), source)?;
+    stage
+        .file()
+        .sync_all()
+        .with_context(|| format!("fsync {}", stage.path().display()))?;
+    drop(stage.publish()?);
     Ok(())
 }
 
-/// Best-effort removal of a half-made snapshot after a failure.
-pub(super) fn discard(target: &Path) {
-    // The error that made us discard is the one reported; a failed remove
-    // leaves at worst an owner-only empty or partial file (never world-readable).
-    let _ = std::fs::remove_file(target);
+/// Give the staged snapshot the source database's permission bits, through
+/// its HANDLE (`fchmod`), never by name. An unreadable source mode yields
+/// owner-only (the stricter answer). Non-unix: a no-op, the platform has no
+/// permission bits to copy (the file keeps the mode its create gave it).
+fn settle_mode_to_source(file: &std::fs::File, source: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(source).map_or(OWNER_ONLY_MODE, |meta| {
+            meta.permissions().mode() & PERMISSION_BITS
+        });
+        file.set_permissions(std::fs::Permissions::from_mode(mode))
+            .context("set pre-migration snapshot mode through its handle")?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (file, source);
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

@@ -5,9 +5,8 @@
 //! ratchet that keeps every new raw write primitive visible.
 
 use super::snapshot_file::{
-    SYMLINK_REFUSAL_TAIL, UNIQUE_NAME_ATTEMPTS, refuse_occupied, refuse_symlink,
-    settle_mode_to_source, stage_beside, symlink_refusal, write_new_private_unique,
-    write_replacing,
+    SYMLINK_REFUSAL_TAIL, UNIQUE_NAME_ATTEMPTS, refuse_occupied, refuse_symlink, stage_beside,
+    symlink_refusal, write_new_private_unique, write_replacing,
 };
 use std::path::{Path, PathBuf};
 
@@ -327,12 +326,13 @@ const RAW_WRITE_PRIMITIVES: [&str; 6] = [
 /// prose that merely names the statement is not counted.
 const VACUUM_INTO_STATEMENTS: [&str; 2] = ["\"VACUUM INTO ?", "\"VACUUM INTO '"];
 
-/// Every production file that runs a `VACUUM INTO` statement must route it
-/// through the shared helper (`snapshot_file::`), and these are all of them.
+/// Every production file that runs a `VACUUM INTO` statement must fill a
+/// private stage (`stage_beside(`), and these are all of them (r1: the
+/// pre-migration snapshot runs inside `snapshot_file.rs`).
 const VACUUM_INTO_FILES: [&str; 3] = [
     "src/cli/backup.rs",
     "src/cli/doctor.rs",
-    "src/storage/migrations.rs",
+    "src/storage/snapshot_file.rs",
 ];
 
 /// Census of raw write primitives (lines) per production file at #8950. A NEW
@@ -402,8 +402,10 @@ const RAW_WRITE_CENSUS_8950: &[(&str, usize)] = &[
     ("src/recover/transcript_paths.rs", 7),
     ("src/recover/watcher.rs", 2),
     ("src/reranker.rs", 3),
-    ("src/storage/migrations.rs", 1),
-    ("src/storage/snapshot_file.rs", 3),
+    // r1 (X-1): the pre-migration VACUUM INTO moved into snapshot_file.rs
+    // (migrations.rs 1 -> 0); create_private_target and the by-name settle
+    // are gone (snapshot_file.rs 3 -> 2: open_new_private + the VACUUM).
+    ("src/storage/snapshot_file.rs", 2),
     ("src/storage/sqlite_integrity.rs", 1),
     ("src/store_url.rs", 1),
     ("src/test_support.rs", 6),
@@ -571,24 +573,6 @@ fn unique_backup_refuses_planted_symlink_rows_8950() {
 /// S-1: a symlink swapped in at the snapshot name is refused with the exact
 /// error, and the link target's mode is unchanged (fchmod, never by name).
 #[cfg(unix)]
-#[test]
-fn settle_mode_refuses_symlink_swapped_in_8950() {
-    use std::os::unix::fs::PermissionsExt;
-    const VICTIM_MODE: u32 = 0o644;
-    let dir = scratch();
-    let (source, victim) = (dir.path().join("src.db"), dir.path().join("victim"));
-    std::fs::write(&source, b"x").expect("source");
-    std::fs::write(&victim, b"x").expect("victim");
-    let victim_mode = std::fs::Permissions::from_mode(VICTIM_MODE);
-    std::fs::set_permissions(&victim, victim_mode).expect("mode");
-    let target = dir.path().join("snap.db");
-    std::os::unix::fs::symlink(&victim, &target).expect("plant symlink");
-    let err = settle_mode_to_source(&target, &source).expect_err("swapped-in symlink");
-    assert_eq!(format!("{err:#}"), symlink_refusal(&target));
-    let meta = std::fs::metadata(&victim).expect("victim");
-    assert_eq!(meta.permissions().mode() & 0o777, VICTIM_MODE);
-}
-
 /// S-4: the name and all numbered names taken, the next one is refused with
 /// the exact error; nothing is written and no staging entry is left.
 #[test]
