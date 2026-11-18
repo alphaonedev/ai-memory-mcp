@@ -19,6 +19,7 @@ import sys
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO_ROOT / "scripts" / "ci"))
@@ -46,6 +47,9 @@ SYNTH = "synthetic.yml"
 # The step key of an R2 (iv) violation: the job's `runs-on`, not one of its steps.
 R2_STEP = "runs-on"
 R2_DETAIL = "job can run on a runner not provably GitHub-hosted and has a trusted trigger: {events}"
+HOST_CREDENTIAL_DETAIL = "a credential resident on a self-hosted host read after pull-request code ran"
+# A non-empty host-fact value of the old contract form; ruling 8b8cede8: no verdict reads it.
+HOST_FACT_VALUE = {"boundary": True, "proof_test": "scripts/ci/tests/test_ci_tainted_job_boundary.py"}
 CLASS_IV = "iv"
 
 # ---------------------------------------------------------------------------------------
@@ -266,8 +270,8 @@ WF_LATE_CHECKOUT = HEADER + """\
           path: other
 """
 
-# Ruling 04701c74: a host-resident credential read after pull-request code is (i) on a
-# host runner; the same read on a GitHub-hosted VM reaches no resident credential.
+# Ruling 04701c74: a credential resident on a self-hosted host read after pull-request code
+# is (i); the same read on a GitHub-hosted VM reaches no resident credential.
 WF_HOST_CREDENTIAL = HEADER + """\
   host:
     runs-on: linux-fed
@@ -299,7 +303,7 @@ WF_HOST_CREDENTIAL = HEADER + """\
         run: test -r ~/.pgpass
 """
 
-# Text -> names a host-resident credential.
+# Text -> names a credential resident on a self-hosted host.
 HOST_CREDENTIAL_CASES = (
     ('url_file="$HOME/.ai-memory-ci-fed-url"', True),
     ("test -r ${HOME}/.pgpass", True),
@@ -727,14 +731,16 @@ class SyntheticCorpusVerdicts(unittest.TestCase):
         result = _scan({SYNTH: WF_LATE_CHECKOUT})
         self.assertEqual({(v.step, v.klass) for v in result.violations}, {("Second checkout", "i")})
 
-    def test_9452_host_resident_credential_read_after_pr_code_is_class_i(self) -> None:
+    def test_9452_credential_resident_on_a_self_hosted_host_read_after_pr_code_is_class_i(self) -> None:
         _need_module(self)
         result = _scan({SYNTH: WF_HOST_CREDENTIAL})
         got = {(v.job, v.step, v.klass) for v in result.violations}
         self.assertEqual(got, {("host", R2_STEP, "iv"), ("host", "Read url", "i"), ("host", "Read pgpass", "i")})
+        details = {v.detail for v in result.violations if v.klass == "i"}
+        self.assertEqual(details, {HOST_CREDENTIAL_DETAIL})
         self.assertEqual(result.verdicts[(SYNTH, "hosted")], "clean")
 
-    def test_9452_host_credential_path_forms(self) -> None:
+    def test_9452_credential_resident_on_a_self_hosted_host_forms(self) -> None:
         _need_module(self)
         for text, expected in HOST_CREDENTIAL_CASES:
             with self.subTest(text=text):
@@ -986,11 +992,26 @@ class PersistentRunnerTrustedTrigger(unittest.TestCase):
                 self.assertEqual(got, {(R2_STEP, CLASS_IV,
                                         R2_DETAIL.format(events="push, workflow_dispatch"))})
 
-    def test_9452_r2_reads_no_host_fact_contract(self) -> None:
+    def test_9452_r2_host_fact_table_is_pinned_empty(self) -> None:
         _need_module(self)
-        for name in ("RUNNER_BOUNDARY_FACTS", "BOUNDARY_REQUIRED_TRUE", "_boundary_holds"):
+        self.assertEqual(tb.RUNNER_BOUNDARY_FACTS, {})
+        for name in ("BOUNDARY_REQUIRED_TRUE", "_boundary_holds", "_leg_persistent"):
             with self.subTest(name=name):
                 self.assertFalse(hasattr(tb, name), name)
+
+    def test_9452_r2_non_empty_host_facts_clear_no_row(self) -> None:
+        _need_module(self)
+        workflows, actions, files = _real()
+        workflows = dict(workflows, **{SYNTH: SYNTH_WORKFLOW})
+        before = tb.scan_texts(workflows, actions, files)
+        labels = {"self-hosted", "linux-fed", "macos-fed", "linux-fed-pr", "ephemeral", "group:pr-tier"}
+        with mock.patch.dict(tb.RUNNER_BOUNDARY_FACTS, {lab: dict(HOST_FACT_VALUE) for lab in labels}):
+            after = tb.scan_texts(workflows, actions, files | {HOST_FACT_VALUE["proof_test"]})
+            problems = tb.check(after)
+        self.assertEqual(after.verdicts, before.verdicts)
+        self.assertEqual(after.violations, before.violations)
+        self.assertEqual([p for p in problems if p.startswith("stale allow row")], [])
+        self.assertEqual(after.verdicts[(HIT_WORKFLOW, HIT_JOB)], "i,iv")
 
     def test_9452_r2_real_rows_stay_open_under_the_runner_issue(self) -> None:
         _need_module(self)
