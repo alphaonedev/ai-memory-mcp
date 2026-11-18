@@ -4123,6 +4123,10 @@ mod tests {
     // `src/cli/backup/tests/signed_manifest_3199.rs`.
     mod signed_manifest_3199;
 
+    // v1.0.0 #8950 — a planted symlink at the snapshot or manifest name is
+    // refused; the table lives in `src/cli/backup/tests/symlink_follow_8950.rs`.
+    mod symlink_follow_8950;
+
     /// `stage_and_verify` never touches the target: that is the whole point
     /// of staging. Pinned directly so a future refactor cannot quietly move
     /// the verification after the swap.
