@@ -472,7 +472,8 @@ def address_space_ceiling():
     try:
         resource.setrlimit(resource.RLIMIT_AS, (ADDRESS_SPACE_CEILING, ADDRESS_SPACE_CEILING))
     except (OSError, ValueError):
-        pass
+        # A kernel that refuses the ceiling still runs the cell: the field assertions hold, only the cap is unproven.
+        return
 
 
 def command_lines(output):
@@ -536,7 +537,9 @@ class ProgressNotice(unittest.TestCase):
             except subprocess.TimeoutExpired:
                 os.killpg(process.pid, signal.SIGKILL)
                 process.communicate()
-                self.fail("%s: the heartbeat run passed the %.0f s wall ceiling (blocked)" % (name, RUN_CEILING_SECS))
+                raise self.failureException(
+                    "%s: the heartbeat run passed the %.0f s wall ceiling (blocked)" % (name, RUN_CEILING_SECS)
+                ) from None
         self.assertLess(time.monotonic() - started, RUN_CEILING_SECS, name)
         return subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
 
@@ -653,7 +656,9 @@ class ProgressNotice(unittest.TestCase):
         try:
             text = result.stdout.decode("utf-8")
         except UnicodeDecodeError as error:
-            self.fail("%s: stdout is not valid UTF-8 (%s): %r" % (name, error, result.stdout))
+            raise self.failureException(
+                "%s: stdout is not valid UTF-8 (%s): %r" % (name, error, result.stdout)
+            ) from error
         self.assertTrue(text.endswith("\n"), "%s: %r" % (name, text))
         self.assertEqual(text.count("\n"), EXPECTED_LINES, "%s: %r" % (name, text))
         self.assertEqual(len(text.splitlines()), EXPECTED_LINES, "%s: %r" % (name, text))
