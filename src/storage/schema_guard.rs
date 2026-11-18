@@ -457,9 +457,28 @@ pub fn schema_ahead_of(err: &anyhow::Error) -> Option<&SchemaAheadOfBinary> {
 pub const SCHEMA_BEHIND_READ_ONLY_REFUSAL: &str =
     crate::errors::error_codes::SCHEMA_BEHIND_READ_ONLY_REFUSAL;
 
-/// Repair verb named in the schema-behind refusal (and in `boot` / `doctor`
-/// copy). One spelling so the hardcoded-literals ratchet does not re-grow.
+/// Repair verb named in the SQLITE schema-behind refusal (and in `boot` /
+/// `doctor` copy, which only ever read a sqlite file). One spelling so the
+/// hardcoded-literals ratchet does not re-grow. A postgres store is repaired
+/// by [`SCHEMA_BEHIND_REPAIR_POSTGRES`]; select by backend with
+/// [`schema_behind_repair`].
 pub const SCHEMA_BEHIND_REPAIR: &str = "ai-memory migrate --in-place";
+
+/// v1.0.0 #9504 — repair verb for a POSTGRES store that is behind: opening the
+/// store runs the upgrade ladder (`docs/postgres-age-guide.md`, "Old postgres
+/// schema version detected"; `schema-init` is `--features sal`).
+pub const SCHEMA_BEHIND_REPAIR_POSTGRES: &str = "ai-memory schema-init --store-url <url>";
+
+/// v1.0.0 #9504 — the schema-behind repair verb that is right for `backend`
+/// ([`BACKEND_SQLITE`] or [`BACKEND_POSTGRES`]); every renderer calls this.
+#[must_use]
+pub fn schema_behind_repair(backend: &str) -> &'static str {
+    if backend == BACKEND_POSTGRES {
+        SCHEMA_BEHIND_REPAIR_POSTGRES
+    } else {
+        SCHEMA_BEHIND_REPAIR
+    }
+}
 
 /// Companion repair: starting the daemon runs [`crate::db::open`], which
 /// migrates. Named next to [`SCHEMA_BEHIND_REPAIR`] because the default
@@ -517,7 +536,7 @@ fn render_behind(observed: i64, supported: i64, backend: &str, target: &str) -> 
          migrate. Repair: `{repair}` or {daemon}, then re-run.",
         slug = SCHEMA_BEHIND_READ_ONLY_REFUSAL,
         bin = crate::PKG_VERSION,
-        repair = SCHEMA_BEHIND_REPAIR,
+        repair = schema_behind_repair(backend),
         daemon = SCHEMA_BEHIND_REPAIR_DAEMON,
     )
 }
