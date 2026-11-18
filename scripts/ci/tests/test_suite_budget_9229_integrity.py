@@ -38,8 +38,8 @@ import sys
 import time
 import traceback
 import unittest
+import unittest.mock as mock
 from pathlib import Path
-from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 
@@ -634,7 +634,7 @@ def call_main(sb, argv):
             rc = sb.main(argv)
         except SystemExit as exc:
             rc = "SystemExit %r" % (exc.code,)
-        except BaseException:  # a traceback is the defect under test
+        except Exception:  # a traceback is the defect under test
             rc = "traceback: " + traceback.format_exc(limit=1).splitlines()[-1]
     return rc, out.getvalue() + err.getvalue()
 
@@ -762,7 +762,7 @@ class InputTotality(unittest.TestCase):
                 rc = self.sb.main(argv)
             except SystemExit as exc:
                 rc = exc.code
-            except BaseException:  # a traceback is the defect under test
+            except Exception:  # a traceback is the defect under test
                 rc = "traceback: " + traceback.format_exc(limit=1).splitlines()[-1]
         return rc, out.getvalue() + err.getvalue()
 

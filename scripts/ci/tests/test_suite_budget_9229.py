@@ -25,8 +25,8 @@ import tempfile
 import textwrap
 import time
 import unittest
+import unittest.mock as mock
 from pathlib import Path
-from unittest import mock
 
 REPO = Path(__file__).resolve().parents[3]
 SCRIPT = REPO / "scripts" / "ci" / "suite_budget.py"
