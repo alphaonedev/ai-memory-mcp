@@ -17,7 +17,9 @@ E-2/F-1 three kinds never mixed: a row in the table of another kind is a failure
 E-4/F-2 all rows applied: zero findings and exactly three not-analysed lines; any ONE row
         removed: exactly that form, line or violation, with its exact reason text. This is a proof
         for what the scan reaches only.
-E-5     NO-CLASS rows (dunder, arithmetic) and every row of a gate-step issue carry the mark.
+E-5     every row carries the gate-step mark exactly when its place is a gate step (its job is a
+        gate job of its workflow file, or its step is the gate step of job check), whatever its
+        issue; the NO-CLASS rows (dunder, arithmetic) sit in gate steps.
 F-5     a pin above its row count fails; the header states the removal rule.
 
 Every corpus is a named constant; every cell works on in-memory text. No file is written and no
@@ -73,10 +75,26 @@ PINS_LINE = "unclassifiable 41; not-analysed 3; violation 17"
 OPEN_ROW_ISSUES = frozenset(range(9533, 9540)) | frozenset(range(9544, 9550))
 NOT_ANALYSED_ROW_ISSUES = frozenset({9550, 9551, 9552})
 VIOLATION_ROW_ISSUES = frozenset({9454, 9455, 9456, 9471, 9553})
-# Gate-step issues (E-5): a change there needs the conductor's word.
-OPEN_GATE_ISSUES = frozenset({9536, 9537, 9548, 9549})
-NOT_ANALYSED_GATE_ISSUES = frozenset({9550, 9551})
-VIOLATION_GATE_ISSUES = frozenset({9553})
+# Gate-step places (E-5, conductor's word b29): a change there needs the conductor's word. The
+# mark follows the place: the gate jobs of each workflow file and the one gate step of job check.
+GATE_JOBS = {"ci.yml": frozenset({"classify", "select", "ci-gate"}), "coverage.yml": frozenset({"classify"})}
+GATE_STEPS = {("ci.yml", "check"): frozenset({"Run tests (impact-aware)"})}
+# One place of each clause, each with a real row; a synthetic workflow of that name puts a row there.
+GATE_PLACES = (
+    ("ci.yml", "classify", STEP),
+    ("ci.yml", "select", STEP),
+    ("ci.yml", "ci-gate", STEP),
+    ("coverage.yml", "classify", STEP),
+    ("ci.yml", "check", "Run tests (impact-aware)"),
+)
+# Places one field away from a gate step: another job, another workflow file, another step of check.
+NOT_GATE_PLACES = (
+    (SYNTH, JOB, STEP),
+    ("ci.yml", "check", STEP),
+    ("coverage.yml", "select", STEP),
+    ("coverage.yml", "check", "Run tests (impact-aware)"),
+    (SYNTH, "classify", STEP),
+)
 # Bad values of the issue field per kind: another kind's issue, a neighbour, not a plain int.
 BAD_OPEN_ISSUES = (9532, 9540, 9543, 9550, 9553, 9454, 0, None, True, "9533")
 BAD_NOT_ANALYSED_ISSUES = (9549, 9553, 9533, 9454, 0, None, True, "9550")
@@ -217,7 +235,7 @@ def _open(form: str = FORM_NOT_LISTED, operand: str = "apt-get", issue: object =
 
 
 def _stop(reason: str = BEHIND_SILENT[0][1], note: str = BEHIND_SILENT[0][2], operand: str = "--version",
-          issue: object = 9551, gate_step: object = True, workflow: str = SYNTH, job: str = JOB, step: str = STEP,
+          issue: object = 9551, gate_step: object = False, workflow: str = SYNTH, job: str = JOB, step: str = STEP,
           marker: str = NOT_ANALYSED_MARKER) -> object:
     return tb.NotAnalysedRow(workflow, job, step, FORM_NO_CLASS, operand, reason, note, issue, gate_step, marker)
 
@@ -334,7 +352,7 @@ class RowTables(unittest.TestCase):
                 group = (row.form, row.reason if row.form == FORM_NO_CLASS else row.operand)
                 self.assertIs(type(row.issue), int)
                 self.assertEqual(row.issue, GROUP_ISSUES[group])
-                self.assertIs(row.gate_step, row.issue in OPEN_GATE_ISSUES)
+                self.assertIs(row.gate_step, tb.gate_step_of(row.workflow, row.job, row.step))
         self.assertEqual({r.issue for r in tb.OPEN_ROWS}, OPEN_ROW_ISSUES)
 
     def test_9452_not_analysed_rows_are_exactly_the_three_stopping_forms(self) -> None:
@@ -357,14 +375,16 @@ class RowTables(unittest.TestCase):
                          sorted((wf, job, step, (klass,)) for wf, job, step, klass, _ in REAL_NEW_VIOLATIONS))
         for row in tb.TAINT_ALLOW:
             with self.subTest(row=_place(row)):
-                self.assertIs(row.gate_step, row.issue in VIOLATION_GATE_ISSUES)
+                self.assertIs(row.gate_step, tb.gate_step_of(row.workflow, row.job, row.step))
 
     def test_9452_fixed_issue_and_gate_sets(self) -> None:
         _need_module(self)
         self.assertEqual((tb.OPEN_ROW_ISSUES, tb.NOT_ANALYSED_ROW_ISSUES, tb.FIX_ISSUES),
                          (OPEN_ROW_ISSUES, NOT_ANALYSED_ROW_ISSUES, VIOLATION_ROW_ISSUES))
-        self.assertEqual((tb.OPEN_GATE_ISSUES, tb.NOT_ANALYSED_GATE_ISSUES, tb.VIOLATION_GATE_ISSUES),
-                         (OPEN_GATE_ISSUES, NOT_ANALYSED_GATE_ISSUES, VIOLATION_GATE_ISSUES))
+        self.assertEqual((tb.GATE_JOBS, tb.GATE_STEPS), (GATE_JOBS, GATE_STEPS))
+        # The gate-step set is derived from the place: no issue-keyed gate set is left.
+        for name in ("OPEN_GATE_ISSUES", "NOT_ANALYSED_GATE_ISSUES", "VIOLATION_GATE_ISSUES"):
+            self.assertFalse(hasattr(tb, name), name)
         sets = (OPEN_ROW_ISSUES, NOT_ANALYSED_ROW_ISSUES, VIOLATION_ROW_ISSUES)
         self.assertEqual([a & b for i, a in enumerate(sets) for b in sets[i + 1:]], [frozenset()] * 3)
 
@@ -438,7 +458,7 @@ class OneRowOneForm(unittest.TestCase):
             with self.subTest(form=form, operand=operand):
                 text = _wf({JOB: [(STEP, _form_text(form, operand) + "\n" + _form_text(form, operand))]})
                 result = _scan({SYNTH: text})
-                row = _open(form, operand, issue, issue in OPEN_GATE_ISSUES)
+                row = _open(form, operand, issue)
                 self.assertEqual(tb.check(result, (), 0, (row,), 1), [])
                 # A row-covered job is NOT shown to hold the boundary.
                 self.assertEqual(result.verdicts[(SYNTH, JOB)], tb.UNCLASSIFIABLE)
@@ -485,7 +505,7 @@ class OneRowOneForm(unittest.TestCase):
         for (form, operand), issue in GROUP_ISSUES.items():
             if form == FORM_NO_CLASS:
                 continue
-            row = _open(form, operand, issue, issue in OPEN_GATE_ISSUES)
+            row = _open(form, operand, issue)
             for second_form, second_operand in SECOND_OPERANDS.items():
                 for first, last in (((form, operand), (second_form, second_operand)),
                                     ((second_form, second_operand), (form, operand))):
@@ -516,7 +536,7 @@ class OneRowOneForm(unittest.TestCase):
             if form == FORM_NO_CLASS:
                 continue
             text = _form_text(form, operand)
-            row = _open(form, operand, issue, issue in OPEN_GATE_ISSUES)
+            row = _open(form, operand, issue)
             cases = (
                 ({SYNTH: _wf({JOB: [(STEP, text), (OTHER_STEP, text)]})}, (SYNTH, JOB, OTHER_STEP)),
                 ({SYNTH: _wf({JOB: [(STEP, text)], OTHER_JOB: [(STEP, text)]})}, (SYNTH, OTHER_JOB, STEP)),
@@ -574,7 +594,7 @@ class KindsNeverMix(unittest.TestCase):
                                  [f"violation class ({klass}) without an allow row: {wf}/{job}/{step}: {detail}"])
         # A violation row at the step of a form never covers the form.
         workflows = {SYNTH: _wf({JOB: [(STEP, _form_text(FORM_NOT_LISTED, "apt-get"))]})}
-        allow = (tb.AllowRow(SYNTH, JOB, STEP, ("iii",), 9553, True),)
+        allow = (tb.AllowRow(SYNTH, JOB, STEP, ("iii",), 9553),)
         self.assertEqual(sorted(_problems(workflows, allow=allow)),
                          sorted([f"stale allow row (no longer violates class iii): {SYNTH}/{JOB}/{STEP}",
                                  UNCLASSIFIABLE_PREFIX
@@ -673,7 +693,7 @@ class CannotContinue(unittest.TestCase):
 
     def test_9452_a_form_behind_a_stopping_form_is_not_covered_by_silence(self) -> None:
         _need_module(self)
-        for (run, reason, note), (_, issue, gate) in zip(BEHIND_SILENT, NOT_ANALYSED_ISSUES):
+        for (run, reason, note), (_, issue, _) in zip(BEHIND_SILENT, NOT_ANALYSED_ISSUES):
             with self.subTest(run=run):
                 result = _scan({SYNTH: _wf({JOB: [(STEP, run)]})})
                 # The hidden form is not reported: only the stopping form, with its line.
@@ -683,7 +703,7 @@ class CannotContinue(unittest.TestCase):
                 self.assertEqual(_problems({SYNTH: _wf({JOB: [(STEP, run)]})}),
                                  [f"{NOT_ANALYSED_PREFIX}{_message(SYNTH, JOB, STEP, reason)}: {note}"])
                 operand = tb.form_class(reason)[1]
-                row = _stop(reason=reason, note=note, operand=operand, issue=issue, gate_step=gate)
+                row = _stop(reason=reason, note=note, operand=operand, issue=issue)
                 self.assertEqual(tb.check(result, (), 0, (), 0, (row,), 1), [])
                 self.assertEqual(tb.not_analysed_lines(result, (row,)),
                                  [_not_analysed_line(SYNTH, JOB, STEP, reason, note, issue)])
@@ -691,8 +711,8 @@ class CannotContinue(unittest.TestCase):
     def test_9452_a_form_after_the_stopping_command_is_reported(self) -> None:
         _need_module(self)
         later = UNCLASSIFIABLE_PREFIX + _message(SYNTH, JOB, STEP, _reason(FORM_NOT_LISTED, LATER_FORM))
-        for (run, reason, note), (_, issue, gate) in zip(BEHIND_SILENT, NOT_ANALYSED_ISSUES):
-            row = _stop(reason=reason, note=note, operand=tb.form_class(reason)[1], issue=issue, gate_step=gate)
+        for (run, reason, note), (_, issue, _) in zip(BEHIND_SILENT, NOT_ANALYSED_ISSUES):
+            row = _stop(reason=reason, note=note, operand=tb.form_class(reason)[1], issue=issue)
             for sep in LATER_SEPARATORS:
                 with self.subTest(run=run, sep=sep):
                     text = _wf({JOB: [(STEP, run + sep + LATER_FORM)]})
@@ -771,37 +791,61 @@ class Pins(unittest.TestCase):
                 row = tb.AllowRow(SYNTH, JOB, STEP, ("i",), issue)
                 self.assertIn(f"allow row without an open fix issue: {SYNTH}/{JOB}/{STEP}", tb.check(result, (row,), 1))
 
-    def test_9452_gate_step_marks_exactly_the_gate_step_issue_rows(self) -> None:
+    def test_9452_every_row_gate_step_mark_follows_its_job_and_step(self) -> None:
         _need_module(self)
-        for rows, gates in ((tb.OPEN_ROWS, OPEN_GATE_ISSUES), (tb.NOT_ANALYSED_ROWS, NOT_ANALYSED_GATE_ISSUES),
-                            (tb.TAINT_ALLOW, VIOLATION_GATE_ISSUES)):
-            marked = [r for r in rows if r.gate_step is True]
-            self.assertEqual(marked, [r for r in rows if r.issue in gates])
-            self.assertEqual({r.issue for r in marked}, gates)
+        # The mark of every row of the three tables is the one the place rule derives; a row
+        # that disagrees is named with its kind, place, operand (a form row), issue and both marks.
+        wrong = [f"{type(r).kind} row {_place(r)}{' ' + repr(r.operand) if hasattr(r, 'operand') else ''} "
+                 f"(#{r.issue}): mark {r.gate_step!r}, "
+                 f"place gives {tb.gate_step_of(r.workflow, r.job, r.step)!r}"
+                 for rows in _tables().values() for r in rows
+                 if type(r.gate_step) is not bool or r.gate_step is not tb.gate_step_of(r.workflow, r.job, r.step)]
+        self.assertEqual(wrong, [])
         # E-5: the NO-CLASS dunder and arithmetic rows are gate steps.
         no_class = [r for r in tb.OPEN_ROWS + tb.NOT_ANALYSED_ROWS
                     if r.reason in ("python code uses a dunder name", NOT_ANALYSED_ISSUES[0][0])]
         self.assertEqual(len(no_class), 3)
         self.assertEqual({r.gate_step for r in no_class}, {True})
 
+    def test_9452_gate_step_rule_names_exactly_the_gate_places(self) -> None:
+        _need_module(self)
+        for place in GATE_PLACES + NOT_GATE_PLACES:
+            with self.subTest(place=place):
+                self.assertIs(tb.gate_step_of(*place), place in GATE_PLACES)
+        # Every clause of the rule holds a real row, so dropping a clause turns a real row red.
+        real_places = {(r.workflow, r.job) for rows in _tables().values() for r in rows if r.gate_step}
+        for workflow, jobs in GATE_JOBS.items():
+            for job in jobs:
+                self.assertIn((workflow, job), real_places)
+        real_steps = {(r.workflow, r.job, r.step) for rows in _tables().values() for r in rows}
+        for (workflow, job), steps in GATE_STEPS.items():
+            for step in steps:
+                self.assertIn((workflow, job, step), real_steps)
+
     def test_9452_check_refuses_a_wrong_gate_step_mark(self) -> None:
         _need_module(self)
-        workflows = {SYNTH: _wf({JOB: [(STEP, _form_text(FORM_NOT_LISTED, "apt-get"))]})}
-        for issue, gate in ((9536, False), (9537, False), (9548, False), (9549, False), (9533, True), (9534, True), (9536, 1)):
-            with self.subTest(kind=KIND_UNCLASSIFIABLE, issue=issue, gate=gate):
-                self.assertIn(f"open row gate-step mark does not match issue {issue}: {SYNTH}/{JOB}/{STEP}",
-                              _problems(workflows, (_open(issue=issue, gate_step=gate),)))
-        stop_wf = {SYNTH: _wf({JOB: [(STEP, BEHIND_SILENT[0][0])]})}
-        for issue, gate in ((9550, False), (9551, False), (9552, True), (9551, 1)):
-            with self.subTest(kind=KIND_NOT_ANALYSED, issue=issue, gate=gate):
-                self.assertIn(f"not-analysed row gate-step mark does not match issue {issue}: {SYNTH}/{JOB}/{STEP}",
-                              _problems(stop_wf, stops=(_stop(issue=issue, gate_step=gate),)))
-        result = _scan({SYNTH: _wf({JOB: [(STEP, "echo done")]})})
-        for issue, gate in ((9553, False), (9455, True), (9553, 1)):
-            with self.subTest(kind=KIND_VIOLATION, issue=issue, gate=gate):
-                row = tb.AllowRow(SYNTH, JOB, STEP, ("i",), issue, gate)
-                self.assertIn(f"allow row gate-step mark does not match issue {issue}: {SYNTH}/{JOB}/{STEP}",
-                              tb.check(result, (row,), 1))
+        # The mark follows the place, for every issue of every kind: the wrong bool and a
+        # non-bool are failures; the right bool is not.
+        for workflow, job, step in GATE_PLACES + NOT_GATE_PLACES:
+            right = (workflow, job, step) in GATE_PLACES
+            result = _scan({workflow: _wf({job: [(step, "echo done")]})})
+            makers = (
+                ("open row", lambda i, g: dict(open_rows=(_open(issue=i, gate_step=g, workflow=workflow, job=job,
+                                                               step=step),), open_pin=1), OPEN_ROW_ISSUES),
+                ("not-analysed row", lambda i, g: dict(not_analysed=(_stop(issue=i, gate_step=g, workflow=workflow,
+                                                                         job=job, step=step),), not_analysed_pin=1),
+                 NOT_ANALYSED_ROW_ISSUES),
+                ("allow row", lambda i, g: dict(allow=(tb.AllowRow(workflow, job, step, ("i",), i, g),), pin=1),
+                 VIOLATION_ROW_ISSUES),
+            )
+            line = f"gate-step mark does not match its place: {workflow}/{job}/{step}"
+            for word, make, issues in makers:
+                for issue in sorted(issues):
+                    with self.subTest(place=(workflow, job, step), kind=word, issue=issue):
+                        base = dict(allow=(), pin=0)
+                        self.assertNotIn(f"{word} {line}", tb.check(result, **{**base, **make(issue, right)}))
+                        for bad in (not right, int(right)):
+                            self.assertIn(f"{word} {line}", tb.check(result, **{**base, **make(issue, bad)}))
 
     def test_9452_header_states_the_pins_and_the_removal_rule(self) -> None:
         _need_module(self)

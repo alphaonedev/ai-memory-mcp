@@ -1127,8 +1127,13 @@ class AllowTable(unittest.TestCase):
         new = [r for r in tb.TAINT_ALLOW if r.issue == NEW_VIOLATION_ISSUE]
         self.assertEqual(sorted((r.workflow, r.job, r.step, r.classes) for r in new),
                          sorted((wf, job, step, (klass,)) for wf, job, step, klass, _ in REAL_NEW_VIOLATIONS))
-        # The 13 rows before PR 9508 keep their issues and are not gate steps; the 4 new rows are.
-        self.assertEqual([r.gate_step for r in tb.TAINT_ALLOW], [r.issue == NEW_VIOLATION_ISSUE for r in tb.TAINT_ALLOW])
+        # The mark follows the place: the rows in a gate job (ci.yml classify, select; coverage.yml
+        # classify) are gate steps, the 9454 row in ci.yml classify among them; no other row is.
+        gate_places = ({(wf, job, step) for wf, job, step, _, _ in REAL_NEW_VIOLATIONS}
+                       | {("ci.yml", "classify", "id:impact")})
+        self.assertEqual([r.gate_step for r in tb.TAINT_ALLOW],
+                         [(r.workflow, r.job, r.step) in gate_places for r in tb.TAINT_ALLOW])
+        self.assertEqual(sum(r.gate_step for r in tb.TAINT_ALLOW), 5)
 
     def test_9452_new_workflow_with_a_violating_job_and_no_row_fails(self) -> None:
         _need_module(self)

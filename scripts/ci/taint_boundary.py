@@ -21,8 +21,9 @@ form class (or NO-CLASS with the exact reason), operand and one issue of its kin
 set; it covers that one form or violation and nothing else, and a row of one kind never
 covers a finding or line of another kind. The scan goes on past a covered form to the end
 of the job, so every other form and every violation of that job is still reported. A row
-that matches nothing is stale, and a stale row is a failure. Rows whose issue is in a
-gate-step set carry the gate-step mark: a change there needs the conductor's word.
+that matches nothing is stale, and a stale row is a failure. A row carries the gate-step mark
+exactly when its place is a gate step (``gate_step_of``: a gate job in ``GATE_JOBS`` or a step
+in ``GATE_STEPS``), whatever its issue: a change there needs the conductor's word.
 Removal rule: the fix PR of an issue deletes its rows and lowers that kind's pin in the same
 commit; each pin only goes down, a pin above its ceiling in ``PIN_CEILINGS`` is a failure and
 a pin that differs from its row count is a failure. Pins at PR 9508: unclassifiable 41,
@@ -185,7 +186,8 @@ class AllowRow:
 # lifetime-tests (ruling abf38892 section 7). Removing a row is the fix lane's job; adding a
 # row needs an issue number from the deputy (the pin moves with it).
 TAINT_ALLOW: tuple[AllowRow, ...] = (
-    AllowRow("ci.yml", "classify", "id:impact", (CLASS_GATE_OUTPUT,), 9454),
+    # In gate job classify of ci.yml: a gate step (the mark follows the place).
+    AllowRow("ci.yml", "classify", "id:impact", (CLASS_GATE_OUTPUT,), 9454, True),
     AllowRow("c8-precheck.yml", "required-contexts-gate",
              # The workflow name runs into a YAML comment at ` #`; the label is the parsed name.
              "Declared-vs-live required-context drift (#3554 /", (CLASS_SECRET,), 9471),
@@ -218,7 +220,6 @@ TAINT_ALLOW_PIN = 17
 # The open fix issues a violation row may name (the fixed set of that kind); a row naming any
 # other value is a finding.
 FIX_ISSUES = frozenset({9454, 9455, 9456, 9471, 9553})
-VIOLATION_GATE_ISSUES = frozenset({9553})
 
 # The four form classes a row may name; a form of no class is named by NO-CLASS and its reason.
 FORM_COMMAND_NOT_LITERAL = "command-word-not-literal"
@@ -239,13 +240,21 @@ NO_OPERAND = "-"
 # The fixed issue sets per kind (ruling f367b2f1 and FINAL 0773f6ce).
 OPEN_ROW_ISSUES = frozenset(range(9533, 9540)) | frozenset(range(9544, 9550))
 NOT_ANALYSED_ROW_ISSUES = frozenset({9550, 9551, 9552})
-OPEN_GATE_ISSUES = frozenset({9536, 9537, 9548, 9549})
-NOT_ANALYSED_GATE_ISSUES = frozenset({9550, 9551})
 NOT_ANALYSED_MARKER = "rest-not-analysed"
 # Each pin only goes down; a pin above its ceiling is a failure.
 PIN_CEILINGS = {KIND_UNCLASSIFIABLE: 41, KIND_VIOLATION: 17, KIND_NOT_ANALYSED: 3}
 # Characters no workflow, job, step or operand of a row may hold: a row names one place.
 ROW_GLOB_CHARS = frozenset("*?[]{}")
+# The gate-step places (conductor's word, b29): a change there needs the conductor's word. The
+# mark of a row follows its place, never its issue: the gate jobs of each workflow file, and the
+# one gate step of job check.
+GATE_JOBS: dict[str, frozenset[str]] = {
+    "ci.yml": frozenset({"classify", "select", "ci-gate"}),
+    "coverage.yml": frozenset({"classify"}),
+}
+GATE_STEPS: dict[tuple[str, str], frozenset[str]] = {
+    ("ci.yml", "check"): frozenset({"Run tests (impact-aware)"}),
+}
 ARITH_NOTE = "the command substitution inside the arithmetic expansion is not analysed"
 PARAM_NOTE = "the command substitution inside the parameter expansion is not analysed"
 REST_OF_COMMAND_NOTE = "command {name!r}: the rest of this command is not analysed after this form"
@@ -283,11 +292,18 @@ class NotAnalysedRow:
     marker: str = NOT_ANALYSED_MARKER
 
 
+def gate_step_of(workflow: str, job: str, step: str) -> bool:
+    """The gate-step mark a row at this place carries: its job is a gate job of its workflow
+    file, or its step is the gate step of that job."""
+    return job in GATE_JOBS.get(workflow, frozenset()) or step in GATE_STEPS.get((workflow, job), frozenset())
+
+
 def _o(workflow: str, job: str, step: str, form: str, operand: str, issue: int) -> OpenRow:
-    """An open row of a classed form; the reason is the text that form raises."""
+    """An open row of a classed form; the reason is the text that form raises and the mark is the
+    one its place gives."""
     template = next(t for t, f in FORM_TEMPLATES.items() if f == form)
     return OpenRow(workflow, job, step, form, operand, template.replace("<X>", repr(operand)), issue,
-                   issue in OPEN_GATE_ISSUES)
+                   gate_step_of(workflow, job, step))
 
 
 _BATMAN = "batman-mode-acceptance.yml"
@@ -3989,7 +4005,14 @@ def _pin_problems(kind: str, count: int, pin: int, table: str) -> list[str]:
     return out
 
 
-def _form_row_problems(rows: list, word: str, issues: frozenset[int], gates: frozenset[int]) -> list[str]:
+def _gate_mark_problems(row: object, word: str) -> list[str]:
+    """A row whose gate-step mark is not the plain bool its place gives is a failure."""
+    if type(row.gate_step) is not bool or row.gate_step is not gate_step_of(row.workflow, row.job, row.step):
+        return [f"{word} gate-step mark does not match its place: {_place(row)}"]
+    return []
+
+
+def _form_row_problems(rows: list, word: str, issues: frozenset[int]) -> list[str]:
     """Shape of the rows of a form kind: exact place, known form, its own reason, fixed issue, gate mark."""
     problems: list[str] = []
     for row in rows:
@@ -4002,8 +4025,7 @@ def _form_row_problems(rows: list, word: str, issues: frozenset[int], gates: fro
         # bool is an int subclass: only a plain int of the fixed set counts.
         if type(row.issue) is not int or row.issue not in issues:
             problems.append(f"{word} without an issue of the fixed set: {place}")
-        if type(row.gate_step) is not bool or row.gate_step != (row.issue in gates):
-            problems.append(f"{word} gate-step mark does not match issue {row.issue}: {place}")
+        problems += _gate_mark_problems(row, word)
     return problems
 
 
@@ -4039,9 +4061,7 @@ def _violation_problems(result: ScanResult, allow: list[AllowRow]) -> list[str]:
         # bool is an int subclass: only a plain int naming an open fix issue counts.
         if type(row.issue) is not int or row.issue not in FIX_ISSUES:
             problems.append(f"allow row without an open fix issue: {row.workflow}/{row.job}/{row.step}")
-        if type(row.gate_step) is not bool or row.gate_step != (row.issue in VIOLATION_GATE_ISSUES):
-            problems.append(f"allow row gate-step mark does not match issue {row.issue}: "
-                            f"{row.workflow}/{row.job}/{row.step}")
+        problems += _gate_mark_problems(row, "allow row")
         if not row.classes or any(k not in CLASSES for k in row.classes):
             problems.append(f"allow row with an unknown class: {row.workflow}/{row.job}/{row.step}")
         # A row of a job that stopped on an Unclassifiable raise is not stale: its verdict is
@@ -4073,8 +4093,8 @@ def _found_key(form: Form) -> tuple[str, ...]:
 def _form_problems(result: ScanResult, opens: list[OpenRow], stops: list[NotAnalysedRow]) -> list[str]:
     """A form is covered only by the one row of its kind that names it: an unclassifiable form by
     an open row, a form with a not-analysed line by a not-analysed row with that exact line."""
-    problems = _form_row_problems(opens, "open row", OPEN_ROW_ISSUES, OPEN_GATE_ISSUES)
-    problems += _form_row_problems(stops, "not-analysed row", NOT_ANALYSED_ROW_ISSUES, NOT_ANALYSED_GATE_ISSUES)
+    problems = _form_row_problems(opens, "open row", OPEN_ROW_ISSUES)
+    problems += _form_row_problems(stops, "not-analysed row", NOT_ANALYSED_ROW_ISSUES)
     for row in stops:
         if row.marker != NOT_ANALYSED_MARKER or not _exact_name(row.note):
             problems.append(f"not-analysed row without the {NOT_ANALYSED_MARKER} mark and its line: {_place(row)}")
