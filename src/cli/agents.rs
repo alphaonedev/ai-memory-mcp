@@ -13,26 +13,15 @@ use anyhow::{Context as _, Result};
 use clap::{Args, Subcommand};
 use std::path::Path;
 
-/// #3781 — the non-argv channel for the `bind-api-key` token (the #1927 /
-/// `AI_MEMORY_STORE_URL_FILE` class). A token on `--token` argv is world-readable
-/// via `/proc/<pid>/cmdline` and `ps auxww`, so it is REFUSED; the token is read
-/// from a `0600` file named by `--token-file` or this owner-only env var.
-const AGENT_API_KEY_FILE_ENV: &str = "AI_MEMORY_AGENT_API_KEY_FILE";
-/// Escape hatch for the strict-permission check on the api-key token file
-/// (mirrors `AI_MEMORY_CAPABILITY_FILE_ALLOW_LAX_PERMS`).
-// #3813: `pub` under test/test-support so the integration binary
-// tests/lax_perms_hatches_doctor_sink_3813.rs can name this const; `pub(crate)`
-// in production so the shipped surface is UNCHANGED. Not blanket `pub`: the
-// env-name const is a caller-dependable surface and only the test needs it wider,
-// and the const is production-used so it cannot be cfg-gated away (the
-// test_key_dir Option-2 shape). Its sibling STORE_URL_FILE_ALLOW_LAX_PERMS_ENV is
-// already blanket-pub; this reaches for the smaller widening per the #3783 order.
+// #9367 V-1 — the env names and the reader live in the neutral
+// `crate::agent_key_file` module the MCP forwarder shares. The lax-perms name
+// keeps its #3813 `pub` (test/test-support) / `pub(crate)` pair here so
+// `crate::cli::agents::AGENT_API_KEY_FILE_ALLOW_LAX_PERMS_ENV` still resolves.
 #[cfg(any(test, feature = "test-support"))]
-pub const AGENT_API_KEY_FILE_ALLOW_LAX_PERMS_ENV: &str =
-    "AI_MEMORY_AGENT_API_KEY_FILE_ALLOW_LAX_PERMS";
+pub use crate::agent_key_file::AGENT_API_KEY_FILE_ALLOW_LAX_PERMS_ENV;
 #[cfg(not(any(test, feature = "test-support")))]
-pub(crate) const AGENT_API_KEY_FILE_ALLOW_LAX_PERMS_ENV: &str =
-    "AI_MEMORY_AGENT_API_KEY_FILE_ALLOW_LAX_PERMS";
+pub(crate) use crate::agent_key_file::AGENT_API_KEY_FILE_ALLOW_LAX_PERMS_ENV;
+use crate::agent_key_file::{AGENT_API_KEY_FILE_ENV, read_api_key_token_file};
 
 #[derive(Args)]
 pub struct AgentsArgs {
@@ -331,54 +320,6 @@ pub(crate) fn resolve_bind_api_key_token(
         "bind-api-key: no api-key token — supply `--token-file <0600 path>` or set \
          `{AGENT_API_KEY_FILE_ENV}` (a token on `--token` argv is refused; #3781)."
     )
-}
-
-/// Read the api-key token from a `0600` file (the #1927 non-argv channel;
-/// mirrors [`crate::governance::capability::capability_from_file`]).
-///
-/// # Errors
-///
-/// - the file cannot be opened or read;
-/// - (unix) its mode grants group/world access and
-///   [`AGENT_API_KEY_FILE_ALLOW_LAX_PERMS_ENV`] is not set;
-/// - the file is empty after trimming.
-fn read_api_key_token_file(path: &Path) -> Result<String> {
-    let raw = std::fs::read_to_string(path)
-        .with_context(|| format!("reading api-key token file {}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        let mode = std::fs::metadata(path)
-            .with_context(|| format!("stat api-key token file {} for permissions", path.display()))?
-            .permissions()
-            .mode()
-            & 0o777;
-        if mode & 0o077 != 0 {
-            let lax = std::env::var(AGENT_API_KEY_FILE_ALLOW_LAX_PERMS_ENV)
-                .map(|v| crate::security_profile::is_truthy(&v))
-                .unwrap_or(false);
-            if lax {
-                tracing::warn!(
-                    path = %path.display(),
-                    mode = format!("{mode:o}"),
-                    "read_api_key_token_file: file is group/world-readable;                      {AGENT_API_KEY_FILE_ALLOW_LAX_PERMS_ENV}=1 — accepting (UNSAFE)."
-                );
-            } else {
-                anyhow::bail!(
-                    "api-key token file {} has lax permissions (mode {:o}, group/world bits set);                      tighten with `chmod 0600 {}` OR set {}=1 to opt out",
-                    path.display(),
-                    mode,
-                    path.display(),
-                    AGENT_API_KEY_FILE_ALLOW_LAX_PERMS_ENV,
-                );
-            }
-        }
-    }
-    let token = raw.trim().to_string();
-    if token.is_empty() {
-        anyhow::bail!("api-key token file {} is empty", path.display());
-    }
-    Ok(token)
 }
 
 fn refuse_store_url_on_sqlite_path(store_url: Option<&str>, verb: &str) -> anyhow::Result<()> {

@@ -43,6 +43,8 @@ pub(crate) fn forward_to_http(
     url: &str,
     body: Option<&Value>,
     extra_headers: &[(&str, String)],
+    api_key: Option<&str>,
+    keyed_agent: Option<&str>,
 ) -> Result<Value, String> {
     // #3711 — the forward URL is operator config and may carry userinfo
     // (`https://user:pw@host/…`); every rendering of it is the allowlist
@@ -54,8 +56,13 @@ pub(crate) fn forward_to_http(
     // this installation wrote (zero-config TLS). Only the local CA: this is
     // the same-installation trust, never a peer's certificate. A CA file
     // that exists but does not parse is an error, not silently ignored.
-    let mut builder =
-        reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(15));
+    // #9367 K-3 / V-2 — no redirect is followed: a 3xx is the status error
+    // below, so a request that carries the per-agent key reaches the
+    // configured origin and no other (redirect policy none, not header
+    // stripping).
+    let mut builder = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .redirect(reqwest::redirect::Policy::none());
     // The load error names the key directory on disk (an operator path):
     // that belongs in the operator log, never in the MCP caller's error
     // text (gate 7, #3688/7 — surfaced on the #3705+#3711 resolved tree).
@@ -79,6 +86,15 @@ pub(crate) fn forward_to_http(
     for (k, v) in extra_headers {
         req = req.header(*k, v);
     }
+    if let Some(key) = api_key {
+        // #9367 K-4 — the value is marked sensitive so no Debug rendering of
+        // the request or its headers repeats it.
+        let mut value = reqwest::header::HeaderValue::from_str(key).map_err(|_| {
+            forward_key_refusal(&crate::agent_key_file::ForwardKeyFileError::Malformed)
+        })?;
+        value.set_sensitive(true);
+        req = req.header(crate::HEADER_API_KEY, value);
+    }
     if let Some(b) = body {
         req = req.json(b);
     }
@@ -99,7 +115,24 @@ pub(crate) fn forward_to_http(
     // without repeating the bytes on this side of the boundary either.
     if !status.is_success() {
         log_foreign_body("peer returned non-success", &target, status, &text);
-        return Err(format!("federation_forward: {target} returned {status}"));
+        let mut err = format!("federation_forward: {target} returned {status}");
+        // #9367 K-5 — a keyed forward the daemon refuses is named: the key in
+        // the variable is not accepted for this agent id. The id is the
+        // operator's own configured identity; the key is never repeated.
+        if api_key.is_some()
+            && let Some(agent_id) = keyed_agent
+            && matches!(
+                status,
+                reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+            )
+        {
+            err.push_str("; the daemon refused the key in ");
+            err.push_str(crate::agent_key_file::AGENT_API_KEY_FILE_ENV);
+            err.push_str(" for agent '");
+            err.push_str(agent_id);
+            err.push('\'');
+        }
+        return Err(err);
     }
     serde_json::from_str::<Value>(&text).map_err(|e| {
         log_foreign_body("peer body is not JSON", &target, status, &text);
@@ -126,6 +159,66 @@ fn log_foreign_body(what: &str, target: &str, status: reqwest::StatusCode, body:
         body_sha256 = %&digest[..16],
         "federation_forward: {what}; body withheld from the caller"
     );
+}
+
+/// #9367 K-2 FINAL — the caller-facing text of a refused key file: the
+/// variable and the form, and that nothing left the process.
+fn forward_key_refusal(e: &crate::agent_key_file::ForwardKeyFileError) -> String {
+    format!("federation_forward: {e}; no request was sent")
+}
+
+/// #9367 K-6 — the ONE funnel every MCP forward site goes through (store,
+/// action transition, signal send). It is the only caller of the generic
+/// request helper above, so no forward site can send without this check.
+///
+/// - [`crate::agent_key_file::AGENT_API_KEY_FILE_ENV`] unset or empty: the
+///   request is byte for byte the request of today (no `X-API-Key`).
+/// - Set: the file is read by the strict reader; any unusable form is a
+///   named local error and no request is sent (never a request without the
+///   key, never the shared key). The key is sent only when `agent_id` is the
+///   explicit process identity (V-3): a synthesized id is refused locally.
+///
+/// # Errors
+///
+/// A refused key file, a missing explicit identity, or the forward error.
+fn forward_as_agent(
+    method: reqwest::Method,
+    url: &str,
+    body: &Value,
+    agent_id: String,
+) -> Result<Value, String> {
+    let api_key =
+        crate::agent_key_file::forward_key_from_env().map_err(|e| forward_key_refusal(&e))?;
+    if api_key.is_some() {
+        let explicit = crate::identity::resolve_mcp_read_visibility_caller().map_err(|e| {
+            tracing::warn!(
+                target: "federation.forward",
+                error = %e,
+                "federation_forward: the explicit agent id could not be resolved"
+            );
+            format!(
+                "federation_forward: {} is set but the explicit agent id could not be resolved; no request was sent",
+                crate::agent_key_file::AGENT_API_KEY_FILE_ENV
+            )
+        })?;
+        if explicit.as_deref() != Some(agent_id.as_str()) {
+            return Err(format!(
+                "federation_forward: {} is set but {} is not; a per-agent key is sent only with the explicit agent id it is bound to; no request was sent",
+                crate::agent_key_file::AGENT_API_KEY_FILE_ENV,
+                crate::identity::ENV_AGENT_ID,
+            ));
+        }
+    }
+    let keyed_agent = api_key.as_ref().map(|_| agent_id.clone());
+    let headers: &[(&str, String)] = &[(crate::HEADER_AGENT_ID, agent_id)];
+    forward_to_http(
+        method,
+        url,
+        Some(body),
+        headers,
+        api_key.as_deref(),
+        keyed_agent.as_deref(),
+    )
 }
 
 /// MCP `memory_store` → HTTP `POST {forward_url}/api/v1/memories`.
@@ -163,10 +256,7 @@ pub(super) fn forward_store_to_http(
     // The HTTP request body mirrors the MCP params; pass them through
     // and let the HTTP handler do all validation, governance, quota,
     // dedup, embedding, audit, and federation broadcast.
-    let body = params.clone();
-    let headers: &[(&str, String)] = &[(crate::HEADER_AGENT_ID, agent_id)];
-
-    forward_to_http(reqwest::Method::POST, &url, Some(&body), headers)
+    forward_as_agent(reqwest::Method::POST, &url, params, agent_id)
 }
 
 /// #1718 — MCP `memory_action_transition` → HTTP
@@ -198,9 +288,7 @@ pub(crate) fn forward_action_transition_to_http(
     );
     let agent_id =
         crate::identity::resolve_agent_id(None, mcp_client).map_err(|e| e.to_string())?;
-    let body = params.clone();
-    let headers: &[(&str, String)] = &[(crate::HEADER_AGENT_ID, agent_id)];
-    forward_to_http(reqwest::Method::POST, &url, Some(&body), headers)
+    forward_as_agent(reqwest::Method::POST, &url, params, agent_id)
 }
 
 /// #1718 — MCP `memory_signal_send` → HTTP `POST {forward_url}/api/v1/signals`,
@@ -225,9 +313,7 @@ pub(crate) fn forward_signal_send_to_http(
     // mismatching wire `from_agent` is refused before any network I/O.
     let agent_id = crate::identity::resolve_governance_subject(explicit, mcp_client, "signal_send")
         .map_err(|e| e.to_string())?;
-    let body = params.clone();
-    let headers: &[(&str, String)] = &[(crate::HEADER_AGENT_ID, agent_id)];
-    forward_to_http(reqwest::Method::POST, &url, Some(&body), headers)
+    forward_as_agent(reqwest::Method::POST, &url, params, agent_id)
 }
 
 #[cfg(test)]
@@ -366,6 +452,8 @@ mod credential_to_sink_3711_tests {
             &url,
             Some(&serde_json::json!({})),
             &[],
+            None,
+            None,
         )
         .expect_err("a closed port refuses the connection");
         assert!(!err.contains("s3cr3t-3711"), "{err}");
@@ -412,6 +500,8 @@ mod credential_to_sink_3711_tests {
             &url,
             Some(&serde_json::json!({})),
             &[],
+            None,
+            None,
         )
         .expect_err("502 is an error");
         assert!(!err.contains("peer-t0ken-3698"), "{err}");
@@ -432,6 +522,8 @@ mod credential_to_sink_3711_tests {
             &url,
             Some(&serde_json::json!({})),
             &[],
+            None,
+            None,
         )
         .expect_err("html is not JSON");
         assert!(!err.contains("peer-c00kie-3698"), "{err}");
