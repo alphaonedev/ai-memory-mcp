@@ -695,6 +695,37 @@ async fn sqlite_racing_binds_that_jointly_exceed_the_bound_one_refused_4492() {
     assert_eq!(n, 0, "the refused bind wrote no row");
 }
 
+/// Deadline for the bind-lock waiter to appear (#9252).
+#[cfg(feature = "sal-postgres")]
+const WAITER_DEADLINE: Duration = Duration::from_secs(30);
+
+/// Waits until at least `want` sessions are parked on an advisory lock request
+/// (the bind lock), seen in `pg_locks`. A bind that never parks fails the cell
+/// with the named setup error; the cell can no longer pass without having
+/// provoked the race (#9252).
+#[cfg(feature = "sal-postgres")]
+async fn await_bind_waiters(pool: &sqlx::PgPool, want: i64) {
+    let deadline = tokio::time::Instant::now() + WAITER_DEADLINE;
+    loop {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_locks l JOIN pg_database d ON d.oid = l.database \
+              WHERE l.locktype = 'advisory' AND NOT l.granted \
+                AND d.datname = current_database()",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("setup error: pg_locks probe failed");
+        if waiting >= want {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "setup error: only {waiting} of {want} binds ever parked on the bind lock"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 #[cfg(feature = "sal-postgres")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn postgres_racing_binds_that_jointly_exceed_the_bound_one_refused_4492() {
@@ -739,7 +770,8 @@ async fn postgres_racing_binds_that_jointly_exceed_the_bound_one_refused_4492() 
                 .await
         })
     };
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    // #9252: the DATABASE shows B parked on the bind lock; no sleep as a synchroniser.
+    await_bind_waiters(&pool, 1).await;
     assert!(!b.is_finished(), "B must wait for A's bind lock");
     holder.commit().await.expect("commit A");
     let b = b.await.expect("B task");
