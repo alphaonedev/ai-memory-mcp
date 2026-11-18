@@ -774,7 +774,7 @@ mod pg_twin {
             "error returned from database: date/time field value out of range: \"2026-13-40T00:00:00Z\"",
         ),
     ];
-    /// The only way an unparsable created_at reaches the PG guard: the column
+    /// The only way an unparsable `created_at` reaches the PG guard: the column
     /// itself no longer decodes as a timestamp.
     const PG_TEXT_CREATED_AT_SQL: &str = "ALTER TABLE memories ALTER COLUMN created_at DROP DEFAULT, \
          ALTER COLUMN created_at TYPE text USING 'not-a-timestamp'";
