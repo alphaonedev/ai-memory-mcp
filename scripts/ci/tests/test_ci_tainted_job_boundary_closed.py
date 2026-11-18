@@ -1,0 +1,616 @@
+"""Closed-list invariants of the tainted-job boundary classifier (umbrella #9452, round-1 fix).
+
+decision: closed positive lists with Unclassifiable as a finding for every unknown form, over
+a patch per reported form, because two review lenses found twelve forms of one class in one
+round (conductor ruling b44e2422).
+
+I-1 a job reads clean only by positive proof: every command word, git/gh/docker subcommand,
+    option that runs a command, expression context, matrix form, job key and step key is on a
+    closed list; every other form is Unclassifiable with an exact reason, and Unclassifiable is
+    a finding.
+I-2 taint and base materialisation are per step and ordered; a secret held at or before the
+    taint point by any carrier counts.
+I-3 an allow row matches exactly one step.
+I-4 every scanner is linear: a 100K+ adversarial input per scanner stays under a named ceiling.
+I-5 nothing from a workflow reaches stdout unescaped; oversized, deeply nested, empty-`on`,
+    null-`permissions` and workflow_call-only inputs each end with their own exact reason.
+I-6 this test runs in an existing hosted job, and that step itself holds the boundary.
+
+Every corpus is a named constant; every cell works on in-memory text. No file is written.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import io
+import re
+import sys
+import time
+import unittest
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(REPO_ROOT / "scripts" / "ci"))
+try:
+    import taint_boundary as tb
+except ImportError as _import_error:  # red at the base: every cell fails on its own
+    tb = None
+    IMPORT_ERROR = repr(_import_error)
+else:
+    IMPORT_ERROR = ""
+
+SYNTH = "synthetic.yml"
+JOB = "j"
+SCAN_CEILING_S = 5.0
+ADVERSARIAL_BYTES = 120_000
+MAX_NESTING = 64
+MAX_YAML_BYTES = 8 * 1024 * 1024
+FIX_ISSUES = frozenset({9454, 9455, 9456, 9471})
+UNCLASSIFIABLE_PREFIX = "unclassifiable: "
+# The hosted job and step that already run the scripts/ci unit tests (I-6).
+HOST_WORKFLOW = "ci.yml"
+HOST_JOB = "classify"
+HOST_STEP = "Shard partition and wiring unit tests (#6344)"
+HOST_COMMAND = "python3 -m unittest discover -s scripts/ci/tests"
+HOSTED_LABEL = "ubuntu-latest"
+# The module-level patterns that remain, by name; a new pattern needs a review and a time cell.
+REGEX_NAMES_EXPECTED = frozenset({
+    "GITHUB_HOSTED_LABEL_RE", "SECRET_REF_RE", "EVENT_EQ_RE", "ENV_FILE_WRITE_RE",
+    "BLOCK_HEADER_RE", "NAME_RE",
+})
+REMOVED_NAMES = ("BASE_MATERIALISE_RE", "CHECKOUT_IN_RUN_RE", "RUNNER_BOUNDARY_FACTS", "VERSION_ARGS",
+                 "HOST_CREDENTIAL_RE", "MATRIX_RUNS_ON_RE", "STEP_OUTPUT_REF_RE")
+
+
+def _need_module(case: unittest.TestCase) -> None:
+    if tb is None:
+        case.fail(f"scripts/ci/taint_boundary.py is missing: {IMPORT_ERROR}")
+
+
+def _wf(steps: str, on: str = "pull_request", job_extra: str = "", top_extra: str = "",
+        perms: str = "permissions:\n  contents: read\n", runs_on: str = "ubuntu-latest") -> str:
+    return (f"on: {on}\n{perms}{top_extra}jobs:\n  {JOB}:\n    runs-on: {runs_on}\n{job_extra}"
+            f"    steps:\n{steps}")
+
+
+CHECKOUT = "      - uses: actions/checkout@v4\n        with:\n          persist-credentials: false\n"
+SECRET_STEP = ("      - name: Late secret\n        env:\n          T: ${{ secrets.X }}\n"
+               "        run: echo done\n")
+
+
+def _run_step(name: str, run: str, env: str = "") -> str:
+    body = "".join(f"          {line}\n" for line in run.split("\n"))
+    env_block = f"        env:\n{env}" if env else ""
+    return f"      - name: {name}\n{env_block}        run: |\n{body}"
+
+
+def _scan(text: str, extra: dict[str, str] | None = None) -> object:
+    return tb.scan_texts(dict({SYNTH: text}, **(extra or {})), {}, frozenset())
+
+
+def _problems(text: str, extra: dict[str, str] | None = None) -> list[str]:
+    return tb.check(_scan(text, extra), allow=(), pin=0)
+
+
+def _classify(text: str) -> bool:
+    return tb._shell_runs_pr_code(text)
+
+
+# ---------------------------------------------------------------------------------------
+# I-1 corpora. Each row: shell text, exact reason. The first rows are the reviewers' forms;
+# the rows marked sibling were named by neither lens.
+# ---------------------------------------------------------------------------------------
+
+SHELL_UNCLASSIFIABLE = (
+    ("unknowncmd --x", "command word 'unknowncmd' is not on the closed command list"),
+    ("$TOOL --flag", "command word '$TOOL' is not a literal word"),
+    ("trap 'unknowncmd' EXIT", "command word 'unknowncmd' is not on the closed command list"),
+    ("env -S 'unknowncmd x'", "command word 'unknowncmd' is not on the closed command list"),
+    ("xargs unknowncmd < list", "command word 'unknowncmd' is not on the closed command list"),
+    ("find . -exec unknowncmd {} \\;", "command word 'unknowncmd' is not on the closed command list"),
+    ("timeout 5 unknowncmd", "command word 'unknowncmd' is not on the closed command list"),
+    ("git frobnicate", "git subcommand 'frobnicate' is not on the closed list"),
+    ("git -c core.fsmonitor=x status", "git -c key 'core.fsmonitor' is not on the closed key list"),
+    ("gh frob", "gh subcommand 'frob' is not on the closed list"),
+    ("docker frob", "docker subcommand 'frob' is not on the closed list"),
+    ("tar --to-command=sh -xf a.tar", "tar option '--to-command' runs a command"),
+    ("sed 'k' f", "sed command 'k' is not on the closed sed list"),
+    ("awk 'BEGIN { system(\"x\") }'", "awk program calls system()"),
+    ("awk '{ print | \"sh\" }' f", "awk program pipes to or from a command"),
+    ("awk '@include \"x\"' f", "awk program loads a source file"),
+    ("psql -c '\\! id'", "psql meta-command in SQL text"),
+    ("echo $(( $(id) + 1 ))", "arithmetic expansion holding a command substitution"),
+    ("echo ${x:-$(id)}", "parameter expansion holding a command substitution"),
+    ("python3 -I -c 'import subprocess'", "python module 'subprocess' is not on the closed module list"),
+    ("python3 -I -c 'x.__class__'", "python code uses a dunder name"),
+    ("python3 -I /opt/x.py", "interpreter path '/opt/x.py' is neither in the workspace nor bound to base content"),
+    ("sudo -i", "sudo option '-i' is not on the closed option list"),
+    # sibling forms of the exec-option class (neither lens named them)
+    ("sort --compress-program=sh f", "sort option '--compress-program' runs a command"),
+    ("rsync -e ssh a b", "rsync option '-e' runs a command"),
+    ("zip -TT x a.zip f", "zip option '-TT' runs a command"),
+    ("openssl req -engine x", "openssl option '-engine' loads code"),
+    ("install --strip-program=x a b", "install option '--strip-program' runs a command"),
+)
+
+SHELL_PR_CODE = (
+    # reviewers' forms
+    ("flock /var/lock/x -c 'make all'", True),
+    ("trap 'cargo build' EXIT", True),
+    ("env -S 'cargo build'", True),
+    ("awk -f x.awk f", True),
+    ("git submodule foreach 'make'", True),
+    ("git rebase --exec 'make' HEAD~1", True),
+    ("sed -e '1e' f", True),
+    ("sed 's/x/y/e' f", True),
+    ("find . -name x -exec make {} \\;", True),
+    ("xargs make < list", True),
+    ("docker run --rm -v \"$PWD:/w\" img true", True),
+    ("cargo --version", True),
+    ("python3 -I - < scripts/x.py", True),
+    ("python3 -I -c \"$(cat x)\"", True),
+    ("python3 -I -c 'exec(open(\"x\").read())'", True),
+    ("psql -f x.sql", True),
+    ("psql < x.sql", True),
+    ("sqlite3 db < x.sql", True),
+    ("case \"$x\" in a) ( bash x ) ;; esac", True),
+    ("echo [[ ; bash x", True),
+    ("gh extension install x", True),
+    # sibling forms (neither lens named them)
+    ("cat x.sh | bash", True),
+    ("nice -n 5 make", True),
+    ("command make", True),
+    ("stdbuf -oL make", True),
+    ("rustup show", True),
+    ("npm --version", True),
+    ("git bisect run make", True),
+)
+
+SHELL_INERT = (
+    ("echo hi && grep -c x file | wc -l", False),
+    ("git diff --name-only HEAD~1 > changed.txt", False),
+    ("bash -c 'echo hi'", False),
+    ("python3 -I -m json.tool f.json", False),
+    ("python3 -I -c 'import json, sys; print(json.dumps(sys.argv))'", False),
+    ("python3 --version", False),
+    ("for f in a b; do echo \"$f\"; done", False),
+    ("case \"$x\" in a|b) echo y ;; *) echo n ;; esac", False),
+    ("if [[ -n \"$x\" && -f y ]]; then echo ok; fi", False),
+    ("(( n += 1 ))", False),
+    ("f() { echo hi; }\nf", False),
+    ("find . -name '*.tmp' -exec rm {} \\;", False),
+    ("cat <<'EOF'\n$(cargo build)\nEOF", False),
+    ("python3 -I - <<'PY'\nimport json\nprint(json.dumps(1))\nPY", False),
+    ("echo x 2>&1 | tee out.log", False),
+    ("sed -n 's/^a=//p' f", False),
+    ("awk '{ print $1 }' f", False),
+    ("psql -c 'select 1'", False),
+    ("timeout 30 sleep 1", False),
+    ("command -v jq", False),
+    ("git -c user.name=x -C . log --oneline -1", False),
+)
+
+# Expression contexts in a run step (I-1): exact reason per unknown context.
+EXPR_UNCLASSIFIABLE = (
+    ("echo ${{ frob.x }}", "expression context 'frob' is not on the closed context list"),
+    ("echo ${{ github.frob }}", "expression context 'github.frob' is not on the closed context list"),
+    ("echo ${{ env.NOPE }}", "expression `env.NOPE` names no env value declared in the workflow"),
+    ("${{ github.sha }} --run", "command word '${{ }}' is not a literal word"),
+)
+
+# Job and step forms (I-1).
+FORM_UNCLASSIFIABLE = (
+    ("job key", _wf(CHECKOUT, job_extra="    frob: 1\n"), "job key 'frob' is not on the closed list"),
+    ("step key", _wf(CHECKOUT + "      - run: echo x\n        frob: 1\n"), "step key 'frob' is not on the closed list"),
+    ("empty shell", _wf(CHECKOUT + "      - run: echo x\n        shell: ''\n"), "`shell:` is empty"),
+    ("pwsh", _wf(CHECKOUT + "      - run: echo x\n        shell: pwsh\n"), "shell 'pwsh' is not on the closed shell list"),
+    ("windows default shell", _wf(CHECKOUT + "      - run: echo x\n", runs_on="windows-latest"),
+     "the default shell of a Windows leg is pwsh, which is not on the closed shell list"),
+    ("matrix axis expression",
+     _wf(CHECKOUT, runs_on="${{ matrix.os }}",
+         job_extra="    strategy:\n      matrix:\n        os: ${{ fromJSON(vars.OS) }}\n"
+                   "        include:\n          - os: ubuntu-latest\n"),
+     "matrix axis 'os' is an expression"),
+    ("matrix include expression",
+     _wf(CHECKOUT, runs_on="${{ matrix.os }}",
+         job_extra="    strategy:\n      matrix:\n        os: [ubuntu-latest]\n        include: ${{ fromJSON(vars.I) }}\n"),
+     "matrix include holds an expression"),
+    ("matrix include scalar",
+     _wf(CHECKOUT, runs_on="${{ matrix.os }}",
+         job_extra="    strategy:\n      matrix:\n        os: [ubuntu-latest]\n        include: 5\n"),
+     "matrix include is not a list of mappings"),
+    ("matrix axis scalar",
+     _wf(CHECKOUT, runs_on="${{ matrix.os }}", job_extra="    strategy:\n      matrix:\n        os: ubuntu-latest\n"),
+     "matrix axis 'os' is not a list"),
+)
+
+# ---------------------------------------------------------------------------------------
+# I-2 corpora: tree changes inside run steps, event text, per-step binding, early secrets.
+# ---------------------------------------------------------------------------------------
+
+TREE_CHANGE_RUNS = (
+    ("pull_request_target", "git -C . fetch origin pull/1/head\ngit -C . checkout FETCH_HEAD"),
+    ("push", "gh pr checkout 1"),
+    ("pull_request_target", "git fetch origin x && git checkout FETCH_HEAD"),
+    # sibling forms
+    ("pull_request_target", "git switch -c x FETCH_HEAD"),
+    ("pull_request_target", "git worktree add ../w FETCH_HEAD"),
+    ("pull_request_target", "git reset --hard FETCH_HEAD"),
+)
+
+EVENT_TEXT_RUNS = (
+    "echo \"${{ github.event.pull_request.title }}\"",
+    "echo \"${{ github.head_ref }}\"",
+    "echo '${{ toJSON(github.event) }}'",
+    "echo ${{ github.event.pull_request.body }}",
+)
+
+UNBOUND_TEMP_RUNS = (
+    ("cp scripts/x.py \"$RUNNER_TEMP/x.py\"\npython3 -I \"$RUNNER_TEMP/x.py\"", "$RUNNER_TEMP/x.py"),
+    ("python3 -I \"$RUNNER_TEMP/../ws/x.py\"", "$RUNNER_TEMP/../ws/x.py"),
+    ("git show HEAD:x.py > \"$RUNNER_TEMP/x.py\"\npython3 -I \"$RUNNER_TEMP/x.py\"", "$RUNNER_TEMP/x.py"),
+    # siblings: a write after the bind unbinds; a `..` destination never binds
+    ("git show \"$BASE:x.py\" > \"$RUNNER_TEMP/x.py\"\necho x >> \"$RUNNER_TEMP/x.py\"\n"
+     "python3 -I \"$RUNNER_TEMP/x.py\"", "$RUNNER_TEMP/x.py"),
+    ("git show \"$BASE:x.py\" > \"$RUNNER_TEMP/../x.py\"\npython3 -I \"$RUNNER_TEMP/../x.py\"",
+     "$RUNNER_TEMP/../x.py"),
+    ("git show \"$OTHER:x.py\" > \"$RUNNER_TEMP/x.py\"\npython3 -I \"$RUNNER_TEMP/x.py\"", "$RUNNER_TEMP/x.py"),
+)
+BASE_ENV = "          BASE: ${{ github.event.pull_request.base.sha }}\n          OTHER: ${{ github.sha }}\n"
+BOUND_TEMP_RUNS = (
+    "git show \"$BASE:x.py\" > \"$RUNNER_TEMP/x.py\"\npython3 -I \"$RUNNER_TEMP/x.py\"",
+    "d=\"$RUNNER_TEMP/t\"\nmkdir -p \"$d\"\nfor f in a.py b.json; do\n  git show \"${BASE}:x/${f}\" > \"$d/$f\"\ndone\n"
+    "python3 -I \"$d/a.py\" --rules \"$d/b.json\"",
+    "ref=$(git merge-base HEAD \"$BASE\")\ngit show \"$ref:x.py\" > \"$RUNNER_TEMP/x.py\"\npython3 -I \"$RUNNER_TEMP/x.py\"",
+)
+
+EARLY_SECRET_STEPS = (
+    ("secret into GITHUB_ENV",
+     _run_step("Stash", "echo \"T=$T\" >> \"$GITHUB_ENV\"", "          T: ${{ secrets.X }}\n"), "Stash"),
+    ("credential action",
+     "      - name: Login\n        uses: docker/login-action@v3\n        with:\n"
+     "          password: ${{ secrets.X }}\n", "Login"),
+    # siblings
+    ("secret into GITHUB_OUTPUT",
+     _run_step("Out", "echo \"t=$T\" >> \"$GITHUB_OUTPUT\"", "          T: ${{ secrets.X }}\n"), "Out"),
+    ("secret into a home file",
+     _run_step("Home", "echo \"$T\" > ~/.token", "          T: ${{ secrets.X }}\n"), "Home"),
+    ("token to a tool",
+     _run_step("Query", "gh api repos/x/y > list.txt", "          GH_TOKEN: ${{ github.token }}\n"), "Query"),
+)
+EARLY_SECRET_DETAIL = "secret held before pull-request code ran can persist into it"
+CONTAINER_DETAIL = "container or service holds a secret for a tainted job"
+CONTAINER_FORMS = (
+    "    container:\n      image: x\n      env:\n        T: ${{ secrets.X }}\n",
+    "    services:\n      db:\n        image: x\n        env:\n          T: ${{ secrets.X }}\n",
+    # siblings
+    "    container:\n      image: x\n      credentials:\n        password: ${{ secrets.X }}\n",
+    "    services:\n      db:\n        image: x\n        credentials:\n          password: ${{ secrets.X }}\n",
+)
+
+
+class ClosedCommandList(unittest.TestCase):
+    """I-1: every command form is on a closed list or Unclassifiable with an exact reason."""
+
+    def test_9452_unknown_shell_forms_are_unclassifiable_with_exact_reason(self) -> None:
+        _need_module(self)
+        for text, reason in SHELL_UNCLASSIFIABLE:
+            with self.subTest(text=text):
+                with self.assertRaises(tb.Unclassifiable) as ctx:
+                    _classify(text)
+                self.assertEqual(str(ctx.exception), reason)
+
+    def test_9452_listed_forms_that_run_pr_code(self) -> None:
+        _need_module(self)
+        for text, expected in SHELL_PR_CODE + SHELL_INERT:
+            with self.subTest(text=text):
+                self.assertIs(_classify(text), expected)
+
+    def test_9452_unknown_expression_context_is_a_finding(self) -> None:
+        _need_module(self)
+        for run, reason in EXPR_UNCLASSIFIABLE:
+            with self.subTest(run=run):
+                problems = _problems(_wf(CHECKOUT + _run_step("S", run)))
+                self.assertIn(f"{UNCLASSIFIABLE_PREFIX}{SYNTH}/{JOB}: step 'S': {reason}", problems)
+
+    def test_9452_unknown_job_and_step_forms_are_findings(self) -> None:
+        _need_module(self)
+        for name, text, reason in FORM_UNCLASSIFIABLE:
+            with self.subTest(form=name):
+                problems = _problems(text)
+                hits = [p for p in problems if p.startswith(UNCLASSIFIABLE_PREFIX) and p.endswith(": " + reason)]
+                self.assertEqual(len(hits), 1, problems)
+
+    def test_9452_rust_cache_runs_pr_code(self) -> None:
+        _need_module(self)
+        text = _wf(CHECKOUT + "      - name: Cache\n        uses: Swatinem/rust-cache@v2\n" + SECRET_STEP)
+        result = _scan(text)
+        self.assertEqual(result.taint_steps[(SYNTH, JOB)], "Cache")
+
+    def test_9452_unclassifiable_never_reads_clean(self) -> None:
+        _need_module(self)
+        result = _scan(_wf(CHECKOUT + _run_step("S", "unknowncmd")))
+        self.assertEqual(result.verdicts[(SYNTH, JOB)], "unclassifiable")
+
+
+class PerStepTaint(unittest.TestCase):
+    """I-2: taint and base materialisation are per step and ordered; every carrier counts."""
+
+    def test_9452_tree_change_in_a_run_step_taints(self) -> None:
+        _need_module(self)
+        for event, run in TREE_CHANGE_RUNS:
+            with self.subTest(run=run):
+                text = _wf(_run_step("Fetch", run) + _run_step("Build", "make") + SECRET_STEP, on=event)
+                result = _scan(text)
+                self.assertEqual(result.taint_steps.get((SYNTH, JOB)), "Build")
+                self.assertIn("i", result.verdicts[(SYNTH, JOB)].split(","))
+
+    def test_9452_event_text_in_a_run_step_is_the_taint_point(self) -> None:
+        _need_module(self)
+        for run in EVENT_TEXT_RUNS:
+            with self.subTest(run=run):
+                result = _scan(_wf(_run_step("Echo", run) + SECRET_STEP, on="pull_request_target"))
+                self.assertEqual(result.taint_steps.get((SYNTH, JOB)), "Echo")
+                self.assertEqual(result.verdicts[(SYNTH, JOB)], "i")
+
+    def test_9452_unbound_runner_temp_path_is_not_trusted(self) -> None:
+        _need_module(self)
+        for run, path in UNBOUND_TEMP_RUNS:
+            with self.subTest(run=run):
+                problems = _problems(_wf(CHECKOUT + _run_step("S", run, BASE_ENV)))
+                reason = f"interpreter path {path!r} is neither in the workspace nor bound to base content"
+                self.assertIn(f"{UNCLASSIFIABLE_PREFIX}{SYNTH}/{JOB}: step 'S': {reason}", problems)
+
+    def test_9452_bound_runner_temp_path_in_the_same_step_is_trusted(self) -> None:
+        _need_module(self)
+        for run in BOUND_TEMP_RUNS:
+            with self.subTest(run=run):
+                result = _scan(_wf(CHECKOUT + _run_step("S", run, BASE_ENV) + SECRET_STEP))
+                self.assertEqual(result.unclassifiable, [])
+                self.assertEqual(result.verdicts[(SYNTH, JOB)], "no-pr-code")
+
+    def test_9452_a_bind_in_one_step_says_nothing_about_the_next(self) -> None:
+        _need_module(self)
+        bind = _run_step("Bind", "git show \"$BASE:x.py\" > \"$RUNNER_TEMP/x.py\"", BASE_ENV)
+        use = _run_step("Use", "python3 -I \"$RUNNER_TEMP/x.py\"")
+        problems = _problems(_wf(CHECKOUT + bind + use))
+        reason = "interpreter path '$RUNNER_TEMP/x.py' is neither in the workspace nor bound to base content"
+        self.assertIn(f"{UNCLASSIFIABLE_PREFIX}{SYNTH}/{JOB}: step 'Use': {reason}", problems)
+
+    def test_9452_a_secret_held_before_the_taint_point_counts(self) -> None:
+        _need_module(self)
+        for name, step, label in EARLY_SECRET_STEPS:
+            with self.subTest(form=name):
+                result = _scan(_wf(step + CHECKOUT + _run_step("Build", "make")))
+                got = {(v.step, v.klass, v.detail) for v in result.violations}
+                self.assertIn((label, "i", EARLY_SECRET_DETAIL), got)
+
+    def test_9452_container_and_service_secrets_count(self) -> None:
+        _need_module(self)
+        for extra in CONTAINER_FORMS:
+            with self.subTest(form=extra):
+                result = _scan(_wf(CHECKOUT + _run_step("Build", "make"), job_extra=extra))
+                got = {(v.step, v.klass, v.detail) for v in result.violations}
+                self.assertIn(("Build", "i", CONTAINER_DETAIL), got)
+
+    def test_9452_leg_ii_write_all_after_pr_code(self) -> None:
+        _need_module(self)
+        result = _scan(_wf(CHECKOUT + _run_step("Build", "make"), perms="permissions: write-all\n"))
+        got = {(v.step, v.klass) for v in result.violations}
+        self.assertEqual(got, {("Build", "ii")})
+
+    def test_9452_leg_iii_env_output_after_pr_code(self) -> None:
+        _need_module(self)
+        extra = "    outputs:\n      x: ${{ env.X }}\n"
+        result = _scan(_wf(CHECKOUT + _run_step("Build", "make"), job_extra=extra))
+        got = {(v.step, v.klass) for v in result.violations}
+        self.assertEqual(got, {("Build", "iii")})
+
+    def test_9452_leg_iii_reads_every_step_field(self) -> None:
+        _need_module(self)
+        for value in ("${{ steps.b.outcome }}", "${{ steps.b.conclusion }}", "${{ toJSON(steps) }}",
+                      "${{ hashFiles('x') }}", "${{ job.status }}"):
+            with self.subTest(value=value):
+                extra = f"    outputs:\n      x: {value}\n"
+                steps = CHECKOUT + "      - name: Build\n        id: b\n        run: make\n"
+                result = _scan(_wf(steps, job_extra=extra))
+                self.assertIn("iii", result.verdicts[(SYNTH, JOB)].split(","))
+
+
+class OneRowOneStep(unittest.TestCase):
+    """I-3: an allow row matches exactly one step of exactly one job."""
+
+    def test_9452_duplicate_step_labels_are_a_finding(self) -> None:
+        _need_module(self)
+        for steps in (_run_step("Same", "echo a") + _run_step("Same", "echo b"),
+                      "      - id: x\n        run: echo a\n      - name: id:x\n        run: echo b\n"):
+            with self.subTest(steps=steps):
+                problems = _problems(_wf(CHECKOUT + steps))
+                self.assertTrue(any(p.startswith(UNCLASSIFIABLE_PREFIX) and "two steps share the label" in p
+                                    for p in problems), problems)
+
+    def test_9452_allow_row_issue_must_be_an_int_fix_issue(self) -> None:
+        _need_module(self)
+        result = _scan(_wf(CHECKOUT + _run_step("Build", "make") + SECRET_STEP))
+        for issue in (True, 1, 0, None, "9455"):
+            with self.subTest(issue=issue):
+                row = tb.AllowRow(SYNTH, JOB, "Late secret", ("i",), issue)
+                self.assertIn(f"allow row without an open fix issue: {SYNTH}/{JOB}/Late secret",
+                              tb.check(result, allow=(row,), pin=1))
+        self.assertEqual(tb.FIX_ISSUES, FIX_ISSUES)
+
+
+class LinearScanners(unittest.TestCase):
+    """I-4: one 100K+ adversarial input per scanner under a named wall-clock ceiling."""
+
+    def _timed(self, func, *args) -> None:
+        start = time.monotonic()
+        try:
+            func(*args)
+        except tb.Unclassifiable:
+            pass
+        self.assertLess(time.monotonic() - start, SCAN_CEILING_S)
+
+    def test_9452_removed_patterns_and_globals_are_gone(self) -> None:
+        _need_module(self)
+        for name in REMOVED_NAMES:
+            with self.subTest(name=name):
+                self.assertFalse(hasattr(tb, name), name)
+        patterns = {name for name, value in vars(tb).items() if isinstance(value, re.Pattern)}
+        self.assertEqual(patterns, REGEX_NAMES_EXPECTED)
+
+    def test_9452_shell_scanners_under_ceiling(self) -> None:
+        _need_module(self)
+        n = ADVERSARIAL_BYTES
+        inputs = (
+            "git " + "--x " * (n // 4) + "z",
+            "git " + "-c " * (n // 3) + "show",
+            "echo " + "\"$(echo " * MAX_NESTING + "x" + ")\"" * MAX_NESTING + " a" * n,
+            "sed '" + "s/a/b/;" * (n // 7) + "' f",
+            "awk '" + "{ x = x \"a\" } " * (n // 15) + "' f",
+            "echo " + "'a' \"b\" " * (n // 8),
+            "case x in " + "a) echo ;; " * (n // 11) + "esac",
+            "cat <<EOF\n" + "$x line\n" * (n // 8) + "EOF",
+            "python3 -I -c '" + "x = 1\n" * (n // 6) + "'",
+        )
+        for text in inputs:
+            with self.subTest(head=text[:24]):
+                self.assertGreater(len(text), ADVERSARIAL_BYTES)
+                self._timed(_classify, text)
+
+    def test_9452_host_credential_scan_under_ceiling(self) -> None:
+        _need_module(self)
+        n = ADVERSARIAL_BYTES
+        for text in ("$HOME/." + "a" * n + " ", "sudo " + "-x " * (n // 3) + "-u nobody",
+                     "psql" + " " * n + "-U x", "~/." + "a." * (n // 2)):
+            with self.subTest(head=text[:24]):
+                start = time.monotonic()
+                tb._host_credential_in({"run": text})
+                self.assertLess(time.monotonic() - start, SCAN_CEILING_S)
+
+    def test_9452_expression_and_yaml_scanners_under_ceiling(self) -> None:
+        _need_module(self)
+        n = ADVERSARIAL_BYTES
+        self._timed(tb._expression_contexts, "a." * (n // 2))
+        self._timed(tb._expression_contexts, "toJSON(" * (n // 7))
+        self._timed(tb.parse_yaml, "a: {" + "b " * n + "}", "big")
+        self._timed(tb.parse_yaml, "a: {" + "'x' " * (n // 4) + ": 1}", "big")
+        self._timed(_scan, _wf(CHECKOUT, runs_on="${{ matrix.x" + " " * n + "}}"))
+
+
+class Bounded(unittest.TestCase):
+    """I-5: escaped output and an exact reason for every refused input shape."""
+
+    def test_9452_step_names_are_escaped_on_stdout(self) -> None:
+        _need_module(self)
+        name = "x\n::error::injected"
+        text = _wf(CHECKOUT + f"      - name: \"x\\n::error::injected\"\n        run: make\n" + SECRET_STEP)
+        result = _scan(text)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            tb.emit(result, tb.check(result, allow=(), pin=0), verdicts=True)
+        lines = out.getvalue().split("\n")
+        self.assertFalse(any(line.startswith("::") for line in lines))
+        self.assertTrue(any("x%0A::error::injected" in line for line in lines))
+        self.assertNotIn(name, out.getvalue())
+
+    def test_9452_deep_yaml_has_its_own_reason(self) -> None:
+        _need_module(self)
+        deep = "".join(" " * (2 * d) + f"k{d}:\n" for d in range(MAX_NESTING + 1)) + " " * (2 * (MAX_NESTING + 1)) + "v: 1\n"
+        with self.assertRaises(tb.YamlError) as ctx:
+            tb.parse_yaml(deep, "deep")
+        self.assertTrue(str(ctx.exception).endswith(f"nesting deeper than {MAX_NESTING} levels"), str(ctx.exception))
+        shallow = "".join(" " * (2 * d) + f"k{d}:\n" for d in range(8)) + " " * 16 + "v: 1\n"
+        self.assertIsInstance(tb.parse_yaml(shallow, "shallow"), dict)
+
+    def test_9452_refused_shapes_have_their_own_reason(self) -> None:
+        _need_module(self)
+        cases = (
+            (_wf(CHECKOUT, on="{}"), f"{SYNTH}: `on:` names no trigger"),
+            (_wf(CHECKOUT, perms="permissions:\n"), f"{SYNTH}/{JOB}: `permissions:` is null"),
+            (_wf(CHECKOUT, on="workflow_call"), f"{SYNTH}: workflow_call-only workflow has no caller in this repository"),
+        )
+        for text, reason in cases:
+            with self.subTest(reason=reason):
+                self.assertIn(UNCLASSIFIABLE_PREFIX + reason, _problems(text))
+
+    def test_9452_load_refusals_have_their_own_reason(self) -> None:
+        _need_module(self)
+        cases = (
+            (_FakePath("a.yml", data=b"on: push\n"), None),
+            (_FakePath("big.yml", size=MAX_YAML_BYTES + 1), f"larger than {MAX_YAML_BYTES} bytes"),
+            (_FakePath("bad.yml", data=b"on: \xff\n"), "not UTF-8"),
+            (_FakePath("link.yml", link=True), "is a symbolic link"),
+            (_FakePath("fifo.yml", regular=False), "is not a regular file"),
+            (_FakePath("UP.YML", data=b"on: push\n"), "workflow suffix '.YML' is not on the closed suffix list"),
+        )
+        for path, reason in cases:
+            with self.subTest(path=path.name):
+                text = tb._load_one(path, workflow=True)
+                if reason is None:
+                    self.assertEqual(text, "on: push\n")
+                    continue
+                with self.assertRaises(tb.YamlError) as ctx:
+                    tb.parse_yaml(text, path.name)
+                self.assertEqual(str(ctx.exception), f"{path.name}: {reason}")
+
+    def test_9452_missing_workflow_dir_is_a_finding(self) -> None:
+        _need_module(self)
+        result = tb.scan_texts(*tb._load_dir(None))
+        self.assertIn(UNCLASSIFIABLE_PREFIX + ".github/workflows: no .github/workflows directory",
+                      tb.check(result, allow=(), pin=0))
+
+
+class _FakeStat:
+    def __init__(self, size: int) -> None:
+        self.st_size = size
+
+
+class _FakePath:
+    """A path double for the loader: no file is written."""
+
+    def __init__(self, name: str, data: bytes = b"", size: int | None = None, link: bool = False,
+                 regular: bool = True) -> None:
+        self.name = name
+        self.suffix = name[name.rfind("."):] if "." in name else ""
+        self._data = data
+        self._size = len(data) if size is None else size
+        self._link = link
+        self._regular = regular
+
+    def is_symlink(self) -> bool:
+        return self._link
+
+    def is_file(self) -> bool:
+        return self._regular
+
+    def lstat(self) -> _FakeStat:
+        return _FakeStat(self._size)
+
+    def read_bytes_bounded(self, limit: int) -> bytes:
+        return (self._data or b"x" * min(self._size, limit))[:limit]
+
+
+class HostedGuard(unittest.TestCase):
+    """I-6: this file runs in an existing hosted job, and that step holds the boundary."""
+
+    def test_9452_boundary_test_runs_in_a_hosted_pr_job(self) -> None:
+        _need_module(self)
+        workflows, actions, files = tb.load_repo(REPO_ROOT)
+        doc = tb.parse_yaml(workflows[HOST_WORKFLOW], HOST_WORKFLOW)
+        self.assertIn("pull_request", doc["on"])
+        job = doc["jobs"][HOST_JOB]
+        self.assertEqual(job["runs-on"], HOSTED_LABEL)
+        steps = [s for s in job["steps"] if s.get("name") == HOST_STEP]
+        self.assertEqual(len(steps), 1)
+        self.assertEqual(steps[0]["run"].strip(), HOST_COMMAND)
+        self.assertTrue(Path(__file__).name.startswith("test"))
+        self.assertEqual(Path(__file__).parent, REPO_ROOT / "scripts" / "ci" / "tests")
+        result = tb.scan_texts(workflows, actions, files)
+        self.assertNotEqual(result.verdicts[(HOST_WORKFLOW, HOST_JOB)], "unclassifiable")
+        self.assertEqual([v for v in result.violations if (v.workflow, v.job, v.step) == (HOST_WORKFLOW, HOST_JOB, HOST_STEP)],
+                         [])
+
+
+if __name__ == "__main__":
+    unittest.main()
