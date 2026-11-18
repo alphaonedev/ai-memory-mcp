@@ -165,6 +165,7 @@ fn archived_column(body: &str, column: &str) -> String {
     format!(
         "CASE WHEN {row}namespace <> '_agents' THEN {row}{column} WHEN {pred} THEN {body} ELSE {row}{column} END",
         row = ARCHIVED_ROW,
+        column = column,
         pred = with_row(PREDICATE, ARCHIVED_ROW),
         body = with_row(body, ARCHIVED_ROW),
     )
@@ -390,6 +391,32 @@ mod tests {
         assert!(
             inside,
             "a freshly registered row already carries the projection"
+        );
+    }
+
+    /// `RESTORE_METADATA` at c73ea912, the head before alert 881's fix.
+    const RESTORE_METADATA_AT_C73EA912: &str = "CASE WHEN archived_memories.namespace <> '_agents' THEN archived_memories.metadata WHEN (archived_memories.namespace = '_agents' AND (json_extract(archived_memories.metadata, '$.agent_pubkey') IS NOT (SELECT pubkey_b64 FROM agent_pubkey_history WHERE agent_id = substr(archived_memories.title, length('agent:') + 1) AND superseded_at IS NULL) OR json_extract(archived_memories.metadata, '$.pubkey_bound_at') IS NOT (SELECT bound_at FROM agent_pubkey_history WHERE agent_id = substr(archived_memories.title, length('agent:') + 1) AND superseded_at IS NULL) OR json_extract(CASE WHEN json_valid(archived_memories.content) THEN archived_memories.content ELSE '{}' END, '$.agent_pubkey') IS NOT (SELECT pubkey_b64 FROM agent_pubkey_history WHERE agent_id = substr(archived_memories.title, length('agent:') + 1) AND superseded_at IS NULL) OR json_extract(CASE WHEN json_valid(archived_memories.content) THEN archived_memories.content ELSE '{}' END, '$.pubkey_bound_at') IS NOT (SELECT bound_at FROM agent_pubkey_history WHERE agent_id = substr(archived_memories.title, length('agent:') + 1) AND superseded_at IS NULL))) THEN json_set(json_remove(CASE WHEN EXISTS (SELECT 1 FROM agent_pubkey_history WHERE agent_id = substr(archived_memories.title, length('agent:') + 1) AND superseded_at IS NULL) THEN json_set(json_remove(archived_memories.metadata, '$.agent_pubkey', '$.pubkey_bound_at'), '$.agent_pubkey', (SELECT pubkey_b64 FROM agent_pubkey_history WHERE agent_id = substr(archived_memories.title, length('agent:') + 1) AND superseded_at IS NULL), '$.pubkey_bound_at', (SELECT bound_at FROM agent_pubkey_history WHERE agent_id = substr(archived_memories.title, length('agent:') + 1) AND superseded_at IS NULL)) ELSE json_remove(archived_memories.metadata, '$.agent_pubkey', '$.pubkey_bound_at') END, '$.write_signature'), '$.attest_level', 'claimed') ELSE archived_memories.metadata END";
+
+    /// `RESTORE_CONTENT` at c73ea912, the head before alert 881's fix.
+    const RESTORE_CONTENT_AT_C73EA912: &str = "CASE WHEN archived_memories.namespace <> '_agents' THEN archived_memories.content WHEN (archived_memories.namespace = '_agents' AND (json_extract(archived_memories.metadata, '$.agent_pubkey') IS NOT (SELECT pubkey_b64 FROM agent_pubkey_history WHERE agent_id = substr(archived_memories.title, length('agent:') + 1) AND superseded_at IS NULL) OR json_extract(archived_memories.metadata, '$.pubkey_bound_at') IS NOT (SELECT bound_at FROM agent_pubkey_history WHERE agent_id = substr(archived_memories.title, length('agent:') + 1) AND superseded_at IS NULL) OR json_extract(CASE WHEN json_valid(archived_memories.content) THEN archived_memories.content ELSE '{}' END, '$.agent_pubkey') IS NOT (SELECT pubkey_b64 FROM agent_pubkey_history WHERE agent_id = substr(archived_memories.title, length('agent:') + 1) AND superseded_at IS NULL) OR json_extract(CASE WHEN json_valid(archived_memories.content) THEN archived_memories.content ELSE '{}' END, '$.pubkey_bound_at') IS NOT (SELECT bound_at FROM agent_pubkey_history WHERE agent_id = substr(archived_memories.title, length('agent:') + 1) AND superseded_at IS NULL))) THEN CASE WHEN json_valid(archived_memories.content) THEN json_set(json_remove(CASE WHEN EXISTS (SELECT 1 FROM agent_pubkey_history WHERE agent_id = substr(archived_memories.title, length('agent:') + 1) AND superseded_at IS NULL) THEN json_set(json_remove(archived_memories.content, '$.agent_pubkey', '$.pubkey_bound_at'), '$.agent_pubkey', (SELECT pubkey_b64 FROM agent_pubkey_history WHERE agent_id = substr(archived_memories.title, length('agent:') + 1) AND superseded_at IS NULL), '$.pubkey_bound_at', (SELECT bound_at FROM agent_pubkey_history WHERE agent_id = substr(archived_memories.title, length('agent:') + 1) AND superseded_at IS NULL)) ELSE json_remove(archived_memories.content, '$.agent_pubkey', '$.pubkey_bound_at') END, '$.write_signature'), '$.attest_level', 'claimed') ELSE archived_memories.content END ELSE archived_memories.content END";
+
+    /// #9273 (code-scanning alert 881) pin. Rule: the restore columns built by
+    /// `archived_column` are byte-equal to their text at c73ea912, so the
+    /// explicit format argument that makes `column`'s use visible to the
+    /// scanner changes no SQL. Limit: it pins the two built strings, not their
+    /// behaviour; `restore_archived_projects_a_tampered_archive_8341` and the
+    /// `restore_archived` cells in tests/fts_corrupt_vtab_9273.rs hold that.
+    #[test]
+    fn restore_columns_are_byte_equal_to_c73ea912_9273() {
+        assert_eq!(
+            RESTORE_METADATA.as_str(),
+            RESTORE_METADATA_AT_C73EA912,
+            "RESTORE_METADATA drifted from c73ea912"
+        );
+        assert_eq!(
+            RESTORE_CONTENT.as_str(),
+            RESTORE_CONTENT_AT_C73EA912,
+            "RESTORE_CONTENT drifted from c73ea912"
         );
     }
 }
