@@ -18,6 +18,7 @@ of GitHub Actions) against stub inputs. Expected values are computed in Python; 
   ``cut -c`` cuts characters, GNU ``cut -c`` cuts bytes).
 """
 
+import errno
 import importlib.util
 import os
 import re
@@ -103,11 +104,64 @@ MIB_CEILING_SECS = 20.0
 # #9433 (ruling (a) 2): the impact print at the base a028c45e was this one line between the span anchors.
 BASE_SHA = "a028c45e55c7817b88c4b139347f407387e4a02c"
 BASE_IMPACT_SPAN = "sed -n '1,200{s/::/: :/g;p}' \"$impact_log\"\n"
-# (base rc, head rc) of the impact print, measured with GNU sed 4.9 at the base. "unreadable" differs:
-# sed exits 2, the head print exits 1; the conductor rules which one is right (needs-conductor in READY).
-# Until then the measured pair is pinned so any change of either is red.
-IMPACT_RC_TABLE = {"readable": (0, 0), "missing": (2, 2), "unreadable": (2, 1)}
-IMPACT_RC_PENDING_RULING = frozenset({"unreadable"})
+# Ruling 6dbbea2d (1): a log the impact print cannot open or read (any OSError) exits the head step's named
+# LOG_READ_FAIL_RC, equal to GNU sed's exit code for an input it cannot open; no other exception is mapped.
+READ_FAIL_RC = 2
+# GNU sed 4.9 at the base: 2 when the open fails ("can't read"), 4 when the open succeeds and the read fails
+# ("read error on", a directory). The head keeps the one constant for both (r1c READY, needs-conductor).
+BASE_SED_OPEN_FAIL_RC = 2
+BASE_SED_READ_ERROR_RC = 4
+# An exception Python does not catch exits 1 with a traceback: what every non-OSError must still do.
+PYTHON_UNCAUGHT_RC = 1
+# (base rc, head rc) of the impact print per log form; base measured with GNU sed 4.9 at a028c45e.
+IMPACT_RC_TABLE = {
+    "readable": (0, 0),
+    "missing": (BASE_SED_OPEN_FAIL_RC, READ_FAIL_RC),
+    "unreadable": (BASE_SED_OPEN_FAIL_RC, READ_FAIL_RC),
+    "dangling_symlink": (BASE_SED_OPEN_FAIL_RC, READ_FAIL_RC),
+    "symlink_loop": (BASE_SED_OPEN_FAIL_RC, READ_FAIL_RC),
+    "not_a_directory": (BASE_SED_OPEN_FAIL_RC, READ_FAIL_RC),
+    "directory": (BASE_SED_READ_ERROR_RC, READ_FAIL_RC),
+}
+# Exceptions that are not OSError, raised at the open and at a read of the log: never mapped to READ_FAIL_RC.
+NOT_OSERROR_CLASSES = ("ValueError", "RuntimeError", "UnicodeDecodeError", "MemoryError", "TypeError")
+INJECT_POINTS = ("open", "read")
+# A python3 stand-in that runs the REAL impact program text (argv: -I -c <program> <log>) with the open or the
+# reads of the log raising the exception named in the environment.
+IMPACT_INJECT_SHIM = '''import builtins, os
+program = sys.argv[3]
+sys.argv = ["-c"] + sys.argv[4:]
+kind = os.environ["INJECT_CLASS"]
+point = os.environ["INJECT_AT"]
+def make():
+    if kind == "OSError":
+        number = int(os.environ["INJECT_ERRNO"])
+        return OSError(number, os.strerror(number))
+    if kind == "UnicodeDecodeError":
+        return UnicodeDecodeError("utf-8", b"\\xff", 0, 1, "injected 9433")
+    return getattr(builtins, kind)("injected 9433")
+real_open = builtins.open
+class FailingLog:
+    def __init__(self, handle):
+        self.handle = handle
+    def __enter__(self):
+        return self
+    def __exit__(self, *exc):
+        self.handle.close()
+    def readline(self, *args):
+        raise make()
+    def __iter__(self):
+        raise make()
+    def read(self, *args):
+        raise make()
+def fake_open(path, *args, **kwargs):
+    if path != sys.argv[1]:
+        return real_open(path, *args, **kwargs)
+    if point == "open":
+        raise make()
+    return FailingLog(real_open(path, *args, **kwargs))
+builtins.open = fake_open
+exec(compile(program, "<impact-step>", "exec"), {"__name__": "__main__"})'''
 TRUST_DIR_MODE = 0o700
 TRUST_FILES = {"__init__.py": b"", "common.py": b"# trusted common 9434\n",
                "cargo_skip.py": b"# trusted decider 9434\n", "rules.json": b"{}\n"}
@@ -717,18 +771,29 @@ class ClassSiblings9433(unittest.TestCase):
         self.assertEqual(runner_commands(out)[1], False)
 
     def test_impact_print_exit_code_equals_the_base(self):
-        """Ruling (a) 2: the BASE step text (a028c45e) and the HEAD step text against a readable, a missing and
-        an unreadable log; exit codes pinned per IMPACT_RC_TABLE (equal, except a case pending the ruling)."""
+        """Ruling (a) 2 and 6dbbea2d (1): the BASE step text (a028c45e) and the HEAD step text against a readable
+        log and every read-failure form; (base rc, head rc) pinned per IMPACT_RC_TABLE, and every failure form
+        exits READ_FAIL_RC at the head."""
         base_text = base_workflow_text()
         if base_text is not None:
             self.assertEqual(impact_span(base_text), BASE_IMPACT_SPAN, "the base step text is not the pinned one")
-        readable = self.box.root / "impact-rc-readable.log"
+        root = self.box.root
+        readable = root / "impact-rc-readable.log"
         readable.write_bytes(b"selected ##[error]x\n::error::y\n")
-        unreadable = self.box.root / "impact-rc-unreadable.log"
+        unreadable = root / "impact-rc-unreadable.log"
         unreadable.write_bytes(b"::error::hidden\n")
         unreadable.chmod(0)
         self.assertNotEqual(os.geteuid(), 0, "run as a user that mode 000 denies (root reads it)")
-        logs = {"readable": readable, "missing": self.box.root / "impact-rc-missing.log", "unreadable": unreadable}
+        directory = root / "impact-rc-directory.log"
+        directory.mkdir()
+        dangling = root / "impact-rc-dangling.log"
+        dangling.symlink_to(root / "impact-rc-no-such-target")
+        loop = root / "impact-rc-loop.log"
+        loop.symlink_to(loop.name)
+        logs = {"readable": readable, "missing": root / "impact-rc-missing.log", "unreadable": unreadable,
+                "dangling_symlink": dangling, "symlink_loop": loop, "not_a_directory": readable / "sub",
+                "directory": directory}
+        self.assertEqual(set(logs), set(IMPACT_RC_TABLE))
         for name, log in logs.items():
             with self.subTest(log=name):
                 got = []
@@ -739,12 +804,45 @@ class ClassSiblings9433(unittest.TestCase):
                     got.append(result.returncode)
                     outs.append(result.stdout)
                 self.assertEqual(tuple(got), IMPACT_RC_TABLE[name], "(base rc, head rc) for a %s log" % name)
-                if name not in IMPACT_RC_PENDING_RULING:
-                    self.assertEqual(got[0], got[1], "head exit code differs from the base for a %s log" % name)
                 if name == "readable":
                     self.assertEqual(outs[0], outs[1].replace(b"# #[", b"##["))
                 else:
+                    self.assertEqual(got[1], READ_FAIL_RC, "head exit code for a %s log" % name)
                     self.assertEqual(outs, [b"", b""], "a failing print must print nothing and stop the step")
+
+    def run_impact_injected(self, bindir, log, kind, point, number=0):
+        return run_bash('impact_log="$STUB_LOG"\n' + impact_span() + 'echo "%s"\n' % AFTER_MARK, self.box.root,
+                        path=bindir, env_extra={"STUB_LOG": str(log), "INJECT_CLASS": kind, "INJECT_AT": point,
+                                                "INJECT_ERRNO": str(number)})[0]
+
+    def test_impact_read_failure_of_any_errno_exits_read_fail_rc(self):
+        """6dbbea2d (1), class invariant: an OSError of EVERY errno, at the open and at a read of the log, exits
+        READ_FAIL_RC, prints nothing to stdout and stops the step; an exception that is not an OSError is never
+        mapped (it escapes: PYTHON_UNCAUGHT_RC and a traceback)."""
+        log = self.box.root / "impact-inject.log"
+        log.write_bytes(b"::error::x\n##[group]y\n")
+        bindir = self.box.shim_bin("impact-inject", IMPACT_INJECT_SHIM)
+        numbers = sorted(errno.errorcode)
+        self.assertGreater(len(numbers), 100)
+        for point in INJECT_POINTS:
+            for number in numbers:
+                with self.subTest(point=point, errno=errno.errorcode[number]):
+                    result = self.run_impact_injected(bindir, log, "OSError", point, number)
+                    self.assertEqual(result.returncode, READ_FAIL_RC, result.stderr[-400:])
+                    self.assertEqual(result.stdout, b"")
+                    self.assertIn(b"[#9433] impact log not readable: ", result.stderr)
+                    self.assertNotIn(b"Traceback", result.stderr)
+            for kind in NOT_OSERROR_CLASSES:
+                with self.subTest(point=point, kind=kind):
+                    result = self.run_impact_injected(bindir, log, kind, point)
+                    self.assertEqual(result.returncode, PYTHON_UNCAUGHT_RC, result.stderr[-400:])
+                    self.assertEqual(result.stdout, b"")
+                    self.assertIn(b"Traceback", result.stderr)
+                    # the injected exception itself escapes: it is the last line, with no handler in between
+                    self.assertTrue(result.stderr.rstrip().splitlines()[-1].startswith(kind.encode() + b": "),
+                                    result.stderr[-400:])
+                    self.assertNotIn(b"During handling of the above exception", result.stderr)
+                    self.assertNotIn(b"impact log not readable", result.stderr)
 
     @staticmethod
     def impact_expected(log):

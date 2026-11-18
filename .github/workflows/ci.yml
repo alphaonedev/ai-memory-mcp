@@ -863,24 +863,35 @@ jobs:
           # The first 200 lines are printed with every "::" spaced to ": :" (as the
           # sed this replaces did) and every "##[" (the legacy command form, read
           # anywhere in a line) spaced to "# #["; Python, so a missing final
-          # newline is added and the next line always starts its own line. A missing
-          # log exits 2, as sed did (#9433 ruling (a) 2).
+          # newline is added and the next line always starts its own line. A log that
+          # cannot be opened or read (any OSError) exits LOG_READ_FAIL_RC = 2, the code
+          # sed gave for an input it could not open (#9433 ruling (a) 2, base parity).
+          # Only the open and the reads are guarded: no other failure is mapped.
           impact_print_rc=0
           python3 -I -c 'if True:
             import sys
+            LOG_READ_FAIL_RC = 2
             out = sys.stdout.buffer
             last = b"\n"
+            def read_failed(err):
+                sys.stderr.write("[#9433] impact log not readable: %s\n" % err.strerror)
+                sys.exit(LOG_READ_FAIL_RC)
             try:
-                with open(sys.argv[1], "rb") as log:
-                    for count, line in enumerate(log):
-                        if count >= 200:
+                try:
+                    log = open(sys.argv[1], "rb")
+                except OSError as err:
+                    read_failed(err)
+                with log:
+                    for _ in range(200):
+                        try:
+                            line = log.readline()
+                        except OSError as err:
+                            read_failed(err)
+                        if not line:
                             break
                         line = line.replace(b"##[", b"# #[").replace(b"::", b": :")
                         out.write(line)
                         last = line[-1:]
-            except OSError as err:
-                sys.stderr.write("[#9433] impact log not readable: %s\n" % err.strerror)
-                sys.exit(2 if isinstance(err, FileNotFoundError) else 1)
             finally:
                 if last != b"\n":
                     out.write(b"\n")
