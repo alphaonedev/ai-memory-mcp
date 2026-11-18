@@ -45,13 +45,40 @@ CI_ENV = "GITHUB_ACTIONS"
 # The text of the red a CI leg without cargo gets: a skip there would hide the real-manifest check.
 CI_NO_CARGO_MSG = "the real-manifest check cannot run on a CI leg without cargo: install cargo or fix PATH"
 NO_CARGO_SKIP_MSG = "cargo metadata unavailable: no cargo on PATH"
+# The text of the other CI red: cargo is on PATH and `cargo metadata` ran and failed. It carries the exit code and
+# the first stderr line, and never the install-cargo remedy, which would be wrong for this cause.
+CI_METADATA_FAILED_MSG = "the real-manifest check cannot run on a CI leg: cargo metadata failed"
+METADATA_SKIP_PREFIX = "cargo metadata unavailable"
+STDERR_LINE_MAX = 200  # characters of the first stderr line a message carries
+NO_STDERR_TEXT = "no stderr"
+# The pinned text of the other CI red: cargo ran and `cargo metadata` failed (written out, not imported from the helper).
+WANT_METADATA_MSG = "the real-manifest check cannot run on a CI leg: cargo metadata failed"
+WANT_NO_STDERR = "no stderr"
+WANT_LINE_MAX = 200
+METADATA_EXIT = 101
 
 
-def manifest_check_gap(environ, detail):
-    """What a test does when the real-manifest check cannot run: ("fail", text) on a CI leg, ("skip", text) elsewhere."""
-    if environ.get(CI_ENV) == "true":
-        return "fail", CI_NO_CARGO_MSG if detail is None else "%s (%s)" % (CI_NO_CARGO_MSG, detail)
-    return "skip", "cargo metadata unavailable: %s" % ("no cargo on PATH" if detail is None else detail)
+def first_stderr_line(stderr):
+    """The first non-blank line of a process's stderr bytes as text, at most STDERR_LINE_MAX characters."""
+    for line in stderr.decode("utf-8", errors="replace").splitlines():
+        if line.strip():
+            return line.strip()[:STDERR_LINE_MAX]
+    return NO_STDERR_TEXT
+
+
+def manifest_check_gap(environ, failure):
+    """What a test does when the real-manifest check cannot run: ("fail", text) on a CI leg, ("skip", text) elsewhere.
+
+    `failure` is None when cargo is missing from PATH, else (returncode, stderr bytes) of the failed `cargo metadata`.
+    """
+    on_ci = environ.get(CI_ENV) == "true"
+    if failure is None:
+        return ("fail", CI_NO_CARGO_MSG) if on_ci else ("skip", NO_CARGO_SKIP_MSG)
+    returncode, stderr = failure
+    line = first_stderr_line(stderr)
+    if on_ci:
+        return "fail", "%s (exit %d): %s" % (CI_METADATA_FAILED_MSG, returncode, line)
+    return "skip", "%s: exit %d: %s" % (METADATA_SKIP_PREFIX, returncode, line)
 
 
 def load():
@@ -372,7 +399,7 @@ class ShardArgs(unittest.TestCase):
                                       cwd=str(REPO), stdout=out, stderr=subprocess.PIPE, timeout=120,
                                       check=False)
             if proc.returncode != 0:
-                self.fail_or_skip(manifest_check_gap(os.environ, proc.stderr[-200:]))
+                self.fail_or_skip(manifest_check_gap(os.environ, (proc.returncode, proc.stderr)))
             data = json.loads(meta.read_text(encoding="utf-8"))
         args = self.sb.shard_args(data)
         names = args[1::2]
@@ -561,23 +588,58 @@ class RealManifestCheckOnCi(unittest.TestCase):
         self.assertEqual((result.failures, result.errors), ([], []))
         self.assertEqual([reason for _, reason in result.skipped], [NO_CARGO_SKIP_MSG])
 
-    def test_ci_leg_with_failing_cargo_metadata_fails_and_other_host_skips(self):
-        failed = subprocess.CompletedProcess([], 1, stderr=b"boom")
-        for environ, want in (({CI_ENV: "true"}, "fail"), ({}, "skip")):
-            case = ShardArgs(REAL_MANIFEST_TEST)
-            result = unittest.TestResult()
-            with mock.patch.dict(os.environ, environ), mock.patch.object(shutil, "which", return_value="cargo"), \
-                    mock.patch.object(subprocess, "run", return_value=failed):
-                if not environ:
-                    os.environ.pop(CI_ENV, None)
-                case.run(result)
-            if want == "fail":
-                self.assertEqual(result.skipped, [])
-                self.assertTrue(result.failures[0][1].rstrip().endswith(
-                    "AssertionError: %s (b'boom')" % CI_NO_CARGO_MSG))
-            else:
-                self.assertEqual((result.failures, result.errors), ([], []))
-                self.assertEqual([r for _, r in result.skipped], ["cargo metadata unavailable: b'boom'"])
+    def run_failing_metadata_cell(self, environ, returncode, stderr):
+        """The real-manifest cell with cargo on PATH and `cargo metadata` exiting `returncode` with `stderr`."""
+        failed = subprocess.CompletedProcess([], returncode, stderr=stderr)
+        case = ShardArgs(REAL_MANIFEST_TEST)
+        result = unittest.TestResult()
+        with mock.patch.dict(os.environ, environ), mock.patch.object(shutil, "which", return_value="cargo"), \
+                mock.patch.object(subprocess, "run", return_value=failed):
+            if CI_ENV not in environ:
+                os.environ.pop(CI_ENV, None)
+            case.run(result)
+        return result
+
+    def assert_ci_failure_message(self, result, message):
+        self.assertEqual(result.skipped, [])
+        self.assertEqual(len(result.failures), 1, result.errors)
+        self.assertTrue(result.failures[0][1].rstrip().endswith("AssertionError: " + message),
+                        result.failures[0][1])
+
+    def test_ci_leg_with_failing_cargo_metadata_names_the_metadata_failure(self):
+        """Cargo is on PATH: the red names the failed `cargo metadata`, its exit code and the first stderr line,
+        never the install-cargo remedy of the missing-cargo red."""
+        result = self.run_failing_metadata_cell({CI_ENV: "true"}, METADATA_EXIT,
+                                                b"error: failed to load manifest\ncaused by: second line\n")
+        self.assert_ci_failure_message(
+            result, "%s (exit %d): error: failed to load manifest" % (WANT_METADATA_MSG, METADATA_EXIT))
+        self.assertNotIn("install cargo", result.failures[0][1])
+
+    def test_ci_leg_stderr_line_table(self):
+        for label, stderr, line in (
+                ("empty stderr", b"", WANT_NO_STDERR),
+                ("blank stderr", b" \n\n", WANT_NO_STDERR),
+                ("leading blank lines", b"\n\n  boom\nsecond", "boom"),
+                ("non-utf8 bytes", b"bad \xff\xfe byte\nnext", "bad \ufffd\ufffd byte"),
+                ("line over the bound", b"x" * (WANT_LINE_MAX + 100) + b"\ny", "x" * WANT_LINE_MAX),
+                ("line at the bound", b"y" * WANT_LINE_MAX, "y" * WANT_LINE_MAX)):
+            with self.subTest(label):
+                result = self.run_failing_metadata_cell({CI_ENV: "true"}, METADATA_EXIT, stderr)
+                self.assert_ci_failure_message(
+                    result, "%s (exit %d): %s" % (WANT_METADATA_MSG, METADATA_EXIT, line))
+                self.assertNotIn("b'", result.failures[0][1])
+
+    def test_other_host_with_failing_cargo_metadata_skips_with_decoded_text(self):
+        result = self.run_failing_metadata_cell({}, METADATA_EXIT, b"boom\nsecond")
+        self.assertEqual((result.failures, result.errors), ([], []))
+        self.assertEqual([r for _, r in result.skipped],
+                         ["cargo metadata unavailable: exit %d: boom" % METADATA_EXIT])
+
+    def test_the_two_ci_causes_have_two_different_messages(self):
+        missing = self.run_real_manifest_cell({CI_ENV: "true"})
+        failed = self.run_failing_metadata_cell({CI_ENV: "true"}, METADATA_EXIT, b"boom")
+        self.assertNotEqual(missing.failures[0][1], failed.failures[0][1])
+        self.assertNotIn(CI_NO_CARGO_MSG, failed.failures[0][1])
 
 
 class WholeSuite(unittest.TestCase):
