@@ -227,6 +227,51 @@ fn forward_key_refusal(e: &crate::agent_key_file::ForwardKeyFileError) -> String
     format!("federation_forward: {e}; no request was sent")
 }
 
+/// #9367 K-2 — why the funnel returned no daemon body. Typed so the funnel
+/// adds no legacy string signature (QUAL-6); `Display` is the caller-facing
+/// text, which names the variable and the form, never the path or the key.
+#[derive(Debug)]
+enum ForwardAsAgentError {
+    /// The key file named by the variable is unusable; nothing was sent.
+    KeyFile(crate::agent_key_file::ForwardKeyFileError),
+    /// The variable is set but the explicit agent id could not be resolved.
+    IdentityUnresolved,
+    /// The variable is set but the id to send is not the explicit identity.
+    NotExplicitIdentity,
+    /// The request helper's own error text (#3698: no peer bytes in it).
+    Forward(String),
+}
+
+impl std::fmt::Display for ForwardAsAgentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let env = crate::agent_key_file::AGENT_API_KEY_FILE_ENV;
+        match self {
+            Self::KeyFile(e) => f.write_str(&forward_key_refusal(e)),
+            Self::IdentityUnresolved => write!(
+                f,
+                "federation_forward: {env} is set but the explicit agent id could not be resolved; no request was sent"
+            ),
+            Self::NotExplicitIdentity => write!(
+                f,
+                "federation_forward: {env} is set but {} is not; a per-agent key is sent only with the explicit agent id it is bound to; no request was sent",
+                crate::identity::ENV_AGENT_ID,
+            ),
+            Self::Forward(text) => f.write_str(text),
+        }
+    }
+}
+
+impl std::error::Error for ForwardAsAgentError {}
+
+/// The ONE conversion of the funnel's typed error into the MCP tool layer's
+/// string error; each of the three forward sites maps through it.
+fn forward_error_text(e: ForwardAsAgentError) -> String {
+    match e {
+        ForwardAsAgentError::Forward(text) => text,
+        local => local.to_string(),
+    }
+}
+
 /// #9367 K-6 — the ONE funnel every MCP forward site goes through (store,
 /// action transition, signal send). It is the only caller of the generic
 /// request helper above, so no forward site can send without this check.
@@ -246,9 +291,9 @@ fn forward_as_agent(
     url: &str,
     body: &Value,
     agent_id: String,
-) -> Result<Value, String> {
+) -> Result<Value, ForwardAsAgentError> {
     let api_key =
-        crate::agent_key_file::forward_key_from_env().map_err(|e| forward_key_refusal(&e))?;
+        crate::agent_key_file::forward_key_from_env().map_err(ForwardAsAgentError::KeyFile)?;
     if api_key.is_some() {
         let explicit = crate::identity::resolve_mcp_read_visibility_caller().map_err(|e| {
             tracing::warn!(
@@ -256,17 +301,10 @@ fn forward_as_agent(
                 error = %e,
                 "federation_forward: the explicit agent id could not be resolved"
             );
-            format!(
-                "federation_forward: {} is set but the explicit agent id could not be resolved; no request was sent",
-                crate::agent_key_file::AGENT_API_KEY_FILE_ENV
-            )
+            ForwardAsAgentError::IdentityUnresolved
         })?;
         if explicit.as_deref() != Some(agent_id.as_str()) {
-            return Err(format!(
-                "federation_forward: {} is set but {} is not; a per-agent key is sent only with the explicit agent id it is bound to; no request was sent",
-                crate::agent_key_file::AGENT_API_KEY_FILE_ENV,
-                crate::identity::ENV_AGENT_ID,
-            ));
+            return Err(ForwardAsAgentError::NotExplicitIdentity);
         }
     }
     let keyed_agent = api_key.as_ref().map(|_| agent_id.clone());
@@ -279,6 +317,7 @@ fn forward_as_agent(
         api_key.as_deref(),
         keyed_agent.as_deref(),
     )
+    .map_err(ForwardAsAgentError::Forward)
 }
 
 /// MCP `memory_store` → HTTP `POST {forward_url}/api/v1/memories`.
@@ -316,7 +355,7 @@ pub(super) fn forward_store_to_http(
     // The HTTP request body mirrors the MCP params; pass them through
     // and let the HTTP handler do all validation, governance, quota,
     // dedup, embedding, audit, and federation broadcast.
-    forward_as_agent(reqwest::Method::POST, &url, params, agent_id)
+    forward_as_agent(reqwest::Method::POST, &url, params, agent_id).map_err(forward_error_text)
 }
 
 /// #1718 — MCP `memory_action_transition` → HTTP
@@ -348,7 +387,7 @@ pub(crate) fn forward_action_transition_to_http(
     );
     let agent_id =
         crate::identity::resolve_agent_id(None, mcp_client).map_err(|e| e.to_string())?;
-    forward_as_agent(reqwest::Method::POST, &url, params, agent_id)
+    forward_as_agent(reqwest::Method::POST, &url, params, agent_id).map_err(forward_error_text)
 }
 
 /// #1718 — MCP `memory_signal_send` → HTTP `POST {forward_url}/api/v1/signals`,
@@ -373,7 +412,7 @@ pub(crate) fn forward_signal_send_to_http(
     // mismatching wire `from_agent` is refused before any network I/O.
     let agent_id = crate::identity::resolve_governance_subject(explicit, mcp_client, "signal_send")
         .map_err(|e| e.to_string())?;
-    forward_as_agent(reqwest::Method::POST, &url, params, agent_id)
+    forward_as_agent(reqwest::Method::POST, &url, params, agent_id).map_err(forward_error_text)
 }
 
 #[cfg(test)]
