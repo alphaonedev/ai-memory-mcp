@@ -19,6 +19,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use ai_memory::db;
+use ai_memory::db::schema_guard;
 use ai_memory::models::{Memory, Tier};
 use rusqlite::Connection;
 
@@ -118,10 +119,29 @@ fn link_unreadable_cid_is_err_not_null_mirror() {
     let res = db::create_link(&conn, CHILD_ID, PARENT_ID, RELATION);
     ai_memory::config::set_lineage_dag(false);
     let err = res.expect_err("cid decode error must surface");
-    assert!(
-        format!("{err:#}").contains(ERR_CID_BLOB),
-        "unexpected error text: {err:#}"
-    );
+    assert_eq!(err.to_string(), ERR_CID_BLOB);
+    assert_eq!(link_rows(&conn), 0, "no link row on a stopped write");
+}
+
+/// Security M3 — the TARGET endpoint's cid read must surface too (a fold on
+/// the target side alone used to survive every cell).
+#[test]
+fn link_unreadable_target_cid_is_err_not_null_mirror() {
+    let _g = flag_guard();
+    ai_memory::config::set_lineage_dag(true);
+    let conn = open_db("link_target_cid_unreadable");
+    seed_pair(&conn);
+    set_column(&conn, "cid", UNREADABLE_BLOB_SQL, PARENT_ID);
+    let res = db::create_link(&conn, CHILD_ID, PARENT_ID, RELATION);
+    ai_memory::config::set_lineage_dag(false);
+    let err = res.expect_err("target cid decode error must surface");
+    assert_eq!(err.to_string(), ERR_CID_BLOB);
+    assert_eq!(link_rows(&conn), 0, "no link row on a stopped write");
+}
+
+fn link_rows(conn: &Connection) -> i64 {
+    conn.query_row("SELECT COUNT(*) FROM memory_links", [], |r| r.get(0))
+        .expect("count links")
 }
 
 #[test]
@@ -148,10 +168,94 @@ fn link_unreadable_created_at_is_err_not_admitted() {
     let res = db::create_link(&conn, CHILD_ID, PARENT_ID, RELATION);
     ai_memory::config::set_lineage_dag(false);
     let err = res.expect_err("created_at decode error must stop the link");
-    assert!(
-        format!("{err:#}").contains(ERR_CREATED_AT_BLOB),
-        "unexpected error text: {err:#}"
+    assert_eq!(err.to_string(), ERR_CREATED_AT_BLOB);
+    assert_eq!(link_rows(&conn), 0, "no link row on a stopped write");
+}
+
+// ---- #9484: an unparsable created_at is an Err, never "not forward" -------
+
+/// Readable TEXT that is not RFC 3339: each one used to answer "not forward"
+/// and ADMIT the edge (security F1, #9484).
+const UNPARSABLE_CREATED_AT: &[&str] = &["", "not-a-timestamp", "2026-13-40T00:00:00Z"];
+
+fn err_unparsable_created_at(id: &str) -> String {
+    format!(
+        "lineage guard: memory {id}: created_at is not an RFC 3339 timestamp, so the edge \
+         direction cannot be established; the link is refused"
+    )
+}
+
+fn unparsable_created_at_case(test: &str, poisoned: &str) {
+    for (n, value) in UNPARSABLE_CREATED_AT.iter().enumerate() {
+        let _g = flag_guard();
+        ai_memory::config::set_lineage_dag(true);
+        let conn = open_db(&format!("{test}_{n}"));
+        seed_pair(&conn);
+        set_column(&conn, "created_at", &format!("'{value}'"), poisoned);
+        let res = db::create_link(&conn, CHILD_ID, PARENT_ID, RELATION);
+        ai_memory::config::set_lineage_dag(false);
+        let err = res.expect_err("an unparsable created_at must stop the link");
+        assert_eq!(
+            err.to_string(),
+            err_unparsable_created_at(poisoned),
+            "value {value:?}"
+        );
+        assert_eq!(link_rows(&conn), 0, "value {value:?}: no link row");
+    }
+}
+
+#[test]
+fn link_unparsable_source_created_at_is_err_and_writes_no_row() {
+    unparsable_created_at_case("link_unparsable_source", CHILD_ID);
+}
+
+#[test]
+fn link_unparsable_target_created_at_is_err_and_writes_no_row() {
+    unparsable_created_at_case("link_unparsable_target", PARENT_ID);
+}
+
+/// The forward (older -> newer) refusal is unchanged by #9484.
+#[test]
+fn link_forward_edge_is_still_refused_as_a_cycle() {
+    let _g = flag_guard();
+    ai_memory::config::set_lineage_dag(true);
+    let conn = open_db("link_forward_refused");
+    seed_pair(&conn);
+    let res = db::create_link(&conn, PARENT_ID, CHILD_ID, RELATION);
+    ai_memory::config::set_lineage_dag(false);
+    let err = res.expect_err("forward edge refused");
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "{}: {PARENT_ID} --reflects_on--> {CHILD_ID} would close a cycle",
+            ai_memory::db::LINK_CYCLE_ERR_PREFIX
+        )
     );
+    assert_eq!(link_rows(&conn), 0);
+}
+
+/// The equal-instant path is unchanged: a clean edge is admitted, and the
+/// reverse edge that would close a 2-cycle is refused.
+#[test]
+fn link_equal_instant_admits_clean_edge_and_refuses_the_cycle() {
+    let _g = flag_guard();
+    ai_memory::config::set_lineage_dag(true);
+    let conn = open_db("link_equal_instant");
+    db::insert(&conn, &mem(CHILD_ID, NEWER_STAMP)).expect("insert child");
+    db::insert(&conn, &mem(PARENT_ID, NEWER_STAMP)).expect("insert parent");
+    let first = db::create_link(&conn, CHILD_ID, PARENT_ID, RELATION);
+    let second = db::create_link(&conn, PARENT_ID, CHILD_ID, RELATION);
+    ai_memory::config::set_lineage_dag(false);
+    first.expect("clean equal-instant edge admitted");
+    let err = second.expect_err("cycle-closing equal-instant edge refused");
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "{}: {PARENT_ID} --reflects_on--> {CHILD_ID} would close a cycle",
+            ai_memory::db::LINK_CYCLE_ERR_PREFIX
+        )
+    );
+    assert_eq!(link_rows(&conn), 1);
 }
 
 // ---- cli::verify::run (the `verify-reflection-chain` root cid line) --------
@@ -252,41 +356,284 @@ fn genesis_missing_column_is_named_schema_error_not_none() {
     assert_eq!(err.to_string(), ERR_GENESIS_COLUMN_MISSING);
 }
 
-/// Build a v73-shaped scratch database: a migrated store with the v74 columns
-/// dropped and the stamp rolled back to 73.
+/// Build a v73-shaped scratch database: a migrated store holding the seeded
+/// pair, with the v74 columns dropped and the stamp set to a REAL 73 (security
+/// r1: deleting the row produced an unstamped store, not a v73 one).
 fn v73_shaped_db(test: &str) -> PathBuf {
     let path = scratch_path(test);
     let conn = db::open(&path).expect("open explicit db");
+    seed_pair(&conn);
+    drop_pre_v74_columns(&conn);
+    set_stamp(&conn, PRE_V74_STAMP);
+    path
+}
+
+fn drop_pre_v74_columns(conn: &Connection) {
     for sql in DROP_PRE_V74_COLUMNS_SQL {
         conn.execute(sql, [])
             .unwrap_or_else(|e| panic!("{sql}: {e}"));
     }
-    conn.execute(
-        "DELETE FROM schema_version WHERE version > ?1",
-        [PRE_V74_STAMP],
-    )
-    .expect("roll back stamp");
-    path
+}
+
+fn set_stamp(conn: &Connection, stamp: i64) {
+    let n = conn
+        .execute("UPDATE schema_version SET version = ?1", [stamp])
+        .expect("set stamp");
+    assert_eq!(n, 1, "one stamp row");
+}
+
+fn read_stamp(conn: &Connection) -> i64 {
+    conn.query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
+        .expect("read stamp")
 }
 
 #[test]
 fn pre_v74_read_only_open_is_refused_before_any_provenance_read() {
     let path = v73_shaped_db("pre_v74_read_only");
     let err = db::open_existing_read_only(&path).expect_err("behind stamp is refused");
+    let expected = schema_guard::SchemaBehindReadOnly::new(
+        PRE_V74_STAMP,
+        schema_guard::BACKEND_SQLITE,
+        &path.display().to_string(),
+    );
+    assert_eq!(err.to_string(), expected.to_string());
+    assert!(expected.detail.contains(ERR_BEHIND_READ_ONLY_MARKER));
+    assert_eq!(expected.observed, PRE_V74_STAMP);
+}
+
+// ---- #9496: the classifier names only the cause it read (invariant B) -----
+
+const ROOT_NO_SUCH_GENESIS: &str = "no such column: cid_genesis";
+
+/// A REAL v73 store (stamp row = 73): the pre-v74 text, unchanged.
+#[test]
+fn genesis_missing_column_on_real_v73_stamp_is_pre_v74_error() {
+    let path = v73_shaped_db("genesis_real_v73");
+    let conn = Connection::open(&path).expect("raw open, no migration");
+    assert_eq!(read_stamp(&conn), PRE_V74_STAMP);
+    let err = db::read_cid_genesis(&conn, CHILD_ID).expect_err("missing column is an error");
+    assert_eq!(err.to_string(), ERR_GENESIS_COLUMN_MISSING);
+    assert_eq!(err.root_cause().to_string(), ROOT_NO_SUCH_GENESIS);
+}
+
+/// Stamp at the tip (>= v74) with the column gone: a DISTINCT error that does
+/// not tell the operator to migrate (#9496).
+#[test]
+fn genesis_missing_column_at_current_stamp_is_distinct_not_migrate() {
+    let path = scratch_path("genesis_at_tip_stamp");
+    let conn = db::open(&path).expect("open explicit db");
+    seed_pair(&conn);
+    drop_pre_v74_columns(&conn);
+    let tip = ai_memory::db::current_schema_version_for_tests();
+    assert_eq!(read_stamp(&conn), tip);
+    let err = db::read_cid_genesis(&conn, CHILD_ID).expect_err("missing column is an error");
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "provenance column memories.cid_genesis is missing, but this database is stamped \
+             schema v{tip}, which has it (added at v74): the stamp and the table shape \
+             disagree, and a migrating open does not re-add the column. Repair: restore the \
+             database from a backup, then re-run."
+        )
+    );
+    assert!(!err.to_string().contains("migrate"), "no migrate advice");
+    assert_eq!(err.root_cause().to_string(), ROOT_NO_SUCH_GENESIS);
+}
+
+/// Exactly v74 is already "has the column": the boundary is `>=`, not `>`.
+#[test]
+fn genesis_missing_column_at_stamp_74_is_distinct_not_migrate() {
+    let path = scratch_path("genesis_at_stamp_74");
+    let conn = db::open(&path).expect("open explicit db");
+    seed_pair(&conn);
+    drop_pre_v74_columns(&conn);
+    set_stamp(&conn, PRE_V74_STAMP + 1);
+    let err = db::read_cid_genesis(&conn, CHILD_ID).expect_err("missing column is an error");
     assert!(
-        err.to_string().contains(ERR_BEHIND_READ_ONLY_MARKER),
-        "unexpected refusal: {err:#}"
+        err.to_string().starts_with(
+            "provenance column memories.cid_genesis is missing, but this database is stamped \
+             schema v74, which has it"
+        ),
+        "unexpected: {err:#}"
+    );
+}
+
+/// The stamp cannot be read: its own error, no cause named.
+#[test]
+fn genesis_missing_column_with_unreadable_stamp_is_own_error() {
+    let path = scratch_path("genesis_unreadable_stamp");
+    let conn = Connection::open(&path).expect("open bare db");
+    conn.execute_batch(
+        "CREATE TABLE memories (id TEXT PRIMARY KEY);
+         CREATE TABLE schema_version (version TEXT);
+         INSERT INTO schema_version VALUES ('not-a-version');",
+    )
+    .expect("store with an unreadable stamp");
+    let err = db::read_cid_genesis(&conn, CHILD_ID).expect_err("missing column is an error");
+    assert_eq!(
+        err.to_string(),
+        "provenance column memories.cid_genesis is missing and the recorded schema version \
+         cannot be read, so the cause is not established. Inspect the database before any \
+         repair."
+    );
+    let chain: Vec<String> = err.chain().map(ToString::to_string).collect();
+    assert_eq!(
+        chain[1..],
+        [
+            ROOT_NO_SUCH_GENESIS.to_string(),
+            "read the recorded schema version".to_string(),
+            "Invalid column type Text at index: 0, name: COALESCE(MAX(version), 0)".to_string(),
+        ]
+    );
+}
+
+/// A populated store whose stamp row says 0: its own error, no cause named.
+#[test]
+fn genesis_missing_column_with_zeroed_stamp_is_own_error() {
+    let path = scratch_path("genesis_zeroed_stamp");
+    let conn = db::open(&path).expect("open explicit db");
+    seed_pair(&conn);
+    drop_pre_v74_columns(&conn);
+    set_stamp(&conn, 0);
+    let err = db::read_cid_genesis(&conn, CHILD_ID).expect_err("missing column is an error");
+    assert_eq!(
+        err.to_string(),
+        "provenance column memories.cid_genesis is missing and the recorded schema version is \
+         v0, which no migration writes, so the cause is not established. Inspect the database \
+         before any repair."
+    );
+}
+
+/// No `memories` table at all: never "older than v74".
+#[test]
+fn genesis_with_no_memories_table_is_own_error() {
+    let path = scratch_path("genesis_no_memories_table");
+    let conn = Connection::open(&path).expect("open bare db");
+    let err = db::read_cid_genesis(&conn, CHILD_ID).expect_err("no table is an error");
+    assert_eq!(
+        err.to_string(),
+        "provenance read of memories.cid_genesis failed: the memories table does not exist in \
+         this database. Check the database path."
+    );
+    assert_eq!(err.root_cause().to_string(), "no such table: memories");
+}
+
+/// Security M7 / code M7: `read_memory_cid` (the `memories.cid` read in front
+/// of a lineage link) is classified too, and names `cid`, not `cid_genesis`.
+#[test]
+fn link_on_real_v73_store_names_the_cid_column() {
+    let _g = flag_guard();
+    ai_memory::config::set_lineage_dag(true);
+    let path = v73_shaped_db("link_real_v73");
+    let conn = Connection::open(&path).expect("raw open, no migration");
+    let res = db::create_link(&conn, CHILD_ID, PARENT_ID, RELATION);
+    ai_memory::config::set_lineage_dag(false);
+    let err = res.expect_err("missing cid column must stop the link");
+    assert_eq!(
+        err.to_string(),
+        "provenance column memories.cid is missing: this database is on a schema older than \
+         v74 (the content-id columns). Repair: `ai-memory migrate --in-place` or start the \
+         daemon, then re-run."
+    );
+    assert_eq!(link_rows(&conn), 0);
+}
+
+// ---- import: the backfill cid read surfaces and names the link -------------
+
+/// Security M2 / code M6: a legacy bundle (no cids on the links) makes the
+/// importer BACKFILL each endpoint's `memories.cid`; an unreadable one must
+/// stop the import and name the link, never import a NULL mirror.
+fn import_with_unreadable_endpoint_cid(test: &str, poisoned: &str) -> String {
+    use ai_memory::portability::{emit, import};
+    let _g = flag_guard();
+    ai_memory::config::set_lineage_dag(true);
+    let src = open_db(&format!("{test}_src"));
+    seed_pair(&src);
+    db::create_link(&src, CHILD_ID, PARENT_ID, RELATION).expect("source link");
+    let envelope = emit::build_full_envelope(&src, "src", NEWER_STAMP).expect("export");
+    let json = serde_json::to_string(&envelope).expect("serialize");
+    let mut parsed: emit::ExportEnvelope = serde_json::from_str(&json).expect("parse");
+    for l in &mut parsed.links {
+        l.source_cid = None;
+        l.target_cid = None;
+    }
+    let dst = open_db(&format!("{test}_dst"));
+    dst.execute_batch(&format!(
+        "CREATE TRIGGER poison_cid AFTER INSERT ON memories WHEN NEW.id = '{poisoned}' \
+         BEGIN UPDATE memories SET cid = {UNREADABLE_BLOB_SQL} WHERE id = NEW.id; END;"
+    ))
+    .expect("poison trigger");
+    let opts = import::ImportOptions {
+        trust_source: true,
+        caller_agent_id: "importer".into(),
+        ..import::ImportOptions::default()
+    };
+    let res = import::import_full_envelope(&dst, &parsed, &opts);
+    ai_memory::config::set_lineage_dag(false);
+    let err = res.expect_err("an unreadable endpoint cid must stop the import");
+    assert_eq!(link_rows(&dst), 0, "no link row imported");
+    format!("{err:#}")
+}
+
+#[test]
+fn import_unreadable_source_cid_is_err_naming_the_link() {
+    let got = import_with_unreadable_endpoint_cid("import_source_cid", CHILD_ID);
+    assert_eq!(
+        got,
+        format!(
+            "import link {CHILD_ID}->{PARENT_ID} ({RELATION}): read source cid: {ERR_CID_BLOB}"
+        )
     );
 }
 
 #[test]
-fn pre_v74_migrating_open_adds_the_columns_so_the_read_is_ok_none() {
+fn import_unreadable_target_cid_is_err_naming_the_link() {
+    let got = import_with_unreadable_endpoint_cid("import_target_cid", PARENT_ID);
+    assert_eq!(
+        got,
+        format!(
+            "import link {CHILD_ID}->{PARENT_ID} ({RELATION}): read target cid: {ERR_CID_BLOB}"
+        )
+    );
+}
+
+// ---- SAL: SqliteStore::verify surfaces the genesis read (code M8) ---------
+
+#[cfg(feature = "sal")]
+#[tokio::test]
+async fn store_verify_unreadable_genesis_is_err_not_unverified() {
+    use ai_memory::store::sqlite::SqliteStore;
+    use ai_memory::store::{CallerContext, MemoryStore};
+    let path = seeded_verify_db("store_verify_unreadable", Some(UNREADABLE_TEXT_SQL));
+    let store = SqliteStore::open(&path).expect("open store");
+    let err = store
+        .verify(&CallerContext::for_agent("alice"), CHILD_ID)
+        .await
+        .expect_err("an unreadable genesis must fail verify");
+    assert_eq!(
+        err.to_string(),
+        format!("backend unavailable: {ERR_GENESIS_TEXT}")
+    );
+}
+
+#[test]
+fn pre_v74_migrating_open_backfills_the_genesis_so_the_read_is_ok_some() {
     let path = v73_shaped_db("pre_v74_migrating");
     // `db::open` is the open every verb that reads provenance uses (verify,
-    // import, link create): it migrates first, so the read never sees the
-    // missing column. The migration itself never reads the column.
+    // import, link create): on a real v73 stamp it runs the v74 step, which
+    // re-adds the column and backfills it, so the read never sees the
+    // missing column. The backfill is the genesis a store that never lost
+    // the column holds for the same row.
     let conn = db::open(&path).expect("migration must not need the v74 column");
-    assert_eq!(db::read_cid_genesis(&conn, CHILD_ID).unwrap(), None);
+    let intact = db::open(&scratch_path("pre_v74_migrating_intact")).expect("open intact db");
+    seed_pair(&intact);
+    let expected = db::read_cid_genesis(&intact, CHILD_ID)
+        .expect("intact read")
+        .expect("an intact store holds a genesis");
+    assert_eq!(
+        db::read_cid_genesis(&conn, CHILD_ID).expect("migrated read"),
+        Some(expected)
+    );
 }
 
 // ---- PostgreSQL twin: consolidate source cid read -------------------------
@@ -368,6 +715,7 @@ mod pg_twin {
     #[tokio::test]
     async fn pg_consolidate_unreadable_source_cid_is_err() {
         let Ok(url) = std::env::var("AI_MEMORY_TEST_POSTGRES_URL") else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
             return;
         };
         let (_scratch, store, ids, ns) = seeded(&url).await;
@@ -384,6 +732,7 @@ mod pg_twin {
     #[tokio::test]
     async fn pg_consolidate_null_source_cid_is_ok() {
         let Ok(url) = std::env::var("AI_MEMORY_TEST_POSTGRES_URL") else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
             return;
         };
         let (_scratch, store, ids, ns) = seeded(&url).await;
