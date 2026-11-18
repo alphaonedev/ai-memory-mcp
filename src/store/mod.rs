@@ -945,6 +945,7 @@ pub(crate) fn delete_link_owner_sql(id: &str, sql: &'static str) -> &'static str
 }
 
 #[cfg(test)]
+#[path = "delete_link_owner_9466_tests.rs"]
 pub(crate) mod delete_link_owner_9466;
 
 // ---------------------------------------------------------------------------
