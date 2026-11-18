@@ -230,6 +230,21 @@ fn recall_mode_capabilities_consistent() {
     let _ = RecallMode::Disabled; // keep the import live for readers
 }
 
+/// #9509/#9515 - the real local embedder, built from the staged offline cache.
+/// A missing cache keeps its named failure (no skip), and with the cache
+/// present `new_local` resolves it cache-first, so no model is fetched from
+/// the network. CI stages the cache with `scripts/ci/stage_hf_cache.py`.
+fn staged_local_embedder() -> ai_memory::embeddings::Embedder {
+    if let Err(e) = ai_memory::embeddings::Embedder::load_from_fallback() {
+        panic!(
+            "prerequisite missing: offline embedder cache ({e}). Stage it with \
+             scripts/ci/stage_hf_cache.py (#9509); this is NOT a failure of the test body"
+        );
+    }
+    ai_memory::embeddings::Embedder::new_local()
+        .expect("staged cache must build the local embedder")
+}
+
 /// The brief asks: call embedder with a controlled-failure mock,
 /// assert returned `EmbedStatus::Failed(_)`.
 ///
@@ -249,19 +264,9 @@ fn recall_mode_capabilities_consistent() {
 fn embed_status_surfaces_failure() {
     // ----- Skipped: oversized content --------------------------------------
     // We need any working Embedder to call `embed_with_status` —
-    // construct via the public API and short-circuit on environments
-    // where the local model isn't available.
-    let local = match ai_memory::embeddings::Embedder::new_local() {
-        Ok(e) => e,
-        Err(_) => {
-            // No HF cache + no network → can't run the success-path
-            // half of this test. Skip cleanly so CI on offline workers
-            // doesn't fail; the contract is still pinned by the lower
-            // layers (the EmbedStatus enum has its own unit tests in
-            // src/embeddings.rs).
-            return;
-        }
-    };
+    // build it from the staged offline cache (#9509); a missing cache is
+    // the named failure, never a skip.
+    let local = staged_local_embedder();
 
     // 1. Empty content → Skipped("empty content")
     let (vec_empty, status_empty) = local.embed_with_status("");

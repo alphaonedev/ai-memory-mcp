@@ -45,9 +45,17 @@ JOB_ID_RE = re.compile(r"^  ([A-Za-z0-9_-]+):\s*$")
 STEP_RE = re.compile(r"^      - (?:name: (?P<name>.*)|uses: .*)$")
 
 # Rust test code that builds the real embedder (not the Mock).
-EMBEDDER_CALL_RE = re.compile(r"(?<![A-Za-z0-9_])Embedder::(?:new_local|new)\(\)")
+EMBEDDER_CALL_RE = re.compile(
+    r"(?<![A-Za-z0-9_])Embedder::(?:(?:new_local|new)\(\)|for_model\(\s*(?:crate::config::)?EmbeddingModel::MiniLmL6V2)"
+)
 FN_START_RE = re.compile(r"^\s*(?:pub(?:\([a-z]+\))? )?(?:async )?fn [A-Za-z0-9_]+", re.M)
-PREREQ_MARKERS = ("AI_MEMORY_EMBED_OFFLINE", "HF_HUB_OFFLINE", "load_from_fallback")
+PREREQ_MARKERS = (
+    "AI_MEMORY_EMBED_OFFLINE",
+    "HF_HUB_OFFLINE",
+    "load_from_fallback",
+    "offline_empty_cache_error",
+    "with_offline_staged_embedder",
+)
 RUST_TEST_GLOBS = ("tests/*.rs", "src/handlers/tests.rs", "src/embeddings.rs")
 
 

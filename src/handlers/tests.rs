@@ -32,7 +32,6 @@ use serde_json::json;
 // pre-split mod.rs. Re-declared here at this file's top so the
 // inline tests below resolve identifiers identically.
 use crate::config::ResolvedTtl;
-use crate::embeddings::Embedder;
 use crate::models::Tier;
 use crate::profile::Family;
 use chrono::Duration;
@@ -15692,31 +15691,26 @@ fn b3_precompute_with_no_embedder_returns_empty() {
 
 #[test]
 fn b3_precompute_with_local_embedder_populates_eight_descriptors() {
-    // Boot with a real local embedder when the model is downloadable
-    // in this environment; otherwise skip — keeps CI green on
-    // sandboxed runners that block hf-hub.
-    let Ok(embedder) = Embedder::new_local() else {
-        eprintln!(
-            "b3_precompute_with_local_embedder_populates_eight_descriptors: \
-             Embedder::new_local() failed (likely sandboxed network); skipping",
-        );
-        return;
-    };
-    let cache =
-        AppState::precompute_family_embeddings(Some(&embedder as &dyn crate::embeddings::Embed));
-    assert_eq!(
-        cache.len(),
-        8,
-        "embedder-available boot must produce 8 family-descriptor embeddings",
-    );
-    let dim = embedder.dim();
-    for (family, vec) in &cache {
+    // #9509/#9515 - boots a REAL local embedder from the staged offline cache
+    // (never from the network). A missing cache keeps its named failure
+    // ("prerequisite missing: offline embedder cache"); there is no skip.
+    crate::embeddings::test_support::with_offline_staged_embedder(|embedder| {
+        let cache =
+            AppState::precompute_family_embeddings(Some(embedder as &dyn crate::embeddings::Embed));
         assert_eq!(
-            vec.len(),
-            dim,
-            "descriptor vector for {family:?} must match embedder dim",
+            cache.len(),
+            8,
+            "embedder-available boot must produce 8 family-descriptor embeddings",
         );
-    }
+        let dim = embedder.dim();
+        for (family, vec) in &cache {
+            assert_eq!(
+                vec.len(),
+                dim,
+                "descriptor vector for {family:?} must match embedder dim",
+            );
+        }
+    });
 }
 
 #[test]

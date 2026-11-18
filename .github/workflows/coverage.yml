@@ -402,63 +402,17 @@ jobs:
           restore-keys: |
             hf-models-minilm-l6-v2-marco-l6-v2-
 
-      - name: Pre-stage HF models with retry (#2019)
-        env:
-          # #2019b — bypass the HF Xet CAS backend (cas-server.xethub.hf.co),
-          # which intermittently returns 401 on the reconstruction endpoint and
-          # failed the pre-stage on 2026-07-14. The Rust hf-hub the tests use is
-          # classic (non-Xet), so the staged classic cache is what they read.
-          HF_HUB_DISABLE_XET: "1"
-        run: |
-          set -euo pipefail
-          python3 -m pip install --quiet --disable-pip-version-check "huggingface_hub>=0.20" \
-            || pip3 install --quiet "huggingface_hub>=0.20"
-          for m in sentence-transformers/all-MiniLM-L6-v2 cross-encoder/ms-marco-MiniLM-L-6-v2; do
-            ok=0
-            for attempt in 1 2 3 4 5; do
-              if python3 -c "from huggingface_hub import snapshot_download; snapshot_download('$m')"; then
-                echo "::notice::staged $m (attempt $attempt)"; ok=1; break
-              fi
-              echo "::warning::hf fetch $m attempt $attempt failed; retry in $((attempt*10))s"
-              sleep $((attempt*10))
-            done
-            [ "$ok" = 1 ] || { echo "::error::could not stage $m after 5 attempts"; exit 1; }
-          done
-
-      # #2019 — VERIFY the Python-staged cache is resolvable by the RUST
-      # `hf-hub` 0.5 loader the tests actually use. `ApiRepo::get()` is
-      # cache-first: it reads `refs/main` → resolves `snapshots/<commit>/
-      # <file>` and returns it WITHOUT any network call, falling through to
-      # a live download ONLY on a cache MISS. So the reranker
-      # (`Api::new().get(...)`) + embedder (`download_via_hf_hub` → `.get()`)
-      # never touch the network as long as the staged layout matches what
-      # `hf-hub::Cache::get` expects. `huggingface_hub` (the pre-stage tool)
-      # and `hf-hub` (the test loader) are DIFFERENT tools, so this step
-      # asserts the layout the Rust side resolves rather than trusting the
-      # Python writer — a mismatch fails LOUD here (deterministic staging
-      # error) instead of silently degrading to the keyword path and
-      # dropping reranker.rs / embeddings.rs / daemon_runtime.rs below floor.
-      - name: Verify staged HF cache is hf-hub-resolvable (#2019)
-        run: |
-          set -euo pipefail
-          hub="$HOME/.cache/huggingface/hub"
-          # repo dir name = models--<org>--<name>; artifact files mirror the
-          # crate consts HF_{CONFIG,TOKENIZER,WEIGHTS}_FILE in src/embeddings.rs.
-          for repo in \
-            models--sentence-transformers--all-MiniLM-L6-v2 \
-            models--cross-encoder--ms-marco-MiniLM-L-6-v2; do
-            base="$hub/$repo"
-            ref="$base/refs/main"
-            [ -f "$ref" ] || { echo "::error::missing ref $ref — cache not hf-hub-resolvable"; exit 1; }
-            commit="$(tr -d '[:space:]' < "$ref")"
-            snap="$base/snapshots/$commit"
-            [ -d "$snap" ] || { echo "::error::missing snapshot dir $snap for $repo"; exit 1; }
-            for f in config.json tokenizer.json model.safetensors; do
-              # -e follows symlinks (hf cache snapshots are symlinks into blobs/).
-              [ -e "$snap/$f" ] || { echo "::error::missing $f in $snap ($repo)"; exit 1; }
-            done
-            echo "::notice::$repo resolvable at $snap (all 3 artifacts present)"
-          done
+      # #2019/#9509 — pre-stage (bounded retries, classic non-Xet cache) and
+      # VERIFY that the staged layout is resolvable by the RUST `hf-hub` 0.5
+      # loader the tests use (`ApiRepo::get()` is cache-first: refs/main ->
+      # snapshots/<commit>/<file>, no network on a hit). `huggingface_hub` (the
+      # staging tool) and `hf-hub` (the test loader) are DIFFERENT tools, so the
+      # script asserts the layout the Rust side resolves; a mismatch ends here
+      # with a named exit code (10 layout, 11 fetch, 12 install) instead of
+      # silently degrading to the keyword path. One implementation shared with
+      # the ci.yml `check` job: scripts/ci/stage_hf_cache.py (#9509).
+      - name: Stage HF models (#2019, #9509)
+        run: python3 -I scripts/ci/stage_hf_cache.py --models all
 
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@6001e75680da9482e125349961b715573ec77af8 # cargo-llvm-cov

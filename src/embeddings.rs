@@ -3038,6 +3038,95 @@ pub mod test_hold_hook;
 pub mod test_support {
     use super::*;
 
+    /// #9509/#9515 - the named prerequisite text, shared with
+    /// `tests/coverage_uplift_3885.rs` so a missing offline embedder cache
+    /// reads the same wherever a test needs it.
+    pub const OFFLINE_CACHE_PREREQUISITE: &str = "prerequisite missing: offline embedder cache";
+    /// Start of the error `load_from_fallback` returns on a cache miss.
+    pub const OFFLINE_CACHE_MISS_PREFIX: &str =
+        "model files not found in the pre-staged HuggingFace cache";
+
+    /// Restores the variables [`with_offline_env`] owns, also on a panic.
+    struct OfflineEnvGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+    impl Drop for OfflineEnvGuard {
+        fn drop(&mut self) {
+            for (k, v) in &self.0 {
+                // SAFETY: serialized via the crate env LOCK held by the caller.
+                unsafe {
+                    match v {
+                        Some(v) => std::env::set_var(k, v),
+                        None => std::env::remove_var(k),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Run `f` with the offline knob set (`AI_MEMORY_EMBED_OFFLINE=1`, so
+    /// `new_local` takes the staged-cache path and can never reach the
+    /// network, #9515) and `HF_HUB_OFFLINE` removed so only the knob under
+    /// test produces the posture. `home` is the new `HOME` and `HF_HOME` is
+    /// `home/hf-home` when `Some`; `None` keeps the ambient cache.
+    fn with_offline_env<R>(home: Option<&std::path::Path>, f: impl FnOnce() -> R) -> R {
+        let _lock = crate::config::test_env_lock();
+        let keys = [
+            "HOME",
+            "HF_HOME",
+            "AI_MEMORY_EMBED_OFFLINE",
+            HF_HUB_OFFLINE_ENV,
+        ];
+        let _restore = OfflineEnvGuard(keys.iter().map(|k| (*k, std::env::var_os(k))).collect());
+        // SAFETY: serialized via the crate env LOCK; no other thread mutates these.
+        unsafe {
+            if let Some(home) = home {
+                std::env::set_var("HOME", home);
+                std::env::set_var("HF_HOME", home.join("hf-home"));
+            }
+            std::env::set_var("AI_MEMORY_EMBED_OFFLINE", "1");
+            std::env::remove_var(HF_HUB_OFFLINE_ENV);
+        }
+        assert!(
+            Embedder::remote_fetch_disabled(),
+            "offline knob must be honored"
+        );
+        f()
+    }
+
+    /// Build with the offline knob set and an EMPTY staged cache; return the
+    /// error text. Hermetic: no network and no model needed (#9509/#9515).
+    pub fn offline_empty_cache_error(build: impl FnOnce() -> Result<Embedder>) -> String {
+        let tmp = std::env::temp_dir().join(format!(
+            "ai-memory-9509-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&tmp).expect("mk empty home");
+        let result = with_offline_env(Some(&tmp), build);
+        let _ = std::fs::remove_dir_all(&tmp);
+        match result {
+            Ok(_) => panic!("empty cache + offline must error (degrades to keyword)"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    /// Run `f` with a REAL local embedder built offline from the staged
+    /// cache. A missing cache keeps its named failure (never a skip, never a
+    /// fetch): CI stages it with `scripts/ci/stage_hf_cache.py` (#9509).
+    pub fn with_offline_staged_embedder<R>(f: impl FnOnce(&Embedder) -> R) -> R {
+        with_offline_env(None, || {
+            if let Err(e) = Embedder::load_from_fallback() {
+                panic!(
+                    "{OFFLINE_CACHE_PREREQUISITE} ({e}). Stage it with \
+                     scripts/ci/stage_hf_cache.py (#9509); this is NOT a failure of the \
+                     test body"
+                );
+            }
+            let embedder = Embedder::new_local().expect("staged cache must build the embedder");
+            f(&embedder)
+        })
+    }
+
     /// Mock embedder for testing model-loading paths without HuggingFace Hub
     /// or candle dependencies. Returns deterministic fake embeddings.
     pub enum MockEmbedder {
@@ -3343,48 +3432,29 @@ mod w12h_extra_tests {
 
     #[test]
     fn pr9i_for_model_minilm_dispatches_to_new_local() {
-        // Exercises the MiniLmL6V2 dispatch arm (line 115). Behavior is
-        // environment-dependent: on a machine with HF cache or network the
-        // call succeeds; without either it errors with the documented
-        // "model files not found in fallback dir" message. Both outcomes
-        // are acceptable — what matters is that the dispatch arm is hit.
-        let res = Embedder::for_model(EmbeddingModel::MiniLmL6V2, None);
-        match res {
-            Ok(e) => {
-                // Path-of-success branch reachable iff HF cache is present.
-                assert_eq!(e.dim(), 384);
-                let desc = e.model_description();
-                assert!(desc.contains("MiniLM"));
-            }
-            Err(e) => {
-                // Path-of-failure branch reachable iff offline + no cache.
-                let msg = e.to_string();
-                assert!(
-                    msg.contains("model")
-                        || msg.contains("config")
-                        || msg.contains("tokenizer")
-                        || msg.contains("fallback")
-                        || msg.contains("HuggingFace"),
-                    "unexpected new_local error: {msg}"
-                );
-            }
-        }
+        // Exercises the MiniLmL6V2 dispatch arm. Offline with an empty staged
+        // cache (#9509/#9515): the dispatch reaches `new_local`'s no-network
+        // branch and surfaces its cache-miss error. One asserted outcome, and
+        // no fetch from the network.
+        let msg = test_support::offline_empty_cache_error(|| {
+            Embedder::for_model(EmbeddingModel::MiniLmL6V2, None)
+        });
+        assert!(
+            msg.starts_with(test_support::OFFLINE_CACHE_MISS_PREFIX),
+            "MiniLmL6V2 dispatch must reach new_local's offline branch: {msg}"
+        );
     }
 
     #[test]
     fn pr9i_embedder_new_alias_is_new_local() {
-        // `Embedder::new()` is a thin shim over `new_local()` (line 50-52).
-        // Same dual-outcome logic as above.
-        let res = Embedder::new();
-        match res {
-            Ok(e) => {
-                assert_eq!(e.dim(), 384);
-            }
-            Err(e) => {
-                let msg = e.to_string();
-                assert!(!msg.is_empty());
-            }
-        }
+        // `Embedder::new()` is a thin shim over `new_local()`. Offline with an
+        // empty staged cache (#9509/#9515) it surfaces `new_local`'s cache-miss
+        // error: one asserted outcome, no fetch from the network.
+        let msg = test_support::offline_empty_cache_error(Embedder::new);
+        assert!(
+            msg.starts_with(test_support::OFFLINE_CACHE_MISS_PREFIX),
+            "Embedder::new must reach new_local's offline branch: {msg}"
+        );
     }
 }
 
@@ -3457,64 +3527,10 @@ fn offline_env_skips_network_and_errors_fast_on_empty_cache() {
     // must take the no-network branch and surface the fallback error fast
     // (the caller then degrades to keyword). This proves the cold-download
     // race can't happen: no HF-Hub fetch is attempted at all.
-    // #2115: shared crate-canonical env lock (see the sibling fallback test)
-    // so this $HOME + AI_MEMORY_EMBED_OFFLINE mutation serializes cross-module
-    // against the reranker tests, not just within this file.
-    let _guard = crate::config::test_env_lock();
-
-    let tmp = std::env::temp_dir().join(format!(
-        "ai-memory-1501-offline-{}-{}",
-        std::process::id(),
-        uuid::Uuid::new_v4()
-    ));
-    std::fs::create_dir_all(&tmp).expect("mk empty home");
-    // f1 goal4 — the test OWNS every variable the offline resolver reads, and
-    // restores them on Drop (also on a panic): `HOME`, `HF_HOME` (the hub root
-    // when set, #3788 — a harness's forwarded cache made the "empty cache"
-    // premise false), `AI_MEMORY_EMBED_OFFLINE` (the knob under test) and
-    // `HF_HUB_OFFLINE` (REMOVED, so only the knob under test can produce the
-    // offline posture — no vacuous green from an ambient OR arm).
-    struct EnvGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            for (k, v) in &self.0 {
-                // SAFETY: serialized via the crate env LOCK held by the test.
-                unsafe {
-                    match v {
-                        Some(v) => std::env::set_var(k, v),
-                        None => std::env::remove_var(k),
-                    }
-                }
-            }
-        }
-    }
-    let keys = [
-        "HOME",
-        "HF_HOME",
-        "AI_MEMORY_EMBED_OFFLINE",
-        HF_HUB_OFFLINE_ENV,
-    ];
-    let restore = EnvGuard(keys.iter().map(|k| (*k, std::env::var_os(k))).collect());
-    // SAFETY: serialized via LOCK; no other thread mutates these here.
-    unsafe {
-        std::env::set_var("HOME", &tmp);
-        std::env::set_var("HF_HOME", tmp.join("hf-home"));
-        std::env::set_var("AI_MEMORY_EMBED_OFFLINE", "1");
-        std::env::remove_var(HF_HUB_OFFLINE_ENV);
-    }
-    assert!(
-        Embedder::remote_fetch_disabled(),
-        "offline knob must be honored"
-    );
-    let result = Embedder::new_local();
-    // Restore env before any assertion that could panic (Drop covers a panic
-    // above).
-    drop(restore);
-    let _ = std::fs::remove_dir_all(&tmp);
-    let msg = match result {
-        Ok(_) => panic!("empty cache + offline must error (degrades to keyword)"),
-        Err(e) => e.to_string(),
-    };
+    // The shared `test_support` helper owns HOME, HF_HOME,
+    // AI_MEMORY_EMBED_OFFLINE and HF_HUB_OFFLINE under the crate env lock and
+    // restores them also on a panic (one env-mutation funnel, #9509).
+    let msg = crate::embeddings::test_support::offline_empty_cache_error(Embedder::new_local);
     assert!(
         msg.contains("not found") || msg.contains("fallback"),
         "offline empty-cache error should point at the fallback dir: {msg}"

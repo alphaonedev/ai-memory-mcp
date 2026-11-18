@@ -281,6 +281,17 @@ class Stage(Base):
         self.assertFalse([line for line in out if str(self.home) in line])
 
 
+class Clean(unittest.TestCase):
+    def test_hostile_names_cannot_form_a_workflow_command(self):
+        hostile = "a::error::b\n##[x]%0A,#[y]\u2028\x1b"
+        cleaned = shc.clean(hostile)
+        for bad in ("::", "##[", "%", "\n", "\u2028", "\x1b", "#", "["):
+            self.assertNotIn(bad, cleaned)
+
+    def test_length_is_bounded(self):
+        self.assertEqual(len(shc.clean("a" * 100_000)), shc.MAX_MESSAGE_CHARS)
+
+
 class Cli(Base):
     def run_cli(self, *args, env_extra=None):
         env = {"PATH": os.environ.get("PATH", ""), "HOME": str(self.home)}

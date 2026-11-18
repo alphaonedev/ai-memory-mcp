@@ -1798,10 +1798,33 @@ jobs:
         if: needs.classify.outputs.cargo_skip != 'true' && contains(matrix.runner, 'self-hosted')
         run: python3 -I scripts/ci/load_gate.py --label "${{ matrix.node }}/${{ matrix.tier }}"
 
+      # #9509 — the offline embedder cache is a prerequisite of
+      # tests/coverage_uplift_3885.rs (named failure "prerequisite missing:
+      # offline embedder cache"). No earlier step of this job provided it, so
+      # the cell passed or failed by test order and network luck. The job now
+      # provides it deterministically, or ends HERE with its own named error
+      # and exit code (scripts/ci/stage_hf_cache.py, the one staging form shared
+      # with coverage.yml) before any test runs. The test step below then runs
+      # offline, so no test can fetch a model from the network (#9515).
+      - name: Cache HuggingFace models (#9509)
+        if: needs.classify.outputs.cargo_skip != 'true'
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-models-minilm-l6-v2-check-v1
+
+      - name: Stage HF embedder cache (#9509)
+        if: needs.classify.outputs.cargo_skip != 'true'
+        run: python3 -I scripts/ci/stage_hf_cache.py --models embedder
+
       - name: Run tests (impact-aware)
         if: needs.classify.outputs.cargo_skip != 'true'
         env:
           AI_MEMORY_NO_CONFIG: "1"
+          # #9509/#9515 — the model cache is staged by the step above; with
+          # this set no test reaches the hf-hub download (`new_local` takes the
+          # staged-cache path only). A missing cache keeps its named failure.
+          AI_MEMORY_EMBED_OFFLINE: "1"
           TIER: ${{ matrix.tier }}
           # #3461 — the watchdog budget is a property of (node, tier), not of
           # tier alone: the macos-fed sqlite leg runs the same suite as the

@@ -10,10 +10,24 @@
 //! fact appended and the same text WITHOUT it. If the two vectors are
 //! identical the fact never reached the vector (a miss); if they differ the
 //! fact is represented (a hit). The table is printed and the measured
-//! behaviour is pinned. The test skips cleanly when the `MiniLM` model is not
-//! available (offline CI worker), like `round2_f10_embed_status.rs`.
+//! behaviour is pinned. The model comes from the staged offline cache; a missing
+//! cache keeps its named failure (#9509), it is never a skip or a fetch.
 
 use ai_memory::embeddings::{Embedder, embedding_document};
+
+/// #9509/#9515 - the real local embedder, built from the staged offline cache.
+/// A missing cache keeps its named failure (no skip), and with the cache
+/// present `new_local` resolves it cache-first, so no model is fetched from
+/// the network. CI stages the cache with `scripts/ci/stage_hf_cache.py`.
+fn staged_local_embedder() -> Embedder {
+    if let Err(e) = Embedder::load_from_fallback() {
+        panic!(
+            "prerequisite missing: offline embedder cache ({e}). Stage it with \
+             scripts/ci/stage_hf_cache.py (#9509); this is NOT a failure of the test body"
+        );
+    }
+    Embedder::new_local().expect("staged cache must build the local embedder")
+}
 
 const TITLE: &str = "long memory coverage";
 const FACT: &str = "zorblax calibration key quillfen seven four two one";
@@ -51,11 +65,7 @@ fn fact_reaches_vector(embedder: &Embedder, words: usize) -> bool {
 
 #[test]
 fn long_memory_fact_past_the_embed_window_is_absent_from_the_vector_8292() {
-    let Ok(embedder) = Embedder::new_local() else {
-        // Offline worker without the cached MiniLM weights: skip cleanly.
-        eprintln!("skip: local MiniLM embedder unavailable");
-        return;
-    };
+    let embedder = staged_local_embedder();
     println!("words | fact in vector (atomisation off)");
     let mut results = Vec::new();
     for words in LENGTHS {
