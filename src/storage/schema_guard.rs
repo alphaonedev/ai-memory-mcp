@@ -814,4 +814,38 @@ mod tests {
             err.detail
         );
     }
+
+    /// v1.0.0 #9504 — pin the schema-behind remedy text per backend. The
+    /// expected strings are spelled out here (not built from the production
+    /// constants) so a change of either backend's remedy fails this cell.
+    #[test]
+    fn schema_behind_remedy_text_is_per_backend_9504() {
+        let supported = crate::storage::migrations::current_schema_version();
+        let observed = supported - 1;
+        let bin = crate::PKG_VERSION;
+        let sqlite = SchemaBehindReadOnly::new(observed, BACKEND_SQLITE, "/db").detail;
+        assert_eq!(
+            sqlite,
+            format!(
+                "{SCHEMA_BEHIND_READ_ONLY_REFUSAL}: database schema is BEHIND this binary: /db \
+                 (sqlite) is on schema v{observed}, but ai-memory {bin} is at v{supported}. \
+                 This read-only verb will not migrate. Repair: `ai-memory migrate --in-place` \
+                 or start the daemon, then re-run."
+            )
+        );
+        let postgres = SchemaBehindReadOnly::new(observed, BACKEND_POSTGRES, "pg").detail;
+        assert_eq!(
+            postgres,
+            format!(
+                "{SCHEMA_BEHIND_READ_ONLY_REFUSAL}: database schema is BEHIND this binary: pg \
+                 (postgres) is on schema v{observed}, but ai-memory {bin} is at v{supported}. \
+                 This read-only verb will not migrate. Repair: \
+                 `ai-memory schema-init --store-url <url>` or start the daemon, then re-run."
+            )
+        );
+        assert!(
+            !postgres.contains("migrate --in-place"),
+            "the sqlite in-place verb must not be offered on postgres: {postgres}"
+        );
+    }
 }
