@@ -9472,9 +9472,9 @@ pub(crate) fn read_memory_cid(conn: &Connection, id: &str) -> Result<Option<Stri
 /// COND 4 (#1859): the comparison parses both stamps into chrono
 /// `DateTime` and compares the instants (NOT an rfc3339 string `>=`), so
 /// mixed-offset / mixed-precision timestamps order correctly. An absent
-/// endpoint or an unparseable stamp returns `false`: the FK existence check
-/// downstream owns the missing-row error, and an unparseable legacy stamp
-/// cannot PROVE forwardness.
+/// endpoint returns `false`: the FK existence check downstream owns the
+/// missing-row error. An unparsable stamp is an `Err` (#9484): it cannot
+/// prove the edge is NOT forward, so the link is refused, never admitted.
 ///
 /// #3041 — EQUAL-instant tie-break. A same-batch pair minted under one
 /// `Utc::now()` shares an EXACT instant, so a strict `>` alone would admit
@@ -9506,12 +9506,19 @@ fn lineage_edge_is_forward(conn: &Connection, source_id: &str, target_id: &str) 
     else {
         return Ok(false);
     };
-    let (Ok(source_t), Ok(target_t)) = (
-        chrono::DateTime::parse_from_rfc3339(&source_at),
-        chrono::DateTime::parse_from_rfc3339(&target_at),
-    ) else {
-        return Ok(false);
+    // #9484 — an unparsable stamp is an `Err` that stops the link: "cannot
+    // prove forwardness" must not ADMIT the edge (invariant A). The raw value
+    // is not echoed (it is caller-written text).
+    let parse = |id: &str, at: &str| {
+        chrono::DateTime::parse_from_rfc3339(at).with_context(|| {
+            format!(
+                "lineage guard: memory {id}: created_at is not an RFC 3339 timestamp, so the \
+                 edge direction cannot be established; the link is refused"
+            )
+        })
     };
+    let source_t = parse(source_id, &source_at)?;
+    let target_t = parse(target_id, &target_at)?;
     Ok(match target_t.cmp(&source_t) {
         // Target genuinely newer than source: the forward (older -> newer)
         // direction that would let the graph cycle. Reject.
