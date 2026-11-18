@@ -5,8 +5,9 @@
 //! ratchet that keeps every new raw write primitive visible.
 
 use super::snapshot_file::{
-    SYMLINK_REFUSAL_TAIL, refuse_occupied, refuse_symlink, stage_beside, symlink_refusal,
-    write_new_private, write_new_private_unique, write_replacing,
+    SYMLINK_REFUSAL_TAIL, UNIQUE_NAME_ATTEMPTS, refuse_occupied, refuse_symlink,
+    settle_mode_to_source, stage_beside, symlink_refusal, write_new_private,
+    write_new_private_unique, write_replacing,
 };
 use std::path::{Path, PathBuf};
 
@@ -564,4 +565,52 @@ fn unique_backup_refuses_planted_symlink_rows_8950() {
             assert_target_untouched(&target, row, &format!("{row:?}/{numbered_slot}"));
         }
     }
+}
+
+/// S-1: a symlink swapped in at the snapshot name is refused with the exact
+/// error, and the link target's mode is unchanged (fchmod, never by name).
+#[cfg(unix)]
+#[test]
+fn settle_mode_refuses_symlink_swapped_in_8950() {
+    use std::os::unix::fs::PermissionsExt;
+    const VICTIM_MODE: u32 = 0o644;
+    let dir = scratch();
+    let (source, victim) = (dir.path().join("src.db"), dir.path().join("victim"));
+    std::fs::write(&source, b"x").expect("source");
+    std::fs::write(&victim, b"x").expect("victim");
+    let victim_mode = std::fs::Permissions::from_mode(VICTIM_MODE);
+    std::fs::set_permissions(&victim, victim_mode).expect("mode");
+    let target = dir.path().join("snap.db");
+    std::os::unix::fs::symlink(&victim, &target).expect("plant symlink");
+    let err = settle_mode_to_source(&target, &source).expect_err("swapped-in symlink");
+    assert_eq!(format!("{err:#}"), symlink_refusal(&target));
+    let meta = std::fs::metadata(&victim).expect("victim");
+    assert_eq!(
+        meta.permissions().mode() & 0o777,
+        VICTIM_MODE,
+        "target mode changed"
+    );
+}
+
+/// S-4: the name and all numbered names taken, the next one is refused with
+/// the exact error; nothing is written and no staging entry is left.
+#[test]
+fn unique_backup_refuses_name_past_the_last_numbered_8950() {
+    let dir = scratch();
+    let dest = dir.path().join("config.toml.bak");
+    let name = |n: u32| PathBuf::from(format!("{}.{n}", dest.display()));
+    std::fs::write(&dest, b"taken").expect("taken");
+    for n in 1..=UNIQUE_NAME_ATTEMPTS {
+        std::fs::write(name(n), b"taken").expect("taken");
+    }
+    let err = write_new_private_unique(&dest, "install backup", b"new").expect_err("all taken");
+    let tail = format!("it and {UNIQUE_NAME_ATTEMPTS} numbered names beside it are taken");
+    let want = format!(
+        "refusing to write install backup {}: {tail}",
+        dest.display()
+    );
+    assert_eq!(format!("{err:#}"), want);
+    assert!(std::fs::symlink_metadata(name(UNIQUE_NAME_ATTEMPTS + 1)).is_err());
+    let entries = u32::try_from(std::fs::read_dir(dir.path()).expect("dir").count());
+    assert_eq!(entries.expect("fits"), UNIQUE_NAME_ATTEMPTS + 1);
 }
