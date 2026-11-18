@@ -255,7 +255,7 @@ WF_HOST_CREDENTIAL = HEADER + """\
           url_file="$HOME/.ai-memory-ci-fed-url"
           test -r "$url_file"
       - name: Read pgpass
-        run: cat ~/.pgpass
+        run: test -r ~/.pgpass
       - name: Toolchain
         run: ls "$HOME/.cargo/bin"
   hosted:
@@ -267,22 +267,22 @@ WF_HOST_CREDENTIAL = HEADER + """\
       - name: Build
         run: cargo build
       - name: Read pgpass
-        run: cat ~/.pgpass
+        run: test -r ~/.pgpass
 """
 
 # Text -> names a host-resident credential.
 HOST_CREDENTIAL_CASES = (
     ('url_file="$HOME/.ai-memory-ci-fed-url"', True),
-    ("cat ${HOME}/.pgpass", True),
-    ("cat ~/.netrc", True),
-    ("cp ~/.ssh/id_ed25519 .", True),
-    ("cat $HOME/.aws/credentials", True),
-    ("cat ~/.docker/config.json", True),
-    ("cat ~/.config/gh/hosts.yml", True),
-    ("cat $HOME/.git-credentials", True),
-    ("cat $HOME/.vault-token", True),
-    ("cat $HOME/.PGPASS", True),
-    ("curl --unix-socket /var/run/docker.sock http://x/info", True),
+    ("test -r ${HOME}/.pgpass", True),
+    ("test -r ~/.netrc", True),
+    ("test -d \"$HOME/.ssh\"", True),
+    ("test -r $HOME/.aws/credentials", True),
+    ("test -r ~/.docker/config.json", True),
+    ("test -r ~/.config/gh/hosts.yml", True),
+    ("test -r $HOME/.git-credentials", True),
+    ("test -r $HOME/.vault-token", True),
+    ("test -r $HOME/.PGPASS", True),
+    ("test -S /var/run/docker.sock", True),
     ("sudo -u postgres psql -c 'select 1'", True),
     ("psql -h 127.0.0.1 -U postgres -c 'select 1'", True),
     ('ls "$HOME/.cargo/bin"', False),
