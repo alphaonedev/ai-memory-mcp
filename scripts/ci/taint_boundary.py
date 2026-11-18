@@ -8,9 +8,32 @@ or (iv) persistent state that a trusted run later reads.
 The module parses each workflow with a fail-closed YAML subset parser (standard library
 only), finds the taint point of every job and reports each violation as
 (workflow, job, step, class). A workflow or a job this module cannot classify is a
-failure, never clean. Known violations are listed in ``TAINT_ALLOW``; every row names the
-open issue of the fix that removes it, the row count is pinned and a row that no longer
-matches a violation is a failure.
+failure, never clean.
+
+Rows (ruling f367b2f1, FINAL words efb2b9e8 and 0773f6ce): three row kinds, never mixed, each
+in its own table with its own pin. Kind violation (``TAINT_ALLOW``): the checker reads the step
+and it breaks invariant i, ii, iii or iv. Kind unclassifiable (``OPEN_ROWS``): the checker
+cannot read one form; the job is NOT shown to hold the boundary. Kind not-analysed
+(``NOT_ANALYSED_ROWS``): the checker cannot read one form and the rest of that command (or
+of that substitution) is not analysed; the row says so with the mark ``rest-not-analysed``,
+and the list behind these rows is NOT complete. A row names one workflow file, job, step,
+form class (or NO-CLASS with the exact reason), operand and one issue of its kind's fixed
+set; it covers that one form or violation and nothing else, and a row of one kind never
+covers a finding or line of another kind. The scan goes on past a covered form to the end
+of the job, so every other form and every violation of that job is still reported. A row
+that matches nothing is stale, and a stale row is a failure. Rows whose issue is in a
+gate-step set carry the gate-step mark: a change there needs the conductor's word.
+Removal rule: the fix PR of an issue deletes its rows and lowers that kind's pin in the same
+commit; each pin only goes down, a pin above its ceiling in ``PIN_CEILINGS`` is a failure and
+a pin that differs from its row count is a failure. Pins at PR 9508: unclassifiable 41,
+not-analysed 3, violation 17 (the 13 rows before PR 9508 and 4 rows of #9553). The fixpoint proof
+(all rows applied: zero findings; any one row removed: exactly that form or line) is a proof for
+what the scan reaches only. A test makes no network call: the
+conductor checks that every cited issue is open at each landing of a fix of these issues, and
+the release checklist line checks it again before the release.
+decision: a context-variable form sink active only while one step of a job is analysed, over
+threading it through every shell handler, because the python-module check has no shell
+context and a form must be recorded against the step it was found in.
 
 decision: own stdlib subset parser over PyYAML because the lane binds the standard library
 and any YAML form outside the subset must fail closed rather than parse loosely.
@@ -49,8 +72,10 @@ import os
 import re
 import stat
 import sys
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import ClassVar
 
 WORKFLOW_DIR = ".github/workflows"
 WORKFLOW_SUFFIXES = (".yml", ".yaml")
@@ -137,15 +162,23 @@ EVENT_EQ_RE = re.compile(r"^github\.event_name\s*==\s*'([a-z_]+)'$")
 ENV_FILE_WRITE_RE = re.compile(r"\$\{?(?:GITHUB_ENV|GITHUB_PATH)\b")
 
 
+# The three row kinds; each kind has its own table and its own pin.
+KIND_UNCLASSIFIABLE = "unclassifiable"
+KIND_VIOLATION = "violation"
+KIND_NOT_ANALYSED = "not-analysed"
+
+
 @dataclass(frozen=True)
 class AllowRow:
-    """A known violation, allowed only while its fix issue is open."""
+    """A known violation (row kind violation), allowed only while its fix issue is open."""
 
+    kind: ClassVar[str] = KIND_VIOLATION
     workflow: str
     job: str
     step: str
     classes: tuple[str, ...]
     issue: int | None
+    gate_step: bool = False
 
 
 # The six hits of the survey at a028c45e, the six host-credential reads and the R2 row of
@@ -174,16 +207,221 @@ TAINT_ALLOW: tuple[AllowRow, ...] = (
     AllowRow("postgres-ignored.yml", "postgres-ignored", "Point at the native enterprise-fed tier (per-job ephemeral db)",
              (CLASS_SECRET,), 9455),
     AllowRow("postgres-ignored.yml", "postgres-ignored", "Cleanup enterprise-fed ephemeral db", (CLASS_SECRET,), 9455),
+    # #9553: classify and select set a job output after a step counted as pull-request code
+    # (reached once the covered forms no longer stop the job); gate steps.
+    AllowRow("ci.yml", "classify", "id:cls", (CLASS_GATE_OUTPUT,), 9553, True),
+    AllowRow("ci.yml", "select", "Select jobs", (CLASS_GATE_OUTPUT,), 9553, True),
+    AllowRow("ci.yml", "select", "Select the full matrix (base selector unavailable)", (CLASS_GATE_OUTPUT,), 9553, True),
+    AllowRow("coverage.yml", "classify", "id:cls", (CLASS_GATE_OUTPUT,), 9553, True),
 )
-TAINT_ALLOW_PIN = 13
-# The open fix issues an allow row may name; a row naming any other value is a finding.
-FIX_ISSUES = frozenset({9454, 9455, 9456, 9471})
+TAINT_ALLOW_PIN = 17
+# The open fix issues a violation row may name (the fixed set of that kind); a row naming any
+# other value is a finding.
+FIX_ISSUES = frozenset({9454, 9455, 9456, 9471, 9553})
+VIOLATION_GATE_ISSUES = frozenset({9553})
+
+# The four form classes a row may name; a form of no class is named by NO-CLASS and its reason.
+FORM_COMMAND_NOT_LITERAL = "command-word-not-literal"
+FORM_COMMAND_NOT_LISTED = "command-not-listed"
+FORM_PY_MODULE = "python-module-not-listed"
+FORM_INTERP_PATH = "interpreter-path-unbound"
+FORM_NO_CLASS = "NO-CLASS"
+FORM_CLASSES = frozenset({FORM_COMMAND_NOT_LITERAL, FORM_COMMAND_NOT_LISTED, FORM_PY_MODULE, FORM_INTERP_PATH})
+# The reason template of each form class (each quoted operand replaced by <X>).
+FORM_TEMPLATES = {
+    "command word <X> is not a literal word": FORM_COMMAND_NOT_LITERAL,
+    "command word <X> is not on the closed command list": FORM_COMMAND_NOT_LISTED,
+    "python module <X> is not on the closed module list": FORM_PY_MODULE,
+    "interpreter path <X> is neither in the workspace nor bound to base content": FORM_INTERP_PATH,
+}
+QUOTED_RE = re.compile(r"'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\"|`[^`]*`")
+NO_OPERAND = "-"
+# The fixed issue sets per kind (ruling f367b2f1 and FINAL 0773f6ce).
+OPEN_ROW_ISSUES = frozenset(range(9533, 9540)) | frozenset(range(9544, 9550))
+NOT_ANALYSED_ROW_ISSUES = frozenset({9550, 9551, 9552})
+OPEN_GATE_ISSUES = frozenset({9536, 9537, 9548, 9549})
+NOT_ANALYSED_GATE_ISSUES = frozenset({9550, 9551})
+NOT_ANALYSED_MARKER = "rest-not-analysed"
+# Each pin only goes down; a pin above its ceiling is a failure.
+PIN_CEILINGS = {KIND_UNCLASSIFIABLE: 41, KIND_VIOLATION: 17, KIND_NOT_ANALYSED: 3}
+# Characters no workflow, job, step or operand of a row may hold: a row names one place.
+ROW_GLOB_CHARS = frozenset("*?[]{}")
+ARITH_NOTE = "the command substitution inside the arithmetic expansion is not analysed"
+PARAM_NOTE = "the command substitution inside the parameter expansion is not analysed"
+REST_OF_COMMAND_NOTE = "command {name!r}: the rest of this command is not analysed after this form"
+
+
+@dataclass(frozen=True)
+class OpenRow:
+    """One form the checker cannot read (row kind unclassifiable), tracked by one open issue."""
+
+    kind: ClassVar[str] = KIND_UNCLASSIFIABLE
+    workflow: str
+    job: str
+    step: str
+    form: str
+    operand: str
+    reason: str
+    issue: int
+    gate_step: bool
+
+
+@dataclass(frozen=True)
+class NotAnalysedRow:
+    """One form after which the rest of the command is not analysed (row kind not-analysed)."""
+
+    kind: ClassVar[str] = KIND_NOT_ANALYSED
+    workflow: str
+    job: str
+    step: str
+    form: str
+    operand: str
+    reason: str
+    note: str
+    issue: int
+    gate_step: bool
+    marker: str = NOT_ANALYSED_MARKER
+
+
+def _o(workflow: str, job: str, step: str, form: str, operand: str, issue: int) -> OpenRow:
+    """An open row of a classed form; the reason is the text that form raises."""
+    template = next(t for t, f in FORM_TEMPLATES.items() if f == form)
+    return OpenRow(workflow, job, step, form, operand, template.replace("<X>", repr(operand)), issue,
+                   issue in OPEN_GATE_ISSUES)
+
+
+_BATMAN = "batman-mode-acceptance.yml"
+_CERT = "cert-postgres-age.yml"
+_CI = "ci.yml"
+_COV = "coverage.yml"
+_MOBILE = "mobile-runtime.yml"
+_PMT = "per-module-thresholds"
+_CHECK_FREE = "Free disk before tests (hosted image only,"
+_CHECK_RUN = "Run tests (impact-aware)"
+_GATE_MAT = "Materialise the base gate (#8240)"
+_SEL_MAT = "Materialise the base selector (#8240)"
+_COV_SWAP = "Free disk + add swap (#1148 belt-and-suspenders, aggressive)"
+_COV_JQ = "Install jq + postgresql-client (bounded+retry"
+_COV_MOLD = "Install mold linker (#1148, pinned+bounded"
+_IOS = "ios-simulator"
+_ANDROID = "android-emulator"
+_DUNDER = "python code uses a dunder name"
+_NL, _NC = FORM_COMMAND_NOT_LITERAL, FORM_COMMAND_NOT_LISTED
+_PY, _IP = FORM_PY_MODULE, FORM_INTERP_PATH
+# Kind unclassifiable: one row per form the scan reaches in the real workflows. These jobs are
+# NOT shown to hold the boundary. A fix PR of an issue deletes its rows and lowers
+# OPEN_ROW_PIN in the same commit.
+OPEN_ROWS: tuple[OpenRow, ...] = (
+    _o(_BATMAN, "bash-integration", "Install sqlite3 + jq (bounded+retry", _NC, "apt-get", 9534),
+    _o(_BATMAN, "rust-integration", "Assert binary refuses /tmp write under R001 end-to-end", _NL, "$BIN", 9533),
+    _o(_CERT, _CERT[:-4], "Assert certified stack versions (cert evidence, hard-fail on drift)", _NL, "$PSQL", 9535),
+    _o(_CERT, _CERT[:-4], "Ensure AGE + vector extensions present (best-effort — tier is pre-provisioned)", _NL,
+       "$PSQL", 9535),
+    _o(_CERT, _CERT[:-4], "Run", _NC, "--test", 9547),
+    _o(_CI, "check", _CHECK_FREE, _NC, "apt-get", 9534),
+    _o(_CI, "check", _CHECK_FREE, _NC, "fallocate", 9544),
+    _o(_CI, "check", _CHECK_FREE, _NC, "mkswap", 9544),
+    _o(_CI, "check", _CHECK_FREE, _NC, "swapon", 9544),
+    _o(_CI, "check", _CHECK_RUN, _NL, "$TIMEOUT_BIN", 9548),
+    _o(_CI, "check", _CHECK_RUN, _NL, "$l", 9548),
+    _o(_CI, "check", _CHECK_RUN, _NL, "$tflag", 9548),
+    _o(_CI, "check", _CHECK_RUN, _NC, "--lib", 9547),
+    _o(_CI, "check", _CHECK_RUN, _NC, "--skip", 9547),
+    _o(_CI, "check", _CHECK_RUN, _NC, "--test", 9547),
+    _o(_CI, "ci-gate", "Fold job results (base gate)", _IP, "$RUNNER_TEMP/impact-base/impact/gate.py", 9537),
+    OpenRow(_CI, "ci-gate", _GATE_MAT, FORM_NO_CLASS, NO_OPERAND, _DUNDER, 9549, True),
+    _o(_CI, "ci-gate", _GATE_MAT, _PY, "os", 9536),
+    _o(_CI, "ci-gate", _GATE_MAT, _PY, "shutil", 9536),
+    _o(_CI, "ci-gate", _GATE_MAT, _PY, "subprocess", 9536),
+    _o(_CI, "classify", "id:cls", _IP, "$trust_impact/cargo_skip.py", 9537),
+    _o(_CI, "select", "Build impact index", _IP, "$RUNNER_TEMP/impact-base/impact/build_index.py", 9537),
+    OpenRow(_CI, "select", _SEL_MAT, FORM_NO_CLASS, NO_OPERAND, _DUNDER, 9549, True),
+    _o(_CI, "select", _SEL_MAT, _PY, "os", 9536),
+    _o(_CI, "select", _SEL_MAT, _PY, "shutil", 9536),
+    _o(_CI, "select", _SEL_MAT, _PY, "subprocess", 9536),
+    _o(_CI, "select", "Select jobs", _IP, "$RUNNER_TEMP/impact-base/impact/select.py", 9537),
+    _o(_CI, "select", "Select the full matrix (base selector unavailable)", _PY, "os", 9536),
+    _o(_COV, "classify", "id:cls", _IP, "$trust_impact/cargo_skip.py", 9537),
+    _o(_COV, _PMT, _COV_SWAP, _NC, "apt-get", 9534),
+    _o(_COV, _PMT, _COV_SWAP, _NC, "fallocate", 9544),
+    _o(_COV, _PMT, _COV_SWAP, _NC, "mkswap", 9544),
+    _o(_COV, _PMT, _COV_SWAP, _NC, "swapon", 9544),
+    _o(_COV, _PMT, _COV_JQ, _NC, "apt-get", 9534),
+    _o(_COV, _PMT, _COV_MOLD, _NC, "apt-get", 9534),
+    _o(_COV, _PMT, _COV_MOLD, _NC, "mold", 9545),
+    _o(_MOBILE, _ANDROID, "Boot Android emulator + run tests", _NC, "adb", 9546),
+    _o(_MOBILE, _ANDROID, "Enable KVM", _NC, "udevadm", 9539),
+    _o(_MOBILE, _IOS, "Boot iOS Simulator (best-available iPhone)", _NC, "xcrun", 9538),
+    _o(_MOBILE, _IOS, "Run mobile_runtime tests on iOS Simulator", _NC, "xcrun", 9538),
+    _o(_MOBILE, _IOS, "Shut down simulator", _NC, "xcrun", 9538),
+)
+OPEN_ROW_PIN = 41
+# Kind not-analysed: one row per form that stops the rest of its command or substitution. The
+# list of forms behind these rows is NOT complete: the checker does not read that text.
+NOT_ANALYSED_ROWS: tuple[NotAnalysedRow, ...] = (
+    NotAnalysedRow(_CI, "check", _CHECK_RUN, FORM_NO_CLASS, NO_OPERAND,
+                   "arithmetic expansion holding a command substitution", ARITH_NOTE, 9550, True),
+    NotAnalysedRow(_CI, "check", _CHECK_RUN, FORM_NO_CLASS, "--version",
+                   "timeout option '--version' is not on the closed option list",
+                   REST_OF_COMMAND_NOTE.format(name="timeout"), 9551, True),
+    NotAnalysedRow(_COV, _PMT, _COV_JQ, FORM_NO_CLASS, "--version",
+                   "psql option '--version' is not on the closed option list",
+                   REST_OF_COMMAND_NOTE.format(name="psql"), 9552, False),
+)
+NOT_ANALYSED_PIN = 3
 # A loader refusal travels as text with this marker; the parser reports its reason.
 REFUSED_MARKER = "\x00taint-boundary-refused:"
 
 
 class Unclassifiable(Exception):
     """A form this module cannot classify; always reported as a failure."""
+
+
+@dataclass(frozen=True)
+class Form:
+    """One form the checker cannot read, in one step; ``note`` says what is not analysed after it."""
+
+    workflow: str
+    job: str
+    step: str
+    reason: str
+    note: str | None = None
+
+    def message(self) -> str:
+        return f"{self.workflow}/{self.job}: step {self.step!r}: {self.reason}"
+
+
+class _FormSink:
+    """The forms of one job; ``step`` is set only while one of its steps is analysed."""
+
+    def __init__(self, workflow: str, job: str) -> None:
+        self.workflow = workflow
+        self.job = job
+        self.step: str | None = None
+        self.forms: list[Form] = []
+        # Membership in a set, not the list: a step of many distinct forms stays linear.
+        self.seen: set[Form] = set()
+
+
+_SINK: ContextVar[_FormSink | None] = ContextVar("taint_boundary_form_sink", default=None)
+
+
+def _sink_active() -> bool:
+    sink = _SINK.get()
+    return sink is not None and sink.step is not None
+
+
+def _form(reason: str, note: str | None = None) -> bool:
+    """A form the checker cannot read: recorded and counted as pull-request code inside a step
+    of a job, else Unclassifiable. The scan goes on; the job is never shown to hold the boundary."""
+    sink = _SINK.get()
+    if sink is None or sink.step is None:
+        raise Unclassifiable(reason)
+    form = Form(sink.workflow, sink.job, sink.step, reason, note)
+    if form not in sink.seen:
+        sink.seen.add(form)
+        sink.forms.append(form)
+    return True
 
 
 # ---------------------------------------------------------------------------------------
@@ -929,7 +1167,7 @@ class _Sh:
             while j < n:
                 ch = s[j]
                 if ch == "`" or (ch == "$" and j + 1 < n and s[j + 1] == "("):
-                    raise Unclassifiable("parameter expansion holding a command substitution")
+                    _form("parameter expansion holding a command substitution", PARAM_NOTE)
                 if ch == "\\":
                     j += 2
                     continue
@@ -1307,7 +1545,7 @@ def _arith_end(s: str, j: int) -> int:
     while j < n:
         ch = s[j]
         if ch == "`" or (ch == "$" and j + 1 < n and s[j + 1] == "("):
-            raise Unclassifiable("arithmetic expansion holding a command substitution")
+            _form("arithmetic expansion holding a command substitution", ARITH_NOTE)
         if ch == "(":
             level += 1
         elif ch == ")":
@@ -1558,29 +1796,43 @@ def _dispatch(words: list[_Word], cmd: _Cmd, ctx: _ShellCtx) -> bool:
     head = words[0]
     name = head.lit
     if name is None or MARK in name or name == "":
-        raise Unclassifiable(f"command word {head.shown()!r} is not a literal word")
+        return _form(f"command word {head.shown()!r} is not a literal word")
     if name in ctx.functions:
         return False
     if "/" in name:
         if not name.startswith("/"):
             return True  # a program from the workspace
         if not name.startswith(SYSTEM_BIN_DIRS):
-            raise Unclassifiable(f"command word {name!r} is not on the closed command list")
+            return _form(f"command word {name!r} is not on the closed command list")
         name = name.rsplit("/", 1)[1]
     handler = _command_handler(name)
     if handler is None:
         if not ctx.strict:
             return False
-        raise Unclassifiable(f"command word {name!r} is not on the closed command list")
+        return _form(f"command word {name!r} is not on the closed command list")
     if name in PATH_WRITERS:
         for word in words[1:]:
             ctx.unbind(word)
     if ctx.strict:
-        return handler(words, cmd, ctx)
+        return _strict_call(handler, name, words, cmd, ctx)
+    # A non-strict job swallows what a handler cannot read, as before; no form is recorded.
+    token = _SINK.set(None)
     try:
         return handler(words, cmd, ctx)
     except Unclassifiable:
         return False
+    finally:
+        _SINK.reset(token)
+
+
+def _strict_call(handler, name: str, words: list[_Word], cmd: _Cmd, ctx: _ShellCtx) -> bool:
+    """A handler that cannot read the rest of its command: a form, and the rest is not analysed."""
+    try:
+        return handler(words, cmd, ctx)
+    except Unclassifiable as exc:
+        if not _sink_active():
+            raise
+        return _form(str(exc), REST_OF_COMMAND_NOTE.format(name=name))
 
 
 def _command_handler(name: str):
@@ -1704,22 +1956,22 @@ def _py_code(code: str) -> bool:
         if isinstance(node, ast.Import):
             for alias in node.names:
                 if alias.name not in PY_MODULES:
-                    raise Unclassifiable(f"python module {alias.name!r} is not on the closed module list")
+                    runs = _form(f"python module {alias.name!r} is not on the closed module list") or runs
         elif isinstance(node, ast.ImportFrom):
             module = "." * node.level + (node.module or "")
             if node.level or module not in PY_MODULES:
-                raise Unclassifiable(f"python module {module!r} is not on the closed module list")
+                runs = _form(f"python module {module!r} is not on the closed module list") or runs
         elif isinstance(node, ast.Name):
             if node.id.startswith("__") and node.id.endswith("__"):
-                raise Unclassifiable("python code uses a dunder name")
+                runs = _form("python code uses a dunder name") or runs
             if node.id in PY_RUN_NAMES:
                 runs = True
         elif isinstance(node, ast.Attribute):
             if node.attr.startswith("__") and node.attr.endswith("__"):
-                raise Unclassifiable("python code uses a dunder name")
+                runs = _form("python code uses a dunder name") or runs
         elif isinstance(node, ast.Constant) and isinstance(node.value, str):
             if node.value.startswith("__") and node.value.endswith("__"):
-                raise Unclassifiable("python code uses a dunder name")
+                runs = _form("python code uses a dunder name") or runs
     return runs
 
 
@@ -1732,7 +1984,7 @@ def _interp_path(word: _Word, ctx: _ShellCtx, isolated: bool) -> bool:
         return True
     if paths and all(p in ctx.bound for p in paths):
         return not isolated
-    raise Unclassifiable(f"interpreter path {word.shown()!r} is neither in the workspace nor bound to base content")
+    return _form(f"interpreter path {word.shown()!r} is neither in the workspace nor bound to base content")
 
 
 def _py_cmd(words: list[_Word], cmd: _Cmd, ctx: _ShellCtx) -> bool:
@@ -2686,6 +2938,15 @@ class ScanResult:
     unclassifiable: list[str] = field(default_factory=list)
     verdicts: dict[tuple[str, str], str] = field(default_factory=dict)
     taint_steps: dict[tuple[str, str], str] = field(default_factory=dict)
+    # Every form the checker cannot read, per step, with the scan gone on past it.
+    forms: list[Form] = field(default_factory=list)
+    # Jobs with forms that the scan read to the end (their violations are complete).
+    open_jobs: set[tuple[str, str]] = field(default_factory=set)
+
+    @property
+    def not_analysed(self) -> list[Form]:
+        """The forms after which the rest of a command or substitution is not analysed."""
+        return [f for f in self.forms if f.note is not None]
 
 
 @dataclass
@@ -3389,6 +3650,22 @@ def _windows_job(legs: list[tuple[str, ...]]) -> bool:
 
 def _analyse_job(wf: str, job_id: str, job: dict[str, object], doc: dict[str, object], events: set[str],
                  actions: dict[str, str], downloads: bool, result: ScanResult) -> str:
+    """One job; a job with a form the checker cannot read is unclassifiable, read to its end."""
+    sink = _FormSink(wf, job_id)
+    token = _SINK.set(sink)
+    try:
+        verdict = _analyse_job_steps(wf, job_id, job, doc, events, actions, downloads, result, sink)
+    finally:
+        _SINK.reset(token)
+        result.forms.extend(sink.forms)
+    if sink.forms:
+        result.open_jobs.add((wf, job_id))
+        return UNCLASSIFIABLE
+    return verdict
+
+
+def _analyse_job_steps(wf: str, job_id: str, job: dict[str, object], doc: dict[str, object], events: set[str],
+                       actions: dict[str, str], downloads: bool, result: ScanResult, sink: _FormSink) -> str:
     label = f"{wf}/{job_id}"
     _check_job_form(job, label)
     job_events = _job_events(job, events)
@@ -3413,10 +3690,13 @@ def _analyse_job(wf: str, job_id: str, job: dict[str, object], doc: dict[str, ob
     leaky_checkouts: list[_Step] = []
     for step in steps:
         body = step.body
+        sink.step = step.label
         try:
             facts = _analyse_step(step, job, doc, job_events, windows, strict)
         except Unclassifiable as exc:
             raise Unclassifiable(f"{label}: step {step.label!r}: {exc}") from exc
+        finally:
+            sink.step = None
         uses = body.get("uses")
         if isinstance(uses, str) and _action_name(uses) == CHECKOUT_ACTION:
             if _checkout_tree(body, job_events) == "pr":
@@ -3667,11 +3947,86 @@ def load_repo(repo_root: Path) -> tuple[dict[str, str], dict[str, str], frozense
     return _load_dir(repo_root)
 
 
-def check(result: ScanResult, allow: tuple[AllowRow, ...] = TAINT_ALLOW, pin: int = TAINT_ALLOW_PIN) -> list[str]:
-    """Every problem: unclassifiable forms, violations without a row, stale rows, rows without an issue."""
+def _exact_name(value: object) -> bool:
+    """A plain, non-empty string with no glob character: a row names one place, never a pattern."""
+    return type(value) is str and value.strip() != "" and not any(c in ROW_GLOB_CHARS for c in value)
+
+
+def form_class(reason: str) -> tuple[str, str]:
+    """(form class or NO-CLASS, operand) of one reason text; the operand is its first quoted word."""
+    found = QUOTED_RE.findall(reason)
+    template = QUOTED_RE.sub("<X>", reason)
+    return FORM_TEMPLATES.get(template, FORM_NO_CLASS), (found[0][1:-1] if found else NO_OPERAND)
+
+
+def _form_key(workflow: str, job: str, step: str, form: str, operand: str, reason: str) -> tuple[str, ...]:
+    # A classed form is named by its class and operand; a NO-CLASS form by its exact reason too.
+    return (workflow, job, step, form, operand, reason if form == FORM_NO_CLASS else "")
+
+
+def _place(row: object) -> str:
+    return f"{getattr(row, 'workflow', '?')}/{getattr(row, 'job', '?')}/{getattr(row, 'step', '?')}"
+
+
+def _of_kind(rows: tuple, kind: str, problems: list[str]) -> list:
+    """The rows of one kind; a row of another kind in this table is a failure and covers nothing."""
+    kept = []
+    for row in rows:
+        row_kind = getattr(type(row), "kind", None)
+        if row_kind != kind:
+            problems.append(f"row of kind {row_kind} in the table of kind {kind}: {_place(row)}")
+            continue
+        kept.append(row)
+    return kept
+
+
+def _pin_problems(kind: str, count: int, pin: int, table: str) -> list[str]:
+    out = []
+    if count != pin:
+        out.append(f"{table} table has {count} rows, pin is {pin}")
+    if pin > PIN_CEILINGS[kind]:
+        out.append(f"{kind} pin {pin} is above the ceiling {PIN_CEILINGS[kind]}")
+    return out
+
+
+def _form_row_problems(rows: list, word: str, issues: frozenset[int], gates: frozenset[int]) -> list[str]:
+    """Shape of the rows of a form kind: exact place, known form, its own reason, fixed issue, gate mark."""
+    problems: list[str] = []
+    for row in rows:
+        place = _place(row)
+        if not all(_exact_name(v) for v in (row.workflow, row.job, row.step)) or row.step == R2_STEP_LABEL:
+            problems.append(f"{word} without an exact workflow, job and step: {place}")
+        if row.form not in FORM_CLASSES | {FORM_NO_CLASS} or not _exact_name(row.operand) \
+                or type(row.reason) is not str or form_class(row.reason) != (row.form, row.operand):
+            problems.append(f"{word} with an unknown form: {place}")
+        # bool is an int subclass: only a plain int of the fixed set counts.
+        if type(row.issue) is not int or row.issue not in issues:
+            problems.append(f"{word} without an issue of the fixed set: {place}")
+        if type(row.gate_step) is not bool or row.gate_step != (row.issue in gates):
+            problems.append(f"{word} gate-step mark does not match issue {row.issue}: {place}")
+    return problems
+
+
+def check(result: ScanResult, allow: tuple[AllowRow, ...] = TAINT_ALLOW, pin: int = TAINT_ALLOW_PIN,
+          open_rows: tuple[OpenRow, ...] = (), open_pin: int = 0,
+          not_analysed: tuple[NotAnalysedRow, ...] = (), not_analysed_pin: int = 0) -> list[str]:
+    """Every problem: forms and violations without a row of their kind, stale, malformed and
+    wrong-kind rows, and pins. Each table defaults to empty, so a form is a finding unless its
+    row is passed."""
     problems = [f"unclassifiable: {msg}" for msg in result.unclassifiable]
-    if len(allow) != pin:
-        problems.append(f"allow table has {len(allow)} rows, pin is {pin}")
+    problems += _pin_problems(KIND_VIOLATION, len(allow), pin, "allow")
+    problems += _pin_problems(KIND_UNCLASSIFIABLE, len(open_rows), open_pin, KIND_UNCLASSIFIABLE)
+    problems += _pin_problems(KIND_NOT_ANALYSED, len(not_analysed), not_analysed_pin, KIND_NOT_ANALYSED)
+    allow_rows = _of_kind(allow, KIND_VIOLATION, problems)
+    opens = _of_kind(open_rows, KIND_UNCLASSIFIABLE, problems)
+    stops = _of_kind(not_analysed, KIND_NOT_ANALYSED, problems)
+    problems += _violation_problems(result, allow_rows)
+    problems += _form_problems(result, opens, stops)
+    return problems
+
+
+def _violation_problems(result: ScanResult, allow: list[AllowRow]) -> list[str]:
+    problems: list[str] = []
     counts: dict[tuple[str, str, str], int] = {}
     for row in allow:
         key = (row.workflow, row.job, row.step)
@@ -3684,12 +4039,17 @@ def check(result: ScanResult, allow: tuple[AllowRow, ...] = TAINT_ALLOW, pin: in
         # bool is an int subclass: only a plain int naming an open fix issue counts.
         if type(row.issue) is not int or row.issue not in FIX_ISSUES:
             problems.append(f"allow row without an open fix issue: {row.workflow}/{row.job}/{row.step}")
+        if type(row.gate_step) is not bool or row.gate_step != (row.issue in VIOLATION_GATE_ISSUES):
+            problems.append(f"allow row gate-step mark does not match issue {row.issue}: "
+                            f"{row.workflow}/{row.job}/{row.step}")
         if not row.classes or any(k not in CLASSES for k in row.classes):
             problems.append(f"allow row with an unknown class: {row.workflow}/{row.job}/{row.step}")
-        # A row of an unclassifiable job is not stale: its verdict is unknown and the
-        # unclassifiable line above already fails the check.
-        unknown = UNCLASSIFIABLE in (result.verdicts.get((row.workflow, row.job)),
-                                     result.verdicts.get((row.workflow, "*")))
+        # A row of a job that stopped on an Unclassifiable raise is not stale: its verdict is
+        # unknown and the unclassifiable line already fails the check. A job with forms is read
+        # to its end, so its rows can be stale.
+        verdict = result.verdicts.get((row.workflow, row.job))
+        unknown = (verdict == UNCLASSIFIABLE and (row.workflow, row.job) not in result.open_jobs) \
+            or result.verdicts.get((row.workflow, "*")) == UNCLASSIFIABLE
         for klass in row.classes:
             key = (row.workflow, row.job, row.step, klass)
             allowed.add(key)
@@ -3700,6 +4060,63 @@ def check(result: ScanResult, allow: tuple[AllowRow, ...] = TAINT_ALLOW, pin: in
         if (v.workflow, v.job, v.step, v.klass) not in allowed:
             problems.append(f"violation class ({v.klass}) without an allow row: {v.workflow}/{v.job}/{v.step}: {v.detail}")
     return problems
+
+
+def _row_key(row: OpenRow | NotAnalysedRow) -> tuple[str, ...]:
+    return _form_key(row.workflow, row.job, row.step, row.form, row.operand, row.reason)
+
+
+def _found_key(form: Form) -> tuple[str, ...]:
+    return _form_key(form.workflow, form.job, form.step, *form_class(form.reason), form.reason)
+
+
+def _form_problems(result: ScanResult, opens: list[OpenRow], stops: list[NotAnalysedRow]) -> list[str]:
+    """A form is covered only by the one row of its kind that names it: an unclassifiable form by
+    an open row, a form with a not-analysed line by a not-analysed row with that exact line."""
+    problems = _form_row_problems(opens, "open row", OPEN_ROW_ISSUES, OPEN_GATE_ISSUES)
+    problems += _form_row_problems(stops, "not-analysed row", NOT_ANALYSED_ROW_ISSUES, NOT_ANALYSED_GATE_ISSUES)
+    for row in stops:
+        if row.marker != NOT_ANALYSED_MARKER or not _exact_name(row.note):
+            problems.append(f"not-analysed row without the {NOT_ANALYSED_MARKER} mark and its line: {_place(row)}")
+    for word, rows in (("open row", opens), ("not-analysed row", stops)):
+        seen: dict[tuple[str, ...], int] = {}
+        for row in rows:
+            seen[_row_key(row)] = seen.get(_row_key(row), 0) + 1
+        for dup in sorted(k for k, c in seen.items() if c > 1):
+            problems.append(f"duplicate {word} {dup}")
+    plain = {_found_key(f) for f in result.forms if f.note is None}
+    noted = {(_found_key(f), f.note) for f in result.forms if f.note is not None}
+    open_keys = {_row_key(r) for r in opens}
+    stop_keys = {(_row_key(r), r.note) for r in stops}
+    for row in opens:
+        if _row_key(row) not in plain:
+            problems.append(f"stale open row (no such form in the step): {_place(row)}")
+    for row in stops:
+        if (_row_key(row), row.note) not in noted:
+            problems.append(f"stale not-analysed row (no such form and line in the step): {_place(row)}")
+    for form in result.forms:
+        if form.note is None:
+            if _found_key(form) not in open_keys:
+                problems.append(f"unclassifiable: {form.message()}")
+        elif (_found_key(form), form.note) not in stop_keys:
+            problems.append(f"not-analysed form without a row: {form.message()}: {form.note}")
+    return problems
+
+
+def check_repo(result: ScanResult) -> list[str]:
+    """``check`` with every real table and pin of this repository."""
+    return check(result, TAINT_ALLOW, TAINT_ALLOW_PIN, OPEN_ROWS, OPEN_ROW_PIN, NOT_ANALYSED_ROWS, NOT_ANALYSED_PIN)
+
+
+def not_analysed_lines(result: ScanResult, rows: tuple[NotAnalysedRow, ...] = NOT_ANALYSED_ROWS) -> list[str]:
+    """One line per form a not-analysed row covers: the rest after it is not analysed."""
+    by_key = {(_row_key(r), r.note): r for r in rows if getattr(type(r), "kind", None) == KIND_NOT_ANALYSED}
+    out = []
+    for form in result.not_analysed:
+        row = by_key.get((_found_key(form), form.note))
+        if row is not None:
+            out.append(f"not-analysed: {form.message()}: {form.note} [{row.marker}, #{row.issue}]")
+    return out
 
 
 def scan(repo_root: Path) -> ScanResult:
@@ -3717,13 +4134,17 @@ def _line(*fields: str) -> str:
     return "\t".join(_escape(f) for f in fields)
 
 
-def emit(result: ScanResult, problems: list[str], verdicts: bool = False) -> None:
-    """Print the verdict table (optional) and every problem, each field escaped (I-5)."""
+def emit(result: ScanResult, problems: list[str], verdicts: bool = False,
+         not_analysed: list[str] | None = None) -> None:
+    """Print the verdict table (optional), the not-analysed lines and every problem, each field
+    escaped (I-5)."""
     if verdicts:
         for (wf, job), verdict in sorted(result.verdicts.items()):
             print(_line(wf, job, verdict, result.taint_steps.get((wf, job), "-")))
         for v in result.violations:
             print(_line("violation", v.workflow, v.job, v.step, f"({v.klass})"))
+    for line in not_analysed or ():
+        print(_line(line))
     for problem in problems:
         print(_line(problem))
     print(f"problems={len(problems)}")
@@ -3735,8 +4156,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--verdicts", action="store_true", help="print the per-job verdict table")
     args = parser.parse_args(argv)
     result = scan(args.repo)
-    problems = check(result)
-    emit(result, problems, verdicts=args.verdicts)
+    problems = check_repo(result)
+    emit(result, problems, verdicts=args.verdicts, not_analysed=not_analysed_lines(result))
     return 1 if problems else 0
 
 
