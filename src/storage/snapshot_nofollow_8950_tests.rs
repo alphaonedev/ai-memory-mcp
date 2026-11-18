@@ -502,9 +502,10 @@ fn vacuum_into_routes_through_the_no_follow_helper_8950() {
     );
     for (rel, _, text) in &census {
         if VACUUM_INTO_FILES.contains(&rel.as_str()) {
+            // r1 (X-1): naming the module is not enough; the file must stage.
             assert!(
-                text.contains("snapshot_file::"),
-                "#8950: {rel} runs VACUUM INTO without the snapshot_file helper"
+                text.contains("stage_beside("),
+                "#8950: {rel} runs VACUUM INTO without snapshot_file::stage_beside"
             );
         }
     }

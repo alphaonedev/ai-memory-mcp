@@ -24782,6 +24782,8 @@ mod forensic_ident_namespace_3774_tests;
 mod governance_read_fault_4043_tests;
 #[cfg(all(test, unix))]
 mod snapshot_mode_8679_tests;
+#[cfg(all(test, unix))]
+mod snapshot_nofollow_8950_r1_tests;
 #[cfg(test)]
 mod snapshot_nofollow_8950_tests;
 #[cfg(test)]

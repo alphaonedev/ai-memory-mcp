@@ -1169,9 +1169,15 @@ pub(super) fn snapshot_before_migration(
     let target = snapshot_path.to_string_lossy().replace('\'', "''");
     // #8679: owner-only target first, source's mode after, removed on any failure.
     snapshot_file::create_private_target(&snapshot_path)?;
+    #[cfg(test)]
+    snapshot_file::seam::fire(snapshot_file::seam::Point::Fill, &snapshot_path);
     let written = conn
         .execute(&format!("VACUUM INTO '{target}'"), [])
         .map_err(anyhow::Error::from)
+        .inspect(|_| {
+            #[cfg(test)]
+            snapshot_file::seam::fire(snapshot_file::seam::Point::Filled, &snapshot_path);
+        })
         .and_then(|_| snapshot_file::settle_mode_to_source(&snapshot_path, &db_path))
         .with_context(|| {
             format!(

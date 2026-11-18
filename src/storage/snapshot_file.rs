@@ -131,6 +131,76 @@ fn open_new_private(path: &Path) -> Result<std::fs::File> {
         .with_context(|| format!("creating {}", path.display()))
 }
 
+/// The ONE `link(2)` call of the publish (the test seam sees every call).
+fn link_no_replace(staged: &Path, dest: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if let Some(injected) = seam::on_link(dest) {
+        return Err(injected);
+    }
+    std::fs::hard_link(staged, dest)
+}
+
+/// Test-only seam (`cfg(test)`, absent from every non-test build): a hook a
+/// test runs at a named point of a snapshot write, a `link(2)` errno to
+/// inject, and the log of every link call. All three are per thread.
+#[cfg(test)]
+pub(crate) mod seam {
+    use std::cell::{Cell, RefCell};
+    use std::path::{Path, PathBuf};
+
+    /// Where the hook runs: before the writer fills the snapshot, and after.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum Point {
+        Fill,
+        Filled,
+    }
+
+    type Hook = Box<dyn FnMut(Point, &Path)>;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Hook>> = RefCell::new(None);
+        static LINK_ERRNO: Cell<Option<i32>> = const { Cell::new(None) };
+        static LINK_CALLS: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Run `hook(point, dest)` at every [`fire`] of this thread.
+    pub(crate) fn set_hook(hook: impl FnMut(Point, &Path) + 'static) {
+        HOOK.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    /// Fail every later link call of this thread with `errno`.
+    pub(crate) fn inject_link_errno(errno: Option<i32>) {
+        LINK_ERRNO.with(|e| e.set(errno));
+    }
+
+    /// The destinations of the link calls so far (and forget them).
+    pub(crate) fn take_link_calls() -> Vec<PathBuf> {
+        LINK_CALLS.with(|c| std::mem::take(&mut *c.borrow_mut()))
+    }
+
+    /// Clear the hook, the injected errno and the call log.
+    pub(crate) fn reset() {
+        HOOK.with(|h| h.borrow_mut().take());
+        inject_link_errno(None);
+        drop(take_link_calls());
+    }
+
+    pub(crate) fn fire(point: Point, dest: &Path) {
+        let hook = HOOK.with(|h| h.borrow_mut().take());
+        if let Some(mut hook) = hook {
+            hook(point, dest);
+            HOOK.with(|h| *h.borrow_mut() = Some(hook));
+        }
+    }
+
+    pub(super) fn on_link(dest: &Path) -> Option<std::io::Error> {
+        LINK_CALLS.with(|c| c.borrow_mut().push(dest.to_path_buf()));
+        LINK_ERRNO
+            .with(Cell::get)
+            .map(std::io::Error::from_raw_os_error)
+    }
+}
+
 /// Owner-only directory mode for the private staging directory.
 #[cfg(unix)]
 const OWNER_ONLY_DIR_MODE: u32 = 0o700;
@@ -394,7 +464,7 @@ impl NoFollowStage {
     /// ONE no-follow, create-new `link(2)` at `dest`; `Ok(false)`: name taken.
     fn publish_at(&mut self, dest: &Path) -> Result<bool> {
         self.verify_identity()?;
-        match std::fs::hard_link(&self.name.path, dest) {
+        match link_no_replace(&self.name.path, dest) {
             Ok(()) => std::fs::remove_file(&self.name.path).with_context(|| {
                 format!("removing the staging name {}", self.name.path.display())
             })?,

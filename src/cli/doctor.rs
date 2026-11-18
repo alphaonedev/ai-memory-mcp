@@ -1047,7 +1047,7 @@ pub fn run_repair_schema_version(
 ///
 /// Propagates a `VACUUM INTO` failure so the caller REFUSES the restamp — a
 /// repair that could not be backed up must not proceed.
-fn snapshot_before_repair(
+pub(crate) fn snapshot_before_repair(
     conn: &rusqlite::Connection,
     db_path: &Path,
     observed: i64,
@@ -1068,6 +1068,11 @@ fn snapshot_before_repair(
     // v1.0.0 #8950 — staged privately and published by a link that never
     // follows or replaces an entry planted at the snapshot name.
     let stage = crate::storage::snapshot_file::stage_beside(&snapshot_path, "repair snapshot")?;
+    #[cfg(test)]
+    crate::storage::snapshot_file::seam::fire(
+        crate::storage::snapshot_file::seam::Point::Fill,
+        &snapshot_path,
+    );
     // Single-quote-escape the target for the SQL string literal (crate-derived
     // path, but doubling quotes is the correct hygiene).
     let escaped = stage.path().to_string_lossy().replace('\'', "''");
