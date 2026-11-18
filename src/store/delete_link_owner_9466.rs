@@ -305,3 +305,164 @@ pub(crate) fn judge(
         ))
     }
 }
+
+/// The owner field values both classifiers are checked over: `(JSON, the
+/// postgres `jsonb_typeof`, the postgres `->>` text, expected reading)`.
+/// `None` JSON = the key is missing.
+const FIELD_CORPUS: &[(Option<&str>, Option<&str>, Option<&str>, Option<&str>)] = &[
+    (None, None, None, Some("")),
+    (Some("null"), Some("null"), None, Some("")),
+    (
+        Some("\"alice-9466\""),
+        Some("string"),
+        Some("alice-9466"),
+        Some("alice-9466"),
+    ),
+    (Some("\"\""), Some("string"), Some(""), Some("")),
+    (Some("42"), Some("number"), Some("42"), None),
+    (Some("true"), Some("boolean"), Some("true"), None),
+    (
+        Some("[\"alice-9466\"]"),
+        Some("array"),
+        Some("[\"alice-9466\"]"),
+        None,
+    ),
+    (
+        Some("{\"id\": \"alice-9466\"}"),
+        Some("object"),
+        Some("{\"id\": \"alice-9466\"}"),
+        None,
+    ),
+];
+
+fn expected_field(reading: Option<&str>) -> super::LinkOwnerField {
+    reading.map_or(super::LinkOwnerField::Unreadable, |s| {
+        super::LinkOwnerField::Read(s.to_string())
+    })
+}
+
+/// `of_json` and `of_pg` give the same reading for every corpus value, and
+/// a present non-string value is never read as text or as "".
+#[test]
+fn delete_link_owner_field_classifiers_agree_9466() {
+    for (json, pg_type, pg_text, reading) in FIELD_CORPUS {
+        let decoded: Option<serde_json::Value> =
+            json.map(|j| serde_json::from_str(j).expect("corpus value is JSON"));
+        let want = expected_field(*reading);
+        assert_eq!(
+            super::LinkOwnerField::of_json(decoded.as_ref()),
+            want,
+            "of_json {json:?}"
+        );
+        assert_eq!(
+            super::LinkOwnerField::of_pg(*pg_type, pg_text.map(str::to_string)),
+            want,
+            "of_pg {pg_type:?}"
+        );
+    }
+}
+
+/// Metadata that is not a JSON object has no readable owner on either
+/// endpoint, whatever it holds.
+#[test]
+fn delete_link_non_object_metadata_unreadable_9466() {
+    for raw in [
+        "[]",
+        NON_OBJECT_METADATA,
+        "42",
+        "\"alice-9466\"",
+        "null",
+        "true",
+    ] {
+        let value: serde_json::Value = serde_json::from_str(raw).expect("JSON");
+        assert_eq!(
+            super::LinkOwnerField::owner_of_json(&value),
+            super::LinkOwnerField::Unreadable,
+            "{raw}"
+        );
+        assert_eq!(
+            super::LinkSourceOwners::of_json(&value),
+            super::LinkSourceOwners::unreadable(),
+            "{raw}"
+        );
+    }
+}
+
+/// The gate over owners as read, with no store: an absent endpoint keeps
+/// today's reading, an unreadable owner on a present pair refuses with the
+/// exact text unless the caller is the daemon or matches a readable owner.
+#[test]
+fn delete_link_gate_decisions_9466() {
+    use super::{LinkOwnerField as F, LinkSourceOwners as S, delete_link_gate as gate};
+    let read = |s: &str| F::Read(s.to_string());
+    let src = |owner: F| S {
+        owner,
+        addressee: read(""),
+    };
+    let daemon = crate::identity::sentinels::DAEMON_PRINCIPAL;
+    let refused = |r: crate::store::StoreResult<bool>| r.map_err(|e| e.to_string());
+    // Both readable: caller_may_delete_link decides, unchanged.
+    assert_eq!(
+        refused(gate(Some(src(read(ALICE))), Some(read(BOB)), ALICE)),
+        Ok(true)
+    );
+    assert_eq!(
+        refused(gate(Some(src(read(ALICE))), Some(read(BOB)), MALLORY)),
+        Ok(false)
+    );
+    assert_eq!(
+        refused(gate(Some(src(read(""))), Some(read("")), MALLORY)),
+        Ok(true)
+    );
+    // Unreadable owner on a present pair.
+    assert_eq!(
+        refused(gate(Some(src(F::Unreadable)), Some(read("")), MALLORY)),
+        Err(refusal_text(SRC))
+    );
+    assert_eq!(
+        refused(gate(Some(src(read(""))), Some(F::Unreadable), MALLORY)),
+        Err(refusal_text(TGT))
+    );
+    assert_eq!(
+        refused(gate(Some(src(F::Unreadable)), Some(F::Unreadable), MALLORY)),
+        Err(refusal_text(SRC))
+    );
+    assert_eq!(
+        refused(gate(Some(src(F::Unreadable)), Some(read("")), daemon)),
+        Ok(true)
+    );
+    assert_eq!(
+        refused(gate(Some(src(F::Unreadable)), Some(read(BOB)), BOB)),
+        Ok(true)
+    );
+    assert_eq!(
+        refused(gate(Some(src(read(ALICE))), Some(F::Unreadable), ALICE)),
+        Ok(true)
+    );
+    assert_eq!(
+        refused(gate(
+            Some(S {
+                owner: F::Unreadable,
+                addressee: read(BOB)
+            }),
+            Some(read("")),
+            BOB
+        )),
+        Ok(true)
+    );
+    assert_eq!(
+        refused(gate(
+            Some(src(F::Unreadable)),
+            Some(read("")),
+            NUMERIC_TEXT_CALLER
+        )),
+        Err(refusal_text(SRC))
+    );
+    // An absent endpoint: no edge can exist, today's reading kept.
+    assert_eq!(refused(gate(None, Some(F::Unreadable), MALLORY)), Ok(false));
+    assert_eq!(
+        refused(gate(Some(S::unreadable()), None, MALLORY)),
+        Ok(false)
+    );
+    assert_eq!(refused(gate(None, None, MALLORY)), Ok(true));
+}

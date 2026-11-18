@@ -899,6 +899,100 @@ pub(crate) fn caller_may_delete_link(
         || caller == crate::identity::sentinels::DAEMON_PRINCIPAL
 }
 
+/// #9466 — one owner field of a link endpoint, as the SAL `delete_link`
+/// gate read it from the row's metadata. The classification is the #3124
+/// [`crate::identity::owner_stamp::OwnerStamp`] one: a JSON string is read
+/// as itself, a missing key or JSON `null` reads as `""` (unstamped), and a
+/// present NON-string value (or metadata that could not be decoded at all)
+/// is [`Self::Unreadable`] — never folded to `""`, never matched as text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LinkOwnerField {
+    /// The field as read: a string, or `""` when missing / `null`.
+    Read(String),
+    /// Present but not a string, or the metadata itself is undecodable.
+    Unreadable,
+}
+
+impl LinkOwnerField {
+    /// Classify a decoded `metadata` value's field (`None` = key missing).
+    #[must_use]
+    pub(crate) fn of_json(field: Option<&serde_json::Value>) -> Self {
+        match field {
+            None | Some(serde_json::Value::Null) => Self::Read(String::new()),
+            Some(serde_json::Value::String(s)) => Self::Read(s.clone()),
+            Some(_) => Self::Unreadable,
+        }
+    }
+
+    /// Classify the postgres pair `(jsonb_typeof(metadata->'<key>'),
+    /// metadata->>'<key>')`, with verdicts identical to [`Self::of_json`]
+    /// over the same JSON.
+    #[must_use]
+    pub(crate) fn of_pg(json_type: Option<&str>, text: Option<String>) -> Self {
+        match json_type {
+            None | Some("null") => Self::Read(String::new()),
+            Some("string") => text.map_or(Self::Unreadable, Self::Read),
+            Some(_) => Self::Unreadable,
+        }
+    }
+
+    /// The `agent_id` of a decoded `metadata` value. Metadata that is not a
+    /// JSON object has no owner key to read, so it is [`Self::Unreadable`]
+    /// (sqlite only: the postgres `memories_metadata_is_object` CHECK
+    /// refuses such a row).
+    #[must_use]
+    pub(crate) fn owner_of_json(metadata: &serde_json::Value) -> Self {
+        if metadata.is_object() {
+            Self::of_json(metadata.get(crate::META_KEY_AGENT_ID))
+        } else {
+            Self::Unreadable
+        }
+    }
+
+    fn is_caller(&self, caller: &str) -> bool {
+        matches!(self, Self::Read(owner) if !owner.is_empty() && owner == caller)
+    }
+}
+
+/// #9466 — the source endpoint's two owner fields: its author
+/// (`metadata.agent_id`) and its inbox addressee (`metadata.target_agent_id`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LinkSourceOwners {
+    pub(crate) owner: LinkOwnerField,
+    pub(crate) addressee: LinkOwnerField,
+}
+
+impl LinkSourceOwners {
+    /// Both fields of a decoded `metadata` object. The addressee keeps the
+    /// #939 HTTP gate's reading (`unlink_admitted`): a non-string
+    /// `target_agent_id` addresses nobody, so it reads as `""`.
+    #[must_use]
+    pub(crate) fn of_json(metadata: &serde_json::Value) -> Self {
+        if !metadata.is_object() {
+            return Self::unreadable();
+        }
+        Self {
+            owner: LinkOwnerField::of_json(metadata.get(crate::META_KEY_AGENT_ID)),
+            addressee: LinkOwnerField::Read(
+                metadata
+                    .get(crate::META_KEY_TARGET_AGENT_ID)
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                    .unwrap_or_default(),
+            ),
+        }
+    }
+
+    /// The metadata could not be decoded, so neither field can be read.
+    #[must_use]
+    pub(crate) fn unreadable() -> Self {
+        Self {
+            owner: LinkOwnerField::Unreadable,
+            addressee: LinkOwnerField::Unreadable,
+        }
+    }
+}
+
 /// #9466 — `IntegrityFailed` detail prefix of the `delete_link` refusal for
 /// a present endpoint whose owner cannot be read. The endpoint follows.
 pub(crate) const DELETE_LINK_UNREADABLE_OWNER: &str =
@@ -912,6 +1006,76 @@ pub(crate) const DELETE_LINK_ENDPOINT_TARGET: &str = "target endpoint";
 pub(crate) const DELETE_LINK_SOURCE_LOOKUP: &str = "delete_link source owner lookup";
 /// #9466 — see [`DELETE_LINK_SOURCE_LOOKUP`].
 pub(crate) const DELETE_LINK_TARGET_LOOKUP: &str = "delete_link target owner lookup";
+
+/// #9466 — the ONE `delete_link` gate decision both adapters call, over the
+/// owners as read (`None` = the endpoint row does not exist).
+///
+/// * Every owner readable: [`caller_may_delete_link`] decides, unchanged
+///   (an absent row still reads as `""`; that admission is #9466 item 3).
+/// * Both rows present and an `agent_id` unreadable: the daemon principal
+///   and a caller matching a READABLE owner field keep today's admission;
+///   anyone else gets [`StoreError::IntegrityFailed`] naming the endpoint,
+///   never a decision taken from a default (pre-fix sqlite folded the
+///   unreadable owner to `""` and could take the legacy-unowned admission;
+///   postgres matched the value's text).
+/// * An absent row with an unreadable other endpoint keeps the pre-#9466
+///   reading: both `memory_links` foreign keys are `ON DELETE CASCADE`, so no
+///   edge to remove can exist, and the HTTP `DELETE /api/v1/links` answer for
+///   a missing source (`{"deleted": false}`) stays as it is.
+///
+/// # Errors
+///
+/// [`StoreError::IntegrityFailed`] as described above.
+pub(crate) fn delete_link_gate(
+    source: Option<LinkSourceOwners>,
+    target: Option<LinkOwnerField>,
+    caller: &str,
+) -> StoreResult<bool> {
+    let both_present = source.is_some() && target.is_some();
+    let empty = || LinkOwnerField::Read(String::new());
+    let source = source.unwrap_or_else(|| LinkSourceOwners {
+        owner: empty(),
+        addressee: empty(),
+    });
+    let target = target.unwrap_or_else(empty);
+    let text = |f: &LinkOwnerField| match f {
+        LinkOwnerField::Read(s) => s.clone(),
+        LinkOwnerField::Unreadable => MALFORMED_LINK_OWNER_TEXT.to_string(),
+    };
+    let unreadable_endpoint = if source.owner == LinkOwnerField::Unreadable {
+        Some(DELETE_LINK_ENDPOINT_SOURCE)
+    } else if target == LinkOwnerField::Unreadable {
+        Some(DELETE_LINK_ENDPOINT_TARGET)
+    } else {
+        None
+    };
+    match unreadable_endpoint {
+        Some(endpoint) if both_present => {
+            if caller == crate::identity::sentinels::DAEMON_PRINCIPAL
+                || source.owner.is_caller(caller)
+                || source.addressee.is_caller(caller)
+                || target.is_caller(caller)
+            {
+                return Ok(true);
+            }
+            Err(StoreError::IntegrityFailed {
+                detail: format!("{DELETE_LINK_UNREADABLE_OWNER} {endpoint}"),
+            })
+        }
+        _ => Ok(caller_may_delete_link(
+            &text(&source.owner),
+            &text(&source.addressee),
+            &text(&target),
+            caller,
+        )),
+    }
+}
+
+/// #9466 — owner text an unreadable field contributes when an endpoint row is
+/// absent (no edge can exist). It is the #3124 display label, which no caller
+/// id can equal (`validate_agent_id` rejects `<`), so it matches nobody and is
+/// never "unstamped".
+const MALFORMED_LINK_OWNER_TEXT: &str = crate::identity::owner_stamp::MALFORMED_OWNER_LABEL;
 
 /// #9466 — the SQL of one `delete_link` owner read. In a test build a cell
 /// can arm a read fault for ONE row id (so concurrent cells never see it):

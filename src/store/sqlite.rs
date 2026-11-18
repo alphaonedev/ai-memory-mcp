@@ -301,11 +301,14 @@ fn pubkey_bind_err(error: anyhow::Error, agent_id: &str) -> StoreError {
 /// `what: <error>`, the same context words the postgres adapter uses.
 const DELETE_LINK_METADATA_SQL: &str = "SELECT metadata FROM memories WHERE id = ?1";
 
+/// #9466 — the decoded `metadata` of a present endpoint row, or `None` when
+/// the column is not JSON text (never folded to `{}`: that would read the
+/// row as unstamped and could take the legacy-unowned admission).
 fn delete_link_metadata(
     conn: &rusqlite::Connection,
     id: &str,
     what: &str,
-) -> StoreResult<Option<serde_json::Value>> {
+) -> StoreResult<Option<Option<serde_json::Value>>> {
     let raw: Option<rusqlite::types::Value> = conn
         .query_row(
             crate::store::delete_link_owner_sql(id, DELETE_LINK_METADATA_SQL),
@@ -315,33 +318,9 @@ fn delete_link_metadata(
         .optional()
         .map_err(|e| box_err(format!("{what}: {e}")))?;
     Ok(raw.map(|value| match value {
-        rusqlite::types::Value::Text(text) => {
-            serde_json::from_str(&text).unwrap_or_else(|_| serde_json::json!({}))
-        }
-        _ => serde_json::json!({}),
+        rusqlite::types::Value::Text(text) => serde_json::from_str(&text).ok(),
+        _ => None,
     }))
-}
-
-/// v1.0.0 #3275 — `(agent_id, target_agent_id)` owner strings of a memory's
-/// metadata (empty when the key is absent), for the SAL `delete_link` gate.
-fn link_owner_target_of(metadata: &serde_json::Value) -> (String, String) {
-    (link_owner_of(metadata), {
-        metadata
-            .get(crate::META_KEY_TARGET_AGENT_ID)
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .to_string()
-    })
-}
-
-/// v1.0.0 #3275 — the `agent_id` owner string of a memory's metadata (empty
-/// when absent).
-fn link_owner_of(metadata: &serde_json::Value) -> String {
-    metadata
-        .get(crate::META_KEY_AGENT_ID)
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default()
-        .to_string()
 }
 
 /// Parity finding #4 (2026-08) — SAL-level caller-owns mutation gate for
@@ -1622,22 +1601,24 @@ impl MemoryStore for SqliteStore {
         // so there is no existence oracle. Endpoint owners are read UNFILTERED
         // (`db::get_any`) so a tombstoned endpoint is still owner-checked.
         // Operator lanes (`ctx.bypass_visibility`) skip the gate.
+        // #9466 — a present endpoint whose owner cannot be read refuses with
+        // a named error (`delete_link_gate`), never a decision from "".
         if !ctx.bypass_visibility {
-            let caller = ctx.effective_principal();
-            let (source_owner, source_target) =
+            let source =
                 delete_link_metadata(&conn, source_id, crate::store::DELETE_LINK_SOURCE_LOOKUP)?
-                    .map(|m| link_owner_target_of(&m))
-                    .unwrap_or_default();
-            let target_owner =
+                    .map(|m| {
+                        m.map_or_else(crate::store::LinkSourceOwners::unreadable, |v| {
+                            crate::store::LinkSourceOwners::of_json(&v)
+                        })
+                    });
+            let target =
                 delete_link_metadata(&conn, target_id, crate::store::DELETE_LINK_TARGET_LOOKUP)?
-                    .map(|m| link_owner_of(&m))
-                    .unwrap_or_default();
-            if !crate::store::caller_may_delete_link(
-                &source_owner,
-                &source_target,
-                &target_owner,
-                caller,
-            ) {
+                    .map(|m| {
+                        m.map_or(crate::store::LinkOwnerField::Unreadable, |v| {
+                            crate::store::LinkOwnerField::owner_of_json(&v)
+                        })
+                    });
+            if !crate::store::delete_link_gate(source, target, ctx.effective_principal())? {
                 return Ok(false);
             }
         }
