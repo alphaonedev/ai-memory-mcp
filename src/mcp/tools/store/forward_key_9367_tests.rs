@@ -37,8 +37,9 @@ const OVERSIZE_BYTES: usize = 128 * 1024;
 const OVERSIZE_CEILING: Duration = Duration::from_secs(2);
 /// The canned 200 every recording server answers by default.
 const OK_200: &str = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
-/// A 403 such as the daemon's `identity_binding_mismatch`.
-const DENY_403: &str = "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
+/// The daemon's `identity_binding_mismatch` 403 (the key is bound to another
+/// agent id), with its wire body.
+const DENY_403: &str = "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: 37\r\nConnection: close\r\n\r\n{\"error\":\"identity_binding_mismatch\"}";
 
 /// A synthetic per-cell key: random hex, never a literal in the source.
 fn synthetic_key() -> String {
@@ -418,6 +419,113 @@ fn keyed_403_is_a_named_error_with_no_retry_9367() {
             .all(|r| header_line(r, crate::HEADER_API_KEY).is_some()),
         "every request carried the key"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// One canned JSON response with an exact `Content-Length`.
+fn reply(status_line: &str, body: &str) -> String {
+    format!(
+        "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+/// The K-5 suffix a credential refusal carries.
+fn refused_suffix() -> String {
+    format!("; the daemon refused the key in {KEY_FILE_ENV} for agent '{AGENT}'")
+}
+
+/// K-5 (host decision a) — the "daemon refused the key" text is added ONLY
+/// when the daemon's body says the credential was refused (the 401
+/// transport-auth body, the 403 identity-binding body). A keyed 403 from any
+/// other gate (attestation, governance, an empty or unknown body) never
+/// carries it; the daemon's own reason is shown as this crate's own code
+/// constant, never as peer text (#3698).
+#[test]
+fn keyed_refusal_text_only_for_a_credential_refusal_9367() {
+    let _lock = crate::identity::agent_id_env_test_lock();
+    if crate::config::run_env_isolated_child_or_spawn(
+        "mcp::store::transport::forward_key_9367_tests::keyed_refusal_text_only_for_a_credential_refusal_9367",
+    ) {
+        return;
+    }
+    let key = synthetic_key();
+    let dir = scratch("gates");
+    let path = token_file(&dir, format!("{key}\n").as_bytes(), 0o600);
+    set_env(KEY_FILE_ENV, path.as_os_str());
+    let _id = AgentIdOverride::set(AGENT);
+    let attest = format!(
+        r#"{{"code":"{}","error":"attestation failed"}}"#,
+        crate::errors::error_codes::ATTESTATION_FAILED
+    );
+    let governance = format!(
+        r#"{{"code":"{}","error":"denied"}}"#,
+        crate::errors::error_codes::GOVERNANCE_REFUSED
+    );
+    let refused = refused_suffix();
+    // (case, status line, body, exact expected tail after "returned <status>")
+    let cases: Vec<(&str, &str, String, String)> = vec![
+        (
+            "transport-auth 401",
+            "401 Unauthorized",
+            r#"{"error":"missing or invalid API key"}"#.to_string(),
+            refused.clone(),
+        ),
+        (
+            "identity-binding 403",
+            "403 Forbidden",
+            r#"{"error":"identity_binding_mismatch","message":"m"}"#.to_string(),
+            refused.clone(),
+        ),
+        (
+            "attestation 403",
+            "403 Forbidden",
+            attest,
+            format!(
+                "; daemon code {}",
+                crate::errors::error_codes::ATTESTATION_FAILED
+            ),
+        ),
+        (
+            "governance 403",
+            "403 Forbidden",
+            governance,
+            format!(
+                "; daemon code {}",
+                crate::errors::error_codes::GOVERNANCE_REFUSED
+            ),
+        ),
+        ("empty-body 403", "403 Forbidden", "{}".to_string(), String::new()),
+        (
+            "unknown-code 403",
+            "403 Forbidden",
+            r#"{"code":"PEER_TEXT_9367","error":"identity_binding_mismatch_not"}"#.to_string(),
+            String::new(),
+        ),
+        (
+            "other 401",
+            "401 Unauthorized",
+            r#"{"error":"token expired"}"#.to_string(),
+            String::new(),
+        ),
+        ("non-JSON 403", "403 Forbidden", "denied".to_string(), String::new()),
+    ];
+    for (case, status_line, body, tail) in cases {
+        let (url, rx) = server(vec![reply(status_line, &body)]);
+        for (site, result) in forward_each(&url) {
+            let err = result.expect_err(&format!("{case}/{site}: must error"));
+            assert!(
+                err.ends_with(&format!("returned {status_line}{tail}")),
+                "{case}/{site}: {err}"
+            );
+            assert!(!err.contains(&key), "{case}/{site}: key bytes in the error");
+            assert!(
+                !err.contains("PEER_TEXT_9367") && !err.contains("attestation failed"),
+                "{case}/{site}: peer text in the error: {err}"
+            );
+        }
+        assert_eq!(drain(&rx).len(), 3, "{case}: one request per site, no retry");
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 
