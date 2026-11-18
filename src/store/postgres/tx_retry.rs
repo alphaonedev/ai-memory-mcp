@@ -689,4 +689,42 @@ mod tests {
              the regression test proved nothing"
         );
     }
+
+    /// #9252 — structural pin on the live 40P01 cell.
+    ///
+    /// Class: a regression test that can end without having provoked the
+    /// state it tests. The present cell picks the deadlock victim by RACING
+    /// two deadlock-check timers (the peer's request for the second lock must
+    /// land inside the funnel's `deadlock_timeout`), so a slow host makes the
+    /// peer the victim, the funnel commits with no retry, and the cell reaches
+    /// its "proved nothing" line. That outcome cannot be forced
+    /// deterministically from outside the test body, so this pin holds the
+    /// invariant on the body itself: the cell never repeats the provocation in
+    /// rounds, waits for the other session's lock in the database, and fails
+    /// with a named setup error when a precondition is not met.
+    #[test]
+    fn the_live_40p01_cell_provokes_by_construction_not_in_rounds_9252() {
+        const SELF_START: &str = "fn the_live_40p01_cell_provokes_by_construction";
+        let source = include_str!("tx_retry.rs");
+        let cell_start = source
+            .find("async fn a_live_40p01_deadlock_is_retried")
+            .expect("the live cell exists");
+        let pin_start = source.find(SELF_START).expect("this pin exists");
+        let cell = &source[cell_start..pin_start];
+        for forbidden in ["for _round", "continue;", "0..4_u32"] {
+            assert!(
+                !cell.contains(forbidden),
+                "the live 40P01 cell must provoke the deadlock by construction; \
+                 it still contains `{forbidden}`"
+            );
+        }
+        assert!(
+            cell.contains("pg_locks") || cell.contains("await_pending_lock"),
+            "the second step must wait for the first lock to be seen in the database"
+        );
+        assert!(
+            cell.contains("setup error"),
+            "an unmet provocation precondition must fail with a named setup error"
+        );
+    }
 }
