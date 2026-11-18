@@ -27,6 +27,7 @@ import re
 import sys
 import time
 import unittest
+import unittest.mock
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -164,6 +165,10 @@ SHELL_PR_CODE = (
     ("rustup show", True),
     ("npm --version", True),
     ("git bisect run make", True),
+    # python -m: only a listed module under -I is inert (PY_INERT_MODULES)
+    ("python3 -I -m pytest", True),
+    ("python3 -I -m os", True),
+    ("python3 -m json.tool f.json", True),
 )
 
 SHELL_INERT = (
@@ -196,6 +201,8 @@ EXPR_UNCLASSIFIABLE = (
     ("echo ${{ github.frob }}", "expression context 'github.frob' is not on the closed context list"),
     ("echo ${{ env.NOPE }}", "expression `env.NOPE` names no env value declared in the workflow"),
     ("${{ github.sha }} --run", "command word '${{ }}' is not a literal word"),
+    # sibling: a quoted expression is a literal part of the word, still not a literal command word
+    ("'${{ github.sha }}' --run", "command word '${{ }}' is not a literal word"),
 )
 
 # Job and step forms (I-1).
@@ -467,7 +474,7 @@ class LinearScanners(unittest.TestCase):
             "git " + "-c " * (n // 3) + "show",
             "echo " + "\"$(echo " * MAX_NESTING + "x" + ")\"" * MAX_NESTING + " a" * n,
             "sed '" + "s/a/b/;" * (n // 7) + "' f",
-            "awk '" + "{ x = x \"a\" } " * (n // 15) + "' f",
+            "awk '" + "{ x = x \"a\" } " * (n // 14 + 1) + "' f",
             "echo " + "'a' \"b\" " * (n // 8),
             "case x in " + "a) echo ;; " * (n // 11) + "esac",
             "cat <<EOF\n" + "$x line\n" * (n // 8) + "EOF",
@@ -577,6 +584,7 @@ class _FakePath:
         self._size = len(data) if size is None else size
         self._link = link
         self._regular = regular
+        self.reads = 0
 
     def is_symlink(self) -> bool:
         return self._link
@@ -588,6 +596,7 @@ class _FakePath:
         return _FakeStat(self._size)
 
     def read_bytes_bounded(self, limit: int) -> bytes:
+        self.reads += 1
         return (self._data or b"x" * min(self._size, limit))[:limit]
 
 
@@ -606,10 +615,193 @@ class HostedGuard(unittest.TestCase):
         self.assertEqual(steps[0]["run"].strip(), HOST_COMMAND)
         self.assertTrue(Path(__file__).name.startswith("test"))
         self.assertEqual(Path(__file__).parent, REPO_ROOT / "scripts" / "ci" / "tests")
+        # The step itself is a listed form: it runs pull-request code and raises no finding.
+        self.assertIs(tb._shell_runs_pr_code(HOST_COMMAND), True)
         result = tb.scan_texts(workflows, actions, files)
-        self.assertNotEqual(result.verdicts[(HOST_WORKFLOW, HOST_JOB)], "unclassifiable")
+        host_prefix = f"{HOST_WORKFLOW}/{HOST_JOB}: step {HOST_STEP!r}"
+        self.assertEqual([u for u in result.unclassifiable if u.startswith(host_prefix)], [])
         self.assertEqual([v for v in result.violations if (v.workflow, v.job, v.step) == (HOST_WORKFLOW, HOST_JOB, HOST_STEP)],
                          [])
+
+
+# I-1 list entry GITHUB_ACTION_PATH: inside a local composite action it names that action's
+# workspace directory, and `..` resolves inside the workspace only, never above its root.
+ACTION_DIR = ".github/actions/a"
+ACTION_STEP = "Outer"
+
+
+def _composite(run: str) -> dict[str, str]:
+    body = "".join(f"        {line}\n" for line in run.split("\n"))
+    return {ACTION_DIR: "runs:\n  using: composite\n  steps:\n    - name: Inner\n      shell: bash\n"
+                        f"      run: |\n{body}"}
+
+
+def _composite_scan(run: str) -> object:
+    steps = CHECKOUT + f"      - name: {ACTION_STEP}\n        uses: ./{ACTION_DIR}\n" + SECRET_STEP
+    return tb.scan_texts({SYNTH: _wf(steps)}, _composite(run), frozenset())
+
+
+ACTION_PATH_PR_CODE = (
+    'python3 -I "${GITHUB_ACTION_PATH}/../../../scripts/x.py"',
+    'python3 -I "$GITHUB_ACTION_PATH/tool.py"',
+    'python3 -I "${GITHUB_ACTION_PATH}/./../a/tool.py"',
+)
+# (run text, the exact interpreter path in the reason)
+ACTION_PATH_UNKNOWN = (
+    ('python3 -I "${GITHUB_ACTION_PATH}/../../../../x.py"', "${GITHUB_ACTION_PATH}/../../../../x.py"),
+    ('GITHUB_ACTION_PATH=/opt\npython3 -I "${GITHUB_ACTION_PATH}/x.py"', "${GITHUB_ACTION_PATH}/x.py"),
+    ('python3 -I "${GITHUB_ACTION_PATH:-/opt}/x.py"', "${GITHUB_ACTION_PATH:-/opt}/x.py"),
+    ('python3 -I "$RUNNER_TEMP/../x.py"', "$RUNNER_TEMP/../x.py"),
+    ('python3 -I "$GITHUB_WORKSPACE/../x.py"', "$GITHUB_WORKSPACE/../x.py"),
+)
+
+
+class ListEntryActionPath(unittest.TestCase):
+    """GITHUB_ACTION_PATH has one meaning (I-1); every other form of it is Unclassifiable."""
+
+    def test_9452_action_path_in_a_local_composite_is_pull_request_code(self) -> None:
+        _need_module(self)
+        for run in ACTION_PATH_PR_CODE:
+            with self.subTest(run=run):
+                result = _composite_scan(run)
+                self.assertEqual(result.unclassifiable, [])
+                # The taint point is the outer step that calls the action.
+                self.assertEqual(result.taint_steps[(SYNTH, JOB)], ACTION_STEP)
+                self.assertEqual(result.verdicts[(SYNTH, JOB)], "i")
+
+    def test_9452_action_path_outside_the_workspace_or_redefined_is_unclassifiable(self) -> None:
+        _need_module(self)
+        for run, path in ACTION_PATH_UNKNOWN:
+            with self.subTest(run=run):
+                result = _composite_scan(run)
+                reason = f"interpreter path {path!r} is neither in the workspace nor bound to base content"
+                self.assertEqual(result.unclassifiable,
+                                 [f"{SYNTH}/{JOB}: step '{ACTION_STEP} > Inner': {reason}"])
+
+    def test_9452_action_path_outside_a_composite_has_no_meaning(self) -> None:
+        _need_module(self)
+        run = 'python3 -I "${GITHUB_ACTION_PATH}/tool.py"'
+        reason = "interpreter path '${GITHUB_ACTION_PATH}/tool.py' is neither in the workspace nor bound to base content"
+        self.assertIn(f"{UNCLASSIFIABLE_PREFIX}{SYNTH}/{JOB}: step 'S': {reason}",
+                      _problems(_wf(CHECKOUT + _run_step("S", run))))
+
+    def test_9452_step_env_redefining_action_path_shadows_it(self) -> None:
+        _need_module(self)
+        ctx = tb._ShellCtx(True, shadowed=frozenset({"GITHUB_ACTION_PATH"}), action_dir=f"{tb.WS}/{ACTION_DIR}")
+        with self.assertRaises(tb.Unclassifiable) as caught:
+            tb._shell_runs_pr_code('python3 -I "${GITHUB_ACTION_PATH}/tool.py"', ctx)
+        self.assertEqual(str(caught.exception), "interpreter path '${GITHUB_ACTION_PATH}/tool.py' is neither "
+                                                "in the workspace nor bound to base content")
+        self.assertIn("GITHUB_ACTION_PATH", tb.SCANNER_NAMES)
+
+
+# psql getopt bundles (I-1 argument grammar): listed one-letter flags, then at most one
+# letter that takes an argument. (text, runs pull-request code or the exact reason)
+PSQL_BUNDLES = (
+    ("psql -tAc 'SELECT 1'", False),
+    ("psql -tAcSELECT", False),
+    ("psql -qtAf x.sql", True),
+    ("psql -tAo out.txt -c 'SELECT 1'", False),
+    ("psql -tAo '|sh' -c 'SELECT 1'", "psql option '-o' runs a command"),
+    ("psql -tAc 'COPY t TO PROGRAM x'", "psql SQL text runs a program"),
+    ("psql -tAc '\\! id'", "psql meta-command in SQL text"),
+    ("psql -tAY", "psql option '-tAY' is not on the closed option list"),
+    ("psql -cSELECT", "psql option '-cSELECT' is not on the closed option list"),
+)
+
+
+class ListEntryPsqlBundle(unittest.TestCase):
+    def test_9452_psql_option_bundles(self) -> None:
+        _need_module(self)
+        for text, expected in PSQL_BUNDLES:
+            with self.subTest(text=text):
+                if isinstance(expected, str):
+                    with self.assertRaises(tb.Unclassifiable) as caught:
+                        _classify(text)
+                    self.assertEqual(str(caught.exception), expected)
+                else:
+                    self.assertIs(_classify(text), expected)
+
+
+class RowOfAnUnclassifiableJob(unittest.TestCase):
+    """A row of an unclassifiable job is never reported stale: its verdict is unknown."""
+
+    def test_9452_row_of_an_unclassifiable_job_is_not_called_stale(self) -> None:
+        _need_module(self)
+        result = _scan(_wf(CHECKOUT + _run_step("S", "unknowncmd") + SECRET_STEP))
+        row = tb.AllowRow(SYNTH, JOB, "Late secret", ("i",), 9455)
+        problems = tb.check(result, allow=(row,), pin=1)
+        self.assertEqual(problems, [f"{UNCLASSIFIABLE_PREFIX}{SYNTH}/{JOB}: step 'S': "
+                                    "command word 'unknowncmd' is not on the closed command list"])
+        clean = _scan(_wf(CHECKOUT + _run_step("S", "echo hi")))
+        self.assertEqual(tb.check(clean, allow=(row,), pin=1),
+                         [f"stale allow row (no longer violates class i): {SYNTH}/{JOB}/Late secret"])
+
+
+# Cells named by the r1fix mutation run: each pins one guard that a broken copy left green.
+NESTED_ACTION_DIR = ".github/actions/a/b"
+BASE_REF_ENV = "          BASE: ${{ github.event.pull_request.base.sha }}\n"
+BASE_COPY_RUN = 'git show "{ref}:x.py" > "$RUNNER_TEMP/x.py"\npython3 -I "$RUNNER_TEMP/x.py"'
+NESTING_FORMS = (
+    ("subshell", lambda d: "( " * d + "echo x" + " )" * d),
+    ("if", lambda d: "if true; then " * d + "echo x; " + "fi; " * (d - 1) + "fi"),
+    ("brace group", lambda d: "{ " * d + "echo x; " + "}; " * (d - 1) + "}"),
+)
+
+
+class MutationPinnedGuards(unittest.TestCase):
+    def test_9452_shell_nesting_has_its_own_reason(self) -> None:
+        _need_module(self)
+        for name, build in NESTING_FORMS:
+            with self.subTest(form=name):
+                self.assertIs(_classify(build(MAX_NESTING)), False)
+                with self.assertRaises(tb.Unclassifiable) as caught:
+                    _classify(build(MAX_NESTING + 1))
+                self.assertEqual(str(caught.exception), f"shell nesting deeper than {MAX_NESTING} levels")
+
+    def test_9452_action_path_names_the_innermost_composite(self) -> None:
+        _need_module(self)
+        # From .github/actions/a/b four `..` reach the workspace root; from .github/actions/a they would not.
+        inner_run = 'python3 -I "${GITHUB_ACTION_PATH}/../../../../x.py"'
+        actions = {
+            ACTION_DIR: f"runs:\n  using: composite\n  steps:\n    - name: Mid\n      uses: ./{NESTED_ACTION_DIR}\n",
+            NESTED_ACTION_DIR: "runs:\n  using: composite\n  steps:\n    - name: Inner\n      shell: bash\n"
+                               f"      run: {inner_run}\n",
+        }
+        steps = CHECKOUT + f"      - name: {ACTION_STEP}\n        uses: ./{ACTION_DIR}\n" + SECRET_STEP
+        result = tb.scan_texts({SYNTH: _wf(steps)}, actions, frozenset())
+        self.assertEqual(result.unclassifiable, [])
+        self.assertEqual(result.verdicts[(SYNTH, JOB)], "i")
+
+    def test_9452_a_base_ref_that_can_be_empty_binds_only_with_a_guard(self) -> None:
+        _need_module(self)
+        # Under push the pull-request base sha is empty and `git show ":x.py"` reads the index.
+        bare = _run_step("S", BASE_COPY_RUN.format(ref="$BASE"), BASE_REF_ENV) + SECRET_STEP
+        reason = "interpreter path '$RUNNER_TEMP/x.py' is neither in the workspace nor bound to base content"
+        self.assertIn(f"{UNCLASSIFIABLE_PREFIX}{SYNTH}/{JOB}: step 'S': {reason}",
+                      _problems(_wf(CHECKOUT + bare, on="[pull_request, push]")))
+        for on, ref in (("pull_request", "$BASE"), ("[pull_request, push]", "${BASE:?}")):
+            with self.subTest(on=on, ref=ref):
+                steps = CHECKOUT + _run_step("S", BASE_COPY_RUN.format(ref=ref), BASE_REF_ENV) + SECRET_STEP
+                result = _scan(_wf(steps, on=on))
+                self.assertEqual(result.unclassifiable, [])
+                self.assertEqual(result.verdicts[(SYNTH, JOB)], "no-pr-code")
+
+    def test_9452_oversized_file_is_refused_before_any_read(self) -> None:
+        _need_module(self)
+        big = _FakePath("big.yml", size=MAX_YAML_BYTES + 1)
+        with self.assertRaises(tb.YamlError) as ctx:
+            tb.parse_yaml(tb._load_one(big, workflow=True), big.name)
+        self.assertEqual(str(ctx.exception), f"big.yml: larger than {MAX_YAML_BYTES} bytes")
+        self.assertEqual(big.reads, 0)
+
+    def test_9452_a_bool_is_never_an_issue_number(self) -> None:
+        _need_module(self)
+        result = _scan(_wf(CHECKOUT + _run_step("Build", "make") + SECRET_STEP))
+        stale = f"allow row without an open fix issue: {SYNTH}/{JOB}/Late secret"
+        with unittest.mock.patch.object(tb, "FIX_ISSUES", FIX_ISSUES | {1}):
+            self.assertIn(stale, tb.check(result, allow=(tb.AllowRow(SYNTH, JOB, "Late secret", ("i",), True),), pin=1))
+            self.assertNotIn(stale, tb.check(result, allow=(tb.AllowRow(SYNTH, JOB, "Late secret", ("i",), 1),), pin=1))
 
 
 if __name__ == "__main__":

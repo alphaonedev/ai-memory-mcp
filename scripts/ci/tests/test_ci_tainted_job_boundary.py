@@ -18,7 +18,6 @@ from __future__ import annotations
 import sys
 import time
 import unittest
-import unittest.mock
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -49,7 +48,6 @@ R2_STEP = "runs-on"
 R2_DETAIL = "job can run on a runner not provably GitHub-hosted and has a trusted trigger: {events}"
 HOST_CREDENTIAL_DETAIL = "a credential resident on a self-hosted host read after pull-request code ran"
 # A non-empty host-fact value of the old contract form; ruling 8b8cede8: no verdict reads it.
-HOST_FACT_VALUE = {"boundary": True, "proof_test": "scripts/ci/tests/test_ci_tainted_job_boundary.py"}
 CLASS_IV = "iv"
 
 # ---------------------------------------------------------------------------------------
@@ -162,10 +160,12 @@ JOB_CLEAN_BASE_TREE = """\
         with:
           persist-credentials: false
       - name: Materialise the base tool
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
         run: |
           base_dir="$RUNNER_TEMP/base"
           mkdir -p "$base_dir"
-          git show "origin/main:scripts/tool.py" > "$base_dir/tool.py"
+          git show "${BASE:?}:scripts/tool.py" > "$base_dir/tool.py"
           python3 -I "$base_dir/tool.py" --data .
 """
 
@@ -227,7 +227,8 @@ SYNTH_VERDICTS = {
     "class-ii": "ii",
     "class-iii": "iii",
     "class-iv": "iv",
-    "clean-secret-before": "clean",
+    # I-2: a token held before the taint point can persist into pull-request code.
+    "clean-secret-before": "i",
     "clean-output-before": "clean",
     "clean-base-tree": "no-pr-code",
     "clean-trusted-only": "trusted-only",
@@ -240,6 +241,7 @@ SYNTH_VIOLATIONS = {
     ("class-i", "Use token", "i"),
     ("class-ii", "Test", "ii"),
     ("class-iii", "Pick", "iii"),
+    ("clean-secret-before", "Query with token", "i"),
     ("class-iv", R2_STEP, "iv"),
     ("trusted-self-hosted", R2_STEP, "iv"),
 }
@@ -565,7 +567,7 @@ R2_RUNS_ON_FORMS = {
                             "          - runner: '[\"self-hosted\",\"macos-fed\"]'\n"
                             "    runs-on: ${{ fromJSON(matrix.runner) }}\n", PERSISTENT),
     "matrix value expression": ("    strategy:\n      matrix:\n        os: ['${{ inputs.os }}']\n"
-                                "    runs-on: ${{ matrix.os }}\n", PERSISTENT),
+                                "    runs-on: ${{ matrix.os }}\n", "matrix axis 'os' is an expression"),
     "expression": ("    runs-on: ${{ github.event.inputs.runner }}\n", PERSISTENT),
     "reusable-workflow input": ("    runs-on: ${{ inputs.runner }}\n", PERSISTENT),
     "expression in a list": ("    runs-on: [self-hosted, '${{ vars.POOL }}']\n", PERSISTENT),
@@ -600,8 +602,10 @@ def r2_workflow(on_block: str, runs_on: str) -> str:
 
 
 # Hit 4-6 job (cert-postgres-age) with each split applied; none may clear R2.
-HIT_WORKFLOW = "cert-postgres-age.yml"
-HIT_JOB = "cert-postgres-age"
+# cert-postgres-age is unclassifiable through another step (REAL_UNCLASSIFIABLE); the
+# postgres-ignored job shares its runs-on and classifies.
+HIT_WORKFLOW = "postgres-ignored.yml"
+HIT_JOB = "postgres-ignored"
 HIT_RUNS_ON = "    runs-on: [self-hosted, linux-fed]\n"
 HIT_SPLITS = {
     "path split": HIT_RUNS_ON + (
@@ -625,7 +629,8 @@ R2_ROWS = (
     ("session-boot-lifetime.yml", "lifetime-tests"),
 )
 
-# Shell text -> runs pull-request code (fail closed on everything unknown).
+# Shell text -> runs pull-request code, or the exact Unclassifiable reason (a str), in the
+# reading of a job with a pull-request trigger (strict).
 SHELL_CASES = (
     ("echo hi && grep -c x file | wc -l", False),
     ("git diff --name-only HEAD~1 > changed.txt", False),
@@ -638,7 +643,7 @@ SHELL_CASES = (
     ("source scripts/lib.sh", True),
     (". scripts/lib.sh", True),
     ("eval \"$cmd\"", True),
-    ("$TOOL --flag", True),
+    ("$TOOL --flag", "command word '$TOOL' is not a literal word"),
     ("python3 scripts/x.py", True),
     ("python3 -I scripts/x.py", True),
     ("python3 -m pip install pytest", True),
@@ -648,7 +653,7 @@ SHELL_CASES = (
     ("python3 --version", False),
     ("node --version", False),
     ("npm ci", True),
-    ("unknowncmd --x", True),
+    ("unknowncmd --x", "command word 'unknowncmd' is not on the closed command list"),
     ("x=$(cargo metadata)", True),
     ("echo \"$(make -s version)\"", True),
     ("echo `npm bin`", True),
@@ -665,15 +670,51 @@ SHELL_CASES = (
     ("find . -name '*.tmp' -exec rm {} \\;", False),
     ("awk -f scripts/x.awk file", True),
     ("docker build -t x .", True),
-    ("docker run --rm img true", False),
+    # The image may be built from the pull-request tree: it runs pull-request code.
+    ("docker run --rm img true", True),
     ("cat <<'EOF'\n$(cargo build)\nEOF", False),
     ("cat <<EOF\n$(cargo build)\nEOF", True),
     ("python3 - <<'PY'\nprint(1)\nPY", True),
     ("python3 -I - <<'PY'\nprint(1)\nPY", False),
     ("echo x 2>&1 | tee out.log", False),
     ("echo GHA_EXPR", False),
-    ("GHA_EXPR --run", True),
+    ("GHA_EXPR --run", "command word 'GHA_EXPR' is not on the closed command list"),
+    ("psql \"$U\" -v ON_ERROR_STOP=1 -tAc 'SELECT 1'", False),
+    ("psql -tAf x.sql", True),
+    ("psql -tAc 'COPY t FROM PROGRAM x'", "psql SQL text runs a program"),
+    ("psql -tAY", "psql option '-tAY' is not on the closed option list"),
 )
+
+# Real Unclassifiable forms at this checkout (ruling b44e2422: a finding, never clean, and no
+# allow row): (workflow, job, step label, exact reason). Each is a `new-finding` of PR 9508.
+REAL_UNCLASSIFIABLE = (
+    ("batman-mode-acceptance.yml", "rust-integration",
+     "Assert binary refuses /tmp write under R001 end-to-end", "command word '$BIN' is not a literal word"),
+    ("batman-mode-acceptance.yml", "bash-integration",
+     "Install sqlite3 + jq (bounded+retry", "command word 'apt-get' is not on the closed command list"),
+    ("cert-postgres-age.yml", "cert-postgres-age",
+     "Ensure AGE + vector extensions present (best-effort \u2014 tier is pre-provisioned)",
+     "command word '$PSQL' is not a literal word"),
+    ("ci.yml", "select", "Materialise the base selector (#8240)",
+     "python module 'os' is not on the closed module list"),
+    ("ci.yml", "classify", "id:cls",
+     "interpreter path '$trust_impact/cargo_skip.py' is neither in the workspace nor bound to base content"),
+    ("ci.yml", "check", "Free disk before tests (hosted image only,",
+     "command word 'apt-get' is not on the closed command list"),
+    ("ci.yml", "ci-gate", "Materialise the base gate (#8240)",
+     "python module 'os' is not on the closed module list"),
+    ("coverage.yml", "classify", "id:cls",
+     "interpreter path '$trust_impact/cargo_skip.py' is neither in the workspace nor bound to base content"),
+    ("coverage.yml", "per-module-thresholds", "Free disk + add swap (#1148 belt-and-suspenders, aggressive)",
+     "command word 'apt-get' is not on the closed command list"),
+    ("mobile-runtime.yml", "ios-simulator", "Boot iOS Simulator (best-available iPhone)",
+     "command word 'xcrun' is not on the closed command list"),
+    ("mobile-runtime.yml", "android-emulator", "Enable KVM",
+     "command word 'udevadm' is not on the closed command list"),
+)
+REAL_UNCLASSIFIABLE_JOBS = frozenset((wf, job) for wf, job, _, _ in REAL_UNCLASSIFIABLE)
+PRUNE_STEP = "Prune stale runner TMPDIR (#8634)"
+WORKFLOW_CALL_ONLY = "workflow_call-only workflow has no caller in this repository"
 
 
 def _need_module(case: unittest.TestCase) -> None:
@@ -913,7 +954,7 @@ class AllowTable(unittest.TestCase):
         result = _scan({SYNTH: HEADER + JOB_CLASS_IV})
         rows = (tb.AllowRow(SYNTH, "class-iv", R2_STEP, ("iv",), None),)
         self.assertEqual(tb.check(result, allow=rows, pin=1),
-                         [f"allow row without an open issue: synthetic.yml/class-iv/{R2_STEP}"])
+                         [f"allow row without an open fix issue: synthetic.yml/class-iv/{R2_STEP}"])
 
     def test_9452_stale_row_is_a_failure(self) -> None:
         _need_module(self)
@@ -937,7 +978,7 @@ class AllowTable(unittest.TestCase):
         _need_module(self)
         workflows, actions, files = _real()
         extended = dict(workflows, **{"new-workflow.yml": HEADER + JOB_CLASS_II})
-        problems = tb.check(tb.scan_texts(extended, actions, files))
+        problems = [p for p in tb.check(tb.scan_texts(extended, actions, files)) if "new-workflow.yml" in p]
         self.assertEqual(problems, [
             "violation class (ii) without an allow row: new-workflow.yml/class-ii/Test: job token has a write scope",
         ])
@@ -952,6 +993,10 @@ class PersistentRunnerTrustedTrigger(unittest.TestCase):
             for trigger, (on_block, trusted, hosted_verdict) in R2_TRIGGER_SETS.items():
                 with self.subTest(form=form, trigger=trigger):
                     result = _scan({SYNTH: r2_workflow(on_block, runs_on)})
+                    if trigger == "workflow_call":
+                        self.assertEqual(result.unclassifiable, [f"{SYNTH}: {WORKFLOW_CALL_ONLY}"])
+                        self.assertEqual(result.verdicts, {(SYNTH, "*"): "unclassifiable"})
+                        continue
                     verdict = result.verdicts[(SYNTH, R2_JOB_ID)]
                     got = {(v.job, v.step, v.klass, v.detail) for v in result.violations}
                     if expected not in (HOSTED, PERSISTENT):
@@ -978,7 +1023,9 @@ class PersistentRunnerTrustedTrigger(unittest.TestCase):
                 with self.subTest(form=form, trigger=trigger):
                     problems = tb.check(_scan({SYNTH: r2_workflow(on_block, runs_on)}), allow=(), pin=0)
                     self.assertEqual(len(problems), 1, problems)
-                    self.assertTrue(problems[0].startswith(f"unclassifiable: {SYNTH}/{R2_JOB_ID}: "), problems)
+                    prefix = f"unclassifiable: {SYNTH}: " if trigger == "workflow_call" else \
+                        f"unclassifiable: {SYNTH}/{R2_JOB_ID}: "
+                    self.assertTrue(problems[0].startswith(prefix), problems)
 
     def test_9452_r2_split_of_a_hit_job_stays_class_iv(self) -> None:
         _need_module(self)
@@ -989,33 +1036,18 @@ class PersistentRunnerTrustedTrigger(unittest.TestCase):
                 text = workflows[HIT_WORKFLOW].replace(HIT_RUNS_ON, replacement, 1)
                 self.assertNotEqual(text, workflows[HIT_WORKFLOW])
                 result = tb.scan_texts(dict(workflows, **{HIT_WORKFLOW: text}), actions, files)
-                self.assertEqual(result.unclassifiable, [])
+                self.assertEqual([u for u in result.unclassifiable if u.startswith(HIT_WORKFLOW)], [])
                 self.assertIn(CLASS_IV, result.verdicts[(HIT_WORKFLOW, HIT_JOB)].split(","))
                 got = {(v.step, v.klass, v.detail) for v in result.violations
                        if (v.workflow, v.job) == (HIT_WORKFLOW, HIT_JOB) and v.klass == CLASS_IV}
                 self.assertEqual(got, {(R2_STEP, CLASS_IV,
                                         R2_DETAIL.format(events="push, workflow_dispatch"))})
 
-    def test_9452_r2_host_fact_table_is_pinned_empty(self) -> None:
+    def test_9452_r2_host_fact_table_is_gone(self) -> None:
         _need_module(self)
-        self.assertEqual(tb.RUNNER_BOUNDARY_FACTS, {})
-        for name in ("BOUNDARY_REQUIRED_TRUE", "_boundary_holds", "_leg_persistent"):
+        for name in ("RUNNER_BOUNDARY_FACTS", "BOUNDARY_REQUIRED_TRUE", "_boundary_holds", "_leg_persistent"):
             with self.subTest(name=name):
                 self.assertFalse(hasattr(tb, name), name)
-
-    def test_9452_r2_non_empty_host_facts_clear_no_row(self) -> None:
-        _need_module(self)
-        workflows, actions, files = _real()
-        workflows = dict(workflows, **{SYNTH: SYNTH_WORKFLOW})
-        before = tb.scan_texts(workflows, actions, files)
-        labels = {"self-hosted", "linux-fed", "macos-fed", "linux-fed-pr", "ephemeral", "group:pr-tier"}
-        with unittest.mock.patch.dict(tb.RUNNER_BOUNDARY_FACTS, {lab: dict(HOST_FACT_VALUE) for lab in labels}):
-            after = tb.scan_texts(workflows, actions, files | {HOST_FACT_VALUE["proof_test"]})
-            problems = tb.check(after)
-        self.assertEqual(after.verdicts, before.verdicts)
-        self.assertEqual(after.violations, before.violations)
-        self.assertEqual([p for p in problems if p.startswith("stale allow row")], [])
-        self.assertEqual(after.verdicts[(HIT_WORKFLOW, HIT_JOB)], "i,iv")
 
     def test_9452_r2_real_rows_stay_open_under_the_runner_issue(self) -> None:
         _need_module(self)
@@ -1027,7 +1059,10 @@ class PersistentRunnerTrustedTrigger(unittest.TestCase):
             with self.subTest(job=key):
                 self.assertEqual(rows[key].classes, (CLASS_IV,))
                 self.assertEqual(rows[key].issue, RUNNER_ISSUE)
-                self.assertIn(CLASS_IV, result.verdicts[key].split(","))
+                if key in REAL_UNCLASSIFIABLE_JOBS:
+                    self.assertEqual(result.verdicts[key], "unclassifiable")
+                else:
+                    self.assertIn(CLASS_IV, result.verdicts[key].split(","))
         self.assertEqual(result.verdicts[("session-boot-lifetime.yml", "lifetime-tests")], CLASS_IV)
 
     def test_9452_r2_stale_row_for_a_gone_job_is_a_failure(self) -> None:
@@ -1046,14 +1081,38 @@ class ShellClassifier(unittest.TestCase):
         _need_module(self)
         for text, expected in SHELL_CASES:
             with self.subTest(text=text):
-                self.assertIs(tb._shell_runs_pr_code(text, tb._ShellCtx(False)), expected)
+                if isinstance(expected, str):
+                    with self.assertRaises(tb.Unclassifiable) as caught:
+                        tb._shell_runs_pr_code(text, tb._ShellCtx(True))
+                    self.assertEqual(str(caught.exception), expected)
+                else:
+                    self.assertIs(tb._shell_runs_pr_code(text, tb._ShellCtx(True)), expected)
 
     def test_9452_runner_temp_path_needs_isolation_and_a_base_copy(self) -> None:
         _need_module(self)
-        text = 'root="$RUNNER_TEMP/base"\npython3 -I "$root/tool.py"'
-        self.assertFalse(tb._shell_runs_pr_code(text, tb._ShellCtx(True)))
-        self.assertTrue(tb._shell_runs_pr_code(text, tb._ShellCtx(False)))
-        self.assertTrue(tb._shell_runs_pr_code(text.replace(" -I", ""), tb._ShellCtx(True)))
+        unbound = 'root="$RUNNER_TEMP/base"\npython3 -I "$root/tool.py"'
+        reason = "interpreter path '$root/tool.py' is neither in the workspace nor bound to base content"
+        with self.assertRaises(tb.Unclassifiable) as caught:
+            tb._shell_runs_pr_code(unbound, tb._ShellCtx(True))
+        self.assertEqual(str(caught.exception), reason)
+        # A job without a pull-request trigger looks only for a pull-request fetch.
+        self.assertIs(tb._shell_runs_pr_code(unbound, tb._ShellCtx(False)), False)
+        bound = 'root="$RUNNER_TEMP/base"\ngit show "$BASE:tool.py" > "$root/tool.py"\npython3 -I "$root/tool.py"'
+        env = {"BASE": "${{ github.event.pull_request.base.sha }}"}
+        result = _scan({SYNTH: "on: pull_request\npermissions:\n  contents: read\njobs:\n  j:\n"
+                        "    runs-on: ubuntu-24.04\n    steps:\n      - uses: actions/checkout@v4\n"
+                        "        with:\n          persist-credentials: false\n      - name: S\n"
+                        "        env:\n          BASE: " + env["BASE"] + "\n        run: |\n"
+                        + "".join("          " + line + "\n" for line in bound.splitlines())})
+        self.assertEqual(result.unclassifiable, [])
+        self.assertEqual(result.verdicts[(SYNTH, "j")], "no-pr-code")
+        # Without -I the interpreter reads the workspace first: pull-request code.
+        result = _scan({SYNTH: "on: pull_request\npermissions:\n  contents: read\njobs:\n  j:\n"
+                        "    runs-on: ubuntu-24.04\n    steps:\n      - uses: actions/checkout@v4\n"
+                        "        with:\n          persist-credentials: false\n      - name: S\n"
+                        "        env:\n          BASE: " + env["BASE"] + "\n        run: |\n"
+                        + "".join("          " + line.replace(" -I", "") + "\n" for line in bound.splitlines())})
+        self.assertNotEqual(result.verdicts[(SYNTH, "j")], "no-pr-code")
 
     def test_9452_unterminated_forms_are_unclassifiable(self) -> None:
         _need_module(self)
@@ -1120,11 +1179,15 @@ class RealWorkflows(unittest.TestCase):
         _need_module(self)
         for workflow, job, step_id in (("ci.yml", "classify", "id:cls"), ("coverage.yml", "classify", "id:cls")):
             with self.subTest(workflow=workflow):
+                # Its base ref may come from the push `before` sha, which is not a proven base
+                # ref: the copied path is unbound and the step is a finding (REAL_UNCLASSIFIABLE).
                 step = _real_step(workflow, job, step_id)
                 text = tb._expr_free(step["run"])
-                self.assertRegex(text, tb.BASE_MATERIALISE_RE)
-                self.assertFalse(tb._shell_runs_pr_code(text, tb._ShellCtx(True)))
-                self.assertTrue(tb._shell_runs_pr_code(text, tb._ShellCtx(False)))
+                reason = ("interpreter path '$trust_impact/cargo_skip.py' is neither in the workspace "
+                          "nor bound to base content")
+                with self.assertRaises(tb.Unclassifiable) as caught:
+                    tb._shell_runs_pr_code(text, tb._ShellCtx(True))
+                self.assertEqual(str(caught.exception), reason)
 
     def test_9452_real_impact_step_runs_pr_code(self) -> None:
         _need_module(self)
@@ -1135,7 +1198,10 @@ class RealWorkflows(unittest.TestCase):
         _need_module(self)
         workflows, actions, files = _real()
         result = tb.scan_texts(workflows, actions, files)
-        self.assertEqual(result.verdicts[("ci.yml", "select")], "no-pr-code")
+        # Its base copy imports a module off the closed list: a finding (REAL_UNCLASSIFIABLE).
+        self.assertEqual(result.verdicts[("ci.yml", "select")], "unclassifiable")
+        self.assertIn("ci.yml/select: step 'Materialise the base selector (#8240)': "
+                      "python module 'os' is not on the closed module list", result.unclassifiable)
 
     def test_9452_real_prune_step_is_the_taint_point_of_the_persistent_jobs(self) -> None:
         _need_module(self)
@@ -1144,7 +1210,13 @@ class RealWorkflows(unittest.TestCase):
         for key in (("ci.yml", "check"), ("cert-postgres-age.yml", "cert-postgres-age"),
                     ("postgres-ignored.yml", "postgres-ignored")):
             with self.subTest(job=key):
-                self.assertEqual(result.taint_steps[key], "Prune stale runner TMPDIR (#8634)")
+                # The prune step runs a workspace script through GITHUB_ACTION_PATH: listed, never
+                # a finding of its own.
+                self.assertEqual([u for u in result.unclassifiable if PRUNE_STEP in u], [])
+                if key in REAL_UNCLASSIFIABLE_JOBS:
+                    self.assertEqual(result.verdicts[key], "unclassifiable")
+                    continue
+                self.assertEqual(result.taint_steps[key], PRUNE_STEP)
                 self.assertEqual(result.verdicts[key], "i,iv")
 
     def test_9452_real_hit_verdicts(self) -> None:
@@ -1154,13 +1226,19 @@ class RealWorkflows(unittest.TestCase):
         hits = {key: v for key, v in result.verdicts.items() if v not in ("clean", "no-pr-code", "trusted-only")}
         self.assertEqual(hits, {
             ("c8-precheck.yml", "required-contexts-gate"): "i",
-            ("coverage.yml", "per-module-thresholds"): "i,ii",
-            ("ci.yml", "classify"): "iii",
-            ("ci.yml", "check"): "i,iv",
-            ("cert-postgres-age.yml", "cert-postgres-age"): "i,iv",
             ("postgres-ignored.yml", "postgres-ignored"): "i,iv",
             ("session-boot-lifetime.yml", "lifetime-tests"): "iv",
-        })
+        } | {key: "unclassifiable" for key in REAL_UNCLASSIFIABLE_JOBS})
+
+    def test_9452_real_unclassifiable_forms_are_exactly_the_listed_findings(self) -> None:
+        _need_module(self)
+        workflows, actions, files = _real()
+        result = tb.scan_texts(workflows, actions, files)
+        self.assertEqual(sorted(result.unclassifiable),
+                         sorted(f"{wf}/{job}: step {step!r}: {reason}" for wf, job, step, reason in REAL_UNCLASSIFIABLE))
+        # No allow row names an unclassifiable form (ruling b44e2422).
+        rows = {(r.workflow, r.job, r.step) for r in tb.TAINT_ALLOW}
+        self.assertEqual({(wf, job, step) for wf, job, step, _ in REAL_UNCLASSIFIABLE} & rows, set())
 
     @unittest.skipUnless(pyyaml is not None, "PyYAML not installed: parity oracle skipped")
     def test_9452_subset_parser_matches_pyyaml_on_every_real_file(self) -> None:
