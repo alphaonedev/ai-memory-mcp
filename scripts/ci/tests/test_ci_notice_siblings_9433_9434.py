@@ -114,8 +114,18 @@ BASE_SED_OPEN_FAIL_RC = 2
 BASE_SED_READ_ERROR_RC = 4
 # An exception Python does not catch exits 1 with a traceback: what every non-OSError must still do.
 PYTHON_UNCAUGHT_RC = 1
+# A FIFO with no writer: the base ``sed`` / ``cat`` blocks on the open (no exit code); the head decides on the file
+# type before it opens and again on the opened handle, and fails at once.
+BASE_BLOCKS = None
+# The exact reasons of the impact print for a log that is not a regular file: before the open, and on the opened
+# handle (the path changed type between the check and the open).
+IMPACT_NOT_REGULAR_REASON = "not a regular file"
+IMPACT_SWAPPED_REASON = "not a regular file when opened"
+IMPACT_REASON_LINE = "[#9433] impact log not readable: %s\n"
+IMPACT_NOT_REGULAR_FORMS = ("directory", "fifo")
 # (base rc, head rc) of the impact print per log form; base measured with GNU sed 4.9 at a028c45e.
 IMPACT_RC_TABLE = {
+    "fifo": (BASE_BLOCKS, READ_FAIL_RC),
     "readable": (0, 0),
     "missing": (BASE_SED_OPEN_FAIL_RC, READ_FAIL_RC),
     "unreadable": (BASE_SED_OPEN_FAIL_RC, READ_FAIL_RC),
@@ -163,6 +173,26 @@ def fake_open(path, *args, **kwargs):
     return FailingLog(real_open(path, *args, **kwargs))
 builtins.open = fake_open
 exec(compile(program, "<impact-step>", "exec"), {"__name__": "__main__"})'''
+# A python3 stand-in that runs the REAL impact program text and replaces the log with the form named in SWAP_TO
+# right after the program's type check of it returns: the change of type between the check and the open, made
+# deterministic.
+IMPACT_SWAP_SHIM = '''import os
+program = sys.argv[3]
+sys.argv = ["-c"] + sys.argv[4:]
+swap_to = os.environ["SWAP_TO"]
+real_stat = os.stat
+def stat_then_swap(path, *args, **kwargs):
+    result = real_stat(path, *args, **kwargs)
+    if path == sys.argv[1]:
+        os.unlink(path)
+        if swap_to == "fifo":
+            os.mkfifo(path)
+        else:
+            os.mkdir(path)
+    return result
+os.stat = stat_then_swap
+exec(compile(program, "<impact-step>", "exec"), {"__name__": "__main__"})'''
+IMPACT_SWAP_FORMS = ("fifo", "directory")
 TRUST_DIR_MODE = 0o700
 TRUST_FILES = {"__init__.py": b"", "common.py": b"# trusted common 9434\n",
                "cargo_skip.py": b"# trusted decider 9434\n", "rules.json": b"{}\n"}
@@ -172,9 +202,6 @@ PARTIAL_PRINT = b"partial-print-no-newline::error::x"
 # run_sharded print (stop-commands token / no token), equal to the exit code of the base ``cat`` (a028c45e).
 SHARD_LOG_READ_FAIL_RC = 1
 BASE_CAT_FAIL_RC = 1
-# A FIFO with no writer: the base ``cat`` blocks on the open (no exit code); the head decides on the file type
-# before it opens and fails at once.
-BASE_BLOCKS = None
 SHARD_TOKEN_BRANCH = "token"
 SHARD_NO_TOKEN_BRANCH = "no_token"
 SHARD_BRANCHES = (SHARD_TOKEN_BRANCH, SHARD_NO_TOKEN_BRANCH)
@@ -912,25 +939,64 @@ class ClassSiblings9433(unittest.TestCase):
         dangling.symlink_to(root / "impact-rc-no-such-target")
         loop = root / "impact-rc-loop.log"
         loop.symlink_to(loop.name)
+        fifo = root / "impact-rc-fifo.log"
+        os.mkfifo(fifo)
         logs = {"readable": readable, "missing": root / "impact-rc-missing.log", "unreadable": unreadable,
                 "dangling_symlink": dangling, "symlink_loop": loop, "not_a_directory": readable / "sub",
-                "directory": directory}
+                "directory": directory, "fifo": fifo}
         self.assertEqual(set(logs), set(IMPACT_RC_TABLE))
         for name, log in logs.items():
             with self.subTest(log=name):
                 got = []
                 outs = []
                 for text in (BASE_IMPACT_SPAN, impact_span()):
-                    result, _ = run_bash('impact_log="$STUB_LOG"\n' + text + 'echo "%s"\n' % AFTER_MARK,
-                                         self.box.root, env_extra={"STUB_LOG": str(log)})
-                    got.append(result.returncode)
-                    outs.append(result.stdout)
+                    # a blocked run (the base on a FIFO) is killed at the ceiling and recorded as BASE_BLOCKS
+                    result, _ = run_bash_bounded('impact_log="$STUB_LOG"\n' + text + 'echo "%s"\n' % AFTER_MARK,
+                                                 self.box.root, SHARD_FORM_CEILING_SECS, {"STUB_LOG": str(log)})
+                    got.append(BASE_BLOCKS if result is None else result.returncode)
+                    outs.append(b"" if result is None else result.stdout)
                 self.assertEqual(tuple(got), IMPACT_RC_TABLE[name], "(base rc, head rc) for a %s log" % name)
                 if name == "readable":
                     self.assertEqual(outs[0], outs[1].replace(b"# #[", b"##["))
                 else:
                     self.assertEqual(got[1], READ_FAIL_RC, "head exit code for a %s log" % name)
                     self.assertEqual(outs, [b"", b""], "a failing print must print nothing and stop the step")
+
+    def run_impact_bounded(self, log, path=None, env_extra=None):
+        return run_bash_bounded('impact_log="$STUB_LOG"\n' + impact_span() + 'echo "%s"\n' % AFTER_MARK,
+                                self.box.root, SHARD_FORM_CEILING_SECS, {"STUB_LOG": str(log), **(env_extra or {})},
+                                path=path)
+
+    def assert_failed_with_reason(self, result, took, reason):
+        self.assertIsNotNone(result, "the impact print blocked past %ss" % SHARD_FORM_CEILING_SECS)
+        self.assertLess(took, SHARD_FORM_CEILING_SECS)
+        self.assertEqual(result.returncode, READ_FAIL_RC, result.stderr[-400:])
+        self.assertEqual(result.stdout, b"", "a failing print must print nothing and stop the step")
+        self.assertEqual(result.stderr, (IMPACT_REASON_LINE % reason).encode())
+
+    def test_impact_log_that_is_not_a_regular_file_fails_before_the_open(self):
+        """#9433 r1e: a FIFO (no writer) and a directory never block and never print: READ_FAIL_RC within the
+        ceiling, with the exact reason of the check made BEFORE the open."""
+        for form in IMPACT_NOT_REGULAR_FORMS:
+            with self.subTest(form=form):
+                log = self.box.root / ("impact-form-%s-%d.log" % (form, time.monotonic_ns()))
+                if form == "fifo":
+                    os.mkfifo(log)
+                else:
+                    log.mkdir()
+                result, took = self.run_impact_bounded(log)
+                self.assert_failed_with_reason(result, took, IMPACT_NOT_REGULAR_REASON)
+
+    def test_impact_log_swapped_after_the_check_is_caught_on_the_handle(self):
+        """#9433 r1e, TOCTOU: the log is regular at the check and a FIFO or a directory at the open; the opened
+        handle is checked, the open never waits for a writer, and the step fails with the handle reason."""
+        bindir = self.box.shim_bin("impact-swap", IMPACT_SWAP_SHIM)
+        for form in IMPACT_SWAP_FORMS:
+            with self.subTest(swap_to=form):
+                log = self.box.root / ("impact-swap-%s-%d.log" % (form, time.monotonic_ns()))
+                log.write_bytes(b"::error::x\n")
+                result, took = self.run_impact_bounded(log, path=bindir, env_extra={"SWAP_TO": form})
+                self.assert_failed_with_reason(result, took, IMPACT_SWAPPED_REASON)
 
     def run_impact_injected(self, bindir, log, kind, point, number=0):
         return run_bash('impact_log="$STUB_LOG"\n' + impact_span() + 'echo "%s"\n' % AFTER_MARK, self.box.root,
