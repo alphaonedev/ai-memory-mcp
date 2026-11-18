@@ -81,6 +81,10 @@ pub(crate) const UNDECODABLE_METADATA: &str = "{not json 9466";
 pub(crate) const NON_OBJECT_METADATA: &str = "[\"mallory-9466\"]";
 /// The namespace every seeded row lives in.
 pub(crate) const NAMESPACE: &str = "delete-link-owner-9466";
+/// The `expect` text of the raw metadata overwrite both backends' seeders run.
+pub(crate) const SET_ENDPOINT_METADATA: &str = "set endpoint metadata";
+/// The assertion text when that overwrite does not touch exactly one row.
+pub(crate) const ENDPOINT_METADATA_SET: &str = "endpoint metadata must be set";
 
 /// The owner state of one endpoint row.
 #[derive(Debug, Clone, Copy)]
@@ -434,126 +438,190 @@ fn delete_link_non_object_metadata_unreadable_9466() {
 /// readable owner, and the legacy admission needs an empty addressee.
 #[test]
 fn delete_link_gate_decisions_9466() {
-    use super::LinkEndpoint as E;
-    use crate::identity::owner_stamp::OwnerStamp as O;
+    use super::LinkEndpoint;
+    use crate::identity::owner_stamp::OwnerStamp;
     let site = crate::identity::owner_stamp::MutationSite::sqlite(
         crate::identity::owner_stamp::funnel::UNLINK,
     );
-    let gate = |source: E<'_>, target: E<'_>, caller: &str| {
+    let gate = |source: LinkEndpoint<'_>, target: LinkEndpoint<'_>, caller: &str| {
         super::delete_link_gate(source, target, "src-9466", caller, site).map_err(|e| e.to_string())
     };
-    let row = |owner: O<'static>| E::Present {
+    let row = |owner: OwnerStamp<'static>| LinkEndpoint::Present {
         owner,
-        addressee: O::Unstamped,
+        addressee: OwnerStamp::Unstamped,
     };
-    let addressed = |owner: O<'static>, addressee: &'static str| E::Present {
+    let addressed = |owner: OwnerStamp<'static>, addressee: &'static str| LinkEndpoint::Present {
         owner,
-        addressee: O::Stamped(addressee),
+        addressee: OwnerStamp::Stamped(addressee),
     };
     let daemon = crate::identity::sentinels::DAEMON_PRINCIPAL;
-    let (alice, bob) = (O::Stamped(ALICE), O::Stamped(BOB));
+    let (alice, bob) = (OwnerStamp::Stamped(ALICE), OwnerStamp::Stamped(BOB));
     // Both readable.
     assert_eq!(gate(row(alice), row(bob), ALICE), Ok(true));
     assert_eq!(gate(row(alice), row(bob), BOB), Ok(true));
     assert_eq!(gate(row(alice), row(bob), MALLORY), Ok(false));
     assert_eq!(
-        gate(row(O::Unstamped), row(O::Unstamped), MALLORY),
+        gate(
+            row(OwnerStamp::Unstamped),
+            row(OwnerStamp::Unstamped),
+            MALLORY
+        ),
         Ok(true)
     );
     // E-4: an addressed unstamped source admits its addressee, nobody else.
     assert_eq!(
-        gate(addressed(O::Unstamped, BOB), row(O::Unstamped), MALLORY),
-        Ok(false)
-    );
-    assert_eq!(
-        gate(addressed(O::Unstamped, BOB), row(O::Unstamped), BOB),
-        Ok(true)
-    );
-    // Malformed owner on a present pair.
-    assert_eq!(
-        gate(row(O::Malformed), row(O::Unstamped), MALLORY),
-        Err(refusal_text(SRC))
-    );
-    assert_eq!(
-        gate(row(O::Unstamped), row(O::Malformed), MALLORY),
-        Err(refusal_text(TGT))
-    );
-    assert_eq!(
-        gate(row(O::Malformed), row(O::Malformed), MALLORY),
-        Err(refusal_text(SRC))
-    );
-    assert_eq!(gate(row(O::Malformed), row(O::Unstamped), daemon), Ok(true));
-    assert_eq!(gate(row(O::Malformed), row(bob), BOB), Ok(true));
-    assert_eq!(gate(row(alice), row(O::Malformed), ALICE), Ok(true));
-    assert_eq!(
-        gate(addressed(O::Malformed, BOB), row(O::Unstamped), BOB),
-        Ok(true),
-        "the addressee of a source that is not unstamped"
-    );
-    assert_eq!(
-        gate(row(O::Malformed), row(O::Unstamped), NUMERIC_TEXT_CALLER),
-        Err(refusal_text(SRC))
-    );
-    // An absent endpoint: refused like a non-owner, never unstamped.
-    assert_eq!(gate(E::Absent, row(O::Malformed), MALLORY), Ok(false));
-    assert_eq!(gate(E::UNDECODABLE, E::Absent, MALLORY), Ok(false));
-    assert_eq!(gate(E::Absent, E::Absent, MALLORY), Ok(false));
-    assert_eq!(gate(E::Absent, row(O::Unstamped), MALLORY), Ok(false));
-    assert_eq!(gate(row(O::Unstamped), E::Absent, MALLORY), Ok(false));
-    assert_eq!(gate(E::Absent, row(alice), ALICE), Ok(true));
-    assert_eq!(gate(row(alice), E::Absent, ALICE), Ok(true));
-    assert_eq!(gate(E::Absent, E::Absent, daemon), Ok(true));
-    // The empty caller never matches an empty (unstamped) owner.
-    assert_eq!(gate(row(O::Unstamped), row(alice), ""), Ok(false));
-}
-
-/// E-3: under `AI_MEMORY_UNSTAMPED_MUTATION=refuse` the both-unstamped
-/// legacy admission (and the addressee of an unstamped source) is refused;
-/// a stamped owner is unaffected. Runs in an env-isolated child so no
-/// other test sees the knob.
-#[test]
-fn delete_link_gate_refuse_mode_9466() {
-    use super::LinkEndpoint as E;
-    use crate::identity::owner_stamp::OwnerStamp as O;
-    if crate::test_support::run_env_isolated_child_or_spawn(
-        "store::delete_link_owner_9466::delete_link_gate_refuse_mode_9466",
-    ) {
-        return;
-    }
-    // SAFETY: this body runs only in the isolated single-threaded child.
-    unsafe {
-        std::env::set_var(
-            crate::identity::owner_stamp::ENV_UNSTAMPED_MUTATION,
-            crate::identity::owner_stamp::MODE_REFUSE,
-        );
-    }
-    let site = crate::identity::owner_stamp::MutationSite::postgres(
-        crate::identity::owner_stamp::funnel::UNLINK,
-    );
-    let gate = |source: E<'_>, target: E<'_>, caller: &str| {
-        super::delete_link_gate(source, target, "src-9466", caller, site).map_err(|e| e.to_string())
-    };
-    let row = |owner: O<'static>| E::Present {
-        owner,
-        addressee: O::Unstamped,
-    };
-    assert_eq!(
-        gate(row(O::Unstamped), row(O::Unstamped), MALLORY),
+        gate(
+            addressed(OwnerStamp::Unstamped, BOB),
+            row(OwnerStamp::Unstamped),
+            MALLORY
+        ),
         Ok(false)
     );
     assert_eq!(
         gate(
-            E::Present {
-                owner: O::Unstamped,
-                addressee: O::Stamped(BOB)
+            addressed(OwnerStamp::Unstamped, BOB),
+            row(OwnerStamp::Unstamped),
+            BOB
+        ),
+        Ok(true)
+    );
+    // Malformed owner on a present pair.
+    assert_eq!(
+        gate(
+            row(OwnerStamp::Malformed),
+            row(OwnerStamp::Unstamped),
+            MALLORY
+        ),
+        Err(refusal_text(SRC))
+    );
+    assert_eq!(
+        gate(
+            row(OwnerStamp::Unstamped),
+            row(OwnerStamp::Malformed),
+            MALLORY
+        ),
+        Err(refusal_text(TGT))
+    );
+    assert_eq!(
+        gate(
+            row(OwnerStamp::Malformed),
+            row(OwnerStamp::Malformed),
+            MALLORY
+        ),
+        Err(refusal_text(SRC))
+    );
+    assert_eq!(
+        gate(
+            row(OwnerStamp::Malformed),
+            row(OwnerStamp::Unstamped),
+            daemon
+        ),
+        Ok(true)
+    );
+    assert_eq!(gate(row(OwnerStamp::Malformed), row(bob), BOB), Ok(true));
+    assert_eq!(
+        gate(row(alice), row(OwnerStamp::Malformed), ALICE),
+        Ok(true)
+    );
+    assert_eq!(
+        gate(
+            addressed(OwnerStamp::Malformed, BOB),
+            row(OwnerStamp::Unstamped),
+            BOB
+        ),
+        Ok(true),
+        "the addressee of a source that is not unstamped"
+    );
+    assert_eq!(
+        gate(
+            row(OwnerStamp::Malformed),
+            row(OwnerStamp::Unstamped),
+            NUMERIC_TEXT_CALLER
+        ),
+        Err(refusal_text(SRC))
+    );
+    // An absent endpoint: refused like a non-owner, never unstamped.
+    assert_eq!(
+        gate(LinkEndpoint::Absent, row(OwnerStamp::Malformed), MALLORY),
+        Ok(false)
+    );
+    assert_eq!(
+        gate(LinkEndpoint::UNDECODABLE, LinkEndpoint::Absent, MALLORY),
+        Ok(false)
+    );
+    assert_eq!(
+        gate(LinkEndpoint::Absent, LinkEndpoint::Absent, MALLORY),
+        Ok(false)
+    );
+    assert_eq!(
+        gate(LinkEndpoint::Absent, row(OwnerStamp::Unstamped), MALLORY),
+        Ok(false)
+    );
+    assert_eq!(
+        gate(row(OwnerStamp::Unstamped), LinkEndpoint::Absent, MALLORY),
+        Ok(false)
+    );
+    assert_eq!(gate(LinkEndpoint::Absent, row(alice), ALICE), Ok(true));
+    assert_eq!(gate(row(alice), LinkEndpoint::Absent, ALICE), Ok(true));
+    assert_eq!(
+        gate(LinkEndpoint::Absent, LinkEndpoint::Absent, daemon),
+        Ok(true)
+    );
+    // The empty caller never matches an empty (unstamped) owner.
+    assert_eq!(gate(row(OwnerStamp::Unstamped), row(alice), ""), Ok(false));
+}
+
+/// E-3: under `AI_MEMORY_UNSTAMPED_MUTATION=refuse` the both-unstamped
+/// legacy admission (and the addressee of an unstamped source) is refused;
+/// a stamped owner is unaffected. The posture is passed as a value
+/// ([`super::delete_link_gate_with_mode`]), so no process env is mutated.
+#[test]
+fn delete_link_gate_refuse_mode_9466() {
+    use super::LinkEndpoint;
+    use crate::identity::owner_stamp::OwnerStamp;
+    let site = crate::identity::owner_stamp::MutationSite::postgres(
+        crate::identity::owner_stamp::funnel::UNLINK,
+    );
+    let gate = |source: LinkEndpoint<'_>, target: LinkEndpoint<'_>, caller: &str| {
+        super::delete_link_gate_with_mode(
+            source,
+            target,
+            "src-9466",
+            caller,
+            site,
+            crate::identity::owner_stamp::UnstampedMutationMode::Refuse,
+        )
+        .map_err(|e| e.to_string())
+    };
+    let row = |owner: OwnerStamp<'static>| LinkEndpoint::Present {
+        owner,
+        addressee: OwnerStamp::Unstamped,
+    };
+    assert_eq!(
+        gate(
+            row(OwnerStamp::Unstamped),
+            row(OwnerStamp::Unstamped),
+            MALLORY
+        ),
+        Ok(false)
+    );
+    assert_eq!(
+        gate(
+            LinkEndpoint::Present {
+                owner: OwnerStamp::Unstamped,
+                addressee: OwnerStamp::Stamped(BOB)
             },
-            row(O::Unstamped),
+            row(OwnerStamp::Unstamped),
             BOB
         ),
         Ok(false)
     );
     assert_eq!(
-        gate(row(O::Stamped(ALICE)), row(O::Unstamped), ALICE),
+        gate(
+            row(OwnerStamp::Stamped(ALICE)),
+            row(OwnerStamp::Unstamped),
+            ALICE
+        ),
         Ok(true)
     );
 }

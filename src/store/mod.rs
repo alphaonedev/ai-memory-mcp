@@ -918,8 +918,28 @@ pub(crate) fn delete_link_gate(
     caller: &str,
     site: crate::identity::owner_stamp::MutationSite,
 ) -> StoreResult<bool> {
-    use crate::identity::owner_stamp::{UnlinkVerdict, unlink_verdict};
-    match unlink_verdict(source, target, source_id, caller, site) {
+    delete_link_gate_with_mode(
+        source,
+        target,
+        source_id,
+        caller,
+        site,
+        crate::identity::owner_stamp::mode(),
+    )
+}
+
+/// [`delete_link_gate`] under an explicit #3124 `mode`, so a cell pins the
+/// `refuse` posture without mutating the process environment.
+pub(crate) fn delete_link_gate_with_mode(
+    source: LinkEndpoint<'_>,
+    target: LinkEndpoint<'_>,
+    source_id: &str,
+    caller: &str,
+    site: crate::identity::owner_stamp::MutationSite,
+    mode: crate::identity::owner_stamp::UnstampedMutationMode,
+) -> StoreResult<bool> {
+    use crate::identity::owner_stamp::{UnlinkVerdict, unlink_verdict_with_mode};
+    match unlink_verdict_with_mode(source, target, source_id, caller, site, mode) {
         UnlinkVerdict::Admit => Ok(true),
         UnlinkVerdict::Refuse => Ok(false),
         UnlinkVerdict::Unreadable(endpoint) => Err(StoreError::IntegrityFailed {

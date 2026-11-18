@@ -299,7 +299,7 @@ fn pubkey_bind_err(error: anyhow::Error, agent_id: &str) -> StoreError {
 /// row `id`, unfiltered by lifecycle (a tombstoned endpoint is still
 /// owner-checked). `None` = no such row. A query error is returned as
 /// `what: <error>`, the same context words the postgres adapter uses.
-const DELETE_LINK_METADATA_SQL: &str = "SELECT metadata FROM memories WHERE id = ?1";
+const DELETE_LINK_METADATA_SQL: &str = crate::storage::MEMORY_METADATA_BY_ID_SQL;
 
 /// #9466 — the decoded `metadata` of a present endpoint row, or `None` when
 /// the column is not JSON text (never folded to `{}`: that would read the

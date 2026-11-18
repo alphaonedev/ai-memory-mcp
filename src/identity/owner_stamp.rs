@@ -490,6 +490,21 @@ pub fn unlink_verdict(
     caller: &str,
     site: MutationSite,
 ) -> UnlinkVerdict {
+    unlink_verdict_with_mode(source, target, source_id, caller, site, mode())
+}
+
+/// [`unlink_verdict`] under an explicit `mode` — the seam that lets unit
+/// tests pin the `refuse` posture without mutating the process environment
+/// (the [`metadata_admits_mutation_with_mode`] precedent).
+#[must_use]
+pub fn unlink_verdict_with_mode(
+    source: LinkEndpoint<'_>,
+    target: LinkEndpoint<'_>,
+    source_id: &str,
+    caller: &str,
+    site: MutationSite,
+    mode: UnstampedMutationMode,
+) -> UnlinkVerdict {
     if caller == crate::identity::sentinels::DAEMON_PRINCIPAL {
         return UnlinkVerdict::Admit;
     }
@@ -526,7 +541,7 @@ pub fn unlink_verdict(
     let legacy = target_owner.is_unstamped() && addressee.is_unstamped();
     if source_owner.is_unstamped()
         && (addressee.is_owned_by(caller) || legacy)
-        && admit_unstamped(site, source_id, caller)
+        && admit_unstamped_rows(site, source_id, caller, 1, mode)
     {
         return UnlinkVerdict::Admit;
     }

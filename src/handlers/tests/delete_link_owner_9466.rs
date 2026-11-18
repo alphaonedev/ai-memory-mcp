@@ -238,7 +238,7 @@ async fn http_delete_link_addressed_unstamped_source_refuses_a_stranger_9466() {
         &state,
         NS,
         "addressed-src",
-        json!({ "target_agent_id": OTHER_ADDRESSEE }),
+        json!({ crate::META_KEY_TARGET_AGENT_ID: OTHER_ADDRESSEE }),
     )
     .await;
     let target = insert_test_memory_with_metadata(&state, NS, "unstamped-tgt", json!({})).await;

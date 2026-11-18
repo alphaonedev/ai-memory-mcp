@@ -1175,7 +1175,7 @@ fn endpoint_metadata_as_stored(
     use rusqlite::OptionalExtension as _;
     let raw: Option<rusqlite::types::Value> = conn
         .query_row(
-            "SELECT metadata FROM memories WHERE id = ?1",
+            crate::storage::MEMORY_METADATA_BY_ID_SQL,
             rusqlite::params![id],
             |row| row.get(0),
         )

@@ -8,8 +8,8 @@
 
 use super::PostgresStore;
 use crate::store::delete_link_owner_9466::{
-    ALICE, BOB, CASES, Caller, Endpoint, MALLORY, READ_FAULT_TABLE, SEED_OWNER, arm_read_fault,
-    edge, judge, seed_memory,
+    ALICE, BOB, CASES, Caller, ENDPOINT_METADATA_SET, Endpoint, MALLORY, READ_FAULT_TABLE,
+    SEED_OWNER, SET_ENDPOINT_METADATA, arm_read_fault, edge, judge, seed_memory,
 };
 use crate::store::{
     CallerContext, DELETE_LINK_SOURCE_LOOKUP, DELETE_LINK_TARGET_LOOKUP, MemoryStore, StoreError,
@@ -18,8 +18,16 @@ use crate::store::{
 /// `undefined_table` — the SQLSTATE a read of [`READ_FAULT_TABLE`] fails with.
 const PG_SQLSTATE_UNDEFINED_TABLE: &str = "42P01";
 
-async fn connect() -> Option<PostgresStore> {
-    let url = std::env::var("AI_MEMORY_TEST_POSTGRES_URL").ok()?;
+/// The env var that names the scratch database (the CI v2 wrapper mints it).
+const PG_URL_ENV: &str = "AI_MEMORY_TEST_POSTGRES_URL";
+
+/// The store of the scratch database, or `None` (with the house SKIP line,
+/// `src/store/update_atomicity_3152_tests.rs` `pg_url`) when it is unset.
+async fn pg_store_9466(test: &str) -> Option<PostgresStore> {
+    let Ok(url) = std::env::var(PG_URL_ENV) else {
+        eprintln!("SKIP {test}: {PG_URL_ENV} unset");
+        return None;
+    };
     Some(PostgresStore::connect(&url).await.expect("connect"))
 }
 
@@ -30,9 +38,9 @@ async fn set_metadata(store: &PostgresStore, id: &str, state: Endpoint) {
         .bind(id)
         .execute(&store.pool)
         .await
-        .expect("set endpoint metadata")
+        .expect(SET_ENDPOINT_METADATA)
         .rows_affected();
-    assert_eq!(updated, 1, "endpoint metadata must be set");
+    assert_eq!(updated, 1, "{ENDPOINT_METADATA_SET}");
 }
 
 /// Seed both endpoints and the edge between them. With both rows present the
@@ -108,8 +116,7 @@ async fn edge_count(store: &PostgresStore, source_id: &str, target_id: &str) -> 
 /// exact refusal text, and the edge still present after every refusal.
 #[tokio::test]
 async fn delete_link_owner_table_pg_9466() {
-    let Some(store) = connect().await else {
-        eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+    let Some(store) = pg_store_9466("delete_link_owner_table_pg_9466").await else {
         return;
     };
     let mut failures = Vec::new();
@@ -141,8 +148,7 @@ async fn delete_link_owner_table_pg_9466() {
 /// removes nothing — for a caller a defaulted owner would admit.
 #[tokio::test]
 async fn delete_link_owner_read_error_pg_9466() {
-    let Some(store) = connect().await else {
-        eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+    let Some(store) = pg_store_9466("delete_link_owner_read_error_pg_9466").await else {
         return;
     };
     let callers = [
@@ -230,8 +236,8 @@ async fn someone_waits_on(store: &PostgresStore, pid: i32) -> bool {
 /// kept.
 #[tokio::test]
 async fn delete_link_owner_read_waits_for_owner_change_pg_9466() {
-    let Some(store) = connect().await else {
-        eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+    let Some(store) = pg_store_9466("delete_link_owner_read_waits_for_owner_change_pg_9466").await
+    else {
         return;
     };
     // (re-stamped endpoint, the caller who owns it before the change)

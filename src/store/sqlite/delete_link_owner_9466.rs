@@ -7,8 +7,8 @@
 
 use super::{OWNER_GATE_TEST_HOOK, SqliteStore};
 use crate::store::delete_link_owner_9466::{
-    ALICE, BOB, CASES, Caller, Endpoint, MALLORY, READ_FAULT_TABLE, SEED_OWNER, arm_read_fault,
-    edge, judge, seed_memory,
+    ALICE, BOB, CASES, Caller, ENDPOINT_METADATA_SET, Endpoint, MALLORY, READ_FAULT_TABLE,
+    SEED_OWNER, SET_ENDPOINT_METADATA, arm_read_fault, edge, judge, seed_memory,
 };
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -16,6 +16,8 @@ use std::time::Duration;
 /// How long the second connection waits for the write lock before SQLite
 /// names the refusal; short, so a held lock fails the attempt fast.
 const SECOND_WRITER_BUSY_TIMEOUT: Duration = Duration::from_millis(100);
+/// The raw metadata overwrite the seeders run under the gate's feet.
+const SET_METADATA_SQL: &str = "UPDATE memories SET metadata = ?1 WHERE id = ?2";
 use crate::store::{
     CallerContext, DELETE_LINK_SOURCE_LOOKUP, DELETE_LINK_TARGET_LOOKUP, MemoryStore, StoreResult,
 };
@@ -39,14 +41,16 @@ async fn seed_endpoint(store: &SqliteStore, state: Endpoint, title: &str) -> Str
         .await
         .expect("seed endpoint");
     let conn = store.state.lock().await;
-    let updated = conn
-        .execute(
-            "UPDATE memories SET metadata = ?1 WHERE id = ?2",
-            rusqlite::params![metadata, id],
-        )
-        .expect("set endpoint metadata");
-    assert_eq!(updated, 1, "endpoint metadata must be set");
+    set_metadata(&conn, &id, &metadata);
     id
+}
+
+/// Overwrite one endpoint row's metadata with its case state.
+fn set_metadata(conn: &rusqlite::Connection, id: &str, metadata: &str) {
+    let updated = conn
+        .execute(SET_METADATA_SQL, rusqlite::params![metadata, id])
+        .expect(SET_ENDPOINT_METADATA);
+    assert_eq!(updated, 1, "{ENDPOINT_METADATA_SET}");
 }
 
 /// Seed both endpoints and the edge between them. With both rows present the
@@ -90,13 +94,7 @@ async fn seed_pair(store: &SqliteStore, source: Endpoint, target: Endpoint) -> (
     let conn = store.state.lock().await;
     for (id, state) in [(&source_id, source), (&target_id, target)] {
         let metadata = state.metadata_text().expect("present endpoint");
-        let updated = conn
-            .execute(
-                "UPDATE memories SET metadata = ?1 WHERE id = ?2",
-                rusqlite::params![metadata, id],
-            )
-            .expect("set endpoint metadata");
-        assert_eq!(updated, 1, "endpoint metadata must be set");
+        set_metadata(&conn, id, &metadata);
     }
     (source_id, target_id)
 }
