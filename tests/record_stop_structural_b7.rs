@@ -662,8 +662,8 @@ const MAP_ERR_BODY_DENY_WORDS: &[&str] = &[
 const MAP_ERR_BODY_DENY_CHARS: &[char] = &['?', '|'];
 /// #9414 ruling 9414-conditions-maperr condition 3 — the macro allow set,
 /// minimal: the two real bodies (`|e| ReflectError::Database(e.to_string())`
-/// in reflect_with_hooks, `|e| QuotaCheckError::Sql(e.into())` in
-/// check_and_record_storage_only_in_transaction) call no macro, so the set is
+/// in `reflect_with_hooks`, `|e| QuotaCheckError::Sql(e.into())` in
+/// `check_and_record_storage_only_in_transaction`) call no macro, so the set is
 /// empty. `panic!`, `unreachable!`, `todo!`, `unimplemented!` are never in it.
 const B7_MAP_ERR_BODY_MACROS_9414: &[&str] = &[];
 /// #9414 ruling 9414-conditions-maperr condition 2 — the non-alphanumeric
@@ -765,20 +765,14 @@ fn gate_shape(
     for p in chars {
         let c = p.0;
         match c {
-            '(' | '[' | '{' if depth == 0 && c == '{' => {
+            // a block opener, a closer or a separator at depth 0 ends the
+            // statement (`{` inside the parens is not depth-counted)
+            '{' | ')' | ']' | '}' | ';' | ',' if depth == 0 => {
                 term = Some(c);
                 break;
             }
             '(' | '[' => depth += 1,
-            ')' | ']' | '}' if depth == 0 => {
-                term = Some(c);
-                break;
-            }
             ')' | ']' => depth -= 1,
-            ';' | ',' if depth == 0 => {
-                term = Some(c);
-                break;
-            }
             _ => {}
         }
         tail.push(p);
@@ -1015,6 +1009,10 @@ fn span_gate_credit(
     e: usize,
     wrappers: &[String],
 ) -> GateCredit {
+    #[expect(
+        clippy::struct_excessive_bools,
+        reason = "one flag per dominance condition of a block level; a state enum would merge independent facts"
+    )]
     struct Level {
         id: usize,
         prefix: String,
@@ -3084,7 +3082,7 @@ const B7_MAP_ERR_ROWS_9414: &[(u8, &str, &str, &str, &str)] = &[
 /// #9414 ruling 9414-conditions-maperr — the conditions the table must cover.
 const B7_MAP_ERR_RULED_CONDITIONS_9414: &[u8] = &[1, 2, 3, 4, 5];
 /// #9414 ruling 9414-conditions-maperr condition 5 / earlier condition 6: a
-/// map_err gate in a file with an unclassifiable form is the tokenizer
+/// `map_err` gate in a file with an unclassifiable form is the tokenizer
 /// finding, never a credit.
 const B7_MAP_ERR_UNCLASSIFIABLE_9414: (&str, &str) = (
     "    let _ = f\"x\";\n    gate_storage_conn(conn).map_err(StoreError::from)?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
@@ -3372,7 +3370,7 @@ fn b7_scan_is_linear_on_a_100k_input_9414() {
 }
 
 /// #9414 ruling 9414-conditions-maperr — one statement of the accepted shape,
-/// repeated to build the 100K-byte input of the map_err linear bound.
+/// repeated to build the 100K-byte input of the `map_err` linear bound.
 const B7_MAP_ERR_BOUND_STMT_9414: &str = "    store.gate_record_stop().await.map_err(|e| {\n        Error::Db(e.to_string())\n    })?;\n";
 
 #[test]
