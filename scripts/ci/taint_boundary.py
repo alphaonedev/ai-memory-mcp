@@ -170,7 +170,7 @@ TAINT_ALLOW: tuple[AllowRow, ...] = (
     AllowRow("ci.yml", "classify", "id:impact", (CLASS_GATE_OUTPUT,), 9454),
     AllowRow("c8-precheck.yml", "required-contexts-gate",
              # The workflow name runs into a YAML comment at ` #`; the label is the parsed name.
-             "Declared-vs-live required-context drift (#3554 /", (CLASS_SECRET,), 9454),
+             "Declared-vs-live required-context drift (#3554 /", (CLASS_SECRET,), 9471),
     # R2: these jobs can run on a persistent self-hosted runner and have a trusted trigger.
     AllowRow("ci.yml", "check", R2_STEP_LABEL, (CLASS_PERSISTENT_STATE,), 9455),
     AllowRow("cert-postgres-age.yml", "cert-postgres-age", R2_STEP_LABEL, (CLASS_PERSISTENT_STATE,), 9455),

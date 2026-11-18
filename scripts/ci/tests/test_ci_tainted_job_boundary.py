@@ -41,7 +41,7 @@ JOB_COUNT_LARGE = 200
 LARGE_SCAN_CEILING_S = 10.0
 RUN_TEXT_BYTES_LARGE = 120_000
 RUN_TEXT_CEILING_S = 5.0
-FIX_ISSUES = frozenset({9454, 9455, 9456})
+FIX_ISSUES = frozenset({9454, 9455, 9456, 9471})
 RUNNER_ISSUE = 9455
 SYNTH = "synthetic.yml"
 # The step key of an R2 (iv) violation: the job's `runs-on`, not one of its steps.
