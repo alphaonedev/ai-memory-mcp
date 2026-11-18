@@ -1256,7 +1256,8 @@ def _runs_on_legs(job: dict[str, object], label: str) -> list[tuple[str, ...]]:
 
 def _leg_hosted(leg: tuple[str, ...]) -> bool:
     """True only when every label of the leg is a GitHub-hosted image label."""
-    hosted = [lab for lab in leg if GITHUB_HOSTED_LABEL_RE.match(lab)]
+    # fullmatch: `$` alone also matches before a trailing line break.
+    hosted = [lab for lab in leg if GITHUB_HOSTED_LABEL_RE.fullmatch(lab)]
     return bool(hosted) and len(hosted) == len(leg)
 
 
