@@ -446,3 +446,7 @@ mod credential_to_sink_3711_tests {
 #[cfg(test)]
 #[path = "forward_key_9367_tests.rs"]
 mod forward_key_9367_tests;
+
+#[cfg(test)]
+#[path = "forward_key_daemon_9367_tests.rs"]
+mod forward_key_daemon_9367_tests;

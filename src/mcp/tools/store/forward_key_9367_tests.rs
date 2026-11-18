@@ -497,3 +497,48 @@ fn every_forward_site_goes_through_the_one_funnel_9367() {
         "{builders:?}"
     );
 }
+
+/// V-1 — the reader and the two env-name constants live in ONE neutral module
+/// that the CLI and this transport both import: `src/cli/agents.rs` defines
+/// neither any more, and the production half of transport.rs reads the key
+/// through `crate::agent_key_file`. (`tests/bind_api_key_token_file_3781.rs`
+/// stays green unedited: the bind-api-key precedence and texts are unchanged.)
+#[test]
+fn reader_and_env_names_live_in_the_one_neutral_module_9367() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let prod = |rel: &str| -> String {
+        let text = std::fs::read_to_string(root.join(rel)).unwrap_or_default();
+        text.split("#[cfg(test)]\nmod ")
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    };
+    let neutral = prod("src/agent_key_file.rs");
+    for needle in [
+        "pub(crate) fn read_api_key_token_file(",
+        "const AGENT_API_KEY_FILE_ENV: &str",
+        "const AGENT_API_KEY_FILE_ALLOW_LAX_PERMS_ENV: &str",
+    ] {
+        assert!(
+            neutral.contains(needle),
+            "src/agent_key_file.rs must define `{needle}`"
+        );
+    }
+    let cli = prod("src/cli/agents.rs");
+    assert!(
+        !cli.contains("fn read_api_key_token_file("),
+        "the CLI must not keep its own reader"
+    );
+    assert!(
+        !cli.contains("const AGENT_API_KEY_FILE_ENV: &str"),
+        "the CLI must not define the env name"
+    );
+    assert!(
+        cli.contains("crate::agent_key_file::"),
+        "the CLI imports the neutral module"
+    );
+    assert!(
+        prod("src/mcp/tools/store/transport.rs").contains("crate::agent_key_file::"),
+        "the transport imports the neutral module"
+    );
+}
