@@ -806,9 +806,9 @@ pub fn run(db_path: &Path, args: &VerifyChainArgs, out: &mut CliOutput<'_>) -> R
     // FAILED (#709). "I could not find it" and "I checked it and it is
     // broken" are different answers and a script must be able to tell them
     // apart.
-    let Some(root) =
-        crate::db::get(&conn, &args.memory_id).context("resolve verify-reflection-chain root")?
-    else {
+    let root =
+        crate::db::get(&conn, &args.memory_id).context("resolve verify-reflection-chain root")?;
+    if root.is_none() {
         if json {
             let payload = serde_json::json!({
                 "ok": false,
@@ -825,14 +825,15 @@ pub fn run(db_path: &Path, args: &VerifyChainArgs, out: &mut CliOutput<'_>) -> R
             )?;
         }
         return Ok(1);
-    };
+    }
 
     // #9505 (3-agent vote (71472661), B + J1) — the root content-id check
     // runs BEFORE anything is printed, in both modes, and folds into the ONE
     // final `ok` that the summary, the JSON and the exit code all read. The
     // root row is the one resolved above: no second read, nothing swallowed.
+    let root_cid = root.as_ref().and_then(|row| check_root_cid(&conn, row));
     let report = build_chain_report(&conn, &args.memory_id, args.include_signed_events)?
-        .with_root_cid(check_root_cid(&conn, &root));
+        .with_root_cid(root_cid);
 
     if json {
         let payload = serde_json::to_string_pretty(&report).context("serialise chain report")?;
