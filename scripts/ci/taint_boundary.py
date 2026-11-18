@@ -2261,12 +2261,21 @@ def _psql_cmd(words: list[_Word], cmd: _Cmd, ctx: _ShellCtx) -> bool:
     """psql: -f runs a file; -c text and stdin text are checked (no meta-command, no PROGRAM)."""
     sql: list[str | None] = []
     lits: list[str | None] = []
+    shown: list[str] = []
     for word in words:
-        lits.extend(_psql_unbundle(word.lit))
+        parts = _psql_unbundle(word.lit)
+        lits.extend(parts)
+        # A word with an expansion is one positional argument only when the whole word is
+        # double-quoted (no word splitting); unquoted, it can split into any option.
+        whole_quoted = (len(word.raw) >= 2 and word.raw[0] == '"' and word.raw[-1] == '"'
+                        and '"' not in word.raw[1:-1])
+        shown.extend([word.shown() if not whole_quoted else ""] * len(parts))
     i = 1
     while i < len(lits):
         lit = lits[i]
         if lit is None:
+            if shown[i]:
+                raise Unclassifiable(f"psql word {shown[i]!r} is an unquoted expansion in an option position")
             i += 1
             continue
         name = lit.split("=", 1)[0] if lit.startswith("--") else lit

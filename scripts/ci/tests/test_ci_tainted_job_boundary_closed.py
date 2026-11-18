@@ -707,6 +707,10 @@ PSQL_BUNDLES = (
     ("psql -tAc '\\! id'", "psql meta-command in SQL text"),
     ("psql -tAY", "psql option '-tAY' is not on the closed option list"),
     ("psql -cSELECT", "psql option '-cSELECT' is not on the closed option list"),
+    # an expansion is a positional argument only when the whole word is double-quoted
+    ('psql "$URL" -v ON_ERROR_STOP=1 -c "SELECT 1"', False),
+    ('psql $FLAGS -c "SELECT 1"', "psql word '$FLAGS' is an unquoted expansion in an option position"),
+    ('psql "$A"$B -c "SELECT 1"', "psql word '$A$B' is an unquoted expansion in an option position"),
 )
 
 
