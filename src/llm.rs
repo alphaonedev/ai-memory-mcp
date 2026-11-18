@@ -696,6 +696,10 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// v0.7.0 F6 — health-probe timeout. Quick check at /api/tags.
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// #4193 — the one posture-aware reqwest builder every inference client
+/// starts from (proxies refused + redirects disabled outside `allow`).
+mod egress_policy;
+
 /// v1.0.0 #3140 — multiplier applied to the largest *inner* reqwest
 /// timeout of a call to derive that call's **bridge budget**, the outer
 /// wall-clock ceiling enforced by [`block_on_local_bounded`].
@@ -1493,9 +1497,9 @@ impl OllamaClient {
     ///
     /// Returns an error if the HTTP client fails to build.
     pub fn new_openai_compatible(base_url: &str, model: &str, api_key: &str) -> Result<Self> {
-        let client = reqwest::Client::builder()
-            .timeout(GENERATE_TIMEOUT)
-            .connect_timeout(CONNECT_TIMEOUT)
+        // #4193 — one posture-aware builder: proxies refused and redirects
+        // disabled outside `allow` (byte-identical legacy under `allow`).
+        let client = egress_policy::inference_client_builder()
             .build()
             .context("Failed to build HTTP client")?;
         Ok(Self {
@@ -1581,9 +1585,9 @@ impl OllamaClient {
     /// time validation is required (e.g. CLI commands that fail
     /// fast on bring-up).
     pub fn new_with_url_no_health_check(base_url: &str, model: &str) -> Result<Self> {
-        let client = reqwest::Client::builder()
-            .timeout(GENERATE_TIMEOUT)
-            .connect_timeout(CONNECT_TIMEOUT)
+        // #4193 — one posture-aware builder: proxies refused and redirects
+        // disabled outside `allow` (byte-identical legacy under `allow`).
+        let client = egress_policy::inference_client_builder()
             .build()
             .context("Failed to build HTTP client")?;
 
@@ -1632,15 +1636,10 @@ impl OllamaClient {
         host: &str,
         addrs: &[std::net::SocketAddr],
     ) -> Result<Self> {
-        let client = Self::apply_internal_egress_pin(
-            reqwest::Client::builder()
-                .timeout(GENERATE_TIMEOUT)
-                .connect_timeout(CONNECT_TIMEOUT),
-            host,
-            addrs,
-        )
-        .build()
-        .context("Failed to build pinned HTTP client (internal-only egress)")?;
+        let client =
+            Self::apply_internal_egress_pin(egress_policy::inference_client_builder(), host, addrs)
+                .build()
+                .context("Failed to build pinned HTTP client (internal-only egress)")?;
         Ok(Self {
             provider: LlmProvider::OpenAiCompatible {
                 api_key: api_key.to_string(),
@@ -1663,15 +1662,10 @@ impl OllamaClient {
         host: &str,
         addrs: &[std::net::SocketAddr],
     ) -> Result<Self> {
-        let client = Self::apply_internal_egress_pin(
-            reqwest::Client::builder()
-                .timeout(GENERATE_TIMEOUT)
-                .connect_timeout(CONNECT_TIMEOUT),
-            host,
-            addrs,
-        )
-        .build()
-        .context("Failed to build pinned HTTP client (internal-only egress)")?;
+        let client =
+            Self::apply_internal_egress_pin(egress_policy::inference_client_builder(), host, addrs)
+                .build()
+                .context("Failed to build pinned HTTP client (internal-only egress)")?;
         Ok(Self {
             provider: LlmProvider::Ollama,
             base_url: base_url.trim_end_matches('/').to_string(),
@@ -1958,13 +1952,14 @@ impl OllamaClient {
         );
 
         let pull_url = format!("{}/api/pull", self.base_url);
-        let pull_client = reqwest::Client::builder()
-            .timeout(PULL_TIMEOUT)
-            .build()
-            .context("Failed to build pull client")?;
-
-        let resp = pull_client
+        // #4193 / #3822 — the pull reuses this client (posture policy and,
+        // when pinned, the internal-only address pin); a fresh builder would
+        // honour env proxies, follow redirects and resolve the host again.
+        // The per-request timeout overrides the client's GENERATE_TIMEOUT.
+        let resp = self
+            .client
             .post(&pull_url)
+            .timeout(PULL_TIMEOUT)
             .json(&json!({ "name": self.model }))
             .send()
             .await
@@ -3119,12 +3114,12 @@ impl OllamaClient {
 
         tracing::info!("Pulling Ollama embedding model '{}'...", model);
         let pull_url = format!("{}/api/pull", self.base_url);
-        let pull_client = reqwest::Client::builder()
-            .timeout(PULL_TIMEOUT)
-            .build()
-            .context("Failed to build pull client")?;
-        let resp = pull_client
+        // #4193 / #3822 — reuse this client (posture policy + pin), see
+        // `ensure_model_async`; the per-request timeout overrides the client's.
+        let resp = self
+            .client
             .post(&pull_url)
+            .timeout(PULL_TIMEOUT)
             .json(&json!({ "name": model }))
             .send()
             .await

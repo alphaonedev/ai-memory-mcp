@@ -35,10 +35,12 @@ const ADMIN_TOKEN: &str = "1539-admin-per-agent-token-0123456789abcdef";
 /// #8494 — a live registry holding the admin's enrolled per-agent key.
 fn admin_enrolled_registry() -> Arc<ai_memory::handlers::identity_binding::EnrolledAgentKeys> {
     let registry = Arc::new(ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty());
-    registry.install(std::collections::HashMap::from([(
-        ai_memory::handlers::identity_binding::api_key_sha256_hex(ADMIN_TOKEN),
-        ADMIN_CALLER.to_string(),
-    )]));
+    registry.mutate(|m| {
+        *m = std::collections::HashMap::from([(
+            ai_memory::handlers::identity_binding::api_key_sha256_hex(ADMIN_TOKEN),
+            ADMIN_CALLER.to_string(),
+        )]);
+    });
     registry
 }
 

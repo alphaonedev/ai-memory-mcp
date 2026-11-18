@@ -32,6 +32,8 @@ system is starting up``) arrives in the server's ``lc_messages``.  On a tier tha
 the leg still fails closed, only without the distinct reason).  psql runs through the shared supervisor of
 ``ensure-age-extension.py`` (#6252, #6337, #6517): SIGTERM, SIGINT, the timeout or the death of this process stops
 psql, so no psql is left holding ``PGPASSWORD``.
+A shared ``workflow_annotation.py`` next to this file that cannot be loaded is exit 1 with one fixed ``::error``
+line built without it, before anything is read (#9365).
 psql's stderr is never echoed (it can carry connection detail); every output line is one GitHub ``::error::`` or
 plain notice line built from constants, the URL file path and ``$RUNNER_NAME``.  The classification is a fixed set
 of substring tests, linear in the stderr length.
@@ -46,10 +48,51 @@ import subprocess
 import sys
 from pathlib import Path
 
+
+def _load_workflow_annotation():
+    """The shared module at WA_RELATIVE_PATH from this file's real directory, by path only, never through
+    sys.path; every name in WA_REQUIRED must be a callable of it (#9365, one shape in every script)."""
+    import importlib.util
+    import os
+    path = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), WA_RELATIVE_PATH))
+    loaded = sys.modules.get("workflow_annotation")
+    if loaded is not None and os.path.realpath(getattr(loaded, "__file__", None) or "") == path:
+        module = loaded
+    else:
+        spec = importlib.util.spec_from_file_location("workflow_annotation", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)  # absent, unreadable or broken: it raises here, the try below catches it
+    missing = [name for name in WA_REQUIRED if not callable(getattr(module, name, None))]
+    if missing:
+        raise AttributeError("workflow_annotation.py lacks " + ", ".join(missing))
+    if loaded is None:
+        sys.modules["workflow_annotation"] = module
+    return module
+
+
 EXIT_OK = 0
 EXIT_UNAVAILABLE = 1
 EXIT_BAD_INPUT = 2
 EXIT_MISMATCH = 3
+
+# The one shared-module load shape of scripts/ (#9365, ruling bcd0a15c; LoaderShape pins it).
+WA_PROG = "tier_cred_preflight"
+WA_RELATIVE_PATH = "workflow_annotation.py"
+WA_REQUIRED = ("annotation", "log_line")
+WA_EXIT_LOAD_REFUSED = EXIT_UNAVAILABLE  # the gate's own refusal code, unchanged
+WA_ERROR_TO_STDERR = False
+
+try:
+    wa = _load_workflow_annotation()
+except (Exception, SystemExit) as exc:  # any failed load: one fixed line built without the module, then exit
+    wa_cause = type(exc).__name__
+    print("%s: refused: shared module workflow_annotation.py next to the script cannot be loaded (%s)"
+          % (WA_PROG, wa_cause if wa_cause.isidentifier() else "BaseException"), file=sys.stderr, flush=True)
+    print("::error title=tier_cred_preflight refused::tier_cred_preflight: refused: shared module workflow_annotation.py"
+          " next to the script cannot be loaded",
+          file=sys.stderr if WA_ERROR_TO_STDERR else sys.stdout, flush=True)
+    sys.exit(WA_EXIT_LOAD_REFUSED)
+
 
 DEFAULT_TIMEOUT_SECONDS = 60
 PROBE_SQL = "SELECT 1"
@@ -144,7 +187,7 @@ def classify(rc, stderr):
 def reason_line(reason, url_file, runner, rc):
     """The one ``::error::`` line for a failure: constants, the URL file path and the runner name only."""
     detail = MESSAGES[reason].format(url_file=url_file, rc=rc)
-    return f"::error::enterprise-fed tier pre-flight on {runner}: {reason} ({ISSUE}): {detail}"
+    return wa.annotation("error", f"enterprise-fed tier pre-flight on {runner}: {reason} ({ISSUE}): {detail}")
 
 
 def parse_args(argv):
@@ -193,12 +236,12 @@ def main(argv=None):
     except KeyboardInterrupt:  # a signal outside the supervised run: nothing to stop, still a failed pre-flight
         reason, code, rc = INTERRUPTED_REASON, EXIT_UNAVAILABLE, None
     if code == EXIT_OK:
-        print(f"enterprise-fed tier pre-flight on {runner}: {OK_REASON} ({args.url_file})")
+        print(wa.log_line(f"enterprise-fed tier pre-flight on {runner}: {OK_REASON} ({args.url_file})"))
     elif reason in MESSAGES:
         print(reason_line(reason, args.url_file, runner, rc))
     else:
         # a refusal from the URL helper or a local psql problem: its message names keys and paths only
-        print(f"::error::enterprise-fed tier pre-flight on {runner}: {reason} ({ISSUE})")
+        print(wa.annotation("error", f"enterprise-fed tier pre-flight on {runner}: {reason} ({ISSUE})"))
     sys.stdout.flush()
     return code
 

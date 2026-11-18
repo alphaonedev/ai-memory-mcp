@@ -15,8 +15,8 @@
 //! operator runs `agents bind-api-key` against the CONFIGURED data tier, and
 //! the daemon's refresh observes it. Concretely, per backend:
 //!
-//! * ALLOWED — bind, `list_agent_api_keys`, feed the rows through
-//!   [`apply_agent_key_refresh`], and the caller resolves to
+//! * ALLOWED — bind, then read `list_agent_api_keys` through
+//!   [`refresh_agent_keys`], and the caller resolves to
 //!   `KeyAuthenticated`; the daemon was never restarted and `AppState` was
 //!   never rebuilt;
 //! * DENIED — revoke, refresh again, and the SAME token stops authenticating.
@@ -31,7 +31,7 @@
 use std::sync::Arc;
 
 use ai_memory::handlers::identity_binding::{
-    AgentKeyRefresh, AuthLevel, EnrolledAgentKeys, api_key_sha256_hex, apply_agent_key_refresh,
+    AgentKeyRefresh, AuthLevel, EnrolledAgentKeys, api_key_sha256_hex, refresh_agent_keys,
     resolve_auth_level,
 };
 use ai_memory::store::{CallerContext, MemoryStore};
@@ -79,8 +79,11 @@ async fn enroll_and_revoke_reach_the_live_registry(store: &Arc<dyn MemoryStore>,
         "#3535 — a fresh digest enrols; the outcome is typed so a refused \
          re-point cannot read as a successful enrolment"
     );
-    let rows = store.list_agent_api_keys().await.map_err(|e| e.to_string());
-    let outcome = apply_agent_key_refresh(&registry, rows);
+    // The read runs INSIDE the funnel's closure, so its ticket is taken first.
+    let outcome = refresh_agent_keys(&registry, || async {
+        store.list_agent_api_keys().await.map_err(|e| e.to_string())
+    })
+    .await;
     assert!(
         matches!(outcome, AgentKeyRefresh::Installed(n) if n >= 1),
         "the refresh must install the freshly enrolled key, got {outcome:?}"
@@ -97,8 +100,11 @@ async fn enroll_and_revoke_reach_the_live_registry(store: &Arc<dyn MemoryStore>,
         .await
         .expect("revoke_agent_api_key");
     assert!(removed >= 1, "the binding we just wrote must be removed");
-    let rows = store.list_agent_api_keys().await.map_err(|e| e.to_string());
-    let outcome = apply_agent_key_refresh(&registry, rows);
+    // The read runs INSIDE the funnel's closure, so its ticket is taken first.
+    let outcome = refresh_agent_keys(&registry, || async {
+        store.list_agent_api_keys().await.map_err(|e| e.to_string())
+    })
+    .await;
     assert!(
         matches!(outcome, AgentKeyRefresh::Installed(_)),
         "a revocation is a change the refresh must install, got {outcome:?}"

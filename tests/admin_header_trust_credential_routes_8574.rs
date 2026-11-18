@@ -163,10 +163,12 @@ fn fixture(tag: &str, mode: HttpIdentityMode, enroll_admin: bool, header_trust: 
     let dir = scratch(tag);
     let registry = Arc::new(EnrolledAgentKeys::empty());
     if enroll_admin {
-        registry.install(std::collections::HashMap::from([(
-            api_key_sha256_hex(ADMIN_TOKEN),
-            ADMIN.to_string(),
-        )]));
+        registry.mutate(|m| {
+            *m = std::collections::HashMap::from([(
+                api_key_sha256_hex(ADMIN_TOKEN),
+                ADMIN.to_string(),
+            )]);
+        });
     }
     let (state, store) = build_state(&registry, &dir, mode);
     let router = router_for(state, &registry, mode);
@@ -407,10 +409,10 @@ async fn postgres_header_trust_refused_when_keys_enrolled_bootstrap_when_empty_8
     set_header_trust(false);
     let dir = scratch("pg");
     let registry = Arc::new(EnrolledAgentKeys::empty());
-    registry.install(std::collections::HashMap::from([(
-        api_key_sha256_hex(ADMIN_TOKEN),
-        ADMIN.to_string(),
-    )]));
+    registry.mutate(|m| {
+        *m =
+            std::collections::HashMap::from([(api_key_sha256_hex(ADMIN_TOKEN), ADMIN.to_string())]);
+    });
     let mode = HttpIdentityMode::Advisory;
     let (mut state, _store) = build_state(&registry, &dir, mode);
     let url =
@@ -451,7 +453,7 @@ async fn postgres_header_trust_refused_when_keys_enrolled_bootstrap_when_empty_8
     );
 
     // Empty registry: the bootstrap still mints.
-    registry.install(std::collections::HashMap::new());
+    registry.mutate(|m| *m = std::collections::HashMap::new());
     let (status, body) = mint(&router, SHARED_KEY, TARGET).await;
     set_header_trust(false);
     assert_eq!(status, StatusCode::OK, "bootstrap mints on pg: {body}");
@@ -473,10 +475,10 @@ async fn pg_empty_snapshot_router(
     set_header_trust(false);
     let dir = scratch(tag);
     let registry = Arc::new(EnrolledAgentKeys::empty());
-    registry.install(std::collections::HashMap::from([(
-        api_key_sha256_hex(ADMIN_TOKEN),
-        ADMIN.to_string(),
-    )]));
+    registry.mutate(|m| {
+        *m =
+            std::collections::HashMap::from([(api_key_sha256_hex(ADMIN_TOKEN), ADMIN.to_string())]);
+    });
     let mode = HttpIdentityMode::Advisory;
     let (mut state, _store) = build_state(&registry, &dir, mode);
     let url =
@@ -501,7 +503,7 @@ async fn pg_empty_snapshot_router(
     )
     .await;
     assert!(status.is_success(), "register: {status}");
-    registry.install(std::collections::HashMap::new());
+    registry.mutate(|m| *m = std::collections::HashMap::new());
     (router, store, registry, state, dir)
 }
 

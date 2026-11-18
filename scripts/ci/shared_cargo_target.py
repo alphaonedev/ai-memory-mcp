@@ -33,6 +33,72 @@ import sys
 import time
 from pathlib import Path
 
+
+def _load_workflow_annotation():
+    """The shared module at WA_RELATIVE_PATH from this file's real directory, by path only, never through
+    sys.path; every name in WA_REQUIRED must be a callable of it (#9365, one shape in every script)."""
+    import importlib.util
+    import os
+    path = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), WA_RELATIVE_PATH))
+    loaded = sys.modules.get("workflow_annotation")
+    if loaded is not None and os.path.realpath(getattr(loaded, "__file__", None) or "") == path:
+        module = loaded
+    else:
+        spec = importlib.util.spec_from_file_location("workflow_annotation", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)  # absent, unreadable or broken: it raises here, the try below catches it
+    missing = [name for name in WA_REQUIRED if not callable(getattr(module, name, None))]
+    if missing:
+        raise AttributeError("workflow_annotation.py lacks " + ", ".join(missing))
+    if loaded is None:
+        sys.modules["workflow_annotation"] = module
+    return module
+
+
+# The one shared-module load shape of scripts/ (#9365, ruling bcd0a15c; LoaderShape pins it).
+WA_PROG = "shared_cargo_target"
+WA_RELATIVE_PATH = "workflow_annotation.py"
+WA_REQUIRED = ("env_file_value", "log_line")
+WA_EXIT_LOAD_REFUSED = 3  # a failed shared-module load; no other meaning in this script
+WA_ERROR_TO_STDERR = False
+
+
+class SharedModuleNotLoadedError(RuntimeError):
+    """A function that needs workflow_annotation.py ran before require_workflow_annotation() loaded it."""
+
+
+class _NotLoaded:
+    """The state of ``wa`` until the load ran: one explicit member per name this script uses from the shared module
+    (a test pins the set against the ast), each a named error, never a half-working helper. No __getattr__, so
+    hasattr and getattr with a default cannot turn a forgotten load into a silent fallback."""
+
+    _WANTED = ("workflow_annotation.py is not loaded; call require_workflow_annotation() "
+              "first (wanted %s)")
+
+    def env_file_value(self, *args, **kwargs):
+        raise SharedModuleNotLoadedError(self._WANTED % "env_file_value")
+
+    def log_line(self, *args, **kwargs):
+        raise SharedModuleNotLoadedError(self._WANTED % "log_line")
+
+
+wa = _NotLoaded()
+
+
+def require_workflow_annotation():
+    """Load the shared module into ``wa`` or refuse: main calls it before any work, so importing prints nothing."""
+    global wa
+    try:
+        wa = _load_workflow_annotation()
+    except (Exception, SystemExit) as exc:  # any failed load: one fixed line built without the module, then exit
+        wa_cause = type(exc).__name__
+        print("%s: refused: shared module workflow_annotation.py next to the script cannot be loaded (%s)"
+              % (WA_PROG, wa_cause if wa_cause.isidentifier() else "BaseException"), file=sys.stderr, flush=True)
+        print("::error title=shared_cargo_target refused::shared_cargo_target: refused: shared module workflow_annotation.py"
+              " next to the script cannot be loaded",
+              file=sys.stderr if WA_ERROR_TO_STDERR else sys.stdout, flush=True)
+        sys.exit(WA_EXIT_LOAD_REFUSED)
+
 TARGET_ROOT_RELATIVE = Path(".cache") / "ai-memory-ci" / "cargo-target"
 ENV_NAME = "CARGO_TARGET_DIR"
 ROOT_ENV_NAME = "AI_MEMORY_CI_TARGET_ROOT"
@@ -142,6 +208,7 @@ def runner_target_dir(home, runner_name):
 
 
 def main(argv=None):
+    require_workflow_annotation()
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--home", default=str(Path.home()), help="runner user home")
     parser.add_argument("--runner-name", default=None, help="runner name (required)")
@@ -154,28 +221,28 @@ def main(argv=None):
     args = parser.parse_args(argv)
     home = Path(args.home)
     if not home.is_absolute() or str(home) in ("/", ""):
-        print("shared_cargo_target: refusing home %r" % args.home, file=sys.stderr)
+        print(wa.log_line("shared_cargo_target: refusing home %r" % args.home), file=sys.stderr)
         return EXIT_USAGE
     try:
         path = runner_target_dir(home, args.runner_name)
     except ValueError as err:
-        print("shared_cargo_target: refusing: %s" % err, file=sys.stderr)
+        print(wa.log_line("shared_cargo_target: refusing: %s" % err), file=sys.stderr)
         return EXIT_USAGE
     root = target_root_dir(home)
     root.mkdir(parents=True, exist_ok=True)
     with evict_lock(root, args.lock_timeout) as held:
         if not held:
             # A job start never fails or deadlocks on the lock (#7292).
-            print("shared_cargo_target: warning: eviction lock %s not taken within %s s; "
-                  "proceeding without it" % (root / EVICT_LOCK_NAME, args.lock_timeout),
+            print(wa.log_line("shared_cargo_target: warning: eviction lock %s not taken within %s s; "
+                  "proceeding without it" % (root / EVICT_LOCK_NAME, args.lock_timeout)),
                   file=sys.stderr)
         path.mkdir(parents=True, exist_ok=True)
         write_in_use_marker(path, args.runner_name)
     if args.github_env:
         with open(args.github_env, "a", encoding="utf-8") as handle:
-            handle.write("%s=%s\n" % (ENV_NAME, path))
-            handle.write("%s=%s\n" % (ROOT_ENV_NAME, target_root_dir(home)))
-    print(path)
+            handle.write("%s=%s\n" % (ENV_NAME, wa.env_file_value(path)))
+            handle.write("%s=%s\n" % (ROOT_ENV_NAME, wa.env_file_value(target_root_dir(home))))
+    print(wa.log_line(path))
     return EXIT_OK
 
 

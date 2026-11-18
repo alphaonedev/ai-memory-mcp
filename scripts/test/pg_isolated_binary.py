@@ -61,6 +61,46 @@ from pathlib import Path
 from typing import Dict, IO, List, Optional, Set, Tuple
 from urllib.parse import parse_qsl, unquote, urlsplit
 
+
+def _load_workflow_annotation():
+    """The shared module at WA_RELATIVE_PATH from this file's real directory, by path only, never through
+    sys.path; every name in WA_REQUIRED must be a callable of it (#9365, one shape in every script)."""
+    import importlib.util
+    import os
+    path = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), WA_RELATIVE_PATH))
+    loaded = sys.modules.get("workflow_annotation")
+    if loaded is not None and os.path.realpath(getattr(loaded, "__file__", None) or "") == path:
+        module = loaded
+    else:
+        spec = importlib.util.spec_from_file_location("workflow_annotation", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)  # absent, unreadable or broken: it raises here, the try below catches it
+    missing = [name for name in WA_REQUIRED if not callable(getattr(module, name, None))]
+    if missing:
+        raise AttributeError("workflow_annotation.py lacks " + ", ".join(missing))
+    if loaded is None:
+        sys.modules["workflow_annotation"] = module
+    return module
+
+
+# The one shared-module load shape of scripts/ (#9365, ruling bcd0a15c; LoaderShape pins it).
+WA_PROG = "pg_isolated_binary"
+WA_RELATIVE_PATH = "../ci/workflow_annotation.py"
+WA_REQUIRED = ("annotation", "end_group_line", "env_file_value", "log_line")
+WA_EXIT_LOAD_REFUSED = 4  # a failed shared-module load, before any child runs (2 usage, 3 mint, 143 terminated, else the child's)
+WA_ERROR_TO_STDERR = True  # setup --emit-env writes stdout to $GITHUB_ENV
+
+try:
+    wa = _load_workflow_annotation()
+except (Exception, SystemExit) as exc:  # any failed load: one fixed line built without the module, then exit
+    wa_cause = type(exc).__name__
+    print("%s: refused: shared module workflow_annotation.py next to the script cannot be loaded (%s)"
+          % (WA_PROG, wa_cause if wa_cause.isidentifier() else "BaseException"), file=sys.stderr, flush=True)
+    print("::error title=pg_isolated_binary refused::pg_isolated_binary: refused: shared module workflow_annotation.py"
+          " next to the script cannot be loaded",
+          file=sys.stderr if WA_ERROR_TO_STDERR else sys.stdout, flush=True)
+    sys.exit(WA_EXIT_LOAD_REFUSED)
+
 URL_VAR = 'AI_MEMORY_TEST_POSTGRES_URL'
 AGE_URL_VAR = 'AI_MEMORY_TEST_AGE_URL'
 FLAG_VAR = 'AI_MEMORY_TEST_PG_ISOLATE'
@@ -150,14 +190,14 @@ def _out(line: str) -> None:
 
 
 def _emit(line: str) -> None:
-    """One ``KEY=value`` line for ``$GITHUB_ENV`` (stdout, nothing else)."""
-    print(line, flush=True)
+    """One ``KEY=value`` line for ``$GITHUB_ENV`` (stdout, nothing else; never a second entry)."""
+    print(wa.env_file_value(line), flush=True)
 
 
 def log(msg: str) -> None:
     """Diagnostics go to stderr so ``--emit-env`` stdout stays clean."""
     with _PRINT_LOCK:
-        print('[pg_isolated_binary] ' + msg, file=sys.stderr, flush=True)
+        print(wa.log_line('[pg_isolated_binary] ' + msg), file=sys.stderr, flush=True)
 
 
 # --- names and URLs -------------------------------------------------------
@@ -1013,9 +1053,10 @@ def _tail(path: Path, lines: int) -> List[str]:
 
 
 def _stderr_note(text: str) -> None:
-    """Best-effort stderr line: a closed stderr must not stop the signal loop (#7915)."""
+    """Best-effort stderr line (``text`` without its newline, through ``log_line``, #9365): a closed stderr
+    must not stop the signal loop (#7915)."""
     try:
-        sys.stderr.write(text)
+        sys.stderr.write(wa.log_line(text) + "\n")
     except (OSError, ValueError):
         return
 
@@ -1058,7 +1099,7 @@ class Runner:
                 continue  # the group already exited: nothing to signal
             except PermissionError as exc:
                 # A group the wrapper may not signal can leak: say so (#7892).
-                _stderr_note("pg_isolated_binary: cannot signal child group %d with %s: %s\n"
+                _stderr_note("pg_isolated_binary: cannot signal child group %d with %s: %s"
                              % (pid, signal.Signals(sig).name, exc.strerror or exc))
 
     def _spawn(self, argv: List[str], env: Dict[str, str], out: IO[str]) -> 'subprocess.Popen[str]':
@@ -1077,14 +1118,14 @@ class Runner:
     def _report(self, label: str, rc: int, log_path: Path) -> None:
         if rc == 0:
             results = [ln for ln in _tail(log_path, 10_000) if 'test result:' in ln]
-            _out('[pg_isolated_binary] PASS %s (log %s)' % (label, log_path))
+            _out(wa.log_line('[pg_isolated_binary] PASS %s (log %s)' % (label, log_path)))
             for line in results:
-                _out('  ' + line)
+                _out(wa.log_line('  ' + line))
             return
-        _out('::group::FAIL %s (exit %d), last %d lines of %s' % (label, rc, LOG_TAIL_LINES, log_path))
+        _out(wa.annotation('group', 'FAIL %s (exit %d), last %d lines of %s' % (label, rc, LOG_TAIL_LINES, log_path)))
         for line in _tail(log_path, LOG_TAIL_LINES):
-            _out(line)
-        _out('::endgroup::')
+            _out(wa.log_line(line))
+        _out(wa.end_group_line())
 
     def run_one(self, target: List[str], isolate: bool = True) -> int:
         """One binary: mint + hold a clone, cargo test it, release, drop."""
@@ -1228,7 +1269,7 @@ def _cmd_run(args: argparse.Namespace, url: str) -> int:
     available = connection_budget(url)[3]
     width = width_for(available, args.jobs)
     if width < clamp_jobs(args.jobs):
-        log('::warning::only %d free connection slots: width degraded to %d' % (available, width))
+        log(wa.annotation('warning', 'only %d free connection slots: width degraded to %d' % (available, width)))
     env = dict(os.environ)
     env[URL_VAR] = url
     runner = Runner(cargo, args.test_arg, env, tpl, run_id, url, args.log_dir or _default_log_dir(), width)
@@ -1265,7 +1306,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             return 0
         return _cmd_run(args, url)
     except WrapperError as exc:
-        print('pg_isolated_binary: %s' % exc, file=sys.stderr)
+        print(wa.log_line('pg_isolated_binary: %s' % exc), file=sys.stderr)
         return EXIT_USAGE
 
 

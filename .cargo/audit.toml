@@ -13,6 +13,18 @@
 # serde_yaml_ng replacement work). Remove this record and the ignore when
 # serde_yaml_ng is replaced or moves off unsafe-libyaml.
 #
+# RUSTSEC-2026-0543: chrono 0.4.44 is unmaintained (informational
+# "unmaintained" warning, not a vulnerability; the advisory states no defect).
+# No patched release exists (versions.patched is empty, all versions are
+# affected); upstream notice: https://github.com/chronotope/chrono/issues/1768.
+# Paths: direct from ai-memory (Cargo.toml chrono 0.4, features clock and
+# serde, about 252 files and 1110 lines under src/), direct from a2a-lf
+# 0.4.2, and transitive through sqlx-core 0.8.6 and sqlx-postgres 0.8.6 via
+# the sqlx "chrono" feature (Cargo.toml sqlx entries). The advisory names jiff
+# and time as alternatives. Review by 2027-02-01; tracked by #9420 and by #9421
+# (the migration off chrono). Remove this record and the ignore when chrono is
+# replaced.
+#
 # RUSTSEC-2023-0071: Marvin Attack on rsa crate via timing side-channels.
 # Reached transitively only when `--features sal-postgres` is built
 # (sqlx-macros-core unconditionally pulls sqlx-mysql → rsa). Default
@@ -24,6 +36,7 @@ ignore = [
     "RUSTSEC-2023-0071",
     "RUSTSEC-2024-0449", # unsafe-libyaml unmaintained; review by 2027-02-01, see #8473 and #8476
     "RUSTSEC-2026-0459", # libsqlite3-sys 0.30.1 WAL page-size read; time-boxed, NOT mitigated, see #8696
+    "RUSTSEC-2026-0543", # chrono unmaintained; review by 2027-02-01, see #9420 and #9421
 ]
 
 # #8615: metadata lives in audit-exceptions.toml; the CI gate cross-checks both files.
