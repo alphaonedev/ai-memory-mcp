@@ -2412,34 +2412,46 @@ jobs:
               # #9433: a shard log is written by PR-run tests. It is printed only between
               # ::stop-commands::<token> and ::<token>::, the token 128 bits from the
               # kernel CSPRNG, new per block, never shown before the stop line. No token:
-              # a fixed notice, no raw log. The exit code stays that of `cat`. A copy that
-              # fails half-way gets a newline, so the end line starts its own line.
-              local shard_tok shard_rc
+              # a fixed notice, no raw log. A copy that fails half-way gets a newline, so
+              # the end line starts its own line.
+              # #9459: a log that is not a regular file or cannot be opened or read fails
+              # the step with SHARD_LOG_READ_FAIL_RC = 1 (the code of the base `cat`) in
+              # BOTH branches; the file type is checked before the open and again on the
+              # open handle, so a FIFO never blocks and a directory never records 0.
+              local shard_tok shard_rc SHARD_LOG_READ_FAIL_RC=1
               echo "::group::[#6344] ${n} shard output"
               shard_tok=$(python3 -I -c 'import secrets; print(secrets.token_hex(16))' 2>/dev/null) || shard_tok=""
               shard_rc=0
               if [[ "$shard_tok" =~ ^[0-9a-f]{32}$ ]]; then
                 echo "::stop-commands::${shard_tok}"
                 python3 -I -c 'if True:
-                  import sys
+                  import os, stat, sys
                   out = sys.stdout.buffer
                   last = b"\n"
+                  def read_failed(why):
+                      sys.stderr.write("[#9433] shard log not readable: %s\n" % why)
+                      sys.exit(int(sys.argv[2]))
                   try:
-                      with open(sys.argv[1], "rb") as log:
+                      if not stat.S_ISREG(os.stat(sys.argv[1]).st_mode):
+                          read_failed("not a regular file")
+                      fd = os.open(sys.argv[1], os.O_RDONLY | os.O_NONBLOCK | os.O_NOCTTY)
+                      with open(fd, "rb") as log:
+                          if not stat.S_ISREG(os.fstat(fd).st_mode):
+                              read_failed("not a regular file")
+                          os.set_blocking(fd, True)
                           while chunk := log.read(1 << 20):
                               out.write(chunk)
                               last = chunk[-1:]
                   except OSError as err:
-                      sys.stderr.write("[#9433] shard log not readable: %s\n" % err.strerror)
-                      sys.exit(1)
+                      read_failed(err.strerror)
                   finally:
                       if last != b"\n":
                           out.write(b"\n")
-                      out.flush()' "$sd/$n.log" || { shard_rc=$?; echo || :; }
+                      out.flush()' "$sd/$n.log" "$SHARD_LOG_READ_FAIL_RC" || { shard_rc=$?; echo || :; }
                 echo "::${shard_tok}::"
               else
                 echo "::notice::[#9433] ${n} shard output not printed: no stop-commands token could be made (fail closed; the step result is unchanged)"
-                : < "$sd/$n.log" || shard_rc=$?
+                if [ -f "$sd/$n.log" ] && { [ -f /dev/fd/3 ]; } 3< "$sd/$n.log"; then :; else shard_rc="$SHARD_LOG_READ_FAIL_RC"; fi
               fi
               echo "::endgroup::"
               (exit "$shard_rc")
