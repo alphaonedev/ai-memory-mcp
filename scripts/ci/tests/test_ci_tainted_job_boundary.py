@@ -611,6 +611,7 @@ HIT_SPLITS = {
     "label split": "    runs-on: [self-hosted, linux-fed-pr, ephemeral]\n",
     "hosted label added": "    runs-on: [ubuntu-latest, self-hosted, linux-fed-pr]\n",
     "group split": "    runs-on:\n      group: pr-tier\n      labels: [self-hosted, ephemeral]\n",
+    "group with a hosted label": "    runs-on:\n      group: pr-tier\n      labels: [ubuntu-latest]\n",
 }
 
 # The allow rows R2 keeps open under #9455 (ruling abf38892 section 7).
