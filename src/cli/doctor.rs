@@ -1065,9 +1065,12 @@ fn snapshot_before_repair(
     let snapshot_name =
         format!("{file_name}.pre-repair-schema-version-v{observed}-to-v{target}-{token}.sqlite");
     let snapshot_path = parent.join(snapshot_name);
+    // v1.0.0 #8950 — staged privately and published by a link that never
+    // follows or replaces an entry planted at the snapshot name.
+    let stage = crate::storage::snapshot_file::stage_beside(&snapshot_path, "repair snapshot")?;
     // Single-quote-escape the target for the SQL string literal (crate-derived
     // path, but doubling quotes is the correct hygiene).
-    let escaped = snapshot_path.to_string_lossy().replace('\'', "''");
+    let escaped = stage.path().to_string_lossy().replace('\'', "''");
     conn.execute(&format!("VACUUM INTO '{escaped}'"), [])
         .with_context(|| {
             format!(
@@ -1076,6 +1079,11 @@ fn snapshot_before_repair(
                 snapshot_path.display()
             )
         })?;
+    stage
+        .file()
+        .sync_all()
+        .with_context(|| format!("fsync the repair snapshot {}", snapshot_path.display()))?;
+    drop(stage.publish()?);
     Ok(Some(snapshot_path))
 }
 
