@@ -289,7 +289,7 @@ fn daemon_cell(fresh: &dyn Fn(&str) -> Backend) {
     let backend = fresh("other");
     let url = spawn_daemon(backend.clone(), auth(Some((&key, OTHER_AGENT))));
     let before = rows(&backend);
-    let sites: Vec<(&str, Result<Value, String>)> = vec![
+    let sites = vec![
         (
             "store",
             forward_store_to_http(&url, &store_params("other"), Some("ai:test")),

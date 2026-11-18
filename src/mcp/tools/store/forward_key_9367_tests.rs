@@ -125,30 +125,35 @@ fn header_line<'a>(request: &'a str, name: &str) -> Option<&'a str> {
     })
 }
 
-/// The three forward sites, each called once against `url`.
-fn forward_each(url: &str) -> Vec<(&'static str, Result<Value, String>)> {
-    vec![
-        (
-            "store",
-            forward_store_to_http(url, &json!({"title": "t", "content": "c"}), Some("ai:test")),
-        ),
-        (
-            "transition",
-            forward_action_transition_to_http(
-                url,
-                &json!({"id": "act-1", "to": "claimed"}),
-                Some("ai:test"),
+/// The three forward sites, each called once against `url`. A macro so the
+/// element type is inferred from the three sites' own signatures (QUAL-6:
+/// the test side adds no legacy error annotation of its own).
+macro_rules! forward_each {
+    ($url:expr) => {{
+        let url: &str = $url;
+        [
+            (
+                "store",
+                forward_store_to_http(url, &json!({"title": "t", "content": "c"}), Some("ai:test")),
             ),
-        ),
-        (
-            "signal",
-            forward_signal_send_to_http(
-                url,
-                &json!({"namespace": "ns", "subject": "s"}),
-                Some("ai:test"),
+            (
+                "transition",
+                forward_action_transition_to_http(
+                    url,
+                    &json!({"id": "act-1", "to": "claimed"}),
+                    Some("ai:test"),
+                ),
             ),
-        ),
-    ]
+            (
+                "signal",
+                forward_signal_send_to_http(
+                    url,
+                    &json!({"namespace": "ns", "subject": "s"}),
+                    Some("ai:test"),
+                ),
+            ),
+        ]
+    }};
 }
 
 /// K-2 FINAL / V-4 — variable UNSET: no `X-API-Key`, no new error, and the
@@ -164,7 +169,7 @@ fn unset_variable_sends_no_api_key_and_no_new_error_9367() {
     unset_env(KEY_FILE_ENV);
     let _id = AgentIdOverride::set(AGENT);
     let (url, rx) = server(vec![OK_200.to_string()]);
-    for (site, result) in forward_each(&url) {
+    for (site, result) in forward_each!(&url) {
         result.unwrap_or_else(|e| panic!("{site}: unset variable must forward as today: {e}"));
     }
     let requests = drain(&rx);
@@ -199,7 +204,7 @@ fn set_variable_sends_the_file_key_on_every_site_9367() {
     set_env(KEY_FILE_ENV, path.as_os_str());
     let _id = AgentIdOverride::set(AGENT);
     let (url, rx) = server(vec![OK_200.to_string()]);
-    for (site, result) in forward_each(&url) {
+    for (site, result) in forward_each!(&url) {
         result.unwrap_or_else(|e| panic!("{site}: keyed forward must succeed: {e}"));
     }
     let requests = drain(&rx);
@@ -299,7 +304,7 @@ fn set_but_unusable_file_is_a_named_local_error_per_form_9367() {
         }
         let (url, rx) = server(vec![OK_200.to_string()]);
         let started = Instant::now();
-        for (site, result) in forward_each(&url) {
+        for (site, result) in forward_each!(&url) {
             let err = result.expect_err(&format!("{form}/{site}: must refuse locally"));
             assert_eq!(
                 err,
@@ -396,7 +401,7 @@ fn keyed_403_is_a_named_error_with_no_retry_9367() {
     set_env(KEY_FILE_ENV, path.as_os_str());
     let _id = AgentIdOverride::set(AGENT);
     let (url, rx) = server(vec![DENY_403.to_string()]);
-    for (site, result) in forward_each(&url) {
+    for (site, result) in forward_each!(&url) {
         let err = result.expect_err(&format!("{site}: 403 must error"));
         assert!(
             err.ends_with(&format!(
@@ -522,7 +527,7 @@ fn keyed_refusal_text_only_for_a_credential_refusal_9367() {
     ];
     for (case, status_line, body, tail) in cases {
         let (url, rx) = server(vec![reply(status_line, &body)]);
-        for (site, result) in forward_each(&url) {
+        for (site, result) in forward_each!(&url) {
             let err = result.expect_err(&format!("{case}/{site}: must error"));
             assert!(
                 err.ends_with(&format!("returned {status_line}{tail}")),
@@ -560,7 +565,7 @@ fn keyed_forward_without_explicit_identity_is_refused_9367() {
     set_env(KEY_FILE_ENV, path.as_os_str());
     let _id = AgentIdOverride::unset();
     let (url, rx) = server(vec![OK_200.to_string()]);
-    for (site, result) in forward_each(&url) {
+    for (site, result) in forward_each!(&url) {
         let err = result.expect_err(&format!("{site}: synthesized id with a key must refuse"));
         assert_eq!(
             err,
