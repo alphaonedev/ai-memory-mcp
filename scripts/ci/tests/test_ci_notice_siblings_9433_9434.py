@@ -23,6 +23,7 @@ import importlib.util
 import os
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -166,6 +167,28 @@ TRUST_DIR_MODE = 0o700
 TRUST_FILES = {"__init__.py": b"", "common.py": b"# trusted common 9434\n",
                "cargo_skip.py": b"# trusted decider 9434\n", "rules.json": b"{}\n"}
 PARTIAL_PRINT = b"partial-print-no-newline::error::x"
+
+# #9459: every read failure of a shard log fails the step through one named constant, in BOTH branches of the
+# run_sharded print (stop-commands token / no token), equal to the exit code of the base ``cat`` (a028c45e).
+SHARD_LOG_READ_FAIL_RC = 1
+BASE_CAT_FAIL_RC = 1
+# A FIFO with no writer: the base ``cat`` blocks on the open (no exit code); the head decides on the file type
+# before it opens and fails at once.
+BASE_BLOCKS = None
+SHARD_TOKEN_BRANCH = "token"
+SHARD_NO_TOKEN_BRANCH = "no_token"
+SHARD_BRANCHES = (SHARD_TOKEN_BRANCH, SHARD_NO_TOKEN_BRANCH)
+# (base rc, head rc) of the first shard's print per log form; base measured with ``cat`` at a028c45e.
+SHARD_RC_TABLE = {
+    "readable": (0, 0),
+    "missing": (BASE_CAT_FAIL_RC, SHARD_LOG_READ_FAIL_RC),
+    "directory": (BASE_CAT_FAIL_RC, SHARD_LOG_READ_FAIL_RC),
+    "mode_000": (BASE_CAT_FAIL_RC, SHARD_LOG_READ_FAIL_RC),
+    "fifo": (BASE_BLOCKS, SHARD_LOG_READ_FAIL_RC),
+    "dangling_symlink": (BASE_CAT_FAIL_RC, SHARD_LOG_READ_FAIL_RC),
+}
+SHARD_FORM_CEILING_SECS = 10.0
+SHARD_READABLE_LOG = b"plain shard line\n"
 
 CHANGED_CORPUS = {
     "v2_name": "src/a.rs\n::error::x\nsrc/b.rs",
@@ -704,6 +727,105 @@ class ShardLogs9433(unittest.TestCase):
         self.assertEqual(out[pos:], b"::endgroup::\n")
         self.assertEqual(result.returncode, 1)
         self.assertEqual(runner_commands(out)[1], False, "the runner would stay in stop-commands mode")
+
+
+def run_bash_bounded(script, cwd, ceiling_secs, env_extra, path=None):
+    """``run_bash`` in its own session with a wall-clock ceiling; a blocked run is killed as a group.
+
+    Returns (result or None when the ceiling was hit, seconds taken).
+    """
+    env = {b"PATH": os.fsencode(path or os.environ.get("PATH", "/usr/bin:/bin")), b"HOME": os.fsencode(str(cwd)),
+           b"LC_ALL": b"C.UTF-8", b"LANG": b"C.UTF-8"}
+    for key, value in env_extra.items():
+        env[os.fsencode(key)] = os.fsencode(value)
+    started = time.monotonic()
+    proc = subprocess.Popen([*BASH_SHELL, script], cwd=str(cwd), env=env, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, start_new_session=True)
+    try:
+        stdout, stderr = proc.communicate(timeout=ceiling_secs)
+    except subprocess.TimeoutExpired:
+        os.killpg(proc.pid, signal.SIGKILL)
+        proc.communicate()
+        return None, time.monotonic() - started
+    return subprocess.CompletedProcess(proc.args, proc.returncode, stdout, stderr), time.monotonic() - started
+
+
+class ShardLogReadForms9459(unittest.TestCase):
+    """#9459: no read failure of a shard log records 0, in either branch; a FIFO never blocks the step."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.box = Sandbox()
+        cls.span = shard_span()
+        cls.no_python = cls.box.shim_bin("shard-9459-no-python", None)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.box.close()
+
+    def make_log(self, sd, form):
+        target = sd / ("%s.log" % SHARDS[0])
+        match form:
+            case "readable":
+                target.write_bytes(SHARD_READABLE_LOG)
+            case "missing":
+                pass
+            case "directory":
+                target.mkdir()
+            case "mode_000":
+                target.write_bytes(b"::error::hidden\n")
+                target.chmod(0)
+            case "fifo":
+                os.mkfifo(target)
+            case "dangling_symlink":
+                target.symlink_to(sd / "no-such-target.log")
+            case _:
+                raise AssertionError("unknown form %s" % form)
+
+    def run_form(self, form, branch):
+        sd = Path(tempfile.mkdtemp(prefix="sd9459-", dir=str(self.box.root)))
+        self.make_log(sd, form)
+        for shard in SHARDS[1:]:
+            (sd / ("%s.log" % shard)).write_bytes(SHARD_READABLE_LOG)
+        script = ('shards_9459() {\nlocal sd="$STUB_SD" n\n' + self.span + '}\nshards_9459\necho "%s"\n'
+                  % AFTER_MARK)
+        path = self.no_python if branch == SHARD_NO_TOKEN_BRANCH else None
+        return run_bash_bounded(script, sd, SHARD_FORM_CEILING_SECS, {"STUB_SD": str(sd)}, path=path)
+
+    def test_every_read_form_both_branches_exact_rc(self):
+        forms = dict(SHARD_RC_TABLE)
+        if os.geteuid() == 0:
+            forms.pop("mode_000")
+        for form, (_, want_rc) in forms.items():
+            for branch in SHARD_BRANCHES:
+                with self.subTest(form=form, branch=branch):
+                    result, took = self.run_form(form, branch)
+                    self.assertIsNotNone(result, "the print blocked past %ss" % SHARD_FORM_CEILING_SECS)
+                    self.assertLess(took, SHARD_FORM_CEILING_SECS)
+                    self.assertEqual(result.returncode, want_rc, result.stderr[-400:])
+                    self.assertNotIn(b"::error::hidden", result.stdout)
+                    group = ("::group::[#6344] %s shard output\n" % SHARDS[0]).encode()
+                    self.assertTrue(result.stdout.startswith(group), result.stdout[:120])
+                    if branch == SHARD_TOKEN_BRANCH:
+                        shown = SHARD_READABLE_LOG if want_rc == 0 else b"\n"
+                        _, pos = take_block(self, result.stdout, len(group), shown)
+                    else:
+                        fallback = (SHARD_FALLBACK % SHARDS[0]).encode()
+                        self.assertTrue(result.stdout.startswith(fallback, len(group)), result.stdout[:240])
+                        pos = len(group) + len(fallback)
+                    self.assertTrue(result.stdout.startswith(b"::endgroup::\n", pos))
+                    tail = result.stdout[pos + len(b"::endgroup::\n"):]
+                    if want_rc == 0:
+                        self.assertTrue(tail.endswith((AFTER_MARK + "\n").encode()), tail[-120:])
+                    else:
+                        self.assertEqual(tail, b"", "the step went on after a failed shard print")
+                    self.assertFalse(runner_commands(result.stdout)[1], "the runner would stay in stop-commands mode")
+
+    def test_failure_forms_share_one_nonzero_constant(self):
+        head_rcs = {head for form, (_, head) in SHARD_RC_TABLE.items() if form != "readable"}
+        self.assertEqual(head_rcs, {SHARD_LOG_READ_FAIL_RC})
+        self.assertNotEqual(SHARD_LOG_READ_FAIL_RC, 0)
+        self.assertEqual(SHARD_LOG_READ_FAIL_RC, BASE_CAT_FAIL_RC)
 
 
 class ClassSiblings9433(unittest.TestCase):
