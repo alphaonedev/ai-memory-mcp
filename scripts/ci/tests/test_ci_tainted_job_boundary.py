@@ -4,8 +4,10 @@ Invariant: after the first step of a job that runs pull-request code, no step of
 holds (i) a secret, (ii) a write token, (iii) an output that feeds a gate decision, or
 (iv) persistent state a trusted run later reads. A workflow or a job the classifier cannot
 classify is a failure. Known violations need an allow row naming the open fix issue; the
-row count is pinned and a stale row is a failure. The (iv) rule reads the OS boundary facts
-of issue #9455 and never a path layout (3-agent vote (71472661), condition T-4).
+row count is pinned and a stale row is a failure. The persistent-runner rule of (iv) is R2
+(ruling abf38892 section 7): a job whose `runs-on` can resolve to a runner that is not
+provably GitHub-hosted has no trusted trigger. It is read from the workflow files alone; no
+environment variable, path form, cache-directory name or runner label clears it.
 
 Every cell works on in-memory text: the real workflows are read once from the checkout and
 synthetic workflows are named constants below. No file is written.
@@ -17,7 +19,6 @@ import sys
 import time
 import unittest
 from pathlib import Path
-from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO_ROOT / "scripts" / "ci"))
@@ -34,14 +35,18 @@ try:
 except ImportError:
     pyyaml = None
 
-ALLOW_PIN_EXPECTED = 12
+ALLOW_PIN_EXPECTED = 13
 JOB_COUNT_LARGE = 200
 LARGE_SCAN_CEILING_S = 10.0
 RUN_TEXT_BYTES_LARGE = 120_000
 RUN_TEXT_CEILING_S = 5.0
 FIX_ISSUES = frozenset({9454, 9455, 9456})
-PERSISTENT_LABEL = "linux-fed"
+RUNNER_ISSUE = 9455
 SYNTH = "synthetic.yml"
+# The step key of an R2 (iv) violation: the job's `runs-on`, not one of its steps.
+R2_STEP = "runs-on"
+R2_DETAIL = "job can run on a runner not provably GitHub-hosted and has a trusted trigger: {events}"
+CLASS_IV = "iv"
 
 # ---------------------------------------------------------------------------------------
 # Synthetic corpus: one job per class and per clean form.
@@ -147,7 +152,7 @@ JOB_CLEAN_OUTPUT_BEFORE = """\
 
 JOB_CLEAN_BASE_TREE = """\
   clean-base-tree:
-    runs-on: [self-hosted, linux-fed]
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
         with:
@@ -163,7 +168,7 @@ JOB_CLEAN_BASE_TREE = """\
 JOB_CLEAN_TRUSTED_ONLY = """\
   clean-trusted-only:
     if: github.event_name == 'push'
-    runs-on: [self-hosted, linux-fed]
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
@@ -172,6 +177,26 @@ JOB_CLEAN_TRUSTED_ONLY = """\
         env:
           TOKEN: ${{ secrets.RELEASE_TOKEN }}
         run: cargo publish
+"""
+
+# R2: a trusted-only job on a persistent runner is (iv) though it runs no pull-request code.
+JOB_TRUSTED_ONLY_SELF_HOSTED = """\
+  trusted-self-hosted:
+    if: github.event_name == 'push'
+    runs-on: [self-hosted, linux-fed]
+    steps:
+      - name: Publish
+        run: cargo publish
+"""
+
+# R2 needs a trusted trigger: a job narrowed to pull_request only has none.
+JOB_PR_ONLY_SELF_HOSTED = """\
+  pr-only-self-hosted:
+    if: github.event_name == 'pull_request'
+    runs-on: [self-hosted, linux-fed]
+    steps:
+      - name: Lint
+        run: echo lint
 """
 
 JOB_CLEAN_GITHUB_HOSTED = """\
@@ -190,6 +215,7 @@ JOB_CLEAN_GITHUB_HOSTED = """\
 SYNTH_WORKFLOW = HEADER + "".join((
     JOB_CLASS_I, JOB_CLASS_II, JOB_CLASS_III, JOB_CLASS_IV, JOB_CLEAN_SECRET_BEFORE,
     JOB_CLEAN_OUTPUT_BEFORE, JOB_CLEAN_BASE_TREE, JOB_CLEAN_TRUSTED_ONLY, JOB_CLEAN_GITHUB_HOSTED,
+    JOB_TRUSTED_ONLY_SELF_HOSTED, JOB_PR_ONLY_SELF_HOSTED,
 ))
 
 SYNTH_VERDICTS = {
@@ -202,13 +228,16 @@ SYNTH_VERDICTS = {
     "clean-base-tree": "no-pr-code",
     "clean-trusted-only": "trusted-only",
     "clean-hosted": "clean",
+    "trusted-self-hosted": "iv",
+    "pr-only-self-hosted": "no-pr-code",
 }
 
 SYNTH_VIOLATIONS = {
     ("class-i", "Use token", "i"),
     ("class-ii", "Test", "ii"),
     ("class-iii", "Pick", "iii"),
-    ("class-iv", "Build", "iv"),
+    ("class-iv", R2_STEP, "iv"),
+    ("trusted-self-hosted", R2_STEP, "iv"),
 }
 
 WF_LEAKY_CHECKOUT = HEADER + """\
@@ -506,17 +535,87 @@ WF_MATRIX = HEADER + """\
         run: cargo build
 """
 
-BOUNDARY_PROOF = "scripts/ci/tests/test_runner_boundary_9455.py"
-BOUNDARY_FACTS_FULL = {
-    "pr_tier_user": "ci-pr",
-    "trusted_user": "ci-trusted",
-    "trusted_root_unwritable": True,
-    "trusted_cargo_home_unwritable": True,
-    "trusted_rustup_toolchains_unwritable": True,
-    "trusted_path_entries_unwritable": True,
-    "trusted_home_credentials_unreadable": True,
-    "proof_test": BOUNDARY_PROOF,
+# R2 table (ruling abf38892 section 7): `runs-on` form x trigger set. A form is the job text
+# above `steps:`; its expectation is HOSTED, PERSISTENT or the needle of the unclassifiable
+# reason. Anything not provably GitHub-hosted is persistent self-hosted.
+HOSTED = "hosted"
+PERSISTENT = "persistent"
+R2_RUNS_ON_FORMS = {
+    "hosted label": ("    runs-on: ubuntu-24.04\n", HOSTED),
+    "hosted list": ("    runs-on: [ubuntu-24.04]\n", HOSTED),
+    "hosted matrix": ("    strategy:\n      matrix:\n        os: [ubuntu-24.04, macos-15]\n"
+                      "    runs-on: ${{ matrix.os }}\n", HOSTED),
+    "self-hosted literal": ("    runs-on: self-hosted\n", PERSISTENT),
+    "custom label": ("    runs-on: linux-fed\n", PERSISTENT),
+    "list form": ("    runs-on: [self-hosted, linux-fed]\n", PERSISTENT),
+    "hosted and self-hosted list": ("    runs-on: [ubuntu-24.04, self-hosted]\n", PERSISTENT),
+    "group mapping": ("    runs-on:\n      group: fleet\n", PERSISTENT),
+    "labels mapping": ("    runs-on:\n      labels: [self-hosted, linux-fed]\n", PERSISTENT),
+    "matrix leg": ("    strategy:\n      matrix:\n        os: [ubuntu-24.04]\n        include:\n"
+                   "          - os: linux-fed\n    runs-on: ${{ matrix.os }}\n", PERSISTENT),
+    "fromJSON matrix leg": ("    strategy:\n      matrix:\n        include:\n"
+                            "          - runner: '[\"ubuntu-latest\"]'\n"
+                            "          - runner: '[\"self-hosted\",\"macos-fed\"]'\n"
+                            "    runs-on: ${{ fromJSON(matrix.runner) }}\n", PERSISTENT),
+    "matrix value expression": ("    strategy:\n      matrix:\n        os: ['${{ inputs.os }}']\n"
+                                "    runs-on: ${{ matrix.os }}\n", PERSISTENT),
+    "expression": ("    runs-on: ${{ github.event.inputs.runner }}\n", PERSISTENT),
+    "reusable-workflow input": ("    runs-on: ${{ inputs.runner }}\n", PERSISTENT),
+    "expression in a list": ("    runs-on: [self-hosted, '${{ vars.POOL }}']\n", PERSISTENT),
+    "missing": ("", "job without runs-on"),
+    "number": ("    runs-on: 7\n", "outside the known forms"),
+    "empty list": ("    runs-on: []\n", "outside the known forms"),
+    "empty label": ("    runs-on: ''\n", "empty runs-on label"),
+    "mapping without labels": ("    runs-on:\n      size: large\n", "outside the known forms"),
+    "unterminated expression": ("    runs-on: '${{ inputs.runner'\n", "unterminated `${{` expression"),
+    "matrix axis without values": ("    strategy:\n      matrix:\n        include:\n          - other: x\n"
+                                   "    runs-on: ${{ matrix.os }}\n", "has no static values"),
 }
+# Trigger set -> (the `on:` block, the trusted triggers R2 names, the verdict of a hosted job
+# that runs no pull-request code).
+R2_TRIGGER_SETS = {
+    "pull_request only": ("on:\n  pull_request:\n", (), "no-pr-code"),
+    "pull_request_target only": ("on:\n  pull_request_target:\n", ("pull_request_target",), "no-pr-code"),
+    "push": ("on:\n  push:\n    branches: [main]\n", ("push",), "trusted-only"),
+    "merge_group": ("on:\n  merge_group:\n", ("merge_group",), "no-pr-code"),
+    "schedule": ("on:\n  schedule:\n    - cron: '0 4 * * *'\n", ("schedule",), "trusted-only"),
+    "workflow_dispatch": ("on:\n  workflow_dispatch:\n", ("workflow_dispatch",), "trusted-only"),
+    "workflow_call": ("on: workflow_call\n", ("workflow_call",), "no-pr-code"),
+    "mixed": ("on:\n  pull_request:\n  push:\n    branches: [main]\n  merge_group:\n",
+              ("merge_group", "push"), "no-pr-code"),
+}
+R2_JOB_ID = "probe"
+R2_STEPS = "    steps:\n      - name: Say\n        run: echo hi\n"
+
+
+def r2_workflow(on_block: str, runs_on: str) -> str:
+    return on_block + "permissions:\n  contents: read\njobs:\n  " + R2_JOB_ID + ":\n" + runs_on + R2_STEPS
+
+
+# Hit 4-6 job (cert-postgres-age) with each split applied; none may clear R2.
+HIT_WORKFLOW = "cert-postgres-age.yml"
+HIT_JOB = "cert-postgres-age"
+HIT_RUNS_ON = "    runs-on: [self-hosted, linux-fed]\n"
+HIT_SPLITS = {
+    "path split": HIT_RUNS_ON + (
+        "    env:\n"
+        "      CARGO_HOME: ${{ runner.temp }}/pr-cargo\n"
+        "      RUSTUP_HOME: ${{ runner.temp }}/pr-rustup\n"
+        "      TMPDIR: ${{ runner.temp }}/pr-tmp\n"
+        "      CARGO_TARGET_DIR: ${{ runner.temp }}/pr-target\n"
+        "      PR_TIER_ISOLATED: 'true'\n"),
+    "label split": "    runs-on: [self-hosted, linux-fed-pr, ephemeral]\n",
+    "hosted label added": "    runs-on: [ubuntu-latest, self-hosted, linux-fed-pr]\n",
+    "group split": "    runs-on:\n      group: pr-tier\n      labels: [self-hosted, ephemeral]\n",
+}
+
+# The allow rows R2 keeps open under #9455 (ruling abf38892 section 7).
+R2_ROWS = (
+    ("ci.yml", "check"),
+    ("cert-postgres-age.yml", "cert-postgres-age"),
+    ("postgres-ignored.yml", "postgres-ignored"),
+    ("session-boot-lifetime.yml", "lifetime-tests"),
+)
 
 # Shell text -> runs pull-request code (fail closed on everything unknown).
 SHELL_CASES = (
@@ -632,7 +731,7 @@ class SyntheticCorpusVerdicts(unittest.TestCase):
         _need_module(self)
         result = _scan({SYNTH: WF_HOST_CREDENTIAL})
         got = {(v.job, v.step, v.klass) for v in result.violations}
-        self.assertEqual(got, {("host", "Build", "iv"), ("host", "Read url", "i"), ("host", "Read pgpass", "i")})
+        self.assertEqual(got, {("host", R2_STEP, "iv"), ("host", "Read url", "i"), ("host", "Read pgpass", "i")})
         self.assertEqual(result.verdicts[(SYNTH, "hosted")], "clean")
 
     def test_9452_host_credential_path_forms(self) -> None:
@@ -671,7 +770,7 @@ class SyntheticCorpusVerdicts(unittest.TestCase):
     def test_9452_matrix_leg_on_a_persistent_runner_is_class_iv(self) -> None:
         _need_module(self)
         result = _scan({SYNTH: WF_MATRIX})
-        self.assertEqual({(v.step, v.klass) for v in result.violations}, {("Build", "iv")})
+        self.assertEqual({(v.step, v.klass) for v in result.violations}, {(R2_STEP, "iv")})
 
 
 class FailClosed(unittest.TestCase):
@@ -772,7 +871,8 @@ class Indirection(unittest.TestCase):
         _need_module(self)
         result = _scan({SYNTH: WF_CALLER, "inner.yml": WF_INNER})
         got = {(v.workflow, v.job, v.step, v.klass) for v in result.violations}
-        self.assertIn((SYNTH, "call > inner-job", "Inner build", "iv"), got)
+        self.assertIn((SYNTH, "call > inner-job", R2_STEP, "iv"), got)
+        self.assertIn(("inner.yml", "inner-job", R2_STEP, "iv"), got)
 
     def test_9452_reusable_workflow_outside_the_repository_is_a_failure(self) -> None:
         _need_module(self)
@@ -787,7 +887,7 @@ class AllowTable(unittest.TestCase):
     ROW = None
 
     def rows(self) -> tuple:
-        return (tb.AllowRow(SYNTH, "class-iv", "Build", ("iv",), 9455),)
+        return (tb.AllowRow(SYNTH, "class-iv", R2_STEP, ("iv",), RUNNER_ISSUE),)
 
     def test_9452_allowed_violation_passes_and_unallowed_fails(self) -> None:
         _need_module(self)
@@ -796,21 +896,21 @@ class AllowTable(unittest.TestCase):
         self.assertEqual(tb.check(result, allow=self.rows(), pin=1), [])
         problems = tb.check(result, allow=(), pin=0)
         self.assertEqual(len(problems), 1)
-        self.assertTrue(problems[0].startswith("violation class (iv) without an allow row: synthetic.yml/class-iv/Build"))
+        self.assertTrue(problems[0].startswith(f"violation class (iv) without an allow row: synthetic.yml/class-iv/{R2_STEP}: "))
 
     def test_9452_row_without_issue_is_a_failure(self) -> None:
         _need_module(self)
         result = _scan({SYNTH: HEADER + JOB_CLASS_IV})
-        rows = (tb.AllowRow(SYNTH, "class-iv", "Build", ("iv",), None),)
+        rows = (tb.AllowRow(SYNTH, "class-iv", R2_STEP, ("iv",), None),)
         self.assertEqual(tb.check(result, allow=rows, pin=1),
-                         ["allow row without an open issue: synthetic.yml/class-iv/Build"])
+                         [f"allow row without an open issue: synthetic.yml/class-iv/{R2_STEP}"])
 
     def test_9452_stale_row_is_a_failure(self) -> None:
         _need_module(self)
         result = _scan({SYNTH: HEADER + JOB_CLEAN_GITHUB_HOSTED})
-        rows = (tb.AllowRow(SYNTH, "clean-hosted", "Build", ("iv",), 9455),)
+        rows = (tb.AllowRow(SYNTH, "clean-hosted", R2_STEP, ("iv",), RUNNER_ISSUE),)
         self.assertEqual(tb.check(result, allow=rows, pin=1),
-                         ["stale allow row (no longer violates class iv): synthetic.yml/clean-hosted/Build"])
+                         [f"stale allow row (no longer violates class iv): synthetic.yml/clean-hosted/{R2_STEP}"])
 
     def test_9452_row_count_differs_from_pin_is_a_failure(self) -> None:
         _need_module(self)
@@ -833,42 +933,85 @@ class AllowTable(unittest.TestCase):
         ])
 
 
-class PersistentRunnerBoundary(unittest.TestCase):
-    """The (iv) rule reads the OS boundary facts of #9455, never a path split (vote T-4)."""
+class PersistentRunnerTrustedTrigger(unittest.TestCase):
+    """R2: a job that can run on a persistent self-hosted runner has no trusted trigger."""
 
-    def verdict(self, facts: dict[str, object] | None, files: frozenset[str]) -> str:
-        patch = {PERSISTENT_LABEL: facts} if facts is not None else {}
-        with mock.patch.dict(tb.RUNNER_BOUNDARY_FACTS, patch, clear=True):
-            result = _scan({SYNTH: HEADER + JOB_CLASS_IV}, repo_files=files)
-        return result.verdicts[(SYNTH, "class-iv")]
-
-    def test_9452_no_boundary_facts_means_class_iv(self) -> None:
+    def test_9452_r2_runs_on_form_by_trigger_set_table(self) -> None:
         _need_module(self)
-        self.assertEqual(self.verdict(None, frozenset()), "iv")
+        for form, (runs_on, expected) in R2_RUNS_ON_FORMS.items():
+            for trigger, (on_block, trusted, hosted_verdict) in R2_TRIGGER_SETS.items():
+                with self.subTest(form=form, trigger=trigger):
+                    result = _scan({SYNTH: r2_workflow(on_block, runs_on)})
+                    verdict = result.verdicts[(SYNTH, R2_JOB_ID)]
+                    got = {(v.job, v.step, v.klass, v.detail) for v in result.violations}
+                    if expected not in (HOSTED, PERSISTENT):
+                        self.assertEqual(verdict, "unclassifiable")
+                        self.assertEqual(len(result.unclassifiable), 1, result.unclassifiable)
+                        self.assertIn(expected, result.unclassifiable[0])
+                        self.assertEqual(got, set())
+                    elif expected == PERSISTENT and trusted:
+                        self.assertEqual(result.unclassifiable, [])
+                        self.assertEqual(verdict, CLASS_IV)
+                        self.assertEqual(got, {(R2_JOB_ID, R2_STEP, CLASS_IV,
+                                                R2_DETAIL.format(events=", ".join(trusted)))})
+                    else:
+                        self.assertEqual(result.unclassifiable, [])
+                        self.assertEqual(verdict, hosted_verdict)
+                        self.assertEqual(got, set())
 
-    def test_9452_full_boundary_facts_with_proof_test_clear_class_iv(self) -> None:
+    def test_9452_r2_unknown_runs_on_form_is_a_problem_never_clean(self) -> None:
         _need_module(self)
-        self.assertEqual(self.verdict(BOUNDARY_FACTS_FULL, frozenset({BOUNDARY_PROOF})), "clean")
+        for form, (runs_on, expected) in R2_RUNS_ON_FORMS.items():
+            if expected in (HOSTED, PERSISTENT):
+                continue
+            for trigger, (on_block, _, _) in R2_TRIGGER_SETS.items():
+                with self.subTest(form=form, trigger=trigger):
+                    problems = tb.check(_scan({SYNTH: r2_workflow(on_block, runs_on)}), allow=(), pin=0)
+                    self.assertEqual(len(problems), 1, problems)
+                    self.assertTrue(problems[0].startswith(f"unclassifiable: {SYNTH}/{R2_JOB_ID}: "), problems)
 
-    def test_9452_path_split_on_one_os_user_does_not_clear_class_iv(self) -> None:
+    def test_9452_r2_split_of_a_hit_job_stays_class_iv(self) -> None:
         _need_module(self)
-        same_user = dict(BOUNDARY_FACTS_FULL, trusted_user="ci-pr")
-        self.assertEqual(self.verdict(same_user, frozenset({BOUNDARY_PROOF})), "iv")
+        workflows, actions, files = _real()
+        self.assertIn(HIT_RUNS_ON, workflows[HIT_WORKFLOW])
+        for split, replacement in HIT_SPLITS.items():
+            with self.subTest(split=split):
+                text = workflows[HIT_WORKFLOW].replace(HIT_RUNS_ON, replacement, 1)
+                self.assertNotEqual(text, workflows[HIT_WORKFLOW])
+                result = tb.scan_texts(dict(workflows, **{HIT_WORKFLOW: text}), actions, files)
+                self.assertEqual(result.unclassifiable, [])
+                self.assertIn(CLASS_IV, result.verdicts[(HIT_WORKFLOW, HIT_JOB)].split(","))
+                got = {(v.step, v.klass, v.detail) for v in result.violations
+                       if (v.workflow, v.job) == (HIT_WORKFLOW, HIT_JOB) and v.klass == CLASS_IV}
+                self.assertEqual(got, {(R2_STEP, CLASS_IV,
+                                        R2_DETAIL.format(events="push, workflow_dispatch"))})
 
-    def test_9452_each_missing_boundary_fact_keeps_class_iv(self) -> None:
+    def test_9452_r2_reads_no_host_fact_contract(self) -> None:
         _need_module(self)
-        for key in tb.BOUNDARY_REQUIRED_TRUE:
-            with self.subTest(fact=key):
-                facts = dict(BOUNDARY_FACTS_FULL, **{key: False})
-                self.assertEqual(self.verdict(facts, frozenset({BOUNDARY_PROOF})), "iv")
+        for name in ("RUNNER_BOUNDARY_FACTS", "BOUNDARY_REQUIRED_TRUE", "_boundary_holds"):
+            with self.subTest(name=name):
+                self.assertFalse(hasattr(tb, name), name)
 
-    def test_9452_boundary_facts_without_the_proof_test_keep_class_iv(self) -> None:
+    def test_9452_r2_real_rows_stay_open_under_the_runner_issue(self) -> None:
         _need_module(self)
-        self.assertEqual(self.verdict(BOUNDARY_FACTS_FULL, frozenset()), "iv")
+        workflows, actions, files = _real()
+        result = tb.scan_texts(workflows, actions, files)
+        rows = {(r.workflow, r.job): r for r in tb.TAINT_ALLOW if r.step == R2_STEP}
+        self.assertEqual(set(rows), set(R2_ROWS))
+        for key in R2_ROWS:
+            with self.subTest(job=key):
+                self.assertEqual(rows[key].classes, (CLASS_IV,))
+                self.assertEqual(rows[key].issue, RUNNER_ISSUE)
+                self.assertIn(CLASS_IV, result.verdicts[key].split(","))
+        self.assertEqual(result.verdicts[("session-boot-lifetime.yml", "lifetime-tests")], CLASS_IV)
 
-    def test_9452_real_boundary_facts_are_empty_until_the_fix_lands(self) -> None:
+    def test_9452_r2_stale_row_for_a_gone_job_is_a_failure(self) -> None:
         _need_module(self)
-        self.assertEqual(tb.RUNNER_BOUNDARY_FACTS, {})
+        result = _scan({SYNTH: HEADER + JOB_CLASS_IV})
+        rows = (tb.AllowRow(SYNTH, "class-iv", R2_STEP, (CLASS_IV,), RUNNER_ISSUE),
+                tb.AllowRow(SYNTH, "gone-job", R2_STEP, (CLASS_IV,), RUNNER_ISSUE))
+        self.assertEqual(tb.check(result, allow=rows, pin=2),
+                         [f"stale allow row (no longer violates class iv): {SYNTH}/gone-job/{R2_STEP}"])
 
 
 class ShellClassifier(unittest.TestCase):
@@ -943,7 +1086,10 @@ class RealWorkflows(unittest.TestCase):
         _need_module(self)
         for row in tb.TAINT_ALLOW:
             with self.subTest(row=row):
-                self.assertIsInstance(_real_step(row.workflow, row.job, row.step), dict)
+                if row.step == R2_STEP:
+                    self.assertIn("runs-on", _real_job(row.workflow, row.job))
+                else:
+                    self.assertIsInstance(_real_step(row.workflow, row.job, row.step), dict)
 
     def test_9452_real_trusted_classify_step_runs_no_pr_code(self) -> None:
         _need_module(self)
@@ -988,6 +1134,7 @@ class RealWorkflows(unittest.TestCase):
             ("ci.yml", "check"): "i,iv",
             ("cert-postgres-age.yml", "cert-postgres-age"): "i,iv",
             ("postgres-ignored.yml", "postgres-ignored"): "i,iv",
+            ("session-boot-lifetime.yml", "lifetime-tests"): "iv",
         })
 
     @unittest.skipUnless(pyyaml is not None, "PyYAML not installed: parity oracle skipped")
