@@ -106,6 +106,15 @@ const TARGET_NOT_OWNED_FOR_MUTATION: &str =
 /// #1929 — refusal when the caller cannot even SEE the link target.
 const TARGET_NOT_VISIBLE: &str = "caller cannot see the link target";
 
+/// #9466 sibling — refusal when the SOURCE row exists but cannot be read.
+/// A failed read is never folded into "no source row" (which skipped the
+/// #1786 source-owner gate and the quota charge).
+const SOURCE_LOOKUP_FAILED: &str = "memory_link source lookup failed";
+
+/// #9466 sibling — refusal when the TARGET row exists but cannot be read
+/// (pre-fix the #1929 target gate was skipped on a read error).
+const TARGET_LOOKUP_FAILED: &str = "memory_link target lookup failed";
+
 pub(super) fn handle_link(
     conn: &rusqlite::Connection,
     db_path: &Path,
@@ -269,7 +278,9 @@ pub(super) fn handle_link(
     // the link is charged against the correct per-namespace
     // accounting row. Falls back to `_global` (the v50 backwards-compat
     // sentinel) when the source memory can't be resolved.
-    let link_owner = db::get(conn, source_id).ok().flatten();
+    // #9466 sibling — a FAILED read is an error, never "no source row".
+    let link_owner =
+        db::get(conn, source_id).map_err(|e| format!("{SOURCE_LOOKUP_FAILED}: {e}"))?;
     let link_agent_id = link_owner.as_ref().and_then(|mem| {
         mem.metadata
             .get(param_names::AGENT_ID)
@@ -311,7 +322,11 @@ pub(super) fn handle_link(
         // (`supersedes`) the caller must OWN the target; for any other
         // relation it must at least be able to SEE it. A missing target is
         // left to `db::create_link_signed`'s FK error (more actionable).
-        if let Some(tgt) = db::get(conn, target_id).ok().flatten() {
+        // #9466 sibling — a FAILED target read refuses; it is never "no
+        // target row" (which skipped this gate).
+        let target_mem =
+            db::get(conn, target_id).map_err(|e| format!("{TARGET_LOOKUP_FAILED}: {e}"))?;
+        if let Some(tgt) = target_mem {
             if relation == SUPERSEDES {
                 if !crate::visibility::caller_owns_for_mutation(
                     &tgt,
@@ -1177,6 +1192,87 @@ mod tests {
             )
             .unwrap_or(-1);
         assert_eq!(inval, 0, "no cross-tenant invalidation write may occur");
+    }
+
+    /// Store a row's `tags` as a BLOB so `db::get` fails decoding it (a real
+    /// read error on a row that exists).
+    fn corrupt_row_9466(conn: &rusqlite::Connection, id: &str) {
+        let changed = conn
+            .execute(
+                "UPDATE memories SET tags = X'00' WHERE id = ?1",
+                rusqlite::params![id],
+            )
+            .unwrap();
+        assert_eq!(changed, 1);
+        assert!(db::get(conn, id).is_err(), "the row must give a read error");
+    }
+
+    fn link_count_9466(conn: &rusqlite::Connection, src: &str, tgt: &str) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM memory_links WHERE source_id = ?1 AND target_id = ?2",
+            [src, tgt],
+            |r| r.get(0),
+        )
+        .unwrap_or(-1)
+    }
+
+    /// #9466 sibling (#1929 target gate) — a failed TARGET read refuses
+    /// with the named lookup error and creates no edge. Pre-fix the read
+    /// error was folded into "no target row" and the owner gate skipped.
+    #[test]
+    fn link_target_read_error_refuses_9466() {
+        let _envg = crate::identity::agent_id_env_test_lock();
+        let conn = fresh_conn();
+        let mut src = make_reflection("attacker-src-9466", "attacker-ns");
+        src.metadata = json!({"agent_id": "ai:attacker"});
+        let mut tgt = make_reflection("victim-tgt-9466", "victim-ns");
+        tgt.metadata = json!({"agent_id": "ai:victim"});
+        let src_id = db::insert(&conn, &src).unwrap();
+        let tgt_id = db::insert(&conn, &tgt).unwrap();
+        corrupt_row_9466(&conn, &tgt_id);
+        unsafe { std::env::set_var("AI_MEMORY_AGENT_ID", "ai:attacker") };
+        let res = handle_link(
+            &conn,
+            &db_path(),
+            &json!({"source_id": src_id, "target_id": tgt_id, "relation": SUPERSEDES, "agent_id": "ai:attacker"}),
+            None,
+        );
+        unsafe { std::env::remove_var("AI_MEMORY_AGENT_ID") };
+        let err = res.expect_err("a failed target read must refuse");
+        assert!(
+            err.starts_with(&format!("{TARGET_LOOKUP_FAILED}: ")),
+            "expected the named target lookup error, got: {err}"
+        );
+        assert_eq!(link_count_9466(&conn, &src_id, &tgt_id), 0);
+    }
+
+    /// #9466 sibling (#1786 source gate) — a failed SOURCE read refuses with
+    /// the named lookup error and creates no edge.
+    #[test]
+    fn link_source_read_error_refuses_9466() {
+        let _envg = crate::identity::agent_id_env_test_lock();
+        let conn = fresh_conn();
+        let mut src = make_reflection("victim-src-9466", "victim-ns");
+        src.metadata = json!({"agent_id": "ai:victim"});
+        let mut tgt = make_reflection("attacker-tgt-9466", "attacker-ns");
+        tgt.metadata = json!({"agent_id": "ai:attacker"});
+        let src_id = db::insert(&conn, &src).unwrap();
+        let tgt_id = db::insert(&conn, &tgt).unwrap();
+        corrupt_row_9466(&conn, &src_id);
+        unsafe { std::env::set_var("AI_MEMORY_AGENT_ID", "ai:attacker") };
+        let res = handle_link(
+            &conn,
+            &db_path(),
+            &json!({"source_id": src_id, "target_id": tgt_id, "relation": "related_to", "agent_id": "ai:attacker"}),
+            None,
+        );
+        unsafe { std::env::remove_var("AI_MEMORY_AGENT_ID") };
+        let err = res.expect_err("a failed source read must refuse");
+        assert!(
+            err.starts_with(&format!("{SOURCE_LOOKUP_FAILED}: ")),
+            "expected the named source lookup error, got: {err}"
+        );
+        assert_eq!(link_count_9466(&conn, &src_id, &tgt_id), 0);
     }
 
     // Supersedes between an observation and a reflection skips the
