@@ -403,7 +403,17 @@ fn pre_v74_read_only_open_is_refused_before_any_provenance_read() {
 
 // ---- #9496: the classifier names only the cause it read (invariant B) -----
 
-const ROOT_NO_SUCH_GENESIS: &str = "no such column: cid_genesis";
+const ROOT_NO_SUCH_GENESIS: &str =
+    "no such column: cid_genesis in SELECT cid_genesis FROM memories WHERE id = ?1 at offset 7";
+const ROOT_NO_SUCH_MEMORIES: &str = "no such table: memories";
+/// The SQLite result code under every prepare failure above.
+const ROOT_SQLITE_CODE_1: &str = "Error code 1: SQL error or missing database";
+
+/// The causes below the top message: the rusqlite error, then its code
+/// (ERRORS-11: kept as `source()`, not rendered into the top text).
+fn causes(err: &anyhow::Error) -> Vec<String> {
+    err.chain().skip(1).map(ToString::to_string).collect()
+}
 
 /// A REAL v73 store (stamp row = 73): the pre-v74 text, unchanged.
 #[test]
@@ -413,7 +423,7 @@ fn genesis_missing_column_on_real_v73_stamp_is_pre_v74_error() {
     assert_eq!(read_stamp(&conn), PRE_V74_STAMP);
     let err = db::read_cid_genesis(&conn, CHILD_ID).expect_err("missing column is an error");
     assert_eq!(err.to_string(), ERR_GENESIS_COLUMN_MISSING);
-    assert_eq!(err.root_cause().to_string(), ROOT_NO_SUCH_GENESIS);
+    assert_eq!(causes(&err), [ROOT_NO_SUCH_GENESIS, ROOT_SQLITE_CODE_1]);
 }
 
 /// Stamp at the tip (>= v74) with the column gone: a DISTINCT error that does
@@ -437,7 +447,7 @@ fn genesis_missing_column_at_current_stamp_is_distinct_not_migrate() {
         )
     );
     assert!(!err.to_string().contains("migrate"), "no migrate advice");
-    assert_eq!(err.root_cause().to_string(), ROOT_NO_SUCH_GENESIS);
+    assert_eq!(causes(&err), [ROOT_NO_SUCH_GENESIS, ROOT_SQLITE_CODE_1]);
 }
 
 /// Exactly v74 is already "has the column": the boundary is `>=`, not `>`.
@@ -515,7 +525,7 @@ fn genesis_with_no_memories_table_is_own_error() {
         "provenance read of memories.cid_genesis failed: the memories table does not exist in \
          this database. Check the database path."
     );
-    assert_eq!(err.root_cause().to_string(), "no such table: memories");
+    assert_eq!(causes(&err), [ROOT_NO_SUCH_MEMORIES, ROOT_SQLITE_CODE_1]);
 }
 
 /// Security M7 / code M7: `read_memory_cid` (the `memories.cid` read in front
@@ -607,12 +617,12 @@ async fn store_verify_unreadable_genesis_is_err_not_unverified() {
     let path = seeded_verify_db("store_verify_unreadable", Some(UNREADABLE_TEXT_SQL));
     let store = SqliteStore::open(&path).expect("open store");
     let err = store
-        .verify(&CallerContext::for_agent("alice"), CHILD_ID)
+        .verify(&CallerContext::for_agent("ai:test@host"), CHILD_ID)
         .await
         .expect_err("an unreadable genesis must fail verify");
     assert_eq!(
         err.to_string(),
-        format!("backend unavailable: {ERR_GENESIS_TEXT}")
+        format!("underlying backend error: {ERR_GENESIS_TEXT}")
     );
 }
 
@@ -743,5 +753,113 @@ mod pg_twin {
         run_consolidate(&store, &ids, &ns)
             .await
             .expect("NULL source cids consolidate cleanly");
+    }
+
+    // ---- #9484 PostgreSQL twin: the lineage guard's created_at read -------
+
+    /// The PG column is TIMESTAMPTZ, so each unparsable text is refused at
+    /// write with the database's own named reason; it can never reach the
+    /// guard as "not forward".
+    const PG_UNPARSABLE_CREATED_AT: &[(&str, &str)] = &[
+        (
+            "",
+            "error returned from database: invalid input syntax for type timestamp with time zone: \"\"",
+        ),
+        (
+            "not-a-timestamp",
+            "error returned from database: invalid input syntax for type timestamp with time zone: \"not-a-timestamp\"",
+        ),
+        (
+            "2026-13-40T00:00:00Z",
+            "error returned from database: date/time field value out of range: \"2026-13-40T00:00:00Z\"",
+        ),
+    ];
+    /// The only way an unparsable created_at reaches the PG guard: the column
+    /// itself no longer decodes as a timestamp.
+    const PG_TEXT_CREATED_AT_SQL: &str = "ALTER TABLE memories ALTER COLUMN created_at DROP DEFAULT, \
+         ALTER COLUMN created_at TYPE text USING 'not-a-timestamp'";
+    const ERR_PG_GUARD_CREATED_AT: &str = "backend unavailable: postgres: lineage guard created_at fetch: error occurred while decoding column 1: mismatched types; Rust type `chrono::datetime::DateTime<chrono::offset::utc::Utc>` (as SQL type `TIMESTAMPTZ`) is not compatible with SQL type `TEXT`";
+    const COUNT_LINKS_SQL: &str = "SELECT count(*) FROM memory_links";
+
+    fn lineage_link(source: &str, target: &str) -> ai_memory::models::MemoryLink {
+        ai_memory::models::MemoryLink {
+            source_id: source.to_string(),
+            target_id: target.to_string(),
+            relation: ai_memory::models::MemoryLinkRelation::DerivedFrom,
+            created_at: super::NEWER_STAMP.to_string(),
+            valid_from: None,
+            valid_until: None,
+            observed_by: None,
+            signature: None,
+            attest_level: None,
+            source_cid: None,
+            target_cid: None,
+        }
+    }
+
+    async fn link_rows(store: &PostgresStore) -> i64 {
+        let (n,): (i64,) = sqlx::query_as(COUNT_LINKS_SQL)
+            .fetch_one(store.pool())
+            .await
+            .expect("count links");
+        n
+    }
+
+    /// Run `body` on its own runtime with the lineage flag on, holding the
+    /// flag lock outside any `.await` (CONCURRENCY-20).
+    fn with_lineage_flag<F: std::future::Future<Output = ()>>(body: F) {
+        let _g = super::flag_guard();
+        ai_memory::config::set_lineage_dag(true);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(body);
+        ai_memory::config::set_lineage_dag(false);
+    }
+
+    #[test]
+    fn pg_unparsable_created_at_is_refused_at_write_with_a_named_reason() {
+        let Ok(url) = std::env::var("AI_MEMORY_TEST_POSTGRES_URL") else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        with_lineage_flag(async move {
+            let (_scratch, store, ids, _ns) = seeded(&url).await;
+            for (value, reason) in PG_UNPARSABLE_CREATED_AT {
+                let sql = format!("UPDATE memories SET created_at = '{value}' WHERE id = $1");
+                let err = sqlx::query(&sql)
+                    .bind(&ids[0])
+                    .execute(store.pool())
+                    .await
+                    .expect_err("an unparsable created_at must not be stored");
+                assert_eq!(err.to_string(), *reason, "value {value:?}");
+            }
+            assert_eq!(link_rows(&store).await, 0);
+        });
+    }
+
+    #[test]
+    fn pg_undecodable_created_at_is_err_and_writes_no_row() {
+        let Ok(url) = std::env::var("AI_MEMORY_TEST_POSTGRES_URL") else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        with_lineage_flag(async move {
+            let (_scratch, store, ids, _ns) = seeded(&url).await;
+            sqlx::query(PG_TEXT_CREATED_AT_SQL)
+                .execute(store.pool())
+                .await
+                .expect("turn created_at into undecodable text");
+            let err = store
+                .link(
+                    &CallerContext::for_agent(AGENT),
+                    &lineage_link(&ids[0], &ids[1]),
+                )
+                .await
+                .expect_err("an undecodable created_at must stop the link");
+            assert_eq!(err.to_string(), ERR_PG_GUARD_CREATED_AT);
+            assert_eq!(link_rows(&store).await, 0, "no link row on a stopped write");
+        });
     }
 }
