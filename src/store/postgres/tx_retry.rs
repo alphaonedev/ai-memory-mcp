@@ -628,7 +628,7 @@ mod tests {
         .expect("create scratch relations");
 
         let mut observed_retry = false;
-        let mut total_attempts = 0_u32;
+        let total_attempts: u32;
         // ONE provocation, built in a fixed order (see the doc comment).
         {
             let before = retries_total();
