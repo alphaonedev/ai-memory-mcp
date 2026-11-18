@@ -16,9 +16,21 @@ decision: own stdlib subset parser over PyYAML because the lane binds the standa
 and any YAML form outside the subset must fail closed rather than parse loosely.
 decision: violations are keyed by step label (name, else ``id:<id>``, else ``uses:`` or
 ``run#<n>``) over line numbers because a row must survive unrelated edits.
-decision: the rule for persistent runner state reads the OS boundary facts of
-``RUNNER_BOUNDARY_FACTS`` (issue #9455) over any path layout, because a path split on one
-OS user is not a boundary (3-agent vote (71472661), condition T-4).
+decision: the persistent-runner rule of (iv) is R2 (ruling abf38892 section 7), read from
+the workflow files alone, over declared host facts, because a fact table is a claim about a
+host the classifier cannot check: a job whose ``runs-on`` can resolve to a runner that is
+not provably GitHub-hosted (a literal or custom label, a list, a group, a matrix value, an
+expression or a reusable-workflow input) has no trusted trigger. No environment variable,
+path form, cache-directory name or runner label clears it; an unknown ``runs-on`` form is a
+failure. ``RUNNER_BOUNDARY_FACTS`` stays empty and unread until the fix of issue #9455
+names its keys (ruling 8b8cede8).
+decision: every known trigger except ``pull_request`` counts as trusted for R2 over the
+four the ruling names, because ``pull_request_target``, ``workflow_call``, ``release`` and
+``repository_dispatch`` all run with trusted context and a trigger added later must fail
+closed.
+
+Limits: detection of a credential resident on a self-hosted host covers literal paths in
+a step's text only; every other form rests on the runner boundary of issue #9455.
 
 Usage: python3 scripts/ci/taint_boundary.py [--repo PATH] [--verdicts]
 Exit codes: 0 no problem, 1 problems found, 2 usage error.
@@ -52,6 +64,13 @@ PR_EVENTS = PR_CODE_EVENTS | {"pull_request_target"}
 TRUSTED_EVENTS = frozenset({"push", "schedule", "workflow_dispatch", "release", "repository_dispatch"})
 CALL_EVENT = "workflow_call"
 KNOWN_EVENTS = PR_EVENTS | TRUSTED_EVENTS | {CALL_EVENT}
+# R2: a run of any of these on a persistent runner is a trusted run (fail closed).
+R2_UNTRUSTED_EVENTS = frozenset({"pull_request"})
+R2_TRUSTED_EVENTS = KNOWN_EVENTS - R2_UNTRUSTED_EVENTS
+# The step key of an R2 violation: the job's runs-on, not one of its steps.
+R2_STEP_LABEL = "runs-on"
+R2_DETAIL = "job can run on a runner not provably GitHub-hosted and has a trusted trigger: {events}"
+HOST_CREDENTIAL_DETAIL = "a credential resident on a self-hosted host read after pull-request code ran"
 
 TRUSTED_CHECKOUT_REFS = frozenset({"${{ github.event.pull_request.base.sha }}"})
 CHECKOUT_ACTION = "actions/checkout"
@@ -113,8 +132,8 @@ BASE_MATERIALISE_RE = re.compile(r"\bgit\s+(?:--?\S+\s+)*show\b|\bgit\(\s*\"show
 #  - the runner host's container socket and a local database superuser.
 # Limits: a path assembled from variables that never spells the home prefix and the name in
 # one place, a credential held in the runner service's own environment, and an absolute
-# `/home/<user>/` path are not seen; the OS boundary facts of #9455
-# (trusted_home_credentials_unreadable) remain the structural answer for those.
+# `/home/<user>/` path are not seen; the runner boundary of #9455 is the structural
+# answer for those.
 HOST_CREDENTIAL_RE = re.compile(
     r"(?:\$\{?HOME\}?|~)/\.(?:"
     r"(?:pgpass|netrc|git-credentials|ssh|aws|kube|gnupg|docker/config\.json|config/(?:gh|copr|git/credentials))\b"
@@ -128,14 +147,9 @@ HOST_CREDENTIAL_RE = re.compile(
 ENV_FILE_WRITE_RE = re.compile(r"\$\{?(?:GITHUB_ENV|GITHUB_PATH)\b")
 
 
-# Persistent-runner OS boundary facts (issue #9455, 3-agent vote (71472661) T-1/T-4). A
-# runner label is a boundary only when the pull-request tier runs as its own OS user that
-# cannot write any trusted path, and a test in the repository proves the permission error
-# on each. Until the fix lands no label has facts, so a tainted self-hosted job is (iv).
+# Runner boundary facts of issue #9455 (ruling 8b8cede8): kept empty; its keys come with the
+# 9455 fix. No verdict reads it: class (iv) is R2, read from the workflow files.
 RUNNER_BOUNDARY_FACTS: dict[str, dict[str, object]] = {}
-BOUNDARY_REQUIRED_TRUE = ("trusted_root_unwritable", "trusted_cargo_home_unwritable",
-                          "trusted_rustup_toolchains_unwritable", "trusted_path_entries_unwritable",
-                          "trusted_home_credentials_unreadable")
 
 
 @dataclass(frozen=True)
@@ -149,21 +163,22 @@ class AllowRow:
     issue: int | None
 
 
-# The six hits of the survey at a028c45e plus the six host-credential reads. Removing a row is the fix lane's job; adding a
+# The six hits of the survey at a028c45e, the six host-credential reads and the R2 row of
+# lifetime-tests (ruling abf38892 section 7). Removing a row is the fix lane's job; adding a
 # row needs an issue number from the deputy (the pin moves with it).
 TAINT_ALLOW: tuple[AllowRow, ...] = (
     AllowRow("ci.yml", "classify", "id:impact", (CLASS_GATE_OUTPUT,), 9454),
     AllowRow("c8-precheck.yml", "required-contexts-gate",
              # The workflow name runs into a YAML comment at ` #`; the label is the parsed name.
              "Declared-vs-live required-context drift (#3554 /", (CLASS_SECRET,), 9454),
-    AllowRow("ci.yml", "check", "Prune stale runner TMPDIR (#8634)", (CLASS_PERSISTENT_STATE,), 9455),
-    AllowRow("cert-postgres-age.yml", "cert-postgres-age", "Prune stale runner TMPDIR (#8634)",
-             (CLASS_PERSISTENT_STATE,), 9455),
-    AllowRow("postgres-ignored.yml", "postgres-ignored", "Prune stale runner TMPDIR (#8634)",
-             (CLASS_PERSISTENT_STATE,), 9455),
+    # R2: these jobs can run on a persistent self-hosted runner and have a trusted trigger.
+    AllowRow("ci.yml", "check", R2_STEP_LABEL, (CLASS_PERSISTENT_STATE,), 9455),
+    AllowRow("cert-postgres-age.yml", "cert-postgres-age", R2_STEP_LABEL, (CLASS_PERSISTENT_STATE,), 9455),
+    AllowRow("postgres-ignored.yml", "postgres-ignored", R2_STEP_LABEL, (CLASS_PERSISTENT_STATE,), 9455),
+    AllowRow("session-boot-lifetime.yml", "lifetime-tests", R2_STEP_LABEL, (CLASS_PERSISTENT_STATE,), 9455),
     AllowRow("coverage.yml", "per-module-thresholds", "Post coverage to PR (sticky) (#1993)",
              (CLASS_WRITE_TOKEN, CLASS_SECRET), 9456),
-    # Ruling 04701c74: a host-resident credential read after pull-request code is (i); the
+    # Ruling 04701c74: a credential resident on a self-hosted host read after pull-request code is (i); the
     # per-run pull-request-tier credential lands under #9455.
     AllowRow("ci.yml", "check", "Configure enterprise-fed tier (per-job ephemeral db, enterprise-fed legs only)",
              (CLASS_SECRET,), 9455),
@@ -175,7 +190,7 @@ TAINT_ALLOW: tuple[AllowRow, ...] = (
              (CLASS_SECRET,), 9455),
     AllowRow("postgres-ignored.yml", "postgres-ignored", "Cleanup enterprise-fed ephemeral db", (CLASS_SECRET,), 9455),
 )
-TAINT_ALLOW_PIN = 12
+TAINT_ALLOW_PIN = 13
 
 
 class Unclassifiable(Exception):
@@ -1181,16 +1196,30 @@ def _runs_on_legs(job: dict[str, object], label: str) -> list[tuple[str, ...]]:
     raw = job.get("runs-on")
     matrix = (job.get("strategy") or {}).get("matrix") if isinstance(job.get("strategy"), dict) else None
 
+    def checked(labels: tuple[str, ...]) -> tuple[str, ...]:
+        for lab in labels:
+            if not lab.strip():
+                raise Unclassifiable(f"{label}: empty runs-on label")
+            try:
+                _expr_free(lab)
+            except Unclassifiable as exc:
+                raise Unclassifiable(f"{label}: runs-on {exc}") from exc
+        return labels
+
     def as_labels(value: object) -> tuple[str, ...]:
         if isinstance(value, str):
-            return (value,)
+            return checked((value,))
         if isinstance(value, list) and value and all(isinstance(v, str) for v in value):
-            return tuple(value)
+            return checked(tuple(value))
         if isinstance(value, dict):
-            labels = value.get("labels")
-            if labels is None and isinstance(value.get("group"), str):
-                return ("group:" + value["group"],)
-            return as_labels(labels)
+            labels, group = value.get("labels"), value.get("group")
+            if group is not None and not (isinstance(group, str) and group.strip()):
+                raise Unclassifiable(f"{label}: runs-on group {group!r} outside the known forms")
+            # A runner group is never provably GitHub-hosted: its name stays in the leg.
+            group_leg = ("group:" + group,) if isinstance(group, str) else ()
+            if labels is None and group_leg:
+                return group_leg
+            return as_labels(labels) + group_leg
         raise Unclassifiable(f"{label}: runs-on value {value!r} outside the known forms")
 
     if isinstance(raw, str):
@@ -1218,39 +1247,24 @@ def _runs_on_legs(job: dict[str, object], label: str) -> list[tuple[str, ...]]:
                         raise Unclassifiable(f"{label}: fromJSON matrix value is not JSON") from exc
                 legs.append(as_labels(v))
             return legs
-        if "${{" in raw:
-            raise Unclassifiable(f"{label}: runs-on expression outside the known forms")
+        # Any other expression (an input, a variable, an event field) can name any runner:
+        # it is one opaque leg, never hosted, so R2 treats it as persistent.
     if raw is None:
         raise Unclassifiable(f"{label}: job without runs-on")
     return [as_labels(raw)]
 
 
-def _boundary_holds(label: str, repo_files: frozenset[str]) -> bool:
-    """The T-1 OS boundary facts for one runner label (issue #9455); paths never decide."""
-    facts = RUNNER_BOUNDARY_FACTS.get(label)
-    if not isinstance(facts, dict):
-        return False
-    pr_user, trusted_user = facts.get("pr_tier_user"), facts.get("trusted_user")
-    if not (isinstance(pr_user, str) and isinstance(trusted_user, str) and pr_user and trusted_user):
-        return False
-    if pr_user == trusted_user:
-        return False
-    if not all(facts.get(key) is True for key in BOUNDARY_REQUIRED_TRUE):
-        return False
-    proof = facts.get("proof_test")
-    return isinstance(proof, str) and proof in repo_files
-
-
 def _leg_hosted(leg: tuple[str, ...]) -> bool:
+    """True only when every label of the leg is a GitHub-hosted image label."""
     hosted = [lab for lab in leg if GITHUB_HOSTED_LABEL_RE.match(lab)]
     return bool(hosted) and len(hosted) == len(leg)
 
 
-def _leg_persistent(leg: tuple[str, ...], repo_files: frozenset[str]) -> bool:
-    hosted = [lab for lab in leg if GITHUB_HOSTED_LABEL_RE.match(lab)]
-    if hosted and len(hosted) == len(leg):
-        return False
-    return not any(_boundary_holds(lab, repo_files) for lab in leg if lab != "self-hosted")
+def _r2_trusted(legs: list[tuple[str, ...]], job_events: set[str]) -> list[str]:
+    """R2: the trusted triggers of a job that can run on a runner not provably hosted."""
+    if all(_leg_hosted(leg) for leg in legs):
+        return []
+    return sorted(job_events & R2_TRUSTED_EVENTS)
 
 
 def _action_name(uses: str) -> str:
@@ -1366,14 +1380,21 @@ def _host_credential_in(step: dict[str, object]) -> bool:
 
 
 def _analyse_job(wf: str, job_id: str, job: dict[str, object], doc: dict[str, object], events: set[str],
-                 actions: dict[str, str], repo_files: frozenset[str], downloads: bool,
-                 result: ScanResult) -> str:
+                 actions: dict[str, str], downloads: bool, result: ScanResult) -> str:
     label = f"{wf}/{job_id}"
     job_events = _job_events(job, events)
-    if not job_events & (PR_EVENTS | {CALL_EVENT}):
-        return "trusted-only"
-    perms = _permissions(job, doc, label)
+    # R2 holds for every job, trusted-only and base-tree jobs included; the runs-on form is
+    # parsed first so an unknown form is a failure whatever the triggers.
     legs = _runs_on_legs(job, label)
+    r2_events = _r2_trusted(legs, job_events)
+    r2 = Violation(wf, job_id, R2_STEP_LABEL, CLASS_PERSISTENT_STATE,
+                   R2_DETAIL.format(events=", ".join(r2_events))) if r2_events else None
+    if not job_events & (PR_EVENTS | {CALL_EVENT}):
+        if r2 is None:
+            return "trusted-only"
+        result.violations.append(r2)
+        return CLASS_PERSISTENT_STATE
+    perms = _permissions(job, doc, label)
     steps = _flatten_steps(job.get("steps"), actions, label)
     pr_tree = False
     materialised = False
@@ -1399,10 +1420,13 @@ def _analyse_job(wf: str, job_id: str, job: dict[str, object], doc: dict[str, ob
             taint = step
             break
     if taint is None:
-        return "no-pr-code"
+        if r2 is None:
+            return "no-pr-code"
+        result.violations.append(r2)
+        return CLASS_PERSISTENT_STATE
     result.taint_steps[(wf, job_id)] = taint.label
     after = [s for s in steps if s.index >= taint.index]
-    found: list[Violation] = []
+    found: list[Violation] = [r2] if r2 is not None else []
 
     def add(step: _Step, klass: str, detail: str) -> None:
         v = Violation(wf, job_id, step.label, klass, detail)
@@ -1427,9 +1451,9 @@ def _analyse_job(wf: str, job_id: str, job: dict[str, object], doc: dict[str, ob
             add(step, CLASS_SECRET, "secret or token used after pull-request code ran")
             token_users.append(step)
         # A GitHub-hosted VM is fresh per job and holds no resident credential; any other
-        # leg is a host that may. The boundary facts do not clear this: the step still reads.
+        # leg is a host that may.
         if host_resident and _host_credential_in(step.body):
-            add(step, CLASS_SECRET, "host-resident credential read after pull-request code ran")
+            add(step, CLASS_SECRET, HOST_CREDENTIAL_DETAIL)
     # (ii) a write token in a tainted job.
     if _has_write(perms):
         add(token_users[0] if token_users else taint, CLASS_WRITE_TOKEN, "job token has a write scope")
@@ -1446,9 +1470,7 @@ def _analyse_job(wf: str, job_id: str, job: dict[str, object], doc: dict[str, ob
                 add(ref, CLASS_GATE_OUTPUT, "job output set at or after pull-request code ran")
         if re.search(r"\benv\.", text):
             add(taint, CLASS_GATE_OUTPUT, "job output read from the environment of a tainted job")
-    # (iv) persistent state a trusted run later reads.
-    if any(_leg_persistent(leg, repo_files) for leg in legs):
-        add(taint, CLASS_PERSISTENT_STATE, "pull-request code runs on a persistent runner without the OS boundary")
+    # (iv) persistent state a trusted run later reads: R2 (added above) and artifacts.
     if downloads:
         for step in after:
             uses = step.body.get("uses")
@@ -1459,7 +1481,7 @@ def _analyse_job(wf: str, job_id: str, job: dict[str, object], doc: dict[str, ob
 
 
 def _analyse_workflow(name: str, text: str, workflows: dict[str, str], actions: dict[str, str],
-                      repo_files: frozenset[str], downloads: bool, result: ScanResult,
+                      downloads: bool, result: ScanResult,
                       caller_events: set[str] | None = None, prefix: str = "", depth: int = 0) -> None:
     if depth > MAX_INDIRECTION_DEPTH:
         raise Unclassifiable(f"{name}: reusable workflow nesting deeper than {MAX_INDIRECTION_DEPTH}")
@@ -1483,12 +1505,11 @@ def _analyse_workflow(name: str, text: str, workflows: dict[str, str], actions: 
                 if not m or m.group(1) not in workflows:
                     raise Unclassifiable(f"{name}/{job_id}: reusable workflow {uses!r} not found in this repository")
                 inner_prefix = f"{key[0]}/{key[1]} > "
-                _analyse_workflow(m.group(1), workflows[m.group(1)], workflows, actions, repo_files, downloads,
+                _analyse_workflow(m.group(1), workflows[m.group(1)], workflows, actions, downloads,
                                   result, _job_events(job, events), inner_prefix, depth + 1)
                 result.verdicts[key] = "reusable"
                 continue
-            result.verdicts[key] = _analyse_job(key[0], key[1], job, doc, events, actions, repo_files,
-                                                downloads, result)
+            result.verdicts[key] = _analyse_job(key[0], key[1], job, doc, events, actions, downloads, result)
         except Unclassifiable as exc:
             result.unclassifiable.append(str(exc))
             result.verdicts[key] = "unclassifiable"
@@ -1496,14 +1517,18 @@ def _analyse_workflow(name: str, text: str, workflows: dict[str, str], actions: 
 
 def scan_texts(workflows: dict[str, str], actions: dict[str, str] | None = None,
                repo_files: frozenset[str] | set[str] | None = None) -> ScanResult:
-    """Classify every job of every workflow given as text (name -> YAML); actions: dir -> YAML."""
+    """Classify every job of every workflow given as text (name -> YAML); actions: dir -> YAML.
+
+    ``repo_files`` is accepted for the callers and decides no verdict: R2 reads the workflow
+    files only (ruling 8b8cede8).
+    """
     actions = actions or {}
-    files = frozenset(repo_files or ())
+    del repo_files
     result = ScanResult()
     downloads = any(marker in text for text in workflows.values() for marker in DOWNLOAD_MARKERS)
     for name in sorted(workflows):
         try:
-            _analyse_workflow(name, workflows[name], workflows, actions, files, downloads, result)
+            _analyse_workflow(name, workflows[name], workflows, actions, downloads, result)
         except Unclassifiable as exc:
             result.unclassifiable.append(str(exc))
             result.verdicts[(name, "*")] = "unclassifiable"
