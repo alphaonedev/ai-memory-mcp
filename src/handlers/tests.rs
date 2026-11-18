@@ -897,6 +897,9 @@ async fn http_update_illegal_edge_rolls_the_content_patch_back_3152() {
 
 use tests_3582_legacy_push::with_legacy_push_env;
 
+#[path = "tests/delete_link_owner_9466.rs"]
+mod delete_link_owner_9466;
+
 #[cfg(test)]
 mod tests_3582_legacy_push {
     /// #3582: downstream push controls use the explicit Standard namespace opt-out.
