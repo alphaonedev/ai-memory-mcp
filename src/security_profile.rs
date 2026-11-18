@@ -82,7 +82,7 @@
 //! | `AI_MEMORY_FED_CERT_PEER_BINDING` | `enforce` | mTLS cert↔`X-Peer-Id` cross-check mode is `enforce`; `off`/`warn` refuse boot. Inert without `AI_MEMORY_FED_CERT_PEER_BINDING_MAP`. The documented `standard` unset default stays `warn` (#3201 / #3289) |
 //! | `AI_MEMORY_UNSTAMPED_MUTATION` | `refuse` | a caller-scoped mutation of an UNSTAMPED (legacy-unowned) row is refused on every funnel of both backends; `warn` refuses boot. The documented `standard` default stays `warn` (#3124) |
 //! | `AI_MEMORY_STORE_URL_FILE_ALLOW_LAX_PERMS` | *(unset)* | PERMISSIVE-shaped: the store-url file lax-perms hatch is refused — a group/world-readable `AI_MEMORY_STORE_URL_FILE` is never silently accepted (#1927/#3813) |
-//! | `AI_MEMORY_AGENT_API_KEY_FILE_ALLOW_LAX_PERMS` | *(unset)* | PERMISSIVE-shaped: the per-agent api-key file lax-perms hatch is refused — a group/world-readable `AI_MEMORY_AGENT_API_KEY_FILE` is never silently accepted (#3781/#3813) |
+//! | `AI_MEMORY_AGENT_API_KEY_FILE_ALLOW_LAX_PERMS` | *(unset)* | PERMISSIVE-shaped: the per-agent api-key file lax-perms hatch is refused — a group/world-readable `AI_MEMORY_AGENT_API_KEY_FILE` is never silently accepted (#3781/#3813); the MCP forwarder's read of the same file (#9367) never honours the hatch |
 //! | `AI_MEMORY_REQUIRE_FORENSIC_SINK` | `1` | a forensic log whose chain tail cannot be established refuses boot instead of running without the forensic sink (#4199) |
 //!
 //! In addition, `asi-hard` forces the config-backed governance knob

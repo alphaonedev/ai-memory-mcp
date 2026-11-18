@@ -1421,6 +1421,11 @@ ai-memory agents bind-api-key --agent-id <admin> \
 
 `AI_MEMORY_AGENT_API_KEY_FILE=/etc/ai-memory/admin-key.token` is the equivalent
 environment channel. The admin then presents the file's contents as `X-API-Key`.
+An `ai-memory mcp` process also reads this variable (#9367): with
+`mcp_federation_forward_url` configured it sends the file's key as `X-API-Key` on
+every forwarded write. **Warning:** do not leave an enrolment or admin token
+exported in `AI_MEMORY_AGENT_API_KEY_FILE` in a shell or unit where an MCP process
+starts; point it only at that agent's own per-agent key file.
 The alternative, **WARN-flagged and weaker**: start the daemon once with
 `AI_MEMORY_ADMIN_HEADER_TRUST=1` (the boot WARN names it), mint the key over
 HTTP, then unset the variable. The opt-in works only while this daemon's enrolled registry is empty (bootstrap, or after every key is revoked; emptiness is confirmed by an authoritative store read, and a store error refuses, recorded with reason `header_trust_refused_registry_unreadable`) (#8574): once ANY

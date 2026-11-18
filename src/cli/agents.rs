@@ -143,6 +143,9 @@ pub enum AgentsAction {
         /// token (#3781). The hygienic channel: unlike `--token`, a file path is
         /// not the secret and never lands in `/proc/<pid>/cmdline`. Equivalent to
         /// the `AI_MEMORY_AGENT_API_KEY_FILE` env var (the flag wins when both set).
+        /// That variable has a second use (#9367): an `ai-memory mcp` process with
+        /// `mcp_federation_forward_url` sends the file's key as `X-API-Key` on every
+        /// forwarded write, with `AI_MEMORY_AGENT_ID` as `X-Agent-Id`.
         #[arg(long)]
         token_file: Option<std::path::PathBuf>,
         /// v1.0.0 #3418 — the data tier this enrollment is written to.

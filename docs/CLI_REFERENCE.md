@@ -559,6 +559,13 @@ sole contents are the token, and it is preferred over the
 `/proc/<pid>/cmdline` and `ps auxww`. Only `sha256(token)` is persisted
 (#3781).
 
+The same variable has a second use (#9367): an `ai-memory mcp` process with
+`mcp_federation_forward_url` configured sends the key in that file as
+`X-API-Key` on every forwarded write, to the configured daemon only, with
+`AI_MEMORY_AGENT_ID` as `X-Agent-Id`. Unset, nothing changes; set but unusable
+(missing, unreadable, not `0600`, empty, malformed) or set without
+`AI_MEMORY_AGENT_ID`, the forward fails locally and no request is sent.
+
 | Flag | Applies to | Notes |
 |---|---|---|
 | `--pubkey <KEY>` | `agents bind-key` | Base64 Ed25519 public key (URL-safe-no-pad or standard padding). Accepts a value whose first character is `-` / `_` verbatim ([#3019](https://github.com/alphaonedev/ai-memory-mcp/issues/3019) — `allow_hyphen_values`); before that fix ~1 key in 40 was parsed as a flag and the enrollment died with a usage error. Both `--pubkey <KEY>` and `--pubkey=<KEY>` work. |
