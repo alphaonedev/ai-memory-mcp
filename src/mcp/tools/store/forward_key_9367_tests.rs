@@ -495,7 +495,12 @@ fn keyed_refusal_text_only_for_a_credential_refusal_9367() {
                 crate::errors::error_codes::GOVERNANCE_REFUSED
             ),
         ),
-        ("empty-body 403", "403 Forbidden", "{}".to_string(), String::new()),
+        (
+            "empty-body 403",
+            "403 Forbidden",
+            "{}".to_string(),
+            String::new(),
+        ),
         (
             "unknown-code 403",
             "403 Forbidden",
@@ -508,7 +513,12 @@ fn keyed_refusal_text_only_for_a_credential_refusal_9367() {
             r#"{"error":"token expired"}"#.to_string(),
             String::new(),
         ),
-        ("non-JSON 403", "403 Forbidden", "denied".to_string(), String::new()),
+        (
+            "non-JSON 403",
+            "403 Forbidden",
+            "denied".to_string(),
+            String::new(),
+        ),
     ];
     for (case, status_line, body, tail) in cases {
         let (url, rx) = server(vec![reply(status_line, &body)]);
@@ -524,7 +534,11 @@ fn keyed_refusal_text_only_for_a_credential_refusal_9367() {
                 "{case}/{site}: peer text in the error: {err}"
             );
         }
-        assert_eq!(drain(&rx).len(), 3, "{case}: one request per site, no retry");
+        assert_eq!(
+            drain(&rx).len(),
+            3,
+            "{case}: one request per site, no retry"
+        );
     }
     let _ = std::fs::remove_dir_all(&dir);
 }

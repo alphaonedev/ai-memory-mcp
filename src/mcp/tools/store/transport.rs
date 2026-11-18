@@ -25,6 +25,9 @@
 
 use serde_json::Value;
 
+/// The tracing target of every forwarder operator-log line.
+const FORWARD_TRACE_TARGET: &str = "federation.forward";
+
 /// Forward an MCP write call to a local HTTP daemon so the daemon's
 /// federation fanout coordinator (`broadcast_store_quorum` /
 /// `broadcast_link_quorum` / `broadcast_delete_quorum`) takes over
@@ -68,7 +71,7 @@ pub(crate) fn forward_to_http(
     // text (gate 7, #3688/7 — surfaced on the #3705+#3711 resolved tree).
     if let Some(ca) = crate::tls_bootstrap::local_ca_certificate().map_err(|e| {
         tracing::warn!(
-            target: "federation.forward",
+            target: FORWARD_TRACE_TARGET,
             error = %e,
             "federation_forward: the local CA certificate could not be loaded"
         );
@@ -117,20 +120,28 @@ pub(crate) fn forward_to_http(
         log_foreign_body("peer returned non-success", &target, status, &text);
         let mut err = format!("federation_forward: {target} returned {status}");
         // #9367 K-5 — a keyed forward the daemon refuses is named: the key in
-        // the variable is not accepted for this agent id. The id is the
-        // operator's own configured identity; the key is never repeated.
+        // the variable is not accepted for this agent id. Only when the body
+        // says the CREDENTIAL was refused; a 403 from another gate
+        // (attestation, governance) shows the daemon's code instead. The id
+        // is the operator's own configured identity; the key is never
+        // repeated, and no peer byte reaches the caller (#3698).
         if api_key.is_some()
             && let Some(agent_id) = keyed_agent
-            && matches!(
-                status,
-                reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
-            )
         {
-            err.push_str("; the daemon refused the key in ");
-            err.push_str(crate::agent_key_file::AGENT_API_KEY_FILE_ENV);
-            err.push_str(" for agent '");
-            err.push_str(agent_id);
-            err.push('\'');
+            match daemon_refusal(status, &text) {
+                DaemonRefusal::Credential => {
+                    err.push_str("; the daemon refused the key in ");
+                    err.push_str(crate::agent_key_file::AGENT_API_KEY_FILE_ENV);
+                    err.push_str(" for agent '");
+                    err.push_str(agent_id);
+                    err.push('\'');
+                }
+                DaemonRefusal::Code(code) => {
+                    err.push_str("; daemon code ");
+                    err.push_str(code);
+                }
+                DaemonRefusal::Unclassified => {}
+            }
         }
         return Err(err);
     }
@@ -146,13 +157,62 @@ pub(crate) fn forward_to_http(
     })
 }
 
+/// #9367 K-5 — what a non-success daemon body says about a keyed forward.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DaemonRefusal {
+    /// The daemon's transport-auth `401` or its per-agent key binding `403`.
+    Credential,
+    /// A refusal from another gate, as this crate's own code constant.
+    Code(&'static str),
+    /// Anything else: nothing is added to the caller's error.
+    Unclassified,
+}
+
+/// The daemon refusal codes the forwarder names. Each entry is this crate's
+/// own constant, so the caller-facing text never carries peer bytes.
+const NAMED_DAEMON_CODES: &[&str] = &[
+    crate::errors::error_codes::ATTESTATION_FAILED,
+    crate::errors::error_codes::GOVERNANCE_REFUSED,
+    crate::errors::error_codes::AGENT_ID_MISMATCH,
+    crate::errors::error_codes::NOT_OWNER,
+    crate::errors::error_codes::IDENTITY_REQUIRED,
+    crate::errors::error_codes::QUOTA_EXCEEDED,
+    crate::errors::error_codes::REFUSED,
+];
+
+/// Classify a non-success daemon reply by its JSON body (`error` for the
+/// auth middleware, `code` for the handler gates), never by the status
+/// number alone: a 403 from the attestation gate is not a refused key.
+fn daemon_refusal(status: reqwest::StatusCode, text: &str) -> DaemonRefusal {
+    let Ok(body) = serde_json::from_str::<Value>(text) else {
+        return DaemonRefusal::Unclassified;
+    };
+    let error = body.get("error").and_then(Value::as_str);
+    let credential = match status {
+        reqwest::StatusCode::UNAUTHORIZED => {
+            error == Some(crate::handlers::errors::API_KEY_REFUSED_ERROR)
+        }
+        reqwest::StatusCode::FORBIDDEN => {
+            error == Some(crate::handlers::errors::IDENTITY_BINDING_MISMATCH_ERROR)
+        }
+        _ => false,
+    };
+    if credential {
+        return DaemonRefusal::Credential;
+    }
+    body.get("code")
+        .and_then(Value::as_str)
+        .and_then(|c| NAMED_DAEMON_CODES.iter().copied().find(|k| *k == c))
+        .map_or(DaemonRefusal::Unclassified, DaemonRefusal::Code)
+}
+
 /// #3698 — operator-side record of a peer body that was withheld from the
 /// caller: length + SHA-256, never the bytes.
 fn log_foreign_body(what: &str, target: &str, status: reqwest::StatusCode, body: &str) {
     use sha2::Digest as _;
     let digest = hex::encode(sha2::Sha256::digest(body.as_bytes()));
     tracing::warn!(
-        target: "federation.forward",
+        target: FORWARD_TRACE_TARGET,
         %target,
         %status,
         body_bytes = body.len(),
@@ -192,7 +252,7 @@ fn forward_as_agent(
     if api_key.is_some() {
         let explicit = crate::identity::resolve_mcp_read_visibility_caller().map_err(|e| {
             tracing::warn!(
-                target: "federation.forward",
+                target: FORWARD_TRACE_TARGET,
                 error = %e,
                 "federation_forward: the explicit agent id could not be resolved"
             );

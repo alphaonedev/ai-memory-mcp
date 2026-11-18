@@ -338,6 +338,76 @@ fn sqlite_daemon_keyed_forward_9367() {
     let _ = std::fs::remove_dir_all(&dbs);
 }
 
+/// One keyed `POST` over a raw loopback socket: the status line and the body.
+fn raw_post(base: &str, path: &str, key: &str, body: &Value) -> (String, String) {
+    use std::io::{Read as _, Write as _};
+    let addr = base.trim_start_matches("http://");
+    let payload = body.to_string();
+    let mut sock = std::net::TcpStream::connect(addr).expect("connect daemon");
+    write!(
+        sock,
+        "POST {path} HTTP/1.1\r\nHost: {addr}\r\n{}: {key}\r\n{}: {AGENT}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+        crate::HEADER_API_KEY,
+        crate::HEADER_AGENT_ID,
+        payload.len()
+    )
+    .expect("write request");
+    let mut reply = String::new();
+    sock.read_to_string(&mut reply).expect("read reply");
+    let (head, rest) = reply.split_once("\r\n\r\n").expect("header end");
+    let status = head.lines().next().unwrap_or_default().to_string();
+    (status, rest.to_string())
+}
+
+/// Evidence pin (to-file candidate, behaviour unchanged): a keyed forwarded
+/// store to a daemon with the DEFAULT attestation settings is refused by the
+/// HTTP-direct attestation gate (src/handlers/create.rs, #1985), not by the
+/// key: 403 with the daemon's `ATTESTATION_FAILED` body, zero rows, and the
+/// forwarder names the daemon's code, never "refused the key".
+#[test]
+fn default_attestation_daemon_refuses_keyed_forward_9367() {
+    let _lock = crate::identity::agent_id_env_test_lock();
+    if crate::config::run_env_isolated_child_or_spawn(
+        "mcp::store::transport::forward_key_daemon_9367_tests::default_attestation_daemon_refuses_keyed_forward_9367",
+    ) {
+        return;
+    }
+    let _id = AgentIdOverride::set(AGENT);
+    unset_env(crate::identity::attest::ENV_REQUIRE_AGENT_ATTESTATION);
+    let dir = scratch("default-attest");
+    let key = synthetic_key();
+    set_env(KEY_FILE_ENV, key_file(&dir, &key).as_os_str());
+    let backend = Backend::Sqlite(dir.join("default.db"));
+    let url = spawn_daemon(backend.clone(), auth(Some((&key, AGENT))));
+    let before = rows(&backend);
+
+    // The daemon's exact reply to the request the forwarder sends, over a raw
+    // socket (no second HTTP client under src/mcp, K-6).
+    let (status_line, body) = raw_post(&url, "/api/v1/memories", &key, &store_params("raw"));
+    assert_eq!(status_line, "HTTP/1.1 403 Forbidden");
+    let body: Value = serde_json::from_str(&body).expect("json body");
+    assert_eq!(
+        body,
+        json!({
+            "code": crate::errors::error_codes::ATTESTATION_FAILED,
+            "error": crate::handlers::errors::ATTESTATION_FAILED_MSG,
+        })
+    );
+
+    let err = forward_store_to_http(&url, &store_params("fwd"), Some("ai:test"))
+        .expect_err("a default daemon refuses the unsigned forwarded store");
+    assert!(
+        err.ends_with(&format!(
+            "returned 403 Forbidden; daemon code {}",
+            crate::errors::error_codes::ATTESTATION_FAILED
+        )),
+        "{err}"
+    );
+    assert!(!err.contains(&key), "key bytes in the error");
+    assert_eq!(rows(&backend), before, "the refused store writes zero rows");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[cfg(feature = "sal-postgres")]
 #[test]
 fn postgres_daemon_keyed_forward_9367() {
