@@ -553,6 +553,9 @@ R2_RUNS_ON_FORMS = {
     "custom label": ("    runs-on: linux-fed\n", PERSISTENT),
     "list form": ("    runs-on: [self-hosted, linux-fed]\n", PERSISTENT),
     "hosted and self-hosted list": ("    runs-on: [ubuntu-24.04, self-hosted]\n", PERSISTENT),
+    # A hosted name followed by a line break is not a hosted label: the match is whole-string.
+    "hosted name with a trailing line break": ("    runs-on: \"ubuntu-24.04\\n\"\n", PERSISTENT),
+    "hosted name in a literal block": ("    runs-on: |\n      ubuntu-24.04\n", PERSISTENT),
     "group mapping": ("    runs-on:\n      group: fleet\n", PERSISTENT),
     "labels mapping": ("    runs-on:\n      labels: [self-hosted, linux-fed]\n", PERSISTENT),
     "matrix leg": ("    strategy:\n      matrix:\n        os: [ubuntu-24.04]\n        include:\n"
