@@ -1626,6 +1626,7 @@ impl MemoryStore for SqliteStore {
                 return Ok(false);
             }
         }
+        owner_gate_test_hook(source_id);
         let removed = db::delete_link(&conn, source_id, target_id).map_err(box_err)?;
         txn.commit().map_err(box_err)?;
         Ok(removed)

@@ -5,11 +5,17 @@
 //! is shared with postgres (`crate::store::delete_link_owner_9466`); a gate
 //! that holds on one backend only turns the other backend's cell red.
 
-use super::SqliteStore;
+use super::{OWNER_GATE_TEST_HOOK, SqliteStore};
 use crate::store::delete_link_owner_9466::{
-    ALICE, CASES, Caller, Endpoint, MALLORY, READ_FAULT_TABLE, SEED_OWNER, arm_read_fault, edge,
-    judge, seed_memory,
+    ALICE, BOB, CASES, Caller, Endpoint, MALLORY, READ_FAULT_TABLE, SEED_OWNER, arm_read_fault,
+    edge, judge, seed_memory,
 };
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+/// How long the second connection waits for the write lock before SQLite
+/// names the refusal; short, so a held lock fails the attempt fast.
+const SECOND_WRITER_BUSY_TIMEOUT: Duration = Duration::from_millis(100);
 use crate::store::{
     CallerContext, DELETE_LINK_SOURCE_LOOKUP, DELETE_LINK_TARGET_LOOKUP, MemoryStore, StoreResult,
 };
@@ -167,5 +173,92 @@ async fn delete_link_owner_read_error_sqlite_9466() {
                 "{state:?} / {caller:?}: a failed {what} must remove nothing"
             );
         }
+    }
+}
+
+/// What a second connection's owner re-stamp of one endpoint returned: the
+/// rows it changed, or the SQLite error code that refused it.
+type SecondWriter = Arc<Mutex<Option<Result<usize, Option<rusqlite::ErrorCode>>>>>;
+
+/// Arm the gate-to-write interleave point of `delete_link` (keyed by the
+/// source id): once the owner decision is taken, a SECOND connection on the
+/// same file tries to hand `endpoint_id` to [`MALLORY`].
+fn arm_second_writer(path: std::path::PathBuf, source_id: &str, endpoint_id: &str) -> SecondWriter {
+    let outcome: SecondWriter = Arc::new(Mutex::new(None));
+    let slot = Arc::clone(&outcome);
+    let endpoint = endpoint_id.to_string();
+    let hook: Box<dyn FnOnce() + Send> = Box::new(move || {
+        let other = rusqlite::Connection::open(&path).expect("second connection");
+        other
+            .busy_timeout(SECOND_WRITER_BUSY_TIMEOUT)
+            .expect("second connection busy timeout");
+        let got = other
+            .execute(
+                "UPDATE memories SET metadata = json_set(metadata, '$.agent_id', ?1) WHERE id = ?2",
+                rusqlite::params![MALLORY, endpoint],
+            )
+            .map_err(|e| e.sqlite_error_code());
+        *slot.lock().expect("second writer slot") = Some(got);
+    });
+    OWNER_GATE_TEST_HOOK
+        .lock()
+        .expect("owner gate hook")
+        .get_or_insert_with(std::collections::HashMap::new)
+        .insert(source_id.to_string(), hook);
+    outcome
+}
+
+fn stored_owner(path: &std::path::Path, id: &str) -> String {
+    rusqlite::Connection::open(path)
+        .expect("reader")
+        .query_row(
+            "SELECT json_extract(metadata, '$.agent_id') FROM memories WHERE id = ?1",
+            rusqlite::params![id],
+            |row| row.get(0),
+        )
+        .expect("endpoint owner")
+}
+
+/// #9466 (D-6) — the owner reads of `SqliteStore::delete_link` and the
+/// DELETE they authorise are ONE `BEGIN IMMEDIATE` transaction. Class: a
+/// read that feeds an owner decision and the write it guards are one atomic
+/// unit. A second connection that tries to change an endpoint's owner after
+/// the decision fails by name (`DatabaseBusy`), the owner's delete lands,
+/// and the endpoint keeps the owner the decision read.
+#[tokio::test]
+async fn delete_link_owner_read_and_delete_one_txn_sqlite_9466() {
+    let store = open_store();
+    // (re-stamped endpoint, the caller who owns it at decision time)
+    for (restamp_source, caller) in [(true, ALICE), (false, BOB)] {
+        let (source_id, target_id) =
+            seed_pair(&store, Endpoint::Stamped(ALICE), Endpoint::Stamped(BOB)).await;
+        let endpoint_id = if restamp_source {
+            &source_id
+        } else {
+            &target_id
+        };
+        let second = arm_second_writer(store.path.clone(), &source_id, endpoint_id);
+        let got = store
+            .delete_link(&CallerContext::for_agent(caller), &source_id, &target_id)
+            .await
+            .map_err(|e| e.to_string());
+        let second = second.lock().expect("second writer slot").take();
+        assert_eq!(
+            second,
+            Some(Err(Some(rusqlite::ErrorCode::DatabaseBusy))),
+            "restamp source={restamp_source}: an owner change between the decision and the \
+             DELETE must be refused by the held write lock (delete: {got:?})"
+        );
+        assert_eq!(
+            got,
+            Ok(true),
+            "restamp source={restamp_source}: the owner's delete"
+        );
+        assert_eq!(edge_count(&store, &source_id, &target_id).await, 0);
+        assert_eq!(
+            stored_owner(&store.path, endpoint_id),
+            if restamp_source { ALICE } else { BOB },
+            "restamp source={restamp_source}: the endpoint keeps the owner the decision read"
+        );
     }
 }

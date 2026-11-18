@@ -8,8 +8,8 @@
 
 use super::PostgresStore;
 use crate::store::delete_link_owner_9466::{
-    ALICE, CASES, Caller, Endpoint, MALLORY, READ_FAULT_TABLE, SEED_OWNER, arm_read_fault, edge,
-    judge, seed_memory,
+    ALICE, BOB, CASES, Caller, Endpoint, MALLORY, READ_FAULT_TABLE, SEED_OWNER, arm_read_fault,
+    edge, judge, seed_memory,
 };
 use crate::store::{
     CallerContext, DELETE_LINK_SOURCE_LOOKUP, DELETE_LINK_TARGET_LOOKUP, MemoryStore, StoreError,
@@ -187,5 +187,108 @@ async fn delete_link_owner_read_error_pg_9466() {
                 "{state:?} / {caller:?}: a failed {what} must remove nothing"
             );
         }
+    }
+}
+
+/// Bound on waiting for `delete_link` to queue behind the other session's
+/// row lock; it queues within milliseconds when the owner read locks.
+const LOCK_WAIT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+/// How often the waiter re-checks `pg_blocking_pids`.
+const LOCK_WAIT_POLL: std::time::Duration = std::time::Duration::from_millis(20);
+/// Bound on `delete_link` finishing once the other session commits.
+const DELETE_AFTER_COMMIT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// `true` once some session is blocked behind backend `pid`, `false` when
+/// [`LOCK_WAIT_DEADLINE`] passes first.
+async fn someone_waits_on(store: &PostgresStore, pid: i32) -> bool {
+    let deadline = tokio::time::Instant::now() + LOCK_WAIT_DEADLINE;
+    loop {
+        let waiting: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity \
+             WHERE datname = current_database() AND $1 = ANY(pg_blocking_pids(pid)))",
+        )
+        .bind(pid)
+        .fetch_one(&store.pool)
+        .await
+        .expect("read pg_blocking_pids");
+        if waiting {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(LOCK_WAIT_POLL).await;
+    }
+}
+
+/// #9466 (E-6) — the owner reads of `PostgresStore::delete_link` are
+/// `FOR SHARE` inside the DELETE's transaction. Class: a read that feeds an
+/// owner decision and the write it guards are one atomic unit. A second
+/// session holds an uncommitted owner change on one endpoint; `delete_link`
+/// must queue behind it (observed through `pg_blocking_pids`), then decide
+/// on the committed new owner: the former owner is refused and the edge is
+/// kept.
+#[tokio::test]
+async fn delete_link_owner_read_waits_for_owner_change_pg_9466() {
+    let Some(store) = connect().await else {
+        eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+        return;
+    };
+    // (re-stamped endpoint, the caller who owns it before the change)
+    for (restamp_source, caller) in [(true, ALICE), (false, BOB)] {
+        let (source_id, target_id) =
+            seed_pair(&store, Endpoint::Stamped(ALICE), Endpoint::Stamped(BOB)).await;
+        let endpoint_id = if restamp_source {
+            &source_id
+        } else {
+            &target_id
+        };
+        let mut other = store.pool.begin().await.expect("second session");
+        let other_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *other)
+            .await
+            .expect("second session pid");
+        let changed = sqlx::query(
+            "UPDATE memories SET metadata = jsonb_set(metadata, '{agent_id}', to_jsonb($1::text)) \
+             WHERE id = $2",
+        )
+        .bind(MALLORY)
+        .bind(endpoint_id)
+        .execute(&mut *other)
+        .await
+        .expect("second session owner change")
+        .rows_affected();
+        assert_eq!(changed, 1, "the second session holds the owner change");
+
+        let ctx = CallerContext::for_agent(caller);
+        let delete = store.delete_link(&ctx, &source_id, &target_id);
+        let observe = async {
+            let queued = someone_waits_on(&store, other_pid).await;
+            other.commit().await.expect("second session commit");
+            queued
+        };
+        let (got, queued) = tokio::join!(
+            async {
+                tokio::time::timeout(DELETE_AFTER_COMMIT_DEADLINE + LOCK_WAIT_DEADLINE, delete)
+                    .await
+                    .map(|r| r.map_err(|e| e.to_string()))
+            },
+            observe
+        );
+        assert!(
+            queued,
+            "restamp source={restamp_source}: delete_link must queue behind the uncommitted \
+             owner change, not decide on the old owner (delete: {got:?})"
+        );
+        assert_eq!(
+            got,
+            Ok(Ok(false)),
+            "restamp source={restamp_source}: the former owner is refused after the change"
+        );
+        assert_eq!(
+            edge_count(&store, &source_id, &target_id).await,
+            1,
+            "restamp source={restamp_source}: the edge is kept"
+        );
     }
 }
