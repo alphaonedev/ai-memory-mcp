@@ -647,11 +647,61 @@ fn block_is_deferred(prefix: &str) -> bool {
             .is_some_and(|w| PIPE_NOT_CLOSURE_HEADS.contains(&w))
 }
 
+/// #9414 ruling 9414-conditions-maperr condition 1 — the one adapter a direct
+/// gate may carry before `?;`. It changes only the error type: it cannot turn
+/// an Err into Ok, so the gate still propagates every refusal.
+const MAP_ERR_ADAPTER: &str = "map_err";
+/// #9414 ruling 9414-conditions-maperr condition 3 — words a `map_err` closure
+/// body may not hold: the exits, the loops and `async` blocks.
+const MAP_ERR_BODY_DENY_WORDS: &[&str] = &[
+    "return", "break", "continue", "loop", "while", "for", "async",
+];
+/// #9414 ruling 9414-conditions-maperr condition 3 — code chars a `map_err`
+/// closure body may not hold: `?` (an early exit) and `|` (a nested closure;
+/// an `||` / `|` operator is refused too, fail closed).
+const MAP_ERR_BODY_DENY_CHARS: &[char] = &['?', '|'];
+/// #9414 ruling 9414-conditions-maperr condition 3 — the macro allow set,
+/// minimal: the two real bodies (`|e| ReflectError::Database(e.to_string())`
+/// in reflect_with_hooks, `|e| QuotaCheckError::Sql(e.into())` in
+/// check_and_record_storage_only_in_transaction) call no macro, so the set is
+/// empty. `panic!`, `unreachable!`, `todo!`, `unimplemented!` are never in it.
+const B7_MAP_ERR_BODY_MACROS_9414: &[&str] = &[];
+/// #9414 ruling 9414-conditions-maperr condition 2 — the non-alphanumeric
+/// chars a closure parameter list may hold (`|e|`, `|_e|`, `|e: Err<T>|`).
+const MAP_ERR_PARAM_CHARS: &[char] = &['_', ':', '&', ',', '<', '>'];
+
+thread_local! {
+    /// #9414 condition 6 — test-only switch for the real-site listing: while
+    /// it holds `Some((file, sites))`, [`gate_shape`] records every gate it
+    /// credits through the map_err shape as `file:line gate | arg` (`line`
+    /// is 1-based in the continuation-joined text).
+    static MAP_ERR_LISTING: std::cell::RefCell<Option<(String, Vec<String>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// #9414 condition 6 — name the file the real-tree scan reads next, for the
+/// listing (a no-op while the listing is off).
+fn map_err_listing_file(rel: &str) {
+    MAP_ERR_LISTING.with(|l| {
+        if let Some((file, _)) = l.borrow_mut().as_mut() {
+            rel.clone_into(file);
+        }
+    });
+}
+
 /// #9414 — the [`GateShape`] of the gate call whose name ends at char `i` of
 /// masked line `k` (`prefix`: the statement prefix before the name). Reads
 /// forward over the call's turbofish and parens, then the tail up to the
-/// statement end.
-fn gate_shape(masked: &[&str], k: usize, i: usize, e: usize, prefix: &str) -> GateShape {
+/// statement end. `lines` are the raw lines, char-aligned with `masked`
+/// (`code_mask` keeps one char per char and every newline).
+fn gate_shape(
+    lines: &[&str],
+    masked: &[&str],
+    k: usize,
+    i: usize,
+    e: usize,
+    prefix: &str,
+) -> GateShape {
     let squeezed: String = prefix.chars().filter(|c| !c.is_whitespace()).collect();
     if squeezed.starts_with("let_=") {
         return GateShape::Discarded;
@@ -661,22 +711,35 @@ fn gate_shape(masked: &[&str], k: usize, i: usize, e: usize, prefix: &str) -> Ga
         .all(|c| c.is_alphanumeric() || c == '_' || c == ':' || c == '.' || c.is_whitespace())
         && !prefix_words(prefix).any(|w| NOT_DIRECT_PREFIX_WORDS.contains(&w))
         && (squeezed.is_empty() || squeezed.ends_with("::") || squeezed.ends_with('.'));
+    // (masked, raw) char pairs; the read stops after GATE_SHAPE_SCAN_LIMIT
+    // code chars (whitespace is not counted, as before).
     let mut chars = masked
         .iter()
+        .zip(lines)
         .take(e)
         .skip(k)
         .enumerate()
-        .flat_map(|(n, l)| {
+        .flat_map(|(n, (m, r))| {
             let skip = if n == 0 { i } else { 0 };
-            l.chars().skip(skip).chain(std::iter::once(' '))
+            m.chars()
+                .zip(r.chars())
+                .skip(skip)
+                .chain(std::iter::once(('\n', '\n')))
         })
-        .filter(|c| !c.is_whitespace())
-        .take(GATE_SHAPE_SCAN_LIMIT);
+        .scan(0usize, |read, p| {
+            if !p.0.is_whitespace() {
+                *read += 1;
+                if *read > GATE_SHAPE_SCAN_LIMIT {
+                    return None;
+                }
+            }
+            Some(p)
+        });
     // turbofish `::<..>` then the call parens
     let mut depth = 0i64;
     let mut angle = 0i64;
     let mut in_call = false;
-    for c in chars.by_ref() {
+    for (c, _) in chars.by_ref() {
         match c {
             '<' if !in_call => angle += 1,
             '>' if !in_call => angle -= 1,
@@ -697,9 +760,10 @@ fn gate_shape(masked: &[&str], k: usize, i: usize, e: usize, prefix: &str) -> Ga
     if !in_call || depth != 0 {
         return GateShape::Conditional;
     }
-    let mut tail = String::new();
+    let mut tail: Vec<(char, char)> = Vec::new();
     let mut term = None;
-    for c in chars {
+    for p in chars {
+        let c = p.0;
         match c {
             '(' | '[' | '{' if depth == 0 && c == '{' => {
                 term = Some(c);
@@ -717,16 +781,209 @@ fn gate_shape(masked: &[&str], k: usize, i: usize, e: usize, prefix: &str) -> Ga
             }
             _ => {}
         }
-        tail.push(c);
+        tail.push(p);
     }
-    if DISCARD_TAILS.iter().any(|t| tail.contains(t)) {
+    let squeezed_tail: String = tail
+        .iter()
+        .map(|p| p.0)
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    if DISCARD_TAILS.iter().any(|t| squeezed_tail.contains(t)) {
         return GateShape::Discarded;
     }
-    if direct_prefix && term == Some(';') && DIRECT_GATE_TAILS.contains(&tail.as_str()) {
-        GateShape::Direct
-    } else {
-        GateShape::Conditional
+    if !(direct_prefix && term == Some(';')) {
+        return GateShape::Conditional;
     }
+    if DIRECT_GATE_TAILS.contains(&squeezed_tail.as_str()) {
+        return GateShape::Direct;
+    }
+    match map_err_tail_shape(&tail) {
+        Ok(arg) => {
+            MAP_ERR_LISTING.with(|l| {
+                if let Some((file, sites)) = l.borrow_mut().as_mut() {
+                    let gate = lines.get(k).map_or("", |l| l.trim());
+                    sites.push(format!("{file}:{} {gate} | arg {arg}", k + 1));
+                }
+            });
+            GateShape::Direct
+        }
+        Err(shape) => shape,
+    }
+}
+
+/// #9414 ruling 9414-conditions-maperr conditions 1-4 — the tail of a direct
+/// gate statement (after the call parens, before `;`) read as
+/// `[.await].map_err(<arg>)?`. `Ok` carries the raw arg text; any other tail
+/// is the finding: two adapters or one other than `map_err` is
+/// [`GateShape::Discarded`], everything else [`GateShape::Conditional`].
+fn map_err_tail_shape(tail: &[(char, char)]) -> Result<String, GateShape> {
+    let m: Vec<char> = tail.iter().map(|p| p.0).collect();
+    let skip_ws = |mut at: usize| {
+        while m.get(at).is_some_and(|c| c.is_whitespace()) {
+            at += 1;
+        }
+        at
+    };
+    let ident_end = |mut at: usize| {
+        while m.get(at).is_some_and(|c| c.is_alphanumeric() || *c == '_') {
+            at += 1;
+        }
+        at
+    };
+    let mut at = skip_ws(0);
+    // (adapter name, arg start, arg end) as indices into `tail`
+    let mut adapters: Vec<(String, usize, usize)> = Vec::new();
+    let mut first = true;
+    while m.get(at) == Some(&'.') {
+        let name_start = skip_ws(at + 1);
+        let name_end = ident_end(name_start);
+        let name: String = m[name_start..name_end].iter().collect();
+        let open = skip_ws(name_end);
+        if first && name == "await" && m.get(open) != Some(&'(') {
+            first = false;
+            at = open;
+            continue;
+        }
+        first = false;
+        if name.is_empty() || m.get(open) != Some(&'(') {
+            return Err(GateShape::Conditional);
+        }
+        let mut depth = 0usize;
+        let mut close = None;
+        for (j, c) in m.iter().enumerate().skip(open) {
+            match c {
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => {
+                    let Some(d) = depth.checked_sub(1) else {
+                        return Err(GateShape::Conditional);
+                    };
+                    depth = d;
+                    if depth == 0 {
+                        close = Some(j);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(close) = close else {
+            return Err(GateShape::Conditional);
+        };
+        adapters.push((name, open + 1, close));
+        at = skip_ws(close + 1);
+    }
+    let question = m.get(at) == Some(&'?');
+    if question {
+        at = skip_ws(at + 1);
+    }
+    if at != m.len() {
+        return Err(GateShape::Conditional);
+    }
+    let Some((_, start, end)) = adapters.first() else {
+        return Err(GateShape::Conditional);
+    };
+    if adapters.len() > 1 || adapters.iter().any(|a| a.0 != MAP_ERR_ADAPTER) {
+        return Err(GateShape::Discarded);
+    }
+    if !question {
+        return Err(GateShape::Conditional);
+    }
+    let arg = &tail[*start..*end];
+    map_err_arg_ok(arg)?;
+    Ok(arg
+        .iter()
+        .map(|p| p.1)
+        .collect::<String>()
+        .trim()
+        .to_string())
+}
+
+/// #9414 ruling 9414-conditions-maperr condition 2 — a path of two or more
+/// `::` segments (`Into::into`, `StoreError::from`), never a bare name.
+fn map_err_path_arg(arg: &str) -> bool {
+    let segments: Vec<&str> = arg.split("::").collect();
+    segments.len() >= 2
+        && segments.iter().all(|s| {
+            s.chars()
+                .next()
+                .is_some_and(|c| c.is_alphabetic() || c == '_')
+                && s.chars().all(|c| c.is_alphanumeric() || c == '_')
+        })
+}
+
+/// #9414 ruling 9414-conditions-maperr conditions 2 and 3 — the `map_err`
+/// arg is a path or a closure literal `|params| body` whose body passes
+/// [`map_err_body_ok`]; any other shape is a conditional gate.
+fn map_err_arg_ok(arg: &[(char, char)]) -> Result<(), GateShape> {
+    let m: Vec<char> = arg.iter().map(|p| p.0).collect();
+    let lo = m.iter().position(|c| !c.is_whitespace()).unwrap_or(m.len());
+    let hi = m
+        .iter()
+        .rposition(|c| !c.is_whitespace())
+        .map_or(lo, |p| p + 1);
+    if map_err_path_arg(&m[lo..hi].iter().collect::<String>()) {
+        return Ok(());
+    }
+    if m.get(lo) != Some(&'|') {
+        return Err(GateShape::Conditional);
+    }
+    let Some(close) = m[lo + 1..hi]
+        .iter()
+        .position(|c| *c == '|')
+        .map(|p| lo + 1 + p)
+    else {
+        return Err(GateShape::Conditional);
+    };
+    let params_ok = m[lo + 1..close]
+        .iter()
+        .all(|c| c.is_alphanumeric() || c.is_whitespace() || MAP_ERR_PARAM_CHARS.contains(c));
+    let body = &arg[close + 1..hi];
+    if !params_ok || body.iter().all(|p| p.0.is_whitespace()) {
+        return Err(GateShape::Conditional);
+    }
+    map_err_body_ok(body)
+}
+
+/// #9414 ruling 9414-conditions-maperr condition 3 — a closure body holds no
+/// `?`, no nested closure, no exit, loop or `async` word, no macro outside
+/// [`B7_MAP_ERR_BODY_MACROS_9414`] (a word then `!` not followed by `=`), and
+/// no raw line of the write set ([`write_sql_line`]).
+fn map_err_body_ok(body: &[(char, char)]) -> Result<(), GateShape> {
+    let m: Vec<char> = body.iter().map(|p| p.0).collect();
+    if m.iter().any(|c| MAP_ERR_BODY_DENY_CHARS.contains(c)) {
+        return Err(GateShape::Conditional);
+    }
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    let mut j = 0;
+    while j < m.len() {
+        if !is_word(m[j]) {
+            j += 1;
+            continue;
+        }
+        let start = j;
+        while j < m.len() && is_word(m[j]) {
+            j += 1;
+        }
+        let word: String = m[start..j].iter().collect();
+        if MAP_ERR_BODY_DENY_WORDS.contains(&word.as_str()) {
+            return Err(GateShape::Conditional);
+        }
+        let mut n = j;
+        while m.get(n).is_some_and(|c| c.is_whitespace()) {
+            n += 1;
+        }
+        if m.get(n) == Some(&'!')
+            && m.get(n + 1) != Some(&'=')
+            && !B7_MAP_ERR_BODY_MACROS_9414.contains(&word.as_str())
+        {
+            return Err(GateShape::Conditional);
+        }
+    }
+    let raw: String = body.iter().map(|p| p.1).collect();
+    if raw.split('\n').any(write_sql_line) {
+        return Err(GateShape::Conditional);
+    }
+    Ok(())
 }
 
 /// #9414 — 0-based lines of the write-SQL lines that belong to span
@@ -865,7 +1122,7 @@ fn span_gate_credit(
                 let is_gate = (next == Some('(') || turbofish)
                     && (GATE_MARKERS.contains(&word.as_str()) || wrappers.contains(&word));
                 if is_gate {
-                    let shape = gate_shape(masked, k, i, e, &top.prefix);
+                    let shape = gate_shape(lines, masked, k, i, e, &top.prefix);
                     let unconditional = prefix_is_unconditional(&top.prefix);
                     first_gate.get_or_insert((k, shape));
                     let no_exit = !stack.iter().any(|l| l.exited);
@@ -1495,6 +1752,7 @@ fn record_stop_write_sql_fns_are_gated_or_allowlisted_b7() {
 
     for path in files {
         let rel = rel_src(&path, root);
+        map_err_listing_file(&rel);
         if skip_path(&rel) || test_only.contains(&rel) {
             continue;
         }
@@ -3133,5 +3391,32 @@ fn b7_absent_fn_is_never_gated_9414() {
         b7_try_verdict(&b7_plant("    gate_storage_conn(conn)?;"), "no_such_fn"),
         Ok(false),
         "#9414 an absent fn must read as ungated"
+    );
+}
+
+/// #9414 condition 6 — the real map_err-shape gates the scanner credits
+/// today, pinned: `reflect_with_hooks` (src/store/postgres.rs) and
+/// `check_and_record_storage_only_in_transaction` (src/quotas.rs). A new
+/// site needs a reviewed change here.
+const B7_MAP_ERR_REAL_SITES_9414: usize = 2;
+
+#[test]
+fn b7_map_err_real_sites_are_listed_9414() {
+    MAP_ERR_LISTING.with(|l| *l.borrow_mut() = Some((String::new(), Vec::new())));
+    record_stop_write_sql_fns_are_gated_or_allowlisted_b7();
+    let mut sites = MAP_ERR_LISTING
+        .with(|l| l.borrow_mut().take())
+        .map(|(_, s)| s)
+        .unwrap_or_default();
+    sites.sort();
+    sites.dedup();
+    for s in &sites {
+        println!("MAPERR-SITE {s}");
+    }
+    assert_eq!(
+        sites.len(),
+        B7_MAP_ERR_REAL_SITES_9414,
+        "#9414 real map_err-shape gate sites changed:\n  {}",
+        sites.join("\n  ")
     );
 }
