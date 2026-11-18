@@ -522,35 +522,106 @@ fn render_behind(observed: i64, supported: i64, backend: &str, target: &str) -> 
     )
 }
 
-/// #9435 (conductor ruling 8c59363f, form A) — a provenance read whose column
-/// does not exist because the database is on a schema older than v74. It is a
-/// NAMED error carrying the remedy, never "no genesis": a read that reports
-/// absent when it could not read is the defect class of #9435.
+/// The schema version that added the content-id columns (`memories.cid`,
+/// `memories.cid_genesis`).
+pub(crate) const PROVENANCE_CID_SCHEMA_VERSION: i64 = 74;
+
+/// #9435 (conductor ruling 8c59363f, form A) / #9496 — a provenance read whose
+/// column does not exist. Each variant names ONLY the cause the classifier
+/// established by reading the store (invariant B): the column alone never
+/// proves "older than v74", so the recorded stamp is read too. The failed read
+/// is kept as `source()` and not repeated in `Display` (ERRORS-11).
 #[derive(Debug)]
-pub(crate) struct ProvenanceColumnMissing {
-    /// The `memories` column the read needed.
-    pub(crate) column: &'static str,
+pub(crate) enum ProvenanceReadFault {
+    /// The stamp is below v74 (or the store is unstamped and empty): the
+    /// column is missing because the schema predates it. Migrating adds it.
+    ColumnMissingPreV74 {
+        column: &'static str,
+        source: rusqlite::Error,
+    },
+    /// The stamp says v74 or later, yet the column is absent: the stamp and
+    /// the table shape disagree, and a migrating open will not re-add it.
+    ColumnMissingAtStamp {
+        column: &'static str,
+        stamp: i64,
+        source: rusqlite::Error,
+    },
+    /// The `memories` table itself does not exist.
+    MemoriesTableMissing {
+        column: &'static str,
+        source: rusqlite::Error,
+    },
+    /// The column is absent and the recorded stamp could not be read.
+    StampUnreadable {
+        column: &'static str,
+        source: anyhow::Error,
+    },
+    /// The column is absent and the stamp is one no migration writes (zero or
+    /// negative on a populated store).
+    StampInvalid {
+        column: &'static str,
+        stamp: i64,
+        source: rusqlite::Error,
+    },
 }
 
-impl fmt::Display for ProvenanceColumnMissing {
+impl fmt::Display for ProvenanceReadFault {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "provenance column memories.{col} is missing: this database is on a schema older \
-             than v74 (the content-id columns). Repair: `{repair}` or {daemon}, then re-run.",
-            col = self.column,
-            repair = SCHEMA_BEHIND_REPAIR,
-            daemon = SCHEMA_BEHIND_REPAIR_DAEMON,
-        )
+        match self {
+            Self::ColumnMissingPreV74 { column, .. } => write!(
+                f,
+                "provenance column memories.{column} is missing: this database is on a schema \
+                 older than v{v} (the content-id columns). Repair: `{repair}` or {daemon}, then \
+                 re-run.",
+                v = PROVENANCE_CID_SCHEMA_VERSION,
+                repair = SCHEMA_BEHIND_REPAIR,
+                daemon = SCHEMA_BEHIND_REPAIR_DAEMON,
+            ),
+            Self::ColumnMissingAtStamp { column, stamp, .. } => write!(
+                f,
+                "provenance column memories.{column} is missing, but this database is stamped \
+                 schema v{stamp}, which has it (added at v{v}): the stamp and the table shape \
+                 disagree, and a migrating open does not re-add the column. Repair: restore the \
+                 database from a backup, then re-run.",
+                v = PROVENANCE_CID_SCHEMA_VERSION,
+            ),
+            Self::MemoriesTableMissing { column, .. } => write!(
+                f,
+                "provenance read of memories.{column} failed: the memories table does not exist \
+                 in this database. Check the database path."
+            ),
+            Self::StampUnreadable { column, .. } => write!(
+                f,
+                "provenance column memories.{column} is missing and the recorded schema version \
+                 cannot be read, so the cause is not established. Inspect the database before \
+                 any repair."
+            ),
+            Self::StampInvalid { column, stamp, .. } => write!(
+                f,
+                "provenance column memories.{column} is missing and the recorded schema version \
+                 is v{stamp}, which no migration writes, so the cause is not established. \
+                 Inspect the database before any repair."
+            ),
+        }
     }
 }
 
-impl std::error::Error for ProvenanceColumnMissing {}
+impl std::error::Error for ProvenanceReadFault {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ColumnMissingPreV74 { source, .. }
+            | Self::ColumnMissingAtStamp { source, .. }
+            | Self::MemoriesTableMissing { source, .. }
+            | Self::StampInvalid { source, .. } => Some(source),
+            Self::StampUnreadable { source, .. } => Some(source.as_ref()),
+        }
+    }
+}
 
-/// #9435 — classify a failed provenance read. The column is probed
-/// STRUCTURALLY (`pragma_table_info`), never by matching error text: absent
-/// column -> [`ProvenanceColumnMissing`]; present column, or a probe that
-/// cannot answer -> the original storage error, unchanged.
+/// #9435 / #9496 — classify a failed provenance read. Every step is a
+/// STRUCTURAL read, never a match on error text: a present column, or a probe
+/// that cannot answer, returns the original storage error unchanged; an absent
+/// column is named by what the store's own stamp says (invariant B).
 pub(crate) fn classify_provenance_read_error(
     conn: &rusqlite::Connection,
     err: rusqlite::Error,
@@ -561,10 +632,46 @@ pub(crate) fn classify_provenance_read_error(
         [column],
         |r| r.get::<_, i64>(0),
     );
-    match present {
-        Ok(0) => anyhow::Error::new(ProvenanceColumnMissing { column }),
-        _ => anyhow::Error::new(err),
+    if !matches!(present, Ok(0)) {
+        return anyhow::Error::new(err);
     }
+    match crate::storage::connection::sqlite_table_present(conn, super::TABLE_MEMORIES) {
+        Ok(true) => {}
+        Ok(false) => {
+            return anyhow::Error::new(ProvenanceReadFault::MemoriesTableMissing {
+                column,
+                source: err,
+            });
+        }
+        Err(_) => return anyhow::Error::new(err),
+    }
+    let fault = match crate::storage::connection::probe_schema_stamp(conn) {
+        Err(probe) => ProvenanceReadFault::StampUnreadable {
+            column,
+            source: probe.context(err.to_string()),
+        },
+        Ok(SchemaStamp::Zeroed(stamp)) => ProvenanceReadFault::StampInvalid {
+            column,
+            stamp,
+            source: err,
+        },
+        Ok(SchemaStamp::Known(stamp)) if stamp >= PROVENANCE_CID_SCHEMA_VERSION => {
+            ProvenanceReadFault::ColumnMissingAtStamp {
+                column,
+                stamp,
+                source: err,
+            }
+        }
+        // Below v74, or unstamped AND empty (`Fresh`): a migrating open adds
+        // the column, so the pre-v74 remedy is the established one.
+        Ok(SchemaStamp::Known(_) | SchemaStamp::Fresh) => {
+            ProvenanceReadFault::ColumnMissingPreV74 {
+                column,
+                source: err,
+            }
+        }
+    };
+    anyhow::Error::new(fault)
 }
 
 /// v1.0.0 #3411 / #3434 — recover the schema-behind verdict from an
