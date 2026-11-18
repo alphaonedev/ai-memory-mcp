@@ -18,8 +18,8 @@ from __future__ import annotations
 import sys
 import time
 import unittest
+import unittest.mock
 from pathlib import Path
-from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO_ROOT / "scripts" / "ci"))
@@ -1009,7 +1009,7 @@ class PersistentRunnerTrustedTrigger(unittest.TestCase):
         workflows = dict(workflows, **{SYNTH: SYNTH_WORKFLOW})
         before = tb.scan_texts(workflows, actions, files)
         labels = {"self-hosted", "linux-fed", "macos-fed", "linux-fed-pr", "ephemeral", "group:pr-tier"}
-        with mock.patch.dict(tb.RUNNER_BOUNDARY_FACTS, {lab: dict(HOST_FACT_VALUE) for lab in labels}):
+        with unittest.mock.patch.dict(tb.RUNNER_BOUNDARY_FACTS, {lab: dict(HOST_FACT_VALUE) for lab in labels}):
             after = tb.scan_texts(workflows, actions, files | {HOST_FACT_VALUE["proof_test"]})
             problems = tb.check(after)
         self.assertEqual(after.verdicts, before.verdicts)
