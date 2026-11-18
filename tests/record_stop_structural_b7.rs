@@ -2096,10 +2096,10 @@ const B7_CONDITION_ROWS_9414: &[(u8, &str, &str, &str, &str)] = &[
     ),
     (
         1,
-        "gate result mapped before ?",
+        "gate result mapped before ? (one map_err adapter, ruling 9414-maperr form A)",
         "    gate_storage_conn(conn).map_err(Error::from)?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
         "w",
-        "conditional gate at line 2",
+        "credited",
     ),
     (
         1,
@@ -2276,6 +2276,15 @@ const B7_CONDITION_ROWS_9414: &[(u8, &str, &str, &str, &str)] = &[
         "w",
         "credited",
     ),
+    (
+        // Only the explicit label check catches this row: the gate and the
+        // write share the labelled block, so block dominance alone credits it.
+        5,
+        "labelled block break over the gate, write in the same block",
+        "    'pre: {\n        if id.is_empty() {\n            break 'pre;\n        }\n        gate_storage_conn(conn)?;\n        conn.execute(\"UPDATE t SET a = 1\", [])?;\n    }",
+        "w",
+        "conditional gate at line 6",
+    ),
 ];
 
 /// #9414 — the conditions the ruling numbers (each has at least one row).
@@ -2300,6 +2309,539 @@ fn b7_gate_conditions_of_the_dominance_rule_9414() {
     assert!(
         wrong.is_empty(),
         "#9414 dominance-rule condition rows misjudged:\n  {}",
+        wrong.join("\n  ")
+    );
+}
+
+/// #9414 ruling 9414-conditions-maperr (form A) condition table:
+/// `(condition, label, body of `pub fn w`, fn to judge, exact finding text)`.
+/// 1: `<gate call>[.await].map_err(<arg>)?;` with exactly ONE adapter; any
+/// other adapter or a second one is `discarded gate`. 2: `<arg>` is a path
+/// (two or more `::` segments) or a closure literal. 3: the closure body holds
+/// no write, exit, `?`, nested closure, `async`, loop or macro outside
+/// [`B7_MAP_ERR_BODY_MACROS_9414`]. 4: `?;` directly after `map_err(..)`.
+/// 5: the dominance rule and the earlier seven conditions apply unchanged.
+const B7_MAP_ERR_ROWS_9414: &[(u8, &str, &str, &str, &str)] = &[
+    // ---- condition 1: accepted shape (positive rows)
+    (
+        1,
+        "map_err with a path arg",
+        "    gate_storage_conn(conn).map_err(StoreError::from)?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "credited",
+    ),
+    (
+        1,
+        "map_err with Into::into",
+        "    gate_storage_conn(conn).map_err(Into::into)?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "credited",
+    ),
+    (
+        1,
+        "map_err with a closure literal",
+        "    gate_storage_conn(conn).map_err(|e| Error::Db(e.to_string()))?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "credited",
+    ),
+    (
+        1,
+        "awaited gate, map_err with a path arg",
+        "    store.gate_record_stop().await.map_err(StoreError::from)?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "credited",
+    ),
+    (
+        1,
+        "awaited gate, map_err with a closure literal",
+        "    store.gate_record_stop().await.map_err(|e| Error::Db(e.to_string()))?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "credited",
+    ),
+    (
+        1,
+        "multi-line closure",
+        "    store.gate_record_stop().await.map_err(|e| {\n        Error::Db(e.to_string())\n    })?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "credited",
+    ),
+    (
+        1,
+        "closure body with != is not a macro",
+        "    gate_storage_conn(conn).map_err(|e| Error::Flag(e.code() != 0))?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "credited",
+    ),
+    (
+        1,
+        "real body src/store/postgres.rs reflect_with_hooks (verbatim)",
+        "        self.gate_record_stop()\n            .await\n            .map_err(|e| ReflectError::Database(e.to_string()))?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "credited",
+    ),
+    (
+        1,
+        "real body src/quotas.rs check_and_record_storage_only_in_transaction (verbatim)",
+        "    crate::storage::record_stop::gate_storage_conn(conn)\n        .map_err(|e| QuotaCheckError::Sql(e.into()))?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "credited",
+    ),
+    // ---- condition 1: every other adapter, and two adapters
+    (
+        1,
+        "adapter .ok()?",
+        "    gate_storage_conn(conn).ok()?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "discarded gate at line 2",
+    ),
+    (
+        1,
+        "adapter .or_else(..)?",
+        "    gate_storage_conn(conn).or_else(|_| Ok::<(), Error>(()))?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "discarded gate at line 2",
+    ),
+    (
+        1,
+        "adapter .unwrap_or_default()",
+        "    gate_storage_conn(conn).unwrap_or_default();\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "discarded gate at line 2",
+    ),
+    (
+        1,
+        "adapter .unwrap_or_else(..)",
+        "    gate_storage_conn(conn).unwrap_or_else(|_| ());\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "discarded gate at line 2",
+    ),
+    (
+        1,
+        "adapter .and_then(..)?",
+        "    gate_storage_conn(conn).and_then(|()| Ok(()))?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "discarded gate at line 2",
+    ),
+    (
+        1,
+        "adapter .map(..)?",
+        "    gate_storage_conn(conn).map(|()| ())?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "discarded gate at line 2",
+    ),
+    (
+        1,
+        "adapter .or(..)?",
+        "    gate_storage_conn(conn).or(Ok::<(), Error>(()))?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "discarded gate at line 2",
+    ),
+    (
+        1,
+        "adapter .is_ok()",
+        "    gate_storage_conn(conn).is_ok();\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "discarded gate at line 2",
+    ),
+    (
+        1,
+        "adapter .is_err()",
+        "    gate_storage_conn(conn).is_err();\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "discarded gate at line 2",
+    ),
+    (
+        1,
+        "let _ = gate.map_err(..)",
+        "    let _ = gate_storage_conn(conn).map_err(StoreError::from);\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "discarded gate at line 2",
+    ),
+    (
+        1,
+        "if let on gate.map_err(..)",
+        "    if let Err(e) = gate_storage_conn(conn).map_err(StoreError::from) {\n        return Err(e);\n    }\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        1,
+        "match on gate.map_err(..)",
+        "    match gate_storage_conn(conn).map_err(StoreError::from) {\n        Ok(()) => {}\n        Err(e) => return Err(e),\n    }\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        1,
+        "two map_err adapters",
+        "    gate_storage_conn(conn).map_err(StoreError::from).map_err(Error::from)?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "discarded gate at line 2",
+    ),
+    (
+        1,
+        "map_err then or_else",
+        "    gate_storage_conn(conn).map_err(StoreError::from).or_else(|_| Ok::<(), Error>(()))?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "discarded gate at line 2",
+    ),
+    (
+        1,
+        "map_err before .await",
+        "    store.gate_record_stop().map_err(StoreError::from).await?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    // ---- condition 2: <arg> shapes other than a path or a closure literal
+    (
+        2,
+        "arg is a call result",
+        "    gate_storage_conn(conn).map_err(make_err())?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        2,
+        "arg is a variable",
+        "    gate_storage_conn(conn).map_err(to_err)?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        2,
+        "arg is a field",
+        "    gate_storage_conn(conn).map_err(self.to_err)?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        2,
+        "arg is a macro call",
+        "    gate_storage_conn(conn).map_err(mk_err!())?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        2,
+        "arg is a block",
+        "    gate_storage_conn(conn).map_err({ StoreError::from })?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        2,
+        "arg is a move closure",
+        "    gate_storage_conn(conn).map_err(move |e| StoreError::from(e))?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        2,
+        "arg is a generic path",
+        "    gate_storage_conn(conn).map_err(StoreError::<E>::from)?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        2,
+        "arg is empty",
+        "    gate_storage_conn(conn).map_err()?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    // ---- condition 3: forbidden closure-body tokens, one by one
+    (
+        3,
+        "closure body returns",
+        "    gate_storage_conn(conn).map_err(|e| { return Error::from(e); })?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        3,
+        "closure body breaks a labelled block",
+        "    gate_storage_conn(conn).map_err(|e| { 'b: { break 'b Error::from(e); } })?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        3,
+        "closure body continues",
+        "    gate_storage_conn(conn).map_err(|e| { if e.is_x() { continue; } Error::from(e) })?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        3,
+        "closure body uses ?",
+        "    gate_storage_conn(conn).map_err(|e| Error::from(conv(e)?))?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        3,
+        "closure body holds a nested closure",
+        "    gate_storage_conn(conn).map_err(|e| Error::from((|x| x)(e)))?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        3,
+        "closure body is an async block",
+        "    gate_storage_conn(conn).map_err(|e| async { Error::from(e) })?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        3,
+        "closure body holds loop",
+        "    gate_storage_conn(conn).map_err(|e| { if e.is_x() { loop {} } Error::from(e) })?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        3,
+        "closure body holds while",
+        "    gate_storage_conn(conn).map_err(|e| { while e.is_x() {} Error::from(e) })?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        3,
+        "closure body holds for",
+        "    gate_storage_conn(conn).map_err(|e| { for _x in [0] {} Error::from(e) })?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        3,
+        "closure body panic!",
+        "    gate_storage_conn(conn).map_err(|e| panic!(\"{e}\"))?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        3,
+        "closure body unreachable!",
+        "    gate_storage_conn(conn).map_err(|_e| unreachable!())?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        3,
+        "closure body todo!",
+        "    gate_storage_conn(conn).map_err(|_e| todo!())?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        3,
+        "closure body unimplemented!",
+        "    gate_storage_conn(conn).map_err(|_e| unimplemented!())?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        3,
+        "closure body format! (not in the minimal allow set)",
+        "    gate_storage_conn(conn).map_err(|e| Error::Msg(format!(\"{e}\")))?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        3,
+        "closure body writes INSERT INTO",
+        "    gate_storage_conn(conn).map_err(|e| {\n        let _ = log.execute(\"INSERT INTO audit VALUES (1)\", []);\n        Error::from(e)\n    })?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        3,
+        "closure body writes INSERT OR",
+        "    gate_storage_conn(conn).map_err(|e| {\n        let _ = log.execute(\"INSERT OR REPLACE INTO audit VALUES (1)\", []);\n        Error::from(e)\n    })?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        3,
+        "closure body writes DELETE FROM",
+        "    gate_storage_conn(conn).map_err(|e| {\n        let _ = log.execute(\"DELETE FROM audit\", []);\n        Error::from(e)\n    })?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        3,
+        "closure body writes UPDATE .. SET",
+        "    gate_storage_conn(conn).map_err(|e| {\n        let _ = log.execute(\"UPDATE audit SET n = 1\", []);\n        Error::from(e)\n    })?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    // ---- condition 4: `?;` directly after map_err(..)
+    (
+        4,
+        "map_err without ?",
+        "    gate_storage_conn(conn).map_err(StoreError::from);\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        4,
+        "map_err? as a tail expression",
+        "    let _r: () = {\n        gate_storage_conn(conn).map_err(StoreError::from)?\n    };\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 3",
+    ),
+    (
+        4,
+        "map_err? bound by let",
+        "    let _x = gate_storage_conn(conn).map_err(StoreError::from)?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        4,
+        "map_err? in a call argument",
+        "    wrap(gate_storage_conn(conn).map_err(StoreError::from)?);\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        4,
+        "map_err? then a method call",
+        "    gate_storage_conn(conn).map_err(StoreError::from)?.touch();\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        4,
+        "map_err? compared",
+        "    gate_storage_conn(conn).map_err(StoreError::from)? == ();\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        4,
+        "map_err??",
+        "    gate_storage_conn(conn).map_err(StoreError::from)??;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    // ---- condition 5: earlier conditions 1-5 and 7 with the map_err form
+    (
+        5,
+        "earlier c1: map_err gate in a closure with the write",
+        "    let run = |c: &Connection| -> Result<()> {\n        gate_storage_conn(c).map_err(StoreError::from)?;\n        c.execute(\"UPDATE t SET a = 1\", [])?;\n        Ok(())\n    };\n    run(conn)?;",
+        "w",
+        "conditional gate at line 3",
+    ),
+    (
+        5,
+        "earlier c1: map_err gate in a macro argument",
+        "    log_err!(gate_storage_conn(conn).map_err(StoreError::from)?);\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        5,
+        "earlier c2: write outside the map_err gate's block",
+        "    if !id.is_empty() {\n        gate_storage_conn(conn).map_err(StoreError::from)?;\n    }\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 3",
+    ),
+    (
+        5,
+        "earlier c2: write before the map_err gate",
+        "    conn.execute(\"UPDATE t SET b = 2\", [])?;\n    gate_storage_conn(conn).map_err(StoreError::from)?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 3",
+    ),
+    (
+        5,
+        "earlier c3: write in a closure defined before the map_err gate",
+        "    let f = || conn.execute(\"UPDATE t SET b = 2\", []);\n    gate_storage_conn(conn).map_err(StoreError::from)?;\n    f()?;",
+        "w",
+        "conditional gate at line 3",
+    ),
+    (
+        5,
+        "earlier c4: return before the map_err gate, no write before",
+        "    if id.is_empty() {\n        return Ok((false, false));\n    }\n    gate_storage_conn(conn).map_err(|e| StoreError::Gate(e.to_string()))?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "credited",
+    ),
+    (
+        5,
+        "earlier c4: return before the map_err gate after a write",
+        "    conn.execute(\"UPDATE t SET b = 2\", [])?;\n    if id.is_empty() {\n        return Ok((false, false));\n    }\n    gate_storage_conn(conn).map_err(StoreError::from)?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 6",
+    ),
+    (
+        5,
+        "earlier c5: labelled block break jumps over the map_err gate",
+        "    'pre: {\n        if id.is_empty() {\n            break 'pre;\n        }\n        gate_storage_conn(conn).map_err(StoreError::from)?;\n    }\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 6",
+    ),
+    (
+        5,
+        "earlier c5: labelled break over the map_err gate, write in the same block",
+        "    'pre: {\n        if id.is_empty() {\n            break 'pre;\n        }\n        gate_storage_conn(conn).map_err(StoreError::from)?;\n        conn.execute(\"UPDATE t SET a = 1\", [])?;\n    }",
+        "w",
+        "conditional gate at line 6",
+    ),
+    (
+        5,
+        "earlier c7 m7a: map_err gate inside if false",
+        "    if false {\n        gate_storage_conn(conn).map_err(StoreError::from)?;\n    }\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 3",
+    ),
+    (
+        5,
+        "earlier c7 m7b: map_err gate after an early return on a path that still writes",
+        "    if id.is_empty() {\n        conn.execute(\"UPDATE t SET b = 2\", [])?;\n        return Ok((false, false));\n    }\n    gate_storage_conn(conn).map_err(StoreError::from)?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 6",
+    ),
+];
+
+/// #9414 ruling 9414-conditions-maperr — the conditions the table must cover.
+const B7_MAP_ERR_RULED_CONDITIONS_9414: &[u8] = &[1, 2, 3, 4, 5];
+/// #9414 ruling 9414-conditions-maperr condition 5 / earlier condition 6: a
+/// map_err gate in a file with an unclassifiable form is the tokenizer
+/// finding, never a credit.
+const B7_MAP_ERR_UNCLASSIFIABLE_9414: (&str, &str) = (
+    "    let _ = f\"x\";\n    gate_storage_conn(conn).map_err(StoreError::from)?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+    "line 2: reserved literal prefix",
+);
+
+#[test]
+fn b7_map_err_gate_conditions_9414() {
+    let mut wrong = Vec::new();
+    for (cond, label, body, target, want) in B7_MAP_ERR_ROWS_9414 {
+        let got = b7_try_reason(&b7_fn(body), target);
+        if got.as_deref() != Ok(*want) {
+            wrong.push(format!(
+                "condition {cond} {label}: expected {want:?}, got {got:?}"
+            ));
+        }
+    }
+    for c in B7_MAP_ERR_RULED_CONDITIONS_9414 {
+        if !B7_MAP_ERR_ROWS_9414.iter().any(|r| r.0 == *c) {
+            wrong.push(format!("condition {c}: no row"));
+        }
+    }
+    let (body, finding) = B7_MAP_ERR_UNCLASSIFIABLE_9414;
+    let got = b7_try_reason(&b7_fn(body), "w");
+    if got != Err(finding.to_string()) {
+        wrong.push(format!(
+            "condition 5 earlier c6 unclassifiable form: expected Err({finding:?}), got {got:?}"
+        ));
+    }
+    assert!(
+        wrong.is_empty(),
+        "#9414 map_err gate rows misjudged:\n  {}",
         wrong.join("\n  ")
     );
 }
@@ -2551,6 +3093,36 @@ fn b7_scan_is_linear_on_a_100k_input_9414() {
     assert!(
         steps <= ceiling,
         "#9414 100K input took {steps} steps, ceiling {ceiling}"
+    );
+}
+
+/// #9414 ruling 9414-conditions-maperr — one statement of the accepted shape,
+/// repeated to build the 100K-byte input of the map_err linear bound.
+const B7_MAP_ERR_BOUND_STMT_9414: &str = "    store.gate_record_stop().await.map_err(|e| {\n        Error::Db(e.to_string())\n    })?;\n";
+
+#[test]
+fn b7_scan_is_linear_on_a_100k_map_err_input_9414() {
+    let mut body = String::new();
+    while body.len() < B7_LINEAR_BOUND_BYTES_9414 {
+        body.push_str(B7_MAP_ERR_BOUND_STMT_9414);
+    }
+    body.push_str("    conn.execute(\"UPDATE t SET a = 1\", [])?;");
+    let src = b7_plant(&body);
+    assert!(
+        src.len() >= B7_LINEAR_BOUND_BYTES_9414,
+        "generated input too small"
+    );
+    let started = std::time::Instant::now();
+    let got = b7_try_verdict(&src, "w");
+    let took = started.elapsed();
+    assert_eq!(
+        got,
+        Ok(true),
+        "#9414 100K map_err input: the map_err gates must be credited"
+    );
+    assert!(
+        took <= B7_LINEAR_BOUND_CEILING_9414,
+        "#9414 100K map_err input took {took:?}, ceiling {B7_LINEAR_BOUND_CEILING_9414:?}"
     );
 }
 
