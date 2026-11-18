@@ -2805,6 +2805,13 @@ const B7_MAP_ERR_ROWS_9414: &[(u8, &str, &str, &str, &str)] = &[
         "w",
         "conditional gate at line 2",
     ),
+    (
+        2,
+        "arg is a bit-or expression, not a closure literal (one `|`, not first)",
+        "    gate_storage_conn(conn).map_err(to_err | StoreError::from)?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
     // ---- condition 3: forbidden closure-body tokens, one by one
     (
         3,
