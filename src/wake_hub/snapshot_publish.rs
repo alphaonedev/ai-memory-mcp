@@ -498,11 +498,65 @@ mod tests {
         (m.uid(), m.gid())
     }
 
+    /// What a link planted at a fixture name points at; a fixture write must
+    /// leave it byte-identical (#8950).
+    const LINK_TARGET_BYTES: &[u8] = b"link-target-must-stay-3971";
+
+    /// Write site 1: the old snapshot the rename replaces.
+    fn plant_old_snapshot(dst: &Path) -> anyhow::Result<()> {
+        std::fs::write(dst, b"old")?;
+        Ok(())
+    }
+
+    /// Write site 2: the entry that keeps the blocking directory non-empty.
+    fn plant_blocker_entry(dst: &Path) -> anyhow::Result<()> {
+        std::fs::write(dst, b"k")?;
+        Ok(())
+    }
+
+    /// A symlink planted at the fixture name is refused with the #8950 named
+    /// refusal and its target is left byte-identical.
+    fn assert_refuses_a_planted_link(plant: fn(&Path) -> anyhow::Result<()>) {
+        let (_root, hub) = hub_dir();
+        let target = hub.join("link-target");
+        crate::storage::snapshot_file::write_new_private_unique(
+            &target,
+            "link target",
+            LINK_TARGET_BYTES,
+        )
+        .expect("target");
+        let dst = hub.join("hub-allow.json");
+        std::os::unix::fs::symlink(&target, &dst).expect("plant link");
+        let err = plant(&dst).expect_err("a fixture write must refuse a planted symlink");
+        assert_eq!(
+            format!("{err:#}"),
+            crate::storage::snapshot_file::symlink_refusal(&dst)
+        );
+        assert_eq!(std::fs::read(&target).expect("target"), LINK_TARGET_BYTES);
+        assert!(
+            std::fs::symlink_metadata(&dst)
+                .expect("link")
+                .file_type()
+                .is_symlink(),
+            "the planted link is not replaced"
+        );
+    }
+
+    #[test]
+    fn old_snapshot_fixture_refuses_a_planted_symlink_8950_3971() {
+        assert_refuses_a_planted_link(plant_old_snapshot);
+    }
+
+    #[test]
+    fn blocker_entry_fixture_refuses_a_planted_symlink_8950_3971() {
+        assert_refuses_a_planted_link(plant_blocker_entry);
+    }
+
     #[test]
     fn write_into_replaces_by_rename_at_0600_and_the_hub_admits_it_3971() {
         let (_root, hub) = hub_dir();
         let dst = hub.join("hub-allow.json");
-        std::fs::write(&dst, b"old").expect("old");
+        plant_old_snapshot(&dst).expect("old");
         std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o600)).expect("chmod");
         let old_ino = std::fs::metadata(&dst).expect("meta").ino();
         let dir = unix::pin_for_test(&hub).expect("pin");
@@ -535,7 +589,7 @@ mod tests {
         // A non-empty directory at the final name: renameat fails.
         let blocker = hub.join("hub-allow.json");
         std::fs::create_dir(&blocker).expect("blocker");
-        std::fs::write(blocker.join("keep"), b"k").expect("keep");
+        plant_blocker_entry(&blocker.join("keep")).expect("keep");
         let dir = unix::pin_for_test(&hub).expect("pin");
         let err = unix::write_into(
             &dir,
