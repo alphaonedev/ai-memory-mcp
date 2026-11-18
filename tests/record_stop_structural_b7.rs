@@ -2984,6 +2984,16 @@ const B7_MAP_ERR_ROWS_9414: &[(u8, &str, &str, &str, &str)] = &[
         "w",
         "conditional gate at line 2",
     ),
+    // Only the `;` statement-end rule catches this one: a brace macro body
+    // is macro input, not a statement list, so a gate ended by `,` there
+    // is never a direct gate statement.
+    (
+        4,
+        "map_err? ended by a comma in a brace macro body",
+        "    m! {\n        gate_storage_conn(conn).map_err(StoreError::from)?,\n        conn.execute(\"UPDATE t SET a = 1\", [])?\n    }",
+        "w",
+        "conditional gate at line 3",
+    ),
     // ---- condition 5: earlier conditions 1-5 and 7 with the map_err form
     (
         5,
