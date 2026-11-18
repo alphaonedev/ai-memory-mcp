@@ -3039,6 +3039,13 @@ const B7_MAP_ERR_ROWS_9414: &[(u8, &str, &str, &str, &str)] = &[
     ),
     (
         5,
+        "earlier c4: unconditional return directly before the map_err gate",
+        "    return Ok((false, false));\n    gate_storage_conn(conn).map_err(StoreError::from)?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 3",
+    ),
+    (
+        5,
         "earlier c4: return before the map_err gate after a write",
         "    conn.execute(\"UPDATE t SET b = 2\", [])?;\n    if id.is_empty() {\n        return Ok((false, false));\n    }\n    gate_storage_conn(conn).map_err(StoreError::from)?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
         "w",
