@@ -28,10 +28,18 @@
 //!
 //! This is a TEXTUAL scanner, so it proves less than a reader may assume:
 //!
-//! - **Reachability is not checked.** A gate call anywhere in the
-//!   function body counts, including one inside a closure that is never
-//!   invoked or a branch that never runs. A gate that is present but
-//!   unreachable reads as gated.
+//! - **Reachability is lexical (#9414).** A gate call is credited only in a
+//!   statement with no closure, attribute, short circuit, `else` or
+//!   macro-argument prefix, after no early exit in its block or an enclosing
+//!   one, and only when it DOMINATES every own write-SQL line: its block
+//!   encloses the write's block and it comes first ([`span_gate_credit`]).
+//!   A gate-only wrapper needs that gate at brace depth 1 of the body.
+//!   Every other gate is a "conditional gate" and needs a reviewed fix or
+//!   ALLOWLIST row. Values are not evaluated: a callee that never returns or
+//!   a gate whose result is discarded still reads as gated.
+//! - **Every byte is classified (#9414).** Comments and literals are read by
+//!   the one tokenizer in `tests/common/rust_tokens.rs`; a form it cannot
+//!   classify fails the scan naming `file:line`.
 //! - **Macro-generated code is invisible.** Write SQL or a gate call
 //!   produced by a macro expansion is never seen.
 //! - **Enclosing function is lexical.** Write SQL is attributed to the
@@ -50,6 +58,8 @@ use std::collections::{HashMap, HashSet};
 #[path = "common/cfg_test_modules.rs"]
 mod cfg_test_modules;
 use cfg_test_modules::cfg_test_declared_files;
+#[path = "common/rust_tokens.rs"]
+mod rust_tokens;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -446,156 +456,14 @@ fn rel_src(path: &Path, root: &Path) -> String {
         .replace('\\', "/")
 }
 
-/// R4-G2 — a copy of `text` in which every comment and every string / char
-/// literal body is blanked to spaces, line structure preserved (an escaped
-/// newline inside a string keeps its `\n`). Function boundaries (braces,
-/// `;`) and gate CALLS are read from this mask, so a brace, a `fn`, or a
-/// gate name inside a comment or a string literal can neither end a body
-/// nor count as a gate (before R4-G2 `// TODO: gate_record_stop();` and a
-/// `const EXPLANATION: &str = "gate_record_stop ..."` both "gated" an
-/// ungated write fn). Handles `//`, nested `/* */`, `"…"` with escapes, raw
-/// strings `r#"…"#` (and `br`), and char literals vs lifetimes.
-fn code_mask(text: &str) -> String {
-    let c: Vec<char> = text.chars().collect();
-    let mut out = String::with_capacity(text.len());
-    let blank = |out: &mut String, ch: char| out.push(if ch == '\n' { '\n' } else { ' ' });
-    let is_ident = |ch: char| ch.is_alphanumeric() || ch == '_';
-    let mut i = 0;
-    while i < c.len() {
-        let ch = c[i];
-        let next = c.get(i + 1).copied();
-        if ch == '/' && next == Some('/') {
-            while i < c.len() && c[i] != '\n' {
-                blank(&mut out, c[i]);
-                i += 1;
-            }
-            continue;
-        }
-        if ch == '/' && next == Some('*') {
-            let mut depth = 0usize;
-            while i < c.len() {
-                if c[i] == '/' && c.get(i + 1) == Some(&'*') {
-                    depth += 1;
-                    out.push_str("  ");
-                    i += 2;
-                } else if c[i] == '*' && c.get(i + 1) == Some(&'/') {
-                    depth -= 1;
-                    out.push_str("  ");
-                    i += 2;
-                    if depth == 0 {
-                        break;
-                    }
-                } else {
-                    blank(&mut out, c[i]);
-                    i += 1;
-                }
-            }
-            continue;
-        }
-        let prev_ident = i > 0 && is_ident(c[i - 1]);
-        // Raw string: r"…", r#"…"#, br#"…"# (not an identifier ending in r).
-        let raw_at = if ch == 'r' && !prev_ident {
-            Some(i + 1)
-        } else if ch == 'b' && next == Some('r') && !prev_ident {
-            Some(i + 2)
-        } else {
-            None
-        };
-        if let Some(mut j) = raw_at {
-            let mut hashes = 0usize;
-            while c.get(j) == Some(&'#') {
-                hashes += 1;
-                j += 1;
-            }
-            if c.get(j) == Some(&'"') {
-                for &k in &c[i..=j] {
-                    out.push(k);
-                }
-                i = j + 1;
-                while i < c.len() {
-                    if c[i] == '"' && (1..=hashes).all(|h| c.get(i + h) == Some(&'#')) {
-                        out.push('"');
-                        out.extend(std::iter::repeat_n('#', hashes));
-                        i += 1 + hashes;
-                        break;
-                    }
-                    blank(&mut out, c[i]);
-                    i += 1;
-                }
-                continue;
-            }
-        }
-        if ch == '"' {
-            out.push('"');
-            i += 1;
-            while i < c.len() {
-                if c[i] == '\\' {
-                    blank(&mut out, c[i]);
-                    if let Some(&e) = c.get(i + 1) {
-                        blank(&mut out, e);
-                    }
-                    i += 2;
-                    continue;
-                }
-                if c[i] == '"' {
-                    out.push('"');
-                    i += 1;
-                    break;
-                }
-                blank(&mut out, c[i]);
-                i += 1;
-            }
-            continue;
-        }
-        if ch == '\'' {
-            // Char literal ('x', '\n', '\u{..}') vs lifetime ('a).
-            let is_char = next == Some('\\') || c.get(i + 2) == Some(&'\'');
-            if is_char {
-                out.push('\'');
-                i += 1;
-                while i < c.len() {
-                    if c[i] == '\\' {
-                        out.push_str("  ");
-                        i += 2;
-                        continue;
-                    }
-                    if c[i] == '\'' {
-                        out.push('\'');
-                        i += 1;
-                        break;
-                    }
-                    blank(&mut out, c[i]);
-                    i += 1;
-                }
-                continue;
-            }
-        }
-        out.push(ch);
-        i += 1;
-    }
-    out
-}
-
-/// R4-G2 — does this MASKED line CALL a gate? A marker counts only as an
-/// identifier (not a suffix of a longer one, not followed by more
-/// identifier characters) immediately followed by `(` or a `::<` turbofish.
-/// A bare mention (a doc link, a fn pointer) is not a call.
-fn line_calls_gate(masked: &str, wrappers: &[String]) -> bool {
-    let is_ident = |ch: char| ch.is_alphanumeric() || ch == '_';
-    GATE_MARKERS
-        .iter()
-        .copied()
-        .chain(wrappers.iter().map(String::as_str))
-        .any(|g| {
-            masked.match_indices(g).any(|(pos, _)| {
-                let before_ok = masked[..pos]
-                    .chars()
-                    .next_back()
-                    .is_none_or(|ch| !is_ident(ch));
-                let after = &masked[pos + g.len()..];
-                before_ok && (after.starts_with('(') || after.starts_with("::<"))
-            })
-        })
+/// #9414 — a copy of `text` in which every comment and every literal body is
+/// blanked to spaces, line structure preserved, built on the ONE tokenizer
+/// in `tests/common/rust_tokens.rs` (replacing the R4-G2 hand masker, which
+/// did not know `c` / `cr` strings: in `cr"\"` it read `\"` as an escape and
+/// masked real code up to the next quote). A form the tokenizer cannot
+/// classify is an `Err("line N: <reason>")`, a scan FINDING, never code.
+fn code_mask(text: &str) -> Result<String, String> {
+    rust_tokens::code_mask(text).map_err(|e| e.to_string())
 }
 
 /// R4-G2 — same-file gate WRAPPERS: a fn named `<marker>_<suffix>` (e.g.
@@ -603,7 +471,7 @@ fn line_calls_gate(masked: &str, wrappers: &[String]) -> bool {
 /// a gate only when its OWN span calls a gate (a marker or an already
 /// proven wrapper). Pre-R4-G2 any identifier merely CONTAINING a marker
 /// counted, proven or not.
-fn gate_wrappers(masked: &[&str], spans: &[(usize, usize, String)]) -> Vec<String> {
+fn gate_wrappers(lines: &[&str], masked: &[&str], spans: &[(usize, usize, String)]) -> Vec<String> {
     let mut wrappers: Vec<String> = Vec::new();
     loop {
         let before = wrappers.len();
@@ -611,7 +479,9 @@ fn gate_wrappers(masked: &[&str], spans: &[(usize, usize, String)]) -> Vec<Strin
             let named = GATE_MARKERS
                 .iter()
                 .any(|g| name.strip_prefix(g).is_some_and(|r| r.starts_with('_')));
-            if named && !wrappers.contains(name) && span_has_gate(masked, spans, *s, *e, &wrappers)
+            if named
+                && !wrappers.contains(name)
+                && span_has_gate(lines, masked, spans, *s, *e, &wrappers)
             {
                 wrappers.push(name.clone());
             }
@@ -689,21 +559,661 @@ fn enclosing_span(spans: &[(usize, usize, String)], idx: usize) -> Option<&(usiz
         .max_by_key(|(s, _, _)| *s)
 }
 
-/// Does span `(s, e)` itself CALL a gate? Lines of NESTED fn spans are
-/// excluded — a nested helper's gate is the helper's, not the outer fn's.
+/// #9414 — why span `(s, e)` is or is not credited with a gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GateCredit {
+    /// A gate call that provably runs before the span's first write.
+    Credited,
+    /// Gate calls exist, but none provably runs first (0-based line of the
+    /// first one): nested block, closure, attribute, short circuit, macro
+    /// argument, after a depth-1 exit, or after the first write.
+    Conditional(usize),
+    /// #9414 the first gate call drops its result (`let _ =`, `.ok()`,
+    /// `unwrap_or..`; 0-based line).
+    Discarded(usize),
+    /// No gate call at all.
+    Absent,
+}
+
+/// #9414 — words that leave the fn body at brace depth 1 (and the macros
+/// that diverge when invoked with `!`).
+const EARLY_EXIT_WORDS: &[&str] = &["return", "break", "continue"];
+const DIVERGING_MACROS: &[&str] = &["panic", "unreachable", "todo", "unimplemented", "bail"];
+/// #9414 — a gate whose statement prefix (depth-1 code since the statement
+/// began) holds one of these may not run: `else`, an `async` / `move` block
+/// or closure.
+const CONDITIONAL_PREFIX_WORDS: &[&str] = &["else", "async", "move"];
+/// #9414 — the same for punctuation: closure params and `||` (`|`), an
+/// attribute such as `#[cfg(test)]` (`#`), `&&`, a match arm (`=>`) and a
+/// macro argument (`!(` / `![`).
+const CONDITIONAL_PREFIX_PUNCT: &[&str] = &["|", "#", "&&", "=>", "!(", "!["];
+
+fn prefix_is_unconditional(prefix: &str) -> bool {
+    !CONDITIONAL_PREFIX_PUNCT.iter().any(|p| prefix.contains(p))
+        && !prefix
+            .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .any(|w| CONDITIONAL_PREFIX_WORDS.contains(&w))
+}
+
+/// #9414 ruling 1 condition 1 — the shape of one gate call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GateShape {
+    /// A direct statement of its block: `<path>gate(..)?;` or
+    /// `<path>gate(..).await?;`.
+    Direct,
+    /// The result is dropped: `let _ = ..`, `.ok()`, `unwrap_or..`.
+    Discarded,
+    /// Any other position (if / match / while condition, call or macro
+    /// argument, binding, mapped result, no `?`).
+    Conditional,
+}
+
+/// #9414 — words that may not appear in the statement prefix of a direct
+/// gate (the prefix of a direct gate is a bare path: identifiers, `::`, `.`).
+const NOT_DIRECT_PREFIX_WORDS: &[&str] = &[
+    "let", "return", "if", "match", "while", "for", "loop", "else", "async", "move", "break",
+    "continue", "unsafe", "fn",
+];
+/// #9414 — the only tails a direct gate may have after its call parens.
+const DIRECT_GATE_TAILS: &[&str] = &["?", ".await?"];
+/// #9414 — tails that drop the gate's result.
+const DISCARD_TAILS: &[&str] = &[".ok()", "unwrap_or"];
+/// #9414 — the forward read of one gate call stops after this many chars and
+/// the gate is then `Conditional` (fail closed, and the scan stays linear).
+const GATE_SHAPE_SCAN_LIMIT: usize = 4096;
+/// #9414 — a block opened in a statement holding one of these words runs
+/// later, repeatedly or never (loop, closure, async block, nested fn): a
+/// gate inside it is a conditional gate for the fn.
+const DEFERRED_BLOCK_WORDS: &[&str] = &["loop", "while", "for", "async", "move", "fn"];
+/// #9414 — statement heads whose `|` is an operator or pattern, not a
+/// closure.
+const PIPE_NOT_CLOSURE_HEADS: &[&str] = &["if", "match", "else"];
+
+fn prefix_words(prefix: &str) -> impl Iterator<Item = &str> {
+    prefix
+        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .filter(|w| !w.is_empty())
+}
+
+/// #9414 — does a `{` opened after statement prefix `prefix` start a
+/// deferred block (see [`DEFERRED_BLOCK_WORDS`])?
+fn block_is_deferred(prefix: &str) -> bool {
+    if prefix_words(prefix).any(|w| DEFERRED_BLOCK_WORDS.contains(&w)) {
+        return true;
+    }
+    prefix.contains('|')
+        && !prefix_words(prefix)
+            .next()
+            .is_some_and(|w| PIPE_NOT_CLOSURE_HEADS.contains(&w))
+}
+
+/// #9414 ruling 9414-conditions-maperr condition 1 — the one adapter a direct
+/// gate may carry before `?;`. It changes only the error type: it cannot turn
+/// an Err into Ok, so the gate still propagates every refusal.
+const MAP_ERR_ADAPTER: &str = "map_err";
+/// #9414 ruling 9414-conditions-maperr condition 3 — words a `map_err` closure
+/// body may not hold: the exits, the loops and `async` blocks.
+const MAP_ERR_BODY_DENY_WORDS: &[&str] = &[
+    "return", "break", "continue", "loop", "while", "for", "async",
+];
+/// #9414 ruling 9414-conditions-maperr condition 3 — code chars a `map_err`
+/// closure body may not hold: `?` (an early exit) and `|` (a nested closure;
+/// an `||` / `|` operator is refused too, fail closed).
+const MAP_ERR_BODY_DENY_CHARS: &[char] = &['?', '|'];
+/// #9414 ruling 9414-conditions-maperr condition 3 — the macro allow set,
+/// minimal: the two real bodies (`|e| ReflectError::Database(e.to_string())`
+/// in `reflect_with_hooks`, `|e| QuotaCheckError::Sql(e.into())` in
+/// `check_and_record_storage_only_in_transaction`) call no macro, so the set is
+/// empty. `panic!`, `unreachable!`, `todo!`, `unimplemented!` are never in it.
+const B7_MAP_ERR_BODY_MACROS_9414: &[&str] = &[];
+/// #9414 ruling 9414-conditions-maperr condition 2 — the non-alphanumeric
+/// chars a closure parameter list may hold (`|e|`, `|_e|`, `|e: Err<T>|`).
+const MAP_ERR_PARAM_CHARS: &[char] = &['_', ':', '&', ',', '<', '>'];
+
+thread_local! {
+    /// #9414 condition 6 — test-only switch for the real-site listing: while
+    /// it holds `Some((file, sites))`, [`gate_shape`] records every gate it
+    /// credits through the map_err shape as `file:line gate | arg` (`line`
+    /// is 1-based in the continuation-joined text).
+    static MAP_ERR_LISTING: std::cell::RefCell<Option<(String, Vec<String>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// #9414 condition 6 — name the file the real-tree scan reads next, for the
+/// listing (a no-op while the listing is off).
+fn map_err_listing_file(rel: &str) {
+    MAP_ERR_LISTING.with(|l| {
+        if let Some((file, _)) = l.borrow_mut().as_mut() {
+            rel.clone_into(file);
+        }
+    });
+}
+
+/// #9414 — the [`GateShape`] of the gate call whose name ends at char `i` of
+/// masked line `k` (`prefix`: the statement prefix before the name). Reads
+/// forward over the call's turbofish and parens, then the tail up to the
+/// statement end. `lines` are the raw lines, char-aligned with `masked`
+/// (`code_mask` keeps one char per char and every newline).
+fn gate_shape(
+    lines: &[&str],
+    masked: &[&str],
+    k: usize,
+    i: usize,
+    e: usize,
+    prefix: &str,
+) -> GateShape {
+    let squeezed: String = prefix.chars().filter(|c| !c.is_whitespace()).collect();
+    if squeezed.starts_with("let_=") {
+        return GateShape::Discarded;
+    }
+    let direct_prefix = prefix
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '_' || c == ':' || c == '.' || c.is_whitespace())
+        && !prefix_words(prefix).any(|w| NOT_DIRECT_PREFIX_WORDS.contains(&w))
+        && (squeezed.is_empty() || squeezed.ends_with("::") || squeezed.ends_with('.'));
+    // (masked, raw) char pairs; the read stops after GATE_SHAPE_SCAN_LIMIT
+    // code chars (whitespace is not counted, as before).
+    let mut chars = masked
+        .iter()
+        .zip(lines)
+        .take(e)
+        .skip(k)
+        .enumerate()
+        .flat_map(|(n, (m, r))| {
+            let skip = if n == 0 { i } else { 0 };
+            m.chars()
+                .zip(r.chars())
+                .skip(skip)
+                .chain(std::iter::once(('\n', '\n')))
+        })
+        .scan(0usize, |read, p| {
+            if !p.0.is_whitespace() {
+                *read += 1;
+                if *read > GATE_SHAPE_SCAN_LIMIT {
+                    return None;
+                }
+            }
+            Some(p)
+        });
+    // turbofish `::<..>` then the call parens
+    let mut depth = 0i64;
+    let mut angle = 0i64;
+    let mut in_call = false;
+    for (c, _) in chars.by_ref() {
+        match c {
+            '<' if !in_call => angle += 1,
+            '>' if !in_call => angle -= 1,
+            '(' if angle == 0 => {
+                in_call = true;
+                depth += 1;
+            }
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => {
+                depth -= 1;
+                if in_call && depth == 0 {
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    if !in_call || depth != 0 {
+        return GateShape::Conditional;
+    }
+    let mut tail: Vec<(char, char)> = Vec::new();
+    let mut term = None;
+    for p in chars {
+        let c = p.0;
+        match c {
+            // a block opener, a closer or a separator at depth 0 ends the
+            // statement (`{` inside the parens is not depth-counted)
+            '{' | ')' | ']' | '}' | ';' | ',' if depth == 0 => {
+                term = Some(c);
+                break;
+            }
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth -= 1,
+            _ => {}
+        }
+        tail.push(p);
+    }
+    let squeezed_tail: String = tail
+        .iter()
+        .map(|p| p.0)
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    if DISCARD_TAILS.iter().any(|t| squeezed_tail.contains(t)) {
+        return GateShape::Discarded;
+    }
+    if !(direct_prefix && term == Some(';')) {
+        return GateShape::Conditional;
+    }
+    if DIRECT_GATE_TAILS.contains(&squeezed_tail.as_str()) {
+        return GateShape::Direct;
+    }
+    match map_err_tail_shape(&tail) {
+        Ok(arg) => {
+            MAP_ERR_LISTING.with(|l| {
+                if let Some((file, sites)) = l.borrow_mut().as_mut() {
+                    let gate = lines.get(k).map_or("", |l| l.trim());
+                    sites.push(format!("{file}:{} {gate} | arg {arg}", k + 1));
+                }
+            });
+            GateShape::Direct
+        }
+        Err(shape) => shape,
+    }
+}
+
+/// #9414 ruling 9414-conditions-maperr conditions 1-4 — the tail of a direct
+/// gate statement (after the call parens, before `;`) read as
+/// `[.await].map_err(<arg>)?`. `Ok` carries the raw arg text; any other tail
+/// is the finding: two adapters or one other than `map_err` is
+/// [`GateShape::Discarded`], everything else [`GateShape::Conditional`].
+fn map_err_tail_shape(tail: &[(char, char)]) -> Result<String, GateShape> {
+    let m: Vec<char> = tail.iter().map(|p| p.0).collect();
+    let skip_ws = |mut at: usize| {
+        while m.get(at).is_some_and(|c| c.is_whitespace()) {
+            at += 1;
+        }
+        at
+    };
+    let ident_end = |mut at: usize| {
+        while m.get(at).is_some_and(|c| c.is_alphanumeric() || *c == '_') {
+            at += 1;
+        }
+        at
+    };
+    let mut at = skip_ws(0);
+    // (adapter name, arg start, arg end) as indices into `tail`
+    let mut adapters: Vec<(String, usize, usize)> = Vec::new();
+    let mut first = true;
+    while m.get(at) == Some(&'.') {
+        let name_start = skip_ws(at + 1);
+        let name_end = ident_end(name_start);
+        let name: String = m[name_start..name_end].iter().collect();
+        let open = skip_ws(name_end);
+        if first && name == "await" && m.get(open) != Some(&'(') {
+            first = false;
+            at = open;
+            continue;
+        }
+        first = false;
+        if name.is_empty() || m.get(open) != Some(&'(') {
+            return Err(GateShape::Conditional);
+        }
+        let mut depth = 0usize;
+        let mut close = None;
+        for (j, c) in m.iter().enumerate().skip(open) {
+            match c {
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => {
+                    let Some(d) = depth.checked_sub(1) else {
+                        return Err(GateShape::Conditional);
+                    };
+                    depth = d;
+                    if depth == 0 {
+                        close = Some(j);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(close) = close else {
+            return Err(GateShape::Conditional);
+        };
+        adapters.push((name, open + 1, close));
+        at = skip_ws(close + 1);
+    }
+    let question = m.get(at) == Some(&'?');
+    if question {
+        at = skip_ws(at + 1);
+    }
+    if at != m.len() {
+        return Err(GateShape::Conditional);
+    }
+    let Some((_, start, end)) = adapters.first() else {
+        return Err(GateShape::Conditional);
+    };
+    if adapters.len() > 1 || adapters.iter().any(|a| a.0 != MAP_ERR_ADAPTER) {
+        return Err(GateShape::Discarded);
+    }
+    if !question {
+        return Err(GateShape::Conditional);
+    }
+    let arg = &tail[*start..*end];
+    map_err_arg_ok(arg)?;
+    Ok(arg
+        .iter()
+        .map(|p| p.1)
+        .collect::<String>()
+        .trim()
+        .to_string())
+}
+
+/// #9414 ruling 9414-conditions-maperr condition 2 — a path of two or more
+/// `::` segments (`Into::into`, `StoreError::from`), never a bare name.
+fn map_err_path_arg(arg: &str) -> bool {
+    let segments: Vec<&str> = arg.split("::").collect();
+    segments.len() >= 2
+        && segments.iter().all(|s| {
+            s.chars()
+                .next()
+                .is_some_and(|c| c.is_alphabetic() || c == '_')
+                && s.chars().all(|c| c.is_alphanumeric() || c == '_')
+        })
+}
+
+/// #9414 ruling 9414-conditions-maperr conditions 2 and 3 — the `map_err`
+/// arg is a path or a closure literal `|params| body` whose body passes
+/// [`map_err_body_ok`]; any other shape is a conditional gate.
+fn map_err_arg_ok(arg: &[(char, char)]) -> Result<(), GateShape> {
+    let m: Vec<char> = arg.iter().map(|p| p.0).collect();
+    let lo = m.iter().position(|c| !c.is_whitespace()).unwrap_or(m.len());
+    let hi = m
+        .iter()
+        .rposition(|c| !c.is_whitespace())
+        .map_or(lo, |p| p + 1);
+    if map_err_path_arg(&m[lo..hi].iter().collect::<String>()) {
+        return Ok(());
+    }
+    if m.get(lo) != Some(&'|') {
+        return Err(GateShape::Conditional);
+    }
+    let Some(close) = m[lo + 1..hi]
+        .iter()
+        .position(|c| *c == '|')
+        .map(|p| lo + 1 + p)
+    else {
+        return Err(GateShape::Conditional);
+    };
+    let params_ok = m[lo + 1..close]
+        .iter()
+        .all(|c| c.is_alphanumeric() || c.is_whitespace() || MAP_ERR_PARAM_CHARS.contains(c));
+    let body = &arg[close + 1..hi];
+    if !params_ok || body.iter().all(|p| p.0.is_whitespace()) {
+        return Err(GateShape::Conditional);
+    }
+    map_err_body_ok(body)
+}
+
+/// #9414 ruling 9414-conditions-maperr condition 3 — a closure body holds no
+/// `?`, no nested closure, no exit, loop or `async` word, no macro outside
+/// [`B7_MAP_ERR_BODY_MACROS_9414`] (a word then `!` not followed by `=`), and
+/// no raw line of the write set ([`write_sql_line`]).
+fn map_err_body_ok(body: &[(char, char)]) -> Result<(), GateShape> {
+    let m: Vec<char> = body.iter().map(|p| p.0).collect();
+    if m.iter().any(|c| MAP_ERR_BODY_DENY_CHARS.contains(c)) {
+        return Err(GateShape::Conditional);
+    }
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    let mut j = 0;
+    while j < m.len() {
+        if !is_word(m[j]) {
+            j += 1;
+            continue;
+        }
+        let start = j;
+        while j < m.len() && is_word(m[j]) {
+            j += 1;
+        }
+        let word: String = m[start..j].iter().collect();
+        if MAP_ERR_BODY_DENY_WORDS.contains(&word.as_str()) {
+            return Err(GateShape::Conditional);
+        }
+        let mut n = j;
+        while m.get(n).is_some_and(|c| c.is_whitespace()) {
+            n += 1;
+        }
+        if m.get(n) == Some(&'!')
+            && m.get(n + 1) != Some(&'=')
+            && !B7_MAP_ERR_BODY_MACROS_9414.contains(&word.as_str())
+        {
+            return Err(GateShape::Conditional);
+        }
+    }
+    let raw: String = body.iter().map(|p| p.1).collect();
+    if raw.split('\n').any(write_sql_line) {
+        return Err(GateShape::Conditional);
+    }
+    Ok(())
+}
+
+/// #9414 — 0-based lines of the write-SQL lines that belong to span
+/// `(s, e)` itself (not to a nested fn).
+fn own_writes(lines: &[&str], spans: &[(usize, usize, String)], s: usize, e: usize) -> Vec<usize> {
+    (s..e)
+        .filter(|&k| {
+            lines.get(k).is_some_and(|l| write_sql_line(l))
+                && enclosing_span(spans, k).is_some_and(|(ss, se, _)| *ss == s && *se == e)
+        })
+        .collect()
+}
+
+/// #9414 — the control-flow credit of span `(s, e)` (masked lines). A gate
+/// CALL (a marker or proven wrapper followed by `(` or `::<`) is VALID when
+/// its statement prefix in its own block is unconditional and no early exit
+/// ran earlier in that block or an enclosing one. The span is credited when
+/// every own write-SQL line is DOMINATED by a valid gate (the gate's block
+/// encloses the write's block and the gate's line comes first) or, for a
+/// span with no own write (a wrapper), when a valid gate sits at brace depth
+/// 1 of the body. A gate in an `if false` block, a closure, after an early
+/// return or after the write therefore never counts. Anything else with a
+/// gate call is [`GateCredit::Conditional`].
+fn span_gate_credit(
+    lines: &[&str],
+    masked: &[&str],
+    spans: &[(usize, usize, String)],
+    s: usize,
+    e: usize,
+    wrappers: &[String],
+) -> GateCredit {
+    #[expect(
+        clippy::struct_excessive_bools,
+        reason = "one flag per dominance condition of a block level; a state enum would merge independent facts"
+    )]
+    struct Level {
+        id: usize,
+        prefix: String,
+        stmt_exits: bool,
+        exited: bool,
+        /// #9414 condition 1: a loop, closure, async block or nested fn body.
+        deferred: bool,
+        /// #9414 condition 5: the label of this block or loop, and whether
+        /// a `break` to it ran before the current position.
+        label: Option<String>,
+        broken: bool,
+        /// A label read in the current statement, for the next `{`.
+        pending_label: Option<String>,
+    }
+    let writes = own_writes(lines, spans, s, e);
+    let mut write_blocks: Vec<(usize, Vec<usize>)> = Vec::new();
+    // (line, block ids, valid for a write span, valid for a wrapper span)
+    let mut valid_gates: Vec<(usize, Vec<usize>, bool, bool)> = Vec::new();
+    let mut first_gate: Option<(usize, GateShape)> = None;
+    let mut stack: Vec<Level> = Vec::new();
+    let mut next_id = 0usize;
+    let mut paren = 0i64;
+    let mut opened = false;
+    'lines: for (k, row) in masked.iter().enumerate().take(e).skip(s) {
+        if opened && writes.contains(&k) {
+            write_blocks.push((k, stack.iter().map(|l| l.id).collect()));
+        }
+        let chars: Vec<char> = row.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            let ch = chars[i];
+            if !opened {
+                match ch {
+                    '(' | '[' => paren += 1,
+                    ')' | ']' => paren -= 1,
+                    '{' if paren == 0 => {
+                        opened = true;
+                        stack.push(Level {
+                            id: next_id,
+                            prefix: String::new(),
+                            stmt_exits: false,
+                            exited: false,
+                            deferred: false,
+                            label: None,
+                            broken: false,
+                            pending_label: None,
+                        });
+                        next_id += 1;
+                    }
+                    ';' if paren == 0 => return GateCredit::Absent,
+                    _ => {}
+                }
+                i += 1;
+                continue;
+            }
+            let Some(top) = stack.last_mut() else {
+                break 'lines;
+            };
+            if ch == '\''
+                && chars
+                    .get(i + 1)
+                    .is_some_and(|c| c.is_alphabetic() || *c == '_')
+            {
+                // #9414 condition 5: a label definition or a labelled break.
+                let st = i + 1;
+                i = st;
+                while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                    i += 1;
+                }
+                let name: String = chars[st..i].iter().collect();
+                let after_break = prefix_words(&top.prefix).last() == Some("break");
+                if after_break {
+                    if let Some(target) = stack
+                        .iter_mut()
+                        .rev()
+                        .find(|l| l.label.as_deref() == Some(&name))
+                    {
+                        target.broken = true;
+                    }
+                } else if chars.get(i) == Some(&':') && chars.get(i + 1) != Some(&':') {
+                    top.pending_label = Some(name.clone());
+                }
+                if let Some(top) = stack.last_mut() {
+                    top.prefix.push('\'');
+                    top.prefix.push_str(&name);
+                    top.prefix.push(' ');
+                }
+                continue;
+            }
+            if ch.is_alphabetic() || ch == '_' {
+                let st = i;
+                while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                    i += 1;
+                }
+                let word: String = chars[st..i].iter().collect();
+                let next = chars.get(i).copied();
+                let turbofish = next == Some(':')
+                    && chars.get(i + 1) == Some(&':')
+                    && chars.get(i + 2) == Some(&'<');
+                if EARLY_EXIT_WORDS.contains(&word.as_str())
+                    || (next == Some('!') && DIVERGING_MACROS.contains(&word.as_str()))
+                {
+                    top.stmt_exits = true;
+                }
+                let is_gate = (next == Some('(') || turbofish)
+                    && (GATE_MARKERS.contains(&word.as_str()) || wrappers.contains(&word));
+                if is_gate {
+                    let shape = gate_shape(lines, masked, k, i, e, &top.prefix);
+                    let unconditional = prefix_is_unconditional(&top.prefix);
+                    first_gate.get_or_insert((k, shape));
+                    let no_exit = !stack.iter().any(|l| l.exited);
+                    let for_wrapper = unconditional && no_exit;
+                    let for_write = shape == GateShape::Direct
+                        && no_exit
+                        && !stack.iter().any(|l| l.deferred || l.broken);
+                    if for_wrapper || for_write {
+                        valid_gates.push((
+                            k,
+                            stack.iter().map(|l| l.id).collect(),
+                            for_write,
+                            for_wrapper,
+                        ));
+                    }
+                }
+                if let Some(top) = stack.last_mut() {
+                    top.prefix.push_str(&word);
+                    top.prefix.push(' ');
+                }
+                continue;
+            }
+            match ch {
+                '{' => {
+                    let deferred = block_is_deferred(&top.prefix);
+                    let label = top.pending_label.take();
+                    stack.push(Level {
+                        id: next_id,
+                        prefix: String::new(),
+                        stmt_exits: false,
+                        exited: false,
+                        deferred,
+                        label,
+                        broken: false,
+                        pending_label: None,
+                    });
+                    next_id += 1;
+                }
+                '}' => {
+                    stack.pop();
+                    let Some(top) = stack.last_mut() else {
+                        break 'lines;
+                    };
+                    top.exited |= top.stmt_exits;
+                    top.stmt_exits = false;
+                    top.prefix.clear();
+                    top.pending_label = None;
+                }
+                ';' => {
+                    top.exited |= top.stmt_exits;
+                    top.stmt_exits = false;
+                    top.prefix.clear();
+                    top.pending_label = None;
+                }
+                c if !c.is_whitespace() => top.prefix.push(c),
+                _ => {}
+            }
+            i += 1;
+        }
+        if let Some(top) = stack.last_mut() {
+            top.prefix.push(' ');
+        }
+    }
+    let credited = if writes.is_empty() {
+        valid_gates
+            .iter()
+            .any(|(_, ids, _, wrapper)| *wrapper && ids.len() == 1)
+    } else {
+        writes.len() == write_blocks.len()
+            && write_blocks.iter().all(|(wk, wids)| {
+                valid_gates
+                    .iter()
+                    .any(|(gk, gids, write, _)| *write && gk < wk && wids.starts_with(gids))
+            })
+    };
+    match (credited, first_gate) {
+        (true, _) => GateCredit::Credited,
+        (false, Some((at, GateShape::Discarded))) => GateCredit::Discarded(at),
+        (false, Some((at, _))) => GateCredit::Conditional(at),
+        (false, None) => GateCredit::Absent,
+    }
+}
+
+/// Is span `(s, e)` credited with a gate ([`span_gate_credit`])?
 fn span_has_gate(
+    lines: &[&str],
     masked: &[&str],
     spans: &[(usize, usize, String)],
     s: usize,
     e: usize,
     wrappers: &[String],
 ) -> bool {
-    (s..e).any(|k| {
-        let nested = spans
-            .iter()
-            .any(|(ns, ne, _)| *ns > s && *ne <= e && *ns <= k && k < *ne);
-        !nested && line_calls_gate(masked[k], wrappers)
-    })
+    span_gate_credit(lines, masked, spans, s, e, wrappers) == GateCredit::Credited
 }
 
 /// #4052 — gate verdict of EVERY production function named exactly `fn_name`
@@ -716,16 +1226,28 @@ fn fn_gate_verdicts(
     fn_name: &str,
     start_of: impl Fn(&str) -> Option<(usize, String)>,
 ) -> Vec<bool> {
+    try_fn_gate_verdicts(src, fn_name, start_of).unwrap_or_else(|finding| {
+        panic!("#9414 B7 tokenizer finding in the `{fn_name}` source: {finding}")
+    })
+}
+
+/// #9414 — [`fn_gate_verdicts`] with the tokenizer finding as the error.
+fn try_fn_gate_verdicts(
+    src: &str,
+    fn_name: &str,
+    start_of: impl Fn(&str) -> Option<(usize, String)>,
+) -> Result<Vec<bool>, String> {
     let text = join_string_continuations(strip_test_mod(src));
-    let mask = code_mask(&text);
+    let mask = code_mask(&text)?;
+    let lines: Vec<&str> = text.lines().collect();
     let masked: Vec<&str> = mask.lines().collect();
     let spans = fn_spans(&masked, start_of);
-    let wrappers = gate_wrappers(&masked, &spans);
-    spans
+    let wrappers = gate_wrappers(&lines, &masked, &spans);
+    Ok(spans
         .iter()
         .filter(|(_, _, n)| n == fn_name)
-        .map(|(s, e, _)| span_has_gate(&masked, &spans, *s, *e, &wrappers))
-        .collect()
+        .map(|(s, e, _)| span_has_gate(&lines, &masked, &spans, *s, *e, &wrappers))
+        .collect())
 }
 
 /// Parity-side read: is `fn_name` gated in `src`? Fails CLOSED — every
@@ -774,10 +1296,11 @@ fn ungated_write_fns_for(
     classify: impl Fn(&str) -> bool,
 ) -> Vec<String> {
     let lines: Vec<&str> = text.lines().collect();
-    let mask = code_mask(text);
+    let mask =
+        code_mask(text).unwrap_or_else(|finding| panic!("#9414 B7 tokenizer finding: {finding}"));
     let masked: Vec<&str> = mask.lines().collect();
     let spans = fn_spans(&masked, start_of);
-    let wrappers = gate_wrappers(&masked, &spans);
+    let wrappers = gate_wrappers(&lines, &masked, &spans);
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     for (idx, line) in lines.iter().enumerate() {
@@ -793,7 +1316,7 @@ fn ungated_write_fns_for(
         if !seen.insert(name.clone()) {
             continue;
         }
-        if !span_has_gate(&masked, &spans, *start, *end, &wrappers) {
+        if !span_has_gate(&lines, &masked, &spans, *start, *end, &wrappers) {
             out.push(name.clone());
         }
     }
@@ -1217,6 +1740,9 @@ fn record_stop_write_sql_fns_are_gated_or_allowlisted_b7() {
         .collect();
 
     let mut ungated: Vec<(String, String, usize)> = Vec::new();
+    let mut findings: Vec<String> = Vec::new();
+    let mut scanned_files = 0usize;
+    let mut gated_fns = 0usize;
     let mut gated_hits: HashMap<String, bool> = MUST_BE_GATED
         .iter()
         .map(|n| ((*n).to_string(), false))
@@ -1224,6 +1750,7 @@ fn record_stop_write_sql_fns_are_gated_or_allowlisted_b7() {
 
     for path in files {
         let rel = rel_src(&path, root);
+        map_err_listing_file(&rel);
         if skip_path(&rel) || test_only.contains(&rel) {
             continue;
         }
@@ -1236,10 +1763,19 @@ fn record_stop_write_sql_fns_are_gated_or_allowlisted_b7() {
         // Pair every write-SQL line with the nearest preceding `fn`
         // (impl methods sit at indent 4; do not swallow them as nested
         // inside an earlier indent-0 helper).
-        let mask = code_mask(&text);
+        // #9414: a form the tokenizer cannot classify is a finding naming
+        // file:line; the file is never skipped and never read as code.
+        let mask = match code_mask(&text) {
+            Ok(m) => m,
+            Err(finding) => {
+                findings.push(format!("{rel}: {finding}"));
+                continue;
+            }
+        };
+        scanned_files += 1;
         let masked: Vec<&str> = mask.lines().collect();
         let spans = fn_spans(&masked, is_fn_start);
-        let wrappers = gate_wrappers(&masked, &spans);
+        let wrappers = gate_wrappers(&lines, &masked, &spans);
         let mut seen: HashSet<(String, String)> = HashSet::new();
         for (idx, line) in lines.iter().enumerate() {
             if !write_sql_line(line) {
@@ -1285,7 +1821,9 @@ fn record_stop_write_sql_fns_are_gated_or_allowlisted_b7() {
             {
                 continue;
             }
-            if span_has_gate(&masked, &spans, start, end, &wrappers) {
+            let credit = span_gate_credit(&lines, &masked, &spans, start, end, &wrappers);
+            if credit == GateCredit::Credited {
+                gated_fns += 1;
                 if let Some(flag) = gated_hits.get_mut(name) {
                     *flag = true;
                 }
@@ -1294,9 +1832,19 @@ fn record_stop_write_sql_fns_are_gated_or_allowlisted_b7() {
             if allow.contains(&key) {
                 continue;
             }
-            ungated.push((rel.clone(), name.clone(), start + 1));
+            let why = b7_credit_reason(credit);
+            ungated.push((rel.clone(), format!("{name} ({why})"), start + 1));
         }
     }
+
+    assert!(
+        findings.is_empty(),
+        "#9414 B7 tokenizer findings (unclassifiable forms):\n  {}",
+        findings.join("\n  ")
+    );
+    // #9414 fail closed: an empty scan or zero credited gates is a failure.
+    assert!(scanned_files > 0, "#9414 B7 scanned no source file");
+    assert!(gated_fns > 0, "#9414 B7 credited no gated fn");
 
     let mut missing_required = Vec::new();
     for (name, hit) in &gated_hits {
@@ -1312,14 +1860,11 @@ fn record_stop_write_sql_fns_are_gated_or_allowlisted_b7() {
         .collect();
     extra.sort();
 
+    // #9414: both lists in one failure, so one run names every site.
     assert!(
-        missing_required.is_empty(),
-        "B7 required functions are not gated: {}",
-        missing_required.join(", ")
-    );
-    assert!(
-        extra.is_empty(),
-        "B7 structural completeness: write-SQL functions are neither gated nor allowlisted:\n  {}\n(add a gate or a reviewed ALLOWLIST row)",
+        missing_required.is_empty() && extra.is_empty(),
+        "B7 required functions are not gated: {}\nB7 structural completeness: write-SQL functions are neither gated nor allowlisted:\n  {}\n(add a gate or a reviewed ALLOWLIST row)",
+        missing_required.join(", "),
         extra.join("\n  ")
     );
 
@@ -1536,5 +2081,1364 @@ fn repair_call_sites_are_migrate_only_4324() {
         sites.len(),
         2,
         "#4324: expected exactly 2 migrate call sites (open-time repair + ladder tail), got {sites:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #9414 — the gate is credited only where it provably runs before the write,
+// and every literal form of the edition is classified (never guessed).
+// ---------------------------------------------------------------------------
+
+/// #9414 — the verdict a unit cell asserts: `Ok(gated)` for the one fn named
+/// `fn_name` in `src`, or the tokenizer finding (`line N: <reason>`).
+fn b7_try_verdict(src: &str, fn_name: &str) -> Result<bool, String> {
+    let v = try_fn_gate_verdicts(src, fn_name, is_fn_start)?;
+    Ok(!v.is_empty() && v.iter().all(|g| *g))
+}
+
+/// #9414 — a write fn named `w` whose body is `body` (one statement per line).
+fn b7_plant(body: &str) -> String {
+    format!(
+        "pub fn w(conn: &Connection, id: &str) -> Result<(bool, bool)> {{\n{body}\n    \
+         conn.execute(\"UPDATE t SET a = 1 WHERE id = ?1\", [id])?;\n    Ok((true, true))\n}}\n"
+    )
+}
+
+/// #9414 control-flow table: `(label, body, credited)`. m7a / m7b / m2 are
+/// the issue's mutants; every `false` row is a gate the scanner cannot prove
+/// runs before the write.
+const B7_CONTROL_FLOW_ROWS_9414: &[(&str, &str, bool)] = &[
+    ("plain gate first", "    gate_storage_conn(conn)?;", true),
+    (
+        "gate in an if condition",
+        "    if record_stop_status(conn)? {\n        return Ok((false, false));\n    }",
+        false,
+    ),
+    (
+        "conditional early return before the gate",
+        "    if id.is_empty() {\n        return Ok((false, false));\n    }\n    gate_storage_conn(conn)?;",
+        true,
+    ),
+    (
+        "? before the gate",
+        "    let _n = id.parse::<i64>()?;\n    gate_storage_conn(conn)?;",
+        true,
+    ),
+    (
+        "m7a gate inside if false",
+        "    if false {\n        gate_storage_conn(conn)?;\n    }",
+        false,
+    ),
+    (
+        "m7b gate after an early return in the same block",
+        "    if id.is_empty() {\n        return Ok((false, false));\n        gate_storage_conn(conn)?;\n    }",
+        false,
+    ),
+    (
+        "m2 gate after the write transaction",
+        "    let out = in_write_txn(conn, || {\n        conn.execute(\"UPDATE t SET b = 2\", [])?;\n        Ok(())\n    });\n    gate_storage_conn(conn)?;\n    out?;",
+        false,
+    ),
+    (
+        "gate only in a nested fn",
+        "    fn inner(conn: &Connection) -> Result<()> {\n        gate_storage_conn(conn)\n    }",
+        false,
+    ),
+    (
+        "gate in an uncalled closure",
+        "    let _later = || gate_storage_conn(conn);",
+        false,
+    ),
+    (
+        "gate in a braced closure",
+        "    let _later = move || {\n        gate_storage_conn(conn)\n    };",
+        false,
+    ),
+    (
+        "gate under a cfg attribute",
+        "    #[cfg(test)]\n    gate_storage_conn(conn)?;",
+        false,
+    ),
+    (
+        "gate behind a short circuit",
+        "    let _ = id.is_empty() && gate_storage_conn(conn).is_ok();",
+        false,
+    ),
+    (
+        "gate in an else branch",
+        "    if id.is_empty() {\n        let _ = 1;\n    } else {\n        gate_storage_conn(conn)?;\n    }",
+        false,
+    ),
+    (
+        "gate after a depth-1 return",
+        "    return Ok((false, false));\n    gate_storage_conn(conn)?;",
+        false,
+    ),
+    (
+        "gate inside a macro argument",
+        "    debug_assert!(gate_storage_conn(conn).is_ok());",
+        false,
+    ),
+];
+
+#[test]
+fn b7_gate_is_credited_only_where_it_runs_before_the_write_9414() {
+    let mut wrong = Vec::new();
+    for (label, body, credited) in B7_CONTROL_FLOW_ROWS_9414 {
+        let got = b7_try_verdict(&b7_plant(body), "w");
+        if got != Ok(*credited) {
+            wrong.push(format!("{label}: expected Ok({credited}), got {got:?}"));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "#9414 control-flow rows misjudged:\n  {}",
+        wrong.join("\n  ")
+    );
+}
+
+/// #9414 — the exact B7 finding text for a credit (the main scan prints the
+/// same text after the fn name): `credited`, `conditional gate at line N`,
+/// `discarded gate at line N` or `no gate` (1-based lines).
+fn b7_credit_reason(credit: GateCredit) -> String {
+    match credit {
+        GateCredit::Credited => B7_REASON_CREDITED_9414.to_string(),
+        GateCredit::Conditional(at) => format!("conditional gate at line {}", at + 1),
+        GateCredit::Discarded(at) => format!("discarded gate at line {}", at + 1),
+        GateCredit::Absent => B7_REASON_NO_GATE_9414.to_string(),
+    }
+}
+
+const B7_REASON_CREDITED_9414: &str = "credited";
+const B7_REASON_NO_GATE_9414: &str = "no gate";
+
+/// #9414 — the finding text of every fn named `fn_name` in `src`, joined by
+/// `; ` (or the tokenizer finding). `src` gets the same preprocessing as the
+/// main scan.
+fn b7_try_reason(src: &str, fn_name: &str) -> Result<String, String> {
+    let text = join_string_continuations(strip_test_mod(src));
+    let mask = code_mask(&text)?;
+    let lines: Vec<&str> = text.lines().collect();
+    let masked: Vec<&str> = mask.lines().collect();
+    let spans = fn_spans(&masked, is_fn_start);
+    let wrappers = gate_wrappers(&lines, &masked, &spans);
+    let reasons: Vec<String> = spans
+        .iter()
+        .filter(|(_, _, n)| n == fn_name)
+        .map(|(s, e, _)| {
+            b7_credit_reason(span_gate_credit(&lines, &masked, &spans, *s, *e, &wrappers))
+        })
+        .collect();
+    if reasons.is_empty() {
+        return Ok(B7_REASON_NO_GATE_9414.to_string());
+    }
+    Ok(reasons.join("; "))
+}
+
+/// #9414 — `pub fn w` with exactly `body` (no write appended; line 1 is the
+/// signature, so the body's first line is line 2).
+fn b7_fn(body: &str) -> String {
+    format!(
+        "pub fn w(conn: &Connection, id: &str) -> Result<(bool, bool)> {{\n{body}\n    Ok((true, true))\n}}\n"
+    )
+}
+
+/// #9414 ruling 1 (dominance rule) condition table:
+/// `(condition, label, body of `pub fn w`, fn to judge, exact finding text)`.
+/// Condition 1: the gate is a direct statement `<path>gate(..)?;` (or
+/// `.await?;`); anything else is `conditional gate`, a dropped result is
+/// `discarded gate`. 2: every write after the gate, inside its block.
+/// 3: a write in a closure / async block / nested fn defined before the gate.
+/// 4: an exit before the gate only when no write precedes it. 5: a labelled
+/// break that jumps over the gate.
+const B7_CONDITION_ROWS_9414: &[(u8, &str, &str, &str, &str)] = &[
+    (
+        1,
+        "direct gate",
+        "    gate_storage_conn(conn)?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "credited",
+    ),
+    (
+        1,
+        "direct gate through a path",
+        "    crate::storage::record_stop::gate_storage_conn(conn)?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "credited",
+    ),
+    (
+        1,
+        "direct awaited gate",
+        "    store.gate_record_stop().await?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "credited",
+    ),
+    (
+        1,
+        "gate in an if condition",
+        "    if gate_storage_conn(conn).is_err() {\n        return Ok((false, false));\n    }\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        1,
+        "gate as an if-let scrutinee",
+        "    if let Err(e) = gate_storage_conn(conn) {\n        return Err(e);\n    }\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        1,
+        "gate as a match scrutinee",
+        "    match gate_storage_conn(conn) {\n        Ok(()) => {}\n        Err(e) => return Err(e),\n    }\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        1,
+        "gate in a match arm",
+        "    match id.len() {\n        0 => gate_storage_conn(conn)?,\n        _ => {}\n    }\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 3",
+    ),
+    (
+        1,
+        "gate in a loop body with the write",
+        "    loop {\n        gate_storage_conn(conn)?;\n        conn.execute(\"UPDATE t SET a = 1\", [])?;\n        break;\n    }",
+        "w",
+        "conditional gate at line 3",
+    ),
+    (
+        1,
+        "gate in a while condition",
+        "    while gate_storage_conn(conn).is_ok() {\n        conn.execute(\"UPDATE t SET a = 1\", [])?;\n        break;\n    }",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        1,
+        "gate in a closure with the write",
+        "    let run = |c: &Connection| -> Result<()> {\n        gate_storage_conn(c)?;\n        c.execute(\"UPDATE t SET a = 1\", [])?;\n        Ok(())\n    };\n    run(conn)?;",
+        "w",
+        "conditional gate at line 3",
+    ),
+    (
+        1,
+        "gate in an async block with the write",
+        "    let fut = async {\n        gate_storage_conn(conn)?;\n        conn.execute(\"UPDATE t SET a = 1\", [])?;\n        Ok::<(), Error>(())\n    };\n    block_on(fut)?;",
+        "w",
+        "conditional gate at line 3",
+    ),
+    (
+        1,
+        "gate in a macro argument",
+        "    log_err!(gate_storage_conn(conn)?);\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        1,
+        "gate in a call argument",
+        "    wrap(gate_storage_conn(conn))?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        1,
+        "gate in a tuple binding",
+        "    let _pair = (gate_storage_conn(conn)?, 1);\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        1,
+        "gate result mapped before ? (one map_err adapter, ruling 9414-maperr form A)",
+        "    gate_storage_conn(conn).map_err(Error::from)?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "credited",
+    ),
+    (
+        1,
+        "gate without ?",
+        "    gate_storage_conn(conn);\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        1,
+        "let _ = gate",
+        "    let _ = gate_storage_conn(conn);\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "discarded gate at line 2",
+    ),
+    (
+        1,
+        "gate .ok()",
+        "    gate_storage_conn(conn).ok();\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "discarded gate at line 2",
+    ),
+    (
+        1,
+        "gate unwrap_or",
+        "    gate_storage_conn(conn).unwrap_or(());\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "discarded gate at line 2",
+    ),
+    (
+        2,
+        "write before the gate",
+        "    conn.execute(\"UPDATE t SET b = 2\", [])?;\n    gate_storage_conn(conn)?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 3",
+    ),
+    (
+        2,
+        "write outside the gate's block",
+        "    if !id.is_empty() {\n        gate_storage_conn(conn)?;\n    }\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 3",
+    ),
+    (
+        2,
+        "gate and write in one if-let block",
+        "    if let Some(_x) = id.chars().next() {\n        gate_storage_conn(conn)?;\n        conn.execute(\"UPDATE t SET a = 1\", [])?;\n    }",
+        "w",
+        "credited",
+    ),
+    (
+        3,
+        "write in a closure defined before the gate",
+        "    let f = || conn.execute(\"UPDATE t SET b = 2\", []);\n    gate_storage_conn(conn)?;\n    f()?;",
+        "w",
+        "conditional gate at line 3",
+    ),
+    (
+        3,
+        "write in a braced closure defined before the gate",
+        "    let f = || {\n        conn.execute(\"UPDATE t SET b = 2\", [])\n    };\n    gate_storage_conn(conn)?;\n    f()?;",
+        "w",
+        "conditional gate at line 5",
+    ),
+    (
+        3,
+        "write in an async block defined before the gate",
+        "    let fut = async {\n        conn.execute(\"UPDATE t SET b = 2\", [])\n    };\n    gate_storage_conn(conn)?;\n    block_on(fut)?;",
+        "w",
+        "conditional gate at line 5",
+    ),
+    (
+        3,
+        "write in a nested fn defined before the gate",
+        "    fn inner(conn: &Connection) -> Result<usize> {\n        conn.execute(\"UPDATE t SET b = 2\", [])\n    }\n    gate_storage_conn(conn)?;\n    inner(conn)?;",
+        "inner",
+        "no gate",
+    ),
+    (
+        4,
+        "return before the gate, no write before",
+        "    if id.is_empty() {\n        return Ok((false, false));\n    }\n    gate_storage_conn(conn)?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "credited",
+    ),
+    (
+        4,
+        "return before the gate after a write",
+        "    conn.execute(\"UPDATE t SET b = 2\", [])?;\n    if id.is_empty() {\n        return Ok((false, false));\n    }\n    gate_storage_conn(conn)?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 6",
+    ),
+    (
+        4,
+        "break before the gate, no write before",
+        "    for x in id.chars() {\n        if x == 'a' {\n            break;\n        }\n    }\n    gate_storage_conn(conn)?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "credited",
+    ),
+    (
+        4,
+        "break before the gate after a write",
+        "    for x in id.chars() {\n        conn.execute(\"UPDATE t SET b = 2\", [])?;\n        if x == 'a' {\n            break;\n        }\n    }\n    gate_storage_conn(conn)?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 8",
+    ),
+    (
+        4,
+        "continue before the gate, no write before",
+        "    for x in id.chars() {\n        if x == 'a' {\n            continue;\n        }\n    }\n    gate_storage_conn(conn)?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "credited",
+    ),
+    (
+        4,
+        "continue before the gate after a write",
+        "    for x in id.chars() {\n        conn.execute(\"UPDATE t SET b = 2\", [])?;\n        if x == 'a' {\n            continue;\n        }\n    }\n    gate_storage_conn(conn)?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 8",
+    ),
+    (
+        4,
+        "? before the gate, no write before",
+        "    let _n = id.parse::<i64>()?;\n    gate_storage_conn(conn)?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "credited",
+    ),
+    (
+        4,
+        "? before the gate after a write",
+        "    conn.execute(\"UPDATE t SET b = 2\", [])?;\n    let _n = id.parse::<i64>()?;\n    gate_storage_conn(conn)?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 4",
+    ),
+    (
+        4,
+        "diverging macro before the gate, no write before",
+        "    if id.is_empty() {\n        panic!(\"empty id\");\n    }\n    gate_storage_conn(conn)?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "credited",
+    ),
+    (
+        4,
+        "diverging macro before the gate after a write",
+        "    conn.execute(\"UPDATE t SET b = 2\", [])?;\n    if id.is_empty() {\n        panic!(\"empty id\");\n    }\n    gate_storage_conn(conn)?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 6",
+    ),
+    (
+        4,
+        "unconditional return directly before the gate",
+        "    return Ok((false, false));\n    gate_storage_conn(conn)?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 3",
+    ),
+    (
+        5,
+        "labelled block break jumps over the gate",
+        "    'pre: {\n        if id.is_empty() {\n            break 'pre;\n        }\n        gate_storage_conn(conn)?;\n    }\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 6",
+    ),
+    (
+        5,
+        "labelled loop break jumps over the gate",
+        "    'outer: loop {\n        if id.is_empty() {\n            break 'outer;\n        }\n        gate_storage_conn(conn)?;\n        break;\n    }\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 6",
+    ),
+    (
+        5,
+        "labelled block break that lands before the gate",
+        "    'pre: {\n        if id.is_empty() {\n            break 'pre;\n        }\n    }\n    gate_storage_conn(conn)?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "credited",
+    ),
+    (
+        // Only the explicit label check catches this row: the gate and the
+        // write share the labelled block, so block dominance alone credits it.
+        5,
+        "labelled block break over the gate, write in the same block",
+        "    'pre: {\n        if id.is_empty() {\n            break 'pre;\n        }\n        gate_storage_conn(conn)?;\n        conn.execute(\"UPDATE t SET a = 1\", [])?;\n    }",
+        "w",
+        "conditional gate at line 6",
+    ),
+];
+
+/// #9414 — the conditions the ruling numbers (each has at least one row).
+const B7_RULED_CONDITIONS_9414: &[u8] = &[1, 2, 3, 4, 5];
+
+#[test]
+fn b7_gate_conditions_of_the_dominance_rule_9414() {
+    let mut wrong = Vec::new();
+    for (cond, label, body, target, want) in B7_CONDITION_ROWS_9414 {
+        let got = b7_try_reason(&b7_fn(body), target);
+        if got.as_deref() != Ok(*want) {
+            wrong.push(format!(
+                "condition {cond} {label}: expected {want:?}, got {got:?}"
+            ));
+        }
+    }
+    for c in B7_RULED_CONDITIONS_9414 {
+        if !B7_CONDITION_ROWS_9414.iter().any(|r| r.0 == *c) {
+            wrong.push(format!("condition {c}: no row"));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "#9414 dominance-rule condition rows misjudged:\n  {}",
+        wrong.join("\n  ")
+    );
+}
+
+/// #9414 ruling 9414-conditions-maperr (form A) condition table:
+/// `(condition, label, body of `pub fn w`, fn to judge, exact finding text)`.
+/// 1: `<gate call>[.await].map_err(<arg>)?;` with exactly ONE adapter; any
+/// other adapter or a second one is `discarded gate`. 2: `<arg>` is a path
+/// (two or more `::` segments) or a closure literal. 3: the closure body holds
+/// no write, exit, `?`, nested closure, `async`, loop or macro outside
+/// [`B7_MAP_ERR_BODY_MACROS_9414`]. 4: `?;` directly after `map_err(..)`.
+/// 5: the dominance rule and the earlier seven conditions apply unchanged.
+const B7_MAP_ERR_ROWS_9414: &[(u8, &str, &str, &str, &str)] = &[
+    // ---- condition 1: accepted shape (positive rows)
+    (
+        1,
+        "map_err with a path arg",
+        "    gate_storage_conn(conn).map_err(StoreError::from)?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "credited",
+    ),
+    (
+        1,
+        "map_err with Into::into",
+        "    gate_storage_conn(conn).map_err(Into::into)?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "credited",
+    ),
+    (
+        1,
+        "map_err with a closure literal",
+        "    gate_storage_conn(conn).map_err(|e| Error::Db(e.to_string()))?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "credited",
+    ),
+    (
+        1,
+        "awaited gate, map_err with a path arg",
+        "    store.gate_record_stop().await.map_err(StoreError::from)?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "credited",
+    ),
+    (
+        1,
+        "awaited gate, map_err with a closure literal",
+        "    store.gate_record_stop().await.map_err(|e| Error::Db(e.to_string()))?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "credited",
+    ),
+    (
+        1,
+        "multi-line closure",
+        "    store.gate_record_stop().await.map_err(|e| {\n        Error::Db(e.to_string())\n    })?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "credited",
+    ),
+    (
+        1,
+        "closure body with != is not a macro",
+        "    gate_storage_conn(conn).map_err(|e| Error::Flag(e.code() != 0))?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "credited",
+    ),
+    (
+        1,
+        "real body src/store/postgres.rs reflect_with_hooks (verbatim)",
+        "        self.gate_record_stop()\n            .await\n            .map_err(|e| ReflectError::Database(e.to_string()))?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "credited",
+    ),
+    (
+        1,
+        "real body src/quotas.rs check_and_record_storage_only_in_transaction (verbatim)",
+        "    crate::storage::record_stop::gate_storage_conn(conn)\n        .map_err(|e| QuotaCheckError::Sql(e.into()))?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "credited",
+    ),
+    // ---- condition 1: every other adapter, and two adapters
+    (
+        1,
+        "adapter .ok()?",
+        "    gate_storage_conn(conn).ok()?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "discarded gate at line 2",
+    ),
+    (
+        1,
+        "adapter .or_else(..)?",
+        "    gate_storage_conn(conn).or_else(|_| Ok::<(), Error>(()))?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "discarded gate at line 2",
+    ),
+    (
+        1,
+        "adapter .unwrap_or_default()",
+        "    gate_storage_conn(conn).unwrap_or_default();\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "discarded gate at line 2",
+    ),
+    (
+        1,
+        "adapter .unwrap_or_else(..)",
+        "    gate_storage_conn(conn).unwrap_or_else(|_| ());\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "discarded gate at line 2",
+    ),
+    (
+        1,
+        "adapter .and_then(..)?",
+        "    gate_storage_conn(conn).and_then(|()| Ok(()))?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "discarded gate at line 2",
+    ),
+    (
+        1,
+        "adapter .map(..)?",
+        "    gate_storage_conn(conn).map(|()| ())?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "discarded gate at line 2",
+    ),
+    (
+        1,
+        "adapter .or(..)?",
+        "    gate_storage_conn(conn).or(Ok::<(), Error>(()))?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "discarded gate at line 2",
+    ),
+    (
+        1,
+        "adapter .is_ok()",
+        "    gate_storage_conn(conn).is_ok();\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "discarded gate at line 2",
+    ),
+    (
+        1,
+        "adapter .is_err()",
+        "    gate_storage_conn(conn).is_err();\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "discarded gate at line 2",
+    ),
+    (
+        1,
+        "let _ = gate.map_err(..)",
+        "    let _ = gate_storage_conn(conn).map_err(StoreError::from);\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "discarded gate at line 2",
+    ),
+    (
+        1,
+        "if let on gate.map_err(..)",
+        "    if let Err(e) = gate_storage_conn(conn).map_err(StoreError::from) {\n        return Err(e);\n    }\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        1,
+        "match on gate.map_err(..)",
+        "    match gate_storage_conn(conn).map_err(StoreError::from) {\n        Ok(()) => {}\n        Err(e) => return Err(e),\n    }\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        1,
+        "two map_err adapters",
+        "    gate_storage_conn(conn).map_err(StoreError::from).map_err(Error::from)?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "discarded gate at line 2",
+    ),
+    (
+        1,
+        "map_err then or_else",
+        "    gate_storage_conn(conn).map_err(StoreError::from).or_else(|_| Ok::<(), Error>(()))?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "discarded gate at line 2",
+    ),
+    (
+        1,
+        "map_err before .await",
+        "    store.gate_record_stop().map_err(StoreError::from).await?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    // ---- condition 2: <arg> shapes other than a path or a closure literal
+    (
+        2,
+        "arg is a call result",
+        "    gate_storage_conn(conn).map_err(make_err())?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        2,
+        "arg is a variable",
+        "    gate_storage_conn(conn).map_err(to_err)?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        2,
+        "arg is a field",
+        "    gate_storage_conn(conn).map_err(self.to_err)?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        2,
+        "arg is a macro call",
+        "    gate_storage_conn(conn).map_err(mk_err!())?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        2,
+        "arg is a block",
+        "    gate_storage_conn(conn).map_err({ StoreError::from })?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        2,
+        "arg is a move closure",
+        "    gate_storage_conn(conn).map_err(move |e| StoreError::from(e))?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        2,
+        "arg is a generic path",
+        "    gate_storage_conn(conn).map_err(StoreError::<E>::from)?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        2,
+        "arg is empty",
+        "    gate_storage_conn(conn).map_err()?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        2,
+        "arg is a bit-or expression, not a closure literal (one `|`, not first)",
+        "    gate_storage_conn(conn).map_err(to_err | StoreError::from)?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    // ---- condition 3: forbidden closure-body tokens, one by one
+    (
+        3,
+        "closure body returns",
+        "    gate_storage_conn(conn).map_err(|e| { return Error::from(e); })?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        3,
+        "closure body breaks a labelled block",
+        "    gate_storage_conn(conn).map_err(|e| { 'b: { break 'b Error::from(e); } })?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        3,
+        "closure body continues",
+        "    gate_storage_conn(conn).map_err(|e| { if e.is_x() { continue; } Error::from(e) })?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        3,
+        "closure body uses ?",
+        "    gate_storage_conn(conn).map_err(|e| Error::from(conv(e)?))?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        3,
+        "closure body holds a nested closure",
+        "    gate_storage_conn(conn).map_err(|e| Error::from((|x| x)(e)))?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        3,
+        "closure body is an async block",
+        "    gate_storage_conn(conn).map_err(|e| async { Error::from(e) })?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        3,
+        "closure body holds loop",
+        "    gate_storage_conn(conn).map_err(|e| { if e.is_x() { loop {} } Error::from(e) })?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        3,
+        "closure body holds while",
+        "    gate_storage_conn(conn).map_err(|e| { while e.is_x() {} Error::from(e) })?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        3,
+        "closure body holds for",
+        "    gate_storage_conn(conn).map_err(|e| { for _x in [0] {} Error::from(e) })?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        3,
+        "closure body panic!",
+        "    gate_storage_conn(conn).map_err(|e| panic!(\"{e}\"))?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        3,
+        "closure body unreachable!",
+        "    gate_storage_conn(conn).map_err(|_e| unreachable!())?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        3,
+        "closure body todo!",
+        "    gate_storage_conn(conn).map_err(|_e| todo!())?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        3,
+        "closure body unimplemented!",
+        "    gate_storage_conn(conn).map_err(|_e| unimplemented!())?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        3,
+        "closure body format! (not in the minimal allow set)",
+        "    gate_storage_conn(conn).map_err(|e| Error::Msg(format!(\"{e}\")))?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        3,
+        "closure body writes INSERT INTO",
+        "    gate_storage_conn(conn).map_err(|e| {\n        let _ = log.execute(\"INSERT INTO audit VALUES (1)\", []);\n        Error::from(e)\n    })?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        3,
+        "closure body writes INSERT OR",
+        "    gate_storage_conn(conn).map_err(|e| {\n        let _ = log.execute(\"INSERT OR REPLACE INTO audit VALUES (1)\", []);\n        Error::from(e)\n    })?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        3,
+        "closure body writes DELETE FROM",
+        "    gate_storage_conn(conn).map_err(|e| {\n        let _ = log.execute(\"DELETE FROM audit\", []);\n        Error::from(e)\n    })?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        3,
+        "closure body writes UPDATE .. SET",
+        "    gate_storage_conn(conn).map_err(|e| {\n        let _ = log.execute(\"UPDATE audit SET n = 1\", []);\n        Error::from(e)\n    })?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    // ---- condition 4: `?;` directly after map_err(..)
+    (
+        4,
+        "map_err without ?",
+        "    gate_storage_conn(conn).map_err(StoreError::from);\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        4,
+        "map_err? as a tail expression",
+        "    let _r: () = {\n        gate_storage_conn(conn).map_err(StoreError::from)?\n    };\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 3",
+    ),
+    (
+        4,
+        "map_err? bound by let",
+        "    let _x = gate_storage_conn(conn).map_err(StoreError::from)?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        4,
+        "map_err? in a call argument",
+        "    wrap(gate_storage_conn(conn).map_err(StoreError::from)?);\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        4,
+        "map_err? then a method call",
+        "    gate_storage_conn(conn).map_err(StoreError::from)?.touch();\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        4,
+        "map_err? compared",
+        "    gate_storage_conn(conn).map_err(StoreError::from)? == ();\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        4,
+        "map_err??",
+        "    gate_storage_conn(conn).map_err(StoreError::from)??;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    // Only the `;` statement-end rule catches this one: a brace macro body
+    // is macro input, not a statement list, so a gate ended by `,` there
+    // is never a direct gate statement.
+    (
+        4,
+        "map_err? ended by a comma in a brace macro body",
+        "    m! {\n        gate_storage_conn(conn).map_err(StoreError::from)?,\n        conn.execute(\"UPDATE t SET a = 1\", [])?\n    }",
+        "w",
+        "conditional gate at line 3",
+    ),
+    // ---- condition 5: earlier conditions 1-5 and 7 with the map_err form
+    (
+        5,
+        "earlier c1: map_err gate in a closure with the write",
+        "    let run = |c: &Connection| -> Result<()> {\n        gate_storage_conn(c).map_err(StoreError::from)?;\n        c.execute(\"UPDATE t SET a = 1\", [])?;\n        Ok(())\n    };\n    run(conn)?;",
+        "w",
+        "conditional gate at line 3",
+    ),
+    (
+        5,
+        "earlier c1: map_err gate in a macro argument",
+        "    log_err!(gate_storage_conn(conn).map_err(StoreError::from)?);\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 2",
+    ),
+    (
+        5,
+        "earlier c2: write outside the map_err gate's block",
+        "    if !id.is_empty() {\n        gate_storage_conn(conn).map_err(StoreError::from)?;\n    }\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 3",
+    ),
+    (
+        5,
+        "earlier c2: write before the map_err gate",
+        "    conn.execute(\"UPDATE t SET b = 2\", [])?;\n    gate_storage_conn(conn).map_err(StoreError::from)?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 3",
+    ),
+    (
+        5,
+        "earlier c3: write in a closure defined before the map_err gate",
+        "    let f = || conn.execute(\"UPDATE t SET b = 2\", []);\n    gate_storage_conn(conn).map_err(StoreError::from)?;\n    f()?;",
+        "w",
+        "conditional gate at line 3",
+    ),
+    (
+        5,
+        "earlier c4: return before the map_err gate, no write before",
+        "    if id.is_empty() {\n        return Ok((false, false));\n    }\n    gate_storage_conn(conn).map_err(|e| StoreError::Gate(e.to_string()))?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "credited",
+    ),
+    (
+        5,
+        "earlier c4: unconditional return directly before the map_err gate",
+        "    return Ok((false, false));\n    gate_storage_conn(conn).map_err(StoreError::from)?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 3",
+    ),
+    (
+        5,
+        "earlier c4: return before the map_err gate after a write",
+        "    conn.execute(\"UPDATE t SET b = 2\", [])?;\n    if id.is_empty() {\n        return Ok((false, false));\n    }\n    gate_storage_conn(conn).map_err(StoreError::from)?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 6",
+    ),
+    (
+        5,
+        "earlier c5: labelled block break jumps over the map_err gate",
+        "    'pre: {\n        if id.is_empty() {\n            break 'pre;\n        }\n        gate_storage_conn(conn).map_err(StoreError::from)?;\n    }\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 6",
+    ),
+    (
+        5,
+        "earlier c5: labelled break over the map_err gate, write in the same block",
+        "    'pre: {\n        if id.is_empty() {\n            break 'pre;\n        }\n        gate_storage_conn(conn).map_err(StoreError::from)?;\n        conn.execute(\"UPDATE t SET a = 1\", [])?;\n    }",
+        "w",
+        "conditional gate at line 6",
+    ),
+    (
+        5,
+        "earlier c7 m7a: map_err gate inside if false",
+        "    if false {\n        gate_storage_conn(conn).map_err(StoreError::from)?;\n    }\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 3",
+    ),
+    (
+        5,
+        "earlier c7 m7b: map_err gate after an early return on a path that still writes",
+        "    if id.is_empty() {\n        conn.execute(\"UPDATE t SET b = 2\", [])?;\n        return Ok((false, false));\n    }\n    gate_storage_conn(conn).map_err(StoreError::from)?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+        "w",
+        "conditional gate at line 6",
+    ),
+];
+
+/// #9414 ruling 9414-conditions-maperr — the conditions the table must cover.
+const B7_MAP_ERR_RULED_CONDITIONS_9414: &[u8] = &[1, 2, 3, 4, 5];
+/// #9414 ruling 9414-conditions-maperr condition 5 / earlier condition 6: a
+/// `map_err` gate in a file with an unclassifiable form is the tokenizer
+/// finding, never a credit.
+const B7_MAP_ERR_UNCLASSIFIABLE_9414: (&str, &str) = (
+    "    let _ = f\"x\";\n    gate_storage_conn(conn).map_err(StoreError::from)?;\n    conn.execute(\"UPDATE t SET a = 1\", [])?;",
+    "line 2: reserved literal prefix",
+);
+
+#[test]
+fn b7_map_err_gate_conditions_9414() {
+    let mut wrong = Vec::new();
+    for (cond, label, body, target, want) in B7_MAP_ERR_ROWS_9414 {
+        let got = b7_try_reason(&b7_fn(body), target);
+        if got.as_deref() != Ok(*want) {
+            wrong.push(format!(
+                "condition {cond} {label}: expected {want:?}, got {got:?}"
+            ));
+        }
+    }
+    for c in B7_MAP_ERR_RULED_CONDITIONS_9414 {
+        if !B7_MAP_ERR_ROWS_9414.iter().any(|r| r.0 == *c) {
+            wrong.push(format!("condition {c}: no row"));
+        }
+    }
+    let (body, finding) = B7_MAP_ERR_UNCLASSIFIABLE_9414;
+    let got = b7_try_reason(&b7_fn(body), "w");
+    if got != Err(finding.to_string()) {
+        wrong.push(format!(
+            "condition 5 earlier c6 unclassifiable form: expected Err({finding:?}), got {got:?}"
+        ));
+    }
+    assert!(
+        wrong.is_empty(),
+        "#9414 map_err gate rows misjudged:\n  {}",
+        wrong.join("\n  ")
+    );
+}
+
+/// #9414 — the allowlist row count, pinned: a new row without a change here
+/// is red.
+const B7_ALLOWLIST_ROW_COUNT_9414: usize = 74;
+/// #9414 — rows the ruling accepted only with a reason citing the filed
+/// product change that removes them.
+const B7_RULED_ALLOWLIST_ROWS_9414: &[(&str, &str)] = &[
+    ("src/storage/mod.rs", "reown"),
+    ("src/store/postgres/reown_3124.rs", "reown_pg"),
+];
+const B7_RULED_ALLOWLIST_ISSUE_9414: &str = "#9438";
+
+#[test]
+fn b7_allowlist_rows_are_counted_and_ruled_rows_cite_their_issue_9414() {
+    let txt = include_str!("record_stop_b7_allowlist.txt");
+    let rows: Vec<&str> = txt
+        .lines()
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect();
+    assert_eq!(
+        rows.len(),
+        B7_ALLOWLIST_ROW_COUNT_9414,
+        "#9414 B7 allowlist row count changed; a row needs a reviewed count change"
+    );
+    let lines: Vec<&str> = txt.lines().collect();
+    for (file, name) in B7_RULED_ALLOWLIST_ROWS_9414 {
+        let row = format!("{file}\t{name}");
+        let at = lines.iter().position(|l| *l == row);
+        assert!(at.is_some(), "#9414 ruled allowlist row `{row}` is missing");
+        let reason: Vec<&str> = lines[..at.unwrap_or(0)]
+            .iter()
+            .rev()
+            .take_while(|l| l.starts_with('#') || !l.contains('\t'))
+            .copied()
+            .collect();
+        assert!(
+            reason
+                .iter()
+                .any(|l| l.contains(B7_RULED_ALLOWLIST_ISSUE_9414)),
+            "#9414 ruled allowlist row `{row}` has no reason citing {B7_RULED_ALLOWLIST_ISSUE_9414}"
+        );
+    }
+}
+
+/// #9414 literal-form table: `(label, statement hiding a gate-looking text,
+/// statement with the same form and no gate text)`. The first must never be
+/// credited; the second, followed by a real gate, must be. `None` = the form
+/// cannot carry the gate text.
+const B7_LITERAL_FORM_ROWS_9414: &[(&str, Option<&str>, &str)] = &[
+    (
+        "string with escapes",
+        Some(r#"    let _ = "gate_storage_conn(conn)?; } \" {";"#),
+        r#"    let _ = "} \" {";"#,
+    ),
+    (
+        "raw string",
+        Some(r#"    let _ = r"gate_storage_conn(conn)?; }\";"#),
+        r#"    let _ = r"\";"#,
+    ),
+    (
+        "raw string with two #",
+        Some(r###"    let _ = r##"gate_storage_conn(conn)?; "# }"##;"###),
+        r###"    let _ = r##"" "# }"##;"###,
+    ),
+    (
+        "byte string",
+        Some(r#"    let _ = b"gate_storage_conn(conn)?; } \"";"#),
+        r#"    let _ = b"}\"";"#,
+    ),
+    (
+        "raw byte string",
+        Some(r##"    let _ = br#"gate_storage_conn(conn)?; }"#;"##),
+        r#"    let _ = br"\";"#,
+    ),
+    (
+        "C string",
+        Some(r#"    let _ = c"gate_storage_conn(conn)?; } \"";"#),
+        r#"    let _ = c"}\"";"#,
+    ),
+    (
+        "raw C string with #",
+        Some(r##"    let _ = cr#"gate_storage_conn(conn)?; }"#;"##),
+        r##"    let _ = cr#"\"#;"##,
+    ),
+    (
+        "raw C string ending in a backslash (9414 comment 6948153318)",
+        Some(r#"    let _ = cr"gate_storage_conn(conn)?; }\";"#),
+        r#"    let _ = cr"\";"#,
+    ),
+    ("char brace", None, "    let _ = '{';"),
+    ("char quote", None, "    let _ = '\"';"),
+    ("char escaped quote", None, r"    let _ = '\'';"),
+    ("byte char", None, "    let _ = b'\"';"),
+    ("lifetime", None, "    let _: &'static str = \"}\";"),
+    ("raw identifier", None, "    let r#match = \"}\";"),
+    (
+        "numbers",
+        None,
+        "    let _ = (1_000_u32, 0x1F, 1.5e-3, 2..3);",
+    ),
+    (
+        "line comment",
+        Some("    // gate_storage_conn(conn)?; }"),
+        "    // }",
+    ),
+    (
+        "nested block comment",
+        Some("    /* /* gate_storage_conn(conn)?; */ } */"),
+        "    /* /* } */ { */",
+    ),
+    (
+        "doc comment",
+        Some("    /// gate_storage_conn(conn)?; }"),
+        "    /// }",
+    ),
+];
+
+#[test]
+fn b7_literal_forms_never_hide_or_fake_a_gate_9414() {
+    let mut wrong = Vec::new();
+    for (label, hiding, plain) in B7_LITERAL_FORM_ROWS_9414 {
+        if let Some(h) = hiding {
+            let got = b7_try_verdict(&b7_plant(h), "w");
+            if got != Ok(false) {
+                wrong.push(format!("{label} (gate text in the form): got {got:?}"));
+            }
+        }
+        let real = format!("{plain}\n    gate_storage_conn(conn)?;");
+        let got = b7_try_verdict(&b7_plant(&real), "w");
+        if got != Ok(true) {
+            wrong.push(format!("{label} (real gate after the form): got {got:?}"));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "#9414 literal-form rows misjudged:\n  {}",
+        wrong.join("\n  ")
+    );
+}
+
+/// #9414 — forms the tokenizer cannot classify: `(label, statement, exact
+/// finding)`. Each is a finding naming the line (the plant's body starts on
+/// line 2), never skipped and never read as code.
+const B7_UNCLASSIFIABLE_ROWS_9414: &[(&str, &str, &str)] = &[
+    (
+        "reserved string prefix",
+        "    let _ = f\"gate_storage_conn(conn)\";",
+        "line 2: reserved literal prefix",
+    ),
+    (
+        "reserved guarded string",
+        "    let _ = #\"gate_storage_conn(conn)\"#;",
+        "line 2: reserved guarded string literal",
+    ),
+    (
+        "unterminated block comment",
+        "    /* gate_storage_conn(conn)?;",
+        "line 2: unterminated block comment",
+    ),
+    (
+        "char literal with two characters",
+        "    let _ = 'ab';",
+        "line 2: char literal with more than one character",
+    ),
+    (
+        "character outside the grammar",
+        "    let _ = `gate_storage_conn(conn)`;",
+        "line 2: unclassifiable character",
+    ),
+];
+
+#[test]
+fn b7_unclassifiable_form_is_a_finding_9414() {
+    let mut wrong = Vec::new();
+    for (label, stmt, finding) in B7_UNCLASSIFIABLE_ROWS_9414 {
+        let got = b7_try_verdict(&b7_plant(stmt), "w");
+        if got != Err((*finding).to_string()) {
+            wrong.push(format!("{label}: expected Err({finding:?}), got {got:?}"));
+        }
+    }
+    let hashes = "#".repeat(B7_RAW_HASH_OVER_LIMIT_9414);
+    let over = format!("    let _ = r{hashes}\"x\"{hashes};");
+    let got = b7_try_verdict(&b7_plant(&over), "w");
+    let want = "line 2: raw string delimiter has more than 255 #";
+    if got != Err(want.to_string()) {
+        wrong.push(format!(
+            "256 # raw string: expected Err({want:?}), got {got:?}"
+        ));
+    }
+    assert!(
+        wrong.is_empty(),
+        "#9414 unclassifiable rows misjudged:\n  {}",
+        wrong.join("\n  ")
+    );
+}
+
+/// #9414 — one more `#` than a raw string delimiter may carry (rustc: 255).
+const B7_RAW_HASH_OVER_LIMIT_9414: usize = 256;
+/// #9414 — size of the generated input of the linear bound.
+const B7_LINEAR_BOUND_BYTES_9414: usize = 100_000;
+/// #9414 — wall-clock ceiling for scanning that input (debug build).
+const B7_LINEAR_BOUND_CEILING_9414: std::time::Duration = std::time::Duration::from_secs(3);
+
+#[test]
+fn b7_scan_is_linear_on_a_100k_input_9414() {
+    // Every literal form, a deep brace nest, and a long quote run inside a
+    // raw string with many `#` (the shape that is quadratic in a naive
+    // closing-delimiter search).
+    let mut body = String::new();
+    let quotes = format!(
+        "    let _ = r{h}\"{q}\"{h};\n",
+        h = "#".repeat(200),
+        q = "\"#".repeat(400)
+    );
+    while body.len() < B7_LINEAR_BOUND_BYTES_9414 {
+        for (_, hiding, plain) in B7_LITERAL_FORM_ROWS_9414 {
+            body.push_str(hiding.unwrap_or(plain));
+            body.push('\n');
+        }
+        body.push_str(&quotes);
+        body.push_str("    { { { { let _ = '}'; } } } }\n");
+    }
+    body.push_str("    gate_storage_conn(conn)?;");
+    let src = b7_plant(&body);
+    assert!(
+        src.len() >= B7_LINEAR_BOUND_BYTES_9414,
+        "generated input too small"
+    );
+    let started = std::time::Instant::now();
+    let got = b7_try_verdict(&src, "w");
+    let took = started.elapsed();
+    assert_eq!(
+        got,
+        Ok(true),
+        "#9414 100K input: the trailing gate must be credited"
+    );
+    assert!(
+        took <= B7_LINEAR_BOUND_CEILING_9414,
+        "#9414 100K input took {took:?}, ceiling {B7_LINEAR_BOUND_CEILING_9414:?}"
+    );
+    // Op-count bound: one step per char plus at most RAW_HASH_LIMIT per
+    // quote inside a raw string, so steps <= (RAW_HASH_LIMIT + 1) * bytes.
+    let (tokens, steps) = rust_tokens::tokenize_steps(&src);
+    assert!(tokens.is_ok(), "#9414 100K input must tokenize: {tokens:?}");
+    let ceiling = u64::try_from((rust_tokens::RAW_HASH_LIMIT + 1) * src.len()).unwrap_or(u64::MAX);
+    assert!(
+        steps <= ceiling,
+        "#9414 100K input took {steps} steps, ceiling {ceiling}"
+    );
+}
+
+/// #9414 ruling 9414-conditions-maperr — one statement of the accepted shape,
+/// repeated to build the 100K-byte input of the `map_err` linear bound.
+const B7_MAP_ERR_BOUND_STMT_9414: &str = "    store.gate_record_stop().await.map_err(|e| {\n        Error::Db(e.to_string())\n    })?;\n";
+
+#[test]
+fn b7_scan_is_linear_on_a_100k_map_err_input_9414() {
+    let mut body = String::new();
+    while body.len() < B7_LINEAR_BOUND_BYTES_9414 {
+        body.push_str(B7_MAP_ERR_BOUND_STMT_9414);
+    }
+    body.push_str("    conn.execute(\"UPDATE t SET a = 1\", [])?;");
+    let src = b7_plant(&body);
+    assert!(
+        src.len() >= B7_LINEAR_BOUND_BYTES_9414,
+        "generated input too small"
+    );
+    let started = std::time::Instant::now();
+    let got = b7_try_verdict(&src, "w");
+    let took = started.elapsed();
+    assert_eq!(
+        got,
+        Ok(true),
+        "#9414 100K map_err input: the map_err gates must be credited"
+    );
+    assert!(
+        took <= B7_LINEAR_BOUND_CEILING_9414,
+        "#9414 100K map_err input took {took:?}, ceiling {B7_LINEAR_BOUND_CEILING_9414:?}"
+    );
+}
+
+#[test]
+fn b7_absent_fn_is_never_gated_9414() {
+    // Fail closed: a fn the scanner cannot find is not gated.
+    assert_eq!(
+        b7_try_verdict(&b7_plant("    gate_storage_conn(conn)?;"), "no_such_fn"),
+        Ok(false),
+        "#9414 an absent fn must read as ungated"
+    );
+}
+
+/// #9414 condition 6 — the real map_err-shape gates the scanner credits
+/// today, pinned: `reflect_with_hooks` (src/store/postgres.rs) and
+/// `check_and_record_storage_only_in_transaction` (src/quotas.rs). A new
+/// site needs a reviewed change here.
+const B7_MAP_ERR_REAL_SITES_9414: usize = 2;
+
+#[test]
+fn b7_map_err_real_sites_are_listed_9414() {
+    MAP_ERR_LISTING.with(|l| *l.borrow_mut() = Some((String::new(), Vec::new())));
+    record_stop_write_sql_fns_are_gated_or_allowlisted_b7();
+    let mut sites = MAP_ERR_LISTING
+        .with(|l| l.borrow_mut().take())
+        .map(|(_, s)| s)
+        .unwrap_or_default();
+    sites.sort();
+    sites.dedup();
+    for s in &sites {
+        println!("MAPERR-SITE {s}");
+    }
+    assert_eq!(
+        sites.len(),
+        B7_MAP_ERR_REAL_SITES_9414,
+        "#9414 real map_err-shape gate sites changed:\n  {}",
+        sites.join("\n  ")
     );
 }
