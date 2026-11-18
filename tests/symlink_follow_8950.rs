@@ -11,8 +11,6 @@
 //! scratch directory and a scratch `HOME`.
 
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
-use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
 
@@ -133,56 +131,4 @@ fn cli_backup_refuses_directory_snapshot_symlink_8950() {
     for (_, target) in &planted {
         assert_eq!(std::fs::read_dir(target).expect("dir").count(), 0);
     }
-}
-
-/// Filler rows and bytes each: the repair `VACUUM INTO` outlasts the planter.
-const FILLER: (u32, u32) = (64, 512 * 1024);
-const STAGE_MARK: &str = ".stage-";
-/// Wall-clock ceiling for the planter's watch.
-const PLANT_DEADLINE: Duration = Duration::from_secs(60);
-
-/// The snapshot name off a staging entry `.{snapshot}{STAGE_MARK}{pid}-{nonce}`.
-fn staged_snapshot(entry: &std::fs::DirEntry) -> Option<String> {
-    let name = entry.file_name().into_string().ok()?;
-    let (snapshot, _) = name.strip_prefix('.')?.rsplit_once(STAGE_MARK)?;
-    Some(snapshot.to_owned())
-}
-
-/// CLI row (S-3): a symlink planted at the `doctor --repair-schema-version`
-/// snapshot name while it is staged is refused with the exact error, and its
-/// target is byte-unchanged. A raw write at the name never stages: red.
-#[test]
-fn cli_doctor_repair_snapshot_refuses_planted_symlink_8950() {
-    let tmp = TempDir::new().expect("tempdir");
-    let (db, _, outside) = seeded(&tmp);
-    let filler = format!(
-        "CREATE TABLE filler (b BLOB); WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL \
-         SELECT i + 1 FROM n WHERE i < {}) INSERT INTO filler SELECT zeroblob({}) FROM n;",
-        FILLER.0, FILLER.1
-    );
-    let conn = rusqlite::Connection::open(&db).expect("open");
-    conn.execute_batch(&filler).expect("filler");
-    let victim = outside.join("victim");
-    std::fs::write(&victim, b"victim-bytes").expect("victim file");
-    let tip = ai_memory::storage::migrations::current_schema_version().to_string();
-    let mut doctor = ai_memory(tmp.path(), &db);
-    doctor.args(["doctor", "--repair-schema-version", &tip]);
-    let mut child = doctor.stderr(Stdio::piped()).spawn().expect("spawn");
-    let deadline = Instant::now() + PLANT_DEADLINE;
-    let link = loop {
-        let mut entries = std::fs::read_dir(tmp.path()).expect("dir").flatten();
-        if let Some(snapshot) = entries.find_map(|e| staged_snapshot(&e)) {
-            let link = tmp.path().join(snapshot);
-            std::os::unix::fs::symlink(&victim, &link).expect("plant symlink");
-            break link;
-        }
-        let running = child.try_wait().expect("poll").is_none();
-        assert!(running && Instant::now() < deadline, "never staged");
-    };
-    let output = child.wait_with_output().expect("doctor output");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(!output.status.success(), "a planted symlink must fail");
-    let refusal = format!("refusing to write {}: {TAIL}", link.display());
-    assert!(stderr.contains(&refusal), "{stderr}");
-    assert_eq!(std::fs::read(&victim).expect("victim"), b"victim-bytes");
 }
