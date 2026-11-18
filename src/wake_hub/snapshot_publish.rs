@@ -504,14 +504,12 @@ mod tests {
 
     /// Write site 1: the old snapshot the rename replaces.
     fn plant_old_snapshot(dst: &Path) -> anyhow::Result<()> {
-        std::fs::write(dst, b"old")?;
-        Ok(())
+        crate::storage::snapshot_file::write_replacing(dst, "old snapshot", b"old")
     }
 
     /// Write site 2: the entry that keeps the blocking directory non-empty.
     fn plant_blocker_entry(dst: &Path) -> anyhow::Result<()> {
-        std::fs::write(dst, b"k")?;
-        Ok(())
+        crate::storage::snapshot_file::write_replacing(dst, "blocker entry", b"k")
     }
 
     /// A symlink planted at the fixture name is refused with the #8950 named
