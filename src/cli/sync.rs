@@ -297,17 +297,19 @@ struct SyncPreview {
 }
 
 impl SyncPreview {
-    fn classify(local: Option<&models::Memory>, remote: &models::Memory) -> MergeOutcome {
-        match local {
-            None => MergeOutcome::New,
-            Some(existing) => {
-                if remote.updated_at > existing.updated_at {
-                    MergeOutcome::Update
-                } else {
-                    MergeOutcome::Noop
-                }
-            }
-        }
+    /// #8912 — the preview reports what the live run WOULD do: the same
+    /// [`sync_disposition`] verdict the write path takes, split by whether the
+    /// destination already holds the id.
+    fn classify(
+        dest: &rusqlite::Connection,
+        dest_row: Option<&models::Memory>,
+        incoming: &models::Memory,
+    ) -> Result<MergeOutcome> {
+        Ok(match sync_disposition(dest, incoming)? {
+            SyncDisposition::Write if dest_row.is_none() => MergeOutcome::New,
+            SyncDisposition::Write => MergeOutcome::Update,
+            SyncDisposition::KeptDestination | SyncDisposition::Covenant => MergeOutcome::Noop,
+        })
     }
 }
 
@@ -315,6 +317,134 @@ enum MergeOutcome {
     New,
     Update,
     Noop,
+}
+
+/// #8912 — the destination's verdict on one incoming row, decided BEFORE any
+/// write and inside the same write transaction as the write itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SyncDisposition {
+    /// The incoming row is newer than anything it would replace: write it.
+    Write,
+    /// The destination holds a newer (or equal) row under the same id or the
+    /// same live `(title, namespace)` slot: the older incoming row loses.
+    KeptDestination,
+    /// The destination forgot (tombstone) or archived the id: never re-admit
+    /// it (the `import` covenant, `cli/io.rs` `skipped_by_covenant`).
+    Covenant,
+}
+
+/// #8912 — the ONE newer-wins verdict for a sync write (live run AND preview).
+/// The tie-break mirrors `db::insert_if_newer`: an equal `updated_at` keeps the
+/// destination unless the incoming id sorts strictly after it.
+fn sync_disposition(
+    dest: &rusqlite::Connection,
+    incoming: &models::Memory,
+) -> Result<SyncDisposition> {
+    if db::memory_is_tombstoned(dest, &incoming.id)?
+        || db::memory_is_genuinely_archived(dest, &incoming.id)?
+    {
+        return Ok(SyncDisposition::Covenant);
+    }
+    let dest_newer: bool = dest.query_row(
+        &format!(
+            "SELECT EXISTS(SELECT 1 FROM memories \
+             WHERE (id = ?1 OR (title = ?2 AND namespace = ?3 AND {})) \
+             AND (updated_at > ?4 OR (updated_at = ?4 AND id >= ?1)))",
+            models::TITLE_SLOT_INDEX_PREDICATE
+        ),
+        rusqlite::params![
+            incoming.id,
+            incoming.title,
+            incoming.namespace,
+            incoming.updated_at
+        ],
+        |r| r.get(0),
+    )?;
+    Ok(if dest_newer {
+        SyncDisposition::KeptDestination
+    } else {
+        SyncDisposition::Write
+    })
+}
+
+/// #8912 — which funnel a sync leg writes an admitted row through.
+#[derive(Clone, Copy)]
+enum SyncWrite {
+    /// pull / push: the plain insert funnel (a primary-key clash is refused).
+    Insert,
+    /// merge: the last-writer-wins funnel.
+    InsertIfNewer,
+}
+
+/// #8912 — the named, counted outcome of every row a sync leg offered.
+#[derive(Default)]
+struct SyncWriteTally {
+    written: usize,
+    kept_destination: usize,
+    skipped_by_covenant: usize,
+    refused: usize,
+}
+
+/// #8912 — decide and write ONE row as a single write transaction, so no
+/// writer can land between the newer-wins verdict and the write. A write the
+/// destination rejects is counted `refused` and named on stderr (never
+/// dropped silently); the run then exits `EXIT_EXPORT_INCOMPLETE`.
+fn sync_write(
+    dest: &rusqlite::Connection,
+    mem: &models::Memory,
+    mode: SyncWrite,
+    tally: &mut SyncWriteTally,
+    out: &mut CliOutput<'_>,
+) -> Result<()> {
+    let verdict = db::in_write_txn(dest, || {
+        let disposition = sync_disposition(dest, mem)?;
+        if disposition == SyncDisposition::Write {
+            match mode {
+                SyncWrite::Insert => db::insert(dest, mem),
+                SyncWrite::InsertIfNewer => db::insert_if_newer(dest, mem),
+            }?;
+        }
+        Ok(disposition)
+    });
+    match verdict {
+        Ok(SyncDisposition::Write) => tally.written += 1,
+        Ok(SyncDisposition::KeptDestination) => tally.kept_destination += 1,
+        Ok(SyncDisposition::Covenant) => tally.skipped_by_covenant += 1,
+        Err(e) => {
+            tally.refused += 1;
+            tracing::warn!(memory_id = %mem.id, "sync: destination refused the row: {e:#}");
+            writeln!(out.stderr, "sync: refused memory {}: {e:#}", mem.id)?;
+        }
+    }
+    Ok(())
+}
+
+/// #8912 — text lines for the non-zero sync outcomes, then the exit code
+/// (precedent `cli/io.rs` `import_exit_code`): a refused row means the
+/// destination is NOT a faithful copy, so the run exits non-zero.
+fn sync_outcome(tally: &SyncWriteTally, json_out: bool, out: &mut CliOutput<'_>) -> Result<i32> {
+    tracing::debug!(
+        kept_destination = tally.kept_destination,
+        "sync: older incoming rows kept the newer destination row"
+    );
+    if !json_out && tally.skipped_by_covenant > 0 {
+        writeln!(
+            out.stdout,
+            "  {} row(s) skipped: the destination forgot or archived them",
+            tally.skipped_by_covenant
+        )?;
+    }
+    if tally.refused == 0 {
+        return Ok(0);
+    }
+    let code = crate::export_scope::EXIT_EXPORT_INCOMPLETE;
+    writeln!(
+        out.stderr,
+        "ERROR: this sync was INCOMPLETE — {} row(s) were refused by the destination \
+         (named above). Exiting {code}.",
+        tally.refused
+    )?;
+    Ok(code)
 }
 
 /// `sync` handler.
@@ -325,7 +455,7 @@ pub fn run(
     json_out: bool,
     cli_agent_id: Option<&str>,
     out: &mut CliOutput<'_>,
-) -> Result<()> {
+) -> Result<i32> {
     // v1.0.0 #2572 — REFUSE the LOCAL-store leg on a Postgres deployment BEFORE
     // opening the local sqlite (see `refuse_pg_store`). The `--remote-db` leg is
     // an explicit second sqlite FILE argument, not the configured store, so it
@@ -351,18 +481,20 @@ pub fn run(
         // local path too, instead of creating it.
         let local_conn = db::open_existing_read_only(db_path)?;
         let remote_conn = db::open_existing_read_only(&args.remote_db)?;
-        return cmd_sync_dry_run(&local_conn, &remote_conn, &args.direction, json_out, out);
+        cmd_sync_dry_run(&local_conn, &remote_conn, &args.direction, json_out, out)?;
+        return Ok(0);
     }
     let local_conn = db::open(db_path)?;
     let remote_conn = db::open(&args.remote_db)?;
     let caller_id = identity::resolve_agent_id(cli_agent_id, None)?;
+    // #8912 — every row any leg offers ends in exactly one named counter.
+    let mut writes = SyncWriteTally::default();
 
     match args.direction.as_str() {
         "pull" => {
             let mems = db::export_all(&remote_conn)?;
             let links = db::export_links(&remote_conn)?;
             validate_final_lineage_graph(&local_conn, &links)?;
-            let mut n = 0;
             let mut tally = InboundAttestTally::default();
             for mem in &mems {
                 let mut owned = mem.clone();
@@ -401,11 +533,10 @@ pub fn run(
                     tracing::warn!("sync: skipping invalid memory {}: {}", owned.id, e);
                     continue;
                 }
-                if db::insert(&local_conn, &owned).is_ok() {
-                    n += 1;
-                }
+                sync_write(&local_conn, &owned, SyncWrite::Insert, &mut writes, out)?;
             }
             import_sync_links(&local_conn, &links)?;
+            let n = writes.written;
             if json_out {
                 writeln!(
                     out.stdout,
@@ -419,6 +550,8 @@ pub fn run(
                         (models::field_names::FORGED_SIGNATURE_SKIPPED): tally.forged_skipped,
                         (models::field_names::PUBKEY_BINDINGS_STRIPPED): tally.pubkey_bindings_stripped,
                         "key_history_refused": tally.key_history_refused,
+                        (models::field_names::SKIPPED_BY_COVENANT): writes.skipped_by_covenant,
+                        "refused": writes.refused,
                     })
                 )?;
             } else {
@@ -430,7 +563,6 @@ pub fn run(
             let mems = db::export_all(&local_conn)?;
             let links = db::export_links(&local_conn)?;
             validate_final_lineage_graph(&remote_conn, &links)?;
-            let mut n = 0;
             let mut pubkey_bindings_stripped = 0usize;
             for mem in &mems {
                 let mut owned = mem.clone();
@@ -439,11 +571,10 @@ pub fn run(
                     tracing::warn!("sync: skipping invalid memory {}: {}", owned.id, e);
                     continue;
                 }
-                if db::insert(&remote_conn, &owned).is_ok() {
-                    n += 1;
-                }
+                sync_write(&remote_conn, &owned, SyncWrite::Insert, &mut writes, out)?;
             }
             import_sync_links(&remote_conn, &links)?;
+            let n = writes.written;
             if json_out {
                 writeln!(
                     out.stdout,
@@ -452,6 +583,8 @@ pub fn run(
                         "direction": "push",
                         "exported": n,
                         (models::field_names::PUBKEY_BINDINGS_STRIPPED): pubkey_bindings_stripped,
+                        (models::field_names::SKIPPED_BY_COVENANT): writes.skipped_by_covenant,
+                        "refused": writes.refused,
                     })
                 )?;
             } else {
@@ -472,7 +605,6 @@ pub fn run(
             // Both legs leave the SAME final graph (the union), so one
             // verdict covers both directions.
             validate_final_lineage_graph(&local_conn, &r_links)?;
-            let (mut pulled, mut pushed) = (0, 0);
             let mut tally = InboundAttestTally::default();
             for mem in &r_mems {
                 let mut owned = mem.clone();
@@ -508,20 +640,30 @@ pub fn run(
                 if validate::validate_memory(&owned).is_err() {
                     continue;
                 }
-                if db::insert_if_newer(&local_conn, &owned).is_ok() {
-                    pulled += 1;
-                }
+                sync_write(
+                    &local_conn,
+                    &owned,
+                    SyncWrite::InsertIfNewer,
+                    &mut writes,
+                    out,
+                )?;
             }
+            let pulled = writes.written;
             for mem in &l_mems {
                 let mut owned = mem.clone();
                 strip_sync_pubkey_binding(&mut owned, &mut tally.pubkey_bindings_stripped);
                 if validate::validate_memory(&owned).is_err() {
                     continue;
                 }
-                if db::insert_if_newer(&remote_conn, &owned).is_ok() {
-                    pushed += 1;
-                }
+                sync_write(
+                    &remote_conn,
+                    &owned,
+                    SyncWrite::InsertIfNewer,
+                    &mut writes,
+                    out,
+                )?;
             }
+            let pushed = writes.written.saturating_sub(pulled);
             // Every node of BOTH legs exists on both sides before either edge
             // set is imported (v1.0.0 #3435 — edges after nodes).
             import_sync_links(&local_conn, &r_links)?;
@@ -539,6 +681,9 @@ pub fn run(
                         (models::field_names::FORGED_SIGNATURE_SKIPPED): tally.forged_skipped,
                         (models::field_names::PUBKEY_BINDINGS_STRIPPED): tally.pubkey_bindings_stripped,
                         "key_history_refused": tally.key_history_refused,
+                        // #8912 — summed over BOTH legs.
+                        (models::field_names::SKIPPED_BY_COVENANT): writes.skipped_by_covenant,
+                        "refused": writes.refused,
                     })
                 )?;
             } else {
@@ -548,7 +693,7 @@ pub fn run(
         }
         _ => unreachable!("direction validated before either database was opened"),
     }
-    Ok(())
+    sync_outcome(&writes, json_out, out)
 }
 
 /// v1.0.0 #3435 — refusal slug for a `sync` remote that does not exist.
@@ -652,7 +797,8 @@ fn cmd_sync_dry_run(
 
     if classify_pull {
         for mem in &r_mems {
-            match SyncPreview::classify(local_by_id.get(mem.id.as_str()).copied(), mem) {
+            match SyncPreview::classify(local_conn, local_by_id.get(mem.id.as_str()).copied(), mem)?
+            {
                 MergeOutcome::New => preview.would_pull_new += 1,
                 MergeOutcome::Update => preview.would_pull_update += 1,
                 MergeOutcome::Noop => preview.would_pull_noop += 1,
@@ -663,7 +809,11 @@ fn cmd_sync_dry_run(
 
     if classify_push {
         for mem in &l_mems {
-            match SyncPreview::classify(remote_by_id.get(mem.id.as_str()).copied(), mem) {
+            match SyncPreview::classify(
+                remote_conn,
+                remote_by_id.get(mem.id.as_str()).copied(),
+                mem,
+            )? {
                 MergeOutcome::New => preview.would_push_new += 1,
                 MergeOutcome::Update => preview.would_push_update += 1,
                 MergeOutcome::Noop => preview.would_push_noop += 1,

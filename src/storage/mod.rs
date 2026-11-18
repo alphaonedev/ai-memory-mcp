@@ -4364,231 +4364,221 @@ pub fn update_with_archive_on_supersede(
     expected_version: Option<i64>,
     edit_source: crate::models::EditSource,
 ) -> Result<SupersedeResult> {
-    // Read the existing row so we can compose the patched NEW row.
-    let mut stmt = conn.prepare_cached(SQL_SELECT_MEMORY_ROW_BY_ID)?;
-    let mut rows = stmt.query_map(params![id], row_to_memory)?;
-    let Some(Ok(existing)) = rows.next() else {
-        // #962 typed envelope — 404 NOT_FOUND through MemoryError mapping.
-        return Err(anyhow::Error::new(StorageError::MemoryNotFound {
-            id: id.to_string(),
-            role: None,
-        }));
-    };
-    drop(rows);
-    drop(stmt);
+    // #4034 — read the row we compose from INSIDE the write transaction.
+    connection::in_write_txn(conn, || -> Result<SupersedeResult> {
+        let mut stmt = conn.prepare_cached(SQL_SELECT_MEMORY_ROW_BY_ID)?;
+        let mut rows = stmt.query_map(params![id], row_to_memory)?;
+        let Some(Ok(existing)) = rows.next() else {
+            // #962 typed envelope — 404 NOT_FOUND through MemoryError mapping.
+            return Err(anyhow::Error::new(StorageError::MemoryNotFound {
+                id: id.to_string(),
+                role: None,
+            }));
+        };
+        drop(rows);
+        drop(stmt);
 
-    // #2060 — TRACT covenant clause 2: authorship-immutability gate.
-    // Same detection as `update_with_expected_version`; this append-and-
-    // archive supersede path composes its own new-row metadata below, so
-    // the caller's RAW patch metadata is checked here too.
-    consult_authorship_immutable_gate(
-        existing.metadata.get("agent_id").and_then(|v| v.as_str()),
-        metadata,
-    )?;
+        // #2060 — TRACT covenant clause 2: authorship-immutability gate.
+        // Same detection as `update_with_expected_version`; this append-and-
+        // archive supersede path composes its own new-row metadata below, so
+        // the caller's RAW patch metadata is checked here too.
+        consult_authorship_immutable_gate(
+            existing.metadata.get("agent_id").and_then(|v| v.as_str()),
+            metadata,
+        )?;
 
-    // v0.7.0 Provenance Gap 1 (#884) — optimistic-concurrency gate.
-    if let Some(expected) = expected_version
-        && existing.version != expected
-    {
-        return Err(VersionConflict {
-            id: existing.id.clone(),
-            expected,
-            current: existing.version,
-        }
-        .into());
-    }
-
-    // Compose the NEW memory row by overlaying the patch on the
-    // OLD row. Mirrors the in-place `update` patch semantics:
-    // unspecified fields inherit from the existing row.
-    let new_id = uuid::Uuid::new_v4().to_string();
-    let now = Utc::now().to_rfc3339();
-    let new_title = title.unwrap_or(&existing.title).to_string();
-    let new_content = content.unwrap_or(&existing.content).to_string();
-    // Tier monotonicity preserved (long ≥ mid ≥ short).
-    let new_tier = match (tier, &existing.tier) {
-        (Some(requested), existing_tier) => match (existing_tier, requested) {
-            (Tier::Long, _) => Tier::Long,
-            (Tier::Mid, Tier::Short) => Tier::Mid,
-            (_, r) => r.clone(),
-        },
-        (None, existing_tier) => existing_tier.clone(),
-    };
-    let new_namespace = namespace.unwrap_or(&existing.namespace).to_string();
-    let new_tags = tags.cloned().unwrap_or_else(|| existing.tags.clone());
-    let new_priority = priority.unwrap_or(existing.priority);
-    let new_confidence = confidence.unwrap_or(existing.confidence);
-    let new_expires = match expires_at {
-        Some("" | "null") => None,
-        Some(v) => Some(v.to_string()),
-        None => existing.expires_at.clone(),
-    };
-    // v1.0.0 #2331 (FBL-01) — same #1626 tier→long ⇒ expires_at = NULL
-    // coupling as `update_with_expected_version`: the superseding row is a
-    // FRESH id (the insert ON CONFLICT long⇒NULL arm never fires for it),
-    // so a mid→long supersede would otherwise inherit the OLD row's live
-    // TTL and the tier-blind GC would reap the new "permanent" row.
-    let new_expires = if matches!(new_tier, Tier::Long) {
-        None
-    } else {
-        new_expires
-    };
-    // v0.7.0 Provenance Gap 2 (#906) — caller-supplied source_uri
-    // wins; otherwise inherit from the OLD row. Mirrors the pattern
-    // used for title/content/tier above.
-    let new_source_uri = match source_uri {
-        Some(uri) => Some(uri.to_string()),
-        None => existing.source_uri.clone(),
-    };
-    // Stamp the edit-source provenance into the new row's metadata so
-    // downstream observers can tell this row came from an
-    // append-and-archive supersede vs. a direct user write.
-    // #2106 review item 2 — preserve the immutable provenance keys
-    // (agent_id + derived_from / consolidated_from_agents) from the OLD row
-    // onto the superseding row so a full-object metadata patch that OMITS
-    // agent_id does not silently ERASE authorship (erasure being strictly
-    // worse than the rewrite the clause-2 gate already refuses). The
-    // superseding row is a fresh id, so `insert`'s ON CONFLICT preservation
-    // never fires — this is the equivalent guard on the mint-new-id path.
-    let patched_metadata = metadata
-        .cloned()
-        .unwrap_or_else(|| existing.metadata.clone());
-    let mut new_metadata =
-        crate::identity::preserve_update_provenance_keys(&existing.metadata, &patched_metadata);
-    if let serde_json::Value::Object(ref mut m) = new_metadata {
-        m.insert(
-            "edit_source".to_string(),
-            serde_json::Value::String(edit_source.as_str().to_string()),
-        );
-        m.insert(
-            field_names::SUPERSEDED_ID.to_string(),
-            serde_json::Value::String(existing.id.clone()),
-        );
-    }
-    // #3420 — the SUPERSEDING row is a FRESH row: new id and, below, a fresh
-    // `created_at` (= `now`). `created_at` is inside the signed
-    // `SignableWrite` envelope, so a carried `write_signature` can NEVER
-    // re-derive from it — the entitlement funnel therefore always drops the
-    // attestation to `claimed` here, and never mints one from a caller-supplied
-    // patch. Stated through the SAME shared decision as the in-place funnel so
-    // the two can never drift.
-    {
-        let existing_agent_id = metadata_agent_id_slot(&existing.metadata).unwrap_or("");
-        let entitled = crate::identity::attest::entitled_update_attestation(
-            &existing.metadata,
-            crate::identity::attest::SignedEnvelopeFields {
-                agent_id: existing_agent_id,
-                namespace: &existing.namespace,
-                title: &existing.title,
-                kind: existing.memory_kind.as_str(),
-                created_at: &existing.created_at,
-                content: &existing.content,
-            },
-            crate::identity::attest::SignedEnvelopeFields {
-                agent_id: existing_agent_id,
-                namespace: &new_namespace,
-                title: &new_title,
-                kind: existing.memory_kind.as_str(),
-                created_at: &now,
-                content: &new_content,
-            },
-        );
-        if let Some(reconciled) =
-            crate::identity::attest::apply_entitled_attestation(&new_metadata, &entitled)
+        // v0.7.0 Provenance Gap 1 (#884) — optimistic-concurrency gate.
+        if let Some(expected) = expected_version
+            && existing.version != expected
         {
-            tracing::warn!(
-                target: "ai_memory::storage::update",
-                memory_id = %existing.id,
-                superseding_id = %new_id,
-                downgrade = entitled.is_downgrade_from(&existing.metadata),
-                "supersede reconciled the new row's attestation: a fresh created_at puts it \
-                 outside every signature the OLD row carried (#3420)"
-            );
-            new_metadata = reconciled;
+            return Err(VersionConflict {
+                id: existing.id.clone(),
+                expected,
+                current: existing.version,
+            }
+            .into());
         }
-    }
 
-    // #1638 — archive + insert run inside ONE BEGIN IMMEDIATE (below),
-    // honoring the documented atomicity contract: a failure mid-way
-    // (SQLITE_BUSY from a concurrent CLI-process writer, ENOSPC, FTS
-    // trigger I/O error on the insert) rolls back the archive too, so
-    // the OLD row stays live instead of vanishing into the archive
-    // with an error returned. Uses `archive_memory_no_tx` (the
-    // `append_signed_event_no_tx` idiom) because SQLite refuses
-    // nested transactions.
-    let archived_id = existing.id.clone();
+        // Compose the NEW memory row by overlaying the patch on the
+        // OLD row. Mirrors the in-place `update` patch semantics:
+        // unspecified fields inherit from the existing row.
+        let new_id = uuid::Uuid::new_v4().to_string();
+        let now = Utc::now().to_rfc3339();
+        let new_title = title.unwrap_or(&existing.title).to_string();
+        let new_content = content.unwrap_or(&existing.content).to_string();
+        // Tier monotonicity preserved (long ≥ mid ≥ short).
+        let new_tier = match (tier, &existing.tier) {
+            (Some(requested), existing_tier) => match (existing_tier, requested) {
+                (Tier::Long, _) => Tier::Long,
+                (Tier::Mid, Tier::Short) => Tier::Mid,
+                (_, r) => r.clone(),
+            },
+            (None, existing_tier) => existing_tier.clone(),
+        };
+        let new_namespace = namespace.unwrap_or(&existing.namespace).to_string();
+        let new_tags = tags.cloned().unwrap_or_else(|| existing.tags.clone());
+        let new_priority = priority.unwrap_or(existing.priority);
+        let new_confidence = confidence.unwrap_or(existing.confidence);
+        let new_expires = match expires_at {
+            Some("" | "null") => None,
+            Some(v) => Some(v.to_string()),
+            None => existing.expires_at.clone(),
+        };
+        // v1.0.0 #2331 (FBL-01) — same #1626 tier→long ⇒ expires_at = NULL
+        // coupling as `update_with_expected_version`: the superseding row is a
+        // FRESH id (the insert ON CONFLICT long⇒NULL arm never fires for it),
+        // so a mid→long supersede would otherwise inherit the OLD row's live
+        // TTL and the tier-blind GC would reap the new "permanent" row.
+        let new_expires = if matches!(new_tier, Tier::Long) {
+            None
+        } else {
+            new_expires
+        };
+        // v0.7.0 Provenance Gap 2 (#906) — caller-supplied source_uri
+        // wins; otherwise inherit from the OLD row. Mirrors the pattern
+        // used for title/content/tier above.
+        let new_source_uri = match source_uri {
+            Some(uri) => Some(uri.to_string()),
+            None => existing.source_uri.clone(),
+        };
+        // Stamp the edit-source provenance into the new row's metadata so
+        // downstream observers can tell this row came from an
+        // append-and-archive supersede vs. a direct user write.
+        // #2106 review item 2 — preserve the immutable provenance keys
+        // (agent_id + derived_from / consolidated_from_agents) from the OLD row
+        // onto the superseding row so a full-object metadata patch that OMITS
+        // agent_id does not silently ERASE authorship (erasure being strictly
+        // worse than the rewrite the clause-2 gate already refuses). The
+        // superseding row is a fresh id, so `insert`'s ON CONFLICT preservation
+        // never fires — this is the equivalent guard on the mint-new-id path.
+        let patched_metadata = metadata
+            .cloned()
+            .unwrap_or_else(|| existing.metadata.clone());
+        let mut new_metadata =
+            crate::identity::preserve_update_provenance_keys(&existing.metadata, &patched_metadata);
+        if let serde_json::Value::Object(ref mut m) = new_metadata {
+            m.insert(
+                "edit_source".to_string(),
+                serde_json::Value::String(edit_source.as_str().to_string()),
+            );
+            m.insert(
+                field_names::SUPERSEDED_ID.to_string(),
+                serde_json::Value::String(existing.id.clone()),
+            );
+        }
+        // #3420 — the SUPERSEDING row is a FRESH row: new id and, below, a fresh
+        // `created_at` (= `now`). `created_at` is inside the signed
+        // `SignableWrite` envelope, so a carried `write_signature` can NEVER
+        // re-derive from it — the entitlement funnel therefore always drops the
+        // attestation to `claimed` here, and never mints one from a caller-supplied
+        // patch. Stated through the SAME shared decision as the in-place funnel so
+        // the two can never drift.
+        {
+            let existing_agent_id = metadata_agent_id_slot(&existing.metadata).unwrap_or("");
+            let entitled = crate::identity::attest::entitled_update_attestation(
+                &existing.metadata,
+                crate::identity::attest::SignedEnvelopeFields {
+                    agent_id: existing_agent_id,
+                    namespace: &existing.namespace,
+                    title: &existing.title,
+                    kind: existing.memory_kind.as_str(),
+                    created_at: &existing.created_at,
+                    content: &existing.content,
+                },
+                crate::identity::attest::SignedEnvelopeFields {
+                    agent_id: existing_agent_id,
+                    namespace: &new_namespace,
+                    title: &new_title,
+                    kind: existing.memory_kind.as_str(),
+                    created_at: &now,
+                    content: &new_content,
+                },
+            );
+            if let Some(reconciled) =
+                crate::identity::attest::apply_entitled_attestation(&new_metadata, &entitled)
+            {
+                tracing::warn!(
+                    target: "ai_memory::storage::update",
+                    memory_id = %existing.id,
+                    superseding_id = %new_id,
+                    downgrade = entitled.is_downgrade_from(&existing.metadata),
+                    "supersede reconciled the new row's attestation: a fresh created_at puts it \
+                     outside every signature the OLD row carried (#3420)"
+                );
+                new_metadata = reconciled;
+            }
+        }
 
-    // FX-C5 — compose the NEW row up front so the substrate
-    // pre-write governance hook (`GOVERNANCE_PRE_WRITE`) gets a
-    // chance to refuse BEFORE the archive step destroys the live
-    // OLD row. Pre-FX-C5 the hook was consulted transitively via
-    // `insert(..)` at the tail of this function; archive ran first
-    // so a refusal left the live table without the OLD row AND
-    // without the patched NEW row. Now the hook fires on a fully-
-    // composed candidate before any state mutation, mirroring the
-    // FX-2 pattern on the postgres adapter (see
-    // `consult_governance_pre_write_pg` in `src/store/postgres.rs`).
-    let mut new_mem = existing.clone();
-    new_mem.id = new_id.clone();
-    new_mem.title = new_title;
-    new_mem.content = new_content;
-    new_mem.tier = new_tier;
-    new_mem.namespace = new_namespace;
-    new_mem.tags = new_tags;
-    new_mem.priority = new_priority;
-    new_mem.confidence = new_confidence;
-    new_mem.expires_at = new_expires;
-    new_mem.metadata = new_metadata;
-    new_mem.source_uri = new_source_uri;
-    new_mem.created_at = now.clone();
-    new_mem.updated_at = now.clone();
-    new_mem.access_count = 0;
-    new_mem.last_accessed_at = None;
-    // The NEW row starts at version=1 — it is a fresh row, not a
-    // continuation of the OLD row's version chain (the chain is
-    // preserved via the supersede link stamped in metadata).
-    new_mem.version = crate::models::default_memory_version();
+        // #1638 — archive + insert run inside ONE BEGIN IMMEDIATE (#4034: top),
+        // honoring the documented atomicity contract: a failure mid-way
+        // (SQLITE_BUSY from a concurrent CLI-process writer, ENOSPC, FTS
+        // trigger I/O error on the insert) rolls back the archive too, so
+        // the OLD row stays live instead of vanishing into the archive
+        // with an error returned. Uses `archive_memory_no_tx` (the
+        // `append_signed_event_no_tx` idiom) because SQLite refuses
+        // nested transactions.
+        let archived_id = existing.id.clone();
 
-    // FX-C5 — consult the substrate governance pre-write hook on
-    // the composed NEW row BEFORE archiving the OLD row. A refusal
-    // returns cleanly with no state change.
-    consult_governance_pre_write(&new_mem)?;
+        // FX-C5 — compose the NEW row up front so the substrate
+        // pre-write governance hook (`GOVERNANCE_PRE_WRITE`) gets a
+        // chance to refuse BEFORE the archive step destroys the live
+        // OLD row. Pre-FX-C5 the hook was consulted transitively via
+        // `insert(..)` at the tail of this function; archive ran first
+        // so a refusal left the live table without the OLD row AND
+        // without the patched NEW row. Now the hook fires on a fully-
+        // composed candidate before any state mutation, mirroring the
+        // FX-2 pattern on the postgres adapter (see
+        // `consult_governance_pre_write_pg` in `src/store/postgres.rs`).
+        let mut new_mem = existing.clone();
+        new_mem.id = new_id.clone();
+        new_mem.title = new_title;
+        new_mem.content = new_content;
+        new_mem.tier = new_tier;
+        new_mem.namespace = new_namespace;
+        new_mem.tags = new_tags;
+        new_mem.priority = new_priority;
+        new_mem.confidence = new_confidence;
+        new_mem.expires_at = new_expires;
+        new_mem.metadata = new_metadata;
+        new_mem.source_uri = new_source_uri;
+        new_mem.created_at = now.clone();
+        new_mem.updated_at = now.clone();
+        new_mem.access_count = 0;
+        new_mem.last_accessed_at = None;
+        // The NEW row starts at version=1 — it is a fresh row, not a
+        // continuation of the OLD row's version chain (the chain is
+        // preserved via the supersede link stamped in metadata).
+        new_mem.version = crate::models::default_memory_version();
 
-    // Steps 1+2 (#1638): one transaction around archive + insert.
-    let write_txn = connection::WriteTxn::begin(conn)?;
-    let tx_result = (|| -> Result<()> {
-        // Step 1: archive the OLD row with reason='superseded'.
+        // FX-C5 — consult the substrate governance pre-write hook on
+        // the composed NEW row BEFORE archiving the OLD row. A refusal
+        // returns cleanly with no state change.
+        consult_governance_pre_write(&new_mem)?;
+
+        // Steps 1+2 (#1638): archive + insert in the transaction opened above;
+        // an Err rolls both back. Step 1: archive the OLD row as 'superseded'.
         let moved = archive_memory_no_tx(conn, &archived_id, Some("superseded"))?;
         if !moved {
-            // #962 typed envelope — substrate-internal fault (DB row
-            // vanished between read and write or row count drifted).
-            // Maps to 500.
+            // #962 typed envelope — substrate-internal fault (row count
+            // drifted under the lock). Maps to 500.
             return Err(anyhow::Error::new(StorageError::ArchiveSupersedeFailed {
                 archived_id: archived_id.clone(),
             }));
         }
         // Step 2: insert the NEW row carrying the patched content.
         insert(conn, &new_mem)?;
-        Ok(())
-    })();
-    match tx_result {
-        Ok(()) => write_txn.commit()?,
-        Err(e) => {
-            write_txn.rollback();
-            return Err(e);
-        }
-    }
 
-    // Step 3: the supersede edge from new→archived id is preserved
-    // in the new row's `metadata.superseded_id` (see above). A
-    // proper `memory_links` row would trip the FK CHECK on
-    // `target_id REFERENCES memories(id)` because the OLD row no
-    // longer lives in `memories`; the metadata pointer is the
-    // substrate-clean way to record the lineage until archive
-    // cross-references land (tracked separately).
-    Ok(SupersedeResult {
-        archived_id,
-        new_id,
+        // Step 3: the supersede edge from new→archived id is preserved
+        // in the new row's `metadata.superseded_id` (see above). A
+        // proper `memory_links` row would trip the FK CHECK on
+        // `target_id REFERENCES memories(id)` because the OLD row no
+        // longer lives in `memories`; the metadata pointer is the
+        // substrate-clean way to record the lineage until archive
+        // cross-references land (tracked separately).
+        Ok(SupersedeResult {
+            archived_id,
+            new_id,
+        })
     })
 }
 
@@ -8736,30 +8726,28 @@ pub fn promote_to_namespace(
     to_namespace: &str,
     promoted_by: Option<&str>,
 ) -> Result<String> {
-    let source = get(conn, source_id)?.ok_or_else(|| {
-        // #962 typed envelope. `Source` here labels the promotion source,
-        // not a link end, but the user-facing message ("source memory
-        // not found: …") is preserved via the LinkEnd::Source Display arm.
-        anyhow::Error::new(StorageError::MemoryNotFound {
-            id: source_id.to_string(),
-            role: Some(LinkEnd::Source),
-        })
-    })?;
-    // #3259 — validation + clone construction are SHARED (pure) helpers so the
-    // sqlite primitive here and the postgres `execute_pending_action` promote
-    // arm cannot drift on which promotions are legal or on the clone's shape.
-    validate_promotion_target(&source, to_namespace)?;
-    let clone = build_promotion_clone(&source, to_namespace, promoted_by);
-    let actual_id = insert(conn, &clone)?;
-    // Clone → source: derived_from. Safe to ignore if the link layer
-    // short-circuits on self-link (impossible here — distinct IDs).
-    create_link(
-        conn,
-        &actual_id,
-        source_id,
-        crate::models::MemoryLinkRelation::DerivedFrom.as_str(),
-    )?;
-    Ok(actual_id)
+    // #8890 — the source read, the clone and its derived_from edge are ONE
+    // write transaction: a failed link rolls the clone back (no orphan).
+    connection::in_write_txn(conn, || {
+        let source = get(conn, source_id)?.ok_or_else(|| {
+            // #962 typed envelope. `Source` here labels the promotion source,
+            // not a link end, but the user-facing message ("source memory
+            // not found: …") is preserved via the LinkEnd::Source Display arm.
+            anyhow::Error::new(StorageError::MemoryNotFound {
+                id: source_id.to_string(),
+                role: Some(LinkEnd::Source),
+            })
+        })?;
+        // #3259 — validation + clone construction are SHARED (pure) helpers so the
+        // sqlite primitive here and the postgres `execute_pending_action` promote
+        // arm cannot drift on which promotions are legal or on the clone's shape.
+        validate_promotion_target(&source, to_namespace)?;
+        let clone = build_promotion_clone(&source, to_namespace, promoted_by);
+        let actual_id = insert(conn, &clone)?;
+        let derived_from = crate::models::MemoryLinkRelation::DerivedFrom.as_str();
+        create_link(conn, &actual_id, source_id, derived_from)?;
+        Ok(actual_id)
+    })
 }
 
 /// v0.6.3.1 P2 (G6) — quick existence check for `(title, namespace)`. Used by
