@@ -573,6 +573,7 @@ impl fmt::Display for ProvenanceReadFault {
                 "provenance column memories.{column} is missing: this database is on a schema \
                  older than v{v} (the content-id columns). Repair: `{repair}` or {daemon}, then \
                  re-run.",
+                column = column,
                 v = PROVENANCE_CID_SCHEMA_VERSION,
                 repair = SCHEMA_BEHIND_REPAIR,
                 daemon = SCHEMA_BEHIND_REPAIR_DAEMON,
@@ -583,24 +584,30 @@ impl fmt::Display for ProvenanceReadFault {
                  schema v{stamp}, which has it (added at v{v}): the stamp and the table shape \
                  disagree, and a migrating open does not re-add the column. Repair: restore the \
                  database from a backup, then re-run.",
+                column = column,
+                stamp = stamp,
                 v = PROVENANCE_CID_SCHEMA_VERSION,
             ),
             Self::MemoriesTableMissing { column, .. } => write!(
                 f,
                 "provenance read of memories.{column} failed: the memories table does not exist \
-                 in this database. Check the database path."
+                 in this database. Check the database path.",
+                column = column
             ),
             Self::StampUnreadable { column, .. } => write!(
                 f,
                 "provenance column memories.{column} is missing and the recorded schema version \
                  cannot be read, so the cause is not established. Inspect the database before \
-                 any repair."
+                 any repair.",
+                column = column
             ),
             Self::StampInvalid { column, stamp, .. } => write!(
                 f,
                 "provenance column memories.{column} is missing and the recorded schema version \
                  is v{stamp}, which no migration writes, so the cause is not established. \
-                 Inspect the database before any repair."
+                 Inspect the database before any repair.",
+                column = column,
+                stamp = stamp
             ),
         }
     }
@@ -964,6 +971,86 @@ mod tests {
             err.detail.contains(SCHEMA_BEHIND_REPAIR_DAEMON),
             "{}",
             err.detail
+        );
+    }
+
+    /// #9435 alerts 905-907 (A-3) - the `Display` text of every
+    /// `ProvenanceReadFault` variant, byte for byte. The arms bind `column` /
+    /// `stamp` and read them only through the format string, so a rewrite of
+    /// the format arguments must leave every one of these strings unchanged.
+    fn fault_source() -> rusqlite::Error {
+        rusqlite::Error::QueryReturnedNoRows
+    }
+
+    #[test]
+    fn provenance_fault_display_column_missing_pre_v74_exact_text_9435() {
+        let fault = ProvenanceReadFault::ColumnMissingPreV74 {
+            column: "cid_genesis",
+            source: fault_source(),
+        };
+        assert_eq!(
+            fault.to_string(),
+            "provenance column memories.cid_genesis is missing: this database is on a schema \
+             older than v74 (the content-id columns). Repair: `ai-memory migrate --in-place` or \
+             start the daemon, then re-run."
+        );
+    }
+
+    #[test]
+    fn provenance_fault_display_column_missing_at_stamp_exact_text_9435() {
+        let fault = ProvenanceReadFault::ColumnMissingAtStamp {
+            column: "cid",
+            stamp: 91,
+            source: fault_source(),
+        };
+        assert_eq!(
+            fault.to_string(),
+            "provenance column memories.cid is missing, but this database is stamped \
+             schema v91, which has it (added at v74): the stamp and the table shape \
+             disagree, and a migrating open does not re-add the column. Repair: restore the \
+             database from a backup, then re-run."
+        );
+    }
+
+    #[test]
+    fn provenance_fault_display_memories_table_missing_exact_text_9435() {
+        let fault = ProvenanceReadFault::MemoriesTableMissing {
+            column: "cid",
+            source: fault_source(),
+        };
+        assert_eq!(
+            fault.to_string(),
+            "provenance read of memories.cid failed: the memories table does not exist \
+             in this database. Check the database path."
+        );
+    }
+
+    #[test]
+    fn provenance_fault_display_stamp_unreadable_exact_text_9435() {
+        let fault = ProvenanceReadFault::StampUnreadable {
+            column: "cid_genesis",
+            source: anyhow::anyhow!("probe failed"),
+        };
+        assert_eq!(
+            fault.to_string(),
+            "provenance column memories.cid_genesis is missing and the recorded schema version \
+             cannot be read, so the cause is not established. Inspect the database before \
+             any repair."
+        );
+    }
+
+    #[test]
+    fn provenance_fault_display_stamp_invalid_exact_text_9435() {
+        let fault = ProvenanceReadFault::StampInvalid {
+            column: "cid",
+            stamp: -3,
+            source: fault_source(),
+        };
+        assert_eq!(
+            fault.to_string(),
+            "provenance column memories.cid is missing and the recorded schema version \
+             is v-3, which no migration writes, so the cause is not established. \
+             Inspect the database before any repair."
         );
     }
 }
