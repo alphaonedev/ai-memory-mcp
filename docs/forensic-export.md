@@ -90,9 +90,23 @@ path, no traversal-order surprises.
 ### Exit codes
 
 - `0` — chain fully verified (or no signatures present *and*
-  `bounded_status != "exceeded_cap"`).
-- `1` — at least one edge failed signature verification, OR the
-  chain exceeds its namespace `max_reflection_depth` cap.
+  `bounded_status != "exceeded_cap"`), and the root's content-id is
+  verified or was not checked (no genesis or no cid stored).
+- `1` — the root memory was not found (`ok: false`, `not_found: true`
+  in JSON mode).
+- `2` — verification failed (`ok: false`): at least one edge failed
+  signature verification, OR the chain exceeds its namespace
+  `max_reflection_depth` cap, OR the root's content-id genesis
+  mismatches its cid or cannot be read (#9505). The text summary line
+  ends `ok=false`, the `cid_verified:` line reads `false (<cid>)` or
+  `unreadable (<class>)`, and JSON mode carries
+  `"root_cid": {"state": "mismatch" | "unreadable", ...}`.
+
+The optional `root_cid` field is present only when the root check ran
+(`{"state": "verified", "cid": ...}`, `{"state": "mismatch", "cid": ...}`
+or `{"state": "unreadable", "error_class": "decode_error" |
+"schema_fault" | "storage_error"}`). The bundle's `verification.json`
+never carries it.
 
 ### `--include-signed-events`
 
