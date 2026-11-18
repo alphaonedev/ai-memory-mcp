@@ -35,9 +35,12 @@ async fn set_metadata(store: &PostgresStore, id: &str, state: Endpoint) {
     assert_eq!(updated, 1, "endpoint metadata must be set");
 }
 
-/// Seed both endpoints and, when both exist, the edge between them (linked
-/// while the seed owner still owns both rows). An absent endpoint is a fresh
-/// id with no row.
+/// Seed both endpoints and the edge between them. With both rows present the
+/// edge is linked while the seed owner still owns both; with an endpoint
+/// absent (a fresh id with no row) it is an ORPHAN edge, inserted with the
+/// foreign keys off (`session_replication_role = replica` on one pooled
+/// connection, reset before the connection returns): both `memory_links`
+/// keys are `ON DELETE CASCADE`, so it cannot arise with the keys on.
 async fn seed_pair(store: &PostgresStore, source: Endpoint, target: Endpoint) -> (String, String) {
     let seed = CallerContext::for_agent(SEED_OWNER);
     let mut ids = Vec::with_capacity(2);
@@ -60,6 +63,29 @@ async fn seed_pair(store: &PostgresStore, source: Endpoint, target: Endpoint) ->
             .link(&seed, &edge(&source_id, &target_id))
             .await
             .expect("seed edge");
+    } else {
+        let mut conn = store.pool.acquire().await.expect("acquire");
+        sqlx::query("SET session_replication_role = replica")
+            .execute(&mut *conn)
+            .await
+            .expect("foreign keys off");
+        let inserted = sqlx::query(
+            "INSERT INTO memory_links (source_id, target_id, relation) \
+             VALUES ($1, $2, 'related_to')",
+        )
+        .bind(&source_id)
+        .bind(&target_id)
+        .execute(&mut *conn)
+        .await;
+        sqlx::query("RESET session_replication_role")
+            .execute(&mut *conn)
+            .await
+            .expect("foreign keys on");
+        assert_eq!(
+            inserted.expect("seed orphan edge").rows_affected(),
+            1,
+            "orphan edge must be seeded"
+        );
     }
     for (id, state) in [(&source_id, source), (&target_id, target)] {
         if state.metadata_text().is_some() {

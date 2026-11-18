@@ -1601,28 +1601,34 @@ impl MemoryStore for SqliteStore {
         // so there is no existence oracle. Endpoint owners are read UNFILTERED
         // (`db::get_any`) so a tombstoned endpoint is still owner-checked.
         // Operator lanes (`ctx.bypass_visibility`) skip the gate.
-        // #9466 — a present endpoint whose owner cannot be read refuses with
-        // a named error (`delete_link_gate`), never a decision from "".
+        // #9466 — the gate reads each endpoint as Absent / present-with-its-
+        // stamps (`delete_link_gate`, the ONE shared predicate): an absent row
+        // is a refusal, never an unstamped row; a failed read is returned as
+        // the store error and deletes nothing. The reads and the DELETE run in
+        // ONE `BEGIN IMMEDIATE` transaction (D-6), so no writer can re-stamp
+        // or remove an endpoint between the decision and the delete.
+        let txn = crate::storage::connection::WriteTxn::begin(&conn).map_err(box_err)?;
         if !ctx.bypass_visibility {
             let source =
-                delete_link_metadata(&conn, source_id, crate::store::DELETE_LINK_SOURCE_LOOKUP)?
-                    .map(|m| {
-                        m.map_or_else(crate::store::LinkSourceOwners::unreadable, |v| {
-                            crate::store::LinkSourceOwners::of_json(&v)
-                        })
-                    });
+                delete_link_metadata(&conn, source_id, crate::store::DELETE_LINK_SOURCE_LOOKUP)?;
             let target =
-                delete_link_metadata(&conn, target_id, crate::store::DELETE_LINK_TARGET_LOOKUP)?
-                    .map(|m| {
-                        m.map_or(crate::store::LinkOwnerField::Unreadable, |v| {
-                            crate::store::LinkOwnerField::owner_of_json(&v)
-                        })
-                    });
-            if !crate::store::delete_link_gate(source, target, ctx.effective_principal())? {
+                delete_link_metadata(&conn, target_id, crate::store::DELETE_LINK_TARGET_LOOKUP)?;
+            if !crate::store::delete_link_gate(
+                crate::store::LinkEndpoint::of_stored(source.as_ref().map(Option::as_ref)),
+                crate::store::LinkEndpoint::of_stored(target.as_ref().map(Option::as_ref)),
+                source_id,
+                ctx.effective_principal(),
+                crate::identity::owner_stamp::MutationSite::sqlite(
+                    crate::identity::owner_stamp::funnel::UNLINK,
+                ),
+            )? {
+                // Nothing was written; the guard's drop rolls back.
                 return Ok(false);
             }
         }
-        db::delete_link(&conn, source_id, target_id).map_err(box_err)
+        let removed = db::delete_link(&conn, source_id, target_id).map_err(box_err)?;
+        txn.commit().map_err(box_err)?;
+        Ok(removed)
     }
 
     async fn list_links(&self, namespace: Option<&str>) -> StoreResult<Vec<MemoryLink>> {

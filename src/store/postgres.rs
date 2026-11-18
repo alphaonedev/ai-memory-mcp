@@ -25234,8 +25234,12 @@ impl MemoryStore for PostgresStore {
         // tx (raw metadata, unfiltered by lifecycle). Operator lanes
         // (`ctx.bypass_visibility`) skip the gate.
         // #9466 — each owner is read with its JSON type, so a present
-        // non-string `agent_id` refuses with a named error
-        // (`delete_link_gate`) instead of being matched as its text.
+        // non-string `agent_id` refuses with a named error, and an absent row
+        // is `LinkEndpoint::Absent` (a refusal, never an unstamped row): the
+        // ONE shared predicate (`delete_link_gate`). Both endpoint rows are
+        // read `FOR SHARE` inside the DELETE's transaction (E-6), so no
+        // writer can re-stamp or delete an endpoint between the decision and
+        // the DELETE.
         if !ctx.bypass_visibility {
             /// `(jsonb_typeof(field), field text)` of one owner field.
             type OwnerCols = (Option<String>, Option<String>);
@@ -25250,7 +25254,7 @@ impl MemoryStore for PostgresStore {
                 source_id,
                 "SELECT jsonb_typeof(metadata->'agent_id'), metadata->>'agent_id', \
                      jsonb_typeof(metadata->'target_agent_id'), metadata->>'target_agent_id' \
-                     FROM memories WHERE id = $1",
+                     FROM memories WHERE id = $1 FOR SHARE",
             ))
             .bind(source_id)
             .fetch_optional(&mut *tx)
@@ -25259,30 +25263,43 @@ impl MemoryStore for PostgresStore {
             let target: Option<OwnerCols> = sqlx::query_as(crate::store::delete_link_owner_sql(
                 target_id,
                 "SELECT jsonb_typeof(metadata->'agent_id'), metadata->>'agent_id' \
-                 FROM memories WHERE id = $1",
+                 FROM memories WHERE id = $1 FOR SHARE",
             ))
             .bind(target_id)
             .fetch_optional(&mut *tx)
             .await
             .map_err(|e| to_store_err(crate::store::DELETE_LINK_TARGET_LOOKUP, e))?;
-            let source = source.map(|(owner_type, owner, addressee_type, addressee)| {
-                crate::store::LinkSourceOwners {
-                    owner: crate::store::LinkOwnerField::of_pg(owner_type.as_deref(), owner),
-                    // The #939 HTTP gate's reading: a non-string addressee
-                    // addresses nobody.
-                    addressee: crate::store::LinkOwnerField::Read(
-                        if addressee_type.as_deref() == Some("string") {
-                            addressee.unwrap_or_default()
-                        } else {
-                            String::new()
-                        },
-                    ),
-                }
-            });
-            let target = target.map(|(owner_type, owner)| {
-                crate::store::LinkOwnerField::of_pg(owner_type.as_deref(), owner)
-            });
-            if !crate::store::delete_link_gate(source, target, ctx.effective_principal())? {
+            let source = source.as_ref().map_or(
+                crate::store::LinkEndpoint::Absent,
+                |(owner_type, owner, addressee_type, addressee)| {
+                    crate::store::LinkEndpoint::of_pg(
+                        owner_type.as_deref(),
+                        owner.as_deref(),
+                        addressee_type.as_deref(),
+                        addressee.as_deref(),
+                    )
+                },
+            );
+            let target = target.as_ref().map_or(
+                crate::store::LinkEndpoint::Absent,
+                |(owner_type, owner)| {
+                    crate::store::LinkEndpoint::of_pg(
+                        owner_type.as_deref(),
+                        owner.as_deref(),
+                        None,
+                        None,
+                    )
+                },
+            );
+            if !crate::store::delete_link_gate(
+                source,
+                target,
+                source_id,
+                ctx.effective_principal(),
+                crate::identity::owner_stamp::MutationSite::postgres(
+                    crate::identity::owner_stamp::funnel::UNLINK,
+                ),
+            )? {
                 return Ok(false);
             }
         }

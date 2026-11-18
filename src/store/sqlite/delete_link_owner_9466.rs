@@ -43,16 +43,31 @@ async fn seed_endpoint(store: &SqliteStore, state: Endpoint, title: &str) -> Str
     id
 }
 
-/// Seed both endpoints and, when both exist, the edge between them (linked
-/// while the seed owner still owns both rows).
+/// Seed both endpoints and the edge between them. With both rows present the
+/// edge is linked while the seed owner still owns both; with an endpoint
+/// absent it is an ORPHAN edge, inserted with the foreign keys off (both
+/// `memory_links` keys are `ON DELETE CASCADE`, so it cannot arise with the
+/// keys on — it is the shape the gate must still refuse when it exists).
 async fn seed_pair(store: &SqliteStore, source: Endpoint, target: Endpoint) -> (String, String) {
     let seed = CallerContext::for_agent(SEED_OWNER);
     let both = source.metadata_text().is_some() && target.metadata_text().is_some();
     if !both {
-        return (
-            seed_endpoint(store, source, "source").await,
-            seed_endpoint(store, target, "target").await,
-        );
+        let source_id = seed_endpoint(store, source, "source").await;
+        let target_id = seed_endpoint(store, target, "target").await;
+        let conn = store.state.lock().await;
+        conn.execute_batch("PRAGMA foreign_keys = OFF;")
+            .expect("foreign keys off");
+        let inserted = conn
+            .execute(
+                "INSERT INTO memory_links (source_id, target_id, relation, created_at) \
+                 VALUES (?1, ?2, 'related_to', ?3)",
+                rusqlite::params![source_id, target_id, chrono::Utc::now().to_rfc3339()],
+            )
+            .expect("seed orphan edge");
+        conn.execute_batch("PRAGMA foreign_keys = ON;")
+            .expect("foreign keys on");
+        assert_eq!(inserted, 1, "orphan edge must be seeded");
+        return (source_id, target_id);
     }
     let source_id = store
         .store(&seed, &seed_memory("source"))

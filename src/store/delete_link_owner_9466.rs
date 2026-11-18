@@ -10,6 +10,13 @@
 //! text; a query error on either owner read is returned as the store error
 //! it is. After every refused case the edge is still in `memory_links`.
 //!
+//! An ABSENT endpoint row (an orphan edge, seeded with the foreign keys off)
+//! is its own state: an ordinary caller gets the same `Ok(false)` a
+//! non-owner gets and the edge stays; the owner of the other endpoint, the
+//! daemon and an operator lane still sever it (#9466 E-1, E-7, D-3). The
+//! both-unstamped legacy admission needs an EMPTY source addressee (E-4) and
+//! goes through `admit_unstamped`, so `refuse` mode refuses it (E-3).
+//!
 //! The backend cells live in `src/store/sqlite/delete_link_owner_9466.rs`
 //! and `src/store/postgres/delete_link_owner_9466.rs`; this module holds the
 //! table, the endpoint states, the expected outcomes and the test-only read
@@ -94,6 +101,13 @@ pub(crate) enum Endpoint {
     Undecodable,
     /// Metadata that decodes to a non-object (sqlite only).
     NonObject,
+    /// `{"agent_id": null}` — unstamped, like `{}` (E-2 parity).
+    NullOwner,
+    /// `{"agent_id": ""}` — unstamped, like `{}` (E-2 parity).
+    EmptyOwner,
+    /// Source only: `{"target_agent_id": <addressee>}` — an unstamped row
+    /// addressed to an agent (E-4).
+    UnstampedAddressed(&'static str),
 }
 
 impl Endpoint {
@@ -116,6 +130,11 @@ impl Endpoint {
                 crate::META_KEY_AGENT_ID: owner,
                 crate::META_KEY_TARGET_AGENT_ID: MALFORMED_OWNER_NUMBER,
             }),
+            Self::NullOwner => serde_json::json!({ crate::META_KEY_AGENT_ID: null }),
+            Self::EmptyOwner => serde_json::json!({ crate::META_KEY_AGENT_ID: "" }),
+            Self::UnstampedAddressed(addressee) => {
+                serde_json::json!({ crate::META_KEY_TARGET_AGENT_ID: addressee })
+            }
         };
         Some(json.to_string())
     }
@@ -158,8 +177,6 @@ pub(crate) enum Expect {
     /// `Err` with exactly [`refusal_text`] for this endpoint name; the edge
     /// is still there.
     Refused(&'static str),
-    /// An endpoint row is absent, so no edge exists: `Ok(false)`.
-    NoEdge,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -212,11 +229,28 @@ pub(crate) const CASES: &[Case] = &[
     Case { name: "non-object source, unstamped target, stranger refused", source: Endpoint::NonObject, target: Endpoint::Unstamped, caller: Caller::Agent(MALLORY), expect: Expect::Refused(SRC) },
     Case { name: "unstamped source, non-object target, stranger refused", source: Endpoint::Unstamped, target: Endpoint::NonObject, caller: Caller::Agent(MALLORY), expect: Expect::Refused(TGT) },
     Case { name: "non-object target, owner of source removes", source: Endpoint::Stamped(ALICE), target: Endpoint::NonObject, caller: Caller::Agent(ALICE), expect: Expect::Removed },
-    // -- an absent endpoint: no edge can exist (#9466 item 3 is open) -------
-    Case { name: "absent source, stamped target, stranger", source: Endpoint::Absent, target: Endpoint::Stamped(ALICE), caller: Caller::Agent(MALLORY), expect: Expect::NoEdge },
-    Case { name: "stamped source, absent target, stranger", source: Endpoint::Stamped(ALICE), target: Endpoint::Absent, caller: Caller::Agent(MALLORY), expect: Expect::NoEdge },
-    Case { name: "absent source, malformed target, stranger", source: Endpoint::Absent, target: Endpoint::MalformedOwner, caller: Caller::Agent(MALLORY), expect: Expect::NoEdge },
-    Case { name: "both absent, stranger", source: Endpoint::Absent, target: Endpoint::Absent, caller: Caller::Agent(MALLORY), expect: Expect::NoEdge },
+    // -- an absent endpoint row (orphan edge): refused like a non-owner -----
+    Case { name: "absent source, stamped target, stranger keeps", source: Endpoint::Absent, target: Endpoint::Stamped(ALICE), caller: Caller::Agent(MALLORY), expect: Expect::Kept },
+    Case { name: "absent source, unstamped target, stranger keeps", source: Endpoint::Absent, target: Endpoint::Unstamped, caller: Caller::Agent(MALLORY), expect: Expect::Kept },
+    Case { name: "unstamped source, absent target, stranger keeps", source: Endpoint::Unstamped, target: Endpoint::Absent, caller: Caller::Agent(MALLORY), expect: Expect::Kept },
+    Case { name: "stamped source, absent target, stranger keeps", source: Endpoint::Stamped(ALICE), target: Endpoint::Absent, caller: Caller::Agent(MALLORY), expect: Expect::Kept },
+    Case { name: "absent source, malformed target, stranger keeps", source: Endpoint::Absent, target: Endpoint::MalformedOwner, caller: Caller::Agent(MALLORY), expect: Expect::Kept },
+    Case { name: "both absent, stranger keeps", source: Endpoint::Absent, target: Endpoint::Absent, caller: Caller::Agent(MALLORY), expect: Expect::Kept },
+    Case { name: "absent source, owner of target removes", source: Endpoint::Absent, target: Endpoint::Stamped(ALICE), caller: Caller::Agent(ALICE), expect: Expect::Removed },
+    Case { name: "absent target, owner of source removes", source: Endpoint::Stamped(ALICE), target: Endpoint::Absent, caller: Caller::Agent(ALICE), expect: Expect::Removed },
+    Case { name: "both absent, daemon removes", source: Endpoint::Absent, target: Endpoint::Absent, caller: Caller::Daemon, expect: Expect::Removed },
+    Case { name: "absent source, daemon removes", source: Endpoint::Absent, target: Endpoint::Stamped(ALICE), caller: Caller::Daemon, expect: Expect::Removed },
+    Case { name: "both absent, operator lane removes", source: Endpoint::Absent, target: Endpoint::Absent, caller: Caller::Operator(MALLORY), expect: Expect::Removed },
+    // -- E-4: the legacy admission needs an EMPTY source addressee ----------
+    Case { name: "unstamped source addressed to another, unstamped target, stranger keeps", source: Endpoint::UnstampedAddressed(BOB), target: Endpoint::Unstamped, caller: Caller::Agent(MALLORY), expect: Expect::Kept },
+    Case { name: "unstamped source addressed to caller, unstamped target, addressee removes", source: Endpoint::UnstampedAddressed(BOB), target: Endpoint::Unstamped, caller: Caller::Agent(BOB), expect: Expect::Removed },
+    Case { name: "unstamped source addressed to another, stamped target, stranger keeps", source: Endpoint::UnstampedAddressed(BOB), target: Endpoint::Stamped(ALICE), caller: Caller::Agent(MALLORY), expect: Expect::Kept },
+    // -- E-2: NULL and "" owners are unstamped, exactly like {} -------------
+    Case { name: "null source owner, unstamped target: legacy admission", source: Endpoint::NullOwner, target: Endpoint::Unstamped, caller: Caller::Agent(MALLORY), expect: Expect::Removed },
+    Case { name: "empty source owner, null target owner: legacy admission", source: Endpoint::EmptyOwner, target: Endpoint::NullOwner, caller: Caller::Agent(MALLORY), expect: Expect::Removed },
+    Case { name: "null source owner, stamped target, stranger keeps", source: Endpoint::NullOwner, target: Endpoint::Stamped(ALICE), caller: Caller::Agent(MALLORY), expect: Expect::Kept },
+    Case { name: "empty source owner, absent target, stranger keeps", source: Endpoint::EmptyOwner, target: Endpoint::Absent, caller: Caller::Agent(MALLORY), expect: Expect::Kept },
+    Case { name: "empty owner is not the empty caller", source: Endpoint::EmptyOwner, target: Endpoint::Stamped(ALICE), caller: Caller::Agent(""), expect: Expect::Kept },
 ];
 
 /// The exact `Display` of the unreadable-owner refusal for `endpoint`.
@@ -288,7 +322,6 @@ pub(crate) fn judge(
     let ok = match (case.expect, got) {
         (Expect::Removed, Ok(true)) => edges_after == 0,
         (Expect::Kept, Ok(false)) => edges_after == 1,
-        (Expect::NoEdge, Ok(false)) => edges_after == 0,
         (Expect::Refused(endpoint), Err(e)) => {
             e.to_string() == refusal_text(endpoint) && edges_after == 1
         }
@@ -307,63 +340,75 @@ pub(crate) fn judge(
 }
 
 /// The owner field values both classifiers are checked over: `(JSON, the
-/// postgres `jsonb_typeof`, the postgres `->>` text, expected reading)`.
+/// postgres `jsonb_typeof`, the postgres `->>` text, expected stamp)`.
 /// `None` JSON = the key is missing.
-const FIELD_CORPUS: &[(Option<&str>, Option<&str>, Option<&str>, Option<&str>)] = &[
-    (None, None, None, Some("")),
-    (Some("null"), Some("null"), None, Some("")),
-    (
-        Some("\"alice-9466\""),
-        Some("string"),
-        Some("alice-9466"),
-        Some("alice-9466"),
-    ),
-    (Some("\"\""), Some("string"), Some(""), Some("")),
-    (Some("42"), Some("number"), Some("42"), None),
-    (Some("true"), Some("boolean"), Some("true"), None),
-    (
-        Some("[\"alice-9466\"]"),
-        Some("array"),
-        Some("[\"alice-9466\"]"),
-        None,
-    ),
-    (
-        Some("{\"id\": \"alice-9466\"}"),
-        Some("object"),
-        Some("{\"id\": \"alice-9466\"}"),
-        None,
-    ),
-];
+const FIELD_CORPUS: &[(
+    Option<&str>,
+    Option<&str>,
+    Option<&str>,
+    crate::identity::owner_stamp::OwnerStamp<'static>,
+)] = {
+    use crate::identity::owner_stamp::OwnerStamp as O;
+    &[
+        (None, None, None, O::Unstamped),
+        (Some("null"), Some("null"), None, O::Unstamped),
+        (
+            Some("\"alice-9466\""),
+            Some("string"),
+            Some("alice-9466"),
+            O::Stamped(ALICE),
+        ),
+        (Some("\"\""), Some("string"), Some(""), O::Unstamped),
+        (Some("42"), Some("number"), Some("42"), O::Malformed),
+        (Some("true"), Some("boolean"), Some("true"), O::Malformed),
+        (
+            Some("[\"alice-9466\"]"),
+            Some("array"),
+            Some("[\"alice-9466\"]"),
+            O::Malformed,
+        ),
+        (
+            Some("{\"id\": \"alice-9466\"}"),
+            Some("object"),
+            Some("{\"id\": \"alice-9466\"}"),
+            O::Malformed,
+        ),
+    ]
+};
 
-fn expected_field(reading: Option<&str>) -> super::LinkOwnerField {
-    reading.map_or(super::LinkOwnerField::Unreadable, |s| {
-        super::LinkOwnerField::Read(s.to_string())
-    })
-}
-
-/// `of_json` and `of_pg` give the same reading for every corpus value, and
-/// a present non-string value is never read as text or as "".
+/// `LinkEndpoint::of` and `LinkEndpoint::of_pg` give the same reading of
+/// both the owner and the addressee for every corpus value (E-2: NULL, a
+/// missing key and `""` are one unstamped state on both backends).
 #[test]
-fn delete_link_owner_field_classifiers_agree_9466() {
-    for (json, pg_type, pg_text, reading) in FIELD_CORPUS {
-        let decoded: Option<serde_json::Value> =
+fn delete_link_endpoint_classifiers_agree_9466() {
+    use super::LinkEndpoint;
+    for (json, pg_type, pg_text, want) in FIELD_CORPUS {
+        let field: Option<serde_json::Value> =
             json.map(|j| serde_json::from_str(j).expect("corpus value is JSON"));
-        let want = expected_field(*reading);
-        assert_eq!(
-            super::LinkOwnerField::of_json(decoded.as_ref()),
-            want,
-            "of_json {json:?}"
-        );
-        assert_eq!(
-            super::LinkOwnerField::of_pg(*pg_type, pg_text.map(str::to_string)),
-            want,
-            "of_pg {pg_type:?}"
-        );
+        for key in [crate::META_KEY_AGENT_ID, crate::META_KEY_TARGET_AGENT_ID] {
+            let mut metadata = serde_json::json!({});
+            if let Some(value) = field.clone() {
+                metadata[key] = value;
+            }
+            let (owner, addressee) = if key == crate::META_KEY_AGENT_ID {
+                (*want, crate::identity::owner_stamp::OwnerStamp::Unstamped)
+            } else {
+                (crate::identity::owner_stamp::OwnerStamp::Unstamped, *want)
+            };
+            let expected = LinkEndpoint::Present { owner, addressee };
+            assert_eq!(LinkEndpoint::of(&metadata), expected, "of {key} {json:?}");
+            let pg = if key == crate::META_KEY_AGENT_ID {
+                LinkEndpoint::of_pg(*pg_type, *pg_text, None, None)
+            } else {
+                LinkEndpoint::of_pg(None, None, *pg_type, *pg_text)
+            };
+            assert_eq!(pg, expected, "of_pg {key} {pg_type:?}");
+        }
     }
 }
 
-/// Metadata that is not a JSON object has no readable owner on either
-/// endpoint, whatever it holds.
+/// Metadata that is not a JSON object has no readable owner or addressee,
+/// whatever it holds — never an unstamped row.
 #[test]
 fn delete_link_non_object_metadata_unreadable_9466() {
     for raw in [
@@ -376,93 +421,139 @@ fn delete_link_non_object_metadata_unreadable_9466() {
     ] {
         let value: serde_json::Value = serde_json::from_str(raw).expect("JSON");
         assert_eq!(
-            super::LinkOwnerField::owner_of_json(&value),
-            super::LinkOwnerField::Unreadable,
-            "{raw}"
-        );
-        assert_eq!(
-            super::LinkSourceOwners::of_json(&value),
-            super::LinkSourceOwners::unreadable(),
+            super::LinkEndpoint::of(&value),
+            super::LinkEndpoint::UNDECODABLE,
             "{raw}"
         );
     }
 }
 
-/// The gate over owners as read, with no store: an absent endpoint keeps
-/// today's reading, an unreadable owner on a present pair refuses with the
-/// exact text unless the caller is the daemon or matches a readable owner.
+/// The gate over the endpoints as read, with no store: an absent endpoint
+/// is a refusal (never an unstamped row), a malformed owner on a present
+/// pair refuses with the exact text unless the caller is the daemon or a
+/// readable owner, and the legacy admission needs an empty addressee.
 #[test]
 fn delete_link_gate_decisions_9466() {
-    use super::{LinkOwnerField as F, LinkSourceOwners as S, delete_link_gate as gate};
-    let read = |s: &str| F::Read(s.to_string());
-    let src = |owner: F| S {
+    use super::LinkEndpoint as E;
+    use crate::identity::owner_stamp::OwnerStamp as O;
+    let site = crate::identity::owner_stamp::MutationSite::sqlite(
+        crate::identity::owner_stamp::funnel::UNLINK,
+    );
+    let gate = |source: E<'_>, target: E<'_>, caller: &str| {
+        super::delete_link_gate(source, target, "src-9466", caller, site).map_err(|e| e.to_string())
+    };
+    let row = |owner: O<'static>| E::Present {
         owner,
-        addressee: read(""),
+        addressee: O::Unstamped,
+    };
+    let addressed = |owner: O<'static>, addressee: &'static str| E::Present {
+        owner,
+        addressee: O::Stamped(addressee),
     };
     let daemon = crate::identity::sentinels::DAEMON_PRINCIPAL;
-    let refused = |r: crate::store::StoreResult<bool>| r.map_err(|e| e.to_string());
-    // Both readable: caller_may_delete_link decides, unchanged.
+    let (alice, bob) = (O::Stamped(ALICE), O::Stamped(BOB));
+    // Both readable.
+    assert_eq!(gate(row(alice), row(bob), ALICE), Ok(true));
+    assert_eq!(gate(row(alice), row(bob), BOB), Ok(true));
+    assert_eq!(gate(row(alice), row(bob), MALLORY), Ok(false));
     assert_eq!(
-        refused(gate(Some(src(read(ALICE))), Some(read(BOB)), ALICE)),
+        gate(row(O::Unstamped), row(O::Unstamped), MALLORY),
         Ok(true)
     );
+    // E-4: an addressed unstamped source admits its addressee, nobody else.
     assert_eq!(
-        refused(gate(Some(src(read(ALICE))), Some(read(BOB)), MALLORY)),
+        gate(addressed(O::Unstamped, BOB), row(O::Unstamped), MALLORY),
         Ok(false)
     );
     assert_eq!(
-        refused(gate(Some(src(read(""))), Some(read("")), MALLORY)),
+        gate(addressed(O::Unstamped, BOB), row(O::Unstamped), BOB),
         Ok(true)
     );
-    // Unreadable owner on a present pair.
+    // Malformed owner on a present pair.
     assert_eq!(
-        refused(gate(Some(src(F::Unreadable)), Some(read("")), MALLORY)),
+        gate(row(O::Malformed), row(O::Unstamped), MALLORY),
         Err(refusal_text(SRC))
     );
     assert_eq!(
-        refused(gate(Some(src(read(""))), Some(F::Unreadable), MALLORY)),
+        gate(row(O::Unstamped), row(O::Malformed), MALLORY),
         Err(refusal_text(TGT))
     );
     assert_eq!(
-        refused(gate(Some(src(F::Unreadable)), Some(F::Unreadable), MALLORY)),
+        gate(row(O::Malformed), row(O::Malformed), MALLORY),
         Err(refusal_text(SRC))
     );
+    assert_eq!(gate(row(O::Malformed), row(O::Unstamped), daemon), Ok(true));
+    assert_eq!(gate(row(O::Malformed), row(bob), BOB), Ok(true));
+    assert_eq!(gate(row(alice), row(O::Malformed), ALICE), Ok(true));
     assert_eq!(
-        refused(gate(Some(src(F::Unreadable)), Some(read("")), daemon)),
-        Ok(true)
+        gate(addressed(O::Malformed, BOB), row(O::Unstamped), BOB),
+        Ok(true),
+        "the addressee of a source that is not unstamped"
     );
     assert_eq!(
-        refused(gate(Some(src(F::Unreadable)), Some(read(BOB)), BOB)),
-        Ok(true)
-    );
-    assert_eq!(
-        refused(gate(Some(src(read(ALICE))), Some(F::Unreadable), ALICE)),
-        Ok(true)
-    );
-    assert_eq!(
-        refused(gate(
-            Some(S {
-                owner: F::Unreadable,
-                addressee: read(BOB)
-            }),
-            Some(read("")),
-            BOB
-        )),
-        Ok(true)
-    );
-    assert_eq!(
-        refused(gate(
-            Some(src(F::Unreadable)),
-            Some(read("")),
-            NUMERIC_TEXT_CALLER
-        )),
+        gate(row(O::Malformed), row(O::Unstamped), NUMERIC_TEXT_CALLER),
         Err(refusal_text(SRC))
     );
-    // An absent endpoint: no edge can exist, today's reading kept.
-    assert_eq!(refused(gate(None, Some(F::Unreadable), MALLORY)), Ok(false));
+    // An absent endpoint: refused like a non-owner, never unstamped.
+    assert_eq!(gate(E::Absent, row(O::Malformed), MALLORY), Ok(false));
+    assert_eq!(gate(E::UNDECODABLE, E::Absent, MALLORY), Ok(false));
+    assert_eq!(gate(E::Absent, E::Absent, MALLORY), Ok(false));
+    assert_eq!(gate(E::Absent, row(O::Unstamped), MALLORY), Ok(false));
+    assert_eq!(gate(row(O::Unstamped), E::Absent, MALLORY), Ok(false));
+    assert_eq!(gate(E::Absent, row(alice), ALICE), Ok(true));
+    assert_eq!(gate(row(alice), E::Absent, ALICE), Ok(true));
+    assert_eq!(gate(E::Absent, E::Absent, daemon), Ok(true));
+    // The empty caller never matches an empty (unstamped) owner.
+    assert_eq!(gate(row(O::Unstamped), row(alice), ""), Ok(false));
+}
+
+/// E-3: under `AI_MEMORY_UNSTAMPED_MUTATION=refuse` the both-unstamped
+/// legacy admission (and the addressee of an unstamped source) is refused;
+/// a stamped owner is unaffected. Runs in an env-isolated child so no
+/// other test sees the knob.
+#[test]
+fn delete_link_gate_refuse_mode_9466() {
+    use super::LinkEndpoint as E;
+    use crate::identity::owner_stamp::OwnerStamp as O;
+    if crate::test_support::run_env_isolated_child_or_spawn(
+        "store::delete_link_owner_9466::delete_link_gate_refuse_mode_9466",
+    ) {
+        return;
+    }
+    // SAFETY: this body runs only in the isolated single-threaded child.
+    unsafe {
+        std::env::set_var(
+            crate::identity::owner_stamp::ENV_UNSTAMPED_MUTATION,
+            crate::identity::owner_stamp::MODE_REFUSE,
+        );
+    }
+    let site = crate::identity::owner_stamp::MutationSite::postgres(
+        crate::identity::owner_stamp::funnel::UNLINK,
+    );
+    let gate = |source: E<'_>, target: E<'_>, caller: &str| {
+        super::delete_link_gate(source, target, "src-9466", caller, site).map_err(|e| e.to_string())
+    };
+    let row = |owner: O<'static>| E::Present {
+        owner,
+        addressee: O::Unstamped,
+    };
     assert_eq!(
-        refused(gate(Some(S::unreadable()), None, MALLORY)),
+        gate(row(O::Unstamped), row(O::Unstamped), MALLORY),
         Ok(false)
     );
-    assert_eq!(refused(gate(None, None, MALLORY)), Ok(true));
+    assert_eq!(
+        gate(
+            E::Present {
+                owner: O::Unstamped,
+                addressee: O::Stamped(BOB)
+            },
+            row(O::Unstamped),
+            BOB
+        ),
+        Ok(false)
+    );
+    assert_eq!(
+        gate(row(O::Stamped(ALICE)), row(O::Unstamped), ALICE),
+        Ok(true)
+    );
 }
