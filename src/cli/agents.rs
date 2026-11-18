@@ -2530,8 +2530,8 @@ mod tests {
             let b64 = base64::engine::general_purpose::STANDARD;
             let conn = db::open(&db).unwrap();
             conn.execute_batch(
-                "DROP TRIGGER IF EXISTS agent_pubkey_history_authoritative_insert_v97;
-                 DROP TRIGGER IF EXISTS agent_pubkey_history_authoritative_update_v97;",
+                "DROP TRIGGER IF EXISTS agent_pubkey_history_projection_guard_insert;
+                 DROP TRIGGER IF EXISTS agent_pubkey_history_projection_guard_update;",
             )
             .expect("model a legacy/hand-edited database without v97 reconciliation");
             conn.execute(
