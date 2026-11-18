@@ -154,6 +154,81 @@ fn link_unreadable_created_at_is_err_not_admitted() {
     );
 }
 
+// ---- cli::verify::run (the `verify-reflection-chain` root cid line) --------
+
+/// The verdict line `verify-reflection-chain` prints for a stamped root.
+const VERIFY_CID_LINE: &str = "cid_verified:   ";
+
+fn scratch_path(test: &str) -> PathBuf {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(RUNS_DIR);
+    std::fs::create_dir_all(&dir).expect("create runs dir");
+    let path = dir.join(format!("{test}.db"));
+    let _ = std::fs::remove_file(&path);
+    path
+}
+
+/// Run `verify-reflection-chain` (text format) on `path`, returning the
+/// result and the stdout text.
+fn run_verify(path: &std::path::Path) -> (anyhow::Result<i32>, String) {
+    let args = ai_memory::cli::verify::VerifyChainArgs {
+        memory_id: CHILD_ID.to_string(),
+        format: "text".to_string(),
+        include_signed_events: false,
+        cid: false,
+    };
+    let mut stdout = Vec::<u8>::new();
+    let mut stderr = Vec::<u8>::new();
+    let res = {
+        let mut out = ai_memory::cli::CliOutput::from_std(&mut stdout, &mut stderr);
+        ai_memory::cli::verify::run(path, &args, &mut out)
+    };
+    (res, String::from_utf8(stdout).expect("utf8 stdout"))
+}
+
+fn seeded_verify_db(test: &str, genesis_sql: Option<&str>) -> PathBuf {
+    let path = scratch_path(test);
+    let conn = db::open(&path).expect("open explicit db");
+    db::insert(&conn, &mem(CHILD_ID, NEWER_STAMP)).expect("insert root");
+    if let Some(sql) = genesis_sql {
+        set_column(&conn, "cid_genesis", sql, CHILD_ID);
+    }
+    path
+}
+
+#[test]
+fn verify_unreadable_genesis_is_err_not_skipped_line() {
+    let path = seeded_verify_db("verify_unreadable", Some(UNREADABLE_TEXT_SQL));
+    let (res, stdout) = run_verify(&path);
+    let err = res.expect_err("an unreadable genesis must fail the verb");
+    assert_eq!(err.to_string(), ERR_GENESIS_TEXT);
+    assert!(
+        !stdout.contains(VERIFY_CID_LINE),
+        "no verdict line: {stdout}"
+    );
+}
+
+#[test]
+fn verify_readable_genesis_prints_cid_verified_true() {
+    let path = seeded_verify_db("verify_readable", None);
+    let (res, stdout) = run_verify(&path);
+    assert_eq!(res.expect("verify runs"), 0);
+    assert!(
+        stdout.contains(&format!("{VERIFY_CID_LINE}true")),
+        "missing verdict line: {stdout}"
+    );
+}
+
+#[test]
+fn verify_null_genesis_is_ok_without_cid_line() {
+    let path = seeded_verify_db("verify_null", Some("NULL"));
+    let (res, stdout) = run_verify(&path);
+    assert_eq!(res.expect("NULL genesis is not an error"), 0);
+    assert!(
+        !stdout.contains(VERIFY_CID_LINE),
+        "no genesis, no line: {stdout}"
+    );
+}
+
 // ---- PostgreSQL twin: consolidate source cid read -------------------------
 
 #[cfg(feature = "sal-postgres")]
