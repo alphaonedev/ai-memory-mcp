@@ -51,11 +51,19 @@ pub(super) fn create_private_target(target: &Path) -> Result<()> {
 pub(super) fn settle_mode_to_source(target: &Path, source: &Path) -> Result<()> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
         let mode = std::fs::metadata(source).map_or(OWNER_ONLY_MODE, |meta| {
             meta.permissions().mode() & PERMISSION_BITS
         });
-        std::fs::set_permissions(target, std::fs::Permissions::from_mode(mode))
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(target)
+            .map_err(|e| match refuse_symlink(target) {
+                Err(refusal) => refusal,
+                Ok(()) => anyhow::Error::new(e).context(format!("opening {}", target.display())),
+            })?;
+        file.set_permissions(std::fs::Permissions::from_mode(mode))
             .with_context(|| format!("set pre-migration snapshot mode on {}", target.display()))?;
     }
     #[cfg(not(unix))]
@@ -239,15 +247,19 @@ pub(crate) fn write_new_private_unique(
     what: &'static str,
     bytes: &[u8],
 ) -> Result<std::path::PathBuf> {
+    let mut stage = stage_in_private_dir(dest, what)?;
+    stage.write_all(bytes)?;
+    stage
+        .file()
+        .sync_all()
+        .with_context(|| format!("fsync {}", stage.path().display()))?;
     for n in 0..=UNIQUE_NAME_ATTEMPTS {
         let candidate = if n == 0 {
             dest.to_path_buf()
         } else {
             numbered(dest, n)
         };
-        refuse_symlink(&candidate)?;
-        if std::fs::symlink_metadata(&candidate).is_err() {
-            write_new_private(&candidate, what, bytes)?;
+        if stage.publish_at(&candidate)? {
             return Ok(candidate);
         }
     }
@@ -385,27 +397,32 @@ impl NoFollowStage {
     /// The identity check fails, something sits at the destination, or the
     /// link, rename or unlink fails (the staging name is then removed).
     pub(crate) fn publish(mut self) -> Result<std::fs::File> {
-        self.verify_identity()?;
-        match std::fs::hard_link(&self.name.path, &self.dest) {
-            Ok(()) => {
-                std::fs::remove_file(&self.name.path).with_context(|| {
-                    format!("removing the staging name {}", self.name.path.display())
-                })?;
-                self.name.armed = false;
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                refuse_occupied(&self.dest, self.what)?;
-                return Err(
-                    anyhow::Error::new(e).context(format!("publishing {}", self.dest.display()))
-                );
-            }
-            Err(_) => {
-                refuse_occupied(&self.dest, self.what)?;
-                std::fs::rename(&self.name.path, &self.dest)
-                    .with_context(|| format!("publishing {}", self.dest.display()))?;
-                self.name.armed = false;
-            }
+        let dest = self.dest.clone();
+        if !self.publish_at(&dest)? {
+            anyhow::bail!(
+                "refusing to overwrite existing {} {}",
+                self.what,
+                dest.display()
+            );
         }
         Ok(self.file)
+    }
+
+    /// ONE no-follow, create-new `link(2)` at `dest`; `Ok(false)`: name taken.
+    fn publish_at(&mut self, dest: &Path) -> Result<bool> {
+        self.verify_identity()?;
+        match std::fs::hard_link(&self.name.path, dest) {
+            Ok(()) => std::fs::remove_file(&self.name.path).with_context(|| {
+                format!("removing the staging name {}", self.name.path.display())
+            })?,
+            Err(_) if std::fs::symlink_metadata(dest).is_ok() => {
+                refuse_symlink(dest)?;
+                return Ok(false);
+            }
+            Err(_) => std::fs::rename(&self.name.path, dest)
+                .with_context(|| format!("publishing {}", dest.display()))?,
+        }
+        self.name.armed = false;
+        Ok(true)
     }
 }
