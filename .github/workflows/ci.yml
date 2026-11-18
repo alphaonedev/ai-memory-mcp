@@ -866,27 +866,39 @@ jobs:
           # newline is added and the next line always starts its own line. A log that
           # cannot be opened or read (any OSError) exits LOG_READ_FAIL_RC = 2, the code
           # sed gave for an input it could not open (#9433 ruling (a) 2, base parity).
-          # Only the open and the reads are guarded: no other failure is mapped.
+          # A log that is not a regular file (a FIFO, a directory) exits the same
+          # code: the type is checked before the open and again on the opened handle,
+          # and the open is non-blocking, so a FIFO never holds the step.
+          # Only the type checks, the open and the reads are guarded: no other failure is mapped.
           impact_print_rc=0
           python3 -I -c 'if True:
-            import sys
+            import os, stat, sys
             LOG_READ_FAIL_RC = 2
             out = sys.stdout.buffer
             last = b"\n"
-            def read_failed(err):
-                sys.stderr.write("[#9433] impact log not readable: %s\n" % err.strerror)
+            def read_failed(why):
+                sys.stderr.write("[#9433] impact log not readable: %s\n" % why)
                 sys.exit(LOG_READ_FAIL_RC)
+            def open_regular(path, flags):
+                fd = os.open(path, flags | os.O_NONBLOCK | os.O_NOCTTY)
+                if not stat.S_ISREG(os.fstat(fd).st_mode):
+                    os.close(fd)
+                    read_failed("not a regular file when opened")
+                os.set_blocking(fd, True)
+                return fd
             try:
                 try:
-                    log = open(sys.argv[1], "rb")
+                    if not stat.S_ISREG(os.stat(sys.argv[1]).st_mode):
+                        read_failed("not a regular file")
+                    log = open(sys.argv[1], "rb", opener=open_regular)
                 except OSError as err:
-                    read_failed(err)
+                    read_failed(err.strerror)
                 with log:
                     for _ in range(200):
                         try:
                             line = log.readline()
                         except OSError as err:
-                            read_failed(err)
+                            read_failed(err.strerror)
                         if not line:
                             break
                         line = line.replace(b"##[", b"# #[").replace(b"::", b": :")
