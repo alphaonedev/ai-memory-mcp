@@ -229,6 +229,66 @@ fn verify_null_genesis_is_ok_without_cid_line() {
     );
 }
 
+// ---- form A: a schema older than v74 is a NAMED error (ruling 8c59363f) ----
+
+const ERR_GENESIS_COLUMN_MISSING: &str = "provenance column memories.cid_genesis is missing: \
+this database is on a schema older than v74 (the content-id columns). Repair: \
+`ai-memory migrate --in-place` or start the daemon, then re-run.";
+const PRE_V74_STAMP: i64 = 73;
+const DROP_PRE_V74_COLUMNS_SQL: &[&str] = &[
+    "DROP INDEX IF EXISTS idx_memories_cid",
+    "ALTER TABLE memories DROP COLUMN cid_genesis",
+    "ALTER TABLE memories DROP COLUMN cid",
+];
+const ERR_BEHIND_READ_ONLY_MARKER: &str = "BEHIND this binary";
+
+#[test]
+fn genesis_missing_column_is_named_schema_error_not_none() {
+    let path = scratch_path("genesis_missing_column");
+    let conn = Connection::open(&path).expect("open bare db");
+    conn.execute_batch("CREATE TABLE memories (id TEXT PRIMARY KEY)")
+        .expect("bare table without the v74 columns");
+    let err = db::read_cid_genesis(&conn, CHILD_ID).expect_err("missing column must not be None");
+    assert_eq!(err.to_string(), ERR_GENESIS_COLUMN_MISSING);
+}
+
+/// Build a v73-shaped scratch database: a migrated store with the v74 columns
+/// dropped and the stamp rolled back to 73.
+fn v73_shaped_db(test: &str) -> PathBuf {
+    let path = scratch_path(test);
+    let conn = db::open(&path).expect("open explicit db");
+    for sql in DROP_PRE_V74_COLUMNS_SQL {
+        conn.execute(sql, [])
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    conn.execute(
+        "DELETE FROM schema_version WHERE version > ?1",
+        [PRE_V74_STAMP],
+    )
+    .expect("roll back stamp");
+    path
+}
+
+#[test]
+fn pre_v74_read_only_open_is_refused_before_any_provenance_read() {
+    let path = v73_shaped_db("pre_v74_read_only");
+    let err = db::open_existing_read_only(&path).expect_err("behind stamp is refused");
+    assert!(
+        err.to_string().contains(ERR_BEHIND_READ_ONLY_MARKER),
+        "unexpected refusal: {err:#}"
+    );
+}
+
+#[test]
+fn pre_v74_migrating_open_adds_the_columns_so_the_read_is_ok_none() {
+    let path = v73_shaped_db("pre_v74_migrating");
+    // `db::open` is the open every verb that reads provenance uses (verify,
+    // import, link create): it migrates first, so the read never sees the
+    // missing column. The migration itself never reads the column.
+    let conn = db::open(&path).expect("migration must not need the v74 column");
+    assert_eq!(db::read_cid_genesis(&conn, CHILD_ID).unwrap(), None);
+}
+
 // ---- PostgreSQL twin: consolidate source cid read -------------------------
 
 #[cfg(feature = "sal-postgres")]

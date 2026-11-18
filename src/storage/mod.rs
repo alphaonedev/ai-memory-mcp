@@ -6754,7 +6754,8 @@ pub fn verify_forget_receipt(
 /// # Errors
 ///
 /// A missing row / NULL map to `Ok(None)`; a query or decode error is
-/// propagated (#9435), never folded into "no genesis".
+/// propagated (#9435), never folded into "no genesis". A schema older
+/// than v74 (no column) is a named `Err` carrying the remedy.
 pub fn read_cid_genesis(conn: &Connection, id: &str) -> Result<Option<Vec<u8>>> {
     use rusqlite::OptionalExtension;
     let genesis = conn
@@ -6763,7 +6764,8 @@ pub fn read_cid_genesis(conn: &Connection, id: &str) -> Result<Option<Vec<u8>>> 
             params![id],
             |r| r.get::<_, Option<Vec<u8>>>(0),
         )
-        .optional()?
+        .optional()
+        .map_err(|e| schema_guard::classify_provenance_read_error(conn, e, "cid_genesis"))?
         .flatten();
     Ok(genesis)
 }
@@ -9448,14 +9450,17 @@ pub fn find_synthesis_candidates(
 
 /// v0.9.0 G13-mem (#1859) — read a memory's schema-v74 content-id
 /// (`memories.cid`), or `None` when the row is absent or carries no cid
-/// (legacy / pre-v74). Used to stamp the lineage-DAG `source_cid` /
+/// (legacy NULL). A schema older than v74 is a named `Err` (#9435). Used to stamp the lineage-DAG `source_cid` /
 /// `target_cid` mirror columns on link write.
 pub(crate) fn read_memory_cid(conn: &Connection, id: &str) -> Result<Option<String>> {
     use rusqlite::OptionalExtension;
     let cid = conn.query_row("SELECT cid FROM memories WHERE id = ?1", params![id], |r| {
         r.get::<_, Option<String>>(0)
     });
-    Ok(cid.optional()?.flatten())
+    let cid = cid.optional();
+    Ok(cid
+        .map_err(|e| schema_guard::classify_provenance_read_error(conn, e, "cid"))?
+        .flatten())
 }
 
 /// v0.9.0 G13-mem (#1859) — is a would-be lineage edge FORWARD (i.e. does

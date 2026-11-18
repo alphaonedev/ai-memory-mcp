@@ -522,6 +522,51 @@ fn render_behind(observed: i64, supported: i64, backend: &str, target: &str) -> 
     )
 }
 
+/// #9435 (conductor ruling 8c59363f, form A) — a provenance read whose column
+/// does not exist because the database is on a schema older than v74. It is a
+/// NAMED error carrying the remedy, never "no genesis": a read that reports
+/// absent when it could not read is the defect class of #9435.
+#[derive(Debug)]
+pub(crate) struct ProvenanceColumnMissing {
+    /// The `memories` column the read needed.
+    pub(crate) column: &'static str,
+}
+
+impl fmt::Display for ProvenanceColumnMissing {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "provenance column memories.{col} is missing: this database is on a schema older \
+             than v74 (the content-id columns). Repair: `{repair}` or {daemon}, then re-run.",
+            col = self.column,
+            repair = SCHEMA_BEHIND_REPAIR,
+            daemon = SCHEMA_BEHIND_REPAIR_DAEMON,
+        )
+    }
+}
+
+impl std::error::Error for ProvenanceColumnMissing {}
+
+/// #9435 — classify a failed provenance read. The column is probed
+/// STRUCTURALLY (`pragma_table_info`), never by matching error text: absent
+/// column -> [`ProvenanceColumnMissing`]; present column, or a probe that
+/// cannot answer -> the original storage error, unchanged.
+pub(crate) fn classify_provenance_read_error(
+    conn: &rusqlite::Connection,
+    err: rusqlite::Error,
+    column: &'static str,
+) -> anyhow::Error {
+    let present = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('memories') WHERE name = ?1",
+        [column],
+        |r| r.get::<_, i64>(0),
+    );
+    match present {
+        Ok(0) => anyhow::Error::new(ProvenanceColumnMissing { column }),
+        _ => anyhow::Error::new(err),
+    }
+}
+
 /// v1.0.0 #3411 / #3434 — recover the schema-behind verdict from an
 /// `anyhow` chain so `boot` / `doctor` report the drift (and the repair)
 /// instead of an opaque open / raw-SQL failure.
