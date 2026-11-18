@@ -203,3 +203,127 @@ fn read_forward_key_file(path: &OsString) -> Result<String, ForwardKeyFileError>
     }
     Ok(token.to_string())
 }
+
+#[cfg(test)]
+mod k1_shared_checks_9367_tests {
+    //! #9367 K-1 — both readers run the SAME file-check function: the
+    //! forwarder with the lax-perms hatch off, `bind-api-key` with it honoured.
+
+    use super::*;
+
+    /// One byte over the cap; the cap itself must still be accepted.
+    const OVER_CAP: usize = 4097;
+    /// Exactly the cap.
+    const AT_CAP: usize = 4096;
+
+    fn scratch(cell: &str) -> std::path::PathBuf {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(".local-runs")
+            .join("9367-k1")
+            .join(format!("{cell}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    fn file_0600(path: &Path, contents: &[u8]) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::write(path, contents).expect("write");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+        path.to_path_buf()
+    }
+
+    /// The bind-api-key reader refuses each shared check with its own text,
+    /// and the cap boundary is the forwarder's (4096 accepted, 4097 refused).
+    #[test]
+    fn bind_reader_applies_the_shared_file_checks_9367() {
+        assert_eq!(
+            usize::try_from(FORWARD_KEY_FILE_MAX_BYTES).ok(),
+            Some(AT_CAP)
+        );
+        let dir = scratch("bind");
+        let not_regular = dir.join("a-directory");
+        std::fs::create_dir_all(&not_regular).expect("mkdir");
+        let err = read_api_key_token_file(&not_regular).expect_err("a directory must be refused");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "api-key token file {} is not a regular file",
+                not_regular.display()
+            )
+        );
+        let over = file_0600(&dir.join("over.token"), &vec![b'a'; OVER_CAP]);
+        let err = read_api_key_token_file(&over).expect_err("over the cap must be refused");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "api-key token file {} is larger than 4096 bytes",
+                over.display()
+            )
+        );
+        let at = file_0600(&dir.join("at.token"), &vec![b'a'; AT_CAP]);
+        assert_eq!(
+            read_api_key_token_file(&at)
+                .expect("the cap itself is accepted")
+                .len(),
+            AT_CAP
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The forwarder's strict reader at the same cap boundary.
+    #[test]
+    fn forward_reader_cap_boundary_is_the_shared_one_9367() {
+        let dir = scratch("forward");
+        let over = file_0600(&dir.join("over.token"), &vec![b'a'; OVER_CAP]);
+        assert_eq!(
+            read_forward_key_file(&over.clone().into_os_string()),
+            Err(ForwardKeyFileError::TooLarge)
+        );
+        let at = file_0600(&dir.join("at.token"), &vec![b'a'; AT_CAP]);
+        assert_eq!(
+            read_forward_key_file(&at.into_os_string()).map(|k| k.len()),
+            Ok(AT_CAP)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Structural pin: one file-check function, called by both readers, the
+    /// forwarder with the hatch off; no second copy of a check in this module.
+    #[test]
+    fn one_file_check_function_serves_both_readers_9367() {
+        let src = include_str!("agent_key_file.rs");
+        let prod = src.split("#[cfg(test)]\nmod ").next().unwrap_or_default();
+        let count = |needle: &str| prod.matches(needle).count();
+        assert_eq!(count("fn read_checked_key_file("), 1, "one check function");
+        assert_eq!(
+            count("read_checked_key_file("),
+            3,
+            "the definition plus the two readers"
+        );
+        assert_eq!(
+            count("read_checked_key_file(Path::new(path), LaxPerms::Refuse)"),
+            1,
+            "the forwarder calls it with the hatch off"
+        );
+        assert_eq!(
+            count("read_checked_key_file(path, LaxPerms::HonourHatch)"),
+            1,
+            "bind-api-key calls it with the hatch honoured"
+        );
+        for check in [
+            ".is_file()",
+            ".permissions().mode()",
+            ".take(",
+            "std::fs::metadata(",
+            "std::fs::read_to_string(",
+        ] {
+            let want = usize::from(!check.starts_with("std::fs::"));
+            assert_eq!(
+                count(check),
+                want,
+                "`{check}`: one copy, in the check function"
+            );
+        }
+    }
+}
