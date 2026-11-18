@@ -1,0 +1,307 @@
+// Copyright 2026 AlphaOne LLC
+// SPDX-License-Identifier: Apache-2.0
+
+//! #9466 — the ONE case table both backends' SAL `delete_link` cells run.
+//!
+//! The invariant pinned: a failed or unreadable owner read refuses with a
+//! named error on both backends, never a decision taken from a default. A
+//! present endpoint whose `metadata.agent_id` is not a string (or whose
+//! metadata is not JSON at all) is never read as `""` and never matched as
+//! text; a query error on either owner read is returned as the store error
+//! it is. After every refused case the edge is still in `memory_links`.
+//!
+//! The backend cells live in `src/store/sqlite/delete_link_owner_9466.rs`
+//! and `src/store/postgres/delete_link_owner_9466.rs`; this module holds the
+//! table, the endpoint states, the expected outcomes and the test-only read
+//! fault both adapters consult through [`super::delete_link_owner_sql`].
+
+use crate::models::{ConfidenceSource, Memory, MemoryLink, Tier};
+use crate::store::{
+    DELETE_LINK_ENDPOINT_SOURCE, DELETE_LINK_ENDPOINT_TARGET, DELETE_LINK_UNREADABLE_OWNER,
+};
+use std::sync::Mutex;
+
+/// The relation a read fault redirects an owner read to. It never exists, so
+/// the read fails through each backend's real error path.
+pub(crate) const READ_FAULT_TABLE: &str = "delete_link_fault_9466";
+/// The SQL an armed owner read runs instead of the production one.
+pub(crate) const READ_FAULT_SQL: &str = "SELECT metadata FROM delete_link_fault_9466 WHERE id = $1";
+
+/// Row ids whose NEXT `delete_link` owner read fails. Keyed by id, so cells
+/// running in parallel never see each other's fault.
+static READ_FAULTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Make the next `delete_link` owner read of row `id` fail.
+pub(crate) fn arm_read_fault(id: &str) {
+    READ_FAULTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(id.to_string());
+}
+
+/// `true` (once) when a read fault is armed for `id`.
+pub(crate) fn take_read_fault(id: &str) -> bool {
+    let mut armed = READ_FAULTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match armed.iter().position(|armed_id| armed_id == id) {
+        Some(at) => {
+            armed.swap_remove(at);
+            true
+        }
+        None => false,
+    }
+}
+
+/// The principal that seeds every row and edge (it owns nothing afterwards:
+/// each present endpoint's metadata is overwritten with its case state).
+pub(crate) const SEED_OWNER: &str = "seed-9466";
+pub(crate) const ALICE: &str = "alice-9466";
+pub(crate) const BOB: &str = "bob-9466";
+pub(crate) const MALLORY: &str = "mallory-9466";
+/// The JSON number a malformed owner field carries.
+pub(crate) const MALFORMED_OWNER_NUMBER: u32 = 42;
+/// A caller whose id is the TEXT of [`MALFORMED_OWNER_NUMBER`]. Pre-#9466
+/// postgres read `metadata->>'agent_id'` of the number as `"42"` and let
+/// this caller own the row.
+pub(crate) const NUMERIC_TEXT_CALLER: &str = "42";
+/// Metadata text that is not JSON (sqlite only: a postgres `jsonb` column
+/// cannot hold it).
+pub(crate) const UNDECODABLE_METADATA: &str = "{not json 9466";
+/// Metadata that decodes but is not a JSON object, so it has no owner key to
+/// read (sqlite only: the postgres `memories_metadata_is_object` CHECK
+/// refuses it).
+pub(crate) const NON_OBJECT_METADATA: &str = "[\"mallory-9466\"]";
+/// The namespace every seeded row lives in.
+pub(crate) const NAMESPACE: &str = "delete-link-owner-9466";
+
+/// The owner state of one endpoint row.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Endpoint {
+    /// No row with that id.
+    Absent,
+    /// `{"agent_id": <owner>}`.
+    Stamped(&'static str),
+    /// `{}` — the legacy single-operator row.
+    Unstamped,
+    /// `{"agent_id": 42}` — present, not a string.
+    MalformedOwner,
+    /// Source only: `{"agent_id": <owner>, "target_agent_id": <addressee>}`.
+    Addressed(&'static str, &'static str),
+    /// Source only: `{"agent_id": <owner>, "target_agent_id": 42}`.
+    MalformedAddressee(&'static str),
+    /// Metadata text that does not decode (sqlite only).
+    Undecodable,
+    /// Metadata that decodes to a non-object (sqlite only).
+    NonObject,
+}
+
+impl Endpoint {
+    /// The raw metadata text the row is given, `None` for an absent row.
+    pub(crate) fn metadata_text(self) -> Option<String> {
+        let json = match self {
+            Self::Absent => return None,
+            Self::Undecodable => return Some(UNDECODABLE_METADATA.to_string()),
+            Self::NonObject => return Some(NON_OBJECT_METADATA.to_string()),
+            Self::Stamped(owner) => serde_json::json!({ crate::META_KEY_AGENT_ID: owner }),
+            Self::Unstamped => serde_json::json!({}),
+            Self::MalformedOwner => {
+                serde_json::json!({ crate::META_KEY_AGENT_ID: MALFORMED_OWNER_NUMBER })
+            }
+            Self::Addressed(owner, addressee) => serde_json::json!({
+                crate::META_KEY_AGENT_ID: owner,
+                crate::META_KEY_TARGET_AGENT_ID: addressee,
+            }),
+            Self::MalformedAddressee(owner) => serde_json::json!({
+                crate::META_KEY_AGENT_ID: owner,
+                crate::META_KEY_TARGET_AGENT_ID: MALFORMED_OWNER_NUMBER,
+            }),
+        };
+        Some(json.to_string())
+    }
+
+    /// `true` for a state a postgres `jsonb` column cannot hold.
+    pub(crate) fn sqlite_only(self) -> bool {
+        matches!(self, Self::Undecodable | Self::NonObject)
+    }
+}
+
+/// Who calls `delete_link`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Caller {
+    Agent(&'static str),
+    /// [`crate::identity::sentinels::DAEMON_PRINCIPAL`].
+    Daemon,
+    /// An operator lane (`ctx.bypass_visibility`); the gate is skipped.
+    Operator(&'static str),
+}
+
+impl Caller {
+    pub(crate) fn ctx(self) -> crate::store::CallerContext {
+        match self {
+            Self::Agent(id) => crate::store::CallerContext::for_agent(id),
+            Self::Daemon => {
+                crate::store::CallerContext::for_agent(crate::identity::sentinels::DAEMON_PRINCIPAL)
+            }
+            Self::Operator(id) => crate::store::CallerContext::for_admin(id),
+        }
+    }
+}
+
+/// What `delete_link` must do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Expect {
+    /// `Ok(true)` and the edge is gone.
+    Removed,
+    /// `Ok(false)` and the edge is still there.
+    Kept,
+    /// `Err` with exactly [`refusal_text`] for this endpoint name; the edge
+    /// is still there.
+    Refused(&'static str),
+    /// An endpoint row is absent, so no edge exists: `Ok(false)`.
+    NoEdge,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Case {
+    pub(crate) name: &'static str,
+    pub(crate) source: Endpoint,
+    pub(crate) target: Endpoint,
+    pub(crate) caller: Caller,
+    pub(crate) expect: Expect,
+}
+
+const SRC: &str = DELETE_LINK_ENDPOINT_SOURCE;
+const TGT: &str = DELETE_LINK_ENDPOINT_TARGET;
+
+/// The (source state x target state x caller) table. The first block pins
+/// the answers #9466 must not change; the rest pin the invariant.
+#[rustfmt::skip]
+pub(crate) const CASES: &[Case] = &[
+    // -- readable owners: today's answers, unchanged ------------------------
+    Case { name: "owner of source removes", source: Endpoint::Stamped(ALICE), target: Endpoint::Stamped(BOB), caller: Caller::Agent(ALICE), expect: Expect::Removed },
+    Case { name: "owner of target removes", source: Endpoint::Stamped(ALICE), target: Endpoint::Stamped(BOB), caller: Caller::Agent(BOB), expect: Expect::Removed },
+    Case { name: "owner of neither keeps", source: Endpoint::Stamped(ALICE), target: Endpoint::Stamped(BOB), caller: Caller::Agent(MALLORY), expect: Expect::Kept },
+    Case { name: "stamped source, unstamped target, stranger keeps", source: Endpoint::Stamped(ALICE), target: Endpoint::Unstamped, caller: Caller::Agent(MALLORY), expect: Expect::Kept },
+    Case { name: "unstamped source, stamped target, stranger keeps", source: Endpoint::Unstamped, target: Endpoint::Stamped(ALICE), caller: Caller::Agent(MALLORY), expect: Expect::Kept },
+    Case { name: "both unstamped: legacy admission", source: Endpoint::Unstamped, target: Endpoint::Unstamped, caller: Caller::Agent(MALLORY), expect: Expect::Removed },
+    Case { name: "inbox addressee of source removes", source: Endpoint::Addressed(BOB, ALICE), target: Endpoint::Stamped(BOB), caller: Caller::Agent(ALICE), expect: Expect::Removed },
+    Case { name: "daemon removes", source: Endpoint::Stamped(ALICE), target: Endpoint::Stamped(BOB), caller: Caller::Daemon, expect: Expect::Removed },
+    Case { name: "operator lane removes", source: Endpoint::Stamped(ALICE), target: Endpoint::Stamped(BOB), caller: Caller::Operator(MALLORY), expect: Expect::Removed },
+    // -- a non-string owner is never "" and never matched as text ----------
+    Case { name: "malformed source owner, unstamped target, stranger refused", source: Endpoint::MalformedOwner, target: Endpoint::Unstamped, caller: Caller::Agent(MALLORY), expect: Expect::Refused(SRC) },
+    Case { name: "unstamped source, malformed target owner, stranger refused", source: Endpoint::Unstamped, target: Endpoint::MalformedOwner, caller: Caller::Agent(MALLORY), expect: Expect::Refused(TGT) },
+    Case { name: "both owners malformed, stranger refused", source: Endpoint::MalformedOwner, target: Endpoint::MalformedOwner, caller: Caller::Agent(MALLORY), expect: Expect::Refused(SRC) },
+    Case { name: "malformed source owner is not its number's text", source: Endpoint::MalformedOwner, target: Endpoint::Unstamped, caller: Caller::Agent(NUMERIC_TEXT_CALLER), expect: Expect::Refused(SRC) },
+    Case { name: "malformed target owner is not its number's text", source: Endpoint::Stamped(ALICE), target: Endpoint::MalformedOwner, caller: Caller::Agent(NUMERIC_TEXT_CALLER), expect: Expect::Refused(TGT) },
+    Case { name: "malformed source owner, owner of target removes", source: Endpoint::MalformedOwner, target: Endpoint::Stamped(BOB), caller: Caller::Agent(BOB), expect: Expect::Removed },
+    Case { name: "malformed source owner, stranger to target refused", source: Endpoint::MalformedOwner, target: Endpoint::Stamped(BOB), caller: Caller::Agent(MALLORY), expect: Expect::Refused(SRC) },
+    Case { name: "malformed target owner, owner of source removes", source: Endpoint::Stamped(ALICE), target: Endpoint::MalformedOwner, caller: Caller::Agent(ALICE), expect: Expect::Removed },
+    Case { name: "malformed target owner, stranger refused", source: Endpoint::Stamped(ALICE), target: Endpoint::MalformedOwner, caller: Caller::Agent(MALLORY), expect: Expect::Refused(TGT) },
+    Case { name: "malformed target owner, source addressee removes", source: Endpoint::Addressed(BOB, ALICE), target: Endpoint::MalformedOwner, caller: Caller::Agent(ALICE), expect: Expect::Removed },
+    Case { name: "malformed owner, daemon removes", source: Endpoint::MalformedOwner, target: Endpoint::Unstamped, caller: Caller::Daemon, expect: Expect::Removed },
+    Case { name: "malformed owner, operator lane removes", source: Endpoint::MalformedOwner, target: Endpoint::MalformedOwner, caller: Caller::Operator(MALLORY), expect: Expect::Removed },
+    Case { name: "malformed addressee addresses nobody", source: Endpoint::MalformedAddressee(BOB), target: Endpoint::Unstamped, caller: Caller::Agent(NUMERIC_TEXT_CALLER), expect: Expect::Kept },
+    Case { name: "malformed addressee, owner of source removes", source: Endpoint::MalformedAddressee(BOB), target: Endpoint::Unstamped, caller: Caller::Agent(BOB), expect: Expect::Removed },
+    // -- undecodable metadata (sqlite only) ---------------------------------
+    Case { name: "undecodable source, unstamped target, stranger refused", source: Endpoint::Undecodable, target: Endpoint::Unstamped, caller: Caller::Agent(MALLORY), expect: Expect::Refused(SRC) },
+    Case { name: "unstamped source, undecodable target, stranger refused", source: Endpoint::Unstamped, target: Endpoint::Undecodable, caller: Caller::Agent(MALLORY), expect: Expect::Refused(TGT) },
+    Case { name: "undecodable source, owner of target removes", source: Endpoint::Undecodable, target: Endpoint::Stamped(BOB), caller: Caller::Agent(BOB), expect: Expect::Removed },
+    Case { name: "undecodable target, owner of source removes", source: Endpoint::Stamped(ALICE), target: Endpoint::Undecodable, caller: Caller::Agent(ALICE), expect: Expect::Removed },
+    Case { name: "undecodable source, daemon removes", source: Endpoint::Undecodable, target: Endpoint::Unstamped, caller: Caller::Daemon, expect: Expect::Removed },
+    Case { name: "non-object source, unstamped target, stranger refused", source: Endpoint::NonObject, target: Endpoint::Unstamped, caller: Caller::Agent(MALLORY), expect: Expect::Refused(SRC) },
+    Case { name: "unstamped source, non-object target, stranger refused", source: Endpoint::Unstamped, target: Endpoint::NonObject, caller: Caller::Agent(MALLORY), expect: Expect::Refused(TGT) },
+    Case { name: "non-object target, owner of source removes", source: Endpoint::Stamped(ALICE), target: Endpoint::NonObject, caller: Caller::Agent(ALICE), expect: Expect::Removed },
+    // -- an absent endpoint: no edge can exist (#9466 item 3 is open) -------
+    Case { name: "absent source, stamped target, stranger", source: Endpoint::Absent, target: Endpoint::Stamped(ALICE), caller: Caller::Agent(MALLORY), expect: Expect::NoEdge },
+    Case { name: "stamped source, absent target, stranger", source: Endpoint::Stamped(ALICE), target: Endpoint::Absent, caller: Caller::Agent(MALLORY), expect: Expect::NoEdge },
+    Case { name: "absent source, malformed target, stranger", source: Endpoint::Absent, target: Endpoint::MalformedOwner, caller: Caller::Agent(MALLORY), expect: Expect::NoEdge },
+    Case { name: "both absent, stranger", source: Endpoint::Absent, target: Endpoint::Absent, caller: Caller::Agent(MALLORY), expect: Expect::NoEdge },
+];
+
+/// The exact `Display` of the unreadable-owner refusal for `endpoint`.
+pub(crate) fn refusal_text(endpoint: &str) -> String {
+    format!("integrity check failed: {DELETE_LINK_UNREADABLE_OWNER} {endpoint}")
+}
+
+/// A fresh endpoint row, seeded as [`SEED_OWNER`]'s.
+pub(crate) fn seed_memory(title: &str) -> Memory {
+    let now = chrono::Utc::now().to_rfc3339();
+    Memory {
+        cid: None,
+        valid_from: None,
+        valid_until: None,
+        id: uuid::Uuid::new_v4().to_string(),
+        tier: Tier::Mid,
+        namespace: NAMESPACE.to_string(),
+        title: format!("{title} {}", uuid::Uuid::new_v4()),
+        content: format!("delete_link owner cell: {title}"),
+        tags: vec![],
+        priority: 5,
+        confidence: 1.0,
+        source: "test".to_string(),
+        access_count: 0,
+        created_at: now.clone(),
+        updated_at: now,
+        last_accessed_at: None,
+        expires_at: None,
+        metadata: serde_json::json!({ crate::META_KEY_AGENT_ID: SEED_OWNER }),
+        reflection_depth: 0,
+        memory_kind: crate::models::MemoryKind::Observation,
+        entity_id: None,
+        persona_version: None,
+        citations: Vec::new(),
+        source_uri: None,
+        source_span: None,
+        confidence_source: ConfidenceSource::CallerProvided,
+        confidence_signals: None,
+        confidence_decayed_at: None,
+        version: 1,
+        lifecycle_state: crate::models::LifecycleState::Open,
+    }
+}
+
+/// The edge `source -> target`.
+pub(crate) fn edge(source_id: &str, target_id: &str) -> MemoryLink {
+    MemoryLink {
+        source_id: source_id.to_string(),
+        target_id: target_id.to_string(),
+        relation: crate::models::MemoryLinkRelation::RelatedTo,
+        created_at: chrono::Utc::now().to_rfc3339(),
+        valid_from: None,
+        valid_until: None,
+        observed_by: None,
+        signature: None,
+        attest_level: None,
+        source_cid: None,
+        target_cid: None,
+    }
+}
+
+/// Judge one case's outcome. `edges_after` is the `memory_links` row count
+/// for the pair after the call. `Err(reason)` names what went wrong.
+pub(crate) fn judge(
+    case: &Case,
+    got: &crate::store::StoreResult<bool>,
+    edges_after: i64,
+) -> Result<(), String> {
+    let ok = match (case.expect, got) {
+        (Expect::Removed, Ok(true)) => edges_after == 0,
+        (Expect::Kept, Ok(false)) => edges_after == 1,
+        (Expect::NoEdge, Ok(false)) => edges_after == 0,
+        (Expect::Refused(endpoint), Err(e)) => {
+            e.to_string() == refusal_text(endpoint) && edges_after == 1
+        }
+        _ => false,
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err(format!(
+            "{}: expected {:?}, got {:?} with {edges_after} edge(s) left",
+            case.name,
+            case.expect,
+            got.as_ref().map_err(ToString::to_string)
+        ))
+    }
+}

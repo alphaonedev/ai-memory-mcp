@@ -899,6 +899,37 @@ pub(crate) fn caller_may_delete_link(
         || caller == crate::identity::sentinels::DAEMON_PRINCIPAL
 }
 
+/// #9466 — `IntegrityFailed` detail prefix of the `delete_link` refusal for
+/// a present endpoint whose owner cannot be read. The endpoint follows.
+pub(crate) const DELETE_LINK_UNREADABLE_OWNER: &str =
+    "delete_link refused: unreadable owner metadata on the";
+/// #9466 — the endpoint names the refusal detail carries.
+pub(crate) const DELETE_LINK_ENDPOINT_SOURCE: &str = "source endpoint";
+/// #9466 — see [`DELETE_LINK_ENDPOINT_SOURCE`].
+pub(crate) const DELETE_LINK_ENDPOINT_TARGET: &str = "target endpoint";
+/// #9466 — `to_store_err` / `box_err` context of the two owner reads, the
+/// same words on both backends.
+pub(crate) const DELETE_LINK_SOURCE_LOOKUP: &str = "delete_link source owner lookup";
+/// #9466 — see [`DELETE_LINK_SOURCE_LOOKUP`].
+pub(crate) const DELETE_LINK_TARGET_LOOKUP: &str = "delete_link target owner lookup";
+
+/// #9466 — the SQL of one `delete_link` owner read. In a test build a cell
+/// can arm a read fault for ONE row id (so concurrent cells never see it):
+/// the read then runs against a relation that does not exist, which fails
+/// on both backends through the real error path.
+#[must_use]
+pub(crate) fn delete_link_owner_sql(id: &str, sql: &'static str) -> &'static str {
+    #[cfg(test)]
+    if delete_link_owner_9466::take_read_fault(id) {
+        return delete_link_owner_9466::READ_FAULT_SQL;
+    }
+    let _ = id;
+    sql
+}
+
+#[cfg(test)]
+pub(crate) mod delete_link_owner_9466;
+
 // ---------------------------------------------------------------------------
 // #3176 — backend-blind `clear_namespace_standard` authorization core
 // ---------------------------------------------------------------------------

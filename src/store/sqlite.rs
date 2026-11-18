@@ -295,27 +295,49 @@ fn pubkey_bind_err(error: anyhow::Error, agent_id: &str) -> StoreError {
     }
 }
 
-/// v1.0.0 #3275 — `(agent_id, target_agent_id)` owner strings of a memory
-/// (empty when the key is absent), for the SAL `delete_link` caller-owns gate.
-fn link_owner_target_of(m: &Memory) -> (String, String) {
-    let owner = m
-        .metadata
-        .get(crate::META_KEY_AGENT_ID)
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    let target = m
-        .metadata
-        .get(crate::META_KEY_TARGET_AGENT_ID)
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    (owner, target)
+/// #9466 — the one `delete_link` owner read: the raw `metadata` column of
+/// row `id`, unfiltered by lifecycle (a tombstoned endpoint is still
+/// owner-checked). `None` = no such row. A query error is returned as
+/// `what: <error>`, the same context words the postgres adapter uses.
+const DELETE_LINK_METADATA_SQL: &str = "SELECT metadata FROM memories WHERE id = ?1";
+
+fn delete_link_metadata(
+    conn: &rusqlite::Connection,
+    id: &str,
+    what: &str,
+) -> StoreResult<Option<serde_json::Value>> {
+    let raw: Option<rusqlite::types::Value> = conn
+        .query_row(
+            crate::store::delete_link_owner_sql(id, DELETE_LINK_METADATA_SQL),
+            rusqlite::params![id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| box_err(format!("{what}: {e}")))?;
+    Ok(raw.map(|value| match value {
+        rusqlite::types::Value::Text(text) => {
+            serde_json::from_str(&text).unwrap_or_else(|_| serde_json::json!({}))
+        }
+        _ => serde_json::json!({}),
+    }))
 }
 
-/// v1.0.0 #3275 — the `agent_id` owner string of a memory (empty when absent).
-fn link_owner_of(m: &Memory) -> String {
-    m.metadata
+/// v1.0.0 #3275 — `(agent_id, target_agent_id)` owner strings of a memory's
+/// metadata (empty when the key is absent), for the SAL `delete_link` gate.
+fn link_owner_target_of(metadata: &serde_json::Value) -> (String, String) {
+    (link_owner_of(metadata), {
+        metadata
+            .get(crate::META_KEY_TARGET_AGENT_ID)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    })
+}
+
+/// v1.0.0 #3275 — the `agent_id` owner string of a memory's metadata (empty
+/// when absent).
+fn link_owner_of(metadata: &serde_json::Value) -> String {
+    metadata
         .get(crate::META_KEY_AGENT_ID)
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default()
@@ -559,6 +581,8 @@ fn owner_gate_test_hook(id: &str) {
 #[cfg(not(test))]
 fn owner_gate_test_hook(_id: &str) {}
 
+#[cfg(test)]
+mod delete_link_owner_9466;
 #[cfg(test)]
 mod owner_gate_txn_3957;
 #[cfg(test)]
@@ -1600,14 +1624,14 @@ impl MemoryStore for SqliteStore {
         // Operator lanes (`ctx.bypass_visibility`) skip the gate.
         if !ctx.bypass_visibility {
             let caller = ctx.effective_principal();
-            let (source_owner, source_target) = db::get_any(&conn, source_id)
-                .map_err(box_err)?
-                .map(|m| link_owner_target_of(&m))
-                .unwrap_or_default();
-            let target_owner = db::get_any(&conn, target_id)
-                .map_err(box_err)?
-                .map(|m| link_owner_of(&m))
-                .unwrap_or_default();
+            let (source_owner, source_target) =
+                delete_link_metadata(&conn, source_id, crate::store::DELETE_LINK_SOURCE_LOOKUP)?
+                    .map(|m| link_owner_target_of(&m))
+                    .unwrap_or_default();
+            let target_owner =
+                delete_link_metadata(&conn, target_id, crate::store::DELETE_LINK_TARGET_LOOKUP)?
+                    .map(|m| link_owner_of(&m))
+                    .unwrap_or_default();
             if !crate::store::caller_may_delete_link(
                 &source_owner,
                 &source_target,

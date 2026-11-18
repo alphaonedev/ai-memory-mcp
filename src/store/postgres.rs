@@ -19984,6 +19984,8 @@ fn normalize_app_search_path(search_path: &str) -> Option<String> {
 }
 
 #[cfg(test)]
+mod delete_link_owner_9466;
+#[cfg(test)]
 mod normalize_app_search_path_tests;
 
 /// v1.0.0 #3055 — relocate ai-memory app tables out of the AGE `ag_catalog`
@@ -25232,20 +25234,25 @@ impl MemoryStore for PostgresStore {
         // tx (raw metadata, unfiltered by lifecycle). Operator lanes
         // (`ctx.bypass_visibility`) skip the gate.
         if !ctx.bypass_visibility {
-            let source: Option<(Option<String>, Option<String>)> = sqlx::query_as(
-                "SELECT metadata->>'agent_id', metadata->>'target_agent_id' \
-                 FROM memories WHERE id = $1",
-            )
-            .bind(source_id)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|e| to_store_err("delete_link source owner lookup", e))?;
+            let source: Option<(Option<String>, Option<String>)> =
+                sqlx::query_as(crate::store::delete_link_owner_sql(
+                    source_id,
+                    "SELECT metadata->>'agent_id', metadata->>'target_agent_id' \
+                     FROM memories WHERE id = $1",
+                ))
+                .bind(source_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| to_store_err(crate::store::DELETE_LINK_SOURCE_LOOKUP, e))?;
             let target_owner: Option<Option<String>> =
-                sqlx::query_scalar("SELECT metadata->>'agent_id' FROM memories WHERE id = $1")
-                    .bind(target_id)
-                    .fetch_optional(&mut *tx)
-                    .await
-                    .map_err(|e| to_store_err("delete_link target owner lookup", e))?;
+                sqlx::query_scalar(crate::store::delete_link_owner_sql(
+                    target_id,
+                    "SELECT metadata->>'agent_id' FROM memories WHERE id = $1",
+                ))
+                .bind(target_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| to_store_err(crate::store::DELETE_LINK_TARGET_LOOKUP, e))?;
             let (source_owner, source_target) = source
                 .map(|(o, t)| (o.unwrap_or_default(), t.unwrap_or_default()))
                 .unwrap_or_default();
