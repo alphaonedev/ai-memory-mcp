@@ -56,47 +56,115 @@ fn trimmed_token(raw: &str) -> Option<&str> {
     (!token.is_empty()).then_some(token)
 }
 
+/// #9367 K-1 — whether the shared file checks honour the bind-api-key
+/// lax-perms hatch. The forwarder passes [`LaxPerms::Refuse`] and never reads
+/// the hatch variable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LaxPerms {
+    /// Group/other bits are refused whatever the environment says.
+    Refuse,
+    /// Group/other bits are accepted (with an operator warning) when
+    /// [`AGENT_API_KEY_FILE_ALLOW_LAX_PERMS_ENV`] is truthy.
+    HonourHatch,
+}
+
+/// #9367 K-1 — the one failed check of [`read_checked_key_file`].
+#[derive(Debug)]
+enum KeyFileCheck {
+    /// The open failed.
+    Open(std::io::Error),
+    /// `fstat` on the open handle failed.
+    Stat(std::io::Error),
+    /// The path is a directory, a fifo, a device or anything but a file.
+    NotRegular,
+    /// (unix) group or other permission bits are set; the `0o777` mode.
+    LaxMode(u32),
+    /// Reading the open handle failed.
+    Read(std::io::Error),
+    /// The file is larger than [`FORWARD_KEY_FILE_MAX_BYTES`].
+    TooLarge,
+}
+
+/// #9367 K-1 — THE file checks of both key-file readers, in one function:
+/// one open (non-blocking, so a fifo cannot park it), `fstat` on that one
+/// handle (no path re-stat), a regular file, (unix) no group/other bits
+/// unless `lax` honours the hatch, and at most [`FORWARD_KEY_FILE_MAX_BYTES`]
+/// read. Returns the raw bytes; each reader names the failure in its own
+/// words.
+fn read_checked_key_file(path: &Path, lax: LaxPerms) -> Result<Vec<u8>, KeyFileCheck> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC);
+    }
+    let file = options.open(path).map_err(KeyFileCheck::Open)?;
+    let meta = file.metadata().map_err(KeyFileCheck::Stat)?;
+    if !meta.is_file() {
+        return Err(KeyFileCheck::NotRegular);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = meta.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            let hatch = lax == LaxPerms::HonourHatch
+                && std::env::var(AGENT_API_KEY_FILE_ALLOW_LAX_PERMS_ENV)
+                    .map(|v| crate::security_profile::is_truthy(&v))
+                    .unwrap_or(false);
+            if !hatch {
+                return Err(KeyFileCheck::LaxMode(mode));
+            }
+            tracing::warn!(
+                path = %path.display(),
+                mode = format!("{mode:o}"),
+                "read_api_key_token_file: file is group/world-readable;                      {AGENT_API_KEY_FILE_ALLOW_LAX_PERMS_ENV}=1 — accepting (UNSAFE)."
+            );
+        }
+    }
+    let mut raw = Vec::new();
+    file.take(FORWARD_KEY_FILE_MAX_BYTES + 1)
+        .read_to_end(&mut raw)
+        .map_err(KeyFileCheck::Read)?;
+    if u64::try_from(raw.len()).unwrap_or(u64::MAX) > FORWARD_KEY_FILE_MAX_BYTES {
+        return Err(KeyFileCheck::TooLarge);
+    }
+    Ok(raw)
+}
+
 /// Read the api-key token from a `0600` file (the #1927 non-argv channel;
-/// mirrors [`crate::governance::capability::capability_from_file`]).
+/// mirrors [`crate::governance::capability::capability_from_file`]). The file
+/// checks are [`read_checked_key_file`] with the lax-perms hatch honoured.
 ///
 /// # Errors
 ///
-/// - the file cannot be opened or read;
+/// - the file cannot be opened or read, or is not valid UTF-8;
+/// - it is not a regular file, or is larger than
+///   [`FORWARD_KEY_FILE_MAX_BYTES`];
 /// - (unix) its mode grants group/world access and
 ///   [`AGENT_API_KEY_FILE_ALLOW_LAX_PERMS_ENV`] is not set;
 /// - the file is empty after trimming.
 pub(crate) fn read_api_key_token_file(path: &Path) -> Result<String> {
-    let raw = std::fs::read_to_string(path)
-        .with_context(|| format!("reading api-key token file {}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        let mode = std::fs::metadata(path)
-            .with_context(|| format!("stat api-key token file {} for permissions", path.display()))?
-            .permissions()
-            .mode()
-            & 0o777;
-        if mode & 0o077 != 0 {
-            let lax = std::env::var(AGENT_API_KEY_FILE_ALLOW_LAX_PERMS_ENV)
-                .map(|v| crate::security_profile::is_truthy(&v))
-                .unwrap_or(false);
-            if lax {
-                tracing::warn!(
-                    path = %path.display(),
-                    mode = format!("{mode:o}"),
-                    "read_api_key_token_file: file is group/world-readable;                      {AGENT_API_KEY_FILE_ALLOW_LAX_PERMS_ENV}=1 — accepting (UNSAFE)."
-                );
-            } else {
-                anyhow::bail!(
-                    "api-key token file {} has lax permissions (mode {:o}, group/world bits set);                      tighten with `chmod 0600 {}` OR set {}=1 to opt out",
-                    path.display(),
-                    mode,
-                    path.display(),
-                    AGENT_API_KEY_FILE_ALLOW_LAX_PERMS_ENV,
-                );
-            }
+    let shown = path.display();
+    let raw = read_checked_key_file(path, LaxPerms::HonourHatch).map_err(|e| match e {
+        KeyFileCheck::Open(io) | KeyFileCheck::Read(io) => {
+            anyhow::Error::new(io).context(format!("reading api-key token file {shown}"))
         }
-    }
+        KeyFileCheck::Stat(io) => anyhow::Error::new(io)
+            .context(format!("stat api-key token file {shown} for permissions")),
+        KeyFileCheck::NotRegular => {
+            anyhow::anyhow!("api-key token file {shown} is not a regular file")
+        }
+        KeyFileCheck::LaxMode(mode) => anyhow::anyhow!(
+            "api-key token file {shown} has lax permissions (mode {mode:o}, group/world bits set);                      tighten with `chmod 0600 {shown}` OR set {AGENT_API_KEY_FILE_ALLOW_LAX_PERMS_ENV}=1 to opt out"
+        ),
+        KeyFileCheck::TooLarge => anyhow::anyhow!(
+            "api-key token file {shown} is larger than {FORWARD_KEY_FILE_MAX_BYTES} bytes"
+        ),
+    })?;
+    let raw =
+        String::from_utf8(raw).with_context(|| format!("reading api-key token file {shown}"))?;
     let Some(token) = trimmed_token(&raw) else {
         anyhow::bail!("api-key token file {} is empty", path.display());
     };
@@ -161,41 +229,20 @@ pub(crate) fn forward_key_from_env() -> Result<Option<String>, ForwardKeyFileErr
     }
 }
 
-/// The strict reader: one open, every check on that handle.
+/// The strict reader: [`read_checked_key_file`] with the lax-perms hatch off,
+/// then one printable token.
 fn read_forward_key_file(path: &OsString) -> Result<String, ForwardKeyFileError> {
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        // O_NONBLOCK so a fifo at the path cannot park the open; the fstat
-        // below refuses it as not a regular file.
-        options.custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC);
-    }
-    let file = options.open(path).map_err(|e| match e.kind() {
-        std::io::ErrorKind::NotFound => ForwardKeyFileError::Missing,
-        _ => ForwardKeyFileError::Unreadable,
-    })?;
-    let meta = file
-        .metadata()
-        .map_err(|_| ForwardKeyFileError::Unreadable)?;
-    if !meta.is_file() {
-        return Err(ForwardKeyFileError::NotRegular);
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        if meta.permissions().mode() & 0o077 != 0 {
-            return Err(ForwardKeyFileError::LaxMode);
+    let raw = read_checked_key_file(Path::new(path), LaxPerms::Refuse).map_err(|e| match e {
+        KeyFileCheck::Open(io) if io.kind() == std::io::ErrorKind::NotFound => {
+            ForwardKeyFileError::Missing
         }
-    }
-    let mut raw = Vec::new();
-    file.take(FORWARD_KEY_FILE_MAX_BYTES + 1)
-        .read_to_end(&mut raw)
-        .map_err(|_| ForwardKeyFileError::Unreadable)?;
-    if u64::try_from(raw.len()).unwrap_or(u64::MAX) > FORWARD_KEY_FILE_MAX_BYTES {
-        return Err(ForwardKeyFileError::TooLarge);
-    }
+        KeyFileCheck::Open(_) | KeyFileCheck::Stat(_) | KeyFileCheck::Read(_) => {
+            ForwardKeyFileError::Unreadable
+        }
+        KeyFileCheck::NotRegular => ForwardKeyFileError::NotRegular,
+        KeyFileCheck::LaxMode(_) => ForwardKeyFileError::LaxMode,
+        KeyFileCheck::TooLarge => ForwardKeyFileError::TooLarge,
+    })?;
     let text = std::str::from_utf8(&raw).map_err(|_| ForwardKeyFileError::Malformed)?;
     let token = trimmed_token(text).ok_or(ForwardKeyFileError::Empty)?;
     if !token.bytes().all(|b| b.is_ascii_graphic()) {
