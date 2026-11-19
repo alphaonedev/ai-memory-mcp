@@ -894,14 +894,21 @@ CLOSED_FORMS_READ = (
     "timeout 180 sudo apt-get update && timeout 180 sudo apt-get install -y pipx",
     "sudo apt-get install -y --no-install-recommends rpm jq",
     "apt-get update -qq",
+    "sudo apt-get autoremove --purge -y         || true",
+    "sudo apt-get clean",
+    "apt-get clean -q",
     "rpm --version",
     "lipo -create a.a b.a -output c.a",
     "copr-cli build alpha-one-ai/ai-memory ~/rpmbuild/SRPMS/ai-memory-*.src.rpm",
     "gh attestation verify dist/x --repo o/r",
 )
 CLOSED_FORMS_REFUSED = (
-    ("apt-get autoremove --purge -y", "apt-get subcommand 'autoremove' is not on the closed list"),
-    ("apt-get clean", "apt-get subcommand 'clean' is not on the closed list"),
+    ("apt-get source x", "apt-get subcommand 'source' is not on the closed list"),
+    ("apt-get build-dep x", "apt-get subcommand 'build-dep' is not on the closed list"),
+    ("apt-get install --purge x", "apt-get option '--purge' is not on the closed option list"),
+    ("apt-get clean --purge", "apt-get option '--purge' is not on the closed option list"),
+    ("apt-get autoremove --purge -y x", "apt-get operand 'x' is not a package name"),
+    ("apt-get clean x", "apt-get operand 'x' is not a package name"),
     ("apt-get", "apt-get subcommand '' is not on the closed list"),
     ("apt-get install -o APT::Update::Pre-Invoke::=x a", "apt-get option '-o' is not on the closed option list"),
     ("apt-get install -y ./x.deb", "apt-get operand './x.deb' is not a package name"),
@@ -922,7 +929,8 @@ CLOSED_FORMS_NO_ENTRY = ("nfpm", "cbindgen", "rpmbuild")
 
 
 class ClosedListEntries(unittest.TestCase):
-    """9566: apt-get update/install, rpm --version, lipo, copr-cli build, gh attestation verify."""
+    """9566: apt-get update/install/autoremove/clean, rpm --version, lipo, copr-cli build,
+    gh attestation verify."""
 
     def test_9566_closed_entry_form_is_read(self) -> None:
         _need_module(self)

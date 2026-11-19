@@ -2909,9 +2909,12 @@ def _command_cmd(words: list[_Word], cmd: _Cmd, ctx: _ShellCtx) -> bool:
 
 
 # 9566: the package and release tools of the workflows, each in its exact form only.
-APT_GET_VERBS = frozenset({"update", "install"})
+# autoremove and clean act on the package database and archive cache only and read no tree file.
+APT_GET_VERBS = frozenset({"update", "install", "autoremove", "clean"})
 APT_GET_FLAGS = frozenset({"-y", "--yes", "--assume-yes", "-q", "-qq", "--quiet", "--no-install-recommends",
                            "--no-install-suggests"})
+# Options closed to one subcommand: the other subcommands refuse them as off the closed option list.
+APT_GET_VERB_FLAGS = {"autoremove": frozenset({"--purge"})}
 APT_GET_OPTION_OFF_LIST = "apt-get option {opt!r} is not on the closed option list"
 APT_GET_OPERAND = "apt-get operand {opt!r} is not a package name"
 APT_GET_LOCAL_PACKAGE = (".deb",)
@@ -2930,14 +2933,16 @@ def _verb(tool: str, words: list[_Word], allowed: frozenset[str]) -> str:
 
 
 def _apt_get_cmd(words: list[_Word], cmd: _Cmd, ctx: _ShellCtx) -> bool:
-    """apt-get update / install of named packages from the configured archives, with closed flags."""
+    """apt-get update / install of named packages from the configured archives, autoremove and clean,
+    with closed flags; only install takes operands."""
     sub = _verb("apt-get", words, APT_GET_VERBS)
+    flags = APT_GET_FLAGS | APT_GET_VERB_FLAGS.get(sub, frozenset())
     for word in words[2:]:
         lit = word.lit
         if lit is None:
             raise Unclassifiable(APT_GET_OPERAND.format(opt=word.shown()))
         if lit.startswith("-"):
-            if lit not in APT_GET_FLAGS:
+            if lit not in flags:
                 raise Unclassifiable(APT_GET_OPTION_OFF_LIST.format(opt=lit))
             continue
         if sub != "install" or "/" in lit or lit.endswith(APT_GET_LOCAL_PACKAGE) or lit.startswith("."):
