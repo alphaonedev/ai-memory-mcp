@@ -657,7 +657,7 @@ UNREAD_SHELL = (
     ("echo $(", "unterminated command substitution"),
     ("echo ${a", "unterminated parameter expansion"),
 )
-NON_STRICT_UNREAD = ("gh attestation verify x", "gh subcommand 'attestation' is not on the closed list")
+NON_STRICT_UNREAD = ("gh codespace x", "gh subcommand 'codespace' is not on the closed list")
 UNCLOSED_ENTRY = ("a:\n  - 'x\n", "a quoted scalar that does not close: t: line 2: unterminated or multi-line quoted scalar")
 
 
@@ -887,6 +887,72 @@ class ArrayLiteralIsData(unittest.TestCase):
         started = time.perf_counter()
         self.assertFalse(_classify(text))
         self.assertLess(time.perf_counter() - started, SCAN_CEILING_S)
+
+
+# 9566: the closed-list entries of the release tools, each in its exact form.
+CLOSED_FORMS_READ = (
+    "timeout 180 sudo apt-get update && timeout 180 sudo apt-get install -y pipx",
+    "sudo apt-get install -y --no-install-recommends rpm jq",
+    "apt-get update -qq",
+    "rpm --version",
+    "lipo -create a.a b.a -output c.a",
+    "copr-cli build alpha-one-ai/ai-memory ~/rpmbuild/SRPMS/ai-memory-*.src.rpm",
+    "gh attestation verify dist/x --repo o/r",
+)
+CLOSED_FORMS_REFUSED = (
+    ("apt-get autoremove --purge -y", "apt-get subcommand 'autoremove' is not on the closed list"),
+    ("apt-get clean", "apt-get subcommand 'clean' is not on the closed list"),
+    ("apt-get", "apt-get subcommand '' is not on the closed list"),
+    ("apt-get install -o APT::Update::Pre-Invoke::=x a", "apt-get option '-o' is not on the closed option list"),
+    ("apt-get install -y ./x.deb", "apt-get operand './x.deb' is not a package name"),
+    ("apt-get install x.deb", "apt-get operand 'x.deb' is not a package name"),
+    ("apt-get install dist/x", "apt-get operand 'dist/x' is not a package name"),
+    ('apt-get install "$P"', "apt-get operand '$P' is not a package name"),
+    ("apt-get update rpm", "apt-get operand 'rpm' is not a package name"),
+    ("rpm -i x.rpm", "rpm form 'rpm -i x.rpm' is not on the closed list"),
+    ("rpm --version x", "rpm form 'rpm --version x' is not on the closed list"),
+    ("rpm", "rpm form 'rpm' is not on the closed list"),
+    ("copr-cli create x", "copr-cli subcommand 'create' is not on the closed list"),
+    ("copr-cli", "copr-cli subcommand '' is not on the closed list"),
+    ("gh attestation download x", "gh attestation subcommand 'download' is not on the closed list"),
+    ("gh attestation", "gh attestation subcommand '' is not on the closed list"),
+)
+# The release tools that run tree code or templates keep no entry.
+CLOSED_FORMS_NO_ENTRY = ("nfpm", "cbindgen", "rpmbuild")
+
+
+class ClosedListEntries(unittest.TestCase):
+    """9566: apt-get update/install, rpm --version, lipo, copr-cli build, gh attestation verify."""
+
+    def test_9566_closed_entry_form_is_read(self) -> None:
+        _need_module(self)
+        for text in CLOSED_FORMS_READ:
+            for strict in (True, False):
+                with self.subTest(text=text, strict=strict):
+                    ctx = tb._ShellCtx(strict=strict)
+                    self.assertFalse(tb._shell_runs_pr_code(tb._joined(text, tb.MARK), ctx))
+                    self.assertEqual(ctx.unread, [])
+
+    def test_9566_closed_entry_other_form_is_not_read(self) -> None:
+        _need_module(self)
+        for text, reason in CLOSED_FORMS_REFUSED:
+            with self.subTest(text=text):
+                with self.assertRaises(tb.Unclassifiable) as caught:
+                    _classify(text)
+                self.assertEqual(str(caught.exception), reason)
+                ctx = tb._ShellCtx(strict=False)
+                self.assertFalse(tb._shell_runs_pr_code(tb._joined(text, tb.MARK), ctx))
+                self.assertEqual(ctx.unread, [reason])
+
+    def test_9566_tree_code_tools_have_no_entry(self) -> None:
+        _need_module(self)
+        for name in CLOSED_FORMS_NO_ENTRY:
+            with self.subTest(name=name):
+                self.assertIsNone(tb._command_handler(name))
+
+    def test_9566_lipo_unbinds_the_paths_it_writes(self) -> None:
+        _need_module(self)
+        self.assertIn("lipo", tb.PATH_WRITERS)
 
 
 class HostedGuard(unittest.TestCase):

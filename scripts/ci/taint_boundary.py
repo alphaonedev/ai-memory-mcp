@@ -2280,6 +2280,11 @@ GH_INERT = frozenset({
 })
 
 
+# 9566: `gh attestation verify` reads an attestation; every other attestation verb is not read.
+GH_ATTESTATION_VERB = "verify"
+SUBCOMMAND_OFF_LIST = "{tool} subcommand {sub!r} is not on the closed list"
+
+
 def _gh_cmd(words: list[_Word], cmd: _Cmd, ctx: _ShellCtx) -> bool:
     """gh: closed subcommands; `gh pr checkout` is a pull-request tree change; extensions run code."""
     if len(words) < 2:
@@ -2291,6 +2296,12 @@ def _gh_cmd(words: list[_Word], cmd: _Cmd, ctx: _ShellCtx) -> bool:
         return False
     if sub == "extension":
         return True
+    if sub == "attestation":
+        verb = words[2].lit if len(words) > 2 else None
+        if verb != GH_ATTESTATION_VERB:
+            shown = words[2].shown() if len(words) > 2 else ""
+            raise Unclassifiable(SUBCOMMAND_OFF_LIST.format(tool="gh attestation", sub=shown))
+        return False
     if sub not in GH_INERT:
         raise Unclassifiable(f"gh subcommand {sub!r} is not on the closed list")
     if sub == "pr" and len(words) > 2 and words[2].lit in ("checkout", "co"):
@@ -2892,6 +2903,56 @@ def _command_cmd(words: list[_Word], cmd: _Cmd, ctx: _ShellCtx) -> bool:
     return _dispatch(rest, cmd, ctx) if rest else False
 
 
+# 9566: the package and release tools of the workflows, each in its exact form only.
+APT_GET_VERBS = frozenset({"update", "install"})
+APT_GET_FLAGS = frozenset({"-y", "--yes", "--assume-yes", "-q", "-qq", "--quiet", "--no-install-recommends",
+                           "--no-install-suggests"})
+APT_GET_OPTION_OFF_LIST = "apt-get option {opt!r} is not on the closed option list"
+APT_GET_OPERAND = "apt-get operand {opt!r} is not a package name"
+APT_GET_LOCAL_PACKAGE = (".deb",)
+RPM_FORM = ("--version",)
+RPM_OFF_LIST = "rpm form {form!r} is not on the closed list"
+COPR_CLI_VERB = "build"
+
+
+def _verb(tool: str, words: list[_Word], allowed: frozenset[str]) -> str:
+    """The literal subcommand of a tool, or Unclassifiable when it is not on the closed list."""
+    sub = words[1].lit if len(words) > 1 else None
+    if sub not in allowed:
+        shown = words[1].shown() if len(words) > 1 else ""
+        raise Unclassifiable(SUBCOMMAND_OFF_LIST.format(tool=tool, sub=shown))
+    return sub
+
+
+def _apt_get_cmd(words: list[_Word], cmd: _Cmd, ctx: _ShellCtx) -> bool:
+    """apt-get update / install of named packages from the configured archives, with closed flags."""
+    sub = _verb("apt-get", words, APT_GET_VERBS)
+    for word in words[2:]:
+        lit = word.lit
+        if lit is None:
+            raise Unclassifiable(APT_GET_OPERAND.format(opt=word.shown()))
+        if lit.startswith("-"):
+            if lit not in APT_GET_FLAGS:
+                raise Unclassifiable(APT_GET_OPTION_OFF_LIST.format(opt=lit))
+            continue
+        if sub != "install" or "/" in lit or lit.endswith(APT_GET_LOCAL_PACKAGE) or lit.startswith("."):
+            raise Unclassifiable(APT_GET_OPERAND.format(opt=lit))
+    return False
+
+
+def _rpm_cmd(words: list[_Word], cmd: _Cmd, ctx: _ShellCtx) -> bool:
+    """rpm: the version query only."""
+    if tuple(_lits(words[1:])) != RPM_FORM:
+        raise Unclassifiable(RPM_OFF_LIST.format(form=" ".join(w.shown() for w in words)))
+    return False
+
+
+def _copr_cli_cmd(words: list[_Word], cmd: _Cmd, ctx: _ShellCtx) -> bool:
+    """copr-cli build: sends a source package to the remote builder; nothing runs on the runner."""
+    _verb("copr-cli", words, frozenset({COPR_CLI_VERB}))
+    return False
+
+
 INERT_COMMANDS = frozenset({
     "echo", "printf", "cat", "tac", "grep", "egrep", "fgrep", "wc", "head", "tail", "cut", "tr", "uniq", "tee",
     "mkdir", "mktemp", "rm", "rmdir", "cp", "mv", "ln", "touch", "chmod", "chown", "chgrp", "ls", "basename",
@@ -2913,7 +2974,7 @@ PR_CODE_COMMANDS = frozenset({
 })
 # Commands that write the paths in their arguments: a base-bound path named there is unbound.
 PATH_WRITERS = frozenset({"cp", "mv", "install", "tee", "ln", "touch", "dd", "rsync", "tar", "unzip", "chmod",
-                          "sed", "patch", "truncate", "curl", "wget", "rm"})
+                          "sed", "patch", "truncate", "curl", "wget", "rm", "lipo"})
 COMMAND_HANDLERS = {name: _inert for name in INERT_COMMANDS}
 COMMAND_HANDLERS.update({name: _pr_code for name in PR_CODE_COMMANDS})
 COMMAND_HANDLERS.update({
@@ -2941,6 +3002,8 @@ COMMAND_HANDLERS.update({
     "env": _env_cmd, "sudo": _sudo_cmd, "flock": _flock_cmd, "trap": _trap_cmd, "command": _command_cmd,
     "read": _binds, "unset": _binds, "export": _binds, "local": _binds, "declare": _binds, "typeset": _binds,
     "readonly": _binds, "mapfile": _binds, "readarray": _binds,
+    # 9566: lipo joins and splits Mach-O archives and runs none of them.
+    "apt-get": _apt_get_cmd, "rpm": _rpm_cmd, "copr-cli": _copr_cli_cmd, "lipo": _inert,
 })
 
 
