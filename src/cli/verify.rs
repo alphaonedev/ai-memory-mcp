@@ -698,11 +698,8 @@ pub fn run(db_path: &Path, args: &VerifyChainArgs, out: &mut CliOutput<'_>) -> R
     } else {
         render_text(&report, out)?;
         // v0.9.0 G8 (#1825) — per-memory cid_verified line for the root.
-        if let Some(genesis) = crate::db::read_cid_genesis(&conn, &args.memory_id)
-            .ok()
-            .flatten()
-        {
-            if let Some(mem) = crate::db::get(&conn, &args.memory_id).ok().flatten() {
+        if let Some(genesis) = crate::db::read_cid_genesis(&conn, &args.memory_id)? {
+            if let Some(mem) = crate::db::get(&conn, &args.memory_id)? {
                 if let Some(cid) = mem.cid.as_deref() {
                     let ok = crate::identity::cid::verify_cid(cid, &genesis).is_ok();
                     writeln!(out.stdout, "cid_verified:   {ok} ({cid})")?;
