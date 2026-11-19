@@ -457,19 +457,19 @@ pub fn schema_ahead_of(err: &anyhow::Error) -> Option<&SchemaAheadOfBinary> {
 pub const SCHEMA_BEHIND_READ_ONLY_REFUSAL: &str =
     crate::errors::error_codes::SCHEMA_BEHIND_READ_ONLY_REFUSAL;
 
-/// Repair command named for a SQLITE store that is behind (public until B4 routes
-/// every renderer through the function; then it is private):
-/// see [`schema_behind_repair_clause`].
-pub const SCHEMA_BEHIND_REPAIR: &str = "ai-memory migrate --in-place";
+/// Repair command named for a SQLITE store that is behind. Private on purpose:
+/// every renderer (schema guard, `boot`, `doctor`, the provenance fault) gets
+/// the text from [`schema_behind_repair_clause`], never from this constant.
+const SCHEMA_BEHIND_REPAIR: &str = "ai-memory migrate --in-place";
 
 /// v1.0.0 #9504 — repair command for a POSTGRES store that is behind: opening
 /// the store runs the upgrade ladder (`docs/postgres-age-guide.md`, "Old
 /// postgres schema version detected"; `schema-init` is `--features sal`).
-pub const SCHEMA_BEHIND_REPAIR_POSTGRES: &str = "ai-memory schema-init --store-url <url>";
+const SCHEMA_BEHIND_REPAIR_POSTGRES: &str = "ai-memory schema-init --store-url <url>";
 
 /// Companion repair: starting the daemon runs [`crate::db::open`], which
 /// migrates (the default build has no `migrate` subcommand).
-pub const SCHEMA_BEHIND_REPAIR_DAEMON: &str = "start the daemon";
+const SCHEMA_BEHIND_REPAIR_DAEMON: &str = "start the daemon";
 
 /// v1.0.0 #9557 B2 — the clause for a backend label this binary does not
 /// know. It names no repair command (any verb would be another backend's) and
@@ -621,12 +621,10 @@ impl fmt::Display for ProvenanceReadFault {
             Self::ColumnMissingPreV74 { column, .. } => write!(
                 f,
                 "provenance column memories.{column} is missing: this database is on a schema \
-                 older than v{v} (the content-id columns). Repair: `{repair}` or {daemon}, then \
-                 re-run.",
+                 older than v{v} (the content-id columns). {repair}, then re-run.",
                 column = column,
                 v = PROVENANCE_CID_SCHEMA_VERSION,
-                repair = SCHEMA_BEHIND_REPAIR,
-                daemon = SCHEMA_BEHIND_REPAIR_DAEMON,
+                repair = schema_behind_repair_clause(BACKEND_SQLITE),
             ),
             Self::ColumnMissingAtStamp { column, stamp, .. } => write!(
                 f,
