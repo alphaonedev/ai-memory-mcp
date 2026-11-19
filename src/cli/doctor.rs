@@ -6027,12 +6027,12 @@ mod tests {
         );
         let set = forward_agent_key_file_fact(Some(URL), Some(OsStr::new(PATH)));
         assert_eq!(set.as_deref(), Some("set"));
-        // The production half ends at the file's test module, not at the first
-        // `#[cfg(test)]`: a production fn may carry a test-only seam statement.
-        let production = include_str!("doctor.rs")
-            .split("\nmod tests {")
-            .next()
-            .unwrap_or_default();
+        // The production text is every line outside the file's test modules
+        // (the ONE resolver, #9367): a production fn may carry a test-only
+        // seam statement, and production after a test module still counts.
+        let production = crate::test_support::cfg_test_modules::strip_cfg_test_inline_mods(
+            include_str!("doctor.rs"),
+        );
         assert_eq!(
             production.matches("forward_agent_key_file_fact(").count(),
             2,
