@@ -51,7 +51,7 @@ FIX_ISSUES = frozenset({9454, 9455, 9456, 9471, 9553})
 UNCLASSIFIABLE_PREFIX = "unclassifiable: "
 # The hosted job and step that already run the scripts/ci unit tests (I-6).
 HOST_WORKFLOW = "ci.yml"
-HOST_JOB = "classify"
+HOST_JOB = "build-script-vetting"
 HOST_STEP = "Shard partition and wiring unit tests (#6344)"
 HOST_COMMAND = "python3 -m unittest discover -s scripts/ci/tests"
 HOSTED_LABEL = "ubuntu-latest"

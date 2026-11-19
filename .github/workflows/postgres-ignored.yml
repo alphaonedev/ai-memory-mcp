@@ -54,7 +54,8 @@ jobs:
     runs-on: [self-hosted, linux-fed]
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     # #8303: compile 24 min + soak 20 min on an idle host, 37+ min under load; 60 min had no headroom.
-    timeout-minutes: 120
+    # #9593: 120 -> 180; the compile step waits up to 3600 s for a host-semaphore slot, so the cap is the old 120 + that 60.
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -113,6 +114,19 @@ jobs:
             echo "AI_MEMORY_TEST_AGE_URL=$new_url"
           } >> "$GITHUB_ENV"
           echo "::notice::[#3274] ignored pg tests pointed at ephemeral db $CI_FED_DB on $RUNNER_NAME"
+
+      # #9593 - the compile (24 min on an idle host, 37+ min under load) is the
+      # part that drives the host to load 44-52 beside the Check leg, so it
+      # takes a slot of the same host semaphore the Check linux-fed leg uses
+      # (ci.yml "Run tests (impact-aware)": name linux-fed-tests, 2 slots, wait
+      # 3600 s). The slot is held for the compile ONLY and freed before the
+      # single-threaded run below; the Check leg's own hold is not touched.
+      # `--no-run` builds exactly the binaries the list and run steps use
+      # (same package, features and profile), so they reuse the artifacts.
+      - name: Compile the ignored-test binaries under the host semaphore (#9593)
+        run: |
+          set -euo pipefail
+          python3 -I scripts/ci/host_semaphore.py --name linux-fed-tests --slots 2 --max-wait-secs 3600 --label "postgres-ignored/compile" -- cargo test --features sal-postgres --no-run
 
       - name: cargo test --features sal-postgres -- --ignored
         timeout-minutes: 100
