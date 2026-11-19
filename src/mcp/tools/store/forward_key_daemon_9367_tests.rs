@@ -25,6 +25,8 @@
 //! its two keyed phases in a second child whose start state names the key
 //! file; the parent only spawns and checks.
 
+#![cfg(test)]
+
 use super::*;
 use crate::identity::test_agent_id::AgentIdOverride;
 use serde_json::json;

@@ -18,6 +18,8 @@
 //! state; the parent only spawns and checks. Keys are synthetic and generated
 //! per cell inside the child; no key byte is in a test name or a fixture path.
 
+#![cfg(test)]
+
 use super::*;
 use crate::identity::test_agent_id::AgentIdOverride;
 use serde_json::json;
