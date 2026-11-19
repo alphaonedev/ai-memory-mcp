@@ -523,16 +523,150 @@ mod tests {
         assert_ne!(a, c, "scratch names must be unique per run");
     }
 
+    /// Prefix of every setup failure of the live cells. A cell that cannot
+    /// build its precondition FAILS with this text; it never passes and
+    /// never silently retries.
+    #[cfg(test)]
+    const SETUP_ERROR: &str = "setup error";
+
+    /// Deadline for every wait on the other session in the live cell.
+    #[cfg(test)]
+    const SETUP_WAIT_DEADLINE: Duration = Duration::from_secs(30);
+
+    /// The peer session's own `deadlock_timeout`. Far above the funnel's
+    /// default (1s) and above [`SETUP_WAIT_DEADLINE`], so the peer's deadlock
+    /// check can never fire first and the funnel is always the victim.
+    #[cfg(test)]
+    const PEER_DEADLOCK_TIMEOUT: &str = "60s";
+
+    /// Interval of the catalog poll in [`await_pending_lock`].
+    #[cfg(test)]
+    const PENDING_LOCK_POLL: Duration = Duration::from_millis(10);
+
+    /// How long the cleanup session waits for a lock on a scratch relation
+    /// before it reports a failed cleanup instead of hanging the test run.
+    #[cfg(test)]
+    const CLEANUP_LOCK_TIMEOUT: &str = "20s";
+
+    /// Prefix of every cleanup failure of the live cell.
+    #[cfg(test)]
+    const CLEANUP_ERROR: &str = "cleanup error";
+
+    /// Ends every session of this cell that still holds or queues for one of
+    /// the scratch `names`, then drops them, on one FRESH connection.
+    ///
+    /// A cell that fails early leaves its peer task parked on a transaction
+    /// that holds `ACCESS EXCLUSIVE` on a scratch relation; a plain
+    /// `DROP TABLE` would queue behind it. The names carry a per-run uuid, so
+    /// the sessions ended here are this cell's own and no other test's.
+    #[cfg(test)]
+    async fn drop_scratch(url: &str, names: &[String]) -> anyhow::Result<()> {
+        use sqlx::Connection as _;
+        let mut conn = sqlx::postgres::PgConnection::connect(url)
+            .await
+            .map_err(|_| anyhow::anyhow!("{CLEANUP_ERROR}: cannot open the cleanup session"))?;
+        sqlx::query(
+            "SELECT pg_terminate_backend(l.pid) FROM pg_locks l \
+               JOIN pg_class c ON c.oid = l.relation \
+              WHERE c.relname = ANY($1) AND l.pid <> pg_backend_pid()",
+        )
+        .bind(names)
+        .execute(&mut conn)
+        .await
+        .map_err(|e| anyhow::anyhow!("{CLEANUP_ERROR}: ending the cell's sessions: {e}"))?;
+        sqlx::query(&format!("SET lock_timeout = '{CLEANUP_LOCK_TIMEOUT}'"))
+            .execute(&mut conn)
+            .await
+            .map_err(|e| anyhow::anyhow!("{CLEANUP_ERROR}: lock_timeout: {e}"))?;
+        for name in names {
+            sqlx::query(&format!("DROP TABLE IF EXISTS {name}"))
+                .execute(&mut conn)
+                .await
+                .map_err(|e| anyhow::anyhow!("{CLEANUP_ERROR}: dropping {name}: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// Owns the two scratch tables of the live cell (#9252).
+    ///
+    /// Created BEFORE the tables, so a half-built setup is cleaned too. The
+    /// drop runs on EVERY exit path: [`Self::finish`] on the passing path
+    /// (where a failed cleanup fails the cell), and `Drop` on any other exit,
+    /// a setup error, a failed assertion or a panic. `Drop` cannot await, so
+    /// it runs [`drop_scratch`] on a fresh runtime in its own thread and never
+    /// panics (`OWNERSHIP-25`).
+    #[cfg(test)]
+    struct ScratchRelations {
+        url: String,
+        names: [String; 2],
+        cleaned: bool,
+    }
+
+    #[cfg(test)]
+    impl ScratchRelations {
+        fn new(url: &str, r1: &str, r2: &str) -> Self {
+            Self {
+                url: url.to_owned(),
+                names: [r1.to_owned(), r2.to_owned()],
+                cleaned: false,
+            }
+        }
+
+        async fn finish(mut self) -> anyhow::Result<()> {
+            drop_scratch(&self.url, &self.names).await?;
+            self.cleaned = true;
+            Ok(())
+        }
+    }
+
+    #[cfg(test)]
+    impl Drop for ScratchRelations {
+        fn drop(&mut self) {
+            if self.cleaned {
+                return;
+            }
+            let url = self.url.clone();
+            let names = self.names.clone();
+            let joined = std::thread::spawn(move || -> anyhow::Result<()> {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| anyhow::anyhow!("{CLEANUP_ERROR}: runtime: {e}"))?;
+                rt.block_on(drop_scratch(&url, &names))
+            })
+            .join();
+            match joined {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => eprintln!("{e}"),
+                Err(_) => eprintln!("{CLEANUP_ERROR}: the cleanup thread panicked"),
+            }
+        }
+    }
+
+    /// The raw `sqlstate` field of a backend error, exactly as the server sent
+    /// it, with NO retry classification in between: the cell uses it to tell
+    /// a failed provocation from a failed retry (#9252).
+    #[cfg(test)]
+    fn raw_sqlstate(e: &StoreError) -> Option<String> {
+        match e {
+            StoreError::BackendUnavailable { sqlstate, .. } => sqlstate.clone(),
+            _ => None,
+        }
+    }
+
     /// Waits until `relation` has at least one PENDING (ungranted) lock
-    /// request, i.e. some session is provably blocked on it.
+    /// request, i.e. some session is provably blocked on it. Returns the
+    /// named setup error when the request does not appear before
+    /// [`SETUP_WAIT_DEADLINE`].
     ///
     /// This is the ORDERING primitive, not an assertion: the two sessions
     /// must enter the cycle in a known order for the victim to be known.
-    /// It polls a catalog view rather than sleeping a guessed interval, so a
-    /// slow host makes the test slower, never flaky.
+    /// It polls a catalog view against a deadline rather than sleeping a
+    /// guessed interval, so a slow host makes the test slower, never flaky.
     #[cfg(test)]
-    async fn await_pending_lock(pool: &sqlx::PgPool, relation: &str) -> bool {
-        for _ in 0..600_u32 {
+    async fn await_pending_lock(pool: &sqlx::PgPool, relation: &str) -> anyhow::Result<()> {
+        let deadline = tokio::time::Instant::now() + SETUP_WAIT_DEADLINE;
+        loop {
             let waiting: i64 = sqlx::query_scalar(
                 "SELECT count(*) FROM pg_locks l \
                    JOIN pg_class c ON c.oid = l.relation \
@@ -541,26 +675,40 @@ mod tests {
             .bind(relation)
             .fetch_one(pool)
             .await
-            .unwrap_or(0);
+            .map_err(|e| anyhow::anyhow!("{SETUP_ERROR}: pg_locks probe failed: {e}"))?;
             if waiting > 0 {
-                return true;
+                return Ok(());
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            if tokio::time::Instant::now() >= deadline {
+                return Err(anyhow::anyhow!(
+                    "{SETUP_ERROR}: no session ever queued a lock request on {relation}"
+                ));
+            }
+            tokio::time::sleep(PENDING_LOCK_POLL).await;
         }
-        false
     }
 
     /// TWO sessions take TWO relation locks in opposite order. PostgreSQL
     /// detects the cycle and aborts one side with `40P01`; the funnel must
     /// recognise that abort STRUCTURALLY, retry the transaction, and commit.
     ///
-    /// Determinism comes from the ordering, not from timing: the funnel
-    /// session begins WAITING first (its deadlock check therefore fires
-    /// first, and PostgreSQL aborts the process that detects the cycle), and
-    /// the peer only requests its second lock once `pg_locks` shows the
-    /// funnel is genuinely blocked. The outer bounded repeat exists so that a
-    /// host which nonetheless picks the peer as the victim re-runs the
-    /// provocation instead of reporting a false green.
+    /// #9252 — the cycle AND its victim are fixed by construction, with no
+    /// timing round and no sleep as a synchroniser:
+    ///
+    /// 1. the peer holds `r2` and reports that; the funnel takes `r1` and its
+    ///    `LOCK` statement RETURNS (the lock is held);
+    /// 2. only then is the peer's second step sent: it requests `r1` and parks
+    ///    behind the funnel;
+    /// 3. the funnel sends its own second step (`LOCK r2`) only after
+    ///    `pg_locks` shows the peer's ungranted request on `r1`, so the cycle
+    ///    is closed by the FUNNEL's request;
+    /// 4. the peer raised its own `deadlock_timeout` (`SET LOCAL`), so its
+    ///    deadlock check cannot fire first and PostgreSQL aborts the funnel's
+    ///    wait. The peer being the victim is impossible, not merely unlikely.
+    ///
+    /// Every wait on the other session has a deadline; passing it (or any
+    /// refused precondition) is the named `setup error`, never a pass and
+    /// never a silent extra round.
     #[tokio::test]
     async fn a_live_40p01_deadlock_is_retried_by_the_funnel_and_commits_3520() {
         let Ok(url) = std::env::var("AI_MEMORY_TEST_POSTGRES_URL") else {
@@ -583,6 +731,9 @@ mod tests {
         // so this suite is safe against ANY store it is pointed at. See
         // [`scratch_relations`].
         let (r1, r2) = scratch_relations();
+        // Owns both tables from BEFORE they exist: every exit below (a setup
+        // panic, a failed assertion, a failed `expect`) drops them (#9252).
+        let scratch = ScratchRelations::new(&url, &r1, &r2);
         sqlx::raw_sql(&format!(
             "CREATE TABLE {r1} (x int); CREATE TABLE {r2} (x int);"
         ))
@@ -591,47 +742,76 @@ mod tests {
         .expect("create scratch relations");
 
         let mut observed_retry = false;
-        let mut total_attempts = 0_u32;
-        // Bounded: each round provokes one cycle. Two rounds is already
-        // generous given the ordering guarantee below.
-        for _round in 0..4_u32 {
+        let total_attempts: u32;
+        // ONE provocation, built in a fixed order (see the doc comment).
+        {
             let before = retries_total();
             let peer_pool = pool.clone();
             let (peer_r1, peer_r2) = (r1.clone(), r2.clone());
-            let poll_pool = pool.clone();
-            let poll_r2 = r2.clone();
 
-            // PEER: holds r2, then queues for r1 — but only once the funnel
-            // is provably waiting on r2, so the funnel's deadlock check is
-            // the one that fires first and the funnel is the victim.
-            //
-            // TWO hand-offs, both catalog-observed rather than timed: the
-            // funnel may not start until the peer HOLDS r2 (otherwise there
-            // is no cycle at all), and the peer may not request r1 until the
-            // funnel is BLOCKED on r2 (otherwise the peer waits first and
-            // PostgreSQL aborts the peer instead).
-            let (holds_r2_tx, holds_r2_rx) = tokio::sync::oneshot::channel::<()>();
+            // PEER: holds r2 and reports that (or the named setup error that
+            // stopped it), then requests r1 only once the funnel reports it
+            // HOLDS r1.
+            let (peer_ready_tx, peer_ready_rx) =
+                tokio::sync::oneshot::channel::<anyhow::Result<()>>();
+            let (funnel_holds_r1_tx, funnel_holds_r1_rx) = tokio::sync::oneshot::channel::<()>();
             let peer = tokio::spawn(async move {
-                let mut tx = peer_pool.begin().await.expect("peer begin");
-                sqlx::query(&format!("LOCK TABLE {peer_r2} IN ACCESS EXCLUSIVE MODE"))
+                let prepared: Result<_, String> = async {
+                    let mut tx = peer_pool
+                        .begin()
+                        .await
+                        .map_err(|e| format!("{SETUP_ERROR}: peer begin: {e}"))?;
+                    sqlx::query(&format!(
+                        "SET LOCAL deadlock_timeout = '{PEER_DEADLOCK_TIMEOUT}'"
+                    ))
                     .execute(&mut *tx)
                     .await
-                    .expect("peer locks r2");
-                let _ = holds_r2_tx.send(());
-                let _blocked = await_pending_lock(&poll_pool, &poll_r2).await;
-                let _ = sqlx::query(&format!("LOCK TABLE {peer_r1} IN ACCESS EXCLUSIVE MODE"))
+                    .map_err(|e| {
+                        format!(
+                            "{SETUP_ERROR}: the peer session cannot raise its own \
+                             deadlock_timeout (the role must be allowed to SET it): {e}"
+                        )
+                    })?;
+                    sqlx::query(&format!("LOCK TABLE {peer_r2} IN ACCESS EXCLUSIVE MODE"))
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| format!("{SETUP_ERROR}: peer cannot lock r2: {e}"))?;
+                    Ok(tx)
+                }
+                .await;
+                let mut tx = match prepared {
+                    Ok(tx) => {
+                        let _ = peer_ready_tx.send(Ok(()));
+                        tx
+                    }
+                    Err(setup) => {
+                        let _ = peer_ready_tx.send(Err(anyhow::anyhow!("{setup}")));
+                        return Err(setup);
+                    }
+                };
+                // The second step is released by the funnel, after it holds r1.
+                tokio::time::timeout(SETUP_WAIT_DEADLINE, funnel_holds_r1_rx)
+                    .await
+                    .map_err(|_| format!("{SETUP_ERROR}: the funnel never reported holding r1"))?
+                    .map_err(|_| format!("{SETUP_ERROR}: the funnel ended before holding r1"))?;
+                // Parks behind the funnel's r1. It is NOT the victim: its own
+                // deadlock check is raised above the whole cell, so this
+                // request is granted once the funnel's transaction aborts.
+                sqlx::query(&format!("LOCK TABLE {peer_r1} IN ACCESS EXCLUSIVE MODE"))
                     .execute(&mut *tx)
-                    .await;
-                let _ = tx.commit().await;
+                    .await
+                    .map_err(|e| format!("peer was aborted instead of the funnel: {e}"))?;
+                tx.commit()
+                    .await
+                    .map_err(|e| format!("peer commit failed: {e}"))
             });
-            if holds_r2_rx.await.is_err() {
-                let _ = peer.await;
-                continue;
-            }
 
             // FUNNEL: the shared driver, wrapping a transaction that takes
-            // r1 then r2 — the opposite order.
+            // r1 then r2 — the opposite order. The barrier runs on the first
+            // attempt only; a retry has nothing left to provoke.
             let mut retry = TxRetry::new("test: provoked 40P01");
+            let mut barrier = Some((peer_ready_rx, funnel_holds_r1_tx));
+            let mut first_abort: Option<String> = None;
             let mut attempts = 0_u32;
             let outcome: StoreResult<()> = loop {
                 attempts += 1;
@@ -644,6 +824,23 @@ mod tests {
                         .execute(&mut *tx)
                         .await
                         .map_err(|e| super::super::to_store_err("t3520 lock r1", e))?;
+                    if let Some((peer_ready, funnel_holds_r1)) = barrier.take() {
+                        // r1 is held (the LOCK above returned) and the peer
+                        // holds r2: release the peer's request, then wait
+                        // until the DATABASE shows it parked on r1.
+                        match tokio::time::timeout(SETUP_WAIT_DEADLINE, peer_ready).await {
+                            Ok(Ok(Ok(()))) => {}
+                            Ok(Ok(Err(setup))) => panic!("{setup}"),
+                            Ok(Err(_)) => {
+                                panic!("{SETUP_ERROR}: the peer ended before locking r2")
+                            }
+                            Err(_) => panic!("{SETUP_ERROR}: the peer never locked r2"),
+                        }
+                        let _ = funnel_holds_r1.send(());
+                        if let Err(setup) = await_pending_lock(&pool, &r1).await {
+                            panic!("{setup}");
+                        }
+                    }
                     sqlx::query(&format!("LOCK TABLE {r2} IN ACCESS EXCLUSIVE MODE"))
                         .execute(&mut *tx)
                         .await
@@ -657,15 +854,34 @@ mod tests {
                 match attempt {
                     Ok(()) => break Ok(()),
                     Err(e) => {
+                        if attempts == 1 {
+                            first_abort = raw_sqlstate(&e);
+                        }
                         if let Err(terminal) = retry.consider(e).await {
                             break Err(terminal);
                         }
                     }
                 }
             };
-            let _ = peer.await;
+            let peer_outcome = peer.await.expect("peer task must not panic");
+            peer_outcome.expect("the peer must commit after the funnel's abort");
 
-            outcome.expect("the funnel must COMMIT, not surface the deadlock");
+            // The cell proves its own provocation: the funnel's FIRST attempt
+            // was aborted with 40P01 itself, read from the RAW sqlstate field
+            // so a broken retry classification cannot masquerade as a failed
+            // provocation (#9252).
+            eprintln!("t3520 provoked: first abort {first_abort:?}, attempts {attempts}");
+            assert_eq!(
+                first_abort.as_deref(),
+                Some(SQLSTATE_DEADLOCK_DETECTED),
+                "the provocation failed: the funnel's first attempt was not aborted \
+                 with the raw sqlstate 40P01 (set-up, not the retry list)"
+            );
+
+            outcome.expect(
+                "the 40P01 was provoked but the funnel surfaced it instead of committing: \
+                 check TX_RETRYABLE_SQLSTATES and the retry classification",
+            );
             total_attempts = attempts;
             if retries_total() > before {
                 observed_retry = true;
@@ -673,20 +889,70 @@ mod tests {
                     attempts >= 2,
                     "a counted retry must correspond to a re-run transaction body"
                 );
-                break;
             }
         }
 
-        let _ = sqlx::raw_sql(&format!(
-            "DROP TABLE IF EXISTS {r1}; DROP TABLE IF EXISTS {r2};"
-        ))
-        .execute(&pool)
-        .await;
+        scratch
+            .finish()
+            .await
+            .expect("the scratch relations must be dropped");
 
         assert!(
             observed_retry,
-            "no 40P01 was provoked in the bounded rounds (last attempt count {total_attempts}); \
-             the regression test proved nothing"
+            "the funnel committed but the retry counter did not move (attempts \
+             {total_attempts}); the regression test proved nothing"
+        );
+    }
+
+    /// #9252 — structural pin on the live 40P01 cell.
+    ///
+    /// Class: a regression test that can end without having provoked the
+    /// state it tests. The present cell picks the deadlock victim by RACING
+    /// two deadlock-check timers (the peer's request for the second lock must
+    /// land inside the funnel's `deadlock_timeout`), so a slow host makes the
+    /// peer the victim, the funnel commits with no retry, and the cell reaches
+    /// its "proved nothing" line. That outcome cannot be forced
+    /// deterministically from outside the test body, so this pin holds the
+    /// invariant on the body itself: the cell never repeats the provocation in a
+    /// loop, waits for the other session's lock in the database, and fails
+    /// with a named setup error when a precondition is not met.
+    #[test]
+    fn the_live_40p01_cell_provokes_by_construction_not_in_rounds_9252() {
+        const SELF_START: &str = "fn the_live_40p01_cell_provokes_by_construction";
+        let source = include_str!("tx_retry.rs");
+        let cell_start = source
+            .find("async fn a_live_40p01_deadlock_is_retried")
+            .expect("the live cell exists");
+        let pin_start = source.find(SELF_START).expect("this pin exists");
+        let cell = &source[cell_start..pin_start];
+        for forbidden in [
+            "for _round",
+            "continue;",
+            "0..4_u32",
+            "rounds",
+            "retryable_tx_sqlstate(&e)",
+        ] {
+            assert!(
+                !cell.contains(forbidden),
+                "the live 40P01 cell must provoke the deadlock by construction; \
+                 it still contains `{forbidden}`"
+            );
+        }
+        assert!(
+            cell.contains("pg_locks") || cell.contains("await_pending_lock"),
+            "the second step must wait for the first lock to be seen in the database"
+        );
+        assert!(
+            cell.contains("SETUP_ERROR"),
+            "an unmet provocation precondition must fail with a named setup error"
+        );
+        assert!(
+            cell.contains("raw_sqlstate(&e)"),
+            "the first abort must be read from the raw sqlstate field, not through the retry list"
+        );
+        assert!(
+            cell.contains("ScratchRelations::new") && cell.contains(".finish()"),
+            "the scratch tables must be owned by the drop guard on every exit path"
         );
     }
 }
