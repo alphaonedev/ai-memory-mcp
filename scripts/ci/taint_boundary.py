@@ -252,10 +252,18 @@ PIN_CEILINGS = {KIND_UNCLASSIFIABLE: 47, KIND_VIOLATION: 17, KIND_NOT_ANALYSED: 
 # Characters no workflow, job, step or operand of a row may hold: a row names one place.
 ROW_GLOB_CHARS = frozenset("*?[]{}")
 # A braced parameter reference of one plain name, the only brace an operand may hold: the shell
-# word the scanner quotes (``${elapsed}``) is text matched by exact equality, never a pattern;
-# every other glob character, a brace list ``{a,b}`` or an operator form ``${a:-b}`` included,
-# is still a failure.
+# word the scanner quotes (``${elapsed}``) is text matched by exact equality, never a pattern.
+# Each ``${`` of an operand opens a span that ends at the next ``}``; the span must FULLY match
+# this pattern (the anchor), so a nested expansion, an operator form (``:-``, ``-``, ``:=``,
+# ``:+``, ``:?``), an index or length form, an empty brace, a leading digit or an unterminated
+# brace is a failure, as is every other glob character and a brace list ``{a,b}``.
 OPERAND_PARAM_REF_RE = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*\}")
+OPERAND_PARAM_REF_OPEN = "${"
+OPERAND_PARAM_REF_CLOSE = "}"
+OPERAND_PARAM_REF_PLAIN = "$"
+# Expansion forms no operand may hold at all: a command substitution (and with it an arithmetic
+# expansion) and the backtick form. Their text is not a name the scanner read.
+OPERAND_REFUSED_EXPANSIONS = ("$(", "`")
 # The gate-step places (conductor's word, b29): a change there needs the conductor's word. The
 # mark of a row follows its place, never its issue: the gate jobs of each workflow file, and the
 # one gate step of job check.
@@ -4005,9 +4013,28 @@ def _exact_name(value: object) -> bool:
     return type(value) is str and value.strip() != "" and not any(c in ROW_GLOB_CHARS for c in value)
 
 
+def _operand_plain_form(value: str) -> str | None:
+    """``value`` with each ``${NAME}`` read as ``$``, or None when a ``${`` span is not exactly that
+    shape. One left-to-right pass: each span is matched once, so the cost is linear."""
+    parts: list[str] = []
+    pos = 0
+    while (start := value.find(OPERAND_PARAM_REF_OPEN, pos)) >= 0:
+        end = value.find(OPERAND_PARAM_REF_CLOSE, start)
+        if end < 0 or OPERAND_PARAM_REF_RE.fullmatch(value, start, end + 1) is None:
+            return None
+        parts += (value[pos:start], OPERAND_PARAM_REF_PLAIN)
+        pos = end + 1
+    parts.append(value[pos:])
+    return "".join(parts)
+
+
 def _exact_operand(value: object) -> bool:
-    """An exact name once each braced parameter reference of one plain name is read as ``$``."""
-    return type(value) is str and _exact_name(OPERAND_PARAM_REF_RE.sub("$", value))
+    """An exact name once each braced parameter reference of one plain name is read as ``$``; a
+    command substitution, a backtick form or any other brace form is never one."""
+    if type(value) is not str or any(form in value for form in OPERAND_REFUSED_EXPANSIONS):
+        return False
+    plain = _operand_plain_form(value)
+    return plain is not None and _exact_name(plain)
 
 
 def form_class(reason: str) -> tuple[str, str]:

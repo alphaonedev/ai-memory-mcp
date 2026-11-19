@@ -125,6 +125,41 @@ FORM_REASONS = {
 ELAPSED_OPERAND = r"${elapsed}$\\t${label}"
 # Shell text of an operand the class template cannot spell (the ANSI-C quote of the tab).
 FORM_TEXT_OF_OPERAND = {(FORM_NOT_LITERAL, ELAPSED_OPERAND): '"${elapsed}"$\'\\t\'"${label}" --version'}
+# The operand shape corpus (conductor's word b29 664a317e, condition of the operand line): an
+# operand row holds a ``${`` only as ``${NAME}`` with NAME of [A-Za-z_][A-Za-z0-9_]*, read as ``$``.
+OPERAND_SHAPE_ACCEPTED = {
+    "${x}": "$", "${_}": "$", "${_a1}": "$", "${A9_b}": "$", "${x}${y}": "$$", "a${x}b": "a$b",
+    ELAPSED_OPERAND: r"$$\\t$", "$line": "$line", "$RUNNER_TEMP/impact/gate.py": "$RUNNER_TEMP/impact/gate.py",
+    "apt-get": "apt-get",
+}
+OPERAND_SHAPE_REFUSED = {
+    "command substitution": "$(date)",
+    "command substitution after a reference": "${x}$(id)",
+    "arithmetic expansion": "$((1+2))",
+    "backtick form": "`date`",
+    "backtick form inside a word": "a`id`b",
+    "nested expansion": "${a${b}}",
+    "nested expansion first": "${${a}}",
+    "default value colon-dash": "${a:-b}",
+    "default value dash": "${a-b}",
+    "assign default": "${a:=b}",
+    "alternate value": "${a:+b}",
+    "error if unset": "${a:?b}",
+    "index form": "${a[0]}",
+    "length form": "${#a}",
+    "empty brace": "${}",
+    "name starting with a digit": "${1a}",
+    "positional digit": "${1}",
+    "unterminated brace": "${a",
+    "unterminated after a reference": "${x}${a",
+}
+# One operand of each long shape, 100K+ characters, read under the ceiling (the check is linear).
+OPERAND_LINEAR_REPEAT = 50_000
+OPERAND_LINEAR_MIN_LEN = 100_000
+OPERAND_LINEAR_CEILING_S = 1.0
+OPERAND_LINEAR_SHAPES = {"accepted references": ("${a}", True), "open braces": ("${", False),
+                         "unterminated names": ("${a", False), "substitutions": ("$(", False),
+                         "backticks": ("``", False), "nested": ("${a${b}", False)}
 # Shell text that raises exactly the form of its class with the operand filled in.
 FORM_TEXTS = {
     FORM_NOT_LITERAL: '"{}" --version',
@@ -468,6 +503,29 @@ class RowTables(unittest.TestCase):
                 start = time.monotonic()
                 self.assertFalse(tb._exact_operand(big))
                 self.assertLess(time.monotonic() - start, OPERAND_CEILING_S)
+
+    def test_9452_operand_shape_is_one_braced_plain_name_9452(self) -> None:
+        """Every ``${`` span of an operand fully matches ``${NAME}``; every other expansion form is refused."""
+        _need_module(self)
+        unknown = [f"open row with an unknown form: {SYNTH}/{JOB}/{STEP}"]
+        for operand, plain in OPERAND_SHAPE_ACCEPTED.items():
+            with self.subTest(accepted=operand):
+                self.assertEqual(tb._operand_plain_form(operand), plain)
+                self.assertTrue(tb._exact_operand(operand))
+                self.assertEqual(tb._form_row_problems([_open(FORM_NOT_LITERAL, operand, 9548)], "open row",
+                                                       tb.OPEN_ROW_ISSUES), [])
+        for label, operand in OPERAND_SHAPE_REFUSED.items():
+            with self.subTest(refused=label):
+                self.assertFalse(tb._exact_operand(operand))
+                self.assertEqual(tb._form_row_problems([_open(FORM_NOT_LITERAL, operand, 9548)], "open row",
+                                                       tb.OPEN_ROW_ISSUES), unknown)
+        for label, (unit, accepted) in OPERAND_LINEAR_SHAPES.items():
+            big = unit * OPERAND_LINEAR_REPEAT
+            with self.subTest(linear=label, size=len(big)):
+                self.assertGreaterEqual(len(big), OPERAND_LINEAR_MIN_LEN)
+                start = time.monotonic()
+                self.assertIs(tb._exact_operand(big), accepted)
+                self.assertLess(time.monotonic() - start, OPERAND_LINEAR_CEILING_S)
 
     def test_9452_two_rows_for_one_form_are_a_failure(self) -> None:
         _need_module(self)
