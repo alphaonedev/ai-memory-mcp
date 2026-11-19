@@ -864,9 +864,38 @@ jobs:
       # #9303: test_9303_real_range_9274_refused_as_frozen_region reads the PR 9274 range and fails, never skips, when a commit is missing.
       - name: Fetch the amendment ledger replay objects (#9303)
         run: python3 -I scripts/ci/tests/test_cert_amendment_ledger_6124.py --print-replay-shas | xargs git fetch --no-tags --depth=1 origin
+      # MEASURE-ONLY #9455 stage 0 (never merged). The step still GATES the whole
+      # suite: it fails on any failing test whose method name is not one of the
+      # six named below (a named test that passes is fine). The six are the #9452 boundary
+      # assertions that go red BECAUSE this branch moves persistent jobs to hosted
+      # runners; their redness is itself a stage 0 measurement result.
       - name: Shard partition and wiring unit tests (#6344)
-        continue-on-error: true # MEASURE-ONLY #9455 stage 0: test_ci_tainted_job_boundary (#9452) fails on purpose when a persistent job moves hosted; keep classify green so check runs
-        run: python3 -m unittest discover -s scripts/ci/tests
+        run: |
+          python3 - <<'PY'
+          import sys
+          import unittest
+
+          TOLERATED = {
+              "test_9452_r2_real_rows_stay_open_under_the_runner_issue",
+              "test_9452_r2_split_of_a_hit_job_stays_class_iv",
+              "test_9452_every_real_job_holds_the_boundary_or_has_a_row_of_each_finding",
+              "test_9452_real_hit_verdicts",
+              "test_9452_real_prune_step_is_the_taint_point_of_the_persistent_jobs",
+              "test_9452_without_form_rows_every_real_form_is_a_finding",
+          }
+          suite = unittest.defaultTestLoader.discover("scripts/ci/tests")
+          result = unittest.TextTestRunner(verbosity=1).run(suite)
+          bad = []
+          for case, _ in result.failures + result.errors:
+              name = case.id().split(" (")[0].rsplit(".", 1)[-1]
+              if name not in TOLERATED:
+                  bad.append(case.id())
+          tolerated = sorted({c.id().split(" (")[0] for c, _ in result.failures + result.errors} - set(bad))
+          print("MEASURE-ONLY tolerated failing ids:", tolerated)
+          if bad or result.testsRun == 0:
+              print("::error::unexpected failing tests:", bad)
+              sys.exit(1)
+          PY
       - name: AGE self-heal helper unit test (#6161)
         run: python3 scripts/test/test_ensure_age_extension_6161.py
       # #7160 - scripts/test/ is outside the discovery root above; run the
