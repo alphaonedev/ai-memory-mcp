@@ -78,8 +78,8 @@ TABLE_NAMES = {KIND_UNCLASSIFIABLE: "unclassifiable", KIND_VIOLATION: "allow", K
 PINS_LINE = "unclassifiable 47; not-analysed 3; violation 17"
 
 # The fixed issue set of each kind; a row naming any other value is a finding.
-# 9559 and 9560: the two issues of forms the merge of the chain tip brought (baseline of the landing tree).
-OPEN_ROW_ISSUES = frozenset(range(9533, 9540)) | frozenset(range(9544, 9550)) | frozenset({9559, 9560})
+# 9559, 9560 and 9561: the three issues of forms the merge of the chain tip brought (baseline of the landing tree).
+OPEN_ROW_ISSUES = frozenset(range(9533, 9540)) | frozenset(range(9544, 9550)) | frozenset({9559, 9560, 9561})
 NOT_ANALYSED_ROW_ISSUES = frozenset({9550, 9551, 9552})
 VIOLATION_ROW_ISSUES = frozenset({9454, 9455, 9456, 9471, 9553})
 # Gate-step places (E-5, conductor's word b29): a change there needs the conductor's word. The
@@ -169,10 +169,10 @@ GROUP_ISSUES = {
     (FORM_NOT_LITERAL, "$l"): 9548,
     (FORM_NOT_LITERAL, "$tflag"): 9548,
     (FORM_NOT_LITERAL, ELAPSED_OPERAND): 9559,
-    (FORM_NOT_LITERAL, "$line"): 9548,
+    (FORM_NOT_LITERAL, "$line"): 9547,
     (FORM_NOT_LISTED, "line"): 9560,
     (FORM_PY_MODULE, "stat"): 9536,
-    (FORM_PY_MODULE, "workflow_annotation"): 9536,
+    (FORM_PY_MODULE, "workflow_annotation"): 9561,
     (FORM_NO_CLASS, "python code uses a dunder name"): 9549,
 }
 # The not-analysed rows: (reason, issue, gate step), in table order.

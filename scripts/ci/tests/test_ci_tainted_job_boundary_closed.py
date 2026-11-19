@@ -662,16 +662,18 @@ UNCLOSED_ENTRY = ("a:\n  - 'x\n", "a quoted scalar that does not close: t: line 
 
 
 def _swallowing_handlers(source: str) -> list[int]:
-    """Lines of the except handlers whose body only drops the exception: pass, continue, or a constant."""
+    """Lines of the except handlers that only drop the exception (pass, continue, break, a constant
+    expression, return or assignment of a constant) or catch everything (bare, Exception)."""
     lines = []
     for node in ast.walk(ast.parse(source)):
         if not isinstance(node, ast.ExceptHandler):
             continue
         body = node.body
-        if len(body) == 1 and (isinstance(body[0], (ast.Pass, ast.Continue))
-                               or (isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant))
-                               or (isinstance(body[0], ast.Return)
-                                   and (body[0].value is None or isinstance(body[0].value, ast.Constant)))):
+        only = body[0] if len(body) == 1 else None
+        value = getattr(only, "value", None)
+        if isinstance(only, (ast.Pass, ast.Continue, ast.Break)) \
+                or (isinstance(only, (ast.Expr, ast.Assign, ast.AnnAssign, ast.Return))
+                    and (value is None or isinstance(value, ast.Constant))):
             lines.append(node.lineno)
         elif node.type is None or (isinstance(node.type, ast.Name) and node.type.id in ("Exception", "BaseException")):
             lines.append(node.lineno)
@@ -735,7 +737,8 @@ class HandlerReasons(unittest.TestCase):
                 self.assertEqual(_swallowing_handlers(path.read_text(encoding="utf-8")), [])
 
     def test_9452_handler_walk_finds_each_swallow(self) -> None:
-        for body in ("pass", "continue", "None", "'x'", "return", "return False", "return 0"):
+        for body in ("pass", "continue", "break", "None", "'x'", "return", "return False", "return 0",
+                     "found = None", "found: int = 0"):
             with self.subTest(body=body):
                 source = ("def f():\n    for _ in ():\n        try:\n            g()\n"
                           f"        except ValueError:\n            {body}\n")

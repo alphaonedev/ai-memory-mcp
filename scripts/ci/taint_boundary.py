@@ -240,9 +240,10 @@ FORM_TEMPLATES = {
 QUOTED_RE = re.compile(r"'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\"|`[^`]*`")
 NO_OPERAND = "-"
 # The fixed issue sets per kind (ruling f367b2f1 and FINAL 0773f6ce).
-# 9559 (the array append SUITE_SECONDS+=) and 9560 (command word 'line' of a local declaration)
-# came with the baseline of the landing tree (merge of chain tip 902faa04).
-OPEN_ROW_LANDING_TREE_ISSUES = frozenset({9559, 9560})
+# 9559 (the array append SUITE_SECONDS+=), 9560 (command word 'line' of a local declaration) and
+# 9561 (python module workflow_annotation) came with the baseline of the landing tree (merge of
+# chain tip 902faa04).
+OPEN_ROW_LANDING_TREE_ISSUES = frozenset({9559, 9560, 9561})
 OPEN_ROW_ISSUES = frozenset(range(9533, 9540)) | frozenset(range(9544, 9550)) | OPEN_ROW_LANDING_TREE_ISSUES
 NOT_ANALYSED_ROW_ISSUES = frozenset({9550, 9551, 9552})
 NOT_ANALYSED_MARKER = "rest-not-analysed"
@@ -357,14 +358,14 @@ OPEN_ROWS: tuple[OpenRow, ...] = (
     # so the reason is spelled out rather than built by repr a second time.
     OpenRow(_CI, "check", _CHECK_RUN, _NL, _ELAPSED, f"command word '{_ELAPSED}' is not a literal word", 9559,
             gate_step_of(_CI, "check", _CHECK_RUN)),
-    _o(_CI, "check", _CHECK_RUN, _NL, "$line", 9548),
+    _o(_CI, "check", _CHECK_RUN, _NL, "$line", 9547),
     _o(_CI, "check", _CHECK_RUN, _NC, "--lib", 9547),
     _o(_CI, "check", _CHECK_RUN, _NC, "--skip", 9547),
     _o(_CI, "check", _CHECK_RUN, _NC, "--test", 9547),
     _o(_CI, "check", _CHECK_RUN, _NC, "line", 9560),
     _o(_CI, "check", _CHECK_RUN, _PY, "os", 9536),
     _o(_CI, "check", _CHECK_RUN, _PY, "stat", 9536),
-    _o(_CI, "check", _CHECK_RUN, _PY, "workflow_annotation", 9536),
+    _o(_CI, "check", _CHECK_RUN, _PY, "workflow_annotation", 9561),
     _o(_CI, "ci-gate", "Fold job results (base gate)", _IP, "$RUNNER_TEMP/impact-base/impact/gate.py", 9537),
     OpenRow(_CI, "ci-gate", _GATE_MAT, FORM_NO_CLASS, NO_OPERAND, _DUNDER, 9549, True),
     _o(_CI, "ci-gate", _GATE_MAT, _PY, "os", 9536),
