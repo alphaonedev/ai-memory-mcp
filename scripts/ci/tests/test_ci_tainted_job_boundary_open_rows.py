@@ -177,6 +177,9 @@ SECOND_OPERANDS = {
     FORM_PY_MODULE: "second_form",
     FORM_INTERP_PATH: "$SECOND_FORM_DIR/x.py",
 }
+# The command word of the synthetic off-list form: a word no handler reads, with its own open row group.
+UNLISTED = "adb"
+UNLISTED_ISSUE = 9546
 DEFAULT = object()  # the reason the form class raises for the operand
 INSERT_AT_START = "start"
 INSERT_AT_END = "end"
@@ -284,7 +287,7 @@ def _wf(jobs: dict[str, list[tuple[str, str]]]) -> str:
     return "\n".join(out) + "\n"
 
 
-def _open(form: str = FORM_NOT_LISTED, operand: str = "apt-get", issue: object = 9534, gate_step: object = False,
+def _open(form: str = FORM_NOT_LISTED, operand: str = UNLISTED, issue: object = UNLISTED_ISSUE, gate_step: object = False,
           workflow: str = SYNTH, job: str = JOB, step: str = STEP, reason: object = DEFAULT) -> object:
     if reason is DEFAULT:
         reason = _reason(form, operand) if form in FORM_REASONS else "no reason"
@@ -461,7 +464,7 @@ class RowTables(unittest.TestCase):
 
     def test_9452_check_refuses_a_row_without_an_exact_place(self) -> None:
         _need_module(self)
-        workflows = {SYNTH: _wf({JOB: [(STEP, _form_text(FORM_NOT_LISTED, "apt-get"))]})}
+        workflows = {SYNTH: _wf({JOB: [(STEP, _form_text(FORM_NOT_LISTED, UNLISTED))]})}
         for workflow, job, step in (("", JOB, STEP), (SYNTH, "", STEP), (SYNTH, JOB, ""), (SYNTH, JOB, " "),
                                     (SYNTH, JOB, "*"), (SYNTH, JOB, "S*"), (SYNTH, JOB, "S?"), (SYNTH, JOB, "[S]"),
                                     ("*.yml", JOB, STEP), (SYNTH, "*", STEP), (SYNTH, "{j,k}", STEP),
@@ -474,13 +477,13 @@ class RowTables(unittest.TestCase):
 
     def test_9452_check_refuses_a_row_with_an_unknown_form(self) -> None:
         _need_module(self)
-        workflows = {SYNTH: _wf({JOB: [(STEP, _form_text(FORM_NOT_LISTED, "apt-get"))]})}
-        apt = _reason(FORM_NOT_LISTED, "apt-get")
-        for form, operand, reason in (("", "apt-get", apt), ("command", "apt-get", apt), ("*", "apt-get", apt),
-                                      (FORM_NOT_LISTED, "", apt), (FORM_NOT_LISTED, "*", apt),
-                                      (FORM_NOT_LISTED, None, apt), (FORM_NOT_LISTED, "xcrun", apt),
-                                      (FORM_NOT_LITERAL, "apt-get", apt), (FORM_NO_CLASS, "apt-get", apt),
-                                      (FORM_NOT_LISTED, "apt-get", None), (FORM_NOT_LISTED, "apt-get", "x")):
+        workflows = {SYNTH: _wf({JOB: [(STEP, _form_text(FORM_NOT_LISTED, UNLISTED))]})}
+        unlisted = _reason(FORM_NOT_LISTED, UNLISTED)
+        for form, operand, reason in (("", UNLISTED, unlisted), ("command", UNLISTED, unlisted), ("*", UNLISTED, unlisted),
+                                      (FORM_NOT_LISTED, "", unlisted), (FORM_NOT_LISTED, "*", unlisted),
+                                      (FORM_NOT_LISTED, None, unlisted), (FORM_NOT_LISTED, "xcrun", unlisted),
+                                      (FORM_NOT_LITERAL, UNLISTED, unlisted), (FORM_NO_CLASS, UNLISTED, unlisted),
+                                      (FORM_NOT_LISTED, UNLISTED, None), (FORM_NOT_LISTED, UNLISTED, "x")):
             with self.subTest(form=form, operand=operand, reason=reason):
                 row = _open(form=form, operand=operand, reason=reason)
                 self.assertIn(f"open row with an unknown form: {SYNTH}/{JOB}/{STEP}", _problems(workflows, (row,)))
@@ -532,11 +535,11 @@ class RowTables(unittest.TestCase):
 
     def test_9452_two_rows_for_one_form_are_a_failure(self) -> None:
         _need_module(self)
-        workflows = {SYNTH: _wf({JOB: [(STEP, _form_text(FORM_NOT_LISTED, "apt-get"))]})}
-        key = (SYNTH, JOB, STEP, FORM_NOT_LISTED, "apt-get", "")
+        workflows = {SYNTH: _wf({JOB: [(STEP, _form_text(FORM_NOT_LISTED, UNLISTED))]})}
+        key = (SYNTH, JOB, STEP, FORM_NOT_LISTED, UNLISTED, "")
         self.assertIn(f"duplicate open row {key}", _problems(workflows, (_open(), _open())))
         # Two forms in one step, one row each: no failure.
-        two = {SYNTH: _wf({JOB: [(STEP, _form_text(FORM_NOT_LISTED, "apt-get") + "\n"
+        two = {SYNTH: _wf({JOB: [(STEP, _form_text(FORM_NOT_LISTED, UNLISTED) + "\n"
                                   + _form_text(FORM_NOT_LISTED, "xcrun"))]})}
         self.assertEqual(_problems(two, (_open(), _open(operand="xcrun", issue=9538))), [])
 
@@ -570,8 +573,8 @@ class OneRowOneForm(unittest.TestCase):
         _need_module(self)
         # (row form, row operand, form in the step): same class other operand, same operand other class.
         for row_form, row_operand, found_form, found_operand in (
-                (FORM_NOT_LISTED, "apt-get", FORM_NOT_LISTED, "fallocate"),
-                (FORM_NOT_LISTED, "fallocate", FORM_NOT_LISTED, "apt-get"),
+                (FORM_NOT_LISTED, UNLISTED, FORM_NOT_LISTED, "fallocate"),
+                (FORM_NOT_LISTED, "fallocate", FORM_NOT_LISTED, UNLISTED),
                 (FORM_NOT_LISTED, "xcrun", FORM_NOT_LISTED, "xcrunx"),
                 (FORM_NOT_LITERAL, "$BIN", FORM_INTERP_PATH, "$BIN"),
                 (FORM_INTERP_PATH, "$BIN", FORM_NOT_LITERAL, "$BIN"),
@@ -580,7 +583,7 @@ class OneRowOneForm(unittest.TestCase):
                 (FORM_PY_MODULE, "os", FORM_PY_MODULE, "shutil")):
             with self.subTest(row=(row_form, row_operand), found=(found_form, found_operand)):
                 workflows = {SYNTH: _wf({JOB: [(STEP, _form_text(found_form, found_operand))]})}
-                row = _open(row_form, row_operand, 9534)
+                row = _open(row_form, row_operand, UNLISTED_ISSUE)
                 self.assertEqual(sorted(_problems(workflows, (row,))),
                                  sorted([f"stale open row (no such form in the step): {SYNTH}/{JOB}/{STEP}",
                                          UNCLASSIFIABLE_PREFIX
@@ -695,12 +698,12 @@ class KindsNeverMix(unittest.TestCase):
                 self.assertEqual(_check(result, tables),
                                  [f"violation class ({klass}) without an allow row: {wf}/{job}/{step}: {detail}"])
         # A violation row at the step of a form never covers the form.
-        workflows = {SYNTH: _wf({JOB: [(STEP, _form_text(FORM_NOT_LISTED, "apt-get"))]})}
+        workflows = {SYNTH: _wf({JOB: [(STEP, _form_text(FORM_NOT_LISTED, UNLISTED))]})}
         allow = (tb.AllowRow(SYNTH, JOB, STEP, ("iii",), 9553),)
         self.assertEqual(sorted(_problems(workflows, allow=allow)),
                          sorted([f"stale allow row (no longer violates class iii): {SYNTH}/{JOB}/{STEP}",
                                  UNCLASSIFIABLE_PREFIX
-                                 + _message(SYNTH, JOB, STEP, _reason(FORM_NOT_LISTED, "apt-get"))]))
+                                 + _message(SYNTH, JOB, STEP, _reason(FORM_NOT_LISTED, UNLISTED))]))
 
     def test_9452_an_open_row_never_covers_a_not_analysed_form_and_back(self) -> None:
         _need_module(self)
@@ -710,11 +713,11 @@ class KindsNeverMix(unittest.TestCase):
         self.assertEqual(sorted(_problems(workflows, (as_open,))),
                          sorted([f"stale open row (no such form in the step): {SYNTH}/{JOB}/{STEP}",
                                  f"{NOT_ANALYSED_PREFIX}{_message(SYNTH, JOB, STEP, reason)}: {note}"]))
-        plain = {SYNTH: _wf({JOB: [(STEP, _form_text(FORM_NOT_LISTED, "apt-get"))]})}
-        as_stop = _stop(reason=_reason(FORM_NOT_LISTED, "apt-get"), operand="apt-get", note=note)
+        plain = {SYNTH: _wf({JOB: [(STEP, _form_text(FORM_NOT_LISTED, UNLISTED))]})}
+        as_stop = _stop(reason=_reason(FORM_NOT_LISTED, UNLISTED), operand=UNLISTED, note=note)
         problems = _problems(plain, stops=(as_stop,))
         self.assertIn(f"stale not-analysed row (no such form and line in the step): {SYNTH}/{JOB}/{STEP}", problems)
-        self.assertIn(UNCLASSIFIABLE_PREFIX + _message(SYNTH, JOB, STEP, _reason(FORM_NOT_LISTED, "apt-get")), problems)
+        self.assertIn(UNCLASSIFIABLE_PREFIX + _message(SYNTH, JOB, STEP, _reason(FORM_NOT_LISTED, UNLISTED)), problems)
 
     def test_9452_a_row_without_a_kind_is_refused_in_every_table(self) -> None:
         _need_module(self)
@@ -877,7 +880,7 @@ class Pins(unittest.TestCase):
 
     def test_9452_an_issue_outside_the_fixed_set_fails_for_every_kind(self) -> None:
         _need_module(self)
-        workflows = {SYNTH: _wf({JOB: [(STEP, _form_text(FORM_NOT_LISTED, "apt-get"))]})}
+        workflows = {SYNTH: _wf({JOB: [(STEP, _form_text(FORM_NOT_LISTED, UNLISTED))]})}
         stop_wf = {SYNTH: _wf({JOB: [(STEP, BEHIND_SILENT[0][0])]})}
         for issue in BAD_OPEN_ISSUES:
             with self.subTest(kind=KIND_UNCLASSIFIABLE, issue=issue):

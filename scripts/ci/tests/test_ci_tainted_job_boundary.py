@@ -179,8 +179,24 @@ JOB_CLEAN_BASE_TREE = """\
           python3 -I "$base_dir/tool.py" --data .
 """
 
+# 9566: trusted-only needs every run step read in full and running no tree code.
 JOB_CLEAN_TRUSTED_ONLY = """\
   clean-trusted-only:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Release
+        env:
+          TOKEN: ${{ secrets.RELEASE_TOKEN }}
+        run: echo release
+"""
+
+# 9566: cargo publish runs code from the checked-out tree; in a push job that code is no pull-request code.
+JOB_PUSH_PUBLISH = """\
+  push-publish:
     if: github.event_name == 'push'
     runs-on: ubuntu-24.04
     permissions:
@@ -200,7 +216,7 @@ JOB_TRUSTED_ONLY_SELF_HOSTED = """\
     runs-on: [self-hosted, linux-fed]
     steps:
       - name: Publish
-        run: cargo publish
+        run: echo publish
 """
 
 # R2 needs a trusted trigger: a job narrowed to pull_request only has none.
@@ -229,7 +245,7 @@ JOB_CLEAN_GITHUB_HOSTED = """\
 SYNTH_WORKFLOW = HEADER + "".join((
     JOB_CLASS_I, JOB_CLASS_II, JOB_CLASS_III, JOB_CLASS_IV, JOB_CLEAN_SECRET_BEFORE,
     JOB_CLEAN_OUTPUT_BEFORE, JOB_CLEAN_BASE_TREE, JOB_CLEAN_TRUSTED_ONLY, JOB_CLEAN_GITHUB_HOSTED,
-    JOB_TRUSTED_ONLY_SELF_HOSTED, JOB_PR_ONLY_SELF_HOSTED,
+    JOB_TRUSTED_ONLY_SELF_HOSTED, JOB_PR_ONLY_SELF_HOSTED, JOB_PUSH_PUBLISH,
 ))
 
 SYNTH_VERDICTS = {
@@ -242,6 +258,7 @@ SYNTH_VERDICTS = {
     "clean-output-before": "clean",
     "clean-base-tree": "no-pr-code",
     "clean-trusted-only": "trusted-only",
+    "push-publish": "no-pr-code",
     "clean-hosted": "clean",
     "trusted-self-hosted": "iv",
     "pr-only-self-hosted": "no-pr-code",

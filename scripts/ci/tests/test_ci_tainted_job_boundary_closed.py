@@ -963,6 +963,38 @@ class ClosedListEntries(unittest.TestCase):
         self.assertIn("lipo", tb.PATH_WRITERS)
 
 
+# 9566: cargo publish builds the checked-out tree; the job trigger decides what that code is.
+PUBLISH_RUN = "cargo publish"
+PUBLISH_SECRET_ENV = "          TOKEN: ${{ secrets.RELEASE_TOKEN }}\n"
+PUBLISH_SECRET_DETAIL = "secret or token used after pull-request code ran"
+
+
+class PackagePublishRunsTreeCode(unittest.TestCase):
+    """9566: cargo publish runs code from the checked-out tree: no-pr-code in a push job, the
+    taint step in a pull_request job."""
+
+    def _publish(self, event: str) -> object:
+        return _scan(_wf(CHECKOUT + _run_step(UNREAD_STEP, PUBLISH_RUN, PUBLISH_SECRET_ENV), on=event))
+
+    def test_9566_cargo_publish_in_a_push_job_runs_no_pr_code(self) -> None:
+        _need_module(self)
+        steps = [tb._Step(UNREAD_STEP, {"run": PUBLISH_RUN}, 0)]
+        self.assertEqual(tb._pre_scan_fetch(steps, {}, {}), PRE_SCAN_RUNS)
+        result = self._publish("push")
+        self.assertEqual(result.verdicts.get((SYNTH, JOB)), "no-pr-code")
+        self.assertIsNone(result.taint_steps.get((SYNTH, JOB)))
+        self.assertEqual(result.violations, [])
+
+    def test_9566_cargo_publish_in_a_pull_request_job_is_the_taint_step(self) -> None:
+        _need_module(self)
+        self.assertTrue(_classify(PUBLISH_RUN))
+        result = self._publish("pull_request")
+        self.assertEqual(result.verdicts.get((SYNTH, JOB)), "i")
+        self.assertEqual(result.taint_steps.get((SYNTH, JOB)), UNREAD_STEP)
+        self.assertEqual([(v.step, v.klass, v.detail) for v in result.violations],
+                         [(UNREAD_STEP, "i", PUBLISH_SECRET_DETAIL)])
+
+
 # 9566: a non-strict job records every command word it does not read (text, unread reasons).
 NON_STRICT_OFF_LIST = (
     ("nfpm package -p rpm", [NO_WORD.format(word="nfpm")]),
