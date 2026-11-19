@@ -273,9 +273,13 @@ mod k1_shared_checks_9367_tests {
         dir
     }
 
+    /// The fixture goes through the #8950 no-follow write primitive (a staged,
+    /// owner-only file renamed into place; a symlink at the name is refused),
+    /// never a raw by-name write.
     fn file_0600(path: &Path, contents: &[u8]) -> std::path::PathBuf {
         use std::os::unix::fs::PermissionsExt as _;
-        std::fs::write(path, contents).expect("write");
+        crate::storage::snapshot_file::write_replacing(path, "key fixture", contents)
+            .expect("no-follow fixture write");
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
         path.to_path_buf()
     }
@@ -372,6 +376,31 @@ mod k1_shared_checks_9367_tests {
                 want,
                 "`{check}`: one copy, in the check function"
             );
+        }
+    }
+
+    /// The #8950 census row of this file (1) is the key-file open of
+    /// [`read_checked_key_file`], and it stays a READ: no flag that creates,
+    /// truncates or writes may join it. Pins the reason written on the census
+    /// row, so the row cannot silently cover a write.
+    #[test]
+    fn key_file_open_is_read_only_8950_9367() {
+        let prod = crate::test_resolver::cfg_test_modules::strip_cfg_test_inline_mods(
+            include_str!("agent_key_file.rs"),
+        );
+        let count = |needle: &str| prod.matches(needle).count();
+        // A second raw primitive is caught by the census ceiling itself; this
+        // pin holds the one counted open to a read.
+        assert_eq!(count("options.open(path)"), 1, "one open");
+        assert_eq!(count("options.read(true);"), 1, "the open reads");
+        for flag in [
+            ".write(",
+            ".append(",
+            ".create(",
+            ".create_new(",
+            ".truncate(",
+        ] {
+            assert_eq!(count(flag), 0, "`{flag}`: the key-file open never writes");
         }
     }
 }
