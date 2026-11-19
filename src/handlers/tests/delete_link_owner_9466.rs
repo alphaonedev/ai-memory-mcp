@@ -76,9 +76,7 @@ async fn http_delete(
     source_id: &str,
     target_id: &str,
 ) -> (StatusCode, serde_json::Value) {
-    let app = Router::new()
-        .route("/api/v1/links", axum::routing::delete(delete_link))
-        .with_state(test_app_state(state.clone()));
+    let app = delete_link_router(state.clone());
     let body = json!({ "source_id": source_id, "target_id": target_id, "relation": RELATION });
     let resp = app
         .oneshot(
