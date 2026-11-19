@@ -543,6 +543,106 @@ mod tests {
     #[cfg(test)]
     const PENDING_LOCK_POLL: Duration = Duration::from_millis(10);
 
+    /// How long the cleanup session waits for a lock on a scratch relation
+    /// before it reports a failed cleanup instead of hanging the test run.
+    #[cfg(test)]
+    const CLEANUP_LOCK_TIMEOUT: &str = "20s";
+
+    /// Prefix of every cleanup failure of the live cell.
+    #[cfg(test)]
+    const CLEANUP_ERROR: &str = "cleanup error";
+
+    /// Ends every session of this cell that still holds or queues for one of
+    /// the scratch `names`, then drops them, on one FRESH connection.
+    ///
+    /// A cell that fails early leaves its peer task parked on a transaction
+    /// that holds `ACCESS EXCLUSIVE` on a scratch relation; a plain
+    /// `DROP TABLE` would queue behind it. The names carry a per-run uuid, so
+    /// the sessions ended here are this cell's own and no other test's.
+    #[cfg(test)]
+    async fn drop_scratch(url: &str, names: &[String]) -> anyhow::Result<()> {
+        use sqlx::Connection as _;
+        let mut conn = sqlx::postgres::PgConnection::connect(url)
+            .await
+            .map_err(|_| anyhow::anyhow!("{CLEANUP_ERROR}: cannot open the cleanup session"))?;
+        sqlx::query(
+            "SELECT pg_terminate_backend(l.pid) FROM pg_locks l \
+               JOIN pg_class c ON c.oid = l.relation \
+              WHERE c.relname = ANY($1) AND l.pid <> pg_backend_pid()",
+        )
+        .bind(names)
+        .execute(&mut conn)
+        .await
+        .map_err(|e| anyhow::anyhow!("{CLEANUP_ERROR}: ending the cell's sessions: {e}"))?;
+        sqlx::query(&format!("SET lock_timeout = '{CLEANUP_LOCK_TIMEOUT}'"))
+            .execute(&mut conn)
+            .await
+            .map_err(|e| anyhow::anyhow!("{CLEANUP_ERROR}: lock_timeout: {e}"))?;
+        for name in names {
+            sqlx::query(&format!("DROP TABLE IF EXISTS {name}"))
+                .execute(&mut conn)
+                .await
+                .map_err(|e| anyhow::anyhow!("{CLEANUP_ERROR}: dropping {name}: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// Owns the two scratch tables of the live cell (#9252).
+    ///
+    /// Created BEFORE the tables, so a half-built setup is cleaned too. The
+    /// drop runs on EVERY exit path: [`Self::finish`] on the passing path
+    /// (where a failed cleanup fails the cell), and `Drop` on any other exit,
+    /// a setup error, a failed assertion or a panic. `Drop` cannot await, so
+    /// it runs [`drop_scratch`] on a fresh runtime in its own thread and never
+    /// panics (`OWNERSHIP-25`).
+    #[cfg(test)]
+    struct ScratchRelations {
+        url: String,
+        names: [String; 2],
+        cleaned: bool,
+    }
+
+    #[cfg(test)]
+    impl ScratchRelations {
+        fn new(url: &str, r1: &str, r2: &str) -> Self {
+            Self {
+                url: url.to_owned(),
+                names: [r1.to_owned(), r2.to_owned()],
+                cleaned: false,
+            }
+        }
+
+        async fn finish(mut self) -> anyhow::Result<()> {
+            drop_scratch(&self.url, &self.names).await?;
+            self.cleaned = true;
+            Ok(())
+        }
+    }
+
+    #[cfg(test)]
+    impl Drop for ScratchRelations {
+        fn drop(&mut self) {
+            if self.cleaned {
+                return;
+            }
+            let url = self.url.clone();
+            let names = self.names.clone();
+            let joined = std::thread::spawn(move || -> anyhow::Result<()> {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| anyhow::anyhow!("{CLEANUP_ERROR}: runtime: {e}"))?;
+                rt.block_on(drop_scratch(&url, &names))
+            })
+            .join();
+            match joined {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => eprintln!("{e}"),
+                Err(_) => eprintln!("{CLEANUP_ERROR}: the cleanup thread panicked"),
+            }
+        }
+    }
+
     /// Waits until `relation` has at least one PENDING (ungranted) lock
     /// request, i.e. some session is provably blocked on it. Returns the
     /// named setup error when the request does not appear before
@@ -620,6 +720,9 @@ mod tests {
         // so this suite is safe against ANY store it is pointed at. See
         // [`scratch_relations`].
         let (r1, r2) = scratch_relations();
+        // Owns both tables from BEFORE they exist: every exit below (a setup
+        // panic, a failed assertion, a failed `expect`) drops them (#9252).
+        let scratch = ScratchRelations::new(&url, &r1, &r2);
         sqlx::raw_sql(&format!(
             "CREATE TABLE {r1} (x int); CREATE TABLE {r2} (x int);"
         ))
@@ -772,11 +875,10 @@ mod tests {
             }
         }
 
-        let _ = sqlx::raw_sql(&format!(
-            "DROP TABLE IF EXISTS {r1}; DROP TABLE IF EXISTS {r2};"
-        ))
-        .execute(&pool)
-        .await;
+        scratch
+            .finish()
+            .await
+            .expect("the scratch relations must be dropped");
 
         assert!(
             observed_retry,
