@@ -21,6 +21,7 @@ Every corpus is a named constant; every cell works on in-memory text. No file is
 
 from __future__ import annotations
 
+import ast
 import contextlib
 import io
 import re
@@ -58,6 +59,8 @@ HOSTED_LABEL = "ubuntu-latest"
 REGEX_NAMES_EXPECTED = frozenset({
     "GITHUB_HOSTED_LABEL_RE", "SECRET_REF_RE", "EVENT_EQ_RE", "ENV_FILE_WRITE_RE",
     "BLOCK_HEADER_RE", "NAME_RE", "QUOTED_RE",
+    # A row operand check, never run on workflow text: one braced plain name, no nested quantifier.
+    "OPERAND_PARAM_REF_RE",
 })
 REMOVED_NAMES = ("BASE_MATERIALISE_RE", "CHECKOUT_IN_RUN_RE", "RUNNER_BOUNDARY_FACTS", "VERSION_ARGS",
                  "HOST_CREDENTIAL_RE", "MATRIX_RUNS_ON_RE", "STEP_OUTPUT_REF_RE")
@@ -452,16 +455,41 @@ class OneRowOneStep(unittest.TestCase):
         self.assertEqual(tb.FIX_ISSUES, FIX_ISSUES)
 
 
+def _refusal_of(func, *args) -> str:
+    """The reason a scanner refuses this input with (the oracle of the reason cell)."""
+    try:
+        func(*args)
+    except tb.Unclassifiable as exc:
+        return str(exc)
+    raise AssertionError(f"{func.__name__} did not refuse")
+
+
 class LinearScanners(unittest.TestCase):
     """I-4: one 100K+ adversarial input per scanner under a named wall-clock ceiling."""
 
-    def _timed(self, func, *args) -> None:
+    def _timed(self, func, *args) -> str | None:
+        """Run one scanner under the ceiling; its refusal reason (never empty), or None for a result."""
         start = time.monotonic()
+        reason = None
         try:
             func(*args)
-        except tb.Unclassifiable:
-            pass
+        except tb.Unclassifiable as exc:
+            reason = str(exc)
+            self.assertNotEqual(reason.strip(), "", f"{func.__name__} refused with no reason")
         self.assertLess(time.monotonic() - start, SCAN_CEILING_S)
+        return reason
+
+    def test_9452_timed_returns_the_refusal_reason_or_none(self) -> None:
+        _need_module(self)
+        self.assertIsNone(self._timed(len, "x"))
+        self.assertEqual(self._timed(tb.parse_yaml, "a: {", "big"), _refusal_of(tb.parse_yaml, "a: {", "big"))
+
+        def refuse_empty() -> None:
+            raise tb.Unclassifiable(" ")
+
+        with self.assertRaises(AssertionError) as caught:
+            self._timed(refuse_empty)
+        self.assertIn("refuse_empty refused with no reason", str(caught.exception))
 
     def test_9452_removed_patterns_and_globals_are_gone(self) -> None:
         _need_module(self)
@@ -562,7 +590,9 @@ class Bounded(unittest.TestCase):
         cases = (
             (_FakePath("a.yml", data=b"on: push\n"), None),
             (_FakePath("big.yml", size=MAX_YAML_BYTES + 1), f"larger than {MAX_YAML_BYTES} bytes"),
-            (_FakePath("bad.yml", data=b"on: \xff\n"), "not UTF-8"),
+            (_FakePath("bad.yml", data=b"on: \xff\n"), "not UTF-8 (byte 4)"),
+            (_FakePath("gone.yml", data=b"on: push\n", read_error=PermissionError(13, "denied")),
+             "cannot be read as a regular file (PermissionError)"),
             (_FakePath("link.yml", link=True), "is a symbolic link"),
             (_FakePath("fifo.yml", regular=False), "is not a regular file"),
             (_FakePath("UP.YML", data=b"on: push\n"), "workflow suffix '.YML' is not on the closed suffix list"),
@@ -593,8 +623,9 @@ class _FakePath:
     """A path double for the loader: no file is written."""
 
     def __init__(self, name: str, data: bytes = b"", size: int | None = None, link: bool = False,
-                 regular: bool = True) -> None:
+                 regular: bool = True, read_error: OSError | None = None) -> None:
         self.name = name
+        self._read_error = read_error
         self.suffix = name[name.rfind("."):] if "." in name else ""
         self._data = data
         self._size = len(data) if size is None else size
@@ -613,7 +644,109 @@ class _FakePath:
 
     def read_bytes_bounded(self, limit: int) -> bytes:
         self.reads += 1
+        if self._read_error is not None:
+            raise self._read_error
         return (self._data or b"x" * min(self._size, limit))[:limit]
+
+
+# The files of this boundary whose except handlers the walk reads (the classifier and its cells).
+HANDLER_FILES = ("taint_boundary.py",)
+HANDLER_TEST_GLOB = "test_ci_tainted_*.py"
+UNREAD_SHELL = (
+    ("echo 'x", "unterminated single quote"),
+    ("echo $(", "unterminated command substitution"),
+    ("echo ${a", "unterminated parameter expansion"),
+)
+NON_STRICT_UNREAD = ("gh attestation verify x", "gh subcommand 'attestation' is not on the closed list")
+UNCLOSED_ENTRY = ("a:\n  - 'x\n", "a quoted scalar that does not close: t: line 2: unterminated or multi-line quoted scalar")
+
+
+def _swallowing_handlers(source: str) -> list[int]:
+    """Lines of the except handlers whose body only drops the exception: pass, continue, or a constant."""
+    lines = []
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.ExceptHandler):
+            continue
+        body = node.body
+        if len(body) == 1 and (isinstance(body[0], (ast.Pass, ast.Continue))
+                               or (isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant))
+                               or (isinstance(body[0], ast.Return)
+                                   and (body[0].value is None or isinstance(body[0].value, ast.Constant)))):
+            lines.append(node.lineno)
+        elif node.type is None or (isinstance(node.type, ast.Name) and node.type.id in ("Exception", "BaseException")):
+            lines.append(node.lineno)
+    return lines
+
+
+class HandlerReasons(unittest.TestCase):
+    """M-5: every handler of the boundary names its exception and acts on the reason."""
+
+    def test_9452_pre_scan_returns_the_unread_reason(self) -> None:
+        _need_module(self)
+        for text, reason in UNREAD_SHELL:
+            with self.subTest(text=text):
+                steps = [tb._Step("first", {"run": "echo ok"}, 0), tb._Step("second", {"run": text}, 1)]
+                self.assertEqual(tb._pre_scan_fetch(steps, {}, {}),
+                                 tb.PRE_SCAN_UNREAD_REASON.format(step="second", reason=reason))
+                self.assertEqual(tb._pre_scan_fetch(steps, {}, {}),
+                                 f"step 'second' cannot be read by the pre-scan: {reason}")
+
+    def test_9452_pre_scan_returns_the_fetch_reason_or_none(self) -> None:
+        _need_module(self)
+        fetch = [tb._Step("get", {"run": "git fetch origin pull/1/head"}, 0)]
+        self.assertEqual(tb._pre_scan_fetch(fetch, {}, {}), "step 'get' fetches a pull-request tree")
+        self.assertIsNone(tb._pre_scan_fetch([tb._Step("ok", {"run": "echo ok"}, 0)], {}, {}))
+        self.assertIsNone(tb._pre_scan_fetch([tb._Step("uses", {"uses": "./x"}, 0)], {}, {}))
+
+    def test_9452_pre_scan_unread_job_is_analysed_in_full(self) -> None:
+        _need_module(self)
+        text = "on: push\njobs:\n  j:\n    runs-on: ubuntu-latest\n    steps:\n      - name: s\n        run: echo 'x\n"
+        result = tb.scan_texts({SYNTH: text})
+        self.assertNotEqual(result.verdicts.get((SYNTH, "j")), "trusted-only")
+
+    def test_9452_non_strict_handler_records_the_reason(self) -> None:
+        _need_module(self)
+        text, reason = NON_STRICT_UNREAD
+        ctx = tb._ShellCtx(strict=False)
+        tb._shell_runs_pr_code(tb._joined(text, tb.MARK), ctx)
+        self.assertEqual(ctx.unread, [reason])
+        clean = tb._ShellCtx(strict=False)
+        tb._shell_runs_pr_code(tb._joined("echo ok", tb.MARK), clean)
+        self.assertEqual(clean.unread, [])
+
+    def test_9452_unclosed_quoted_entry_raises_with_its_reason(self) -> None:
+        _need_module(self)
+        text, reason = UNCLOSED_ENTRY
+        with self.assertRaises(tb.YamlError) as caught:
+            tb.parse_yaml(text, "t")
+        self.assertEqual(str(caught.exception), reason)
+        self.assertIsInstance(caught.exception.__cause__, tb.YamlError)
+
+    def test_9452_pyyaml_import_reason_is_kept(self) -> None:
+        import test_ci_tainted_job_boundary as main_cells
+        self.assertEqual(main_cells.pyyaml is None, main_cells.PYYAML_IMPORT_ERROR != "")
+
+    def test_9452_no_handler_only_drops_its_exception(self) -> None:
+        here = Path(__file__).resolve().parent
+        files = [here.parent / name for name in HANDLER_FILES] + sorted(here.glob(HANDLER_TEST_GLOB))
+        self.assertGreaterEqual(len(files), 4)
+        for path in files:
+            with self.subTest(file=path.name):
+                self.assertEqual(_swallowing_handlers(path.read_text(encoding="utf-8")), [])
+
+    def test_9452_handler_walk_finds_each_swallow(self) -> None:
+        for body in ("pass", "continue", "None", "'x'", "return", "return False", "return 0"):
+            with self.subTest(body=body):
+                source = ("def f():\n    for _ in ():\n        try:\n            g()\n"
+                          f"        except ValueError:\n            {body}\n")
+                self.assertEqual(_swallowing_handlers(source), [5])
+        for head in ("except:", "except Exception as exc:", "except BaseException as exc:"):
+            with self.subTest(head=head):
+                self.assertEqual(_swallowing_handlers(f"try:\n    g()\n{head}\n    raise\n"), [3])
+        for body in ("return str(exc)", "raise", "found.append(str(exc))", "found.append(exc)\n        return False"):
+            with self.subTest(kept=body):
+                source = f"def f():\n    try:\n        g()\n    except ValueError as exc:\n        {body}\n"
+                self.assertEqual(_swallowing_handlers(source), [])
 
 
 class HostedGuard(unittest.TestCase):

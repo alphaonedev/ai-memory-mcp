@@ -32,15 +32,18 @@ else:
 
 try:
     import yaml as pyyaml  # parity oracle only; the classifier never imports it
-except ImportError:
+except ImportError as _pyyaml_error:  # the skip reason of the parity cell names the import failure
     pyyaml = None
+    PYYAML_IMPORT_ERROR = repr(_pyyaml_error)
+else:
+    PYYAML_IMPORT_ERROR = ""
 
 # Three row kinds, three pins (FINAL efb2b9e8, correction 0773f6ce); each pin only goes down.
 # Kind violation: the 13 rows before PR 9508 plus 4 class (iii) rows of #9553.
 ALLOW_PIN_EXPECTED = 17
 ALLOW_ROW_COUNT = 13
 NEW_VIOLATION_ROW_COUNT = 4
-OPEN_PIN_EXPECTED = 41
+OPEN_PIN_EXPECTED = 47
 NOT_ANALYSED_PIN_EXPECTED = 3
 JOB_COUNT_LARGE = 200
 LARGE_SCAN_CEILING_S = 10.0
@@ -693,8 +696,8 @@ SHELL_CASES = (
 )
 
 # Real forms at this checkout, every one the scan reaches to a fixpoint (FACTS of ruling
-# f367b2f1): (workflow, job, step label, exact reason). Kind unclassifiable: 41 forms, one open
-# row each; these jobs are NOT shown to hold the boundary.
+# f367b2f1, re-taken on the merge of chain tip 902faa04): (workflow, job, step label, exact
+# reason). Kind unclassifiable: 47 forms, one open row each; these jobs are NOT shown to hold the boundary.
 REAL_UNCLASSIFIABLE = (
     (
         'batman-mode-acceptance.yml', 'bash-integration', 'Install sqlite3 + jq (bounded+retry',
@@ -737,6 +740,16 @@ REAL_UNCLASSIFIABLE = (
     ('ci.yml', 'check', 'Run tests (impact-aware)', "command word '--lib' is not on the closed command list"),
     ('ci.yml', 'check', 'Run tests (impact-aware)', "command word '--skip' is not on the closed command list"),
     ('ci.yml', 'check', 'Run tests (impact-aware)', "command word '--test' is not on the closed command list"),
+    # The six forms the merge of chain tip 902faa04 brought into this step (baseline of the landing tree).
+    ('ci.yml', 'check', 'Run tests (impact-aware)', "command word '${elapsed}$\\\\t${label}' is not a literal word"),
+    ('ci.yml', 'check', 'Run tests (impact-aware)', "command word '$line' is not a literal word"),
+    ('ci.yml', 'check', 'Run tests (impact-aware)', "command word 'line' is not on the closed command list"),
+    ('ci.yml', 'check', 'Run tests (impact-aware)', "python module 'os' is not on the closed module list"),
+    ('ci.yml', 'check', 'Run tests (impact-aware)', "python module 'stat' is not on the closed module list"),
+    (
+        'ci.yml', 'check', 'Run tests (impact-aware)',
+        "python module 'workflow_annotation' is not on the closed module list",
+    ),
     (
         'ci.yml', 'ci-gate', 'Fold job results (base gate)',
         "interpreter path '$RUNNER_TEMP/impact-base/impact/gate.py' is neither in the workspace nor bound to base content",
@@ -1434,7 +1447,7 @@ class RealWorkflows(unittest.TestCase):
                           ("ci.yml", "select", "Select jobs"),
                           ("ci.yml", "select", "Select the full matrix (base selector unavailable)")})
 
-    @unittest.skipUnless(pyyaml is not None, "PyYAML not installed: parity oracle skipped")
+    @unittest.skipUnless(pyyaml is not None, f"PyYAML not importable ({PYYAML_IMPORT_ERROR}): parity oracle skipped")
     def test_9452_subset_parser_matches_pyyaml_on_every_real_file(self) -> None:
         _need_module(self)
         workflows, actions, _ = _real()

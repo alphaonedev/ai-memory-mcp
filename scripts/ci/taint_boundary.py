@@ -26,8 +26,10 @@ exactly when its place is a gate step (``gate_step_of``: a gate job in ``GATE_JO
 in ``GATE_STEPS``), whatever its issue: a change there needs the conductor's word.
 Removal rule: the fix PR of an issue deletes its rows and lowers that kind's pin in the same
 commit; each pin only goes down, a pin above its ceiling in ``PIN_CEILINGS`` is a failure and
-a pin that differs from its row count is a failure. Pins at PR 9508: unclassifiable 41,
-not-analysed 3, violation 17 (the 13 rows before PR 9508 and 4 rows of #9553). The fixpoint proof
+a pin that differs from its row count is a failure. Pins at PR 9508: unclassifiable 47,
+not-analysed 3, violation 17 (the 13 rows before PR 9508 and 4 rows of #9553). The pins are the
+baseline of the tree PR 9508 lands on (the merge of chain tip 902faa04 moved the unclassifiable
+pin 41 -> 47 once); after it lands they only go down. The fixpoint proof
 (all rows applied: zero findings; any one row removed: exactly that form or line) is a proof for
 what the scan reaches only. A test makes no network call: the
 conductor checks that every cited issue is open at each landing of a fix of these issues, and
@@ -238,13 +240,21 @@ FORM_TEMPLATES = {
 QUOTED_RE = re.compile(r"'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\"|`[^`]*`")
 NO_OPERAND = "-"
 # The fixed issue sets per kind (ruling f367b2f1 and FINAL 0773f6ce).
-OPEN_ROW_ISSUES = frozenset(range(9533, 9540)) | frozenset(range(9544, 9550))
+# 9559 (the array append SUITE_SECONDS+=) and 9560 (command word 'line' of a local declaration)
+# came with the baseline of the landing tree (merge of chain tip 902faa04).
+OPEN_ROW_LANDING_TREE_ISSUES = frozenset({9559, 9560})
+OPEN_ROW_ISSUES = frozenset(range(9533, 9540)) | frozenset(range(9544, 9550)) | OPEN_ROW_LANDING_TREE_ISSUES
 NOT_ANALYSED_ROW_ISSUES = frozenset({9550, 9551, 9552})
 NOT_ANALYSED_MARKER = "rest-not-analysed"
 # Each pin only goes down; a pin above its ceiling is a failure.
-PIN_CEILINGS = {KIND_UNCLASSIFIABLE: 41, KIND_VIOLATION: 17, KIND_NOT_ANALYSED: 3}
+PIN_CEILINGS = {KIND_UNCLASSIFIABLE: 47, KIND_VIOLATION: 17, KIND_NOT_ANALYSED: 3}
 # Characters no workflow, job, step or operand of a row may hold: a row names one place.
 ROW_GLOB_CHARS = frozenset("*?[]{}")
+# A braced parameter reference of one plain name, the only brace an operand may hold: the shell
+# word the scanner quotes (``${elapsed}``) is text matched by exact equality, never a pattern;
+# every other glob character, a brace list ``{a,b}`` or an operator form ``${a:-b}`` included,
+# is still a failure.
+OPERAND_PARAM_REF_RE = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*\}")
 # The gate-step places (conductor's word, b29): a change there needs the conductor's word. The
 # mark of a row follows its place, never its issue: the gate jobs of each workflow file, and the
 # one gate step of job check.
@@ -314,6 +324,8 @@ _MOBILE = "mobile-runtime.yml"
 _PMT = "per-module-thresholds"
 _CHECK_FREE = "Free disk before tests (hosted image only,"
 _CHECK_RUN = "Run tests (impact-aware)"
+# The operand of the array append SUITE_SECONDS+=("${elapsed}"$'\t'"${label}") as form_class reads it.
+_ELAPSED = r"${elapsed}$\\t${label}"
 _GATE_MAT = "Materialise the base gate (#8240)"
 _SEL_MAT = "Materialise the base selector (#8240)"
 _COV_SWAP = "Free disk + add swap (#1148 belt-and-suspenders, aggressive)"
@@ -341,9 +353,18 @@ OPEN_ROWS: tuple[OpenRow, ...] = (
     _o(_CI, "check", _CHECK_RUN, _NL, "$TIMEOUT_BIN", 9548),
     _o(_CI, "check", _CHECK_RUN, _NL, "$l", 9548),
     _o(_CI, "check", _CHECK_RUN, _NL, "$tflag", 9548),
+    # The operand is the inside of the repr the scanner prints (its one backslash shows as two),
+    # so the reason is spelled out rather than built by repr a second time.
+    OpenRow(_CI, "check", _CHECK_RUN, _NL, _ELAPSED, f"command word '{_ELAPSED}' is not a literal word", 9559,
+            gate_step_of(_CI, "check", _CHECK_RUN)),
+    _o(_CI, "check", _CHECK_RUN, _NL, "$line", 9548),
     _o(_CI, "check", _CHECK_RUN, _NC, "--lib", 9547),
     _o(_CI, "check", _CHECK_RUN, _NC, "--skip", 9547),
     _o(_CI, "check", _CHECK_RUN, _NC, "--test", 9547),
+    _o(_CI, "check", _CHECK_RUN, _NC, "line", 9560),
+    _o(_CI, "check", _CHECK_RUN, _PY, "os", 9536),
+    _o(_CI, "check", _CHECK_RUN, _PY, "stat", 9536),
+    _o(_CI, "check", _CHECK_RUN, _PY, "workflow_annotation", 9536),
     _o(_CI, "ci-gate", "Fold job results (base gate)", _IP, "$RUNNER_TEMP/impact-base/impact/gate.py", 9537),
     OpenRow(_CI, "ci-gate", _GATE_MAT, FORM_NO_CLASS, NO_OPERAND, _DUNDER, 9549, True),
     _o(_CI, "ci-gate", _GATE_MAT, _PY, "os", 9536),
@@ -371,7 +392,7 @@ OPEN_ROWS: tuple[OpenRow, ...] = (
     _o(_MOBILE, _IOS, "Run mobile_runtime tests on iOS Simulator", _NC, "xcrun", 9538),
     _o(_MOBILE, _IOS, "Shut down simulator", _NC, "xcrun", 9538),
 )
-OPEN_ROW_PIN = 41
+OPEN_ROW_PIN = 47
 # Kind not-analysed: one row per form that stops the rest of its command or substitution. The
 # list of forms behind these rows is NOT complete: the checker does not read that text.
 NOT_ANALYSED_ROWS: tuple[NotAnalysedRow, ...] = (
@@ -641,8 +662,8 @@ class _YamlSubset:
         if text[:1] in ("'", '"'):
             try:
                 _, rest = self.quoted(text)
-            except YamlError:
-                return False
+            except YamlError as exc:
+                raise YamlError(f"a quoted scalar that does not close: {exc}") from exc
             return rest.lstrip(" ").startswith(":")
         if text[:1] in "[{":
             return False
@@ -1596,6 +1617,9 @@ class _ShellCtx:
         self.functions: set[str] = set()
         self.tree_change = False
         self.pr_fetch = False
+        # The reasons a non-strict handler could not read its command (the finding list of a
+        # non-strict scan), kept so the reason is never dropped.
+        self.unread: list[str] = []
         self.depth = 0
 
     def drop(self, name: str) -> None:
@@ -1831,11 +1855,14 @@ def _dispatch(words: list[_Word], cmd: _Cmd, ctx: _ShellCtx) -> bool:
             ctx.unbind(word)
     if ctx.strict:
         return _strict_call(handler, name, words, cmd, ctx)
-    # A non-strict job swallows what a handler cannot read, as before; no form is recorded.
+    # A non-strict job records what a handler cannot read on ctx.unread and goes on; no form is
+    # recorded. The pre-scan does not read ctx.unread yet (needs the conductor's word: it would
+    # move release.yml jobs from trusted-only to violations).
     token = _SINK.set(None)
     try:
         return handler(words, cmd, ctx)
-    except Unclassifiable:
+    except Unclassifiable as exc:
+        ctx.unread.append(str(exc))
         return False
     finally:
         _SINK.reset(token)
@@ -3633,8 +3660,17 @@ def _analyse_step(step: _Step, job: dict[str, object], doc: dict[str, object], j
     return facts
 
 
-def _pre_scan_fetch(steps: list[_Step], job: dict[str, object], doc: dict[str, object]) -> bool:
-    """A job with no pull-request trigger: does any run step fetch a pull-request tree?"""
+PRE_SCAN_FETCH_REASON = "step {step!r} fetches a pull-request tree"
+PRE_SCAN_UNREAD_REASON = "step {step!r} cannot be read by the pre-scan: {reason}"
+
+
+def _pre_scan_fetch(steps: list[_Step], job: dict[str, object], doc: dict[str, object]) -> str | None:
+    """A job with no pull-request trigger: the reason it must be analysed in full, or None.
+
+    The reason is PRE_SCAN_FETCH_REASON for a run step that fetches a pull-request tree, or the
+    text of the form the pre-scan cannot read: a step it cannot read is never taken as a step
+    that fetches nothing (fail closed), so the full analysis reads that job and records the form.
+    """
     env_job = (doc.get("env"), job.get("env"))
     for step in steps:
         run = step.body.get("run")
@@ -3644,11 +3680,11 @@ def _pre_scan_fetch(steps: list[_Step], job: dict[str, object], doc: dict[str, o
                          composite=step.body.get(COMPOSITE_MARK))
         try:
             _shell_runs_pr_code(_joined(run, MARK), ctx)
-        except Unclassifiable:
-            pass
+        except Unclassifiable as exc:
+            return PRE_SCAN_UNREAD_REASON.format(step=step.label, reason=exc)
         if ctx.pr_fetch:
-            return True
-    return False
+            return PRE_SCAN_FETCH_REASON.format(step=step.label)
+    return None
 
 
 def _check_labels(steps: list[_Step], label: str) -> None:
@@ -3694,7 +3730,7 @@ def _analyse_job_steps(wf: str, job_id: str, job: dict[str, object], doc: dict[s
     steps = _flatten_steps(job.get("steps"), actions, label)
     _check_labels(steps, label)
     strict = bool(job_events & (PR_EVENTS | {CALL_EVENT}))
-    if not strict and not _pre_scan_fetch(steps, job, doc):
+    if not strict and _pre_scan_fetch(steps, job, doc) is None:
         if r2 is None:
             return "trusted-only"
         result.violations.append(r2)
@@ -3933,14 +3969,14 @@ def _load_one(path: object, workflow: bool) -> str:
         return _refused(f"larger than {MAX_YAML_BYTES} bytes")
     try:
         data = path.read_bytes_bounded(MAX_YAML_BYTES + 1)
-    except OSError:
-        return _refused("cannot be read as a regular file")
+    except OSError as exc:
+        return _refused(f"cannot be read as a regular file ({type(exc).__name__})")
     if len(data) > MAX_YAML_BYTES:
         return _refused(f"larger than {MAX_YAML_BYTES} bytes")
     try:
         return data.decode("utf-8")
-    except UnicodeDecodeError:
-        return _refused("not UTF-8")
+    except UnicodeDecodeError as exc:
+        return _refused(f"not UTF-8 (byte {exc.start})")
 
 
 def _load_dir(repo_root: Path | None) -> tuple[dict[str, str], dict[str, str], frozenset[str]]:
@@ -3966,6 +4002,11 @@ def load_repo(repo_root: Path) -> tuple[dict[str, str], dict[str, str], frozense
 def _exact_name(value: object) -> bool:
     """A plain, non-empty string with no glob character: a row names one place, never a pattern."""
     return type(value) is str and value.strip() != "" and not any(c in ROW_GLOB_CHARS for c in value)
+
+
+def _exact_operand(value: object) -> bool:
+    """An exact name once each braced parameter reference of one plain name is read as ``$``."""
+    return type(value) is str and _exact_name(OPERAND_PARAM_REF_RE.sub("$", value))
 
 
 def form_class(reason: str) -> tuple[str, str]:
@@ -4019,7 +4060,7 @@ def _form_row_problems(rows: list, word: str, issues: frozenset[int]) -> list[st
         place = _place(row)
         if not all(_exact_name(v) for v in (row.workflow, row.job, row.step)) or row.step == R2_STEP_LABEL:
             problems.append(f"{word} without an exact workflow, job and step: {place}")
-        if row.form not in FORM_CLASSES | {FORM_NO_CLASS} or not _exact_name(row.operand) \
+        if row.form not in FORM_CLASSES | {FORM_NO_CLASS} or not _exact_operand(row.operand) \
                 or type(row.reason) is not str or form_class(row.reason) != (row.form, row.operand):
             problems.append(f"{word} with an unknown form: {place}")
         # bool is an int subclass: only a plain int of the fixed set counts.

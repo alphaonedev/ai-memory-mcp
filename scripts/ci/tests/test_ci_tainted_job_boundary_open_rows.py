@@ -28,6 +28,7 @@ cell makes a network call.
 
 from __future__ import annotations
 
+import re
 import sys
 import time
 import unittest
@@ -58,21 +59,27 @@ STEP = "S"
 OTHER_STEP = "T"
 R2_STEP = "runs-on"
 GLOB_CHARS = "*?[]{}"
+# The one brace an operand may hold: a braced parameter reference of one plain name (the shell
+# word as the scanner quotes it, matched by exact equality).
+OPERAND_BOUND_REPEAT = 40_000
+OPERAND_CEILING_S = 2.0
+OPERAND_PARAM_REF = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*\}")
 
 # The three kinds and their pins (FINAL 0773f6ce): each pin only goes down.
 KIND_UNCLASSIFIABLE = "unclassifiable"
 KIND_VIOLATION = "violation"
 KIND_NOT_ANALYSED = "not-analysed"
-OPEN_PIN = 41
+OPEN_PIN = 47
 NOT_ANALYSED_PIN = 3
 VIOLATION_PIN = 17
 PIN_CEILINGS = {KIND_UNCLASSIFIABLE: OPEN_PIN, KIND_VIOLATION: VIOLATION_PIN, KIND_NOT_ANALYSED: NOT_ANALYSED_PIN}
 # The name each kind's table carries in a pin line.
 TABLE_NAMES = {KIND_UNCLASSIFIABLE: "unclassifiable", KIND_VIOLATION: "allow", KIND_NOT_ANALYSED: "not-analysed"}
-PINS_LINE = "unclassifiable 41; not-analysed 3; violation 17"
+PINS_LINE = "unclassifiable 47; not-analysed 3; violation 17"
 
 # The fixed issue set of each kind; a row naming any other value is a finding.
-OPEN_ROW_ISSUES = frozenset(range(9533, 9540)) | frozenset(range(9544, 9550))
+# 9559 and 9560: the two issues of forms the merge of the chain tip brought (baseline of the landing tree).
+OPEN_ROW_ISSUES = frozenset(range(9533, 9540)) | frozenset(range(9544, 9550)) | frozenset({9559, 9560})
 NOT_ANALYSED_ROW_ISSUES = frozenset({9550, 9551, 9552})
 VIOLATION_ROW_ISSUES = frozenset({9454, 9455, 9456, 9471, 9553})
 # Gate-step places (E-5, conductor's word b29): a change there needs the conductor's word. The
@@ -108,11 +115,16 @@ FORM_INTERP_PATH = "interpreter-path-unbound"
 FORM_NO_CLASS = "NO-CLASS"
 NO_OPERAND = "-"
 FORM_REASONS = {
-    FORM_NOT_LITERAL: "command word {!r} is not a literal word",
-    FORM_NOT_LISTED: "command word {!r} is not on the closed command list",
-    FORM_PY_MODULE: "python module {!r} is not on the closed module list",
-    FORM_INTERP_PATH: "interpreter path {!r} is neither in the workspace nor bound to base content",
+    FORM_NOT_LITERAL: "command word '{}' is not a literal word",
+    FORM_NOT_LISTED: "command word '{}' is not on the closed command list",
+    FORM_PY_MODULE: "python module '{}' is not on the closed module list",
+    FORM_INTERP_PATH: "interpreter path '{}' is neither in the workspace nor bound to base content",
 }
+# The operand of the array append SUITE_SECONDS+=("${elapsed}"$'\t'"${label}"): the inside of
+# the repr the scanner prints, so its one backslash shows as two.
+ELAPSED_OPERAND = r"${elapsed}$\\t${label}"
+# Shell text of an operand the class template cannot spell (the ANSI-C quote of the tab).
+FORM_TEXT_OF_OPERAND = {(FORM_NOT_LITERAL, ELAPSED_OPERAND): '"${elapsed}"$\'\\t\'"${label}" --version'}
 # Shell text that raises exactly the form of its class with the operand filled in.
 FORM_TEXTS = {
     FORM_NOT_LITERAL: '"{}" --version',
@@ -156,6 +168,11 @@ GROUP_ISSUES = {
     (FORM_NOT_LITERAL, "$TIMEOUT_BIN"): 9548,
     (FORM_NOT_LITERAL, "$l"): 9548,
     (FORM_NOT_LITERAL, "$tflag"): 9548,
+    (FORM_NOT_LITERAL, ELAPSED_OPERAND): 9559,
+    (FORM_NOT_LITERAL, "$line"): 9548,
+    (FORM_NOT_LISTED, "line"): 9560,
+    (FORM_PY_MODULE, "stat"): 9536,
+    (FORM_PY_MODULE, "workflow_annotation"): 9536,
     (FORM_NO_CLASS, "python code uses a dunder name"): 9549,
 }
 # The not-analysed rows: (reason, issue, gate step), in table order.
@@ -187,7 +204,9 @@ REMOVAL_RULE_PHRASES = (
     "each pin only goes down",
     "a pin above its ceiling in ``PIN_CEILINGS`` is a failure",
     "a pin that differs from its row count is a failure",
-    "Pins at PR 9508: unclassifiable 41, not-analysed 3, violation 17",
+    "Pins at PR 9508: unclassifiable 47, not-analysed 3, violation 17",
+    "The pins are the baseline of the tree PR 9508 lands on",
+    "moved the unclassifiable pin 41 -> 47 once); after it lands they only go down",
     "is a proof for what the scan reaches only",
     "the list behind these rows is NOT complete",
     "rest-not-analysed",
@@ -209,7 +228,7 @@ def _need_module(case: unittest.TestCase) -> None:
 
 
 def _form_text(form: str, operand: str) -> str:
-    return FORM_TEXTS[form].format(operand)
+    return FORM_TEXT_OF_OPERAND.get((form, operand)) or FORM_TEXTS[form].format(operand)
 
 
 def _reason(form: str, operand: str) -> str:
@@ -396,7 +415,7 @@ class RowTables(unittest.TestCase):
                 for value in (row.workflow, row.job, row.step, row.form, row.operand, row.reason):
                     self.assertIs(type(value), str)
                     self.assertNotEqual(value.strip(), "")
-                for value in (row.workflow, row.job, row.step, row.operand):
+                for value in (row.workflow, row.job, row.step, OPERAND_PARAM_REF.sub("$", row.operand)):
                     self.assertEqual([c for c in value if c in GLOB_CHARS], [])
                 self.assertNotEqual(row.step, R2_STEP)
                 self.assertIs(type(row.issue), int)
@@ -427,6 +446,28 @@ class RowTables(unittest.TestCase):
             with self.subTest(form=form, operand=operand, reason=reason):
                 row = _open(form=form, operand=operand, reason=reason)
                 self.assertIn(f"open row with an unknown form: {SYNTH}/{JOB}/{STEP}", _problems(workflows, (row,)))
+
+    def test_9452_operand_braces_only_as_a_plain_parameter_reference(self) -> None:
+        _need_module(self)
+        # A braced reference of one plain name is the shell word, matched exactly: accepted.
+        for operand in ("${x}", "${_a1}", ELAPSED_OPERAND):
+            with self.subTest(accepted=operand):
+                text = FORM_TEXT_OF_OPERAND.get((FORM_NOT_LITERAL, operand)) or f'"{operand}" --version'
+                workflows = {SYNTH: _wf({JOB: [(STEP, text)]})}
+                row = _open(FORM_NOT_LITERAL, operand, 9548)
+                self.assertEqual(_problems(workflows, (row,)), [])
+        # Any other brace or glob character in the operand is refused, the reason matching or not.
+        for operand in ("{a,b}", "${a:-b}", "${a}*", "${}", "${1}", "${a", "$a}", "${a}[b]", "${a}?", "${${a}}"):
+            with self.subTest(refused=operand):
+                workflows = {SYNTH: _wf({JOB: [(STEP, f'"{operand}" --version')]})}
+                row = _open(FORM_NOT_LITERAL, operand, 9548)
+                self.assertIn(f"open row with an unknown form: {SYNTH}/{JOB}/{STEP}", _problems(workflows, (row,)))
+        # Bound: a 100K+ operand of near-references is read in linear time.
+        for big in ("${a" * OPERAND_BOUND_REPEAT, "${a}" * OPERAND_BOUND_REPEAT + "{"):
+            with self.subTest(bound=len(big)):
+                start = time.monotonic()
+                self.assertFalse(tb._exact_operand(big))
+                self.assertLess(time.monotonic() - start, OPERAND_CEILING_S)
 
     def test_9452_two_rows_for_one_form_are_a_failure(self) -> None:
         _need_module(self)
