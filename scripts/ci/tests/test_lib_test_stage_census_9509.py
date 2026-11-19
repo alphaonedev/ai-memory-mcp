@@ -16,6 +16,13 @@ that test in an explicit ``--skip`` argument with a shell comment naming 9509 in
 run block. A run line with neither is a finding; a workflow the parser cannot read is an
 error, never clean.
 
+ci.yml is held to the narrower form (conductor b29 6a339cef, condition (2)): for EVERY job
+of ci.yml that runs the lib tests the stage step is present (a named skip does not count
+there) AND its condition is not narrower than the condition of the lib test step: the same
+``if:`` (compared after removing a whole ``${{ }}`` wrapper and folding blanks), or none.
+A cell copies the ``cargo_skip`` condition of job check into the stage step of job
+sal-feature in the real ci.yml text and requires the census to turn red on it.
+
 The real workflow files are read from the checkout; synthetic jobs are named constants
 below. No file is written, no network is used.
 
@@ -50,6 +57,11 @@ REASON_NO_STAGE = "neither a stage step before it nor a named skip"
 REASON_STAGE_IF = "the stage step before it runs under a condition the test step does not have"
 REASON_SKIP_NO_MARK = "names the skip without a shell comment naming 9509"
 REASON_UNREADABLE = "job is not a mapping"
+REASON_CI_NO_STAGE = "no stage step before it (ci.yml takes the stage step, a named skip does not count)"
+# Workflow files held to the stage-step-only form (condition (2) of b29 6a339cef).
+STAGE_ONLY_FILES = frozenset({"ci.yml"})
+CARGO_SKIP_IF = "needs.classify.outputs.cargo_skip != 'true'"
+STAGE_RUN_LINE = "run: python3 -I scripts/ci/stage_hf_cache.py --models embedder"
 
 # Lib-test jobs the census must see on the real tree (a superset check).
 KNOWN_LIB_JOBS = frozenset({
@@ -193,12 +205,22 @@ def has_issue_comment(text: str) -> bool:
 
 
 def condition(step: dict) -> str | None:
+    """The step condition, normalised: a whole ``${{ }}`` wrapper removed, blanks folded."""
     cond = step.get("if")
-    return None if cond is None else str(cond).strip()
+    if cond is None:
+        return None
+    text = str(cond).strip()
+    if text.startswith("${{") and text.endswith("}}") and text.count("${{") == 1:
+        text = text[3:-2].strip()
+    return " ".join(text.split())
 
 
 def job_census(label: str, job_id: str, job: object) -> tuple[bool, list[str]]:
-    """Return (job runs lib tests able to select B3, findings) for one job."""
+    """Return (job runs lib tests able to select B3, findings) for one job.
+
+    In a file of STAGE_ONLY_FILES a named skip does not count: the stage step is required.
+    """
+    stage_only = label in STAGE_ONLY_FILES
     if not isinstance(job, dict):
         return False, [f"{label}: job {job_id}: {REASON_UNREADABLE}"]
     steps = job.get("steps")
@@ -228,11 +250,11 @@ def job_census(label: str, job_id: str, job: object) -> tuple[bool, list[str]]:
                 runs_lib = True
                 cmd = " ".join(toks)
                 where = f"{label}: job {job_id}: step {name!r}: `{cmd}`"
-                if names_b3_skip(toks):
+                if names_b3_skip(toks) and not stage_only:
                     if not has_issue_comment(text):
                         findings.append(f"{where}: {REASON_SKIP_NO_MARK}")
                 elif not stage_conds:
-                    findings.append(f"{where}: {REASON_NO_STAGE}")
+                    findings.append(f"{where}: {REASON_CI_NO_STAGE if stage_only else REASON_NO_STAGE}")
                 elif not any(c is None or c == cond for c in stage_conds):
                     findings.append(f"{where}: {REASON_STAGE_IF}")
     return runs_lib, findings
@@ -334,6 +356,47 @@ SYNTHETIC_ROWS: tuple[tuple[str, list[dict], list[str]], ...] = (
     ("two-lines-no-stage", [step("t", "cargo test --lib\ncargo test --features sal --lib")], [REASON_NO_STAGE, REASON_NO_STAGE]),
 )
 
+# (row id, steps, expected finding reasons) judged as jobs of ci.yml (stage step only).
+CI_ROWS: tuple[tuple[str, list[dict], list[str]], ...] = (
+    ("ci-no-stage", [LIB], [REASON_CI_NO_STAGE]),
+    ("ci-stage-before", [STAGE, LIB], []),
+    ("ci-skip-with-mark", [step("t", SKIP_RUN)], [REASON_CI_NO_STAGE]),
+    ("ci-skip-without-mark", [step("t", f"cargo test --lib -- --skip {B3}")], [REASON_CI_NO_STAGE]),
+    ("ci-skip-and-stage", [STAGE, step("t", SKIP_RUN)], []),
+    ("ci-stage-after", [LIB, STAGE], [REASON_CI_NO_STAGE]),
+    ("ci-cargo-skip-if-copied", [step("s", STAGE["run"], COND), LIB], [REASON_STAGE_IF]),
+    ("ci-cargo-skip-if-both", [step("s", STAGE["run"], COND), step("t", LIB["run"], COND)], []),
+    ("ci-wrapped-equal", [step("s", STAGE["run"], "${{ " + COND + " }}"), step("t", LIB["run"], COND)], []),
+    ("ci-blank-folded-equal", [step("s", STAGE["run"], COND.replace(" != ", "  !=  ")), step("t", LIB["run"], COND)], []),
+    ("ci-narrower-and", [step("s", STAGE["run"], COND + " && runner.os == 'Linux'"), step("t", LIB["run"], COND)], [REASON_STAGE_IF]),
+    ("ci-stage-none-test-if", [STAGE, step("t", LIB["run"], COND)], []),
+    ("ci-stage-other-if", [step("s", STAGE["run"], "always()"), LIB], [REASON_STAGE_IF]),
+    ("ci-two-stages-one-ok", [step("s1", STAGE["run"], COND), STAGE, LIB], []),
+)
+
+
+def with_stage_if_in_job(text: str, job_id: str, cond: str) -> str:
+    """Copy ``if: <cond>`` into the embedder stage step of one job of a workflow text.
+
+    Raises ValueError when the job or its stage step is not found, so the mutant cell is red
+    on a tree whose job has no stage step.
+    """
+    lines = text.split("\n")
+    head = f"  {job_id}:"
+    try:
+        start = lines.index(head)
+    except ValueError:
+        raise ValueError(f"job {job_id} not found") from None
+    for i in range(start + 1, len(lines)):
+        line = lines[i]
+        if re.match(r"^  [A-Za-z0-9_-]+:\s*$", line):
+            break
+        if line.strip() == STAGE_RUN_LINE:
+            indent = line[: len(line) - len(line.lstrip())]
+            return "\n".join(lines[:i] + [f"{indent}if: {cond}"] + lines[i:])
+    raise ValueError(f"job {job_id}: no stage step `{STAGE_RUN_LINE}`")
+
+
 REAL_FORM_WORKFLOW = f"""name: synthetic
 on: pull_request
 jobs:
@@ -381,6 +444,24 @@ class SyntheticRows(unittest.TestCase):
                 if expected:
                     self.assertTrue(runs_lib)
 
+    def test_every_ci_row_gives_its_exact_reasons(self):
+        for row_id, steps, expected in CI_ROWS:
+            with self.subTest(row=row_id):
+                runs_lib, findings = job_census("ci.yml", row_id, {"steps": steps})
+                self.assertEqual(reasons(findings), expected, findings)
+                self.assertTrue(runs_lib)
+
+    def test_condition_normalisation(self):
+        self.assertIsNone(condition({}))
+        self.assertEqual(condition({"if": "${{ a  &&  b }}"}), "a && b")
+        self.assertEqual(condition({"if": "${{ a }} && ${{ b }}"}), "${{ a }} && ${{ b }}")
+
+    def test_mutation_helper_fails_closed(self):
+        with self.assertRaisesRegex(ValueError, r"^job nope not found$"):
+            with_stage_if_in_job("jobs:\n  a:\n    steps: []\n", "nope", COND)
+        with self.assertRaisesRegex(ValueError, r"^job a: no stage step "):
+            with_stage_if_in_job("jobs:\n  a:\n    steps: []\n  b:\n      " + STAGE_RUN_LINE + "\n", "a", COND)
+
     def test_unreadable_job_is_a_finding(self):
         _, findings = job_census("synthetic.yml", "j", ["not", "a", "mapping"])
         self.assertEqual(findings, [f"synthetic.yml: job j: {REASON_UNREADABLE}"])
@@ -392,7 +473,7 @@ class SyntheticRows(unittest.TestCase):
         _, findings = job_census("ci.yml", "sal-feature", {"steps": [LIB]})
         self.assertEqual(findings, [
             "ci.yml: job sal-feature: step 'Run lib tests': `cargo test --features sal --lib`: "
-            + REASON_NO_STAGE
+            + REASON_CI_NO_STAGE
         ])
 
     def test_yaml_text_path_reads_run_blocks_and_comments(self):
@@ -436,6 +517,22 @@ class RealTree(unittest.TestCase):
 
     def test_every_lib_test_job_stages_or_skips_b3_by_name(self):
         self.assertEqual(self.findings, [])
+
+    def test_every_ci_lib_test_job_has_a_stage_step_not_narrower_than_its_test(self):
+        ci_jobs = sorted(j for f, j in self.lib_jobs if f == "ci.yml")
+        self.assertLessEqual({j for f, j in KNOWN_LIB_JOBS if f == "ci.yml"}, set(ci_jobs))
+        ci_findings = [f for f in self.findings if f.startswith("ci.yml: ")]
+        self.assertEqual(ci_findings, [], ci_jobs)
+
+    def test_cargo_skip_if_copied_into_sal_feature_is_red(self):
+        """Mutant of condition (2): the check job's step-level if copied into sal-feature."""
+        text = (ROOT / ".github" / "workflows" / "ci.yml").read_text()
+        mutated = with_stage_if_in_job(text, "sal-feature", CARGO_SKIP_IF)
+        _, findings = census_text(mutated, "ci.yml")
+        self.assertEqual(findings, [
+            "ci.yml: job sal-feature: step 'Run lib tests (sal feature)': "
+            f"`cargo test --features sal --lib`: {REASON_STAGE_IF}"
+        ])
 
 
 class OnlyHostCacheTest(unittest.TestCase):
