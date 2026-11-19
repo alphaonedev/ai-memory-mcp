@@ -134,7 +134,7 @@ jobs:
     # exists continuously); the cert EVIDENCE is unchanged — the "Assert
     # certified stack versions" step still hard-fails on ANY drift from the
     # SSOT-pinned 18.6 / 1.8.0 / 0.8.7, now read off the live native tier.
-    runs-on: [self-hosted, linux-fed]
+    runs-on: ubuntu-latest # MEASURE-ONLY #9455 stage 0 (was [self-hosted, linux-fed])
     # 2026-08-26 rigid-security-controls: never schedule a fork PR onto the
     # self-hosted enterprise-fed node (defence-in-depth behind the Actions
     # "require approval for all external contributors" policy). Required

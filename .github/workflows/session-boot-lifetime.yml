@@ -6,6 +6,9 @@ name: Session-boot lifetime suite
 # regresses, this workflow fails on the next nightly run.
 
 on:
+  # MEASURE-ONLY #9455 stage 0: a pull_request trigger so the measurement PR reaches this job.
+  pull_request:
+    branches: ["chain/**"]
   schedule:
     # 4am UTC daily — runs after the v0.6.x.y dogfood / tag-cut routine
     # so a regression caught here lands in the next morning's review.
@@ -55,7 +58,7 @@ jobs:
           - os: ubuntu-latest
             runner: '["ubuntu-latest"]'
           - os: macos-fed
-            runner: '["self-hosted","macos-fed"]'
+            runner: '["macos-latest"]' # MEASURE-ONLY #9455 stage 0 (was self-hosted macos-fed)
     runs-on: ${{ fromJSON(matrix.runner) }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4

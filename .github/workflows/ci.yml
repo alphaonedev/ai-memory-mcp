@@ -1259,7 +1259,7 @@ jobs:
             # all. A named flag cannot drift out of a rename.
             once: true
           - leg: linux-fed,enterprise-fed
-            runner: '["self-hosted","linux-fed"]'
+            runner: '["ubuntu-latest"]' # MEASURE-ONLY #9455 stage 0 (was self-hosted linux-fed)
             node: linux-fed
             tier: enterprise-fed
             # #7188 - opt in to the shared per-host cargo target (see the
@@ -1293,12 +1293,12 @@ jobs:
             # macos-fed and hosted caps are unchanged.
             timeout: 300
           - leg: macos-fed,sqlite
-            runner: '["self-hosted","macos-fed"]'
+            runner: '["macos-latest"]' # MEASURE-ONLY #9455 stage 0 (was self-hosted macos-fed)
             node: macos-fed
             tier: sqlite
             timeout: 80
           - leg: macos-fed,enterprise-fed
-            runner: '["self-hosted","macos-fed"]'
+            runner: '["macos-latest"]' # MEASURE-ONLY #9455 stage 0 (was self-hosted macos-fed)
             node: macos-fed
             tier: enterprise-fed
             # #3525/#3976/#6202/#6344: compile (~6-12 min) + the 7800 s

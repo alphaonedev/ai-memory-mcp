@@ -51,7 +51,7 @@ env:
 jobs:
   postgres-ignored:
     name: "Postgres ignored tests (sal-postgres --ignored)"
-    runs-on: [self-hosted, linux-fed]
+    runs-on: ubuntu-latest # MEASURE-ONLY #9455 stage 0 (was [self-hosted, linux-fed])
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     # #8303: compile 24 min + soak 20 min on an idle host, 37+ min under load; 60 min had no headroom.
     timeout-minutes: 120
