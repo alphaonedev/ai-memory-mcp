@@ -3061,7 +3061,7 @@ jobs:
       # staging script's own named error before any test runs. No step-level
       # `if:` on purpose: the test step of this job has none, so the cache
       # must be staged wherever these lib tests run (b29 6a339cef; held by
-      # scripts/ci/tests/test_lib_test_stage_census_9509.py).
+      # the 9509 lib-test stage census cell under scripts/ci/tests).
       - name: Cache HuggingFace models (#9509)
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
