@@ -64,8 +64,8 @@ const SEED_SKIP_SQL: &str = "INSERT INTO embed_skip \
 /// exact v96 shape the previous release wrote (same reversal as
 /// `tests/embed_skip_upgrade_4078.rs`), then stamp v96.
 const PREVIOUS_RELEASE_SHAPE: &str = "
-DROP TRIGGER agent_pubkey_history_authoritative_insert_v97;
-DROP TRIGGER agent_pubkey_history_authoritative_update_v97;
+DROP TRIGGER agent_pubkey_history_projection_guard_insert;
+DROP TRIGGER agent_pubkey_history_projection_guard_update;
 DROP TABLE agent_pubkey_history;
 DROP TABLE agent_pubkey_challenges;
 DROP VIEW inbox_namespace_aliases;

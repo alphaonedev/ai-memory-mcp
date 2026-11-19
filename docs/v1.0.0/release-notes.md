@@ -91,12 +91,14 @@ The "defaults stop lying" lane (Gate 1′) is the centerpiece: six knobs
 that shipped OFF (or non-functional) through v0.10.0 now resolve to their
 secure posture by default, each riding the one-cycle deprecation-WARN
 discipline the v0.10.0 `warn-carrier` release delivered. The release also
-advances the schema **v78 → v100**. The ladder is not uniformly additive:
+advances the schema **v78 → v102**. The ladder is not uniformly additive:
 v86/v87 normalize stored timestamp renderings, v97 rewrites existing
 agent-registration memory rows (take a backup before upgrading), v89 rebuilds the derived
-PostgreSQL FTS column, v92 rebuilds SQLite's `schema_version` table to add
-its bound, and v101 replaces the title-slot unique index with a partial
-index. Other additions and backfills are described per rung in
+PostgreSQL FTS column, v100 replaces the title-slot unique index with a
+partial index, v101 adds the A2A task store, v102 (#8341) replaces SQLite's
+v97 `_agents` projection triggers with abort guards (reconciles drifted rows
+and rebuilds the FTS index; a no-op on postgres), and v92 rebuilds SQLite's
+`schema_version` table to add its bound. Other additions and backfills are described per rung in
 §"Schema ladder v78 → v100"; historical migration trials attest only their
 stated version range. The release also adds an M-of-N
 threshold key-recovery lane, human-key-signed m-of-n approvals, an
@@ -117,7 +119,7 @@ CLI subcommands):
 | HTTP routes | **105 production `.route(...)` registrations** / 91 unique URL paths |
 | CLI subcommands | **90 default build** / **92 under `--features sal`** (the `capability init` sub-verb rides the existing `Capability` command, so the top-level count is unchanged) |
 | `MemoryKind` variants | **16** (adds v1.0.0 epistemic typing `Told` / `Instruction` / `Intervention`, [#1945](https://github.com/alphaonedev/ai-memory-mcp/issues/1945)) |
-| Schema | **v101** (`CURRENT_SCHEMA_VERSION`, both adapters). Not uniformly additive: v79–v85 are additive, **v86 and v87 rewrite stored rows**, v88 is index-only, v89 redefines the postgres FTS `tsv` generated column (derived data, no stored-row rewrite), v90–v97 add tables/columns, except that **v97 also rewrites existing `_agents` registration rows in `memories`** (removes `metadata.write_signature`, sets `attest_level=claimed`; sqlite `0081_v97_agent_pubkey_history.sql:118-140`, postgres `0054_v97_agent_pubkey_history.sql:118-132` — take a backup first) and v92 rebuilds SQLite's `schema_version` table (create + copy + drop + rename) to add its `version <= 100000` bound (postgres: `ADD CONSTRAINT`) — a version-table rebuild, not a `memories` rewrite; v98 adds legacy inbox namespace aliases; v99 (#3655) adds the per-peer contact stamp; v101 (#3690) makes the `(title, namespace)` unique index PARTIAL (`WHERE lifecycle_state <> 'tombstoned'`) so a consolidation tombstone gives its slot up — index-only, no stored-row rewrite. Per-rung detail + the true bound of the migration evidence: §"Schema ladder v78 → v101" |
+| Schema | **v102** (`CURRENT_SCHEMA_VERSION`, both adapters). Not uniformly additive: v79–v85 are additive, **v86 and v87 rewrite stored rows**, v88 is index-only, v89 redefines the postgres FTS `tsv` generated column (derived data, no stored-row rewrite), v90–v97 add tables/columns, except that **v97 also rewrites existing `_agents` registration rows in `memories`** (removes `metadata.write_signature`, sets `attest_level=claimed`; sqlite `0081_v97_agent_pubkey_history.sql:118-140`, postgres `0054_v97_agent_pubkey_history.sql:118-132` — take a backup first) and v92 rebuilds SQLite's `schema_version` table (create + copy + drop + rename) to add its `version <= 100000` bound (postgres: `ADD CONSTRAINT`) — a version-table rebuild, not a `memories` rewrite; v98 adds legacy inbox namespace aliases; v99 (#3655) adds the per-peer contact stamp; v100 (#3690) makes the `(title, namespace)` unique index PARTIAL (`WHERE lifecycle_state <> 'tombstoned'`) so a consolidation tombstone gives its slot up — index-only, no stored-row rewrite; v101 (#8444) adds the `a2a_tasks` table; v102 (#8341) replaces the SQLite v97 `_agents` projection triggers with RAISE(ABORT) guards and **reconciles drifted `_agents` registration rows** to the open `agent_pubkey_history` row, then rebuilds `memories_fts` (postgres: version stamp only). Per-rung detail + the true bound of the migration evidence: §"Schema ladder v78 → v100" |
 
 ## Before upgrading — run `ai-memory config check` (#3715)
 
@@ -714,7 +716,7 @@ those two review lanes raised, and no tag has been cut.
 
 ## Schema ladder v78 → v100
 
-`CURRENT_SCHEMA_VERSION = 101` on both adapters
+`CURRENT_SCHEMA_VERSION = 102` on both adapters
 (`src/storage/migrations.rs`, `src/store/postgres.rs`); CLAUDE.md
 §Database is the SSOT. Both adapters mirror via
 `src/store/postgres.rs::{migrate_v79 … migrate_v100}`.
@@ -743,6 +745,21 @@ pubkey disagrees with the live history anchor
 `migrations/postgres/0054_v97_agent_pubkey_history.sql:118-132`). **Take a
 backup before upgrading across v97.** **v100 replaces the
 `(title, namespace)` unique index with a partial index** (index-only).
+v101 (#8444) adds the `a2a_tasks` table. **v102 (#8341) is row-changing on
+SQLite only:** it drops the v97 projection triggers (which rewrote a row
+after `memories_fts` had indexed it), reconciles every drifted `_agents`
+registration row to the open `agent_pubkey_history` row, installs
+RAISE(ABORT) guards and rebuilds `memories_fts`
+(`migrations/sqlite/0086_v102_fts_projection_guard.sql`); postgres only
+stamps the version. **Rolling back across v102 is refused, not silent:** a
+binary built before v102 (schema v101) opening a v102 database prints
+`database schema is AHEAD of this binary: <db> (<backend>) is on schema v102
+... this binary ... supports schema v101; upgrade ai-memory to the build that
+wrote this database, or open a backup copy ...`
+(`src/storage/schema_guard.rs` `render`) and writes nothing; the daemon
+(`serve`) exits 75 (EX_TEMPFAIL), a one-shot CLI command exits 1. Take a
+backup (`ai-memory backup`) before upgrading so a rollback has a v101 copy
+to open.
 The v86 and v87 rungs are
 instant/value-preserving, idempotent, and fail-safe on an unparseable
 value (left byte-untouched rather than destroyed), but they are row

@@ -2148,7 +2148,9 @@ const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
 //       has carried these since v56, so its v88 is a no-op; doc twins
 //       migrations/{postgres/0045,sqlite/0072}_v88_list_composite_indexes.sql.
 //       CURRENT_SCHEMA_VERSION stays pinned in lockstep with sqlite.
-const CURRENT_SCHEMA_VERSION: i32 = 101;
+// v102: #8341 SQLite FTS projection guard; postgres version-stamp only
+//       (doc twin migrations/postgres/0059_v102_fts_projection_guard_noop.sql).
+const CURRENT_SCHEMA_VERSION: i32 = 102;
 
 /// PostgreSQL session-scoped advisory lock key used to serialize
 /// concurrent `migrate()` invocations across processes and across
@@ -4321,8 +4323,11 @@ impl PostgresStore {
         if current_version < 100 {
             self.migrate_v100().await?;
         }
-        if current_version < CURRENT_SCHEMA_VERSION {
+        if current_version < 101 {
             self.migrate_v101().await?;
+        }
+        if current_version < CURRENT_SCHEMA_VERSION {
+            self.migrate_v102().await?;
         }
 
         Ok(())
@@ -7522,6 +7527,27 @@ impl PostgresStore {
             target: TRACE_TARGET,
             "schema migration v101 applied (#8444: a2a_tasks - durable Task rows \
              for the Agent2Agent standard binding)"
+        );
+        Ok(())
+    }
+
+    /// v102 (#8341) - SQLite-only FTS projection guard. The postgres v97
+    /// projection is a BEFORE trigger and its full-text index is the stored
+    /// generated `tsv`, so there is no index to fall out of step; this arm
+    /// stamps the literal version only (v56 precedent).
+    async fn migrate_v102(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v102 tx", e))?;
+        record_schema_version(&mut tx, 102).await?;
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v102 migration", e))?;
+        tracing::info!(
+            target: TRACE_TARGET,
+            "schema migration v102 applied (#8341: FTS projection guard is sqlite-only; no-op postgres DDL)"
         );
         Ok(())
     }
