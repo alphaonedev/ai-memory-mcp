@@ -1883,6 +1883,9 @@ def _shell_runs_pr_code(text: str, ctx: _ShellCtx | None = None) -> bool:
     return _run_nodes(_Sh(text, ctx.depth).parse_all(), ctx)
 
 
+COMMAND_OFF_LIST = "command word {name!r} is not on the closed command list"
+
+
 def _dispatch(words: list[_Word], cmd: _Cmd, ctx: _ShellCtx) -> bool:
     head = words[0]
     name = head.lit
@@ -1894,21 +1897,23 @@ def _dispatch(words: list[_Word], cmd: _Cmd, ctx: _ShellCtx) -> bool:
         if not name.startswith("/"):
             return True  # a program from the workspace
         if not name.startswith(SYSTEM_BIN_DIRS):
-            return _form(f"command word {name!r} is not on the closed command list")
+            return _form(COMMAND_OFF_LIST.format(name=name))
         name = name.rsplit("/", 1)[1]
     handler = _command_handler(name)
     if handler is None:
         if not ctx.strict:
+            # 9566: a word off the closed list is unread; the pre-scan sends its job to the analysis.
+            ctx.unread.append(COMMAND_OFF_LIST.format(name=name))
             return False
-        return _form(f"command word {name!r} is not on the closed command list")
+        return _form(COMMAND_OFF_LIST.format(name=name))
     if name in PATH_WRITERS:
         for word in words[1:]:
             ctx.unbind(word)
     if ctx.strict:
         return _strict_call(handler, name, words, cmd, ctx)
     # A non-strict job records what a handler cannot read on ctx.unread and goes on; no form is
-    # recorded. The pre-scan does not read ctx.unread yet (needs the conductor's word: it would
-    # move release.yml jobs from trusted-only to violations).
+    # recorded here. The pre-scan reads ctx.unread (9566): a step with an unread command is never
+    # trusted-only, and the full analysis of its job reports the command as a result.
     token = _SINK.set(None)
     try:
         return handler(words, cmd, ctx)

@@ -955,6 +955,30 @@ class ClosedListEntries(unittest.TestCase):
         self.assertIn("lipo", tb.PATH_WRITERS)
 
 
+# 9566: a non-strict job records every command word it does not read (text, unread reasons).
+NON_STRICT_OFF_LIST = (
+    ("nfpm package -p rpm", [NO_WORD.format(word="nfpm")]),
+    ("unknowntool x && echo ok", [NO_WORD.format(word="unknowntool")]),
+    ('x=( "$(cbindgen --version)" )', [NO_WORD.format(word="cbindgen")]),
+    ("rpmbuild -bs x.spec; gh codespace x",
+     [NO_WORD.format(word="rpmbuild"), "gh subcommand 'codespace' is not on the closed list"]),
+    ("f() { echo ok; }\nf", []),
+    ("echo ok", []),
+)
+
+
+class NonStrictUnreadWords(unittest.TestCase):
+    """9566: _dispatch records a word off the closed list and a handler refusal on ctx.unread."""
+
+    def test_9566_non_strict_off_list_word_is_unread(self) -> None:
+        _need_module(self)
+        for text, unread in NON_STRICT_OFF_LIST:
+            with self.subTest(text=text):
+                ctx = tb._ShellCtx(strict=False)
+                self.assertFalse(tb._shell_runs_pr_code(tb._joined(text, tb.MARK), ctx))
+                self.assertEqual(ctx.unread, unread)
+
+
 class HostedGuard(unittest.TestCase):
     """I-6: this file runs in an existing hosted job, and that step holds the boundary."""
 
