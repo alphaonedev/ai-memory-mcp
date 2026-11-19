@@ -185,6 +185,16 @@ pub(super) fn bind_agent_pubkey_no_tx(
         )
         .map_err(anyhow::Error::new)?;
     append_agent_pubkey_version(conn, agent_id, pubkey_b64, proof, &now)?;
+    // #9259 - the flat projection carries the OPEN history row's `bound_at`,
+    // not `now`: a same-key rebind appends no version and keeps the original
+    // validity boundary, so writing `now` would move it (and the v102 guard
+    // aborts a projection that disagrees with the ledger).
+    let bound_at: String = conn.query_row(
+        "SELECT bound_at FROM agent_pubkey_history
+          WHERE agent_id = ?1 AND superseded_at IS NULL",
+        params![agent_id],
+        |row| row.get(0),
+    )?;
     let affected = conn.execute(
         "UPDATE memories SET
             metadata = json_set(
@@ -197,9 +207,9 @@ pub(super) fn bind_agent_pubkey_no_tx(
                 '$.agent_pubkey', ?3,
                 '$.pubkey_bound_at', ?4,
                 '$.attest_level', 'claimed'),
-            updated_at = ?4
+            updated_at = ?5
          WHERE namespace = ?1 AND title = ?2",
-        params![AGENTS_NAMESPACE, &title, pubkey_b64, &now],
+        params![AGENTS_NAMESPACE, &title, pubkey_b64, &bound_at, &now],
     )?;
     if affected == 0 {
         return Err(anyhow::anyhow!(

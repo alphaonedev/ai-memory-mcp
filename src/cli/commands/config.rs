@@ -633,18 +633,27 @@ fn migrate(dry_run: bool, also_clean_claude_json: bool, out: &mut CliOutput) -> 
         }
     }
 
-    // Write backup.
+    // Write backup. v1.0.0 #8950 — a new owner-only file that never follows
+    // or replaces a symlink planted at the timestamped name.
     let timestamp = chrono::Utc::now().format("%Y%m%d-%H%M%S").to_string();
-    let backup_path = path.with_extension(format!("toml.bak.{timestamp}"));
-    if let Err(e) = std::fs::write(&backup_path, &contents) {
-        let _ = writeln!(
-            out.stderr,
-            "ERROR: could not write backup {}: {}",
-            backup_path.display(),
-            e
-        );
-        return Ok(4);
-    }
+    // A backup already taken in the same second keeps its copy; this one
+    // takes the next numbered name.
+    let wanted = path.with_extension(format!("toml.bak.{timestamp}"));
+    let backup_path = match crate::storage::snapshot_file::write_new_private_unique(
+        &wanted,
+        "config backup",
+        contents.as_bytes(),
+    ) {
+        Ok(written) => written,
+        Err(e) => {
+            let _ = writeln!(
+                out.stderr,
+                "ERROR: could not write backup {}: {e:#}",
+                wanted.display(),
+            );
+            return Ok(4);
+        }
+    };
 
     // Write migrated file.
     if let Err(e) = std::fs::write(&path, &migrated_text) {
@@ -884,11 +893,17 @@ fn clean_claude_json(timestamp: &str) -> Result<Option<String>> {
         return Ok(None);
     }
 
-    let backup_path = format!("{}.bak.{}", path.display(), timestamp);
-    std::fs::write(&backup_path, &contents)?;
+    let wanted = format!("{}.bak.{}", path.display(), timestamp);
+    // v1.0.0 #8950 — never follows or replaces a link at the backup name;
+    // a backup already taken in the same second keeps its copy.
+    let written = crate::storage::snapshot_file::write_new_private_unique(
+        Path::new(&wanted),
+        "config backup",
+        contents.as_bytes(),
+    )?;
     std::fs::write(&path, serde_json::to_string_pretty(&value)?)?;
 
-    Ok(Some(backup_path))
+    Ok(Some(written.display().to_string()))
 }
 
 #[cfg(test)]

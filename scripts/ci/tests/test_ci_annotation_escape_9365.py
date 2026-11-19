@@ -821,6 +821,7 @@ SIBLING_SCRIPTS = {
     "scripts/ci/pg_isolate_split.py": ("scripts/ci/partition_test_binaries.py", "scripts/ci/pg_isolate_serial_residual.txt"),
     "scripts/ci/prune_runner_artifacts.py": ("scripts/ci/shared_cargo_target.py",),
     "scripts/ci/sccache_env.py": ("scripts/ci/shared_cargo_target.py",),
+    "scripts/ci/suite_budget.py": (),  # #9229 suite margin gate
 }
 SHARED_MODULE_PATH = "scripts/ci/" + SHARED_MODULE_NAME
 
@@ -1082,9 +1083,9 @@ class OsPlantNeverRuns(unittest.TestCase):
                     self.assertEqual(planted, clean)
 
     def test_sibling_scripts_os_plant_table_9365(self):
-        """Table over the 13 sibling scripts of 0f1ec1b7: ``--help`` with an os.py plant equals the clean run."""
+        """Table over the 14 sibling scripts (the 13 of 0f1ec1b7 plus suite_budget of #9229): ``--help`` with an os.py plant equals the clean run."""
         scripts = (*SIBLING_SCRIPTS, "scripts/test/pg_isolated_binary.py")
-        self.assertEqual(len(scripts), 13)
+        self.assertEqual(len(scripts), 14)
         layout = SiblingLoadInvariant.layout
         for rel in scripts:
             for where in OS_PLANT_PLACES:
@@ -1112,7 +1113,7 @@ class OsPlantNeverRuns(unittest.TestCase):
                         self.assertEqual(results[1], results[0])
 
 
-# The five gates (ruling 0011e5e0): a failed load of the shared module fails the step with the gate's fail-closed
+# The gates (the five of ruling 0011e5e0, plus suite_budget of #9229): a failed load of the shared module fails the step with the gate's fail-closed
 # exit code, one fixed ::error line built without the module and one stderr line naming the cause; nothing else.
 GATE_LOAD_EXIT_CODES = {
     "scripts/ci/load_gate.py": 3,  # EXIT_LOAD_REFUSED (0 = proceed, 2 = bad arguments)
@@ -1120,6 +1121,7 @@ GATE_LOAD_EXIT_CODES = {
     "scripts/ci/tier_cred_preflight.py": 1,  # EXIT_UNAVAILABLE
     "scripts/ci/host_semaphore.py": 4,  # EXIT_LOAD_REFUSED (3 = no slot; any other code is the child's)
     "scripts/ci/partition_test_binaries.py": 2,  # EXIT_FAIL_CLOSED
+    "scripts/ci/suite_budget.py": 4,  # EXIT_LOAD_REFUSED (2 = malformed input, 3 = margin lost) #9229
 }
 GATE_LOAD_ERROR_LINE = ("::error title={prog} refused::{prog}: refused: shared module workflow_annotation.py next to "
                         "the script cannot be loaded")
@@ -1339,7 +1341,7 @@ class SiblingLoadFailsClosed(unittest.TestCase):
                         self.cell(rel, kind, flags)
 
     def test_the_one_shape_gives_the_gates_the_new_kinds_too_9365(self):
-        """The five gates under the kinds their 60-row table lacks: same exit code, same two lines."""
+        """Every gate under the kinds its load table lacks: same exit code, same two lines."""
         if os.geteuid() == 0:
             self.skipTest("root reads a mode-0 file")
         for rel in GATE_LOAD_EXIT_CODES:
@@ -1819,7 +1821,7 @@ STREAM_SCRIPTS = tuple(sorted(set(GATE_LOAD_EXIT_CODES) | set(NON_GATE_LOAD_EXIT
 STREAM_SHARED_CALLS = SHARED_FIELD_FUNCTIONS | {"safe_value", "render", "join", "end_group_line"}
 STREAM_NUMBER_CALLS = frozenset({"len", "int", "float", "round", "abs"})  # return a number for any argument
 STREAM_TRACE_DEPTH = 6
-STREAM_SCRIPT_COUNT = 14
+STREAM_SCRIPT_COUNT = 15  # 14 + suite_budget (#9229)
 STREAM_MODULE_VARS = frozenset({"wa"})  # the name every script binds the loaded module to
 # Runs before the shared module exists, so it cannot use it; each output is fixed text pinned by its own test:
 # prune_runner_tmp's floor check (VERSION_REFUSAL_AT_0F1EC1B7 cells) and load refusal (SiblingLoadFailsClosed, P1).
@@ -2016,7 +2018,7 @@ def stream_violations(rel, source):
 
 
 class StreamRatchet(unittest.TestCase):
-    def test_the_fourteen_scripts_print_only_traceable_text_9365(self):
+    def test_the_fifteen_scripts_print_only_traceable_text_9365(self):
         self.assertEqual(len(STREAM_SCRIPTS), STREAM_SCRIPT_COUNT)
         found = []
         for rel in STREAM_SCRIPTS:

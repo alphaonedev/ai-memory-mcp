@@ -503,6 +503,7 @@ def consumer_shape_problems():
 
 
 FAKE_CARGO = "#!%s -I\nimport json, sys\nwith open(%r, 'a') as log:\n    log.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+MARGIN_GATE_SCRIPTS = ("scripts/ci/suite_budget.py", "scripts/ci/workflow_annotation.py")
 STEP_ENV_DROP = ("TEST_IMPACT", "TEST_IMPACT_REASON", "TEST_IMPACT_COUNT", "TEST_IMPACT_TOTAL",
                  "DOCS_ONLY", "TIER", "CI_NODE", "JOB_T0", "HOST_SEMAPHORE_HELD",
                  "CI_PG_ISOLATE_OFF", "AI_MEMORY_TEST_PG_ISOLATE", "TEST_RESULT_LOG")
@@ -519,6 +520,15 @@ def run_whole_step(impact, docs_only="false", tier="sqlite"):
         (work / "tests").mkdir()
         for name in WHOLE_STEP_NAMES:
             (work / "tests" / ("%s.rs" % name)).write_text("")
+        # #9229: the step's margin gate runs scripts/ci/suite_budget.py (and its shared module)
+        # from the working directory; a missing gate script fails the step closed.
+        (work / "scripts" / "ci").mkdir(parents=True)
+        for rel in MARGIN_GATE_SCRIPTS:
+            shutil.copyfile(str(REPO / rel), str(work / rel))
+        # #9229 cdfe800f: the full suite's whole-suite plan reads the job timeout of the running
+        # leg from ci.yml in the working directory, so the scratch tree carries it and a real leg.
+        (work / ".github" / "workflows").mkdir(parents=True)
+        shutil.copyfile(str(CI_YML), str(work / ".github" / "workflows" / "ci.yml"))
         (work / "bin").mkdir()
         argv_log = work / "cargo-argv.jsonl"
         fake = work / "bin" / "cargo"
@@ -526,7 +536,7 @@ def run_whole_step(impact, docs_only="false", tier="sqlite"):
         fake.chmod(0o755)
         env = {k: v for k, v in os.environ.items() if k not in STEP_ENV_DROP}
         env.update(PATH="%s%s%s" % (work / "bin", os.pathsep, os.environ.get("PATH", "")),
-                   TEST_IMPACT=impact, DOCS_ONLY=docs_only, TIER=tier, CI_NODE="probe",
+                   TEST_IMPACT=impact, DOCS_ONLY=docs_only, TIER=tier, CI_NODE="ubuntu-latest",
                    HOST_SEMAPHORE_SLOTS="0", JOB_TIMEOUT_MIN="60", AI_MEMORY_NO_CONFIG="1",
                    RUNNER_TEMP=str(work), GITHUB_ENV=str(work / "github-env"))
         res = subprocess.run(RUNNER_BASH + [consumer_step_body()], cwd=str(work), env=env,
@@ -562,7 +572,10 @@ WHOLE_STEP_ROWS = (
 NAME_ARGS = ["--test", "alpha_test", "--test", "beta_test"]
 SHARD_BUILD = ["test", "--no-run", "--message-format=json-render-diagnostics", "--features", "sal-postgres"]
 EXPECTED_ARGV = {
-    ("sqlite", "full"): [["test", "--no-run"], ["test", "--no-fail-fast"]],
+    # #9229: the full suite first asks cargo metadata for its shard list; the fake cargo prints
+    # none, so the step warns and runs the one unsharded invocation (the fail-closed fallback).
+    ("sqlite", "full"): [["metadata", "--no-deps", "--format-version", "1"], ["test", "--no-run"],
+                         ["test", "--no-fail-fast"]],
     ("sqlite", "names"): [["test", "--no-run", "--lib"], ["test", "--no-fail-fast", "--lib"],
                           ["test", "--no-run"] + NAME_ARGS, ["test", "--no-fail-fast"] + NAME_ARGS],
     # enterprise-fed shards after one build; the scratch tree has no
