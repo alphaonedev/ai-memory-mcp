@@ -45,7 +45,7 @@ const FILL_WORD: &str = "x";
 const THIS_FILE: &str = "tests/repair_text_cli_parse_9557.rs";
 /// The corpus must not shrink to nothing: a floor on what the scan finds.
 const MIN_SCANNED_COMMANDS: usize = 6;
-/// CLI_REFERENCE has two schema-behind rows that name the command (#9564).
+/// `CLI_REFERENCE` has two schema-behind rows that name the command (#9564).
 const MIN_DOC_ROWS: usize = 2;
 /// The placeholder the sqlite clause keeps literally for the database path.
 const PATH_PLACEHOLDER: &str = "<path>";
@@ -332,15 +332,15 @@ fn the_sqlite_repair_command_migrates_an_old_stamp_fixture_9557() {
     let command = sqlite_command();
     assert!(command.contains(PATH_PLACEHOLDER), "{command}");
     let line = command.replace(PATH_PLACEHOLDER, fx.db.to_str().unwrap());
-    let argv: Vec<String> = line.split_whitespace().map(str::to_string).collect();
-    Cli::try_parse_from(&argv).unwrap_or_else(|e| panic!("`{line}` must parse: {e}"));
-    let args: Vec<&str> = argv.iter().skip(1).map(String::as_str).collect();
+    let words: Vec<String> = line.split_whitespace().map(str::to_string).collect();
+    Cli::try_parse_from(&words).unwrap_or_else(|e| panic!("`{line}` must parse: {e}"));
+    let child_args: Vec<&str> = words.iter().skip(1).map(String::as_str).collect();
     let home = TempDir::new().expect("empty home");
     let out = ChildCommand::cargo_bin("ai-memory")
         .unwrap()
         .env("AI_MEMORY_NO_CONFIG", "1")
         .env("HOME", home.path())
-        .args(&args)
+        .args(&child_args)
         .output()
         .expect("spawn");
     assert!(
@@ -360,14 +360,14 @@ fn the_sqlite_repair_command_migrates_an_old_stamp_fixture_9557() {
 /// migrates (the stamp is unchanged after each).
 #[test]
 fn boot_and_doctor_refuse_with_the_clause_and_do_not_migrate_9557() {
-    let clause = schema_behind_repair_clause(BACKEND_SQLITE);
-    // `boot` gets an explicit namespace: without one the stamp is migrated by
-    // the namespace resolution before the read-only open (a pre-existing
-    // defect at the base, reported in the lane READY, not fixed here).
     const VERBS: &[(&str, &[&str])] = &[
         ("boot", &["boot", "--namespace", "n"]),
         ("doctor", &["doctor"]),
     ];
+    let clause = schema_behind_repair_clause(BACKEND_SQLITE);
+    // `boot` gets an explicit namespace: without one the stamp is migrated by
+    // the namespace resolution before the read-only open (a pre-existing
+    // defect at the base, reported in the lane READY, not fixed here).
     for (verb, args) in VERBS {
         let fx = Fixture::old_stamp();
         let out = fx.run(args);
