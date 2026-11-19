@@ -935,6 +935,11 @@ SYSTEM_BIN_DIRS = ("/usr/bin/", "/bin/", "/usr/local/bin/", "/usr/sbin/", "/sbin
 STRICT_BASE = 2  # a base ref proven non-empty
 MAYBE_EMPTY_BASE = 1  # a base ref that may be empty (an empty ref names the index)
 NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+# 9566: `NAME=( ... )` / `NAME+=( ... )` is an array literal: its elements are data, never commands.
+# The commands whose operands take the array-literal form (`declare -A NAME=( ... )`).
+ARRAY_DECLARERS = frozenset({"declare", "local", "typeset", "readonly", "export"})
+ARRAY_UNTERMINATED = "unterminated array literal"
+ARRAY_FOREIGN = "array literal holds {tok!r}"
 
 
 class _Word:
@@ -1549,6 +1554,9 @@ class _Sh:
             if tok[0] == "word":
                 word = tok[1]
                 self.next()
+                if self.peek() == ("op", "(") and _array_head(word) and \
+                        (not cmd.words or cmd.words[0].lit in ARRAY_DECLARERS):
+                    word = self.array_word(word)
                 if not cmd.words:
                     assign = word.assignment()
                     if assign is not None:
@@ -1568,6 +1576,40 @@ class _Sh:
         if not (cmd.words or cmd.assigns or cmd.redirs):
             raise Unclassifiable(f"unexpected {_tok_text(self.peek())!r} in shell text")
         return [("cmd", cmd)]
+
+    def array_word(self, head: _Word) -> _Word:
+        """The array literal after `head` (`NAME=` or `NAME+=`), read as one word of data.
+
+        The literal text of each element is data; every other part of an element (a variable, a
+        command substitution, an expression) is kept in the word, so the command substitutions of
+        the elements are still run and read. One pass over the tokens of the literal.
+        """
+        self.next()
+        word = _Word()
+        word.plain = False
+        word.parts = [("lit", head.lit or ""), ("dyn",)]
+        shown = [head.raw + "("]
+        while True:
+            tok = self.next()
+            if tok == ("op", ")"):
+                break
+            if tok[0] == "nl":
+                continue
+            if tok[0] == "eof":
+                raise Unclassifiable(ARRAY_UNTERMINATED)
+            if tok[0] != "word":
+                raise Unclassifiable(ARRAY_FOREIGN.format(tok=_tok_text(tok)))
+            word.parts.extend(part for part in tok[1].parts if part[0] != "lit")
+            shown.append(tok[1].raw)
+        word.raw = " ".join(shown) + ")"
+        return word
+
+
+def _array_head(word: _Word) -> bool:
+    """`NAME=` or `NAME+=` written as an unquoted literal: the head of an array literal."""
+    raw = word.raw
+    name = raw[:-2] if raw.endswith("+=") else raw[:-1] if raw.endswith("=") else ""
+    return word.plain and word.lit == raw and NAME_RE.fullmatch(name) is not None
 
 
 def _flush(word: _Word, buf: list[str]) -> None:

@@ -810,6 +810,85 @@ class PreScanReadsEveryRunStep(unittest.TestCase):
                         self.assertNotEqual(result.verdicts.get((SYNTH, JOB)), "trusted-only")
 
 
+# 9566: the array-literal form at every site of the workflows (the element text is data).
+ARRAY_DATA_FORMS = (
+    "declare -A ABI_OF=(\n  [aarch64-linux-android]=arm64-v8a\n  [i686-linux-android]=x86\n)\necho ok",
+    "TESTS=(\n  --test a\n  --test b # a comment\n)",
+    'SUITE_SECONDS+=("${elapsed}"$\'\\t\'"${label}")',
+    "local part_1=() part_2=() line expect=4 meta_rc=0",
+    "local -a SUITE_SECONDS=()",
+    'part_1+=("$line")',
+    "sel=()",
+    "itargs=(); libargs=()",
+    'sel+=("$tflag" "$tname")',
+    'libargs+=(--skip "$l")',
+    "ARGS=(--lib)",
+    'ARGS+=(--test "$t")',
+    "local -A M=( [k]=v )",
+    "typeset -a T=( x y )",
+    "readonly R=( x )",
+    "export E=( x )",
+)
+# A command substitution inside an element is still run and read: (text, strict reason or None
+# when the text runs tree code).
+ARRAY_SUB_FORMS = (
+    ('x=( "$(nfpm --version)" )', NO_WORD.format(word="nfpm")),
+    ('declare -A M=( [k]="$(unknowntool)" )', NO_WORD.format(word="unknowntool")),
+    ('x=( a "$(./build.sh)" )', None),
+    ("local -a A=( `./build.sh` )", None),
+)
+ARRAY_BROKEN_FORMS = (
+    ("x=( a b", "unterminated array literal"),
+    ("x=( a ; b )", "array literal holds ';'"),
+    ("x=( a | b )", "array literal holds '|'"),
+    ("x=( ( a ) )", "array literal holds '('"),
+)
+# Outside an assignment or a declaring command the parenthesis is a subshell, read as before.
+ARRAY_NOT_DECLARED = ("echo a=(b)", NO_WORD.format(word="b"))
+ARRAY_SCAN_ELEMENTS = 12_000
+
+
+class ArrayLiteralIsData(unittest.TestCase):
+    """9566: `NAME=( ... )` and `declare -A NAME=( ... )` elements are data, their substitutions run."""
+
+    def test_9566_array_elements_are_data(self) -> None:
+        _need_module(self)
+        for text in ARRAY_DATA_FORMS:
+            for strict in (True, False):
+                with self.subTest(text=text, strict=strict):
+                    ctx = tb._ShellCtx(strict=strict)
+                    self.assertFalse(tb._shell_runs_pr_code(tb._joined(text, tb.MARK), ctx))
+                    self.assertEqual(ctx.unread, [])
+
+    def test_9566_array_element_substitution_is_read(self) -> None:
+        _need_module(self)
+        for text, reason in ARRAY_SUB_FORMS:
+            with self.subTest(text=text):
+                if reason is None:
+                    self.assertTrue(_classify(text))
+                    continue
+                with self.assertRaises(tb.Unclassifiable) as caught:
+                    _classify(text)
+                self.assertEqual(str(caught.exception), reason)
+
+    def test_9566_array_literal_of_another_form_is_unclassifiable(self) -> None:
+        _need_module(self)
+        for text, reason in ARRAY_BROKEN_FORMS + (ARRAY_NOT_DECLARED,):
+            with self.subTest(text=text):
+                with self.assertRaises(tb.Unclassifiable) as caught:
+                    _classify(text)
+                self.assertEqual(str(caught.exception), reason)
+
+    def test_9566_array_literal_scan_is_linear(self) -> None:
+        _need_module(self)
+        body = "".join(f"  [key{i:06d}]=value{i:06d}\n" for i in range(ARRAY_SCAN_ELEMENTS))
+        text = f"declare -A M=(\n{body})\necho ok"
+        self.assertGreaterEqual(len(text), ADVERSARIAL_BYTES * 2)
+        started = time.perf_counter()
+        self.assertFalse(_classify(text))
+        self.assertLess(time.perf_counter() - started, SCAN_CEILING_S)
+
+
 class HostedGuard(unittest.TestCase):
     """I-6: this file runs in an existing hosted job, and that step holds the boundary."""
 
