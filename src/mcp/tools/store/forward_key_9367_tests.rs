@@ -629,13 +629,28 @@ fn keyed_forward_without_explicit_identity_is_refused_9367() {
     assert!(drain(&rx).is_empty(), "no request left the process");
 }
 
+/// The production text of one Rust source file, the text every source pin of
+/// this file scans.
+fn production_text(src: &str) -> String {
+    src.split("#[cfg(test)]")
+        .next()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Whether the production text of one source file builds an HTTP client.
+fn builds_http_client(src: &str) -> bool {
+    let prod = production_text(src);
+    prod.contains("reqwest::blocking::Client") || prod.contains("reqwest::Client")
+}
+
 /// K-6 — the three forward sites go through the one funnel: the production
 /// half of transport.rs calls `forward_to_http` once (from the funnel) and the
 /// funnel three times; no other file under src/mcp builds an HTTP client.
 #[test]
 fn every_forward_site_goes_through_the_one_funnel_9367() {
     let src = include_str!("transport.rs");
-    let production = src.split("#[cfg(test)]").next().unwrap_or_default();
+    let production = production_text(src);
     assert_eq!(
         production.matches("forward_to_http(").count(),
         2,
@@ -656,8 +671,7 @@ fn every_forward_site_goes_through_the_one_funnel_9367() {
                 stack.push(path);
             } else if path.extension().is_some_and(|e| e == "rs") {
                 let text = std::fs::read_to_string(&path).expect("read source");
-                let prod = text.split("#[cfg(test)]").next().unwrap_or_default();
-                if prod.contains("reqwest::blocking::Client") || prod.contains("reqwest::Client") {
+                if builds_http_client(&text) {
                     builders.push(path.display().to_string());
                 }
             }
@@ -672,6 +686,140 @@ fn every_forward_site_goes_through_the_one_funnel_9367() {
     assert!(
         builders[0].ends_with("src/mcp/tools/store/transport.rs"),
         "{builders:?}"
+    );
+}
+
+/// The cut table: (row, synthetic source, the production text it must give).
+/// Production text is every line outside the file's test modules; a
+/// `#[cfg(test)]` on one item or statement inside production code does not
+/// end it; a `#![cfg(test)]` file has none.
+const CUT_TABLE: &[(&str, &str, &str)] = &[
+    (
+        "inner cfg(test) item, production after it",
+        "fn a() {}\n#[cfg(test)]\nfn seam() {}\nfn b() {}\n",
+        "fn a() {}\n#[cfg(test)]\nfn seam() {}\nfn b() {}\n",
+    ),
+    (
+        "cfg(test) seam statement inside a production fn",
+        "fn a() {\n    let x = 1;\n    #[cfg(test)]\n    seam::fire();\n    b(x);\n}\n",
+        "fn a() {\n    let x = 1;\n    #[cfg(test)]\n    seam::fire();\n    b(x);\n}\n",
+    ),
+    (
+        "test module at the end",
+        "fn a() {}\n#[cfg(test)]\nmod tests {\n    fn t() {}\n}\n",
+        "fn a() {}\n",
+    ),
+    (
+        "production after the test module",
+        "fn a() {}\n#[cfg(test)]\nmod tests {\n    fn t() {}\n}\nfn b() {}\n",
+        "fn a() {}\nfn b() {}\n",
+    ),
+    (
+        "attributes and docs between cfg(test) and a named test module",
+        "#[cfg(test)]\n#[allow(clippy::too_many_lines)]\n/// doc\nmod k1_tests {\n    use super::*;\n}\nfn c() {}\n",
+        "fn c() {}\n",
+    ),
+    (
+        "out-of-line test module declaration, production after it",
+        "#[cfg(test)]\n#[path = \"x_tests.rs\"]\nmod x_tests;\nfn d() {}\n",
+        "#[cfg(test)]\n#[path = \"x_tests.rs\"]\nmod x_tests;\nfn d() {}\n",
+    ),
+    (
+        "a test-only file as a whole",
+        "// header\n//! doc\n\n#![cfg(test)]\nfn e() {}\n",
+        "",
+    ),
+    (
+        "no test module gives the whole file",
+        "fn f() {}\nfn g() {}\n",
+        "fn f() {}\nfn g() {}\n",
+    ),
+    (
+        "mod tests without the attribute",
+        "fn a() {}\nmod tests {\n    fn t() {}\n}\n",
+        "fn a() {}\n",
+    ),
+    (
+        "test module gated on all(test, feature)",
+        "fn a() {}\n#[cfg(all(test, feature = \"sal\"))]\nmod pg_tests {\n    fn t() {}\n}\nfn b() {}\n",
+        "fn a() {}\nfn b() {}\n",
+    ),
+    (
+        "test module nested in a production module",
+        "mod inner {\n    fn p() {}\n    #[cfg(test)]\n    mod tests {\n        fn t() {}\n    }\n    fn q() {}\n}\n",
+        "mod inner {\n    fn p() {}\n    fn q() {}\n}\n",
+    ),
+    (
+        "cfg(not(test)) module is production",
+        "#[cfg(not(test))]\nmod real {\n    fn r() {}\n}\n",
+        "#[cfg(not(test))]\nmod real {\n    fn r() {}\n}\n",
+    ),
+    (
+        "an unclosed test module keeps the rest (scan more, never less)",
+        "fn a() {}\n#[cfg(test)]\nmod tests {\n    fn t() {}\nfn b() {}\n",
+        "fn a() {}\n#[cfg(test)]\nmod tests {\n    fn t() {}\nfn b() {}\n",
+    ),
+];
+
+/// The cut every source pin of this file uses gives exactly the production
+/// text of each table row.
+#[test]
+fn production_text_is_everything_outside_the_test_modules_9367() {
+    let wrong: Vec<String> = CUT_TABLE
+        .iter()
+        .filter(|(_, src, want)| production_text(src) != *want)
+        .map(|(row, src, want)| format!("{row}: got {:?}, want {want:?}", production_text(src)))
+        .collect();
+    assert!(wrong.is_empty(), "production text mismatch: {wrong:#?}");
+}
+
+/// A client constructor placed after a test-only seam statement in a
+/// production fn is seen by the K-6 scan; a constructor only in the test
+/// module, or in a test-only file, is not.
+#[test]
+fn k6_scan_sees_a_client_after_an_inner_cfg_test_item_9367() {
+    let hidden = "fn seam_host() {\n    #[cfg(test)]\n    seam::fire();\n}\nfn later() {\n    let _c = reqwest::blocking::Client::builder();\n}\n#[cfg(test)]\nmod tests {\n    fn t() {}\n}\n";
+    assert!(
+        builds_http_client(hidden),
+        "a client built after an inner #[cfg(test)] item is production and the K-6 scan must see it"
+    );
+    let test_only =
+        "fn p() {}\n#[cfg(test)]\nmod tests {\n    fn t() { let _ = reqwest::Client::new(); }\n}\n";
+    assert!(
+        !builds_http_client(test_only),
+        "a client built only in the test module is not production"
+    );
+    let test_file = "//! doc\n#![cfg(test)]\nfn t() { let _ = reqwest::Client::new(); }\n";
+    assert!(
+        !builds_http_client(test_file),
+        "a client built in a #![cfg(test)] file is not production"
+    );
+}
+
+/// Lines of the large synthetic source for the cut's time bound (100K+).
+const CUT_LARGE_LINES: usize = 120_000;
+/// Wall-clock ceiling for cutting that source (a linear pass in a debug build).
+const CUT_CEILING: Duration = Duration::from_secs(5);
+
+/// The cut is linear: a long run of `#[cfg(test)]` lines with no module after
+/// them, then an unclosed test module, is cut inside the ceiling and keeps
+/// every line.
+#[test]
+fn production_text_is_linear_on_a_large_source_9367() {
+    let mut src = "#[cfg(test)]\n".repeat(CUT_LARGE_LINES);
+    src.push_str("fn after_the_run() {}\n");
+    src.push_str("#[cfg(test)]\nmod tests {\n");
+    src.push_str(&"    fn t() {}\n".repeat(CUT_LARGE_LINES));
+    let started = Instant::now();
+    let prod = production_text(&src);
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < CUT_CEILING,
+        "cutting {CUT_LARGE_LINES}-line runs took {elapsed:?}, ceiling {CUT_CEILING:?}"
+    );
+    assert!(
+        prod == src,
+        "an unclosed test module keeps every line (the {CUT_LARGE_LINES}-line source was cut)"
     );
 }
 
