@@ -140,6 +140,9 @@ OPERAND_SHAPE_REFUSED = {
     "backtick form inside a word": "a`id`b",
     "nested expansion": "${a${b}}",
     "nested expansion first": "${${a}}",
+    # The outer brace never closes: only a span that FULLY matches is a reference, never a match inside it.
+    "nested expansion, outer brace open": "${x${y}",
+    "default value of a nested reference, outer brace open": "${a:-${b}",
     "default value colon-dash": "${a:-b}",
     "default value dash": "${a-b}",
     "assign default": "${a:=b}",
