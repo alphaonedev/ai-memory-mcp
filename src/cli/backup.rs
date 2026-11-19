@@ -6,6 +6,7 @@
 
 use crate::cli::CliOutput;
 use crate::db;
+use crate::storage::snapshot_file;
 use anyhow::{Context, Result};
 use clap::Args;
 use std::path::{Path, PathBuf};
@@ -1361,7 +1362,6 @@ fn run_backup_with(
     out: &mut CliOutput<'_>,
     policy: &BackupPolicy,
 ) -> Result<()> {
-    use std::io::Read;
     // #2444 — resolve (and where necessary REFUSE) the configured store BEFORE
     // anything is created on disk. A backup that cannot capture the configured
     // store must ERROR, never produce an artifact.
@@ -1427,34 +1427,25 @@ fn run_backup_with(
     let ts = chrono::Utc::now().format(BACKUP_TS_FMT).to_string();
     let snapshot_name = format!("ai-memory-{ts}.db");
     let snapshot_path = args.to.join(&snapshot_name);
-    if snapshot_path.exists() {
-        anyhow::bail!(
-            "refusing to overwrite existing snapshot {}",
-            snapshot_path.display()
-        );
-    }
+    let manifest_path = args.to.join(manifest_file_name(&format!("ai-memory-{ts}")));
+    // v1.0.0 #8950 — nothing at either name is followed or replaced: an
+    // `exists()` check is false for a DANGLING symlink, which `VACUUM INTO`
+    // then wrote through, and the manifest rename replaced a planted link.
+    // Both names are refused up front (`symlink_metadata`), the snapshot is
+    // written into a private staging directory and published by a link that
+    // fails on any entry; size, hash and fsync come from the staged handle.
+    snapshot_file::refuse_occupied(&manifest_path, "manifest")?;
+    let stage = snapshot_file::stage_beside(&snapshot_path, "snapshot")?;
     conn.execute(
         "VACUUM INTO ?1",
-        rusqlite::params![snapshot_path.to_string_lossy()],
+        rusqlite::params![stage.path().to_string_lossy()],
     )
     .context("VACUUM INTO failed")?;
     drop(conn);
+    stage.verify_identity()?;
 
-    let bytes = std::fs::metadata(&snapshot_path)?.len();
-    let sha = {
-        use sha2::Digest;
-        let mut hasher = sha2::Sha256::new();
-        let mut f = std::fs::File::open(&snapshot_path)?;
-        let mut buf = vec![0u8; 64 * 1024];
-        loop {
-            let n = f.read(&mut buf)?;
-            if n == 0 {
-                break;
-            }
-            hasher.update(&buf[..n]);
-        }
-        format!("{:x}", hasher.finalize())
-    };
+    let bytes = stage.file().metadata()?.len();
+    let sha = sha256_hex(stage.file())?;
 
     let created_at = chrono::Utc::now().to_rfc3339();
     let mut manifest = BackupManifest {
@@ -1495,14 +1486,9 @@ fn run_backup_with(
     // rotated away. Each fsync that fails is reported (`durable: false`),
     // rotation is then skipped, and under asi-hard the command exits non-zero
     // once the output is written.
-    let manifest_path = args.to.join(manifest_file_name(&format!("ai-memory-{ts}")));
     let manifest_text = serde_json::to_string_pretty(&manifest)?;
-    let durability_failures = write_backup_pair_durably(
-        &snapshot_path,
-        &manifest_path,
-        &manifest_text,
-        policy.sync_dir,
-    )?;
+    let durability_failures =
+        write_backup_pair_durably(stage, &manifest_path, &manifest_text, policy.sync_dir)?;
     let durable = durability_failures.is_empty();
     if !durable {
         writeln!(
@@ -1589,47 +1575,47 @@ fn run_backup_with(
     Ok(())
 }
 
-/// v1.0.0 #3605 — make a fresh backup pair durable: fsync the snapshot `VACUUM
-/// INTO` wrote, publish the manifest through a same-directory temp file
-/// (created owner-only, written, fsynced) renamed into place, then fsync the
-/// directory so both entries survive a power cut.
+/// v1.0.0 #3605 / #8950 — make a fresh backup pair durable: fsync the staged
+/// snapshot through its handle, publish it, publish the manifest the same way
+/// (staged owner-only, written, fsynced), then fsync the directory so both
+/// entries survive a power cut. Neither publish follows or replaces anything
+/// at its name (`snapshot_file::NoFollowStage::publish`).
 ///
-/// Returns the fsync steps that FAILED (empty = durable); a manifest that
-/// cannot be written at all is an error instead.
+/// Returns the fsync steps that FAILED (empty = durable); a pair that cannot
+/// be published at all is an error instead, and a snapshot published without
+/// its manifest is removed again.
 ///
 /// # Errors
-/// The manifest's temp file cannot be created, written or renamed.
+/// Either publish fails, or the manifest cannot be staged, written or synced.
 fn write_backup_pair_durably(
-    snapshot: &Path,
+    snapshot: snapshot_file::NoFollowStage,
     manifest_path: &Path,
     manifest_text: &str,
     sync_dir: fn(&Path) -> std::io::Result<()>,
 ) -> Result<Vec<String>> {
     let mut failures = Vec::new();
-    if let Err(e) = std::fs::File::open(snapshot).and_then(|f| f.sync_all()) {
-        failures.push(format!("fsync {}: {e}", snapshot.display()));
+    let snapshot_path = snapshot.dest().to_path_buf();
+    if let Err(e) = snapshot.file().sync_all() {
+        failures.push(format!("fsync {}: {e}", snapshot_path.display()));
+    }
+    drop(snapshot.publish()?);
+    let published = (|| -> Result<()> {
+        let mut stage = snapshot_file::stage_beside(manifest_path, "manifest")?;
+        stage.write_all(manifest_text.as_bytes())?;
+        stage
+            .file()
+            .sync_all()
+            .with_context(|| format!("fsync the manifest {}", manifest_path.display()))?;
+        drop(stage.publish()?);
+        Ok(())
+    })();
+    if let Err(e) = published {
+        // A snapshot without a manifest is unrestorable, so it is taken back.
+        // Removing by name unlinks the entry and never follows it.
+        let _ = std::fs::remove_file(&snapshot_path);
+        return Err(e);
     }
     let dir = publish_dir(manifest_path);
-    let file_name = manifest_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or_default();
-    let tmp = dir.join(format!(".{file_name}.tmp-{}", std::process::id()));
-    // A leftover from a crashed run with the same pid; `create_new` below
-    // would refuse it, and removing a planted symlink removes only the link.
-    let _ = std::fs::remove_file(&tmp);
-    drop(copy_into_new_file(
-        &mut manifest_text.as_bytes(),
-        &tmp,
-        None,
-    )?);
-    if let Err(e) = std::fs::rename(&tmp, manifest_path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(anyhow::Error::new(e).context(format!(
-            "publishing the manifest {}",
-            manifest_path.display()
-        )));
-    }
     if let Err(e) = sync_dir(dir) {
         failures.push(format!("fsync {}: {e}", dir.display()));
     }
@@ -4122,6 +4108,10 @@ mod tests {
     // v1.0.0 #3199 — the signed-manifest cert battery lives in
     // `src/cli/backup/tests/signed_manifest_3199.rs`.
     mod signed_manifest_3199;
+
+    // v1.0.0 #8950 — a planted symlink at the snapshot or manifest name is
+    // refused; the table lives in `src/cli/backup/tests/symlink_follow_8950.rs`.
+    mod symlink_follow_8950;
 
     /// `stage_and_verify` never touches the target: that is the whole point
     /// of staging. Pinned directly so a future refactor cannot quietly move

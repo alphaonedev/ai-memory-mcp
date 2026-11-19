@@ -541,6 +541,165 @@ fn render_behind(observed: i64, supported: i64, backend: &str, target: &str) -> 
     )
 }
 
+/// The schema version that added the content-id columns (`memories.cid`,
+/// `memories.cid_genesis`).
+pub(crate) const PROVENANCE_CID_SCHEMA_VERSION: i64 = 74;
+
+/// #9435 (conductor ruling 8c59363f, form A) / #9496 — a provenance read whose
+/// column does not exist. Each variant names ONLY the cause the classifier
+/// established by reading the store (invariant B): the column alone never
+/// proves "older than v74", so the recorded stamp is read too. The failed read
+/// is kept as `source()` and not repeated in `Display` (ERRORS-11).
+#[derive(Debug)]
+pub(crate) enum ProvenanceReadFault {
+    /// The stamp is below v74 (or the store is unstamped and empty): the
+    /// column is missing because the schema predates it. Migrating adds it.
+    ColumnMissingPreV74 {
+        column: &'static str,
+        source: rusqlite::Error,
+    },
+    /// The stamp says v74 or later, yet the column is absent: the stamp and
+    /// the table shape disagree, and a migrating open will not re-add it.
+    ColumnMissingAtStamp {
+        column: &'static str,
+        stamp: i64,
+        source: rusqlite::Error,
+    },
+    /// The `memories` table itself does not exist.
+    MemoriesTableMissing {
+        column: &'static str,
+        source: rusqlite::Error,
+    },
+    /// The column is absent and the recorded stamp could not be read.
+    StampUnreadable {
+        column: &'static str,
+        source: anyhow::Error,
+    },
+    /// The column is absent and the stamp is one no migration writes (zero or
+    /// negative on a populated store).
+    StampInvalid {
+        column: &'static str,
+        stamp: i64,
+        source: rusqlite::Error,
+    },
+}
+
+impl fmt::Display for ProvenanceReadFault {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ColumnMissingPreV74 { column, .. } => write!(
+                f,
+                "provenance column memories.{column} is missing: this database is on a schema \
+                 older than v{v} (the content-id columns). Repair: `{repair}` or {daemon}, then \
+                 re-run.",
+                column = column,
+                v = PROVENANCE_CID_SCHEMA_VERSION,
+                repair = SCHEMA_BEHIND_REPAIR,
+                daemon = SCHEMA_BEHIND_REPAIR_DAEMON,
+            ),
+            Self::ColumnMissingAtStamp { column, stamp, .. } => write!(
+                f,
+                "provenance column memories.{column} is missing, but this database is stamped \
+                 schema v{stamp}, which has it (added at v{v}): the stamp and the table shape \
+                 disagree, and a migrating open does not re-add the column. Repair: restore the \
+                 database from a backup, then re-run.",
+                column = column,
+                stamp = stamp,
+                v = PROVENANCE_CID_SCHEMA_VERSION,
+            ),
+            Self::MemoriesTableMissing { column, .. } => write!(
+                f,
+                "provenance read of memories.{column} failed: the memories table does not exist \
+                 in this database. Check the database path.",
+                column = column
+            ),
+            Self::StampUnreadable { column, .. } => write!(
+                f,
+                "provenance column memories.{column} is missing and the recorded schema version \
+                 cannot be read, so the cause is not established. Inspect the database before \
+                 any repair.",
+                column = column
+            ),
+            Self::StampInvalid { column, stamp, .. } => write!(
+                f,
+                "provenance column memories.{column} is missing and the recorded schema version \
+                 is v{stamp}, which no migration writes, so the cause is not established. \
+                 Inspect the database before any repair.",
+                column = column,
+                stamp = stamp
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ProvenanceReadFault {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ColumnMissingPreV74 { source, .. }
+            | Self::ColumnMissingAtStamp { source, .. }
+            | Self::MemoriesTableMissing { source, .. }
+            | Self::StampInvalid { source, .. } => Some(source),
+            Self::StampUnreadable { source, .. } => Some(source.as_ref()),
+        }
+    }
+}
+
+/// #9435 / #9496 — classify a failed provenance read. Every step is a
+/// STRUCTURAL read, never a match on error text: a present column, or a probe
+/// that cannot answer, returns the original storage error unchanged; an absent
+/// column is named by what the store's own stamp says (invariant B).
+pub(crate) fn classify_provenance_read_error(
+    conn: &rusqlite::Connection,
+    err: rusqlite::Error,
+    column: &'static str,
+) -> anyhow::Error {
+    let present = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('memories') WHERE name = ?1",
+        [column],
+        |r| r.get::<_, i64>(0),
+    );
+    if !matches!(present, Ok(0)) {
+        return anyhow::Error::new(err);
+    }
+    match crate::storage::connection::sqlite_table_present(conn, super::TABLE_MEMORIES) {
+        Ok(true) => {}
+        Ok(false) => {
+            return anyhow::Error::new(ProvenanceReadFault::MemoriesTableMissing {
+                column,
+                source: err,
+            });
+        }
+        Err(_) => return anyhow::Error::new(err),
+    }
+    let fault = match crate::storage::connection::probe_schema_stamp(conn) {
+        Err(probe) => ProvenanceReadFault::StampUnreadable {
+            column,
+            source: probe.context(err.to_string()),
+        },
+        Ok(SchemaStamp::Zeroed(stamp)) => ProvenanceReadFault::StampInvalid {
+            column,
+            stamp,
+            source: err,
+        },
+        Ok(SchemaStamp::Known(stamp)) if stamp >= PROVENANCE_CID_SCHEMA_VERSION => {
+            ProvenanceReadFault::ColumnMissingAtStamp {
+                column,
+                stamp,
+                source: err,
+            }
+        }
+        // Below v74, or unstamped AND empty (`Fresh`): a migrating open adds
+        // the column, so the pre-v74 remedy is the established one.
+        Ok(SchemaStamp::Known(_) | SchemaStamp::Fresh) => {
+            ProvenanceReadFault::ColumnMissingPreV74 {
+                column,
+                source: err,
+            }
+        }
+    };
+    anyhow::Error::new(fault)
+}
+
 /// v1.0.0 #3411 / #3434 — recover the schema-behind verdict from an
 /// `anyhow` chain so `boot` / `doctor` report the drift (and the repair)
 /// instead of an opaque open / raw-SQL failure.
@@ -865,6 +1024,86 @@ mod tests {
         assert!(
             !postgres.contains("migrate --in-place"),
             "the sqlite in-place verb must not be offered on postgres: {postgres}"
+        );
+    }
+
+    /// #9435 alerts 905-907 (A-3) - the `Display` text of every
+    /// `ProvenanceReadFault` variant, byte for byte. The arms bind `column` /
+    /// `stamp` and read them only through the format string, so a rewrite of
+    /// the format arguments must leave every one of these strings unchanged.
+    fn fault_source() -> rusqlite::Error {
+        rusqlite::Error::QueryReturnedNoRows
+    }
+
+    #[test]
+    fn provenance_fault_display_column_missing_pre_v74_exact_text_9435() {
+        let fault = ProvenanceReadFault::ColumnMissingPreV74 {
+            column: "cid_genesis",
+            source: fault_source(),
+        };
+        assert_eq!(
+            fault.to_string(),
+            "provenance column memories.cid_genesis is missing: this database is on a schema \
+             older than v74 (the content-id columns). Repair: `ai-memory migrate --in-place` or \
+             start the daemon, then re-run."
+        );
+    }
+
+    #[test]
+    fn provenance_fault_display_column_missing_at_stamp_exact_text_9435() {
+        let fault = ProvenanceReadFault::ColumnMissingAtStamp {
+            column: "cid",
+            stamp: 91,
+            source: fault_source(),
+        };
+        assert_eq!(
+            fault.to_string(),
+            "provenance column memories.cid is missing, but this database is stamped \
+             schema v91, which has it (added at v74): the stamp and the table shape \
+             disagree, and a migrating open does not re-add the column. Repair: restore the \
+             database from a backup, then re-run."
+        );
+    }
+
+    #[test]
+    fn provenance_fault_display_memories_table_missing_exact_text_9435() {
+        let fault = ProvenanceReadFault::MemoriesTableMissing {
+            column: "cid",
+            source: fault_source(),
+        };
+        assert_eq!(
+            fault.to_string(),
+            "provenance read of memories.cid failed: the memories table does not exist \
+             in this database. Check the database path."
+        );
+    }
+
+    #[test]
+    fn provenance_fault_display_stamp_unreadable_exact_text_9435() {
+        let fault = ProvenanceReadFault::StampUnreadable {
+            column: "cid_genesis",
+            source: anyhow::anyhow!("probe failed"),
+        };
+        assert_eq!(
+            fault.to_string(),
+            "provenance column memories.cid_genesis is missing and the recorded schema version \
+             cannot be read, so the cause is not established. Inspect the database before \
+             any repair."
+        );
+    }
+
+    #[test]
+    fn provenance_fault_display_stamp_invalid_exact_text_9435() {
+        let fault = ProvenanceReadFault::StampInvalid {
+            column: "cid",
+            stamp: -3,
+            source: fault_source(),
+        };
+        assert_eq!(
+            fault.to_string(),
+            "provenance column memories.cid is missing and the recorded schema version \
+             is v-3, which no migration writes, so the cause is not established. \
+             Inspect the database before any repair."
         );
     }
 }
