@@ -2090,12 +2090,33 @@ jobs:
             # (folded into $FEAT/$TAIL there), so these two cargo lines stay the
             # exact `... "$@" ...` shape the #2657 / #2500 invariant gates pin.
             started=$(date +%s)
+            # #9229 suite margin gate, opt-in by the SUITE_MARGIN_GATE=1 prefix of the sqlite
+            # dispatch (never inside run_shard: its chains share one shrinking budget). The
+            # timer prints the named red once the wall is past 80 percent of the budget while
+            # cargo still runs, BEFORE the watchdog kill, and exits 3; the gate after the run
+            # judges the wall with the same predicate (a pass that used more than that is a red
+            # too) and is red whenever the timer reported (--timer-rc 3), so one invocation never
+            # gets both the red and the held notice. Its seconds go to the caller's SUITE_SECONDS
+            # array (shell memory, never a file a test can write). The gate's red returns after
+            # the #6202 / #1492 notices. Logic: scripts/ci/suite_budget.py.
+            local timer_pid="" log_offset=0 gate_rc=0 timer_rc=0
+            if [ "${SUITE_MARGIN_GATE:-0}" = "1" ]; then
+              log_offset=$(( $(wc -c < "$RESULT_LOG" 2>/dev/null || echo 0) + 0 ))
+              python3 -I scripts/ci/suite_budget.py timer --label "$label" --budget "$WATCHDOG_SECS" --log "$RESULT_LOG" --log-offset "$log_offset" &
+              timer_pid=$!
+            fi
             if [ -n "$TIMEOUT_BIN" ]; then
               "$TIMEOUT_BIN" --signal=TERM --kill-after=60 "$WATCHDOG_SECS" cargo test --no-fail-fast "$@" || rc=$?
             else
               cargo test --no-fail-fast "$@" || rc=$?
             fi
             elapsed=$(( $(date +%s) - started ))
+            if [ -n "$timer_pid" ]; then
+              kill "$timer_pid" 2>/dev/null || true
+              wait "$timer_pid" 2>/dev/null || timer_rc=$?
+              SUITE_SECONDS+=("${elapsed}"$'\t'"${label}")
+              python3 -I scripts/ci/suite_budget.py gate --label "$label" --elapsed "$elapsed" --budget "$WATCHDOG_SECS" --rc "$rc" --log "$RESULT_LOG" --log-offset "$log_offset" --timer-rc "$timer_rc" || gate_rc=$?
+            fi
             # #6202 — make the margin visible in EVERY green run so the budget
             # is re-tuned from data, not from the next surprise kill.
             if [ "$rc" -eq 0 ]; then
@@ -2108,6 +2129,7 @@ jobs:
               fi
               return "$rc"
             fi
+            if [ "$gate_rc" -ne 0 ]; then return "$gate_rc"; fi
           }
 
           # #6344 — SHARDED enterprise-fed suite. The serial 1,005-executable
@@ -2144,15 +2166,85 @@ jobs:
             # is the plain `--no-run` of the same feature set (lib + doc deps).
             cargo test --no-run "$@" || return "$?"
             started=$(date +%s)
+            # #9229: the same opt-in suite margin gate as run_tests.
+            local timer_pid="" log_offset=0 gate_rc=0 timer_rc=0
+            if [ "${SUITE_MARGIN_GATE:-0}" = "1" ]; then
+              log_offset=$(( $(wc -c < "$RESULT_LOG" 2>/dev/null || echo 0) + 0 ))
+              python3 -I scripts/ci/suite_budget.py timer --label "$label" --budget "$WATCHDOG_SECS" --log "$RESULT_LOG" --log-offset "$log_offset" &
+              timer_pid=$!
+            fi
             if [ -n "$TIMEOUT_BIN" ]; then
               "$TIMEOUT_BIN" --signal=TERM --kill-after=60 "$WATCHDOG_SECS" cargo test --doc --no-fail-fast "$@" || rc=$?
             else
               cargo test --doc --no-fail-fast "$@" || rc=$?
             fi
             elapsed=$(( $(date +%s) - started ))
+            if [ -n "$timer_pid" ]; then
+              kill "$timer_pid" 2>/dev/null || true
+              wait "$timer_pid" 2>/dev/null || timer_rc=$?
+              SUITE_SECONDS+=("${elapsed}"$'\t'"${label}")
+              python3 -I scripts/ci/suite_budget.py gate --label "$label" --elapsed "$elapsed" --budget "$WATCHDOG_SECS" --rc "$rc" --log "$RESULT_LOG" --log-offset "$log_offset" --timer-rc "$timer_rc" || gate_rc=$?
+            fi
             echo "::notice::[#1492] '${label}' ran ${elapsed}s of the ${WATCHDOG_SECS}s per-invocation watchdog budget (tier=${TIER:-sqlite} node=${CI_NODE:-unknown})"
-            if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
-              echo "::error::[#1492 watchdog] '${label}' exceeded the ${WATCHDOG_SECS}s per-invocation timeout (tier=${TIER:-sqlite}) and was terminated."
+            if [ "$rc" -ne 0 ]; then
+              if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+                echo "::error::[#1492 watchdog] '${label}' exceeded the ${WATCHDOG_SECS}s per-invocation timeout (tier=${TIER:-sqlite}) and was terminated."
+              fi
+              return "$rc"
+            fi
+            if [ "$gate_rc" -ne 0 ]; then return "$gate_rc"; fi
+          }
+          # #9229 — the sqlite full suite as four sequential invocations, each under its
+          # own per-invocation budget and the margin gate: lib unit tests (--lib), every
+          # other target of cargo's default test selection (derived from cargo metadata
+          # by suite_budget.py shard-args, so a new tests/*.rs is never missed) in two
+          # round-robin parts, then doc tests. Same test set as one `cargo test`;
+          # ceilings unchanged, check names unchanged (same step). A failed shard does
+          # not stop the later ones (#2500 evidence, precedent run_shard); the function
+          # returns the first failure. When a derivation is refused it warns and runs
+          # the one unsharded invocation, gated (fail closed to full coverage); a failed
+          # `cargo metadata` prints its ::warning:: before that fallback runs.
+          # Whole-suite ceiling (ruling b29 cdfe800f): suite-plan first proves the one
+          # WHOLE_SUITE_CEILING_SECS plus the margin fits this job's timeout as this file
+          # states it (red before any test, never a job kill); each gated invocation
+          # appends its seconds to the SUITE_SECONDS array (a local of this shell, so the
+          # run_tests calls see it and no test process can rewrite it), and suite-sum
+          # judges their sum after the last one with --expect the number of invocations
+          # this function ran (a missing or extra row is a named red, exit 2; after an earlier
+          # failure a missing row is one not-judged notice and that failure's code).
+          run_sqlite_full_suite() {
+            local rc=0 r=0 meta="${RUNNER_TEMP:-.}/suite-9229-metadata.json" list="${RUNNER_TEMP:-.}/suite-9229-shard.txt"
+            local part_1=() part_2=() line expect=4 meta_rc=0
+            local -a SUITE_SECONDS=()
+            python3 -I scripts/ci/suite_budget.py suite-plan --workflow .github/workflows/ci.yml --job check --node "${CI_NODE:-unknown}" --tier "${TIER:-sqlite}" || return "$?"
+            cargo metadata --no-deps --format-version 1 > "$meta" || meta_rc=$?
+            if [ "$meta_rc" -ne 0 ]; then
+              echo "::warning::[#9229 margin] cargo metadata failed (rc ${meta_rc}); the full suite runs unsharded, gated (#9229)"
+            else
+              if python3 -I scripts/ci/suite_budget.py shard-args --metadata "$meta" --part 1/2 > "$list"; then
+                while IFS= read -r line; do part_1+=("$line"); done < "$list"
+              fi
+              if python3 -I scripts/ci/suite_budget.py shard-args --metadata "$meta" --part 2/2 > "$list"; then
+                while IFS= read -r line; do part_2+=("$line"); done < "$list"
+              fi
+            fi
+            if [ "${#part_1[@]}" -eq 0 ] || [ "${#part_2[@]}" -eq 0 ]; then
+              expect=1
+              SUITE_MARGIN_GATE=1 run_tests "full suite (cargo test)" $FEAT $TAIL || rc=$?
+            else
+              SUITE_MARGIN_GATE=1 run_tests "full suite shard 1/4: lib unit tests" $FEAT --lib $TAIL || rc=$?
+              SUITE_MARGIN_GATE=1 run_tests "full suite shard 2/4: bins, integration tests and tested examples, part 1/2" $FEAT "${part_1[@]}" $TAIL || { r=$?; [ "$rc" -ne 0 ] || rc=$r; }
+              SUITE_MARGIN_GATE=1 run_tests "full suite shard 3/4: bins, integration tests and tested examples, part 2/2" $FEAT "${part_2[@]}" $TAIL || { r=$?; [ "$rc" -ne 0 ] || rc=$r; }
+              SUITE_MARGIN_GATE=1 run_doc_tests "full suite shard 4/4: doc tests" $FEAT $TAIL || { r=$?; [ "$rc" -ne 0 ] || rc=$r; }
+            fi
+            # An invocation that ended before its gate (a failed prebuild) keeps no row. With rc
+            # already non-zero and fewer than $expect rows the sum is not judged: one notice names
+            # rc, the rows kept and $expect (printf %d: digits only), and rc stays the first
+            # failure's code. With rc 0 a short count is still the malformed-input red (exit 2).
+            if [ "$rc" -ne 0 ] && [ "${#SUITE_SECONDS[@]}" -lt "$expect" ]; then
+              printf '::notice::[#9229 margin] whole sqlite suite: not judged, an invocation ended before its gate (rc %d); %d of %d invocation rows kept (#9229)\n' "$rc" "${#SUITE_SECONDS[@]}" "$expect"
+            else
+              python3 -I scripts/ci/suite_budget.py suite-sum --expect "$expect" -- ${SUITE_SECONDS[@]+"${SUITE_SECONDS[@]}"} || { r=$?; [ "$rc" -ne 0 ] || rc=$r; }
             fi
             return "$rc"
           }
@@ -2311,7 +2403,40 @@ jobs:
             pid_2=$!
             ( while true; do
                 sleep 300 >/dev/null 2>&1
-                echo "::notice::[#6344] progress | serial: $(tail -n 1 "$sd/serial.log" 2>/dev/null | cut -c1-90) | parallel_1: $(tail -n 1 "$sd/parallel_1.log" 2>/dev/null | cut -c1-90) | parallel_2: $(tail -n 1 "$sd/parallel_2.log" 2>/dev/null | cut -c1-90)"
+                # #9430: the last lines of the shard logs are pull-request text. The one python3 -I call below reads them itself
+                # (no host text tool: uutils tail 0.10.0 loses bytes at 64 KiB, uutils and BSD cut -c cut characters): each log
+                # path is opened rb with O_NONBLOCK and read only when fstat says it is a regular file (missing, unreadable, a
+                # directory, a FIFO or a device gives an empty field); at most READ_BYTES are read back from the end; the field
+                # is the last line cut to CUT_BYTES bytes, or the last CUT_BYTES bytes read when that window holds no line feed.
+                # workflow_annotation.render escapes each field once, so no line break, %, :: or ##[ of a log line reaches the
+                # runner through this notice (the raw shard logs printed below are #9433); a cut inside a multi-byte character
+                # shows as \udcXX and the line is written as UTF-8. set -e is live here: a failed call is reported on stderr and
+                # that report cannot fail (`|| true`), so no failure of the notice ends the loop or changes the step result.
+                python3 -I -c 'if True:
+                    import os, stat, sys
+                    sys.path.insert(0, "scripts/ci")
+                    import workflow_annotation as wa
+                    READ_BYTES = 8192  # bytes read back from the end of each log, never more
+                    CUT_BYTES = 90  # bytes kept of each last line
+                    def last_line(path):
+                        try:
+                            with open(path, "rb", opener=lambda name, flags: os.open(name, flags | os.O_NONBLOCK | os.O_NOCTTY)) as log:
+                                info = os.fstat(log.fileno())
+                                if not stat.S_ISREG(info.st_mode):
+                                    return b""
+                                start = max(0, info.st_size - READ_BYTES)
+                                log.seek(start)
+                                window = log.read(READ_BYTES)
+                        except OSError:
+                            return b""
+                        body = window[:-1] if window.endswith(b"\n") else window
+                        newline = body.rfind(b"\n")
+                        if newline < 0 and start > 0:
+                            return body[-CUT_BYTES:]
+                        return body[newline + 1:][:CUT_BYTES]
+                    sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
+                    s, p1, p2 = (last_line(path).decode("utf-8", "surrogateescape") for path in sys.argv[1:4])
+                    print(wa.annotation("notice", wa.render("[#6344] progress | serial: {s} | parallel_1: {p1} | parallel_2: {p2}", s=s, p1=p1, p2=p2), max_chars=2 * wa.MAX_ANNOTATION_CHARS), flush=True)' "$sd/serial.log" "$sd/parallel_1.log" "$sd/parallel_2.log" || { echo "[#6344] progress notice not written: python3 exited $?" >&2 || true; }
               done ) &
             hb=$!
             # Wait on each PID separately: a bare `wait` discards the exit codes.
@@ -2402,7 +2527,7 @@ jobs:
               if [ "${TIER:-sqlite}" = "enterprise-fed" ]; then
                 run_sharded "full suite (sharded cargo test)" 1
               else
-                run_tests "full suite (cargo test)" $FEAT $TAIL
+                run_sqlite_full_suite
               fi
               ;;
             *)
@@ -2417,13 +2542,13 @@ jobs:
                 done
                 run_sharded "impact-selected (sharded: ${TEST_IMPACT})" 0 "${ARGS[@]}"
               else
-                run_tests "cargo test --lib" $FEAT --lib $TAIL
+                SUITE_MARGIN_GATE=1 run_tests "cargo test --lib" $FEAT --lib $TAIL
                 # Dispatch each impacted tests/*.rs binary
                 ARGS=()
                 for t in "${impact_words[@]}"; do
                   ARGS+=(--test "$t")
                 done
-                run_tests "impact-selected integration binaries (${TEST_IMPACT})" $FEAT "${ARGS[@]}" $TAIL
+                SUITE_MARGIN_GATE=1 run_tests "impact-selected integration binaries (${TEST_IMPACT})" $FEAT "${ARGS[@]}" $TAIL
               fi
               ;;
           esac
