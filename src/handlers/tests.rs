@@ -4697,8 +4697,10 @@ async fn http_sync_since_empty_since_string_treated_as_full_snapshot() {
 async fn http_sync_since_records_peer_via_observe() {
     // #1789 — downstream-intent test; opt back to permissive enrollment.
     let _fed = PermissiveFedEnv::new();
-    // Hitting sync_since with a `peer=` param and an X-Agent-Id header
-    // exercises the side-effect sync_state_observe write path.
+    // Hitting sync_since with a `peer=` param and an X-Agent-Id header but
+    // no signature and no cert binding: the pull is served, and (#9596)
+    // the side-effect sync_state_observe write is skipped because no
+    // authenticated peer exists to key the clock row on.
     let state = test_state();
     let _id = insert_test_memory(&state, "sync-peer", "row").await;
     let app = Router::new()
@@ -4715,6 +4717,15 @@ async fn http_sync_since_records_peer_via_observe() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+    let lock = state.lock().await;
+    let rows: i64 = lock
+        .0
+        .query_row("SELECT COUNT(*) FROM sync_state", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        rows, 0,
+        "#9596: an unauthenticated pull records no clock row"
+    );
 }
 
 // ---- Capabilities + session_start + taxonomy ----
