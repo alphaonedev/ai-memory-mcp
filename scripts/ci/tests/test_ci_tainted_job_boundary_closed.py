@@ -967,6 +967,42 @@ NON_STRICT_OFF_LIST = (
 )
 
 
+# 9566: the class a step with an unread command takes, by carrier.
+UNREAD_CARRIER_CLASS = {"step secret": "i", "write scope": "ii", "id token": "ii"}
+# The UNREAD_FORMS rows that leave a reason on ctx.unread (the last two run or change the base tree).
+UNREAD_TAINT_FORMS = UNREAD_FORMS[:-2]
+UNREAD_SCRIPT_ACTION = "reactivecircus/android-emulator-runner@v2"
+
+
+class UnreadStepIsATaintStep(unittest.TestCase):
+    """9566: _analyse_step carries ctx.unread, and a step with any unread command is a taint step."""
+
+    def test_9566_step_facts_carry_the_unread_reasons(self) -> None:
+        _need_module(self)
+        step = tb._Step(UNREAD_STEP, {"run": "nfpm package; gh codespace x"}, 0)
+        facts = tb._analyse_step(step, {}, {}, set(), False, False)
+        self.assertEqual(facts.unread, [NO_WORD.format(word="nfpm"),
+                                        "gh subcommand 'codespace' is not on the closed list"])
+        clean = tb._analyse_step(tb._Step(UNREAD_STEP, {"run": "echo ok"}, 0), {}, {}, set(), False, False)
+        self.assertEqual(clean.unread, [])
+        # The script input of an action is read by the same reader and carries its unread reasons.
+        scripted = tb._Step(UNREAD_STEP, {"uses": UNREAD_SCRIPT_ACTION, "with": {"script": "nfpm package"}}, 0)
+        self.assertEqual(tb._analyse_step(scripted, {}, {}, set(), False, False).unread,
+                         [NO_WORD.format(word="nfpm")])
+
+    def test_9566_unread_step_takes_the_class_of_its_carrier(self) -> None:
+        _need_module(self)
+        for event in UNREAD_EVENTS:
+            for carrier, perms, env in UNREAD_CARRIERS:
+                for run, _ in UNREAD_TAINT_FORMS:
+                    with self.subTest(event=event, carrier=carrier, run=run):
+                        result = _scan(_unread_workflow(event, perms, env, run))
+                        klass = UNREAD_CARRIER_CLASS[carrier]
+                        self.assertEqual(result.verdicts.get((SYNTH, JOB)), klass)
+                        self.assertEqual(result.taint_steps.get((SYNTH, JOB)), UNREAD_STEP)
+                        self.assertEqual([(v.step, v.klass) for v in result.violations], [(UNREAD_STEP, klass)])
+
+
 class NonStrictUnreadWords(unittest.TestCase):
     """9566: _dispatch records a word off the closed list and a handler refusal on ctx.unread."""
 

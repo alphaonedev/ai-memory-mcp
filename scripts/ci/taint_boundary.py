@@ -3726,6 +3726,8 @@ class _StepFacts:
     event_text: bool = False
     tree_change: bool = False
     pr_fetch: bool = False
+    # 9566: what a non-strict job could not read in this step; a step with any is a taint step.
+    unread: list[str] = field(default_factory=list)
 
 
 def _analyse_step(step: _Step, job: dict[str, object], doc: dict[str, object], job_events: set[str],
@@ -3758,6 +3760,7 @@ def _analyse_step(step: _Step, job: dict[str, object], doc: dict[str, object], j
             ctx = _shell_ctx(env, job_events, strict, body.get(COMPOSITE_MARK))
             facts.runs_pr_code = _shell_runs_pr_code(_joined(script, MARK), ctx)
             facts.tree_change, facts.pr_fetch = ctx.tree_change, ctx.pr_fetch
+            facts.unread = list(ctx.unread)
             return facts
         if known.pr_code:
             facts.runs_pr_code = not known.pr_code_unless or \
@@ -3776,6 +3779,7 @@ def _analyse_step(step: _Step, job: dict[str, object], doc: dict[str, object], j
     ctx = _shell_ctx(env, job_events, strict, body.get(COMPOSITE_MARK))
     facts.runs_pr_code = _shell_runs_pr_code(_joined(run, MARK), ctx)
     facts.tree_change, facts.pr_fetch = ctx.tree_change, ctx.pr_fetch
+    facts.unread = list(ctx.unread)
     return facts
 
 
@@ -3890,7 +3894,8 @@ def _analyse_job_steps(wf: str, job_id: str, job: dict[str, object], doc: dict[s
         if taint is None:
             event_text = facts.event_text and bool(job_events & (PR_EVENTS | {CALL_EVENT}))
             env_write = ENV_FILE_WRITE_RE.search(_dump([body.get("run"), body.get("with")])) is not None
-            if event_text or (pr_tree and (env_write or facts.runs_pr_code)):
+            # 9566: a step the reader could not read in full is taken as running unknown code.
+            if event_text or (pr_tree and (env_write or facts.runs_pr_code)) or bool(facts.unread):
                 taint = step
         if facts.pr_fetch or (facts.tree_change and job_events & PR_EVENTS):
             pr_tree = True
