@@ -846,12 +846,20 @@ fn apply_all_classes(
         let (source_cid, target_cid): (Option<String>, Option<String>) =
             if crate::config::lineage_dag_enabled() {
                 (
-                    link.source_cid
-                        .clone()
-                        .or_else(|| crate::storage::read_memory_cid(conn, &link.source_id)),
-                    link.target_cid
-                        .clone()
-                        .or_else(|| crate::storage::read_memory_cid(conn, &link.target_id)),
+                    link.source_cid.clone().map_or_else(
+                        || {
+                            crate::storage::read_memory_cid(conn, &link.source_id)
+                                .with_context(|| link_read_context(link, LINK_END_SOURCE))
+                        },
+                        |c| Ok(Some(c)),
+                    )?,
+                    link.target_cid.clone().map_or_else(
+                        || {
+                            crate::storage::read_memory_cid(conn, &link.target_id)
+                                .with_context(|| link_read_context(link, LINK_END_TARGET))
+                        },
+                        |c| Ok(Some(c)),
+                    )?,
                 )
             } else {
                 (None, None)
@@ -1778,6 +1786,22 @@ fn memory_row_exists(conn: &Connection, id: &str) -> Result<bool> {
         |r| r.get(0),
     )
     .with_context(|| format!("import: endpoint-presence probe for memory {id}"))
+}
+
+/// Which endpoint of a bundle link a backfill cid read was for.
+const LINK_END_SOURCE: &str = "source";
+const LINK_END_TARGET: &str = "target";
+
+/// #9435 code r1 — the context of a failed backfill cid read names the link
+/// (source id, target id, relation) and the endpoint, so the operator can
+/// find the row that stopped the import.
+fn link_read_context(link: &crate::models::MemoryLink, end: &str) -> String {
+    format!(
+        "import link {}->{} ({}): read {end} cid",
+        link.source_id,
+        link.target_id,
+        link.relation.as_str()
+    )
 }
 
 /// Pre-ship 3x7 HIGH-1 — re-derive a staged memory's attestation from what
