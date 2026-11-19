@@ -69,19 +69,21 @@ OPERAND_PARAM_REF = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*\}")
 KIND_UNCLASSIFIABLE = "unclassifiable"
 KIND_VIOLATION = "violation"
 KIND_NOT_ANALYSED = "not-analysed"
-OPEN_PIN = 47
+OPEN_PIN = 33
 NOT_ANALYSED_PIN = 3
-VIOLATION_PIN = 17
+VIOLATION_PIN = 33
 PIN_CEILINGS = {KIND_UNCLASSIFIABLE: OPEN_PIN, KIND_VIOLATION: VIOLATION_PIN, KIND_NOT_ANALYSED: NOT_ANALYSED_PIN}
 # The name each kind's table carries in a pin line.
 TABLE_NAMES = {KIND_UNCLASSIFIABLE: "unclassifiable", KIND_VIOLATION: "allow", KIND_NOT_ANALYSED: "not-analysed"}
-PINS_LINE = "unclassifiable 47; not-analysed 3; violation 17"
+PINS_LINE = "unclassifiable 33; not-analysed 3; violation 33"
 
 # The fixed issue set of each kind; a row naming any other value is a finding.
-# 9559, 9560 and 9561: the three issues of forms the merge of the chain tip brought (baseline of the landing tree).
-OPEN_ROW_ISSUES = frozenset(range(9533, 9540)) | frozenset(range(9544, 9550)) | frozenset({9559, 9560, 9561})
+# 9561: the issue of a form the merge of the chain tip brought (baseline of the landing tree); the pre-scan
+# of #9566 leaves no row of 9534, 9547, 9559 or 9560.
+OPEN_ROW_ISSUES = (frozenset({9533}) | frozenset(range(9535, 9540)) | frozenset({9544, 9545, 9546, 9548, 9549})
+                   | frozenset({9561}))
 NOT_ANALYSED_ROW_ISSUES = frozenset({9550, 9551, 9552})
-VIOLATION_ROW_ISSUES = frozenset({9454, 9455, 9456, 9471, 9553})
+VIOLATION_ROW_ISSUES = frozenset({9454, 9455, 9456, 9471, 9553, 9570})
 # Gate-step places (E-5, conductor's word b29): a change there needs the conductor's word. The
 # mark follows the place: the gate jobs of each workflow file and the one gate step of job check.
 GATE_JOBS = {"ci.yml": frozenset({"classify", "select", "ci-gate"}), "coverage.yml": frozenset({"classify"})}
@@ -253,7 +255,6 @@ INSERT_AT_END = "end"
 # The issue of each row group (FACTS groups, ruling f367b2f1): (form, operand or NO-CLASS reason).
 GROUP_ISSUES = {
     (FORM_NOT_LITERAL, "$BIN"): 9533,
-    (FORM_NOT_LISTED, "apt-get"): 9534,
     (FORM_NOT_LITERAL, "$PSQL"): 9535,
     (FORM_PY_MODULE, "os"): 9536,
     (FORM_PY_MODULE, "shutil"): 9536,
@@ -269,15 +270,7 @@ GROUP_ISSUES = {
     (FORM_NOT_LISTED, "swapon"): 9544,
     (FORM_NOT_LISTED, "mold"): 9545,
     (FORM_NOT_LISTED, "adb"): 9546,
-    (FORM_NOT_LISTED, "--test"): 9547,
-    (FORM_NOT_LISTED, "--lib"): 9547,
-    (FORM_NOT_LISTED, "--skip"): 9547,
     (FORM_NOT_LITERAL, "$TIMEOUT_BIN"): 9548,
-    (FORM_NOT_LITERAL, "$l"): 9548,
-    (FORM_NOT_LITERAL, "$tflag"): 9548,
-    (FORM_NOT_LITERAL, ELAPSED_OPERAND): 9559,
-    (FORM_NOT_LITERAL, "$line"): 9547,
-    (FORM_NOT_LISTED, "line"): 9560,
     (FORM_PY_MODULE, "stat"): 9536,
     (FORM_PY_MODULE, "workflow_annotation"): 9561,
     (FORM_NO_CLASS, "python code uses a dunder name"): 9549,
@@ -311,9 +304,9 @@ REMOVAL_RULE_PHRASES = (
     "each pin only goes down",
     "a pin above its ceiling in ``PIN_CEILINGS`` is a failure",
     "a pin that differs from its row count is a failure",
-    "Pins at PR 9508: unclassifiable 47, not-analysed 3, violation 17",
+    "Pins at PR 9508: unclassifiable 33, not-analysed 3, violation 33",
     "The pins are the baseline of the tree PR 9508 lands on",
-    "moved the unclassifiable pin 41 -> 47 once); after it lands they only go down",
+    "the pre-scan of #9566 moved it 47 -> 33 and the violation pin 17 -> 33 once); after it lands they only go down",
     "is a proof for what the scan reaches only",
     "the list behind these rows is NOT complete",
     "rest-not-analysed",
@@ -803,7 +796,7 @@ class KindsNeverMix(unittest.TestCase):
         _need_module(self)
         run, reason, note = BEHIND_SILENT[0]
         workflows = {SYNTH: _wf({JOB: [(STEP, run)]})}
-        as_open = _open(FORM_NO_CLASS, "--version", 9547, reason=reason)
+        as_open = _open(FORM_NO_CLASS, "--version", 9548, reason=reason)
         self.assertEqual(sorted(_problems(workflows, (as_open,))),
                          sorted([f"stale open row (no such form in the step): {SYNTH}/{JOB}/{STEP}",
                                  f"{NOT_ANALYSED_PREFIX}{_message(SYNTH, JOB, STEP, reason)}: {note}"]))

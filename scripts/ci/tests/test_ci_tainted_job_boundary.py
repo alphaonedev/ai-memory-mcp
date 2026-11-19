@@ -39,18 +39,21 @@ else:
     PYYAML_IMPORT_ERROR = ""
 
 # Three row kinds, three pins (FINAL efb2b9e8, correction 0773f6ce); each pin only goes down.
-# Kind violation: the 13 rows before PR 9508 plus 4 class (iii) rows of #9553.
-ALLOW_PIN_EXPECTED = 17
+# Kind violation: the 13 rows before PR 9508, 4 class (iii) rows of #9553 and the 16 release.yml
+# rows of #9570.
+ALLOW_PIN_EXPECTED = 33
 ALLOW_ROW_COUNT = 13
 NEW_VIOLATION_ROW_COUNT = 4
-OPEN_PIN_EXPECTED = 47
+RELEASE_ROW_COUNT = 16
+OPEN_PIN_EXPECTED = 33
 NOT_ANALYSED_PIN_EXPECTED = 3
 JOB_COUNT_LARGE = 200
 LARGE_SCAN_CEILING_S = 10.0
 RUN_TEXT_BYTES_LARGE = 120_000
 RUN_TEXT_CEILING_S = 5.0
-FIX_ISSUES = frozenset({9454, 9455, 9456, 9471, 9553})
+FIX_ISSUES = frozenset({9454, 9455, 9456, 9471, 9553, 9570})
 NEW_VIOLATION_ISSUE = 9553
+RELEASE_ISSUE = 9570
 RUNNER_ISSUE = 9455
 SYNTH = "synthetic.yml"
 # The step key of an R2 (iv) violation: the job's `runs-on`, not one of its steps.
@@ -717,10 +720,6 @@ SHELL_CASES = (
 # reason). Kind unclassifiable: 47 forms, one open row each; these jobs are NOT shown to hold the boundary.
 REAL_UNCLASSIFIABLE = (
     (
-        'batman-mode-acceptance.yml', 'bash-integration', 'Install sqlite3 + jq (bounded+retry',
-        "command word 'apt-get' is not on the closed command list",
-    ),
-    (
         'batman-mode-acceptance.yml', 'rust-integration', 'Assert binary refuses /tmp write under R001 end-to-end',
         "command word '$BIN' is not a literal word",
     ),
@@ -733,11 +732,6 @@ REAL_UNCLASSIFIABLE = (
         'cert-postgres-age.yml', 'cert-postgres-age',
         'Ensure AGE + vector extensions present (best-effort — tier is pre-provisioned)',
         "command word '$PSQL' is not a literal word",
-    ),
-    ('cert-postgres-age.yml', 'cert-postgres-age', 'Run', "command word '--test' is not on the closed command list"),
-    (
-        'ci.yml', 'check', 'Free disk before tests (hosted image only,',
-        "command word 'apt-get' is not on the closed command list",
     ),
     (
         'ci.yml', 'check', 'Free disk before tests (hosted image only,',
@@ -752,15 +746,8 @@ REAL_UNCLASSIFIABLE = (
         "command word 'swapon' is not on the closed command list",
     ),
     ('ci.yml', 'check', 'Run tests (impact-aware)', "command word '$TIMEOUT_BIN' is not a literal word"),
-    ('ci.yml', 'check', 'Run tests (impact-aware)', "command word '$l' is not a literal word"),
-    ('ci.yml', 'check', 'Run tests (impact-aware)', "command word '$tflag' is not a literal word"),
-    ('ci.yml', 'check', 'Run tests (impact-aware)', "command word '--lib' is not on the closed command list"),
-    ('ci.yml', 'check', 'Run tests (impact-aware)', "command word '--skip' is not on the closed command list"),
-    ('ci.yml', 'check', 'Run tests (impact-aware)', "command word '--test' is not on the closed command list"),
-    # The six forms the merge of chain tip 902faa04 brought into this step (baseline of the landing tree).
-    ('ci.yml', 'check', 'Run tests (impact-aware)', "command word '${elapsed}$\\\\t${label}' is not a literal word"),
-    ('ci.yml', 'check', 'Run tests (impact-aware)', "command word '$line' is not a literal word"),
-    ('ci.yml', 'check', 'Run tests (impact-aware)', "command word 'line' is not on the closed command list"),
+    # The forms the merge of chain tip 902faa04 brought into this step (baseline of the landing tree)
+    # that the pre-scan of #9566 still reaches.
     ('ci.yml', 'check', 'Run tests (impact-aware)', "python module 'os' is not on the closed module list"),
     ('ci.yml', 'check', 'Run tests (impact-aware)', "python module 'stat' is not on the closed module list"),
     (
@@ -816,10 +803,6 @@ REAL_UNCLASSIFIABLE = (
     ),
     (
         'coverage.yml', 'per-module-thresholds', 'Free disk + add swap (#1148 belt-and-suspenders, aggressive)',
-        "command word 'apt-get' is not on the closed command list",
-    ),
-    (
-        'coverage.yml', 'per-module-thresholds', 'Free disk + add swap (#1148 belt-and-suspenders, aggressive)',
         "command word 'fallocate' is not on the closed command list",
     ),
     (
@@ -829,14 +812,6 @@ REAL_UNCLASSIFIABLE = (
     (
         'coverage.yml', 'per-module-thresholds', 'Free disk + add swap (#1148 belt-and-suspenders, aggressive)',
         "command word 'swapon' is not on the closed command list",
-    ),
-    (
-        'coverage.yml', 'per-module-thresholds', 'Install jq + postgresql-client (bounded+retry',
-        "command word 'apt-get' is not on the closed command list",
-    ),
-    (
-        'coverage.yml', 'per-module-thresholds', 'Install mold linker (#1148, pinned+bounded',
-        "command word 'apt-get' is not on the closed command list",
     ),
     (
         'coverage.yml', 'per-module-thresholds', 'Install mold linker (#1148, pinned+bounded',
@@ -890,8 +865,83 @@ REAL_NEW_VIOLATIONS = (
     ),
     ('coverage.yml', 'classify', 'id:cls', 'iii', 'job output set at or after pull-request code ran'),
 )
+# The violations of release.yml reached once the pre-scan of #9566 reads every run step of a
+# job in full: (workflow, job, step label, class, detail); kind violation, #9570, no gate step.
+REAL_RELEASE_VIOLATIONS = (
+    ('release.yml', 'copr', 'Build source RPM', 'i', 'secret or token used after pull-request code ran'),
+    ('release.yml', 'copr', 'Configure copr-cli', 'i', 'secret or token used after pull-request code ran'),
+    (
+        'release.yml', 'crates-io', 'Publish to crates.io (with retry)', 'i',
+        'secret or token used after pull-request code ran',
+    ),
+    (
+        'release.yml', 'homebrew', 'Checkout Homebrew tap', 'i',
+        'checkout keeps the token in the workspace for later pull-request code',
+    ),
+    (
+        'release.yml', 'homebrew', 'Checkout Homebrew tap', 'i',
+        'secret held before pull-request code ran can persist into it',
+    ),
+    (
+        'release.yml', 'homebrew', 'Download release assets, verify, and pin SHA256', 'i',
+        'secret held before pull-request code ran can persist into it',
+    ),
+    (
+        'release.yml', 'mobile-android', 'Attest build provenance (Android JNI bundle)', 'i',
+        'secret or token used after pull-request code ran',
+    ),
+    (
+        'release.yml', 'mobile-android', 'Attest build provenance (Android JNI bundle)', 'ii',
+        'job token has a write scope',
+    ),
+    (
+        'release.yml', 'mobile-android', 'Upload to GitHub Release', 'i',
+        'secret or token used after pull-request code ran',
+    ),
+    (
+        'release.yml', 'mobile-ios', 'Attest build provenance (iOS xcframework)', 'i',
+        'secret or token used after pull-request code ran',
+    ),
+    ('release.yml', 'mobile-ios', 'Attest build provenance (iOS xcframework)', 'ii', 'job token has a write scope'),
+    ('release.yml', 'mobile-ios', 'Upload to GitHub Release', 'i', 'secret or token used after pull-request code ran'),
+    (
+        'release.yml', 'preflight', 'Refuse when no tag ruleset protects v* tags', 'i',
+        'secret or token used after pull-request code ran',
+    ),
+    (
+        'release.yml', 'preflight', 'Verify the tag (annotated, SSH-signed by an enrolled release key)', 'iii',
+        'job output set at or after pull-request code ran',
+    ),
+    ('release.yml', 'qualify', 'Qualify the tagged SHA', 'i', 'secret or token used after pull-request code ran'),
+    (
+        'release.yml', 'release', 'Attest build provenance (release binaries + packages)', 'i',
+        'secret or token used after pull-request code ran',
+    ),
+    (
+        'release.yml', 'release', 'Attest build provenance (release binaries + packages)', 'ii',
+        'job token has a write scope',
+    ),
+    ('release.yml', 'release', 'Create GitHub Release', 'i', 'secret or token used after pull-request code ran'),
+    (
+        'release.yml', 'sbom', 'Attest build provenance (CycloneDX SBOM)', 'i',
+        'secret or token used after pull-request code ran',
+    ),
+    ('release.yml', 'sbom', 'Attest build provenance (CycloneDX SBOM)', 'ii', 'job token has a write scope'),
+    ('release.yml', 'sbom', 'Upload to GitHub Release', 'i', 'secret or token used after pull-request code ran'),
+)
+REAL_RELEASE_VERDICTS = {
+    ('release.yml', 'copr'): 'i',
+    ('release.yml', 'crates-io'): 'i',
+    ('release.yml', 'homebrew'): 'i',
+    ('release.yml', 'mobile-android'): 'i,ii',
+    ('release.yml', 'mobile-ios'): 'i,ii',
+    ('release.yml', 'preflight'): 'i,iii',
+    ('release.yml', 'qualify'): 'i',
+    ('release.yml', 'release'): 'i,ii',
+    ('release.yml', 'sbom'): 'i,ii',
+}
 REAL_UNCLASSIFIABLE_JOBS = frozenset((wf, job) for wf, job, _, _ in REAL_UNCLASSIFIABLE)
-REAL_FORM_JOB_COUNT = 11
+REAL_FORM_JOB_COUNT = 10
 PRUNE_STEP = "Prune stale runner TMPDIR (#8634)"
 WORKFLOW_CALL_ONLY = "workflow_call-only workflow has no caller in this repository"
 
@@ -1160,13 +1210,17 @@ class AllowTable(unittest.TestCase):
     def test_9452_real_allow_table_is_pinned_and_names_fix_issues(self) -> None:
         _need_module(self)
         self.assertEqual(tb.TAINT_ALLOW_PIN, ALLOW_PIN_EXPECTED)
-        self.assertEqual(len(tb.TAINT_ALLOW), ALLOW_ROW_COUNT + NEW_VIOLATION_ROW_COUNT)
+        self.assertEqual(len(tb.TAINT_ALLOW), ALLOW_ROW_COUNT + NEW_VIOLATION_ROW_COUNT + RELEASE_ROW_COUNT)
         self.assertEqual(len(tb.TAINT_ALLOW), ALLOW_PIN_EXPECTED)
         self.assertEqual((tb.OPEN_ROW_PIN, tb.NOT_ANALYSED_PIN), (OPEN_PIN_EXPECTED, NOT_ANALYSED_PIN_EXPECTED))
         self.assertEqual({row.issue for row in tb.TAINT_ALLOW}, FIX_ISSUES)
         new = [r for r in tb.TAINT_ALLOW if r.issue == NEW_VIOLATION_ISSUE]
         self.assertEqual(sorted((r.workflow, r.job, r.step, r.classes) for r in new),
                          sorted((wf, job, step, (klass,)) for wf, job, step, klass, _ in REAL_NEW_VIOLATIONS))
+        release = [r for r in tb.TAINT_ALLOW if r.issue == RELEASE_ISSUE]
+        self.assertEqual(len(release), RELEASE_ROW_COUNT)
+        self.assertEqual({(r.workflow, r.job, r.step, k) for r in release for k in r.classes},
+                         {(wf, job, step, klass) for wf, job, step, klass, _ in REAL_RELEASE_VIOLATIONS})
         # The mark follows the place: the rows in a gate job (ci.yml classify, select; coverage.yml
         # classify) are gate steps, the 9454 row in ci.yml classify among them; no other row is.
         gate_places = ({(wf, job, step) for wf, job, step, _, _ in REAL_NEW_VIOLATIONS}
@@ -1389,6 +1443,17 @@ class RealWorkflows(unittest.TestCase):
         self.assertEqual(problems, sorted(f"violation class ({klass}) without an allow row: {wf}/{job}/{step}: {detail}"
                                           for wf, job, step, klass, detail in REAL_NEW_VIOLATIONS))
 
+    def test_9566_without_the_release_rows_each_release_violation_is_a_finding(self) -> None:
+        _need_module(self)
+        workflows, actions, files = _real()
+        result = tb.scan_texts(workflows, actions, files)
+        old = tuple(r for r in tb.TAINT_ALLOW if r.issue != RELEASE_ISSUE)
+        problems = tb.check(result, old, len(old), tb.OPEN_ROWS, tb.OPEN_ROW_PIN, tb.NOT_ANALYSED_ROWS,
+                            tb.NOT_ANALYSED_PIN)
+        # The check orders its lines by place, class and detail.
+        self.assertEqual(problems, [f"violation class ({klass}) without an allow row: {wf}/{job}/{step}: {detail}"
+                                    for wf, job, step, klass, detail in sorted(REAL_RELEASE_VIOLATIONS)])
+
     def test_9452_every_allow_row_names_a_real_step(self) -> None:
         _need_module(self)
         for row in tb.TAINT_ALLOW:
@@ -1452,7 +1517,7 @@ class RealWorkflows(unittest.TestCase):
             ("c8-precheck.yml", "required-contexts-gate"): "i",
             ("postgres-ignored.yml", "postgres-ignored"): "i,iv",
             ("session-boot-lifetime.yml", "lifetime-tests"): "iv",
-        } | {key: "unclassifiable" for key in REAL_UNCLASSIFIABLE_JOBS})
+        } | REAL_RELEASE_VERDICTS | {key: "unclassifiable" for key in REAL_UNCLASSIFIABLE_JOBS})
 
     def test_9452_real_unclassifiable_forms_are_exactly_the_listed_findings(self) -> None:
         _need_module(self)

@@ -47,7 +47,7 @@ SCAN_CEILING_S = 5.0
 ADVERSARIAL_BYTES = 120_000
 MAX_NESTING = 64
 MAX_YAML_BYTES = 8 * 1024 * 1024
-FIX_ISSUES = frozenset({9454, 9455, 9456, 9471, 9553})
+FIX_ISSUES = frozenset({9454, 9455, 9456, 9471, 9553, 9570})
 UNCLASSIFIABLE_PREFIX = "unclassifiable: "
 # The hosted job and step that already run the scripts/ci unit tests (I-6).
 HOST_WORKFLOW = "ci.yml"

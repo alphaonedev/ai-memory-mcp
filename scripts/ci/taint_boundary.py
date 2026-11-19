@@ -26,10 +26,11 @@ exactly when its place is a gate step (``gate_step_of``: a gate job in ``GATE_JO
 in ``GATE_STEPS``), whatever its issue: a change there needs the conductor's word.
 Removal rule: the fix PR of an issue deletes its rows and lowers that kind's pin in the same
 commit; each pin only goes down, a pin above its ceiling in ``PIN_CEILINGS`` is a failure and
-a pin that differs from its row count is a failure. Pins at PR 9508: unclassifiable 47,
-not-analysed 3, violation 17 (the 13 rows before PR 9508 and 4 rows of #9553). The pins are the
-baseline of the tree PR 9508 lands on (the merge of chain tip 902faa04 moved the unclassifiable
-pin 41 -> 47 once); after it lands they only go down. The fixpoint proof
+a pin that differs from its row count is a failure. Pins at PR 9508: unclassifiable 33,
+not-analysed 3, violation 33 (the 13 rows before PR 9508, 4 rows of #9553 and 16 rows of #9570).
+The pins are the baseline of the tree PR 9508 lands on (the merge of chain tip 902faa04 moved the
+unclassifiable pin 41 -> 47 once; the pre-scan of #9566 moved it 47 -> 33 and the violation pin
+17 -> 33 once); after it lands they only go down. The fixpoint proof
 (all rows applied: zero findings; any one row removed: exactly that form or line) is a proof for
 what the scan reaches only. A test makes no network call: the
 conductor checks that every cited issue is open at each landing of a fix of these issues, and
@@ -187,6 +188,7 @@ class AllowRow:
 # The six hits of the survey at a028c45e, the six host-credential reads and the R2 row of
 # lifetime-tests (ruling abf38892 section 7). Removing a row is the fix lane's job; adding a
 # row needs an issue number from the deputy (the pin moves with it).
+_RELEASE = "release.yml"
 TAINT_ALLOW: tuple[AllowRow, ...] = (
     # In gate job classify of ci.yml: a gate step (the mark follows the place).
     AllowRow("ci.yml", "classify", "id:impact", (CLASS_GATE_OUTPUT,), 9454, True),
@@ -217,11 +219,33 @@ TAINT_ALLOW: tuple[AllowRow, ...] = (
     AllowRow("ci.yml", "select", "Select jobs", (CLASS_GATE_OUTPUT,), 9553, True),
     AllowRow("ci.yml", "select", "Select the full matrix (base selector unavailable)", (CLASS_GATE_OUTPUT,), 9553, True),
     AllowRow("coverage.yml", "classify", "id:cls", (CLASS_GATE_OUTPUT,), 9553, True),
+    # #9570: the release jobs of release.yml, reached once the pre-scan of #9566 reads every run
+    # step of a job in full (no row covers these places before it); no gate step.
+    AllowRow(_RELEASE, 'copr', 'Build source RPM', (CLASS_SECRET,), 9570),
+    AllowRow(_RELEASE, 'copr', 'Configure copr-cli', (CLASS_SECRET,), 9570),
+    AllowRow(_RELEASE, 'crates-io', 'Publish to crates.io (with retry)', (CLASS_SECRET,), 9570),
+    AllowRow(_RELEASE, 'homebrew', 'Checkout Homebrew tap', (CLASS_SECRET,), 9570),
+    AllowRow(_RELEASE, 'homebrew', 'Download release assets, verify, and pin SHA256', (CLASS_SECRET,), 9570),
+    AllowRow(_RELEASE, 'mobile-android', 'Attest build provenance (Android JNI bundle)',
+             (CLASS_SECRET, CLASS_WRITE_TOKEN), 9570),
+    AllowRow(_RELEASE, 'mobile-android', 'Upload to GitHub Release', (CLASS_SECRET,), 9570),
+    AllowRow(_RELEASE, 'mobile-ios', 'Attest build provenance (iOS xcframework)',
+             (CLASS_SECRET, CLASS_WRITE_TOKEN), 9570),
+    AllowRow(_RELEASE, 'mobile-ios', 'Upload to GitHub Release', (CLASS_SECRET,), 9570),
+    AllowRow(_RELEASE, 'preflight', 'Refuse when no tag ruleset protects v* tags', (CLASS_SECRET,), 9570),
+    AllowRow(_RELEASE, 'preflight', 'Verify the tag (annotated, SSH-signed by an enrolled release key)',
+             (CLASS_GATE_OUTPUT,), 9570),
+    AllowRow(_RELEASE, 'qualify', 'Qualify the tagged SHA', (CLASS_SECRET,), 9570),
+    AllowRow(_RELEASE, 'release', 'Attest build provenance (release binaries + packages)',
+             (CLASS_SECRET, CLASS_WRITE_TOKEN), 9570),
+    AllowRow(_RELEASE, 'release', 'Create GitHub Release', (CLASS_SECRET,), 9570),
+    AllowRow(_RELEASE, 'sbom', 'Attest build provenance (CycloneDX SBOM)', (CLASS_SECRET, CLASS_WRITE_TOKEN), 9570),
+    AllowRow(_RELEASE, 'sbom', 'Upload to GitHub Release', (CLASS_SECRET,), 9570),
 )
-TAINT_ALLOW_PIN = 17
+TAINT_ALLOW_PIN = 33
 # The open fix issues a violation row may name (the fixed set of that kind); a row naming any
 # other value is a finding.
-FIX_ISSUES = frozenset({9454, 9455, 9456, 9471, 9553})
+FIX_ISSUES = frozenset({9454, 9455, 9456, 9471, 9553, 9570})
 
 # The four form classes a row may name; a form of no class is named by NO-CLASS and its reason.
 FORM_COMMAND_NOT_LITERAL = "command-word-not-literal"
@@ -240,15 +264,15 @@ FORM_TEMPLATES = {
 QUOTED_RE = re.compile(r"'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\"|`[^`]*`")
 NO_OPERAND = "-"
 # The fixed issue sets per kind (ruling f367b2f1 and FINAL 0773f6ce).
-# 9559 (the array append SUITE_SECONDS+=), 9560 (command word 'line' of a local declaration) and
 # 9561 (python module workflow_annotation) came with the baseline of the landing tree (merge of
-# chain tip 902faa04).
-OPEN_ROW_LANDING_TREE_ISSUES = frozenset({9559, 9560, 9561})
-OPEN_ROW_ISSUES = frozenset(range(9533, 9540)) | frozenset(range(9544, 9550)) | OPEN_ROW_LANDING_TREE_ISSUES
+# chain tip 902faa04). The pre-scan of #9566 leaves no row of 9534, 9547, 9559 or 9560.
+OPEN_ROW_LANDING_TREE_ISSUES = frozenset({9561})
+OPEN_ROW_ISSUES = (frozenset({9533}) | frozenset(range(9535, 9540)) | frozenset({9544, 9545, 9546, 9548, 9549})
+                   | OPEN_ROW_LANDING_TREE_ISSUES)
 NOT_ANALYSED_ROW_ISSUES = frozenset({9550, 9551, 9552})
 NOT_ANALYSED_MARKER = "rest-not-analysed"
 # Each pin only goes down; a pin above its ceiling is a failure.
-PIN_CEILINGS = {KIND_UNCLASSIFIABLE: 47, KIND_VIOLATION: 17, KIND_NOT_ANALYSED: 3}
+PIN_CEILINGS = {KIND_UNCLASSIFIABLE: 33, KIND_VIOLATION: 33, KIND_NOT_ANALYSED: 3}
 # Characters no workflow, job, step or operand of a row may hold: a row names one place.
 ROW_GLOB_CHARS = frozenset("*?[]{}")
 # A braced parameter reference of one plain name, the only brace an operand may hold: the shell
@@ -351,28 +375,14 @@ _PY, _IP = FORM_PY_MODULE, FORM_INTERP_PATH
 # NOT shown to hold the boundary. A fix PR of an issue deletes its rows and lowers
 # OPEN_ROW_PIN in the same commit.
 OPEN_ROWS: tuple[OpenRow, ...] = (
-    _o(_BATMAN, "bash-integration", "Install sqlite3 + jq (bounded+retry", _NC, "apt-get", 9534),
     _o(_BATMAN, "rust-integration", "Assert binary refuses /tmp write under R001 end-to-end", _NL, "$BIN", 9533),
     _o(_CERT, _CERT[:-4], "Assert certified stack versions (cert evidence, hard-fail on drift)", _NL, "$PSQL", 9535),
     _o(_CERT, _CERT[:-4], "Ensure AGE + vector extensions present (best-effort — tier is pre-provisioned)", _NL,
        "$PSQL", 9535),
-    _o(_CERT, _CERT[:-4], "Run", _NC, "--test", 9547),
-    _o(_CI, "check", _CHECK_FREE, _NC, "apt-get", 9534),
     _o(_CI, "check", _CHECK_FREE, _NC, "fallocate", 9544),
     _o(_CI, "check", _CHECK_FREE, _NC, "mkswap", 9544),
     _o(_CI, "check", _CHECK_FREE, _NC, "swapon", 9544),
     _o(_CI, "check", _CHECK_RUN, _NL, "$TIMEOUT_BIN", 9548),
-    _o(_CI, "check", _CHECK_RUN, _NL, "$l", 9548),
-    _o(_CI, "check", _CHECK_RUN, _NL, "$tflag", 9548),
-    # The operand is the inside of the repr the scanner prints (its one backslash shows as two),
-    # so the reason is spelled out rather than built by repr a second time.
-    OpenRow(_CI, "check", _CHECK_RUN, _NL, _ELAPSED, f"command word '{_ELAPSED}' is not a literal word", 9559,
-            gate_step_of(_CI, "check", _CHECK_RUN)),
-    _o(_CI, "check", _CHECK_RUN, _NL, "$line", 9547),
-    _o(_CI, "check", _CHECK_RUN, _NC, "--lib", 9547),
-    _o(_CI, "check", _CHECK_RUN, _NC, "--skip", 9547),
-    _o(_CI, "check", _CHECK_RUN, _NC, "--test", 9547),
-    _o(_CI, "check", _CHECK_RUN, _NC, "line", 9560),
     _o(_CI, "check", _CHECK_RUN, _PY, "os", 9536),
     _o(_CI, "check", _CHECK_RUN, _PY, "stat", 9536),
     _o(_CI, "check", _CHECK_RUN, _PY, "workflow_annotation", 9561),
@@ -390,12 +400,9 @@ OPEN_ROWS: tuple[OpenRow, ...] = (
     _o(_CI, "select", "Select jobs", _IP, "$RUNNER_TEMP/impact-base/impact/select.py", 9537),
     _o(_CI, "select", "Select the full matrix (base selector unavailable)", _PY, "os", 9536),
     _o(_COV, "classify", "id:cls", _IP, "$trust_impact/cargo_skip.py", 9537),
-    _o(_COV, _PMT, _COV_SWAP, _NC, "apt-get", 9534),
     _o(_COV, _PMT, _COV_SWAP, _NC, "fallocate", 9544),
     _o(_COV, _PMT, _COV_SWAP, _NC, "mkswap", 9544),
     _o(_COV, _PMT, _COV_SWAP, _NC, "swapon", 9544),
-    _o(_COV, _PMT, _COV_JQ, _NC, "apt-get", 9534),
-    _o(_COV, _PMT, _COV_MOLD, _NC, "apt-get", 9534),
     _o(_COV, _PMT, _COV_MOLD, _NC, "mold", 9545),
     _o(_MOBILE, _ANDROID, "Boot Android emulator + run tests", _NC, "adb", 9546),
     _o(_MOBILE, _ANDROID, "Enable KVM", _NC, "udevadm", 9539),
@@ -403,7 +410,7 @@ OPEN_ROWS: tuple[OpenRow, ...] = (
     _o(_MOBILE, _IOS, "Run mobile_runtime tests on iOS Simulator", _NC, "xcrun", 9538),
     _o(_MOBILE, _IOS, "Shut down simulator", _NC, "xcrun", 9538),
 )
-OPEN_ROW_PIN = 47
+OPEN_ROW_PIN = 33
 # Kind not-analysed: one row per form that stops the rest of its command or substitution. The
 # list of forms behind these rows is NOT complete: the checker does not read that text.
 NOT_ANALYSED_ROWS: tuple[NotAnalysedRow, ...] = (
