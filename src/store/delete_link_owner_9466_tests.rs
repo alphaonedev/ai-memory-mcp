@@ -25,6 +25,7 @@
 use crate::models::{ConfidenceSource, Memory, MemoryLink, Tier};
 use crate::store::{
     DELETE_LINK_ENDPOINT_SOURCE, DELETE_LINK_ENDPOINT_TARGET, DELETE_LINK_UNREADABLE_OWNER,
+    StoreError, StoreResult,
 };
 use std::sync::Mutex;
 
@@ -317,12 +318,9 @@ pub(crate) fn edge(source_id: &str, target_id: &str) -> MemoryLink {
 }
 
 /// Judge one case's outcome. `edges_after` is the `memory_links` row count
-/// for the pair after the call. `Err(reason)` names what went wrong.
-pub(crate) fn judge(
-    case: &Case,
-    got: &crate::store::StoreResult<bool>,
-    edges_after: i64,
-) -> Result<(), String> {
+/// for the pair after the call. A wrong outcome is
+/// [`StoreError::IntegrityFailed`] whose `detail` names what went wrong.
+pub(crate) fn judge(case: &Case, got: &StoreResult<bool>, edges_after: i64) -> StoreResult<()> {
     let ok = match (case.expect, got) {
         (Expect::Removed, Ok(true)) => edges_after == 0,
         (Expect::Kept, Ok(false)) => edges_after == 1,
@@ -334,12 +332,14 @@ pub(crate) fn judge(
     if ok {
         Ok(())
     } else {
-        Err(format!(
-            "{}: expected {:?}, got {:?} with {edges_after} edge(s) left",
-            case.name,
-            case.expect,
-            got.as_ref().map_err(ToString::to_string)
-        ))
+        Err(StoreError::IntegrityFailed {
+            detail: format!(
+                "{}: expected {:?}, got {:?} with {edges_after} edge(s) left",
+                case.name,
+                case.expect,
+                got.as_ref().map_err(ToString::to_string)
+            ),
+        })
     }
 }
 

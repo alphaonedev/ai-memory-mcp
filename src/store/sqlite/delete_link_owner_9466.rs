@@ -121,8 +121,8 @@ async fn delete_link_owner_table_sqlite_9466() {
             .delete_link(&case.caller.ctx(), &source_id, &target_id)
             .await;
         let left = edge_count(&store, &source_id, &target_id).await;
-        if let Err(reason) = judge(case, &got, left) {
-            failures.push(reason);
+        if let Err(mismatch) = judge(case, &got, left) {
+            failures.push(mismatch.to_string());
         }
     }
     assert!(
