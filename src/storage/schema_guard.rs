@@ -480,6 +480,17 @@ pub fn schema_behind_repair(backend: &str) -> &'static str {
     }
 }
 
+/// v1.0.0 #9557 — the repair clause of a schema-behind text for `backend`
+/// (red-commit form: the old if/else selection; B2 replaces it).
+#[must_use]
+pub fn schema_behind_repair_clause(backend: &str) -> String {
+    format!(
+        "Repair: `{}` or {}",
+        schema_behind_repair(backend),
+        SCHEMA_BEHIND_REPAIR_DAEMON
+    )
+}
+
 /// Companion repair: starting the daemon runs [`crate::db::open`], which
 /// migrates. Named next to [`SCHEMA_BEHIND_REPAIR`] because the default
 /// build has no `migrate` subcommand (`Migrate` is `--features sal`).
@@ -993,38 +1004,77 @@ mod tests {
         );
     }
 
-    /// v1.0.0 #9504 — pin the schema-behind remedy text per backend. The
-    /// expected strings are spelled out here (not built from the production
-    /// constants) so a change of either backend's remedy fails this cell.
+    /// The repair clause of the sqlite schema-behind refusal, built from the
+    /// two constants (the verb word is pinned as an exact text in the 9435
+    /// provenance cells and by the CLI parse cell, not here).
+    fn want_repair_sqlite_9504() -> String {
+        format!("Repair: `{SCHEMA_BEHIND_REPAIR}` or {SCHEMA_BEHIND_REPAIR_DAEMON}")
+    }
+    /// The repair clause of the postgres schema-behind refusal.
+    const WANT_REPAIR_POSTGRES_9504: &str =
+        "Repair: `ai-memory schema-init --store-url <url>` or start the daemon";
+    /// The repair clause for a backend label this binary does not know: it names
+    /// no repair command and says the backend is not known.
+    const WANT_REPAIR_UNKNOWN_9504: &str =
+        "Repair: the backend is not known, so no repair command is named; start the daemon";
+
+    /// Which repair clause a backend label must get.
+    #[derive(Clone, Copy)]
+    enum Want9504 {
+        Sqlite,
+        Postgres,
+        Unknown,
+    }
+
+    /// v1.0.0 #9504 / #9557 B2 B3 — the schema-behind refusal text for EVERY
+    /// backend value: the two real labels, near-miss spellings of each (case,
+    /// spaces, prefix, suffix) and the empty and foreign labels. Only the exact
+    /// label gets its backend's verb; anything else gets the neutral text. The
+    /// postgres arm is proved at the renderer only (the one production
+    /// constructor, `open_existing_read_only`, passes the sqlite label).
     #[test]
     fn schema_behind_remedy_text_is_per_backend_9504() {
+        const TABLE: &[(&str, Want9504)] = &[
+            (BACKEND_SQLITE, Want9504::Sqlite),
+            (BACKEND_POSTGRES, Want9504::Postgres),
+            ("SQLite", Want9504::Unknown),
+            ("SQLITE", Want9504::Unknown),
+            (" sqlite", Want9504::Unknown),
+            ("sqlite ", Want9504::Unknown),
+            ("sqlite3", Want9504::Unknown),
+            ("sqlit", Want9504::Unknown),
+            ("xsqlite", Want9504::Unknown),
+            ("Postgres", Want9504::Unknown),
+            ("POSTGRES", Want9504::Unknown),
+            ("postgresql", Want9504::Unknown),
+            ("postgres ", Want9504::Unknown),
+            (" postgres", Want9504::Unknown),
+            ("postgre", Want9504::Unknown),
+            ("pg", Want9504::Unknown),
+            ("", Want9504::Unknown),
+            ("mysql", Want9504::Unknown),
+        ];
         let supported = crate::storage::migrations::current_schema_version();
         let observed = supported - 1;
         let bin = crate::PKG_VERSION;
-        let sqlite = SchemaBehindReadOnly::new(observed, BACKEND_SQLITE, "/db").detail;
-        assert_eq!(
-            sqlite,
-            format!(
-                "{SCHEMA_BEHIND_READ_ONLY_REFUSAL}: database schema is BEHIND this binary: /db \
-                 (sqlite) is on schema v{observed}, but ai-memory {bin} is at v{supported}. \
-                 This read-only verb will not migrate. Repair: `ai-memory migrate --in-place` \
-                 or start the daemon, then re-run."
-            )
-        );
-        let postgres = SchemaBehindReadOnly::new(observed, BACKEND_POSTGRES, "pg").detail;
-        assert_eq!(
-            postgres,
-            format!(
-                "{SCHEMA_BEHIND_READ_ONLY_REFUSAL}: database schema is BEHIND this binary: pg \
-                 (postgres) is on schema v{observed}, but ai-memory {bin} is at v{supported}. \
-                 This read-only verb will not migrate. Repair: \
-                 `ai-memory schema-init --store-url <url>` or start the daemon, then re-run."
-            )
-        );
-        assert!(
-            !postgres.contains("migrate --in-place"),
-            "the sqlite in-place verb must not be offered on postgres: {postgres}"
-        );
+        for (label, want) in TABLE {
+            let repair = match want {
+                Want9504::Sqlite => want_repair_sqlite_9504(),
+                Want9504::Postgres => WANT_REPAIR_POSTGRES_9504.to_string(),
+                Want9504::Unknown => WANT_REPAIR_UNKNOWN_9504.to_string(),
+            };
+            let got = SchemaBehindReadOnly::new(observed, *label, "/db").detail;
+            assert_eq!(
+                got,
+                format!(
+                    "{SCHEMA_BEHIND_READ_ONLY_REFUSAL}: database schema is BEHIND this binary: \
+                     /db ({label}) is on schema v{observed}, but ai-memory {bin} is at \
+                     v{supported}. This read-only verb will not migrate. {repair}, then \
+                     re-run."
+                ),
+                "label {label:?}"
+            );
+        }
     }
 
     /// #9435 alerts 905-907 (A-3) - the `Display` text of every
