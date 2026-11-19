@@ -143,8 +143,7 @@ jobs:
     # about skip=satisfied on fork PRs. Not a matrix (rule (b1) does not
     # apply).
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    # #9593: 60 -> 120; the two compile steps wait up to 3600 s for a host-semaphore slot, so the cap is the old 60 + that 60.
-    timeout-minutes: 120
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -345,37 +344,6 @@ jobs:
             ${CERT_EXPECTED_PGVECTOR_VERSION}*) echo "pgvector $vec_ver == certified ${CERT_EXPECTED_PGVECTOR_VERSION} OK" ;;
             *) echo "::error::expected pgvector exactly ${CERT_EXPECTED_PGVECTOR_VERSION} (certified, deploy/docker-1461/provision/lib.sh PGVECTOR_APT_VERSION), got '$vec_ver' — CI must not certify a version it does not run (§5.4(3))"; exit 1 ;;
           esac
-
-      # #9593 - the two compiles of this job (the sal-postgres test binaries
-      # and the `ai-memory` binary of the bootstrap-cert gate) take a slot of
-      # the same host semaphore as the Check linux-fed leg (ci.yml "Run tests
-      # (impact-aware)": name linux-fed-tests, 2 slots, wait 3600 s), one hold
-      # per compile, each freed before any test runs. The `--test` list below
-      # must stay equal to the TESTS array of the run step (a unit test pins it).
-      - name: Compile the cert binaries under the host semaphore (#9593)
-        run: |
-          set -euo pipefail
-          python3 -I scripts/ci/host_semaphore.py --name linux-fed-tests --slots 2 --max-wait-secs 3600 --label "cert-postgres-age/compile-tests" -- cargo test --features sal-postgres --no-run \
-            --test secret_screen_postgres_parity_g29 \
-            --test postgres_l2_rehydration_1693 \
-            --test erasure_fanout_postgres_g30 \
-            --test recall_purity_p01_postgres \
-            --test qual_pg_write_funnel_parity_2393_2397 \
-            --test store_parity_gaps \
-            --test age_cypher_param_binding_2511 \
-            --test kg_query_relation_parity_2792 \
-            --test g2_postgres_find_paths_age_param_binding \
-            --test g4_postgres_link_projects_into_age_graph \
-            --test g5_find_paths_cte_served_on_age \
-            --test kg_age_fallback \
-            --test kg_age_orphan_graph_3883 \
-            --test age_cte_equivalence \
-            --test issue_1482_age_cypher_persistent \
-            --test pillar4_4c_deferred_age_cold_path_1735 \
-            --test pillar4_4d_age_unprojection_on_delete_1783 \
-            --test age_deferred_projection_cluster_2375_2376_2377 \
-            --test bootstrap_node_cert_gate_3016
-          python3 -I scripts/ci/host_semaphore.py --name linux-fed-tests --slots 2 --max-wait-secs 3600 --label "cert-postgres-age/compile-bin" -- cargo build --features sal-postgres --bin ai-memory
 
       - name: Run #[ignore]-gated pg + AGE cells against the certified stack
         run: |

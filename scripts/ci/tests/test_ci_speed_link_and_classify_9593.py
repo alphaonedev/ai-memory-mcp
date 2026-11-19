@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 """Workflow wiring invariants for the CI speed change of #9593.
 
-Class: three changes that must leave the set of tests and the set of reported check names
+Class: the changes that must leave the set of tests and the set of reported check names
 unchanged (invariant for every push):
   (a) debuginfo is off on the self-hosted linux-fed enterprise-fed Check leg ONLY;
-  (b) the compiles of cert-postgres-age.yml and postgres-ignored.yml run under the same host
-      semaphore as that Check leg, and the Check leg's own hold is not changed;
   (c) the scripts/ci unit-test step lives in exactly one job that is no `needs` ancestor of any
       Check leg, runs on every push and carries no path filter or job-level `if:`.
   (d) the job ids and names of ci.yml equal the list pinned from the base (6c67b17b7).
@@ -17,28 +15,20 @@ Run: python3 -m unittest discover -s scripts/ci/tests
 Python 3.9+, standard library only (the workflows are read as text).
 """
 import re
-import sys
 import unittest
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[3]
 WORKFLOWS = REPO / ".github" / "workflows"
-sys.path.insert(0, str(REPO / "scripts" / "ci"))
-import host_semaphore  # noqa: E402
 
 CI = "ci.yml"
-CERT = "cert-postgres-age.yml"
-PGI = "postgres-ignored.yml"
 LINUX_FED_LEG = "linux-fed,enterprise-fed"
 OTHER_CHECK_LEGS = ("ubuntu-latest,sqlite", "macos-fed,sqlite", "macos-fed,enterprise-fed")
 DEBUG_KEY = "cargo_debug"
 DEBUG_EXPR = "${{ matrix.cargo_debug || 'line-tables-only' }}"
-SEMAPHORE_NAME = "linux-fed-tests"
 UNIT_COMMAND = "python3 -m unittest discover -s scripts/ci/tests"
 UNIT_JOB = "build-script-vetting"
 UNIT_STEP = "Shard partition and wiring unit tests (#6344)"
-# A wait of 3600 s is a term of every job cap that takes the slot.
-CAP_MINUTES_BEFORE = {CERT: 60, PGI: 120}
 # Job id -> `name:` of ci.yml at the base 6c67b17b7, in file order.
 PINNED_JOBS = (
     ("select", "Impact selection"),
@@ -177,65 +167,6 @@ def problems_debuginfo(workflows: dict) -> list:
 
 
 # ---------------------------------------------------------------------------------------
-# (b) the two compiles under the same host semaphore
-# ---------------------------------------------------------------------------------------
-
-def _held_lines(text: str, name: str) -> list:
-    return [line.strip() for line in step_run(text, name).split("\n") if "host_semaphore.py" in line]
-
-
-def _flag(line: str, flag: str) -> str:
-    match = re.search(r"%s (\S+)" % re.escape(flag), line)
-    return match.group(1) if match else ""
-
-
-def _test_list(text: str) -> list:
-    return re.findall(r"--test (\S+)", text)
-
-
-def problems_semaphore(workflows: dict) -> list:
-    out: list = []
-    ci_wait = re.search(r"HOST_SEMAPHORE_MAX_WAIT_SECS: '(\d+)'", workflows[CI])
-    wait = ci_wait.group(1) if ci_wait else ""
-    ci_tests = step_run(workflows[CI], "Run tests (impact-aware)")
-    if "--name %s --slots" % SEMAPHORE_NAME not in ci_tests:
-        out.append("ci.yml Run tests (impact-aware): the Check leg must keep the %s semaphore" % SEMAPHORE_NAME)
-    for wf, step, builds in (
-        (PGI, "Compile the ignored-test binaries under the host semaphore (#9593)", ("cargo test --features sal-postgres --no-run",)),
-        (CERT, "Compile the cert binaries under the host semaphore (#9593)",
-         ("cargo test --features sal-postgres --no-run", "cargo build --features sal-postgres --bin ai-memory")),
-    ):
-        text = workflows[wf]
-        lines = _held_lines(text, step)
-        if len(lines) != len(builds):
-            out.append("%s: step %r must hold %d semaphore call(s), found %d" % (wf, step, len(builds), len(lines)))
-            continue
-        for line, build in zip(lines, builds):
-            if _flag(line, "--name") != SEMAPHORE_NAME:
-                out.append("%s: step %r must use the semaphore name %s" % (wf, step, SEMAPHORE_NAME))
-            if _flag(line, "--slots") != str(host_semaphore.SEMAPHORE_SLOTS_DEFAULT):
-                out.append("%s: step %r must use the Check leg slot count %d" % (wf, step, host_semaphore.SEMAPHORE_SLOTS_DEFAULT))
-            if _flag(line, "--max-wait-secs") != wait:
-                out.append("%s: step %r must use the Check leg wait %s s" % (wf, step, wait))
-            if build not in line:
-                out.append("%s: step %r must hold %r" % (wf, step, build))
-        position = text.find("      - name: %s\n" % step)
-        first_run = text.find("-- --ignored" if wf == PGI else "-- --include-ignored")
-        if position < 0 or first_run < 0 or position > first_run:
-            out.append("%s: step %r must come before the first test run" % (wf, step))
-        match = re.search(r"^    timeout-minutes: (\d+)$", text, re.M)
-        floor = CAP_MINUTES_BEFORE[wf] + int(wait or "0") // 60
-        if not match or int(match.group(1)) < floor:
-            out.append("%s: the job cap must be at least %d min (old cap plus the semaphore wait)" % (wf, floor))
-    cert_run = workflows[CERT]
-    held = _test_list(step_run(cert_run, "Compile the cert binaries under the host semaphore (#9593)"))
-    run = _test_list(step_run(cert_run, "Run #[ignore]-gated pg + AGE cells against the certified stack"))
-    if not held or held != run:
-        out.append("cert-postgres-age.yml: the compile --test list must equal the TESTS array of the run step")
-    return out
-
-
-# ---------------------------------------------------------------------------------------
 # (c) the unit-test step: one job, no path to a Check leg, every push
 # ---------------------------------------------------------------------------------------
 
@@ -289,9 +220,6 @@ class RealFiles(unittest.TestCase):
     def test_9593_debuginfo_off_on_the_linux_fed_leg_only(self):
         self.assertEqual(problems_debuginfo(real_workflows()), [])
 
-    def test_9593_both_compiles_go_through_the_check_leg_semaphore(self):
-        self.assertEqual(problems_semaphore(real_workflows()), [])
-
     def test_9593_unit_test_step_is_in_one_job_with_no_path_to_a_check_leg(self):
         self.assertEqual(problems_unit_placement(real_workflows()), [])
 
@@ -323,26 +251,6 @@ class BrokenCopies(unittest.TestCase):
         workflows["coverage.yml"] += "\n# cargo_debug\n"
         self.assertEqual(problems_debuginfo(workflows),
                          ["coverage.yml: release-shaped and coverage builds must not use cargo_debug"])
-
-    def test_pg_ignored_compile_outside_the_semaphore(self):
-        workflows = self._broken(
-            PGI, 'python3 -I scripts/ci/host_semaphore.py --name linux-fed-tests --slots 2 --max-wait-secs 3600 --label "postgres-ignored/compile" -- ', "")
-        self.assertEqual(problems_semaphore(workflows), [
-            "postgres-ignored.yml: step 'Compile the ignored-test binaries under the host semaphore (#9593)' "
-            "must hold 1 semaphore call(s), found 0"])
-
-    def test_cert_wait_differs_from_the_check_leg(self):
-        workflows = self._broken(
-            CERT, '--max-wait-secs 3600 --label "cert-postgres-age/compile-bin"',
-            '--max-wait-secs 60 --label "cert-postgres-age/compile-bin"')
-        self.assertEqual(problems_semaphore(workflows), [
-            "cert-postgres-age.yml: step 'Compile the cert binaries under the host semaphore (#9593)' "
-            "must use the Check leg wait 3600 s"])
-
-    def test_cert_test_list_drift(self):
-        workflows = self._broken(CERT, "            --test kg_age_fallback \\\n", "")
-        self.assertEqual(problems_semaphore(workflows),
-                         ["cert-postgres-age.yml: the compile --test list must equal the TESTS array of the run step"])
 
     def test_unit_step_back_in_classify(self):
         workflows = real_workflows()
