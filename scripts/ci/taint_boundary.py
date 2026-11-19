@@ -327,10 +327,6 @@ _CHECK_FREE = "Free disk before tests (hosted image only,"
 _CHECK_RUN = "Run tests (impact-aware)"
 # The operand of the array append SUITE_SECONDS+=("${elapsed}"$'\t'"${label}") as form_class reads it.
 _ELAPSED = r"${elapsed}$\\t${label}"
-# The python module the shared annotation loader of scripts/ci loads, named here only as the operand
-# of one open row. The loader-shape cell of 9365 reads every non-docstring string that names that
-# module as a load of it, so the operand is built from its two words, never held as one string.
-_SHARED_ANNOTATION_MODULE = "_".join(("workflow", "annotation"))
 _GATE_MAT = "Materialise the base gate (#8240)"
 _SEL_MAT = "Materialise the base selector (#8240)"
 _COV_SWAP = "Free disk + add swap (#1148 belt-and-suspenders, aggressive)"
@@ -369,7 +365,7 @@ OPEN_ROWS: tuple[OpenRow, ...] = (
     _o(_CI, "check", _CHECK_RUN, _NC, "line", 9560),
     _o(_CI, "check", _CHECK_RUN, _PY, "os", 9536),
     _o(_CI, "check", _CHECK_RUN, _PY, "stat", 9536),
-    _o(_CI, "check", _CHECK_RUN, _PY, _SHARED_ANNOTATION_MODULE, 9561),
+    _o(_CI, "check", _CHECK_RUN, _PY, "workflow_annotation", 9561),
     _o(_CI, "ci-gate", "Fold job results (base gate)", _IP, "$RUNNER_TEMP/impact-base/impact/gate.py", 9537),
     OpenRow(_CI, "ci-gate", _GATE_MAT, FORM_NO_CLASS, NO_OPERAND, _DUNDER, 9549, True),
     _o(_CI, "ci-gate", _GATE_MAT, _PY, "os", 9536),
