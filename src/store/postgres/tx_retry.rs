@@ -553,7 +553,7 @@ mod tests {
     /// It polls a catalog view against a deadline rather than sleeping a
     /// guessed interval, so a slow host makes the test slower, never flaky.
     #[cfg(test)]
-    async fn await_pending_lock(pool: &sqlx::PgPool, relation: &str) -> Result<(), String> {
+    async fn await_pending_lock(pool: &sqlx::PgPool, relation: &str) -> anyhow::Result<()> {
         let deadline = tokio::time::Instant::now() + SETUP_WAIT_DEADLINE;
         loop {
             let waiting: i64 = sqlx::query_scalar(
@@ -564,12 +564,12 @@ mod tests {
             .bind(relation)
             .fetch_one(pool)
             .await
-            .map_err(|e| format!("{SETUP_ERROR}: pg_locks probe failed: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("{SETUP_ERROR}: pg_locks probe failed: {e}"))?;
             if waiting > 0 {
                 return Ok(());
             }
             if tokio::time::Instant::now() >= deadline {
-                return Err(format!(
+                return Err(anyhow::anyhow!(
                     "{SETUP_ERROR}: no session ever queued a lock request on {relation}"
                 ));
             }
@@ -639,7 +639,7 @@ mod tests {
             // stopped it), then requests r1 only once the funnel reports it
             // HOLDS r1.
             let (peer_ready_tx, peer_ready_rx) =
-                tokio::sync::oneshot::channel::<Result<(), String>>();
+                tokio::sync::oneshot::channel::<anyhow::Result<()>>();
             let (funnel_holds_r1_tx, funnel_holds_r1_rx) = tokio::sync::oneshot::channel::<()>();
             let peer = tokio::spawn(async move {
                 let prepared: Result<_, String> = async {
@@ -671,7 +671,7 @@ mod tests {
                         tx
                     }
                     Err(setup) => {
-                        let _ = peer_ready_tx.send(Err(setup.clone()));
+                        let _ = peer_ready_tx.send(Err(anyhow::anyhow!("{setup}")));
                         return Err(setup);
                     }
                 };
