@@ -37,6 +37,13 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
+/// #9367 — THE production view of a source file for every lib source pin: the
+/// ONE resolver the integration-test structural gates already share
+/// (#4198/#4200), included here with `#[path]`, never copied, so a lib pin
+/// and an integration-test pin cannot disagree on what is test-only.
+#[path = "../tests/common/cfg_test_modules.rs"]
+pub(crate) mod cfg_test_modules;
+
 /// Process-wide lock serialising every test that mutates an environment
 /// variable in-process, so `set_var`'s single-threaded contract holds and no
 /// test observes another's transient env state.

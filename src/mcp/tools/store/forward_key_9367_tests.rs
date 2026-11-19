@@ -27,6 +27,16 @@ use std::io::{Read as _, Write as _};
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
+// The production text every source pin of this file scans comes from the ONE
+// resolver the tree's structural gates share (#4198/#4200,
+// tests/common/cfg_test_modules.rs, included by `crate::test_support` with
+// `#[path]`, never copied): every inline `cfg(test)` module body is removed, a
+// `#[cfg(test)]` on one item or statement inside production code is kept, and
+// a file its parent declares test-only is not production.
+use crate::test_support::cfg_test_modules::{
+    cfg_test_declared_files, production_sources, strip_cfg_test_inline_mods,
+};
+
 /// The env var the forwarder reads (the #3781 bind-api-key channel).
 const KEY_FILE_ENV: &str = "AI_MEMORY_AGENT_API_KEY_FILE";
 /// The bind-api-key lax-perms hatch; it must NOT open the forwarder.
@@ -629,92 +639,9 @@ fn keyed_forward_without_explicit_identity_is_refused_9367() {
     assert!(drain(&rx).is_empty(), "no request left the process");
 }
 
-/// The production text of one Rust source file, the text every source pin of
-/// this file scans: every line outside the file's test modules, each kept line
-/// followed by `\n`. A test module is `mod tests {` or a module with a body
-/// whose attribute run holds `#[cfg(test)]` / `#[cfg(all(test, ...))]`; it
-/// ends at the first line that is its own indentation plus `}` (rustfmt
-/// layout). A `#[cfg(test)]` on one item or statement inside production code
-/// (an out-of-line `mod x;` included) is kept and does not end the scan. A
-/// file whose leading inner attributes hold `#![cfg(test)]` has no production
-/// text. An unclosed test module keeps the rest of the file: the pin then
-/// scans more, never less. One pass over the lines, linear in the input.
-fn production_text(src: &str) -> String {
-    let lines: Vec<&str> = src.lines().collect();
-    for line in lines.iter().map(|l| l.trim()) {
-        if line.is_empty() || line.starts_with("//") {
-            continue;
-        }
-        if line == "#![cfg(test)]" {
-            return String::new();
-        }
-        if !line.starts_with("#![") {
-            break;
-        }
-    }
-    let is_test_cfg = |t: &str| t == "#[cfg(test)]" || t.starts_with("#[cfg(all(test,");
-    let is_attr_or_doc = |t: &str| t.starts_with("#[") || t.starts_with("//");
-    let opens_mod_body = |t: &str| {
-        let decl = t
-            .strip_prefix("pub(crate) ")
-            .or_else(|| t.strip_prefix("pub(super) "))
-            .or_else(|| t.strip_prefix("pub "))
-            .unwrap_or(t);
-        decl.starts_with("mod ") && decl.ends_with('{')
-    };
-    let mut out = String::with_capacity(src.len());
-    let mut i = 0;
-    while i < lines.len() {
-        let trimmed = lines[i].trim();
-        // The first line of a test module region and the line of its `mod`.
-        let region = if trimmed == "mod tests {" {
-            Some(i)
-        } else if is_test_cfg(trimmed) {
-            let mut j = i + 1;
-            while j < lines.len() && is_attr_or_doc(lines[j].trim()) {
-                j += 1;
-            }
-            if j < lines.len() && opens_mod_body(lines[j].trim()) {
-                Some(j)
-            } else {
-                // Lines i..j are attributes or docs; any test cfg among them
-                // reaches the same line j, so none of them opens a region.
-                for line in &lines[i..j] {
-                    out.push_str(line);
-                    out.push('\n');
-                }
-                i = j;
-                continue;
-            }
-        } else {
-            None
-        };
-        if let Some(mod_line) = region {
-            let decl = lines[mod_line];
-            let indent = &decl[..decl.len() - decl.trim_start().len()];
-            let close = (mod_line + 1..lines.len())
-                .find(|&k| lines[k].trim_end().strip_prefix(indent) == Some("}"));
-            if let Some(k) = close {
-                i = k + 1;
-                continue;
-            }
-            for line in &lines[i..] {
-                out.push_str(line);
-                out.push('\n');
-            }
-            return out;
-        }
-        out.push_str(lines[i]);
-        out.push('\n');
-        i += 1;
-    }
-    out
-}
-
-/// Whether the production text of one source file builds an HTTP client.
-fn builds_http_client(src: &str) -> bool {
-    let prod = production_text(src);
-    prod.contains("reqwest::blocking::Client") || prod.contains("reqwest::Client")
+/// Whether one file's production text builds an HTTP client.
+fn builds_http_client(production: &str) -> bool {
+    production.contains("reqwest::blocking::Client") || production.contains("reqwest::Client")
 }
 
 /// K-6 — the three forward sites go through the one funnel: the production
@@ -722,8 +649,7 @@ fn builds_http_client(src: &str) -> bool {
 /// funnel three times; no other file under src/mcp builds an HTTP client.
 #[test]
 fn every_forward_site_goes_through_the_one_funnel_9367() {
-    let src = include_str!("transport.rs");
-    let production = production_text(src);
+    let production = strip_cfg_test_inline_mods(include_str!("transport.rs"));
     assert_eq!(
         production.matches("forward_to_http(").count(),
         2,
@@ -734,23 +660,12 @@ fn every_forward_site_goes_through_the_one_funnel_9367() {
         4,
         "forward_as_agent: the definition plus the three forward sites"
     );
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcp");
-    let mut stack = vec![root];
-    let mut builders = Vec::new();
-    while let Some(dir) = stack.pop() {
-        for entry in std::fs::read_dir(&dir).expect("read src/mcp") {
-            let path = entry.expect("entry").path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if path.extension().is_some_and(|e| e == "rs") {
-                let text = std::fs::read_to_string(&path).expect("read source");
-                if builds_http_client(&text) {
-                    builders.push(path.display().to_string());
-                }
-            }
-        }
-    }
-    builders.sort();
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let builders: Vec<String> = production_sources(root)
+        .into_iter()
+        .filter(|(rel, prod)| rel.starts_with("src/mcp/") && builds_http_client(prod))
+        .map(|(rel, _)| rel)
+        .collect();
     assert_eq!(
         builders.len(),
         1,
@@ -763,9 +678,9 @@ fn every_forward_site_goes_through_the_one_funnel_9367() {
 }
 
 /// The cut table: (row, synthetic source, the production text it must give).
-/// Production text is every line outside the file's test modules; a
+/// Production text is every line outside the file's inline test modules; a
 /// `#[cfg(test)]` on one item or statement inside production code does not
-/// end it; a `#![cfg(test)]` file has none.
+/// end it; a module the resolver cannot prove test-only is kept (scan more).
 const CUT_TABLE: &[(&str, &str, &str)] = &[
     (
         "inner cfg(test) item, production after it",
@@ -788,9 +703,14 @@ const CUT_TABLE: &[(&str, &str, &str)] = &[
         "fn a() {}\nfn b() {}\n",
     ),
     (
-        "attributes and docs between cfg(test) and a named test module",
-        "#[cfg(test)]\n#[allow(clippy::too_many_lines)]\n/// doc\nmod k1_tests {\n    use super::*;\n}\nfn c() {}\n",
+        "attributes between cfg(test) and a named test module",
+        "#[cfg(test)]\n#[allow(clippy::too_many_lines)]\nmod k1_tests {\n    use super::*;\n}\nfn c() {}\n",
         "fn c() {}\n",
+    ),
+    (
+        "a doc line between cfg(test) and the module keeps it (scan more)",
+        "#[cfg(test)]\n/// doc\nmod k1_tests {\n    fn t() {}\n}\n",
+        "#[cfg(test)]\n/// doc\nmod k1_tests {\n    fn t() {}\n}\n",
     ),
     (
         "out-of-line test module declaration, production after it",
@@ -798,19 +718,14 @@ const CUT_TABLE: &[(&str, &str, &str)] = &[
         "#[cfg(test)]\n#[path = \"x_tests.rs\"]\nmod x_tests;\nfn d() {}\n",
     ),
     (
-        "a test-only file as a whole",
-        "// header\n//! doc\n\n#![cfg(test)]\nfn e() {}\n",
-        "",
-    ),
-    (
         "no test module gives the whole file",
         "fn f() {}\nfn g() {}\n",
         "fn f() {}\nfn g() {}\n",
     ),
     (
-        "mod tests without the attribute",
+        "mod tests without cfg(test) is compiled, so it is production",
         "fn a() {}\nmod tests {\n    fn t() {}\n}\n",
-        "fn a() {}\n",
+        "fn a() {}\nmod tests {\n    fn t() {}\n}\n",
     ),
     (
         "test module gated on all(test, feature)",
@@ -823,14 +738,14 @@ const CUT_TABLE: &[(&str, &str, &str)] = &[
         "mod inner {\n    fn p() {}\n    fn q() {}\n}\n",
     ),
     (
+        "a brace in a string inside the test module does not end it",
+        "#[cfg(test)]\nmod tests {\n    const S: &str = \"}\";\n}\nfn b() {}\n",
+        "fn b() {}\n",
+    ),
+    (
         "cfg(not(test)) module is production",
         "#[cfg(not(test))]\nmod real {\n    fn r() {}\n}\n",
         "#[cfg(not(test))]\nmod real {\n    fn r() {}\n}\n",
-    ),
-    (
-        "an unclosed test module keeps the rest (scan more, never less)",
-        "fn a() {}\n#[cfg(test)]\nmod tests {\n    fn t() {}\nfn b() {}\n",
-        "fn a() {}\n#[cfg(test)]\nmod tests {\n    fn t() {}\nfn b() {}\n",
     ),
 ];
 
@@ -840,59 +755,92 @@ const CUT_TABLE: &[(&str, &str, &str)] = &[
 fn production_text_is_everything_outside_the_test_modules_9367() {
     let wrong: Vec<String> = CUT_TABLE
         .iter()
-        .filter(|(_, src, want)| production_text(src) != *want)
-        .map(|(row, src, want)| format!("{row}: got {:?}, want {want:?}", production_text(src)))
+        .filter(|(_, src, want)| strip_cfg_test_inline_mods(src) != *want)
+        .map(|(row, src, want)| {
+            format!(
+                "{row}: got {:?}, want {want:?}",
+                strip_cfg_test_inline_mods(src)
+            )
+        })
         .collect();
     assert!(wrong.is_empty(), "production text mismatch: {wrong:#?}");
 }
 
+/// An unclosed test module is never stripped to the end of the file (that
+/// would hide every production line after it): the resolver refuses.
+#[test]
+#[should_panic(expected = "never closes")]
+fn an_unclosed_test_module_fails_closed_9367() {
+    let _ = strip_cfg_test_inline_mods(
+        "fn a() {}\n#[cfg(test)]\nmod tests {\n    fn t() {}\nfn b() {}\n",
+    );
+}
+
 /// A client constructor placed after a test-only seam statement in a
 /// production fn is seen by the K-6 scan; a constructor only in the test
-/// module, or in a test-only file, is not.
+/// module, or in a file its parent declares test-only, is not.
 #[test]
 fn k6_scan_sees_a_client_after_an_inner_cfg_test_item_9367() {
     let hidden = "fn seam_host() {\n    #[cfg(test)]\n    seam::fire();\n}\nfn later() {\n    let _c = reqwest::blocking::Client::builder();\n}\n#[cfg(test)]\nmod tests {\n    fn t() {}\n}\n";
     assert!(
-        builds_http_client(hidden),
+        builds_http_client(&strip_cfg_test_inline_mods(hidden)),
         "a client built after an inner #[cfg(test)] item is production and the K-6 scan must see it"
     );
     let test_only =
         "fn p() {}\n#[cfg(test)]\nmod tests {\n    fn t() { let _ = reqwest::Client::new(); }\n}\n";
     assert!(
-        !builds_http_client(test_only),
+        !builds_http_client(&strip_cfg_test_inline_mods(test_only)),
         "a client built only in the test module is not production"
     );
-    let test_file = "//! doc\n#![cfg(test)]\nfn t() { let _ = reqwest::Client::new(); }\n";
+    let files: Vec<(String, String)> = [
+        ("src/lib.rs", "mod mcp;\n"),
+        ("src/mcp.rs", "mod a;\n#[cfg(test)]\nmod a_tests;\n"),
+        ("src/mcp/a.rs", "pub fn a() {}\n"),
+        (
+            "src/mcp/a_tests.rs",
+            "#![cfg(test)]\nfn t() { let _ = reqwest::Client::new(); }\n",
+        ),
+    ]
+    .iter()
+    .map(|(p, s)| ((*p).to_string(), (*s).to_string()))
+    .collect();
+    let test_only_files = cfg_test_declared_files(&files);
     assert!(
-        !builds_http_client(test_file),
-        "a client built in a #![cfg(test)] file is not production"
+        test_only_files.contains("src/mcp/a_tests.rs"),
+        "a file its parent declares #[cfg(test)] is test-only, so its client is not production: {test_only_files:?}"
+    );
+    assert!(
+        !test_only_files.contains("src/mcp/a.rs"),
+        "a plainly declared module is production: {test_only_files:?}"
     );
 }
 
 /// Lines of the large synthetic source for the cut's time bound (100K+).
 const CUT_LARGE_LINES: usize = 120_000;
-/// Wall-clock ceiling for cutting that source (a linear pass in a debug build).
+/// Wall-clock ceiling for cutting that source (a debug build).
 const CUT_CEILING: Duration = Duration::from_secs(5);
 
-/// The cut is linear: a long run of `#[cfg(test)]` lines with no module after
-/// them, then an unclosed test module, is cut inside the ceiling and keeps
-/// every line.
+/// The cut is linear in the source: production text holding
+/// {CUT_LARGE_LINES} lines of inner `#[cfg(test)]` items, then one test module
+/// of {CUT_LARGE_LINES} lines, is cut inside the ceiling and keeps every
+/// production line.
 #[test]
 fn production_text_is_linear_on_a_large_source_9367() {
-    let mut src = "#[cfg(test)]\n".repeat(CUT_LARGE_LINES);
-    src.push_str("fn after_the_run() {}\n");
-    src.push_str("#[cfg(test)]\nmod tests {\n");
-    src.push_str(&"    fn t() {}\n".repeat(CUT_LARGE_LINES));
+    let production = "#[cfg(test)]\nfn seam() {}\n".repeat(CUT_LARGE_LINES / 2) + "fn after() {}\n";
+    let src = format!(
+        "{production}#[cfg(test)]\nmod tests {{\n{}}}\n",
+        "    fn t() {}\n".repeat(CUT_LARGE_LINES)
+    );
     let started = Instant::now();
-    let prod = production_text(&src);
+    let prod = strip_cfg_test_inline_mods(&src);
     let elapsed = started.elapsed();
     assert!(
         elapsed < CUT_CEILING,
-        "cutting {CUT_LARGE_LINES}-line runs took {elapsed:?}, ceiling {CUT_CEILING:?}"
+        "cutting a {CUT_LARGE_LINES}-line source took {elapsed:?}, ceiling {CUT_CEILING:?}"
     );
     assert!(
-        prod == src,
-        "an unclosed test module keeps every line (the {CUT_LARGE_LINES}-line source was cut)"
+        prod == production,
+        "every production line and no test-module line is kept (the {CUT_LARGE_LINES}-line source was cut wrong)"
     );
 }
 
@@ -906,7 +854,7 @@ fn reader_and_env_names_live_in_the_one_neutral_module_9367() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let prod = |rel: &str| -> String {
         let text = std::fs::read_to_string(root.join(rel)).expect("read source");
-        production_text(&text)
+        strip_cfg_test_inline_mods(&text)
     };
     let neutral = prod("src/agent_key_file.rs");
     for needle in [
