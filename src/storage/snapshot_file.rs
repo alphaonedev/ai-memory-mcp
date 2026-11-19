@@ -6,12 +6,17 @@
 //! `VACUUM INTO` creates its target with the process umask, so a snapshot of an
 //! owner-only (0600) database could land world-readable. The snapshot is a
 //! full copy of the durable tier and must be exactly as private as its source.
-//! The target is therefore created first, owner-only, with `create_new`
-//! (`O_EXCL`: never follows a planted symlink, never reuses a file), handed to
-//! `VACUUM INTO` as the empty file SQLite accepts, and only then settled to the
-//! source's permission bits. Any failure removes the file and surfaces as an
-//! error so the migration does not proceed without a private snapshot (fail
-//! closed). The same backup precedent is `backup.rs` `PRIVATE_FILE_MODE`.
+//! [`vacuum_into_private`] therefore fills an owner-only file staged in a
+//! private (0700) directory ([`stage_beside`]), settles the source's permission
+//! bits through the staged HANDLE, and publishes it by a no-replace link. Any
+//! failure removes the staged file and surfaces as an error so the migration
+//! does not proceed without a private snapshot (fail closed).
+//!
+//! #8950 - the same module is the ONE no-follow write path for a file the
+//! product creates at a predictable name ([`stage_beside`] then
+//! [`NoFollowStage::publish`]): nothing that sits at the destination name, a
+//! symlink above all, is ever followed, chmod-ed or replaced. Nothing here
+//! writes or chmods a final name BY NAME.
 
 use anyhow::{Context, Result};
 use std::path::Path;
@@ -23,44 +28,554 @@ const OWNER_ONLY_MODE: u32 = 0o600;
 #[cfg(unix)]
 const PERMISSION_BITS: u32 = 0o777;
 
-/// Create the empty snapshot target, owner-only, failing if it already exists.
-pub(super) fn create_private_target(target: &Path) -> Result<()> {
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(OWNER_ONLY_MODE);
-    }
-    options
-        .open(target)
-        .map(drop)
-        .with_context(|| format!("create pre-migration snapshot target {}", target.display()))
+/// The `what` of the pre-migration snapshot in every refusal.
+const PRE_MIGRATION_WHAT: &str = "pre-migration snapshot";
+
+/// `VACUUM INTO` the database behind `conn` as a NEW snapshot at `dest`
+/// (#8679 mode, #8950 no-follow): staged privately beside `dest`, filled by
+/// name only inside the private staging directory, the staged name proven to
+/// still be the staged file, the source's mode set through the handle,
+/// fsynced, then published without replacing anything at `dest`.
+///
+/// # Errors
+/// Something sits at `dest`, the stage, `VACUUM INTO`, mode, fsync or
+/// identity check fails, or the publish is refused.
+pub(super) fn vacuum_into_private(
+    conn: &rusqlite::Connection,
+    dest: &Path,
+    source: &Path,
+) -> Result<()> {
+    let stage = stage_beside(dest, PRE_MIGRATION_WHAT)?;
+    #[cfg(test)]
+    seam::fire(seam::Point::Fill, dest);
+    // Single-quote-escape the target for the SQL string literal (the path is
+    // crate-derived, but doubling quotes is the correct hygiene).
+    let staged = stage.path().to_string_lossy().replace('\'', "''");
+    conn.execute(&format!("VACUUM INTO '{staged}'"), [])
+        .with_context(|| format!("VACUUM INTO the staged {}", stage.path().display()))?;
+    #[cfg(test)]
+    seam::fire(seam::Point::Filled, dest);
+    stage.verify_identity()?;
+    settle_mode_to_source(stage.file(), source)?;
+    stage
+        .file()
+        .sync_all()
+        .with_context(|| format!("fsync {}", stage.path().display()))?;
+    drop(stage.publish()?);
+    Ok(())
 }
 
-/// Give the finished snapshot the source database's permission bits.
-///
-/// An unreadable source mode yields owner-only (the stricter answer).
-pub(super) fn settle_mode_to_source(target: &Path, source: &Path) -> Result<()> {
+/// Give the staged snapshot the source database's permission bits, through
+/// its HANDLE (`fchmod`), never by name. An unreadable source mode yields
+/// owner-only (the stricter answer). Non-unix: a no-op, the platform has no
+/// permission bits to copy (the file keeps the mode its create gave it).
+fn settle_mode_to_source(file: &std::fs::File, source: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let mode = std::fs::metadata(source).map_or(OWNER_ONLY_MODE, |meta| {
             meta.permissions().mode() & PERMISSION_BITS
         });
-        std::fs::set_permissions(target, std::fs::Permissions::from_mode(mode))
-            .with_context(|| format!("set pre-migration snapshot mode on {}", target.display()))?;
+        file.set_permissions(std::fs::Permissions::from_mode(mode))
+            .context("set pre-migration snapshot mode through its handle")?;
     }
     #[cfg(not(unix))]
     {
-        let _ = (target, source);
+        let _ = (file, source);
     }
     Ok(())
 }
 
-/// Best-effort removal of a half-made snapshot after a failure.
-pub(super) fn discard(target: &Path) {
-    // The error that made us discard is the one reported; a failed remove
-    // leaves at worst an owner-only empty or partial file (never world-readable).
-    let _ = std::fs::remove_file(target);
+// ---------------------------------------------------------------------------
+// v1.0.0 #8950 — the ONE no-follow write path for a file the product creates
+// at a predictable name (backup snapshot + manifest, doctor repair snapshot).
+// ---------------------------------------------------------------------------
+
+/// The tail of every refusal of a symlink planted at a destination.
+pub(crate) const SYMLINK_REFUSAL_TAIL: &str =
+    "a symlink sits at that path and would be followed (#8950)";
+
+/// The exact refusal for a symlink at `dest`.
+pub(crate) fn symlink_refusal(dest: &Path) -> String {
+    format!(
+        "refusing to write {}: {SYMLINK_REFUSAL_TAIL}",
+        dest.display()
+    )
+}
+
+/// Refuse `dest` when ANY entry sits at its final component, inspected with
+/// `symlink_metadata` (never follows): a symlink — dangling, to a file or to a
+/// directory — gets [`symlink_refusal`]; anything else gets
+/// `refusing to overwrite existing <what> <dest>`. A symlinked PARENT is
+/// followed: the class covers the final component only.
+///
+/// # Errors
+/// Something sits at `dest`, or it cannot be inspected.
+pub(crate) fn refuse_occupied(dest: &Path, what: &str) -> Result<()> {
+    match std::fs::symlink_metadata(dest) {
+        Ok(meta) if meta.file_type().is_symlink() => anyhow::bail!(symlink_refusal(dest)),
+        Ok(_) => anyhow::bail!("refusing to overwrite existing {what} {}", dest.display()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(anyhow::Error::new(e).context(format!("inspecting {}", dest.display()))),
+    }
+}
+
+/// Open a NEW owner-only file for read and write: `create_new` (`O_EXCL`,
+/// which also refuses a symlink, dangling or not) plus `O_NOFOLLOW`.
+fn open_new_private(path: &Path) -> Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .mode(OWNER_ONLY_MODE)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    options
+        .open(path)
+        .with_context(|| format!("creating {}", path.display()))
+}
+
+/// The ONE `link(2)` call of the publish (the test seam sees every call).
+fn link_no_replace(staged: &Path, dest: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if let Some(injected) = seam::on_link(dest) {
+        return Err(injected);
+    }
+    std::fs::hard_link(staged, dest)
+}
+
+/// Test-only seam (`cfg(test)`, absent from every non-test build): a hook a
+/// test runs at a named point of a snapshot write, a `link(2)` errno to
+/// inject, and the log of every link call. All three are per thread.
+#[cfg(test)]
+pub(crate) mod seam {
+    use std::cell::{Cell, RefCell};
+    use std::path::{Path, PathBuf};
+
+    /// Where the hook runs: before the writer fills the snapshot, after, and
+    /// (with the STAGING name as the path) right after a successful link.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum Point {
+        Fill,
+        Filled,
+        Linked,
+    }
+
+    type Hook = Box<dyn FnMut(Point, &Path)>;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Hook>> = RefCell::new(None);
+        static LINK_ERRNO: Cell<Option<i32>> = const { Cell::new(None) };
+        static LINK_CALLS: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Run `hook(point, dest)` at every [`fire`] of this thread.
+    pub(crate) fn set_hook(hook: impl FnMut(Point, &Path) + 'static) {
+        HOOK.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    /// Fail every later link call of this thread with `errno`.
+    pub(crate) fn inject_link_errno(errno: Option<i32>) {
+        LINK_ERRNO.with(|e| e.set(errno));
+    }
+
+    /// The destinations of the link calls so far (and forget them).
+    pub(crate) fn take_link_calls() -> Vec<PathBuf> {
+        LINK_CALLS.with(|c| std::mem::take(&mut *c.borrow_mut()))
+    }
+
+    /// Clear the hook, the injected errno and the call log.
+    pub(crate) fn reset() {
+        HOOK.with(|h| h.borrow_mut().take());
+        inject_link_errno(None);
+        drop(take_link_calls());
+    }
+
+    pub(crate) fn fire(point: Point, dest: &Path) {
+        let hook = HOOK.with(|h| h.borrow_mut().take());
+        if let Some(mut hook) = hook {
+            hook(point, dest);
+            HOOK.with(|h| *h.borrow_mut() = Some(hook));
+        }
+    }
+
+    pub(super) fn on_link(dest: &Path) -> Option<std::io::Error> {
+        LINK_CALLS.with(|c| c.borrow_mut().push(dest.to_path_buf()));
+        LINK_ERRNO
+            .with(Cell::get)
+            .map(std::io::Error::from_raw_os_error)
+    }
+}
+
+/// The "name taken" answer of a publish: a symlink there is refused with
+/// [`symlink_refusal`], anything else means try the next name.
+fn name_taken(dest: &Path) -> Result<bool> {
+    refuse_symlink(dest)?;
+    Ok(false)
+}
+
+/// A `link(2)` failure that means the filesystem has no hard links, the only
+/// one that may fall back (to [`rename_no_replace`]). Non-unix: none does.
+fn no_hard_links(err: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        matches!(
+            err.raw_os_error(),
+            Some(libc::EPERM | libc::EOPNOTSUPP | libc::ENOSYS)
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = err;
+        false
+    }
+}
+
+/// Rename `staged` to `dest` ATOMICALLY refusing an existing `dest` (`EEXIST`):
+/// Linux `renameat2(RENAME_NOREPLACE)`, macOS `renamex_np(RENAME_EXCL)`. Any
+/// other platform has no such call and refuses (`Unsupported`).
+fn rename_no_replace(staged: &Path, dest: &Path) -> std::io::Result<()> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let c_path = |p: &Path| {
+            std::ffi::CString::new(p.as_os_str().as_bytes())
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+        };
+        let (from, to) = (c_path(staged)?, c_path(dest)?);
+        // SAFETY: `from` and `to` are NUL-terminated C strings that outlive
+        // the call; the call reads them and touches no Rust memory.
+        #[cfg(target_os = "linux")]
+        let rc = unsafe {
+            libc::renameat2(
+                libc::AT_FDCWD,
+                from.as_ptr(),
+                libc::AT_FDCWD,
+                to.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        // SAFETY: as above.
+        #[cfg(target_os = "macos")]
+        let rc = unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL) };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (staged, dest);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "no atomic no-replace rename on this platform",
+        ))
+    }
+}
+
+/// Owner-only directory mode for the private staging directory.
+#[cfg(unix)]
+const OWNER_ONLY_DIR_MODE: u32 = 0o700;
+
+/// Create a NEW owner-only directory (`mkdir(2)` fails on any existing entry,
+/// a symlink included, and never follows it).
+fn create_private_dir(path: &Path) -> Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(OWNER_ONLY_DIR_MODE);
+    }
+    builder
+        .create(path)
+        .with_context(|| format!("creating the staging directory {}", path.display()))
+}
+
+/// The private staging directory and the staged file inside it; both are
+/// removed on drop (the file only while the publish has not taken it over).
+struct StagedName {
+    dir: std::path::PathBuf,
+    path: std::path::PathBuf,
+    armed: bool,
+}
+
+impl Drop for StagedName {
+    fn drop(&mut self) {
+        if self.armed {
+            // Removing by name removes only a link if one was swapped in.
+            let _ = std::fs::remove_file(&self.path);
+        }
+        // Empty by now; a non-empty directory (an entry planted by the
+        // owner) is left in place rather than walked.
+        let _ = std::fs::remove_dir(&self.dir);
+    }
+}
+
+/// A private file staged beside its destination, published without ever
+/// following or replacing what sits at the destination name.
+pub(crate) struct NoFollowStage {
+    name: StagedName,
+    dest: std::path::PathBuf,
+    what: &'static str,
+    file: std::fs::File,
+}
+
+/// Stage a new owner-only file beside `dest`: inside a freshly created
+/// owner-only (0700) directory in `dest`'s directory, so no other account can
+/// plant anything at the staged name while a writer that opens BY NAME
+/// (`VACUUM INTO`, which takes no `O_NOFOLLOW`) fills it. The directory sits
+/// on `dest`'s filesystem, so the publish is a link, not a copy.
+///
+/// # Errors
+/// Something already sits at `dest` ([`refuse_occupied`]), `dest` has no file
+/// name, or the staging directory or file cannot be created.
+pub(crate) fn stage_beside(dest: &Path, what: &'static str) -> Result<NoFollowStage> {
+    refuse_occupied(dest, what)?;
+    stage_in_private_dir(dest, what)
+}
+
+/// Refuse `dest` when a symlink (dangling or not) sits at its final
+/// component; an absent name or any other entry passes.
+///
+/// # Errors
+/// A symlink sits at `dest`, or it cannot be inspected.
+pub(crate) fn refuse_symlink(dest: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(dest) {
+        Ok(meta) if meta.file_type().is_symlink() => anyhow::bail!(symlink_refusal(dest)),
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(anyhow::Error::new(e).context(format!("inspecting {}", dest.display()))),
+    }
+}
+
+/// How many numbered names [`write_new_private_unique`] tries after `dest`.
+pub(crate) const UNIQUE_NAME_ATTEMPTS: u32 = 1000;
+
+/// `dest` with `.{n}` appended to its file name.
+fn numbered(dest: &Path, n: u32) -> std::path::PathBuf {
+    let mut name = dest.as_os_str().to_owned();
+    name.push(format!(".{n}"));
+    std::path::PathBuf::from(name)
+}
+
+/// A NEW owner-only fsynced file at the first FREE name of `dest`, `dest.1`,
+/// `dest.2`, ...: two backups taken in the same clock tick keep both copies
+/// instead of the second failing (or, before #8950, overwriting the first).
+/// A symlink at any tried name is refused, never skipped. Returns the name
+/// written.
+///
+/// # Errors
+/// A symlink sits at a tried name, all [`UNIQUE_NAME_ATTEMPTS`] numbered
+/// names are taken, or the stage, write, fsync or publish fails.
+pub(crate) fn write_new_private_unique(
+    dest: &Path,
+    what: &'static str,
+    bytes: &[u8],
+) -> Result<std::path::PathBuf> {
+    let mut stage = stage_in_private_dir(dest, what)?;
+    stage.write_all(bytes)?;
+    stage
+        .file()
+        .sync_all()
+        .with_context(|| format!("fsync {}", stage.path().display()))?;
+    for n in 0..=UNIQUE_NAME_ATTEMPTS {
+        let candidate = if n == 0 {
+            dest.to_path_buf()
+        } else {
+            numbered(dest, n)
+        };
+        if stage.publish_at(&candidate)? {
+            return Ok(candidate);
+        }
+    }
+    anyhow::bail!(
+        "refusing to write {what} {}: it and {UNIQUE_NAME_ATTEMPTS} numbered names beside it are taken",
+        dest.display()
+    )
+}
+
+/// Replace the product-owned file at `dest` with `bytes` (owner-only,
+/// fsynced) by a rename, refusing a symlink at the name instead of following
+/// or replacing it. A regular file there is replaced; an absent one created.
+///
+/// # Errors
+/// A symlink sits at `dest`, or the stage, write, fsync or rename fails.
+pub(crate) fn write_replacing(dest: &Path, what: &'static str, bytes: &[u8]) -> Result<()> {
+    refuse_symlink(dest)?;
+    let mut stage = stage_in_private_dir(dest, what)?;
+    stage.write_all(bytes)?;
+    stage
+        .file()
+        .sync_all()
+        .with_context(|| format!("fsync {}", stage.path().display()))?;
+    stage.verify_identity()?;
+    refuse_symlink(dest)?;
+    std::fs::rename(&stage.name.path, dest)
+        .with_context(|| format!("replacing {}", dest.display()))?;
+    stage.name.armed = false;
+    Ok(())
+}
+
+/// The staging step shared by [`stage_beside`] and [`write_replacing`].
+fn stage_in_private_dir(dest: &Path, what: &'static str) -> Result<NoFollowStage> {
+    let name = dest
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("{} has no file name", dest.display()))?;
+    let dir = match dest.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let stage_dir = dir.join(format!(
+        ".{}.stage-{}-{nonce}",
+        name.to_string_lossy(),
+        std::process::id()
+    ));
+    create_private_dir(&stage_dir)?;
+    let mut staged_name = StagedName {
+        path: stage_dir.join(name),
+        dir: stage_dir,
+        armed: false,
+    };
+    let file = open_new_private(&staged_name.path)?;
+    staged_name.armed = true;
+    Ok(NoFollowStage {
+        name: staged_name,
+        dest: dest.to_path_buf(),
+        what,
+        file,
+    })
+}
+
+impl NoFollowStage {
+    /// The private staging path (what `VACUUM INTO` is pointed at).
+    pub(crate) fn path(&self) -> &Path {
+        &self.name.path
+    }
+
+    /// The destination the publish creates.
+    pub(crate) fn dest(&self) -> &Path {
+        &self.dest
+    }
+
+    /// The staged file's handle: hash, size and fsync come from HERE, never
+    /// from a name.
+    pub(crate) fn file(&self) -> &std::fs::File {
+        &self.file
+    }
+
+    /// Write `bytes` through the handle.
+    ///
+    /// # Errors
+    /// The write fails.
+    pub(crate) fn write_all(&mut self, bytes: &[u8]) -> Result<()> {
+        use std::io::Write;
+        self.file
+            .write_all(bytes)
+            .with_context(|| format!("staging {} {}", self.what, self.name.path.display()))
+    }
+
+    /// Prove the staging NAME still names the staged handle's file. `VACUUM
+    /// INTO` writes by name, so a name swapped for a symlink (or another file)
+    /// after the create must not be published. Unix compares the
+    /// (device, inode) pair of the name and the handle. Non-unix has no inode
+    /// to compare: it checks only that the name is a regular file (not a
+    /// symlink), so a swapped regular file there is not detected.
+    ///
+    /// # Errors
+    /// The name is gone, is a symlink, or names a different file.
+    pub(crate) fn verify_identity(&self) -> Result<()> {
+        let path = &self.name.path;
+        let by_name = std::fs::symlink_metadata(path)
+            .with_context(|| format!("inspecting the staged file {}", path.display()))?;
+        if by_name.file_type().is_symlink() {
+            anyhow::bail!(symlink_refusal(path));
+        }
+        #[cfg(unix)]
+        let same = {
+            use std::os::unix::fs::MetadataExt;
+            let by_handle = self
+                .file
+                .metadata()
+                .with_context(|| format!("fstat of {}", path.display()))?;
+            (by_name.dev(), by_name.ino()) == (by_handle.dev(), by_handle.ino())
+        };
+        #[cfg(not(unix))]
+        let same = by_name.file_type().is_file();
+        if !same {
+            anyhow::bail!(
+                "refusing to publish {}: the staged file {} was replaced while it was written (#8950)",
+                self.dest.display(),
+                path.display()
+            );
+        }
+        Ok(())
+    }
+
+    /// Publish the staged file at the destination WITHOUT replacing anything
+    /// there: a hard link (`link(2)` fails on any existing entry, a dangling
+    /// symlink included, and never follows it), then the staging name is
+    /// dropped (best effort). Only a link failure that means "no hard links
+    /// here" (`EPERM`, `EOPNOTSUPP`, `ENOSYS`) falls back, and only to an
+    /// atomic no-replace rename ([`rename_no_replace`]); a platform without
+    /// one, and every other errno, is refused. The caller fsyncs the
+    /// directory. Returns the handle.
+    ///
+    /// # Errors
+    /// The identity check fails, something sits at the destination, or the
+    /// link (or its no-replace fallback) fails; the staging name is removed.
+    pub(crate) fn publish(mut self) -> Result<std::fs::File> {
+        let dest = self.dest.clone();
+        if !self.publish_at(&dest)? {
+            anyhow::bail!(
+                "refusing to overwrite existing {} {}",
+                self.what,
+                dest.display()
+            );
+        }
+        Ok(self.file)
+    }
+
+    /// ONE no-follow, create-new `link(2)` at `dest`; `Ok(false)`: name taken.
+    /// I-2: nothing that exists at `dest` is replaced, for any errno.
+    fn publish_at(&mut self, dest: &Path) -> Result<bool> {
+        self.verify_identity()?;
+        match link_no_replace(&self.name.path, dest) {
+            Ok(()) => {
+                // X-5: the file is published; a staging name that will not go
+                // away now is retried by Drop and never fails the publish.
+                #[cfg(test)]
+                seam::fire(seam::Point::Linked, &self.name.path);
+                if std::fs::remove_file(&self.name.path).is_ok() {
+                    self.name.armed = false;
+                }
+                Ok(true)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => name_taken(dest),
+            Err(e) if no_hard_links(&e) => match rename_no_replace(&self.name.path, dest) {
+                Ok(()) => {
+                    self.name.armed = false;
+                    Ok(true)
+                }
+                Err(r) if r.kind() == std::io::ErrorKind::AlreadyExists => name_taken(dest),
+                Err(r) => Err(anyhow::Error::new(r).context(format!(
+                    "refusing to publish {} {}: no hard links here (the link failed: {e}) \
+                     and the no-replace rename failed (#8950)",
+                    self.what,
+                    dest.display()
+                ))),
+            },
+            Err(e) => Err(anyhow::Error::new(e).context(format!(
+                "refusing to publish {} {}: the link failed and no fallback applies (#8950)",
+                self.what,
+                dest.display()
+            ))),
+        }
+    }
 }

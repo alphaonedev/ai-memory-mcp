@@ -3091,6 +3091,65 @@ mod tests {
         assert!(mirrored.get(field_names::PUBKEY_BOUND_AT).is_none());
     }
 
+    /// #8341 (voter condition 5): a `--trust-source` restore of a bundle whose
+    /// `_agents` registration row disagrees with the DESTINATION's ledger (the
+    /// agent is bound to another key there) neither aborts the whole restore
+    /// nor rewrites the destination binding: the ledger stays authoritative,
+    /// the destination row still carries its projection and `memories_fts`
+    /// stays in step.
+    #[test]
+    fn trust_source_restore_of_mismatched_registration_keeps_ledger_8341() {
+        use crate::models::field_names;
+        let agent = "ai:trusted-restore-mismatch-8341";
+        let bind = |conn: &Connection| {
+            crate::db::register_agent(conn, agent, "test", &[]).expect("register");
+            let kp = crate::identity::keypair::generate(agent).expect("keypair");
+            crate::db::bind_agent_pubkey_with_keypair(conn, agent, &kp).expect("bind");
+        };
+        let src = fresh_conn("restore-mismatch-src-8341");
+        bind(&src);
+        let env = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
+        let dst = fresh_conn("restore-mismatch-dst-8341");
+        bind(&dst);
+        let ledger_before = crate::storage::agent_pubkey_versions(&dst, agent).expect("history");
+
+        let report =
+            import_full_envelope(&dst, &env, &opts_trusted()).expect("trusted restore commits");
+        assert!(report.committed, "no silent whole-restore rollback");
+        assert_eq!(
+            crate::storage::agent_pubkey_versions(&dst, agent).expect("history"),
+            ledger_before,
+            "a restore never moves the destination binding"
+        );
+        let (key, bound_at): (String, String) = dst
+            .query_row(
+                "SELECT pubkey_b64, bound_at FROM agent_pubkey_history
+                  WHERE agent_id = ?1 AND superseded_at IS NULL",
+                [agent],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("open history row");
+        let (meta, content): (String, String) = dst
+            .query_row(
+                "SELECT metadata, content FROM memories WHERE namespace = ?1 AND title = ?2",
+                rusqlite::params![
+                    crate::models::AGENTS_NAMESPACE,
+                    crate::models::agent_registration_title(agent)
+                ],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("one registration row");
+        for mirror in [meta, content] {
+            let v: serde_json::Value = serde_json::from_str(&mirror).expect("JSON mirror");
+            assert_eq!(v[field_names::AGENT_PUBKEY], serde_json::json!(key));
+            assert_eq!(v[field_names::PUBKEY_BOUND_AT], serde_json::json!(bound_at));
+        }
+        dst.execute_batch(
+            "INSERT INTO memories_fts(memories_fts, rank) VALUES('integrity-check', 1)",
+        )
+        .expect("memories_fts in step after a trusted restore");
+    }
+
     /// ★ HIGH-2: rows violating the write invariants (over-MAX_CONTENT_SIZE,
     /// out-of-range priority, non-RFC3339 #1834 valid_from) are refused
     /// per-row (skip + WARN + counted) and NOT persisted; the rest of the

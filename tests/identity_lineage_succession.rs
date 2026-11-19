@@ -93,8 +93,8 @@ fn kp(label: &str) -> AgentKeypair {
 fn force_flat_key(conn: &Connection, agent_id: &str, pubkey_b64: &str) {
     let title = ai_memory::models::agent_registration_title(agent_id);
     conn.execute_batch(
-        "DROP TRIGGER IF EXISTS agent_pubkey_history_authoritative_insert_v97;
-         DROP TRIGGER IF EXISTS agent_pubkey_history_authoritative_update_v97;",
+        "DROP TRIGGER IF EXISTS agent_pubkey_history_projection_guard_insert;
+         DROP TRIGGER IF EXISTS agent_pubkey_history_projection_guard_update;",
     )
     .expect("model a database attacker bypassing the v97 authority triggers");
     conn.execute(

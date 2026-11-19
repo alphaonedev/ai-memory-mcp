@@ -17,7 +17,7 @@ main.rs            -- Thin CLI shim (W6 refactor); top-level Command enum now li
 daemon_runtime.rs  -- HTTP daemon `serve` bootstrap, MCP `mcp` dispatch, top-level clap Command enum
 models/            -- Data structures: Memory (30 fields at v1.0.0), MemoryLink (9 relations at v0.8.0), MemoryKind (Batman Form-6 + Goal/Plan/Step), LifecycleState (v0.8.0 Pillar-2 state machine), Citation/SourceSpan (Form-4), query types, constants
 handlers/          -- HTTP request handlers split per domain (http.rs, federation_receive.rs, hook_subscribers.rs, transport.rs, plus per-surface modules: recall.rs, memories.rs, admin.rs, kg.rs, …); Axum extractors + JSON responses; error sanitization. Route-path SSOT in handlers/routes.rs (#1558 batch 4 — one const per production route path; lib.rs registers them, the postgres gate / federation receiver / doctor match on them)
-storage/           -- sqlite SQL primitives; CRUD, FTS5, recall scoring, GC, migration (CURRENT_SCHEMA_VERSION = 101)
+storage/           -- sqlite SQL primitives; CRUD, FTS5, recall scoring, GC, migration (CURRENT_SCHEMA_VERSION = 102)
 store/             -- SAL `MemoryStore` trait + adapter implementations (sqlite + postgres + AGE feature gates); new DB operations land here FIRST (post-#961)
 mcp/               -- MCP server over stdio JSON-RPC; tool registry (registry.rs incl. the tool_names const module), per-tool handlers under tools/, JSON-RPC wire-constant SSOT (mcp/jsonrpc.rs, #1558 batch 3 — version tag, reserved error codes, method names), tool-call param-name SSOT (mcp/param_names.rs), notification handling
 identity/          -- NHI identity: keypair storage (keypair.rs — DAEMON_KEYPAIR_LABEL), reserved-principal sentinel SSOT (sentinels.rs, #1558 batch 2 — DAEMON_PRINCIPAL, ANONYMOUS_INVALID, …; validate::RESERVED_AGENT_IDS is built from these), attestation (attest.rs), signing/verification (sign.rs/verify.rs), replay protection (replay.rs)
@@ -391,7 +391,7 @@ Added in schema migration v3 -> v4 (shown in its original 16-column shape). Stor
 
 ### `schema_version` table
 
-Tracks migration state. Current version: **101** (`CURRENT_SCHEMA_VERSION` in `src/storage/migrations.rs`).
+Tracks migration state. Current version: **102** (`CURRENT_SCHEMA_VERSION` in `src/storage/migrations.rs`).
 
 ## Recall Scoring Formula
 
@@ -1074,6 +1074,31 @@ ai-memory completions fish
 6. **Add the CLI command** -- new variant in the `Command` enum in `src/daemon_runtime.rs`, an `Args` struct (typically under `src/cli/commands/`), a dispatch arm, and bump `EXPECTED_CLI_SUBCOMMANDS_*`
 7. **Add the MCP tool** (post-v0.7.0 #987 D1.x): define `<ToolName>Request` (schemars `JsonSchema` derive; NO `deny_unknown_fields` per the #1052 wire-truthfulness pin) + `<ToolName>Tool` (zero-sized) with `impl McpTool` in `src/mcp/tools/<name>.rs`; register ONE `RegisteredTool::of::<…>()` line in `registered_tools()` in `src/mcp/registry.rs`; add a `tool_names::*` const + `ALL` slice entry (census/pin tests track the count automatically against `Profile::full().expected_tool_count()`); add the handler + dispatch arm in `src/mcp/mod.rs::handle_request()`; add a `d1_6_987_tests` parity-test mod. The pre-D1.6 step "add JSON definition in `tool_definitions()`" is gone — `tool_definitions()` is now a four-line iteration.
 8. **Add tests** under `tests/` (integration) and in the module's unit-test suite
+
+### Adding a schema migration (SQLite)
+
+SQLite migrations live in `migrations/sqlite/NNNN_*.sql` and run from
+`migrate()` in `src/storage/migrations.rs` inside one exclusive write
+transaction (`WriteTxn::begin_exclusive`), so one migration file either
+applies whole or not at all.
+
+**Guard triggers.** Some triggers on `memories` are guards: their body
+calls `RAISE(...)` (today `agent_pubkey_history_projection_guard_insert` and
+`agent_pubkey_history_projection_guard_update`, installed by
+`0086_v102_fts_projection_guard.sql`). SQLite re-checks every trigger body
+on `ALTER TABLE ... DROP COLUMN` and `RENAME COLUMN`, and moves or drops
+triggers silently on `RENAME TO` and `DROP TABLE`. The rule:
+
+- A migration that drops, renames or rebuilds a column or a table that a
+  guard trigger names MUST `DROP TRIGGER` that guard before the change and
+  `CREATE TRIGGER` it again after the change, in the same migration file.
+- Do not remove or widen a guard's `UPDATE OF` column list to get past the
+  drop error: the explicit list is the reviewed write-cost design.
+- The guarded names are not a hand-kept list. The structural test
+  `tests/migration_guard_trigger_rebuild_8341.rs` derives them from the
+  trigger definitions in `sqlite_master` and fails on any migration after
+  0086 that breaks this rule. A fixture that rewinds a store to an older
+  shape follows the same rule (see `tests/migrate_v064_to_v070_lossless.rs`).
 
 ## Testing
 

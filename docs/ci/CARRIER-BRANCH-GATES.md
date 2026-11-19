@@ -4,7 +4,10 @@ The full-suite step in `.github/workflows/ci.yml` ("full suite (cargo test)")
 runs `cargo test --no-fail-fast` under GNU `timeout --signal=TERM
 --kill-after=60 $WATCHDOG_SECS`. On tier `enterprise-fed` the suite runs as
 three concurrent shards and `$WATCHDOG_SECS` bounds each shard's whole chain
-(see [Sharded enterprise-fed suite (#6344)](#sharded-enterprise-fed-suite-6344)). The watchdog exists to catch a hung test and
+(see [Sharded enterprise-fed suite (#6344)](#sharded-enterprise-fed-suite-6344)). On tier `sqlite` the
+full suite runs as four sequential invocations, each under the same
+`$WATCHDOG_SECS` and the suite margin gate (see [Sqlite suite margin gate and
+shards (#9229)](#sqlite-suite-margin-gate-and-shards-9229)). The watchdog exists to catch a hung test and
 name it; it is NOT a cap on total suite duration. The job-level
 `timeout-minutes` (matrix `timeout`) is the outer backstop and must sit at
 least 15 minutes above the watchdog, and on a sharded tier at least the watchdog
@@ -54,6 +57,8 @@ ephemeral-database setup/teardown (about 970 s measured).
 Every green run now emits `::notice::[#6202] ... suite wall <s>s of the
 <budget>s watchdog budget (<n>% used, <m> min margin ...)`. Re-derive the
 budget whenever a measured full run comes within 20 % of it.
+On tier `sqlite` that 20 % is enforced, not advisory: see the #9229 section
+below.
 
 ## Not done here
 
@@ -174,3 +179,112 @@ watchdog killed it, while `parallel_1` and `parallel_2` passed.
   that the walk never read, bad root or any internal error) and
   fails the check. Unit tests:
   `scripts/ci/tests/test_manifest_owned_paths_8050.py`.
+
+## Sqlite suite margin gate and shards (#9229)
+
+Invariant (ruling 17183e98): every sqlite test invocation of `Run tests
+(impact-aware)` ends with at least 20 percent (`MARGIN_PCT`) of its per-invocation
+watchdog budget left, and an invocation that loses the margin is a named red
+before the watchdog kills it. The 2100 s budget is not raised: a raised
+constant hides the growth.
+
+- **Gate.** `run_tests` and `run_doc_tests` run the gate when the caller
+  prefixes `SUITE_MARGIN_GATE=1` (every sqlite dispatch call; never
+  `run_shard`, whose chains share one shrinking budget). `python3
+  scripts/ci/suite_budget.py timer`, started beside the watchdogged `cargo
+  test`, prints `::error::[#9229 margin] '<label>' lost the suite margin while
+  still running: ...` (exit 3) once the wall passes 80 percent of the budget
+  (at 1681 s of 2100 s: 1680 s still holds). The timer and the gate share one
+  predicate, `margin_lost` (elapsed over the 1680 s deadline), so the two can
+  never disagree at the boundary. After the invocation the step passes the
+  timer's exit code to `suite_budget.py gate --timer-rc`: 3 (the timer fired)
+  is the one red verdict and never a held notice, a killed timer is judged by
+  the wall, and any other code is exit 2. Otherwise the gate prints `margin
+  held: ...` as a notice, or fails the step with `::error::[#9229 margin]
+  '<label>' lost the suite margin: ...` (exit 3) when the wall used more than
+  80 percent even though every test passed, or when the watchdog killed it.
+  The invocation's own non-zero exit (101, 124) wins over the gate's. The
+  #1492 notice prints on every path that reaches the timed run, and the #6202
+  notice only for a passing `run_tests` invocation (never in `run_doc_tests`);
+  both print before either exit is returned. A failed prebuild (`cargo test
+  --no-run`) returns its own code before the timer, the gate and the notices.
+  Every such red carries
+  `this red is issue #9229 (the cost of the sqlite suite), not a failure of the
+  change under test` and then the binary still running and the slowest
+  binaries of that invocation (`slowest binaries: none profiled` without a
+  log), so a lane whose PR it fails on does not read it as its own defect. The
+  gate covers the two impact-selected sqlite invocations as well. Every
+  subcommand ends 0, 2 or 3 with a named reason for any input (invalid dates,
+  overflow digits, NUL bytes, empty or 100K+ line logs, malformed arguments);
+  malformed input is exit 2 with a named error, never a traceback or a pass.
+  Each reason is the gate's own fixed text, with no exception class name,
+  standard-library message or argparse wording, so a line reads the same on
+  every runner image: an unreadable file is `cannot be opened or read` or
+  `unreadable or not UTF-8`, a bad cargo metadata file is `unreadable, not
+  UTF-8, or not JSON within the decoder's depth`, a bad argument is one line
+  per kind (`argument --elapsed: not an integer of at most 18 ASCII digits`,
+  `argument cmd: missing, or not one of its allowed values`, or `the argument
+  list is not a suite_budget command line`) and an unforeseen exception is
+  `internal error`. No `#9229` annotation contains a percent sign (the 9365 escaper turns it
+  into `\x25`), so every percentage is written as `N percent`.
+- **Whole-suite ceiling** (ruling cdfe800f). Four budgets of 2100 s must not
+  become a silent 8400 s suite: the sum of the full suite's invocations is
+  checked against one constant, `WHOLE_SUITE_CEILING_SECS` (3600 s). Before
+  the first invocation `suite_budget.py suite-plan` reads the timeout of job
+  `check` for the running leg from `ci.yml` (`timeout-minutes`, or the
+  matrix leg's `timeout`) and requires the ceiling plus the same 20 percent margin
+  to fit it (at most 4560 s of the 95-minute ubuntu-latest leg, 3840 s of the
+  80-minute macos-fed leg); a ceiling that cannot fit is a named red (exit 3)
+  before any test runs, never a job kill, and an absent or unreadable timeout
+  is exit 2. Each gated invocation appends `<seconds><TAB><label>` to the
+  bash array `SUITE_SECONDS` of the step shell (no file: a test process can
+  write anything under `RUNNER_TEMP`, so no file there is an input of the
+  verdict); after the last one `suite_budget.py suite-sum --expect N -- <rows>`
+  prints the sum and each invocation's seconds, and a sum over the ceiling is
+  a named red (exit 3). N is the number of invocations the step ran (4 for the
+  shards, 1 for the fallback); a row count other than N, an empty, non-numeric
+  or negative seconds value, or a duplicated label is exit 2 with a named
+  reason. The unsharded fallback is checked the same way. An invocation that
+  ended before its gate (a failed prebuild) keeps no row: when the step's
+  exit code is already non-zero and fewer than N rows were kept, the sum is
+  not judged and the step prints one notice, `::notice::[#9229 margin] whole
+  sqlite suite: not judged, an invocation ended before its gate (rc <rc>);
+  <k> of <N> invocation rows kept (#9229)`, and ends with the first failing
+  code unchanged; with exit code 0 a short count stays the exit-2 red.
+- **Shards.** The full suite runs as four sequential invocations of the same
+  test set as one `cargo test`, each with its own budget: `--lib` (lib unit
+  tests), then every other target of cargo's default test selection (bins,
+  `tests/*.rs`, examples with `test = true`) in two round-robin parts
+  (`shard-args --part 1/2` and `--part 2/2`, disjoint and complete), then
+  `--doc`. The target list is derived from `cargo metadata --no-deps` by
+  `suite_budget.py shard-args`, so a new `tests/*.rs` is never missed; a target with unmet `required-features` is
+  skipped exactly as cargo's default selection skips it. A manifest it cannot
+  judge (a part that selects nothing, no single default member, not exactly one lib with test and doctest
+  on, an unknown target kind, a name outside `[A-Za-z0-9_-]` or with a leading
+  dash, a dependency feature) prints a `::warning::` and the step runs the one
+  unsharded invocation, still gated; a failed `cargo metadata` prints
+  `::warning::[#9229 margin] cargo metadata failed (rc N); the full suite runs
+  unsharded, gated (#9229)` before that fallback. A failed shard does not stop the later
+  ones (#2500); the step fails if any did. Job names, check names, matrix legs
+  and every ceiling are unchanged.
+- **Estimate.** From the per-binary seconds of run 44041202670 (the killed
+  run, 2097 s summed): lib 629 s (30 percent of 2100 s), part 1/2 577 s
+  (27 percent), part 2/2 867 s (41 percent), doc tests a few seconds. With the
+  measured 30 percent hosted variance the largest invocation reaches about
+  54 percent, inside the 80 percent line. A single non-lib invocation would
+  have been 1444 s (69 percent), which that variance pushes past 80 percent.
+- **Per-binary profile.** `suite_budget.py profile --log <job log>` ranks the
+  binaries of a saved job log by wall seconds (timestamped lines) or by
+  libtest's `finished in`.
+
+Unit tests: `scripts/ci/tests/test_suite_budget_9229.py` (judge table and
+boundary, CLI texts, timer, profile with a 200k-line time bound, shard
+derivation and its two parts over the real manifest, the whole-suite ceiling
+and plan, the step executed with a stub cargo, wiring pins) and
+`scripts/ci/tests/test_suite_budget_9229_integrity.py` (a table of every exit
+code propagation site of the step, each mutant proven red; each shard failing
+in turn ends the step with 101; sum completeness; a hostile input corpus with a
+time bound; the one boundary at 1679 / 1680 / 1681 s and 3600 / 3601 s; no
+percent sign in any annotation; the #1492 notice on every path that reaches
+the timed run). The stub cargo of both files advances a clock file by a fixed
+number of seconds per timed run, so the tests assert exact non-zero walls.
