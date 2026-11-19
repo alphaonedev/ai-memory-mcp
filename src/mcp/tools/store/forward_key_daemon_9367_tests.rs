@@ -157,13 +157,6 @@ type SalStore = Arc<dyn crate::store::MemoryStore>;
 #[cfg(not(feature = "sal"))]
 type SalStore = ();
 
-#[cfg_attr(
-    not(feature = "sal"),
-    expect(
-        clippy::needless_pass_by_value,
-        reason = "`SalStore` is `()` without `sal`; one signature for both feature legs"
-    )
-)]
 fn app_state(
     db: crate::handlers::Db,
     backend: crate::handlers::StorageBackend,
