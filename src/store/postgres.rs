@@ -28293,7 +28293,10 @@ impl MemoryStore for PostgresStore {
                     ));
                 }
             }
-            source_cids.push(row.try_get::<Option<String>, _>("cid").unwrap_or(None));
+            source_cids.push(
+                row.try_get::<Option<String>, _>("cid")
+                    .map_err(|e| to_store_err("read source cid", e))?,
+            );
             let priority: i32 = row.try_get("priority").unwrap_or(5);
             max_priority = max_priority.max(priority);
             // v1.0.0 #2935 — running min over the source confidences.
