@@ -752,6 +752,64 @@ class HandlerReasons(unittest.TestCase):
                 self.assertEqual(_swallowing_handlers(source), [])
 
 
+# ---------------------------------------------------------------------------------------
+# 9566: a job with no pull-request trigger is trusted-only only when the pre-scan read every
+# run step. Corpus: non-PR event x carrier (step secret, write scope, id token) x one step
+# form the pre-scan does not read; each row is the run text and the exact pre-scan reason.
+# The uses: column of this corpus arrives with the second PR of 9566.
+# ---------------------------------------------------------------------------------------
+
+UNREAD_STEP = "s"
+UNREAD_EVENTS = ("workflow_dispatch", "push", "schedule")
+UNREAD_SECRET_ENV = "          T: ${{ secrets.X }}\n"
+UNREAD_CARRIERS = (
+    ("step secret", "permissions:\n  contents: read\n", UNREAD_SECRET_ENV),
+    ("write scope", "permissions:\n  contents: write\n", ""),
+    ("id token", "permissions:\n  contents: read\n  id-token: write\n", ""),
+)
+PRE_SCAN_UNREAD = "step 's' cannot be read by the pre-scan: {reason}"
+PRE_SCAN_RUNS = "step 's' runs code from the checked-out tree"
+PRE_SCAN_TREE = "step 's' changes the checked-out tree"
+NO_WORD = "command word {word!r} is not on the closed command list"
+UNREAD_FORMS = (
+    ("gh codespace list", PRE_SCAN_UNREAD.format(reason="gh subcommand 'codespace' is not on the closed list")),
+    ("nfpm package -p deb -f nfpm.yaml -t dist/", PRE_SCAN_UNREAD.format(reason=NO_WORD.format(word="nfpm"))),
+    ("cbindgen --config cbindgen.toml --output x.h", PRE_SCAN_UNREAD.format(reason=NO_WORD.format(word="cbindgen"))),
+    ("rpmbuild -bs x.spec", PRE_SCAN_UNREAD.format(reason=NO_WORD.format(word="rpmbuild"))),
+    ("unknowntool x", PRE_SCAN_UNREAD.format(reason=NO_WORD.format(word="unknowntool"))),
+    ("timeout 60 sudo nfpm package", PRE_SCAN_UNREAD.format(reason=NO_WORD.format(word="nfpm"))),
+    ('X="$(cbindgen --version)"', PRE_SCAN_UNREAD.format(reason=NO_WORD.format(word="cbindgen"))),
+    ("f() { rpmbuild -bs x.spec; }\nf", PRE_SCAN_UNREAD.format(reason=NO_WORD.format(word="rpmbuild"))),
+    ("bash -c 'unknowntool x'", PRE_SCAN_UNREAD.format(reason=NO_WORD.format(word="unknowntool"))),
+    ("./build.sh", PRE_SCAN_RUNS),
+    ("git reset --hard HEAD~1", PRE_SCAN_TREE),
+)
+
+
+def _unread_workflow(event: str, perms: str, env: str, run: str) -> str:
+    return _wf(CHECKOUT + _run_step(UNREAD_STEP, run, env), on=event, perms=perms)
+
+
+class PreScanReadsEveryRunStep(unittest.TestCase):
+    """9566: the pre-scan returns trusted-only for a job only when it read every run step."""
+
+    def test_9566_pre_scan_names_the_first_step_it_did_not_read(self) -> None:
+        _need_module(self)
+        for run, reason in UNREAD_FORMS:
+            with self.subTest(run=run):
+                steps = [tb._Step("first", {"run": "echo ok"}, 0), tb._Step(UNREAD_STEP, {"run": run}, 1)]
+                self.assertEqual(tb._pre_scan_fetch(steps, {}, {}), reason)
+
+    def test_9566_unread_run_step_is_never_trusted_only(self) -> None:
+        _need_module(self)
+        for event in UNREAD_EVENTS:
+            for carrier, perms, env in UNREAD_CARRIERS:
+                for run, _ in UNREAD_FORMS:
+                    with self.subTest(event=event, carrier=carrier, run=run):
+                        result = _scan(_unread_workflow(event, perms, env, run))
+                        self.assertNotEqual(result.verdicts.get((SYNTH, JOB)), "trusted-only")
+
+
 class HostedGuard(unittest.TestCase):
     """I-6: this file runs in an existing hosted job, and that step holds the boundary."""
 
