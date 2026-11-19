@@ -243,6 +243,11 @@ fn host_env(host: Host, dir: &Path) -> Vec<(&'static str, OsString)> {
     }
 }
 
+/// The only variable of the parent the child keeps: the coverage profile
+/// path, so a `cargo llvm-cov` run still counts the child (it names a file
+/// to write, never one the child reads).
+const PASS_THROUGH: [&str; 1] = ["LLVM_PROFILE_FILE"];
+
 /// The child: the leaker and the probe, one thread, with the cell's dirs.
 fn child_command(cell: &CellDirs, host: &[(&'static str, OsString)]) -> std::process::Command {
     let mut cmd = crate::spawn_audit::audited_command(
@@ -250,12 +255,22 @@ fn child_command(cell: &CellDirs, host: &[(&'static str, OsString)]) -> std::pro
         CELL_MODULE,
     );
     cmd.args(["--exact", LEAKER, PROBE, "--nocapture", "--test-threads=1"]);
-    // What the child would inherit on that host.
+    // What the child would inherit on that host ...
     cmd.envs(host.iter().map(|(k, v)| (*k, v)));
+    // ... and none of it reaches the child: the cell builds its environment
+    // complete (ruling b29 127a16a7 (1)).
+    cmd.env_clear();
+    for name in PASS_THROUGH {
+        if let Some(v) = std::env::var_os(name) {
+            cmd.env(name, v);
+        }
+    }
     cmd.env("HOME", cell.dir("home"))
-        .env_remove("HF_HOME")
-        .env_remove(HF_HUB_OFFLINE_ENV)
-        .env_remove("AI_MEMORY_EMBED_OFFLINE")
+        .env("XDG_CONFIG_HOME", cell.dir("config"))
+        .env("XDG_CACHE_HOME", cell.dir("cache"))
+        .env("XDG_DATA_HOME", cell.dir("data"))
+        .env("XDG_STATE_HOME", cell.dir("state"))
+        .env("TMPDIR", cell.dir("tmp"))
         .env(CHILD_ROLE_ENV, "1");
     cmd
 }
