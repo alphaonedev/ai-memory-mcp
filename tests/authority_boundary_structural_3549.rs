@@ -51,6 +51,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+// #9367: the ONE resolver of what is test-only (#4198/#4200), never copied.
+#[path = "common/cfg_test_modules.rs"]
+mod cfg_test_modules;
+
 const MCP_MOD: &str = "src/mcp/mod.rs";
 const LIB: &str = "src/lib.rs";
 const ROUTES: &str = "src/handlers/routes.rs";
@@ -122,54 +126,13 @@ fn strip_line_comments(src: &str) -> String {
         .join("\n")
 }
 
-/// The production text of a file: every INLINE `#[cfg(test)] mod x { … }`
-/// block is removed by brace matching (an out-of-line `#[cfg(test)] mod x;`
-/// declaration has no body and is left alone). Deliberately tolerant — a
-/// brace inside a string literal in a test module can only make the strip
-/// end EARLY, which leaves test text in the scan and fails LOUD, never
-/// silently narrows it.
+/// The production text of a file: every inline `cfg(test)` module body removed
+/// by the ONE resolver (`tests/common/cfg_test_modules.rs`, #4198/#4200, #9367):
+/// lexer brace matching, `cfg(all(.., test, ..))` included, an out-of-line
+/// `#[cfg(test)] mod x;` declaration kept, and an unclosed module refused
+/// (fails closed) instead of stripped to the end of the file.
 fn production_part(src: &str) -> String {
-    let mut out = String::with_capacity(src.len());
-    let mut rest = src;
-    loop {
-        let Some(attr) = rest.find("#[cfg(test)]") else {
-            out.push_str(rest);
-            return out;
-        };
-        let after_attr = &rest[attr + "#[cfg(test)]".len()..];
-        let trimmed = after_attr.trim_start();
-        let is_inline_mod = trimmed.starts_with("mod ") || trimmed.starts_with("pub mod ");
-        let brace = trimmed.find('{');
-        let semi = trimmed.find(';');
-        let inline = is_inline_mod && brace.is_some_and(|b| semi.is_none_or(|sc| b < sc));
-        if !inline {
-            let keep = attr + "#[cfg(test)]".len();
-            out.push_str(&rest[..keep]);
-            rest = &rest[keep..];
-            continue;
-        }
-        let open = attr
-            + "#[cfg(test)]".len()
-            + (after_attr.len() - trimmed.len())
-            + brace.expect("brace");
-        let mut depth = 0usize;
-        let mut end = rest.len();
-        for (i, c) in rest[open..].char_indices() {
-            match c {
-                '{' => depth += 1,
-                '}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        end = open + i + 1;
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-        out.push_str(&rest[..attr]);
-        rest = &rest[end..];
-    }
+    cfg_test_modules::strip_cfg_test_inline_mods(src)
 }
 
 // ---------------------------------------------------------------------------
