@@ -866,7 +866,7 @@ jobs:
         run: python3 -I scripts/ci/tests/test_cert_amendment_ledger_6124.py --print-replay-shas | xargs git fetch --no-tags --depth=1 origin
       # MEASURE-ONLY #9455 stage 0 (never merged). The step still GATES the whole
       # suite: it fails on any failing test whose method name is not one of the
-      # six named below (a named test that passes is fine). The six are the #9452 boundary
+      # sixteen named below (a named test that passes is fine). The sixteen are the #9452 boundary
       # assertions that go red BECAUSE this branch moves persistent jobs to hosted
       # runners; their redness is itself a stage 0 measurement result.
       - name: Shard partition and wiring unit tests (#6344)
@@ -876,18 +876,28 @@ jobs:
           import unittest
 
           TOLERATED = {
-              "test_9452_r2_real_rows_stay_open_under_the_runner_issue",
-              "test_9452_r2_split_of_a_hit_job_stays_class_iv",
-              "test_9452_every_real_job_holds_the_boundary_or_has_a_row_of_each_finding",
-              "test_9452_real_hit_verdicts",
-              "test_9452_real_prune_step_is_the_taint_point_of_the_persistent_jobs",
-              "test_9452_without_form_rows_every_real_form_is_a_finding",
+              "test_ci_tainted_job_boundary.PersistentRunnerTrustedTrigger.test_9452_r2_real_rows_stay_open_under_the_runner_issue",
+              "test_ci_tainted_job_boundary.PersistentRunnerTrustedTrigger.test_9452_r2_split_of_a_hit_job_stays_class_iv",
+              "test_ci_tainted_job_boundary.RealWorkflows.test_9452_every_real_job_holds_the_boundary_or_has_a_row_of_each_finding",
+              "test_ci_tainted_job_boundary.RealWorkflows.test_9452_real_hit_verdicts",
+              "test_ci_tainted_job_boundary.RealWorkflows.test_9452_real_prune_step_is_the_taint_point_of_the_persistent_jobs",
+              "test_ci_tainted_job_boundary.RealWorkflows.test_9452_without_form_rows_every_real_form_is_a_finding",
+              "test_ci_tainted_job_boundary.RealWorkflows.test_9452_without_the_new_violation_rows_each_is_a_finding",
+              "test_ci_tainted_job_boundary_closed.HostedGuard.test_9452_boundary_test_runs_in_a_hosted_pr_job",
+              "test_ci_tainted_job_boundary_open_rows.CannotContinue.test_9452_real_cannot_continue_places_report_a_later_form",
+              "test_ci_tainted_job_boundary_open_rows.Fixpoint.test_9452_all_rows_applied_give_zero_findings_and_three_not_analysed_lines",
+              "test_ci_tainted_job_boundary_open_rows.Fixpoint.test_9452_any_one_row_removed_reports_exactly_that_form_line_or_violation",
+              "test_ci_tainted_job_boundary_open_rows.KindsNeverMix.test_9452_a_form_row_never_covers_a_violation_and_back",
+              "test_ci_tainted_job_boundary_open_rows.KindsNeverMix.test_9452_a_row_in_the_table_of_another_kind_is_a_failure_and_covers_nothing",
+              "test_ci_tainted_job_boundary_open_rows.OneRowOneForm.test_9452_second_form_in_a_real_row_covered_step_is_a_finding",
+              "test_ci_tainted_job_boundary_open_rows.Pins.test_9452_a_pin_below_its_row_count_fails",
+              "test_ci_tainted_job_boundary_open_rows.Pins.test_9452_each_pin_raised_fails",
           }
           suite = unittest.defaultTestLoader.discover("scripts/ci/tests")
           result = unittest.TextTestRunner(verbosity=1).run(suite)
           bad = []
           for case, _ in result.failures + result.errors:
-              name = case.id().split(" (")[0].rsplit(".", 1)[-1]
+              name = case.id().split(" (")[0]
               if name not in TOLERATED:
                   bad.append(case.id())
           tolerated = sorted({c.id().split(" (")[0] for c, _ in result.failures + result.errors} - set(bad))
