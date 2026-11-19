@@ -16,8 +16,6 @@ use std::time::Duration;
 /// How long the second connection waits for the write lock before SQLite
 /// names the refusal; short, so a held lock fails the attempt fast.
 const SECOND_WRITER_BUSY_TIMEOUT: Duration = Duration::from_millis(100);
-/// The raw metadata overwrite the seeders run under the gate's feet.
-const SET_METADATA_SQL: &str = "UPDATE memories SET metadata = ?1 WHERE id = ?2";
 use crate::store::{
     CallerContext, DELETE_LINK_SOURCE_LOOKUP, DELETE_LINK_TARGET_LOOKUP, MemoryStore, StoreResult,
 };
@@ -47,10 +45,16 @@ async fn seed_endpoint(store: &SqliteStore, state: Endpoint, title: &str) -> Str
 
 /// Overwrite one endpoint row's metadata with its case state.
 fn set_metadata(conn: &rusqlite::Connection, id: &str, metadata: &str) {
-    let updated = conn
-        .execute(SET_METADATA_SQL, rusqlite::params![metadata, id])
-        .expect(SET_ENDPOINT_METADATA);
-    assert_eq!(updated, 1, "{ENDPOINT_METADATA_SET}");
+    // The sanctioned metadata overwrite (#8341 pin): no raw `memories` write here.
+    crate::storage::set_row_metadata(conn, id, metadata).expect(SET_ENDPOINT_METADATA);
+    let kept: String = conn
+        .query_row(
+            "SELECT metadata FROM memories WHERE id = ?1",
+            rusqlite::params![id],
+            |row| row.get(0),
+        )
+        .expect("read back endpoint metadata");
+    assert_eq!(kept, metadata, "{ENDPOINT_METADATA_SET}");
 }
 
 /// Seed both endpoints and the edge between them. With both rows present the
@@ -176,7 +180,7 @@ async fn delete_link_owner_read_error_sqlite_9466() {
 
 /// What a second connection's owner re-stamp of one endpoint returned: the
 /// rows it changed, or the SQLite error code that refused it.
-type SecondWriter = Arc<Mutex<Option<Result<usize, Option<rusqlite::ErrorCode>>>>>;
+type SecondWriter = Arc<Mutex<Option<Result<(), Option<rusqlite::ErrorCode>>>>>;
 
 /// Arm the gate-to-write interleave point of `delete_link` (keyed by the
 /// source id): once the owner decision is taken, a SECOND connection on the
@@ -190,12 +194,15 @@ fn arm_second_writer(path: std::path::PathBuf, source_id: &str, endpoint_id: &st
         other
             .busy_timeout(SECOND_WRITER_BUSY_TIMEOUT)
             .expect("second connection busy timeout");
-        let got = other
-            .execute(
-                "UPDATE memories SET metadata = json_set(metadata, '$.agent_id', ?1) WHERE id = ?2",
-                rusqlite::params![MALLORY, endpoint],
-            )
-            .map_err(|e| e.sqlite_error_code());
+        // The seeded endpoint metadata is exactly the owner stamp, so the
+        // sanctioned overwrite with MALLORY's stamp is the owner re-stamp.
+        let restamp = Endpoint::Stamped(MALLORY)
+            .metadata_text()
+            .expect("a stamped endpoint has metadata");
+        let got = crate::storage::set_row_metadata(&other, &endpoint, &restamp).map_err(|e| {
+            e.downcast_ref::<rusqlite::Error>()
+                .and_then(rusqlite::Error::sqlite_error_code)
+        });
         *slot.lock().expect("second writer slot") = Some(got);
     });
     OWNER_GATE_TEST_HOOK
