@@ -3032,6 +3032,43 @@ pub mod test_hold_hook;
 #[cfg(test)]
 mod offline_home_9509_tests;
 
+/// #9509 - the `HOME` leaker the class cell runs before its probe (the module
+/// name sorts before `offline_home_9509_tests`). Its write goes through
+/// `test_support::apply_env`, the one env writer of this file.
+#[cfg(test)]
+mod offline_home_9509_leaker {
+    use super::offline_home_9509_tests::CHILD_ROLE_ENV;
+    use super::test_support::apply_env;
+
+    /// Changes `HOME` to a deleted directory and checks that the pinned
+    /// `HOME` / `HF_HOME` does not follow. Restores `HOME` except in the
+    /// cell's child, where the changed `HOME` is the condition the probe
+    /// runs under.
+    #[test]
+    fn home_leaker_9509() {
+        let _lock = crate::config::test_env_lock();
+        let pinned = crate::test_support::pristine_home_env().clone();
+        let before = std::env::var_os("HOME");
+        let gone = {
+            let dir = tempfile::tempdir().expect("leaked home");
+            dir.path().to_path_buf()
+        };
+        apply_env(&[("HOME", Some(gone.clone().into_os_string()))]);
+        let after = crate::test_support::pristine_home_env().clone();
+        if std::env::var_os(CHILD_ROLE_ENV).is_none() {
+            apply_env(&[("HOME", before)]);
+        }
+        assert!(
+            !gone.exists(),
+            "the leaked HOME must be a deleted directory"
+        );
+        assert_eq!(
+            after, pinned,
+            "the pinned HOME/HF_HOME must not follow a changed HOME"
+        );
+    }
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unused_self,
@@ -3050,11 +3087,12 @@ pub mod test_support {
     pub const OFFLINE_CACHE_MISS_PREFIX: &str =
         "model files not found in the pre-staged HuggingFace cache";
 
-    type EnvSetting = (&'static str, Option<std::ffi::OsString>);
+    pub(super) type EnvSetting = (&'static str, Option<std::ffi::OsString>);
 
     /// Apply `settings` (`None` removes the variable). One writer for the
-    /// set-up and the restore of [`with_offline_env`].
-    fn apply_env(settings: &[EnvSetting]) {
+    /// set-up and the restore of [`with_offline_env`], and the `HOME` write
+    /// of the #9509 leaker. The caller holds `crate::config::test_env_lock()`.
+    pub(super) fn apply_env(settings: &[EnvSetting]) {
         for (k, v) in settings {
             // SAFETY: serialized via the crate env LOCK held by the caller.
             unsafe {
@@ -3128,12 +3166,29 @@ pub mod test_support {
         }
     }
 
+    /// The offline prerequisite verdict, read under the env of
+    /// [`with_offline_env`]: the staged `config.json`, or the cache-miss text.
+    /// One function for the prerequisite of [`with_offline_staged_embedder`]
+    /// and for [`offline_staged_cache_check`], so both give the same verdict.
+    fn staged_cache_verdict() -> std::result::Result<std::path::PathBuf, String> {
+        Embedder::load_from_fallback()
+            .map(|(config, _, _)| config)
+            .map_err(|e| e.to_string())
+    }
+
+    /// The prerequisite verdict of [`with_offline_staged_embedder`] without
+    /// building a model: the cache at the pinned process-start `HOME` /
+    /// `HF_HOME`, whatever an earlier test did to `HOME` (#9509).
+    pub fn offline_staged_cache_check() -> std::result::Result<std::path::PathBuf, String> {
+        with_offline_env(None, staged_cache_verdict)
+    }
+
     /// Run `f` with a REAL local embedder built offline from the staged
     /// cache. A missing cache keeps its named failure (never a skip, never a
     /// fetch): CI stages it with `scripts/ci/stage_hf_cache.py` (#9509).
     pub fn with_offline_staged_embedder<R>(f: impl FnOnce(&Embedder) -> R) -> R {
         with_offline_env(None, || {
-            if let Err(e) = Embedder::load_from_fallback() {
+            if let Err(e) = staged_cache_verdict() {
                 panic!(
                     "{OFFLINE_CACHE_PREREQUISITE} ({e}). Stage it with \
                      scripts/ci/stage_hf_cache.py (#9509); this is NOT a failure of the \
