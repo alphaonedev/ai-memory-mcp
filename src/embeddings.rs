@@ -3028,6 +3028,10 @@ mod tests {
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_hold_hook;
 
+/// #9509 - the staged-cache-after-a-changed-HOME class cell.
+#[cfg(test)]
+mod offline_home_9509_tests;
+
 #[cfg(test)]
 #[allow(
     clippy::unused_self,
