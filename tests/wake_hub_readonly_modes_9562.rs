@@ -68,7 +68,7 @@ const UNIT_BINARY: &str = "/usr/bin/ai-memory";
 const DEGRADED: &str = "WITHOUT the forensic audit sink";
 
 /// How long a started hub may take to stop after SIGTERM (its drain deadline
-/// is 5 s; the unit's TimeoutStopSec is 15 s).
+/// is 5 s; the unit's `TimeoutStopSec` is 15 s).
 const STOP_DEADLINE: Duration = Duration::from_secs(15);
 
 /// How long the hub may take to bind its socket in the serve cell.
@@ -141,7 +141,7 @@ fn unwritable_homes(root: &Path) -> Vec<Home> {
 }
 
 /// A writable runtime directory for the socket and the allowlist, outside the
-/// home, kept short for the AF_UNIX path limit.
+/// home, kept short for the `AF_UNIX` path limit.
 fn runtime_dir(root: &Path) -> PathBuf {
     let dir = root.join("run");
     std::fs::create_dir_all(&dir).expect("create the runtime dir");
@@ -406,7 +406,7 @@ fn wait_until(child: &mut Child, deadline: Duration) -> Option<ExitStatus> {
     }
 }
 
-/// SIGTERM the child's whole process group (the unit's KillSignal).
+/// SIGTERM the child's whole process group (the unit's `KillSignal`).
 fn terminate_group(child: &Child) {
     let pgid = i32::try_from(child.id()).expect("pid fits i32");
     // SAFETY: `kill(2)` on the negative pgid of a group this test created
@@ -580,7 +580,7 @@ fn unit_shell(home: &Home, run: &Path, script: &str) -> Command {
     cmd
 }
 
-/// T-6 — the unit's ExecStart and both ExecStartPost lines, read from the unit
+/// T-6 — the unit's `ExecStart` and both `ExecStartPost` lines, read from the unit
 /// file and run against the built binary under an unwritable home: the hub
 /// starts, `--health` passes, the admit gate passes on an admitting snapshot,
 /// and a key refusal is never reported as exit 3. FAILS ON THE BASE: the hub
