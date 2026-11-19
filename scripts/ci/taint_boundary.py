@@ -3781,14 +3781,18 @@ def _analyse_step(step: _Step, job: dict[str, object], doc: dict[str, object], j
 
 PRE_SCAN_FETCH_REASON = "step {step!r} fetches a pull-request tree"
 PRE_SCAN_UNREAD_REASON = "step {step!r} cannot be read by the pre-scan: {reason}"
+PRE_SCAN_RUNS_REASON = "step {step!r} runs code from the checked-out tree"
+PRE_SCAN_TREE_REASON = "step {step!r} changes the checked-out tree"
 
 
 def _pre_scan_fetch(steps: list[_Step], job: dict[str, object], doc: dict[str, object]) -> str | None:
     """A job with no pull-request trigger: the reason it must be analysed in full, or None.
 
-    The reason is PRE_SCAN_FETCH_REASON for a run step that fetches a pull-request tree, or the
-    text of the form the pre-scan cannot read: a step it cannot read is never taken as a step
-    that fetches nothing (fail closed), so the full analysis reads that job and records the form.
+    The reason is PRE_SCAN_FETCH_REASON for a run step that fetches a pull-request tree, the
+    text of the first form or command the pre-scan cannot read, PRE_SCAN_RUNS_REASON for a step
+    that runs code from the checked-out tree, or PRE_SCAN_TREE_REASON for a step that changes it.
+    None only when every run step is read in full and does none of these (fail closed), so the
+    full analysis reads every other job and reports what it finds.
     """
     env_job = (doc.get("env"), job.get("env"))
     for step in steps:
@@ -3798,11 +3802,18 @@ def _pre_scan_fetch(steps: list[_Step], job: dict[str, object], doc: dict[str, o
         ctx = _shell_ctx(_merged_env(*env_job, step.body.get("env")), set(), strict=False,
                          composite=step.body.get(COMPOSITE_MARK))
         try:
-            _shell_runs_pr_code(_joined(run, MARK), ctx)
+            runs_code = _shell_runs_pr_code(_joined(run, MARK), ctx)
         except Unclassifiable as exc:
             return PRE_SCAN_UNREAD_REASON.format(step=step.label, reason=exc)
         if ctx.pr_fetch:
             return PRE_SCAN_FETCH_REASON.format(step=step.label)
+        # 9566: trusted-only only when the step is read in full; anything else is analysed.
+        if ctx.unread:
+            return PRE_SCAN_UNREAD_REASON.format(step=step.label, reason=ctx.unread[0])
+        if runs_code:
+            return PRE_SCAN_RUNS_REASON.format(step=step.label)
+        if ctx.tree_change:
+            return PRE_SCAN_TREE_REASON.format(step=step.label)
     return None
 
 
