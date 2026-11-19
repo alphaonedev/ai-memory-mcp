@@ -460,7 +460,11 @@ pub const SCHEMA_BEHIND_READ_ONLY_REFUSAL: &str =
 /// Repair command named for a SQLITE store that is behind. Private on purpose:
 /// every renderer (schema guard, `boot`, `doctor`, the provenance fault) gets
 /// the text from [`schema_behind_repair_clause`], never from this constant.
-const SCHEMA_BEHIND_REPAIR: &str = "ai-memory migrate --in-place";
+/// `stats` opens the file through the migrating open (`db::open`, `cli/gc.rs`),
+/// parses in every feature set and leaves no listener; the cell
+/// `the_sqlite_repair_command_migrates_an_old_stamp_fixture_9557` binds this text
+/// to that behaviour.
+const SCHEMA_BEHIND_REPAIR: &str = "ai-memory --db <path> stats";
 
 /// v1.0.0 #9504 — repair command for a POSTGRES store that is behind: opening
 /// the store runs the upgrade ladder (`docs/postgres-age-guide.md`, "Old
@@ -1112,7 +1116,7 @@ mod tests {
         assert_eq!(
             fault.to_string(),
             "provenance column memories.cid_genesis is missing: this database is on a schema \
-             older than v74 (the content-id columns). Repair: `ai-memory migrate --in-place` or \
+             older than v74 (the content-id columns). Repair: `ai-memory --db <path> stats` or \
              start the daemon, then re-run."
         );
     }

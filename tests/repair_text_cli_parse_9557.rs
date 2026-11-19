@@ -25,8 +25,10 @@ use ai_memory::daemon_runtime::Cli;
 use ai_memory::storage::schema_guard::{
     BACKEND_POSTGRES, BACKEND_SQLITE, SchemaBehindReadOnly, schema_behind_repair_clause,
 };
+use assert_cmd::Command as ChildCommand;
 use clap::Parser;
 use std::path::{Path, PathBuf};
+use tempfile::TempDir;
 
 const PROGRAM: &str = "ai-memory";
 const SCAN_DIRS: &[&str] = &["src", "tests"];
@@ -45,6 +47,11 @@ const THIS_FILE: &str = "tests/repair_text_cli_parse_9557.rs";
 const MIN_SCANNED_COMMANDS: usize = 6;
 /// CLI_REFERENCE has two schema-behind rows that name the command (#9564).
 const MIN_DOC_ROWS: usize = 2;
+/// The placeholder the sqlite clause keeps literally for the database path.
+const PATH_PLACEHOLDER: &str = "<path>";
+/// A schema stamp strictly behind this binary (the fixture is stamped back to it).
+const OLD_STAMP: i64 = 17;
+const STAMP_SQL: &str = "SELECT COALESCE(MAX(version), 0) FROM schema_version";
 
 fn root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -255,5 +262,124 @@ fn cli_reference_rows_state_the_command_of_the_one_function_9557() {
             "{DOC_FILE}:{} does not state `{want}`: {row}",
             n + 1
         );
+    }
+}
+
+/// An old-stamp fixture store, made inside a test-owned temp directory (never a
+/// live database): a real store whose `schema_version` is rolled back to
+/// [`OLD_STAMP`].
+struct Fixture {
+    _dir: TempDir,
+    db: PathBuf,
+}
+
+impl Fixture {
+    fn old_stamp() -> Self {
+        let dir = TempDir::new().expect("fixture dir");
+        let db = dir.path().join("behind.db");
+        let conn = ai_memory::db::open(&db).expect("fixture open");
+        conn.execute("DELETE FROM schema_version", []).unwrap();
+        conn.execute(
+            "INSERT INTO schema_version (version) VALUES (?1)",
+            [OLD_STAMP],
+        )
+        .unwrap();
+        drop(conn);
+        let f = Self { _dir: dir, db };
+        assert_eq!(f.stamp(), OLD_STAMP, "the fixture must start behind");
+        f
+    }
+
+    /// The stamp as a NEW connection reads it.
+    fn stamp(&self) -> i64 {
+        rusqlite::Connection::open(&self.db)
+            .expect("new connection")
+            .query_row(STAMP_SQL, [], |r| r.get(0))
+            .expect("read stamp")
+    }
+
+    /// Run the product binary with `args` on the fixture only (empty HOME, no config).
+    fn run(&self, args: &[&str]) -> std::process::Output {
+        let home = TempDir::new().expect("empty home");
+        ChildCommand::cargo_bin("ai-memory")
+            .expect("product binary")
+            .env("AI_MEMORY_NO_CONFIG", "1")
+            .env("HOME", home.path())
+            .args(["--db", self.db.to_str().unwrap()])
+            .args(args)
+            .output()
+            .expect("spawn")
+    }
+}
+
+/// The sqlite repair command of the one function.
+fn sqlite_command() -> String {
+    commands_in(&schema_behind_repair_clause(BACKEND_SQLITE))
+        .pop()
+        .expect("the sqlite clause names a command")
+}
+
+/// PROOF-2 (#9557 B1): the TEXT is bound to the BEHAVIOUR. The cell takes the
+/// sqlite command from the one function, substitutes the fixture path for the
+/// placeholder, parses it with the product parser (this file runs under the
+/// default and the `sal` feature set), runs it as the product binary on an
+/// old-stamp fixture, then reads the stamp from a NEW connection and asserts
+/// the current version. A later change that makes the verb open read-only
+/// turns this cell red, so the text cannot go stale silently.
+#[test]
+fn the_sqlite_repair_command_migrates_an_old_stamp_fixture_9557() {
+    let fx = Fixture::old_stamp();
+    let command = sqlite_command();
+    assert!(command.contains(PATH_PLACEHOLDER), "{command}");
+    let line = command.replace(PATH_PLACEHOLDER, fx.db.to_str().unwrap());
+    let argv: Vec<String> = line.split_whitespace().map(str::to_string).collect();
+    Cli::try_parse_from(&argv).unwrap_or_else(|e| panic!("`{line}` must parse: {e}"));
+    let args: Vec<&str> = argv.iter().skip(1).map(String::as_str).collect();
+    let home = TempDir::new().expect("empty home");
+    let out = ChildCommand::cargo_bin("ai-memory")
+        .unwrap()
+        .env("AI_MEMORY_NO_CONFIG", "1")
+        .env("HOME", home.path())
+        .args(&args)
+        .output()
+        .expect("spawn");
+    assert!(
+        out.status.success(),
+        "`{line}` failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        fx.stamp(),
+        ai_memory::storage::migrations::current_schema_version(),
+        "the repair command must leave the CURRENT stamp"
+    );
+}
+
+/// Condition (5): `boot` and `doctor` keep refusing on a schema that is behind,
+/// their refusal text carries the clause of the one function, and neither
+/// migrates (the stamp is unchanged after each).
+#[test]
+fn boot_and_doctor_refuse_with_the_clause_and_do_not_migrate_9557() {
+    let clause = schema_behind_repair_clause(BACKEND_SQLITE);
+    // `boot` gets an explicit namespace: without one the stamp is migrated by
+    // the namespace resolution before the read-only open (a pre-existing
+    // defect at the base, reported in the lane READY, not fixed here).
+    const VERBS: &[(&str, &[&str])] = &[
+        ("boot", &["boot", "--namespace", "n"]),
+        ("doctor", &["doctor"]),
+    ];
+    for (verb, args) in VERBS {
+        let fx = Fixture::old_stamp();
+        let out = fx.run(args);
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            text.contains(&clause),
+            "{verb} must carry `{clause}`: {text}"
+        );
+        assert_eq!(fx.stamp(), OLD_STAMP, "{verb} must not migrate");
     }
 }
