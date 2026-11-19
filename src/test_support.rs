@@ -581,6 +581,23 @@ pub(crate) fn spawn_test_child(test: &str, env: &[(&str, &str)]) -> std::process
 #[cfg(test)]
 pub(crate) const TEST_ENV_ISOLATION_ROLE_ENV: &str = "AI_MEMORY_TEST_ENV_ISOLATION_ROLE";
 
+/// #9509 - the `HOME` / `HF_HOME` the lib-test process started with.
+///
+/// Captured ONCE, from inside the `config::test_env_mutex` initializer, i.e.
+/// before any test holding the env lock can mutate `HOME` (every `HOME`
+/// mutator in the lib takes that lock). Tests that set `HOME` to a tempdir
+/// and never restore it (`config::tests` write-default tests) leave a deleted
+/// home behind; a test that needs the staged offline embedder cache reads
+/// the cache location from here instead of the ambient, possibly leaked,
+/// variable.
+#[cfg(test)]
+pub(crate) fn pristine_home_env()
+-> &'static (Option<std::ffi::OsString>, Option<std::ffi::OsString>) {
+    static PRISTINE: std::sync::OnceLock<(Option<std::ffi::OsString>, Option<std::ffi::OsString>)> =
+        std::sync::OnceLock::new();
+    PRISTINE.get_or_init(|| (std::env::var_os("HOME"), std::env::var_os("HF_HOME")))
+}
+
 /// #2905 test-isolation: run an env-MUTATING posture / security-profile
 /// test in an ISOLATED CHILD process so its process-global
 /// `std::env::set_var`s cannot leak to concurrent handler tests in the

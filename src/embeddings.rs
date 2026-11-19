@@ -3050,20 +3050,28 @@ pub mod test_support {
     pub const OFFLINE_CACHE_MISS_PREFIX: &str =
         "model files not found in the pre-staged HuggingFace cache";
 
+    type EnvSetting = (&'static str, Option<std::ffi::OsString>);
+
+    /// Apply `settings` (`None` removes the variable). One writer for the
+    /// set-up and the restore of [`with_offline_env`].
+    fn apply_env(settings: &[EnvSetting]) {
+        for (k, v) in settings {
+            // SAFETY: serialized via the crate env LOCK held by the caller.
+            unsafe {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
     /// Restores the variables [`with_offline_env`] owns, also on a panic.
-    struct OfflineEnvGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
+    struct OfflineEnvGuard(Vec<EnvSetting>);
 
     impl Drop for OfflineEnvGuard {
         fn drop(&mut self) {
-            for (k, v) in &self.0 {
-                // SAFETY: serialized via the crate env LOCK held by the caller.
-                unsafe {
-                    match v {
-                        Some(v) => std::env::set_var(k, v),
-                        None => std::env::remove_var(k),
-                    }
-                }
-            }
+            apply_env(&self.0);
         }
     }
 
@@ -3071,7 +3079,9 @@ pub mod test_support {
     /// `new_local` takes the staged-cache path and can never reach the
     /// network, #9515) and `HF_HUB_OFFLINE` removed so only the knob under
     /// test produces the posture. `home` is the new `HOME` and `HF_HOME` is
-    /// `home/hf-home` when `Some`; `None` keeps the ambient cache.
+    /// `home/hf-home` when `Some`; `None` pins the process-start `HOME` and
+    /// `HF_HOME` (the staged cache, whatever an earlier test did to `HOME`,
+    /// #9509).
     fn with_offline_env<R>(home: Option<&std::path::Path>, f: impl FnOnce() -> R) -> R {
         let _lock = crate::config::test_env_lock();
         let keys = [
@@ -3081,15 +3091,19 @@ pub mod test_support {
             HF_HUB_OFFLINE_ENV,
         ];
         let _restore = OfflineEnvGuard(keys.iter().map(|k| (*k, std::env::var_os(k))).collect());
-        // SAFETY: serialized via the crate env LOCK; no other thread mutates these.
-        unsafe {
-            if let Some(home) = home {
-                std::env::set_var("HOME", home);
-                std::env::set_var("HF_HOME", home.join("hf-home"));
-            }
-            std::env::set_var("AI_MEMORY_EMBED_OFFLINE", "1");
-            std::env::remove_var(HF_HUB_OFFLINE_ENV);
-        }
+        let (home_value, hf_home_value) = match home {
+            Some(home) => (
+                Some(home.as_os_str().to_owned()),
+                Some(home.join("hf-home").into_os_string()),
+            ),
+            None => crate::test_support::pristine_home_env().clone(),
+        };
+        apply_env(&[
+            ("HOME", home_value),
+            ("HF_HOME", hf_home_value),
+            ("AI_MEMORY_EMBED_OFFLINE", Some("1".into())),
+            (HF_HUB_OFFLINE_ENV, None),
+        ]);
         assert!(
             Embedder::remote_fetch_disabled(),
             "offline knob must be honored"

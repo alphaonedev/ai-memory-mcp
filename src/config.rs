@@ -10598,7 +10598,11 @@ pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
 pub(crate) fn test_env_mutex() -> &'static std::sync::Mutex<()> {
     use std::sync::{Mutex, OnceLock};
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
+    LOCK.get_or_init(|| {
+        // #9509: pin the pristine HOME before any lock holder can change it.
+        let _ = crate::test_support::pristine_home_env();
+        Mutex::new(())
+    })
 }
 
 /// The env-isolation child-spawn helpers live in `test_support` so this file
