@@ -21,6 +21,10 @@
 
 use std::path::Path;
 
+// #9367: the ONE resolver of what is test-only (#4198/#4200), never copied.
+#[path = "common/cfg_test_modules.rs"]
+mod cfg_test_modules;
+
 /// The single bounded funnel every read-path query embedding crosses.
 const FUNNEL: &str = "recall_query_embedding";
 
@@ -63,10 +67,10 @@ fn every_production_embed_query_goes_through_the_bounded_funnel_2577() {
         let Ok(text) = std::fs::read_to_string(file) else {
             continue;
         };
-        // Skip in-src `#[cfg(test)]` bodies: a test double is free to call
-        // the trait method directly. Mirrors the production-vs-test
-        // boundary used by `scripts/check-vendor-literals.sh`.
-        let production = text.split("mod tests {").next().unwrap_or(&text);
+        // Skip in-src `cfg(test)` module bodies: a test double is free to
+        // call the trait method directly. Production after a test module
+        // still counts (the ONE resolver, #9367).
+        let production = cfg_test_modules::strip_cfg_test_inline_mods(&text);
 
         for (idx, line) in production.lines().enumerate() {
             let trimmed = line.trim_start();
