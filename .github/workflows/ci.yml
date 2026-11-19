@@ -911,9 +911,9 @@ jobs:
       # #7160 - scripts/test/ is outside the discovery root above; run the
       # sweep script tests (including the Linux-only O_PATH test, which this
       # ubuntu-latest job is where it executes) and the sweep workflow pin.
-      # MEASURE-ONLY #9455 stage 0: exactly one id of this step pins the literal
-      # discovery run line that the gating wrapper above replaced; it is the only
-      # tolerated id here, every other test of the two files still gates.
+      # MEASURE-ONLY #9455 stage 0: three ids of this step pin the literal run lines
+      # of the discovery step and of this step, which the gating wrappers replaced;
+      # they are the only tolerated ids here, every other test of the two files still gates.
       - name: Target sweep unit tests (#7160)
         run: |
           python3 - <<'PY'
@@ -921,6 +921,8 @@ jobs:
           import unittest
 
           TOLERATED = {
+              "scripts.test.test_workflow_sweep_7160.SweepTestsRunInCi.test_classify_job_runs_the_sweep_unit_tests_7160_f3",
+              "scripts.test.test_workflow_sweep_7160.SweepTestsRunInCi.test_classify_job_runs_the_sweep_workflow_pin_7160_f3",
               "scripts.test.test_workflow_sweep_7160.SweepTestsRunInCi.test_existing_discovery_step_is_intact_7160_f3",
           }
           suite = unittest.defaultTestLoader.loadTestsFromNames(
