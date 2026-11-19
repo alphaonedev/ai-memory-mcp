@@ -480,6 +480,58 @@ impl IdentityPosture {
 /// is structurally blind to.
 pub const EXIT_ADMITS_NOBODY: i32 = 3;
 
+/// #9562 — the ONE derivation of what a `wake-hub` invocation does, shared by
+/// [`dispatch`] and the #3354 ledger-writer classification in `src/main.rs`,
+/// so the two can never disagree about which mode a flag set selects.
+///
+/// Modifiers inherit their mode: `--json` and `--require-admits` change what a
+/// posture or health run prints or exits with, never what it writes.
+/// `--posture` wins over `--health` when both are given (it is the strictly
+/// non-interacting one).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WakeHubMode {
+    /// `--posture` (with `--json` / `--require-admits`): report the resolved
+    /// configuration and the admit readiness, bind nothing.
+    Posture,
+    /// `--health` (with `--json`): probe a running hub's socket.
+    Health,
+    /// No mode flag: bind the socket and route wakes until SIGINT / SIGTERM.
+    Serve,
+}
+
+impl WakeHubMode {
+    /// The mode `args` selects.
+    #[must_use]
+    pub const fn of(args: &WakeHubArgs) -> Self {
+        if args.posture {
+            Self::Posture
+        } else if args.health {
+            Self::Health
+        } else {
+            Self::Serve
+        }
+    }
+
+    /// Whether this mode can append a `signed_events` row (and so must not
+    /// start without a signing key, #3354). The match names every mode and
+    /// has no wildcard arm, so a new mode does not compile until it is
+    /// classified here (3-agent vote (71472661), T-1).
+    ///
+    /// Every mode is `false` on a read of the code each one reaches
+    /// (T-3, T-7): posture reads the configuration, the allowlist snapshot
+    /// and the socket's `stat`; health connects, reads the hub's challenge
+    /// and closes; serve binds and unlinks its socket and routes frames in
+    /// memory. None of them reaches `audit::`, `record_decision`,
+    /// `signed_events`, or a signing-key load, ensure or generation; the
+    /// pin is `tests/wake_hub_readonly_modes_9562.rs`.
+    #[must_use]
+    pub const fn writes_ledger(self) -> bool {
+        match self {
+            Self::Posture | Self::Health | Self::Serve => false,
+        }
+    }
+}
+
 /// Bind and serve until SIGINT / SIGTERM, or run one of the non-binding
 /// reporting modes.
 ///
@@ -492,16 +544,17 @@ pub const EXIT_ADMITS_NOBODY: i32 = 3;
 /// from the reporting modes.
 pub async fn dispatch(args: &WakeHubArgs, app_config: &AppConfig) -> Result<i32> {
     let cfg = resolve_config(args, app_config)?;
-    if args.posture || args.health {
-        let stdout = std::io::stdout();
-        let stderr = std::io::stderr();
-        let mut so = stdout.lock();
-        let mut se = stderr.lock();
-        let mut out = CliOutput::from_std(&mut so, &mut se);
-        // `--posture` wins when both are given: it is the strictly
-        // non-interacting one, and reporting the resolved configuration before
-        // probing anything is the order an operator debugs in.
-        if args.posture {
+    // #9562: the mode comes from the one derivation `ledger_writer` also uses.
+    // `--posture` wins when both are given: it is the strictly non-interacting
+    // one, and reporting the resolved configuration before probing anything
+    // is the order an operator debugs in.
+    match WakeHubMode::of(args) {
+        WakeHubMode::Posture => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = CliOutput::from_std(&mut so, &mut se);
             print_posture(&cfg, args, &mut out)?;
             // #3643 admit-readiness gate. `--posture` alone is a non-interacting
             // INSPECTION and always exits 0; `--require-admits` turns the same
@@ -515,7 +568,15 @@ pub async fn dispatch(args: &WakeHubArgs, app_config: &AppConfig) -> Result<i32>
             }
             return Ok(0);
         }
-        return run_health(&cfg, args.json, &mut out).await;
+        WakeHubMode::Health => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = CliOutput::from_std(&mut so, &mut se);
+            return run_health(&cfg, args.json, &mut out).await;
+        }
+        WakeHubMode::Serve => {}
     }
 
     // Resolve the posture and BUILD THE VERIFIER before `cfg` is consumed, so

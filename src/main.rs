@@ -630,7 +630,34 @@ fn is_key_provisioning_verb(cmd: &daemon_runtime::Command) -> bool {
     )
 }
 
+/// #9562 — `wake-hub` is classified per MODE, not as one verb, by the same
+/// derivation its dispatch uses ([`ai_memory::cli::wake_hub::WakeHubMode`]),
+/// so the default-true rule above cannot reach it by omission again
+/// (3-agent vote (71472661), T-1..T-9). Read of every function each mode
+/// reaches (T-3, facts in the #9562 lane; pin
+/// `tests/wake_hub_readonly_modes_9562.rs`):
+///
+/// - posture (`--json`, `--require-admits` inherit it): `resolve_config`,
+///   `print_posture`, `IdentityPosture::resolve`, `SnapshotFreshness::observe`,
+///   `AdmitReadiness::observe`, `fd_budget_facts` (getrlimit only),
+///   `SocketPosture::read` (stat only). Reads only.
+/// - health (`--json` inherits it): `run_health` -> `health::probe` (connect,
+///   read the hub's challenge, close; no frame sent). Reads only.
+/// - serve: `AllowlistCache::load_from_file` and `ReloadingAllowlist` (public
+///   keys only), `StopListener`, `WakeHub::bind` / `serve` / drain (the socket
+///   directory and socket file are its only writes), the routing, pending and
+///   connection modules (frames in memory and on the socket).
+///
+/// None emits a `signed_events` row, an `audit::` or `record_decision` row,
+/// or loads, ensures or generates a signing key, so a hub user whose home is
+/// unwritable starts every mode; a forensic sink that cannot start prints the
+/// one degraded-boot warning and, as a non-writer, records no outage row.
+/// A new mode does not compile until `WakeHubMode::writes_ledger` names it.
 fn ledger_writer(cmd: &daemon_runtime::Command) -> bool {
+    if let daemon_runtime::Command::WakeHub(args) = cmd {
+        // #9562, 3-agent vote (71472661): per mode, via the dispatch derivation.
+        return ai_memory::cli::wake_hub::WakeHubMode::of(args).writes_ledger();
+    }
     !(is_egress_verb(cmd)
         || is_remediation_verb(cmd)
         || matches!(

@@ -27,7 +27,7 @@
 
 use std::io::Read as _;
 use std::os::unix::fs::PermissionsExt as _;
-use std::os::unix::process::CommandExt as _;
+use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -593,7 +593,20 @@ fn the_packaged_unit_command_lines_run_under_an_unwritable_home_9562() {
     let run = runtime_dir(root.path());
     publish_admitting_snapshot(&allowlist_path(&run));
     let (head, _) = refusal_parts();
-    for home in unwritable_homes(root.path()) {
+    // The unit lines drop AI_MEMORY_NO_CONFIG, as the unit does, so the config
+    // loader runs. Only the 0500 shape is a home the unit can meet (its hub
+    // user's home is an existing directory); a home under a regular file
+    // makes the config read fail with ENOTDIR, which #3166 refuses before
+    // any key is touched, a separate contract the T-5 cells cover with the
+    // config loader off.
+    let homes: Vec<Home> = unwritable_homes(root.path())
+        .into_iter()
+        .filter(|home| home.restore.is_some())
+        .collect();
+    if homes.is_empty() {
+        eprintln!("NOT PROVABLE UNDER ROOT: T-6 needs the 0500 home, which uid 0 can write");
+    }
+    for home in homes {
         let (_, _, start_script) = &scripts[0];
         let mut hub = unit_shell(&home, &run, start_script)
             .stdout(Stdio::null())
@@ -634,10 +647,20 @@ fn the_packaged_unit_command_lines_run_under_an_unwritable_home_9562() {
             home.label,
             scripts[0].0
         );
-        assert_eq!(
-            status.code(),
-            Some(0),
-            "the unit hub drains to 0: {hub_err}"
+        // ExecStart is `/bin/sh -c '...'` without `exec`, so the unit's
+        // KillSignal reaches the shell too. systemd counts a main process that
+        // exits 0 or dies of SIGTERM as a clean stop; the hub itself must
+        // have drained.
+        let clean = status.code() == Some(0) || status.signal() == Some(libc::SIGTERM);
+        assert!(
+            clean,
+            "#9562 ({}): the unit ExecStart did not stop cleanly ({status:?}): {hub_err}",
+            home.label
+        );
+        assert!(
+            hub_err.contains("wake-hub: stopped"),
+            "#9562 ({}): the unit hub did not drain: {hub_err}",
+            home.label
         );
         for (line, key, out) in &posts {
             let both = format!("{}{}", text(&out.stdout), text(&out.stderr));
