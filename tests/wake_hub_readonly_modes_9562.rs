@@ -41,6 +41,9 @@ use ai_memory::wake_hub::delegation_verifier::{
     ALLOWLIST_FILE_VERSION, AllowlistEntry, AllowlistFile,
 };
 use ai_memory::wake_hub::server::MAX_SOCKET_PATH_BYTES;
+#[path = "common/short_sock.rs"]
+mod short_sock;
+
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
@@ -147,11 +150,21 @@ fn runtime_dir(root: &Path) -> PathBuf {
     let dir = root.join("run");
     std::fs::create_dir_all(&dir).expect("create the runtime dir");
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod 0700");
+    // The socket directory is created by the test (0700) and every child
+    // runs with it as its working directory: see `short_sock`.
+    short_sock::create_socket_dir(&dir);
     dir
 }
 
+/// The socket path handed to the hub: relative and of constant length, so it
+/// fits the product limit under any workspace root.
 fn socket_path(run: &Path) -> PathBuf {
-    run.join("hub").join("wake-hub.sock")
+    short_sock::socket_arg(run)
+}
+
+/// Where the socket file really is, for file-system assertions only.
+fn socket_file(run: &Path) -> PathBuf {
+    short_sock::socket_file(run)
 }
 
 fn allowlist_path(run: &Path) -> PathBuf {
@@ -193,12 +206,21 @@ fn hub_command(home: &Home, program: &Path) -> Command {
     cmd
 }
 
+/// [`hub_command`] for a child that binds or connects the hub socket: its
+/// working directory is the socket directory, so the relative socket path
+/// resolves for it (the test process never changes its own).
+fn hub_socket_command(home: &Home, run: &Path, program: &Path) -> Command {
+    let mut cmd = hub_command(home, program);
+    short_sock::set_socket_cwd(&mut cmd, run);
+    cmd
+}
+
 fn bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_ai-memory"))
 }
 
 fn wake_hub(home: &Home, run: &Path, extra: &[&str]) -> Output {
-    let mut cmd = hub_command(home, &bin());
+    let mut cmd = hub_socket_command(home, run, &bin());
     cmd.arg("wake-hub").arg("--socket").arg(socket_path(run));
     cmd.args(extra);
     cmd.output().expect("run wake-hub")
@@ -469,7 +491,7 @@ fn serve_starts_under_an_unwritable_home_9562() {
     let run = runtime_dir(root.path());
     for home in unwritable_homes(root.path()) {
         let before = tree(root.path());
-        let mut cmd = hub_command(&home, &bin());
+        let mut cmd = hub_socket_command(&home, &run, &bin());
         cmd.arg("wake-hub")
             .arg("--socket")
             .arg(socket_path(&run))
@@ -515,7 +537,7 @@ fn serve_starts_under_an_unwritable_home_9562() {
         let created: Vec<PathBuf> = tree(root.path())
             .into_iter()
             .filter(|p| !before.contains(p))
-            .filter(|p| p != &socket_path(&run))
+            .filter(|p| p != &socket_file(&run))
             .collect();
         assert!(created.is_empty(), "serve created files: {created:?}");
     }
@@ -596,7 +618,7 @@ fn unit_scripts() -> Vec<(usize, String, String)> {
 fn unit_shell(home: &Home, run: &Path, script: &str) -> Command {
     let built = bin();
     let script = script.replace(UNIT_BINARY, built.to_str().expect("utf-8 binary path"));
-    let mut cmd = hub_command(home, Path::new("/bin/sh"));
+    let mut cmd = hub_socket_command(home, run, Path::new("/bin/sh"));
     // The unit's own Environment= lines; SOCKET/ALLOWLIST point at scratch.
     cmd.env_remove("AI_MEMORY_NO_CONFIG")
         .env("RUST_LOG", "info")
