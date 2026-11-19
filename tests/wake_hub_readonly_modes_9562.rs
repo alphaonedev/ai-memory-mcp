@@ -107,6 +107,18 @@ const SINK_ENV_NAMES: [&str; 5] = [
 /// caller's environment is cleared.
 type ChildEnv = Vec<(&'static str, OsString)>;
 
+/// Add the coverage profile variable to `env` when the test process has it,
+/// value unchanged: an instrumented child writes its profile where the
+/// coverage tool points, not into its working directory (which for the
+/// socket-directory cells is the directory the created-files census reads).
+/// The ONE place the name is added; the value is never printed.
+fn with_profile(mut env: ChildEnv, profile: Option<OsString>) -> ChildEnv {
+    if let Some(value) = profile {
+        env.push((PROFILE_VAR, value));
+    }
+    env
+}
+
 /// Clear the child's environment and hand it exactly `env`.
 fn apply_env(cmd: &mut Command, env: ChildEnv) {
     cmd.env_clear();
@@ -230,8 +242,8 @@ fn publish_admitting_snapshot(path: &Path) {
 /// The environment of a hub user: an unwritable home and key location,
 /// nothing else of the caller's. A pure function of its arguments: `path` is
 /// the caller's `PATH`.
-fn hub_env(home: &Home, path: OsString, _profile: Option<OsString>) -> ChildEnv {
-    vec![
+fn hub_env(home: &Home, path: OsString, profile: Option<OsString>) -> ChildEnv {
+    let env = vec![
         ("PATH", path),
         ("HOME", home.path.clone().into_os_string()),
         (
@@ -245,7 +257,8 @@ fn hub_env(home: &Home, path: OsString, _profile: Option<OsString>) -> ChildEnv 
         ("AI_MEMORY_KEY_DIR", home.key_dir().into_os_string()),
         ("AI_MEMORY_AGENT_ID", OsString::from(AGENT_ID)),
         ("AI_MEMORY_NO_CONFIG", OsString::from("1")),
-    ]
+    ];
+    with_profile(env, profile)
 }
 
 /// The child environment of a hub user, built from the test process's own
@@ -835,14 +848,15 @@ fn sink_outage() -> SinkOutage {
 
 /// The environment of the forensic-sink child. A pure function of its
 /// arguments, like [`hub_env`].
-fn sink_env(root: &Path, key_dir: &Path, path: OsString, _profile: Option<OsString>) -> ChildEnv {
-    vec![
+fn sink_env(root: &Path, key_dir: &Path, path: OsString, profile: Option<OsString>) -> ChildEnv {
+    let env = vec![
         ("PATH", path),
         ("HOME", root.to_path_buf().into_os_string()),
         ("XDG_CONFIG_HOME", root.join(".config").into_os_string()),
         ("AI_MEMORY_KEY_DIR", key_dir.as_os_str().to_owned()),
         ("AI_MEMORY_AGENT_ID", OsString::from(AGENT_ID)),
-    ]
+    ];
+    with_profile(env, profile)
 }
 
 fn sink_command(sb: &SinkOutage) -> Command {
