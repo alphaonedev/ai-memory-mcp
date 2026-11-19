@@ -40,6 +40,7 @@ use ai_memory::signed_events::event_types::FORENSIC_SINK_UNAVAILABLE;
 use ai_memory::wake_hub::delegation_verifier::{
     ALLOWLIST_FILE_VERSION, AllowlistEntry, AllowlistFile,
 };
+use ai_memory::wake_hub::server::MAX_SOCKET_PATH_BYTES;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
@@ -259,6 +260,32 @@ fn assert_nothing_created(label: &str, root: &Path, before: &[PathBuf]) {
         new.is_empty(),
         "#9562 ({label}): a read-only wake-hub mode created files: {new:?}"
     );
+}
+
+// ------------------------------------------------------- socket path length
+
+/// The socket path handed to the hub must fit the product limit for ANY
+/// workspace root (a runner with a long checkout path put the old fixture at
+/// 114 bytes and the hub refused it). Feeds a 200-byte root through the
+/// fixture's own path function and compares with the product constant.
+#[test]
+fn the_socket_path_handed_to_the_hub_fits_any_workspace_root_9562() {
+    const LONG_ROOT_BYTES: usize = 200;
+    let mut root = String::from("/");
+    root.push_str(&"d".repeat(LONG_ROOT_BYTES - root.len()));
+    assert_eq!(root.len(), LONG_ROOT_BYTES);
+    for root in [Path::new("/r"), Path::new(&root)] {
+        let run = root.join("run");
+        let arg = socket_path(&run);
+        let len = arg.as_os_str().as_encoded_bytes().len();
+        assert!(
+            len <= MAX_SOCKET_PATH_BYTES,
+            "#9562: the socket path handed to the hub is {len} bytes under a {}-byte root, \
+             over the {MAX_SOCKET_PATH_BYTES}-byte product limit: {}",
+            root.as_os_str().len(),
+            arg.display()
+        );
+    }
 }
 
 // ------------------------------------------------------------ T-5 / T-2 cells
