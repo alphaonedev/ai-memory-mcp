@@ -6027,8 +6027,10 @@ mod tests {
         );
         let set = forward_agent_key_file_fact(Some(URL), Some(OsStr::new(PATH)));
         assert_eq!(set.as_deref(), Some("set"));
+        // The production half ends at the file's test module, not at the first
+        // `#[cfg(test)]`: a production fn may carry a test-only seam statement.
         let production = include_str!("doctor.rs")
-            .split("#[cfg(test)]")
+            .split("\nmod tests {")
             .next()
             .unwrap_or_default();
         assert_eq!(
