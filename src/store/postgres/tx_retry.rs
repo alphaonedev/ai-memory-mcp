@@ -643,6 +643,17 @@ mod tests {
         }
     }
 
+    /// The raw `sqlstate` field of a backend error, exactly as the server sent
+    /// it, with NO retry classification in between: the cell uses it to tell
+    /// a failed provocation from a failed retry (#9252).
+    #[cfg(test)]
+    fn raw_sqlstate(e: &StoreError) -> Option<String> {
+        match e {
+            StoreError::BackendUnavailable { sqlstate, .. } => sqlstate.clone(),
+            _ => None,
+        }
+    }
+
     /// Waits until `relation` has at least one PENDING (ungranted) lock
     /// request, i.e. some session is provably blocked on it. Returns the
     /// named setup error when the request does not appear before
@@ -844,7 +855,7 @@ mod tests {
                     Ok(()) => break Ok(()),
                     Err(e) => {
                         if attempts == 1 {
-                            first_abort = retryable_tx_sqlstate(&e).map(str::to_owned);
+                            first_abort = raw_sqlstate(&e);
                         }
                         if let Err(terminal) = retry.consider(e).await {
                             break Err(terminal);
@@ -856,15 +867,21 @@ mod tests {
             peer_outcome.expect("the peer must commit after the funnel's abort");
 
             // The cell proves its own provocation: the funnel's FIRST attempt
-            // was aborted with 40P01 itself (not merely "some retryable code").
+            // was aborted with 40P01 itself, read from the RAW sqlstate field
+            // so a broken retry classification cannot masquerade as a failed
+            // provocation (#9252).
             eprintln!("t3520 provoked: first abort {first_abort:?}, attempts {attempts}");
             assert_eq!(
                 first_abort.as_deref(),
                 Some(SQLSTATE_DEADLOCK_DETECTED),
-                "the funnel's first attempt must be aborted with 40P01 by construction"
+                "the provocation failed: the funnel's first attempt was not aborted \
+                 with the raw sqlstate 40P01 (set-up, not the retry list)"
             );
 
-            outcome.expect("the funnel must COMMIT, not surface the deadlock");
+            outcome.expect(
+                "the 40P01 was provoked but the funnel surfaced it instead of committing: \
+                 check TX_RETRYABLE_SQLSTATES and the retry classification",
+            );
             total_attempts = attempts;
             if retries_total() > before {
                 observed_retry = true;
@@ -882,8 +899,8 @@ mod tests {
 
         assert!(
             observed_retry,
-            "no 40P01 was provoked in the bounded rounds (last attempt count {total_attempts}); \
-             the regression test proved nothing"
+            "the funnel committed but the retry counter did not move (attempts \
+             {total_attempts}); the regression test proved nothing"
         );
     }
 
@@ -896,8 +913,8 @@ mod tests {
     /// peer the victim, the funnel commits with no retry, and the cell reaches
     /// its "proved nothing" line. That outcome cannot be forced
     /// deterministically from outside the test body, so this pin holds the
-    /// invariant on the body itself: the cell never repeats the provocation in
-    /// rounds, waits for the other session's lock in the database, and fails
+    /// invariant on the body itself: the cell never repeats the provocation in a
+    /// loop, waits for the other session's lock in the database, and fails
     /// with a named setup error when a precondition is not met.
     #[test]
     fn the_live_40p01_cell_provokes_by_construction_not_in_rounds_9252() {
@@ -908,7 +925,13 @@ mod tests {
             .expect("the live cell exists");
         let pin_start = source.find(SELF_START).expect("this pin exists");
         let cell = &source[cell_start..pin_start];
-        for forbidden in ["for _round", "continue;", "0..4_u32"] {
+        for forbidden in [
+            "for _round",
+            "continue;",
+            "0..4_u32",
+            "rounds",
+            "retryable_tx_sqlstate(&e)",
+        ] {
             assert!(
                 !cell.contains(forbidden),
                 "the live 40P01 cell must provoke the deadlock by construction; \
@@ -922,6 +945,14 @@ mod tests {
         assert!(
             cell.contains("SETUP_ERROR"),
             "an unmet provocation precondition must fail with a named setup error"
+        );
+        assert!(
+            cell.contains("raw_sqlstate(&e)"),
+            "the first abort must be read from the raw sqlstate field, not through the retry list"
+        );
+        assert!(
+            cell.contains("ScratchRelations::new") && cell.contains(".finish()"),
+            "the scratch tables must be owned by the drop guard on every exit path"
         );
     }
 }
