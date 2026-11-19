@@ -262,8 +262,10 @@ OPERAND_PARAM_REF_OPEN = "${"
 OPERAND_PARAM_REF_CLOSE = "}"
 OPERAND_PARAM_REF_PLAIN = "$"
 # Expansion forms no operand may hold at all: a command substitution (and with it an arithmetic
-# expansion) and the backtick form. Their text is not a name the scanner read.
-OPERAND_REFUSED_EXPANSIONS = ("$(", "`")
+# expansion), the backtick form, both process substitutions, the extended glob openers the glob
+# characters do not already refuse, and the tilde (a home directory read from the user database).
+# Each runs a command or reads a file; its text is not a name the scanner read.
+OPERAND_REFUSED_EXPANSIONS = ("$(", "`", "<(", ">(", "+(", "@(", "!(", "~")
 # The gate-step places (conductor's word, b29): a change there needs the conductor's word. The
 # mark of a row follows its place, never its issue: the gate jobs of each workflow file, and the
 # one gate step of job check.
@@ -4161,7 +4163,8 @@ def _operand_plain_form(value: str) -> str | None:
 
 def _exact_operand(value: object) -> bool:
     """An exact name once each braced parameter reference of one plain name is read as ``$``; a
-    command substitution, a backtick form or any other brace form is never one."""
+    form of OPERAND_REFUSED_EXPANSIONS (command or process substitution, backtick, extended glob,
+    tilde) or any other brace form is never one."""
     if type(value) is not str or any(form in value for form in OPERAND_REFUSED_EXPANSIONS):
         return False
     plain = _operand_plain_form(value)

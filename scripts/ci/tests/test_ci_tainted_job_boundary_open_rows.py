@@ -155,14 +155,38 @@ OPERAND_SHAPE_REFUSED = {
     "positional digit": "${1}",
     "unterminated brace": "${a",
     "unterminated after a reference": "${x}${a",
+    # Every other shell form that runs a command or reads a file inside one word (issue 9580).
+    "process substitution, input": "<(date)",
+    "process substitution, output": ">(cat)",
+    "process substitution inside a word": "a<(id)b",
+    "function substitution": "${ date; }",
+    "value substitution": "${| date; }",
+    "arithmetic expansion, legacy form": "$[1+2]",
+    "extended glob, one or more": "+(a|b)",
+    "extended glob, exactly one": "@(a|b)",
+    "extended glob, none of": "!(a)",
+    "extended glob, zero or one": "?(a)",
+    "extended glob, any number": "*(a)",
+    "tilde": "~",
+    "tilde of a user": "~root/x",
+    "tilde after a colon": "a:~/b",
+    "glob star": "a*",
+    "glob question mark": "a?",
+    "glob bracket": "[ab]",
+    "brace list": "{a,b}",
+    "brace sequence": "{1..3}",
 }
+# The substring forms the classifier refuses in any operand (issue 9580): each runs a command or
+# reads a file, and each has a cell above.
+OPERAND_COMMAND_FORMS = ("$(", "`", "<(", ">(", "+(", "@(", "!(", "~")
 # One operand of each long shape, 100K+ characters, read under the ceiling (the check is linear).
 OPERAND_LINEAR_REPEAT = 50_000
 OPERAND_LINEAR_MIN_LEN = 100_000
 OPERAND_LINEAR_CEILING_S = 1.0
 OPERAND_LINEAR_SHAPES = {"accepted references": ("${a}", True), "open braces": ("${", False),
                          "unterminated names": ("${a", False), "substitutions": ("$(", False),
-                         "backticks": ("``", False), "nested": ("${a${b}", False)}
+                         "backticks": ("``", False), "nested": ("${a${b}", False),
+                         "process substitutions": ("<(", False)}
 # Shell text that raises exactly the form of its class with the operand filled in.
 FORM_TEXTS = {
     FORM_NOT_LITERAL: '"{}" --version',
@@ -532,6 +556,20 @@ class RowTables(unittest.TestCase):
                 start = time.monotonic()
                 self.assertIs(tb._exact_operand(big), accepted)
                 self.assertLess(time.monotonic() - start, OPERAND_LINEAR_CEILING_S)
+
+    def test_9580_every_refused_command_form_has_a_shape_cell(self) -> None:
+        """The refused substring forms are exactly the command forms, each with a refused cell in
+        the corpus, and each alone, inside a word and after a reference is refused."""
+        _need_module(self)
+        self.assertEqual(tb.OPERAND_REFUSED_EXPANSIONS, OPERAND_COMMAND_FORMS)
+        unknown = [f"open row with an unknown form: {SYNTH}/{JOB}/{STEP}"]
+        for form in OPERAND_COMMAND_FORMS:
+            with self.subTest(form=form):
+                self.assertTrue(any(form in operand for operand in OPERAND_SHAPE_REFUSED.values()))
+                for operand in (form, f"a{form}b", f"${{x}}{form}"):
+                    self.assertFalse(tb._exact_operand(operand), operand)
+                    self.assertEqual(tb._form_row_problems([_open(FORM_NOT_LITERAL, operand, 9548)], "open row",
+                                                           tb.OPEN_ROW_ISSUES), unknown)
 
     def test_9452_two_rows_for_one_form_are_a_failure(self) -> None:
         _need_module(self)
