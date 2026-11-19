@@ -630,12 +630,85 @@ fn keyed_forward_without_explicit_identity_is_refused_9367() {
 }
 
 /// The production text of one Rust source file, the text every source pin of
-/// this file scans.
+/// this file scans: every line outside the file's test modules, each kept line
+/// followed by `\n`. A test module is `mod tests {` or a module with a body
+/// whose attribute run holds `#[cfg(test)]` / `#[cfg(all(test, ...))]`; it
+/// ends at the first line that is its own indentation plus `}` (rustfmt
+/// layout). A `#[cfg(test)]` on one item or statement inside production code
+/// (an out-of-line `mod x;` included) is kept and does not end the scan. A
+/// file whose leading inner attributes hold `#![cfg(test)]` has no production
+/// text. An unclosed test module keeps the rest of the file: the pin then
+/// scans more, never less. One pass over the lines, linear in the input.
 fn production_text(src: &str) -> String {
-    src.split("#[cfg(test)]")
-        .next()
-        .unwrap_or_default()
-        .to_string()
+    let lines: Vec<&str> = src.lines().collect();
+    for line in lines.iter().map(|l| l.trim()) {
+        if line.is_empty() || line.starts_with("//") {
+            continue;
+        }
+        if line == "#![cfg(test)]" {
+            return String::new();
+        }
+        if !line.starts_with("#![") {
+            break;
+        }
+    }
+    let is_test_cfg = |t: &str| t == "#[cfg(test)]" || t.starts_with("#[cfg(all(test,");
+    let is_attr_or_doc = |t: &str| t.starts_with("#[") || t.starts_with("//");
+    let opens_mod_body = |t: &str| {
+        let decl = t
+            .strip_prefix("pub(crate) ")
+            .or_else(|| t.strip_prefix("pub(super) "))
+            .or_else(|| t.strip_prefix("pub "))
+            .unwrap_or(t);
+        decl.starts_with("mod ") && decl.ends_with('{')
+    };
+    let mut out = String::with_capacity(src.len());
+    let mut i = 0;
+    while i < lines.len() {
+        let trimmed = lines[i].trim();
+        // The first line of a test module region and the line of its `mod`.
+        let region = if trimmed == "mod tests {" {
+            Some(i)
+        } else if is_test_cfg(trimmed) {
+            let mut j = i + 1;
+            while j < lines.len() && is_attr_or_doc(lines[j].trim()) {
+                j += 1;
+            }
+            if j < lines.len() && opens_mod_body(lines[j].trim()) {
+                Some(j)
+            } else {
+                // Lines i..j are attributes or docs; any test cfg among them
+                // reaches the same line j, so none of them opens a region.
+                for line in &lines[i..j] {
+                    out.push_str(line);
+                    out.push('\n');
+                }
+                i = j;
+                continue;
+            }
+        } else {
+            None
+        };
+        if let Some(mod_line) = region {
+            let decl = lines[mod_line];
+            let indent = &decl[..decl.len() - decl.trim_start().len()];
+            let close = (mod_line + 1..lines.len())
+                .find(|&k| lines[k].trim_end().strip_prefix(indent) == Some("}"));
+            if let Some(k) = close {
+                i = k + 1;
+                continue;
+            }
+            for line in &lines[i..] {
+                out.push_str(line);
+                out.push('\n');
+            }
+            return out;
+        }
+        out.push_str(lines[i]);
+        out.push('\n');
+        i += 1;
+    }
+    out
 }
 
 /// Whether the production text of one source file builds an HTTP client.
@@ -832,11 +905,8 @@ fn production_text_is_linear_on_a_large_source_9367() {
 fn reader_and_env_names_live_in_the_one_neutral_module_9367() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let prod = |rel: &str| -> String {
-        let text = std::fs::read_to_string(root.join(rel)).unwrap_or_default();
-        text.split("#[cfg(test)]\nmod ")
-            .next()
-            .unwrap_or_default()
-            .to_string()
+        let text = std::fs::read_to_string(root.join(rel)).expect("read source");
+        production_text(&text)
     };
     let neutral = prod("src/agent_key_file.rs");
     for needle in [
