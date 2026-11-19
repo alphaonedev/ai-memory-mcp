@@ -132,6 +132,47 @@ OPERAND_SHAPE_ACCEPTED = {
     ELAPSED_OPERAND: r"$$\\t$", "$line": "$line", "$RUNNER_TEMP/impact/gate.py": "$RUNNER_TEMP/impact/gate.py",
     "apt-get": "apt-get",
 }
+# Every other operator spelling of a bash parameter expansion (issue 9581), each refused by the
+# brace pattern of the classifier alone: one cell per operator character.
+PARAM_OPERATOR_SPELLINGS = {
+    "remove shortest prefix": "${a#b}",
+    "remove longest prefix": "${a##b}",
+    "remove shortest suffix": "${a%b}",
+    "remove longest suffix": "${a%%b}",
+    "replace first": "${a/b/c}",
+    "replace all": "${a//b/c}",
+    "replace at start": "${a/#b/c}",
+    "replace at end": "${a/%b/c}",
+    "indirect reference": "${!a}",
+    "names with a prefix, star": "${!a*}",
+    "names with a prefix, at": "${!a@}",
+    "keys of an array": "${!a[@]}",
+    "upper case all": "${a^^}",
+    "upper case first": "${a^}",
+    "lower case all": "${a,,}",
+    "lower case first": "${a,}",
+    "quoted transform": "${a@Q}",
+    "prompt transform": "${a@P}",
+    "escape transform": "${a@E}",
+    "assignment transform": "${a@A}",
+    "attribute transform": "${a@a}",
+    "assign default without colon": "${a=b}",
+    "error if unset without colon": "${a?b}",
+    "alternate value without colon": "${a+b}",
+    "substring offset": "${a:1}",
+    "substring offset and length": "${a:1:2}",
+    "all elements, at": "${a[@]}",
+    "all elements, star": "${a[*]}",
+    "star after a name, no bash form": "${a*}",
+    "length of an array": "${#a[@]}",
+    "special parameter at": "${@}",
+    "special parameter star": "${*}",
+    "special parameter count": "${#}",
+    "special parameter status": "${?}",
+    "special parameter pid": "${$}",
+    "special parameter background pid": "${!}",
+    "special parameter flags": "${-}",
+}
 OPERAND_SHAPE_REFUSED = {
     "command substitution": "$(date)",
     "command substitution after a reference": "${x}$(id)",
@@ -175,6 +216,7 @@ OPERAND_SHAPE_REFUSED = {
     "glob bracket": "[ab]",
     "brace list": "{a,b}",
     "brace sequence": "{1..3}",
+    **PARAM_OPERATOR_SPELLINGS,
 }
 # The substring forms the classifier refuses in any operand (issue 9580): each runs a command or
 # reads a file, and each has a cell above.
@@ -570,6 +612,20 @@ class RowTables(unittest.TestCase):
                     self.assertFalse(tb._exact_operand(operand), operand)
                     self.assertEqual(tb._form_row_problems([_open(FORM_NOT_LITERAL, operand, 9548)], "open row",
                                                            tb.OPEN_ROW_ISSUES), unknown)
+
+    def test_9581_each_parameter_operator_spelling_is_refused_by_the_brace_pattern(self) -> None:
+        """No spelling holds a refused substring form, so the brace pattern alone refuses each one:
+        its span never fully matches, the plain form is None and the row is an unknown form."""
+        _need_module(self)
+        unknown = [f"open row with an unknown form: {SYNTH}/{JOB}/{STEP}"]
+        for label, operand in PARAM_OPERATOR_SPELLINGS.items():
+            with self.subTest(spelling=label):
+                self.assertFalse(any(form in operand for form in OPERAND_COMMAND_FORMS))
+                self.assertIsNone(tb.OPERAND_PARAM_REF_RE.fullmatch(operand))
+                self.assertIsNone(tb._operand_plain_form(operand))
+                self.assertFalse(tb._exact_operand(operand))
+                self.assertEqual(tb._form_row_problems([_open(FORM_NOT_LITERAL, operand, 9548)], "open row",
+                                                       tb.OPEN_ROW_ISSUES), unknown)
 
     def test_9452_two_rows_for_one_form_are_a_failure(self) -> None:
         _need_module(self)
