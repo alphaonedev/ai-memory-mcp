@@ -29,11 +29,11 @@ use std::time::{Duration, Instant};
 
 // The production text every source pin of this file scans comes from the ONE
 // resolver the tree's structural gates share (#4198/#4200,
-// tests/common/cfg_test_modules.rs, included by `crate::test_support` with
+// tests/common/cfg_test_modules.rs, included once by `crate::test_resolver` with
 // `#[path]`, never copied): every inline `cfg(test)` module body is removed, a
 // `#[cfg(test)]` on one item or statement inside production code is kept, and
 // a file its parent declares test-only is not production.
-use crate::test_support::cfg_test_modules::{
+use crate::test_resolver::cfg_test_modules::{
     cfg_test_declared_files, production_sources, strip_cfg_test_inline_mods,
 };
 

@@ -945,6 +945,9 @@ pub mod mtls_agent_binding;
 /// for the process-global `LINEAGE_DAG` atomic (#3577).
 #[cfg(test)]
 mod test_support;
+// #9367 — the lib's ONE include of the cfg(test) resolver (#4198/#4200).
+#[cfg(test)]
+mod test_resolver;
 // v0.7.0 Form 3 (issue #756) — multi-step ingest orchestrator. Batman
 // closeout: deterministic helpers run first (Jaccard, cosine, FTS
 // classifier), then LLM stages prepend a SHARED PREFIX and consume

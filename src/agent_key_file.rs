@@ -339,9 +339,9 @@ mod k1_shared_checks_9367_tests {
     /// forwarder with the hatch off; no second copy of a check in this module.
     #[test]
     fn one_file_check_function_serves_both_readers_9367() {
-        let prod = crate::test_support::cfg_test_modules::strip_cfg_test_inline_mods(include_str!(
-            "agent_key_file.rs"
-        ));
+        let prod = crate::test_resolver::cfg_test_modules::strip_cfg_test_inline_mods(
+            include_str!("agent_key_file.rs"),
+        );
         let count = |needle: &str| prod.matches(needle).count();
         assert_eq!(count("fn read_checked_key_file("), 1, "one check function");
         assert_eq!(

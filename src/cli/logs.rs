@@ -1564,7 +1564,7 @@ mod tests {
     fn prod_source() -> &'static str {
         static PROD: std::sync::OnceLock<String> = std::sync::OnceLock::new();
         PROD.get_or_init(|| {
-            crate::test_support::cfg_test_modules::strip_cfg_test_inline_mods(include_str!(
+            crate::test_resolver::cfg_test_modules::strip_cfg_test_inline_mods(include_str!(
                 "logs.rs"
             ))
         })

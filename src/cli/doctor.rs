@@ -6030,7 +6030,7 @@ mod tests {
         // The production text is every line outside the file's test modules
         // (the ONE resolver, #9367): a production fn may carry a test-only
         // seam statement, and production after a test module still counts.
-        let production = crate::test_support::cfg_test_modules::strip_cfg_test_inline_mods(
+        let production = crate::test_resolver::cfg_test_modules::strip_cfg_test_inline_mods(
             include_str!("doctor.rs"),
         );
         assert_eq!(
