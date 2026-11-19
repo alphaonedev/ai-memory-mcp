@@ -6,11 +6,14 @@ provides. Invariant: the job provides the offline embedder cache itself, or
 ends in the cache step with its own named error before any test runs, and no
 test fetches a model from the network.
 
-These cells pin: the two workflow call sites of scripts/ci/stage_hf_cache.py
-(ci.yml `check` job, coverage.yml `per-module-thresholds` job), their order
-before the first test step, the offline env on the test step, the absence of
-any third staging form, and that no Rust test reaches the model fetch with
-offline unset.
+These cells pin: the three workflow call sites of scripts/ci/stage_hf_cache.py
+(ci.yml `check` and `sal-feature` jobs, coverage.yml `per-module-thresholds`
+job), their order before the first test step, the offline env on the `check`
+test step, the absence of any other staging form, and that no Rust test
+reaches the model fetch with offline unset. The `sal-feature` cache and stage
+steps are job check's two steps word for word without the step-level `if:`
+(conductor b29 6a339cef: that job's lib test step has no `if:`), and that
+test step gains no offline env line and no `if:`.
 
 Open point (kept open): what filled the model files in the green jobs is not
 proven.
@@ -31,6 +34,15 @@ CALL_RE = re.compile(r"python3 -I scripts/ci/stage_hf_cache\.py(?P<args>[^\n]*)"
 OFFLINE_LINE = 'AI_MEMORY_EMBED_OFFLINE: "1"'
 TEST_STEP = "Run tests (impact-aware)"
 CHECK_JOB = "check"
+SAL_JOB = "sal-feature"
+SAL_TEST_STEP = "Run lib tests (sal feature)"
+CACHE_STEP = "Cache HuggingFace models (#9509)"
+STAGE_STEP = "Stage HF embedder cache (#9509)"
+# Code (non-comment) occurrences of SCRIPT_REL per workflow file: one per job that stages.
+SCRIPT_CALLS_PER_FILE = {"ci.yml": 2, "coverage.yml": 1}
+# Workflow files of the HF cache restore steps, one entry per step.
+HF_CACHE_STEP_FILES = ["ci.yml", "ci.yml", "coverage.yml"]
+IF_LINE_RE = re.compile(r"^\s+if: .*$")
 COVERAGE_JOB = "per-module-thresholds"
 
 # Any of these in a workflow or action is a staging form of its own.
@@ -164,7 +176,61 @@ class CallSites(unittest.TestCase):
     def test_both_workflows_name_the_script_exactly_once_per_job(self):
         self.assertTrue((ROOT / SCRIPT_REL).is_file())
         for path in (CI, COVERAGE):
-            self.assertEqual(code_lines(path.read_text()).count(SCRIPT_REL), 1, path.name)
+            self.assertEqual(
+                code_lines(path.read_text()).count(SCRIPT_REL), SCRIPT_CALLS_PER_FILE[path.name], path.name
+            )
+
+
+def step_code(body: str, drop_if: bool = False) -> list[str]:
+    """The code lines of one step: comments and blank lines dropped, optionally its `if:`."""
+    return [
+        line
+        for line in code_lines(body).split("\n")
+        if line.strip() and not (drop_if and IF_LINE_RE.match(line))
+    ]
+
+
+class SalFeatureJob(unittest.TestCase):
+    """ci.yml `sal-feature` runs `cargo test --features sal --lib` (the b3 test among them)."""
+
+    def sal_pairs(self):
+        return [(n, "\n".join(b)) for n, b in steps(job_lines(CI, SAL_JOB))]
+
+    def check_pairs(self):
+        return [(n, "\n".join(b)) for n, b in steps(job_lines(CI, CHECK_JOB))]
+
+    def test_job_has_cache_then_stage_directly_before_the_lib_test_step(self):
+        names = [n for n, _ in self.sal_pairs()]
+        test_idx = names.index(SAL_TEST_STEP)
+        self.assertEqual(names[test_idx - 2:test_idx], [CACHE_STEP, STAGE_STEP])
+        self.assertEqual(names.count(CACHE_STEP), 1)
+        self.assertEqual(names.count(STAGE_STEP), 1)
+        self.assertLess(names.index("uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4"), test_idx - 2)
+
+    def test_cache_and_stage_steps_are_check_word_for_word_without_the_if(self):
+        sal, check = dict(self.sal_pairs()), dict(self.check_pairs())
+        for name in (CACHE_STEP, STAGE_STEP):
+            with self.subTest(step=name):
+                self.assertEqual(step_code(sal[name]), step_code(check[name], drop_if=True))
+                self.assertEqual(len(step_code(check[name])) - 1, len(step_code(sal[name])))
+
+    def test_no_step_level_if_on_cache_stage_or_test_step(self):
+        sal = dict(self.sal_pairs())
+        for name in (CACHE_STEP, STAGE_STEP, SAL_TEST_STEP):
+            with self.subTest(step=name):
+                self.assertEqual([l for l in step_code(sal[name]) if IF_LINE_RE.match(l)], [])
+
+    def test_lib_test_step_gains_no_offline_line(self):
+        body = dict(self.sal_pairs())[SAL_TEST_STEP]
+        self.assertNotIn("AI_MEMORY_EMBED_OFFLINE", code_lines(body))
+        self.assertEqual(step_code(body)[-1].strip(), "run: cargo test --features sal --lib")
+
+    def test_exactly_one_staging_call_with_embedder_set_and_no_secret(self):
+        found = [(n, b) for n, b in self.sal_pairs() if CALL_RE.search(code_lines(b))]
+        self.assertEqual([n for n, _ in found], [STAGE_STEP])
+        self.assertEqual(CALL_RE.search(code_lines(found[0][1])).group("args"), " --models embedder")
+        for name in (CACHE_STEP, STAGE_STEP):
+            self.assertNotRegex(dict(self.sal_pairs())[name], r"secrets\.|GITHUB_TOKEN|HF_TOKEN|token:")
 
 
 class NoThirdForm(unittest.TestCase):
@@ -195,7 +261,7 @@ class NoThirdForm(unittest.TestCase):
                 text = "\n".join(body)
                 if "actions/cache@" in text and "huggingface" in code_lines(text):
                     offenders.append(path.name)
-        self.assertEqual(sorted(offenders), ["ci.yml", "coverage.yml"])
+        self.assertEqual(sorted(offenders), HF_CACHE_STEP_FILES)
 
 
 class NoTestFetchesWithOfflineUnset(unittest.TestCase):
