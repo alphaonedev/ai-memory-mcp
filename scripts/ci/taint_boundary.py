@@ -4279,7 +4279,7 @@ def _violation_problems(result: ScanResult, allow: list[AllowRow]) -> list[str]:
             if key not in violated and not unknown:
                 problems.append(f"stale allow row (no longer violates class {klass}): "
                                 f"{row.workflow}/{row.job}/{row.step}")
-    for v in sorted(result.violations, key=lambda x: (x.workflow, x.job, x.step, x.klass)):
+    for v in sorted(result.violations, key=lambda x: (x.workflow, x.job, x.step, x.klass, x.detail)):
         if (v.workflow, v.job, v.step, v.klass) not in allowed:
             problems.append(f"violation class ({v.klass}) without an allow row: {v.workflow}/{v.job}/{v.step}: {v.detail}")
     return problems

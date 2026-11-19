@@ -1128,6 +1128,16 @@ class AllowTable(unittest.TestCase):
         self.assertEqual(len(problems), 1)
         self.assertTrue(problems[0].startswith(f"violation class (iv) without an allow row: synthetic.yml/class-iv/{R2_STEP}: "))
 
+    def test_9566_two_violations_of_one_class_on_one_step_print_in_one_order(self) -> None:
+        """Two results of one class on one step differ only in detail: the lines come out in the
+        same order whichever order the scan found them in."""
+        _need_module(self)
+        found = [tb.Violation(SYNTH, "class-iv", R2_STEP, "iv", detail) for detail in ("z detail", "a detail")]
+        runs = [tb.check(tb.ScanResult(violations=list(order)), allow=(), pin=0) for order in (found, found[::-1])]
+        expected = [f"violation class (iv) without an allow row: {SYNTH}/class-iv/{R2_STEP}: {detail}"
+                    for detail in ("a detail", "z detail")]
+        self.assertEqual(runs, [expected, expected])
+
     def test_9452_row_without_issue_is_a_failure(self) -> None:
         _need_module(self)
         result = _scan({SYNTH: HEADER + JOB_CLASS_IV})
