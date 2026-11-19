@@ -25,6 +25,7 @@
 
 #![cfg(unix)]
 
+use std::ffi::OsString;
 use std::io::Read as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
@@ -77,6 +78,42 @@ const STOP_DEADLINE: Duration = Duration::from_secs(15);
 
 /// How long the hub may take to bind its socket in the serve cell.
 const BIND_DEADLINE: Duration = Duration::from_secs(10);
+
+/// The coverage profile variable of the LLVM profile runtime: the one name of
+/// the caller's environment a child may be handed besides its closed list.
+const PROFILE_VAR: &str = "LLVM_PROFILE_FILE";
+
+/// The closed list of names the hub fixture hands a child (sorted).
+const HUB_ENV_NAMES: [&str; 7] = [
+    "AI_MEMORY_AGENT_ID",
+    "AI_MEMORY_KEY_DIR",
+    "AI_MEMORY_NO_CONFIG",
+    "HOME",
+    "PATH",
+    "XDG_CONFIG_HOME",
+    "XDG_STATE_HOME",
+];
+
+/// The closed list of names the forensic-sink fixture hands a child (sorted).
+const SINK_ENV_NAMES: [&str; 5] = [
+    "AI_MEMORY_AGENT_ID",
+    "AI_MEMORY_KEY_DIR",
+    "HOME",
+    "PATH",
+    "XDG_CONFIG_HOME",
+];
+
+/// The environment of a child: a list of names and values, applied after the
+/// caller's environment is cleared.
+type ChildEnv = Vec<(&'static str, OsString)>;
+
+/// Clear the child's environment and hand it exactly `env`.
+fn apply_env(cmd: &mut Command, env: ChildEnv) {
+    cmd.env_clear();
+    for (name, value) in env {
+        cmd.env(name, value);
+    }
+}
 
 // ---------------------------------------------------------------- sandboxes
 
@@ -190,19 +227,40 @@ fn publish_admitting_snapshot(path: &Path) {
     hub_cache::publish(path, &file).expect("publish the synthetic snapshot");
 }
 
-/// The child environment of a hub user: an unwritable home and key location,
-/// nothing else of the caller's.
+/// The environment of a hub user: an unwritable home and key location,
+/// nothing else of the caller's. A pure function of its arguments: `path` is
+/// the caller's `PATH`.
+fn hub_env(home: &Home, path: OsString, _profile: Option<OsString>) -> ChildEnv {
+    vec![
+        ("PATH", path),
+        ("HOME", home.path.clone().into_os_string()),
+        (
+            "XDG_CONFIG_HOME",
+            home.path.join(".config").into_os_string(),
+        ),
+        (
+            "XDG_STATE_HOME",
+            home.path.join(".local").join("state").into_os_string(),
+        ),
+        ("AI_MEMORY_KEY_DIR", home.key_dir().into_os_string()),
+        ("AI_MEMORY_AGENT_ID", OsString::from(AGENT_ID)),
+        ("AI_MEMORY_NO_CONFIG", OsString::from("1")),
+    ]
+}
+
+/// The child environment of a hub user, built from the test process's own
+/// `PATH` and profile variable.
 fn hub_command(home: &Home, program: &Path) -> Command {
     let mut cmd = Command::new(program);
-    cmd.env_clear()
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-        .env("HOME", &home.path)
-        .env("XDG_CONFIG_HOME", home.path.join(".config"))
-        .env("XDG_STATE_HOME", home.path.join(".local").join("state"))
-        .env("AI_MEMORY_KEY_DIR", home.key_dir())
-        .env("AI_MEMORY_AGENT_ID", AGENT_ID)
-        .env("AI_MEMORY_NO_CONFIG", "1")
-        .stdin(Stdio::null());
+    apply_env(
+        &mut cmd,
+        hub_env(
+            home,
+            std::env::var_os("PATH").unwrap_or_default(),
+            std::env::var_os(PROFILE_VAR),
+        ),
+    );
+    cmd.stdin(Stdio::null());
     cmd
 }
 
@@ -775,18 +833,30 @@ fn sink_outage() -> SinkOutage {
     sb
 }
 
+/// The environment of the forensic-sink child. A pure function of its
+/// arguments, like [`hub_env`].
+fn sink_env(root: &Path, key_dir: &Path, path: OsString, _profile: Option<OsString>) -> ChildEnv {
+    vec![
+        ("PATH", path),
+        ("HOME", root.to_path_buf().into_os_string()),
+        ("XDG_CONFIG_HOME", root.join(".config").into_os_string()),
+        ("AI_MEMORY_KEY_DIR", key_dir.as_os_str().to_owned()),
+        ("AI_MEMORY_AGENT_ID", OsString::from(AGENT_ID)),
+    ]
+}
+
 fn sink_command(sb: &SinkOutage) -> Command {
     let mut cmd = Command::new(bin());
-    cmd.env_clear()
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-        .env("HOME", &sb.root)
-        .env("XDG_CONFIG_HOME", sb.root.join(".config"))
-        .env(
-            "AI_MEMORY_KEY_DIR",
+    apply_env(
+        &mut cmd,
+        sink_env(
+            &sb.root,
             ai_memory::identity::test_key_dir::install(),
-        )
-        .env("AI_MEMORY_AGENT_ID", AGENT_ID)
-        .current_dir(&sb.root)
+            std::env::var_os("PATH").unwrap_or_default(),
+            std::env::var_os(PROFILE_VAR),
+        ),
+    );
+    cmd.current_dir(&sb.root)
         .stdin(Stdio::null())
         .arg("--db")
         .arg(&sb.db);
@@ -1115,4 +1185,82 @@ fn the_refusal_text_is_the_3354_text_9562() {
     assert!(head.starts_with(UNSIGNED_LEDGER_ISSUE), "{head}");
     assert!(head.contains(AGENT_ID), "{head}");
     assert!(tail.contains("Read-only verbs"), "{tail}");
+}
+
+// ------------------------------------------------------ child environment
+
+/// Sorted names of an environment.
+fn env_names(env: &ChildEnv) -> Vec<&'static str> {
+    let mut names: Vec<&'static str> = env.iter().map(|(name, _)| *name).collect();
+    names.sort_unstable();
+    names
+}
+
+/// The value of `name` in `env`, if any.
+fn env_value<'a>(env: &'a ChildEnv, name: &str) -> Option<&'a OsString> {
+    env.iter().find(|(n, _)| *n == name).map(|(_, v)| v)
+}
+
+/// The cleared environment of a child is a closed list (the hub fixture and
+/// the forensic-sink fixture each hold theirs), plus ONE conditional name:
+/// the coverage profile variable, passed with its value unchanged when the
+/// test process has it and absent when it does not. Without it an instrumented
+/// child writes its default profile file into its working directory, which for
+/// the socket-directory cells is the directory the created-files census reads.
+/// A later added name turns this cell red. Values are asserted by equality and
+/// never printed.
+#[test]
+fn the_child_env_is_a_closed_list_plus_the_profile_variable_9562() {
+    let scratch_root = Path::new("/ai-9562-env-cell");
+    let home = Home {
+        label: "env cell",
+        path: scratch_root.join("home"),
+        restore: None,
+    };
+    let path = OsString::from("/ai-9562-env-cell/bin");
+    let outside = OsString::from("/ai-9562-env-cell/outside/cov-%m-%p.profraw");
+
+    for profile in [None, Some(outside.clone())] {
+        let mut hub_expected: Vec<&str> = HUB_ENV_NAMES.to_vec();
+        let mut sink_expected: Vec<&str> = SINK_ENV_NAMES.to_vec();
+        if profile.is_some() {
+            hub_expected.push(PROFILE_VAR);
+            sink_expected.push(PROFILE_VAR);
+        }
+        hub_expected.sort_unstable();
+        sink_expected.sort_unstable();
+
+        let hub = hub_env(&home, path.clone(), profile.clone());
+        let sink = sink_env(
+            scratch_root,
+            &scratch_root.join("keys"),
+            path.clone(),
+            profile.clone(),
+        );
+        assert!(
+            env_names(&hub) == hub_expected,
+            "#9562: the hub fixture's child env names are not the closed list \
+             (profile passed: {})",
+            profile.is_some()
+        );
+        assert!(
+            env_names(&sink) == sink_expected,
+            "#9562: the sink fixture's child env names are not the closed list \
+             (profile passed: {})",
+            profile.is_some()
+        );
+        for env in [&hub, &sink] {
+            match &profile {
+                Some(value) => assert!(
+                    env_value(env, PROFILE_VAR) == Some(value),
+                    "#9562: the profile variable was not passed with its value unchanged"
+                ),
+                None => assert!(
+                    env_value(env, PROFILE_VAR).is_none(),
+                    "#9562: the profile variable was handed to a child that the test \
+                     process did not have it for"
+                ),
+            }
+        }
+    }
 }
