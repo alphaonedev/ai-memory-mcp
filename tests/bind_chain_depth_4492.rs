@@ -695,35 +695,116 @@ async fn sqlite_racing_binds_that_jointly_exceed_the_bound_one_refused_4492() {
     assert_eq!(n, 0, "the refused bind wrote no row");
 }
 
-/// Deadline for the bind-lock waiter to appear (#9252).
+/// The shared waiter for sessions parked on the bind lock (#9252). It counts
+/// only ungranted waits on the bind key, never another advisory wait.
 #[cfg(feature = "sal-postgres")]
-const WAITER_DEADLINE: Duration = Duration::from_secs(30);
+#[path = "common/pg_bind_wait.rs"]
+mod pg_bind_wait;
+#[cfg(feature = "sal-postgres")]
+use pg_bind_wait::await_bind_waiters;
 
-/// Waits until at least `want` sessions are parked on an advisory lock request
-/// (the bind lock), seen in `pg_locks`. A bind that never parks fails the cell
-/// with the named setup error; the cell can no longer pass without having
-/// provoked the race (#9252).
+/// How long the foreign-wait probe watches the bind key before it accepts
+/// that nothing parked there.
 #[cfg(feature = "sal-postgres")]
-async fn await_bind_waiters(pool: &sqlx::PgPool, want: i64) {
-    let deadline = tokio::time::Instant::now() + WAITER_DEADLINE;
-    loop {
-        let waiting: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM pg_locks l JOIN pg_database d ON d.oid = l.database \
-              WHERE l.locktype = 'advisory' AND NOT l.granted \
-                AND d.datname = current_database()",
-        )
-        .fetch_one(pool)
-        .await
-        .expect("setup error: pg_locks probe failed");
-        if waiting >= want {
-            return;
-        }
+const FOREIGN_WAIT_PROBE: Duration = Duration::from_millis(500);
+
+/// #9252: structural pin. The bind waiter lives once, in the shared helper,
+/// and counts only the bind key. A copy of the unkeyed waiter in either bind
+/// race file brings the false green back.
+#[test]
+fn the_bind_waiter_has_one_shared_keyed_copy_9252() {
+    const HELPER: &str = include_str!("common/pg_bind_wait.rs");
+    const THIS_FILE: &str = include_str!("bind_chain_depth_4492.rs");
+    const OTHER_FILE: &str = include_str!("ns_standard_ancestor_bind_race_4356.rs");
+    for (name, source) in [
+        ("bind_chain_depth_4492", THIS_FILE),
+        ("ns_standard_ancestor_bind_race_4356", OTHER_FILE),
+    ] {
         assert!(
-            tokio::time::Instant::now() < deadline,
-            "setup error: only {waiting} of {want} binds ever parked on the bind lock"
+            !source.contains(concat!("async fn ", "await_bind_waiters")),
+            "{name} must use the shared waiter, not define its own"
         );
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            source.contains("common/pg_bind_wait.rs"),
+            "{name} must take the shared waiter"
+        );
     }
+    assert!(
+        HELPER.contains("hashtext($1)") && HELPER.contains("classid") && HELPER.contains("objid"),
+        "the shared waiter must be keyed on the hashed advisory key"
+    );
+}
+
+/// #9252: a waiter parked on an UNRELATED advisory key must not satisfy the
+/// bind-lock wait. The old waiter counted every ungranted advisory lock in
+/// the database, so this foreign wait made it return at once, before the
+/// bind under test had parked.
+#[cfg(feature = "sal-postgres")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_foreign_advisory_wait_does_not_satisfy_the_bind_waiter_9252() {
+    let Some(url) = common::postgres_url() else {
+        return;
+    };
+    let _serial = SERIAL.lock().await;
+    let pool = sqlx::PgPool::connect(&url).await.expect("raw pool");
+    let bind_key = ai_memory::ns_standard_ancestor::PG_STANDARD_BIND_LOCK_KEY;
+    let foreign_key = format!("t9252_foreign_{}", uuid::Uuid::new_v4().simple());
+
+    // A holds the FOREIGN key; B parks behind it.
+    let mut foreign_holder = pool.begin().await.expect("foreign holder tx");
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+        .bind(&foreign_key)
+        .execute(&mut *foreign_holder)
+        .await
+        .expect("take the foreign lock");
+    let foreign_waiter = {
+        let (pool, key) = (pool.clone(), foreign_key.clone());
+        tokio::spawn(async move {
+            let mut tx = pool.begin().await.expect("foreign waiter tx");
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+                .bind(&key)
+                .execute(&mut *tx)
+                .await
+                .expect("foreign waiter gets the lock once released");
+            tx.commit().await.expect("foreign waiter commit");
+        })
+    };
+    pg_bind_wait::await_advisory_waiters(&pool, &foreign_key, 1, pg_bind_wait::BIND_WAIT_DEADLINE)
+        .await
+        .expect("the foreign waiter must park (the probe sees its own key)");
+
+    // The foreign wait is a real ungranted advisory lock, but not the bind lock.
+    let seen = pg_bind_wait::await_advisory_waiters(&pool, bind_key, 1, FOREIGN_WAIT_PROBE).await;
+    assert!(
+        seen.is_err(),
+        "a wait on another advisory key must not satisfy the bind-lock waiter"
+    );
+
+    // A real bind-lock wait IS seen.
+    let mut bind_holder = pool.begin().await.expect("bind holder tx");
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+        .bind(bind_key)
+        .execute(&mut *bind_holder)
+        .await
+        .expect("take the bind lock");
+    let bind_waiter = {
+        let pool = pool.clone();
+        tokio::spawn(async move {
+            let mut tx = pool.begin().await.expect("bind waiter tx");
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+                .bind(bind_key)
+                .execute(&mut *tx)
+                .await
+                .expect("bind waiter gets the lock once released");
+            tx.commit().await.expect("bind waiter commit");
+        })
+    };
+    await_bind_waiters(&pool, 1).await;
+
+    foreign_holder.commit().await.expect("release foreign");
+    bind_holder.commit().await.expect("release bind");
+    foreign_waiter.await.expect("foreign waiter task");
+    bind_waiter.await.expect("bind waiter task");
 }
 
 #[cfg(feature = "sal-postgres")]

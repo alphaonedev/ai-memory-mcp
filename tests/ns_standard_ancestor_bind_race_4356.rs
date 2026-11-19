@@ -140,8 +140,15 @@ async fn sqlite_concurrent_first_bind_cannot_pass_on_a_stale_chain_4356() {
     assert_eq!(n, 0, "a refused racing bind must leave no binding");
 }
 
+/// The shared waiter for sessions parked on the bind lock (#9252). It counts
+/// only ungranted waits on the bind key, never another advisory wait.
+#[cfg(feature = "sal-postgres")]
+#[path = "common/pg_bind_wait.rs"]
+mod pg_bind_wait;
+
 #[cfg(feature = "sal-postgres")]
 mod pg {
+    use super::pg_bind_wait::await_bind_waiters;
     use super::*;
     use ai_memory::config::{FeatureTier, ResolvedScoring, ResolvedTtl};
     use ai_memory::handlers::{ApiKeyState, AppState, Db, StorageBackend};
@@ -256,35 +263,6 @@ mod pg {
             app,
         );
         (r, store)
-    }
-
-    /// Deadline for the bind-lock waiters to appear (#9252).
-    const WAITER_DEADLINE: Duration = Duration::from_secs(30);
-
-    /// Waits until at least `want` sessions are parked on an advisory lock
-    /// request (the bind lock), seen in `pg_locks`. A bind that never parks
-    /// fails the cell with the named setup error; the cell can no longer pass
-    /// without having provoked the race.
-    async fn await_bind_waiters(pool: &sqlx::PgPool, want: i64) {
-        let deadline = tokio::time::Instant::now() + WAITER_DEADLINE;
-        loop {
-            let waiting: i64 = sqlx::query_scalar(
-                "SELECT count(*) FROM pg_locks l JOIN pg_database d ON d.oid = l.database \
-                  WHERE l.locktype = 'advisory' AND NOT l.granted \
-                    AND d.datname = current_database()",
-            )
-            .fetch_one(pool)
-            .await
-            .expect("setup error: pg_locks probe failed");
-            if waiting >= want {
-                return;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "setup error: only {waiting} of {want} binds ever parked on the bind lock"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
     }
 
     /// postgres: the in-flight ancestor bind holds the bind advisory lock and
