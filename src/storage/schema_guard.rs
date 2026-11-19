@@ -457,44 +457,65 @@ pub fn schema_ahead_of(err: &anyhow::Error) -> Option<&SchemaAheadOfBinary> {
 pub const SCHEMA_BEHIND_READ_ONLY_REFUSAL: &str =
     crate::errors::error_codes::SCHEMA_BEHIND_READ_ONLY_REFUSAL;
 
-/// Repair verb named in the SQLITE schema-behind refusal (and in `boot` /
-/// `doctor` copy, which only ever read a sqlite file). One spelling so the
-/// hardcoded-literals ratchet does not re-grow. A postgres store is repaired
-/// by [`SCHEMA_BEHIND_REPAIR_POSTGRES`]; select by backend with
-/// [`schema_behind_repair`].
+/// Repair command named for a SQLITE store that is behind (public until B4 routes
+/// every renderer through the function; then it is private):
+/// see [`schema_behind_repair_clause`].
 pub const SCHEMA_BEHIND_REPAIR: &str = "ai-memory migrate --in-place";
 
-/// v1.0.0 #9504 — repair verb for a POSTGRES store that is behind: opening the
-/// store runs the upgrade ladder (`docs/postgres-age-guide.md`, "Old postgres
-/// schema version detected"; `schema-init` is `--features sal`).
+/// v1.0.0 #9504 — repair command for a POSTGRES store that is behind: opening
+/// the store runs the upgrade ladder (`docs/postgres-age-guide.md`, "Old
+/// postgres schema version detected"; `schema-init` is `--features sal`).
 pub const SCHEMA_BEHIND_REPAIR_POSTGRES: &str = "ai-memory schema-init --store-url <url>";
 
-/// v1.0.0 #9504 — the schema-behind repair verb that is right for `backend`
-/// ([`BACKEND_SQLITE`] or [`BACKEND_POSTGRES`]); every renderer calls this.
-#[must_use]
-pub fn schema_behind_repair(backend: &str) -> &'static str {
-    if backend == BACKEND_POSTGRES {
-        SCHEMA_BEHIND_REPAIR_POSTGRES
-    } else {
-        SCHEMA_BEHIND_REPAIR
+/// Companion repair: starting the daemon runs [`crate::db::open`], which
+/// migrates (the default build has no `migrate` subcommand).
+pub const SCHEMA_BEHIND_REPAIR_DAEMON: &str = "start the daemon";
+
+/// v1.0.0 #9557 B2 — the clause for a backend label this binary does not
+/// know. It names no repair command (any verb would be another backend's) and
+/// says why.
+const SCHEMA_BEHIND_REPAIR_UNKNOWN_BACKEND: &str =
+    "Repair: the backend is not known, so no repair command is named; start the daemon";
+
+/// The stores a schema-behind repair text can be about. Parsed from the label
+/// with an EXACT match ([`Self::from_label`]); everything else is
+/// [`Self::Unknown`], which has its own text and never borrows a verb.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RepairBackend {
+    Sqlite,
+    Postgres,
+    Unknown,
+}
+
+impl RepairBackend {
+    fn from_label(label: &str) -> Self {
+        match label {
+            BACKEND_SQLITE => Self::Sqlite,
+            BACKEND_POSTGRES => Self::Postgres,
+            _ => Self::Unknown,
+        }
     }
 }
 
-/// v1.0.0 #9557 — the repair clause of a schema-behind text for `backend`
-/// (red-commit form: the old if/else selection; B2 replaces it).
+/// v1.0.0 #9504 / #9557 B2 B4 / #9564 — THE one place an operator-facing
+/// schema-behind repair text is built: `Repair: ...` for the backend named by
+/// `backend` ([`BACKEND_SQLITE`] or [`BACKEND_POSTGRES`]). The match is
+/// exhaustive over [`RepairBackend`], so an unknown label gets the
+/// [`SCHEMA_BEHIND_REPAIR_UNKNOWN_BACKEND`] text and never another backend's
+/// command. `boot`, `doctor`, [`SchemaBehindReadOnly`] and
+/// [`ProvenanceReadFault`] all render through this function.
 #[must_use]
 pub fn schema_behind_repair_clause(backend: &str) -> String {
-    format!(
-        "Repair: `{}` or {}",
-        schema_behind_repair(backend),
-        SCHEMA_BEHIND_REPAIR_DAEMON
-    )
+    match RepairBackend::from_label(backend) {
+        RepairBackend::Sqlite => {
+            format!("Repair: `{SCHEMA_BEHIND_REPAIR}` or {SCHEMA_BEHIND_REPAIR_DAEMON}")
+        }
+        RepairBackend::Postgres => {
+            format!("Repair: `{SCHEMA_BEHIND_REPAIR_POSTGRES}` or {SCHEMA_BEHIND_REPAIR_DAEMON}")
+        }
+        RepairBackend::Unknown => SCHEMA_BEHIND_REPAIR_UNKNOWN_BACKEND.to_string(),
+    }
 }
-
-/// Companion repair: starting the daemon runs [`crate::db::open`], which
-/// migrates. Named next to [`SCHEMA_BEHIND_REPAIR`] because the default
-/// build has no `migrate` subcommand (`Migrate` is `--features sal`).
-pub const SCHEMA_BEHIND_REPAIR_DAEMON: &str = "start the daemon";
 
 /// v1.0.0 #3411 / #3434 — the typed refusal: this database's schema is
 /// BEHIND what this binary's migration ladder produces, and the caller is
@@ -544,11 +565,10 @@ fn render_behind(observed: i64, supported: i64, backend: &str, target: &str) -> 
     format!(
         "{slug}: database schema is BEHIND this binary: {target} ({backend}) is on schema \
          v{observed}, but ai-memory {bin} is at v{supported}. This read-only verb will not \
-         migrate. Repair: `{repair}` or {daemon}, then re-run.",
+         migrate. {repair}, then re-run.",
         slug = SCHEMA_BEHIND_READ_ONLY_REFUSAL,
         bin = crate::PKG_VERSION,
-        repair = schema_behind_repair(backend),
-        daemon = SCHEMA_BEHIND_REPAIR_DAEMON,
+        repair = schema_behind_repair_clause(backend),
     )
 }
 
@@ -996,9 +1016,9 @@ mod tests {
             "{}",
             err.detail
         );
-        assert!(err.detail.contains(SCHEMA_BEHIND_REPAIR), "{}", err.detail);
         assert!(
-            err.detail.contains(SCHEMA_BEHIND_REPAIR_DAEMON),
+            err.detail
+                .contains(&schema_behind_repair_clause(BACKEND_SQLITE)),
             "{}",
             err.detail
         );
