@@ -86,7 +86,7 @@ class Mutants(unittest.TestCase):
 FLAG = 'AI_MEMORY_TEST_PG_ISOLATE'
 CI_REL = '.github/workflows/ci.yml'
 ENTRY_PATH = REPO / 'scripts' / 'ci' / 'pg_isolate_serial_step.py'
-ALLOWED_STEP = 'Serial shard isolated binaries (linux-fed enterprise-fed, #9592)'
+ALLOWED_STEP = 'Serial shard isolated binaries (linux-fed enterprise-fed, issue 9592)'
 ALLOWED_IF = ("${{ !cancelled() && steps.run-tests.outcome != 'skipped' && "
               "needs.classify.outputs.cargo_skip != 'true' && matrix.node == 'linux-fed' && "
               "matrix.tier == 'enterprise-fed' }}")
