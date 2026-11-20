@@ -282,8 +282,7 @@ fn refused_default_config_write_is_reported_by_path_9620() {
         return;
     }
     let out = sb.run(&["store", "--title", "t", "--content", "c"]);
-    fs::set_permissions(sb.config_dir(), fs::Permissions::from_mode(0o700))
-        .expect("restore mode");
+    fs::set_permissions(sb.config_dir(), fs::Permissions::from_mode(0o700)).expect("restore mode");
     let stderr = stderr_of(&out);
     let named = sb.config_path().display().to_string();
     assert!(

@@ -31,7 +31,7 @@ use ai_memory::tls;
 // (color init, OnceLock-backed permissions/hmac/audit posture) and
 // can call `std::process::exit(78)` on a bad hmac secret, which would
 // abort the test harness. Its individual steps are covered indirectly:
-//   - `config::AppConfig::load_for_boot` / `write_default_if_missing` — config tests
+//   - `config::AppConfig::load_for_boot` / `write_default_if_missing` — config tests (writing commands only, #9620)
 //     (+ `tests/boot_fail_closed_config_3166.rs` drives the real binary)
 //   - `daemon_runtime::apply_startup_env` / `apply_anonymize_default` — daemon_runtime tests
 //   - `config::set_active_permissions_mode` / `set_active_hooks_hmac_secret`
@@ -152,7 +152,16 @@ fn main() -> Result<()> {
             }
         }
     };
-    config::AppConfig::write_default_if_missing();
+    // #9620 — only a command that WRITES state seeds the default config, and
+    // a refused write is reported by path (rust-1-98 ERRORS-19), never
+    // dropped. Read-only and diagnostic verbs create nothing.
+    if writes_default_config(&cli.command)
+        && let Err(e) = config::AppConfig::write_default_if_missing()
+    {
+        let path = config::AppConfig::config_path()
+            .map_or_else(|| "<unresolved>".to_string(), |p| p.display().to_string());
+        eprintln!("ai-memory: WARN could not write the default config {path}: {e}");
+    }
 
     // #1889 — ALL env mutation (passphrase-file export + anonymize seeding)
     // happens HERE, synchronously, before any thread (tracing appender worker,
@@ -531,6 +540,28 @@ fn config_tolerant_command(cmd: &daemon_runtime::Command) -> bool {
                 action: daemon_runtime::GovernanceAction::MigrateToPermissions(_),
                 ..
             })
+    )
+}
+
+/// #9620 — the commands that seed `<config dir>/ai-memory/config.toml` on a
+/// host that has none. An ALLOW-list of WRITING commands: a verb not listed
+/// here (every read-only and diagnostic verb, and any verb added later)
+/// creates no file at start. A new `Command` variant needs a verdict in
+/// `writes_default_config_has_a_verdict_for_every_command_9620`.
+fn writes_default_config(cmd: &daemon_runtime::Command) -> bool {
+    matches!(
+        cmd,
+        daemon_runtime::Command::Serve(_)
+            | daemon_runtime::Command::Mcp { .. }
+            | daemon_runtime::Command::SyncDaemon(_)
+            | daemon_runtime::Command::Boot(_)
+            | daemon_runtime::Command::Install(_)
+            | daemon_runtime::Command::Wrap(_)
+            | daemon_runtime::Command::Store(_)
+            | daemon_runtime::Command::CaptureTurn(_)
+            | daemon_runtime::Command::Import(_)
+            | daemon_runtime::Command::Restore(_)
+            | daemon_runtime::Command::Mine(_)
     )
 }
 
@@ -927,6 +958,210 @@ fn warn_if_plaintext_retention_requested(audit_cfg: &config::AuditConfig) -> boo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
+
+    /// #9620 — the verdict for EVERY top-level verb: does it seed the default
+    /// config? Adding a `Command` variant without a row here fails
+    /// `writes_default_config_has_a_verdict_for_every_command_9620`.
+    const DEFAULT_CONFIG_VERDICTS: &[(&str, bool)] = &[
+        ("serve", true),
+        ("mcp", true),
+        ("store", true),
+        ("update", false),
+        ("recall", false),
+        ("search", false),
+        ("get", false),
+        ("list", false),
+        ("delete", false),
+        ("promote", false),
+        ("forget", false),
+        ("link", false),
+        ("consolidate", false),
+        ("gc", false),
+        ("stats", false),
+        ("namespaces", false),
+        ("namespace", false),
+        ("config", false),
+        ("export", false),
+        ("import", true),
+        ("resolve", false),
+        ("shell", false),
+        ("sync", false),
+        ("sync-daemon", true),
+        ("auto-consolidate", false),
+        ("completions", false),
+        ("man", false),
+        ("mine", true),
+        ("archive", false),
+        ("agents", false),
+        ("identity", false),
+        ("keys", false),
+        ("tls", false),
+        ("capability", false),
+        ("offload", false),
+        ("deref", false),
+        ("rules", false),
+        ("model-attest", false),
+        ("quarantine", false),
+        ("epoch-apply", false),
+        ("pending", false),
+        ("backup", false),
+        ("restore", true),
+        ("curator", false),
+        ("bench", false),
+        ("migrate", false),
+        ("schema-init", false),
+        ("doctor", false),
+        ("boot", true),
+        ("install", true),
+        ("wrap", true),
+        ("logs", false),
+        ("audit", false),
+        ("governance", false),
+        ("verify-reflection-chain", false),
+        ("verify-signed-events-chain", false),
+        ("verify-audit-trail", false),
+        ("export-forensic-bundle", false),
+        ("verify-forensic-bundle", false),
+        ("export-reflections", false),
+        ("recover-previous-session", false),
+        ("watch", false),
+        ("wake-hub", false),
+        ("wake-listen", false),
+        ("atomise", false),
+        ("persona", false),
+        ("calibrate", false),
+        ("skill", false),
+        ("share", false),
+        ("kg-query", false),
+        ("find-paths", false),
+        ("lineage", false),
+        ("recall-observations", false),
+        ("expand", false),
+        ("check-duplicate", false),
+        ("reembed", false),
+        ("undo-edit", false),
+        ("reown", false),
+        ("stop", false),
+        ("replay", false),
+        ("reflect", false),
+        ("subscribe", false),
+        ("unsubscribe", false),
+        ("list-subscriptions", false),
+        ("subscription-replay", false),
+        ("subscription-dlq-list", false),
+        ("notify", false),
+        ("capture-turn", true),
+        ("inbox", false),
+        ("ingest-multistep", false),
+        ("kg-invalidate", false),
+        ("kg-timeline", false),
+        ("entity-register", false),
+        ("entity-get-by-alias", false),
+        ("dependents-of-invalidated", false),
+        ("swarm-rewind", false),
+        ("reflection-origin", false),
+        ("quota-status", false),
+        ("features", false),
+    ];
+
+    /// Verbs that exist only behind the `sal` feature.
+    const SAL_ONLY_VERBS: &[&str] = &["migrate", "schema-init"];
+
+    /// Build an argv for `sub` that satisfies its required arguments, trying
+    /// each filler in turn (`x` for text, `1` for numbers).
+    fn argv_for(sub: &clap::Command, filler: &str) -> Vec<String> {
+        let mut argv = vec![sub.get_name().to_string()];
+        for arg in sub.get_arguments() {
+            if !arg.is_required_set() || arg.is_global_set() {
+                continue;
+            }
+            match arg.get_long() {
+                Some(long) => {
+                    argv.push(format!("--{long}"));
+                    if arg.get_action().takes_values() {
+                        argv.push(filler.to_string());
+                    }
+                }
+                None => argv.push(filler.to_string()),
+            }
+        }
+        if sub.is_subcommand_required_set()
+            && let Some(first) = sub.get_subcommands().next()
+        {
+            argv.extend(argv_for(first, filler));
+        }
+        argv
+    }
+
+    /// Verbs whose required arguments are an enum value or a conditional
+    /// requirement the generator cannot infer.
+    const ARGV_OVERRIDES: &[(&str, &[&str])] = &[
+        ("completions", &["completions", "bash"]),
+        ("reown", &["reown", "--all-namespaces", "--to", "ai:x"]),
+    ];
+
+    fn parse_verb(sub: &clap::Command) -> Option<daemon_runtime::Command> {
+        if let Some((_, argv)) = ARGV_OVERRIDES.iter().find(|(n, _)| *n == sub.get_name()) {
+            let full = std::iter::once("ai-memory").chain(argv.iter().copied());
+            return Cli::try_parse_from(full).ok().map(|cli| cli.command);
+        }
+        ["x", "1", "0"].iter().find_map(|filler| {
+            let mut full = vec!["ai-memory".to_string()];
+            full.extend(argv_for(sub, filler));
+            Cli::try_parse_from(full).ok().map(|cli| cli.command)
+        })
+    }
+
+    /// #9620 (e) — a table over the WHOLE `Command` enum. The table and
+    /// clap's subcommand list must name exactly the same verbs (a new
+    /// variant without a verdict, or a stale row, fails), and the real
+    /// classifier must agree with the verdict for each parsed verb.
+    #[test]
+    fn writes_default_config_has_a_verdict_for_every_command_9620() {
+        let root = Cli::command();
+        let actual: std::collections::BTreeSet<String> = root
+            .get_subcommands()
+            .map(|s| s.get_name().to_string())
+            .filter(|n| n != "help")
+            .collect();
+        let tabled: std::collections::BTreeSet<String> = DEFAULT_CONFIG_VERDICTS
+            .iter()
+            .map(|(n, _)| (*n).to_string())
+            .filter(|n| cfg!(feature = "sal") || !SAL_ONLY_VERBS.contains(&n.as_str()))
+            .collect();
+        let missing: Vec<_> = actual.difference(&tabled).collect();
+        let stale: Vec<_> = tabled.difference(&actual).collect();
+        assert!(
+            missing.is_empty() && stale.is_empty(),
+            "#9620: every Command variant needs a default-config verdict; \
+             missing from the table: {missing:?}; stale rows: {stale:?}"
+        );
+        let mut unparsed = Vec::new();
+        for sub in root.get_subcommands().filter(|s| s.get_name() != "help") {
+            let name = sub.get_name();
+            let Some(expected) = DEFAULT_CONFIG_VERDICTS
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, w)| *w)
+            else {
+                continue;
+            };
+            let Some(cmd) = parse_verb(sub) else {
+                unparsed.push(name.to_string());
+                continue;
+            };
+            assert_eq!(
+                writes_default_config(&cmd),
+                expected,
+                "#9620: `{name}` default-config verdict disagrees with the table"
+            );
+        }
+        assert!(
+            unparsed.is_empty(),
+            "#9620: the argv generator could not build these verbs: {unparsed:?}"
+        );
+    }
 
     /// #4319 — only the long-running request servers queue forensic rows on
     /// the background writer; every other command writes inline, so a

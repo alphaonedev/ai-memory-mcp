@@ -10388,17 +10388,43 @@ impl AppConfig {
         }
     }
 
-    /// Write a default config file if one doesn't exist yet.
-    pub fn write_default_if_missing() {
-        let Some(path) = Self::config_path() else {
-            return;
-        };
-        if path.exists() {
-            return;
+    /// Write a default config file if one doesn't exist yet (#9620).
+    ///
+    /// No config path resolvable is `Ok(())`. A file already present is left
+    /// byte for byte alone. Any other failure is returned so the caller can
+    /// name the path (rust-1-98 ERRORS-19); the caller decides which commands
+    /// write at all (`writes_default_config` in `src/main.rs`).
+    ///
+    /// # Errors
+    /// The I/O error from creating the config directory or the file.
+    pub fn write_default_if_missing() -> std::io::Result<()> {
+        match Self::config_path() {
+            Some(path) => Self::write_default_at(&path),
+            None => Ok(()),
         }
+    }
+
+    /// Create `path` with the default template, atomically: `create_new`
+    /// fails with `AlreadyExists` rather than truncating a file that appeared
+    /// since any earlier check, so there is no check-then-write race (#9620).
+    ///
+    /// # Errors
+    /// The I/O error from creating the parent directory, opening the file
+    /// (other than `AlreadyExists`, which is `Ok(())`) or writing it.
+    pub fn write_default_at(path: &std::path::Path) -> std::io::Result<()> {
+        use std::io::Write;
         if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            std::fs::create_dir_all(parent)?;
         }
+        let mut file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+        {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
+            Err(e) => return Err(e),
+        };
         let default_toml = r#"# ai-memory configuration
 # See: https://github.com/alphaonedev/ai-memory-mcp
 
@@ -10538,7 +10564,7 @@ impl AppConfig {
 # enabled = true
 # redact_titles = false
 "#;
-        let _ = std::fs::write(&path, default_toml);
+        file.write_all(default_toml.as_bytes())
     }
 }
 
@@ -11684,16 +11710,53 @@ legacy_scoring = false
         // SAFETY: env mutation serialised by `_g`.
         unsafe { std::env::set_var("HOME", tmp.path()) };
         // First call writes the file.
-        AppConfig::write_default_if_missing();
+        AppConfig::write_default_if_missing().expect("first call writes the default config");
         let expected = AppConfig::config_path().unwrap();
         assert!(expected.exists(), "config not written at {expected:?}");
         let original = std::fs::read_to_string(&expected).unwrap();
         assert!(original.contains("ai-memory configuration"));
         // Second call must NOT overwrite (idempotent).
         std::fs::write(&expected, "# user-edited\n").unwrap();
-        AppConfig::write_default_if_missing();
+        AppConfig::write_default_if_missing().expect("second call is a no-op");
         let after = std::fs::read_to_string(&expected).unwrap();
         assert_eq!(after, "# user-edited\n");
+    }
+
+    /// #9620 — an existing file is left byte for byte alone and reported Ok.
+    #[test]
+    fn write_default_at_leaves_an_existing_file_alone_9620() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("ai-memory").join("config.toml");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "# mine\n").unwrap();
+        AppConfig::write_default_at(&path).expect("AlreadyExists is Ok");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "# mine\n");
+    }
+
+    /// #9620 — a missing file is created with the template, parents included.
+    #[test]
+    fn write_default_at_creates_parents_and_template_9620() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("a").join("b").join("config.toml");
+        AppConfig::write_default_at(&path).expect("creates");
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.starts_with("# ai-memory configuration"), "{body:.40}");
+    }
+
+    /// #9620 — a refused write is an Err, never dropped: here the parent
+    /// path is a regular file, so the directory cannot be created.
+    #[test]
+    fn write_default_at_reports_a_refused_parent_9620() {
+        let tmp = tempfile::tempdir().unwrap();
+        let blocker = tmp.path().join("blocker");
+        std::fs::write(&blocker, "x").unwrap();
+        let path = blocker.join("config.toml");
+        let err = AppConfig::write_default_at(&path).expect_err("parent is a file");
+        // `create_dir_all` reports a non-directory in the way as an error;
+        // it must reach the caller instead of being read as "already there".
+        assert!(!err.to_string().is_empty(), "error carries a message");
+        assert!(!path.exists());
+        assert_eq!(std::fs::read_to_string(&blocker).unwrap(), "x");
     }
 
     #[test]
@@ -12677,7 +12740,7 @@ legacy_scoring = false
         let tmp = tempfile::tempdir().expect("tempdir");
         // SAFETY: env mutation serialised by `_g`.
         unsafe { std::env::set_var("HOME", tmp.path()) };
-        AppConfig::write_default_if_missing();
+        AppConfig::write_default_if_missing().expect("default config written");
         let written = AppConfig::config_path().expect("config_path resolves");
         let contents = std::fs::read_to_string(&written).expect("default toml written");
         assert!(
