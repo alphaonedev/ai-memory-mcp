@@ -94,7 +94,9 @@ path, no traversal-order surprises.
   verified or was not checked (no genesis or no cid stored), and (with
   `--cid`) no swept row mismatched or was unreadable.
 - `1` — the root memory was not found (`ok: false`, `not_found: true`
-  in JSON mode), or the arguments are wrong: you asked wrongly.
+  in JSON mode), or the arguments are wrong: you asked wrongly. Exit
+  `1` also: the report could not be written (a stdout or stderr write
+  failed).
 - `2` — verification failed (`ok: false`): at least one edge failed
   signature verification, OR the chain exceeds its namespace
   `max_reflection_depth` cap, OR the root's content-id genesis
