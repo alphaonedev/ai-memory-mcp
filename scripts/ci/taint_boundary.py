@@ -30,7 +30,9 @@ a pin that differs from its row count is a failure. Pins at PR 9508: unclassifia
 not-analysed 3, violation 33 (the 13 rows before PR 9508, 4 rows of #9553 and 16 rows of #9570).
 The pins are the baseline of the tree PR 9508 lands on (the merge of chain tip 902faa04 moved the
 unclassifiable pin 41 -> 47 once; the pre-scan of #9566 moved it 47 -> 33 and the violation pin
-17 -> 33 once); after it lands they only go down. The fixpoint proof
+17 -> 33 once); after it lands they only go down. Stage 1 of #9455 moved
+session-boot-lifetime.yml lifetime-tests to hosted runners and lowered the violation pin by one
+(17 -> 16 on the chain, 33 -> 32 after the pre-scan of #9566). The fixpoint proof
 (all rows applied: zero findings; any one row removed: exactly that form or line) is a proof for
 what the scan reaches only. A test makes no network call: the
 conductor checks that every cited issue is open at each landing of a fix of these issues, and
@@ -185,8 +187,8 @@ class AllowRow:
     gate_step: bool = False
 
 
-# The six hits of the survey at a028c45e, the six host-credential reads and the R2 row of
-# lifetime-tests (ruling abf38892 section 7). Removing a row is the fix lane's job; adding a
+# The six hits of the survey at a028c45e and the six host-credential reads (ruling abf38892
+# section 7); the R2 row of lifetime-tests left with stage 1 of #9455. Removing a row is the fix lane's job; adding a
 # row needs an issue number from the deputy (the pin moves with it).
 _RELEASE = "release.yml"
 TAINT_ALLOW: tuple[AllowRow, ...] = (
@@ -199,7 +201,6 @@ TAINT_ALLOW: tuple[AllowRow, ...] = (
     AllowRow("ci.yml", "check", R2_STEP_LABEL, (CLASS_PERSISTENT_STATE,), 9455),
     AllowRow("cert-postgres-age.yml", "cert-postgres-age", R2_STEP_LABEL, (CLASS_PERSISTENT_STATE,), 9455),
     AllowRow("postgres-ignored.yml", "postgres-ignored", R2_STEP_LABEL, (CLASS_PERSISTENT_STATE,), 9455),
-    AllowRow("session-boot-lifetime.yml", "lifetime-tests", R2_STEP_LABEL, (CLASS_PERSISTENT_STATE,), 9455),
     AllowRow("coverage.yml", "per-module-thresholds", "Post coverage to PR (sticky) (#1993)",
              (CLASS_WRITE_TOKEN, CLASS_SECRET), 9456),
     # Ruling 04701c74: a credential resident on a self-hosted host read after pull-request code is (i); the
@@ -242,7 +243,7 @@ TAINT_ALLOW: tuple[AllowRow, ...] = (
     AllowRow(_RELEASE, 'sbom', 'Attest build provenance (CycloneDX SBOM)', (CLASS_SECRET, CLASS_WRITE_TOKEN), 9570),
     AllowRow(_RELEASE, 'sbom', 'Upload to GitHub Release', (CLASS_SECRET,), 9570),
 )
-TAINT_ALLOW_PIN = 33
+TAINT_ALLOW_PIN = 32
 # The open fix issues a violation row may name (the fixed set of that kind); a row naming any
 # other value is a finding.
 FIX_ISSUES = frozenset({9454, 9455, 9456, 9471, 9553, 9570})
@@ -272,7 +273,7 @@ OPEN_ROW_ISSUES = (frozenset({9533}) | frozenset(range(9535, 9540)) | frozenset(
 NOT_ANALYSED_ROW_ISSUES = frozenset({9550, 9551, 9552})
 NOT_ANALYSED_MARKER = "rest-not-analysed"
 # Each pin only goes down; a pin above its ceiling is a failure.
-PIN_CEILINGS = {KIND_UNCLASSIFIABLE: 33, KIND_VIOLATION: 33, KIND_NOT_ANALYSED: 3}
+PIN_CEILINGS = {KIND_UNCLASSIFIABLE: 33, KIND_VIOLATION: 32, KIND_NOT_ANALYSED: 3}
 # Characters no workflow, job, step or operand of a row may hold: a row names one place.
 ROW_GLOB_CHARS = frozenset("*?[]{}")
 # A braced parameter reference of one plain name, the only brace an operand may hold: the shell

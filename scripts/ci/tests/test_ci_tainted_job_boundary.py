@@ -40,9 +40,9 @@ else:
 
 # Three row kinds, three pins (FINAL efb2b9e8, correction 0773f6ce); each pin only goes down.
 # Kind violation: the 13 rows before PR 9508, 4 class (iii) rows of #9553 and the 16 release.yml
-# rows of #9570.
-ALLOW_PIN_EXPECTED = 33
-ALLOW_ROW_COUNT = 13
+# rows of #9570; stage 1 of #9455 removed the lifetime-tests R2 row (33 -> 32).
+ALLOW_PIN_EXPECTED = 32
+ALLOW_ROW_COUNT = 12
 NEW_VIOLATION_ROW_COUNT = 4
 RELEASE_ROW_COUNT = 16
 OPEN_PIN_EXPECTED = 33
@@ -656,8 +656,9 @@ R2_ROWS = (
     ("ci.yml", "check"),
     ("cert-postgres-age.yml", "cert-postgres-age"),
     ("postgres-ignored.yml", "postgres-ignored"),
-    ("session-boot-lifetime.yml", "lifetime-tests"),
 )
+# Stage 1 of #9455: this job left the persistent runner; its R2 row is gone.
+HOSTED_SESSION_BOOT = ("session-boot-lifetime.yml", "lifetime-tests")
 
 # Shell text -> runs pull-request code, or the exact Unclassifiable reason (a str), in the
 # reading of a job with a pull-request trigger (strict).
@@ -1318,7 +1319,10 @@ class PersistentRunnerTrustedTrigger(unittest.TestCase):
                     self.assertEqual(result.verdicts[key], "unclassifiable")
                 else:
                     self.assertIn(CLASS_IV, result.verdicts[key].split(","))
-        self.assertEqual(result.verdicts[("session-boot-lifetime.yml", "lifetime-tests")], CLASS_IV)
+        # Hosted on every leg: no R2 violation, and no row may cover it. Its suite step runs the
+        # checked-out tree, so the pre-scan of #9566 sends it to the full analysis: no PR code.
+        self.assertEqual(result.verdicts[HOSTED_SESSION_BOOT], "no-pr-code")
+        self.assertNotIn(HOSTED_SESSION_BOOT, rows)
 
     def test_9452_r2_stale_row_for_a_gone_job_is_a_failure(self) -> None:
         _need_module(self)
@@ -1516,7 +1520,6 @@ class RealWorkflows(unittest.TestCase):
         self.assertEqual(hits, {
             ("c8-precheck.yml", "required-contexts-gate"): "i",
             ("postgres-ignored.yml", "postgres-ignored"): "i,iv",
-            ("session-boot-lifetime.yml", "lifetime-tests"): "iv",
         } | REAL_RELEASE_VERDICTS | {key: "unclassifiable" for key in REAL_UNCLASSIFIABLE_JOBS})
 
     def test_9452_real_unclassifiable_forms_are_exactly_the_listed_findings(self) -> None:
