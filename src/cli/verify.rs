@@ -118,6 +118,9 @@ impl CidSweepReport {
     }
 }
 
+/// The tracing target of every `--cid` sweep event.
+const CID_LOG_TARGET: &str = "cid.enforce";
+
 /// The three swept columns of one row.
 type SweepColumns = (String, Option<String>, Option<Vec<u8>>);
 
@@ -168,7 +171,7 @@ pub fn run_cid_sweep(conn: &Connection) -> Result<CidSweepReport> {
                 // reported as absent, the row is still counted.
                 let id = row.get::<_, String>(0).ok();
                 tracing::warn!(
-                    target: "cid.enforce",
+                    target: CID_LOG_TARGET,
                     memory_id = %Printed::field(id.as_deref().unwrap_or("")),
                     "cid row unreadable ({})",
                     error_class.label()
@@ -190,9 +193,9 @@ pub fn run_cid_sweep(conn: &Connection) -> Result<CidSweepReport> {
                 report.cid_mismatched += 1;
                 let detail = format!("{id}: {mismatch}");
                 if enforce {
-                    tracing::warn!(target: "cid.enforce", "cid mismatch: {}", Printed::field(&detail));
+                    tracing::warn!(target: CID_LOG_TARGET, "cid mismatch: {}", Printed::field(&detail));
                 } else {
-                    tracing::info!(target: "cid.enforce", "cid mismatch (detect-only): {}", Printed::field(&detail));
+                    tracing::info!(target: CID_LOG_TARGET, "cid mismatch (detect-only): {}", Printed::field(&detail));
                 }
                 if report.mismatches.len() < MAX_SWEEP_DETAIL_ROWS {
                     report.mismatches.push(detail);
