@@ -47,6 +47,21 @@ def row(name, tests=2, ignored=0, mode='isolated', db='ai_memory_t_rabc_1_000000
 GOOD_ROWS = [row('alpha_9592'), row('beta_9592', db='ai_memory_t_rabc_1_00000002'),
              row('resid_9592', mode='residual', db=base.SHARED_DB)]
 DONE = 'complete binaries=3 run_id=%s' % RUN_ID
+# #9751: the ledger row's mode must be the mode the deferred lists give the binary, and a residual row
+# must name the shared database. Reasons written out by hand.
+CLONE_OF_RUN = 'ai_memory_t_rabc_1_00000003'
+OTHER_DB = 'ai_memory_other_9592'
+ISOLATED_AS_RESIDUAL = 'ledger row for alpha_9592 has mode residual, expected isolated'
+RESIDUAL_AS_ISOLATED = 'ledger row for resid_9592 has mode isolated, expected residual'
+RESIDUAL_OFF_SHARED = 'ledger row for resid_9592 is not on the shared database'
+FORGED_ISOLATED = ledger([row('alpha_9592', mode='residual', db=base.SHARED_DB)] + GOOD_ROWS[1:], DONE)
+FORGED_RESIDUAL = ledger(GOOD_ROWS[:2] + [row('resid_9592', db=CLONE_OF_RUN)], DONE)
+RESIDUAL_OTHER_DB = ledger(GOOD_ROWS[:2] + [row('resid_9592', mode='residual', db=OTHER_DB)], DONE)
+RESIDUAL_ON_A_CLONE = ledger(GOOD_ROWS[:2] + [row('resid_9592', mode='residual', db=CLONE_OF_RUN)], DONE)
+
+
+def reasons_of(e, text, targets=TARGETS, residual=base.RESIDUAL, shared_db=base.SHARED_DB):
+    return e.ledger_reasons(text, list(targets), RUN_ID, set(residual), shared_db)
 
 # (label, ledger text, exact reasons)
 LEDGER_CASES = (
@@ -65,6 +80,10 @@ LEDGER_CASES = (
      ['ledger row 2 is malformed', 'ledger misses deferred binaries: beta_9592']),
     ('malformed complete row', ledger(GOOD_ROWS, 'complete binaries=3 run_id=RABC'), ['ledger row 4 is malformed']),
     ('other run', ledger(GOOD_ROWS, 'complete binaries=3 run_id=rzzz'), ['ledger run id is not this run']),
+    ('isolated binary written residual', FORGED_ISOLATED, [ISOLATED_AS_RESIDUAL]),
+    ('residual binary written isolated', FORGED_RESIDUAL, [RESIDUAL_AS_ISOLATED]),
+    ('residual on another database', RESIDUAL_OTHER_DB, [RESIDUAL_OFF_SHARED]),
+    ('residual on a clone of this run', RESIDUAL_ON_A_CLONE, [RESIDUAL_OFF_SHARED]),
 )
 
 
@@ -72,22 +91,30 @@ class Ledger(base.Base):
     def test_ledger_reasons_table(self):
         for label, text, want in LEDGER_CASES:
             with self.subTest(label):
-                self.assertEqual(self.e.ledger_reasons(text, list(TARGETS), RUN_ID), want)
+                self.assertEqual(reasons_of(self.e, text), want)
+
+    def test_unset_shared_db_fails_every_residual_row(self):
+        # #9751 fail closed: an empty shared database name proves no residual row.
+        self.assertEqual(reasons_of(self.e, ledger(GOOD_ROWS, DONE), shared_db=''), [RESIDUAL_OFF_SHARED])
+
+    def test_mode_follows_the_residual_list_not_the_row(self):
+        # The same good ledger, with resid_9592 not on the residual list: its residual row is forged.
+        self.assertEqual(reasons_of(self.e, ledger(GOOD_ROWS, DONE), residual=()),
+                         ['ledger row for resid_9592 has mode residual, expected isolated'])
 
     def test_ledger_over_the_byte_ceiling_fails(self):
         text = 'x' * (self.e.LEDGER_MAX_BYTES + 1)
-        self.assertEqual(self.e.ledger_reasons(text, list(TARGETS), RUN_ID),
-                         ['ledger over %d bytes' % self.e.LEDGER_MAX_BYTES])
+        self.assertEqual(reasons_of(self.e, text), ['ledger over %d bytes' % self.e.LEDGER_MAX_BYTES])
 
     def test_ledger_with_100k_rows_is_bounded(self):
         rows = [row('bin_%06d' % i) for i in range(BIG_ROWS)]
         text = ledger(rows, 'complete binaries=%d run_id=%s' % (BIG_ROWS, RUN_ID))
         self.assertLessEqual(len(text.encode()), self.e.LEDGER_MAX_BYTES * 8)
         started = time.monotonic()
-        reasons = self.e.ledger_reasons(text[:self.e.LEDGER_MAX_BYTES], list(TARGETS), RUN_ID)
+        reasons = reasons_of(self.e, text[:self.e.LEDGER_MAX_BYTES])
         self.assertLess(time.monotonic() - started, BOUND_SECS)
         self.assertLessEqual(len(reasons), self.e.REASONS_MAX)
-        reasons = self.e.ledger_reasons(text, ['bin_%06d' % i for i in range(BIG_ROWS)], RUN_ID)
+        reasons = reasons_of(self.e, text, targets=['bin_%06d' % i for i in range(BIG_ROWS)])
         self.assertEqual(reasons, ['ledger over %d bytes' % self.e.LEDGER_MAX_BYTES])
 
     def test_green_run_writes_the_ledger_with_the_complete_row_last(self):
@@ -155,6 +182,23 @@ class CleanupLedger(base.Base):
         rc, out = self.cleanup(base.FakeHost(self.e))
         self.assertEqual(rc, 1)
         self.assertIn(FAIL + 'ledger run id is not this run', out)
+
+    def test_cleanup_rejects_a_forged_mode_row(self):
+        # #9751: Cleanup reads the residual list (_read_targets) and checks each row's mode against it.
+        for text, want in ((FORGED_ISOLATED, ISOLATED_AS_RESIDUAL), (FORGED_RESIDUAL, RESIDUAL_AS_ISOLATED)):
+            with self.subTest(want=want):
+                (self.root / 'ci-iso-ledger.txt').write_text(text)
+                rc, out = self.cleanup(base.FakeHost(self.e))
+                self.assertEqual(rc, 1, out)
+                self.assertIn(FAIL + want, out)
+
+    def test_cleanup_rejects_a_residual_row_off_the_shared_database(self):
+        for text in (RESIDUAL_OTHER_DB, RESIDUAL_ON_A_CLONE):
+            with self.subTest(text=text.splitlines()[2]):
+                (self.root / 'ci-iso-ledger.txt').write_text(text)
+                rc, out = self.cleanup(base.FakeHost(self.e))
+                self.assertEqual(rc, 1, out)
+                self.assertIn(FAIL + RESIDUAL_OFF_SHARED, out)
 
     def test_cleanup_env_run_id_that_differs_from_the_run_file_fails(self):
         rc, out = self.cleanup(base.FakeHost(self.e), AI_MEMORY_TEST_PG_RUN_ID='rother')
