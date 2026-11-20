@@ -17,7 +17,6 @@ import importlib.util
 import os
 import re
 import shutil
-import stat
 import subprocess
 import sys
 import tempfile
@@ -227,6 +226,7 @@ class Scratch(unittest.TestCase):
 
     def setUp(self):
         SCRATCH_ROOT.mkdir(exist_ok=True)
+        self.relax_skipped = []
         self.dir = Path(tempfile.mkdtemp(prefix="red-cause-9709-", dir=str(SCRATCH_ROOT)))
         self.addCleanup(self.remove_dir)
 
@@ -235,8 +235,10 @@ class Scratch(unittest.TestCase):
             for name in dirs + files:
                 try:
                     os.chmod(os.path.join(root, name), 0o700)
-                except OSError:
-                    pass
+                except OSError as error:
+                    # A name that vanished or is a dangling link has nothing to relax; the cleanup goes on and
+                    # the error number is kept for the assertion in ``ScratchCleanup``.
+                    self.relax_skipped.append((name, error.errno))
         resolved = self.dir.resolve()
         if str(resolved).startswith(str(SCRATCH_ROOT.resolve()) + os.sep):
             shutil.rmtree(str(resolved), ignore_errors=True)
@@ -1053,24 +1055,24 @@ class Wiring(unittest.TestCase):
         self.assertIn("the job reads secrets.", wiring_problems(planted, "ci.yml", "sal-feature"))
 
 
-def planted(prefix, length, alphabet="A1b2C3d4E5f6G7h8"):
-    """A synthetic secret of one token shape, built at run time (never a literal in the tree)."""
+def canary(prefix, length, alphabet="A1b2C3d4E5f6G7h8"):
+    """A synthetic canary string of one key shape, built at run time (never a literal in the tree)."""
     return prefix + (alphabet * (length // len(alphabet) + 1))[:length]
 
 
-def planted_secrets():
-    jwt_part = planted("", 40, "aB3dE5fG7hJ9kL1m")
+def canary_shapes():
+    jwt_part = canary("", 40, "aB3dE5fG7hJ9kL1m")
     return (
-        ("gh" + "p_", planted("gh" + "p_", 36)),
-        ("gh" + "o_", planted("gh" + "o_", 36)),
-        ("gh" + "s_", planted("gh" + "s_", 36)),
-        ("gh" + "u_", planted("gh" + "u_", 36)),
-        ("gh" + "r_", planted("gh" + "r_", 36)),
-        ("github" + "_pat_", planted("github" + "_pat_", 22) + "_" + planted("", 59)),
-        ("s" + "k-", planted("s" + "k-", 48)),
-        ("jwt", "ey" + "J" + jwt_part + ".ey" + "J" + jwt_part + "." + planted("", 43)),
-        ("hex64", planted("", 64, "0123456789abcdef")),
-        ("base64 32", planted("", 32, "QWxhZGRpbjpvcGVu")),
+        ("gh" + "p_", canary("gh" + "p_", 36)),
+        ("gh" + "o_", canary("gh" + "o_", 36)),
+        ("gh" + "s_", canary("gh" + "s_", 36)),
+        ("gh" + "u_", canary("gh" + "u_", 36)),
+        ("gh" + "r_", canary("gh" + "r_", 36)),
+        ("github" + "_pat_", canary("github" + "_pat_", 22) + "_" + canary("", 59)),
+        ("s" + "k-", canary("s" + "k-", 48)),
+        ("jwt", "ey" + "J" + jwt_part + ".ey" + "J" + jwt_part + "." + canary("", 43)),
+        ("hex64", canary("", 64, "0123456789abcdef")),
+        ("base64 32", canary("", 32, "QWxhZGRpbjpvcGVu")),
     )
 
 
@@ -1103,16 +1105,16 @@ class CleanedByConstruction(Scratch):
             findings.add_test("b", "n", shown, "n")
 
     def test_a_token_shaped_binary_never_reaches_any_output(self):
-        token = planted("gh" + "p_", 36)
-        running = "     Running tests/x.rs (target/debug/deps/%s-0123456789abcdef)\n" % token
+        canary_text = canary("gh" + "p_", 36)
+        running = "     Running tests/x.rs (target/debug/deps/%s-0123456789abcdef)\n" % canary_text
         self.write("a.log", running + "test m::a ... FAILED\n" + RESULT_FAILED_LINE + "\n"
                    + running + "failures:\n    m::b\n\n" + RESULT_FAILED_LINE + "\n"
                    + running + "running 1 test\n" + "  process didn't exit successfully: `x`\n"
-                   + "test " + token + " ... FAILED\n")
+                   + "test " + canary_text + " ... FAILED\n")
         rc, out, err, summary = self.run_script(["a.log"])
         self.assertEqual(rc, 0, err)
         for text in (out, err, summary):
-            self.assertNotIn(token[4:20], text)
+            self.assertNotIn(canary_text[4:20], text)
         self.assertIn("failing tests: 3\n", summary)
 
     def test_three_long_failing_names_print_three_rows(self):
@@ -1130,25 +1132,25 @@ class CleanedByConstruction(Scratch):
             self.assertIn("| ai_memory | %s |\n" % name.replace("::", "\\x3a:"), summary)
         self.assertEqual(out.count("::error title=failing test::"), 3)
 
-    def test_every_planted_secret_shape_is_masked(self):
+    def test_every_canary_shape_is_masked(self):
         module = self.module()
-        for shape, secret in planted_secrets():
-            for raw in (secret, "tests::" + secret, "tests::x_" + secret):
+        for shape, canary_text in canary_shapes():
+            for raw in (canary_text, "tests::" + canary_text, "tests::x_" + canary_text):
                 with self.subTest(shape=shape, raw=raw[:12]):
                     shown = module.render_name(raw).text
-                    self.assertNotIn(secret, shown)
+                    self.assertNotIn(canary_text, shown)
                     self.assertNotEqual(shown, raw)
 
-    def test_every_planted_secret_is_masked_end_to_end(self):
-        secrets_ = [secret for _shape, secret in planted_secrets()]
+    def test_every_canary_is_masked_end_to_end(self):
+        canaries = [canary_text for _shape, canary_text in canary_shapes()]
         self.write("a.log", "     Running tests/h.rs (target/debug/deps/h-0123456789abcdef)\n"
-                   + "".join("test tests::%s ... FAILED\n" % secret for secret in secrets_))
+                   + "".join("test tests::%s ... FAILED\n" % canary_text for canary_text in canaries))
         rc, out, err, summary = self.run_script(["a.log"])
         self.assertEqual(rc, 0, err)
-        self.assertIn("failing tests: %d\n" % len(secrets_), summary)
-        for secret in secrets_:
+        self.assertIn("failing tests: %d\n" % len(canaries), summary)
+        for canary_text in canaries:
             for text in (out, summary):
-                self.assertNotIn(secret, text)
+                self.assertNotIn(canary_text, text)
 
 
 # Hand-written: every key prefix of NAME_TOKEN_MARKERS, never read from the module (#9709 r3 D1). A body of
@@ -1193,6 +1195,16 @@ class NameMarkerAndLengthRows(Scratch):
                 shown = module.render_name(raw).text
                 self.assertNotEqual(shown, raw)
                 self.assertLessEqual(len(shown), RENDER_NAME_BOUND)
+
+
+class ScratchCleanup(Scratch):
+    """The cleanup walk keeps going past a dangling link and records its error number (never a bare pass)."""
+
+    def test_a_dangling_link_is_recorded_and_the_directory_is_still_removed(self):
+        (self.dir / "dangling").symlink_to(self.dir / "absent")
+        self.remove_dir()
+        self.assertEqual(self.relax_skipped, [("dangling", errno.ENOENT)])
+        self.assertFalse(self.dir.exists())
 
 
 def pin_problems(text):
@@ -1333,11 +1345,11 @@ class NamedCause(Scratch):
         self.assertEqual((rc, out, summary), (0, FIXTURE_A_STDOUT, FIXTURE_A_SUMMARY))
 
     def test_a_hostile_error_line_is_cleaned_and_escaped(self):
-        token = planted("gh" + "p_", 36)
-        self.write("logs/sal-build.log", "error: ::error::pwn " + token + " @x\n")
+        canary_text = canary("gh" + "p_", 36)
+        self.write("logs/sal-build.log", "error: ::error::pwn " + canary_text + " @x\n")
         rc, out, err, summary = self.run_script(list(self.STEPS) + ["logs"])
         self.assertEqual(rc, 0, err)
-        self.assertNotIn(token[4:20], out + summary)
+        self.assertNotIn(canary_text[4:20], out + summary)
         for line in out.splitlines():
             self.assertRegex(line, ALLOWED_STDOUT_LINE)
             self.assertNotIn("::", line.split("::", 2)[2])
