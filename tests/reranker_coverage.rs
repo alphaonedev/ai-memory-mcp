@@ -9,15 +9,15 @@
 //!
 //! Most of the uncovered lines in `reranker.rs` belong to the
 //! `CrossEncoder::Neural` variant (`new_neural` / `load_neural` /
-//! `neural_score`). Exercising those requires downloading the
-//! 80 MB `cross-encoder/ms-marco-MiniLM-L-6-v2` BERT weights from
-//! `HuggingFace` Hub — explicitly out of scope for `cargo test`. They
-//! are gated behind the `test-with-models` feature inside `reranker.rs`.
+//! `neural_score`). This file reaches them through the staged offline
+//! cache of `cross-encoder/ms-marco-MiniLM-L-6-v2` (#9509, staged by
+//! `scripts/ci/stage_hf_cache.py`), never through a download.
 //!
-//! What this file *can* contribute from the public integration surface:
-//! - `CrossEncoder::new_neural()`'s fallback branch when the HF Hub
-//!   API can't reach the model (forced via `HF_HUB_OFFLINE=1` +
-//!   nonexistent `HF_HOME`).
+//! What this file contributes from the public integration surface:
+//! - the neural load and score paths on the staged model, each asserted
+//!   neural;
+//! - the neural constructor's degraded fallback over an empty hub,
+//!   asserted degraded lexical.
 //! - The `Default` and `new()` constructors and a few additional
 //!   `score()` / `rerank()` shapes the `cfg(test)` unit tests don't
 //!   already cover (mostly redundant insurance — small lift).
@@ -27,6 +27,10 @@
 use ai_memory::models::ConfidenceSource;
 use ai_memory::models::{Memory, Tier};
 use ai_memory::reranker::CrossEncoder;
+
+#[path = "common/staged_models.rs"]
+mod staged_models;
+use staged_models::{offline_cross_encoder_in, staged_cross_encoder};
 
 fn make_memory(title: &str, content: &str) -> Memory {
     Memory {
@@ -77,74 +81,48 @@ fn new_returns_lexical_variant() {
 }
 
 // ---------------------------------------------------------------------------
-// new_neural() fallback — force HF Hub failure via HF_HUB_OFFLINE.
+// The neural constructor, one exact outcome per test (#9509/#9515).
 //
-// hf-hub respects HF_HUB_OFFLINE and (for cache misses) returns an Err
-// from `repo.get(...)`. Combined with a nonexistent HF_HOME the
-// fallback branch (`Err(_)` arm at lines 62-65 in reranker.rs) runs
-// deterministically without touching the network.
+// An empty hub yields exactly the degraded lexical encoder; the staged
+// offline cache (scripts/ci/stage_hf_cache.py) yields exactly the neural
+// encoder. Neither path can reach the network or the host's own cache, and
+// no test here mutates the process environment.
 // ---------------------------------------------------------------------------
-//
-// SAFETY: env is process-global. We isolate this test in a dedicated
-// process by spawning `cargo test --test reranker_coverage
-// neural_fallback_when_offline -- --test-threads=1` is unnecessary because we
-// `unsafe { set_var }` BEFORE the call and `unset_var` after — and the
-// call is synchronous. To avoid races with other tests we use a
-// `#[serial_test]`-style approach: simply ensure no other test in this
-// file mutates HF_HUB_OFFLINE or HF_HOME.
 
 #[test]
 fn new_neural_fallback_when_offline_returns_lexical() {
-    // SAFETY: integration tests run in their own process by default
-    // (one binary per `tests/*.rs`). The HF_HUB_OFFLINE+HF_HOME pair
-    // is mutated only by this test in this binary.
-    //
-    // Use a tempdir so HF_HOME points to a guaranteed-empty cache —
-    // hf-hub then cannot resolve `cross-encoder/ms-marco-MiniLM-L-6-v2`
-    // from cache, and HF_HUB_OFFLINE forbids it from making the network
-    // call. This deterministically forces `load_neural()` → Err, which
-    // triggers the fallback arm.
-    let tmp = tempfile::tempdir().expect("tempdir");
-    unsafe {
-        std::env::set_var("HF_HUB_OFFLINE", "1");
-        std::env::set_var("HF_HOME", tmp.path());
-        std::env::set_var("HUGGINGFACE_HUB_CACHE", tmp.path().join("hub"));
-        std::env::set_var("HF_HUB_CACHE", tmp.path().join("hub"));
-    }
-    let ce = CrossEncoder::new_neural();
-    // Construction completed — either Neural (if hf-hub ignored env)
-    // or Lexical (the expected fallback). Both paths exercised lines.
-    let _is = ce.is_neural();
-
-    unsafe {
-        std::env::remove_var("HF_HUB_OFFLINE");
-        std::env::remove_var("HF_HOME");
-        std::env::remove_var("HUGGINGFACE_HUB_CACHE");
-        std::env::remove_var("HF_HUB_CACHE");
-    }
+    let hub = tempfile::tempdir().expect("empty hub");
+    let ce = offline_cross_encoder_in(hub.path());
+    assert!(
+        !ce.is_neural(),
+        "an empty hub must not build the neural encoder"
+    );
+    assert!(
+        ce.is_degraded_lexical(),
+        "an empty hub must degrade to the lexical encoder"
+    );
 }
 
 #[test]
 fn new_neural_with_local_cache_runs_load_path() {
-    // On hosts where the BERT model is locally cached (e.g. dev
-    // workstations that previously downloaded it), this exercises the
-    // happy `load_neural()` → Ok arm including config parsing,
-    // tokenizer load, weight mmap, classifier-head parsing.
-    //
-    // On CI without the model cached, this falls through to the
-    // `Err(_)` fallback arm — also fine. We just want both branches
-    // covered across the test matrix.
-    let ce = CrossEncoder::new_neural();
-    let _is = ce.is_neural();
+    // The happy load arm: config parsing, tokenizer load, weight mmap and
+    // the classifier-head parse, from the staged cache only.
+    let ce = staged_cross_encoder();
+    assert!(
+        ce.is_neural(),
+        "the staged cache must build the neural encoder"
+    );
+    assert!(!ce.is_degraded_lexical());
 }
 
 #[test]
 fn neural_score_path_is_safe_if_neural_variant_present() {
-    // When the host has the BERT model cached, `new_neural()` returns
-    // Neural and `score()` runs through the neural_score branch
-    // (lines 138-170). On hosts without the model, this just exercises
-    // the lexical path again — both are safe.
-    let ce = CrossEncoder::new_neural();
+    // `score()` runs through the neural_score branch on the staged model.
+    let ce = staged_cross_encoder();
+    assert!(
+        ce.is_neural(),
+        "the staged cache must build the neural encoder"
+    );
     let s = ce.score(
         "machine learning models",
         "Deep learning fundamentals",
@@ -163,10 +141,13 @@ fn neural_score_path_is_safe_if_neural_variant_present() {
 
 #[test]
 fn neural_rerank_full_path_if_available() {
-    // Exercises rerank() through the Neural-or-fallback dispatcher with
-    // multiple candidates. On Neural-cached hosts this runs neural_score
-    // for each candidate; on others it runs lexical_score.
-    let ce = CrossEncoder::new_neural();
+    // Exercises rerank() through the neural dispatcher with multiple
+    // candidates: neural_score runs for each one on the staged model.
+    let ce = staged_cross_encoder();
+    assert!(
+        ce.is_neural(),
+        "the staged cache must build the neural encoder"
+    );
     let cands = vec![
         (
             make_memory("BERT models for NLP", "transformers attention"),
@@ -400,28 +381,14 @@ fn batched_reranker_encoder_accessor_returns_inner() {
 #[test]
 fn batched_reranker_is_degraded_lexical_proxy_to_encoder() {
     use ai_memory::reranker::BatchedReranker;
-    // Build a CrossEncoder that's intentionally degraded: an offline
-    // new_neural() fallback yields Lexical { degraded: true }.
-    let tmp = tempfile::tempdir().expect("tempdir");
-    unsafe {
-        std::env::set_var("HF_HUB_OFFLINE", "1");
-        std::env::set_var("HF_HOME", tmp.path());
-        std::env::set_var("HUGGINGFACE_HUB_CACHE", tmp.path().join("hub"));
-        std::env::set_var("HF_HUB_CACHE", tmp.path().join("hub"));
-    }
-    let ce = CrossEncoder::new_neural();
-    unsafe {
-        std::env::remove_var("HF_HUB_OFFLINE");
-        std::env::remove_var("HF_HOME");
-        std::env::remove_var("HUGGINGFACE_HUB_CACHE");
-        std::env::remove_var("HF_HUB_CACHE");
-    }
-    let br = BatchedReranker::new(ce);
-    // On hosts without a cached model, the fallback is Lexical { degraded: true }
-    // and is_degraded_lexical() returns true. On hosts WITH a cached
-    // model, hf-hub may still load it and we get Neural — both are valid;
-    // we just exercise the proxy method.
-    let _ = br.is_degraded_lexical();
+    // An intentionally degraded encoder: the neural constructor over an
+    // empty hub yields exactly Lexical { degraded: true }.
+    let hub = tempfile::tempdir().expect("empty hub");
+    let br = BatchedReranker::new(offline_cross_encoder_in(hub.path()));
+    assert!(
+        br.is_degraded_lexical(),
+        "BatchedReranker must mirror the degraded encoder"
+    );
 }
 
 #[test]

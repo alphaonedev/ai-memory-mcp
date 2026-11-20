@@ -73,14 +73,15 @@ fn write_model_files(snap: &Path) {
     }
 }
 
-/// The `scripts/ci/stage_hf_cache.py` / air-gap layout: `snapshots/main`.
+/// The legacy air-gap layout: `snapshots/main` (no `refs/main`).
 fn stage_main_layout(hub: &Path) -> PathBuf {
     let snap = model_repo(hub).join("snapshots").join("main");
     write_model_files(&snap);
     snap
 }
 
-/// The hf-hub online layout: `refs/main` names `snapshots/<commit>`.
+/// The CI layout `scripts/ci/stage_hf_cache.py` writes (the hf-hub online
+/// layout): `refs/main` names `snapshots/<commit>`.
 fn stage_commit_layout(hub: &Path) {
     let repo = model_repo(hub);
     write_model_files(&repo.join("snapshots").join(FAKE_COMMIT));
@@ -105,7 +106,9 @@ fn pinned_cache_present() -> bool {
     let repo = model_repo(&hub);
     let snap = std::fs::read_to_string(repo.join("refs").join("main"))
         .ok()
-        .map(|commit| repo.join("snapshots").join(commit.trim()))
+        .map(|commit| commit.trim().to_owned())
+        .filter(|c| !c.is_empty() && c.bytes().all(|b| b.is_ascii_alphanumeric()))
+        .map(|commit| repo.join("snapshots").join(commit))
         .filter(|p| p.is_dir())
         .unwrap_or_else(|| repo.join("snapshots").join("main"));
     [HF_CONFIG_FILE, HF_TOKENIZER_FILE, HF_WEIGHTS_FILE]
@@ -367,6 +370,50 @@ fn staged_cache_verdict_is_host_independent_9509() {
     assert!(
         failures.is_empty(),
         "#9509 ruling (1): the child reads only what the cell built:\n{}",
+        failures.join("\n")
+    );
+}
+
+/// `refs/main` contents and the commit [`super::Embedder::ref_main_commit`]
+/// must take from them: only one trimmed path component of ASCII
+/// alphanumerics names a snapshot (#9509: a blank or traversing ref never
+/// leaves `snapshots/`).
+const REF_ROWS: [(&[u8], Option<&str>); 9] = [
+    (b"", None),
+    (b"  \n", None),
+    (b"../x", None),
+    (b"..", None),
+    (b"a/b", None),
+    (b"abc def", None),
+    (b"\xff\xfe", None),
+    (FAKE_COMMIT.as_bytes(), Some(FAKE_COMMIT)),
+    (
+        b"0123456789abcdef0123456789abcdef01234567\n",
+        Some(FAKE_COMMIT),
+    ),
+];
+
+#[test]
+fn ref_main_commit_takes_one_alphanumeric_component_9509() {
+    let tmp = tempfile::tempdir().expect("ref table root");
+    let repo = tmp.path().join("repo");
+    assert_eq!(
+        super::Embedder::ref_main_commit(&repo),
+        None,
+        "a missing refs/main names no commit"
+    );
+    std::fs::create_dir_all(repo.join("refs")).expect("mk refs");
+    let failures: Vec<String> = REF_ROWS
+        .iter()
+        .filter_map(|&(raw, want)| {
+            std::fs::write(repo.join("refs").join("main"), raw).expect("write refs/main");
+            let got = super::Embedder::ref_main_commit(&repo);
+            (got.as_deref() != want).then(|| format!("{raw:?}: got {got:?}, want {want:?}"))
+        })
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "#9509 refs/main table:\n{}",
         failures.join("\n")
     );
 }

@@ -230,20 +230,9 @@ fn recall_mode_capabilities_consistent() {
     let _ = RecallMode::Disabled; // keep the import live for readers
 }
 
-/// #9509/#9515 - the real local embedder, built from the staged offline cache.
-/// A missing cache keeps its named failure (no skip), and with the cache
-/// present `new_local` resolves it cache-first, so no model is fetched from
-/// the network. CI stages the cache with `scripts/ci/stage_hf_cache.py`.
-fn staged_local_embedder() -> ai_memory::embeddings::Embedder {
-    if let Err(e) = ai_memory::embeddings::Embedder::load_from_fallback() {
-        panic!(
-            "prerequisite missing: offline embedder cache ({e}). Stage it with \
-             scripts/ci/stage_hf_cache.py (#9509); this is NOT a failure of the test body"
-        );
-    }
-    ai_memory::embeddings::Embedder::new_local()
-        .expect("staged cache must build the local embedder")
-}
+#[path = "common/staged_models.rs"]
+mod staged_models;
+use staged_models::staged_local_embedder;
 
 /// The brief asks: call embedder with a controlled-failure mock,
 /// assert returned `EmbedStatus::Failed(_)`.

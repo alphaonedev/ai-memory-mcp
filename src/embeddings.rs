@@ -1031,9 +1031,7 @@ impl Embedder {
 
     /// Create a local candle embedder (MiniLM-L6-v2, 384-dim).
     pub fn new_local() -> Result<Self> {
-        let device = Device::Cpu;
-
-        let (config_path, tokenizer_path, weights_path) = if Self::remote_fetch_disabled() {
+        let paths = if Self::remote_fetch_disabled() {
             // Offline mode (#1501): skip the network HF-Hub fetch entirely and
             // rely solely on a pre-staged cache. This eliminates the cold-cache
             // concurrent-download race — many parallel `ai-memory recall`
@@ -1058,7 +1056,32 @@ impl Embedder {
                 }
             }
         };
+        Self::build_local(paths)
+    }
 
+    /// #9509/#9515 - build the local embedder from the staged offline cache
+    /// ONLY. This constructor has no network branch at all, whatever the
+    /// environment holds, so a test that needs the real model can never
+    /// fetch it: a missing cache is the named [`Self::load_from_fallback`]
+    /// error. Hidden from the docs: it exists for the test suites.
+    ///
+    /// # Errors
+    /// The cache-miss error of [`Self::load_from_fallback`], or a model
+    /// build error.
+    #[doc(hidden)]
+    pub fn new_local_staged() -> Result<Self> {
+        Self::build_local(Self::load_from_fallback()?)
+    }
+
+    /// Build the candle `MiniLM` embedder from resolved model files.
+    fn build_local(
+        (config_path, tokenizer_path, weights_path): (
+            std::path::PathBuf,
+            std::path::PathBuf,
+            std::path::PathBuf,
+        ),
+    ) -> Result<Self> {
+        let device = Device::Cpu;
         let config_data =
             std::fs::read_to_string(&config_path).context("failed to read config.json")?;
         let config: Config =
@@ -2028,7 +2051,22 @@ impl Embedder {
     /// (the hf-hub cache-first layout), falling back to the pre-#3788 `snapshots/main`
     /// layout so a legacy air-gapped stage is byte-for-byte unchanged.
     fn staged_model_snapshot_dir() -> std::path::PathBuf {
-        let hub_root = match std::env::var("HF_HOME") {
+        let repo = Self::hf_repo_dir(&Self::hf_hub_root(), MINILM_MODEL_ID);
+        // hf-hub: `refs/main` -> commit hash -> `snapshots/<commit>`.
+        let commit_snapshot = Self::ref_main_commit(&repo)
+            .map(|commit| repo.join("snapshots").join(commit))
+            .filter(|p| p.is_dir());
+        // Legacy pre-#3788 layout (also the HF_HOME-unset no-behaviour-change path).
+        commit_snapshot.unwrap_or_else(|| repo.join("snapshots").join("main"))
+    }
+
+    /// #9509 - the hf-hub cache root both model loaders read: `$HF_HOME/hub`
+    /// when `HF_HOME` is set and not blank (the job-private home of the CI
+    /// legs, vote D2-1), else `$HOME/.cache/huggingface/hub`. One resolver
+    /// for the embedder and the cross-encoder, so neither can read `HOME`
+    /// while the other honours `HF_HOME` (vote D2-3).
+    pub(crate) fn hf_hub_root() -> std::path::PathBuf {
+        match std::env::var("HF_HOME") {
             Ok(hf_home) if !hf_home.trim().is_empty() => {
                 std::path::PathBuf::from(hf_home).join("hub")
             }
@@ -2039,15 +2077,24 @@ impl Embedder {
                     .join(crate::config::HF_CACHE_DIR_NAME)
                     .join("hub")
             }
-        };
-        let repo = hub_root.join(format!("models--{}", MINILM_MODEL_ID.replace('/', "--")));
-        // hf-hub: `refs/main` -> commit hash -> `snapshots/<commit>`.
-        let commit_snapshot = std::fs::read_to_string(repo.join("refs").join("main"))
-            .ok()
-            .map(|commit| repo.join("snapshots").join(commit.trim()))
-            .filter(|p| p.is_dir());
-        // Legacy pre-#3788 layout (also the HF_HOME-unset no-behaviour-change path).
-        commit_snapshot.unwrap_or_else(|| repo.join("snapshots").join("main"))
+        }
+    }
+
+    /// The hf-hub repo directory of `model_id` under `hub`
+    /// (`models--<org>--<name>`).
+    pub(crate) fn hf_repo_dir(hub: &std::path::Path, model_id: &str) -> std::path::PathBuf {
+        hub.join(format!("models--{}", model_id.replace('/', "--")))
+    }
+
+    /// #9509 - the commit `repo/refs/main` names, when it is one path
+    /// component of ASCII alphanumerics after trimming. A blank ref would
+    /// resolve to `snapshots/` itself and a ref holding `/` or `..` would
+    /// leave the repo directory, so both read as no ref at all.
+    pub(crate) fn ref_main_commit(repo: &std::path::Path) -> Option<String> {
+        let raw = std::fs::read_to_string(repo.join("refs").join("main")).ok()?;
+        let commit = raw.trim();
+        (!commit.is_empty() && commit.bytes().all(|b| b.is_ascii_alphanumeric()))
+            .then(|| commit.to_string())
     }
 }
 
@@ -3178,7 +3225,7 @@ pub mod test_support {
 
     /// Build with the offline knob set and an EMPTY staged cache; return the
     /// error text. Hermetic: no network and no model needed (#9509/#9515).
-    pub fn offline_empty_cache_error(build: impl FnOnce() -> Result<Embedder>) -> String {
+    pub fn offline_empty_cache_error<T>(build: impl FnOnce() -> Result<T>) -> String {
         let tmp = std::env::temp_dir().join(format!(
             "ai-memory-9509-{}-{}",
             std::process::id(),
@@ -3222,7 +3269,8 @@ pub mod test_support {
                      test body"
                 );
             }
-            let embedder = Embedder::new_local().expect("staged cache must build the embedder");
+            let embedder =
+                Embedder::new_local_staged().expect("staged cache must build the embedder");
             f(&embedder)
         })
     }
@@ -3560,61 +3608,32 @@ mod w12h_extra_tests {
 
 #[test]
 fn embedder_returns_unreachable_when_model_path_missing() {
-    // Test that load_from_fallback returns an error when model files
-    // are not present in the fallback directory.
-    let result = Embedder::load_from_fallback();
-    // On a test machine without pre-downloaded models, this should fail
-    // with a descriptive error message.
-    match result {
-        Ok(_) => {
-            // If the fallback directory exists, that's OK — skip this assertion
-        }
-        Err(e) => {
-            // Expected: error message mentions fallback dir or model files
-            let err_msg = e.to_string();
-            assert!(
-                err_msg.contains("not found") || err_msg.contains("fallback"),
-                "error should mention missing model files: {err_msg}"
-            );
-        }
-    }
+    // #9509: one exact outcome. An empty staged cache (HOME and HF_HOME
+    // under a fresh temp dir) makes load_from_fallback return the named
+    // cache-miss error, whatever cache the host holds.
+    let msg = test_support::offline_empty_cache_error(Embedder::load_from_fallback);
+    assert!(
+        msg.starts_with(test_support::OFFLINE_CACHE_MISS_PREFIX),
+        "error should name the missing model files: {msg}"
+    );
 }
 
 #[test]
 fn load_from_fallback_succeeds_when_files_present() {
-    // Set HOME to a temp dir that has the expected fallback structure
-    // populated with placeholder files. This exercises the Ok-branch
-    // (lines 272-273) without requiring real model files — Tokenizer
-    // loading is not part of `load_from_fallback`.
-    // #2115: serialize on the crate-canonical process-global env lock so this
-    // $HOME-mutating test does not race the reranker module's own
-    // $HOME-mutating tests cross-module under parallel `cargo test`
-    // (std::env::set_var is unsound multithreaded — a module-local Mutex only
-    // covers this file's tests).
-    let _guard = crate::config::test_env_lock();
-
-    let tmp = std::env::temp_dir().join(format!("ai-memory-w12h-fallback-{}", std::process::id()));
-    let model_dir = tmp.join(
-        ".cache/huggingface/hub/models--sentence-transformers--all-MiniLM-L6-v2/snapshots/main",
-    );
+    // A temp HOME whose job-private HF_HOME (`home/hf-home`) holds the
+    // legacy `snapshots/main` layout with placeholder files. This exercises
+    // the Ok-branch without real model files (Tokenizer loading is not part
+    // of `load_from_fallback`). The `test_support` helper owns HOME and
+    // HF_HOME under the crate env lock (#2115, #9509).
+    let tmp = tempfile::tempdir().expect("fallback home");
+    let model_dir = Embedder::hf_repo_dir(&tmp.path().join("hf-home").join("hub"), MINILM_MODEL_ID)
+        .join("snapshots")
+        .join("main");
     std::fs::create_dir_all(&model_dir).expect("mk model dir");
-    for name in ["config.json", "tokenizer.json", "model.safetensors"] {
+    for name in [HF_CONFIG_FILE, HF_TOKENIZER_FILE, HF_WEIGHTS_FILE] {
         std::fs::write(model_dir.join(name), b"{}").expect("write placeholder");
     }
-    let prev = std::env::var("HOME").ok();
-    // SAFETY: serialized via LOCK above; no other thread mutates HOME.
-    unsafe {
-        std::env::set_var("HOME", &tmp);
-    }
-    let result = Embedder::load_from_fallback();
-    // Restore HOME before any assertion that could panic.
-    unsafe {
-        match prev {
-            Some(p) => std::env::set_var("HOME", p),
-            None => std::env::remove_var("HOME"),
-        }
-    }
-    let _ = std::fs::remove_dir_all(&tmp);
+    let result = test_support::with_offline_home(tmp.path(), Embedder::load_from_fallback);
     let (cfg, tok, w) = result.expect("placeholder files satisfy load_from_fallback");
     assert!(cfg.ends_with("config.json"));
     assert!(tok.ends_with("tokenizer.json"));
@@ -3632,8 +3651,8 @@ fn offline_env_skips_network_and_errors_fast_on_empty_cache() {
     // restores them also on a panic (one env-mutation funnel, #9509).
     let msg = crate::embeddings::test_support::offline_empty_cache_error(Embedder::new_local);
     assert!(
-        msg.contains("not found") || msg.contains("fallback"),
-        "offline empty-cache error should point at the fallback dir: {msg}"
+        msg.starts_with(test_support::OFFLINE_CACHE_MISS_PREFIX),
+        "offline empty-cache error must be the named cache miss: {msg}"
     );
 }
 

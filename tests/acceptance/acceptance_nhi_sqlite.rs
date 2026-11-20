@@ -188,8 +188,9 @@ fn local_ca_client(
 /// #3788 — the real HuggingFace cache to forward as `HF_HOME` to the daemon
 /// child so the OFFLINE embedder resolves the #2019-staged model despite the
 /// per-test HOME override. hf-hub reads `HF_HOME` (else `$HOME/.cache/huggingface`);
-/// coverage.yml stages under `~/.cache/huggingface` and sets no `HF_HOME`, so
-/// derive it from the test process's real `$HOME` (unchanged by the child override).
+/// coverage.yml stages into a job-private `HF_HOME` under the runner temp
+/// directory (#9509), so forward that when it is set; a local run without it
+/// falls back to the test process's real `$HOME` (unchanged by the child override).
 fn real_hf_home() -> Option<String> {
     if let Ok(hf) = std::env::var("HF_HOME")
         && !hf.trim().is_empty()

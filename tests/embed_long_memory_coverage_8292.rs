@@ -15,19 +15,9 @@
 
 use ai_memory::embeddings::{Embedder, embedding_document};
 
-/// #9509/#9515 - the real local embedder, built from the staged offline cache.
-/// A missing cache keeps its named failure (no skip), and with the cache
-/// present `new_local` resolves it cache-first, so no model is fetched from
-/// the network. CI stages the cache with `scripts/ci/stage_hf_cache.py`.
-fn staged_local_embedder() -> Embedder {
-    if let Err(e) = Embedder::load_from_fallback() {
-        panic!(
-            "prerequisite missing: offline embedder cache ({e}). Stage it with \
-             scripts/ci/stage_hf_cache.py (#9509); this is NOT a failure of the test body"
-        );
-    }
-    Embedder::new_local().expect("staged cache must build the local embedder")
-}
+#[path = "common/staged_models.rs"]
+mod staged_models;
+use staged_models::staged_local_embedder;
 
 const TITLE: &str = "long memory coverage";
 const FACT: &str = "zorblax calibration key quillfen seven four two one";

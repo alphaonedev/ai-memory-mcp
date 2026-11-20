@@ -47,6 +47,10 @@ use ai_memory::config::{FeatureTier, ResolvedScoring, ResolvedTtl};
 use ai_memory::embeddings::{EmbedStatus, Embedder};
 use ai_memory::handlers::{ApiKeyState, AppState, Db};
 
+#[path = "common/staged_models.rs"]
+mod staged_models;
+use staged_models::staged_local_embedder;
+
 /// #1751 — pin this test binary (and any spawned `ai-memory` child, which
 /// inherits the process env) to the explicit permissive agent-attestation
 /// opt-out. The v0.9 store-path default is REQUIRED and would reject this
@@ -151,20 +155,6 @@ async fn post(router: &axum::Router, body: Value) -> (StatusCode, Value) {
         .unwrap();
     let parsed: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
     (status, parsed)
-}
-
-/// #9509/#9515 - the real local embedder, built from the staged offline cache.
-/// A missing cache keeps its named failure (no skip), and with the cache
-/// present `new_local` resolves it cache-first, so no model is fetched from
-/// the network. CI stages the cache with `scripts/ci/stage_hf_cache.py`.
-fn staged_local_embedder() -> Embedder {
-    if let Err(e) = Embedder::load_from_fallback() {
-        panic!(
-            "prerequisite missing: offline embedder cache ({e}). Stage it with \
-             scripts/ci/stage_hf_cache.py (#9509); this is NOT a failure of the test body"
-        );
-    }
-    Embedder::new_local().expect("staged cache must build the local embedder")
 }
 
 #[tokio::test]
