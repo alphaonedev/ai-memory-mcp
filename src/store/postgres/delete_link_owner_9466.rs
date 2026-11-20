@@ -103,6 +103,26 @@ async fn seed_pair(store: &PostgresStore, source: Endpoint, target: Endpoint) ->
     (source_id, target_id)
 }
 
+/// Remove exactly the rows one [`seed_pair`] call created, by its own ids: the
+/// edge between the two ids (which may be an orphan with no endpoint row) and
+/// the endpoint rows themselves. The shared coverage database is one database
+/// for every binary, and an unembedded ordinary row left behind here is
+/// offered by `list_unembedded` (oldest first, capped) ahead of rows later
+/// tests seed, so a cell must leave no row of its own.
+async fn reap_pair(store: &PostgresStore, source_id: &str, target_id: &str) {
+    sqlx::query("DELETE FROM memory_links WHERE source_id = $1 AND target_id = $2")
+        .bind(source_id)
+        .bind(target_id)
+        .execute(&store.pool)
+        .await
+        .expect("reap seeded edge");
+    sqlx::query("DELETE FROM memories WHERE id = ANY($1)")
+        .bind(vec![source_id.to_string(), target_id.to_string()])
+        .execute(&store.pool)
+        .await
+        .expect("reap seeded endpoints");
+}
+
 async fn edge_count(store: &PostgresStore, source_id: &str, target_id: &str) -> i64 {
     sqlx::query_scalar("SELECT COUNT(*) FROM memory_links WHERE source_id = $1 AND target_id = $2")
         .bind(source_id)
@@ -131,6 +151,7 @@ async fn delete_link_owner_table_pg_9466() {
             .delete_link(&case.caller.ctx(), &source_id, &target_id)
             .await;
         let left = edge_count(&store, &source_id, &target_id).await;
+        reap_pair(&store, &source_id, &target_id).await;
         if let Err(mismatch) = judge(case, &got, left) {
             failures.push(mismatch.to_string());
         }
@@ -187,9 +208,10 @@ async fn delete_link_owner_read_error_pg_9466() {
                      `{expected}`, got {other:?}"
                 ),
             }
+            let left = edge_count(&store, &source_id, &target_id).await;
+            reap_pair(&store, &source_id, &target_id).await;
             assert_eq!(
-                edge_count(&store, &source_id, &target_id).await,
-                1,
+                left, 1,
                 "{state:?} / {caller:?}: a failed {what} must remove nothing"
             );
         }
@@ -281,6 +303,8 @@ async fn delete_link_owner_read_waits_for_owner_change_pg_9466() {
             },
             observe
         );
+        let left = edge_count(&store, &source_id, &target_id).await;
+        reap_pair(&store, &source_id, &target_id).await;
         assert!(
             queued,
             "restamp source={restamp_source}: delete_link must queue behind the uncommitted \
@@ -291,10 +315,6 @@ async fn delete_link_owner_read_waits_for_owner_change_pg_9466() {
             Ok(Ok(false)),
             "restamp source={restamp_source}: the former owner is refused after the change"
         );
-        assert_eq!(
-            edge_count(&store, &source_id, &target_id).await,
-            1,
-            "restamp source={restamp_source}: the edge is kept"
-        );
+        assert_eq!(left, 1, "restamp source={restamp_source}: the edge is kept");
     }
 }

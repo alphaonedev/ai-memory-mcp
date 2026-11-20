@@ -900,7 +900,7 @@ fn archive_source(
         // `atomisation_archived_at` key — never clobber other keys.
         let existing_metadata_str: String = conn
             .query_row(
-                "SELECT metadata FROM memories WHERE id = ?1",
+                crate::storage::MEMORY_METADATA_BY_ID_SQL,
                 params![source_id],
                 |r| {
                     r.get::<_, Option<String>>(0)

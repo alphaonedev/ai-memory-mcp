@@ -49,7 +49,7 @@ fn set_metadata(conn: &rusqlite::Connection, id: &str, metadata: &str) {
     crate::storage::set_row_metadata(conn, id, metadata).expect(SET_ENDPOINT_METADATA);
     let kept: String = conn
         .query_row(
-            "SELECT metadata FROM memories WHERE id = ?1",
+            crate::storage::MEMORY_METADATA_BY_ID_SQL,
             rusqlite::params![id],
             |row| row.get(0),
         )

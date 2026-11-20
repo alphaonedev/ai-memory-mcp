@@ -5633,11 +5633,7 @@ pub(crate) fn caller_may_mutate_live_row(
 ) -> Result<bool> {
     use rusqlite::OptionalExtension;
     let metadata: Option<String> = conn
-        .query_row(
-            "SELECT metadata FROM memories WHERE id = ?1",
-            params![id],
-            |r| r.get(0),
-        )
+        .query_row(MEMORY_METADATA_BY_ID_SQL, params![id], |r| r.get(0))
         .optional()?;
     let Some(metadata) = metadata else {
         return Ok(false);
