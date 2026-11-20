@@ -163,32 +163,43 @@ EXPECTED_DOCS_GLOBS = ["docs/**", "**/*.md"]
 EXPECTED_EXIT = {"EXIT_FULL_RUN": 0, "EXIT_USAGE": 2, "EXIT_DOCS_ONLY": 3, "EXIT_UNREADABLE": 4}
 EXPECTED_MAX_PATHS = 100_000
 BIG_LIST_SECONDS = 20.0
+EVENT_BASE_EXPR = "${{ github.event.pull_request.base.sha }}"
 EXPECTED_ACTION_ENV = {
-    "DOCS_GATE_BASE_SHA": "${{ inputs.base-sha }}",
+    # The sha the base copy is read at comes from the event itself (the taint scanner's base binding);
+    # the caller's input must equal it or the run is full.
+    "DOCS_GATE_BASE_SHA": EVENT_BASE_EXPR,
+    "DOCS_GATE_INPUT_BASE_SHA": "${{ inputs.base-sha }}",
     "DOCS_GATE_EVENT_NAME": "${{ inputs.event-name }}",
     "DOCS_GATE_BASE_REF": "${{ inputs.base-ref }}",
 }
 GATE_FILES = ("__init__.py", "common.py", "cargo_skip.py", "docs_only_gate.py", "rules.json")
 CHAIN_BASE = "chain/promo6-ssh-r2"
-# The action (H1 of REVIEW-9696-code-r1): fixed git commands copy the BASE commit's gate files into
-# RUNNER_TEMP, and the step that maps the decider's exit to docs_only is that base copy. Hand-written.
+# The action (H1 of REVIEW-9696-code-r1): ONE step copies the BASE commit's gate files into RUNNER_TEMP
+# with fixed `git show <base>:<path>` commands and then runs that base copy, so the code that maps the
+# decider's exit to docs_only is the base copy. Every doubt before the run prints a full-run notice and
+# exits 0 with docs_only empty; the run itself has errexit and no continue-on-error. Hand-written.
 BASE_GATE_DIR = "$RUNNER_TEMP/docs-gate-base/impact"
-EXPECTED_BASE_RUN = "".join(
-    ['[[ "$DOCS_GATE_BASE_SHA" =~ ^[0-9a-f]{40}([0-9a-f]{24})?$ ]]\n',
-     ': "${RUNNER_TEMP:?RUNNER_TEMP is unset}"\n',
+
+
+def full_run_guard(why):
+    return ('|| { echo "::notice::docs-only gate (#9683): %s; docs_only stays empty and the job runs in'
+            ' full"; exit 0; }\n' % why)
+
+
+EXPECTED_GATE_RUN = "".join(
+    ['[[ "$DOCS_GATE_BASE_SHA" =~ ^[0-9a-f]{40}([0-9a-f]{24})?$ && "$DOCS_GATE_INPUT_BASE_SHA" =='
+     ' "$DOCS_GATE_BASE_SHA" ]] ' + full_run_guard("the base sha is missing, malformed or not the event's"),
+     '[[ -d "$RUNNER_TEMP" ]] ' + full_run_guard("RUNNER_TEMP is unset or not a directory"),
      'git cat-file -e "${DOCS_GATE_BASE_SHA}^{commit}" || git fetch --no-tags --no-recurse-submodules'
-     ' --depth=1 origin "$DOCS_GATE_BASE_SHA"\n',
-     'rm -rf "$RUNNER_TEMP/docs-gate-base"\n',
-     'mkdir -p "%s"\n' % BASE_GATE_DIR]
-    + ['git cat-file blob "$DOCS_GATE_BASE_SHA:scripts/ci/impact/%s" > "%s/%s"\n' % (name, BASE_GATE_DIR, name)
-       for name in GATE_FILES])
-EXPECTED_GATE_RUN = 'python3 -I "%s/docs_only_gate.py" step' % BASE_GATE_DIR
+     ' --depth=1 origin "$DOCS_GATE_BASE_SHA" ' + full_run_guard("the base commit could not be fetched"),
+     'rm -rf "$RUNNER_TEMP/docs-gate-base" && mkdir -p "%s" ' % BASE_GATE_DIR
+     + full_run_guard("the base copy directory could not be made")]
+    + ['git show "${DOCS_GATE_BASE_SHA:?}:scripts/ci/impact/%s" > "%s/%s" ' % (name, BASE_GATE_DIR, name)
+       + full_run_guard("the base commit has no gate files") for name in GATE_FILES]
+    + ['python3 -I "%s/docs_only_gate.py" step\n' % BASE_GATE_DIR])
 EXPECTED_ACTION_STEPS = [
     # (id, if, continue-on-error, env)
-    ("base", "inputs.event-name == 'pull_request'", "true",
-     {"DOCS_GATE_BASE_SHA": "${{ inputs.base-sha }}"}),
-    ("gate", "steps.base.outcome == 'success'", None, EXPECTED_ACTION_ENV),
-    (None, "inputs.event-name == 'pull_request' && steps.base.outcome != 'success'", None, {}),
+    ("gate", "inputs.event-name == 'pull_request'", None, EXPECTED_ACTION_ENV),
 ]
 EXPECTED_ACTION_OUTPUT = "${{ steps.gate.outputs.docs_only }}"
 HEAD_GATE_PATH = "GITHUB_ACTION_PATH"
@@ -338,11 +349,6 @@ def parse_action(text):
 ACTION_CONDITIONS = {
     "inputs.event-name == 'pull_request'":
         lambda inputs, outcomes: inputs["event-name"] == "pull_request",
-    "steps.base.outcome == 'success'":
-        lambda inputs, outcomes: outcomes.get("base") == "success",
-    "inputs.event-name == 'pull_request' && steps.base.outcome != 'success'":
-        lambda inputs, outcomes: (inputs["event-name"] == "pull_request"
-                                  and outcomes.get("base") != "success"),
 }
 INPUT_EXPR = re.compile(r"^\$\{\{ inputs\.([a-z-]+) \}\}$")
 STEP_OUTPUT_EXPR = re.compile(r"^\$\{\{ steps\.([a-z_]+)\.outputs\.([a-z_]+) \}\}$")
@@ -443,8 +449,7 @@ class GateAction(unittest.TestCase):
         self.assertEqual(outputs, {"docs_only": EXPECTED_ACTION_OUTPUT})
         got = [(s.get("id"), s.get("if"), s.get("continue-on-error"), s["env"]) for s in steps]
         self.assertEqual(got, EXPECTED_ACTION_STEPS)
-        self.assertEqual(steps[0]["run"], EXPECTED_BASE_RUN)
-        self.assertEqual(steps[1]["run"], EXPECTED_GATE_RUN)
+        self.assertEqual(steps[0]["run"], EXPECTED_GATE_RUN)
         for step in steps:
             self.assertEqual(step.get("shell"), "bash")
             self.assertNotIn("${{", step["run"])
@@ -612,7 +617,7 @@ class Table(unittest.TestCase):
 
 
 # ---------------------------------------------------------------- step mode
-def git(repo, *args):
+def git_bytes(repo, *args):
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     # Same email-free identity as impact_fixture.GIT_IDENT.
     env.update({"GIT_AUTHOR_NAME": "fixture", "GIT_AUTHOR_EMAIL": "fixture-ident",
@@ -620,7 +625,11 @@ def git(repo, *args):
                 "GIT_CONFIG_NOSYSTEM": "1", "HOME": str(repo)})
     res = subprocess.run(["git", "-C", str(repo), "-c", "commit.gpgsign=false"] + list(args),
                          capture_output=True, env=env, timeout=120, check=True)
-    return res.stdout.decode("utf-8").strip()
+    return res.stdout
+
+
+def git(repo, *args):
+    return git_bytes(repo, *args).decode("utf-8").strip()
 
 
 GATE_REL = "scripts/ci/impact/docs_only_gate.py"
@@ -730,18 +739,22 @@ class GateRepo(unittest.TestCase):
         self.assertEqual(len(lines), 1, lines)
         return lines[0], res.stdout.decode("utf-8", "replace")
 
-    def run_action(self, event="pull_request", base=None, base_ref=CHAIN_BASE, runner_temp=True):
+    def run_action(self, event="pull_request", base=None, base_ref=CHAIN_BASE, runner_temp=True,
+                   event_base=None):
         """Run this tree's composite action the way the runner does; return a result dict.
 
         Each step runs as `bash --noprofile --norc -eo pipefail` (the runner's `shell: bash`) in the
-        workspace, with the step's env (inputs substituted), GITHUB_ACTION_PATH at the PR head's copy
-        of the action, and its own GITHUB_OUTPUT. `if:` comes from ACTION_CONDITIONS only; a failed step
-        without continue-on-error fails the action. Keys: failed, docs_only, outcomes, stdout.
+        workspace, with the step's env (inputs and the event's base sha substituted), GITHUB_ACTION_PATH
+        at the PR head's copy of the action, and its own GITHUB_OUTPUT. `event_base` is
+        github.event.pull_request.base.sha (default: the base-sha input, as every caller passes it).
+        `if:` comes from ACTION_CONDITIONS only; a failed step without continue-on-error fails the
+        action. Keys: failed, docs_only, outcomes, stdout.
         """
         inputs_default, outputs, steps = parse_action(ACTION.read_text(encoding="utf-8"))
         inputs = dict(inputs_default)
         inputs.update({"base-sha": self.base if base is None else base, "event-name": event,
                        "base-ref": base_ref})
+        expressions = {EVENT_BASE_EXPR: inputs["base-sha"] if event_base is None else event_base}
         bindir = self.top / "bin"
         bindir.mkdir(exist_ok=True)
         python3 = bindir / "python3"
@@ -766,6 +779,9 @@ class GateRepo(unittest.TestCase):
             for key in ("DOCS_GATE_EVENT_NAME", "DOCS_GATE_BASE_SHA", "DOCS_GATE_BASE_REF"):
                 env.pop(key)
             for key, value in step["env"].items():
+                if value in expressions:
+                    env[key] = expressions[value]
+                    continue
                 match = INPUT_EXPR.match(value)
                 self.assertIsNotNone(match, value)
                 env[key] = inputs[match.group(1)]
@@ -1030,7 +1046,8 @@ class ActionRun(GateRepo):
         result = self.run_action()
         self.assertFalse(result["failed"], result)
         self.assertEqual(result["docs_only"], "true", result)
-        self.assertEqual(result["outcomes"].get("base"), "success")
+        self.assertEqual(result["outcomes"].get("gate"), "success")
+        self.assertNotIn(FULL_RUN_LITERAL, result["stdout"])
 
     def test_base_decider_unknown_exit_through_the_action_is_a_full_run_9683(self):
         for code in (1, 2, 4):
@@ -1068,10 +1085,8 @@ class ActionRun(GateRepo):
                 self.commit("docs/b-%s.md" % name, "b\n")
                 result = self.run_action()
                 self.assertFalse(result["failed"], result)
-                self.assertNotEqual(result["docs_only"], "true", result)
-                self.assertEqual(result["outcomes"].get("base"), "failure", result)
-                self.assertEqual(result["outcomes"].get("gate"), "skipped", result)
-                self.assertIn(FULL_RUN_LITERAL, result["stdout"])
+                self.assertEqual(result["docs_only"], "", result)
+                self.assertIn("the base commit has no gate files; " + FULL_RUN_LITERAL, result["stdout"])
 
     def test_missing_or_malformed_base_through_the_action_is_a_full_run_9683(self):
         self.commit("docs/b.md", "b\n")
@@ -1079,13 +1094,78 @@ class ActionRun(GateRepo):
             with self.subTest(base=base):
                 result = self.run_action(base=base)
                 self.assertFalse(result["failed"], result)
-                self.assertNotEqual(result["docs_only"], "true", result)
+                self.assertEqual(result["docs_only"], "", result)
+                self.assertIn(FULL_RUN_LITERAL, result["stdout"])
+
+    def test_input_base_that_is_not_the_events_is_a_full_run_9683(self):
+        """The copy is read at the event's base sha; a caller input naming another commit is a full run."""
+        other = self.base
+        self.commit("docs/b.md", "b\n")
+        later = git(self.repo, "rev-parse", "HEAD")
+        for input_base, event_base in ((later, other), (other, later), (other, "")):
+            with self.subTest(input=input_base, event=event_base):
+                result = self.run_action(base=input_base, event_base=event_base)
+                self.assertFalse(result["failed"], result)
+                self.assertEqual(result["docs_only"], "", result)
+                self.assertIn("not the event's; " + FULL_RUN_LITERAL, result["stdout"])
 
     def test_runner_temp_unset_through_the_action_is_a_full_run_9683(self):
         self.commit("docs/b.md", "b\n")
-        result = self.run_action(runner_temp=None)
+        afile = self.top / "a-file"
+        afile.write_text("x")
+        for temp in (None, self.top / "missing", afile, ""):
+            with self.subTest(runner_temp=str(temp)):
+                result = self.run_action(runner_temp=temp)
+                self.assertFalse(result["failed"], result)
+                self.assertEqual(result["docs_only"], "", result)
+                self.assertIn("RUNNER_TEMP is unset or not a directory; " + FULL_RUN_LITERAL, result["stdout"])
+
+    def test_unfetchable_base_through_the_action_is_a_full_run_9683(self):
+        """A well-formed base sha the clone lacks and no origin can serve is a full run, not a red job."""
+        self.commit("docs/b.md", "b\n")
+        result = self.run_action(base="ab" * 20)
         self.assertFalse(result["failed"], result)
-        self.assertNotEqual(result["docs_only"], "true", result)
+        self.assertEqual(result["docs_only"], "", result)
+        self.assertIn("the base commit could not be fetched; " + FULL_RUN_LITERAL, result["stdout"])
+
+    def test_base_copy_dir_that_cannot_be_made_is_a_full_run_9683(self):
+        self.commit("docs/b.md", "b\n")
+        (self.runner_temp / "docs-gate-base").write_text("a file where the directory goes\n")
+        os.chmod(str(self.runner_temp), 0o555)
+        try:
+            result = self.run_action()
+        finally:
+            os.chmod(str(self.runner_temp), 0o755)
+        self.assertFalse(result["failed"], result)
+        self.assertEqual(result["docs_only"], "", result)
+        self.assertIn("the base copy directory could not be made; " + FULL_RUN_LITERAL, result["stdout"])
+
+    def test_head_gitattributes_textconv_does_not_alter_the_base_copy_9683(self):
+        """decision: `git show <sha>:<path>` over `git cat-file blob`; a blob is shown as its plain bytes,
+        even with a head .gitattributes naming a textconv driver that would map docs-only onto full run."""
+        git(self.repo, "config", "diff.evil9683.textconv",
+            "sed 's/EXIT_DOCS_ONLY = 3/EXIT_DOCS_ONLY = 0/'")
+        self.commit(".gitattributes", "*.py diff=evil9683\n")
+        self.commit("src/lib.rs", "// changed\n")
+        result = self.run_action()
+        self.assertFalse(result["failed"], result)
+        self.assertEqual(result["docs_only"], "false", result)
+        copied = (self.runner_temp / "docs-gate-base" / "impact" / "docs_only_gate.py").read_bytes()
+        self.assertEqual(copied, git_bytes(self.repo, "cat-file", "blob", "%s:%s" % (self.base, GATE_REL)))
+
+    def test_stale_base_copy_is_replaced_9683(self):
+        """A leftover RUNNER_TEMP copy that says docs-only is removed before the base copy is written."""
+        stale = self.runner_temp / "docs-gate-base" / "impact"
+        stale.mkdir(parents=True)
+        (stale / "docs_only_gate.py").write_text("import sys\nsys.exit(3)\n")
+        (stale / "extra.py").write_text("x = 1\n")
+        (stale / "__pycache__").mkdir()
+        self.commit("src/lib.rs", "// changed\n")
+        result = self.run_action()
+        self.assertEqual(result["docs_only"], "false", result)
+        # __pycache__ is the base copy's own import cache from this run (rm -rf clears it every run).
+        self.assertEqual(sorted(p.name for p in stale.iterdir() if p.name != "__pycache__"), sorted(GATE_FILES))
+        self.assertNotIn("extra.py", [p.name for p in stale.iterdir()])
 
     def test_not_a_pull_request_through_the_action_is_a_full_run_9683(self):
         self.commit("docs/b.md", "b\n")

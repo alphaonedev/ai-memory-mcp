@@ -21,10 +21,10 @@ Two subcommands:
 
     step
         The composite action (.github/actions/docs-only-gate) runs this, and
-        on pull_request it runs the BASE commit's copy: a first action step
-        copies the base commit's gate files (git cat-file blob
-        <base>:scripts/ci/impact/<file>) into RUNNER_TEMP, and the step that
-        runs this mode is that copy, with -I. The step reads
+        on pull_request it runs the BASE commit's copy: the action's one step
+        copies the base commit's gate files (git show
+        <event base sha>:scripts/ci/impact/<file>) into RUNNER_TEMP and then
+        runs this mode from that copy, with -I. The mode reads
         DOCS_GATE_EVENT_NAME, DOCS_GATE_BASE_SHA, DOCS_GATE_BASE_REF,
         GITHUB_WORKSPACE, GITHUB_OUTPUT and RUNNER_TEMP, extracts the base
         decider and rules again into its own RUNNER_TEMP directory, runs that
