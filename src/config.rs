@@ -11728,7 +11728,8 @@ legacy_scoring = false
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("ai-memory").join("config.toml");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, "# mine\n").unwrap();
+        std::io::Write::write_all(&mut std::fs::File::create_new(&path).unwrap(), b"# mine\n")
+            .unwrap();
         AppConfig::write_default_at(&path).expect("AlreadyExists is Ok");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "# mine\n");
     }
@@ -11749,7 +11750,7 @@ legacy_scoring = false
     fn write_default_at_reports_a_refused_parent_9620() {
         let tmp = tempfile::tempdir().unwrap();
         let blocker = tmp.path().join("blocker");
-        std::fs::write(&blocker, "x").unwrap();
+        std::io::Write::write_all(&mut std::fs::File::create_new(&blocker).unwrap(), b"x").unwrap();
         let path = blocker.join("config.toml");
         let err = AppConfig::write_default_at(&path).expect_err("parent is a file");
         // `create_dir_all` reports a non-directory in the way as an error;
