@@ -67,8 +67,14 @@ const SHAPE_UNITS: &[(&str, &str)] = &[
     ("mixed prefixes", "sk-ghp_xai-eyJAKIAagithub_pat_"),
     ("mixed with dots", "sk-.eyJ.ghp_.AKIAa.xai-."),
     ("token chars only", "aZ09-_+/.="),
-    ("multibyte between prefixes", "sk-\u{e9}ghp_\u{65e5}\u{672c}eyJ\u{20ac}"),
-    ("multibyte after long run", "sk-sk-sk-sk-sk-sk-sk-sk-sk-sk-\u{1d11e}"),
+    (
+        "multibyte between prefixes",
+        "sk-\u{e9}ghp_\u{65e5}\u{672c}eyJ\u{20ac}",
+    ),
+    (
+        "multibyte after long run",
+        "sk-sk-sk-sk-sk-sk-sk-sk-sk-sk-\u{1d11e}",
+    ),
     ("multibyte only", "\u{e9}\u{65e5}\u{20ac}\u{1d11e}"),
 ];
 
@@ -292,7 +298,9 @@ fn same_run_late_secret_cases() -> Vec<String> {
 #[test]
 fn screen_detections_match_reference_9599() {
     let mut rng = Rng(CORPUS_SEED);
-    let mut cases: Vec<String> = (0..CORPUS_CASES).map(|_| generated_case(&mut rng)).collect();
+    let mut cases: Vec<String> = (0..CORPUS_CASES)
+        .map(|_| generated_case(&mut rng))
+        .collect();
     cases.extend(same_run_late_secret_cases());
     for &(_, unit) in SHAPE_UNITS {
         cases.push(repeat_to(unit, REFERENCE_SHAPE_BYTES));
