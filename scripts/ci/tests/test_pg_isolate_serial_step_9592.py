@@ -52,8 +52,9 @@ def good_log(name, db, mode, tests=2, extra=''):
 class FakeHost:
     """Records every call; ``run_rc`` scripts the exit of argv containing a key."""
 
-    def __init__(self, entry, run_rc=None, setup_out=None, leftovers=(0, 0), write_logs=None):
+    def __init__(self, entry, run_rc=None, setup_out=None, leftovers=(0, 0), write_logs=None, list_out=None):
         self.entry = entry
+        self.list_out = list_out or {}
         self.calls = []
         self.env_lines = []
         self.run_rc = run_rc or {}
@@ -73,6 +74,10 @@ class FakeHost:
 
     def capture(self, argv, env):
         self.calls.append(('capture', list(argv), dict(env)))
+        if '--list' in argv:
+            # C-L3: ``<test exe> --list --ignored``; keyed by binary name, default: none ignored.
+            name = Path(argv[0]).name.rsplit('-', 1)[0]
+            return self.list_out.get(name, (0, ''))
         if self.setup_out is not None:
             return self.setup_out
         run_id = argv[argv.index('--run-id') + 1]
@@ -92,6 +97,13 @@ class FakeHost:
     def leftovers(self, env, db, run_id):
         self.leftover_checks += 1
         return self.left
+
+
+def ledger_text(names, run_id, tests=2):
+    rows = ['binary %s tests=%d ignored=0 mode=%s db=%s' % (n, tests, 'residual' if n in RESIDUAL else 'isolated',
+                                                           SHARED_DB if n in RESIDUAL else 'ai_memory_t_%s_1_%08x' % (run_id, i))
+            for i, n in enumerate(names)]
+    return '\n'.join(rows + ['complete binaries=%d run_id=%s' % (len(names), run_id)]) + '\n'
 
 
 def all_good(log_dir, run_id):
@@ -117,7 +129,7 @@ class Base(unittest.TestCase):
         (self.root / 'ci-iso-mode.txt').write_text('deferred\n')
         self.env = {'RUNNER_TEMP': str(self.root), 'AI_MEMORY_TEST_POSTGRES_URL': SECRET_URL,
                     'AI_MEMORY_TEST_PG_ISOLATE': '1', 'CI_FED_DB': SHARED_DB, 'JOB_TIMEOUT_MIN': '150',
-                    'JOB_T0': str(JOB_T0), 'PATH': '/usr/bin'}
+                    'JOB_T0': str(JOB_T0), 'PATH': '/usr/bin', 'CI_PG_ISOLATE_OFF': ''}
 
     def step(self, host, **env_over):
         env = dict(self.env, **env_over)
@@ -310,8 +322,18 @@ class IsolatedPath(Base):
 
 
 class Inputs(Base):
+    def test_mode_none_with_deferred_binaries_listed_fails_closed(self):
+        # SA / C-M1: Run tests split the binaries out but the mode stayed none (mutant S20).
+        (self.root / 'ci-iso-mode.txt').write_text('none\n')
+        host = FakeHost(self.e)
+        rc, out = self.step(host)
+        self.assertEqual(rc, 1)
+        self.assertIn('serial shard step FAIL: mode none but iso_targets.txt lists binaries', out)
+        self.assertEqual(host.calls, [])
+
     def test_mode_none_is_a_notice_and_zero(self):
         (self.root / 'ci-iso-mode.txt').write_text('none\n')
+        (self.shard / 'iso_targets.txt').unlink()
         host = FakeHost(self.e)
         rc, out = self.step(host)
         self.assertEqual(rc, 0)
@@ -355,26 +377,23 @@ class Inputs(Base):
 
 
 class KillSwitch(Base):
-    def test_kill_switch_prints_notice_and_runs_the_exact_serial_argv(self):
+    """SF / C-L2: with the kill switch on, Run tests ran the binaries serially itself (mode killswitch)."""
+
+    def test_kill_switch_on_with_mode_killswitch_is_a_notice_and_zero(self):
+        (self.root / 'ci-iso-mode.txt').write_text('killswitch\n')
+        (self.shard / 'iso_targets.txt').unlink()
         host = FakeHost(self.e)
         rc, out = self.step(host, CI_PG_ISOLATE_OFF='1')
         self.assertEqual(rc, 0, out)
-        self.assertIn('[#9592] per-binary Postgres isolation disabled by CI_PG_ISOLATE_OFF=1: running the serial path',
-                      out)
-        self.assertEqual(self.wrapper_runs(host), [])
-        runs = [(argv, env) for kind, argv, env in host.calls if kind == 'run']
-        sel = ['--test', 'alpha_9592', '--test', 'beta_9592', '--test', 'resid_9592']
-        self.assertEqual(runs[0][0], ['cargo', 'test', '--no-run', '--features', 'sal-postgres'] + sel)
-        self.assertEqual(runs[1][0][4:], ['cargo', 'test', '--no-fail-fast', '--features', 'sal-postgres'] + sel
-                         + ['--', '--test-threads=1'])
-        self.assertEqual(runs[1][1]['AI_MEMORY_TEST_PG_ISOLATE'], '0')
-        self.assertEqual(self.e.serial_argv(sel), ['cargo', 'test', '--no-fail-fast', '--features', 'sal-postgres']
-                         + sel + ['--', '--test-threads=1'])
+        self.assertIn('[#9592] per-binary Postgres isolation disabled by CI_PG_ISOLATE_OFF: '
+                      'Run tests ran the serial-shard binaries itself', out)
+        self.assertEqual(host.calls, [])
 
-    def test_kill_switch_red_tests_stay_red(self):
-        rc, out = self.step(FakeHost(self.e, run_rc={'--no-fail-fast': 101}), CI_PG_ISOLATE_OFF='1')
+    def test_kill_switch_on_but_binaries_deferred_fails_closed(self):
+        # The two steps disagree (mutant K1): Run tests deferred, the step sees the switch on.
+        rc, out = self.step(FakeHost(self.e), CI_PG_ISOLATE_OFF='1')
         self.assertEqual(rc, 1)
-        self.assertIn('serial path test failures (exit 101)', out)
+        self.assertIn('serial shard step FAIL: the kill switch is on but the mode file says deferred', out)
 
 
 class SelfSkip(Base):
@@ -390,11 +409,14 @@ class SelfSkip(Base):
             'test t0 ... ok',
             '# [pg_isolated_binary] skip connect failed',
         ]))
+        # SE: any skip print is red, whatever the marker (b29 205/723, justin 130 in 47 binaries).
         self.assertEqual(hits, ['skip: AI_MEMORY_TEST_POSTGRES_URL not set',
                                 'skipping: AI_MEMORY_TEST_POSTGRES_URL unset',
                                 'test skipped: PostgresStore::connect failed: refused',
                                 'skip: cannot reach AI_MEMORY_TEST_POSTGRES_URL: <redacted-url>',
-                                'skip: no AI_MEMORY_TEST_POSTGRES_URL'])
+                                'skip: no AI_MEMORY_TEST_POSTGRES_URL',
+                                'skip: AI_MEMORY_TEST_AGE_URL not set',
+                                'skipping: openssl not available on PATH'])
 
     def test_detector_bounds_long_lines(self):
         hits = self.e.self_skip_lines('skip: connect failed ' + 'x' * 100_000)
@@ -419,16 +441,32 @@ class Leftovers(Base):
         self.assertEqual(rc, 0)
         self.assertIn('[#9592] isolation leftovers after teardown: clones=0 template=0', buf.getvalue())
 
-    def test_leftovers_without_a_run_id_is_zero(self):
+    def test_leftovers_without_a_run_id_fails_closed(self):
+        # SB: an unset run id is red, never "nothing to check".
         buf = io.StringIO()
         with redirect_stdout(buf):
             rc = self.e.cmd_leftovers(FakeHost(self.e), self.env)
-        self.assertEqual(rc, 0)
-        self.assertIn('no isolation run id', buf.getvalue())
+        self.assertEqual(rc, 1)
+        self.assertIn('serial shard step FAIL: no isolation run id (AI_MEMORY_TEST_PG_RUN_ID or ci-iso-run.txt)',
+                      buf.getvalue())
+
+    def test_leftovers_reads_the_run_file(self):
+        (self.root / 'ci-iso-run.txt').write_text('AI_MEMORY_TEST_PG_RUN_ID=rabc\n')
+        host = FakeHost(self.e, leftovers=(1, 0))
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = self.e.cmd_leftovers(host, self.env)
+        self.assertEqual(rc, 1)
+        self.assertIn('[#9592] isolation leftovers after teardown: clones=1 template=0', buf.getvalue())
 
 
 class Cleanup(Base):
     """I-11: the always() Cleanup step tears this run down again, then proves nothing is left."""
+
+    def setUp(self):
+        super().setUp()
+        (self.root / 'ci-iso-run.txt').write_text('AI_MEMORY_TEST_PG_RUN_ID=rabc\n')
+        (self.root / 'ci-iso-ledger.txt').write_text(ledger_text(TARGETS, 'rabc'))
 
     def cleanup(self, host, **env_over):
         env = dict(self.env, AI_MEMORY_TEST_PG_RUN_ID='rabc')
@@ -465,12 +503,21 @@ class Cleanup(Base):
         self.assertIn('wrapper teardown failed (exit 2)', out)
         self.assertEqual(host.leftover_checks, 1)
 
-    def test_cleanup_without_a_run_id_does_nothing(self):
+    def test_cleanup_deferred_without_a_run_file_fails_closed(self):
+        # SB: mode deferred and no run id is red (the step was killed before it wrote one, or never ran).
+        (self.root / 'ci-iso-run.txt').unlink()
         host = FakeHost(self.e)
         rc, out = self.cleanup(host, AI_MEMORY_TEST_PG_RUN_ID=None)
-        self.assertEqual(rc, 0)
-        self.assertIn('no isolation run id', out)
+        self.assertEqual(rc, 1)
+        self.assertIn('serial shard step FAIL: cannot read ci-iso-run.txt: the isolated step never started', out)
         self.assertEqual(host.calls, [])
+
+    def test_cleanup_uses_the_run_file_id_without_the_env(self):
+        host = FakeHost(self.e)
+        rc, out = self.cleanup(host, AI_MEMORY_TEST_PG_RUN_ID=None)
+        self.assertEqual(rc, 0, out)
+        ((argv, _env),) = [(a, e) for kind, a, e in host.calls if 'teardown' in a]
+        self.assertEqual(argv[argv.index('--run-id') + 1], 'rabc')
 
     def test_cleanup_refuses_a_db_that_is_not_the_url_database(self):
         host = FakeHost(self.e)

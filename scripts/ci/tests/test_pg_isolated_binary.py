@@ -39,6 +39,7 @@ BASE = 'postgres://u:pw@127.0.0.1:5445/ai_memory_test_ci_9_1_x?sslmode=verify-fu
 TPL = 'ai_memory_test_ci_9_1_x_tpl'
 RUN = 'r6386'
 OTHER = 'zother'
+SERVER_DB_9592 = 'ai_memory_server_named_9592'
 SCRATCH = REPO / '.local-runs' / 'pg-isolate-unittest'
 
 
@@ -2058,7 +2059,8 @@ class RunOne(unittest.TestCase):
         with Patched() as rec:
             rc = r.run_one(['--test', 'a2a_campaign_round1'], isolate=False)
         self.assertEqual(rc, 0)
-        self.assertEqual(rec.sql(), [], 'nothing minted for a residual binary')
+        # C-L6 (#9592): the only statement is the server's own database name for the evidence line.
+        self.assertEqual(rec.sql(), ['SELECT current_database()'], 'nothing minted for a residual binary')
         env = FakePopen.cargo()[0].kw['env']
         self.assertEqual(env[pib.URL_VAR], BASE)
         self.assertNotIn(pib.FLAG_VAR, env)
@@ -2750,17 +2752,96 @@ class Evidence9592(unittest.TestCase):
         first = (Path(d) / 'foo_9592.log').read_text().splitlines()[0]
         self.assertEqual(first, '# [pg_isolated_binary] current_database=<unknown> mode=isolated')
 
-    def test_residual_log_names_the_shared_database_without_sql(self):
+    def test_residual_log_names_the_database_the_server_reports(self):
+        # C-L6: the residual evidence comes from current_database() on the shared URL, not the URL text.
         d = scratch_dir()
         r = runner(log_dir=d)
-        with Patched() as rec:
+
+        def answer(argv, kw):
+            sql = argv[-1] if '-c' in argv else ''
+            if sql == 'SELECT current_database()':
+                return Result(0, SERVER_DB_9592 + '\n')
+            return default_answer(argv, kw)
+        with Patched(Recorder(answer)) as rec:
             r.run_one(['--test', 'res_9592'], isolate=False)
-        self.assertEqual(rec.sql(), [])
+        self.assertEqual(rec.sql(), ['SELECT current_database()'])
         text = (Path(d) / 'res_9592.log').read_text()
         self.assertEqual(text.splitlines()[0], '# [pg_isolated_binary] current_database=%s mode=residual'
-                         % pib.database_name(BASE))
+                         % SERVER_DB_9592)
         self.assertNotIn('pw@', text)
         self.assertNotIn('postgres://', text)
+
+    def test_residual_with_an_unreadable_database_is_marked_unknown(self):
+        d = scratch_dir()
+        r = runner(log_dir=d)
+        with Patched():
+            r.run_one(['--test', 'res_9592'], isolate=False)
+        first = (Path(d) / 'res_9592.log').read_text().splitlines()[0]
+        self.assertEqual(first, '# [pg_isolated_binary] current_database=<unknown> mode=residual')
+
+
+class SessionBound9592(unittest.TestCase):
+    """SEC-L4: a binary that opens more sessions on its clone than the budget assumes is killed, exit 5."""
+
+    BOUND = pib.PER_BINARY_CONNECTIONS + pib.HOLD_CONNECTIONS
+
+    def run_with_sessions(self, sessions, polls_before_exit=2, isolate=True):
+        d = scratch_dir()
+        r = runner(log_dir=d)
+        state = {'waits': 0}
+
+        class SlowCargo(FakePopen):
+            def wait(self, timeout=None):
+                if self.is_hold or timeout is None or self.returncode is not None:
+                    return super().wait(timeout)
+                state['waits'] += 1
+                if state['waits'] <= polls_before_exit:
+                    raise subprocess.TimeoutExpired(self.argv, timeout)
+                return super().wait(timeout)
+
+        def answer(argv, kw):
+            sql = argv[-1] if '-c' in argv else ''
+            if 'count(*)' in sql and 'pg_stat_activity' in sql and 'datname =' in sql:
+                return Result(0, '%d\n' % sessions)
+            return default_answer(argv, kw)
+        rec, stack = patched(Recorder(answer))
+        stack[1] = unittest.mock.patch.object(pib.subprocess, 'Popen', SlowCargo)
+        out = io.StringIO()
+        with contextlib.ExitStack() as es:
+            for cm in stack:
+                es.enter_context(cm)
+            killpg = pib.os.killpg
+            es.enter_context(contextlib.redirect_stderr(out))
+            es.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            rc = r.run_one(['--test', 'many_9592'], isolate=isolate)
+            calls = list(killpg.call_args_list)
+        return rc, out.getvalue(), calls, state
+
+    def test_bound_is_the_budget_figure(self):
+        self.assertEqual(pib.Admission.NEED, self.BOUND)
+        self.assertEqual(pib.EXIT_SESSIONS, 5)
+
+    def test_sessions_over_the_bound_are_refused_with_the_exact_reason(self):
+        for sessions in (self.BOUND + 1, self.BOUND + 50):
+            with self.subTest(sessions=sessions):
+                rc, err, calls, _ = self.run_with_sessions(sessions)
+                self.assertEqual(rc, pib.EXIT_SESSIONS)
+                self.assertIn('FAIL many_9592: session bound exceeded: ', err)
+                self.assertIn(' opened %d sessions (bound %d)' % (sessions, self.BOUND), err)
+                self.assertIn(unittest.mock.call(unittest.mock.ANY, pib.signal.SIGKILL), calls)
+
+    def test_sessions_at_the_bound_pass(self):
+        for sessions in (1, self.BOUND):
+            with self.subTest(sessions=sessions):
+                rc, err, calls, state = self.run_with_sessions(sessions)
+                self.assertEqual(rc, 0, err)
+                self.assertNotIn('session bound exceeded', err)
+                self.assertEqual(state['waits'], 3)
+
+    def test_residual_binaries_are_not_polled(self):
+        rc, err, _calls, state = self.run_with_sessions(self.BOUND + 1, polls_before_exit=0, isolate=False)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(state['waits'], 0)
 
 
 if __name__ == '__main__':

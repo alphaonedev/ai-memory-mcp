@@ -83,14 +83,169 @@ class Mutants(unittest.TestCase):
         self.assert_caught(CI_YML.replace('vars.CI_PG_ISOLATE_OFF', 'vars.SOMETHING_ELSE'), 'G8-kill-switch')
 
 
+RUN_TESTS_STEP = 'Run tests (impact-aware)'
+ISO_STEP = 'Serial shard isolated binaries (linux-fed enterprise-fed, issue 9592)'
+CLEANUP_STEP = 'Cleanup enterprise-fed ephemeral db'
+REDACT_STEP = 'Redact isolated-lane per-binary logs (issue 9592)'
+UPLOAD_STEP = 'Upload isolated-lane per-binary logs (#6383)'
+KILL_LINE = '          CI_PG_ISOLATE_OFF: ${{ vars.CI_PG_ISOLATE_OFF }}\n'
+
+
+def step_span(text, name):
+    """(start, end) of the step named ``name`` in the workflow text: its ``- name:`` line to the next sibling."""
+    marker = '      - name: %s\n' % name
+    start = text.index(marker)
+    nxt = text.find('\n      - name: ', start + len(marker))
+    return start, (len(text) if nxt < 0 else nxt + 1)
+
+
+def mutate_step(name, old, new, text=None):
+    """Replace ``old`` by ``new`` once inside one named step of ci.yml (the mutation must change it)."""
+    text = CI_YML if text is None else text
+    start, end = step_span(text, name)
+    block = text[start:end]
+    if old not in block:
+        raise AssertionError('%r not in step %r' % (old, name))
+    return text[:start] + block.replace(old, new, 1) + text[end:]
+
+
+def failures_of(text, cid):
+    return [msg for c, msg in chk.static_failures(text, REPO) if c == cid]
+
+
+class StepWiring9592(unittest.TestCase):
+    """#9592 r1 SA / C-M1 / C-M2 / SB / SD / SG: the gate checks that the halves agree, step by step."""
+
+    def caught(self, mutant, cid, reason=None):
+        self.assertNotEqual(mutant, CI_YML, 'the mutation must change the text')
+        found = failures_of(mutant, cid)
+        self.assertTrue(found, 'no %s failure for the mutant' % cid)
+        if reason is not None:
+            self.assertIn(reason, found)
+
+    # G8: the exact kill-switch env line on Run tests AND on the isolated step (C-M1, K1).
+    def test_kill_switch_dropped_from_run_tests_is_caught(self):
+        self.caught(mutate_step(RUN_TESTS_STEP, KILL_LINE, ''), 'G8-kill-switch',
+                    "step %r does not set CI_PG_ISOLATE_OFF: ${{ vars.CI_PG_ISOLATE_OFF }}" % RUN_TESTS_STEP)
+
+    def test_kill_switch_dropped_from_the_isolated_step_is_caught(self):
+        self.caught(mutate_step(ISO_STEP, KILL_LINE, ''), 'G8-kill-switch',
+                    "step %r does not set CI_PG_ISOLATE_OFF: ${{ vars.CI_PG_ISOLATE_OFF }}" % ISO_STEP)
+
+    def test_kill_switch_from_another_variable_is_caught(self):
+        self.caught(mutate_step(ISO_STEP, KILL_LINE, '          CI_PG_ISOLATE_OFF: ${{ vars.OTHER }}\n'),
+                    'G8-kill-switch')
+
+    def test_kill_switch_dropped_from_both_steps_is_caught(self):
+        both = mutate_step(ISO_STEP, KILL_LINE, '', mutate_step(RUN_TESTS_STEP, KILL_LINE, ''))
+        self.assertEqual(len(failures_of(both, 'G8-kill-switch')), 2)
+
+    # G10: the deferral and the kill switch are decided in Run tests by the pinned lines.
+    def test_every_deferral_pin_is_required(self):
+        for pin in chk.DEFER_PINS:
+            with self.subTest(pin=pin):
+                self.caught(mutate_step(RUN_TESTS_STEP, pin, pin + ' # changed'), 'G10-deferral',
+                            'Run tests lost the deferral pin %r' % pin)
+
+    def test_the_deferral_leg_matches_the_isolated_step_if(self):
+        self.assertIn("matrix.node == '%s' && matrix.tier == '%s'" % (chk.DEFER_NODE, chk.DEFER_TIER),
+                      chk.ALLOWED_IF)
+        for pin in chk.DEFER_PINS[1:3]:
+            self.assertIn('"%s"' % chk.DEFER_NODE, pin)
+            self.assertIn('"%s"' % chk.DEFER_TIER, pin)
+
+    # G11: Cleanup runs the entry first, and every exit carries its exit code.
+    def test_cleanup_exit_zero_is_caught(self):
+        self.caught(mutate_step(CLEANUP_STEP, 'exit "$iso_rc"', 'exit 0'), 'G11-cleanup',
+                    'the Cleanup step exits with %r (allowed: %r)' % ('exit 0', chk.CLEANUP_EXIT))
+
+    def test_cleanup_call_after_an_exit_is_caught(self):
+        call = '          %s\n' % chk.CLEANUP_CALL
+        moved = mutate_step(CLEANUP_STEP, call, '')
+        moved = mutate_step(CLEANUP_STEP, '          export PATH\n', '          export PATH\n' + call, moved)
+        self.caught(moved, 'G11-cleanup', 'the Cleanup step does not run %r before its first exit' % chk.CLEANUP_CALL)
+
+    def test_cleanup_without_always_is_caught(self):
+        self.caught(mutate_step(CLEANUP_STEP, 'if: always() && ', 'if: '), 'G11-cleanup',
+                    'the Cleanup step is not always()')
+
+    def test_cleanup_without_the_entry_is_caught(self):
+        self.caught(mutate_step(CLEANUP_STEP, chk.CLEANUP_CALL, 'true'), 'G11-cleanup')
+
+    # G12: continue-on-error is banned on the steps of the handshake and on job check.
+    def test_continue_on_error_is_caught_on_every_step(self):
+        for name in (RUN_TESTS_STEP, ISO_STEP, CLEANUP_STEP, REDACT_STEP):
+            with self.subTest(step=name):
+                marker = '      - name: %s\n' % name
+                self.caught(CI_YML.replace(marker, marker + '        continue-on-error: true\n', 1),
+                            'G12-continue-on-error', 'continue-on-error on step %r' % name)
+
+    def test_continue_on_error_on_job_check_is_caught(self):
+        self.caught(CI_YML.replace('\n  check:\n', '\n  check:\n    continue-on-error: true\n', 1),
+                    'G12-continue-on-error', 'continue-on-error on job check')
+
+    # G13: the isolated step never runs on a fork pull request (SG).
+    def test_a_missing_fork_guard_is_caught(self):
+        self.caught(mutate_step(ISO_STEP, ' && ' + FORK_GUARD, ''), 'G13-fork-guard',
+                    'the isolated step has no fork guard %r' % FORK_GUARD)
+
+    # G14: the isolated step runs inside the #7914 host semaphore (C-M2).
+    def test_the_isolated_step_outside_the_semaphore_is_caught(self):
+        self.caught(mutate_step(ISO_STEP, ALLOWED_RUN, 'python3 scripts/ci/pg_isolate_serial_step.py run'),
+                    'G14-host-semaphore', 'the isolated step does not run %r' % ALLOWED_RUN)
+
+    def test_the_run_line_is_the_semaphore_wrapper(self):
+        self.assertTrue(chk.ALLOWED_RUN.startswith('python3 -I scripts/ci/host_semaphore.py --name linux-fed-tests '))
+        self.assertIn('--label "${CI_NODE}/${TIER}/iso"', chk.ALLOWED_RUN)
+        self.assertTrue(chk.ALLOWED_RUN.endswith(' -- python3 scripts/ci/pg_isolate_serial_step.py run'))
+
+    def test_semaphore_env_that_differs_from_run_tests_is_caught(self):
+        for key in chk.SEMAPHORE_ENV:
+            with self.subTest(key=key):
+                start, end = step_span(CI_YML, ISO_STEP)
+                block = CI_YML[start:end]
+                line = next(ln for ln in block.splitlines() if ln.strip().startswith(key + ':'))
+                mutant = mutate_step(ISO_STEP, line + '\n', '          %s: "9"\n' % key)
+                self.caught(mutant, 'G14-host-semaphore',
+                            'the isolated step env %s differs from Run tests' % key)
+
+    # G7: the per-binary logs are redacted by an always() step before they are uploaded (SD).
+    def test_a_missing_redact_step_is_caught(self):
+        self.caught(mutate_step(REDACT_STEP, chk.REDACT_RUN, 'true'), 'G7-log-upload',
+                    'no always() step runs %r before the %s upload' % (chk.REDACT_RUN, chk.LOG_PATH))
+
+    def test_a_redact_step_without_always_is_caught(self):
+        self.caught(mutate_step(REDACT_STEP, 'if: always() && ', 'if: '), 'G7-log-upload')
+
+    def test_a_redact_step_after_the_upload_is_caught(self):
+        start, end = step_span(CI_YML, REDACT_STEP)
+        block = CI_YML[start:end]
+        without = CI_YML[:start] + CI_YML[end:]
+        u_start, u_end = step_span(without, UPLOAD_STEP)
+        moved = without[:u_end] + block + without[u_end:]
+        self.caught(moved, 'G7-log-upload')
+
+    def test_the_real_workflow_has_every_step(self):
+        for name in (RUN_TESTS_STEP, ISO_STEP, CLEANUP_STEP, REDACT_STEP, UPLOAD_STEP):
+            self.assertIn('      - name: %s\n' % name, CI_YML)
+        for cid in ('G7-log-upload', 'G8-kill-switch', 'G10-deferral', 'G11-cleanup', 'G12-continue-on-error',
+                    'G13-fork-guard', 'G14-host-semaphore'):
+            self.assertEqual(failures_of(CI_YML, cid), [], cid)
+
+
 FLAG = 'AI_MEMORY_TEST_PG_ISOLATE'
 CI_REL = '.github/workflows/ci.yml'
 ENTRY_PATH = REPO / 'scripts' / 'ci' / 'pg_isolate_serial_step.py'
 ALLOWED_STEP = 'Serial shard isolated binaries (linux-fed enterprise-fed, issue 9592)'
+FORK_GUARD = ("(github.event_name != 'pull_request' || "
+              "github.event.pull_request.head.repo.full_name == github.repository)")
 ALLOWED_IF = ("${{ !cancelled() && steps.run-tests.outcome != 'skipped' && "
               "needs.classify.outputs.cargo_skip != 'true' && matrix.node == 'linux-fed' && "
-              "matrix.tier == 'enterprise-fed' }}")
-ALLOWED_RUN = 'python3 scripts/ci/pg_isolate_serial_step.py run'
+              "matrix.tier == 'enterprise-fed' && " + FORK_GUARD + " }}")
+# #9592 C-M2: the isolated step runs inside the #7914 host semaphore, like Run tests.
+ALLOWED_RUN = ('python3 -I scripts/ci/host_semaphore.py --name linux-fed-tests --slots "$HOST_SEMAPHORE_SLOTS" '
+               '--max-wait-secs "$HOST_SEMAPHORE_MAX_WAIT_SECS" --label "${CI_NODE}/${TIER}/iso" '
+               '-- python3 scripts/ci/pg_isolate_serial_step.py run')
 SITE = '          %s: "1"\n' % FLAG
 
 # A minimal workflow with exactly the one allowed site (#9592, vote 71472661 I-1 / I-3).
@@ -228,6 +383,30 @@ class OneSiteG1(unittest.TestCase):
         self.assertEqual(len(reasons), 1)
         self.assertTrue(reasons[0].startswith('unparseable workflow %s: ' % other), reasons)
 
+    # #9592 C-L5: an expression-valued env: mapping can carry the flag past every key check.
+    def test_an_expression_valued_env_fails(self):
+        for where, mutant in (
+                ('jobs/check/steps/0/env', WORKFLOW.replace(
+                    '        env:\n          AI_MEMORY_NO_CONFIG: "1"\n        run: echo serial\n',
+                    '        env: ${{ fromJSON(vars.X) }}\n        run: echo serial\n', 1)),
+                ('jobs/check/env', WORKFLOW.replace('    runs-on: ubuntu-latest\n',
+                                                    '    runs-on: ubuntu-latest\n    env: ${{ fromJSON(vars.X) }}\n', 1)),
+                ('env', WORKFLOW.replace('jobs:\n', 'env: ${{ fromJSON(vars.X) }}\njobs:\n', 1))):
+            with self.subTest(where=where):
+                self.assertNotEqual(mutant, WORKFLOW)
+                self.assertEqual(self.reasons(mutant),
+                                 ['an expression-valued env: in %s at %s' % (CI_REL, where)])
+
+    def test_an_expression_valued_env_in_another_workflow_fails(self):
+        other = '.github/workflows/other.yml'
+        text = 'on:\n  push:\njobs:\n  x:\n    runs-on: a\n    env: ${{ fromJSON(vars.X) }}\n'
+        self.assertEqual(self.reasons(WORKFLOW, {other: text}),
+                         ['an expression-valued env: in %s at jobs/x/env' % other])
+
+    def test_the_real_workflows_have_no_expression_valued_env(self):
+        files = {rel: (REPO / rel).read_text() for rel in chk.workflow_files(REPO)}
+        self.assertEqual([r for r in chk.g1_reasons(files) if 'expression-valued' in r], [])
+
     def test_static_failures_reads_the_other_workflows(self):
         # The repo argument is used: a site in another real workflow file is G1.
         self.assertTrue(any(rel.endswith('ci.yml') for rel in chk.workflow_files(REPO)))
@@ -272,6 +451,47 @@ class EntryChecks(unittest.TestCase):
     def test_a_url_on_a_direct_wrapper_call_in_ci_yml_is_caught(self):
         self.assertIn('G3-no-url-argv', failed_ids(
             CI_YML + '\n#\n        run: python3 scripts/test/pg_isolated_binary.py teardown --url x\n'))
+
+
+FLAG_NEAR_ENV_CASES = (
+    # (name, text, expected reasons for path scripts/x.py)
+    ('flag on the GITHUB_ENV line', 'open(os.environ["GITHUB_ENV"], "a").write("%s=1")\n' % FLAG,
+     ['%s within %d lines of GITHUB_ENV: scripts/x.py:1' % (FLAG, 3)]),
+    ('flag three lines above', 'X = "%s"\n\n\nwith open(os.environ["GITHUB_ENV"]) as f: f.write(X)\n' % FLAG,
+     ['%s within %d lines of GITHUB_ENV: scripts/x.py:1' % (FLAG, 3)]),
+    ('flag four lines above', 'X = "%s"\n\n\n\nos.environ["GITHUB_ENV"]\n' % FLAG, []),
+    ('a longer name is not the flag', 'X = "%s_OFF"\nos.environ["GITHUB_ENV"]\n' % FLAG, []),
+    ('no GITHUB_ENV', 'X = "%s"\n' % FLAG, []),
+)
+
+
+class ScriptsFlagScan(unittest.TestCase):
+    """#9592 C-L5: a script outside .github that writes the flag to GITHUB_ENV is a G1 site."""
+
+    def test_the_table(self):
+        self.assertEqual(chk.FLAG_ENV_WINDOW, 3)
+        for name, text, expected in FLAG_NEAR_ENV_CASES:
+            with self.subTest(case=name):
+                self.assertEqual(chk.script_flag_reasons({'scripts/x.py': text}), expected)
+
+    def test_tests_and_the_gate_are_excluded(self):
+        text = 'X = "%s"\nos.environ["GITHUB_ENV"]\n' % FLAG
+        self.assertEqual(chk.script_flag_reasons({'scripts/ci/tests/test_x.py': text,
+                                                  'scripts/ci/check_pg_isolate_invariants.py': text}), [])
+
+    def test_the_real_scripts_are_clean(self):
+        self.assertEqual(chk.script_flag_reasons(chk.script_files(REPO)), [])
+
+    def test_a_script_site_is_a_static_failure(self):
+        self.assertTrue(chk.script_files(REPO))
+        self.assertIn('scripts/ci/pg_isolate_serial_step.py', chk.script_files(REPO))
+
+    def test_a_large_script_scans_in_linear_time(self):
+        import time
+        text = ('y = 1\n' * 200000) + 'os.environ["GITHUB_ENV"]\n'
+        started = time.monotonic()
+        self.assertEqual(chk.script_flag_reasons({'scripts/big.py': text}), [])
+        self.assertLess(time.monotonic() - started, 5.0)
 
 
 class SourceChecks(unittest.TestCase):
