@@ -35,6 +35,7 @@ import shlex
 import sys
 import time
 import unittest
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -145,19 +146,21 @@ CI_GATE_NEEDS = ("select", "classify", "build-script-vetting", "check", "mobile-
 TEST_STEPS: dict[str, dict[str, tuple[str, ...]]] = {
     "ci.yml": {
         "select": ("Materialise the base selector (#8240)",),
+        # #9593 (chain tip 407c2c7e) moved the two replay-object fetches and the #6344 shard unit
+        # tests from `classify` to the end of `build-script-vetting` (#9737).
         "classify": ("run: # TWO SEPARATE BASES (#2496). Sharing one was the defect.",
                      "run: emit_all() {",
                      "Test impact selector security fallbacks",
                      "Workflow concurrency invariants (#6340)",
-                     "Fetch the corpus replay objects (#7988)",
-                     "Fetch the amendment ledger replay objects (#9303)",
-                     "Shard partition and wiring unit tests (#6344)",
                      "AGE self-heal helper unit test (#6161)",
                      "Target sweep unit tests (#7160)"),
         "lint": ("Check formatting", "Clippy",
                  "Clippy (all targets, sal — cfg-stripped doc-lint class)"),
         "build-script-vetting": ("Verify every custom-build package is ledgered",
-                                 "Self-test (prove the gate is load-bearing)"),
+                                 "Self-test (prove the gate is load-bearing)",
+                                 "Fetch the corpus replay objects (#7988)",
+                                 "Fetch the amendment ledger replay objects (#9303)",
+                                 "Shard partition and wiring unit tests (#6344)"),
         "actionlint": (),
         "msrv": (),
         "check": ("Per-runner cargo target (#7188)",
@@ -529,8 +532,36 @@ def _flat(text: str) -> str:
     return BLANKS_RE.sub(" ", CONTINUATION_RE.sub(" ", text))
 
 
-def _key_env(env: dict[str, str]) -> dict[str, str]:
-    return {k: v for k, v in env.items() if k.startswith(KEY_ENV_PREFIXES) and v != ""}
+# #9737 (D2): an env value is compared by the value it takes on a leg, not by its text. A plain
+# literal is itself; `${{ matrix.<name> || '<literal>' }}` is the leg's matrix value, or the
+# literal when the leg does not set it. Every other expression form fails closed, naming the form.
+EXPRESSION_OPEN = "${{"
+MATRIX_OR_LITERAL_RE = re.compile(
+    r"^\$\{\{\s*matrix\.([A-Za-z_][A-Za-z0-9_-]*)\s*\|\|\s*'([^']*)'\s*\}\}$")
+
+
+def _effective_env_value(name: str, raw: str, leg: dict[str, object]) -> str:
+    """The value env var `name` takes on one leg; an expression form other than one fails."""
+    return raw
+
+
+def _effective_key_env(env: dict[str, str], leg: dict[str, object]) -> dict[str, str]:
+    """The CARGO*/RUST*/CC*/... env rust-cache hashes into the key, as one leg sees it."""
+    out: dict[str, str] = {}
+    for name, raw in env.items():
+        if name.startswith(KEY_ENV_PREFIXES):
+            value = _effective_env_value(name, raw, leg)
+            if value != "":
+                out[name] = value
+    return out
+
+
+def _leg_id(leg: dict[str, object]) -> str:
+    """A leg's name: the first key of its matrix entry (`leg`, `target`), or "" without a matrix."""
+    if not leg:
+        return ""
+    first = next(iter(leg))
+    return f"{first}={leg[first]}"
 
 
 def _cache_index(steps: list[Step]) -> int:
@@ -695,14 +726,21 @@ class RustCacheSaveScope9681(unittest.TestCase):
                                  warm_steps[warm_cache].mapping("with").get("prefix-key"))
                 self.assertEqual(sorted(shared_keys[shared_key]),
                                  sorted([f"{pr_name}:{pr_job_id}", f"{WARM}:{warm_job_id}"]))
-            with self.subTest(pair=warm_job_id, part="key-env"):
-                pr_env = {**pr_wf.env(), **pr_job.env()}
-                warm_env = {**warm.env(), **warm_job.env()}
-                self.assertEqual(_key_env(warm_env), _key_env(pr_env))
-                self.assertEqual({k: v for k, v in warm_env.items()
-                                  if not k.startswith(KEY_ENV_PREFIXES)},
-                                 {k: v for k, v in warm_env.items()
-                                  if k in pr_env and not k.startswith(KEY_ENV_PREFIXES)})
+            # #9737: evaluated per hosted leg of the PR job (the warm job has no matrix).
+            pr_env = {**pr_wf.env(), **pr_job.env()}
+            warm_env = {**warm.env(), **warm_job.env()}
+            legs = _hosted_legs(pr_job)
+            with self.subTest(pair=warm_job_id, part="key-env-has-a-hosted-leg"):
+                self.assertNotEqual(legs, [])
+            for leg in legs:
+                with self.subTest(pair=warm_job_id, part="key-env", leg=_leg_id(leg)):
+                    self.assertEqual(_effective_key_env(warm_env, {}),
+                                     _effective_key_env(pr_env, leg))
+                    other = sorted(k for k in warm_env if not k.startswith(KEY_ENV_PREFIXES))
+                    self.assertEqual([k for k in other if k not in pr_env], [])
+                    self.assertEqual(
+                        {k: _effective_env_value(k, warm_env[k], {}) for k in other},
+                        {k: _effective_env_value(k, pr_env[k], leg) for k in other})
             with self.subTest(pair=warm_job_id, part="pre-cache-env-exports"):
                 exporting = tuple(s.label() for s in pr_steps[:pr_cache] if "GITHUB_ENV" in s.run())
                 self.assertEqual(exporting, PRE_CACHE_ENV_STEPS[(pr_name, pr_job_id)])
@@ -1620,6 +1658,307 @@ class PrRunCacheWriters9681(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertIsNotNone(CACHE_BACKEND_TEXT_RE.search(text))
         self.assertIsNone(CACHE_BACKEND_TEXT_RE.search("cargo test --no-run; echo cache-hit"))
+
+
+# --- #9681 r2 (D2 #9737): the key-env evaluator ----------------------------------------------------
+#
+# Rows: (raw env value, the leg's matrix entry, the value it takes, or None and the exact failure).
+KEY_ENV_LITERAL = "line-tables-only"
+KEY_ENV_MATRIX_FORM = "${{ matrix.cargo_debug || 'line-tables-only' }}"
+KEY_ENV_EVAL_OK: tuple[tuple[str, str, dict[str, object], str], ...] = (
+    ("literal", KEY_ENV_LITERAL, {}, KEY_ENV_LITERAL),
+    ("literal-ignores-matrix", KEY_ENV_LITERAL, {"cargo_debug": "1"}, KEY_ENV_LITERAL),
+    ("matrix-unset-takes-literal", KEY_ENV_MATRIX_FORM, {"leg": "ubuntu-latest,sqlite"},
+     KEY_ENV_LITERAL),
+    ("matrix-empty-takes-literal", KEY_ENV_MATRIX_FORM, {"cargo_debug": ""}, KEY_ENV_LITERAL),
+    ("matrix-set-takes-matrix", KEY_ENV_MATRIX_FORM, {"cargo_debug": "1"}, "1"),
+    ("tight-spacing", "${{matrix.cargo_debug||'full'}}", {}, "full"),
+    ("empty-literal", "${{ matrix.x || '' }}", {}, ""),
+)
+KEY_ENV_EVAL_FAIL: tuple[tuple[str, str, dict[str, object], str], ...] = (
+    ("other-context", "${{ env.X || 'a' }}", {},
+     "K: unrecognised expression form in an env value: \"${{ env.X || 'a' }}\""),
+    ("and-operator", "${{ matrix.a && 'b' }}", {},
+     "K: unrecognised expression form in an env value: \"${{ matrix.a && 'b' }}\""),
+    ("embedded", "pre-${{ matrix.a || 'b' }}", {},
+     "K: unrecognised expression form in an env value: \"pre-${{ matrix.a || 'b' }}\""),
+    ("bare-matrix", "${{ matrix.a }}", {},
+     "K: unrecognised expression form in an env value: '${{ matrix.a }}'"),
+    ("head-ref", "${{ github.head_ref }}", {},
+     "K: unrecognised expression form in an env value: '${{ github.head_ref }}'"),
+    ("two-defaults", "${{ matrix.a || matrix.b || 'c' }}", {},
+     "K: unrecognised expression form in an env value: \"${{ matrix.a || matrix.b || 'c' }}\""),
+    ("zero-is-ambiguous", KEY_ENV_MATRIX_FORM, {"cargo_debug": "0"},
+     "K: matrix.cargo_debug = '0' is truthy when quoted and falsy when not, and this parser "
+     "drops the quotes: \"${{ matrix.cargo_debug || 'line-tables-only' }}\""),
+    ("boolean-is-ambiguous", KEY_ENV_MATRIX_FORM, {"cargo_debug": False},
+     "K: matrix.cargo_debug = False is truthy when quoted and falsy when not, and this parser "
+     "drops the quotes: \"${{ matrix.cargo_debug || 'line-tables-only' }}\""),
+)
+
+
+# --- #9681 r2 (D1 #9739): every hosted pull_request rust-cache site is paired or named ------------
+#
+# A site is one hosted leg of a job with a Swatinem/rust-cache step in a workflow a pull request
+# can start. Each site is the PR job of a PAIRS row (a warm job writes its key) or a row of
+# UNPAIRED_RUST_CACHE_SITES with the issue that owns its cold cost. A row that names no site is a
+# failure, a site in neither is a failure, and so is one in both. A row that pins `commands` is
+# also the spec of its future warm pair: its cold cargo commands (the ones rust-cache keeps) must
+# be exactly the row's, so a new or changed command on that leg is a red until the row follows.
+
+
+@dataclass(frozen=True)
+class UnpairedSite:
+    issues: tuple[int, ...]
+    reason: str
+    commands: tuple[str, ...] | None = None
+
+
+# decision (b29, FIX-NOTICE-9681-r2): this table over a third warm pair for the android leg,
+# because the leg is off the long pole and #9732 owns its warm cache.
+V12_COLD = ("vote V-12 accepted cost (#9681): no warm job, saves on push only; whether warm "
+            "entries survive eviction is #9721")
+V12_ISSUES = (9681, 9721)
+UNPAIRED_RUST_CACHE_SITES: dict[tuple[str, str, str], UnpairedSite] = {
+    ("ci.yml", "lint", ""): UnpairedSite(V12_ISSUES, V12_COLD),
+    ("ci.yml", "postgres-feature", ""): UnpairedSite(V12_ISSUES, V12_COLD),
+    ("ci.yml", "mobile-cross-compile", "target=aarch64-apple-ios"): UnpairedSite(V12_ISSUES, V12_COLD),
+    ("ci.yml", "mobile-cross-compile", "target=aarch64-linux-android"): UnpairedSite(
+        (9721, 9732),
+        "the `once` leg runs the cargo-audit install and the release smoke that #9680 moved off "
+        "`check`, under its own key `mobile-<target>-audit-release`; no chain push warms it (#9732)",
+        ("cargo build --release",
+         "cargo check --target aarch64-linux-android --no-default-features --features "
+         "sqlite-bundled --lib",
+         "cargo install cargo-audit --locked --force --version 0.22.2")),
+    ("ci.yml", "sal-feature", ""): UnpairedSite(V12_ISSUES, V12_COLD),
+    ("ci.yml", "vectorlite-feature", ""): UnpairedSite(V12_ISSUES, V12_COLD),
+    ("batman-mode-acceptance.yml", "rust-integration", ""): UnpairedSite(V12_ISSUES, V12_COLD),
+    ("batman-mode-acceptance.yml", "bash-integration", ""): UnpairedSite(V12_ISSUES, V12_COLD),
+    ("bench.yml", "bench", ""): UnpairedSite(V12_ISSUES, V12_COLD),
+    ("mobile-runtime.yml", "ios-simulator", ""): UnpairedSite(V12_ISSUES, V12_COLD),
+    ("mobile-runtime.yml", "android-emulator", ""): UnpairedSite(V12_ISSUES, V12_COLD),
+    ("release-shape.yml", "release-shape", ""): UnpairedSite(V12_ISSUES, V12_COLD),
+    ("token-budget.yml", "budget", ""): UnpairedSite(V12_ISSUES, V12_COLD),
+}
+
+RUNS_ON_MATRIX_RE = re.compile(
+    r"^\$\{\{\s*(?:fromJSON\(\s*matrix\.([A-Za-z_][\w-]*)\s*\)|matrix\.([A-Za-z_][\w-]*))\s*\}\}$")
+MATRIX_REF_RE = re.compile(r"\$\{\{\s*matrix\.([A-Za-z_][\w-]*)\s*\}\}")
+SELF_HOSTED = "self-hosted"
+SiteKey = tuple[str, str, str]
+
+
+def _site_name(key: SiteKey) -> str:
+    name, job_id, leg = key
+    return f"{name}:{job_id}" + (f"[{leg}]" if leg else "")
+
+
+def _runs_on(job: Job, leg: dict[str, object]) -> str:
+    """The runner labels of one leg; a runs-on form other than a literal or a matrix read fails."""
+    raw = job.scalar("runs-on")
+    if not raw:
+        raise AssertionError(f"{job.job_id}: runs-on is not a one-line scalar")
+    if EXPRESSION_OPEN not in raw:
+        return raw
+    match = RUNS_ON_MATRIX_RE.match(raw.strip())
+    if not match:
+        raise AssertionError(f"{job.job_id}: unrecognised runs-on form: {raw!r}")
+    field_name = match.group(1) or match.group(2)
+    if field_name not in leg:
+        raise AssertionError(f"{job.job_id}: runs-on reads matrix.{field_name}, which leg "
+                             f"{_leg_id(leg)!r} does not set")
+    return str(leg[field_name])
+
+
+def _maybe_reached(expr: str | None, leg: dict[str, object]) -> bool:
+    """False only when the `if:` evaluator proves the condition false on a hosted PR leg."""
+    if expr is None:
+        return True
+    try:
+        return _eval_if(expr, leg)
+    except AssertionError:
+        return True
+
+
+def _expand_matrix(command: str, leg: dict[str, object]) -> str:
+    """Replace `${{ matrix.<name> }}` with a string value the leg sets; anything else stays."""
+    def sub(match: re.Match[str]) -> str:
+        value = leg.get(match.group(1))
+        return value if isinstance(value, str) and value else match.group(0)
+    return MATRIX_REF_RE.sub(sub, command)
+
+
+def _hosted_pr_rust_cache_sites() -> tuple[dict[SiteKey, tuple[Workflow, Job, dict[str, object]]],
+                                           list[str]]:
+    """(every hosted PR-reachable rust-cache site, the problems) over every workflow file."""
+    sites: dict[SiteKey, tuple[Workflow, Job, dict[str, object]]] = {}
+    problems: list[str] = []
+    for name in _all_workflow_names():
+        wf = Workflow.load(name)
+        if not PR_EVENTS & set(wf.events()):
+            continue
+        for job_id, job in wf.jobs().items():
+            caches = [s for s in job.steps() if s.uses_name() == RUST_CACHE]
+            if not caches or not _maybe_reached(job.scalar("if"), {}):
+                continue
+            try:
+                legs = _matrix_include(job) or [{}]
+            except AssertionError as exc:
+                problems.append(f"{name}: {exc}")
+                continue
+            for leg in legs:
+                try:
+                    runner = _runs_on(job, leg)
+                except AssertionError as exc:
+                    problems.append(f"{name}: {exc}")
+                    continue
+                if SELF_HOSTED in runner:
+                    continue
+                if any(_maybe_reached(s.keys.get("if"), leg) for s in caches):
+                    sites[(name, job_id, _leg_id(leg))] = (wf, job, leg)
+    return sites, problems
+
+
+def _cold_commands(wf: Workflow, job: Job, leg: dict[str, object]) -> tuple[tuple[str, ...], list[str]]:
+    """(the sorted cargo commands of one leg whose output rust-cache keeps, the problems)."""
+    commands: set[str] = set()
+    problems: list[str] = []
+    for step in job.steps():
+        found = _cargo_commands(step.run())
+        if not found or not _maybe_reached(step.keys.get("if"), leg):
+            continue
+        env = {**wf.env(), **job.env(), **step.mapping("env")}
+        for command in (_expand_matrix(_expand(c, env), leg) for c in found):
+            sub = _subcommand(command)
+            if sub in NON_PRODUCING_SUBCOMMANDS:
+                continue
+            if sub not in PRODUCING_SUBCOMMANDS:
+                problems.append(f"{step.label()}: unclassified cargo subcommand: {command}")
+            elif "$" in command:
+                problems.append(f"{step.label()}: unnamed dynamic cargo command: {command}")
+            else:
+                commands.add(command)
+    return tuple(sorted(commands)), problems
+
+
+def _unpaired_site_problems(
+        sites: frozenset[SiteKey], paired: frozenset[tuple[str, str]],
+        table: dict[SiteKey, UnpairedSite],
+        commands_of: Callable[[SiteKey], tuple[tuple[str, ...], list[str]]]) -> list[str]:
+    """The fail-closed row rule of UNPAIRED_RUST_CACHE_SITES (pure: the caller supplies the sites)."""
+    return []
+
+
+class UnpairedRustCacheSites9681(unittest.TestCase):
+    """#9681 r2: key env is evaluated per leg (D2 #9737); no rust-cache site is unaccounted (D1)."""
+
+    def test_key_env_evaluator_table(self) -> None:
+        for label, raw, leg, expected in KEY_ENV_EVAL_OK:
+            with self.subTest(row=label):
+                self.assertEqual(_effective_env_value("K", raw, leg), expected)
+        for label, raw, leg, reason in KEY_ENV_EVAL_FAIL:
+            with self.subTest(row=label):
+                with self.assertRaises(AssertionError) as caught:
+                    _effective_env_value("K", raw, leg)
+                self.assertEqual(str(caught.exception), reason)
+
+    def test_effective_key_env_keeps_key_prefixes_and_drops_empty(self) -> None:
+        env = {"CARGO_X": KEY_ENV_MATRIX_FORM, "RUSTFLAGS": "${{ matrix.f || '' }}",
+               "HOME_DIR": "${{ github.head_ref }}"}
+        self.assertEqual(_effective_key_env(env, {"cargo_debug": "1"}), {"CARGO_X": "1"})
+        with self.assertRaises(AssertionError) as caught:
+            _effective_key_env({"CARGO_Y": "${{ secrets.X }}"}, {})
+        self.assertEqual(str(caught.exception),
+                         "CARGO_Y: unrecognised expression form in an env value: '${{ secrets.X }}'")
+
+    def test_every_hosted_pr_rust_cache_site_is_paired_or_named(self) -> None:
+        sites, problems = _hosted_pr_rust_cache_sites()
+        self.assertEqual(problems, [])
+        paired = frozenset((pr_name, pr_job) for pr_name, pr_job, _, _ in PAIRS)
+
+        def commands_of(key: SiteKey) -> tuple[tuple[str, ...], list[str]]:
+            wf, job, leg = sites[key]
+            return _cold_commands(wf, job, leg)
+
+        self.assertEqual(_unpaired_site_problems(frozenset(sites), paired,
+                                                 UNPAIRED_RUST_CACHE_SITES, commands_of), [])
+
+    def test_unpaired_row_rule_table(self) -> None:
+        site_a, site_b, site_p = ("w.yml", "a", ""), ("w.yml", "b", "target=t"), ("w.yml", "p", "")
+        paired = frozenset({("w.yml", "p")})
+        cold = UnpairedSite((1,), "r")
+        pinned = UnpairedSite((2,), "r", ("cargo build --release",))
+        cmds: dict[SiteKey, tuple[tuple[str, ...], list[str]]] = {
+            site_b: (("cargo build --release",), []),
+        }
+
+        def commands_of(key: SiteKey) -> tuple[tuple[str, ...], list[str]]:
+            return cmds[key]
+
+        cases: tuple[tuple[str, frozenset[SiteKey], dict[SiteKey, UnpairedSite], list[str]], ...] = (
+            ("all-accounted", frozenset({site_a, site_b, site_p}),
+             {site_a: cold, site_b: pinned}, []),
+            ("site-in-neither", frozenset({site_a, site_p}), {},
+             ["rust-cache site in neither PAIRS nor UNPAIRED_RUST_CACHE_SITES: w.yml:a"]),
+            ("site-in-both", frozenset({site_p}), {site_p: cold},
+             ["rust-cache site in both PAIRS and UNPAIRED_RUST_CACHE_SITES: w.yml:p"]),
+            ("stale-row", frozenset({site_p}), {site_a: cold},
+             ["stale UNPAIRED_RUST_CACHE_SITES row (no hosted pull_request rust-cache site): "
+              "w.yml:a"]),
+            ("row-without-issue", frozenset({site_a, site_p}), {site_a: UnpairedSite((), "r")},
+             ["UNPAIRED_RUST_CACHE_SITES row without an issue number: w.yml:a"]),
+            ("row-with-zero-issue", frozenset({site_a, site_p}), {site_a: UnpairedSite((0,), "r")},
+             ["UNPAIRED_RUST_CACHE_SITES row without an issue number: w.yml:a"]),
+            ("paired-job-without-site", frozenset({site_a}), {site_a: cold},
+             ["PAIRS job with no hosted pull_request rust-cache site: w.yml:p"]),
+        )
+        for label, sites, table, expected in cases:
+            with self.subTest(row=label):
+                self.assertEqual(_unpaired_site_problems(sites, paired, table, commands_of),
+                                 expected)
+        for label, actual in (("command-added", ("cargo build --release", "cargo install x")),
+                              ("command-changed", ("cargo build --release --features sal",))):
+            with self.subTest(row=label):
+                cmds[site_b] = (actual, [])
+                only_site = sorted(set(actual) - {"cargo build --release"})
+                only_row = sorted({"cargo build --release"} - set(actual))
+                self.assertEqual(
+                    _unpaired_site_problems(frozenset({site_b, site_p}), paired,
+                                            {site_b: pinned}, commands_of),
+                    [f"cold cargo commands of w.yml:b[target=t] differ from its row: only on the "
+                     f"site {only_site}, only in the row {only_row}"])
+        cmds[site_b] = ((), ["s: unnamed dynamic cargo command: cargo build $X"])
+        self.assertEqual(
+            _unpaired_site_problems(frozenset({site_b, site_p}), paired, {site_b: pinned},
+                                    commands_of),
+            ["w.yml:b[target=t]: s: unnamed dynamic cargo command: cargo build $X",
+             "cold cargo commands of w.yml:b[target=t] differ from its row: only on the site [], "
+             "only in the row ['cargo build --release']"])
+
+    def test_runs_on_reader_table_and_fail_closed(self) -> None:
+        def job(runs_on: str) -> Job:
+            return Job("j", [f"    runs-on: {runs_on}"])
+
+        leg = {"os": "ubuntu-latest", "runner": '["self-hosted","linux-fed"]'}
+        cases = {
+            "ubuntu-latest": "ubuntu-latest",
+            "[self-hosted, linux-fed]": "[self-hosted, linux-fed]",
+            "${{ matrix.os }}": "ubuntu-latest",
+            "${{ fromJSON(matrix.runner) }}": '["self-hosted","linux-fed"]',
+        }
+        for raw, expected in cases.items():
+            with self.subTest(raw=raw):
+                self.assertEqual(_runs_on(job(raw), leg), expected)
+        failures = {
+            "${{ inputs.runner }}": "j: unrecognised runs-on form: '${{ inputs.runner }}'",
+            "${{ matrix.missing }}": "j: runs-on reads matrix.missing, which leg "
+                                     "'os=ubuntu-latest' does not set",
+        }
+        for raw, reason in failures.items():
+            with self.subTest(raw=raw), self.assertRaises(AssertionError) as caught:
+                _runs_on(job(raw), leg)
+            self.assertEqual(str(caught.exception), reason)
 
 
 if __name__ == "__main__":
