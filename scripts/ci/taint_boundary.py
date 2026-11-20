@@ -26,11 +26,15 @@ exactly when its place is a gate step (``gate_step_of``: a gate job in ``GATE_JO
 in ``GATE_STEPS``), whatever its issue: a change there needs the conductor's word.
 Removal rule: the fix PR of an issue deletes its rows and lowers that kind's pin in the same
 commit; each pin only goes down, a pin above its ceiling in ``PIN_CEILINGS`` is a failure and
-a pin that differs from its row count is a failure. Pins at PR 9508: unclassifiable 47,
-not-analysed 3, violation 17 (the 13 rows before PR 9508 and 4 rows of #9553). The pins are the
-baseline of the tree PR 9508 lands on (the merge of chain tip 902faa04 moved the unclassifiable
-pin 41 -> 47 once); after it lands they only go down. Stage 1 of #9455 moved
-session-boot-lifetime.yml lifetime-tests to hosted runners and lowered the violation pin 17 -> 16. The fixpoint proof
+a pin that differs from its row count is a failure. Pins at PR 9508: unclassifiable 33,
+not-analysed 3, violation 33 (the 13 rows before PR 9508, 4 rows of #9553 and 16 rows of #9570).
+The pins are the baseline of the tree PR 9508 lands on (the merge of chain tip 902faa04 moved the
+unclassifiable pin 41 -> 47 once; the pre-scan of #9566 moved it 47 -> 33 and the violation pin
+17 -> 33 once); after it lands they only go down. Stage 1 of #9455 moved
+session-boot-lifetime.yml lifetime-tests to hosted runners and lowered the violation pin by one
+(17 -> 16 on the chain, 33 -> 32 after the pre-scan of #9566). 9566 item 3, the full analysis of
+every job, moved the violation pin 32 -> 34 once for the two docker rows of #9570 (pins now:
+unclassifiable 33, not-analysed 3, violation 34). The fixpoint proof
 (all rows applied: zero findings; any one row removed: exactly that form or line) is a proof for
 what the scan reaches only. A test makes no network call: the
 conductor checks that every cited issue is open at each landing of a fix of these issues, and
@@ -188,6 +192,7 @@ class AllowRow:
 # The six hits of the survey at a028c45e and the six host-credential reads (ruling abf38892
 # section 7); the R2 row of lifetime-tests left with stage 1 of #9455. Removing a row is the fix lane's job; adding a
 # row needs an issue number from the deputy (the pin moves with it).
+_RELEASE = "release.yml"
 TAINT_ALLOW: tuple[AllowRow, ...] = (
     # In gate job classify of ci.yml: a gate step (the mark follows the place).
     AllowRow("ci.yml", "classify", "id:impact", (CLASS_GATE_OUTPUT,), 9454, True),
@@ -217,11 +222,37 @@ TAINT_ALLOW: tuple[AllowRow, ...] = (
     AllowRow("ci.yml", "select", "Select jobs", (CLASS_GATE_OUTPUT,), 9553, True),
     AllowRow("ci.yml", "select", "Select the full matrix (base selector unavailable)", (CLASS_GATE_OUTPUT,), 9553, True),
     AllowRow("coverage.yml", "classify", "id:cls", (CLASS_GATE_OUTPUT,), 9553, True),
+    # #9570: the release jobs of release.yml, reached once the pre-scan of #9566 reads every run
+    # step of a job in full (no row covers these places before it); no gate step.
+    AllowRow(_RELEASE, 'copr', 'Build source RPM', (CLASS_SECRET,), 9570),
+    AllowRow(_RELEASE, 'copr', 'Configure copr-cli', (CLASS_SECRET,), 9570),
+    AllowRow(_RELEASE, 'crates-io', 'Publish to crates.io (with retry)', (CLASS_SECRET,), 9570),
+    AllowRow(_RELEASE, 'homebrew', 'Checkout Homebrew tap', (CLASS_SECRET,), 9570),
+    AllowRow(_RELEASE, 'homebrew', 'Download release assets, verify, and pin SHA256', (CLASS_SECRET,), 9570),
+    AllowRow(_RELEASE, 'mobile-android', 'Attest build provenance (Android JNI bundle)',
+             (CLASS_SECRET, CLASS_WRITE_TOKEN), 9570),
+    AllowRow(_RELEASE, 'mobile-android', 'Upload to GitHub Release', (CLASS_SECRET,), 9570),
+    AllowRow(_RELEASE, 'mobile-ios', 'Attest build provenance (iOS xcframework)',
+             (CLASS_SECRET, CLASS_WRITE_TOKEN), 9570),
+    AllowRow(_RELEASE, 'mobile-ios', 'Upload to GitHub Release', (CLASS_SECRET,), 9570),
+    AllowRow(_RELEASE, 'preflight', 'Refuse when no tag ruleset protects v* tags', (CLASS_SECRET,), 9570),
+    AllowRow(_RELEASE, 'preflight', 'Verify the tag (annotated, SSH-signed by an enrolled release key)',
+             (CLASS_GATE_OUTPUT,), 9570),
+    AllowRow(_RELEASE, 'qualify', 'Qualify the tagged SHA', (CLASS_SECRET,), 9570),
+    AllowRow(_RELEASE, 'release', 'Attest build provenance (release binaries + packages)',
+             (CLASS_SECRET, CLASS_WRITE_TOKEN), 9570),
+    AllowRow(_RELEASE, 'release', 'Create GitHub Release', (CLASS_SECRET,), 9570),
+    AllowRow(_RELEASE, 'sbom', 'Attest build provenance (CycloneDX SBOM)', (CLASS_SECRET, CLASS_WRITE_TOKEN), 9570),
+    AllowRow(_RELEASE, 'sbom', 'Upload to GitHub Release', (CLASS_SECRET,), 9570),
+    # 9566 item 3: the docker job, reached once the full analysis reads every job (the pre-scan
+    # skipped its uses: steps); it checks out the preflight sha like the jobs above.
+    AllowRow(_RELEASE, 'docker', 'Attest build provenance (Docker image)', (CLASS_SECRET, CLASS_WRITE_TOKEN), 9570),
+    AllowRow(_RELEASE, 'docker', 'Log in to GitHub Container Registry', (CLASS_SECRET,), 9570),
 )
-TAINT_ALLOW_PIN = 16
+TAINT_ALLOW_PIN = 34
 # The open fix issues a violation row may name (the fixed set of that kind); a row naming any
 # other value is a finding.
-FIX_ISSUES = frozenset({9454, 9455, 9456, 9471, 9553})
+FIX_ISSUES = frozenset({9454, 9455, 9456, 9471, 9553, 9570})
 
 # The four form classes a row may name; a form of no class is named by NO-CLASS and its reason.
 FORM_COMMAND_NOT_LITERAL = "command-word-not-literal"
@@ -240,15 +271,26 @@ FORM_TEMPLATES = {
 QUOTED_RE = re.compile(r"'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\"|`[^`]*`")
 NO_OPERAND = "-"
 # The fixed issue sets per kind (ruling f367b2f1 and FINAL 0773f6ce).
-# 9559 (the array append SUITE_SECONDS+=), 9560 (command word 'line' of a local declaration) and
 # 9561 (python module workflow_annotation) came with the baseline of the landing tree (merge of
-# chain tip 902faa04).
-OPEN_ROW_LANDING_TREE_ISSUES = frozenset({9559, 9560, 9561})
-OPEN_ROW_ISSUES = frozenset(range(9533, 9540)) | frozenset(range(9544, 9550)) | OPEN_ROW_LANDING_TREE_ISSUES
+# chain tip 902faa04). The pre-scan of #9566 leaves no row of 9534, 9547, 9559 or 9560.
+OPEN_ROW_LANDING_TREE_ISSUES = frozenset({9561})
+OPEN_ROW_ISSUES = (frozenset({9533}) | frozenset(range(9535, 9540)) | frozenset({9544, 9545, 9546, 9548, 9549})
+                   | OPEN_ROW_LANDING_TREE_ISSUES)
 NOT_ANALYSED_ROW_ISSUES = frozenset({9550, 9551, 9552})
 NOT_ANALYSED_MARKER = "rest-not-analysed"
 # Each pin only goes down; a pin above its ceiling is a failure.
-PIN_CEILINGS = {KIND_UNCLASSIFIABLE: 47, KIND_VIOLATION: 16, KIND_NOT_ANALYSED: 3}
+# Current values: unclassifiable 33 (33 rows), violation 34 (34 allow rows), not-analysed 3 (3 rows).
+# Violation history: 17 -> 33 -> 32 (after the merge of fd43a727) -> 34 (9566 item 3).
+# decision: raise the violation ceiling once, 17 -> 33 (58dd50570), over keeping 17, because the
+# pre-scan of #9566 sends release.yml jobs to the full analysis, which reports 16 rows of classes i
+# and ii that #9570 fixes; each row names 9570 and leaves with it.
+# decision: violation pin and ceiling 32 over 33 at the merge of chain tip fd43a727, because stage 1
+# of #9455 removed the lifetime-tests row and the pin equals the allow-table row count and only
+# ever follows it down; the unclassifiable pin stays 33.
+# decision: violation pin and ceiling 32 -> 34 once over leaving the docker results unrowed, because
+# the full analysis of every job (9566 item 3) reaches release.yml/docker, whose two results are
+# the #9570 class, and the pin is the allow-table row count after that merge (34).
+PIN_CEILINGS = {KIND_UNCLASSIFIABLE: 33, KIND_VIOLATION: 34, KIND_NOT_ANALYSED: 3}
 # Characters no workflow, job, step or operand of a row may hold: a row names one place.
 ROW_GLOB_CHARS = frozenset("*?[]{}")
 # A braced parameter reference of one plain name, the only brace an operand may hold: the shell
@@ -262,8 +304,10 @@ OPERAND_PARAM_REF_OPEN = "${"
 OPERAND_PARAM_REF_CLOSE = "}"
 OPERAND_PARAM_REF_PLAIN = "$"
 # Expansion forms no operand may hold at all: a command substitution (and with it an arithmetic
-# expansion) and the backtick form. Their text is not a name the scanner read.
-OPERAND_REFUSED_EXPANSIONS = ("$(", "`")
+# expansion), the backtick form, both process substitutions, the extended glob openers the glob
+# characters do not already refuse, and the tilde (a home directory read from the user database).
+# Each runs a command or reads a file; its text is not a name the scanner read.
+OPERAND_REFUSED_EXPANSIONS = ("$(", "`", "<(", ">(", "+(", "@(", "!(", "~")
 # The gate-step places (conductor's word, b29): a change there needs the conductor's word. The
 # mark of a row follows its place, never its issue: the gate jobs of each workflow file, and the
 # one gate step of job check.
@@ -349,28 +393,14 @@ _PY, _IP = FORM_PY_MODULE, FORM_INTERP_PATH
 # NOT shown to hold the boundary. A fix PR of an issue deletes its rows and lowers
 # OPEN_ROW_PIN in the same commit.
 OPEN_ROWS: tuple[OpenRow, ...] = (
-    _o(_BATMAN, "bash-integration", "Install sqlite3 + jq (bounded+retry", _NC, "apt-get", 9534),
     _o(_BATMAN, "rust-integration", "Assert binary refuses /tmp write under R001 end-to-end", _NL, "$BIN", 9533),
     _o(_CERT, _CERT[:-4], "Assert certified stack versions (cert evidence, hard-fail on drift)", _NL, "$PSQL", 9535),
     _o(_CERT, _CERT[:-4], "Ensure AGE + vector extensions present (best-effort — tier is pre-provisioned)", _NL,
        "$PSQL", 9535),
-    _o(_CERT, _CERT[:-4], "Run", _NC, "--test", 9547),
-    _o(_CI, "check", _CHECK_FREE, _NC, "apt-get", 9534),
     _o(_CI, "check", _CHECK_FREE, _NC, "fallocate", 9544),
     _o(_CI, "check", _CHECK_FREE, _NC, "mkswap", 9544),
     _o(_CI, "check", _CHECK_FREE, _NC, "swapon", 9544),
     _o(_CI, "check", _CHECK_RUN, _NL, "$TIMEOUT_BIN", 9548),
-    _o(_CI, "check", _CHECK_RUN, _NL, "$l", 9548),
-    _o(_CI, "check", _CHECK_RUN, _NL, "$tflag", 9548),
-    # The operand is the inside of the repr the scanner prints (its one backslash shows as two),
-    # so the reason is spelled out rather than built by repr a second time.
-    OpenRow(_CI, "check", _CHECK_RUN, _NL, _ELAPSED, f"command word '{_ELAPSED}' is not a literal word", 9559,
-            gate_step_of(_CI, "check", _CHECK_RUN)),
-    _o(_CI, "check", _CHECK_RUN, _NL, "$line", 9547),
-    _o(_CI, "check", _CHECK_RUN, _NC, "--lib", 9547),
-    _o(_CI, "check", _CHECK_RUN, _NC, "--skip", 9547),
-    _o(_CI, "check", _CHECK_RUN, _NC, "--test", 9547),
-    _o(_CI, "check", _CHECK_RUN, _NC, "line", 9560),
     _o(_CI, "check", _CHECK_RUN, _PY, "os", 9536),
     _o(_CI, "check", _CHECK_RUN, _PY, "stat", 9536),
     _o(_CI, "check", _CHECK_RUN, _PY, "workflow_annotation", 9561),
@@ -388,12 +418,9 @@ OPEN_ROWS: tuple[OpenRow, ...] = (
     _o(_CI, "select", "Select jobs", _IP, "$RUNNER_TEMP/impact-base/impact/select.py", 9537),
     _o(_CI, "select", "Select the full matrix (base selector unavailable)", _PY, "os", 9536),
     _o(_COV, "classify", "id:cls", _IP, "$trust_impact/cargo_skip.py", 9537),
-    _o(_COV, _PMT, _COV_SWAP, _NC, "apt-get", 9534),
     _o(_COV, _PMT, _COV_SWAP, _NC, "fallocate", 9544),
     _o(_COV, _PMT, _COV_SWAP, _NC, "mkswap", 9544),
     _o(_COV, _PMT, _COV_SWAP, _NC, "swapon", 9544),
-    _o(_COV, _PMT, _COV_JQ, _NC, "apt-get", 9534),
-    _o(_COV, _PMT, _COV_MOLD, _NC, "apt-get", 9534),
     _o(_COV, _PMT, _COV_MOLD, _NC, "mold", 9545),
     _o(_MOBILE, _ANDROID, "Boot Android emulator + run tests", _NC, "adb", 9546),
     _o(_MOBILE, _ANDROID, "Enable KVM", _NC, "udevadm", 9539),
@@ -401,7 +428,7 @@ OPEN_ROWS: tuple[OpenRow, ...] = (
     _o(_MOBILE, _IOS, "Run mobile_runtime tests on iOS Simulator", _NC, "xcrun", 9538),
     _o(_MOBILE, _IOS, "Shut down simulator", _NC, "xcrun", 9538),
 )
-OPEN_ROW_PIN = 47
+OPEN_ROW_PIN = 33
 # Kind not-analysed: one row per form that stops the rest of its command or substitution. The
 # list of forms behind these rows is NOT complete: the checker does not read that text.
 NOT_ANALYSED_ROWS: tuple[NotAnalysedRow, ...] = (
@@ -935,6 +962,11 @@ SYSTEM_BIN_DIRS = ("/usr/bin/", "/bin/", "/usr/local/bin/", "/usr/sbin/", "/sbin
 STRICT_BASE = 2  # a base ref proven non-empty
 MAYBE_EMPTY_BASE = 1  # a base ref that may be empty (an empty ref names the index)
 NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+# 9566: `NAME=( ... )` / `NAME+=( ... )` is an array literal: its elements are data, never commands.
+# The commands whose operands take the array-literal form (`declare -A NAME=( ... )`).
+ARRAY_DECLARERS = frozenset({"declare", "local", "typeset", "readonly", "export"})
+ARRAY_UNTERMINATED = "unterminated array literal"
+ARRAY_FOREIGN = "array literal holds {tok!r}"
 
 
 class _Word:
@@ -1549,6 +1581,9 @@ class _Sh:
             if tok[0] == "word":
                 word = tok[1]
                 self.next()
+                if self.peek() == ("op", "(") and _array_head(word) and \
+                        (not cmd.words or cmd.words[0].lit in ARRAY_DECLARERS):
+                    word = self.array_word(word)
                 if not cmd.words:
                     assign = word.assignment()
                     if assign is not None:
@@ -1568,6 +1603,40 @@ class _Sh:
         if not (cmd.words or cmd.assigns or cmd.redirs):
             raise Unclassifiable(f"unexpected {_tok_text(self.peek())!r} in shell text")
         return [("cmd", cmd)]
+
+    def array_word(self, head: _Word) -> _Word:
+        """The array literal after `head` (`NAME=` or `NAME+=`), read as one word of data.
+
+        The literal text of each element is data; every other part of an element (a variable, a
+        command substitution, an expression) is kept in the word, so the command substitutions of
+        the elements are still run and read. One pass over the tokens of the literal.
+        """
+        self.next()
+        word = _Word()
+        word.plain = False
+        word.parts = [("lit", head.lit or ""), ("dyn",)]
+        shown = [head.raw + "("]
+        while True:
+            tok = self.next()
+            if tok == ("op", ")"):
+                break
+            if tok[0] == "nl":
+                continue
+            if tok[0] == "eof":
+                raise Unclassifiable(ARRAY_UNTERMINATED)
+            if tok[0] != "word":
+                raise Unclassifiable(ARRAY_FOREIGN.format(tok=_tok_text(tok)))
+            word.parts.extend(part for part in tok[1].parts if part[0] != "lit")
+            shown.append(tok[1].raw)
+        word.raw = " ".join(shown) + ")"
+        return word
+
+
+def _array_head(word: _Word) -> bool:
+    """`NAME=` or `NAME+=` written as an unquoted literal: the head of an array literal."""
+    raw = word.raw
+    name = raw[:-2] if raw.endswith("+=") else raw[:-1] if raw.endswith("=") else ""
+    return word.plain and word.lit == raw and NAME_RE.fullmatch(name) is not None
 
 
 def _flush(word: _Word, buf: list[str]) -> None:
@@ -1841,6 +1910,9 @@ def _shell_runs_pr_code(text: str, ctx: _ShellCtx | None = None) -> bool:
     return _run_nodes(_Sh(text, ctx.depth).parse_all(), ctx)
 
 
+COMMAND_OFF_LIST = "command word {name!r} is not on the closed command list"
+
+
 def _dispatch(words: list[_Word], cmd: _Cmd, ctx: _ShellCtx) -> bool:
     head = words[0]
     name = head.lit
@@ -1852,21 +1924,23 @@ def _dispatch(words: list[_Word], cmd: _Cmd, ctx: _ShellCtx) -> bool:
         if not name.startswith("/"):
             return True  # a program from the workspace
         if not name.startswith(SYSTEM_BIN_DIRS):
-            return _form(f"command word {name!r} is not on the closed command list")
+            return _form(COMMAND_OFF_LIST.format(name=name))
         name = name.rsplit("/", 1)[1]
     handler = _command_handler(name)
     if handler is None:
         if not ctx.strict:
+            # 9566: a word off the closed list is unread; the pre-scan sends its job to the analysis.
+            ctx.unread.append(COMMAND_OFF_LIST.format(name=name))
             return False
-        return _form(f"command word {name!r} is not on the closed command list")
+        return _form(COMMAND_OFF_LIST.format(name=name))
     if name in PATH_WRITERS:
         for word in words[1:]:
             ctx.unbind(word)
     if ctx.strict:
         return _strict_call(handler, name, words, cmd, ctx)
     # A non-strict job records what a handler cannot read on ctx.unread and goes on; no form is
-    # recorded. The pre-scan does not read ctx.unread yet (needs the conductor's word: it would
-    # move release.yml jobs from trusted-only to violations).
+    # recorded here. The pre-scan reads ctx.unread (9566): a step with an unread command is never
+    # trusted-only, and the full analysis of its job reports the command as a result.
     token = _SINK.set(None)
     try:
         return handler(words, cmd, ctx)
@@ -2238,6 +2312,11 @@ GH_INERT = frozenset({
 })
 
 
+# 9566: `gh attestation verify` reads an attestation; every other attestation verb is not read.
+GH_ATTESTATION_VERB = "verify"
+SUBCOMMAND_OFF_LIST = "{tool} subcommand {sub!r} is not on the closed list"
+
+
 def _gh_cmd(words: list[_Word], cmd: _Cmd, ctx: _ShellCtx) -> bool:
     """gh: closed subcommands; `gh pr checkout` is a pull-request tree change; extensions run code."""
     if len(words) < 2:
@@ -2249,6 +2328,12 @@ def _gh_cmd(words: list[_Word], cmd: _Cmd, ctx: _ShellCtx) -> bool:
         return False
     if sub == "extension":
         return True
+    if sub == "attestation":
+        verb = words[2].lit if len(words) > 2 else None
+        if verb != GH_ATTESTATION_VERB:
+            shown = words[2].shown() if len(words) > 2 else ""
+            raise Unclassifiable(SUBCOMMAND_OFF_LIST.format(tool="gh attestation", sub=shown))
+        return False
     if sub not in GH_INERT:
         raise Unclassifiable(f"gh subcommand {sub!r} is not on the closed list")
     if sub == "pr" and len(words) > 2 and words[2].lit in ("checkout", "co"):
@@ -2850,6 +2935,61 @@ def _command_cmd(words: list[_Word], cmd: _Cmd, ctx: _ShellCtx) -> bool:
     return _dispatch(rest, cmd, ctx) if rest else False
 
 
+# 9566: the package and release tools of the workflows, each in its exact form only.
+# autoremove and clean act on the package database and archive cache only and read no tree file.
+APT_GET_VERBS = frozenset({"update", "install", "autoremove", "clean"})
+APT_GET_FLAGS = frozenset({"-y", "--yes", "--assume-yes", "-q", "-qq", "--quiet", "--no-install-recommends",
+                           "--no-install-suggests"})
+# Options closed to one subcommand: the other subcommands refuse them as off the closed option list.
+APT_GET_VERB_FLAGS = {"autoremove": frozenset({"--purge"})}
+APT_GET_OPTION_OFF_LIST = "apt-get option {opt!r} is not on the closed option list"
+APT_GET_OPERAND = "apt-get operand {opt!r} is not a package name"
+APT_GET_LOCAL_PACKAGE = (".deb",)
+RPM_FORM = ("--version",)
+RPM_OFF_LIST = "rpm form {form!r} is not on the closed list"
+COPR_CLI_VERB = "build"
+
+
+def _verb(tool: str, words: list[_Word], allowed: frozenset[str]) -> str:
+    """The literal subcommand of a tool, or Unclassifiable when it is not on the closed list."""
+    sub = words[1].lit if len(words) > 1 else None
+    if sub not in allowed:
+        shown = words[1].shown() if len(words) > 1 else ""
+        raise Unclassifiable(SUBCOMMAND_OFF_LIST.format(tool=tool, sub=shown))
+    return sub
+
+
+def _apt_get_cmd(words: list[_Word], cmd: _Cmd, ctx: _ShellCtx) -> bool:
+    """apt-get update / install of named packages from the configured archives, autoremove and clean,
+    with closed flags; only install takes operands."""
+    sub = _verb("apt-get", words, APT_GET_VERBS)
+    flags = APT_GET_FLAGS | APT_GET_VERB_FLAGS.get(sub, frozenset())
+    for word in words[2:]:
+        lit = word.lit
+        if lit is None:
+            raise Unclassifiable(APT_GET_OPERAND.format(opt=word.shown()))
+        if lit.startswith("-"):
+            if lit not in flags:
+                raise Unclassifiable(APT_GET_OPTION_OFF_LIST.format(opt=lit))
+            continue
+        if sub != "install" or "/" in lit or lit.endswith(APT_GET_LOCAL_PACKAGE) or lit.startswith("."):
+            raise Unclassifiable(APT_GET_OPERAND.format(opt=lit))
+    return False
+
+
+def _rpm_cmd(words: list[_Word], cmd: _Cmd, ctx: _ShellCtx) -> bool:
+    """rpm: the version query only."""
+    if tuple(_lits(words[1:])) != RPM_FORM:
+        raise Unclassifiable(RPM_OFF_LIST.format(form=" ".join(w.shown() for w in words)))
+    return False
+
+
+def _copr_cli_cmd(words: list[_Word], cmd: _Cmd, ctx: _ShellCtx) -> bool:
+    """copr-cli build: sends a source package to the remote builder; nothing runs on the runner."""
+    _verb("copr-cli", words, frozenset({COPR_CLI_VERB}))
+    return False
+
+
 INERT_COMMANDS = frozenset({
     "echo", "printf", "cat", "tac", "grep", "egrep", "fgrep", "wc", "head", "tail", "cut", "tr", "uniq", "tee",
     "mkdir", "mktemp", "rm", "rmdir", "cp", "mv", "ln", "touch", "chmod", "chown", "chgrp", "ls", "basename",
@@ -2871,7 +3011,7 @@ PR_CODE_COMMANDS = frozenset({
 })
 # Commands that write the paths in their arguments: a base-bound path named there is unbound.
 PATH_WRITERS = frozenset({"cp", "mv", "install", "tee", "ln", "touch", "dd", "rsync", "tar", "unzip", "chmod",
-                          "sed", "patch", "truncate", "curl", "wget", "rm"})
+                          "sed", "patch", "truncate", "curl", "wget", "rm", "lipo"})
 COMMAND_HANDLERS = {name: _inert for name in INERT_COMMANDS}
 COMMAND_HANDLERS.update({name: _pr_code for name in PR_CODE_COMMANDS})
 COMMAND_HANDLERS.update({
@@ -2899,6 +3039,8 @@ COMMAND_HANDLERS.update({
     "env": _env_cmd, "sudo": _sudo_cmd, "flock": _flock_cmd, "trap": _trap_cmd, "command": _command_cmd,
     "read": _binds, "unset": _binds, "export": _binds, "local": _binds, "declare": _binds, "typeset": _binds,
     "readonly": _binds, "mapfile": _binds, "readarray": _binds,
+    # 9566: lipo joins and splits Mach-O archives and runs none of them.
+    "apt-get": _apt_get_cmd, "rpm": _rpm_cmd, "copr-cli": _copr_cli_cmd, "lipo": _inert,
 })
 
 
@@ -3616,6 +3758,8 @@ class _StepFacts:
     event_text: bool = False
     tree_change: bool = False
     pr_fetch: bool = False
+    # 9566: what a non-strict job could not read in this step; a step with any is a taint step.
+    unread: list[str] = field(default_factory=list)
 
 
 def _analyse_step(step: _Step, job: dict[str, object], doc: dict[str, object], job_events: set[str],
@@ -3648,6 +3792,7 @@ def _analyse_step(step: _Step, job: dict[str, object], doc: dict[str, object], j
             ctx = _shell_ctx(env, job_events, strict, body.get(COMPOSITE_MARK))
             facts.runs_pr_code = _shell_runs_pr_code(_joined(script, MARK), ctx)
             facts.tree_change, facts.pr_fetch = ctx.tree_change, ctx.pr_fetch
+            facts.unread = list(ctx.unread)
             return facts
         if known.pr_code:
             facts.runs_pr_code = not known.pr_code_unless or \
@@ -3655,7 +3800,7 @@ def _analyse_step(step: _Step, job: dict[str, object], doc: dict[str, object], j
         return facts
     run = body.get("run")
     if not isinstance(run, str):
-        raise Unclassifiable("run is not text")
+        raise Unclassifiable(PRE_SCAN_RUN_NOT_TEXT)
     paths, _ = _text_refs(run)
     declared = _env_names(doc.get("env"), job.get("env"), body.get("env"))
     for path in paths:
@@ -3666,33 +3811,134 @@ def _analyse_step(step: _Step, job: dict[str, object], doc: dict[str, object], j
     ctx = _shell_ctx(env, job_events, strict, body.get(COMPOSITE_MARK))
     facts.runs_pr_code = _shell_runs_pr_code(_joined(run, MARK), ctx)
     facts.tree_change, facts.pr_fetch = ctx.tree_change, ctx.pr_fetch
+    facts.unread = list(ctx.unread)
     return facts
 
 
 PRE_SCAN_FETCH_REASON = "step {step!r} fetches a pull-request tree"
 PRE_SCAN_UNREAD_REASON = "step {step!r} cannot be read by the pre-scan: {reason}"
+PRE_SCAN_RUNS_REASON = "step {step!r} runs code from the checked-out tree"
+PRE_SCAN_TREE_REASON = "step {step!r} changes the checked-out tree"
+# 9566 item 3: every step form the pre-scan does not model has its own reason; none is skipped.
+PRE_SCAN_USES_REASON = "step {step!r} uses an action, which the pre-scan does not read"
+PRE_SCAN_COMPOSITE_REASON = "step {step!r} runs inside a composite action, which the pre-scan does not read"
+PRE_SCAN_SHELL_REASON = "{holder} sets a shell, which the pre-scan does not read"
+PRE_SCAN_FORM_REASON = "{holder} has a form the pre-scan does not read: {form}"
+PRE_SCAN_WINDOWS_REASON = "the job may run on a Windows leg, whose default shell the pre-scan does not read"
+# The step keys the pre-scan reads (run) or that change no command it judges; any other key
+# (with, shell, working-directory, a key GitHub adds later) sends the job to the full analysis.
+PRE_SCAN_STEP_KEYS = frozenset({"name", "id", "if", "env", "run", "timeout-minutes", "continue-on-error"})
+PRE_SCAN_NOT_MAP = "it is not a mapping"
+PRE_SCAN_NOT_LIST = "it is not a list"
+PRE_SCAN_KEY_FORM = "key {key!r} is not on the pre-scan list"
+PRE_SCAN_NO_RUN = "it has no run key"
+PRE_SCAN_RUN_NOT_TEXT = "run is not text"
+PRE_SCAN_RUN_EMPTY = "run is empty text"
+PRE_SCAN_ITEM_FORM = "an item is not a step"
+PRE_SCAN_STEP_HOLDER = "step {step!r}"
+PRE_SCAN_STEPS_HOLDER = "the job steps"
+PRE_SCAN_DEFAULTS_HOLDER = "the {owner} defaults"
+PRE_SCAN_DEFAULTS_RUN_HOLDER = "the {owner} defaults.run"
+
+
+def _pre_scan_defaults(owner: str, holder: dict[str, object]) -> str | None:
+    """The reason the defaults of a job or workflow send the job to the full analysis, or None."""
+    if "defaults" not in holder:
+        return None
+    defaults = holder["defaults"]
+    where = PRE_SCAN_DEFAULTS_HOLDER.format(owner=owner)
+    if not isinstance(defaults, dict):
+        return PRE_SCAN_FORM_REASON.format(holder=where, form=PRE_SCAN_NOT_MAP)
+    for key in defaults:
+        if key != "run":
+            return PRE_SCAN_FORM_REASON.format(holder=where, form=PRE_SCAN_KEY_FORM.format(key=key))
+    if "run" not in defaults:
+        return None
+    return _pre_scan_defaults_run(PRE_SCAN_DEFAULTS_RUN_HOLDER.format(owner=owner), defaults["run"])
+
+
+def _pre_scan_defaults_run(where: str, run: object) -> str | None:
+    if not isinstance(run, dict):
+        return PRE_SCAN_FORM_REASON.format(holder=where, form=PRE_SCAN_NOT_MAP)
+    if "shell" in run:
+        return PRE_SCAN_SHELL_REASON.format(holder=where)
+    if run:
+        return PRE_SCAN_FORM_REASON.format(holder=where, form=PRE_SCAN_KEY_FORM.format(key=next(iter(run))))
+    return None
+
+
+def _pre_scan_step(step: object) -> str | None:
+    """The reason one step is a form the pre-scan does not read, or None for a plain run step."""
+    if not isinstance(step, _Step):
+        return PRE_SCAN_FORM_REASON.format(holder=PRE_SCAN_STEPS_HOLDER, form=PRE_SCAN_ITEM_FORM)
+    where = PRE_SCAN_STEP_HOLDER.format(step=step.label)
+    body = step.body
+    if not isinstance(body, dict):
+        return PRE_SCAN_FORM_REASON.format(holder=where, form=PRE_SCAN_NOT_MAP)
+    if "uses" in body:
+        return PRE_SCAN_USES_REASON.format(step=step.label)
+    if COMPOSITE_MARK in body:
+        return PRE_SCAN_COMPOSITE_REASON.format(step=step.label)
+    if "shell" in body:
+        return PRE_SCAN_SHELL_REASON.format(holder=where)
+    for key in body:
+        if key not in PRE_SCAN_STEP_KEYS:
+            return PRE_SCAN_FORM_REASON.format(holder=where, form=PRE_SCAN_KEY_FORM.format(key=key))
+    if "run" not in body:
+        return PRE_SCAN_FORM_REASON.format(holder=where, form=PRE_SCAN_NO_RUN)
+    run_text = body["run"]
+    # 9566 F1: a present run key that is not non-empty text is never read as harmless.
+    if not isinstance(run_text, str):
+        return PRE_SCAN_UNREAD_REASON.format(step=step.label, reason=PRE_SCAN_RUN_NOT_TEXT)
+    if not run_text.strip():
+        return PRE_SCAN_UNREAD_REASON.format(step=step.label, reason=PRE_SCAN_RUN_EMPTY)
+    return None
 
 
 def _pre_scan_fetch(steps: list[_Step], job: dict[str, object], doc: dict[str, object]) -> str | None:
-    """A job with no pull-request trigger: the reason it must be analysed in full, or None.
+    """A job with no pull-request trigger: the reason it is not trusted-only, or None.
 
-    The reason is PRE_SCAN_FETCH_REASON for a run step that fetches a pull-request tree, or the
-    text of the form the pre-scan cannot read: a step it cannot read is never taken as a step
-    that fetches nothing (fail closed), so the full analysis reads that job and records the form.
+    The pre-scan only picks the label of a job: the full analysis reads every job whatever this
+    returns (9566 item 3), so a form it misses can cost a label, never a result. The reason is
+    the first of: a steps container, a defaults form, a Windows leg or a step form the pre-scan
+    does not read (a uses: step, a composite step, a shell: key, a key off PRE_SCAN_STEP_KEYS or
+    a step with no run); a run key whose value is not text or is empty or blank text
+    (PRE_SCAN_RUN_NOT_TEXT, PRE_SCAN_RUN_EMPTY; the full analysis reports the first as
+    unclassifiable and reads the second); PRE_SCAN_FETCH_REASON for a run step that fetches a
+    pull-request tree; the text of the first command the pre-scan cannot read;
+    PRE_SCAN_RUNS_REASON for a step that runs code from the checked-out tree; or
+    PRE_SCAN_TREE_REASON for a step that changes it. None only when every step is a plain run
+    step of non-blank text read in full that does none of these (fail closed).
     """
+    if not isinstance(steps, list):  # the pre-scan steps container
+        return PRE_SCAN_FORM_REASON.format(holder=PRE_SCAN_STEPS_HOLDER, form=PRE_SCAN_NOT_LIST)
+    for owner, holder in (("workflow", doc), ("job", job)):
+        reason = _pre_scan_defaults(owner, holder)
+        if reason is not None:
+            return reason
+    if WINDOWS_LABEL_WORD in _dump([job.get("runs-on"), job.get("strategy")]).lower():
+        return PRE_SCAN_WINDOWS_REASON
     env_job = (doc.get("env"), job.get("env"))
     for step in steps:
-        run = step.body.get("run")
-        if not isinstance(run, str):
-            continue
+        reason = _pre_scan_step(step)
+        if reason is not None:
+            return reason
+        run = step.body["run"]
         ctx = _shell_ctx(_merged_env(*env_job, step.body.get("env")), set(), strict=False,
                          composite=step.body.get(COMPOSITE_MARK))
         try:
-            _shell_runs_pr_code(_joined(run, MARK), ctx)
+            runs_code = _shell_runs_pr_code(_joined(run, MARK), ctx)
         except Unclassifiable as exc:
             return PRE_SCAN_UNREAD_REASON.format(step=step.label, reason=exc)
         if ctx.pr_fetch:
             return PRE_SCAN_FETCH_REASON.format(step=step.label)
+        # 9566: trusted-only only when the step is read in full; anything else is analysed.
+        if ctx.unread:
+            return PRE_SCAN_UNREAD_REASON.format(step=step.label, reason=ctx.unread[0])
+        if runs_code:
+            return PRE_SCAN_RUNS_REASON.format(step=step.label)
+        if ctx.tree_change:
+            return PRE_SCAN_TREE_REASON.format(step=step.label)
     return None
 
 
@@ -3739,11 +3985,9 @@ def _analyse_job_steps(wf: str, job_id: str, job: dict[str, object], doc: dict[s
     steps = _flatten_steps(job.get("steps"), actions, label)
     _check_labels(steps, label)
     strict = bool(job_events & (PR_EVENTS | {CALL_EVENT}))
-    if not strict and _pre_scan_fetch(steps, job, doc) is None:
-        if r2 is None:
-            return "trusted-only"
-        result.violations.append(r2)
-        return CLASS_PERSISTENT_STATE
+    # 9566 item 3: the full analysis reads every job; the pre-scan only picks the label, so the
+    # gate result of a job is the full-analysis result whatever form the pre-scan misses.
+    pre_scan = None if strict else _pre_scan_fetch(steps, job, doc)
     perms = _permissions(job, doc, label)
     windows = _windows_job(legs)
     pr_tree = False
@@ -3769,13 +4013,14 @@ def _analyse_job_steps(wf: str, job_id: str, job: dict[str, object], doc: dict[s
         if taint is None:
             event_text = facts.event_text and bool(job_events & (PR_EVENTS | {CALL_EVENT}))
             env_write = ENV_FILE_WRITE_RE.search(_dump([body.get("run"), body.get("with")])) is not None
-            if event_text or (pr_tree and (env_write or facts.runs_pr_code)):
+            # 9566: a step the reader could not read in full is taken as running unknown code.
+            if event_text or (pr_tree and (env_write or facts.runs_pr_code)) or bool(facts.unread):
                 taint = step
         if facts.pr_fetch or (facts.tree_change and job_events & PR_EVENTS):
             pr_tree = True
     if taint is None:
         if r2 is None:
-            return "no-pr-code"
+            return "trusted-only" if not strict and pre_scan is None else "no-pr-code"
         result.violations.append(r2)
         return CLASS_PERSISTENT_STATE
     result.taint_steps[(wf, job_id)] = taint.label
@@ -4030,7 +4275,8 @@ def _operand_plain_form(value: str) -> str | None:
 
 def _exact_operand(value: object) -> bool:
     """An exact name once each braced parameter reference of one plain name is read as ``$``; a
-    command substitution, a backtick form or any other brace form is never one."""
+    form of OPERAND_REFUSED_EXPANSIONS (command or process substitution, backtick, extended glob,
+    tilde) or any other brace form is never one."""
     if type(value) is not str or any(form in value for form in OPERAND_REFUSED_EXPANSIONS):
         return False
     plain = _operand_plain_form(value)
@@ -4145,7 +4391,7 @@ def _violation_problems(result: ScanResult, allow: list[AllowRow]) -> list[str]:
             if key not in violated and not unknown:
                 problems.append(f"stale allow row (no longer violates class {klass}): "
                                 f"{row.workflow}/{row.job}/{row.step}")
-    for v in sorted(result.violations, key=lambda x: (x.workflow, x.job, x.step, x.klass)):
+    for v in sorted(result.violations, key=lambda x: (x.workflow, x.job, x.step, x.klass, x.detail)):
         if (v.workflow, v.job, v.step, v.klass) not in allowed:
             problems.append(f"violation class ({v.klass}) without an allow row: {v.workflow}/{v.job}/{v.step}: {v.detail}")
     return problems

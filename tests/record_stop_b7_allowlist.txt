@@ -162,3 +162,12 @@ src/store/postgres.rs	pg_apply_entitled_attestation_in_tx
 src/store/postgres/lifecycle_tx_3152.rs	apply_lifecycle_patch_in_tx
 # #4078 repair (reviewed): runs only inside the migrate/open repair transaction; visibility pub(super) (#4324) so only crate::storage migrate callers can reach it; clears a regenerable cache (embed_skip), no durable text. Deliberately NOT routed through the record-stop gate: a repair inside the ladder must not consult it.
 src/storage/embed_skip.rs	repair_sqlite_after_trigger_gap
+# PR 9586 r1 Class B (reviewed): the federation anti-replay nonce cache
+# (#1255). B7 never saw these two: its old cut dropped every line after the
+# first `#[cfg(test)] mod tests {` of src/identity/replay.rs, and both sit
+# after it. They write only `federation_nonce_cache` (a peer id, a 32-byte
+# fingerprint, a touch time): security bookkeeping, never record-plane text.
+# Deliberately NOT behind the record-stop gate: refusing them during a stop
+# would drop replay protection for that window (fail-open on security).
+src/identity/replay.rs	prune_nonce_cache_to_per_peer_cap
+src/identity/replay.rs	persist_fingerprint_and_evict

@@ -48,6 +48,7 @@
       "CHANGELOG.md", "CLAUDE.md", "CONTRIBUTING.md", "PERFORMANCE.md", "README.md", "ROADMAP.md",
       "**/README.md",
       "docs/ADMIN_GUIDE.md", "docs/API_REFERENCE.md", "docs/CLI_REFERENCE.md", "docs/USER_GUIDE.md",
+      "docs/forensic-export.md",
       "docs/reference/ARCHITECTURE_REFERENCE.md",
       "docs/benchmarks/longmemeval-reflection.md",
       "docs/compliance/**", "docs/contracts/**", "docs/deploy/**",
