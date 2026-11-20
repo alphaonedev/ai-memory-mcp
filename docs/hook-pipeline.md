@@ -311,20 +311,33 @@ hook removal would be a security regression.
 
 At startup `ai-memory serve`, `ai-memory mcp` and `ai-memory curator`
 (when it installs the enforcement gate) load the hooks file through one
-loader, [`HookConfig::load_default`](../src/hooks/config.rs). Only a
+loader, [`HookConfig::load_for_boot`](../src/hooks/config.rs). Only a
 path that does not exist (no file and no symlink) means zero hooks; an
 empty file is valid with zero hooks. A file that exists but cannot be
 honoured stops startup with exit code 78 (`EX_CONFIG`) and
 `ai-memory: boot refused — hooks file <path> cannot be loaded: <reason>`:
 a TOML syntax or schema error (for example an unknown `event`), a
 validation error (for example `timeout_ms` over 30000), a read error such as permission denied, a
-directory or other non-regular file, a dangling symlink, or a file over
-1 MiB. The parse reason is bounded and never quotes the file's lines.
-`ai-memory doctor --hooks` (and `doctor --tokens --hooks`) reports the
-same error and exits 2. Before #9637 these files started the process
-with zero hooks, so every configured deny gate was silently absent; a
+directory or other non-regular file, a dangling symlink, a file that is
+not valid UTF-8, or a file over 1 MiB. The parse reason is bounded and
+never quotes the file's lines. Exit code 78 is the same code the #3166
+`config.toml` boot refusal uses. `ai-memory mcp` refuses before the
+stdio loop opens, so it never answers a handshake with partial hooks.
+There is no environment variable or flag that turns the refusal off;
+the recovery is to fix or remove the file. When no config directory
+resolves at all, no hooks file can exist: startup continues with zero
+hooks and logs that once.
+
+`ai-memory doctor --hooks` (and `doctor --tokens --hooks`) still runs
+with such a file: it reports the same error (path and reason) on
+stderr and exits 2.
+
+**Upgrade note.** Before #9637 these files started the process with
+zero hooks, so every configured deny gate was silently absent. A
 daemon that used to start with a broken `hooks.toml` now refuses to
-start until the file is fixed or removed.
+start until the file is fixed or removed. Run `ai-memory doctor --hooks`
+before restarting after an upgrade: a supervised daemon (systemd,
+launchd) with a broken file exits 78 on every start and restart-loops.
 
 ## Security hardening
 

@@ -738,7 +738,7 @@ fn load_hooks_for_doctor(
     let Some(p) = path else {
         return Ok(Some(Vec::new()));
     };
-    match crate::hooks::config::HookConfig::load_optional(p) {
+    match crate::hooks::config::HookConfig::try_load_from_optional(p) {
         Ok(hooks) => Ok(Some(hooks.unwrap_or_default())),
         Err(e) => {
             writeln!(out.stderr, "ai-memory doctor --hooks: {e}")?;

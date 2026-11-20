@@ -390,7 +390,10 @@ impl HookConfig {
     /// The file type is checked twice: on the path before `open`
     /// (so a FIFO is never opened and cannot block) and on the opened
     /// handle (so a swap between the check and the open is caught).
-    pub fn load_optional(path: &Path) -> Result<Option<Vec<HookConfig>>, HooksFileError> {
+    ///
+    /// Named and shaped after the #3166 `AppConfig::try_load_from_optional`
+    /// (only "no entry" is absent), with the dangling-symlink arm added.
+    pub fn try_load_from_optional(path: &Path) -> Result<Option<Vec<HookConfig>>, HooksFileError> {
         let refuse = |error: HooksConfigError| HooksFileError {
             path: path.to_path_buf(),
             error,
@@ -424,28 +427,56 @@ impl HookConfig {
         if opened.len() > MAX_HOOKS_FILE_BYTES {
             return Err(refuse(too_large()));
         }
-        let mut contents = String::new();
-        std::io::Read::read_to_string(
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(
             &mut std::io::Read::take(file, MAX_HOOKS_FILE_BYTES + 1),
-            &mut contents,
+            &mut bytes,
         )
         .map_err(|e| refuse(HooksConfigError::Io(e)))?;
-        if !u64::try_from(contents.len()).is_ok_and(|n| n <= MAX_HOOKS_FILE_BYTES) {
+        if !u64::try_from(bytes.len()).is_ok_and(|n| n <= MAX_HOOKS_FILE_BYTES) {
             return Err(refuse(too_large()));
         }
+        let contents = String::from_utf8(bytes).map_err(|_| refuse(not_utf8()))?;
         Self::load_from_str(&contents).map(Some).map_err(refuse)
     }
 
-    /// [`Self::load_optional`] on [`Self::default_path`]: zero hooks
-    /// when no config directory resolves or nothing exists at the
-    /// path, an error for every file that exists but cannot be
-    /// honoured. Every startup site (serve, mcp, curator) uses this.
-    pub fn load_default() -> Result<Vec<HookConfig>, HooksFileError> {
-        match Self::default_path() {
-            Some(path) => Ok(Self::load_optional(&path)?.unwrap_or_default()),
-            None => Ok(Vec::new()),
+    /// [`Self::try_load_from_optional`] on [`Self::default_path`], named
+    /// after the #3166 `AppConfig::load_for_boot`: zero hooks when no
+    /// config directory resolves (logged once) or nothing exists at the
+    /// path, an error for every file that exists but cannot be honoured.
+    /// Every startup site (serve, mcp, curator) uses this. There is no
+    /// environment variable or flag that turns the refusal off.
+    pub fn load_for_boot() -> Result<Vec<HookConfig>, HooksFileError> {
+        Self::resolve_for_boot(Self::default_path())
+    }
+
+    /// [`Self::load_for_boot`] with the default path passed in, so the
+    /// "no config directory" arm is testable.
+    pub(crate) fn resolve_for_boot(
+        path: Option<PathBuf>,
+    ) -> Result<Vec<HookConfig>, HooksFileError> {
+        match path {
+            Some(path) => Ok(Self::try_load_from_optional(&path)?.unwrap_or_default()),
+            None => {
+                note_no_config_dir();
+                Ok(Vec::new())
+            }
         }
     }
+}
+
+static NO_CONFIG_DIR_NOTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Logs, once per process, that no config directory resolves so no
+/// hooks file can exist (#9637 V-6). Returns `true` on the call that
+/// logged.
+fn note_no_config_dir() -> bool {
+    let first = !NO_CONFIG_DIR_NOTED.swap(true, std::sync::atomic::Ordering::Relaxed);
+    if first {
+        eprintln!("ai-memory: hooks: no config directory resolves; starting with no hooks");
+    }
+    first
 }
 
 /// Size ceiling for a hooks file. A hooks file is a few `[[hook]]`
@@ -460,6 +491,13 @@ fn not_a_regular_file() -> HooksConfigError {
     HooksConfigError::Io(std::io::Error::new(
         std::io::ErrorKind::InvalidInput,
         "not a regular file",
+    ))
+}
+
+fn not_utf8() -> HooksConfigError {
+    HooksConfigError::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "not valid UTF-8",
     ))
 }
 
@@ -1332,12 +1370,14 @@ priority = 0
 timeout_ms = 1000
 mode = "exec"
 enabled = true
+namespace = "*"
 "#;
 
     #[test]
     fn door_absent_path_is_the_only_no_hooks_outcome_9637() {
         let dir = door_scratch();
-        let got = HookConfig::load_optional(&dir.path().join("hooks.toml")).expect("absent is ok");
+        let got = HookConfig::try_load_from_optional(&dir.path().join("hooks.toml"))
+            .expect("absent is ok");
         assert!(got.is_none(), "absent path must be Ok(None)");
     }
 
@@ -1346,10 +1386,14 @@ enabled = true
         let dir = door_scratch();
         let p = dir.path().join("hooks.toml");
         std::fs::write(&p, DOOR_VALID).expect("write");
-        let hooks = HookConfig::load_optional(&p).expect("valid").expect("Some");
+        let hooks = HookConfig::try_load_from_optional(&p)
+            .expect("valid")
+            .expect("Some");
         assert_eq!(hooks.len(), 1);
         std::fs::write(&p, "").expect("write empty");
-        let hooks = HookConfig::load_optional(&p).expect("empty").expect("Some");
+        let hooks = HookConfig::try_load_from_optional(&p)
+            .expect("empty")
+            .expect("Some");
         assert!(hooks.is_empty(), "an empty file is valid with zero hooks");
     }
 
@@ -1359,7 +1403,7 @@ enabled = true
         let p = dir.path().join("hooks.toml");
 
         std::fs::write(&p, "[[hook]]\nevent = \"post_store\"\ncommand = \n").expect("write");
-        let err = HookConfig::load_optional(&p).expect_err("parse error refuses");
+        let err = HookConfig::try_load_from_optional(&p).expect_err("parse error refuses");
         assert!(
             matches!(err.error, HooksConfigError::Toml { .. }),
             "{err:?}"
@@ -1368,7 +1412,7 @@ enabled = true
         assert!(err.to_string().contains(&p.display().to_string()), "{err}");
 
         std::fs::write(&p, DOOR_VALID.replace("1000", "999999999")).expect("write");
-        let err = HookConfig::load_optional(&p).expect_err("validation refuses");
+        let err = HookConfig::try_load_from_optional(&p).expect_err("validation refuses");
         assert!(
             matches!(err.error, HooksConfigError::Validation { .. }),
             "{err:?}"
@@ -1376,12 +1420,12 @@ enabled = true
 
         let d = dir.path().join("as-dir");
         std::fs::create_dir(&d).expect("mkdir");
-        let err = HookConfig::load_optional(&d).expect_err("directory refuses");
+        let err = HookConfig::try_load_from_optional(&d).expect_err("directory refuses");
         assert!(err.to_string().contains("not a regular file"), "{err}");
 
         let big = vec![b'#'; usize::try_from(MAX_HOOKS_FILE_BYTES).expect("fits") + 1];
         std::fs::write(&p, big).expect("write big");
-        let err = HookConfig::load_optional(&p).expect_err("oversize refuses");
+        let err = HookConfig::try_load_from_optional(&p).expect_err("oversize refuses");
         assert!(err.to_string().contains("larger than"), "{err}");
     }
 
@@ -1395,7 +1439,7 @@ enabled = true
             format!("[[hook]]\nevent = \"post_store\"\ncommand = {canary} {canary}\n"),
         )
         .expect("write");
-        let err = HookConfig::load_optional(&p).expect_err("parse error refuses");
+        let err = HookConfig::try_load_from_optional(&p).expect_err("parse error refuses");
         let HooksConfigError::Toml { message, .. } = &err.error else {
             panic!("expected Toml, got {err:?}");
         };
@@ -1412,8 +1456,39 @@ enabled = true
         let dir = door_scratch();
         let p = dir.path().join("hooks.toml");
         std::os::unix::fs::symlink(dir.path().join("missing-target.toml"), &p).expect("symlink");
-        let err = HookConfig::load_optional(&p).expect_err("dangling symlink refuses");
+        let err = HookConfig::try_load_from_optional(&p).expect_err("dangling symlink refuses");
         assert!(err.to_string().contains("dangling symlink"), "{err}");
+    }
+
+    #[test]
+    fn door_refuses_a_non_utf8_file_with_a_named_error_9637() {
+        let dir = door_scratch();
+        let p = dir.path().join("hooks.toml");
+        std::fs::write(&p, [0x23, 0x20, 0xff, 0xfe, 0x0a]).expect("write non-UTF-8");
+        let err = HookConfig::try_load_from_optional(&p).expect_err("non-UTF-8 refuses");
+        assert!(err.to_string().contains("not valid UTF-8"), "{err}");
+        assert!(err.to_string().contains(&p.display().to_string()), "{err}");
+    }
+
+    #[test]
+    fn no_config_dir_is_absent_and_logged_once_9637() {
+        let hooks = HookConfig::resolve_for_boot(None).expect("no config dir is absent");
+        assert!(hooks.is_empty());
+        // `resolve_for_boot(None)` has logged (here or earlier in this
+        // process), so every later note stays quiet.
+        assert!(
+            !note_no_config_dir(),
+            "resolve_for_boot(None) logs the note"
+        );
+        assert!(
+            !note_no_config_dir(),
+            "the no-config-dir note is logged once"
+        );
+        assert!(
+            HookConfig::resolve_for_boot(None)
+                .expect("still absent")
+                .is_empty()
+        );
     }
 
     #[cfg(unix)]
@@ -1428,7 +1503,7 @@ enabled = true
             eprintln!("skip: running with privileges that read a mode-000 file");
             return;
         }
-        let err = HookConfig::load_optional(&p).expect_err("permission error refuses");
+        let err = HookConfig::try_load_from_optional(&p).expect_err("permission error refuses");
         assert!(
             matches!(&err.error, HooksConfigError::Io(e) if e.kind() == std::io::ErrorKind::PermissionDenied),
             "{err:?}"

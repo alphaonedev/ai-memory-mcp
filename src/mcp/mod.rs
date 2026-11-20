@@ -4550,7 +4550,7 @@ pub fn run_mcp_server(
     // #3356: configured-but-invalid identity aborts boot rather than becoming unresolved.
     let _ = crate::identity::resolve_mcp_read_visibility_caller()?;
     // #9637: one fail-closed load; an existing hooks file that cannot be honoured refuses boot.
-    let startup_hooks = crate::hooks::config::HookConfig::load_default()?;
+    let startup_hooks = crate::hooks::config::HookConfig::load_for_boot()?;
 
     let mut conn = db::open(db_path)?;
 

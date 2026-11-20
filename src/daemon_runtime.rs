@@ -2350,7 +2350,7 @@ pub async fn run(
                 let required = app_config.resolve_required_events();
                 if mode != HookEnforceMode::Off && !required.is_empty() {
                     // #9637: an existing hooks file that cannot be honoured refuses.
-                    let all_hooks = HookConfig::load_default()?;
+                    let all_hooks = HookConfig::load_for_boot()?;
                     // `install_pre_event_enforce_gate_for_tests` is the ONLY
                     // public installer for the process-global gate (the `_for_tests`
                     // suffix names its introduction, not a `#[cfg(test)]` guard);
@@ -8138,7 +8138,7 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
         return Ok(());
     }
     // #9637: a hooks file that exists but cannot be honoured refuses boot.
-    let startup_hooks = crate::hooks::config::HookConfig::load_default()?;
+    let startup_hooks = crate::hooks::config::HookConfig::load_for_boot()?;
 
     let mut bootstrap = match bootstrap_serve(&db_path, &args, app_config).await {
         Ok(bootstrap) => bootstrap,

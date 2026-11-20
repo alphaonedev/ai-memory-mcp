@@ -39,6 +39,9 @@ const DOCTOR_HOOKS_INVALID_EXIT: i32 = 2;
 /// How long a refusing entry point may take to exit. A daemon that is still
 /// running at this deadline did NOT refuse.
 const REFUSAL_DEADLINE: Duration = Duration::from_secs(20);
+/// `mcp` at the keyword tier loads no embedder, so a start cell measures the
+/// hooks door and not a model load (precedent: `tests/mcp_integration.rs`).
+const MCP_ARGS: &[&str] = &["mcp", "--tier", "keyword"];
 /// Poll interval for child processes and snapshots.
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 /// Window in which a failed SIGHUP reload must leave the snapshot unchanged.
@@ -118,6 +121,10 @@ fn plant_unknown_event(p: &Path) {
     .expect("write unknown-event fixture");
 }
 
+fn plant_non_utf8(p: &Path) {
+    std::fs::write(p, [b'#', b' ', 0xff, 0xfe, b'\n']).expect("write non-UTF-8 fixture");
+}
+
 fn plant_mode_000(p: &Path) {
     use std::os::unix::fs::PermissionsExt as _;
     std::fs::write(p, deny_hook_toml(NONEXISTENT_HOOK_BIN)).expect("write mode-000 fixture");
@@ -148,6 +155,11 @@ const INVALID_CASES: &[InvalidCase] = &[
         name: "unknown_event",
         plant: plant_unknown_event,
         reason: "parse error",
+    },
+    InvalidCase {
+        name: "non_utf8",
+        plant: plant_non_utf8,
+        reason: "not valid UTF-8",
     },
     InvalidCase {
         name: "mode_000",
@@ -320,8 +332,15 @@ fn mcp_refuses_every_invalid_hooks_file_9637() {
         if !sb.plant(case) {
             continue;
         }
-        let run = sb.run(&["mcp"], true);
+        let run = sb.run(MCP_ARGS, true);
         assert_refused("mcp", case, &sb, &run, EX_CONFIG);
+        // V-4: the refusal lands before the stdio loop, so nothing is served.
+        assert!(
+            run.stdout.trim().is_empty(),
+            "#9637 mcp/{}: an MCP server that refuses must write nothing to stdout; stdout={}",
+            case.name,
+            run.stdout
+        );
     }
 }
 
@@ -413,7 +432,7 @@ fn curator_refuses_an_invalid_hooks_file_under_enforce_9637() {
 fn absent_hooks_file_starts_with_zero_hooks_9637() {
     let sb = Sandbox::new();
     assert!(!sb.hooks_path().exists());
-    let run = sb.run(&["mcp"], true);
+    let run = sb.run(MCP_ARGS, true);
     assert_eq!(
         run.code,
         Some(0),
@@ -430,7 +449,7 @@ fn absent_hooks_file_starts_with_zero_hooks_9637() {
 fn empty_hooks_file_is_valid_with_zero_hooks_9637() {
     let sb = Sandbox::new();
     std::fs::write(sb.hooks_path(), "").expect("write empty hooks file");
-    let run = sb.run(&["mcp"], true);
+    let run = sb.run(MCP_ARGS, true);
     assert_eq!(
         run.code,
         Some(0),
@@ -451,7 +470,7 @@ fn valid_hooks_file_loads_its_hooks_9637() {
     assert_eq!(run.code, Some(0), "stderr={}", run.stderr);
     let v: Value = serde_json::from_str(run.stdout.trim()).expect("doctor --hooks --json");
     assert_eq!(v["hooks_loaded"], json!(1), "valid file = its hooks: {v}");
-    let run = sb.run(&["mcp"], true);
+    let run = sb.run(MCP_ARGS, true);
     assert_eq!(
         run.code,
         Some(0),
@@ -540,6 +559,23 @@ async fn sighup_reload_with_an_invalid_file_keeps_the_previous_deny_9637() {
             );
             assert_eq!(guard[0].event, HookEvent::PreStore);
             assert_eq!(guard[0].command, PathBuf::from(NONEXISTENT_HOOK_BIN));
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+
+    // V-6: a reload whose file has disappeared keeps the previous deny too.
+    std::fs::remove_file(&path).expect("remove the hooks file this cell wrote");
+    self_sighup();
+    let start = Instant::now();
+    while start.elapsed() < RELOAD_KEEP_WINDOW {
+        {
+            let guard = snapshot.read().await;
+            assert_eq!(
+                guard.len(),
+                1,
+                "a reload with the file gone must keep the previous deny"
+            );
+            assert_eq!(guard[0].event, HookEvent::PreStore);
         }
         tokio::time::sleep(POLL_INTERVAL).await;
     }
