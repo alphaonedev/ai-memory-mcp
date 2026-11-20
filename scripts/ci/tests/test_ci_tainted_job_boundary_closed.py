@@ -52,7 +52,7 @@ UNCLASSIFIABLE_PREFIX = "unclassifiable: "
 # The hosted job and step that already run the scripts/ci unit tests (I-6).
 HOST_WORKFLOW = "ci.yml"
 HOST_JOB = "build-script-vetting"
-HOST_STEP = "Shard partition and wiring unit tests (#6344)"
+HOST_STEP = "All scripts/ci unit tests (#9734)"
 HOST_COMMAND = "python3 -m unittest discover -s scripts/ci/tests"
 HOSTED_LABEL = "ubuntu-latest"
 # The module-level patterns that remain, by name; a new pattern needs a review and a time cell.

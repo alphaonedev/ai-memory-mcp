@@ -969,6 +969,10 @@ jobs:
         # pre-#2635 ledger-only algorithm over a planted unvetted package and
         # requires it to MISS — so the leg cannot pass tautologically.
         run: python3 scripts/check-build-script-vetting.py --self-test
+      # #9734: the step below keeps its #6344 name and runs only the shard wiring tests, so its time
+      # stays under 10 s; the whole scripts/ci/tests discovery (659 s) runs in the next steps.
+      - name: Shard partition and wiring unit tests (#6344)
+        run: python3 -m unittest discover -s scripts/ci/tests -p test_ci_shard_wiring_6344.py
       # #9593 - moved here from `classify`, where this 11.7 min step held every
       # `needs: classify` job (the four Check legs and seven others) back.
       # This job has no `needs:`, is no ancestor of any Check leg, runs on every
@@ -997,7 +1001,7 @@ jobs:
       # #9303: test_9303_real_range_9274_refused_as_frozen_region reads the PR 9274 range and fails, never skips, when a commit is missing.
       - name: Fetch the amendment ledger replay objects (#9303)
         run: python3 -I scripts/ci/tests/test_cert_amendment_ledger_6124.py --print-replay-shas | xargs git fetch --no-tags --depth=1 origin
-      - name: Shard partition and wiring unit tests (#6344)
+      - name: All scripts/ci unit tests (#9734)
         run: python3 -m unittest discover -s scripts/ci/tests
 
   # actionlint — workflow-injection guard (#1851, audit follow-up #1855).
