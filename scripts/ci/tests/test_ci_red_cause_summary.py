@@ -392,6 +392,11 @@ HOSTILE_CASES = (
     ("line separator", "a\u2028b", "a\\u2028b", "a\\u2028b"),
     ("token", "ghp_abcdefghijklmnop", "&lt;redacted>", "<redacted>"),
     ("backslash", "a\\b", "a\\\\b", "a\\\\b"),
+    # #9709 r2 N2 (D2): a dash is not in the plain Rust path shape, so a 36-character dash segment goes through
+    # clean() and is masked; a short dash segment is masked by nothing and stays readable.
+    ("dash segment of 36 characters", "m::abcdefghij-abcdefghij-abcdefghij-abc", "m\\x3a:&lt;redacted>",
+     "m\\x3a:<redacted>"),
+    ("dash segment of 7 characters", "m::abc-def", "m\\x3a:abc-def", "m\\x3a:abc-def"),
 )
 ALLOWED_STDOUT_LINE = re.compile(r"^::(?:error|notice) title=[a-z ]+::")
 
@@ -1249,6 +1254,132 @@ class NamedCause(Scratch):
             self.assertRegex(line, ALLOWED_STDOUT_LINE)
             self.assertNotIn("::", line.split("::", 2)[2])
         self.assertIn("@​x", summary)
+
+
+BOUND_NAME_KEY_BYTES = 284  # 300 line bytes - len("test ") - len(" ... FAILED"): what a cut FAILED line keeps of a name
+E2 = "é"  # 2 bytes in UTF-8
+E3 = "€"  # 3 bytes
+E4 = "\U0001F600"  # 4 bytes
+REPLACEMENT_CHARACTER = "�"
+RUNNING_H = "     Running tests/h.rs (target/debug/deps/h-0123456789abcdef)\n"
+
+# #9709 r2 N1: (case, raw test name, shown name when its FAILED line comes first, shown name when its failures-list
+# line comes first, "input lines over 300 bytes cut" count).  Written by hand from the bounds: a FAILED line keeps
+# 284 bytes of the name (300 - 5 - 11), a list line keeps 296 (300 - 4); a cut never ends inside a character, so a
+# 2-byte character fits 140 times after "t::" in 284 bytes (3 + 280) and 146 times in 296 (3 + 292); a 3-byte one 93
+# (3 + 279) and 97 (3 + 291) times; a 4-byte one 70 (3 + 280) and 73 (3 + 292) times.
+NAME_KEY_ROWS = (
+    ("2-byte characters over the bound", "t::" + E2 * 200, "t::" + E2 * 140, "t::" + E2 * 146, 2),
+    ("3-byte characters over the bound", "t::" + E3 * 200, "t::" + E3 * 93, "t::" + E3 * 97, 2),
+    ("4-byte characters over the bound", "t::" + E4 * 200, "t::" + E4 * 70, "t::" + E4 * 73, 2),
+    ("284 bytes: at the bound", "t::" + E2 * 140 + "a", "t::" + E2 * 140 + "a", "t::" + E2 * 140 + "a", 0),
+    ("283 bytes: just under", "t::" + E2 * 140, "t::" + E2 * 140, "t::" + E2 * 140, 0),
+    ("285 bytes: one over, only the FAILED line is cut", "t::" + E2 * 141, "t::" + E2 * 140, "t::" + E2 * 141, 1),
+)
+NAME_KEY_FORMS = (
+    ("FAILED line first", "test %s ... FAILED\n\nfailures:\n    %s\n\n"),
+    ("failures list first", "failures:\n    %s\n\ntest %s ... FAILED\n"),
+)
+
+
+def escaped_name(name):
+    return name.replace("::", "\\x3a:")
+
+
+class NameKeyBytes(Scratch):
+    """#9709 r2 N1: lines are cut in bytes, so the key of a failing test is cut in bytes too, on a character boundary:
+    one failing test is ONE row whatever form its line has and whatever characters its name has, and nothing printed
+    is ever split inside a multi-byte character."""
+
+    def test_the_key_bound_is_the_common_byte_prefix_of_the_two_forms(self):
+        module = load_module()
+        self.assertEqual(module.NAME_KEY_BYTES, BOUND_NAME_KEY_BYTES)
+        self.assertEqual(module.NAME_KEY_BYTES,
+                         module.MAX_LINE_BYTES - len(module.TEST_PREFIX) - len(module.FAILED_SUFFIX))
+
+    def test_both_forms_of_one_name_are_one_row_and_no_character_is_split(self):
+        for case, raw, shown_failed_first, shown_list_first, cuts in NAME_KEY_ROWS:
+            for form, template in NAME_KEY_FORMS:
+                with self.subTest(case=case, form=form):
+                    first_shown = shown_failed_first if form == NAME_KEY_FORMS[0][0] else shown_list_first
+                    self.write("a.log", RUNNING_H + template % (raw, raw) + RESULT_FAILED_LINE + "\n")
+                    (self.dir / "summary.md").unlink(missing_ok=True)
+                    rc, out, err, summary = self.run_script(["a.log"])
+                    self.assertEqual((rc, err), (0, ""))
+                    self.assertIn("failing tests: 1\n", summary)
+                    self.assertEqual([line for line in summary.splitlines() if line.startswith("| h | t\\x3a:")],
+                                     ["| h | " + escaped_name(first_shown) + " |"])
+                    self.assertEqual(out.splitlines()[-1], "::error title=failing test::h: " + escaped_name(first_shown))
+                    self.assertEqual(len(out.splitlines()), 2)
+                    self.assertNotIn(REPLACEMENT_CHARACTER, summary + out)
+                    note = "input lines over 300 bytes cut: %d\n" % cuts
+                    self.assertEqual(summary.endswith(note), cuts > 0, summary[-80:])
+
+    def test_the_reproducer_prints_one_failing_test(self):
+        raw = "t::" + E2 * 200
+        self.write("a.log", RUNNING_H + "test %s ... FAILED\n\nfailures:\n    %s\n\n" % (raw, raw) + RESULT_FAILED_LINE + "\n")
+        rc, out, err, summary = self.run_script(["a.log"])
+        self.assertEqual(rc, 0)
+        self.assertEqual([line for line in summary.splitlines() if line.startswith("failing tests")], ["failing tests: 1"])
+
+    def test_every_alignment_of_every_width_keys_both_forms_alike(self):
+        names = []
+        for char in (E2, E3, E4):
+            for shift in range(4):
+                for count in range(60, 150, 6):
+                    names.append("t%03d::%s%s" % (len(names), "a" * shift, char * count))
+        expected = 3 * 4 * 15  # widths x alignments x lengths, written out; every name differs in its first bytes
+        self.assertEqual(len(names), expected)
+        log = RUNNING_H + "".join("test %s ... FAILED\n" % n for n in names) + "\nfailures:\n"
+        log += "".join("    %s\n" % n for n in names) + "\n" + RESULT_FAILED_LINE + "\n"
+        self.write("a.log", log)
+        rc, out, err, summary = self.run_script(["a.log"])
+        self.assertEqual((rc, err), (0, ""))
+        self.assertIn("failing tests: %d\n" % expected, summary)
+        self.assertNotIn(REPLACEMENT_CHARACTER, summary + out)
+
+    def test_distinct_tests_sharing_a_long_prefix_stay_distinct(self):
+        # D18: a key cut far below the bound merges names that differ after a long common module path.
+        prefix = "m::" + "p" * 200
+        self.write("a.log", RUNNING_H + "test %s_a ... FAILED\ntest %s_b ... FAILED\n" % (prefix, prefix)
+                   + "\nfailures:\n    %s_a\n    %s_b\n\n" % (prefix, prefix) + RESULT_FAILED_LINE + "\n")
+        rc, out, err, summary = self.run_script(["a.log"])
+        self.assertEqual(rc, 0)
+        self.assertIn("failing tests: 2\n", summary)
+        self.assertEqual(len([line for line in summary.splitlines() if line.startswith("| h | m")]), 2)
+
+    def test_an_error_line_over_the_bound_is_cut_on_a_character_boundary(self):
+        # sibling: first_error_line cuts a step log line in bytes: 7 + 146 x 2 = 299 bytes fit, a 147th would pass 300.
+        self.write("logs/sal-build.log", "error: " + E2 * 200 + "\n")
+        rc, out, err, summary = self.run_script(["--step", "logs/sal-build.log", "Build", "logs"])
+        self.assertEqual((rc, err), (0, ""))
+        self.assertEqual(out, CAUSE_TITLE + "Build: error: " + E2 * 146 + "\n")
+        self.assertNotIn(REPLACEMENT_CHARACTER, summary + out)
+
+    def test_a_crash_detail_over_the_bound_is_cut_on_a_character_boundary(self):
+        # sibling: the crash detail is a cut line too; with a 3-space indent 3 + 34 + 2 x 131 = 299 bytes fit, a 132nd
+        # character would pass 300.
+        detail = "process didn't exit successfully: " + E2 * 200
+        self.write("a.log", "     Running tests/c.rs (target/debug/deps/c-0123456789abcdef)\n   " + detail + "\n")
+        rc, out, err, summary = self.run_script(["a.log"])
+        self.assertEqual((rc, err), (0, ""))
+        self.assertNotIn(REPLACEMENT_CHARACTER, summary + out)
+        self.assertIn("process didn't exit successfully: " + E2 * 131 + " |\n", summary)
+
+
+class CrashRowKeys(Scratch):
+    """#9709 r2 N2 (D11): crashed binaries are de-duplicated on the raw values, before cutting and masking."""
+
+    def test_two_crashes_whose_shown_rows_are_equal_stay_two_rows(self):
+        head = "  process didn't exit successfully: " + "word " * 50
+        self.write("a.log", "     Running tests/c.rs (target/debug/deps/c-0123456789abcdef)\n" + head + "first\n"
+                            "     Running tests/c.rs (target/debug/deps/c-0123456789abcdef)\n" + head + "second\n")
+        rc, out, err, summary = self.run_script(["a.log"])
+        self.assertEqual((rc, err), (0, ""))
+        self.assertIn("failing test binaries: 2\n", summary)
+        rows = [line for line in summary.splitlines() if line.startswith("| c |")]
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0], rows[1])  # the cut hides the difference: only the raw values tell them apart
 
 
 if __name__ == "__main__":
