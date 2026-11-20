@@ -563,7 +563,17 @@ Frontmatter fields (in this order): `memory_id`, `namespace`,
 level across the row's outbound `reflects_on` edges), `created_at`,
 `agent_id`, then a sequence-shaped `reflects_on` block listing
 target ids + per-edge attest levels. Body is the reflection's
-`content` field, untouched.
+`content` field, untouched apart from the export confidentiality boundary.
+
+Both the CLI and the automatic export run every row through the export
+confidentiality boundary that `export` uses (#9606). A row classified into
+a forbidden export class (private-key material, master or threshold secret,
+governance signing key, biometric embedding) is never written and leaves one
+signed `export.forbidden_class_refused` audit row; credential values in the
+surviving rows are written redacted when secret screening is on. The CLI
+prints a structured `export_report` line on stderr and exits `3` when a row
+was withheld; the automatic export writes nothing for that row and logs a
+warning.
 
 The companion MCP tool `memory_export_reflection` returns the
 rendered content + a suggested filename without touching the

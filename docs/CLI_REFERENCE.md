@@ -1439,6 +1439,18 @@ Walks the reflection-chain and writes Markdown to
 `~/.ai-memory/reflections/<ns>/<id>.md` by default. Pair with
 `auto_export_reflections_to_filesystem = true` for hands-off operation.
 
+Every row passes the same export confidentiality boundary as `export`
+(#9606): a reflection classified as private-key material, a master or
+threshold secret, a governance signing key or a biometric embedding is never
+written, and each such row leaves one signed `export.forbidden_class_refused`
+audit row; credential values in the surviving rows are written redacted when
+secret screening is on. When a row was withheld or redacted, stderr carries
+one structured `export_report` JSON line; when a row was withheld, the other
+files are still written and the command exits `3` so a scripted export
+cannot mistake a partial tree for a complete one. The automatic
+reflection and persona exports apply the same boundary, write nothing for a
+withheld row and log a warning.
+
 Unix exports create current-user-owned mode 0700 roots and namespace directories
 and atomically publish mode 0600 files. Existing managed directories must already
 have permission bits 0700 (owner only; a setgid bit inherited from the parent

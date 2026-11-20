@@ -208,7 +208,7 @@ pub fn run_auto_persona(
     };
 
     if policy.effective_auto_export_personas_to_filesystem() {
-        write_persona_export(&persona, &config.out_dir)?;
+        write_persona_export(&conn, &persona, &config.out_dir)?;
     }
     Ok(())
 }
@@ -302,13 +302,39 @@ fn count_entity_reflections(
 /// persona. Sanitises namespace path components the way QW-1's
 /// reflection export does — replaces every `/` with `_` to keep the
 /// path flat.
+///
+/// #9606 — the persona is a memory row, so its durable row runs through the
+/// export taxonomy screen before render and before any path is opened: a
+/// forbidden-class persona is dropped (one signed refusal row) and nothing
+/// is written; a secret value in the body is written redacted.
 fn write_persona_export(
+    conn: &rusqlite::Connection,
     persona: &crate::persona::Persona,
     out_dir: &std::path::Path,
 ) -> anyhow::Result<()> {
     use crate::cli::commands::export_reflections::private_file::{
         PrivateExportDir, validate_component,
     };
+
+    let row = db::get(conn, &persona.id)?
+        .with_context(|| format!("persona row {} vanished before export", persona.id))?;
+    let (mut screened, _ledger) =
+        crate::export_taxonomy::screen_memories_for_export_audited(vec![row], Some(conn));
+    let Some(screened) = screened.pop() else {
+        tracing::warn!(
+            target: "post_reflect.auto_persona",
+            "persona export for entity {} (ns={}) withheld by the export confidentiality \
+             boundary; nothing written (#9606)",
+            persona.entity_id,
+            persona.namespace,
+        );
+        return Ok(());
+    };
+    let persona = crate::persona::Persona {
+        body_md: screened.content,
+        ..persona.clone()
+    };
+    let persona = &persona;
 
     let ns_safe = persona.namespace.replace('/', "_");
     let entity_safe = persona.entity_id.replace('/', "_");

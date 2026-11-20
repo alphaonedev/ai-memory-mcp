@@ -244,6 +244,19 @@ pub fn run_auto_export(
     };
     // ERRORS-02/15: refuse durable IDs before touching the destination tree.
     export_reflections::validate_export_id(&mem.id, &mem.namespace)?;
+    // #9606 — the export taxonomy screen runs before render and before any
+    // path is opened: a forbidden-class row is dropped (one signed refusal
+    // row), nothing is written, and the hook stays notify-class (`Ok`).
+    let (mut screened, _ledger) =
+        crate::export_taxonomy::screen_memories_for_export_audited(vec![mem], Some(&conn));
+    let Some(mem) = screened.pop() else {
+        tracing::warn!(
+            target: "post_reflect.auto_export",
+            "auto-export of reflection {memory_id} withheld by the export confidentiality \
+             boundary; nothing written (#9606)"
+        );
+        return Ok(());
+    };
     let edges = collect_outbound_reflects_on(&conn, memory_id)?;
     let attest_level = export_reflections::summarise_attest_level(&edges);
     let payload = export_reflections::render_payload(&mem, &edges, attest_level, config.format);
