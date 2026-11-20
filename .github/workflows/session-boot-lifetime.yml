@@ -42,28 +42,32 @@ env:
 jobs:
   lifetime-tests:
     name: Lifetime suite (${{ matrix.os }})
+    # #9455 stage 1: every trigger here is trusted, so the job never resolves to
+    # a persistent runner. 25 min = 3x the slowest measured hosted run (8 min
+    # 20 s, stage 0); GitHub's default would be 360.
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
-        # Linux runs GitHub-hosted (operator directive 2026-08-22: Linux CI is
-        # self-hosted ONLY for the native pg tier, which this suite does not
-        # use). macOS stays on the f1 node — the directive is Linux-only, and
-        # there is no GitHub-hosted arm64 macOS class this suite is calibrated
-        # for. `runner` is a JSON array of runner LABELS so one matrix can carry
-        # both shapes; see the `check` job in ci.yml for the same pattern.
+        # Both legs run GitHub-hosted (#9455, 3-agent vote 71472661): this
+        # workflow has only trusted triggers (schedule, workflow_dispatch, push),
+        # and a trusted run must not read the cargo target or sccache state a
+        # pull-request run on the persistent fleet runner can write. The `os`
+        # value `macos-fed` is kept on purpose: it is the check name
+        # `Lifetime suite (macos-fed)` other pins refer to. `runner` is a JSON
+        # array of runner LABELS; scripts/ci/tests/
+        # test_ci_tainted_job_boundary_runner_legs.py fails if a leg names a
+        # runner that is not provably GitHub-hosted.
         include:
           - os: ubuntu-latest
             runner: '["ubuntu-latest"]'
           - os: macos-fed
-            runner: '["self-hosted","macos-fed"]'
+            runner: '["macos-latest"]'
     runs-on: ${{ fromJSON(matrix.runner) }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-      - name: Prune stale runner TMPDIR (#8634)
-        if: runner.environment == 'self-hosted'
-        uses: ./.github/actions/prune-runner-tmp
 
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
