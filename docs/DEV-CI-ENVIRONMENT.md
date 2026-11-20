@@ -79,8 +79,11 @@ the cert SANs, catching a misrouted/MITM'd connection, not merely an untrusted o
   - Cluster listens on `127.0.0.1:5445`
   - Certs / env / init script live under the operator-local `pg-age-stack/` tree
 - **Self-hosted runner labels:** `self-hosted,macOS,ARM64,macos-fed`
-- **Trusted triggers stay off this runner (#9455).** A job with a trusted trigger
-  (`push`, `schedule`, `workflow_dispatch`, `merge_group`) must not run on a
+- **Trusted triggers stay off this runner (#9455).** Every event except `pull_request`
+  is a trusted trigger: `push`, `schedule`, `workflow_dispatch`, `release`,
+  `repository_dispatch`, `merge_group`, `pull_request_target` and `workflow_call`
+  (`R2_TRUSTED_EVENTS` of `scripts/ci/taint_boundary.py`). A job with a trusted
+  trigger must not run on a
   persistent self-hosted label, because pull-request runs can write its cargo
   target and sccache state. `session-boot-lifetime.yml` therefore runs its
   `Lifetime suite (macos-fed)` leg on the GitHub-hosted `macos-latest` label (the

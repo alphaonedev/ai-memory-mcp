@@ -55,9 +55,8 @@ jobs:
         # pull-request run on the persistent fleet runner can write. The `os`
         # value `macos-fed` is kept on purpose: it is the check name
         # `Lifetime suite (macos-fed)` other pins refer to. `runner` is a JSON
-        # array of runner LABELS; scripts/ci/tests/
-        # test_ci_tainted_job_boundary_runner_legs.py fails if a leg names a
-        # runner that is not provably GitHub-hosted.
+        # array of runner LABELS; the runner-legs structural test of #9455 fails
+        # if a leg names a runner that is not provably GitHub-hosted.
         include:
           - os: ubuntu-latest
             runner: '["ubuntu-latest"]'

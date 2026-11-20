@@ -96,6 +96,9 @@ def _walk(name: str, workflows: dict[str, str], caller_events: set[str] | None, 
         try:
             if not isinstance(job, dict):
                 raise tb.Unclassifiable(f"{label}: job is not a mapping")
+            # One reader: the classifier's own closed list of job and matrix forms, so the walker
+            # is never more permissive than the classifier (#9646 N2).
+            tb._check_job_form(job, label)
             job_events = tb._job_events(job, events)
             uses = job.get("uses")
             if isinstance(uses, str):
@@ -459,7 +462,7 @@ class WorkflowCommentsSpellNoTestPath(unittest.TestCase):
 DOC_PATH = "docs/DEV-CI-ENVIRONMENT.md"
 DOC_ANCHOR = "**Trusted triggers stay off this runner (#9455).**"
 DOC_BULLET_END = "\n- "
-DOC_RULE_TEXT = "every event except `pull_request`"
+DOC_RULE_TEXT = "Every event except `pull_request`"
 BACKTICK_RE = re.compile(r"`([a-z_]+)`")
 
 
