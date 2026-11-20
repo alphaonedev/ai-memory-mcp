@@ -74,9 +74,8 @@ URL_LINES = frozenset((
     'if ! psql "$new_url" -v ON_ERROR_STOP=1 -c "CREATE EXTENSION IF NOT EXISTS age; CREATE EXTENSION IF NOT EXISTS'
     ' vector;"; then',
     'echo "AI_MEMORY_TEST_POSTGRES_URL=$new_url" >> "$GITHUB_ENV"',
-    # #6383: the per-binary isolation wrapper takes the URL through its environment, never argv.
-    'AI_MEMORY_TEST_POSTGRES_URL="$new_url" python3 scripts/test/pg_isolated_binary.py setup --db "$CI_FED_DB"'
-    ' --jobs 8 --emit-env >> "$GITHUB_ENV"',
+    # #9592: the wrapper setup moved out of this step into scripts/ci/pg_isolate_serial_step.py, which passes the
+    # URL through the child environment only (gate check_pg_isolate_invariants.py, G1 and the source rows).
 ))
 
 
