@@ -101,7 +101,8 @@ impl Form {
     }
 }
 
-/// One census route: method, uri (with `{id}` for the fixture memory) and
+/// One census route: method, uri (with `{id}` for the fixture memory and
+/// `{ns}` for the per-run fixture namespace) and
 /// an optional JSON body.
 struct Route {
     method: &'static str,
@@ -175,7 +176,7 @@ fn census_routes() -> Vec<Route> {
         r("GET", "/api/v1/links/{id}", None, false),
         r("GET", "/api/v1/memories/{id}/lineage", None, false),
         r("POST", "/api/v1/namespaces", Some(namespace_body), false),
-        r("DELETE", "/api/v1/namespaces?namespace=ns-9616", None, true),
+        r("DELETE", "/api/v1/namespaces?namespace={ns}", None, true),
         r(
             "POST",
             "/api/v1/check_duplicate",
@@ -406,7 +407,7 @@ async fn census(app: AppState, backend: &str) -> (Vec<String>, Vec<String>) {
         // The valid control only classifies a postgres-gated route; it is
         // never sent to a destructive route (it would act on the fixture).
         let gated = if backend == "postgres" && !route.destructive {
-            let uri = route.uri.replace("{id}", &id);
+            let uri = route.uri.replace("{id}", &id).replace("{ns}", namespace());
             let control_body = route.body.map(|b| b(&id));
             let (control, _) = call(&router, route.method, &uri, &alice(), control_body).await;
             control == StatusCode::NOT_IMPLEMENTED
@@ -414,7 +415,7 @@ async fn census(app: AppState, backend: &str) -> (Vec<String>, Vec<String>) {
             false
         };
         for form in INVALID_FORMS {
-            let uri = route.uri.replace("{id}", &id);
+            let uri = route.uri.replace("{id}", &id).replace("{ns}", namespace());
             let (status, body) = call(
                 &router,
                 route.method,
