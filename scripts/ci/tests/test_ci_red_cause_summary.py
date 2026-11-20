@@ -340,6 +340,16 @@ class ParseAndRender(Scratch):
         self.assertIn("| x | m\\x3a:one |\n| x | m\\x3a:two |\n", summary)
         self.assertIn("failing tests: 2\n", summary)
 
+    def test_blank_lines_between_the_failures_header_and_the_names_are_skipped(self):
+        self.write("a.log", "     Running tests/x.rs (target/debug/deps/x-0123456789abcdef)\n\nfailures:\n\n\n    m::one\n"
+                            "    m::two\n\n    m::not_listed\n"
+                            "test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out\n")
+        rc, out, err, summary = self.run_script(["a.log"])
+        self.assertEqual(rc, 0)
+        self.assertIn("| x | m\\x3a:one |\n| x | m\\x3a:two |\n", summary)
+        self.assertNotIn("not_listed", summary)
+        self.assertIn("failing tests: 2\n", summary)
+
     def test_doc_test_failure_and_ansi_colour(self):
         self.write("a.log", "   Doc-tests ai_memory\n\x1b[31mtest src/lib.rs - foo (line 3) ... FAILED\x1b[0m\n"
                             "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out\n")
@@ -673,6 +683,38 @@ class FailsOpen(Scratch):
         self.write("real.log", "test x ... FAILED\n")
         os.symlink("real.log", str(self.dir / "link.log"))
         self.check(["link.log"], "cannot read input link.log: " + os.strerror(errno.ELOOP))
+
+    def grow_after_fstat(self, path, growth):
+        """Make the next fstat append ``growth`` to ``path`` after it took the size: a writer still appending."""
+        real_fstat = os.fstat
+
+        def fstat_then_grow(fd):
+            info = real_fstat(fd)
+            with open(str(path), "ab") as handle:
+                handle.write(growth)
+            return info
+
+        os.fstat = fstat_then_grow
+        self.addCleanup(setattr, os, "fstat", real_fstat)
+
+    def test_a_file_growing_after_fstat_is_read_only_to_its_fstat_size(self):
+        module = load_module()
+        text = b"test one ... FAILED\n"
+        path = self.dir / "a.log"
+        path.write_bytes(text)
+        self.grow_after_fstat(path, b"test grown ... FAILED\n" * 4096)
+        self.assertEqual(module.read_input(str(path), module.MAX_FILE_BYTES), (text, len(text), False))
+
+    def test_a_large_file_growing_after_fstat_is_read_only_to_its_fstat_tail(self):
+        module = load_module()
+        tail = b"test last ... FAILED\n"
+        path = self.dir / "big.log"
+        with open(str(path), "wb") as handle:
+            handle.seek(module.MAX_FILE_BYTES + 100)  # sparse: no byte of the hole is written
+            handle.write(b"\n" + tail)
+        size = module.MAX_FILE_BYTES + 101 + len(tail)
+        self.grow_after_fstat(path, b"test grown ... FAILED\n" * 4096)
+        self.assertEqual(module.read_input(str(path), module.MAX_FILE_BYTES), (tail, size, True))
 
     def test_summary_variable_missing_still_prints_the_annotations(self):
         self.write("a.log", "test one ... FAILED\n")
