@@ -19,6 +19,7 @@ synthetic workflows are named constants. No file is written and no cell makes a 
 from __future__ import annotations
 
 import json
+import re
 import sys
 import time
 import unittest
@@ -216,6 +217,31 @@ FORM_CASES = (
     ("unclassifiable: no runs-on", "", set(), [f"{SYNTH}/{JOB}: job without runs-on"]),
 )
 
+# The classifier's own closed list of job and matrix forms (`taint_boundary._check_job_form`):
+# (case name, extra job lines after a hosted literal `runs-on`, the exact reason). The walker
+# is never more permissive than the classifier, so each one is a finding (#9646 N2).
+MATRIX_HEAD = "    strategy:\n      matrix:\n"
+CLOSED_LIST_CASES = (
+    ("job key off the closed list", "    bogus: 1\n", "job key 'bogus' is not on the closed list"),
+    ("strategy not a mapping", "    strategy: fast\n", "strategy is not a mapping"),
+    ("matrix is an expression", "    strategy:\n      matrix: ${{ fromJSON(inputs.m) }}\n",
+     "matrix is an expression"),
+    ("matrix not a mapping", "    strategy:\n      matrix: [a]\n", "matrix is not a mapping"),
+    ("matrix include expression",
+     MATRIX_HEAD + "        os: [ubuntu-latest]\n        include: ${{ fromJSON(inputs.m) }}\n",
+     "matrix include holds an expression"),
+    ("matrix exclude expression",
+     MATRIX_HEAD + "        os: [ubuntu-latest]\n        exclude: ${{ fromJSON(inputs.m) }}\n",
+     "matrix exclude holds an expression"),
+    ("matrix include not mappings",
+     MATRIX_HEAD + "        os: [ubuntu-latest]\n        include: [a]\n",
+     "matrix include is not a list of mappings"),
+    ("matrix axis expression", MATRIX_HEAD + "        os: ${{ inputs.os }}\n", "matrix axis 'os' is an expression"),
+    ("matrix axis not a list", MATRIX_HEAD + "        os: ubuntu-latest\n", "matrix axis 'os' is not a list"),
+    ("matrix axis value expression", MATRIX_HEAD + "        os: ['${{ inputs.os }}']\n",
+     "matrix axis 'os' is an expression"),
+)
+
 
 class RunnerLegForms(unittest.TestCase):
     """Table-driven: every `runs-on` form, each with its rows or its exact finding."""
@@ -226,6 +252,17 @@ class RunnerLegForms(unittest.TestCase):
             with self.subTest(form=name):
                 got_rows, got_findings = persistent_trusted_legs({SYNTH: TRUSTED_HEADER + body + STEPS})
                 self.assertEqual((got_rows, got_findings), (rows, findings))
+
+    def test_9646_every_form_the_classifier_refuses_is_a_finding_in_the_walker(self) -> None:
+        _need_module(self)
+        for name, extra, reason in CLOSED_LIST_CASES:
+            with self.subTest(form=name):
+                for header in (TRUSTED_HEADER, PR_ONLY_HEADER):
+                    text = header + "    runs-on: ubuntu-latest\n" + extra + STEPS
+                    with self.assertRaises(tb.Unclassifiable) as ctx:
+                        tb._check_job_form(tb.parse_yaml(text, SYNTH)["jobs"][JOB], f"{SYNTH}/{JOB}")
+                    self.assertEqual(str(ctx.exception), f"{SYNTH}/{JOB}: {reason}")
+                    self.assertEqual(persistent_trusted_legs({SYNTH: text}), (set(), [f"{SYNTH}/{JOB}: {reason}"]))
 
     def test_9455_a_pull_request_only_job_holds_the_invariant(self) -> None:
         _need_module(self)
@@ -327,6 +364,115 @@ class RealRunnerLegs(unittest.TestCase):
         rows, _ = persistent_trusted_legs({SESSION_BOOT_WORKFLOW: broken})
         self.assertEqual(check_open_rows(rows, ()), [ROW_MESSAGE.format(
             wf=SESSION_BOOT_WORKFLOW, job=SESSION_BOOT_JOB, leg=SESSION_BOOT_PERSISTENT_LEG)])
+
+
+# ---------------------------------------------------------------------------------------
+# #9646 N1: a workflow comment that spells the path of a test file the cargo-skip set holds is
+# read by the cargo-skip read-set tests (test_impact_cargo_skip_8322 / _8328) as a workflow use
+# of that file, so the PR turns CI red. Test files outside the skip set (Rust `tests/*.rs`, the
+# `scripts/test` suites) are cargo or gate inputs already and are not part of this class.
+# ---------------------------------------------------------------------------------------
+
+WORKFLOW_DIR = ".github/workflows"
+PATH_TOKEN_RE = re.compile(r"[A-Za-z0-9_./@-]+")
+TOKEN_TRAILING_PUNCTUATION = ".,:;)"
+TEST_DIR_NAMES = frozenset({"test", "tests"})
+TEST_FILE_PREFIX = "test_"
+TEST_FILE_SUFFIXES = ("_test.py", "_test.rs", "_tests.py", "_tests.rs")
+OFFENDER_MESSAGE = "{wf}:{line} comment spells the skippable test file path {path}"
+SPELLED = "scripts/ci/tests/test_example_9646.py"
+# The synthetic spellable set: one skippable test file. A test file outside the skip set (the
+# second path) is a read of cargo already and may be spelled.
+SPELLABLE = frozenset({SPELLED})
+NOT_SKIPPABLE_TEST = "scripts/test/test_example_9646.py"
+
+# (case name, workflow text, expected offender messages)
+COMMENT_CASES = (
+    ("comment spells a skippable test path", f"# see {SPELLED} for the cells\n",
+     [OFFENDER_MESSAGE.format(wf=SYNTH, line=1, path=SPELLED)]),
+    ("trailing comment spells a skippable test path", f"name: x  # {SPELLED}.\n",
+     [OFFENDER_MESSAGE.format(wf=SYNTH, line=1, path=SPELLED)]),
+    # The read-set matches a bare file name too (`hit.endswith("/" + name)`), so the name alone
+    # is the same use as the path.
+    ("comment spells the bare file name", f"# {SPELLED.rsplit('/', 1)[1]} pins this\n",
+     [OFFENDER_MESSAGE.format(wf=SYNTH, line=1, path=SPELLED.rsplit("/", 1)[1])]),
+    ("comment names the test by issue and suite only", "# the runner-legs cells of #9455 pin this\n", []),
+    ("comment spells a non-test path", "# scripts/ci/taint_boundary.py classifies\n", []),
+    ("comment spells a test path outside the skip set", f"# {NOT_SKIPPABLE_TEST}\n", []),
+    ("a non-comment line is not read here", f"run: echo {SPELLED}\n", []),
+    ("second line is reported by number", f"a: 1\n  # {SPELLED}\n",
+     [OFFENDER_MESSAGE.format(wf=SYNTH, line=2, path=SPELLED)]),
+)
+
+
+def is_test_file(path: str) -> bool:
+    parts = path.split("/")
+    return (bool(TEST_DIR_NAMES & set(parts[:-1])) or parts[-1].startswith(TEST_FILE_PREFIX)
+            or parts[-1].endswith(TEST_FILE_SUFFIXES))
+
+
+def comment_test_paths(name: str, text: str, spellable: frozenset[str]) -> list[str]:
+    """Every comment of one workflow that spells a path or bare file name of `spellable`."""
+    out: list[str] = []
+    spelled = spellable | {p.rsplit("/", 1)[-1] for p in spellable}
+    for number, line in enumerate(text.splitlines(), 1):
+        for start in (m.start() for m in re.finditer("#", line)):
+            if start and not line[start - 1].isspace():
+                continue
+            for token in PATH_TOKEN_RE.findall(line[start:]):
+                path = token.rstrip(TOKEN_TRAILING_PUNCTUATION)
+                if path in spelled:
+                    out.append(OFFENDER_MESSAGE.format(wf=name, line=number, path=path))
+            break
+    return out
+
+
+def skippable_test_files() -> frozenset[str]:
+    """Every tracked test file the cargo-skip set holds (the paths whose spelling the read-set counts)."""
+    from impact import cargo_skip, read_set  # the read-set tests' own readers
+
+    section = cargo_skip.load_section()
+    return frozenset(p for p in read_set.tracked_files(REPO_ROOT)
+                     if is_test_file(p) and cargo_skip.is_skippable(section, p))
+
+
+class WorkflowCommentsSpellNoTestPath(unittest.TestCase):
+    """Class invariant: no comment of any workflow file spells the path of a skippable test file."""
+
+    def test_9646_no_workflow_comment_spells_a_skippable_test_file_path(self) -> None:
+        _need_module(self)
+        for name, text, expected in COMMENT_CASES:
+            with self.subTest(case=name):
+                self.assertEqual(comment_test_paths(SYNTH, text, SPELLABLE), expected)
+        spellable = skippable_test_files()
+        self.assertIn(f"scripts/ci/tests/{Path(__file__).name}", spellable)  # the scan is not vacuous
+        offenders: list[str] = []
+        for rel in sorted((REPO_ROOT / WORKFLOW_DIR).glob("*.y*ml")):
+            offenders += comment_test_paths(rel.name, rel.read_text(encoding="utf-8"), spellable)
+        self.assertEqual(offenders, [])
+
+
+# ---------------------------------------------------------------------------------------
+# #9646 N3: the docs list the trusted triggers of the classifier's constant, nothing else.
+# ---------------------------------------------------------------------------------------
+
+DOC_PATH = "docs/DEV-CI-ENVIRONMENT.md"
+DOC_ANCHOR = "**Trusted triggers stay off this runner (#9455).**"
+DOC_BULLET_END = "\n- "
+DOC_RULE_TEXT = "every event except `pull_request`"
+BACKTICK_RE = re.compile(r"`([a-z_]+)`")
+
+
+class TrustedTriggerDocList(unittest.TestCase):
+    def test_9646_doc_lists_exactly_the_classifier_trusted_events(self) -> None:
+        _need_module(self)
+        doc = (REPO_ROOT / DOC_PATH).read_text(encoding="utf-8")
+        self.assertIn(DOC_ANCHOR, doc)
+        paragraph = doc.split(DOC_ANCHOR, 1)[1].split(DOC_BULLET_END, 1)[0]
+        self.assertIn(DOC_RULE_TEXT, paragraph)
+        named = {e for e in BACKTICK_RE.findall(paragraph) if e in tb.KNOWN_EVENTS}
+        self.assertEqual(named, set(tb.R2_TRUSTED_EVENTS) | set(tb.R2_UNTRUSTED_EVENTS))
+        self.assertEqual(len(tb.R2_TRUSTED_EVENTS), 8)
 
 
 if __name__ == "__main__":
