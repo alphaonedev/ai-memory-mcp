@@ -2184,12 +2184,19 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let (conn, _) = open_test_db(&tmp);
         let id = insert_mem(&conn, "ns-9505", 0);
+        /// SQLite's prepare error for the hidden table.
+        const NO_SIGNED_EVENTS_9505: &str = "no such table: signed_events";
         conn.execute_batch("ALTER TABLE signed_events RENAME TO signed_events_gone_9505")
             .expect("hide signed_events");
-        assert!(
-            build_chain_report(&conn, &id, true).is_err(),
-            "an unreadable signed_events table must not read as no events"
-        );
+        let err = build_chain_report(&conn, &id, true)
+            .expect_err("an unreadable signed_events table must not read as no events");
+        match err.downcast_ref::<rusqlite::Error>() {
+            Some(rusqlite::Error::SqliteFailure(code, Some(msg))) => {
+                assert_eq!(code.code, rusqlite::ErrorCode::Unknown, "{err:#}");
+                assert_eq!(msg, NO_SIGNED_EVENTS_9505, "{err:#}");
+            }
+            other => panic!("expected the prepare failure, got {other:?} ({err:#})"),
+        }
         // Without the flag the table is never read.
         assert!(build_chain_report(&conn, &id, false).is_ok());
     }
