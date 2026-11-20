@@ -76,6 +76,17 @@ fn install_security_bypass_for_legacy_tests() {
     });
 }
 
+/// #1751 / #9730 — the one site of this file that pins the lib-test binary to
+/// the explicit permissive attestation opt-out, so the unsigned HTTP create
+/// fixtures keep exercising their actual subject matter (required-default
+/// rejection is covered by `tests/agent_attestation_integrity.rs`). Both
+/// `test_state` and `test_app_state` go through it: one helper-routed
+/// environment mutation in this file, not one per caller
+/// (`scripts/check-test-env-lock.sh` arm (e), #3523).
+fn pin_permissive_attestation() {
+    crate::identity::attest::permissive_attestation_for_lib_tests();
+}
+
 fn test_state() -> Db {
     install_security_bypass_for_legacy_tests();
     // #3498 battery: isolated handler slices must install the network gate
@@ -86,7 +97,7 @@ fn test_state() -> Db {
     // (403). `test_app_state` pins the permissive posture for the process;
     // pin it here too so a test that skips it does not depend on a sibling
     // having run first (nextest runs each test in its own process).
-    crate::identity::attest::permissive_attestation_for_lib_tests();
+    pin_permissive_attestation();
     let conn = db::open(std::path::Path::new(":memory:")).unwrap();
     let path = std::path::PathBuf::from(":memory:");
     Arc::new(Mutex::new((conn, path, ResolvedTtl::default(), true)))
@@ -419,7 +430,7 @@ pub(super) fn test_app_state(db: Db) -> AppState {
     // attestation opt-out so the unsigned HTTP create fixtures below
     // keep exercising their actual subject matter (required-default
     // rejection is covered by `tests/agent_attestation_integrity.rs`).
-    crate::identity::attest::permissive_attestation_for_lib_tests();
+    pin_permissive_attestation();
     // v0.7.0 Wave-3 — test helper. Test fixtures use `:memory:`
     // SQLite for the legacy `db` field (no on-disk path) so the
     // trait-routed `store` field is set to a separate SqliteStore
