@@ -361,8 +361,8 @@ def is_ephemeral_base(name: str) -> bool:
         return False
     run, attempt, leg = parts
     return (_ascii_digits(run, EPHEMERAL_RUN_MAX) and _ascii_digits(attempt, EPHEMERAL_ATTEMPT_MAX)
-            and 1 <= len(leg) <= EPHEMERAL_LEG_MAX and all(ch in EPHEMERAL_LEG_CHARS for ch in leg)
-            and any(ch != '_' for ch in leg))
+            and len(leg) <= EPHEMERAL_LEG_MAX and all(ch in EPHEMERAL_LEG_CHARS for ch in leg)
+            and any(ch != '_' for ch in leg))  # also refuses an empty leg
 
 
 def checked_base(db_name: str, allow_shared: Optional[str] = None) -> str:

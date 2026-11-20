@@ -103,6 +103,8 @@ URL_KEY = ('unsupported URL query key (supported: application_name, connect_time
            'sslkey, sslmode, sslrootcert, target_session_attrs)')
 URL_SSLMODE = 'the URL sslmode is not one of allow, disable, prefer, require, verify-ca, verify-full'
 URL_MULTI_HOST = 'multi-host URLs are not supported'
+URL_OPTIONS_BACKSLASH = ("the URL query key 'options' ends in an unescaped backslash; end it with a value character "
+                         "or double the backslash")
 READ_FAILED = 'cannot read %r (%s)'
 # S3: the watermark is read only from a table
 WATERMARK_RELKIND = ('refusing base database %r: lineage_integrity_watermark in schema %s is not a table (relkind %r); '
@@ -704,6 +706,8 @@ MARKER_URLS = (                                      # (URL, the one refusal lin
     ('postgres://%s127.0.0.1:5445/%s;x' % (PW, MARKER), URL_DB_UNSAFE),
     ('postgres://%s127.0.0.1:5445/%s%%22' % (PW, EPHEMERAL), URL_DB_UNSAFE),
     ('postgres://%sh1:5445,h2:5445/%s' % (PW, EPHEMERAL), URL_MULTI_HOST),
+    (EPHEMERAL_URL + '&options=-c%%20x%%3D%s%%5C' % MARKER, URL_OPTIONS_BACKSLASH),
+    (EPHEMERAL_URL + '&options=%s%%5C%%5C%%5C' % MARKER, URL_OPTIONS_BACKSLASH),
 )
 
 
@@ -734,12 +738,27 @@ class MarkerPasswordP1(Base):
                         self.assertOutcome(got, EXIT_USAGE, [refusal])
                         self.assertEqual(pg.log, [], 'a URL refusal comes before any SQL')
 
+    def test_an_escaped_trailing_backslash_in_options_is_accepted_9689(self):
+        # an even run of trailing backslashes is escaped text, not an open escape: accepted as is
+        _db, env = pib._parsed_url(EPHEMERAL_URL + '&options=-c%20x%3Dy%5C%5C')
+        self.assertEqual(env['PGOPTIONS'], '-c x=y\\\\')
+
     def test_a_missing_targets_file_is_a_refusal_9689(self):
         missing = SCRATCH / 'missing-targets-9689.txt'
         pg = HygienePg()
         got = run_main(['run', '--url', EPHEMERAL_URL, '--run-id', RUN, '--template', EPHEMERAL_TPL,
                         '--targets-file', str(missing), '--', 'cargo', 'test'], pg, env={pib.FLAG_VAR: '1'})
         self.assertOutcome(got, EXIT_USAGE, [READ_FAILED % (str(missing), 'No such file or directory')])
+        self.assertEqual(pg.log, [])
+
+    def test_an_unexpected_error_outside_setup_and_teardown_is_one_line_and_exit_2_c1(self):
+        # main() catches every type: a non-wrapper error on the run path is one line and exit 2, never a traceback
+        pg = HygienePg()
+        with unittest.mock.patch.object(pib, 'read_lines', side_effect=RuntimeError('v9686')):
+            got = run_main(['run', '--url', EPHEMERAL_URL, '--run-id', RUN, '--template', EPHEMERAL_TPL,
+                            '--targets-file', str(SCRATCH / 'any-9686.txt'), '--', 'cargo', 'test'], pg,
+                           env={pib.FLAG_VAR: '1'})
+        self.assertOutcome(got, EXIT_USAGE, ['unexpected RuntimeError: v9686'])
         self.assertEqual(pg.log, [])
 
     def test_url_validation_is_linear_on_a_100k_url_9689(self):
