@@ -47,6 +47,61 @@ const SYNC_SINCE_PEER_MISMATCH: &str = "sync_since_peer_mismatch";
 const SYNC_SINCE_PEER_MISMATCH_NOTE: &str = "a /sync/since pull may record only its own sync clock: \
      `peer` and `X-Agent-Id`, when present, must equal the authenticated peer id";
 
+/// #9665 — `error` tag of the 400 a `/sync/since` request gets when its
+/// `X-Agent-Id` header cannot be read as exactly one value.
+const SYNC_SINCE_AGENT_ID_UNREADABLE: &str = "sync_since_agent_id_unreadable";
+/// #9665 — `note` carried by that refusal.
+const SYNC_SINCE_AGENT_ID_UNREADABLE_NOTE: &str = "send X-Agent-Id at most once, as visible ASCII; \
+     an empty value counts as absent";
+/// #9665 — `reason` of that refusal: the header was sent more than once.
+const AGENT_ID_REASON_REPEATED: &str = "repeated";
+/// #9665 — `reason` of that refusal: the value is not visible ASCII.
+const AGENT_ID_REASON_NOT_VISIBLE_ASCII: &str = "not_visible_ascii";
+
+/// #9665 / #9596 — the ONE reader of `X-Agent-Id` on this route, shared by
+/// the clock-field check and the visibility caller ladder so the two can
+/// never read different values.
+///
+/// - absent, or one empty value: `Ok(None)`. An empty value counts as
+///   absent, exactly as `identity::resolve_http_agent_id` treats it
+///   (#9656 owns the fleet-wide empty-header question).
+/// - one visible-ASCII value: `Ok(Some(value))`.
+/// - a repeated header, or a value that is not visible ASCII: a 400 with
+///   the exact `sync_since_agent_id_unreadable` tag. Pre-fix the raw
+///   `get(..).to_str().ok()` read silently dropped such a value (or kept
+///   only the first copy), so the request was served as if the header
+///   said something it did not.
+fn read_agent_id_header(headers: &HeaderMap) -> Result<Option<&str>, axum::response::Response> {
+    let mut values = headers.get_all(crate::HEADER_AGENT_ID).iter();
+    let Some(first) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(agent_id_unreadable(AGENT_ID_REASON_REPEATED));
+    }
+    let Ok(text) = first.to_str() else {
+        return Err(agent_id_unreadable(AGENT_ID_REASON_NOT_VISIBLE_ASCII));
+    };
+    Ok((!text.is_empty()).then_some(text))
+}
+
+fn agent_id_unreadable(reason: &'static str) -> axum::response::Response {
+    tracing::warn!(
+        target: crate::federation::SCOPE_TRACE_TARGET,
+        reason,
+        "sync_since: refusing a pull whose X-Agent-Id cannot be read as one value (#9665)"
+    );
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "error": SYNC_SINCE_AGENT_ID_UNREADABLE,
+            "reason": reason,
+            "note": SYNC_SINCE_AGENT_ID_UNREADABLE_NOTE,
+        })),
+    )
+        .into_response()
+}
+
 /// #9596 — the peer a `/sync/since` request is authenticated as. Built only
 /// by [`authenticated_pull_peer`], so holding one proves the id came from a
 /// verified signature or a cert binding, never from a bare request field.
@@ -243,10 +298,12 @@ pub async fn sync_since(
     // #9596 — the durable sync clock this pull may record is keyed on the
     // AUTHENTICATED peer only. A clock-writing request whose `?peer=` or
     // `X-Agent-Id` names anyone else is refused here, before either backend
-    // runs, never silently re-keyed.
-    let header_agent_id = headers
-        .get(crate::HEADER_AGENT_ID)
-        .and_then(|v| v.to_str().ok());
+    // runs, never silently re-keyed. #9665 — the header is read once, fail
+    // closed, by `read_agent_id_header`.
+    let header_agent_id = match read_agent_id_header(&headers) {
+        Ok(value) => value,
+        Err(refusal) => return refusal,
+    };
     let authn_peer = authenticated_pull_peer(
         cert_peer.as_ref().map(|e| &e.0),
         sig_outcome,
@@ -319,12 +376,7 @@ pub async fn sync_since(
         .as_ref()
         .and_then(|e| e.0.effective_agent_id())
         .or_else(|| peer_header.as_deref().filter(|s| !s.is_empty()))
-        .or_else(|| {
-            headers
-                .get(crate::HEADER_AGENT_ID)
-                .and_then(|v| v.to_str().ok())
-                .filter(|s| !s.is_empty())
-        })
+        .or(header_agent_id)
         .unwrap_or("")
         .to_string();
 
@@ -559,7 +611,9 @@ pub async fn sync_since(
         && let Some(watermark) = next_since.as_deref()
         && let Err(e) = db::sync_state_observe(&lock.0, peer, peer, watermark)
     {
-        tracing::debug!("sync_since: sync_state_observe failed: {e}");
+        // #9596 — WARN, like the `/sync/push` and catch-up clock writes: the
+        // pull is served, but the durable record of it is missing.
+        tracing::warn!("sync_since: sync_state_observe failed: {e}");
     }
 
     // S39 diagnostic echo (v0.6.2). The testbook scenario writes 6 rows
@@ -813,5 +867,97 @@ mod authenticated_pull_peer_9596_tests {
             );
         }
         assert_eq!(SYNC_SINCE_PEER_MISMATCH, "sync_since_peer_mismatch");
+    }
+}
+
+#[cfg(test)]
+mod read_agent_id_header_9665_tests {
+    use super::{
+        AGENT_ID_REASON_NOT_VISIBLE_ASCII, AGENT_ID_REASON_REPEATED,
+        SYNC_SINCE_AGENT_ID_UNREADABLE, read_agent_id_header,
+    };
+    use axum::http::{HeaderMap, HeaderValue, StatusCode};
+
+    const P: &str = "ai:peer-alice";
+    const Q: &str = "ai:peer-victim";
+    /// A long value: the reader is one pass over the header list, so a
+    /// header far past any agent-id length is read once, never rescanned.
+    const LONG_VALUE_LEN: usize = 100_000;
+    const BODY_CAP: usize = 64 * 1024;
+    /// `é` in UTF-8: readable bytes, but not visible ASCII.
+    const NON_ASCII: &[u8] = b"\xc3\xa9";
+
+    fn headers(values: &[&[u8]]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for v in values {
+            map.append(
+                crate::HEADER_AGENT_ID,
+                HeaderValue::from_bytes(v).expect("header value"),
+            );
+        }
+        map
+    }
+
+    /// Every accepted shape and the value the route reads from it.
+    #[test]
+    fn accepted_agent_id_header_shapes_9665() {
+        let long = "a".repeat(LONG_VALUE_LEN);
+        let padded = format!(" {P} ");
+        let cases: &[(&[&[u8]], Option<&str>)] = &[
+            (&[], None),
+            // #9656: empty counts as absent, as in resolve_http_agent_id.
+            (&[b""], None),
+            (&[P.as_bytes()], Some(P)),
+            // read verbatim; a padded value never equals the trimmed id,
+            // so the clock check refuses it rather than re-keying it.
+            (&[padded.as_bytes()], Some(padded.as_str())),
+            (&[long.as_bytes()], Some(long.as_str())),
+        ];
+        for &(values, want) in cases {
+            let map = headers(values);
+            let got = read_agent_id_header(&map);
+            assert_eq!(
+                got.as_ref().ok().copied(),
+                Some(want),
+                "values={values:?} must be accepted as {want:?}"
+            );
+        }
+    }
+
+    /// Every unreadable shape is a 400 with the exact tag and reason.
+    #[tokio::test]
+    async fn unreadable_agent_id_header_is_refused_9665() {
+        let cases: &[(&[&[u8]], &str)] = &[
+            (&[P.as_bytes(), P.as_bytes()], AGENT_ID_REASON_REPEATED),
+            (&[P.as_bytes(), Q.as_bytes()], AGENT_ID_REASON_REPEATED),
+            (&[Q.as_bytes(), P.as_bytes()], AGENT_ID_REASON_REPEATED),
+            (&[b"", P.as_bytes()], AGENT_ID_REASON_REPEATED),
+            (&[NON_ASCII], AGENT_ID_REASON_NOT_VISIBLE_ASCII),
+        ];
+        for &(values, reason) in cases {
+            let map = headers(values);
+            let Err(resp) = read_agent_id_header(&map) else {
+                panic!("values={values:?} must be refused");
+            };
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "values={values:?}");
+            let bytes = axum::body::to_bytes(resp.into_body(), BODY_CAP)
+                .await
+                .expect("body");
+            let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json body");
+            assert_eq!(
+                body["error"].as_str(),
+                Some(SYNC_SINCE_AGENT_ID_UNREADABLE),
+                "values={values:?} body={body}"
+            );
+            assert_eq!(
+                body["reason"].as_str(),
+                Some(reason),
+                "values={values:?} body={body}"
+            );
+        }
+        assert_eq!(
+            SYNC_SINCE_AGENT_ID_UNREADABLE,
+            "sync_since_agent_id_unreadable"
+        );
     }
 }

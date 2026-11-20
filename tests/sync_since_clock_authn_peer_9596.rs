@@ -17,7 +17,18 @@
 //!      tag and writes NO `sync_state` row;
 //!   2. a request with no authenticated peer writes NO `sync_state` row
 //!      (the pull itself is served as before);
-//!   3. a request authenticated as P that names only P records `(P, P)`.
+//!   3. a request authenticated as P that names only P records `(P, P)`
+//!      with the pulled watermark as its value;
+//!   4. an `X-Agent-Id` that cannot be read as one value is refused with
+//!      the exact `sync_since_agent_id_unreadable` tag (#9665); an empty
+//!      value counts as absent, and an absent id is unauthenticated and
+//!      served (#9656);
+//!   5. a failed clock write is logged at WARN and the pull is still served.
+//!
+//! Peer authentication has two paths, each with its own rows here so a
+//! broken path is caught without the unit tests: the signature gate
+//! (including its unenrolled-peer rollout arm, which authenticates no one)
+//! and the mTLS cert binding (bound to exactly the asserted id, or not).
 //!
 //! The fixture is the real production router (`ai_memory::build_router`)
 //! with an enrolled Ed25519 peer key, signing the canonical GET bytes the
@@ -29,10 +40,10 @@
 #![allow(clippy::await_holding_lock)]
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use axum::body::Body;
-use axum::http::{Request, StatusCode};
+use axum::http::{HeaderValue, Request, StatusCode};
 use serde_json::Value;
 use tempfile::TempDir;
 use tokio::sync::Mutex;
@@ -45,6 +56,7 @@ use ai_memory::federation::signing::{
 };
 use ai_memory::handlers::{ApiKeyState, AppState, Db, StorageBackend};
 use ai_memory::identity::keypair as kp_mod;
+use ai_memory::tls::{ClientCertPeerId, FED_CERT_PEER_BINDING_ENV};
 
 /// The enrolled, signing peer.
 const ALICE: &str = "ai:peer-alice";
@@ -58,6 +70,21 @@ const MISMATCH_TAG: &str = "sync_since_peer_mismatch";
 const KEY_DIR_ENV: &str = "AI_MEMORY_KEY_DIR";
 const REQUIRE_ENROLLMENT_ENV: &str = "AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT";
 const TRUST_PEER_ENV: &str = "AI_MEMORY_FED_SYNC_TRUST_PEER";
+/// The rollout escape hatch of the GET signature gate: an unenrolled peer
+/// is served unsigned (the crate constant is `pub(crate)`).
+const ALLOW_UNENROLLED_ENV: &str = "AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS";
+/// Cert-binding posture that logs a mismatch and proceeds, so the handler's
+/// own authentication decision is what the row observes.
+const CERT_BINDING_WARN: &str = "warn";
+const AGENT_ID_UNREADABLE_TAG: &str = "sync_since_agent_id_unreadable";
+const AGENT_ID_REASON_REPEATED: &str = "repeated";
+const AGENT_ID_REASON_NOT_VISIBLE_ASCII: &str = "not_visible_ascii";
+/// UTF-8 for `é`: not visible ASCII, so `HeaderValue::to_str` refuses it.
+const NON_ASCII_AGENT_ID: &[u8] = b"ai:peer-\xc3\xa9";
+/// The exact WARN line prefix of a failed clock write.
+const CLOCK_WRITE_WARN: &str = "sync_since: sync_state_observe failed: ";
+/// Message the trigger below raises, so the WARN line can be matched whole.
+const CLOCK_WRITE_REFUSAL: &str = "clock write refused by test trigger 9596";
 /// Both peers may pull `public/*`, so the scope gate never short-circuits
 /// before the clock write.
 const ALLOWLIST: &str = r#"{"ai:peer-alice":{"allowed_namespaces":["public/*"]},"ai:peer-victim":{"allowed_namespaces":["public/*"]}}"#;
@@ -108,6 +135,8 @@ fn clear_posture() {
             TRUST_PEER_ENV,
             PEER_ATTESTATION_ENV,
             KEY_DIR_ENV,
+            ALLOW_UNENROLLED_ENV,
+            FED_CERT_PEER_BINDING_ENV,
         ] {
             std::env::remove_var(var);
         }
@@ -115,6 +144,12 @@ fn clear_posture() {
 }
 
 fn setup() -> Fixture {
+    setup_with_cert(None)
+}
+
+/// The fixture, with the request carrying `cert` as the mTLS client-cert
+/// binding when `Some` (the extension the peer-binding acceptor inserts).
+fn setup_with_cert(cert: Option<ClientCertPeerId>) -> Fixture {
     let db_tmp = tempfile::NamedTempFile::new().expect("db tempfile");
     let db_path = db_tmp.path().to_path_buf();
     let seed_conn = ai_memory::db::open(&db_path).expect("db::open");
@@ -212,8 +247,13 @@ fn setup() -> Fixture {
         ),
         http_identity_mode: ai_memory::config::HttpIdentityMode::default(),
     };
+    let router = ai_memory::build_router(api_key_state, app_state);
+    let router = match cert {
+        Some(binding) => router.layer(axum::Extension(binding)),
+        None => router,
+    };
     Fixture {
-        router: ai_memory::build_router(api_key_state, app_state),
+        router,
         alice,
         db_path,
         _db_tmp: db_tmp,
@@ -248,14 +288,30 @@ async fn pull(
     agent_id_header: Option<&str>,
     sign_as_alice: bool,
 ) -> (StatusCode, Value) {
+    let agent_values: Vec<HeaderValue> = agent_id_header
+        .map(|a| HeaderValue::from_str(a).expect("agent header value"))
+        .into_iter()
+        .collect();
+    pull_raw(host, query, peer_id_header, &agent_values, sign_as_alice).await
+}
+
+/// One pull sending every value in `agent_values` as its own `X-Agent-Id`
+/// header line (none, one, or a repeated header).
+async fn pull_raw(
+    host: &Fixture,
+    query: &str,
+    peer_id_header: Option<&str>,
+    agent_values: &[HeaderValue],
+    sign_as_alice: bool,
+) -> (StatusCode, Value) {
     let mut builder = Request::builder()
         .method("GET")
         .uri(format!("{SYNC_SINCE_PATH}?{query}"));
     if let Some(p) = peer_id_header {
         builder = builder.header(PEER_ID_HEADER, p);
     }
-    if let Some(a) = agent_id_header {
-        builder = builder.header(ai_memory::HEADER_AGENT_ID, a);
+    for a in agent_values {
+        builder = builder.header(ai_memory::HEADER_AGENT_ID, a.clone());
     }
     if sign_as_alice {
         let priv_key = host.alice.private.as_ref().expect("alice has private key");
@@ -346,6 +402,10 @@ const UNAUTHENTICATED_CASES: &[(Option<&str>, Option<&str>, Option<&str>)] = &[
     (Some(VICTIM), Some(VICTIM), Some(SERVER)),
     (Some(ALICE), Some(ALICE), Some(ALICE)),
     (Some(VICTIM), Some(VICTIM), Some(VICTIM)),
+    // #9656 — an empty `X-Agent-Id` counts as absent, and an absent id is
+    // unauthenticated: served, no clock.
+    (Some(ALICE), Some(ALICE), Some("")),
+    (Some(ALICE), Some(ALICE), None),
 ];
 
 #[tokio::test(flavor = "current_thread")]
@@ -398,7 +458,8 @@ async fn unsigned_pull_from_enrolled_peer_is_refused_and_writes_no_clock_9596() 
 /// The authenticated peer naming only itself: with and without the
 /// optional `X-Agent-Id` header (both production pullers send it equal to
 /// `X-Peer-Id`).
-const OWN_CLOCK_AGENT_HEADERS: &[Option<&str>] = &[Some(ALICE), None];
+/// An empty value counts as absent (#9656), so it records the clock too.
+const OWN_CLOCK_AGENT_HEADERS: &[Option<&str>] = &[Some(ALICE), None, Some("")];
 
 #[tokio::test(flavor = "current_thread")]
 async fn authenticated_peer_records_only_its_own_clock_9596() {
@@ -421,10 +482,11 @@ async fn authenticated_peer_records_only_its_own_clock_9596() {
             "#9596: the clock is keyed (authenticated peer, authenticated peer); \
              agent={agent_header:?} body={body}"
         );
-        assert!(
-            watermarks.entries.contains_key(ALICE),
-            "#9596: the recorded watermark is readable under the authenticated peer; \
-             agent={agent_header:?}"
+        assert_eq!(
+            watermarks.entries.get(ALICE).map(String::as_str),
+            Some(SEED_UPDATED_AT),
+            "#9596: the recorded watermark is the pulled row's timestamp, under the \
+             authenticated peer; agent={agent_header:?}"
         );
     }
 }
@@ -442,4 +504,235 @@ async fn pull_without_peer_param_writes_no_clock_9596() {
     clear_posture();
     assert_eq!(status, StatusCode::OK, "body={body}");
     assert_eq!(rows, Vec::<(String, String)>::new(), "body={body}");
+}
+
+/// #9665 — `X-Agent-Id` values that cannot be read as exactly one value:
+/// `(header values, exact reason)`. Each is refused before the clock check.
+fn unreadable_agent_id_cases() -> Vec<(Vec<HeaderValue>, &'static str)> {
+    vec![
+        (
+            vec![
+                HeaderValue::from_static(ALICE),
+                HeaderValue::from_static(ALICE),
+            ],
+            AGENT_ID_REASON_REPEATED,
+        ),
+        (
+            vec![
+                HeaderValue::from_static(ALICE),
+                HeaderValue::from_static(VICTIM),
+            ],
+            AGENT_ID_REASON_REPEATED,
+        ),
+        (
+            vec![
+                HeaderValue::from_static(""),
+                HeaderValue::from_static(ALICE),
+            ],
+            AGENT_ID_REASON_REPEATED,
+        ),
+        (
+            vec![HeaderValue::from_bytes(NON_ASCII_AGENT_ID).expect("opaque header bytes")],
+            AGENT_ID_REASON_NOT_VISIBLE_ASCII,
+        ),
+    ]
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn unreadable_agent_id_is_refused_and_writes_no_clock_9665() {
+    let _g = env_lock();
+    for (values, reason) in unreadable_agent_id_cases() {
+        set_posture(true);
+        let host = setup();
+        let query = query_for(Some(ALICE));
+        let (status, body) = pull_raw(&host, &query, Some(ALICE), &values, true).await;
+        let rows = clock_rows(&host);
+        clear_posture();
+        assert_eq!(
+            rows,
+            Vec::<(String, String)>::new(),
+            "#9665: values={values:?} must write no clock row; body={body}"
+        );
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "#9665: values={values:?} must be refused; body={body}"
+        );
+        assert_eq!(
+            body["error"].as_str(),
+            Some(AGENT_ID_UNREADABLE_TAG),
+            "#9665: exact tag; values={values:?} body={body}"
+        );
+        assert_eq!(
+            body["reason"].as_str(),
+            Some(reason),
+            "#9665: exact reason; values={values:?} body={body}"
+        );
+    }
+}
+
+/// The GET signature gate's rollout arm: `REQUIRE_SIG=1`, an unenrolled
+/// peer sending no signature is served because enrollment is not required
+/// or the unenrolled escape hatch is open. `(require_enrollment,
+/// allow_unenrolled)`. Neither authenticates the peer, so no clock row.
+const ROLLOUT_POSTURES: &[(bool, bool)] = &[(false, false), (true, true)];
+
+#[tokio::test(flavor = "current_thread")]
+async fn rollout_arm_serves_an_unenrolled_peer_without_recording_its_clock_9596() {
+    let _g = env_lock();
+    for &(require_enrollment, allow_unenrolled) in ROLLOUT_POSTURES {
+        set_posture(true);
+        // SAFETY: env mutation under `env_lock()` (see `set_posture`).
+        unsafe {
+            std::env::set_var(
+                REQUIRE_ENROLLMENT_ENV,
+                if require_enrollment { "1" } else { "0" },
+            );
+            if allow_unenrolled {
+                std::env::set_var(ALLOW_UNENROLLED_ENV, "1");
+            }
+        }
+        let host = setup();
+        let query = query_for(Some(VICTIM));
+        let (status, body) = pull(&host, &query, Some(VICTIM), Some(VICTIM), false).await;
+        let rows = clock_rows(&host);
+        clear_posture();
+        assert_eq!(
+            rows,
+            Vec::<(String, String)>::new(),
+            "#9596: the rollout arm authenticates no one (require_enrollment=\
+             {require_enrollment} allow_unenrolled={allow_unenrolled}); body={body}"
+        );
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "#9596: the rollout arm still serves the pull; body={body}"
+        );
+        assert_eq!(body["count"].as_u64(), Some(1), "body={body}");
+    }
+}
+
+/// `sync_state` rows as `(agent_id, peer_id)`.
+type ClockRows = Vec<(String, String)>;
+
+/// The mTLS cert path, signatures off: `(cert binding, X-Peer-Id, expected
+/// clock rows)`. Only a cert bound to exactly the asserted id authenticates.
+fn cert_binding_cases() -> Vec<(ClientCertPeerId, &'static str, ClockRows)> {
+    vec![
+        (
+            ClientCertPeerId(Some(ALICE.to_string())),
+            ALICE,
+            vec![(ALICE.to_string(), ALICE.to_string())],
+        ),
+        // bound to another id: the warn posture proceeds, unauthenticated
+        (
+            ClientCertPeerId(Some(VICTIM.to_string())),
+            ALICE,
+            Vec::new(),
+        ),
+        // a cert with no binding authenticates no one
+        (ClientCertPeerId(None), ALICE, Vec::new()),
+    ]
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cert_bound_to_exactly_the_asserted_peer_records_its_clock_9596() {
+    let _g = env_lock();
+    for (binding, peer_header, want) in cert_binding_cases() {
+        set_posture(false);
+        // SAFETY: env mutation under `env_lock()` (see `set_posture`).
+        unsafe {
+            std::env::set_var(FED_CERT_PEER_BINDING_ENV, CERT_BINDING_WARN);
+        }
+        let label = format!("{binding:?}");
+        let host = setup_with_cert(Some(binding));
+        let query = query_for(Some(peer_header));
+        let (status, body) = pull(&host, &query, Some(peer_header), Some(peer_header), false).await;
+        let rows = clock_rows(&host);
+        clear_posture();
+        assert_eq!(status, StatusCode::OK, "cert={label}; body={body}");
+        assert_eq!(
+            rows, want,
+            "#9596: cert={label} x-peer-id={peer_header} must record exactly {want:?}; body={body}"
+        );
+    }
+}
+
+#[derive(Clone, Default)]
+struct LogSink(Arc<StdMutex<Vec<u8>>>);
+
+impl std::io::Write for LogSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogSink {
+    type Writer = LogSink;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+impl LogSink {
+    fn text(&self) -> String {
+        String::from_utf8_lossy(
+            &self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+        .into_owned()
+    }
+}
+
+/// A clock write that fails is logged at WARN with the exact message, and
+/// the pull is still served. A trigger makes the `sync_state` insert fail.
+#[tokio::test(flavor = "current_thread")]
+async fn failed_clock_write_is_logged_at_warn_9596() {
+    let _g = env_lock();
+    set_posture(true);
+    let host = setup();
+    {
+        let conn = ai_memory::db::open(&host.db_path).expect("reopen for trigger");
+        conn.execute_batch(&format!(
+            "CREATE TRIGGER clock_write_refused_9596 BEFORE INSERT ON sync_state \
+             BEGIN SELECT RAISE(ABORT, '{CLOCK_WRITE_REFUSAL}'); END;"
+        ))
+        .expect("create trigger");
+    }
+    let sink = LogSink::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(sink.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::INFO)
+        .finish();
+    let guard = tracing::subscriber::set_default(subscriber);
+    let query = query_for(Some(ALICE));
+    let (status, body) = pull(&host, &query, Some(ALICE), Some(ALICE), true).await;
+    drop(guard);
+    let rows = clock_rows(&host);
+    clear_posture();
+    let logs = sink.text();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the pull is still served; body={body}"
+    );
+    assert_eq!(rows, Vec::<(String, String)>::new(), "body={body}");
+    let line = logs
+        .lines()
+        .find(|l| l.contains(CLOCK_WRITE_WARN))
+        .unwrap_or_else(|| panic!("#9596: no clock-write log line; logs:\n{logs}"));
+    assert!(
+        line.contains(" WARN ") && line.contains(CLOCK_WRITE_REFUSAL),
+        "#9596: the failed clock write is logged at WARN with its cause; line: {line}"
+    );
 }
