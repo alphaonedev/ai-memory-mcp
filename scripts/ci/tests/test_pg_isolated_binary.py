@@ -2625,5 +2625,143 @@ class ConnectTimeout7866(unittest.TestCase):
             self.assertLess(len(str(caught.exception)), 1000)
 
 
+class Admission9592(unittest.TestCase):
+    """#9592 / PR 8230 defect 1: the budget is re-read for every clone and in-flight clones are reserved."""
+
+    NEED = pib.PER_BINARY_CONNECTIONS + pib.HOLD_CONNECTIONS
+
+    def make(self, free, own=0, wait_secs=30.0):
+        self.reads = []
+        clock = iter(float(t) for t in range(0, 10_000))
+
+        def budget(url):
+            self.reads.append(url)
+            return (1000, 3, 1000 - 3 - free, free)
+        self.stop = threading.Event()
+        return pib.Admission(BASE, RUN, self.stop, budget=budget, own=lambda url: own, wait_secs=wait_secs,
+                             poll=0.0, clock=lambda: next(clock))
+
+    def test_every_admission_re_reads_the_budget(self):
+        adm = self.make(free=1000)
+        adm.acquire()
+        adm.acquire()
+        self.assertEqual(len(self.reads), 2)
+
+    def test_in_flight_clones_are_reserved_until_they_connect(self):
+        adm = self.make(free=2 * self.NEED + pib.CONNECTION_HEADROOM)
+        adm.acquire()
+        adm.acquire()
+        with self.assertRaises(pib.WrapperError) as caught:
+            adm.acquire()
+        self.assertEqual(str(caught.exception),
+                         'no connection budget for another clone after 30s '
+                         '(free=58, reserved for in-flight clones=38, need=39)')
+        self.assertEqual(adm.in_flight, 2)
+
+    def test_release_returns_the_reservation(self):
+        adm = self.make(free=self.NEED + pib.CONNECTION_HEADROOM + 1)
+        adm.acquire()
+        adm.release()
+        adm.acquire()
+        self.assertEqual(adm.in_flight, 1)
+
+    def test_sessions_the_clones_already_hold_are_not_reserved_twice(self):
+        adm = self.make(free=self.NEED + pib.CONNECTION_HEADROOM, own=2 * self.NEED)
+        adm.in_flight = 2
+        adm.acquire()
+        self.assertEqual(adm.in_flight, 3)
+
+    def test_a_stop_ends_the_wait(self):
+        adm = self.make(free=0)
+        self.stop.set()
+        with self.assertRaises(pib.WrapperError) as caught:
+            adm.acquire()
+        self.assertEqual(str(caught.exception), 'stopped before a connection slot was admitted')
+
+    def test_run_one_without_budget_fails_closed_before_minting(self):
+        r = runner()
+        r.admit = self.make(free=0, wait_secs=1.0)
+        with Patched() as rec:
+            rc = r.run_one(['--test', 'foo_9592'], isolate=True)
+        self.assertEqual(rc, pib.EXIT_MINT)
+        self.assertEqual(FakePopen.cargo(), [])
+        self.assertFalse(any(s.startswith('CREATE DATABASE') for s in rec.sql()))
+        self.assertEqual(r.admit.in_flight, 0)
+
+    def test_run_one_releases_its_slot(self):
+        r = runner()
+        r.admit = self.make(free=1000)
+        with Patched():
+            self.assertEqual(r.run_one(['--test', 'foo_9592'], isolate=True), 0)
+        self.assertEqual(r.admit.in_flight, 0)
+        self.assertEqual(len(self.reads), 1)
+
+    def test_residual_binaries_take_no_slot(self):
+        r = runner()
+        r.admit = self.make(free=0)
+        with Patched():
+            self.assertEqual(r.run_one(['--test', 'res_9592'], isolate=False), 0)
+        self.assertEqual(self.reads, [])
+
+    def test_own_session_sql_is_scoped_to_this_run(self):
+        with Patched(Recorder(lambda a, k: Result(0, '4\n'))) as rec:
+            self.assertEqual(pib.own_sessions(BASE, RUN), 4)
+        self.assertEqual(rec.sql()[-1], "SELECT count(*) FROM pg_stat_activity WHERE starts_with(datname, '%s')"
+                         % pib.run_prefix(RUN))
+
+    def test_cmd_run_installs_the_admission(self):
+        seen = []
+        d = scratch_dir()
+        targets = Path(d) / 'targets.txt'
+        targets.write_text('--test foo_9592\n')
+        env = {pib.FLAG_VAR: '1', pib.URL_VAR: BASE}
+        with Patched(), unittest.mock.patch.dict(os.environ, env), \
+                unittest.mock.patch.object(pib.Runner, 'run_all', lambda self, t, r: seen.append(self) or 0), \
+                unittest.mock.patch.object(pib.signal, 'signal'):
+            rc = pib.main(['run', '--run-id', RUN, '--template', TPL, '--log-dir', d, '--targets-file',
+                           str(targets), '--', 'cargo', 'test'])
+        self.assertEqual(rc, 0)
+        self.assertIsInstance(seen[0].admit, pib.Admission)
+
+
+class Evidence9592(unittest.TestCase):
+    """#9592 I-6: each per-binary log opens with the database the binary runs on."""
+
+    def test_isolated_log_names_the_clone(self):
+        d = scratch_dir()
+        r = runner(log_dir=d)
+
+        def answer(argv, kw):
+            sql = argv[-1] if '-c' in argv else ''
+            if sql == 'SELECT current_database()':
+                return Result(0, kw['env']['PGDATABASE'] + '\n')
+            return default_answer(argv, kw)
+        with Patched(Recorder(answer)):
+            r.run_one(['--test', 'foo_9592'], isolate=True)
+        minted = pib.database_name(FakePopen.cargo()[0].kw['env'][pib.URL_VAR])
+        first = (Path(d) / 'foo_9592.log').read_text().splitlines()[0]
+        self.assertEqual(first, '# [pg_isolated_binary] current_database=%s mode=isolated' % minted)
+
+    def test_unreadable_database_is_marked_unknown(self):
+        d = scratch_dir()
+        r = runner(log_dir=d)
+        with Patched():
+            r.run_one(['--test', 'foo_9592'], isolate=True)
+        first = (Path(d) / 'foo_9592.log').read_text().splitlines()[0]
+        self.assertEqual(first, '# [pg_isolated_binary] current_database=<unknown> mode=isolated')
+
+    def test_residual_log_names_the_shared_database_without_sql(self):
+        d = scratch_dir()
+        r = runner(log_dir=d)
+        with Patched() as rec:
+            r.run_one(['--test', 'res_9592'], isolate=False)
+        self.assertEqual(rec.sql(), [])
+        text = (Path(d) / 'res_9592.log').read_text()
+        self.assertEqual(text.splitlines()[0], '# [pg_isolated_binary] current_database=%s mode=residual'
+                         % pib.database_name(BASE))
+        self.assertNotIn('pw@', text)
+        self.assertNotIn('postgres://', text)
+
+
 if __name__ == '__main__':
     unittest.main()
