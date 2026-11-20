@@ -1476,7 +1476,11 @@ mod tests {
             let back: serde_json::Value = serde_json::from_str(&safe).expect("parse");
             assert_eq!(back, value, "U+{cp:04X}");
         }
-        assert!(raw.is_empty(), "{} reach the terminal raw: {raw:?}", raw.len());
+        assert!(
+            raw.is_empty(),
+            "{} reach the terminal raw: {raw:?}",
+            raw.len()
+        );
     }
 
     /// #9636 — `ai-memory verify` text mode prints each code point of the

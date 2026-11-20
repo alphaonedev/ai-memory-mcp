@@ -354,7 +354,9 @@ mod hidden_char_list_ratchet_9636_tests {
                 .find(|(file, _)| *file == rel)
                 .map_or(0, |&(_, count)| count);
             if got > allowed {
-                extra.push(format!("{rel}: {got} hidden-char list members (allowed {allowed})"));
+                extra.push(format!(
+                    "{rel}: {got} hidden-char list members (allowed {allowed})"
+                ));
             }
         }
         assert!(one_list_members > 0, "{ONE_LIST_FILE} holds no list");
