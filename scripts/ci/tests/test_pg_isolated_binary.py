@@ -2281,6 +2281,8 @@ class CiLiveCells(unittest.TestCase):
         self.assertIn("matrix.tier == 'enterprise-fed'", step)
         self.assertIn('AI_MEMORY_TEST_PG_LIVE_REQUIRED: "1"', step)
         self.assertIn('test_pg_isolated_binary.LiveEndToEnd', step)
+        # B1: the real-server hygiene cells run here too; with LIVE_REQUIRED=1 a missing server fails them
+        self.assertIn('test_pg_isolated_binary_hygiene_6983.LiveHygiene', step)
 
 
 class NoShell(unittest.TestCase):

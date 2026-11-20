@@ -16,7 +16,6 @@ Offline cells replace ``subprocess.run`` with a small stateful server (``Hygiene
 argv, so every assertion is an exact exit code plus the exact ``pg_isolated_binary:`` stderr lines. ``LiveHygiene``
 runs the real script against the Postgres named by ``AI_MEMORY_TEST_POSTGRES_URL`` and skips when it is unset.
 """
-import ast
 import contextlib
 import importlib.util
 import io
@@ -42,10 +41,13 @@ SCRATCH = REPO / '.local-runs' / 'pg-isolate-hygiene'
 PREFIX = 'pg_isolated_binary: '
 QUERY = '?sslmode=verify-full&sslrootcert=/c/ca.crt'
 ADMIN_DB = 'ai_memory_test'                       # the URL default of the CI admin URL, and the poisoned base
-ADMIN_URL = 'postgres://u:pw@127.0.0.1:5445/%s%s' % (ADMIN_DB, QUERY)
+MARKER = 'MARKERpw7031'                           # P1 #9689: the password of every URL here; no output may hold it
+ADMIN_URL = 'postgres://u:%s@127.0.0.1:5445/%s%s' % (MARKER, ADMIN_DB, QUERY)
 EPHEMERAL = 'ai_memory_test_ci_9_1_x'
 EPHEMERAL_TPL = EPHEMERAL + '_tpl'
+EPHEMERAL_URL = 'postgres://u:%s@127.0.0.1:5445/%s%s' % (MARKER, EPHEMERAL, QUERY)
 RUN = 'r7031'
+TPL_ENV = {'AI_MEMORY_TEST_PG_TEMPLATE': EPHEMERAL_TPL}   # the env a teardown of EPHEMERAL runs with (S1)
 
 # --- the contract this file pins (exit codes and exact messages) ------------------------------------------------
 EXIT_OK = 0
@@ -84,6 +86,47 @@ MAYBE = ("unreleased: database %s may exist with no owner record (the CREATE end
          "with `SELECT 1 FROM pg_database WHERE datname = '%s'` and drop it with a plain DROP DATABASE if this run "
          "made it")
 INTERRUPTED = 'interrupted by signal %d (%s)'
+# S1: a teardown drops a template only when the job's emitted template names it
+TEARDOWN_UNSET = ("refusing teardown --db %r: %s is unset or empty; set it to the template this job's setup emitted "
+                  "(%r for this base) before a teardown may drop it")
+# S2: setup connects to the URL database, so --db names it; run uses only the template of the URL database
+SETUP_URL_MISMATCH = ('refusing setup --db %r: the URL names database %r; setup connects to the URL database, so '
+                      '--db must name the same database')
+RUN_TEMPLATE_MISMATCH = 'refusing run: template %r is not %r, the template of the URL database %r'
+# P1 #9689: every URL refusal is fixed text; the builder gets no part of the URL
+URL_UNPARSED = 'the URL cannot be parsed'
+URL_NO_DB = 'the URL names no database'
+URL_DB_UNSAFE = 'the URL database name is not a safe identifier (1 to 63 of [A-Za-z0-9_])'
+URL_SCHEME = 'not a postgres URL (the scheme must be postgres or postgresql)'
+URL_PORT = 'the URL port is not a number from 0 to 65535'
+URL_KEY = ('unsupported URL query key (supported: application_name, connect_timeout, options, sslcert, sslcrl, '
+           'sslkey, sslmode, sslrootcert, target_session_attrs)')
+URL_SSLMODE = 'the URL sslmode is not one of allow, disable, prefer, require, verify-ca, verify-full'
+URL_MULTI_HOST = 'multi-host URLs are not supported'
+READ_FAILED = 'cannot read %r (%s)'
+# S3: the watermark is read only from a table
+WATERMARK_RELKIND = ('refusing base database %r: lineage_integrity_watermark in schema %s is not a table (relkind %r); '
+                     'a view or foreign table can show any mark, so the precheck reads only a plain or partitioned '
+                     'table')
+TOO_MANY_SCHEMAS = 'refusing base database %r: lineage_integrity_watermark sits in more than %d schemas'
+# C1: every path that leaves a name of this run says so and exits 5
+UNKNOWN_CLONES = ("unreleased: the clones of run %s are unknown, the listing failed: %s; list them with `%s` and drop "
+                  "each with a plain DROP DATABASE")
+HANDED = ("unreleased: database %s of this run is still on the server: setup handed it to the job before signal %d "
+          "(%s) arrived; the job's teardown drops it, or drop it with a plain DROP DATABASE once no session holds it")
+CLONE_LISTING = "SELECT datname FROM pg_database WHERE starts_with(datname, '%s')"
+CREATE_UNKNOWN = ('CREATE DATABASE %s ended without a clean answer; the outcome is unknown and the template may exist '
+                  'with no owner record: %s; %s; to check by hand run `%s` and, if the template is from this run, run '
+                  '`pg_isolated_binary.py teardown --db %s --run-id <run id>`')
+FOREIGN_TPL = ("refusing to use template %s, it was not created by this run: psql failed (1): ERROR:  database \"%s\" "
+               "already exists; if it is a leftover of your own earlier run, run `pg_isolated_binary.py teardown --db %s "
+               "--run-id <run id>` first, otherwise choose a different --db")
+REGRESSED_ANY = ('refusing base database %r: the append-only relation `%s.%s` REGRESSED from a previously-recorded '
+                 'high-water mark of %d row(s) to %d; a template built beside it would run the suite on a poisoned '
+                 'base (#6983)')
+RUST_SSOT = REPO / 'src' / 'storage' / 'schema_integrity.rs'
+DOC = REPO / 'docs' / 'ci' / 'PG-ISOLATION.md'
+LIVE_REQUIRED_VAR = 'AI_MEMORY_TEST_PG_LIVE_REQUIRED'
 
 
 def unexpected(exc):
@@ -116,6 +159,12 @@ BASES_REFUSED = (                                    # classifiable as an identi
     'ai_memory_test_ci_9_1_X',
     'AI_MEMORY_TEST_CI_9_1_X',
     'xai_memory_test_ci_9_1_x',
+    'bi_memory_test_ci_9_1_x',                       # S5: same length, wrong prefix, valid suffix (security M1)
+    'AI_MEMORY_TEST_CI_9_1_x',                       # B3: upper-case prefix, valid suffix (a case-folded match)
+    'ai_memory_test_ci_1_1_x_tpl',                   # C2: the template name of another base
+    'ai_memory_test_ci_9_1_tpl',
+    'ai_memory_test_ci_1_1___',                      # C2: a leg of underscores only
+    'ai_memory_test_ci_1_1__',
     'ai_memory_test_ci_' + '1' * 21 + '_1_x',
     'ai_memory_test_ci_9_123456_x',
     'ai_memory_test_ci_9_1_' + 'a' * 37,             # leg over the 36-byte room a 59-byte base leaves
@@ -151,7 +200,7 @@ class HygienePg:
 
     def __init__(self, dbs=None, watermark=None, fail=None, hooks=None, lost=None, clock=None):
         self.dbs = {k: dict(v) for k, v in (dbs or {}).items()}
-        self.watermark = dict(watermark or {})      # schema -> (rows text, count text)
+        self.watermark = dict(watermark or {})      # schema -> (rows text, count text[, relkind, default 'r'])
         self.fail = dict(fail or {})
         self.hooks = dict(hooks or {})
         self.lost = dict(lost or {})
@@ -180,13 +229,16 @@ class HygienePg:
 
     def _answer(self, sql):
         if 'pg_catalog.pg_class' in sql and 'lineage_integrity_watermark' in sql:
+            if 'c.relkind' in sql.split(' FROM ', 1)[0]:      # S3: the precheck reads the relkind column
+                return Result(0, ''.join('%s|%s\n' % (s, (self.watermark[s] + ('r',))[2]) for s in sorted(self.watermark)))
             return Result(0, ''.join(s + '\n' for s in sorted(self.watermark)))
         rows = re.search(r'FROM "([^"]+)"\.lineage_integrity_watermark', sql)
         if rows:
             return Result(0, self.watermark[rows.group(1)][0])
-        count = re.search(r'FROM "([^"]+)"\."agent_lineage"', sql)
+        count = re.search(r'FROM "([^"]+)"\."([^"]+)"', sql)
         if count and 'count(*)' in sql:
-            return Result(0, self.watermark[count.group(1)][1] + '\n')
+            counted = self.watermark[count.group(1)][1]   # one count text, or relation -> count text (B2)
+            return Result(0, (counted[count.group(2)] if isinstance(counted, dict) else counted) + '\n')
         if 'extract(epoch' in sql:
             return Result(0, '%d\n' % self.clock)
         if 'NOT EXISTS (SELECT 1 FROM pg_stat_activity' in sql:
@@ -231,15 +283,21 @@ class Outcome:
         return [ln for ln in self.stderr.splitlines() if ln.startswith(PREFIX)]
 
 
-def run_main(argv, pg, env=None):
-    """``main(argv)`` against ``pg``; the env vars the wrapper reads are cleared unless ``env`` names them."""
+def run_main(argv, pg, env=None, on_emit=None):
+    """``main(argv)`` against ``pg``; the env vars the wrapper reads are cleared unless ``env`` names them.
+    ``on_emit`` runs after each emitted line is recorded (a signal right after the hand-over, C1)."""
     emitted, err, escaped, rc = [], io.StringIO(), None, None
+
+    def emit(text):
+        emitted.append(text)
+        if on_emit:
+            on_emit(text)
     with unittest.mock.patch.object(pib.subprocess, 'run', pg), \
             unittest.mock.patch.object(pib.time, 'sleep'), \
-            unittest.mock.patch.object(pib, '_emit', emitted.append), \
+            unittest.mock.patch.object(pib, '_emit', emit), \
             unittest.mock.patch.dict(os.environ, env or {}), \
             contextlib.redirect_stderr(err):
-        for var in (pib.URL_VAR, pib.TEMPLATE_VAR, pib.RUN_ID_VAR):
+        for var in (pib.URL_VAR, pib.TEMPLATE_VAR, pib.RUN_ID_VAR, pib.FLAG_VAR, pib.KILL_VAR):
             if var not in (env or {}):
                 os.environ.pop(var, None)
         try:
@@ -249,7 +307,14 @@ def run_main(argv, pg, env=None):
     return Outcome(rc, emitted, err.getvalue(), escaped)
 
 
-def setup_argv(db=None, *extra, url=ADMIN_URL):
+IDENT_RE = re.compile(r'[A-Za-z0-9_]{1,63}', re.ASCII)
+
+
+def setup_argv(db=None, *extra, url=None):
+    """Setup argv; the URL names ``db`` itself (S2: setup connects to the URL database) unless ``url`` is given or
+    ``db`` is not an identifier (refused before the URL is read)."""
+    if url is None:
+        url = pib.with_database(ADMIN_URL, db) if db is not None and IDENT_RE.fullmatch(db) else ADMIN_URL
     argv = ['setup', '--url', url, '--jobs', '1', '--run-id', RUN]
     if db is not None:
         argv += ['--db', db]
@@ -262,7 +327,12 @@ class Base(unittest.TestCase):
         self.assertEqual(got.rc, rc, got.stderr[-2000:])
         self.assertEqual(got.lines, [line(m) for m in lines])
         self.assertNotIn('Traceback', got.stderr)
-        self.assertNotIn(':pw@', got.stderr)
+        self.assertNoMarker(got)
+
+    def assertNoMarker(self, got):
+        """P1 #9689: no output holds the URL password, in any case."""
+        for text in [got.stderr] + list(got.emitted):
+            self.assertNotIn(MARKER.lower(), text.lower())
 
     def assertNoForce(self, pg):
         self.assertFalse([s for s in pg.log if 'FORCE' in s.upper()])
@@ -508,19 +578,13 @@ class OwnershipI3I4(Base):
     def test_unknown_create_outcome_is_unreleased_not_dropped_7200(self):
         pg = HygienePg(lost={'CREATE DATABASE': 2})
         got = run_main(setup_argv(EPHEMERAL), pg)
-        self.assertIsNone(got.escaped)
-        self.assertEqual(got.rc, EXIT_UNRELEASED)
-        self.assertEqual(got.lines[-1], line(MAYBE % (EPHEMERAL_TPL, EPHEMERAL_TPL)))
+        check = "SELECT 1 FROM pg_database WHERE datname = '%s'" % EPHEMERAL_TPL
+        self.assertOutcome(got, EXIT_UNRELEASED, [
+            CREATE_UNKNOWN % (EPHEMERAL_TPL, 'psql failed (2): psql: error: connection to server was lost',
+                              'psql ended with status 2, not a plain SQL error', check, EPHEMERAL),
+            MAYBE % (EPHEMERAL_TPL, EPHEMERAL_TPL)])
         self.assertEqual(pg.drops(EPHEMERAL_TPL), [], 'a name of unknown outcome is never dropped')
         self.assertIn(EPHEMERAL_TPL, pg.dbs)
-
-    def test_unreleased_exit_is_distinct_7200(self):
-        codes = {EXIT_OK, EXIT_USAGE, EXIT_MINT, EXIT_LOAD_REFUSED, EXIT_UNRELEASED, pib.EXIT_TERM}
-        codes |= {SIGNAL_EXIT_BASE + s for s in SIGNALS}
-        self.assertEqual(len(codes), 6 + len(SIGNALS) - 1, 'SIGTERM is the run exit 143 too, every other differs')
-        self.assertEqual(pib.EXIT_USAGE, EXIT_USAGE)
-        self.assertEqual(pib.WA_EXIT_LOAD_REFUSED, EXIT_LOAD_REFUSED)
-        self.assertEqual(getattr(pib, 'EXIT_UNRELEASED', None), EXIT_UNRELEASED)
 
     def test_settle_timeout_keeps_the_name_owned_7212(self):
         busy = 'ERROR:  database "%s" is being accessed by other users' % EPHEMERAL_TPL
@@ -533,7 +597,7 @@ class OwnershipI3I4(Base):
 
     def test_teardown_settle_timeout_is_unreleased_7212(self):
         pg = HygienePg(dbs={EPHEMERAL_TPL: {'sessions': 1}})
-        got = run_main(['teardown', '--url', ADMIN_URL, '--db', EPHEMERAL, '--run-id', RUN], pg)
+        got = run_main(['teardown', '--url', ADMIN_URL, '--db', EPHEMERAL, '--run-id', RUN], pg, env=TPL_ENV)
         busy = 'ERROR:  database "%s" is being accessed by other users' % EPHEMERAL_TPL
         self.assertOutcome(got, EXIT_UNRELEASED, [UNRELEASED % (EPHEMERAL_TPL, 'psql failed (1): %s' % busy)])
         self.assertEqual(len(pg.drops(EPHEMERAL_TPL)), pib.DROP_ATTEMPTS)
@@ -544,7 +608,7 @@ class OwnershipI3I4(Base):
         foreign = 'ai_memory_t_zother_1700000000_0123abcd'
         cause = 'ERROR:  must be owner of database %s' % clone
         pg = HygienePg(dbs={clone: {'drop_fail': cause}, foreign: {}, EPHEMERAL_TPL: {}})
-        got = run_main(['teardown', '--url', ADMIN_URL, '--db', EPHEMERAL, '--run-id', RUN], pg)
+        got = run_main(['teardown', '--url', ADMIN_URL, '--db', EPHEMERAL, '--run-id', RUN], pg, env=TPL_ENV)
         self.assertOutcome(got, EXIT_UNRELEASED, [UNRELEASED % (clone, 'psql failed (1): %s' % cause)])
         self.assertEqual(sorted(pg.dbs), sorted([clone, foreign]), 'the template went, the foreign clone stayed')
         self.assertEqual(pg.drops(foreign), [])
@@ -555,7 +619,7 @@ class OwnershipI3I4(Base):
         missing = []
         pg = HygienePg(dbs=dict({c: {} for c in clones}, **{EPHEMERAL_TPL: {}}),
                        hooks={'DROP DATABASE IF EXISTS "%s"' % clones[0]: self._signal_hook(signal.SIGTERM, missing)})
-        got = run_main(['teardown', '--url', ADMIN_URL, '--db', EPHEMERAL, '--run-id', RUN], pg)
+        got = run_main(['teardown', '--url', ADMIN_URL, '--db', EPHEMERAL, '--run-id', RUN], pg, env=TPL_ENV)
         self.assertEqual(missing, [], 'teardown has no SIGTERM handler')
         self.assertOutcome(got, SIGNAL_EXIT_BASE + signal.SIGTERM, [INTERRUPTED % (15, 'SIGTERM')])
         self.assertEqual(pg.dbs, {})
@@ -565,13 +629,7 @@ class OwnershipI3I4(Base):
         got = run_main(setup_argv(EPHEMERAL, '--emit-env'), pg)
         self.assertOutcome(got, EXIT_OK, [])
         self.assertEqual(got.emitted, ['%s=%s' % (pib.TEMPLATE_VAR, EPHEMERAL_TPL), '%s=%s' % (pib.RUN_ID_VAR, RUN)])
-        for emitted in got.emitted:
-            self.assertNotIn(pib.URL_VAR, emitted)
-            self.assertNotIn('postgres', emitted)
-        tree = ast.parse(SCRIPT.read_text(encoding='utf-8'))
-        calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and getattr(n.func, 'id', '') == '_emit']
-        named = sorted(n.args[0].right.elts[0].id for n in calls)
-        self.assertEqual(named, EMITTED_VARS, 'every _emit call names one of the two variables, never URL_VAR')
+        self.assertEqual(sorted(e.split('=', 1)[0] for e in got.emitted), sorted(getattr(pib, v) for v in EMITTED_VARS))
 
     def test_sweep_two_runs_one_run_id_7156(self):
         aged = 'ai_memory_t_r7156_1700000000_aaaaaaaa'            # the finished run, idle and old
@@ -588,6 +646,339 @@ class OwnershipI3I4(Base):
         self.assertNoForce(pg)
 
 
+# --- S1: teardown drops a template only when the job's emitted template names it ---------------------------------
+TEARDOWN = ['teardown', '--url', ADMIN_URL, '--db', EPHEMERAL, '--run-id', RUN]
+
+
+class OwnershipS1(Base):
+    def test_teardown_with_the_template_unset_or_empty_is_refused_s1(self):
+        for env in ({}, {pib.TEMPLATE_VAR: ''}):
+            with self.subTest(env=env):
+                pg = HygienePg(dbs={EPHEMERAL_TPL: {}})
+                got = run_main(TEARDOWN, pg, env=env)
+                self.assertOutcome(got, EXIT_USAGE, [TEARDOWN_UNSET % (EPHEMERAL, pib.TEMPLATE_VAR, EPHEMERAL_TPL)])
+                self.assertEqual(pg.log, [], 'refused before the first statement')
+                self.assertIn(EPHEMERAL_TPL, pg.dbs)
+
+    def test_teardown_with_a_blank_template_is_a_mismatch_s1(self):
+        pg = HygienePg(dbs={EPHEMERAL_TPL: {}})
+        got = run_main(TEARDOWN, pg, env={pib.TEMPLATE_VAR: ' '})
+        self.assertOutcome(got, EXIT_USAGE, [TEARDOWN_MISMATCH % (EPHEMERAL, EPHEMERAL_TPL, pib.TEMPLATE_VAR, ' ')])
+        self.assertEqual(pg.log, [])
+
+
+# --- S2: --db and --template agree with the URL database ----------------------------------------------------------
+class UrlCrossCheckS2(Base):
+    OTHER = 'ai_memory_test_ci_9_1_y'
+
+    def test_setup_db_must_be_the_url_database_s2(self):
+        for url, db, url_db in ((EPHEMERAL_URL, self.OTHER, EPHEMERAL), (ADMIN_URL, EPHEMERAL, ADMIN_DB)):
+            with self.subTest(db=db, url_db=url_db):
+                pg = HygienePg()
+                got = run_main(setup_argv(db, url=url), pg)
+                self.assertOutcome(got, EXIT_USAGE, [SETUP_URL_MISMATCH % (db, url_db)])
+                self.assertEqual(pg.log, [])
+
+    def test_run_template_must_be_the_template_of_the_url_database_s2(self):
+        other = self.OTHER + '_tpl'
+        pg = HygienePg()
+        got = run_main(['run', '--url', EPHEMERAL_URL, '--run-id', RUN, '--template', other, '--targets-file',
+                        str(SCRATCH / 'never-read.txt'), '--', 'cargo', 'test'], pg, env={pib.FLAG_VAR: '1'})
+        self.assertOutcome(got, EXIT_USAGE, [RUN_TEMPLATE_MISMATCH % (other, EPHEMERAL_TPL, EPHEMERAL)])
+        self.assertEqual(pg.log, [])
+
+
+# --- P1 #9689: no refusal text holds the URL password, by construction ---------------------------------------------
+PW = 'u:%s@' % MARKER
+MARKER_URLS = (                                      # (URL, the one refusal line)
+    ('postgres://%s127.0.0.1:5445%s' % (PW, QUERY), URL_NO_DB),
+    ('postgres://%s127.0.0.1:5445/%s' % (PW, QUERY), URL_NO_DB),
+    ('postgres://u:%s/%s' % (MARKER, EPHEMERAL), URL_PORT),
+    ('postgres://u@127.0.0.1:%s/%s' % (MARKER, EPHEMERAL), URL_PORT),
+    ('postgres://%s127.0.0.1:99999/%s' % (PW, EPHEMERAL), URL_PORT),
+    (EPHEMERAL_URL + '&%s=1' % MARKER, URL_KEY),
+    ('postgres://%s127.0.0.1:5445/%s?sslmode=%s' % (PW, EPHEMERAL, MARKER), URL_SSLMODE),
+    ('pg+%s://%s127.0.0.1:5445/%s' % (MARKER, PW, EPHEMERAL), URL_SCHEME),
+    ('mysql://%s127.0.0.1:5445/%s' % (PW, EPHEMERAL), URL_SCHEME),
+    ('postgres://%s[::1/%s' % (PW, EPHEMERAL), URL_UNPARSED),
+    ('postgres://%s127.0.0.1:5445/%s;x' % (PW, MARKER), URL_DB_UNSAFE),
+    ('postgres://%s127.0.0.1:5445/%s%%22' % (PW, EPHEMERAL), URL_DB_UNSAFE),
+    ('postgres://%sh1:5445,h2:5445/%s' % (PW, EPHEMERAL), URL_MULTI_HOST),
+)
+
+
+def marker_commands(url):
+    """Every sub-command, each with the URL under test and otherwise valid arguments."""
+    return (
+        ('setup', ['setup', '--url', url, '--jobs', '1', '--run-id', RUN], None),
+        ('teardown', ['teardown', '--url', url, '--db', EPHEMERAL, '--run-id', RUN], TPL_ENV),
+        ('run', ['run', '--url', url, '--run-id', RUN, '--template', EPHEMERAL_TPL, '--targets-file',
+                 str(SCRATCH / 'never-read.txt'), '--', 'cargo', 'test'], {pib.FLAG_VAR: '1'}),
+        ('sweep', ['sweep', '--url', url, '--older-than', '86400'], None),
+    )
+
+
+class MarkerPasswordP1(Base):
+    def test_every_url_refusal_is_fixed_text_without_the_password_9689(self):
+        for url, refusal in MARKER_URLS:
+            for cmd, argv, env in marker_commands(url):
+                for via in ('argv', 'env'):
+                    with self.subTest(url=url.replace(MARKER, '<pw>'), cmd=cmd, via=via):
+                        pg = HygienePg()
+                        if via == 'env':
+                            i = argv.index('--url')
+                            argv_env = argv[:i] + argv[i + 2:]
+                            got = run_main(argv_env, pg, env=dict(env or {}, **{pib.URL_VAR: url}))
+                        else:
+                            got = run_main(argv, pg, env=env)
+                        self.assertOutcome(got, EXIT_USAGE, [refusal])
+                        self.assertEqual(pg.log, [], 'a URL refusal comes before any SQL')
+
+    def test_a_missing_targets_file_is_a_refusal_9689(self):
+        missing = SCRATCH / 'missing-targets-9689.txt'
+        pg = HygienePg()
+        got = run_main(['run', '--url', EPHEMERAL_URL, '--run-id', RUN, '--template', EPHEMERAL_TPL,
+                        '--targets-file', str(missing), '--', 'cargo', 'test'], pg, env={pib.FLAG_VAR: '1'})
+        self.assertOutcome(got, EXIT_USAGE, [READ_FAILED % (str(missing), 'No such file or directory')])
+        self.assertEqual(pg.log, [])
+
+    def test_url_validation_is_linear_on_a_100k_url_9689(self):
+        started = time.monotonic()
+        for url in ('postgres://%s127.0.0.1:5445/%s' % (PW, 'a' * 100_000),
+                    EPHEMERAL_URL + '&x=' + 'y' * 100_000, 'postgres://%s%s/db' % (PW, ',h' * 50_000)):
+            got = run_main(['sweep', '--url', url, '--older-than', '86400'], HygienePg())
+            self.assertEqual(got.rc, EXIT_USAGE)
+            self.assertNoMarker(got)
+        self.assertLess(time.monotonic() - started, 2.0)
+
+
+# --- C1: one exit-state table; every exit is true about what is left -------------------------------------------
+DOC_ROW_RE = re.compile(r'^\| (.+?) \| (.+) \|$')
+
+
+def doc_exit_rows():
+    text = DOC.read_text(encoding='utf-8').split('\n')
+    start = text.index('| Exit | Meaning |')
+    rows = []
+    for ln in text[start + 2:]:
+        found = DOC_ROW_RE.match(ln)
+        if not found:
+            break
+        rows.append((found.group(1), found.group(2)))
+    return tuple(rows)
+
+
+class ExitStatesC1(Base):
+    def test_one_exit_state_table_for_code_docs_and_help_c1(self):
+        states = tuple(getattr(pib, 'EXIT_STATES', ()))
+        self.assertEqual([code for code, _ in states], ['0', '2', '128 + signal', '5'])
+        self.assertEqual(doc_exit_rows(), states, 'docs/ci/PG-ISOLATION.md shows the same table')
+        helped = ' '.join(pib.build_parser().format_help().split())
+        for code, meaning in states:
+            self.assertIn(' '.join(('%s: %s' % (code, meaning)).split()), helped)
+
+    def test_teardown_listing_failure_is_unreleased_c1(self):
+        prefix = pib.run_prefix(RUN)
+        pg = HygienePg(dbs={EPHEMERAL_TPL: {}, prefix + '1700000000_0123abcd': {}},
+                       fail={'SELECT datname FROM pg_database WHERE starts_with': 'ERROR:  boom'})
+        got = run_main(TEARDOWN, pg, env=TPL_ENV)
+        self.assertOutcome(got, EXIT_UNRELEASED,
+                           [UNKNOWN_CLONES % (RUN, 'psql failed (1): ERROR:  boom', CLONE_LISTING % prefix)])
+        self.assertNotIn(EPHEMERAL_TPL, pg.dbs, 'the template is still dropped')
+
+    def test_teardown_non_wrapper_error_on_a_drop_is_unreleased_c1(self):
+        clone = pib.run_prefix(RUN) + '1700000000_0123abcd'
+        for victim in (clone, EPHEMERAL_TPL):
+            with self.subTest(victim=victim):
+                def boom(_sql):
+                    raise ValueError('v7114')
+                pg = HygienePg(dbs={EPHEMERAL_TPL: {}, clone: {}}, hooks={'DROP DATABASE IF EXISTS "%s"' % victim: boom})
+                got = run_main(TEARDOWN, pg, env=TPL_ENV)
+                self.assertOutcome(got, EXIT_UNRELEASED, [UNRELEASED % (victim, 'unexpected ValueError: v7114')])
+                self.assertEqual(sorted(pg.dbs), [victim], 'every other name is still dropped')
+
+    def test_setup_signal_after_the_hand_over_names_the_template_c1(self):
+        missing = []
+
+        def after_emit(text):
+            if text.startswith(pib.RUN_ID_VAR + '='):
+                current = signal.getsignal(signal.SIGTERM)
+                if not callable(current):
+                    missing.append(text)
+                    return
+                os.kill(os.getpid(), signal.SIGTERM)    # blocked: delivered once the hand-over is done
+        pg = HygienePg()
+        got = run_main(setup_argv(EPHEMERAL, '--emit-env'), pg, on_emit=after_emit)
+        self.assertEqual(missing, [])
+        self.assertOutcome(got, EXIT_UNRELEASED, [INTERRUPTED % (15, 'SIGTERM'), HANDED % (EPHEMERAL_TPL, 15, 'SIGTERM')])
+        self.assertIn(EPHEMERAL_TPL, pg.dbs, 'the job owns it and its teardown drops it')
+        self.assertEqual(len(got.emitted), 2)
+
+    def test_setup_foreign_template_is_refused_and_kept_7127(self):
+        pg = HygienePg(dbs={EPHEMERAL_TPL: {}})
+        got = run_main(setup_argv(EPHEMERAL), pg)
+        self.assertOutcome(got, EXIT_USAGE, [FOREIGN_TPL % (EPHEMERAL_TPL, EPHEMERAL_TPL, EPHEMERAL)])
+        self.assertIn(EPHEMERAL_TPL, pg.dbs)
+        self.assertEqual(pg.drops(EPHEMERAL_TPL), [])
+
+    @staticmethod
+    def raiser(exc):
+        def boom(_sql):
+            raise exc
+        return boom
+
+    def setup_corpus(self):
+        """(name, HygienePg kwargs, on_emit) over every way setup can end."""
+        cells = [('ok', {}, None), ('foreign', {'dbs': {EPHEMERAL_TPL: {}}}, None),
+                 ('lost', {'lost': {'CREATE DATABASE': 2}}, None),
+                 ('refused-create', {'fail': {'CREATE DATABASE': 'ERROR:  permission denied to create database'}}, None),
+                 ('busy-cleanup', {'fail': {'CREATE EXTENSION IF NOT EXISTS age': 'ERROR:  boom',
+                                            'DROP DATABASE': 'ERROR:  database "x" is being accessed by other users'}},
+                  None)]
+        for exc in EXCEPTIONS:
+            cells.append(('raise-%s' % type(exc).__name__,
+                          {'hooks': {'CREATE EXTENSION IF NOT EXISTS age': self.raiser(exc)}}, None))
+            cells.append(('raise-%s-failed-cleanup' % type(exc).__name__,
+                          {'hooks': {'ALTER DATABASE': self.raiser(exc)},
+                           'fail': {'DROP DATABASE': 'ERROR:  permission denied to drop database'}}, None))
+        for sig in SIGNALS:
+            for prefix in ('CREATE DATABASE', 'CREATE EXTENSION IF NOT EXISTS vector', 'ALTER DATABASE'):
+                cells.append(('%s-%s' % (sig.name, prefix), {'hooks': {prefix: self.kill(sig)}}, None))
+            cells.append(('%s-after-hand-over' % sig.name, {},
+                          lambda text, sig=sig: text.startswith(pib.RUN_ID_VAR) and os.kill(os.getpid(), sig)))
+        return cells
+
+    @staticmethod
+    def kill(sig):
+        return lambda _sql: os.kill(os.getpid(), sig)
+
+    def test_every_setup_exit_is_true_about_what_is_left_c1(self):
+        for name, kw, on_emit in self.setup_corpus():
+            with self.subTest(cell=name):
+                pg = HygienePg(**kw)
+                before = set(pg.dbs)
+                got = run_main(setup_argv(EPHEMERAL, '--emit-env'), pg, on_emit=on_emit)
+                self.assertIsNone(got.escaped)
+                self.assertNoMarker(got)
+                created = set(pg.dbs) - before
+                named = [ln for ln in got.lines if ln.startswith(line('unreleased: '))]
+                if got.rc == EXIT_OK:
+                    self.assertEqual(created, {EPHEMERAL_TPL})
+                elif got.rc == EXIT_UNRELEASED:
+                    for left in created:
+                        self.assertTrue([ln for ln in named if ' %s ' % left in ln], 'rc 5 names %s' % left)
+                    self.assertTrue(named)
+                else:
+                    self.assertIn(got.rc, [EXIT_USAGE] + [SIGNAL_EXIT_BASE + s for s in SIGNALS])
+                    self.assertEqual(created, set(), 'exit %d says nothing this invocation created is left' % got.rc)
+
+    def test_every_teardown_exit_is_true_about_what_is_left_c1(self):
+        prefix = pib.run_prefix(RUN)
+        clones = [prefix + '170000000%d_0123abcd' % i for i in range(2)]
+        cells = [('ok', {}), ('busy-tpl', {'dbs_extra': {EPHEMERAL_TPL: {'sessions': 1}}}),
+                 ('clone-fail', {'dbs_extra': {clones[0]: {'drop_fail': 'ERROR:  must be owner'}}}),
+                 ('listing-fail', {'fail': {'SELECT datname FROM pg_database WHERE starts_with': 'ERROR:  boom'}}),
+                 ('alter-fail', {'fail': {'ALTER DATABASE': 'ERROR:  boom'}})]
+        for exc in EXCEPTIONS:
+            for victim in (clones[0], EPHEMERAL_TPL):
+                cells.append(('raise-%s-%s' % (type(exc).__name__, victim),
+                              {'hooks': {'DROP DATABASE IF EXISTS "%s"' % victim: self.raiser(exc)}}))
+            cells.append(('raise-%s-listing' % type(exc).__name__,
+                          {'hooks': {'SELECT datname FROM pg_database WHERE starts_with': self.raiser(exc)}}))
+        for sig in SIGNALS:
+            cells.append(('%s-drop' % sig.name, {'hooks': {'DROP DATABASE IF EXISTS "%s"' % clones[0]: self.kill(sig)}}))
+        for name, kw in cells:
+            with self.subTest(cell=name):
+                dbs = dict({c: {} for c in clones}, **{EPHEMERAL_TPL: {}})
+                dbs.update(kw.pop('dbs_extra', {}))
+                pg = HygienePg(dbs=dbs, **kw)
+                got = run_main(TEARDOWN, pg, env=TPL_ENV)
+                self.assertIsNone(got.escaped)
+                self.assertNoMarker(got)
+                left = sorted(n for n in pg.dbs if n == EPHEMERAL_TPL or n.startswith(prefix))
+                named = [ln for ln in got.lines if ln.startswith(line('unreleased: '))]
+                unknown = [ln for ln in named if 'clones of run %s are unknown' % RUN in ln]
+                self.assertEqual(got.rc == EXIT_UNRELEASED, bool(left), 'rc %d with %r left' % (got.rc, left))
+                for name_left in left:
+                    self.assertTrue([ln for ln in named if ' %s ' % name_left in ln] or
+                                    (unknown and name_left != EPHEMERAL_TPL), 'rc 5 names %s' % name_left)
+
+
+# --- S3 / B3: the watermark is read from a table, in at most 64 schemas -------------------------------------------
+class WatermarkShapeS3B3(Base):
+    def test_watermark_relation_kinds_s3(self):
+        for kind, refusal in (('r', None), ('p', None), ('v', WATERMARK_RELKIND % (EPHEMERAL, 'public', 'v')),
+                              ('m', WATERMARK_RELKIND % (EPHEMERAL, 'public', 'm')),
+                              ('f', WATERMARK_RELKIND % (EPHEMERAL, 'public', 'f'))):
+            with self.subTest(kind=kind):
+                pg = HygienePg(watermark={'public': ('agent_lineage|3\n', '3', kind)})
+                got = run_main(setup_argv(EPHEMERAL), pg)
+                self.assertOutcome(got, EXIT_USAGE if refusal else EXIT_OK, [refusal] if refusal else [])
+                self.assertEqual(EPHEMERAL_TPL in pg.dbs, refusal is None)
+
+    def test_schema_cap_is_exact_b3(self):
+        for count, refusal in ((WATERMARK_MAX_ROWS, None),
+                               (WATERMARK_MAX_ROWS + 1, TOO_MANY_SCHEMAS % (EPHEMERAL, WATERMARK_MAX_ROWS))):
+            with self.subTest(schemas=count):
+                pg = HygienePg(watermark={'s%02d' % i: ('agent_lineage|1\n', '1') for i in range(count)})
+                got = run_main(setup_argv(EPHEMERAL), pg)
+                self.assertOutcome(got, EXIT_USAGE if refusal else EXIT_OK, [refusal] if refusal else [])
+
+
+# --- B2: the watermark relation set is the Rust SSOT -------------------------------------------------------------
+def rust_watermarked_relations():
+    src = RUST_SSOT.read_text(encoding='utf-8')
+    start = src.index('pub const WATERMARKED_RELATIONS: &[WatermarkedRelation] = &[')
+    body = src[start:src.index('];', start)]
+    names = []
+    for ref in re.findall(r'\bname:\s*([A-Z][A-Z0-9_]*|"[^"]*")', body):
+        if ref.startswith('"'):
+            names.append(ref[1:-1])
+            continue
+        const = re.search(r'pub const %s: &str = "([^"]*)";' % ref, src)
+        if const is None:
+            raise AssertionError('WATERMARKED_RELATIONS names %s, which is not a &str const of %s' % (ref, RUST_SSOT))
+        names.append(const.group(1))
+    return tuple(names)
+
+
+class WatermarkDriftB2(Base):
+    def test_python_relations_are_the_rust_watermarked_relations_b2(self):
+        rust = rust_watermarked_relations()
+        self.assertTrue(rust)
+        self.assertEqual(tuple(getattr(pib, 'WATERMARKED_RELATIONS', ())), rust)
+
+    def test_a_second_relation_is_checked_not_refused_b2(self):
+        rels = ('agent_lineage', 'memory_chain')
+        rows = 'agent_lineage|3\nmemory_chain|5\n'
+        for counts, refusal in (({'agent_lineage': '3', 'memory_chain': '5'}, None),
+                                ({'agent_lineage': '3', 'memory_chain': '2'},
+                                 REGRESSED_ANY % (EPHEMERAL, 'public', 'memory_chain', 5, 2))):
+            with self.subTest(counts=counts), unittest.mock.patch.object(pib, 'WATERMARKED_RELATIONS', rels, create=True):
+                pg = HygienePg(watermark={'public': (rows, counts)})
+                got = run_main(setup_argv(EPHEMERAL), pg)
+                self.assertOutcome(got, EXIT_USAGE if refusal else EXIT_OK, [refusal] if refusal else [])
+
+
+# --- B1: the live cells fail, not skip, when CI requires them ---------------------------------------------------
+class LiveRequiredB1(unittest.TestCase):
+    def run_live_cell(self, required):
+        env = {k: v for k, v in os.environ.items() if k != LIVE_REQUIRED_VAR}
+        if required:
+            env[LIVE_REQUIRED_VAR] = '1'
+        result = unittest.TestResult()
+        with unittest.mock.patch.dict(os.environ, env, clear=True), \
+                unittest.mock.patch.object(sys.modules[__name__], 'LIVE_READY', False):
+            LiveHygiene('test_live_foreign_template_survives_i3').run(result)
+        return result
+
+    def test_a_required_live_cell_without_a_server_fails_b1(self):
+        result = self.run_live_cell(True)
+        self.assertEqual((len(result.failures), len(result.errors), len(result.skipped)), (1, 0, 0))
+        local = self.run_live_cell(False)
+        self.assertEqual((len(local.failures), len(local.errors), len(local.skipped)), (0, 0, 1))
+
+
 # --- the absence table: every [M]/[F] finding of PR 7088 --------------------------------------------------------
 ABSENCE = (
     # (issue, kind, the test that proves the window is closed in this design)
@@ -595,33 +986,48 @@ ABSENCE = (
     (7152, 'M', 'test_signal_windows_release_and_exit_128_plus_signum_7152_7179'),
     (7179, 'M', 'test_signal_during_a_failing_cleanup_is_unreleased_7179'),
     (7180, 'M', 'test_teardown_without_db_is_refused_7180'),
-    (7200, 'M', 'test_unreleased_exit_is_distinct_7200'),
+    (7200, 'M', 'test_unknown_create_outcome_is_unreleased_not_dropped_7200'),
     (7212, 'M', 'test_settle_timeout_keeps_the_name_owned_7212'),
     (7156, 'F', 'test_sweep_two_runs_one_run_id_7156'),
     (7159, 'F', 'test_failed_teardown_asserts_cause_and_state_7159'),
 )
-CREATE_SITES = sorted(('CREATE DATABASE %s', 'CREATE DATABASE %s TEMPLATE %s'))   # the template, the clone
-CREATE_SQL_RE = re.compile(r'CREATE DATABASE [^;]*%s', re.IGNORECASE)                # a SQL format, not prose
+FAMILY_MARKERS = ('COMMENT ON', 'SHOBJ_DESCRIPTION')
+
+
+def issued_sql_corpus():
+    """Every statement setup, teardown and sweep issue over a small corpus of outcomes (C4: behaviour, not text)."""
+    issued = []
+    cells = (
+        (setup_argv(EPHEMERAL, '--emit-env'), {}, None),
+        (setup_argv(EPHEMERAL), {'fail': {'CREATE EXTENSION IF NOT EXISTS age': 'ERROR:  boom'}}, None),
+        (setup_argv(EPHEMERAL), {'lost': {'CREATE DATABASE': 2}}, None),
+        (setup_argv('ci_base_%d_%d' % (4242, 1700000000)), {}, None),
+        (['teardown', '--url', ADMIN_URL, '--db', EPHEMERAL, '--run-id', RUN],
+         {'dbs': {EPHEMERAL_TPL: {}, 'ai_memory_t_%s_1700000000_0123abcd' % RUN: {}}}, TPL_ENV),
+        (['sweep', '--url', ADMIN_URL, '--older-than', '86400'],
+         {'dbs': {'ai_memory_t_r1_1600000000_0123abcd': {}}, 'clock': 1700000000}, None),
+    )
+    for argv, kw, env in cells:
+        pg = HygienePg(**kw)
+        run_main(argv, pg, env=env)
+        issued += pg.log
+    return issued
 
 
 class AbsenceTable(unittest.TestCase):
     def test_minted_base_and_family_marker_classes_cannot_exist_7031(self):
-        source = SCRIPT.read_text(encoding='utf-8')
-        tree = ast.parse(source)
-        creates = sorted(n.left.value for n in ast.walk(tree) if isinstance(n, ast.BinOp)
-                         and isinstance(n.left, ast.Constant) and isinstance(n.left.value, str)
-                         and CREATE_SQL_RE.fullmatch(n.left.value))
-        names = {getattr(c, '__name__', '') for c in (OwnershipI3I4, BaseClassI1)}
+        issued = issued_sql_corpus()
+        self.assertTrue(issued)
+        creates = [sql for sql in issued if sql.upper().startswith('CREATE DATABASE')]
         for issue, kind, test in ABSENCE:
             with self.subTest(issue=issue, kind=kind):
-                owner = [c for c in (OwnershipI3I4, BaseClassI1) if hasattr(c, test)]
-                self.assertTrue(owner, '#%d names %s, which %s does not define' % (issue, test, names))
-                if kind == 'M':   # only a minted base opens the window: the wrapper creates the template and clones
-                    self.assertEqual(creates, CREATE_SITES)
-                    self.assertNotIn('ci_base_', source)
-                else:             # only a family marker opens the window: the wrapper writes no marker at all
-                    self.assertNotIn('COMMENT ON', source.upper())
-                    self.assertNotIn('SHOBJ_DESCRIPTION', source.upper())
+                self.assertTrue([c for c in (OwnershipI3I4, BaseClassI1) if hasattr(c, test)],
+                                '#%d names %s, which no class defines' % (issue, test))
+                if kind == 'M':   # no base is minted: the only CREATE is the template of the given base
+                    self.assertEqual(sorted(set(creates)), ['CREATE DATABASE "%s"' % EPHEMERAL_TPL])
+                    self.assertFalse([sql for sql in issued if 'ci_base_' in sql])
+                else:             # no family marker is ever written or read
+                    self.assertFalse([sql for sql in issued if any(m in sql.upper() for m in FAMILY_MARKERS)])
 
 
 # --- live cells ---------------------------------------------------------------------------------------------------
@@ -650,11 +1056,16 @@ sys.exit(done.returncode)
 '''
 
 
-@unittest.skipUnless(LIVE_READY, 'AI_MEMORY_TEST_POSTGRES_URL unset (live hygiene)')
 class LiveHygiene(unittest.TestCase):
-    """The real script against a real server: a poisoned base, a foreign template, SIGTERM in CREATE and cleanup."""
+    """The real script against a real server: a poisoned base, a foreign template, SIGTERM in CREATE and cleanup.
+    A missing server or psql skips locally and FAILS when AI_MEMORY_TEST_PG_LIVE_REQUIRED=1 (the CI step, B1)."""
 
     def setUp(self):
+        if not LIVE_READY:
+            if os.environ.get(LIVE_REQUIRED_VAR) == '1':
+                self.fail('%s=1 but %s or psql is missing: the live hygiene cells must run' % (LIVE_REQUIRED_VAR,
+                                                                                              pib.URL_VAR))
+            self.skipTest('AI_MEMORY_TEST_POSTGRES_URL unset (live hygiene)')
         self.base = 'ai_memory_test_ci_7031_1_h%s' % uuid.uuid4().hex[:8]
         self.tpl = self.base + '_tpl'
         self.admin('CREATE DATABASE %s' % self.base)
@@ -684,7 +1095,10 @@ class LiveHygiene(unittest.TestCase):
 
     def script(self, *argv, env=None, popen=False):
         cmd = [sys.executable, str(SCRIPT)] + list(argv)
-        child_env = dict(os.environ, **{pib.URL_VAR: LIVE_ADMIN}, **(env or {}))
+        child_env = {k: v for k, v in os.environ.items() if k not in (pib.TEMPLATE_VAR, pib.RUN_ID_VAR)}
+        # S2: setup connects to the URL database, so its URL names the base; teardown uses the admin URL
+        child_env[pib.URL_VAR] = pib.with_database(LIVE_URL, self.base) if argv[:1] == ('setup',) else LIVE_ADMIN
+        child_env.update(env or {})
         if popen:
             return subprocess.Popen(cmd, env=child_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         return subprocess.run(cmd, env=child_env, capture_output=True, text=True, timeout=300)
@@ -713,7 +1127,19 @@ class LiveHygiene(unittest.TestCase):
         done = self.script('setup', '--db', self.base, '--jobs', '1', '--run-id', 'r7031i')
         self.assertEqual(done.returncode, EXIT_OK, done.stderr[-1500:])
         self.assertTrue(self.exists(self.tpl))
-        down = self.script('teardown', '--db', self.base, '--run-id', 'r7031i')
+        down = self.script('teardown', '--db', self.base, '--run-id', 'r7031i', env={pib.TEMPLATE_VAR: self.tpl})
+        self.assertEqual(down.returncode, EXIT_OK, down.stderr[-1500:])
+        self.assertFalse(self.exists(self.tpl))
+
+    def test_live_teardown_with_the_template_unset_is_refused_s1(self):
+        done = self.script('setup', '--db', self.base, '--jobs', '1', '--run-id', 'r7031u')
+        self.assertEqual(done.returncode, EXIT_OK, done.stderr[-1500:])
+        for env in ({}, {pib.TEMPLATE_VAR: ''}):
+            down = self.script('teardown', '--db', self.base, '--run-id', 'r7031u', env=env)
+            self.assertEqual(down.returncode, EXIT_USAGE, down.stderr[-1500:])
+            self.assertEqual(self.lines(down.stderr), [line(TEARDOWN_UNSET % (self.base, pib.TEMPLATE_VAR, self.tpl))])
+            self.assertTrue(self.exists(self.tpl), 'a refused teardown drops nothing')
+        down = self.script('teardown', '--db', self.base, '--run-id', 'r7031u', env={pib.TEMPLATE_VAR: self.tpl})
         self.assertEqual(down.returncode, EXIT_OK, down.stderr[-1500:])
         self.assertFalse(self.exists(self.tpl))
 
