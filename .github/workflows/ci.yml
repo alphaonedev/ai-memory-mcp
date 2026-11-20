@@ -2857,7 +2857,7 @@ jobs:
     # release smoke 1319 s (run 43715405044, both on the check leg before the
     # move) = 1955 s = 32.6 min; 45 min is 1.38x that sum (the iOS leg's
     # longest is 276 s). Re-derive when a measured run comes within 20 % of it.
-    # scripts/ci/tests/test_ci_release_split_9680.py bounds it on both sides.
+    # The #9680 release-split module bounds it on both sides.
     timeout-minutes: 45
     strategy:
       fail-fast: false
