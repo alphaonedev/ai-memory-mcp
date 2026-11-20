@@ -70,6 +70,12 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  # #9509/#9515: no Rust test of this workflow may fetch a model from the
+  # network; the embedder and cross-encoder take the staged offline cache
+  # only (one workflow-level source, held by the 9509 staging pin).
+  AI_MEMORY_EMBED_OFFLINE: "1"
+
 jobs:
   # --------------------------------------------------------------------
   # iOS Simulator runtime.
