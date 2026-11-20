@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import re
 import sys
+import time
 import unittest
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -810,35 +811,37 @@ def _filter_list(body: list[str], key: str) -> tuple[str, ...] | None:
 
 
 def _glob_re(pattern: str) -> re.Pattern[str]:
+    """GitHub branch-filter glob with only `*` (no `/`) and `**` (anything). A run of two or more
+    stars is one `.*`, so no input builds a regex of nested unbounded repeats."""
     out = []
-    i = 0
-    while i < len(pattern):
-        if pattern.startswith("**", i):
-            out.append(".*")
-            i += 2
-        elif pattern[i] == "*":
-            out.append("[^/]*")
-            i += 1
+    for run in re.finditer(r"\*+|[^*]+", pattern):
+        part = run.group(0)
+        if part.startswith("*"):
+            if not out or out[-1] not in (".*", "[^/]*"):
+                out.append(".*" if len(part) > 1 else "[^/]*")
+            elif len(part) > 1:
+                out[-1] = ".*"
         else:
-            out.append(re.escape(pattern[i]))
-            i += 1
+            out.append(re.escape(part))
     return re.compile("".join(out) + r"\Z")
 
 
 def _pattern_reaches_chain(pattern: str) -> bool:
-    """Conservative: a pattern whose literal head is compatible with `chain/` counts as reaching
-    a chain ref even if no sample ref matches it; GitHub-only operators (?, +, [], !) are judged on
-    their literal head alone."""
+    """Whether a push.branches pattern can match a chain ref. A literal ref under `chain/` does;
+    a `*`/`**` glob is matched against sample chain refs; a pattern with a GitHub-only operator
+    (?, +, [], !) is judged conservatively on its literal head (reaches when that head is
+    compatible with `chain/`)."""
     literal = ""
     for char in pattern:
         if char in GLOB_CHARS:
             break
         literal += char
-    if literal.startswith(CHAIN_PREFIX) or (CHAIN_PREFIX.startswith(literal)
-                                            and len(literal) < len(pattern)):
+    if literal.startswith(CHAIN_PREFIX):
         return True
+    if literal == pattern:
+        return False
     if GLOB_CHARS & set(pattern) - {"*"}:
-        return CHAIN_PREFIX.startswith(literal) or literal.startswith(CHAIN_PREFIX)
+        return CHAIN_PREFIX.startswith(literal)
     return any(_glob_re(pattern).match(ref) for ref in CHAIN_SAMPLE_REFS)
 
 
@@ -869,6 +872,17 @@ def _line_no(wf: Workflow, needle: str) -> int:
         elif line and not line[0].isspace() and not line.startswith("#"):
             in_on = False
         if in_on and needle in line:
+            return n
+    return 0
+
+
+def _job_line(name: str, job_id: str, needle: str) -> int:
+    """The line number of the first `needle` inside job `job_id` of workflow `name`, else 0."""
+    inside = False
+    for n, line in enumerate((WORKFLOWS / name).read_text(encoding="utf-8").splitlines(), 1):
+        if _indent(line) == 2 and not _is_comment_or_blank(line):
+            inside = line.strip().rstrip(":") == job_id
+        elif inside and needle in line and not _is_comment_or_blank(line):
             return n
     return 0
 
@@ -951,13 +965,14 @@ class ChainCacheSoleWriter9681(unittest.TestCase):
                     with self.subTest(workflow=name, job=job_id):
                         for key in ("shared-key", "prefix-key"):
                             value = inputs.get(key, "")
-                            self.assertNotIn("${{", value, f"{name}:{job_id}: dynamic rust-cache "
-                                                           f"{key} {value!r} could build a chain "
-                                                           f"key (V-4)")
+                            where = f"{name}:{_job_line(name, job_id, f'{key}:')} (job {job_id})"
+                            self.assertNotIn("${{", value, f"{where}: dynamic rust-cache {key} "
+                                                           f"{value!r} could build a chain key "
+                                                           f"(V-4)")
                             if not owner:
                                 self.assertNotIn(value, literals,
-                                                 f"{name}:{job_id}: rust-cache {key} {value!r} "
-                                                 f"is a chain cache key (V-4)")
+                                                 f"{where}: rust-cache {key} {value!r} is a "
+                                                 f"chain cache key (V-4)")
 
     def test_v5_every_warm_action_is_pinned_to_a_commit_sha(self) -> None:
         uses = [(n, m.group(1)) for n, line in _numbered(WORKFLOWS / WARM)
@@ -1051,6 +1066,44 @@ class ChainCacheSoleWriter9681(unittest.TestCase):
                     # Contexts are job names; a bare job id such as `coverage` is ordinary prose.
                     self.assertNotIn(ident, protection, f"{BRANCH_PROTECTION.name}: names warm job "
                                                         f"{ident!r} (V-10)")
+
+    def test_v3_chain_push_classifier_table(self) -> None:
+        """The scan's verdict for each push-filter shape a later edit could introduce."""
+        reaching = ('branches: ["chain/**"]', 'branches: ["chain/*"]', 'branches: ["**"]',
+                    'branches: ["*/**"]', 'branches: ["ch*/**"]', 'branches: ["c***"]',
+                    'branches: ["chain/promo6-ssh-r2"]', 'branches: ["chai?/**"]',
+                    'branches: ["[c]hain/**"]', 'branches: ["chain/**", "!chain/x"]',
+                    "branches:\n      - main\n      - 'chain/**'",
+                    'branches-ignore: ["main"]', None)
+        quiet = ('branches: [main, develop, "release/**"]', 'branches: ["chainx/**"]',
+                 'branches: ["*"]', 'branches: ["c*"]', 'branches: ["!chain/**"]',
+                 'branches-ignore: ["chain/**"]',
+                 'branches-ignore: ["**"]', 'tags: ["v*"]', 'tags-ignore: ["x"]')
+        for body, expect in [(b, True) for b in reaching] + [(b, False) for b in quiet]:
+            lines = ["on:", "  push:"] + ([] if body is None else
+                                          [("    " + part if not part.startswith(" ") else part)
+                                           for part in body.split("\n")])
+            with self.subTest(body=body):
+                got = _push_reaches_chain(Workflow("synthetic.yml", [*lines, "jobs: {}"]))
+                self.assertEqual(got is not None, expect, f"push filter {body!r}: {got!r}")
+
+    def test_v3_unreadable_on_form_fails_closed(self) -> None:
+        for lines in (['"on":', "  push:"], ["true:", "  push:"], ["on:", "  push:", "on:"]):
+            with self.subTest(lines=lines), self.assertRaisesRegex(AssertionError,
+                                                                   "expected one plain top-level"):
+                _triggers(Workflow("synthetic.yml", lines))
+        self.assertEqual(sorted(_triggers(Workflow("s.yml", ["on: [push, pull_request]"]))),
+                         ["pull_request", "push"])
+
+    def test_v3_scanner_is_linear_on_a_large_filter(self) -> None:
+        """100K branch patterns and a 100K-character pattern: the scan stays well under a second."""
+        many = ["on:", "  push:", "    branches:"] + [f"      - rel/{i}" for i in range(100_000)]
+        start = time.monotonic()
+        self.assertIsNone(_push_reaches_chain(Workflow("big.yml", many)))
+        self.assertFalse(_pattern_reaches_chain("x" * 100_000 + "*" * 100_000))
+        self.assertFalse(_pattern_reaches_chain("*a" * 50_000 + "z"))
+        self.assertTrue(_pattern_reaches_chain("*" * 100_000 + "/**"))
+        self.assertLess(time.monotonic() - start, 5.0)
 
     def test_v11_kill_switch_and_revert_rule_are_stated(self) -> None:
         texts = {WARM: _header(WORKFLOWS / WARM),
