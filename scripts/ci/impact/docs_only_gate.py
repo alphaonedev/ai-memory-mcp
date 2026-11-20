@@ -233,7 +233,6 @@ def judge_step(workspace: Path, runner_temp: Path, event: str, base: str,
 def cmd_step(_args: argparse.Namespace) -> int:
     """Write docs_only=<true|false> to GITHUB_OUTPUT; always exit 0."""
     env = os.environ
-    value, notice = FALSE, "internal error"
     try:
         workspace = Path(env.get("GITHUB_WORKSPACE") or ".").resolve()
         temp = env.get("RUNNER_TEMP", "")

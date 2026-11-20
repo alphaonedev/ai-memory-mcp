@@ -37,8 +37,8 @@ import sys
 import tempfile
 import time
 import unittest
+import unittest.mock
 from pathlib import Path
-from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[3]
 WORKFLOWS = ROOT / ".github" / "workflows"
@@ -735,6 +735,8 @@ ACTION_REL = ".github/actions/docs-only-gate/action.yml"
 DECIDE_SHIM_ANCHOR = "from impact import common  # noqa: E402\n"
 DECIDE_SHIM = "\nif sys.argv[1:2] == ['decide']:\n%s\n"
 UNKNOWN_EXITS = (1, 2, 4, 5, 7, 125, 255)
+OWNER_READ_EXEC_ONLY = 0o500  # a directory the owner cannot write into
+OWNER_FULL_ONLY = 0o700  # the restored mode: owner only
 EXIT_FULL_RUN_CODE = 0  # the decider's full-run code, written by hand (not read from the gate)
 # A rules file that calls every path documentation and no path CI code: what a PR could put in its
 # own copy of rules.json to skip the heavy jobs if the head's rules were ever read.
@@ -1063,7 +1065,7 @@ class StepDoubt(GateRepo):
     def test_base_decider_timeout_is_a_full_run_9683(self):
         self.base_decider_exits("    import time\n    time.sleep(60)\n    sys.exit(%d)" % GATE.EXIT_DOCS_ONLY)
         self.commit("docs/b.md", "b\n")
-        with mock.patch.object(GATE, "DECIDER_TIMEOUT_S", 2):
+        with unittest.mock.patch.object(GATE, "DECIDER_TIMEOUT_S", 2):
             started = time.monotonic()
             value, notice = self.judge()
         self.assertLess(time.monotonic() - started, 30)
@@ -1072,7 +1074,7 @@ class StepDoubt(GateRepo):
 
     def test_base_decider_that_cannot_start_is_a_full_run_9683(self):
         self.commit("docs/b.md", "b\n")
-        with mock.patch.object(GATE.sys, "executable", str(self.top / "no-such-python")):
+        with unittest.mock.patch.object(GATE.sys, "executable", str(self.top / "no-such-python")):
             value, notice = self.judge()
         self.assertEqual(value, GATE.FALSE)
         self.assertIn("base decider did not run", notice)
@@ -1095,8 +1097,8 @@ class StepDoubt(GateRepo):
                 out.write_text("")
                 env = self.step_env(out, "pull_request", None, CHAIN_BASE, self.runner_temp)
                 printed = io.StringIO()
-                with mock.patch.dict(os.environ, env, clear=True), \
-                        mock.patch.object(GATE, "judge_step", side_effect=exc), \
+                with unittest.mock.patch.dict(os.environ, env, clear=True), \
+                        unittest.mock.patch.object(GATE, "judge_step", side_effect=exc), \
                         contextlib.redirect_stdout(printed):
                     code = GATE.cmd_step(None)
                 self.assertEqual(code, GATE.EXIT_FULL_RUN)
@@ -1277,11 +1279,12 @@ class ActionRun(GateRepo):
     def test_base_copy_dir_that_cannot_be_made_is_a_full_run_9683(self):
         self.commit("docs/b.md", "b\n")
         (self.runner_temp / "docs-gate-base").write_text("a file where the directory goes\n")
-        os.chmod(str(self.runner_temp), 0o555)
+        # owner read+execute only: the owner is the sole user that must be refused, so no group or other bit is set
+        os.chmod(str(self.runner_temp), OWNER_READ_EXEC_ONLY)
         try:
             result = self.run_action()
         finally:
-            os.chmod(str(self.runner_temp), 0o755)
+            os.chmod(str(self.runner_temp), OWNER_FULL_ONLY)
         self.assertFalse(result["failed"], result)
         self.assertEqual(result["docs_only"], "", result)
         self.assertIn("the base copy directory could not be made; " + FULL_RUN_LITERAL, result["stdout"])
