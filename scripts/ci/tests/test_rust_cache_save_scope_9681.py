@@ -360,13 +360,7 @@ class Step:
         return self.keys.get("uses", "").split("@", 1)[0]
 
     def mapping(self, key: str) -> dict[str, str]:
-        out: dict[str, str] = {}
-        for line in self.blocks.get(key, []):
-            if _is_comment_or_blank(line) or _indent(line) != KEY_INDENT + 2:
-                continue
-            name, _, value = line.strip().partition(":")
-            out[name] = _scalar(value)
-        return out
+        return _mapping(self.blocks.get(key, []), KEY_INDENT + 2)
 
     def run(self) -> str:
         return "\n".join(line[KEY_INDENT + 2:] for line in self.blocks.get("run", [])).strip("\n")
@@ -444,13 +438,37 @@ class Job:
         return [_parse_step(item) for item in steps]
 
 
+class SourceStr(str):
+    """A mapping value as the lenient reader cut it, plus what the strict decoder needs: `source`
+    is the text after the colon (comment included) and `nested` is the first deeper line below
+    the key ("" when none). #9745 r1: an env value is decoded from `source`, never from the cut."""
+
+    source: str
+    nested: str
+
+    def __new__(cls, text: str, source: str = "", nested: str = "") -> SourceStr:
+        obj = super().__new__(cls, text)
+        obj.source = source
+        obj.nested = nested
+        return obj
+
+
+def _nested_line(rest: list[str], indent: int) -> str:
+    """The first non-blank, non-comment line of `rest` when it is deeper than `indent`, else ""."""
+    for line in rest:
+        if _is_comment_or_blank(line):
+            continue
+        return line.strip() if _indent(line) > indent else ""
+    return ""
+
+
 def _mapping(lines: list[str], indent: int) -> dict[str, str]:
     out: dict[str, str] = {}
-    for line in lines:
+    for index, line in enumerate(lines):
         if _is_comment_or_blank(line) or _indent(line) != indent:
             continue
         name, _, value = line.strip().partition(":")
-        out[name] = _scalar(value)
+        out[name] = SourceStr(_scalar(value), value.strip(), _nested_line(lines[index + 1:], indent))
     return out
 
 
@@ -566,8 +584,121 @@ def _yaml_typed_form(text: str) -> str:
     return ""
 
 
+# #9745 r1 (L2): ONE strict reader for every matrix leg value and env value. A value is decoded to
+# the exact string the runner uses, or the reader raises UnreadForm naming where it is and which
+# form it did not read. There is no default and no raw-text fallback: the forms below are a closed
+# list, and the refusal is the `else`.
+UNREAD_FLOW_MAPPING = "flow mapping"
+UNREAD_FLOW_SEQUENCE = "flow sequence"
+UNREAD_BLOCK_SCALAR = "block scalar"
+UNREAD_ALIAS = "alias"
+UNREAD_ANCHOR = "anchor"
+UNREAD_TAG = "tag"
+UNREAD_EXPRESSION = "expression"
+UNREAD_AFTER_QUOTE = "text after the closing quote"
+UNREAD_UNTERMINATED = "unterminated quote"
+UNREAD_ESCAPE = "escape in a double-quoted scalar"
+UNREAD_COLON = "colon in a plain scalar"
+UNREAD_RESERVED = "reserved indicator"
+UNREAD_FLOW_INDICATOR = "flow indicator at the start of a plain scalar"
+UNREAD_BLOCK_INDICATOR = "block collection indicator"
+UNREAD_CONTROL = "control character"
+UNREAD_NESTED = "nested or continued value"
+UNREAD_INDENT = "mis-indented line"
+UNREAD_DUPLICATE = "duplicate key"
+UNREAD_LINE = "line that is not key: value with a plain identifier key"
+UNREAD_BARE_DASH = "list entry that does not start with a key on the dash line"
+UNREAD_AXIS = "matrix axis"
+UNREAD_STRATEGY_BLOCK = "strategy is not a block mapping"
+UNREAD_STRATEGY_KEY = "strategy key other than fail-fast, max-parallel and matrix"
+UNREAD_MATRIX_BLOCK = "matrix is not a block mapping"
+UNREAD_INCLUDE_BLOCK = "include is not a block list"
+UNREAD_UNQUOTED_FORM = "unquoted YAML {form}"
+
+PLAIN_FIRST_CHAR_REASONS = {
+    "{": UNREAD_FLOW_MAPPING, "[": UNREAD_FLOW_SEQUENCE, ">": UNREAD_BLOCK_SCALAR,
+    "|": UNREAD_BLOCK_SCALAR, "*": UNREAD_ALIAS, "&": UNREAD_ANCHOR, "!": UNREAD_TAG,
+    "@": UNREAD_RESERVED, "`": UNREAD_RESERVED, "%": UNREAD_RESERVED,
+    ",": UNREAD_FLOW_INDICATOR, "]": UNREAD_FLOW_INDICATOR, "}": UNREAD_FLOW_INDICATOR,
+}
+CONTROL_RE = re.compile(r"[\x00-\x08\x0a-\x1f\x7f]")
+COMMENT_TAIL_RE = re.compile(r"^\s+#")
+PLAIN_COMMENT_RE = re.compile(r"\s#")
+PLAIN_COLON_RE = re.compile(r":(?:\s|$)")
+BLOCK_INDICATOR_RE = re.compile(r"^[-?](?:\s|$)")
+SINGLE_QUOTE, DOUBLE_QUOTE, BACKSLASH = "'", '"', "\\"
+
+
+class UnreadForm(AssertionError):
+    """A YAML form this reader does not model: it names `where`, the form (`reason`) and the text."""
+
+    def __init__(self, where: str, reason: str, text: str) -> None:
+        super().__init__(f"{where}: unread YAML form, {reason}: {text!r}")
+        self.reason = reason
+
+
+def _scan_quoted(text: str, where: str) -> tuple[str, str]:
+    """(the unescaped body, the text after the closing quote) of a fully quoted scalar. Single
+    quotes unescape `''`; a double-quoted scalar with a backslash escape is refused."""
+    quote = text[0]
+    out: list[str] = []
+    index = 1
+    while index < len(text):
+        char = text[index]
+        if quote == DOUBLE_QUOTE and char == BACKSLASH:
+            raise UnreadForm(where, UNREAD_ESCAPE, text)
+        if char == quote:
+            if quote == SINGLE_QUOTE and text[index + 1:index + 2] == SINGLE_QUOTE:
+                out.append(SINGLE_QUOTE)
+                index += 2
+                continue
+            return "".join(out), text[index + 1:]
+        out.append(char)
+        index += 1
+    raise UnreadForm(where, UNREAD_UNTERMINATED, text)
+
+
+def _decode_scalar(raw: str, where: str, allow_expression: bool) -> str:
+    """The string a runner reads from the text after `key:`: a QuotedStr for a quoted scalar, a plain
+    str for a plain scalar, "" for null. Every other form raises UnreadForm (never a default)."""
+    text = raw.strip()
+    if CONTROL_RE.search(text):
+        raise UnreadForm(where, UNREAD_CONTROL, text)
+    if not text or text.startswith("#"):
+        return ""
+    if text[0] in (SINGLE_QUOTE, DOUBLE_QUOTE):
+        body, tail = _scan_quoted(text, where)
+        if tail and not COMMENT_TAIL_RE.match(tail):
+            raise UnreadForm(where, UNREAD_AFTER_QUOTE, text)
+        if not allow_expression and EXPRESSION_OPEN in body:
+            raise UnreadForm(where, UNREAD_EXPRESSION, text)
+        return QuotedStr(body)
+    reason = PLAIN_FIRST_CHAR_REASONS.get(text[0])
+    if reason is None and BLOCK_INDICATOR_RE.match(text):
+        reason = UNREAD_BLOCK_INDICATOR
+    if reason is not None:
+        raise UnreadForm(where, reason, text)
+    plain = PLAIN_COMMENT_RE.split(text, 1)[0].rstrip()
+    if EXPRESSION_OPEN in plain:
+        if not allow_expression:
+            raise UnreadForm(where, UNREAD_EXPRESSION, text)
+    elif PLAIN_COLON_RE.search(plain):
+        raise UnreadForm(where, UNREAD_COLON, text)
+    return plain
+
+
 def _effective_env_value(name: str, raw: str, leg: dict[str, object]) -> str:
-    """The value env var `name` takes on one leg; an expression form other than one fails."""
+    """The value env var `name` takes on one leg; an expression form other than one fails. A value
+    read from a workflow (SourceStr) is decoded by the strict reader first (#9745 r1)."""
+    if isinstance(raw, SourceStr):
+        if raw.nested:
+            raise UnreadForm(name, UNREAD_NESTED, raw.nested)
+        decoded = _decode_scalar(raw.source, name, True)
+        if not isinstance(decoded, QuotedStr):
+            form = _yaml_typed_form(decoded)
+            if form and decoded != "0":
+                raise UnreadForm(name, UNREAD_UNQUOTED_FORM.format(form=form), raw.source.strip())
+        raw = str(decoded)
     if EXPRESSION_OPEN not in raw:
         return raw
     match = MATRIX_OR_LITERAL_RE.match(raw)
@@ -633,27 +764,36 @@ def _test_step_labels(job: Job) -> tuple[str, ...]:
     return tuple(s.label() for s in job.steps() if TEST_RUN_RE.search(s.run()))
 
 
+# #9745 r1 (L3): the checks below walk `_reachable_jobs`. The remaining `wf.jobs()` uses in this
+# module are kept on purpose, each commented where it stands: lookups by an explicit job id from
+# a hand table (PAIRS, JOBS, TEST_STEPS, CI_GATE_JOB, the warm workflow), where a missing id is a
+# KeyError and a called workflow is not meant; and the whole-file V-4 key walk, which visits
+# every workflow file and so every called workflow once under its own name.
 def _rust_cache_site_counts() -> tuple[dict[str, dict[str, int]], list[str]]:
     """({workflow: {job: rust-cache step count}}, problems) over the PR-startable workflows
     (#9747 r1: L3)."""
     found: dict[str, dict[str, int]] = {}
+    problems: list[str] = []
     for name in _all_workflow_names():
         wf = Workflow.load(name)
         if not PR_EVENTS & set(wf.events()):
             continue
-        for job_id, job in wf.jobs().items():
-            count = sum(1 for s in job.steps() if s.uses_name() == RUST_CACHE)
+        jobs, unread = _reachable_jobs(wf)
+        problems.extend(f"{name}: {problem}" for problem in unread)
+        for job_id, _job_wf, job in jobs:
+            count =sum(1 for s in job.steps() if s.uses_name() == RUST_CACHE)
             if count:
                 found.setdefault(name, {})[job_id] = count
-    return found, []
+    return found, problems
 
 
 def _rust_cache_step_failures(names: list[str]) -> list[str]:
     """Every rust-cache step of `names` that is not the pinned sha, push-only save, no on-failure."""
     failures: list[str] = []
     for name in names:
-        wf = Workflow.load(name)
-        for job_id, job in wf.jobs().items():
+        jobs, unread = _reachable_jobs(Workflow.load(name))
+        failures.extend(f"{name}: {problem}" for problem in unread)
+        for job_id, _job_wf, job in jobs:
             for step in job.steps():
                 if step.uses_name() != RUST_CACHE:
                     continue
@@ -676,9 +816,11 @@ def _pr_cache_action_failures() -> list[str]:
         wf = Workflow.load(name)
         if not PR_EVENTS & set(wf.events()):
             continue
-        for job_id, job in wf.jobs().items():
+        jobs, unread = _reachable_jobs(wf)
+        failures.extend(f"{name}: {problem}" for problem in unread)
+        for job_id, _job_wf, job in jobs:
             for step in job.steps():
-                where = f"{name}:{job_id}: {step.label()}"
+                where =f"{name}:{job_id}: {step.label()}"
                 if step.uses_name() == CACHE_COMBINED:
                     failures.append(f"{where}: actions/cache saves in its post step on every event")
                 if step.uses_name() == CACHE_SAVE and not step.keys.get("if", "").startswith(PUSH_GATE):
@@ -691,7 +833,10 @@ def _shared_key_owners(names: list[str]) -> dict[str, list[str]]:
     """{shared-key: [workflow:job of every rust-cache step that sets it]} over `names`."""
     shared_keys: dict[str, list[str]] = {}
     for name in names:
-        for job_id, job in Workflow.load(name).jobs().items():
+        jobs, unread = _reachable_jobs(Workflow.load(name))
+        if unread:
+            raise AssertionError("\n".join(f"{name}: {problem}" for problem in unread))
+        for job_id, _job_wf, job in jobs:
             for step in job.steps():
                 if step.uses_name() == RUST_CACHE and "shared-key" in step.mapping("with"):
                     shared_keys.setdefault(step.mapping("with")["shared-key"], []).append(
@@ -746,6 +891,8 @@ class RustCacheSaveScope9681(unittest.TestCase):
         self.assertEqual(concurrency.get("group"), "rust-cache-warm-${{ github.ref_name }}")
         self.assertEqual(concurrency.get("cancel-in-progress"), "false")
         self.assertNotIn("pull_request", "\n".join(wf.lines))
+        # wf.jobs() walk kept (#9745 r1 L3): the warm workflow is push-only and its jobs are
+        # checked by their own ids; a job-level `uses:` there would fail `runs-on` below.
         for job_id, job in wf.jobs().items():
             with self.subTest(job=job_id):
                 self.assertEqual(job.scalar("runs-on"), "ubuntu-latest")
@@ -1052,6 +1199,9 @@ class ChainCacheSoleWriter9681(unittest.TestCase):
                                          f"cache key {literal!r} is used outside the four paired "
                                          f"rust-cache steps (V-4)")
         for name in _all_workflow_names():
+            # wf.jobs() walk kept (#9745 r1 L3): this visits EVERY workflow file, and a called
+            # workflow is itself one of those files, so each rust-cache step is seen once, under
+            # its own file name; `_reachable_jobs` would see it a second time through its caller.
             for job_id, job in Workflow.load(name).jobs().items():
                 for step in job.steps():
                     if step.uses_name() != RUST_CACHE:
@@ -1436,35 +1586,128 @@ def _eval_if(expr: str, matrix: dict[str, object]) -> bool:
     return bool(result)
 
 
-def _matrix_include(job: Job) -> list[dict[str, object]]:
-    """The `strategy.matrix.include` entries of a job, scalar values only."""
-    entries: list[dict[str, object]] = []
-    include_indent = -1
-    item_indent = -1
-    for line in job.block("strategy"):
-        if _is_comment_or_blank(line):
-            continue
+STRATEGY_KEYS = ("fail-fast", "max-parallel", "matrix")
+MATRIX_INCLUDE_KEY = "include"
+KEY_LINE_RE = re.compile(r"^([A-Za-z_][\w-]*):(?:[ \t]+(.*))?$")
+DASH_LINE_RE = re.compile(r"^-( +)(\S.*)$")
+PLAIN_BOOLEANS = {"true": True, "false": False}
+
+
+def _inline_value(job: Job, key: str) -> str:
+    """The text after `key:` on the job's own key line ("" when empty or only a comment)."""
+    for line in job.lines:
+        if _indent(line) == 4 and line.strip().startswith(key + ":"):
+            rest = line.strip()[len(key) + 1:].strip()
+            return "" if rest.startswith("#") else rest
+    return ""
+
+
+def _key_line(stripped: str, where: str) -> tuple[str, str]:
+    match = KEY_LINE_RE.match(stripped)
+    if not match:
+        raise UnreadForm(where, UNREAD_LINE, stripped)
+    return match.group(1), (match.group(2) or "").strip()
+
+
+def _inline_text(value: str) -> str:
+    """`value` unless it is empty or only a comment."""
+    return "" if value.startswith("#") else value
+
+
+def _key_sections(lines: list[str], indent: int, where: str
+                  ) -> list[tuple[str, str, list[str], str]]:
+    """Split block-mapping `lines` at `indent` into (key, inline text, deeper lines, key line)."""
+    sections: list[tuple[str, str, list[str], str]] = []
+    for line in lines:
         stripped = line.strip()
-        if stripped == "include:":
-            include_indent = _indent(line)
+        if _indent(line) < indent:
+            raise UnreadForm(where, UNREAD_INDENT, stripped)
+        if _indent(line) > indent:
+            sections[-1][2].append(line)
             continue
-        if include_indent < 0:
-            continue
-        if _indent(line) <= include_indent:
-            break
-        if stripped.startswith("- ") and (item_indent < 0 or _indent(line) == item_indent):
-            item_indent = _indent(line)
+        key, value = _key_line(stripped, where)
+        if any(key == seen[0] for seen in sections):
+            raise UnreadForm(where, UNREAD_DUPLICATE, stripped)
+        sections.append((key, _inline_text(value), [], stripped))
+    return sections
+
+
+def _include_entries(children: list[str], where: str) -> list[dict[str, object]]:
+    """The legs of a block list of `key: scalar` mappings; any other line form is refused."""
+    if not children[0].strip().startswith("-"):
+        raise UnreadForm(where, UNREAD_INCLUDE_BLOCK, children[0].strip())
+    entries: list[dict[str, object]] = []
+    dash_indent = _indent(children[0])
+    key_indent = -1
+    last_key = ""
+    for line in children:
+        indent, stripped = _indent(line), line.strip()
+        item_where = f"{where}[{len(entries) - 1}]"
+        if indent == dash_indent:
+            item_where = f"{where}[{len(entries)}]"
+            if not stripped.startswith("-"):
+                raise UnreadForm(f"{where}[{len(entries) - 1}]", UNREAD_INDENT, stripped)
+            if stripped == "-":
+                raise UnreadForm(item_where, UNREAD_BARE_DASH, stripped)
+            dash = DASH_LINE_RE.match(stripped)
+            if not dash:
+                raise UnreadForm(item_where, UNREAD_LINE, stripped)
+            content = dash.group(2)
+            if content[0] in "{[":
+                raise UnreadForm(item_where, PLAIN_FIRST_CHAR_REASONS[content[0]], content)
+            key_indent = dash_indent + 1 + len(dash.group(1))
             entries.append({})
-            stripped = stripped[2:]
-        elif _indent(line) != item_indent + 2:
-            continue
-        name, _, value = stripped.partition(":")
-        scalar = _scalar(value)
-        if value.strip()[:1] in ("'", '"'):
-            entries[-1][name.strip()] = QuotedStr(scalar)
+            last_key = ""
+        elif indent == key_indent:
+            content = stripped
+        elif indent > key_indent and last_key:
+            raise UnreadForm(f"{item_where}.{last_key}", UNREAD_NESTED, stripped)
         else:
-            entries[-1][name.strip()] = {"true": True, "false": False}.get(scalar, scalar)
+            raise UnreadForm(item_where, UNREAD_INDENT, stripped)
+        key, value = _key_line(content, item_where)
+        if key in entries[-1]:
+            raise UnreadForm(f"{item_where}.{key}", UNREAD_DUPLICATE, value)
+        decoded = _decode_scalar(value, f"{item_where}.{key}", False)
+        entries[-1][key] = decoded if isinstance(decoded, QuotedStr) \
+            else PLAIN_BOOLEANS.get(decoded, decoded)
+        last_key = key
     return entries
+
+
+def _matrix_include(job: Job) -> list[dict[str, object]]:
+    """The `strategy.matrix.include` legs of a job, as the runner reads them (#9745 r1: a closed
+    list of forms; any other strategy, matrix, include or leg form raises UnreadForm)."""
+    where = f"{job.job_id}: strategy"
+    inline = _inline_value(job, "strategy")
+    if inline:
+        raise UnreadForm(where, UNREAD_STRATEGY_BLOCK, inline)
+    lines = [line for line in job.block("strategy") if not _is_comment_or_blank(line)]
+    if not lines:
+        return []
+    matrix: tuple[str, list[str]] | None = None
+    for key, value, children, line in _key_sections(lines, _indent(lines[0]), where):
+        if key not in STRATEGY_KEYS:
+            raise UnreadForm(where, UNREAD_STRATEGY_KEY, line)
+        if key == "matrix":
+            matrix = (value, children)
+        elif children:
+            raise UnreadForm(f"{where}.{key}", UNREAD_NESTED, children[0].strip())
+    if matrix is None:
+        return []
+    matrix_where = f"{where}.matrix"
+    value, children = matrix
+    if value or not children:
+        raise UnreadForm(matrix_where, UNREAD_MATRIX_BLOCK, value)
+    include: tuple[str, list[str]] | None = None
+    for key, value, deeper, line in _key_sections(children, _indent(children[0]), matrix_where):
+        if key != MATRIX_INCLUDE_KEY:
+            raise UnreadForm(matrix_where, UNREAD_AXIS, line)
+        include = (value, deeper)
+    assert include is not None  # children is not empty and holds no key but include
+    value, deeper = include
+    if value or not deeper:
+        raise UnreadForm(f"{matrix_where}.include", UNREAD_INCLUDE_BLOCK, value)
+    return _include_entries(deeper, f"{matrix_where}.include")
 
 
 def _hosted_legs(job: Job) -> list[dict[str, object]]:
@@ -1681,7 +1924,11 @@ def _reachable_jobs(wf: Workflow, prefix: str = "", trail: tuple[str, ...] = ()
     A job of `wf` is itself. A job with a job-level `uses: ./.github/workflows/<x>.yml` stands for
     the jobs of that workflow, id `<caller job>/<called job>`, followed to CALL_DEPTH_MAX. Any
     other job-level `uses` (a remote reusable workflow, a `@ref`, a path outside the tree, a
-    missing file, a cycle) is a problem: its jobs cannot be read, so the rule fails closed."""
+    missing file, a cycle) is a problem: its jobs cannot be read, so the rule fails closed.
+
+    The caller job's own `if:` is ignored: a call that a push-only or otherwise gated condition
+    would skip still counts its inner jobs. That is the conservative side: it can over-report a
+    site (a false problem a reader resolves by naming the site), never hide one (fail-closed)."""
     jobs: list[tuple[str, Workflow, Job]] = []
     problems: list[str] = []
     for job_id, job in wf.jobs().items():
@@ -1695,8 +1942,10 @@ def _reachable_jobs(wf: Workflow, prefix: str = "", trail: tuple[str, ...] = ()
                 or not called.endswith((".yml", ".yaml"))):
             problems.append(f"{where}: job-level uses of a reusable workflow that is not a "
                             f"local {LOCAL_WORKFLOW_PREFIX}<name>.yml: {uses!r}")
-        elif called in (*trail, wf.name) or len(trail) >= CALL_DEPTH_MAX:
-            problems.append(f"{where}: reusable workflow call cycle or deeper than "
+        elif called in (*trail, wf.name):
+            problems.append(f"{where}: reusable workflow call cycle: {uses!r}")
+        elif len(trail) >= CALL_DEPTH_MAX:
+            problems.append(f"{where}: reusable workflow call chain deeper than "
                             f"{CALL_DEPTH_MAX}: {uses!r}")
         elif called not in _all_workflow_names():
             problems.append(f"{where}: reusable workflow {uses!r} is not a file")
@@ -2157,9 +2406,10 @@ class UnpairedRustCacheSites9681(unittest.TestCase):
     def test_hosted_legs_read_runs_on_and_fail_closed(self) -> None:
         """Sibling (#9681 r2): the PAIRS leg filter reads `runs-on`, not one matrix field's text."""
         def job(runs_on: str, *legs: str) -> Job:
-            lines = [f"    runs-on: {runs_on}", "    strategy:", "      matrix:", "        include:"]
-            for leg in legs:
-                lines.append(f"          - {leg}")
+            lines = [f"    runs-on: {runs_on}"]
+            if legs:  # an `include:` with no entries is a refused form (#9745 r1), so no strategy
+                lines += ["    strategy:", "      matrix:", "        include:"]
+                lines += [f"          - {leg}" for leg in legs]
             return Job("j", lines)
 
         by_os = job("${{ matrix.os }}", "os: ubuntu-latest", "os: '[self-hosted, linux-fed]'")
