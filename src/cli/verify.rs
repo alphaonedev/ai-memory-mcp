@@ -15,13 +15,16 @@
 //!   `bounded_status != "exceeded_cap"`), the root's content-id is
 //!   verified or was not checked (no genesis or no cid), and (with
 //!   `--cid`) no swept row mismatched or was unreadable.
-//! - `1` — the root memory was not found (#3436), or the verdict could
-//!   not be computed (a storage error before anything is printed).
+//! - `1` — the root memory was not found (#3436), or the arguments are
+//!   wrong (a caller error).
 //! - `2` — verification failed: at least one edge failed signature
 //!   verification, the chain exceeds its namespace
 //!   `max_reflection_depth` cap, (#9505) the root's content-id
-//!   genesis mismatches its cid or cannot be read, or (#9634) the
-//!   `--cid` sweep found a mismatched or unreadable row.
+//!   genesis mismatches its cid or cannot be read, (#9634) the
+//!   `--cid` sweep found a mismatched or unreadable row, or (#9505) an
+//!   input could not be read at all (the database, the root row, the
+//!   chain or the sweep query): one UNREADABLE document naming the
+//!   stage and the `error_class` is printed.
 //!
 //! ## Output formats
 //!
@@ -145,9 +148,10 @@ fn sweep_columns(row: &rusqlite::Row<'_>) -> Result<SweepColumns, GenesisReadErr
 ///
 /// # Errors
 ///
-/// Propagates a failure to prepare or step the query (the verdict could not
-/// be computed; nothing has been printed yet).
-pub fn run_cid_sweep(conn: &Connection) -> Result<CidSweepReport> {
+/// A query that cannot be prepared or stepped is a [`ReadFault`] at stage
+/// [`ReadStage::CidSweepPrepare`] or [`ReadStage::CidSweepStep`], with the
+/// error classified by type; the verb reports it as UNREADABLE, exit 2.
+pub fn run_cid_sweep(conn: &Connection) -> Result<CidSweepReport, ReadFault> {
     run_cid_sweep_query(conn, CID_SWEEP_SQL)
 }
 
@@ -156,10 +160,11 @@ const CID_SWEEP_SQL: &str = "SELECT id, cid, cid_genesis FROM memories WHERE cid
 
 /// [`run_cid_sweep`] over `sql`, which selects the same three columns (the
 /// unit cells pass a query that cannot be prepared or stepped).
-fn run_cid_sweep_query(conn: &Connection, sql: &str) -> Result<CidSweepReport> {
+fn run_cid_sweep_query(conn: &Connection, sql: &str) -> Result<CidSweepReport, ReadFault> {
     let enforce = crate::config::cid_enforce_enabled();
-    let mut stmt = conn.prepare(sql)?;
-    let mut rows = stmt.query([])?;
+    let prepare_fault = |e| ReadFault::of_sqlite(ReadStage::CidSweepPrepare, e);
+    let mut stmt = conn.prepare(sql).map_err(prepare_fault)?;
+    let mut rows = stmt.query([]).map_err(prepare_fault)?;
 
     let mut report = CidSweepReport {
         checked: 0,
@@ -170,7 +175,10 @@ fn run_cid_sweep_query(conn: &Connection, sql: &str) -> Result<CidSweepReport> {
         mismatches: Vec::new(),
         unreadable: Vec::new(),
     };
-    while let Some(row) = rows.next()? {
+    while let Some(row) = rows
+        .next()
+        .map_err(|e| ReadFault::of_sqlite(ReadStage::CidSweepStep, e))?
+    {
         let (id, cid, genesis) = match sweep_columns(row) {
             Ok(columns) => columns,
             Err(error_class) => {
@@ -404,6 +412,76 @@ impl GenesisReadErrorClass {
     }
 }
 
+/// #9505 (3-agent vote (71472661), ruling fe96bc17) — the verification input
+/// that could not be read. Each stage is a fixed label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadStage {
+    /// The database could not be opened.
+    Open,
+    /// The root memory row could not be read.
+    Root,
+    /// The reflection chain (memory rows, edges, governance or signed
+    /// events) could not be read.
+    Chain,
+    /// The `--cid` sweep query could not be prepared.
+    CidSweepPrepare,
+    /// The `--cid` sweep query could not be stepped.
+    CidSweepStep,
+}
+
+impl ReadStage {
+    /// The label printed in text mode and serialised in JSON mode.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Root => "root",
+            Self::Chain => "chain",
+            Self::CidSweepPrepare => "cid_sweep_prepare",
+            Self::CidSweepStep => "cid_sweep_step",
+        }
+    }
+}
+
+/// #9505 — a read that the verdict needs failed: the state UNREADABLE (ok
+/// false, exit 2, one document). Only the stage and the error class are
+/// kept, never the storage error's text, so no stored byte and no path
+/// reaches the operator's streams.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ReadFault {
+    /// Which input could not be read.
+    pub stage: ReadStage,
+    /// Why, classified by the error's type.
+    pub error_class: GenesisReadErrorClass,
+}
+
+impl ReadFault {
+    fn of(stage: ReadStage, err: &anyhow::Error) -> Self {
+        Self {
+            stage,
+            error_class: GenesisReadErrorClass::of(err),
+        }
+    }
+
+    fn of_sqlite(stage: ReadStage, err: rusqlite::Error) -> Self {
+        Self::of(stage, &anyhow::Error::new(err))
+    }
+}
+
+impl std::fmt::Display for ReadFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} could not be read ({})",
+            self.stage.label(),
+            self.error_class.label()
+        )
+    }
+}
+
+impl std::error::Error for ReadFault {}
+
 /// #9505 — the root memory's content-id verdict (3-agent vote (71472661),
 /// B + J1). A root that was not checked (no genesis, or no cid) has NO
 /// value: `ChainReport::root_cid` is `None` and the field is omitted from
@@ -555,7 +633,9 @@ fn fetch_memory_meta(conn: &Connection, id: &str) -> Result<Option<(String, Stri
         Ok(Some((
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
-            row.get::<_, i32>(2).unwrap_or(0),
+            // #9505: a depth that does not decode is an error, never depth 0
+            // (which would read an over-cap chain as within its cap).
+            row.get::<_, i32>(2)?,
         )))
     } else {
         Ok(None)
@@ -603,8 +683,8 @@ fn fetch_reflects_on_edges(conn: &Connection, source_id: &str) -> Result<Vec<Edg
 /// Fetch up to 1000 `signed_events` rows whose `agent_id` matches any
 /// of the supplied memory ids (by convention the audit rows for a
 /// reflect use the agent_id field as the actor's identifier; the
-/// memory_id is embedded in the payload). Best-effort — returns empty
-/// on query failure.
+/// memory_id is embedded in the payload). #9505: a query failure is an
+/// error, never an empty list presented as "no events".
 fn fetch_signed_events_for(conn: &Connection, ids: &[String]) -> Result<Vec<SignedEventSummary>> {
     if ids.is_empty() {
         return Ok(Vec::new());
@@ -784,7 +864,7 @@ pub fn build_chain_report_at(
     .to_string();
 
     let signed_events = if include_signed_events {
-        fetch_signed_events_for(conn, &all_ids).unwrap_or_default()
+        fetch_signed_events_for(conn, &all_ids)?
     } else {
         Vec::new()
     };
@@ -1027,9 +1107,14 @@ pub(super) fn render_text(report: &ChainReport, out: &mut CliOutput<'_>) -> Resu
 /// raised on `verify-forensic-bundle` in the same fold) and aligns
 /// with the new top-line `ok` field in [`ChainReport`].
 ///
+/// #9505 (3-agent vote (71472661), ruling fe96bc17) — an input that cannot
+/// be read (the database, the root row, the chain, the `--cid` sweep query)
+/// is UNREADABLE: one document naming the stage and the error class, exit
+/// `2`. It is never the generic `Err` path, which `main` turns into exit 1.
+///
 /// # Errors
 ///
-/// Propagates I/O or database errors via `anyhow`.
+/// Propagates only a failure to write the report to `out`.
 pub fn run(db_path: &Path, args: &VerifyChainArgs, out: &mut CliOutput<'_>) -> Result<i32> {
     run_with_sweep_sql(db_path, args, out, CID_SWEEP_SQL)
 }
@@ -1043,7 +1128,13 @@ fn run_with_sweep_sql(
     sweep_sql: &str,
 ) -> Result<i32> {
     let json = args.format.to_ascii_lowercase() == "json";
-    let conn = crate::db::open(db_path).context("open db")?;
+    let root_id = args.memory_id.as_str();
+    let conn = match crate::db::open(db_path) {
+        Ok(conn) => conn,
+        Err(err) => {
+            return report_unreadable(out, json, root_id, ReadFault::of(ReadStage::Open, &err));
+        }
+    };
 
     // v1.0.0 #3436 — REFUSE an unknown root instead of certifying it.
     //
@@ -1065,8 +1156,12 @@ fn run_with_sweep_sql(
     // FAILED (#709). "I could not find it" and "I checked it and it is
     // broken" are different answers and a script must be able to tell them
     // apart.
-    let root =
-        crate::db::get(&conn, &args.memory_id).context("resolve verify-reflection-chain root")?;
+    let root = match crate::db::get(&conn, root_id) {
+        Ok(root) => root,
+        Err(err) => {
+            return report_unreadable(out, json, root_id, ReadFault::of(ReadStage::Root, &err));
+        }
+    };
     if root.is_none() {
         if json {
             let payload = serde_json::json!({
@@ -1095,13 +1190,19 @@ fn run_with_sweep_sql(
     // embedded in the same report: one JSON document, one summary line.
     let root_cid = root.as_ref().and_then(|row| check_root_cid(&conn, row));
     let cid_sweep = if args.cid {
-        Some(run_cid_sweep_query(&conn, sweep_sql)?)
+        match run_cid_sweep_query(&conn, sweep_sql) {
+            Ok(sweep) => Some(sweep),
+            Err(fault) => return report_unreadable(out, json, root_id, fault),
+        }
     } else {
         None
     };
-    let report = build_chain_report(&conn, &args.memory_id, args.include_signed_events)?
-        .with_root_cid(root_cid)
-        .with_cid_sweep(cid_sweep);
+    let report = match build_chain_report(&conn, root_id, args.include_signed_events) {
+        Ok(report) => report.with_root_cid(root_cid).with_cid_sweep(cid_sweep),
+        Err(err) => {
+            return report_unreadable(out, json, root_id, ReadFault::of(ReadStage::Chain, &err));
+        }
+    };
 
     if json {
         let payload = serde_json::to_string_pretty(&report).context("serialise chain report")?;
@@ -1139,10 +1240,45 @@ fn run_with_sweep_sql(
     // failed check is a failed verification, exit 2, never the generic
     // `Err` path, which `main` turns into exit 1 = NOT FOUND's code. It is
     // set once, by `with_root_cid` and `with_cid_sweep`, before anything
-    // was printed. A sweep query that cannot be prepared or stepped is the
-    // one `Err` left: the verdict could not be computed, nothing was
-    // printed, and stderr names the cause.
+    // was printed. An input that could not be read returned above through
+    // `report_unreadable` (exit 2, one document); the only `Err` left is a
+    // failure to write to `out`.
     if report.ok { Ok(0) } else { Ok(2) }
+}
+
+/// #9505 — print the ONE UNREADABLE document for `fault` and return exit
+/// `2`. JSON mode prints one object (`ok` false, `root_id`, `unreadable`
+/// with the stage and error class); text mode prints one summary line. Both
+/// streams carry fixed labels only, plus the caller's root id through the
+/// terminal funnels.
+fn report_unreadable(
+    out: &mut CliOutput<'_>,
+    json: bool,
+    root_id: &str,
+    fault: ReadFault,
+) -> Result<i32> {
+    if json {
+        let payload = serde_json::json!({
+            "ok": false,
+            "root_id": root_id,
+            "unreadable": fault,
+        });
+        let payload = serde_json::to_string_pretty(&payload).context("serialise unreadable")?;
+        writeln!(out.stdout, "{}", json_for_terminal(&payload)?)?;
+    } else {
+        writeln!(
+            out.stdout,
+            "verify-reflection-chain: root={} unreadable={} error_class={} ok=false",
+            Printed::field(root_id),
+            fault.stage.label(),
+            fault.error_class.label()
+        )?;
+    }
+    writeln!(
+        out.stderr,
+        "verify-reflection-chain: {fault}; verification failed"
+    )?;
+    Ok(2)
 }
 
 // ─────────────────────────────────────────────────────────────────────
