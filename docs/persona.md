@@ -117,6 +117,13 @@ the same fields as the SQL row plus the rendered body. Operators may
 freely delete or regenerate the directory — the SQL row stays
 canonical.
 
+The persona row passes the export confidentiality boundary that `export`
+uses before anything is written (#9606): a persona classified into a
+forbidden export class (for example a body carrying private-key material)
+is not written, leaves one signed `export.forbidden_class_refused` audit
+row and logs a warning; credential values in the body are written redacted
+when secret screening is on.
+
 On Unix, persona exports use mode 0600 files and mode 0700 directories
 owned by the current user. Publication replaces the file atomically; symlinks
 and non-regular destinations are refused. Slashes in namespace and entity

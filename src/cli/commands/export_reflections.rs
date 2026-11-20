@@ -22,7 +22,7 @@
 //! the file on disk is a derived artefact. Operators may freely
 //! delete / regenerate the directory at any time.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -140,7 +140,7 @@ pub fn run(db_path: &Path, args: &ExportReflectionsArgs, out: &mut CliOutput<'_>
     let reflections = collect_reflections(&conn, args.namespace.as_deref(), args.since.as_deref())?;
     // ERRORS-02: validate the whole batch before creating directories or files.
     // OWNERSHIP-05: borrow each row and retain its validated namespace path.
-    let mut validated = Vec::with_capacity(reflections.len());
+    let mut relatives = HashMap::with_capacity(reflections.len());
     for mem in &reflections {
         validate_export_id(&mem.id, &mem.namespace)?;
         let relative = sanitise_namespace_for_path(&mem.namespace).with_context(|| {
@@ -150,12 +150,24 @@ pub fn run(db_path: &Path, args: &ExportReflectionsArgs, out: &mut CliOutput<'_>
                 export_diagnostic(&mem.namespace)
             )
         })?;
-        validated.push((mem, relative));
+        relatives.insert(mem.id.clone(), relative);
     }
+    // #9606 — the export taxonomy screen (forbidden-class drop + signed
+    // refusal, then secret redaction) runs BEFORE any path is opened, so a
+    // dropped row never reaches render or the filesystem.
+    let (screened, ledger) =
+        crate::export_taxonomy::screen_memories_for_export_audited(reflections, Some(&conn));
     let private_root = PrivateExportDir::open(&out_dir)
         .with_context(|| format!("opening private out-dir {}", out_dir.display()))?;
     let mut swept_directories = HashSet::new();
-    for (mem, relative) in validated {
+    for mem in &screened {
+        // The screen only drops and redacts rows; ids are unchanged.
+        let relative = relatives.remove(&mem.id).with_context(|| {
+            format!(
+                "memory {}: screened row has no validated path",
+                export_diagnostic(&mem.id)
+            )
+        })?;
         let edges = collect_outbound_reflects_on(&conn, &mem.id)?;
         let attest_level = summarise_attest_level(&edges);
         let payload = render_payload(mem, &edges, attest_level, format);
@@ -194,7 +206,39 @@ pub fn run(db_path: &Path, args: &ExportReflectionsArgs, out: &mut CliOutput<'_>
         out_dir.display()
     )?;
     let _ = summary.skipped; // reserved for future "skip-existing" mode.
-    Ok(0)
+    finish_screen_report(&ledger, db_path, summary.written, out)
+}
+
+/// #9606 — report what the export taxonomy screen withheld or redacted on
+/// the operator channel, copying the `export` precedent
+/// (`cli::io::finish_export_report`): the structured `export_report` line
+/// whenever the run is partial or redacted, and exit
+/// [`crate::export_scope::EXIT_EXPORT_INCOMPLETE`] when a row was withheld,
+/// so a scripted export cannot mistake a partial tree for a complete one.
+fn finish_screen_report(
+    ledger: &crate::export_scope::ExportWithholdLedger,
+    source_db: &Path,
+    exported: usize,
+    out: &mut CliOutput<'_>,
+) -> Result<i32> {
+    if ledger.is_partial() || ledger.redacted_total() > 0 {
+        writeln!(
+            out.stderr,
+            "{}",
+            ledger.stderr_report_line(&source_db.to_string_lossy(), exported)
+        )?;
+    }
+    let withheld = ledger.withheld_total();
+    if withheld == 0 {
+        return Ok(0);
+    }
+    writeln!(
+        out.stderr,
+        "ERROR: export-reflections is INCOMPLETE — {withheld} reflection(s) withheld by the \
+         export confidentiality boundary; the other files WERE written. Exiting {} (#9606).",
+        crate::export_scope::EXIT_EXPORT_INCOMPLETE
+    )?;
+    Ok(crate::export_scope::EXIT_EXPORT_INCOMPLETE)
 }
 
 /// One outbound `reflects_on` edge — the substrate-side projection that

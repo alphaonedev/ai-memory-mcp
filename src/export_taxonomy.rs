@@ -387,9 +387,12 @@ pub fn screen_export_value_audited(
 }
 
 /// Unified export-egress screen for a corpus of memory ROWS — the single
-/// SSOT the CLI `export`, the HTTP admin `export_memories`, and (row-wise)
-/// the forensic bundle share so the three egress paths cannot drift (M2:
-/// three parallel egress paths previously gated inconsistently). Applies
+/// SSOT the CLI `export`, the HTTP admin `export_memories`, (row-wise) the
+/// forensic bundle, the CLI `export-reflections`, the `post_reflect`
+/// auto-export hook and the auto-persona file export share so the egress
+/// paths cannot drift (M2: three parallel egress paths previously gated
+/// inconsistently; #9606: the reflection and persona file writers were
+/// unscreened). Applies
 /// BOTH guards the confidentiality invariant requires, per row, in THIS
 /// order (order is load-bearing — see below):
 ///
