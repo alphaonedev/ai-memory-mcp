@@ -337,7 +337,7 @@ fn verify_null_genesis_is_ok_without_cid_line() {
 
 const ERR_GENESIS_COLUMN_MISSING: &str = "provenance column memories.cid_genesis is missing: \
 this database is on a schema older than v74 (the content-id columns). Repair: \
-`ai-memory migrate --in-place` or start the daemon, then re-run.";
+`ai-memory --db <path> stats` or start the daemon, then re-run.";
 const PRE_V74_STAMP: i64 = 73;
 const DROP_PRE_V74_COLUMNS_SQL: &[&str] = &[
     "DROP INDEX IF EXISTS idx_memories_cid",
@@ -542,7 +542,7 @@ fn link_on_real_v73_store_names_the_cid_column() {
     assert_eq!(
         err.to_string(),
         "provenance column memories.cid is missing: this database is on a schema older than \
-         v74 (the content-id columns). Repair: `ai-memory migrate --in-place` or start the \
+         v74 (the content-id columns). Repair: `ai-memory --db <path> stats` or start the \
          daemon, then re-run."
     );
     assert_eq!(link_rows(&conn), 0);

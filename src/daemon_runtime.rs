@@ -2722,7 +2722,7 @@ pub async fn run(
             // #3471 — the two REPORTING modes stay quiet: their whole output is
             // the report on stdout, and a tracing preamble on stderr would be
             // noise in a supervisor's health check.
-            if !a.posture && !a.health {
+            if cli::wake_hub::WakeHubMode::of(&a) == cli::wake_hub::WakeHubMode::Serve {
                 init_tracing();
             }
             match cli::wake_hub::dispatch(&a, app_config).await? {

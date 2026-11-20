@@ -71,11 +71,11 @@ KIND_VIOLATION = "violation"
 KIND_NOT_ANALYSED = "not-analysed"
 OPEN_PIN = 47
 NOT_ANALYSED_PIN = 3
-VIOLATION_PIN = 17
+VIOLATION_PIN = 16  # 17 at PR 9508; stage 1 of #9455 removed the lifetime-tests R2 row
 PIN_CEILINGS = {KIND_UNCLASSIFIABLE: OPEN_PIN, KIND_VIOLATION: VIOLATION_PIN, KIND_NOT_ANALYSED: NOT_ANALYSED_PIN}
 # The name each kind's table carries in a pin line.
 TABLE_NAMES = {KIND_UNCLASSIFIABLE: "unclassifiable", KIND_VIOLATION: "allow", KIND_NOT_ANALYSED: "not-analysed"}
-PINS_LINE = "unclassifiable 47; not-analysed 3; violation 17"
+PINS_LINE = "unclassifiable 47; not-analysed 3; violation 16"
 
 # The fixed issue set of each kind; a row naming any other value is a finding.
 # 9559, 9560 and 9561: the three issues of forms the merge of the chain tip brought (baseline of the landing tree).
@@ -245,6 +245,7 @@ REMOVAL_RULE_PHRASES = (
     "Pins at PR 9508: unclassifiable 47, not-analysed 3, violation 17",
     "The pins are the baseline of the tree PR 9508 lands on",
     "moved the unclassifiable pin 41 -> 47 once); after it lands they only go down",
+    "lowered the violation pin 17 -> 16",
     "is a proof for what the scan reaches only",
     "the list behind these rows is NOT complete",
     "rest-not-analysed",
