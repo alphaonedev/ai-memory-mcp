@@ -139,7 +139,7 @@ footer a{color:var(--text-muted)}
       <h4>Evidence sources</h4>
       <ul>
         <li><strong style="color:var(--text)">Unit / integration tests</strong> — named tests in <code>tests/</code> or in-module <code>#[cfg(test)]</code> blocks, run by <code>AI_MEMORY_NO_CONFIG=1 cargo test</code>. Cited as <code>file::test_name</code>; reproduce any single row with <code>cargo test &lt;test_name&gt;</code>.</li>
-        <li><strong style="color:var(--text)">CI gate</strong> — the GitHub Actions workflow · job that runs the check on every PR / push. Job names are read directly from <code>.github/workflows/*.yml</code>: <code>CI · check</code> (full test suite + the <em>Security audit</em> <code>cargo audit</code> step), <code>Fuzz Testing · fuzz</code>, <code>token-budget · budget</code>, <code>Bench · bench</code>, <code>Batman Mode acceptance gate · rust-integration / bash-integration / surface-stability</code>.</li>
+        <li><strong style="color:var(--text)">CI gate</strong> — the GitHub Actions workflow · job that runs the check on every PR / push. Job names are read directly from <code>.github/workflows/*.yml</code>: <code>CI · check</code> (full test suite), <code>CI · mobile-cross-compile</code> (android leg: the <em>Security audit</em> <code>cargo audit</code> step and the release-profile smoke build), <code>Fuzz Testing · fuzz</code>, <code>token-budget · budget</code>, <code>Bench · bench</code>, <code>Batman Mode acceptance gate · rust-integration / bash-integration / surface-stability</code>.</li>
         <li><strong style="color:var(--text)">do-1461 live-fleet harness</strong> — black-box probes against the live 15-node, 3-region reference fleet over the real TLS+mTLS path. Check ids come from <code>deploy/do-1461/test/run.sh</code> (groups <code>regression / crypto / federation / zerotouch / a2a / ai_nhi / nsa_gaps / curator</code>), <code>deploy/do-1461/validate/run.sh</code>, and <code>deploy/do-1461/test/encrypted_legs.sh</code>. Cited rows reference the run artifacts <code>test-20260609T161203Z.tsv</code> (150/150 PASS), <code>verify-20260609T133956Z.tsv</code> (119/119 PASS), and <code>encrypted-legs-20260608T205716Z.tsv</code> under <code>.local-runs/do-1461/reports/</code>. See the <a href="../reference-architecture/">reference architecture page</a> for the fleet itself.</li>
       </ul>
     </div>
@@ -332,7 +332,7 @@ footer a{color:var(--text-muted)}
         <tr>
           <td class="col-name">a · Choose supported MCP projects when possible</td>
           <td>Process control (maintenance + advisory channel), not a test target. Dependency hygiene is mechanically gated: the <em>Security audit</em> step runs <code>cargo audit</code> against the RustSec advisory DB.</td>
-          <td><code>CI · check</code> (<em>Security audit</em> step)</td>
+          <td><code>CI · mobile-cross-compile</code> (<em>Security audit</em> step, android leg)</td>
           <td><span class="tag na">not harness-applicable</span><br>Release/registry process — no fleet probe.</td>
         </tr>
         <tr>
@@ -406,7 +406,7 @@ footer a{color:var(--text-muted)}
         <tr>
           <td class="col-name">meta · Track and patch MCP-related vulnerabilities</td>
           <td><code>cargo audit</code> against the RustSec advisory database (<em>Security audit</em> step, <code>.github/workflows/ci.yml</code>), <code>Cargo.lock</code> dependency pinning.</td>
-          <td><code>CI · check</code> (<em>Security audit</em> step)</td>
+          <td><code>CI · mobile-cross-compile</code> (<em>Security audit</em> step, android leg)</td>
           <td><span class="tag na">not harness-applicable</span><br>Process control — no fleet probe.</td>
         </tr>
         <tr>

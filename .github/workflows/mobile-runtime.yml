@@ -103,6 +103,8 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: mobile-ios-sim
+          # #9681: a pull_request or merge_group run restores, never writes.
+          save-if: ${{ github.event_name == 'push' }}
 
       # Build the mobile-runtime test binary for the simulator.
       # `cargo test --no-run` produces the binary under
@@ -245,6 +247,8 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: mobile-android-emu
+          # #9681: a pull_request or merge_group run restores, never writes.
+          save-if: ${{ github.event_name == 'push' }}
 
       - name: Install Android NDK r26d
         id: setup-ndk
