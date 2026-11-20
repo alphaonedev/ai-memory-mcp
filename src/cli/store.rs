@@ -1958,4 +1958,106 @@ mod tests {
         assert_eq!(atom_count(&conn, cli_id), atom_count(&conn, mcp_id));
         assert_eq!(atom_count(&conn, cli_id), 2);
     }
+
+    // 9730-SCAN-END: the class guard scans the test module text ABOVE this line;
+    // the guard, its pure scanner and the table below live under it so their own
+    // setter-shaped text is never counted.
+
+    /// #9730 — the pure guard: every violation found in `src`, as exact reasons.
+    fn key_dir_guard_violations(src: &str) -> Vec<String> {
+        let needle = ["EnvVarGuard::set(", "\"AI_MEMORY_KEY_DIR\""].concat();
+        src.matches(needle.as_str())
+            .map(|_| "found a raw setter".to_owned())
+            .collect()
+    }
+
+    /// One table row: label, module text, expected violations.
+    type GuardRow = (&'static str, &'static str, Vec<String>);
+
+    fn guard_rows() -> Vec<GuardRow> {
+        let raw = |f: &str, form: &str, arg: &str| {
+            format!(
+                "key-dir variable set in `{f}` via `{form}` with `{arg}`; go through bind_key_dir (#9730)"
+            )
+        };
+        let unknown = |form: &str, arg: &str| {
+            format!(
+                "unrecognised first argument `{arg}` to `{form}`; use a string literal, a table name or bind_key_dir (#9730)"
+            )
+        };
+        vec![
+            (
+                "literal through EnvVarGuard::set",
+                r#"fn sign_a() { let _g = EnvVarGuard::set("AI_MEMORY_KEY_DIR", p); }"#,
+                vec![raw("sign_a", "EnvVarGuard::set(", "\"AI_MEMORY_KEY_DIR\"")],
+            ),
+            (
+                "constant path through EnvVarGuard::set",
+                r"fn sign_b() { let _g = EnvVarGuard::set(crate::identity::keypair::KEY_DIR_ENV, p); }",
+                vec![raw(
+                    "sign_b",
+                    "EnvVarGuard::set(",
+                    "crate::identity::keypair::KEY_DIR_ENV",
+                )],
+            ),
+            (
+                "bare constant through std::env::set_var",
+                r"fn sign_c() { unsafe { std::env::set_var(KEY_DIR_ENV, p) }; }",
+                vec![raw("sign_c", "set_var(", "KEY_DIR_ENV")],
+            ),
+            (
+                "literal through env::set_var",
+                r#"fn sign_d() { unsafe { env::set_var("AI_MEMORY_KEY_DIR", p) }; }"#,
+                vec![raw("sign_d", "set_var(", "\"AI_MEMORY_KEY_DIR\"")],
+            ),
+            (
+                "call split over lines with extra whitespace",
+                "fn sign_e() {\n  let _g = EnvVarGuard  ::\n   set (\n      KEY_DIR_ENV ,\n   p );\n}",
+                vec![raw("sign_e", "EnvVarGuard::set(", "KEY_DIR_ENV")],
+            ),
+            (
+                "unknown expression as first argument",
+                r"fn sign_f() { unsafe { std::env::set_var(name_from(x), p) }; }",
+                vec![unknown("set_var(", "name_from(x)")],
+            ),
+            (
+                "alias of the variable name",
+                r#"fn sign_g() { let k = "AI_MEMORY_KEY_DIR"; unsafe { std::env::set_var(k, p) }; }"#,
+                vec![unknown("set_var(", "k")],
+            ),
+            (
+                "key-dir setter outside any fn",
+                r"static X: () = set_var(KEY_DIR_ENV, p);",
+                vec![raw("<no enclosing fn>", "set_var(", "KEY_DIR_ENV")],
+            ),
+            (
+                "allowed: the helper, literal form",
+                r#"fn bind_key_dir(d: &Path) -> G { EnvVarGuard::set("AI_MEMORY_KEY_DIR", d) }"#,
+                vec![],
+            ),
+            (
+                "allowed: the guard's own test, constant form",
+                r"fn env_var_guard_restores_previous_value_on_drop() { set_var(KEY_DIR_ENV, p); }",
+                vec![],
+            ),
+            (
+                "allowed: other variable by literal and by table names",
+                r#"fn t() { EnvVarGuard::set("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", v); set_var(key, val); set_var(self.key, v); }"#,
+                vec![],
+            ),
+            (
+                "unknown stays red inside an allowed site",
+                r"fn bind_key_dir(d: &Path) { set_var(pick(), d); }",
+                vec![unknown("set_var(", "pick()")],
+            ),
+        ]
+    }
+
+    /// #9730 — table over setter spellings: the guard must report each exactly.
+    #[test]
+    fn key_dir_guard_reports_every_setter_spelling_9730() {
+        for (label, src, expected) in guard_rows() {
+            assert_eq!(key_dir_guard_violations(src), expected, "row: {label}");
+        }
+    }
 }
