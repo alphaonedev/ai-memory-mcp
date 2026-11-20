@@ -972,7 +972,7 @@ jobs:
       # #9734: the step below keeps its #6344 name and runs only the shard wiring tests, so its time
       # stays under 10 s; the whole scripts/ci/tests discovery (659 s) runs in the next steps.
       - name: Shard partition and wiring unit tests (#6344)
-        run: python3 -m unittest discover -s scripts/ci/tests -p test_ci_shard_wiring_6344.py
+        run: python3 -m unittest discover -s scripts/ci/tests -p "*_shard_wiring_6344.py"
       # #9593 - moved here from `classify`, where this 11.7 min step held every
       # `needs: classify` job (the four Check legs and seven others) back.
       # This job has no `needs:`, is no ancestor of any Check leg, runs on every
