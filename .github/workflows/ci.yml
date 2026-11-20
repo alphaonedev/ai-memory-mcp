@@ -151,10 +151,6 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
-  # #9509/#9515: no Rust test of this workflow may fetch a model from the
-  # network; the embedder and cross-encoder take the staged offline cache
-  # only (one workflow-level source, held by the 9509 staging pin).
-  AI_MEMORY_EMBED_OFFLINE: "1"
   CARGO_TERM_COLOR: always
   # #7160 - size cap for the persistent self-hosted target/debug build state
   # (40 GiB); scripts/ci-sweep-target.py reads it via the sweep step below.
@@ -1153,6 +1149,12 @@ jobs:
     # that wait counts against the cap (JOB_T0 is unchanged), hence 300 there.
     timeout-minutes: ${{ matrix.timeout }}
     env:
+      # #9509/#9515: no Rust test of this job may fetch a model from the
+      # network; the embedder and cross-encoder take the staged offline cache
+      # only. ci.yml sets the knob once per job that runs Rust tests, not at
+      # workflow level, because the #8240 pre-trust gate pins the workflow env
+      # (held by the 9509 staging pin).
+      AI_MEMORY_EMBED_OFFLINE: "1"
       # Debuginfo budget for this job — the heaviest compile in CI (~600
       # integration test binaries per leg).
       #
@@ -1814,7 +1816,7 @@ jobs:
       #      the pinned revisions and otherwise ends HERE with a named reason
       #      and exit code before any test runs (D1-1);
       #   4. a save only after a verified stage on a cache miss (D1-2).
-      # The workflow-level AI_MEMORY_EMBED_OFFLINE then keeps every test
+      # The job-level AI_MEMORY_EMBED_OFFLINE then keeps every test
       # offline, so no test can fetch a model from the network (#9515).
       - name: Private HF home (#9509)
         if: needs.classify.outputs.cargo_skip != 'true'
@@ -3048,6 +3050,10 @@ jobs:
     # masking a genuine hang (this job has no #1492 watchdog, so its cap is its
     # only bound).
     timeout-minutes: 55
+    env:
+      # #9509/#9515: the lib tests run offline from the staged model cache
+      # (one job-level source; see job check).
+      AI_MEMORY_EMBED_OFFLINE: "1"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -3087,7 +3093,7 @@ jobs:
       # none, so the cache must be staged wherever these lib tests run (b29
       # 6a339cef; held by the 9509 lib-test stage census cell under
       # scripts/ci/tests). The lib tests read AI_MEMORY_EMBED_OFFLINE from the
-      # workflow-level env, so they run offline too (#9515).
+      # job-level env, so they run offline too (#9515).
       - name: Private HF home (#9509)
         env:
           RUNNER_TEMP_ARG: ${{ runner.temp }}
@@ -3141,6 +3147,10 @@ jobs:
     # #1487 — bound the job so a wedged test can't pin the runner. 30 is the
     # pre-#3109 value measured on this runner class and is unchanged by #3109.
     timeout-minutes: 30
+    env:
+      # #9509/#9515: no Rust test of this job may fetch a model from the
+      # network (one job-level source; see job check).
+      AI_MEMORY_EMBED_OFFLINE: "1"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:

@@ -6,8 +6,10 @@ provides, and a test that can reach a network model fetch. Invariants (fix
 notice 9531-r1, 3-agent vote 71472661 D1-1 .. D2-4):
 
 A. No test and no CI step can reach a network model fetch. Every workflow
-   step that runs Rust tests sees AI_MEMORY_EMBED_OFFLINE=1 from the one
-   workflow-level env line (no job or step overrides it), and Rust test code
+   step that runs Rust tests sees AI_MEMORY_EMBED_OFFLINE=1 from one source:
+   the workflow-level env line, or, in a workflow whose workflow env the
+   #8240 pre-trust gate pins (ci.yml), one job-level line per job that runs
+   Rust tests (no step overrides it, nothing else names it), and Rust test code
    never names a network-capable constructor (`Embedder::new_local`,
    `Embedder::new`, `Embedder::for_model(MiniLmL6V2)`,
    `CrossEncoder::new_neural`) outside the argument of a knob runner that
@@ -45,6 +47,10 @@ STAGE_REL = "scripts/ci/stage_hf_cache.py"
 PRIVATE_REL = "scripts/ci/hf_home_private.py"
 KNOB = "AI_MEMORY_EMBED_OFFLINE"
 KNOB_VALUE = '"1"'
+# Workflows whose workflow-level env is pinned key for key by the #8240
+# pre-trust gate (scripts/ci/tests/test_ci_base_selector_8240.py
+# WORKFLOW_ENV_VALUES): the knob is one job-level line per Rust-test job there.
+JOB_LEVEL_KNOB_FILES = ("ci.yml",)
 CHECK_JOB = "check"
 SAL_JOB = "sal-feature"
 COVERAGE_JOB = "per-module-thresholds"
@@ -292,7 +298,7 @@ class StagingJobs(unittest.TestCase):
 
 
 class OfflineKnob(unittest.TestCase):
-    """A: every step that runs Rust tests sees the knob from the one workflow-level line."""
+    """A: every step that runs Rust tests sees the knob from its one source."""
 
     def rust_test_steps(self, path: Path):
         for job in jobs_of(path):
@@ -300,6 +306,9 @@ class OfflineKnob(unittest.TestCase):
             for name, body in steps(lines):
                 if TEST_RE.search(code_lines("\n".join(body))):
                     yield job, name, lines, body
+
+    def rust_test_jobs(self, path: Path) -> list[str]:
+        return sorted({job for job, _, _, _ in self.rust_test_steps(path)})
 
     def test_every_test_step_runs_with_the_knob_9509(self):
         offenders, seen = [], 0
@@ -316,17 +325,34 @@ class OfflineKnob(unittest.TestCase):
     def test_knob_has_one_source_per_workflow_9509(self):
         for path in workflow_files():
             text = code_lines(path.read_text())
-            runs_tests = any(True for _ in self.rust_test_steps(path))
+            test_jobs = self.rust_test_jobs(path)
             with self.subTest(file=path.name):
-                self.assertEqual(text.count(KNOB), 1 if runs_tests else 0)
-                if runs_tests:
+                if path.name in JOB_LEVEL_KNOB_FILES:
+                    self.assertGreater(len(test_jobs), 0)
+                    self.assertNotIn(KNOB, top_env(path))
+                    self.assertEqual(text.count(KNOB), len(test_jobs))
+                    for job in test_jobs:
+                        self.assertEqual(job_env(job_lines(path, job)).get(KNOB), KNOB_VALUE, job)
+                    continue
+                self.assertEqual(text.count(KNOB), 1 if test_jobs else 0)
+                if test_jobs:
                     self.assertEqual(top_env(path).get(KNOB), KNOB_VALUE)
 
-    def test_sal_lib_test_step_reads_the_workflow_knob_9509(self):
-        """The inverted sal pin: the lib tests run offline, from the workflow line."""
+    def test_job_level_knob_files_have_pinned_workflow_env_9509(self):
+        """The job-level exception holds only where the #8240 gate pins the workflow env."""
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import test_ci_base_selector_8240 as selector  # noqa: PLC0415
+
+        self.assertEqual(JOB_LEVEL_KNOB_FILES, (CI.name,))
+        self.assertNotIn(KNOB, selector.WORKFLOW_ENV_VALUES)
+        self.assertEqual(set(top_env(CI)), set(selector.WORKFLOW_ENV_VALUES))
+
+    def test_sal_lib_test_step_reads_the_job_knob_9509(self):
+        """The inverted sal pin: the lib tests run offline, from the job-level line."""
         body = "\n".join(dict(steps(job_lines(CI, SAL_JOB)))[SAL_TEST_STEP])
-        self.assertEqual(top_env(CI).get(KNOB), KNOB_VALUE)
-        self.assertNotIn(KNOB, job_env(job_lines(CI, SAL_JOB)))
+        self.assertNotIn(KNOB, top_env(CI))
+        self.assertEqual(job_env(job_lines(CI, SAL_JOB)).get(KNOB), KNOB_VALUE)
+        self.assertNotIn(KNOB, env_block(body.split("\n"), 8))
         self.assertEqual(step_code(body)[-1].strip(), "run: cargo test --features sal --lib")
 
     def test_no_composite_action_runs_rust_tests_9509(self):
