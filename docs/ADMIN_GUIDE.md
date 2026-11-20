@@ -1426,6 +1426,13 @@ An `ai-memory mcp` process also reads this variable (#9367): with
 every forwarded write. **Warning:** do not leave an enrolment or admin token
 exported in `AI_MEMORY_AGENT_API_KEY_FILE` in a shell or unit where an MCP process
 starts; point it only at that agent's own per-agent key file.
+Both readers of this file (`bind-api-key` and the MCP forwarder) refuse a file
+that is not a regular file, larger than 4096 bytes, not owned by the current
+user or root, or readable by group or others. A symlink is followed on purpose:
+mounted secrets (a Kubernetes secret volume, for example) are symlinks, so the
+checks apply to the file the link reaches. Keep the key file and every
+directory on its path writable only by its owner, so no other user can swap the
+link target.
 The alternative, **WARN-flagged and weaker**: start the daemon once with
 `AI_MEMORY_ADMIN_HEADER_TRUST=1` (the boot WARN names it), mint the key over
 HTTP, then unset the variable. The opt-in works only while this daemon's enrolled registry is empty (bootstrap, or after every key is revoked; emptiness is confirmed by an authoritative store read, and a store error refuses, recorded with reason `header_trust_refused_registry_unreadable`) (#8574): once ANY
