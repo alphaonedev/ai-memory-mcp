@@ -13949,7 +13949,9 @@ const FIXTURE_PROBE_LINE_9719: &str = "FIXTURE_PROBE_9719";
 const FIXTURE_PROBE_LEAD_MS_9719: u128 = 3000;
 
 /// Field separator of the child result line.
-const FIXTURE_PROBE_SEP_9719: char = ' ';
+/// A tab: a space is legal inside a target directory path, a tab is not
+/// produced by any path the fixture builds (the writer asserts it).
+const FIXTURE_PROBE_SEP_9719: char = '\t';
 
 /// Number of fields in the child result line: prefix, HOME, keys dir, loaded.
 const FIXTURE_PROBE_FIELDS_9719: usize = 4;
@@ -13957,6 +13959,10 @@ const FIXTURE_PROBE_FIELDS_9719: usize = 4;
 /// Writer half of the child-to-parent result line.
 fn format_probe_line_9719(home: &std::path::Path, keys: &std::path::Path, loaded: bool) -> String {
     let sep = FIXTURE_PROBE_SEP_9719;
+    assert!(
+        !home.to_string_lossy().contains(sep) && !keys.to_string_lossy().contains(sep),
+        "fixture path carries the probe separator: {home:?} {keys:?}"
+    );
     format!(
         "{FIXTURE_PROBE_LINE_9719}{sep}{}{sep}{}{sep}{loaded}",
         home.display(),
