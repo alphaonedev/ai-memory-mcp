@@ -438,6 +438,101 @@ class WorkflowShape(unittest.TestCase):
                     self.assertIn(needle, body, "%s: %s" % (name, step_label))
 
 
+# The step-level `if:` terms the touched workflows may use, each evaluated by hand. A condition is
+# terms joined by " && "; a term outside this table fails the test, so a new form is never guessed.
+DOCS_TERM = re.compile(r"^steps\.docs\.outputs\.docs_only (==|!=) '([^']*)'$")
+RUNNER_TERM = re.compile(r"^runner\.environment (==|!=) '([^']*)'$")
+RUNNER_ENVIRONMENTS = ("github-hosted", "self-hosted")
+# What the gate step can leave in docs_only: true skips work; empty (a doubt before the base copy, or
+# an event other than pull_request) and false run in full.
+DOCS_ONLY_VALUES = ("true", "", "false")
+# The guarded steps that also carry a runner term (by hand); every other guarded step runs on both.
+RUNNER_ONLY = {
+    ("postgres-ignored.yml", ASSERT_RUSTUP): NOT_HOSTED,
+    ("cert-postgres-age.yml", ASSERT_RUSTUP): NOT_HOSTED,
+    ("cert-postgres-age.yml", "Swatinem/rust-cache"): HOSTED,
+}
+
+
+def step_runs(cond, docs_only, runner_env, failed=False):
+    """Whether a step with `if: cond` runs in a job that has not failed, as GitHub evaluates it."""
+    if cond is None:
+        return not failed
+    status = None
+    result = True
+    for term in cond.split(" && "):
+        if term in (ALWAYS, FAILURE):
+            status = term
+            continue
+        for pattern, actual in ((DOCS_TERM, docs_only), (RUNNER_TERM, runner_env)):
+            match = pattern.match(term)
+            if match:
+                equal = actual == match.group(2)
+                result = result and (equal if match.group(1) == "==" else not equal)
+                break
+        else:
+            raise AssertionError("an `if:` term this harness cannot evaluate: %r" % term)
+    if status == ALWAYS:
+        return result
+    if status == FAILURE:
+        return failed and result
+    return (not failed) and result
+
+
+class WorkflowRun(unittest.TestCase):
+    """Every step of every touched job, run through its `if:` for each docs_only value and runner."""
+
+    def runs(self, name, job_id, docs_only, runner_env):
+        _, jobs = read_workflow(name)
+        return [label(s) for s in jobs[job_id]["steps"]
+                if step_runs(s.get("if"), docs_only, runner_env)]
+
+    def test_test_steps_run_unless_docs_only_is_true_9683(self):
+        for name, spec in EXPECTED.items():
+            for job_id in spec["jobs"]:
+                for runner_env in RUNNER_ENVIRONMENTS:
+                    for docs_only in DOCS_ONLY_VALUES:
+                        with self.subTest(workflow=name, runner=runner_env, docs_only=docs_only):
+                            ran = self.runs(name, job_id, docs_only, runner_env)
+                            for step_label in spec["tests"]:
+                                self.assertEqual(step_label in ran, docs_only != "true", step_label)
+
+    def test_docs_only_true_runs_only_the_steps_before_the_gate_and_housekeeping_9683(self):
+        for name, spec in EXPECTED.items():
+            for job_id in spec["jobs"]:
+                _, jobs = read_workflow(name)
+                labels = [label(s) for s in jobs[job_id]["steps"]]
+                before = labels[:labels.index(GATE_LABEL) + 1]
+                for runner_env in RUNNER_ENVIRONMENTS:
+                    with self.subTest(workflow=name, runner=runner_env):
+                        ran = self.runs(name, job_id, "true", runner_env)
+                        full = self.runs(name, job_id, "false", runner_env)
+                        for step in jobs[job_id]["steps"]:
+                            step_label = label(step)
+                            if step_label in before or (step.get("if") or "").startswith(HOUSEKEEPING_PREFIXES):
+                                self.assertEqual(step_label in ran, step_label in full, step_label)
+                            else:
+                                # Skipped on docs-only; on a full run only its runner term decides.
+                                self.assertNotIn(step_label, ran)
+                                runner_only = RUNNER_ONLY.get((name, step_label))
+                                self.assertEqual(step_label in full,
+                                                 step_runs(runner_only, "false", runner_env), step_label)
+
+    def test_the_evaluator_reads_each_term_9683(self):
+        """Controls for step_runs itself, written by hand."""
+        self.assertTrue(step_runs(GUARD, "", "self-hosted"))
+        self.assertFalse(step_runs(GUARD, "true", "self-hosted"))
+        self.assertFalse(step_runs(guarded(NOT_HOSTED), "", "github-hosted"))
+        self.assertTrue(step_runs(guarded(NOT_HOSTED), "false", "self-hosted"))
+        self.assertTrue(step_runs(ALWAYS, "true", "github-hosted", failed=True))
+        self.assertFalse(step_runs(FAILURE, "", "self-hosted"))
+        self.assertTrue(step_runs(FAILURE, "", "self-hosted", failed=True))
+        self.assertFalse(step_runs(SWEEP_IF, "", "github-hosted"))
+        self.assertFalse(step_runs(None, "", "self-hosted", failed=True))
+        with self.assertRaises(AssertionError):
+            step_runs("steps.docs.outputs.docs_only != 'true' || always()", "", "self-hosted")
+
+
 class GateAction(unittest.TestCase):
     """The composite action: inputs only through env, fixed git commands, the BASE copy's step."""
 
@@ -648,6 +743,16 @@ ALL_DOCS_SECTION = {
     "test_read_globs": [], "ci_tree_globs": [], "ci_tree_exempt_globs": [], "full_ci_events": [],
     "full_ci_base_names": [], "full_ci_base_prefixes": []}
 FULL_RUN_LITERAL = "docs_only stays empty and the job runs in full"
+# Standard-library modules the gate's helpers import after the gate extends sys.path; a file of the
+# same name beside impact/ must never be the one imported.
+PLANTED_STDLIB_NAMES = ("json.py", "sqlite3.py")
+# A sitecustomize a job could reach through PYTHONPATH: it claims docs-only and exits before the
+# gate runs. The interpreter that runs the base copy is isolated, so it is never loaded.
+STEERING_SITECUSTOMIZE = (
+    "import os\n"
+    "with open(os.environ['GITHUB_OUTPUT'], 'a') as out:\n"
+    "    out.write('docs_only=true\\n')\n"
+    "os._exit(0)\n")
 
 
 def all_docs_rules():
@@ -740,7 +845,7 @@ class GateRepo(unittest.TestCase):
         return lines[0], res.stdout.decode("utf-8", "replace")
 
     def run_action(self, event="pull_request", base=None, base_ref=CHAIN_BASE, runner_temp=True,
-                   event_base=None):
+                   event_base=None, extra_env=None):
         """Run this tree's composite action the way the runner does; return a result dict.
 
         Each step runs as `bash --noprofile --norc -eo pipefail` (the runner's `shell: bash`) in the
@@ -748,7 +853,8 @@ class GateRepo(unittest.TestCase):
         at the PR head's copy of the action, and its own GITHUB_OUTPUT. `event_base` is
         github.event.pull_request.base.sha (default: the base-sha input, as every caller passes it).
         `if:` comes from ACTION_CONDITIONS only; a failed step without continue-on-error fails the
-        action. Keys: failed, docs_only, outcomes, stdout.
+        action. `extra_env` is added to every step's environment (a runner variable the job set).
+        Keys: failed, docs_only, outcomes, stdout.
         """
         inputs_default, outputs, steps = parse_action(ACTION.read_text(encoding="utf-8"))
         inputs = dict(inputs_default)
@@ -788,6 +894,7 @@ class GateRepo(unittest.TestCase):
             env.update({"GITHUB_ACTION_PATH": str(action_path), "HOME": str(self.top),
                         "GIT_CONFIG_NOSYSTEM": "1",
                         "PATH": str(bindir) + os.pathsep + env.get("PATH", "/usr/bin:/bin")})
+            env.update(extra_env or {})
             self.assertEqual(step.get("shell"), "bash")
             res = subprocess.run(["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", step["run"]],
                                  cwd=str(self.repo), env=env, capture_output=True, timeout=300,
@@ -925,6 +1032,34 @@ class StepDoubt(GateRepo):
         line, _ = self.run_step()
         self.assertEqual(line, "docs_only=true")
 
+    def test_base_decider_is_not_asked_off_pull_request_9683(self):
+        """Off pull_request the step writes false before it runs any decider: a base decider that
+        always answers docs-only is not consulted (the decider's own event check is a second line)."""
+        self.base_decider_exits("    sys.exit(%d)" % GATE.EXIT_DOCS_ONLY)
+        self.commit("docs/b.md", "b\n")
+        for event in ("push", "merge_group", "workflow_dispatch", ""):
+            with self.subTest(event=event):
+                line, out = self.run_step(event=event)
+                self.assertEqual(line, "docs_only=false")
+                self.assertIn("is not a pull request", out)
+
+    def test_planted_stdlib_name_beside_impact_is_not_imported_9683(self):
+        """The gate appends its parent to sys.path, so a json.py or sqlite3.py planted beside impact/
+        never shadows the standard library (REVIEW-9696 L2); the copy still decides a full run."""
+        tree = self.top / "planted" / "ci"
+        (tree / "impact").mkdir(parents=True)
+        for name in GATE_FILES:
+            shutil.copyfile(str(IMPACT / name), str(tree / "impact" / name))
+        for name in PLANTED_STDLIB_NAMES:
+            (tree / name).write_text("raise SystemExit(%d)\n" % GATE.EXIT_DOCS_ONLY)
+        for raw, expected in ((FULL_ROWS["code middle"], EXIT_FULL_RUN_CODE),
+                              (DOCS_ONLY_ROWS["three docs"], GATE.EXIT_DOCS_ONLY)):
+            res = subprocess.run([sys.executable, "-I", str(tree / "impact" / "docs_only_gate.py"),
+                                  "decide", "--stdin", "--rules", str(tree / "impact" / "rules.json"),
+                                  "--event-name", "pull_request", "--base-ref", CHAIN_BASE],
+                                 input=raw, capture_output=True, timeout=120, check=False)
+            self.assertEqual(res.returncode, expected, res.stderr.decode("utf-8", "replace"))
+
     def test_base_decider_timeout_is_a_full_run_9683(self):
         self.base_decider_exits("    import time\n    time.sleep(60)\n    sys.exit(%d)" % GATE.EXIT_DOCS_ONLY)
         self.commit("docs/b.md", "b\n")
@@ -1048,6 +1183,17 @@ class ActionRun(GateRepo):
         self.assertEqual(result["docs_only"], "true", result)
         self.assertEqual(result["outcomes"].get("gate"), "success")
         self.assertNotIn(FULL_RUN_LITERAL, result["stdout"])
+
+    def test_pythonpath_sitecustomize_does_not_steer_the_base_copy_9683(self):
+        """A job-level PYTHONPATH is not read by the isolated interpreter that runs the base copy, so a
+        sitecustomize there cannot write docs_only=true for a code PR."""
+        site = self.top / "site"
+        site.mkdir()
+        (site / "sitecustomize.py").write_text(STEERING_SITECUSTOMIZE)
+        self.commit("src/lib.rs", "// changed\n")
+        result = self.run_action(extra_env={"PYTHONPATH": str(site)})
+        self.assertFalse(result["failed"], result)
+        self.assertEqual(result["docs_only"], "false", result)
 
     def test_base_decider_unknown_exit_through_the_action_is_a_full_run_9683(self):
         for code in (1, 2, 4):
