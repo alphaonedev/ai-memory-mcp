@@ -693,7 +693,9 @@ class TierSteps(unittest.TestCase):
             return Result()
         rec = Recorder(answer)
         with unittest.mock.patch.object(pib.subprocess, 'run', rec):
-            pib.teardown(BASE, 'ai_memory_test_ci_9_1_x', RUN)
+            failed = pib.teardown(BASE, 'ai_memory_test_ci_9_1_x', RUN)
+        # #9592: a name of another run is filtered before drop(), never counted as a failed drop.
+        self.assertEqual(failed, 0)
         sql = rec.sql()
         listing = [s for s in sql if s.startswith('SELECT')][0]
         self.assertIn('ai_memory_t_r6386_', listing, 'the listing is scoped to this run')
