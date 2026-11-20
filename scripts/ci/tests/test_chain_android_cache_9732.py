@@ -19,6 +19,14 @@ pull_request run never writes a cache the chain reads. Same scheme as #9681 (cop
   the job id by rust-cache, so a pair of differently named jobs could never match.
 * The PR step still saves on a `push` only.
 
+Second class (review r1, F1): an input of the cache key or of the cached output that no test reads.
+The module reads the whole of every mirrored step and of every job-level input against a hand table
+(`MIRRORS`, `JOB_KEYS_MAY_DIFFER`, `ENV_ONE_SIDED`): any added, removed or changed key or value on
+either side is a failure unless the table names that key for that step as allowed to differ, and a
+step key, a job key or a step the table does not know is a failure naming workflow, job, step and
+key. No key is skipped by default. Fixture tests feed `mirror_problems` mutated copies of the two
+workflow texts (the reviewer's R1 and R2 and one per key and side) and assert the exact text.
+
 Run: python3 -I -m unittest discover -s scripts/ci/tests -p 'test_chain_android_cache_9732.py'
 """
 
@@ -26,6 +34,7 @@ from __future__ import annotations
 
 import sys
 import unittest
+from dataclasses import dataclass
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -75,6 +84,92 @@ def _by_label(job: base.Job, label: str) -> base.Step:
 
 def _expanded(step: base.Step, key: str, leg: dict[str, object]) -> dict[str, str]:
     return {k: base._expand_matrix(v, leg) for k, v in step.mapping(key).items()}
+
+
+
+
+# --- fixtures: mutated copies of the two workflow texts ---------------------------------------
+# An op is ("after", anchor, [lines]) | ("sub", old, new) | ("replace_at", anchor, offset, old,
+# new) | ("end", [lines]). An anchor must match exactly one line, or the fixture itself fails.
+
+OLD_CHECKOUT_PIN = "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
+NEW_CHECKOUT_PIN = "actions/checkout@0000000000000000000000000000000000000000"
+CHECKOUT_ID = "actions/checkout"
+CACHE_ID = "Swatinem/rust-cache"
+GATE_SKIP = "needs.classify.outputs.cargo_skip != 'true'"
+BUILD_PR_LABEL = "Build release (once leg — release-profile smoke)"
+BUILD_WARM_LABEL = "Build release (release-profile smoke)"
+ENV_STEP = ["        env:", "          FOO: bar"]
+SIDES = ("pr", "warm")
+
+
+def _apply(lines: list[str], ops: tuple[tuple, ...]) -> list[str]:
+    out = list(lines)
+    for op in ops:
+        if op[0] == "end":
+            out.extend(op[1])
+            continue
+        anchor = op[1]
+        hits = [i for i, line in enumerate(out) if anchor in line]
+        if len(hits) != 1:
+            raise AssertionError(f"fixture anchor {anchor!r} matched {len(hits)} lines")
+        at = hits[0]
+        if op[0] == "after":
+            out[at + 1:at + 1] = op[2]
+        elif op[0] == "sub":
+            out[at] = out[at].replace(anchor, op[2])
+        elif op[0] == "replace_at":
+            _, _, offset, old, new = op
+            if old not in out[at + offset]:
+                raise AssertionError(f"fixture text {old!r} is not on line {at + offset}")
+            out[at + offset] = out[at + offset].replace(old, new)
+        else:
+            raise AssertionError(f"unknown fixture op {op[0]!r}")
+    return out
+
+
+def _problems(pr_wf_ops: tuple = (), warm_wf_ops: tuple = (), pr_job_ops: tuple = (),
+              warm_job_ops: tuple = ()) -> list[str]:
+    pr_wf, pr_job, leg = _android_leg()
+    warm_wf, warm_job = _warm_job()
+    if pr_wf_ops:
+        pr_wf = base.Workflow(pr_wf.name, _apply(pr_wf.lines, pr_wf_ops))
+        pr_job = pr_wf.jobs()[PR_JOB_ID]
+    if warm_wf_ops:
+        warm_wf = base.Workflow(warm_wf.name, _apply(warm_wf.lines, warm_wf_ops))
+        warm_job = warm_wf.jobs()[WARM_JOB_ID]
+    if pr_job_ops:
+        pr_job = base.Job(pr_job.job_id, _apply(pr_job.lines, pr_job_ops))
+    if warm_job_ops:
+        warm_job = base.Job(warm_job.job_id, _apply(warm_job.lines, warm_job_ops))
+    return mirror_problems(pr_wf, pr_job, warm_wf, warm_job, leg)
+
+
+def _on_side(side: str, ops: tuple) -> list[str]:
+    """The problems when `ops` edit the job of one side (the other side stays as it is)."""
+    return _problems(pr_job_ops=ops) if side == "pr" else _problems(warm_job_ops=ops)
+
+
+def _step_diff(pr_id: str, warm_id: str, key: str, pr_val: object, warm_val: object) -> str:
+    return (f"{PR_NAME}:{PR_JOB_ID} step {pr_id!r} vs {base.WARM}:{WARM_JOB_ID} step "
+            f"{warm_id!r}: key {key!r} differs: {PR_NAME} has {pr_val!r}, {base.WARM} has "
+            f"{warm_val!r}")
+
+
+def _job_diff(key: str, pr_val: object, warm_val: object) -> str:
+    return (f"{PR_NAME}:{PR_JOB_ID} vs {base.WARM}:{WARM_JOB_ID}: job key {key!r} differs: "
+            f"{PR_NAME} has {pr_val!r}, {base.WARM} has {warm_val!r}")
+
+
+def _env_diff(name: str, pr_val: object, warm_val: object) -> str:
+    return (f"{PR_NAME}:{PR_JOB_ID} vs {base.WARM}:{WARM_JOB_ID}: env {name!r} differs: "
+            f"{PR_NAME} has {pr_val!r}, {base.WARM} has {warm_val!r}")
+
+
+def _real_problems() -> list[str]:
+    pr_wf, pr_job, leg = _android_leg()
+    warm_wf, warm_job = _warm_job()
+    return mirror_problems(pr_wf, pr_job, warm_wf, warm_job, leg)
 
 
 class ChainAndroidCache9732(unittest.TestCase):
@@ -185,6 +280,271 @@ class ChainAndroidCache9732(unittest.TestCase):
         self.assertIn((PR_NAME, PR_JOB_ID, "target=aarch64-apple-ios"),
                       base.UNPAIRED_RUST_CACHE_SITES)
         self.assertNotIn((PR_NAME, PR_JOB_ID, LEG_ID), base.UNPAIRED_RUST_CACHE_SITES)
+
+
+class MirrorInputs9732(unittest.TestCase):
+    """Review r1 F1: every input of the cache key and of the cached output is read, both sides."""
+
+    def test_the_real_workflows_have_no_mirror_problem(self) -> None:
+        self.assertEqual(_real_problems(), [])
+
+    def test_r1_a_step_env_on_the_pr_cache_step_is_refused(self) -> None:
+        ops = (("after", "uses: Swatinem/rust-cache@", ENV_STEP),)
+        self.assertEqual(_problems(pr_job_ops=ops),
+                         [_step_diff(CACHE_ID, CACHE_ID, "env", "FOO: bar", None)])
+
+    def test_r2_a_step_env_on_the_warm_build_release_step_is_refused(self) -> None:
+        ops = (("after", "name: Build release", ENV_STEP),)
+        self.assertEqual(_problems(warm_job_ops=ops),
+                         [_step_diff(BUILD_PR_LABEL, BUILD_WARM_LABEL, "env", None, "FOO: bar")])
+
+    def test_a_step_env_on_the_other_side_of_each_pair_is_refused(self) -> None:
+        for side, anchor, pr_id, warm_id, pr_val, warm_val in (
+                ("warm", "uses: Swatinem/rust-cache@", CACHE_ID, CACHE_ID, None, "FOO: bar"),
+                ("pr", "name: Build release", BUILD_PR_LABEL, BUILD_WARM_LABEL, "FOO: bar", None)):
+            with self.subTest(side=side, anchor=anchor):
+                self.assertEqual(_on_side(side, (("after", anchor, ENV_STEP),)),
+                                 [_step_diff(pr_id, warm_id, "env", pr_val, warm_val)])
+
+    def test_every_step_key_added_to_either_side_is_refused(self) -> None:
+        added = (("if", ["        if: always()"], "always()"),
+                 ("shell", ["        shell: bash"], "bash"),
+                 ("working-directory", ["        working-directory: sub"], "sub"),
+                 ("env", ENV_STEP, "FOO: bar"),
+                 ("run", ["        run: echo hi"], "echo hi"),
+                 ("id", ["        id: extra"], "extra"),
+                 ("name", ["        name: Extra"], "Extra"),
+                 ("continue-on-error", ["        continue-on-error: true"], "true"),
+                 ("timeout-minutes", ["        timeout-minutes: 5"], "5"))
+        for key, lines, value in added:
+            for side in SIDES:
+                with self.subTest(key=key, side=side):
+                    got = _on_side(side, (("after", "uses: actions/checkout@", lines),))
+                    pr_val, warm_val = (value, None) if side == "pr" else (None, value)
+                    self.assertEqual(got, [_step_diff(CHECKOUT_ID, CHECKOUT_ID, key, pr_val,
+                                                      warm_val)])
+
+    def test_a_step_with_block_added_to_either_side_is_refused(self) -> None:
+        lines = ["        with:", "          FOO: bar"]
+        for side in SIDES:
+            with self.subTest(side=side):
+                got = _on_side(side, (("after", "name: Build release", lines),))
+                pr_val, warm_val = ("FOO: bar", None) if side == "pr" else (None, "FOO: bar")
+                self.assertEqual(got, [_step_diff(BUILD_PR_LABEL, BUILD_WARM_LABEL, "with",
+                                                  pr_val, warm_val)])
+
+    def test_a_changed_uses_or_with_value_is_refused_on_either_side(self) -> None:
+        for side in SIDES:
+            with self.subTest(key="uses", side=side):
+                got = _on_side(side, (("sub", OLD_CHECKOUT_PIN, NEW_CHECKOUT_PIN),))
+                pr_val, warm_val = ((NEW_CHECKOUT_PIN, OLD_CHECKOUT_PIN) if side == "pr"
+                                    else (OLD_CHECKOUT_PIN, NEW_CHECKOUT_PIN))
+                self.assertEqual(got, [_step_diff(CHECKOUT_ID, CHECKOUT_ID, "uses", pr_val,
+                                                  warm_val)])
+            with self.subTest(key="with", side=side):
+                got = _on_side(side, (("sub", "persist-credentials: false",
+                                       "persist-credentials: true"),))
+                pr_val, warm_val = (("persist-credentials: true", "persist-credentials: false")
+                                    if side == "pr"
+                                    else ("persist-credentials: false", "persist-credentials: true"))
+                self.assertEqual(got, [_step_diff(CHECKOUT_ID, CHECKOUT_ID, "with", pr_val,
+                                                  warm_val)])
+
+    def test_a_changed_run_of_the_build_release_step_is_refused_on_either_side(self) -> None:
+        for side in SIDES:
+            with self.subTest(side=side):
+                got = _on_side(side, (("sub", "run: cargo build --release",
+                                       "run: cargo build --release --locked"),))
+                pr_val, warm_val = (("cargo build --release --locked", "cargo build --release")
+                                    if side == "pr"
+                                    else ("cargo build --release", "cargo build --release --locked"))
+                self.assertEqual(got, [_step_diff(BUILD_PR_LABEL, BUILD_WARM_LABEL, "run", pr_val,
+                                                  warm_val)])
+
+    def test_a_step_key_the_table_does_not_know_is_refused_naming_it(self) -> None:
+        lines = ["        frobnicate: yes"]
+        for side, wf_name, job_id in (("pr", PR_NAME, PR_JOB_ID), ("warm", base.WARM, WARM_JOB_ID)):
+            with self.subTest(side=side):
+                self.assertEqual(
+                    _on_side(side, (("after", "uses: actions/checkout@", lines),)),
+                    [f"{wf_name}:{job_id} step {CHECKOUT_ID!r}: step key 'frobnicate' is not a "
+                     f"known step key"])
+
+    def test_a_step_the_table_does_not_know_a_missing_step_and_a_duplicate_are_refused(self) -> None:
+        extra = ["      - name: Extra", "        run: echo hi"]
+        for side, wf_name, job_id in (("pr", PR_NAME, PR_JOB_ID), ("warm", base.WARM, WARM_JOB_ID)):
+            with self.subTest(case="unmapped", side=side):
+                self.assertEqual(
+                    _on_side(side, (("end", extra),)),
+                    [f"{wf_name}:{job_id} step 'Extra': no row in the mirror table"])
+        with self.subTest(case="missing"):
+            got = _problems(warm_job_ops=(("sub", "name: Build release (release-profile smoke)",
+                                           "name: Build release (smoke)"),))
+            self.assertEqual(got, [
+                f"{base.WARM}:{WARM_JOB_ID}: no step {BUILD_WARM_LABEL!r} (the mirror table "
+                f"needs it)",
+                f"{base.WARM}:{WARM_JOB_ID} step 'Build release (smoke)': no row in the mirror "
+                f"table"])
+        for side, wf_name, job_id in (("pr", PR_NAME, PR_JOB_ID), ("warm", base.WARM, WARM_JOB_ID)):
+            with self.subTest(case="duplicate", side=side):
+                dup = ["      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262"]
+                self.assertEqual(
+                    _on_side(side, (("after", "uses: actions/checkout@", dup),)),
+                    [f"{wf_name}:{job_id}: step {CHECKOUT_ID!r} appears 2 times"])
+
+    def test_the_hand_table_names_the_exact_value_of_every_allowed_difference(self) -> None:
+        with self.subTest(case="warm cache id"):
+            self.assertEqual(
+                _problems(warm_job_ops=(("sub", "id: rust-cache", "id: rust-cache2"),)),
+                [f"{base.WARM}:{WARM_JOB_ID} step {CACHE_ID!r}: key 'id' is 'rust-cache2', the "
+                 f"hand table says 'rust-cache'"])
+        with self.subTest(case="warm toolchain gets an if"):
+            self.assertEqual(
+                _problems(warm_job_ops=(("after", "name: Install Rust 1.99.1",
+                                         ["        if: always()"]),)),
+                [f"{base.WARM}:{WARM_JOB_ID} step {TOOLCHAIN_ACTION!r}: key 'if' is "
+                 f"'always()', the hand table says None"])
+        with self.subTest(case="pr toolchain gate changed"):
+            self.assertEqual(
+                _problems(pr_job_ops=(("replace_at", "name: Install Rust 1.99.1", 1,
+                                       "!= 'true'", "== 'true'"),)),
+                [f"{PR_NAME}:{PR_JOB_ID} step {TOOLCHAIN_ACTION!r}: key 'if' is "
+                 f"\"needs.classify.outputs.cargo_skip == 'true'\", the hand table says "
+                 f"\"{GATE_SKIP}\""])
+        with self.subTest(case="warm audit run changed"):
+            got = _problems(warm_job_ops=(("sub", "run: cargo install cargo-audit --locked",
+                                           "run: cargo install cargo-audit"),))
+            self.assertEqual(len(got), 1)
+            self.assertTrue(got[0].startswith(
+                f"{base.WARM}:{WARM_JOB_ID} step 'Install the pinned cargo-audit (no audit run)': "
+                f"key 'run' is 'cargo install cargo-audit --force"), got)
+
+    def test_a_difference_the_table_allows_is_not_a_problem(self) -> None:
+        for side, ops in (("warm timeout", ("warm", ("sub", "timeout-minutes: 45",
+                                                      "timeout-minutes: 30"))),
+                          ("pr timeout", ("pr", ("sub", "timeout-minutes: 45",
+                                                  "timeout-minutes: 50"))),
+                          ("warm name", ("warm", ("sub", "name: Rust cache warm (Cross-compile "
+                                                  "android audit+release deps)",
+                                                  "name: Renamed"))),
+                          ("pr name", ("pr", ("sub", "name: Cross-compile (${{ matrix.target }})",
+                                              "name: Renamed")))):
+            with self.subTest(case=side):
+                self.assertEqual(_on_side(ops[0], (ops[1],)), [])
+
+    def test_every_job_level_input_added_to_either_side_is_refused(self) -> None:
+        for key in ("defaults", "container", "services", "permissions", "if", "concurrency",
+                    "outputs", "environment", "continue-on-error"):
+            for side in SIDES:
+                with self.subTest(key=key, side=side):
+                    got = _on_side(side, (("after", "timeout-minutes: 45", [f"    {key}: v1"]),))
+                    pr_val, warm_val = ("v1", None) if side == "pr" else (None, "v1")
+                    self.assertEqual(got, [_job_diff(key, pr_val, warm_val)])
+
+    def test_a_changed_runs_on_is_refused_on_either_side(self) -> None:
+        self.assertEqual(
+            _problems(pr_job_ops=(("sub", "runs-on: ${{ matrix.os }}", "runs-on: ubuntu-24.04"),)),
+            [_job_diff("runs-on", "ubuntu-24.04", "ubuntu-latest")])
+        self.assertEqual(
+            _problems(warm_job_ops=(("sub", "runs-on: ubuntu-latest", "runs-on: ubuntu-24.04"),)),
+            [_job_diff("runs-on", "ubuntu-latest", "ubuntu-24.04")])
+
+    def test_an_unreadable_runs_on_is_refused_with_the_reason(self) -> None:
+        got = _problems(warm_job_ops=(("sub", "runs-on: ubuntu-latest",
+                                       "runs-on: ${{ github.x }}"),))
+        self.assertEqual(got, [f"{base.WARM}:{WARM_JOB_ID}: runs-on cannot be read: "
+                               f"{WARM_JOB_ID}: unrecognised runs-on form: '${{{{ github.x }}}}'"])
+
+    def test_a_job_key_the_table_does_not_know_is_refused_naming_it(self) -> None:
+        for side, wf_name, job_id in (("pr", PR_NAME, PR_JOB_ID), ("warm", base.WARM, WARM_JOB_ID)):
+            with self.subTest(side=side):
+                self.assertEqual(
+                    _on_side(side, (("after", "timeout-minutes: 45", ["    frobnicate: x"]),)),
+                    [f"{wf_name}:{job_id}: job key 'frobnicate' is not a known job key"])
+
+    def test_env_is_compared_at_workflow_and_job_level_on_both_sides(self) -> None:
+        with self.subTest(case="pr workflow env value changed"):
+            self.assertEqual(
+                _problems(pr_wf_ops=(("sub", "CARGO_TERM_COLOR: always",
+                                      "CARGO_TERM_COLOR: never"),)),
+                [_env_diff("CARGO_TERM_COLOR", "never", "always")])
+        with self.subTest(case="warm workflow env value changed"):
+            self.assertEqual(
+                _problems(warm_wf_ops=(("sub", "CARGO_TERM_COLOR: always",
+                                        "CARGO_TERM_COLOR: never"),)),
+                [_env_diff("CARGO_TERM_COLOR", "always", "never")])
+        with self.subTest(case="pr workflow CARGO_INCREMENTAL changed"):
+            self.assertEqual(
+                _problems(pr_wf_ops=(("sub", 'CARGO_INCREMENTAL: "0"', 'CARGO_INCREMENTAL: "1"'),)),
+                [_env_diff("CARGO_INCREMENTAL", "1", "0")])
+        with self.subTest(case="warm job env name removed"):
+            self.assertEqual(
+                _problems(warm_job_ops=(("sub", 'CARGO_INCREMENTAL: "0"', ""),)),
+                [_env_diff("CARGO_INCREMENTAL", "0", None)])
+        for name, value in (("CARGO_NET_RETRY", "9"), ("FOO", "bar")):
+            with self.subTest(case="warm job env name added", name=name):
+                self.assertEqual(
+                    _problems(warm_job_ops=(("after", 'CARGO_INCREMENTAL: "0"',
+                                             [f'      {name}: "{value}"']),)),
+                    [_env_diff(name, None, value)])
+            with self.subTest(case="pr job env name added", name=name):
+                self.assertEqual(
+                    _problems(pr_job_ops=(("after", "timeout-minutes: 45",
+                                           ["    env:", f"      {name}: {value}"]),)),
+                    [_env_diff(name, value, None)])
+
+    def test_the_self_hosted_cap_is_allowed_on_the_pr_side_only(self) -> None:
+        self.assertEqual(_problems(), [])
+        got = _problems(warm_job_ops=(("after", 'CARGO_INCREMENTAL: "0"',
+                                       ["      SELF_HOSTED_TARGET_CAP_BYTES: 1"]),))
+        self.assertEqual(got, [_env_diff("SELF_HOSTED_TARGET_CAP_BYTES", "42949672960", "1")])
+
+    def test_an_env_value_that_cannot_be_evaluated_is_refused_with_the_reason(self) -> None:
+        got = _problems(warm_job_ops=(("after", 'CARGO_INCREMENTAL: "0"',
+                                       ["      FOO: ${{ github.sha }}"]),))
+        self.assertEqual(got, [f"{base.WARM}:{WARM_JOB_ID}: env 'FOO' cannot be evaluated: FOO: "
+                               f"unrecognised expression form in an env value: "
+                               f"'${{{{ github.sha }}}}'"])
+
+    def test_a_workflow_level_defaults_block_on_either_side_is_refused(self) -> None:
+        lines = ["defaults:", "  run:", "    shell: bash"]
+        self.assertEqual(
+            _problems(pr_wf_ops=(("end", lines),)),
+            [f"{PR_NAME} vs {base.WARM}: workflow key 'defaults' differs: {PR_NAME} has "
+             f"'run:\\n  shell: bash', {base.WARM} has None"])
+        self.assertEqual(
+            _problems(warm_wf_ops=(("end", lines),)),
+            [f"{PR_NAME} vs {base.WARM}: workflow key 'defaults' differs: {PR_NAME} has None, "
+             f"{base.WARM} has 'run:\\n  shell: bash'"])
+
+    def test_the_hand_tables_are_pinned(self) -> None:
+        self.assertEqual(KNOWN_STEP_KEYS, ("uses", "with", "env", "run", "if", "shell",
+                                           "working-directory", "id", "name", "continue-on-error",
+                                           "timeout-minutes"))
+        self.assertEqual([(r.pr_id, r.warm_id) for r in MIRRORS], [
+            ("actions/checkout", "actions/checkout"),
+            ("dtolnay/rust-toolchain", "dtolnay/rust-toolchain"),
+            ("Swatinem/rust-cache", "Swatinem/rust-cache"),
+            ("nttld/setup-ndk", "nttld/setup-ndk"),
+            ("Configure NDK toolchain for cargo", "Configure NDK toolchain for cargo"),
+            ("cargo check (--lib --features sqlite-bundled)",
+             "cargo check (--lib --features sqlite-bundled)"),
+            ("Security audit", "Install the pinned cargo-audit (no audit run)"),
+            (BUILD_PR_LABEL, BUILD_WARM_LABEL)])
+        for row in MIRRORS:
+            self.assertLessEqual(set(row.allowed), set(KNOWN_STEP_KEYS), row.pr_id)
+            self.assertNotIn("uses", row.allowed, row.pr_id)
+            self.assertNotIn("with", row.allowed, row.pr_id)
+            self.assertNotIn("env", row.allowed, row.pr_id)
+        self.assertEqual(PR_ONLY_STEPS, ("cargo_skip short-circuit", "actions/setup-python"))
+        self.assertEqual(JOB_KEYS_MAY_DIFFER, ("name", "needs", "timeout-minutes", "strategy",
+                                               "steps"))
+        self.assertEqual(set(JOB_KEYS_COMPARED), {"defaults", "container", "services",
+                                                  "permissions", "if", "concurrency", "outputs",
+                                                  "environment", "continue-on-error"})
+        self.assertEqual(ENV_ONE_SIDED, {"ci.yml": ("SELF_HOSTED_TARGET_CAP_BYTES",),
+                                         "rust-cache-warm.yml": ()})
+        self.assertEqual(WORKFLOW_KEYS_COMPARED, ("defaults",))
 
 
 if __name__ == "__main__":
