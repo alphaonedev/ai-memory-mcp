@@ -510,8 +510,9 @@ class Table(unittest.TestCase):
 # ---------------------------------------------------------------- step mode
 def git(repo, *args):
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
-    env.update({"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
-                "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid",
+    # Same email-free identity as impact_fixture.GIT_IDENT.
+    env.update({"GIT_AUTHOR_NAME": "fixture", "GIT_AUTHOR_EMAIL": "fixture-ident",
+                "GIT_COMMITTER_NAME": "fixture", "GIT_COMMITTER_EMAIL": "fixture-ident",
                 "GIT_CONFIG_NOSYSTEM": "1", "HOME": str(repo)})
     res = subprocess.run(["git", "-C", str(repo), "-c", "commit.gpgsign=false"] + list(args),
                          capture_output=True, env=env, timeout=120, check=True)
