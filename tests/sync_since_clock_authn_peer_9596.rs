@@ -473,7 +473,7 @@ async fn authenticated_peer_records_only_its_own_clock_9596() {
         set_posture(true);
         let host = setup();
         let query = query_for(Some(ALICE));
-        let (status, body) = pull(&host, &query, Some(ALICE), agent_header, true).await;
+        let (status, _) = pull(&host, &query, Some(ALICE), agent_header, true).await;
         let rows = clock_rows(&host);
         let watermarks = {
             let conn = ai_memory::db::open(&host.db_path).expect("reopen for read");
@@ -503,7 +503,7 @@ async fn pull_without_peer_param_writes_no_clock_9596() {
     set_posture(true);
     let host = setup();
     let query = query_for(None);
-    let (status, body) = pull(&host, &query, Some(ALICE), Some(ALICE), true).await;
+    let (status, _) = pull(&host, &query, Some(ALICE), Some(ALICE), true).await;
     let rows = clock_rows(&host);
     clear_posture();
     assert_eq!(status, StatusCode::OK, "#9596: pull served");
@@ -646,7 +646,7 @@ async fn cert_bound_to_exactly_the_asserted_peer_records_its_clock_9596() {
         }
         let host = setup_with_cert(Some(binding));
         let query = query_for(Some(peer_header));
-        let (status, body) = pull(&host, &query, Some(peer_header), Some(peer_header), false).await;
+        let (status, _) = pull(&host, &query, Some(peer_header), Some(peer_header), false).await;
         let rows = clock_rows(&host);
         clear_posture();
         assert_eq!(status, StatusCode::OK, "#9596: cert-bound pull served");
@@ -715,7 +715,7 @@ async fn failed_clock_write_is_logged_at_warn_9596() {
         .finish();
     let guard = tracing::subscriber::set_default(subscriber);
     let query = query_for(Some(ALICE));
-    let (status, body) = pull(&host, &query, Some(ALICE), Some(ALICE), true).await;
+    let (status, _) = pull(&host, &query, Some(ALICE), Some(ALICE), true).await;
     drop(guard);
     let rows = clock_rows(&host);
     clear_posture();
