@@ -90,6 +90,10 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  # #9509/#9515: no Rust test of this workflow may fetch a model from the
+  # network; the embedder and cross-encoder take the staged offline cache
+  # only (one workflow-level source, held by the 9509 staging pin).
+  AI_MEMORY_EMBED_OFFLINE: "1"
   CARGO_TERM_COLOR: always
   # #3128 — EXPLICIT, not inherited. `Swatinem/rust-cache` is what used to export
   # CARGO_INCREMENTAL=0, and it is now skipped on the self-hosted fleet (see the

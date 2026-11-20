@@ -822,6 +822,7 @@ SIBLING_SCRIPTS = {
     "scripts/ci/prune_runner_artifacts.py": ("scripts/ci/shared_cargo_target.py",),
     "scripts/ci/sccache_env.py": ("scripts/ci/shared_cargo_target.py",),
     "scripts/ci/suite_budget.py": (),  # #9229 suite margin gate
+    "scripts/ci/hf_home_private.py": (),  # #9509 job-private HF_HOME
 }
 SHARED_MODULE_PATH = "scripts/ci/" + SHARED_MODULE_NAME
 
@@ -1083,9 +1084,9 @@ class OsPlantNeverRuns(unittest.TestCase):
                     self.assertEqual(planted, clean)
 
     def test_sibling_scripts_os_plant_table_9365(self):
-        """Table over the 14 sibling scripts (the 13 of 0f1ec1b7 plus suite_budget of #9229): ``--help`` with an os.py plant equals the clean run."""
+        """Table over the 15 sibling scripts (the 13 of 0f1ec1b7, suite_budget of #9229, hf_home_private of #9509): ``--help`` with an os.py plant equals the clean run."""
         scripts = (*SIBLING_SCRIPTS, "scripts/test/pg_isolated_binary.py")
-        self.assertEqual(len(scripts), 14)
+        self.assertEqual(len(scripts), 15)
         layout = SiblingLoadInvariant.layout
         for rel in scripts:
             for where in OS_PLANT_PLACES:
@@ -1180,7 +1181,7 @@ class GateLoadFailsClosed(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------------------------------------------
-# The 8 non-gate siblings (conductor ruling bcd0a15c): a failed load of ANY kind ends the process non-zero with one
+# The 9 non-gate siblings (conductor ruling bcd0a15c): a failed load of ANY kind ends the process non-zero with one
 # fixed ::error literal built without the module, and the script does none of its work. Each code is the script's
 # WA_EXIT_LOAD_REFUSED; the comment says what the other codes mean to the calling step, so the new one collides with
 # none of them. "at 55b6a5d2" is what the same cell gave on the base of this lane (plain python3, every kind).
@@ -1216,6 +1217,9 @@ NON_GATE_LOAD_EXIT_CODES = {
     # this cell gave rc 2 "pg_isolated_binary: set AI_MEMORY_TEST_POSTGRES_URL (or pass --url for local admin use)"
     # for every kind; a failed load surfaced only at the first annotation, by traceback or a silent sys.exit(0)
     "scripts/test/pg_isolated_binary.py": 4,
+    # 0 ok, 2 usage or a refused root. New in #9509 (no BASE row): the load runs before argparse and before any
+    # directory or $GITHUB_ENV write
+    "scripts/ci/hf_home_private.py": 3,
 }
 # setup --emit-env sends stdout into $GITHUB_ENV: the refusal goes to stderr there, never into the env file
 SIBLING_LOAD_ERROR_TO_STDERR = frozenset({"scripts/test/pg_isolated_binary.py"})
@@ -1265,6 +1269,8 @@ def sibling_work_argv(rel, fx):
         "scripts/ci/prune_runner_artifacts.py": ["--work-root", str(work), "--workspace", str(work / "ws"),
                                                  "--protected-root", str(fx / "protected"), "--dry-run"],
         "scripts/test/pg_isolated_binary.py": ["setup", "--emit-env", "--db", "ai_memory_9365"],
+        "scripts/ci/hf_home_private.py": ["--runner-temp", str(target), "--workspace", str(work / "ws"),
+                                          "--github-env", out],
     }.get(rel, ["--help"])
 
 
@@ -1315,7 +1321,7 @@ def sibling_load_run(base, rel, source, flags, script_root=None):
 
 
 class SiblingLoadFailsClosed(unittest.TestCase):
-    """Table: 8 non-gate siblings x 7 failure kinds x (plain, -I, -S) on fixture copies (ruling bcd0a15c)."""
+    """Table: 9 non-gate siblings x 7 failure kinds x (plain, -I, -S) on fixture copies (ruling bcd0a15c)."""
 
     def cell(self, rel, kind, flags):
         base = scratch_dir("sibling-fail-closed")
@@ -1333,7 +1339,7 @@ class SiblingLoadFailsClosed(unittest.TestCase):
     def test_failed_load_of_any_kind_fails_each_sibling_closed_9365(self):
         if os.geteuid() == 0:
             self.skipTest("root reads a mode-0 file")
-        self.assertEqual(len(NON_GATE_LOAD_EXIT_CODES), 8)
+        self.assertEqual(len(NON_GATE_LOAD_EXIT_CODES), 9)
         for rel in NON_GATE_LOAD_EXIT_CODES:
             for kind in SIBLING_LOAD_BREAKS:
                 for label, flags in PYTHON_FLAG_SETS:
@@ -1878,13 +1884,14 @@ STREAM_SCRIPTS = tuple(sorted(set(GATE_LOAD_EXIT_CODES) | set(NON_GATE_LOAD_EXIT
 STREAM_SHARED_CALLS = SHARED_FIELD_FUNCTIONS | {"safe_value", "render", "join", "end_group_line"}
 STREAM_NUMBER_CALLS = frozenset({"len", "int", "float", "round", "abs"})  # return a number for any argument
 STREAM_TRACE_DEPTH = 6
-STREAM_SCRIPT_COUNT = 15  # 14 + suite_budget (#9229)
+STREAM_SCRIPT_COUNT = 16  # 14 + suite_budget (#9229) + hf_home_private (#9509)
 STREAM_MODULE_VARS = frozenset({"wa"})  # the name every script binds the loaded module to
 # Runs before the shared module exists, so it cannot use it; each output is fixed text pinned by its own test:
 # prune_runner_tmp's floor check (VERSION_REFUSAL_AT_0F1EC1B7 cells) and load refusal (SiblingLoadFailsClosed, P1).
 STREAM_PRELOAD_FUNCTIONS = {"scripts/ci/prune_runner_tmp.py": frozenset({"load_refused"}),
                             "scripts/ci/partition_test_binaries.py": frozenset({"require_workflow_annotation"}),
-                            "scripts/ci/shared_cargo_target.py": frozenset({"require_workflow_annotation"})}
+                            "scripts/ci/shared_cargo_target.py": frozenset({"require_workflow_annotation"}),
+                            "scripts/ci/hf_home_private.py": frozenset({"require_workflow_annotation"})}
 STREAM_PRELOAD_GUARD_CALL = "python_refusal"  # a module-level ``if`` that calls it is the floor check
 
 
@@ -2075,7 +2082,7 @@ def stream_violations(rel, source):
 
 
 class StreamRatchet(unittest.TestCase):
-    def test_the_fifteen_scripts_print_only_traceable_text_9365(self):
+    def test_the_sixteen_scripts_print_only_traceable_text_9365(self):
         self.assertEqual(len(STREAM_SCRIPTS), STREAM_SCRIPT_COUNT)
         found = []
         for rel in STREAM_SCRIPTS:

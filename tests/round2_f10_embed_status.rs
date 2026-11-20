@@ -29,12 +29,10 @@
 //!
 //! ## Local-model availability
 //!
-//! The `Embedder::new_local()` constructor pulls the MiniLM model from
-//! HuggingFace Hub. On CI workers without a pre-warmed cache + no
-//! network this fails; we follow α's F6 pattern and `return` cleanly
-//! so the suite stays green on offline workers. The contract is still
-//! pinned at the lower layer by α's `embed_status_*` unit tests in
-//! `src/embeddings.rs` and by the F9/F7 sister tests above.
+//! The MiniLM model comes from the staged offline cache (#9509): a missing
+//! cache keeps its named failure ("prerequisite missing: offline embedder
+//! cache"), it is never a skip and never a fetch from the network. CI stages
+//! the cache with `scripts/ci/stage_hf_cache.py`.
 
 use std::sync::Arc;
 
@@ -48,6 +46,10 @@ use tower::ServiceExt as _;
 use ai_memory::config::{FeatureTier, ResolvedScoring, ResolvedTtl};
 use ai_memory::embeddings::{EmbedStatus, Embedder};
 use ai_memory::handlers::{ApiKeyState, AppState, Db};
+
+#[path = "common/staged_models.rs"]
+mod staged_models;
+use staged_models::staged_local_embedder;
 
 /// #1751 — pin this test binary (and any spawned `ai-memory` child, which
 /// inherits the process env) to the explicit permissive agent-attestation
@@ -160,16 +162,7 @@ async fn http_oversized_content_surfaces_skipped_embed_status() {
     // F10 acceptance: content >64KB returns 201 (row committed) AND
     // `embed_status: "skipped"` so the caller can tell semantic
     // recall will miss this row until a re-index.
-    let local = match Embedder::new_local() {
-        Ok(e) => e,
-        Err(_) => {
-            // Offline CI worker — see the module-level note. Skip
-            // cleanly; α's `embed_status_*` unit tests cover the
-            // lower-layer contract, and the F9/F7 sister tests cover
-            // the rest of the HTTP path.
-            return;
-        }
-    };
+    let local = staged_local_embedder();
     let (router, _keep) = build_router_with_embedder(Some(local));
 
     // The HTTP store path validates `content.len() <= MAX_CONTENT_SIZE`
@@ -238,10 +231,7 @@ async fn http_empty_content_surfaces_skipped_embed_status() {
     // the lower layer by α's unit tests. Here we just pin that an
     // available embedder + a normal-size body produces an `Indexed`
     // outcome (no `embed_status` field surfaced).
-    let local = match Embedder::new_local() {
-        Ok(e) => e,
-        Err(_) => return,
-    };
+    let local = staged_local_embedder();
     let (router, _keep) = build_router_with_embedder(Some(local));
 
     let body = json!({

@@ -468,53 +468,12 @@ fn test_reranker_degraded_mode_signaled() {
     let ttl = ResolvedTtl::default();
     let scoring = ResolvedScoring::default();
 
-    // Construct a *degraded* Lexical variant directly via the public
-    // constructor route. `new_neural()` produces a degraded fallback
-    // when the HF download fails — on a no-network test runner that
-    // is the dominant outcome, but it is environment-dependent. To
-    // keep this test deterministic, we round-trip a fixture through
-    // the public `is_degraded_lexical` accessor: if `new_neural()`
-    // happened to succeed (cached model on the runner), skip the
-    // assertion; if it fell back (the common case), assert the
-    // in-band signal.
-    let ce = CrossEncoder::new_neural();
-    if ce.is_neural() {
-        // Test runner had a cached neural model — synthesize the
-        // degraded path via the Drop+fallback shape inside
-        // `rerank_batch`. The simpler deterministic check: reuse
-        // the variant-construction helper exposed at the recall
-        // path.
-        //
-        // For coverage parity we still assert the wire field is
-        // present and equals "neural" — the degraded branch is
-        // exercised by the unit test below
-        // (`degraded_lexical_surfaces_via_is_degraded_lexical_unit`)
-        // which does not depend on environment.
-        let batched = BatchedReranker::new(ce);
-        let resp = ai_memory::mcp::handle_recall(
-            &conn,
-            &json!({"context": "probe", "namespace": "test"}),
-            None,
-            None,
-            Some(&batched),
-            false,
-            &ttl,
-            &scoring,
-            None,
-        )
-        .expect("recall");
-        let meta = resp.get("meta").expect("meta required");
-        assert_eq!(
-            meta["reranker_used"].as_str(),
-            Some("neural"),
-            "neural ce on this runner must surface 'neural'"
-        );
-        return;
-    }
-
-    // Environment-typical: `new_neural()` fell back to degraded
-    // lexical. `is_degraded_lexical` must report true; the recall
-    // response must surface `"degraded_lexical"`.
+    // #9509/#9515: one exact outcome. The neural constructor over an
+    // empty hub falls back to the degraded lexical encoder on every host
+    // (never the network, never the host's own cache), so the in-band
+    // signal is asserted unconditionally.
+    let hub = tempfile::tempdir().expect("empty hub");
+    let ce = CrossEncoder::new_neural_in(hub.path());
     assert!(
         ce.is_degraded_lexical(),
         "fell-back variant must be degraded_lexical"

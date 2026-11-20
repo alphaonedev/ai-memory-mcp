@@ -85,6 +85,10 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
+  # #9509/#9515: no Rust test of this workflow may fetch a model from the
+  # network; the embedder and cross-encoder take the staged offline cache
+  # only (one workflow-level source, held by the 9509 staging pin).
+  AI_MEMORY_EMBED_OFFLINE: "1"
   CARGO_TERM_COLOR: always
   AI_MEMORY_NO_CONFIG: "1"
   # AI_MEMORY_TEST_POSTGRES_URL / AI_MEMORY_TEST_AGE_URL (the pins that make
@@ -289,8 +293,9 @@ jobs:
                       /opt/google /usr/lib/jvm /opt/microsoft \
                       /usr/share/swift /usr/share/miniconda || true
           # #2960 — also free the whole tool cache ($AGENT_TOOLSDIRECTORY =
-          # /opt/hostedtoolcache, ~10 GiB). The HF pre-stage step below uses
-          # the SYSTEM /usr/bin/python3 (there is no setup-python step), and
+          # /opt/hostedtoolcache, ~10 GiB). The HF staging steps below use
+          # the SYSTEM python3 standard library only (no setup-python step, no
+          # pip; #9509), and
           # everything else comes via rustup / apt / taiki-e install-action,
           # so nothing reads the tool cache after this — pure extra headroom
           # for the llvm-cov instrumented build that ran out of disk on
@@ -382,83 +387,44 @@ jobs:
           save-if: ${{ github.event_name == 'push' }}
 
       # #2019 — the reranker (cross-encoder/ms-marco-MiniLM-L-6-v2) + embedder
-      # (sentence-transformers/all-MiniLM-L6-v2) tests download their weights via
-      # hf-hub. A flaky HF download made those modules' per-module coverage
-      # NON-DETERMINISTIC: on a failed fetch the tests take the offline/keyword
-      # path, the model-execution lines go uncovered, and reranker.rs /
-      # embeddings.rs / daemon_runtime.rs deterministically drop below floor
-      # (81.71% / 86.01% / 85.97%) — red on main AND every PR until the fetch
-      # succeeds. Cache the HF dir + retry-prefetch so the model tests ALWAYS run.
-      # huggingface_hub writes the same standard hub cache the Rust hf-hub Api reads.
-      - name: Cache HuggingFace models (#2019)
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
-        with:
-          path: ~/.cache/huggingface
-          # Bump the version suffix (…-v2) whenever the pinned model set or
-          # the staged cache layout changes. `restore-keys` lets a stale-but-
-          # compatible cache seed the dir so the pre-stage step only has to
-          # top up deltas instead of a full cold re-download on every key bump.
-          key: hf-models-minilm-l6-v2-marco-l6-v2-v2
-          restore-keys: |
-            hf-models-minilm-l6-v2-marco-l6-v2-
-
-      - name: Pre-stage HF models with retry (#2019)
+      # (sentence-transformers/all-MiniLM-L6-v2) tests need their weights. A
+      # flaky HF download made those modules' per-module coverage
+      # NON-DETERMINISTIC (reranker.rs / embeddings.rs / daemon_runtime.rs fell
+      # below floor whenever the fetch failed). #2019/#9509 — the cache is now
+      # staged by the four steps shared with the ci.yml `check` and
+      # `sal-feature` jobs (see the comment there; vote 9531-staging-posture,
+      # 3-agent vote (71472661)): a job-private HF_HOME under runner.temp, an
+      # exact-key restore naming both pinned revisions (no restore-keys), the
+      # standard-library stage script (scripts/ci/stage_hf_cache.py: pinned
+      # revision plus sha256 per file; exit 10 layout, 11 fetch, 13 placement,
+      # each with a named reason) and a save only after a verified stage. The
+      # tests then run offline from that cache (workflow-level
+      # AI_MEMORY_EMBED_OFFLINE), never a download (#9515).
+      - name: Private HF home (#9509)
         env:
-          # #2019b — bypass the HF Xet CAS backend (cas-server.xethub.hf.co),
-          # which intermittently returns 401 on the reconstruction endpoint and
-          # failed the pre-stage on 2026-07-14. The Rust hf-hub the tests use is
-          # classic (non-Xet), so the staged classic cache is what they read.
-          HF_HUB_DISABLE_XET: "1"
-        run: |
-          set -euo pipefail
-          python3 -m pip install --quiet --disable-pip-version-check "huggingface_hub>=0.20" \
-            || pip3 install --quiet "huggingface_hub>=0.20"
-          for m in sentence-transformers/all-MiniLM-L6-v2 cross-encoder/ms-marco-MiniLM-L-6-v2; do
-            ok=0
-            for attempt in 1 2 3 4 5; do
-              if python3 -c "from huggingface_hub import snapshot_download; snapshot_download('$m')"; then
-                echo "::notice::staged $m (attempt $attempt)"; ok=1; break
-              fi
-              echo "::warning::hf fetch $m attempt $attempt failed; retry in $((attempt*10))s"
-              sleep $((attempt*10))
-            done
-            [ "$ok" = 1 ] || { echo "::error::could not stage $m after 5 attempts"; exit 1; }
-          done
+          RUNNER_TEMP_ARG: ${{ runner.temp }}
+          WORKSPACE_ARG: ${{ github.workspace }}
+        run: python3 -I scripts/ci/hf_home_private.py --runner-temp "$RUNNER_TEMP_ARG" --workspace "$WORKSPACE_ARG" --github-env "$GITHUB_ENV"
 
-      # #2019 — VERIFY the Python-staged cache is resolvable by the RUST
-      # `hf-hub` 0.5 loader the tests actually use. `ApiRepo::get()` is
-      # cache-first: it reads `refs/main` → resolves `snapshots/<commit>/
-      # <file>` and returns it WITHOUT any network call, falling through to
-      # a live download ONLY on a cache MISS. So the reranker
-      # (`Api::new().get(...)`) + embedder (`download_via_hf_hub` → `.get()`)
-      # never touch the network as long as the staged layout matches what
-      # `hf-hub::Cache::get` expects. `huggingface_hub` (the pre-stage tool)
-      # and `hf-hub` (the test loader) are DIFFERENT tools, so this step
-      # asserts the layout the Rust side resolves rather than trusting the
-      # Python writer — a mismatch fails LOUD here (deterministic staging
-      # error) instead of silently degrading to the keyword path and
-      # dropping reranker.rs / embeddings.rs / daemon_runtime.rs below floor.
-      - name: Verify staged HF cache is hf-hub-resolvable (#2019)
-        run: |
-          set -euo pipefail
-          hub="$HOME/.cache/huggingface/hub"
-          # repo dir name = models--<org>--<name>; artifact files mirror the
-          # crate consts HF_{CONFIG,TOKENIZER,WEIGHTS}_FILE in src/embeddings.rs.
-          for repo in \
-            models--sentence-transformers--all-MiniLM-L6-v2 \
-            models--cross-encoder--ms-marco-MiniLM-L-6-v2; do
-            base="$hub/$repo"
-            ref="$base/refs/main"
-            [ -f "$ref" ] || { echo "::error::missing ref $ref — cache not hf-hub-resolvable"; exit 1; }
-            commit="$(tr -d '[:space:]' < "$ref")"
-            snap="$base/snapshots/$commit"
-            [ -d "$snap" ] || { echo "::error::missing snapshot dir $snap for $repo"; exit 1; }
-            for f in config.json tokenizer.json model.safetensors; do
-              # -e follows symlinks (hf cache snapshots are symlinks into blobs/).
-              [ -e "$snap/$f" ] || { echo "::error::missing $f in $snap ($repo)"; exit 1; }
-            done
-            echo "::notice::$repo resolvable at $snap (all 3 artifacts present)"
-          done
+      - name: Restore HuggingFace models (#9509)
+        id: hf_restore
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ env.HF_HOME }}/hub
+          key: hf-hub-minilm-l6-v2-1110a243fdf4706b3f48f1d95db1a4f5529b4d41-marco-l6-v2-233902d25c440f23af6f7d6e94d2946bac0bee0a-v3
+
+      - name: Stage HF model cache (#9509)
+        env:
+          RUNNER_TEMP_ARG: ${{ runner.temp }}
+          WORKSPACE_ARG: ${{ github.workspace }}
+        run: python3 -I scripts/ci/stage_hf_cache.py --models all --runner-temp "$RUNNER_TEMP_ARG" --workspace "$WORKSPACE_ARG"
+
+      - name: Save HuggingFace models (#9509)
+        if: steps.hf_restore.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ env.HF_HOME }}/hub
+          key: hf-hub-minilm-l6-v2-1110a243fdf4706b3f48f1d95db1a4f5529b4d41-marco-l6-v2-233902d25c440f23af6f7d6e94d2946bac0bee0a-v3
 
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@6001e75680da9482e125349961b715573ec77af8 # cargo-llvm-cov

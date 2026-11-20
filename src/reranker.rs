@@ -15,12 +15,12 @@
 //! **Offline / air-gapped installs (#2086).** `AI_MEMORY_EMBED_OFFLINE` /
 //! `HF_HUB_OFFLINE` (the same knob the embedder honors, #1501) makes
 //! [`CrossEncoder::new_neural`] skip the network entirely and resolve the
-//! model files from the dedicated pre-stage directory
-//! [`CROSS_ENCODER_FALLBACK_MODEL_SUBDIR`]. Pre-stage the three
-//! `cross-encoder/ms-marco-MiniLM-L-6-v2` artifacts (`config.json`,
+//! model files from the hf-hub cache under `$HF_HOME/hub` (else
+//! `$HOME/.cache/huggingface/hub`, the embedder's resolver, #9509). Pre-stage
+//! the three `cross-encoder/ms-marco-MiniLM-L-6-v2` artifacts (`config.json`,
 //! `tokenizer.json`, `model.safetensors`) there for a fully air-gapped
-//! neural-reranker install (see that constant's doc comment for the exact
-//! recipe); an absent file under offline mode bails LOUD and `new_neural`
+//! neural-reranker install (see [`CrossEncoder::load_cross_encoder_from_fallback`]
+//! for the exact recipe); an absent file under offline mode bails LOUD and `new_neural`
 //! degrades to `reranker_used = "degraded_lexical"` rather than making a
 //! futile or silent network attempt.
 
@@ -368,38 +368,6 @@ const CROSS_ENCODER_MODEL_ID: &str = "cross-encoder/ms-marco-MiniLM-L-6-v2";
 /// the `ai-memory config migrate` template (#1558 batch 6).
 pub(crate) const DEFAULT_RERANKER_MODEL: &str = "ms-marco-MiniLM-L-6-v2";
 
-/// #2086 — fallback subdirectory under `$HOME` for a pre-staged / bundled
-/// cross-encoder model (config/tokenizer/weights). This is the reranker's
-/// counterpart to the embedder's [`crate::embeddings`] `FALLBACK_MODEL_SUBDIR`
-/// (#1501): the offline/air-gapped unlock condition (i) named by #1867/#1969
-/// as a precondition for eventually reconsidering the reranker's global
-/// default-on flip (§2.6 — the cross-encoder reranker is a load-bearing
-/// property strengthener, but an always-on ~90MB download + silent degrade on
-/// every stock/offline install is not acceptable without a bundled path).
-///
-/// **Pre-stage recipe for air-gapped operators / image builds:**
-///
-/// ```text
-/// mkdir -p "$HOME/.cache/huggingface/hub/models--cross-encoder--ms-marco-MiniLM-L-6-v2/snapshots/main"
-/// cd "$HOME/.cache/huggingface/hub/models--cross-encoder--ms-marco-MiniLM-L-6-v2/snapshots/main"
-/// # From a networked host (or the vendor artifact mirror), download the
-/// # three cross-encoder/ms-marco-MiniLM-L-6-v2 files by name into this
-/// # directory: config.json, tokenizer.json, model.safetensors.
-/// ```
-///
-/// `snapshots/main` is the **hand-staged air-gap** leaf documented in the
-/// recipe above. An *online* `hf-hub` `Api::get` fetch instead writes the
-/// artifacts under `snapshots/<commit-hash>/` (with `refs/main` naming the
-/// commit), NOT `snapshots/main` — so the two layouts differ. #2114: the
-/// offline resolver ([`CrossEncoder::load_cross_encoder_from_fallback`])
-/// therefore does NOT hard-code this single leaf; it derives the hf-hub repo
-/// cache dir (`~/.cache/huggingface/hub/models--<org>--<repo>`, the
-/// grandparent of this leaf) and scans EVERY `snapshots/*` leaf for a complete
-/// artifact set, so BOTH "ran online once, now offline" (`snapshots/<hash>/`)
-/// and "never online, hand-staged for air-gap" (`snapshots/main/`) operators
-/// resolve with zero network activity.
-const CROSS_ENCODER_FALLBACK_MODEL_SUBDIR: &str =
-    ".cache/huggingface/hub/models--cross-encoder--ms-marco-MiniLM-L-6-v2/snapshots/main";
 /// Model-architecture ceiling on the cross-encoder input sequence.
 /// Per-consumer truncation (e.g. the #1604 rerank cap below) may go
 /// tighter, never looser — the resolver clamps against this value.
@@ -750,9 +718,10 @@ fn degrade_to_hybrid_ordering(mut candidates: Vec<(Memory, f64)>) -> Vec<(Memory
 /// "autonomous" when the embedder failed, which is precisely the bug.
 ///
 /// Extracted as a pure predicate so the decision is assertable in CI
-/// without model weights — a CI host always degrades `new_neural()` to the
-/// lexical variant, so a test that asserted the resulting VARIANT would
-/// pass vacuously.
+/// without model weights: whether `new_neural()` yields the neural or the
+/// degraded lexical variant depends on the cache the host has staged
+/// (#9509), so a test that asserted the resulting VARIANT would test the
+/// host, not this decision.
 #[must_use]
 pub fn should_build_cross_encoder(
     tier_enables_cross_encoder: bool,
@@ -988,7 +957,47 @@ impl CrossEncoder {
     /// neural→lexical degrade. The eprintln remains for backward-compat
     /// startup logs.
     pub fn new_neural() -> Self {
-        match Self::load_neural() {
+        Self::degrade_on_err(Self::load_neural())
+    }
+
+    /// #9509/#9515 - the neural encoder built from the staged offline cache
+    /// ONLY (the `$HF_HOME/hub` resolver of
+    /// [`Self::load_cross_encoder_from_fallback`]). No network branch exists
+    /// here, whatever the environment holds, so a test that needs the real
+    /// model can never fetch it; a missing cache is the named offline error,
+    /// never a silent lexical fallback. Hidden from the docs: it exists for
+    /// the test suites.
+    ///
+    /// # Errors
+    /// The offline cache-miss error, or a model build error.
+    #[doc(hidden)]
+    pub fn new_neural_staged() -> Result<Self> {
+        Self::load_neural_from(Self::load_cross_encoder_from_fallback()?)
+    }
+
+    /// #9509/#9515 - [`Self::new_neural`] against the hf-hub cache rooted at
+    /// `hub` only: never the network and never the environment, so a test
+    /// over an empty `hub` has exactly one outcome (the degraded lexical
+    /// encoder, through the same degrade path as `new_neural`). Hidden from
+    /// the docs: it exists for the test suites.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn new_neural_in(hub: &std::path::Path) -> Self {
+        let repo_dir = crate::embeddings::Embedder::hf_repo_dir(hub, CROSS_ENCODER_MODEL_ID);
+        let files = Self::first_complete_snapshot(&repo_dir).ok_or_else(|| {
+            anyhow::anyhow!(
+                "cross-encoder model files not found in pre-stage dir: {}",
+                repo_dir.display()
+            )
+        });
+        Self::degrade_on_err(files.and_then(Self::load_neural_from))
+    }
+
+    /// The one neural-to-lexical degrade of every neural constructor: a
+    /// load error becomes `Lexical { degraded: true }`, logged as the
+    /// structured `reranker.fallback` event.
+    fn degrade_on_err(loaded: Result<Self>) -> Self {
+        match loaded {
             Ok(ce) => ce,
             Err(e) => {
                 tracing::warn!(
@@ -1106,22 +1115,30 @@ impl CrossEncoder {
     /// (`snapshots/<commit-hash>`) by scanning every `snapshots/*` leaf under
     /// the repo dir, so the documented "ran online once, now offline" path no
     /// longer silently degrades to lexical.
+    ///
+    /// #9509: the repo dir is `models--cross-encoder--ms-marco-MiniLM-L-6-v2`
+    /// under [`crate::embeddings::Embedder::hf_hub_root`], the resolver the
+    /// embedder uses: `$HF_HOME/hub` when `HF_HOME` is set (the job-private
+    /// home of the CI legs, vote D2-1/D2-3), else
+    /// `$HOME/.cache/huggingface/hub`. A loader that read `HOME` alone would
+    /// miss the staged cache or load the runner user's own one.
+    ///
+    /// **Pre-stage recipe for air-gapped operators / image builds** (with
+    /// `HF_HOME` unset; under `HF_HOME` the hub is `$HF_HOME/hub`):
+    ///
+    /// ```text
+    /// mkdir -p "$HOME/.cache/huggingface/hub/models--cross-encoder--ms-marco-MiniLM-L-6-v2/snapshots/main"
+    /// cd "$HOME/.cache/huggingface/hub/models--cross-encoder--ms-marco-MiniLM-L-6-v2/snapshots/main"
+    /// # From a networked host (or the vendor artifact mirror), download the
+    /// # three cross-encoder/ms-marco-MiniLM-L-6-v2 files by name into this
+    /// # directory: config.json, tokenizer.json, model.safetensors.
+    /// ```
     fn load_cross_encoder_from_fallback()
     -> Result<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)> {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-        // [`CROSS_ENCODER_FALLBACK_MODEL_SUBDIR`] is the `<repo>/snapshots/main`
-        // hand-staged leaf; its grandparent is the hf-hub repo cache dir
-        // `<repo>`, under which an online fetch instead writes
-        // `snapshots/<commit-hash>/`. Derive the repo dir from the one SSOT
-        // const so both layouts resolve without duplicating the path literal.
-        let staged = std::path::PathBuf::from(&home).join(CROSS_ENCODER_FALLBACK_MODEL_SUBDIR);
-        let repo_dir = staged
-            .parent()
-            .and_then(std::path::Path::parent)
-            .map_or_else(
-                || std::path::PathBuf::from(&home),
-                std::path::Path::to_path_buf,
-            );
+        let repo_dir = crate::embeddings::Embedder::hf_repo_dir(
+            &crate::embeddings::Embedder::hf_hub_root(),
+            CROSS_ENCODER_MODEL_ID,
+        );
         if let Some(files) = Self::first_complete_snapshot(&repo_dir) {
             return Ok(files);
         }
@@ -1148,11 +1165,10 @@ impl CrossEncoder {
         let mut candidates: Vec<std::path::PathBuf> = Vec::new();
         // 1. The ref-pointed commit leaf (online hf-hub layout): `refs/main`
         //    holds the commit hash naming the `snapshots/<hash>/` leaf.
-        if let Ok(commit) = std::fs::read_to_string(repo_dir.join("refs").join("main")) {
-            let commit = commit.trim();
-            if !commit.is_empty() {
-                candidates.push(snapshots.join(commit));
-            }
+        //    #9509: only a one-component alphanumeric commit counts, so a
+        //    blank or traversing ref never names a dir outside `snapshots/`.
+        if let Some(commit) = crate::embeddings::Embedder::ref_main_commit(repo_dir) {
+            candidates.push(snapshots.join(commit));
         }
         // 2. The hand-staged air-gap leaf.
         candidates.push(snapshots.join("main"));
@@ -1176,9 +1192,18 @@ impl CrossEncoder {
     }
 
     fn load_neural() -> Result<Self> {
-        let device = Device::Cpu;
+        Self::load_neural_from(Self::resolve_cross_encoder_files()?)
+    }
 
-        let (config_path, tokenizer_path, weights_path) = Self::resolve_cross_encoder_files()?;
+    /// Build the neural encoder from resolved model files.
+    fn load_neural_from(
+        (config_path, tokenizer_path, weights_path): (
+            std::path::PathBuf,
+            std::path::PathBuf,
+            std::path::PathBuf,
+        ),
+    ) -> Result<Self> {
+        let device = Device::Cpu;
 
         // Load BERT config
         let config_data = std::fs::read_to_string(&config_path)
@@ -2636,6 +2661,9 @@ fn process_batch(
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+mod hf_home_9509_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::models::{Memory, Tier};
@@ -2873,7 +2901,7 @@ mod tests {
     #[cfg(feature = "test-with-models")]
     #[test]
     fn test_rerank_preserves_input_count_neural_if_available() {
-        let ce = CrossEncoder::new_neural();
+        let ce = CrossEncoder::new_neural_staged().expect("staged cross-encoder");
         let candidates: Vec<(Memory, f64)> = (0..5)
             .map(|i| (make_memory(&format!("t{i}"), &format!("body {i}")), 0.5))
             .collect();
@@ -3110,16 +3138,49 @@ mod tests {
 
     #[test]
     fn pr9i_new_neural_dual_outcome() {
-        // Exercises CrossEncoder::new_neural() (lines 65-79). Behavior is
-        // environment-dependent: with an HF cache or network the call
-        // succeeds and returns Self::Neural; without either it falls back
-        // to Self::Lexical via the documented eprintln + tracing warn
-        // pathway. Both outcomes are acceptable — what matters is the
-        // dispatch is hit. Functionally, both variants score within
-        // [0.0, 1.0].
-        let ce = CrossEncoder::new_neural();
+        // #9509/#9515: one exact outcome. The neural constructor over an
+        // EMPTY hub (never the network, never the host cache) takes the
+        // documented degrade path: the lexical encoder marked degraded,
+        // scoring within [0.0, 1.0].
+        let hub = tempfile::tempdir().expect("empty hub");
+        let ce = CrossEncoder::new_neural_in(hub.path());
+        assert!(
+            !ce.is_neural(),
+            "an empty hub must not build the neural encoder"
+        );
+        assert!(
+            ce.is_degraded_lexical(),
+            "an empty hub must degrade to the lexical encoder"
+        );
         let s = ce.score("query", "title", "content");
         assert!((0.0..=1.0).contains(&s), "score {s} out of bounds");
+    }
+
+    /// Start of the error [`CrossEncoder::load_cross_encoder_from_fallback`]
+    /// returns on a cache miss (#9509: exact reason assertions).
+    const CROSS_ENCODER_CACHE_MISS_PREFIX: &str = "offline (AI_MEMORY_EMBED_OFFLINE/HF_HUB_OFFLINE): \
+         cross-encoder model files not found in pre-stage dir: ";
+
+    /// The hf-hub repo dir of the cross-encoder under the job-private
+    /// `home/hf-home/hub` that `test_support::with_offline_home` points
+    /// `HF_HOME` at (#9509).
+    fn staged_repo_dir(home: &std::path::Path) -> std::path::PathBuf {
+        crate::embeddings::Embedder::hf_repo_dir(
+            &home.join("hf-home").join("hub"),
+            CROSS_ENCODER_MODEL_ID,
+        )
+    }
+
+    /// Write the three placeholder artifacts into `leaf`.
+    fn write_placeholder_artifacts(leaf: &std::path::Path) {
+        std::fs::create_dir_all(leaf).expect("mk snapshot leaf");
+        for name in [
+            crate::embeddings::HF_CONFIG_FILE,
+            crate::embeddings::HF_TOKENIZER_FILE,
+            crate::embeddings::HF_WEIGHTS_FILE,
+        ] {
+            std::fs::write(leaf.join(name), b"{}").expect("write placeholder");
+        }
     }
 
     // -----------------------------------------------------------------
@@ -3133,39 +3194,15 @@ mod tests {
         // freshly-created dir) must bail LOUD naming the pre-stage dir and
         // the model id — never a silent network attempt, never a silent
         // lexical downgrade at this layer (that decision belongs to the
-        // caller, new_neural).
-        // #2115: serialize on the crate-canonical process-global env lock so
-        // these $HOME-mutating tests do not race the embeddings module's own
-        // $HOME-mutating tests cross-module under parallel `cargo test`
-        // (std::env::set_var is unsound multithreaded — one module-local Mutex
-        // per file can never serialize against another file's tests).
-        let _guard = crate::config::test_env_lock();
-
-        let tmp = std::env::temp_dir().join(format!(
-            "ai-memory-2086-reranker-empty-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
-        std::fs::create_dir_all(&tmp).expect("mk empty home");
-        let prev_home = std::env::var("HOME").ok();
-        // SAFETY: serialized via LOCK above; no other thread mutates HOME
-        // for the duration of this guard.
-        unsafe {
-            std::env::set_var("HOME", &tmp);
-        }
-        let result = CrossEncoder::load_cross_encoder_from_fallback();
-        unsafe {
-            match prev_home {
-                Some(p) => std::env::set_var("HOME", p),
-                None => std::env::remove_var("HOME"),
-            }
-        }
-        let _ = std::fs::remove_dir_all(&tmp);
-        let err = result.expect_err("uncached pre-stage dir must bail, not silently fetch");
-        let msg = err.to_string();
+        // caller, new_neural). The `test_support` helper owns HOME, HF_HOME
+        // and the knob under the crate env lock (#2115, #9509).
+        let msg = crate::embeddings::test_support::offline_empty_cache_error(
+            CrossEncoder::load_cross_encoder_from_fallback,
+        );
+        assert!(
+            msg.starts_with(CROSS_ENCODER_CACHE_MISS_PREFIX),
+            "error must be the named cross-encoder cache miss: {msg}"
+        );
         assert!(
             msg.contains("offline"),
             "error must name the offline posture: {msg}"
@@ -3184,43 +3221,21 @@ mod tests {
     fn cross_encoder_fallback_succeeds_when_prestaged_2086() {
         // With the three cross-encoder files present under the documented
         // pre-stage dir, resolution succeeds with zero network — the
-        // air-gapped pre-stage path this issue exists to provide.
-        // #2115: shared crate-canonical env lock (see the sibling test) so the
-        // $HOME mutation serializes cross-module, not just within this file.
-        let _guard = crate::config::test_env_lock();
-
-        let tmp = std::env::temp_dir().join(format!(
-            "ai-memory-2086-reranker-prestaged-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
-        let model_dir = tmp.join(CROSS_ENCODER_FALLBACK_MODEL_SUBDIR);
-        std::fs::create_dir_all(&model_dir).expect("mk pre-stage model dir");
-        for name in [
-            crate::embeddings::HF_CONFIG_FILE,
-            crate::embeddings::HF_TOKENIZER_FILE,
-            crate::embeddings::HF_WEIGHTS_FILE,
-        ] {
-            std::fs::write(model_dir.join(name), b"{}").expect("write placeholder");
-        }
-        let prev_home = std::env::var("HOME").ok();
-        // SAFETY: serialized via LOCK above.
-        unsafe {
-            std::env::set_var("HOME", &tmp);
-        }
-        let result = CrossEncoder::load_cross_encoder_from_fallback();
-        unsafe {
-            match prev_home {
-                Some(p) => std::env::set_var("HOME", p),
-                None => std::env::remove_var("HOME"),
-            }
-        }
-        let _ = std::fs::remove_dir_all(&tmp);
+        // air-gapped pre-stage path this issue exists to provide. The
+        // `test_support` helper owns HOME and HF_HOME (#2115, #9509).
+        let tmp = tempfile::tempdir().expect("pre-stage home");
+        let model_dir = staged_repo_dir(tmp.path()).join("snapshots").join("main");
+        write_placeholder_artifacts(&model_dir);
+        let result = crate::embeddings::test_support::with_offline_home(
+            tmp.path(),
+            CrossEncoder::load_cross_encoder_from_fallback,
+        );
         let (config, tokenizer, weights) =
             result.expect("pre-staged cross-encoder files must resolve");
+        assert!(
+            config.starts_with(&model_dir),
+            "must resolve the snapshots/main leaf: {config:?}"
+        );
         assert!(config.ends_with(crate::embeddings::HF_CONFIG_FILE));
         assert!(tokenizer.ends_with(crate::embeddings::HF_TOKENIZER_FILE));
         assert!(weights.ends_with(crate::embeddings::HF_WEIGHTS_FILE));
@@ -3233,51 +3248,19 @@ mod tests {
         // the commit), NOT `snapshots/main`. The offline resolver must scan the
         // repo's snapshot leaves and resolve this layout so the documented
         // "ran online once, now offline" path does not silently degrade to
-        // lexical.
-        let _guard = crate::config::test_env_lock();
-
-        let tmp = std::env::temp_dir().join(format!(
-            "ai-memory-2114-reranker-online-cache-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
-        // Build the hf-hub repo dir (grandparent of the `snapshots/main` leaf)
-        // WITHOUT a `snapshots/main` — only a commit-hash leaf + `refs/main`,
-        // exactly what an online fetch leaves behind.
-        let repo_dir = std::path::PathBuf::from(&tmp)
-            .join(CROSS_ENCODER_FALLBACK_MODEL_SUBDIR)
-            .parent()
-            .and_then(std::path::Path::parent)
-            .expect("repo dir")
-            .to_path_buf();
+        // lexical. The repo dir holds NO `snapshots/main`, only a commit-hash
+        // leaf + `refs/main`, exactly what an online fetch leaves behind.
+        let tmp = tempfile::tempdir().expect("online-cache home");
+        let repo_dir = staged_repo_dir(tmp.path());
         let commit = "0123456789abcdef0123456789abcdef01234567";
         let hash_dir = repo_dir.join("snapshots").join(commit);
-        std::fs::create_dir_all(&hash_dir).expect("mk online-cache snapshot dir");
+        write_placeholder_artifacts(&hash_dir);
         std::fs::create_dir_all(repo_dir.join("refs")).expect("mk refs dir");
         std::fs::write(repo_dir.join("refs").join("main"), commit).expect("write refs/main");
-        for name in [
-            crate::embeddings::HF_CONFIG_FILE,
-            crate::embeddings::HF_TOKENIZER_FILE,
-            crate::embeddings::HF_WEIGHTS_FILE,
-        ] {
-            std::fs::write(hash_dir.join(name), b"{}").expect("write placeholder");
-        }
-        let prev_home = std::env::var("HOME").ok();
-        // SAFETY: serialized via the crate env lock above.
-        unsafe {
-            std::env::set_var("HOME", &tmp);
-        }
-        let result = CrossEncoder::load_cross_encoder_from_fallback();
-        unsafe {
-            match prev_home {
-                Some(p) => std::env::set_var("HOME", p),
-                None => std::env::remove_var("HOME"),
-            }
-        }
-        let _ = std::fs::remove_dir_all(&tmp);
+        let result = crate::embeddings::test_support::with_offline_home(
+            tmp.path(),
+            CrossEncoder::load_cross_encoder_from_fallback,
+        );
         let (config, tokenizer, weights) =
             result.expect("online-populated snapshots/<hash>/ cache must resolve offline");
         assert!(
@@ -3295,48 +3278,13 @@ mod tests {
         // attempt a network fetch) whenever the offline knob is set — proves
         // the #2086 wiring between the public resolver and the fallback
         // helper, independent of the fallback helper's own two tests above.
-        // #2115: shared crate-canonical env lock (see the sibling test) so the
-        // $HOME mutation serializes cross-module, not just within this file.
-        let _guard = crate::config::test_env_lock();
-
-        let tmp = std::env::temp_dir().join(format!(
-            "ai-memory-2086-resolve-offline-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
-        std::fs::create_dir_all(&tmp).expect("mk empty home");
-        let prev_home = std::env::var("HOME").ok();
-        let prev_off = std::env::var("AI_MEMORY_EMBED_OFFLINE").ok();
-        // SAFETY: serialized via LOCK above.
-        unsafe {
-            std::env::set_var("HOME", &tmp);
-            std::env::set_var("AI_MEMORY_EMBED_OFFLINE", "1");
-        }
-        assert!(
-            crate::embeddings::Embedder::remote_fetch_disabled(),
-            "offline knob must be honored"
+        // The `test_support` helper sets the knob, HOME and HF_HOME under the
+        // crate env lock and asserts the knob is honored (#2115, #9509).
+        let msg = crate::embeddings::test_support::offline_empty_cache_error(
+            CrossEncoder::resolve_cross_encoder_files,
         );
-        let result = CrossEncoder::resolve_cross_encoder_files();
-        unsafe {
-            match prev_home {
-                Some(p) => std::env::set_var("HOME", p),
-                None => std::env::remove_var("HOME"),
-            }
-            match prev_off {
-                Some(v) => std::env::set_var("AI_MEMORY_EMBED_OFFLINE", v),
-                None => std::env::remove_var("AI_MEMORY_EMBED_OFFLINE"),
-            }
-        }
-        let _ = std::fs::remove_dir_all(&tmp);
-        let msg = match result {
-            Ok(_) => panic!("empty pre-stage dir + offline must error (no silent network fetch)"),
-            Err(e) => e.to_string(),
-        };
         assert!(
-            msg.contains("offline") && msg.contains("pre-stage dir"),
+            msg.starts_with(CROSS_ENCODER_CACHE_MISS_PREFIX),
             "offline empty-cache error must point at the pre-stage dir: {msg}"
         );
     }
@@ -3570,10 +3518,16 @@ mod tests {
 
     #[test]
     fn pr9i_rerank_via_score_returns_blend() {
-        // Even when new_neural() falls back to lexical, rerank() must
-        // still produce a deterministic [0..1] blend. Pins the contract
-        // for both branches of CrossEncoder::score().
-        let ce = CrossEncoder::new_neural();
+        // #9509/#9515: one exact outcome. The neural constructor over an
+        // empty hub degrades to lexical (never the network, never the host
+        // cache), and rerank() must still produce a deterministic [0..1]
+        // blend on that degraded encoder.
+        let hub = tempfile::tempdir().expect("empty hub");
+        let ce = CrossEncoder::new_neural_in(hub.path());
+        assert!(
+            ce.is_degraded_lexical(),
+            "an empty hub must degrade to the lexical encoder"
+        );
         let cands = vec![
             (
                 Memory {
@@ -4468,8 +4422,8 @@ mod issue_1597_tests {
     }
 
     /// #1597 bench evidence — manual run against the REAL neural
-    /// cross-encoder (resolves from the local HF cache; downloads
-    /// ~80 MB on a cold host):
+    /// cross-encoder, resolved from the staged offline cache only (never a
+    /// download, #9509; stage it with `scripts/ci/stage_hf_cache.py`):
     ///
     /// ```bash
     /// AI_MEMORY_NO_CONFIG=1 cargo test --release --lib \
@@ -4482,7 +4436,7 @@ mod issue_1597_tests {
     #[test]
     #[ignore = "#1597 manual bench evidence: loads the real neural cross-encoder"]
     fn issue_1597_neural_rerank_timing_evidence() {
-        let ce = CrossEncoder::new_neural();
+        let ce = CrossEncoder::new_neural_staged().expect("staged cross-encoder");
         assert!(
             ce.is_neural(),
             "neural encoder failed to load; timing evidence invalid"
@@ -4534,9 +4488,10 @@ mod issue_1597_tests {
 mod reranker_budget_seam_2608_tests {
     //! #2608 — CI coverage of the pluggable [`PairScorer`] seam + the
     //! pre-flight wall-clock rerank budget. These run WITHOUT a BERT model:
-    //! a CI host always degrades `CrossEncoder::new_neural()` to lexical, so
-    //! the seam is the only way to exercise the neural-rerank decision path
-    //! (`neural_score_pairs` and its blend) and the budget-degrade branch.
+    //! whether `CrossEncoder::new_neural()` loads depends on the cache the
+    //! host has staged (#9509), so the seam is the only host-independent way
+    //! to exercise the neural-rerank decision path (`neural_score_pairs` and
+    //! its blend) and the budget-degrade branch.
     use super::{
         BatchedReranker, PairScorer, RERANK_FORWARD_NANOS_PER_PAIR_TOKEN, RERANK_POOL_MAX,
         RerankerScoreFloor, degrade_to_hybrid_ordering, est_token_len, estimate_rerank_forward_ms,

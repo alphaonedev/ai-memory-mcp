@@ -230,6 +230,10 @@ fn recall_mode_capabilities_consistent() {
     let _ = RecallMode::Disabled; // keep the import live for readers
 }
 
+#[path = "common/staged_models.rs"]
+mod staged_models;
+use staged_models::staged_local_embedder;
+
 /// The brief asks: call embedder with a controlled-failure mock,
 /// assert returned `EmbedStatus::Failed(_)`.
 ///
@@ -249,19 +253,9 @@ fn recall_mode_capabilities_consistent() {
 fn embed_status_surfaces_failure() {
     // ----- Skipped: oversized content --------------------------------------
     // We need any working Embedder to call `embed_with_status` —
-    // construct via the public API and short-circuit on environments
-    // where the local model isn't available.
-    let local = match ai_memory::embeddings::Embedder::new_local() {
-        Ok(e) => e,
-        Err(_) => {
-            // No HF cache + no network → can't run the success-path
-            // half of this test. Skip cleanly so CI on offline workers
-            // doesn't fail; the contract is still pinned by the lower
-            // layers (the EmbedStatus enum has its own unit tests in
-            // src/embeddings.rs).
-            return;
-        }
-    };
+    // build it from the staged offline cache (#9509); a missing cache is
+    // the named failure, never a skip.
+    let local = staged_local_embedder();
 
     // 1. Empty content → Skipped("empty content")
     let (vec_empty, status_empty) = local.embed_with_status("");

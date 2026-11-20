@@ -10,10 +10,14 @@
 //! fact appended and the same text WITHOUT it. If the two vectors are
 //! identical the fact never reached the vector (a miss); if they differ the
 //! fact is represented (a hit). The table is printed and the measured
-//! behaviour is pinned. The test skips cleanly when the `MiniLM` model is not
-//! available (offline CI worker), like `round2_f10_embed_status.rs`.
+//! behaviour is pinned. The model comes from the staged offline cache; a missing
+//! cache keeps its named failure (#9509), it is never a skip or a fetch.
 
 use ai_memory::embeddings::{Embedder, embedding_document};
+
+#[path = "common/staged_models.rs"]
+mod staged_models;
+use staged_models::staged_local_embedder;
 
 const TITLE: &str = "long memory coverage";
 const FACT: &str = "zorblax calibration key quillfen seven four two one";
@@ -51,11 +55,7 @@ fn fact_reaches_vector(embedder: &Embedder, words: usize) -> bool {
 
 #[test]
 fn long_memory_fact_past_the_embed_window_is_absent_from_the_vector_8292() {
-    let Ok(embedder) = Embedder::new_local() else {
-        // Offline worker without the cached MiniLM weights: skip cleanly.
-        eprintln!("skip: local MiniLM embedder unavailable");
-        return;
-    };
+    let embedder = staged_local_embedder();
     println!("words | fact in vector (atomisation off)");
     let mut results = Vec::new();
     for words in LENGTHS {

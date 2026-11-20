@@ -128,6 +128,10 @@ class ActionFacts:
 KNOWN_ACTIONS: dict[str, ActionFacts] = {
     "actions/attest-build-provenance": ActionFacts(default_token=True),
     "actions/cache": ActionFacts(),
+    # The restore and save halves of actions/cache at the same pinned sha (#9509): save runs only
+    # after the job verified the staged bytes, so an unverified tree is never written to the cache.
+    "actions/cache/restore": ActionFacts(),
+    "actions/cache/save": ActionFacts(),
     "actions/checkout": ActionFacts(),
     "actions/setup-node": ActionFacts(),
     "actions/setup-python": ActionFacts(),

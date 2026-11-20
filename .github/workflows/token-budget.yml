@@ -72,6 +72,12 @@ concurrency:
   group: token-budget-${{ github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref || github.event.pull_request.number || github.ref_name }}
   cancel-in-progress: true
 
+env:
+  # #9509/#9515: no Rust test of this workflow may fetch a model from the
+  # network; the embedder and cross-encoder take the staged offline cache
+  # only (one workflow-level source, held by the 9509 staging pin).
+  AI_MEMORY_EMBED_OFFLINE: "1"
+
 jobs:
   budget:
     name: token-budget gates

@@ -40,6 +40,10 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
+  # #9509/#9515: no Rust test of this workflow may fetch a model from the
+  # network; the embedder and cross-encoder take the staged offline cache
+  # only (one workflow-level source, held by the 9509 staging pin).
+  AI_MEMORY_EMBED_OFFLINE: "1"
   CARGO_TERM_COLOR: always
   # #7160 - size cap for the persistent self-hosted target/debug build state
   # (40 GiB); scripts/ci-sweep-target.py reads it via the sweep step below.

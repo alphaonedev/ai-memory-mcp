@@ -1149,6 +1149,12 @@ jobs:
     # that wait counts against the cap (JOB_T0 is unchanged), hence 300 there.
     timeout-minutes: ${{ matrix.timeout }}
     env:
+      # #9509/#9515: no Rust test of this job may fetch a model from the
+      # network; the embedder and cross-encoder take the staged offline cache
+      # only. ci.yml sets the knob once per job that runs Rust tests, not at
+      # workflow level, because the #8240 pre-trust gate pins the workflow env
+      # (held by the 9509 staging pin).
+      AI_MEMORY_EMBED_OFFLINE: "1"
       # Debuginfo budget for this job — the heaviest compile in CI (~600
       # integration test binaries per leg).
       #
@@ -1797,6 +1803,49 @@ jobs:
       - name: Load gate (#6795)
         if: needs.classify.outputs.cargo_skip != 'true' && contains(matrix.runner, 'self-hosted')
         run: python3 -I scripts/ci/load_gate.py --label "${{ matrix.node }}/${{ matrix.tier }}"
+
+      # #9509 — the staged offline model cache is a prerequisite of the tests
+      # below (named failure "prerequisite missing: offline embedder cache").
+      # The four steps are the one staging form shared with job sal-feature and
+      # coverage.yml (vote 9531-staging-posture, 3-agent vote (71472661)):
+      #   1. a job-private HF_HOME under runner.temp, outside the checkout and
+      #      the runner user's home, written to GITHUB_ENV fail-closed (D2-1);
+      #   2. an exact-key restore of that hub, the key naming both pinned
+      #      revisions, no restore-keys (D1-2, D1-4);
+      #   3. the stage script, which exits 0 only on a byte-verified cache at
+      #      the pinned revisions and otherwise ends HERE with a named reason
+      #      and exit code before any test runs (D1-1);
+      #   4. a save only after a verified stage on a cache miss (D1-2).
+      # The job-level AI_MEMORY_EMBED_OFFLINE then keeps every test
+      # offline, so no test can fetch a model from the network (#9515).
+      - name: Private HF home (#9509)
+        if: needs.classify.outputs.cargo_skip != 'true'
+        env:
+          RUNNER_TEMP_ARG: ${{ runner.temp }}
+          WORKSPACE_ARG: ${{ github.workspace }}
+        run: python3 -I scripts/ci/hf_home_private.py --runner-temp "$RUNNER_TEMP_ARG" --workspace "$WORKSPACE_ARG" --github-env "$GITHUB_ENV"
+
+      - name: Restore HuggingFace models (#9509)
+        if: needs.classify.outputs.cargo_skip != 'true'
+        id: hf_restore
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ env.HF_HOME }}/hub
+          key: hf-hub-minilm-l6-v2-1110a243fdf4706b3f48f1d95db1a4f5529b4d41-marco-l6-v2-233902d25c440f23af6f7d6e94d2946bac0bee0a-v3
+
+      - name: Stage HF model cache (#9509)
+        if: needs.classify.outputs.cargo_skip != 'true'
+        env:
+          RUNNER_TEMP_ARG: ${{ runner.temp }}
+          WORKSPACE_ARG: ${{ github.workspace }}
+        run: python3 -I scripts/ci/stage_hf_cache.py --models all --runner-temp "$RUNNER_TEMP_ARG" --workspace "$WORKSPACE_ARG"
+
+      - name: Save HuggingFace models (#9509)
+        if: needs.classify.outputs.cargo_skip != 'true' && steps.hf_restore.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ env.HF_HOME }}/hub
+          key: hf-hub-minilm-l6-v2-1110a243fdf4706b3f48f1d95db1a4f5529b4d41-marco-l6-v2-233902d25c440f23af6f7d6e94d2946bac0bee0a-v3
 
       - name: Run tests (impact-aware)
         if: needs.classify.outputs.cargo_skip != 'true'
@@ -3001,6 +3050,10 @@ jobs:
     # masking a genuine hang (this job has no #1492 watchdog, so its cap is its
     # only bound).
     timeout-minutes: 55
+    env:
+      # #9509/#9515: the lib tests run offline from the staged model cache
+      # (one job-level source; see job check).
+      AI_MEMORY_EMBED_OFFLINE: "1"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -3031,6 +3084,42 @@ jobs:
       - name: Build release (sal feature)
         run: cargo build --release --features sal
 
+      # #9509 — the lib tests below include the b3 test, whose prerequisite is
+      # the offline embedder cache (named failure "prerequisite missing:
+      # offline embedder cache"; fail loud by design, ruling b29 127a16a7 (2)).
+      # The same four steps as job check provide it (see the comment there),
+      # or end HERE with the staging script's own named error before any test
+      # runs. No step-level `if:` on purpose: the test step of this job has
+      # none, so the cache must be staged wherever these lib tests run (b29
+      # 6a339cef; held by the 9509 lib-test stage census cell under
+      # scripts/ci/tests). The lib tests read AI_MEMORY_EMBED_OFFLINE from the
+      # job-level env, so they run offline too (#9515).
+      - name: Private HF home (#9509)
+        env:
+          RUNNER_TEMP_ARG: ${{ runner.temp }}
+          WORKSPACE_ARG: ${{ github.workspace }}
+        run: python3 -I scripts/ci/hf_home_private.py --runner-temp "$RUNNER_TEMP_ARG" --workspace "$WORKSPACE_ARG" --github-env "$GITHUB_ENV"
+
+      - name: Restore HuggingFace models (#9509)
+        id: hf_restore
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ env.HF_HOME }}/hub
+          key: hf-hub-minilm-l6-v2-1110a243fdf4706b3f48f1d95db1a4f5529b4d41-marco-l6-v2-233902d25c440f23af6f7d6e94d2946bac0bee0a-v3
+
+      - name: Stage HF model cache (#9509)
+        env:
+          RUNNER_TEMP_ARG: ${{ runner.temp }}
+          WORKSPACE_ARG: ${{ github.workspace }}
+        run: python3 -I scripts/ci/stage_hf_cache.py --models all --runner-temp "$RUNNER_TEMP_ARG" --workspace "$WORKSPACE_ARG"
+
+      - name: Save HuggingFace models (#9509)
+        if: steps.hf_restore.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ env.HF_HOME }}/hub
+          key: hf-hub-minilm-l6-v2-1110a243fdf4706b3f48f1d95db1a4f5529b4d41-marco-l6-v2-233902d25c440f23af6f7d6e94d2946bac0bee0a-v3
+
       - name: Run lib tests (sal feature)
         env:
           AI_MEMORY_NO_CONFIG: "1"
@@ -3058,6 +3147,10 @@ jobs:
     # #1487 — bound the job so a wedged test can't pin the runner. 30 is the
     # pre-#3109 value measured on this runner class and is unchanged by #3109.
     timeout-minutes: 30
+    env:
+      # #9509/#9515: no Rust test of this job may fetch a model from the
+      # network (one job-level source; see job check).
+      AI_MEMORY_EMBED_OFFLINE: "1"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
