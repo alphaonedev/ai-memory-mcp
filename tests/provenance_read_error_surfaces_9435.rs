@@ -299,15 +299,18 @@ fn seeded_verify_db(test: &str, genesis_sql: Option<&str>) -> PathBuf {
     path
 }
 
+/// #9505 (3-agent vote (71472661), B + J1) — an unreadable genesis fails the
+/// verb as a failed VERIFICATION (exit 2, a named class on the verdict line),
+/// not as a generic `Err` after a passing-looking report; the full matrix
+/// lives in `tests/verify_chain_genesis_exit_code_9505.rs`.
 #[test]
-fn verify_unreadable_genesis_is_err_not_skipped_line() {
+fn verify_unreadable_genesis_is_exit_2_not_skipped_line() {
     let path = seeded_verify_db("verify_unreadable", Some(UNREADABLE_TEXT_SQL));
     let (res, stdout) = run_verify(&path);
-    let err = res.expect_err("an unreadable genesis must fail the verb");
-    assert_eq!(err.to_string(), ERR_GENESIS_TEXT);
+    assert_eq!(res.expect("a failed check is an exit code"), 2);
     assert!(
-        !stdout.contains(VERIFY_CID_LINE),
-        "no verdict line: {stdout}"
+        stdout.contains(&format!("{VERIFY_CID_LINE}unreadable (decode_error)")),
+        "verdict line names the class: {stdout}"
     );
 }
 
@@ -337,7 +340,7 @@ fn verify_null_genesis_is_ok_without_cid_line() {
 
 const ERR_GENESIS_COLUMN_MISSING: &str = "provenance column memories.cid_genesis is missing: \
 this database is on a schema older than v74 (the content-id columns). Repair: \
-`ai-memory migrate --in-place` or start the daemon, then re-run.";
+`ai-memory --db <path> stats` or start the daemon, then re-run.";
 const PRE_V74_STAMP: i64 = 73;
 const DROP_PRE_V74_COLUMNS_SQL: &[&str] = &[
     "DROP INDEX IF EXISTS idx_memories_cid",
@@ -542,7 +545,7 @@ fn link_on_real_v73_store_names_the_cid_column() {
     assert_eq!(
         err.to_string(),
         "provenance column memories.cid is missing: this database is on a schema older than \
-         v74 (the content-id columns). Repair: `ai-memory migrate --in-place` or start the \
+         v74 (the content-id columns). Repair: `ai-memory --db <path> stats` or start the \
          daemon, then re-run."
     );
     assert_eq!(link_rows(&conn), 0);
