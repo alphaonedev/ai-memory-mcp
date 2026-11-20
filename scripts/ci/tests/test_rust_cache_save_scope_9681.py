@@ -19,6 +19,12 @@ it so the restored artifacts are reused.
 The touched workflows keep every job id, job name and test step (hand tables below, d54c4b0e):
 required contexts are unchanged, and the same tests run.
 
+Vote V2-9681 (3-agent vote 71472661, A+ push-only hosted warm workflow on chain/**): the chain
+cache has exactly one writer, rust-cache-warm.yml (push on chain/** only, GitHub-hosted, no
+secrets, sha-pinned actions); no other workflow can write or share its keys; one prefix-key
+generation constant at the four paired cache steps invalidates it. ``ChainCacheSoleWriter9681``
+holds conditions V-2 to V-11 over every workflow file, not over hand tables.
+
 Run: python3 -I -m unittest discover -s scripts/ci/tests -p 'test_rust_cache_save_scope_9681.py'
 """
 
@@ -268,6 +274,39 @@ HF_CACHE_SITES = {
     (WARM, "coverage"): ("Restore HuggingFace models (#2019)",
                          "Save HuggingFace models (#2019, push only)"),
 }
+
+# --- vote V2-9681 conditions (whole-repository scans, no per-file hand table) --------------------
+
+CHAIN_PREFIX = "chain/"
+# Refs a chain push can carry; a push filter that matches any of them reaches the chain scope.
+CHAIN_SAMPLE_REFS = ("chain/promo6-ssh-r2", "chain/a/b", "chain/x")
+GLOB_CHARS = frozenset("*?+[]!")
+# Steps whose text marks a workflow that builds or publishes release artefacts.
+RELEASE_ARTEFACT_RE = re.compile(
+    r"actions/upload-artifact|softprops/action-gh-release|actions/attest|attest-build-provenance"
+    r"|docker/build-push-action|\bdocker push\b|\bgh release (?:create|upload)\b|\bcargo publish\b"
+    r"|\bnpm publish\b|\btwine upload\b|id-token:\s*write")
+# The keys the chain PR jobs restore; they may appear only in the paired workflows.
+SHARED_KEYS = tuple(pair[3] for pair in PAIRS)
+KEY_HOLDERS = frozenset({"ci.yml", "coverage.yml", WARM})
+# Workflows started by these events run with a base-branch token and may write the base cache.
+PRIVILEGED_EVENTS = frozenset({"pull_request_target", "workflow_run"})
+CACHE_USES_RE = re.compile(r"""^\s*(?:-\s+)?uses:\s*['"]?(Swatinem/rust-cache|actions/cache)(?:[/@]|['"]?\s*$)""")
+USES_RE = re.compile(r"""^\s*(?:-\s+)?uses:\s*['"]?([^'"\s#]+)""")
+PINNED_USES_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_./-]+)?@[0-9a-f]{40}$")
+WARM_FORBIDDEN_RE = re.compile(r"upload-artifact|id-token|\bsecrets\s*[.:\[]")
+# V-7: one generation constant at the four paired cache steps; a bump changes every chain key.
+PREFIX_KEY_RE = re.compile(r"^chain-cache-g[1-9][0-9]*$")
+HOSTED_GUARD = "runner.environment == 'github-hosted'"
+CI_GATE_JOB = ("ci.yml", "ci-gate")
+BRANCH_PROTECTION = REPO / ".github" / "branch-protection.yml"
+CHANGELOG_9681 = REPO / "changelog.d" / "9681.changed.md"
+# V-2: the header names the precedents and why this push trigger is the one exception.
+V2_HEADER_PHRASES = ("#2506", "#2523", "#2508", "the one sanctioned exception")
+# V-11: the kill switch and the revert rule, in the header and in the changelog entry.
+V11_PHRASES = ("Kill switch:", "delete the caches of the chain ref", "revert this workflow",
+               "build.rs", "a proc-macro crate", ".cargo/", "Cargo.lock",
+               "bumps the prefix-key generation constant in the same merge")
 
 
 # --- a small indentation parser for the workflow shapes this repository uses --------------------
@@ -648,9 +687,12 @@ class RustCacheSaveScope9681(unittest.TestCase):
                 for step in (pr_steps[pr_cache], warm_steps[warm_cache]):
                     inputs = step.mapping("with")
                     self.assertEqual(inputs.get("shared-key"), shared_key)
-                    for absent in ("key", "prefix-key", "add-job-id-key",
+                    for absent in ("key", "add-job-id-key",
                                    "add-rust-environment-hash-key", "env-vars", "workspaces"):
                         self.assertNotIn(absent, inputs)
+                # prefix-key leads the restore key, so the PR job and its warm job carry the same.
+                self.assertEqual(pr_steps[pr_cache].mapping("with").get("prefix-key"),
+                                 warm_steps[warm_cache].mapping("with").get("prefix-key"))
                 self.assertEqual(sorted(shared_keys[shared_key]),
                                  sorted([f"{pr_name}:{pr_job_id}", f"{WARM}:{warm_job_id}"]))
             with self.subTest(pair=warm_job_id, part="key-env"):
@@ -712,6 +754,312 @@ class RustCacheSaveScope9681(unittest.TestCase):
                 self.assertIn(action, tb.KNOWN_ACTIONS)
                 facts = tb.KNOWN_ACTIONS[action]
                 self.assertFalse(facts.pr_code or facts.default_token or facts.script_input)
+
+
+# --- vote V2-9681: the chain cache has one writer ------------------------------------------------
+
+ON_KEY_RE = re.compile(r"""^(?:["']?on["']?|true)\s*:""")
+# A rust-cache key input line: the one place a paired workflow may spell a chain key.
+KEY_INPUT_RE = re.compile(r"^\s+(?:shared-key|prefix-key):\s*[A-Za-z0-9_.-]+\s*$")
+
+
+def _numbered(path: Path) -> list[tuple[int, str]]:
+    """(1-based line number, line) of every line that is not a comment or blank."""
+    return [(n, line) for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
+            if not _is_comment_or_blank(line)]
+
+
+def _github_yaml_files() -> list[Path]:
+    """Every workflow and composite action under .github (a shared key can hide in either)."""
+    out = [p for p in WORKFLOWS.iterdir() if p.suffix in (".yml", ".yaml")]
+    actions = REPO / ".github" / "actions"
+    if actions.is_dir():
+        out += [p for p in actions.rglob("*") if p.suffix in (".yml", ".yaml")]
+    return sorted(out)
+
+
+def _triggers(wf: Workflow) -> dict[str, list[str]]:
+    """Trigger name -> body lines. An `on:` form this parser cannot read is an assertion, so an
+    unreadable trigger never passes as 'no push'."""
+    hits = [(n, line) for n, line in enumerate(wf.lines, 1) if ON_KEY_RE.match(line)]
+    if len(hits) != 1 or not hits[0][1].startswith("on:"):
+        raise AssertionError(f"{wf.name}: expected one plain top-level `on:` key, found "
+                             f"{[f'{n}: {line}' for n, line in hits]}")
+    inline = hits[0][1][len("on:"):].strip()
+    if inline and not inline.startswith("#"):
+        return {event: [] for event in _flow_list(inline)}
+    return wf.events()
+
+
+def _filter_list(body: list[str], key: str) -> tuple[str, ...] | None:
+    for index, line in enumerate(body):
+        if _indent(line) == 4 and line.strip().startswith(key + ":"):
+            rest = line.strip()[len(key) + 1:].strip()
+            if rest and not rest.startswith("#"):
+                return _flow_list(rest)
+            items = []
+            for item in body[index + 1:]:
+                if _is_comment_or_blank(item):
+                    continue
+                if _indent(item) <= 4:
+                    break
+                items.append(_scalar(item.strip()[2:]) if item.strip().startswith("- ")
+                             else item.strip())
+            return tuple(items)
+    return None
+
+
+def _glob_re(pattern: str) -> re.Pattern[str]:
+    out = []
+    i = 0
+    while i < len(pattern):
+        if pattern.startswith("**", i):
+            out.append(".*")
+            i += 2
+        elif pattern[i] == "*":
+            out.append("[^/]*")
+            i += 1
+        else:
+            out.append(re.escape(pattern[i]))
+            i += 1
+    return re.compile("".join(out) + r"\Z")
+
+
+def _pattern_reaches_chain(pattern: str) -> bool:
+    """Conservative: a pattern whose literal head is compatible with `chain/` counts as reaching
+    a chain ref even if no sample ref matches it; GitHub-only operators (?, +, [], !) are judged on
+    their literal head alone."""
+    literal = ""
+    for char in pattern:
+        if char in GLOB_CHARS:
+            break
+        literal += char
+    if literal.startswith(CHAIN_PREFIX) or (CHAIN_PREFIX.startswith(literal)
+                                            and len(literal) < len(pattern)):
+        return True
+    if GLOB_CHARS & set(pattern) - {"*"}:
+        return CHAIN_PREFIX.startswith(literal) or literal.startswith(CHAIN_PREFIX)
+    return any(_glob_re(pattern).match(ref) for ref in CHAIN_SAMPLE_REFS)
+
+
+def _push_reaches_chain(wf: Workflow) -> str | None:
+    """The reason a push to a chain ref starts this workflow, or None."""
+    body = _triggers(wf).get("push")
+    if body is None:
+        return None
+    branches = _filter_list(body, "branches")
+    ignored = _filter_list(body, "branches-ignore")
+    if branches is not None:
+        hits = [p for p in branches if not p.startswith("!") and _pattern_reaches_chain(p)]
+        return f"push.branches {hits}" if hits else None
+    if ignored is not None:
+        if any(p in ("**", "chain/**") for p in ignored):
+            return None
+        return f"push.branches-ignore {list(ignored)} does not exclude chain/**"
+    if _filter_list(body, "tags") is not None or _filter_list(body, "tags-ignore") is not None:
+        return None
+    return "push has no branch filter, so every branch push starts it"
+
+
+def _line_no(wf: Workflow, needle: str) -> int:
+    in_on = False
+    for n, line in enumerate(wf.lines, 1):
+        if line.startswith("on:"):
+            in_on = True
+        elif line and not line[0].isspace() and not line.startswith("#"):
+            in_on = False
+        if in_on and needle in line:
+            return n
+    return 0
+
+
+def _header(path: Path) -> str:
+    """The leading comment block, comment markers dropped and blanks squeezed."""
+    out = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        if not line.startswith("#"):
+            break
+        out.append(line[1:].strip())
+    return " ".join(" ".join(out).split())
+
+
+def _cache_step_inputs(name: str, job_id: str) -> tuple[Step, dict[str, str]]:
+    steps = Workflow.load(name).jobs()[job_id].steps()
+    step = steps[_cache_index(steps)]
+    return step, step.mapping("with")
+
+
+class ChainCacheSoleWriter9681(unittest.TestCase):
+    """Vote V2-9681 conditions V-2 to V-11: rust-cache-warm.yml is the chain cache's only writer."""
+
+    def test_v2_warm_header_cites_the_push_overlap_precedents(self) -> None:
+        header = _header(WORKFLOWS / WARM)
+        for phrase in V2_HEADER_PHRASES:
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, header,
+                              f"{WARM}: header lacks {phrase!r} (V-2: cite #2506/#2523/#2508 and "
+                              f"say why this chain/** push trigger is the one sanctioned exception)")
+
+    def test_v3_only_the_warm_workflow_runs_on_a_chain_push(self) -> None:
+        reaching: dict[str, str] = {}
+        for name in _all_workflow_names():
+            wf = Workflow.load(name)
+            reason = _push_reaches_chain(wf)
+            if reason is not None:
+                reaching[name] = reason
+                if name != WARM:
+                    self.fail(f"{name}:{_line_no(wf, 'push')}: {reason}; only {WARM} may run on "
+                              f"a chain/** push (V-3)")
+        self.assertEqual(set(reaching), {WARM}, f"chain/** push workflows: {reaching}")
+
+    def test_v3_no_release_artefact_workflow_runs_on_a_chain_push(self) -> None:
+        for name in _all_workflow_names():
+            wf = Workflow.load(name)
+            if _push_reaches_chain(wf) is None:
+                continue
+            for n, line in _numbered(WORKFLOWS / name):
+                with self.subTest(workflow=name, line=n):
+                    self.assertIsNone(RELEASE_ARTEFACT_RE.search(line),
+                                      f"{name}:{n}: {line.strip()} - a workflow that runs on a "
+                                      f"chain/** push builds or publishes release artefacts (V-3)")
+
+    def test_v4_shared_keys_and_generation_live_only_in_the_paired_workflows(self) -> None:
+        _, warm_inputs = _cache_step_inputs(WARM, PAIRS[0][2])
+        literals = (*SHARED_KEYS, warm_inputs.get("prefix-key", "<no prefix-key>"))
+        for path in _github_yaml_files():
+            holder = path.parent == WORKFLOWS and path.name in KEY_HOLDERS
+            for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+                if holder and (_is_comment_or_blank(line) or KEY_INPUT_RE.match(line)):
+                    # In a paired workflow the literal may sit only on a rust-cache key input,
+                    # whose step the parse below ties to an owner job.
+                    continue
+                for literal in literals:
+                    with self.subTest(file=path.name, line=n, literal=literal):
+                        self.assertNotIn(literal, line,
+                                         f"{path.relative_to(REPO)}:{n}: {line.strip()} - the chain "
+                                         f"cache key {literal!r} is used outside the four paired "
+                                         f"rust-cache steps (V-4)")
+        for name in _all_workflow_names():
+            for job_id, job in Workflow.load(name).jobs().items():
+                for step in job.steps():
+                    if step.uses_name() != RUST_CACHE:
+                        continue
+                    inputs = step.mapping("with")
+                    owner = any((name, job_id) in ((p[0], p[1]), (WARM, p[2])) for p in PAIRS)
+                    with self.subTest(workflow=name, job=job_id):
+                        for key in ("shared-key", "prefix-key"):
+                            value = inputs.get(key, "")
+                            self.assertNotIn("${{", value, f"{name}:{job_id}: dynamic rust-cache "
+                                                           f"{key} {value!r} could build a chain "
+                                                           f"key (V-4)")
+                            if not owner:
+                                self.assertNotIn(value, literals,
+                                                 f"{name}:{job_id}: rust-cache {key} {value!r} "
+                                                 f"is a chain cache key (V-4)")
+
+    def test_v5_every_warm_action_is_pinned_to_a_commit_sha(self) -> None:
+        uses = [(n, m.group(1)) for n, line in _numbered(WORKFLOWS / WARM)
+                if (m := USES_RE.match(line))]
+        self.assertTrue(uses, f"{WARM}: no uses: line parsed")
+        for n, ref in uses:
+            with self.subTest(line=n):
+                self.assertRegex(ref, PINNED_USES_RE,
+                                 f"{WARM}:{n}: uses {ref} is not pinned to a 40-hex commit sha (V-5)")
+
+    def test_v6_warm_triggers_and_no_artifact_token_or_secret(self) -> None:
+        wf = Workflow.load(WARM)
+        triggers = _triggers(wf)
+        self.assertEqual(sorted(triggers), ["push"],
+                         f"{WARM}:{_line_no(wf, ':')}: triggers {sorted(triggers)}; only push (V-6)")
+        body = [line.strip() for line in triggers["push"] if not _is_comment_or_blank(line)]
+        self.assertEqual(body, ['branches: ["chain/**"]'],
+                         f"{WARM}: push filter {body}; exactly branches chain/** (V-6)")
+        for n, line in _numbered(WORKFLOWS / WARM):
+            with self.subTest(line=n):
+                self.assertIsNone(WARM_FORBIDDEN_RE.search(line),
+                                  f"{WARM}:{n}: {line.strip()} - upload-artifact, id-token or a "
+                                  f"secrets reference in the chain cache writer (V-6)")
+
+    def test_v7_one_prefix_key_generation_at_the_four_paired_steps(self) -> None:
+        sites = {}
+        for pr_name, pr_job_id, warm_job_id, _ in PAIRS:
+            for name, job_id in ((pr_name, pr_job_id), (WARM, warm_job_id)):
+                _, inputs = _cache_step_inputs(name, job_id)
+                sites[f"{name}:{job_id}"] = inputs.get("prefix-key")
+        self.assertEqual(len(sites), 4)
+        values = set(sites.values())
+        self.assertEqual(len(values), 1, f"prefix-key differs across the four paired cache steps: "
+                                         f"{sites} (V-7)")
+        (value,) = values
+        self.assertIsNotNone(value, f"no prefix-key at the four paired cache steps: {sites} (V-7)")
+        self.assertRegex(value, PREFIX_KEY_RE,
+                         f"prefix-key {value!r} is not a chain-cache-g<N> generation (V-7)")
+
+    def test_v8_check_cache_step_is_hosted_only(self) -> None:
+        for pr_name, pr_job_id, _, _ in PAIRS:
+            job = Workflow.load(pr_name).jobs()[pr_job_id]
+            step, _ = _cache_step_inputs(pr_name, pr_job_id)
+            with self.subTest(workflow=pr_name, job=pr_job_id):
+                if pr_name == "ci.yml" or job.scalar("runs-on") != "ubuntu-latest":
+                    self.assertIn(HOSTED_GUARD, step.keys.get("if", ""),
+                                  f"{pr_name}:{pr_job_id}: rust-cache if {step.keys.get('if')!r} "
+                                  f"lacks {HOSTED_GUARD} (V-8)")
+
+    def test_v9_no_privileged_trigger_touches_a_cache(self) -> None:
+        to_scan: list[tuple[str, str]] = []
+        for name in _all_workflow_names():
+            events = set(_triggers(Workflow.load(name)))
+            if events & PRIVILEGED_EVENTS:
+                to_scan.append((name, ",".join(sorted(events & PRIVILEGED_EVENTS))))
+        seen: set[str] = set()
+        while to_scan:
+            name, why = to_scan.pop()
+            if name in seen:
+                continue
+            seen.add(name)
+            for n, line in _numbered(WORKFLOWS / name):
+                with self.subTest(workflow=name, line=n):
+                    self.assertIsNone(CACHE_USES_RE.match(line),
+                                      f"{name}:{n}: {line.strip()} - a workflow started by {why} "
+                                      f"uses a cache action (V-9)")
+                called = USES_RE.match(line)
+                if called and called.group(1).startswith("./.github/workflows/"):
+                    to_scan.append((Path(called.group(1)).name, f"{why} via {name}"))
+
+    def test_v10_no_warm_job_is_required_or_gated(self) -> None:
+        warm_jobs = Workflow.load(WARM).jobs()
+        identities = {job_id for job_id in warm_jobs} | {job.scalar("name") or "" for job in
+                                                          warm_jobs.values()}
+        required = {line.strip() for line in REQUIRED_CONTEXTS.read_text(encoding="utf-8").splitlines()
+                    if line.strip() and not line.startswith("#")}
+        gate = Workflow.load(CI_GATE_JOB[0]).jobs()[CI_GATE_JOB[1]]
+        needs_raw = gate.scalar("needs") or ""
+        needs = set(_flow_list(needs_raw)) if needs_raw else {
+            _scalar(line.strip()[2:]) for line in gate.block("needs") if line.strip().startswith("- ")}
+        protection = BRANCH_PROTECTION.read_text(encoding="utf-8") if BRANCH_PROTECTION.exists() else ""
+        names = {job.scalar("name") or "" for job in warm_jobs.values()}
+        for ident in sorted(identities):
+            with self.subTest(job=ident):
+                self.assertTrue(ident, f"{WARM}: a warm job has no name (V-10)")
+                self.assertNotIn(ident, required, f"{REQUIRED_CONTEXTS.name}: warm job {ident!r} is a "
+                                                  f"required context (V-10)")
+                self.assertNotIn(ident, needs, f"{CI_GATE_JOB[0]}:{CI_GATE_JOB[1]}: needs warm job "
+                                               f"{ident!r} (V-10)")
+                if ident in names:
+                    # Contexts are job names; a bare job id such as `coverage` is ordinary prose.
+                    self.assertNotIn(ident, protection, f"{BRANCH_PROTECTION.name}: names warm job "
+                                                        f"{ident!r} (V-10)")
+
+    def test_v11_kill_switch_and_revert_rule_are_stated(self) -> None:
+        texts = {WARM: _header(WORKFLOWS / WARM),
+                 CHANGELOG_9681.name: " ".join(CHANGELOG_9681.read_text(encoding="utf-8").split())}
+        for where, text in texts.items():
+            for phrase in V11_PHRASES:
+                with self.subTest(file=where, phrase=phrase):
+                    self.assertIn(phrase, text, f"{where}: lacks {phrase!r} (V-11: kill switch and "
+                                                f"the generation bump on a build-affecting revert)")
 
 
 if __name__ == "__main__":
