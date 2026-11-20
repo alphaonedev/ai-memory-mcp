@@ -298,32 +298,54 @@ def shim_rewrite_argv(argv):
     return shim_namespace()["rewrite_argv"](list(argv))
 
 
-def probe_host_sed(search_path=None):
-    """Return (state, path): SED_GNU, SED_BSD or SED_ABSENT; never raises.
+SED_PROBE_GNU_RC = 0
+SED_PROBE_BSD_RC = 1  # BSD sed rejects `--version` with a usage error and exit 1
+PROBE_FAILED_TEXT = "host sed %s is present but its probe failed: %s"
 
-    GNU sed answers `--version` with exit 0, BSD sed rejects the option. A sed that cannot
-    be found or run, or that does not answer in time, is absent.
+
+class HostSedProbeError(AssertionError):
+    """A sed that resolves on PATH gave no GNU or BSD answer; a cell that hits it fails."""
+
+
+def probe_host_sed(search_path=None, which=shutil.which, run=subprocess.run):
+    """Return (state, path): SED_GNU, SED_BSD or SED_ABSENT; raises HostSedProbeError.
+
+    GNU sed answers `--version` with exit 0, BSD sed rejects the option with exit 1. The
+    absent state means only that no sed resolves on PATH (or the resolved path vanished
+    before the exec: FileNotFoundError). A sed that resolves but whose probe raises another
+    OSError, times out or exits with any other code is broken: it raises, never skips.
     """
-    real = shutil.which("sed", path=search_path)
+    real = which("sed", path=search_path)
     if real is None:
         return SED_ABSENT, None
     try:
-        res = subprocess.run([real, "--version"], capture_output=True, text=True, timeout=TIMEOUT_S)
-    except (OSError, subprocess.SubprocessError):
+        res = run([real, "--version"], capture_output=True, text=True, timeout=TIMEOUT_S)
+    except FileNotFoundError:
         return SED_ABSENT, None
-    return (SED_GNU if res.returncode == 0 else SED_BSD), real
+    except subprocess.TimeoutExpired:
+        raise HostSedProbeError(PROBE_FAILED_TEXT % (real, "timeout after %s s" % TIMEOUT_S))
+    except OSError as exc:
+        name = errno.errorcode.get(exc.errno, "unknown")
+        raise HostSedProbeError(PROBE_FAILED_TEXT % (real, "errno %s (%s)" % (exc.errno, name)))
+    if res.returncode == SED_PROBE_GNU_RC:
+        return SED_GNU, real
+    if res.returncode == SED_PROBE_BSD_RC:
+        return SED_BSD, real
+    raise HostSedProbeError(PROBE_FAILED_TEXT % (
+        real, "exit %d is neither GNU (%d) nor BSD (%d)"
+        % (res.returncode, SED_PROBE_GNU_RC, SED_PROBE_BSD_RC)))
 
 
-def bsd_sed_shim_dir(work: Path, search_path=None, force: bool = False):
+def bsd_sed_shim_dir(work: Path, search_path=None, force: bool = False, probe=probe_host_sed):
     """Return a directory holding a `sed` shim for a BSD-userland host, else None.
 
     The step text lives in ci.yml (its form is pinned there), so the test adapts
     the host instead: the shim repairs only the `p}` brace-close of the sed program
     to `p;}` and runs the host's own sed. On a GNU host nothing is installed (unless
     `force`) and the step runs byte for byte as on the hosted runner. A host with no
-    sed skips with a named reason.
+    sed on PATH skips with a named reason; a sed that is there but broken fails.
     """
-    state, real = probe_host_sed(search_path)
+    state, real = probe(search_path)
     if state == SED_ABSENT:
         raise unittest.SkipTest(ABSENT_SED_REASON_TEXT)
     if state == SED_GNU and not force:
@@ -629,7 +651,7 @@ def run_shim(work: Path, args, stdin_text: str = ""):
 
 
 class HostSedProbe(unittest.TestCase):
-    """F1: every probe of the host sed ends in gnu, bsd or absent; none raises."""
+    """F1: the host sed probe ends in gnu, bsd or absent (see HostSedProbeStates for the rest)."""
 
     def test_no_sed_on_path_is_the_absent_state(self):
         empty = scratch_dir()
