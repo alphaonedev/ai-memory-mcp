@@ -3,7 +3,7 @@
 
 //! #9509/#9515 - the one shared way an integration test builds a real model.
 //!
-//! Every constructor here reads only the staged offline HuggingFace cache
+//! Every constructor here reads only the staged offline Hugging Face cache
 //! (`$HF_HOME/hub`, else `$HOME/.cache/huggingface/hub`), so no integration
 //! test can reach a network model fetch, whatever the knob or the host. CI
 //! stages the cache with `scripts/ci/stage_hf_cache.py`. Include it with
@@ -19,7 +19,7 @@ use ai_memory::reranker::CrossEncoder;
 /// names the cache, never a skip and never a download.
 const PREREQUISITE: &str = "prerequisite missing: offline embedder cache";
 
-/// The real local MiniLM embedder, built from the staged cache only.
+/// The real local `MiniLM` embedder, built from the staged cache only.
 ///
 /// # Panics
 /// With the named prerequisite message when the cache is not staged, and
