@@ -175,38 +175,162 @@ def scratch_dir() -> Path:
     return Path(tempfile.mkdtemp(prefix="cs8328-", dir=str(SCRATCH)))
 
 
-SED_SHIM = (
-    "#!%s -I\n"
-    "import os, re, sys\n"
-    "# Host shim (#9744): the workflow step uses the GNU form `{...;p}`; BSD sed needs `p;}`.\n"
-    "args = [re.sub(r'p\\}', 'p;}', a) for a in sys.argv[1:]]\n"
-    "os.execv(%r, [%r] + args)\n"
-)
+SED_GNU = "gnu"
+SED_BSD = "bsd"
+SED_ABSENT = "absent"
+ABSENT_SED_REASON_TEXT = "host has no sed on PATH: the impact step cannot run"
+
+# The host shim (#9744). The workflow step uses the GNU form `{...;p}`; BSD sed needs `p;}`.
+# The shim repairs only that one form, only inside the sed program argument (the value of
+# `-e`, else the first non-option argument), never inside an `s`, `y` or address pattern or
+# replacement. A program or option it cannot classify is passed through unchanged, so the host
+# sed then fails loudly. Every other argument (file operands included) is passed as given.
+SED_SHIM_BODY = r'''
+import os
+import sys
+
+SIMPLE_COMMANDS = "pdDnNgGhHxP="
+S_FLAGS = "gpiImMeE0123456789"
+PLAIN_FLAGS = "nErsu"
+SKIP_BLANKS = " \t"
 
 
-def host_sed_is_gnu() -> bool:
-    """True when the host `sed` accepts the GNU form (it answers `--version`)."""
-    res = subprocess.run(["sed", "--version"], capture_output=True, text=True)
-    return res.returncode == 0
+def _skip_parts(prog, pos, parts):
+    """Return the index after `parts` delimited parts that follow the delimiter at `pos`, or -1."""
+    if pos >= len(prog):
+        return -1
+    delim = prog[pos]
+    if delim.isalnum() or delim in "\\\n[]":
+        return -1
+    pos += 1
+    for _ in range(parts):
+        while pos < len(prog) and prog[pos] != delim:
+            if prog[pos] == "[":
+                return -1
+            pos += 2 if prog[pos] == "\\" else 1
+        if pos >= len(prog):
+            return -1
+        pos += 1
+    return pos
 
 
-def bsd_sed_shim_dir(work: Path):
+def _closes_block(prog, pos):
+    """True when the next non-blank character at or after `pos` is the closing brace."""
+    while pos < len(prog) and prog[pos] in SKIP_BLANKS:
+        pos += 1
+    return pos < len(prog) and prog[pos] == "}"
+
+
+def repair_program(prog):
+    """Return `prog` with `;` inserted between a `p` and its closing brace, or `prog` unchanged."""
+    inserts = []
+    pos = 0
+    while pos < len(prog):
+        char = prog[pos]
+        if char in " \t\n;{}!,$" or char.isdigit():
+            pos += 1
+        elif char == "/":
+            pos = _skip_parts(prog, pos, 1)
+        elif char == "s":
+            pos = _skip_parts(prog, pos + 1, 2)
+            while pos >= 0 and pos < len(prog) and prog[pos] in S_FLAGS:
+                if prog[pos] == "p" and _closes_block(prog, pos + 1):
+                    inserts.append(pos + 1)
+                pos += 1
+        elif char == "y":
+            pos = _skip_parts(prog, pos + 1, 2)
+        elif char in SIMPLE_COMMANDS:
+            if char == "p" and _closes_block(prog, pos + 1):
+                inserts.append(pos + 1)
+            pos += 1
+        else:
+            return prog
+        if pos < 0:
+            return prog
+    for index in reversed(inserts):
+        prog = prog[:index] + ";" + prog[index:]
+    return prog
+
+
+def rewrite_argv(argv):
+    """Return argv with only the sed program argument repaired."""
+    out = list(argv)
+    have_script = False
+    pos = 0
+    while pos < len(out):
+        arg = out[pos]
+        if arg == "--":
+            if not have_script and pos + 1 < len(out):
+                out[pos + 1] = repair_program(out[pos + 1])
+            return out
+        if arg == "-e":
+            if pos + 1 >= len(out):
+                return list(argv)
+            out[pos + 1] = repair_program(out[pos + 1])
+            have_script = True
+            pos += 2
+        elif len(arg) > 1 and arg[0] == "-" and all(c in PLAIN_FLAGS for c in arg[1:]):
+            pos += 1
+        elif arg.startswith("-") and arg != "-":
+            return list(argv)
+        else:
+            if not have_script:
+                out[pos] = repair_program(arg)
+            return out
+    return out
+
+
+if __name__ == "__main__":
+    os.execv(REAL_SED, [REAL_SED] + rewrite_argv(sys.argv[1:]))
+'''
+
+
+def shim_namespace():
+    """Return the shim source executed as a library (its `__main__` block does not run)."""
+    namespace = {"__name__": "sed_shim_under_test", "REAL_SED": "sed"}
+    exec(compile(SED_SHIM_BODY, "<sed-shim>", "exec"), namespace)
+    return namespace
+
+
+def shim_rewrite_argv(argv):
+    """Return what the shim hands the host sed for `argv`."""
+    return shim_namespace()["rewrite_argv"](list(argv))
+
+
+def probe_host_sed(search_path=None):
+    """Return (state, path): SED_GNU, SED_BSD or SED_ABSENT; never raises.
+
+    GNU sed answers `--version` with exit 0, BSD sed rejects the option. A sed that cannot
+    be found or run, or that does not answer in time, is absent.
+    """
+    real = shutil.which("sed", path=search_path)
+    if real is None:
+        return SED_ABSENT, None
+    try:
+        res = subprocess.run([real, "--version"], capture_output=True, text=True, timeout=TIMEOUT_S)
+    except (OSError, subprocess.SubprocessError):
+        return SED_ABSENT, None
+    return (SED_GNU if res.returncode == 0 else SED_BSD), real
+
+
+def bsd_sed_shim_dir(work: Path, search_path=None, force: bool = False):
     """Return a directory holding a `sed` shim for a BSD-userland host, else None.
 
     The step text lives in ci.yml (its form is pinned there), so the test adapts
-    the host instead: the shim rewrites only the `p}` brace-close to `p;}` and
-    runs the host's own sed. On a GNU host nothing is installed and the step
-    runs byte for byte as on the hosted runner.
+    the host instead: the shim repairs only the `p}` brace-close of the sed program
+    to `p;}` and runs the host's own sed. On a GNU host nothing is installed (unless
+    `force`) and the step runs byte for byte as on the hosted runner. A host with no
+    sed skips with a named reason.
     """
-    if host_sed_is_gnu():
+    state, real = probe_host_sed(search_path)
+    if state == SED_ABSENT:
+        raise unittest.SkipTest(ABSENT_SED_REASON_TEXT)
+    if state == SED_GNU and not force:
         return None
-    real = shutil.which("sed")
-    if real is None:
-        raise unittest.SkipTest("host has no sed on PATH: the impact step cannot run")
     shim_dir = work / "bin-sed-shim"
     shim_dir.mkdir()
     shim = shim_dir / "sed"
-    shim.write_text(SED_SHIM % (sys.executable, real, real))
+    shim.write_text("#!%s -I\nREAL_SED = %r\n%s" % (sys.executable, real, SED_SHIM_BODY))
     shim.chmod(0o755)
     return shim_dir
 
@@ -219,7 +343,8 @@ def run_cli(rules_text: str, args, stdin_text: str = "x.md\n"):
         rules.write_text(rules_text)
         res = subprocess.run(
             [sys.executable, "-I", str(SCRIPT), "--stdin", "--rules", str(rules)] + list(args),
-            input=stdin_text, capture_output=True, text=True, timeout=TIMEOUT_S)
+            input=stdin_text, capture_output=True, text=True, timeout=TIMEOUT_S,
+            cwd=str(REPO))
         return res.returncode, res.stdout, res.stderr
     finally:
         shutil.rmtree(str(work), ignore_errors=True)
@@ -912,7 +1037,8 @@ class NoWorkspaceFirstOnSysPath(unittest.TestCase):
             res = subprocess.run(
                 [sys.executable, "-I", str(tree / "impact" / "cargo_skip.py"), "--stdin",
                  "--rules", str(tree / "impact" / "rules.json")],
-                input="src/lib.rs\n", capture_output=True, text=True, timeout=TIMEOUT_S)
+                input="src/lib.rs\n", capture_output=True, text=True, timeout=TIMEOUT_S,
+                cwd=str(work))
         finally:
             shutil.rmtree(str(work), ignore_errors=True)
         self.assertEqual(res.returncode, 0, res.stderr)
