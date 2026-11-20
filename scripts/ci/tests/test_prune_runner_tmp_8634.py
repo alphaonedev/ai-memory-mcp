@@ -30,6 +30,7 @@ Python 3.12+, standard library only.
 import ast
 import contextlib
 import errno
+import functools
 import importlib.util
 import io
 import json
@@ -131,8 +132,8 @@ COUNTED_REFUSAL_SUMMARY = "pruned=0 kept=0 failed=1 freed_bytes=0 skipped=0"
 VERIFIABLE_PLATFORMS = ("linux", "darwin")
 UNVERIFIABLE_PLATFORMS = ("freebsd14", "sunos5", "cygwin", "aix7", "win32", "linux-gnu", "darwin2")
 # errno -> strerror of a probe that cannot write (decision 3): the prune goes on after a read-only probe.
-CANNOT_WRITE_ERRNOS = {errno.ENOSPC: "No space left on device", errno.EDQUOT: "Disk quota exceeded",
-                       errno.EROFS: "Read-only file system"}
+# The strerror text is libc's (glibc "Disk quota exceeded", macOS "Disc quota exceeded"): read from the host, never a literal.
+CANNOT_WRITE_ERRNOS = {code: os.strerror(code) for code in (errno.ENOSPC, errno.EDQUOT, errno.EROFS)}
 CREATING_CALLS = ("mkdir", "file-create")
 NON_CREATING_PROBE_CALLS = ("open", "lstat")  # probe calls that make nothing: a full-disk errno there is a broken call
 READ_ONLY_PROBE_LINE = "prune_runner_tmp: probe cannot write ({why}); the read-only probe passed, pruning goes on"
@@ -168,6 +169,45 @@ def setUpModule():
     CHK = _load("check_pg_preflight_workflows", CHECKER)
     if SCRIPT.exists():
         PRUNE = _load("prune_runner_tmp", SCRIPT)
+
+
+def _fresh_probe_dir():
+    SCRATCH_BASE.mkdir(parents=True, exist_ok=True)
+    return Path(tempfile.mkdtemp(dir=SCRATCH_BASE, prefix="prune8634-probe-")).resolve()
+
+
+@functools.cache
+def host_refuses_byte_ff_names():
+    """None when the scratch file system accepts a file name holding byte 0xff (Linux), else the errno name (APFS: EILSEQ)."""
+    top = _fresh_probe_dir()
+    try:
+        fd = os.open(os.path.join(os.fsencode(top), b"probe\xff"), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except OSError as exc:
+        return errno.errorcode.get(exc.errno, str(exc.errno))
+    else:
+        os.close(fd)
+        return None
+    finally:
+        remove_scratch(top, SCRATCH_BASE)
+
+
+@functools.cache
+def host_folds_case():
+    """True when the scratch file system treats ``Probe-case`` and ``probe-case`` as one name (APFS default)."""
+    top = _fresh_probe_dir()
+    try:
+        (top / "Probe-case").write_bytes(b"x")
+        return (top / "probe-case").exists()
+    finally:
+        remove_scratch(top, SCRATCH_BASE)
+
+
+def byte_ff_skip_reason():
+    """The exact skip reason for a cell that needs a 0xff file name, or None when the host runs it."""
+    errno_name = host_refuses_byte_ff_names()
+    if errno_name is None:
+        return None
+    return f"this file system refuses a file name holding byte 0xff ({errno_name}, platform {sys.platform})"
 
 
 def remove_scratch(top, base):
@@ -575,9 +615,15 @@ class PathForms(Base):
     def test_not_a_runner_directory_below_a_root(self):
         for name in ("skills", "god-zsg", "runner-", "runner-1x", "Runner-1", "runner-1 ", "xrunner-1", "runner--1", "runner-١"):
             with self.subTest(name=name):
-                lane = self.root / name
+                root = self.root
+                if host_folds_case() and name.casefold() == self.runner.name:
+                    # `Runner-1` is `runner-1` here: put the row in a sibling allowed root that holds no `runner-1`.
+                    root = self.base / "root-case-fold"
+                    root.mkdir(exist_ok=True)
+                lane = root / name
                 lane.mkdir()
-                self.refused(lane, f"TMPDIR is not named runner-<digits>: {name}", victim_dir=lane)
+                with mock.patch.object(PRUNE, "ALLOWED_ROOTS", (str(self.root), str(root))):
+                    self.refused(lane, f"TMPDIR is not named runner-<digits>: {name}", victim_dir=lane)
         nested = self.runner / "nested" / "x"
         nested.mkdir(parents=True)
         self.refused(nested, "TMPDIR is not named runner-<digits>: x")
@@ -622,7 +668,9 @@ class PathForms(Base):
 
     def test_forbidden_by_file_identity_not_by_spelling(self):
         self.refused("/", "TMPDIR is a forbidden path: /")
-        self.refused("/tmp", "TMPDIR is a forbidden path: /tmp")
+        # macOS: /tmp is a symlink to private/tmp, and the tool names a symlink before it tests the forbidden list.
+        tmp_reason = "TMPDIR is a symlink: /tmp" if os.path.islink("/tmp") else "TMPDIR is a forbidden path: /tmp"
+        self.refused("/tmp", tmp_reason)
         self.refused(self.home, f"TMPDIR is a forbidden path: {self.home}", victim_dir=self.home)
         via_alias = self.base / "alias"
         os.symlink(self.base, via_alias)
@@ -810,6 +858,21 @@ class PlatformProbe(Base):
         env["TMPDIR"] = str(self.runner)
         for interpreter in interpreters:
             with self.subTest(interpreter=interpreter):
+                version = subprocess.run(
+                    [interpreter, "-I", "-c", "import sys; print(*sys.version_info[:3])"],
+                    capture_output=True, text=True, check=True,
+                ).stdout.split()
+                refusal = PRUNE.python_refusal(tuple(int(part) for part in version))
+                if refusal is not None:
+                    # An interpreter below the floor (macOS /usr/bin/python3 is 3.9.6) refuses by design, deleting nothing.
+                    victim = self.make_file("old.db", OLD_AGE_SECS)
+                    rc, out, err = self.run_cli(self.runner, interpreter=interpreter)
+                    self.assertEqual((rc, err), (EXIT_OK, f"prune_runner_tmp: refused: {refusal}\n"))
+                    self.assertIn(ANNOTATION_PREFIX + refusal, out.splitlines())
+                    self.assertTrue(victim.exists())
+                    self.assertEqual(self.probe_dirs(), [])
+                    victim.unlink()
+                    continue
                 self.make_file("old.db", OLD_AGE_SECS)
                 rc, out, err = self.run_cli(self.runner, interpreter=interpreter)
                 self.assertEqual((rc, err), (EXIT_OK, ""))
@@ -1052,6 +1115,8 @@ class HostileNames(Base):
         return raw
 
     def test_dry_run_lines_carry_no_injection(self):
+        if (reason := byte_ff_skip_reason()) is not None:
+            self.skipTest(reason)
         for index, name in enumerate(HOSTILE_NAMES):
             self.make_named(f"{index}-{name}", as_dir=False)
         rc, out, err = self.run_prune(self.runner, "--dry-run")
@@ -1062,6 +1127,8 @@ class HostileNames(Base):
 
     @unittest.skipIf(os.geteuid() == 0, "root ignores directory permissions")
     def test_failure_lines_carry_no_injection(self):
+        if (reason := byte_ff_skip_reason()) is not None:
+            self.skipTest(reason)
         locked = []
         for index, name in enumerate(HOSTILE_NAMES):
             raw = self.make_named(f"{index}-{name}", as_dir=True)
@@ -1606,6 +1673,8 @@ class FailureAnnotation(Base):
     def test_hostile_names_reach_the_runner_as_exact_escaped_text(self):
         for raw, escaped in ANNOTATION_ESCAPES.items():
             with self.subTest(raw=raw):
+                if "\udcff" in raw and (reason := byte_ff_skip_reason()) is not None:
+                    self.skipTest(reason)
                 path = os.path.join(os.fsencode(self.runner), os.fsencode(raw))
                 Path(os.fsdecode(path)).write_bytes(b"x")
                 os.utime(path, (time.time() - OLD_AGE_SECS,) * 2)
