@@ -10,7 +10,8 @@ cache") without it; a quiet skip inside the test is the 9509 class itself (rulin
 
 Invariant: every run line of every job (of every workflow and composite action) that runs
 the lib unit tests, and could select that test, EITHER comes after a stage step
-(``python3 -I scripts/ci/stage_hf_cache.py --models embedder|all``) of the same job that
+(``python3 -I scripts/ci/stage_hf_cache.py --models embedder|all --runner-temp <dir>
+--workspace <dir>``, both placement arguments present once) of the same job that
 runs whenever the test step runs (no ``if:``, or the test step's own ``if:``), OR names
 that test in an explicit ``--skip`` argument with a shell comment naming 9509 in the same
 run block. A run line with neither is a finding; a workflow the parser cannot read is an
@@ -61,7 +62,10 @@ REASON_CI_NO_STAGE = "no stage step before it (ci.yml takes the stage step, a na
 # Workflow files held to the stage-step-only form (condition (2) of b29 6a339cef).
 STAGE_ONLY_FILES = frozenset({"ci.yml"})
 CARGO_SKIP_IF = "needs.classify.outputs.cargo_skip != 'true'"
-STAGE_RUN_LINE = "run: python3 -I scripts/ci/stage_hf_cache.py --models embedder"
+# The placement arguments the stage script requires (it exits 2 without them).
+PLACEMENT_FLAGS = ("--runner-temp", "--workspace")
+STAGE_ARGS = ' --runner-temp "$RUNNER_TEMP_ARG" --workspace "$WORKSPACE_ARG"'
+STAGE_RUN_LINE = "run: python3 -I scripts/ci/stage_hf_cache.py --models all" + STAGE_ARGS
 
 # Lib-test jobs the census must see on the real tree (a superset check).
 KNOWN_LIB_JOBS = frozenset({
@@ -131,11 +135,14 @@ def strip_assignments(words: list[str]) -> list[str]:
 def is_stage(words: list[str]) -> bool:
     """True for the one staging form that stages the embedder."""
     words = strip_assignments(words)
-    return (
-        len(words) == 5
-        and words[:4] == ["python3", "-I", STAGE_SCRIPT, "--models"]
-        and words[4] in EMBEDDER_SETS
-    )
+    if len(words) != 5 + 2 * len(PLACEMENT_FLAGS):
+        return False
+    if words[:4] != ["python3", "-I", STAGE_SCRIPT, "--models"] or words[4] not in EMBEDDER_SETS:
+        return False
+    pairs = words[5:]
+    flags = sorted(pairs[0::2])
+    values = pairs[1::2]
+    return flags == sorted(PLACEMENT_FLAGS) and all(v and not v.startswith("-") for v in values)
 
 
 def test_command(words: list[str]) -> list[str] | None:
@@ -307,8 +314,9 @@ def step(name: str, run: str, cond: str | None = None) -> dict:
     return out
 
 
-STAGE = step("Stage HF embedder cache (#9509)", "python3 -I scripts/ci/stage_hf_cache.py --models embedder")
-STAGE_ALL = step("Stage", "python3 -I scripts/ci/stage_hf_cache.py --models all")
+STAGE_EMB = "python3 -I scripts/ci/stage_hf_cache.py --models embedder" + STAGE_ARGS
+STAGE = step("Stage HF model cache (#9509)", STAGE_EMB)
+STAGE_ALL = step("Stage", "python3 -I scripts/ci/stage_hf_cache.py --models all" + STAGE_ARGS)
 LIB = step("Run lib tests", "cargo test --features sal --lib")
 COND = "needs.classify.outputs.cargo_skip != 'true'"
 SKIP_RUN = f"# #9509: no network on this runner, the b3 test is skipped by name\ncargo test --lib -- --skip {B3}"
@@ -319,12 +327,16 @@ SYNTHETIC_ROWS: tuple[tuple[str, list[dict], list[str]], ...] = (
     ("stage-before", [STAGE, LIB], []),
     ("stage-all-before", [STAGE_ALL, LIB], []),
     ("stage-after", [LIB, STAGE], [REASON_NO_STAGE]),
-    ("stage-same-step-before", [step("both", "python3 -I scripts/ci/stage_hf_cache.py --models embedder\ncargo test --lib")], []),
-    ("stage-same-step-after", [step("both", "cargo test --lib\npython3 -I scripts/ci/stage_hf_cache.py --models embedder")], [REASON_NO_STAGE]),
-    ("stage-verify-only", [step("v", "python3 -I scripts/ci/stage_hf_cache.py --models embedder --verify-only"), LIB], [REASON_NO_STAGE]),
-    ("stage-unknown-set", [step("r", "python3 -I scripts/ci/stage_hf_cache.py --models reranker"), LIB], [REASON_NO_STAGE]),
-    ("stage-commented-out", [step("c", "# python3 -I scripts/ci/stage_hf_cache.py --models embedder\ntrue"), LIB], [REASON_NO_STAGE]),
-    ("stage-echoed", [step("e", "echo python3 -I scripts/ci/stage_hf_cache.py --models embedder"), LIB], [REASON_NO_STAGE]),
+    ("stage-same-step-before", [step("both", STAGE_EMB + "\ncargo test --lib")], []),
+    ("stage-same-step-after", [step("both", "cargo test --lib\n" + STAGE_EMB)], [REASON_NO_STAGE]),
+    ("stage-verify-only", [step("v", STAGE_EMB + " --verify-only"), LIB], [REASON_NO_STAGE]),
+    ("stage-unknown-set", [step("r", "python3 -I scripts/ci/stage_hf_cache.py --models reranker" + STAGE_ARGS), LIB], [REASON_NO_STAGE]),
+    ("stage-without-placement", [step("p", "python3 -I scripts/ci/stage_hf_cache.py --models all"), LIB], [REASON_NO_STAGE]),
+    ("stage-one-placement-arg", [step("p", "python3 -I scripts/ci/stage_hf_cache.py --models all --runner-temp x"), LIB], [REASON_NO_STAGE]),
+    ("stage-placement-twice", [step("p", "python3 -I scripts/ci/stage_hf_cache.py --models all --runner-temp x --runner-temp y"), LIB], [REASON_NO_STAGE]),
+    ("stage-placement-swapped", [step("p", "python3 -I scripts/ci/stage_hf_cache.py --models all --workspace w --runner-temp r"), LIB], []),
+    ("stage-commented-out", [step("c", "# " + STAGE_EMB + "\ntrue"), LIB], [REASON_NO_STAGE]),
+    ("stage-echoed", [step("e", "echo " + STAGE_EMB), LIB], [REASON_NO_STAGE]),
     ("stage-if-test-none", [step("s", STAGE["run"], COND), LIB], [REASON_STAGE_IF]),
     ("stage-if-equal", [step("s", STAGE["run"], COND), step("t", LIB["run"], COND)], []),
     ("stage-if-differs", [step("s", STAGE["run"], COND), step("t", LIB["run"], "always()")], [REASON_STAGE_IF]),
@@ -404,8 +416,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - name: Stage HF embedder cache (#9509)
-        run: python3 -I scripts/ci/stage_hf_cache.py --models embedder
+      - name: Stage HF model cache (#9509)
+        {STAGE_RUN_LINE}
       - name: Run lib tests
         env:
           AI_MEMORY_NO_CONFIG: "1"

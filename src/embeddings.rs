@@ -376,7 +376,7 @@ pub fn recall_query_embedding(embedder: &dyn Embed, text: &str) -> Option<Vec<f3
     Some(vector)
 }
 
-const MINILM_MODEL_ID: &str = "sentence-transformers/all-MiniLM-L6-v2";
+pub(crate) const MINILM_MODEL_ID: &str = "sentence-transformers/all-MiniLM-L6-v2";
 #[allow(dead_code)]
 const MINILM_DIM: usize = 384;
 const MAX_SEQ_LEN: usize = 256;
@@ -3113,6 +3113,9 @@ pub mod test_support {
         }
     }
 
+    /// The `HOME` and `HF_HOME` values a helper sets (`None` removes one).
+    type HomeEnv = (Option<std::ffi::OsString>, Option<std::ffi::OsString>);
+
     /// Run `f` with the offline knob set (`AI_MEMORY_EMBED_OFFLINE=1`, so
     /// `new_local` takes the staged-cache path and can never reach the
     /// network, #9515) and `HF_HUB_OFFLINE` removed so only the knob under
@@ -3121,6 +3124,37 @@ pub mod test_support {
     /// `HF_HOME` (the staged cache, whatever an earlier test did to `HOME`,
     /// #9509).
     fn with_offline_env<R>(home: Option<&std::path::Path>, f: impl FnOnce() -> R) -> R {
+        let values = match home {
+            Some(home) => (
+                Some(home.as_os_str().to_owned()),
+                Some(home.join("hf-home").into_os_string()),
+            ),
+            None => crate::test_support::pristine_home_env().clone(),
+        };
+        with_offline_env_values(values, f)
+    }
+
+    /// Run `f` offline with `HOME = home` and `HF_HOME = home/hf-home`: the
+    /// job-private hub of the CI legs (#9509 vote D2-1).
+    pub fn with_offline_home<R>(home: &std::path::Path, f: impl FnOnce() -> R) -> R {
+        with_offline_env(Some(home), f)
+    }
+
+    /// Run `f` offline with `HF_HOME = hf_home` and `HOME` at its
+    /// process-start value: a loader must resolve the model cache from
+    /// `HF_HOME` alone (#9509 vote D2-3).
+    pub fn with_offline_hf_home<R>(hf_home: &std::path::Path, f: impl FnOnce() -> R) -> R {
+        let (home, _) = crate::test_support::pristine_home_env().clone();
+        with_offline_env_values((home, Some(hf_home.as_os_str().to_owned())), f)
+    }
+
+    /// The one env writer behind every offline helper: sets `HOME` and
+    /// `HF_HOME` to `values`, the knob on, `HF_HUB_OFFLINE` off, and restores
+    /// all four after `f`, also on a panic.
+    fn with_offline_env_values<R>(
+        (home_value, hf_home_value): HomeEnv,
+        f: impl FnOnce() -> R,
+    ) -> R {
         let _lock = crate::config::test_env_lock();
         let keys = [
             "HOME",
@@ -3129,13 +3163,6 @@ pub mod test_support {
             HF_HUB_OFFLINE_ENV,
         ];
         let _restore = OfflineEnvGuard(keys.iter().map(|k| (*k, std::env::var_os(k))).collect());
-        let (home_value, hf_home_value) = match home {
-            Some(home) => (
-                Some(home.as_os_str().to_owned()),
-                Some(home.join("hf-home").into_os_string()),
-            ),
-            None => crate::test_support::pristine_home_env().clone(),
-        };
         apply_env(&[
             ("HOME", home_value),
             ("HF_HOME", hf_home_value),

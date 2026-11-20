@@ -2636,6 +2636,9 @@ fn process_batch(
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+mod hf_home_9509_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::models::{Memory, Tier};
