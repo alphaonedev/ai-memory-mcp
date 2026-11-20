@@ -38,6 +38,10 @@
 
 use std::path::{Path, PathBuf};
 
+// #9367: the ONE resolver of what is test-only (#4198/#4200), never copied.
+#[path = "common/cfg_test_modules.rs"]
+mod cfg_test_modules;
+
 /// Every production write funnel, with the disposition on record.
 ///
 /// `(module path, funnel symbol, disposition)`. The symbol must still
@@ -149,17 +153,12 @@ fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-/// Strip `#[cfg(test)]` modules and comment lines so a test fixture or a
-/// doc reference is never counted as a production call site. Mirrors the
-/// boundary heuristic `scripts/check-vendor-literals.sh` and
-/// `tests/db_open_funnel_ceiling_2445.rs` use, so the whole repo agrees on
-/// where production ends.
-fn production_prefix(src: &str) -> String {
-    let cut = src
-        .find("\n#[cfg(test)]\nmod tests")
-        .or_else(|| src.find("\n#[cfg(test)]\n#[path"))
-        .unwrap_or(src.len());
-    src[..cut]
+/// Every line outside the file's `cfg(test)` modules (the ONE resolver,
+/// `tests/common/cfg_test_modules.rs`, #9367: production after a test module
+/// or an out-of-line test declaration still counts), minus comment lines, so a
+/// test fixture or a doc reference is never counted as a production call site.
+fn production_text(src: &str) -> String {
+    cfg_test_modules::strip_cfg_test_inline_mods(src)
         .lines()
         .filter(|l| {
             let t = l.trim_start();
@@ -201,7 +200,7 @@ fn atomise_call_sites_match_the_pinned_inventory_2984() {
     let root = repo_root();
     let mut problems = Vec::new();
     for (file, needle, pinned, why) in CALL_SITE_LEDGER {
-        let src = production_prefix(&read(&root, file));
+        let src = production_text(&read(&root, file));
         let n = src.matches(needle).count();
         if n != *pinned {
             problems.push(format!(
@@ -235,7 +234,7 @@ fn the_process_global_atomise_dispatch_stays_abolished_2983() {
     // symbol by name (that history is exactly what stops the next reader
     // re-adding it), and a gate that forbade naming the defect would be
     // the wrong gate.
-    let hook = production_prefix(&read(&root, "src/hooks/pre_store/auto_atomise.rs"));
+    let hook = production_text(&read(&root, "src/hooks/pre_store/auto_atomise.rs"));
     for banned in [
         "AUTO_ATOMISE_DISPATCH",
         "install_auto_atomise_dispatch",
@@ -266,7 +265,7 @@ fn the_process_global_atomise_dispatch_stays_abolished_2983() {
 #[test]
 fn the_unbounded_per_store_spawn_stays_deleted_2986() {
     let root = repo_root();
-    let hook = production_prefix(&read(&root, "src/hooks/pre_store/auto_atomise.rs"));
+    let hook = production_text(&read(&root, "src/hooks/pre_store/auto_atomise.rs"));
     assert!(
         !hook.contains("std::thread::spawn"),
         "#2986: the deferred atomise path must NOT spawn a detached thread per store. \

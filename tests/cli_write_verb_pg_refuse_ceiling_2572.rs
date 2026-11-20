@@ -37,13 +37,19 @@
 
 use std::path::{Path, PathBuf};
 
+// #9367 r1 Class B: the production view is the shared resolver (#4198), which
+// removes each inline test-only module body and keeps every other line; no
+// first-marker cut.
+#[path = "common/cfg_test_modules.rs"]
+mod cfg_test_modules;
+
 /// The frozen guard-CALL inventory: `(file, count, disposition)`.
 ///
 /// `count` is the number of PRODUCTION `crate::cli::backup::refuse_pg_store(`
 /// call sites in that file (the `fn refuse_pg_store` DEFINITION in
 /// `src/cli/backup.rs` is NOT a call — it lacks the `backup::` path prefix — so
 /// it is correctly excluded). Test-module sites are excluded by
-/// [`production_prefix`]. Total = 37 across 24 files (#2555: +1 doctor.rs
+/// [`production_text`]. Total = 37 across 24 files (#2555: +1 doctor.rs
 /// `--repair-schema-version`; #3730: +3 — `inbox`, `notify`, the wake
 /// listener's catch-up inbox read; #3924: +1 `swarm-rewind`).
 const GUARDED: &[(&str, usize, &str)] = &[
@@ -198,22 +204,20 @@ fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf()
 }
 
-/// Byte offset of the first test-module marker, or the whole file when there is
-/// none. Mirrors the boundary heuristic the shell gates + the #2445 funnel test
-/// use, so all agree on what "production code" means.
-fn production_prefix(src: &str) -> &str {
-    let cut = ["#[cfg(test)]", "mod tests {", "pub mod tests {"]
-        .iter()
-        .filter_map(|m| src.find(m))
-        .min();
-    cut.map_or(src, |i| &src[..i])
+/// The production text of one file: every inline test-only module body
+/// removed by the shared resolver, everything else kept (a guard call after an
+/// early indented test marker, or after a one-line test module, is still
+/// production text). The resolver panics on an unclosed test module, so a
+/// cut never hides the rest of a file.
+fn production_text(src: &str) -> String {
+    cfg_test_modules::strip_cfg_test_inline_mods(src)
 }
 
 /// Count production `crate::cli::backup::refuse_pg_store(` CALL sites (matched
 /// by the `backup::refuse_pg_store(` substring, which the `fn` definition lacks)
 /// on non-comment lines.
 fn count_guard_calls(src: &str) -> usize {
-    production_prefix(src)
+    production_text(src)
         .lines()
         .filter(|l| {
             let t = l.trim_start();
@@ -311,7 +315,7 @@ fn carve_outs_stay_node_local_and_unguarded_2572() {
              on a Postgres deployment ({why})"
         );
         assert!(
-            production_prefix(&src).contains("Connection::open("),
+            production_text(&src).contains("Connection::open("),
             "{file} is only meaningful as a carve-out because it opens a raw local \
              sqlite connection; if that changed, re-examine the carve-out ({why})"
         );
@@ -352,9 +356,12 @@ fn the_production_boundary_heuristic_is_load_bearing_2572() {
         1,
         "a production guard call must be counted"
     );
+    // PR 9586 r1: a multi-line test module (the form every `src/` file uses;
+    // the one-line form is pinned as kept by
+    // `a_one_line_test_module_is_kept_as_production_text_9367`).
     assert_eq!(
         count_guard_calls(
-            "#[cfg(test)]\nmod t { fn f() { backup::refuse_pg_store(p, \"x\", o); } }"
+            "#[cfg(test)]\nmod t {\n    fn f() { backup::refuse_pg_store(p, \"x\", o); }\n}\n"
         ),
         0,
         "a test-module guard call must NOT be counted"
@@ -368,6 +375,47 @@ fn the_production_boundary_heuristic_is_load_bearing_2572() {
         count_guard_calls("pub(crate) fn refuse_pg_store(db_path: &Path) {}"),
         0,
         "the `fn` DEFINITION (no `backup::` prefix) must NOT be counted as a call"
+    );
+}
+
+/// PR 9586 r1 Class B: production text comes from the shared resolver, never
+/// from a cut at the FIRST test marker. An indented `#[cfg(test)]` on one item
+/// early in a file (src/cli/doctor.rs has one at line 1071, 4475 lines before
+/// its test module) must not hide the guard calls that follow it.
+#[test]
+fn a_guard_call_after_an_early_indented_test_marker_is_counted_9367() {
+    let src = "fn verb() {\n    #[cfg(test)]\n    let _probe = 1;\n}\n\
+               fn later(db_path: &Path, out: &mut W) -> Result<()> {\n    \
+               crate::cli::backup::refuse_pg_store(db_path, VERB, out)?;\n    Ok(())\n}\n\
+               #[cfg(test)]\nmod tests {\n    fn t() { backup::refuse_pg_store(p, \"x\", o); }\n}\n";
+    assert_eq!(
+        count_guard_calls(src),
+        1,
+        "the production guard call after an early item-level marker is counted; \
+         the one inside the test module is not"
+    );
+    // The same for `mod tests {` text inside a string or a nested item: only
+    // a real `#[cfg(test)]` module body is removed.
+    let src = "const DOC: &str = \"mod tests {\";\n\
+               fn verb() { crate::cli::backup::refuse_pg_store(p, VERB, o)?; }\n";
+    assert_eq!(
+        count_guard_calls(src),
+        1,
+        "a marker inside a literal is not a cut"
+    );
+}
+
+/// Note pinned (not a finding): the resolver keeps a one-line
+/// `#[cfg(test)] mod tests { ... }` (the module body on the attribute's line)
+/// as production text. It errs toward scanning MORE; no file under `src/`
+/// uses that form. If the resolver ever starts removing it, this cell says so.
+#[test]
+fn a_one_line_test_module_is_kept_as_production_text_9367() {
+    let src = "#[cfg(test)] mod tests { fn t() { backup::refuse_pg_store(p, \"x\", o); } }\n";
+    assert_eq!(
+        count_guard_calls(src),
+        1,
+        "the one-line test module form is scanned as production text (errs toward more)"
     );
 }
 

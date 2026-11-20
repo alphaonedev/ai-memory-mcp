@@ -25,6 +25,9 @@
 
 use serde_json::Value;
 
+/// The tracing target of every forwarder operator-log line.
+const FORWARD_TRACE_TARGET: &str = "federation.forward";
+
 /// Forward an MCP write call to a local HTTP daemon so the daemon's
 /// federation fanout coordinator (`broadcast_store_quorum` /
 /// `broadcast_link_quorum` / `broadcast_delete_quorum`) takes over
@@ -43,6 +46,8 @@ pub(crate) fn forward_to_http(
     url: &str,
     body: Option<&Value>,
     extra_headers: &[(&str, String)],
+    api_key: Option<&str>,
+    keyed_agent: Option<&str>,
 ) -> Result<Value, String> {
     // #3711 — the forward URL is operator config and may carry userinfo
     // (`https://user:pw@host/…`); every rendering of it is the allowlist
@@ -54,14 +59,19 @@ pub(crate) fn forward_to_http(
     // this installation wrote (zero-config TLS). Only the local CA: this is
     // the same-installation trust, never a peer's certificate. A CA file
     // that exists but does not parse is an error, not silently ignored.
-    let mut builder =
-        reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(15));
+    // #9367 K-3 / V-2 — no redirect is followed: a 3xx is the status error
+    // below, so a request that carries the per-agent key reaches the
+    // configured origin and no other (redirect policy none, not header
+    // stripping).
+    let mut builder = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .redirect(reqwest::redirect::Policy::none());
     // The load error names the key directory on disk (an operator path):
     // that belongs in the operator log, never in the MCP caller's error
     // text (gate 7, #3688/7 — surfaced on the #3705+#3711 resolved tree).
     if let Some(ca) = crate::tls_bootstrap::local_ca_certificate().map_err(|e| {
         tracing::warn!(
-            target: "federation.forward",
+            target: FORWARD_TRACE_TARGET,
             error = %e,
             "federation_forward: the local CA certificate could not be loaded"
         );
@@ -78,6 +88,17 @@ pub(crate) fn forward_to_http(
     let mut req = client.request(method, url);
     for (k, v) in extra_headers {
         req = req.header(*k, v);
+    }
+    if let Some(key) = api_key {
+        // #9367 K-4 — the value is marked sensitive so no Debug rendering of
+        // the request or its headers repeats it. This `HeaderValue` is the
+        // one copy of the key outside a `Zeroizing` buffer (#1258 precedent):
+        // the HTTP client owns it for the request and it is not wiped on drop.
+        let mut value = reqwest::header::HeaderValue::from_str(key).map_err(|_| {
+            forward_key_refusal(&crate::agent_key_file::ForwardKeyFileError::Malformed)
+        })?;
+        value.set_sensitive(true);
+        req = req.header(crate::HEADER_API_KEY, value);
     }
     if let Some(b) = body {
         req = req.json(b);
@@ -99,7 +120,32 @@ pub(crate) fn forward_to_http(
     // without repeating the bytes on this side of the boundary either.
     if !status.is_success() {
         log_foreign_body("peer returned non-success", &target, status, &text);
-        return Err(format!("federation_forward: {target} returned {status}"));
+        let mut err = format!("federation_forward: {target} returned {status}");
+        // #9367 K-5 — a keyed forward the daemon refuses is named: the key in
+        // the variable is not accepted for this agent id. Only when the body
+        // says the CREDENTIAL was refused; a 403 from another gate
+        // (attestation, governance) shows the daemon's code instead. The id
+        // is the operator's own configured identity; the key is never
+        // repeated, and no peer byte reaches the caller (#3698).
+        if api_key.is_some()
+            && let Some(agent_id) = keyed_agent
+        {
+            match daemon_refusal(status, &text) {
+                DaemonRefusal::Credential => {
+                    err.push_str("; the daemon refused the key in ");
+                    err.push_str(crate::agent_key_file::AGENT_API_KEY_FILE_ENV);
+                    err.push_str(" for agent '");
+                    err.push_str(agent_id);
+                    err.push('\'');
+                }
+                DaemonRefusal::Code(code) => {
+                    err.push_str("; daemon code ");
+                    err.push_str(code);
+                }
+                DaemonRefusal::Unclassified => {}
+            }
+        }
+        return Err(err);
     }
     serde_json::from_str::<Value>(&text).map_err(|e| {
         log_foreign_body("peer body is not JSON", &target, status, &text);
@@ -113,19 +159,267 @@ pub(crate) fn forward_to_http(
     })
 }
 
+/// #9367 K-5 — what a non-success daemon body says about a keyed forward.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DaemonRefusal {
+    /// The daemon's transport-auth `401` or its per-agent key binding `403`.
+    Credential,
+    /// A refusal from another gate, as this crate's own code constant.
+    Code(&'static str),
+    /// Anything else: nothing is added to the caller's error.
+    Unclassified,
+}
+
+/// The daemon refusal codes the forwarder names. Each entry is this crate's
+/// own constant, so the caller-facing text never carries peer bytes.
+const NAMED_DAEMON_CODES: &[&str] = &[
+    crate::errors::error_codes::ATTESTATION_FAILED,
+    crate::errors::error_codes::GOVERNANCE_REFUSED,
+    crate::errors::error_codes::AGENT_ID_MISMATCH,
+    crate::errors::error_codes::NOT_OWNER,
+    crate::errors::error_codes::IDENTITY_REQUIRED,
+    crate::errors::error_codes::QUOTA_EXCEEDED,
+    crate::errors::error_codes::REFUSED,
+];
+
+/// Classify a non-success daemon reply by its JSON body (`error` for the
+/// auth middleware, `code` for the handler gates), never by the status
+/// number alone: a 403 from the attestation gate is not a refused key.
+fn daemon_refusal(status: reqwest::StatusCode, text: &str) -> DaemonRefusal {
+    let Ok(body) = serde_json::from_str::<Value>(text) else {
+        return DaemonRefusal::Unclassified;
+    };
+    let error = body.get("error").and_then(Value::as_str);
+    let credential = match status {
+        reqwest::StatusCode::UNAUTHORIZED => {
+            error == Some(crate::handlers::errors::API_KEY_REFUSED_ERROR)
+        }
+        reqwest::StatusCode::FORBIDDEN => {
+            error == Some(crate::handlers::errors::IDENTITY_BINDING_MISMATCH_ERROR)
+        }
+        _ => false,
+    };
+    if credential {
+        return DaemonRefusal::Credential;
+    }
+    body.get("code")
+        .and_then(Value::as_str)
+        .and_then(|c| NAMED_DAEMON_CODES.iter().copied().find(|k| *k == c))
+        .map_or(DaemonRefusal::Unclassified, DaemonRefusal::Code)
+}
+
 /// #3698 — operator-side record of a peer body that was withheld from the
 /// caller: length + SHA-256, never the bytes.
 fn log_foreign_body(what: &str, target: &str, status: reqwest::StatusCode, body: &str) {
     use sha2::Digest as _;
     let digest = hex::encode(sha2::Sha256::digest(body.as_bytes()));
     tracing::warn!(
-        target: "federation.forward",
+        target: FORWARD_TRACE_TARGET,
         %target,
         %status,
         body_bytes = body.len(),
         body_sha256 = %&digest[..16],
         "federation_forward: {what}; body withheld from the caller"
     );
+}
+
+/// #9367 K-2 FINAL — the caller-facing text of a refused key file: the
+/// variable and the form, and that nothing left the process.
+fn forward_key_refusal(e: &crate::agent_key_file::ForwardKeyFileError) -> String {
+    format!("federation_forward: {e}; no request was sent")
+}
+
+/// #9367 K-2 — why the funnel returned no daemon body. Typed so the funnel
+/// adds no legacy string signature (QUAL-6); `Display` is the caller-facing
+/// text, which names the variable and the form, never the path or the key.
+#[derive(Debug)]
+enum ForwardAsAgentError {
+    /// The key file named by the variable is unusable; nothing was sent.
+    KeyFile(crate::agent_key_file::ForwardKeyFileError),
+    /// The variable is set but the explicit agent id could not be resolved.
+    IdentityUnresolved,
+    /// The variable is set but the id to send is not the explicit identity.
+    NotExplicitIdentity,
+    /// The request helper's own error text (#3698: no peer bytes in it).
+    Forward(String),
+}
+
+impl std::fmt::Display for ForwardAsAgentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let env = crate::agent_key_file::AGENT_API_KEY_FILE_ENV;
+        match self {
+            Self::KeyFile(e) => f.write_str(&forward_key_refusal(e)),
+            Self::IdentityUnresolved => write!(
+                f,
+                "federation_forward: {env} is set but the explicit agent id could not be resolved; no request was sent"
+            ),
+            Self::NotExplicitIdentity => write!(
+                f,
+                "federation_forward: {env} is set but {} is not; a per-agent key is sent only with the explicit agent id it is bound to; no request was sent",
+                crate::identity::ENV_AGENT_ID,
+            ),
+            Self::Forward(text) => f.write_str(text),
+        }
+    }
+}
+
+impl std::error::Error for ForwardAsAgentError {}
+
+/// The ONE conversion of the funnel's typed error into the MCP tool layer's
+/// string error; each of the three forward sites maps through it.
+fn forward_error_text(e: ForwardAsAgentError) -> String {
+    match e {
+        ForwardAsAgentError::Forward(text) => text,
+        local => local.to_string(),
+    }
+}
+
+/// #9367 K-6 — the ONE funnel every MCP forward site goes through (store,
+/// action transition, signal send). It is the only caller of the generic
+/// request helper above, so no forward site can send without this check.
+///
+/// - [`crate::agent_key_file::AGENT_API_KEY_FILE_ENV`] unset or empty: the
+///   request is byte for byte the request of today (no `X-API-Key`).
+/// - Set: the file is read by the strict reader; any unusable form is a
+///   named local error and no request is sent (never a request without the
+///   key, never the shared key). The key is sent only when `agent_id` is the
+///   explicit process identity (V-3): a synthesized id is refused locally.
+///
+/// # Errors
+///
+/// A refused key file, a missing explicit identity, or the forward error.
+fn forward_as_agent(
+    method: reqwest::Method,
+    url: &str,
+    body: &Value,
+    agent_id: String,
+) -> Result<Value, ForwardAsAgentError> {
+    let api_key =
+        crate::agent_key_file::forward_key_from_env().map_err(ForwardAsAgentError::KeyFile)?;
+    if api_key.is_some() {
+        let explicit = crate::identity::resolve_mcp_read_visibility_caller().map_err(|e| {
+            tracing::warn!(
+                target: FORWARD_TRACE_TARGET,
+                error = %e,
+                "federation_forward: the explicit agent id could not be resolved"
+            );
+            ForwardAsAgentError::IdentityUnresolved
+        })?;
+        if explicit.as_deref() != Some(agent_id.as_str()) {
+            return Err(ForwardAsAgentError::NotExplicitIdentity);
+        }
+    }
+    let keyed_agent = api_key.as_ref().map(|_| agent_id.clone());
+    let headers: &[(&str, String)] = &[(crate::HEADER_AGENT_ID, agent_id)];
+    forward_to_http(
+        method,
+        url,
+        Some(body),
+        headers,
+        api_key.as_ref().map(|key| key.as_str()),
+        keyed_agent.as_deref(),
+    )
+    .map_err(ForwardAsAgentError::Forward)
+}
+
+/// #9367 r1 Class A — why a forward request URL could not be built. Every
+/// variant is raised before any byte is sent and before the key file is read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ForwardRouteError {
+    /// The configured forward URL does not parse as a base URL. The text
+    /// never echoes the URL (its userinfo may hold a credential).
+    NotBaseUrl,
+    /// The `id` param is absent, empty, blank or not a string.
+    ActionIdMissing,
+    /// The action id is longer than [`crate::validate::MAX_ID_LEN`] bytes.
+    ActionIdTooLong,
+    /// The action id is `.`, `..` or holds `..` (a dot segment).
+    ActionIdDots,
+    /// The action id holds a byte outside `[A-Za-z0-9_:.@-]`.
+    ActionIdCharset,
+}
+
+impl std::fmt::Display for ForwardRouteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotBaseUrl => f.write_str(
+                "federation_forward: the configured forward URL is not a valid base URL; \
+                 no request was sent",
+            ),
+            Self::ActionIdMissing => f.write_str("memory_action_transition: missing action id"),
+            Self::ActionIdTooLong => write!(
+                f,
+                "memory_action_transition: the action id is longer than {} bytes; \
+                 no request was sent",
+                crate::validate::MAX_ID_LEN
+            ),
+            Self::ActionIdDots => f.write_str(
+                "memory_action_transition: the action id is a dot segment ('.' or '..') \
+                 or contains '..'; no request was sent",
+            ),
+            Self::ActionIdCharset => f.write_str(
+                "memory_action_transition: the action id has a character outside \
+                 [A-Za-z0-9_:.@-]; no request was sent",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ForwardRouteError {}
+
+/// #9367 r1 Class A — the ONE builder of every forward request URL (store,
+/// action transition, signal send). The configured origin keeps its scheme,
+/// host, port and path prefix; its query and fragment are dropped; each of
+/// `segments` is pushed as exactly ONE percent-encoded path segment, so no
+/// caller text can add a segment, a dot segment, a query or a fragment.
+///
+/// # Errors
+///
+/// [`ForwardRouteError::NotBaseUrl`] when the forward URL does not parse or
+/// cannot be a base (for example `mailto:`).
+pub(crate) fn forward_route_url(
+    forward_url: &str,
+    segments: &[&str],
+) -> Result<String, ForwardRouteError> {
+    let mut url = reqwest::Url::parse(forward_url).map_err(|_| ForwardRouteError::NotBaseUrl)?;
+    url.set_query(None);
+    url.set_fragment(None);
+    // Every trailing `/` of the configured prefix goes (the old
+    // `trim_end_matches('/')`), so `http://h/` and `http://h` agree.
+    let prefix = url.path().trim_end_matches('/').to_owned();
+    url.set_path(&prefix);
+    url.path_segments_mut()
+        .map_err(|()| ForwardRouteError::NotBaseUrl)?
+        .pop_if_empty()
+        .extend(segments);
+    Ok(url.into())
+}
+
+/// #9367 r1 Class A — the action id as ONE path segment, checked before the
+/// agent id is resolved and before the key file is read. Order: missing,
+/// length (bounded before any scan), dot segments, charset.
+///
+/// # Errors
+///
+/// The [`ForwardRouteError`] action-id variant for the first rule broken.
+fn action_id_segment(params: &Value) -> Result<&str, ForwardRouteError> {
+    let id = params[crate::mcp::param_names::ID]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or(ForwardRouteError::ActionIdMissing)?;
+    if id.len() > crate::validate::MAX_ID_LEN {
+        return Err(ForwardRouteError::ActionIdTooLong);
+    }
+    if id == "." || id.contains("..") {
+        return Err(ForwardRouteError::ActionIdDots);
+    }
+    let segment_byte =
+        |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'_' | b':' | b'.' | b'@' | b'-');
+    if !id.bytes().all(segment_byte) {
+        return Err(ForwardRouteError::ActionIdCharset);
+    }
+    Ok(id)
 }
 
 /// MCP `memory_store` → HTTP `POST {forward_url}/api/v1/memories`.
@@ -143,7 +437,8 @@ pub(super) fn forward_store_to_http(
     params: &Value,
     mcp_client: Option<&str>,
 ) -> Result<Value, String> {
-    let url = format!("{}/api/v1/memories", forward_url.trim_end_matches('/'));
+    let url =
+        forward_route_url(forward_url, &["api", "v1", "memories"]).map_err(|e| e.to_string())?;
 
     // Resolve agent_id with the same precedence chain the local path
     // uses, then surface it as an X-Agent-Id header (the HTTP handler's
@@ -163,10 +458,7 @@ pub(super) fn forward_store_to_http(
     // The HTTP request body mirrors the MCP params; pass them through
     // and let the HTTP handler do all validation, governance, quota,
     // dedup, embedding, audit, and federation broadcast.
-    let body = params.clone();
-    let headers: &[(&str, String)] = &[(crate::HEADER_AGENT_ID, agent_id)];
-
-    forward_to_http(reqwest::Method::POST, &url, Some(&body), headers)
+    forward_as_agent(reqwest::Method::POST, &url, params, agent_id).map_err(forward_error_text)
 }
 
 /// #1718 — MCP `memory_action_transition` → HTTP
@@ -186,21 +478,14 @@ pub(crate) fn forward_action_transition_to_http(
     params: &Value,
     mcp_client: Option<&str>,
 ) -> Result<Value, String> {
-    let id = params[crate::mcp::param_names::ID]
-        .as_str()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| "memory_action_transition: missing action id".to_string())?;
-    let url = format!(
-        "{}/api/v1/actions/{}/transition",
-        forward_url.trim_end_matches('/'),
-        id
-    );
+    // #9367 r1 Class A: the id is checked as one path segment and the URL is
+    // built by the shared builder, both before the agent id and the key.
+    let id = action_id_segment(params).map_err(|e| e.to_string())?;
+    let url = forward_route_url(forward_url, &["api", "v1", "actions", id, "transition"])
+        .map_err(|e| e.to_string())?;
     let agent_id =
         crate::identity::resolve_agent_id(None, mcp_client).map_err(|e| e.to_string())?;
-    let body = params.clone();
-    let headers: &[(&str, String)] = &[(crate::HEADER_AGENT_ID, agent_id)];
-    forward_to_http(reqwest::Method::POST, &url, Some(&body), headers)
+    forward_as_agent(reqwest::Method::POST, &url, params, agent_id).map_err(forward_error_text)
 }
 
 /// #1718 — MCP `memory_signal_send` → HTTP `POST {forward_url}/api/v1/signals`,
@@ -218,16 +503,15 @@ pub(crate) fn forward_signal_send_to_http(
     params: &Value,
     mcp_client: Option<&str>,
 ) -> Result<Value, String> {
-    let url = format!("{}/api/v1/signals", forward_url.trim_end_matches('/'));
+    let url =
+        forward_route_url(forward_url, &["api", "v1", "signals"]).map_err(|e| e.to_string())?;
     let explicit = params[crate::mcp::param_names::FROM_AGENT].as_str();
     // #8496 — the forwarded `X-Agent-Id` is the sender the daemon stamps, so it
     // is bound to the enforced caller (#3171 store-forward precedent); a
     // mismatching wire `from_agent` is refused before any network I/O.
     let agent_id = crate::identity::resolve_governance_subject(explicit, mcp_client, "signal_send")
         .map_err(|e| e.to_string())?;
-    let body = params.clone();
-    let headers: &[(&str, String)] = &[(crate::HEADER_AGENT_ID, agent_id)];
-    forward_to_http(reqwest::Method::POST, &url, Some(&body), headers)
+    forward_as_agent(reqwest::Method::POST, &url, params, agent_id).map_err(forward_error_text)
 }
 
 #[cfg(test)]
@@ -366,6 +650,8 @@ mod credential_to_sink_3711_tests {
             &url,
             Some(&serde_json::json!({})),
             &[],
+            None,
+            None,
         )
         .expect_err("a closed port refuses the connection");
         assert!(!err.contains("s3cr3t-3711"), "{err}");
@@ -412,6 +698,8 @@ mod credential_to_sink_3711_tests {
             &url,
             Some(&serde_json::json!({})),
             &[],
+            None,
+            None,
         )
         .expect_err("502 is an error");
         assert!(!err.contains("peer-t0ken-3698"), "{err}");
@@ -432,6 +720,8 @@ mod credential_to_sink_3711_tests {
             &url,
             Some(&serde_json::json!({})),
             &[],
+            None,
+            None,
         )
         .expect_err("html is not JSON");
         assert!(!err.contains("peer-c00kie-3698"), "{err}");
@@ -442,3 +732,11 @@ mod credential_to_sink_3711_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "forward_key_9367_tests.rs"]
+mod forward_key_9367_tests;
+
+#[cfg(test)]
+#[path = "forward_key_daemon_9367_tests.rs"]
+mod forward_key_daemon_9367_tests;

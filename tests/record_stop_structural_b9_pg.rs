@@ -31,6 +31,9 @@ use std::collections::{HashMap, HashSet};
 // `src/store/postgres/` (fail closed on an empty / short file set).
 #[path = "common/pg_sources.rs"]
 mod pg_sources;
+// #9367 r1 Class B: the production view is the shared resolver (#4198).
+#[path = "common/cfg_test_modules.rs"]
+mod cfg_test_modules;
 
 const GATE_MARKERS: &[&str] = &["gate_record_stop", "refuse_if_record_stopped"];
 
@@ -187,12 +190,29 @@ fn is_fn_start(line: &str) -> Option<(usize, String)> {
     }
 }
 
-fn strip_test_mod(src: &str) -> &str {
-    let needle = "\n#[cfg(test)]\nmod tests {";
-    if let Some(idx) = src.rfind(needle) {
-        return &src[..idx];
+/// #9367 r1 Class B: `(original, masked)` with every inline test-only module
+/// removed from BOTH, decided on the MASKED copy by the shared resolver
+/// (#4198), so a string that mimics a test-module header cannot hide a line
+/// and production code after a test module is still scanned. The two copies
+/// stay line-aligned (the mask preserves line count).
+fn strip_test_mods(orig: &str, masked: &str) -> (String, String) {
+    let kept = cfg_test_modules::cfg_test_inline_mod_kept_lines(masked);
+    assert_eq!(
+        orig.lines().count(),
+        kept.len(),
+        "mask_rust must preserve line count"
+    );
+    let mut o = String::new();
+    let mut m = String::new();
+    for ((ol, ml), keep) in orig.lines().zip(masked.lines()).zip(kept) {
+        if keep {
+            o.push_str(ol);
+            o.push('\n');
+            m.push_str(ml);
+            m.push('\n');
+        }
     }
-    src
+    (o, m)
 }
 
 fn signature_has_self(lines: &[&str], start: usize) -> bool {
@@ -326,13 +346,13 @@ fn scan(sources: &[(String, String)]) -> Scan {
             // later fn header into the opening method (K3).
             let masked =
                 pg_sources::try_mask_rust(text).unwrap_or_else(|e| panic!("B9: {rel}: {e}"));
-            // The test-module cut is found on the MASKED text so a string that
+            // The test modules are found on the MASKED text so a string that
             // mimics the `mod tests` header cannot truncate the scan.
-            let cut = strip_test_mod(&masked).len();
+            let (orig, masked) = strip_test_mods(text, &masked);
             (
                 rel.rsplit('/').next().unwrap_or(rel.as_str()).to_string(),
-                text[..cut].to_string(),
-                masked[..cut].to_string(),
+                orig,
+                masked,
             )
         })
         .collect();
