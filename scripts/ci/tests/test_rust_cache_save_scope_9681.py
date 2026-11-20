@@ -542,7 +542,21 @@ MATRIX_OR_LITERAL_RE = re.compile(
 
 def _effective_env_value(name: str, raw: str, leg: dict[str, object]) -> str:
     """The value env var `name` takes on one leg; an expression form other than one fails."""
-    return raw
+    if EXPRESSION_OPEN not in raw:
+        return raw
+    match = MATRIX_OR_LITERAL_RE.match(raw)
+    if not match:
+        raise AssertionError(f"{name}: unrecognised expression form in an env value: {raw!r}")
+    field_name, literal = match.groups()
+    value = leg.get(field_name)
+    if value is None or value == "":
+        return literal
+    # `||` takes the literal for a falsy matrix value (false, 0, ''). _scalar drops quoting, so a
+    # quoted '0' (a truthy string) and a bare 0 (falsy) read the same: refuse rather than guess.
+    if isinstance(value, bool) or str(value).strip() in ("0", "0.0", "-0"):
+        raise AssertionError(f"{name}: matrix.{field_name} = {value!r} is truthy when quoted and "
+                             f"falsy when not, and this parser drops the quotes: {raw!r}")
+    return str(value)
 
 
 def _effective_key_env(env: dict[str, str], leg: dict[str, object]) -> dict[str, str]:
@@ -1847,7 +1861,38 @@ def _unpaired_site_problems(
         table: dict[SiteKey, UnpairedSite],
         commands_of: Callable[[SiteKey], tuple[tuple[str, ...], list[str]]]) -> list[str]:
     """The fail-closed row rule of UNPAIRED_RUST_CACHE_SITES (pure: the caller supplies the sites)."""
-    return []
+    problems: list[str] = []
+    for key in sorted(sites):
+        in_pairs = key[:2] in paired
+        in_table = key in table
+        if in_pairs and in_table:
+            problems.append(f"rust-cache site in both PAIRS and UNPAIRED_RUST_CACHE_SITES: "
+                            f"{_site_name(key)}")
+        elif not in_pairs and not in_table:
+            problems.append(f"rust-cache site in neither PAIRS nor UNPAIRED_RUST_CACHE_SITES: "
+                            f"{_site_name(key)}")
+    for key in sorted(table):
+        row = table[key]
+        if key not in sites:
+            problems.append(f"stale UNPAIRED_RUST_CACHE_SITES row (no hosted pull_request "
+                            f"rust-cache site): {_site_name(key)}")
+            continue
+        if not row.issues or any(n <= 0 for n in row.issues):
+            problems.append(f"UNPAIRED_RUST_CACHE_SITES row without an issue number: "
+                            f"{_site_name(key)}")
+        if row.commands is not None:
+            actual, found = commands_of(key)
+            problems.extend(f"{_site_name(key)}: {problem}" for problem in found)
+            if actual != tuple(sorted(row.commands)):
+                problems.append(
+                    f"cold cargo commands of {_site_name(key)} differ from its row: only on the "
+                    f"site {sorted(set(actual) - set(row.commands))}, only in the row "
+                    f"{sorted(set(row.commands) - set(actual))}")
+    site_jobs = {key[:2] for key in sites}
+    for pair in sorted(paired - site_jobs):
+        problems.append(f"PAIRS job with no hosted pull_request rust-cache site: "
+                        f"{pair[0]}:{pair[1]}")
+    return problems
 
 
 class UnpairedRustCacheSites9681(unittest.TestCase):
