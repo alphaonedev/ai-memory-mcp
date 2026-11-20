@@ -109,8 +109,8 @@ mod tests {
     /// One extra row whose body is this many bytes (the 100K+ input).
     const SCREEN_LARGE_BODY_BYTES: usize = 256 * 1024;
     /// Wall-clock ceiling for screening `SCREEN_SCALE_ROWS` rows plus the
-    /// large body in an unoptimised test build. The screen is one serialize
-    /// + classify + secret scan per row, so the cost is linear; a quadratic
+    /// large body in an unoptimised test build. The screen is one serialize,
+    /// classify and secret scan per row, so the cost is linear; a quadratic
     /// regression over 20,000 rows blows far past this.
     const SCREEN_WALL_CLOCK_CEILING: Duration = Duration::from_secs(60);
 
@@ -458,7 +458,7 @@ mod tests {
             .join(NAMESPACE)
             .join(format!("{CLEAN_ID}.{}", extension(format)));
         assert_eq!(fs::read_to_string(path).unwrap(), expected);
-        assert!(refusal_hashes(&conn).is_empty());
+        assert_eq!(refusal_hashes(&conn), Vec::<Vec<u8>>::new());
     }
 
     #[test]
