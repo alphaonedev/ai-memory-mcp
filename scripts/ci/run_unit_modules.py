@@ -37,12 +37,13 @@ RAN_RE = re.compile(r"^Ran (\d+) tests? in ", re.MULTILINE)
 RESULT_RE = re.compile(r"^(OK.*|FAILED.*)$", re.MULTILINE)
 TAIL_CHARS = 400
 
-# Modules that must not share the pool, each with the reason. They run one at a time after the pool.
+# Modules (file stem, no suffix: a spelled test path would join the cargo-skip read set, #9646 N1) that
+# must not share the pool, each with the reason. They run one at a time after the pool.
 SERIAL_MODULES: dict[str, str] = {
-    "test_cert_amendment_ledger_6124.py": (
+    "test_cert_amendment_ledger_6124": (
         "asserts absolute 1.0 s wall-clock bounds on 100K-line inputs; red at 2.4 s when the CPU is shared (seen at jobs=8)"
     ),
-    "test_certification_scope_8262.py": (
+    "test_certification_scope_8262": (
         "asserts absolute 2.0 s wall-clock bounds on 100K-char inputs; same shared-CPU sensitivity as the ledger module"
     ),
 }
@@ -93,6 +94,10 @@ class RunResult:
             len(self.modules), len(self.bad), ",".join(self.bad), self.tests, self.wall)
 
 
+def stem(name: str) -> str:
+    return name.removesuffix(".py")
+
+
 def discover_modules(tests_dir: Path) -> list[str]:
     """The module file names plain `unittest discover` would load (top level `test*.py`)."""
     if not tests_dir.is_dir():
@@ -126,14 +131,14 @@ def run_one(name: str, tests_dir: Path, repo: Path, timeout_s: float) -> ModuleR
 def run_modules(names: list[str], *, tests_dir: Path, repo: Path, jobs: int, timeout_s: float,
                 serial: frozenset, on_done=None) -> RunResult:
     """Run `names` once each: the pool first, the `serial` ones one at a time after it."""
-    missing_serial = sorted(serial - set(names))
+    missing_serial = sorted(serial - {stem(n) for n in names})
     if missing_serial:
         raise DiscoveryError("SERIAL_MODULES names that match no module: %s" % ", ".join(missing_serial))
     for name in names:
         if not (tests_dir / name).is_file():
             raise DiscoveryError("module %s vanished from %s" % (name, tests_dir))
-    pooled = [n for n in names if n not in serial]
-    tail = [n for n in names if n in serial]
+    pooled = [n for n in names if stem(n) not in serial]
+    tail = [n for n in names if stem(n) in serial]
     started = time.monotonic()
     done: list[ModuleResult] = []
 
@@ -164,7 +169,9 @@ def main(argv=None) -> int:
         names = discover_modules(args.tests_dir)
         if not names:
             raise DiscoveryError("no %s module found in %s" % (MODULE_GLOB, args.tests_dir))
-        serial = frozenset(SERIAL_MODULES) & set(names) if args.tests_dir != DEFAULT_TESTS_DIR else frozenset(SERIAL_MODULES)
+        serial = frozenset(SERIAL_MODULES)
+        if args.tests_dir != DEFAULT_TESTS_DIR:
+            serial &= {stem(n) for n in names}
         result = run_modules(names, tests_dir=args.tests_dir, repo=args.repo, jobs=args.jobs,
                              timeout_s=args.timeout, serial=serial,
                              on_done=lambda m: print(m.line(), flush=True))

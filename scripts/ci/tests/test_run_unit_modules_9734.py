@@ -164,7 +164,7 @@ class UsageErrors(Synthetic):
         self.write("test_a.py", GREEN)
         with self.assertRaises(runner.DiscoveryError):
             runner.run_modules(["test_a.py"], tests_dir=self.dir, repo=REPO, jobs=2,
-                               timeout_s=RUN_LIMIT_S, serial=frozenset({"test_not_here.py"}))
+                               timeout_s=RUN_LIMIT_S, serial=frozenset({"test_not_here"}))
 
 
 class WallTime(Synthetic):
@@ -191,7 +191,7 @@ class WallTime(Synthetic):
             self.write(name, stamped(markers, name))
         result = runner.run_modules(["test_p1.py", "test_p2.py", "test_ser.py"], tests_dir=self.dir,
                                     repo=REPO, jobs=3, timeout_s=RUN_LIMIT_S,
-                                    serial=frozenset({"test_ser.py"}))
+                                    serial=frozenset({"test_ser"}))
         self.assertEqual(result.bad, [])
         spans = {n: tuple(float(x) for x in (markers / n).read_text().split()) for n in
                  ("test_p1.py", "test_p2.py", "test_ser.py")}
@@ -220,7 +220,7 @@ class RealSuite(unittest.TestCase):
 
     def test_serial_modules_are_real_and_have_a_reason(self):
         runner = load_runner()
-        present = {p.name for p in REAL_TESTS.glob("test*.py")}
+        present = {p.stem for p in REAL_TESTS.glob("test*.py")}
         for name, reason in runner.SERIAL_MODULES.items():
             self.assertIn(name, present)
             self.assertTrue(reason.strip(), name)
