@@ -129,6 +129,41 @@ class Compare(unittest.TestCase):
         reasons, _ = self.check(iso, serial_log(BASE))
         self.assertEqual(reasons, ['result totals differ from the test lines: beta_9592 (isolated)'])
 
+    def test_an_outcome_after_child_stderr_is_read_9592(self):
+        # A test that spawns a child process: the child's stderr lands between
+        # "test X ... " and the outcome, which then arrives alone on a later
+        # line (seen in the local proof on envelope_column_type_fail_closed_4133).
+        interleaved = binary_log('beta_9592', BASE['beta_9592']).replace(
+            'test b::one ... ok\n',
+            'test b::one ... ai-memory: generated a key at <path>\nai-memory MCP server started\nok\n')
+        seg = [s for s in self.p.segments(interleaved) if s.name == 'beta_9592'][0]
+        self.assertEqual(seg.tests, {'b::one': 'ok'})
+        reasons, summary = self.check(self.iso(beta_9592=interleaved), serial_log(BASE))
+        self.assertEqual(reasons, [])
+        self.assertEqual(summary['tests'], 4)
+
+    def test_every_interleaved_outcome_form_is_read_9592(self):
+        for outcome, line in (('ok', 'ok'), ('FAILED', 'FAILED'), ('ignored', 'ignored, needs pg')):
+            with self.subTest(outcome=outcome):
+                text = ('     Running tests/x.rs (target/debug/deps/x_9592-0123456789abcdef)\n'
+                        'test x::t ... child line\n%s\n' % line)
+                self.assertEqual(self.p.segments(text)[0].tests, {'x::t': outcome})
+
+    def test_a_stray_outcome_word_without_an_open_test_is_ignored_9592(self):
+        text = ('     Running tests/x.rs (target/debug/deps/x_9592-0123456789abcdef)\n'
+                'test x::t ... ok\nok\nFAILED\n')
+        self.assertEqual(self.p.segments(text)[0].tests, {'x::t': 'ok'})
+
+    def test_a_wrong_stray_outcome_is_caught_by_the_totals_9592(self):
+        # A child that prints "ok" alone while the test later FAILS: the read
+        # outcome is wrong, and the totals cross-check fails closed on it.
+        text = ('     Running tests/x.rs (target/debug/deps/x_9592-0123456789abcdef)\n'
+                'test x::t ... child\nok\nFAILED\n\n'
+                'test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n')
+        seg = self.p.segments(text)[0]
+        self.assertEqual(self.p.structural(seg, 'isolated'),
+                         'result totals differ from the test lines: x_9592 (isolated)')
+
     def test_a_log_running_no_binary_fails(self):
         iso = self.iso(beta_9592='# [pg_isolated_binary] current_database=x mode=isolated\nerror: could not compile\n')
         reasons, _ = self.check(iso, serial_log(BASE))
