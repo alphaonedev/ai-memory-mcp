@@ -81,6 +81,9 @@ EXPECTED_STEPS = {
         "Load gate (#6795)",
         "Run tests (impact-aware)",
         "Run the pg_isolated_binary live cells (enterprise-fed legs only)",
+    ],
+    # #9680 moved the audit and the release smoke to the android entry.
+    "mobile-cross-compile": [
         "Security audit",
         "Build release (once leg — release-profile smoke)",
     ],
