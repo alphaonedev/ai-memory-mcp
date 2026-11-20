@@ -53,8 +53,9 @@ run id is ``[a-z0-9]{1,20}``. The Rust helper (``tests/common/pg_isolate.rs``)
 uses the same shape.
 
 Exit codes: 0 success, 2 usage or wrapper error (fails closed), 3 a clone
-could not be minted or held, 143 terminated, otherwise the worst exit code of
-the cargo runs. Standard library only, Python 3.9+.
+could not be minted or held, 5 a binary held more sessions on its clone than
+the per-binary bound (it is killed), 143 terminated, otherwise the worst exit
+code of the cargo runs. Standard library only, Python 3.9+.
 """
 import argparse
 import os
@@ -164,6 +165,9 @@ IN_USE_TEXT = 'being accessed by other users'
 EXIT_USAGE = 2
 EXIT_MINT = 3
 EXIT_TERM = 143
+EXIT_SESSIONS = 5  # SEC-L4: a binary opened more sessions than the budget assumes (#9592)
+# SEC-L4: how often a running isolated binary's sessions are counted against the per-binary bound.
+SESSION_POLL_SECS = 5.0
 
 # URL query keys and the libpq variable each maps to. Anything else fails
 # closed rather than being silently dropped.
@@ -1207,6 +1211,34 @@ class Runner:
             _out(wa.log_line(line))
         _out(wa.end_group_line())
 
+    def _wait_bounded(self, child: 'subprocess.Popen[str]', minted: Optional[str], label: str) -> int:
+        """Wait for ``child``; on a clone, kill it when it holds more sessions than the budget assumes (SEC-L4).
+
+        The bound is PER_BINARY_CONNECTIONS + HOLD_CONNECTIONS, the figure Admission reserves per clone.
+        decision: a poll that cannot read the count is skipped (the next poll reads again) over failing the
+        binary, because a transient admin-session error must not turn a green binary red; the bound holds on
+        every poll that reads a count."""
+        if minted is None:
+            return child.wait()
+        bound = PER_BINARY_CONNECTIONS + HOLD_CONNECTIONS
+        while True:
+            try:
+                return child.wait(timeout=SESSION_POLL_SECS)
+            except subprocess.TimeoutExpired:
+                pass
+            try:
+                count = session_count(self.admin, minted)
+            except WrapperError:
+                continue
+            if count > bound:
+                log('FAIL %s: session bound exceeded: %s opened %d sessions (bound %d)' % (label, minted, count, bound))
+                try:
+                    os.killpg(child.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass  # the group already exited
+                child.wait()
+                return EXIT_SESSIONS
+
     def run_one(self, target: List[str], isolate: bool = True) -> int:
         """One binary: mint + hold a clone, cargo test it, release, drop."""
         label = target[-1]
@@ -1239,6 +1271,8 @@ class Runner:
                 # Residual binaries stay on the shared database: strip the flag
                 # so the Rust helper does not mint a clone of its own.
                 child_env.pop(FLAG_VAR, None)
+                # C-L6: the server names the database, as on the isolated path; never the URL text.
+                evidence = '%s mode=residual' % current_database(self.env.get(URL_VAR, ''))
             if self.stop.is_set():
                 return EXIT_TERM
             self.log_dir.mkdir(parents=True, exist_ok=True)
@@ -1248,7 +1282,7 @@ class Runner:
                 out.flush()
                 child = self._spawn(argv, child_env, out)
                 try:
-                    rc = child.wait()
+                    rc = self._wait_bounded(child, minted, label)
                 finally:
                     self._forget(child)
             if self.stop.is_set():

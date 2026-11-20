@@ -1848,21 +1848,31 @@ jobs:
             *) JOB_T0_VALID=1 ;;
           esac
           # #9592 (3-agent vote (71472661), decision A) — this step never runs
-          # isolated: the flag is forced to 0 for every cargo child. On the
-          # linux-fed enterprise-fed leg, unless CI_PG_ISOLATE_OFF=1, the serial
-          # shard DEFERS its --test binaries to the "Serial shard isolated
-          # binaries" step below (the only step with the flag at 1) and writes
-          # the mode file it reads: `deferred` plus iso_targets.txt /
-          # iso_residual.txt, else `none`. With the kill switch, and on every
-          # other leg, the serial shard runs every binary in-line (the exact
-          # serial path) and the mode stays `none`.
+          # isolated: the flag is forced to 0 for every cargo child. The kill
+          # switch is read by the entry the isolated step uses (1/true/on or
+          # 0/false/off/empty, case-insensitive; any other value fails this
+          # step). On the linux-fed enterprise-fed leg (the isolated step's
+          # if:) with the kill switch off, the serial shard DEFERS its --test
+          # binaries to the "Serial shard isolated binaries" step below (the
+          # only step with the flag at 1) and the mode file says `deferred`
+          # once iso_targets.txt / iso_residual.txt exist. With the kill switch
+          # on, that leg runs every binary in-line (--test-threads=1) and the
+          # mode is `killswitch`; every other leg keeps `none`. The isolated
+          # step and Cleanup are red when the mode, the kill switch and
+          # iso_targets.txt disagree (check_pg_isolate_invariants.py G10 pins
+          # these lines).
           export AI_MEMORY_TEST_PG_ISOLATE=0
+          PG_ISO_KILL="$(python3 scripts/ci/pg_isolate_serial_step.py killswitch)"
           PG_ISO_DEFER=0
-          if [ "${CI_NODE:-}" = "linux-fed" ] && [ "${TIER:-}" = "enterprise-fed" ] && [ "${CI_PG_ISOLATE_OFF:-}" != "1" ]; then
+          PG_ISO_MODE=none
+          if [ "${CI_NODE:-}" = "linux-fed" ] && [ "${TIER:-}" = "enterprise-fed" ] && [ "$PG_ISO_KILL" = "off" ]; then
             PG_ISO_DEFER=1
           fi
+          if [ "${CI_NODE:-}" = "linux-fed" ] && [ "${TIER:-}" = "enterprise-fed" ] && [ "$PG_ISO_KILL" = "on" ]; then
+            PG_ISO_MODE=killswitch
+          fi
           PG_ISO_MODE_FILE="${RUNNER_TEMP:-$PWD/.local-runs}/ci-iso-mode.txt"
-          echo none > "$PG_ISO_MODE_FILE"
+          echo "$PG_ISO_MODE" > "$PG_ISO_MODE_FILE"
           # v1.0.0 2x2 — tier-parametrised feature/thread selection. The
           # `enterprise-fed` legs add `--features sal-postgres` and serialise
           # DDL with `-- --test-threads=1` (the sal-postgres suite shares one
@@ -2535,26 +2545,37 @@ jobs:
       # own clone of a locked age+vector template, `--jobs 8`, the residual list
       # (scripts/ci/pg_isolate_serial_residual.txt plus the port / shared-path /
       # unknown-source detections) alone on the shared database after the pool
-      # drains, in-binary --test-threads=1 unchanged. Fail closed: a missing
-      # log, a zero-test binary, a log without its current_database evidence
-      # line, two binaries on one clone, a self-skipped Postgres test, a clone
-      # mint failure, a teardown failure or any clone or template left after
-      # teardown. Mode `none` (kill switch, no deferral) is a no-op. With
-      # CI_PG_ISOLATE_OFF=1 the entry runs the exact serial path itself.
+      # drains, in-binary --test-threads=1 unchanged, inside the #7914 host
+      # semaphore like "Run tests" (same slots and wait, label .../iso; G14).
+      # It writes the run id to $RUNNER_TEMP/ci-iso-run.txt before the first
+      # clone and, only when green, the completion ledger ci-iso-ledger.txt
+      # (one row per deferred binary, then the `complete` row) that Cleanup
+      # checks against iso_targets.txt. Fail closed: a missing log, a
+      # zero-test binary, a log without its current_database evidence line,
+      # two binaries on one clone, any skip print, an ignored count that
+      # differs from --list --ignored, a clone mint failure, a teardown
+      # failure, any clone or template left after teardown, and a mode, kill
+      # switch or deferred list that disagree. Mode `none` with no deferred
+      # list and mode `killswitch` (Run tests ran the serial-shard binaries
+      # in-line) are green no-ops. Never on a fork pull request (G13).
       # Teardown passes AI_MEMORY_TEST_PG_TEMPLATE, the run id and a --db equal
       # to the URL database explicitly, and no decision reads refusal text.
       # I-12: after landing, a red of this step is NEVER re-run to pass: the
       # conductor sets the CI_PG_ISOLATE_OFF repo variable to 1 and files an
       # issue with the failing binary and the step log line.
       - name: Serial shard isolated binaries (linux-fed enterprise-fed, issue 9592)
-        if: ${{ !cancelled() && steps.run-tests.outcome != 'skipped' && needs.classify.outputs.cargo_skip != 'true' && matrix.node == 'linux-fed' && matrix.tier == 'enterprise-fed' }}
+        if: ${{ !cancelled() && steps.run-tests.outcome != 'skipped' && needs.classify.outputs.cargo_skip != 'true' && matrix.node == 'linux-fed' && matrix.tier == 'enterprise-fed' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
         env:
           AI_MEMORY_TEST_PG_ISOLATE: "1"
           AI_MEMORY_NO_CONFIG: "1"
           CI_PG_ISOLATE_OFF: ${{ vars.CI_PG_ISOLATE_OFF }}
           JOB_TIMEOUT_MIN: ${{ matrix.timeout }}
+          TIER: ${{ matrix.tier }}
+          CI_NODE: ${{ matrix.node }}
+          HOST_SEMAPHORE_SLOTS: ${{ matrix.node == 'linux-fed' && matrix.tier == 'enterprise-fed' && '2' || '0' }}
+          HOST_SEMAPHORE_MAX_WAIT_SECS: '3600'
         shell: bash
-        run: python3 scripts/ci/pg_isolate_serial_step.py run
+        run: python3 -I scripts/ci/host_semaphore.py --name linux-fed-tests --slots "$HOST_SEMAPHORE_SLOTS" --max-wait-secs "$HOST_SEMAPHORE_MAX_WAIT_SECS" --label "${CI_NODE}/${TIER}/iso" -- python3 scripts/ci/pg_isolate_serial_step.py run
 
       # Durable audit-history artifact (#4). Uploaded on success AND failure so
       # a red leg's full output is retrievable long after the log view expires.
@@ -2587,6 +2608,16 @@ jobs:
             ${{ runner.temp }}/ci-shard/manifest.json
           if-no-files-found: ignore
           retention-days: 30
+
+      # #9592 SD — the per-binary logs carry --show-output test bodies and the
+      # artifact is public: every log is rewritten through the redaction of
+      # the step's printed lines before the upload below (the isolated step
+      # also redacts in its own finally; this step covers a cancel or a
+      # job-cap kill). G7 pins it always() and before the upload.
+      - name: Redact isolated-lane per-binary logs (issue 9592)
+        if: always() && needs.classify.outputs.cargo_skip != 'true' && matrix.tier == 'enterprise-fed'
+        shell: bash
+        run: python3 scripts/ci/pg_isolate_serial_step.py redact-logs
 
       # #6383 / #6386 review r1 M3 — one log file per isolated binary, written
       # by scripts/test/pg_isolated_binary.py under the shard directory. Only
@@ -2669,8 +2700,11 @@ jobs:
 
       # Drop the per-job ephemeral db (created by "Configure enterprise-fed
       # tier" above). always() so a failed/cancelled test run still reclaims
-      # it. Guarded on CI_FED_DB so it no-ops on the sqlite legs (where it was
-      # never set) and if the configure step failed before creating the db.
+      # it. The #9592 isolation cleanup runs FIRST on every leg (G11) and its
+      # exit code is the step's on every exit path, so an unset CI_FED_DB can
+      # never turn a red isolation cleanup into a green step. The db drop
+      # itself no-ops on the sqlite legs (CI_FED_DB never set) and if the
+      # configure step failed before creating the db.
       - name: Cleanup enterprise-fed ephemeral db
         # always() so a failed/cancelled test run still reclaims the db, but
         # still docs_only-guarded (rule (b3)): on a docs-only run the configure
@@ -2679,27 +2713,29 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [ -z "${CI_FED_DB:-}" ]; then
-            echo "::notice::no ephemeral db to drop (CI_FED_DB unset — sqlite leg or configure never ran)"
-            exit 0
-          fi
           # Re-derive psql on PATH defensively (GITHUB_PATH from the configure
           # step normally carries it, but this step must not depend on that).
           for d in /usr/lib/postgresql/18/bin /opt/homebrew/opt/postgresql@18/bin; do
             [ -d "$d" ] && PATH="$d:$PATH"
           done
-          export PATH
-          # #9592 (I-11): when the serial shard isolated binaries step exported
-          # a run id (AI_MEMORY_TEST_PG_RUN_ID / AI_MEMORY_TEST_PG_TEMPLATE via
-          # $GITHUB_ENV), the entry tears THIS run's clones and the locked
-          # template down again (a cancel or a job-cap kill can stop the step's
-          # own teardown), passing the template, the run id and a --db equal to
-          # the URL database ($CI_FED_DB) explicitly, then counts what is left:
-          # a clone or template left fails this step (after the drop below).
-          # No FORCE; another run's clones are never touched. The URL travels
-          # in the environment ($GITHUB_ENV), never argv.
+          # #9592 (I-11, SB): the entry reads $RUNNER_TEMP/ci-iso-mode.txt. Mode
+          # `none` or `killswitch` is green only with no deferred list, no run
+          # file and no ledger. Mode `deferred` is red without the run id the
+          # isolated step wrote to ci-iso-run.txt before its first clone; with
+          # it, the entry tears THIS run's clones and the locked template down
+          # again (a cancel or a job-cap kill can stop the step's own
+          # teardown), passing the template, the run id and a --db equal to the
+          # URL database ($CI_FED_DB) explicitly, counts what is left, and is
+          # red unless the completion ledger lists every deferred binary. No
+          # FORCE; another run's clones are never touched. The URL travels in
+          # the environment ($GITHUB_ENV), never argv.
           iso_rc=0
           python3 scripts/ci/pg_isolate_serial_step.py cleanup || iso_rc=$?
+          if [ -z "${CI_FED_DB:-}" ]; then
+            echo "::notice::no ephemeral db to drop (CI_FED_DB unset — sqlite leg or configure never ran)"
+            exit "$iso_rc"
+          fi
+          export PATH
           url_file="$HOME/.ai-memory-ci-fed-url"
           if [ ! -f "$url_file" ]; then
             echo "::warning::cannot drop $CI_FED_DB — $url_file missing on $RUNNER_NAME (leaked ephemeral db)"
