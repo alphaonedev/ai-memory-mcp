@@ -50,14 +50,18 @@ fn isolated_home_and_keys() -> (&'static std::path::Path, &'static std::path::Pa
     use std::sync::OnceLock;
     static ISOLATED: OnceLock<(std::path::PathBuf, std::path::PathBuf)> = OnceLock::new();
     let (home, keys) = ISOLATED.get_or_init(|| {
-        let root =
-            std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("integration-isolated");
+        // #9719 — one root PER PROCESS. Under nextest every test is its own
+        // process; a shared root let two processes' `keypair::save` (two
+        // separate renames: `.priv`, then `.pub`) interleave into a torn pair
+        // that `load` rejects, and every spawned child then refused (#3354).
+        let root = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("integration-isolated-{}", std::process::id()));
         let home = root.join("home");
         let keys = root.join("keys");
         key_dir_sandbox::mkdir_0700(&home);
         key_dir_sandbox::mkdir_0700(&keys);
-        // RACE-FREE first boot — mint the daemon signing key ONCE, in-process,
-        // before any parallel test spawns concurrent `serve` daemons. On a cold
+        // RACE-FREE first boot — mint the daemon signing key ONCE per process,
+        // in-process, before any parallel test spawns concurrent `serve` daemons. On a cold
         // shared key dir, multiple daemons would otherwise race to generate the
         // same `host:<hostname>` id; whichever writes the on-disk pair LAST then
         // disagrees with the in-memory key an earlier daemon already booted
@@ -14011,7 +14015,10 @@ fn fixture_processes_get_distinct_loadable_key_dirs_9719() {
             .unwrap_or_else(|| panic!("no probe line in child output: {stdout}"));
         let fields: Vec<&str> = line.split(' ').collect();
         assert_eq!(fields.len(), 4, "probe line shape: {line}");
-        assert_eq!(fields[3], "true", "child saw an unloadable key pair: {line}");
+        assert_eq!(
+            fields[3], "true",
+            "child saw an unloadable key pair: {line}"
+        );
         homes.insert(fields[1].to_string());
         keys_dirs.insert(fields[2].to_string());
     }
