@@ -19,23 +19,11 @@ use ai_memory::models::AttestLevel;
 use std::fs;
 use std::path::Path;
 
-const SRC_DIRS: &[&str] = &["src"];
+// #9367: the ONE resolver of what is test-only (#4198/#4200), never copied.
+#[path = "common/cfg_test_modules.rs"]
+mod cfg_test_modules;
 
-/// Find the line number of the first `mod tests {` or `pub mod tests {`
-/// in `content`, returning `usize::MAX` when absent.
-fn tests_mod_boundary(content: &str) -> usize {
-    for (i, line) in content.lines().enumerate() {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("mod tests {")
-            || trimmed.starts_with("pub mod tests {")
-            || trimmed.starts_with("pub(crate) mod tests {")
-            || trimmed.starts_with("pub(super) mod tests {")
-        {
-            return i;
-        }
-    }
-    usize::MAX
-}
+const SRC_DIRS: &[&str] = &["src"];
 
 fn is_skip_file(name: &str) -> bool {
     name.contains("test") || name == "tests.rs"
@@ -93,11 +81,11 @@ fn every_production_attest_level_literal_parses_via_from_str() {
         let Ok(content) = fs::read_to_string(path) else {
             continue;
         };
-        let boundary = tests_mod_boundary(&content);
+        // Every line outside the file's cfg(test) modules (the ONE resolver,
+        // #9367): production after a test module still counts. A line number
+        // past a stripped module counts production lines only.
+        let content = cfg_test_modules::strip_cfg_test_inline_mods(&content);
         for (lineno, line) in content.lines().enumerate() {
-            if lineno >= boundary {
-                break;
-            }
             let trimmed = line.trim_start();
             if trimmed.starts_with("//") || trimmed.starts_with('*') || trimmed.starts_with("///") {
                 continue;
