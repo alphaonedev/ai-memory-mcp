@@ -425,7 +425,7 @@ fn main() -> Result<()> {
         &app_config,
         hosts_ledger_writers(&cli.command),
         ledger_writer(&cli.command),
-        is_key_provisioning_verb(&cli.command),
+        boot_key_setup(&cli.command),
         &app_config.effective_db_explicit(cli.db.as_deref()),
     ) {
         // #4199 — only under AI_MEMORY_REQUIRE_FORENSIC_SINK (pinned by
@@ -661,7 +661,72 @@ fn is_key_provisioning_verb(cmd: &daemon_runtime::Command) -> bool {
     )
 }
 
+/// How the boot sets up the resolved id's signing key
+/// ([`init_forensic_audit`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BootKeySetup {
+    /// #3354 — load the key, or generate it when absent; a ledger writer
+    /// whose key cannot be ensured refuses to start.
+    Ensure,
+    /// #3743 / #3717 — a key-provisioning verb: load only, generate nothing.
+    LoadOnly,
+    /// #9562 — a `wake-hub` mode that writes no ledger row: no key is
+    /// loaded, ensured or generated, no audit signer is installed, and the
+    /// forensic sink starts keyless.
+    Skip,
+}
+
+/// #9562, 3-agent vote (71472661) T-3 — the key setup of the boot, per
+/// command. Only the non-writer `wake-hub` modes skip it, by the same
+/// derivation their dispatch and [`ledger_writer`] use. The other
+/// `ledger_writer`-false verbs keep the ensure: `verify-signed-events-chain`
+/// verifies with the in-process key the ensure loads, so a general gate
+/// would turn its check fail-open (#9574 stays open for them).
+fn boot_key_setup(cmd: &daemon_runtime::Command) -> BootKeySetup {
+    if let daemon_runtime::Command::WakeHub(args) = cmd
+        && !ai_memory::cli::wake_hub::WakeHubMode::of(args).writes_ledger()
+    {
+        return BootKeySetup::Skip;
+    }
+    if is_key_provisioning_verb(cmd) {
+        BootKeySetup::LoadOnly
+    } else {
+        BootKeySetup::Ensure
+    }
+}
+
+/// #9562 — `wake-hub` is classified per MODE, not as one verb, by the same
+/// derivation its dispatch uses ([`ai_memory::cli::wake_hub::WakeHubMode`]),
+/// so the default-true rule above cannot reach it by omission again
+/// (3-agent vote (71472661), T-1..T-9). Read of every function each mode
+/// reaches (T-3, facts in the #9562 lane; pin
+/// `tests/wake_hub_readonly_modes_9562.rs`):
+///
+/// - posture (`--json`, `--require-admits` inherit it): `resolve_config`,
+///   `print_posture`, `IdentityPosture::resolve`, `SnapshotFreshness::observe`,
+///   `AdmitReadiness::observe`, `fd_budget_facts` (getrlimit only),
+///   `SocketPosture::read` (stat only). Reads only.
+/// - health (`--json` inherits it): `run_health` -> `health::probe` (connect,
+///   read the hub's challenge, close; no frame sent). Reads only.
+/// - serve: `AllowlistCache::load_from_file` and `ReloadingAllowlist` (public
+///   keys only), `StopListener`, `WakeHub::bind` / `serve` / drain (the socket
+///   directory and socket file are its only writes), the routing, pending and
+///   connection modules (frames in memory and on the socket).
+///
+/// None emits a `signed_events` row or an `audit::` or `record_decision`
+/// row. The boot skips the key setup for every mode ([`boot_key_setup`],
+/// T-3): no signing key is loaded, ensured or generated and no audit signer
+/// is installed, whatever the home and key directory permit; the forensic
+/// sink starts keyless and creates only its directory, never a forensic file.
+/// A hub user whose home is unwritable starts every mode; a forensic sink
+/// that cannot start prints the one degraded-boot warning and, as a
+/// non-writer, records no outage row.
+/// A new mode does not compile until `WakeHubMode::writes_ledger` names it.
 fn ledger_writer(cmd: &daemon_runtime::Command) -> bool {
+    if let daemon_runtime::Command::WakeHub(args) = cmd {
+        // #9562, 3-agent vote (71472661): per mode, via the dispatch derivation.
+        return ai_memory::cli::wake_hub::WakeHubMode::of(args).writes_ledger();
+    }
     !(is_egress_verb(cmd)
         || is_remediation_verb(cmd)
         || matches!(
@@ -701,6 +766,11 @@ fn ledger_writer(cmd: &daemon_runtime::Command) -> bool {
 ///    or generated when absent). A ledger-writing verb whose key cannot be
 ///    ensured REFUSES here, before any row can be written — that refusal
 ///    is the diagnostic an operator sees, and nothing below runs.
+///    `key_setup` ([`boot_key_setup`]) narrows this: a key-provisioning verb
+///    loads only (#3743); a non-writer `wake-hub` mode (#9562) loads,
+///    ensures and installs nothing and starts the sink keyless
+///    (`governance::audit::init_keyless`), which creates only the forensic
+///    directory.
 /// 2. The database audit signers are installed from the ENSURED key
 ///    (#3647: they must not depend on the forensic directory resolving or
 ///    being creatable). Installing them from a plain load, before the
@@ -722,7 +792,7 @@ fn init_forensic_audit(
     app_config: &config::AppConfig,
     hosts_writers: bool,
     ledger_writer: bool,
-    key_provisioning: bool,
+    key_setup: BootKeySetup,
     db_path: &std::path::Path,
 ) -> Result<()> {
     let audit_cfg = app_config.effective_audit();
@@ -740,22 +810,25 @@ fn init_forensic_audit(
     // operator left it, never pre-empted by a boot-minted pair. Load only,
     // generate nothing: these verbs write no ledger row (see
     // `is_key_provisioning_verb`), so there is nothing here to sign.
-    let (signing_key, generated) = if key_provisioning {
-        (
+    // #9562 — a non-writer `wake-hub` mode touches no key material at all.
+    let (signing_key, generated) = match key_setup {
+        BootKeySetup::Skip => (None, None),
+        BootKeySetup::LoadOnly => (
             ai_memory::governance::audit::load_daemon_signing_key(&agent_id).unwrap_or(None),
             None,
-        )
-    } else {
-        match ai_memory::governance::audit::ensure_daemon_signing_key(&agent_id) {
-            Ok(pair) => pair,
-            Err(e) => {
-                if ledger_writer {
-                    anyhow::bail!(ai_memory::governance::audit::unsigned_ledger_refusal(
-                        &agent_id,
-                        &format!("{e:#}")
-                    ));
+        ),
+        BootKeySetup::Ensure => {
+            match ai_memory::governance::audit::ensure_daemon_signing_key(&agent_id) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    if ledger_writer {
+                        anyhow::bail!(ai_memory::governance::audit::unsigned_ledger_refusal(
+                            &agent_id,
+                            &format!("{e:#}")
+                        ));
+                    }
+                    (None, None)
                 }
-                (None, None)
             }
         }
     };
@@ -783,8 +856,11 @@ fn init_forensic_audit(
     }
     // The database audit signers must not depend on the forensic directory
     // resolving or being creatable (#3647) — and they take the ENSURED key
-    // (#3354), never a plain load that could predate generation.
-    ai_memory::governance::audit::init_audit_signers(signing_key.as_ref());
+    // (#3354), never a plain load that could predate generation. #9562: a
+    // keyless mode installs none (the recorder key file is never read).
+    if key_setup != BootKeySetup::Skip {
+        ai_memory::governance::audit::init_audit_signers(signing_key.as_ref());
+    }
     let log_path = ai_memory::audit::resolve_audit_path(&audit_cfg);
     let record = hosts_writers || ledger_writer;
     let Some(dir) = log_path.parent() else {
@@ -800,7 +876,11 @@ fn init_forensic_audit(
         );
     };
     warn_if_plaintext_retention_requested(&audit_cfg);
-    let init_result = ai_memory::governance::audit::init(dir, signing_key);
+    let init_result = if key_setup == BootKeySetup::Skip {
+        ai_memory::governance::audit::init_keyless(dir)
+    } else {
+        ai_memory::governance::audit::init(dir, signing_key)
+    };
     report_future_dated_forensic_files(dir, record, db_path);
     if let Err(e) = init_result {
         // #4272 — EVERY failure to start the sink is "forensic sink
@@ -1264,6 +1344,50 @@ mod tests {
         }
     }
 
+    /// #9562, 3-agent vote (71472661) T-3 — every non-writer `wake-hub` argv
+    /// skips the boot key setup; writers keep the ensure, provisioning verbs
+    /// load only, and the other `ledger_writer`-false verbs keep the ensure
+    /// (`verify-signed-events-chain` verifies with the ensured key, #9574).
+    #[test]
+    fn boot_key_setup_skips_only_non_writer_wake_hub_modes_9562() {
+        let parse = |argv: &[&str]| Cli::try_parse_from(argv).expect("argv parses").command;
+        let table: [(&[&str], BootKeySetup); 11] = [
+            (&["ai-memory", "wake-hub", "--posture"], BootKeySetup::Skip),
+            (
+                &["ai-memory", "wake-hub", "--posture", "--json"],
+                BootKeySetup::Skip,
+            ),
+            (
+                &["ai-memory", "wake-hub", "--posture", "--require-admits"],
+                BootKeySetup::Skip,
+            ),
+            (&["ai-memory", "wake-hub", "--health"], BootKeySetup::Skip),
+            (
+                &["ai-memory", "wake-hub", "--health", "--json"],
+                BootKeySetup::Skip,
+            ),
+            (&["ai-memory", "wake-hub"], BootKeySetup::Skip),
+            (&["ai-memory", "serve"], BootKeySetup::Ensure),
+            (&["ai-memory", "capture-turn"], BootKeySetup::Ensure),
+            (&["ai-memory", "stats"], BootKeySetup::Ensure),
+            (
+                &["ai-memory", "verify-signed-events-chain"],
+                BootKeySetup::Ensure,
+            ),
+            (
+                &["ai-memory", "identity", "generate", "--agent-id", "ai:x"],
+                BootKeySetup::LoadOnly,
+            ),
+        ];
+        for (argv, want) in table {
+            let cmd = parse(argv);
+            assert_eq!(boot_key_setup(&cmd), want, "{argv:?}");
+            if want == BootKeySetup::Skip {
+                assert!(!ledger_writer(&cmd), "{argv:?} skips only as a non-writer");
+            }
+        }
+    }
+
     fn forensic_boot_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         LOCK.lock()
@@ -1297,7 +1421,7 @@ mod tests {
             &app_config,
             false,
             false,
-            false,
+            BootKeySetup::Ensure,
             std::path::Path::new("does-not-exist-4199.db"),
         )
         .expect("forensic boot");
@@ -1489,7 +1613,7 @@ mod tests {
             &app_config,
             false,
             false,
-            false,
+            BootKeySetup::Ensure,
             std::path::Path::new("does-not-exist-4199.db"),
         )
         .expect("init");

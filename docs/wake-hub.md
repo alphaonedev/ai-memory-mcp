@@ -362,6 +362,24 @@ every peer uses. There is no privileged side channel and no second admission
 path — the hub applies its peer-credential gate, its identity verifier, its
 token buckets and its queue bounds to the daemon exactly as it does to an agent.
 
+**The hub process needs no signing key and writes no ledger row**
+([#9562](https://github.com/alphaonedev/ai-memory-mcp/issues/9562)). Every
+`ai-memory wake-hub` mode is classified per mode for the #3354 unsigned-ledger
+refusal by one exhaustive match (`WakeHubMode::writes_ledger`), and every mode
+is read-only: serve binds and unlinks its socket and routes frames in memory,
+`--posture` (also `--json`, `--require-admits`) reads the configuration, the
+allowlist snapshot and the socket's mode, and `--health` (also `--json`) only
+connects and reads the challenge. The boot skips the signing-key setup for
+every mode: no key is loaded, ensured or generated, even under a writable home,
+and the forensic sink starts without a key, creating only its directory and no
+forensic file. So the packaged unit's three command lines
+(the serve `ExecStart`, the `--health` and the `--posture --require-admits`
+`ExecStartPost` gates) start for the `ai-memory-hub` user, whose home cannot be
+written, and a key problem is never reported as the admit gate's exit `3`. When
+the forensic sink cannot start, the hub prints the one
+`Continuing WITHOUT the forensic audit sink` warning and records no outage row,
+since it writes no ledger rows at all.
+
 ## Identity, and why it fails closed
 
 A substrate wake is stamped with the reserved `wake-hub-producer` identity, NOT

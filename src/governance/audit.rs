@@ -1419,6 +1419,23 @@ pub fn init_audit_signers(signing_key: Option<&SigningKey>) {
 ///   inside the `anyhow::Error`): the binary runs without the sink, or refuses
 ///   under [`REQUIRE_FORENSIC_SINK_ENV`].
 pub fn init(dir: &Path, signing_key: Option<SigningKey>) -> Result<()> {
+    start_sink(dir, signing_key, true)
+}
+
+/// #9562 — start the forensic sink for a process that writes no ledger row
+/// (the non-writer `wake-hub` modes): no key is loaded and no database audit
+/// signer is installed (the recorder key file is never read). The sink
+/// creates the forensic DIRECTORY and its probe file (removed again); no
+/// forensic file is created until a row is appended, and such a process
+/// appends none.
+///
+/// # Errors
+/// The same as [`init`].
+pub fn init_keyless(dir: &Path) -> Result<()> {
+    start_sink(dir, None, false)
+}
+
+fn start_sink(dir: &Path, signing_key: Option<SigningKey>, install_signers: bool) -> Result<()> {
     std::fs::create_dir_all(dir)
         .with_context(|| format!("creating forensic audit dir {}", dir.display()))?;
     // #4302 (r1 B2 on #4272) — prove the sink can WRITE before it is up. A
@@ -1431,7 +1448,9 @@ pub fn init(dir: &Path, signing_key: Option<SigningKey>) -> Result<()> {
     // #4199 — only a genuinely empty chain starts at genesis; an unavailable
     // tail is an error: no sink, never a fork (see `read_chain_tail`).
     let last_hash = read_chain_tail(dir)?.unwrap_or_else(|| CHAIN_HEAD_PREV_HASH.to_string());
-    init_audit_signers(signing_key.as_ref());
+    if install_signers {
+        init_audit_signers(signing_key.as_ref());
+    }
     let commitment_key = signing_key.as_ref().map(forensic_commitment_key);
     let mut guard = sink()
         .lock()
