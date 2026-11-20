@@ -118,13 +118,15 @@ pub async fn inbox_sse(
     // principal, so the value reaching the filter is the BOUND
     // principal. A `host:`-prefixed value is treated as anonymous and,
     // like an absent header, yields a stream that never emits.
-    let subscriber_agent = headers
-        .get(crate::HEADER_AGENT_ID)
-        .and_then(|v| v.to_str().ok())
-        .map(str::trim)
-        .filter(|s| !s.starts_with("host:"))
-        .unwrap_or("")
-        .to_string();
+    // #9616 — a non-UTF-8 or repeated header is the named 400.
+    let subscriber_agent = match crate::handlers::caller_identity::header_agent_id(&headers) {
+        Ok(header) => header,
+        Err(refusal) => return refusal.into_response(),
+    }
+    .map(str::trim)
+    .filter(|s| !s.starts_with("host:"))
+    .unwrap_or("")
+    .to_string();
 
     /// Bridges a `BroadcastStream<InboxEvent>` into the
     /// `Stream<Item = Result<Event, Infallible>>` axum's `Sse`

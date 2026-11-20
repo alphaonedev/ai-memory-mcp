@@ -31,7 +31,6 @@ use ai_memory::handlers::{ApiKeyState, AppState, Db, StorageBackend};
 use axum::body::Body;
 use axum::http::{HeaderValue, Request, StatusCode};
 use serde_json::{Value, json};
-#[cfg(feature = "sal-postgres")]
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
@@ -42,7 +41,15 @@ mod common;
 const ALICE: &str = "ai:alice-9616";
 const BOB: &str = "ai:bob-9616";
 const API_KEY: &str = "agent-id-refusal-9616";
-const NAMESPACE: &str = "ns-9616";
+/// Prefix of the per-run namespace. A postgres lane database outlives one
+/// run, so each run writes under its own namespace and a fixture title from an
+/// earlier run never collides (409) with this one.
+const NAMESPACE_PREFIX: &str = "ns-9616-";
+
+fn namespace() -> &'static str {
+    static RUN_NAMESPACE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    RUN_NAMESPACE.get_or_init(|| format!("{NAMESPACE_PREFIX}{}", uuid::Uuid::new_v4().simple()))
+}
 /// The named-400 prefix (`errors::msg::invalid("agent_id", ..)`).
 const INVALID_AGENT_ID_PREFIX: &str = "invalid agent_id:";
 /// One byte past the 128-byte `validate_agent_id` ceiling.
@@ -106,7 +113,7 @@ struct Route {
 
 fn create_body(_: &str) -> Value {
     json!({
-        "namespace": NAMESPACE,
+        "namespace": namespace(),
         "title": "refused create 9616",
         "content": "must never be written",
         "tier": "long",
@@ -123,7 +130,7 @@ fn link_body(id: &str) -> Value {
 }
 
 fn namespace_body(id: &str) -> Value {
-    json!({"namespace": NAMESPACE, "id": id})
+    json!({"namespace": namespace(), "id": id})
 }
 
 fn duplicate_body(_: &str) -> Value {
@@ -168,14 +175,19 @@ fn census_routes() -> Vec<Route> {
         r("GET", "/api/v1/links/{id}", None, false),
         r("GET", "/api/v1/memories/{id}/lineage", None, false),
         r("POST", "/api/v1/namespaces", Some(namespace_body), false),
+        r("DELETE", "/api/v1/namespaces?namespace=ns-9616", None, true),
         r(
-            "DELETE",
-            "/api/v1/namespaces?namespace=ns-9616",
-            None,
-            true,
+            "POST",
+            "/api/v1/check_duplicate",
+            Some(duplicate_body),
+            false,
         ),
-        r("POST", "/api/v1/check_duplicate", Some(duplicate_body), false),
-        r("GET", "/api/v1/entities/by_alias?alias=refused", None, false),
+        r(
+            "GET",
+            "/api/v1/entities/by_alias?alias=refused",
+            None,
+            false,
+        ),
         r("POST", "/api/v1/links/verify", Some(empty_body), false),
         r("POST", "/api/v1/archive", Some(ids_body), true),
         r("DELETE", "/api/v1/archive", None, true),
@@ -363,7 +375,7 @@ async fn create_fixture(router: &axum::Router) -> String {
         "/api/v1/memories",
         &alice(),
         Some(json!({
-            "namespace": NAMESPACE,
+            "namespace": namespace(),
             "title": "fixture 9616",
             "content": "alice owns this row",
             "tier": "long",
@@ -412,8 +424,8 @@ async fn census(app: AppState, backend: &str) -> (Vec<String>, Vec<String>) {
             )
             .await;
             let error = body["error"].as_str().unwrap_or_default();
-            let refused = status == StatusCode::BAD_REQUEST
-                && error.starts_with(INVALID_AGENT_ID_PREFIX);
+            let refused =
+                status == StatusCode::BAD_REQUEST && error.starts_with(INVALID_AGENT_ID_PREFIX);
             let gate_held = gated && status == StatusCode::NOT_IMPLEMENTED;
             let cell = if refused {
                 "400 named"
@@ -494,6 +506,127 @@ async fn postgres_invalid_agent_id_is_one_named_400_on_every_route_9616() {
     report(&table, &broken);
 }
 
+/// Documented prefix of the per-request anonymous principal a request with
+/// NO `X-Agent-Id` header receives (`docs/API_REFERENCE.md`).
+const ANONYMOUS_REQUEST_PREFIX: &str = "anonymous:req-";
+/// Hex length of the per-request suffix after the prefix.
+const ANONYMOUS_SUFFIX_LEN: usize = 8;
+
+/// The WARN `identity::resolve_http_agent_id` emits on its one missing-header
+/// arm; the pin asserts it names the principal it assigned.
+const ANONYMOUS_WARN: &str = "without agent_id body field or X-Agent-Id header; assigned ";
+
+/// In-memory tracing sink for the missing-header WARN pin.
+#[derive(Clone, Default)]
+struct WarnSink(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for WarnSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The split is deliberate: a MISSING header is not refused, it keeps the
+/// documented anonymous default, and two missing-header requests never share
+/// one principal. Pinned per backend so a later change to the missing arm of
+/// `caller_identity` is a visible, tested decision.
+async fn assert_missing_header_stays_anonymous(app: AppState, backend: &str) {
+    let router = router(app);
+    let sink = WarnSink::default();
+    let writer = sink.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || writer.clone())
+        .with_max_level(tracing::Level::WARN)
+        .with_ansi(false)
+        .finish();
+    let _capture = tracing::subscriber::set_default(subscriber);
+    let mut principals = Vec::new();
+    for n in 0..2 {
+        let (status, created) = call(
+            &router,
+            "POST",
+            "/api/v1/memories",
+            &[],
+            Some(json!({
+                "namespace": namespace(),
+                "title": format!("anonymous 9616 {n}"),
+                "content": "no agent header",
+                "tier": "long",
+                "tags": [],
+                "priority": 5,
+                "confidence": 1.0,
+                "source": "api",
+                "metadata": {}
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{backend}: {created}");
+        // sqlite answers a write receipt (`agent_id` at the top level),
+        // postgres the stored memory (`metadata.agent_id`).
+        let agent = created["agent_id"]
+            .as_str()
+            .or_else(|| created["metadata"]["agent_id"].as_str())
+            .unwrap_or_default()
+            .to_string();
+        let suffix = agent
+            .strip_prefix(ANONYMOUS_REQUEST_PREFIX)
+            .unwrap_or_else(|| panic!("{backend}: missing header gave {agent:?}, not anonymous"));
+        assert_eq!(suffix.len(), ANONYMOUS_SUFFIX_LEN, "{backend}: {agent:?}");
+        assert!(
+            suffix.bytes().all(|b| b.is_ascii_hexdigit()),
+            "{backend}: {agent:?}"
+        );
+        principals.push(agent);
+    }
+    assert_ne!(
+        principals[0], principals[1],
+        "{backend}: two anonymous requests shared one principal"
+    );
+    let logs = String::from_utf8_lossy(
+        &sink
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone(),
+    )
+    .into_owned();
+    for agent in &principals {
+        assert!(
+            logs.contains(&format!("{ANONYMOUS_WARN}{agent}")),
+            "{backend}: no missing-header WARN naming {agent}:\n{logs}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn sqlite_missing_agent_id_stays_anonymous_9616() {
+    common::permissive_attestation_for_tests();
+    std::fs::create_dir_all(".local-runs").unwrap();
+    let dir = tempfile::tempdir_in(".local-runs").unwrap();
+    assert_missing_header_stays_anonymous(
+        sqlite_app_state(&dir.path().join("memories.db")),
+        "sqlite",
+    )
+    .await;
+}
+
+#[cfg(feature = "sal-postgres")]
+#[tokio::test]
+async fn postgres_missing_agent_id_stays_anonymous_9616() {
+    let Some(url) = common::postgres_url() else {
+        return;
+    };
+    common::permissive_attestation_for_tests();
+    assert_missing_header_stays_anonymous(postgres_app_state(&url).await, "postgres").await;
+}
+
 /// The one module allowed to read the `X-Agent-Id` header under
 /// `src/handlers`.
 const CALLER_IDENTITY_MODULE: &str = "caller_identity.rs";
@@ -511,6 +644,20 @@ const FORBIDDEN_FORMS: &[(&str, &str)] = &[
     (
         "resolve_http_agent_id(None,header_agent_id).ok()",
         "resolver error folded into None",
+    ),
+    // The sibling class the census found beyond the 26 header sites: the
+    // shared parity resolver with its error folded into a principal.
+    (
+        "resolve_caller_agent_id(None,&headers,None).unwrap_or",
+        "resolver error folded into a fallback",
+    ),
+    (
+        "resolve_caller_agent_id(None,&headers,None).ok()",
+        "resolver error folded into None",
+    ),
+    (
+        "sentinels::ANONYMOUS_INVALID.to_string()",
+        "invalid header folded into the anonymous:invalid principal",
     ),
 ];
 
@@ -540,7 +687,10 @@ fn handlers_read_the_agent_id_header_only_through_caller_identity_9616() {
     );
     let mut offenders = Vec::new();
     for file in &files {
-        let name = file.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+        let name = file
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
         if name == CALLER_IDENTITY_MODULE || name == "tests.rs" || name.ends_with("_tests.rs") {
             continue;
         }
@@ -551,7 +701,9 @@ fn handlers_read_the_agent_id_header_only_through_caller_identity_9616() {
             if hits > 0 {
                 offenders.push(format!(
                     "{} : {hits} x {why} ({form})",
-                    file.strip_prefix(env!("CARGO_MANIFEST_DIR")).unwrap_or(file).display()
+                    file.strip_prefix(env!("CARGO_MANIFEST_DIR"))
+                        .unwrap_or(file)
+                        .display()
                 ));
             }
         }

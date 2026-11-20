@@ -2642,18 +2642,9 @@ async fn sync_push_write(
     }
     // Receiver's local identity — default to the caller-supplied header,
     // fall back to the anonymous placeholder. Recorded in sync_state rows.
-    let header_agent_id = headers
-        .get(crate::HEADER_AGENT_ID)
-        .and_then(|v| v.to_str().ok());
-    let local_agent_id = match crate::identity::resolve_http_agent_id(None, header_agent_id) {
-        Ok(id) => id,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": format!("invalid x-agent-id: {e}")})),
-            )
-                .into_response();
-        }
+    let local_agent_id = match crate::handlers::caller_identity::http_caller(&headers) {
+        Ok(caller) => caller,
+        Err(refusal) => return refusal,
     };
 
     // v0.7.0 S6-LOW2 — observability-only sender_clock skew detection.

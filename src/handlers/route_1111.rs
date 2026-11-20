@@ -313,10 +313,12 @@ pub async fn handle_smart_load_http(
     // applies the scope=private visibility filter (the always-on intent loader
     // must not surface another tenant's private family-tagged rows). Reuses the
     // shared `resolve_caller_agent_id` helper (non-sal-safe, anonymous-fallback
-    // handling lives inside it, not duplicated here); the empty principal owns
-    // no private row.
-    let caller =
-        crate::handlers::parity::resolve_caller_agent_id(None, &headers, None).unwrap_or_default();
+    // handling lives inside it, not duplicated here). #9616 — a resolution
+    // error is the named 400, never the empty principal.
+    let caller = match crate::handlers::caller_identity::http_caller(&headers) {
+        Ok(caller) => caller,
+        Err(refusal) => return refusal,
+    };
     // #3064 lane L-PGP family F2 — postgres SAL dispatch. The family PICK is
     // pure Rust (`mcp::tools::load_family::pick_family_for_intent`) and the
     // family-tagged READ rides the SAME `app.store.list` path
@@ -836,16 +838,18 @@ pub async fn handle_recall_observations_http(
 /// #3232 HTTP disposition (the header-asserted id, anonymous when absent —
 /// the #3549 authority layer has already refused a malformed assertion
 /// before this runs), with an enrolled admin reading trust-all (`None`).
-fn http_read_caller(app: &AppState, headers: &HeaderMap) -> Option<String> {
-    let header_agent_id = headers
-        .get(crate::HEADER_AGENT_ID)
-        .and_then(|v| v.to_str().ok());
-    let caller = crate::identity::resolve_http_agent_id(None, header_agent_id)
-        .unwrap_or_else(|_| crate::identity::anonymous_request_id());
+///
+/// # Errors
+/// The #9616 named `400` when the `X-Agent-Id` header is unusable.
+fn http_read_caller(
+    app: &AppState,
+    headers: &HeaderMap,
+) -> Result<Option<String>, axum::response::Response> {
+    let caller = crate::handlers::caller_identity::http_caller(headers)?;
     if crate::handlers::admin_role::is_admin_caller_trusted(app, headers, &caller) {
-        None
+        Ok(None)
     } else {
-        Some(caller)
+        Ok(Some(caller))
     }
 }
 
@@ -904,7 +908,10 @@ pub async fn handle_reflection_origin_http(
 ) -> impl IntoResponse {
     // #3600 — the same caller gate the MCP handler applies (sqlite arm) /
     // its postgres twin below.
-    let caller = http_read_caller(&app, &headers);
+    let caller = match http_read_caller(&app, &headers) {
+        Ok(caller) => caller,
+        Err(refusal) => return refusal,
+    };
     // Postgres SAL path (#1549): walk reflection origin metadata through
     // `MemoryStore::get_reflection_origin`. Mirrors the sqlite MCP path's
     // `memory_id` validation + response shape + "memory not found" 4xx.
@@ -957,7 +964,10 @@ pub async fn handle_dependents_of_invalidated_http(
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
     // #3599 — the same caller gate the MCP handler applies.
-    let caller = http_read_caller(&app, &headers);
+    let caller = match http_read_caller(&app, &headers) {
+        Ok(caller) => caller,
+        Err(refusal) => return refusal,
+    };
     // #3064 batch B — postgres SAL dispatch. Direct list is
     // `MemoryStore::list_dependents_of_invalidated`; opt-in
     // `transitive` reuses `lineage_descendants` (sqlite
@@ -1323,9 +1333,9 @@ fn resolve_calibrate_http_caller(
     app: &AppState,
     headers: &HeaderMap,
 ) -> Result<CalibrateHttpCaller, axum::response::Response> {
-    let header_present = headers
-        .get(crate::HEADER_AGENT_ID)
-        .and_then(|value| value.to_str().ok())
+    // #9616 — a non-UTF-8 or repeated header is the named 400, not "absent".
+    let header_present = crate::handlers::caller_identity::header_agent_id(headers)
+        .map_err(axum::response::IntoResponse::into_response)?
         .is_some_and(|value| !value.trim().is_empty());
     if !header_present {
         return Err(forbidden_calibrate_caller());
@@ -1464,7 +1474,10 @@ pub async fn handle_verify_http(
 ) -> impl IntoResponse {
     // #3601 — both endpoints must be readable by the caller (the MCP
     // handler's gate on the sqlite arm; its postgres twin below).
-    let caller = http_read_caller(&app, &headers);
+    let caller = match http_read_caller(&app, &headers) {
+        Ok(caller) => caller,
+        Err(refusal) => return refusal,
+    };
     // #3064 — postgres SAL dispatch. `PostgresStore::verify_link` already
     // exists; the gate used to 501 this route so the sqlite MCP handler
     // never ran against the empty scratch db.

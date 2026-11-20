@@ -236,15 +236,13 @@ pub async fn verify_link_handler(
                     // another caller's fingerprints (the module doc's
                     // "eviction-flush attack"), re-opening the replay window
                     // for the victim. Resolve the caller from `X-Agent-Id`
-                    // (like `create_link` / `get_links`), falling back to a
-                    // fresh per-request `anonymous:req-<uuid8>` — an
-                    // anonymous partition can only ever evict itself.
-                    let caller = {
-                        let header_agent_id = headers
-                            .get(crate::HEADER_AGENT_ID)
-                            .and_then(|v| v.to_str().ok());
-                        crate::identity::resolve_http_agent_id(None, header_agent_id)
-                            .unwrap_or_else(|_| crate::identity::anonymous_request_id())
+                    // (like `create_link` / `get_links`); an ABSENT header is
+                    // a fresh per-request `anonymous:req-<uuid8>` — an
+                    // anonymous partition can only ever evict itself — and an
+                    // unusable one is the named 400 (#9616).
+                    let caller = match crate::handlers::caller_identity::http_caller(&headers) {
+                        Ok(caller) => caller,
+                        Err(refusal) => return refusal,
                     };
                     // Empty bytes as the "signature" component —
                     // the resolved link's identity already binds the
@@ -539,7 +537,10 @@ pub async fn create_link(
         // attribution matches the request principal. Pre-fix this
         // hardcoded "ai:http" — every link appeared to come from the
         // legacy daemon principal regardless of caller.
-        let ctx = crate::handlers::parity::http_caller_ctx(&headers, None);
+        let ctx = match crate::handlers::parity::http_caller_ctx(&headers, None) {
+            Ok(ctx) => ctx,
+            Err(refusal) => return refusal,
+        };
         return match app
             .store
             .link_signed(&ctx, &link, app.active_keypair.as_ref().as_ref())
@@ -960,11 +961,10 @@ pub async fn delete_link(
     // action audit. Link delete mutates the graph topology; emit the
     // forensic-chain entry BEFORE the storage write so the audit trail
     // captures intent regardless of downstream success.
-    let header_agent_id = headers
-        .get(crate::HEADER_AGENT_ID)
-        .and_then(|v| v.to_str().ok());
-    let caller = crate::identity::resolve_http_agent_id(None, header_agent_id)
-        .unwrap_or_else(|_| sentinels::ANONYMOUS_INVALID.to_string());
+    let caller = match crate::handlers::caller_identity::http_caller(&headers) {
+        Ok(caller) => caller,
+        Err(refusal) => return refusal,
+    };
     crate::governance::audit::record_decision(
         &caller,
         "allow",
@@ -984,7 +984,10 @@ pub async fn delete_link(
     // edge survived and the caller got a false `{"deleted": false}`.
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
-        let ctx = crate::handlers::parity::http_caller_ctx(&headers, None);
+        let ctx = match crate::handlers::parity::http_caller_ctx(&headers, None) {
+            Ok(ctx) => ctx,
+            Err(refusal) => return refusal,
+        };
         // Owner-gate parity with the sqlite #939 gate below: the caller
         // must own EITHER endpoint (links are symmetric — either party
         // can sever). A missing source memory falls through to
@@ -1174,12 +1177,9 @@ pub async fn get_links(
     // enumerate that memory's outgoing link topology regardless of
     // whether either endpoint memory was scope=private owned by a
     // different agent. Admin callers still apply the substrate gate.
-    let caller = {
-        let header_agent_id = headers
-            .get(crate::HEADER_AGENT_ID)
-            .and_then(|v| v.to_str().ok());
-        crate::identity::resolve_http_agent_id(None, header_agent_id)
-            .unwrap_or_else(|_| crate::identity::anonymous_request_id())
+    let caller = match crate::handlers::caller_identity::http_caller(&headers) {
+        Ok(caller) => caller,
+        Err(refusal) => return refusal,
     };
     let caller_is_admin =
         crate::handlers::admin_role::is_admin_caller_trusted(&app, &headers, &caller);
@@ -1371,12 +1371,9 @@ pub async fn get_lineage(
 
     // Caller resolution + root-visibility gate (the #959/#910 post-filter
     // family `get_links` rides, applied to the walk ROOT).
-    let caller = {
-        let header_agent_id = headers
-            .get(crate::HEADER_AGENT_ID)
-            .and_then(|v| v.to_str().ok());
-        crate::identity::resolve_http_agent_id(None, header_agent_id)
-            .unwrap_or_else(|_| crate::identity::anonymous_request_id())
+    let caller = match crate::handlers::caller_identity::http_caller(&headers) {
+        Ok(caller) => caller,
+        Err(refusal) => return refusal,
     };
     let caller_is_admin =
         crate::handlers::admin_role::is_admin_caller_trusted(&app, &headers, &caller);

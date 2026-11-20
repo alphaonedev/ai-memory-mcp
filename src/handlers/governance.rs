@@ -89,11 +89,10 @@ pub async fn list_pending(
     // legitimate operator queue-view surface. Non-admin callers see
     // only their OWN pending rows; cross-tenant rows are silently
     // dropped (no enumeration / count leak).
-    let header_agent_id = headers
-        .get(crate::HEADER_AGENT_ID)
-        .and_then(|v| v.to_str().ok());
-    let caller = crate::identity::resolve_http_agent_id(None, header_agent_id)
-        .unwrap_or_else(|_| crate::identity::sentinels::ANONYMOUS_INVALID.to_string());
+    let caller = match crate::handlers::caller_identity::http_caller(&headers) {
+        Ok(caller) => caller,
+        Err(refusal) => return refusal,
+    };
     let is_admin = crate::handlers::admin_role::is_admin_caller_trusted(&app, &headers, &caller);
 
     // v0.7.0 Wave-3 Continuation 5 — postgres-backed daemons read
@@ -215,14 +214,18 @@ pub async fn approve_pending(
     ) {
         return resp;
     }
+    // #9616 — the approver header through the one reader: a non-UTF-8
+    // or repeated header is the named 400, never "no approver".
+    let approver_header = match crate::handlers::caller_identity::header_agent_id(&headers) {
+        Ok(header) => header,
+        Err(refusal) => return refusal.into_response(),
+    };
     if let Err(refusal) = super::approvals::verify_approver_bound_hmac(
         &headers,
         &body_bytes,
         "POST",
         &id,
-        headers
-            .get(crate::HEADER_AGENT_ID)
-            .and_then(|v| v.to_str().ok()),
+        approver_header,
     ) {
         return refusal.refuse(&headers, &id, super::approvals::APPROVE_PENDING_ENDPOINT);
     }
@@ -245,18 +248,9 @@ pub async fn approve_pending(
         )
             .into_response();
     }
-    let header_agent_id = headers
-        .get(crate::HEADER_AGENT_ID)
-        .and_then(|v| v.to_str().ok());
-    let agent_id = match crate::identity::resolve_http_agent_id(None, header_agent_id) {
-        Ok(a) => a,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": crate::errors::msg::invalid("agent_id", e)})),
-            )
-                .into_response();
-        }
+    let agent_id = match crate::handlers::caller_identity::http_caller(&headers) {
+        Ok(caller) => caller,
+        Err(refusal) => return refusal,
     };
 
     // #2355 — presented R40 approver signatures ride the request body as
@@ -559,14 +553,18 @@ pub async fn reject_pending(
     ) {
         return resp;
     }
+    // #9616 — the approver header through the one reader: a non-UTF-8
+    // or repeated header is the named 400, never "no approver".
+    let approver_header = match crate::handlers::caller_identity::header_agent_id(&headers) {
+        Ok(header) => header,
+        Err(refusal) => return refusal.into_response(),
+    };
     if let Err(refusal) = super::approvals::verify_approver_bound_hmac(
         &headers,
         &body_bytes,
         "POST",
         &id,
-        headers
-            .get(crate::HEADER_AGENT_ID)
-            .and_then(|v| v.to_str().ok()),
+        approver_header,
     ) {
         return refusal.refuse(&headers, &id, super::approvals::REJECT_PENDING_ENDPOINT);
     }
@@ -589,18 +587,9 @@ pub async fn reject_pending(
         )
             .into_response();
     }
-    let header_agent_id = headers
-        .get(crate::HEADER_AGENT_ID)
-        .and_then(|v| v.to_str().ok());
-    let agent_id = match crate::identity::resolve_http_agent_id(None, header_agent_id) {
-        Ok(a) => a,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": crate::errors::msg::invalid("agent_id", e)})),
-            )
-                .into_response();
-        }
+    let agent_id = match crate::handlers::caller_identity::http_caller(&headers) {
+        Ok(caller) => caller,
+        Err(refusal) => return refusal,
     };
 
     // #913 (security-medium / SOC2, 2026-05-19) — admin governance audit.

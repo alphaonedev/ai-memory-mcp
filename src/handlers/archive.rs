@@ -27,7 +27,6 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::db;
-use crate::identity::sentinels;
 use crate::validate;
 
 use super::AppState;
@@ -154,11 +153,10 @@ pub async fn restore_archive(
     // table back into the live working set; this is a privileged admin
     // operation that must produce a forensic-chain entry BEFORE the
     // storage write.
-    let header_agent_id = headers
-        .get(crate::HEADER_AGENT_ID)
-        .and_then(|v| v.to_str().ok());
-    let caller = crate::identity::resolve_http_agent_id(None, header_agent_id)
-        .unwrap_or_else(|_| sentinels::ANONYMOUS_INVALID.to_string());
+    let caller = match crate::handlers::caller_identity::http_caller(&headers) {
+        Ok(caller) => caller,
+        Err(refusal) => return refusal,
+    };
     crate::governance::audit::record_decision(
         &caller,
         "allow",
@@ -321,11 +319,10 @@ pub async fn purge_archive(
     // deployments must prove "who deleted what when". Forensic-chain
     // entry is emitted BEFORE the destructive write so the audit trail
     // captures the intent even if the storage layer errors.
-    let header_agent_id = headers
-        .get(crate::HEADER_AGENT_ID)
-        .and_then(|v| v.to_str().ok());
-    let caller = crate::identity::resolve_http_agent_id(None, header_agent_id)
-        .unwrap_or_else(|_| sentinels::ANONYMOUS_INVALID.to_string());
+    let caller = match crate::handlers::caller_identity::http_caller(&headers) {
+        Ok(caller) => caller,
+        Err(refusal) => return refusal,
+    };
 
     // #936 (security-critical, 2026-05-20) — caller-vs-row-owner gate.
     // Pre-#936 the SAL trait method took NO caller and the handler
@@ -521,11 +518,10 @@ pub async fn archive_by_ids(
     // into the archived_memories table. Emit the forensic-chain entry
     // BEFORE the storage writes so the audit trail captures the batch
     // and the caller's identity regardless of partial-success behaviour.
-    let header_agent_id = headers
-        .get(crate::HEADER_AGENT_ID)
-        .and_then(|v| v.to_str().ok());
-    let caller = crate::identity::resolve_http_agent_id(None, header_agent_id)
-        .unwrap_or_else(|_| sentinels::ANONYMOUS_INVALID.to_string());
+    let caller = match crate::handlers::caller_identity::http_caller(&headers) {
+        Ok(caller) => caller,
+        Err(refusal) => return refusal,
+    };
     crate::governance::audit::record_decision(
         &caller,
         "allow",

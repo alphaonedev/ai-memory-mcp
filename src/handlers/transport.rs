@@ -1204,11 +1204,13 @@ pub async fn api_key_auth(
     if let Some(agent_id) = per_agent.filter(|_| !cert_governs)
         && auth.identity_mode != crate::config::HttpIdentityMode::Off
     {
-        let header_id = req
-            .headers()
-            .get(crate::HEADER_AGENT_ID)
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string);
+        // #9616 — the header through the one reader, BEFORE the bind below
+        // overwrites it: a non-UTF-8 or repeated header is the named 400,
+        // never silently collapsed into the key-derived principal.
+        let header_id = match crate::handlers::caller_identity::header_agent_id(req.headers()) {
+            Ok(header) => header.map(str::to_string),
+            Err(refusal) => return refusal.into_response(),
+        };
         if let Some(ref hid) = header_id
             && !hid.is_empty()
             && *hid != agent_id

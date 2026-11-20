@@ -384,9 +384,13 @@ pub async fn consolidate_memories(
     // The helper takes `&str` (agent id) rather than the typed
     // `CallerContext` so non-sal builds compile without conditional
     // gating.
-    let consolidate_caller_principal =
-        crate::handlers::parity::resolve_caller_agent_id(None, &headers, None)
-            .unwrap_or_else(|_| crate::identity::sentinels::ANONYMOUS_INVALID.to_string());
+    // #9616 — an unusable header is the named 400, never the
+    // `anonymous:invalid` sentinel principal.
+    let consolidate_caller_principal = match crate::handlers::caller_identity::http_caller(&headers)
+    {
+        Ok(caller) => caller,
+        Err(refusal) => return refusal,
+    };
     // v1.0.0 #3380 — the #905 body-vs-header `agent_id` spoof guard is hoisted
     // to HERE, ahead of the request-shape validation and the source gate below.
     // It is an AUTHENTICATION check: a caller presenting a body principal that
@@ -408,19 +412,9 @@ pub async fn consolidate_memories(
     // breaks the cross-tenant tracking the K9 governance walk leans
     // on. Header-only authentication now; body.agent_id (if present)
     // must match the authenticated caller else 403.
-    let header_agent_id = headers
-        .get(crate::HEADER_AGENT_ID)
-        .and_then(|v| v.to_str().ok());
-    let consolidator_agent_id = match crate::identity::resolve_http_agent_id(None, header_agent_id)
-    {
-        Ok(id) => id,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": crate::errors::msg::invalid("agent_id", e)})),
-            )
-                .into_response();
-        }
+    let consolidator_agent_id = match crate::handlers::caller_identity::http_caller(&headers) {
+        Ok(caller) => caller,
+        Err(refusal) => return refusal,
     };
     if let Some(claimed) = body.agent_id.as_deref()
         && claimed != consolidator_agent_id
@@ -1279,11 +1273,12 @@ pub async fn load_family_handler(
     // rows in a shared namespace. Reuses the shared `resolve_caller_agent_id`
     // helper (non-sal-safe; the postgres branch's `http_caller_ctx` is sal-gated
     // and unavailable on this default-backend path) — the anonymous-fallback
-    // handling lives inside it, not duplicated here. On the rare resolution
-    // error the empty principal owns no private row, so it sees only
-    // scope=shared/public rows.
-    let caller =
-        crate::handlers::parity::resolve_caller_agent_id(None, &headers, None).unwrap_or_default();
+    // handling lives inside it, not duplicated here. #9616 — a resolution
+    // error is the named 400, never the empty principal.
+    let caller = match crate::handlers::caller_identity::http_caller(&headers) {
+        Ok(caller) => caller,
+        Err(refusal) => return refusal,
+    };
     let lock = app.db.lock().await;
     let params = json!({
         "family": family_name,
@@ -1368,7 +1363,7 @@ pub(crate) async fn load_family_rows_via_store(
 
         ..Default::default()
     };
-    let ctx = crate::handlers::parity::http_caller_ctx(headers, None);
+    let ctx = crate::handlers::parity::http_caller_ctx(headers, None)?;
     let narrow = |rows: Vec<Memory>| -> Vec<Memory> {
         let mut kept: Vec<Memory> = rows
             .into_iter()

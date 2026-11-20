@@ -130,18 +130,9 @@ async fn capture_turn_write(
     headers: HeaderMap,
     JsonOrBadRequest(req): JsonOrBadRequest<MemoryCaptureTurnRequest>,
 ) -> impl IntoResponse {
-    let header_agent_id = headers
-        .get(crate::HEADER_AGENT_ID)
-        .and_then(|v| v.to_str().ok());
-    let agent_id = match crate::identity::resolve_http_agent_id(None, header_agent_id) {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "error": e.to_string() })),
-            )
-                .into_response();
-        }
+    let agent_id = match crate::handlers::caller_identity::http_caller(&headers) {
+        Ok(caller) => caller,
+        Err(refusal) => return refusal,
     };
 
     // All validation (agent_id agreement #1413, host-signature

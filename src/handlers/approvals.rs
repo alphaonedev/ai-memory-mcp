@@ -265,11 +265,7 @@ pub(crate) fn audit_signature_refusal(
     endpoint: &'static str,
     reason: &'static str,
 ) {
-    let header_agent_id = headers
-        .get(crate::HEADER_AGENT_ID)
-        .and_then(|v| v.to_str().ok());
-    let actor = crate::identity::resolve_http_agent_id(None, header_agent_id)
-        .unwrap_or_else(|_| crate::identity::sentinels::ANONYMOUS_INVALID.to_string());
+    let actor = crate::handlers::caller_identity::audit_actor(headers);
     crate::governance::audit::record_decision(
         &actor,
         "refuse",
@@ -578,15 +574,15 @@ pub async fn approval_decide(
     Path(id): Path<String>,
     body_bytes: axum::body::Bytes,
 ) -> impl IntoResponse {
-    if let Err(refusal) = verify_approver_bound_hmac(
-        &headers,
-        &body_bytes,
-        "POST",
-        &id,
-        headers
-            .get(crate::HEADER_AGENT_ID)
-            .and_then(|v| v.to_str().ok()),
-    ) {
+    // #9616 — the approver header through the one reader: a non-UTF-8
+    // or repeated header is the named 400, never "no approver".
+    let approver_header = match crate::handlers::caller_identity::header_agent_id(&headers) {
+        Ok(header) => header,
+        Err(refusal) => return refusal.into_response(),
+    };
+    if let Err(refusal) =
+        verify_approver_bound_hmac(&headers, &body_bytes, "POST", &id, approver_header)
+    {
         return refusal.refuse(&headers, &id, APPROVAL_DECIDE_ENDPOINT);
     }
     // #8495: under `identity_mode = enforce` the approver the signature
@@ -617,18 +613,9 @@ pub async fn approval_decide(
         )
             .into_response();
     }
-    let header_agent_id = headers
-        .get(crate::HEADER_AGENT_ID)
-        .and_then(|v| v.to_str().ok());
-    let agent_id = match crate::identity::resolve_http_agent_id(None, header_agent_id) {
-        Ok(a) => a,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": crate::errors::msg::invalid("agent_id", e)})),
-            )
-                .into_response();
-        }
+    let agent_id = match crate::handlers::caller_identity::http_caller(&headers) {
+        Ok(caller) => caller,
+        Err(refusal) => return refusal,
     };
     // #3394 — refuse `remember='forever'` before any sqlite/postgres work
     // so a false-success cannot land a decision (or a synthetic rule).
@@ -1211,13 +1198,15 @@ pub async fn approvals_sse(
     // the historical `host:` bypass in `sse_event_visible_to`). A
     // client passing `X-Agent-Id: host:…` is treated as anonymous
     // (empty subscriber_agent → fail-closed).
-    let subscriber_agent = headers
-        .get(crate::HEADER_AGENT_ID)
-        .and_then(|v| v.to_str().ok())
-        .map(str::trim)
-        .filter(|s| !s.starts_with("host:"))
-        .unwrap_or("")
-        .to_string();
+    // #9616 — a non-UTF-8 or repeated header is the named 400.
+    let subscriber_agent = match crate::handlers::caller_identity::header_agent_id(&headers) {
+        Ok(header) => header,
+        Err(refusal) => return refusal.into_response(),
+    }
+    .map(str::trim)
+    .filter(|s| !s.starts_with("host:"))
+    .unwrap_or("")
+    .to_string();
 
     /// Bridges a `BroadcastStream<ApprovalEvent>` into the
     /// `Stream<Item = Result<Event, Infallible>>` axum's `Sse` requires.

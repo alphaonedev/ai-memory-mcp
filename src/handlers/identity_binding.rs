@@ -775,11 +775,7 @@ pub fn admit_idor_identity(
     headers: &axum::http::HeaderMap,
     endpoint: &str,
 ) -> Result<String, Response> {
-    let header_agent_id = headers
-        .get(crate::HEADER_AGENT_ID)
-        .and_then(|v| v.to_str().ok());
-    let caller = crate::identity::resolve_http_agent_id(None, header_agent_id)
-        .unwrap_or_else(|_| crate::identity::anonymous_request_id());
+    let caller = crate::handlers::caller_identity::http_caller(headers)?;
     match enforce_for_request(enrolled, mode, headers, &caller, endpoint) {
         Some(refusal) => Err(refusal),
         None => Ok(caller),

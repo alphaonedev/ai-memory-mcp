@@ -114,7 +114,11 @@ pub(crate) async fn resolve_pre_event_namespaces(
     let mut out: Vec<String> = Vec::new();
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
-        let ctx = crate::handlers::parity::http_caller_ctx(headers, None);
+        // #9616 — an unusable caller identity resolves no namespace; the
+        // request is refused by its handler's own caller resolution.
+        let Ok(ctx) = crate::handlers::parity::http_caller_ctx(headers, None) else {
+            return Vec::new();
+        };
         for id in ids {
             if let Ok(mem) = app.store.get(&ctx, id).await
                 && !out.contains(&mem.namespace)
@@ -278,9 +282,6 @@ impl CreateFieldError {
 /// principal EXACTLY once for the whole batch (its historical behaviour) while
 /// still sharing the per-row field resolution below.
 pub(crate) fn resolve_create_caller(headers: &HeaderMap) -> Result<String, CreateFieldError> {
-    let header_agent_id = headers
-        .get(crate::HEADER_AGENT_ID)
-        .and_then(|v| v.to_str().ok());
     // #907 (security-high, 2026-05-19) — sibling of #874/#901/#905.
     // The pre-#907 path preferred caller-supplied
     // `body.agent_id` / `metadata.agent_id` over the authenticated
@@ -294,11 +295,15 @@ pub(crate) fn resolve_create_caller(headers: &HeaderMap) -> Result<String, Creat
     // Header-only authentication now; caller-supplied claims (if
     // present) must MATCH the authenticated caller else 403. The
     // metadata stamp is forced to the resolved caller below.
-    crate::identity::resolve_http_agent_id(None, header_agent_id).map_err(|e| CreateFieldError {
-        status: StatusCode::BAD_REQUEST,
-        code: crate::errors::error_codes::VALIDATION_FAILED,
-        field: "agent_id",
-        message: crate::errors::msg::invalid("agent_id", e),
+    // #9616 — the one header reader refuses a non-UTF-8 or repeated
+    // header with the same named message as a malformed one.
+    crate::handlers::caller_identity::resolve_caller(headers, None).map_err(|refusal| {
+        CreateFieldError {
+            status: StatusCode::BAD_REQUEST,
+            code: crate::errors::error_codes::VALIDATION_FAILED,
+            field: crate::handlers::caller_identity::AGENT_ID_FIELD,
+            message: refusal.message().to_string(),
+        }
     })
 }
 

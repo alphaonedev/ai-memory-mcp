@@ -223,16 +223,25 @@ pub async fn sync_since(
     //   0. #8357 — when the mTLS client certificate is bound to an agent
     //      by `AI_MEMORY_MTLS_AGENT_BINDING_MAP`, THAT agent is the caller
     //      (a certificate cannot pull as an id it is not bound to).
+    //   #9616 — the `X-Agent-Id` header through the one reader: a
+    //      non-UTF-8 or repeated header is the named 400, never read as
+    //      absent or as its first value.
+    let header_agent_id = match crate::handlers::caller_identity::header_agent_id(&headers) {
+        Ok(header) => header,
+        Err(refusal) => return refusal.into_response(),
+    };
+    // The local principal the durable per-peer clock row is recorded under
+    // (#2441 below): a malformed header is the same named 400, not a
+    // silently skipped clock update.
+    let local_agent_id = match crate::handlers::caller_identity::http_caller(&headers) {
+        Ok(caller) => caller,
+        Err(refusal) => return refusal,
+    };
     let federation_caller: String = cert_agent
         .as_ref()
         .and_then(|e| e.0.effective_agent_id())
         .or_else(|| peer_header.as_deref().filter(|s| !s.is_empty()))
-        .or_else(|| {
-            headers
-                .get(crate::HEADER_AGENT_ID)
-                .and_then(|v| v.to_str().ok())
-                .filter(|s| !s.is_empty())
-        })
+        .or_else(|| header_agent_id.filter(|s| !s.is_empty()))
         .unwrap_or("")
         .to_string();
 
@@ -449,18 +458,13 @@ pub async fn sync_since(
     // Record the puller as a peer so subsequent incremental push/pull
     // pairs have a durable clock entry. Best-effort; don't fail the
     // response if the side-effect write fails.
-    let header_agent_id = headers
-        .get(crate::HEADER_AGENT_ID)
-        .and_then(|v| v.to_str().ok());
     // #2441 — the durable per-peer clock entry must advance on rows
     // EXAMINED, exactly like the wire cursor. Pre-fix this used
     // `mems.last()` (post namespace + visibility filter), so a window
     // that filtered to empty left the server's own record of the peer's
     // watermark pinned as well — the stall was recorded on BOTH sides.
-    if let (Some(peer), Ok(local_agent_id)) = (
-        q.peer.as_deref(),
-        crate::identity::resolve_http_agent_id(None, header_agent_id),
-    ) && validate::validate_agent_id(peer).is_ok()
+    if let Some(peer) = q.peer.as_deref()
+        && validate::validate_agent_id(peer).is_ok()
         && let Some(watermark) = next_since.as_deref()
         && let Err(e) = db::sync_state_observe(&lock.0, &local_agent_id, peer, watermark)
     {

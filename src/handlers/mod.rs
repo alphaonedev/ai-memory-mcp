@@ -113,6 +113,7 @@ pub mod auth_backoff;
 /// `api_key_auth`; every route registration sits under it).
 pub mod authority;
 pub mod bulk;
+pub mod caller_identity;
 pub mod capture_turn;
 pub mod consolidate_federation;
 pub mod coordination;
