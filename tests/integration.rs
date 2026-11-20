@@ -13961,7 +13961,9 @@ fn format_probe_line_9719(home: &std::path::Path, keys: &std::path::Path, loaded
     let sep = FIXTURE_PROBE_SEP_9719;
     assert!(
         !home.to_string_lossy().contains(sep) && !keys.to_string_lossy().contains(sep),
-        "fixture path carries the probe separator: {home:?} {keys:?}"
+        "fixture path carries the probe separator: {} {}",
+        home.display(),
+        keys.display()
     );
     format!(
         "{FIXTURE_PROBE_LINE_9719}{sep}{}{sep}{}{sep}{loaded}",
