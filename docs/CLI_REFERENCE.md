@@ -921,7 +921,7 @@ These seven subcommands land in v0.6.3.1.
 Universal session-boot CLI primitive. Read-only, fast (no embedder, no
 daemon). A missing `--db` is refused — the file is never created or
 migrated (#3411). A `--db` whose schema stamp is behind this binary is
-refused (not migrated); repair with `ai-memory migrate --in-place` or
+refused (not migrated); repair with `ai-memory --db <path> stats` or
 start the daemon. Always emits a 5-field diagnostic manifest (version, db_path +
 schema_version + memory count, tier with embedder/reranker/llm, latency,
 namespace + loaded count) so the agent and the human always see what
@@ -1168,7 +1168,7 @@ Reflection Health / **LLM Reachability (#1146)** / **Embeddings
 Reachability (#1598)**. Each section is severity-tagged. Read-only —
 never mutates the database. A missing `--db` is reported as Critical
 Storage and is never created (#3434). A `--db` whose schema stamp is
-behind this binary is Critical Storage naming `ai-memory migrate --in-place`
+behind this binary is Critical Storage naming `ai-memory --db <path> stats`
 (or start the daemon); the file is not migrated. Identity reports the resolved
 caller id and whether a signing key for THAT id is enrolled.
 
@@ -1780,7 +1780,7 @@ recovery goes through `memory_recall` / `memory_session_start` instead.
 | `share` | #1095 — copy a memory into `_shared/<from>→<to>/` (same primitive as `memory_share` / `POST /api/v1/share`). |
 | `skill <register\|list\|get\|resource\|export\|promote\|compose\|retire\|delete>` | Cluster E API-2 (#767) — CLI parity for the `memory_skill_*` MCP tools. `export` is **jailed** (#3357): the destination folder must resolve inside the export root — `AI_MEMORY_SKILLS_EXPORT_ROOT` when set, otherwise a `skills-export` directory beside the resolved store (the parent directory of the `--db` path, created `0700` on first export). A `..` component, an absolute path outside the root, or a symlink leading out of it is REFUSED before anything is written; if neither root resolves to an existing directory the export is refused rather than falling back to an unconfined write. Same control as the `AI_MEMORY_SKILLS_IMPORT_ROOT` register jail (#1923). The process working directory is deliberately not the fallback. Substrate errors are mapped onto clap flags (`--id`, `--name`, `--namespace`) at the CLI boundary so `skill retire` never prints `memory_skill_retire requires skill_id` ([#3414](https://github.com/alphaonedev/ai-memory-mcp/issues/3414)). |
 | `namespace <set-standard\|get-standard\|clear-standard\|batman-policy>` | #800 — operator CRUD for the per-namespace standard policy pointer. |
-| `verify-reflection-chain <memory_id>` | L1-3 — walk `reflects_on` edges to depth 0, verify each Ed25519 signature, emit a chain-integrity report. Distinct from `verify-signed-events-chain` and `audit verify`. |
+| `verify-reflection-chain <memory_id>` | L1-3 — walk `reflects_on` edges to depth 0, verify each Ed25519 signature, check the root's content-id, emit a chain-integrity report. Exit `0` verified, `1` root not found or wrong arguments (exit 1 also: the report could not be written), `2` verification failed (an edge signature, the `max_reflection_depth` cap, a root content-id genesis that mismatches or cannot be read, #9505, with `--cid` a swept row that mismatches or cannot be read, #9634, or an input that could not be read at all: the database, the root row, the chain or the sweep query, printed as one `unreadable` document naming the stage and the `error_class`, #9505). `--cid --format json` prints one document with an optional `cid_sweep` field; stored values in text output are escaped and bounded (#9636). Distinct from `verify-signed-events-chain` and `audit verify`. |
 
 ### Additional v0.8.0 subcommands
 
@@ -2037,6 +2037,21 @@ Acceptance-latency measurement #3473 remains open.
 ai-memory inbox row stays the durable record and the `<=60 s` backstop poll
 stays the guarantee — losing the hub degrades wake **latency** and nothing else.
 It opens no database, on either backend.
+
+**Every mode is read-only for the signed ledger**
+([#9562](https://github.com/alphaonedev/ai-memory-mcp/issues/9562)). Serve,
+`--posture` (with `--json` and `--require-admits`) and `--health` (with
+`--json`) write no `signed_events` row, so none of them is a #3354 ledger
+writer, and the boot skips the signing-key setup for them: no key is loaded,
+ensured or generated and no key file is created, even when the home and key
+directory are writable. The forensic sink starts without a key and creates only
+its directory, never a forensic file. Each mode starts for a hub user whose home
+and key directory cannot be written, with its exit code unchanged (`--posture`
+0, `--require-admits` 3 only when the hub admits nobody, `--health` 0 / 2, serve
+0 after a drain). A forensic sink that cannot start prints the one
+`Continuing WITHOUT the forensic audit sink` warning and records no outage row.
+The classification is one exhaustive match, `WakeHubMode::writes_ledger` in
+`src/cli/wake_hub.rs`, shared with the dispatch.
 
 **Identity** ([#3468](https://github.com/alphaonedev/ai-memory-mcp/issues/3468)).
 A hello is admitted only when it presents a scoped `a2a-hub/join/v1`

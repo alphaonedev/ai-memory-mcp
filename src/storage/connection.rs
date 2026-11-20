@@ -1325,7 +1325,7 @@ pub fn open_existing_read_only(path: &Path) -> Result<Connection> {
     // silent migrate (`db::open`). After the read-only funnel, the first
     // query against a missing column failed as raw rusqlite. Probe the
     // stamp and refuse with a typed error naming both versions + the
-    // repair (`ai-memory migrate --in-place` / start the daemon).
+    // repair (the clause of `schema_behind_repair_clause`).
     let stamp = probe_schema_stamp(&conn)?;
     let observed = stamp.version();
     let supported = super::migrations::current_schema_version();
@@ -1565,7 +1565,9 @@ mod tests {
             "refusal must name the slug: {msg}"
         );
         assert!(
-            msg.contains(crate::storage::schema_guard::SCHEMA_BEHIND_REPAIR),
+            msg.contains(&crate::storage::schema_guard::schema_behind_repair_clause(
+                crate::storage::schema_guard::BACKEND_SQLITE
+            )),
             "refusal must name the repair: {msg}"
         );
         let still: i64 = Connection::open(&path)

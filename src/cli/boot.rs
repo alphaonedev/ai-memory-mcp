@@ -341,7 +341,7 @@ enum BootStatus {
     /// v1.0.0 #3411 / #3434 — `open_existing_read_only` refused because the
     /// recorded schema stamp is strictly BEHIND this binary. Distinct from
     /// [`Self::WarnSchemaUnsupported`] (ahead → "install a newer binary"):
-    /// this one names `ai-memory migrate --in-place` / start the daemon,
+    /// this one names the repair clause of `schema_behind_repair_clause`,
     /// because the binary is already the right one and the database needs
     /// the writer funnel.
     WarnSchemaBehind { observed: i64, supported: i64 },
@@ -560,10 +560,11 @@ impl BootManifest {
                 supported,
             } => format!(
                 "db schema v{observed} is behind this binary (v{supported}); \
-                 this read-only verb will not migrate. Repair: `{repair}` or {daemon}. \
+                 this read-only verb will not migrate. {repair}. \
                  Run `ai-memory doctor`.",
-                repair = crate::storage::schema_guard::SCHEMA_BEHIND_REPAIR,
-                daemon = crate::storage::schema_guard::SCHEMA_BEHIND_REPAIR_DAEMON,
+                repair = crate::storage::schema_guard::schema_behind_repair_clause(
+                    crate::storage::schema_guard::BACKEND_SQLITE
+                ),
             ),
         };
 
@@ -1045,13 +1046,13 @@ fn emit_status_header(
                     writeln!(
                         out.stdout,
                         "#   namespace:  {} (db schema v{} is behind this binary \
-                         (v{}); this read-only verb will not migrate. Repair: `{}` \
-                         or {}.)",
+                         (v{}); this read-only verb will not migrate. {}.)",
                         manifest.namespace,
                         observed,
                         supported,
-                        crate::storage::schema_guard::SCHEMA_BEHIND_REPAIR,
-                        crate::storage::schema_guard::SCHEMA_BEHIND_REPAIR_DAEMON,
+                        crate::storage::schema_guard::schema_behind_repair_clause(
+                            crate::storage::schema_guard::BACKEND_SQLITE
+                        ),
                     )?;
                 }
             }
@@ -2097,7 +2098,9 @@ mod tests {
             "expected both versions in the warn: {stdout}"
         );
         assert!(
-            stdout.contains(crate::storage::schema_guard::SCHEMA_BEHIND_REPAIR),
+            stdout.contains(&crate::storage::schema_guard::schema_behind_repair_clause(
+                crate::storage::schema_guard::BACKEND_SQLITE
+            )),
             "expected the repair verb: {stdout}"
         );
         assert!(
