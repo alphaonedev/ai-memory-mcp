@@ -781,7 +781,7 @@ def _rust_cache_site_counts() -> tuple[dict[str, dict[str, int]], list[str]]:
         jobs, unread = _reachable_jobs(wf)
         problems.extend(f"{name}: {problem}" for problem in unread)
         for job_id, _job_wf, job in jobs:
-            count =sum(1 for s in job.steps() if s.uses_name() == RUST_CACHE)
+            count = sum(1 for s in job.steps() if s.uses_name() == RUST_CACHE)
             if count:
                 found.setdefault(name, {})[job_id] = count
     return found, problems
@@ -820,7 +820,7 @@ def _pr_cache_action_failures() -> list[str]:
         failures.extend(f"{name}: {problem}" for problem in unread)
         for job_id, _job_wf, job in jobs:
             for step in job.steps():
-                where =f"{name}:{job_id}: {step.label()}"
+                where = f"{name}:{job_id}: {step.label()}"
                 if step.uses_name() == CACHE_COMBINED:
                     failures.append(f"{where}: actions/cache saves in its post step on every event")
                 if step.uses_name() == CACHE_SAVE and not step.keys.get("if", "").startswith(PUSH_GATE):
@@ -2694,6 +2694,50 @@ class CalledWorkflowSaveScope9745R1(unittest.TestCase):
         texts = _caller_and_inner(steps)
         self.assertEqual(_under_stubs(texts, _shared_key_owners, ["caller.yml"]),
                          {"k": ["caller.yml:call/inner"]})
+
+    def test_shared_key_owners_refuse_an_unreadable_call(self) -> None:
+        texts = _caller_and_inner(
+            FOREIGN_RUST_CACHE_STEP, call=f"  call:\n    uses: {REMOTE_CALL}\n")
+        with self.assertRaises(AssertionError) as caught:
+            _under_stubs(texts, _shared_key_owners, ["caller.yml"])
+        self.assertEqual(str(caught.exception), REMOTE_CALL_PROBLEM)
+
+
+class StrategyStructureRefusals9745R1(unittest.TestCase):
+    """#9745 r1: strategy, matrix and include structure forms the first hand-mutant run found
+    unpinned (each case is red on a mutant that drops its branch)."""
+
+    @staticmethod
+    def _strategy_job(*lines: str) -> Job:
+        return Job("j", ["    runs-on: x", "    strategy:", *lines])
+
+    def test_structure_refusals(self) -> None:
+        include = ["        include:", "          - target: t"]
+        cases = (
+            (["      fail-fast: false", "        extra: 1", "      matrix:", *include],
+             "j: strategy.fail-fast", R_NESTED, "extra: 1"),
+            (["      matrix:", *include, "      matrix:", *include],
+             "j: strategy", R_DUPLICATE, "matrix:"),
+            (["      matrix:", *include, "        include:", "          - target: u"],
+             "j: strategy.matrix", R_DUPLICATE, "include:"),
+            (["        fail-fast: false", "      matrix:", *include],
+             "j: strategy", R_INDENT, "matrix:"),
+            (["      matrix:", "        include:", "          target: t"],
+             "j: strategy.matrix.include", R_INCLUDE_BLOCK, "target: t"),
+            (["      matrix:", "        include:", "          -x: 1"],
+             "j: strategy.matrix.include[0]", R_LINE, "-x: 1"),
+            (["      matrix:", *include, "          cargo_debug: 1"],
+             "j: strategy.matrix.include[0]", R_INDENT, "cargo_debug: 1"),
+        )
+        for lines, where, reason, text in cases:
+            with self.subTest(reason=reason, text=text):
+                with self.assertRaises(UnreadForm) as caught:
+                    _matrix_include(self._strategy_job(*lines))
+                self.assertEqual(str(caught.exception), _unread(where, reason, text))
+
+    def test_a_strategy_without_a_matrix_has_no_legs(self) -> None:
+        self.assertEqual(_matrix_include(self._strategy_job("      fail-fast: false")), [])
+        self.assertEqual(_matrix_include(Job("j", ["    runs-on: x"])), [])
 
 
 class AddSiteFirstWins9746R1(unittest.TestCase):
