@@ -131,7 +131,8 @@ class Base(unittest.TestCase):
         return rc, out
 
     def wrapper_runs(self, host):
-        return [argv for kind, argv, _ in host.calls if kind == 'run' and 'pg_isolated_binary.py' in ' '.join(argv)]
+        return [argv for kind, argv, _ in host.calls
+                if kind == 'run' and 'pg_isolated_binary.py' in ' '.join(argv) and 'run' in argv]
 
 
 class IsolatedPath(Base):
@@ -429,7 +430,8 @@ class Cleanup(Base):
     """I-11: the always() Cleanup step tears this run down again, then proves nothing is left."""
 
     def cleanup(self, host, **env_over):
-        env = dict(self.env, AI_MEMORY_TEST_PG_RUN_ID='rabc', **env_over)
+        env = dict(self.env, AI_MEMORY_TEST_PG_RUN_ID='rabc')
+        env.update(env_over)
         env = {k: v for k, v in env.items() if v is not None}
         buf = io.StringIO()
         with redirect_stdout(buf):
