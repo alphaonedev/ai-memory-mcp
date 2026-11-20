@@ -47,11 +47,11 @@ SCAN_CEILING_S = 5.0
 ADVERSARIAL_BYTES = 120_000
 MAX_NESTING = 64
 MAX_YAML_BYTES = 8 * 1024 * 1024
-FIX_ISSUES = frozenset({9454, 9455, 9456, 9471, 9553})
+FIX_ISSUES = frozenset({9454, 9455, 9456, 9471, 9553, 9570})
 UNCLASSIFIABLE_PREFIX = "unclassifiable: "
 # The hosted job and step that already run the scripts/ci unit tests (I-6).
 HOST_WORKFLOW = "ci.yml"
-HOST_JOB = "classify"
+HOST_JOB = "build-script-vetting"
 HOST_STEP = "Shard partition and wiring unit tests (#6344)"
 HOST_COMMAND = "python3 -m unittest discover -s scripts/ci/tests"
 HOSTED_LABEL = "ubuntu-latest"
@@ -657,7 +657,7 @@ UNREAD_SHELL = (
     ("echo $(", "unterminated command substitution"),
     ("echo ${a", "unterminated parameter expansion"),
 )
-NON_STRICT_UNREAD = ("gh attestation verify x", "gh subcommand 'attestation' is not on the closed list")
+NON_STRICT_UNREAD = ("gh codespace x", "gh subcommand 'codespace' is not on the closed list")
 UNCLOSED_ENTRY = ("a:\n  - 'x\n", "a quoted scalar that does not close: t: line 2: unterminated or multi-line quoted scalar")
 
 
@@ -698,7 +698,9 @@ class HandlerReasons(unittest.TestCase):
         fetch = [tb._Step("get", {"run": "git fetch origin pull/1/head"}, 0)]
         self.assertEqual(tb._pre_scan_fetch(fetch, {}, {}), "step 'get' fetches a pull-request tree")
         self.assertIsNone(tb._pre_scan_fetch([tb._Step("ok", {"run": "echo ok"}, 0)], {}, {}))
-        self.assertIsNone(tb._pre_scan_fetch([tb._Step("uses", {"uses": "./x"}, 0)], {}, {}))
+        # 9566 item 3: a uses: step is a form the pre-scan does not read; it is never skipped.
+        self.assertEqual(tb._pre_scan_fetch([tb._Step("uses", {"uses": "./x"}, 0)], {}, {}),
+                         "step 'uses' uses an action, which the pre-scan does not read")
 
     def test_9452_pre_scan_unread_job_is_analysed_in_full(self) -> None:
         _need_module(self)
@@ -750,6 +752,452 @@ class HandlerReasons(unittest.TestCase):
             with self.subTest(kept=body):
                 source = f"def f():\n    try:\n        g()\n    except ValueError as exc:\n        {body}\n"
                 self.assertEqual(_swallowing_handlers(source), [])
+
+
+# ---------------------------------------------------------------------------------------
+# 9566: a job with no pull-request trigger is trusted-only only when the pre-scan read every
+# run step. Corpus: non-PR event x carrier (step secret, write scope, id token) x one step
+# form the pre-scan does not read; each row is the run text and the exact pre-scan reason.
+# The uses:, shell:, defaults and container forms (9566 item 3) are the corpus of
+# test_ci_tainted_job_boundary_prescan_uses.py.
+# ---------------------------------------------------------------------------------------
+
+UNREAD_STEP = "s"
+UNREAD_EVENTS = ("workflow_dispatch", "push", "schedule")
+UNREAD_SECRET_ENV = "          T: ${{ secrets.X }}\n"
+UNREAD_CARRIERS = (
+    ("step secret", "permissions:\n  contents: read\n", UNREAD_SECRET_ENV),
+    ("write scope", "permissions:\n  contents: write\n", ""),
+    ("id token", "permissions:\n  contents: read\n  id-token: write\n", ""),
+)
+PRE_SCAN_UNREAD = "step 's' cannot be read by the pre-scan: {reason}"
+PRE_SCAN_RUNS = "step 's' runs code from the checked-out tree"
+PRE_SCAN_TREE = "step 's' changes the checked-out tree"
+NO_WORD = "command word {word!r} is not on the closed command list"
+UNREAD_FORMS = (
+    ("gh codespace list", PRE_SCAN_UNREAD.format(reason="gh subcommand 'codespace' is not on the closed list")),
+    ("nfpm package -p deb -f nfpm.yaml -t dist/", PRE_SCAN_UNREAD.format(reason=NO_WORD.format(word="nfpm"))),
+    ("cbindgen --config cbindgen.toml --output x.h", PRE_SCAN_UNREAD.format(reason=NO_WORD.format(word="cbindgen"))),
+    ("rpmbuild -bs x.spec", PRE_SCAN_UNREAD.format(reason=NO_WORD.format(word="rpmbuild"))),
+    ("unknowntool x", PRE_SCAN_UNREAD.format(reason=NO_WORD.format(word="unknowntool"))),
+    ("timeout 60 sudo nfpm package", PRE_SCAN_UNREAD.format(reason=NO_WORD.format(word="nfpm"))),
+    ('X="$(cbindgen --version)"', PRE_SCAN_UNREAD.format(reason=NO_WORD.format(word="cbindgen"))),
+    ("f() { rpmbuild -bs x.spec; }\nf", PRE_SCAN_UNREAD.format(reason=NO_WORD.format(word="rpmbuild"))),
+    ("bash -c 'unknowntool x'", PRE_SCAN_UNREAD.format(reason=NO_WORD.format(word="unknowntool"))),
+    ("./build.sh", PRE_SCAN_RUNS),
+    ("git reset --hard HEAD~1", PRE_SCAN_TREE),
+)
+
+
+def _unread_workflow(event: str, perms: str, env: str, run: str) -> str:
+    return _wf(CHECKOUT + _run_step(UNREAD_STEP, run, env), on=event, perms=perms)
+
+
+class PreScanReadsEveryRunStep(unittest.TestCase):
+    """9566: the pre-scan returns trusted-only for a job only when it read every run step."""
+
+    def test_9566_pre_scan_names_the_first_step_it_did_not_read(self) -> None:
+        _need_module(self)
+        for run, reason in UNREAD_FORMS:
+            with self.subTest(run=run):
+                steps = [tb._Step("first", {"run": "echo ok"}, 0), tb._Step(UNREAD_STEP, {"run": run}, 1)]
+                self.assertEqual(tb._pre_scan_fetch(steps, {}, {}), reason)
+
+    def test_9566_unread_run_step_is_never_trusted_only(self) -> None:
+        _need_module(self)
+        for event in UNREAD_EVENTS:
+            for carrier, perms, env in UNREAD_CARRIERS:
+                for run, _ in UNREAD_FORMS:
+                    with self.subTest(event=event, carrier=carrier, run=run):
+                        result = _scan(_unread_workflow(event, perms, env, run))
+                        self.assertNotEqual(result.verdicts.get((SYNTH, JOB)), "trusted-only")
+
+
+# 9566 F1: a run key that is present and is not non-empty text. Each row: name, the YAML text
+# after `run:`, the value the reader gives, the exact pre-scan reason, the full-analysis verdict.
+# The expected set is written by hand; it does not come from the code under test.
+RUN_NOT_TEXT = "run is not text"
+RUN_EMPTY = "run is empty text"
+RUN_NOT_TEXT_ROW = f"{SYNTH}/{JOB}: step {UNREAD_STEP!r}: {RUN_NOT_TEXT}"
+VERDICT_UNCLASSIFIABLE = "unclassifiable"
+VERDICT_NO_PR_CODE = "no-pr-code"
+VERDICT_TRUSTED_ONLY = "trusted-only"
+# A blank the shell lexer does not skip is an unread command word: the job is a finding, by carrier.
+# Written by hand: (i) a secret held by the job, (ii) a write scope or id-token for a tainted job.
+VERDICT_FINDING_BY_CARRIER = {"step secret": "i", "write scope": "ii", "id token": "ii"}
+RUN_FORMS = (
+    ("int", "5", 5, RUN_NOT_TEXT, VERDICT_UNCLASSIFIABLE),
+    ("negative int", "-1", -1, RUN_NOT_TEXT, VERDICT_UNCLASSIFIABLE),
+    ("float", "1.5", 1.5, RUN_NOT_TEXT, VERDICT_UNCLASSIFIABLE),
+    ("empty string", '""', "", RUN_EMPTY, VERDICT_NO_PR_CODE),
+    ("whitespace string", '"   "', "   ", RUN_EMPTY, VERDICT_NO_PR_CODE),
+    ("single-quoted whitespace", "'  '", "  ", RUN_EMPTY, VERDICT_NO_PR_CODE),
+    # 9566 r2 L1: every blank form of str.strip() with no argument, alone and mixed. The YAML
+    # text uses double-quoted escapes; the value column is the character itself. The pre-scan
+    # reason is RUN_EMPTY for every row. The full analysis reads only space, tab and newline as
+    # an empty step (taint_boundary.py _Sh._lex); any other blank is an unread command word, so
+    # its job is a finding by carrier (a shell would run that word as a command).
+    ("tab only", '"\\t"', "\t", RUN_EMPTY, VERDICT_NO_PR_CODE),
+    ("newline only", '"\\n"', "\n", RUN_EMPTY, VERDICT_NO_PR_CODE),
+    ("mixed space tab newline", '" \\t\\n"', " \t\n", RUN_EMPTY, VERDICT_NO_PR_CODE),
+    ("crlf only", '"\\r\\n"', "\r\n", RUN_EMPTY, VERDICT_FINDING_BY_CARRIER),
+    ("vertical tab", '"\\u000b"', "\x0b", RUN_EMPTY, VERDICT_FINDING_BY_CARRIER),
+    ("form feed", '"\\u000c"', "\x0c", RUN_EMPTY, VERDICT_FINDING_BY_CARRIER),
+    ("file separator", '"\\u001c"', "\x1c", RUN_EMPTY, VERDICT_FINDING_BY_CARRIER),
+    ("group separator", '"\\u001d"', "\x1d", RUN_EMPTY, VERDICT_FINDING_BY_CARRIER),
+    ("record separator", '"\\u001e"', "\x1e", RUN_EMPTY, VERDICT_FINDING_BY_CARRIER),
+    ("unit separator", '"\\u001f"', "\x1f", RUN_EMPTY, VERDICT_FINDING_BY_CARRIER),
+    ("next line", '"\\u0085"', "\x85", RUN_EMPTY, VERDICT_FINDING_BY_CARRIER),
+    ("no-break space", '" "', " ", RUN_EMPTY, VERDICT_FINDING_BY_CARRIER),
+    ("ogham space mark", '" "', " ", RUN_EMPTY, VERDICT_FINDING_BY_CARRIER),
+    ("em space", '" "', " ", RUN_EMPTY, VERDICT_FINDING_BY_CARRIER),
+    ("line separator", '" "', " ", RUN_EMPTY, VERDICT_FINDING_BY_CARRIER),
+    ("paragraph separator", '" "', " ", RUN_EMPTY, VERDICT_FINDING_BY_CARRIER),
+    ("narrow no-break space", '" "', " ", RUN_EMPTY, VERDICT_FINDING_BY_CARRIER),
+    ("medium mathematical space", '" "', " ", RUN_EMPTY, VERDICT_FINDING_BY_CARRIER),
+    ("ideographic space", '"　"', "　", RUN_EMPTY, VERDICT_FINDING_BY_CARRIER),
+    ("mixed unicode blanks", '" \\t 　 "', " \t 　 ", RUN_EMPTY, VERDICT_FINDING_BY_CARRIER),
+    ("flow list", "[echo a]", ["echo a"], RUN_NOT_TEXT, VERDICT_UNCLASSIFIABLE),
+    ("block list", "\n          - echo a", ["echo a"], RUN_NOT_TEXT, VERDICT_UNCLASSIFIABLE),
+    ("flow map", "{a: b}", {"a": "b"}, RUN_NOT_TEXT, VERDICT_UNCLASSIFIABLE),
+    ("block map", "\n          a: b", {"a": "b"}, RUN_NOT_TEXT, VERDICT_UNCLASSIFIABLE),
+    ("null", "null", None, RUN_NOT_TEXT, VERDICT_UNCLASSIFIABLE),
+    ("tilde null", "~", None, RUN_NOT_TEXT, VERDICT_UNCLASSIFIABLE),
+    ("empty value", "", None, RUN_NOT_TEXT, VERDICT_UNCLASSIFIABLE),
+    ("true", "true", True, RUN_NOT_TEXT, VERDICT_UNCLASSIFIABLE),
+    ("false", "false", False, RUN_NOT_TEXT, VERDICT_UNCLASSIFIABLE),
+)
+RUN_FORM_NAMES = frozenset({"int", "negative int", "float", "empty string", "whitespace string",
+                            "single-quoted whitespace", "tab only", "newline only", "crlf only",
+                            "mixed space tab newline", "vertical tab", "form feed", "file separator",
+                            "group separator", "record separator", "unit separator",
+                            "next line", "no-break space", "ogham space mark", "em space",
+                            "line separator", "paragraph separator", "narrow no-break space",
+                            "medium mathematical space", "ideographic space", "mixed unicode blanks",
+                            "flow list", "block list", "flow map", "block map",
+                            "null", "tilde null", "empty value", "true", "false"})
+RUN_FORM_BULK_ITEMS = 30_000
+
+
+def _run_value_workflow(event: str, perms: str, env: str, value: str) -> str:
+    env_block = f"        env:\n{env}" if env else ""
+    step = f"      - name: {UNREAD_STEP}\n{env_block}        run: {value}\n"
+    return _wf(CHECKOUT + step, on=event, perms=perms)
+
+
+class PreScanRefusesRunThatIsNotText(unittest.TestCase):
+    """9566 F1: a present run key that is not non-empty text never leaves a job trusted-only."""
+
+    def test_9566_run_form_table_is_the_hand_written_set(self) -> None:
+        self.assertEqual({name for name, *_ in RUN_FORMS}, RUN_FORM_NAMES)
+        self.assertEqual(len(RUN_FORMS), len(RUN_FORM_NAMES))
+        for name, _, _, _, verdict in RUN_FORMS:
+            expected = set(verdict.values()) if isinstance(verdict, dict) else {verdict}
+            self.assertNotIn(VERDICT_TRUSTED_ONLY, expected, name)
+
+    def test_9566_reader_gives_the_value_of_each_run_form(self) -> None:
+        _need_module(self)
+        for name, value, expected, _, _ in RUN_FORMS:
+            with self.subTest(form=name):
+                doc = tb.parse_yaml(_run_value_workflow("push", "", "", value), SYNTH)
+                self.assertEqual(doc["jobs"][JOB]["steps"][1]["run"], expected)
+
+    def test_9566_pre_scan_names_each_run_form_with_its_exact_reason(self) -> None:
+        _need_module(self)
+        for name, _, run, reason, _ in RUN_FORMS:
+            with self.subTest(form=name):
+                steps = [tb._Step("first", {"run": "echo ok"}, 0), tb._Step(UNREAD_STEP, {"run": run}, 1)]
+                self.assertEqual(tb._pre_scan_fetch(steps, {}, {}), PRE_SCAN_UNREAD.format(reason=reason))
+
+    def test_9566_run_form_is_never_trusted_only(self) -> None:
+        _need_module(self)
+        for event in UNREAD_EVENTS:
+            for carrier, perms, env in UNREAD_CARRIERS:
+                for name, value, _, _, verdict in RUN_FORMS:
+                    with self.subTest(event=event, carrier=carrier, form=name):
+                        result = _scan(_run_value_workflow(event, perms, env, value))
+                        expected = verdict[carrier] if isinstance(verdict, dict) else verdict
+                        got = result.verdicts.get((SYNTH, JOB))
+                        self.assertNotEqual(got, VERDICT_TRUSTED_ONLY)
+                        self.assertEqual(got, expected)
+                        expected_rows = [RUN_NOT_TEXT_ROW] if expected == VERDICT_UNCLASSIFIABLE else []
+                        self.assertEqual(result.unclassifiable, expected_rows)
+
+    def test_9566_uses_step_is_never_skipped_by_the_pre_scan(self) -> None:
+        # H1 (uses: steps, no run key), closed by lane boundary-prescan-uses-steps-fail-closed: the
+        # pre-scan names the step and the job goes to the full analysis.
+        _need_module(self)
+        self.assertEqual(tb._pre_scan_fetch([tb._Step("u", {"uses": "./x"}, 0)], {}, {}),
+                         "step 'u' uses an action, which the pre-scan does not read")
+
+    def test_9566_large_run_forms_are_refused_in_bounded_time(self) -> None:
+        # The full analysis reads every job (9566 item 3), so the verdict alone no longer shows a
+        # pre-scan that passes a large form over; the pre-scan reason of the read value is checked too.
+        _need_module(self)
+        bulk = (("flow list", "[" + ", ".join(["a"] * RUN_FORM_BULK_ITEMS) + "]", RUN_NOT_TEXT,
+                 VERDICT_UNCLASSIFIABLE),
+                ("whitespace string", '"' + " " * ADVERSARIAL_BYTES + '"', RUN_EMPTY, VERDICT_NO_PR_CODE))
+        for name, value, reason, verdict in bulk:
+            with self.subTest(form=name):
+                self.assertGreaterEqual(len(value), ADVERSARIAL_BYTES // 2)
+                text = _run_value_workflow("push", "permissions:\n  contents: write\n", "", value)
+                start = time.monotonic()
+                result = _scan(text)
+                run = tb.parse_yaml(text, SYNTH)["jobs"][JOB]["steps"][1]["run"]
+                got_reason = tb._pre_scan_fetch([tb._Step(UNREAD_STEP, {"run": run}, 0)], {}, {})
+                self.assertLess(time.monotonic() - start, SCAN_CEILING_S)
+                self.assertGreaterEqual(len(run), RUN_FORM_BULK_ITEMS)
+                self.assertEqual(got_reason, PRE_SCAN_UNREAD.format(reason=reason))
+                self.assertEqual(result.verdicts.get((SYNTH, JOB)), verdict)
+
+
+# 9566: the array-literal form at every site of the workflows (the element text is data).
+ARRAY_DATA_FORMS = (
+    "declare -A ABI_OF=(\n  [aarch64-linux-android]=arm64-v8a\n  [i686-linux-android]=x86\n)\necho ok",
+    "TESTS=(\n  --test a\n  --test b # a comment\n)",
+    'SUITE_SECONDS+=("${elapsed}"$\'\\t\'"${label}")',
+    "local part_1=() part_2=() line expect=4 meta_rc=0",
+    "local -a SUITE_SECONDS=()",
+    'part_1+=("$line")',
+    "sel=()",
+    "itargs=(); libargs=()",
+    'sel+=("$tflag" "$tname")',
+    'libargs+=(--skip "$l")',
+    "ARGS=(--lib)",
+    'ARGS+=(--test "$t")',
+    "local -A M=( [k]=v )",
+    "typeset -a T=( x y )",
+    "readonly R=( x )",
+    "export E=( x )",
+)
+# A command substitution inside an element is still run and read: (text, strict reason or None
+# when the text runs tree code).
+ARRAY_SUB_FORMS = (
+    ('x=( "$(nfpm --version)" )', NO_WORD.format(word="nfpm")),
+    ('declare -A M=( [k]="$(unknowntool)" )', NO_WORD.format(word="unknowntool")),
+    ('x=( a "$(./build.sh)" )', None),
+    ("local -a A=( `./build.sh` )", None),
+)
+ARRAY_BROKEN_FORMS = (
+    ("x=( a b", "unterminated array literal"),
+    ("x=( a ; b )", "array literal holds ';'"),
+    ("x=( a | b )", "array literal holds '|'"),
+    ("x=( ( a ) )", "array literal holds '('"),
+)
+# Outside an assignment or a declaring command the parenthesis is a subshell, read as before.
+ARRAY_NOT_DECLARED = ("echo a=(b)", NO_WORD.format(word="b"))
+ARRAY_SCAN_ELEMENTS = 12_000
+
+
+class ArrayLiteralIsData(unittest.TestCase):
+    """9566: `NAME=( ... )` and `declare -A NAME=( ... )` elements are data, their substitutions run."""
+
+    def test_9566_array_elements_are_data(self) -> None:
+        _need_module(self)
+        for text in ARRAY_DATA_FORMS:
+            for strict in (True, False):
+                with self.subTest(text=text, strict=strict):
+                    ctx = tb._ShellCtx(strict=strict)
+                    self.assertFalse(tb._shell_runs_pr_code(tb._joined(text, tb.MARK), ctx))
+                    self.assertEqual(ctx.unread, [])
+
+    def test_9566_array_element_substitution_is_read(self) -> None:
+        _need_module(self)
+        for text, reason in ARRAY_SUB_FORMS:
+            with self.subTest(text=text):
+                if reason is None:
+                    self.assertTrue(_classify(text))
+                    continue
+                with self.assertRaises(tb.Unclassifiable) as caught:
+                    _classify(text)
+                self.assertEqual(str(caught.exception), reason)
+
+    def test_9566_array_literal_of_another_form_is_unclassifiable(self) -> None:
+        _need_module(self)
+        for text, reason in ARRAY_BROKEN_FORMS + (ARRAY_NOT_DECLARED,):
+            with self.subTest(text=text):
+                with self.assertRaises(tb.Unclassifiable) as caught:
+                    _classify(text)
+                self.assertEqual(str(caught.exception), reason)
+
+    def test_9566_array_literal_scan_is_linear(self) -> None:
+        _need_module(self)
+        body = "".join(f"  [key{i:06d}]=value{i:06d}\n" for i in range(ARRAY_SCAN_ELEMENTS))
+        text = f"declare -A M=(\n{body})\necho ok"
+        self.assertGreaterEqual(len(text), ADVERSARIAL_BYTES * 2)
+        started = time.perf_counter()
+        self.assertFalse(_classify(text))
+        self.assertLess(time.perf_counter() - started, SCAN_CEILING_S)
+
+
+# 9566: the closed-list entries of the release tools, each in its exact form.
+CLOSED_FORMS_READ = (
+    "timeout 180 sudo apt-get update && timeout 180 sudo apt-get install -y pipx",
+    "sudo apt-get install -y --no-install-recommends rpm jq",
+    "apt-get update -qq",
+    "sudo apt-get autoremove --purge -y         || true",
+    "sudo apt-get clean",
+    "apt-get clean -q",
+    "rpm --version",
+    "lipo -create a.a b.a -output c.a",
+    "copr-cli build alpha-one-ai/ai-memory ~/rpmbuild/SRPMS/ai-memory-*.src.rpm",
+    "gh attestation verify dist/x --repo o/r",
+)
+CLOSED_FORMS_REFUSED = (
+    ("apt-get source x", "apt-get subcommand 'source' is not on the closed list"),
+    ("apt-get build-dep x", "apt-get subcommand 'build-dep' is not on the closed list"),
+    ("apt-get install --purge x", "apt-get option '--purge' is not on the closed option list"),
+    ("apt-get clean --purge", "apt-get option '--purge' is not on the closed option list"),
+    ("apt-get autoremove --purge -y x", "apt-get operand 'x' is not a package name"),
+    ("apt-get clean x", "apt-get operand 'x' is not a package name"),
+    ("apt-get", "apt-get subcommand '' is not on the closed list"),
+    ("apt-get install -o APT::Update::Pre-Invoke::=x a", "apt-get option '-o' is not on the closed option list"),
+    ("apt-get install -y ./x.deb", "apt-get operand './x.deb' is not a package name"),
+    ("apt-get install x.deb", "apt-get operand 'x.deb' is not a package name"),
+    ("apt-get install dist/x", "apt-get operand 'dist/x' is not a package name"),
+    # 9566 F2: apt reads a dot-led operand with no slash and no .deb suffix as a path in the tree.
+    ("apt-get install .", "apt-get operand '.' is not a package name"),
+    ("apt-get install -y ..", "apt-get operand '..' is not a package name"),
+    ("apt-get install .x", "apt-get operand '.x' is not a package name"),
+    ('apt-get install "$P"', "apt-get operand '$P' is not a package name"),
+    ("apt-get update rpm", "apt-get operand 'rpm' is not a package name"),
+    ("rpm -i x.rpm", "rpm form 'rpm -i x.rpm' is not on the closed list"),
+    ("rpm --version x", "rpm form 'rpm --version x' is not on the closed list"),
+    ("rpm", "rpm form 'rpm' is not on the closed list"),
+    ("copr-cli create x", "copr-cli subcommand 'create' is not on the closed list"),
+    ("copr-cli", "copr-cli subcommand '' is not on the closed list"),
+    ("gh attestation download x", "gh attestation subcommand 'download' is not on the closed list"),
+    ("gh attestation", "gh attestation subcommand '' is not on the closed list"),
+)
+# The release tools that run tree code or templates keep no entry.
+CLOSED_FORMS_NO_ENTRY = ("nfpm", "cbindgen", "rpmbuild")
+
+
+class ClosedListEntries(unittest.TestCase):
+    """9566: apt-get update/install/autoremove/clean, rpm --version, lipo, copr-cli build,
+    gh attestation verify."""
+
+    def test_9566_closed_entry_form_is_read(self) -> None:
+        _need_module(self)
+        for text in CLOSED_FORMS_READ:
+            for strict in (True, False):
+                with self.subTest(text=text, strict=strict):
+                    ctx = tb._ShellCtx(strict=strict)
+                    self.assertFalse(tb._shell_runs_pr_code(tb._joined(text, tb.MARK), ctx))
+                    self.assertEqual(ctx.unread, [])
+
+    def test_9566_closed_entry_other_form_is_not_read(self) -> None:
+        _need_module(self)
+        for text, reason in CLOSED_FORMS_REFUSED:
+            with self.subTest(text=text):
+                with self.assertRaises(tb.Unclassifiable) as caught:
+                    _classify(text)
+                self.assertEqual(str(caught.exception), reason)
+                ctx = tb._ShellCtx(strict=False)
+                self.assertFalse(tb._shell_runs_pr_code(tb._joined(text, tb.MARK), ctx))
+                self.assertEqual(ctx.unread, [reason])
+
+    def test_9566_tree_code_tools_have_no_entry(self) -> None:
+        _need_module(self)
+        for name in CLOSED_FORMS_NO_ENTRY:
+            with self.subTest(name=name):
+                self.assertIsNone(tb._command_handler(name))
+
+    def test_9566_lipo_unbinds_the_paths_it_writes(self) -> None:
+        _need_module(self)
+        self.assertIn("lipo", tb.PATH_WRITERS)
+
+
+# 9566: cargo publish builds the checked-out tree; the job trigger decides what that code is.
+PUBLISH_RUN = "cargo publish"
+PUBLISH_SECRET_ENV = "          TOKEN: ${{ secrets.RELEASE_TOKEN }}\n"
+PUBLISH_SECRET_DETAIL = "secret or token used after pull-request code ran"
+
+
+class PackagePublishRunsTreeCode(unittest.TestCase):
+    """9566: cargo publish runs code from the checked-out tree: no-pr-code in a push job, the
+    taint step in a pull_request job."""
+
+    def _publish(self, event: str) -> object:
+        return _scan(_wf(CHECKOUT + _run_step(UNREAD_STEP, PUBLISH_RUN, PUBLISH_SECRET_ENV), on=event))
+
+    def test_9566_cargo_publish_in_a_push_job_runs_no_pr_code(self) -> None:
+        _need_module(self)
+        steps = [tb._Step(UNREAD_STEP, {"run": PUBLISH_RUN}, 0)]
+        self.assertEqual(tb._pre_scan_fetch(steps, {}, {}), PRE_SCAN_RUNS)
+        result = self._publish("push")
+        self.assertEqual(result.verdicts.get((SYNTH, JOB)), "no-pr-code")
+        self.assertIsNone(result.taint_steps.get((SYNTH, JOB)))
+        self.assertEqual(result.violations, [])
+
+    def test_9566_cargo_publish_in_a_pull_request_job_is_the_taint_step(self) -> None:
+        _need_module(self)
+        self.assertTrue(_classify(PUBLISH_RUN))
+        result = self._publish("pull_request")
+        self.assertEqual(result.verdicts.get((SYNTH, JOB)), "i")
+        self.assertEqual(result.taint_steps.get((SYNTH, JOB)), UNREAD_STEP)
+        self.assertEqual([(v.step, v.klass, v.detail) for v in result.violations],
+                         [(UNREAD_STEP, "i", PUBLISH_SECRET_DETAIL)])
+
+
+# 9566: a non-strict job records every command word it does not read (text, unread reasons).
+NON_STRICT_OFF_LIST = (
+    ("nfpm package -p rpm", [NO_WORD.format(word="nfpm")]),
+    ("unknowntool x && echo ok", [NO_WORD.format(word="unknowntool")]),
+    ('x=( "$(cbindgen --version)" )', [NO_WORD.format(word="cbindgen")]),
+    ("rpmbuild -bs x.spec; gh codespace x",
+     [NO_WORD.format(word="rpmbuild"), "gh subcommand 'codespace' is not on the closed list"]),
+    ("f() { echo ok; }\nf", []),
+    ("echo ok", []),
+)
+
+
+# 9566: the class a step with an unread command takes, by carrier.
+UNREAD_CARRIER_CLASS = {"step secret": "i", "write scope": "ii", "id token": "ii"}
+# The UNREAD_FORMS rows that leave a reason on ctx.unread (the last two run or change the base tree).
+UNREAD_TAINT_FORMS = UNREAD_FORMS[:-2]
+UNREAD_SCRIPT_ACTION = "reactivecircus/android-emulator-runner@v2"
+
+
+class UnreadStepIsATaintStep(unittest.TestCase):
+    """9566: _analyse_step carries ctx.unread, and a step with any unread command is a taint step."""
+
+    def test_9566_step_facts_carry_the_unread_reasons(self) -> None:
+        _need_module(self)
+        step = tb._Step(UNREAD_STEP, {"run": "nfpm package; gh codespace x"}, 0)
+        facts = tb._analyse_step(step, {}, {}, set(), False, False)
+        self.assertEqual(facts.unread, [NO_WORD.format(word="nfpm"),
+                                        "gh subcommand 'codespace' is not on the closed list"])
+        clean = tb._analyse_step(tb._Step(UNREAD_STEP, {"run": "echo ok"}, 0), {}, {}, set(), False, False)
+        self.assertEqual(clean.unread, [])
+        # The script input of an action is read by the same reader and carries its unread reasons.
+        scripted = tb._Step(UNREAD_STEP, {"uses": UNREAD_SCRIPT_ACTION, "with": {"script": "nfpm package"}}, 0)
+        self.assertEqual(tb._analyse_step(scripted, {}, {}, set(), False, False).unread,
+                         [NO_WORD.format(word="nfpm")])
+
+    def test_9566_unread_step_takes_the_class_of_its_carrier(self) -> None:
+        _need_module(self)
+        for event in UNREAD_EVENTS:
+            for carrier, perms, env in UNREAD_CARRIERS:
+                for run, _ in UNREAD_TAINT_FORMS:
+                    with self.subTest(event=event, carrier=carrier, run=run):
+                        result = _scan(_unread_workflow(event, perms, env, run))
+                        klass = UNREAD_CARRIER_CLASS[carrier]
+                        self.assertEqual(result.verdicts.get((SYNTH, JOB)), klass)
+                        self.assertEqual(result.taint_steps.get((SYNTH, JOB)), UNREAD_STEP)
+                        self.assertEqual([(v.step, v.klass) for v in result.violations], [(UNREAD_STEP, klass)])
+
+
+class NonStrictUnreadWords(unittest.TestCase):
+    """9566: _dispatch records a word off the closed list and a handler refusal on ctx.unread."""
+
+    def test_9566_non_strict_off_list_word_is_unread(self) -> None:
+        _need_module(self)
+        for text, unread in NON_STRICT_OFF_LIST:
+            with self.subTest(text=text):
+                ctx = tb._ShellCtx(strict=False)
+                self.assertFalse(tb._shell_runs_pr_code(tb._joined(text, tb.MARK), ctx))
+                self.assertEqual(ctx.unread, unread)
 
 
 class HostedGuard(unittest.TestCase):

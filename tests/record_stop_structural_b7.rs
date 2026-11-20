@@ -49,7 +49,7 @@ use std::collections::{HashMap, HashSet};
 
 #[path = "common/cfg_test_modules.rs"]
 mod cfg_test_modules;
-use cfg_test_modules::cfg_test_declared_files;
+use cfg_test_modules::{cfg_test_declared_files, strip_cfg_test_inline_mods};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -390,15 +390,12 @@ fn walk_rs(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-fn strip_test_mod(src: &str) -> &str {
-    // Only drop a trailing `#[cfg(test)] mod tests { … }` so in-file
-    // `#[cfg(test)]` helpers earlier in a large module are not mistaken
-    // for the end of production code (storage/mod.rs, postgres.rs).
-    let needle = "\n#[cfg(test)]\nmod tests {";
-    if let Some(idx) = src.rfind(needle) {
-        return &src[..idx];
-    }
-    src
+/// #9367 r1 Class B: the production text is the shared resolver's (#4198):
+/// every inline test-only module body removed, every other line kept, so
+/// production code after a test module is still scanned and a test helper
+/// earlier in a large module is never mistaken for the end of the file.
+fn strip_test_mod(src: &str) -> String {
+    strip_cfg_test_inline_mods(src)
 }
 
 fn skip_path(rel: &str) -> bool {
@@ -716,7 +713,7 @@ fn fn_gate_verdicts(
     fn_name: &str,
     start_of: impl Fn(&str) -> Option<(usize, String)>,
 ) -> Vec<bool> {
-    let text = join_string_continuations(strip_test_mod(src));
+    let text = join_string_continuations(&strip_test_mod(src));
     let mask = code_mask(&text);
     let masked: Vec<&str> = mask.lines().collect();
     let spans = fn_spans(&masked, start_of);
@@ -1230,7 +1227,7 @@ fn record_stop_write_sql_fns_are_gated_or_allowlisted_b7() {
         let Ok(raw) = fs::read_to_string(&path) else {
             continue;
         };
-        let text = join_string_continuations(strip_test_mod(&raw));
+        let text = join_string_continuations(&strip_test_mod(&raw));
         let lines: Vec<&str> = text.lines().collect();
 
         // Pair every write-SQL line with the nearest preceding `fn`

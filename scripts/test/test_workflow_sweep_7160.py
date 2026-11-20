@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Pin the #7160 target-cap sweep wiring in the CI workflows.
 
-Read from the workflow text (stdlib only, Python 3.9+; PyYAML is not
+Read from the workflow text (stdlib only, Python 3.12+; PyYAML is not
 guaranteed on every node). Properties:
 
   (a) every self-hosted leg of the ``check`` matrix runs exactly one sweep
@@ -277,9 +277,18 @@ class SweepTestsRunInCi(unittest.TestCase):
     def test_classify_job_runs_the_sweep_workflow_pin_7160_f3(self):
         self.assertEqual(len(self.runs(self.PIN_TEST_FILE)), 1)
 
+    # #9593 moved the scripts/ci discovery step out of classify into this job (off the
+    # Check legs' critical path); the pin follows it and proves classify no longer runs it.
+    DISCOVERY_JOB = "build-script-vetting"
+
     def test_existing_discovery_step_is_intact_7160_f3(self):
+        host = steps(job_lines(read(CI_YML), self.DISCOVERY_JOB))
+        found = [s for s in host if field(s, "run") == self.DISCOVERY]
+        self.assertEqual(len(found), 1, "the %s job must run %r exactly once" % (self.DISCOVERY_JOB, self.DISCOVERY))
+
+    def test_classify_no_longer_runs_the_discovery_step_9593(self):
         found = [s for s in self.classify if field(s, "run") == self.DISCOVERY]
-        self.assertEqual(len(found), 1)
+        self.assertEqual(found, [], "classify must not run %r (#9593 moved it)" % self.DISCOVERY)
 
     def test_classify_job_runs_on_linux_so_o_path_exists_7160_f3(self):
         self.assertIn("    runs-on: ubuntu-latest", job_lines(read(CI_YML), "classify"))
