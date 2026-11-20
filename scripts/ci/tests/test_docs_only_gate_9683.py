@@ -273,6 +273,11 @@ class WorkflowShape(unittest.TestCase):
         for name, spec in EXPECTED.items():
             _, jobs = read_workflow(name)
             self.assertEqual({j: v["if"] for j, v in jobs.items()}, spec["job_if"], name)
+            for job_id, job in jobs.items():
+                # A second job-level key (a duplicate `if:` above the first)
+                # would hide behind the last-value read above.
+                self.assertEqual(len(job["keys"]), len(set(job["keys"])),
+                                 "%s %s: duplicate job key" % (name, job_id))
 
     def test_no_paths_filter_on_any_trigger_9683(self):
         for name in EXPECTED:
