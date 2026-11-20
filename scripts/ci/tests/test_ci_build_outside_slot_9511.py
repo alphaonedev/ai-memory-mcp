@@ -335,6 +335,15 @@ class BuildSemaphoreBound(unittest.TestCase):
         self.assertLess(int(consts['BUILD_SEMAPHORE_MAX_WAIT_SECS']), int(consts['HOST_SEMAPHORE_MAX_WAIT_SECS']))
         self.assertIn('--on-timeout proceed', CI_YML.read_text())
 
+    def test_proceed_never_reaches_the_test_slot(self):
+        # The bound-reached overflow is for the BUILD semaphore only: the test slot keeps
+        # the default `fail` (exit 3), so a test run never starts without its slot.
+        calls = [line for line in CI_YML.read_text().splitlines() if 'host_semaphore.py --name' in line]
+        by_name = {re.search(r'--name (\S+)', line).group(1): line for line in calls}
+        self.assertEqual(sorted(by_name), ['linux-fed-build', 'linux-fed-tests'], calls)
+        self.assertNotIn('--on-timeout', by_name['linux-fed-tests'])
+        self.assertIn('--on-timeout proceed', by_name['linux-fed-build'])
+
 
 class LoadGateRecord(unittest.TestCase):
     """#9733: the gate's wait lands in the job summary; no long wait where the build semaphore gates."""
