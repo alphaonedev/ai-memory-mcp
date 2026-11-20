@@ -7,6 +7,11 @@ proceeds. It NEVER fails on load alone: after ``--max-wait-secs`` it prints a
 Exit 2 is reserved for bad arguments. Exit 3: the shared workflow_annotation.py
 next to this file cannot be loaded (a broken checkout, one ``::error`` line, #9365).
 
+#9733: the waited seconds and how the wait ended (``condition``: the load was
+acceptable; ``timeout``: the bound was spent and the leg proceeded anyway;
+``unreadable``: no load average) are appended as one row to ``$GITHUB_STEP_SUMMARY``
+when that variable is set. A failed summary write is noted on stderr, never fatal.
+
 Usage: python3 scripts/ci/load_gate.py --label "<os>/<tier>" [--max-ratio 1.5]
        [--max-wait-secs 1200] [--poll-secs 30]
 
@@ -60,6 +65,29 @@ except (Exception, SystemExit) as exc:  # any failed load: one fixed line built 
     sys.exit(WA_EXIT_LOAD_REFUSED)
 
 TAG = '[#6795 load gate]'
+SUMMARY_HEADER = '| gate | label | waited s | ended by |\n|---|---|---|---|\n'
+SUMMARY_LABEL_MAX = 80
+OUTCOME_CONDITION = 'condition'
+OUTCOME_TIMEOUT = 'timeout'
+OUTCOME_UNREADABLE = 'unreadable'
+
+
+def summary_cell(text):
+    """One table cell: printable ASCII only, no pipe, at most SUMMARY_LABEL_MAX chars."""
+    return ''.join(c if ' ' <= c <= '~' and c != '|' else '?' for c in text)[:SUMMARY_LABEL_MAX]
+
+
+def record_summary(label, waited, outcome, environ=None):
+    """Append the gate's row to $GITHUB_STEP_SUMMARY (#9733). Unset: nothing. A failed write is noted."""
+    path = (os.environ if environ is None else environ).get('GITHUB_STEP_SUMMARY', '')
+    if not path:
+        return
+    try:
+        with open(path, 'a', encoding='utf-8') as fh:
+            fh.write('\n' + SUMMARY_HEADER + '| load gate | %s | %d | %s |\n' % (summary_cell(label), waited, outcome))
+    except OSError as exc:
+        print(wa.log_line('%s note: job summary row not written (%s); proceeding' % (TAG, type(exc).__name__)),
+              file=sys.stderr, flush=True)
 
 
 def should_wait(load, cores, ratio):
@@ -82,19 +110,28 @@ def _plain(label, load, cores, ratio, waited):
 
 def run(label, max_ratio, max_wait_secs, poll_secs, cores, load_fn, sleep_fn):
     """Poll until the load is acceptable or the wait budget is spent. Always returns 0."""
+    waited, outcome = _wait(label, max_ratio, max_wait_secs, poll_secs, cores, load_fn, sleep_fn)
+    record_summary(label, waited, outcome)
+    return 0
+
+
+def _wait(label, max_ratio, max_wait_secs, poll_secs, cores, load_fn, sleep_fn):
+    """The gate loop; returns (waited seconds, outcome)."""
     waited = 0
     try:
         load = load_fn()
     except (OSError, AttributeError) as exc:
         print(wa.annotation("warning", "%s '%s': cannot read the load average (%s); proceeding without the gate"
                             % (TAG, label, exc)), flush=True)
-        return 0
+        return waited, OUTCOME_UNREADABLE
+    outcome = OUTCOME_CONDITION
     print(format_notice(label, load, cores, max_ratio, waited), flush=True)
     while should_wait(load, cores, max_ratio):
         if waited >= max_wait_secs:
             print(wa.annotation("warning", "%s '%s': load=%.2f still above %s x %d cores after %ds; "
                                 "proceeding anyway (the gate never fails on load alone)"
                                 % (TAG, label, load, max_ratio, cores, waited)), flush=True)
+            outcome = OUTCOME_TIMEOUT
             break
         step = min(poll_secs, max_wait_secs - waited)
         sleep_fn(step)
@@ -104,11 +141,11 @@ def run(label, max_ratio, max_wait_secs, poll_secs, cores, load_fn, sleep_fn):
         except (OSError, AttributeError) as exc:
             print(wa.annotation("warning", "%s '%s': load average became unreadable (%s); proceeding"
                                 % (TAG, label, exc)), flush=True)
-            return 0
+            return waited, OUTCOME_UNREADABLE
         if should_wait(load, cores, max_ratio):
             print(_plain(label, load, cores, max_ratio, waited), flush=True)
     print(format_notice(label, load, cores, max_ratio, waited), flush=True)
-    return 0
+    return waited, outcome
 
 
 def _positive_float(text):
