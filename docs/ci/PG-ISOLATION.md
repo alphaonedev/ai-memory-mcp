@@ -57,9 +57,11 @@ after another. With the lane on (flag `1`, kill switch not `1`, tier
    Rust helper does not mint for them.
 3. **Cleanup** runs `pg_isolated_binary.py teardown --db "$CI_FED_DB" --run-id <this run>`,
    which drops this run's leftover clones and the template. The `--db` is
-   classified as in setup, and a `--db` whose template is not the
-   `AI_MEMORY_TEST_PG_TEMPLATE` this job's setup emitted is refused (#7180). A
-   signal does not stop the drops.
+   classified as in setup, and the teardown is refused unless
+   `AI_MEMORY_TEST_PG_TEMPLATE` is set to the template this job's setup emitted
+   for that `--db` (#7180; unset or empty is refused, #7031). A signal or an
+   error does not stop the drops: a name not dropped, or a clone listing that
+   failed, is printed on an `unreleased:` line.
 
 Setup and teardown run under one ownership guard (#7114, #7179, #7200, #7212).
 A database is owned only after its `CREATE DATABASE` succeeded in this run, and
@@ -71,10 +73,10 @@ dropped. Exit codes of setup and teardown:
 
 | Exit | Meaning |
 |---|---|
-| 0 | done; nothing of this run is left except the template handed to the job |
-| 2 | refused or failed, and nothing this run created is left |
-| 128 + signal | interrupted (143 for SIGTERM), and nothing this run created is left |
-| 5 | a database of this run is still on the server, or may be (a CREATE that ended without a clean answer); every such name is printed on its own `unreleased:` line |
+| 0 | done: setup leaves only the template it handed to the job; teardown leaves nothing of this run |
+| 2 | refused or failed: nothing this invocation created is left; a teardown refused before its first statement dropped nothing |
+| 128 + signal | interrupted (143 for SIGTERM): nothing this invocation created is left, and a teardown still ran every drop |
+| 5 | a database of this run is, or may be, still on the server; every such name, or the query that lists them, is on its own `unreleased:` line |
 
 Exit 5 wins over a signal, and a signal wins over an error.
 

@@ -37,9 +37,10 @@ Sub-commands (``-h`` on each):
               SIGTERM/SIGINT stop dispatch, signal every child group, drop the
               clones and exit 143.
 ``teardown``  drop THIS run's clones (``--run-id``) and the template. The
-              ``--db`` is classified as in setup, and a ``--db`` whose template
-              is not the ``AI_MEMORY_TEST_PG_TEMPLATE`` setup emitted is
-              refused. A signal does not stop it: every drop is still tried.
+              ``--db`` is classified as in setup, and a teardown is refused
+              unless ``AI_MEMORY_TEST_PG_TEMPLATE`` is set to the template
+              setup emitted for that ``--db`` (unset or empty is refused, #7031).
+              A signal or an error does not stop it: every drop is still tried.
 ``sweep``     ADMIN ONLY, never run by CI: drop idle clones of any run that
               are older than ``--older-than`` seconds (at least 600).
 
@@ -49,7 +50,9 @@ terminating someone else's work.
 
 Connection details reach ``psql`` through libpq environment variables
 (``PGHOST``, ``PGPASSWORD``, ...), never through argv. The URL comes from
-``AI_MEMORY_TEST_POSTGRES_URL`` (``--url`` exists for local admin use).
+``AI_MEMORY_TEST_POSTGRES_URL`` (``--url`` exists for local admin use). Every refusal about the URL is a fixed
+text that never contains the URL or any part of it (#9689); setup's ``--db``
+and run's template must name the URL's database (#7031).
 
 Clone names are ``ai_memory_t_<run id>_<10-digit unix seconds>_<8 hex>``; the
 run id is ``[a-z0-9]{1,20}``. The Rust helper (``tests/common/pg_isolate.rs``)
@@ -60,7 +63,8 @@ could not be minted or held, 143 terminated, otherwise the worst exit code of
 the cargo runs. ``setup`` and ``teardown`` also exit 5 when a database of this
 run is still on the server (or may be, after a CREATE without a clean answer),
 naming it, and 128 + the signal number after SIGTERM / SIGINT / SIGHUP; 5 wins
-over a signal, a signal over 2. Standard library only, Python 3.12+.
+over a signal, a signal over 2. ``EXIT_STATES`` below is the one table of what
+each code means (``--help`` prints it). Standard library only, Python 3.12+.
 """
 import argparse
 import contextlib
@@ -76,7 +80,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Dict, IO, Iterator, List, Optional, Set, Tuple
-from urllib.parse import parse_qsl, unquote, urlsplit
+from urllib.parse import SplitResult, parse_qsl, unquote, urlsplit
 
 
 def _load_workflow_annotation():
@@ -168,6 +172,18 @@ EXIT_TERM = 143
 EXIT_UNRELEASED = 5  # setup / teardown: a database of this run is (or may be) still on the server
 SIGNAL_EXIT_BASE = 128  # setup / teardown exit 128 + signum after a handled signal
 HANDLED_SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+# C1: the one exit-state table of setup and teardown. The --help epilog and docs/ci/PG-ISOLATION.md show it, the
+# tests read it, and _report derives the code from the same facts (a name left, handed, unknown or maybe -> 5;
+# else a signal -> 128 + signum; else an error -> 2; else 0).
+EXIT_STATES = (
+    ('0', 'done: setup leaves only the template it handed to the job; teardown leaves nothing of this run'),
+    ('2', 'refused or failed: nothing this invocation created is left; a teardown refused before its first '
+          'statement dropped nothing'),
+    ('128 + signal', 'interrupted (143 for SIGTERM): nothing this invocation created is left, and a teardown still '
+                     'ran every drop'),
+    ('5', 'a database of this run is, or may be, still on the server; every such name, or the query that lists '
+          'them, is on its own `unreleased:` line'),
+)
 # decision: an ephemeral base is recognised by a string parse over a new regex, because the parse is linear by
 # construction on at most IDENT_MAX characters and every regex of this module is pinned by the regex audit.
 EPHEMERAL_PREFIX = 'ai_memory_test_ci_'
@@ -178,6 +194,10 @@ EPHEMERAL_LEG_CHARS = frozenset('abcdefghijklmnopqrstuvwxyz0123456789_')
 SHARED_REASON_MAX = 200
 WATERMARK_TABLE = 'lineage_integrity_watermark'
 LINEAGE_RELATION = 'agent_lineage'
+# B2: the relations a watermark row may name, the Python side of the Rust WATERMARKED_RELATIONS
+# (src/storage/schema_integrity.rs); a drift test reads the Rust list, so a relation added on one side only is red.
+WATERMARKED_RELATIONS = (LINEAGE_RELATION,)
+WATERMARK_RELKINDS = ('r', 'p')  # S3: a plain or partitioned table; a view or foreign table can show any mark
 WATERMARK_MAX_ROWS = 64  # rows per schema, and schemas per base, the precheck reads (LIMIT one more to see excess)
 HIGH_WATER_MAX_DIGITS = 19  # a BIGINT has at most 19 digits
 ROW_QUOTE_MAX = 200  # a refused row or count is quoted at most this many characters: the output stays bounded
@@ -195,6 +215,20 @@ _QUERY_TO_ENV = {
     'target_session_attrs': 'PGTARGETSESSIONATTRS',
     'options': 'PGOPTIONS',
 }
+URL_SCHEMES = ('postgres', 'postgresql')
+SSLMODES = ('allow', 'disable', 'prefer', 'require', 'verify-ca', 'verify-full')
+# P1 #9689: every URL refusal is one of these fixed texts. The builder never receives the URL or any part of it
+# (scheme, port, key, value, database name), so no credential can reach a message: redaction by construction.
+URL_UNPARSED = 'the URL cannot be parsed'
+URL_SCHEME = 'not a postgres URL (the scheme must be postgres or postgresql)'
+URL_MULTI_HOST = 'multi-host URLs are not supported'
+URL_PORT = 'the URL port is not a number from 0 to 65535'
+URL_NO_DB = 'the URL names no database'
+URL_DB_UNSAFE = 'the URL database name is not a safe identifier (1 to %d of [A-Za-z0-9_])' % IDENT_MAX
+URL_KEY = 'unsupported URL query key (supported: %s)' % ', '.join(sorted(_QUERY_TO_ENV))
+URL_SSLMODE = 'the URL sslmode is not one of %s' % ', '.join(SSLMODES)
+URL_OPTIONS_BACKSLASH = ("the URL query key 'options' ends in an unescaped backslash; end it with a value character "
+                         "or double the backslash")
 # linear: one bounded class repetition between anchors
 _RUN_ID_RE = re.compile(r'^[a-z0-9]{1,%d}$' % RUN_ID_MAX_LEN)
 # linear: bounded class repetitions separated by a fixed underscore, so no two quantifiers can overlap
@@ -236,9 +270,8 @@ def log(msg: str) -> None:
 # --- names and URLs -------------------------------------------------------
 
 def database_name(url: str) -> str:
-    """Database segment of a postgres URL, query string ignored."""
-    base = url.split('?', 1)[0].rstrip('/')
-    return base.rsplit('/', 1)[-1]
+    """The database a postgres URL names, after the whole URL is validated (fails closed, fixed texts only)."""
+    return _parsed_url(url)[0]
 
 
 def with_database(url: str, db: str) -> str:
@@ -320,14 +353,16 @@ def _ascii_digits(text: str, most: int) -> bool:
 def is_ephemeral_base(name: str) -> bool:
     """``ai_memory_test_ci_<run>_<attempt>_<leg>`` as ci.yml names a job's base: run 1-20 digits, attempt 1-5
     digits, leg 1-36 of ``[a-z0-9_]``. A string parse on an already-checked identifier: linear, no regex."""
-    if not name.startswith(EPHEMERAL_PREFIX):
+    # S4 = C2: a name that is itself a template name (``..._tpl``) or a leg of underscores only is refused.
+    if not name.startswith(EPHEMERAL_PREFIX) or name.endswith(TEMPLATE_SUFFIX):
         return False
     parts = name[len(EPHEMERAL_PREFIX):].split('_', 2)
     if len(parts) != 3:
         return False
     run, attempt, leg = parts
     return (_ascii_digits(run, EPHEMERAL_RUN_MAX) and _ascii_digits(attempt, EPHEMERAL_ATTEMPT_MAX)
-            and 1 <= len(leg) <= EPHEMERAL_LEG_MAX and all(ch in EPHEMERAL_LEG_CHARS for ch in leg))
+            and 1 <= len(leg) <= EPHEMERAL_LEG_MAX and all(ch in EPHEMERAL_LEG_CHARS for ch in leg)
+            and any(ch != '_' for ch in leg))
 
 
 def checked_base(db_name: str, allow_shared: Optional[str] = None) -> str:
@@ -373,21 +408,33 @@ def width_for(available: int, jobs: int) -> int:
 
 # --- psql through libpq env ------------------------------------------------
 
-def libpq_env(url: str) -> Dict[str, str]:
-    """Map a postgres URL to libpq environment variables (fails closed)."""
-    parts = urlsplit(url)
-    if parts.scheme not in ('postgres', 'postgresql'):
-        raise WrapperError('not a postgres URL (scheme %r)' % parts.scheme)
-    netloc = parts.netloc.rsplit('@', 1)[-1]
-    if ',' in netloc:
-        raise WrapperError('multi-host URLs are not supported')
+def _parsed_url(url: str) -> Tuple[str, Dict[str, str]]:
+    """``(database, libpq env)`` of a postgres URL; fails closed. P1 #9689: every refusal is a fixed module text and
+    is raised outside any ``except`` block, so neither the message nor a chained exception carries a part of the URL
+    (redaction by construction). Checked in order: parse, scheme, one host, port, database, query keys and values.
+    Linear in the URL length: one split, one query parse, no regex over the URL."""
+    try:
+        parts: Optional[SplitResult] = urlsplit(url)
+    except ValueError:
+        parts = None
+    if parts is None:
+        raise WrapperError(URL_UNPARSED)
+    if parts.scheme not in URL_SCHEMES:
+        raise WrapperError(URL_SCHEME)
+    if ',' in parts.netloc.rpartition('@')[2]:
+        raise WrapperError(URL_MULTI_HOST)
+    try:
+        port: Optional[int] = parts.port
+        port_ok = True
+    except ValueError:
+        port, port_ok = None, False
+    if not port_ok:
+        raise WrapperError(URL_PORT)
     db = unquote(parts.path.lstrip('/'))
     if not db:
-        raise WrapperError('the URL names no database')
-    try:
-        port = parts.port
-    except ValueError as exc:
-        raise WrapperError('bad port in the URL: %s' % exc)
+        raise WrapperError(URL_NO_DB)
+    if not _IDENT_RE.fullmatch(db):
+        raise WrapperError(URL_DB_UNSAFE)
     env = {'PGDATABASE': db, 'PGCONNECT_TIMEOUT': CONNECT_TIMEOUT_SECS}
     if parts.hostname:
         env['PGHOST'] = parts.hostname
@@ -400,12 +447,18 @@ def libpq_env(url: str) -> Dict[str, str]:
     for key, value in parse_qsl(parts.query, keep_blank_values=True):
         var = _QUERY_TO_ENV.get(key)
         if var is None:
-            raise WrapperError('unsupported URL query key %r' % key)
+            raise WrapperError(URL_KEY)
+        if key == 'sslmode' and value not in SSLMODES:
+            raise WrapperError(URL_SSLMODE)
         if key == 'options' and (len(value) - len(value.rstrip('\\'))) % 2:
-            raise WrapperError('the URL query key \'options\' ends in an unescaped backslash; end it with a '
-                               'value character or double the backslash')
+            raise WrapperError(URL_OPTIONS_BACKSLASH)
         env[var] = value
-    return env
+    return db, env
+
+
+def libpq_env(url: str) -> Dict[str, str]:
+    """Map a postgres URL to libpq environment variables (fails closed, fixed texts only)."""
+    return _parsed_url(url)[1]
 
 
 def _pg_env(url: str) -> Dict[str, str]:
@@ -1023,6 +1076,8 @@ class _Lifetime:
         self.locked: Set[str] = set()
         self.maybe: List[str] = []
         self.left: List[Tuple[str, str]] = []
+        self.handed: List[str] = []  # C1: handed to the job, then a signal arrived: still on the server, named
+        self.unknown: List[Tuple[str, str, str]] = []  # C1: (run id, cause, listing SQL) of a failed clone listing
         self.signum: Optional[int] = None
 
     def note_signal(self, signum: int, _frame: object) -> None:
@@ -1068,15 +1123,30 @@ def _signals(lifetime: _Lifetime) -> Iterator[_Lifetime]:
             signal.signal(sig, handler)
 
 
+def _signal_name(signum: int) -> str:
+    try:
+        return signal.Signals(signum).name
+    except ValueError:
+        return 'signal'
+
+
 def _report(lifetime: _Lifetime, error: Optional[str]) -> int:
     """I4: one line per fact, then the exit code: 5 while a name of this run is (or may be) on the server, else
     128 + signum after a signal, else 2 after an error, else 0."""
     lines = [error] if error else []
     if lifetime.signum is not None:
-        lines.append('interrupted by signal %d (%s)' % (lifetime.signum, signal.Signals(lifetime.signum).name))
+        lines.append('interrupted by signal %d (%s)' % (lifetime.signum, _signal_name(lifetime.signum)))
     for name, cause in lifetime.left:
         lines.append('unreleased: database %s of this run is still on the server: %s; drop it with a plain DROP '
                      'DATABASE once no session holds it' % (name, cause))
+    for name in lifetime.handed:
+        signum = lifetime.signum if lifetime.signum is not None else 0
+        lines.append("unreleased: database %s of this run is still on the server: setup handed it to the job before "
+                     "signal %d (%s) arrived; the job's teardown drops it, or drop it with a plain DROP DATABASE once "
+                     "no session holds it" % (name, signum, _signal_name(signum)))
+    for run_id, cause, listing in lifetime.unknown:
+        lines.append('unreleased: the clones of run %s are unknown, the listing failed: %s; list them with `%s` and '
+                     'drop each with a plain DROP DATABASE' % (run_id, cause, listing))
     for name in lifetime.maybe:
         lines.append("unreleased: database %s may exist with no owner record (the CREATE ended without a clean "
                      "answer); check with `SELECT 1 FROM pg_database WHERE datname = '%s'` and drop it with a plain "
@@ -1084,7 +1154,7 @@ def _report(lifetime: _Lifetime, error: Optional[str]) -> int:
     with _PRINT_LOCK:
         for text in lines:
             print(wa.log_line('pg_isolated_binary: %s' % text), file=sys.stderr, flush=True)
-    if lifetime.left or lifetime.maybe:
+    if lifetime.left or lifetime.handed or lifetime.unknown or lifetime.maybe:
         return EXIT_UNRELEASED
     if lifetime.signum is not None:
         return SIGNAL_EXIT_BASE + lifetime.signum
@@ -1103,34 +1173,39 @@ def _precheck_read(base_url: str, db_name: str, sql: str) -> str:
         raise WrapperError('refusing base database %r: the lineage precheck could not read it: %s' % (db_name, exc))
 
 
+# S3: every relation of that name is read with its relkind, so a view, materialized view or foreign table that
+# shadows the watermark is a refusal, never a silent skip.
 _WATERMARK_SCHEMAS_SQL = (
-    "SELECT n.nspname FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
-    "WHERE c.relname = '%s' AND c.relkind IN ('r', 'p') ORDER BY n.nspname LIMIT %d"
+    "SELECT n.nspname, c.relkind FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+    "WHERE c.relname = '%s' ORDER BY n.nspname LIMIT %d"
     % (WATERMARK_TABLE, WATERMARK_MAX_ROWS + 1))
 
 
-def _high_water(db_name: str, schema: str, raw: str) -> Optional[int]:
-    """The highest ``agent_lineage`` mark of one schema's watermark rows, None when it has none. Every row must be
-    exactly ``agent_lineage|<1-19 ASCII digits>``; anything else is a refusal, never a skip (#7157)."""
+def _high_water(db_name: str, schema: str, raw: str) -> Dict[str, int]:
+    """The highest mark per relation of one schema's watermark rows (B2: every relation of WATERMARKED_RELATIONS).
+    Every row must be exactly ``<relation>|<1-19 ASCII digits>``; anything else is a refusal, never a skip (#7157)."""
     rows = [row for row in raw.split('\n') if row]
     if len(rows) > WATERMARK_MAX_ROWS:
         raise WrapperError('refusing base database %r: %s in schema %s has more than %d rows'
                            % (db_name, WATERMARK_TABLE, schema, WATERMARK_MAX_ROWS))
-    highest = None
+    relations = tuple(WATERMARKED_RELATIONS)
+    not_relation = ('relation is not %s' % relations[0] if len(relations) == 1
+                    else 'relation is not one of %s' % ', '.join(relations))
+    highest: Dict[str, int] = {}
     for row in rows:
         fields = row.split('|')
         why = None
         if len(fields) != 2:
             why = 'not two fields'
-        elif fields[0] != LINEAGE_RELATION:
-            why = 'relation is not %s' % LINEAGE_RELATION
+        elif fields[0] not in relations:
+            why = not_relation
         elif not _ascii_digits(fields[1], HIGH_WATER_MAX_DIGITS):
             why = 'high_water is not a non-negative integer of at most %d digits' % HIGH_WATER_MAX_DIGITS
         if why:
             raise WrapperError('refusing base database %r: %s in schema %s has a row the precheck cannot read '
                                '(%s): %r' % (db_name, WATERMARK_TABLE, schema, why, _quoted(row)))
         mark = int(fields[1])
-        highest = mark if highest is None else max(highest, mark)
+        highest[fields[0]] = max(highest.get(fields[0], mark), mark)
     return highest
 
 
@@ -1139,30 +1214,38 @@ def lineage_precheck(url: str, db_name: str) -> None:
     ``agent_lineage`` in any schema (#6983). Reads only, on the base itself, one statement per call, every
     answer bounded (schemas and rows LIMIT 65, a row quoted at most ROW_QUOTE_MAX characters)."""
     base_url = with_database(url, db_name)
-    schemas = [name for name in _precheck_read(base_url, db_name, _WATERMARK_SCHEMAS_SQL).split('\n') if name]
-    if len(schemas) > WATERMARK_MAX_ROWS:
+    rows = [row for row in _precheck_read(base_url, db_name, _WATERMARK_SCHEMAS_SQL).split('\n') if row]
+    if len(rows) > WATERMARK_MAX_ROWS:
         raise WrapperError('refusing base database %r: %s sits in more than %d schemas'
                            % (db_name, WATERMARK_TABLE, WATERMARK_MAX_ROWS))
-    for schema in sorted(schemas):
+    schemas = []
+    for row in sorted(rows):
+        schema, _sep, kind = row.rpartition('|')
         if not _IDENT_RE.fullmatch(schema):
             raise WrapperError('refusing base database %r: %s sits in a schema with an unsafe name %r'
-                               % (db_name, WATERMARK_TABLE, _quoted(schema)))
-    for schema in sorted(schemas):
+                               % (db_name, WATERMARK_TABLE, _quoted(schema or row)))
+        if kind not in WATERMARK_RELKINDS:
+            raise WrapperError('refusing base database %r: %s in schema %s is not a table (relkind %r); a view or '
+                               'foreign table can show any mark, so the precheck reads only a plain or partitioned '
+                               'table' % (db_name, WATERMARK_TABLE, schema, _quoted(kind)))
+        schemas.append(schema)
+    for schema in schemas:
         raw = _precheck_read(base_url, db_name, 'SELECT relation, high_water FROM %s.%s ORDER BY relation LIMIT %d'
                              % (quote_ident(schema), WATERMARK_TABLE, WATERMARK_MAX_ROWS + 1))
         highest = _high_water(db_name, schema, raw)
-        if highest is None:
-            continue
-        counted = _precheck_read(base_url, db_name, 'SELECT count(*) FROM %s.%s'
-                                 % (quote_ident(schema), quote_ident(LINEAGE_RELATION))).strip()
-        if not _ascii_digits(counted, HIGH_WATER_MAX_DIGITS):
-            raise WrapperError('refusing base database %r: count(*) of %s.%s is not an integer (%r)'
-                               % (db_name, schema, LINEAGE_RELATION, _quoted(counted)))
-        if highest > int(counted):
-            raise WrapperError('refusing base database %r: the append-only relation `%s.%s` REGRESSED from a '
-                               'previously-recorded high-water mark of %d row(s) to %d; a template built beside it '
-                               'would run the suite on a poisoned base (#6983)'
-                               % (db_name, schema, LINEAGE_RELATION, highest, int(counted)))
+        for relation in WATERMARKED_RELATIONS:
+            if relation not in highest:
+                continue
+            counted = _precheck_read(base_url, db_name, 'SELECT count(*) FROM %s.%s'
+                                     % (quote_ident(schema), quote_ident(relation))).strip()
+            if not _ascii_digits(counted, HIGH_WATER_MAX_DIGITS):
+                raise WrapperError('refusing base database %r: count(*) of %s.%s is not an integer (%r)'
+                                   % (db_name, schema, relation, _quoted(counted)))
+            if highest[relation] > int(counted):
+                raise WrapperError('refusing base database %r: the append-only relation `%s.%s` REGRESSED from a '
+                                   'previously-recorded high-water mark of %d row(s) to %d; a template built beside '
+                                   'it would run the suite on a poisoned base (#6983)'
+                                   % (db_name, schema, relation, highest[relation], int(counted)))
 
 
 def setup(url: str, db_name: str, jobs: int = MAX_JOBS, allow_shared: Optional[str] = None,
@@ -1171,6 +1254,11 @@ def setup(url: str, db_name: str, jobs: int = MAX_JOBS, allow_shared: Optional[s
     under the ownership guard (I3). Returns its name. On any exception the template this call created is dropped
     before the exception goes on; a name that could not be dropped is in ``lifetime.left``."""
     checked_base(db_name, allow_shared)
+    url_db = database_name(url)
+    if db_name != url_db:
+        # S2: CREATE DATABASE runs on the URL database and the precheck reads --db; the two must be one database.
+        raise WrapperError('refusing setup --db %r: the URL names database %r; setup connects to the URL database, '
+                           'so --db must name the same database' % (db_name, url_db))
     tpl = _checked_ident(template_name(db_name))
     need = required_connections(clamp_jobs(jobs))
     life = _Lifetime() if lifetime is None else lifetime
@@ -1238,34 +1326,45 @@ def _names(url: str, sql: str) -> List[str]:
     return [n for n in psql(url, sql, tuples=True).split() if _IDENT_RE.fullmatch(n)]
 
 
+CLONE_LISTING_SQL = "SELECT datname FROM pg_database WHERE starts_with(datname, '%s')"
+
+
 def teardown(url: str, db_name: str, run_id: str, lifetime: Optional[_Lifetime] = None) -> int:
     """Drop this run's clones, then the template (ALTER IS_TEMPLATE false, then a plain DROP that waits out the
-    settle window). Every drop is tried; a name not dropped goes to ``lifetime.left``. Returns how many failed."""
+    settle window). Every step is tried whatever the one before raised (C1): a failed listing goes to
+    ``lifetime.unknown`` with the query that lists the clones, a name not dropped to ``lifetime.left``, each with
+    its cause. Returns how many steps failed."""
     _checked_ident(db_name)
     prefix = run_prefix(run_id)
     tpl = _checked_ident(template_name(db_name))
     life = _Lifetime() if lifetime is None else lifetime
     failed = 0
-    names = [n for n in _names(url, "SELECT datname FROM pg_database WHERE starts_with(datname, '%s')" % prefix)
-             if parse_isolated_name(n, run_id) is not None]
+    listing = CLONE_LISTING_SQL % prefix
+    names: List[str] = []
+    try:
+        names = [n for n in _names(url, listing) if parse_isolated_name(n, run_id) is not None]
+    except BaseException as exc:  # every type: unknown clones are named with the listing query, never claimed gone
+        failed += 1
+        life.unknown.append((run_id, _describe(exc), listing))
+        log('WARN could not list the clones of run %s: %s' % (run_id, _describe(exc)))
     for name in names:
         try:
             drop(url, name, run_id)
-        except WrapperError as exc:
+        except BaseException as exc:  # every type: a name not dropped is named, and the next drop still runs
             failed += 1
-            life.left.append((name, str(exc)))
-            log('WARN could not drop %s: %s' % (name, exc))
+            life.left.append((name, _describe(exc)))
+            log('WARN could not drop %s: %s' % (name, _describe(exc)))
     q = quote_ident(tpl)
     try:
-        psql(url, 'ALTER DATABASE %s WITH IS_TEMPLATE false' % q)
-    except WrapperError:
-        pass  # already gone
-    try:
+        try:
+            psql(url, 'ALTER DATABASE %s WITH IS_TEMPLATE false' % q)
+        except WrapperError as exc:
+            log('the template %s was not unlocked (%s); the DROP below reports what is left' % (tpl, exc))
         _drop_settled(url, tpl)
-    except WrapperError as exc:
+    except BaseException as exc:  # every type: the template not dropped is named
         failed += 1
-        life.left.append((tpl, str(exc)))
-        log('WARN could not drop the template %s: %s' % (tpl, exc))
+        life.left.append((tpl, _describe(exc)))
+        log('WARN could not drop the template %s: %s' % (tpl, _describe(exc)))
     log('teardown of run %s: %d clone(s) and template %s, %d failure(s)' % (run_id, len(names), tpl, failed))
     return failed
 
@@ -1457,14 +1556,22 @@ class Runner:
 # --- CLI ------------------------------------------------------------------
 
 def read_lines(path: str) -> List[str]:
-    with open(path, encoding='utf-8') as handle:
-        return [ln.strip() for ln in handle if ln.strip() and not ln.lstrip().startswith('#')]
+    """Non-blank, non-comment lines of a UTF-8 file; an unreadable file is one refusal line, never a traceback."""
+    try:
+        with open(path, encoding='utf-8') as handle:
+            return [ln.strip() for ln in handle if ln.strip() and not ln.lstrip().startswith('#')]
+    except OSError as exc:
+        cause = exc.strerror or type(exc).__name__
+    except UnicodeError:
+        cause = 'not UTF-8 text'
+    raise WrapperError('cannot read %r (%s)' % (path, cause))
 
 
 def _url(args: argparse.Namespace) -> str:
     url = getattr(args, 'url', None) or os.environ.get(URL_VAR)
     if not url:
         raise WrapperError('set %s (or pass --url for local admin use)' % URL_VAR)
+    _parsed_url(url)  # P1 #9689: every sub-command refuses a bad URL, with a fixed text, before any SQL
     return url
 
 
@@ -1476,7 +1583,9 @@ def _default_log_dir() -> str:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__.split('\n', 1)[0])
+    epilog = 'exit codes of setup and teardown:\n' + '\n'.join('  %s: %s' % row for row in EXIT_STATES)
+    parser = argparse.ArgumentParser(description=__doc__.split('\n', 1)[0], epilog=epilog,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest='cmd', required=True)
     url_help = 'admin URL for local use (default and CI: $%s; argv is visible to other users)' % URL_VAR
 
@@ -1525,6 +1634,12 @@ def _cmd_run(args: argparse.Namespace, url: str) -> int:
     if not cargo:
         raise WrapperError('missing the cargo command after "--"')
     tpl = _checked_ident(args.template or os.environ.get(TEMPLATE_VAR) or '')
+    url_db = database_name(url)
+    expected = template_name(url_db)
+    if tpl != expected:
+        # S2: a clone is minted on the URL database from the template; only that database's template may be used.
+        raise WrapperError('refusing run: template %r is not %r, the template of the URL database %r'
+                           % (tpl, expected, url_db))
     run_id = checked_run_id(args.run_id or os.environ.get(RUN_ID_VAR))
     targets = [parse_target_line(ln) for ln in read_lines(args.targets_file)]
     residual = set(read_lines(args.residual_file)) if args.residual_file else set()
@@ -1553,7 +1668,7 @@ def _guarded(url: str, body) -> int:
         try:
             body(life)
         except _Interrupted:
-            pass
+            error = None  # the signal itself is the fact: _report prints its line and exits 128 + signum
         except BaseException as exc:  # every type gets a line and a non-zero exit, never a traceback
             error = _describe(exc)
         finally:
@@ -1581,6 +1696,10 @@ def _cmd_setup(args: argparse.Namespace, url: str) -> int:
             life.locked.clear()
         finally:
             signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+        if life.signum is not None:
+            # C1: the checkpoint above saw no signal, so this one arrived after the hand-over (delivered at the
+            # unmask): the template is the job's and stays on the server; the exit names it, never "nothing left".
+            life.handed.append(tpl)
     return _guarded(url, body)
 
 
@@ -1590,7 +1709,12 @@ def _cmd_teardown(args: argparse.Namespace, url: str) -> int:
     def body(life: _Lifetime) -> None:
         checked_base(db, args.allow_shared_base)
         emitted = os.environ.get(TEMPLATE_VAR)
-        if emitted and emitted != template_name(db):
+        if not emitted:
+            # S1: a teardown drops a template only when the template this job's setup emitted names it.
+            raise WrapperError("refusing teardown --db %r: %s is unset or empty; set it to the template this job's "
+                               "setup emitted (%r for this base) before a teardown may drop it"
+                               % (db, TEMPLATE_VAR, template_name(db)))
+        if emitted != template_name(db):
             raise WrapperError("refusing teardown --db %r: its template %r is not %s=%r, the template this job's "
                                "setup emitted" % (db, template_name(db), TEMPLATE_VAR, emitted))
         teardown(url, db, checked_run_id(args.run_id or os.environ.get(RUN_ID_VAR)), life)
@@ -1612,8 +1736,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             sweep(url, args.older_than)
             return 0
         return _cmd_run(args, url)
-    except WrapperError as exc:
-        print(wa.log_line('pg_isolated_binary: %s' % exc), file=sys.stderr)
+    except BaseException as exc:  # every type: one line and exit 2, never a traceback (the run path's own codes
+        # come back as return values; setup and teardown report inside _guarded)
+        print(wa.log_line('pg_isolated_binary: %s' % _describe(exc)), file=sys.stderr)
         return EXIT_USAGE
 
 

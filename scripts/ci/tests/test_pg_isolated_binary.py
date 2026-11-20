@@ -2603,7 +2603,7 @@ class ConnectTimeout7866(unittest.TestCase):
                                AI_MEMORY_TEST_POSTGRES_URL=BASE + '&connect_timeout=' + '9' * digits,
                                PYTHONPATH=str(directory), PSQL_MARKER_7866=str(marker))
                     result = subprocess.run(
-                        [sys.executable, str(SCRIPT), 'setup', '--db', 'ai_memory_test_ci_7866_1_x', '--jobs', '1'],
+                        [sys.executable, str(SCRIPT), 'setup', '--db', pib.database_name(BASE), '--jobs', '1'],
                         env=env, capture_output=True, text=True, timeout=30)
                     self.assertFalse(marker.exists(), "refusal must precede psql")
                     self.assertEqual(result.returncode, 2, result.stderr[:1000])
