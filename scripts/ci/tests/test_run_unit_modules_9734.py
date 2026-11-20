@@ -45,6 +45,8 @@ GREEN = "import unittest\nclass T(unittest.TestCase):\n    def test_a(self):\n  
 RED = "import unittest\nclass T(unittest.TestCase):\n    def test_a(self):\n        self.assertEqual(1, 2, 'RED-MARKER-9734')\n"
 EMPTY = "import unittest\n"
 NO_RAN = "import os\nos._exit(0)\n"
+# rc 0 with a `Ran 0 tests` line: only the runner's own zero-test check can catch it (unittest itself exits 5).
+RAN_ZERO_RC0 = "import os, sys\nsys.stderr.write('Ran 0 tests in 0.000s\\n\\nOK\\n')\nos._exit(0)\n"
 HANG = "import time, unittest\nclass T(unittest.TestCase):\n    def test_a(self):\n        time.sleep(%d)\n" % HANG_S
 SLEEP = "import time, unittest\nclass T(unittest.TestCase):\n    def test_a(self):\n        time.sleep(%s)\n" % SLEEP_S
 
@@ -117,6 +119,12 @@ class GreenAndRed(Synthetic):
         self.assertEqual(done.returncode, EXIT_BAD_MODULE)
         self.assertEqual(self.summary(done)[1:3], (1, "test_empty.py"))
         self.assertIn("Ran 0 tests", done.stdout)
+
+    def test_rc_zero_with_ran_zero_tests_fails_closed(self):
+        self.write("test_ranzero.py", RAN_ZERO_RC0)
+        done, _ = self.run_runner()
+        self.assertEqual(done.returncode, EXIT_BAD_MODULE)
+        self.assertEqual(self.summary(done)[1:3], (1, "test_ranzero.py"))
 
     def test_module_that_prints_no_ran_line_fails_closed(self):
         self.write("test_silent.py", NO_RAN)

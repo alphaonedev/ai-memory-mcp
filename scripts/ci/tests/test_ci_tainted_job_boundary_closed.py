@@ -53,7 +53,7 @@ UNCLASSIFIABLE_PREFIX = "unclassifiable: "
 HOST_WORKFLOW = "ci.yml"
 HOST_JOB = "build-script-vetting"
 HOST_STEP = "All scripts/ci unit tests (#9734)"
-HOST_COMMAND = "python3 -m unittest discover -s scripts/ci/tests"
+HOST_COMMAND = "python3 scripts/ci/run_unit_modules.py"
 HOSTED_LABEL = "ubuntu-latest"
 # The module-level patterns that remain, by name; a new pattern needs a review and a time cell.
 REGEX_NAMES_EXPECTED = frozenset({

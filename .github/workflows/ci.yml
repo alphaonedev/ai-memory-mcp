@@ -1001,8 +1001,11 @@ jobs:
       # #9303: test_9303_real_range_9274_refused_as_frozen_region reads the PR 9274 range and fails, never skips, when a commit is missing.
       - name: Fetch the amendment ledger replay objects (#9303)
         run: python3 -I scripts/ci/tests/test_cert_amendment_ledger_6124.py --print-replay-shas | xargs git fetch --no-tags --depth=1 origin
+      # #9734: one process per module, run in parallel and fail closed (a module that is not rc 0, times
+      # out, prints no `Ran` line or runs zero tests fails the step); same discovery, wall time is the
+      # slowest module plus the queue, not the sum (659 s and 983 s measured serial).
       - name: All scripts/ci unit tests (#9734)
-        run: python3 -m unittest discover -s scripts/ci/tests
+        run: python3 scripts/ci/run_unit_modules.py
 
   # actionlint — workflow-injection guard (#1851, audit follow-up #1855).
   # actionlint's NATIVE expression-injection check flags the #1851 class: an
