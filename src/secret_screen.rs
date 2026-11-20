@@ -139,6 +139,8 @@ const MIN_PREFIXED_TOKEN_LEN: usize = 20;
 const MIN_TOKEN_ENTROPY_BITS: f64 = 3.5;
 /// AWS access-key id is exactly `AKIA` + 16 uppercase-alnum chars.
 const AWS_KEY_BODY_LEN: usize = 16;
+/// One histogram bin per byte value (the entropy confirmation's table).
+const BYTE_VALUE_BINS: usize = 256;
 
 /// Screen a content string for embedded credentials.
 ///
@@ -152,6 +154,8 @@ pub fn screen(content: &str) -> ScreenOutcome {
     let mut redacted = content.to_string();
 
     // 1. PEM private key block (any algorithm) — structural, no entropy gate.
+    // Two `contains` passes over the input (#9599 meter).
+    charge_scan(content.len().saturating_mul(2));
     if content.contains(PEM_BEGIN_MARKER) && content.contains(PEM_PRIVATE_KEY_MARKER) {
         kinds.push(KIND_PEM_PRIVATE_KEY);
         redacted = redact_pem_blocks(&redacted);
@@ -190,13 +194,77 @@ pub fn screen(content: &str) -> ScreenOutcome {
     }
 }
 
+/// #9599 — test-only cost meter for the detectors. Every detector reports
+/// the bytes it examines through [`charge_scan`]; a lib test arms a budget
+/// and reads the total, which turns "no screened input takes more than
+/// linear time" into a deterministic op-count assertion. Release builds
+/// compile [`charge_scan`] to nothing.
+#[cfg(test)]
+pub(crate) mod scan_meter {
+    use std::cell::Cell;
+
+    /// The panic text the meter raises when an armed budget is exceeded.
+    pub(crate) const BUDGET_EXCEEDED: &str = "secret-screen scan budget exceeded (#9599)";
+
+    thread_local! {
+        static COST: Cell<u64> = const { Cell::new(0) };
+        static BUDGET: Cell<u64> = const { Cell::new(u64::MAX) };
+    }
+
+    /// Add `bytes` examined bytes; panics with [`BUDGET_EXCEEDED`] once the
+    /// armed budget is passed so a super-linear detector fails fast.
+    pub(crate) fn charge(bytes: usize) {
+        let add = u64::try_from(bytes).unwrap_or(u64::MAX);
+        let total = COST.with(|c| {
+            let v = c.get().saturating_add(add);
+            c.set(v);
+            v
+        });
+        if total > BUDGET.with(Cell::get) {
+            panic!("{BUDGET_EXCEEDED}");
+        }
+    }
+
+    /// Reset the counter and arm `budget` for this thread.
+    pub(crate) fn arm(budget: u64) {
+        COST.with(|c| c.set(0));
+        BUDGET.with(|b| b.set(budget));
+    }
+
+    /// Disarm the budget and return the cost charged since [`arm`].
+    pub(crate) fn disarm() -> u64 {
+        BUDGET.with(|b| b.set(u64::MAX));
+        COST.with(Cell::get)
+    }
+}
+
+/// Report `bytes` examined bytes to the #9599 test meter (no-op outside
+/// tests).
+#[inline]
+fn charge_scan(bytes: usize) {
+    #[cfg(test)]
+    scan_meter::charge(bytes);
+    #[cfg(not(test))]
+    let _ = bytes;
+}
+
+/// `content[from..].find(pat)`, metered: charges the bytes up to the end of
+/// the match (or the whole remainder when there is none).
+fn find_from(content: &str, from: usize, pat: &str) -> Option<usize> {
+    let hay = &content[from..];
+    let found = hay.find(pat);
+    charge_scan(found.map_or(hay.len(), |rel| rel + pat.len()));
+    found
+}
+
 /// Shannon entropy (bits/char) of a token's byte distribution.
 #[must_use]
 fn shannon_entropy_bits(s: &str) -> f64 {
     if s.is_empty() {
         return 0.0;
     }
-    let mut counts = [0usize; 256];
+    charge_scan(s.len() + BYTE_VALUE_BINS);
+    let mut counts = [0usize; BYTE_VALUE_BINS];
     for b in s.bytes() {
         counts[b as usize] += 1;
     }
@@ -225,6 +293,7 @@ fn token_at(content: &str, start: usize) -> &str {
     while end < bytes.len() && is_token_char(bytes[end] as char) {
         end += 1;
     }
+    charge_scan(end - start);
     &content[start..end]
 }
 
@@ -240,7 +309,7 @@ fn redact_prefixed_tokens(
     let mut out = String::with_capacity(content.len());
     let mut search_from = 0usize;
     let mut hit = false;
-    while let Some(rel) = content[search_from..].find(prefix) {
+    while let Some(rel) = find_from(content, search_from, prefix) {
         let pfx_start = search_from + rel;
         let token_start = pfx_start + prefix.len();
         let token = token_at(content, token_start);
@@ -272,7 +341,7 @@ fn redact_aws_keys(content: &str, kinds: &mut Vec<&'static str>) -> Option<Strin
     let mut out = String::with_capacity(content.len());
     let mut search_from = 0usize;
     let mut hit = false;
-    while let Some(rel) = content[search_from..].find(AWS_AKIA_PREFIX) {
+    while let Some(rel) = find_from(content, search_from, AWS_AKIA_PREFIX) {
         let start = search_from + rel;
         let body_start = start + AWS_AKIA_PREFIX.len();
         let body = token_at(content, body_start);
@@ -310,6 +379,7 @@ fn looks_like_jwt(token: &str) -> bool {
     }
     let mut n = 0usize;
     for seg in token.split('.') {
+        charge_scan(seg.len() + 1);
         if seg.len() < MIN_SEG_LEN {
             return false;
         }
@@ -329,7 +399,7 @@ fn redact_jwts(content: &str, kinds: &mut Vec<&'static str>) -> Option<String> {
     let mut out = String::with_capacity(content.len());
     let mut search_from = 0usize;
     let mut hit = false;
-    while let Some(rel) = content[search_from..].find(JWT_HEADER_MARKER) {
+    while let Some(rel) = find_from(content, search_from, JWT_HEADER_MARKER) {
         let start = search_from + rel;
         let token = token_at(content, start);
         if looks_like_jwt(token) {
@@ -370,7 +440,7 @@ fn redact_jwts(content: &str, kinds: &mut Vec<&'static str>) -> Option<String> {
 fn redact_pem_blocks(content: &str) -> String {
     let mut out = String::with_capacity(content.len());
     let mut rest = content;
-    while let Some(begin) = rest.find(PEM_BEGIN_MARKER) {
+    while let Some(begin) = find_from(rest, 0, PEM_BEGIN_MARKER) {
         out.push_str(&rest[..begin]);
         // The scan advances within `rest` — NOT re-sliced from the original
         // `content` (FBL-16: re-basing to `content` reproduced the same tail
@@ -379,10 +449,10 @@ fn redact_pem_blocks(content: &str) -> String {
         rest = &rest[begin..];
         // #2387 — bound this block's span at the NEXT `-----BEGIN` so a
         // later block (key or not) can never be folded into this one.
-        let region_end = rest[PEM_BEGIN_MARKER.len()..]
-            .find(PEM_BEGIN_MARKER)
+        let region_end = find_from(rest, PEM_BEGIN_MARKER.len(), PEM_BEGIN_MARKER)
             .map_or(rest.len(), |rel| PEM_BEGIN_MARKER.len() + rel);
         let region = &rest[..region_end];
+        charge_scan(region.len());
         // Within the bounded region the FIRST `PRIVATE KEY-----` closes a
         // key HEADER and the SECOND closes the FOOTER (the pre-#2387 scan
         // used the same first/second rule, just unbounded).
@@ -1130,6 +1200,10 @@ pub fn redact_pending_action_for_storage(
     out.payload = payload;
     Some(out)
 }
+
+#[cfg(test)]
+#[path = "secret_screen_linear_9599_tests.rs"]
+mod linear_9599_tests;
 
 #[cfg(test)]
 mod tests {
