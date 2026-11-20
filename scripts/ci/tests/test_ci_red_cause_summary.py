@@ -716,7 +716,9 @@ class WorkflowInvariant(unittest.TestCase):
         for workflow, expected in EXPECTED_JOBS.items():
             for job in expected:
                 (_, item), = self.red_steps(self.workflows[workflow][job])
-                self.assertEqual(item["if"], "failure()", (workflow, job))
+                # check has no job-level if: rule (b3) of check-required-contexts.sh wants a classify guard on every step.
+                want = "failure() && needs.classify.outputs.cargo_skip != 'true'" if (workflow, job) == ("ci.yml", "check") else "failure()"
+                self.assertEqual(item["if"], want, (workflow, job))
                 self.assertEqual(item["coe"], "true", (workflow, job))
 
     def test_the_step_command_is_exactly_the_expected_one(self):

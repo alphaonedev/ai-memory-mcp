@@ -2563,6 +2563,13 @@ jobs:
           # disabled the fail-fast the invariants depend on.
           run_all 2>&1 | tee "$RESULT_LOG"
 
+      # #9709: a red leg names its failing test binaries and tests in the step summary and as annotations.
+      # Deterministic, no secret, no network, no LLM; never changes the job result.
+      - name: Red cause summary (#9709)
+        if: failure() && needs.classify.outputs.cargo_skip != 'true'
+        continue-on-error: true
+        run: python3 -I scripts/ci/red_cause_summary.py "${TEST_RESULT_LOG:-}" "${RUNNER_TEMP}/ci-shard"
+
       # Durable audit-history artifact (#4). Uploaded on success AND failure so
       # a red leg's full output is retrievable long after the log view expires.
       # A real JUnit XML would require swapping the runner to cargo-nextest —
@@ -3032,9 +3039,18 @@ jobs:
         run: cargo build --release --features sal
 
       - name: Run lib tests (sal feature)
+        # shell: bash = errexit + pipefail, so the tee below (#9709) cannot mask a red cargo test.
+        shell: bash
         env:
           AI_MEMORY_NO_CONFIG: "1"
-        run: cargo test --features sal --lib
+        run: |
+          mkdir -p "${RUNNER_TEMP}/red-cause"
+          cargo test --features sal --lib 2>&1 | tee "${RUNNER_TEMP}/red-cause/sal-lib.log"
+
+      - name: Red cause summary (#9709)
+        if: failure()
+        continue-on-error: true
+        run: python3 -I scripts/ci/red_cause_summary.py "${RUNNER_TEMP}/red-cause"
 
   # v1.0.0 #2257 — vectorlite OPT-IN feature gate. The `vectorlite` cargo
   # feature (#1860/#2219; `rusqlite/load_extension` + `src/vectorlite.rs`)
@@ -3086,14 +3102,26 @@ jobs:
         run: cargo clippy --all-targets --features vectorlite -- -D warnings -D clippy::all -D clippy::pedantic
 
       - name: Run vectorlite no-native-lib seam tests (#1860)
+        # shell: bash = errexit + pipefail, so the tee below (#9709) cannot mask a red cargo test.
+        shell: bash
         env:
           AI_MEMORY_NO_CONFIG: "1"
-        run: cargo test --features vectorlite --test vectorlite_1860
+        run: |
+          mkdir -p "${RUNNER_TEMP}/red-cause"
+          cargo test --features vectorlite --test vectorlite_1860 2>&1 | tee "${RUNNER_TEMP}/red-cause/vectorlite-1860.log"
 
       - name: Run config-precedence under vectorlite (#2256 feature-gated pin)
+        shell: bash
         env:
           AI_MEMORY_NO_CONFIG: "1"
-        run: cargo test --features vectorlite --test config_precedence
+        run: |
+          mkdir -p "${RUNNER_TEMP}/red-cause"
+          cargo test --features vectorlite --test config_precedence 2>&1 | tee "${RUNNER_TEMP}/red-cause/config-precedence.log"
+
+      - name: Red cause summary (#9709)
+        if: failure()
+        continue-on-error: true
+        run: python3 -I scripts/ci/red_cause_summary.py "${RUNNER_TEMP}/red-cause"
 
   # v0.6.5 — Dockerfile-build smoke. Runs on EVERY push to main / develop /
   # release/** AND on EVERY PR that touches code. Builds the Docker image;

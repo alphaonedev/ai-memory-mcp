@@ -652,6 +652,14 @@ jobs:
         # counts are thread-count-independent, so the per-module thresholds
         # are unaffected; the 110-minute job timeout (#7070) absorbs the serial run.
 
+      # #9709: the llvm-cov command shape above is pinned (Section E of
+      # scripts/test/test-ci-workflow-invariants.sh), so no tee capture is added
+      # here; the step reads ${RUNNER_TEMP}/red-cause and says so when it is absent.
+      - name: Red cause summary (#9709)
+        if: failure()
+        continue-on-error: true
+        run: python3 -I scripts/ci/red_cause_summary.py "${RUNNER_TEMP}/red-cause"
+
       - name: Enforce per-module thresholds
         id: thresholds
         run: |

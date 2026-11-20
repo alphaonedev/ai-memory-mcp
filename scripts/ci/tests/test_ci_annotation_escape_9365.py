@@ -1084,9 +1084,9 @@ class OsPlantNeverRuns(unittest.TestCase):
                     self.assertEqual(planted, clean)
 
     def test_sibling_scripts_os_plant_table_9365(self):
-        """Table over the 14 sibling scripts (the 13 of 0f1ec1b7 plus suite_budget of #9229): ``--help`` with an os.py plant equals the clean run."""
+        """Table over the 15 sibling scripts (the 13 of 0f1ec1b7 plus suite_budget of #9229 and red_cause_summary of #9709): ``--help`` with an os.py plant equals the clean run."""
         scripts = (*SIBLING_SCRIPTS, "scripts/test/pg_isolated_binary.py")
-        self.assertEqual(len(scripts), 14)
+        self.assertEqual(len(scripts), 15)
         layout = SiblingLoadInvariant.layout
         for rel in scripts:
             for where in OS_PLANT_PLACES:
