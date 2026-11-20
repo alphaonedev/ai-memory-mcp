@@ -34,6 +34,7 @@ import sys
 import tempfile
 import time
 import unittest
+import unittest.mock
 from pathlib import Path
 
 HARNESS_ROOT = Path(__file__).resolve().parents[3]
@@ -1550,10 +1551,7 @@ class OptionBRegion(LedgerCase):
                                                           "Quoted prose!, not a record."))
 
     def test_d3_real_release_range_passes(self):
-        probe = subprocess.run(["git", "-C", str(HARNESS_ROOT), "cat-file", "-e", RELEASE_SHA + "^{commit}"],
-                               capture_output=True, timeout=GIT_TIMEOUT_S, check=False)
-        if probe.returncode != 0:
-            self.skipTest(f"release commit {RELEASE_SHA} is not in this clone")
+        require_commit(self, RELEASE_SHA, "release commit")
         self.use_real_clock()  # W-4: the real range is judged by the real calendar
         ok, out = cert.check_change(HARNESS_ROOT, RELEASE_SHA, "HEAD")
         self.assert_pass(ok, out, RELEASE_PASS)
@@ -1887,13 +1885,7 @@ class TrackedDocFrozenReason9303(LedgerCase):
 
     def test_9303_real_range_9274_refused_as_frozen_region(self):
         for sha in (CHAIN_TIP_9274, HEAD_9274_R3):
-            probe = subprocess.run(["git", "-C", str(HARNESS_ROOT), "cat-file", "-e", sha + "^{commit}"],
-                                   capture_output=True, timeout=GIT_TIMEOUT_S, check=False)
-            if probe.returncode != 0:
-                if os.environ.get(CI_ENV):
-                    self.fail(f"commit {sha} is not in this clone: the CI replay fetch must bring "
-                              f"it ({REPLAY_FETCH_FLAG})")
-                self.skipTest(f"commit {sha} is not in this clone")
+            require_commit(self, sha, "commit")
         self.use_real_clock()  # W-4: real commits, so the real clock
         ok, out = cert.check_change(HARNESS_ROOT, CHAIN_TIP_9274, HEAD_9274_R3)
         self.assert_region_refused(ok, out, RANGE_9274_FIRST_DIFF)
@@ -2094,9 +2086,68 @@ class DocRecordForm(unittest.TestCase):
         self.assertIn(PATH_RESTRICTION, text)
 
 
+def require_commit(case, sha, what):
+    """A real-range cell needs `sha` in this clone. Under CI the replay fetch must have brought
+    it, so a missing commit is a failure there (#9303, #9593); outside CI the cell skips."""
+    probe = subprocess.run(["git", "-C", str(HARNESS_ROOT), "cat-file", "-e", sha + "^{commit}"],
+                           capture_output=True, timeout=GIT_TIMEOUT_S, check=False)
+    if probe.returncode == 0:
+        return
+    if os.environ.get(CI_ENV):
+        case.fail(f"{what} {sha} is not in this clone: the CI replay fetch must bring it ({REPLAY_FETCH_FLAG})")
+    case.skipTest(f"{what} {sha} is not in this clone")
+
+
 def replay_objects():
-    """X-3: the commits the real-range cell reads; CI fetches them like the corpus replay objects."""
-    return [CHAIN_TIP_9274, HEAD_9274_R3]
+    """X-3: the commits the real-range cells read; CI fetches them like the corpus replay objects.
+    RELEASE_SHA is D-3's base (#9593: the depth-2 unit-test job no longer deepens to it)."""
+    return [CHAIN_TIP_9274, HEAD_9274_R3, RELEASE_SHA]
+
+
+# #9593 (REVIEW-9684-security-r1 F2): the unit-test step moved to a depth-2 job, so the D-3
+# real-range cell lost the release commit that the old classify base deepen brought along.
+# A commit id no clone holds (all zero), and the two real-range cells with their messages.
+MISSING_COMMIT_9593 = "0" * 40
+REAL_RANGE_CELLS_9593 = (
+    ("OptionBRegion", "test_d3_real_release_range_passes", "RELEASE_SHA",
+     "release commit {sha} is not in this clone"),
+    ("TrackedDocFrozenReason9303", "test_9303_real_range_9274_refused_as_frozen_region", "CHAIN_TIP_9274",
+     "commit {sha} is not in this clone"),
+)
+
+
+class RealRangeReplay9593(unittest.TestCase):
+    """Every real-range cell gets its commits from the CI replay fetch and fails, never skips,
+    under CI=true when one is missing; outside CI it skips with the same reason."""
+
+    def test_9593_release_commit_is_a_replay_object(self):
+        self.assertIn(RELEASE_SHA, replay_objects())
+
+    def _run_cell(self, cls_name, method, constant, ci):
+        env = {k: v for k, v in os.environ.items() if k != CI_ENV}
+        if ci:
+            env[CI_ENV] = "true"
+        result = unittest.TestResult()
+        module = sys.modules[__name__]
+        with unittest.mock.patch.dict(os.environ, env, clear=True), \
+                unittest.mock.patch.object(module, constant, MISSING_COMMIT_9593):
+            getattr(module, cls_name)(method).run(result)
+        return result
+
+    def test_9593_missing_real_range_commit_fails_under_ci(self):
+        for cls_name, method, constant, reason in REAL_RANGE_CELLS_9593:
+            with self.subTest(cell=method):
+                result = self._run_cell(cls_name, method, constant, ci=True)
+                self.assertEqual((len(result.failures), len(result.errors), len(result.skipped)), (1, 0, 0))
+                self.assertIn(reason.format(sha=MISSING_COMMIT_9593) + ": the CI replay fetch must bring it ("
+                              + REPLAY_FETCH_FLAG + ")", result.failures[0][1])
+
+    def test_9593_missing_real_range_commit_skips_outside_ci(self):
+        for cls_name, method, constant, reason in REAL_RANGE_CELLS_9593:
+            with self.subTest(cell=method):
+                result = self._run_cell(cls_name, method, constant, ci=False)
+                self.assertEqual([r for _case, r in result.skipped], [reason.format(sha=MISSING_COMMIT_9593)])
+                self.assertEqual((result.failures, result.errors), ([], []))
 
 
 if __name__ == "__main__":
