@@ -13948,6 +13948,42 @@ const FIXTURE_PROBE_LINE_9719: &str = "FIXTURE_PROBE_9719";
 /// How far ahead of the spawn loop the common start instant is set.
 const FIXTURE_PROBE_LEAD_MS_9719: u128 = 3000;
 
+/// Field separator of the child result line.
+const FIXTURE_PROBE_SEP_9719: char = ' ';
+
+/// Number of fields in the child result line: prefix, HOME, keys dir, loaded.
+const FIXTURE_PROBE_FIELDS_9719: usize = 4;
+
+/// Writer half of the child-to-parent result line.
+fn format_probe_line_9719(home: &std::path::Path, keys: &std::path::Path, loaded: bool) -> String {
+    let sep = FIXTURE_PROBE_SEP_9719;
+    format!(
+        "{FIXTURE_PROBE_LINE_9719}{sep}{}{sep}{}{sep}{loaded}",
+        home.display(),
+        keys.display()
+    )
+}
+
+/// Parser half: the line split into its fields (prefix, HOME, keys, loaded).
+fn parse_probe_line_9719(line: &str) -> Vec<&str> {
+    line.split(FIXTURE_PROBE_SEP_9719).collect()
+}
+
+/// The result line must round-trip paths that carry a space (a target
+/// directory such as `/x/target dir/tmp`): exactly four fields, each exact.
+#[test]
+fn probe_line_round_trips_paths_with_spaces_9719() {
+    let home = std::path::Path::new("/x/target dir/tmp/integration-isolated-1/home");
+    let keys = std::path::Path::new("/x/target dir/tmp/integration-isolated-1/keys");
+    let line = format_probe_line_9719(home, keys, true);
+    let fields = parse_probe_line_9719(&line);
+    assert_eq!(fields.len(), FIXTURE_PROBE_FIELDS_9719, "line: {line}");
+    assert_eq!(fields[0], FIXTURE_PROBE_LINE_9719);
+    assert_eq!(fields[1], "/x/target dir/tmp/integration-isolated-1/home");
+    assert_eq!(fields[2], "/x/target dir/tmp/integration-isolated-1/keys");
+    assert_eq!(fields[3], "true");
+}
+
 /// Child half: a no-op unless the parent test set `FIXTURE_PROBE_ENV_9719`.
 #[test]
 fn fixture_probe_child_9719() {
@@ -13971,11 +14007,7 @@ fn fixture_probe_child_9719() {
     let (home, keys) = isolated_home_and_keys();
     let id = ai_memory::identity::resolve_agent_id(None, None).expect("agent id");
     let loaded = ai_memory::identity::keypair::load(&id, keys).is_ok();
-    println!(
-        "{FIXTURE_PROBE_LINE_9719} {} {} {loaded}",
-        home.display(),
-        keys.display()
-    );
+    println!("{}", format_probe_line_9719(home, keys, loaded));
 }
 
 #[test]
@@ -14013,8 +14045,12 @@ fn fixture_processes_get_distinct_loadable_key_dirs_9719() {
             .lines()
             .find(|l| l.starts_with(FIXTURE_PROBE_LINE_9719))
             .unwrap_or_else(|| panic!("no probe line in child output: {stdout}"));
-        let fields: Vec<&str> = line.split(' ').collect();
-        assert_eq!(fields.len(), 4, "probe line shape: {line}");
+        let fields = parse_probe_line_9719(line);
+        assert_eq!(
+            fields.len(),
+            FIXTURE_PROBE_FIELDS_9719,
+            "probe line shape: {line}"
+        );
         assert_eq!(
             fields[3], "true",
             "child saw an unloadable key pair: {line}"
