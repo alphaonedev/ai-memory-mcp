@@ -35,6 +35,10 @@ mod mcp_wait;
 #[path = "common/mcp_stdio_child.rs"]
 mod mcp_stdio_child;
 
+// #9367: the ONE resolver of what is test-only (#4198/#4200), never copied.
+#[path = "common/cfg_test_modules.rs"]
+mod cfg_test_modules;
+
 use mcp_stdio_child::{Fixture, Mcp};
 
 const NS: &str = "refl4059";
@@ -176,10 +180,7 @@ fn compositional_context_is_funnelled_not_allowlisted_4059() {
     let handler =
         std::fs::read_to_string(root.join("src/mcp/tools/skill_compositional_context.rs"))
             .expect("read handler");
-    let production = handler
-        .split("#[cfg(test)]")
-        .next()
-        .unwrap_or_default()
+    let production = cfg_test_modules::strip_cfg_test_inline_mods(&handler)
         .lines()
         .filter(|l| !l.trim_start().starts_with("//"))
         .collect::<Vec<_>>()

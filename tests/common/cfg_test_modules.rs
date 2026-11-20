@@ -591,8 +591,24 @@ pub fn cfg_test_mod_close_offset(lines: &[&str], decl_line: usize) -> usize {
 /// further attributes, then `mod NAME {`). Everything else is kept.
 /// FAILS CLOSED: an unclosed module panics ([`cfg_test_mod_close_offset`]).
 pub fn strip_cfg_test_inline_mods(text: &str) -> String {
-    let lines: Vec<&str> = text.lines().collect();
     let mut out = String::new();
+    for (line, kept) in text.lines().zip(cfg_test_inline_mod_kept_lines(text)) {
+        if kept {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// #9367 r1 — the per-line form of [`strip_cfg_test_inline_mods`]: one flag
+/// per `text.lines()` line, `false` for a line inside (or declaring) an
+/// inline test-only module. A scanner that holds two line-aligned copies of
+/// one file (the original and a literal-masked copy) decides on one copy and
+/// filters both with the same flags. FAILS CLOSED like the strip.
+pub fn cfg_test_inline_mod_kept_lines(text: &str) -> Vec<bool> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut kept = vec![true; lines.len()];
     let mut i = 0;
     while i < lines.len() {
         if cfg_requires_test(lines[i].trim()) {
@@ -605,15 +621,15 @@ pub fn strip_cfg_test_inline_mods(text: &str) -> String {
                 d.starts_with("mod ") && d.ends_with('{')
             });
             if opens_inline_mod {
-                i = d_at + cfg_test_mod_close_offset(&lines[d_at..], d_at) + 1;
+                let end = d_at + cfg_test_mod_close_offset(&lines[d_at..], d_at) + 1;
+                kept[i..end].fill(false);
+                i = end;
                 continue;
             }
         }
-        out.push_str(lines[i]);
-        out.push('\n');
         i += 1;
     }
-    out
+    kept
 }
 
 /// #4198 — THE production view of `src/` for every structural scanner:

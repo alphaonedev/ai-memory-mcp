@@ -188,7 +188,7 @@ pub mod owner_stamp;
 
 /// Environment variable override for `agent_id` (used by CLI via clap's
 /// `env = "AI_MEMORY_AGENT_ID"`; read directly for MCP fallback).
-const ENV_AGENT_ID: &str = "AI_MEMORY_AGENT_ID";
+pub(crate) const ENV_AGENT_ID: &str = "AI_MEMORY_AGENT_ID";
 
 /// v1.0.0 #3523 — the ONE read of [`ENV_AGENT_ID`] on the caller-resolution
 /// path, and the only place the test-only injection seam is consulted.

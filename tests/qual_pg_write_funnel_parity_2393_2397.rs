@@ -40,6 +40,10 @@
 #[path = "common/pg_sources.rs"]
 mod pg_sources;
 
+// #9367: the ONE resolver of what is test-only (#4198/#4200), never copied.
+#[path = "common/cfg_test_modules.rs"]
+mod cfg_test_modules;
+
 /// The postgres SAL adapter root, relative to `CARGO_MANIFEST_DIR`. The
 /// scanned source is the root PLUS every child module (see `pg_sources`).
 const PG_ADAPTER_PATH: &str = pg_sources::PG_ROOT_REL;
@@ -495,10 +499,11 @@ fn age_unprojection_follows_delegation_only_without_a_local_delete_8741() {
 }
 
 /// Split one adapter file into `(fn name, body)` spans at every `fn` item
-/// (any indentation), cutting the file at its first `#[cfg(test)]` item so
-/// test fixtures are never swept.
+/// (any indentation) of its production text: every `cfg(test)` module body is
+/// removed by the ONE resolver (#9367), so test fixtures are never swept and
+/// an adapter fn after an inner `#[cfg(test)]` item still is.
 fn child_fn_spans(text: &str) -> Vec<(String, String)> {
-    let prod = text.split("\n#[cfg(test)]").next().unwrap_or(text);
+    let prod = cfg_test_modules::strip_cfg_test_inline_mods(text);
     let mut out: Vec<(String, String)> = Vec::new();
     let mut cur: Option<(String, String)> = None;
     for line in prod.lines() {
