@@ -2591,8 +2591,10 @@ class TrustDecisionFirst(unittest.TestCase):
                          JOB_TIMEOUT_MINUTES)
         for job, minutes in JOB_TIMEOUT_MINUTES.items():
             with self.subTest(job=job):
-                widened = CI_YML.read_text().replace(
-                    "    timeout-minutes: %s\n" % minutes, "    timeout-minutes: 600\n", 1)
+                # Scoped to the job's own block: a step-level `timeout-minutes` of an
+                # earlier job (8 spaces) also contains the 4-space text (#9709).
+                widened = self.mutated(job, "    timeout-minutes: %s\n" % minutes,
+                                       "    timeout-minutes: 600\n")
                 self.assertNotEqual(widened, CI_YML.read_text())
                 again = yaml_subset_load(widened)["jobs"]
                 self.assertNotEqual(again[job].get("timeout-minutes"), minutes)
