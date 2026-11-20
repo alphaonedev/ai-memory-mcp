@@ -1454,6 +1454,95 @@ mod tests {
         assert!(shown.ends_with(" chars)"), "{shown}");
     }
 
+    /// Unicode 18 `General_Category=Cf` (170 scalars) plus U+2028/U+2029.
+    const HIDDEN_LIST_CODE_POINTS: usize = 172;
+
+    fn hidden_list() -> Vec<char> {
+        ('\0'..=char::MAX)
+            .filter(|&c| crate::yaml_frontmatter::is_hidden_text_char(c))
+            .collect()
+    }
+
+    /// #9636 — every code point of the one hidden-character list leaves the
+    /// text funnel as an escape, and the JSON filter keeps none of them raw.
+    #[test]
+    fn printed_escapes_every_hidden_list_code_point_9636() {
+        let list = hidden_list();
+        assert_eq!(list.len(), HIDDEN_LIST_CODE_POINTS);
+        let mut raw = Vec::new();
+        for c in list {
+            let cp = u32::from(c);
+            let shown = Printed::field(&format!("a{c}b")).to_string();
+            if shown != format!("a\\u{{{cp:x}}}b") {
+                raw.push(format!("U+{cp:04X} -> {shown:?}"));
+            }
+            let value = serde_json::json!({ "v": format!("a{c}b") });
+            let doc = serde_json::to_string(&value).expect("serialise");
+            let safe = json_for_terminal(&doc).expect("filter");
+            if safe.contains(c) {
+                raw.push(format!("U+{cp:04X} raw in JSON"));
+            }
+            let back: serde_json::Value = serde_json::from_str(&safe).expect("parse");
+            assert_eq!(back, value, "U+{cp:04X}");
+        }
+        assert!(raw.is_empty(), "{} reach the terminal raw: {raw:?}", raw.len());
+    }
+
+    /// #9636 — `ai-memory verify` text mode prints each code point of the
+    /// list inside a failure reason as an escape, on the exact edge line, and
+    /// keeps the `reason="{reason}"` literal the stale-contract gate reads
+    /// (#9660: the gate takes `reason="` out of that literal).
+    #[test]
+    fn render_text_escapes_every_hidden_list_code_point_in_reason_9636() {
+        const EDGE_LINE: &str = "  [FAIL] src-id-l -> tgt-id-l  attest=self_signed  reason=";
+        let list = hidden_list();
+        let edge = |reason: String| EdgeResult {
+            source_id: "src-id-long-1234".to_string(),
+            target_id: "tgt-id-long-5678".to_string(),
+            signature_hex: Some("aabb".to_string()),
+            attest_level: "self_signed".to_string(),
+            verified: false,
+            failure_reason: Some(reason),
+        };
+        let mut edges = vec![edge("tampered".to_string())];
+        edges.extend(list.iter().map(|c| edge(format!("x{c}y"))));
+        let report = ChainReport {
+            ok: false,
+            root_id: "0123456789abcdef0123".to_string(),
+            n_memories: 2,
+            chain_depth: 1,
+            edges_verified: 0,
+            edges_failed: edges.len(),
+            edges,
+            max_reflection_depth_per_namespace: std::collections::HashMap::new(),
+            bounded_status: "within_cap".to_string(),
+            root_cid: None,
+            cid_sweep: None,
+            signed_events: vec![],
+            generated_at: "2026-05-13T00:00:00Z".to_string(),
+        };
+        let mut stdout = Vec::<u8>::new();
+        let mut stderr = Vec::<u8>::new();
+        let mut out = crate::cli::CliOutput::from_std(&mut stdout, &mut stderr);
+        render_text(&report, &mut out).expect("render");
+        let s = String::from_utf8(stdout).expect("utf-8");
+        let got: Vec<&str> = s.lines().filter(|l| l.starts_with("  [FAIL]")).collect();
+        let mut want = vec![format!("{EDGE_LINE}\"tampered\"")];
+        want.extend(
+            list.iter()
+                .map(|&c| format!("{EDGE_LINE}\"x\\u{{{:x}}}y\"", u32::from(c))),
+        );
+        assert_eq!(got, want);
+
+        // The literal itself, split here so this cell does not match itself.
+        let pinned = ["write!(out.stdout, \"  reason=\\\"{", "reason}\\\"\")?;"].concat();
+        assert_eq!(
+            include_str!("verify.rs").matches(pinned.as_str()).count(),
+            1,
+            "{pinned}"
+        );
+    }
+
     fn open_test_db(tmp: &TempDir) -> (rusqlite::Connection, std::path::PathBuf) {
         let db_path = tmp.path().join("ai-memory.db");
         let conn = db::open(&db_path).expect("db::open");
