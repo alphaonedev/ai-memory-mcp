@@ -769,6 +769,9 @@ pub mod build_features;
 // future MCP `memory_checkpoint_*` handlers over a bare rusqlite Connection.
 pub mod checkpoints;
 // v1.0.0 #1836 (TRACT-gap G22) — non-authoritative Claim view + divergence record.
+/// #9367 — the per-agent api-key file: env names and readers shared by the
+/// CLI and the MCP federation forwarder.
+pub(crate) mod agent_key_file;
 pub mod claim;
 pub mod cli;
 pub mod color;
@@ -942,6 +945,9 @@ pub mod mtls_agent_binding;
 /// for the process-global `LINEAGE_DAG` atomic (#3577).
 #[cfg(test)]
 mod test_support;
+// #9367 — the lib's ONE include of the cfg(test) resolver (#4198/#4200).
+#[cfg(test)]
+mod test_resolver;
 // v0.7.0 Form 3 (issue #756) — multi-step ingest orchestrator. Batman
 // closeout: deterministic helpers run first (Jaccard, cosine, FTS
 // classifier), then LLM stages prepend a SHARED PREFIX and consume
