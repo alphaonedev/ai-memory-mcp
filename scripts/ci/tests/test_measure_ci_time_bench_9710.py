@@ -303,6 +303,10 @@ class NextestTests(unittest.TestCase):
         summary, _, why = mct.parse_nextest(["Summary [ 1.000s] 5 tests run: 5 passed (1 slow, 2 failed"])
         self.assertEqual((summary, why), (None, "unbalanced parenthesis in Summary clauses: '5 passed (1 slow, 2 failed'"))
 
+    def test_a_close_before_its_open_is_unbalanced_even_when_the_depth_returns_to_zero(self):
+        summary, _, why = mct.parse_nextest(["Summary [ 1.000s] 1 tests run: 1 passed ) 2 skipped ("])
+        self.assertEqual((summary, why), (None, "unbalanced parenthesis in Summary clauses: '1 passed ) 2 skipped ('"))
+
     def test_a_summary_line_of_an_unknown_form_is_a_reason(self):
         summary, _, why = mct.parse_nextest(["  Summary [ 1.0s] five tests ran"])
         self.assertEqual((summary, why), (None, "Summary line not understood: 'Summary [ 1.0s] five tests ran'"))
@@ -369,6 +373,13 @@ class BenchReportTests(unittest.TestCase):
             "Summary [  10.500s] 5 tests run: 2 passed (1 slow, 1 flaky), 1 failed, 2 timed out, 2 skipped"])
         self.assertEqual(lines[I_NX1], f"nextest-1.log (written {WRITTEN}): nextest Summary 10.5 s, 5 run, 2 passed, "
                                        "1 failed, 2 timed out, 2 skipped; 0 distinct FAIL names (== failed: NO)")
+        self.assertEqual(unmeasured, [])
+
+    def test_a_leaky_clause_is_printed_between_failed_and_skipped(self):
+        lines, _, unmeasured = self.report(nextest_1_log=[
+            "Summary [  10.500s] 5 tests run: 3 passed, 1 failed, 1 leaky, 2 skipped"])
+        self.assertEqual(lines[I_NX1], f"nextest-1.log (written {WRITTEN}): nextest Summary 10.5 s, 5 run, 3 passed, "
+                                       "1 failed, 1 leaky, 2 skipped; 0 distinct FAIL names (== failed: NO)")
         self.assertEqual(unmeasured, [])
 
     def test_a_build_log_without_a_finished_line_is_not_measured(self):
