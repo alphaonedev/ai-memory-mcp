@@ -12,20 +12,25 @@
 //! ## Exit codes
 //!
 //! - `0` — chain fully verified (or no signatures present and
-//!   `bounded_status != "exceeded_cap"`), and the root's content-id is
-//!   verified or was not checked (no genesis or no cid).
-//! - `1` — the root memory was not found (#3436).
+//!   `bounded_status != "exceeded_cap"`), the root's content-id is
+//!   verified or was not checked (no genesis or no cid), and (with
+//!   `--cid`) no swept row mismatched or was unreadable.
+//! - `1` — the root memory was not found (#3436), or the verdict could
+//!   not be computed (a storage error before anything is printed).
 //! - `2` — verification failed: at least one edge failed signature
 //!   verification, the chain exceeds its namespace
-//!   `max_reflection_depth` cap, or (#9505) the root's content-id
-//!   genesis mismatches its cid or cannot be read.
+//!   `max_reflection_depth` cap, (#9505) the root's content-id
+//!   genesis mismatches its cid or cannot be read, or (#9634) the
+//!   `--cid` sweep found a mismatched or unreadable row.
 //!
 //! ## Output formats
 //!
 //! - `--format text` (default) — human-readable report printed to
-//!   stdout.
+//!   stdout: exactly one summary line, and (#9636) every stored value
+//!   escaped and bounded by [`Printed`].
 //! - `--format json` — structured `AgenticMem Attest` tier evidence
-//!   packet serialised as JSON.
+//!   packet serialised as ONE JSON document (the `--cid` sweep is its
+//!   optional `cid_sweep` field).
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
@@ -58,11 +63,27 @@ pub struct VerifyChainArgs {
     /// v0.9.0 G8 (#1825) — opt-in fleet-wide content-id (cid) sweep:
     /// recompute every stamped memory's BLAKE3 address from its stored
     /// `cid_genesis` pre-image and report matches / mismatches. Detects
-    /// partial corruption of `cid` / `cid_genesis`. Detect-and-log only —
-    /// never mutates or refuses; `AI_MEMORY_CID_ENFORCE=1` raises the log
-    /// level of a mismatch to `WARN`.
+    /// partial corruption of `cid` / `cid_genesis`. Never mutates. #9634:
+    /// the sweep runs before anything is printed and is part of the one
+    /// verdict: a mismatched row or a row whose columns do not decode makes
+    /// `ok` false and the exit code `2`. `AI_MEMORY_CID_ENFORCE=1` raises
+    /// the log level of a mismatch to `WARN`.
     #[arg(long)]
     pub cid: bool,
+}
+
+/// #9634 — most mismatch and unreadable detail rows one sweep keeps (the
+/// counts stay exact; only the per-row detail is capped).
+pub const MAX_SWEEP_DETAIL_ROWS: usize = 100;
+
+/// #9634 — one swept row whose columns could not be decoded. The class is a
+/// fixed label; no stored byte of the row is kept.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UnreadableRow {
+    /// The row id, when the id column itself decodes.
+    pub id: Option<String>,
+    /// Why the row could not be read.
+    pub error_class: GenesisReadErrorClass,
 }
 
 /// v0.9.0 G8 (#1825) — outcome of a fleet-wide cid sweep.
@@ -74,42 +95,90 @@ pub struct CidSweepReport {
     pub cid_verified: usize,
     /// Rows whose recomputed address did NOT match (partial corruption).
     pub cid_mismatched: usize,
+    /// #9634 — rows whose `id`, `cid` or `cid_genesis` column does not
+    /// decode (a TEXT or numeric genesis, for example). A failure, like a
+    /// mismatch: the row's content-id cannot be confirmed.
+    pub cid_unreadable: usize,
     /// Rows with a `cid` but a NULL `cid_genesis` (e.g. forgotten rows,
     /// T7) — unverifiable, reported but not a failure.
     pub cid_unverifiable: usize,
-    /// Per-mismatch `id: description` detail (capped for output sanity).
+    /// Per-mismatch `id: description` detail (at most
+    /// [`MAX_SWEEP_DETAIL_ROWS`]).
     pub mismatches: Vec<String>,
+    /// #9634 — per-unreadable-row detail (at most [`MAX_SWEEP_DETAIL_ROWS`]).
+    pub unreadable: Vec<UnreadableRow>,
+}
+
+impl CidSweepReport {
+    /// `true` when no swept row mismatched and none was unreadable. An
+    /// unverifiable row (NULL genesis) does not fail the sweep.
+    #[must_use]
+    pub const fn passes(&self) -> bool {
+        self.cid_mismatched == 0 && self.cid_unreadable == 0
+    }
+}
+
+/// The three swept columns of one row.
+type SweepColumns = (String, Option<String>, Option<Vec<u8>>);
+
+/// #9634 — decode one swept row, classifying a column that does not decode
+/// by the error's type (never its text) with the root check's classifier.
+fn sweep_columns(row: &rusqlite::Row<'_>) -> Result<SweepColumns, GenesisReadErrorClass> {
+    let classify = |e: rusqlite::Error| GenesisReadErrorClass::of(&anyhow::Error::new(e));
+    Ok((
+        row.get(0).map_err(classify)?,
+        row.get(1).map_err(classify)?,
+        row.get(2).map_err(classify)?,
+    ))
 }
 
 /// v0.9.0 G8 (#1825) — run the fleet-wide cid sweep. Reads `(id, cid,
 /// cid_genesis)` for every row and verifies each stamped pair. Pure read;
 /// never mutates. A mismatch is logged at `WARN` when
-/// `AI_MEMORY_CID_ENFORCE` is truthy, else at `INFO` — NEVER refused.
+/// `AI_MEMORY_CID_ENFORCE` is truthy, else at `INFO`. #9634: a row whose
+/// columns do not decode is counted `cid_unreadable` with its class and the
+/// sweep goes on; the verb folds the report into its one verdict
+/// ([`ChainReport::with_cid_sweep`]).
 ///
 /// # Errors
 ///
-/// Propagates the database read error.
+/// Propagates a failure to prepare or step the query (the verdict could not
+/// be computed; nothing has been printed yet).
 pub fn run_cid_sweep(conn: &Connection) -> Result<CidSweepReport> {
     let enforce = crate::config::cid_enforce_enabled();
     let mut stmt =
         conn.prepare("SELECT id, cid, cid_genesis FROM memories WHERE cid IS NOT NULL")?;
-    let rows = stmt.query_map([], |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, Option<String>>(1)?,
-            r.get::<_, Option<Vec<u8>>>(2)?,
-        ))
-    })?;
+    let mut rows = stmt.query([])?;
 
     let mut report = CidSweepReport {
         checked: 0,
         cid_verified: 0,
         cid_mismatched: 0,
+        cid_unreadable: 0,
         cid_unverifiable: 0,
         mismatches: Vec::new(),
+        unreadable: Vec::new(),
     };
-    for row in rows {
-        let (id, cid, genesis) = row?;
+    while let Some(row) = rows.next()? {
+        let (id, cid, genesis) = match sweep_columns(row) {
+            Ok(columns) => columns,
+            Err(error_class) => {
+                report.cid_unreadable += 1;
+                // The id is detail only: an id that does not decode is
+                // reported as absent, the row is still counted.
+                let id = row.get::<_, String>(0).ok();
+                tracing::warn!(
+                    target: "cid.enforce",
+                    memory_id = %Printed::field(id.as_deref().unwrap_or("")),
+                    "cid row unreadable ({})",
+                    error_class.label()
+                );
+                if report.unreadable.len() < MAX_SWEEP_DETAIL_ROWS {
+                    report.unreadable.push(UnreadableRow { id, error_class });
+                }
+                continue;
+            }
+        };
         let (Some(cid), Some(genesis)) = (cid, genesis) else {
             report.cid_unverifiable += 1;
             continue;
@@ -119,18 +188,133 @@ pub fn run_cid_sweep(conn: &Connection) -> Result<CidSweepReport> {
             Ok(()) => report.cid_verified += 1,
             Err(mismatch) => {
                 report.cid_mismatched += 1;
-                if report.mismatches.len() < 100 {
-                    report.mismatches.push(format!("{id}: {mismatch}"));
-                }
+                let detail = format!("{id}: {mismatch}");
                 if enforce {
-                    tracing::warn!(target: "cid.enforce", memory_id = %id, "cid mismatch: {mismatch}");
+                    tracing::warn!(target: "cid.enforce", "cid mismatch: {}", Printed::field(&detail));
                 } else {
-                    tracing::info!(target: "cid.enforce", memory_id = %id, "cid mismatch (detect-only): {mismatch}");
+                    tracing::info!(target: "cid.enforce", "cid mismatch (detect-only): {}", Printed::field(&detail));
+                }
+                if report.mismatches.len() < MAX_SWEEP_DETAIL_ROWS {
+                    report.mismatches.push(detail);
                 }
             }
         }
     }
     Ok(report)
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// #9636 — the one print funnel for stored values
+// ─────────────────────────────────────────────────────────────────────
+
+/// #9636 — most characters one stored field may put on a text line. Long
+/// enough for every value the verb itself produces (a mismatch detail is
+/// about 220 characters); a longer stored value is cut and marked.
+pub const MAX_PRINTED_FIELD_CHARS: usize = 512;
+
+/// Edge ids are shown by this many leading characters.
+const EDGE_ID_PREFIX_CHARS: usize = 8;
+
+/// Shown in place of a swept row id that does not decode itself.
+const UNREADABLE_ID_LABEL: &str = "<id unreadable>";
+
+/// Characters that reorder or hide text on a terminal: zero-width and
+/// direction marks, bidi embeddings and isolates, the line and paragraph
+/// separators, and the byte-order mark.
+const fn is_hidden(c: char) -> bool {
+    matches!(
+        c,
+        '\u{200b}'..='\u{200f}'
+            | '\u{2028}'
+            | '\u{2029}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{feff}'
+    )
+}
+
+/// A character no stored value may put on a stream as itself.
+fn needs_escape(c: char) -> bool {
+    c.is_control() || is_hidden(c)
+}
+
+/// #9636 — a stored value as it may appear on a text line: every control or
+/// hidden character is written as `\u{..}`, and the output stops at
+/// `max_chars` characters with a `...(+N chars)` marker. Linear in the
+/// value. Every stored field the text renderer and the stderr lines print
+/// goes through it, so no stored byte can forge a line or drive a terminal.
+pub struct Printed<'a> {
+    value: &'a str,
+    max_chars: usize,
+    mark_cut: bool,
+}
+
+impl<'a> Printed<'a> {
+    /// A whole stored field, bounded by [`MAX_PRINTED_FIELD_CHARS`].
+    #[must_use]
+    pub const fn field(value: &'a str) -> Self {
+        Self {
+            value,
+            max_chars: MAX_PRINTED_FIELD_CHARS,
+            mark_cut: true,
+        }
+    }
+
+    /// The leading `chars` characters of a value, cut on a char boundary
+    /// and unmarked (an abbreviated id).
+    #[must_use]
+    pub const fn prefix(value: &'a str, chars: usize) -> Self {
+        Self {
+            value,
+            max_chars: chars,
+            mark_cut: false,
+        }
+    }
+}
+
+impl std::fmt::Display for Printed<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut written = 0usize;
+        let mut chars = self.value.chars();
+        while let Some(c) = chars.next() {
+            let escape = needs_escape(c).then(|| c.escape_unicode());
+            let width = escape.as_ref().map_or(1, ExactSizeIterator::len);
+            if written.saturating_add(width) > self.max_chars {
+                if self.mark_cut {
+                    let rest = 1 + chars.count();
+                    write!(f, "...(+{rest} chars)")?;
+                }
+                return Ok(());
+            }
+            match escape {
+                Some(escaped) => write!(f, "{escaped}")?,
+                None => write!(f, "{c}")?,
+            }
+            written += width;
+        }
+        Ok(())
+    }
+}
+
+/// #9636 — a serialised JSON document as it may reach a terminal: a control
+/// or hidden character inside a string (the encoder leaves DEL, C1 controls
+/// and bidi characters raw) is written as its `\uXXXX` JSON escape, so the
+/// document parses to the same value and no raw such character is printed.
+/// The line feeds of the pretty layout are kept.
+fn json_for_terminal(payload: &str) -> Result<String, std::fmt::Error> {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(payload.len());
+    for c in payload.chars() {
+        if c != '\n' && needs_escape(c) {
+            let mut units = [0u16; 2];
+            for unit in c.encode_utf16(&mut units) {
+                write!(out, "\\u{unit:04x}")?;
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    Ok(out)
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -265,14 +449,17 @@ pub struct ChainReport {
     /// chain. `true` when every edge verified AND no namespace
     /// exceeded its governance cap AND (#9505) the root content-id
     /// check, when it ran (`root_cid` set), is `verified`: a root
-    /// genesis that mismatches or cannot be read makes it `false`.
+    /// genesis that mismatches or cannot be read makes it `false`; AND
+    /// (#9634) the `--cid` sweep, when it ran (`cid_sweep` set), found no
+    /// mismatched and no unreadable row.
     /// Surfaced as the first field on the JSON wire shape so external
     /// auditors / CI scripts can `jq '.ok'` instead of recomputing the
     /// predicate. The shell exit code mirrors this field: `0` when
     /// `ok = true`, `2` when `ok = false` (matching the
     /// `verify-forensic-bundle` exit convention, also raised to `2`
-    /// in #709). The verb sets it ONCE, after the root check and before
-    /// anything is printed ([`ChainReport::with_root_cid`]).
+    /// in #709). The verb sets it ONCE, after the root check and the sweep
+    /// and before anything is printed ([`ChainReport::with_root_cid`],
+    /// [`ChainReport::with_cid_sweep`]).
     pub ok: bool,
     /// Root memory id supplied on the command line.
     pub root_id: String,
@@ -298,6 +485,11 @@ pub struct ChainReport {
     /// builder never sets it, so `verification.json` is unchanged.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub root_cid: Option<RootCidCheck>,
+    /// #9634 — the `--cid` sweep, embedded in the one report. Additive and
+    /// optional: `None` (no `--cid`) is omitted from the JSON, and the
+    /// forensic-bundle builder never sets it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cid_sweep: Option<CidSweepReport>,
     /// Optional `signed_events` entries when `--include-signed-events`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub signed_events: Vec<SignedEventSummary>,
@@ -315,6 +507,18 @@ impl ChainReport {
             self.ok = self.ok && verdict.passes();
         }
         self.root_cid = check;
+        self
+    }
+
+    /// #9634 — record the `--cid` sweep and fold it into the ONE final `ok`:
+    /// a mismatched or unreadable row makes `ok` false; no sweep (`None`)
+    /// leaves it as it was.
+    #[must_use]
+    pub fn with_cid_sweep(mut self, sweep: Option<CidSweepReport>) -> Self {
+        if let Some(report) = &sweep {
+            self.ok = self.ok && report.passes();
+        }
+        self.cid_sweep = sweep;
         self
     }
 }
@@ -590,6 +794,7 @@ pub fn build_chain_report_at(
         max_reflection_depth_per_namespace: max_depth_per_ns,
         bounded_status,
         root_cid: None,
+        cid_sweep: None,
         signed_events,
         generated_at,
     })
@@ -681,11 +886,13 @@ fn verify_edge(
 // Text renderer
 // ─────────────────────────────────────────────────────────────────────
 
+/// #9636 — every stored value below goes through [`Printed`]; the verdict
+/// and the counts are the verb's own values.
 pub(super) fn render_text(report: &ChainReport, out: &mut CliOutput<'_>) -> Result<()> {
     writeln!(
         out.stdout,
         "verify-reflection-chain: root={} memories={} depth={} edges={} failed={} ok={}",
-        report.root_id,
+        Printed::field(&report.root_id),
         report.n_memories,
         report.chain_depth,
         report.edges.len(),
@@ -698,10 +905,14 @@ pub(super) fn render_text(report: &ChainReport, out: &mut CliOutput<'_>) -> Resu
     // before this function runs. Not checked = no line.
     match &report.root_cid {
         Some(RootCidCheck::Verified { cid }) => {
-            writeln!(out.stdout, "cid_verified:   true ({cid})")?
+            writeln!(out.stdout, "cid_verified:   true ({})", Printed::field(cid))?;
         }
         Some(RootCidCheck::Mismatch { cid }) => {
-            writeln!(out.stdout, "cid_verified:   false ({cid})")?;
+            writeln!(
+                out.stdout,
+                "cid_verified:   false ({})",
+                Printed::field(cid)
+            )?;
         }
         Some(RootCidCheck::Unreadable { error_class }) => writeln!(
             out.stdout,
@@ -716,7 +927,7 @@ pub(super) fn render_text(report: &ChainReport, out: &mut CliOutput<'_>) -> Resu
         let mut ns_vec: Vec<_> = report.max_reflection_depth_per_namespace.iter().collect();
         ns_vec.sort_by_key(|(ns, _)| ns.as_str());
         for (ns, depth) in ns_vec {
-            writeln!(out.stdout, "  {ns}: {depth}")?;
+            writeln!(out.stdout, "  {}: {depth}", Printed::field(ns))?;
         }
     }
 
@@ -724,15 +935,17 @@ pub(super) fn render_text(report: &ChainReport, out: &mut CliOutput<'_>) -> Resu
         writeln!(out.stdout, "\nedges:")?;
         for e in &report.edges {
             let status = if e.verified { "OK" } else { "FAIL" };
-            let src_short = &e.source_id[..e.source_id.len().min(8)];
-            let tgt_short = &e.target_id[..e.target_id.len().min(8)];
+            // Char-boundary prefixes (OWNERSHIP-15): a byte slice of a
+            // stored id could split a multi-byte character and panic.
             write!(
                 out.stdout,
-                "  [{status}] {src_short} -> {tgt_short}  attest={}",
-                e.attest_level,
+                "  [{status}] {} -> {}  attest={}",
+                Printed::prefix(&e.source_id, EDGE_ID_PREFIX_CHARS),
+                Printed::prefix(&e.target_id, EDGE_ID_PREFIX_CHARS),
+                Printed::field(&e.attest_level),
             )?;
             if let Some(ref reason) = e.failure_reason {
-                write!(out.stdout, "  reason=\"{reason}\"")?;
+                write!(out.stdout, "  reason=\"{}\"", Printed::field(reason))?;
             }
             writeln!(out.stdout)?;
         }
@@ -748,10 +961,34 @@ pub(super) fn render_text(report: &ChainReport, out: &mut CliOutput<'_>) -> Resu
             writeln!(
                 out.stdout,
                 "  {} | {} | {} | sig={}",
-                ev.event_id,
-                ev.event_type,
-                ev.timestamp,
+                Printed::field(&ev.event_id),
+                Printed::field(&ev.event_type),
+                Printed::field(&ev.timestamp),
                 if ev.signature_present { "yes" } else { "no" }
+            )?;
+        }
+    }
+
+    // #9634 — the `--cid` sweep, decided before this function runs.
+    if let Some(sweep) = &report.cid_sweep {
+        writeln!(
+            out.stdout,
+            "cid sweep: checked={} verified={} mismatched={} unreadable={} unverifiable={}",
+            sweep.checked,
+            sweep.cid_verified,
+            sweep.cid_mismatched,
+            sweep.cid_unreadable,
+            sweep.cid_unverifiable
+        )?;
+        for m in &sweep.mismatches {
+            writeln!(out.stdout, "  MISMATCH {}", Printed::field(m))?;
+        }
+        for row in &sweep.unreadable {
+            writeln!(
+                out.stdout,
+                "  UNREADABLE {} ({})",
+                Printed::field(row.id.as_deref().unwrap_or(UNREADABLE_ID_LABEL)),
+                row.error_class.label()
             )?;
         }
     }
@@ -816,12 +1053,13 @@ pub fn run(db_path: &Path, args: &VerifyChainArgs, out: &mut CliOutput<'_>) -> R
                 "not_found": true,
                 "error": crate::errors::msg::not_found(&args.memory_id),
             });
-            writeln!(out.stdout, "{}", serde_json::to_string_pretty(&payload)?)?;
+            let payload = serde_json::to_string_pretty(&payload)?;
+            writeln!(out.stdout, "{}", json_for_terminal(&payload)?)?;
         } else {
             writeln!(
                 out.stderr,
                 "{}",
-                crate::errors::msg::not_found(&args.memory_id)
+                Printed::field(&crate::errors::msg::not_found(&args.memory_id))
             )?;
         }
         return Ok(1);
@@ -831,21 +1069,30 @@ pub fn run(db_path: &Path, args: &VerifyChainArgs, out: &mut CliOutput<'_>) -> R
     // runs BEFORE anything is printed, in both modes, and folds into the ONE
     // final `ok` that the summary, the JSON and the exit code all read. The
     // root row is the one resolved above: no second read, nothing swallowed.
+    // #9634 — the `--cid` sweep runs here too, before any output, and is
+    // embedded in the same report: one JSON document, one summary line.
     let root_cid = root.as_ref().and_then(|row| check_root_cid(&conn, row));
+    let cid_sweep = if args.cid {
+        Some(run_cid_sweep(&conn)?)
+    } else {
+        None
+    };
     let report = build_chain_report(&conn, &args.memory_id, args.include_signed_events)?
-        .with_root_cid(root_cid);
+        .with_root_cid(root_cid)
+        .with_cid_sweep(cid_sweep);
 
     if json {
         let payload = serde_json::to_string_pretty(&report).context("serialise chain report")?;
-        writeln!(out.stdout, "{payload}")?;
+        writeln!(out.stdout, "{}", json_for_terminal(&payload)?)?;
     } else {
         render_text(&report, out)?;
     }
     match &report.root_cid {
         Some(RootCidCheck::Mismatch { cid }) => writeln!(
             out.stderr,
-            "verify-reflection-chain: root content-id mismatch (cid {cid}): the stored genesis \
-             is not the pre-image of the cid; verification failed"
+            "verify-reflection-chain: root content-id mismatch (cid {}): the stored genesis \
+             is not the pre-image of the cid; verification failed",
+            Printed::field(cid)
         )?,
         Some(RootCidCheck::Unreadable { error_class }) => writeln!(
             out.stderr,
@@ -854,32 +1101,25 @@ pub fn run(db_path: &Path, args: &VerifyChainArgs, out: &mut CliOutput<'_>) -> R
         )?,
         Some(RootCidCheck::Verified { .. }) | None => {}
     }
-
-    // v0.9.0 G8 (#1825) — opt-in fleet-wide cid sweep.
-    if args.cid {
-        let sweep = run_cid_sweep(&conn)?;
-        if json {
-            let payload =
-                serde_json::to_string_pretty(&sweep).context("serialise cid sweep report")?;
-            writeln!(out.stdout, "{payload}")?;
-        } else {
-            writeln!(
-                out.stdout,
-                "cid sweep: checked={} verified={} mismatched={} unverifiable={}",
-                sweep.checked, sweep.cid_verified, sweep.cid_mismatched, sweep.cid_unverifiable
-            )?;
-            for m in &sweep.mismatches {
-                writeln!(out.stdout, "  MISMATCH {m}")?;
-            }
-        }
+    if let Some(sweep) = report.cid_sweep.as_ref().filter(|s| !s.passes()) {
+        writeln!(
+            out.stderr,
+            "verify-reflection-chain: cid sweep failed (mismatched={} unreadable={}); \
+             verification failed",
+            sweep.cid_mismatched, sweep.cid_unreadable
+        )?;
     }
 
     // Exit code mirrors `report.ok`. The predicate is
     // `edges_failed == 0 && bounded_status != "exceeded_cap"` AND (#9505)
-    // a checked root content-id is `verified` (a mismatch or an unreadable
-    // genesis is a failed verification, exit 2, never the generic `Err`
-    // path, which `main` turns into exit 1 = NOT FOUND's code). It is set
-    // once, by `with_root_cid`, before anything was printed.
+    // a checked root content-id is `verified` AND (#9634) the `--cid`
+    // sweep, when asked for, found no mismatched and no unreadable row. A
+    // failed check is a failed verification, exit 2, never the generic
+    // `Err` path, which `main` turns into exit 1 = NOT FOUND's code. It is
+    // set once, by `with_root_cid` and `with_cid_sweep`, before anything
+    // was printed. A sweep query that cannot be prepared or stepped is the
+    // one `Err` left: the verdict could not be computed, nothing was
+    // printed, and stderr names the cause.
     if report.ok { Ok(0) } else { Ok(2) }
 }
 
@@ -976,6 +1216,84 @@ mod tests {
             assert_eq!(got, *want, "{name}");
             assert_eq!(got.label(), *label, "{name}");
         }
+    }
+
+    /// #9636 — the funnel escapes every control and hidden character, keeps
+    /// ordinary text (multi-byte included) as is, and cuts on the output
+    /// bound with an exact marker.
+    #[test]
+    fn printed_escapes_and_bounds_stored_values_9636() {
+        let cases: &[(&str, &str)] = &[
+            ("b3:abc", "b3:abc"),
+            ("a\nb", "a\\u{a}b"),
+            ("a\rb", "a\\u{d}b"),
+            ("\u{1b}[2J", "\\u{1b}[2J"),
+            ("\u{9b}2J", "\\u{9b}2J"),
+            ("\u{7f}", "\\u{7f}"),
+            ("x\0y", "x\\u{0}y"),
+            ("\u{202e}ab\u{2066}", "\\u{202e}ab\\u{2066}"),
+            ("\u{200b}\u{feff}\u{2028}", "\\u{200b}\\u{feff}\\u{2028}"),
+            ("héllo ✓ 日本", "héllo ✓ 日本"),
+        ];
+        for (value, want) in cases {
+            assert_eq!(Printed::field(value).to_string(), *want, "{value:?}");
+        }
+
+        let long = "x".repeat(MAX_PRINTED_FIELD_CHARS + 10);
+        assert_eq!(
+            Printed::field(&long).to_string(),
+            format!("{}...(+10 chars)", "x".repeat(MAX_PRINTED_FIELD_CHARS))
+        );
+        let exact = "y".repeat(MAX_PRINTED_FIELD_CHARS);
+        assert_eq!(Printed::field(&exact).to_string(), exact);
+        // An escape that would cross the bound is not split.
+        let edge = format!("{}\n", "z".repeat(MAX_PRINTED_FIELD_CHARS - 2));
+        assert_eq!(
+            Printed::field(&edge).to_string(),
+            format!("{}...(+1 chars)", "z".repeat(MAX_PRINTED_FIELD_CHARS - 2))
+        );
+
+        // Abbreviated ids cut on a char boundary, unmarked (OWNERSHIP-15).
+        assert_eq!(
+            Printed::prefix("日本語のメモリーです", 8).to_string(),
+            "日本語のメモリー"
+        );
+        assert_eq!(Printed::prefix("ab", 8).to_string(), "ab");
+    }
+
+    /// #9636 — the JSON terminal filter keeps the document's value and
+    /// prints no raw control or hidden character.
+    #[test]
+    fn json_for_terminal_keeps_the_value_and_escapes_9636() {
+        let value = serde_json::json!({
+            "cid": "a\u{9b}b\u{202e}c\u{7f}d\u{feff}\n😀",
+            "plain": "héllo",
+        });
+        let pretty = serde_json::to_string_pretty(&value).expect("serialise");
+        let safe = json_for_terminal(&pretty).expect("filter");
+        assert!(
+            safe.chars().all(|c| c == '\n' || !needs_escape(c)),
+            "{safe:?}"
+        );
+        let back: serde_json::Value = serde_json::from_str(&safe).expect("parse");
+        assert_eq!(back, value);
+    }
+
+    /// #9636 — an oversized value is printed in linear time and bounded.
+    #[test]
+    fn printed_large_value_is_bounded_and_fast_9636() {
+        const LARGE_CHARS: usize = 1_000_000;
+        const DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+        let large = "\u{1b}".repeat(LARGE_CHARS);
+        let started = std::time::Instant::now();
+        let shown = Printed::field(&large).to_string();
+        assert!(started.elapsed() < DEADLINE, "{:?}", started.elapsed());
+        assert!(
+            shown.chars().count() <= MAX_PRINTED_FIELD_CHARS + 32,
+            "{}",
+            shown.len()
+        );
+        assert!(shown.ends_with(" chars)"), "{shown}");
     }
 
     fn open_test_db(tmp: &TempDir) -> (rusqlite::Connection, std::path::PathBuf) {
@@ -1346,6 +1664,7 @@ mod tests {
             max_reflection_depth_per_namespace: ns,
             bounded_status: "within_cap".to_string(),
             root_cid: None,
+            cid_sweep: None,
             signed_events: vec![SignedEventSummary {
                 memory_id: "agent-x".to_string(),
                 event_id: "ev-1".to_string(),
@@ -1384,6 +1703,7 @@ mod tests {
             max_reflection_depth_per_namespace: std::collections::HashMap::new(),
             bounded_status: "no_cap_configured".to_string(),
             root_cid: None,
+            cid_sweep: None,
             signed_events: vec![SignedEventSummary {
                 memory_id: "agent-y".to_string(),
                 event_id: "ev-2".to_string(),
