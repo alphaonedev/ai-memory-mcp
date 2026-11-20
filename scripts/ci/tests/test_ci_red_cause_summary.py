@@ -1151,6 +1151,94 @@ class CleanedByConstruction(Scratch):
                 self.assertNotIn(secret, text)
 
 
+# Hand-written: every key prefix of NAME_TOKEN_MARKERS, never read from the module (#9709 r3 D1). A body of
+# underscore-separated groups has no 32-character alphanumeric run, so only the marker (and the base64url run of the
+# redaction) can mask a name built from it.
+KEY_PREFIXES = ("ghp_", "gho_", "ghs_", "ghu_", "ghr_", "github_pat_", "sk-", "eyJ")
+UNDERSCORE_BODY = "A1b2_C3d4_E5f6_G7h8_J9k1_L2m3_N4p5_Q6r7"
+RENDER_NAME_BOUND = 300  # written out: the line bound MAX_LINE_BYTES, never read from the module
+
+
+class NameMarkerAndLengthRows(Scratch):
+    """#9709 r3 D1 and D16: the two guards of render_name that the first rows left alive. A name with the plain Rust
+    path shape is printed as written only when it is at most the line bound and has no key prefix and no long run."""
+
+    def module(self):
+        module = load_module()
+        module.load_redaction()
+        return module
+
+    def test_a_name_with_a_key_prefix_is_masked_even_with_the_plain_path_shape(self):
+        module = self.module()
+        for prefix in KEY_PREFIXES:
+            raw = "tests::" + prefix + UNDERSCORE_BODY
+            with self.subTest(prefix=prefix):
+                shown = module.render_name(raw).text
+                self.assertNotEqual(shown, raw)
+                self.assertNotIn(UNDERSCORE_BODY[:20], shown)
+
+    def test_the_same_body_without_a_key_prefix_prints_as_written(self):
+        module = self.module()
+        raw = "tests::x_" + UNDERSCORE_BODY
+        self.assertEqual(module.render_name(raw).text, raw)
+
+    def test_a_name_over_the_line_bound_is_cut_and_masked_and_one_at_the_bound_is_not(self):
+        module = self.module()
+        at_bound = ("a_" * RENDER_NAME_BOUND)[:RENDER_NAME_BOUND]
+        over = ("a_" * RENDER_NAME_BOUND)[:RENDER_NAME_BOUND + 1]
+        huge = ("a_" * 5000)[:10000]
+        self.assertEqual(module.render_name(at_bound).text, at_bound)
+        for raw in (over, huge):
+            with self.subTest(length=len(raw)):
+                shown = module.render_name(raw).text
+                self.assertNotEqual(shown, raw)
+                self.assertLessEqual(len(shown), RENDER_NAME_BOUND)
+
+
+def pin_problems(text):
+    """The problems of a live-pin file text: its ``# count:`` header must equal the number of names it lists, and no
+    name may repeat. The header is the source the count is derived from; no count is written in this module."""
+    lines = text.splitlines()
+    names = [line.strip() for line in lines if line.strip() and not line.lstrip().startswith("#")]
+    headers = [m.group(1) for m in (re.match(r"^#\s*count:\s*(\d+)\s*$", line) for line in lines) if m]
+    problems = []
+    if len(headers) != 1:
+        problems.append("the pin has %d count headers, expected 1" % len(headers))
+    elif int(headers[0]) != len(names):
+        problems.append("the pin header says %s names, the file lists %d" % (headers[0], len(names)))
+    if len(set(names)) != len(names):
+        problems.append("the pin lists a name twice")
+    return problems
+
+
+class RequiredPinCount(unittest.TestCase):
+    """#9709 r3: the live-pin file lists as many required contexts as its own header says; the count is derived from
+    that header, never written as a number here."""
+
+    PIN = REPO / "scripts" / "qc-allowlists" / "required-contexts-live-pin.txt"
+
+    def test_the_pin_lists_exactly_the_names_its_header_counts(self):
+        self.assertEqual(pin_problems(self.PIN.read_text(encoding="utf-8")), [])
+
+    def test_a_dropped_name_is_a_count_problem(self):
+        text = self.PIN.read_text(encoding="utf-8")
+        lines = text.splitlines()
+        first_name = next(i for i, line in enumerate(lines) if line.strip() and not line.startswith("#"))
+        del lines[first_name]
+        problems = pin_problems("\n".join(lines) + "\n")
+        self.assertEqual(len(problems), 1)
+        self.assertRegex(problems[0], r"^the pin header says \d+ names, the file lists \d+$")
+
+    def test_a_repeated_name_and_a_missing_header_are_problems(self):
+        text = self.PIN.read_text(encoding="utf-8")
+        lines = text.splitlines()
+        first_name = next(i for i, line in enumerate(lines) if line.strip() and not line.startswith("#"))
+        repeated = "\n".join(lines[:first_name + 1] + [lines[first_name]] + lines[first_name + 1:]) + "\n"
+        self.assertIn("the pin lists a name twice", pin_problems(repeated))
+        headless = "\n".join(line for line in lines if not re.match(r"^#\s*count:", line)) + "\n"
+        self.assertEqual(pin_problems(headless), ["the pin has 0 count headers, expected 1"])
+
+
 class Census(unittest.TestCase):
     """At least 99% of the repository's real fn names print unmasked (fixture: gen_red_cause_census_9709.py)."""
 
