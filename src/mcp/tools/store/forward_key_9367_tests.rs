@@ -885,3 +885,8 @@ fn reader_and_env_names_live_in_the_one_neutral_module_9367() {
         "the transport imports the neutral module"
     );
 }
+
+/// r1 Class A: the action-id route table (a child, so it reuses this
+/// module's clean-child and recording-server helpers).
+#[path = "forward_route_9367_tests.rs"]
+mod forward_route_9367_tests;

@@ -371,6 +371,47 @@ fn the_production_boundary_heuristic_is_load_bearing_2572() {
     );
 }
 
+/// PR 9586 r1 Class B: production text comes from the shared resolver, never
+/// from a cut at the FIRST test marker. An indented `#[cfg(test)]` on one item
+/// early in a file (src/cli/doctor.rs has one at line 1071, 4475 lines before
+/// its test module) must not hide the guard calls that follow it.
+#[test]
+fn a_guard_call_after_an_early_indented_test_marker_is_counted_9367() {
+    let src = "fn verb() {\n    #[cfg(test)]\n    let _probe = 1;\n}\n\
+               fn later(db_path: &Path, out: &mut W) -> Result<()> {\n    \
+               crate::cli::backup::refuse_pg_store(db_path, VERB, out)?;\n    Ok(())\n}\n\
+               #[cfg(test)]\nmod tests {\n    fn t() { backup::refuse_pg_store(p, \"x\", o); }\n}\n";
+    assert_eq!(
+        count_guard_calls(src),
+        1,
+        "the production guard call after an early item-level marker is counted; \
+         the one inside the test module is not"
+    );
+    // The same for `mod tests {` text inside a string or a nested item: only
+    // a real `#[cfg(test)]` module body is removed.
+    let src = "const DOC: &str = \"mod tests {\";\n\
+               fn verb() { crate::cli::backup::refuse_pg_store(p, VERB, o)?; }\n";
+    assert_eq!(
+        count_guard_calls(src),
+        1,
+        "a marker inside a literal is not a cut"
+    );
+}
+
+/// Note pinned (not a finding): the resolver keeps a one-line
+/// `#[cfg(test)] mod tests { ... }` (the module body on the attribute's line)
+/// as production text. It errs toward scanning MORE; no file under `src/`
+/// uses that form. If the resolver ever starts removing it, this cell says so.
+#[test]
+fn a_one_line_test_module_is_kept_as_production_text_9367() {
+    let src = "#[cfg(test)] mod tests { fn t() { backup::refuse_pg_store(p, \"x\", o); } }\n";
+    assert_eq!(
+        count_guard_calls(src),
+        1,
+        "the one-line test module form is scanned as production text (errs toward more)"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // R-203 — behavioral proof against the real binary.
 //
