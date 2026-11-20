@@ -307,7 +307,7 @@ impl std::fmt::Display for Printed<'_> {
 
 /// #9636 — a serialised JSON document as it may reach a terminal: a control
 /// or hidden character inside a string (the encoder leaves DEL, C1 controls
-/// and bidi characters raw) is written as its `\uXXXX` JSON escape, so the
+/// and bidi characters raw) is written as its backslash-u JSON escape (four hex digits), so the
 /// document parses to the same value and no raw such character is printed.
 /// The line feeds of the pretty layout are kept.
 fn json_for_terminal(payload: &str) -> Result<String, std::fmt::Error> {
