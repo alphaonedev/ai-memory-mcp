@@ -136,11 +136,16 @@ struct Run {
 }
 
 fn run_lib(path: &Path, format: &str) -> Run {
+    run_lib_with(path, format, false)
+}
+
+/// The library entry point; `cid` adds the fleet-wide `--cid` sweep.
+fn run_lib_with(path: &Path, format: &str, cid: bool) -> Run {
     let args = VerifyChainArgs {
         memory_id: ROOT_ID.to_string(),
         format: format.to_string(),
         include_signed_events: false,
-        cid: false,
+        cid,
     };
     let mut stdout = Vec::<u8>::new();
     let mut stderr = Vec::<u8>::new();
@@ -161,6 +166,11 @@ fn run_lib(path: &Path, format: &str) -> Run {
 }
 
 fn run_bin(dir: &Path, path: &Path, json_mode: bool) -> Output {
+    run_bin_with(dir, path, json_mode, false)
+}
+
+/// The built binary; `cid` adds the fleet-wide `--cid` sweep.
+fn run_bin_with(dir: &Path, path: &Path, json_mode: bool, cid: bool) -> Output {
     let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_ai-memory"));
     cmd.current_dir(dir)
         .env("AI_MEMORY_NO_CONFIG", "1")
@@ -169,6 +179,9 @@ fn run_bin(dir: &Path, path: &Path, json_mode: bool) -> Output {
         .args(["verify-reflection-chain", ROOT_ID]);
     if json_mode {
         cmd.args(["--format", "json"]);
+    }
+    if cid {
+        cmd.arg("--cid");
     }
     cmd.output().expect("spawn ai-memory")
 }
@@ -580,4 +593,503 @@ fn forensic_export_doc_lists_exit_codes_0_1_2_9507() {
         "1 is not verification failure: {}",
         rows[1]
     );
+}
+
+// ---- #9634: the `--cid` sweep decides before anything prints -------------------
+
+/// A second memory, so a sweep can find a bad row that is not the root.
+const OTHER_ID: &str = "other-9505";
+const OTHER_CREATED_AT: &str = "2026-03-01T00:00:00Z";
+const SWEEP_LINE: &str = "cid sweep: ";
+const STDERR_SWEEP_FAILED: &str = "cid sweep failed";
+/// The two output modes, by their `--format` value.
+const FORMATS: [&str; 2] = ["text", "json"];
+
+/// One root content-id state, with what `--cid` must count for it.
+struct SweepCase {
+    label: &'static str,
+    /// `None` keeps the genesis the insert wrote (verified).
+    genesis_sql: Option<&'static str>,
+    code: i32,
+    checked: u64,
+    verified: u64,
+    mismatched: u64,
+    unreadable: u64,
+    unverifiable: u64,
+}
+
+const SWEEP_CASES: [SweepCase; 4] = [
+    SweepCase {
+        label: "verified",
+        genesis_sql: None,
+        code: EXIT_OK,
+        checked: 1,
+        verified: 1,
+        mismatched: 0,
+        unreadable: 0,
+        unverifiable: 0,
+    },
+    SweepCase {
+        label: "mismatch",
+        genesis_sql: Some(MISMATCH_GENESIS_SQL),
+        code: EXIT_FAILED,
+        checked: 1,
+        verified: 0,
+        mismatched: 1,
+        unreadable: 0,
+        unverifiable: 0,
+    },
+    SweepCase {
+        label: "unreadable",
+        genesis_sql: Some(UNREADABLE_GENESIS[0].0),
+        code: EXIT_FAILED,
+        checked: 0,
+        verified: 0,
+        mismatched: 0,
+        unreadable: 1,
+        unverifiable: 0,
+    },
+    SweepCase {
+        label: "absent",
+        genesis_sql: Some("NULL"),
+        code: EXIT_OK,
+        checked: 0,
+        verified: 0,
+        mismatched: 0,
+        unreadable: 0,
+        unverifiable: 1,
+    },
+];
+
+fn set_genesis_of(conn: &Connection, id: &str, value_sql: &str) {
+    conn.execute(
+        &format!("UPDATE memories SET cid_genesis = {value_sql} WHERE id = ?1"),
+        [id],
+    )
+    .expect("set genesis");
+}
+
+/// A good root plus a second row whose genesis is `other_genesis_sql`.
+fn seeded_db_with_other(dir: &Path, other_genesis_sql: &str) -> PathBuf {
+    let path = seeded_db(dir, None);
+    let conn = db::open(&path).expect("reopen scratch db");
+    db::insert(&conn, &mem(OTHER_ID, OTHER_CREATED_AT, 0)).expect("insert other");
+    set_genesis_of(&conn, OTHER_ID, other_genesis_sql);
+    path
+}
+
+/// The text sweep line the verb prints for these counts.
+fn sweep_line(case: &SweepCase) -> String {
+    format!(
+        "{SWEEP_LINE}checked={} verified={} mismatched={} unreadable={} unverifiable={}",
+        case.checked, case.verified, case.mismatched, case.unreadable, case.unverifiable
+    )
+}
+
+/// The JSON `cid_sweep` object carries exactly these counts.
+fn assert_sweep_counts(v: &Value, case: &SweepCase) {
+    let s = &v["cid_sweep"];
+    for (field, want) in [
+        ("checked", case.checked),
+        ("cid_verified", case.verified),
+        ("cid_mismatched", case.mismatched),
+        ("cid_unreadable", case.unreadable),
+        ("cid_unverifiable", case.unverifiable),
+    ] {
+        assert_eq!(
+            s[field],
+            json!(want),
+            "{}: cid_sweep.{field}: {v}",
+            case.label
+        );
+    }
+}
+
+/// Mode x state x with and without `--cid`, library entry point. Without
+/// `--cid` there is no sweep output; with it the sweep is ONE part of the one
+/// report: one summary line in text, one JSON document with `cid_sweep`.
+#[test]
+fn cid_sweep_state_matrix_both_modes_9634() {
+    for case in &SWEEP_CASES {
+        for format in FORMATS {
+            for cid in [false, true] {
+                let ctx = format!("{} {format} cid={cid}", case.label);
+                let dir = scratch_dir(&format!("sweep-{}-{format}", case.label));
+                let path = seeded_db(dir.path(), case.genesis_sql);
+                let run = run_lib_with(&path, format, cid);
+                assert_eq!(run.code, case.code, "{ctx}\nstdout: {}", run.stdout);
+                assert_no_leak(&run, &path, MISMATCH_RAW_HEX);
+                assert_no_leak(&run, &path, UNREADABLE_GENESIS[0].1);
+                let ok = case.code == EXIT_OK;
+                if format == "text" {
+                    assert_text_summary(&run, ok);
+                    let lines: Vec<&str> = run
+                        .stdout
+                        .lines()
+                        .filter(|l| l.starts_with(SWEEP_LINE))
+                        .collect();
+                    if cid {
+                        assert_eq!(lines, [sweep_line(case)], "{ctx}:\n{}", run.stdout);
+                    } else {
+                        assert!(lines.is_empty(), "{ctx}: no sweep:\n{}", run.stdout);
+                    }
+                } else {
+                    let v = one_json_doc(&run);
+                    assert_eq!(v["ok"], json!(ok), "{ctx}: {v}");
+                    if cid {
+                        assert_sweep_counts(&v, case);
+                    } else {
+                        assert!(v.get("cid_sweep").is_none(), "{ctx}: no sweep: {v}");
+                    }
+                }
+                let sweep_failed = cid && !ok;
+                assert_eq!(
+                    run.stderr.contains(STDERR_SWEEP_FAILED),
+                    sweep_failed,
+                    "{ctx}: stderr: {}",
+                    run.stderr
+                );
+            }
+        }
+    }
+}
+
+/// The sweep names each failing row: the mismatch detail and the unreadable
+/// row with its class, in both modes.
+#[test]
+fn cid_sweep_names_the_failing_root_row_and_class_9634() {
+    for format in FORMATS {
+        let dir = scratch_dir(&format!("sweep-detail-mismatch-{format}"));
+        let path = seeded_db(dir.path(), Some(MISMATCH_GENESIS_SQL));
+        let run = run_lib_with(&path, format, true);
+        assert_eq!(run.code, EXIT_FAILED, "{format}: {}", run.stdout);
+        if format == "text" {
+            assert!(
+                run.stdout
+                    .contains(&format!("  MISMATCH {ROOT_ID}: cid mismatch: stored ")),
+                "{}",
+                run.stdout
+            );
+        } else {
+            let v = one_json_doc(&run);
+            let detail = v["cid_sweep"]["mismatches"][0].as_str().unwrap_or_default();
+            assert!(detail.starts_with(&format!("{ROOT_ID}: ")), "{v}");
+        }
+
+        let dir = scratch_dir(&format!("sweep-detail-unreadable-{format}"));
+        let path = seeded_db(dir.path(), Some(UNREADABLE_GENESIS[0].0));
+        let run = run_lib_with(&path, format, true);
+        assert_eq!(run.code, EXIT_FAILED, "{format}: {}", run.stdout);
+        if format == "text" {
+            assert!(
+                run.stdout
+                    .contains(&format!("  UNREADABLE {ROOT_ID} ({CLASS_DECODE})")),
+                "{}",
+                run.stdout
+            );
+        } else {
+            let v = one_json_doc(&run);
+            assert_eq!(
+                v["cid_sweep"]["unreadable"],
+                json!([{ "id": ROOT_ID, "error_class": CLASS_DECODE }]),
+                "{v}"
+            );
+        }
+    }
+}
+
+/// A good root and ONE other row whose genesis does not decode: `--cid`
+/// fails the verification (exit 2, never `Err`), names the row and the class,
+/// and no `ok=true` line is anywhere on stdout. Every undecodable form.
+#[test]
+fn cid_sweep_unreadable_non_root_row_fails_both_modes_9634() {
+    for (sql, marker) in UNREADABLE_GENESIS {
+        for format in FORMATS {
+            let ctx = format!("{sql} {format}");
+            let dir = scratch_dir(&format!("sweep-other-unreadable-{format}"));
+            let path = seeded_db_with_other(dir.path(), sql);
+            let run = run_lib_with(&path, format, true);
+            assert_eq!(run.code, EXIT_FAILED, "{ctx}\nstdout: {}", run.stdout);
+            assert_no_leak(&run, &path, marker);
+            assert!(
+                run.stderr.contains(STDERR_SWEEP_FAILED),
+                "{ctx}: {}",
+                run.stderr
+            );
+            if format == "text" {
+                assert_text_summary(&run, false);
+                assert!(
+                    run.stdout
+                        .contains(&format!("  UNREADABLE {OTHER_ID} ({CLASS_DECODE})")),
+                    "{ctx}:\n{}",
+                    run.stdout
+                );
+            } else {
+                let v = one_json_doc(&run);
+                assert_eq!(v["ok"], json!(false), "{ctx}: {v}");
+                assert_eq!(v["root_cid"]["state"], json!("verified"), "{ctx}: {v}");
+                assert_eq!(v["cid_sweep"]["cid_verified"], json!(1), "{ctx}: {v}");
+                assert_eq!(v["cid_sweep"]["cid_unreadable"], json!(1), "{ctx}: {v}");
+                assert_eq!(
+                    v["cid_sweep"]["unreadable"],
+                    json!([{ "id": OTHER_ID, "error_class": CLASS_DECODE }]),
+                    "{ctx}: {v}"
+                );
+            }
+        }
+    }
+}
+
+/// A good root and ONE other row with a mismatched genesis: `--cid` fails.
+#[test]
+fn cid_sweep_mismatch_non_root_row_fails_both_modes_9634() {
+    for format in FORMATS {
+        let dir = scratch_dir(&format!("sweep-other-mismatch-{format}"));
+        let path = seeded_db_with_other(dir.path(), MISMATCH_GENESIS_SQL);
+        let run = run_lib_with(&path, format, true);
+        assert_eq!(run.code, EXIT_FAILED, "{format}\nstdout: {}", run.stdout);
+        assert_no_leak(&run, &path, MISMATCH_RAW_HEX);
+        assert!(run.stderr.contains(STDERR_SWEEP_FAILED), "{}", run.stderr);
+        if format == "text" {
+            assert_text_summary(&run, false);
+            assert!(
+                run.stdout.contains(&format!("  MISMATCH {OTHER_ID}: ")),
+                "{}",
+                run.stdout
+            );
+        } else {
+            let v = one_json_doc(&run);
+            assert_eq!(v["ok"], json!(false), "{v}");
+            assert_eq!(v["cid_sweep"]["cid_mismatched"], json!(1), "{v}");
+        }
+    }
+}
+
+/// Without `--cid` a bad non-root row is not looked at: the root verdict alone.
+#[test]
+fn no_cid_flag_leaves_non_root_rows_unchecked_9634() {
+    for format in FORMATS {
+        let dir = scratch_dir(&format!("no-sweep-other-{format}"));
+        let path = seeded_db_with_other(dir.path(), UNREADABLE_GENESIS[0].0);
+        let run = run_lib_with(&path, format, false);
+        assert_eq!(run.code, EXIT_OK, "{format}\nstdout: {}", run.stdout);
+    }
+}
+
+/// The built binary, `--cid`, every state plus both bad non-root rows, both
+/// modes: the exact exit code, never `main`'s generic `Err` path, one JSON
+/// document, and no passing summary line when the verdict fails.
+#[test]
+fn binary_cid_sweep_cells_exit_codes_9634() {
+    enum Fixture {
+        Root(Option<&'static str>),
+        Other(&'static str),
+    }
+    let mut cases: Vec<(&str, Fixture, i32)> = SWEEP_CASES
+        .iter()
+        .map(|c| (c.label, Fixture::Root(c.genesis_sql), c.code))
+        .collect();
+    cases.push((
+        "other-unreadable",
+        Fixture::Other(UNREADABLE_GENESIS[0].0),
+        EXIT_FAILED,
+    ));
+    cases.push((
+        "other-mismatch",
+        Fixture::Other(MISMATCH_GENESIS_SQL),
+        EXIT_FAILED,
+    ));
+    for (label, fixture, code) in &cases {
+        for json_mode in [false, true] {
+            let ctx = format!("{label} json={json_mode}");
+            let dir = scratch_dir(&format!("bin-sweep-{label}"));
+            let path = match fixture {
+                Fixture::Root(sql) => seeded_db(dir.path(), *sql),
+                Fixture::Other(sql) => seeded_db_with_other(dir.path(), sql),
+            };
+            let out = run_bin_with(dir.path(), &path, json_mode, true);
+            let run = Run {
+                code: out.status.code().unwrap_or(-1),
+                stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            };
+            assert_eq!(
+                run.code, *code,
+                "{ctx}\nstdout: {}\nstderr: {}",
+                run.stdout, run.stderr
+            );
+            assert!(
+                !run.stderr.contains(GENERIC_ERR_PREFIX),
+                "{ctx}: left through the generic Err path: {}",
+                run.stderr
+            );
+            let ok = *code == EXIT_OK;
+            if json_mode {
+                let v = one_json_doc(&run);
+                assert_eq!(v["ok"], json!(ok), "{ctx}: {v}");
+                assert!(v["cid_sweep"].is_object(), "{ctx}: {v}");
+            } else {
+                assert_text_summary(&run, ok);
+            }
+        }
+    }
+}
+
+// ---- #9636: no stored value reaches a text line unescaped or unbounded ----------
+
+/// A forged passing summary line an attacker would smuggle in a stored cid.
+const FORGED_SUMMARY: &str =
+    "verify-reflection-chain: root=forged memories=1 depth=0 edges=0 failed=0 ok=true";
+/// Characters that reorder or hide text on a terminal (bidi controls, zero
+/// width and line separators); none may reach a stream unescaped.
+const HIDDEN_CHARS: &[char] = &[
+    '\u{200b}', '\u{200c}', '\u{200d}', '\u{200e}', '\u{200f}', '\u{2028}', '\u{2029}', '\u{202a}',
+    '\u{202b}', '\u{202c}', '\u{202d}', '\u{202e}', '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}',
+    '\u{feff}',
+];
+/// Length of the oversized stored cid (above the 100K floor for scanners).
+const LARGE_CID_CHARS: usize = 120_000;
+/// Longest line either stream may print: the verb's per-field bound (512
+/// printed chars) plus each line's fixed text, far below the stored value.
+const MAX_LINE_CHARS: usize = 2_048;
+/// Wall-clock ceiling for one verification of the oversized value.
+const LARGE_INPUT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Stored cids that try to forge lines or drive the terminal.
+fn hostile_cids() -> Vec<String> {
+    vec![
+        format!("bafy-newline\n{FORGED_SUMMARY}"),
+        format!("bafy-cr\r{FORGED_SUMMARY}"),
+        format!("bafy-esc\u{1b}[2J\u{1b}[1;1H{FORGED_SUMMARY}"),
+        format!("bafy-csi\u{9b}2J{FORGED_SUMMARY}"),
+        "bafy-bidi\u{202e}eurt=ko\u{2066}x\u{feff}".to_string(),
+        format!("bafy-nul\0{FORGED_SUMMARY}"),
+    ]
+}
+
+fn set_root_cid(path: &Path, cid: &str) {
+    let conn = db::open(path).expect("reopen scratch db");
+    conn.execute(
+        "UPDATE memories SET cid = ?1 WHERE id = ?2",
+        rusqlite::params![cid, ROOT_ID],
+    )
+    .expect("set cid");
+}
+
+/// No control character but the line feed, and no hidden character, on
+/// either stream.
+fn assert_clean_streams(run: &Run, ctx: &str) {
+    for (name, stream) in [("stdout", &run.stdout), ("stderr", &run.stderr)] {
+        for c in stream.chars() {
+            assert!(
+                c == '\n' || (!c.is_control() && !HIDDEN_CHARS.contains(&c)),
+                "{ctx}: {name} prints U+{:04X} unescaped:\n{stream:?}",
+                u32::from(c)
+            );
+        }
+    }
+}
+
+/// Exactly ONE line starts the summary, and it carries the final verdict.
+fn assert_one_summary_line(run: &Run, ok: bool, ctx: &str) {
+    let summaries: Vec<&str> = run
+        .stdout
+        .lines()
+        .filter(|l| l.starts_with(SUMMARY_PREFIX))
+        .collect();
+    assert_eq!(
+        summaries.len(),
+        1,
+        "{ctx}: one summary line:\n{}",
+        run.stdout
+    );
+    assert!(
+        summaries[0].ends_with(&format!(" ok={ok}")),
+        "{ctx}: {}",
+        run.stdout
+    );
+}
+
+/// A hostile stored cid, with and without `--cid`: one summary line ending
+/// `ok=false`, no control or hidden character on either stream, and the cid
+/// shown in its escaped form.
+#[test]
+fn hostile_root_cid_text_is_escaped_with_one_summary_line_9636() {
+    for cid_value in hostile_cids() {
+        for sweep in [false, true] {
+            let ctx = format!("{cid_value:?} cid={sweep}");
+            let dir = scratch_dir("hostile-text");
+            let path = seeded_db(dir.path(), None);
+            set_root_cid(&path, &cid_value);
+            let run = run_lib_with(&path, "text", sweep);
+            assert_eq!(run.code, EXIT_FAILED, "{ctx}\nstdout: {}", run.stdout);
+            assert_one_summary_line(&run, false, &ctx);
+            assert_clean_streams(&run, &ctx);
+            assert!(
+                run.stdout.contains(&format!("{CID_LINE}false (bafy-")),
+                "{ctx}:\n{}",
+                run.stdout
+            );
+            assert!(
+                run.stderr.contains(STDERR_MISMATCH),
+                "{ctx}: {}",
+                run.stderr
+            );
+        }
+    }
+}
+
+/// JSON mode carries the full value, escaped by the JSON encoder, in ONE
+/// document; stderr is escaped like text mode.
+#[test]
+fn hostile_root_cid_json_is_one_document_with_clean_stderr_9636() {
+    for cid_value in hostile_cids() {
+        for sweep in [false, true] {
+            let ctx = format!("{cid_value:?} cid={sweep}");
+            let dir = scratch_dir("hostile-json");
+            let path = seeded_db(dir.path(), None);
+            set_root_cid(&path, &cid_value);
+            let run = run_lib_with(&path, "json", sweep);
+            assert_eq!(run.code, EXIT_FAILED, "{ctx}\nstdout: {}", run.stdout);
+            let v = one_json_doc(&run);
+            assert_eq!(v["ok"], json!(false), "{ctx}: {v}");
+            assert_eq!(v["root_cid"]["cid"], json!(cid_value), "{ctx}: {v}");
+            assert_clean_streams(&run, &ctx);
+        }
+    }
+}
+
+/// A 120K stored cid that also carries a forged line: every printed line on
+/// both streams stays under the named bound, and the run is fast.
+#[test]
+fn oversized_root_cid_is_bounded_on_every_line_9636() {
+    let cid_value = format!("bafy{}\n{FORGED_SUMMARY}", "x".repeat(LARGE_CID_CHARS));
+    for format in FORMATS {
+        for sweep in [false, true] {
+            let ctx = format!("{format} cid={sweep}");
+            let dir = scratch_dir("oversized");
+            let path = seeded_db(dir.path(), None);
+            set_root_cid(&path, &cid_value);
+            let started = std::time::Instant::now();
+            let run = run_lib_with(&path, format, sweep);
+            let took = started.elapsed();
+            assert!(took < LARGE_INPUT_DEADLINE, "{ctx}: took {took:?}");
+            assert_eq!(run.code, EXIT_FAILED, "{ctx}");
+            assert_clean_streams(&run, &ctx);
+            let streams: Vec<(&str, &String)> = if format == "text" {
+                vec![("stdout", &run.stdout), ("stderr", &run.stderr)]
+            } else {
+                vec![("stderr", &run.stderr)]
+            };
+            for (name, stream) in streams {
+                for line in stream.lines() {
+                    let n = line.chars().count();
+                    assert!(n <= MAX_LINE_CHARS, "{ctx}: {name} line of {n} chars");
+                }
+            }
+            if format == "text" {
+                assert_one_summary_line(&run, false, &ctx);
+            }
+        }
+    }
 }

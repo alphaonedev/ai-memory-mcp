@@ -899,6 +899,85 @@ mod tests {
     use crate::identity::sign;
     use crate::models::{Memory, Tier};
 
+    /// #9635 — every branch of the read-error classifier, by error type,
+    /// including a decode error wrapped in `anyhow` context.
+    #[test]
+    fn genesis_read_error_class_labels_every_branch_9635() {
+        use crate::storage::schema_guard::ProvenanceReadFault;
+        use anyhow::Context as _;
+        use rusqlite::types::Type;
+        let decode_in_context: anyhow::Error = Err::<(), _>(rusqlite::Error::InvalidColumnType(
+            2,
+            "cid_genesis".into(),
+            Type::Text,
+        ))
+        .context("read cid_genesis")
+        .expect_err("err by construction");
+        let cases: Vec<(&str, anyhow::Error, GenesisReadErrorClass, &str)> = vec![
+            (
+                "provenance fault",
+                anyhow::Error::new(ProvenanceReadFault::ColumnMissingPreV74 {
+                    column: "cid_genesis",
+                    source: rusqlite::Error::InvalidQuery,
+                }),
+                GenesisReadErrorClass::SchemaFault,
+                "schema_fault",
+            ),
+            (
+                "invalid column type",
+                anyhow::Error::new(rusqlite::Error::InvalidColumnType(
+                    2,
+                    "cid_genesis".into(),
+                    Type::Text,
+                )),
+                GenesisReadErrorClass::DecodeError,
+                "decode_error",
+            ),
+            (
+                "from-sql conversion",
+                anyhow::Error::new(rusqlite::Error::FromSqlConversionFailure(
+                    2,
+                    Type::Integer,
+                    Box::new(std::fmt::Error),
+                )),
+                GenesisReadErrorClass::DecodeError,
+                "decode_error",
+            ),
+            (
+                "decode error in context",
+                decode_in_context,
+                GenesisReadErrorClass::DecodeError,
+                "decode_error",
+            ),
+            (
+                "no rows",
+                anyhow::Error::new(rusqlite::Error::QueryReturnedNoRows),
+                GenesisReadErrorClass::StorageError,
+                "storage_error",
+            ),
+            (
+                "sqlite io error",
+                anyhow::Error::new(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR),
+                    None,
+                )),
+                GenesisReadErrorClass::StorageError,
+                "storage_error",
+            ),
+            (
+                "plain error",
+                anyhow::anyhow!("plain"),
+                GenesisReadErrorClass::StorageError,
+                "storage_error",
+            ),
+        ];
+        for (name, err, want, label) in &cases {
+            let got = GenesisReadErrorClass::of(err);
+            assert_eq!(got, *want, "{name}");
+            assert_eq!(got.label(), *label, "{name}");
+        }
+    }
+
     fn open_test_db(tmp: &TempDir) -> (rusqlite::Connection, std::path::PathBuf) {
         let db_path = tmp.path().join("ai-memory.db");
         let conn = db::open(&db_path).expect("db::open");
