@@ -6,11 +6,13 @@
 # push only on main/develop/release/**. Adding chain/** to their push triggers would run
 # the fed self-hosted legs and the Postgres coverage suite a second time on every chain
 # push, so this workflow is separate, hosted only, and runs no tests: it runs exactly
-# the cargo command lines of the two hosted PR jobs whose output rust-cache keeps (their
+# the cargo command lines of the three hosted PR jobs whose output rust-cache keeps (their
 # builds) and lets rust-cache save them under the same shared-key and the same key env.
 #
 #   ci.yml `check` (ubuntu-latest,sqlite leg)  <- job check-hosted-sqlite (shared-key ci-check-hosted-sqlite)
 #   coverage.yml `per-module-thresholds`       <- job coverage            (shared-key coverage-per-module)
+#   ci.yml `mobile-cross-compile` (android leg, #9732) <- job mobile-android-audit-release
+#                                              (shared-key mobile-aarch64-linux-android-audit-release)
 #
 # On a full key match rust-cache restores, every build step is skipped and nothing is
 # saved. The #9681 save-scope invariant test pins the pairing: the same
@@ -31,9 +33,10 @@
 # chain cache; the invariant test fails on any other workflow that runs on a chain/**
 # push or spells its keys.
 #
-# Generation constant. The two cache steps here and their PR counterparts (ci.yml
-# `check`, coverage.yml `per-module-thresholds`) carry one prefix-key, chain-cache-g<N>.
-# Bumping N at all four in one commit invalidates every chain cache; the first run after
+# Generation constant. The three cache steps here and their PR counterparts (ci.yml
+# `check`, ci.yml `mobile-cross-compile` android leg, coverage.yml `per-module-thresholds`)
+# carry one prefix-key, chain-cache-g<N>.
+# Bumping N at all six in one commit invalidates every chain cache; the first run after
 # a bump misses once and writes the new generation.
 #
 # Kill switch: delete the caches of the chain ref (gh cache delete for each key of
@@ -155,7 +158,7 @@ jobs:
         id: rust-cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          # The chain cache generation (header); equal at all four paired steps.
+          # The chain cache generation (header); equal at all six paired steps.
           prefix-key: chain-cache-g1
           shared-key: ci-check-hosted-sqlite
           save-if: ${{ github.event_name == 'push' }}
@@ -298,7 +301,7 @@ jobs:
         id: rust-cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          # The chain cache generation (header); equal at all four paired steps.
+          # The chain cache generation (header); equal at all six paired steps.
           prefix-key: chain-cache-g1
           shared-key: coverage-per-module
           save-if: ${{ github.event_name == 'push' }}
@@ -384,3 +387,93 @@ jobs:
             --lib --tests \
             --workspace \
             -- --test-threads=1 --exact __rust_cache_warm_no_such_test__
+
+  # #9732: the android entry of ci.yml `mobile-cross-compile` (the `once` leg). Its cargo lines
+  # are the three whose output rust-cache keeps: the target check, the pinned cargo-audit
+  # install and the release-profile smoke (#9680). The NDK steps are mirrored byte for byte
+  # because the check cross-compiles the bundled SQLite C blob with the NDK clang. They sit
+  # after the cache step on both sides (their GITHUB_ENV exports are not part of the key).
+  mobile-android-audit-release:
+    name: Rust cache warm (Cross-compile android audit+release deps)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      # The key env of the android leg: the workflow's CARGO_INCREMENTAL (the job has no env).
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust 1.99.1 (target aarch64-linux-android, matches rust-toolchain.toml pin)
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: 1.99.1
+          targets: aarch64-linux-android
+
+      - name: Rust cache (write the key the PR job restores)
+        id: rust-cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          # The chain cache generation (header); equal at all six paired steps.
+          prefix-key: chain-cache-g1
+          shared-key: mobile-aarch64-linux-android-audit-release
+          save-if: ${{ github.event_name == 'push' }}
+
+      - name: Install Android NDK r26d
+        if: steps.rust-cache.outputs.cache-hit != 'true'
+        id: setup-ndk
+        uses: nttld/setup-ndk@ed92fe6cadad69be94a966a7ee3271275e62f779 # v1
+        with:
+          ndk-version: r26d
+          add-to-path: false
+
+      - name: Configure NDK toolchain for cargo
+        if: steps.rust-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          NDK="${{ steps.setup-ndk.outputs.ndk-path }}"
+          TC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          test -x "$TC/aarch64-linux-android24-clang" || {
+            echo "::error::NDK clang for android24 not found at $TC"
+            ls "$TC" | head -40
+            exit 1
+          }
+          # Bundled SQLite (rusqlite/bundled feature) compiles its C
+          # blob via the `cc` crate, which honors the per-target
+          # CC_<target_underscores> and AR_<target_underscores> env
+          # vars. We point them at the NDK's clang + llvm-ar so the C
+          # bits link against the Android sysroot, not the host's.
+          # min-sdk 24 (Android 7.0+) — matches the floor v0.7.0
+          # Posture-1a documents in ROADMAP §1067.
+          {
+            echo "CC_aarch64_linux_android=$TC/aarch64-linux-android24-clang"
+            echo "CXX_aarch64_linux_android=$TC/aarch64-linux-android24-clang++"
+            echo "AR_aarch64_linux_android=$TC/llvm-ar"
+            echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$TC/aarch64-linux-android24-clang"
+          } >> "$GITHUB_ENV"
+
+      - name: cargo check (--lib --features sqlite-bundled)
+        if: steps.rust-cache.outputs.cache-hit != 'true'
+        run: |
+          cargo check \
+            --target aarch64-linux-android \
+            --no-default-features \
+            --features sqlite-bundled \
+            --lib
+
+      # The cargo-audit binary, built from source at the #3138 pin with the PR job's own install
+      # line. The PR job installs only when the pinned version is missing; here the install is
+      # unconditional (the cache is empty on a miss, and the warm job reads no version probe,
+      # which keeps nothing). The audit gate itself is not run here.
+      - name: Install the pinned cargo-audit (no audit run)
+        if: steps.rust-cache.outputs.cache-hit != 'true'
+        env:
+          # #3138: named pin for the cargo-audit version the PR job installs.
+          CARGO_AUDIT_VERSION: "0.22.2"
+        run: cargo install cargo-audit --locked --force --version "${CARGO_AUDIT_VERSION}"
+
+      - name: Build release (release-profile smoke)
+        if: steps.rust-cache.outputs.cache-hit != 'true'
+        run: cargo build --release

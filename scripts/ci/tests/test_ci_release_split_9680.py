@@ -507,7 +507,10 @@ RUST_CACHE_USES_PREFIX = "Swatinem/rust-cache@"
 # the save-if is the #3089 form of the check and postgres-feature cache steps.
 MOBILE_CACHE_KEY = "mobile-${{ matrix.target }}-audit-release"
 PUSH_ONLY_SAVE_IF = "${{ github.event_name == 'push' }}"
-EXPECTED_MOBILE_CACHE_WITH = {"key": MOBILE_CACHE_KEY, "save-if": PUSH_ONLY_SAVE_IF}
+# #9732: the same value, now a `shared-key` with the chain generation `prefix-key` (the
+# chain cache pair of rust-cache-warm.yml; a `key:` input would add the job id).
+EXPECTED_MOBILE_CACHE_WITH = {"prefix-key": "chain-cache-g1", "shared-key": MOBILE_CACHE_KEY,
+                              "save-if": PUSH_ONLY_SAVE_IF}
 # (b) #9699: the longest measured time of each piece of work the job now holds
 # (push runs of ci.yml on release/v1.0.0, 2026-11-20). The job timeout must leave
 # the 20 % margin the check-leg cap rule asks for (ci.yml `timeout: 95` comment)

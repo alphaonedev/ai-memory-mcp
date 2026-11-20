@@ -2949,9 +2949,15 @@ jobs:
           # #9700 - the key was rotated once when this entry began to hold
           # cargo-audit and target/release (#9680): the old exact-match entry
           # held neither and, on a full match, rust-cache never re-saves. Saved
-          # only on trunk `push` (#3089, the form of the check job's cache), so
-          # a pull_request run restores and never writes a PR-scoped entry.
-          key: mobile-${{ matrix.target }}-audit-release
+          # only on a `push` (#3089), so a pull_request run restores and never
+          # writes a PR-scoped entry. #9732: a chain PR reads chain/<name>, which
+          # only rust-cache-warm.yml writes (job mobile-android-audit-release),
+          # under this shared-key (the android leg resolves it to the literal the
+          # warm job spells; a `key:` input would add the job id and never match)
+          # and the chain generation prefix-key. The iOS leg shares this step
+          # and stays unpaired (#9681 V-12).
+          prefix-key: chain-cache-g1
+          shared-key: mobile-${{ matrix.target }}-audit-release
           save-if: ${{ github.event_name == 'push' }}
 
       # Android NDK r26d — provides the clang toolchain we point at via

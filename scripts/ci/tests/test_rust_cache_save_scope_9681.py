@@ -22,7 +22,7 @@ required contexts are unchanged, and the same tests run.
 Vote V2-9681 (3-agent vote 71472661, A+ push-only hosted warm workflow on chain/**): the chain
 cache has exactly one writer, rust-cache-warm.yml (push on chain/** only, GitHub-hosted, no
 secrets, sha-pinned actions); no other workflow can write or share its keys; one prefix-key
-generation constant at the four paired cache steps invalidates it. ``ChainCacheSoleWriter9681``
+generation constant at the six paired cache steps (#9732 added the android leg pair) invalidates it. ``ChainCacheSoleWriter9681``
 holds conditions V-2 to V-11 over every workflow file, not over hand tables.
 
 Run: python3 -I -m unittest discover -s scripts/ci/tests -p 'test_rust_cache_save_scope_9681.py'
@@ -134,6 +134,7 @@ JOBS: dict[str, dict[str, str]] = {
     WARM: {
         "check-hosted-sqlite": "Rust cache warm (Check ubuntu-latest,sqlite deps)",
         "coverage": "Rust cache warm (Per-Module Coverage deps)",
+        "mobile-android-audit-release": "Rust cache warm (Cross-compile android audit+release deps)",
     },
 }
 
@@ -302,7 +303,7 @@ RELEASE_ARTEFACT_RE = re.compile(
     r"|docker/build-push-action|\bdocker push\b|\bgh release (?:create|upload)\b|\bcargo publish\b"
     r"|\bnpm publish\b|\btwine upload\b|id-token:\s*write")
 # The keys the chain PR jobs restore; they may appear only in the paired workflows.
-SHARED_KEYS = tuple(pair[3] for pair in PAIRS)
+SHARED_KEYS = (*(pair[3] for pair in PAIRS), *(pair[1] for pair in LEG_PAIRS.values()))
 KEY_HOLDERS = frozenset({"ci.yml", "coverage.yml", WARM})
 # Workflows started by these events run with a base-branch token and may write the base cache.
 PRIVILEGED_EVENTS = frozenset({"pull_request_target", "workflow_run"})
@@ -310,7 +311,7 @@ CACHE_USES_RE = re.compile(r"""^\s*(?:-\s+)?uses:\s*['"]?(Swatinem/rust-cache|ac
 USES_RE = re.compile(r"""^\s*(?:-\s+)?uses:\s*['"]?([^'"\s#]+)""")
 PINNED_USES_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_./-]+)?@[0-9a-f]{40}$")
 WARM_FORBIDDEN_RE = re.compile(r"upload-artifact|id-token|\bsecrets\s*[.:\[]")
-# V-7: one generation constant at the four paired cache steps; a bump changes every chain key.
+# V-7: one generation constant at the six paired cache steps; a bump changes every chain key.
 PREFIX_KEY_RE = re.compile(r"^chain-cache-g[1-9][0-9]*$")
 HOSTED_GUARD = "runner.environment == 'github-hosted'"
 CI_GATE_JOB = ("ci.yml", "ci-gate")
@@ -993,7 +994,7 @@ class ChainCacheSoleWriter9681(unittest.TestCase):
                     with self.subTest(file=path.name, line=n, literal=literal):
                         self.assertNotIn(literal, line,
                                          f"{path.relative_to(REPO)}:{n}: {line.strip()} - the chain "
-                                         f"cache key {literal!r} is used outside the four paired "
+                                         f"cache key {literal!r} is used outside the six paired "
                                          f"rust-cache steps (V-4)")
         for name in _all_workflow_names():
             for job_id, job in Workflow.load(name).jobs().items():
@@ -1002,10 +1003,17 @@ class ChainCacheSoleWriter9681(unittest.TestCase):
                         continue
                     inputs = step.mapping("with")
                     owner = any((name, job_id) in ((p[0], p[1]), (WARM, p[2])) for p in PAIRS)
+                    owner = owner or any((name, job_id) in ((k[0], k[1]), (WARM, v[0]))
+                                         for k, v in LEG_PAIRS.items())
                     with self.subTest(workflow=name, job=job_id):
                         for key in ("shared-key", "prefix-key"):
                             value = inputs.get(key, "")
                             where = f"{name}:{_job_line(name, job_id, f'{key}:')} (job {job_id})"
+                            # #9732: the one dynamic shared-key, a hand-table exact match; it
+                            # resolves per matrix leg to the literal of a LEG_PAIRS warm job.
+                            if key == "shared-key" and value == LEG_SHARED_KEY_TEMPLATES.get(
+                                    (name, job_id)):
+                                continue
                             self.assertNotIn("${{", value, f"{where}: dynamic rust-cache {key} "
                                                            f"{value!r} could build a chain key "
                                                            f"(V-4)")
@@ -1037,18 +1045,20 @@ class ChainCacheSoleWriter9681(unittest.TestCase):
                                   f"{WARM}:{n}: {line.strip()} - upload-artifact, id-token or a "
                                   f"secrets reference in the chain cache writer (V-6)")
 
-    def test_v7_one_prefix_key_generation_at_the_four_paired_steps(self) -> None:
+    def test_v7_one_prefix_key_generation_at_the_six_paired_steps(self) -> None:
         sites = {}
-        for pr_name, pr_job_id, warm_job_id, _ in PAIRS:
+        pairs = [(a, b, c) for a, b, c, _ in PAIRS]
+        pairs += [(k[0], k[1], v[0]) for k, v in LEG_PAIRS.items()]
+        for pr_name, pr_job_id, warm_job_id in pairs:
             for name, job_id in ((pr_name, pr_job_id), (WARM, warm_job_id)):
                 _, inputs = _cache_step_inputs(name, job_id)
                 sites[f"{name}:{job_id}"] = inputs.get("prefix-key")
-        self.assertEqual(len(sites), 4)
+        self.assertEqual(len(sites), 6)
         values = set(sites.values())
-        self.assertEqual(len(values), 1, f"prefix-key differs across the four paired cache steps: "
+        self.assertEqual(len(values), 1, f"prefix-key differs across the six paired cache steps: "
                                          f"{sites} (V-7)")
         (value,) = values
-        self.assertIsNotNone(value, f"no prefix-key at the four paired cache steps: {sites} (V-7)")
+        self.assertIsNotNone(value, f"no prefix-key at the six paired cache steps: {sites} (V-7)")
         self.assertRegex(value, PREFIX_KEY_RE,
                          f"prefix-key {value!r} is not a chain-cache-g<N> generation (V-7)")
 
@@ -1741,7 +1751,8 @@ class UnpairedSite:
 
 
 # decision (b29, FIX-NOTICE-9681-r2): this table over a third warm pair for the android leg,
-# because the leg is off the long pole and #9732 owns its warm cache.
+# because the leg is off the long pole. #9732 then paired it as LEG_PAIRS (a leg-level pair:
+# the job's other leg, iOS, stays named here).
 V12_COLD = ("vote V-12 accepted cost (#9681): no warm job, saves on push only; whether warm "
             "entries survive eviction is #9721")
 V12_ISSUES = (9681, 9721)
@@ -1749,14 +1760,6 @@ UNPAIRED_RUST_CACHE_SITES: dict[tuple[str, str, str], UnpairedSite] = {
     ("ci.yml", "lint", ""): UnpairedSite(V12_ISSUES, V12_COLD),
     ("ci.yml", "postgres-feature", ""): UnpairedSite(V12_ISSUES, V12_COLD),
     ("ci.yml", "mobile-cross-compile", "target=aarch64-apple-ios"): UnpairedSite(V12_ISSUES, V12_COLD),
-    ("ci.yml", "mobile-cross-compile", "target=aarch64-linux-android"): UnpairedSite(
-        (9721, 9732),
-        "the `once` leg runs the cargo-audit install and the release smoke that #9680 moved off "
-        "`check`, under its own key `mobile-<target>-audit-release`; no chain push warms it (#9732)",
-        ("cargo build --release",
-         "cargo check --target aarch64-linux-android --no-default-features --features "
-         "sqlite-bundled --lib",
-         "cargo install cargo-audit --locked --force --version 0.22.2")),
     ("ci.yml", "sal-feature", ""): UnpairedSite(V12_ISSUES, V12_COLD),
     ("ci.yml", "vectorlite-feature", ""): UnpairedSite(V12_ISSUES, V12_COLD),
     ("batman-mode-acceptance.yml", "rust-integration", ""): UnpairedSite(V12_ISSUES, V12_COLD),
@@ -1938,7 +1941,10 @@ class UnpairedRustCacheSites9681(unittest.TestCase):
             wf, job, leg = sites[key]
             return _cold_commands(wf, job, leg)
 
-        self.assertEqual(_unpaired_site_problems(frozenset(sites), paired,
+        # #9732: a leg pair is a paired site of its own; the iOS leg of the same job stays named.
+        self.assertEqual(sorted(set(LEG_PAIRS) - set(sites)), [], "LEG_PAIRS names no site")
+        unpaired_candidates = frozenset(sites) - frozenset(LEG_PAIRS)
+        self.assertEqual(_unpaired_site_problems(unpaired_candidates, paired,
                                                  UNPAIRED_RUST_CACHE_SITES, commands_of), [])
 
     def test_unpaired_row_rule_table(self) -> None:
