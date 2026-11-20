@@ -332,9 +332,12 @@ When `ai-memory verify-audit-trail`, `verify-signed-events-chain`, or
 `verify-reflection-chain` reports an integrity failure, the command returns a
 non-zero result and identifies the implemented failing check and available
 row/sequence context. `verify-reflection-chain` exits `0` when the chain
-verifies, `1` when the root memory is not found and `2` when verification
-fails: an edge signature, the `max_reflection_depth` cap, or a root content-id
-genesis that mismatches its cid or cannot be read (#9505). Operators should retain the database and companion audit
+verifies, `1` when the root memory is not found (or a storage error stops the
+verdict from being computed, before anything is printed) and `2` when
+verification fails: an edge signature, the `max_reflection_depth` cap, a root
+content-id genesis that mismatches its cid or cannot be read (#9505), or, with
+`--cid`, a swept row that mismatches or cannot be read (#9634). Stored values
+in the text report are escaped and bounded (#9636). Operators should retain the database and companion audit
 artifacts, stop relying on the affected chain as trusted evidence, and
 investigate against independently retained witnesses or forensic exports.
 

@@ -91,16 +91,31 @@ path, no traversal-order surprises.
 
 - `0` — chain fully verified (or no signatures present *and*
   `bounded_status != "exceeded_cap"`), and the root's content-id is
-  verified or was not checked (no genesis or no cid stored).
+  verified or was not checked (no genesis or no cid stored), and (with
+  `--cid`) no swept row mismatched or was unreadable.
 - `1` — the root memory was not found (`ok: false`, `not_found: true`
-  in JSON mode).
+  in JSON mode), or a storage error stopped the verdict from being
+  computed (nothing is printed on stdout; stderr names the cause).
 - `2` — verification failed (`ok: false`): at least one edge failed
   signature verification, OR the chain exceeds its namespace
   `max_reflection_depth` cap, OR the root's content-id genesis
-  mismatches its cid or cannot be read (#9505). The text summary line
-  ends `ok=false`, the `cid_verified:` line reads `false (<cid>)` or
-  `unreadable (<class>)`, and JSON mode carries
-  `"root_cid": {"state": "mismatch" | "unreadable", ...}`.
+  mismatches its cid or cannot be read (#9505), OR the `--cid` sweep
+  found a row whose content-id mismatches or whose genesis cannot be
+  read (#9634). The text summary line ends `ok=false`, the
+  `cid_verified:` line reads `false (<cid>)` or `unreadable (<class>)`,
+  and JSON mode carries
+  `"root_cid": {"state": "mismatch" | "unreadable", ...}` or a
+  `cid_sweep` with `cid_mismatched` or `cid_unreadable` above zero.
+
+With `--cid`, the sweep is part of the one report: text mode prints a
+`cid sweep: checked=… verified=… mismatched=… unreadable=… unverifiable=…`
+line with one `MISMATCH` or `UNREADABLE <id> (<class>)` line per failing
+row (at most 100 of each), and JSON mode prints ONE document whose
+optional `cid_sweep` field carries the same counts and rows. The field
+is omitted without `--cid` and is never set in a forensic bundle's
+`verification.json`. Every stored value the text report prints is
+escaped (control, bidi and zero-width characters as `\u{…}`) and cut at
+512 characters with a `...(+N chars)` marker (#9636).
 
 The optional `root_cid` field is present only when the root check ran
 (`{"state": "verified", "cid": ...}`, `{"state": "mismatch", "cid": ...}`

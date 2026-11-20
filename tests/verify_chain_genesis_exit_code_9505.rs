@@ -585,7 +585,7 @@ fn forensic_export_doc_lists_exit_codes_0_1_2_9507() {
         .collect();
     assert_eq!(codes, ["0", "1", "2"], "rows: {rows:#?}");
     assert!(rows[1].contains("not found"), "1 = NOT FOUND: {}", rows[1]);
-    for needle in ["signature", "max_reflection_depth", "content-id"] {
+    for needle in ["signature", "max_reflection_depth", "content-id", "--cid"] {
         assert!(rows[2].contains(needle), "2 names {needle}: {}", rows[2]);
     }
     assert!(
