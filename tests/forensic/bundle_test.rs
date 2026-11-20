@@ -407,5 +407,8 @@ fn export_fails_when_chain_report_signed_events_read_fails_9505() {
         SIGNED_EVENTS_READS_9505,
         "the fault must hit the chain-report read, after the bundle's own slice"
     );
-    assert!(!bundle_path.exists(), "no bundle may be written on a read fault");
+    assert!(
+        !bundle_path.exists(),
+        "no bundle may be written on a read fault"
+    );
 }
