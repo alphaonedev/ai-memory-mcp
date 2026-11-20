@@ -614,6 +614,172 @@ fn serve_starts_under_an_unwritable_home_9562() {
     }
 }
 
+// ------------------------------------------------- T-3 writable-home cells
+
+/// A WRITABLE home (0700) with a WRITABLE key directory (0700) inside it: the
+/// shape where a key ensure at boot would succeed and create a key pair, so
+/// only the boot key gate keeps the key files away (3-agent vote (71472661),
+/// T-3).
+fn writable_home(root: &Path) -> Home {
+    let path = root.join("home-writable");
+    let home = Home {
+        label: "writable home",
+        path,
+        restore: None,
+    };
+    for dir in [home.path.clone(), home.key_dir()] {
+        std::fs::create_dir_all(&dir).expect("create the writable home");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod 0700");
+    }
+    home
+}
+
+/// The exact key files a boot ensure of [`AGENT_ID`] creates in the key
+/// directory (`<agent>.priv` and `<agent>.pub`, `src/identity/keypair.rs`).
+fn key_files(home: &Home) -> [PathBuf; 2] {
+    [
+        home.key_dir().join(format!("{AGENT_ID}.priv")),
+        home.key_dir().join(format!("{AGENT_ID}.pub")),
+    ]
+}
+
+/// The default config file every boot writes under a writable home
+/// (`src/main.rs:155`, even with `AI_MEMORY_NO_CONFIG=1`): a separate defect
+/// with its own lane (#9620), not part of the key gate. It is the ONE file
+/// the writable-home cells excuse, by exact path.
+fn config_write_9620(home: &Home) -> PathBuf {
+    home.path
+        .join(".config")
+        .join("ai-memory")
+        .join("config.toml")
+}
+
+/// After a wake-hub run under a writable home: neither key file exists, the
+/// key directory holds no file at all, no `forensic-*` file exists anywhere
+/// under the scratch, and no other file was created (`allowed` excepted).
+fn assert_no_key_or_forensic_file(label: &str, root: &Path, home: &Home, before: &[PathBuf]) {
+    for key in key_files(home) {
+        assert!(
+            !key.exists(),
+            "#9562 T-3 ({label}): a non-writer wake-hub mode created the key file {}",
+            key.display()
+        );
+    }
+    let keys = tree(&home.key_dir());
+    assert!(
+        keys.is_empty(),
+        "#9562 T-3 ({label}): the key directory gained files: {keys:?}"
+    );
+    let forensic: Vec<PathBuf> = tree(root)
+        .into_iter()
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("forensic-"))
+        })
+        .collect();
+    assert!(
+        forensic.is_empty(),
+        "#9562 T-3 ({label}): a non-writer wake-hub mode created forensic files: {forensic:?}"
+    );
+    assert_nothing_created(label, root, before);
+}
+
+/// Run one reporting mode under a writable home and check its exit code and
+/// that it created no key and no forensic file. FAILS ON THE BASE: the boot
+/// ensure created `keys/<agent>.priv` and `.pub`.
+fn reporting_mode_under_a_writable_home(args: &[&str], code: i32) {
+    let root = scratch();
+    let run = runtime_dir(root.path());
+    let home = writable_home(root.path());
+    let label = format!("writable home, wake-hub {}", args.join(" "));
+    let mut before = tree(root.path());
+    before.push(config_write_9620(&home));
+    let out = wake_hub(&home, &run, args);
+    assert_not_refused(&label, &out);
+    assert_eq!(
+        out.status.code(),
+        Some(code),
+        "#9562 ({label}): {}",
+        text(&out.stderr)
+    );
+    assert_no_key_or_forensic_file(&label, root.path(), &home, &before);
+}
+
+#[test]
+fn posture_creates_no_key_under_a_writable_home_9562() {
+    reporting_mode_under_a_writable_home(&["--posture"], 0);
+}
+
+#[test]
+fn posture_json_creates_no_key_under_a_writable_home_9562() {
+    reporting_mode_under_a_writable_home(&["--posture", "--json"], 0);
+}
+
+#[test]
+fn posture_require_admits_creates_no_key_under_a_writable_home_9562() {
+    reporting_mode_under_a_writable_home(&["--posture", "--require-admits"], EXIT_ADMITS_NOBODY);
+}
+
+#[test]
+fn health_creates_no_key_under_a_writable_home_9562() {
+    reporting_mode_under_a_writable_home(&["--health"], EXIT_UNREACHABLE);
+}
+
+#[test]
+fn health_json_creates_no_key_under_a_writable_home_9562() {
+    reporting_mode_under_a_writable_home(&["--health", "--json"], EXIT_UNREACHABLE);
+}
+
+/// T-3 — serve under a writable home binds, answers health, stops with exit
+/// 0 on SIGTERM and leaves no key file and no forensic file (its socket file
+/// is the one file it may leave). FAILS ON THE BASE: the boot ensure created
+/// the key pair.
+#[test]
+fn serve_creates_no_key_under_a_writable_home_9562() {
+    let root = scratch();
+    let run = runtime_dir(root.path());
+    let home = writable_home(root.path());
+    let mut before = tree(root.path());
+    before.push(socket_file(&run));
+    before.push(config_write_9620(&home));
+    let mut cmd = hub_socket_command(&home, &run, &bin());
+    cmd.arg("wake-hub")
+        .arg("--socket")
+        .arg(socket_path(&run))
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    let mut hub = cmd.spawn().expect("spawn the hub");
+    let start = Instant::now();
+    let mut healthy = false;
+    while start.elapsed() < BIND_DEADLINE {
+        if let Some(status) = hub.try_wait().expect("poll the hub") {
+            panic!(
+                "#9562 (writable home): serve exited early ({status}): {}",
+                drain_stderr(&mut hub)
+            );
+        }
+        if wake_hub(&home, &run, &["--health"]).status.code() == Some(0) {
+            healthy = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    if !healthy {
+        kill_group(&mut hub);
+        panic!("#9562 (writable home): serve never answered health");
+    }
+    terminate_group(&hub);
+    let Some(status) = wait_until(&mut hub, STOP_DEADLINE) else {
+        kill_group(&mut hub);
+        panic!("#9562 (writable home): serve did not stop on SIGTERM");
+    };
+    let err = drain_stderr(&mut hub);
+    assert_eq!(status.code(), Some(0), "a drained stop exits 0: {err}");
+    assert_no_key_or_forensic_file("writable home, wake-hub serve", root.path(), &home, &before);
+}
+
 /// T-5 — a WRITER verb under the same unwritable home still refuses with the
 /// exact #3354 text (and writes nothing). Green on the base and after the fix:
 /// the fix must not be over-applied.
@@ -896,6 +1062,79 @@ fn degraded_tail() -> String {
         .to_owned()
 }
 
+/// [`sink_command`] for a wake-hub child on the socket of `run` (the short
+/// relative socket path, resolved from the socket directory).
+fn sink_hub_command(sb: &SinkOutage, run: &Path, extra: &[&str]) -> Command {
+    let mut cmd = sink_command(sb);
+    short_sock::set_socket_cwd(&mut cmd, run);
+    cmd.arg("wake-hub")
+        .arg("--socket")
+        .arg(socket_path(run))
+        .args(extra);
+    cmd
+}
+
+/// T-8 serve case (security LOW-2) — serve under the failing sink binds,
+/// prints the one named warning exactly once (with its exact remedy line),
+/// stops with exit 0 on SIGTERM and records no outage row.
+fn serve_warns_once_and_records_no_outage_row(sb: &SinkOutage, tail: &str) {
+    let run = runtime_dir(&sb.root);
+    let before = outage_rows(&sb.db);
+    let mut cmd = sink_hub_command(sb, &run, &[]);
+    cmd.stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    let mut hub = cmd.spawn().expect("spawn the hub under the failing sink");
+    let start = Instant::now();
+    let mut healthy = false;
+    while start.elapsed() < BIND_DEADLINE {
+        if let Some(status) = hub.try_wait().expect("poll the hub") {
+            panic!(
+                "#9562 (serve, failing sink): exited early ({status}): {}",
+                drain_stderr(&mut hub)
+            );
+        }
+        let probe = sink_hub_command(sb, &run, &["--health"])
+            .output()
+            .expect("probe the hub");
+        if probe.status.code() == Some(0) {
+            healthy = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    if !healthy {
+        kill_group(&mut hub);
+        panic!("#9562 (serve, failing sink): never answered health");
+    }
+    terminate_group(&hub);
+    let Some(status) = wait_until(&mut hub, STOP_DEADLINE) else {
+        kill_group(&mut hub);
+        panic!("#9562 (serve, failing sink): did not stop on SIGTERM");
+    };
+    let err = drain_stderr(&mut hub);
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "#9562 (serve, failing sink): a drained stop exits 0: {err}"
+    );
+    assert_eq!(
+        err.matches(DEGRADED).count(),
+        1,
+        "#9562 (serve, failing sink): exactly one named warning: {err}"
+    );
+    assert_eq!(
+        err.matches(tail).count(),
+        1,
+        "#9562 (serve, failing sink): the warning carries its exact remedy line: {err}"
+    );
+    assert_eq!(
+        outage_rows(&sb.db),
+        before,
+        "#9562 (serve, failing sink): serve records no outage row (B1-4)"
+    );
+}
+
 /// T-8 / B1-4 — in a read-only wake-hub mode, a forensic sink that cannot
 /// start prints the one named warning (exact remedy line, exactly once) and
 /// records NO outage row; a writer in the same state still records one, so
@@ -951,6 +1190,7 @@ fn a_read_only_mode_warns_once_and_records_no_outage_row_9562() {
             "#9562 ({label}): a read-only mode records no outage row (B1-4)"
         );
     }
+    serve_warns_once_and_records_no_outage_row(&sb, &tail);
     // Contrast: a writer in the same state records the row, so the store
     // above WAS recordable and the zero is the classification, not a skip.
     let before = outage_rows(&sb.db);
@@ -1189,6 +1429,97 @@ fn every_wake_hub_mode_is_classified_by_one_exhaustive_match_9562() {
     assert!(
         ledger.contains("3-agent vote (71472661)"),
         "the classification cites its vote: {ledger}"
+    );
+}
+
+/// The production code of `body` with `//` comments dropped and every run of
+/// whitespace collapsed to one blank, so a pin can name an exact form.
+fn normalized(body: &str) -> String {
+    production_lines(body)
+        .into_iter()
+        .map(|(_, code)| code)
+        .collect::<Vec<_>>()
+        .join(" ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The ONLY allowed forms of the key calls in the boot path: the key setup is
+/// a match on [`BootKeySetup`] whose `Skip` arm touches no key, the audit
+/// signers are installed only outside `Skip`, and the sink starts keyless
+/// under `Skip`.
+const BOOT_GATED_FORMS: [&str; 3] = [
+    "let (signing_key, generated) = match key_setup { BootKeySetup::Skip => (None, None), \
+     BootKeySetup::LoadOnly => ( \
+     ai_memory::governance::audit::load_daemon_signing_key(&agent_id).unwrap_or(None), None, ), \
+     BootKeySetup::Ensure => { \
+     match ai_memory::governance::audit::ensure_daemon_signing_key(&agent_id) {",
+    "if key_setup != BootKeySetup::Skip { \
+     ai_memory::governance::audit::init_audit_signers(signing_key.as_ref()); }",
+    "let init_result = if key_setup == BootKeySetup::Skip { \
+     ai_memory::governance::audit::init_keyless(dir) } else { \
+     ai_memory::governance::audit::init(dir, signing_key) };",
+];
+
+/// Every key call of the boot path; each must occur exactly once, inside its
+/// gated form, so no second ungated call can sit beside the gate.
+const BOOT_KEY_CALLS: [&str; 5] = [
+    "ensure_daemon_signing_key(",
+    "load_daemon_signing_key(",
+    "init_audit_signers(",
+    "governance::audit::init(",
+    "governance::audit::init_keyless(",
+];
+
+/// T-3 / T-4 — the main.rs boot path (`init_forensic_audit`) is pinned too:
+/// the key calls appear only in their gated forms, `boot_key_setup` skips by
+/// the one mode derivation, the boot passes `boot_key_setup(&cli.command)`,
+/// and the tracing gate of the dispatch arm derives the mode the same way.
+/// FAILS ON THE BASE: the boot ensured the key for every wake-hub mode.
+#[test]
+fn the_boot_path_gates_the_key_setup_for_wake_hub_9562() {
+    let base = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let main = std::fs::read_to_string(base.join("src/main.rs")).expect("read main");
+    let boot = normalized(fn_body(&main, "fn init_forensic_audit("));
+    for form in BOOT_GATED_FORMS {
+        assert!(
+            boot.contains(form),
+            "#9562 T-3: the boot key setup is not in its gated form `{form}`:\n{boot}"
+        );
+    }
+    for call in BOOT_KEY_CALLS {
+        assert_eq!(
+            boot.matches(call).count(),
+            1,
+            "#9562 T-3: `{call}` occurs once, in its gated form only:\n{boot}"
+        );
+    }
+    let setup = normalized(fn_body(&main, "fn boot_key_setup("));
+    assert!(
+        setup.contains(
+            "if let daemon_runtime::Command::WakeHub(args) = cmd && \
+             !ai_memory::cli::wake_hub::WakeHubMode::of(args).writes_ledger() \
+             { return BootKeySetup::Skip; }"
+        ),
+        "#9562 T-3: boot_key_setup skips by the one mode derivation: {setup}"
+    );
+    let production = normalized(&main);
+    assert_eq!(
+        production.matches("boot_key_setup(&cli.command)").count(),
+        1,
+        "#9562 T-3: the boot passes the per-command key setup"
+    );
+    let runtime =
+        std::fs::read_to_string(base.join("src/daemon_runtime.rs")).expect("read the runtime");
+    let arm = fn_body(&runtime, "Command::WakeHub(a) =>");
+    assert!(
+        arm.contains("cli::wake_hub::WakeHubMode::of(&a) == cli::wake_hub::WakeHubMode::Serve"),
+        "#9562 LOW-1: the tracing gate derives the mode once: {arm}"
+    );
+    assert!(
+        !arm.contains("a.posture") && !arm.contains("a.health"),
+        "#9562 LOW-1: the dispatch arm never re-derives the mode from the raw flags: {arm}"
     );
 }
 

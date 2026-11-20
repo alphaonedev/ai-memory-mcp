@@ -521,9 +521,12 @@ impl WakeHubMode {
     /// (T-3, T-7): posture reads the configuration, the allowlist snapshot
     /// and the socket's `stat`; health connects, reads the hub's challenge
     /// and closes; serve binds and unlinks its socket and routes frames in
-    /// memory. None of them reaches `audit::`, `record_decision`,
-    /// `signed_events`, or a signing-key load, ensure or generation; the
-    /// pin is `tests/wake_hub_readonly_modes_9562.rs`.
+    /// memory. None of them reaches `audit::`, `record_decision` or
+    /// `signed_events`. A `false` mode also skips the boot key setup
+    /// (`boot_key_setup` in `src/main.rs`, T-3): no signing key is loaded,
+    /// ensured or generated and no audit signer is installed; the forensic
+    /// sink starts keyless and creates only its directory (no forensic
+    /// file). The pin is `tests/wake_hub_readonly_modes_9562.rs`.
     #[must_use]
     pub const fn writes_ledger(self) -> bool {
         match self {
