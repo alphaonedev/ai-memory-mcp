@@ -516,10 +516,35 @@ pub async fn dispatch(
     // a stop signal delivered there was lost for good. A signal that arrives
     // while an iteration runs is remembered and wins at the next select.
     let mut stop = crate::stop_signal::StopListener::install();
+    listen_loop(db_path, args, &resolved, &mut stream, &mut stop).await
+}
+
+/// What the listen loop waits on to learn that the operator asked it to stop.
+/// A seam so the loop's exit contract is testable without a real signal.
+trait StopRequest {
+    /// Resolve when a stop was requested.
+    async fn requested(&mut self);
+}
+
+impl StopRequest for crate::stop_signal::StopListener {
+    async fn requested(&mut self) {
+        self.wait().await;
+    }
+}
+
+/// The loop behind [`dispatch`]: `Ok(())` ONLY after a requested stop (or the
+/// `--once` single report); a stream that ends on its own is an error.
+async fn listen_loop(
+    db_path: &Path,
+    args: &WakeListenArgs,
+    resolved: &Resolved,
+    stream: &mut WakeStream,
+    stop: &mut impl StopRequest,
+) -> Result<()> {
     loop {
         let signal = tokio::select! {
             biased;
-            () = stop.wait() => {
+            () = stop.requested() => {
                 tracing::info!("wake listener: stopping on signal");
                 return Ok(());
             }
@@ -548,7 +573,7 @@ pub async fn dispatch(
         stream.note_read();
         let count = envelope.get("count").and_then(Value::as_u64).unwrap_or(0);
 
-        emit(&resolved, args, &signal, count).await?;
+        emit(resolved, args, &signal, count).await?;
 
         if args.once {
             return Ok(());
@@ -846,5 +871,109 @@ mod tests_3642 {
             emit(&resolved, &args, &clean, 0).await.is_ok(),
             "the next well-formed wake still emits after a poisoned one"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests_9641 {
+    use super::*;
+
+    /// The exact named error a stream that ended on its own must produce.
+    const EXPECTED_STREAM_END_9641: &str = "wake listener: every wake producer stopped without a stop request; \
+         exiting non-zero so a supervisor restarts the listener";
+
+    /// A stop source that never fires: the stream end is the only exit.
+    struct NeverStop;
+
+    impl StopRequest for NeverStop {
+        async fn requested(&mut self) {
+            std::future::pending::<()>().await;
+        }
+    }
+
+    /// A stop source that has already fired.
+    struct StopNow;
+
+    impl StopRequest for StopNow {
+        async fn requested(&mut self) {}
+    }
+
+    fn resolved_9641() -> Resolved {
+        Resolved {
+            agent_id: "ai:me-9641".into(),
+            socket: None,
+            hub_id: "ai-memory-wake-hub".into(),
+            key_dir: PathBuf::from("/nonexistent-9641"),
+            bundle: PathBuf::from("/nonexistent-9641/bundle"),
+            client: WakeClientConfig::default(),
+        }
+    }
+
+    fn args_9641() -> WakeListenArgs {
+        WakeListenArgs {
+            agent_id: None,
+            socket: None,
+            hub_id: None,
+            key_dir: None,
+            bundle: None,
+            poll_secs: None,
+            unread_only: false,
+            limit: None,
+            json: false,
+            exec: None,
+            once: false,
+            no_hub: true,
+        }
+    }
+
+    /// A stream that ended with no stop requested is a peer-side end: the loop
+    /// returns the exact named error, never `Ok`.
+    #[tokio::test]
+    async fn an_ended_stream_without_a_stop_is_a_named_error_9641() {
+        let (mut stream, tx) = WakeStream::detached_for_test();
+        drop(tx);
+        let err = listen_loop(
+            Path::new("/nonexistent-9641.db"),
+            &args_9641(),
+            &resolved_9641(),
+            &mut stream,
+            &mut NeverStop,
+        )
+        .await
+        .expect_err("a stream that ended on its own must not exit 0");
+        assert_eq!(err.to_string(), EXPECTED_STREAM_END_9641);
+    }
+
+    /// A requested stop still returns `Ok` even though the stream is live and
+    /// quiet, so the named error is not a blanket failure.
+    #[tokio::test]
+    async fn a_requested_stop_still_returns_ok_9641() {
+        let (mut stream, _tx) = WakeStream::detached_for_test();
+        listen_loop(
+            Path::new("/nonexistent-9641.db"),
+            &args_9641(),
+            &resolved_9641(),
+            &mut stream,
+            &mut StopNow,
+        )
+        .await
+        .expect("a requested stop exits 0");
+    }
+
+    /// A stop that is already pending wins over an ended stream (the stop arm
+    /// is biased first), so a SIGTERM racing a teardown still exits 0.
+    #[tokio::test]
+    async fn a_stop_wins_over_a_simultaneous_stream_end_9641() {
+        let (mut stream, tx) = WakeStream::detached_for_test();
+        drop(tx);
+        listen_loop(
+            Path::new("/nonexistent-9641.db"),
+            &args_9641(),
+            &resolved_9641(),
+            &mut stream,
+            &mut StopNow,
+        )
+        .await
+        .expect("stop wins");
     }
 }

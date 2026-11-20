@@ -417,6 +417,23 @@ impl WakeStream {
         Arc::clone(&self.metrics)
     }
 
+    /// A stream with no producer tasks, for tests of what a consumer does when
+    /// the stream ends or stays quiet. The returned sender keeps it live until
+    /// dropped.
+    #[cfg(test)]
+    pub(crate) fn detached_for_test() -> (Self, mpsc::Sender<WakeSignal>) {
+        let (tx, rx) = mpsc::channel::<WakeSignal>(SIGNAL_QUEUE_DEPTH);
+        (
+            Self {
+                rx,
+                read_done: Arc::new(Notify::new()),
+                metrics: Arc::new(ClientMetrics::default()),
+                tasks: Vec::new(),
+            },
+            tx,
+        )
+    }
+
     /// Await the next signal. `None` only when every producer has stopped.
     pub async fn next(&mut self) -> Option<WakeSignal> {
         self.rx.recv().await
