@@ -31,6 +31,7 @@ Run: python3 -I -m unittest discover -s scripts/ci/tests -p 'test_rust_cache_sav
 from __future__ import annotations
 
 import re
+import shlex
 import sys
 import time
 import unittest
@@ -1113,6 +1114,537 @@ class ChainCacheSoleWriter9681(unittest.TestCase):
                 with self.subTest(file=where, phrase=phrase):
                     self.assertIn(phrase, text, f"{where}: lacks {phrase!r} (V-11: kill switch and "
                                                 f"the generation bump on a build-affecting revert)")
+
+
+# --- #9681 r1: one cargo command list, derived from both workflows ------------------------------
+#
+# Invariant: every cargo command a hosted PR leg runs whose output rust-cache keeps (target/
+# builds and `cargo install` binaries in ~/.cargo/bin) is run by its warm job with the EXACT same
+# command line, and the warm job runs no other cargo command. Both lists are read from the
+# workflow files; only the shell lines a static read cannot resolve are named below, each with
+# its reason, and a table row that no longer matches a workflow line is itself a failure.
+
+REPO_SLUG = "alphaonedev/ai-memory-mcp"
+# The values a step `if:` can read on a same-repository pull_request run of a hosted leg (chain
+# PRs are same-repository; a fork PR never reaches the chain cache). Any other name fails closed.
+HOSTED_PR_CONTEXT: dict[str, object] = {
+    "needs.classify.outputs.cargo_skip": "false",
+    "runner.environment": "github-hosted",
+    "runner.os": "Linux",
+    "github.event_name": "pull_request",
+    "github.repository": REPO_SLUG,
+    "github.event.pull_request.head.repo.full_name": REPO_SLUG,
+}
+# Cargo subcommands whose output rust-cache saves (target/, ~/.cargo/bin, ~/.cargo/registry).
+PRODUCING_SUBCOMMANDS = frozenset({"build", "test", "install", "llvm-cov", "check", "clippy",
+                                   "rustc", "doc", "bench", "nextest", "run", "fetch"})
+# Cargo subcommands that leave nothing a cache keeps, each with its reason.
+NON_PRODUCING_SUBCOMMANDS: dict[str, str] = {
+    "clean": "removes target/ entries; a PR run saves no cache, so nothing it removes is kept",
+    "audit": "reads the advisory database; `cargo audit --version` only probes the installed binary",
+    "metadata": "prints the package graph",
+    "fmt": "checks formatting; builds nothing",
+}
+# PR-leg cargo lines a static read cannot resolve (shell variables, or a second call over the
+# same build): (workflow, job, exact line) -> (the warm command it needs, or None, reason).
+RESOLVED_PR_COMMANDS: dict[tuple[str, str, str], tuple[str | None, str]] = {
+    ("ci.yml", "check", 'cargo test --no-run "$@"'): (
+        "cargo test --no-run",
+        "run_tests / run_doc_tests prebuild: on the hosted sqlite leg FEAT and TAIL are empty, the "
+        "full suite passes no argument and the impact path passes --lib / --test names, a subset "
+        "of the same build"),
+    ("ci.yml", "check", 'cargo test --no-fail-fast "$@"'): (
+        "cargo test --no-run",
+        "runs the binaries the prebuild line above it built, with the same arguments"),
+    ("ci.yml", "check", 'cargo test --doc --no-fail-fast "$@"'): (
+        "cargo test --no-run",
+        "doctests link the library the prebuild built; rustdoc's doctest binaries are not in target/"),
+    ("ci.yml", "check", 'cargo test --no-run "$@" "${sel[@]}"'): (
+        None, "run_isolated_lane: enterprise-fed tier only, never the hosted sqlite leg"),
+    ("ci.yml", "check", 'cargo test --no-run --message-format=json-render-diagnostics $FEAT "$@"'): (
+        None, "run_sharded: enterprise-fed tier only, never the hosted sqlite leg"),
+    ("coverage.yml", "per-module-thresholds",
+     "cargo llvm-cov --no-clean --features sal,sal-postgres --lib --workspace --json --output-path "
+     "coverage/current.json -- schema_init_postgres_embedding_dim_conversion --ignored "
+     "--test-threads=1"): (
+        "cargo llvm-cov --no-report --features sal,sal-postgres --lib --tests --workspace -- "
+        "--test-threads=1",
+        "report call: --no-clean reuses the first call's instrumented build, and --lib with the "
+        "same features is a subset of --lib --tests"),
+}
+# Test-runner arguments (after `--`) a warm command may append: they reach the test binary, not
+# the compiler, so the build is the PR command's build.
+WARM_RUNNER_SUFFIX: dict[str, tuple[str, str]] = {
+    "coverage": ("--exact __rust_cache_warm_no_such_test__",
+                 "matches no test, so the instrumented binaries start and exit without Postgres"),
+}
+
+CARGO_WORD_RE = re.compile(r"(?<![\w$/.{-])cargo(?=[ \t])")
+SHELL_STOP_CHARS = frozenset("();<>|&")
+ENV_REF_RE = re.compile(r'"\$\{([A-Za-z_][A-Za-z0-9_]*)\}"|\$\{([A-Za-z_][A-Za-z0-9_]*)\}'
+                        r'|"\$([A-Za-z_][A-Za-z0-9_]*)"|\$([A-Za-z_][A-Za-z0-9_]*)')
+IF_TOKEN_RE = re.compile(r"\s*(\(|\)|&&|\|\||!=|==|!|,|'[^']*'|[A-Za-z_][\w.-]*|\d+)")
+IF_FUNCTIONS = frozenset({"always", "success", "contains"})
+
+
+def _inside_quotes(line: str, pos: int) -> bool:
+    quote = ""
+    escaped = False
+    for char in line[:pos]:
+        if escaped:
+            escaped = False
+        elif char == "\\" and quote != "'":
+            escaped = True
+        elif quote:
+            quote = "" if char == quote else quote
+        elif char in "'\"":
+            quote = char
+    return bool(quote)
+
+
+def _command_at(text: str) -> str:
+    """The words of one cargo invocation, up to the first shell operator or redirect."""
+    lexer = shlex.shlex(text, posix=False, punctuation_chars=True)
+    lexer.whitespace_split = True
+    words: list[str] = []
+    for token in lexer:
+        if token and set(token) <= SHELL_STOP_CHARS:
+            if set(token) & set("<>") and words and words[-1].isdigit():
+                words.pop()
+            break
+        words.append(token)
+    return " ".join(words)
+
+
+def _cargo_commands(text: str) -> list[str]:
+    """Every cargo invocation in a run text (a `cargo` word outside quotes and comments)."""
+    out: list[str] = []
+    for line in _flat(text).splitlines():
+        if line.lstrip().startswith("#"):
+            continue
+        for match in CARGO_WORD_RE.finditer(line):
+            if not _inside_quotes(line, match.start()):
+                out.append(_command_at(line[match.start():]))
+    return out
+
+
+def _expand(command: str, env: dict[str, str]) -> str:
+    """Replace a reference to a variable the workflow sets (workflow, job or step env)."""
+    def sub(match: re.Match[str]) -> str:
+        name = next(group for group in match.groups() if group)
+        return env[name] if name in env else match.group(0)
+    return ENV_REF_RE.sub(sub, command)
+
+
+def _subcommand(command: str) -> str:
+    words = command.split()
+    rest = words[2:] if len(words) > 1 and words[1].startswith("+") else words[1:]
+    if not rest:
+        raise AssertionError(f"cargo without a subcommand: {command!r}")
+    return rest[0]
+
+
+def _eval_if(expr: str, matrix: dict[str, object]) -> bool:
+    """Evaluate a step `if:` for a hosted PR leg; an unknown name or form fails closed."""
+    text = expr.strip()
+    if text.startswith("${{") and text.endswith("}}"):
+        text = text[3:-2]
+    tokens: list[str] = []
+    pos = 0
+    while pos < len(text):
+        match = IF_TOKEN_RE.match(text, pos)
+        if not match:
+            if not text[pos:].strip():
+                break
+            raise AssertionError(f"unreadable if: {expr!r} at {text[pos:]!r}")
+        tokens.append(match.group(1))
+        pos = match.end()
+    index = 0
+
+    def peek() -> str:
+        return tokens[index] if index < len(tokens) else ""
+
+    def take(expected: str | None = None) -> str:
+        nonlocal index
+        token = peek()
+        if not token or (expected is not None and token != expected):
+            raise AssertionError(f"unreadable if: {expr!r} (wanted {expected!r}, got {token!r})")
+        index += 1
+        return token
+
+    def atom() -> object:
+        token = take()
+        if token == "(":
+            value = either()
+            take(")")
+            return value
+        if token.startswith("'"):
+            return token[1:-1]
+        if token.isdigit():
+            return int(token)
+        if token in ("true", "false"):
+            return token == "true"
+        if peek() == "(":
+            if token not in IF_FUNCTIONS:
+                raise AssertionError(f"unknown function {token!r} in if: {expr!r}")
+            take("(")
+            args: list[object] = []
+            while peek() != ")":
+                args.append(either())
+                if peek() == ",":
+                    take(",")
+            take(")")
+            if token == "contains":
+                return str(args[1]).lower() in str(args[0]).lower()
+            return True
+        if token.startswith("matrix."):
+            return matrix.get(token[len("matrix."):])
+        if token in HOSTED_PR_CONTEXT:
+            return HOSTED_PR_CONTEXT[token]
+        raise AssertionError(f"unknown name {token!r} in if: {expr!r}")
+
+    def compare() -> object:
+        left = atom()
+        if peek() in ("==", "!="):
+            op = take()
+            right = atom()
+            same = (str(left).lower() == str(right).lower()
+                    if isinstance(left, str) and isinstance(right, str) else left == right)
+            return same if op == "==" else not same
+        return left
+
+    def negation() -> object:
+        if peek() == "!":
+            take("!")
+            return not negation()
+        return compare()
+
+    def both() -> object:
+        value = negation()
+        while peek() == "&&":
+            take("&&")
+            right = negation()
+            value = value and right
+        return value
+
+    def either() -> object:
+        value = both()
+        while peek() == "||":
+            take("||")
+            right = both()
+            value = value or right
+        return value
+
+    result = either()
+    if index != len(tokens):
+        raise AssertionError(f"unreadable if: {expr!r} (trailing {tokens[index:]!r})")
+    return bool(result)
+
+
+def _matrix_include(job: Job) -> list[dict[str, object]]:
+    """The `strategy.matrix.include` entries of a job, scalar values only."""
+    entries: list[dict[str, object]] = []
+    include_indent = -1
+    item_indent = -1
+    for line in job.block("strategy"):
+        if _is_comment_or_blank(line):
+            continue
+        stripped = line.strip()
+        if stripped == "include:":
+            include_indent = _indent(line)
+            continue
+        if include_indent < 0:
+            continue
+        if _indent(line) <= include_indent:
+            break
+        if stripped.startswith("- ") and (item_indent < 0 or _indent(line) == item_indent):
+            item_indent = _indent(line)
+            entries.append({})
+            stripped = stripped[2:]
+        elif _indent(line) != item_indent + 2:
+            continue
+        name, _, value = stripped.partition(":")
+        scalar = _scalar(value)
+        entries[-1][name.strip()] = {"true": True, "false": False}.get(scalar, scalar)
+    return entries
+
+
+def _hosted_legs(job: Job) -> list[dict[str, object]]:
+    legs = _matrix_include(job)
+    if not legs:
+        return [{}]
+    return [leg for leg in legs if "self-hosted" not in str(leg.get("runner", ""))]
+
+
+def _pr_leg_commands(name: str, job_id: str) -> tuple[list[str], list[str]]:
+    """(the warm commands the hosted legs need, the problems) for one PR job."""
+    wf = Workflow.load(name)
+    job = wf.jobs()[job_id]
+    needed: list[str] = []
+    problems: list[str] = []
+    seen: set[str] = set()
+    legs = _hosted_legs(job)
+    if not legs:
+        problems.append(f"{name}:{job_id}: no hosted leg")
+    for leg in legs:
+        for step in job.steps():
+            commands = _cargo_commands(step.run())
+            if not commands or ("if" in step.keys and not _eval_if(step.keys["if"], leg)):
+                continue
+            env = {**wf.env(), **job.env(), **step.mapping("env")}
+            for command in (_expand(c, env) for c in commands):
+                seen.add(command)
+                sub = _subcommand(command)
+                if sub in NON_PRODUCING_SUBCOMMANDS:
+                    continue
+                if sub not in PRODUCING_SUBCOMMANDS:
+                    problems.append(f"{step.label()}: unclassified cargo subcommand: {command}")
+                    continue
+                key = (name, job_id, command)
+                if key in RESOLVED_PR_COMMANDS:
+                    resolved = RESOLVED_PR_COMMANDS[key][0]
+                    if resolved is not None:
+                        needed.append(resolved)
+                elif "$" in command:
+                    problems.append(f"{step.label()}: unnamed dynamic cargo command: {command}")
+                else:
+                    needed.append(command)
+    for row_name, row_job, row_command in RESOLVED_PR_COMMANDS:
+        if (row_name, row_job) == (name, job_id) and row_command not in seen:
+            problems.append(f"stale RESOLVED_PR_COMMANDS row (no such line): {row_command}")
+    return sorted(set(needed)), problems
+
+
+def _warm_commands(warm_job_id: str) -> tuple[list[str], list[str]]:
+    """(the warm job's cargo commands, the problems): literal, cache-miss gated, after the cache."""
+    wf = Workflow.load(WARM)
+    job = wf.jobs()[warm_job_id]
+    steps = job.steps()
+    cache = _cache_index(steps)
+    gate = f"steps.{steps[cache].keys.get('id', '')}.outputs.cache-hit != 'true'"
+    commands: list[str] = []
+    problems: list[str] = []
+    suffix = WARM_RUNNER_SUFFIX.get(warm_job_id, ("", ""))[0]
+    for index, step in enumerate(steps):
+        env = {**wf.env(), **job.env(), **step.mapping("env")}
+        for command in (_expand(c, env) for c in _cargo_commands(step.run())):
+            if index < cache:
+                problems.append(f"{step.label()}: cargo before the cache step: {command}")
+            if step.keys.get("if") != gate:
+                problems.append(f"{step.label()}: if is {step.keys.get('if')!r}, not {gate!r}")
+            if "$" in command:
+                problems.append(f"{step.label()}: warm command is not literal: {command}")
+            if _subcommand(command) not in PRODUCING_SUBCOMMANDS:
+                problems.append(f"{step.label()}: warm command builds nothing: {command}")
+            if suffix and " -- " in command and command.endswith(" " + suffix):
+                command = command[:-len(suffix) - 1]
+            commands.append(command)
+    return commands, problems
+
+
+class WarmCommandList9681(unittest.TestCase):
+    """#9681 r1 (C1, C2): the warm jobs and the hosted PR legs run one cargo command list."""
+
+    def test_warm_job_runs_exactly_the_hosted_pr_leg_cargo_commands(self) -> None:
+        for pr_name, pr_job_id, warm_job_id, _ in PAIRS:
+            needed, pr_problems = _pr_leg_commands(pr_name, pr_job_id)
+            warm, warm_problems = _warm_commands(warm_job_id)
+            with self.subTest(pair=warm_job_id, part="pr-leg-commands-classified"):
+                self.assertEqual(pr_problems, [])
+            with self.subTest(pair=warm_job_id, part="warm-commands-literal-and-gated"):
+                self.assertEqual(warm_problems, [])
+            with self.subTest(pair=warm_job_id, part="no-command-twice"):
+                self.assertEqual(len(warm), len(set(warm)), warm)
+            with self.subTest(pair=warm_job_id, part="only-in-pr-leg"):
+                self.assertEqual(sorted(set(needed) - set(warm)), [])
+            with self.subTest(pair=warm_job_id, part="only-in-warm-job"):
+                self.assertEqual(sorted(set(warm) - set(needed)), [])
+
+    def test_command_reader_table(self) -> None:
+        cases = {
+            'cargo test --no-run "$@" || return "$?"': ['cargo test --no-run "$@"'],
+            'if ! cargo audit --version 2>/dev/null | grep -Fqw -- "${V}"; then':
+                ["cargo audit --version"],
+            'echo "::notice::cargo test $FEAT"': [],
+            'run_tests "full suite (cargo test)" $FEAT $TAIL': [],
+            "# cargo build --release": [],
+            'x "$T" --kill-after=60 "$S" cargo test --no-fail-fast "$@" || rc=$?':
+                ['cargo test --no-fail-fast "$@"'],
+            "cargo llvm-cov \\\n  --no-report \\\n  --lib": ["cargo llvm-cov --no-report --lib"],
+            'cargo metadata --no-deps > "$meta"': ["cargo metadata --no-deps"],
+            'echo "${CARGO_TARGET_DIR:?cargo target not set}"': [],
+        }
+        for text, expected in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(_cargo_commands(text), expected)
+        self.assertEqual(_expand('cargo install x --version "${V}"', {"V": "0.22.2"}),
+                         "cargo install x --version 0.22.2")
+        self.assertEqual(_expand('cargo test "$@"', {"V": "1"}), 'cargo test "$@"')
+
+    def test_if_evaluator_table_and_fail_closed(self) -> None:
+        hosted = {"once": True, "runner": '["ubuntu-latest"]', "tier": "sqlite"}
+        cases = {
+            "needs.classify.outputs.cargo_skip != 'true' && matrix.once": True,
+            "needs.classify.outputs.cargo_skip != 'true' && matrix.shared_target": False,
+            "runner.environment == 'github-hosted'": True,
+            "contains(matrix.runner, 'self-hosted')": False,
+            "always() && matrix.tier == 'enterprise-fed'": False,
+            "!matrix.shared_target && (github.event_name != 'pull_request' || true)": True,
+            "${{ runner.os == 'linux' }}": True,
+        }
+        for expr, expected in cases.items():
+            with self.subTest(expr=expr):
+                self.assertIs(_eval_if(expr, hosted), expected)
+        for bad in ("env.TEST_RESULT_LOG != ''", "hashFiles('x')", "matrix.a ==", "a ~ b",
+                    "(always()"):
+            with self.subTest(bad=bad), self.assertRaises(AssertionError):
+                _eval_if(bad, hosted)
+
+    def test_reader_is_linear_on_a_large_run_text(self) -> None:
+        text = "\n".join(f'echo "cargo test {i}" && cargo build --bin b{i} || true'
+                         for i in range(20_000))
+        start = time.monotonic()
+        commands = _cargo_commands(text)
+        self.assertEqual(len(commands), 20_000)
+        self.assertEqual(commands[-1], "cargo build --bin b19999")
+        self.assertLess(time.monotonic() - start, 10.0)
+
+
+# --- #9681 r1 S1: every cache writer a pull_request run can reach -------------------------------
+#
+# Each action a PR-startable workflow (and the warm workflow) uses is in exactly one table: a
+# cache writer with the rule that keeps it from saving on a PR run, or an action that never
+# writes the Actions cache, with the reason. An action in neither table fails, and so does a run
+# text that drives the cache backend itself.
+
+ACTIONS_LOCAL = REPO / ".github" / "actions"
+# action -> (inputs that would make it save, the reason it saves nothing as configured).
+CONFIG_GATED_WRITERS: dict[str, tuple[tuple[str, ...], str]] = {
+    "actions/setup-python": (("cache", "cache-dependency-path"),
+                             "v5 saves a pip/poetry cache only when `cache:` is set"),
+    "actions/setup-node": (("cache", "cache-dependency-path", "package-manager-cache"),
+                           "v4 saves a package-manager cache only when `cache:` is set"),
+    "nttld/setup-ndk": (("local-cache",), "v1 saves the NDK to the Actions cache only with local-cache"),
+    "docker/setup-buildx-action": (("version", "cache-binary"),
+                                   "v3 caches the buildx binary only when it downloads a `version`"),
+    "github/codeql-action/init": (("dependency-caching",),
+                                  "v3 caches dependencies only when dependency-caching is set"),
+}
+# Writers whose save is decided by an event gate: action -> the input or key that must carry it.
+EVENT_GATED_WRITERS = {
+    RUST_CACHE: "save-if",
+    CACHE_SAVE: "if",
+    "docker/build-push-action": "cache-to",
+}
+NON_WRITER_ACTIONS: dict[str, str] = {
+    "actions/checkout": "fetches the repository",
+    CACHE_RESTORE: "restore half of the split cache action: it has no post step",
+    "actions/upload-artifact": "uploads a run artifact, not an Actions cache entry",
+    "dtolnay/rust-toolchain": "runs rustup; no cache input",
+    "taiki-e/install-action": "downloads a pinned binary release; no cache input",
+    "marocchino/sticky-pull-request-comment": "writes a PR comment",
+    "reactivecircus/android-emulator-runner": "starts an emulator; no cache input",
+    "github/codeql-action/analyze": "uploads SARIF",
+    "docker://rhysd/actionlint:1.7.1": "a container step running actionlint",
+    "./.github/actions/prune-runner-tmp": "local composite action; it uses no action and no cache "
+                                          "(read by test_local_actions_hold_no_cache_writer)",
+}
+# Named exceptions: a cache writer that a pull_request run can reach today, with its tracker.
+PR_CACHE_WRITER_EXCEPTIONS: dict[tuple[str, str, str], str] = {
+    ("ci.yml", "dockerfile-validate", "Build Docker image (validation only)"):
+        "#9711 (pre-existing at fd43a727): `cache-to: type=gha,mode=max` writes the buildx layer "
+        "cache on pull_request and merge_group runs; a docker layer scope, never read by a "
+        "rust-cache restore. The push gate lands with #9711, not in #9681.",
+}
+CACHE_BACKEND_TEXT_RE = re.compile(r"type=gha|SCCACHE_GHA|ACTIONS_CACHE_URL|ACTIONS_RESULTS_URL"
+                                   r"|actions/cache|\bgh cache\b")
+
+
+def _event_gated(step: Step, how: str) -> bool:
+    """Whether a writer step saves only on push."""
+    if how == "save-if":
+        return step.mapping("with").get("save-if") == SAVE_IF_PUSH
+    if how == "if":
+        return step.keys.get("if", "").startswith(PUSH_GATE + " &&") or \
+            step.keys.get("if", "") == PUSH_GATE
+    value = step.mapping("with").get("cache-to")
+    return value is None or value.startswith("${{ github.event_name == 'push' && ")
+
+
+def _pr_cache_writers() -> tuple[list[tuple[str, str, str]], list[str]]:
+    """(writers a PR run reaches, problems) across every PR-startable workflow and the warm one."""
+    reached: list[tuple[str, str, str]] = []
+    problems: list[str] = []
+    for name in _all_workflow_names():
+        wf = Workflow.load(name)
+        pr_run = bool(PR_EVENTS & set(wf.events()))
+        if not pr_run and name != WARM:
+            continue
+        for job_id, job in wf.jobs().items():
+            for step in job.steps():
+                where = (name, job_id, step.label())
+                uses = step.uses_name()
+                text = "\n".join(step.lines)
+                writes = False
+                if uses == CACHE_COMBINED:
+                    problems.append(f"{where}: actions/cache saves in its post step on every event")
+                elif uses in EVENT_GATED_WRITERS:
+                    writes = not _event_gated(step, EVENT_GATED_WRITERS[uses])
+                elif uses in CONFIG_GATED_WRITERS:
+                    set_inputs = sorted(set(CONFIG_GATED_WRITERS[uses][0]) & set(step.mapping("with")))
+                    if set_inputs:
+                        problems.append(f"{where}: {uses} sets {set_inputs}: name its gate")
+                elif uses and uses not in NON_WRITER_ACTIONS:
+                    problems.append(f"{where}: unclassified action {uses}")
+                if not writes and CACHE_BACKEND_TEXT_RE.search(step.run()):
+                    writes = True
+                if writes and pr_run:
+                    reached.append(where)
+    return reached, problems
+
+
+class PrRunCacheWriters9681(unittest.TestCase):
+    """#9681 r1 (S1): no pull_request run writes a cache, except the named rows."""
+
+    def test_every_pr_reachable_cache_writer_is_gated_or_named(self) -> None:
+        reached, problems = _pr_cache_writers()
+        self.assertEqual(problems, [])
+        self.assertEqual(sorted(reached), sorted(PR_CACHE_WRITER_EXCEPTIONS))
+
+    def test_local_actions_hold_no_cache_writer(self) -> None:
+        for path in sorted(ACTIONS_LOCAL.rglob("action.y*ml")):
+            with self.subTest(action=str(path.relative_to(REPO))):
+                text = path.read_text(encoding="utf-8")
+                self.assertIsNone(re.search(r"^\s*(?:-\s+)?uses:", text, re.M))
+                self.assertIsNone(CACHE_BACKEND_TEXT_RE.search(text))
+
+    def test_writer_rules_table(self) -> None:
+        def step(*lines: str) -> Step:
+            return _parse_step([" " * STEP_INDENT + "- name: s", *(" " * KEY_INDENT + l for l in lines)])
+
+        cases = [
+            (step(f"uses: {RUST_CACHE}@{RUST_CACHE_SHA}", "with:", f"  save-if: {SAVE_IF_PUSH}"),
+             "save-if", True),
+            (step(f"uses: {RUST_CACHE}@{RUST_CACHE_SHA}"), "save-if", False),
+            (step(f"uses: {RUST_CACHE}@{RUST_CACHE_SHA}", "with:", "  save-if: true"), "save-if", False),
+            (step(f"if: {PUSH_GATE} && steps.r.outputs.cache-hit != 'true'"), "if", True),
+            (step(f"if: {PUSH_GATE}"), "if", True),
+            (step(f"if: {PUSH_GATE}x"), "if", False),
+            (step("if: always()"), "if", False),
+            (step(), "if", False),
+            (step("with:", "  cache-to: type=gha,mode=max"), "cache-to", False),
+            (step("with:", "  cache-from: type=gha"), "cache-to", True),
+            (step("with:", "  cache-to: ${{ github.event_name == 'push' && 'type=gha' || '' }}"),
+             "cache-to", True),
+        ]
+        for index, (candidate, how, expected) in enumerate(cases):
+            with self.subTest(case=index):
+                self.assertIs(_event_gated(candidate, how), expected)
+        for text in ("SCCACHE_GHA_ENABLED=true sccache", "docker buildx build --cache-to type=gha",
+                     "gh cache delete x", "curl $ACTIONS_CACHE_URL"):
+            with self.subTest(text=text):
+                self.assertIsNotNone(CACHE_BACKEND_TEXT_RE.search(text))
+        self.assertIsNone(CACHE_BACKEND_TEXT_RE.search("cargo test --no-run; echo cache-hit"))
 
 
 if __name__ == "__main__":
