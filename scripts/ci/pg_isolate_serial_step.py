@@ -246,10 +246,13 @@ def _shown(names: list[str]) -> str:
     return text
 
 
-def ledger_reasons(text: str, targets: list[str], run_id: str) -> list[str]:
+def ledger_reasons(text: str, targets: list[str], run_id: str, residual: set[str], shared_db: str) -> list[str]:
     """Every reason the ledger does not prove that each deferred binary ran with at least one test in this run.
 
-    One linear pass; the reasons are capped at REASONS_MAX and the text at LEDGER_MAX_BYTES."""
+    A row's mode must be the one the deferred lists give its binary (residual when ``residual`` names it,
+    else isolated; #9751), an isolated row must name a clone of this run and a residual row the shared
+    database ``shared_db`` (an empty name proves no residual row). One linear pass; the reasons are capped
+    at REASONS_MAX and the text at LEDGER_MAX_BYTES."""
     if len(text.encode('utf-8', 'replace')) > LEDGER_MAX_BYTES:
         return ['ledger over %d bytes' % LEDGER_MAX_BYTES]
     w = wrapper()
@@ -272,8 +275,12 @@ def ledger_reasons(text: str, targets: list[str], run_id: str) -> list[str]:
                 reasons.append('ledger names a binary that was not deferred: %s' % name)
             elif tests == 0:
                 reasons.append('ledger row for %s has zero tests' % name)
+            elif mode != (want := 'residual' if name in residual else 'isolated'):
+                reasons.append('ledger row for %s has mode %s, expected %s' % (name, mode, want))
             elif mode == 'isolated' and (prefix is None or not db.startswith(prefix)):
                 reasons.append('ledger row for %s is not on a clone of this run' % name)
+            elif mode == 'residual' and (not shared_db or db != shared_db):
+                reasons.append('ledger row for %s is not on the shared database' % name)
             seen.add(name)
         elif (end := LEDGER_DONE_RE.fullmatch(line)):
             if done is not None:
@@ -646,7 +653,7 @@ def run_step(host, env: dict) -> int:
     say('serial shard step wall time: %ds, jobs=%s, binaries=%d' % (int(host.now() - started), JOBS, len(targets)))
     if not reasons:
         text = ledger_text(rows, run_id)
-        reasons = ledger_reasons(text, targets, run_id)
+        reasons = ledger_reasons(text, targets, run_id, residual, db)
         if not reasons:
             try:
                 _write_atomic(temp / LEDGER_FILE, text)
@@ -707,9 +714,9 @@ def cmd_leftovers(host, env: dict) -> int:
     return 1 if clones or template else 0
 
 
-def _cleanup_ledger(temp: Path, run_id: str) -> tuple[list[str], int]:
+def _cleanup_ledger(temp: Path, run_id: str, shared_db: str) -> tuple[list[str], int]:
     try:
-        _shard, targets, _residual = _read_targets(temp)
+        _shard, targets, residual = _read_targets(temp)
     except StepFail as exc:
         return [str(exc)], 0
     try:
@@ -717,7 +724,7 @@ def _cleanup_ledger(temp: Path, run_id: str) -> tuple[list[str], int]:
             data = handle.read(LEDGER_MAX_BYTES + 1)
     except OSError:
         return ['cannot read %s: the isolated step did not complete' % LEDGER_FILE], len(targets)
-    return ledger_reasons(data.decode('utf-8', 'replace'), targets, run_id), len(targets)
+    return ledger_reasons(data.decode('utf-8', 'replace'), targets, run_id, residual, shared_db), len(targets)
 
 
 def cmd_cleanup(host, env: dict) -> int:
@@ -746,7 +753,7 @@ def cmd_cleanup(host, env: dict) -> int:
         fail(str(exc))
         return 1
     reasons = _teardown(host, env, db, tpl, run_id)
-    more, binaries = _cleanup_ledger(temp, run_id)
+    more, binaries = _cleanup_ledger(temp, run_id, db)
     reasons += more
     for reason in _capped(reasons):
         fail(reason)
