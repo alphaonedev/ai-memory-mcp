@@ -214,8 +214,9 @@ def job_blocks(text):
 
 
 def job_meta(lines):
-    """Return {"name", "if", "needs"} of one job block."""
-    meta = {"name": None, "if": None, "needs": ()}
+    """Return {"name", "if", "needs", "timeout-minutes", "continue-on-error"} of one job block."""
+    meta = {"name": None, "if": None, "needs": (), "timeout-minutes": None,
+            "continue-on-error": None}
     collecting_needs = False
     needs = []
     for line in lines:
@@ -231,8 +232,8 @@ def job_meta(lines):
         name, value = key.group(1), key.group(2).strip()
         if name == "name":
             meta["name"] = unquote(value)
-        elif name == "if":
-            meta["if"] = value
+        elif name in ("if", "timeout-minutes", "continue-on-error"):
+            meta[name] = value
         elif name == "needs":
             if not value:
                 collecting_needs = True
@@ -267,6 +268,45 @@ def matrix_include(lines):
             continue
         break
     return entries
+
+
+STRATEGY_LINE = "    strategy:"
+STRATEGY_KEY_RE = re.compile(r"^      ([A-Za-z0-9_-]+):\s*(.*)$")
+MATRIX_KEY_RE = re.compile(r"^        ([A-Za-z0-9_-]+):\s*(.*)$")
+# An `exclude` key at any indent, block or `- exclude:` form, outside a comment.
+EXCLUDE_RE = re.compile(r"^\s*(?:-\s+)?exclude\s*:")
+
+
+def strategy_shape(lines):
+    """Return ({strategy key: raw value}, [matrix keys]) of one job block (#9698).
+
+    A flow-style `matrix: {...}` shows up as a non-empty raw `matrix` value.
+    """
+    strategy, matrix_keys = {}, []
+    inside = in_matrix = False
+    for line in lines:
+        if line == STRATEGY_LINE:
+            inside = True
+            continue
+        if not inside:
+            continue
+        if JOB_KEY_RE.match(line):
+            break
+        key = STRATEGY_KEY_RE.match(line)
+        if key:
+            strategy[key.group(1)] = key.group(2).strip()
+            in_matrix = key.group(1) == "matrix"
+            continue
+        matrix_key = MATRIX_KEY_RE.match(line)
+        if in_matrix and matrix_key:
+            matrix_keys.append(matrix_key.group(1))
+    return strategy, matrix_keys
+
+
+def scalar_int(raw):
+    """The integer of a one-line YAML scalar (a trailing comment dropped), else None."""
+    text = (raw or "").split("#", 1)[0].strip()
+    return int(text) if text.isdigit() else None
 
 
 def expand_names(name, axis, entries):
@@ -451,6 +491,130 @@ class Steps9680(unittest.TestCase):
         self.assertEqual(len(setup), 1)
         self.assertEqual(self.wf.steps[job][setup[0]]["if"], ONCE_GUARD)
         self.assertLess(setup[0], self.wf.index(job, SECURITY_AUDIT))
+
+
+# ---------------------------------------------------------------------------
+# The properties of the old home of the moved work move with it (#9698, #9699,
+# #9700): the moved steps and their job (a) cannot report green after a failure,
+# (b) are bounded by a job timeout, (c) are cached the way the PR body says, and
+# pull_request runs cannot save that cache.
+# ---------------------------------------------------------------------------
+MOVED_JOB = "mobile-cross-compile"
+MOVED_STEPS = (SECURITY_AUDIT, RELEASE_SMOKE)
+RUST_CACHE_USES_PREFIX = "Swatinem/rust-cache@"
+# (c) #9700: the key is rotated once, so the entry saved before the move (no
+# cargo-audit, no target/release) is not an exact match that never re-saves;
+# the save-if is the #3089 form of the check and postgres-feature cache steps.
+MOBILE_CACHE_KEY = "mobile-${{ matrix.target }}-audit-release"
+PUSH_ONLY_SAVE_IF = "${{ github.event_name == 'push' }}"
+EXPECTED_MOBILE_CACHE_WITH = {"key": MOBILE_CACHE_KEY, "save-if": PUSH_ONLY_SAVE_IF}
+# (b) #9699: the longest measured time of each piece of work the job now holds
+# (push runs of ci.yml on release/v1.0.0, 2026-11-20). The job timeout must leave
+# the 20 % margin the check-leg cap rule asks for (ci.yml `timeout: 95` comment)
+# and stay below twice the sum, so a hang still ends near the honest worst case.
+MOVED_WORK_MEASURED_MAX_S = {
+    "android leg before the move (run 43809244411)": 177,
+    "Security audit, cold cargo-audit install (run 43715405044)": 459,
+    "release smoke, cold (run 43715405044)": 1319,
+}
+TIMEOUT_FLOOR_FACTOR = 1.2
+TIMEOUT_CEILING_FACTOR = 2.0
+SECS_PER_MINUTE = 60
+# (a) #9698: the only steps of the workflow that may carry continue-on-error.
+# The select job widens the run when the selector is unusable (ci.yml, the
+# comment above `select:`); nothing else may turn a failed step green.
+CONTINUE_ON_ERROR_BY_DESIGN = {
+    ("select", "Build impact index"): "true",
+    ("select", "Select jobs"): "true",
+}
+FAIL_OPEN_RUN_RE = re.compile(r"\|\|\s*(?:true|:)(?:\s|;|$)|\bset\s+\+e\b")
+# #9687: the classify unit-test steps run on every event, unconditionally.
+CLASSIFY_JOB = "classify"
+
+
+class MovedWorkBounds9680(unittest.TestCase):
+    """The moved steps and their job fail closed, are time-bounded and push-cached."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.wf = Workflow(CI_YML)
+
+    def test_mobile_cache_saves_only_on_push_under_the_rotated_key(self):
+        caches = [s for s in self.wf.steps[MOVED_JOB]
+                  if (s["uses"] or "").startswith(RUST_CACHE_USES_PREFIX)]
+        self.assertEqual(len(caches), 1, "%s: expected one rust-cache step" % MOVED_JOB)
+        cache = caches[0]
+        self.assertEqual(cache["if"], CARGO_SKIP_GUARD, "%s rust-cache guard" % MOVED_JOB)
+        self.assertEqual(cache["with"], EXPECTED_MOBILE_CACHE_WITH,
+                         "%s rust-cache must use the rotated key and save only on push "
+                         "(#9700)" % MOVED_JOB)
+
+    def test_job_timeout_bounds_the_moved_work(self):
+        raw = self.wf.meta[MOVED_JOB]["timeout-minutes"]
+        minutes = scalar_int(raw)
+        self.assertIsNotNone(minutes, "%s: no integer job timeout-minutes (got %r, #9699)"
+                             % (MOVED_JOB, raw))
+        work_s = sum(MOVED_WORK_MEASURED_MAX_S.values())
+        self.assertGreaterEqual(minutes * SECS_PER_MINUTE, work_s * TIMEOUT_FLOOR_FACTOR,
+                                "%s timeout %d min leaves under 20 %% over the %d s of "
+                                "measured work" % (MOVED_JOB, minutes, work_s))
+        self.assertLessEqual(minutes * SECS_PER_MINUTE, work_s * TIMEOUT_CEILING_FACTOR,
+                             "%s timeout %d min is over twice the %d s of measured work"
+                             % (MOVED_JOB, minutes, work_s))
+
+    def test_moved_job_steps_have_no_step_timeout(self):
+        timed = [(s["name"], s["timeout-minutes"]) for s in self.wf.steps[MOVED_JOB]
+                 if s["timeout-minutes"] is not None]
+        self.assertEqual(timed, [], "%s: the job timeout is the bound; a step timeout "
+                         "can cut the moved work short" % MOVED_JOB)
+
+    def test_no_continue_on_error_outside_the_select_job(self):
+        found = {(job, s["name"]): s["continue-on-error"]
+                 for job, steps in self.wf.steps.items() for s in steps
+                 if s["continue-on-error"] is not None}
+        self.assertEqual(found, CONTINUE_ON_ERROR_BY_DESIGN,
+                         "step-level continue-on-error outside the select job (#9698)")
+
+    def test_no_job_level_continue_on_error(self):
+        found = {job: meta["continue-on-error"] for job, meta in self.wf.meta.items()
+                 if meta["continue-on-error"] is not None}
+        self.assertEqual(found, {}, "job-level continue-on-error (#9698; %s, check and "
+                         "ci-gate above all)" % MOVED_JOB)
+
+    def test_moved_steps_cannot_swallow_a_failure(self):
+        for name in MOVED_STEPS:
+            step = self.wf.step(MOVED_JOB, name)
+            self.assertIsNotNone(step, name)
+            self.assertIsNone(FAIL_OPEN_RUN_RE.search(step["run"] or ""),
+                              "%s: run swallows a failure" % name)
+
+    def test_matrix_has_no_exclude(self):
+        for job in MATRIX_JOBS:
+            lines = self.wf.blocks[job]
+            strategy, matrix_keys = strategy_shape(lines)
+            self.assertEqual(strategy.get("fail-fast"), "false", "%s fail-fast" % job)
+            self.assertEqual(strategy.get("matrix"), "", "%s: flow-style matrix" % job)
+            self.assertEqual(matrix_keys, ["include"], "%s: matrix keys other than "
+                             "include (an exclude can drop the leg that holds the "
+                             "work, #9698)" % job)
+            excludes = [line for line in lines if EXCLUDE_RE.match(line)]
+            self.assertEqual(excludes, [], "%s: exclude key" % job)
+
+    def test_the_once_leg_is_present(self):
+        mobile = matrix_include(self.wf.blocks[MOVED_JOB])
+        once = [e.get("target") for e in mobile if e.get("once") == "true"]
+        self.assertEqual(once, [ONCE_HOLDER[1]], "%s: the android leg with once: true "
+                         "holds the moved work" % MOVED_JOB)
+
+    def test_classify_unit_test_steps_are_unconditional(self):
+        gated = {name: self.wf.step(CLASSIFY_JOB, name) for name, job in
+                 EXPECTED_GATE_STEPS.items() if job == CLASSIFY_JOB}
+        missing = sorted(name for name, step in gated.items() if step is None)
+        self.assertEqual(missing, [], "classify gate steps missing")
+        conditional = {name: step["if"] for name, step in gated.items() if step["if"]}
+        self.assertEqual(conditional, {}, "classify unit-test steps with a step-level if "
+                         "(#9687)")
+        self.assertIsNone(self.wf.meta[CLASSIFY_JOB]["if"], "classify job-level if (#9687)")
 
 
 # ---------------------------------------------------------------------------
