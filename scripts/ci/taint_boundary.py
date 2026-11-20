@@ -3783,7 +3783,7 @@ def _analyse_step(step: _Step, job: dict[str, object], doc: dict[str, object], j
         return facts
     run = body.get("run")
     if not isinstance(run, str):
-        raise Unclassifiable("run is not text")
+        raise Unclassifiable(PRE_SCAN_RUN_NOT_TEXT)
     paths, _ = _text_refs(run)
     declared = _env_names(doc.get("env"), job.get("env"), body.get("env"))
     for path in paths:
@@ -3802,6 +3802,8 @@ PRE_SCAN_FETCH_REASON = "step {step!r} fetches a pull-request tree"
 PRE_SCAN_UNREAD_REASON = "step {step!r} cannot be read by the pre-scan: {reason}"
 PRE_SCAN_RUNS_REASON = "step {step!r} runs code from the checked-out tree"
 PRE_SCAN_TREE_REASON = "step {step!r} changes the checked-out tree"
+PRE_SCAN_RUN_NOT_TEXT = "run is not text"
+PRE_SCAN_RUN_EMPTY = "run is empty text"
 
 
 def _pre_scan_fetch(steps: list[_Step], job: dict[str, object], doc: dict[str, object]) -> str | None:
@@ -3810,14 +3812,22 @@ def _pre_scan_fetch(steps: list[_Step], job: dict[str, object], doc: dict[str, o
     The reason is PRE_SCAN_FETCH_REASON for a run step that fetches a pull-request tree, the
     text of the first form or command the pre-scan cannot read, PRE_SCAN_RUNS_REASON for a step
     that runs code from the checked-out tree, or PRE_SCAN_TREE_REASON for a step that changes it.
-    None only when every run step is read in full and does none of these (fail closed), so the
-    full analysis reads every other job and reports what it finds.
+    A step with a run key whose value is not text, or is empty or blank text, is not read
+    (PRE_SCAN_RUN_NOT_TEXT, PRE_SCAN_RUN_EMPTY): the full analysis reports the first as
+    unclassifiable and reads the second. None only when every run step is read in full and does
+    none of these (fail closed), so the full analysis reads every other job and reports what it
+    finds. A step with no run key (a uses: step) is not read here.
     """
     env_job = (doc.get("env"), job.get("env"))
     for step in steps:
-        run = step.body.get("run")
-        if not isinstance(run, str):
+        if "run" not in step.body:
             continue
+        run = step.body["run"]
+        # 9566 F1: a present run key that is not non-empty text is never read as harmless.
+        if not isinstance(run, str):
+            return PRE_SCAN_UNREAD_REASON.format(step=step.label, reason=PRE_SCAN_RUN_NOT_TEXT)
+        if not run.strip():
+            return PRE_SCAN_UNREAD_REASON.format(step=step.label, reason=PRE_SCAN_RUN_EMPTY)
         ctx = _shell_ctx(_merged_env(*env_job, step.body.get("env")), set(), strict=False,
                          composite=step.body.get(COMPOSITE_MARK))
         try:
