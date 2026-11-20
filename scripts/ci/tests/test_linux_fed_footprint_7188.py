@@ -30,7 +30,7 @@ SHARED_FLAG = "shared_target"
 SHARED_HELPER = "scripts/ci/shared_cargo_target.py"
 PRUNE_HELPER = "scripts/ci/prune_runner_artifacts.py"
 CAP_KEY = "max-parallel"
-EXPECTED_CAP = 3
+EXPECTED_CAP = 4  # #9682: the cap equals the leg count
 SHARED_LEG = "linux-fed,enterprise-fed"
 
 
@@ -145,9 +145,15 @@ class PostJobPrune(unittest.TestCase):
 class ConcurrencyCap(unittest.TestCase):
     def test_cap_declared_on_check_strategy(self):
         job = active(check_job_lines())
-        caps = [ln for ln in job if re.match(r"^      %s:\s*\d+\s*$" % CAP_KEY, ln)]
-        self.assertEqual(len(caps), 1, "check strategy must declare %s" % CAP_KEY)
-        self.assertEqual(int(caps[0].split(":")[1]), EXPECTED_CAP)
+        # The cap is read by the strategy-anchored reader of the #9682 module, so a
+        # stray copy (for example in `env:`) next to a quoted real cap, or a cap
+        # outside `strategy:`, is red here too (#9685 r1).
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import test_ci_check_matrix_max_parallel_9682 as pin
+        cap = pin.read_cap("check", job)
+        self.assertEqual(cap, EXPECTED_CAP,
+                         "job check: %s differs from the pinned %d (or is missing)"
+                         % (CAP_KEY, EXPECTED_CAP))
 
 
 if __name__ == "__main__":
