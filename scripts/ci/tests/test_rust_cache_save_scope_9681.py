@@ -2005,6 +2005,31 @@ class UnpairedRustCacheSites9681(unittest.TestCase):
                 _runs_on(job(raw), leg)
             self.assertEqual(str(caught.exception), reason)
 
+    def test_readers_are_linear_on_large_values(self) -> None:
+        """A 200K-character env value or runs-on is read in well under a second, failing closed."""
+        size = 200_000
+        cases = (
+            ("${{ matrix.a || '" + "x" * size + "' }}", {}, "x" * size),
+            ("${{ matrix.a " + " " * size + "|| 'b' }}", {}, "b"),
+        )
+        for raw, leg, expected in cases:
+            started = time.monotonic()
+            self.assertEqual(_effective_env_value("K", raw, leg), expected)
+            self.assertLess(time.monotonic() - started, 1.0)
+        for raw in ("${{ matrix.a || '" + "x" * size, "${{ " + " " * size + "matrix.a |",
+                    "${{ matrix.a || '" + "'" * size + " }}"):
+            started = time.monotonic()
+            with self.assertRaises(AssertionError) as caught:
+                _effective_env_value("K", raw, {})
+            self.assertLess(time.monotonic() - started, 1.0)
+            self.assertTrue(str(caught.exception).startswith(
+                "K: unrecognised expression form in an env value: "))
+        started = time.monotonic()
+        with self.assertRaises(AssertionError) as caught:
+            _runs_on(Job("j", ["    runs-on: ${{ fromJSON(matrix." + "a" * size + " }}"]), {})
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertTrue(str(caught.exception).startswith("j: unrecognised runs-on form: "))
+
     def test_hosted_legs_read_runs_on_and_fail_closed(self) -> None:
         """Sibling (#9681 r2): the PAIRS leg filter reads `runs-on`, not one matrix field's text."""
         def job(runs_on: str, *legs: str) -> Job:
