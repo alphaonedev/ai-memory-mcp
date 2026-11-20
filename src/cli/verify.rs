@@ -237,24 +237,14 @@ const EDGE_ID_PREFIX_CHARS: usize = 8;
 /// Shown in place of a swept row id that does not decode itself.
 const UNREADABLE_ID_LABEL: &str = "<id unreadable>";
 
-/// Characters that reorder or hide text on a terminal: zero-width and
-/// direction marks, bidi embeddings and isolates, the line and paragraph
-/// separators, and the byte-order mark.
-const fn is_hidden(c: char) -> bool {
-    matches!(
-        c,
-        '\u{200b}'..='\u{200f}'
-            | '\u{2028}'
-            | '\u{2029}'
-            | '\u{202a}'..='\u{202e}'
-            | '\u{2066}'..='\u{2069}'
-            | '\u{feff}'
-    )
-}
-
-/// A character no stored value may put on a stream as itself.
+/// A character no stored value may put on a stream as itself: a control
+/// character, or one on the crate's one hidden-character list
+/// ([`crate::yaml_frontmatter::is_hidden_text_char`]: every Unicode format
+/// control plus the line and paragraph separators). The list is not
+/// repeated here; the `hidden_char_list_ratchet_9636` cell fails if a second
+/// copy appears under `src/`.
 fn needs_escape(c: char) -> bool {
-    c.is_control() || is_hidden(c)
+    c.is_control() || crate::yaml_frontmatter::is_hidden_text_char(c)
 }
 
 /// #9636 — a stored value as it may appear on a text line: every control or
@@ -1036,7 +1026,8 @@ pub(super) fn render_text(report: &ChainReport, out: &mut CliOutput<'_>) -> Resu
                 Printed::field(&e.attest_level),
             )?;
             if let Some(ref reason) = e.failure_reason {
-                write!(out.stdout, "  reason=\"{}\"", Printed::field(reason))?;
+                let reason = Printed::field(reason);
+                write!(out.stdout, "  reason=\"{reason}\"")?;
             }
             writeln!(out.stdout)?;
         }
