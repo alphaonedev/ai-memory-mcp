@@ -581,7 +581,8 @@ class MintAndDrop(unittest.TestCase):
         self.assertEqual(pib.database_name(url), name)
         self.assertEqual(pib.parse_isolated_name(name, RUN), 1700000000)
         self.assertIn('sslmode=verify-full', url)
-        self.assertEqual(rec.sql(), ['CREATE DATABASE "%s" TEMPLATE "%s"' % (name, TPL)])
+        self.assertEqual(rec.sql(), ['CREATE DATABASE "%s" TEMPLATE "%s" CONNECTION LIMIT %d'
+                                     % (name, TPL, CLONE_LIMIT_9752)])
 
     def test_mint_retries_on_template_in_use_then_succeeds(self):
         state = {'n': 0}
@@ -1295,7 +1296,7 @@ class TemplateOwnership(unittest.TestCase):
     REAL_CALLER_SHAPES = [
         ("SELECT current_setting('max_connections')::int, current_setting('superuser_reserved_connections')::int, "
          "coalesce(current_setting('reserved_connections', true)::int, 0), (SELECT count(*) FROM pg_stat_activity)"),
-        'CREATE DATABASE "ai_memory_t_r1_2" TEMPLATE "ai_memory_x_tpl"',
+        'CREATE DATABASE "ai_memory_t_r1_2" TEMPLATE "ai_memory_x_tpl" CONNECTION LIMIT 19',
         'DROP DATABASE IF EXISTS "ai_memory_t_r1_2"',
         "SELECT count(*) FROM pg_stat_activity WHERE datname = 'ai_memory_t_r1_2'",
         "SELECT 1 FROM pg_database WHERE datname = 'ai_memory_x_tpl'",
@@ -2847,6 +2848,120 @@ class SessionBound9592(unittest.TestCase):
         rc, err, _calls, state = self.run_with_sessions(self.BOUND + 1, polls_before_exit=0, isolate=False)
         self.assertEqual(rc, 0, err)
         self.assertEqual(state['waits'], 0)
+
+
+# #9752: hand-written figures. Three unreadable polls in a row (15 s at SESSION_POLL_SECS) fail the binary; the
+# clone is created with the per-binary connection figure as its CONNECTION LIMIT.
+UNREADABLE_MAX_9752 = 3
+CLONE_LIMIT_9752 = 19
+UNREADABLE_FORMS_9752 = (
+    ('statement refused', Result(1, '', 'ERROR:  canceling statement due to statement timeout')),
+    ('connection lost', Result(2, '', 'psql: error: connection to server was lost')),
+    ('not a number', Result(0, 'x\n')),
+    ('empty answer', Result(0, '')),
+    ('negative', Result(0, '-1\n')),
+)
+GOOD_COUNT_9752 = Result(0, '1\n')
+
+
+class SessionPollFailsClosed9752(unittest.TestCase):
+    """#9752: a session count that cannot be read is never a pass; a run of them fails the binary closed."""
+
+    def run_with_counts(self, counts, polls_before_exit):
+        """``counts`` answers the binary's polls in order (the last one repeats); the hold check reads 1."""
+        d = scratch_dir()
+        r = runner(log_dir=d)
+        state = {'waits': 0, 'counts': 0}
+
+        class SlowCargo(FakePopen):
+            def wait(self, timeout=None):
+                if self.is_hold or timeout is None or self.returncode is not None:
+                    return super().wait(timeout)
+                state['waits'] += 1
+                if state['waits'] <= polls_before_exit:
+                    raise subprocess.TimeoutExpired(self.argv, timeout)
+                return super().wait(timeout)
+
+        def answer(argv, kw):
+            sql = argv[-1] if '-c' in argv else ''
+            if 'count(*)' in sql and 'pg_stat_activity' in sql and 'datname =' in sql:
+                state['counts'] += 1
+                if state['counts'] == 1:
+                    return GOOD_COUNT_9752  # wait_for_hold: the keepalive session is there
+                return counts[min(state['counts'] - 2, len(counts) - 1)]
+            return default_answer(argv, kw)
+        rec, stack = patched(Recorder(answer))
+        stack[1] = unittest.mock.patch.object(pib.subprocess, 'Popen', SlowCargo)
+        out = io.StringIO()
+        with contextlib.ExitStack() as es:
+            for cm in stack:
+                es.enter_context(cm)
+            killpg = pib.os.killpg
+            es.enter_context(contextlib.redirect_stderr(out))
+            es.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            rc = r.run_one(['--test', 'poll_9752'])
+            calls = list(killpg.call_args_list)
+        return rc, out.getvalue(), calls, state
+
+    def test_the_limit_is_a_named_constant(self):
+        self.assertEqual(pib.SESSION_UNREADABLE_MAX, UNREADABLE_MAX_9752)
+
+    def test_a_run_of_unreadable_polls_fails_closed_with_the_count(self):
+        want = ('FAIL poll_9752: session count unreadable on %d consecutive polls (limit %d)'
+                % (UNREADABLE_MAX_9752, UNREADABLE_MAX_9752))
+        for label, bad in UNREADABLE_FORMS_9752:
+            with self.subTest(label):
+                rc, err, calls, state = self.run_with_counts([bad], polls_before_exit=UNREADABLE_MAX_9752 + 5)
+                self.assertEqual(rc, pib.EXIT_SESSIONS, err)
+                self.assertIn(want, err)
+                self.assertIn(unittest.mock.call(unittest.mock.ANY, pib.signal.SIGKILL), calls)
+                self.assertEqual(state['waits'], UNREADABLE_MAX_9752 + 1, 'killed at the limit, not later')
+
+    def test_fewer_unreadable_polls_than_the_limit_pass(self):
+        for label, bad in UNREADABLE_FORMS_9752:
+            with self.subTest(label):
+                rc, err, calls, _ = self.run_with_counts([bad], polls_before_exit=UNREADABLE_MAX_9752 - 1)
+                self.assertEqual(rc, 0, err)
+                self.assertNotIn('unreadable', err)
+                self.assertEqual(calls, [])
+
+    def test_a_readable_poll_resets_the_run(self):
+        _label, bad = UNREADABLE_FORMS_9752[0]
+        counts = [bad] * (UNREADABLE_MAX_9752 - 1) + [GOOD_COUNT_9752] + [bad] * (UNREADABLE_MAX_9752 - 1)
+        rc, err, calls, _ = self.run_with_counts(counts + [GOOD_COUNT_9752], polls_before_exit=len(counts))
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(calls, [])
+
+    def test_an_unreadable_count_is_an_error_never_zero(self):
+        for label, bad in UNREADABLE_FORMS_9752[2:]:
+            with self.subTest(label):
+                with unittest.mock.patch.object(pib.subprocess, 'run', Recorder(lambda a, k, bad=bad: bad)):
+                    with self.assertRaises(pib.WrapperError) as cm:
+                        pib.session_count(BASE, 'ai_memory_t_r1_2')
+                self.assertEqual(str(cm.exception), 'could not read the sessions of ai_memory_t_r1_2 (got %r)'
+                                 % bad.stdout.strip())
+
+
+class CloneConnectionLimit9752(unittest.TestCase):
+    """#9752: the server caps a clone's sessions too (CONNECTION LIMIT), not only the wrapper's poll."""
+
+    def test_the_limit_is_the_per_binary_figure(self):
+        self.assertEqual(pib.CLONE_CONNECTION_LIMIT, CLONE_LIMIT_9752)
+        self.assertEqual(pib.CLONE_CONNECTION_LIMIT, pib.PER_BINARY_CONNECTIONS + pib.HOLD_CONNECTIONS)
+
+    def test_mint_creates_the_clone_with_the_connection_limit(self):
+        rec = Recorder()
+        with unittest.mock.patch.object(pib.subprocess, 'run', rec):
+            _url, name = pib.mint(BASE, TPL, RUN, now=1700000000)
+        self.assertEqual(rec.sql(), ['CREATE DATABASE "%s" TEMPLATE "%s" CONNECTION LIMIT %d'
+                                     % (name, TPL, CLONE_LIMIT_9752)])
+
+    def test_the_psql_guard_admits_the_limited_create(self):
+        sql = 'CREATE DATABASE "ai_memory_t_r1_2" TEMPLATE "ai_memory_x_tpl" CONNECTION LIMIT %d' % CLONE_LIMIT_9752
+        rec = Recorder(lambda argv, kw: Result(0, 'ok', ''))
+        with unittest.mock.patch.object(pib.subprocess, 'run', rec):
+            pib.psql(BASE, sql, tuples=True)
+        self.assertEqual(rec.sql()[-1:], [sql])
 
 
 if __name__ == '__main__':
