@@ -1399,10 +1399,8 @@ def _matrix_include(job: Job) -> list[dict[str, object]]:
 def _hosted_legs(job: Job) -> list[dict[str, object]]:
     """The legs of a job that run on a GitHub-hosted runner, read from `runs-on` (#9681 r2: a
     runs-on form `_runs_on` does not read fails instead of counting as hosted)."""
-    legs = _matrix_include(job)
-    if not legs:
-        return [{}]
-    return [leg for leg in legs if "self-hosted" not in str(leg.get("runner", ""))]
+    legs = _matrix_include(job) or [{}]
+    return [leg for leg in legs if SELF_HOSTED not in _runs_on(job, leg)]
 
 
 def _pr_leg_commands(name: str, job_id: str) -> tuple[list[str], list[str]]:
