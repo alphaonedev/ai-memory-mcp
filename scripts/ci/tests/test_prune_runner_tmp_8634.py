@@ -2373,6 +2373,66 @@ class RoundOneFixes(Base):
         self.assertEqual(self.names(), ["at-cutoff.db"])
 
 
+SUN_PATH_OVERFLOW_BYTES = 200  # above both AF_UNIX limits (104 macOS, 108 Linux), so no TMPDIR length matters
+BYTE_FF_REFUSED_NAME = "EILSEQ"
+UNRELATED_PROBE_ERRNOS = (errno.ENOSPC, errno.EDQUOT, errno.EIO, errno.EROFS, errno.EACCES)
+
+
+class HostProbes(unittest.TestCase):
+    """Fix round 1 of #9674: a host probe skips only on the one errno that names the missing facility."""
+
+    @staticmethod
+    def failing_create(code):
+        def create(path, flags, mode=0o777):
+            raise OSError(code, os.strerror(code))
+        return create
+
+    def test_byte_ff_probe_skips_only_on_eilseq(self):
+        got = probe_byte_ff_refusal(self.failing_create(errno.EILSEQ))
+        self.assertEqual(got, BYTE_FF_REFUSED_NAME)
+        self.assertEqual(
+            byte_ff_reason(got),
+            f"this file system refuses a file name holding byte 0xff (EILSEQ, platform {sys.platform})",
+        )
+
+    def test_byte_ff_probe_propagates_every_other_errno(self):
+        for code in UNRELATED_PROBE_ERRNOS:
+            with self.subTest(errno=errno.errorcode[code]):
+                with self.assertRaises(OSError) as caught:
+                    probe_byte_ff_refusal(self.failing_create(code))
+                self.assertEqual(caught.exception.errno, code)
+
+    def test_byte_ff_probe_propagates_a_non_oserror(self):
+        def create(path, flags, mode=0o777):
+            raise RuntimeError("boom")
+        with self.assertRaises(RuntimeError):
+            probe_byte_ff_refusal(create)
+
+    def test_byte_ff_probe_accepting_host_returns_none(self):
+        self.assertIsNone(probe_byte_ff_refusal(os.open))
+
+    def test_hostile_names_drop_only_the_0xff_row_on_a_refusing_host(self):
+        kept, dropped = split_hostile_names(HOSTILE_NAMES, BYTE_FF_REFUSED_NAME)
+        self.assertEqual(dropped, ["bad\udcff\nname"])
+        self.assertEqual(kept, [name for name in HOSTILE_NAMES if "\udcff" not in name])
+        self.assertEqual(len(kept), len(HOSTILE_NAMES) - 1)
+
+    def test_hostile_names_keep_every_row_on_an_accepting_host(self):
+        kept, dropped = split_hostile_names(HOSTILE_NAMES, None)
+        self.assertEqual((kept, dropped), (list(HOSTILE_NAMES), []))
+
+
+class SocketPathLength(Base):
+    """Fix round 1 of #9674: a socket fixture never depends on the length of TMPDIR (sun_path 104 macOS, 108 Linux)."""
+
+    def test_socket_kind_is_made_in_a_directory_deeper_than_sun_path(self):
+        deep = self.base.joinpath("d" * 60, "e" * 60, "f" * 60)
+        deep.mkdir(parents=True)
+        self.assertGreater(len(str(deep)), SUN_PATH_OVERFLOW_BYTES - 20)
+        made = EntryKinds.make_kinds(self, deep)
+        self.assertTrue(stat.S_ISSOCK(os.lstat(made["socket"]).st_mode))
+
+
 class RootsAndFloor(unittest.TestCase):
     """The roots are named constants with evidence, the floor check runs before newer code, docs match the code."""
 
