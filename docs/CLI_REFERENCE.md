@@ -2028,6 +2028,21 @@ ai-memory inbox row stays the durable record and the `<=60 s` backstop poll
 stays the guarantee — losing the hub degrades wake **latency** and nothing else.
 It opens no database, on either backend.
 
+**Every mode is read-only for the signed ledger**
+([#9562](https://github.com/alphaonedev/ai-memory-mcp/issues/9562)). Serve,
+`--posture` (with `--json` and `--require-admits`) and `--health` (with
+`--json`) write no `signed_events` row, so none of them is a #3354 ledger
+writer, and the boot skips the signing-key setup for them: no key is loaded,
+ensured or generated and no key file is created, even when the home and key
+directory are writable. The forensic sink starts without a key and creates only
+its directory, never a forensic file. Each mode starts for a hub user whose home
+and key directory cannot be written, with its exit code unchanged (`--posture`
+0, `--require-admits` 3 only when the hub admits nobody, `--health` 0 / 2, serve
+0 after a drain). A forensic sink that cannot start prints the one
+`Continuing WITHOUT the forensic audit sink` warning and records no outage row.
+The classification is one exhaustive match, `WakeHubMode::writes_ledger` in
+`src/cli/wake_hub.rs`, shared with the dispatch.
+
 **Identity** ([#3468](https://github.com/alphaonedev/ai-memory-mcp/issues/3468)).
 A hello is admitted only when it presents a scoped `a2a-hub/join/v1`
 delegation — a short-lived certificate minted by the agent's ENROLLED key
