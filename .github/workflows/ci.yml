@@ -1220,6 +1220,9 @@ jobs:
             # f32c18dad) took release smoke to 1225 s when the maximum
             # recorded below was 787 s, and passed with 4 min 4 s of margin —
             # inside the "re-derive when within 20 %" rule this comment set.
+            # (History: `Security audit` and `Build release` ran on this leg
+            # then; since #9680 they run on the android entry of
+            # mobile-cross-compile, see the note above `timeout: 95`.)
             #
             # Measured today (UTC 18:17–19:32, the cancelled run): free-disk
             # 160 s + impact-aware tests 2708 s (a full-impact diff — the
@@ -1249,10 +1252,12 @@ jobs:
             # completed run of 3271 s and a step-max sum of 3865 s
             # (free-disk 187 + tests 2441 + cold cargo-audit 413 + release
             # smoke 787 + setup ~37); both maxima have since moved (tests
-            # 2708, release smoke 1225). #9680 moved cargo-audit and the
-            # release smoke off this leg (to the `once` entry of the
-            # mobile-cross-compile matrix); the cap stays until the
-            # post-move maxima are measured.
+            # 2708, release smoke 1225). The measurements above were taken
+            # while this leg still ran cargo-audit and the release smoke.
+            # #9680 moved both to the android (`once`) entry of
+            # mobile-cross-compile, bounded there by that job's own
+            # timeout-minutes (#9699); this leg now runs neither, and its cap
+            # stays at 95 until the post-move maxima of this leg are measured.
             timeout: 95
           - leg: linux-fed,enterprise-fed
             runner: '["self-hosted","linux-fed"]'
@@ -2846,6 +2851,14 @@ jobs:
     name: Cross-compile (${{ matrix.target }})
     needs: classify
     runs-on: ${{ matrix.os }}
+    # #9699 - the outer cap on honest work, re-derived for the work this job
+    # holds since #9680 (measured maxima, push runs on release/v1.0.0): android
+    # leg 177 s (run 43809244411) + cold cargo-audit install 459 s + cold
+    # release smoke 1319 s (run 43715405044, both on the check leg before the
+    # move) = 1955 s = 32.6 min; 45 min is 1.38x that sum (the iOS leg's
+    # longest is 276 s). Re-derive when a measured run comes within 20 % of it.
+    # scripts/ci/tests/test_ci_release_split_9680.py bounds it on both sides.
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -2885,7 +2898,13 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         if: needs.classify.outputs.cargo_skip != 'true'
         with:
-          key: mobile-${{ matrix.target }}
+          # #9700 - the key was rotated once when this entry began to hold
+          # cargo-audit and target/release (#9680): the old exact-match entry
+          # held neither and, on a full match, rust-cache never re-saves. Saved
+          # only on trunk `push` (#3089, the form of the check job's cache), so
+          # a pull_request run restores and never writes a PR-scoped entry.
+          key: mobile-${{ matrix.target }}-audit-release
+          save-if: ${{ github.event_name == 'push' }}
 
       # Android NDK r26d — provides the clang toolchain we point at via
       # CC_aarch64_linux_android / AR_aarch64_linux_android below so the

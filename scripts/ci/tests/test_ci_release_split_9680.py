@@ -12,7 +12,7 @@ The invariant holds for EVERY job of `.github/workflows/ci.yml`:
   4. a consumer of a downloaded artifact verifies the commit sha and fails closed;
      the ci-gate aggregator treats a skipped, failed or cancelled need as red.
 cargo-audit comes only from `cargo install --locked` at the #3138 pin (the base
-fd43a727 form), once, in the job that runs it; no step downloads, extracts or
+bbede4b2 form), once, in the job that runs it; no step downloads, extracts or
 checksums a prebuilt cargo-audit (ruling 7fd3cd38).
 
 Every expected set is written by hand (rule d54c4b0e); nothing is derived from
@@ -620,7 +620,7 @@ class MovedWorkBounds9680(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # cargo-audit source invariant (#9680 r0 send-back, ruling 7fd3cd38): in every
 # job of the workflow cargo-audit comes only from `cargo install --locked` at
-# the one named pin (the base fd43a727 form, #3138), and no step downloads,
+# the one named pin (the base bbede4b2 form, #3138), and no step downloads,
 # extracts or checksums a prebuilt cargo-audit. The scanner reads the whole
 # workflow on its own (it does not reuse workflow_text.read_steps): every job,
 # every `run:` value at any indent (literal, folded and plain multi-line
