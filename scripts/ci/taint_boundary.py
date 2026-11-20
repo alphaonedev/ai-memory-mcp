@@ -32,7 +32,9 @@ The pins are the baseline of the tree PR 9508 lands on (the merge of chain tip 9
 unclassifiable pin 41 -> 47 once; the pre-scan of #9566 moved it 47 -> 33 and the violation pin
 17 -> 33 once); after it lands they only go down. Stage 1 of #9455 moved
 session-boot-lifetime.yml lifetime-tests to hosted runners and lowered the violation pin by one
-(17 -> 16 on the chain, 33 -> 32 after the pre-scan of #9566). The fixpoint proof
+(17 -> 16 on the chain, 33 -> 32 after the pre-scan of #9566). 9566 item 3, the full analysis of
+every job, moved the violation pin 32 -> 34 once for the two docker rows of #9570 (pins now:
+unclassifiable 33, not-analysed 3, violation 34). The fixpoint proof
 (all rows applied: zero findings; any one row removed: exactly that form or line) is a proof for
 what the scan reaches only. A test makes no network call: the
 conductor checks that every cited issue is open at each landing of a fix of these issues, and
@@ -245,8 +247,12 @@ TAINT_ALLOW: tuple[AllowRow, ...] = (
     AllowRow(_RELEASE, 'release', 'Create GitHub Release', (CLASS_SECRET,), 9570),
     AllowRow(_RELEASE, 'sbom', 'Attest build provenance (CycloneDX SBOM)', (CLASS_SECRET, CLASS_WRITE_TOKEN), 9570),
     AllowRow(_RELEASE, 'sbom', 'Upload to GitHub Release', (CLASS_SECRET,), 9570),
+    # 9566 item 3: the docker job, reached once the full analysis reads every job (the pre-scan
+    # skipped its uses: steps); it checks out the preflight sha like the jobs above.
+    AllowRow(_RELEASE, 'docker', 'Attest build provenance (Docker image)', (CLASS_SECRET, CLASS_WRITE_TOKEN), 9570),
+    AllowRow(_RELEASE, 'docker', 'Log in to GitHub Container Registry', (CLASS_SECRET,), 9570),
 )
-TAINT_ALLOW_PIN = 32
+TAINT_ALLOW_PIN = 34
 # The open fix issues a violation row may name (the fixed set of that kind); a row naming any
 # other value is a finding.
 FIX_ISSUES = frozenset({9454, 9455, 9456, 9471, 9553, 9570})
@@ -276,11 +282,18 @@ OPEN_ROW_ISSUES = (frozenset({9533}) | frozenset(range(9535, 9540)) | frozenset(
 NOT_ANALYSED_ROW_ISSUES = frozenset({9550, 9551, 9552})
 NOT_ANALYSED_MARKER = "rest-not-analysed"
 # Each pin only goes down; a pin above its ceiling is a failure.
+# Current values: unclassifiable 33 (33 rows), violation 34 (34 allow rows), not-analysed 3 (3 rows).
+# Violation history: 17 -> 33 -> 32 (after the merge of fd43a727) -> 34 (9566 item 3).
 # decision: raise the violation ceiling once, 17 -> 33 (58dd50570), over keeping 17, because the
 # pre-scan of #9566 sends release.yml jobs to the full analysis, which reports 16 rows of classes i
-# and ii that #9570 fixes; each row names 9570 and leaves with it. Stage 1 of #9455 removed the
-# lifetime-tests row (33 -> 32 at the merge of chain tip fd43a727).
-PIN_CEILINGS = {KIND_UNCLASSIFIABLE: 33, KIND_VIOLATION: 32, KIND_NOT_ANALYSED: 3}
+# and ii that #9570 fixes; each row names 9570 and leaves with it.
+# decision: violation pin and ceiling 32 over 33 at the merge of chain tip fd43a727, because stage 1
+# of #9455 removed the lifetime-tests row and the pin equals the allow-table row count and only
+# ever follows it down; the unclassifiable pin stays 33.
+# decision: violation pin and ceiling 32 -> 34 once over leaving the docker results unrowed, because
+# the full analysis of every job (9566 item 3) reaches release.yml/docker, whose two results are
+# the #9570 class, and the pin is the allow-table row count after that merge (34).
+PIN_CEILINGS = {KIND_UNCLASSIFIABLE: 33, KIND_VIOLATION: 34, KIND_NOT_ANALYSED: 3}
 # Characters no workflow, job, step or operand of a row may hold: a row names one place.
 ROW_GLOB_CHARS = frozenset("*?[]{}")
 # A braced parameter reference of one plain name, the only brace an operand may hold: the shell
@@ -3809,32 +3822,111 @@ PRE_SCAN_FETCH_REASON = "step {step!r} fetches a pull-request tree"
 PRE_SCAN_UNREAD_REASON = "step {step!r} cannot be read by the pre-scan: {reason}"
 PRE_SCAN_RUNS_REASON = "step {step!r} runs code from the checked-out tree"
 PRE_SCAN_TREE_REASON = "step {step!r} changes the checked-out tree"
+# 9566 item 3: every step form the pre-scan does not model has its own reason; none is skipped.
+PRE_SCAN_USES_REASON = "step {step!r} uses an action, which the pre-scan does not read"
+PRE_SCAN_COMPOSITE_REASON = "step {step!r} runs inside a composite action, which the pre-scan does not read"
+PRE_SCAN_SHELL_REASON = "{holder} sets a shell, which the pre-scan does not read"
+PRE_SCAN_FORM_REASON = "{holder} has a form the pre-scan does not read: {form}"
+PRE_SCAN_WINDOWS_REASON = "the job may run on a Windows leg, whose default shell the pre-scan does not read"
+# The step keys the pre-scan reads (run) or that change no command it judges; any other key
+# (with, shell, working-directory, a key GitHub adds later) sends the job to the full analysis.
+PRE_SCAN_STEP_KEYS = frozenset({"name", "id", "if", "env", "run", "timeout-minutes", "continue-on-error"})
+PRE_SCAN_NOT_MAP = "it is not a mapping"
+PRE_SCAN_NOT_LIST = "it is not a list"
+PRE_SCAN_KEY_FORM = "key {key!r} is not on the pre-scan list"
+PRE_SCAN_NO_RUN = "it has no run key"
 PRE_SCAN_RUN_NOT_TEXT = "run is not text"
 PRE_SCAN_RUN_EMPTY = "run is empty text"
+PRE_SCAN_ITEM_FORM = "an item is not a step"
+PRE_SCAN_STEP_HOLDER = "step {step!r}"
+PRE_SCAN_STEPS_HOLDER = "the job steps"
+PRE_SCAN_DEFAULTS_HOLDER = "the {owner} defaults"
+PRE_SCAN_DEFAULTS_RUN_HOLDER = "the {owner} defaults.run"
+
+
+def _pre_scan_defaults(owner: str, holder: dict[str, object]) -> str | None:
+    """The reason the defaults of a job or workflow send the job to the full analysis, or None."""
+    if "defaults" not in holder:
+        return None
+    defaults = holder["defaults"]
+    where = PRE_SCAN_DEFAULTS_HOLDER.format(owner=owner)
+    if not isinstance(defaults, dict):
+        return PRE_SCAN_FORM_REASON.format(holder=where, form=PRE_SCAN_NOT_MAP)
+    for key in defaults:
+        if key != "run":
+            return PRE_SCAN_FORM_REASON.format(holder=where, form=PRE_SCAN_KEY_FORM.format(key=key))
+    if "run" not in defaults:
+        return None
+    return _pre_scan_defaults_run(PRE_SCAN_DEFAULTS_RUN_HOLDER.format(owner=owner), defaults["run"])
+
+
+def _pre_scan_defaults_run(where: str, run: object) -> str | None:
+    if not isinstance(run, dict):
+        return PRE_SCAN_FORM_REASON.format(holder=where, form=PRE_SCAN_NOT_MAP)
+    if "shell" in run:
+        return PRE_SCAN_SHELL_REASON.format(holder=where)
+    if run:
+        return PRE_SCAN_FORM_REASON.format(holder=where, form=PRE_SCAN_KEY_FORM.format(key=next(iter(run))))
+    return None
+
+
+def _pre_scan_step(step: object) -> str | None:
+    """The reason one step is a form the pre-scan does not read, or None for a plain run step."""
+    if not isinstance(step, _Step):
+        return PRE_SCAN_FORM_REASON.format(holder=PRE_SCAN_STEPS_HOLDER, form=PRE_SCAN_ITEM_FORM)
+    where = PRE_SCAN_STEP_HOLDER.format(step=step.label)
+    body = step.body
+    if not isinstance(body, dict):
+        return PRE_SCAN_FORM_REASON.format(holder=where, form=PRE_SCAN_NOT_MAP)
+    if "uses" in body:
+        return PRE_SCAN_USES_REASON.format(step=step.label)
+    if COMPOSITE_MARK in body:
+        return PRE_SCAN_COMPOSITE_REASON.format(step=step.label)
+    if "shell" in body:
+        return PRE_SCAN_SHELL_REASON.format(holder=where)
+    for key in body:
+        if key not in PRE_SCAN_STEP_KEYS:
+            return PRE_SCAN_FORM_REASON.format(holder=where, form=PRE_SCAN_KEY_FORM.format(key=key))
+    if "run" not in body:
+        return PRE_SCAN_FORM_REASON.format(holder=where, form=PRE_SCAN_NO_RUN)
+    run_text = body["run"]
+    # 9566 F1: a present run key that is not non-empty text is never read as harmless.
+    if not isinstance(run_text, str):
+        return PRE_SCAN_UNREAD_REASON.format(step=step.label, reason=PRE_SCAN_RUN_NOT_TEXT)
+    if not run_text.strip():
+        return PRE_SCAN_UNREAD_REASON.format(step=step.label, reason=PRE_SCAN_RUN_EMPTY)
+    return None
 
 
 def _pre_scan_fetch(steps: list[_Step], job: dict[str, object], doc: dict[str, object]) -> str | None:
-    """A job with no pull-request trigger: the reason it must be analysed in full, or None.
+    """A job with no pull-request trigger: the reason it is not trusted-only, or None.
 
-    The reason is PRE_SCAN_FETCH_REASON for a run step that fetches a pull-request tree, the
-    text of the first form or command the pre-scan cannot read, PRE_SCAN_RUNS_REASON for a step
-    that runs code from the checked-out tree, or PRE_SCAN_TREE_REASON for a step that changes it.
-    A step with a run key whose value is not text, or is empty or blank text, is not read
-    (PRE_SCAN_RUN_NOT_TEXT, PRE_SCAN_RUN_EMPTY): the full analysis reports the first as
-    unclassifiable and reads the second. None only when every run step is read in full and does
-    none of these (fail closed), so the full analysis reads every other job and reports what it
-    finds. A step with no run key (a uses: step) is not read here.
+    The pre-scan only picks the label of a job: the full analysis reads every job whatever this
+    returns (9566 item 3), so a form it misses can cost a label, never a result. The reason is
+    the first of: a steps container, a defaults form, a Windows leg or a step form the pre-scan
+    does not read (a uses: step, a composite step, a shell: key, a key off PRE_SCAN_STEP_KEYS or
+    a step with no run); a run key whose value is not text or is empty or blank text
+    (PRE_SCAN_RUN_NOT_TEXT, PRE_SCAN_RUN_EMPTY; the full analysis reports the first as
+    unclassifiable and reads the second); PRE_SCAN_FETCH_REASON for a run step that fetches a
+    pull-request tree; the text of the first command the pre-scan cannot read;
+    PRE_SCAN_RUNS_REASON for a step that runs code from the checked-out tree; or
+    PRE_SCAN_TREE_REASON for a step that changes it. None only when every step is a plain run
+    step of non-blank text read in full that does none of these (fail closed).
     """
+    if not isinstance(steps, list):  # the pre-scan steps container
+        return PRE_SCAN_FORM_REASON.format(holder=PRE_SCAN_STEPS_HOLDER, form=PRE_SCAN_NOT_LIST)
+    for owner, holder in (("workflow", doc), ("job", job)):
+        reason = _pre_scan_defaults(owner, holder)
+        if reason is not None:
+            return reason
+    if WINDOWS_LABEL_WORD in _dump([job.get("runs-on"), job.get("strategy")]).lower():
+        return PRE_SCAN_WINDOWS_REASON
     env_job = (doc.get("env"), job.get("env"))
     for step in steps:
-        if "run" not in step.body:
-            continue
+        reason = _pre_scan_step(step)
+        if reason is not None:
+            return reason
         run = step.body["run"]
-        # 9566 F1: a present run key that is not non-empty text is never read as harmless.
-        if not isinstance(run, str):
-            return PRE_SCAN_UNREAD_REASON.format(step=step.label, reason=PRE_SCAN_RUN_NOT_TEXT)
-        if not run.strip():
-            return PRE_SCAN_UNREAD_REASON.format(step=step.label, reason=PRE_SCAN_RUN_EMPTY)
         ctx = _shell_ctx(_merged_env(*env_job, step.body.get("env")), set(), strict=False,
                          composite=step.body.get(COMPOSITE_MARK))
         try:
@@ -3896,11 +3988,9 @@ def _analyse_job_steps(wf: str, job_id: str, job: dict[str, object], doc: dict[s
     steps = _flatten_steps(job.get("steps"), actions, label)
     _check_labels(steps, label)
     strict = bool(job_events & (PR_EVENTS | {CALL_EVENT}))
-    if not strict and _pre_scan_fetch(steps, job, doc) is None:
-        if r2 is None:
-            return "trusted-only"
-        result.violations.append(r2)
-        return CLASS_PERSISTENT_STATE
+    # 9566 item 3: the full analysis reads every job; the pre-scan only picks the label, so the
+    # gate result of a job is the full-analysis result whatever form the pre-scan misses.
+    pre_scan = None if strict else _pre_scan_fetch(steps, job, doc)
     perms = _permissions(job, doc, label)
     windows = _windows_job(legs)
     pr_tree = False
@@ -3933,7 +4023,7 @@ def _analyse_job_steps(wf: str, job_id: str, job: dict[str, object], doc: dict[s
             pr_tree = True
     if taint is None:
         if r2 is None:
-            return "no-pr-code"
+            return "trusted-only" if not strict and pre_scan is None else "no-pr-code"
         result.violations.append(r2)
         return CLASS_PERSISTENT_STATE
     result.taint_steps[(wf, job_id)] = taint.label
