@@ -128,6 +128,9 @@ class ActionFacts:
 KNOWN_ACTIONS: dict[str, ActionFacts] = {
     "actions/attest-build-provenance": ActionFacts(default_token=True),
     "actions/cache": ActionFacts(),
+    # The split halves of actions/cache (#9681): same code, same facts as the combined action.
+    "actions/cache/restore": ActionFacts(),
+    "actions/cache/save": ActionFacts(),
     "actions/checkout": ActionFacts(),
     "actions/setup-node": ActionFacts(),
     "actions/setup-python": ActionFacts(),

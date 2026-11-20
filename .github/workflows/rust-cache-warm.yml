@@ -1,0 +1,361 @@
+# #9681 — warm the hosted Rust dependency caches of the chain branches.
+#
+# A PR run restores a cache from its merge ref, then its base ref, then the
+# default branch, and saves only to its own merge ref. A PR into chain/** therefore
+# restores from chain/<name>, but no workflow ever SAVED there: ci.yml and coverage.yml
+# push only on main/develop/release/**. Adding chain/** to their push triggers would run
+# the fed self-hosted legs and the Postgres coverage suite a second time on every chain
+# push, so this workflow is separate, hosted only, and runs no tests: it builds exactly
+# the dependency set the two hosted PR jobs build and lets rust-cache save it under the
+# same shared-key and the same key env.
+#
+#   ci.yml `check` (ubuntu-latest,sqlite leg)  <- job check-hosted-sqlite (shared-key ci-check-hosted-sqlite)
+#   coverage.yml `per-module-thresholds`       <- job coverage            (shared-key coverage-per-module)
+#
+# On a full key match rust-cache restores, every build step is skipped and nothing is
+# saved. The #9681 save-scope invariant test pins the pairing: the same
+# shared-key, the same key env, byte-equal toolchain and env steps, the same compile
+# commands, save-if push only, and no PR trigger. No job here is a required
+# context; a red run here costs cache warmth, never correctness.
+
+name: Rust cache warm (chain)
+
+on:
+  push:
+    branches: ["chain/**"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-cache-warm-${{ github.ref_name }}
+  # A newer push waits instead of cancelling, so a long build still saves its cache.
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check-hosted-sqlite:
+    name: Rust cache warm (Check ubuntu-latest,sqlite deps)
+    runs-on: ubuntu-latest
+    timeout-minutes: 95
+    env:
+      # The key env of ci.yml `check`: the workflow's CARGO_INCREMENTAL plus the job's
+      # profile overrides (the hosted leg exports nothing with a key prefix before its cache).
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Free disk before tests (hosted image only, #1407/#1405/#1387 fix)
+        run: |
+          set -eu
+          echo "::group::Disk usage before cleanup"
+          df -h /
+          echo "::endgroup::"
+          sudo rm -rf /usr/share/dotnet              || true  # ~17 GiB
+          sudo rm -rf /opt/hostedtoolcache/CodeQL    || true  # ~5 GiB
+          sudo rm -rf /usr/local/lib/android         || true  # ~13 GiB
+          sudo rm -rf /opt/ghc                       || true  # ~5 GiB
+          sudo rm -rf /usr/local/.ghcup              || true  # ~6 GiB (#1810)
+          # #2960 — the existing pruning above (dotnet/CodeQL/android/ghc/
+          # ghcup) was no longer enough headroom for the grown ~200k-LOC +
+          # ~600-dep debug test-compile: run 31911087758 died with
+          # `rustc-LLVM ERROR: No space left on device` on this Check
+          # (ubuntu-latest) leg. Bring the Check reclaim up to parity with
+          # the (heavier, already-passing-on-space) Postgres + Coverage
+          # legs and additionally free the whole tool cache
+          # ($AGENT_TOOLSDIRECTORY = /opt/hostedtoolcache, ~10 GiB of
+          # Python/Node/Go/Ruby/PyPy) — safe here because setup-python /
+          # setup-node run AFTER this step and repopulate exactly the
+          # versions the conformance readers (#2452) need. Pure first-party
+          # shell per the no-external-code-injection rule; each rm is
+          # best-effort so a shifting runner image never fails the step.
+          sudo rm -rf "${AGENT_TOOLSDIRECTORY:-}"    || true  # ~10 GiB (#2960)
+          sudo rm -rf /usr/local/share/powershell /usr/local/share/chromium \
+                      /usr/local/share/boost /usr/local/lib/node_modules \
+                      /opt/google /usr/lib/jvm /opt/microsoft \
+                      /usr/share/swift /usr/share/miniconda || true  # ~15 GiB (#2960)
+          sudo docker system prune -af --volumes     || true  # ~4 GiB (#1810)
+          sudo apt-get autoremove --purge -y         || true
+          sudo apt-get clean
+          # #1810 — bring the Check job's pre-test disk cleanup up to parity
+          # with the (passing, heavier-llvm-cov) Coverage job, which already
+          # frees `.ghcup` + docker images. The full `cargo test` compile of
+          # all integration bins under DEV_DEBUG=1 (full debug symbols)
+          # exhausted the ubuntu runner disk on c3087e33 with
+          # `rustc-LLVM ERROR: No space left on device`; the extra ~10 GiB
+          # restores headroom. macOS Check + Coverage were unaffected.
+          # #1407 — add swap on /mnt (ephemeral data disk) so the
+          # heavy lib-test link step has headroom above the ~7 GB RAM
+          # ceiling and stops dying with `ld ... signal 7 [Bus error]`.
+          # Mirrors the postgres-feature / coverage swap recipe.
+          # 2026-08-28 — 8G was not enough: 605ae49c rerun of this
+          # REQUIRED Check (ubuntu-latest,sqlite) leg died with
+          # `collect2: fatal error: ld terminated with signal 7
+          # [Bus error], core dumped` on the hosted 14/16 GB image
+          # (prior attempt was ENOSPC). 16G is still well inside
+          # /mnt on the hosted image; combined with CARGO_BUILD_JOBS=1
+          # on this leg only (step below) it serialises rustc/ld so
+          # peak RSS stays under the hosted ceiling. Do NOT apply
+          # CARGO_BUILD_JOBS=1 to self-hosted legs (operator topology:
+          # f2 is pg-tier only; macos-fed already covers sqlite on
+          # capable HW).
+          sudo fallocate -l 16G /mnt/swapfile-1407
+          sudo chmod 600 /mnt/swapfile-1407
+          sudo mkswap /mnt/swapfile-1407
+          sudo swapon /mnt/swapfile-1407
+          echo "::group::Disk + memory after cleanup"
+          df -h /
+          free -h
+          echo "::endgroup::"
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+
+      - name: Install Rust 1.99.1 (matches rust-toolchain.toml pin)
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: 1.99.1
+
+      - name: Rust cache (write the key the PR job restores)
+        id: rust-cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: ci-check-hosted-sqlite
+          save-if: ${{ github.event_name == 'push' }}
+
+      - name: Low-mem hosted sqlite link (debuginfo=0, system ld — mold isolation)
+        run: |
+          {
+            echo "CARGO_BUILD_JOBS=1"
+            echo "CARGO_PROFILE_DEV_DEBUG=0"
+            # #3461 — the job-level env now sets CARGO_PROFILE_TEST_DEBUG
+            # explicitly, so the `test` profile no longer inherits the `dev`
+            # override above. State the 0 here too, or this leg would silently
+            # regain debuginfo on exactly the binaries whose link it is
+            # isolating.
+            echo "CARGO_PROFILE_TEST_DEBUG=0"
+            echo "RUSTFLAGS=-C debuginfo=0"
+          } >> "$GITHUB_ENV"
+
+      # The debug test build of the hosted sqlite leg (FEAT is empty there) and its
+      # release-profile smoke. Not trimmed in between: the saved target/ keeps both
+      # profiles' dependencies, which is what the PR job compiles against.
+      - name: Build the test targets (no run)
+        if: steps.rust-cache.outputs.cache-hit != 'true'
+        run: cargo test --no-run
+
+      - name: Build release
+        if: steps.rust-cache.outputs.cache-hit != 'true'
+        run: cargo build --release
+
+  coverage:
+    name: Rust cache warm (Per-Module Coverage deps)
+    runs-on: ubuntu-latest
+    timeout-minutes: 110
+    env:
+      # The key env of coverage.yml `per-module-thresholds` (workflow env plus job env).
+      AI_MEMORY_NO_CONFIG: "1"
+      RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_DEV_LTO: "false"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Free disk + add swap (#1148 belt-and-suspenders, aggressive)
+        run: |
+          # Aggressive cleanup — the sal+sal-postgres instrumented
+          # coverage build's target/llvm-cov-target/ can exceed 20 GB
+          # under heavy integration-test instrumentation. Free
+          # everything we don't need before building.
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/.ghcup \
+                      /usr/local/share/powershell /usr/local/share/chromium \
+                      /usr/local/share/boost /usr/local/lib/node_modules \
+                      /opt/google /usr/lib/jvm /opt/microsoft \
+                      /usr/share/swift /usr/share/miniconda || true
+          # #2960 — also free the whole tool cache ($AGENT_TOOLSDIRECTORY =
+          # /opt/hostedtoolcache, ~10 GiB). The HF pre-stage step below uses
+          # the SYSTEM /usr/bin/python3 (there is no setup-python step), and
+          # everything else comes via rustup / apt / taiki-e install-action,
+          # so nothing reads the tool cache after this — pure extra headroom
+          # for the llvm-cov instrumented build that ran out of disk on
+          # run 31911087758.
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker system prune -af --volumes || true
+          sudo apt-get autoremove --purge -y || true
+          sudo apt-get clean
+          # Swap on /mnt (the ephemeral data disk, ~70 GB) so the 8 GB
+          # doesn't eat into the root partition.
+          sudo fallocate -l 8G /mnt/swapfile-1148
+          sudo chmod 600 /mnt/swapfile-1148
+          sudo mkswap /mnt/swapfile-1148
+          sudo swapon /mnt/swapfile-1148
+          echo "::group::memory + disk after"
+          free -h
+          df -h /
+          df -h /mnt
+          echo "::endgroup::"
+
+      - name: Install Rust 1.99.1
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: "1.99.1"
+          components: llvm-tools-preview
+
+      - name: Install mold linker (#1148, pinned+bounded #3090)
+        timeout-minutes: 6
+        env:
+          MOLD_VERSION: "2.4.1"
+        run: |
+          set -euo pipefail
+          # ------------------------------------------------------------------
+          # #3090 — the old body was a bare `apt-get update && apt-get install
+          # -y mold` with NO step timeout, NO retry, NO pin. When the Azure apt
+          # mirror stalled, the step blocked until the JOB `timeout-minutes`
+          # fired (75 here) — a ~1h15m flake per PR. This step is now
+          # idempotent, PINNED, time-bounded (step `timeout-minutes` above +
+          # per-command GNU `timeout`), retried once, and FAILS LOUD (exit 1)
+          # rather than hanging if mold cannot be fetched. Primary path pulls a
+          # pinned first-party mold release tarball from github.com (the infra
+          # the runner already trusts) into /usr/local/bin, removing the flaky
+          # apt mirror from the happy path; apt is the bounded fallback only. No
+          # external Action is added (repo no-external-code-injection rule).
+          # ------------------------------------------------------------------
+          if command -v mold >/dev/null 2>&1 && mold --version | grep -q "${MOLD_VERSION}"; then
+            echo "mold ${MOLD_VERSION} already present: $(mold --version)"; exit 0
+          fi
+          install_from_tarball() {
+            local arch tgz url dir ok attempt
+            arch="$(uname -m)"
+            tgz="mold-${MOLD_VERSION}-${arch}-linux.tar.gz"
+            url="https://github.com/rui314/mold/releases/download/v${MOLD_VERSION}/${tgz}"
+            dir="$(mktemp -d)"; ok=0
+            for attempt in 1 2; do
+              if timeout 120 curl -fsSL --retry 2 --retry-delay 3 -o "${dir}/${tgz}" "${url}"; then
+                ok=1; break
+              fi
+              echo "mold tarball fetch attempt ${attempt} failed; retrying" >&2; sleep 3
+            done
+            [ "${ok}" = 1 ] || return 1
+            tar -xzf "${dir}/${tgz}" -C "${dir}"
+            sudo install -m0755 "${dir}/mold-${MOLD_VERSION}-${arch}-linux/bin/mold" /usr/local/bin/mold
+            sudo ln -sf /usr/local/bin/mold /usr/local/bin/ld.mold
+          }
+          install_from_apt() {
+            local ok attempt; ok=0
+            for attempt in 1 2; do
+              if timeout 180 sudo apt-get update && timeout 180 sudo apt-get install -y mold; then
+                ok=1; break
+              fi
+              echo "apt mold install attempt ${attempt} failed; retrying" >&2; sleep 5
+            done
+            [ "${ok}" = 1 ]
+          }
+          if ! install_from_tarball; then
+            echo "::warning::pinned mold tarball unavailable — falling back to apt"
+            install_from_apt || { echo "::error::mold install failed (tarball + apt both failed)"; exit 1; }
+          fi
+          command -v mold >/dev/null 2>&1 || { echo "::error::mold not on PATH after install"; exit 1; }
+          mold --version
+
+      - name: Rust cache (write the key the PR job restores)
+        id: rust-cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: coverage-per-module
+          save-if: ${{ github.event_name == 'push' }}
+
+      - name: Restore HuggingFace models (#2019)
+        id: hf-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.cache/huggingface
+          # Bump the version suffix (…-v2) whenever the pinned model set or
+          # the staged cache layout changes. `restore-keys` lets a stale-but-
+          # compatible cache seed the dir so the pre-stage step only has to
+          # top up deltas instead of a full cold re-download on every key bump.
+          key: hf-models-minilm-l6-v2-marco-l6-v2-v2
+          restore-keys: |
+            hf-models-minilm-l6-v2-marco-l6-v2-
+
+      - name: Pre-stage HF models with retry (#2019)
+        env:
+          # #2019b — bypass the HF Xet CAS backend (cas-server.xethub.hf.co),
+          # which intermittently returns 401 on the reconstruction endpoint and
+          # failed the pre-stage on 2026-07-14. The Rust hf-hub the tests use is
+          # classic (non-Xet), so the staged classic cache is what they read.
+          HF_HUB_DISABLE_XET: "1"
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet --disable-pip-version-check "huggingface_hub>=0.20" \
+            || pip3 install --quiet "huggingface_hub>=0.20"
+          for m in sentence-transformers/all-MiniLM-L6-v2 cross-encoder/ms-marco-MiniLM-L-6-v2; do
+            ok=0
+            for attempt in 1 2 3 4 5; do
+              if python3 -c "from huggingface_hub import snapshot_download; snapshot_download('$m')"; then
+                echo "::notice::staged $m (attempt $attempt)"; ok=1; break
+              fi
+              echo "::warning::hf fetch $m attempt $attempt failed; retry in $((attempt*10))s"
+              sleep $((attempt*10))
+            done
+            [ "$ok" = 1 ] || { echo "::error::could not stage $m after 5 attempts"; exit 1; }
+          done
+
+      - name: Verify staged HF cache is hf-hub-resolvable (#2019)
+        run: |
+          set -euo pipefail
+          hub="$HOME/.cache/huggingface/hub"
+          # repo dir name = models--<org>--<name>; artifact files mirror the
+          # crate consts HF_{CONFIG,TOKENIZER,WEIGHTS}_FILE in src/embeddings.rs.
+          for repo in \
+            models--sentence-transformers--all-MiniLM-L6-v2 \
+            models--cross-encoder--ms-marco-MiniLM-L-6-v2; do
+            base="$hub/$repo"
+            ref="$base/refs/main"
+            [ -f "$ref" ] || { echo "::error::missing ref $ref — cache not hf-hub-resolvable"; exit 1; }
+            commit="$(tr -d '[:space:]' < "$ref")"
+            snap="$base/snapshots/$commit"
+            [ -d "$snap" ] || { echo "::error::missing snapshot dir $snap for $repo"; exit 1; }
+            for f in config.json tokenizer.json model.safetensors; do
+              # -e follows symlinks (hf cache snapshots are symlinks into blobs/).
+              [ -e "$snap/$f" ] || { echo "::error::missing $f in $snap ($repo)"; exit 1; }
+            done
+            echo "::notice::$repo resolvable at $snap (all 3 artifacts present)"
+          done
+
+      - name: Save HuggingFace models (#2019, push only)
+        if: github.event_name == 'push' && steps.hf-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-models-minilm-l6-v2-marco-l6-v2-v2
+
+      - name: Install cargo-llvm-cov
+        if: steps.rust-cache.outputs.cache-hit != 'true'
+        uses: taiki-e/install-action@6001e75680da9482e125349961b715573ec77af8 # cargo-llvm-cov
+
+      # The instrumented build of the PR job's first llvm-cov call, same features and
+      # targets. The test filter matches no test, so the binaries start and exit at once
+      # and no Postgres is needed.
+      - name: Build the instrumented coverage targets (no test runs)
+        if: steps.rust-cache.outputs.cache-hit != 'true'
+        run: |
+          cargo llvm-cov \
+            --no-report \
+            --features sal,sal-postgres \
+            --lib --tests \
+            --workspace \
+            -- --test-threads=1 --exact __rust_cache_warm_no_such_test__

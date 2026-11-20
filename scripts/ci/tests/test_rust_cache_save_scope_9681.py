@@ -136,8 +136,7 @@ CI_GATE_NEEDS = ("select", "classify", "build-script-vetting", "check", "mobile-
 # step name ends at ` #`, so some labels below stop mid-parenthesis exactly as GitHub shows them.
 TEST_STEPS: dict[str, dict[str, tuple[str, ...]]] = {
     "ci.yml": {
-        "select": ("Materialise the base selector (#8240)",
-                   "Select the full matrix (base selector unavailable)"),
+        "select": ("Materialise the base selector (#8240)",),
         "classify": ("run: # TWO SEPARATE BASES (#2496). Sharing one was the defect.",
                      "run: emit_all() {",
                      "Test impact selector security fallbacks",
@@ -162,7 +161,6 @@ TEST_STEPS: dict[str, dict[str, tuple[str, ...]]] = {
                   "Load gate (#6795)",
                   "Run tests (impact-aware)",
                   "Security audit",
-                  "Trim target/debug before release build (hosted)",
                   "Build release (once leg — release-profile smoke)",
                   "Cleanup enterprise-fed ephemeral db",
                   "sccache hit-rate summary (#7199)",
@@ -177,7 +175,7 @@ TEST_STEPS: dict[str, dict[str, tuple[str, ...]]] = {
         "vectorlite-feature": ("Clippy (vectorlite feature, all targets)",
                                "Run vectorlite no-native-lib seam tests (#1860)",
                                "Run config-precedence under vectorlite (#2256 feature-gated pin)"),
-        "dockerfile-validate": ("Smoke-test the built image",),
+        "dockerfile-validate": (),
         "ci-gate": ("Materialise the base gate (#8240)",
                     "Fold job results (bootstrap, PR-tree gate)",
                     "Fold job results (branch tip gate)"),
@@ -207,7 +205,7 @@ TEST_STEPS: dict[str, dict[str, tuple[str, ...]]] = {
     },
     "mobile-runtime.yml": {
         "ios-simulator": ("Build mobile_runtime test binary for iOS Simulator",),
-        "android-emulator": ("Enable KVM", "Build mobile_runtime test binary for Android (x86_64)"),
+        "android-emulator": ("Build mobile_runtime test binary for Android (x86_64)",),
     },
     "release-shape.yml": {
         "release-shape": ("Release feature declaration guard",
@@ -256,8 +254,9 @@ MIRRORED_STEPS: dict[tuple[str, str], tuple[str, ...]] = {
 }
 # Compile commands: each must appear in the PR job's run text and in the warm job's run text.
 WARM_COMPILES: dict[tuple[str, str], tuple[str, ...]] = {
-    ("ci.yml", "check"): ("cargo test --no-run", "cargo build --release",
-                          'cargo install cargo-audit --locked --force --version "${CARGO_AUDIT_VERSION}"'),
+    # Not `cargo install cargo-audit`: the PR job installs it with --force into a throwaway
+    # target, so a warm install would cost hosted minutes and restore nothing the PR uses.
+    ("ci.yml", "check"): ("cargo test --no-run", "cargo build --release"),
     ("coverage.yml", "per-module-thresholds"): (
         "cargo llvm-cov --no-report --features sal,sal-postgres --lib --tests --workspace",),
 }
@@ -337,6 +336,11 @@ def _parse_step(lines: list[str]) -> Step:
     body = [first, *lines[1:]]
     current = ""
     for line in body:
+        if current == "run" and line.strip() and _indent(line) <= KEY_INDENT \
+                and line.lstrip().startswith("#"):
+            # A less-indented comment ends a YAML block scalar: it is not run text.
+            current = ""
+            continue
         if _is_comment_or_blank(line) and current != "run":
             continue
         if _indent(line) == KEY_INDENT and not line.strip().startswith("#"):
@@ -686,14 +690,16 @@ class RustCacheSaveScope9681(unittest.TestCase):
                     if any(c in _flat(step.run()) for c in WARM_COMPILES[(pr_name, pr_job_id)]):
                         self.assertIn(gate, step.keys.get("if", ""), step.label())
 
-    def test_audit_version_matches(self) -> None:
-        def audit_version(job: Job) -> set[str]:
-            return {s.mapping("env").get("CARGO_AUDIT_VERSION", "") for s in job.steps()
-                    if "cargo-audit" in s.run()} - {""}
-        pr = audit_version(Workflow.load("ci.yml").jobs()["check"])
-        warm = audit_version(Workflow.load(WARM).jobs()["check-hosted-sqlite"])
-        self.assertEqual(len(pr), 1)
-        self.assertEqual(warm, pr)
+    def test_warm_jobs_run_only_the_hand_table_cargo_commands(self) -> None:
+        warm_jobs = Workflow.load(WARM).jobs()
+        for pr_name, pr_job_id, warm_job_id, _ in PAIRS:
+            compiles = WARM_COMPILES[(pr_name, pr_job_id)]
+            for step in warm_jobs[warm_job_id].steps():
+                for line in _flat(step.run()).splitlines():
+                    if "cargo " not in line or line.lstrip().startswith("#"):
+                        continue
+                    with self.subTest(job=warm_job_id, line=line.strip()):
+                        self.assertTrue(any(c in line for c in compiles), line)
 
     def test_taint_boundary_knows_the_split_cache_actions(self) -> None:
         sys.path.insert(0, str(REPO / "scripts" / "ci"))
