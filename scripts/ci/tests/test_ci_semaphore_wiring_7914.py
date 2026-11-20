@@ -25,6 +25,9 @@ import host_semaphore  # noqa: E402
 # 39686450440 attempt 2): a cold compile took ~4100 s and the serial shard alone ~7800 s.
 COLD_COMPILE_SECS = 4100
 SERIAL_SHARD_SECS = 7800
+# #9511: the contended compile measured in job 136315786439 (run 44742248080); the build
+# phase timeout must stay above it so a real build is never killed by it.
+CONTENDED_COMPILE_SECS = 6466
 
 
 def step_text(name):
@@ -65,14 +68,23 @@ class SemaphoreWiring(unittest.TestCase):
         self.assertNotIn('linux-fed-tests', re.sub(r'--name linux-fed-tests', '', CI))
 
     def test_job_cap_covers_every_wait_plus_the_serial_shard_7928(self):
-        """The cap, the gate wait, the semaphore wait and the safety are read from the YAML text."""
+        """The cap, every wait and the safety are read from the YAML text (#7928, #9511, #9733)."""
         caps = dict(re.findall(r'- leg: (\S+)\n(?:(?!\n          - leg:).)*?timeout: (\d+)\n', CI, re.S))
         cap_secs = int(caps['linux-fed,enterprise-fed']) * 60
-        gate = re.search(r'load_gate\.py[^\n]*--max-wait-secs (\d+)', CI)
-        if gate is None:  # no flag in the workflow: the helper default applies
-            gate = re.search(r"'--max-wait-secs', type=_non_negative_int, default=(\d+)",
-                             (REPO / 'scripts' / 'ci' / 'load_gate.py').read_text())
+        # #9733: the gate wait is one named constant of the gate step, per leg
+        gate = re.search(r"LOAD_GATE_MAX_WAIT_SECS: \$\{\{ matrix\.node == 'linux-fed' && "
+                         r"matrix\.tier == 'enterprise-fed' && '(\d+)' \|\| '(\d+)' \}\}", CI)
+        self.assertIsNotNone(gate, 'the load-gate wait must be one named env constant')
+        self.assertIn('load_gate.py --label "${{ matrix.node }}/${{ matrix.tier }}" '
+                      '--max-wait-secs "$LOAD_GATE_MAX_WAIT_SECS"', CI)
         gate_wait = int(gate.group(1))
+        build = re.search(r"BUILD_SEMAPHORE_MAX_WAIT_SECS: '(\d+)'", CI)
+        self.assertIsNotNone(build, 'the build-semaphore wait must be one named env constant')
+        build_wait = int(build.group(1))
+        self.assertIn('--max-wait-secs "$BUILD_SEMAPHORE_MAX_WAIT_SECS"', CI)
+        build_timeout = re.search(r"BUILD_PHASE_TIMEOUT_SECS: '(\d+)'", CI)
+        self.assertIsNotNone(build_timeout)
+        self.assertGreater(int(build_timeout.group(1)), CONTENDED_COMPILE_SECS)
         sem = re.search(r"HOST_SEMAPHORE_MAX_WAIT_SECS: '(\d+)'", CI)
         self.assertIsNotNone(sem, 'the semaphore wait must be one named env constant')
         semaphore_wait = int(sem.group(1))
@@ -80,13 +92,17 @@ class SemaphoreWiring(unittest.TestCase):
         safety = re.search(r'JOB_T0\) - (\d+) \)\)', CI)
         self.assertIsNotNone(safety)
         safety_secs = int(safety.group(1))
-        slack = cap_secs - gate_wait - semaphore_wait - COLD_COMPILE_SECS - safety_secs
+        slack = cap_secs - gate_wait - build_wait - semaphore_wait - COLD_COMPILE_SECS - safety_secs
         self.assertGreaterEqual(
             slack, SERIAL_SHARD_SECS,
-            'cap %d - gate %d - semaphore %d - compile %d - safety %d = %d < serial shard %d'
-            % (cap_secs, gate_wait, semaphore_wait, COLD_COMPILE_SECS, safety_secs, slack, SERIAL_SHARD_SECS))
-        self.assertIn('cap 18000 s >= load-gate wait 1200 + semaphore wait 3600 + cold compile 4100 '
-                      '+ safety 300 + serial shard 7800 (= 17000 s)', CI)
+            'cap %d - gate %d - build %d - semaphore %d - compile %d - safety %d = %d < serial shard %d'
+            % (cap_secs, gate_wait, build_wait, semaphore_wait, COLD_COMPILE_SECS, safety_secs, slack,
+               SERIAL_SHARD_SECS))
+        total = gate_wait + build_wait + COLD_COMPILE_SECS + semaphore_wait + safety_secs + SERIAL_SHARD_SECS
+        self.assertIn('cap %d s >= load-gate wait %d + build-semaphore wait %d + cold compile %d '
+                      '+ semaphore wait %d + safety %d + serial shard %d (= %d s)'
+                      % (cap_secs, gate_wait, build_wait, COLD_COMPILE_SECS, semaphore_wait, safety_secs,
+                         SERIAL_SHARD_SECS, total), CI)
 
     def test_only_the_linux_fed_enterprise_leg_has_300(self):
         rows = re.findall(r'- leg: (\S+)\n(?:(?!\n          - leg:).)*?timeout: (\d+)\n', CI, re.S)

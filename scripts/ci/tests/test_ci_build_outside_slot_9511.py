@@ -68,6 +68,12 @@ if "%(union)s" in argv:
     if rc:
         print("%(err)s", file=sys.stderr)
         sys.exit(rc)
+    tests = [argv[i + 1] for i, w in enumerate(argv[:-1]) if w == "--test"]
+    selected = tests or "--lib" in argv
+    for name in (tests or ([] if "--lib" in argv else %(names)r)):
+        print(json.dumps({"reason": "compiler-artifact", "target": {"name": name, "kind": ["test"]}}))
+    if "--lib" in argv or not selected:
+        print(json.dumps({"reason": "compiler-artifact", "target": {"name": "ai_memory", "kind": ["lib"]}}))
     print('{"reason":"build-finished","success":true}')
     sys.exit(0)
 if "--doc" in argv:
@@ -80,7 +86,7 @@ sys.exit(0)
 
 FAKE_PARTITION = r'''#!/usr/bin/env python3
 """Fake partition (#9511 test): fixed shard lists from an existing build record."""
-import argparse, os, sys
+import argparse, json, os, sys
 p = argparse.ArgumentParser()
 p.add_argument("--build-json", required=True)
 p.add_argument("--repo-root")
@@ -90,11 +96,20 @@ a = p.parse_args()
 if not os.path.isfile(a.build_json) or os.path.getsize(a.build_json) == 0:
     print("fake partition: no build record", file=sys.stderr)
     sys.exit(2)
-files = {"serial.txt": "--lib\n--test alpha_test\n", "parallel_1.txt": "--lib\n--test beta_test\n",
-         "parallel_2.txt": "--test gamma_test\n", "lib_pg_filters.txt": "store::postgres\n"}
-for name, body in files.items():
+built = set()
+with open(a.build_json) as fh:
+    for line in fh:
+        rec = json.loads(line)
+        if rec.get("reason") == "compiler-artifact":
+            built.add(("--lib" if "lib" in rec["target"]["kind"] else "--test " + rec["target"]["name"]))
+# only what the build record holds is partitioned, like the real partitioner
+files = {"serial.txt": ["--lib", "--test alpha_test"], "parallel_1.txt": ["--lib", "--test beta_test"],
+         "parallel_2.txt": ["--test gamma_test"]}
+for name, lines in files.items():
     with open(os.path.join(a.out_dir, name), "w") as fh:
-        fh.write(body)
+        fh.write("".join(l + "\n" for l in lines if l in built))
+with open(os.path.join(a.out_dir, "lib_pg_filters.txt"), "w") as fh:
+    fh.write("store::postgres\n")
 '''
 
 
@@ -131,7 +146,7 @@ def run_step(ci_text, impact='__ALL__', node='linux-fed', slots='2', extra_env=N
         calls_log = work / 'cargo-calls.jsonl'
         fake = work / 'bin' / 'cargo'
         fake.write_text(FAKE_CARGO % {'py': sys.executable, 'log': str(calls_log), 'union': UNION_FLAG,
-                                      'err': COMPILER_ERROR})
+                                      'err': COMPILER_ERROR, 'names': list(TEST_NAMES)})
         fake.chmod(0o755)
         consts, script = step_parts(ci_text)
         consts.update(consts_override or {})
@@ -202,7 +217,8 @@ def violations(calls):
                 continue
             u_feats, u_targets = selection(unions[0]['argv'])
             feats, targets = selection(c['argv'])
-            if feats != u_feats or (u_targets and not targets <= u_targets):
+            # an empty selector set means every target: beyond a union that named targets
+            if feats != u_feats or (u_targets and (not targets or not targets <= u_targets)):
                 out.append('prebuild inside the hold compiles beyond the union build: cargo %s'
                            % ' '.join(c['argv']))
     runs = [c for c in calls if call_kind(c['argv']) == 'run']
@@ -261,7 +277,7 @@ class BuildOutsideSlot(unittest.TestCase):
     def test_waits_are_recorded_in_the_job_summary(self):
         rc, _, out, summary = run_step(self.ci)
         self.assertEqual(rc, 0, out[-3000:])
-        self.assertRegex(summary, r"\| linux-fed-build \| linux-fed/enterprise-fed \| \d+ \| slot \d of \d+ \|")
+        self.assertRegex(summary, r"\| linux-fed-build \| linux-fed/enterprise-fed build \| \d+ \| slot \d of \d+ \|")
         self.assertRegex(summary, r"\| linux-fed-tests \| linux-fed/enterprise-fed \| \d+ \| slot \d of \d+ \|")
 
 
