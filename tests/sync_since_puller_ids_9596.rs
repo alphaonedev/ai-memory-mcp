@@ -272,10 +272,10 @@ fn id_corpus() -> Vec<String> {
 #[test]
 fn every_puller_form_sends_one_identity_in_all_clock_fields_9596() {
     let ids = id_corpus();
-    for id in &ids {
+    for (index, id) in ids.iter().enumerate() {
         assert!(
             ai_memory::validate::validate_agent_id(id).is_ok(),
-            "corpus id {id:?} must be a valid agent id"
+            "#9596 corpus index {index}: every corpus id must be a valid agent id"
         );
     }
     let cases: Vec<(PullerForm, &str, &str)> = PULLER_FORMS
@@ -313,10 +313,10 @@ fn every_puller_form_sends_one_identity_in_all_clock_fields_9596() {
             };
             match got {
                 Ok(captured) if *captured == want => None,
-                Ok(captured) => Some(format!(
-                    "form `{label}` id {id:?}: sent {captured:?}, want {want:?}"
+                Ok(_) => Some(format!(
+                    "form `{label}`: the pull sent a different identity than its local id"
                 )),
-                Err(why) => Some(format!("form `{label}` id {id:?}: {why}")),
+                Err(_) => Some(format!("form `{label}`: the pull did not complete")),
             }
         })
         .collect();

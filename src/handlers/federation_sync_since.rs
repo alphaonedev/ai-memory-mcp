@@ -857,13 +857,13 @@ mod authenticated_pull_peer_9596_tests {
             (true, None, Some(OTHER), false),
             (false, Some(OTHER), Some(OTHER), false),
         ];
-        for &(authenticated, peer, agent, refused) in cases {
+        for (case, &(authenticated, peer, agent, refused)) in cases.iter().enumerate() {
             let a = authenticated.then_some(&authn);
             let got = clock_field_mismatch(a, peer, agent);
             assert_eq!(
                 got.as_ref().map(axum::response::Response::status),
                 refused.then_some(StatusCode::FORBIDDEN),
-                "authenticated={authenticated} peer={peer:?} agent={agent:?}"
+                "#9596 case {case}: the clock-field mismatch verdict must match the table"
             );
         }
         assert_eq!(SYNC_SINCE_PEER_MISMATCH, "sync_since_peer_mismatch");
@@ -913,13 +913,13 @@ mod read_agent_id_header_9665_tests {
             (&[padded.as_bytes()], Some(padded.as_str())),
             (&[long.as_bytes()], Some(long.as_str())),
         ];
-        for &(values, want) in cases {
+        for (case, &(values, want)) in cases.iter().enumerate() {
             let map = headers(values);
             let got = read_agent_id_header(&map);
             assert_eq!(
                 got.as_ref().ok().copied(),
                 Some(want),
-                "values={values:?} must be accepted as {want:?}"
+                "#9665 case {case}: a readable agent id must be accepted verbatim"
             );
         }
     }
@@ -937,7 +937,7 @@ mod read_agent_id_header_9665_tests {
         for (case, &(values, reason)) in cases.iter().enumerate() {
             let map = headers(values);
             let Err(resp) = read_agent_id_header(&map) else {
-                panic!("values={values:?} must be refused");
+                panic!("#9665 case {case}: an unreadable agent id must be refused");
             };
             assert_eq!(
                 resp.status(),
@@ -951,12 +951,12 @@ mod read_agent_id_header_9665_tests {
             assert_eq!(
                 body["error"].as_str(),
                 Some(SYNC_SINCE_AGENT_ID_UNREADABLE),
-                "values={values:?} body={body}"
+                "#9665 case {case}: the refusal body must carry the expected tag and reason"
             );
             assert_eq!(
                 body["reason"].as_str(),
                 Some(reason),
-                "values={values:?} body={body}"
+                "#9665 case {case}: the refusal body must carry the expected tag and reason"
             );
         }
         assert_eq!(
