@@ -19,7 +19,8 @@ REPO = Path(__file__).resolve().parents[3]
 SCRIPT = REPO / 'scripts' / 'ci' / 'pg_isolate_serial_step.py'
 SCRATCH = REPO / '.local-runs' / 'test-pg-isolate-serial-step-9592'
 
-SECRET_URL = 'postgresql://ci_user:s3cr3t-9592@pg.invalid:5445/ai_memory_ci_fed_9592'
+# A fixture URL (fake credential, single-label host) whose text must never reach output or argv.
+SECRET_URL = 'postgresql://ci_user:canarypw9592@pgfixture:5445/ai_memory_ci_fed_9592'
 SHARED_DB = 'ai_memory_ci_fed_9592'
 TEMPLATE = SHARED_DB + '_tpl'
 TARGETS = ('alpha_9592', 'beta_9592', 'resid_9592')
