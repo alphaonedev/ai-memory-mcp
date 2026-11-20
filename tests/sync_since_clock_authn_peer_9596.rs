@@ -611,9 +611,15 @@ async fn rollout_arm_serves_an_unenrolled_peer_without_recording_its_clock_9596(
         assert_eq!(
             status,
             StatusCode::OK,
-            "#9596: the rollout arm still serves the pull"
+            "#9596: the rollout arm still serves the pull (require_enrollment=\
+             {require_enrollment} allow_unenrolled={allow_unenrolled})"
         );
-        assert_eq!(body["count"].as_u64(), Some(1), "#9596: one row projected");
+        assert_eq!(
+            body["count"].as_u64(),
+            Some(1),
+            "#9596: one row projected (require_enrollment={require_enrollment} \
+             allow_unenrolled={allow_unenrolled})"
+        );
     }
 }
 
