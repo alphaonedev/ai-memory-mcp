@@ -1001,6 +1001,10 @@ CLOSED_FORMS_REFUSED = (
     ("apt-get install -y ./x.deb", "apt-get operand './x.deb' is not a package name"),
     ("apt-get install x.deb", "apt-get operand 'x.deb' is not a package name"),
     ("apt-get install dist/x", "apt-get operand 'dist/x' is not a package name"),
+    # 9566 F2: apt reads a dot-led operand with no slash and no .deb suffix as a path in the tree.
+    ("apt-get install .", "apt-get operand '.' is not a package name"),
+    ("apt-get install -y ..", "apt-get operand '..' is not a package name"),
+    ("apt-get install .x", "apt-get operand '.x' is not a package name"),
     ('apt-get install "$P"', "apt-get operand '$P' is not a package name"),
     ("apt-get update rpm", "apt-get operand 'rpm' is not a package name"),
     ("rpm -i x.rpm", "rpm form 'rpm -i x.rpm' is not on the closed list"),
