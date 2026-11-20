@@ -39,7 +39,6 @@ LIVE_PIN = REPO / "scripts" / "qc-allowlists" / "required-contexts-live-pin.txt"
 
 CARGO_SKIP_GUARD = "needs.classify.outputs.cargo_skip != 'true'"
 ONCE_GUARD = CARGO_SKIP_GUARD + " && matrix.once"
-HOSTED_ONCE_GUARD = ONCE_GUARD + " && runner.environment == 'github-hosted'"
 
 # 1. Job ids and their `name:` values.
 EXPECTED_JOB_NAMES = {
@@ -119,7 +118,6 @@ EXPECTED_REQUIRED_CI_CONTEXTS = EXPECTED_CI_CONTEXTS - {"Impact selection", "ci-
 # 2./3. Gate steps: name -> the job that must hold it.
 SECURITY_AUDIT = "Security audit"
 RELEASE_SMOKE = "Build release (once leg — release-profile smoke)"
-SWAP_STEP = "Add swap for the release build (hosted once leg)"
 RUN_TESTS = "Run tests (impact-aware)"
 EXPECTED_GATE_STEPS = {
     "Select jobs": "select",
@@ -161,7 +159,6 @@ EXPECTED_STEP_IFS = {
     ("check", RUN_TESTS): CARGO_SKIP_GUARD,
     ("mobile-cross-compile", "cargo check (--lib --features sqlite-bundled)"): CARGO_SKIP_GUARD,
     ("mobile-cross-compile", SECURITY_AUDIT): ONCE_GUARD,
-    ("mobile-cross-compile", SWAP_STEP): HOSTED_ONCE_GUARD,
     ("mobile-cross-compile", RELEASE_SMOKE): ONCE_GUARD,
 }
 RELEASE_SMOKE_RUN = "cargo build --release"
@@ -426,13 +423,18 @@ class Steps9680(unittest.TestCase):
         android = [e for e in EXPECTED_MOBILE_TARGETS if e["target"] == ONCE_HOLDER[1]][0]
         self.assertEqual(android["os"], "ubuntu-latest")
 
-    def test_release_smoke_runs_once_after_swap(self):
+    def test_release_smoke_runs_once_after_the_audit(self):
         job = "mobile-cross-compile"
         smoke = self.wf.step(job, RELEASE_SMOKE)
         self.assertIsNotNone(smoke)
         self.assertEqual((smoke["run"] or "").strip(), RELEASE_SMOKE_RUN)
-        self.assertLess(self.wf.index(job, SWAP_STEP), self.wf.index(job, RELEASE_SMOKE))
-        self.assertGreaterEqual(self.wf.index(job, SWAP_STEP), 0)
+        self.assertGreaterEqual(self.wf.index(job, SECURITY_AUDIT), 0)
+        self.assertLess(self.wf.index(job, SECURITY_AUDIT), self.wf.index(job, RELEASE_SMOKE))
+        # One binary, the same fat-LTO link the ubuntu-latest Bench / Batman /
+        # token-budget jobs run without swap: no swap step (and no new
+        # tainted-job-boundary row) in this job.
+        for step in self.wf.steps[job]:
+            self.assertNotIn("swapon", step["run"] or "", step["name"])
         exact = [(j, s["name"]) for j, steps in self.wf.steps.items() for s in steps
                  if (s["run"] or "").strip() == RELEASE_SMOKE_RUN]
         self.assertEqual(exact, [(job, RELEASE_SMOKE)])

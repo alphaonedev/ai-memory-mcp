@@ -40,6 +40,12 @@ PUSHING_CHECKOUTS = {
 }
 
 CARGO_AUDIT_PIN = "CARGO_AUDIT_VERSION"
+# #9680: rustsec/rustsec release cargo-audit/v0.22.2, x86_64 musl asset.
+CARGO_AUDIT_VERSION = "0.22.2"
+CARGO_AUDIT_TGZ_SHA256 = "7fb9497f8594b389e5fce5ef9b92db08432996895b2e0c5a0167a69ed445c428"
+CARGO_AUDIT_BIN_SHA256 = "66f9c8f530950d106c1869ce27ef5a4008bcea53c7716c3ed8117586337ee7d8"
+ARCHIVE_CHECK = 'echo "${CARGO_AUDIT_TGZ_SHA256}  ${tgz}" | sha256sum -c -'
+BINARY_CHECK = 'echo "${CARGO_AUDIT_BIN_SHA256}  ${bindir}/cargo-audit" | sha256sum -c -'
 LOW_PORT_SYSCTL = "ip_unprivileged_port_start"
 
 
@@ -132,37 +138,65 @@ def security_audit_step(text):
     return ""
 
 
+def cargo_audit_pin_problems(step):
+    """Ways the Security audit step could run an unpinned or unverified cargo-audit."""
+    problems = []
+    if '%s: "%s"' % (CARGO_AUDIT_PIN, CARGO_AUDIT_VERSION) not in step:
+        problems.append("version pin")
+    if 'CARGO_AUDIT_TGZ_SHA256: "%s"' % CARGO_AUDIT_TGZ_SHA256 not in step:
+        problems.append("archive pin")
+    if 'CARGO_AUDIT_BIN_SHA256: "%s"' % CARGO_AUDIT_BIN_SHA256 not in step:
+        problems.append("binary pin")
+    if "cargo install" in step:
+        problems.append("source build")
+    tar = step.find("tar -xzf")
+    run = step.find("cargo audit --version")
+    archive = step.find("if ! " + ARCHIVE_CHECK + "; then")
+    binary = step.find("if ! " + BINARY_CHECK + "; then")
+    if archive < 0 or tar < 0 or archive > tar:
+        problems.append("archive checksum")
+    if binary < 0 or tar < 0 or run < 0 or not tar < binary < run:
+        problems.append("binary checksum")
+    return problems
+
+
 class WorkflowPermissions8172(unittest.TestCase):
     def test_3138_security_audit_guards_and_pins_cargo_audit(self):
         step = security_audit_step(read(CI_YML))
         self.assertTrue(step, "Security audit step not found in ci.yml")
-        self.assertIn("command -v cargo-audit", step)
-        self.assertIn(CARGO_AUDIT_PIN, step)
-        install = [l for l in step.splitlines() if "cargo install cargo-audit" in l]
-        self.assertTrue(install)
-        for l in install:
-            self.assertIn("--version", l, "cargo install must pin the version")
+        self.assertEqual(cargo_audit_pin_problems(step), [])
+        # #9680: no source build; the pinned prebuilt is what runs.
+        self.assertNotIn("cargo install", step)
+        self.assertIn('export PATH="${bindir}:${PATH}"', step)
+        # cargo searches $CARGO_HOME/bin before PATH: the image copy goes first.
+        cargo_home_copy = 'rm -f "${CARGO_HOME:-${HOME}/.cargo}/bin/cargo-audit"'
+        self.assertIn(cargo_home_copy, step)
+        self.assertLess(step.index(cargo_home_copy), step.index("cargo audit --version"))
+        self.assertIn('[ "$(command -v cargo-audit)" != "${bindir}/cargo-audit" ]', step)
 
     def test_3138_stale_installed_cargo_audit_is_replaced_or_fails(self):
         step = security_audit_step(read(CI_YML))
         self.assertTrue(step, "Security audit step not found in ci.yml")
-        # The installed version is compared with the pin, not just presence.
-        self.assertIn('cargo audit --version', step)
-        self.assertIn('grep -Fqw -- "${CARGO_AUDIT_VERSION}"', step)
-        # A mismatch reinstalls the pinned version over the stale one.
-        install = [l for l in step.splitlines() if "cargo install cargo-audit" in l]
-        self.assertTrue(install)
-        for l in install:
-            self.assertIn("--force", l)
-            self.assertIn('--version "${CARGO_AUDIT_VERSION}"', l)
-        # After the install the job fails unless the pinned version is what runs.
-        self.assertIn("exit 1", step)
-        self.assertLess(step.index("exit 1"), step.index("cargo audit\n") if "cargo audit\n" in step else len(step))
-        # The pin bites: the old presence-only guard is rejected.
-        presence_only = step.replace(
-            ' \\\n             || ! cargo audit --version 2>/dev/null | grep -Fqw -- "${CARGO_AUDIT_VERSION}"', "", 1)
-        self.assertNotEqual(presence_only, step)
-        self.assertNotIn("|| ! cargo audit --version", presence_only)
+        # The version that runs is compared with the pin, not just presence,
+        # and the job fails before the audit when it differs.
+        self.assertIn('cargo audit --version | grep -Fqw -- "${CARGO_AUDIT_VERSION}"', step)
+        version_check = step.index("cargo audit --version")
+        self.assertLess(version_check, step.index("exit 1", version_check))
+        self.assertLess(step.index("exit 1", version_check), step.index("check_cargo_audit.py"))
+        # The pins bite: a dropped checksum, a wrong pin or a source build is rejected.
+        no_archive_check = step.replace(
+            'if ! echo "${CARGO_AUDIT_TGZ_SHA256}  ${tgz}" | sha256sum -c -; then', "if false; then", 1)
+        self.assertNotEqual(no_archive_check, step)
+        self.assertIn("archive checksum", cargo_audit_pin_problems(no_archive_check))
+        no_binary_check = step.replace(
+            'if ! echo "${CARGO_AUDIT_BIN_SHA256}  ${bindir}/cargo-audit" | sha256sum -c -; then',
+            "if false; then", 1)
+        self.assertNotEqual(no_binary_check, step)
+        self.assertIn("binary checksum", cargo_audit_pin_problems(no_binary_check))
+        wrong_pin = step.replace(CARGO_AUDIT_TGZ_SHA256, "0" * 64, 1)
+        self.assertIn("archive pin", cargo_audit_pin_problems(wrong_pin))
+        source_build = step + '\n          cargo install cargo-audit --locked --version "${CARGO_AUDIT_VERSION}"\n'
+        self.assertIn("source build", cargo_audit_pin_problems(source_build))
 
     def test_8172_release_yml_has_no_top_level_contents_write(self):
         text = read("release.yml")
