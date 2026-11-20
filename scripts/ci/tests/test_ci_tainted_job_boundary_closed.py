@@ -931,15 +931,23 @@ class PreScanRefusesRunThatIsNotText(unittest.TestCase):
                          "step 'u' uses an action, which the pre-scan does not read")
 
     def test_9566_large_run_forms_are_refused_in_bounded_time(self) -> None:
+        # The full analysis reads every job (9566 item 3), so the verdict alone no longer shows a
+        # pre-scan that passes a large form over; the pre-scan reason of the read value is checked too.
         _need_module(self)
-        bulk = (("flow list", "[" + ", ".join(["a"] * RUN_FORM_BULK_ITEMS) + "]", VERDICT_UNCLASSIFIABLE),
-                ("whitespace string", '"' + " " * ADVERSARIAL_BYTES + '"', VERDICT_NO_PR_CODE))
-        for name, value, verdict in bulk:
+        bulk = (("flow list", "[" + ", ".join(["a"] * RUN_FORM_BULK_ITEMS) + "]", RUN_NOT_TEXT,
+                 VERDICT_UNCLASSIFIABLE),
+                ("whitespace string", '"' + " " * ADVERSARIAL_BYTES + '"', RUN_EMPTY, VERDICT_NO_PR_CODE))
+        for name, value, reason, verdict in bulk:
             with self.subTest(form=name):
                 self.assertGreaterEqual(len(value), ADVERSARIAL_BYTES // 2)
+                text = _run_value_workflow("push", "permissions:\n  contents: write\n", "", value)
                 start = time.monotonic()
-                result = _scan(_run_value_workflow("push", "permissions:\n  contents: write\n", "", value))
+                result = _scan(text)
+                run = tb.parse_yaml(text, SYNTH)["jobs"][JOB]["steps"][1]["run"]
+                got_reason = tb._pre_scan_fetch([tb._Step(UNREAD_STEP, {"run": run}, 0)], {}, {})
                 self.assertLess(time.monotonic() - start, SCAN_CEILING_S)
+                self.assertGreaterEqual(len(run), RUN_FORM_BULK_ITEMS)
+                self.assertEqual(got_reason, PRE_SCAN_UNREAD.format(reason=reason))
                 self.assertEqual(result.verdicts.get((SYNTH, JOB)), verdict)
 
 
