@@ -176,19 +176,30 @@ def _fresh_probe_dir():
     return Path(tempfile.mkdtemp(dir=SCRATCH_BASE, prefix="prune8634-probe-")).resolve()
 
 
-@functools.cache
-def host_refuses_byte_ff_names():
-    """None when the scratch file system accepts a file name holding byte 0xff (Linux), else the errno name (APFS: EILSEQ)."""
+def probe_byte_ff_refusal(create):
+    """None when ``create`` makes a file named with byte 0xff, "EILSEQ" when the file system refuses that name.
+
+    The one errno that names the missing facility is EILSEQ (APFS). Every other error (ENOSPC, EIO, EACCES, ...)
+    says nothing about the name, so it propagates and the cell fails instead of silently dropping a security cell.
+    """
     top = _fresh_probe_dir()
     try:
-        fd = os.open(os.path.join(os.fsencode(top), b"probe\xff"), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        fd = create(os.path.join(os.fsencode(top), b"probe\xff"), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     except OSError as exc:
-        return errno.errorcode.get(exc.errno, str(exc.errno))
+        if exc.errno != errno.EILSEQ:
+            raise
+        return errno.errorcode[errno.EILSEQ]
     else:
         os.close(fd)
         return None
     finally:
         remove_scratch(top, SCRATCH_BASE)
+
+
+@functools.cache
+def host_refuses_byte_ff_names():
+    """None when the scratch file system accepts a file name holding byte 0xff (Linux), else "EILSEQ" (APFS)."""
+    return probe_byte_ff_refusal(os.open)
 
 
 @functools.cache
@@ -202,12 +213,24 @@ def host_folds_case():
         remove_scratch(top, SCRATCH_BASE)
 
 
-def byte_ff_skip_reason():
-    """The exact skip reason for a cell that needs a 0xff file name, or None when the host runs it."""
-    errno_name = host_refuses_byte_ff_names()
+def byte_ff_reason(errno_name):
+    """The exact skip reason for a row that needs a 0xff file name, or None when the host runs it."""
     if errno_name is None:
         return None
     return f"this file system refuses a file name holding byte 0xff ({errno_name}, platform {sys.platform})"
+
+
+def byte_ff_skip_reason():
+    """The skip reason of this host for a 0xff-name row, or None when the host runs it."""
+    return byte_ff_reason(host_refuses_byte_ff_names())
+
+
+def split_hostile_names(names, refusal):
+    """(kept, dropped): drop only the names holding a lone surrogate (byte 0xff) on a host that refuses them."""
+    if refusal is None:
+        return list(names), []
+    kept = [name for name in names if "\udcff" not in name]
+    return kept, [name for name in names if "\udcff" in name]
 
 
 def remove_scratch(top, base):
@@ -497,7 +520,8 @@ class EntryKinds(Base):
         os.mkfifo(parent / "k-fifo")
         made["fifo"] = parent / "k-fifo"
         sock = socket.socket(socket.AF_UNIX)
-        sock.bind(str(parent / "k-sock"))
+        with contextlib.chdir(parent):  # a relative name keeps sun_path short whatever the length of TMPDIR (#8213 precedent)
+            sock.bind("k-sock")
         sock.close()
         made["socket"] = parent / "k-sock"
         for path in (parent / "k-dir" / "inner" / "f", parent / "k-dir" / "inner", *made.values()):
@@ -1114,32 +1138,38 @@ class HostileNames(Base):
             os.utime(raw, (time.time() - OLD_AGE_SECS,) * 2)
         return raw
 
+    def host_names(self):
+        """The hostile names this host can create; each dropped 0xff name is a skipped subTest with the exact reason."""
+        kept, dropped = split_hostile_names(HOSTILE_NAMES, host_refuses_byte_ff_names())
+        for name in dropped:
+            with self.subTest(name=name):
+                self.skipTest(byte_ff_skip_reason())
+        return kept
+
     def test_dry_run_lines_carry_no_injection(self):
-        if (reason := byte_ff_skip_reason()) is not None:
-            self.skipTest(reason)
-        for index, name in enumerate(HOSTILE_NAMES):
+        names = self.host_names()
+        for index, name in enumerate(names):
             self.make_named(f"{index}-{name}", as_dir=False)
         rc, out, err = self.run_prune(self.runner, "--dry-run")
         self.assertEqual((rc, err), (EXIT_OK, ""))
         self.lines_ok(out)
-        self.assertEqual(len(out.splitlines()), len(HOSTILE_NAMES) + 1)
-        self.assertIn(f"pruned={len(HOSTILE_NAMES)} ", out)
+        self.assertEqual(len(out.splitlines()), len(names) + 1)
+        self.assertIn(f"pruned={len(names)} ", out)
 
     @unittest.skipIf(os.geteuid() == 0, "root ignores directory permissions")
     def test_failure_lines_carry_no_injection(self):
-        if (reason := byte_ff_skip_reason()) is not None:
-            self.skipTest(reason)
+        names = self.host_names()
         locked = []
-        for index, name in enumerate(HOSTILE_NAMES):
+        for index, name in enumerate(names):
             raw = self.make_named(f"{index}-{name}", as_dir=True)
             os.chmod(os.path.join(raw, b"sub"), 0o500)
             locked.append(raw)
         self.addCleanup(lambda: [os.chmod(os.path.join(raw, b"sub"), 0o700) for raw in locked])
         rc, out, err = self.run_prune(self.runner)
         self.assertEqual(rc, EXIT_OK)
-        self.assertIn(f"failed={len(HOSTILE_NAMES)} ", out)
+        self.assertIn(f"failed={len(names)} ", out)
         self.lines_ok(err)
-        self.assertEqual(len(err.splitlines()), len(HOSTILE_NAMES))
+        self.assertEqual(len(err.splitlines()), len(names))
 
     def test_safe_text_forms(self):
         cases = {
@@ -2409,7 +2439,9 @@ class HostProbes(unittest.TestCase):
             probe_byte_ff_refusal(create)
 
     def test_byte_ff_probe_accepting_host_returns_none(self):
-        self.assertIsNone(probe_byte_ff_refusal(os.open))
+        def accepting_create(path, flags, mode=0o777):
+            return os.open(os.devnull, os.O_RDONLY)
+        self.assertIsNone(probe_byte_ff_refusal(accepting_create))
 
     def test_hostile_names_drop_only_the_0xff_row_on_a_refusing_host(self):
         kept, dropped = split_hostile_names(HOSTILE_NAMES, BYTE_FF_REFUSED_NAME)
