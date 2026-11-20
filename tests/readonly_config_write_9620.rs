@@ -31,7 +31,7 @@ const DEFAULT_CONFIG_FIRST_LINE: &str = "# ai-memory configuration";
 const SENTINEL_CONFIG: &str = "# sentinel 9620 - must survive byte for byte\n";
 
 /// Age of the planted config, so an mtime bump is visible.
-const SENTINEL_AGE: Duration = Duration::from_secs(86_400 * 30);
+const SENTINEL_AGE: Duration = Duration::from_hours(720);
 
 /// Scratch root under the repo's gitignored `.local-runs/` (no `/tmp`).
 fn scratch_root() -> PathBuf {
