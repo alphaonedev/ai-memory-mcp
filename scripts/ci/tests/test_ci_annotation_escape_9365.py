@@ -1379,12 +1379,23 @@ LOADER_NAME = "_load_workflow_annotation"
 ERROR_LINE_PLACEHOLDER = "WA_ERROR_LINE"
 REQUIRE_NAME = "require_workflow_annotation"
 DEFERRED_SUPPORT_CLASSES = frozenset({"SharedModuleNotLoadedError", "_NotLoaded"})
+TAINT_BOUNDARY_REL = "scripts/ci/taint_boundary.py"
 LOADER_SHAPE_EXCEPTIONS = {
-    # The single named exception: its floor check (Python >= 3.12) runs before every import, so its load is a
+    # The first named exception: its floor check (Python >= 3.12) runs before every import, so its load is a
     # function called after the check, executes a fresh module object never put in sys.modules and checks
     # SHARED_MODULE_USED; by ruling bcd0a15c a failed load stays a ::warning, exit 0, nothing pruned.
     "scripts/ci/prune_runner_tmp.py": "floor check first; warning, exit 0, prunes nothing (ruling bcd0a15c)",
+    # Issue 9561: the operand of the one open row of the python module form in ci.yml / check / "Run tests
+    # (impact-aware)"; the script names the module as row text and never loads it. This entry leaves with the
+    # row when 9561 closes.
+    TAINT_BOUNDARY_REL: "the operand of the open row of issue 9561, row text only (leaves when 9561 closes)",
 }
+# An entry named here covers exactly one string constant whose whole value is this text; every other reference
+# to the module in that file (an import, a name, an attribute, a second such string, a longer string) is still
+# read as a load and must have the one shape.
+LOADER_SHAPE_EXCEPTION_TEXTS = {TAINT_BOUNDARY_REL: SHARED_STEM}
+# The exception count only goes down: a third entry needs its own ruling.
+LOADER_SHAPE_EXCEPTION_COUNT = 2
 WA_SETTINGS = ("WA_PROG", "WA_RELATIVE_PATH", "WA_REQUIRED", "WA_EXIT_LOAD_REFUSED", "WA_ERROR_TO_STDERR")
 CANONICAL_LOADER_SOURCE = textwrap.dedent('''\
     def _load_workflow_annotation():
@@ -1449,6 +1460,14 @@ def shared_module_references(tree):
     return found
 
 
+def references_outside_exception_text(references, text):
+    """``references`` less the first string constant whose whole value is ``text``; a second one stays."""
+    for index, node in enumerate(references):
+        if isinstance(node, ast.Constant) and node.value == text:
+            return references[:index] + references[index + 1:]
+    return references
+
+
 def _canonical_nodes():
     tree = ast.parse(CANONICAL_LOADER_SOURCE)
     return ast.dump(tree.body[0]), ast.dump(tree.body[1])
@@ -1465,7 +1484,11 @@ def loader_shape_violations(rel, source):
     references the shared module."""
     tree = ast.parse(source)
     references = shared_module_references(tree)
-    if not references or rel in LOADER_SHAPE_EXCEPTIONS:
+    if rel in LOADER_SHAPE_EXCEPTIONS:
+        if rel not in LOADER_SHAPE_EXCEPTION_TEXTS:
+            return []
+        references = references_outside_exception_text(references, LOADER_SHAPE_EXCEPTION_TEXTS[rel])
+    if not references:
         return []
     problems = []
     canonical_def, canonical_try = _canonical_nodes()
@@ -1618,10 +1641,44 @@ class LoaderShape(unittest.TestCase):
         self.assertEqual(loader_shape_violations("scripts/ci/new_tool.py", no_references), [])
         self.assertNotEqual(loader_shape_violations("scripts/ci/new_tool.py", "import workflow_annotation\n"), [])
 
-    def test_prune_runner_tmp_is_the_single_named_exception_9365(self):
-        self.assertEqual(set(LOADER_SHAPE_EXCEPTIONS), {"scripts/ci/" + PRUNE_SCRIPT_NAME})
+    def test_prune_runner_tmp_is_the_whole_file_exception_9365(self):
+        self.assertIn("scripts/ci/" + PRUNE_SCRIPT_NAME, LOADER_SHAPE_EXCEPTIONS)
+        self.assertNotIn("scripts/ci/" + PRUNE_SCRIPT_NAME, LOADER_SHAPE_EXCEPTION_TEXTS)
         source = (CI_DIR / PRUNE_SCRIPT_NAME).read_text(encoding="utf-8")
         self.assertTrue(shared_module_references(ast.parse(source)), "the exception must still name the module")
+
+    def test_the_exception_count_is_pinned_and_the_9561_entry_is_one_string_9561(self):
+        """Two exceptions, no more; the 9561 entry covers the one row string of taint_boundary.py and nothing else."""
+        self.assertEqual(len(LOADER_SHAPE_EXCEPTIONS), LOADER_SHAPE_EXCEPTION_COUNT)
+        self.assertEqual(set(LOADER_SHAPE_EXCEPTIONS), {"scripts/ci/" + PRUNE_SCRIPT_NAME, TAINT_BOUNDARY_REL})
+        self.assertEqual(LOADER_SHAPE_EXCEPTION_TEXTS, {TAINT_BOUNDARY_REL: SHARED_STEM})
+        source = (REPO / TAINT_BOUNDARY_REL).read_text(encoding="utf-8")
+        references = shared_module_references(ast.parse(source))
+        # The entry leaves with the row: the file names the module exactly once, as that one whole string.
+        self.assertEqual([(type(node).__name__, node.value) for node in references], [("Constant", SHARED_STEM)])
+        self.assertEqual(loader_shape_violations(TAINT_BOUNDARY_REL, source), [])
+        row_line = f'"{SHARED_STEM}"'
+        self.assertEqual(source.count(row_line), 1)
+        mutants = {
+            "import by name elsewhere": source + f"\nimport {SHARED_STEM}\n",
+            "a second row string": source + f"\nSECOND = {row_line}\n",
+            "a longer string": source.replace(row_line, f'"{SHARED_MODULE_NAME}"', 1),
+            "a name": source + f"\n{SHARED_STEM} = None\n",
+            "an attribute": source + f"\nsys.{SHARED_STEM}\n",
+            "dunder import": source + f"\nwa = __import__({row_line})\n",
+        }
+        for label, mutant in mutants.items():
+            with self.subTest(mutant=label):
+                self.assertNotEqual(mutant, source, "the mutant did not change the script")
+                self.assertEqual(loader_shape_violations(TAINT_BOUNDARY_REL, mutant)[:2], [
+                    f"{TAINT_BOUNDARY_REL}: 0 module-level {LOADER_NAME} definitions (want 1)",
+                    f"{TAINT_BOUNDARY_REL}: 0 module-level load try blocks (want 1)"])
+        # The entry is load-bearing: without it the row string alone is read as a load.
+        entry = LOADER_SHAPE_EXCEPTIONS.pop(TAINT_BOUNDARY_REL)
+        try:
+            self.assertNotEqual(loader_shape_violations(TAINT_BOUNDARY_REL, source), [])
+        finally:
+            LOADER_SHAPE_EXCEPTIONS[TAINT_BOUNDARY_REL] = entry
 
 
 # ---------------------------------------------------------------------------------------------------------------

@@ -140,8 +140,15 @@ async fn sqlite_concurrent_first_bind_cannot_pass_on_a_stale_chain_4356() {
     assert_eq!(n, 0, "a refused racing bind must leave no binding");
 }
 
+/// The shared waiter for sessions parked on the bind lock (#9252). It counts
+/// only ungranted waits on the bind key, never another advisory wait.
+#[cfg(feature = "sal-postgres")]
+#[path = "common/pg_bind_wait.rs"]
+mod pg_bind_wait;
+
 #[cfg(feature = "sal-postgres")]
 mod pg {
+    use super::pg_bind_wait::await_bind_waiters;
     use super::*;
     use ai_memory::config::{FeatureTier, ResolvedScoring, ResolvedTtl};
     use ai_memory::handlers::{ApiKeyState, AppState, Db, StorageBackend};
@@ -334,7 +341,9 @@ mod pg {
                 )
             })
         };
-        tokio::time::sleep(HOLD).await;
+        // #9252: wait until the DATABASE shows both binds parked on the bind
+        // lock, instead of sleeping and hoping they arrived.
+        await_bind_waiters(&pool, 2).await;
         assert!(
             !sal.is_finished(),
             "the SAL bind must wait for the in-flight bind's lock, not read a stale chain"
