@@ -175,6 +175,42 @@ def scratch_dir() -> Path:
     return Path(tempfile.mkdtemp(prefix="cs8328-", dir=str(SCRATCH)))
 
 
+SED_SHIM = (
+    "#!%s -I\n"
+    "import os, re, sys\n"
+    "# Host shim (#9744): the workflow step uses the GNU form `{...;p}`; BSD sed needs `p;}`.\n"
+    "args = [re.sub(r'p\\}', 'p;}', a) for a in sys.argv[1:]]\n"
+    "os.execv(%r, [%r] + args)\n"
+)
+
+
+def host_sed_is_gnu() -> bool:
+    """True when the host `sed` accepts the GNU form (it answers `--version`)."""
+    res = subprocess.run(["sed", "--version"], capture_output=True, text=True)
+    return res.returncode == 0
+
+
+def bsd_sed_shim_dir(work: Path):
+    """Return a directory holding a `sed` shim for a BSD-userland host, else None.
+
+    The step text lives in ci.yml (its form is pinned there), so the test adapts
+    the host instead: the shim rewrites only the `p}` brace-close to `p;}` and
+    runs the host's own sed. On a GNU host nothing is installed and the step
+    runs byte for byte as on the hosted runner.
+    """
+    if host_sed_is_gnu():
+        return None
+    real = shutil.which("sed")
+    if real is None:
+        raise unittest.SkipTest("host has no sed on PATH: the impact step cannot run")
+    shim_dir = work / "bin-sed-shim"
+    shim_dir.mkdir()
+    shim = shim_dir / "sed"
+    shim.write_text(SED_SHIM % (sys.executable, real, real))
+    shim.chmod(0o755)
+    return shim_dir
+
+
 def run_cli(rules_text: str, args, stdin_text: str = "x.md\n"):
     """Run cargo_skip.py -I against a rules text; return (rc, stdout, stderr)."""
     work = scratch_dir()
@@ -336,6 +372,9 @@ class ImpactStepOutputAllowList(unittest.TestCase):
             env = dict(os.environ, GITHUB_OUTPUT=str(out), RUNNER_TEMP=str(work),
                        CLS_BASE="base", IMPACT_BASE="base", DOCS_ONLY=docs_only,
                        IMPACT_FORCED_REASON=forced)
+            shim_dir = bsd_sed_shim_dir(work)
+            if shim_dir is not None:
+                env["PATH"] = str(shim_dir) + os.pathsep + env.get("PATH", "")
             res = subprocess.run(RUNNER_BASH + [step_by_id(CI_YML, "impact")[2]],
                                  cwd=str(work), env=env, capture_output=True, text=True,
                                  timeout=TIMEOUT_S)
