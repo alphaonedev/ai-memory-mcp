@@ -17,6 +17,30 @@
 # shared-key, the same key env, byte-equal toolchain and env steps, the same compile
 # commands, save-if push only, and no PR trigger. No job here is a required
 # context; a red run here costs cache warmth, never correctness.
+#
+# Why a chain/** push trigger is allowed here. The precedents forbid a push trigger
+# that overlaps the pull-request trigger of the same checks: #2506 (push and
+# pull-request branch lists that disagree leave a branch unchecked), #2508 (a
+# dual-trigger workflow under a shared concurrency key leaves a CANCELLED check-run
+# that reads as a pass) and #2523 (the same shape through push.branches local/**).
+# This workflow is the one sanctioned exception: it has no pull-request trigger, its
+# concurrency group is its own per ref and never cancels, and none of its jobs is a
+# required context or a need of the CI gate, so no check a PR depends on can be
+# duplicated, cancelled or skipped by it. A chain push already has authority over the
+# code these jobs compile (3-agent vote 71472661, V2-9681). It is the only writer of the
+# chain cache; the invariant test fails on any other workflow that runs on a chain/**
+# push or spells its keys.
+#
+# Generation constant. The two cache steps here and their PR counterparts (ci.yml
+# `check`, coverage.yml `per-module-thresholds`) carry one prefix-key, chain-cache-g<N>.
+# Bumping N at all four in one commit invalidates every chain cache; the first run after
+# a bump misses once and writes the new generation.
+#
+# Kill switch: delete the caches of the chain ref (gh cache delete for each key of
+# refs/heads/chain/<name>), then revert this workflow. A revert of a chain commit that
+# touched build.rs, a proc-macro crate, .cargo/ or Cargo.lock bumps the prefix-key
+# generation constant in the same merge, because a cache entry outlives the commit that
+# wrote it and could otherwise restore artefacts built from the reverted code.
 
 name: Rust cache warm (chain)
 
@@ -131,6 +155,8 @@ jobs:
         id: rust-cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
+          # The chain cache generation (header); equal at all four paired steps.
+          prefix-key: chain-cache-g1
           shared-key: ci-check-hosted-sqlite
           save-if: ${{ github.event_name == 'push' }}
 
@@ -275,6 +301,8 @@ jobs:
         id: rust-cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
+          # The chain cache generation (header); equal at all four paired steps.
+          prefix-key: chain-cache-g1
           shared-key: coverage-per-module
           save-if: ${{ github.event_name == 'push' }}
 

@@ -1561,6 +1561,9 @@ jobs:
           # same compile commands); the only hosted leg of this matrix is
           # ubuntu-latest,sqlite, so one key per lock state is unambiguous.
           # The #9681 save-scope invariant test pins the pair.
+          # The chain cache generation (rust-cache-warm.yml header); equal at all four
+          # paired steps, so one bump invalidates every chain cache.
+          prefix-key: chain-cache-g1
           shared-key: ci-check-hosted-sqlite
           save-if: ${{ github.event_name == 'push' }}
 

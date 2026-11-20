@@ -384,6 +384,9 @@ jobs:
           # push-only rust-cache-warm.yml writes this exact shared-key on every
           # chain/** push (same toolchain, same key env, same llvm-cov build).
           # The #9681 save-scope invariant test pins the pair.
+          # The chain cache generation (rust-cache-warm.yml header); equal at all four
+          # paired steps, so one bump invalidates every chain cache.
+          prefix-key: chain-cache-g1
           shared-key: coverage-per-module
           save-if: ${{ github.event_name == 'push' }}
 
