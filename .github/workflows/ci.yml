@@ -2571,12 +2571,14 @@ jobs:
           # disabled the fail-fast the invariants depend on.
           run_all 2>&1 | tee "$RESULT_LOG"
 
-      # #9709: a red leg names its failing test binaries and tests in the step summary and as annotations.
-      # Deterministic, no secret, no network, no LLM; never changes the job result.
+      # #9709: a red leg names its failing test binaries and tests in the step summary and as annotations, or the
+      # first error line of the failing step, or "cause not identified" plus that step's name. Deterministic, no
+      # secret, no network, no LLM; never changes the job result. Fork PRs skip it like the other shared-target steps.
       - name: Red cause summary (#9709)
-        if: failure() && needs.classify.outputs.cargo_skip != 'true'
+        if: (failure() || cancelled()) && needs.classify.outputs.cargo_skip != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
         continue-on-error: true
-        run: python3 -I scripts/ci/red_cause_summary.py "${TEST_RESULT_LOG:-}" "${RUNNER_TEMP}/ci-shard"
+        timeout-minutes: 5
+        run: python3 -I scripts/ci/red_cause_summary.py --step "${TEST_RESULT_LOG:-}" "Run tests (impact-aware)" "${TEST_RESULT_LOG:-}" "${RUNNER_TEMP}/ci-shard"
 
       # Durable audit-history artifact (#4). Uploaded on success AND failure so
       # a red leg's full output is retrievable long after the log view expires.
@@ -3040,14 +3042,20 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         if: runner.environment == 'github-hosted'
 
+      # shell: bash = errexit + pipefail on every tee step below, so the tee (#9709) cannot mask a red cargo command.
       - name: Clippy (sal feature)
-        run: cargo clippy --features sal -- -D warnings -D clippy::all -D clippy::pedantic
+        shell: bash
+        run: |
+          mkdir -p "${RUNNER_TEMP}/red-cause"
+          cargo clippy --features sal -- -D warnings -D clippy::all -D clippy::pedantic 2>&1 | tee "${RUNNER_TEMP}/red-cause/sal-clippy.log"
 
       - name: Build release (sal feature)
-        run: cargo build --release --features sal
+        shell: bash
+        run: |
+          mkdir -p "${RUNNER_TEMP}/red-cause"
+          cargo build --release --features sal 2>&1 | tee "${RUNNER_TEMP}/red-cause/sal-build.log"
 
       - name: Run lib tests (sal feature)
-        # shell: bash = errexit + pipefail, so the tee below (#9709) cannot mask a red cargo test.
         shell: bash
         env:
           AI_MEMORY_NO_CONFIG: "1"
@@ -3056,9 +3064,10 @@ jobs:
           cargo test --features sal --lib 2>&1 | tee "${RUNNER_TEMP}/red-cause/sal-lib.log"
 
       - name: Red cause summary (#9709)
-        if: failure()
+        if: failure() || cancelled()
         continue-on-error: true
-        run: python3 -I scripts/ci/red_cause_summary.py "${RUNNER_TEMP}/red-cause"
+        timeout-minutes: 5
+        run: python3 -I scripts/ci/red_cause_summary.py --step "${RUNNER_TEMP}/red-cause/sal-clippy.log" "Clippy (sal feature)" --step "${RUNNER_TEMP}/red-cause/sal-build.log" "Build release (sal feature)" --step "${RUNNER_TEMP}/red-cause/sal-lib.log" "Run lib tests (sal feature)" "${RUNNER_TEMP}/red-cause"
 
   # v1.0.0 #2257 — vectorlite OPT-IN feature gate. The `vectorlite` cargo
   # feature (#1860/#2219; `rusqlite/load_extension` + `src/vectorlite.rs`)
@@ -3106,11 +3115,14 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         if: runner.environment == 'github-hosted'
 
+      # shell: bash = errexit + pipefail on every tee step below, so the tee (#9709) cannot mask a red cargo command.
       - name: Clippy (vectorlite feature, all targets)
-        run: cargo clippy --all-targets --features vectorlite -- -D warnings -D clippy::all -D clippy::pedantic
+        shell: bash
+        run: |
+          mkdir -p "${RUNNER_TEMP}/red-cause"
+          cargo clippy --all-targets --features vectorlite -- -D warnings -D clippy::all -D clippy::pedantic 2>&1 | tee "${RUNNER_TEMP}/red-cause/vectorlite-clippy.log"
 
       - name: Run vectorlite no-native-lib seam tests (#1860)
-        # shell: bash = errexit + pipefail, so the tee below (#9709) cannot mask a red cargo test.
         shell: bash
         env:
           AI_MEMORY_NO_CONFIG: "1"
@@ -3127,9 +3139,10 @@ jobs:
           cargo test --features vectorlite --test config_precedence 2>&1 | tee "${RUNNER_TEMP}/red-cause/config-precedence.log"
 
       - name: Red cause summary (#9709)
-        if: failure()
+        if: failure() || cancelled()
         continue-on-error: true
-        run: python3 -I scripts/ci/red_cause_summary.py "${RUNNER_TEMP}/red-cause"
+        timeout-minutes: 5
+        run: python3 -I scripts/ci/red_cause_summary.py --step "${RUNNER_TEMP}/red-cause/vectorlite-clippy.log" "Clippy (vectorlite feature, all targets)" --step "${RUNNER_TEMP}/red-cause/vectorlite-1860.log" "Run vectorlite no-native-lib seam tests (#1860)" --step "${RUNNER_TEMP}/red-cause/config-precedence.log" "Run config-precedence under vectorlite (#2256 feature-gated pin)" "${RUNNER_TEMP}/red-cause"
 
   # v0.6.5 — Dockerfile-build smoke. Runs on EVERY push to main / develop /
   # release/** AND on EVERY PR that touches code. Builds the Docker image;
