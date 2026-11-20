@@ -1,11 +1,15 @@
 # CI time facts, November 2026 (#9710)
 
 Measured on 2026-11-20 (`date -u`: Fri Nov 20 16:29:18 UTC 2026); section 2 was re-read from the stored logs at
-2026-11-20T22:21:01Z UTC (below). Measurement only: no workflow, `Cargo.toml`,
-`Cargo.lock` or `.cargo` file changed. Every number in sections 1 and 2 is printed by `scripts/ci/measure_ci_time.py`
-from a named source (the GitHub jobs API for section 1, the stored benchmark logs for section 2) at the time named in
-its section. A figure that could not be measured says "not measured" with the reason. The numbers of section 3 are
-gh GET statuses, listed with their endpoints.
+2026-11-20T22:48:42Z UTC (below). Measurement only: no workflow, `Cargo.toml`,
+`Cargo.lock` or `.cargo` file changed. Every number of section 1, and every time and count of the section 2 tables and
+of its test-count paragraph (including the `9365 filtered out` figure and the two ignored test names), is printed by
+`scripts/ci/measure_ci_time.py` from a named source (the GitHub jobs API for section 1, the stored benchmark logs for
+section 2) at the time named in its section. In section 2 the script prints the counts of the two fail-name lists (63
+in both, 131 in either) but not the names; the names were compared with the `FAIL` names of `nextest-1.log` and
+`nextest-2.log` and match. The host, tool versions, target list and probe command lines of section 2 are not script
+output. A figure the script could not measure says "not measured" with the reason, and the script exits 7 instead of 0
+when any stored log is not measured. The numbers of section 3 are gh GET statuses, listed with their endpoints.
 
 ## 1. Where the minutes of a test job go
 
@@ -48,7 +52,7 @@ Source of every number in this section: the stored logs of the benchmark lane (`
 `.local-runs/bench`: `compile.log`, `cglist.log`, `nxlist.log`, `cargotest-1.log`, `cargotest-2.log`, `nextest-1.log`,
 `nextest-2.log`, `nextest-solo1.log`, `nextest-solo.log`, `nextest-solo-j1.log`), read by
 `python3 -I scripts/ci/measure_ci_time.py --repo <owner/repo> --branch <branch> --bench-dir <dir>` at
-2026-11-20T22:21:01Z UTC. The script prints each log's write time, so the figure is tied to the file it came from. The
+2026-11-20T22:48:42Z UTC. The script prints each log's write time, so the figure is tied to the file it came from. The
 logs are on the node that ran the lane, not in the repository; rerun the command on that directory to reproduce every
 figure below. The wall-clock times (`135.7`, `786.2`, `753.4`, `263.7`, `268.7` s) and the `load1` readings the first
 version of this section carried came from a scratch timer whose output was not stored; no log holds them, the script

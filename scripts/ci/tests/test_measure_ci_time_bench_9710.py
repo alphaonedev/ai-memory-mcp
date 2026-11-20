@@ -400,8 +400,8 @@ class BenchReportTests(unittest.TestCase):
 
     def test_empty_cargo_and_list_logs_print_no_number_and_no_yes(self):
         lines, _, unmeasured = self.report({"cargotest-1.log": b"", "cargotest-2.log": b"", "cglist.log": b""})
-        text = "\n".join(lines)
-        self.assertNotIn("yes", text.replace("== failed: yes", ""))
+        text = "\n".join(lines[I_CARGO1:I_NX1])  # the two cargo logs with their reconcile lines
+        self.assertNotIn("yes", text)
         self.assertNotIn("0.0 s", text)
         self.assertNotIn(" 0 passed", text)
         self.assertEqual(unmeasured, ["cglist.log", "cargotest-1.log", "cargotest-2.log"])
@@ -423,7 +423,10 @@ class BenchReportTests(unittest.TestCase):
 
     def test_two_not_measured_logs_both_change_their_lines(self):
         lines, _, unmeasured = self.report({"cglist.log": b"", "nextest-1.log": b""})
-        self.assertEqual(lines, expected_lines(("cglist.log", "empty (0 bytes)"), ("nextest-1.log", "empty (0 bytes)")))
+        expected = expected_lines(("cglist.log", "empty (0 bytes)"), ("nextest-1.log", "empty (0 bytes)"))
+        expected[I_SAME] = ("same test count: nextest run + skipped == cargo list not measured: nextest-1.log, "
+                            "cglist.log; nextest list == nextest run not measured: nextest-1.log")
+        self.assertEqual(lines, expected)
         self.assertEqual(unmeasured, ["cglist.log", "nextest-1.log"])
 
     def test_a_cargo_log_with_a_bad_summary_clause_in_a_nextest_run_is_not_measured(self):
