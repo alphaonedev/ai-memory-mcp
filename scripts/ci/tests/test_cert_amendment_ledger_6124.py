@@ -1551,10 +1551,7 @@ class OptionBRegion(LedgerCase):
                                                           "Quoted prose!, not a record."))
 
     def test_d3_real_release_range_passes(self):
-        probe = subprocess.run(["git", "-C", str(HARNESS_ROOT), "cat-file", "-e", RELEASE_SHA + "^{commit}"],
-                               capture_output=True, timeout=GIT_TIMEOUT_S, check=False)
-        if probe.returncode != 0:
-            self.skipTest(f"release commit {RELEASE_SHA} is not in this clone")
+        require_commit(self, RELEASE_SHA, "release commit")
         self.use_real_clock()  # W-4: the real range is judged by the real calendar
         ok, out = cert.check_change(HARNESS_ROOT, RELEASE_SHA, "HEAD")
         self.assert_pass(ok, out, RELEASE_PASS)
@@ -1888,13 +1885,7 @@ class TrackedDocFrozenReason9303(LedgerCase):
 
     def test_9303_real_range_9274_refused_as_frozen_region(self):
         for sha in (CHAIN_TIP_9274, HEAD_9274_R3):
-            probe = subprocess.run(["git", "-C", str(HARNESS_ROOT), "cat-file", "-e", sha + "^{commit}"],
-                                   capture_output=True, timeout=GIT_TIMEOUT_S, check=False)
-            if probe.returncode != 0:
-                if os.environ.get(CI_ENV):
-                    self.fail(f"commit {sha} is not in this clone: the CI replay fetch must bring "
-                              f"it ({REPLAY_FETCH_FLAG})")
-                self.skipTest(f"commit {sha} is not in this clone")
+            require_commit(self, sha, "commit")
         self.use_real_clock()  # W-4: real commits, so the real clock
         ok, out = cert.check_change(HARNESS_ROOT, CHAIN_TIP_9274, HEAD_9274_R3)
         self.assert_region_refused(ok, out, RANGE_9274_FIRST_DIFF)
@@ -2095,9 +2086,22 @@ class DocRecordForm(unittest.TestCase):
         self.assertIn(PATH_RESTRICTION, text)
 
 
+def require_commit(case, sha, what):
+    """A real-range cell needs `sha` in this clone. Under CI the replay fetch must have brought
+    it, so a missing commit is a failure there (#9303, #9593); outside CI the cell skips."""
+    probe = subprocess.run(["git", "-C", str(HARNESS_ROOT), "cat-file", "-e", sha + "^{commit}"],
+                           capture_output=True, timeout=GIT_TIMEOUT_S, check=False)
+    if probe.returncode == 0:
+        return
+    if os.environ.get(CI_ENV):
+        case.fail(f"{what} {sha} is not in this clone: the CI replay fetch must bring it ({REPLAY_FETCH_FLAG})")
+    case.skipTest(f"{what} {sha} is not in this clone")
+
+
 def replay_objects():
-    """X-3: the commits the real-range cell reads; CI fetches them like the corpus replay objects."""
-    return [CHAIN_TIP_9274, HEAD_9274_R3]
+    """X-3: the commits the real-range cells read; CI fetches them like the corpus replay objects.
+    RELEASE_SHA is D-3's base (#9593: the depth-2 unit-test job no longer deepens to it)."""
+    return [CHAIN_TIP_9274, HEAD_9274_R3, RELEASE_SHA]
 
 
 # #9593 (REVIEW-9684-security-r1 F2): the unit-test step moved to a depth-2 job, so the D-3

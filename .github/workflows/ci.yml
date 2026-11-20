@@ -1169,10 +1169,11 @@ jobs:
       # `target/debug/deps` across two runners, until rust-lld died with
       # `ld terminated with signal 7 [Bus error]` on a full disk (#3453) — and
       # (b) charged the link time to the macOS full-suite job that then blew
-      # the #1492 watchdog (#3461). `line-tables-only` keeps file:line in every
-      # backtrace and panic location (the only debuginfo CI actually reads;
-      # nothing here runs a debugger) at roughly a third of the size and link
-      # cost. DECLARED HERE, in the workflow, deliberately: a runner-side
+      # the #1492 watchdog (#3461). `line-tables-only` keeps file:line in
+      # backtraces on the legs that keep it (panic locations come from the
+      # compiler, not debuginfo, and stay on every leg; nothing here runs a
+      # debugger or sets RUST_BACKTRACE) at roughly a third of the size and
+      # link cost. DECLARED HERE, in the workflow, deliberately: a runner-side
       # `.env` is per-node operator state that no repo change can preserve or
       # audit, so a re-imaged or added runner would silently regress.
       #
@@ -1188,9 +1189,11 @@ jobs:
       # debuginfo off for BOTH profiles on that one leg (the test binaries use
       # the test profile, the package library they link against the dev
       # profile; cert-postgres-age.yml and postgres-ignored.yml already do
-      # this). Every other leg has no `cargo_debug` key and keeps
-      # line-tables-only. Environment only: no Cargo.toml or .cargo change,
-      # and no release-shaped or coverage build reads this key.
+      # this), so backtraces on that leg carry no file:line. No other leg has
+      # a `cargo_debug` key: the two macOS legs keep line-tables-only, and the
+      # hosted sqlite leg sets 0 in its own low-mem step below. Environment
+      # only: no Cargo.toml or .cargo change, and no release-shaped or
+      # coverage build reads this key.
       CARGO_PROFILE_DEV_DEBUG: ${{ matrix.cargo_debug || 'line-tables-only' }}
       CARGO_PROFILE_TEST_DEBUG: ${{ matrix.cargo_debug || 'line-tables-only' }}
     strategy:

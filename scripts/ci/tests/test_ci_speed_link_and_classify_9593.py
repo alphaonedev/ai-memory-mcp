@@ -16,7 +16,7 @@ Every check is a pure function over workflow TEXT that returns the problem lines
 assert an empty list on the real files and an exact message on a deliberately broken copy.
 
 Run: python3 -m unittest discover -s scripts/ci/tests
-Python 3.9+, standard library only (the workflows are read as text).
+Python 3.12+, standard library only (the workflows are read as text).
 """
 import re
 import unittest
