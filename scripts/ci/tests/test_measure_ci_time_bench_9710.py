@@ -176,6 +176,10 @@ class BenchReportTests(unittest.TestCase):
         self.assertIn(f"nextest-1.log (written {WRITTEN}): not measured: no Summary line", lines)
         self.assertIn("same test count: nextest run + skipped == cargo list NO; nextest list == nextest run NO", lines)
 
+    def test_a_probe_log_without_a_summary_is_not_measured(self):
+        lines, _ = self.report(nextest_solo_log=SOLO[:1])
+        self.assertIn(f"nextest-solo.log (written {WRITTEN}): not measured: no Summary line", lines)
+
     def test_a_build_log_without_a_finished_line_is_not_measured(self):
         lines, _ = self.report(compile_log=["   Compiling x v1"])
         self.assertIn(f"build: compile.log (written {WRITTEN}) cargo Finished in not measured", lines)

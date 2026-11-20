@@ -1,8 +1,11 @@
 # CI time facts, November 2026 (#9710)
 
-Measured on 2026-11-20 (`date -u`: Fri Nov 20 16:29:18 UTC 2026). Measurement only: no workflow, `Cargo.toml`,
-`Cargo.lock` or `.cargo` file changed. Every figure names its command and its run or job ids. A figure that could
-not be measured says "not measured" with the error.
+Measured on 2026-11-20 (`date -u`: Fri Nov 20 16:29:18 UTC 2026); section 2 was re-read from the stored logs at
+2026-11-20T22:21:01Z UTC (below). Measurement only: no workflow, `Cargo.toml`,
+`Cargo.lock` or `.cargo` file changed. Every number in sections 1 and 2 is printed by `scripts/ci/measure_ci_time.py`
+from a named source (the GitHub jobs API for section 1, the stored benchmark logs for section 2) at the time named in
+its section. A figure that could not be measured says "not measured" with the reason. The numbers of section 3 are
+gh GET statuses, listed with their endpoints.
 
 ## 1. Where the minutes of a test job go
 
@@ -37,10 +40,21 @@ The per-run rows (job ids, head shas) are in the script's `--json-out` file; the
 
 ## 2. cargo-nextest against `cargo test`, sqlite suite, one build
 
-Host: the f1 macOS node. `uptime` before the first compile showed load1 6 to 10 (below the 30 limit);
-load1 after each run is in the table. Environment: `CARGO_TARGET_DIR=<lane dir> CARGO_PROFILE_DEV_DEBUG=0
+Host: the f1 macOS node. Environment: `CARGO_TARGET_DIR=<lane dir> CARGO_PROFILE_DEV_DEBUG=0
 CARGO_PROFILE_TEST_DEBUG=0 AI_MEMORY_NO_CONFIG=1`. cargo 1.99.1; cargo-nextest 0.9.152 (crates.io, built with
 `cargo install cargo-nextest --locked --version 0.9.152 --root <tools dir>`, outside the repository).
+
+Source of every number in this section: the stored logs of the benchmark lane (`ci-9710-time-facts`, directory
+`.local-runs/bench`: `compile.log`, `cglist.log`, `nxlist.log`, `cargotest-1.log`, `cargotest-2.log`, `nextest-1.log`,
+`nextest-2.log`, `nextest-solo1.log`, `nextest-solo.log`, `nextest-solo-j1.log`), read by
+`python3 -I scripts/ci/measure_ci_time.py --repo <owner/repo> --branch <branch> --bench-dir <dir>` at
+2026-11-20T22:21:01Z UTC. The script prints each log's write time, so the figure is tied to the file it came from. The
+logs are on the node that ran the lane, not in the repository; rerun the command on that directory to reproduce every
+figure below. The wall-clock times (`135.7`, `786.2`, `753.4`, `263.7`, `268.7` s) and the `load1` readings the first
+version of this section carried came from a scratch timer whose output was not stored; no log holds them, the script
+cannot reproduce them, and they are dropped. Their replacement is the time each tool printed into its own log: cargo's
+`Finished` line, the sum of cargo's `finished in` lines, and the nextest `Summary` time. The host load during the runs
+is "not measured: no `uptime` output was stored".
 
 Targets (same for every command): `--lib` plus `--test` for the 10 integration binaries with the longest `finished in`
 time in job 133082849450 (Check macos-fed,sqlite, ci.yml run 43787761690, ranked with
@@ -48,26 +62,34 @@ time in job 133082849450 (Check macos-fed,sqlite, ci.yml run 43787761690, ranked
 file_sink_warn_3650, l07_3_chunk_d_http_surface, federation_catchup_posture_3582, bulk_post_commit_stages_2724,
 e2_post_ship_dry_run, integration, federation_inbox_wake_3631. Never `cargo build --tests`, never a bare `cargo test`.
 
-| Step | Command (after the targets are added) | Wall | rc | load1 after | Tests |
-|---|---|---|---|---|---|
-| build (cold) | `cargo test --no-run` | 135.7 s | 0 | not recorded | n/a |
-| cargo test run 1 | `cargo test --no-fail-fast` | 786.2 s | 0 | 7.4 | 9802 passed, 0 failed, 2 ignored |
-| cargo test run 2 | `cargo test --no-fail-fast` | 753.4 s | 0 | 7.6 | 9802 passed, 0 failed, 2 ignored |
-| nextest run 1 | `cargo nextest run --no-fail-fast` | 263.7 s (nextest summary 261.5 s) | 100 | 18.1 | 9796 run: 9704 passed, 92 failed, 2 skipped |
-| nextest run 2 | `cargo nextest run --no-fail-fast` | 268.7 s | 100 | 17.0 | 9796 run: 9694 passed, 102 failed, 2 skipped |
+| Step | Command (after the targets are added) | Time the tool printed | Tests |
+|---|---|---|---|
+| build (cold) | `cargo test --no-run` | cargo `Finished` 135 s (`compile.log`, 2m 15s) | n/a |
+| cargo test run 1 | `cargo test --no-fail-fast` | sum of 11 `finished in` lines 781.3 s (`cargotest-1.log`) | top level: 9796 passed, 0 failed, 2 ignored |
+| cargo test run 2 | `cargo test --no-fail-fast` | sum of 11 `finished in` lines 752.5 s (`cargotest-2.log`) | top level: 9796 passed, 0 failed, 2 ignored |
+| nextest run 1 | `cargo nextest run --no-fail-fast` | Summary 261.5 s (`nextest-1.log`) | 9796 run: 9704 passed, 92 failed, 2 skipped |
+| nextest run 2 | `cargo nextest run --no-fail-fast` | Summary 268.2 s (`nextest-2.log`) | 9796 run: 9694 passed, 102 failed, 2 skipped |
 
-Target directory after the compile: `du -sh` 6.3G (6.2G after the runs); removed at the end.
+The sum of `finished in` lines is the test-run time inside cargo test summed over its 11 binaries; it is not the
+wall time of the command, which includes link and start-up. The wall of the command was not stored (see above), so a
+cargo test against nextest wall comparison is "not measured"; the printed times are the nearest measured figure.
 
-Test counts. `cargo test -- --list` prints 9798 `: test` lines (the per-binary `N tests` headers add up to 9797: 9366 lib plus 431), of which 2 are `#[ignore]`d:
+Test counts, reconciled by the script for both cargo test logs. `cargo test -- --list` (`cglist.log`) prints 9798
+`: test` lines, of which 2 are `#[ignore]`d:
 `audit::verify_snapshot_4332_tests::verify_in_a_loop_never_starves_audited_writes_4332` and
-`reranker::issue_1597_tests::issue_1597_neural_rerank_timing_evidence`. `cargo nextest list` shows 9796 and nextest
-reports those 2 as skipped. The `test result:` lines of the cargo test log add up to 9802 passed, 4 more than the list; the
-cause was not isolated (not measured: no per-binary reconciliation of the `test result:` lines).
+`reranker::issue_1597_tests::issue_1597_neural_rerank_timing_evidence`. The per-binary `running N tests` headers of each cargo test log sum to
+9798, the same number. Each log has 11 top-level `test result:` rows (9796 passed, 0 failed, 2 ignored) and 6 more
+`test result:` rows with `1 passed ... 9365 filtered out`: a child process that a lib test starts prints its own
+`running 1 test` block and result row into the lib test output. Counting the 6 nested rows as if they were binaries gives 9802 passed, 4
+above the list (6 nested passed minus 2 ignored = 4). The earlier "9802 passed" figure was that over-count, not 4 tests that the list
+lacks. `cargo nextest list` (`nxlist.log`) shows 9796 and nextest runs 9796 and reports 2 skipped, so nextest run plus
+skipped equals the cargo list (9798).
 
 ### Tests that fail only under nextest (process per test)
 
 Under `cargo test` 0 tests failed in both runs. Under nextest 131 distinct tests failed in at least one of two runs, 63 in
-both. Every failure message that was read names the same cause: `#3354: refusing to start a ledger-writing command as
+both (the script's `nextest fail sets over runs 1 and 2` line, from the distinct `FAIL` names of `nextest-1.log` and
+`nextest-2.log`; each log's distinct-name count equals its Summary failed count, 92 and 102). Every failure message that was read names the same cause: `#3354: refusing to start a ledger-writing command as
 host:<name>: no signing key for that id is loadable and one could not be generated (no key was loadable after the
 ensure step)`, plus the follow-on `invalid JSON response` and `status.success()` assertions. The failing set changes
 between runs (two runs only; the failing sets were compared, not repeated further). Probes on the same build, one run
@@ -75,9 +97,9 @@ of each command (n = 1):
 
 | Command | Result |
 |---|---|
-| `cargo nextest run --test integration test_link_creation` (alone) | 1 passed |
-| `cargo nextest run --test integration test_link_creation test_budget_truncates_to_fit test_boundary_confidence_one` | 0 passed, 3 failed (2.4 s) |
-| the same three tests with `-j 1` | 3 passed (3.9 s) |
+| `cargo nextest run --test integration test_link_creation` (alone; `nextest-solo1.log`) | 1 passed (Summary 2.0 s) |
+| `cargo nextest run --test integration test_link_creation test_budget_truncates_to_fit test_boundary_confidence_one` (`nextest-solo.log`) | 0 passed, 3 failed (Summary 1.7 s) |
+| the same three tests with `-j 1` (`nextest-solo-j1.log`) | 3 passed (Summary 3.4 s) |
 
 The tests pass alone and one at a time and fail when several nextest processes start together. This is consistent with
 a hypothesis, not a traced cause: concurrent first-start generation of the per-host signing key
@@ -189,18 +211,20 @@ I:test_vpromote_rejects_non_ancestor
 Repository runners: 9 self-hosted. macOS ARM64 label `macos-fed`: 5 (3 online, 2 offline). Linux X64 label
 `linux-fed`: 4, all online. (Names and labels only; no secret was read.)
 
-Owner and larger runners. The owner `alphaonedev` is a `User` account (no organization exists at that name), so the
-org hosted-runner endpoints return 404 and the larger-runner API was not reachable: "not measured: HTTP 404 on every
-`orgs/alphaonedev/actions/hosted-runners*` endpoint". the GitHub Docs
-"Billing" reference page for Actions runner rates (docs.github.com, read 2026-11-20 through a page fetch) states
-"Larger runners are only available for organizations and enterprises using the GitHub Team or GitHub Enterprise Cloud
-plans". The page shows no last-updated date, so per-minute prices are "price not read". Plan name of the account:
-not measured (`GET user` returned no `plan` field for this token).
+Owner and larger runners: none usable, the owner is a User account. Proof, from the table above:
+`users/alphaonedev` returns 200 with `type` `User`, `orgs/alphaonedev` returns 404 Not Found, and every
+`orgs/alphaonedev/actions/hosted-runners*` endpoint (`hosted-runners`, `hosted-runners/machine-sizes`,
+`hosted-runners/images/github-owned`) returns 404, so no organization exists at that name and the larger-runner API
+has nothing to answer. The GitHub Docs "Billing" reference page for Actions runner rates (docs.github.com, read
+2026-11-20 through a page fetch) states "Larger runners are only available for organizations and enterprises using the
+GitHub Team or GitHub Enterprise Cloud plans", which a User account is not. No further probe is made. Per-minute prices
+are therefore not needed and not read, and the plan name of the account is not measured (`GET user` returned no `plan`
+field for this token).
 
 ## 4. What the numbers say
 
 1. Queue wait for ci.yml Check (macos-fed,enterprise-fed) has median 1990 s (598-2433, n=8); every other measured job has a median queue of 189 s or less.
 2. ci.yml Check (ubuntu-latest,sqlite) compile has median 1952 s against 368 s for Check (macos-fed,sqlite), which runs the same sqlite leg.
 3. ci.yml Check (linux-fed,enterprise-fed) total has median 7318 s (1059-10739), against 1988 s for Check (macos-fed,sqlite) and 2624 s for Check (macos-fed,enterprise-fed).
-4. On one build, nextest took 263.7 s and 268.7 s against 786.2 s and 753.4 s for `cargo test`, and 92 and 102 tests failed under nextest against 0 under `cargo test`; 63 failed in both runs.
+4. On one build, nextest printed a Summary of 261.5 s and 268.2 s against cargo test's summed `finished in` times of 781.3 s and 752.5 s, and 92 and 102 tests failed under nextest against 0 under `cargo test`; 63 failed in both runs. The wall time of each command was not stored, so the comparison is of the times the tools printed, not of wall clocks.
 5. coverage.yml Per-Module Coverage Thresholds has median total 5164 s, of which 3924 s is the test part of the llvm-cov step.

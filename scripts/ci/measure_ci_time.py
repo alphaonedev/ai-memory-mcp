@@ -26,8 +26,14 @@ Every duration is computed from two UTC timestamps that are both present and ord
 out of every median and range. The table is followed by a footer line that counts them. A value that could not be
 measured is never printed as 0 s. Link time is inside cargo's one `Finished` compile figure and is not split out.
 
+`--bench-dir DIR` reads the stored logs of the nextest-against-cargo-test runs (compile.log, cglist.log, nxlist.log,
+cargotest-1/2.log, nextest-1/2.log, nextest-solo1.log, nextest-solo.log, nextest-solo-j1.log) and prints, with the UTC
+time it was read and each file's write time, the cargo build time, the test counts, the reconciliation of the
+`test result:` rows with the list (rows printed by a child process inside a test are counted apart as nested), the
+nextest summaries and the failed-test sets. A missing log is `not measured` with its error and exit 6.
+
 Exit codes: 0 done, 2 usage error (argparse; `--runs` outside 1..30 is one), 3 a gh call failed, 4 no green run found,
-5 the API payload had an unexpected shape (one line on stderr).
+5 the API payload had an unexpected shape (one line on stderr), 6 a stored bench log is missing.
 """
 import argparse
 import json
@@ -35,6 +41,7 @@ import re
 import statistics
 import subprocess
 import sys
+import time
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -58,6 +65,23 @@ LOG_TS_RE = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d+))?Z ")
 FINISHED_RE = re.compile(r"Finished `[^`]+` profile .* target\(s\) in (?:(\d+)m )?([\d.]+)s")
 RUNNING_RE = re.compile(r"Running (?:unittests )?(\S+)")
 RESULT_RE = re.compile(r"test result: \w+\. (\d+) passed;.* finished in ([\d.]+)s")
+STDERR_MARK = "--- stderr ---"
+HEADER_RE = re.compile(r"^running (\d+) tests?$")
+TEST_RESULT_RE = re.compile(
+    r"^test result: \w+\. (\d+) passed; (\d+) failed; (\d+) ignored; (\d+) measured; (\d+) filtered out; finished in ([\d.]+)s")
+NEXTEST_FAIL_RE = re.compile(r"^\s+FAIL \[\s*[\d.]+s\] \(\s*\d+/\d+\)\s+(.+?)\s*$")
+NEXTEST_SUMMARY_RE = re.compile(
+    r"Summary \[\s*([\d.]+)s\] (\d+) tests? run: (\d+) passed(?: \(\d+ slow\))?(?:, (\d+) failed)?(?:, (\d+) skipped)?")
+LIST_TEST_RE = re.compile(r"^\S.*: test$")
+NEXTEST_LIST_RE = re.compile(r"^ai-memory(?:::\w+)? \S+$")
+BENCH_COMPILE = "compile.log"
+BENCH_CARGO_LIST = "cglist.log"
+BENCH_NEXTEST_LIST = "nxlist.log"
+BENCH_CARGO_RUNS = ("cargotest-1.log", "cargotest-2.log")
+BENCH_NEXTEST_RUNS = ("nextest-1.log", "nextest-2.log")
+BENCH_PROBES = ("nextest-solo1.log", "nextest-solo.log", "nextest-solo-j1.log")
+BENCH_FILES = (BENCH_COMPILE, BENCH_CARGO_LIST, BENCH_NEXTEST_LIST, *BENCH_CARGO_RUNS, *BENCH_NEXTEST_RUNS, *BENCH_PROBES)
+EXIT_BENCH_MISSING = 6
 RANK_TOP = 16
 STAGES = ("queue", "setup", "compile", "test", "post", "total")
 NOT_MEASURED = "not measured"
@@ -222,6 +246,125 @@ def rank_binaries(lines):
     return sorted(rows, reverse=True)
 
 
+def clean_lines(text):
+    """Lines of a stored log with ANSI colour removed and trailing blanks stripped."""
+    return [ANSI_RE.sub("", ln).rstrip() for ln in text.splitlines()]
+
+
+def parse_cargo_results(lines):
+    """(top, nested): the `test result:` rows of a stored `cargo test` log, split by who printed them.
+
+    Only the stdout part (before the stderr marker) is read. A binary prints `running N tests` and later one result
+    row whose passed + failed + ignored + measured equals N: that row is top-level. Any other row inside that
+    window, and any header inside it, was printed by a child process of a test (nested) and is counted apart.
+    """
+    top, nested, open_count = [], [], None
+    for line in lines:
+        if line == STDERR_MARK:
+            break
+        head = HEADER_RE.match(line)
+        if head:
+            open_count = int(head.group(1)) if open_count is None else open_count
+            continue
+        res = TEST_RESULT_RE.match(line)
+        if not res:
+            continue
+        row = {"passed": int(res.group(1)), "failed": int(res.group(2)), "ignored": int(res.group(3)),
+               "measured": int(res.group(4)), "secs": float(res.group(6))}
+        if open_count is not None and row["passed"] + row["failed"] + row["ignored"] + row["measured"] == open_count:
+            row["header"] = open_count
+            top.append(row)
+            open_count = None
+        else:
+            nested.append(row)
+    return top, nested
+
+
+def parse_nextest(lines):
+    """Summary and distinct failed test names of a stored `cargo nextest run` log; summary None when absent."""
+    summary, fails = None, set()
+    for line in lines:
+        fail = NEXTEST_FAIL_RE.match(line)
+        if fail:
+            fails.add(fail.group(1))
+        done = NEXTEST_SUMMARY_RE.search(line)
+        if done:
+            summary = {"secs": float(done.group(1)), "run": int(done.group(2)), "passed": int(done.group(3)),
+                       "failed": int(done.group(4) or 0), "skipped": int(done.group(5) or 0)}
+    return summary, fails
+
+
+def count_list(lines, pattern):
+    """Number of lines of a stored `list` output that match the compiled pattern."""
+    return sum(1 for ln in lines if pattern.match(ln))
+
+
+def utc_text(epoch):
+    return datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def yes_no(flag):
+    return "yes" if flag else "NO"
+
+
+def bench_report(directory, now):
+    """(report lines, missing file names) for the stored nextest-against-cargo-test logs in one directory."""
+    missing, logs, mtimes = [], {}, {}
+    for name in BENCH_FILES:
+        path = directory / name
+        try:
+            logs[name] = clean_lines(path.read_text(encoding="utf-8", errors="replace"))
+            mtimes[name] = utc_text(path.stat().st_mtime)
+        except OSError as exc:
+            missing.append(f"{name}: {str(exc)[:120]}")
+    if missing:
+        return [], missing
+    out = [f"read at {utc_text(now)} UTC from {directory}"]
+    build = next((FINISHED_RE.search(ln) for ln in logs[BENCH_COMPILE] if FINISHED_RE.search(ln)), None)
+    build_secs = int(build.group(1) or 0) * 60 + float(build.group(2)) if build else None
+    out.append(f"build: {BENCH_COMPILE} (written {mtimes[BENCH_COMPILE]}) cargo Finished in "
+               f"{NOT_MEASURED if build_secs is None else f'{build_secs:.0f} s'}")
+    list_total = count_list(logs[BENCH_CARGO_LIST], LIST_TEST_RE)
+    nextest_list = count_list(logs[BENCH_NEXTEST_LIST], NEXTEST_LIST_RE)
+    out.append(f"list: {BENCH_CARGO_LIST} (written {mtimes[BENCH_CARGO_LIST]}) {list_total} `: test` lines; "
+               f"{BENCH_NEXTEST_LIST} (written {mtimes[BENCH_NEXTEST_LIST]}) {nextest_list} test lines")
+    for name in BENCH_CARGO_RUNS:
+        top, nested = parse_cargo_results(logs[name])
+        head = sum(r["header"] for r in top)
+        passed, ignored = sum(r["passed"] for r in top), sum(r["ignored"] for r in top)
+        nest_passed = sum(r["passed"] for r in nested)
+        out.append(f"{name} (written {mtimes[name]}): {len(top)} top-level result rows, header sum {head}, "
+                   f"{passed} passed, {sum(r['failed'] for r in top)} failed, {ignored} ignored, "
+                   f"sum of finished-in {sum(r['secs'] for r in top):.1f} s; {len(nested)} nested result rows "
+                   f"({nest_passed} passed) printed inside the lib test output; all rows {passed + nest_passed} passed")
+        out.append(f"  reconcile: header sum == list {yes_no(head == list_total)}; "
+                   f"top-level passed + ignored == list {yes_no(passed + ignored == list_total)}; "
+                   f"all rows passed - list = {passed + nest_passed - list_total}, "
+                   f"explained by nested rows ({nest_passed}) minus ignored ({ignored}) = {nest_passed - ignored}: "
+                   f"{yes_no(passed + nest_passed - list_total == nest_passed - ignored)}")
+    sets = []
+    for name in BENCH_NEXTEST_RUNS:
+        summary, fails = parse_nextest(logs[name])
+        sets.append(fails)
+        if summary is None:
+            out.append(f"{name} (written {mtimes[name]}): {NOT_MEASURED}: no Summary line")
+            continue
+        out.append(f"{name} (written {mtimes[name]}): nextest Summary {summary['secs']:.1f} s, {summary['run']} run, "
+                   f"{summary['passed']} passed, {summary['failed']} failed, {summary['skipped']} skipped; "
+                   f"{len(fails)} distinct FAIL names (== failed: {yes_no(len(fails) == summary['failed'])})")
+    out.append(f"nextest fail sets over runs 1 and 2: {len(sets[0] & sets[1])} in both, {len(sets[0] | sets[1])} in either")
+    for name in BENCH_PROBES:
+        summary, fails = parse_nextest(logs[name])
+        out.append(f"{name} (written {mtimes[name]}): " + (NOT_MEASURED + ": no Summary line" if summary is None else
+                   f"nextest Summary {summary['secs']:.1f} s, {summary['run']} run, {summary['passed']} passed, "
+                   f"{summary['failed']} failed"))
+    first = parse_nextest(logs[BENCH_NEXTEST_RUNS[0]])[0]
+    same = first is not None and first["run"] + first["skipped"] == list_total
+    out.append(f"same test count: nextest run + skipped == cargo list {yes_no(same)}; nextest list == nextest run "
+               f"{yes_no(first is not None and nextest_list == first['run'])}")
+    return out, []
+
+
 def summarize(values):
     """(median, min, max, n) over the numbers in values, None entries dropped; None when nothing is left."""
     nums = [v for v in values if v is not None]
@@ -339,7 +482,16 @@ def main(argv=None):
     parser.add_argument("--no-logs", action="store_true", help="skip the log split; compile/test stay unseparated")
     parser.add_argument("--json-out", type=Path)
     parser.add_argument("--rank-job", type=int, help="print the longest test binaries of this job id's log and exit")
+    parser.add_argument("--bench-dir", type=Path,
+                        help="read the stored cargo test and nextest logs of one directory, print their counts and exit")
     args = parser.parse_args(argv)
+    if args.bench_dir:
+        report, missing = bench_report(args.bench_dir, time.time())
+        for reason in missing:
+            print(f"{NOT_MEASURED}: {reason}", file=sys.stderr)
+        for line in report:
+            print(line)
+        return EXIT_BENCH_MISSING if missing else EXIT_OK
     args.scratch.mkdir(parents=True, exist_ok=True)
     if args.rank_job:
         lines, err = fetch_log_lines(args.repo, args.rank_job, args.scratch)
