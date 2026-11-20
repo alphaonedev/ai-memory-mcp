@@ -1,0 +1,40 @@
+name: Docs-only short-circuit (#9683)
+description: >-
+  Decides once per job whether the whole pull request (base sha to the
+  checked-out merge ref) changes only documentation no test reads, with the
+  allowlist coverage uses (rules.json cargo_skip docs_globs minus every
+  never-skip and test-read glob; scripts/ci/impact/docs_only_gate.py). The
+  decider and its rules are read from the BASE commit, so a PR never judges
+  its own diff. Output docs_only is "true" only on the decider's docs-only
+  exit; a push, merge_group or other event, a missing or malformed base sha,
+  a failed fetch, an empty, unreadable or over-bound diff, a decider absent
+  from the base and any error give "false", which runs the job in full. The
+  caller guards every later step with steps.<id>.outputs.docs_only != 'true',
+  so the job and its required context still report.
+inputs:
+  base-sha:
+    description: github.event.pull_request.base.sha (empty outside a pull request).
+    required: false
+    default: ""
+  event-name:
+    description: github.event_name.
+    required: true
+  base-ref:
+    description: github.base_ref (main, develop and release/* bases run in full).
+    required: false
+    default: ""
+outputs:
+  docs_only:
+    description: '"true" when the whole-PR diff is docs only; anything else runs the job in full.'
+    value: ${{ steps.gate.outputs.docs_only }}
+runs:
+  using: composite
+  steps:
+    - name: Decide docs-only from the whole-PR diff
+      id: gate
+      shell: bash
+      env:
+        DOCS_GATE_BASE_SHA: ${{ inputs.base-sha }}
+        DOCS_GATE_EVENT_NAME: ${{ inputs.event-name }}
+        DOCS_GATE_BASE_REF: ${{ inputs.base-ref }}
+      run: python3 -I "${GITHUB_ACTION_PATH}/../../../scripts/ci/impact/docs_only_gate.py" step

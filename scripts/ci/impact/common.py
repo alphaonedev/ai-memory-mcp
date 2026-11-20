@@ -1,4 +1,5 @@
 """Shared constants and helpers for the impact-selection scripts (#8240)."""
+import functools
 import json
 import re
 import sqlite3
@@ -57,16 +58,22 @@ create table if not exists symbol_edges (
 """
 
 
+GLOB_CACHE_SIZE = 4096
+
+
 def log(message: str) -> None:
     """Write one diagnostic line to stderr (never to a GitHub output file)."""
     print(message, file=sys.stderr)
 
 
+@functools.lru_cache(maxsize=GLOB_CACHE_SIZE)
 def glob_to_regex(glob: str) -> Pattern:
     """Translate a path glob to a full-match regex.
 
     `**/` matches zero or more directories, `**` matches anything, `*`
     matches within one path segment and `?` matches one non-slash character.
+    Cached (#9683): the globs come from rules.json, so the set is small, and a
+    100K-path diff otherwise re-translates every glob for every path.
     """
     out: List[str] = []
     i = 0
