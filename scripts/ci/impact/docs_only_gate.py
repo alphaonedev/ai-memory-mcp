@@ -20,15 +20,25 @@ Two subcommands:
         including a crash, is a full run.
 
     step
-        The composite action (.github/actions/docs-only-gate) runs this. It
-        reads DOCS_GATE_EVENT_NAME, DOCS_GATE_BASE_SHA, DOCS_GATE_BASE_REF,
-        GITHUB_WORKSPACE, GITHUB_OUTPUT and RUNNER_TEMP, and writes exactly one
-        line, docs_only=true or docs_only=false, to GITHUB_OUTPUT. It always
-        exits 0: a doubt is docs_only=false, which runs the job in full.
-        The decider that judges the diff is read from the BASE commit
-        (git cat-file blob <base>:scripts/ci/impact/<file>) into RUNNER_TEMP
-        and run with -I, so a PR cannot judge its own diff with an edited
-        decider or allowlist; a base without the decider is a full run.
+        The composite action (.github/actions/docs-only-gate) runs this, and
+        on pull_request it runs the BASE commit's copy: a first action step
+        copies the base commit's gate files (git cat-file blob
+        <base>:scripts/ci/impact/<file>) into RUNNER_TEMP, and the step that
+        runs this mode is that copy, with -I. The step reads
+        DOCS_GATE_EVENT_NAME, DOCS_GATE_BASE_SHA, DOCS_GATE_BASE_REF,
+        GITHUB_WORKSPACE, GITHUB_OUTPUT and RUNNER_TEMP, extracts the base
+        decider and rules again into its own RUNNER_TEMP directory, runs that
+        decider on the whole-PR diff, and writes exactly one line,
+        docs_only=true or docs_only=false, to GITHUB_OUTPUT. It always exits
+        0: a doubt (an error, a timeout, an exit code other than
+        EXIT_DOCS_ONLY, an unreadable diff, RUNNER_TEMP unset or not a
+        directory, an exception) is docs_only=false, which runs the job in
+        full. So the decider, its rules and the step that maps its exit code
+        to the output all come from the base commit. What still comes from
+        the PR head is the action file and the workflow YAML that call it;
+        a PR that edits either is classified by the base rules as a CI-tree
+        change, which is a full run. A base without a gate file leaves
+        docs_only empty, which is a full run too.
 
 Unreadable input: an empty or absent path, a path that is not strict UTF-8,
 holds a control or line-break character or a backslash, is absolute, ends in
@@ -45,7 +55,7 @@ import tempfile
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from impact import cargo_skip  # noqa: E402
 from impact import common  # noqa: E402
@@ -226,15 +236,18 @@ def cmd_step(_args: argparse.Namespace) -> int:
     value, notice = FALSE, "internal error"
     try:
         workspace = Path(env.get("GITHUB_WORKSPACE") or ".").resolve()
-        runner_temp = Path(env.get("RUNNER_TEMP") or str(workspace)).resolve()
-        value, notice = judge_step(workspace, runner_temp,
-                                   env.get("DOCS_GATE_EVENT_NAME", ""),
-                                   env.get("DOCS_GATE_BASE_SHA", ""),
-                                   env.get("DOCS_GATE_BASE_REF", ""))
+        temp = env.get("RUNNER_TEMP", "")
+        if not temp or not Path(temp).is_dir():
+            value, notice = FALSE, "RUNNER_TEMP unset or not a directory; full run"
+        else:
+            value, notice = judge_step(workspace, Path(temp).resolve(),
+                                       env.get("DOCS_GATE_EVENT_NAME", ""),
+                                       env.get("DOCS_GATE_BASE_SHA", ""),
+                                       env.get("DOCS_GATE_BASE_REF", ""))
     except Exception as exc:  # noqa: BLE001 - every doubt is a full run
         value, notice = FALSE, "error: %s" % exc
     print("::notice::docs-only gate (#9683): docs_only=%s; %s"
-          % (value, cargo_skip.clean_text(notice)))
+          % (common.safe_text(value), common.safe_text(cargo_skip.clean_text(notice))))
     output = env.get("GITHUB_OUTPUT", "")
     if not output:
         print("::warning::GITHUB_OUTPUT unset; docs_only stays empty, the job runs in full")
@@ -244,7 +257,7 @@ def cmd_step(_args: argparse.Namespace) -> int:
             handle.write("%s=%s\n" % (OUTPUT_KEY, value))
     except OSError as exc:
         print("::warning::cannot write GITHUB_OUTPUT (%s); the job runs in full"
-              % cargo_skip.clean_text(str(exc)))
+              % common.safe_text(cargo_skip.clean_text(str(exc))))
     return EXIT_FULL_RUN
 
 

@@ -3,14 +3,20 @@ description: >-
   Decides once per job whether the whole pull request (base sha to the
   checked-out merge ref) changes only documentation no test reads, with the
   allowlist coverage uses (rules.json cargo_skip docs_globs minus every
-  never-skip and test-read glob; scripts/ci/impact/docs_only_gate.py). The
-  decider and its rules are read from the BASE commit, so a PR never judges
-  its own diff. Output docs_only is "true" only on the decider's docs-only
-  exit; a push, merge_group or other event, a missing or malformed base sha,
-  a failed fetch, an empty, unreadable or over-bound diff, a decider absent
-  from the base and any error give "false", which runs the job in full. The
-  caller guards every later step with steps.<id>.outputs.docs_only != 'true',
-  so the job and its required context still report.
+  never-skip and test-read glob; scripts/ci/impact/docs_only_gate.py). On
+  pull_request the first step copies the BASE commit's gate files (decider,
+  rules and helpers) into RUNNER_TEMP with fixed git cat-file blob commands,
+  and the step that judges the diff and writes the output is that base copy,
+  so the Python that turns the diff into docs_only=true comes from the base
+  commit. This action file and the workflow YAML that calls it still come
+  from the PR head; a PR that edits either is a CI-tree change by the base
+  rules, which is a full run. Output docs_only is "true" only on the base
+  decider's docs-only exit; a push, merge_group or other event, a missing or
+  malformed base sha, a failed fetch, a base commit without a gate file,
+  RUNNER_TEMP unset, an empty, unreadable or over-bound diff, any other exit
+  code and any error leave it "false" or empty, which runs the job in full.
+  The caller guards every later step with steps.<id>.outputs.docs_only !=
+  'true', so the job and its required context still report.
 inputs:
   base-sha:
     description: github.event.pull_request.base.sha (empty outside a pull request).
@@ -30,11 +36,35 @@ outputs:
 runs:
   using: composite
   steps:
-    - name: Decide docs-only from the whole-PR diff
+    - name: Copy the base commit's gate files into RUNNER_TEMP
+      id: base
+      if: inputs.event-name == 'pull_request'
+      continue-on-error: true
+      shell: bash
+      env:
+        DOCS_GATE_BASE_SHA: ${{ inputs.base-sha }}
+      run: |
+        [[ "$DOCS_GATE_BASE_SHA" =~ ^[0-9a-f]{40}([0-9a-f]{24})?$ ]]
+        : "${RUNNER_TEMP:?RUNNER_TEMP is unset}"
+        git cat-file -e "${DOCS_GATE_BASE_SHA}^{commit}" || git fetch --no-tags --no-recurse-submodules --depth=1 origin "$DOCS_GATE_BASE_SHA"
+        rm -rf "$RUNNER_TEMP/docs-gate-base"
+        mkdir -p "$RUNNER_TEMP/docs-gate-base/impact"
+        git cat-file blob "$DOCS_GATE_BASE_SHA:scripts/ci/impact/__init__.py" > "$RUNNER_TEMP/docs-gate-base/impact/__init__.py"
+        git cat-file blob "$DOCS_GATE_BASE_SHA:scripts/ci/impact/common.py" > "$RUNNER_TEMP/docs-gate-base/impact/common.py"
+        git cat-file blob "$DOCS_GATE_BASE_SHA:scripts/ci/impact/cargo_skip.py" > "$RUNNER_TEMP/docs-gate-base/impact/cargo_skip.py"
+        git cat-file blob "$DOCS_GATE_BASE_SHA:scripts/ci/impact/docs_only_gate.py" > "$RUNNER_TEMP/docs-gate-base/impact/docs_only_gate.py"
+        git cat-file blob "$DOCS_GATE_BASE_SHA:scripts/ci/impact/rules.json" > "$RUNNER_TEMP/docs-gate-base/impact/rules.json"
+    - name: Decide docs-only from the whole-PR diff (the base commit's gate)
       id: gate
+      if: steps.base.outcome == 'success'
       shell: bash
       env:
         DOCS_GATE_BASE_SHA: ${{ inputs.base-sha }}
         DOCS_GATE_EVENT_NAME: ${{ inputs.event-name }}
         DOCS_GATE_BASE_REF: ${{ inputs.base-ref }}
-      run: python3 -I "${GITHUB_ACTION_PATH}/../../../scripts/ci/impact/docs_only_gate.py" step
+      run: python3 -I "$RUNNER_TEMP/docs-gate-base/impact/docs_only_gate.py" step
+    - name: Base gate files unreadable, full run
+      if: inputs.event-name == 'pull_request' && steps.base.outcome != 'success'
+      shell: bash
+      run: |
+        echo "::notice::docs-only gate (#9683): the base commit's gate files could not be read; docs_only stays empty and the job runs in full"

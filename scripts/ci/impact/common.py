@@ -153,3 +153,37 @@ def single_line(value) -> str:
     return "".join(" " if char in LINE_BREAK_CHARS
                    else "\\u%04x" % ord(char) if 0xD800 <= ord(char) <= 0xDFFF else char
                    for char in str(value))
+
+
+def safe_text(text) -> str:
+    """A value that cannot start or end a workflow command inside a notice or annotation (#9683, #9365).
+
+    The docs-only gate runs from the base commit as a closed set of files, so it cannot import the shared
+    annotation module from the PR tree; this mirrors that module's ``safe_text`` character for character
+    (a parity cell in the #9683 test module compares the two over every code point). A ``:`` followed by
+    ``:`` becomes ``\\x3a``; a ``#`` before ``#`` or ``[`` becomes ``\\x23`` and a ``[`` after ``#``
+    becomes ``\\x5b``; ``\\`` is doubled; ``%`` becomes ``\\x25``; a C0 or C1 control becomes ``\\xNN``;
+    a surrogate, U+2028 or U+2029 becomes ``\\uNNNN``.
+    """
+    text = str(text)
+    last = len(text) - 1
+    pieces = []
+    for index, char in enumerate(text):
+        code = ord(char)
+        if char == ":" and index < last and text[index + 1] == ":":
+            pieces.append("\\x3a")
+        elif char == "#" and index < last and text[index + 1] in "#[":
+            pieces.append("\\x23")
+        elif char == "[" and index > 0 and text[index - 1] == "#":
+            pieces.append("\\x5b")
+        elif char == "\\":
+            pieces.append("\\\\")
+        elif char == "%":
+            pieces.append("\\x25")
+        elif code < 0x20 or 0x7F <= code <= 0x9F:
+            pieces.append("\\x%02x" % code)
+        elif 0xD800 <= code <= 0xDFFF or code in (0x2028, 0x2029):
+            pieces.append("\\u%04x" % code)
+        else:
+            pieces.append(char)
+    return "".join(pieces)
