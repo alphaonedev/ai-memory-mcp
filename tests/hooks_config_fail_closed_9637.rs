@@ -221,7 +221,7 @@ impl Sandbox {
     }
 
     /// Plant `case`; `false` when this runner cannot observe the case (a
-    /// mode-000 file is readable by root / CAP_DAC_OVERRIDE).
+    /// mode-000 file is readable by root / `CAP_DAC_OVERRIDE`).
     fn plant(&self, case: &InvalidCase) -> bool {
         (case.plant)(&self.hooks_path());
         if case.name == "mode_000" && std::fs::read(self.hooks_path()).is_ok() {
