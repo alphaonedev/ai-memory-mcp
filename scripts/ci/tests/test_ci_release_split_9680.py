@@ -23,6 +23,7 @@ import importlib.util
 import os
 import re
 import sys
+import time
 import unittest
 from pathlib import Path
 
@@ -515,6 +516,460 @@ class CargoAudit9680(unittest.TestCase):
         self.assertIn("source build", audit_problems(source))
         wrong = dict(step, env=dict(step["env"], CARGO_AUDIT_TGZ_SHA256='"00"'))
         self.assertIn("archive sha256 pin", audit_problems(wrong))
+
+
+# ---------------------------------------------------------------------------
+# cargo-audit source invariant (#9680 r0 send-back, ruling 7fd3cd38): in every
+# job of the workflow cargo-audit comes only from `cargo install --locked` at
+# the one named pin (the base fd43a727 form, #3138), and no step downloads,
+# extracts or checksums a prebuilt cargo-audit. The scanner reads the whole
+# workflow on its own (it does not reuse workflow_text.read_steps): every job,
+# every `run:` value at any indent (literal, folded and plain multi-line
+# scalars, one-line values), shell continuation lines, and every env entry.
+# ---------------------------------------------------------------------------
+AUDIT_JOB = "mobile-cross-compile"
+CARGO_AUDIT_PIN_VAR = "CARGO_AUDIT_VERSION"
+CARGO_AUDIT_PIN = "0.22.2"
+CARGO_AUDIT_VERSION_ARG = '"${CARGO_AUDIT_VERSION}"'
+CARGO_AUDIT_INSTALL = 'cargo install cargo-audit --locked --force --version "${CARGO_AUDIT_VERSION}"'
+EXPECTED_AUDIT_INSTALL_JOBS = frozenset({AUDIT_JOB})
+
+# Text that names the audit tool or its upstream (CARGO_AUDIT_* variables too).
+AUDIT_SUBJECT_RE = re.compile(r"(?i)cargo[-_]audit|rustsec")
+RUSTSEC_RELEASE_RE = re.compile(r"(?i)rustsec/rustsec/releases")
+SHA256_DIGEST_RE = re.compile(r"\b[0-9a-fA-F]{64}\b")
+# The download, extract and checksum forms a prebuilt install takes.
+PREBUILT_FORMS = (
+    ("curl download", re.compile(r"\bcurl\b")),
+    ("wget download", re.compile(r"\bwget\b")),
+    ("gh release download", re.compile(r"\bgh\s+release\s+download\b")),
+    ("tar extract", re.compile(r"\btar\b")),
+    ("unzip extract", re.compile(r"\bunzip\b")),
+    ("checksum", re.compile(r"\b(?:sha256sum|sha512sum|shasum|b2sum)\b|\bopenssl\s+dgst\b")),
+    ("cargo binstall", re.compile(r"\bcargo[- ]binstall\b")),
+)
+INSTALLER_INPUT_RE = re.compile(
+    r"^\s*(?:-\s+)?(?:tool|tools|crate|crates|bin|bins|package|packages):\s*.*\bcargo-audit\b")
+INSTALL_RE = re.compile(r"\bcargo\s+install\b")
+AUDIT_CRATE_RE = re.compile(r"(?<![\w-])cargo-audit(?![\w-])")
+RUNS_AUDIT_RE = re.compile(r"\bcargo\s+audit\b|check_cargo_audit\.py")
+
+SCAN_JOB_RE = re.compile(r"^  ([A-Za-z0-9_-]+):\s*(?:#.*)?$")
+SCAN_KEY_RE = re.compile(r"^(?P<indent> *)(?P<dash>- +)?(?P<key>[A-Za-z0-9_.-]+):(?:[ \t]+(?P<value>.*?))?\s*$")
+SCAN_DASH_RE = re.compile(r"^(?P<indent> *)- ")
+BLOCK_HEADER_RE = re.compile(r"^(?P<style>[|>])(?:[1-9][+-]?|[+-][1-9]?)?\s*(?:#.*)?$")
+SHELL_ASSIGN_RE = re.compile(r"^\s*(?:export\s+|local\s+|readonly\s+)?([A-Za-z_][A-Za-z0-9_]*)=(\S*)")
+SHELL_VAR_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)[^}]*\}|\$([A-Za-z_][A-Za-z0-9_]*)")
+EXPAND_PASSES = 3
+
+
+def indent_of(line):
+    return len(line) - len(line.lstrip(" "))
+
+
+def scalar_value(raw):
+    """A one-line YAML value without quotes or a trailing comment."""
+    value = raw.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        inner = value[1:-1]
+        return inner.replace('\\"', '"') if value[0] == '"' else inner.replace("''", "'")
+    return re.sub(r"\s+#.*$", "", value)
+
+
+def block_text(lines, style):
+    """Body of a literal (|) or folded (>) block scalar, its indent removed."""
+    body = [l for l in lines]
+    while body and not body[-1].strip():
+        body.pop()
+    width = min((indent_of(l) for l in body if l.strip()), default=0)
+    body = [l[width:] for l in body]
+    if style == "|":
+        return "\n".join(body)
+    folded, para = [], []
+    for line in body:
+        if not line.strip():
+            folded.append(" ".join(para))
+            para = []
+        elif line.startswith((" ", "\t")):
+            if para:
+                folded.append(" ".join(para))
+                para = []
+            folded.append(line)
+        else:
+            para.append(line)
+    if para:
+        folded.append(" ".join(para))
+    return "\n".join(folded)
+
+
+def shell_lines(script):
+    """Logical shell lines: backslash continuations joined, comment lines dropped."""
+    logical, pending = [], ""
+    for line in script.split("\n"):
+        stripped = line.rstrip()
+        trailing = len(stripped) - len(stripped.rstrip("\\"))
+        if trailing % 2 == 1:
+            pending += stripped[:-1] + " "
+            continue
+        logical.append(pending + line)
+        pending = ""
+    if pending:
+        logical.append(pending)
+    return [l for l in logical if l.strip() and not l.strip().startswith("#")]
+
+
+def scan_workflow(text):
+    """Read the whole workflow: every run script, every env entry, every line's place.
+
+    Returns (scripts, envs, places, run_lines): scripts is
+    [{"job","step","script"}] with the script as shell text, envs is
+    [{"job","step","key","value"}], places maps each line index to its
+    (job, step) label, run_lines holds the indexes of every run key and body.
+    """
+    lines = text.split("\n")
+    scripts, envs, places = [], [], {}
+    in_jobs = False
+    job = step = None
+    steps_indent = item_indent = None
+    step_index = 0
+    run_lines = set()
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if line == "jobs:" or line.startswith("jobs:"):
+            in_jobs = True
+            job = step = None
+            i += 1
+            continue
+        if line and not line.startswith((" ", "#")):
+            in_jobs = False
+            job = step = None
+        job_match = SCAN_JOB_RE.match(line) if in_jobs else None
+        if job_match:
+            job, step = job_match.group(1), None
+            steps_indent = item_indent = None
+            step_index = 0
+            places[i] = (job, None)
+            i += 1
+            continue
+        dash = SCAN_DASH_RE.match(line)
+        if job and steps_indent is not None and dash:
+            if item_indent is None and indent_of(line) > steps_indent:
+                item_indent = indent_of(line)
+            if indent_of(line) == item_indent:
+                step_index += 1
+                step = "step %d" % step_index
+        if job and steps_indent is not None and line.strip() and indent_of(line) <= steps_indent \
+                and not SCAN_DASH_RE.match(line):
+            steps_indent = item_indent = None
+            step = None
+        places[i] = (job, step)
+        key = SCAN_KEY_RE.match(line)
+        if not key or line.strip().startswith("#"):
+            i += 1
+            continue
+        name, value = key.group("key"), key.group("value") or ""
+        key_col = len(key.group("indent")) + len(key.group("dash") or "")
+        if job and name == "steps" and not value:
+            steps_indent = key_col
+            step = None
+        elif job and name in ("name", "uses") and step and item_indent is not None \
+                and key_col == item_indent + 2 and step.startswith("step "):
+            step = scalar_value(value)
+            places[i] = (job, step)
+        if name in ("run", "env"):
+            j = i + 1
+            while j < len(lines) and (not lines[j].strip() or indent_of(lines[j]) > key_col):
+                j += 1
+            child = lines[i + 1:j]
+            for k in range(i + 1, j):
+                places[k] = (job, step)
+            if name == "run":
+                header = BLOCK_HEADER_RE.match(value)
+                if header:
+                    script = block_text(child, header.group("style"))
+                else:
+                    parts = [value.strip()] + [c.strip() for c in child if c.strip()]
+                    script = scalar_value(" ".join(parts))
+                scripts.append({"job": job, "step": step, "script": script})
+                run_lines.update(range(i, j))
+            elif not value:
+                width = min((indent_of(c) for c in child if c.strip()), default=0)
+                for c in child:
+                    entry = SCAN_KEY_RE.match(c)
+                    if entry and indent_of(c) == width and not entry.group("dash"):
+                        envs.append({"job": job, "step": step, "key": entry.group("key"),
+                                     "value": scalar_value(entry.group("value") or "")})
+            i = j
+            continue
+        i += 1
+    return scripts, envs, places, run_lines
+
+
+def expand(line, variables):
+    for _ in range(EXPAND_PASSES):
+        new = SHELL_VAR_RE.sub(lambda m: variables.get(m.group(1) or m.group(2), m.group(0)), line)
+        if new == line:
+            break
+        line = new
+    return line
+
+
+def label(job, step):
+    return "%s: %s" % (job or "workflow", step or "job")
+
+
+def install_problem(tokens):
+    """Why an install line is not the base form, or None."""
+    if " ".join(tokens) == CARGO_AUDIT_INSTALL:
+        return None
+    if "--locked" not in tokens:
+        return "cargo-audit install without --locked"
+    version = None
+    for n, tok in enumerate(tokens):
+        if tok in ("--version", "--vers") and n + 1 < len(tokens):
+            version = tokens[n + 1]
+        elif tok.startswith(("--version=", "--vers=")):
+            version = tok.split("=", 1)[1]
+    if version is None:
+        return "cargo-audit install without --version"
+    if version != CARGO_AUDIT_VERSION_ARG:
+        return "cargo-audit install version is not ${CARGO_AUDIT_VERSION}"
+    return "cargo-audit install is not the base form"
+
+
+def cargo_audit_source_problems(text):
+    """Every way the workflow gets cargo-audit other than the pinned source install."""
+    scripts, envs, places, run_lines = scan_workflow(text)
+    problems = []
+
+    def add(message):
+        if message not in problems:
+            problems.append(message)
+
+    global_vars = {e["key"]: e["value"] for e in envs}
+    installs = {}
+    runs = set()
+    for entry in scripts:
+        job, step = entry["job"], entry["step"]
+        variables = dict(global_vars)
+        logical = shell_lines(entry["script"])
+        for line in logical:
+            assign = SHELL_ASSIGN_RE.match(line)
+            if assign:
+                variables[assign.group(1)] = scalar_value(assign.group(2))
+        for line in logical:
+            seen = line + " " + expand(line, variables)
+            if AUDIT_SUBJECT_RE.search(seen):
+                for form, pattern in PREBUILT_FORMS:
+                    if pattern.search(line):
+                        add("%s: %s of a prebuilt cargo-audit" % (label(job, step), form))
+            if INSTALL_RE.search(line) and AUDIT_CRATE_RE.search(line):
+                installs.setdefault(job, []).append((step, line.split()))
+            elif RUNS_AUDIT_RE.search(line):
+                runs.add(job)
+    for idx, line in enumerate(text.split("\n")):
+        if line.strip().startswith("#"):
+            continue
+        job, step = places.get(idx, (None, None))
+        if RUSTSEC_RELEASE_RE.search(line):
+            add("%s: rustsec release URL of a prebuilt cargo-audit" % label(job, step))
+        if SHA256_DIGEST_RE.search(line) and AUDIT_SUBJECT_RE.search(line):
+            add("%s: sha256 pin of a prebuilt cargo-audit" % label(job, step))
+        if idx not in run_lines and INSTALLER_INPUT_RE.match(line):
+            add("%s: installer action of a prebuilt cargo-audit" % label(job, step))
+    for job in sorted(runs - set(installs)):
+        add("%s: runs cargo-audit with no cargo install of it" % job)
+    for job, found in installs.items():
+        if len(found) > 1:
+            add("%s: installs cargo-audit %d times, not once" % (job, len(found)))
+        if job not in runs:
+            add("%s: installs cargo-audit and never runs it" % job)
+        for step, tokens in found:
+            why = install_problem(tokens)
+            if why:
+                add("%s: %s" % (label(job, step), why))
+            pins = [e["value"] for e in envs
+                    if e["job"] == job and e["step"] == step and e["key"] == CARGO_AUDIT_PIN_VAR]
+            if not pins:
+                add("%s: no %s pin on the install step" % (label(job, step), CARGO_AUDIT_PIN_VAR))
+    for e in envs:
+        if e["key"] == CARGO_AUDIT_PIN_VAR and e["value"] != CARGO_AUDIT_PIN:
+            add("%s: %s is %r, not %r" % (label(e["job"], e["step"]), CARGO_AUDIT_PIN_VAR,
+                                          e["value"], CARGO_AUDIT_PIN))
+    return problems
+
+
+def cargo_audit_install_jobs(text):
+    scripts = scan_workflow(text)[0]
+    return {s["job"] for s in scripts
+            for line in shell_lines(s["script"])
+            if INSTALL_RE.search(line) and AUDIT_CRATE_RE.search(line)}
+
+
+AUDIT_FIXTURE = """name: CI
+on: [push]
+env:
+  TOP_LEVEL: "x"
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@0000000000000000000000000000000000000000 # v4
+      - name: Lint
+        run: cargo fmt --all --check
+  mobile-cross-compile:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Security audit
+        if: matrix.once
+        env:
+          CARGO_AUDIT_VERSION: "0.22.2"
+        run: |
+          if ! command -v cargo-audit >/dev/null 2>&1 \\
+             || ! cargo audit --version 2>/dev/null | grep -Fqw -- "${CARGO_AUDIT_VERSION}"; then
+            cargo install cargo-audit --locked --force --version "${CARGO_AUDIT_VERSION}"
+          fi
+          #INJECT
+          python3 scripts/ci/check_cargo_audit.py
+"""
+FIXTURE_INSTALL = '            cargo install cargo-audit --locked --force --version "${CARGO_AUDIT_VERSION}"\n'
+FIXTURE_PIN = '          CARGO_AUDIT_VERSION: "0.22.2"\n'
+FIXTURE_LINT_STEP = "      - name: Lint\n        run: cargo fmt --all --check\n"
+INJECT = "          #INJECT\n"
+DIGEST = "7f" * 32
+AUDIT_STEP = AUDIT_JOB + ": Security audit"
+
+
+def inject(body):
+    return AUDIT_FIXTURE.replace(INJECT, "".join("          %s\n" % l for l in body.split("\n")))
+
+
+def lint_step(step):
+    return AUDIT_FIXTURE.replace(FIXTURE_LINT_STEP, FIXTURE_LINT_STEP + step)
+
+
+# (row, workflow text, exact problems). Every download form, in every scalar shape.
+AUDIT_SOURCE_ROWS = (
+    ("base form", AUDIT_FIXTURE, []),
+    ("curl", inject('curl -fsSL -o ca.tgz "https://example.invalid/cargo-audit.tgz"'),
+     [AUDIT_STEP + ": curl download of a prebuilt cargo-audit"]),
+    ("wget", inject("wget -q https://example.invalid/cargo-audit-v0.22.2.tgz"),
+     [AUDIT_STEP + ": wget download of a prebuilt cargo-audit"]),
+    ("gh release download", inject("gh release download cargo-audit/v0.22.2 --repo rustsec/rustsec"),
+     [AUDIT_STEP + ": gh release download of a prebuilt cargo-audit"]),
+    ("tar through a shell variable",
+     inject('asset="cargo-audit-x86_64-unknown-linux-musl"\ntar -xzf "${asset}.tgz" -C bin'),
+     [AUDIT_STEP + ": tar extract of a prebuilt cargo-audit"]),
+    ("tar through an env value",
+     AUDIT_FIXTURE.replace(FIXTURE_PIN, FIXTURE_PIN + '          ARCHIVE: "ca-musl.tgz"\n'
+                           '          MEMBER: "cargo-audit"\n').replace(
+         INJECT, '          tar -xzf "${ARCHIVE}" "${MEMBER}"\n'),
+     [AUDIT_STEP + ": tar extract of a prebuilt cargo-audit"]),
+    ("unzip", inject("unzip -o cargo-audit.zip"),
+     [AUDIT_STEP + ": unzip extract of a prebuilt cargo-audit"]),
+    ("sha256sum", inject('echo "${SUM}  cargo-audit" | sha256sum -c -'),
+     [AUDIT_STEP + ": checksum of a prebuilt cargo-audit"]),
+    ("shasum", inject("shasum -a 256 -c cargo-audit.sha256"),
+     [AUDIT_STEP + ": checksum of a prebuilt cargo-audit"]),
+    ("cargo binstall", inject("cargo binstall --no-confirm cargo-audit"),
+     [AUDIT_STEP + ": cargo binstall of a prebuilt cargo-audit"]),
+    ("rustsec release URL in env",
+     AUDIT_FIXTURE.replace(FIXTURE_PIN, FIXTURE_PIN +
+                           '          CA_URL: "https://github.com/rustsec/rustsec/releases/download/x"\n'),
+     [AUDIT_STEP + ": rustsec release URL of a prebuilt cargo-audit"]),
+    ("sha256 pin in env",
+     AUDIT_FIXTURE.replace(FIXTURE_PIN, FIXTURE_PIN + '          CARGO_AUDIT_TGZ_SHA256: "%s"\n' % DIGEST),
+     [AUDIT_STEP + ": sha256 pin of a prebuilt cargo-audit"]),
+    ("installer action",
+     lint_step("      - uses: taiki-e/install-action@0000000000000000000000000000000000000000\n"
+               "        with:\n          tool: cargo-audit\n"),
+     ["lint: taiki-e/install-action@0000000000000000000000000000000000000000: "
+      "installer action of a prebuilt cargo-audit"]),
+    ("folded scalar in another job",
+     lint_step("      - name: Fetch\n        run: >\n          curl -fsSL -o ca.tgz\n"
+               "          https://example.invalid/cargo-audit.tgz\n"),
+     ["lint: Fetch: curl download of a prebuilt cargo-audit"]),
+    ("folded strip scalar",
+     lint_step("      - name: Fetch\n        run: >-\n          wget\n          cargo-audit.tgz\n"),
+     ["lint: Fetch: wget download of a prebuilt cargo-audit"]),
+    ("continuation lines",
+     inject("curl -fsSL \\\n  -o ca.tgz \\\n  https://example.invalid/cargo-audit.tgz"),
+     [AUDIT_STEP + ": curl download of a prebuilt cargo-audit"]),
+    ("one-line run",
+     lint_step("      - name: Fetch\n        run: wget https://example.invalid/cargo-audit.tgz\n"),
+     ["lint: Fetch: wget download of a prebuilt cargo-audit"]),
+    ("plain multi-line run",
+     lint_step("      - name: Fetch\n        run: curl -fsSL -o ca.tgz\n"
+               "          https://example.invalid/cargo-audit.tgz\n"),
+     ["lint: Fetch: curl download of a prebuilt cargo-audit"]),
+    ("dash run step",
+     lint_step("      - run: curl -fsSL https://example.invalid/cargo-audit.tgz\n"),
+     ["lint: step 3: curl download of a prebuilt cargo-audit"]),
+    ("install without --locked",
+     AUDIT_FIXTURE.replace(" --locked --force", " --force"),
+     [AUDIT_STEP + ": cargo-audit install without --locked"]),
+    ("install at another version",
+     AUDIT_FIXTURE.replace('--version "${CARGO_AUDIT_VERSION}"\n', "--version 0.22.3\n"),
+     [AUDIT_STEP + ": cargo-audit install version is not ${CARGO_AUDIT_VERSION}"]),
+    ("install with no version",
+     AUDIT_FIXTURE.replace(' --version "${CARGO_AUDIT_VERSION}"\n', "\n"),
+     [AUDIT_STEP + ": cargo-audit install without --version"]),
+    ("install from git",
+     AUDIT_FIXTURE.replace("cargo install cargo-audit --locked",
+                           "cargo install --git https://example.invalid/rustsec cargo-audit --locked"),
+     [AUDIT_STEP + ": cargo-audit install is not the base form"]),
+    ("install removed", AUDIT_FIXTURE.replace(FIXTURE_INSTALL, ""),
+     [AUDIT_JOB + ": runs cargo-audit with no cargo install of it"]),
+    ("install doubled", AUDIT_FIXTURE.replace(FIXTURE_INSTALL, FIXTURE_INSTALL * 2),
+     [AUDIT_JOB + ": installs cargo-audit 2 times, not once"]),
+    ("install in a job that never runs it",
+     lint_step('      - name: Tools\n        run: cargo install cargo-audit --locked --force'
+               ' --version "${CARGO_AUDIT_VERSION}"\n'),
+     ["lint: installs cargo-audit and never runs it",
+      "lint: Tools: no CARGO_AUDIT_VERSION pin on the install step"]),
+    ("pin changed", AUDIT_FIXTURE.replace(FIXTURE_PIN, '          CARGO_AUDIT_VERSION: "0.22.3"\n'),
+     [AUDIT_STEP + ": CARGO_AUDIT_VERSION is '0.22.3', not '0.22.2'"]),
+    ("pin removed", AUDIT_FIXTURE.replace(FIXTURE_PIN, '          OTHER: "1"\n'),
+     [AUDIT_STEP + ": no CARGO_AUDIT_VERSION pin on the install step"]),
+)
+# Input-size bound for the scanner: a 100K+ line run body scans in linear time.
+SCAN_BOUND_LINES = 120_000
+SCAN_BOUND_SECONDS = 10.0
+
+
+class CargoAuditSource9680(unittest.TestCase):
+    """cargo-audit comes only from the pinned `cargo install --locked`; no prebuilt."""
+
+    def test_workflow_gets_cargo_audit_only_from_the_pinned_source_install(self):
+        self.assertEqual(cargo_audit_source_problems(CI_YML.read_text(encoding="utf-8")), [])
+
+    def test_only_the_audit_job_installs_cargo_audit(self):
+        self.assertEqual(cargo_audit_install_jobs(CI_YML.read_text(encoding="utf-8")),
+                         EXPECTED_AUDIT_INSTALL_JOBS)
+
+    def test_the_audit_step_installs_the_base_form(self):
+        wf = Workflow(CI_YML)
+        step = wf.step(AUDIT_JOB, SECURITY_AUDIT)
+        self.assertIsNotNone(step)
+        self.assertEqual(unquote(step["env"].get(CARGO_AUDIT_PIN_VAR)), CARGO_AUDIT_PIN)
+        installs = [" ".join(l.split()) for l in shell_lines(step["run"] or "")
+                    if INSTALL_RE.search(l)]
+        self.assertEqual(installs, [CARGO_AUDIT_INSTALL])
+
+    def test_rows(self):
+        for row, text, want in AUDIT_SOURCE_ROWS:
+            with self.subTest(row=row):
+                self.assertEqual(sorted(cargo_audit_source_problems(text)), sorted(want))
+
+    def test_scan_is_linear_in_input_size(self):
+        filler = "".join("          echo line %d\n" % n for n in range(SCAN_BOUND_LINES))
+        text = AUDIT_FIXTURE.replace(INJECT, filler + "          curl https://example.invalid/cargo-audit\n")
+        started = time.monotonic()
+        problems = cargo_audit_source_problems(text)
+        elapsed = time.monotonic() - started
+        self.assertEqual(problems, [AUDIT_STEP + ": curl download of a prebuilt cargo-audit"])
+        self.assertLess(elapsed, SCAN_BOUND_SECONDS)
 
 
 class Aggregator9680(unittest.TestCase):
