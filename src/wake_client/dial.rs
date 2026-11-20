@@ -39,6 +39,10 @@ type PeerCredReader = fn(RawFd) -> io::Result<PeerCred>;
 
 /// Dial the hub socket at `path` as the current effective user.
 ///
+/// The connected peer is accepted only when its kernel-attested uid is the
+/// caller's own (no exemption for uid 0) and only when the credential could
+/// be read at all; every other case is a named refusal and no byte is sent.
+///
 /// # Errors
 ///
 /// The preflight refusal (owner, mode, directory, symlink, not a socket), the
@@ -50,14 +54,12 @@ pub async fn dial_hub_socket(path: &Path) -> Result<UnixStream> {
 /// The dial: preflight, connect, then the peer check on the connected
 /// descriptor with the credential `read_cred` returns.
 async fn dial_checked(path: &Path, euid: u32, read_cred: PeerCredReader) -> Result<UnixStream> {
-    // RED (#9638 seam): stubbed to today's behaviour, the injected reader is
-    // not consulted yet.
-    let _ = read_cred;
     assert_socket_is_owned_by(path, euid)?;
     let stream = UnixStream::connect(path)
         .await
         .with_context(|| format!("connecting to {}", path.display()))?;
-    check_peer(path, euid, read_peer_cred(stream.as_raw_fd()))?;
+    // On refusal `stream` is dropped here, before the caller can write.
+    check_peer(path, euid, read_cred(stream.as_raw_fd()))?;
     Ok(stream)
 }
 
@@ -65,8 +67,13 @@ async fn dial_checked(path: &Path, euid: u32, read_cred: PeerCredReader) -> Resu
 /// uid is the caller's own. There is no exemption for uid 0: a root peer is
 /// accepted only when the caller is root itself.
 fn check_peer(path: &Path, euid: u32, cred: io::Result<PeerCred>) -> Result<()> {
-    let peer =
-        cred.with_context(|| format!("reading the peer credentials of {}", path.display()))?;
+    let peer = cred.with_context(|| {
+        format!(
+            "could not read the peer credentials of {}; refusing to send a frame to a peer \
+             whose uid is unknown",
+            path.display()
+        )
+    })?;
     if peer.uid != euid {
         bail!(
             "the peer of {} is uid {}, not the caller (uid {euid}); the socket was replaced \

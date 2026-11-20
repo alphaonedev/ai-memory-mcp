@@ -99,7 +99,7 @@
     "path": "src/wake_client/dial.rs",
     "role": "Client bundle/session/signal boundary; decode hints and request a read, never write memory.",
     "mode": "rust-production-tokens",
-    "sha256": "587fd9c8dd2210d333452c1447461df0216563bc033078d1d0846ac6a0b23f00"
+    "sha256": "c581087cb6c07170e9ffcbc3e045a383e4db261f5381847662734a051e15ca5c"
   },
   {
     "path": "src/wake_client/mod.rs",
