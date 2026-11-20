@@ -28,6 +28,11 @@ OUTCOMES = {'ok': 'ok', 'FAILED': 'failed', 'ignored': 'ignored'}
 
 RUNNING_RE = re.compile(r'^\s*Running \S+ \((?:\S*/)?deps/([A-Za-z0-9_]+)-[0-9a-f]+(?:\.exe)?\)\s*$')
 TEST_RE = re.compile(r'^test (\S+) \.\.\. (ok|FAILED|ignored)\b')
+# A test that spawns a child process: the child's stderr follows "test X ... "
+# on the same line and the outcome arrives alone on a later line (in-binary
+# --test-threads=1, so at most one test is open at a time).
+OPEN_RE = re.compile(r'^test (\S+) \.\.\. ')
+LONE_OUTCOME_RE = re.compile(r'^(ok|FAILED|ignored)(?:, .*)?$')
 RESULT_RE = re.compile(r'^test result: (?:ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored;')
 
 
@@ -45,13 +50,22 @@ class Segment:
 def segments(text: str) -> list[Segment]:
     """Every ``Running`` segment of ``text``, in order (one linear pass)."""
     out: list[Segment] = []
+    open_test: str | None = None
     for line in text.splitlines():
         if (m := RUNNING_RE.match(line)):
             out.append(Segment(m.group(1)))
+            open_test = None
         elif out and (m := TEST_RE.match(line)):
             out[-1].tests[m.group(1)] = m.group(2)
+            open_test = None
+        elif out and (m := OPEN_RE.match(line)):
+            open_test = m.group(1)
+        elif out and open_test is not None and (m := LONE_OUTCOME_RE.match(line)):
+            out[-1].tests[open_test] = m.group(1)
+            open_test = None
         elif out and out[-1].totals is None and (m := RESULT_RE.match(line)):
             out[-1].totals = (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+            open_test = None
     return out
 
 
