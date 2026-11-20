@@ -105,6 +105,7 @@ WRAPPER_LINE_PREFIX = '# [pg_isolated_binary]'
 HERE = Path(os.path.realpath(__file__)).parent
 WRAPPER = HERE.parent / 'test' / 'pg_isolated_binary.py'
 PARITY = HERE / 'pg_isolate_parity.py'
+SECRET_REDACT = HERE / 'secret_redact.py'
 
 EVIDENCE_RE = re.compile(r'^# \[pg_isolated_binary\] current_database=([A-Za-z0-9_<>]{1,63}) mode=(isolated|residual)$')
 TARGET_RE = re.compile(r'^--test ([A-Za-z0-9_]{1,128})$')
@@ -113,7 +114,6 @@ DIGITS_RE = re.compile(r'^[1-9][0-9]{0,8}$')
 T0_RE = re.compile(r'^[1-9][0-9]{0,11}$')
 ENV_LINE_RE = re.compile(r'AI_MEMORY_TEST_PG_RUN_ID=[a-z0-9]{1,63}|AI_MEMORY_TEST_PG_TEMPLATE=[a-z0-9_]{1,63}')
 RUN_FILE_RE = re.compile(r'AI_MEMORY_TEST_PG_RUN_ID=([a-z0-9]{1,63})\n?')
-URL_RE = re.compile(r'[A-Za-z][A-Za-z0-9+.-]{0,30}://\S*')
 # SE: any skip word (skip, skips, skipped, skipping; any case, colon or not) is a skip print.
 SKIP_RE = re.compile(r'\bskip(?:s|ping|ped)?\b', re.IGNORECASE)
 LIBTEST_IGNORED = 'ignored'
@@ -139,7 +139,8 @@ class StepFail(Exception):
 
 
 def redact(text: str) -> str:
-    return URL_RE.sub(REDACTED, text)
+    """``text`` through the one redaction funnel (#9750): URL, keyword, environment and quoted forms."""
+    return _SECRET.redact(text, REDACTED)
 
 
 def say(line: str) -> None:
@@ -159,6 +160,9 @@ def _load(name: str, path: Path):
     return module
 
 
+# The redaction funnel, by its real path at import: a missing or broken funnel stops the step before it
+# prints anything (fail closed, #9750).
+_SECRET = _load('pg_secret_redact', SECRET_REDACT)
 _MODULES: dict = {}
 
 

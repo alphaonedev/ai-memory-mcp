@@ -112,6 +112,35 @@ except (Exception, SystemExit) as exc:  # any failed load: one fixed line built 
           file=sys.stderr if WA_ERROR_TO_STDERR else sys.stdout, flush=True)
     sys.exit(WA_EXIT_LOAD_REFUSED)
 
+SECRET_REDACT_RELATIVE_PATH = '../ci/secret_redact.py'
+REDACTED_URL = '<redacted-url>'
+
+
+def _load_secret_redact():
+    """The redaction funnel (#9750) by its real path from this file, never through sys.path."""
+    import importlib.util
+    path = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), SECRET_REDACT_RELATIVE_PATH))
+    spec = importlib.util.spec_from_file_location('pg_secret_redact', path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    if not callable(getattr(module, 'redact', None)):
+        raise AttributeError('secret_redact.py lacks redact')
+    return module
+
+
+try:
+    _SECRET = _load_secret_redact()
+except (Exception, SystemExit):  # no funnel, no output that could carry a credential: refuse before any child
+    print(wa.log_line('pg_isolated_binary: refused: redaction funnel ci/secret_redact.py cannot be loaded'),
+          file=sys.stderr, flush=True)
+    sys.exit(WA_EXIT_LOAD_REFUSED)
+
+
+def redact(text: str) -> str:
+    """``text`` with every URL, keyword and environment credential form replaced (#9750)."""
+    return _SECRET.redact(text, REDACTED_URL)
+
+
 URL_VAR = 'AI_MEMORY_TEST_POSTGRES_URL'
 AGE_URL_VAR = 'AI_MEMORY_TEST_AGE_URL'
 FLAG_VAR = 'AI_MEMORY_TEST_PG_ISOLATE'
@@ -217,7 +246,7 @@ def _emit(line: str) -> None:
 def log(msg: str) -> None:
     """Diagnostics go to stderr so ``--emit-env`` stdout stays clean."""
     with _PRINT_LOCK:
-        print(wa.log_line('[pg_isolated_binary] ' + msg), file=sys.stderr, flush=True)
+        print(wa.log_line('[pg_isolated_binary] ' + redact(msg)), file=sys.stderr, flush=True)
 
 
 # --- names and URLs -------------------------------------------------------
@@ -1139,7 +1168,7 @@ def _stderr_note(text: str) -> None:
     """Best-effort stderr line (``text`` without its newline, through ``log_line``, #9365): a closed stderr
     must not stop the signal loop (#7915)."""
     try:
-        sys.stderr.write(wa.log_line(text) + "\n")
+        sys.stderr.write(wa.log_line(redact(text)) + "\n")
     except (OSError, ValueError):
         return
 
@@ -1204,11 +1233,11 @@ class Runner:
             results = [ln for ln in _tail(log_path, 10_000) if 'test result:' in ln]
             _out(wa.log_line('[pg_isolated_binary] PASS %s (log %s)' % (label, log_path)))
             for line in results:
-                _out(wa.log_line('  ' + line))
+                _out(wa.log_line('  ' + redact(line)))
             return
         _out(wa.annotation('group', 'FAIL %s (exit %d), last %d lines of %s' % (label, rc, LOG_TAIL_LINES, log_path)))
         for line in _tail(log_path, LOG_TAIL_LINES):
-            _out(wa.log_line(line))
+            _out(wa.log_line(redact(line)))
         _out(wa.end_group_line())
 
     def _wait_bounded(self, child: 'subprocess.Popen[str]', minted: Optional[str], label: str) -> int:
@@ -1435,7 +1464,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             return 0
         return _cmd_run(args, url)
     except WrapperError as exc:
-        print(wa.log_line('pg_isolated_binary: %s' % exc), file=sys.stderr)
+        print(wa.log_line('pg_isolated_binary: %s' % redact(str(exc))), file=sys.stderr)
         return EXIT_USAGE
 
 

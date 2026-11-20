@@ -507,7 +507,8 @@ FAKE_CARGO = "#!%s -I\nimport json, sys\nwith open(%r, 'a') as log:\n    log.wri
 MARGIN_GATE_SCRIPTS = ("scripts/ci/suite_budget.py", "scripts/ci/workflow_annotation.py")
 # #9592: the step reads the kill switch through scripts/ci/pg_isolate_serial_step.py, which fails closed
 # when CI_PG_ISOLATE_OFF is absent; the step env always carries it (ci.yml `CI_PG_ISOLATE_OFF: ${{ vars... }}`).
-STEP_HELPER_SCRIPTS = MARGIN_GATE_SCRIPTS + ("scripts/ci/pg_isolate_serial_step.py",)
+# #9750: the serial step loads its redaction funnel by path at import and refuses without it.
+STEP_HELPER_SCRIPTS = MARGIN_GATE_SCRIPTS + ("scripts/ci/pg_isolate_serial_step.py", "scripts/ci/secret_redact.py")
 STEP_ENV_DROP = ("TEST_IMPACT", "TEST_IMPACT_REASON", "TEST_IMPACT_COUNT", "TEST_IMPACT_TOTAL",
                  "DOCS_ONLY", "TIER", "CI_NODE", "JOB_T0", "HOST_SEMAPHORE_HELD",
                  "CI_PG_ISOLATE_OFF", "AI_MEMORY_TEST_PG_ISOLATE", "TEST_RESULT_LOG")

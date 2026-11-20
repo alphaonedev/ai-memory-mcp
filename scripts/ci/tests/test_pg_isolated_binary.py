@@ -30,6 +30,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[3]
 SCRIPT = REPO / 'scripts' / 'test' / 'pg_isolated_binary.py'
 SHARED_MODULE = REPO / 'scripts' / 'ci' / 'workflow_annotation.py'
+SECRET_FUNNEL = REPO / 'scripts' / 'ci' / 'secret_redact.py'
 SPEC = importlib.util.spec_from_file_location('pg_isolated_binary', SCRIPT)
 pib = importlib.util.module_from_spec(SPEC)
 sys.modules['pg_isolated_binary'] = pib
@@ -1471,10 +1472,12 @@ class TemplateOwnership(unittest.TestCase):
         folder = scratch_dir()
         self.addCleanup(shutil.rmtree, folder, True)
         # the copy sits in <folder>/test with the real shared module at <folder>/ci, the layout the script's
-        # eager by-path load needs (#9365: a copy without it ends in the fixed load refusal, exit 4)
+        # eager by-path load needs (#9365: a copy without it ends in the fixed load refusal, exit 4), and the
+        # redaction funnel next to it (#9750: a copy without it is the same refusal)
         (Path(folder) / 'test').mkdir()
         (Path(folder) / 'ci').mkdir()
         shutil.copyfile(str(SHARED_MODULE), str(Path(folder) / 'ci' / 'workflow_annotation.py'))
+        shutil.copyfile(str(SECRET_FUNNEL), str(Path(folder) / 'ci' / 'secret_redact.py'))
         path = Path(folder) / 'test' / 'pib_copy.py'
         path.write_text(source, encoding='utf-8')
         name = 'pib_copy_' + uuid.uuid4().hex

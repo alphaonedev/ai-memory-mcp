@@ -19,9 +19,12 @@ Run: python3 -m unittest discover -s scripts/ci/tests -p test_secret_redact_9750
 import contextlib
 import importlib.util
 import io
+import os
 import subprocess
+import sys
 import time
 import unittest
+import unittest.mock as mock
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -31,6 +34,7 @@ STEP = CI / "pg_isolate_serial_step.py"
 PREFLIGHT = CI / "pg_env_preflight.py"
 WRAPPER = REPO / "scripts" / "test" / "pg_isolated_binary.py"
 FUNNEL = CI / "secret_redact.py"
+SCRATCH = REPO / ".local-runs" / "secret-redact-9750"
 FAKE = "fakepw9750"
 BIG_LINES = 100_000
 BIG_CHARS = 100_000
@@ -79,27 +83,53 @@ def wrapper_stderr(call, *args):
     return buf.getvalue()
 
 
+def wrapper_stdout(call, *args):
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        call(*args)
+    return buf.getvalue()
+
+
 class EveryFormEverySink(unittest.TestCase):
     def test_serial_step_redact(self):
         for label, raw, expected in FORMS:
-            self.assertEqual(STEP_MOD.redact(raw), expected.format(u=URL), label)
+            self.assertEqual(STEP_MOD.redact(raw), expected.replace("{u}", URL), label)
 
     def test_preflight_detail(self):
         for label, raw, expected in FORMS:
             proc = subprocess.CompletedProcess(["psql"], 2, stdout="", stderr=raw + "\nsecond line\n")
-            self.assertEqual(PREFLIGHT_MOD._detail(proc), expected.format(u=VAL), label)
+            self.assertEqual(PREFLIGHT_MOD._detail(proc), expected.replace("{u}", VAL), label)
 
     def test_wrapper_log(self):
         wa = WRAPPER_MOD.wa
         for label, raw, expected in FORMS:
             got = wrapper_stderr(WRAPPER_MOD.log, raw)
-            self.assertEqual(got, wa.log_line("[pg_isolated_binary] " + expected.format(u=URL)) + "\n", label)
+            self.assertEqual(got, wa.log_line("[pg_isolated_binary] " + expected.replace("{u}", URL)) + "\n", label)
 
     def test_wrapper_stderr_note(self):
         wa = WRAPPER_MOD.wa
         for label, raw, expected in FORMS:
             got = wrapper_stderr(WRAPPER_MOD._stderr_note, raw)
-            self.assertEqual(got, wa.log_line(expected.format(u=URL)) + "\n", label)
+            self.assertEqual(got, wa.log_line(expected.replace("{u}", URL)) + "\n", label)
+
+    def test_wrapper_fail_tail_and_pass_result_lines(self):
+        wa = WRAPPER_MOD.wa
+        SCRATCH.mkdir(parents=True, exist_ok=True)
+        log_path = SCRATCH / "bin.log"
+        for label, raw, expected in FORMS:
+            log_path.write_text("test result: " + raw + "\n", encoding="utf-8")
+            fail = wrapper_stdout(WRAPPER_MOD.Runner._report, None, "bin", 1, log_path).splitlines()
+            self.assertEqual(fail[1], wa.log_line("test result: " + expected.replace("{u}", URL)), label)
+            ok = wrapper_stdout(WRAPPER_MOD.Runner._report, None, "bin", 0, log_path).splitlines()
+            self.assertEqual(ok[1], wa.log_line("  test result: " + expected.replace("{u}", URL)), label)
+
+    def test_wrapper_main_error_line(self):
+        wa = WRAPPER_MOD.wa
+        for label, raw, expected in FORMS:
+            with mock.patch.dict(os.environ, {WRAPPER_MOD.URL_VAR: "postgresql://u:%s@db.invalid/x" % FAKE}), \
+                    mock.patch.object(WRAPPER_MOD, "setup", side_effect=WRAPPER_MOD.WrapperError(raw)):
+                got = wrapper_stderr(WRAPPER_MOD.main, ["setup", "--db", "ai_memory_x"])
+            self.assertEqual(got, wa.log_line("pg_isolated_binary: " + expected.replace("{u}", URL)) + "\n", label)
 
     def test_no_sink_keeps_the_fake_secret(self):
         for label, raw, _ in FORMS:
@@ -108,6 +138,53 @@ class EveryFormEverySink(unittest.TestCase):
                     wrapper_stderr(WRAPPER_MOD._stderr_note, raw))
             for out in outs:
                 self.assertNotIn(FAKE, out, label)
+
+
+class FunnelMissingFailsClosed(unittest.TestCase):
+    """Without the funnel no sink prints raw text: the preflight withholds the detail, the wrapper and the
+    serial step refuse at import."""
+
+    def copy_tree(self, with_funnel):
+        root = SCRATCH / ("tree-funnel" if with_funnel else "tree-nofunnel")
+        for sub in ("ci", "test"):
+            (root / sub).mkdir(parents=True, exist_ok=True)
+        (root / "ci" / "workflow_annotation.py").write_bytes((CI / "workflow_annotation.py").read_bytes())
+        (root / "test" / WRAPPER.name).write_bytes(WRAPPER.read_bytes())
+        (root / "ci" / STEP.name).write_bytes(STEP.read_bytes())
+        funnel = root / "ci" / FUNNEL.name
+        if with_funnel:
+            funnel.write_bytes(FUNNEL.read_bytes())
+        elif funnel.exists():
+            funnel.unlink()
+        return root
+
+    def test_preflight_withholds_the_detail(self):
+        proc = subprocess.CompletedProcess(["psql"], 2, stdout="", stderr="password=%s\n" % FAKE)
+        with mock.patch.object(PREFLIGHT_MOD, "_SECRET", [None]):
+            self.assertEqual(PREFLIGHT_MOD._detail(proc), "<detail withheld: redaction funnel unavailable>")
+
+    def test_wrapper_refuses_without_the_funnel(self):
+        root = self.copy_tree(with_funnel=False)
+        done = subprocess.run([sys.executable, str(root / "test" / WRAPPER.name), "--help"], capture_output=True,
+                              text=True, timeout=60)
+        self.assertEqual(done.returncode, WRAPPER_MOD.WA_EXIT_LOAD_REFUSED)
+        self.assertEqual(done.stderr, "pg_isolated_binary: refused: redaction funnel ci/secret_redact.py cannot be"
+                         " loaded\n")
+        self.assertEqual(done.stdout, "")
+
+    def test_wrapper_runs_with_the_funnel(self):
+        root = self.copy_tree(with_funnel=True)
+        done = subprocess.run([sys.executable, str(root / "test" / WRAPPER.name), "--help"], capture_output=True,
+                              text=True, timeout=60)
+        self.assertEqual(done.returncode, 0, done.stderr)
+
+    def test_serial_step_refuses_without_the_funnel(self):
+        root = self.copy_tree(with_funnel=False)
+        done = subprocess.run([sys.executable, str(root / "ci" / STEP.name)], capture_output=True, text=True,
+                              timeout=60, env={"PATH": os.environ.get("PATH", "")})
+        self.assertNotEqual(done.returncode, 0)
+        self.assertEqual(done.stdout, "")
+        self.assertIn("FileNotFoundError", done.stderr)
 
 
 class LinearBound(unittest.TestCase):
