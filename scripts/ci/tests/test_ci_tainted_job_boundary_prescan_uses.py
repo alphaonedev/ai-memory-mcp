@@ -81,6 +81,7 @@ WINDOWS_REASON = "the job may run on a Windows leg, whose default shell the pre-
 NOT_MAP = "it is not a mapping"
 NOT_LIST = "it is not a list"
 NO_RUN = "it has no run key"
+ITEM_FORM = "an item is not a step"
 RUN_NOT_TEXT = "run is not text"
 RUN_EMPTY = "run is empty text"
 # The run-value forms carry the reason text of the 9671 F1 table (a present run key that is not
@@ -113,6 +114,12 @@ STEP_FORMS: tuple[tuple[str, object, dict, dict, str], ...] = (
      USES_REASON.format("s")),
     ("uses-local-action", {"s": {"uses": "./act"}}, {}, {}, USES_REASON.format("s")),
     ("uses-not-text", {"s": {"uses": 3}}, {}, {}, USES_REASON.format("s")),
+    ("uses-empty-text", {"s": {"uses": ""}}, {}, {}, USES_REASON.format("s")),
+    ("uses-null", {"s": {"uses": None}}, {}, {}, USES_REASON.format("s")),
+    ("uses-zero", {"s": {"uses": 0}}, {}, {}, USES_REASON.format("s")),
+    ("uses-false", {"s": {"uses": False}}, {}, {}, USES_REASON.format("s")),
+    ("uses-empty-list", {"s": {"uses": []}}, {}, {}, USES_REASON.format("s")),
+    ("uses-empty-map", {"s": {"uses": {}}}, {}, {}, USES_REASON.format("s")),
     ("composite-step", {"s": {"run": "echo hi", "_composite": "act"}}, {}, {}, COMPOSITE_REASON.format("s")),
     ("shell-bash", {"s": {"run": "echo hi", "shell": "bash"}}, {}, {}, SHELL_REASON.format(STEP.format("s"))),
     ("shell-pwsh", {"s": {"run": "echo hi", "shell": "pwsh"}}, {}, {}, SHELL_REASON.format(STEP.format("s"))),
@@ -150,6 +157,10 @@ STEP_FORMS: tuple[tuple[str, object, dict, dict, str], ...] = (
     ("step-key-working-directory", {"s": {"run": "echo hi", "working-directory": "x"}}, {}, {},
      FORM_REASON.format(STEP.format("s"), KEY_FORM.format("working-directory"))),
     ("steps-not-list", "steps-map", {}, {}, FORM_REASON.format(JOB_STEPS, NOT_LIST)),
+    ("item-not-step-text", ["x"], {}, {}, FORM_REASON.format(JOB_STEPS, ITEM_FORM)),
+    ("item-not-step-null", [None], {}, {}, FORM_REASON.format(JOB_STEPS, ITEM_FORM)),
+    ("item-not-step-map", [{"run": "echo hi"}], {}, {}, FORM_REASON.format(JOB_STEPS, ITEM_FORM)),
+    ("item-not-step-int", [3], {}, {}, FORM_REASON.format(JOB_STEPS, ITEM_FORM)),
 )
 STEP_FORM_NAMES = tuple(row[0] for row in STEP_FORMS)
 # The control: a plain run step on a Linux leg is read in full and judged.
@@ -176,6 +187,8 @@ MUTANTS: tuple[tuple[str, str, str, str], ...] = (
      "    if False:", "windows-runs-on"),
     ("step container is a map", "    if not isinstance(body, dict):", "    if False:", "step-not-map"),
     ("uses step", '    if "uses" in body:', "    if False:", "uses-local-action"),
+    ("uses truthy", '    if "uses" in body:', '    if body.get("uses"):', "uses-empty-text"),
+    ("item is a step", "    if not isinstance(step, _Step):", "    if False:", "item-not-step-text"),
     ("composite step", "    if COMPOSITE_MARK in body:", "    if False:", "composite-step"),
     ("step shell", '    if "shell" in body:', "    if False:", "shell-custom"),
     ("step key list", "        if key not in PRE_SCAN_STEP_KEYS:", "        if False:", "step-key-working-directory"),
