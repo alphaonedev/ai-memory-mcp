@@ -211,7 +211,7 @@ fn the_route_builder_drops_origin_query_and_fragment_9367() {
 #[test]
 fn a_forward_url_that_is_no_base_is_refused_without_echo_9367() {
     const NOT_BASE: &str = "federation_forward: the configured forward URL is not a valid base URL; no request was sent";
-    for bad in ["not a url", "mailto:secret-user@example.invalid", ""] {
+    for bad in ["not a url", "mailto:opaque-path-9367", ""] {
         let err = forward_route_url(bad, &["api", "v1", "memories"]).expect_err(bad);
         assert_eq!(err.to_string(), NOT_BASE);
     }
