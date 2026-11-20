@@ -718,7 +718,8 @@ SHELL_CASES = (
 
 # Real forms at this checkout, every one the scan reaches to a fixpoint (FACTS of ruling
 # f367b2f1, re-taken on the merge of chain tip 902faa04): (workflow, job, step label, exact
-# reason). Kind unclassifiable: 47 forms, one open row each; these jobs are NOT shown to hold the boundary.
+# reason). Kind unclassifiable: 33 forms (47 before the pre-scan of #9566), one open row each; these
+# jobs are NOT shown to hold the boundary.
 REAL_UNCLASSIFIABLE = (
     (
         'batman-mode-acceptance.yml', 'rust-integration', 'Assert binary refuses /tmp write under R001 end-to-end',
