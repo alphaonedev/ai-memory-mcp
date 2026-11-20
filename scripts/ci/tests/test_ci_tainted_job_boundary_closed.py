@@ -813,6 +813,136 @@ class PreScanReadsEveryRunStep(unittest.TestCase):
                         self.assertNotEqual(result.verdicts.get((SYNTH, JOB)), "trusted-only")
 
 
+# 9566 F1: a run key that is present and is not non-empty text. Each row: name, the YAML text
+# after `run:`, the value the reader gives, the exact pre-scan reason, the full-analysis verdict.
+# The expected set is written by hand; it does not come from the code under test.
+RUN_NOT_TEXT = "run is not text"
+RUN_EMPTY = "run is empty text"
+RUN_NOT_TEXT_ROW = f"{SYNTH}/{JOB}: step {UNREAD_STEP!r}: {RUN_NOT_TEXT}"
+VERDICT_UNCLASSIFIABLE = "unclassifiable"
+VERDICT_NO_PR_CODE = "no-pr-code"
+VERDICT_TRUSTED_ONLY = "trusted-only"
+# A blank the shell lexer does not skip is an unread command word: the job is a finding, by carrier.
+# Written by hand: (i) a secret held by the job, (ii) a write scope or id-token for a tainted job.
+VERDICT_FINDING_BY_CARRIER = {"step secret": "i", "write scope": "ii", "id token": "ii"}
+RUN_FORMS = (
+    ("int", "5", 5, RUN_NOT_TEXT, VERDICT_UNCLASSIFIABLE),
+    ("negative int", "-1", -1, RUN_NOT_TEXT, VERDICT_UNCLASSIFIABLE),
+    ("float", "1.5", 1.5, RUN_NOT_TEXT, VERDICT_UNCLASSIFIABLE),
+    ("empty string", '""', "", RUN_EMPTY, VERDICT_NO_PR_CODE),
+    ("whitespace string", '"   "', "   ", RUN_EMPTY, VERDICT_NO_PR_CODE),
+    ("single-quoted whitespace", "'  '", "  ", RUN_EMPTY, VERDICT_NO_PR_CODE),
+    # 9566 r2 L1: every blank form of str.strip() with no argument, alone and mixed. The YAML
+    # text uses double-quoted escapes; the value column is the character itself. The pre-scan
+    # reason is RUN_EMPTY for every row. The full analysis reads only space, tab and newline as
+    # an empty step (taint_boundary.py _Sh._lex); any other blank is an unread command word, so
+    # its job is a finding by carrier (a shell would run that word as a command).
+    ("tab only", '"\\t"', "\t", RUN_EMPTY, VERDICT_NO_PR_CODE),
+    ("newline only", '"\\n"', "\n", RUN_EMPTY, VERDICT_NO_PR_CODE),
+    ("mixed space tab newline", '" \\t\\n"', " \t\n", RUN_EMPTY, VERDICT_NO_PR_CODE),
+    ("crlf only", '"\\r\\n"', "\r\n", RUN_EMPTY, VERDICT_FINDING_BY_CARRIER),
+    ("vertical tab", '"\\u000b"', "\x0b", RUN_EMPTY, VERDICT_FINDING_BY_CARRIER),
+    ("form feed", '"\\u000c"', "\x0c", RUN_EMPTY, VERDICT_FINDING_BY_CARRIER),
+    ("file separator", '"\\u001c"', "\x1c", RUN_EMPTY, VERDICT_FINDING_BY_CARRIER),
+    ("group separator", '"\\u001d"', "\x1d", RUN_EMPTY, VERDICT_FINDING_BY_CARRIER),
+    ("record separator", '"\\u001e"', "\x1e", RUN_EMPTY, VERDICT_FINDING_BY_CARRIER),
+    ("unit separator", '"\\u001f"', "\x1f", RUN_EMPTY, VERDICT_FINDING_BY_CARRIER),
+    ("next line", '"\\u0085"', "\x85", RUN_EMPTY, VERDICT_FINDING_BY_CARRIER),
+    ("no-break space", '" "', " ", RUN_EMPTY, VERDICT_FINDING_BY_CARRIER),
+    ("ogham space mark", '" "', " ", RUN_EMPTY, VERDICT_FINDING_BY_CARRIER),
+    ("em space", '" "', " ", RUN_EMPTY, VERDICT_FINDING_BY_CARRIER),
+    ("line separator", '" "', " ", RUN_EMPTY, VERDICT_FINDING_BY_CARRIER),
+    ("paragraph separator", '" "', " ", RUN_EMPTY, VERDICT_FINDING_BY_CARRIER),
+    ("narrow no-break space", '" "', " ", RUN_EMPTY, VERDICT_FINDING_BY_CARRIER),
+    ("medium mathematical space", '" "', " ", RUN_EMPTY, VERDICT_FINDING_BY_CARRIER),
+    ("ideographic space", '"　"', "　", RUN_EMPTY, VERDICT_FINDING_BY_CARRIER),
+    ("mixed unicode blanks", '" \\t 　 "', " \t 　 ", RUN_EMPTY, VERDICT_FINDING_BY_CARRIER),
+    ("flow list", "[echo a]", ["echo a"], RUN_NOT_TEXT, VERDICT_UNCLASSIFIABLE),
+    ("block list", "\n          - echo a", ["echo a"], RUN_NOT_TEXT, VERDICT_UNCLASSIFIABLE),
+    ("flow map", "{a: b}", {"a": "b"}, RUN_NOT_TEXT, VERDICT_UNCLASSIFIABLE),
+    ("block map", "\n          a: b", {"a": "b"}, RUN_NOT_TEXT, VERDICT_UNCLASSIFIABLE),
+    ("null", "null", None, RUN_NOT_TEXT, VERDICT_UNCLASSIFIABLE),
+    ("tilde null", "~", None, RUN_NOT_TEXT, VERDICT_UNCLASSIFIABLE),
+    ("empty value", "", None, RUN_NOT_TEXT, VERDICT_UNCLASSIFIABLE),
+    ("true", "true", True, RUN_NOT_TEXT, VERDICT_UNCLASSIFIABLE),
+    ("false", "false", False, RUN_NOT_TEXT, VERDICT_UNCLASSIFIABLE),
+)
+RUN_FORM_NAMES = frozenset({"int", "negative int", "float", "empty string", "whitespace string",
+                            "single-quoted whitespace", "tab only", "newline only", "crlf only",
+                            "mixed space tab newline", "vertical tab", "form feed", "file separator",
+                            "group separator", "record separator", "unit separator",
+                            "next line", "no-break space", "ogham space mark", "em space",
+                            "line separator", "paragraph separator", "narrow no-break space",
+                            "medium mathematical space", "ideographic space", "mixed unicode blanks",
+                            "flow list", "block list", "flow map", "block map",
+                            "null", "tilde null", "empty value", "true", "false"})
+RUN_FORM_BULK_ITEMS = 30_000
+
+
+def _run_value_workflow(event: str, perms: str, env: str, value: str) -> str:
+    env_block = f"        env:\n{env}" if env else ""
+    step = f"      - name: {UNREAD_STEP}\n{env_block}        run: {value}\n"
+    return _wf(CHECKOUT + step, on=event, perms=perms)
+
+
+class PreScanRefusesRunThatIsNotText(unittest.TestCase):
+    """9566 F1: a present run key that is not non-empty text never leaves a job trusted-only."""
+
+    def test_9566_run_form_table_is_the_hand_written_set(self) -> None:
+        self.assertEqual({name for name, *_ in RUN_FORMS}, RUN_FORM_NAMES)
+        self.assertEqual(len(RUN_FORMS), len(RUN_FORM_NAMES))
+        for name, _, _, _, verdict in RUN_FORMS:
+            expected = set(verdict.values()) if isinstance(verdict, dict) else {verdict}
+            self.assertNotIn(VERDICT_TRUSTED_ONLY, expected, name)
+
+    def test_9566_reader_gives_the_value_of_each_run_form(self) -> None:
+        _need_module(self)
+        for name, value, expected, _, _ in RUN_FORMS:
+            with self.subTest(form=name):
+                doc = tb.parse_yaml(_run_value_workflow("push", "", "", value), SYNTH)
+                self.assertEqual(doc["jobs"][JOB]["steps"][1]["run"], expected)
+
+    def test_9566_pre_scan_names_each_run_form_with_its_exact_reason(self) -> None:
+        _need_module(self)
+        for name, _, run, reason, _ in RUN_FORMS:
+            with self.subTest(form=name):
+                steps = [tb._Step("first", {"run": "echo ok"}, 0), tb._Step(UNREAD_STEP, {"run": run}, 1)]
+                self.assertEqual(tb._pre_scan_fetch(steps, {}, {}), PRE_SCAN_UNREAD.format(reason=reason))
+
+    def test_9566_run_form_is_never_trusted_only(self) -> None:
+        _need_module(self)
+        for event in UNREAD_EVENTS:
+            for carrier, perms, env in UNREAD_CARRIERS:
+                for name, value, _, _, verdict in RUN_FORMS:
+                    with self.subTest(event=event, carrier=carrier, form=name):
+                        result = _scan(_run_value_workflow(event, perms, env, value))
+                        expected = verdict[carrier] if isinstance(verdict, dict) else verdict
+                        got = result.verdicts.get((SYNTH, JOB))
+                        self.assertNotEqual(got, VERDICT_TRUSTED_ONLY)
+                        self.assertEqual(got, expected)
+                        expected_rows = [RUN_NOT_TEXT_ROW] if expected == VERDICT_UNCLASSIFIABLE else []
+                        self.assertEqual(result.unclassifiable, expected_rows)
+
+    def test_9566_uses_step_is_never_skipped_by_the_pre_scan(self) -> None:
+        # H1 (uses: steps, no run key), closed by lane boundary-prescan-uses-steps-fail-closed: the
+        # pre-scan names the step and the job goes to the full analysis.
+        _need_module(self)
+        self.assertEqual(tb._pre_scan_fetch([tb._Step("u", {"uses": "./x"}, 0)], {}, {}),
+                         "step 'u' uses an action, which the pre-scan does not read")
+
+    def test_9566_large_run_forms_are_refused_in_bounded_time(self) -> None:
+        _need_module(self)
+        bulk = (("flow list", "[" + ", ".join(["a"] * RUN_FORM_BULK_ITEMS) + "]", VERDICT_UNCLASSIFIABLE),
+                ("whitespace string", '"' + " " * ADVERSARIAL_BYTES + '"', VERDICT_NO_PR_CODE))
+        for name, value, verdict in bulk:
+            with self.subTest(form=name):
+                self.assertGreaterEqual(len(value), ADVERSARIAL_BYTES // 2)
+                start = time.monotonic()
+                result = _scan(_run_value_workflow("push", "permissions:\n  contents: write\n", "", value))
+                self.assertLess(time.monotonic() - start, SCAN_CEILING_S)
+                self.assertEqual(result.verdicts.get((SYNTH, JOB)), verdict)
+
+
 # 9566: the array-literal form at every site of the workflows (the element text is data).
 ARRAY_DATA_FORMS = (
     "declare -A ABI_OF=(\n  [aarch64-linux-android]=arm64-v8a\n  [i686-linux-android]=x86\n)\necho ok",
@@ -917,6 +1047,10 @@ CLOSED_FORMS_REFUSED = (
     ("apt-get install -y ./x.deb", "apt-get operand './x.deb' is not a package name"),
     ("apt-get install x.deb", "apt-get operand 'x.deb' is not a package name"),
     ("apt-get install dist/x", "apt-get operand 'dist/x' is not a package name"),
+    # 9566 F2: apt reads a dot-led operand with no slash and no .deb suffix as a path in the tree.
+    ("apt-get install .", "apt-get operand '.' is not a package name"),
+    ("apt-get install -y ..", "apt-get operand '..' is not a package name"),
+    ("apt-get install .x", "apt-get operand '.x' is not a package name"),
     ('apt-get install "$P"', "apt-get operand '$P' is not a package name"),
     ("apt-get update rpm", "apt-get operand 'rpm' is not a package name"),
     ("rpm -i x.rpm", "rpm form 'rpm -i x.rpm' is not on the closed list"),

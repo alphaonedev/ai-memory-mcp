@@ -27,11 +27,14 @@ in ``GATE_STEPS``), whatever its issue: a change there needs the conductor's wor
 Removal rule: the fix PR of an issue deletes its rows and lowers that kind's pin in the same
 commit; each pin only goes down, a pin above its ceiling in ``PIN_CEILINGS`` is a failure and
 a pin that differs from its row count is a failure. Pins at PR 9508: unclassifiable 33,
-not-analysed 3, violation 35 (the 13 rows before PR 9508, 4 rows of #9553 and 18 rows of #9570).
+not-analysed 3, violation 33 (the 13 rows before PR 9508, 4 rows of #9553 and 16 rows of #9570).
 The pins are the baseline of the tree PR 9508 lands on (the merge of chain tip 902faa04 moved the
 unclassifiable pin 41 -> 47 once; the pre-scan of #9566 moved it 47 -> 33 and the violation pin
-17 -> 33 once; 9566 item 3, the full analysis of every job, moved the violation pin 33 -> 35
-once for the two docker rows); after it lands they only go down. The fixpoint proof
+17 -> 33 once); after it lands they only go down. Stage 1 of #9455 moved
+session-boot-lifetime.yml lifetime-tests to hosted runners and lowered the violation pin by one
+(17 -> 16 on the chain, 33 -> 32 after the pre-scan of #9566). 9566 item 3, the full analysis of
+every job, moved the violation pin 32 -> 34 once for the two docker rows of #9570 (pins now:
+unclassifiable 33, not-analysed 3, violation 34). The fixpoint proof
 (all rows applied: zero findings; any one row removed: exactly that form or line) is a proof for
 what the scan reaches only. A test makes no network call: the
 conductor checks that every cited issue is open at each landing of a fix of these issues, and
@@ -186,8 +189,8 @@ class AllowRow:
     gate_step: bool = False
 
 
-# The six hits of the survey at a028c45e, the six host-credential reads and the R2 row of
-# lifetime-tests (ruling abf38892 section 7). Removing a row is the fix lane's job; adding a
+# The six hits of the survey at a028c45e and the six host-credential reads (ruling abf38892
+# section 7); the R2 row of lifetime-tests left with stage 1 of #9455. Removing a row is the fix lane's job; adding a
 # row needs an issue number from the deputy (the pin moves with it).
 _RELEASE = "release.yml"
 TAINT_ALLOW: tuple[AllowRow, ...] = (
@@ -200,7 +203,6 @@ TAINT_ALLOW: tuple[AllowRow, ...] = (
     AllowRow("ci.yml", "check", R2_STEP_LABEL, (CLASS_PERSISTENT_STATE,), 9455),
     AllowRow("cert-postgres-age.yml", "cert-postgres-age", R2_STEP_LABEL, (CLASS_PERSISTENT_STATE,), 9455),
     AllowRow("postgres-ignored.yml", "postgres-ignored", R2_STEP_LABEL, (CLASS_PERSISTENT_STATE,), 9455),
-    AllowRow("session-boot-lifetime.yml", "lifetime-tests", R2_STEP_LABEL, (CLASS_PERSISTENT_STATE,), 9455),
     AllowRow("coverage.yml", "per-module-thresholds", "Post coverage to PR (sticky) (#1993)",
              (CLASS_WRITE_TOKEN, CLASS_SECRET), 9456),
     # Ruling 04701c74: a credential resident on a self-hosted host read after pull-request code is (i); the
@@ -247,7 +249,7 @@ TAINT_ALLOW: tuple[AllowRow, ...] = (
     AllowRow(_RELEASE, 'docker', 'Attest build provenance (Docker image)', (CLASS_SECRET, CLASS_WRITE_TOKEN), 9570),
     AllowRow(_RELEASE, 'docker', 'Log in to GitHub Container Registry', (CLASS_SECRET,), 9570),
 )
-TAINT_ALLOW_PIN = 35
+TAINT_ALLOW_PIN = 34
 # The open fix issues a violation row may name (the fixed set of that kind); a row naming any
 # other value is a finding.
 FIX_ISSUES = frozenset({9454, 9455, 9456, 9471, 9553, 9570})
@@ -277,7 +279,18 @@ OPEN_ROW_ISSUES = (frozenset({9533}) | frozenset(range(9535, 9540)) | frozenset(
 NOT_ANALYSED_ROW_ISSUES = frozenset({9550, 9551, 9552})
 NOT_ANALYSED_MARKER = "rest-not-analysed"
 # Each pin only goes down; a pin above its ceiling is a failure.
-PIN_CEILINGS = {KIND_UNCLASSIFIABLE: 33, KIND_VIOLATION: 35, KIND_NOT_ANALYSED: 3}
+# Current values: unclassifiable 33 (33 rows), violation 34 (34 allow rows), not-analysed 3 (3 rows).
+# Violation history: 17 -> 33 -> 32 (after the merge of fd43a727) -> 34 (9566 item 3).
+# decision: raise the violation ceiling once, 17 -> 33 (58dd50570), over keeping 17, because the
+# pre-scan of #9566 sends release.yml jobs to the full analysis, which reports 16 rows of classes i
+# and ii that #9570 fixes; each row names 9570 and leaves with it.
+# decision: violation pin and ceiling 32 over 33 at the merge of chain tip fd43a727, because stage 1
+# of #9455 removed the lifetime-tests row and the pin equals the allow-table row count and only
+# ever follows it down; the unclassifiable pin stays 33.
+# decision: violation pin and ceiling 32 -> 34 once over leaving the docker results unrowed, because
+# the full analysis of every job (9566 item 3) reaches release.yml/docker, whose two results are
+# the #9570 class, and the pin is the allow-table row count after that merge (34).
+PIN_CEILINGS = {KIND_UNCLASSIFIABLE: 33, KIND_VIOLATION: 34, KIND_NOT_ANALYSED: 3}
 # Characters no workflow, job, step or operand of a row may hold: a row names one place.
 ROW_GLOB_CHARS = frozenset("*?[]{}")
 # A braced parameter reference of one plain name, the only brace an operand may hold: the shell
@@ -3787,7 +3800,7 @@ def _analyse_step(step: _Step, job: dict[str, object], doc: dict[str, object], j
         return facts
     run = body.get("run")
     if not isinstance(run, str):
-        raise Unclassifiable("run is not text")
+        raise Unclassifiable(PRE_SCAN_RUN_NOT_TEXT)
     paths, _ = _text_refs(run)
     declared = _env_names(doc.get("env"), job.get("env"), body.get("env"))
     for path in paths:
@@ -3820,6 +3833,7 @@ PRE_SCAN_NOT_LIST = "it is not a list"
 PRE_SCAN_KEY_FORM = "key {key!r} is not on the pre-scan list"
 PRE_SCAN_NO_RUN = "it has no run key"
 PRE_SCAN_RUN_NOT_TEXT = "run is not text"
+PRE_SCAN_RUN_EMPTY = "run is empty text"
 PRE_SCAN_ITEM_FORM = "an item is not a step"
 PRE_SCAN_STEP_HOLDER = "step {step!r}"
 PRE_SCAN_STEPS_HOLDER = "the job steps"
@@ -3872,8 +3886,12 @@ def _pre_scan_step(step: object) -> str | None:
             return PRE_SCAN_FORM_REASON.format(holder=where, form=PRE_SCAN_KEY_FORM.format(key=key))
     if "run" not in body:
         return PRE_SCAN_FORM_REASON.format(holder=where, form=PRE_SCAN_NO_RUN)
-    if not isinstance(body.get("run"), str):
-        return PRE_SCAN_FORM_REASON.format(holder=where, form=PRE_SCAN_RUN_NOT_TEXT)
+    run_text = body["run"]
+    # 9566 F1: a present run key that is not non-empty text is never read as harmless.
+    if not isinstance(run_text, str):
+        return PRE_SCAN_UNREAD_REASON.format(step=step.label, reason=PRE_SCAN_RUN_NOT_TEXT)
+    if not run_text.strip():
+        return PRE_SCAN_UNREAD_REASON.format(step=step.label, reason=PRE_SCAN_RUN_EMPTY)
     return None
 
 
@@ -3883,12 +3901,14 @@ def _pre_scan_fetch(steps: list[_Step], job: dict[str, object], doc: dict[str, o
     The pre-scan only picks the label of a job: the full analysis reads every job whatever this
     returns (9566 item 3), so a form it misses can cost a label, never a result. The reason is
     the first of: a steps container, a defaults form, a Windows leg or a step form the pre-scan
-    does not read (a uses: step, a composite step, a shell: key, a key off PRE_SCAN_STEP_KEYS, a
-    step with no run or a run that is not text); PRE_SCAN_FETCH_REASON for a run step that
-    fetches a pull-request tree; the text of the first command the pre-scan cannot read;
+    does not read (a uses: step, a composite step, a shell: key, a key off PRE_SCAN_STEP_KEYS or
+    a step with no run); a run key whose value is not text or is empty or blank text
+    (PRE_SCAN_RUN_NOT_TEXT, PRE_SCAN_RUN_EMPTY; the full analysis reports the first as
+    unclassifiable and reads the second); PRE_SCAN_FETCH_REASON for a run step that fetches a
+    pull-request tree; the text of the first command the pre-scan cannot read;
     PRE_SCAN_RUNS_REASON for a step that runs code from the checked-out tree; or
     PRE_SCAN_TREE_REASON for a step that changes it. None only when every step is a plain run
-    step read in full that does none of these (fail closed).
+    step of non-blank text read in full that does none of these (fail closed).
     """
     if not isinstance(steps, list):  # the pre-scan steps container
         return PRE_SCAN_FORM_REASON.format(holder=PRE_SCAN_STEPS_HOLDER, form=PRE_SCAN_NOT_LIST)

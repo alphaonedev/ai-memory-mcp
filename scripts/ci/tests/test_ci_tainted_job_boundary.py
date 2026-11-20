@@ -39,10 +39,11 @@ else:
     PYYAML_IMPORT_ERROR = ""
 
 # Three row kinds, three pins (FINAL efb2b9e8, correction 0773f6ce); each pin only goes down.
-# Kind violation: the 13 rows before PR 9508, 4 class (iii) rows of #9553 and the 18 release.yml
-# rows of #9570 (two of them the docker job, reached by the full analysis of 9566 item 3).
-ALLOW_PIN_EXPECTED = 35
-ALLOW_ROW_COUNT = 13
+# Kind violation: the 13 rows before PR 9508 less the lifetime-tests R2 row (stage 1 of #9455), 4 class
+# (iii) rows of #9553 and the 18 release.yml rows of #9570 (two of them the docker job, reached by the full
+# analysis of 9566 item 3): 12 + 4 + 18 = 34.
+ALLOW_PIN_EXPECTED = 34
+ALLOW_ROW_COUNT = 12
 NEW_VIOLATION_ROW_COUNT = 4
 RELEASE_ROW_COUNT = 18
 OPEN_PIN_EXPECTED = 33
@@ -659,8 +660,9 @@ R2_ROWS = (
     ("ci.yml", "check"),
     ("cert-postgres-age.yml", "cert-postgres-age"),
     ("postgres-ignored.yml", "postgres-ignored"),
-    ("session-boot-lifetime.yml", "lifetime-tests"),
 )
+# Stage 1 of #9455: this job left the persistent runner; its R2 row is gone.
+HOSTED_SESSION_BOOT = ("session-boot-lifetime.yml", "lifetime-tests")
 
 # Shell text -> runs pull-request code, or the exact Unclassifiable reason (a str), in the
 # reading of a job with a pull-request trigger (strict).
@@ -720,7 +722,8 @@ SHELL_CASES = (
 
 # Real forms at this checkout, every one the scan reaches to a fixpoint (FACTS of ruling
 # f367b2f1, re-taken on the merge of chain tip 902faa04): (workflow, job, step label, exact
-# reason). Kind unclassifiable: 47 forms, one open row each; these jobs are NOT shown to hold the boundary.
+# reason). Kind unclassifiable: 33 forms (47 before the pre-scan of #9566), one open row each; these
+# jobs are NOT shown to hold the boundary.
 REAL_UNCLASSIFIABLE = (
     (
         'batman-mode-acceptance.yml', 'rust-integration', 'Assert binary refuses /tmp write under R001 end-to-end',
@@ -1332,7 +1335,10 @@ class PersistentRunnerTrustedTrigger(unittest.TestCase):
                     self.assertEqual(result.verdicts[key], "unclassifiable")
                 else:
                     self.assertIn(CLASS_IV, result.verdicts[key].split(","))
-        self.assertEqual(result.verdicts[("session-boot-lifetime.yml", "lifetime-tests")], CLASS_IV)
+        # Hosted on every leg: no R2 violation, and no row may cover it. Its suite step runs the
+        # checked-out tree, so the pre-scan of #9566 sends it to the full analysis: no PR code.
+        self.assertEqual(result.verdicts[HOSTED_SESSION_BOOT], "no-pr-code")
+        self.assertNotIn(HOSTED_SESSION_BOOT, rows)
 
     def test_9452_r2_stale_row_for_a_gone_job_is_a_failure(self) -> None:
         _need_module(self)
@@ -1530,7 +1536,6 @@ class RealWorkflows(unittest.TestCase):
         self.assertEqual(hits, {
             ("c8-precheck.yml", "required-contexts-gate"): "i",
             ("postgres-ignored.yml", "postgres-ignored"): "i,iv",
-            ("session-boot-lifetime.yml", "lifetime-tests"): "iv",
         } | REAL_RELEASE_VERDICTS | {key: "unclassifiable" for key in REAL_UNCLASSIFIABLE_JOBS})
 
     def test_9452_real_unclassifiable_forms_are_exactly_the_listed_findings(self) -> None:

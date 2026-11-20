@@ -59,8 +59,9 @@ DOCKER_LINES = frozenset({
     "secret held before pull-request code ran can persist into it",
 })
 DOCKER_ROWS = frozenset({(DOCKER_ATTEST, ("i", "ii")), (DOCKER_LOGIN, ("i",))})
-ALLOW_PIN = 35
-VIOLATION_CEILING = 35
+# The allow-table row count after the merge of the 9671 head: 32 rows there plus the two docker rows.
+ALLOW_PIN = 34
+VIOLATION_CEILING = 34
 VIOLATION_KIND = "violation"
 TRUSTED_ONLY = "trusted-only"
 NO_PR_CODE = "no-pr-code"
@@ -81,6 +82,20 @@ NOT_MAP = "it is not a mapping"
 NOT_LIST = "it is not a list"
 NO_RUN = "it has no run key"
 RUN_NOT_TEXT = "run is not text"
+RUN_EMPTY = "run is empty text"
+# The run-value forms carry the reason text of the 9671 F1 table (a present run key that is not
+# non-empty text); the step shapes carry FORM_REASON.
+UNREAD_REASON = "step {!r} cannot be read by the pre-scan: {}"
+# Every blank form of str.strip() with no argument, alone and mixed, written as code points.
+BLANK_RUNS: tuple[tuple[str, str], ...] = (
+    ("empty", ""), ("space", " "), ("spaces", "   "), ("tab", "\t"), ("newline", "\n"),
+    ("space-tab-newline", " \t\n"), ("crlf", "\r\n"), ("vertical-tab", "\x0b"), ("form-feed", "\x0c"),
+    ("file-separator", "\x1c"), ("group-separator", "\x1d"), ("record-separator", "\x1e"),
+    ("unit-separator", "\x1f"), ("next-line", "\x85"), ("no-break-space", "\xa0"), ("ogham-space", " "),
+    ("em-space", " "), ("line-separator", " "), ("paragraph-separator", " "),
+    ("narrow-no-break-space", " "), ("medium-math-space", " "), ("ideographic-space", "　"),
+    ("mixed-unicode", " \t\xa0　 "),
+)
 KEY_FORM = "key {!r} is not on the pre-scan list"
 STEP = "step {!r}"
 JOB_STEPS = "the job steps"
@@ -120,10 +135,14 @@ STEP_FORMS: tuple[tuple[str, object, dict, dict, str], ...] = (
     ("windows-matrix-leg", {"s": CLEAN_RUN},
      {"runs-on": "${{ matrix.os }}", "strategy": {"matrix": {"os": ["ubuntu-latest", "Windows-2022"]}}}, {},
      WINDOWS_REASON),
-    ("run-number", {"s": {"run": 3}}, {}, {}, FORM_REASON.format(STEP.format("s"), RUN_NOT_TEXT)),
-    ("run-empty", {"s": {"run": None}}, {}, {}, FORM_REASON.format(STEP.format("s"), RUN_NOT_TEXT)),
-    ("run-list", {"s": {"run": ["echo hi"]}}, {}, {}, FORM_REASON.format(STEP.format("s"), RUN_NOT_TEXT)),
-    ("run-map", {"s": {"run": {"a": "b"}}}, {}, {}, FORM_REASON.format(STEP.format("s"), RUN_NOT_TEXT)),
+    ("run-number", {"s": {"run": 3}}, {}, {}, UNREAD_REASON.format("s", RUN_NOT_TEXT)),
+    ("run-empty", {"s": {"run": None}}, {}, {}, UNREAD_REASON.format("s", RUN_NOT_TEXT)),
+    ("run-list", {"s": {"run": ["echo hi"]}}, {}, {}, UNREAD_REASON.format("s", RUN_NOT_TEXT)),
+    ("run-map", {"s": {"run": {"a": "b"}}}, {}, {}, UNREAD_REASON.format("s", RUN_NOT_TEXT)),
+    ("run-bool", {"s": {"run": True}}, {}, {}, UNREAD_REASON.format("s", RUN_NOT_TEXT)),
+    *((f"run-blank-{blank}", {"s": {"run": value}}, {}, {}, UNREAD_REASON.format("s", RUN_EMPTY))
+      for blank, value in BLANK_RUNS),
+    ("run-blank-after-clean-run", {"a": CLEAN_RUN, "s": {"run": " "}}, {}, {}, UNREAD_REASON.format("s", RUN_EMPTY)),
     ("neither-run-nor-uses", {"s": {"name": "s"}}, {}, {}, FORM_REASON.format(STEP.format("s"), NO_RUN)),
     ("step-not-map", {"s": ["echo hi"]}, {}, {}, FORM_REASON.format(STEP.format("s"), NOT_MAP)),
     ("step-key-with", {"s": {"run": "echo hi", "with": {"a": "b"}}}, {}, {},
@@ -161,7 +180,8 @@ MUTANTS: tuple[tuple[str, str, str, str], ...] = (
     ("step shell", '    if "shell" in body:', "    if False:", "shell-custom"),
     ("step key list", "        if key not in PRE_SCAN_STEP_KEYS:", "        if False:", "step-key-working-directory"),
     ("run key present", '    if "run" not in body:', "    if False:", "neither-run-nor-uses"),
-    ("run is text", '    if not isinstance(body.get("run"), str):', "    if False:", "run-list"),
+    ("run is text", "    if not isinstance(run_text, str):", "    if False:", "run-list"),
+    ("run is non-blank text", "    if not run_text.strip():", "    if False:", "run-blank-space"),
 )
 MUTANT_FORMS = frozenset(row[3] for row in MUTANTS)
 # The caller mutant brings back the short cut past the full analysis.
@@ -330,6 +350,27 @@ class GateIsNeverLaxerThanFullAnalysis(unittest.TestCase):
         workflows, actions, _ = tb.load_repo(REPO_ROOT)
         self.assertGreater(len(workflows), 0)
         self.assertEqual(_laxer(tb, workflows, actions), [])
+
+    def test_9566_blank_run_forms_differential_and_never_trusted_only(self) -> None:
+        # The 9671 F1 blank forms in a scan: the gate verdict is the full-analysis verdict, never
+        # trusted-only, with and without pull-request code before the blank step.
+        _need_module(self)
+        for blank, value in BLANK_RUNS:
+            quoted = '"' + "".join(f"\\u{ord(char):04x}" for char in value) + '"'
+            blank_step = f"      - name: Blank\n        run: {quoted}\n"
+            for carrier, text in (("plain", _wf(blank_step)),
+                                  ("payload", _wf(PAYLOAD_CHECKOUT + blank_step + SECRET_STEP,
+                                                  on="repository_dispatch"))):
+                with self.subTest(form=blank, carrier=carrier):
+                    doc = tb.parse_yaml(text, SYNTH)
+                    blank_index = 1 if carrier == "payload" else 0
+                    self.assertEqual(doc["jobs"][JOB]["steps"][blank_index]["run"], value)
+                    gate = tb.scan_texts({SYNTH: text}, {}, frozenset())
+                    with _full_analysis(tb):
+                        full = tb.scan_texts({SYNTH: text}, {}, frozenset())
+                    self.assertNotEqual(gate.verdicts.get((SYNTH, JOB)), TRUSTED_ONLY)
+                    self.assertEqual(gate.verdicts.get((SYNTH, JOB)), full.verdicts.get((SYNTH, JOB)))
+                    self.assertEqual(_laxer(tb, {SYNTH: text}, {}), [])
 
     def test_9566_synthetic_forms_differential_and_exact_problem(self) -> None:
         _need_module(self)
