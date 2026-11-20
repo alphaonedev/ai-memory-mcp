@@ -593,6 +593,18 @@ fn forensic_export_doc_lists_exit_codes_0_1_2_9507() {
         "1 is not verification failure: {}",
         rows[1]
     );
+    // Ruling fe96bc17: 1 keeps its old meaning (a caller error); an input
+    // that cannot be read is UNREADABLE under 2, with the class named.
+    for widened in ["storage", "computed", "could not be read"] {
+        assert!(
+            !rows[1].contains(widened),
+            "1 must not cover {widened}: {}",
+            rows[1]
+        );
+    }
+    for needle in ["could not be read", "unreadable", "error_class"] {
+        assert!(rows[2].contains(needle), "2 names {needle}: {}", rows[2]);
+    }
 }
 
 // ---- #9634: the `--cid` sweep decides before anything prints -------------------

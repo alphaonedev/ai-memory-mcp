@@ -148,9 +148,17 @@ fn sweep_columns(row: &rusqlite::Row<'_>) -> Result<SweepColumns, GenesisReadErr
 /// Propagates a failure to prepare or step the query (the verdict could not
 /// be computed; nothing has been printed yet).
 pub fn run_cid_sweep(conn: &Connection) -> Result<CidSweepReport> {
+    run_cid_sweep_query(conn, CID_SWEEP_SQL)
+}
+
+/// The fleet-wide sweep query: `(id, cid, cid_genesis)` of every stamped row.
+const CID_SWEEP_SQL: &str = "SELECT id, cid, cid_genesis FROM memories WHERE cid IS NOT NULL";
+
+/// [`run_cid_sweep`] over `sql`, which selects the same three columns (the
+/// unit cells pass a query that cannot be prepared or stepped).
+fn run_cid_sweep_query(conn: &Connection, sql: &str) -> Result<CidSweepReport> {
     let enforce = crate::config::cid_enforce_enabled();
-    let mut stmt =
-        conn.prepare("SELECT id, cid, cid_genesis FROM memories WHERE cid IS NOT NULL")?;
+    let mut stmt = conn.prepare(sql)?;
     let mut rows = stmt.query([])?;
 
     let mut report = CidSweepReport {
@@ -1023,6 +1031,17 @@ pub(super) fn render_text(report: &ChainReport, out: &mut CliOutput<'_>) -> Resu
 ///
 /// Propagates I/O or database errors via `anyhow`.
 pub fn run(db_path: &Path, args: &VerifyChainArgs, out: &mut CliOutput<'_>) -> Result<i32> {
+    run_with_sweep_sql(db_path, args, out, CID_SWEEP_SQL)
+}
+
+/// [`run`] with the `--cid` sweep query given (the unit cells pass a query
+/// that cannot be prepared or stepped).
+fn run_with_sweep_sql(
+    db_path: &Path,
+    args: &VerifyChainArgs,
+    out: &mut CliOutput<'_>,
+    sweep_sql: &str,
+) -> Result<i32> {
     let json = args.format.to_ascii_lowercase() == "json";
     let conn = crate::db::open(db_path).context("open db")?;
 
@@ -1076,7 +1095,7 @@ pub fn run(db_path: &Path, args: &VerifyChainArgs, out: &mut CliOutput<'_>) -> R
     // embedded in the same report: one JSON document, one summary line.
     let root_cid = root.as_ref().and_then(|row| check_root_cid(&conn, row));
     let cid_sweep = if args.cid {
-        Some(run_cid_sweep(&conn)?)
+        Some(run_cid_sweep_query(&conn, sweep_sql)?)
     } else {
         None
     };
@@ -1829,5 +1848,213 @@ mod tests {
         // The JSON should at minimum carry the report wrapper fields.
         assert!(s.contains("\"root_id\""), "got: {s}");
         assert!(s.contains("\"bounded_status\""), "got: {s}");
+    }
+
+    // -----------------------------------------------------------------
+    // #9505 (3-agent vote (71472661), ruling fe96bc17) — a verification
+    // input that cannot be read is UNREADABLE: ok false, exit 2, ONE
+    // document naming the stage and the error class, in both modes. It is
+    // never the generic `Err` path (exit 1 with nothing printed), which
+    // stays the code of a caller error (unknown root).
+    // -----------------------------------------------------------------
+
+    /// A sweep query naming a column that does not exist: prepare fails.
+    const SWEEP_SQL_PREPARE_FAULT: &str =
+        "SELECT id, cid, no_such_column_9505 FROM memories WHERE cid IS NOT NULL";
+    /// A sweep query whose filter overflows an integer: prepare succeeds and
+    /// the first step fails.
+    const SWEEP_SQL_STEP_FAULT: &str = "SELECT id, cid, cid_genesis FROM memories \
+         WHERE cid IS NOT NULL AND abs(-9223372036854775808) > 0";
+    /// Text that only the SQLite error message of the prepare fault holds.
+    const PREPARE_FAULT_RAW: &str = "no_such_column_9505";
+    /// Text that only the SQLite error message of the step fault holds.
+    const STEP_FAULT_RAW: &str = "overflow";
+    const EXIT_UNREADABLE: i32 = 2;
+    const CLASS_STORAGE: &str = "storage_error";
+    const STAGE_PREPARE: &str = "cid_sweep_prepare";
+    const STAGE_STEP: &str = "cid_sweep_step";
+    const STAGE_OPEN: &str = "open";
+    const SUMMARY_PREFIX_9505: &str = "verify-reflection-chain: root=";
+
+    struct Outcome {
+        code: Option<i32>,
+        err: Option<String>,
+        stdout: String,
+        stderr: String,
+    }
+
+    fn run_case(db_path: &Path, memory_id: &str, format: &str, sweep_sql: &str) -> Outcome {
+        let args = VerifyChainArgs {
+            memory_id: memory_id.to_string(),
+            format: format.to_string(),
+            include_signed_events: false,
+            cid: true,
+        };
+        let mut stdout = Vec::<u8>::new();
+        let mut stderr = Vec::<u8>::new();
+        let res = {
+            let mut out = crate::cli::CliOutput::from_std(&mut stdout, &mut stderr);
+            run_with_sweep_sql(db_path, &args, &mut out, sweep_sql)
+        };
+        Outcome {
+            code: res.as_ref().ok().copied(),
+            err: res.err().map(|e| format!("{e:#}")),
+            stdout: String::from_utf8(stdout).expect("utf8 stdout"),
+            stderr: String::from_utf8(stderr).expect("utf8 stderr"),
+        }
+    }
+
+    /// The shared UNREADABLE contract: exact exit 2, one document, no
+    /// passing summary, the exact stage and class, no path and no raw
+    /// storage-error text on either stream.
+    fn assert_unreadable(run: &Outcome, format: &str, stage: &str, leaks: &[&str]) {
+        assert_eq!(
+            run.code,
+            Some(EXIT_UNREADABLE),
+            "must return exit 2, not Err ({:?}):\nstdout: {}\nstderr: {}",
+            run.err,
+            run.stdout,
+            run.stderr
+        );
+        assert!(
+            !run.stdout.contains("ok=true") && !run.stdout.contains("\"ok\": true"),
+            "no passing summary:\n{}",
+            run.stdout
+        );
+        if format == "json" {
+            let mut docs =
+                serde_json::Deserializer::from_str(&run.stdout).into_iter::<serde_json::Value>();
+            let doc = docs
+                .next()
+                .expect("one document")
+                .unwrap_or_else(|e| panic!("stdout must be JSON: {e}\n{}", run.stdout));
+            assert!(docs.next().is_none(), "one document:\n{}", run.stdout);
+            assert_eq!(doc["ok"], serde_json::Value::Bool(false), "{doc}");
+            assert_eq!(doc["unreadable"]["stage"], stage, "{doc}");
+            assert_eq!(doc["unreadable"]["error_class"], CLASS_STORAGE, "{doc}");
+        } else {
+            let summaries: Vec<&str> = run
+                .stdout
+                .lines()
+                .filter(|l| l.starts_with(SUMMARY_PREFIX_9505))
+                .collect();
+            assert_eq!(summaries.len(), 1, "one summary line:\n{}", run.stdout);
+            let fields: Vec<&str> = summaries[0].split(' ').collect();
+            assert!(fields.contains(&"ok=false"), "{}", summaries[0]);
+            assert!(
+                fields.contains(&format!("unreadable={stage}").as_str()),
+                "{}",
+                summaries[0]
+            );
+            assert!(
+                fields.contains(&format!("error_class={CLASS_STORAGE}").as_str()),
+                "{}",
+                summaries[0]
+            );
+        }
+        for (name, stream) in [("stdout", &run.stdout), ("stderr", &run.stderr)] {
+            for leak in leaks {
+                assert!(!stream.contains(leak), "{name} leaks {leak:?}:\n{stream}");
+            }
+        }
+    }
+
+    /// A database with one stamped memory; returns (dir, db path, id).
+    fn sweep_db() -> (TempDir, std::path::PathBuf, String) {
+        let tmp = TempDir::new().unwrap();
+        let (conn, db_path) = open_test_db(&tmp);
+        let id = insert_mem(&conn, "ns-9505", 0);
+        drop(conn);
+        (tmp, db_path, id)
+    }
+
+    fn sweep_fault_cell(format: &str, sql: &str, stage: &str, raw: &str) {
+        let (tmp, db_path, id) = sweep_db();
+        let run = run_case(&db_path, &id, format, sql);
+        let path_text = db_path.display().to_string();
+        let dir_text = tmp.path().display().to_string();
+        assert_unreadable(&run, format, stage, &[&path_text, &dir_text, raw]);
+    }
+
+    #[test]
+    fn cid_sweep_prepare_fault_text_is_unreadable_exit_2_9505() {
+        sweep_fault_cell(
+            "text",
+            SWEEP_SQL_PREPARE_FAULT,
+            STAGE_PREPARE,
+            PREPARE_FAULT_RAW,
+        );
+    }
+
+    #[test]
+    fn cid_sweep_prepare_fault_json_is_unreadable_exit_2_9505() {
+        sweep_fault_cell(
+            "json",
+            SWEEP_SQL_PREPARE_FAULT,
+            STAGE_PREPARE,
+            PREPARE_FAULT_RAW,
+        );
+    }
+
+    #[test]
+    fn cid_sweep_step_fault_text_is_unreadable_exit_2_9505() {
+        sweep_fault_cell("text", SWEEP_SQL_STEP_FAULT, STAGE_STEP, STEP_FAULT_RAW);
+    }
+
+    #[test]
+    fn cid_sweep_step_fault_json_is_unreadable_exit_2_9505() {
+        sweep_fault_cell("json", SWEEP_SQL_STEP_FAULT, STAGE_STEP, STEP_FAULT_RAW);
+    }
+
+    /// Sibling: a database that cannot be opened is UNREADABLE too, not the
+    /// generic `Err` path.
+    #[test]
+    fn database_that_cannot_be_opened_is_unreadable_exit_2_9505() {
+        for format in ["text", "json"] {
+            let tmp = TempDir::new().unwrap();
+            // A directory is not a database file.
+            let run = run_case(tmp.path(), "root-9505", format, CID_SWEEP_SQL);
+            let dir_text = tmp.path().display().to_string();
+            assert_unreadable(&run, format, STAGE_OPEN, &[&dir_text]);
+        }
+    }
+
+    /// Sibling: a `reflection_depth` that does not decode is an error, never
+    /// depth 0 (which would report an over-cap chain as within its cap).
+    #[test]
+    fn reflection_depth_that_does_not_decode_is_an_error_9505() {
+        let tmp = TempDir::new().unwrap();
+        let (conn, _) = open_test_db(&tmp);
+        let id = insert_mem(&conn, "ns-9505", 0);
+        conn.execute(
+            "UPDATE memories SET reflection_depth = 'not-a-depth' WHERE id = ?1",
+            params![id],
+        )
+        .expect("corrupt depth");
+        let err = fetch_memory_meta(&conn, &id).expect_err("must not read as depth 0");
+        assert!(
+            matches!(
+                err.downcast_ref::<rusqlite::Error>(),
+                Some(rusqlite::Error::InvalidColumnType(..))
+            ),
+            "{err:#}"
+        );
+    }
+
+    /// Sibling: a signed-events read that fails is an error, never an empty
+    /// list presented as "no events".
+    #[test]
+    fn signed_events_read_failure_is_an_error_9505() {
+        let tmp = TempDir::new().unwrap();
+        let (conn, _) = open_test_db(&tmp);
+        let id = insert_mem(&conn, "ns-9505", 0);
+        conn.execute_batch("ALTER TABLE signed_events RENAME TO signed_events_gone_9505")
+            .expect("hide signed_events");
+        assert!(
+            build_chain_report(&conn, &id, true).is_err(),
+            "an unreadable signed_events table must not read as no events"
+        );
+        // Without the flag the table is never read.
+        assert!(build_chain_report(&conn, &id, false).is_ok());
     }
 }
