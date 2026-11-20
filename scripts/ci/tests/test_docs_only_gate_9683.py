@@ -1168,12 +1168,14 @@ class ActionRun(GateRepo):
         self.assertNotIn("extra.py", [p.name for p in stale.iterdir()])
 
     def test_not_a_pull_request_through_the_action_is_a_full_run_9683(self):
+        """Off pull_request the gate step never runs, even with a valid base sha in the event."""
         self.commit("docs/b.md", "b\n")
         for event in ("push", "merge_group", "workflow_dispatch", "pull_request_target", ""):
             with self.subTest(event=event):
-                result = self.run_action(event=event)
+                result = self.run_action(event=event, event_base=self.base)
                 self.assertFalse(result["failed"], result)
-                self.assertNotEqual(result["docs_only"], "true", result)
+                self.assertEqual(result["docs_only"], "", result)
+                self.assertEqual(result["outcomes"].get("gate"), "skipped", result)
 
     def test_a_failing_gate_step_fails_the_job_9683(self):
         """No continue-on-error on the gate step: a base step that writes true and then fails is a red job."""
