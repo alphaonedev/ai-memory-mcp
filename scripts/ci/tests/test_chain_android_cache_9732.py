@@ -86,6 +86,236 @@ def _expanded(step: base.Step, key: str, leg: dict[str, object]) -> dict[str, st
     return {k: base._expand_matrix(v, leg) for k, v in step.mapping(key).items()}
 
 
+# --- fix-begin ---
+# The whole-step and whole-job comparison (review r1 F1). Written by hand from the two workflows,
+# never derived from the text under test.
+KNOWN_STEP_KEYS = ("uses", "with", "env", "run", "if", "shell", "working-directory", "id", "name",
+                   "continue-on-error", "timeout-minutes")
+# Job-level keys that must be equal on both sides (`runs-on` and `env` are read by their own rule).
+JOB_KEYS_COMPARED = ("defaults", "container", "services", "permissions", "if", "concurrency",
+                     "outputs", "environment", "continue-on-error")
+# Job-level keys that may differ: the warm job is a different job with its own name, no `needs`,
+# its own cap, no matrix and its own step list (the steps are read step by step below).
+JOB_KEYS_MAY_DIFFER = ("name", "needs", "timeout-minutes", "strategy", "steps")
+JOB_KEYS_KNOWN = ("runs-on", "env", *JOB_KEYS_COMPARED, *JOB_KEYS_MAY_DIFFER)
+# Workflow-level keys compared the same way (`env` is read with the job-level env).
+WORKFLOW_KEYS_COMPARED = ("defaults",)
+# An env name one workflow carries and the other does not, by workflow. The cap only sizes the
+# self-hosted runner target directory; the hosted android leg and the warm job never read it.
+ENV_ONE_SIDED = {PR_NAME: ("SELF_HOSTED_TARGET_CAP_BYTES",), base.WARM: ()}
+
+SKIP_GATE = "needs.classify.outputs.cargo_skip != 'true'"
+CACHE_GATE = "steps.rust-cache.outputs.cache-hit != 'true'"
+ONCE_GATE = f"{SKIP_GATE} && matrix.once"
+NDK_GATE = f"{SKIP_GATE} && matrix.target == 'aarch64-linux-android'"
+CARGO_CHECK_STEP = "cargo check (--lib --features sqlite-bundled)"
+AUDIT_PR_STEP = "Security audit"
+AUDIT_WARM_STEP = "Install the pinned cargo-audit (no audit run)"
+AUDIT_WARM_RUN = 'cargo install cargo-audit --locked --force --version "${CARGO_AUDIT_VERSION}"'
+BUILD_PR_STEP = "Build release (once leg — release-profile smoke)"
+BUILD_WARM_STEP = "Build release (release-profile smoke)"
+CACHE_WARM_NAME = "Rust cache (write the key the PR job restores)"
+ANY = object()  # in a row: the value on that side is read by another test, not pinned here
+
+
+@dataclass(frozen=True)
+class Row:
+    """One mirrored step: its identity on each side and the keys allowed to differ, each with the
+    value the hand table expects on the PR side and on the warm side (None = key absent)."""
+
+    pr_id: str
+    warm_id: str
+    allowed: dict[str, tuple[object, object]]
+
+
+MIRRORS = (
+    Row("actions/checkout", "actions/checkout", {}),
+    Row(TOOLCHAIN_ACTION, TOOLCHAIN_ACTION, {"if": (SKIP_GATE, None)}),
+    Row(base.RUST_CACHE, base.RUST_CACHE,
+        {"if": (SKIP_GATE, None), "name": (None, CACHE_WARM_NAME), "id": (None, "rust-cache")}),
+    Row("nttld/setup-ndk", "nttld/setup-ndk", {"if": (NDK_GATE, CACHE_GATE)}),
+    Row(NDK_STEPS[1], NDK_STEPS[1], {"if": (NDK_GATE, CACHE_GATE)}),
+    Row(CARGO_CHECK_STEP, CARGO_CHECK_STEP, {"if": (SKIP_GATE, CACHE_GATE)}),
+    Row(AUDIT_PR_STEP, AUDIT_WARM_STEP,
+        {"name": (AUDIT_PR_STEP, AUDIT_WARM_STEP), "if": (ONCE_GATE, CACHE_GATE),
+         "run": (ANY, AUDIT_WARM_RUN)}),
+    Row(BUILD_PR_STEP, BUILD_WARM_STEP,
+        {"name": (BUILD_PR_STEP, BUILD_WARM_STEP), "if": (ONCE_GATE, CACHE_GATE)}),
+)
+# Steps of the PR job that have no warm counterpart (they run no cargo and write no cache input).
+PR_ONLY_STEPS = ("cargo_skip short-circuit", "actions/setup-python")
+
+
+def _relative(lines: list[str], indent: int) -> str:
+    """The non-comment lines of a block with `indent` columns removed (relative indent kept)."""
+    out = []
+    for line in lines:
+        if base._is_comment_or_blank(line):
+            continue
+        out.append(line.rstrip()[indent:] if base._indent(line) >= indent else line.strip())
+    return "\n".join(out)
+
+
+def _step_id(step: base.Step) -> str:
+    return step.uses_name() or step.label()
+
+
+def _step_value(step: base.Step, key: str, leg: dict[str, object]) -> str | None:
+    """The whole value of one step key (None when absent); the PR side expands `matrix.<name>`."""
+    if key == "run":
+        value = step.run() if "run" in step.blocks else None
+    elif key in step.keys:
+        value = step.keys[key]
+    elif key in step.blocks:
+        value = _relative(step.blocks[key], base.KEY_INDENT + 2)
+    else:
+        return None
+    return None if value is None else base._expand_matrix(value, leg)
+
+
+def _identities(wf: base.Workflow, job: base.Job,
+                problems: list[str]) -> tuple[dict[str, base.Step], set[str]]:
+    groups: dict[str, list[base.Step]] = {}
+    for step in job.steps():
+        groups.setdefault(_step_id(step), []).append(step)
+    found: dict[str, base.Step] = {}
+    duplicated: set[str] = set()
+    for ident, group in groups.items():
+        if len(group) > 1:
+            duplicated.add(ident)
+            problems.append(f"{wf.name}:{job.job_id}: step {ident!r} appears {len(group)} times")
+        else:
+            found[ident] = group[0]
+    return found, duplicated
+
+
+def _step_problems(pr_wf: base.Workflow, pr_job: base.Job, warm_wf: base.Workflow,
+                   warm_job: base.Job, leg: dict[str, object]) -> list[str]:
+    problems: list[str] = []
+    pr_steps, pr_dup = _identities(pr_wf, pr_job, problems)
+    warm_steps, warm_dup = _identities(warm_wf, warm_job, problems)
+    for row in MIRRORS:
+        missing = False
+        for wf, job, ident, steps, dup in ((pr_wf, pr_job, row.pr_id, pr_steps, pr_dup),
+                                           (warm_wf, warm_job, row.warm_id, warm_steps, warm_dup)):
+            if ident not in steps and ident not in dup:
+                problems.append(f"{wf.name}:{job.job_id}: no step {ident!r} (the mirror table "
+                                f"needs it)")
+                missing = True
+        if missing or row.pr_id not in pr_steps or row.warm_id not in warm_steps:
+            continue
+        pr_step, warm_step = pr_steps[row.pr_id], warm_steps[row.warm_id]
+        for wf, job, ident, step in ((pr_wf, pr_job, row.pr_id, pr_step),
+                                     (warm_wf, warm_job, row.warm_id, warm_step)):
+            for key in dict.fromkeys([*step.blocks, *step.keys]):
+                if key not in KNOWN_STEP_KEYS:
+                    problems.append(f"{wf.name}:{job.job_id} step {ident!r}: step key {key!r} is "
+                                    f"not a known step key")
+        for key in KNOWN_STEP_KEYS:
+            pr_val = _step_value(pr_step, key, leg)
+            warm_val = _step_value(warm_step, key, {})
+            if key in row.allowed:
+                for wf, job, ident, actual, expected in (
+                        (pr_wf, pr_job, row.pr_id, pr_val, row.allowed[key][0]),
+                        (warm_wf, warm_job, row.warm_id, warm_val, row.allowed[key][1])):
+                    if expected is not ANY and actual != expected:
+                        problems.append(f"{wf.name}:{job.job_id} step {ident!r}: key {key!r} is "
+                                        f"{actual!r}, the hand table says {expected!r}")
+            elif pr_val != warm_val:
+                problems.append(f"{pr_wf.name}:{pr_job.job_id} step {row.pr_id!r} vs "
+                                f"{warm_wf.name}:{warm_job.job_id} step {row.warm_id!r}: key "
+                                f"{key!r} differs: {pr_wf.name} has {pr_val!r}, {warm_wf.name} "
+                                f"has {warm_val!r}")
+    mirrored_pr = {row.pr_id for row in MIRRORS} | set(PR_ONLY_STEPS)
+    mirrored_warm = {row.warm_id for row in MIRRORS}
+    for wf, job, steps, known in ((pr_wf, pr_job, pr_steps, mirrored_pr),
+                                   (warm_wf, warm_job, warm_steps, mirrored_warm)):
+        for ident in steps:
+            if ident not in known:
+                problems.append(f"{wf.name}:{job.job_id} step {ident!r}: no row in the mirror "
+                                f"table")
+    return problems
+
+
+def _job_keys(job: base.Job) -> list[str]:
+    keys = (line.strip().partition(":")[0] for line in job.lines
+            if base._indent(line) == 4 and not base._is_comment_or_blank(line))
+    return list(dict.fromkeys(keys))
+
+
+def _job_value(job: base.Job, key: str, leg: dict[str, object]) -> str | None:
+    if key not in _job_keys(job):
+        return None
+    return base._expand_matrix(_relative(job.block(key), 6), leg)
+
+
+def _runner(wf: base.Workflow, job: base.Job, leg: dict[str, object],
+            problems: list[str]) -> str | None:
+    try:
+        return base._runs_on(job, leg)
+    except AssertionError as exc:
+        problems.append(f"{wf.name}:{job.job_id}: runs-on cannot be read: {exc}")
+        return None
+
+
+def _resolved_env(wf: base.Workflow, job: base.Job, leg: dict[str, object],
+                  problems: list[str]) -> tuple[dict[str, str], set[str]]:
+    env: dict[str, str] = {}
+    failed: set[str] = set()
+    for name, raw in {**wf.env(), **job.env()}.items():
+        try:
+            env[name] = base._effective_env_value(name, raw, leg)
+        except AssertionError as exc:
+            failed.add(name)
+            problems.append(f"{wf.name}:{job.job_id}: env {name!r} cannot be evaluated: {exc}")
+    return env, failed
+
+
+def _job_problems(pr_wf: base.Workflow, pr_job: base.Job, warm_wf: base.Workflow,
+                  warm_job: base.Job, leg: dict[str, object]) -> list[str]:
+    problems: list[str] = []
+    where = f"{pr_wf.name}:{pr_job.job_id} vs {warm_wf.name}:{warm_job.job_id}"
+    for wf, job in ((pr_wf, pr_job), (warm_wf, warm_job)):
+        for key in _job_keys(job):
+            if key not in JOB_KEYS_KNOWN:
+                problems.append(f"{wf.name}:{job.job_id}: job key {key!r} is not a known job key")
+    pr_runner = _runner(pr_wf, pr_job, leg, problems)
+    warm_runner = _runner(warm_wf, warm_job, {}, problems)
+    pairs = [("runs-on", pr_runner, warm_runner)] if pr_runner and warm_runner else []
+    for key in JOB_KEYS_COMPARED:
+        pairs.append((key, _job_value(pr_job, key, leg), _job_value(warm_job, key, {})))
+    for key, pr_val, warm_val in pairs:
+        if pr_val != warm_val:
+            problems.append(f"{where}: job key {key!r} differs: {pr_wf.name} has {pr_val!r}, "
+                            f"{warm_wf.name} has {warm_val!r}")
+    pr_env, pr_failed = _resolved_env(pr_wf, pr_job, leg, problems)
+    warm_env, warm_failed = _resolved_env(warm_wf, warm_job, {}, problems)
+    pr_free = ENV_ONE_SIDED.get(pr_wf.name, ())
+    warm_free = ENV_ONE_SIDED.get(warm_wf.name, ())
+    for name in sorted({*pr_env, *warm_env} - pr_failed - warm_failed):
+        if name in pr_env and name not in warm_env and name in pr_free:
+            continue
+        if name in warm_env and name not in pr_env and name in warm_free:
+            continue
+        if pr_env.get(name) != warm_env.get(name):
+            problems.append(f"{where}: env {name!r} differs: {pr_wf.name} has "
+                            f"{pr_env.get(name)!r}, {warm_wf.name} has {warm_env.get(name)!r}")
+    for key in WORKFLOW_KEYS_COMPARED:
+        pr_val = _relative(pr_wf.top(key), 2) or None
+        warm_val = _relative(warm_wf.top(key), 2) or None
+        if pr_val != warm_val:
+            problems.append(f"{pr_wf.name} vs {warm_wf.name}: workflow key {key!r} differs: "
+                            f"{pr_wf.name} has {pr_val!r}, {warm_wf.name} has {warm_val!r}")
+    return problems
+
+
+def mirror_problems(pr_wf: base.Workflow, pr_job: base.Job, warm_wf: base.Workflow,
+                    warm_job: base.Job, leg: dict[str, object]) -> list[str]:
+    """Every difference between the android leg and its warm job that the hand table does not
+    allow: step by step (every key), then the job-level keys, `runs-on` and the merged `env`."""
+    return (_step_problems(pr_wf, pr_job, warm_wf, warm_job, leg)
+            + _job_problems(pr_wf, pr_job, warm_wf, warm_job, leg))
+# --- fix-end ---
 
 
 # --- fixtures: mutated copies of the two workflow texts ---------------------------------------
