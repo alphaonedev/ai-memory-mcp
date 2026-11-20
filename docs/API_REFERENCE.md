@@ -1540,8 +1540,10 @@ mTLS client certificate is bound to exactly that id. The row is keyed
 pull with no authenticated peer (signature not required, the
 unenrolled-peer rollout arm, no `X-Peer-Id`, or a certificate bound to
 another id or to none) is still served and records nothing. An absent
-`X-Agent-Id`, or one with an empty value (treated as absent, #9656), is
-unauthenticated and served.
+`X-Agent-Id`, or one with an empty value (treated as absent, #9656), is not
+compared: an authenticated pull without it still records its own
+`(peer, peer)` row, and an unauthenticated pull is served and records
+nothing.
 
 Refusals specific to this route:
 

@@ -838,7 +838,7 @@ mod authenticated_pull_peer_9596_tests {
             assert_eq!(
                 got.as_ref().map(AuthenticatedPullPeer::as_str),
                 want,
-                "cert={cert:?} outcome={outcome:?} header={header:?}"
+                "#9596: authenticated_pull_peer outcome={outcome:?}"
             );
         }
     }
@@ -939,7 +939,11 @@ mod read_agent_id_header_9665_tests {
             let Err(resp) = read_agent_id_header(&map) else {
                 panic!("values={values:?} must be refused");
             };
-            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "values={values:?}");
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "#9665: an unreadable agent id must be refused"
+            );
             let bytes = axum::body::to_bytes(resp.into_body(), BODY_CAP)
                 .await
                 .expect("body");

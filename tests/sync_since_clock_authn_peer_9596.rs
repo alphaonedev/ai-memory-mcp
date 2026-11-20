@@ -20,9 +20,11 @@
 //!   3. a request authenticated as P that names only P records `(P, P)`
 //!      with the pulled watermark as its value;
 //!   4. an `X-Agent-Id` that cannot be read as one value is refused with
-//!      the exact `sync_since_agent_id_unreadable` tag (#9665); an empty
-//!      value counts as absent, and an absent id is unauthenticated and
-//!      served (#9656);
+//!      the exact `sync_since_agent_id_unreadable` tag (#9665). An absent
+//!      `X-Agent-Id`, or one with an empty value (treated as absent,
+//!      #9656), is not compared: an authenticated pull without it still
+//!      records its own `(peer, peer)` row, and an unauthenticated pull is
+//!      served and records nothing;
 //!   5. a failed clock write is logged at WARN and the pull is still served.
 //!
 //! Peer authentication has two paths, each with its own rows here so a
@@ -375,23 +377,23 @@ async fn authenticated_peer_naming_another_principal_is_refused_and_writes_no_cl
         assert_eq!(
             rows,
             Vec::<(String, String)>::new(),
-            "#9596: a pull authenticated as {ALICE} naming peer={peer_param:?} \
-             agent={agent_header:?} must write no clock row; body={body}"
+            "#9596: a pull authenticated as {ALICE} naming another principal \
+             must write no clock row"
         );
         assert_eq!(
             status,
             StatusCode::FORBIDDEN,
-            "#9596: mismatch peer={peer_param:?} agent={agent_header:?} must be refused; body={body}"
+            "#9596: a mismatched principal must be refused"
         );
         assert_eq!(
             body["error"].as_str(),
             Some(MISMATCH_TAG),
-            "#9596: refusal must carry the exact tag; body={body}"
+            "#9596: refusal must carry the exact tag"
         );
         assert_eq!(
             body["authenticated_peer"].as_str(),
             Some(ALICE),
-            "#9596: refusal names the authenticated peer; body={body}"
+            "#9596: refusal names the authenticated peer"
         );
     }
 }
@@ -402,8 +404,8 @@ const UNAUTHENTICATED_CASES: &[(Option<&str>, Option<&str>, Option<&str>)] = &[
     (Some(VICTIM), Some(VICTIM), Some(SERVER)),
     (Some(ALICE), Some(ALICE), Some(ALICE)),
     (Some(VICTIM), Some(VICTIM), Some(VICTIM)),
-    // #9656 — an empty `X-Agent-Id` counts as absent, and an absent id is
-    // unauthenticated: served, no clock.
+    // #9656 — an empty `X-Agent-Id` counts as absent and is not compared;
+    // with no authenticated peer the pull is served and records no clock.
     (Some(ALICE), Some(ALICE), Some("")),
     (Some(ALICE), Some(ALICE), None),
 ];
@@ -421,18 +423,17 @@ async fn unauthenticated_pull_writes_no_clock_9596() {
         assert_eq!(
             rows,
             Vec::<(String, String)>::new(),
-            "#9596: an unauthenticated pull (x-peer-id={peer_header:?} peer={peer_param:?} \
-             agent={agent_header:?}) must write no clock row; body={body}"
+            "#9596: an unauthenticated pull must write no clock row"
         );
         assert_eq!(
             status,
             StatusCode::OK,
-            "#9596: the unauthenticated pull itself is still served; body={body}"
+            "#9596: the unauthenticated pull itself is still served"
         );
         assert_eq!(
             body["count"].as_u64(),
             Some(1),
-            "#9596: the seeded row is still projected; body={body}"
+            "#9596: the seeded row is still projected"
         );
     }
 }
@@ -446,12 +447,16 @@ async fn unsigned_pull_from_enrolled_peer_is_refused_and_writes_no_clock_9596() 
     let (status, body) = pull(&host, &query, Some(ALICE), Some(ALICE), false).await;
     let rows = clock_rows(&host);
     clear_posture();
-    assert_eq!(rows, Vec::<(String, String)>::new(), "body={body}");
-    assert_eq!(status, StatusCode::UNAUTHORIZED, "body={body}");
+    assert_eq!(rows, Vec::<(String, String)>::new(), "#9596: no clock row");
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "#9596: unsigned pull refused"
+    );
     assert_eq!(
         body["error"].as_str(),
         Some("x_memory_sig_missing"),
-        "body={body}"
+        "#9596: exact refusal tag"
     );
 }
 
@@ -475,18 +480,17 @@ async fn authenticated_peer_records_only_its_own_clock_9596() {
             ai_memory::db::sync_state_load(&conn, ALICE).expect("load clock")
         };
         clear_posture();
-        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert_eq!(status, StatusCode::OK, "#9596: pull served");
         assert_eq!(
             rows,
             vec![(ALICE.to_string(), ALICE.to_string())],
-            "#9596: the clock is keyed (authenticated peer, authenticated peer); \
-             agent={agent_header:?} body={body}"
+            "#9596: the clock is keyed (authenticated peer, authenticated peer)"
         );
         assert_eq!(
             watermarks.entries.get(ALICE).map(String::as_str),
             Some(SEED_UPDATED_AT),
             "#9596: the recorded watermark is the pulled row's timestamp, under the \
-             authenticated peer; agent={agent_header:?}"
+             authenticated peer"
         );
     }
 }
@@ -502,8 +506,8 @@ async fn pull_without_peer_param_writes_no_clock_9596() {
     let (status, body) = pull(&host, &query, Some(ALICE), Some(ALICE), true).await;
     let rows = clock_rows(&host);
     clear_posture();
-    assert_eq!(status, StatusCode::OK, "body={body}");
-    assert_eq!(rows, Vec::<(String, String)>::new(), "body={body}");
+    assert_eq!(status, StatusCode::OK, "#9596: pull served");
+    assert_eq!(rows, Vec::<(String, String)>::new(), "#9596: no clock row");
 }
 
 /// #9665 — `X-Agent-Id` values that cannot be read as exactly one value:
@@ -551,23 +555,19 @@ async fn unreadable_agent_id_is_refused_and_writes_no_clock_9665() {
         assert_eq!(
             rows,
             Vec::<(String, String)>::new(),
-            "#9665: values={values:?} must write no clock row; body={body}"
+            "#9665: an unreadable agent id must write no clock row"
         );
         assert_eq!(
             status,
             StatusCode::BAD_REQUEST,
-            "#9665: values={values:?} must be refused; body={body}"
+            "#9665: an unreadable agent id must be refused"
         );
         assert_eq!(
             body["error"].as_str(),
             Some(AGENT_ID_UNREADABLE_TAG),
-            "#9665: exact tag; values={values:?} body={body}"
+            "#9665: exact tag"
         );
-        assert_eq!(
-            body["reason"].as_str(),
-            Some(reason),
-            "#9665: exact reason; values={values:?} body={body}"
-        );
+        assert_eq!(body["reason"].as_str(), Some(reason), "#9665: exact reason");
     }
 }
 
@@ -601,14 +601,14 @@ async fn rollout_arm_serves_an_unenrolled_peer_without_recording_its_clock_9596(
             rows,
             Vec::<(String, String)>::new(),
             "#9596: the rollout arm authenticates no one (require_enrollment=\
-             {require_enrollment} allow_unenrolled={allow_unenrolled}); body={body}"
+             {require_enrollment} allow_unenrolled={allow_unenrolled})"
         );
         assert_eq!(
             status,
             StatusCode::OK,
-            "#9596: the rollout arm still serves the pull; body={body}"
+            "#9596: the rollout arm still serves the pull"
         );
-        assert_eq!(body["count"].as_u64(), Some(1), "body={body}");
+        assert_eq!(body["count"].as_u64(), Some(1), "#9596: one row projected");
     }
 }
 
@@ -644,16 +644,15 @@ async fn cert_bound_to_exactly_the_asserted_peer_records_its_clock_9596() {
         unsafe {
             std::env::set_var(FED_CERT_PEER_BINDING_ENV, CERT_BINDING_WARN);
         }
-        let label = format!("{binding:?}");
         let host = setup_with_cert(Some(binding));
         let query = query_for(Some(peer_header));
         let (status, body) = pull(&host, &query, Some(peer_header), Some(peer_header), false).await;
         let rows = clock_rows(&host);
         clear_posture();
-        assert_eq!(status, StatusCode::OK, "cert={label}; body={body}");
+        assert_eq!(status, StatusCode::OK, "#9596: cert-bound pull served");
         assert_eq!(
             rows, want,
-            "#9596: cert={label} x-peer-id={peer_header} must record exactly {want:?}; body={body}"
+            "#9596: the cert binding must record exactly the expected clock rows"
         );
     }
 }
@@ -721,12 +720,8 @@ async fn failed_clock_write_is_logged_at_warn_9596() {
     let rows = clock_rows(&host);
     clear_posture();
     let logs = sink.text();
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "the pull is still served; body={body}"
-    );
-    assert_eq!(rows, Vec::<(String, String)>::new(), "body={body}");
+    assert_eq!(status, StatusCode::OK, "#9596: the pull is still served");
+    assert_eq!(rows, Vec::<(String, String)>::new(), "#9596: no clock row");
     let line = logs
         .lines()
         .find(|l| l.contains(CLOCK_WRITE_WARN))
