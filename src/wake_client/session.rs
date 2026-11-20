@@ -37,7 +37,6 @@ use std::time::Duration;
 use anyhow::{Context as _, Result, bail};
 use bytes::{Bytes, BytesMut};
 use tokio::io::AsyncWriteExt as _;
-use tokio::net::UnixStream;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio_stream::StreamExt as _;
 use tokio_util::codec::{Encoder as _, FramedRead, LengthDelimitedCodec};
@@ -260,10 +259,7 @@ impl Session {
 /// refusal from the hub. Every one is a case where continuing would mean a
 /// listener that looks attached and is woken by nobody.
 pub async fn connect(cfg: &SessionConfig, bundle: &HubJoinBundle) -> Result<Session> {
-    assert_socket_is_owner_only(&cfg.socket_path)?;
-    let stream = UnixStream::connect(&cfg.socket_path)
-        .await
-        .with_context(|| format!("connecting to {}", cfg.socket_path.display()))?;
+    let stream = super::dial::dial_hub_socket(&cfg.socket_path).await?;
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = FramedRead::new(read_half, codec());
     let welcome = handshake(cfg, bundle, &mut reader, &mut write_half).await?;
@@ -381,11 +377,20 @@ async fn write_framed(write_half: &mut OwnedWriteHalf, body: Bytes) -> Result<()
 /// another uid, or carries any group/other permission bit — on the socket or
 /// on its parent directory.
 pub fn assert_socket_is_owner_only(path: &Path) -> Result<()> {
+    assert_socket_is_owned_by(path, current_euid())
+}
+
+/// [`assert_socket_is_owner_only`] with the expected owner passed in, so a
+/// test can name a uid the caller is not (the wrong-owner case needs no root).
+///
+/// # Errors
+///
+/// As [`assert_socket_is_owner_only`], with `euid` as the expected owner.
+pub(crate) fn assert_socket_is_owned_by(path: &Path, euid: u32) -> Result<()> {
     use std::os::unix::fs::FileTypeExt as _;
     use std::os::unix::fs::MetadataExt as _;
     use std::os::unix::fs::PermissionsExt as _;
 
-    let euid = current_euid();
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         let dir = std::fs::metadata(parent).with_context(|| {
             format!(
@@ -451,6 +456,7 @@ pub fn assert_socket_is_owner_only(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::net::UnixStream;
     // #3641 F1 — `encode_error` is used only by the refusal-frame fixtures in
     // this module; keep it out of the production import so the non-test build
     // carries no unused import (all five clippy forms).

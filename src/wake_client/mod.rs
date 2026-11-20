@@ -58,6 +58,7 @@
 //! silently stopped reading must not look like a quiet inbox.
 
 pub mod bundle;
+pub mod dial;
 pub mod session;
 
 use std::sync::Arc;
@@ -415,6 +416,23 @@ impl WakeStream {
     #[must_use]
     pub fn metrics(&self) -> Arc<ClientMetrics> {
         Arc::clone(&self.metrics)
+    }
+
+    /// A stream with no producer tasks, for tests of what a consumer does when
+    /// the stream ends or stays quiet. The returned sender keeps it live until
+    /// dropped.
+    #[cfg(test)]
+    pub(crate) fn detached_for_test() -> (Self, mpsc::Sender<WakeSignal>) {
+        let (tx, rx) = mpsc::channel::<WakeSignal>(SIGNAL_QUEUE_DEPTH);
+        (
+            Self {
+                rx,
+                read_done: Arc::new(Notify::new()),
+                metrics: Arc::new(ClientMetrics::default()),
+                tasks: Vec::new(),
+            },
+            tx,
+        )
     }
 
     /// Await the next signal. `None` only when every producer has stopped.

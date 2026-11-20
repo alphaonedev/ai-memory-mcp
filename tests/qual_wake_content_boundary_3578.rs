@@ -184,14 +184,22 @@ fn expected_hook_metadata() -> Vec<(String, String)> {
 #[test]
 fn admitted_read_render_and_audited_operator_edges_are_pinned() {
     let src = source("src/cli/wake_listen.rs");
+    // #9641: the loop moved out of `dispatch` into `listen_loop` so its exit
+    // contract is testable; the same two edges are pinned where they now live,
+    // and `dispatch` must still hand the run to that loop.
     let dispatch = function(&src, "dispatch");
     assert!(contains(
         &dispatch,
+        "listen_loop(db_path, args, &resolved, &mut stream, &mut stop).await"
+    ));
+    let listen_loop = function(&src, "listen_loop");
+    assert!(contains(
+        &listen_loop,
         "catch_up_read(db_path, &resolved.agent_id, args.unread_only, args.limit).await"
     ));
     assert!(contains(
-        &dispatch,
-        "emit(&resolved, args, &signal, count).await?"
+        &listen_loop,
+        "emit(resolved, args, &signal, count).await?"
     ));
     let read = function(&src, "catch_up_read");
     assert!(contains(

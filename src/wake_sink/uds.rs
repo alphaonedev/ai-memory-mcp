@@ -50,7 +50,6 @@ use anyhow::{Context as _, Result, bail};
 use bytes::{Bytes, BytesMut};
 use rand_core::RngCore as _;
 use tokio::io::AsyncWriteExt as _;
-use tokio::net::UnixStream;
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt as _;
@@ -438,9 +437,7 @@ async fn connect_and_pump(
     metrics: &SinkMetrics,
     rx: &mut mpsc::Receiver<Bytes>,
 ) -> Result<()> {
-    let stream = UnixStream::connect(&cfg.socket_path)
-        .await
-        .with_context(|| format!("connecting to {}", cfg.socket_path.display()))?;
+    let stream = crate::wake_client::dial::dial_hub_socket(&cfg.socket_path).await?;
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = FramedRead::new(read_half, codec());
     handshake(cfg, credential, &mut reader, &mut write_half).await?;
@@ -848,5 +845,118 @@ mod tests {
         );
         assert!(rendered.contains("pubkey_bytes"), "{rendered}");
         assert!(!rendered.contains("WIRE-MATERIAL-3469"), "{rendered}");
+    }
+
+    // ---------------------------------------------------------------------
+    // #9638 — the forwarder verifies the socket before it sends a frame.
+    // ---------------------------------------------------------------------
+
+    /// What one dial attempt against a socket in a given posture did.
+    struct DialOutcome9638 {
+        /// The error `connect_and_pump` ended with (it never returns `Ok`
+        /// here: the "hub" accepts and drops, or is never reached).
+        error: String,
+        /// Connections the listener accepted: nonzero means a connection (and
+        /// so a handshake frame) reached a socket the preflight should refuse.
+        accepted: usize,
+        /// The socket path, for building the exact expected text.
+        socket: PathBuf,
+    }
+
+    /// Bind a hub-shaped socket in a `dir_mode` directory at `socket_mode`,
+    /// accept-and-drop every connection, and dial it with `connect_and_pump`.
+    async fn dial_posture_9638(dir_mode: u32, socket_mode: u32) -> DialOutcome9638 {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("chmod dir 0700 to bind");
+        let socket = dir.path().join("h9638.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind");
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(socket_mode))
+            .expect("chmod socket");
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(dir_mode))
+            .expect("chmod dir");
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&accepted);
+        let acceptor = tokio::spawn(async move {
+            while let Ok((conn, _)) = listener.accept().await {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                drop(conn);
+            }
+        });
+
+        let cfg = UdsSinkConfig::with_socket_path(socket.clone());
+        let credential = NamedCredential::new(WAKE_HUB_PRODUCER);
+        let metrics = SinkMetrics::default();
+        let (_tx, mut rx) = mpsc::channel::<Bytes>(4);
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            connect_and_pump(&cfg, credential.as_ref(), &metrics, &mut rx),
+        )
+        .await
+        .expect("the dial attempt must end within the bound");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        acceptor.abort();
+        // Restore so the tempdir can be removed.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("restore");
+        DialOutcome9638 {
+            error: format!("{:#}", result.expect_err("the attempt never succeeds")),
+            accepted: accepted.load(std::sync::atomic::Ordering::SeqCst),
+            socket,
+        }
+    }
+
+    /// DENIED: a world-writable socket is refused with the named error, and no
+    /// connection (so no handshake byte) reaches it.
+    #[tokio::test]
+    async fn the_sink_refuses_a_world_writable_socket_and_sends_nothing_9638() {
+        let out = dial_posture_9638(0o700, 0o666).await;
+        assert_eq!(
+            out.error,
+            format!(
+                "{} is mode 0666; a wake-hub socket must be 0600",
+                out.socket.display()
+            )
+        );
+        assert_eq!(out.accepted, 0, "no connection may reach the socket");
+    }
+
+    /// DENIED: a group-writable socket.
+    #[tokio::test]
+    async fn the_sink_refuses_a_group_writable_socket_and_sends_nothing_9638() {
+        let out = dial_posture_9638(0o700, 0o620).await;
+        assert_eq!(
+            out.error,
+            format!(
+                "{} is mode 0620; a wake-hub socket must be 0600",
+                out.socket.display()
+            )
+        );
+        assert_eq!(out.accepted, 0, "no connection may reach the socket");
+    }
+
+    /// DENIED: a socket in a directory other users can write to (they could
+    /// replace the socket between the check and the dial).
+    #[tokio::test]
+    async fn the_sink_refuses_a_group_writable_directory_and_sends_nothing_9638() {
+        let out = dial_posture_9638(0o775, 0o600).await;
+        let dir = out.socket.parent().expect("parent").display().to_string();
+        assert_eq!(
+            out.error,
+            format!(
+                "{dir} is mode 0775; the wake-hub socket directory must be 0700. Another local \
+                 user could otherwise replace the socket and take this listener's handshake."
+            )
+        );
+        assert_eq!(out.accepted, 0, "no connection may reach the socket");
+    }
+
+    /// ALLOWED: the standard posture (0600 socket in a 0700 directory) still
+    /// connects, so the refusals above are not a blanket failure.
+    #[tokio::test]
+    async fn the_sink_still_connects_to_an_owner_only_socket_9638() {
+        let out = dial_posture_9638(0o700, 0o600).await;
+        assert_eq!(out.accepted, 1, "the standard posture is dialled");
     }
 }
