@@ -24,7 +24,10 @@ that never started wrote no log).  The parser reads libtest output:
 
 Every shown value is a ``Cleaned``, which only ``clean()`` (cut to the line bound, then the redaction of
 ``scripts/cert_gate_evidence.py``) and ``render_name()`` make; ``Findings`` refuses anything else.  Counting and
-de-duplication run on the raw values, so N failing tests always print ``failing tests: N``.  ``render_name`` shows a
+de-duplication run on the raw values, so N failing tests always print ``failing tests: N``: a test is keyed on its
+binary and the first NAME_KEY_BYTES UTF-8 bytes of its name, and every input line is cut in bytes on a character
+boundary (``cut_bytes``), so the FAILED line and the failures-list line of one name give one key and no cut line
+holds a half character.  ``render_name`` shows a
 name as written only when it has the plain Rust path shape and no token shape; every other name goes through
 ``clean()``.  Output passes the shared escape of ``workflow_annotation.py``; Markdown cells also escape ``&``, ``<``,
 ``|``, a backtick and ``[`` and break GFM autolinks and @mentions with a zero-width space.  Each bound is a named
@@ -127,9 +130,13 @@ TITLE_CAUSE = "red cause"
 TEST_PREFIX = "test "
 FAILED_SUFFIX = " ... FAILED"
 FAILED_SUFFIX_BYTES = FAILED_SUFFIX.encode("ascii")
-# A name is keyed on at most this many characters: what a cut FAILED line keeps, so the same long name in its FAILED
-# line and in the failures list counts once.
-NAME_KEY_CHARS = MAX_LINE_BYTES - len(TEST_PREFIX) - len(FAILED_SUFFIX)
+# A name is keyed on at most this many UTF-8 bytes, cut on a character boundary: the most a cut FAILED line keeps, so
+# the same long name in its FAILED line and in the failures list is one key (both lines are cut in bytes).
+NAME_KEY_BYTES = MAX_LINE_BYTES - len(TEST_PREFIX) - len(FAILED_SUFFIX)
+# UTF-8 continuation bytes are 10xxxxxx; a character has at most 3 of them, so a cut backs up at most 3 bytes.
+UTF8_CONTINUATION_MASK = 0xC0
+UTF8_CONTINUATION_TAG = 0x80
+UTF8_MAX_BACKUP = 3
 RESULT_PREFIX = "test result:"
 RESULT_FAILED_PREFIX = "test result: FAILED"
 FAILURES_HEADER = "failures:"
@@ -211,8 +218,21 @@ def load_redaction():
     _redact_line = module.redact_line
 
 
+def cut_bytes(data, limit):
+    """``data`` (UTF-8 bytes) cut to at most ``limit`` bytes without splitting a character: a cut that falls inside a
+    multi-byte character backs up to that character's first byte, so nothing cut decodes to U+FFFD."""
+    if len(data) <= limit:
+        return data
+    end = limit
+    for _ in range(UTF8_MAX_BACKUP):
+        if end > 0 and data[end] & UTF8_CONTINUATION_MASK == UTF8_CONTINUATION_TAG:
+            end -= 1
+    return data[:end]
+
+
 def clean(text):
-    """``text`` cut to the line bound and redacted; a redaction that fails yields a fixed marker, never the raw text."""
+    """``text`` cut to the line bound (in characters, which never splits one) and redacted; a redaction that fails
+    yields a fixed marker, never the raw text."""
     if _redact_line is None:
         return Cleaned(REDACTION_FAILED, _MINT)
     shown = text if len(text) <= MAX_LINE_BYTES else text[:MAX_LINE_BYTES]
@@ -288,8 +308,9 @@ class Findings:
 
     def add_test(self, raw_binary, raw_name, shown_binary, shown_name):
         require_cleaned(shown_binary, shown_name)
-        digest = hashlib.blake2b((raw_binary + "\x00" + raw_name[:NAME_KEY_CHARS]).encode("utf-8", "replace"),
-                                 digest_size=16).digest()
+        key = raw_binary.encode("utf-8", "replace") + b"\x00" + cut_bytes(raw_name.encode("utf-8", "replace"),
+                                                                          NAME_KEY_BYTES)
+        digest = hashlib.blake2b(key, digest_size=16).digest()
         if digest in self.test_keys:
             return
         self.test_keys.add(digest)
@@ -330,9 +351,9 @@ def parse_data(data, findings):
         if len(raw) > MAX_LINE_BYTES:
             findings.cut_lines += 1
             if raw.endswith(FAILED_SUFFIX_BYTES):  # a long failing test name is cut, never its FAILED verdict
-                raw = raw[:MAX_LINE_BYTES - len(FAILED_SUFFIX_BYTES)] + FAILED_SUFFIX_BYTES
+                raw = cut_bytes(raw, MAX_LINE_BYTES - len(FAILED_SUFFIX_BYTES)) + FAILED_SUFFIX_BYTES
             else:
-                raw = raw[:MAX_LINE_BYTES]
+                raw = cut_bytes(raw, MAX_LINE_BYTES)
         line = ANSI.sub("", raw.decode("utf-8", "replace"))
         stripped = line.strip()
         if in_list:
@@ -482,7 +503,7 @@ def scan(paths, problems):
 def first_error_line(data):
     """The first ``error[``/``error:`` line of a step log (colour removed), or None."""
     for chunk in data.split(b"\n"):
-        text = ANSI.sub("", chunk[:MAX_LINE_BYTES].decode("utf-8", "replace")).strip()
+        text = ANSI.sub("", cut_bytes(chunk, MAX_LINE_BYTES).decode("utf-8", "replace")).strip()
         if text.startswith(ERROR_LINE_PREFIXES):
             return text
     return None
