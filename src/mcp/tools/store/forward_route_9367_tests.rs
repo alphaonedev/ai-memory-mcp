@@ -73,7 +73,6 @@ fn every_non_segment_action_id_is_refused_before_any_byte_9367() {
         );
         return;
     }
-    let _id = AgentIdOverride::set(AGENT);
     let (url, rx) = server(vec![OK_200.to_string()]);
     for (row, id, want) in refused_rows() {
         let err = transition_err(&url, &json!(id)).expect(row);
@@ -107,7 +106,6 @@ fn a_refused_action_id_is_checked_before_the_key_is_read_9367() {
         return;
     }
     assert!(!child_key_path().exists(), "the key file is absent");
-    let _id = AgentIdOverride::set(AGENT);
     let (url, rx) = server(vec![OK_200.to_string()]);
     for (row, id, want) in refused_rows() {
         let err = transition_err(&url, &json!(id)).expect(row);
@@ -129,7 +127,6 @@ fn a_valid_action_id_is_one_exact_path_segment_9367() {
         );
         return;
     }
-    let _id = AgentIdOverride::set(AGENT);
     let (url, rx) = server(vec![OK_200.to_string()]);
     let ceiling = "b".repeat(ID_CEILING);
     let ids = ["act-1", "ns:act_2.v@host", ceiling.as_str()];
@@ -161,7 +158,6 @@ fn a_huge_action_id_is_refused_in_bounded_time_9367() {
         );
         return;
     }
-    let _id = AgentIdOverride::set(AGENT);
     let (url, rx) = server(vec![OK_200.to_string()]);
     let id = "a/".repeat(HUGE_ID_BYTES / 2);
     let started = Instant::now();
