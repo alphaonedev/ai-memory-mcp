@@ -71,11 +71,13 @@ KIND_VIOLATION = "violation"
 KIND_NOT_ANALYSED = "not-analysed"
 OPEN_PIN = 33
 NOT_ANALYSED_PIN = 3
-VIOLATION_PIN = 32  # 33 after the pre-scan of #9566; stage 1 of #9455 removed the lifetime-tests R2 row
+# 33 after the pre-scan of #9566, 32 after stage 1 of #9455 removed the lifetime-tests R2 row, then 34 for
+# the two docker rows of #9570 the full analysis of every job reaches (9566 item 3).
+VIOLATION_PIN = 34
 PIN_CEILINGS = {KIND_UNCLASSIFIABLE: OPEN_PIN, KIND_VIOLATION: VIOLATION_PIN, KIND_NOT_ANALYSED: NOT_ANALYSED_PIN}
 # The name each kind's table carries in a pin line.
 TABLE_NAMES = {KIND_UNCLASSIFIABLE: "unclassifiable", KIND_VIOLATION: "allow", KIND_NOT_ANALYSED: "not-analysed"}
-PINS_LINE = "unclassifiable 33; not-analysed 3; violation 32"
+PINS_LINE = "unclassifiable 33; not-analysed 3; violation 34"
 
 # The fixed issue set of each kind; a row naming any other value is a finding.
 # 9561: the issue of a form the merge of the chain tip brought (baseline of the landing tree); the pre-scan
@@ -308,6 +310,8 @@ REMOVAL_RULE_PHRASES = (
     "The pins are the baseline of the tree PR 9508 lands on",
     "the pre-scan of #9566 moved it 47 -> 33 and the violation pin 17 -> 33 once); after it lands they only go down",
     "lowered the violation pin by one (17 -> 16 on the chain, 33 -> 32 after the pre-scan of #9566)",
+    "9566 item 3, the full analysis of every job, moved the violation pin 32 -> 34 once for the two docker rows of"
+    " #9570 (pins now: unclassifiable 33, not-analysed 3, violation 34)",
     "is a proof for what the scan reaches only",
     "the list behind these rows is NOT complete",
     "rest-not-analysed",

@@ -698,7 +698,9 @@ class HandlerReasons(unittest.TestCase):
         fetch = [tb._Step("get", {"run": "git fetch origin pull/1/head"}, 0)]
         self.assertEqual(tb._pre_scan_fetch(fetch, {}, {}), "step 'get' fetches a pull-request tree")
         self.assertIsNone(tb._pre_scan_fetch([tb._Step("ok", {"run": "echo ok"}, 0)], {}, {}))
-        self.assertIsNone(tb._pre_scan_fetch([tb._Step("uses", {"uses": "./x"}, 0)], {}, {}))
+        # 9566 item 3: a uses: step is a form the pre-scan does not read; it is never skipped.
+        self.assertEqual(tb._pre_scan_fetch([tb._Step("uses", {"uses": "./x"}, 0)], {}, {}),
+                         "step 'uses' uses an action, which the pre-scan does not read")
 
     def test_9452_pre_scan_unread_job_is_analysed_in_full(self) -> None:
         _need_module(self)
@@ -756,7 +758,8 @@ class HandlerReasons(unittest.TestCase):
 # 9566: a job with no pull-request trigger is trusted-only only when the pre-scan read every
 # run step. Corpus: non-PR event x carrier (step secret, write scope, id token) x one step
 # form the pre-scan does not read; each row is the run text and the exact pre-scan reason.
-# The uses: column of this corpus arrives with the second PR of 9566.
+# The uses:, shell:, defaults and container forms (9566 item 3) are the corpus of
+# test_ci_tainted_job_boundary_prescan_uses.py.
 # ---------------------------------------------------------------------------------------
 
 UNREAD_STEP = "s"
@@ -920,21 +923,31 @@ class PreScanRefusesRunThatIsNotText(unittest.TestCase):
                         expected_rows = [RUN_NOT_TEXT_ROW] if expected == VERDICT_UNCLASSIFIABLE else []
                         self.assertEqual(result.unclassifiable, expected_rows)
 
-    def test_9566_uses_step_stays_with_its_own_lane(self) -> None:
-        # H1 (uses: steps, no run key) belongs to lane boundary-prescan-uses-steps-fail-closed.
+    def test_9566_uses_step_is_never_skipped_by_the_pre_scan(self) -> None:
+        # H1 (uses: steps, no run key), closed by lane boundary-prescan-uses-steps-fail-closed: the
+        # pre-scan names the step and the job goes to the full analysis.
         _need_module(self)
-        self.assertIsNone(tb._pre_scan_fetch([tb._Step("u", {"uses": "./x"}, 0)], {}, {}))
+        self.assertEqual(tb._pre_scan_fetch([tb._Step("u", {"uses": "./x"}, 0)], {}, {}),
+                         "step 'u' uses an action, which the pre-scan does not read")
 
     def test_9566_large_run_forms_are_refused_in_bounded_time(self) -> None:
+        # The full analysis reads every job (9566 item 3), so the verdict alone no longer shows a
+        # pre-scan that passes a large form over; the pre-scan reason of the read value is checked too.
         _need_module(self)
-        bulk = (("flow list", "[" + ", ".join(["a"] * RUN_FORM_BULK_ITEMS) + "]", VERDICT_UNCLASSIFIABLE),
-                ("whitespace string", '"' + " " * ADVERSARIAL_BYTES + '"', VERDICT_NO_PR_CODE))
-        for name, value, verdict in bulk:
+        bulk = (("flow list", "[" + ", ".join(["a"] * RUN_FORM_BULK_ITEMS) + "]", RUN_NOT_TEXT,
+                 VERDICT_UNCLASSIFIABLE),
+                ("whitespace string", '"' + " " * ADVERSARIAL_BYTES + '"', RUN_EMPTY, VERDICT_NO_PR_CODE))
+        for name, value, reason, verdict in bulk:
             with self.subTest(form=name):
                 self.assertGreaterEqual(len(value), ADVERSARIAL_BYTES // 2)
+                text = _run_value_workflow("push", "permissions:\n  contents: write\n", "", value)
                 start = time.monotonic()
-                result = _scan(_run_value_workflow("push", "permissions:\n  contents: write\n", "", value))
+                result = _scan(text)
+                run = tb.parse_yaml(text, SYNTH)["jobs"][JOB]["steps"][1]["run"]
+                got_reason = tb._pre_scan_fetch([tb._Step(UNREAD_STEP, {"run": run}, 0)], {}, {})
                 self.assertLess(time.monotonic() - start, SCAN_CEILING_S)
+                self.assertGreaterEqual(len(run), RUN_FORM_BULK_ITEMS)
+                self.assertEqual(got_reason, PRE_SCAN_UNREAD.format(reason=reason))
                 self.assertEqual(result.verdicts.get((SYNTH, JOB)), verdict)
 
 
