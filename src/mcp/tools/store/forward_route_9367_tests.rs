@@ -170,3 +170,53 @@ fn a_huge_action_id_is_refused_in_bounded_time_9367() {
     assert_eq!(err, LONG);
     assert!(drain(&rx).is_empty());
 }
+
+/// The shared builder pushes each segment as ONE percent-encoded segment:
+/// `/`, `?` and `#` in a segment never split it, never open a query or a
+/// fragment. Pins the builder itself, so a builder that pastes the text with
+/// `format!` is red even while the id shape check would hide it.
+#[test]
+fn the_route_builder_pushes_one_encoded_segment_9367() {
+    let built = forward_route_url(
+        "http://127.0.0.1:1/base/?x=1#f",
+        &["api", "v1", "actions", "a/b?c#d", "transition"],
+    );
+    assert_eq!(
+        built.as_deref(),
+        Ok("http://127.0.0.1:1/base/api/v1/actions/a%2Fb%3Fc%23d/transition")
+    );
+}
+
+/// The configured origin's query and fragment never reach the request; any
+/// number of trailing `/` on the prefix gives the same URL.
+#[test]
+fn the_route_builder_drops_origin_query_and_fragment_9367() {
+    for origin in [
+        "http://127.0.0.1:1",
+        "http://127.0.0.1:1/",
+        "http://127.0.0.1:1//",
+        "http://127.0.0.1:1?q=1",
+        "http://127.0.0.1:1/#frag",
+    ] {
+        assert_eq!(
+            forward_route_url(origin, &["api", "v1", "signals"]).as_deref(),
+            Ok("http://127.0.0.1:1/api/v1/signals"),
+            "origin {origin}"
+        );
+    }
+}
+
+/// A forward URL that is no base URL is a named local error whose text does
+/// not echo the configured URL (userinfo may hold a credential).
+#[test]
+fn a_forward_url_that_is_no_base_is_refused_without_echo_9367() {
+    const NOT_BASE: &str = "federation_forward: the configured forward URL is not a valid base URL; no request was sent";
+    for bad in ["not a url", "mailto:secret-user@example.invalid", ""] {
+        let err = forward_route_url(bad, &["api", "v1", "memories"]).expect_err(bad);
+        assert_eq!(err.to_string(), NOT_BASE);
+    }
+    let err = forward_signal_send_to_http("data:secret-token", &json!({}), Some("ai:test"))
+        .expect_err("no base");
+    assert_eq!(err, NOT_BASE);
+    assert!(!err.contains("secret-token"));
+}

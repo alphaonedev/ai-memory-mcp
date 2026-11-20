@@ -91,7 +91,9 @@ pub(crate) fn forward_to_http(
     }
     if let Some(key) = api_key {
         // #9367 K-4 — the value is marked sensitive so no Debug rendering of
-        // the request or its headers repeats it.
+        // the request or its headers repeats it. This `HeaderValue` is the
+        // one copy of the key outside a `Zeroizing` buffer (#1258 precedent):
+        // the HTTP client owns it for the request and it is not wiped on drop.
         let mut value = reqwest::header::HeaderValue::from_str(key).map_err(|_| {
             forward_key_refusal(&crate::agent_key_file::ForwardKeyFileError::Malformed)
         })?;
@@ -314,10 +316,110 @@ fn forward_as_agent(
         url,
         Some(body),
         headers,
-        api_key.as_deref(),
+        api_key.as_ref().map(|key| key.as_str()),
         keyed_agent.as_deref(),
     )
     .map_err(ForwardAsAgentError::Forward)
+}
+
+/// #9367 r1 Class A — why a forward request URL could not be built. Every
+/// variant is raised before any byte is sent and before the key file is read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ForwardRouteError {
+    /// The configured forward URL does not parse as a base URL. The text
+    /// never echoes the URL (its userinfo may hold a credential).
+    NotBaseUrl,
+    /// The `id` param is absent, empty, blank or not a string.
+    ActionIdMissing,
+    /// The action id is longer than [`crate::validate::MAX_ID_LEN`] bytes.
+    ActionIdTooLong,
+    /// The action id is `.`, `..` or holds `..` (a dot segment).
+    ActionIdDots,
+    /// The action id holds a byte outside `[A-Za-z0-9_:.@-]`.
+    ActionIdCharset,
+}
+
+impl std::fmt::Display for ForwardRouteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotBaseUrl => f.write_str(
+                "federation_forward: the configured forward URL is not a valid base URL; \
+                 no request was sent",
+            ),
+            Self::ActionIdMissing => f.write_str("memory_action_transition: missing action id"),
+            Self::ActionIdTooLong => write!(
+                f,
+                "memory_action_transition: the action id is longer than {} bytes; \
+                 no request was sent",
+                crate::validate::MAX_ID_LEN
+            ),
+            Self::ActionIdDots => f.write_str(
+                "memory_action_transition: the action id is a dot segment ('.' or '..') \
+                 or contains '..'; no request was sent",
+            ),
+            Self::ActionIdCharset => f.write_str(
+                "memory_action_transition: the action id has a character outside \
+                 [A-Za-z0-9_:.@-]; no request was sent",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ForwardRouteError {}
+
+/// #9367 r1 Class A — the ONE builder of every forward request URL (store,
+/// action transition, signal send). The configured origin keeps its scheme,
+/// host, port and path prefix; its query and fragment are dropped; each of
+/// `segments` is pushed as exactly ONE percent-encoded path segment, so no
+/// caller text can add a segment, a dot segment, a query or a fragment.
+///
+/// # Errors
+///
+/// [`ForwardRouteError::NotBaseUrl`] when the forward URL does not parse or
+/// cannot be a base (for example `mailto:`).
+pub(crate) fn forward_route_url(
+    forward_url: &str,
+    segments: &[&str],
+) -> Result<String, ForwardRouteError> {
+    let mut url = reqwest::Url::parse(forward_url).map_err(|_| ForwardRouteError::NotBaseUrl)?;
+    url.set_query(None);
+    url.set_fragment(None);
+    // Every trailing `/` of the configured prefix goes (the old
+    // `trim_end_matches('/')`), so `http://h/` and `http://h` agree.
+    let prefix = url.path().trim_end_matches('/').to_owned();
+    url.set_path(&prefix);
+    url.path_segments_mut()
+        .map_err(|()| ForwardRouteError::NotBaseUrl)?
+        .pop_if_empty()
+        .extend(segments);
+    Ok(url.into())
+}
+
+/// #9367 r1 Class A — the action id as ONE path segment, checked before the
+/// agent id is resolved and before the key file is read. Order: missing,
+/// length (bounded before any scan), dot segments, charset.
+///
+/// # Errors
+///
+/// The [`ForwardRouteError`] action-id variant for the first rule broken.
+fn action_id_segment(params: &Value) -> Result<&str, ForwardRouteError> {
+    let id = params[crate::mcp::param_names::ID]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or(ForwardRouteError::ActionIdMissing)?;
+    if id.len() > crate::validate::MAX_ID_LEN {
+        return Err(ForwardRouteError::ActionIdTooLong);
+    }
+    if id == "." || id.contains("..") {
+        return Err(ForwardRouteError::ActionIdDots);
+    }
+    let segment_byte =
+        |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'_' | b':' | b'.' | b'@' | b'-');
+    if !id.bytes().all(segment_byte) {
+        return Err(ForwardRouteError::ActionIdCharset);
+    }
+    Ok(id)
 }
 
 /// MCP `memory_store` → HTTP `POST {forward_url}/api/v1/memories`.
@@ -335,7 +437,8 @@ pub(super) fn forward_store_to_http(
     params: &Value,
     mcp_client: Option<&str>,
 ) -> Result<Value, String> {
-    let url = format!("{}/api/v1/memories", forward_url.trim_end_matches('/'));
+    let url =
+        forward_route_url(forward_url, &["api", "v1", "memories"]).map_err(|e| e.to_string())?;
 
     // Resolve agent_id with the same precedence chain the local path
     // uses, then surface it as an X-Agent-Id header (the HTTP handler's
@@ -375,16 +478,11 @@ pub(crate) fn forward_action_transition_to_http(
     params: &Value,
     mcp_client: Option<&str>,
 ) -> Result<Value, String> {
-    let id = params[crate::mcp::param_names::ID]
-        .as_str()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| "memory_action_transition: missing action id".to_string())?;
-    let url = format!(
-        "{}/api/v1/actions/{}/transition",
-        forward_url.trim_end_matches('/'),
-        id
-    );
+    // #9367 r1 Class A: the id is checked as one path segment and the URL is
+    // built by the shared builder, both before the agent id and the key.
+    let id = action_id_segment(params).map_err(|e| e.to_string())?;
+    let url = forward_route_url(forward_url, &["api", "v1", "actions", id, "transition"])
+        .map_err(|e| e.to_string())?;
     let agent_id =
         crate::identity::resolve_agent_id(None, mcp_client).map_err(|e| e.to_string())?;
     forward_as_agent(reqwest::Method::POST, &url, params, agent_id).map_err(forward_error_text)
@@ -405,7 +503,8 @@ pub(crate) fn forward_signal_send_to_http(
     params: &Value,
     mcp_client: Option<&str>,
 ) -> Result<Value, String> {
-    let url = format!("{}/api/v1/signals", forward_url.trim_end_matches('/'));
+    let url =
+        forward_route_url(forward_url, &["api", "v1", "signals"]).map_err(|e| e.to_string())?;
     let explicit = params[crate::mcp::param_names::FROM_AGENT].as_str();
     // #8496 — the forwarded `X-Agent-Id` is the sender the daemon stamps, so it
     // is bound to the enforced caller (#3171 store-forward precedent); a
