@@ -5,14 +5,15 @@ Reads ``serial.txt`` (one cargo selector per line, written by
 ``partition_test_binaries.py``) and the same build JSON, then writes to
 ``--out-dir``:
 
-* ``iso_targets.txt``   every ``--test NAME`` / ``--bin NAME`` line of the
-                        serial shard, for ``scripts/test/pg_isolated_binary.py run``.
+* ``iso_targets.txt``   every ``--test NAME`` line of the serial shard, for the
+                        serial shard isolated binaries step (#9592), which runs
+                        them through ``scripts/test/pg_isolated_binary.py run``.
 * ``iso_residual.txt``  the names among them that must stay serial on the
                         shared database: unknown source, a fixed loopback port,
                         a shared filesystem path (cross-process state a
                         per-binary database cannot isolate), or named in
                         ``scripts/ci/pg_isolate_serial_residual.txt``.
-* ``iso_other.txt``     the remaining selectors (``--example``, ``--bench``;
+* ``iso_other.txt``     the remaining selectors (``--bin``, ``--example``, ``--bench``;
                         ``--lib`` is left to the existing lib run), which keep
                         the existing single-process path.
 
@@ -106,7 +107,10 @@ def split(serial_lines, exes, static):
         exe = by_selector.get(line)
         if exe is None:
             raise SplitError('serial selector %r is not a built executable' % line)
-        if exe.kind in ('test', 'bin'):
+        # #9592: only integration test binaries are deferred to the isolated
+        # step (its targets file takes `--test NAME` lines only); a --bin
+        # target's unit tests stay in the serial shard, run in-line.
+        if exe.kind == 'test':
             targets.append(line)
             if residual_reason(exe, static) is not None:
                 residual.append(exe.name)
