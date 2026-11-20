@@ -62,9 +62,15 @@ fn the_census_scan_sees_a_dial_and_ignores_a_comment_9638() {
         1
     );
     assert_eq!(dial_sites("let s = UnixStream::from_std(raw)?;"), 1);
-    assert_eq!(dial_sites("let s = tokio::net::UnixSocket::new_stream()?;"), 1);
+    assert_eq!(
+        dial_sites("let s = tokio::net::UnixSocket::new_stream()?;"),
+        1
+    );
     assert_eq!(dial_sites("SslmodeFloor::UnixSocket { dir } => {"), 0);
-    assert_eq!(dial_sites("    // UnixStream::connect is only named here"), 0);
+    assert_eq!(
+        dial_sites("    // UnixStream::connect is only named here"),
+        0
+    );
     assert_eq!(dial_sites("let ok = 1;"), 0);
 }
 

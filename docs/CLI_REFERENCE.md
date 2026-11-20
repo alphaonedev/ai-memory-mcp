@@ -2252,6 +2252,12 @@ the durable record.
 | `--once` | exit after the first catch-up read |
 | `--no-hub` | do not dial a hub; the bounded poll is the delivery mechanism |
 
+**Exit status.** `wake-listen` exits `0` only after a requested stop (SIGINT or
+SIGTERM) or after `--once` finished its catch-up read. If every wake producer
+stops with no stop requested, it exits non-zero with the error `wake listener:
+every wake producer stopped without a stop request`, so a supervisor restarts
+it instead of treating a dead listener as a clean shutdown.
+
 **The exec hook receives metadata, never a body.** The hub structurally carries
 no message body, so neither does the hook: it gets the row id to read and the
 digest to verify what it read. The metadata rides in the ENVIRONMENT rather

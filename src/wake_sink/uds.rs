@@ -50,7 +50,6 @@ use anyhow::{Context as _, Result, bail};
 use bytes::{Bytes, BytesMut};
 use rand_core::RngCore as _;
 use tokio::io::AsyncWriteExt as _;
-use tokio::net::UnixStream;
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt as _;
@@ -438,9 +437,7 @@ async fn connect_and_pump(
     metrics: &SinkMetrics,
     rx: &mut mpsc::Receiver<Bytes>,
 ) -> Result<()> {
-    let stream = UnixStream::connect(&cfg.socket_path)
-        .await
-        .with_context(|| format!("connecting to {}", cfg.socket_path.display()))?;
+    let stream = crate::wake_client::dial::dial_hub_socket(&cfg.socket_path).await?;
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = FramedRead::new(read_half, codec());
     handshake(cfg, credential, &mut reader, &mut write_half).await?;

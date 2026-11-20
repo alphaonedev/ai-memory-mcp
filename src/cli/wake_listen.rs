@@ -121,7 +121,9 @@ pub struct WakeListenArgs {
     /// Run this command on each wake with the metadata in the environment.
     #[arg(long, value_name = "CMD")]
     pub exec: Option<String>,
-    /// Exit after the first catch-up read instead of listening forever.
+    /// Exit after the first catch-up read instead of listening forever. Without
+    /// it the process exits 0 only after a requested stop; every producer
+    /// ending on its own is a non-zero exit.
     #[arg(long)]
     pub once: bool,
     /// Run without a hub: the bounded backstop poll IS the delivery
@@ -519,6 +521,13 @@ pub async fn dispatch(
     listen_loop(db_path, args, &resolved, &mut stream, &mut stop).await
 }
 
+/// The named error for a wake stream that ended with no stop requested: every
+/// producer is gone, so the listener would otherwise sit exit-0 as if a
+/// supervisor had asked it to stop (#9641). Exit 0 is reserved for a requested
+/// stop (or `--once`).
+const STREAM_ENDED_9641: &str = "wake listener: every wake producer stopped without a stop request; \
+     exiting non-zero so a supervisor restarts the listener";
+
 /// What the listen loop waits on to learn that the operator asked it to stop.
 /// A seam so the loop's exit contract is testable without a real signal.
 trait StopRequest {
@@ -550,10 +559,7 @@ async fn listen_loop(
             }
             next = stream.next() => match next {
                 Some(s) => s,
-                None => {
-                    tracing::warn!("wake listener: every producer stopped; exiting");
-                    return Ok(());
-                }
+                None => bail!(STREAM_ENDED_9641),
             },
         };
 

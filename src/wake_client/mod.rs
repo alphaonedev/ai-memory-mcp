@@ -58,6 +58,7 @@
 //! silently stopped reading must not look like a quiet inbox.
 
 pub mod bundle;
+pub mod dial;
 pub mod session;
 
 use std::sync::Arc;
