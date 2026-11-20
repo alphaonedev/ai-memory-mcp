@@ -841,31 +841,6 @@ jobs:
         run: python3 scripts/test/test_ci_test_impact.py
       - name: Workflow concurrency invariants (#6340)
         run: python3 scripts/test/test_workflow_concurrency_6340.py
-      # #7987: the corpus ratchet reads the manifest from the base tree. Fetch the pull-request base branch so a
-      # merge-base exists; a push has no base branch, so its first parent (fetch-depth 2) is the anchor.
-      - name: Resolve the corpus ratchet base (#7987)
-        env:
-          PR_BASE_REF: ${{ github.base_ref }}
-        run: |
-          if [ -n "$PR_BASE_REF" ]; then
-            git fetch --no-tags --depth=1 origin "refs/heads/${PR_BASE_REF}:refs/remotes/origin/${PR_BASE_REF}"
-            if ! git merge-base HEAD "origin/${PR_BASE_REF}" > /dev/null; then
-              # the base branch moved past the first parent of the merge commit: deepen until the histories meet
-              git fetch --no-tags --deepen=200 origin "refs/heads/${PR_BASE_REF}:refs/remotes/origin/${PR_BASE_REF}"
-              git fetch --no-tags --deepen=200 origin HEAD || true
-            fi
-            echo "CERT_MANIFEST_BASE_REF=origin/${PR_BASE_REF}" >> "$GITHUB_ENV"
-          else
-            echo "CERT_MANIFEST_BASE_REF=HEAD^" >> "$GITHUB_ENV"
-          fi
-      # #7988: case_7988_prefix_replay reads the PR 7393 commits the probes were verified against.
-      - name: Fetch the corpus replay objects (#7988)
-        run: python3 -I scripts/ci/tests/test_check_cert_expiry_corpus.py --print-replay-shas | xargs git fetch --no-tags --depth=1 origin
-      # #9303: test_9303_real_range_9274_refused_as_frozen_region reads the PR 9274 range and fails, never skips, when a commit is missing.
-      - name: Fetch the amendment ledger replay objects (#9303)
-        run: python3 -I scripts/ci/tests/test_cert_amendment_ledger_6124.py --print-replay-shas | xargs git fetch --no-tags --depth=1 origin
-      - name: Shard partition and wiring unit tests (#6344)
-        run: python3 -m unittest discover -s scripts/ci/tests
       - name: AGE self-heal helper unit test (#6161)
         run: python3 scripts/test/test_ensure_age_extension_6161.py
       # #7160 - scripts/test/ is outside the discovery root above; run the
@@ -964,11 +939,16 @@ jobs:
     # it nothing. `Swatinem/rust-cache` restores the registry on hosted exactly
     # as it did before #3109.
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # #9593 - 15 -> 40: the job now also runs the scripts/ci unit tests (11.7 min
+    # measured in `classify`), after its own ~0.5 min of gate work.
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
+          # #9593 - fetch-depth 2 as in `classify`, where the unit tests below
+          # ran before: a push anchors the corpus ratchet on its first parent.
+          fetch-depth: 2
       - name: Install Rust 1.99.1 (matches rust-toolchain.toml pin)
         uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
@@ -989,6 +969,36 @@ jobs:
         # pre-#2635 ledger-only algorithm over a planted unvetted package and
         # requires it to MISS — so the leg cannot pass tautologically.
         run: python3 scripts/check-build-script-vetting.py --self-test
+      # #9593 - moved here from `classify`, where this 11.7 min step held every
+      # `needs: classify` job (the four Check legs and seven others) back.
+      # This job has no `needs:`, is no ancestor of any Check leg, runs on every
+      # push and pull request and is a required context, so the same tests still
+      # run and still gate the merge. Same steps, same command, same order.
+      # #7987: the corpus ratchet reads the manifest from the base tree. Fetch the pull-request base branch so a
+      # merge-base exists; a push has no base branch, so its first parent (fetch-depth 2) is the anchor.
+      - name: Resolve the corpus ratchet base (#7987)
+        env:
+          PR_BASE_REF: ${{ github.base_ref }}
+        run: |
+          if [ -n "$PR_BASE_REF" ]; then
+            git fetch --no-tags --depth=1 origin "refs/heads/${PR_BASE_REF}:refs/remotes/origin/${PR_BASE_REF}"
+            if ! git merge-base HEAD "origin/${PR_BASE_REF}" > /dev/null; then
+              # the base branch moved past the first parent of the merge commit: deepen until the histories meet
+              git fetch --no-tags --deepen=200 origin "refs/heads/${PR_BASE_REF}:refs/remotes/origin/${PR_BASE_REF}"
+              git fetch --no-tags --deepen=200 origin HEAD || true
+            fi
+            echo "CERT_MANIFEST_BASE_REF=origin/${PR_BASE_REF}" >> "$GITHUB_ENV"
+          else
+            echo "CERT_MANIFEST_BASE_REF=HEAD^" >> "$GITHUB_ENV"
+          fi
+      # #7988: case_7988_prefix_replay reads the PR 7393 commits the probes were verified against.
+      - name: Fetch the corpus replay objects (#7988)
+        run: python3 -I scripts/ci/tests/test_check_cert_expiry_corpus.py --print-replay-shas | xargs git fetch --no-tags --depth=1 origin
+      # #9303: test_9303_real_range_9274_refused_as_frozen_region reads the PR 9274 range and fails, never skips, when a commit is missing.
+      - name: Fetch the amendment ledger replay objects (#9303)
+        run: python3 -I scripts/ci/tests/test_cert_amendment_ledger_6124.py --print-replay-shas | xargs git fetch --no-tags --depth=1 origin
+      - name: Shard partition and wiring unit tests (#6344)
+        run: python3 -m unittest discover -s scripts/ci/tests
 
   # actionlint — workflow-injection guard (#1851, audit follow-up #1855).
   # actionlint's NATIVE expression-injection check flags the #1851 class: an
@@ -1161,10 +1171,11 @@ jobs:
       # `target/debug/deps` across two runners, until rust-lld died with
       # `ld terminated with signal 7 [Bus error]` on a full disk (#3453) — and
       # (b) charged the link time to the macOS full-suite job that then blew
-      # the #1492 watchdog (#3461). `line-tables-only` keeps file:line in every
-      # backtrace and panic location (the only debuginfo CI actually reads;
-      # nothing here runs a debugger) at roughly a third of the size and link
-      # cost. DECLARED HERE, in the workflow, deliberately: a runner-side
+      # the #1492 watchdog (#3461). `line-tables-only` keeps file:line in
+      # backtraces on the legs that keep it (panic locations come from the
+      # compiler, not debuginfo, and stay on every leg; nothing here runs a
+      # debugger or sets RUST_BACKTRACE) at roughly a third of the size and
+      # link cost. DECLARED HERE, in the workflow, deliberately: a runner-side
       # `.env` is per-node operator state that no repo change can preserve or
       # audit, so a re-imaged or added runner would silently regress.
       #
@@ -1173,8 +1184,20 @@ jobs:
       # CARGO_PROFILE_DEV_DEBUG (the hosted low-mem step below) would otherwise
       # leave the test profile at this value. Both are stated at every point
       # they are set, so the pair can never drift apart.
-      CARGO_PROFILE_DEV_DEBUG: line-tables-only
-      CARGO_PROFILE_TEST_DEBUG: line-tables-only
+      #
+      # #9593 - the self-hosted linux-fed enterprise-fed leg links ~1,057 test
+      # executables (55 min median; the macos-fed leg does the same set in
+      # 7-11 min). Its matrix entry sets `cargo_debug: '0'`, which turns
+      # debuginfo off for BOTH profiles on that one leg (the test binaries use
+      # the test profile, the package library they link against the dev
+      # profile; cert-postgres-age.yml and postgres-ignored.yml already do
+      # this), so backtraces on that leg carry no file:line. No other leg has
+      # a `cargo_debug` key: the two macOS legs keep line-tables-only, and the
+      # hosted sqlite leg sets 0 in its own low-mem step below. Environment
+      # only: no Cargo.toml or .cargo change, and no release-shaped or
+      # coverage build reads this key.
+      CARGO_PROFILE_DEV_DEBUG: ${{ matrix.cargo_debug || 'line-tables-only' }}
+      CARGO_PROFILE_TEST_DEBUG: ${{ matrix.cargo_debug || 'line-tables-only' }}
     strategy:
       fail-fast: false
       # #7188/#9682 - concurrency cap: N = 4 = the number of legs. The cap of 3
@@ -1277,6 +1300,8 @@ jobs:
             # the hosted and macOS legs do not set it and keep their default
             # workspace `target/`.
             shared_target: true
+            # #9593 - debuginfo off on this leg only (see the job env above).
+            cargo_debug: '0'
             # #3525/#3976/#6202/#6344: compile (~6-12 min) + the 7800 s
             # per-shard watchdog + the ephemeral-db setup/teardown must fit
             # inside this outer bound. 160 = 130 min watchdog + 28 min of
