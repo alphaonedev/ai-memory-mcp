@@ -1281,24 +1281,6 @@ mod tests {
         EnvVarGuard::set("AI_MEMORY_KEY_DIR", dir.as_os_str())
     }
 
-    /// #9730 — class guard: no sign test in this module may set
-    /// `AI_MEMORY_KEY_DIR` by hand. The raw setters that remain are the one
-    /// inside [`bind_key_dir`] and the one in
-    /// `env_var_guard_restores_previous_value_on_drop`, which tests the guard
-    /// itself. A new sign test that skips the helper adds a third and fails
-    /// here in every run.
-    #[test]
-    fn key_dir_override_goes_through_bind_key_dir_9730() {
-        const ALLOWED_RAW_SETTERS: usize = 2;
-        let src = include_str!("store.rs");
-        let needle = ["EnvVarGuard::set(", "\"AI_MEMORY_KEY_DIR\""].concat();
-        let hits = src.matches(needle.as_str()).count();
-        assert_eq!(
-            hits, ALLOWED_RAW_SETTERS,
-            "AI_MEMORY_KEY_DIR must be set through bind_key_dir (#9730); found {hits} raw setters"
-        );
-    }
-
     #[test]
     fn test_store_sign_with_bound_key_stamps_agent_attested() {
         let _lock = locked_env();
@@ -1964,11 +1946,253 @@ mod tests {
     // setter-shaped text is never counted.
 
     /// #9730 — the pure guard: every violation found in `src`, as exact reasons.
+    ///
+    /// Decision (fail closed by construction): the text is whitespace
+    /// normalised, then EVERY env-setter call (`set_var(` and
+    /// `EnvVarGuard::set(`) is classified by its first argument. The key-dir
+    /// variable (literal or `KEY_DIR_ENV` constant) is allowed only inside the
+    /// two named sites; a first argument that is neither a plain string
+    /// literal nor a name in [`KNOWN_NAME_ARGS`] is a violation, never a pass.
     fn key_dir_guard_violations(src: &str) -> Vec<String> {
-        let needle = ["EnvVarGuard::set(", "\"AI_MEMORY_KEY_DIR\""].concat();
-        src.matches(needle.as_str())
-            .map(|_| "found a raw setter".to_owned())
+        let mut violations = Vec::new();
+        for setter in scan_env_setters(src) {
+            match classify_arg(&setter.arg) {
+                ArgKind::KeyDir => {
+                    let site = setter.fn_name.as_deref().unwrap_or(NO_ENCLOSING_FN);
+                    if !KEY_DIR_ALLOWED_FNS.contains(&site) {
+                        violations.push(format!(
+                            "key-dir variable set in `{site}` via `{}` with `{}`; go through bind_key_dir (#9730)",
+                            setter.form, setter.arg
+                        ));
+                    }
+                }
+                ArgKind::OtherLiteral | ArgKind::KnownName => {}
+                ArgKind::Unknown => violations.push(format!(
+                    "unrecognised first argument `{}` to `{}`; use a string literal, a table name or bind_key_dir (#9730)",
+                    setter.arg, setter.form
+                )),
+            }
+        }
+        violations
+    }
+
+    /// Names of the functions that set the key-dir variable (sorted, unique).
+    fn key_dir_setter_fns(src: &str) -> Vec<String> {
+        let mut fns: Vec<String> = scan_env_setters(src)
+            .into_iter()
+            .filter(|s| matches!(classify_arg(&s.arg), ArgKind::KeyDir))
+            .map(|s| s.fn_name.unwrap_or_else(|| NO_ENCLOSING_FN.to_owned()))
+            .collect();
+        fns.sort();
+        fns.dedup();
+        fns
+    }
+
+    /// Env-setter call forms the guard scans for.
+    const SETTER_FORMS: [&str; 2] = ["set_var(", "EnvVarGuard::set("];
+    /// The key-dir variable as a string literal.
+    const KEY_DIR_LITERAL: &str = "\"AI_MEMORY_KEY_DIR\"";
+    /// The key-dir variable as the production constant's last path segment.
+    const KEY_DIR_CONST_NAME: &str = "KEY_DIR_ENV";
+    /// Non-literal first arguments that are known not to be the key-dir
+    /// variable: the parameters inside `EnvVarGuard`'s own `set` and `drop`.
+    const KNOWN_NAME_ARGS: [&str; 2] = ["key", "self.key"];
+    /// The only two sites allowed to set the key-dir variable.
+    const KEY_DIR_ALLOWED_FNS: [&str; 2] = [
+        "bind_key_dir",
+        "env_var_guard_restores_previous_value_on_drop",
+    ];
+    /// Site label when a setter sits outside every `fn`.
+    const NO_ENCLOSING_FN: &str = "<no enclosing fn>";
+
+    struct Setter {
+        fn_name: Option<String>,
+        form: &'static str,
+        arg: String,
+    }
+
+    enum ArgKind {
+        KeyDir,
+        OtherLiteral,
+        KnownName,
+        Unknown,
+    }
+
+    /// Collapse whitespace runs to one space, then drop spaces next to `(`,
+    /// `)`, `,` and `:` so a call split over lines or padded with spaces
+    /// matches the same needle as the one-line form.
+    fn normalise_ws(src: &str) -> String {
+        let mut collapsed: Vec<char> = Vec::with_capacity(src.len());
+        let mut pending = false;
+        for c in src.chars() {
+            if c.is_whitespace() {
+                pending = true;
+                continue;
+            }
+            if pending && !collapsed.is_empty() {
+                collapsed.push(' ');
+            }
+            pending = false;
+            collapsed.push(c);
+        }
+        let mut out = String::with_capacity(collapsed.len());
+        for (i, &c) in collapsed.iter().enumerate() {
+            if c == ' ' {
+                let prev = i.checked_sub(1).map(|j| collapsed[j]);
+                let next = collapsed.get(i + 1).copied();
+                if matches!(prev, Some('(' | ':')) || matches!(next, Some('(' | ')' | ',' | ':')) {
+                    continue;
+                }
+            }
+            out.push(c);
+        }
+        out
+    }
+
+    fn is_ident_char(c: char) -> bool {
+        c.is_alphanumeric() || c == '_'
+    }
+
+    /// Every `fn <name>` in `text` as (byte offset, name), in text order.
+    fn collect_fns(text: &str) -> Vec<(usize, String)> {
+        text.match_indices("fn ")
+            .filter(|(i, _)| !text[..*i].chars().next_back().is_some_and(is_ident_char))
+            .filter_map(|(i, _)| {
+                let name: String = text[i + 3..]
+                    .chars()
+                    .take_while(|c| is_ident_char(*c))
+                    .collect();
+                (!name.is_empty()).then_some((i, name))
+            })
             .collect()
+    }
+
+    /// The text up to the first top-level `,` or the closing `)`.
+    fn first_arg(args: &str) -> String {
+        let (mut depth, mut in_str, mut esc) = (0usize, false, false);
+        let mut end = args.len();
+        for (i, c) in args.char_indices() {
+            if in_str {
+                if esc {
+                    esc = false;
+                } else if c == '\\' {
+                    esc = true;
+                } else if c == '"' {
+                    in_str = false;
+                }
+                continue;
+            }
+            match c {
+                '"' => in_str = true,
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' | ',' if depth == 0 => {
+                    end = i;
+                    break;
+                }
+                ')' | ']' | '}' => depth -= 1,
+                _ => {}
+            }
+        }
+        args[..end].to_owned()
+    }
+
+    /// Every env-setter call in `src`, with its enclosing fn and first argument.
+    /// Linear in the input apart from a binary search per setter.
+    fn scan_env_setters(src: &str) -> Vec<Setter> {
+        let text = normalise_ws(src);
+        let fns = collect_fns(&text);
+        let mut out = Vec::new();
+        for form in SETTER_FORMS {
+            for (pos, _) in text.match_indices(form) {
+                if text[..pos].chars().next_back().is_some_and(is_ident_char) {
+                    continue;
+                }
+                let idx = fns.partition_point(|(p, _)| *p < pos);
+                out.push(Setter {
+                    fn_name: idx.checked_sub(1).map(|i| fns[i].1.clone()),
+                    form,
+                    arg: first_arg(&text[pos + form.len()..]),
+                });
+            }
+        }
+        out
+    }
+
+    /// A single string literal: opens and closes with `"`, no unescaped `"` inside.
+    fn is_plain_literal(arg: &str) -> bool {
+        let Some(inner) = arg.strip_prefix('"').and_then(|a| a.strip_suffix('"')) else {
+            return false;
+        };
+        let mut esc = false;
+        for c in inner.chars() {
+            if esc {
+                esc = false;
+            } else if c == '\\' {
+                esc = true;
+            } else if c == '"' {
+                return false;
+            }
+        }
+        !esc
+    }
+
+    fn classify_arg(arg: &str) -> ArgKind {
+        if arg == KEY_DIR_LITERAL {
+            ArgKind::KeyDir
+        } else if is_plain_literal(arg) {
+            ArgKind::OtherLiteral
+        } else if arg.rsplit("::").next() == Some(KEY_DIR_CONST_NAME)
+            && arg.chars().all(|c| is_ident_char(c) || c == ':')
+        {
+            ArgKind::KeyDir
+        } else if KNOWN_NAME_ARGS.contains(&arg) {
+            ArgKind::KnownName
+        } else {
+            ArgKind::Unknown
+        }
+    }
+
+    /// #9730 — class guard: in the test code of this file the key-dir variable
+    /// is set only inside [`bind_key_dir`] and
+    /// `env_var_guard_restores_previous_value_on_drop` (which tests the guard
+    /// itself), whatever the spelling; an env-setter the scanner cannot
+    /// classify is a violation. A new sign test that skips the helper fails
+    /// here in every run.
+    #[test]
+    fn key_dir_override_goes_through_bind_key_dir_9730() {
+        let src = include_str!("store.rs");
+        let start = src
+            .find(["mod ", "tests {"].concat().as_str())
+            .expect("tests module");
+        let end = src
+            .find(["// 9730-", "SCAN-END"].concat().as_str())
+            .expect("scan end marker");
+        let region = &src[start..end];
+        let violations = key_dir_guard_violations(region);
+        assert!(violations.is_empty(), "{violations:#?}");
+        assert_eq!(
+            key_dir_setter_fns(region),
+            KEY_DIR_ALLOWED_FNS.map(str::to_owned).to_vec(),
+            "both allowed sites must still set the key-dir variable (stale allow-list)"
+        );
+    }
+
+    /// #9730 — the scanner is linear: 100K+ of setter-dense text stays fast.
+    #[test]
+    fn key_dir_guard_scan_is_bounded_9730() {
+        const REPEATS: usize = 6_000;
+        const CEILING: std::time::Duration = std::time::Duration::from_secs(5);
+        let unit = "fn f() { unsafe { std::env::set_var(KEY_DIR_ENV, p) }; }\n";
+        let big = unit.repeat(REPEATS);
+        assert!(big.len() >= 100_000);
+        let started = std::time::Instant::now();
+        let violations = key_dir_guard_violations(&big);
+        assert_eq!(violations.len(), REPEATS);
+        assert!(
+            started.elapsed() < CEILING,
+            "scan took {:?}",
+            started.elapsed()
+        );
     }
 
     /// One table row: label, module text, expected violations.
