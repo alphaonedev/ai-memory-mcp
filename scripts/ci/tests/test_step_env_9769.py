@@ -13,6 +13,7 @@ Run: python3 -m unittest discover -s scripts/ci/tests -p test_step_env_9769.py
 """
 import importlib.util
 import os
+import re
 import subprocess
 import unittest
 import unittest.mock as mock
@@ -57,6 +58,43 @@ FIXTURE_KEYS = {
                    "HOST_SEMAPHORE_SLOTS"},
     "8328_boundary": {"TEST_IMPACT", "DOCS_ONLY"},
 }
+
+
+# Allowlist ratchet over every tracked file under scripts/ (the whole tree where workflow tests live): a
+# file that names the Run tests step (plain or regex-escaped) and starts bash is a step-exec harness and
+# must be in HARNESS_FILES; each other file that names the step is listed here with its reason.
+REPO = HERE.parents[2]
+SCAN_ROOT = "scripts"
+NAMES_STEP_RE = re.compile(r"Run tests \\?\(impact-aware|RUN_TESTS_STEP|step_exec_env\(")
+STARTS_BASH_RE = re.compile(r"""['"](?:/bin/|/usr/bin/env )?bash['"]|RUNNER_BASH|^\s*bash\s""", re.M)
+NOT_STEP_EXEC = {
+    "scripts/ci/tests/workflow_text.py": "the helper itself; reads the workflow text, runs nothing",
+    "scripts/ci/tests/test_step_env_9769.py": "this module; subprocess.run is a recorder here",
+    "scripts/ci/check_pg_isolate_invariants.py": "the gate; parses ci.yml, runs no step body",
+    "scripts/ci/taint_boundary.py": "a static parser of run steps ('bash' is a table key); executes nothing",
+    "scripts/ci/tests/test_check_pg_isolate_invariants.py": "runs the gate script, not a step body",
+    "scripts/ci/tests/test_ci_check_matrix_max_parallel_9682.py": "text pins on the job matrix",
+    "scripts/ci/tests/test_ci_load_gate_wiring_6795.py": "text pins on the step wiring",
+    "scripts/ci/tests/test_ci_semaphore_wiring_7914.py": "text pins on the semaphore wiring",
+    "scripts/ci/tests/test_ci_tainted_job_boundary.py": "text pins on the job boundary",
+    "scripts/ci/tests/test_ci_tainted_job_boundary_open_rows.py": "text pins on the job boundary rows",
+    "scripts/test/test-ci-workflow-invariants.sh": "grep pins on ci.yml text, runs no step body",
+}
+
+
+def step_exec_files():
+    """Tracked files under SCAN_ROOT that name the step and start bash, and those that only name it."""
+    listed = subprocess.run(["git", "-C", str(REPO), "ls-files", "-z", "--", SCAN_ROOT], capture_output=True,
+                            check=True).stdout.decode("utf-8", "surrogateescape").split("\0")
+    execs, names = set(), set()
+    for rel in filter(None, listed):
+        try:
+            text = (REPO / rel).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if NAMES_STEP_RE.search(text):
+            (execs if STARTS_BASH_RE.search(text) else names).add(rel)
+    return execs, names
 
 
 def load(key):
@@ -113,6 +151,21 @@ class StepEnvHelper(unittest.TestCase):
             workflow_text.step_env(step="no such step")
         self.assertEqual(str(ctx.exception), "0 steps named 'no such step' in job 'check' of %s"
                          % workflow_text.CI_YML)
+
+
+class HarnessAllowlist(unittest.TestCase):
+    def test_every_step_exec_harness_is_listed(self):
+        execs, names = step_exec_files()
+        harness = {"scripts/ci/tests/" + name for name in HARNESS_FILES.values()}
+        self.assertEqual(sorted(execs - harness - set(NOT_STEP_EXEC)), [],
+                         "a file names the Run tests step and starts bash but is not in HARNESS_FILES")
+        self.assertEqual(sorted(harness - execs), [], "a listed harness no longer starts bash")
+        self.assertEqual(sorted(set(NOT_STEP_EXEC) - execs - names), [], "a stale NOT_STEP_EXEC entry")
+
+    def test_every_harness_builds_its_env_through_the_helper(self):
+        for key, name in HARNESS_FILES.items():
+            text = (HERE / name).read_text(encoding="utf-8")
+            self.assertIn("workflow_text.step_exec_env(", text, key)
 
 
 class HarnessEnv(unittest.TestCase):

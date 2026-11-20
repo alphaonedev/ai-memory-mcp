@@ -41,6 +41,8 @@ import unittest
 import unittest.mock as mock
 from pathlib import Path
 
+import workflow_text
+
 HERE = Path(__file__).resolve().parent
 
 
@@ -218,9 +220,9 @@ def run_step(text, runs=(), prebuild=(), metadata_rc=0, meta="default", impact="
                 (d / "timer.index").write_text(shard.group(1))
         script = d / "step.sh"
         script.write_text("#!/bin/bash\n" + text + "\n", encoding="utf-8")
-        env = dict(os.environ)
-        env.update({
-            "PATH": "%s:%s" % (bindir, env.get("PATH", "")),
+        # #9769: the step env of ci.yml (every key, unset expressions empty) under the fixture keys.
+        env = workflow_text.step_exec_env({
+            "PATH": "%s:%s" % (bindir, os.environ.get("PATH", "")),
             "AI_MEMORY_NO_CONFIG": "1", "TIER": "sqlite", "CI_NODE": node, "TEST_IMPACT": impact,
             "JOB_TIMEOUT_MIN": "95", "JOB_T0": "",  # no job-left caps: the frozen clock is far from real time
             "RUNNER_TEMP": str(runner_temp), "GITHUB_ENV": str(d / "github-env"),
@@ -981,8 +983,8 @@ def run_real_time(cargo_secs):
         script.write_text("#!/bin/bash\nset -euo pipefail\n" + functions +
                           'JOB_T0_VALID=0\nWATCHDOG_SECS=%d\nTIMEOUT_BIN=""\nRESULT_LOG=%s\n'
                           'SUITE_MARGIN_GATE=1 run_tests "boundary"\n' % (REAL_TIME_BUDGET, log))
-        env = dict(os.environ)
-        env["PATH"] = "%s:%s" % (bindir, env.get("PATH", ""))
+        # #9769: the functions run under the step env of ci.yml too (the one harness env source).
+        env = workflow_text.step_exec_env({"PATH": "%s:%s" % (bindir, os.environ.get("PATH", ""))})
         r = subprocess.run(["bash", str(script)], cwd=str(REPO), env=env, capture_output=True, text=True,
                            timeout=STEP_TIMEOUT_SECS)
         return r.returncode, r.stdout + r.stderr

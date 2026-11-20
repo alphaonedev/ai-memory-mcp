@@ -59,6 +59,7 @@ REPO = Path(__file__).resolve().parents[3]
 sys.path.append(str(REPO / "scripts" / "ci"))
 
 from impact import cargo_skip, read_set  # noqa: E402
+import workflow_text  # noqa: E402  (scripts/ci/tests, the discover start directory)
 
 CI_YML = REPO / ".github" / "workflows" / "ci.yml"
 COVERAGE_YML = REPO / ".github" / "workflows" / "coverage.yml"
@@ -537,11 +538,13 @@ def run_whole_step(impact, docs_only="false", tier="sqlite"):
         fake = work / "bin" / "cargo"
         fake.write_text(FAKE_CARGO % (sys.executable, str(argv_log)))
         fake.chmod(0o755)
-        env = {k: v for k, v in os.environ.items() if k not in STEP_ENV_DROP}
-        env.update(PATH="%s%s%s" % (work / "bin", os.pathsep, os.environ.get("PATH", "")),
-                   TEST_IMPACT=impact, DOCS_ONLY=docs_only, TIER=tier, CI_NODE="ubuntu-latest",
-                   HOST_SEMAPHORE_SLOTS="0", JOB_TIMEOUT_MIN="60", AI_MEMORY_NO_CONFIG="1",
-                   RUNNER_TEMP=str(work), GITHUB_ENV=str(work / "github-env"), CI_PG_ISOLATE_OFF="")
+        # #9769: the step env of ci.yml (every key, unset expressions empty) under the fixture keys.
+        env = workflow_text.step_exec_env(
+            dict(PATH="%s%s%s" % (work / "bin", os.pathsep, os.environ.get("PATH", "")),
+                 TEST_IMPACT=impact, DOCS_ONLY=docs_only, TIER=tier, CI_NODE="ubuntu-latest",
+                 HOST_SEMAPHORE_SLOTS="0", JOB_TIMEOUT_MIN="60", AI_MEMORY_NO_CONFIG="1",
+                 RUNNER_TEMP=str(work), GITHUB_ENV=str(work / "github-env")),
+            base={k: v for k, v in os.environ.items() if k not in STEP_ENV_DROP})
         res = subprocess.run(RUNNER_BASH + [consumer_step_body()], cwd=str(work), env=env,
                              capture_output=True, text=True, timeout=TIMEOUT_S)
         argv = []
@@ -637,7 +640,8 @@ class ConsumerBoundary(unittest.TestCase):
             for name in WHOLE_STEP_NAMES:
                 (work / "tests" / ("%s.rs" % name)).write_text("")
             script = "set -u\n%s\necho \"RESULT=$TEST_IMPACT\"\n" % self.boundary_block()
-            env = dict(os.environ, TEST_IMPACT=impact, DOCS_ONLY=docs_only)
+            # #9769: the step env of ci.yml under the two fixture keys.
+            env = workflow_text.step_exec_env({"TEST_IMPACT": impact, "DOCS_ONLY": docs_only})
             res = subprocess.run(RUNNER_BASH + [script], cwd=str(work), env=env,
                                  capture_output=True, text=True, timeout=TIMEOUT_S)
         finally:
