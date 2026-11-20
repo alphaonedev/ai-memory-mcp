@@ -30,7 +30,7 @@ SHARED_FLAG = "shared_target"
 SHARED_HELPER = "scripts/ci/shared_cargo_target.py"
 PRUNE_HELPER = "scripts/ci/prune_runner_artifacts.py"
 CAP_KEY = "max-parallel"
-EXPECTED_CAP = 3
+EXPECTED_CAP = 4  # #9682: the cap equals the leg count
 SHARED_LEG = "linux-fed,enterprise-fed"
 
 
